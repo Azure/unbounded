@@ -52,6 +52,16 @@ impl<U: Origin, T: AzureTransport, K: AzureTokenSource> OriginRouter<U, T, K> {
 }
 
 impl<U: Origin, T: AzureTransport, K: AzureTokenSource> Origin for OriginRouter<U, T, K> {
+    /// The published cluster page size; the default before any publication.
+    fn page_size(&self) -> crate::error::Result<racer_wire::object::PageSize> {
+        Ok(self
+            .snapshots
+            .current()?
+            .map_or(racer_wire::object::PageSize::DEFAULT, |snapshot| {
+                snapshot.page_size
+            }))
+    }
+
     fn bootstrap_reserved<'a>(
         &'a self,
         authority: &'a OriginAuthority,

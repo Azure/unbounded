@@ -6283,3 +6283,59 @@ fn expired_follower_of_expired_probe_reports_its_own_deadline() {
     }
     assert_local_plaintext_idle(&f);
 }
+
+/// An origin that only answers the published cluster page size.
+struct SizedOrigin(racer_wire::object::PageSize);
+impl Origin for SizedOrigin {
+    fn bootstrap_reserved<'a>(
+        &'a self,
+        _: &'a super::super::candidates::OriginAuthority,
+        _: &'a OriginContext,
+        _: flow_control::Charge<AdmissionPolicy>,
+        _: &'a RequestScope,
+    ) -> Operation<'a, MetadataReply> {
+        unreachable!("the reservation test does not fetch")
+    }
+    fn metadata<'a>(
+        &'a self,
+        _: &'a super::super::candidates::OriginAuthority,
+        _: &'a OriginContext,
+        _: crate::model::MetadataSelector,
+        _: &'a RequestScope,
+    ) -> Operation<'a, MetadataReply> {
+        unreachable!("the reservation test does not fetch")
+    }
+    fn page_reserved<'a>(
+        &'a self,
+        _: &'a super::super::candidates::OriginAuthority,
+        _: &'a OriginContext,
+        _: &'a PageId,
+        _: flow_control::Charge<AdmissionPolicy>,
+        _: &'a RequestScope,
+    ) -> Operation<'a, OriginPage> {
+        unreachable!("the reservation test does not fetch")
+    }
+    fn page_size(&self) -> crate::error::Result<racer_wire::object::PageSize> {
+        Ok(self.0)
+    }
+}
+
+/// D13: a small-page cluster reserves one small page of plaintext per origin fill and bootstrap,
+/// not the 16 MiB maximum.
+#[test]
+fn small_page_cluster_reserves_page_sized_plaintext() {
+    let small = racer_wire::object::PageSize::new(64 << 10).unwrap();
+    let mut f = fixture();
+    f.fill.dependencies.origin = Rc::new(SizedOrigin(small));
+    assert_eq!(f.fill.page_plaintext_bytes(), Ok(64 << 10));
+    let bootstrap = f.fill.reserve_bootstrap(&f.context.object.cache).unwrap();
+    assert_eq!(bootstrap.amount(), 64 << 10);
+    let network =
+        futures::executor::block_on(f.fill.reserve_network_plaintext(&f.scope, &f.page)).unwrap();
+    assert_eq!(network.amount(), 64 << 10);
+
+    // The default cluster still reserves a full default page.
+    f.fill.dependencies.origin = Rc::new(SizedOrigin(racer_wire::object::PageSize::DEFAULT));
+    let full = f.fill.reserve_bootstrap(&f.context.object.cache).unwrap();
+    assert_eq!(full.amount(), PAGE_BYTES as usize);
+}

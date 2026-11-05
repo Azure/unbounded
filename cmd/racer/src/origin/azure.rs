@@ -3,7 +3,7 @@
 //! Serves caches whose publication carries `CacheDefinition::origin` directly
 //! from Azure Blob Storage. Request plan:
 //!
-//! - bootstrap: one `GET` with `x-ms-range: bytes=0-<PAGE_BYTES-1>`. A 206
+//! - bootstrap: one `GET` with `x-ms-range: bytes=0-<page size - 1>`. A 206
 //!   carries metadata, the size (from `Content-Range`), and page 0. An empty
 //!   blob answers 416, so a `HEAD` follows to read its metadata.
 //! - page: one `GET` with `x-ms-range` and `If-Match: <pinned ETag>`.
@@ -37,8 +37,8 @@ use crate::control::cell::PublicationCell;
 use crate::error::{Error, Operation, Result};
 use crate::memory::{BufferPool, PlaintextBuffer};
 use crate::model::{
-    ExpiresAt, MetadataSelector, ObjectId, ObjectMetadata, ObjectVersion, PAGE_BYTES, PageId,
-    PageNumber, StrongEtag,
+    ExpiresAt, MetadataSelector, ObjectId, ObjectMetadata, ObjectVersion, PageId, PageNumber,
+    StrongEtag,
 };
 use crate::read::candidates::OriginAuthority;
 use crate::runtime::RequestScope;
@@ -359,7 +359,7 @@ impl<T: AzureTransport, K: AzureTokenSource> AzureOrigin<T, K> {
     }
 
     /// The published cluster page size; the default before any publication.
-    fn page_size(&self) -> Result<racer_wire::object::PageSize> {
+    pub(crate) fn published_page_size(&self) -> Result<racer_wire::object::PageSize> {
         Ok(self
             .snapshots
             .current()?
@@ -374,7 +374,10 @@ impl<T: AzureTransport, K: AzureTokenSource> AzureOrigin<T, K> {
         reservation: &flow_control::Charge<AdmissionPolicy>,
         object: &ObjectId,
     ) -> Result<()> {
-        reservation.validate(ResourceClass::Plaintext, PAGE_BYTES as usize)?;
+        reservation.validate(
+            ResourceClass::Plaintext,
+            self.published_page_size()?.get() as usize,
+        )?;
         if !self.admission.owns(reservation) || reservation.key() != Some(&object.cache) {
             return Err(Error::InvalidConfiguration);
         }
@@ -491,7 +494,7 @@ impl<T: AzureTransport, K: AzureTokenSource> AzureOrigin<T, K> {
         scope: &RequestScope,
     ) -> Result<MetadataReply> {
         self.validate_reservation(&reservation, &context.object)?;
-        let page_size = self.page_size()?;
+        let page_size = self.published_page_size()?;
         let size = page_size.get();
         let begun = self.begin(definition, context, scope).await?;
         let range = ByteRange {
@@ -629,7 +632,7 @@ impl<T: AzureTransport, K: AzureTokenSource> AzureOrigin<T, K> {
         if page.version.object != context.object {
             return Err(Error::Unauthorized);
         }
-        let page_size = self.page_size()?;
+        let page_size = self.published_page_size()?;
         let size = page_size.get();
         let first = page.number.0.checked_mul(size).ok_or(Error::InvalidRange)?;
         let last = first
@@ -717,6 +720,10 @@ fn metadata(
 }
 
 impl<T: AzureTransport, K: AzureTokenSource> Origin for AzureOrigin<T, K> {
+    fn page_size(&self) -> Result<racer_wire::object::PageSize> {
+        self.published_page_size()
+    }
+
     fn bootstrap_reserved<'a>(
         &'a self,
         authority: &'a OriginAuthority,

@@ -27,7 +27,7 @@ use crate::model::ObjectMetadata;
 use crate::model::ObjectVersion;
 use crate::model::PageId;
 use crate::model::PageNumber;
-use crate::model::{PAGE_BYTES, PageSize};
+use crate::model::PageSize;
 use crate::read::candidates::OriginAuthority;
 use crate::runtime::RequestScope;
 use crate::security::OriginContext;
@@ -72,6 +72,11 @@ pub trait Origin {
         selector: MetadataSelector,
         scope: &'a RequestScope,
     ) -> Operation<'a, MetadataReply>;
+    /// The published cluster page size that sizes one page's plaintext reservation. Adapters
+    /// without a publication (test doubles) keep the default.
+    fn page_size(&self) -> Result<PageSize> {
+        Ok(PageSize::DEFAULT)
+    }
 }
 pub struct OriginClient {
     health: crate::topology::LinkHealth,
@@ -168,15 +173,6 @@ impl OriginClient {
             }),
             metadata,
         })
-    }
-
-    /// The published cluster page size; the default before any publication (callers that pass
-    /// an explicit endpoint may run without one).
-    fn page_size(&self) -> Result<PageSize> {
-        Ok(self
-            .snapshots
-            .current()?
-            .map_or(PageSize::DEFAULT, |snapshot| snapshot.page_size))
     }
 
     fn endpoint(&self, context: &OriginContext) -> Result<Endpoint> {
@@ -280,7 +276,7 @@ impl OriginClient {
         reservation: &flow_control::Charge<AdmissionPolicy>,
         context: &OriginContext,
     ) -> Result<()> {
-        reservation.validate(ResourceClass::Plaintext, PAGE_BYTES as usize)?;
+        reservation.validate(ResourceClass::Plaintext, self.page_size()?.get() as usize)?;
         if !self.admission.owns(reservation) || reservation.key() != Some(&context.object.cache) {
             return Err(Error::InvalidConfiguration);
         }
@@ -351,6 +347,15 @@ fn resolve_socket(root: &Path, cache: &CacheDefinition) -> Result<PathBuf> {
     Ok(endpoint)
 }
 impl Origin for OriginClient {
+    /// The published cluster page size; the default before any publication (callers that pass
+    /// an explicit endpoint may run without one).
+    fn page_size(&self) -> Result<PageSize> {
+        Ok(self
+            .snapshots
+            .current()?
+            .map_or(PageSize::DEFAULT, |snapshot| snapshot.page_size))
+    }
+
     fn bootstrap_reserved<'a>(
         &'a self,
         authority: &'a OriginAuthority,

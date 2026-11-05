@@ -692,7 +692,7 @@ impl Fill {
                 .reserve(
                     Some(&page.version.object.cache),
                     ResourceClass::Plaintext,
-                    PAGE_BYTES as usize,
+                    self.page_plaintext_bytes()?,
                 )
                 .map_err(Into::into)
         })
@@ -707,7 +707,7 @@ impl Fill {
     ) -> Result<flow_control::Charge<AdmissionPolicy>> {
         let admission = &self.dependencies.admission;
         let cache = &page.version.object.cache;
-        let amount = PAGE_BYTES as usize;
+        let amount = self.page_plaintext_bytes()?;
         // The memory cache retains no plaintext, so nothing local can be
         // reclaimed. Retry once after a yield, which lets completed readers
         // drop their plaintext.
@@ -823,7 +823,14 @@ impl Fill {
         &self,
         cache: &racer_wire::control::CacheId,
     ) -> Result<flow_control::Charge<AdmissionPolicy>> {
-        self.reserve_with_reclamation(cache, ResourceClass::Plaintext, PAGE_BYTES as usize)
+        let amount = self.page_plaintext_bytes()?;
+        self.reserve_with_reclamation(cache, ResourceClass::Plaintext, amount)
+    }
+
+    /// One page's plaintext at the published cluster page size: what an origin fill or
+    /// bootstrap reserves before the page length is known.
+    pub(crate) fn page_plaintext_bytes(&self) -> Result<usize> {
+        Ok(self.dependencies.origin.page_size()?.get() as usize)
     }
 
     /// A received or retained copy already fixes the output length. Validate it
@@ -1851,7 +1858,6 @@ impl Fill {
             return Err(Error::CorruptRecord);
         }
         use crate::admission::ResourceClass;
-        use crate::model::PAGE_BYTES;
         if origin.plaintext.bytes()?.len()
             != origin
                 .metadata
@@ -1890,7 +1896,7 @@ impl Fill {
                 self.reserve_with_reclamation(
                     &page.version.object.cache,
                     ResourceClass::Ciphertext,
-                    PAGE_BYTES as usize + 16,
+                    origin.page_size.get() as usize + 16,
                 )
             })?;
         let (plaintext, ciphertext) = self
@@ -2464,7 +2470,7 @@ impl Fill {
                             self.reserve_with_reclamation(
                                 &context.object.cache,
                                 ResourceClass::Ciphertext,
-                                PAGE_BYTES as usize + 16,
+                                self.page_plaintext_bytes()? + 16,
                             )
                         },
                     )?;
@@ -2596,7 +2602,7 @@ impl Fill {
                 self.reserve_with_reclamation(
                     &context.object.cache,
                     ResourceClass::Ciphertext,
-                    PAGE_BYTES as usize + 16,
+                    self.page_plaintext_bytes()? + 16,
                 )
             })?;
         let origin = self
