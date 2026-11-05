@@ -968,3 +968,20 @@ fn dropped_watches_are_resumed() {
     assert!(w.ready(1));
     assert!(matches!(w.role(1), Role::Primary(0)));
 }
+
+/// A Pod process dies without stopping (its authority is dropped). A new
+/// process with the same identity binds the same addresses and rejoins.
+#[test]
+fn dropped_authority_restarts_with_the_same_identity() {
+    let mut w = World::new(1);
+    ready_single(&mut w);
+    let before = w.os.live_handles();
+    w.nodes[0].authority = None;
+    // Its listeners and connections closed with it.
+    assert!(w.os.live_handles() < before);
+    w.run_for(Duration::from_secs(1));
+    let c = fixed(&w, 1, 1);
+    w.start_with(1, c);
+    assert!(w.run_until(Duration::from_secs(120), |w| w.ready(1)
+        && matches!(w.role(1), Role::Primary(0))));
+}

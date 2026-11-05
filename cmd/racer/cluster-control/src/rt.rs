@@ -51,6 +51,14 @@ fn current() -> Rc<Current> {
     try_current().expect("control reactor is not running")
 }
 
+/// The current reactor, for futures. Futures must hold this and never the
+/// `Rc<Current>`: the runtime owns its tasks, so a task holding the runtime
+/// is a cycle that keeps every task, socket and listener alive after the
+/// [`Executor`] is dropped.
+fn reactor() -> Reactor {
+    current().reactor.clone()
+}
+
 fn try_current() -> Option<Rc<Current>> {
     CURRENT.with(|c| c.borrow().clone())
 }
@@ -348,9 +356,7 @@ pub async fn timeout<T>(
 /// reactor, so the control thread never blocks on the filesystem.
 /// Ordinary symlinks are followed; files over `limit` bytes fail.
 pub async fn read_file(path: &std::path::Path, limit: usize) -> io::Result<Vec<u8>> {
-    let c = current();
-    let bytes = c
-        .reactor
+    let bytes = reactor()
         .read_path(path, limit, &OpCtx::none())
         .await
         .map_err(to_io)?;
@@ -379,18 +385,18 @@ impl Tcp {
 
     /// Connect on the reactor.
     pub async fn connect(address: SocketAddr) -> io::Result<Self> {
-        let c = current();
+        let reactor = reactor();
         let domain = if address.is_ipv4() {
             libc::AF_INET
         } else {
             libc::AF_INET6
         };
-        let fd = match c.reactor.sim_os() {
+        let fd = match reactor.sim_os() {
             Some(os) => os.socket(domain)?,
             None => Descriptor::socket(domain).map_err(to_io)?,
         };
         let fd = Rc::new(fd);
-        c.reactor
+        reactor
             .connect(fd.clone(), SocketAddress::Inet(address), (), &OpCtx::none())
             .await
             .map_err(to_io)?;
@@ -401,8 +407,7 @@ impl Tcp {
     /// Receive and append to `out`. Returns 0 at end of stream.
     pub async fn recv_into(&mut self, out: &mut Vec<u8>) -> io::Result<usize> {
         let buf = self.buf.take().unwrap_or_else(|| vec![0; RECV_BYTES]);
-        let done = current()
-            .reactor
+        let done = reactor()
             .recv(self.fd.clone(), buf, (), &OpCtx::none())
             .await
             .map_err(to_io)?;
@@ -415,8 +420,7 @@ impl Tcp {
     pub async fn send_all(&mut self, data: Vec<u8>) -> io::Result<()> {
         let mut data = data;
         loop {
-            let done = current()
-                .reactor
+            let done = reactor()
                 .send(self.fd.clone(), data, (), &OpCtx::none())
                 .await
                 .map_err(to_io)?;
@@ -464,8 +468,7 @@ impl Listener {
 
     /// Accept one connection.
     pub async fn accept(&self) -> io::Result<(Tcp, SocketAddr)> {
-        let fd = current()
-            .reactor
+        let fd = reactor()
             .accept(self.fd.clone(), &OpCtx::none())
             .await
             .map_err(to_io)?;
