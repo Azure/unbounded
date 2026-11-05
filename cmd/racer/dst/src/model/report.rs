@@ -104,6 +104,8 @@ pub struct Counters {
     pub stored_pages_max: u64,
     /// Most bodies of one page one node streamed at once (racer-sim `mesh.page_peak_fanin`).
     pub page_peak_fanin: u64,
+    /// Pages crashed nodes lost.
+    pub crash_lost_pages: u64,
     /// Relays that found no free `Relay` transfer (racer-sim fails the hop `Overloaded`).
     pub relay_sheds: u64,
     /// Requests whose verification found the crypto queue full (racer-sim `verify_sheds`).
@@ -246,6 +248,7 @@ impl Report {
                     "metadata_requests": c.metadata_requests,
                     "stored_pages_max": c.stored_pages_max,
                     "page_peak_fanin": c.page_peak_fanin,
+                    "crash_lost_pages": c.crash_lost_pages,
                     "probe_timeouts": c.probe_timeouts,
                     "silence_pings": c.silence_pings,
                     "flights_reelected": c.flights_reelected,

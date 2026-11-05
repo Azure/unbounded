@@ -1283,6 +1283,12 @@ impl<'s> Model<'s> {
                     F::Crash { node } => {
                         self.report.counters.crashes += 1;
                         self.nodes[node as usize].down = true;
+                        // The process loses its memory. The Model has one page tier, so every
+                        // stored page goes with it (racer-sim drops a crashed node's memory
+                        // pages; production recovers only its last checkpoint).
+                        let lost = self.nodes[node as usize].stored.len() as u64;
+                        self.report.counters.crash_lost_pages += lost;
+                        self.nodes[node as usize].stored = Store::new(self.spec.stored_pages);
                     }
                     F::Restart { node } => self.nodes[node as usize].down = false,
                     F::Partition { a, b } if a != b => {
