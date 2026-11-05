@@ -370,6 +370,14 @@ func applyQualificationEvidence(
 		}
 
 		enforceQualificationRequirements(participant, config, result, measurementErr)
+		if config.BackendKind == string(signalv1.ExecutionBackendMPIJob) &&
+			participant.Verdict.Verdict == "Pass" &&
+			!mpiParticipantObservedHealthy(*participant) {
+			participant.Verdict = inconclusiveVerdict(
+				"ParticipantHealthNotProven",
+				participant.Verdict.Attribution,
+			)
+		}
 	}
 
 	if config.BackendKind == string(signalv1.ExecutionBackendMPIJob) && len(results) > 0 {
@@ -393,6 +401,28 @@ func applyQualificationEvidence(
 			evidence.Timing.MaxObservedGap = &value
 		}
 	}
+}
+
+func mpiParticipantObservedHealthy(participant ParticipantBackendEvidence) bool {
+	for podIndex := range participant.Pods {
+		pod := &participant.Pods[podIndex]
+		if pod.Role != "worker" {
+			continue
+		}
+		if pod.Phase != corev1.PodSucceeded || len(pod.Containers) == 0 {
+			return false
+		}
+		for containerIndex := range pod.Containers {
+			state := pod.Containers[containerIndex].State
+			if state.State != "terminated" || state.ExitCode != 0 {
+				return false
+			}
+		}
+
+		return true
+	}
+
+	return false
 }
 
 func qualificationAttribution(config Config) string {

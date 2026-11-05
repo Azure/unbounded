@@ -9,6 +9,7 @@ import (
 	"testing"
 	"time"
 
+	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 
@@ -21,6 +22,7 @@ func TestApplyQualificationEvidenceAttributesPodParticipants(t *testing.T) {
 	config := qualificationConfig(signalv1.ExecutionBackendPod)
 	started := time.Date(2026, 1, 2, 3, 4, 5, 0, time.UTC)
 	evidence := qualificationEvidenceSkeleton(2)
+	addHealthyMPIWorkers(&evidence)
 	results := []Result{
 		qualificationResult(0, "Pass", "participant-zero", started),
 		qualificationResult(1, "Fail", "participant-one", started),
@@ -92,6 +94,7 @@ func TestApplyQualificationEvidenceSeparatesMPIGroupAndParticipantObservation(t 
 	}
 
 	evidence = qualificationEvidenceSkeleton(2)
+	addHealthyMPIWorkers(&evidence)
 	results[0].Measurements = `{"qualification":{"participants":[{"participantIndex":0,"visibleDevices":["gpu-a"],"coveredDevices":["gpu-a"]}]}}`
 	results[1].Measurements = results[0].Measurements
 	applyQualificationEvidence(
@@ -351,6 +354,23 @@ func qualificationResult(index int, verdict, reason string, started time.Time) R
 		StartedAt:        started,
 		FinishedAt:       started.Add(time.Minute),
 		SampleTimes:      []time.Time{started.Add(10 * time.Second), started.Add(20 * time.Second)},
+	}
+}
+
+func addHealthyMPIWorkers(evidence *BackendEvidence) {
+	for index := range evidence.Participants {
+		evidence.Participants[index].Pods = []PodEvidence{{
+			Name:     "worker",
+			UID:      types.UID("worker-uid-" + string(rune('0'+index))),
+			Role:     "worker",
+			NodeName: "node",
+			NodeUID:  types.UID("node-uid-" + string(rune('0'+index))),
+			Phase:    corev1.PodSucceeded,
+			Containers: []ContainerEvidence{{
+				Name:  "runner",
+				State: ContainerStateEvidence{State: "terminated", ExitCode: 0},
+			}},
+		}}
 	}
 }
 

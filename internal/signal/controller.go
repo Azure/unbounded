@@ -4833,6 +4833,7 @@ func groupedBackendEvidenceComplete(
 
 		complete = complete && participant.CaptureError == "" && len(participant.Pods) > 0
 		workerPods := 0
+		workerHealthy := false
 
 		for _, pod := range participant.Pods {
 			if pod.UID == "" || pod.Name == "" || pod.NodeName == "" || pod.NodeUID == "" {
@@ -4869,6 +4870,12 @@ func groupedBackendEvidenceComplete(
 							participant.ParticipantIndex,
 						)
 					}
+					workerHealthy = pod.Phase == corev1.PodSucceeded && len(pod.Containers) > 0
+					for _, container := range pod.Containers {
+						workerHealthy = workerHealthy &&
+							container.State.State == "terminated" &&
+							container.State.ExitCode == 0
+					}
 				default:
 					return false, fmt.Errorf("backend-evidence MPI Pod role %q is invalid", pod.Role)
 				}
@@ -4890,6 +4897,12 @@ func groupedBackendEvidenceComplete(
 
 		if backend == signalv1.ExecutionBackendMPIJob {
 			complete = complete && workerPods == 1
+			if participant.Verdict.Verdict == "Pass" && !workerHealthy {
+				return false, fmt.Errorf(
+					"backend-evidence participant %d pass verdict lacks healthy worker evidence",
+					participant.ParticipantIndex,
+				)
+			}
 
 			if participant.LauncherJob != nil {
 				if participant.LauncherJob.Name == "" || participant.LauncherJob.UID == "" {
