@@ -686,7 +686,7 @@ pub mod metrics {
     /// Declare a fixed metric enum, its ordered array, and its count.
     ///
     /// ```
-    /// telemetry::metrics! { Event, EVENTS, EVENT_COUNT;
+    /// racer::metrics! { Event, EVENTS, EVENT_COUNT;
     ///     Self::Request => "requests_total",
     /// }
     /// assert_eq!(Event::ALL, &EVENTS);
@@ -697,11 +697,11 @@ pub mod metrics {
     /// contiguous variants:
     ///
     /// ```
-    /// telemetry::metrics! { Event, EVENTS, EVENT_COUNT;
+    /// racer::metrics! { Event, EVENTS, EVENT_COUNT;
     ///     Self::Hit => "reads_total" { "outcome=\"hit\"" },
     ///     Self::Miss => "reads_total" { "outcome=\"miss\"" },
     /// }
-    /// assert_eq!(crate::telemetry::primitives::Metric::labels(Event::Miss), "outcome=\"miss\"");
+    /// assert_eq!(racer::telemetry::primitives::Metric::labels(Event::Miss), "outcome=\"miss\"");
     /// ```
     #[macro_export]
     macro_rules! metrics {
