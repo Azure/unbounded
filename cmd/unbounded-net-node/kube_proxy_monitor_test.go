@@ -5,6 +5,7 @@ package main
 
 import (
 	"context"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -14,7 +15,23 @@ import (
 func TestKubeProxyMonitorHealthy(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
-		_, _ = w.Write([]byte("ok"))
+		_, _ = w.Write([]byte(`{"healthy":true}`))
+	}))
+	defer srv.Close()
+
+	m := newKubeProxyMonitor(100 * time.Millisecond)
+	m.url = srv.URL + "/healthz"
+	m.check()
+
+	if w := m.GetWarning(); w != "" {
+		t.Fatalf("expected no warning, got: %s", w)
+	}
+}
+
+func TestKubeProxyMonitorHealthyWithServiceUnavailableStatus(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusServiceUnavailable)
+		_, _ = w.Write([]byte(`{"nodeEligible":false,"healthy":true}`))
 	}))
 	defer srv.Close()
 
@@ -30,7 +47,7 @@ func TestKubeProxyMonitorHealthy(t *testing.T) {
 func TestKubeProxyMonitorUnhealthy(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusServiceUnavailable)
-		_, _ = w.Write([]byte("not ready"))
+		_, _ = w.Write([]byte(`{"healthy":false}`))
 	}))
 	defer srv.Close()
 
@@ -43,8 +60,24 @@ func TestKubeProxyMonitorUnhealthy(t *testing.T) {
 		t.Fatal("expected warning, got empty")
 	}
 
-	if w != "kube-proxy healthz returned 503: not ready" {
+	if w != `kube-proxy healthz returned 503: {"healthy":false}` {
 		t.Fatalf("unexpected warning: %s", w)
+	}
+}
+
+func TestKubeProxyMonitorInvalidResponse(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("ok"))
+	}))
+	defer srv.Close()
+
+	m := newKubeProxyMonitor(100 * time.Millisecond)
+	m.url = srv.URL + "/healthz"
+	m.check()
+
+	if w := m.GetWarning(); w == "" {
+		t.Fatal("expected warning for invalid response")
 	}
 }
 
@@ -68,6 +101,8 @@ func TestKubeProxyMonitorRecovery(t *testing.T) {
 		} else {
 			w.WriteHeader(http.StatusServiceUnavailable)
 		}
+
+		_, _ = fmt.Fprintf(w, `{"healthy":%t}`, healthy)
 	}))
 	defer srv.Close()
 
