@@ -392,6 +392,28 @@ impl<P: Policy> Charge<P> {
         Ok(self.transfer(amount, self.buffers.clone(), key))
     }
 
+    /// Absorb `other` into this charge, the inverse of [`Self::split`].
+    ///
+    /// Both charges must come from the same authority, class, and key;
+    /// otherwise `other` is handed back unchanged.
+    pub fn merge(&mut self, mut other: Self) -> std::result::Result<(), Self> {
+        let same_local = match (&self.local, &other.local) {
+            (None, None) => true,
+            (Some(a), Some(b)) => Arc::ptr_eq(a, b),
+            _ => false,
+        };
+        if self.class.index() != other.class.index()
+            || !Arc::ptr_eq(&self.totals, &other.totals)
+            || !same_local
+            || self.key != other.key
+        {
+            return Err(other);
+        }
+        self.amount += other.amount;
+        other.amount = 0;
+        Ok(())
+    }
+
     /// Caller must retain at least the capacity of every live backing allocation.
     pub fn shrink(&mut self, amount: usize) -> Result<()> {
         if amount == 0 || amount > self.amount {

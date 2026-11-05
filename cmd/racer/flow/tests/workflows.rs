@@ -540,6 +540,33 @@ mod quota_tests {
         assert!(quotas.policy().rejected.lock().unwrap().is_empty());
     }
 
+    /// Merging is accounting-neutral and refuses charges with another key or authority.
+    #[test]
+    fn merge_combines_matching_charges_and_returns_mismatches() {
+        let quotas = Quotas::new(TestPolicy::new(100, 2));
+        let shared = quotas.shared();
+        let mut charge = quotas.reserve(Some(&1), Resource::Waking, 30).unwrap();
+        let extra = quotas.reserve(Some(&1), Resource::Waking, 20).unwrap();
+        assert!(charge.merge(extra).is_ok());
+        assert_eq!(charge.amount(), 50);
+        assert_eq!(shared.used(Resource::Waking), 50);
+        let other_key = quotas.reserve(Some(&2), Resource::Waking, 10).unwrap();
+        let Err(other_key) = charge.merge(other_key) else {
+            panic!("merged another key");
+        };
+        assert_eq!(other_key.amount(), 10);
+        let foreign = Quotas::new(TestPolicy::new(100, 1));
+        let foreign = foreign.reserve(Some(&1), Resource::Waking, 5).unwrap();
+        let Err(foreign) = charge.merge(foreign) else {
+            panic!("merged a foreign charge");
+        };
+        assert_eq!(charge.amount(), 50);
+        drop((foreign, other_key));
+        assert_eq!(shared.used(Resource::Waking), 50);
+        drop(charge);
+        assert_eq!(shared.used(Resource::Waking), 0);
+    }
+
     /// Retaining backing transfers surplus admission but not the donor's key owner.
     #[test]
     fn recycler_transfers_surplus_and_empty_donor_still_owns_key_until_drop() {
