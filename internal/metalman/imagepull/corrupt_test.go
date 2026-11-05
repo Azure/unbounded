@@ -5,6 +5,7 @@ package imagepull_test
 
 import (
 	"bytes"
+	"compress/gzip"
 	"errors"
 	"fmt"
 	"io"
@@ -275,5 +276,213 @@ func TestQuarantineEvictsOldest(t *testing.T) {
 
 	if imagepull.QuarantineHas(p, "other", "1") {
 		t.Fatal("entry matched a different mirror")
+	}
+}
+
+// garbageMirror proxies to upstream and, while garbage is set, replaces the
+// body of every blob response for layer with replace(body), keeping the
+// length intact.
+func garbageMirror(t *testing.T, upstream *ipt.Registry, layer string, replace func([]byte) []byte) (*httptest.Server, *atomic.Int32) {
+	t.Helper()
+
+	var served atomic.Int32
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		req, err := http.NewRequestWithContext(r.Context(), r.Method, upstream.URL()+r.URL.Path, nil)
+		if err != nil {
+			t.Error(err)
+			return
+		}
+
+		req.Header.Set("Accept", r.Header.Get("Accept"))
+
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Error(err)
+			return
+		}
+		defer resp.Body.Close() //nolint:errcheck // test
+
+		body, _ := io.ReadAll(resp.Body)
+
+		for k, v := range resp.Header {
+			w.Header()[k] = v
+		}
+
+		if strings.HasSuffix(r.URL.Path, "/blobs/"+layer) && resp.StatusCode == http.StatusOK {
+			served.Add(1)
+
+			body = replace(body)
+		}
+
+		w.WriteHeader(resp.StatusCode)
+		_, _ = w.Write(body)
+	}))
+	t.Cleanup(srv.Close)
+
+	return srv, &served
+}
+
+func pushBigGzip(t *testing.T, reg *ipt.Registry, size int) (string, []byte, string) {
+	t.Helper()
+
+	content := randomBytes(size, 11)
+	ref, dgst := reg.Push(t, "img", "v1", ipt.ImageSpec{Layers: []ipt.Layer{{
+		Files:       map[string][]byte{"disk/big": content, "disk/z-after": []byte("after")},
+		Compression: ipt.Gzip,
+	}}})
+
+	layers := reg.LayerDigests(dgst)
+	if len(layers) != 1 {
+		t.Fatalf("layers = %v", layers)
+	}
+
+	return ref, content, layers[0]
+}
+
+// badDeflate keeps the gzip header and overwrites the deflate stream with
+// 0xff bytes, an invalid block type, so decompression fails long before
+// the blob is read to EOF.
+func badDeflate(b []byte) []byte {
+	out := bytes.Clone(b)
+	for k := 10; k < len(out); k++ {
+		out[k] = 0xff
+	}
+
+	return out
+}
+
+// garbageTar serves a valid gzip stream whose payload is not a tar
+// archive, padded with zeros to the original length.
+func garbageTar(b []byte) []byte {
+	var buf bytes.Buffer
+
+	zw := gzip.NewWriter(&buf)
+	_, _ = zw.Write(bytes.Repeat([]byte{0x01}, 4096))
+	_ = zw.Close()
+
+	out := make([]byte, len(b))
+	copy(out, buf.Bytes())
+
+	return out
+}
+
+func TestUndecodableMirrorLayerRetriedFromUpstream(t *testing.T) {
+	for name, replace := range map[string]func([]byte) []byte{"deflate": badDeflate, "tar": garbageTar} {
+		t.Run(name, func(t *testing.T) {
+			upstream := ipt.NewRegistry(t)
+			ref, content, layer := pushBigGzip(t, upstream, 256*1024)
+			mirror, served := garbageMirror(t, upstream, layer, replace)
+
+			p := &imagepull.Puller{Mirror: mirror.URL, ChunkSize: 1024}
+
+			img := resolve(t, p, imagepull.Source{Ref: ref})
+			if data, _ := readFile(t, img, "disk/big"); !bytes.Equal(data, content) {
+				t.Fatal("content mismatch")
+			}
+
+			if served.Load() == 0 {
+				t.Fatal("mirror never served the garbage blob")
+			}
+
+			if upstreamBlobReads(upstream, layer) == 0 {
+				t.Fatal("upstream received no blob request")
+			}
+
+			if got := imagepull.QuarantineLen(p); got != 1 {
+				t.Fatalf("quarantine len = %d, want 1", got)
+			}
+
+			before := served.Load()
+
+			img2 := resolve(t, p, imagepull.Source{Ref: ref})
+			if data, _ := readFile(t, img2, "disk/big"); !bytes.Equal(data, content) {
+				t.Fatal("content mismatch on second request")
+			}
+
+			if got := served.Load(); got != before {
+				t.Fatalf("mirror served %d more blob requests, want 0", got-before)
+			}
+		})
+	}
+}
+
+func TestUndecodableMirrorFileRetriedFromUpstream(t *testing.T) {
+	upstream := ipt.NewRegistry(t)
+	ref, content, layer := pushBigGzip(t, upstream, 256*1024)
+
+	var bad atomic.Bool
+
+	mirror, _ := garbageMirror(t, upstream, layer, func(b []byte) []byte {
+		if bad.Load() {
+			return badDeflate(b)
+		}
+
+		return b
+	})
+
+	p := &imagepull.Puller{Mirror: mirror.URL, ChunkSize: 1024}
+	img := resolve(t, p, imagepull.Source{Ref: ref})
+
+	// Build the index from a healthy mirror, then break later reads.
+	f, err := img.Open(t.Context(), "disk/big")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	_ = f.Close()
+
+	upstream.ResetRequests()
+	bad.Store(true)
+
+	if data, _ := readFile(t, img, "disk/big"); !bytes.Equal(data, content) {
+		t.Fatal("content mismatch")
+	}
+
+	if upstreamBlobReads(upstream, layer) == 0 {
+		t.Fatal("upstream received no blob request")
+	}
+
+	if got := imagepull.QuarantineLen(p); got != 1 {
+		t.Fatalf("quarantine len = %d, want 1", got)
+	}
+}
+
+func TestUndecodableUpstreamLayer(t *testing.T) {
+	upstream := ipt.NewRegistry(t)
+	ref, _, layer := pushBigGzip(t, upstream, 64*1024)
+	mirror, _ := garbageMirror(t, upstream, layer, badDeflate)
+
+	img := resolve(t, &imagepull.Puller{Mirror: mirror.URL, ChunkSize: 1024}, imagepull.Source{Ref: ref})
+
+	// Upstream serves undecodable bytes too.
+	upstream.SetBlob(layer, badDeflate(upstreamBlob(t, upstream, layer)))
+	upstream.ResetRequests()
+
+	_, _, err := img.ReadFile(t.Context(), "disk/big")
+	if !errors.Is(err, imagepull.ErrCorruptLayer) && !errors.Is(err, imagepull.ErrDigestMismatch) {
+		t.Fatalf("err = %v, want ErrCorruptLayer or ErrDigestMismatch", err)
+	}
+
+	if upstreamBlobReads(upstream, layer) == 0 {
+		t.Fatal("upstream received no blob request")
+	}
+}
+
+func TestUndecodableLayerWithoutMirror(t *testing.T) {
+	upstream := ipt.NewRegistry(t)
+	ref, _, layer := pushBigGzip(t, upstream, 64*1024)
+
+	img := resolve(t, &imagepull.Puller{ChunkSize: 1024}, imagepull.Source{Ref: ref})
+	upstream.SetBlob(layer, badDeflate(upstreamBlob(t, upstream, layer)))
+	upstream.ResetRequests()
+
+	_, _, err := img.ReadFile(t.Context(), "disk/big")
+	if !errors.Is(err, imagepull.ErrCorruptLayer) {
+		t.Fatalf("err = %v, want ErrCorruptLayer", err)
+	}
+
+	if got := len(upstream.BlobRequests(layer)); got == 0 {
+		t.Fatal("no blob request")
 	}
 }

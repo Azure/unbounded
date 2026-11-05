@@ -79,6 +79,7 @@ func (i *Image) Source() Source { return i.src }
 // layerStream is an open, decompressed tar stream over one layer.
 type layerStream struct {
 	blob *blobStream
+	src  *srcReader // blob as read by the decoder
 	dec  io.Closer
 	r    io.Reader // decompressed stream
 	tr   *tar.Reader
@@ -105,9 +106,61 @@ func (l *layerStream) drain() error {
 		}
 	}
 
-	_, err := io.Copy(io.Discard, l.blob)
+	_, err := io.Copy(io.Discard, l.src)
 
 	return err
+}
+
+// srcReader records the first error, including io.EOF, returned by the
+// raw blob, so that a decoder failure can be told apart from a transport
+// or verification failure passed through by the decoder.
+type srcReader struct {
+	r   io.Reader
+	err error
+}
+
+func (s *srcReader) Read(p []byte) (int, error) {
+	n, err := s.r.Read(p)
+	if err != nil && s.err == nil {
+		s.err = err
+	}
+
+	return n, err
+}
+
+// errMirrorDecode marks a decode failure on a layer a mirror served, after
+// the blob was quarantined for that mirror; the read is retried upstream.
+var errMirrorDecode = errors.New("mirror served undecodable layer")
+
+// decodeErr classifies err, returned while decompressing or parsing the tar
+// stream of ls. Errors from the raw blob (transport, digest mismatch) and
+// caller cancellation are returned as is. Any other failure means the
+// bytes do not decode: it wraps ErrCorruptLayer, and when a mirror served
+// any of a blob not yet verified, the blob is quarantined for the mirror
+// and the error also wraps errMirrorDecode so the caller retries upstream.
+// A blob read to EOF passed digest verification, so a decode failure then
+// is in the authentic content and is not blamed on the mirror.
+func (i *Image) decodeErr(ls *layerStream, err error) error {
+	if err == nil || errors.Is(err, ErrCorruptLayer) {
+		return err
+	}
+
+	if ls.blob.rr.ctx.Err() != nil {
+		return err
+	}
+
+	switch {
+	case ls.src.err == nil:
+		if ls.blob.fromMirror() {
+			i.noteMismatch(ls.blob.desc.Digest, ls.blob.rr)
+			return fmt.Errorf("%w: %w: %w", ErrCorruptLayer, errMirrorDecode, err)
+		}
+	case errors.Is(ls.src.err, io.EOF):
+	default:
+		return err
+	}
+
+	return fmt.Errorf("%w: %w", ErrCorruptLayer, err)
 }
 
 func (i *Image) openLayer(ctx context.Context, idx int) (*layerStream, error) {
@@ -123,24 +176,30 @@ func (i *Image) openLayer(ctx context.Context, idx int) (*layerStream, error) {
 		return nil, err
 	}
 
-	ls := &layerStream{blob: blob}
+	ls := &layerStream{blob: blob, src: &srcReader{r: blob}}
 
-	var r io.Reader = blob
+	var r io.Reader = ls.src
 
 	switch comp {
 	case compressionGzip:
-		zr, err := gzip.NewReader(blob)
+		zr, err := gzip.NewReader(ls.src)
 		if err != nil {
+			err = i.decodeErr(ls, err)
+
 			_ = blob.Close() //nolint:errcheck // already failing
+
 			return nil, fmt.Errorf("layer %s: %w", desc.Digest, err)
 		}
 
 		ls.dec = zr
 		r = zr
 	case compressionZstd:
-		zr, err := zstd.NewReader(blob, zstd.WithDecoderConcurrency(1))
+		zr, err := zstd.NewReader(ls.src, zstd.WithDecoderConcurrency(1))
 		if err != nil {
+			err = i.decodeErr(ls, err)
+
 			_ = blob.Close() //nolint:errcheck // already failing
+
 			return nil, fmt.Errorf("layer %s: %w", desc.Digest, err)
 		}
 
@@ -383,7 +442,7 @@ func (i *Image) ReadFile(ctx context.Context, names ...string) ([]byte, string, 
 func (i *Image) readFile(ctx context.Context, names ...string) ([]byte, string, bool, error) {
 	f, err := i.Open(ctx, names...)
 	if err != nil {
-		return nil, "", false, err
+		return nil, "", errors.Is(err, errMirrorDecode), err
 	}
 	defer f.Close() //nolint:errcheck // read-only
 
@@ -395,7 +454,7 @@ func (i *Image) readFile(ctx context.Context, names ...string) ([]byte, string, 
 	// from offset 0, so the bytes below are verified.
 	data, err := io.ReadAll(f)
 	if err != nil {
-		retry := errors.Is(err, ErrDigestMismatch) && f.ls != nil && f.ls.blob.fromMirror()
+		retry := errors.Is(err, errMirrorDecode) || (errors.Is(err, ErrDigestMismatch) && f.ls != nil && f.ls.blob.fromMirror())
 		return nil, "", retry, err
 	}
 
@@ -481,6 +540,7 @@ func (f *File) Read(p []byte) (int, error) {
 		f.streamPos += n
 
 		if err != nil {
+			err = f.img.decodeErr(f.ls, err)
 			return 0, fmt.Errorf("imagepull: skip in %s: %w", f.name, err)
 		}
 	}
@@ -490,6 +550,10 @@ func (f *File) Read(p []byte) (int, error) {
 	}
 
 	n, err := f.ls.tr.Read(p)
+	if err != nil && !errors.Is(err, io.EOF) {
+		err = f.img.decodeErr(f.ls, err)
+	}
+
 	f.hash(p[:n])
 	f.off += int64(n)
 	f.streamPos += int64(n)
@@ -578,7 +642,10 @@ func (f *File) reopen() error {
 	for k := 0; k <= f.ordinal; k++ {
 		hdr, err := ls.tr.Next()
 		if err != nil {
+			err = f.img.decodeErr(ls, err)
+
 			_ = ls.Close() //nolint:errcheck // already failing
+
 			return fmt.Errorf("imagepull: reopen %s: %w", f.name, err)
 		}
 

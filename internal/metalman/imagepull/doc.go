@@ -81,6 +81,12 @@
 // be verified: the bytes returned come from a layer that has been verified
 // once, but the registry could serve different bytes on a later request.
 //
+// A layer whose bytes cannot be decompressed or parsed as a tar archive
+// yields an error wrapping ErrCorruptLayer. If a mirror served any of the
+// layer and the failure occurs before the blob was read to EOF and
+// verified, it is treated as a verification failure of the mirror, as
+// below. Caller context cancellation is never treated this way.
+//
 // When content fails verification after a mirror served any of it, the
 // blob is marked on the Image so that later reads skip the mirror and go to
 // the upstream registry only. The Puller also remembers the blob for that
@@ -91,5 +97,5 @@
 // being read still returns the error, since it may already have delivered
 // unverified bytes; opening the file again reads from upstream. If the
 // upstream content also fails verification, the error wraps
-// ErrDigestMismatch.
+// ErrDigestMismatch or ErrCorruptLayer; it is not retried again.
 package imagepull

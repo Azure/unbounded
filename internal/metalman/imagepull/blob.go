@@ -762,6 +762,10 @@ func (v *verifyReader) Close() error { return v.rc.Close() }
 // read to EOF, or a file read sequentially from offset 0 to EOF.
 var ErrDigestMismatch = errors.New("blob digest mismatch")
 
+// ErrCorruptLayer reports that a layer blob could not be decompressed or
+// parsed as a tar archive.
+var ErrCorruptLayer = errors.New("corrupt layer")
+
 // budget is a Puller-wide limit on bytes held in prefetched chunks.
 type budget struct {
 	mu   sync.Mutex

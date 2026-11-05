@@ -91,7 +91,7 @@ func (x *layerIndex) hides(p string) bool {
 // the upstream registry, starting at offset zero.
 func (i *Image) buildIndex(ctx context.Context, li int) (*layerIndex, error) {
 	x, mirrored, err := i.buildIndexOnce(ctx, li)
-	if err != nil && mirrored && errors.Is(err, ErrDigestMismatch) && i.mirrorAvoided(i.layers[li].Digest) {
+	if err != nil && mirrored && (errors.Is(err, ErrDigestMismatch) || errors.Is(err, errMirrorDecode)) && i.mirrorAvoided(i.layers[li].Digest) {
 		x, _, err = i.buildIndexOnce(ctx, li)
 	}
 
@@ -119,7 +119,7 @@ func (i *Image) buildIndexOnce(ctx context.Context, li int) (x *layerIndex, mirr
 		}
 
 		if err != nil {
-			return nil, false, fmt.Errorf("read layer %s: %w", desc.Digest, err)
+			return nil, false, fmt.Errorf("read layer %s: %w", desc.Digest, i.decodeErr(ls, err))
 		}
 
 		name := cleanName(hdr.Name)
@@ -148,7 +148,7 @@ func (i *Image) buildIndexOnce(ctx context.Context, li int) (x *layerIndex, mirr
 
 			h := sha256.New()
 			if _, err := io.Copy(h, ls.tr); err != nil {
-				return nil, false, fmt.Errorf("read layer %s: %w", desc.Digest, err)
+				return nil, false, fmt.Errorf("read layer %s: %w", desc.Digest, i.decodeErr(ls, err))
 			}
 
 			e.sum = digest.NewDigest(digest.SHA256, h)
@@ -180,7 +180,7 @@ func (i *Image) buildIndexOnce(ctx context.Context, li int) (x *layerIndex, mirr
 	// Read the rest of the stream so that the blob digest is verified. The
 	// index is only kept when that succeeds.
 	if err := ls.drain(); err != nil {
-		return nil, false, fmt.Errorf("read layer %s: %w", desc.Digest, err)
+		return nil, false, fmt.Errorf("read layer %s: %w", desc.Digest, i.decodeErr(ls, err))
 	}
 
 	return x, false, nil
