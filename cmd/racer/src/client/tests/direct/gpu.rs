@@ -676,8 +676,10 @@ fn tamper_retained(fixture: &Fixture, in_tag: bool) {
         )
         .unwrap();
     let tampered = CiphertextPage {
+        pinned: true,
         provenance: None,
         inner: Arc::new(CiphertextBytes {
+            pins: Default::default(),
             envelope: copy.ciphertext.envelope().clone(),
             storage: flow_control::ChargedBytes { bytes, reservation }.into(),
         }),

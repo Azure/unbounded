@@ -242,16 +242,71 @@ impl std::ops::DerefMut for VerifiedBytes {
         &mut self.storage
     }
 }
-#[derive(Clone)]
+/// A handle on immutable ciphertext.
+///
+/// Handles are pinning by default: each pinning handle, including every clone
+/// of one, counts in [`CiphertextBytes::pins`] until dropped. Caches and write
+/// queues ask [`Self::pins`] whether evicting their entry would free the bytes,
+/// instead of reading the `Arc` strong count. Telemetry, sampling, and other
+/// observers take [`Self::unpinned`] handles, which keep the bytes alive but
+/// never make an entry look busy.
 pub struct CiphertextPage {
     pub(crate) inner: Arc<CiphertextBytes>,
     pub(crate) provenance: Option<crate::telemetry::PeerProvenance>,
+    /// Whether this handle counts in `inner.pins`.
+    pub(crate) pinned: bool,
+}
+impl Clone for CiphertextPage {
+    fn clone(&self) -> Self {
+        if self.pinned {
+            self.inner.pins.pin();
+        }
+        Self {
+            inner: self.inner.clone(),
+            provenance: self.provenance,
+            pinned: self.pinned,
+        }
+    }
+}
+impl Drop for CiphertextPage {
+    fn drop(&mut self) {
+        if self.pinned {
+            self.inner.pins.unpin();
+        }
+    }
+}
+/// Count of pinning [`CiphertextPage`] handles on one allocation. It starts at
+/// one for the handle that constructs the bytes.
+pub(crate) struct PinCount(std::sync::atomic::AtomicU32);
+impl Default for PinCount {
+    fn default() -> Self {
+        Self(std::sync::atomic::AtomicU32::new(1))
+    }
+}
+impl PinCount {
+    fn pin(&self) {
+        let previous = self.0.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        assert!(
+            previous != 0 && previous != u32::MAX,
+            "ciphertext pin count"
+        );
+    }
+    fn unpin(&self) {
+        let previous = self.0.fetch_sub(1, std::sync::atomic::Ordering::Release);
+        debug_assert!(previous != 0, "ciphertext pin count underflow");
+    }
+    fn get(&self) -> u32 {
+        self.0.load(std::sync::atomic::Ordering::Acquire)
+    }
 }
 /// Ciphertext metadata remains separate from allocation ownership.
 pub(crate) struct CiphertextBytes {
     pub envelope: PageEnvelope,
 
     pub storage: CiphertextStorage,
+
+    /// Pinning handles; see [`CiphertextPage`].
+    pub(crate) pins: PinCount,
 }
 
 /// Pooled disk read storage charged to the reading cache's Ciphertext class.
@@ -532,8 +587,10 @@ impl BufferPool {
         )?;
         reservation.shrink(bytes.capacity())?;
         Ok(CiphertextPage {
+            pinned: true,
             provenance: None,
             inner: Arc::new(CiphertextBytes {
+                pins: Default::default(),
                 envelope,
                 storage: flow_control::ChargedBytes { bytes, reservation }.into(),
             }),
@@ -558,8 +615,10 @@ impl BufferPool {
             Some(&envelope.page.version.object.cache),
         )?;
         Ok(CiphertextPage {
+            pinned: true,
             provenance: None,
             inner: Arc::new(CiphertextBytes {
+                pins: Default::default(),
                 envelope,
                 storage: CiphertextStorage::Registered {
                     page,
@@ -679,8 +738,10 @@ impl BufferPool {
         // The read CQE has returned ownership. Freeze exposes no mutable bytes,
         // and the full padded allocation and charge outlive every ciphertext view.
         Ok(CiphertextPage {
+            pinned: true,
             provenance: None,
             inner: Arc::new(CiphertextBytes {
+                pins: Default::default(),
                 envelope,
                 storage: CiphertextStorage::Slab { buffer, range },
             }),
@@ -795,6 +856,27 @@ impl VerifiedPage {
 }
 
 impl CiphertextPage {
+    /// Pinning handles on these bytes, including this one when it pins.
+    pub(crate) fn pins(&self) -> u32 {
+        self.inner.pins.get()
+    }
+    /// Whether this is the only pinning handle, so dropping it frees the
+    /// bytes unless an unpinned observer still holds them.
+    pub(crate) fn exclusive(&self) -> bool {
+        self.pins() == 1
+    }
+    /// An observer handle that keeps the bytes alive without pinning them.
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "for telemetry and sampling observers")
+    )]
+    pub(crate) fn unpinned(&self) -> Self {
+        Self {
+            inner: self.inner.clone(),
+            provenance: self.provenance,
+            pinned: false,
+        }
+    }
     /// Rehome a completed receive before retaining it in another worker's cache.
     /// Admit the new charge first. Shared transport owners keep their original
     /// allocation and charge until fenced; only exclusive bytes can move in place.
@@ -844,7 +926,9 @@ impl CiphertextPage {
             // Fresh allocations are zeroed, so the pad past `length` stays zero.
             buffer.as_mut_slice()[..length].copy_from_slice(self.bytes());
             Self {
+                pinned: true,
                 inner: Arc::new(CiphertextBytes {
+                    pins: Default::default(),
                     envelope: self.envelope().clone(),
                     storage: CiphertextStorage::Aligned {
                         buffer: AlignedBody(buffer.freeze()?),
@@ -857,7 +941,9 @@ impl CiphertextPage {
             let mut bytes = reservation.buffer(length)?;
             bytes.copy_from_slice(self.bytes());
             Self {
+                pinned: true,
                 inner: Arc::new(CiphertextBytes {
+                    pins: Default::default(),
                     envelope: self.envelope().clone(),
                     storage: flow_control::ChargedBytes { bytes, reservation }.into(),
                 }),
@@ -894,8 +980,10 @@ impl CiphertextPage {
     pub(crate) fn from_aligned(buffer: CiphertextBuffer, envelope: PageEnvelope) -> Self {
         let length = buffer.len();
         Self {
+            pinned: true,
             provenance: None,
             inner: Arc::new(CiphertextBytes {
+                pins: Default::default(),
                 envelope,
                 storage: CiphertextStorage::Aligned {
                     buffer: buffer.freeze(),
@@ -1618,7 +1706,7 @@ impl MemoryCache {
                 entries.expiring(after, ciphertext_cutoff, racer_core::cache::EXPIRY_BATCH);
             expiry.ciphertext = next;
             for (_, id) in selected {
-                if Arc::strong_count(&entries[&id].copy.ciphertext.inner) == 1 {
+                if entries[&id].copy.ciphertext.exclusive() {
                     entries.remove(&id);
                     released += 1;
                 }
@@ -1730,7 +1818,7 @@ impl MemoryCache {
                     break;
                 }
                 entries.lanes.advance(cache, tick);
-                if Arc::strong_count(&entries[&id].copy.ciphertext.inner) != 1 {
+                if !entries[&id].copy.ciphertext.exclusive() {
                     continue;
                 }
                 if let Some(entry) = entries.remove(&id) {
@@ -1782,7 +1870,7 @@ impl MemoryCache {
             }
             *self.ciphertext_cursor.borrow_mut() = Some(id.clone());
             if cache.is_some_and(|c| c != &id.version.object.cache)
-                || Arc::strong_count(&entries[&id].copy.ciphertext.inner) != 1
+                || !entries[&id].copy.ciphertext.exclusive()
             {
                 continue;
             }
@@ -1793,9 +1881,9 @@ impl MemoryCache {
         released
     }
 }
-/// No owner outside the cache shares the retained ciphertext.
+/// No pinning handle outside the cache shares the retained ciphertext.
 fn idle(entry: &CachedPage) -> bool {
-    Arc::strong_count(&entry.ciphertext.inner) == 1
+    entry.ciphertext.exclusive()
 }
 
 #[cfg(test)]
@@ -2982,6 +3070,54 @@ pub(crate) mod tests {
                 assert!(entries.order.is_empty() && entries.ticks.is_empty());
                 drop(entries);
                 assert_eq!(admission.used(ResourceClass::Plaintext), 0);
+            }
+
+            #[test]
+            fn pinned_readers_keep_entries_busy_and_unpinned_observers_do_not() {
+                let admission = admission(8);
+                let cache = MemoryCache::new(
+                    BufferPool::new(admission.clone()),
+                    crate::test_support::availability(),
+                );
+                let start = std::time::Instant::now();
+                let pinned = publish(&cache, &admission, "pinned");
+                let observed = publish(&cache, &admission, "observed");
+                let cipher = publish_ciphertext(&cache, &admission, "cipher");
+                let page = |id: &PageId| cache.entries.borrow().pages[id].1.ciphertext.clone();
+                let reader = page(&pinned);
+                assert_eq!(reader.pins(), 2);
+                let clone = reader.clone();
+                assert_eq!(reader.pins(), 3);
+                drop(clone);
+                assert_eq!(reader.pins(), 2);
+                let observer = page(&observed).unpinned();
+                assert_eq!(observer.pins(), 1);
+                let observer_clone = observer.clone();
+                assert_eq!(observer.pins(), 1);
+                drop(observer_clone);
+                let cipher_observer = cache.ciphertext_entries.borrow()[&cipher]
+                    .copy
+                    .ciphertext
+                    .unpinned();
+                assert_eq!(
+                    expire_through(
+                        &cache,
+                        start,
+                        racer_core::cache::IDLE_TTL + racer_core::cache::EXPIRY_CHECKPOINT
+                    ),
+                    2
+                );
+                // The pinned reader keeps its entry; observers do not.
+                assert!(cache.entries.borrow().pages.contains_key(&pinned));
+                assert!(!cache.entries.borrow().pages.contains_key(&observed));
+                assert!(!cache.ciphertext_entries.borrow().contains_key(&cipher));
+                // Observers still keep the bytes readable after eviction.
+                assert_eq!(observer.pins(), 0);
+                assert!(!observer.bytes().is_empty());
+                assert!(!cipher_observer.bytes().is_empty());
+                drop((observer, cipher_observer));
+                drop(reader);
+                assert_eq!(page(&pinned).pins(), 2);
             }
 
             #[test]

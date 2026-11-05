@@ -69,8 +69,10 @@ pub(crate) fn page(byte: u8) -> crate::memory::PageResult {
             }),
         },
         ciphertext: CiphertextPage {
+            pinned: true,
             provenance: None,
             inner: Arc::new(CiphertextBytes {
+                pins: Default::default(),
                 envelope: PageEnvelope {
                     cipher: crate::model::PageCipher::Xaes256Gcm,
                     page,
@@ -1929,8 +1931,10 @@ mod flight {
                 }),
             },
             ciphertext: CiphertextPage {
+                pinned: true,
                 provenance: None,
                 inner: Arc::new(CiphertextBytes {
+                    pins: Default::default(),
                     envelope: PageEnvelope {
                         cipher: crate::model::PageCipher::Xaes256Gcm,
                         page,

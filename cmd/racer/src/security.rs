@@ -769,8 +769,10 @@ impl PageCryptoEngine {
                             .shrink(bytes.capacity())
                             .expect("validated crypto capacity");
                         CiphertextPage {
+                            pinned: true,
                             provenance: None,
                             inner: Arc::new(CiphertextBytes {
+                                pins: Default::default(),
                                 envelope,
                                 storage: flow_control::ChargedBytes {
                                     bytes: std::mem::take(&mut *bytes),
@@ -4730,8 +4732,10 @@ mod tests {
                 panic!("reserve");
             };
             let cipher = CiphertextPage {
+                pinned: true,
                 provenance: None,
                 inner: Arc::new(CiphertextBytes {
+                    pins: Default::default(),
                     envelope: descriptor.clone(),
                     storage: flow_control::ChargedBytes {
                         bytes,

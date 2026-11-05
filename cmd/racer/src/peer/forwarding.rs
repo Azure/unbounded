@@ -1057,8 +1057,10 @@ mod tests {
     use std::time::Instant;
     fn wire_ciphertext(envelope: PageEnvelope, length: usize) -> crate::memory::CiphertextPage {
         crate::memory::CiphertextPage {
+            pinned: true,
             provenance: None,
             inner: Arc::new(crate::memory::CiphertextBytes {
+                pins: Default::default(),
                 envelope,
                 storage: flow_control::ChargedBytes {
                     bytes: vec![0; length],

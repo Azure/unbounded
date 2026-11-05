@@ -2637,7 +2637,7 @@ impl Fill {
     /// charge for their current capacity.
     fn selected_capacity(&self, ciphertext: &crate::memory::CiphertextPage) -> usize {
         let capacity = ciphertext.inner.capacity();
-        if !ciphertext.is_registered() && Arc::strong_count(&ciphertext.inner) == 1 {
+        if !ciphertext.is_registered() && ciphertext.exclusive() {
             return capacity;
         }
         self.dependencies

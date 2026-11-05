@@ -1159,7 +1159,7 @@ impl StoreWriter {
         let mut pending = self.pending.borrow_mut();
         if pending.get(id).is_some_and(|dirty| {
             std::sync::Arc::ptr_eq(&dirty.page.ciphertext.inner, &ciphertext.inner)
-                && std::sync::Arc::strong_count(&ciphertext.inner) == 2
+                && ciphertext.pins() == 2
         }) {
             queue.remove(position);
             let dirty = pending.remove(id).expect("located queued copy");
@@ -1248,7 +1248,7 @@ impl StoreWriter {
             }
             if let Some(dirty) = pending.remove(&id) {
                 released = released.saturating_add(dirty.staging_bytes());
-                if std::sync::Arc::strong_count(&dirty.page.ciphertext.inner) == 1 {
+                if dirty.page.ciphertext.exclusive() {
                     released =
                         released.saturating_add(dirty.page.ciphertext.inner.reservation().amount());
                 }

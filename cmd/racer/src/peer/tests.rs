@@ -640,8 +640,10 @@ mod destination_disconnect {
                 }),
             },
             ciphertext: CiphertextPage {
+                pinned: true,
                 provenance: None,
                 inner: Arc::new(CiphertextBytes {
+                    pins: Default::default(),
                     envelope: PageEnvelope {
                         cipher: crate::model::PageCipher::Xaes256Gcm,
                         page: page.clone(),
