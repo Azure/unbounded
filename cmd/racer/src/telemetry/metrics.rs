@@ -583,7 +583,8 @@ impl Metrics {
         self.cache_disks.replace(self.shard, samples);
     }
 
-    fn write_cache_disks(&self, out: &mut impl Write) -> std::fmt::Result {
+    /// Per-cache disk totals across workers, sorted by cache name.
+    fn cache_disk_totals(&self) -> Vec<(Arc<str>, u64, u64)> {
         let mut totals = std::collections::BTreeMap::<Arc<str>, (u64, u64)>::new();
         for shard in self.cache_disks.snapshots() {
             for sample in shard {
@@ -592,17 +593,33 @@ impl Metrics {
                 total.1 = total.1.saturating_add(sample.share);
             }
         }
+        totals
+            .into_iter()
+            .map(|(cache, (resident, share))| (cache, resident, share))
+            .collect()
+    }
+
+    #[cfg(test)]
+    fn write_cache_disks(&self, out: &mut impl Write) -> std::fmt::Result {
+        let totals = self.cache_disk_totals();
         if !totals.is_empty() {
             for metric in CACHE_DISK_METRICS {
                 writeln!(out, "# TYPE {metric} gauge")?;
             }
         }
-        for (cache, (resident, share)) in totals {
-            for (metric, value) in CACHE_DISK_METRICS.into_iter().zip([resident, share]) {
-                write!(out, "{metric}{{cache=\"")?;
-                write_disk_label(out, &cache)?;
-                writeln!(out, "\"}} {value}")?;
-            }
+        totals
+            .iter()
+            .try_for_each(|item| Self::write_cache_disk(out, item))
+    }
+
+    fn write_cache_disk(
+        out: &mut impl Write,
+        (cache, resident, share): &(Arc<str>, u64, u64),
+    ) -> std::fmt::Result {
+        for (metric, value) in CACHE_DISK_METRICS.into_iter().zip([*resident, *share]) {
+            write!(out, "{metric}{{cache=\"")?;
+            write_disk_label(out, cache)?;
+            writeln!(out, "\"}} {value}")?;
         }
         Ok(())
     }
@@ -884,15 +901,23 @@ impl Metrics {
     /// The destination is bounded by the diagnostic server; no intermediate String.
     /// Relaxed per-series observations are not a coherent snapshot of all workers.
     pub fn write_prometheus(&self, out: &mut impl std::fmt::Write) -> std::fmt::Result {
-        self.core.write_prometheus(out)?;
-        self.write_retention(out)?;
-        self.write_held(out)?;
-        self.write_disks(out)?;
-        self.write_memory(out)?;
-        self.write_worker_pools(out)?;
-        self.write_cache_disks(out)?;
-        self.gpu.write(out)?;
-        self.prefetch.write(out)?;
+        let mut exposition = self.exposition();
+        while exposition.next(out)? {}
+        Ok(())
+    }
+
+    /// A resumable exposition written one bounded piece at a time, so the
+    /// diagnostic server can stream it without a fixed body cap. Pieces are
+    /// fixed sections, except per-cache series, which are one piece per cache.
+    pub(crate) fn exposition(&self) -> Exposition<'_> {
+        Exposition {
+            metrics: self,
+            stage: 0,
+            caches: None,
+        }
+    }
+
+    fn write_quotas(&self, out: &mut impl std::fmt::Write) -> std::fmt::Result {
         // Quota labels use runtime worker IDs. Read the authority's actual charge,
         // including pooled ciphertext capacity, without sampling on worker polls.
         // A stalled worker therefore remains observable from another worker.
@@ -928,6 +953,64 @@ impl Metrics {
             }
         }
         Ok(())
+    }
+}
+
+/// Resumable `/metrics` writer. A failed piece leaves the state unchanged,
+/// so the caller can retry it with fresh space.
+pub(crate) struct Exposition<'a> {
+    metrics: &'a Metrics,
+    stage: usize,
+    /// Per-cache totals, captured once when the cache section starts.
+    caches: Option<Vec<(Arc<str>, u64, u64)>>,
+}
+
+impl Exposition<'_> {
+    /// Fixed sections before the per-cache series.
+    const HEAD: usize = 6;
+    /// Fixed sections after the per-cache series.
+    const TAIL: usize = 3;
+
+    /// Write the next piece; `Ok(true)` while more remain.
+    pub(crate) fn next(
+        &mut self,
+        out: &mut impl Write,
+    ) -> std::result::Result<bool, std::fmt::Error> {
+        let metrics = self.metrics;
+        match self.stage {
+            0 => metrics.core.write_prometheus(out)?,
+            1 => metrics.write_retention(out)?,
+            2 => metrics.write_held(out)?,
+            3 => metrics.write_disks(out)?,
+            4 => metrics.write_memory(out)?,
+            5 => metrics.write_worker_pools(out)?,
+            stage => {
+                let caches = self
+                    .caches
+                    .get_or_insert_with(|| metrics.cache_disk_totals());
+                // Stage HEAD writes the type lines, then one stage per cache.
+                let cache = stage - Self::HEAD;
+                if cache == 0 {
+                    if !caches.is_empty() {
+                        for metric in CACHE_DISK_METRICS {
+                            writeln!(out, "# TYPE {metric} gauge")?;
+                        }
+                    }
+                } else if let Some(item) = caches.get(cache - 1) {
+                    Metrics::write_cache_disk(out, item)?;
+                } else {
+                    match cache - 1 - caches.len() {
+                        0 => metrics.gpu.write(out)?,
+                        1 => metrics.prefetch.write(out)?,
+                        _ => metrics.write_quotas(out)?,
+                    }
+                }
+                self.stage += 1;
+                return Ok(stage - Self::HEAD < caches.len() + Self::TAIL);
+            }
+        }
+        self.stage += 1;
+        Ok(true)
     }
 }
 

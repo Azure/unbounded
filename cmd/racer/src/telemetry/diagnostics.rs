@@ -128,6 +128,20 @@ impl Handler for DiagnosticHandler<'_> {
         self.telemetry.metrics.record(event, 1);
     }
 
+    fn stream<'a>(&'a self, path: &str) -> Option<(Response, Box<dyn server::TextStream + 'a>)> {
+        if path != "/metrics" {
+            return None;
+        }
+        let telemetry = self.telemetry;
+        let now = telemetry.failures.now();
+        let ready = !self.admission.is_stopped() && telemetry.health.ready_at(now);
+        telemetry.metrics.record(Event::DiagnosticMetrics, 1);
+        Some((
+            Response::Metrics,
+            Box::new(MetricsStream::new(telemetry, ready, now)),
+        ))
+    }
+
     fn binary(
         &self,
         path: &str,
@@ -142,6 +156,43 @@ impl Handler for DiagnosticHandler<'_> {
             return Some(hardware_request(self.telemetry, self.hardware));
         }
         profile_request(self.telemetry.profiling.as_ref(), path)
+    }
+}
+
+/// `/metrics` as resumable pieces: the registry exposition, then health.
+struct MetricsStream<'a> {
+    telemetry: &'a Telemetry,
+    exposition: Option<super::metrics::Exposition<'a>>,
+    ready: bool,
+    now: Instant,
+}
+
+impl<'a> MetricsStream<'a> {
+    fn new(telemetry: &'a Telemetry, ready: bool, now: Instant) -> Self {
+        Self {
+            telemetry,
+            exposition: Some(telemetry.metrics.exposition()),
+            ready,
+            now,
+        }
+    }
+}
+
+impl server::TextStream for MetricsStream<'_> {
+    fn next(&mut self, mut out: &mut dyn Write) -> std::result::Result<bool, std::fmt::Error> {
+        if let Some(exposition) = &mut self.exposition {
+            if !exposition.next(&mut out)? {
+                self.exposition = None;
+            }
+            return Ok(true);
+        }
+        writeln!(
+            out,
+            "# TYPE racer_ready gauge\nracer_ready {}\n# TYPE racer_live gauge\nracer_live {}",
+            u8::from(self.ready),
+            u8::from(self.telemetry.health.live_at(self.now))
+        )?;
+        Ok(false)
     }
 }
 
@@ -443,13 +494,8 @@ pub(super) fn get(
     };
     telemetry.metrics.record(event, 1);
     if path == "/metrics" {
-        telemetry.metrics.write_prometheus(&mut output)?;
-        writeln!(
-            output,
-            "# TYPE racer_ready gauge\nracer_ready {}\n# TYPE racer_live gauge\nracer_live {}",
-            u8::from(ready),
-            u8::from(telemetry.health.live_at(now))
-        )?;
+        let mut stream = MetricsStream::new(telemetry, ready, now);
+        while server::TextStream::next(&mut stream, output)? {}
     } else if path == "/debug/membership" {
         match telemetry.membership.get().and_then(|read| read().ok()) {
             Some(state) => state.write(&mut output)?,
@@ -659,14 +705,15 @@ mod tests {
                         Err(error) => panic!("{error}"),
                     }
                 }
-                let mut bytes = [0; 512];
+                let mut bytes = vec![0; 64 * 1024];
                 match socket.read(&mut bytes) {
                     Ok(0) => break,
                     Ok(count) => response.extend_from_slice(&bytes[..count]),
                     Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => (),
                     Err(error) => panic!("{error}"),
                 }
-                assert!(response.len() <= MAX_RESPONSE_BYTES);
+                // Streamed `/metrics` may exceed one buffer; still bound runaway output.
+                assert!(response.len() <= 16 * MAX_RESPONSE_BYTES);
             }
             response
         }
@@ -697,16 +744,36 @@ mod tests {
                 "{text}"
             );
             let (head, actual_body) = text.split_once("\r\n\r\n").unwrap();
-            let length: usize = head
-                .lines()
-                .find_map(|line| line.strip_prefix("Content-Length: "))
-                .unwrap()
-                .parse()
-                .unwrap();
-            assert_eq!(actual_body.len(), length);
+            let actual_body = if head.contains("Transfer-Encoding: chunked") {
+                assert!(!head.contains("Content-Length"));
+                dechunk(actual_body)
+            } else {
+                let length: usize = head
+                    .lines()
+                    .find_map(|line| line.strip_prefix("Content-Length: "))
+                    .unwrap()
+                    .parse()
+                    .unwrap();
+                assert_eq!(actual_body.len(), length);
+                actual_body.to_owned()
+            };
             assert!(head.contains("Connection: close"));
             if let Some(body) = body {
                 assert_eq!(actual_body, body);
+            }
+        }
+        /// Decode a complete chunked body, requiring its terminating chunk.
+        fn dechunk(mut chunked: &str) -> String {
+            let mut body = String::new();
+            loop {
+                let (size, rest) = chunked.split_once("\r\n").unwrap();
+                let size = usize::from_str_radix(size, 16).unwrap();
+                if size == 0 {
+                    assert_eq!(rest, "\r\n");
+                    return body;
+                }
+                body.push_str(&rest[..size]);
+                chunked = rest[size..].strip_prefix("\r\n").unwrap();
             }
         }
         fn good_resources() -> crate::telemetry::Resources {
@@ -732,8 +799,15 @@ mod tests {
             );
             let bytes = exchange_raw(address, request.as_bytes(), &mut server, &reactor);
             assert_response(&bytes, "200 OK", None);
-            assert!(bytes.len() < MAX_RESPONSE_BYTES);
-            let text = std::str::from_utf8(&bytes).unwrap().to_owned();
+            // Keep the head, but decode a streamed body.
+            let raw = std::str::from_utf8(&bytes).unwrap();
+            let (head, body) = raw.split_once("\r\n\r\n").unwrap();
+            let text = if head.contains("Transfer-Encoding: chunked") {
+                format!("{head}\r\n\r\n{}", dechunk(body))
+            } else {
+                assert!(bytes.len() < MAX_RESPONSE_BYTES);
+                raw.to_owned()
+            };
             assert!(!text.contains("synthetic"));
             finish(server, &scope, &reactor);
             text
@@ -1727,10 +1801,11 @@ mod tests {
             finish(server, &scope, &reactor);
         }
 
-        /// Estimated largest catalog: key bundles are capped at
-        /// `racer_control_wire::MAX_BUNDLE_BYTES` (768 KiB), which holds
-        /// about 624 caches' keys.
-        const MAX_METRIC_CACHES: usize = 624;
+        /// Largest catalog the control plane can key: one retained page key
+        /// per cache gives the most caches that fit a key bundle.
+        fn max_metric_caches() -> usize {
+            racer_cluster_control::rules::keyring::catalog_capacity(1)
+        }
 
         #[test]
         fn metrics_http_response_exports_worker_quotas_with_bounded_output() {
@@ -1819,7 +1894,20 @@ mod tests {
             });
             // Every cache-labeled series at the maximum catalog, with
             // maximum-length names and values, spread across all workers.
-            let caches: Vec<_> = (0..MAX_METRIC_CACHES)
+            let max_caches = max_metric_caches();
+            assert!(max_caches >= 1000, "{max_caches}");
+            // GPU helper and prefetch families at their full fixed cardinality.
+            telemetry
+                .metrics
+                .gpu()
+                .attach_helper(crate::gpu::testing::helper(&[None, None]));
+            for priority in crate::prefetch::Priority::ALL {
+                telemetry
+                    .metrics
+                    .prefetch()
+                    .demand_wait(priority, Duration::MAX);
+            }
+            let caches: Vec<_> = (0..max_caches)
                 .map(|index| crate::telemetry::CacheDiskUsage {
                     cache: format!("{index:04}{}", "a".repeat(249)).into(),
                     resident: u64::MAX,
@@ -1832,14 +1920,15 @@ mod tests {
             let text = diagnostic_text(&telemetry, "/metrics");
             assert!(text.contains(&format!(
                 "racer_cache_disk_share_bytes{{cache=\"{:04}{}\"}}",
-                MAX_METRIC_CACHES - 1,
+                max_caches - 1,
                 "a".repeat(249)
             )));
+            assert!(text.contains("racer_gpu_cufile_enabled "));
+            assert!(text.contains("racer_gpu_staging_slots_free{ordinal=\"1\"}"));
             assert!(
-                text.len() < ::telemetry::server::MAX_BODY_BYTES,
-                "{} bytes",
-                text.len()
+                text.contains("racer_prefetch_demand_wait_seconds_count{priority=\"high\"} 1\n")
             );
+            assert!(text.ends_with("racer_live 1\n") || text.ends_with("racer_live 0\n"));
             for name in [
                 "racer_admission_used{class=\"ordinary_outbound_connection\"}",
                 "racer_staging_pool_trimmed_total ",
@@ -1848,7 +1937,6 @@ mod tests {
             ] {
                 assert!(text.contains(name), "{name}");
             }
-            assert!(text.len() < MAX_RESPONSE_BYTES);
             for (name, kind) in crate::telemetry::RETENTION_METRICS
                 .into_iter()
                 .chain(crate::telemetry::HELD_METRICS)
@@ -1890,6 +1978,24 @@ mod tests {
                     .count(),
                 6 * 64
             );
+            // Streaming has no fixed body cap: several times the largest
+            // catalog still scrapes completely over HTTP.
+            let caches: Vec<_> = (0..4 * max_caches)
+                .map(|index| crate::telemetry::CacheDiskUsage {
+                    cache: format!("{index:05}{}", "b".repeat(248)).into(),
+                    resident: u64::MAX,
+                    share: u64::MAX,
+                })
+                .collect();
+            workers[0].observe_cache_disks(caches);
+            let text = diagnostic_text(&telemetry, "/metrics");
+            assert!(text.len() > MAX_RESPONSE_BYTES, "{} bytes", text.len());
+            assert!(text.contains(&format!(
+                "racer_cache_disk_resident_bytes{{cache=\"{:05}{}\"}}",
+                4 * max_caches - 1,
+                "b".repeat(248)
+            )));
+            assert!(text.ends_with("racer_live 1\n") || text.ends_with("racer_live 0\n"));
             struct Small(usize);
             impl std::fmt::Write for Small {
                 fn write_str(&mut self, text: &str) -> std::fmt::Result {
