@@ -126,9 +126,9 @@ type migrationEnv struct {
 	ReadConfig func(log *slog.Logger, mode isolation.Mode, slot string) (*ActiveMachine, error)
 	// WaitReady waits for the node stack of slot in mode to be up on the host.
 	WaitReady func(ctx context.Context, log *slog.Logger, mode isolation.Mode, slot string) error
-	// Preflight checks the target mode's host requirements without changing
-	// anything.
-	Preflight func(ctx context.Context, log *slog.Logger, mode isolation.Mode) error
+	// Preflight checks the target mode's host requirements for a change by
+	// strategy, without changing anything.
+	Preflight func(ctx context.Context, log *slog.Logger, mode isolation.Mode, strategy migrate.Strategy) error
 	// ReadAttest reads the recorded attestation settings.
 	ReadAttest func() (*provision.AgentAttestConfig, error)
 	// ProbeToken asks the API server whether it accepts a bootstrap token.
@@ -282,12 +282,12 @@ func (e *migrationEnv) waitReady(ctx context.Context, log *slog.Logger, mode iso
 	return nodestart.WaitForKubelet(log, slot).Do(ctx)
 }
 
-func (e *migrationEnv) preflight(ctx context.Context, log *slog.Logger, mode isolation.Mode) error {
+func (e *migrationEnv) preflight(ctx context.Context, log *slog.Logger, mode isolation.Mode, strategy migrate.Strategy) error {
 	if e.Preflight != nil {
-		return e.Preflight(ctx, log, mode)
+		return e.Preflight(ctx, log, mode, strategy)
 	}
 
-	return preflightMigrationTarget(ctx, log, mode)
+	return preflightMigrationTarget(ctx, log, mode, strategy)
 }
 
 func (e *migrationEnv) readAttest() (*provision.AgentAttestConfig, error) {

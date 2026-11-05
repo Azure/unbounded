@@ -118,7 +118,7 @@ func (e *migrationEnv) migrateReprovision(ctx context.Context, log *slog.Logger,
 	}
 
 	// Before any mutation.
-	if err := e.preflight(ctx, log, target); err != nil {
+	if err := e.preflight(ctx, log, target, migrate.Reprovision); err != nil {
 		return err
 	}
 
