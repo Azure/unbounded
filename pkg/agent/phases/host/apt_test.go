@@ -101,3 +101,34 @@ func TestHardenAPT_SkipsWhenAPTUnavailable(t *testing.T) {
 	require.NoFileExists(t, aptPath)
 	require.NoFileExists(t, nrPath)
 }
+
+func TestRemoveAPTHardening_RemovesBothDropIns(t *testing.T) {
+	dir := t.TempDir()
+	apt := filepath.Join(dir, "apt.conf.d", "99-unbounded-no-restart-systemd")
+	nr := filepath.Join(dir, "needrestart", "conf.d", "99-unbounded.conf")
+
+	harden := &hardenAPT{
+		log: slog.New(slog.DiscardHandler), aptDropInPath: apt, needrestartDropInPath: nr,
+		lookupPath: func(string) (string, error) { return "/usr/bin/apt-get", nil },
+	}
+	require.NoError(t, harden.Do(t.Context()))
+
+	remove := &removeAPTHardening{log: slog.New(slog.DiscardHandler), aptDropInPath: apt, needrestartDropInPath: nr}
+	require.Equal(t, "remove-apt-hardening", remove.Name())
+	require.NoError(t, remove.Do(t.Context()))
+	require.NoFileExists(t, apt)
+	require.NoFileExists(t, nr)
+
+	// Nothing to remove is not an error.
+	require.NoError(t, remove.Do(t.Context()))
+}
+
+func TestRemoveAPTHardening_ReportsAFailedRemoval(t *testing.T) {
+	dir := t.TempDir()
+	// A non-empty directory at the path cannot be removed with os.Remove.
+	blocked := filepath.Join(dir, "blocked")
+	require.NoError(t, os.MkdirAll(filepath.Join(blocked, "child"), 0o755))
+
+	remove := &removeAPTHardening{log: slog.New(slog.DiscardHandler), aptDropInPath: blocked, needrestartDropInPath: filepath.Join(dir, "missing")}
+	require.ErrorContains(t, remove.Do(t.Context()), "blocked")
+}
