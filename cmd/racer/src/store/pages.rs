@@ -11,6 +11,7 @@ use crate::error::Result;
 use crate::model::ObjectVersion;
 use crate::model::PageId;
 use crate::model::VersionMetadata;
+use crate::retention::Payload;
 use crate::runtime::HashMap;
 use page_alloc::SegmentId;
 use page_alloc::Segments;
@@ -85,6 +86,9 @@ struct Inner {
     slots: Interner,
     caches: CacheTable<CacheId>,
     keys: Vec<KeyId>,
+    /// Indexed payload charge of each stored page, released when the
+    /// page leaves the table.
+    charges: Vec<Option<Payload>>,
 }
 
 /// Page table sized at first use; see the module docs.
@@ -149,6 +153,7 @@ impl Inner {
             slots: Interner::with_hasher(slots, hash_key),
             caches: CacheTable::default(),
             keys: vec![KeyId([0; 16]); slots as usize],
+            charges: (0..slots).map(|_| None).collect(),
         })
     }
 }
@@ -207,18 +212,36 @@ impl Pages {
         self.slots = slots;
         self.inner = None;
         self.stored = 0;
-        for (page, entry) in entries {
-            self.insert(page, entry)?;
+        for (page, entry, charge) in entries {
+            self.insert(page.clone(), entry)?;
+            if let Some(charge) = charge {
+                self.charge(&page, charge);
+            }
         }
         Ok(())
     }
 
-    fn drain_all(&mut self) -> Vec<(PageId, IndexedPage)> {
+    /// Attach the indexed payload charge of stored `page`, replacing any
+    /// previous charge. Ignored when `page` is not stored.
+    pub fn charge(&mut self, page: &PageId, charge: Payload) {
+        let Some(inner) = self.inner.as_mut() else {
+            return;
+        };
+        let Some(slot) = inner.slots.get(page) else {
+            return;
+        };
+        if inner.disk.borrow().get(slot).is_some() {
+            inner.charges[slot.0 as usize] = Some(charge);
+        }
+    }
+
+    fn drain_all(&mut self) -> Vec<(PageId, IndexedPage, Option<Payload>)> {
         let Some(inner) = self.inner.as_mut() else {
             return Vec::new();
         };
         let mut disk = inner.disk.borrow_mut();
         disk.age_reset(Walk::Rebuild.cursor());
+        let charges = &mut inner.charges;
         let entries: Vec<_> = disk
             .age_entries(Walk::Rebuild.cursor())
             .map(|(slot, view)| {
@@ -230,6 +253,7 @@ impl Pages {
                         metadata: self.versions[&page.version].0.clone(),
                         key_id: inner.keys[slot.0 as usize],
                     },
+                    charges[slot.0 as usize].take(),
                 )
             })
             .collect();
@@ -430,10 +454,12 @@ impl Pages {
 
     fn forget(
         versions: &mut HashMap<ObjectVersion, (VersionMetadata, usize)>,
+        charges: &mut [Option<Payload>],
         slots: &mut Interner,
         disk: &DiskIndex,
         slot: PageSlot,
     ) {
+        charges[slot.0 as usize] = None;
         let page = slots.key(slot).expect("interned page");
         if let Some((_, count)) = versions.get_mut(&page.version) {
             *count -= 1;
@@ -461,7 +487,13 @@ impl Pages {
         }
         disk.remove(slot).expect("stored page");
         self.stored -= 1;
-        Self::forget(&mut self.versions, &mut inner.slots, &disk, slot);
+        Self::forget(
+            &mut self.versions,
+            &mut inner.charges,
+            &mut inner.slots,
+            &disk,
+            slot,
+        );
         true
     }
 
@@ -491,6 +523,7 @@ impl Pages {
             disk,
             slots,
             caches,
+            charges,
             ..
         } = inner;
         let mut disk = disk.borrow_mut();
@@ -498,7 +531,7 @@ impl Pages {
         caches.drain(&mut disk, usize::MAX, |slot, _| removed.push(slot));
         self.stored -= removed.len();
         for slot in removed {
-            Self::forget(&mut self.versions, slots, &disk, slot);
+            Self::forget(&mut self.versions, charges, slots, &disk, slot);
         }
     }
 
@@ -750,7 +783,7 @@ impl Pages {
         for slot in removed {
             let page = inner.slots.key(slot).expect("interned page");
             evicted(page, &versions[&page.version].0);
-            Self::forget(versions, &mut inner.slots, &disk, slot);
+            Self::forget(versions, &mut inner.charges, &mut inner.slots, &disk, slot);
         }
         drop(disk);
         self.settle();

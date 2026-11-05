@@ -90,9 +90,6 @@ struct State {
     order: VecDeque<ObjectVersion>,
 
     current: HashMap<ObjectId, CurrentVersion>,
-
-    /// Indexed payload charge of each stored page.
-    residents: HashMap<PageId, crate::retention::Payload>,
 }
 impl State {
     fn new(slots: u32) -> Self {
@@ -101,7 +98,6 @@ impl State {
             metadata: HashMap::default(),
             order: VecDeque::new(),
             current: HashMap::default(),
-            residents: HashMap::default(),
         }
     }
 }
@@ -797,8 +793,7 @@ impl Index {
             availability,
             reserved: Cell::new(0),
             retention: RefCell::new(Rc::new(
-                Retention::new(256 * 1024, clock.clone())
-                    .expect("valid bounded retention"),
+                Retention::new(256 * 1024, clock.clone()).expect("valid bounded retention"),
             )),
             holds: RefCell::new(super::holds::Holds::new(&clock)),
             key_sweep: Cell::default(),
@@ -888,7 +883,7 @@ impl Index {
         // Startup wiring only: replacing a live policy would invalidate read-side
         // clones and strand the payload charges of stored pages.
         assert!(
-            self.state.borrow().residents.is_empty(),
+            self.state.borrow().pages.len() == 0,
             "install retention before publishing pages"
         );
         *self.retention.borrow_mut() = retention;
@@ -974,7 +969,7 @@ impl Index {
         if inserted != Ok(true) {
             return inserted.map(drop);
         }
-        state.residents.insert(page, payload);
+        state.pages.charge(&page, payload);
         Ok(())
     }
     /// Look in both the standalone catalog and retained page entries for this exact
@@ -1100,9 +1095,7 @@ impl Index {
     }
     pub fn remove_if_matches(&self, page: &PageId, location: &RecordLocation) {
         let mut s = self.state.borrow_mut();
-        if s.pages.remove(page, Some(location)) {
-            s.residents.remove(page);
-        }
+        s.pages.remove(page, Some(location));
     }
     pub fn snapshot(&self) -> Result<IndexSnapshot> {
         let s = self.state.borrow();
@@ -1347,8 +1340,6 @@ impl Index {
             }
         }
         s.pages.remove_caches(caches);
-        s.residents
-            .retain(|page, _| !caches.contains(&page.version.object.cache));
         s.metadata.retain(|v, _| !caches.contains(&v.object.cache));
         s.order.retain(|v| !caches.contains(&v.object.cache));
         s.current.retain(|o, _| !caches.contains(&o.cache));
@@ -1515,10 +1506,8 @@ impl SegmentClock {
                 evicted.push((page.clone(), metadata.page_length(page).unwrap_or(0)));
             },
         );
-        let mut state = self.index.state.borrow_mut();
         for (page, bytes) in evicted {
             retention.evicted(&page, u64::from(bytes));
-            state.residents.remove(&page);
         }
         result
     }
