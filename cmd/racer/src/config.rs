@@ -2199,9 +2199,14 @@ mod tests {
         assert_eq!(config.admission_history_per_worker(8), Ok(512 * 1024));
         for workers in [1, 2, 3, 8, 64] {
             let share = config.admission_history_per_worker(workers).unwrap();
-            let policy =
-                crate::retention::Retention::configured(share, 1, config.admission_period, true)
-                    .unwrap();
+            let policy = crate::retention::Retention::configured(
+                share,
+                1,
+                config.admission_period,
+                true,
+                racer_io::Clock::host(),
+            )
+            .unwrap();
             let allocated = policy.snapshot().filter_bits / 8;
             assert_eq!(allocated, share / 32 * 32);
             assert!(allocated * workers <= config.admission_history_bytes.get());

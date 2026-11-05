@@ -683,7 +683,7 @@ impl Index {
         clock: racer_io::Clock,
     ) -> Self {
         Self {
-            clock,
+            clock: clock.clone(),
             worker,
             metadata_capacity,
             page_capacity: Cell::new(65536),
@@ -692,7 +692,8 @@ impl Index {
             reserved: Cell::new(0),
             residency: Rc::new(Residency {
                 retention: RefCell::new(Rc::new(
-                    Retention::new(256 * 1024, 65536 + 64).expect("valid bounded retention"),
+                    Retention::new(256 * 1024, 65536 + 64, clock.clone())
+                        .expect("valid bounded retention"),
                 )),
                 counts: RefCell::new(HashMap::default()),
             }),
@@ -2517,7 +2518,7 @@ mod tests {
     #[test]
     fn second_sight_heat_capacity_and_failed_restore_leave_existing_residency_intact() {
         let index = index(4);
-        let retention = Rc::new(Retention::new(4096, 1).unwrap());
+        let retention = Rc::new(Retention::new(4096, 1, crate::test_support::clock()).unwrap());
         index.set_retention(retention.clone());
         let (page, entry) = indexed(descriptor("resident", 17), 0);
         index.publish(page.clone(), entry.clone()).unwrap();

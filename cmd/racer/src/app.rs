@@ -1810,6 +1810,7 @@ impl WorkerApplication {
                 .ok_or(Error::InvalidConfiguration)?,
             config.admission_period,
             config.admission_mode == crate::config::AdmissionMode::SecondSight,
+            runtime.reactor.ctx().clock.clone(),
         )?));
         // Disk shares use the same priority table as memory flow control.
         writer

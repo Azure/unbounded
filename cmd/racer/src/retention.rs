@@ -183,6 +183,9 @@ struct Counters {
     share_rejected: AtomicU64,
 }
 pub struct Retention {
+    /// Worker time for history rotation and heat decay.
+    clock: racer_io::Clock,
+
     state: RefCell<State>,
 
     ownership: RefCell<Ownership>,
@@ -266,35 +269,22 @@ struct State {
     heat: Heat<PageId>,
 }
 impl Retention {
-    pub fn new(history_bytes: usize, heat_entries: usize) -> Result<Self> {
-        Self::configured(history_bytes, heat_entries, PERIOD, true)
+    pub fn new(history_bytes: usize, heat_entries: usize, clock: racer_io::Clock) -> Result<Self> {
+        Self::configured(history_bytes, heat_entries, PERIOD, true, clock)
     }
+    /// History rotation starts at the clock's current time.
     pub fn configured(
         history_bytes: usize,
         heat_entries: usize,
         period: Duration,
         enabled: bool,
+        clock: racer_io::Clock,
     ) -> Result<Self> {
-        Self::configured_at(
-            history_bytes,
-            heat_entries,
-            period,
-            enabled,
-            uring_runtime::environment::now(),
-        )
-    }
-    /// [`Retention::configured`] with history rotation starting at `now`.
-    pub fn configured_at(
-        history_bytes: usize,
-        heat_entries: usize,
-        period: Duration,
-        enabled: bool,
-        now: Instant,
-    ) -> Result<Self> {
-        let history =
-            SecondSight::new(history_bytes, period, now).ok_or(Error::InvalidConfiguration)?;
+        let history = SecondSight::new(history_bytes, period, clock.now())
+            .ok_or(Error::InvalidConfiguration)?;
         let heat = Heat::new(heat_entries).ok_or(Error::InvalidConfiguration)?;
         Ok(Self {
+            clock,
             state: RefCell::new(State { history, heat }),
             ownership: RefCell::new(Rc::new(|_| false)),
             ownership_pass: RefCell::new(None),
@@ -510,7 +500,7 @@ impl Retention {
         }
     }
     pub fn observe(&self, page: &PageId, interest: &Interest) -> Observation {
-        self.observe_at(page, interest, uring_runtime::environment::now())
+        self.observe_at(page, interest, self.clock.now())
     }
     /// [`Retention::observe`] at an explicit instant.
     pub fn observe_at(&self, page: &PageId, interest: &Interest, now: Instant) -> Observation {
@@ -542,7 +532,7 @@ impl Retention {
     /// Storage installs/removes heat with resident index mappings. Admission never
     /// replaces another resident's exact heat just because hashes collide.
     pub fn track(&self, page: &PageId) -> bool {
-        self.track_at(page, uring_runtime::environment::now())
+        self.track_at(page, self.clock.now())
     }
     /// [`Retention::track`] at an explicit instant.
     pub fn track_at(&self, page: &PageId, now: Instant) -> bool {
@@ -552,14 +542,14 @@ impl Retention {
         self.state.borrow_mut().heat.forget(page);
     }
     pub fn touch(&self, page: &PageId) {
-        self.touch_at(page, uring_runtime::environment::now());
+        self.touch_at(page, self.clock.now());
     }
     /// [`Retention::touch`] at an explicit instant.
     pub fn touch_at(&self, page: &PageId, now: Instant) {
         self.state.borrow_mut().heat.touch(page, now);
     }
     pub fn score(&self, page: &PageId) -> u8 {
-        self.score_at(page, uring_runtime::environment::now())
+        self.score_at(page, self.clock.now())
     }
     /// [`Retention::score`] at an explicit instant.
     pub fn score_at(&self, page: &PageId, now: Instant) -> u8 {
@@ -655,7 +645,7 @@ impl Retention {
         });
     }
     pub fn snapshot(&self) -> Snapshot {
-        self.snapshot_at(uring_runtime::environment::now())
+        self.snapshot_at(self.clock.now())
     }
     /// [`Retention::snapshot`] with history rotation applied at `now`.
     pub fn snapshot_at(&self, now: Instant) -> Snapshot {
@@ -686,7 +676,7 @@ mod tests {
         use racer_control_wire::CacheDefinition;
         let clock = uring_runtime::environment::SimulationClock::new(52);
         let _environment = clock.environment(0).enter();
-        let policy = Rc::new(Retention::new(4096, 1).unwrap());
+        let policy = Rc::new(Retention::new(4096, 1, crate::test_support::clock()).unwrap());
         let id = |n: &str| CacheId(n.into());
         let def = |n: &str, priority: u16| CacheDefinition {
             id: id(n),
@@ -736,7 +726,7 @@ mod tests {
         use racer_control_wire::CacheDefinition;
         let clock = uring_runtime::environment::SimulationClock::new(53);
         let _environment = clock.environment(0).enter();
-        let policy = Rc::new(Retention::new(4096, 1).unwrap());
+        let policy = Rc::new(Retention::new(4096, 1, crate::test_support::clock()).unwrap());
         let id = |n: &str| CacheId(n.into());
         let def = |n: &str, priority: u16| CacheDefinition {
             id: id(n),
@@ -830,7 +820,7 @@ mod tests {
         use racer_control_wire::CacheDefinition;
         let clock = uring_runtime::environment::SimulationClock::new(59);
         let _environment = clock.environment(0).enter();
-        let policy = Rc::new(Retention::new(4096, 1).unwrap());
+        let policy = Rc::new(Retention::new(4096, 1, crate::test_support::clock()).unwrap());
         let id = |n: usize| CacheId(format!("c{n:04}"));
         let def = |n: usize, priority: u16| CacheDefinition {
             id: id(n),
@@ -933,7 +923,7 @@ mod tests {
     fn scoring_pass_pins_ownership_and_time_and_replacement_clears_factory() {
         let clock = uring_runtime::environment::SimulationClock::new(51);
         let _environment = clock.environment(0).enter();
-        let policy = Retention::new(4096, 1).unwrap();
+        let policy = Retention::new(4096, 1, crate::test_support::clock()).unwrap();
         let owned = Rc::new(Cell::new(true));
         let calls = Rc::new(Cell::new(0));
         policy.set_ownership_pass(Rc::new({
@@ -965,7 +955,8 @@ mod tests {
         policy.set_ownership(Rc::new(|_| true));
         assert_eq!(policy.scoring_at(now, u64::MAX).score(&page(1)), 1);
         assert_eq!(calls.get(), 2);
-        let disabled = Retention::configured(4096, 1, PERIOD, false).unwrap();
+        let disabled =
+            Retention::configured(4096, 1, PERIOD, false, crate::test_support::clock()).unwrap();
         disabled.set_ownership(Rc::new(|_| true));
         assert_eq!(disabled.scoring_at(now, u64::MAX).score(&page(0)), 0);
     }
@@ -983,7 +974,7 @@ mod tests {
     }
     #[test]
     fn disk_observability_samples_current_class_without_scrape_classification() {
-        let policy = Rc::new(Retention::new(4096, 2).unwrap());
+        let policy = Rc::new(Retention::new(4096, 2, crate::test_support::clock()).unwrap());
         let owned = Rc::new(Cell::new(false));
         let current = owned.clone();
         let calls = Rc::new(Cell::new(0));
@@ -1024,7 +1015,7 @@ mod tests {
     }
     #[test]
     fn readers_latch_before_insert_and_retries_do_not_promote() {
-        let policy = Retention::new(32, 1).unwrap();
+        let policy = Retention::new(32, 1, crate::test_support::clock()).unwrap();
         let first = Interest::default();
         assert!(!policy.observe(&page(0), &first).eligible());
         for n in 1..1000 {
@@ -1040,7 +1031,8 @@ mod tests {
     #[test]
     fn rotation_retains_three_to_four_minutes_and_clears_long_idle() {
         for period in [Duration::from_secs(60), Duration::from_millis(10)] {
-            let policy = Retention::configured(4096, 1, period, true).unwrap();
+            let policy =
+                Retention::configured(4096, 1, period, true, crate::test_support::clock()).unwrap();
             let start = uring_runtime::environment::now();
             let first = Interest::default();
             assert!(!policy.observe_at(&page(0), &first, start).eligible());
@@ -1049,7 +1041,8 @@ mod tests {
                     .observe_at(&page(0), &first, start + period * 3)
                     .eligible()
             );
-            let retained = Retention::configured(4096, 1, period, true).unwrap();
+            let retained =
+                Retention::configured(4096, 1, period, true, crate::test_support::clock()).unwrap();
             retained.observe_at(&page(0), &Interest::default(), start);
             assert!(
                 retained
@@ -1065,7 +1058,7 @@ mod tests {
     }
     #[test]
     fn ownership_is_current_and_heat_saturates_then_decays() {
-        let policy = Retention::new(4096, 2).unwrap();
+        let policy = Retention::new(4096, 2, crate::test_support::clock()).unwrap();
         assert!(policy.track(&page(0)));
         assert!(policy.track(&page(1)));
         assert!(!policy.track(&page(2)));
@@ -1088,7 +1081,8 @@ mod tests {
     }
     #[test]
     fn disabled_is_owned_only_and_metrics_count_once() {
-        let policy = Retention::configured(4096, 1, PERIOD, false).unwrap();
+        let policy =
+            Retention::configured(4096, 1, PERIOD, false, crate::test_support::clock()).unwrap();
         for _ in 0..10 {
             assert!(!policy.observe(&page(0), &Interest::default()).eligible());
         }
@@ -1105,11 +1099,14 @@ mod tests {
         assert_eq!(snapshot.persistence_attempts, 2);
         assert_eq!(snapshot.persistence_accepted, 1);
         assert_eq!(snapshot.filter_set_bits, 0);
-        assert!(Retention::configured(4096, 1, Duration::ZERO, true).is_err());
+        assert!(
+            Retention::configured(4096, 1, Duration::ZERO, true, crate::test_support::clock())
+                .is_err()
+        );
     }
     #[test]
     fn full_identity_and_memory_bounds() {
-        let policy = Retention::new(4096, 2).unwrap();
+        let policy = Retention::new(4096, 2, crate::test_support::clock()).unwrap();
         let a = page(0);
         let mut b = a.clone();
         b.version.etag = crate::model::StrongEtag::test_value("v2");
@@ -1125,7 +1122,7 @@ mod tests {
         }
         assert_eq!(policy.snapshot().heat_entries, 2);
         assert_eq!(policy.snapshot().filter_bits, 4096 * 8);
-        assert!(Retention::new(31, 1).is_err());
-        assert!(Retention::new(4096, 0).is_err());
+        assert!(Retention::new(31, 1, crate::test_support::clock()).is_err());
+        assert!(Retention::new(4096, 0, crate::test_support::clock()).is_err());
     }
 }
