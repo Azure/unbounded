@@ -118,11 +118,12 @@ The same-path contract holds, as in every mode; see
 - **NVIDIA GPUs.** The host driver and the NVIDIA Container Toolkit must be
   installed on the host; the agent does not install them in this mode. See
   [Toolkit and CDI in `none` mode]({{< relref "reference/gpu/nvidia#toolkit-and-cdi-in-none-mode" >}}).
-- **Changing the mode.** A node in `none` is installed by a fresh bootstrap. This
-  release does not change the mode of a running node; a declared mode different
-  from the one the node runs is reported as refused in the `IsolationDrift`
-  condition, and repaves go ahead in the current mode. To move a host to or
-  from `none`, run `unbounded-agent reset` and bootstrap it again.
+- **Changing the mode.** A change to or from `none` is a reprovision: at the
+  next repave the agent resets the host and bootstraps it again in the declared
+  mode, and only when the Machine carries the annotation
+  `unbounded-cloud.io/allow-reprovision: "true"`. Without it the change is
+  reported as refused and repaves go ahead in the current mode. See
+  [Changing the mode]({{< relref "reference/agent/isolation#changing-the-mode" >}}).
 
 ## Troubleshooting
 
