@@ -917,6 +917,60 @@ impl DiskIndex {
         Ok(())
     }
 
+    /// Grow the segment table to at least `count` segments.
+    pub fn ensure_segments(&mut self, count: usize) -> Result<()> {
+        if count >= NIL as usize {
+            return Err(Error::InvalidConfiguration);
+        }
+        if self.segments.len() < count {
+            self.segments.resize(
+                count,
+                SegmentMeta {
+                    head: NIL,
+                    ..SegmentMeta::default()
+                },
+            );
+        }
+        Ok(())
+    }
+
+    /// Store a record at a location the caller has already validated (a
+    /// completed catalog write or a checked checkpoint entry), replacing any
+    /// record of `slot`. The segment table grows to cover `segment`. Unlike
+    /// [`Self::restore`], `capacity` is not checked: the caller admits pages.
+    pub fn place(
+        &mut self,
+        slot: PageSlot,
+        cache: CacheKey,
+        segment: SegmentId,
+        generation: Generation,
+        extent: Extent,
+    ) -> Result<Option<Removed>> {
+        self.entry(slot)?;
+        if !self.live(cache) {
+            return Err(Error::Stale);
+        }
+        let index = usize::try_from(segment.0).map_err(|_| Error::Corrupt)?;
+        if u32::try_from(extent.length()).is_err() {
+            return Err(Error::Corrupt);
+        }
+        self.ensure_segments(index.checked_add(1).ok_or(Error::Corrupt)?)
+            .map_err(|_| Error::Corrupt)?;
+        let previous = self.entries[slot.0 as usize]
+            .stored()
+            .then(|| self.unstore(slot));
+        self.store(
+            slot,
+            cache.idx,
+            RecordLocation {
+                segment,
+                generation,
+                extent,
+            },
+        );
+        Ok(previous)
+    }
+
     // ---- holds ----
 
     /// Hold `slots` until `until`. Held stored records keep their segments
@@ -1321,6 +1375,39 @@ mod tests {
         assert_eq!(index.age_seek(a, PageSlot(9)), Err(Error::Stale));
         assert_eq!(
             index.age_seek(AgeCursor(AGE_CURSORS as u8), PageSlot(3)),
+            Err(Error::InvalidConfiguration)
+        );
+    }
+
+    #[test]
+    fn place_grows_segments_replaces_and_rejects_stale_caches() {
+        let mut index = DiskIndex::new(4, 1, 1).unwrap();
+        let cache = index.add_cache(CacheIdx(0)).unwrap();
+        let extent = Extent::new(0, 512).unwrap();
+        assert_eq!(
+            index.place(PageSlot(0), cache, SegmentId(3), Generation(1), extent),
+            Ok(None)
+        );
+        // Capacity belongs to the caller; a second slot still places.
+        index
+            .place(PageSlot(1), cache, SegmentId(0), Generation(1), extent)
+            .unwrap();
+        let removed = index
+            .place(PageSlot(0), cache, SegmentId(2), Generation(4), extent)
+            .unwrap()
+            .unwrap();
+        assert_eq!(removed.location.segment(), SegmentId(3));
+        assert_eq!(index.segment_usage(SegmentId(3)), (0, 0));
+        assert_eq!(index.segment_usage(SegmentId(2)), (1, 512));
+        assert_eq!(index.len(), 2);
+        index.check_invariants();
+        assert!(index.remove_cache(cache, 8, |_, _| {}).unwrap());
+        assert_eq!(
+            index.place(PageSlot(0), cache, SegmentId(0), Generation(1), extent),
+            Err(Error::Stale)
+        );
+        assert_eq!(
+            index.place(PageSlot(9), cache, SegmentId(0), Generation(1), extent),
             Err(Error::InvalidConfiguration)
         );
     }
