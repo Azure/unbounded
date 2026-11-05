@@ -200,3 +200,20 @@ fn replays_exactly() {
     }
     assert_ne!(run("full-churn", 3).0.trace, run("full-churn", 4).0.trace);
 }
+
+/// racer-sim `failover_drops_the_dead_member`: the Pod crashed for good at `d / 2 + 5 s` leaves
+/// the membership once its Node has been not ready for the grace, so peers stop choosing it.
+#[test]
+fn failover_drops_the_dead_member() {
+    let r = quick("full-failover", 200, 300, 1, 0.2);
+    assert_clean(&r);
+    assert!(counter(&r, "dead_member_links") > 0, "{}", r["metrics"]);
+    // Node monitor grace 40 s, readiness grace 30 s, one 10 s pass, plus client propagation.
+    let age = counter(&r, "dead_member_link_age_max_s");
+    assert!(age <= 90, "{age}");
+    assert!(
+        ctl_counter(&r, "ctl_commits") > 0 && counter(&r, "membership_publications") >= 2,
+        "{}",
+        r["metrics"]["counters"]
+    );
+}

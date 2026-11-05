@@ -554,6 +554,8 @@ struct Node {
     detours: Detours<u32>,
     /// Crashed and not yet restarted: its peer server takes no connections.
     down: bool,
+    /// When it last crashed.
+    down_at: Nanos,
 }
 
 /// When an acquisition started, and how its walk probes ended.
@@ -879,6 +881,7 @@ impl<'s> Model<'s> {
                 pings: 0,
                 detours: Detours::new(SILENCE_CAPACITY),
                 down: false,
+                down_at: 0,
             })
             .collect();
         Self {
@@ -1283,6 +1286,7 @@ impl<'s> Model<'s> {
                     F::Crash { node } => {
                         self.report.counters.crashes += 1;
                         self.nodes[node as usize].down = true;
+                        self.nodes[node as usize].down_at = now;
                         // The process loses its memory. The Model has one page tier, so every
                         // stored page goes with it (racer-sim drops a crashed node's memory
                         // pages; production recovers only its last checkpoint).
@@ -2543,6 +2547,12 @@ impl<'s> Model<'s> {
         let cut = self.cut(holder, next);
         if cut {
             let why = if self.nodes[next as usize].down {
+                // A peer chose a crashed member (racer-sim `dead_member_links`): how long after
+                // the crash.
+                let age = (now - self.nodes[next as usize].down_at) / SECONDS;
+                let c = &mut self.report.counters;
+                c.dead_member_links += 1;
+                c.dead_member_link_age_max_s = c.dead_member_link_age_max_s.max(age);
                 Cut::Down
             } else {
                 Cut::Partition
