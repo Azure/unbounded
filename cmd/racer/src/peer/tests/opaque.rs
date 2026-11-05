@@ -639,7 +639,7 @@ mod safety {
         }
         let poll_crypto = || {
             for engine in engines.borrow_mut().iter_mut() {
-                uring_runtime::group::Service::poll_budgeted(
+                crate::lifecycle::Service::poll_budgeted(
                     engine,
                     &mut std::task::Context::from_waker(futures::task::noop_waker_ref()),
                     8,

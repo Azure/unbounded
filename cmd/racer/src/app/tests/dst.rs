@@ -3,6 +3,8 @@
 
 use crate::admission::ResourceClass;
 use crate::app::*;
+#[cfg(test)]
+use crate::lifecycle::Service;
 use crate::model::PAGE_BYTES;
 use crate::model::*;
 use racer_control_wire as wire;
@@ -18,8 +20,6 @@ use std::collections::BTreeMap;
 use std::collections::VecDeque;
 use std::num::NonZeroUsize;
 use uring_runtime::environment::SimulationClock;
-#[cfg(test)]
-use uring_runtime::group::Service;
 use uring_runtime::reactor::SocketAddress;
 use uring_runtime::reactor::descriptor::Descriptor;
 use uring_runtime::reactor::simulation::Fault;
@@ -2213,7 +2213,7 @@ struct Node {
 struct LocalWorker {
     app: WorkerApplication,
     runtime: WorkerRuntime,
-    crypto: Box<dyn uring_runtime::group::Service<RequestScope>>,
+    crypto: Box<dyn crate::lifecycle::Service<RequestScope>>,
 }
 impl Node {
     fn poll(&mut self, budget: usize) {
@@ -3769,7 +3769,7 @@ fn lifecycle(workers: &mut [LocalWorker], scope: &RequestScope, phase: Lifecycle
 }
 fn drive_local<T>(
     runtime: &WorkerRuntime,
-    crypto: &mut dyn uring_runtime::group::Service<RequestScope>,
+    crypto: &mut dyn crate::lifecycle::Service<RequestScope>,
     mut operation: Operation<'_, T>,
 ) -> Result<T> {
     for _ in 0..MAX_TURNS {

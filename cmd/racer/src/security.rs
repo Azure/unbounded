@@ -752,7 +752,7 @@ impl PageCryptoEngine {
             .map_err(Into::into)
     }
 }
-impl uring_runtime::group::Service<RequestScope> for PageCryptoEngine {
+impl crate::lifecycle::Service<RequestScope> for PageCryptoEngine {
     fn register_driver(&self, waker: &std::task::Waker) {
         self.runtime.port.register_driver(waker);
     }
@@ -1650,10 +1650,10 @@ impl CryptoClient {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::lifecycle::Service;
     use crate::model::*;
     use racer_control_wire::CacheId;
     use racer_control_wire::KeyId;
-    use uring_runtime::group::Service;
 
     /// Publication retries reset only queue timing, not execution or ownership.
     #[test]

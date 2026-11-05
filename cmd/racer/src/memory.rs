@@ -2060,6 +2060,7 @@ pub(crate) mod tests {
     /// Owner and reclamation contracts over real allocations.
     mod owners {
         use super::*;
+        use crate::lifecycle::Service;
         use crate::model::CacheKey;
         use crate::model::ObjectId;
         use crate::model::RequestId;
@@ -2075,7 +2076,6 @@ pub(crate) mod tests {
         use std::task::Context;
         use std::time::Duration;
         use std::time::Instant;
-        use uring_runtime::group::Service;
 
         const PLAIN: usize = PAGE_BYTES as usize;
         /// Pooled ciphertext charge for one full page: its tag rounds up a granule.

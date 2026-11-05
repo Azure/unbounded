@@ -11,11 +11,24 @@
 //! must permit progress when both threads share one CPU.
 
 use crate::admission::AdmissionPolicy;
+use crate::affinity::CpuLocation;
+use crate::affinity::EffectiveTopology;
+use crate::affinity::NicLocality;
+#[cfg(test)]
+use crate::affinity::current_cpus;
 use crate::config::Config;
 use crate::config::Limits;
 use crate::error::Error;
 use crate::error::Operation;
 use crate::error::Result;
+use crate::lifecycle::Factory;
+use crate::lifecycle::FailureReporter;
+use crate::lifecycle::Group;
+use crate::lifecycle::Helper;
+use crate::lifecycle::Lane;
+use crate::lifecycle::Plan;
+use crate::lifecycle::Service;
+use crate::lifecycle::drive_local_with;
 use crate::model::RequestId;
 use crate::model::WorkerId;
 use crate::runtime::Reactor;
@@ -41,23 +54,10 @@ use std::task::Waker;
 use std::time::Duration;
 #[cfg(test)]
 use std::time::Instant;
-use uring_runtime::drivers::drive_local_with;
-use uring_runtime::group::Factory;
-use uring_runtime::group::FailureReporter;
-use uring_runtime::group::Group;
-use uring_runtime::group::Helper;
-use uring_runtime::group::Lane;
-use uring_runtime::group::Plan;
-use uring_runtime::group::Service;
-use uring_runtime::group::affinity::CpuLocation;
-use uring_runtime::group::affinity::EffectiveTopology;
-use uring_runtime::group::affinity::NicLocality;
-#[cfg(test)]
-use uring_runtime::group::affinity::current_cpus;
 
 #[cfg(test)]
-use uring_runtime::group::IDLE_WAIT;
-use uring_runtime::group::WORK_BUDGET;
+use crate::lifecycle::IDLE_WAIT;
+use crate::lifecycle::WORK_BUDGET;
 /// One I/O shard and its crypto execution placement. Equal crypto CPU IDs identify
 /// the same execution thread. NIC locality never overrides the end-to-end rail.
 #[derive(Clone, Debug)]
@@ -112,7 +112,7 @@ impl AffinityPlan {
                     && (rails.is_empty()
                         || rails.iter().any(|rail| rail.numa_node == nic.numa_node))
             });
-            let pairs = uring_runtime::group::affinity::place_exact(
+            let pairs = crate::affinity::place_exact(
                 topology,
                 config.max_threads,
                 io,
@@ -154,21 +154,17 @@ impl AffinityPlan {
             nic.numa_node.is_some()
                 && (rails.is_empty() || rails.iter().any(|rail| rail.numa_node == nic.numa_node))
         });
-        let pairs = uring_runtime::group::affinity::place(
-            topology,
-            max_threads,
-            usize::from(u16::MAX) + 1,
-            allow_smt,
-        )?
-        .into_iter()
-        .enumerate()
-        .map(|(index, placement)| WorkerPair {
-            worker: WorkerId(index as u16),
-            io: placement.lane,
-            crypto: placement.helper,
-            nic: placement.nic,
-        })
-        .collect();
+        let pairs =
+            crate::affinity::place(topology, max_threads, usize::from(u16::MAX) + 1, allow_smt)?
+                .into_iter()
+                .enumerate()
+                .map(|(index, placement)| WorkerPair {
+                    worker: WorkerId(index as u16),
+                    io: placement.lane,
+                    crypto: placement.helper,
+                    nic: placement.nic,
+                })
+                .collect();
         Ok(Self { pairs, max_threads })
     }
     /// Deterministic execution groups ordered by crypto CPU, then pair index.
@@ -223,7 +219,7 @@ pub use crate::security::CryptoRuntime;
 /// ```compile_fail
 /// use std::rc::Rc;
 /// use racer::{error::Result, runtime::RequestScope};
-/// use uring_runtime::group::{Factory, Service};
+/// use racer::lifecycle::{Factory, Service};
 /// struct LocalFactory(Rc<()>);
 /// impl Factory<RequestScope> for LocalFactory {
 ///     fn build_lane(&self, _: usize) -> Result<Box<dyn Service<RequestScope>>> { todo!() }
@@ -490,7 +486,7 @@ fn drive_local<'a>(
 /// handle (cross-thread and phase-change wakes), and this thread's alarms.
 struct ReactorPark(Rc<Reactor>);
 
-impl uring_runtime::group::Park<Error> for ReactorPark {
+impl crate::lifecycle::Park<Error> for ReactorPark {
     fn wait_timeout(&self, maximum: Duration) -> Duration {
         uring_runtime::drivers::next_alarm().map_or(maximum, |at| {
             maximum.min(at.saturating_duration_since(self.0.ctx().clock.now()))
@@ -800,15 +796,8 @@ impl Service<RequestScope> for IoService {
             service.wait_timeout(maximum).min(maximum)
         })
     }
-    fn parker(&self) -> Box<dyn uring_runtime::group::Park<Error>> {
+    fn parker(&self) -> Box<dyn crate::lifecycle::Park<Error>> {
         Box::new(ReactorPark(self.runtime.reactor.clone()))
-    }
-    fn park(&mut self, timeout: Duration) -> Result<()> {
-        // Even a zero wait submits SQEs queued during the service turn.
-        self.runtime
-            .reactor
-            .wait(timeout)
-            .inspect_err(|error| log_fatal("io-reactor-wait", *error))
     }
     fn stop_admission(&mut self) -> Result<()> {
         self.runtime.admission.stop();
@@ -861,7 +850,7 @@ impl Service<RequestScope> for IoService {
 
 #[cfg(test)]
 fn colocated_plan(max_threads: usize, workers: u16) -> AffinityPlan {
-    let location = uring_runtime::group::affinity::CpuLocation {
+    let location = crate::affinity::CpuLocation {
         cpu: *current_cpus().unwrap().first().unwrap(),
         package: 0,
         core: 0,
@@ -1054,7 +1043,7 @@ mod tests {
 
     #[test]
     fn direct_factory_resources_validate_sets_consume_once_and_fence() {
-        use uring_runtime::group::Factory;
+        use crate::lifecycle::Factory;
         let limits = crate::test_support::cluster::config(false).limits;
         for workers in [vec![], vec![WorkerId(7), WorkerId(7)]] {
             assert!(matches!(
@@ -1144,12 +1133,12 @@ mod tests {
         //! across nodes; local pair placement must not change the page's selected rail.
         //! Opt-in SMT counts allowed logical CPUs. Reactors prefer distinct physical cores.
 
-        use crate::worker::*;
         #[cfg(test)]
-        use uring_runtime::group::affinity::CpuQuota;
-        use uring_runtime::group::affinity::current_cpus;
-        use uring_runtime::group::affinity::pin_cpu;
-        use uring_runtime::group::affinity::set_cpus;
+        use crate::affinity::CpuQuota;
+        use crate::affinity::current_cpus;
+        use crate::affinity::pin_cpu;
+        use crate::affinity::set_cpus;
+        use crate::worker::*;
 
         #[cfg(test)]
         mod tests {
@@ -1242,7 +1231,7 @@ mod tests {
 
             #[test]
             fn exact_placement_rejects_insufficient_or_unknown_local_capacity() {
-                use uring_runtime::group::affinity::place_exact;
+                use crate::affinity::place_exact;
                 assert!(place_exact(topology(72, None), 30, 20, 20, false).is_err());
                 assert!(place_exact(topology(39, None), 40, 20, 20, false).is_err());
                 assert!(place_exact(topology(72, Some((39, 1))), 40, 20, 20, false).is_err());
@@ -1263,7 +1252,7 @@ mod tests {
 
             #[test]
             fn exact_smt_requires_opt_in_and_keeps_io_on_distinct_cores() {
-                use uring_runtime::group::affinity::place_exact;
+                use crate::affinity::place_exact;
                 let mut hardware = topology(8, None);
                 for cpu in &mut hardware.cpus {
                     cpu.core = cpu.cpu % 4;
@@ -1278,7 +1267,7 @@ mod tests {
 
             #[test]
             fn exact_nic_preference_selects_one_node_without_capacity_fallback() {
-                use uring_runtime::group::affinity::place_exact;
+                use crate::affinity::place_exact;
                 let mut hardware = topology(16, None);
                 for cpu in &mut hardware.cpus {
                     cpu.numa_node = Some(cpu.cpu / 8);
@@ -2428,7 +2417,7 @@ mod tests {
         fn factory_and_crypto_runtime_have_cross_thread_bounds() {
             fn sync<T: Sync + ?Sized>() {}
             fn send<T: Send + 'static>() {}
-            sync::<dyn uring_runtime::group::Factory<RequestScope>>();
+            sync::<dyn crate::lifecycle::Factory<RequestScope>>();
             send::<CryptoRuntime>();
         }
 

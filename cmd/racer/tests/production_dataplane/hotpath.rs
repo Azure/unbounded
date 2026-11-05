@@ -128,7 +128,7 @@ impl Factory {
         &self,
         worker: WorkerId,
         runtime: WorkerRuntime,
-    ) -> Result<Box<dyn uring_runtime::group::Service<RequestScope>>> {
+    ) -> Result<Box<dyn racer::lifecycle::Service<RequestScope>>> {
         let rig = Rc::new(Rig::assemble(
             P,
             false,
@@ -155,22 +155,19 @@ impl Factory {
         &self,
         _: WorkerId,
         runtime: CryptoRuntime,
-    ) -> Result<Box<dyn uring_runtime::group::Service<RequestScope>>> {
+    ) -> Result<Box<dyn racer::lifecycle::Service<RequestScope>>> {
         Ok(Box::new(PageCryptoEngine::new(runtime)))
     }
 }
-impl uring_runtime::group::Factory<RequestScope> for Factory {
-    fn build_lane(
-        &self,
-        lane: usize,
-    ) -> Result<Box<dyn uring_runtime::group::Service<RequestScope>>> {
+impl racer::lifecycle::Factory<RequestScope> for Factory {
+    fn build_lane(&self, lane: usize) -> Result<Box<dyn racer::lifecycle::Service<RequestScope>>> {
         self.resources
             .build_lane(lane, |worker, runtime| self.build(worker, runtime))
     }
     fn build_helper(
         &self,
         lane: usize,
-    ) -> Result<Box<dyn uring_runtime::group::Service<RequestScope>>> {
+    ) -> Result<Box<dyn racer::lifecycle::Service<RequestScope>>> {
         self.resources
             .build_helper(lane, |worker, runtime| self.build_crypto(worker, runtime))
     }
@@ -293,7 +290,7 @@ impl Service {
         Ok(())
     }
 }
-impl uring_runtime::group::Service<RequestScope> for Service {
+impl racer::lifecycle::Service<RequestScope> for Service {
     fn start<'a>(&'a mut self, _: &'a RequestScope) -> Operation<'a, ()> {
         Box::pin(async { Ok(()) })
     }
@@ -438,7 +435,7 @@ fn balanced_workload_covers_owners_without_multiplying_pages() {
 
 #[test]
 fn automatic_and_capped_plans_preserve_shared_and_explicit_paired_crypto() {
-    use uring_runtime::group::affinity::CpuLocation;
+    use racer::affinity::CpuLocation;
     let mut config = default_config();
     let topology = EffectiveTopology {
         cpus: (0..12)
@@ -1078,4 +1075,4 @@ impl Drop for Brd {
         }
     }
 }
-use uring_runtime::group::affinity::EffectiveTopology;
+use racer::affinity::EffectiveTopology;

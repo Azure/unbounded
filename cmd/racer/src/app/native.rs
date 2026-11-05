@@ -91,7 +91,7 @@ impl NativeNode {
         &self,
         worker: WorkerId,
         engine: PageCryptoEngine,
-    ) -> Result<Box<dyn uring_runtime::group::Service<RequestScope>>> {
+    ) -> Result<Box<dyn crate::lifecycle::Service<RequestScope>>> {
         let mut owner = self.owner.lock().map_err(|_| Error::Unavailable)?;
         let ctx = engine.ctx().clone();
         Ok(match owner.take_if(|(hosted, _)| *hosted == worker) {
@@ -644,8 +644,8 @@ mod tests {
     }
 
     fn core_plan(config: &Config, cores: usize) -> AffinityPlan {
-        use uring_runtime::group::affinity::CpuLocation;
-        use uring_runtime::group::affinity::EffectiveTopology;
+        use crate::affinity::CpuLocation;
+        use crate::affinity::EffectiveTopology;
         AffinityPlan::from_topology(
             config,
             EffectiveTopology {
@@ -705,8 +705,8 @@ mod tests {
     }
 
     fn four_pair_plan(config: &Config) -> AffinityPlan {
-        use uring_runtime::group::affinity::CpuLocation;
-        use uring_runtime::group::affinity::EffectiveTopology;
+        use crate::affinity::CpuLocation;
+        use crate::affinity::EffectiveTopology;
         let plan = AffinityPlan::from_topology(
             config,
             EffectiveTopology {
@@ -730,8 +730,8 @@ mod tests {
 
     #[test]
     fn smt_startup_final_count_partitions_live_budgets_and_obeys_memory_floors() {
-        use uring_runtime::group::affinity::CpuLocation;
-        use uring_runtime::group::affinity::EffectiveTopology;
+        use crate::affinity::CpuLocation;
+        use crate::affinity::EffectiveTopology;
         for (allow_smt, expected) in [(false, 3), (true, 5)] {
             let mut config = Config::from_lookup(|name| {
                 Ok(match name {
@@ -816,8 +816,8 @@ mod tests {
 
     #[test]
     fn resource_shortage_reduces_and_regroups_uneven_numa_workers() {
-        use uring_runtime::group::affinity::CpuLocation;
-        use uring_runtime::group::affinity::EffectiveTopology;
+        use crate::affinity::CpuLocation;
+        use crate::affinity::EffectiveTopology;
         let mut config = default_config(false);
         config.scale_limits(11).unwrap();
         let floor = 3 * crate::model::PAGE_BYTES as usize;

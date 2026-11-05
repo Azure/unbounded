@@ -5,7 +5,7 @@
 //! original owner across nested scopes. No executor or application policy is hidden
 //! here. For example, a local proxy can drive detached cache writes alongside I/O.
 
-use crate::{Error, Operation, Result, Scope, group::FailureReporter, reactor::ReactorWake};
+use crate::{Error, Operation, Result, Scope, reactor::ReactorWake};
 use std::{
     cell::{Cell, RefCell},
     collections::VecDeque,
@@ -473,35 +473,6 @@ pub async fn poll_scoped<S: Scope, T, E: Into<S::Error>>(
 /// Wake this thread and, optionally, interrupt its reactor wait. No thread is spawned.
 pub fn thread_waker(reactor: Option<ReactorWake>) -> Waker {
     Waker::from(Arc::new(ThreadWake(thread::current(), reactor)))
-}
-
-/// Drive resource completions while a local operation borrows its service graph.
-///
-/// Each poll first drives the resources (`poll`, which also registers the
-/// task's waker with them), then the operation. Nothing here waits or wakes
-/// itself: the surrounding lifecycle driver parks on the resources' wake
-/// sources (completions, cross-thread wakes, alarms, and scope deadlines).
-///
-/// Backend failures are reported immediately but do not abandon the operation.
-/// Its completion fence runs to completion, then the first backend error wins.
-pub fn drive_local_with<'a, T: 'a, E: Copy + PartialEq + From<crate::Error> + 'a>(
-    mut operation: Operation<'a, T, E>,
-    reporter: Option<&'a FailureReporter<E>>,
-    mut poll: impl FnMut(&Waker) -> Result<(), E> + 'a,
-) -> Operation<'a, T, E> {
-    let mut error = None;
-    Box::pin(std::future::poll_fn(move |cx| {
-        if let Err(failure) = poll(cx.waker()) {
-            if let Some(reporter) = reporter {
-                reporter.report(failure);
-            }
-            error.get_or_insert(failure);
-        }
-        match operation.as_mut().poll(cx) {
-            Poll::Ready(result) => Poll::Ready(error.map_or(result, Err)),
-            Poll::Pending => Poll::Pending,
-        }
-    }))
 }
 
 /// Submission retry policy for the explicitly polled listener helper.
@@ -1336,30 +1307,6 @@ mod scheduler_tests {
     use crate::test_util::WakeCounter;
     use std::{future::Future, pin::pin, rc::Rc};
 
-    /// A pending operation does not wake its own task; only its resources do.
-    #[test]
-    fn driver_does_not_self_wake() {
-        let ready = Cell::new(false);
-        let mut driver = drive_local_with(
-            Box::pin(std::future::poll_fn(|_| {
-                if ready.get() {
-                    Poll::Ready(Ok::<_, Error>(7))
-                } else {
-                    Poll::Pending
-                }
-            })),
-            None,
-            |_| Ok(()),
-        );
-        let count = Arc::new(WakeCounter::default());
-        let waker = Waker::from(count.clone());
-        let mut cx = Context::from_waker(&waker);
-        assert!(driver.as_mut().poll(&mut cx).is_pending());
-        assert_eq!(count.count(), 0);
-        ready.set(true);
-        assert_eq!(driver.as_mut().poll(&mut cx), Poll::Ready(Ok(7)));
-    }
-
     /// Shares cancellation and a caller-controlled admission error across polls.
     #[derive(Clone)]
     struct TestScope {
@@ -1491,49 +1438,6 @@ mod scheduler_tests {
         drop(guard);
         assert!(!flag.get());
         drop(Busy::try_enter(&flag).unwrap());
-    }
-
-    /// Backend failures retain their first error without truncating operation completion.
-    #[test]
-    fn driver_retains_operation_and_first_backend_error_until_completion() {
-        for fail_poll in [false, true] {
-            let ready = Cell::new(false);
-            let operation = Box::pin(std::future::poll_fn(|_| {
-                if ready.get() {
-                    Poll::Ready(Err::<(), _>(Error::Unavailable))
-                } else {
-                    Poll::Pending
-                }
-            }));
-            let mut future = drive_local_with(operation, None, |_| {
-                if fail_poll { Err(Error::Io) } else { Ok(()) }
-            });
-            let mut cx = Context::from_waker(Waker::noop());
-            assert!(future.as_mut().poll(&mut cx).is_pending());
-            ready.set(true);
-            assert_eq!(
-                future.as_mut().poll(&mut cx),
-                Poll::Ready(Err(if fail_poll {
-                    Error::Io
-                } else {
-                    Error::Unavailable
-                }))
-            );
-        }
-    }
-
-    /// An already completed operation preserves its result.
-    #[test]
-    fn driver_preserves_ready_value_and_does_not_wait() {
-        for result in [Ok(7), Err(Error::Unavailable)] {
-            let mut future = drive_local_with(Box::pin(async move { result }), None, |_| Ok(()));
-            assert_eq!(
-                future
-                    .as_mut()
-                    .poll(&mut Context::from_waker(Waker::noop())),
-                Poll::Ready(result)
-            );
-        }
     }
 
     /// Cross-thread notification unparks the thread that created the waker.

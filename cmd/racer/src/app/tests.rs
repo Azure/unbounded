@@ -4,7 +4,10 @@ use super::*;
 use crate::admission::AdmissionPolicy;
 use crate::admission::ResourceClass;
 use crate::admission::reserve_connection;
+use crate::affinity::EffectiveTopology;
 use crate::http::Codec;
+#[cfg(test)]
+use crate::lifecycle::Service;
 use crate::model::ExpiresAt;
 use crate::model::MetadataSelector;
 use crate::model::ObjectMetadata;
@@ -40,9 +43,6 @@ use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
 use std::thread;
 use std::time::Instant;
-#[cfg(test)]
-use uring_runtime::group::Service;
-use uring_runtime::group::affinity::EffectiveTopology;
 
 /// Controllable TLS endpoints and observations for application lifecycle tests.
 pub(super) struct ControlFixture {
@@ -868,7 +868,7 @@ fn queue_limited_plan(planned: usize, supported: usize) -> (Limits, AffinityPlan
         max_threads: planned * 2,
         pairs: (0..planned)
             .map(|id| {
-                let io = uring_runtime::group::affinity::CpuLocation {
+                let io = crate::affinity::CpuLocation {
                     cpu: id,
                     package: 0,
                     core: id,
@@ -939,7 +939,7 @@ fn worker_sizing_reduces_at_or_above_half() {
 
 #[test]
 fn worker_sizing_funds_diagnostics_and_ordinary_progress() {
-    use uring_runtime::group::affinity::CpuLocation;
+    use crate::affinity::CpuLocation;
     use uring_runtime::reactor::simulation::Simulation;
     let mut config = Config::from_lookup(|name| {
         Ok(match name {
@@ -1063,7 +1063,7 @@ fn worker_sizing_funds_diagnostics_and_ordinary_progress() {
 
 #[test]
 fn worker_sizing_rejects_four_queue_entries_with_two_threads() {
-    use uring_runtime::group::affinity::CpuLocation;
+    use crate::affinity::CpuLocation;
     let config = Config::from_lookup(|name| {
         Ok(match name {
             "RACER_CLUSTER_ID" => Some("00000000-0000-4000-8000-000000000001".into()),
@@ -1106,8 +1106,8 @@ fn worker_sizing_rejects_four_queue_entries_with_two_threads() {
 #[test]
 fn worker_sizing_funds_derived_connection_pools() {
     use crate::admission::ResourceClass;
-    use uring_runtime::group::affinity::CpuLocation;
-    use uring_runtime::group::affinity::EffectiveTopology;
+    use crate::affinity::CpuLocation;
+    use crate::affinity::EffectiveTopology;
     let mut config = Config::from_lookup(|name| {
         Ok(match name {
             "RACER_CLUSTER_ID" => Some("00000000-0000-4000-8000-000000000001".into()),
@@ -2867,8 +2867,8 @@ fn startup_reauthenticates_retained_identity_and_fails_closed() {
 
 #[test]
 fn node_replacement_drains_all_workers_and_restart_converges() {
+    use crate::affinity::EffectiveTopology;
     use crate::worker::WorkerPair;
-    use uring_runtime::group::affinity::EffectiveTopology;
     for renewal_due in [false, true] {
         let mut fixture = ControlFixture::new();
         let (config, node) = fixture.bootstrap_node(2, Duration::from_secs(15));
@@ -3075,7 +3075,7 @@ fn two_worker_real_control_key_lease_drain_and_checkpoint_cut() {
 fn stop_worker(
     worker: &mut WorkerApplication,
     runtime: &WorkerRuntime,
-    engine: &mut dyn uring_runtime::group::Service<RequestScope>,
+    engine: &mut dyn crate::lifecycle::Service<RequestScope>,
 ) {
     drive(
         runtime,
@@ -3163,7 +3163,7 @@ fn oversized_populated_shutdown_cut_thaws_and_finishes_drain_without_publication
 
 fn drive<T>(
     runtime: &WorkerRuntime,
-    engine: &mut dyn uring_runtime::group::Service<RequestScope>,
+    engine: &mut dyn crate::lifecycle::Service<RequestScope>,
     future: Operation<'_, T>,
 ) -> Result<T> {
     let mut future = future;
@@ -4358,8 +4358,8 @@ fn assembled_peer_io_carries_maximum_client_context_over_eight_signed_links() {
 
 #[test]
 fn peer_worker_partition_rejects_underfunding_and_reduces_worker_count() {
-    use uring_runtime::group::affinity::CpuLocation;
-    use uring_runtime::group::affinity::EffectiveTopology;
+    use crate::affinity::CpuLocation;
+    use crate::affinity::EffectiveTopology;
     let mut config = crate::test_support::cluster::config(false);
     config.max_threads = 4;
     config.limits.range_window_pages = NonZeroUsize::new(1).unwrap();

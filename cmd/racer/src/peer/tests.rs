@@ -2,6 +2,8 @@
 use super::*;
 use crate::admission::AdmissionPolicy;
 use crate::admission::ResourceClass;
+#[cfg(test)]
+use crate::lifecycle::Service;
 use crate::memory::BufferPool;
 use crate::model::MetadataSelector;
 use crate::model::Nonce;
@@ -31,8 +33,6 @@ use std::time::Duration;
 use std::time::Instant;
 use uring_runtime::environment::Deadline;
 use uring_runtime::environment::SimulationClock;
-#[cfg(test)]
-use uring_runtime::group::Service;
 
 mod body_progress {
     use super::*;

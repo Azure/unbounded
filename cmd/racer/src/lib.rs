@@ -7,6 +7,7 @@
 #![deny(unsafe_op_in_unsafe_fn)]
 
 pub mod admission;
+pub mod affinity;
 pub mod app;
 pub mod client;
 pub mod config;
@@ -19,6 +20,7 @@ pub mod gpu_slot;
 pub mod gpu_telemetry;
 pub mod hardware;
 pub mod http;
+pub mod lifecycle;
 pub mod memory;
 pub mod model;
 pub mod origin;

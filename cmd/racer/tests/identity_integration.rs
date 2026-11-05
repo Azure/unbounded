@@ -299,7 +299,7 @@ fn active_crypto_operation_completes_after_rotation_with_its_original_key_lease(
     bundle.cache_keys = vec![record(2, 10)];
     install_decoded(&installer, &bundle).unwrap();
     assert!(keys.lease(Some(&cache), old_id, KeyPurpose::Page).is_err());
-    uring_runtime::group::Service::poll_budgeted(
+    racer::lifecycle::Service::poll_budgeted(
         &mut engine,
         &mut std::task::Context::from_waker(futures::task::noop_waker_ref()),
         8,

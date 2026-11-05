@@ -748,17 +748,18 @@ fn worker_drop() {
 /// The owner can be hosted by `WithNative` and drained by its fence.
 fn owner_hosted_by_with_native() {
     profiles(|| {
-        use uring_runtime::group::Service;
-
         let mut w = world();
         let owner = w.a.owner.take().unwrap();
-        let mut service = rdma_verbs::WithNative::with_host(inner::Inner, owner);
-        let mut cx = Context::from_waker(futures::task::noop_waker_ref());
-        service.register_driver(cx.waker());
+        let mut service = rdma_verbs::WithNative::with_host((), owner);
+        let cx = Context::from_waker(futures::task::noop_waker_ref());
+        service.native().register_driver(cx.waker());
         let opened = w.a.clients[0].open(TO_B);
-        service.poll_budgeted(&mut cx, 8).unwrap();
+        service.native_mut().poll_budgeted(8).unwrap();
         assert!(ready(&opened).is_ok());
-        futures::executor::block_on(service.fence(&inner::Scope)).unwrap();
+        futures::executor::block_on(
+            service.close_alongside(|_| Box::pin(async { Ok::<(), rdma_verbs::Error>(()) })),
+        )
+        .unwrap();
         assert!(w.a.clients[0].drained());
         drop(service);
         w.b.clients[0].close();
@@ -773,179 +774,44 @@ fn owner_hosted_by_with_native() {
 /// fence runs; draining the native side first would wait forever.
 fn with_native_drives_inner_work_holding_buffers() {
     profiles(|| {
-        use uring_runtime::group::Service;
-
-        for fence in [false, true] {
-            let mut w = world();
-            let (ea, eb) = link_up(&mut w);
-            let deadline = w.now() + 5 * SECOND;
-            let granted = w.a.clients[0].grant(TO_B, ea, [1; 16], 4, deadline);
-            let granted = wait(&mut w, &granted).unwrap();
-            let written = w.b.clients[0].write(TO_A, eb, granted.tag, bytes(vec![2; 4]), deadline);
-            assert_eq!(wait(&mut w, &written), Ok(()));
-            let held = page(ready(&granted.arrival));
-            assert_eq!(
-                w.a.clients[1].buffers(7, BufferState::Free),
-                Some(BUFFERS - 1)
-            );
-            let owner = w.a.owner.take().unwrap();
-            let mut cx = Context::from_waker(futures::task::noop_waker_ref());
-            let holder = inner::Holder(Some(held));
-            let mut service = rdma_verbs::WithNative::with_host(holder, owner);
-            service.register_driver(cx.waker());
-            service.poll_budgeted(&mut cx, 8).unwrap();
-            let scope = inner::Scope;
-            let mut teardown = if fence {
-                service.fence(&scope)
-            } else {
-                service.drain(&scope)
-            };
-            let mut finished = None;
-            for _ in 0..64 {
-                if let Poll::Ready(result) = teardown.as_mut().poll(&mut cx) {
-                    finished = Some(result);
-                    break;
-                }
+        let mut w = world();
+        let (ea, eb) = link_up(&mut w);
+        let deadline = w.now() + 5 * SECOND;
+        let granted = w.a.clients[0].grant(TO_B, ea, [1; 16], 4, deadline);
+        let granted = wait(&mut w, &granted).unwrap();
+        let written = w.b.clients[0].write(TO_A, eb, granted.tag, bytes(vec![2; 4]), deadline);
+        assert_eq!(wait(&mut w, &written), Ok(()));
+        let held = page(ready(&granted.arrival));
+        assert_eq!(
+            w.a.clients[1].buffers(7, BufferState::Free),
+            Some(BUFFERS - 1)
+        );
+        let owner = w.a.owner.take().unwrap();
+        let mut cx = Context::from_waker(futures::task::noop_waker_ref());
+        let mut service = rdma_verbs::WithNative::with_host(Some(held), owner);
+        service.native().register_driver(cx.waker());
+        service.native_mut().poll_budgeted(8).unwrap();
+        let mut teardown = service.close_alongside(|holder| {
+            Box::pin(async move {
+                holder.take();
+                Ok::<(), rdma_verbs::Error>(())
+            })
+        });
+        let mut finished = None;
+        for _ in 0..64 {
+            if let Poll::Ready(result) = teardown.as_mut().poll(&mut cx) {
+                finished = Some(result);
+                break;
             }
-            assert!(
-                matches!(finished, Some(Ok(()))),
-                "teardown stalled (fence={fence})"
-            );
-            drop(teardown);
-            assert!(w.a.clients[0].drained());
-            drop(service);
-            w.b.clients[0].close();
-            pump(&mut w);
-            assert_eq!(w.sim.live_resources(), 0);
         }
+        assert!(matches!(finished, Some(Ok(()))), "teardown stalled");
+        drop(teardown);
+        assert!(w.a.clients[0].drained());
+        drop(service);
+        w.b.clients[0].close();
+        pump(&mut w);
+        assert_eq!(w.sim.live_resources(), 0);
     });
-}
-
-mod inner {
-    use std::task::{Context, Waker};
-
-    use uring_runtime::{Operation, group::Service};
-
-    #[derive(Clone, Copy, Debug, PartialEq)]
-    pub struct Failure;
-
-    impl From<racer_io::Error> for Failure {
-        fn from(_: racer_io::Error) -> Self {
-            Self
-        }
-    }
-
-    impl From<rdma_verbs::Error> for Failure {
-        fn from(_: rdma_verbs::Error) -> Self {
-            Self
-        }
-    }
-
-    #[derive(Clone)]
-    pub struct Scope;
-
-    impl uring_runtime::Scope for Scope {
-        type Error = Failure;
-
-        fn check(&self) -> Result<(), Failure> {
-            Ok(())
-        }
-
-        fn cancellation(&self) -> Option<&uring_runtime::environment::Cancellation> {
-            None
-        }
-    }
-
-    pub struct Inner;
-
-    /// Holds a received page until its drain or fence runs.
-    pub struct Holder(pub Option<rdma_verbs::RegisteredPage>);
-
-    impl Service<Scope> for Holder {
-        fn waker(&self) -> Result<Waker, Failure> {
-            Ok(Waker::noop().clone())
-        }
-
-        fn register_driver(&self, _: &Waker) {}
-
-        fn start<'a>(&'a mut self, _: &'a Scope) -> Operation<'a, (), Failure> {
-            Box::pin(async { Ok(()) })
-        }
-
-        fn poll_budgeted(&mut self, _: &mut Context<'_>, _: usize) -> Result<(), Failure> {
-            Ok(())
-        }
-
-        fn wait_timeout(&self, maximum: std::time::Duration) -> std::time::Duration {
-            maximum
-        }
-
-        fn drain<'a>(&'a mut self, _: &'a Scope) -> Operation<'a, (), Failure> {
-            Box::pin(async move {
-                self.0.take();
-                Ok(())
-            })
-        }
-
-        fn stop_admission(&mut self) -> Result<(), Failure> {
-            Ok(())
-        }
-
-        fn close(&mut self) -> Result<(), Failure> {
-            Ok(())
-        }
-
-        fn fence<'a>(&'a mut self, _: &'a Scope) -> Operation<'a, (), Failure> {
-            Box::pin(async move {
-                self.0.take();
-                Ok(())
-            })
-        }
-
-        fn shutdown<'a>(&'a mut self, _: &'a Scope) -> Operation<'a, (), Failure> {
-            Box::pin(async { Ok(()) })
-        }
-    }
-
-    impl Service<Scope> for Inner {
-        fn waker(&self) -> Result<Waker, Failure> {
-            Ok(Waker::noop().clone())
-        }
-
-        fn register_driver(&self, _: &Waker) {}
-
-        fn start<'a>(&'a mut self, _: &'a Scope) -> Operation<'a, (), Failure> {
-            Box::pin(async { Ok(()) })
-        }
-
-        fn poll_budgeted(&mut self, _: &mut Context<'_>, _: usize) -> Result<(), Failure> {
-            Ok(())
-        }
-
-        fn wait_timeout(&self, maximum: std::time::Duration) -> std::time::Duration {
-            maximum
-        }
-
-        fn drain<'a>(&'a mut self, _: &'a Scope) -> Operation<'a, (), Failure> {
-            Box::pin(async { Ok(()) })
-        }
-
-        fn stop_admission(&mut self) -> Result<(), Failure> {
-            Ok(())
-        }
-
-        fn close(&mut self) -> Result<(), Failure> {
-            Ok(())
-        }
-
-        fn fence<'a>(&'a mut self, _: &'a Scope) -> Operation<'a, (), Failure> {
-            Box::pin(async { Ok(()) })
-        }
-
-        fn shutdown<'a>(&'a mut self, _: &'a Scope) -> Operation<'a, (), Failure> {
-            Box::pin(async { Ok(()) })
-        }
-    }
 }
 
 /// Device pool memory: two buffers plus a tail too small for a third.

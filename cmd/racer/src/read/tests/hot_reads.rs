@@ -82,7 +82,7 @@ mod duplex_release {
             let mut pump = |endpoint: &mut crate::read::dispatch::WorkerEndpoint| {
                 endpoint.poll(&mut cx, 64).unwrap();
                 uring_runtime::drivers::poll(&mut cx, 64);
-                uring_runtime::group::Service::poll_budgeted(
+                crate::lifecycle::Service::poll_budgeted(
                     &mut f.engine,
                     &mut std::task::Context::from_waker(futures::task::noop_waker_ref()),
                     64,
@@ -1135,7 +1135,7 @@ fn later_page_completes_before_head_and_cancellation_keeps_completion_fence() {
             let mut cx = Context::from_waker(futures::task::noop_waker_ref());
             endpoint.poll(&mut cx, 64).unwrap();
             uring_runtime::drivers::poll(&mut cx, 64);
-            uring_runtime::group::Service::poll_budgeted(
+            crate::lifecycle::Service::poll_budgeted(
                 &mut f.engine,
                 &mut std::task::Context::from_waker(futures::task::noop_waker_ref()),
                 64,
@@ -1523,7 +1523,7 @@ fn production_range_windows(old_provider: bool) -> Vec<Rc<LinkStats>> {
             64,
         );
         for f in &mut fixtures {
-            uring_runtime::group::Service::poll_budgeted(
+            crate::lifecycle::Service::poll_budgeted(
                 &mut f.engine,
                 &mut std::task::Context::from_waker(futures::task::noop_waker_ref()),
                 64,
@@ -1942,7 +1942,7 @@ fn read_range(
         }
         endpoint.poll(&mut cx, 64).unwrap();
         uring_runtime::drivers::poll(&mut cx, 64);
-        uring_runtime::group::Service::poll_budgeted(&mut f.engine, &mut cx, 64).unwrap();
+        crate::lifecycle::Service::poll_budgeted(&mut f.engine, &mut cx, 64).unwrap();
         f.crypto.poll_budgeted(64).unwrap();
         f.reactor.poll_budgeted(128).unwrap();
     }

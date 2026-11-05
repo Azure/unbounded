@@ -2473,7 +2473,7 @@ impl Application {
         &self,
         worker: WorkerId,
         runtime: WorkerRuntime,
-    ) -> Result<Box<dyn uring_runtime::group::Service<RequestScope>>> {
+    ) -> Result<Box<dyn crate::lifecycle::Service<RequestScope>>> {
         let application = WorkerApplication::assemble(
             &self.config,
             self.node.clone(),
@@ -2489,18 +2489,15 @@ impl Application {
         &self,
         worker: WorkerId,
         runtime: CryptoRuntime,
-    ) -> Result<Box<dyn uring_runtime::group::Service<RequestScope>>> {
+    ) -> Result<Box<dyn crate::lifecycle::Service<RequestScope>>> {
         self.node
             .native
             .crypto(worker, PageCryptoEngine::new(runtime))
     }
 }
 
-impl uring_runtime::group::Factory<RequestScope> for Application {
-    fn build_lane(
-        &self,
-        lane: usize,
-    ) -> Result<Box<dyn uring_runtime::group::Service<RequestScope>>> {
+impl crate::lifecycle::Factory<RequestScope> for Application {
+    fn build_lane(&self, lane: usize) -> Result<Box<dyn crate::lifecycle::Service<RequestScope>>> {
         self.resources
             .get()
             .ok_or(Error::InvalidConfiguration)?
@@ -2510,7 +2507,7 @@ impl uring_runtime::group::Factory<RequestScope> for Application {
     fn build_helper(
         &self,
         lane: usize,
-    ) -> Result<Box<dyn uring_runtime::group::Service<RequestScope>>> {
+    ) -> Result<Box<dyn crate::lifecycle::Service<RequestScope>>> {
         self.resources
             .get()
             .ok_or(Error::InvalidConfiguration)?
@@ -2529,7 +2526,7 @@ impl uring_runtime::group::Factory<RequestScope> for Application {
     }
 }
 
-impl uring_runtime::group::Service<RequestScope> for WorkerApplication {
+impl crate::lifecycle::Service<RequestScope> for WorkerApplication {
     fn wait_timeout(&self, maximum: Duration) -> Duration {
         let _environment = self.environment.enter();
         let maximum =
@@ -3618,9 +3615,9 @@ mod lifecycle_policy_tests {
         config.max_threads = 40;
         let mut plan = AffinityPlan::from_topology(
             &config,
-            uring_runtime::group::affinity::EffectiveTopology {
+            crate::affinity::EffectiveTopology {
                 cpus: (0..72)
-                    .map(|cpu| uring_runtime::group::affinity::CpuLocation {
+                    .map(|cpu| crate::affinity::CpuLocation {
                         cpu,
                         package: 0,
                         core: cpu,
@@ -3670,9 +3667,9 @@ mod lifecycle_policy_tests {
             .unwrap();
             let mut plan = AffinityPlan::from_topology(
                 &config,
-                uring_runtime::group::affinity::EffectiveTopology {
+                crate::affinity::EffectiveTopology {
                     cpus: (0..144)
-                        .map(|cpu| uring_runtime::group::affinity::CpuLocation {
+                        .map(|cpu| crate::affinity::CpuLocation {
                             cpu,
                             package: 0,
                             core: cpu,
@@ -3712,9 +3709,9 @@ mod lifecycle_policy_tests {
         .unwrap();
         let mut plan = AffinityPlan::from_topology(
             &config,
-            uring_runtime::group::affinity::EffectiveTopology {
+            crate::affinity::EffectiveTopology {
                 cpus: (0..16)
-                    .map(|cpu| uring_runtime::group::affinity::CpuLocation {
+                    .map(|cpu| crate::affinity::CpuLocation {
                         cpu,
                         package: 0,
                         core: cpu,
@@ -3768,9 +3765,9 @@ mod lifecycle_policy_tests {
         .unwrap();
         let mut enabled = AffinityPlan::from_topology(
             &config,
-            uring_runtime::group::affinity::EffectiveTopology {
+            crate::affinity::EffectiveTopology {
                 cpus: (0..15)
-                    .map(|cpu| uring_runtime::group::affinity::CpuLocation {
+                    .map(|cpu| crate::affinity::CpuLocation {
                         cpu,
                         core: cpu,
                         package: 0,

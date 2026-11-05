@@ -696,7 +696,7 @@ impl Rig {
         let mut cx = Context::from_waker(futures::task::noop_waker_ref());
         self.reactor.poll_budgeted(128).unwrap();
         if let Some(engine) = &self.engine {
-            uring_runtime::group::Service::poll_budgeted(
+            racer::lifecycle::Service::poll_budgeted(
                 &mut *engine.borrow_mut(),
                 &mut std::task::Context::from_waker(futures::task::noop_waker_ref()),
                 64,

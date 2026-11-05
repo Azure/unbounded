@@ -444,7 +444,7 @@ impl SubscriptionFixture {
         self.clients.poll_budgeted(cx, 64).unwrap();
         self.endpoint.poll_budgeted(64).unwrap();
         self.drivers.poll(cx, 64);
-        uring_runtime::group::Service::poll_budgeted(
+        crate::lifecycle::Service::poll_budgeted(
             &mut self.engine,
             &mut std::task::Context::from_waker(futures::task::noop_waker_ref()),
             64,

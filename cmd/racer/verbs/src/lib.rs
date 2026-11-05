@@ -16,7 +16,7 @@
 //!
 //! 1. Call [`node()`] to get one [`Client`] per I/O worker and an [`OwnerPort`].
 //! 2. On the native thread, build the [`Owner`] and poll it, or host it in a
-//!    `uring-runtime` service with [`WithNative::with_host`].
+//!    lifecycle service with [`WithNative::with_host`].
 //! 3. Call [`Client::activate`] with a [`NodeConfig`]. The owner finds RDMA
 //!    ports, your selector picks some, and each picked port gets a page pool.
 //! 4. Set up a link with [`Client::open`] and [`Client::accept`], exchanging
@@ -59,7 +59,7 @@
 //!
 //! [`Client::close`] breaks every link. The owner frees everything once no
 //! page is held. Once it has drained, [`Client::reopen`] can start a new
-//! round. [`WithNative`] adds a native host to a `uring-runtime` service so
+//! round. [`WithNative`] adds a native host to a lifecycle service so
 //! drain and fence also finish the native side.
 //!
 //! # Backends
@@ -219,7 +219,7 @@ pub struct Selection {
     pub port: PortInfo,
 }
 
-/// A `uring-runtime` service with a [`NativeHost`] attached.
+/// A lifecycle service (implemented in `racer::lifecycle`) with a [`NativeHost`] attached.
 ///
 /// - Poll: polls both with the same budget.
 /// - Stop admission: only the inner service. Native work keeps going.
@@ -294,17 +294,17 @@ impl Endpoint {
 }
 
 use std::{
+    future::Future,
+    pin::Pin,
     sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
     },
-    task::{Context, Poll, Waker},
+    task::{Poll, Waker},
 };
 
-use uring_runtime::{
-    Operation, Scope,
-    group::{FailureReporter, Service},
-};
+/// A boxed lifecycle future borrowing the hosted service.
+pub type Operation<'a, T, E> = Pin<Box<dyn Future<Output = std::result::Result<T, E>> + 'a>>;
 
 impl<T, N: NativeHost> WithNative<T, N> {
     /// Wrap `inner` with an already built native host, for example an
@@ -312,31 +312,33 @@ impl<T, N: NativeHost> WithNative<T, N> {
     pub fn with_host(inner: T, native: N) -> Self {
         Self { inner, native }
     }
-}
 
-impl<S: Scope, T: Service<S>, N: NativeHost> Service<S> for WithNative<T, N>
-where
-    S::Error: From<Error>,
-{
-    /// Pass through to the inner service.
-    fn set_failure_reporter(&mut self, reporter: FailureReporter<S::Error>) {
-        self.inner.set_failure_reporter(reporter);
+    /// The hosted service.
+    pub fn inner(&self) -> &T {
+        &self.inner
     }
 
-    /// Pass through to the inner service.
-    fn waker(&self) -> std::result::Result<Waker, S::Error> {
-        self.inner.waker()
+    /// The hosted service, mutably.
+    pub fn inner_mut(&mut self) -> &mut T {
+        &mut self.inner
     }
 
-    /// Register `waker` with both.
-    fn register_driver(&self, waker: &Waker) {
-        self.inner.register_driver(waker);
-        self.native.register_driver(waker);
+    /// The native host.
+    pub fn native(&self) -> &N {
+        &self.native
     }
 
-    /// Drive native activation while the inner service starts.
-    fn start<'a>(&'a mut self, scope: &'a S) -> Operation<'a, (), S::Error> {
-        let mut startup = self.inner.start(scope);
+    /// The native host, mutably.
+    pub fn native_mut(&mut self) -> &mut N {
+        &mut self.native
+    }
+
+    /// Drive native activation while the inner service's `start` runs.
+    pub fn start_alongside<'a, E: From<Error> + 'a>(
+        &'a mut self,
+        start: impl FnOnce(&'a mut T) -> Operation<'a, (), E>,
+    ) -> Operation<'a, (), E> {
+        let mut startup = start(&mut self.inner);
         let native = &mut self.native;
         Box::pin(std::future::poll_fn(move |cx| {
             native.register_driver(cx.waker());
@@ -345,47 +347,14 @@ where
         }))
     }
 
-    /// Poll the inner service, then the native side, each with `budget`.
-    fn poll_budgeted(
-        &mut self,
-        cx: &mut Context<'_>,
-        budget: usize,
-    ) -> std::result::Result<(), S::Error> {
-        self.inner.poll_budgeted(cx, budget)?;
-        self.native.poll_budgeted(budget).map_err(Into::into)
-    }
-
-    /// The earlier of the inner service's and the native side's bounds.
-    fn wait_timeout(&self, maximum: std::time::Duration) -> std::time::Duration {
-        self.native.wait_timeout(self.inner.wait_timeout(maximum))
-    }
-
-    /// Stop the inner service only. Native work keeps going.
-    fn stop_admission(&mut self) -> std::result::Result<(), S::Error> {
-        self.inner.stop_admission()
-    }
-
-    /// Drain the native side and the inner service together.
-    fn drain<'a>(&'a mut self, scope: &'a S) -> Operation<'a, (), S::Error> {
-        let inner = self.inner.drain(scope);
-        close_alongside(&mut self.native, inner)
-    }
-
-    /// Close the native side, then the inner service.
-    fn close(&mut self) -> std::result::Result<(), S::Error> {
-        self.native.close();
-        self.inner.close()
-    }
-
-    /// Drain the native side and fence the inner service together.
-    fn fence<'a>(&'a mut self, scope: &'a S) -> Operation<'a, (), S::Error> {
-        let inner = self.inner.fence(scope);
-        close_alongside(&mut self.native, inner)
-    }
-
-    /// Pass through to the inner service.
-    fn shutdown<'a>(&'a mut self, scope: &'a S) -> Operation<'a, (), S::Error> {
-        self.inner.shutdown(scope)
+    /// Close the native side and drive it alongside the inner operation built
+    /// by `inner` (a drain or fence) until both finish.
+    pub fn close_alongside<'a, E: From<Error> + 'a>(
+        &'a mut self,
+        inner: impl FnOnce(&'a mut T) -> Operation<'a, (), E>,
+    ) -> Operation<'a, (), E> {
+        let operation = inner(&mut self.inner);
+        close_alongside(&mut self.native, operation)
     }
 }
 

@@ -545,7 +545,7 @@ fn serial_zero_grant_reaches_real_pending_and_disk_copy() {
             let mut cx = Context::from_waker(futures::task::noop_waker_ref());
             uring_runtime::drivers::poll(&mut cx, 64);
             for f in [&mut source, &mut target] {
-                uring_runtime::group::Service::poll_budgeted(&mut f.engine, &mut cx, 64).unwrap();
+                crate::lifecycle::Service::poll_budgeted(&mut f.engine, &mut cx, 64).unwrap();
                 f.crypto.poll_budgeted(64).unwrap();
             }
             target.reactor.poll_budgeted(64).unwrap();
@@ -609,7 +609,7 @@ fn serial_zero_grant_reaches_real_pending_and_disk_copy() {
         for _ in 0..4096 {
             let mut cx = Context::from_waker(futures::task::noop_waker_ref());
             uring_runtime::drivers::poll(&mut cx, 64);
-            uring_runtime::group::Service::poll_budgeted(&mut target.engine, &mut cx, 64).unwrap();
+            crate::lifecycle::Service::poll_budgeted(&mut target.engine, &mut cx, 64).unwrap();
             target.crypto.poll_budgeted(64).unwrap();
             target.reactor.poll_budgeted(64).unwrap();
             if let Poll::Ready(done) = control.as_mut().poll(&mut cx) {
@@ -888,7 +888,7 @@ fn invalid_signed_selection_falls_back_without_resetting_acquisition_budget() {
                 }
                 endpoint.poll(&mut cx, 64).unwrap();
                 uring_runtime::drivers::poll(&mut cx, 64);
-                uring_runtime::group::Service::poll_budgeted(
+                crate::lifecycle::Service::poll_budgeted(
                     &mut f.engine,
                     &mut std::task::Context::from_waker(futures::task::noop_waker_ref()),
                     64,
@@ -949,7 +949,7 @@ fn open_subscription_selects_no_peers_after_switching_to_passthrough_local() {
         }
         endpoint.poll(&mut cx, 64).unwrap();
         uring_runtime::drivers::poll(&mut cx, 64);
-        uring_runtime::group::Service::poll_budgeted(
+        crate::lifecycle::Service::poll_budgeted(
             &mut f.engine,
             &mut std::task::Context::from_waker(futures::task::noop_waker_ref()),
             64,
@@ -1832,7 +1832,7 @@ fn hedge_cold_backup_coordinators_probe_predecessors_then_reach_origin_with_orig
         for _ in 0..512 {
             uring_runtime::drivers::poll(&mut cx, 64);
             for f in &mut fixtures {
-                uring_runtime::group::Service::poll_budgeted(
+                crate::lifecycle::Service::poll_budgeted(
                     &mut f.engine,
                     &mut std::task::Context::from_waker(futures::task::noop_waker_ref()),
                     64,
@@ -2093,7 +2093,7 @@ fn hedge_loser_child_cancels_accepted_crypto_but_waits_for_completion_fence() {
         pair.as_mut().poll(&mut cx).is_pending(),
         "cancellation is not the crypto fence"
     );
-    uring_runtime::group::Service::poll_budgeted(
+    crate::lifecycle::Service::poll_budgeted(
         &mut f.engine,
         &mut std::task::Context::from_waker(futures::task::noop_waker_ref()),
         8,
@@ -2197,7 +2197,7 @@ fn hedge_child_cancellation_removes_crypto_admission_wait_without_canceling_acce
     drop(waiting);
     assert!(!f.scope.cancellation.is_cancelled());
     assert_eq!(f.crypto.outstanding(), 1);
-    uring_runtime::group::Service::poll_budgeted(
+    crate::lifecycle::Service::poll_budgeted(
         &mut f.engine,
         &mut std::task::Context::from_waker(futures::task::noop_waker_ref()),
         8,
@@ -2611,7 +2611,7 @@ fn corrupt_copy_cannot_extend_original_budget_deadline() {
     assert_eq!(f.crypto.outstanding(), 1);
     // Complete AEAD while live, then resume fallback after the tighter budget
     // deadline. The caller scope is still live and must not renew that deadline.
-    uring_runtime::group::Service::poll_budgeted(
+    crate::lifecycle::Service::poll_budgeted(
         &mut f.engine,
         &mut std::task::Context::from_waker(futures::task::noop_waker_ref()),
         64,
@@ -2727,7 +2727,7 @@ fn replica_selection_orders_first_acquire_and_non_primary_owner_fills() {
         for _ in 0..512 {
             uring_runtime::drivers::poll(&mut cx, 64);
             for f in &mut fixtures {
-                uring_runtime::group::Service::poll_budgeted(
+                crate::lifecycle::Service::poll_budgeted(
                     &mut f.engine,
                     &mut std::task::Context::from_waker(futures::task::noop_waker_ref()),
                     64,
@@ -5585,7 +5585,7 @@ fn passthrough_peers_coalesces_reads_from_distinct_nodes_on_the_owner() {
         () => {{
             uring_runtime::drivers::poll(&mut cx, 64);
             for f in fixtures.iter_mut() {
-                uring_runtime::group::Service::poll_budgeted(
+                crate::lifecycle::Service::poll_budgeted(
                     &mut f.engine,
                     &mut Context::from_waker(futures::task::noop_waker_ref()),
                     64,

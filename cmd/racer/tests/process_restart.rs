@@ -1454,5 +1454,5 @@ fn periodic_checkpoint_sigkill_recovers_older_pages_and_bounds_recent_loss() {
     );
     assert!(second.stop(libc::SIGTERM).success(), "{}", second.logs());
 }
-use uring_runtime::group::affinity::CpuLocation;
-use uring_runtime::group::affinity::EffectiveTopology;
+use racer::affinity::CpuLocation;
+use racer::affinity::EffectiveTopology;
