@@ -2145,10 +2145,10 @@ impl WorkerApplication {
         // Drop pages whose key left the keyring, a bounded batch per turn.
         self.memory
             .sweep_unavailable(racer_core::cache::EXPIRY_BATCH);
-        self.store
-            .writer
-            .index()
-            .sweep_unavailable(racer_core::cache::EXPIRY_BATCH);
+        let index = self.store.writer.index();
+        index.sweep_unavailable(racer_core::cache::EXPIRY_BATCH);
+        // Release expired hard holds, a bounded batch per turn.
+        index.expire_holds(racer_core::cache::EXPIRY_BATCH);
         self.memory.buffers().maintain_idle_buffers(now);
     }
 

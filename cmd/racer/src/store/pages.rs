@@ -17,6 +17,8 @@ use page_alloc::Segments;
 use page_alloc::disk_index::AgeCursor;
 use page_alloc::disk_index::DiskIndex;
 use page_alloc::disk_index::EntryView;
+use page_alloc::disk_index::HoldId;
+use page_alloc::disk_index::Monotonic;
 use page_alloc::disk_index::PageSlot;
 use page_alloc::intern::CacheTable;
 use page_alloc::intern::SlotInterner;
@@ -93,6 +95,8 @@ pub(super) struct Pages {
     /// Stored pages (in-flight reservations excluded).
     stored: usize,
     versions: HashMap<ObjectVersion, (VersionMetadata, usize)>,
+    /// Hold identities a rebuilt disk index must stay above.
+    hold_floor: HoldId,
 }
 
 /// A reserved publication of one page: the disk index reservation, then
@@ -136,11 +140,11 @@ fn location(view: &EntryView) -> RecordLocation {
 }
 
 impl Inner {
-    fn new(slots: u32) -> Result<Self> {
+    fn new(slots: u32, hold_floor: HoldId) -> Result<Self> {
+        let mut disk = DiskIndex::new(slots, slots as usize, 0).map_err(Error::from)?;
+        disk.continue_hold_ids(hold_floor);
         Ok(Self {
-            disk: Rc::new(RefCell::new(
-                DiskIndex::new(slots, slots as usize, 0).map_err(Error::from)?,
-            )),
+            disk: Rc::new(RefCell::new(disk)),
             slots: Interner::new(slots),
             caches: CacheTable::default(),
             keys: vec![KeyId([0; 16]); slots as usize],
@@ -156,6 +160,7 @@ impl Pages {
             slots,
             stored: 0,
             versions: HashMap::default(),
+            hold_floor: HoldId::default(),
         }
     }
 
@@ -176,13 +181,13 @@ impl Pages {
         if slots == u32::MAX || (slots as usize) < self.len() {
             return Err(Error::InvalidConfiguration);
         }
-        if self
-            .inner
-            .as_ref()
-            .is_some_and(|inner| inner.disk.borrow().len() != self.stored)
-        {
+        if self.inner.as_ref().is_some_and(|inner| {
+            let disk = inner.disk.borrow();
+            disk.len() != self.stored || disk.hold_count() != 0
+        }) {
             return Err(Error::Overloaded);
         }
+        self.hold_floor = self.last_hold_id();
         let entries = self.drain_all();
         self.slots = slots;
         self.inner = None;
@@ -220,7 +225,7 @@ impl Pages {
 
     fn inner_mut(&mut self) -> Result<&mut Inner> {
         if self.inner.is_none() {
-            self.inner = Some(Inner::new(self.slots)?);
+            self.inner = Some(Inner::new(self.slots, self.hold_floor)?);
         }
         Ok(self.inner.as_mut().expect("initialized page table"))
     }
@@ -481,6 +486,151 @@ impl Pages {
         }
     }
 
+    // ---- holds ----
+
+    /// Hold `pages` until `until`, interning each. The disk index is the only
+    /// record of which pages are held: a held page's segment is never
+    /// evicted, and a held page neither stored nor being written counts
+    /// toward [`Self::holds_unused`]. Returns the hold and the slots in
+    /// `pages` order. Nothing changes on error.
+    pub fn hold(
+        &mut self,
+        pages: &[PageId],
+        until: Monotonic,
+        now: Monotonic,
+    ) -> Result<(HoldId, Vec<PageSlot>)> {
+        let inner = self.inner_mut()?;
+        let mut slots = Vec::with_capacity(pages.len());
+        for page in pages {
+            match inner.slots.intern(page) {
+                Ok(slot) => slots.push(slot),
+                Err(_) => {
+                    Self::release_slots(inner, &slots);
+                    return Err(Error::Overloaded);
+                }
+            }
+        }
+        let held = inner.disk.borrow_mut().hold(&slots, until, now);
+        match held {
+            Ok(id) => Ok((id, slots)),
+            Err(error) => {
+                Self::release_slots(inner, &slots);
+                Err(error.into())
+            }
+        }
+    }
+
+    fn release_slots(inner: &mut Inner, slots: &[PageSlot]) {
+        let disk = inner.disk.borrow();
+        for slot in slots {
+            inner.slots.release_unused(&disk, *slot);
+        }
+    }
+
+    /// Move a live hold's deadline; a released or expired hold is ignored.
+    pub fn extend_hold(&mut self, id: HoldId, until: Monotonic, now: Monotonic) -> Result<()> {
+        let Some(inner) = self.inner.as_ref() else {
+            return Ok(());
+        };
+        match inner.disk.borrow_mut().extend_hold(id, until, now) {
+            Ok(()) | Err(page_alloc::Error::Stale) => Ok(()),
+            Err(error) => Err(error.into()),
+        }
+    }
+
+    /// Drop `slot` from hold `id`. Returns whether the hold still exists.
+    pub fn release_hold_slot(&mut self, id: HoldId, slot: PageSlot) -> bool {
+        let Some(inner) = self.inner.as_mut() else {
+            return false;
+        };
+        let mut disk = inner.disk.borrow_mut();
+        // A released or expired hold has already dropped the slot.
+        let _ = disk.release_hold_slots(id, &[slot]);
+        inner.slots.release_unused(&disk, slot);
+        disk.hold_deadline(id).is_some()
+    }
+
+    /// Release a whole hold; an unknown hold is ignored.
+    pub fn release_hold(&mut self, id: HoldId) {
+        let Some(inner) = self.inner.as_mut() else {
+            return;
+        };
+        let mut disk = inner.disk.borrow_mut();
+        let Some(slots) = disk.hold_slots(id).map(<[PageSlot]>::to_vec) else {
+            return;
+        };
+        disk.release_hold(id).expect("live hold");
+        for slot in slots {
+            inner.slots.release_unused(&disk, slot);
+        }
+    }
+
+    /// Release up to `budget` holds due at `now`, reporting each.
+    pub fn expire_holds(&mut self, now: Monotonic, budget: usize, mut expired: impl FnMut(HoldId)) {
+        let Some(inner) = self.inner.as_mut() else {
+            return;
+        };
+        let mut disk = inner.disk.borrow_mut();
+        let mut released = Vec::new();
+        disk.expire_holds_with(now, budget, |id, slots| {
+            released.extend_from_slice(slots);
+            expired(id);
+        });
+        for slot in released {
+            inner.slots.release_unused(&disk, slot);
+        }
+    }
+
+    /// Held pages that are neither stored nor being written.
+    pub fn holds_unused(&self) -> usize {
+        self.inner
+            .as_ref()
+            .map_or(0, |inner| inner.disk.borrow().holds_unused())
+    }
+
+    /// Whether `page` is stored or being written.
+    pub fn occupied(&self, page: &PageId) -> bool {
+        self.inner.as_ref().is_some_and(|inner| {
+            inner.slots.get(page).is_some_and(|slot| {
+                let disk = inner.disk.borrow();
+                disk.get(slot).is_some() || disk.is_inflight(slot)
+            })
+        })
+    }
+
+    /// Whether `page` counts toward [`Self::holds_unused`].
+    pub fn is_unused_held(&self, page: &PageId) -> bool {
+        self.inner.as_ref().is_some_and(|inner| {
+            inner
+                .slots
+                .get(page)
+                .is_some_and(|slot| inner.disk.borrow().is_unused_held(slot))
+        })
+    }
+
+    /// The newest hold identity issued so far.
+    pub fn last_hold_id(&self) -> HoldId {
+        self.inner
+            .as_ref()
+            .map_or(self.hold_floor, |inner| inner.disk.borrow().last_hold_id())
+    }
+
+    /// Issue only hold identities newer than `after`, for a table that
+    /// replaces another.
+    pub fn continue_hold_ids(&mut self, after: HoldId) {
+        self.hold_floor = self.hold_floor.max(after);
+        if let Some(inner) = self.inner.as_ref() {
+            inner.disk.borrow_mut().continue_hold_ids(after);
+        }
+    }
+
+    /// Whether a held record is stored in `segment`.
+    pub fn segment_held(&self, segment: SegmentId) -> bool {
+        self.inner
+            .as_ref()
+            .is_some_and(|inner| inner.disk.borrow().segment_held(segment))
+    }
+
     /// Every stored page, in slot order.
     pub fn iter(&self) -> impl Iterator<Item = PageView<'_>> {
         self.inner.iter().flat_map(move |inner| {
@@ -581,7 +731,7 @@ impl Pages {
             return;
         };
         let disk = inner.disk.borrow();
-        assert_eq!(inner.slots.len(), disk.len());
+        assert_eq!(inner.slots.len(), disk.len() + disk.holds_unused());
         assert_eq!(self.stored, disk.iter().count());
         drop(disk);
         let mut counts: HashMap<&ObjectVersion, usize> = HashMap::default();
