@@ -593,10 +593,13 @@ pub mod identity {
     use sha2::{Digest, Sha256};
     use std::collections::{HashMap, HashSet};
     use std::{
-        cell::RefCell,
+        cell::{Cell, RefCell},
         collections::VecDeque,
         rc::Rc,
-        sync::{Arc, Mutex},
+        sync::{
+            Arc, Mutex, Weak,
+            atomic::{AtomicU64, Ordering},
+        },
     };
     use x509_parser::{extensions::GeneralName, parse_x509_certificate};
     use zeroize::Zeroizing;
@@ -691,6 +694,10 @@ pub mod identity {
     pub struct KeyEpochs {
         state: Mutex<State>,
 
+        /// Advanced with Release after every replacement of the published key
+        /// table, so keyring views reload their worker-local index lazily.
+        epoch: AtomicU64,
+
         clock: WallClock,
     }
 
@@ -706,6 +713,7 @@ pub mod identity {
         pub fn with_clock(clock: WallClock) -> Self {
             Self {
                 state: Mutex::default(),
+                epoch: AtomicU64::new(0),
                 clock,
             }
         }
@@ -717,6 +725,10 @@ pub mod identity {
     }
 
     /// A cluster/node view of shared epochs, responsible for admission and rotation.
+    ///
+    /// Each view keeps a local copy of the admission index, reloaded only when
+    /// the shared epoch moves, so admission checks and leases take no lock.
+    /// The index holds no key material; leases upgrade a weak entry reference.
     #[derive(Clone)]
     pub struct Keyring {
         cluster: ClusterId,
@@ -724,6 +736,11 @@ pub mod identity {
         node: NodeId,
 
         epochs: Arc<KeyEpochs>,
+
+        /// Epoch of `local`; `u64::MAX` before the first load.
+        local_epoch: Cell<u64>,
+
+        local: RefCell<Option<Arc<KeyIndex>>>,
     }
 
     /// Canonical bundle replay tracking paired with its current keyring owner.
@@ -825,9 +842,8 @@ pub mod identity {
     /// fn diagnostic(key: racer_crypto::identity::KeyLease) { println!("{key:?}"); }
     /// ```
     pub struct KeyLease {
-        reference: CacheKeyRef,
-
-        secret: Arc<Secret>,
+        /// The admitted epoch entry; cloning it never allocates.
+        entry: Arc<Entry>,
 
         /// Whether the key was active when leased. Only active keys seal.
         sealable: bool,
@@ -1193,7 +1209,10 @@ pub mod identity {
     /// Empty or coherent publication, with an independently installable identity.
     #[derive(Default)]
     struct State {
-        published: Option<PublishedBundle>,
+        published: Option<Arc<PublishedBundle>>,
+
+        /// Secret-free admission index of `published`.
+        index: Option<Arc<KeyIndex>>,
 
         identity: Option<InstalledIdentity>,
     }
@@ -1208,7 +1227,66 @@ pub mod identity {
 
         roots: Arc<Vec<Vec<u8>>>,
 
-        entries: Vec<Entry>,
+        entries: Vec<Arc<Entry>>,
+    }
+
+    /// Secret-free, sorted admission metadata for one published table. Worker
+    /// views cache it; it never extends the lifetime of key material.
+    struct KeyIndex {
+        cluster: ClusterId,
+
+        generation: BundleGeneration,
+
+        entries: Vec<IndexEntry>,
+    }
+
+    /// One admitted epoch in [`KeyIndex`], sorted like the published entries.
+    struct IndexEntry {
+        reference: CacheKeyRef,
+
+        state: CacheKeyState,
+
+        entry: Weak<Entry>,
+    }
+
+    impl KeyIndex {
+        /// Build the index for a published table.
+        fn new(published: &PublishedBundle) -> Self {
+            Self {
+                cluster: published.cluster.clone(),
+                generation: published.generation,
+                entries: published
+                    .entries
+                    .iter()
+                    .map(|entry| IndexEntry {
+                        reference: entry.reference.clone(),
+                        state: entry.state,
+                        entry: Arc::downgrade(entry),
+                    })
+                    .collect(),
+            }
+        }
+
+        /// Find an exact epoch.
+        fn find(&self, cache: &CacheId, id: KeyId, purpose: KeyPurpose) -> Option<&IndexEntry> {
+            let key = ((cache, purpose as u8), id.0);
+            self.entries
+                .binary_search_by(|entry| reference_order(&entry.reference).cmp(&key))
+                .ok()
+                .map(|i| &self.entries[i])
+        }
+
+        /// Find the unique active epoch of a cache and purpose.
+        fn active(&self, cache: &CacheId, purpose: KeyPurpose) -> Option<&IndexEntry> {
+            let group = (cache, purpose as u8);
+            let first = self
+                .entries
+                .partition_point(|entry| reference_group(&entry.reference) < group);
+            self.entries[first..]
+                .iter()
+                .take_while(|entry| reference_group(&entry.reference) == group)
+                .find(|entry| entry.state == CacheKeyState::Active)
+        }
     }
 
     /// An accepted signing identity and the trust snapshot that validated it.
@@ -1288,7 +1366,8 @@ pub mod identity {
             if !self.sealable {
                 return Err(Error::MissingKey);
             }
-            self.secret
+            self.entry
+                .secret
                 .page_cipher
                 .seal(nonce, aad, input, out)
                 .map_err(|_| Error::CorruptRecord)
@@ -1308,7 +1387,8 @@ pub mod identity {
             out: &mut [u8],
         ) -> Result<()> {
             self.bound_material(cache, id, KeyPurpose::Page)?;
-            self.secret
+            self.entry
+                .secret
                 .page_cipher
                 .open(nonce, aad, input, out)
                 .map_err(|_| Error::CorruptRecord)
@@ -1329,7 +1409,8 @@ pub mod identity {
             tag: &[u8],
         ) -> Result<()> {
             self.bound_material(cache, id, KeyPurpose::Page)?;
-            self.secret
+            self.entry
+                .secret
                 .page_cipher
                 .open_in_place(nonce, aad, inout, tag)
                 .map_err(|_| Error::CorruptRecord)
@@ -1350,7 +1431,8 @@ pub mod identity {
             tag: &[u8],
         ) -> Result<()> {
             self.bound_material(cache, id, KeyPurpose::Page)?;
-            self.secret
+            self.entry
+                .secret
                 .page_cipher
                 .verify_tag(nonce, aad, ciphertext, tag)
                 .map_err(|_| Error::CorruptRecord)
@@ -1451,39 +1533,76 @@ pub mod identity {
 
         /// Return the immutable generation-bound key ID.
         pub fn id(&self) -> KeyId {
-            self.reference.id
+            self.entry.reference.id
         }
 
         /// Return the cache authorized to use this secret.
         pub fn cache(&self) -> &CacheId {
-            &self.reference.cache
+            &self.entry.reference.cache
         }
 
         /// Exact immutable epoch identity, independent of current admission.
         pub fn reference(&self) -> &CacheKeyRef {
-            &self.reference
+            &self.entry.reference
         }
 
         /// Borrow private material only for the lease's fixed purpose.
         fn material(&self, purpose: KeyPurpose) -> Result<&[u8; 32]> {
-            if self.reference.purpose != purpose {
+            if self.entry.reference.purpose != purpose {
                 return Err(Error::MissingKey);
             }
-            Ok(&self.secret.material)
+            Ok(&self.entry.secret.material)
         }
     }
 
     impl Keyring {
         /// Locally installed coherent bundle, not a controller acknowledgment.
         pub fn generation(&self) -> Result<Option<u64>> {
-            Ok(self
-                .epochs
-                .state
-                .lock()
-                .map_err(|_| Error::Unavailable)?
-                .published
-                .as_ref()
-                .map(|bundle| bundle.generation.0))
+            self.with_index(|index| Ok(index.map(|index| index.generation.0)))
+        }
+
+        /// Run `f` over the current admission index, reloading the local copy
+        /// under the shared lock only when the published epoch has moved.
+        #[inline]
+        fn with_index<R>(&self, f: impl FnOnce(Option<&KeyIndex>) -> Result<R>) -> Result<R> {
+            if self.epochs.epoch.load(Ordering::Acquire) != self.local_epoch.get() {
+                self.reload()?;
+            }
+            f(self.local.borrow().as_deref())
+        }
+
+        /// Replace the local index copy with the shared one.
+        #[cold]
+        fn reload(&self) -> Result<()> {
+            let state = self.epochs.state.lock().map_err(|_| Error::Unavailable)?;
+            // The epoch only changes under this lock, so it names `index` exactly.
+            let epoch = self.epochs.epoch.load(Ordering::Relaxed);
+            let index = state.index.clone();
+            drop(state);
+            let old = self.local.replace(index);
+            self.local_epoch.set(epoch);
+            drop(old);
+            Ok(())
+        }
+
+        /// Whether the current table admits this exact epoch.
+        pub fn admits(&self, cache: &CacheId, id: KeyId, purpose: KeyPurpose) -> bool {
+            self.with_index(|index| {
+                Ok(index.is_some_and(|index| {
+                    index.cluster == self.cluster && index.find(cache, id, purpose).is_some()
+                }))
+            })
+            .unwrap_or(false)
+        }
+
+        /// Whether the current table has an active key for this cache and purpose.
+        pub fn has_active(&self, cache: &CacheId, purpose: KeyPurpose) -> bool {
+            self.with_index(|index| {
+                Ok(index.is_some_and(|index| {
+                    index.cluster == self.cluster && index.active(cache, purpose).is_some()
+                }))
+            })
+            .unwrap_or(false)
         }
 
         /// Create a node-bound view without implicitly installing any keys.
@@ -1492,6 +1611,8 @@ pub mod identity {
                 cluster,
                 node,
                 epochs,
+                local_epoch: Cell::new(u64::MAX),
+                local: RefCell::new(None),
             }
         }
 
@@ -1533,10 +1654,17 @@ pub mod identity {
             let validated =
                 ValidatedBundle::prepare(self.epochs.clock(), bundle, &self.cluster, &self.node)?;
             let mut state = self.epochs.state.lock().map_err(|_| Error::Unavailable)?;
-            let published = validated.transition(state.published.as_ref())?;
-            if let Some(published) = published {
-                state.published = Some(published);
-            }
+            let published = validated.transition(state.published.as_deref())?;
+            let retired = published.map(|published| {
+                state.index = Some(Arc::new(KeyIndex::new(&published)));
+                // Release pairs with the Acquire load in `with_index`.
+                self.epochs.epoch.fetch_add(1, Ordering::Release);
+                state.published.replace(Arc::new(published))
+            });
+            drop(state);
+            drop(retired);
+            // Drop this view's copy of the old index now rather than on next use.
+            self.reload()?;
             Ok(bundle.generation)
         }
     }
@@ -1637,7 +1765,7 @@ pub mod identity {
                         Err(Error::InvalidConfiguration)
                     };
                 }
-                let by_reference: HashMap<_, &Entry> = current
+                let by_reference: HashMap<_, &Arc<Entry>> = current
                     .entries
                     .iter()
                     .map(|e| (reference_order(&e.reference), e))
@@ -1684,14 +1812,14 @@ pub mod identity {
                             .ok()
                             .map(|i| &current.entries[i])
                     });
-                    Entry {
+                    Arc::new(Entry {
                         reference: candidate.key.clone(),
                         state: candidate.state,
                         secret: retained.map_or_else(
                             || Arc::new(Secret::new(candidate.material.clone())),
                             |entry| entry.secret.clone(),
                         ),
-                    }
+                    })
                 })
                 .collect();
             entries
@@ -1799,51 +1927,40 @@ pub mod identity {
             id: KeyId,
             purpose: KeyPurpose,
         ) -> Result<KeyLease> {
-            let reference = CacheKeyRef {
-                cache: cache.ok_or(Error::MissingKey)?.clone(),
-                id,
-                purpose,
-            };
-            let state = self.epochs.state.lock().map_err(|_| Error::Unavailable)?;
-            let published = state.published.as_ref().ok_or(Error::MissingKey)?;
-            if published.cluster != self.cluster {
-                return Err(Error::MissingKey);
-            }
-            let position = published
-                .entries
-                .binary_search_by(|entry| {
-                    reference_order(&entry.reference).cmp(&reference_order(&reference))
-                })
-                .map_err(|_| Error::MissingKey)?;
-            let entry = &published.entries[position];
-            Ok(KeyLease {
-                reference,
-                secret: entry.secret.clone(),
-                sealable: entry.state == CacheKeyState::Active,
-            })
+            let cache = cache.ok_or(Error::MissingKey)?;
+            self.lease_with(|index| index.find(cache, id, purpose))
         }
 
         /// Admit the unique active key for this cache and purpose.
         pub fn active(&self, cache: &CacheId, purpose: KeyPurpose) -> Result<KeyLease> {
-            let state = self.epochs.state.lock().map_err(|_| Error::Unavailable)?;
-            let published = state.published.as_ref().ok_or(Error::MissingKey)?;
-            if published.cluster != self.cluster {
-                return Err(Error::MissingKey);
+            self.lease_with(|index| index.active(cache, purpose))
+        }
+
+        /// Lease the entry selected from the current index without a lock or
+        /// an allocation. A concurrent replacement can retire the entry between
+        /// the epoch check and the upgrade; then reload once and retry.
+        fn lease_with(
+            &self,
+            select: impl Fn(&KeyIndex) -> Option<&IndexEntry>,
+        ) -> Result<KeyLease> {
+            for _ in 0..2 {
+                let leased = self.with_index(|index| {
+                    let index = index.ok_or(Error::MissingKey)?;
+                    if index.cluster != self.cluster {
+                        return Err(Error::MissingKey);
+                    }
+                    let found = select(index).ok_or(Error::MissingKey)?;
+                    Ok(found.entry.upgrade().map(|entry| KeyLease {
+                        entry,
+                        sealable: found.state == CacheKeyState::Active,
+                    }))
+                })?;
+                if let Some(lease) = leased {
+                    return Ok(lease);
+                }
+                self.reload()?;
             }
-            let group = (cache, purpose as u8);
-            let first = published
-                .entries
-                .partition_point(|entry| reference_group(&entry.reference) < group);
-            let entry = published.entries[first..]
-                .iter()
-                .take_while(|entry| reference_group(&entry.reference) == group)
-                .find(|entry| entry.state == CacheKeyState::Active)
-                .ok_or(Error::MissingKey)?;
-            Ok(KeyLease {
-                reference: entry.reference.clone(),
-                secret: entry.secret.clone(),
-                sealable: true,
-            })
+            Err(Error::MissingKey)
         }
     }
 
@@ -2346,7 +2463,7 @@ pub mod identity {
                 assert_eq!(keys.generation().unwrap(), Some(1));
                 assert!(Arc::ptr_eq(&roots, &keys.peer_trust_roots().unwrap()));
                 let admitted = keys.active(held.cache(), KeyPurpose::Page).unwrap();
-                assert!(Arc::ptr_eq(&held.secret, &admitted.secret));
+                assert!(Arc::ptr_eq(&held.entry.secret, &admitted.entry.secret));
             }
 
             initial.generation = BundleGeneration(2);
@@ -2354,9 +2471,45 @@ pub mod identity {
             assert_eq!(keys.generation().unwrap(), Some(2));
             assert!(Arc::ptr_eq(&roots, &keys.peer_trust_roots().unwrap()));
             assert!(Arc::ptr_eq(
-                &held.secret,
-                &keys.active(held.cache(), KeyPurpose::Page).unwrap().secret
+                &held.entry.secret,
+                &keys
+                    .active(held.cache(), KeyPurpose::Page)
+                    .unwrap()
+                    .entry
+                    .secret
             ));
+        }
+
+        /// Views share one published table but cache only a secret-free index:
+        /// an idle view never extends key material, and sees rotation lazily.
+        #[test]
+        fn view_index_follows_epoch_without_pinning_secrets() {
+            let keys = keys();
+            let other = Keyring::new(
+                keys.cluster().clone(),
+                keys.node().clone(),
+                keys.epochs.clone(),
+            );
+            let roots = (*keys.peer_trust_roots().unwrap()).clone();
+            let first = rotation_bundle(2, roots.clone());
+            keys.install_inner(&first).unwrap();
+            let cache = CacheId(CACHE.into());
+            let lease = other.active(&cache, KeyPurpose::Page).unwrap();
+            let held = lease.reference().clone();
+            assert!(other.admits(&cache, held.id, KeyPurpose::Page));
+            assert!(other.has_active(&cache, KeyPurpose::Page));
+            let secret = Arc::downgrade(&lease.entry.secret);
+            keys.install_inner(&rotation_bundle(100, roots)).unwrap();
+            // `other` has not looked since; its stale index must not pin secrets.
+            drop(lease);
+            assert!(secret.upgrade().is_none());
+            assert!(!other.admits(&cache, held.id, KeyPurpose::Page));
+            assert!(
+                other
+                    .lease(Some(&cache), held.id, KeyPurpose::Page)
+                    .is_err()
+            );
+            assert_eq!(other.generation().unwrap(), Some(100));
         }
 
         /// Removed epochs cannot return even after skipped bundle generations.
@@ -2369,7 +2522,7 @@ pub mod identity {
             let lease = keys
                 .active(&CacheId(CACHE.into()), KeyPurpose::Page)
                 .unwrap();
-            let secret = Arc::downgrade(&lease.secret);
+            let secret = Arc::downgrade(&lease.entry.secret);
             // Skipped bundle generations are normal after projected-secret delays.
             let next = rotation_bundle(100, roots.clone());
             keys.install_inner(&next).unwrap();
@@ -2578,7 +2731,7 @@ pub mod identity {
             keys.install_inner(&rotated).unwrap();
             let active = keys.active(&cache, KeyPurpose::Page).unwrap();
             assert_eq!(active.id(), prepared.id());
-            assert!(Arc::ptr_eq(&active.secret, &prepared.secret));
+            assert!(Arc::ptr_eq(&active.entry.secret, &prepared.entry.secret));
             assert!(
                 keys.lease(Some(&cache), lease.id(), KeyPurpose::Page)
                     .is_err()
@@ -2592,7 +2745,7 @@ pub mod identity {
             let keys = keys();
             let cache = CacheId(CACHE.into());
             let lease = keys.active(&cache, KeyPurpose::Page).unwrap();
-            let reference = lease.reference.clone();
+            let reference = lease.reference().clone();
             let mut next = bundle(
                 2,
                 (*keys.peer_trust_roots().unwrap()).clone(),
@@ -2610,7 +2763,7 @@ pub mod identity {
                 keys.active(&cache, KeyPurpose::Page).unwrap().id(),
                 KeyId::from_generation(2, 4).unwrap()
             );
-            let secret = Arc::downgrade(&lease.secret);
+            let secret = Arc::downgrade(&lease.entry.secret);
             assert_eq!(lease.material(KeyPurpose::Page).unwrap(), &[7; 32]);
             assert_eq!(secret.strong_count(), 1);
             // Exact replay must acknowledge the new epoch without reviving the old one.
