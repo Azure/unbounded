@@ -97,6 +97,10 @@ type BackendFactory func(log *slog.Logger, cfg *provision.AgentConfig) isolation
 // hasDrift reports whether the desired AgentConfig differs from the applied
 // config in any field that would require a machine update.
 func hasDrift(applied, desired *provision.AgentConfig) bool {
+	if effectiveIsolation(applied) != effectiveIsolation(desired) {
+		return true
+	}
+
 	appliedVersion := strings.TrimPrefix(applied.Cluster.Version, "v")
 
 	desiredVersion := strings.TrimPrefix(desired.Cluster.Version, "v")
@@ -153,4 +157,26 @@ func hasDrift(applied, desired *provision.AgentConfig) bool {
 
 func gantryDisabled(cfg *provision.AgentConfig) bool {
 	return cfg.Gantry != nil && cfg.Gantry.Disabled
+}
+
+// effectiveIsolation is the mode cfg selects, with an empty value meaning the
+// default mode. A value the agent cannot parse is returned as is, so it still
+// compares unequal to every mode the agent can operate.
+func effectiveIsolation(cfg *provision.AgentConfig) isolation.Mode {
+	mode, err := cfg.IsolationMode()
+	if err != nil {
+		return isolation.Mode(cfg.Isolation)
+	}
+
+	return mode
+}
+
+// activeModeOf is the mode the active machine runs in. An unset mode is the
+// default mode.
+func activeModeOf(active *ActiveMachine) isolation.Mode {
+	if active.Mode == "" {
+		return isolation.DefaultMode
+	}
+
+	return active.Mode
 }
