@@ -12,10 +12,13 @@ import (
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	apimeta "k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
+	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 
 	signalv1 "github.com/Azure/unbounded/api/signal/v1alpha1"
@@ -308,6 +311,167 @@ func TestEvaluateLedgerRevocationExpiryAndFingerprintInvalidation(t *testing.T) 
 	}
 }
 
+func TestEvaluateLedgerRequalifiesAfterFingerprintChange(t *testing.T) {
+	t.Parallel()
+
+	now := time.Now().UTC()
+	node := qualificationNode("node", "node-uid", "boot-b")
+	policy := qualificationPolicy("policy", "policy-uid", signalv1.NonPassBehaviorIgnore)
+	policy.Spec.InvalidationFingerprintFields = []signalv1.FingerprintField{
+		signalv1.FingerprintFieldNodeUID,
+		signalv1.FingerprintFieldBootID,
+	}
+	oldPass := qualificationRun("old-pass", node, signalv1.QualificationVerdictPass, now.Add(-time.Hour))
+	oldPass.Status.Evidence.Identity.Participants[0].Start.BootID = "boot-a"
+	oldPass.Status.Evidence.Identity.Participants[0].End.BootID = "boot-a"
+	newPass := qualificationRun("new-pass", node, signalv1.QualificationVerdictPass, now)
+	policy.Spec.Requirements[0].AcceptedPlans.Digests = []string{newPass.Spec.PlanDigest}
+
+	scheme := qualificationScheme(t)
+	kube := fake.NewClientBuilder().WithScheme(scheme).WithObjects(node, policy, oldPass, newPass).Build()
+	reconciler := &QualificationReconciler{
+		Client:    kube,
+		APIReader: kube,
+		Evidence:  missingEvidenceStore{},
+		Namespace: "signal-system",
+		Now:       func() time.Time { return now },
+	}
+
+	status, err := reconciler.evaluateLedger(context.Background(), policy, node, qualificationLedger(policy, node))
+	if err != nil {
+		t.Fatalf("evaluateLedger() error = %v", err)
+	}
+	if status.Phase != signalv1.NodeCertificationPhaseQualified ||
+		len(status.ContributingRuns) != 1 ||
+		status.ContributingRuns[0].UID != newPass.UID {
+		t.Fatalf("requalification status = %#v", status)
+	}
+
+	newPass.Status.Evidence.Identity.Participants[0].Start.BootID = "boot-a"
+	kube = fake.NewClientBuilder().WithScheme(scheme).WithObjects(node, policy, newPass).Build()
+	reconciler.Client = kube
+	reconciler.APIReader = kube
+
+	status, err = reconciler.evaluateLedger(context.Background(), policy, node, qualificationLedger(policy, node))
+	if err != nil {
+		t.Fatalf("evaluateLedger(changed within Run) error = %v", err)
+	}
+	if status.Phase == signalv1.NodeCertificationPhaseQualified {
+		t.Fatalf("same-Run fingerprint change received credit: %#v", status)
+	}
+}
+
+func TestQualificationEvidenceRetriesTransientNodeRead(t *testing.T) {
+	t.Parallel()
+
+	node := qualificationNode("node", "node-uid", "boot-a")
+	run := qualificationRun("run", node, signalv1.QualificationVerdictPass, time.Now().UTC())
+	run.Annotations = map[string]string{
+		RunStartIdentityAnnotation: `[{"nodeUID":"node-uid","bootID":"boot-a"}]`,
+	}
+	start := metav1.NewTime(time.Now().UTC().Add(-time.Minute))
+	finish := metav1.NewTime(time.Now().UTC())
+	reconciler := &RunReconciler{
+		APIReader: failingNodeReader{
+			err: apierrors.NewServiceUnavailable("temporary API failure"),
+		},
+		ControllerImage: pinnedImage("controller", "a"),
+	}
+
+	identity, verdict, reason, err := reconciler.qualificationEvidenceIdentity(
+		context.Background(),
+		run,
+		[]signalv1.CheckStatus{{
+			ID:         signalv1.CheckID("R01"),
+			Phase:      signalv1.CheckPhaseSucceeded,
+			StartedAt:  &start,
+			FinishedAt: &finish,
+		}},
+		"Pass",
+		"",
+	)
+	if err == nil || !apierrors.IsServiceUnavailable(err) {
+		t.Fatalf("qualificationEvidenceIdentity() error = %v, want service unavailable", err)
+	}
+	if identity != nil || verdict != "Pass" || reason != "" {
+		t.Fatalf("transient failure changed result: identity %#v, verdict %q, reason %q", identity, verdict, reason)
+	}
+}
+
+func TestQualificationReconcileIsolatesCorruptEvidenceAndListsRunsOnce(t *testing.T) {
+	t.Parallel()
+
+	now := time.Now().UTC()
+	policy := qualificationPolicy("policy", "policy-uid", signalv1.NonPassBehaviorIgnore)
+	corruptNode := qualificationNode("corrupt", "corrupt-uid", "boot-a")
+	cleanupNode := qualificationNode("cleanup", "cleanup-uid", "boot-a")
+	cleanupNode.Labels = map[string]string{
+		signalv1.NodeQualificationLabel: signalv1.NodeQualificationValue,
+	}
+	corruptLedger := qualificationLedger(policy, corruptNode)
+	corruptLedger.Status.ContributingRuns = []signalv1.ContributingRunReference{{
+		Name:           "corrupt-run",
+		UID:            "corrupt-run-uid",
+		PlanDigest:     "sha256:" + strings.Repeat("a", 64),
+		EvidenceURI:    "kubernetes://signal-system/corrupt-run",
+		EvidenceDigest: "sha256:" + strings.Repeat("b", 64),
+	}}
+	cleanupLedger := qualificationLedger(policy, cleanupNode)
+	cleanupLedger.Status.Phase = signalv1.NodeCertificationPhaseRevoked
+
+	scheme := qualificationScheme(t)
+	base := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithStatusSubresource(&signalv1.NodeCertification{}).
+		WithObjects(policy, corruptNode, cleanupNode, corruptLedger, cleanupLedger).
+		Build()
+	kube := &countingClient{Client: base}
+	reconciler := &QualificationReconciler{
+		Client:        kube,
+		APIReader:     kube,
+		Evidence:      corruptEvidenceStore{},
+		Namespace:     "signal-system",
+		GateProtected: true,
+		Now:           func() time.Time { return now },
+	}
+
+	_, err := reconciler.Reconcile(
+		context.Background(),
+		ctrl.Request{NamespacedName: types.NamespacedName{Name: policy.Name}},
+	)
+	if err == nil {
+		t.Fatal("Reconcile() error = nil, want corrupt evidence error")
+	}
+	if kube.runLists != 1 {
+		t.Fatalf("CertificationRun lists = %d, want 1", kube.runLists)
+	}
+
+	var currentCleanup corev1.Node
+	if err := kube.Get(
+		context.Background(),
+		types.NamespacedName{Name: cleanupNode.Name},
+		&currentCleanup,
+	); err != nil {
+		t.Fatal(err)
+	}
+	if _, exists := currentCleanup.Labels[signalv1.NodeQualificationLabel]; exists {
+		t.Fatalf("corrupt evidence prevented unrelated label cleanup: %#v", currentCleanup.Labels)
+	}
+
+	var currentCorrupt signalv1.NodeCertification
+	if err := kube.Get(
+		context.Background(),
+		types.NamespacedName{Namespace: corruptLedger.Namespace, Name: corruptLedger.Name},
+		&currentCorrupt,
+	); err != nil {
+		t.Fatal(err)
+	}
+	condition := apimeta.FindStatusCondition(currentCorrupt.Status.Conditions, "EvidenceHealthy")
+	if condition == nil || condition.Status != metav1.ConditionFalse {
+		t.Fatalf("corrupt evidence condition = %#v", condition)
+	}
+}
+
 func TestEvaluateLedgerAccumulatesSeparatedRunsAndResetsAfterNonPass(t *testing.T) {
 	t.Parallel()
 
@@ -364,6 +528,157 @@ func TestEvaluateLedgerAccumulatesSeparatedRunsAndResetsAfterNonPass(t *testing.
 
 	if status.Phase == signalv1.NodeCertificationPhaseQualified {
 		t.Fatalf("pre-failure Runs retained credit after Reset: %#v", status)
+	}
+}
+
+func TestEvaluateLedgerRevokeWatermarkSurvivesFailedRunDeletion(t *testing.T) {
+	t.Parallel()
+
+	now := time.Now().UTC()
+	node := qualificationNode("node", "node-uid", "boot-a")
+	policy := qualificationPolicy("policy", "policy-uid", signalv1.NonPassBehaviorRevoke)
+	oldPass := qualificationRun("old-pass", node, signalv1.QualificationVerdictPass, now.Add(-time.Hour))
+	failed := qualificationRun("failed", node, signalv1.QualificationVerdictFail, now.Add(-30*time.Minute))
+	failed.Status.Phase = signalv1.RunPhaseFailed
+	policy.Spec.Requirements[0].AcceptedPlans.Digests = []string{oldPass.Spec.PlanDigest}
+
+	scheme := qualificationScheme(t)
+	kube := fake.NewClientBuilder().WithScheme(scheme).WithObjects(node, policy, oldPass, failed).Build()
+	reconciler := &QualificationReconciler{
+		Client:    kube,
+		APIReader: kube,
+		Evidence:  missingEvidenceStore{},
+		Namespace: "signal-system",
+		Now:       func() time.Time { return now },
+	}
+	ledger := qualificationLedger(policy, node)
+
+	status, err := reconciler.evaluateLedger(context.Background(), policy, node, ledger)
+	if err != nil {
+		t.Fatalf("evaluateLedger(with failed Run) error = %v", err)
+	}
+	if status.Phase != signalv1.NodeCertificationPhaseRevoked ||
+		status.LatestNonPass == nil ||
+		status.LatestNonPass.UID != failed.UID {
+		t.Fatalf("revoked status = %#v", status)
+	}
+
+	ledger.Status = status
+	kube = fake.NewClientBuilder().WithScheme(scheme).WithObjects(node, policy, oldPass).Build()
+	reconciler.Client = kube
+	reconciler.APIReader = kube
+
+	status, err = reconciler.evaluateLedger(context.Background(), policy, node, ledger)
+	if err != nil {
+		t.Fatalf("evaluateLedger(after failed Run deletion) error = %v", err)
+	}
+	if status.Phase != signalv1.NodeCertificationPhaseRevoked ||
+		status.LatestNonPass == nil ||
+		status.LatestNonPass.UID != failed.UID {
+		t.Fatalf("failed Run deletion laundered revocation: %#v", status)
+	}
+
+	newPass := qualificationRun("new-pass", node, signalv1.QualificationVerdictPass, now)
+	kube = fake.NewClientBuilder().WithScheme(scheme).WithObjects(node, policy, oldPass, newPass).Build()
+	reconciler.Client = kube
+	reconciler.APIReader = kube
+
+	status, err = reconciler.evaluateLedger(context.Background(), policy, node, ledger)
+	if err != nil {
+		t.Fatalf("evaluateLedger(with later pass) error = %v", err)
+	}
+	if status.Phase != signalv1.NodeCertificationPhaseQualified ||
+		len(status.ContributingRuns) != 1 ||
+		status.ContributingRuns[0].UID != newPass.UID {
+		t.Fatalf("later pass did not requalify after revocation: %#v", status)
+	}
+}
+
+func TestEvaluateLedgerResetWatermarkSurvivesFailedRunDeletion(t *testing.T) {
+	t.Parallel()
+
+	now := time.Now().UTC()
+	node := qualificationNode("node", "node-uid", "boot-a")
+	policy := qualificationPolicy("policy", "policy-uid", signalv1.NonPassBehaviorReset)
+	policy.Spec.Requirements[0].RequiredPassCount = 2
+	oldPassA := qualificationRun("old-pass-a", node, signalv1.QualificationVerdictPass, now.Add(-2*time.Hour))
+	oldPassB := qualificationRun("old-pass-b", node, signalv1.QualificationVerdictPass, now.Add(-time.Hour))
+	failed := qualificationRun("failed", node, signalv1.QualificationVerdictFail, now.Add(-30*time.Minute))
+	failed.Status.Phase = signalv1.RunPhaseFailed
+	policy.Spec.Requirements[0].AcceptedPlans.Digests = []string{oldPassA.Spec.PlanDigest}
+
+	scheme := qualificationScheme(t)
+	kube := fake.NewClientBuilder().WithScheme(scheme).WithObjects(
+		node,
+		policy,
+		oldPassA,
+		oldPassB,
+		failed,
+	).Build()
+	reconciler := &QualificationReconciler{
+		Client:    kube,
+		APIReader: kube,
+		Evidence:  missingEvidenceStore{},
+		Namespace: "signal-system",
+		Now:       func() time.Time { return now },
+	}
+	ledger := qualificationLedger(policy, node)
+
+	status, err := reconciler.evaluateLedger(context.Background(), policy, node, ledger)
+	if err != nil {
+		t.Fatalf("evaluateLedger(with failed Run) error = %v", err)
+	}
+	if status.Phase == signalv1.NodeCertificationPhaseQualified ||
+		status.LatestNonPass == nil ||
+		status.LatestNonPass.UID != failed.UID ||
+		len(status.ContributingRuns) != 0 ||
+		len(status.PlanDigests) != 0 {
+		t.Fatalf("reset status = %#v", status)
+	}
+
+	ledger.Status = status
+	newPassA := qualificationRun("new-pass-a", node, signalv1.QualificationVerdictPass, now.Add(-10*time.Minute))
+	kube = fake.NewClientBuilder().WithScheme(scheme).WithObjects(
+		node,
+		policy,
+		oldPassA,
+		oldPassB,
+		newPassA,
+	).Build()
+	reconciler.Client = kube
+	reconciler.APIReader = kube
+
+	status, err = reconciler.evaluateLedger(context.Background(), policy, node, ledger)
+	if err != nil {
+		t.Fatalf("evaluateLedger(after failed Run deletion) error = %v", err)
+	}
+	if status.Phase == signalv1.NodeCertificationPhaseQualified ||
+		status.LatestNonPass == nil ||
+		status.LatestNonPass.UID != failed.UID ||
+		len(status.ContributingRuns) != 0 {
+		t.Fatalf("failed Run deletion laundered reset: %#v", status)
+	}
+
+	ledger.Status = status
+	newPassB := qualificationRun("new-pass-b", node, signalv1.QualificationVerdictPass, now)
+	kube = fake.NewClientBuilder().WithScheme(scheme).WithObjects(
+		node,
+		policy,
+		oldPassA,
+		oldPassB,
+		newPassA,
+		newPassB,
+	).Build()
+	reconciler.Client = kube
+	reconciler.APIReader = kube
+
+	status, err = reconciler.evaluateLedger(context.Background(), policy, node, ledger)
+	if err != nil {
+		t.Fatalf("evaluateLedger(with replacement passes) error = %v", err)
+	}
+	if status.Phase != signalv1.NodeCertificationPhaseQualified ||
+		len(status.ContributingRuns) != 2 {
+		t.Fatalf("replacement passes did not qualify after reset: %#v", status)
 	}
 }
 
@@ -631,6 +946,42 @@ func (missingEvidenceStore) Put(context.Context, string, []byte) (string, string
 
 func (missingEvidenceStore) Get(context.Context, string) ([]byte, string, string, bool, error) {
 	return nil, "", "", false, nil
+}
+
+type corruptEvidenceStore struct{}
+
+func (corruptEvidenceStore) Put(context.Context, string, []byte) (string, string, error) {
+	return "", "", nil
+}
+
+func (corruptEvidenceStore) Get(context.Context, string) ([]byte, string, string, bool, error) {
+	return []byte("{"), "", "sha256:" + strings.Repeat("b", 64), true, nil
+}
+
+type failingNodeReader struct {
+	client.Reader
+	err error
+}
+
+func (r failingNodeReader) Get(context.Context, client.ObjectKey, client.Object, ...client.GetOption) error {
+	return r.err
+}
+
+type countingClient struct {
+	client.Client
+	runLists int
+}
+
+func (c *countingClient) List(
+	ctx context.Context,
+	list client.ObjectList,
+	options ...client.ListOption,
+) error {
+	if _, ok := list.(*signalv1.CertificationRunList); ok {
+		c.runLists++
+	}
+
+	return c.Client.List(ctx, list, options...)
 }
 
 func qualificationScheme(t *testing.T) *runtime.Scheme {

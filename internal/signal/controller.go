@@ -2754,7 +2754,15 @@ func (r *RunReconciler) qualificationEvidenceIdentity(
 			client.ObjectKey{Name: run.Spec.Participants[index].NodeName},
 			&node,
 		); err != nil {
-			return nil, "Inconclusive", "ParticipantIdentityMissing: end fingerprint unavailable", nil
+			if apierrors.IsNotFound(err) {
+				return nil, "Inconclusive", "ParticipantIdentityMissing: end fingerprint unavailable", nil
+			}
+
+			return nil, verdict, reason, fmt.Errorf(
+				"read participant %s end fingerprint: %w",
+				run.Spec.Participants[index].NodeName,
+				err,
+			)
 		}
 
 		if node.UID != run.Spec.Participants[index].NodeUID {

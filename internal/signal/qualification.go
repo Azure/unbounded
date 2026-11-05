@@ -10,6 +10,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"reflect"
 	"slices"
 	"sort"
 	"time"
@@ -59,6 +60,10 @@ type qualificationRecord struct {
 	StartedAt  time.Time
 	FinishedAt time.Time
 }
+
+type qualificationRunIndex map[types.UID][]qualificationRecord
+
+type qualificationRunIndexContextKey struct{}
 
 func (r *QualificationReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	if r.Client == nil || r.APIReader == nil || r.Evidence == nil {
@@ -123,23 +128,30 @@ func (r *QualificationReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 		return ctrl.Result{}, err
 	}
 
+	runIndex, err := r.buildQualificationRunIndex(ctx)
+	if err != nil {
+		return ctrl.Result{}, err
+	}
+	ctx = context.WithValue(ctx, qualificationRunIndexContextKey{}, runIndex)
+
+	var reconcileErrors []error
 	for index := range nodes.Items {
 		if err := r.reconcileNodeLedger(ctx, &policy, &nodes.Items[index]); err != nil {
-			return ctrl.Result{}, err
+			reconcileErrors = append(reconcileErrors, err)
 		}
 	}
 
 	if err := r.markGoneLedgers(ctx, &policy, nodes.Items); err != nil {
-		return ctrl.Result{}, err
+		reconcileErrors = append(reconcileErrors, err)
 	}
 
 	for index := range nodes.Items {
 		if err := r.reconcileQualificationLabel(ctx, &nodes.Items[index]); err != nil {
-			return ctrl.Result{}, err
+			reconcileErrors = append(reconcileErrors, err)
 		}
 	}
 
-	return ctrl.Result{RequeueAfter: time.Minute}, nil
+	return ctrl.Result{RequeueAfter: time.Minute}, errors.Join(reconcileErrors...)
 }
 
 func (r *QualificationReconciler) finalizePolicy(
@@ -228,14 +240,18 @@ func (r *QualificationReconciler) reconcileNodeLedger(
 	}
 
 	status, err := r.evaluateLedger(ctx, policy, node, &ledger)
-	if err != nil {
-		return err
-	}
 
 	before := ledger.DeepCopy()
 	ledger.Status = status
+	if reflect.DeepEqual(before.Status, ledger.Status) {
+		return err
+	}
 
-	return r.Status().Patch(ctx, &ledger, client.MergeFrom(before))
+	if patchErr := r.Status().Patch(ctx, &ledger, client.MergeFrom(before)); patchErr != nil {
+		return errors.Join(err, patchErr)
+	}
+
+	return err
 }
 
 func (r *QualificationReconciler) evaluateLedger(
@@ -263,32 +279,49 @@ func (r *QualificationReconciler) evaluateLedger(
 
 	records, err := r.qualificationRecords(ctx, ledger, node.UID)
 	if err != nil {
-		return status, err
+		apimeta.SetStatusCondition(&status.Conditions, metav1.Condition{
+			Type:               "EvidenceHealthy",
+			Status:             metav1.ConditionFalse,
+			ObservedGeneration: policy.Generation,
+			Reason:             "EvidenceUnavailable",
+			Message:            boundedStatusText(err.Error()),
+		})
+	} else {
+		apimeta.SetStatusCondition(&status.Conditions, metav1.Condition{
+			Type:               "EvidenceHealthy",
+			Status:             metav1.ConditionTrue,
+			ObservedGeneration: policy.Generation,
+			Reason:             "Verified",
+			Message:            "All retained evidence references were verified",
+		})
+	}
+	evidenceErr := err
+
+	var liveNonPass *signalv1.LatestNonPassWatermark
+
+	var watermarkErr error
+	if policy.Spec.NonPassBehavior != signalv1.NonPassBehaviorIgnore {
+		liveNonPass, watermarkErr = latestNonPassWatermark(policy, records)
+	}
+	evidenceErr = errors.Join(evidenceErr, watermarkErr)
+	if watermarkErr != nil {
+		clearQualificationStatus(&status)
+		status.Phase = signalv1.NodeCertificationPhasePending
+		status.Reason = "Latest non-pass evidence could not be recorded"
+
+		return status, evidenceErr
 	}
 
-	latestNonPass := time.Time{}
-	for index := range records {
-		if recordMatchesPolicy(policy, records[index]) &&
-			records[index].Phase != signalv1.RunPhaseSucceeded &&
-			records[index].FinishedAt.After(latestNonPass) {
-			latestNonPass = records[index].FinishedAt
-		}
+	if watermarkAfter(liveNonPass, status.LatestNonPass) {
+		status.LatestNonPass = liveNonPass
+		clearQualificationStatus(&status)
 	}
 
-	if !latestNonPass.IsZero() {
-		switch policy.Spec.NonPassBehavior {
-		case signalv1.NonPassBehaviorRevoke:
-			status.Phase = signalv1.NodeCertificationPhaseRevoked
-			status.Reason = "A later non-pass Run revoked qualification"
-			status.QualifiedAt = nil
-			status.ExpiresAt = nil
-
-			return status, nil
-		case signalv1.NonPassBehaviorReset:
-			records = slices.DeleteFunc(records, func(record qualificationRecord) bool {
-				return !record.FinishedAt.After(latestNonPass)
-			})
-		}
+	if status.LatestNonPass != nil &&
+		policy.Spec.NonPassBehavior != signalv1.NonPassBehaviorIgnore {
+		records = slices.DeleteFunc(records, func(record qualificationRecord) bool {
+			return !record.FinishedAt.After(status.LatestNonPass.FinishedAt.Time)
+		})
 	}
 
 	contributions := make([]qualificationRecord, 0)
@@ -296,24 +329,41 @@ func (r *QualificationReconciler) evaluateLedger(
 	for requirementIndex := range policy.Spec.Requirements {
 		requirement := &policy.Spec.Requirements[requirementIndex]
 
-		accepted, err := r.acceptedRecords(ctx, requirement, node.UID, records)
+		accepted, err := r.acceptedRecords(
+			ctx,
+			requirement,
+			node,
+			policy.Spec.InvalidationFingerprintFields,
+			records,
+		)
 		if err != nil {
-			return status, err
+			return status, errors.Join(evidenceErr, err)
 		}
 
 		if !requirementSatisfied(requirement, accepted) {
-			status.Phase = signalv1.NodeCertificationPhaseQualifying
-			if len(contributions) == 0 {
+			switch {
+			case policy.Spec.NonPassBehavior == signalv1.NonPassBehaviorRevoke &&
+				status.LatestNonPass != nil:
+				status.Phase = signalv1.NodeCertificationPhaseRevoked
+			case len(contributions) == 0:
 				status.Phase = signalv1.NodeCertificationPhasePending
+			default:
+				status.Phase = signalv1.NodeCertificationPhaseQualifying
 			}
 
 			status.Reason = fmt.Sprintf("Requirement %s is not yet satisfied", requirement.Name)
+			if status.Phase == signalv1.NodeCertificationPhaseRevoked {
+				status.Reason = fmt.Sprintf(
+					"Requirement %s is not yet satisfied after the latest non-pass Run",
+					requirement.Name,
+				)
+			}
 			status.ContributingRuns = recordReferences(contributions)
 			status.PlanDigests = recordPlanDigests(contributions)
 			status.QualifiedAt = nil
 			status.ExpiresAt = nil
 
-			return status, nil
+			return status, evidenceErr
 		}
 
 		contributions = append(contributions, accepted...)
@@ -328,7 +378,7 @@ func (r *QualificationReconciler) evaluateLedger(
 		status.QualifiedAt = nil
 		status.ExpiresAt = nil
 
-		return status, nil
+		return status, evidenceErr
 	}
 
 	qualifiedAt := latestRecordTime(contributions)
@@ -351,7 +401,7 @@ func (r *QualificationReconciler) evaluateLedger(
 			Message:            "Qualification evidence has expired",
 		})
 
-		return status, nil
+		return status, evidenceErr
 	}
 
 	status.Phase = signalv1.NodeCertificationPhaseQualified
@@ -376,7 +426,86 @@ func (r *QualificationReconciler) evaluateLedger(
 		Message:            conditionMessage,
 	})
 
-	return status, nil
+	return status, evidenceErr
+}
+
+func latestNonPassWatermark(
+	policy *signalv1.CertificationPolicy,
+	records []qualificationRecord,
+) (*signalv1.LatestNonPassWatermark, error) {
+	var latest *signalv1.LatestNonPassWatermark
+
+	for index := range records {
+		record := records[index]
+		if !recordMatchesPolicy(policy, record) || record.Phase == signalv1.RunPhaseSucceeded {
+			continue
+		}
+
+		classification, ok := nonPassClassification(record.Phase)
+		if !ok {
+			continue
+		}
+		if !signalv1.IsSHA256Digest(record.Reference.EvidenceDigest) {
+			return nil, fmt.Errorf(
+				"non-pass Run %s has no valid evidence digest",
+				record.Reference.Name,
+			)
+		}
+
+		candidate := &signalv1.LatestNonPassWatermark{
+			Name:           record.Reference.Name,
+			UID:            record.Reference.UID,
+			FinishedAt:     metav1.NewTime(record.FinishedAt),
+			Classification: classification,
+			EvidenceDigest: record.Reference.EvidenceDigest,
+		}
+		if watermarkAfter(candidate, latest) {
+			latest = candidate
+		}
+	}
+
+	return latest, nil
+}
+
+func nonPassClassification(phase signalv1.RunPhase) (signalv1.NonPassClassification, bool) {
+	switch phase {
+	case signalv1.RunPhaseFailed:
+		return signalv1.NonPassClassificationFailed, true
+	case signalv1.RunPhaseInconclusive:
+		return signalv1.NonPassClassificationInconclusive, true
+	case signalv1.RunPhaseCancelled:
+		return signalv1.NonPassClassificationCanceled, true
+	default:
+		return "", false
+	}
+}
+
+func watermarkAfter(
+	candidate *signalv1.LatestNonPassWatermark,
+	current *signalv1.LatestNonPassWatermark,
+) bool {
+	if candidate == nil {
+		return false
+	}
+	if current == nil {
+		return true
+	}
+	if candidate.FinishedAt.After(current.FinishedAt.Time) {
+		return true
+	}
+	if !candidate.FinishedAt.Equal(&current.FinishedAt) {
+		return false
+	}
+
+	return string(candidate.UID) > string(current.UID)
+}
+
+func clearQualificationStatus(status *signalv1.NodeCertificationStatus) {
+	status.PlanDigests = nil
+	status.Fingerprint = nil
+	status.QualifiedAt = nil
+	status.ExpiresAt = nil
+	status.ContributingRuns = nil
 }
 
 func (r *QualificationReconciler) qualificationRecords(
@@ -386,28 +515,66 @@ func (r *QualificationReconciler) qualificationRecords(
 ) ([]qualificationRecord, error) {
 	records := make([]qualificationRecord, 0, len(ledger.Status.ContributingRuns))
 	seen := map[types.UID]struct{}{}
+	var evidenceErrors []error
 
 	for index := range ledger.Status.ContributingRuns {
-		record, found, err := r.recordFromEvidence(ctx, ledger.Status.ContributingRuns[index])
+		reference := ledger.Status.ContributingRuns[index]
+		seen[reference.UID] = struct{}{}
+
+		record, found, err := r.recordFromEvidence(ctx, reference)
 		if err != nil {
-			return nil, err
+			evidenceErrors = append(evidenceErrors, fmt.Errorf(
+				"verify retained Run %s evidence: %w",
+				reference.Name,
+				err,
+			))
+
+			continue
 		}
 
 		if !found || !recordIncludesNode(record, nodeUID) {
 			continue
 		}
-
 		records = append(records, record)
-		seen[record.Reference.UID] = struct{}{}
+		records = append(records, record)
 	}
 
+	runIndex, ok := ctx.Value(qualificationRunIndexContextKey{}).(qualificationRunIndex)
+	if !ok {
+		var err error
+		runIndex, err = r.buildQualificationRunIndex(ctx)
+		if err != nil {
+			evidenceErrors = append(evidenceErrors, err)
+		}
+	}
+
+	for index := range runIndex[nodeUID] {
+		record := runIndex[nodeUID][index]
+		if _, exists := seen[record.Reference.UID]; exists {
+			continue
+		}
+
+		records = append(records, record)
+	}
+
+	sort.Slice(records, func(i, j int) bool {
+		return records[i].FinishedAt.Before(records[j].FinishedAt)
+	})
+
+	return records, errors.Join(evidenceErrors...)
+}
+
+func (r *QualificationReconciler) buildQualificationRunIndex(
+	ctx context.Context,
+) (qualificationRunIndex, error) {
 	var runs signalv1.CertificationRunList
 	if err := r.List(ctx, &runs, client.InNamespace(r.Namespace)); err != nil {
 		return nil, err
 	}
 
-	for index := range runs.Items {
-		run := &runs.Items[index]
+	index := make(qualificationRunIndex)
+	for runIndex := range runs.Items {
+		run := &runs.Items[runIndex]
 		if !run.Status.Phase.Terminal() || run.Status.Evidence.Identity == nil ||
 			run.Spec.PlanDigest == "" || run.Spec.PlanProvenance == nil {
 			continue
@@ -422,10 +589,6 @@ func (r *QualificationReconciler) qualificationRecords(
 		if err != nil || canonical != run.Spec.PlanDigest ||
 			run.Status.Evidence.Identity.PlanDigest != run.Spec.PlanDigest ||
 			!qualificationIdentityProvenanceValid(run.Status.Evidence.Identity) {
-			continue
-		}
-
-		if _, exists := seen[run.UID]; exists {
 			continue
 		}
 
@@ -444,16 +607,23 @@ func (r *QualificationReconciler) qualificationRecords(
 			StartedAt:  identityStartedAt(run.Status.Evidence.Identity),
 			FinishedAt: identityFinishedAt(run.Status.Evidence.Identity),
 		}
-		if recordIncludesNode(record, nodeUID) {
-			records = append(records, record)
+		for participantIndex := range run.Status.Evidence.Identity.Participants {
+			nodeUID := run.Status.Evidence.Identity.Participants[participantIndex].End.NodeUID
+			if nodeUID == "" || !recordIncludesNode(record, nodeUID) {
+				continue
+			}
+
+			index[nodeUID] = append(index[nodeUID], record)
 		}
 	}
 
-	sort.Slice(records, func(i, j int) bool {
-		return records[i].FinishedAt.Before(records[j].FinishedAt)
-	})
+	for nodeUID := range index {
+		sort.Slice(index[nodeUID], func(i, j int) bool {
+			return index[nodeUID][i].FinishedAt.Before(index[nodeUID][j].FinishedAt)
+		})
+	}
 
-	return records, nil
+	return index, nil
 }
 
 func (r *QualificationReconciler) recordFromEvidence(
@@ -461,12 +631,15 @@ func (r *QualificationReconciler) recordFromEvidence(
 	reference signalv1.ContributingRunReference,
 ) (qualificationRecord, bool, error) {
 	data, _, digest, found, err := r.Evidence.Get(ctx, reference.Name+".json")
-	if err != nil || !found {
+	if err != nil {
 		return qualificationRecord{}, false, err
+	}
+	if !found {
+		return qualificationRecord{}, false, errors.New("evidence document is missing")
 	}
 
 	if digest != reference.EvidenceDigest {
-		return qualificationRecord{}, false, nil
+		return qualificationRecord{}, false, errors.New("evidence digest does not match the retained reference")
 	}
 
 	var document struct {
@@ -487,7 +660,7 @@ func (r *QualificationReconciler) recordFromEvidence(
 
 	if document.RunID != string(reference.UID) || document.QualificationIdentity == nil ||
 		document.QualificationIdentity.PlanDigest != reference.PlanDigest {
-		return qualificationRecord{}, false, nil
+		return qualificationRecord{}, false, errors.New("evidence identity does not match the retained reference")
 	}
 
 	provenance := signalv1.ExecutionPlanProvenance{
@@ -501,9 +674,14 @@ func (r *QualificationReconciler) recordFromEvidence(
 		document.Checks,
 		provenance,
 	)
-	if err != nil || canonical != reference.PlanDigest ||
-		!qualificationIdentityProvenanceValid(document.QualificationIdentity) {
-		return qualificationRecord{}, false, nil
+	if err != nil {
+		return qualificationRecord{}, false, fmt.Errorf("derive evidence plan digest: %w", err)
+	}
+	if canonical != reference.PlanDigest {
+		return qualificationRecord{}, false, errors.New("evidence plan digest is not canonical")
+	}
+	if !qualificationIdentityProvenanceValid(document.QualificationIdentity) {
+		return qualificationRecord{}, false, errors.New("evidence provenance is incomplete")
 	}
 
 	finishedAt, err := time.Parse(time.RFC3339Nano, document.FinishedAt)
@@ -548,7 +726,8 @@ func qualificationIdentityProvenanceValid(identity *signalv1.QualificationEviden
 func (r *QualificationReconciler) acceptedRecords(
 	ctx context.Context,
 	requirement *signalv1.CertificationRequirement,
-	nodeUID types.UID,
+	node *corev1.Node,
+	fingerprintFields []signalv1.FingerprintField,
 	records []qualificationRecord,
 ) ([]qualificationRecord, error) {
 	var currentProfile signalv1.CertificationProfile
@@ -587,8 +766,15 @@ func (r *QualificationReconciler) acceptedRecords(
 			continue
 		}
 
-		participant, found := recordParticipant(record, nodeUID)
+		participant, found := recordParticipant(record, node.UID)
 		if !found || participant.Verdict != signalv1.QualificationVerdictPass {
+			continue
+		}
+		if !participantFingerprintMatches(
+			fingerprintFields,
+			participant,
+			nodeFingerprint(node),
+		) {
 			continue
 		}
 
@@ -612,6 +798,21 @@ func (r *QualificationReconciler) acceptedRecords(
 	}
 
 	return accepted, nil
+}
+
+func participantFingerprintMatches(
+	fields []signalv1.FingerprintField,
+	participant signalv1.ParticipantEvidenceIdentity,
+	current signalv1.NodeFingerprint,
+) bool {
+	for _, field := range fields {
+		if !fingerprintFieldMatches(field, participant.Start, participant.End) ||
+			!fingerprintFieldMatches(field, participant.End, current) {
+			return false
+		}
+	}
+
+	return true
 }
 
 func requirementSatisfied(
@@ -757,6 +958,14 @@ func (r *QualificationReconciler) markGoneLedgers(
 			continue
 		}
 
+		if ledger.Status.Phase == signalv1.NodeCertificationPhaseNodeGone {
+			if err := r.Delete(ctx, ledger); client.IgnoreNotFound(err) != nil {
+				return err
+			}
+
+			continue
+		}
+
 		before := ledger.DeepCopy()
 		ledger.Status.Phase = signalv1.NodeCertificationPhaseNodeGone
 
@@ -844,6 +1053,10 @@ func (r *QualificationReconciler) reconcileQualificationLabel(
 			current.Labels[signalv1.NodeQualificationLabel] = signalv1.NodeQualificationValue
 		} else {
 			delete(current.Labels, signalv1.NodeQualificationLabel)
+		}
+
+		if reflect.DeepEqual(before.Labels, current.Labels) {
+			return nil
 		}
 
 		return r.Patch(ctx, &current, client.MergeFromWithOptions(before, client.MergeFromWithOptimisticLock{}))
