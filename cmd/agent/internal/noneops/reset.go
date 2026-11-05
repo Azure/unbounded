@@ -24,9 +24,12 @@ import (
 const gantryHostsMarker = "# Managed by unbounded-agent for Gantry."
 
 // Teardown removes a none node. Its tasks slot into the same positions in the
-// reset order as the nspawn machine tasks they replace: stop, then config, then
-// the node itself, with the host-global cleanup the caller owns in between and
-// after.
+// reset order as the nspawn machine tasks they correspond to: stop, then
+// config, then the node itself, with the host-global cleanup the caller owns in
+// between and after. The reset runs it only on a host where Present finds the
+// node's traces, so what it removes at the shared paths is what the agent wrote
+// there: the bootstrap refused a host that had a kubelet or containerd of its
+// own.
 type Teardown struct {
 	Log *slog.Logger
 	// Layout, SystemdDir and Run are as in Params.
@@ -62,7 +65,7 @@ func (t *Teardown) backend() *none.Backend {
 		}
 	}
 
-	return &none.Backend{Log: t.logger(), Layout: t.Layout, SystemdDir: t.SystemdDir, Run: t.Run, Proc: proc, CgroupRoot: cgroups}
+	return &none.Backend{Log: t.logger(), Layout: t.Layout, SystemdDir: t.SystemdDir, Run: t.Run, Proc: proc, CgroupRoot: cgroups, HostRoot: t.Root}
 }
 
 // Present reports whether the host has any trace of a none node: the layout
@@ -119,8 +122,10 @@ func (t *Teardown) RemoveConfig() phases.Task {
 	return hostnode.Func("remove-none-config", func(context.Context) error {
 		var errs []error
 
+		// The agent's own containerd configuration, never the distro's
+		// /etc/containerd/config.toml, which a none node does not write.
 		files := []string{
-			goalstates.ContainerdConfigPath,
+			none.ContainerdConfigPath,
 			goalstates.NvidiaRuntimeDropInPath,
 			goalstates.CDISpecFile,
 			goalstates.KubeletAPIServerCACertPath,
@@ -143,7 +148,7 @@ func (t *Teardown) RemoveConfig() phases.Task {
 
 		// Directories the agent created and nothing else is expected in. Remove
 		// only when empty so anything an operator or a workload put there stays.
-		for _, d := range []string{goalstates.ContainerdConfDropInDir, goalstates.CDISpecDir, goalstates.ContainerdDefaultHostsDir, goalstates.KubeletStaticPodManifestsDir, goalstates.KubeletPKIDir} {
+		for _, d := range []string{filepath.Dir(none.ContainerdConfigPath), goalstates.ContainerdConfDropInDir, goalstates.CDISpecDir, goalstates.ContainerdDefaultHostsDir, goalstates.KubeletStaticPodManifestsDir, goalstates.KubeletPKIDir} {
 			if err := os.Remove(t.path(d)); err != nil && !errors.Is(err, os.ErrNotExist) && !IsNotEmpty(err) {
 				errs = append(errs, err)
 			}

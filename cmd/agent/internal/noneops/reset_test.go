@@ -88,7 +88,7 @@ func TestTeardownRemoveConfig(t *testing.T) {
 	td, _, root := newTeardown(t)
 
 	for _, p := range []string{
-		goalstates.ContainerdConfigPath, goalstates.NvidiaRuntimeDropInPath, goalstates.KubeletAPIServerCACertPath,
+		none.ContainerdConfigPath, goalstates.NvidiaRuntimeDropInPath, goalstates.KubeletAPIServerCACertPath,
 		"/etc/systemd/system/localdns.slice", "/etc/unbounded/localdns/Corefile", "/etc/unbounded/localdns/environment",
 	} {
 		put(t, root, p, "x")
@@ -101,10 +101,15 @@ func TestTeardownRemoveConfig(t *testing.T) {
 	// must the directories they keep alive.
 	put(t, root, "/etc/containerd/conf.d/50-site.toml", "site")
 	put(t, root, "/etc/kubernetes/pki/other.crt", "other")
+	// The distro's containerd configuration is not the agent's: a none node
+	// never writes it, so reset never deletes it.
+	put(t, root, goalstates.ContainerdConfigPath, "distro")
 
 	require.NoError(t, td.RemoveConfig().Do(t.Context()))
+	require.FileExists(t, filepath.Join(root, goalstates.ContainerdConfigPath))
+	require.NoDirExists(t, filepath.Join(root, filepath.Dir(none.ContainerdConfigPath)))
 
-	for _, p := range []string{goalstates.ContainerdConfigPath, goalstates.KubeletAPIServerCACertPath, "/etc/unbounded/localdns", goalstates.ContainerdDefaultHostsPath, "/etc/systemd/system/localdns.slice"} {
+	for _, p := range []string{none.ContainerdConfigPath, goalstates.KubeletAPIServerCACertPath, "/etc/unbounded/localdns", goalstates.ContainerdDefaultHostsPath, "/etc/systemd/system/localdns.slice"} {
 		require.NoFileExists(t, filepath.Join(root, p), p)
 	}
 
@@ -298,4 +303,26 @@ func TestTeardownDestroyKeepsMountableDirectoriesWhenTheMountTableIsUnreadable(t
 	require.FileExists(t, filepath.Join(root, "/var/lib/kubelet/x"))
 	require.FileExists(t, filepath.Join(root, "/var/lib/containerd/x"))
 	require.NoDirExists(t, filepath.Join(root, "/etc/cni/net.d"))
+}
+
+// The teardown removes only the CNI plugin links the node made; plugins other
+// components installed in /opt/cni/bin stay.
+func TestTeardownDestroyKeepsOtherCNIPlugins(t *testing.T) {
+	td, _, root := newTeardown(t)
+
+	version := filepath.Join(td.Layout.VersionDir("v1"), "cni", "bin")
+	put(t, "/", filepath.Join(version, "bridge"), "ours")
+	_, err := td.Layout.Flip("v1")
+	require.NoError(t, err)
+
+	cni := filepath.Join(root, "/opt/cni/bin")
+	require.NoError(t, os.MkdirAll(cni, 0o755))
+	require.NoError(t, os.Symlink(filepath.Join(td.Layout.CNIBinDir(), "bridge"), filepath.Join(cni, "bridge")))
+	put(t, root, "/opt/cni/bin/unbounded-ipam", "theirs")
+
+	require.NoError(t, td.Destroy().Do(t.Context()))
+
+	_, err = os.Lstat(filepath.Join(cni, "bridge"))
+	require.ErrorIs(t, err, os.ErrNotExist)
+	require.FileExists(t, filepath.Join(cni, "unbounded-ipam"))
 }
