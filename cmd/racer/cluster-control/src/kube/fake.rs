@@ -34,6 +34,7 @@ struct Inner {
     counter: RefCell<Option<Arc<AtomicUsize>>>,
     put_delay: RefCell<Option<Arc<AtomicU64>>>,
     get_delay: RefCell<Option<Arc<AtomicU64>>>,
+    token: RefCell<String>,
 }
 
 impl FakeApi {
@@ -45,7 +46,13 @@ impl FakeApi {
             counter: RefCell::new(None),
             put_delay: RefCell::new(None),
             get_delay: RefCell::new(None),
+            token: RefCell::new(TOKEN.into()),
         }))
+    }
+
+    /// Accept only `token` as the bearer from now on.
+    pub fn set_token(&self, token: &str) {
+        *self.0.token.borrow_mut() = token.into();
     }
 
     /// Count every request in `counter`, readable from other threads.
@@ -184,17 +191,38 @@ impl FakeApi {
     }
 }
 
+/// Bearer token the fake API accepts until [`FakeApi::set_token`].
+pub const TOKEN: &str = "api-token";
+
 /// Serve the fake API on loopback and return client settings for it.
 pub fn serve(api: FakeApi, dir: &std::path::Path) -> KubeConfig {
+    serve_at(api, dir, "127.0.0.1:0".parse().unwrap())
+}
+
+/// Write a client file: on the simulated disk when the current runtime is
+/// simulated, else on the host.
+pub fn write_file(path: &std::path::Path, bytes: &[u8]) {
+    match rt::sim_os() {
+        Some(os) => os.write_file(path, bytes).unwrap(),
+        None => {
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, bytes).unwrap();
+        }
+    }
+}
+
+/// Serve the fake API at `address` and return client settings for it. On a
+/// simulated runtime the listener is on the simulated network and the CA
+/// and token files are on the simulated disk under `dir`.
+pub fn serve_at(api: FakeApi, dir: &std::path::Path, address: std::net::SocketAddr) -> KubeConfig {
     let key = rcgen::KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).unwrap();
     let mut params = rcgen::CertificateParams::new(vec![]).unwrap();
-    params.subject_alt_names = vec![rcgen::SanType::IpAddress("127.0.0.1".parse().unwrap())];
+    params.subject_alt_names = vec![rcgen::SanType::IpAddress(address.ip())];
     let cert = params.self_signed(&key).unwrap();
-    std::fs::create_dir_all(dir).unwrap();
     let ca = dir.join("ca.crt");
     let token = dir.join("token");
-    std::fs::write(&ca, cert.pem()).unwrap();
-    std::fs::write(&token, "api-token").unwrap();
+    write_file(&ca, cert.pem().as_bytes());
+    write_file(&token, TOKEN.as_bytes());
     let config = rustls::ServerConfig::builder_with_provider(Arc::new(
         rustls::crypto::ring::default_provider(),
     ))
@@ -207,7 +235,7 @@ pub fn serve(api: FakeApi, dir: &std::path::Path) -> KubeConfig {
     )
     .unwrap();
     let config = Arc::new(config);
-    let listener = Rc::new(Listener::bind("127.0.0.1:0".parse().unwrap()).unwrap());
+    let listener = Rc::new(Listener::bind(address).unwrap());
     let address = listener.local_addr().unwrap();
     rt::spawn(async move {
         loop {
@@ -225,7 +253,8 @@ pub fn serve(api: FakeApi, dir: &std::path::Path) -> KubeConfig {
                     let Ok(body) = conn.read_request_body(&head, 64 << 20).await else {
                         return;
                     };
-                    if head.one("authorization").ok().flatten() != Some("Bearer api-token") {
+                    let bearer = format!("Bearer {}", api.0.token.borrow());
+                    if head.one("authorization").ok().flatten() != Some(bearer.as_str()) {
                         let _ = conn
                             .tls
                             .write_all(&http::response_head(401, &[], 0, false))
@@ -240,13 +269,13 @@ pub fn serve(api: FakeApi, dir: &std::path::Path) -> KubeConfig {
                         return;
                     }
                     // Delays are re-read while waiting.
-                    let received = std::time::Instant::now();
-                    while received.elapsed() < api.delays(&head.method).0 {
+                    let received = rt::now();
+                    while rt::now() - received < api.delays(&head.method).0 {
                         rt::sleep(Duration::from_millis(20)).await;
                     }
                     let (status, value) = api.handle(&head.method, &head.target, &body);
-                    let answered = std::time::Instant::now();
-                    while answered.elapsed() < api.delays(&head.method).1 {
+                    let answered = rt::now();
+                    while rt::now() - answered < api.delays(&head.method).1 {
                         rt::sleep(Duration::from_millis(20)).await;
                     }
                     let body = serde_json::to_vec(&value).unwrap();

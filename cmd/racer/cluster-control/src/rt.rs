@@ -100,6 +100,25 @@ impl Executor {
         Ok(Self::with_reactor(reactor, max_tasks))
     }
 
+    /// A simulated executor: `os` is the simulated disk and network, shared
+    /// by every node of one world, and `clock` is this node's clock. Nothing
+    /// blocks and time moves only through the clock.
+    pub fn simulated(
+        os: racer_io::sim::SimOs,
+        clock: &racer_io::ctx::VirtualClock,
+        seed: u64,
+        max_tasks: usize,
+    ) -> io::Result<Self> {
+        let entries = max_tasks.next_power_of_two().clamp(MIN_QUEUE, MAX_QUEUE);
+        let reactor = Reactor::new(
+            Driver::Sim(os),
+            Config::new(entries as u32),
+            WorkerCtx::simulated(clock, seed, 0),
+        )
+        .map_err(to_io)?;
+        Ok(Self::with_reactor(reactor, max_tasks))
+    }
+
     /// An executor over an existing reactor, such as a simulated one.
     pub fn with_reactor(reactor: Reactor, max_tasks: usize) -> Self {
         let executor = Rc::new(LocalExecutor::new(Some(reactor.wake_handle())));
@@ -157,6 +176,7 @@ impl Executor {
     }
 
     /// Run until `done` returns true. `done` is checked after each turn.
+    #[cfg(test)]
     pub fn run(&mut self, mut done: impl FnMut() -> bool) {
         loop {
             if self.turn().is_err() {
@@ -252,6 +272,21 @@ pub fn task_count() -> usize {
 /// Current time on the reactor clock, or the host clock outside a runtime.
 pub fn now() -> Instant {
     try_current().map_or_else(Instant::now, |c| c.reactor.now())
+}
+
+/// Current wall time on the reactor clock, or the host clock outside a
+/// runtime. Lease timestamps and certificate validity use it, so a
+/// simulated authority stamps virtual wall time.
+pub fn wall_now() -> std::time::SystemTime {
+    try_current().map_or_else(std::time::SystemTime::now, |c| {
+        c.reactor.ctx().clock.wall_now()
+    })
+}
+
+/// The simulated OS of the current runtime, if it is simulated.
+#[cfg(test)]
+pub fn sim_os() -> Option<racer_io::sim::SimOs> {
+    try_current().and_then(|c| c.reactor.sim_os())
 }
 
 /// Sleep until an instant on the reactor clock.

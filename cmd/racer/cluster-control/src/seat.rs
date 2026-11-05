@@ -241,7 +241,7 @@ fn my_seat_annotations(shared: &Shared, seat: &Seat) -> BTreeMap<&'static str, O
     if let Some(c) = shared.issuer.borrow_mut().as_mut()
         && Rc::ptr_eq(&c.issuer, &issuer)
     {
-        c.offered = SystemTime::now();
+        c.offered = crate::rt::wall_now();
     }
     a.insert(
         annotations::ISSUER_CERTIFICATE,
@@ -326,7 +326,7 @@ fn seat_issuer(shared: &Shared, now: SystemTime) -> Result<Rc<SeatIssuer>, Error
 /// Build seat material. The issuer is shared with earlier seats of this
 /// process, see [`seat_issuer`]; serving identities are always fresh.
 pub fn new_seat(shared: &Shared, index: usize) -> Result<Seat, Error> {
-    let now = SystemTime::now();
+    let now = crate::rt::wall_now();
     let issuer = seat_issuer(shared, now)?;
     let control = Rc::new(
         ServingIdentity::pinned(
@@ -410,7 +410,7 @@ pub async fn lottery(shared: Rc<Shared>, primary_changed: Rc<RefCell<(String, Op
         let spec = election::claim(
             &obs.spec,
             &shared.config.pod_name,
-            &election::now_micro(SystemTime::now()),
+            &election::now_micro(crate::rt::wall_now()),
         );
         let started = crate::rt::now();
         let body = lease::with(&object, &spec, &my_seat_annotations(&shared, &seat));
@@ -443,7 +443,7 @@ pub async fn lottery(shared: Rc<Shared>, primary_changed: Rc<RefCell<(String, Op
 /// its endpoint before its trust, and a fresh claim publishes new material
 /// before it is ready.
 fn rotate(shared: &Shared, seat: &Seat) {
-    let now = SystemTime::now();
+    let now = crate::rt::wall_now();
     if seat.issuer.borrow().should_rotate(now) && seat.pending.borrow().is_none() {
         let cluster = shared.cluster.borrow().clone();
         if let Ok(p) = SeatIssuer::generate(&cluster, now, pki::ROOT_LIFETIME) {
@@ -519,7 +519,7 @@ pub async fn seat_task(shared: Rc<Shared>, seat: Rc<Seat>, mut object: serde_jso
             &shared.config.node_name,
             shared.is_primary.get(),
             shared.stopping.get(),
-            serving_rotation_due(&seat.control.borrow(), seat.index, SystemTime::now()),
+            serving_rotation_due(&seat.control.borrow(), seat.index, crate::rt::wall_now()),
             ready_changed(&shared, &seat, &object),
         );
         match schedule.decide(now, inputs) {
@@ -544,7 +544,7 @@ pub async fn seat_task(shared: Rc<Shared>, seat: Rc<Seat>, mut object: serde_jso
         }
         rotate(&shared, &seat);
         let obs = lease::observe(&object);
-        let spec = election::renew(&obs.spec, &election::now_micro(SystemTime::now()));
+        let spec = election::renew(&obs.spec, &election::now_micro(crate::rt::wall_now()));
         let body = lease::with(&object, &spec, &my_seat_annotations(&shared, &seat));
         let started = crate::rt::now();
         schedule.put_started(started);

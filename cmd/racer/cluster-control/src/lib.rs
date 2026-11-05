@@ -59,7 +59,8 @@ mod tls;
 pub mod webhook;
 
 pub use config::{Config, Rotation, SeatPolicy};
-pub use control::{Bootstrap, Diagnostics, Handle, Role, start};
+pub use control::{Authority, Bootstrap, Diagnostics, Handle, Role, start};
+pub use racer_io::exec::Next;
 pub use shared::PrimaryView;
 
 /// Threads started by [`start`]. The dataplane counts this against its budget.

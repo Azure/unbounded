@@ -105,6 +105,9 @@ pub struct Shared {
     /// Live seat holders by seat index, kept by the primary.
     pub seat_holders: RefCell<BTreeMap<usize, SeatHolder>>,
     pub is_primary: Cell<bool>,
+    /// The primary term this Pod leads and its Lease freshness, while a
+    /// term runs. See [`Shared::primary_term`].
+    pub term: RefCell<Option<(crate::rules::state::Term, Freshness)>>,
     pub primary: RefCell<PrimaryView>,
     /// Holder key `<pod name>/<nonce>`, see [`crate::lease::holder_key`].
     pub identity: String,
@@ -181,6 +184,14 @@ impl Shared {
         self.serving.borrow().roots.clone()
     }
 
+    /// The term this Pod may act as primary under at `now`: a running term
+    /// whose Lease is fresh by the local monotonic clock.
+    pub fn primary_term(&self, now: std::time::Instant) -> Option<crate::rules::state::Term> {
+        let term = self.term.borrow();
+        let (term, lease) = term.as_ref()?;
+        (self.is_primary.get() && lease.fresh(now)).then(|| term.clone())
+    }
+
     /// Count a Lease release in flight until the guard drops.
     pub fn releasing(self: &Rc<Self>) -> Releasing {
         self.releasing.set(self.releasing.get() + 1);
@@ -246,6 +257,7 @@ pub(crate) mod tests {
             verifier: DynamicClientVerifier::new(),
             seat_holders: RefCell::new(BTreeMap::new()),
             is_primary: Cell::new(false),
+            term: RefCell::new(None),
             primary: RefCell::new(PrimaryView::default()),
             stopping: Cell::new(false),
             releasing: Cell::new(0),

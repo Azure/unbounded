@@ -11,6 +11,7 @@ use crate::{
     seat, server,
     shared::{Serving, Shared},
 };
+use racer_io::exec::Next;
 use serde_json::json;
 use std::{
     cell::RefCell,
@@ -83,22 +84,14 @@ const START_TIMEOUT: Duration = Duration::from_secs(30);
 /// Start the control thread. Listeners are bound before this returns.
 pub fn start(config: Config) -> Result<Handle, Error> {
     config.validate()?;
-    let outer = Arc::new(Outer {
-        bootstrap: Mutex::new(None),
-        bootstrapped: Condvar::new(),
-        report: Mutex::new(None),
-        report_generation: AtomicU64::new(0),
-        stop: AtomicBool::new(false),
-        diagnostics: Mutex::new(Diagnostics::default()),
-    });
-    let endpoints: DiscoveredEndpoints = Default::default();
+    let outer = Outer::new();
     let (tx, rx) = std::sync::mpsc::sync_channel(1);
-    let (o, e) = (outer.clone(), endpoints.clone());
+    let o = outer.clone();
     let thread = std::thread::Builder::new()
         .name("racer-control".into())
-        .spawn(move || run(config, o, e, tx))
+        .spawn(move || run(config, o, tx))
         .map_err(|_| Error::Io)?;
-    let notifier = match rx.recv_timeout(START_TIMEOUT) {
+    let (notifier, endpoints) = match rx.recv_timeout(START_TIMEOUT) {
         Ok(r) => r?,
         Err(e) => {
             // The thread sees the flag, or fails to hand over, and exits.
@@ -118,16 +111,91 @@ pub fn start(config: Config) -> Result<Handle, Error> {
     })
 }
 
+/// The control thread: one host [`Authority`] run until it finishes.
 fn run(
     config: Config,
     outer: Arc<Outer>,
-    endpoints: DiscoveredEndpoints,
-    ready: std::sync::mpsc::SyncSender<Result<Notifier, Error>>,
+    ready: std::sync::mpsc::SyncSender<Result<(Notifier, DiscoveredEndpoints), Error>>,
 ) {
-    #[allow(clippy::type_complexity)]
-    let setup =
-        || -> Result<(Executor, Rc<Shared>, Listener, Listener, Option<Listener>), Error> {
-            let executor = Executor::new(MAX_TASKS).map_err(|_| Error::Io)?;
+    let executor = match Executor::new(MAX_TASKS) {
+        Ok(e) => e,
+        Err(_) => {
+            let _ = ready.send(Err(Error::Io));
+            return;
+        }
+    };
+    let mut authority = match Authority::build(config, executor, Box::new(OsEntropy), outer.clone())
+    {
+        Ok(a) => a,
+        Err(e) => {
+            let _ = ready.send(Err(e));
+            return;
+        }
+    };
+    let handover = (authority.executor.notifier(), authority.endpoints());
+    // Nobody waits any more after a start timeout: exit without serving.
+    if ready.send(Ok(handover)).is_err() || outer.stop.load(Ordering::SeqCst) {
+        return;
+    }
+    loop {
+        let next = authority.turn();
+        if matches!(next, Next::Done) || authority.executor.park(next).is_err() {
+            return;
+        }
+    }
+}
+
+/// One Pod's control plane role: seat lottery, primary, control API and
+/// webhook servers, and its Kubernetes API clients, on one reactor.
+///
+/// [`start`] runs one on a dedicated thread over `io_uring`. A deterministic
+/// simulation builds one with [`Authority::simulated`] and steps it with
+/// [`Authority::turn`] on its own thread, together with other authorities
+/// and a fake API server, moving virtual time itself. Not `Send`.
+pub struct Authority {
+    executor: Executor,
+    ctl: Ctl,
+}
+
+/// Run state checked after every turn.
+struct Ctl {
+    shared: Rc<Shared>,
+    outer: Arc<Outer>,
+    endpoints: DiscoveredEndpoints,
+    report_signal: Signal,
+    seen_report: u64,
+    stop_at: Option<Instant>,
+    done: bool,
+}
+
+impl Authority {
+    /// An authority on the simulated driver. `os` is the simulated network
+    /// and disk shared by every node of the world (the Kubernetes CA and
+    /// token files are read from it); `clock` is this Pod's clock, which
+    /// may run at its own rate. Randomness for jitter and nonces is seeded
+    /// from `seed`. Listeners in `config` must use fixed ports.
+    pub fn simulated(
+        config: Config,
+        os: racer_io::sim::SimOs,
+        clock: &racer_io::ctx::VirtualClock,
+        seed: u64,
+    ) -> Result<Self, Error> {
+        config.validate()?;
+        let executor = Executor::simulated(os, clock, seed, MAX_TASKS).map_err(|_| Error::Io)?;
+        let rng = Box::new(racer_core::time::SplitMix64::new(seed));
+        Self::build(config, executor, rng, Outer::new())
+    }
+
+    /// Bind listeners and spawn every task on `executor`.
+    fn build(
+        config: Config,
+        executor: Executor,
+        mut rng: Box<dyn Entropy>,
+        outer: Arc<Outer>,
+    ) -> Result<Self, Error> {
+        let endpoints: DiscoveredEndpoints = Default::default();
+        let report_signal = Signal::default();
+        let shared = executor.enter(|| -> Result<Rc<Shared>, Error> {
             let kube = KubeConfig {
                 server: config.api_server.clone(),
                 ca: config.api_ca.clone(),
@@ -149,7 +217,6 @@ fn run(
                 .map(|ip| Listener::bind(SocketAddr::new(ip, config.webhook_listen.port())))
                 .transpose()
                 .map_err(|_| Error::Io)?;
-            let mut rng: Box<dyn Entropy> = Box::new(OsEntropy);
             let mut nonce = [0u8; 8];
             rng.fill(&mut nonce).map_err(|_| Error::Io)?;
             let nonce: String = nonce.iter().map(|b| format!("{b:02x}")).collect();
@@ -168,6 +235,7 @@ fn run(
                 verifier: DynamicClientVerifier::new(),
                 seat_holders: RefCell::new(Default::default()),
                 is_primary: Default::default(),
+                term: Default::default(),
                 primary: RefCell::new(Default::default()),
                 stopping: Default::default(),
                 releasing: Default::default(),
@@ -176,69 +244,178 @@ fn run(
                 authz: Default::default(),
                 auth_budget: Default::default(),
             });
-            Ok((executor, shared, control, webhook, webhook_alternate))
-        };
-    let (mut executor, shared, control, webhook, webhook_alternate) = match setup() {
-        Ok(v) => v,
-        Err(e) => {
-            let _ = ready.send(Err(e));
-            return;
-        }
-    };
-    // Nobody waits any more after a start timeout: exit without serving.
-    if ready.send(Ok(executor.notifier())).is_err() || outer.stop.load(Ordering::SeqCst) {
-        return;
-    }
-    let report_signal = Signal::default();
-    let primary_changed = Rc::new(RefCell::new((String::new(), None)));
-    let started = {
-        let shared = shared.clone();
-        let outer = outer.clone();
-        let report_signal = report_signal.clone();
-        move || -> Result<(), Error> {
+            let primary_changed = Rc::new(RefCell::new((String::new(), None)));
             rt::spawn(bootstrap(shared.clone(), outer.clone()))?;
             rt::spawn(seat::discovery(
                 shared.clone(),
                 endpoints.clone(),
                 primary_changed.clone(),
             ))?;
-            rt::spawn(seat::lottery(shared.clone(), primary_changed.clone()))?;
+            rt::spawn(seat::lottery(shared.clone(), primary_changed))?;
             rt::spawn(server::Server::new(shared.clone()).run(control))?;
             // One budget across both Pod IP families.
             server::spawn_webhooks(&shared, std::iter::once(webhook).chain(webhook_alternate))?;
-            rt::spawn(reporter(shared.clone(), outer.clone(), report_signal))?;
-            Ok(())
+            rt::spawn(reporter(
+                shared.clone(),
+                outer.clone(),
+                report_signal.clone(),
+            ))?;
+            Ok(shared)
+        })?;
+        Ok(Self {
+            executor,
+            ctl: Ctl {
+                shared,
+                outer,
+                endpoints,
+                report_signal,
+                seen_report: 0,
+                stop_at: None,
+                done: false,
+            },
+        })
+    }
+
+    /// One bounded step: reap completions, poll ready tasks, and apply
+    /// reports and stop requests. Returns what the authority needs next:
+    /// `Ready` to be turned again, `WaitUntil(t)` on its own clock, `Idle`
+    /// until a completion or wake, or `Done` once it stopped. Never blocks.
+    pub fn turn(&mut self) -> Next {
+        if self.ctl.done {
+            return Next::Done;
         }
-    };
-    let mut started = Some(started);
-    let mut seen_report = 0;
-    let mut stop_at: Option<Instant> = None;
-    executor.run(|| {
-        if let Some(start) = started.take()
-            && start().is_err()
-        {
-            return true;
+        if self.executor.turn().is_err() {
+            self.ctl.done = true;
+            return Next::Done;
         }
+        let ctl = &mut self.ctl;
+        if self.executor.enter(|| ctl.after_turn()) {
+            ctl.done = true;
+            return Next::Done;
+        }
+        self.executor.next()
+    }
+
+    /// What [`Self::turn`] would report, without doing work.
+    pub fn next(&self) -> Next {
+        if self.ctl.done {
+            return Next::Done;
+        }
+        self.executor.next()
+    }
+
+    /// Ask the authority to stop. Held Leases are released within a bounded
+    /// grace period while it is turned; then [`Self::turn`] returns `Done`.
+    pub fn stop(&mut self) {
+        self.ctl.outer.stop.store(true, Ordering::SeqCst);
+        self.executor.notifier().notify();
+    }
+
+    /// The bootstrap result, once known.
+    pub fn bootstrap(&self) -> Option<Result<Bootstrap, Error>> {
+        self.ctl
+            .outer
+            .bootstrap
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
+
+    /// Ready seat endpoints, updated from the primary Lease.
+    pub fn endpoints(&self) -> DiscoveredEndpoints {
+        self.ctl.endpoints.clone()
+    }
+
+    /// Report shares and RDMA NICs in this Pod's report annotation.
+    pub fn report(
+        &mut self,
+        shares: u32,
+        rdma_nics: Vec<racer_control_wire::RailMapping>,
+    ) -> Result<(), Error> {
+        self.ctl.outer.set_report(shares, rdma_nics)?;
+        self.executor.notifier().notify();
+        Ok(())
+    }
+
+    /// Point-in-time state, as of this call.
+    pub fn diagnostics(&self) -> Diagnostics {
+        self.executor
+            .enter(|| update_diagnostics(&self.ctl.shared, &self.ctl.outer));
+        self.ctl.outer.diagnostics()
+    }
+
+    /// The primary term this Pod may act under now: it leads a term whose
+    /// Lease is fresh by its own monotonic clock. At most one authority in a
+    /// cluster returns a term at any moment of true time.
+    pub fn primary_term(&self) -> Option<crate::rules::state::Term> {
+        self.executor
+            .enter(|| self.ctl.shared.primary_term(rt::now()))
+    }
+}
+
+impl Ctl {
+    /// Apply reports and stop requests after a turn. True when finished.
+    fn after_turn(&mut self) -> bool {
+        let shared = &self.shared;
+        let outer = &self.outer;
         let g = outer.report_generation.load(Ordering::SeqCst);
-        if g != seen_report {
-            seen_report = g;
-            report_signal.notify();
+        if g != self.seen_report {
+            self.seen_report = g;
+            self.report_signal.notify();
         }
-        update_diagnostics(&shared, &outer);
+        update_diagnostics(shared, outer);
         if outer.stop.load(Ordering::SeqCst) {
             if !shared.stopping.get() {
                 shared.stopping.set(true);
                 shared.changed.notify();
-                stop_at = Some(rt::now() + Duration::from_secs(5));
+                self.stop_at = Some(rt::now() + STOP_GRACE);
             }
             // Give seat tasks a bounded chance to release Leases.
             return shared.seat.borrow().is_none()
                 && !shared.is_primary.get()
                 && shared.releasing.get() == 0
-                || stop_at.is_some_and(|t| rt::now() >= t);
+                || self.stop_at.is_some_and(|t| rt::now() >= t);
         }
         false
-    });
+    }
+}
+
+/// Bounded time a stopping authority spends releasing its Leases.
+const STOP_GRACE: Duration = Duration::from_secs(5);
+
+impl Outer {
+    fn new() -> Arc<Self> {
+        Arc::new(Self {
+            bootstrap: Mutex::new(None),
+            bootstrapped: Condvar::new(),
+            report: Mutex::new(None),
+            report_generation: AtomicU64::new(0),
+            stop: AtomicBool::new(false),
+            diagnostics: Mutex::new(Diagnostics::default()),
+        })
+    }
+
+    fn set_report(
+        &self,
+        shares: u32,
+        rdma_nics: Vec<racer_control_wire::RailMapping>,
+    ) -> Result<(), Error> {
+        let report = Report {
+            shares: NonZeroU32::new(shares).ok_or(Error::InvalidConfiguration)?,
+            rdma_nics,
+        };
+        let encoded = rails::encode_report(&report).map_err(|_| Error::InvalidConfiguration)?;
+        *self.report.lock().unwrap_or_else(|e| e.into_inner()) = Some(encoded);
+        self.report_generation.fetch_add(1, Ordering::SeqCst);
+        Ok(())
+    }
+
+    fn diagnostics(&self) -> Diagnostics {
+        self.diagnostics
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
 }
 
 fn update_diagnostics(shared: &Shared, outer: &Outer) {
@@ -434,23 +611,13 @@ impl Handle {
         shares: u32,
         rdma_nics: Vec<racer_control_wire::RailMapping>,
     ) -> Result<(), Error> {
-        let report = Report {
-            shares: NonZeroU32::new(shares).ok_or(Error::InvalidConfiguration)?,
-            rdma_nics,
-        };
-        let encoded = rails::encode_report(&report).map_err(|_| Error::InvalidConfiguration)?;
-        *self.outer.report.lock().unwrap_or_else(|e| e.into_inner()) = Some(encoded);
-        self.outer.report_generation.fetch_add(1, Ordering::SeqCst);
+        self.outer.set_report(shares, rdma_nics)?;
         self.notifier.notify();
         Ok(())
     }
 
     pub fn diagnostics(&self) -> Diagnostics {
-        self.outer
-            .diagnostics
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .clone()
+        self.outer.diagnostics()
     }
 
     /// Stop the thread, releasing held Leases within a bounded time.

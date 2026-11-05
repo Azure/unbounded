@@ -32,7 +32,7 @@ use std::{
     collections::BTreeMap,
     net::IpAddr,
     rc::Rc,
-    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant, UNIX_EPOCH},
 };
 
 /// Reconcile at least this often.
@@ -42,7 +42,7 @@ const RESYNC: Duration = Duration::from_secs(30);
 const DEBOUNCE: Duration = Duration::from_secs(1);
 
 fn unix_now() -> u64 {
-    SystemTime::now()
+    crate::rt::wall_now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs()
@@ -67,7 +67,7 @@ pub async fn contend(shared: Rc<Shared>, seat: Rc<Seat>) {
                 let spec = election::claim(
                     &obs.spec,
                     &shared.config.pod_name,
-                    &election::now_micro(SystemTime::now()),
+                    &election::now_micro(crate::rt::wall_now()),
                 );
                 let started = crate::rt::now();
                 let body = lease::with(
@@ -178,6 +178,7 @@ async fn lead(shared: &Rc<Shared>, seat: &Rc<Seat>, object: Value, started: Inst
     // Held for the whole term: shutdown waits until the loop exits and the
     // release PUT below completes, even if the seat is cleared first.
     let _releasing = shared.releasing();
+    *shared.term.borrow_mut() = Some((t.shell.borrow().term().clone(), t.shell.borrow().lease()));
     shared.is_primary.set(true);
     shared.changed.notify();
     let _ = rt::spawn(renew(t.clone()));
@@ -213,6 +214,7 @@ async fn lead(shared: &Rc<Shared>, seat: &Rc<Seat>, object: Value, started: Inst
     }
     t.alive.set(false);
     shared.is_primary.set(false);
+    *shared.term.borrow_mut() = None;
     shared.changed.notify();
     if shared.stopping.get() || !seat_mine(shared, seat) {
         let object = t.object.borrow().clone();
@@ -258,7 +260,7 @@ async fn renew(t: Rc<Term_>) {
         let object = t.object.borrow().clone();
         let spec = election::renew(
             &lease::observe(&object).spec,
-            &election::now_micro(SystemTime::now()),
+            &election::now_micro(crate::rt::wall_now()),
         );
         let body = lease::with(
             &object,
@@ -274,6 +276,11 @@ async fn renew(t: Rc<Term_>) {
             Ok(Ok(v)) => {
                 *t.object.borrow_mut() = v;
                 t.shell.borrow_mut().renewed(started);
+                if let Some((term, lease)) = t.shared.term.borrow_mut().as_mut()
+                    && term == t.shell.borrow().term()
+                {
+                    *lease = t.shell.borrow().lease();
+                }
             }
             Ok(Err(KubeError::Conflict)) => {
                 match lease::get(&t.shared.lease_api, &ns, annotations::PRIMARY_LEASE).await {

@@ -73,6 +73,16 @@ struct Credentials {
     ca: Vec<u8>,
     tls: Arc<rustls::ClientConfig>,
     read_at: Instant,
+    /// Set by a 401: reread before the next call, whatever the age.
+    stale: bool,
+}
+
+impl Credentials {
+    /// Whether the files must be reread at `now`. Never subtracts from an
+    /// `Instant`, so a virtual clock near its origin cannot underflow.
+    fn stale(&self, now: Instant) -> bool {
+        self.stale || now.saturating_duration_since(self.read_at) >= CREDENTIAL_TTL
+    }
 }
 
 /// Kubernetes API client. Not `Send`; it lives on the control thread.
@@ -151,9 +161,12 @@ impl Kube {
     async fn credentials(
         &self,
     ) -> Result<(zeroize::Zeroizing<String>, Arc<rustls::ClientConfig>), KubeError> {
-        let stale = self.credentials.borrow().as_ref().is_none_or(|c| {
-            crate::rt::now().saturating_duration_since(c.read_at) >= CREDENTIAL_TTL
-        });
+        let now = crate::rt::now();
+        let stale = self
+            .credentials
+            .borrow()
+            .as_ref()
+            .is_none_or(|c| c.stale(now));
         if stale {
             let token = rt::read_file(&self.config.token, limits::MAX_TOKEN_BYTES * 2)
                 .await
@@ -183,6 +196,7 @@ impl Kube {
                 ca,
                 tls,
                 read_at: crate::rt::now(),
+                stale: false,
             });
         }
         let slot = self.credentials.borrow();
@@ -280,7 +294,7 @@ impl Kube {
                     if head.status == 401 {
                         // Force a token reread on the next call.
                         if let Some(c) = self.credentials.borrow_mut().as_mut() {
-                            c.read_at = crate::rt::now() - CREDENTIAL_TTL;
+                            c.stale = true;
                         }
                     }
                     return Ok((head.status, body));
@@ -694,6 +708,48 @@ mod tests {
         assert_eq!(str_at(&v, &["metadata", "name"]), "x");
         assert_eq!(str_at(&v, &["metadata", "missing"]), "");
         assert_eq!(map_at(&v, &["metadata", "labels"]).len(), 1);
+    }
+
+    /// A 401 forces a token reread before the TTL, and the TTL forces one
+    /// after it, on a virtual clock that starts at its origin.
+    #[test]
+    fn credentials_reread_on_401_and_after_ttl_on_virtual_time() {
+        let clock = racer_io::ctx::VirtualClock::new();
+        let os = racer_io::sim::SimOs::seeded(3);
+        let mut ex = rt::Executor::simulated(os, &clock, 3, 64).unwrap();
+        ex.block_on(async {
+            let api = fake::FakeApi::new();
+            let config = fake::serve_at(
+                api.clone(),
+                std::path::Path::new("/kube"),
+                "10.0.0.1:443".parse().unwrap(),
+            );
+            let kube = Kube::new(config.clone()).unwrap();
+            api.put_object(
+                "/api/v1/nodes/a",
+                serde_json::json!({"metadata":{"name":"a"}}),
+            );
+            kube.get("/api/v1/nodes/a").await.unwrap();
+            // Rotated on the server, not yet on disk: rejected, and marked stale.
+            api.set_token("t2");
+            assert_eq!(
+                kube.get("/api/v1/nodes/a").await.unwrap_err(),
+                KubeError::Unauthorized
+            );
+            fake::write_file(&config.token, b"t2");
+            // Well inside the TTL: only the stale flag forces the reread.
+            assert!(
+                rt::now() - kube.credentials.borrow().as_ref().unwrap().read_at < CREDENTIAL_TTL
+            );
+            kube.get("/api/v1/nodes/a").await.unwrap();
+            // Rotated on both sides: the cached token is reread after the TTL.
+            api.set_token("t3");
+            fake::write_file(&config.token, b"t3");
+            rt::sleep(CREDENTIAL_TTL).await;
+            kube.get("/api/v1/nodes/a").await.unwrap();
+            assert_eq!(api.requests().len(), 3);
+        });
+        assert!(clock.elapsed() >= CREDENTIAL_TTL);
     }
 
     #[test]

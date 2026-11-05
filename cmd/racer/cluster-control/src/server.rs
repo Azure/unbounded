@@ -22,7 +22,7 @@ use std::{
     collections::HashSet,
     rc::Rc,
     sync::Arc,
-    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant, UNIX_EPOCH},
 };
 
 /// Primary-only route that seats use to copy the committed image.
@@ -35,7 +35,7 @@ pub const DELTA_HEADER: &str = "X-Racer-Delta-Base";
 const WRITE_CHUNK: usize = 64 * 1024;
 
 fn unix_now() -> u64 {
-    SystemTime::now()
+    crate::rt::wall_now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs()
@@ -580,7 +580,7 @@ impl Server {
                 &cluster,
                 &caller.node.uid,
                 &request.csr_der,
-                SystemTime::now(),
+                crate::rt::wall_now(),
             )
             .map_err(pki_failure)?;
         let response = wire::EnrollmentResponse {
@@ -601,7 +601,7 @@ impl Server {
             return Err(ProtocolFailure::Unauthenticated);
         }
         let cluster = self.shared.cluster.borrow().clone();
-        pki::authenticate_client(chain, &self.shared.roots(), &cluster, SystemTime::now())
+        pki::authenticate_client(chain, &self.shared.roots(), &cluster, crate::rt::wall_now())
             .map_err(pki_failure)
     }
 
@@ -1321,6 +1321,7 @@ mod tests {
         rt::{Executor, Tcp},
     };
     use rustls::pki_types::ServerName;
+    use std::time::SystemTime;
 
     const POD_IP: &str = "127.0.0.2";
 
