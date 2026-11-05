@@ -65,15 +65,17 @@ pub(super) struct PageView<'a> {
     pub key_id: KeyId,
 }
 impl PageView<'_> {
+    /// Clone the stored entry without its page identity.
+    pub fn into_entry(self) -> IndexedPage {
+        IndexedPage {
+            location: self.location,
+            metadata: self.metadata.clone(),
+            key_id: self.key_id,
+        }
+    }
+
     pub fn into_owned(self) -> (PageId, IndexedPage) {
-        (
-            self.page.clone(),
-            IndexedPage {
-                location: self.location,
-                metadata: self.metadata.clone(),
-                key_id: self.key_id,
-            },
-        )
+        (self.page.clone(), self.into_entry())
     }
 }
 

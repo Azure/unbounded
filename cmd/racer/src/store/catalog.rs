@@ -798,7 +798,7 @@ impl Index {
             .pages
             .get(page)
             .filter(|e| self.availability.page(&page.version.object.cache, e.key_id))
-            .map(|e| e.into_owned().1))
+            .map(super::pages::PageView::into_entry))
     }
     /// Allocation-free capacity preflight, not a slot reservation. Replacements
     /// remain admissible at capacity; new pages require an existing free slot.
