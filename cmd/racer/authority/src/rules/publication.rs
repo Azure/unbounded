@@ -10,7 +10,6 @@ use racer_wire::control::{
     self as wire, CacheDefinition, ClusterId, Member, MembershipVersion, Publication,
     PublicationSequence,
 };
-use racer_wire::object::PageSize;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::{collections::BTreeMap, sync::Arc};
@@ -219,6 +218,7 @@ pub fn history(p: &Publication) -> BTreeMap<String, Member> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use racer_wire::object::PageSize;
     use std::num::NonZeroU32;
 
     const C: &str = "11111111-1111-4111-8111-111111111111";
@@ -241,7 +241,14 @@ mod tests {
         caches: Vec<CacheDefinition>,
     ) -> Result<Prepared, wire::Error> {
         let plans = pools::plan(&caches, &Default::default(), []);
-        prepare(prev, cluster, members, caches, &plans, PageSize::DEFAULT)
+        prepare(
+            prev,
+            cluster,
+            members,
+            caches,
+            &plans,
+            racer_wire::object::PageSize::DEFAULT,
+        )
     }
 
     fn cache() -> CacheDefinition {
