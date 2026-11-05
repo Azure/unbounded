@@ -152,6 +152,20 @@ impl Default for Limits {
     }
 }
 
+impl Limits {
+    /// Crypto submissions one worker accepts: `queue_entries` port slots plus as many admission
+    /// waiters (`src/security.rs` `try_pair`, `CryptoClient::new`). Past it a request
+    /// verification fails `Overloaded` and the peer server answers the unsigned overload head
+    /// (`src/peer/server.rs` `serve_connection`).
+    ///
+    /// Each connection runs one exchange at a time, so a worker's peer exchanges hold at most
+    /// `IngressConnection + OutboundConnection` crypto jobs (`Rules::peer_crypto_jobs`); every
+    /// byte a queued verification pins is charged to `RequestContext`.
+    pub fn crypto_submissions(&self) -> usize {
+        self.queue_entries.get().saturating_mul(2)
+    }
+}
+
 /// Per-charge minimum amounts for the byte classes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Floors {
@@ -188,6 +202,14 @@ pub struct Rules {
 impl Rules {
     pub fn new(limits: Limits, floors: Floors) -> Self {
         Self { limits, floors }
+    }
+
+    /// Most crypto jobs one worker's peer exchanges can hold at once: one per inbound and per
+    /// outbound connection, since a connection runs one exchange at a time
+    /// (`src/peer/server.rs` `listen`).
+    pub fn peer_crypto_jobs(&self) -> usize {
+        self.limit(ResourceClass::IngressConnection)
+            .saturating_add(self.limit(ResourceClass::OutboundConnection))
     }
 
     pub fn limit(&self, class: ResourceClass) -> usize {
@@ -328,6 +350,28 @@ mod tests {
         assert_eq!(r.limit(ResourceClass::IngressConnection), 1);
         limits.flights = nz(usize::MAX);
         assert_eq!(rules(&limits).limit(ResourceClass::Waiter), usize::MAX);
+    }
+
+    #[test]
+    fn crypto_queue_holds_every_peer_exchange_of_a_worker() {
+        let limits = Limits::default();
+        assert_eq!(limits.crypto_submissions(), 512);
+        let rules = Rules::new(limits.clone(), Floors::for_page(16 * MIB, 0));
+        // 45 inbound and 16 outbound connections: the default queue never sheds a
+        // verification before connection admission stops accepting work.
+        assert_eq!(rules.peer_crypto_jobs(), 61);
+        assert!(rules.peer_crypto_jobs() <= limits.crypto_submissions());
+        // Connection admission scales with `client_connections`, the queue with
+        // `queue_entries`; at the minimum the queue is still two submissions.
+        let mut small = limits.clone();
+        small.queue_entries = nz(1);
+        small.client_connections = nz(1);
+        assert_eq!(small.crypto_submissions(), 2);
+        let rules = Rules::new(small.clone(), Floors::for_page(16 * MIB, 0));
+        assert!(rules.peer_crypto_jobs() <= small.crypto_submissions());
+        let mut huge = limits;
+        huge.queue_entries = nz(usize::MAX);
+        assert_eq!(huge.crypto_submissions(), usize::MAX);
     }
 
     #[test]
