@@ -17,17 +17,15 @@ use std::{
 };
 
 /// Poll interval of lifecycle phases (startup, drain, fences, barriers).
-const IDLE_WAIT: Duration = Duration::from_millis(1);
+pub const IDLE_WAIT: Duration = Duration::from_millis(1);
 
 /// Longest steady-state park. Lanes and helpers park until a wake source
 /// fires (completion, cross-thread wake, phase change, stop signal) or a
 /// service-reported deadline; this only bounds the arithmetic.
 const MAX_PARK: Duration = Duration::from_secs(3600);
 
-/// Consecutive full 1 ms parks after which a lane stops bounding its park.
-const QUIET_PARKS: u32 = 100;
-
-const WORK_BUDGET: usize = 64;
+/// Work steps one service turn may run before the lane parks or yields.
+pub const WORK_BUDGET: usize = 64;
 
 /// One locally driven service and the CPU on which it is constructed.
 #[derive(Clone)]
@@ -972,23 +970,10 @@ fn lane_thread<S: Scope>(
             registration.register(&waker);
         }
         let mut cx = Context::from_waker(&waker);
-        let mut quiet = 0;
         while !control.stopping(&startup) {
             match poll_turn(&mut *service, &mut cx, &startup, check_scope).and_then(|wait| {
-                // An active lane keeps a 1 ms bound: some lane work still
-                // progresses only on a later turn. After `QUIET_PARKS`
-                // consecutive parks that ran to that bound, the lane parks on
-                // its wake sources alone.
-                let bounded = quiet < QUIET_PARKS;
-                let wait = if bounded { wait.min(IDLE_WAIT) } else { wait };
-                let parked = std::time::Instant::now();
-                service.park(wait)?;
-                if bounded && !wait.is_zero() && parked.elapsed() >= wait {
-                    quiet += 1;
-                } else if parked.elapsed() < wait.min(IDLE_WAIT) {
-                    quiet = 0;
-                }
-                Ok(())
+                // Parks until a wake source fires or the service's own deadline.
+                service.park(wait)
             }) {
                 Ok(()) => {}
                 Err(error) => {
