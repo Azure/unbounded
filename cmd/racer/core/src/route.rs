@@ -225,6 +225,26 @@ pub fn relay_failure(fault: Fault, ping: bool) -> RelayFailure {
     }
 }
 
+/// What a holder does when it cannot verify a request.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum UnverifiedFailure {
+    /// Answer the unsigned overload head (`peer_wire::overloaded_head`): no key work and nothing
+    /// from the request, so it reveals only that this holder is busy. The sender reads it as
+    /// `Overloaded`: a relay signs its own `Overloaded`, a requester asks its helper.
+    Overloaded,
+    /// Close the connection without an answer.
+    Close,
+}
+
+/// Failure table before verification. Only overload is answered; the request is unverified, so
+/// every other failure (bad proof, replay, malformed route) closes the connection as before.
+pub fn unverified_failure(fault: Fault) -> UnverifiedFailure {
+    match fault {
+        Fault::Overloaded => UnverifiedFailure::Overloaded,
+        _ => UnverifiedFailure::Close,
+    }
+}
+
 /// Destination failure table. `None` propagates the error unsigned.
 pub fn serve_failure(fault: Fault) -> Option<Response> {
     Some(match fault {
@@ -585,6 +605,14 @@ mod tests {
             MissingKey,
             Other,
         ];
+        for fault in all {
+            let expected = if fault == Overloaded {
+                UnverifiedFailure::Overloaded
+            } else {
+                UnverifiedFailure::Close
+            };
+            assert_eq!(unverified_failure(fault), expected, "{fault:?}");
+        }
         for fault in all {
             let relay = relay_failure(fault, false);
             let expected = match fault {
