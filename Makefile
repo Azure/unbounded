@@ -371,6 +371,7 @@ help: ## Show this help
 	@echo "  racer-purity-graph               Report pure Racer crates that depend on IO crates (STRICT=1 fails)"
 	@echo "  racer-gpu-test                   Build the CUDA shim with kernels and run GPU hardware tests"
 	@echo "  racer-sim                        Run the Racer simulator (ARGS='--scenario smoke --nodes 16')"
+	@echo "  racer-fuzz                       Run each Racer libFuzzer target briefly (FUZZ_SECONDS, default 30)"
 	@echo "  racer-dst                        Run the Racer DST seed set twice each (DST_SEEDS, DST_STEPS, DST_FILTER)"
 	@echo "  racer-envtest                    Run Racer API-server tests with KUBEBUILDER_ASSETS"
 	@echo "  racer-envtest-ci                 Provision pinned assets and run Racer API-server tests"
@@ -594,6 +595,15 @@ racer-lint: racer-purity-graph ## Check Rust formatting, workspace Clippy, and R
 	timeout --signal=TERM --kill-after=10s 300s cargo +$(RACER_RUST_TOOLCHAIN) fmt --manifest-path cmd/racer/Cargo.toml --all --check
 	timeout --signal=TERM --kill-after=10s 1200s cargo +$(RACER_RUST_TOOLCHAIN) clippy --locked --manifest-path cmd/racer/Cargo.toml --workspace --all-targets -- -D warnings
 	timeout --signal=TERM --kill-after=10s 600s cargo +$(RACER_RUST_TOOLCHAIN) test --locked --manifest-path cmd/racer/Cargo.toml -p racer-core --test purity
+
+FUZZ_SECONDS ?= 30
+RACER_FUZZ_TARGETS ?= http_head small_body peer_envelope control_documents store_record checkpoint
+
+.PHONY: racer-fuzz
+racer-fuzz: ## Run each Racer libFuzzer target for FUZZ_SECONDS (default 30)
+	cd cmd/racer/fuzz && for target in $(RACER_FUZZ_TARGETS); do \
+		timeout --signal=TERM --kill-after=10s 1500s env RUSTC_BOOTSTRAP=1 cargo +$(RACER_RUST_TOOLCHAIN) fuzz run "$$target" "corpus/$$target" -- -max_total_time=$(FUZZ_SECONDS) || exit 1; \
+	done
 
 RACER_GPU_NATIVE ?= $(CURDIR)/bin/racer-gpu-native
 # 1 skips when no GPU is found; require fails instead (dedicated GPU runners).
