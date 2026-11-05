@@ -1,0 +1,38 @@
+# Full image-repository prefix (registry host plus org/namespace) for the
+# operator and every operator-managed first-party component image. The operator
+# resolves components as <imageRegistry>/<component>:<operator version>, so the
+# operator and its components always come from the same registry.
+imageRegistry: ghcr.io/azure
+
+image:
+  # Full operator image reference; overrides name, tag and digest. Used by
+  # `make unbounded-operator-manifests`, whose UNBOUNDED_OPERATOR_IMAGE may be
+  # a locally built image outside imageRegistry.
+  reference: ""
+  # Operator image name without a registry; the registry is imageRegistry.
+  name: unbounded-operator
+  # Defaults to the chart appVersion.
+  tag: ""
+  # Optional digest (sha256:...). Takes precedence over tag.
+  digest: ""
+  pullPolicy: Always
+
+# External Kubernetes API endpoint advertised to provisioned machines. Empty
+# lets the operator discover it from kube-public/cluster-info, or from the
+# KUBERNETES_SERVICE_HOST FQDN on AKS.
+apiServerEndpoint: ""
+
+# Translate legacy net-group Sites, migrate state into the release namespace,
+# and reap the pre-consolidation namespaces.
+reapLegacyResources: true
+
+resources:
+  requests:
+    cpu: 50m
+    memory: 64Mi
+
+namespace:
+  # Render a Namespace object for the release namespace. Off for Helm and AKS
+  # cluster extension installs, which own the release namespace; on for the
+  # static `kubectl apply` manifests (values-static.yaml).
+  create: false

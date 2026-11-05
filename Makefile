@@ -124,8 +124,11 @@ UNBOUNDED_OPERATOR_API_SERVER_ENDPOINT ?=
 UNBOUNDED_OPERATOR_IMAGE_REGISTRY ?= $(CONTAINER_REGISTRY)
 UNBOUNDED_OPERATOR_REAP_LEGACY_RESOURCES ?= true
 export UNBOUNDED_OPERATOR_API_SERVER_ENDPOINT
-UNBOUNDED_OPERATOR_MANIFEST_TEMPLATES_DIR := deploy/unbounded-operator
 UNBOUNDED_OPERATOR_MANIFEST_RENDERED_DIR  := deploy/unbounded-operator/rendered
+UNBOUNDED_OPERATOR_CHART_DIR             := deploy/unbounded-operator/chart
+UNBOUNDED_OPERATOR_RENDER_DIR            := tmp/unbounded-operator-render
+UNBOUNDED_OPERATOR_CHART_VERSION         ?= 0.0.0-dev
+UNBOUNDED_OPERATOR_CHART_APP_VERSION     ?= $(VERSION_TAG)
 
 TOKEN_REFRESHER_NAMESPACE ?= $(UNBOUNDED_NAMESPACE)
 TOKEN_REFRESHER_MANIFEST_TEMPLATES_DIR := deploy/token-refresher
@@ -248,7 +251,7 @@ NET_FRONTEND_CACHE_FILE    := $(NET_FRONTEND_DIST_DIR)/.frontend-build-key
 REACT_DEV ?= false
 
 .PHONY: all help fmt lint lint-actions test build vulncheck check-deps kubectl-unbounded kubectl-unbounded-build install-tools install-protoc install-helm install-kind generate kubectl-unbounded forge relctl relctl-build agent-artifacts-builder agent-artifacts-builder-build orcadev unbounded-agent machina machina-build machina-oci machina-oci-push machina-manifests machine-ops-controller machine-ops-controller-build machine-ops-controller-oci machine-ops-controller-oci-push machine-ops-manifests metalman metalman-build metalman-oci metalman-oci-push unbounded-operator unbounded-operator-build unbounded-operator-manifests playpen-manifests e2e-gantry e2e-playpen e2e-racer gomod docs-serve unbounded-net-controller unbounded-net-controller-build unbounded-net-node unbounded-net-node-build unbounded-net-routeplan-debug unping unping-build unroute unroute-build license-check notice notice-check gantry gantry-build gantry-manifests inventory-manifests
-.PHONY: net-frontend net-frontend-clean net-ebpf-build net-ebpf-generate net-ebpf-verify net-manifests gantry-chart-lint gantry-chart-package release-bom release-manifests unbounded-operator-release-manifest
+.PHONY: net-frontend net-frontend-clean net-ebpf-build net-ebpf-generate net-ebpf-verify net-manifests gantry-chart-lint gantry-chart-package unbounded-operator-chart-lint unbounded-operator-chart-package release-bom release-manifests unbounded-operator-release-manifest
 .PHONY: karpenter karpenter-fmt karpenter-lint karpenter-test karpenter-test-ci karpenter-build karpenter-manifests image-karpenter-local
 .PHONY: image-machina-local image-token-refresher-local image-machine-ops-controller-local image-metalman-local image-unbounded-operator-local image-unbounded-operator-push image-playpen-local image-net-controller-local image-net-node-local image-gantry-local image-gantry-push images-local
 .PHONY: image-net-controller-push image-net-node-push images-net-all images-net-all-push
@@ -367,6 +370,8 @@ help: ## Show this help
 	@echo "  unbounded-operator-manifests     Render unbounded-operator manifests into deploy/unbounded-operator/rendered"
 	@echo "  gantry-chart-lint                Validate the standalone Gantry Helm chart"
 	@echo "  gantry-chart-package             Package the standalone Gantry Helm chart"
+	@echo "  unbounded-operator-chart-lint    Validate the unbounded-operator Helm chart"
+	@echo "  unbounded-operator-chart-package Package the unbounded-operator Helm chart"
 	@echo "  unbounded-operator-release-manifest Build a versioned, directly applicable operator manifest under build/"
 	@echo ""
 	@echo "Net Kubernetes (apply to current kubectl context):"
@@ -588,14 +593,14 @@ ifdef CI
 
 test: machina-manifests token-refresher-manifests machine-ops-manifests playpen-manifests net-manifests unbounded-operator-manifests gantry-manifests ## Run all tests with race detector
 	@mkdir -p $(dir $(GO_TEST_REPORT))
-	$(GOTESTSUM) -- -race ./...
+	HELM=$(HELM) $(GOTESTSUM) -- -race ./...
 
 else
 # Locally, chain test -> lint for convenience.
 
 test: lint machina-manifests token-refresher-manifests machine-ops-manifests playpen-manifests net-manifests unbounded-operator-manifests gantry-manifests ## Run all tests (implies lint)
 	@mkdir -p $(dir $(GO_TEST_REPORT))
-	$(GOTESTSUM) -- ./...
+	HELM=$(HELM) $(GOTESTSUM) -- ./...
 
 endif
 
@@ -1273,18 +1278,35 @@ token-refresher-manifests: ## Render token-refresher manifests into deploy/token
 		--set Image=$(TOKEN_REFRESHER_IMAGE)
 	@echo "Rendered token-refresher manifests into $(TOKEN_REFRESHER_MANIFEST_RENDERED_DIR) (image: $(TOKEN_REFRESHER_IMAGE))"
 
-unbounded-operator-manifests: ## Render unbounded-operator manifests into deploy/unbounded-operator/rendered
+unbounded-operator-manifests: $(HELM) ## Render unbounded-operator manifests into deploy/unbounded-operator/rendered
 	@mkdir -p $(UNBOUNDED_OPERATOR_MANIFEST_RENDERED_DIR)
 	@find $(UNBOUNDED_OPERATOR_MANIFEST_RENDERED_DIR) -mindepth 1 -not -name .gitignore -delete
-	$(GOCMD) run ./hack/cmd/render-manifests \
-		--templates-dir $(UNBOUNDED_OPERATOR_MANIFEST_TEMPLATES_DIR) \
-		--output-dir $(UNBOUNDED_OPERATOR_MANIFEST_RENDERED_DIR) \
-		--set Namespace=$(UNBOUNDED_OPERATOR_NAMESPACE) \
-		--set OperatorImage=$(UNBOUNDED_OPERATOR_IMAGE) \
-		--set ImageRegistry=$(UNBOUNDED_OPERATOR_IMAGE_REGISTRY) \
-		--set "APIServerEndpoint=$${UNBOUNDED_OPERATOR_API_SERVER_ENDPOINT}" \
-		--set ReapLegacyResources=$(UNBOUNDED_OPERATOR_REAP_LEGACY_RESOURCES)
+	@rm -rf $(UNBOUNDED_OPERATOR_RENDER_DIR)
+	@mkdir -p $(UNBOUNDED_OPERATOR_RENDER_DIR)
+	@# --set-file passes the endpoint verbatim; --set-string would split on commas.
+	@printf '%s' "$${UNBOUNDED_OPERATOR_API_SERVER_ENDPOINT}" > $(UNBOUNDED_OPERATOR_RENDER_DIR)/api-server-endpoint
+	$(HELM) template unbounded-operator $(UNBOUNDED_OPERATOR_CHART_DIR) \
+		--namespace $(UNBOUNDED_OPERATOR_NAMESPACE) \
+		--values $(UNBOUNDED_OPERATOR_CHART_DIR)/values-static.yaml \
+		--set-string image.reference=$(UNBOUNDED_OPERATOR_IMAGE) \
+		--set-string imageRegistry=$(UNBOUNDED_OPERATOR_IMAGE_REGISTRY) \
+		--set-file apiServerEndpoint=$(UNBOUNDED_OPERATOR_RENDER_DIR)/api-server-endpoint \
+		--set reapLegacyResources=$(UNBOUNDED_OPERATOR_REAP_LEGACY_RESOURCES) \
+		--output-dir $(UNBOUNDED_OPERATOR_RENDER_DIR)/out
+	@cp $(UNBOUNDED_OPERATOR_RENDER_DIR)/out/unbounded-operator/templates/*.yaml $(UNBOUNDED_OPERATOR_MANIFEST_RENDERED_DIR)/
+	@rm -rf $(UNBOUNDED_OPERATOR_RENDER_DIR)
 	@echo "Rendered unbounded-operator manifests into $(UNBOUNDED_OPERATOR_MANIFEST_RENDERED_DIR) (image: $(UNBOUNDED_OPERATOR_IMAGE))"
+
+unbounded-operator-chart-lint: $(HELM) ## Validate the unbounded-operator Helm chart
+	$(HELM) lint --strict $(UNBOUNDED_OPERATOR_CHART_DIR) --namespace $(UNBOUNDED_OPERATOR_NAMESPACE)
+
+unbounded-operator-chart-package: unbounded-operator-chart-lint ## Package the unbounded-operator Helm chart
+	@mkdir -p $(GANTRY_CHART_PACKAGE_DIR)
+	@rm -f $(GANTRY_CHART_PACKAGE_DIR)/unbounded-operator-$(UNBOUNDED_OPERATOR_CHART_VERSION).tgz
+	$(HELM) package $(UNBOUNDED_OPERATOR_CHART_DIR) \
+		--version $(UNBOUNDED_OPERATOR_CHART_VERSION) \
+		--app-version $(UNBOUNDED_OPERATOR_CHART_APP_VERSION) \
+		--destination $(GANTRY_CHART_PACKAGE_DIR)
 
 machine-ops-manifests: ## Render machine-ops-controller manifests into deploy/machine-ops/rendered
 	@mkdir -p $(MACHINE_OPS_MANIFEST_RENDERED_DIR)
