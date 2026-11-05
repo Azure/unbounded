@@ -270,7 +270,7 @@ impl ClientListeners {
         let idle = Rc::new(Cell::new(!retirement_request));
         let task_idle = idle.clone();
         let timeout = self.request_timeout;
-        let deadline = Rc::new(Cell::new(uring_runtime::environment::now() + timeout));
+        let deadline = Rc::new(Cell::new(self.io.reactor().ctx().now() + timeout));
         let task_deadline = deadline.clone();
         let parser = self.parser.clone();
         let reads = self.reads.clone();
@@ -327,7 +327,7 @@ impl ClientListeners {
             || !authorization
                 .allowed
                 .load(std::sync::atomic::Ordering::Acquire)
-            || uring_runtime::environment::now() >= authorization.deadline
+            || self.io.reactor().ctx().now() >= authorization.deadline
         {
             return Ok(());
         }
@@ -393,6 +393,7 @@ impl ClientListeners {
                 retirement_records: self.retirement_records.clone(),
                 new_records: Vec::new(),
                 retirement_timeout: self.request_timeout,
+                clock: self.io.reactor().ctx().clock.clone(),
                 exchanged: BTreeSet::new(),
                 retained_names: definitions.iter().map(|d| d.name.clone()).collect(),
             };
@@ -400,7 +401,7 @@ impl ClientListeners {
             self.cleanup.borrow_mut().clear();
             self.retirement_records
                 .borrow_mut()
-                .retain(|record| record.live(uring_runtime::environment::now()));
+                .retain(|record| record.live(self.io.reactor().ctx().now()));
             let old = self.listeners.borrow().clone();
             let old_by_name: BTreeMap<_, _> = old
                 .values()
@@ -439,7 +440,7 @@ impl ClientListeners {
                     name: listener.definition.name.clone(),
                     listener: Rc::downgrade(listener),
                     allowed: Arc::downgrade(&listener.backlog_allowed),
-                    deadline: uring_runtime::environment::now(),
+                    deadline: self.io.reactor().ctx().now(),
                 });
             }
             // Commit must not allocate while adding deferred owners to the queue.
@@ -476,7 +477,11 @@ impl ClientListeners {
                     continue;
                 }
                 let mut random = [0; 16];
-                uring_runtime::environment::fill_random(&mut random)
+                self.io
+                    .reactor()
+                    .ctx()
+                    .rng
+                    .fill(&mut random)
                     .map_err(|_| Error::Unavailable)?;
                 let temporary = format!(".racer-{:032x}", u128::from_ne_bytes(random));
                 let previous = old_by_name.get(definition.name.as_str()).cloned();
@@ -566,7 +571,7 @@ impl ClientListeners {
             }
             let deadline = active.deadline.get();
             let force = active.expired != Some(deadline)
-                && (uring_runtime::environment::now() >= deadline
+                && (self.io.reactor().ctx().now() >= deadline
                     || active.cancellation.is_cancelled());
             if force {
                 active.expired = Some(deadline);
@@ -700,7 +705,7 @@ impl ClientListeners {
         };
         if !self.accepting.get()
             || entry.remaining == 0
-            || uring_runtime::environment::now() >= entry.deadline
+            || self.io.reactor().ctx().now() >= entry.deadline
         {
             return;
         }
@@ -1193,6 +1198,8 @@ impl ReadyListeners {
 /// Owns prepared paths and sockets. Keep this on the listener's worker. Drop
 /// rolls back; commit performs no filesystem or network operations.
 pub struct PreparedListeners {
+    /// Retirement deadlines.
+    clock: racer_io::Clock,
     generation: Rc<Cell<u64>>,
     definitions: Vec<CacheDefinition>,
     target: Rc<RefCell<BTreeMap<CacheId, Rc<BoundListener>>>>,
@@ -1245,7 +1252,7 @@ impl PreparedListeners {
             retain
         });
         if self.accepting.get() {
-            let retirement_deadline = uring_runtime::environment::now() + self.retirement_timeout;
+            let retirement_deadline = self.clock.now() + self.retirement_timeout;
             for mut record in self.new_records.drain(..) {
                 record.deadline = retirement_deadline;
                 self.retirement_records.borrow_mut().push(record);

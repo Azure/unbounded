@@ -289,7 +289,7 @@ impl peer_wire::Context for HttpContext {
         scope.deadline.0 = scope
             .deadline
             .0
-            .min(uring_runtime::environment::now() + Duration::from_secs(5));
+            .min(parent.clock().now() + Duration::from_secs(5));
         Ok(scope)
     }
 }

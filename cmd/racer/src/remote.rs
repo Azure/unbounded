@@ -181,23 +181,20 @@ impl RemoteEndpoint {
         }
     }
 
-    /// Whether [`Self::resolve`] would query the resolver now.
-    pub fn needs_resolve(&self) -> bool {
+    /// Whether [`Self::resolve`] would query the resolver at `now`.
+    pub fn needs_resolve(&self, now: std::time::Instant) -> bool {
         if self.0.literal.is_some() {
             return false;
         }
         let cache = self.0.cache.lock().unwrap_or_else(|e| e.into_inner());
-        cache.addresses.is_empty()
-            || cache
-                .refreshed
-                .is_none_or(|at| uring_runtime::environment::now() >= at + DNS_TTL)
+        cache.addresses.is_empty() || cache.refreshed.is_none_or(|at| now >= at + DNS_TTL)
     }
 
     /// Resolve unless the endpoint is an IP literal or its addresses are fresh.
     /// A failed refresh keeps previously resolved addresses usable.
     pub async fn resolve(&self, resolver: &dyn Resolver, scope: &RequestScope) -> Result<()> {
         scope.check()?;
-        if !self.needs_resolve() {
+        if !self.needs_resolve(scope.clock().now()) {
             return Ok(());
         }
         match resolver.resolve(&self.0.host, self.0.port, scope).await {
@@ -207,7 +204,7 @@ impl RemoteEndpoint {
                 // attempt after a connect-failure re-resolve back to the
                 // first (possibly dead) address every time.
                 cache.addresses = addresses;
-                cache.refreshed = Some(uring_runtime::environment::now());
+                cache.refreshed = Some(scope.clock().now());
                 Ok(())
             }
             result => {

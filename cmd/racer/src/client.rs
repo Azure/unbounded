@@ -469,7 +469,7 @@ impl Responses {
                 stream.enable_progress(timeout);
                 while sent < expected {
                     let mut progress_scope = scope.clone();
-                    progress_scope.deadline.0 = uring_runtime::environment::now() + timeout;
+                    progress_scope.deadline.0 = progress_scope.clock().now() + timeout;
                     let reader = if let Some(reader) = first.take() {
                         reader
                     } else {
@@ -600,7 +600,7 @@ impl Responses {
                             let socket = socket.clone();
                             let reservation = reservation.clone();
                             let mut receive_scope = scope.clone();
-                            receive_scope.deadline.0 = uring_runtime::environment::now() + timeout;
+                            receive_scope.deadline.0 = receive_scope.clock().now() + timeout;
                             ready = Some(Box::pin(async move {
                                 reactor
                                     .readiness_with_lease(
@@ -637,7 +637,7 @@ impl Responses {
                 }
             }
             let mut final_scope = scope.clone();
-            final_scope.deadline.0 = uring_runtime::environment::now() + timeout;
+            final_scope.deadline.0 = final_scope.clock().now() + timeout;
             connection =
                 send_frame(&self.io, connection, frame(2, pages, sent, 0), &final_scope).await?;
             // Completion closes the subscription without waiting for final releases.
@@ -736,7 +736,7 @@ impl Responses {
             stream.enable_progress(timeout);
             while sent < expected {
                 let mut progress_scope = scope.clone();
-                progress_scope.deadline.0 = uring_runtime::environment::now() + timeout;
+                progress_scope.deadline.0 = progress_scope.clock().now() + timeout;
                 let item = match first.take() {
                     Some(item) => item,
                     None => std::future::poll_fn(|cx| {
@@ -835,7 +835,7 @@ impl Responses {
             }
         }
         let mut final_scope = scope.clone();
-        final_scope.deadline.0 = uring_runtime::environment::now() + timeout;
+        final_scope.deadline.0 = final_scope.clock().now() + timeout;
         sink.finish(&final_scope).await?;
         connection =
             send_frame(&self.io, connection, frame(2, pages, sent, 0), &final_scope).await?;
