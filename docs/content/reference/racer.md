@@ -246,6 +246,15 @@ runs a privileged UID 0 container with these host paths:
 | `/run/racer` | Client and origin sockets |
 | `/dev`, mounted read-only at `/host/dev` | Optional [raw cache devices](#raw-device-storage) |
 
+Every admitted connection and splice pipe is a file descriptor. At startup the
+dataplane computes the descriptors its final budgets need: 1,024, plus the
+node-wide `RACER_CLIENT_CONNECTIONS`, `RACER_PEER_CONNECTIONS`, and
+`RACER_OUTBOUND_CONNECTIONS`, plus two per `RACER_PIPES`, plus 64 per I/O worker.
+With defaults, a 16-worker node needs about 37,000. The dataplane raises its soft
+`RLIMIT_NOFILE` to that amount when needed, and refuses to start (`stage=fd-limit`)
+when the hard limit is lower. Raise the container runtime's `nofile` limit or lower
+those budgets.
+
 Do not turn off cluster-wide admission protections. Authorize these workloads
 narrowly. RDMA is optional; see [RDMA](#rdma).
 

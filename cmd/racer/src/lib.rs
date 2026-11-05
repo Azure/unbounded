@@ -14,6 +14,7 @@ pub mod config;
 pub mod control;
 pub mod enrollment;
 pub mod error;
+pub mod fd_limit;
 pub mod gpu;
 pub mod gpu_landing;
 pub mod gpu_slot;

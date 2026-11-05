@@ -482,6 +482,8 @@ impl Application {
             self.config.io_workers.is_some(),
         )?;
         self.config.admission_history_per_worker(plan.pairs.len())?;
+        // Every admitted connection and pipe is a descriptor; check before any opens.
+        crate::fd_limit::ensure(&self.config.limits, plan.pairs.len())?;
         log_worker_plan("final", &plan);
         let mut node = NodeState::with_peer_admission(
             plan.pairs.iter().map(|p| p.worker).collect(),
