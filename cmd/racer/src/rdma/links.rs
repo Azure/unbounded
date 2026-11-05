@@ -1045,18 +1045,25 @@ impl Links {
 
     /// Sender: decline the peer's grant if its link is still the granted one.
     ///
-    /// Reads the link snapshot with [`Client::link_current`], never the
-    /// contended-reads-as-idle [`Client::link`]: a skipped release leaves the
-    /// peer's grant exposed until its deadline, which breaks the peer's link.
+    /// The owner matches the grant's link id against its own link table,
+    /// not the worker snapshot: a snapshot that lags a just-ready link would
+    /// otherwise skip the release and leave the peer's grant exposed until
+    /// its deadline, which breaks the peer's link. Release is idempotent on
+    /// the owner, and a grant whose link is gone has nothing to release.
     pub fn release(&self, peer: &NodeId, grant: &AuthenticatedGrant) {
         if !self.rail_ready(grant.rail) {
             return;
         }
         let key = link_key(peer, grant.rail);
-        if let LinkState::Ready { epoch, link_id } = self.client.link_current(key)
+        let release = self.client.release_link(key, grant.link, grant.tag);
+        let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+        // Refused before the owner saw it (full queue): break the link on
+        // the guaranteed path, as `release_epoch` does.
+        if let std::task::Poll::Ready(Err(rdma_verbs::Error::Overloaded)) = release.poll(&mut cx)
+            && let LinkState::Ready { epoch, link_id } = self.client.link(key)
             && link_id == grant.link
         {
-            self.release_epoch(key, epoch, grant.tag);
+            self.client.break_link(key, epoch);
         }
     }
 

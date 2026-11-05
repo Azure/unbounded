@@ -14,7 +14,7 @@ use std::{
     rc::Rc,
     sync::{
         Arc, Mutex, PoisonError, RwLock,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
     },
     task::{Context, Poll, Waker},
     time::{Duration, Instant},
@@ -138,6 +138,16 @@ pub struct NodeConfig {
     pub guard: Guard,
 }
 
+/// How a command names its link.
+#[derive(Clone, Copy)]
+enum LinkMatch {
+    /// The QP incarnation.
+    Epoch(Epoch),
+
+    /// The handshake link id.
+    Id(u64),
+}
+
 /// Owner commands.
 enum Command {
     Activate(NodeConfig, Completer<Vec<Selection>>),
@@ -188,7 +198,7 @@ enum Command {
 
     Release {
         key: LinkKey,
-        epoch: Epoch,
+        link: LinkMatch,
         tag: u32,
         done: Completer<()>,
     },
@@ -196,9 +206,60 @@ enum Command {
     Break(LinkKey, Epoch),
 }
 
+/// Published link states, keyed by link.
+type LinkMap = BTreeMap<LinkKey, LinkState>;
+
+/// The owner's published link table: an `Arc` swapped under a mutex that is
+/// held only for the pointer swap or clone, plus a generation counter so
+/// readers can reuse a cached `Arc` without locking.
+///
+/// Unlike a `try_read` on a `RwLock`, a read never fails under contention:
+/// it waits at most for one pointer swap, and a writer never waits for
+/// readers to finish with the old table.
+struct Snapshot {
+    current: Mutex<Arc<LinkMap>>,
+
+    /// Bumped after every swap of `current`.
+    generation: AtomicU64,
+}
+
+impl Snapshot {
+    fn new() -> Self {
+        Self {
+            current: Mutex::new(Arc::new(LinkMap::new())),
+            generation: AtomicU64::new(0),
+        }
+    }
+
+    /// The latest table and its generation.
+    fn load(&self) -> (u64, Arc<LinkMap>) {
+        let current = self.current.lock().unwrap_or_else(PoisonError::into_inner);
+        // Read under the lock: the generation matches the table.
+        (self.generation.load(Ordering::Acquire), current.clone())
+    }
+
+    /// Replace the table. The old one drops outside the lock.
+    fn store(&self, links: LinkMap) {
+        let links = Arc::new(links);
+        let old = {
+            let mut current = self.current.lock().unwrap_or_else(PoisonError::into_inner);
+            self.generation.fetch_add(1, Ordering::AcqRel);
+            std::mem::replace(&mut *current, links)
+        };
+        drop(old);
+    }
+}
+
+/// A worker's cached copy of the [`Snapshot`].
+struct Cached {
+    generation: u64,
+
+    links: Arc<LinkMap>,
+}
+
 /// State shared by the owner and every client.
 struct NodeShared {
-    links: RwLock<BTreeMap<LinkKey, LinkState>>,
+    links: Snapshot,
 
     pools: RwLock<BTreeMap<u16, Arc<PoolShared>>>,
 
@@ -229,7 +290,7 @@ pub fn node(workers: usize) -> Result<(Vec<Client>, OwnerPort)> {
 
     let (handles, channel) = channel::channels(workers, COMMAND_QUEUE)?;
     let shared = Arc::new(NodeShared {
-        links: RwLock::new(BTreeMap::new()),
+        links: Snapshot::new(),
         pools: RwLock::new(BTreeMap::new()),
         device_pools: RwLock::new(BTreeMap::new()),
         breaks: Mutex::new(Vec::new()),
@@ -244,6 +305,7 @@ pub fn node(workers: usize) -> Result<(Vec<Client>, OwnerPort)> {
         .map(|worker| Client {
             worker,
             shared: shared.clone(),
+            cached: Mutex::new(None),
         })
         .collect();
 
@@ -269,6 +331,9 @@ pub struct Client {
     worker: channel::Worker<Command>,
 
     shared: Arc<NodeShared>,
+
+    /// The last snapshot this worker read. Uncontended: one worker owns it.
+    cached: Mutex<Option<Cached>>,
 }
 
 /// An op that already failed with `error`.
@@ -307,27 +372,23 @@ impl Client {
         self.submit(|done| Command::Activate(config, done))
     }
 
-    /// Snapshot of `key`'s link. A busy snapshot reads as [`LinkState::Idle`]
-    /// (callers then use HTTP or get `Overloaded` from `open`).
+    /// Snapshot of `key`'s link as last published by the owner. May lag the
+    /// owner, but never reads as [`LinkState::Idle`] because of a concurrent
+    /// publish: the read reuses this worker's cached table while the
+    /// generation is unchanged and otherwise waits at most for one pointer
+    /// swap.
     pub fn link(&self, key: LinkKey) -> LinkState {
-        match self.shared.links.try_read() {
-            Ok(links) => links.get(&key).copied().unwrap_or(LinkState::Idle),
-            Err(_) => LinkState::Idle,
-        }
-    }
+        let generation = self.shared.links.generation.load(Ordering::Acquire);
+        let mut cached = self.cached.lock().unwrap_or_else(PoisonError::into_inner);
 
-    /// Snapshot of `key`'s link, waiting out a concurrent publish instead of
-    /// reading [`LinkState::Idle`]. For paths that must act on the current
-    /// link, such as releasing a peer's grant: skipping that release would
-    /// later break the peer's link at its grant deadline. The owner holds the
-    /// write lock only while copying the snapshot.
-    pub fn link_current(&self, key: LinkKey) -> LinkState {
-        self.shared
-            .links
-            .read()
-            .unwrap_or_else(PoisonError::into_inner)
-            .get(&key)
-            .copied()
+        if cached.as_ref().is_none_or(|c| c.generation != generation) {
+            let (generation, links) = self.shared.links.load();
+            *cached = Some(Cached { generation, links });
+        }
+
+        cached
+            .as_ref()
+            .and_then(|c| c.links.get(&key).copied())
             .unwrap_or(LinkState::Idle)
     }
 
@@ -468,7 +529,21 @@ impl Client {
     pub fn release(&self, key: LinkKey, epoch: Epoch, tag: u32) -> Op<()> {
         self.submit(|done| Command::Release {
             key,
-            epoch,
+            link: LinkMatch::Epoch(epoch),
+            tag,
+            done,
+        })
+    }
+
+    /// Sender: decline the peer's grant `tag` on whichever current link of
+    /// `key` carries handshake id `link_id`, without consulting the
+    /// snapshot. The owner resolves the link, so a snapshot that lags a
+    /// just-ready link cannot skip the release. Fails `Unavailable` if no
+    /// ready link of `key` has that id.
+    pub fn release_link(&self, key: LinkKey, link_id: u64, tag: u32) -> Op<()> {
+        self.submit(|done| Command::Release {
+            key,
+            link: LinkMatch::Id(link_id),
             tag,
             done,
         })
@@ -573,8 +648,8 @@ struct Backoff {
     delay: Duration,
 }
 
-/// Retry delay for owner work that raises no wake event: snapshot lock
-/// contention, failed destroys, and shutdown checks.
+/// Retry delay for owner work that raises no wake event: failed destroys
+/// and shutdown checks.
 pub const RETRY_SOON: Duration = Duration::from_millis(1);
 
 /// Runs on the native thread and owns every link, pool, and device.
@@ -688,10 +763,9 @@ impl Owner {
         if self.backlog {
             return Some(now);
         }
-        // Lock contention on the snapshot or pools, destroys to retry, and
-        // shutdown checks retry on a short timer.
-        if self.dirty || !self.dying.is_empty() || (self.closing && !self.leaked && !self.drained())
-        {
+        // Destroys to retry and shutdown checks retry on a short timer. The
+        // snapshot always publishes within the poll that dirtied it.
+        if !self.dying.is_empty() || (self.closing && !self.leaked && !self.drained()) {
             at(now + RETRY_SOON);
         }
         for link in self.links.values() {
@@ -862,16 +936,31 @@ impl Owner {
             },
             Command::Release {
                 key,
-                epoch,
+                link,
                 tag,
                 done,
-            } => match self.ready(key, epoch) {
+            } => match self.matching(key, link) {
                 Some((link, _)) => link.release(tag, done, now),
                 None => {
                     let _ = done.complete(Err(Error::Unavailable));
                 }
             },
             Command::Break(key, epoch) => self.break_matching(key, epoch, now),
+        }
+    }
+
+    /// The link for `key` named by `link`, and its pool.
+    fn matching(&mut self, key: LinkKey, link: LinkMatch) -> Option<(&mut Link, &Pool)> {
+        match link {
+            LinkMatch::Epoch(epoch) => self.ready(key, epoch),
+            LinkMatch::Id(id) => {
+                let link = self
+                    .links
+                    .get_mut(&key)
+                    .filter(|link| link.phase() == Phase::Ready && link.link_id() == id)?;
+                let device = self.devices.get(&key.rail)?;
+                Some((link, &device.pool))
+            }
         }
     }
 
@@ -1329,15 +1418,17 @@ impl Owner {
 
         // Clients read receive-pool state through these; withdraw them before
         // checking that every device pool is idle.
-        match self.shared.pools.try_write() {
-            Ok(mut pools) => pools.clear(),
-            Err(_) => return,
-        }
-
-        match self.shared.device_pools.try_write() {
-            Ok(mut pools) => pools.clear(),
-            Err(_) => return,
-        }
+        // Readers hold these locks only to count buffers.
+        self.shared
+            .pools
+            .write()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clear();
+        self.shared
+            .device_pools
+            .write()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clear();
 
         if self.devices.values().any(|d| !d.pool.idle()) {
             return;
@@ -1372,11 +1463,7 @@ impl Owner {
             return;
         }
 
-        let Ok(mut links) = self.shared.links.try_write() else {
-            return;
-        };
-
-        links.clear();
+        let mut links = LinkMap::new();
         self.expiry = None;
 
         for (key, backoff) in &self.backoff {
@@ -1405,6 +1492,7 @@ impl Owner {
             links.insert(*key, state);
         }
 
+        self.shared.links.store(links);
         self.dirty = false;
     }
 }
@@ -1431,11 +1519,7 @@ impl Drop for Owner {
             }
         }
 
-        self.shared
-            .links
-            .write()
-            .unwrap_or_else(PoisonError::into_inner)
-            .clear();
+        self.shared.links.store(LinkMap::new());
         self.shared
             .pools
             .write()
@@ -1516,23 +1600,56 @@ mod tests {
     }
 
     #[test]
-    /// A contended snapshot reads as `Idle` through `link`, but
-    /// `link_current` waits for the publish and sees the real state.
-    fn link_current_waits_out_a_contended_snapshot() {
+    /// A reader racing a stream of publishes never sees a ready link as
+    /// `Idle`: every published table holds the link, and a read either
+    /// reuses its cached table or waits for the swap.
+    fn contended_snapshot_never_reads_idle() {
         let (clients, port) = node(1).unwrap();
         let key = LinkKey {
             peer: [1; 32],
             rail: 0,
         };
-        let state = LinkState::Connecting(Epoch(3));
         let client = clients.into_iter().next().unwrap();
-        let mut links = port.shared.links.write().unwrap();
-        assert_eq!(client.link(key), LinkState::Idle);
-        let reader = std::thread::spawn(move || client.link_current(key));
-        std::thread::sleep(Duration::from_millis(20));
-        links.insert(key, state);
-        drop(links);
-        assert_eq!(reader.join().unwrap(), state);
+        let ready = |n: u64| LinkState::Ready {
+            epoch: Epoch(n),
+            link_id: n,
+        };
+        port.shared.links.store(LinkMap::from([(key, ready(0))]));
+        let stop = Arc::new(AtomicBool::new(false));
+        let reader = {
+            let stop = stop.clone();
+            std::thread::spawn(move || {
+                let mut reads = 0u64;
+                while !stop.load(Ordering::Acquire) || reads < 1000 {
+                    assert!(matches!(client.link(key), LinkState::Ready { .. }));
+                    reads += 1;
+                }
+                // A later read sees the last publish.
+                client.link(key)
+            })
+        };
+        for n in 1..=20_000 {
+            port.shared.links.store(LinkMap::from([(key, ready(n))]));
+        }
+        stop.store(true, Ordering::Release);
+        assert_eq!(reader.join().unwrap(), ready(20_000));
+    }
+
+    #[test]
+    /// A read reuses the cached table until the generation moves.
+    fn snapshot_read_tracks_generation() {
+        let (clients, port) = node(1).unwrap();
+        let key = LinkKey {
+            peer: [2; 32],
+            rail: 1,
+        };
+        assert_eq!(clients[0].link(key), LinkState::Idle);
+        port.shared
+            .links
+            .store(LinkMap::from([(key, LinkState::Breaking)]));
+        assert_eq!(clients[0].link(key), LinkState::Breaking);
+        port.shared.links.store(LinkMap::new());
+        assert_eq!(clients[0].link(key), LinkState::Idle);
     }
 
     #[test]

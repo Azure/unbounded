@@ -317,6 +317,33 @@ fn activation_requires_implicit_odp_and_releases_on_failure() {
 }
 
 #[test]
+/// `release_link` names the link by handshake id: the owner resolves it, so
+/// the release goes out without the caller's snapshot. A wrong id is refused
+/// and leaves the grant and link alone.
+fn release_by_link_id_reaches_the_current_link() {
+    profiles(|| {
+        let mut w = world();
+        let (ea, _) = link_up(&mut w);
+        let LinkState::Ready { link_id, .. } = w.b.clients[0].link(TO_A) else {
+            panic!("link not ready");
+        };
+        let deadline = w.now() + 5 * SECOND;
+        let granted = w.a.clients[0].grant(TO_B, ea, [1; 16], 10, deadline);
+        let granted = wait(&mut w, &granted).unwrap();
+        let wrong = w.b.clients[0].release_link(TO_A, link_id ^ 1, granted.tag);
+        assert_eq!(wait(&mut w, &wrong), Err(Error::Unavailable));
+        assert!(pending(&granted.arrival));
+        let released = w.b.clients[0].release_link(TO_A, link_id, granted.tag);
+        assert_eq!(wait(&mut w, &released), Ok(()));
+        assert!(matches!(ready(&granted.arrival), Ok(Arrival::Released)));
+        // Idempotent: a second release of the same tag completes too.
+        let again = w.b.clients[0].release_link(TO_A, link_id, granted.tag);
+        assert_eq!(wait(&mut w, &again), Ok(()));
+        assert!(matches!(w.b.clients[0].link(TO_A), LinkState::Ready { .. }));
+    });
+}
+
+#[test]
 /// The sender releases instead of writing; a write for a tag never
 /// granted times out; neither breaks the link.
 fn release_and_wrong_tag_fall_back_without_break() {
