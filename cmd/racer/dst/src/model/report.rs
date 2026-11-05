@@ -90,6 +90,14 @@ pub struct Counters {
     pub link_failures: u64,
     /// Sends refused by an open link circuit (racer-sim `link_circuit_open`).
     pub link_circuit_open: u64,
+    /// Walk probes sent with acquisition authority (racer-sim `peer_requests_acquire`).
+    pub peer_requests_acquire: u64,
+    /// Walk probes sent copy-only (racer-sim `peer_requests_copy_only`).
+    pub peer_requests_copy_only: u64,
+    /// Acquisitions that ended with a result.
+    pub fills: u64,
+    /// Acquisitions that ended with an error (racer-sim `fills_failed`).
+    pub fills_failed: u64,
     /// Replies lost on a cut route (racer-sim `replies_lost`).
     pub replies_lost: u64,
     /// Most pages any node stores at the end of the run.
@@ -160,6 +168,8 @@ pub struct Report {
     pub attempt_errors: BTreeMap<String, u64>,
     /// Origin requests by page.
     pub origin_per_page: BTreeMap<Page, u64>,
+    /// Origin repeat classification (racer-sim `classify_repeat`).
+    pub repeats: super::repeats::Repeats,
     /// Core effect and serve outcome variants seen, by [`super::effect_name`].
     pub coverage: BTreeMap<&'static str, u64>,
     /// Hard failures (invariant violations), first few kept.
@@ -196,7 +206,7 @@ impl Report {
         };
         let max_per_page = self.origin_per_page.values().copied().max().unwrap_or(0);
         let pages = self.origin_per_page.len() as u64;
-        json!({
+        let mut report = json!({
             "scenario": scenario.name,
             "fidelity": "model",
             "seed": seed,
@@ -270,6 +280,10 @@ impl Report {
                     "messages_lost": c.messages_lost,
                     "link_failures": c.link_failures,
                     "link_circuit_open": c.link_circuit_open,
+                    "peer_requests_acquire": c.peer_requests_acquire,
+                    "peer_requests_copy_only": c.peer_requests_copy_only,
+                    "fills": c.fills,
+                    "fills_failed": c.fills_failed,
                     "replies_lost": c.replies_lost,
                     "replies_abandoned": c.replies_abandoned,
                 },
@@ -295,6 +309,16 @@ impl Report {
                 "hard_failures": self.hard_failures,
                 "violations": self.violations,
             },
-        })
+        });
+        // racer-sim's repeat fields and counters, under the same names.
+        if let Some(o) = report["origin_per_page"].as_object_mut() {
+            o.extend(self.repeats.json(&self.origin_per_page));
+        }
+        if let Some(counters) = report["metrics"]["counters"].as_object_mut() {
+            for (name, n) in &self.repeats.counters {
+                counters.insert((*name).to_owned(), json!(n));
+            }
+        }
+        report
     }
 }

@@ -15,6 +15,7 @@ pub mod coverage;
 pub mod ctl_report;
 pub mod membership;
 pub mod phantom;
+mod repeats;
 mod report;
 
 use std::{
@@ -78,6 +79,7 @@ use crate::{
 };
 use membership::{Members, Version, Versions};
 use phantom::Phantom;
+use repeats::{Asked, Cut};
 
 /// A page of an object.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -554,6 +556,9 @@ struct Node {
     down: bool,
 }
 
+/// When an acquisition started, and how its walk probes ended.
+type Walked = (Nanos, Vec<(u32, Asked)>);
+
 /// One worker's link circuits (production `LinkHealth::inner`, `src/topology.rs`).
 struct Links {
     circuits: Circuits<u32>,
@@ -569,6 +574,40 @@ impl Links {
             circuits: Circuits::new(LINK_HEALTH_CAPACITY, Duration::from_secs(1)),
             failed: BTreeSet::new(),
         }
+    }
+}
+
+/// How a walk probe's reply ended, for repeat classification (racer-sim's mapping from the
+/// walk outcome to `Asked`).
+fn asked(reply: &Reply, cut: Option<Cut>) -> Asked {
+    use racer_core::read::ResponseKind as K;
+    match *reply {
+        Reply::Answer { kind, .. } if kind.has_payload() => Asked::Copy,
+        Reply::Answer {
+            kind: K::Miss | K::VersionUnavailable,
+            ..
+        } => Asked::Miss,
+        Reply::Answer {
+            kind: K::Unavailable,
+            signed,
+        } => {
+            if signed {
+                Asked::Failed
+            } else {
+                Asked::Relayed
+            }
+        }
+        Reply::Answer {
+            kind: K::Overloaded | K::FlightFull | K::StaleMembership,
+            ..
+        } => Asked::Busy,
+        Reply::Answer { .. } => Asked::Unfunded,
+        Reply::TimedOut => Asked::Unreachable(cut),
+        Reply::Failed {
+            error: Error::Overloaded,
+            ..
+        } => Asked::Busy,
+        Reply::Failed { .. } => Asked::Unreachable(cut),
     }
 }
 
@@ -692,6 +731,13 @@ struct Model<'s> {
     searches: BTreeMap<(u32, u8), Vec<Nanos>>,
     /// Link circuits per `(node, worker)` (production `LinkHealth`, worker-local).
     links: BTreeMap<(u32, u8), Links>,
+    /// Running acquisitions by `(node, worker, read)`: when each started and how its walk
+    /// probes ended, for origin repeat classification ([`repeats`]).
+    acquisitions: BTreeMap<(u32, u32, ReadId), Walked>,
+    /// Acquisitions recorded since the last prune of ended ones.
+    acquisitions_added: usize,
+    /// Why a walk probe's request failed in transport, by `(node, worker, effect)`.
+    cuts: BTreeMap<(u32, u32, EffectId), Cut>,
     report: Report,
     expected_reads: u64,
     /// Queued [`Ev::ProbeTimeout`], [`Ev::PingTimeout`] and [`Ev::LastHop`] events: bounds that
@@ -867,6 +913,9 @@ impl<'s> Model<'s> {
             relays_active: BTreeMap::new(),
             searches: BTreeMap::new(),
             links: BTreeMap::new(),
+            acquisitions: BTreeMap::new(),
+            acquisitions_added: 0,
+            cuts: BTreeMap::new(),
             report: Report::default(),
             expected_reads: 0,
             timeouts_queued: 0,
@@ -1285,6 +1334,7 @@ impl<'s> Model<'s> {
             } => {
                 self.trace.record(now, TAG_EVENT, 2, u64::from(node));
                 if let Input::Replied { id, reply, .. } = &input {
+                    let cut = self.cuts.remove(&(node, worker, *id));
                     let Some((to, page, _, sent)) = self.probes.remove(&(node, worker, *id)) else {
                         // The attempt timed out first; its late answer is dropped.
                         self.report.counters.late_answers += 1;
@@ -1296,6 +1346,7 @@ impl<'s> Model<'s> {
                         let verify = self.fabric.costs.crypto_verify_ns;
                         self.fabric.crypto(now, node, worker as u8, verify);
                     }
+                    self.asked(node, worker, read, to, asked(reply, cut));
                     if self.diag {
                         let owners = self.latest_owners(page);
                         let role = |n: u32| match owners.iter().position(|o| *o == n) {
@@ -1397,7 +1448,9 @@ impl<'s> Model<'s> {
                 id,
             } => {
                 self.timeouts_queued -= 1;
+                let cut = self.cuts.remove(&(node, worker, id));
                 if let Some((to, page, copy_only, _)) = self.probes.remove(&(node, worker, id)) {
+                    self.asked(node, worker, read, to, Asked::Unreachable(cut));
                     if self.diag {
                         let owners = self.latest_owners(page);
                         let role = match owners.iter().position(|o| *o == to) {
@@ -2322,6 +2375,7 @@ impl<'s> Model<'s> {
             Some(plan) => plan.search,
         };
         let Ok((keep, links)) = search else {
+            self.note_cut(mid, Cut::Route);
             return self.fail_hop(mid, holder, Fault::HopBudgetExhausted);
         };
         let Some(members) = self
@@ -2420,6 +2474,7 @@ impl<'s> Model<'s> {
             }
             Err(_) => {
                 self.report.counters.route_unreachable += 1;
+                self.note_cut(mid, Cut::Route);
                 return self.fail_hop(mid, holder, Fault::Unavailable);
             }
         };
@@ -2458,6 +2513,7 @@ impl<'s> Model<'s> {
     fn link(&mut self, mid: u64, holder: u32, plan: Option<RelayPlan>, next: u32, ready: Nanos) {
         let now = self.now();
         if plan.is_some_and(|plan| plan.outbound.is_err()) {
+            self.note_cut(mid, Cut::Route);
             return self.fail_hop(mid, holder, Fault::HopBudgetExhausted);
         }
         let conn = self.link_worker(mid, holder);
@@ -2469,10 +2525,19 @@ impl<'s> Model<'s> {
                 && links.circuits.acquire(&next, at).is_err()
             {
                 self.report.counters.link_circuit_open += 1;
+                self.note_cut(mid, Cut::Circuit);
                 return self.fail_hop(mid, holder, Fault::Unavailable);
             }
         }
         let cut = self.cut(holder, next);
+        if cut {
+            let why = if self.nodes[next as usize].down {
+                Cut::Down
+            } else {
+                Cut::Partition
+            };
+            self.note_cut(mid, why);
+        }
         // The sender's pool hands out a connection before any I/O (`racer_core::connections`).
         let acquired = (!cut && self.spec.connections != PeerConnections::Off)
             .then(|| self.conns.acquire(now, holder, conn, next));
@@ -2672,6 +2737,90 @@ impl<'s> Model<'s> {
     /// The worker of a node that holds request `mid`'s connection, as the Model spreads peer
     /// connections over workers (racer-sim `hop`: `probe % workers`). An inference: production
     /// assigns accepted connections to workers by its listener, not by request.
+    /// Record acquisition `read` when first seen; every so often forget ended ones.
+    fn track_acquisition(&mut self, node: u32, worker: u32, read: ReadId) {
+        if self.acquisitions.contains_key(&(node, worker, read)) {
+            return;
+        }
+        let now = self.now();
+        self.acquisitions
+            .insert((node, worker, read), (now, Vec::new()));
+        self.acquisitions_added += 1;
+        if self.acquisitions_added >= 4096.max(self.acquisitions.len()) {
+            self.acquisitions_added = 0;
+            let nodes = &self.nodes;
+            self.acquisitions
+                .retain(|(n, w, r), _| nodes[*n as usize].cores[*w as usize].read(*r).is_some());
+        }
+    }
+
+    /// Walk probe of acquisition `read` to `to` ended as `how`.
+    fn asked(&mut self, node: u32, worker: u32, read: ReadId, to: u32, how: Asked) {
+        if let Some((_, asked)) = self.acquisitions.get_mut(&(node, worker, read)) {
+            asked.push((to, how));
+        }
+    }
+
+    /// Note why the walk probe `mid` failed in transport (racer-sim `note_cut`).
+    fn note_cut(&mut self, mid: u64, cut: Cut) {
+        if let Some(m) = self.msgs.get(&mid)
+            && m.ping.is_none()
+        {
+            self.cuts.insert((m.from, m.worker, m.id), cut);
+        }
+    }
+
+    /// Classify an origin request of acquisition `read` for `page`, ending at `done` with
+    /// `outcome` (racer-sim `classify_repeat`).
+    fn classify_origin(
+        &mut self,
+        node: u32,
+        worker: u32,
+        read: ReadId,
+        page: Page,
+        done: Nanos,
+        outcome: OriginOutcome,
+    ) {
+        let now = self.now();
+        let Some(fill) = self.nodes[node as usize].cores[worker as usize]
+            .read(read)
+            .map(|r| r.fill())
+        else {
+            return;
+        };
+        let rank0 = fill.owners.first().copied().unwrap_or(node);
+        let rank = fill.rank;
+        let (started, asked) = self
+            .acquisitions
+            .get(&(node, worker, read))
+            .map_or((now, &[][..]), |(s, a)| (*s, &a[..]));
+        let request = repeats::Request {
+            now,
+            node,
+            page,
+            rank0,
+            rank,
+            started,
+            asked,
+            done,
+            ok: outcome == OriginOutcome::Ok,
+        };
+        let nodes = &self.nodes;
+        let held = |n: u32| {
+            let holder = &nodes[n as usize];
+            !holder.down && holder.stored.contains(&page)
+        };
+        // racer-sim makes an unexplained repeat a hard invariant (`origin_repeat_explained`).
+        // The Model counts it (`origin_per_page.repeats.unexplained`) and the ported tests
+        // assert it is zero: `model-range-readers` refetches pages a node holds through its
+        // range windows (see `dst/MODEL.md`, Origin repeats).
+        if let Some(why) = self.report.repeats.origin(&request, held)
+            && self.diag
+        {
+            *self.report.attempt_errors.entry(why).or_default() += 1;
+        }
+    }
+
     /// The worker whose link health a send from `holder` uses: the requester's read worker,
     /// or the connection's worker at a relay.
     fn link_worker(&self, mid: u64, holder: u32) -> u8 {
@@ -2861,6 +3010,9 @@ impl<'s> Model<'s> {
             {
                 self.violation(format!("node {node} worker {worker} reused effect {id:?}"));
             }
+            if let Effect::Acquisition { read, .. } = &effect {
+                self.track_acquisition(node, worker, *read);
+            }
             self.complete(node, worker, effect);
         }
     }
@@ -2967,6 +3119,11 @@ impl<'s> Model<'s> {
                         },
                     );
                     let copy_only = probe.mode == racer_core::read::walk::Mode::CopyOnly;
+                    if copy_only {
+                        self.report.counters.peer_requests_copy_only += 1;
+                    } else {
+                        self.report.counters.peer_requests_acquire += 1;
+                    }
                     self.probes
                         .insert((node, worker, id), (to, page, copy_only, now));
                     let plan = match plan {
@@ -3052,6 +3209,13 @@ impl<'s> Model<'s> {
                 Acq::Origin { id, .. } => {
                     self.report.counters.origin_requests += 1;
                     *self.report.origin_per_page.entry(page).or_default() += 1;
+                    let (at, outcome) = self.origin.request(
+                        now,
+                        page.object,
+                        self.spec.page_bytes,
+                        self.origin_errors(),
+                    );
+                    self.classify_origin(node, worker, read, page, at, outcome);
                     if self.diag {
                         // Which owner asked origin, after what walk.
                         let owners = self.latest_owners(page);
@@ -3060,12 +3224,6 @@ impl<'s> Model<'s> {
                         let key = format!("origin:rank{rank:?}:{}", walk.unwrap_or_default());
                         *self.report.attempt_errors.entry(key).or_default() += 1;
                     }
-                    let (at, outcome) = self.origin.request(
-                        now,
-                        page.object,
-                        self.spec.page_bytes,
-                        self.origin_errors(),
-                    );
                     // racer-sim's mapping (`sim/src/node/world.rs`, origin completion).
                     let c = &mut self.report.counters;
                     let result = match outcome {
@@ -3340,6 +3498,8 @@ impl<'s> Model<'s> {
                 self.report.counters.helpers += observed.helpers;
                 self.report.counters.no_helper += observed.no_helper;
                 self.report.counters.flights_reelected += observed.reelected;
+                self.report.counters.fills += observed.fills;
+                self.report.counters.fills_failed += observed.fills_failed;
             }
         }
         if !self.ranges.is_empty() || !self.refreshing.is_empty() {

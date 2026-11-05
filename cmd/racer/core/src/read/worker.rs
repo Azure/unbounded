@@ -277,6 +277,10 @@ pub struct Observed {
     /// Waiters elected to lead a flight after an earlier leader of it ended without
     /// settling it (production `Flights::fail`; racer-sim `flight_reelected`).
     pub reelected: u64,
+    /// Acquisitions that ended with a result, and those whose result was an error
+    /// (racer-sim `fills_*`).
+    pub fills: u64,
+    pub fills_failed: u64,
 }
 
 /// A serve-side decision with successor deferral.
@@ -768,6 +772,8 @@ impl<T: Types> WorkerCore<T> {
         let Some(entry) = self.reads.remove(&read) else {
             return;
         };
+        self.observed.fills += 1;
+        self.observed.fills_failed += u64::from(result.is_err());
         let page = entry.page;
         let Some(flight) = self.flight.get_mut(&page) else {
             return;
