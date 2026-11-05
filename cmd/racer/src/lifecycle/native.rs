@@ -1,8 +1,8 @@
 //! Lifecycle hosting for services paired with an RDMA native host.
 use super::{FailureReporter, Service};
+use racer_io::{Operation, Scope};
 use rdma_verbs::{Error, NativeHost, WithNative};
 use std::task::{Context, Waker};
-use uring_runtime::{Operation, Scope};
 
 impl<S: Scope, T: Service<S>, N: NativeHost> Service<S> for WithNative<T, N>
 where

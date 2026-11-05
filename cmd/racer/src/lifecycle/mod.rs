@@ -5,6 +5,7 @@
 //! external I/O stopped referencing storage. We never detach or drop such owners.
 use racer_io::exec::Next;
 use racer_io::pin as affinity;
+use racer_io::{Error, Operation, Result, Scope};
 use std::{
     cell::Cell,
     future::Future,
@@ -18,7 +19,6 @@ use std::{
     thread::{self, JoinHandle},
     time::{Duration, Instant},
 };
-use uring_runtime::{Error, Operation, Result, Scope};
 
 /// Short recheck interval offered to tests and services that poll a condition
 /// without a wake source. The group itself never polls on it: lifecycle phases,
@@ -113,7 +113,7 @@ pub trait Service<S: Scope> {
 
     /// Return the wake handle used to drive this service's lifecycle.
     fn waker(&self) -> Result<Waker, S::Error> {
-        Ok(uring_runtime::drivers::thread_waker(None))
+        Ok(racer_io::exec::thread_waker())
     }
 
     /// Arrange notification when locally owned work can make progress.
@@ -1245,7 +1245,7 @@ fn lane_thread<S: Scope>(
     service.attach_reporter(control);
     let waker = service.waker().unwrap_or_else(|error| {
         control.fail(error);
-        uring_runtime::drivers::thread_waker(None)
+        racer_io::exec::thread_waker()
     });
     control.subscribe(&waker);
     let park = service.parker();
@@ -1336,7 +1336,7 @@ fn helper_thread<S: Scope>(
         control.lock().stats.drained += 1;
         return Err(error.into());
     }
-    let waker = uring_runtime::drivers::thread_waker(None);
+    let waker = racer_io::exec::thread_waker();
     let mut services = Vec::new();
     for &index in &helper.lanes {
         match factory.build_helper(index) {
@@ -1600,7 +1600,7 @@ fn drive_helpers<E: Copy + PartialEq + From<Error>>(
 ///
 /// Backend failures are reported immediately but do not abandon the operation.
 /// Its completion fence runs to completion, then the first backend error wins.
-pub fn drive_local_with<'a, T: 'a, E: Copy + PartialEq + From<uring_runtime::Error> + 'a>(
+pub fn drive_local_with<'a, T: 'a, E: Copy + PartialEq + From<racer_io::Error> + 'a>(
     mut operation: Operation<'a, T, E>,
     reporter: Option<&'a FailureReporter<E>>,
     mut poll: impl FnMut(&Waker) -> Result<(), E> + 'a,

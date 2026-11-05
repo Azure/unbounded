@@ -542,3 +542,34 @@ mod tests {
         assert_eq!(polls.get(), 7);
     }
 }
+
+/// A waker that unparks the calling thread. No thread is spawned.
+pub fn thread_waker() -> std::task::Waker {
+    std::task::Waker::from(std::sync::Arc::new(ThreadWake(std::thread::current())))
+}
+
+/// Unparks one owner thread.
+struct ThreadWake(std::thread::Thread);
+
+impl std::task::Wake for ThreadWake {
+    fn wake(self: std::sync::Arc<Self>) {
+        self.0.unpark();
+    }
+
+    fn wake_by_ref(self: &std::sync::Arc<Self>) {
+        self.0.unpark();
+    }
+}
+
+#[cfg(test)]
+mod thread_waker_tests {
+    /// A thread waker unparks its owner, so a later park returns at once.
+    #[test]
+    fn thread_waker_unparks_owner() {
+        let waker = super::thread_waker();
+        waker.wake_by_ref();
+        let started = std::time::Instant::now();
+        std::thread::park_timeout(std::time::Duration::from_secs(10));
+        assert!(started.elapsed() < std::time::Duration::from_secs(5));
+    }
+}

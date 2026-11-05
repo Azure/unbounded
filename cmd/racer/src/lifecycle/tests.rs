@@ -101,7 +101,7 @@ fn service_owner_requires_both_fences_and_explicit_release() {
             drain_error: None,
         }));
         let control = Control::new(1, usize::from(helper), true);
-        let waker = uring_runtime::drivers::thread_waker(None);
+        let waker = racer_io::exec::thread_waker();
         assert_eq!(owner.stage, ReleaseStage::Live);
         if helper {
             drive_helpers(
@@ -250,7 +250,7 @@ fn fence_failure_aborts_before_service_drop() {
             let control = Control::new(1, 0, true);
             let factory = FatalFactory(mode.clone());
             let mut owner = ServiceOwner::new(factory.build_lane(0).unwrap());
-            let waker = uring_runtime::drivers::thread_waker(None);
+            let waker = racer_io::exec::thread_waker();
             if !mode.contains("live") {
                 owner.fence_lane_blocking(&TestScope, &control, &waker);
             }
@@ -279,7 +279,7 @@ fn fence_failure_aborts_before_service_drop() {
             control.fence(0);
             let factory = FatalFactory(mode.clone());
             let mut owner = ServiceOwner::new(factory.build_lane(0).unwrap());
-            let waker = uring_runtime::drivers::thread_waker(None);
+            let waker = racer_io::exec::thread_waker();
             drive_helpers(
                 vec![helper_service(
                     0,
@@ -374,7 +374,7 @@ fn helper_shutdown_deadline_is_diagnostic_not_detachment() {
             Poll::Pending
         }
     }));
-    let waker = uring_runtime::drivers::thread_waker(None);
+    let waker = racer_io::exec::thread_waker();
     drive_helpers(
         vec![diagnose_operation(operation, &Expired, &control)],
         &control,
