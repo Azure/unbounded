@@ -591,6 +591,7 @@ spec:
                 enum:
                 - ""
                 - nspawn
+                - none
                 type: string
               kubernetes:
                 description: Kubernetes contains Kubernetes-specific configuration.
@@ -1058,6 +1059,7 @@ spec:
                 enum:
                 - ""
                 - nspawn
+                - none
                 type: string
               isolationChange:
                 description: |-
