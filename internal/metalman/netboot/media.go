@@ -64,6 +64,10 @@ type MediaProvider struct {
 	// DefaultMediaFetchTimeout.
 	FetchTimeout time.Duration
 
+	// ReleaseWait bounds how long Release waits for an in-flight build of
+	// the same media ID after canceling it. Zero uses DefaultMediaReleaseWait.
+	ReleaseWait time.Duration
+
 	// mu guards locks. Each media ID has its own lock so a stalled build for
 	// one machine does not block OpenISO or Release for unrelated machines.
 	mu    sync.Mutex
@@ -73,40 +77,107 @@ type MediaProvider struct {
 // DefaultMediaFetchTimeout bounds registry reads when building boot media.
 const DefaultMediaFetchTimeout = 5 * time.Minute
 
+// DefaultMediaReleaseWait bounds how long Release waits for a canceled build.
+const DefaultMediaReleaseWait = 2 * time.Second
+
 type mediaLock struct {
-	mu   sync.Mutex
+	// sem is a one-slot semaphore so Release can bound its wait.
+	sem  chan struct{}
 	refs int
+	// cancel stops the work of the current holder, if it registered one.
+	// Guarded by MediaProvider.mu.
+	cancel context.CancelFunc
 }
 
-// lock serializes work on a single media ID and returns its unlock function.
-func (p *MediaProvider) lock(id string) func() {
-	p.mu.Lock()
+// ref returns the lock for id with one more reference. Callers hold p.mu.
+func (p *MediaProvider) ref(id string) *mediaLock {
 	if p.locks == nil {
 		p.locks = map[string]*mediaLock{}
 	}
 
 	l := p.locks[id]
 	if l == nil {
-		l = &mediaLock{}
+		l = &mediaLock{sem: make(chan struct{}, 1)}
 		p.locks[id] = l
 	}
 
 	l.refs++
+
+	return l
+}
+
+// unref drops one reference to the lock for id.
+func (p *MediaProvider) unref(id string, l *mediaLock) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	l.refs--
+	if l.refs == 0 {
+		delete(p.locks, id)
+	}
+}
+
+// lock serializes work on a single media ID. It returns a context that
+// Release cancels while this holder runs, and the unlock function.
+func (p *MediaProvider) lock(ctx context.Context, id string) (context.Context, func()) {
+	p.mu.Lock()
+	l := p.ref(id)
 	p.mu.Unlock()
 
-	l.mu.Lock()
+	l.sem <- struct{}{}
 
-	return func() {
-		l.mu.Unlock()
+	ctx, cancel := context.WithCancel(ctx)
 
+	p.mu.Lock()
+	l.cancel = cancel
+	p.mu.Unlock()
+
+	return ctx, func() {
 		p.mu.Lock()
-		defer p.mu.Unlock()
+		l.cancel = nil
+		p.mu.Unlock()
 
-		l.refs--
-		if l.refs == 0 {
-			delete(p.locks, id)
-		}
+		cancel()
+		<-l.sem
+		p.unref(id, l)
 	}
+}
+
+// lockForRelease cancels the current holder of the media lock and waits for
+// it at most wait. It returns bootmedia.ErrMediaBusy if the lock stays held.
+func (p *MediaProvider) lockForRelease(ctx context.Context, id string, wait time.Duration) (func(), error) {
+	p.mu.Lock()
+	l := p.ref(id)
+
+	if l.cancel != nil {
+		l.cancel()
+	}
+	p.mu.Unlock()
+
+	timer := time.NewTimer(wait)
+	defer timer.Stop()
+
+	select {
+	case l.sem <- struct{}{}:
+		return func() {
+			<-l.sem
+			p.unref(id, l)
+		}, nil
+	case <-ctx.Done():
+		p.unref(id, l)
+		return nil, ctx.Err()
+	case <-timer.C:
+		p.unref(id, l)
+		return nil, fmt.Errorf("%w: media %s is still being built", bootmedia.ErrMediaBusy, id)
+	}
+}
+
+func (p *MediaProvider) releaseWait() time.Duration {
+	if p.ReleaseWait > 0 {
+		return p.ReleaseWait
+	}
+
+	return DefaultMediaReleaseWait
 }
 
 func (p *MediaProvider) fetchTimeout() time.Duration {
@@ -212,7 +283,8 @@ func (p *MediaProvider) owner(ctx context.Context, id string) (*mediaOwner, erro
 }
 
 func (p *MediaProvider) Prepare(ctx context.Context, machine *v1alpha3.Machine, op *v1alpha3.MachineOperation, id string) (bootmedia.Source, error) {
-	defer p.lock(id)()
+	ctx, unlock := p.lock(ctx, id)
+	defer unlock()
 
 	o, err := p.owner(ctx, id)
 	if err != nil {
@@ -232,12 +304,21 @@ func (p *MediaProvider) Prepare(ctx context.Context, machine *v1alpha3.Machine, 
 
 // Release removes only local bytes. Durable Cleaned/terminal state revokes the
 // capability and must be saved by the controller before calling Release.
-func (p *MediaProvider) Release(_ context.Context, id string) error {
+// Release cancels an in-flight build of the same ID and waits for it only
+// briefly; if the build has not stopped yet it returns an error wrapping
+// bootmedia.ErrMediaBusy and the caller retries later. A canceled build never
+// leaves a partial ISO: builds are staged in a temporary directory and renamed
+// into place only when complete.
+func (p *MediaProvider) Release(ctx context.Context, id string) error {
 	if !mediaIDPattern.MatchString(id) || p.CacheDir == "" {
 		return fmt.Errorf("invalid media ID or cache directory")
 	}
 
-	defer p.lock(id)()
+	unlock, err := p.lockForRelease(ctx, id, p.releaseWait())
+	if err != nil {
+		return err
+	}
+	defer unlock()
 
 	return os.RemoveAll(filepath.Join(p.CacheDir, "bootmedia", id))
 }
@@ -259,7 +340,8 @@ func (p *MediaProvider) OpenISO(ctx context.Context, name string) (*os.File, err
 		return nil, fmt.Errorf("invalid media filename")
 	}
 
-	defer p.lock(id)()
+	ctx, unlock := p.lock(ctx, id)
+	defer unlock()
 
 	o, err := p.owner(ctx, id)
 	if err != nil {

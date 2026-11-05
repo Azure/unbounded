@@ -530,7 +530,9 @@ func (r *Reconciler) advanceVirtualMedia(ctx context.Context, op *v1alpha3.Machi
 	}
 
 	if err != nil {
-		if errors.Is(err, netboot.ErrImageUnavailable) {
+		// Both mean "not yet": a registry read or an old build is still
+		// running. Wait without counting a retry.
+		if errors.Is(err, netboot.ErrImageUnavailable) || errors.Is(err, bootmedia.ErrMediaBusy) {
 			target.Message = err.Error()
 			return targetChange{target: target}
 		}

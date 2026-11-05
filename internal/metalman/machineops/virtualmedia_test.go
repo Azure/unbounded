@@ -7,6 +7,7 @@ import (
 	"context"
 	"encoding/hex"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -1441,4 +1442,35 @@ func (rt *redirectTransport) RoundTrip(req *http.Request) (*http.Response, error
 	}
 
 	return resp, err
+}
+
+func TestVirtualMediaBusyReleaseRetriesWithoutFailing(t *testing.T) {
+	r, d, _, op := mediaFixture(t)
+	for range 3 {
+		mediaStep(t, r, op.Name)
+	}
+
+	var current v1alpha3.MachineOperation
+	require.NoError(t, r.Get(t.Context(), client.ObjectKeyFromObject(op), &current))
+	current.Status.Targets[0].BootMedia.ImageWritten = true
+	require.NoError(t, r.Status().Update(t.Context(), &current))
+	mediaStep(t, r, op.Name)
+	mediaStep(t, r, op.Name)
+	require.NoError(t, r.Get(t.Context(), client.ObjectKeyFromObject(op), &current))
+	current.Status.Targets[0].BootMedia.RebootRequestedAt = ptrTo(fixedNow())
+	require.NoError(t, r.Status().Update(t.Context(), &current))
+
+	d.err = fmt.Errorf("%w: still building", bootmedia.ErrMediaBusy)
+	_, err := r.Reconcile(t.Context(), ctrl.Request{NamespacedName: types.NamespacedName{Name: op.Name}})
+	require.ErrorIs(t, err, bootmedia.ErrMediaBusy)
+	require.NoError(t, r.Get(t.Context(), client.ObjectKeyFromObject(op), &current))
+	require.False(t, current.Status.Targets[0].BootMedia.Released)
+	require.NotEqual(t, v1alpha3.OperationPhaseFailed, current.Status.Targets[0].Phase)
+	require.Contains(t, current.Finalizers, mediaFinalizer)
+
+	d.err = nil
+
+	mediaStep(t, r, op.Name)
+	require.NoError(t, r.Get(t.Context(), client.ObjectKeyFromObject(op), &current))
+	require.True(t, current.Status.Targets[0].BootMedia.Released)
 }

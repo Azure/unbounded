@@ -1581,3 +1581,93 @@ func TestMediaPrepareFetchTimeoutDoesNotBlockOtherMedia(t *testing.T) {
 
 	require.Empty(t, p.locks)
 }
+
+func TestMediaReleaseCancelsBusyHolderAndReturnsRetryable(t *testing.T) {
+	p := &MediaProvider{CacheDir: t.TempDir(), ReleaseWait: 50 * time.Millisecond}
+	id := strings.Repeat("a", 32)
+	other := strings.Repeat("b", 32)
+	dir := filepath.Join(p.CacheDir, "bootmedia", id)
+	require.NoError(t, os.MkdirAll(dir, 0o700))
+
+	// A holder that ignores cancellation keeps the lock past ReleaseWait.
+	holderCtx, unlock := p.lock(t.Context(), id)
+
+	start := time.Now()
+	err := p.Release(t.Context(), id)
+	require.ErrorIs(t, err, bootmedia.ErrMediaBusy)
+	require.Less(t, time.Since(start), 2*time.Second)
+	require.ErrorIs(t, holderCtx.Err(), context.Canceled, "Release must cancel the holder")
+	require.DirExists(t, dir)
+
+	// Other media IDs are not blocked.
+	require.NoError(t, p.Release(t.Context(), other))
+
+	unlock()
+	require.NoError(t, p.Release(t.Context(), id))
+	require.NoDirExists(t, dir)
+
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	require.Empty(t, p.locks)
+}
+
+func TestMediaReleaseCancelsStalledPrepare(t *testing.T) {
+	stall := imagepulltest.WithMiddleware(func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if strings.Contains(r.URL.Path, "/blobs/") {
+				<-r.Context().Done()
+				return
+			}
+
+			next.ServeHTTP(w, r)
+		})
+	})
+	p, m, op, images := mediaFixtureImages(t, "amd64", nil, nil, stall)
+	images.Puller.IndexBuildTimeout = time.Second
+
+	var calls []string
+
+	p.Run = mockMediaRunner(t, &calls)
+	// Only cancellation can end the stalled fetch within the test.
+	p.FetchTimeout = time.Minute
+	id := op.Status.Targets[0].BootMedia.ID
+
+	done := make(chan error, 1)
+
+	go func() {
+		_, err := p.Prepare(context.WithoutCancel(t.Context()), m, op, id)
+		done <- err
+	}()
+
+	require.Eventually(t, func() bool {
+		p.mu.Lock()
+		defer p.mu.Unlock()
+
+		return p.locks[id] != nil && p.locks[id].cancel != nil
+	}, 5*time.Second, 5*time.Millisecond)
+
+	start := time.Now()
+	err := p.Release(t.Context(), id)
+	require.Less(t, time.Since(start), 5*time.Second)
+
+	if err != nil {
+		require.ErrorIs(t, err, bootmedia.ErrMediaBusy)
+	}
+
+	select {
+	case err := <-done:
+		require.Error(t, err)
+	case <-time.After(10 * time.Second):
+		t.Fatal("Release did not cancel the stalled Prepare")
+	}
+
+	require.NoError(t, p.Release(t.Context(), id))
+	require.Empty(t, calls)
+	require.NoDirExists(t, filepath.Join(p.CacheDir, "bootmedia", id))
+
+	entries, err := os.ReadDir(filepath.Join(p.CacheDir, "bootmedia"))
+	if err == nil {
+		require.Empty(t, entries, "a canceled build must not leave staging files")
+	}
+}

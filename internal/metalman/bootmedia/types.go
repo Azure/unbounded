@@ -5,10 +5,15 @@ package bootmedia
 
 import (
 	"context"
+	"errors"
 	"strings"
 
 	v1alpha3 "github.com/Azure/unbounded/api/machina/v1alpha3"
 )
+
+// ErrMediaBusy reports that media is still in use by an in-flight build that
+// was asked to stop. The operation is retryable.
+var ErrMediaBusy = errors.New("boot media is busy")
 
 // Source identifies a bootstrap ISO served to a management controller over TFTP.
 type Source struct {
