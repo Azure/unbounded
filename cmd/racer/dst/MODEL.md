@@ -156,19 +156,19 @@ Every racer-sim number below is from the racer-sim release binary at this commit
 | | origin requests, origin/page | 30, 3 | 36, 3 |
 | | route unreachable | 7 | 8 |
 | | relays | 4167 | see Scale |
-| | flight joins | 6061 | 9417 |
-| | sheds / helper copies | 91 / 3332 | 35 / 3265 |
-| | latency ms | 92 / 185 / 220 | 104 / 167 / 2094 |
+| | flight joins | 6061 | 9418 |
+| | sheds / helper copies | 91 / 3332 | 35 / 3259 |
+| | latency ms | 92 / 185 / 220 | 104 / 167 / 2097 |
 | cold start, 2000 nodes | completed / failed | 32000 / 0 | 31998 / 2 (`Overloaded`) |
 | | origin requests, origin/page | 43, 3 | 43, 3 |
-| | flight joins | 30204 | 56141 |
-| | sheds / helper copies | 1536 / 27734 | 3967 / 26805 |
-| | latency ms | 126 / 2013 / 2125 | 139 / 2105 / 2146 |
+| | flight joins | 30204 | 59431 |
+| | sheds / helper copies | 1536 / 27734 | 1088 / 26688 |
+| | latency ms | 126 / 2013 / 2125 | 128 / 2121 / 2194 |
 | hot-page storm, 512 nodes | completed / failed | 513 / 0 | 513 / 0 |
 | | origin requests | 1 | 1 |
-| | sheds / helper probes / helper copies | 300 / 496 / 324 | 359 / 460 / 314 |
-| | flight joins | 614 | 617 |
-| | latency ms | 1879 / 2953 / 3192 | 1422 / 3087 / 3132 |
+| | sheds / helper probes / helper copies | 300 / 496 / 324 | 444 / 454 / 308 |
+| | flight joins | 614 | 606 |
+| | latency ms | 1879 / 2953 / 3192 | 1399 / 3163 / 3225 |
 | origin 403, 64 nodes | completed / failed | 1004 / 20 | 1007 / 17 |
 | | origin requests, origin/page | 36, 6 | 33, 12 |
 | | latency ms | 92 / 218 / 225 | 74 / 400 / 407 |
@@ -211,20 +211,23 @@ differences:
 
 Tolerance for the scale cold start (seed 8, every node reads one 16-page object in 10 ms):
 Model failures within 2x of racer-sim's and the same order of magnitude, origin requests at
-most racer-sim's. Since per-worker crypto helpers (below) the 10,000-node point is outside the
-2x bound; see "Accepted divergence" for why the Model keeps production's helpers anyway.
+most racer-sim's.
 
-| Nodes | racer-sim | Model, one crypto helper per node | Model, per-worker crypto helpers and helper silence evidence |
-|---|---|---|---|
-| 400 | 0 failed, 30 origin | 0 failed, 36 origin | 0 failed, 36 origin, 21 relay sheds, 3 pings, p50 104 ms / p99 167 ms |
-| 2,000 | 0 failed, 43 origin | 2 failed, 43 origin | 2 failed, 43 origin, p50 128 ms / p99 2.10 s |
-| 10,000 | 180 failed, 47 origin, 3,986 pings, p50 335 ms | 134 failed (22,926 relay sheds), 25 origin, 0 pings, p50 353 ms / p99 2.19 s, 89,276 B/node, 28 s | 682 failed (15,980 relay sheds), 25 origin, 1,651 pings, p50 268 ms / p99 2.14 s, 93,094 B/node, 22 s |
-| 50,000 | 24,742 failed (3.1%; 76,062 relay rejections), 47 origin, 15,254 pings, p50 1.48 s | 143,726 failed (18%; 1,541,629 relay sheds), 17 origin, 39 pings, p50 1.79 s / p99 2.91 s, 89,544 B/node, 221 s | 56,145 failed (7.0%; 1,032,122 relay sheds), 21 origin, 6,959 pings, p50 0.91 s / p99 2.41 s, 93,479 B/node, 201 s |
+Since the overflow helper spends its own grant (`core/src/read/walk.rs` `helper_grant`), both
+fidelities changed, because racer-sim drives the same racer-core walk. Before and after, both
+at seed 8 (racer-sim from `NodeWorld` with the `cold_start` test's config, release):
 
-At 50,000 the Model fails 2.3x racer-sim's reads (was 5.8x), at 10,000 3.8x (was 0.74x);
-both the same order of magnitude, origin requests below racer-sim's, memory under the
-~110 KB/node budget. The cold start's own 1% failure check fails at 50,000 for both
-fidelities' numbers (racer-sim 3.1%).
+| Nodes | racer-sim before | racer-sim after | Model before | Model after |
+|---|---|---|---|---|
+| 400 | 0 failed, 30 origin | 0 failed, 30 origin | 0 failed, 36 origin | 0 failed, 36 origin, p50 104 ms / p99 167 ms |
+| 2,000 | 0 failed, 43 origin | 0 failed, 43 origin | 2 failed, 43 origin | 2 failed (`Overloaded`), 43 origin, p50 128 ms / p99 2.12 s |
+| 10,000 | 180 failed, 47 origin | 44 failed, 47 origin, 11,432 pings | 682 failed, 25 origin | 95 failed (16,029 relay sheds), 25 origin, 8,773 pings, p50 295 ms / p99 2.23 s, 91,004 B/node |
+| 50,000 | 24,742 failed (3.1%), 47 origin | 1,094 failed (0.14%), 35 origin, 97,468 pings | 56,145 failed (7.0%), 21 origin | 30,697 failed (3.8%; 1,030,672 relay sheds), 21 origin, 35,011 pings, p50 0.96 s / p99 2.69 s, 92,488 B/node |
+
+At 10,000 the Model now fails 2.2x racer-sim's reads (was 3.8x). At 50,000 the gap grew to
+28x (was 2.3x): racer-sim gained more from the helper fix than the Model did, so the Model's
+50,000-node failures have another cause, not yet diagnosed. The cold start's own 1% failure
+check passes for racer-sim at 50,000 now and still fails for the Model.
 
 Crypto helpers (production-faithful, adopted). Production pairs each worker with its own
 crypto helper (`src/worker.rs:124-130` `WorkerPair { io, crypto }`); racer-sim has one per
@@ -234,33 +237,15 @@ Model and production also wait for request verification before dispatch
 (`src/peer/forwarding.rs:368` `verify_request_async`); racer-sim charges `verify_ns` and goes
 on.
 
-Accepted divergence: the 10,000-node failures. The extra failures are walks
-`OOver HUnav OFail OFail` (`MODEL_DIAG=1`, `walk:*`), and every step follows racer-core decision
-code that production calls, so the Model is faithful here and racer-sim's timing (one slower
-helper per node) hides the effect:
-
-1. The page budget has 16 links (`core/src/read/mod.rs:694` `PAGE_LINKS`, `:817`). Owner 0's
-   probe charges `route_links()` = 4 up front (`core/src/read/budget.rs:109-111`, `:182-205`
-   `begin_peer_attempt`), and a signed `Overloaded` (`Outcome::Shed`, `core/src/read/walk.rs:2144`)
-   keeps the debit: links are refunded only for a verified `StaleMembership`
-   (`src/read/candidates.rs:2280`, the only production `refund_links` caller). 12 left.
-2. The shed arms the helper (`walk.rs:948-950`). It needs only `HELPER_FLOOR_LINKS` = 4
-   (`walk.rs:582`, `budget.rs:421`) and is funded `min(remaining, HELPER_LINKS = 8)`
-   (`walk.rs:520-526`), with `note_route_failure`, so its probe charges all 8 even on a direct
-   route. 4 left.
-3. The helper is itself a reader of the page; the request joins its flight, and when its own
-   walk fails every joined serving read fails with the leader's error
-   (`core/src/read/flight.rs` `fail`), answered `Unavailable`. The helper's child budget comes
-   back empty (`walk.rs:897-902` `reunite`) and the failure notes a route failure
-   (`walk.rs:939-943`).
-4. Owner 1 gets the last 4 links (`budget.route_links` = min(4, 8)). If it sheds too, owner 2
-   gets `HopBudgetExhausted` before any send (`walk.rs:1197-1201` `plan_attempt`).
-
-This is a production weakness, not a Model bug: a helper probe that fails costs 8 of the 12
-links left for two owners, so a shed at owner 1 leaves owner 2 untried. Changing it (funding the
-helper only from links beyond what the remaining owners need, or refunding links on a verified
-helper failure) changes production behavior and the helper's failure-routing envelope, so it is
-reported, not changed.
+Fixed: helper detours starved the remaining owners. Before the fix, the extra 10,000-node
+failures were walks `OOver HUnav OFail OFail` (`MODEL_DIAG=1`, `walk:*`). Owner 0 shed the
+reader (`Outcome::Shed`). The helper was funded from the walk's own 8-attempt, 16-link page
+budget (`min(remaining, HELPER_ATTEMPTS)` attempts and `min(remaining, HELPER_LINKS)` links).
+It then failed at once with `Unavailable` and came back empty. Owners 1 and 2 had no credits
+left, so they failed to plan with `Unavailable` (0 attempts) or `HopBudgetExhausted` (0 links).
+At 2,000 nodes there were 1,647 such walks and 4,879 unsent owner probes. After the fix there
+are none and 504 unsent probes. The helper now spends its own grant, which is dropped after
+the probe, so a walk asks at most one helper and the walk's budget never grows.
 
 Pings. Production records a probe's silence evidence through `CandidatePolicy::apply`
 (`src/read/candidates.rs:1546-1580`) with the helper as the destination
