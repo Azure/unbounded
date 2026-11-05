@@ -25,7 +25,10 @@ use super::acquisition::{self, PageAcquisition};
 use super::budget::mesh_helper;
 use super::cohort::{self, CohortKey, MetadataCohort};
 use super::effect::{EffectId, EffectIds, Stale};
-use super::flight::{FlightLimits, FlightTable, Joined, Operation, Settled, Wait};
+use super::flight::{
+    FlightLimits, FlightTable, Joined, Operation, PageFlightTable, PageFlightTypes, Settled, Token,
+    Wait, Waiter,
+};
 use super::hints::{MAX_DEFERRALS, SuccessorHints, defer_allowed, successor_deferral};
 use super::serve::{Decision, ServeDecision, ServeRequest, Step};
 use super::walk::{Evidence, FillConfig, SilenceNote};
@@ -358,7 +361,23 @@ struct Window<P> {
 }
 
 type Hasher = BuildHasherDefault<DefaultHasher>;
-type PageFlights<P> = FlightTable<P, (), (), (), (), Hasher>;
+/// The worker's page flight payloads: the Model tracks flight structure, not bytes.
+pub struct ModelFlights<P>(std::marker::PhantomData<P>);
+
+impl<P: 'static> PageFlightTypes for ModelFlights<P> {
+    type Page = P;
+    type Complete = ();
+    type Partial = ();
+    type Outcome = ();
+    type Result = ();
+    type Hash = Hasher;
+    type Wake = Token;
+    type Waiter = Waiter<()>;
+    type Ext = ();
+    type Retained = ();
+}
+
+type PageFlights<P> = PageFlightTable<ModelFlights<P>>;
 
 fn complete(value: ()) -> Published<(), ()> {
     Published::Complete(value)

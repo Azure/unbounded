@@ -115,18 +115,24 @@ pub use flight::FlightLimits;
 type FlightHashState = std::collections::hash_map::RandomState;
 #[cfg(test)]
 type FlightHashState = crate::runtime::HashState;
-pub(super) type Table = flight::FlightTable<
-    PageId,
-    PageResult,
-    UnverifiedPage,
-    AcquiredPage,
-    (),
-    FlightHashState,
-    WakeTarget,
-    WaiterRecord,
-    EntryExt,
-    Retained,
->;
+/// Production page flight payloads; the same [`flight::PageFlightTable`] family the core
+/// `WorkerCore` owns, instantiated with real pages, wakers, and admission charges.
+pub(super) struct ProductionFlights;
+
+impl flight::PageFlightTypes for ProductionFlights {
+    type Page = PageId;
+    type Complete = PageResult;
+    type Partial = UnverifiedPage;
+    type Outcome = AcquiredPage;
+    type Result = ();
+    type Hash = FlightHashState;
+    type Wake = WakeTarget;
+    type Waiter = WaiterRecord;
+    type Ext = EntryExt;
+    type Retained = Retained;
+}
+
+pub(super) type Table = flight::PageFlightTable<ProductionFlights>;
 type Entry = flight::FlightEntry<
     PageResult,
     UnverifiedPage,

@@ -12,6 +12,44 @@ use std::time::Instant;
 mod table;
 pub use table::{Fence, FlightEntry, FlightTable, Joined, Operation, Removed, Ticket, Waiter};
 
+/// Names one instantiation of the page [`FlightTable`].
+///
+/// [`crate::read::worker::WorkerCore`] and the production `Flights` both name their page table
+/// through [`PageFlightTable`], so the two drivers share one table type family and one set of step
+/// functions; only the payload types differ.
+pub trait PageFlightTypes: 'static {
+    type Page;
+    /// Completed value published to joiners.
+    type Complete;
+    /// Reusable partial value.
+    type Partial;
+    /// Leader outcome split by the table's publish function.
+    type Outcome;
+    /// Per-waiter result payload of the default [`Waiter`].
+    type Result;
+    type Hash;
+    type Wake;
+    type Waiter: WaiterPolicy;
+    /// Per-entry driver extension.
+    type Ext;
+    /// Retained operation payload.
+    type Retained;
+}
+
+/// The page flight table for `F`.
+pub type PageFlightTable<F> = FlightTable<
+    <F as PageFlightTypes>::Page,
+    <F as PageFlightTypes>::Complete,
+    <F as PageFlightTypes>::Partial,
+    <F as PageFlightTypes>::Outcome,
+    <F as PageFlightTypes>::Result,
+    <F as PageFlightTypes>::Hash,
+    <F as PageFlightTypes>::Wake,
+    <F as PageFlightTypes>::Waiter,
+    <F as PageFlightTypes>::Ext,
+    <F as PageFlightTypes>::Retained,
+>;
+
 /// Opaque wake target chosen by the driver (for example, a simulated task id).
 pub type Token = u64;
 
