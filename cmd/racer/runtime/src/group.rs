@@ -24,6 +24,9 @@ const IDLE_WAIT: Duration = Duration::from_millis(1);
 /// service-reported deadline; this only bounds the arithmetic.
 const MAX_PARK: Duration = Duration::from_secs(3600);
 
+/// Consecutive full 1 ms parks after which a lane stops bounding its park.
+const QUIET_PARKS: u32 = 100;
+
 const WORK_BUDGET: usize = 64;
 
 /// One locally driven service and the CPU on which it is constructed.
@@ -969,10 +972,24 @@ fn lane_thread<S: Scope>(
             registration.register(&waker);
         }
         let mut cx = Context::from_waker(&waker);
+        let mut quiet = 0;
         while !control.stopping(&startup) {
-            match poll_turn(&mut *service, &mut cx, &startup, check_scope)
-                .and_then(|wait| service.park(wait))
-            {
+            match poll_turn(&mut *service, &mut cx, &startup, check_scope).and_then(|wait| {
+                // An active lane keeps a 1 ms bound: some lane work still
+                // progresses only on a later turn. After `QUIET_PARKS`
+                // consecutive parks that ran to that bound, the lane parks on
+                // its wake sources alone.
+                let bounded = quiet < QUIET_PARKS;
+                let wait = if bounded { wait.min(IDLE_WAIT) } else { wait };
+                let parked = std::time::Instant::now();
+                service.park(wait)?;
+                if bounded && !wait.is_zero() && parked.elapsed() >= wait {
+                    quiet += 1;
+                } else if parked.elapsed() < wait.min(IDLE_WAIT) {
+                    quiet = 0;
+                }
+                Ok(())
+            }) {
                 Ok(()) => {}
                 Err(error) => {
                     control.fail(error);
@@ -1224,8 +1241,9 @@ fn diagnose_operation<'a, S: Scope>(
 }
 
 /// Rotate helper polling fairly and retain every future through its final
-/// fence. After each pass the thread parks until a wake or the bound the
-/// futures reported in `park` (`IDLE_WAIT` without one).
+/// fence. After `WORK_BUDGET` passes the thread parks until a wake or the
+/// bound the futures reported in `park` (`IDLE_WAIT` without one); the
+/// short spin keeps wake latency off a busy helper's path.
 fn drive_helpers<E: Copy + PartialEq + From<Error>>(
     operations: Vec<Operation<'_, (), E>>,
     control: &Control<E>,
@@ -1236,6 +1254,7 @@ fn drive_helpers<E: Copy + PartialEq + From<Error>>(
     let mut operations: Vec<_> = operations.into_iter().map(Some).collect();
     let mut remaining = operations.len();
     let mut first = 0;
+    let mut passes = 0;
     let mut cx = Context::from_waker(waker);
     while remaining != 0 {
         if let Some(park) = park {
@@ -1253,7 +1272,9 @@ fn drive_helpers<E: Copy + PartialEq + From<Error>>(
         }
         after_pass();
         first = (first + 1) % operations.len();
-        if remaining != 0 {
+        passes += 1;
+        if remaining != 0 && passes == WORK_BUDGET {
+            passes = 0;
             let wait = park.map_or(IDLE_WAIT, Cell::get);
             if !wait.is_zero() {
                 thread::park_timeout(wait);
