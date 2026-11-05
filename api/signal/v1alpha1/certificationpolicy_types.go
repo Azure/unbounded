@@ -9,7 +9,7 @@ import (
 )
 
 const (
-	NodeQualificationLabel = "signal.unbounded-cloud.io/qualified"
+	NodeQualificationLabel = "node-restriction.kubernetes.io/project-signal-qualified"
 	NodeQualificationValue = "true"
 )
 
@@ -105,7 +105,10 @@ const (
 
 type GateProjection struct {
 	// Mode ProtectedLabel projects only the fixed
-	// signal.unbounded-cloud.io/qualified=true contract.
+	// node-restriction.kubernetes.io/project-signal-qualified=true contract.
+	// It requires the Node authorizer and NodeRestriction admission plugin.
+	// Controllers must fail closed instead of projecting the label when that
+	// protection is unavailable.
 	Mode GateProjectionMode `json:"mode"`
 }
 

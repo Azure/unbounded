@@ -56,7 +56,10 @@ spec:
                   mode:
                     description: |-
                       Mode ProtectedLabel projects only the fixed
-                      signal.unbounded-cloud.io/qualified=true contract.
+                      node-restriction.kubernetes.io/project-signal-qualified=true contract.
+                      It requires the Node authorizer and NodeRestriction admission plugin.
+                      Controllers must fail closed instead of projecting the label when that
+                      protection is unavailable.
                     enum:
                     - None
                     - ProtectedLabel
