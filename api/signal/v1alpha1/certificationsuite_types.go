@@ -16,6 +16,9 @@ const (
 	// MaxCertificationChecks bounds CEL immutability cost and persisted Run
 	// status size without making the suite length part of the domain model.
 	MaxCertificationChecks = 256
+	// MaxWorkloadPathLength bounds CEL path-validation cost across the maximum
+	// Suite check and host-path counts.
+	MaxWorkloadPathLength = 1024
 )
 
 // +kubebuilder:validation:XValidation:rule="duration(self.backendActiveDeadline) > duration('0s')",message="backendActiveDeadline must be positive"
@@ -48,10 +51,10 @@ const (
 // +kubebuilder:validation:XValidation:rule="(self.path == '/proc' || self.path.startsWith('/proc/') || self.path == '/sys' || self.path.startsWith('/sys/') || self.path == '/var/lib/project-signal' || self.path.startsWith('/var/lib/project-signal/')) && !self.path.contains('//') && !self.path.contains('/./') && !self.path.contains('/../') && !self.path.endsWith('/.') && !self.path.endsWith('/..')",message="path must be a clean absolute path under /proc, /sys, or /var/lib/project-signal"
 type WorkloadHostPath struct {
 	// +kubebuilder:validation:MinLength=1
-	// +kubebuilder:validation:MaxLength=4096
+	// +kubebuilder:validation:MaxLength=1024
 	MountPath string `json:"mountPath"`
 	// +kubebuilder:validation:MinLength=1
-	// +kubebuilder:validation:MaxLength=4096
+	// +kubebuilder:validation:MaxLength=1024
 	Path string `json:"path"`
 }
 
