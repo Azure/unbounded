@@ -192,8 +192,9 @@ pub struct Written {
     location: RecordLocation,
 }
 
-/// Identity of one hold reservation.
-#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+/// Identity of one hold reservation. Identities increase with every hold;
+/// the default is older than any issued hold.
+#[derive(Clone, Copy, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct HoldId(u64);
 
 /// Number of independent [`AgeCursor`]s per index.
@@ -1051,6 +1052,16 @@ impl DiskIndex {
 
     /// Release up to `budget` holds whose deadline is at or before `now`.
     pub fn expire_holds(&mut self, now: Monotonic, budget: usize) -> usize {
+        self.expire_holds_with(now, budget, |_, _| {})
+    }
+
+    /// [`Self::expire_holds`], reporting each released hold and its slots.
+    pub fn expire_holds_with(
+        &mut self,
+        now: Monotonic,
+        budget: usize,
+        mut expired_hold: impl FnMut(HoldId, &[PageSlot]),
+    ) -> usize {
         let mut expired = 0;
         while expired < budget {
             let Some(&(until, id)) = self.expiry.first() else {
@@ -1059,7 +1070,10 @@ impl DiskIndex {
             if until > now {
                 break;
             }
-            self.release_hold(id).expect("expiry tracks live holds");
+            let hold = self.holds.remove(&id).expect("expiry tracks live holds");
+            self.expiry.remove(&(until, id));
+            self.drop_slots(&hold.slots);
+            expired_hold(id, &hold.slots);
             expired += 1;
         }
         expired
@@ -1078,6 +1092,41 @@ impl DiskIndex {
     /// Whether any hold covers `slot`.
     pub fn is_held(&self, slot: PageSlot) -> bool {
         self.entry(slot).is_ok_and(|entry| entry.holders != 0)
+    }
+
+    /// The most recently issued hold identity, live or not.
+    pub fn last_hold_id(&self) -> HoldId {
+        HoldId(self.next_hold)
+    }
+
+    /// Issue only identities newer than `after` from now on, so identities
+    /// stay increasing across a rebuilt index.
+    pub fn continue_hold_ids(&mut self, after: HoldId) {
+        self.next_hold = self.next_hold.max(after.0);
+    }
+
+    /// Live holds.
+    pub fn hold_count(&self) -> usize {
+        self.holds.len()
+    }
+
+    /// Whether `slot` is held but neither stored nor in flight, so it counts
+    /// toward [`Self::holds_unused`].
+    pub fn is_unused_held(&self, slot: PageSlot) -> bool {
+        self.entry(slot)
+            .is_ok_and(|entry| entry.holders != 0 && entry.flags == 0)
+    }
+
+    /// Whether a held record is stored in `segment`.
+    pub fn segment_held(&self, segment: SegmentId) -> bool {
+        self.segments
+            .get(segment.0 as usize)
+            .is_some_and(|meta| meta.held != 0)
+    }
+
+    /// Slots a live hold covers.
+    pub fn hold_slots(&self, id: HoldId) -> Option<&[PageSlot]> {
+        self.holds.get(&id).map(|hold| hold.slots.as_slice())
     }
 
     /// A hold's deadline.
@@ -1609,6 +1658,45 @@ mod tests {
         assert_eq!(index.expire_holds(Monotonic(200), 8), 1);
         assert_eq!(index.holds_unused(), 0);
         assert_eq!(index.release_hold(hold), Err(Error::Stale));
+        index.check_invariants();
+    }
+
+    #[test]
+    fn hold_queries_and_reported_expiry() {
+        let segments = segments(2);
+        let mut index = DiskIndex::new(8, 8, 2).unwrap();
+        let cache = index.add_cache(CacheIdx(0)).unwrap();
+        assert_eq!(index.last_hold_id(), HoldId::default());
+        let first = index
+            .hold(&[PageSlot(0), PageSlot(1)], Monotonic(10), Monotonic(0))
+            .unwrap();
+        assert!(first > HoldId::default());
+        assert_eq!(index.last_hold_id(), first);
+        assert!(index.is_unused_held(PageSlot(0)) && !index.is_unused_held(PageSlot(2)));
+        write(&mut index, &segments, 0, cache, 512).unwrap();
+        let segment = index.get(PageSlot(0)).unwrap().location.segment();
+        assert!(!index.is_unused_held(PageSlot(0)) && index.segment_held(segment));
+        let second = index
+            .hold(&[PageSlot(3)], Monotonic(20), Monotonic(0))
+            .unwrap();
+        assert!(second > first && index.hold_count() == 2);
+        assert_eq!(index.hold_slots(second), Some(&[PageSlot(3)][..]));
+        let mut expired = Vec::new();
+        assert_eq!(
+            index.expire_holds_with(Monotonic(15), 8, |id, slots| {
+                expired.push((id, slots.to_vec()));
+            }),
+            1
+        );
+        assert_eq!(expired, vec![(first, vec![PageSlot(0), PageSlot(1)])]);
+        assert!(!index.segment_held(segment) && index.hold_count() == 1);
+        assert_eq!(index.last_hold_id(), second);
+        index.continue_hold_ids(HoldId(100));
+        index.continue_hold_ids(HoldId(50));
+        let third = index
+            .hold(&[PageSlot(4)], Monotonic(30), Monotonic(0))
+            .unwrap();
+        assert_eq!(third, HoldId(101));
         index.check_invariants();
     }
 
