@@ -1844,6 +1844,7 @@ impl WorkerApplication {
             availability.clone(),
             runtime.reactor.ctx().clock.clone(),
         ));
+        index.seed_page_hash(&runtime.reactor.ctx().rng)?;
         let segments = Rc::new(page_alloc::Segments::new(config.segment_bytes));
         let eviction = Rc::new(SegmentClock::with_budget(
             index.clone(),

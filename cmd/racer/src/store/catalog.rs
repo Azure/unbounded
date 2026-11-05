@@ -831,6 +831,16 @@ impl Index {
                 pages.min((segments.count() as u64).saturating_mul(segments.segment_bytes()))
             })
     }
+    /// Startup only: key page interning from the worker's random source,
+    /// so production hashing is unpredictable and simulation replays.
+    pub fn seed_page_hash(&self, rng: &racer_io::Rng) -> Result<()> {
+        let mut key = [0; 16];
+        rng.fill(&mut key).map_err(|_| Error::Unavailable)?;
+        self.state
+            .borrow_mut()
+            .pages
+            .set_hash_key(page_alloc::intern::KeyedState::from_bytes(key))
+    }
     pub fn page_capacity(&self) -> usize {
         self.page_capacity.get()
     }
@@ -1214,6 +1224,12 @@ impl Index {
             self.clock.clone(),
         );
         *replacement.retention.borrow_mut() = self.retention();
+        let hash_key = self.state.borrow().pages.hash_key();
+        replacement
+            .state
+            .borrow_mut()
+            .pages
+            .set_hash_key(hash_key)?;
         replacement.set_page_capacity(self.page_capacity.get())?;
         for (p, e) in snapshot.entries {
             replacement.publish(p, e)?;

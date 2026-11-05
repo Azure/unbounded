@@ -48,6 +48,40 @@ impl Hasher for FixedHasher {
 /// [`BuildHasher`] for [`FixedHasher`].
 pub type FixedState = BuildHasherDefault<FixedHasher>;
 
+/// SipHash (std [`DefaultHasher`](std::hash::DefaultHasher)) keyed by a
+/// 128-bit secret absorbed before the key. Seed it from the worker's random
+/// source: simulation replays then hash identically, while production keys
+/// are unpredictable, so crafted page identities cannot flood one chain.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct KeyedState([u64; 2]);
+
+impl KeyedState {
+    /// A state keyed by `key`.
+    pub fn new(key: [u64; 2]) -> Self {
+        Self(key)
+    }
+
+    /// A state keyed by 16 bytes.
+    pub fn from_bytes(bytes: [u8; 16]) -> Self {
+        let (low, high) = bytes.split_at(8);
+        Self([
+            u64::from_le_bytes(low.try_into().expect("8 bytes")),
+            u64::from_le_bytes(high.try_into().expect("8 bytes")),
+        ])
+    }
+}
+
+impl BuildHasher for KeyedState {
+    type Hasher = std::hash::DefaultHasher;
+
+    fn build_hasher(&self) -> Self::Hasher {
+        let mut hasher = std::hash::DefaultHasher::new();
+        hasher.write_u64(self.0[0]);
+        hasher.write_u64(self.0[1]);
+        hasher
+    }
+}
+
 /// Hasher for map keys that already are [`FixedHasher`] outputs.
 #[derive(Clone, Copy, Debug, Default)]
 struct PrehashedHasher(u64);
@@ -90,6 +124,13 @@ pub struct SlotInterner<K, S = FixedState> {
 impl<K: Hash + Eq + Clone, S: BuildHasher + Default> SlotInterner<K, S> {
     /// An empty arena of `capacity` slots (fixed for its lifetime).
     pub fn new(capacity: u32) -> Self {
+        Self::with_hasher(capacity, S::default())
+    }
+}
+
+impl<K: Hash + Eq + Clone, S: BuildHasher> SlotInterner<K, S> {
+    /// [`Self::new`] with an explicit hash state.
+    pub fn with_hasher(capacity: u32, hasher: S) -> Self {
         let mut keys = Vec::new();
         keys.resize_with(capacity as usize, || None);
         Self {
@@ -98,7 +139,7 @@ impl<K: Hash + Eq + Clone, S: BuildHasher + Default> SlotInterner<K, S> {
             heads: HashMap::default(),
             free: (0..capacity).rev().collect(),
             len: 0,
-            hasher: S::default(),
+            hasher,
         }
     }
 
@@ -376,6 +417,22 @@ mod tests {
             FixedState::default().hash_one("page")
         );
         assert_ne!(state.hash_one(1u64), state.hash_one(2u64));
+    }
+
+    #[test]
+    fn keyed_hash_depends_on_key_and_interns_with_any_key() {
+        let a = KeyedState::new([1, 2]);
+        assert_eq!(a.hash_one("page"), KeyedState::new([1, 2]).hash_one("page"));
+        assert_ne!(a.hash_one("page"), KeyedState::new([1, 3]).hash_one("page"));
+        assert_eq!(
+            KeyedState::from_bytes([0; 16]),
+            KeyedState::default(),
+            "zero bytes are the zero key"
+        );
+        let mut interner = SlotInterner::<String, _>::with_hasher(4, a);
+        let slot = interner.intern(&"x".to_owned()).unwrap();
+        assert_eq!(interner.get(&"x".to_owned()), Some(slot));
+        assert_eq!(interner.intern(&"x".to_owned()), Ok(slot));
     }
 
     #[test]

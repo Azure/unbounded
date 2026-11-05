@@ -21,6 +21,7 @@ use page_alloc::disk_index::HoldId;
 use page_alloc::disk_index::Monotonic;
 use page_alloc::disk_index::PageSlot;
 use page_alloc::intern::CacheTable;
+use page_alloc::intern::KeyedState;
 use page_alloc::intern::SlotInterner;
 use page_alloc::pending::PendingWrite;
 use racer_control_wire::CacheId;
@@ -28,12 +29,10 @@ use racer_control_wire::KeyId;
 use std::cell::RefCell;
 use std::rc::Rc;
 
-/// Production interning uses randomized hashing, as the page map did.
-#[cfg(not(test))]
-type Interner = SlotInterner<PageId, std::hash::RandomState>;
-/// Simulation keeps its deterministic hash state.
-#[cfg(test)]
-type Interner = SlotInterner<PageId, crate::runtime::HashState>;
+/// Interning hashes with a keyed SipHash seeded from the worker's random
+/// source ([`Pages::set_hash_key`]): deterministic under simulation,
+/// unpredictable in production.
+type Interner = SlotInterner<PageId, KeyedState>;
 
 /// Independent publish-order walks; see [`Pages::walk`].
 #[derive(Clone, Copy, Debug)]
@@ -97,6 +96,8 @@ pub(super) struct Pages {
     versions: HashMap<ObjectVersion, (VersionMetadata, usize)>,
     /// Hold identities a rebuilt disk index must stay above.
     hold_floor: HoldId,
+    /// Interning hash key.
+    hash_key: KeyedState,
 }
 
 /// A reserved publication of one page: the disk index reservation, then
@@ -140,12 +141,12 @@ fn location(view: &EntryView) -> RecordLocation {
 }
 
 impl Inner {
-    fn new(slots: u32, hold_floor: HoldId) -> Result<Self> {
+    fn new(slots: u32, hold_floor: HoldId, hash_key: KeyedState) -> Result<Self> {
         let mut disk = DiskIndex::new(slots, slots as usize, 0).map_err(Error::from)?;
         disk.continue_hold_ids(hold_floor);
         Ok(Self {
             disk: Rc::new(RefCell::new(disk)),
-            slots: Interner::new(slots),
+            slots: Interner::with_hasher(slots, hash_key),
             caches: CacheTable::default(),
             keys: vec![KeyId([0; 16]); slots as usize],
         })
@@ -161,6 +162,7 @@ impl Pages {
             stored: 0,
             versions: HashMap::default(),
             hold_floor: HoldId::default(),
+            hash_key: KeyedState::default(),
         }
     }
 
@@ -173,6 +175,19 @@ impl Pages {
     #[cfg(test)]
     pub fn slots(&self) -> u32 {
         self.slots
+    }
+
+    /// The interning hash key.
+    pub fn hash_key(&self) -> KeyedState {
+        self.hash_key
+    }
+
+    /// Re-key interning, rebuilding the table (startup only; see
+    /// [`Self::resize`]).
+    pub fn set_hash_key(&mut self, key: KeyedState) -> Result<()> {
+        let previous = std::mem::replace(&mut self.hash_key, key);
+        self.resize(self.slots)
+            .inspect_err(|_| self.hash_key = previous)
     }
 
     /// Resize the slot arena, re-inserting every page in publish order.
@@ -225,7 +240,7 @@ impl Pages {
 
     fn inner_mut(&mut self) -> Result<&mut Inner> {
         if self.inner.is_none() {
-            self.inner = Some(Inner::new(self.slots, self.hold_floor)?);
+            self.inner = Some(Inner::new(self.slots, self.hold_floor, self.hash_key)?);
         }
         Ok(self.inner.as_mut().expect("initialized page table"))
     }
@@ -867,6 +882,25 @@ mod tests {
         assert!(pages.remove(&a1, None));
         assert!(pages.version(&a0.version).is_none());
         assert_eq!(pages.len(), 0);
+        pages.check();
+    }
+
+    #[test]
+    fn rekeying_keeps_pages_and_publish_order() {
+        let mut pages = Pages::new(4);
+        let ids: Vec<_> = (0..3).map(|n| page("c", "a", n)).collect();
+        for (n, id) in ids.iter().enumerate() {
+            pages.insert(id.clone(), entry(id, n as u64)).unwrap();
+        }
+        let key = KeyedState::new([7, 9]);
+        pages.set_hash_key(key).unwrap();
+        assert_eq!(pages.hash_key(), key);
+        assert_eq!(
+            pages
+                .walk(Walk::Ownership, 0, 8, |v| Some(v.page.clone()))
+                .1,
+            ids
+        );
         pages.check();
     }
 
