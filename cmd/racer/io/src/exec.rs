@@ -457,11 +457,13 @@ impl Runnable {
     }
 
     /// Register the polling owner notified by the next wake.
+    #[inline]
     pub fn register_owner(&self, waker: &Waker) {
         self.owner.register(waker);
     }
 
     /// Whether a wake is pending since the last poll.
+    #[inline]
     pub fn is_ready(&self) -> bool {
         self.ready.load(Ordering::Acquire)
     }
