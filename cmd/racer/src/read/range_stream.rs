@@ -38,7 +38,6 @@ use std::future::poll_fn;
 use std::rc::Rc;
 use std::sync::Arc;
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::task::Context;
 use std::task::Poll;
 use std::task::Waker;
@@ -66,9 +65,6 @@ struct Reader {
     busy: BTreeSet<u64>,
     /// Selected pages offered to this reader, bounded by its window.
     offered: VecDeque<PageResult>,
-    /// Set while `offered` is not empty, so the window can check for offers
-    /// without the scheduler lock.
-    pending: Arc<AtomicBool>,
     waker: Option<Waker>,
 }
 
@@ -254,7 +250,6 @@ impl Scheduler {
         }
         state.sequence = state.sequence.checked_add(1).ok_or(Error::Overloaded)?;
         let id = state.sequence;
-        let pending = Arc::new(AtomicBool::new(false));
         state.readers.insert(
             id,
             Reader {
@@ -262,14 +257,12 @@ impl Scheduler {
                 wants: BTreeSet::new(),
                 busy: BTreeSet::new(),
                 offered: VecDeque::new(),
-                pending: pending.clone(),
                 waker: None,
             },
         );
         Ok(WindowLease {
             scheduler: self.clone(),
             id,
-            pending,
         })
     }
 
@@ -310,7 +303,6 @@ fn offer(state: &mut State, version: &ObjectVersion, page: &PageResult, wake: &m
         }
         reader.busy.remove(&number);
         reader.offered.push_back(page.clone());
-        reader.pending.store(true, Ordering::Release);
         wake.extend(reader.waker.take());
     }
 }
@@ -319,16 +311,9 @@ fn offer(state: &mut State, version: &ObjectVersion, page: &PageResult, wake: &m
 struct WindowLease {
     scheduler: Arc<Scheduler>,
     id: u64,
-    /// The reader's offered-pages flag.
-    pending: Arc<AtomicBool>,
 }
 
 impl WindowLease {
-    /// Whether pages were offered since the last exchange.
-    fn offered(&self) -> bool {
-        self.pending.load(Ordering::Acquire)
-    }
-
     /// One step's exchange with the scheduler, under one lock: publish the
     /// pages `window` still wants and those it is busy with, take the pages
     /// offered to it, fan its directly `filled` pages out to other windows of
@@ -362,7 +347,6 @@ impl WindowLease {
                 {
                     reader.waker = Some(waker.clone());
                 }
-                reader.pending.store(false, Ordering::Relaxed);
                 offered.extend(reader.offered.drain(..));
             }
             for page in filled.drain(..) {
@@ -399,10 +383,7 @@ impl WindowLease {
         state
             .readers
             .get_mut(&self.id)
-            .map(|reader| {
-                reader.pending.store(false, Ordering::Relaxed);
-                std::mem::take(&mut reader.offered)
-            })
+            .map(|reader| std::mem::take(&mut reader.offered))
             .unwrap_or_default()
     }
 
@@ -600,10 +581,6 @@ pub struct RangeStream {
 
     /// Scheduler facts from the latest exchange.
     facts: win::Facts,
-
-    /// Whether the window exchanged with the scheduler at least once.
-    synced: bool,
-
     /// The cursor and per-slot interest classes the latest exchange published.
     published: (u64, Vec<u8>),
 
@@ -693,7 +670,6 @@ impl RangeStreams {
             offered: VecDeque::new(),
             filled: Vec::new(),
             facts: win::Facts::default(),
-            synced: false,
             published: (0, Vec::new()),
             epochs: BTreeMap::new(),
             next_epoch: 0,
@@ -810,9 +786,9 @@ impl RangeStream {
         scope.check()?;
         // Offers that arrived since the last step go first, as they spare
         // direct fills of their pages.
-        if !self.synced || self.lease.as_ref().is_some_and(WindowLease::offered) {
-            self.exchange(cx);
-        }
+        // Facts (pages busy elsewhere, spare flights) are refreshed once per
+        // step so admission sees other windows' current work.
+        self.exchange(cx);
         loop {
             loop {
                 let mut changed = self.poll_io(cx, &scope);
@@ -855,7 +831,6 @@ impl RangeStream {
         let Some(lease) = self.lease.as_ref() else {
             return false;
         };
-        self.synced = true;
         if let Some(window) = self.window.as_ref() {
             self.published.0 = window.cursor();
             self.published.1.clear();
