@@ -356,6 +356,13 @@ pub mod metrics {
 
         /// Return its trusted Prometheus identifier.
         fn name(self) -> &'static str;
+
+        /// Return its trusted, fixed label set without braces, or "" when
+        /// unlabeled. Members of one labeled family share a name and must be
+        /// contiguous in `ALL` so the family gets a single `# TYPE` line.
+        fn labels(self) -> &'static str {
+            ""
+        }
     }
 
     /// Clones retain their writer shard; reads aggregate all retained shards.
@@ -612,8 +619,17 @@ pub mod metrics {
         /// Stream relaxed per-series observations, not a coherent worker snapshot.
         /// Writes directly to the caller's sink and propagates capacity errors.
         pub fn write_prometheus(&self, out: &mut impl fmt::Write) -> fmt::Result {
+            let mut previous = None;
             for &metric in C::ALL {
-                Exposition::new([(metric.name(), "counter")]).write(out, [self.count(metric)])?;
+                let name = metric.name();
+                if previous != Some(name) {
+                    writeln!(out, "# TYPE {name} counter")?;
+                }
+                previous = Some(name);
+                match metric.labels() {
+                    "" => writeln!(out, "{name} {}", self.count(metric))?,
+                    labels => writeln!(out, "{name}{{{labels}}} {}", self.count(metric))?,
+                }
             }
             for &metric in G::ALL {
                 Exposition::new([(metric.name(), "gauge")]).write(out, [self.gauge(metric)])?;
@@ -673,9 +689,20 @@ pub mod metrics {
     /// assert_eq!(Event::ALL, &EVENTS);
     /// assert_eq!(Event::Request.name(), "requests_total");
     /// ```
+    ///
+    /// A fixed label family repeats one name with a trusted label literal on
+    /// contiguous variants:
+    ///
+    /// ```
+    /// telemetry::metrics! { Event, EVENTS, EVENT_COUNT;
+    ///     Self::Hit => "reads_total" { "outcome=\"hit\"" },
+    ///     Self::Miss => "reads_total" { "outcome=\"miss\"" },
+    /// }
+    /// assert_eq!(telemetry::Metric::labels(Event::Miss), "outcome=\"miss\"");
+    /// ```
     #[macro_export]
     macro_rules! metrics {
-        ($kind:ident, $all:ident, $count:ident; $(Self::$variant:ident => $name:literal,)*) => {
+        ($kind:ident, $all:ident, $count:ident; $(Self::$variant:ident => $name:literal $({ $labels:literal })?,)*) => {
             #[doc = "Fixed metric identifiers in registry index order."]
             #[derive(Clone, Copy, Debug, Eq, PartialEq)]
             pub enum $kind { $(#[doc = $name] $variant,)* }
@@ -704,6 +731,11 @@ pub mod metrics {
 
                 /// Return the fixed Prometheus identifier.
                 fn name(self) -> &'static str { self.name() }
+
+                /// Return the fixed label set, or "" when unlabeled.
+                fn labels(self) -> &'static str {
+                    match self { $(Self::$variant => concat!("" $(, $labels)?),)* }
+                }
             }
         };
     }
@@ -853,6 +885,26 @@ pub mod metrics {
                 .collect();
             assert_eq!(output, expected);
             assert!(metrics.write_prometheus(&mut Full).is_err());
+        }
+
+        crate::metrics! { Family, FAMILY, FAMILY_COUNT;
+            Self::Plain => "plain_total",
+            Self::Hit => "reads_total" { "outcome=\"hit\"" },
+            Self::Miss => "reads_total" { "outcome=\"miss\"" },
+        }
+
+        /// A labeled family shares one type line and keeps label order.
+        #[test]
+        fn labeled_families_share_one_type_line() {
+            let metrics = Metrics::<Family, Level>::shards(2);
+            metrics[0].add(Family::Miss, 2);
+            metrics[1].add(Family::Miss, 3);
+            let mut output = String::new();
+            metrics[0].write_prometheus(&mut output).unwrap();
+            assert!(output.starts_with(
+                "# TYPE plain_total counter\nplain_total 0\n# TYPE reads_total counter\nreads_total{outcome=\"hit\"} 0\nreads_total{outcome=\"miss\"} 5\n"
+            ));
+            assert_eq!(Metric::labels(Family::Plain), "");
         }
 
         /// Reject registries without writers.

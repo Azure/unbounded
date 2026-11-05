@@ -230,10 +230,24 @@ fn gpu_read_errors_before_the_head_release_everything() {
     assert_no_body_leases(&fixture);
     // The 412 comes after the import, so it counts as a GPU open.
     use crate::gpu_telemetry::GpuReadOutcome;
-    let gpu = fixture.listeners.metrics.gpu();
-    assert_eq!(gpu.requests(GpuReadOutcome::Gpu), 1);
-    assert_eq!(gpu.requests(GpuReadOutcome::Invalid), 2);
-    assert_eq!(gpu.requests(GpuReadOutcome::WrongDevice), 1);
+    assert_eq!(
+        fixture.listeners.metrics.gpu_requests(GpuReadOutcome::Gpu),
+        1
+    );
+    assert_eq!(
+        fixture
+            .listeners
+            .metrics
+            .gpu_requests(GpuReadOutcome::Invalid),
+        2
+    );
+    assert_eq!(
+        fixture
+            .listeners
+            .metrics
+            .gpu_requests(GpuReadOutcome::WrongDevice),
+        1
+    );
 }
 
 #[test]
@@ -877,8 +891,13 @@ fn auto_starts_the_gpu_on_the_first_gpu_read_only() {
     assert!(links.gpu_landing_configured());
     assert!(links.take_landing_pending());
     use crate::gpu_telemetry::GpuReadOutcome;
-    let gpu = fixture.listeners.metrics.gpu();
-    assert_eq!(gpu.requests(GpuReadOutcome::Invalid), 1);
+    assert_eq!(
+        fixture
+            .listeners
+            .metrics
+            .gpu_requests(GpuReadOutcome::Invalid),
+        1
+    );
     // Later reads use the started helper.
     let allocation = allocate(&helper, 0, GRANULE);
     let output = exchange(
@@ -892,7 +911,10 @@ fn auto_starts_the_gpu_on_the_first_gpu_read_only() {
     settle(&fixture);
     assert_released(&helper);
     assert_eq!(calls_now(&calls), 1);
-    assert_eq!(gpu.requests(GpuReadOutcome::Gpu), 1);
+    assert_eq!(
+        fixture.listeners.metrics.gpu_requests(GpuReadOutcome::Gpu),
+        1
+    );
 }
 
 #[test]
@@ -967,8 +989,13 @@ fn auto_start_failure_is_501_and_not_retried() {
         assert!(slot.get().is_none());
         assert!(!links.gpu_landing_configured());
         use crate::gpu_telemetry::GpuReadOutcome;
-        let gpu = fixture.listeners.metrics.gpu();
-        assert_eq!(gpu.requests(GpuReadOutcome::NotEnabled), 3);
+        assert_eq!(
+            fixture
+                .listeners
+                .metrics
+                .gpu_requests(GpuReadOutcome::NotEnabled),
+            3
+        );
         let text = render(&telemetry);
         assert!(text.contains("racer_gpu_standby 0\n"), "{text}");
         assert!(text.contains("racer_gpu_enabled 0\n"), "{text}");

@@ -1012,12 +1012,10 @@ async fn serve_connection(
             other => other,
         };
         if gpu_read {
-            metrics
-                .gpu()
-                .record_request(crate::gpu_telemetry::GpuReadOutcome::classify(
-                    parsed.as_ref().map(|_| ()).map_err(|error| *error),
-                    responses.has_gpu(),
-                ));
+            metrics.record_gpu_request(crate::gpu_telemetry::GpuReadOutcome::classify(
+                parsed.as_ref().map(|_| ()).map_err(|error| *error),
+                responses.has_gpu(),
+            ));
         }
         let (request, sink) = match parsed {
             Ok(parsed) => parsed,

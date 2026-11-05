@@ -383,6 +383,25 @@ metrics! { Event, EVENTS, EVENT_COUNT;
             Self::SilencePeerSilent => "racer_silence_peers_silent_total",
             Self::GpuDirectJoined => "racer_gpu_direct_joined_total",
             Self::PassthroughLocalOrigin => "racer_passthrough_local_origin_fills_total",
+            Self::GpuReadGpu => "racer_gpu_read_requests_total" { "outcome=\"gpu\"" },
+            Self::GpuReadNotEnabled => "racer_gpu_read_requests_total" { "outcome=\"not_enabled\"" },
+            Self::GpuReadWrongDevice => "racer_gpu_read_requests_total" { "outcome=\"wrong_device\"" },
+            Self::GpuReadBusy => "racer_gpu_read_requests_total" { "outcome=\"busy\"" },
+            Self::GpuReadInvalid => "racer_gpu_read_requests_total" { "outcome=\"invalid\"" },
+            Self::GpuReadFailed => "racer_gpu_read_requests_total" { "outcome=\"failed\"" },
+}
+
+/// The labeled request counter for one `gpu-read` outcome.
+fn gpu_read_event(outcome: crate::gpu_telemetry::GpuReadOutcome) -> Event {
+    use crate::gpu_telemetry::GpuReadOutcome as O;
+    match outcome {
+        O::Gpu => Event::GpuReadGpu,
+        O::NotEnabled => Event::GpuReadNotEnabled,
+        O::WrongDevice => Event::GpuReadWrongDevice,
+        O::Busy => Event::GpuReadBusy,
+        O::Invalid => Event::GpuReadInvalid,
+        O::Failed => Event::GpuReadFailed,
+    }
 }
 metrics! { Gauge, GAUGES, GAUGE_COUNT;
             Self::PeerReceiveActive => "racer_peer_receive_active",
@@ -817,6 +836,15 @@ impl Metrics {
         self.record(count, 1);
     }
     /// GPU metric sources shared by every worker.
+    /// Count one `gpu-read` request head on this worker's shard.
+    pub(crate) fn record_gpu_request(&self, outcome: crate::gpu_telemetry::GpuReadOutcome) {
+        self.record(gpu_read_event(outcome), 1);
+    }
+    /// `gpu-read` request heads counted with `outcome` across workers.
+    #[cfg(test)]
+    pub(crate) fn gpu_requests(&self, outcome: crate::gpu_telemetry::GpuReadOutcome) -> u64 {
+        self.count(gpu_read_event(outcome))
+    }
     pub fn gpu(&self) -> &crate::gpu_telemetry::GpuTelemetry {
         &self.gpu
     }
@@ -1277,7 +1305,7 @@ mod tests {
         }
 
         #[test]
-        fn integrity_diagnostics_have_fixed_names_and_saturating_sharded_counts() {
+        fn integrity_diagnostics_have_fixed_names_and_wrapping_sharded_counts() {
             let workers = Metrics::for_workers(2).unwrap();
             let events = [
                 Event::CryptoDecryptCrcRejected,
@@ -1306,11 +1334,22 @@ mod tests {
             assert_eq!(
                 EVENTS
                     .iter()
-                    .map(|e| e.name())
+                    .map(|e| (e.name(), ::telemetry::Metric::labels(*e)))
                     .collect::<std::collections::BTreeSet<_>>()
                     .len(),
                 EVENT_COUNT
             );
+        }
+
+        #[test]
+        fn every_metric_family_has_exactly_one_type_line() {
+            let mut output = String::new();
+            Metrics::default().write_prometheus(&mut output).unwrap();
+            let mut seen = std::collections::BTreeSet::new();
+            for line in output.lines().filter(|l| l.starts_with("# TYPE ")) {
+                let name = line.split(' ').nth(2).unwrap();
+                assert!(seen.insert(name.to_owned()), "duplicate {line}");
+            }
         }
 
         #[test]
