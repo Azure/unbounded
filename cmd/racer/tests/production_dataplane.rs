@@ -528,7 +528,14 @@ impl Rig {
         let snapshot =
             controlplane::Target::prepare(snapshots.as_ref(), document.clone()).unwrap()().unwrap();
         controlplane::Target::install(snapshots.as_ref(), &document, &snapshot).unwrap();
-        let network = Rc::new(PeerNetwork::new(NodeId(NODE.into()), published.clone()).unwrap());
+        let network = Rc::new(
+            PeerNetwork::new(
+                NodeId(NODE.into()),
+                published.clone(),
+                racer_io::Clock::host(),
+            )
+            .unwrap(),
+        );
         let certificates = Rc::new(Certificates::new(ClusterId(CLUSTER.into()), keys.clone()));
         let signatures = Rc::new(Signatures::new(keys.clone(), certificates));
         let forwarding = Rc::new(Forwarding::new(signatures.clone()));

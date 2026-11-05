@@ -2600,7 +2600,12 @@ pub(crate) mod tests {
             let _env = clock.environment(0).enter();
             let members = membership(100_000);
             let source = &members.members()[0].node;
-            let admission = AdaptivePeers::new(Config::default(), Default::default()).unwrap();
+            let admission = AdaptivePeers::new(
+                Config::default(),
+                Default::default(),
+                crate::test_support::clock(),
+            )
+            .unwrap();
             let paths = Paths::new(Rc::new(LinkHealth::default()), 1)
                 .with_peer_admission(admission.clone());
             let mut request = budget(&members, 80_003, 4);

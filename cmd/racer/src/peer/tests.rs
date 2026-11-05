@@ -224,7 +224,8 @@ mod body_progress {
                 signed,
                 binding,
             } = self;
-            let mut timing = super::super::PageTiming::new(&telemetry.metrics);
+            let mut timing =
+                super::super::PageTiming::new(&telemetry.metrics, crate::test_support::clock());
             let address = listener.local_addr().unwrap();
             let fixture_end = start + Duration::from_secs(5);
             let sent = Cell::new(0usize);
@@ -716,6 +717,7 @@ mod destination_disconnect {
                 PeerNetwork::new(
                     NodeId(C.into()),
                     crate::test_support::published_membership(membership.clone()),
+                    crate::test_support::clock(),
                 )
                 .unwrap(),
             );
@@ -1463,6 +1465,7 @@ mod requester_safety {
             crate::peer::PeerNetwork::new(
                 local.clone(),
                 crate::test_support::published_membership(members.clone()),
+                crate::test_support::clock(),
             )
             .unwrap(),
         );
@@ -1482,7 +1485,12 @@ mod requester_safety {
             0,
         ));
         let pool = Rc::new(crate::http::new_pool(reactor, admission.clone(), 2));
-        let adaptive = AdaptivePeers::new(Default::default(), Metrics::default()).unwrap();
+        let adaptive = AdaptivePeers::new(
+            Default::default(),
+            Metrics::default(),
+            crate::test_support::clock(),
+        )
+        .unwrap();
         let signers = crate::peer::tests::signers();
         let requester = Requester::new(
             Rc::new(Paths::new(Rc::new(LinkHealth::default()), 4).with_peer_admission(adaptive)),
@@ -1550,6 +1558,7 @@ mod requester_safety {
                 ..Default::default()
             },
             metrics.clone(),
+            crate::test_support::clock(),
         )
         .unwrap();
         let node = signers[2].node().clone();
@@ -1571,6 +1580,7 @@ mod requester_safety {
                 crate::peer::PeerNetwork::new(
                     signers[0].node().clone(),
                     crate::test_support::published_membership(membership.clone()),
+                    crate::test_support::clock(),
                 )
                 .unwrap(),
             ),
@@ -1884,6 +1894,7 @@ mod subscriptions {
                 PeerNetwork::new(
                     NodeId(C.into()),
                     crate::test_support::published_membership(membership),
+                    crate::test_support::clock(),
                 )
                 .unwrap(),
             );
@@ -2079,6 +2090,7 @@ mod subscriptions {
             PeerNetwork::new(
                 NodeId(C.into()),
                 crate::test_support::published_membership(membership),
+                crate::test_support::clock(),
             )
             .unwrap(),
         );
@@ -2527,6 +2539,7 @@ mod subscriptions {
                 PeerNetwork::new(
                     NodeId(node.into()),
                     crate::test_support::published_membership(membership.clone()),
+                    crate::test_support::clock(),
                 )
                 .unwrap(),
             )
@@ -2710,7 +2723,7 @@ mod timing {
         let metrics = Metrics::default();
         let clock = SimulationClock::new_at(7, Instant::now(), std::time::SystemTime::now());
         let _environment = clock.environment(1).enter();
-        let mut timing = PageTiming::new(&metrics);
+        let mut timing = PageTiming::new(&metrics, crate::test_support::clock());
         timing.enable(&local, TransportPlan::Http, false);
         for stage in 0..4 {
             if stage > 0 {
@@ -2767,7 +2780,7 @@ mod timing {
             } else {
                 TransportPlan::Http
             };
-            let mut timing = PageTiming::new(&metrics);
+            let mut timing = PageTiming::new(&metrics, crate::test_support::clock());
             timing.enable(&local, plan, case == "opaque");
             for stage in 0..4 {
                 timing.begin();
@@ -2794,7 +2807,7 @@ mod timing {
         let clock = SimulationClock::new_at(8, Instant::now(), std::time::SystemTime::now());
         let _environment = clock.environment(1).enter();
         let mut work = Box::pin(async {
-            let mut timing = PageTiming::new(&metrics);
+            let mut timing = PageTiming::new(&metrics, crate::test_support::clock());
             timing.enable(&local, TransportPlan::Http, false);
             clock.advance(Duration::from_nanos(17));
             timing.end(0);
@@ -2825,7 +2838,7 @@ mod timing {
         let metrics = Metrics::default();
         for (attempt, case) in ["invalid", "miss", "drop"].into_iter().enumerate() {
             let local = page_request(&admission, attempt as u8);
-            let mut timing = PageTiming::new(&metrics);
+            let mut timing = PageTiming::new(&metrics, crate::test_support::clock());
             timing.enable(&local, TransportPlan::Http, false);
             for stage in 0..4 {
                 timing.begin();
@@ -2913,7 +2926,12 @@ mod timing {
         let requester = Requester::new(
             Rc::new(
                 Paths::new(Rc::new(LinkHealth::default()), 4).with_peer_admission(
-                    crate::peer::AdaptivePeers::new(Default::default(), metrics.clone()).unwrap(),
+                    crate::peer::AdaptivePeers::new(
+                        Default::default(),
+                        metrics.clone(),
+                        crate::test_support::clock(),
+                    )
+                    .unwrap(),
                 ),
             ),
             Rc::new(Forwarding::new(signers[0].clone())),
@@ -2922,6 +2940,7 @@ mod timing {
                 PeerNetwork::new(
                     NodeId(A.into()),
                     crate::test_support::published_membership(members.clone()),
+                    crate::test_support::clock(),
                 )
                 .unwrap(),
             ),
@@ -3378,19 +3397,19 @@ fn page_timing_duration_conversion_saturates_and_reversed_clock_is_zero() {
     use crate::peer::Event;
     use crate::peer::Metrics;
     use crate::peer::PageTiming;
-    use crate::peer::now;
+
     use std::time::Duration;
     use uring_runtime::environment::SimulationClock;
     let metrics = Metrics::default();
     let clock = SimulationClock::new(9);
     let _environment = clock.environment(1).enter();
-    let mut timing = PageTiming::new(&metrics);
+    let mut timing = PageTiming::new(&metrics, crate::test_support::clock());
     timing.active = true;
     timing.begin();
     clock.advance(Duration::from_secs(u64::MAX / 1_000_000_000 + 1));
     timing.end(0);
     assert_eq!(timing.durations[0], u64::MAX);
-    timing.start = Some(now() + Duration::from_secs(1));
+    timing.start = Some(timing.clock.now() + Duration::from_secs(1));
     timing.end(1);
     assert_eq!(timing.durations[1], 0);
     drop(timing);
@@ -3410,6 +3429,7 @@ mod adaptive {
                 ..Default::default()
             },
             Metrics::default(),
+            crate::test_support::clock(),
         )
         .unwrap();
         let node = NodeId("a".into());
@@ -3426,6 +3446,7 @@ mod adaptive {
                 ..Default::default()
             },
             Metrics::default(),
+            crate::test_support::clock(),
         )
         .unwrap();
         let permit = owner.acquire(&node).unwrap();
@@ -3443,6 +3464,7 @@ mod adaptive {
                 ..Default::default()
             },
             Metrics::default(),
+            crate::test_support::clock(),
         )
         .unwrap();
         let node = NodeId("000-circuit".into());
@@ -3479,6 +3501,7 @@ mod adaptive {
                 ..Default::default()
             },
             metrics.clone(),
+            crate::test_support::clock(),
         )
         .unwrap();
         let worker = owner.clone();
@@ -3513,6 +3536,7 @@ mod adaptive {
                 ..Default::default()
             },
             Metrics::default(),
+            crate::test_support::clock(),
         )
         .unwrap();
         let node = NodeId("a".into());
@@ -3549,6 +3573,7 @@ mod adaptive {
                 ..Default::default()
             },
             Metrics::default(),
+            crate::test_support::clock(),
         )
         .unwrap();
         let permits: Vec<_> = (0..CAPACITY)
@@ -3590,6 +3615,7 @@ mod adaptive {
                 ..Default::default()
             },
             metrics.clone(),
+            crate::test_support::clock(),
         )
         .unwrap();
         let node = NodeId("a".into());

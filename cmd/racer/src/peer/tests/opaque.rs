@@ -1143,6 +1143,7 @@ impl RelayFixture {
             PeerNetwork::new(
                 NodeId(B.into()),
                 crate::test_support::published_membership(membership),
+                crate::test_support::clock(),
             )
             .unwrap(),
         );

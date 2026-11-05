@@ -26,7 +26,6 @@ use std::rc::Rc;
 use std::sync::Arc;
 use std::time::Duration;
 use std::time::Instant;
-use uring_runtime::environment::now;
 
 pub mod forwarding;
 pub mod protocol;
@@ -45,15 +44,17 @@ const STAGES: [(Event, Event); 4] = [
 /// Publish all HTTP Page stages only after verification; censor other outcomes.
 pub(crate) struct PageTiming<'a> {
     metrics: &'a Metrics,
+    clock: racer_io::Clock,
     active: bool,
     start: Option<Instant>,
     durations: [u64; 4],
     completed: u8,
 }
 impl<'a> PageTiming<'a> {
-    fn new(metrics: &'a Metrics) -> Self {
+    fn new(metrics: &'a Metrics, clock: racer_io::Clock) -> Self {
         Self {
             metrics,
+            clock,
             active: false,
             start: None,
             durations: [0; 4],
@@ -69,12 +70,14 @@ impl<'a> PageTiming<'a> {
     }
     fn begin(&mut self) {
         if self.active {
-            self.start = Some(now());
+            self.start = Some(self.clock.now());
         }
     }
     fn end(&mut self, stage: usize) {
         if let Some(start) = self.start.take() {
-            self.durations[stage] = now()
+            self.durations[stage] = self
+                .clock
+                .now()
                 .saturating_duration_since(start)
                 .as_nanos()
                 .min(u64::MAX as u128) as u64;
@@ -179,16 +182,18 @@ impl AdaptivePeers {
     pub(crate) fn hedge_available(&self, node: &NodeId) -> bool {
         self.inner.hedge_available(node)
     }
-    pub(crate) fn new(config: Config, metrics: Metrics) -> Result<Arc<Self>> {
-        Self::with_clock(config, metrics, now)
+    pub(crate) fn new(
+        config: Config,
+        metrics: Metrics,
+        clock: racer_io::Clock,
+    ) -> Result<Arc<Self>> {
+        Self::with_clock(config, metrics, move || clock.now())
     }
-    /// As `new`, reading time from `clock` instead of the runtime clock. A
-    /// simulator passes its virtual clock; `new` passes the runtime clock, so
-    /// production pays nothing for the parameter.
+    /// As `new`, reading time from an arbitrary monotonic source.
     pub(crate) fn with_clock(
         config: Config,
         metrics: Metrics,
-        clock: fn() -> std::time::Instant,
+        clock: impl Fn() -> std::time::Instant + Send + Sync + 'static,
     ) -> Result<Arc<Self>> {
         config.validate()?;
         Ok(Arc::new(Self {
@@ -226,17 +231,23 @@ impl AdaptivePeers {
 pub struct PeerNetwork {
     pub local: NodeId,
     published: Arc<controlplane::Published<crate::control::Snapshot>>,
+    clock: racer_io::Clock,
 }
 
 impl PeerNetwork {
     pub fn new(
         local: NodeId,
         published: Arc<controlplane::Published<crate::control::Snapshot>>,
+        clock: racer_io::Clock,
     ) -> Result<Self> {
         if local.0.is_empty() {
             return Err(Error::InvalidConfiguration);
         }
-        Ok(Self { local, published })
+        Ok(Self {
+            local,
+            published,
+            clock,
+        })
     }
 
     pub fn membership(
@@ -244,7 +255,7 @@ impl PeerNetwork {
         version: MembershipVersion,
     ) -> Result<std::sync::Arc<crate::topology::Membership>> {
         self.published
-            .resolve(version.0, uring_runtime::environment::now())?
+            .resolve(version.0, self.clock.now())?
             .ok_or(Error::IncompatibleMembership)
     }
 
@@ -773,7 +784,7 @@ impl Requester {
                 return Err(Error::Overloaded);
             }
             let (signed, binding) = forwarding.sign_request_to(request, &next)?;
-            let mut timing = PageTiming::new(metrics);
+            let mut timing = PageTiming::new(metrics, scope.clock().clone());
             let response = self
                 .exchange_inner_mode(
                     signed,
@@ -913,7 +924,7 @@ impl Requester {
             )?;
             let next = route.nodes.get(1).ok_or(Error::Unavailable)?;
             let (signed, binding) = forwarding.sign_request_to(request, next)?;
-            let mut timing = PageTiming::new(metrics);
+            let mut timing = PageTiming::new(metrics, scope.clock().clone());
             let response = self
                 .exchange_inner_mode(
                     signed,
@@ -1068,7 +1079,7 @@ impl Requester {
             };
             let receive_permit = transfers.admit_receive(&request.request, &scope).await?;
             let _probe = health.acquire(&next)?;
-            let sent = uring_runtime::environment::now();
+            let sent = scope.clock().now();
             let permit = paths
                 .peer_admission
                 .as_ref()

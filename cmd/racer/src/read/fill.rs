@@ -1677,7 +1677,7 @@ impl Fill {
                 Event::FillDriverStartNs,
                 submitted,
             );
-            let started = uring_runtime::environment::now();
+            let started = fill.dependencies.flights.clock().now();
             let _diagnostic_lifetime = diagnostic_lifetime;
             let mut work = Box::pin(async {
                 if shared_local {

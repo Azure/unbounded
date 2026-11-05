@@ -1695,6 +1695,7 @@ mod tests {
                             std::sync::Arc::new(controlplane::Published::new(
                                 crate::control::Snapshot::retention(2),
                             )),
+                            crate::test_support::clock(),
                         )
                         .unwrap(),
                     ),
@@ -1710,6 +1711,7 @@ mod tests {
                             std::sync::Arc::new(controlplane::Published::new(
                                 crate::control::Snapshot::retention(2),
                             )),
+                            crate::test_support::clock(),
                         )
                         .unwrap(),
                     ),

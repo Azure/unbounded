@@ -223,7 +223,8 @@ impl NodeState {
         let count = workers.len();
         let map = Arc::new(WorkerMap::new(workers.clone())?);
         let metrics = crate::telemetry::Metrics::for_workers(count)?;
-        let peer_admission = crate::peer::AdaptivePeers::new(peer_config, metrics[0].clone())?;
+        let peer_admission =
+            crate::peer::AdaptivePeers::new(peer_config, metrics[0].clone(), clock.clone())?;
         Ok(Self {
             peer_admission,
             devices: None,
@@ -1330,6 +1331,7 @@ impl WorkerApplication {
         let network = Rc::new(crate::peer::PeerNetwork::new(
             config.node.clone(),
             node.publications.clone(),
+            reactor.ctx().clock.clone(),
         )?);
         let wire = Rc::new(crate::peer::protocol::SecurityCodec::new(
             admission.clone(),

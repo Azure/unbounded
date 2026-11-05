@@ -1579,8 +1579,13 @@ fn multiworker_memberships_retire_after_request_leases_and_reuse_capacity() {
     let published = Arc::new(Published::new(Snapshot::retention(1)));
     let store = PublicationTarget::new(publication.cluster.clone(), published.clone());
     let networks = [
-        PeerNetwork::new(local.clone(), published.clone()).unwrap(),
-        PeerNetwork::new(local, published).unwrap(),
+        PeerNetwork::new(
+            local.clone(),
+            published.clone(),
+            crate::test_support::clock(),
+        )
+        .unwrap(),
+        PeerNetwork::new(local, published, crate::test_support::clock()).unwrap(),
     ];
     let mut publish = |sequence, version| {
         publication.sequence.0 = sequence;

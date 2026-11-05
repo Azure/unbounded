@@ -379,6 +379,7 @@ fn server_authenticates_before_copy_only_service_and_signs_failures() {
         PeerNetwork::new(
             NodeId(C.into()),
             crate::test_support::published_membership(membership),
+            crate::test_support::clock(),
         )
         .unwrap(),
     );
@@ -465,6 +466,7 @@ fn relay_dispatch_preserves_reverse_path_and_fails_closed_on_link_loss() {
             PeerNetwork::new(
                 NodeId(B.into()),
                 crate::test_support::published_membership(membership.clone()),
+                crate::test_support::clock(),
             )
             .unwrap(),
         );
@@ -591,6 +593,7 @@ fn relay_fails_a_request_for_a_silent_destination_at_once() {
         PeerNetwork::new(
             NodeId(B.into()),
             crate::test_support::published_membership(membership.clone()),
+            crate::test_support::clock(),
         )
         .unwrap(),
     );
@@ -800,6 +803,7 @@ fn refused_socket_opens_only_immediate_link_and_selects_bounded_alternate() {
             PeerNetwork::new(
                 NodeId(A.into()),
                 crate::test_support::published_membership(members.clone()),
+                crate::test_support::clock(),
             )
             .unwrap(),
         ),
@@ -972,6 +976,7 @@ fn signed_tcp_case(case: &str) {
         PeerNetwork::new(
             NodeId(A.into()),
             crate::test_support::published_membership(membership.clone()),
+            crate::test_support::clock(),
         )
         .unwrap(),
     );
@@ -979,12 +984,18 @@ fn signed_tcp_case(case: &str) {
         PeerNetwork::new(
             NodeId(C.into()),
             crate::test_support::published_membership(membership.clone()),
+            crate::test_support::clock(),
         )
         .unwrap(),
     );
     let destination_auth = Rc::new(Forwarding::new(signers[2].clone()));
     let metrics = crate::telemetry::Metrics::default();
-    let adaptive = crate::peer::AdaptivePeers::new(Default::default(), metrics.clone()).unwrap();
+    let adaptive = crate::peer::AdaptivePeers::new(
+        Default::default(),
+        metrics.clone(),
+        crate::test_support::clock(),
+    )
+    .unwrap();
     let paths =
         Rc::new(Paths::new(Rc::new(LinkHealth::default()), 4).with_peer_admission(adaptive));
     let outbound = NoOutbound::new(signers[2].clone(), destination_network.clone());
@@ -1157,6 +1168,7 @@ fn incoming_header_timeout_closes_silent_partial_and_idle_keepalive_peers() {
                     Arc::new(controlplane::Published::new(
                         crate::control::Snapshot::retention(2),
                     )),
+                    crate::test_support::clock(),
                 )
                 .unwrap(),
             ),
@@ -1172,6 +1184,7 @@ fn incoming_header_timeout_closes_silent_partial_and_idle_keepalive_peers() {
                     Arc::new(controlplane::Published::new(
                         crate::control::Snapshot::retention(2),
                     )),
+                    crate::test_support::clock(),
                 )
                 .unwrap(),
             ),
@@ -1541,6 +1554,7 @@ fn outbound_lease_routes_without_registry_and_rejects_non_neighbors() {
         Arc::new(controlplane::Published::new(
             crate::control::Snapshot::retention(2),
         )),
+        crate::test_support::clock(),
     )
     .unwrap();
     assert!(matches!(
@@ -1653,6 +1667,7 @@ mod established_sessions {
                 PeerNetwork::new(
                     NodeId(C.into()),
                     crate::test_support::published_membership(membership),
+                    crate::test_support::clock(),
                 )
                 .unwrap(),
             );
@@ -1997,6 +2012,7 @@ fn hot_page_shedding(mate: bool) {
         PeerNetwork::new(
             NodeId(C.into()),
             crate::test_support::published_membership(membership.clone()),
+            crate::test_support::clock(),
         )
         .unwrap(),
     );

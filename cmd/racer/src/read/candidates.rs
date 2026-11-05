@@ -4532,7 +4532,12 @@ pub(super) mod tests {
                 Rc::new(Forwarding::new(signatures)),
                 transfers,
                 Rc::new(
-                    crate::peer::PeerNetwork::new(config.node.clone(), published.clone()).unwrap(),
+                    crate::peer::PeerNetwork::new(
+                        config.node.clone(),
+                        published.clone(),
+                        crate::test_support::clock(),
+                    )
+                    .unwrap(),
                 ),
             ));
             let policy = Rc::new(CandidatePolicy::new(

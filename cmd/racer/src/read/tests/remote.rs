@@ -363,13 +363,21 @@ fn remote_candidate_with_churn(absence: Option<Absence>, forbidden: bool, churn:
         codec.clone(),
         a.signatures.clone(),
     ));
-    let source_network = Rc::new(PeerNetwork::new(source.clone(), source_publications).unwrap());
+    let source_network = Rc::new(
+        PeerNetwork::new(
+            source.clone(),
+            source_publications,
+            crate::test_support::clock(),
+        )
+        .unwrap(),
+    );
     let destination_membership =
         Arc::new(Membership::validate(membership.version, membership.members().to_vec()).unwrap());
     let destination_network = Rc::new(
         PeerNetwork::new(
             destination.clone(),
             crate::test_support::published_membership(destination_membership),
+            crate::test_support::clock(),
         )
         .unwrap(),
     );

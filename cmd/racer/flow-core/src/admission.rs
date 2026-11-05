@@ -125,7 +125,7 @@ pub struct Adaptive<K, O> {
 
     observer: O,
 
-    now: fn() -> Instant,
+    now: Box<dyn Fn() -> Instant + Send + Sync>,
 }
 
 /// Mutex-protected aggregate admission and bounded peer records.
@@ -172,7 +172,11 @@ pub struct Permit<K: Ord + Clone, O: Observer> {
 
 impl<K: Ord + Clone, O: Observer> Adaptive<K, O> {
     /// Validate positive limits and publish the initial aggregate ceiling.
-    pub fn new(config: Config, observer: O, now: fn() -> Instant) -> Result<Arc<Self>> {
+    pub fn new(
+        config: Config,
+        observer: O,
+        now: impl Fn() -> Instant + Send + Sync + 'static,
+    ) -> Result<Arc<Self>> {
         if config.total == 0
             || config.per_key == 0
             || config.per_key > config.total
@@ -181,14 +185,15 @@ impl<K: Ord + Clone, O: Observer> Adaptive<K, O> {
             return Err(Error::InvalidInput);
         }
         observer.limit(config.total);
+        let updated = now();
         Ok(Arc::new(Self {
             config,
             observer,
-            now,
+            now: Box::new(now),
             state: Mutex::new(State {
                 active: 0,
                 limit: config.total,
-                updated: now(),
+                updated,
                 peers: BTreeMap::new(),
             }),
         }))

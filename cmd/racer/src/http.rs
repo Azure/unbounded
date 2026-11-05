@@ -805,6 +805,7 @@ pub(crate) mod tests {
                             ..Default::default()
                         },
                         metrics.clone(),
+                        crate::test_support::clock(),
                     )
                     .unwrap();
                     let gate = crate::peer::receive::Gate::with_metrics(
@@ -862,7 +863,12 @@ pub(crate) mod tests {
     #[test]
     fn exchange_owners_clear_overload_and_drop_without_reporting_success() {
         let metrics = crate::telemetry::Metrics::default();
-        let peers = crate::peer::AdaptivePeers::new(Default::default(), metrics.clone()).unwrap();
+        let peers = crate::peer::AdaptivePeers::new(
+            Default::default(),
+            metrics.clone(),
+            crate::test_support::clock(),
+        )
+        .unwrap();
         let node = racer_control_wire::NodeId("peer".into());
         let mut exchange = PeerExchange::new(Some(peers.acquire(&node).unwrap()), None, None);
         exchange.verified_response(true);
@@ -2588,6 +2594,7 @@ pub(crate) mod tests {
                         ..Default::default()
                     },
                     metrics.clone(),
+                    crate::test_support::clock(),
                 )
                 .unwrap();
                 let node = racer_control_wire::NodeId("peer".into());

@@ -1819,8 +1819,12 @@ mod tests {
             uring_runtime::environment::now() + std::time::Duration::from_secs(10),
         )
         .unwrap();
-        let owner =
-            crate::peer::AdaptivePeers::new(Default::default(), Default::default()).unwrap();
+        let owner = crate::peer::AdaptivePeers::new(
+            Default::default(),
+            Default::default(),
+            crate::test_support::clock(),
+        )
+        .unwrap();
         let node = racer_control_wire::NodeId("peer".into());
         let permit = Some(owner.acquire(&node).unwrap());
         let failed = Rc::new(std::cell::Cell::new(false));

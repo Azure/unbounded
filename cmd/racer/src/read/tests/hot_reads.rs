@@ -1397,6 +1397,7 @@ fn production_range_windows(old_provider: bool) -> Vec<Rc<LinkStats>> {
                     PeerNetwork::new(
                         node(i),
                         crate::test_support::published_membership(membership.clone()),
+                        crate::test_support::clock(),
                     )
                     .unwrap(),
                 ),
@@ -1426,7 +1427,14 @@ fn production_range_windows(old_provider: bool) -> Vec<Rc<LinkStats>> {
     });
     let admission = fixtures[2].fill.dependencies.admission.clone();
     let auth = Rc::new(Forwarding::new(signers[2].clone()));
-    let network = Rc::new(PeerNetwork::new(node(2), publications[2].clone()).unwrap());
+    let network = Rc::new(
+        PeerNetwork::new(
+            node(2),
+            publications[2].clone(),
+            crate::test_support::clock(),
+        )
+        .unwrap(),
+    );
     let outbound = crate::peer::tests::NoOutbound::new(signers[2].clone(), network.clone());
     let relay = Rc::new(crate::peer::Relay::new(
         Rc::new(Paths::new(Rc::new(LinkHealth::default()), 4)),
