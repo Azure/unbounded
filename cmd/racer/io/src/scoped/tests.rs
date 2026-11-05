@@ -1,20 +1,13 @@
 //! Adapter contracts: scope precedence, scope scans, scope fences, partitions,
 //! and rejection observation. Ring ownership is covered by `racer-io`.
 use super::*;
-use fixtures::{Admission, Limits, Reactor, RequestScope};
-use std::{collections::BTreeMap, num::NonZeroUsize, task::Context, time::Instant};
+use fixtures::{Limits, Reactor, RequestScope, host_env, reactor};
+use std::{num::NonZeroUsize, task::Context, time::Instant};
 
 pub(super) mod fixtures {
-    //! Counting guards and a scoped adapter for raw completion ownership tests.
+    //! A scoped adapter with an explicit backend for raw completion ownership tests.
     use super::*;
-    use std::ops::Deref;
-
-    /// Independently counted connection leases and request bookkeeping bytes.
-    #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-    pub enum ResourceClass {
-        /// Allocation and completion bookkeeping charged through the runtime budget.
-        RequestContext,
-    }
+    use crate::{CancelToken, Env, WorkerCtx};
 
     /// Queue ceiling selected by each ownership regression.
     pub struct Limits {
@@ -22,132 +15,41 @@ pub(super) mod fixtures {
         pub queue_entries: NonZeroUsize,
     }
 
-    /// Shared accounting ledger for observing exact resource release boundaries.
-    pub struct Admission {
-        /// Queue ceiling used when constructing the associated reactor.
-        pub limits: Limits,
+    /// The adapter under test.
+    pub type Reactor = super::super::Reactor<RequestScope>;
 
-        used: Rc<RefCell<BTreeMap<ResourceClass, usize>>>,
+    /// Build a lazy reactor on `env` with the selected queue ceiling.
+    pub fn reactor(limits: Limits, env: &Env) -> Reactor {
+        Reactor::new(limits.queue_entries.get(), env)
     }
 
-    /// One counted resource amount released by its owner's destructor.
-    pub struct Reservation {
-        used: Rc<RefCell<BTreeMap<ResourceClass, usize>>>,
-
-        class: ResourceClass,
-
-        amount: usize,
-    }
-
-    impl Drop for Reservation {
-        /// Return the guard's exact charged amount to the shared ledger.
-        fn drop(&mut self) {
-            *self.used.borrow_mut().entry(self.class).or_default() -= self.amount;
-        }
-    }
-
-    impl Admission {
-        /// Start an empty resource ledger with the selected queue limit.
-        pub fn new(limits: Limits) -> Self {
-            Self {
-                limits,
-                used: Rc::default(),
-            }
-        }
-
-        /// Charge one class and return an independently owned release guard.
-        pub fn reserve(
-            &self,
-            _: Option<&()>,
-            class: ResourceClass,
-            amount: usize,
-        ) -> Result<Reservation> {
-            *self.used.borrow_mut().entry(class).or_default() += amount;
-            Ok(Reservation {
-                used: self.used.clone(),
-                class,
-                amount,
-            })
-        }
-
-        /// Observe live guards without mutating the accounting ledger.
-        pub fn used(&self, class: ResourceClass) -> usize {
-            *self.used.borrow().get(&class).unwrap_or(&0)
-        }
-    }
-
-    /// Adapt the ledger to the runtime's public allocation-budget contract.
-    pub struct CountingBudget(Rc<Admission>);
-
-    impl Budget for CountingBudget {
-        /// Exact ledger guard retained by the charged runtime owner.
-        type Charge = Reservation;
-
-        /// Charge completion memory through the observable test ledger.
-        fn charge(&self, bytes: usize) -> Result<Reservation> {
-            self.0.reserve(None, ResourceClass::RequestContext, bytes)
-        }
-    }
-
-    /// Scoped reactor with an accessible ledger for private completion regressions.
-    pub struct Reactor {
-        core: super::super::Reactor<RequestScope, CountingBudget>,
-
-        /// Resource accounting shared with buffers, leases, and completion owners.
-        pub admission: Rc<Admission>,
-    }
-
-    impl Reactor {
-        /// Construct a lazy reactor using the ledger's queue ceiling.
-        pub fn new(admission: Rc<Admission>) -> Self {
-            Self {
-                core: super::super::Reactor::new(
-                    admission.limits.queue_entries.get(),
-                    CountingBudget(admission.clone()),
-                    &crate::reactor::simulation::ambient_env(),
-                ),
-                admission,
-            }
-        }
-
-        /// Fence a snapshot of all current operations while leaving admission open.
-        pub fn file_fence(&self, _: ()) -> Operation<'_, ()> {
-            self.core.fence_matching(|_| true)
-        }
-    }
-
-    impl Deref for Reactor {
-        /// Production implementation exercised by the test adapter.
-        type Target = super::super::Reactor<RequestScope, CountingBudget>;
-
-        /// Expose the production reactor without duplicating operation implementations.
-        fn deref(&self) -> &Self::Target {
-            &self.core
-        }
+    /// A kernel backend on host time.
+    pub fn host_env() -> Env {
+        Env::new(crate::Driver::Uring, WorkerCtx::host())
     }
 
     /// Deadline and cancellation policy retained independently by each operation.
     #[derive(Clone)]
     pub struct RequestScope {
-        /// Absolute deadline in the active clock domain.
-        pub deadline: Deadline,
+        /// Absolute host deadline.
+        pub deadline: Instant,
 
         /// Shared cancellation state, checked before deadline expiration.
-        pub cancellation: Cancellation,
+        pub cancellation: CancelToken,
     }
 
     impl RequestScope {
         /// Create a fresh cancellation source with a caller-selected deadline.
-        pub fn new(_: (), deadline: Instant) -> Result<Self> {
-            Ok(Self {
-                deadline: Deadline(deadline),
-                cancellation: Cancellation::new()?,
-            })
+        pub fn new(deadline: Instant) -> Self {
+            Self {
+                deadline,
+                cancellation: CancelToken::new(),
+            }
         }
 
         /// Request cancellation without treating the request as a kernel fence.
-        pub fn cancel(&self) -> Result<()> {
-            self.cancellation.cancel()
+        pub fn cancel(&self) {
+            self.cancellation.cancel();
         }
     }
 
@@ -155,11 +57,11 @@ pub(super) mod fixtures {
         /// Runtime classification used by ownership regressions.
         type Error = Error;
 
-        /// Give cancellation precedence over expiration in the active clock domain.
+        /// Give cancellation precedence over expiration on host time.
         fn check(&self) -> Result<()> {
             if self.cancellation.is_cancelled() {
                 Err(Error::Cancelled)
-            } else if crate::environment::now() >= self.deadline.0 {
+            } else if Instant::now() >= self.deadline {
                 Err(Error::DeadlineExceeded)
             } else {
                 Ok(())
@@ -167,7 +69,6 @@ pub(super) mod fixtures {
         }
     }
 }
-use crate::environment::{Cancellation, Deadline};
 
 /// Build a nonzero queue ceiling for a regression's admitted operation count.
 fn limits(capacity: usize) -> Limits {
@@ -178,7 +79,7 @@ fn limits(capacity: usize) -> Limits {
 
 /// Create fresh cancellation state and a five-second deadline for a test operation.
 pub(super) fn scope() -> RequestScope {
-    RequestScope::new((), Instant::now() + Duration::from_secs(5)).unwrap()
+    RequestScope::new(Instant::now() + Duration::from_secs(5))
 }
 
 /// Poll delivery once without advancing the kernel or simulated driver.
@@ -223,24 +124,19 @@ pub(super) fn kernel_reactor(capacity: usize) -> Option<Reactor> {
         }
         Err(error) => panic!("unexpected io_uring setup failure: {error}"),
     }
-    let reactor = Reactor::new(Rc::new(Admission::new(limits(capacity))));
+    let reactor = reactor(limits(capacity), &host_env());
     reactor.init().unwrap();
     Some(reactor)
 }
 
-#[cfg(feature = "simulation")]
-#[cfg(feature = "simulation")]
 mod adapter {
     use super::*;
-    use simulation::Simulation;
+    use crate::{Env, WorkerCtx, sim::SimOs};
 
-    fn sim_reactor(
-        capacity: usize,
-    ) -> (Simulation, crate::reactor::simulation::Environment, Reactor) {
-        let sim = Simulation::new();
-        let environment = sim.enter();
-        let reactor = Reactor::new(Rc::new(Admission::new(limits(capacity))));
-        (sim, environment, reactor)
+    fn sim_reactor(capacity: usize) -> (SimOs, (), Reactor) {
+        let sim = SimOs::new();
+        let reactor = reactor(limits(capacity), &Env::sim(&sim, WorkerCtx::host()));
+        (sim, (), reactor)
     }
 
     #[test]
@@ -248,7 +144,7 @@ mod adapter {
         let (sim, _environment, r) = sim_reactor(4);
         let (_left, right) = sim.socket_pair();
         let scope = scope();
-        scope.cancel().unwrap();
+        scope.cancel();
         let mut recv = r.recv(Rc::new(right), vec![0; 1], (), &scope);
         assert!(matches!(
             poll(&mut recv),
@@ -261,15 +157,15 @@ mod adapter {
     fn scan_cancels_operations_whose_scope_fails_and_scope_error_wins() {
         let (sim, _environment, r) = sim_reactor(4);
         let (_left, right) = sim.socket_pair();
-        let clock = crate::environment::now();
-        let scope = RequestScope::new((), clock + Duration::from_secs(60)).unwrap();
+        let clock = Instant::now();
+        let scope = RequestScope::new(clock + Duration::from_secs(60));
         let mut recv = r.recv(Rc::new(right), vec![0; 1], (), &scope);
         assert!(poll(&mut recv).is_pending());
         assert_eq!(r.in_flight(), 1);
         // A deadline-only scope fails its check without a cancel token firing:
         // the scan must cancel the kernel operation.
         let mut expired = scope.clone();
-        expired.deadline = Deadline(clock);
+        expired.deadline = clock;
         let mut recv_expired = {
             let (_l, rr) = sim.socket_pair();
             r.recv(Rc::new(rr), vec![0; 1], (), &expired)
@@ -278,7 +174,7 @@ mod adapter {
             poll(&mut recv_expired),
             Poll::Ready(Err(Error::DeadlineExceeded))
         ));
-        scope.cancel().unwrap();
+        scope.cancel();
         assert!(matches!(drive(&r, recv), Err(Error::Cancelled)));
         assert_eq!(r.in_flight(), 0);
     }
@@ -297,7 +193,7 @@ mod adapter {
         let target = first.cancellation.clone();
         drive(
             &r,
-            r.fence_matching(move |scope| scope.cancellation.token().same(target.token())),
+            r.fence_matching(move |scope| scope.cancellation.same(&target)),
         )
         .unwrap();
         assert!(matches!(poll(&mut one), Poll::Ready(Err(Error::Cancelled))));
@@ -310,18 +206,12 @@ mod adapter {
 
     #[test]
     fn reserved_partition_keeps_control_slots_and_reports_rejections() {
-        let sim = Simulation::new();
-        let _environment = sim.enter();
+        let sim = SimOs::new();
         let rejections = Rc::new(RefCell::new(Vec::new()));
         let seen = rejections.clone();
-        let r = super::super::Reactor::<RequestScope, ()>::new(
-            2,
-            (),
-            &crate::reactor::simulation::ambient_env(),
-        )
-        .with_rejection_observer(move |_, facts: SubmissionRejection| {
-            seen.borrow_mut().push(facts.reason)
-        });
+        let r = Reactor::new(2, &Env::sim(&sim, WorkerCtx::host())).with_rejection_observer(
+            move |_, facts: SubmissionRejection| seen.borrow_mut().push(facts.reason),
+        );
         let capacity = r.reserve_submissions(1, ()).unwrap();
         assert_eq!(capacity.capacity(), 1);
         assert!(r.reserve_submissions(1, ()).is_err());
@@ -363,7 +253,7 @@ mod adapter {
 
 #[test]
 fn constructor_does_not_open_kernel_resources() {
-    let r = Reactor::new(Rc::new(Admission::new(limits(1))));
+    let r = reactor(limits(1), &host_env());
     assert_eq!(r.in_flight(), 0);
     assert_eq!(r.poll_budgeted(8), Ok(0));
 }
@@ -373,7 +263,7 @@ fn kernel_reactor_reads_and_writes_files() {
     let Some(r) = kernel_reactor(4) else {
         return;
     };
-    let path = std::env::temp_dir().join(format!("uring-runtime-adapter-{}", std::process::id()));
+    let path = std::env::temp_dir().join(format!("racer-io-scoped-{}", std::process::id()));
     let file = std::fs::OpenOptions::new()
         .create(true)
         .truncate(true)

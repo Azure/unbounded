@@ -40,10 +40,11 @@ use std::cell::RefCell;
 use std::path::Path;
 use std::path::PathBuf;
 use std::rc::Rc;
+use uring_runtime::filesystem::prelude::*;
 
 pub(crate) const CHECKPOINT_NAMES: [&str; 2] = ["checkpoint.0", "checkpoint.1"];
-const SLOTS: uring_runtime::reactor::filesystem::checkpoint::Slots<HEADER_BYTES> =
-    uring_runtime::reactor::filesystem::checkpoint::Slots {
+const SLOTS: uring_runtime::filesystem::checkpoint::Slots<HEADER_BYTES> =
+    uring_runtime::filesystem::checkpoint::Slots {
         names: CHECKPOINT_NAMES,
         minimum_bytes: HEADER_BYTES + CLUSTER_BYTES + 4 + DIGEST_BYTES,
         maximum_bytes: MAX_CHECKPOINT_BYTES,
@@ -456,7 +457,7 @@ pub(crate) fn candidates(directory: &Path, budget: usize) -> Result<Candidates> 
 }
 
 pub(crate) type Candidates =
-    uring_runtime::reactor::filesystem::checkpoint::Candidates<CheckpointImage, HEADER_BYTES>;
+    uring_runtime::filesystem::checkpoint::Candidates<CheckpointImage, HEADER_BYTES>;
 
 #[cfg(test)]
 pub(crate) fn read_candidates(directory: &Path) -> Result<Vec<(usize, CheckpointImage)>> {

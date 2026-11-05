@@ -4,9 +4,10 @@
 //! Slot failures are disposable; inaccessible directories are not. No payload scan or
 //! fsync is performed. Directory trust and admission fencing remain caller policy.
 
-use super::operations::{Durability, Replacement, ReplacementError};
+use super::Files;
+use super::operations::{Durability, ReplaceFiles, Replacement, ReplacementError};
 use crate::reactor::Reactor;
-use crate::{Budget, Error, Scope};
+use crate::{Error, Scope};
 use std::fs::OpenOptions;
 use std::io::{self, Read};
 use std::os::unix::fs::OpenOptionsExt;
@@ -132,9 +133,9 @@ impl<const HEADER: usize> Slots<HEADER> {
     /// Publish a periodic hint using bounded reactor scratch and no fsync.
     /// The caller serializes this fixed stage and fences abandoned operations
     /// before retrying. Cancellation can leave a stage or an uncertain rename.
-    pub async fn publish_async<S: Scope, B: Budget>(
+    pub async fn publish_async<S: Scope>(
         &self,
-        reactor: &Reactor<S, B>,
+        reactor: &Reactor<S>,
         directory: &Path,
         slot: usize,
         bytes: &[u8],

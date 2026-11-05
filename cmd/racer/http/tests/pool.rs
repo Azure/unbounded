@@ -21,7 +21,6 @@ use std::{
     task::{Context, Poll, Wake, Waker},
     time::{Duration, Instant},
 };
-use uring_runtime::environment::now;
 
 /// Keep protocol failures distinct from runtime and quota admission failures.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -105,7 +104,7 @@ impl Scope for RequestScope {
         if self.cancellation.is_cancelled() {
             return Err(racer_io::Error::Cancelled.into());
         }
-        if now() >= self.deadline {
+        if Instant::now() >= self.deadline {
             return Err(racer_io::Error::DeadlineExceeded.into());
         }
         Ok(())
@@ -118,7 +117,7 @@ impl Scope for RequestScope {
 /// Give each operation a fresh, bounded cancellation lifetime.
 fn scope() -> RequestScope {
     RequestScope {
-        deadline: now() + Duration::from_secs(5),
+        deadline: Instant::now() + Duration::from_secs(5),
         cancellation: Cancellation::new().unwrap(),
     }
 }
@@ -141,8 +140,6 @@ impl HttpContext for Caller {
     type Error = Error;
 
     type Scope = RequestScope;
-
-    type Budget = ();
 
     type Reactor = Rc<Reactor>;
 
@@ -168,7 +165,7 @@ impl HttpContext for Caller {
         self.0.is_stopped()
     }
 }
-type Reactor = uring_runtime::reactor::Reactor<RequestScope, ()>;
+type Reactor = racer_io::scoped::Reactor<RequestScope>;
 type Pool = connection::HttpPool<Caller>;
 type Io = connection::HttpIo<Caller>;
 type Lease = connection::ConnectionLease<Caller>;
@@ -200,7 +197,7 @@ fn new_io(reactor: Rc<Reactor>, admission: Rc<Quotas<Limits>>) -> Io {
 /// Initialize the explicitly polled reactor before recording accounting baselines.
 fn setup() -> (Rc<Quotas<Limits>>, Rc<Reactor>, Pool) {
     let admission = Rc::new(Quotas::new(Limits));
-    let reactor = Rc::new(Reactor::new(32, (), &racer_io::Env::host()));
+    let reactor = Rc::new(Reactor::new(32, &racer_io::Env::host()));
     reactor.init().unwrap();
     let pool = new_pool(reactor.clone(), admission.clone());
     (admission, reactor, pool)
@@ -351,7 +348,7 @@ fn waiting_cancel_deadline_close_stop_and_drop_release_only_waiter_quota() {
         let baseline = admission.used(Resource::Context);
         let mut scope = scope();
         if case == "deadline" {
-            scope.deadline = now() + Duration::from_millis(20);
+            scope.deadline = Instant::now() + Duration::from_millis(20);
         }
         let count = Arc::new(WakeCounter::default());
         let waker = Waker::from(count.clone());
@@ -403,7 +400,7 @@ fn worker_tick_wakes_bounded_round_robin_waiters_even_in_nested_executor() {
     let (listener, endpoint) = listener();
     let (_held, _peer) = held(&pool, &reactor, &admission, &endpoint, &listener);
     let mut scope = scope();
-    scope.deadline = now() + Duration::from_millis(20);
+    scope.deadline = Instant::now() + Duration::from_millis(20);
     let mut futures = FuturesUnordered::new();
     futures.push(pool.checkout_wait(&endpoint, &scope));
     futures.push(pool.checkout_wait(&endpoint, &scope));
@@ -638,7 +635,7 @@ fn deadline_expires_without_peer_traffic() {
     let (admission, reactor, _) = setup();
     let io = new_io(reactor.clone(), admission.clone());
     let mut scope = scope();
-    scope.deadline = now() + Duration::from_millis(30);
+    scope.deadline = Instant::now() + Duration::from_millis(30);
     let (socket, _peer) = UnixStream::pair().unwrap();
     assert!(matches!(
         drive(

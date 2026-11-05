@@ -8,6 +8,9 @@ use crate::error::Error;
 use crate::error::Operation;
 use crate::error::Result;
 use crate::model::RequestId;
+use racer_io::scoped::ReactorWake;
+use racer_io::scoped::SUBMISSION_BYTES;
+use racer_io::scoped::SubmissionCapacity;
 use std::ops::Deref;
 use std::rc::Rc;
 use std::sync::Arc;
@@ -15,10 +18,8 @@ use std::sync::Mutex;
 use std::sync::OnceLock;
 use std::time::Instant;
 use uring_runtime::environment::Deadline;
-use uring_runtime::reactor::ReactorWake;
-use uring_runtime::reactor::SUBMISSION_BYTES;
-use uring_runtime::reactor::SubmissionCapacity;
-use uring_runtime::reactor::filesystem::Buffer;
+use uring_runtime::filesystem::Buffer;
+use uring_runtime::filesystem::prelude::*;
 
 // Seeded hashing only in simulated worlds; production retains std hashing.
 #[cfg(not(test))]
@@ -337,20 +338,6 @@ impl wire_codec::rest::Scope for RequestScope {
     }
 }
 
-pub struct AdmissionBudget(Rc<flow_control::Quotas<AdmissionPolicy>>);
-impl uring_runtime::Budget for AdmissionBudget {
-    type Charge = flow_control::Charge<AdmissionPolicy>;
-    fn charge(&self, bytes: usize) -> racer_io::Result<flow_control::Charge<AdmissionPolicy>> {
-        self.0
-            .reserve_completion(None, ResourceClass::RequestContext, bytes)
-            .map_err(|error| match error {
-                flow_control::Error::InvalidInput => racer_io::Error::InvalidConfiguration,
-                flow_control::Error::Unavailable => racer_io::Error::Unavailable,
-                _ => racer_io::Error::Overloaded,
-            })
-    }
-}
-
 /// Racer admission and request policy around the worker-local runtime reactor.
 ///
 /// Inline storage cannot meet the stable-buffer contract:
@@ -396,11 +383,11 @@ impl uring_runtime::Budget for AdmissionBudget {
 /// }
 /// ```
 pub struct Reactor {
-    core: uring_runtime::reactor::Reactor<RequestScope, AdmissionBudget>,
+    core: racer_io::scoped::Reactor<RequestScope>,
     admission: Rc<flow_control::Quotas<AdmissionPolicy>>,
 }
 impl Deref for Reactor {
-    type Target = uring_runtime::reactor::Reactor<RequestScope, AdmissionBudget>;
+    type Target = racer_io::scoped::Reactor<RequestScope>;
     fn deref(&self) -> &Self::Target {
         &self.core
     }
@@ -414,9 +401,8 @@ impl Reactor {
     pub fn new(admission: Rc<flow_control::Quotas<AdmissionPolicy>>, env: &racer_io::Env) -> Self {
         let diagnostics = admission.clone();
         Self {
-            core: uring_runtime::reactor::Reactor::new(
+            core: racer_io::scoped::Reactor::new(
                 admission.policy().limits().queue_entries.get(),
-                AdmissionBudget(admission.clone()),
                 env,
             )
             .with_rejection_observer(move |scope, facts| {
@@ -886,7 +872,7 @@ mod tests {
             use uring_runtime::reactor::simulation;
 
             #[test]
-            fn direct_filesystem_buffers_preserve_nonempty_boundary_and_charge() {
+            fn direct_filesystem_buffers_preserve_nonempty_boundary() {
                 let admission = Rc::new(flow_control::Quotas::new(AdmissionPolicy::new(limits(4))));
                 let reactor = Reactor::new(admission.clone(), &crate::test_support::env());
                 assert!(matches!(
@@ -898,7 +884,7 @@ mod tests {
                     Err(Error::InvalidConfiguration)
                 ));
                 assert_eq!(admission.used(ResourceClass::RequestContext), 0);
-                let mut buffer: uring_runtime::reactor::filesystem::Buffer =
+                let mut buffer: uring_runtime::filesystem::Buffer =
                     reactor.file_bytes(b"abc").unwrap();
                 assert_eq!(buffer.prefix(3).unwrap(), b"abc");
                 assert!(buffer.prefix(4).is_err());
@@ -906,7 +892,6 @@ mod tests {
                 buffer.advance(1).unwrap();
                 assert_eq!(buffer.remaining(), 2);
                 assert_eq!(buffer.bytes().unwrap(), b"bc");
-                assert!(admission.used(ResourceClass::RequestContext) >= 3);
                 drop(buffer);
                 assert_eq!(admission.used(ResourceClass::RequestContext), 0);
                 let buffer = reactor.file_buffer(3).unwrap();
@@ -1292,6 +1277,7 @@ mod tests {
             use std::path::Path;
             use std::rc::Rc;
             use std::time::Duration;
+            use uring_runtime::filesystem::prelude::*;
             use uring_runtime::reactor::simulation::Environment;
             use uring_runtime::reactor::simulation::Fault;
             use uring_runtime::reactor::simulation::Simulation;
@@ -1472,7 +1458,6 @@ mod tests {
                     assert_eq!(drops.get(), 0);
                     assert!(weak.upgrade().is_some());
                     assert_eq!(r.in_flight(), 1);
-                    assert!(r.admission.used(ResourceClass::RequestContext) > baseline);
                     assert_eq!(r.poll_budgeted(1), Ok(1));
                     assert!(matches!(
                         poll(&mut recv),
@@ -1622,7 +1607,7 @@ mod tests {
                 assert_eq!(&*bytes, b"first");
                 let private = drive(
                     &r,
-                    Box::pin(uring_runtime::reactor::filesystem::secure::directory(
+                    Box::pin(uring_runtime::filesystem::secure::directory(
                         &r,
                         Path::new("/private"),
                         true,
@@ -1635,7 +1620,7 @@ mod tests {
                 drive(
                     &r,
                     Box::pin(async {
-                        uring_runtime::reactor::filesystem::secure::atomic_write(
+                        uring_runtime::filesystem::secure::atomic_write(
                             &r, &private, "identity", b"secret", &scope,
                         )
                         .await

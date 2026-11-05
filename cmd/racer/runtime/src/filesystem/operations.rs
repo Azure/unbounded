@@ -81,10 +81,33 @@ struct WrittenReplacement {
     _scratch: Option<Buffer>,
 }
 
-impl<S: Scope, B: Budget> Reactor<S, B> {
+/// Staged replacement sharing the reactor's completion fences.
+pub trait ReplaceFiles<S: Scope> {
     /// Write a fresh empty stage, then atomically rename it. Reused/nonempty stages
     /// are rejected, including for empty input. Failure cleanup remains caller-owned.
-    pub fn file_replace<'a>(
+    fn file_replace<'a>(
+        &'a self,
+        replacement: Replacement,
+        buffer: Buffer,
+        scope: &'a S,
+    ) -> Operation<'a, (), ReplacementError<S::Error>>;
+
+    /// Write a fresh stage with reusable, bounded scratch, then publish it.
+    /// The input may exceed the scratch limit. Stage creation and failure cleanup
+    /// remain caller-owned, just as for [`Self::file_replace`].
+    fn file_replace_chunked<'a>(
+        &'a self,
+        replacement: Replacement,
+        bytes: &'a [u8],
+        chunk: NonZeroUsize,
+        scope: &'a S,
+    ) -> Operation<'a, (), ReplacementError<S::Error>>;
+}
+
+impl<S: Scope> ReplaceFiles<S> for Reactor<S> {
+    /// Write a fresh empty stage, then atomically rename it. Reused/nonempty stages
+    /// are rejected, including for empty input. Failure cleanup remains caller-owned.
+    fn file_replace<'a>(
         &'a self,
         replacement: Replacement,
         buffer: Buffer,
@@ -96,7 +119,7 @@ impl<S: Scope, B: Budget> Reactor<S, B> {
     /// Write a fresh stage with reusable, bounded scratch, then publish it.
     /// The input may exceed the scratch limit. Stage creation and failure cleanup
     /// remain caller-owned, just as for [`Self::file_replace`].
-    pub fn file_replace_chunked<'a>(
+    fn file_replace_chunked<'a>(
         &'a self,
         replacement: Replacement,
         bytes: &'a [u8],
@@ -105,7 +128,53 @@ impl<S: Scope, B: Budget> Reactor<S, B> {
     ) -> Operation<'a, (), ReplacementError<S::Error>> {
         self.replace_input(replacement, ReplacementInput::Chunked(bytes, chunk), scope)
     }
+}
 
+/// Replacement steps private to this module.
+#[allow(async_fn_in_trait)]
+trait ReplaceSteps<S: Scope> {
+    /// Share validation, full-write completion, and publication across input forms.
+    fn replace_input<'a>(
+        &'a self,
+        replacement: Replacement,
+        input: ReplacementInput<'a>,
+        scope: &'a S,
+    ) -> Operation<'a, (), ReplacementError<S::Error>>;
+
+    /// Verify a fresh single-link stage and reopen its exact inode without append.
+    async fn prepare_replacement(
+        &self,
+        replacement: Replacement,
+        scope: &S,
+    ) -> Result<PreparedReplacement, S::Error>;
+
+    /// Finish every input chunk before granting the capability to publish the stage.
+    /// Empty input still passes stage validation and preserves allocation policy.
+    async fn write_replacement(
+        &self,
+        prepared: PreparedReplacement,
+        input: ReplacementInput<'_>,
+        scope: &S,
+    ) -> Result<WrittenReplacement, S::Error>;
+
+    /// Consume short writes while retaining the same scratch allocation.
+    async fn write_complete(
+        &self,
+        staged: Rc<Descriptor>,
+        buffer: Buffer,
+        offset: &mut u64,
+        scope: &S,
+    ) -> Result<Buffer, S::Error>;
+
+    /// Apply the selected durability fences and preserve the failed publication phase.
+    async fn publish_replacement(
+        &self,
+        written: WrittenReplacement,
+        scope: &S,
+    ) -> Result<(), ReplacementError<S::Error>>;
+}
+
+impl<S: Scope> ReplaceSteps<S> for Reactor<S> {
     /// Share validation, full-write completion, and publication across input forms.
     fn replace_input<'a>(
         &'a self,
@@ -512,15 +581,12 @@ mod chunked_tests {
     //! Reused scratch and publication faults exercised through simulated completions.
     use super::*;
     use crate::reactor::{
+        filesystem::fixtures::{Admission, Limits, Reactor, scope},
         filesystem::{
             operations::publish_new,
             test_support::{drive, poll},
         },
         simulation::{Fault, Simulation},
-        tests::{
-            fixtures::{Admission, Limits, Reactor},
-            scope,
-        },
     };
     use std::path::{Path, PathBuf};
 
@@ -732,12 +798,9 @@ mod tests {
     //! Bounded output ownership and staged publication phase regressions.
     use super::*;
     use crate::reactor::{
+        filesystem::fixtures::{Admission, Limits, Reactor, scope},
         filesystem::test_support::{drive, poll},
         simulation::{Fault, Simulation},
-        tests::{
-            fixtures::{Admission, Limits, Reactor},
-            scope,
-        },
     };
     use std::path::Path;
 
@@ -820,10 +883,7 @@ mod tests {
 
     /// Preserve each input form's scratch lifetime and fence a shared held rename.
     #[test]
-    fn shared_pipeline_preserves_scratch_accounting_through_publication() {
-        use crate::reactor::tests::fixtures::ResourceClass;
-
-        let mut retained = Vec::new();
+    fn shared_pipeline_preserves_scratch_through_publication() {
         for chunked in [false, true] {
             let sim = Simulation::new();
             let _environment = sim.enter();
@@ -832,7 +892,6 @@ mod tests {
             let replacement = replacement(&r, Durability::Publish);
             let directory = Rc::downgrade(&replacement.directory);
             let staged = Rc::downgrade(&replacement.staged);
-            let baseline = r.admission.used(ResourceClass::RequestContext);
             sim.inject("rename", Fault::HoldCompletion(20)).unwrap();
             let mut future = if chunked {
                 r.file_replace_chunked(
@@ -854,7 +913,6 @@ mod tests {
             }
             assert_eq!(sim.read_file(Path::new("/target")).unwrap(), b"new bytes");
             assert!(staged.upgrade().is_some());
-            retained.push(r.admission.used(ResourceClass::RequestContext) - baseline);
             drop(future);
             assert!(staged.upgrade().is_none());
             assert!(directory.upgrade().is_some());
@@ -862,11 +920,7 @@ mod tests {
             drive(&r, r.file_fence(())).unwrap();
             assert!(directory.upgrade().is_none());
             assert_eq!(r.in_flight(), 0);
-            assert_eq!(r.admission.used(ResourceClass::RequestContext), baseline);
         }
-        // Both paths retain identical rename bookkeeping. Only chunked input
-        // keeps its three-byte scratch allocation after all writes have finished.
-        assert_eq!(retained[1], retained[0] + 3);
     }
 
     /// Honor the selected durability fences after consuming all short writes.
@@ -960,10 +1014,9 @@ mod tests {
         }
     }
 
-    /// Keep output charged until drop and interpret prefixes at the current cursor.
+    /// Interpret prefixes at the current cursor.
     #[test]
-    fn read_output_owns_budget_and_prefix_uses_current_cursor() {
-        use crate::reactor::tests::fixtures::ResourceClass;
+    fn read_output_prefix_uses_current_cursor() {
         let sim = Simulation::new();
         let _environment = sim.enter();
         let r = reactor();
@@ -974,7 +1027,6 @@ mod tests {
         drop(buffer);
         sim.write_file(Path::new("/data"), b"abc").unwrap();
         r.init().unwrap();
-        let baseline = r.admission.used(ResourceClass::RequestContext);
         let out = drive(
             &r,
             r.file_read_bounded(
@@ -986,12 +1038,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(&*out, b"abc");
-        assert_eq!(
-            r.admission.used(ResourceClass::RequestContext),
-            baseline + 100
-        );
         drop(out);
-        assert_eq!(r.admission.used(ResourceClass::RequestContext), baseline);
     }
 
     /// Distinguish uncertain rename completion from failed post-publication sync.
@@ -1039,35 +1086,6 @@ mod tests {
             assert_eq!(r.in_flight(), 0);
             assert_eq!(sim.read_file(Path::new("/target")).unwrap(), b"new");
         }
-    }
-
-    /// Reject output allocation before submitting reads when admission is exhausted.
-    #[test]
-    fn output_budget_failure_precedes_any_read() {
-        /// Budget that rejects every allocation to exercise admission ordering.
-        struct Reject;
-
-        impl Budget for Reject {
-            /// No charge can be constructed by this rejecting budget.
-            type Charge = ();
-
-            /// Deny all requested bytes without retaining a charge.
-            fn charge(&self, _: usize) -> Result<()> {
-                Err(Error::Overloaded)
-            }
-        }
-        let sim = Simulation::new();
-        let _environment = sim.enter();
-        sim.write_file(Path::new("/data"), b"abc").unwrap();
-        let fd = Rc::new(sim.open(None, Path::new("/data"), libc::O_RDONLY).unwrap());
-        let r = crate::reactor::Reactor::new(8, Reject, &crate::reactor::simulation::ambient_env());
-        let request = scope();
-        let mut future = r.file_read_bounded(fd, 3, NonZeroUsize::new(2).unwrap(), &request);
-        assert!(matches!(
-            poll(&mut future),
-            Poll::Ready(Err(Error::Overloaded))
-        ));
-        assert!(!sim.trace().iter().any(|e| e.operation == "submit:read"));
     }
 
     /// Maintain positioned offsets when a completion consumes only part of scratch.

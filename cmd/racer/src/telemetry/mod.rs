@@ -70,7 +70,7 @@ pub const CONTROL_SLOTS: usize = server::CONTROL_SLOTS + server::JSON_CONTROL_SL
 /// (`HARDWARE_STACK_BYTES`) is charged too, since a blocked sysfs read can keep
 /// the helper alive after diagnostics teardown.
 pub const RESERVED_BYTES: usize = server::RESERVED_BYTES
-    + server::JSON_CONTROL_SLOTS * uring_runtime::reactor::SUBMISSION_BYTES
+    + server::JSON_CONTROL_SLOTS * racer_io::scoped::SUBMISSION_BYTES
     + HARDWARE_BODY_BYTES
     + crate::hardware::WORKING_BYTES
     + HARDWARE_STACK_BYTES;
@@ -194,10 +194,8 @@ impl Telemetry {
     ) -> Operation<'a, ()> {
         Box::pin(async move {
             scope.check()?;
-            let listener = uring_runtime::reactor::descriptor::tcp_listener(
-                io.reactor.sim_os().as_ref(),
-                address,
-            )?;
+            let listener =
+                racer_io::scoped::descriptor::tcp_listener(io.reactor.sim_os().as_ref(), address)?;
             serve(self, listener, io, scope).await
         })
     }

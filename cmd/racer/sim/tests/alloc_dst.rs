@@ -15,6 +15,7 @@ use page_alloc::{
     AlignedBuffer, Alignment, Charge, Error, Extent, FreezeGuard, Generation, SegmentId,
     SegmentLease, SegmentSnapshot, SegmentState, Segments, Slab,
 };
+use racer_io::scoped::Reactor;
 use racer_io::{Operation, Scope};
 use racer_sim::alloc_model::{SegmentClock, SegmentEntries};
 use std::{
@@ -27,10 +28,7 @@ use std::{
     },
     task::{Context, Poll, Wake, Waker},
 };
-use uring_runtime::reactor::{
-    Reactor,
-    simulation::{Fault, Simulation},
-};
+use uring_runtime::reactor::simulation::{Fault, Simulation};
 
 const PAGE: u64 = 4096;
 const SEGMENT: u64 = 2 * PAGE;
@@ -518,7 +516,7 @@ struct Table {
 
     clock: SegmentClock,
 
-    reactor: Reactor<TestScope, ()>,
+    reactor: Reactor<TestScope>,
 }
 
 impl Table {
@@ -533,7 +531,7 @@ impl Table {
             slab,
             clock: SegmentClock::new(segments.clone()),
             segments,
-            reactor: Reactor::new(32, (), &uring_runtime::reactor::simulation::ambient_env()),
+            reactor: Reactor::new(32, &uring_runtime::reactor::simulation::ambient_env()),
         }
     }
 }

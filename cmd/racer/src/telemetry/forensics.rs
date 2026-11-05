@@ -275,7 +275,7 @@ pub(crate) enum GateFacts {
 
         error: Error,
     },
-    Reactor(uring_runtime::reactor::SubmissionRejection),
+    Reactor(racer_io::scoped::SubmissionRejection),
     Join {
         gate: JoinGate,
         copy: bool,
@@ -1246,9 +1246,9 @@ mod gate_event_tests {
             observer.gate_rejection(
                 &scope,
                 Some(u64::MAX),
-                GateFacts::Reactor(uring_runtime::reactor::SubmissionRejection {
-                    reason: uring_runtime::reactor::RejectionReason::SubmissionQueueFull,
-                    kind: uring_runtime::reactor::SubmissionKind::Readiness,
+                GateFacts::Reactor(racer_io::scoped::SubmissionRejection {
+                    reason: racer_io::scoped::RejectionReason::SubmissionQueueFull,
+                    kind: racer_io::scoped::SubmissionKind::Readiness,
                     reserved: true,
                     used: Some(usize::MAX),
                     limit: Some(usize::MAX),

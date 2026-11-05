@@ -50,9 +50,11 @@ use std::time::Instant;
 #[cfg(test)]
 use std::time::SystemTime;
 use uring_runtime::drivers::Busy;
-use uring_runtime::reactor::filesystem::secure;
 #[cfg(test)]
-use uring_runtime::reactor::filesystem::secure::{
+use uring_runtime::filesystem::prelude::*;
+use uring_runtime::filesystem::secure;
+#[cfg(test)]
+use uring_runtime::filesystem::secure::{
     BENEATH, NO_MAGICLINKS, atomic_write, directory, read_at, read_path,
 };
 use wire_codec::rest;
@@ -400,9 +402,7 @@ pub struct ReactorControlIo {
 impl secure::Host for ReactorControlIo {
     type Scope = RequestScope;
 
-    type Budget = crate::runtime::AdmissionBudget;
-
-    fn reactor(&self) -> &uring_runtime::reactor::Reactor<Self::Scope, Self::Budget> {
+    fn reactor(&self) -> &racer_io::scoped::Reactor<Self::Scope> {
         &self.reactor
     }
 
@@ -452,7 +452,7 @@ impl rest::Io for ReactorControlIo {
         self.reactor.sim_os()
     }
 
-    type FileBytes = uring_runtime::reactor::filesystem::ReadBuffer;
+    type FileBytes = uring_runtime::filesystem::ReadBuffer;
 
     type Error = Error;
 

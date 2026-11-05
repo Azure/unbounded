@@ -139,7 +139,6 @@ pub struct HttpContext(pub(crate) Rc<flow_control::Quotas<AdmissionPolicy>>);
 impl http1::connection::Context for HttpContext {
     type Error = Error;
     type Scope = RequestScope;
-    type Budget = crate::runtime::AdmissionBudget;
     type Reactor = Reactor;
     type Charge = flow_control::Charge<AdmissionPolicy>;
     type Slot = ConnectionReservation;
@@ -2729,7 +2728,7 @@ pub(crate) mod tests {
             use futures::stream::FuturesUnordered;
             use std::sync::Arc;
             use std::task::Wake;
-            struct WakeReactor(uring_runtime::reactor::ReactorWake);
+            struct WakeReactor(racer_io::scoped::ReactorWake);
             impl Wake for WakeReactor {
                 fn wake(self: Arc<Self>) {
                     self.0.wake().unwrap();

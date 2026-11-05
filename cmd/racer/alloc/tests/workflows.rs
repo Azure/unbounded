@@ -2,6 +2,7 @@
 
 use page_alloc::{Alignment, DevicePlacement, Error, Generation, SegmentId, Segments, Slab};
 use page_alloc::{Charge, SegmentState};
+use racer_io::scoped::Reactor;
 use racer_io::sim::Fault;
 use racer_io::{Operation, Scope};
 use std::{cell::Cell, path::Path, rc::Rc};
@@ -14,7 +15,6 @@ use std::{
     sync::Arc,
     task::{Context, Poll, Waker},
 };
-use uring_runtime::reactor::Reactor;
 
 /// Distinguishes allocator validation errors from runtime completion failures.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -60,7 +60,7 @@ fn poll<T>(future: &mut Pin<Box<dyn Future<Output = T> + '_>>) -> Poll<T> {
 
 /// Drive a simulated operation with a fixed, finite reactor-turn budget.
 fn drive<T>(
-    reactor: &Reactor<TestScope, ()>,
+    reactor: &Reactor<TestScope>,
     mut operation: Pin<Box<dyn Future<Output = T> + '_>>,
 ) -> T {
     for _ in 0..100 {
@@ -109,7 +109,7 @@ impl Drop for CountingCharge {
 fn reopen_snapshot_reads_old_record_and_appends_without_overwriting_it() {
     let simulation = racer_io::sim::SimOs::new();
     let env = racer_io::Env::sim(&simulation, racer_io::WorkerCtx::host());
-    let reactor = Reactor::<TestScope, ()>::new(16, (), &env);
+    let reactor = Reactor::<TestScope>::new(16, &env);
     let make_slab = || slab_new::<()>(&env, "/alloc-workflows/restart".into(), 16384, 8192, 1024);
     let slab = make_slab();
     let segments = Segments::new(slab.segment_bytes());
@@ -366,7 +366,7 @@ fn idle_pool_adapts_to_demand_and_constraint() {
 fn bound_io_rejects_foreign_tables_and_ranges_appended_after_lease_acquisition() {
     let simulation = racer_io::sim::SimOs::new();
     let env = racer_io::Env::sim(&simulation, racer_io::WorkerCtx::host());
-    let reactor = Reactor::<TestScope, ()>::new(16, (), &env);
+    let reactor = Reactor::<TestScope>::new(16, &env);
     let slab = slab_new::<()>(&env, "/alloc-workflows/bound".into(), 16384, 8192, 512);
     let segments = Segments::new(slab.segment_bytes());
     let alignment = slab.open_configured(&segments).unwrap();
@@ -463,7 +463,7 @@ fn restore_waits_for_freeze_guard_and_abandoned_write_completion_independently()
         let simulation = racer_io::sim::SimOs::new();
         simulation.set_cancel_first(cancel_first);
         let env = racer_io::Env::sim(&simulation, racer_io::WorkerCtx::host());
-        let reactor = Reactor::<TestScope, ()>::new(16, (), &env);
+        let reactor = Reactor::<TestScope>::new(16, &env);
         let slab = slab_new::<()>(&env, "/alloc-workflows/freeze".into(), 8192, 4096, 512);
         let segments = Segments::new(slab.segment_bytes());
         let alignment = slab.open_configured(&segments).unwrap();
@@ -519,7 +519,7 @@ fn roundtrip_short_io_and_runtime_errors() {
     let sim = racer_io::sim::SimOs::new();
     let env = racer_io::Env::sim(&sim, racer_io::WorkerCtx::host());
     let (slab, segments) = setup::<()>(&env);
-    let reactor = Reactor::<TestScope, ()>::new(16, (), &env);
+    let reactor = Reactor::<TestScope>::new(16, &env);
     let (lease, extent) = segments.append(4096).unwrap();
     let mut buffer = slab.allocate(extent.length(), ()).unwrap();
     buffer.as_mut_slice().fill(42);
@@ -585,7 +585,7 @@ fn abandoned_write_retains_lease_charges_and_counter_until_completion() {
         sim.set_cancel_first(cancel_first);
         let env = racer_io::Env::sim(&sim, racer_io::WorkerCtx::host());
         let (slab, segments) = setup::<CountingCharge>(&env);
-        let reactor = Reactor::<TestScope, ()>::new(16, (), &env);
+        let reactor = Reactor::<TestScope>::new(16, &env);
         let used = Rc::new(Cell::new(0));
         let (lease, extent) = segments.append(4096).unwrap();
         let mut buffer = slab
@@ -633,7 +633,7 @@ fn abandoned_read_and_unpolled_write_release_at_the_correct_fence() {
     let sim = racer_io::sim::SimOs::new();
     let env = racer_io::Env::sim(&sim, racer_io::WorkerCtx::host());
     let (slab, segments) = setup::<()>(&env);
-    let reactor = Reactor::<TestScope, ()>::new(16, (), &env);
+    let reactor = Reactor::<TestScope>::new(16, &env);
     let (lease, extent) = segments.append(4096).unwrap();
     let op = slab.write(
         &reactor,
@@ -728,7 +728,7 @@ fn replacement_hooks_are_fallible_and_refuse_live_writes() {
         Err(Error::Unavailable)
     );
     let (slab, segments) = setup::<()>(&env);
-    let reactor = Reactor::<TestScope, ()>::new(16, (), &env);
+    let reactor = Reactor::<TestScope>::new(16, &env);
     let (lease, extent) = segments.append(4096).unwrap();
     sim.inject("write", Fault::HoldCompletion(8)).unwrap();
     let mut write = slab.write(
@@ -867,7 +867,7 @@ fn kernel_available() -> bool {
 
 /// Drive real I/O with a strict in-test deadline as well as the external test timeout.
 fn drive_real<T>(
-    reactor: &Reactor<TestScope, ()>,
+    reactor: &Reactor<TestScope>,
     mut op: Operation<'_, T, TestError>,
 ) -> Result<T, TestError> {
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
@@ -904,7 +904,7 @@ fn io_uring_roundtrip_and_completion_fence() {
     );
     let segments = Segments::new(segment_bytes);
     assert_eq!(slab.open_configured(&segments), Ok(alignment));
-    let reactor = Reactor::<TestScope, ()>::new(16, (), &racer_io::Env::host());
+    let reactor = Reactor::<TestScope>::new(16, &racer_io::Env::host());
     reactor.init().unwrap();
     let (lease, extent) = segments.append(segment_bytes as usize).unwrap();
     let mut buffer = slab.allocate(extent.length(), ()).unwrap();
@@ -1070,7 +1070,7 @@ fn device_placements_route_real_io_and_reject_short_reads() {
     assert_eq!(slab.alignment(), Err(Error::Unavailable));
     let segments = Segments::new(segment_bytes);
     assert_eq!(slab.open_configured(&segments), Ok(alignment));
-    let reactor = Reactor::<TestScope, ()>::new(16, (), &racer_io::Env::host());
+    let reactor = Reactor::<TestScope>::new(16, &racer_io::Env::host());
     reactor.init().unwrap();
     for id in 0..3 {
         for half in 0..2 {
@@ -1183,7 +1183,7 @@ fn unbound_and_failed_binding_reject_reads_and_writes_before_reactor_admission()
         let correct = Segments::from_geometry(slab.geometry().unwrap()).unwrap();
         let (lease, extent) = correct.append(segment_bytes as usize).unwrap();
         let buffer = slab.allocate(extent.length(), ()).unwrap();
-        let reactor = Reactor::<TestScope, ()>::new(16, (), &racer_io::Env::host());
+        let reactor = Reactor::<TestScope>::new(16, &racer_io::Env::host());
         let mut read = slab.read(&reactor, extent, buffer, lease, &TestScope);
         assert!(matches!(
             poll(&mut read),
@@ -1216,7 +1216,7 @@ fn unbound_and_failed_binding_reject_reads_and_writes_before_reactor_admission()
 fn partial_table_reclamation_changes_authority_without_erasing_storage() {
     let simulation = racer_io::sim::SimOs::new();
     let env = racer_io::Env::sim(&simulation, racer_io::WorkerCtx::host());
-    let reactor = Reactor::<TestScope, ()>::new(16, (), &env);
+    let reactor = Reactor::<TestScope>::new(16, &env);
     let slab = slab_new::<()>(&env, "/alloc-workflows/partial".into(), 16384, 4096, 512);
     let alignment = slab.open_now().unwrap();
     let physical = slab.geometry().unwrap();
@@ -1369,7 +1369,7 @@ fn vectored_write_roundtrip_validation_and_faults() {
     let unit = slab.open_configured(&segments).unwrap().length();
     assert!(unit * 2 <= 16384);
     let total = 2 * unit;
-    let reactor = Reactor::<TestScope, ()>::new(16, (), &env);
+    let reactor = Reactor::<TestScope>::new(16, &env);
     let (lease, extent) = segments.append(total).unwrap();
     let lease_again = || segments.lease(SegmentId(0), Generation(1)).unwrap();
     let header = |len: usize| {

@@ -2,6 +2,7 @@
 
 use racer_io::Error;
 use racer_io::cancel::Cancellation;
+use racer_io::scoped::Reactor;
 use racer_io::{Operation, Scope};
 use std::{
     cell::RefCell,
@@ -15,7 +16,6 @@ use telemetry::{
     Lease, Metrics, Ring,
     server::{self, Event, Handler, Response, Server},
 };
-use uring_runtime::reactor::Reactor;
 
 telemetry::metrics! { Counter, COUNTERS, COUNTER_COUNT;
     Self::Completed => "completed_total",
@@ -214,7 +214,7 @@ fn exchange(
     address: SocketAddr,
     path: &str,
     service: &mut Operation<'_, (), Error>,
-    reactor: &Reactor<RequestScope, ()>,
+    reactor: &Reactor<RequestScope>,
 ) -> Vec<u8> {
     exchange_request(
         address,
@@ -229,7 +229,7 @@ fn exchange_request(
     address: SocketAddr,
     request: &[u8],
     service: &mut Operation<'_, (), Error>,
-    reactor: &Reactor<RequestScope, ()>,
+    reactor: &Reactor<RequestScope>,
 ) -> Vec<u8> {
     let mut socket = TcpStream::connect_timeout(&address, Duration::from_secs(1)).unwrap();
     socket
@@ -258,7 +258,7 @@ fn exchange_request(
 /// Output failure must close only that connection without sending private partial text.
 #[test]
 fn failed_and_oversized_handler_output_closes_only_that_connection() {
-    let reactor = Reactor::<RequestScope, ()>::new(8, (), &racer_io::Env::host());
+    let reactor = Reactor::<RequestScope>::new(8, &racer_io::Env::host());
     let submissions = reactor
         .reserve_submissions(server::CONTROL_SLOTS, ())
         .unwrap();
@@ -317,7 +317,7 @@ fn failed_and_oversized_handler_output_closes_only_that_connection() {
 /// terminator is rejected, and both exchanges release their connection lease.
 #[test]
 fn exact_request_limit_distinguishes_complete_and_unterminated_headers() {
-    let reactor = Reactor::<RequestScope, ()>::new(8, (), &racer_io::Env::host());
+    let reactor = Reactor::<RequestScope>::new(8, &racer_io::Env::host());
     let submissions = reactor
         .reserve_submissions(server::CONTROL_SLOTS, ())
         .unwrap();
@@ -383,7 +383,7 @@ fn exact_request_limit_distinguishes_complete_and_unterminated_headers() {
 }
 
 /// Fence every abandoned operation after releasing the service and its owner.
-fn drain(reactor: &Reactor<RequestScope, ()>) {
+fn drain(reactor: &Reactor<RequestScope>) {
     let mut cx = Context::from_waker(Waker::noop());
     let mut drain = reactor.drain();
     let deadline = Instant::now() + Duration::from_secs(3);

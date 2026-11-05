@@ -20,6 +20,7 @@
 //! kind, and observes fixed transport events. Application routes, trusted response
 //! bodies, health, metric names, and connection admission remain with the caller.
 use racer_io::Operation;
+use racer_io::scoped::{Reactor, SUBMISSION_BYTES, SubmissionCapacity, descriptor::Descriptor};
 use racer_io::{Error, Result, ring::IoBuffer};
 use std::{
     cell::Cell,
@@ -28,10 +29,6 @@ use std::{
     rc::Rc,
     task::Poll,
     time::{Duration, Instant},
-};
-use uring_runtime::{
-    Budget,
-    reactor::{Reactor, SUBMISSION_BYTES, SubmissionCapacity, descriptor::Descriptor},
 };
 use zeroize::{Zeroize, Zeroizing};
 
@@ -311,9 +308,9 @@ impl Server {
 
     /// Poll alongside the reactor, at least every 10ms during queue pressure.
     /// Dropping this future abandons work, not ownership: drain the reactor.
-    pub fn serve<'a, S: Scope, B: Budget, H: Handler>(
+    pub fn serve<'a, S: Scope, H: Handler>(
         &'a self,
-        reactor: &'a Reactor<S, B>,
+        reactor: &'a Reactor<S>,
         listener: Descriptor,
         handler: &'a H,
         scope: &'a S,
@@ -397,9 +394,9 @@ impl Server {
     }
 
     /// Read one request, scrub it, and send one response under a shared deadline.
-    fn exchange<'a, S: Scope, B: Budget, H: Handler>(
+    fn exchange<'a, S: Scope, H: Handler>(
         &'a self,
-        reactor: &'a Reactor<S, B>,
+        reactor: &'a Reactor<S>,
         handler: &'a H,
         fd: Rc<Descriptor>,
         mut buffer: Buffer<H::Connection>,
@@ -486,9 +483,9 @@ impl Server {
     }
 
     /// Send a streamed body as fixed-width HTTP chunks, one buffer at a time.
-    async fn stream_exchange<S: Scope, B: Budget, C: 'static>(
+    async fn stream_exchange<S: Scope, C: 'static>(
         &self,
-        reactor: &Reactor<S, B>,
+        reactor: &Reactor<S>,
         fd: Rc<Descriptor>,
         mut buffer: Buffer<C>,
         scope: &S,
@@ -530,9 +527,9 @@ impl Server {
         }
     }
 
-    async fn binary_exchange<S: Scope, B: Budget, C: 'static>(
+    async fn binary_exchange<S: Scope, C: 'static>(
         &self,
-        reactor: &Reactor<S, B>,
+        reactor: &Reactor<S>,
         fd: Rc<Descriptor>,
         mut buffer: Buffer<C>,
         parent: &S,
@@ -1027,7 +1024,7 @@ mod tests {
             racer_io::SimClock::new_at(1, Instant::now(), std::time::SystemTime::UNIX_EPOCH);
         let sim_ctx = clock.ctx(0);
         let env = racer_io::Env::new(racer_io::Driver::Uring, sim_ctx.clone());
-        let reactor = Reactor::<TestScope, ()>::new(12, (), &env);
+        let reactor = Reactor::<TestScope>::new(12, &env);
         let owner = setup(
             reactor
                 .reserve_submissions(
@@ -1201,7 +1198,7 @@ mod tests {
         let sim = racer_io::sim::SimOs::new();
         sim.set_stream_capacity(32).unwrap();
         let env = racer_io::Env::sim(&sim, racer_io::WorkerCtx::host());
-        let reactor = Reactor::<TestScope, ()>::new(12, (), &env);
+        let reactor = Reactor::<TestScope>::new(12, &env);
         let submissions = reactor
             .reserve_submissions(CONTROL_SLOTS + BINARY_CONTROL_SLOTS, ())
             .unwrap();
@@ -1322,7 +1319,7 @@ mod tests {
             let clock = racer_io::SimClock::new_at(1, now, std::time::SystemTime::UNIX_EPOCH);
             let sim_ctx = clock.ctx(0);
             let env = racer_io::Env::new(racer_io::Driver::Uring, sim_ctx.clone());
-            let reactor = Reactor::<TestScope, ()>::new(12, (), &env);
+            let reactor = Reactor::<TestScope>::new(12, &env);
             let submissions = reactor
                 .reserve_submissions(CONTROL_SLOTS + BINARY_CONTROL_SLOTS, ())
                 .unwrap();
@@ -1546,7 +1543,7 @@ mod tests {
         let buffer_bytes = (MAX_CONNECTIONS + 1) * MAX_RESPONSE_BYTES;
         assert_eq!(
             RESERVED_BYTES - buffer_bytes,
-            CONTROL_SLOTS * uring_runtime::reactor::SUBMISSION_BYTES
+            CONTROL_SLOTS * racer_io::scoped::SUBMISSION_BYTES
         );
     }
 
@@ -1831,7 +1828,7 @@ mod tests {
     /// Exercise partial progress and invalid completion sizes against the same range.
     #[test]
     fn completion_progress_preserves_bounds_on_failure() {
-        let reactor = Reactor::<TestScope, ()>::new(8, (), &racer_io::Env::host());
+        let reactor = Reactor::<TestScope>::new(8, &racer_io::Env::host());
         let submissions = reactor.reserve_submissions(CONTROL_SLOTS, ()).unwrap();
         let owner = Server::new(submissions, ());
         let mut buffer = owner.buffer(&Routes::default()).unwrap();
@@ -1974,7 +1971,7 @@ mod tests {
         let sim_ctx = clock.ctx(0);
         let simulation = racer_io::sim::SimOs::new();
         let env = racer_io::Env::sim(&simulation, sim_ctx.clone());
-        let reactor = Reactor::<TestScope, ()>::new(8, (), &env);
+        let reactor = Reactor::<TestScope>::new(8, &env);
         let submissions = reactor.reserve_submissions(CONTROL_SLOTS, ()).unwrap();
         let owner = Server::new(submissions, ());
         let connections = Rc::new(Cell::new(0));
@@ -2031,7 +2028,7 @@ mod tests {
             let sim_ctx = clock.ctx(0);
             let simulation = racer_io::sim::SimOs::new();
             let env = racer_io::Env::sim(&simulation, sim_ctx.clone());
-            let reactor = Reactor::<TestScope, ()>::new(8, (), &env);
+            let reactor = Reactor::<TestScope>::new(8, &env);
             let submissions = reactor.reserve_submissions(CONTROL_SLOTS, ()).unwrap();
             let owner = Server::new(submissions, ());
             let handler = Routes::default();
@@ -2077,7 +2074,7 @@ mod tests {
         let sim_ctx = clock.ctx(0);
         let simulation = racer_io::sim::SimOs::new();
         let env = racer_io::Env::sim(&simulation, sim_ctx.clone());
-        let reactor = Reactor::<TestScope, ()>::new(8, (), &env);
+        let reactor = Reactor::<TestScope>::new(8, &env);
         let memory = Rc::new(Cell::new(0));
         let control = Rc::new(Cell::new(0));
         let connections = Rc::new(Cell::new(0));
@@ -2181,7 +2178,7 @@ mod tests {
             net::{TcpListener, TcpStream},
             task::{Context, Waker},
         };
-        let reactor = Reactor::<TestScope, ()>::new(8, (), &racer_io::Env::host());
+        let reactor = Reactor::<TestScope>::new(8, &racer_io::Env::host());
         let memory = Rc::new(Cell::new(0));
         let control = Rc::new(Cell::new(0));
         let connections = Rc::new(Cell::new(0));
@@ -2277,7 +2274,7 @@ mod tests {
             net::{TcpListener, TcpStream},
             task::{Context, Waker},
         };
-        let reactor = Reactor::<TestScope, ()>::new(8, (), &racer_io::Env::host());
+        let reactor = Reactor::<TestScope>::new(8, &racer_io::Env::host());
         let memory = Rc::new(Cell::new(0));
         let control = Rc::new(Cell::new(0));
         let connections = Rc::new(Cell::new(0));

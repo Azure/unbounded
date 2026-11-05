@@ -53,9 +53,9 @@ impl DiagnosticIo {
         let mut memory = admission.reserve(
             None,
             ResourceClass::RequestContext,
-            RESERVED_BYTES + (slots - CONTROL_SLOTS) * uring_runtime::reactor::SUBMISSION_BYTES,
+            RESERVED_BYTES + (slots - CONTROL_SLOTS) * racer_io::scoped::SUBMISSION_BYTES,
         )?;
-        let bookkeeping = memory.split(slots * uring_runtime::reactor::SUBMISSION_BYTES)?;
+        let bookkeeping = memory.split(slots * racer_io::scoped::SUBMISSION_BYTES)?;
         let submissions = reactor.reserve_submissions(control, bookkeeping)?;
         // The hardware report is always available, independent of pprof, with its
         // own single in-flight slot so a running profile never makes it busy. Its
@@ -611,7 +611,7 @@ mod encode_report_tests {
         assert_eq!(
             RESERVED_BYTES,
             server::RESERVED_BYTES
-                + server::JSON_CONTROL_SLOTS * uring_runtime::reactor::SUBMISSION_BYTES
+                + server::JSON_CONTROL_SLOTS * racer_io::scoped::SUBMISSION_BYTES
                 + HARDWARE_BODY_BYTES
                 + crate::hardware::WORKING_BYTES
                 + HARDWARE_STACK_BYTES
@@ -2105,7 +2105,7 @@ mod tests {
                     admission.used(ResourceClass::RequestContext) - baseline,
                     RESERVED_BYTES
                         + if enabled {
-                            server::BINARY_CONTROL_SLOTS * uring_runtime::reactor::SUBMISSION_BYTES
+                            server::BINARY_CONTROL_SLOTS * racer_io::scoped::SUBMISSION_BYTES
                         } else {
                             0
                         }

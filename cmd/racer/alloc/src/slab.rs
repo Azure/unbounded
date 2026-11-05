@@ -11,6 +11,7 @@ use crate::{
     Segments,
 };
 use racer_io::ring::SharedWriteBuffer;
+use racer_io::scoped::{Reactor, descriptor::Descriptor};
 use racer_io::{Operation, Scope};
 use std::{
     cell::{Cell, RefCell},
@@ -27,10 +28,6 @@ use std::{
     rc::Rc,
     sync::Arc,
     task::{Context, Poll, Waker},
-};
-use uring_runtime::{
-    Budget,
-    reactor::{Reactor, descriptor::Descriptor},
 };
 
 /// One logical segment's range on a caller-opened device.
@@ -666,9 +663,9 @@ impl<C: Charge> Slab<C> {
     /// generation. Append only reserves space; recycled bytes may come from an
     /// earlier generation or a different cache. Before exposing a valid record,
     /// the caller must check its integrity, authentication, and cache identity.
-    pub fn read<'a, S: Scope, B: Budget>(
+    pub fn read<'a, S: Scope>(
         &'a self,
-        reactor: &'a Reactor<S, B>,
+        reactor: &'a Reactor<S>,
         extent: Extent,
         buffer: AlignedBuffer<C>,
         lease: SegmentLease,
@@ -691,9 +688,9 @@ impl<C: Charge> Slab<C> {
     /// validates them. The buffer's length must equal the extent length and its
     /// first byte must meet the slab's memory alignment. Unlike [`Self::read`],
     /// dropping the returned buffer returns its storage to the owning pool.
-    pub fn read_buf<'a, D: Charge, S: Scope, B: Budget>(
+    pub fn read_buf<'a, D: Charge, S: Scope>(
         &'a self,
-        reactor: &'a Reactor<S, B>,
+        reactor: &'a Reactor<S>,
         extent: Extent,
         buffer: crate::buf::Buf<D>,
         lease: SegmentLease,
@@ -729,9 +726,9 @@ impl<C: Charge> Slab<C> {
     /// [`Segments::lease`]; it does not grant exclusive record ownership. The trusted
     /// caller must write only reserved extents it owns, never overwrite published or
     /// readable records, and publish a mapping only after the write succeeds.
-    pub fn write<'a, S: Scope, B: Budget>(
+    pub fn write<'a, S: Scope>(
         &'a self,
-        reactor: &'a Reactor<S, B>,
+        reactor: &'a Reactor<S>,
         extent: Extent,
         buffer: AlignedBuffer<C>,
         lease: SegmentLease,
@@ -755,9 +752,9 @@ impl<C: Charge> Slab<C> {
     /// sum to the extent length. Fencing, lease ownership, and the caller
     /// obligations match [`Self::write`]. A short or failed completion is an
     /// error and drops both owners after completion; success returns them.
-    pub fn write_vectored<'a, S: Scope, B: Budget, T: SharedWriteBuffer>(
+    pub fn write_vectored<'a, S: Scope, T: SharedWriteBuffer>(
         &'a self,
-        reactor: &'a Reactor<S, B>,
+        reactor: &'a Reactor<S>,
         extent: Extent,
         header: AlignedBuffer<C>,
         body: T,
@@ -889,9 +886,9 @@ struct Submission<C: Charge> {
 
 impl<C: Charge> Submission<C> {
     /// Move the complete read capability into the reactor's completion ownership.
-    async fn read<S: Scope, B: Budget>(
+    async fn read<S: Scope>(
         self,
-        reactor: &Reactor<S, B>,
+        reactor: &Reactor<S>,
         scope: &S,
     ) -> std::result::Result<AlignedBuffer<C>, S::Error>
     where
@@ -910,9 +907,9 @@ impl<C: Charge> Submission<C> {
     }
 
     /// Move the write capability and its counter guard into completion ownership.
-    async fn write<S: Scope, B: Budget>(
+    async fn write<S: Scope>(
         self,
-        reactor: &Reactor<S, B>,
+        reactor: &Reactor<S>,
         scope: &S,
         fence: WriteFence,
     ) -> std::result::Result<AlignedBuffer<C>, S::Error>
@@ -1721,7 +1718,7 @@ mod tests {
         };
         placements[0].file = Rc::new(descriptor);
         drop(opened);
-        let reactor = Reactor::<TestScope, ()>::new(16, (), &env);
+        let reactor = Reactor::<TestScope>::new(16, &env);
         for write in [false, true] {
             for (fault, expected) in [
                 (Fault::Short(512), TestError::Alloc(Error::Io)),

@@ -361,6 +361,7 @@ pub mod delivery {
         use super::super::fixtures::{Failure, Key, TestScope};
         use super::*;
         use crate::Error;
+        use racer_io::scoped::Reactor;
         use std::{
             cell::{Cell, RefCell},
             future::Future,
@@ -370,7 +371,6 @@ pub mod delivery {
             task::Waker,
             time::Duration,
         };
-        use uring_runtime::reactor::Reactor;
 
         /// Permissive context with reference-counted connection admission.
         struct Caller;
@@ -380,9 +380,7 @@ pub mod delivery {
 
             type Scope = TestScope;
 
-            type Budget = ();
-
-            type Reactor = Rc<Reactor<TestScope, ()>>;
+            type Reactor = Rc<Reactor<TestScope>>;
 
             type Charge = ();
 
@@ -537,7 +535,7 @@ pub mod delivery {
 
         #[test]
         fn direct_delivery_large_chunks_preserve_bytes_without_pipe_calls() {
-            let reactor = Rc::new(Reactor::new(16, (), &racer_io::Env::host()));
+            let reactor = Rc::new(Reactor::new(16, &racer_io::Env::host()));
             let (connection, mut peer, _) = connection();
             let bytes = Rc::new(vec![91; 16 * 1024 * 1024]);
             let expected = bytes.len();
@@ -571,7 +569,7 @@ pub mod delivery {
         #[test]
         fn direct_delivery_empty_and_rejected_scope_never_touch_pipe() {
             for empty in [false, true] {
-                let reactor = Rc::new(Reactor::new(16, (), &racer_io::Env::host()));
+                let reactor = Rc::new(Reactor::new(16, &racer_io::Env::host()));
                 let (connection, _peer, slot) = connection();
                 let observer = Observe::default();
                 observer.scope_error.set(true);
@@ -595,7 +593,7 @@ pub mod delivery {
 
         #[test]
         fn direct_abandonment_retains_view_and_connection_until_fence() {
-            let reactor = Rc::new(Reactor::new(16, (), &racer_io::Env::host()));
+            let reactor = Rc::new(Reactor::new(16, &racer_io::Env::host()));
             reactor.init().unwrap();
             let (connection, _peer, slot) = connection();
             while connection.socket().try_send(&[0; 8192]).is_ok() {}
@@ -692,7 +690,7 @@ pub mod delivery {
         }
 
         /// Poll a future and its reactor under the delivery watchdog.
-        fn drive<T>(reactor: &Reactor<TestScope, ()>, future: impl Future<Output = T>) -> T {
+        fn drive<T>(reactor: &Reactor<TestScope>, future: impl Future<Output = T>) -> T {
             let mut future = std::pin::pin!(future);
             let mut cx = std::task::Context::from_waker(Waker::noop());
             let until = Instant::now() + Duration::from_secs(2);
@@ -708,7 +706,7 @@ pub mod delivery {
         /// Fallback must reconstruct the unaccepted body rather than replay staging.
         #[test]
         fn partial_pipe_fallback_resumes_at_accepted_not_staged_cursor() {
-            let reactor = Rc::new(Reactor::new(16, (), &racer_io::Env::host()));
+            let reactor = Rc::new(Reactor::new(16, &racer_io::Env::host()));
             let (connection, mut peer, _) = connection();
             let observer = Observe::default();
             let owner = Reader {
@@ -743,7 +741,7 @@ pub mod delivery {
         /// An interrupted drain yields without submission or resetting the stall clock.
         #[test]
         fn drain_interruption_yields_then_owned_send_observes_in_order() {
-            let reactor = Rc::new(Reactor::new(16, (), &racer_io::Env::host()));
+            let reactor = Rc::new(Reactor::new(16, &racer_io::Env::host()));
             let (connection, mut peer, _) = connection();
             let observer = Observe::default();
             let owner = Reader {
@@ -788,7 +786,7 @@ pub mod delivery {
         #[test]
         fn short_drain_scope_rejection_and_completion_rejection_do_not_advance() {
             for failure in ["drain", "scope", "completion"] {
-                let reactor = Rc::new(Reactor::new(16, (), &racer_io::Env::host()));
+                let reactor = Rc::new(Reactor::new(16, &racer_io::Env::host()));
                 let (connection, _peer, weak) = connection();
                 let observer = Observe::default();
                 observer.scope_error.set(failure == "scope");
@@ -826,7 +824,7 @@ pub mod delivery {
         /// Interrupted staging yields, while an exhausted reader does not consult policy.
         #[test]
         fn interrupted_write_yields_and_empty_delivery_does_not_consult_scope() {
-            let reactor = Rc::new(Reactor::new(16, (), &racer_io::Env::host()));
+            let reactor = Rc::new(Reactor::new(16, &racer_io::Env::host()));
             let (connection, _peer, _) = connection();
             let observer = Observe::default();
             let owner = Reader {
@@ -862,7 +860,7 @@ pub mod delivery {
         #[test]
         fn abandoned_owned_send_keeps_backing_and_connection_until_fence() {
             use std::os::fd::AsRawFd;
-            let reactor = Rc::new(Reactor::new(16, (), &racer_io::Env::host()));
+            let reactor = Rc::new(Reactor::new(16, &racer_io::Env::host()));
             reactor.init().unwrap();
             let (connection, _peer, slot) = connection();
             let size: libc::c_int = 4096;
@@ -916,7 +914,7 @@ pub mod delivery {
         /// Writable short sends yield at the call budget without submitting readiness.
         #[test]
         fn writable_pipe_yields_at_call_budget_and_retains_accepted_cursor() {
-            let reactor = Rc::new(Reactor::new(16, (), &racer_io::Env::host()));
+            let reactor = Rc::new(Reactor::new(16, &racer_io::Env::host()));
             let (connection, mut peer, _) = connection();
             let observer = Observe::default();
             let owner = Reader {
@@ -1285,6 +1283,7 @@ pub mod relay {
         use super::super::fixtures::{Failure, Key, TestScope};
         use super::*;
         use crate::{Codec, Error};
+        use racer_io::scoped::Reactor;
         use std::{
             cell::{Cell, RefCell},
             io::{Read, Write},
@@ -1292,7 +1291,6 @@ pub mod relay {
             task::{Poll, Waker},
             time::{Duration, Instant},
         };
-        use uring_runtime::reactor::Reactor;
 
         /// Counted admission returned to its ledger on drop.
         struct Charge(Rc<Cell<usize>>, usize);
@@ -1319,9 +1317,7 @@ pub mod relay {
 
             type Scope = TestScope;
 
-            type Budget = ();
-
-            type Reactor = Rc<Reactor<TestScope, ()>>;
+            type Reactor = Rc<Reactor<TestScope>>;
 
             type Charge = Charge;
 
@@ -1436,7 +1432,7 @@ pub mod relay {
             fn new() -> Self {
                 let hooks = Rc::new(Hooks::default());
                 let io = HttpIo::new(
-                    Rc::new(Rc::new(Reactor::new(16, (), &racer_io::Env::host()))),
+                    Rc::new(Rc::new(Reactor::new(16, &racer_io::Env::host()))),
                     Codec::new(128),
                     hooks.clone(),
                     64,

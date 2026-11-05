@@ -1,6 +1,21 @@
 //! Filesystem SQEs use the parent reactor's original/cancel completion fences.
 //! Every pointer backing, descriptor, and quota lives in the submission closure.
-use super::*;
+#[cfg(feature = "simulation")]
+use crate::reactor::simulation;
+use crate::{Error, Operation, Result, Scope};
+use racer_io::{
+    ring::{IoBuffer, IoId},
+    scoped::{Reactor, SubmissionKind, descriptor::Descriptor},
+};
+#[cfg(test)]
+use std::time::Duration;
+use std::{
+    cell::{Cell, RefCell},
+    future::Future,
+    pin::Pin,
+    rc::Rc,
+    task::{Context, Poll},
+};
 use std::{ffi::CString, num::NonZeroUsize, ops::Deref};
 #[allow(unused_imports)]
 use std::{
@@ -15,6 +30,17 @@ use zeroize::Zeroize;
 pub mod checkpoint;
 pub mod operations;
 
+#[cfg(all(test, feature = "simulation"))]
+mod fixtures;
+
+pub use operations::ReplaceFiles;
+pub use secure::SecureFiles;
+
+/// The filesystem operation traits, for `use ...::prelude::*`.
+pub mod prelude {
+    pub use super::{Files, ReplaceFiles, SecureFiles};
+}
+
 /// Stable, quota-owning I/O storage with a cursor for partial writes.
 /// The entire allocation is zeroized on drop, including already consumed bytes.
 pub struct Buffer {
@@ -23,8 +49,6 @@ pub struct Buffer {
     start: usize,
 
     end: usize,
-
-    _quota: Charge,
 }
 
 /// Read output owns its admission charge until drop. Storage is allocated once,
@@ -92,7 +116,7 @@ impl Buffer {
 
     /// Allocate initialized storage without imposing an SQE-sized upper bound.
     /// Bounded read output can exceed one SQE; submission buffers cannot.
-    fn allocate(length: usize, quota: Charge) -> Result<Self> {
+    fn allocate(length: usize) -> Result<Self> {
         let mut data = Vec::new();
         data.try_reserve_exact(length)
             .map_err(|_| Error::Overloaded)?;
@@ -101,23 +125,83 @@ impl Buffer {
             data,
             start: 0,
             end: length,
-            _quota: quota,
         })
     }
 }
 
-impl<S: Scope, B: Budget> Reactor<S, B> {
+/// Descriptor filesystem operations sharing the reactor's completion fences.
+pub trait Files<S: Scope> {
     /// Allocate zero-initialized, quota-owning storage sized for one I/O submission.
-    pub fn file_buffer(&self, length: usize) -> Result<Buffer> {
+    fn file_buffer(&self, length: usize) -> Result<Buffer>;
+
+    /// Copy caller bytes into stable, zeroizing storage charged to this reactor.
+    fn file_bytes(&self, bytes: &[u8]) -> Result<Buffer>;
+
+    /// Read from offset zero through EOF, probing one byte beyond `limit`.
+    /// Output reserves and charges the full caller-selected limit up front.
+    /// Callers validate type, permissions, and service ceilings before calling.
+    fn file_read_bounded<'a>(
+        &'a self,
+        fd: Rc<Descriptor>,
+        limit: usize,
+        chunk: NonZeroUsize,
+        scope: &'a S,
+    ) -> Operation<'a, ReadBuffer, S::Error>;
+
+    /// Open a pathname relative to `dir` (or the working directory). Created
+    /// files are owner-only (0600, reduced by umask). O_PATH accepts only
+    /// DIRECTORY/NOFOLLOW/CLOEXEC, without forced NONBLOCK. Linux's 4096-byte
+    /// path limit includes NUL; filesystem NAME_MAX still applies.
+    fn file_open<'a>(
+        &'a self,
+        dir: Option<Rc<Descriptor>>,
+        path: CString,
+        flags: i32,
+        resolve: u64,
+        scope: &'a S,
+    ) -> Operation<'a, Rc<Descriptor>, S::Error>;
+
+    /// Read basic metadata through an owned descriptor.
+    fn file_stat<'a>(
+        &'a self,
+        fd: Rc<Descriptor>,
+        scope: &'a S,
+    ) -> Operation<'a, libc::statx, S::Error>;
+
+    /// Sync a file or directory while retaining its descriptor through the CQE fence.
+    fn file_sync<'a>(&'a self, fd: Rc<Descriptor>, scope: &'a S) -> Operation<'a, (), S::Error>;
+
+    /// Rename within a pinned directory; cancellation is not proof it did not execute.
+    /// Callers own name validation, namespace serialization, and durability policy.
+    fn file_rename<'a>(
+        &'a self,
+        dir: Rc<Descriptor>,
+        from: CString,
+        to: CString,
+        scope: &'a S,
+    ) -> Operation<'a, (), S::Error>;
+
+    /// Unlink relative to a pinned parent without an implicit directory sync.
+    fn file_unlink<'a>(
+        &'a self,
+        dir: Rc<Descriptor>,
+        name: CString,
+        scope: &'a S,
+    ) -> Operation<'a, (), S::Error>;
+}
+
+impl<S: Scope> Files<S> for Reactor<S> {
+    /// Allocate zero-initialized, quota-owning storage sized for one I/O submission.
+    fn file_buffer(&self, length: usize) -> Result<Buffer> {
         // SQE read/write lengths are u32, not an application-specific 1 MiB cap.
         if length > u32::MAX as usize {
             return Err(Error::Overloaded);
         }
-        Buffer::allocate(length, self.charge(length)?)
+        Buffer::allocate(length)
     }
 
     /// Copy caller bytes into stable, zeroizing storage charged to this reactor.
-    pub fn file_bytes(&self, bytes: &[u8]) -> Result<Buffer> {
+    fn file_bytes(&self, bytes: &[u8]) -> Result<Buffer> {
         let mut buffer = self.file_buffer(bytes.len())?;
         buffer.data.copy_from_slice(bytes);
         Ok(buffer)
@@ -126,7 +210,7 @@ impl<S: Scope, B: Budget> Reactor<S, B> {
     /// Read from offset zero through EOF, probing one byte beyond `limit`.
     /// Output reserves and charges the full caller-selected limit up front.
     /// Callers validate type, permissions, and service ceilings before calling.
-    pub fn file_read_bounded<'a>(
+    fn file_read_bounded<'a>(
         &'a self,
         fd: Rc<Descriptor>,
         limit: usize,
@@ -136,7 +220,7 @@ impl<S: Scope, B: Budget> Reactor<S, B> {
         Box::pin(async move {
             let probe = limit.checked_add(1).ok_or(Error::InvalidInput)?;
             let mut out = ReadBuffer {
-                buffer: Buffer::allocate(limit, self.charge(limit)?)?,
+                buffer: Buffer::allocate(limit)?,
             };
             out.buffer.end = 0;
             let mut buffer = self.file_buffer(probe.min(chunk.get()))?;
@@ -165,7 +249,7 @@ impl<S: Scope, B: Budget> Reactor<S, B> {
     /// files are owner-only (0600, reduced by umask). O_PATH accepts only
     /// DIRECTORY/NOFOLLOW/CLOEXEC, without forced NONBLOCK. Linux's 4096-byte
     /// path limit includes NUL; filesystem NAME_MAX still applies.
-    pub fn file_open<'a>(
+    fn file_open<'a>(
         &'a self,
         dir: Option<Rc<Descriptor>>,
         path: CString,
@@ -178,13 +262,12 @@ impl<S: Scope, B: Budget> Reactor<S, B> {
                 return Err(Error::InvalidInput.into());
             }
             open_flags(flags)?;
-            let quota = self.charge(path.as_bytes().len() + 128)?;
             let opened = self
                 .run_holding(
                     scope,
                     None,
                     SubmissionKind::OtherIo,
-                    Some(quota),
+                    None,
                     move |io, ctx| {
                         Deferred::new(io.open(dir, path, flags, resolve, ctx), |f| f.id())
                     },
@@ -196,18 +279,17 @@ impl<S: Scope, B: Budget> Reactor<S, B> {
     }
 
     /// Read basic metadata through an owned descriptor.
-    pub fn file_stat<'a>(
+    fn file_stat<'a>(
         &'a self,
         fd: Rc<Descriptor>,
         scope: &'a S,
     ) -> Operation<'a, libc::statx, S::Error> {
         Box::pin(async move {
-            let quota = self.charge(std::mem::size_of::<libc::statx>())?;
             self.run_holding(
                 scope,
                 None,
                 SubmissionKind::OtherIo,
-                Some(quota),
+                None,
                 move |io, ctx| io.stat(fd, ctx),
                 |f| f.id(),
             )
@@ -216,11 +298,7 @@ impl<S: Scope, B: Budget> Reactor<S, B> {
     }
 
     /// Sync a file or directory while retaining its descriptor through the CQE fence.
-    pub fn file_sync<'a>(
-        &'a self,
-        fd: Rc<Descriptor>,
-        scope: &'a S,
-    ) -> Operation<'a, (), S::Error> {
+    fn file_sync<'a>(&'a self, fd: Rc<Descriptor>, scope: &'a S) -> Operation<'a, (), S::Error> {
         self.run(
             scope,
             None,
@@ -232,7 +310,7 @@ impl<S: Scope, B: Budget> Reactor<S, B> {
 
     /// Rename within a pinned directory; cancellation is not proof it did not execute.
     /// Callers own name validation, namespace serialization, and durability policy.
-    pub(super) fn file_rename<'a>(
+    fn file_rename<'a>(
         &'a self,
         dir: Rc<Descriptor>,
         from: CString,
@@ -240,12 +318,12 @@ impl<S: Scope, B: Budget> Reactor<S, B> {
         scope: &'a S,
     ) -> Operation<'a, (), S::Error> {
         Box::pin(async move {
-            let quota = self.file_path_quota(&[&from, &to])?;
+            self.file_path_check(&[&from, &to])?;
             self.run_holding(
                 scope,
                 None,
                 SubmissionKind::OtherIo,
-                Some(quota),
+                None,
                 move |io, ctx| Deferred::new(io.rename(dir, from, to, 0, ctx), |f| f.id()),
                 Deferred::id,
             )
@@ -254,7 +332,7 @@ impl<S: Scope, B: Budget> Reactor<S, B> {
     }
 
     /// Unlink relative to a pinned parent without an implicit directory sync.
-    pub fn file_unlink<'a>(
+    fn file_unlink<'a>(
         &'a self,
         dir: Rc<Descriptor>,
         name: CString,
@@ -262,7 +340,22 @@ impl<S: Scope, B: Budget> Reactor<S, B> {
     ) -> Operation<'a, (), S::Error> {
         self.file_change(dir, name, NamespaceChange::Unlink, scope)
     }
+}
 
+/// Namespace helpers private to this module.
+trait Namespace<S: Scope> {
+    fn file_change<'a>(
+        &'a self,
+        dir: Rc<Descriptor>,
+        name: CString,
+        change: NamespaceChange,
+        scope: &'a S,
+    ) -> Operation<'a, (), S::Error>;
+
+    fn file_path_check(&self, paths: &[&CString]) -> Result<()>;
+}
+
+impl<S: Scope> Namespace<S> for Reactor<S> {
     /// Retain a relative mutation's descriptor, pathname, and quota as one owner.
     /// Only a fenced kernel errno can satisfy the selected idempotency policy;
     /// scope cancellation and admission failures always propagate unchanged.
@@ -274,14 +367,14 @@ impl<S: Scope, B: Budget> Reactor<S, B> {
         scope: &'a S,
     ) -> Operation<'a, (), S::Error> {
         Box::pin(async move {
-            let quota = self.file_path_quota(&[&name])?;
+            self.file_path_check(&[&name])?;
             match change {
                 NamespaceChange::EnsureDirectory => {
                     self.run_holding(
                         scope,
                         None,
                         SubmissionKind::OtherIo,
-                        Some(quota),
+                        None,
                         move |io, ctx| {
                             Deferred::new(io.mkdir(dir, name, 0o700, true, ctx), |f| f.id())
                         },
@@ -295,7 +388,7 @@ impl<S: Scope, B: Budget> Reactor<S, B> {
                         scope,
                         None,
                         SubmissionKind::OtherIo,
-                        Some(quota),
+                        None,
                         move |io, ctx| {
                             Deferred::new(io.unlink(dir, name, 0, missing_ok, ctx), |f| f.id())
                         },
@@ -307,12 +400,12 @@ impl<S: Scope, B: Budget> Reactor<S, B> {
         })
     }
 
-    /// Validate Linux pathname bounds and charge retained NUL-terminated bytes.
-    fn file_path_quota(&self, paths: &[&CString]) -> Result<Charge> {
+    /// Validate Linux pathname bounds.
+    fn file_path_check(&self, paths: &[&CString]) -> Result<()> {
         if paths.iter().any(|p| p.as_bytes().len() > PATH_BYTES) {
             return Err(Error::InvalidInput);
         }
-        self.charge(paths.iter().map(|p| p.as_bytes_with_nul().len()).sum())
+        Ok(())
     }
 }
 
@@ -435,11 +528,8 @@ pub mod secure {
         /// Caller cancellation and error boundary.
         type Scope: Scope;
 
-        /// Accounting retained by the reactor.
-        type Budget: Budget;
-
         /// Serving worker's explicitly driven reactor.
-        fn reactor(&self) -> &Reactor<Self::Scope, Self::Budget>;
+        fn reactor(&self) -> &Reactor<Self::Scope>;
 
         /// Allocate an independent attempt while retaining parent cancellation/deadline.
         fn fresh_scope(
@@ -461,11 +551,8 @@ pub mod secure {
         /// Preserve the underlying host's cancellation and error policy.
         type Scope = H::Scope;
 
-        /// Preserve the underlying host's retained accounting guards.
-        type Budget = H::Budget;
-
         /// Borrow the same worker-local reactor through shared host ownership.
-        fn reactor(&self) -> &Reactor<Self::Scope, Self::Budget> {
+        fn reactor(&self) -> &Reactor<Self::Scope> {
             (**self).reactor()
         }
 
@@ -564,8 +651,8 @@ pub mod secure {
     }
 
     /// Pin a symlink-free directory, optionally creating and checking private access.
-    pub async fn directory<S: Scope, B: Budget>(
-        r: &Reactor<S, B>,
+    pub async fn directory<S: Scope>(
+        r: &Reactor<S>,
         path: &Path,
         create: bool,
         private: bool,
@@ -582,8 +669,8 @@ pub mod secure {
     }
 
     /// Read a regular file with a 1 MiB ceiling and optional private access checks.
-    pub async fn read_file<S: Scope, B: Budget>(
-        r: &Reactor<S, B>,
+    pub async fn read_file<S: Scope>(
+        r: &Reactor<S>,
         fd: Rc<Descriptor>,
         limit: usize,
         private: bool,
@@ -605,8 +692,8 @@ pub mod secure {
     }
 
     /// Read a projected file, permitting normal symlinks but never magic links.
-    pub async fn read_path<S: Scope, B: Budget>(
-        r: &Reactor<S, B>,
+    pub async fn read_path<S: Scope>(
+        r: &Reactor<S>,
         path: &Path,
         limit: usize,
         scope: &S,
@@ -627,8 +714,8 @@ pub mod secure {
     }
 
     /// Read one direct child without following symlinks or escaping its pinned parent.
-    pub async fn read_at<S: Scope, B: Budget>(
-        r: &Reactor<S, B>,
+    pub async fn read_at<S: Scope>(
+        r: &Reactor<S>,
         dir: &Rc<Descriptor>,
         file: &str,
         limit: usize,
@@ -652,8 +739,8 @@ pub mod secure {
 
     /// Durably replace a bounded file, preserving the exact publication failure phase.
     /// The caller exclusively owns the target and its deterministic stage namespace.
-    pub async fn atomic_write<S: Scope, B: Budget>(
-        r: &Reactor<S, B>,
+    pub async fn atomic_write<S: Scope>(
+        r: &Reactor<S>,
         dir: &Rc<Descriptor>,
         target: &str,
         bytes: &[u8],
@@ -686,8 +773,8 @@ pub mod secure {
     }
 
     /// Remove one child and sync its parent, including when the child was absent.
-    pub async fn remove<S: Scope, B: Budget>(
-        r: &Reactor<S, B>,
+    pub async fn remove<S: Scope>(
+        r: &Reactor<S>,
         dir: &Rc<Descriptor>,
         file: &str,
         scope: &S,
@@ -740,11 +827,45 @@ pub mod secure {
         Ok(())
     }
 
-    impl<S: Scope, B: Budget> Reactor<S, B> {
+    /// Path-walking filesystem operations sharing the reactor's completion fences.
+    pub trait SecureFiles<S: Scope> {
         /// Walk from `/` or `.`, pinning directories and rejecting parent components
         /// and symlinks. Creation uses owner-only mode and syncs each parent even
         /// when its child already exists. Access checks remain caller-owned.
-        pub fn file_directory<'a>(
+        fn file_directory<'a>(
+            &'a self,
+            path: &'a Path,
+            create: bool,
+            path_limit: usize,
+            scope: &'a S,
+        ) -> Operation<'a, Rc<Descriptor>, S::Error>;
+
+        /// Remove a relative component and sync its parent even if it was absent,
+        /// restoring the durability fence after a previously canceled unlink.
+        fn file_remove_synced<'a>(
+            &'a self,
+            directory: Rc<Descriptor>,
+            name: CString,
+            scope: &'a S,
+        ) -> Operation<'a, (), S::Error>;
+
+        /// Remove and fence a stale stage, then exclusively create an owner-only
+        /// file without following symlinks. Naming, serialization, publication,
+        /// and failure cleanup remain caller-owned.
+        fn file_stage<'a>(
+            &'a self,
+            directory: Rc<Descriptor>,
+            temporary: &'a OsStr,
+            name_limit: usize,
+            scope: &'a S,
+        ) -> Operation<'a, Rc<Descriptor>, S::Error>;
+    }
+
+    impl<S: Scope> SecureFiles<S> for Reactor<S> {
+        /// Walk from `/` or `.`, pinning directories and rejecting parent components
+        /// and symlinks. Creation uses owner-only mode and syncs each parent even
+        /// when its child already exists. Access checks remain caller-owned.
+        fn file_directory<'a>(
             &'a self,
             path: &'a Path,
             create: bool,
@@ -802,7 +923,7 @@ pub mod secure {
 
         /// Remove a relative component and sync its parent even if it was absent,
         /// restoring the durability fence after a previously canceled unlink.
-        pub fn file_remove_synced<'a>(
+        fn file_remove_synced<'a>(
             &'a self,
             directory: Rc<Descriptor>,
             name: CString,
@@ -824,7 +945,7 @@ pub mod secure {
         /// Remove and fence a stale stage, then exclusively create an owner-only
         /// file without following symlinks. Naming, serialization, publication,
         /// and failure cleanup remain caller-owned.
-        pub fn file_stage<'a>(
+        fn file_stage<'a>(
             &'a self,
             directory: Rc<Descriptor>,
             temporary: &'a OsStr,
@@ -895,7 +1016,7 @@ pub mod secure {
 
             /// Record fence order and inject pending, failed, and successful host callbacks.
             struct Hosting {
-                reactor: Reactor<Request, ()>,
+                reactor: Reactor<Request>,
 
                 next: Cell<u64>,
 
@@ -912,11 +1033,8 @@ pub mod secure {
                 /// Preserve attempt identity in each fenced scope.
                 type Scope = Request;
 
-                /// This callback-only fixture owns no I/O allocation charges.
-                type Budget = ();
-
                 /// Expose a lazy reactor without allocating a kernel ring.
-                fn reactor(&self) -> &Reactor<Request, ()> {
+                fn reactor(&self) -> &Reactor<Request> {
                     &self.reactor
                 }
 
@@ -951,7 +1069,7 @@ pub mod secure {
             }
 
             let host = Rc::new(Hosting {
-                reactor: Reactor::new(4, (), &crate::reactor::simulation::ambient_env()),
+                reactor: Reactor::new(4, &crate::reactor::simulation::ambient_env()),
                 next: Cell::new(0),
                 fences: RefCell::default(),
                 ready: Cell::new(false),
@@ -1109,14 +1227,11 @@ pub mod secure {
 mod secure_tests {
     //! Simulated namespace fault sequences complement host integration coverage.
     use super::*;
-    use crate::reactor::{
-        simulation::{Fault, Simulation},
-        tests::{
-            drive,
-            fixtures::{Admission, Limits, Reactor},
-            poll, scope,
-        },
+    use crate::filesystem::{
+        fixtures::{Admission, Limits, Reactor, scope},
+        test_support::{drive, poll},
     };
+    use crate::reactor::simulation::{Fault, Simulation};
     use std::{num::NonZeroUsize, path::Path};
 
     /// Construct the counting reactor used to observe simulated namespace fences.
@@ -1129,8 +1244,6 @@ mod secure_tests {
     /// Keep common namespace backing and charges until abandoned SQEs are fenced.
     #[test]
     fn abandoned_namespace_changes_retain_descriptor_and_admission() {
-        use crate::reactor::tests::fixtures::ResourceClass;
-
         for change in [
             NamespaceChange::EnsureDirectory,
             NamespaceChange::Unlink,
@@ -1150,7 +1263,6 @@ mod secure_tests {
                     "unlink"
                 }
             };
-            let baseline = r.admission.used(ResourceClass::RequestContext);
             sim.inject(operation, Fault::Delay(10)).unwrap();
             let mut future =
                 r.file_change(directory, CString::new("entry").unwrap(), change, &request);
@@ -1158,11 +1270,9 @@ mod secure_tests {
             drop(future);
             assert_eq!(r.in_flight(), 1);
             assert!(weak.upgrade().is_some());
-            assert!(r.admission.used(ResourceClass::RequestContext) > baseline);
             drive(&r, r.file_fence(())).unwrap();
             assert_eq!(r.in_flight(), 0);
             assert!(weak.upgrade().is_none());
-            assert_eq!(r.admission.used(ResourceClass::RequestContext), baseline);
         }
     }
 
@@ -1317,7 +1427,7 @@ mod secure_tests {
 mod test_support {
     //! Bounded explicit driving for filesystem operations with arbitrary errors.
     use super::*;
-    use crate::reactor::tests::fixtures::Reactor;
+    use crate::filesystem::fixtures::Reactor;
     use std::time::Instant;
 
     /// Poll one reply without implicitly advancing the backend.
@@ -1346,30 +1456,22 @@ mod memory_tests {
     //! Delayed consumers exercise pointer provenance without kernel access.
     use super::*;
 
-    /// Keep cursor mutations bounded and release quota on allocation failure or drop.
+    /// Keep cursor mutations bounded and fail oversized allocations.
     #[test]
-    fn shared_allocation_preserves_cursor_and_releases_charge_on_failure() {
-        let charge = Rc::new(());
-        let weak = Rc::downgrade(&charge);
-        let mut buffer = Buffer::allocate(4, Box::new(charge)).unwrap();
+    fn shared_allocation_preserves_cursor_and_fails_oversized() {
+        let mut buffer = Buffer::allocate(4).unwrap();
         assert_eq!(buffer.bytes().unwrap(), &[0; 4]);
         buffer.bytes_mut().unwrap().copy_from_slice(b"data");
         buffer.advance(2).unwrap();
         assert_eq!(buffer.prefix(2).unwrap(), b"ta");
         assert_eq!(buffer.advance(3), Err(Error::Io));
         assert_eq!(buffer.remaining(), 2);
-        assert!(weak.upgrade().is_some());
         drop(buffer);
-        assert!(weak.upgrade().is_none());
-
-        let charge = Rc::new(());
-        let weak = Rc::downgrade(&charge);
         assert!(matches!(
-            Buffer::allocate(usize::MAX, Box::new(charge)),
+            Buffer::allocate(usize::MAX),
             Err(Error::Overloaded)
         ));
-        assert!(weak.upgrade().is_none());
-        assert_eq!(Buffer::allocate(0, Box::new(())).unwrap().remaining(), 0);
+        assert_eq!(Buffer::allocate(0).unwrap().remaining(), 0);
     }
 }
 

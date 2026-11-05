@@ -7,7 +7,7 @@ use crate::{
 };
 use racer_control_wire::RailMapping;
 use std::{cell::Cell, path::PathBuf, rc::Rc, sync::Arc};
-use uring_runtime::reactor::filesystem::secure::{self, Attempts, Host};
+use uring_runtime::filesystem::secure::{self, Attempts, Host};
 
 /// Own one journal namespace and fence abandoned writes before reusing its stage name.
 pub struct RailJournal {

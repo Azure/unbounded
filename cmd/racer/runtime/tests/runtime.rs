@@ -23,11 +23,12 @@ mod filesystem {
         time::{Duration, Instant},
     };
     use uring_runtime::{
-        Budget, Error, Operation, Result, Scope,
+        Error, Operation, Result, Scope,
         reactor::{
             IoBuffer, Reactor as Core,
             filesystem::{
                 operations::{Durability, Replacement, ReplacementError, publish_new},
+                prelude::*,
                 secure,
             },
         },
@@ -75,47 +76,14 @@ mod filesystem {
         }
     }
 
-    /// Count retained budget independently through the public accounting callback.
-    struct CountingBudget(Rc<Cell<usize>>);
-
-    /// Return the exact accounted amount when its owner is dropped.
-    struct Charge {
-        used: Rc<Cell<usize>>,
-
-        amount: usize,
-    }
-
-    impl Drop for Charge {
-        /// Release this charge from the shared budget counter.
-        fn drop(&mut self) {
-            self.used.set(self.used.get() - self.amount);
-        }
-    }
-
-    impl Budget for CountingBudget {
-        /// Retain the accounted amount until the charge is dropped.
-        type Charge = Charge;
-
-        /// Account for the requested amount and return its release guard.
-        fn charge(&self, amount: usize) -> Result<Charge> {
-            self.0.set(self.0.get() + amount);
-            Ok(Charge {
-                used: self.0.clone(),
-                amount,
-            })
-        }
-    }
-
-    /// Public reactor plus externally observed budget usage, without private access.
+    /// Public reactor with a test fence, without private access.
     struct Reactor {
-        core: Core<RequestScope, CountingBudget>,
-
-        used: Rc<Cell<usize>>,
+        core: Core<RequestScope>,
     }
 
     impl Deref for Reactor {
         /// Expose the wrapped public reactor for filesystem operations.
-        type Target = Core<RequestScope, CountingBudget>;
+        type Target = Core<RequestScope>;
 
         /// Borrow the wrapped reactor without changing its accounting.
         fn deref(&self) -> &Self::Target {
@@ -206,14 +174,8 @@ mod filesystem {
             }
             Err(error) => panic!("unexpected io_uring setup failure: {error}"),
         }
-        let used = Rc::new(Cell::new(0));
         let reactor = Reactor {
-            core: Core::new(
-                capacity,
-                CountingBudget(used.clone()),
-                &uring_runtime::reactor::simulation::ambient_env(),
-            ),
-            used,
+            core: Core::new(capacity, &uring_runtime::reactor::simulation::ambient_env()),
         };
         reactor.init().unwrap();
         Some(reactor)
@@ -256,7 +218,7 @@ mod filesystem {
 
     /// Drive composed helper futures explicitly with a bounded host deadline.
     fn drive_secure<T, E>(
-        reactor: &Core<SecureScope, ()>,
+        reactor: &Core<SecureScope>,
         future: impl std::future::Future<Output = Result<T, E>>,
     ) -> Result<T, E> {
         let mut future = Box::pin(future);
@@ -289,7 +251,7 @@ mod filesystem {
         let root = Directory::new();
         let path = root.0.join("private");
         let request = SecureScope(scope());
-        let host = Core::new(16, (), &uring_runtime::reactor::simulation::ambient_env());
+        let host = Core::new(16, &uring_runtime::reactor::simulation::ambient_env());
         let host_dir =
             drive_secure(&host, secure::directory(&host, &path, true, true, &request)).unwrap();
         drive_secure(
@@ -299,7 +261,7 @@ mod filesystem {
         .unwrap();
         let sim = Simulation::new();
         let environment = sim.enter();
-        let simulated = Core::new(16, (), &uring_runtime::reactor::simulation::ambient_env());
+        let simulated = Core::new(16, &uring_runtime::reactor::simulation::ambient_env());
         let sim_dir = drive_secure(
             &simulated,
             secure::directory(&simulated, &path, true, true, &request),
@@ -387,7 +349,7 @@ mod filesystem {
             let root = Directory::new();
             let path = root.0.join("private");
             let request = SecureScope(scope());
-            let r = Core::new(16, (), &uring_runtime::reactor::simulation::ambient_env());
+            let r = Core::new(16, &uring_runtime::reactor::simulation::ambient_env());
             r.init().unwrap();
             let dir = drive_secure(&r, secure::directory(&r, &path, true, true, &request)).unwrap();
             drive_secure(
@@ -546,14 +508,8 @@ mod filesystem {
         let directory_before = sim.metadata(&root.0).unwrap();
         let file_before = sim.metadata(&existing).unwrap();
         let _simulation = sim.enter();
-        let used = Rc::new(Cell::new(0));
         let simulated = Reactor {
-            core: Core::new(
-                16,
-                CountingBudget(used.clone()),
-                &uring_runtime::reactor::simulation::ambient_env(),
-            ),
-            used,
+            core: Core::new(16, &uring_runtime::reactor::simulation::ambient_env()),
         };
         simulated.init().unwrap();
         for path in [&missing, &existing, &root.0] {
@@ -606,9 +562,7 @@ mod filesystem {
         let Some(r) = kernel_reactor(16) else {
             return;
         };
-        let baseline = r.used.get();
         let mut b = r.file_bytes(b"abcdef").unwrap();
-        assert!(r.used.get() >= baseline + 6);
         b.advance(2).unwrap();
         assert_eq!(b.bytes().unwrap(), b"cdef");
         assert_eq!(b.prefix(2).unwrap(), b"cd");
@@ -618,7 +572,6 @@ mod filesystem {
         b.advance(4).unwrap();
         assert_eq!(b.remaining(), 0);
         drop(b);
-        assert_eq!(r.used.get(), baseline);
         let scope = scope();
         let fd = drive(
             &r,
@@ -644,7 +597,6 @@ mod filesystem {
             return;
         };
         let scope = scope();
-        let baseline = r.used.get();
         let mut open = r.file_open(
             None,
             CString::new("/").unwrap(),
@@ -657,10 +609,8 @@ mod filesystem {
         }
         assert_eq!(r.in_flight(), 1);
         drop(open);
-        assert!(r.used.get() > baseline);
         drive(&r, r.file_fence()).unwrap();
         assert_eq!(r.in_flight(), 0);
-        assert_eq!(r.used.get(), baseline);
         let fd = drive(
             &r,
             r.file_open(
@@ -680,7 +630,6 @@ mod filesystem {
         assert!(weak.upgrade().is_some());
         drive(&r, r.file_fence()).unwrap();
         assert!(weak.upgrade().is_none());
-        assert_eq!(r.used.get(), baseline);
     }
 
     /// Check partial reads, abandoned opens, and canceled metadata requests on Linux.
@@ -696,19 +645,15 @@ mod filesystem {
         fs::create_dir_all(path.parent().unwrap()).unwrap();
         fs::write(&path, b"abc").unwrap();
         let filename = || CString::new(path.as_os_str().as_bytes()).unwrap();
-        let baseline = r.used.get();
         let mut abandoned = r.file_open(None, filename(), libc::O_RDONLY, 0, &scope);
         assert!(poll(&mut abandoned).is_pending());
         for _ in 0..8 {
             assert!(poll(&mut abandoned).is_pending());
         }
         assert_eq!(r.in_flight(), 1);
-        assert!(r.used.get() > baseline);
         drop(abandoned);
-        assert!(r.used.get() > baseline);
         drive(&r, r.file_fence()).unwrap();
         assert_eq!(r.in_flight(), 0);
-        assert_eq!(r.used.get(), baseline);
         let fd = drive(&r, r.file_open(None, filename(), libc::O_RDONLY, 0, &scope)).unwrap();
         let read = drive(
             &r,
@@ -732,7 +677,6 @@ mod filesystem {
         drop(fd);
         fs::remove_file(path).unwrap();
         assert_eq!(r.in_flight(), 0);
-        assert_eq!(r.used.get(), baseline);
     }
 
     /// Verify publication contains staging paths and preserves permissions and symlinks.
@@ -982,7 +926,7 @@ mod reserved_capacity {
     };
     use uring_runtime::{
         Error, Operation, Result, Scope,
-        reactor::{Reactor, simulation::Simulation},
+        reactor::{Reactor, filesystem::prelude::*, simulation::Simulation},
     };
 
     /// Keep cancellation and deadlines out of admission-only scenarios.
@@ -1007,7 +951,7 @@ mod reserved_capacity {
     }
 
     /// Complete accepted operations without consuming their waiting replies.
-    fn complete(reactor: &Reactor<OpenScope, ()>) {
+    fn complete(reactor: &Reactor<OpenScope>) {
         for _ in 0..16 {
             if reactor.in_flight() == 0 {
                 return;
@@ -1022,8 +966,8 @@ mod reserved_capacity {
     fn reserved_capacity_is_reactor_local_and_failed_replies_release_it_only_on_consumption() {
         let simulation = Simulation::new();
         let _os = simulation.enter();
-        let owner = Reactor::new(1, (), &uring_runtime::reactor::simulation::ambient_env());
-        let foreign = Reactor::new(1, (), &uring_runtime::reactor::simulation::ambient_env());
+        let owner = Reactor::new(1, &uring_runtime::reactor::simulation::ambient_env());
+        let foreign = Reactor::new(1, &uring_runtime::reactor::simulation::ambient_env());
         let scope = OpenScope;
         let charge = Rc::new(());
         let retained_charge = Rc::downgrade(&charge);
@@ -1112,7 +1056,7 @@ mod reserved_capacity {
         use uring_runtime::reactor::{SocketAddress, simulation::Fault};
         let simulation = Simulation::new();
         let _os = simulation.enter();
-        let reactor = Reactor::new(1, (), &uring_runtime::reactor::simulation::ambient_env());
+        let reactor = Reactor::new(1, &uring_runtime::reactor::simulation::ambient_env());
         let capacity = reactor.reserve_submissions(1, ()).unwrap();
         let scope = OpenScope;
         let (socket, peer) = simulation.socket_pair();
@@ -1179,7 +1123,7 @@ mod reserved_capacity {
         }
         let simulation = Simulation::new();
         let _os = simulation.enter();
-        let reactor = Reactor::new(1, (), &uring_runtime::reactor::simulation::ambient_env());
+        let reactor = Reactor::new(1, &uring_runtime::reactor::simulation::ambient_env());
         let capacity = reactor.reserve_submissions(1, ()).unwrap();
         let scope = OpenScope;
         let (socket, peer) = simulation.socket_pair();
@@ -1199,7 +1143,7 @@ mod reserved_capacity {
         use uring_runtime::reactor::{SocketAddress, simulation::Fault};
         let simulation = Simulation::new();
         let _os = simulation.enter();
-        let reactor = Reactor::new(3, (), &uring_runtime::reactor::simulation::ambient_env());
+        let reactor = Reactor::new(3, &uring_runtime::reactor::simulation::ambient_env());
         let scope = OpenScope;
         let charge = Rc::new(());
         let weak = Rc::downgrade(&charge);
@@ -1304,7 +1248,7 @@ mod reserved_capacity {
         }
         let simulation = Simulation::new();
         let _os = simulation.enter();
-        let reactor = Reactor::new(2, (), &uring_runtime::reactor::simulation::ambient_env());
+        let reactor = Reactor::new(2, &uring_runtime::reactor::simulation::ambient_env());
         let scope = OpenScope;
         let charge = Rc::new(());
         let charge_weak = Rc::downgrade(&charge);

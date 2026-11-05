@@ -3470,8 +3470,8 @@ fn size_workers_policy(
     loop {
         let partition = partition_limits_with_cause(node, count, rdma).and_then(|limits| {
             if profiling {
-                let extra = ::telemetry::server::BINARY_CONTROL_SLOTS
-                    * uring_runtime::reactor::SUBMISSION_BYTES;
+                let extra =
+                    ::telemetry::server::BINARY_CONTROL_SLOTS * racer_io::scoped::SUBMISSION_BYTES;
                 let floor = crate::telemetry::RESERVED_BYTES
                     + crate::peer::protocol::MIN_REQUEST_CONTEXT_BYTES
                     + 4 * limits.header_bytes.get().max(crate::model::MAX_FIELD_BYTES);

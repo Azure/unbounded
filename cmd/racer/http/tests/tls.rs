@@ -17,7 +17,6 @@ use std::{
     task::{Context, Poll, Waker},
     time::{Duration, Instant},
 };
-use uring_runtime::environment::now;
 
 const PAGE: usize = 16 << 20;
 
@@ -96,7 +95,7 @@ impl Scope for RequestScope {
         if self.cancellation.is_cancelled() {
             return Err(racer_io::Error::Cancelled.into());
         }
-        if now() >= self.deadline {
+        if Instant::now() >= self.deadline {
             return Err(racer_io::Error::DeadlineExceeded.into());
         }
         Ok(())
@@ -108,7 +107,7 @@ impl Scope for RequestScope {
 }
 fn scope() -> RequestScope {
     RequestScope {
-        deadline: now() + Duration::from_secs(60),
+        deadline: Instant::now() + Duration::from_secs(60),
         cancellation: Cancellation::new().unwrap(),
     }
 }
@@ -152,8 +151,6 @@ impl HttpContext for Caller {
 
     type Scope = RequestScope;
 
-    type Budget = ();
-
     type Reactor = std::rc::Rc<Reactor>;
 
     type Charge = Charge<Limits>;
@@ -178,7 +175,7 @@ impl HttpContext for Caller {
         self.0.is_stopped()
     }
 }
-type Reactor = uring_runtime::reactor::Reactor<RequestScope, ()>;
+type Reactor = racer_io::scoped::Reactor<RequestScope>;
 type Pool = connection::HttpPool<Caller>;
 type Io = connection::HttpIo<Caller>;
 
@@ -193,7 +190,7 @@ fn fixture() -> Fixture {
 }
 fn fixture_with(context: usize) -> Fixture {
     let admission = std::rc::Rc::new(Quotas::new(Limits(context)));
-    let reactor = std::rc::Rc::new(Reactor::new(64, (), &racer_io::Env::host()));
+    let reactor = std::rc::Rc::new(Reactor::new(64, &racer_io::Env::host()));
     reactor.init().unwrap();
     let pool = Pool::new(
         std::rc::Rc::new(reactor.clone()),

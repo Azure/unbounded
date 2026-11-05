@@ -1,6 +1,7 @@
 use super::*;
 use http1::connection::{HttpPool, PoolConfig, State};
 use racer_io::cancel::Cancellation;
+use racer_io::scoped::{Reactor, SocketAddress};
 use std::{
     cell::Cell,
     future::{Future, poll_fn},
@@ -9,7 +10,7 @@ use std::{
 };
 use uring_runtime::{
     environment::{SimulationClock, now},
-    reactor::{Reactor, SocketAddress, simulation::Simulation},
+    reactor::simulation::Simulation,
 };
 
 #[derive(Clone)]
@@ -92,10 +93,10 @@ struct Hooks {
     installations: Rc<Cell<usize>>,
 }
 
-struct TestReactor(Reactor<TestScope, ()>);
+struct TestReactor(Reactor<TestScope>);
 
 impl std::ops::Deref for TestReactor {
-    type Target = Reactor<TestScope, ()>;
+    type Target = Reactor<TestScope>;
 
     fn deref(&self) -> &Self::Target {
         &self.0
@@ -105,7 +106,6 @@ impl std::ops::Deref for TestReactor {
 impl http1::connection::Context for Hooks {
     type Error = Error;
     type Scope = TestScope;
-    type Budget = ();
     type Reactor = TestReactor;
     type Charge = ();
     type Slot = Slot;
@@ -159,7 +159,7 @@ struct Harness {
 
 impl Harness {
     fn new(env: &racer_io::Env) -> Self {
-        let reactor = Rc::new(TestReactor(Reactor::new(32, (), env)));
+        let reactor = Rc::new(TestReactor(Reactor::new(32, env)));
         let hooks = Rc::new(Hooks::default());
         let identities = crate::tests::network(3, reactor.0.ctx());
         Self {

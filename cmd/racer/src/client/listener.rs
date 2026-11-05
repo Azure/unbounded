@@ -17,6 +17,7 @@ use crate::runtime::Cancellation;
 use crate::runtime::RequestScope;
 use racer_control_wire::CacheDefinition;
 use racer_control_wire::CacheId;
+use racer_io::scoped::ready_set::ReadySet;
 use std::cell::Cell;
 use std::cell::RefCell;
 use std::collections::BTreeMap;
@@ -36,7 +37,6 @@ pub(super) use uds_endpoint::file_path;
 use uds_endpoint::publication::{Endpoint, Publication, Rename, Replacement};
 #[cfg(test)]
 pub(super) use uds_endpoint::same_inode;
-use uring_runtime::reactor::ready_set::ReadySet;
 
 enum Listener {
     Real(uds_endpoint::BoundSocket),

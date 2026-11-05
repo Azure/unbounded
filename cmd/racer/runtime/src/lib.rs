@@ -12,6 +12,8 @@ pub mod drivers;
 
 pub mod environment;
 
+pub mod filesystem;
+
 pub mod offload;
 
 pub mod reactor;

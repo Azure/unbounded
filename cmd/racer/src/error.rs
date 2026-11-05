@@ -179,9 +179,9 @@ impl From<crate::enrollment::Error> for Error {
     }
 }
 
-impl From<uring_runtime::reactor::filesystem::secure::AccessError> for Error {
-    fn from(error: uring_runtime::reactor::filesystem::secure::AccessError) -> Self {
-        use uring_runtime::reactor::filesystem::secure::AccessError;
+impl From<uring_runtime::filesystem::secure::AccessError> for Error {
+    fn from(error: uring_runtime::filesystem::secure::AccessError) -> Self {
+        use uring_runtime::filesystem::secure::AccessError;
         match error {
             AccessError::MissingMetadata => Self::Io,
             AccessError::PermissionDenied => Self::Unauthorized,
@@ -297,11 +297,9 @@ impl From<racer_io::Error> for Error {
     }
 }
 
-impl From<uring_runtime::reactor::filesystem::operations::ReplacementError<Error>> for Error {
-    fn from(
-        error: uring_runtime::reactor::filesystem::operations::ReplacementError<Error>,
-    ) -> Self {
-        use uring_runtime::reactor::filesystem::operations::ReplacementError;
+impl From<uring_runtime::filesystem::operations::ReplacementError<Error>> for Error {
+    fn from(error: uring_runtime::filesystem::operations::ReplacementError<Error>) -> Self {
+        use uring_runtime::filesystem::operations::ReplacementError;
         match error {
             ReplacementError::BeforeRename(cause) => cause,
             ReplacementError::RenameUncertain(cause) => Self::RenameUncertain(cause.into()),
@@ -362,7 +360,7 @@ mod tests {
     fn control_foundation_errors_preserve_boundary_meanings() {
         use crate::enrollment::Error as Enrollment;
         use racer_crypto::identity::BundleError;
-        use uring_runtime::reactor::filesystem::secure::AccessError;
+        use uring_runtime::filesystem::secure::AccessError;
         for (source, expected) in [
             (controlplane::Error::Replay, Error::Replay),
             (controlplane::Error::Conflict, Error::IncompatibleMembership),
@@ -544,7 +542,7 @@ mod tests {
 
     #[test]
     fn replacement_outcomes_preserve_publication_phase() {
-        use uring_runtime::reactor::filesystem::operations::ReplacementError;
+        use uring_runtime::filesystem::operations::ReplacementError;
         assert_eq!(
             Error::from(ReplacementError::BeforeRename(Error::Os(libc::ENOSPC))),
             Error::Os(libc::ENOSPC)

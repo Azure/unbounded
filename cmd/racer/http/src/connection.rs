@@ -5,6 +5,7 @@
 
 use crate::{Codec, Error, MessageHead, Opaque, StartLine};
 use racer_io::Scope;
+use racer_io::scoped::{Completion, Reactor, SocketAddress, descriptor::Descriptor};
 use racer_io::{ring::IoBuffer, ring::SendBuffer};
 use std::{
     cell::{Cell, RefCell},
@@ -14,10 +15,6 @@ use std::{
     rc::{Rc, Weak},
     task::{Poll, Waker},
     time::{Duration, Instant},
-};
-use uring_runtime::{
-    Budget,
-    reactor::{Completion, Reactor, SocketAddress, descriptor::Descriptor},
 };
 use zeroize::{Zeroize, Zeroizing};
 
@@ -130,11 +127,8 @@ pub trait Context: 'static {
     /// Cancellation and deadline checks for each operation.
     type Scope: Scope<Error = Self::Error>;
 
-    /// Runtime completion budget, separate from ordinary admission.
-    type Budget: Budget;
-
     /// Caller-owned reactor handle.
-    type Reactor: Deref<Target = Reactor<Self::Scope, Self::Budget>>;
+    type Reactor: Deref<Target = Reactor<Self::Scope>>;
 
     /// Reservation released when admitted storage is no longer retained.
     type Charge: 'static;
@@ -1803,7 +1797,7 @@ impl<C: Context> HttpPool<C> {
             result => result?,
         };
         let address = endpoint.address()?;
-        let fd = uring_runtime::reactor::descriptor::socket(
+        let fd = racer_io::scoped::descriptor::socket(
             self.reactor.sim_os().as_ref(),
             socket_domain(&address),
         )?;
@@ -1853,7 +1847,7 @@ impl<C: Context> HttpPool<C> {
                     // switched to the `tls` ULP. Close it and redo TCP and the
                     // handshake on a fresh socket under the same scope.
                     scope.check()?;
-                    let fd = uring_runtime::reactor::descriptor::socket(
+                    let fd = racer_io::scoped::descriptor::socket(
                         self.reactor.sim_os().as_ref(),
                         socket_domain(&address),
                     )?;
@@ -2518,10 +2512,10 @@ mod tests {
     }
 
     /// Direct reactor owner satisfying the context's Deref contract without another Rc.
-    struct TestReactor(Reactor<TestScope, ()>);
+    struct TestReactor(Reactor<TestScope>);
 
     impl Deref for TestReactor {
-        type Target = Reactor<TestScope, ()>;
+        type Target = Reactor<TestScope>;
 
         /// Borrow the fixture's directly owned reactor.
         fn deref(&self) -> &Self::Target {
@@ -2544,8 +2538,6 @@ mod tests {
         type Error = Failure;
 
         type Scope = TestScope;
-
-        type Budget = ();
 
         type Reactor = TestReactor;
 
@@ -2595,7 +2587,7 @@ mod tests {
 
     /// Create the caller-owned reactor wrapper used by test contexts.
     fn reactor() -> Rc<TestReactor> {
-        Rc::new(TestReactor(Reactor::new(16, (), &racer_io::Env::host())))
+        Rc::new(TestReactor(Reactor::new(16, &racer_io::Env::host())))
     }
 
     /// Build a response with one explicit content length.
@@ -2905,10 +2897,7 @@ mod tests {
     }
 
     /// Drive a future and reactor with a bounded deadline.
-    fn drive<T>(
-        reactor: &Reactor<TestScope, ()>,
-        future: impl std::future::Future<Output = T>,
-    ) -> T {
+    fn drive<T>(reactor: &Reactor<TestScope>, future: impl std::future::Future<Output = T>) -> T {
         let mut future = std::pin::pin!(future);
         let mut cx = std::task::Context::from_waker(Waker::noop());
         let deadline = Instant::now() + Duration::from_secs(5);

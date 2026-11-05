@@ -247,7 +247,7 @@ impl PeerServer {
             use futures::stream::FuturesUnordered;
             scope.check()?;
             let reactor = self.io.reactor();
-            let fd = Rc::new(uring_runtime::reactor::descriptor::tcp_listener(
+            let fd = Rc::new(racer_io::scoped::descriptor::tcp_listener(
                 reactor.sim_os().as_ref(),
                 address,
             )?);
@@ -1559,7 +1559,6 @@ mod tests {
                 if !ready && end != "consume" {
                     assert_eq!(reactor.in_flight(), 1);
                     assert!(weak.upgrade().is_some());
-                    assert!(admission.used(ResourceClass::RequestContext) > baseline);
                 }
                 drive(&reactor, reactor.drain()).unwrap();
                 assert_eq!(reactor.in_flight(), 0);

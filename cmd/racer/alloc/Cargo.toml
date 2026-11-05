@@ -9,11 +9,9 @@ description = "Worker-local aligned buffers and lease-fenced sparse slab storage
 [dependencies]
 libc = "0.2"
 zeroize = "1"
-uring-runtime = { path = "../runtime" }
 racer-io = { path = "../io" }
 
 [dev-dependencies]
-uring-runtime = { path = "../runtime", features = ["simulation"] }
 
 [target.'cfg(loom)'.dev-dependencies]
 loom = "0.7"

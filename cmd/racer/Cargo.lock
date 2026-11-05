@@ -559,7 +559,6 @@ dependencies = [
  "racer-io",
  "rcgen",
  "rustls",
- "uring-runtime",
  "zeroize",
 ]
 
@@ -741,7 +740,6 @@ dependencies = [
  "libc",
  "loom",
  "racer-io",
- "uring-runtime",
  "zeroize",
 ]
 

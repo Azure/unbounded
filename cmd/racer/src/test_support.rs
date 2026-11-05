@@ -42,6 +42,7 @@ use std::rc::Rc;
 use std::sync::Arc;
 use std::task::Context;
 use uring_runtime::drivers::DriverQueue;
+use uring_runtime::filesystem::prelude::*;
 
 pub mod clock {
     use crate::error::Error;
@@ -397,11 +398,10 @@ pub(crate) async fn projected_file(
     file: &str,
     limit: usize,
     scope: &crate::runtime::RequestScope,
-) -> crate::error::Result<uring_runtime::reactor::filesystem::ReadBuffer> {
-    use uring_runtime::reactor::filesystem::secure::{BENEATH, NO_MAGICLINKS};
+) -> crate::error::Result<uring_runtime::filesystem::ReadBuffer> {
+    use uring_runtime::filesystem::secure::{BENEATH, NO_MAGICLINKS};
 
-    let dir =
-        uring_runtime::reactor::filesystem::secure::directory(r, path, false, false, scope).await?;
+    let dir = uring_runtime::filesystem::secure::directory(r, path, false, false, scope).await?;
     // One openat2 resolves ..data and pins the target directory across rotation.
     // BENEATH rejects absolute/escaping links; NO_MAGICLINKS rejects proc escapes.
     let generation = r
@@ -413,8 +413,7 @@ pub(crate) async fn projected_file(
             scope,
         )
         .await?;
-    uring_runtime::reactor::filesystem::secure::read_at(r, &generation, file, limit, false, scope)
-        .await
+    uring_runtime::filesystem::secure::read_at(r, &generation, file, limit, false, scope).await
 }
 
 /// Enrollment I/O and certificate fixtures shared by control and application tests.

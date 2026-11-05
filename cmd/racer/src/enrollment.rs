@@ -23,7 +23,8 @@ use std::{
     sync::Arc,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
-use uring_runtime::reactor::filesystem::{
+use uring_runtime::filesystem::prelude::*;
+use uring_runtime::filesystem::{
     operations::ReplacementError,
     secure::{self, Attempts, Host},
 };
@@ -678,6 +679,7 @@ mod tests {
     //! Real enrollment state transitions over deterministic reactor completions.
     use super::*;
     use racer_io::cancel::Cancellation;
+    use racer_io::scoped::Reactor;
     use std::{
         cell::Cell,
         path::Path,
@@ -685,10 +687,7 @@ mod tests {
         task::{Context, Poll},
         time::Instant,
     };
-    use uring_runtime::reactor::{
-        Reactor,
-        simulation::{Fault, Simulation},
-    };
+    use uring_runtime::reactor::simulation::{Fault, Simulation};
 
     std::thread_local! {
         /// Observe secret-field destruction without reading deallocated memory.
@@ -897,7 +896,7 @@ mod tests {
 
     /// Deterministic worker hosting no dataplane state or hardware inventory.
     struct Files {
-        reactor: Reactor<Request, ()>,
+        reactor: Reactor<Request>,
 
         next: Cell<u64>,
     }
@@ -905,10 +904,8 @@ mod tests {
     impl Host for Files {
         type Scope = Request;
 
-        type Budget = ();
-
         /// Keep every attempt bound to this serving reactor.
-        fn reactor(&self) -> &Reactor<Request, ()> {
+        fn reactor(&self) -> &Reactor<Request> {
             &self.reactor
         }
 
@@ -942,7 +939,7 @@ mod tests {
     /// Construct one namespace owner on the active simulation backend.
     fn fixture() -> (Rc<Files>, Enrollment<Rc<Files>>, Request) {
         let files = Rc::new(Files {
-            reactor: Reactor::new(64, (), &crate::test_support::env()),
+            reactor: Reactor::new(64, &crate::test_support::env()),
             next: Cell::new(0),
         });
         let enrollment = Enrollment::new(
