@@ -21,7 +21,7 @@ resubmits the same id and only missing pages are scheduled.
 ## Current code this replaces
 
 - Client parser: only `HEAD` and `POST` under `/v1/objects/` are accepted
-  (`cmd/racer/object-wire/src/client.rs:177-179`, `:338-356`); any other
+  (`cmd/racer/wire/src/object/client.rs:177-179`, `:338-356`); any other
   method is 405 with `Allow: HEAD, POST` (`client.rs:615-619`). A request body
   is rejected: `Content-Length` is accepted only as `0`
   (`client.rs:241-255`). Query strings are not parsed; the target is used
@@ -65,7 +65,7 @@ socket belongs to. `.` and `..` alone are invalid (400).
 
 ### Parser extension
 
-The object-wire client parser gains a separate prefetch route:
+The `racer_wire::object` client parser gains a separate prefetch route:
 
 - Dispatch on the path prefix before the `/v1/objects/` key parse. Split the
   target at the first `?` for prefetch paths only.

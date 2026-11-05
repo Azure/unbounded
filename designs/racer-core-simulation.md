@@ -30,7 +30,7 @@ trace hash.
 
 Path: `cmd/racer/core`, crate `racer-core`, lib `racer_core`.
 
-Depends only on `topology`, `racer-object-wire`, `racer-control-wire`, `flow-control`, and `sha2`.
+Depends only on `topology`, `racer-wire`, `flow-control`, and `sha2`.
 
 ### Purity rules
 
