@@ -532,10 +532,8 @@ impl Rig {
             reactor.ctx().clock.clone(),
         ));
         let document = Arc::new(fixture_publication());
-        let snapshot = racer::control::plane::Target::prepare(snapshots.as_ref(), document.clone())
-            .unwrap()()
-        .unwrap();
-        racer::control::plane::Target::install(snapshots.as_ref(), &document, &snapshot).unwrap();
+        let snapshot = snapshots.projection(document.clone()).unwrap()().unwrap();
+        snapshots.install_publication(&document, &snapshot).unwrap();
         let network = Rc::new(
             PeerNetwork::new(
                 NodeId(NODE.into()),

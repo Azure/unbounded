@@ -62,7 +62,7 @@ use std::time::SystemTime;
 
 pub mod cell;
 pub mod managed;
-pub mod plane;
+pub mod poll;
 pub mod publication;
 pub mod rails;
 pub mod rest;
@@ -442,21 +442,6 @@ impl secure::Host for ReactorControlIo {
 
     fn is_missing(error: Error) -> bool {
         error == Error::MissingKey
-    }
-}
-
-impl crate::control::plane::Host for ReactorControlIo {
-    fn sleep<'a>(&'a self, until: Instant, scope: &'a RequestScope) -> Operation<'a, ()> {
-        ReactorControlIo::sleep(self, until, scope)
-    }
-
-    fn classify(&self, error: Error) -> crate::control::plane::FailureClass {
-        match error {
-            Error::Cancelled => crate::control::plane::FailureClass::Cancelled,
-            Error::Unauthorized => crate::control::plane::FailureClass::Rejected,
-            error if transient(error) => crate::control::plane::FailureClass::Retry,
-            _ => crate::control::plane::FailureClass::Permanent,
-        }
     }
 }
 
@@ -1142,11 +1127,7 @@ pub(crate) mod tests {
             let env = racer_io::Env::host();
             let store = store(&env, 2);
             let before = crate::topology::scored_members();
-            let job = crate::control::plane::Target::<publication::PublicationCodec>::prepare(
-                &store,
-                Arc::new(publication(1)),
-            )
-            .unwrap();
+            let job = PublicationTarget::projection(&store, Arc::new(publication(1))).unwrap();
             let prepared = std::thread::spawn(job).join().unwrap().unwrap();
             assert_eq!(
                 crate::topology::scored_members(),
@@ -1179,21 +1160,18 @@ pub(crate) mod tests {
             submissions: Rc<Cell<usize>>,
         }
 
-        impl crate::control::plane::Target<publication::PublicationCodec> for GatedTarget {
-            type Prepared = Arc<Snapshot>;
-
+        impl crate::control::poll::Install for GatedTarget {
             fn prepare(
                 &self,
-                document: Arc<Publication>,
-            ) -> Result<crate::control::plane::feed::Preparation<Self::Prepared, Error>>
-            {
+                document: crate::control::poll::Document,
+            ) -> Result<crate::control::poll::Preparation> {
                 self.submissions.set(self.submissions.get() + 1);
                 let wait = self
                     .wait
                     .borrow_mut()
                     .take()
                     .expect("only one job admitted");
-                let job = crate::control::plane::Target::prepare(&self.target, document)?;
+                let job = self.target.prepare(document)?;
                 Ok(Box::new(move || {
                     wait.recv_timeout(Duration::from_secs(5))
                         .map_err(|_| Error::DeadlineExceeded)?;
@@ -1201,23 +1179,26 @@ pub(crate) mod tests {
                 }))
             }
 
-            fn install(&self, document: &Publication, prepared: &Arc<Snapshot>) -> Result<()> {
-                crate::control::plane::Target::install(&self.target, document, prepared)
+            fn install(
+                &self,
+                document: &crate::control::poll::Document,
+                prepared: &crate::control::poll::Prepared,
+            ) -> Result<()> {
+                self.target.install(document, prepared)
             }
         }
 
         /// One full publication followed by a held long poll.
         struct PublicationSource(Cell<bool>);
 
-        impl crate::control::plane::feed::Source<ReactorControlIo> for PublicationSource {
+        impl crate::control::poll::Fetch for PublicationSource {
             fn get<'a>(
                 &'a self,
                 _: &'a str,
                 _: Option<&'a str>,
                 _: usize,
                 scope: &'a RequestScope,
-            ) -> racer_io::Operation<'a, Response, crate::control::plane::feed::FetchError<Error>>
-            {
+            ) -> racer_io::Operation<'a, Response, crate::control::poll::FetchError> {
                 Box::pin(async move {
                     if self.0.replace(true) {
                         crate::drivers::poll_scoped(scope, |_| {
@@ -1259,21 +1240,16 @@ pub(crate) mod tests {
             let published = target.published.clone();
             let submissions = Rc::new(Cell::new(0));
             let (release, wait) = std::sync::mpsc::channel();
-            let mut sync = crate::control::plane::Sync::new(
+            let mut sync = crate::control::poll::Poll::new(
                 Rc::new(ReactorControlIo::new(reactor.clone())),
-                crate::control::plane::Feed::new(
-                    publication::PublicationCodec,
-                    wire::SNAPSHOT_PATH.into(),
-                    wire::MAX_PUBLICATION_BYTES,
-                )
-                .unwrap(),
-                PublicationSource(Cell::new(false)),
-                GatedTarget {
+                crate::control::poll::Doc::Publication,
+                Box::new(PublicationSource(Cell::new(false))),
+                Box::new(GatedTarget {
                     target,
                     wait: RefCell::new(Some(wait)),
                     submissions: submissions.clone(),
-                },
-                crate::control::plane::feed::Schedule {
+                }),
+                crate::control::poll::Schedule {
                     turn: Duration::from_secs(5),
                     tick: Duration::from_millis(1),
                     retry_min: Duration::from_millis(1),
@@ -1559,11 +1535,10 @@ pub(crate) mod tests {
         /// Same-version races cannot swap topology allocations or commit resources.
         #[test]
         fn stale_projection_and_foreign_cluster_leave_publication_unchanged() {
-            use crate::control::plane::Target;
             let env = racer_io::Env::host();
             let target = store(&env, 2);
             target.apply(publication(1)).unwrap();
-            let old_job = target.prepare(Arc::new(membership(3, 2))).unwrap();
+            let old_job = target.projection(Arc::new(membership(3, 2))).unwrap();
             let current = target.apply(membership(2, 2)).unwrap();
             let stale = old_job().unwrap();
             assert!(!Arc::ptr_eq(&current.membership, &stale.membership));

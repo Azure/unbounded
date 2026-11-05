@@ -1,6 +1,6 @@
 //! Publication cell semantics: replay, capacity, grace retention, destructor
 //! placement, and epoch-published worker copies. Ported from the former
-//! `controlplane` crate tests (now `control::plane`).
+//! Publication cell tests, formerly in the `controlplane` crate.
 
 use super::*;
 use crate::app::rollout::Rollout;

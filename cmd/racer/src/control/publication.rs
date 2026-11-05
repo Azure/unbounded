@@ -2,44 +2,17 @@
 
 use super::cell::{Generation, PublicationCell, Retention};
 use super::{CacheTransition, Snapshot};
-use crate::control::plane::{Codec, Target};
+use crate::control::poll::{Document, Preparation, Prepared};
 use crate::error::{Error, Result};
 use crate::topology::{Member, Membership};
 use racer_wire::control::{self as wire, ClusterId, Publication, PublicationSequence};
 use sha2::{Digest, Sha256};
 use std::{cell::RefCell, rc::Rc, sync::Arc, time::Duration};
 
-/// Wire publication codec. The exact document remains available as a delta base.
 /// The REST method surface cannot represent arbitrary string methods:
 /// ```compile_fail
 /// let method = crate::control::rest::Method::Delete;
 /// ```
-pub struct PublicationCodec;
-
-impl Codec for PublicationCodec {
-    type Document = Publication;
-
-    type Version = u64;
-
-    type Error = Error;
-
-    fn version(&self, document: &Publication) -> u64 {
-        document.sequence.0
-    }
-
-    fn decode(&self, bytes: &[u8]) -> Result<Publication> {
-        Ok(wire::decode_publication(bytes)?)
-    }
-
-    fn delta(&self, base: &Publication, bytes: &[u8]) -> Result<Publication> {
-        Ok(wire::apply_delta(base, bytes)?)
-    }
-
-    fn digest(&self, document: &Publication) -> Result<String> {
-        Ok(wire::content_hash(document)?)
-    }
-}
-
 /// Cluster-bound projection and local cache installation policy, never a registry.
 pub struct PublicationTarget {
     cluster: ClusterId,
@@ -74,7 +47,7 @@ impl PublicationTarget {
     /// Synchronously project a fixture using the production preparation closure.
     #[cfg(any(test, feature = "subscription-interop"))]
     pub(crate) fn project(&self, document: Publication) -> Result<Arc<Snapshot>> {
-        let job = <Self as Target<PublicationCodec>>::prepare(self, Arc::new(document))?;
+        let job = self.projection(Arc::new(document))?;
         job()
     }
 
@@ -139,13 +112,12 @@ impl PublicationTarget {
     }
 }
 
-impl Target<PublicationCodec> for PublicationTarget {
-    type Prepared = Arc<Snapshot>;
-
-    fn prepare(
+impl PublicationTarget {
+    /// Capture thread-safe projection inputs; the returned closure does the CPU work.
+    pub fn projection(
         &self,
         document: Arc<Publication>,
-    ) -> Result<crate::control::plane::feed::Preparation<Self::Prepared, Error>> {
+    ) -> Result<Box<dyn FnOnce() -> Result<Arc<Snapshot>> + Send + 'static>> {
         let cluster = self.cluster.clone();
         let predecessor = self.published.current()?;
         Ok(Box::new(move || {
@@ -153,11 +125,35 @@ impl Target<PublicationCodec> for PublicationTarget {
         }))
     }
 
-    fn install(&self, document: &Publication, prepared: &Arc<Snapshot>) -> Result<()> {
+    /// Install a projection of exactly `document`.
+    pub fn install_publication(
+        &self,
+        document: &Publication,
+        prepared: &Arc<Snapshot>,
+    ) -> Result<()> {
         if document.sequence != prepared.sequence || document.cluster != prepared.cluster {
             return Err(Error::InvalidRequest);
         }
         self.install_projection(prepared)
+    }
+
+    /// Poll install hook: prepare a publication document.
+    pub(crate) fn prepare(&self, document: Document) -> Result<Preparation> {
+        let Document::Publication(document) = document else {
+            return Err(Error::InvalidRequest);
+        };
+        let job = self.projection(document)?;
+        Ok(Box::new(move || job().map(Prepared::Snapshot)))
+    }
+
+    /// Poll install hook: install a prepared publication snapshot.
+    pub(crate) fn install(&self, document: &Document, prepared: &Prepared) -> Result<()> {
+        match (document, prepared) {
+            (Document::Publication(document), Prepared::Snapshot(prepared)) => {
+                self.install_publication(document, prepared)
+            }
+            _ => Err(Error::InvalidRequest),
+        }
     }
 }
 

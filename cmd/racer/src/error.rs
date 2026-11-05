@@ -144,19 +144,6 @@ impl TryFrom<Error> for racer_core::read::Error {
     }
 }
 
-impl From<crate::control::plane::Error> for Error {
-    fn from(error: crate::control::plane::Error) -> Self {
-        match error {
-            crate::control::plane::Error::Replay => Self::Replay,
-            crate::control::plane::Error::Conflict => Self::IncompatibleMembership,
-            crate::control::plane::Error::Capacity => Self::Overloaded,
-            crate::control::plane::Error::Stale => Self::StaleFlight,
-            crate::control::plane::Error::Pending => Self::Unavailable,
-            crate::control::plane::Error::Internal => Self::Internal,
-        }
-    }
-}
-
 impl From<racer_crypto::identity::BundleError> for Error {
     fn from(error: racer_crypto::identity::BundleError) -> Self {
         match error {
@@ -376,19 +363,6 @@ mod tests {
         use crate::enrollment::Error as Enrollment;
         use racer_crypto::identity::BundleError;
         use racer_io::scoped::fs::secure::AccessError;
-        for (source, expected) in [
-            (crate::control::plane::Error::Replay, Error::Replay),
-            (
-                crate::control::plane::Error::Conflict,
-                Error::IncompatibleMembership,
-            ),
-            (crate::control::plane::Error::Capacity, Error::Overloaded),
-            (crate::control::plane::Error::Stale, Error::StaleFlight),
-            (crate::control::plane::Error::Pending, Error::Unavailable),
-            (crate::control::plane::Error::Internal, Error::Internal),
-        ] {
-            assert_eq!(Error::from(source), expected);
-        }
         for (source, expected) in [
             (Enrollment::Unauthorized, Error::Unauthorized),
             (Enrollment::CorruptRecord, Error::CorruptRecord),

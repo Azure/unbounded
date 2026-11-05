@@ -1,27 +1,27 @@
-//! Racer authentication and renewal policy around two independent generic feeds.
+//! Racer authentication and renewal policy around two independent long polls.
 
-use super::publication::{PublicationCodec, PublicationTarget};
+use super::poll::{
+    self, Doc, Document, Fetch, FetchError, Install, Poll, Preparation, Prepared, Rejection,
+    Schedule,
+};
+use super::publication::PublicationTarget;
 use super::rails::RailJournal;
 use super::{ControlEndpoint, ReactorControlIo, transient};
-use crate::control::plane::feed::{Identity, Preparation, RejectionPolicy, Schedule};
-use crate::control::plane::{Client, Codec, Credentials, Feed, Sync, Target};
 use crate::control::rest;
 use crate::enrollment::{Enrollment, LocalSigningIdentity};
 use crate::error::{Error, Operation, Result};
 use crate::runtime::RequestScope;
 use racer_crypto::identity::{BundleInstaller, Keyring};
 use racer_wire::control as wire;
-use sha2::{Digest, Sha256};
 use std::{
     cell::{Cell, RefCell},
     ops::{Deref, DerefMut},
     rc::Rc,
-    sync::Arc,
     time::{Duration, Instant},
 };
 use zeroize::Zeroizing;
 
-/// Owner-local session. Only generic Sync owns cursors, retry, and preparation jobs.
+/// Owner-local session. Only the two polls own cursors, retry, and preparation jobs.
 pub struct Session {
     block_devices: RefCell<Option<String>>,
     rails: RailJournal,
@@ -47,23 +47,9 @@ pub struct Session {
 
     pub(super) snapshots: Rc<PublicationTarget>,
 
-    // Keep the concrete generic owner type visible rather than aliased.
-    #[allow(clippy::type_complexity)]
-    publications: RefCell<
-        Option<Sync<ReactorControlIo, ObservedPublication, PublicationSource, PublicationInstall>>,
-    >,
+    publications: RefCell<Option<Poll>>,
 
-    #[allow(clippy::type_complexity)]
-    keyrings: RefCell<
-        Option<
-            Sync<
-                ReactorControlIo,
-                BundleCodec,
-                Client<ReactorControlIo, FeedCredentials>,
-                BundleTarget,
-            >,
-        >,
-    >,
+    keyrings: RefCell<Option<Poll>>,
 
     received: Rc<Cell<Option<(u64, u64)>>>,
 
@@ -159,94 +145,136 @@ impl<T> Drop for Turn<'_, T> {
     }
 }
 
-/// Independent per-feed authentication policy using one node-binding authority.
-struct FeedCredentials {
+/// Authenticated REST client for one document. Identity first; token
+/// fallback only where the document's policy allows it.
+struct Client {
+    transport: rest::Transport<ReactorControlIo>,
+
     auth: Rc<Authentication>,
 
-    policy: RejectionPolicy,
+    doc: Doc,
+
+    /// Set on request entry so renewal completion never cancels an active GET.
+    started: Option<Rc<Cell<bool>>>,
 }
 
-/// Observe only request entry so renewal completion never cancels an active GET.
-struct PublicationSource {
-    client: Client<ReactorControlIo, FeedCredentials>,
-
-    started: Rc<Cell<bool>>,
-}
-
-impl crate::control::plane::feed::Source<ReactorControlIo> for PublicationSource {
-    fn get<'a>(
-        &'a self,
-        path: &'a str,
-        digest: Option<&'a str>,
-        limit: usize,
-        scope: &'a RequestScope,
-    ) -> racer_io::Operation<'a, rest::Response, crate::control::plane::feed::FetchError<Error>>
-    {
-        self.started.set(true);
-        self.client.get(path, digest, limit, scope)
-    }
-
-    fn close(&self) {
-        self.client.close();
-    }
-
-    fn demote(&self) {
-        self.client.demote();
-    }
-}
-
-/// REST credential lease; borrows the crypto-owned private key without exporting it.
-struct IdentityLease(LocalSigningIdentity);
-
-impl Identity for IdentityLease {
-    fn identity(&self) -> rest::Identity<'_> {
-        rest::Identity {
-            certificate_chain: self.0.certificate_chain(),
-            private_key: self.0.private_key_der(),
-            expires: self.0.expires_at(),
-        }
-    }
-}
-
-impl Credentials<ReactorControlIo> for FeedCredentials {
-    type Identity = IdentityLease;
-
-    type Token = Zeroizing<String>;
-
-    fn identity(&self) -> Result<Option<Self::Identity>> {
+impl Client {
+    /// Snapshot a currently usable TLS identity.
+    fn identity(&self) -> Result<Option<LocalSigningIdentity>> {
         self.auth.check()?;
         Ok(self
             .auth
             .identity
             .borrow()
             .clone()
-            .filter(|i| i.valid_at(self.auth.enrollment.wall_now()))
-            .map(IdentityLease))
+            .filter(|i| i.valid_at(self.auth.enrollment.wall_now())))
     }
 
-    fn policy(&self) -> RejectionPolicy {
-        self.policy
+    /// Validate structured errors before using Retry-After or rejection policy.
+    fn validate(response: rest::Response) -> std::result::Result<rest::Response, FetchError> {
+        match poll::validate_response(&response) {
+            Ok(()) => Ok(response),
+            Err(error) => Err(FetchError {
+                error,
+                retry_after: if matches!(response.status, 429 | 503) {
+                    response.retry_after
+                } else {
+                    None
+                },
+            }),
+        }
     }
 
-    fn token<'a>(&'a self, scope: &'a RequestScope) -> Operation<'a, Option<Self::Token>> {
-        Box::pin(async move {
-            self.auth.check()?;
-            Ok(Some(self.auth.enrollment.read_token(scope).await?))
-        })
-    }
-
-    fn rejected(&self) {
-        self.auth.binding_check.set(true);
-    }
-
-    fn validate_response(&self, response: &rest::Response) -> Result<()> {
-        validate_response(response)
+    async fn request(
+        &self,
+        connection: rest::Connection<ReactorControlIo>,
+        path: &str,
+        bearer: Option<&str>,
+        digest: Option<&str>,
+        limit: usize,
+        scope: &RequestScope,
+    ) -> std::result::Result<rest::Response, FetchError> {
+        let response = connection
+            .request(
+                rest::Request {
+                    method: rest::Method::Get,
+                    path,
+                    bearer,
+                    header: digest.map(|digest| (poll::DIGEST_HEADER, digest)),
+                    body: &[],
+                    limit,
+                },
+                scope,
+            )
+            .await?;
+        Self::validate(response)
     }
 }
 
-/// Codec receipt observation is diagnostic only; generic Feed retains the delta base.
-struct ObservedPublication {
-    received: Rc<Cell<Option<(u64, u64)>>>,
+impl Fetch for Client {
+    /// Prefer identity authentication; token fallback gets a fresh TLS connection.
+    fn get<'a>(
+        &'a self,
+        path: &'a str,
+        digest: Option<&'a str>,
+        limit: usize,
+        scope: &'a RequestScope,
+    ) -> racer_io::Operation<'a, rest::Response, FetchError> {
+        if let Some(started) = &self.started {
+            started.set(true);
+        }
+        Box::pin(async move {
+            let policy = self.doc.rejection();
+            if let Some(identity) = self.identity()? {
+                let result = async {
+                    let connection = self
+                        .transport
+                        .connect(
+                            Some(rest::Identity {
+                                certificate_chain: identity.certificate_chain(),
+                                private_key: identity.private_key_der(),
+                                expires: identity.expires_at(),
+                            }),
+                            scope,
+                        )
+                        .await?;
+                    self.request(connection, path, None, digest, limit, scope)
+                        .await
+                }
+                .await;
+                match result {
+                    Err(failure)
+                        if poll::classify(failure.error) == poll::FailureClass::Rejected =>
+                    {
+                        self.auth.binding_check.set(true);
+                        self.transport.close_idle();
+                        if policy == Rejection::IdentityOnly {
+                            return Err(failure);
+                        }
+                    }
+                    other => return other,
+                }
+            } else if policy == Rejection::IdentityOnly {
+                return Err(Error::Unauthorized.into());
+            }
+            // No token leaves this owner until CA and server name verification.
+            let connection = self.transport.connect(None, scope).await?;
+            self.auth.check()?;
+            let token: Zeroizing<String> = self.auth.enrollment.read_token(scope).await?;
+            self.request(connection, path, Some(token.as_str()), digest, limit, scope)
+                .await
+        })
+    }
+
+    /// Drop the idle TLS connection without touching the other poll.
+    fn close(&self) {
+        self.transport.close_idle();
+    }
+
+    /// Move the next request away from the seat that served the last response.
+    fn demote(&self) {
+        self.transport.demote();
+    }
 }
 
 /// Retain the newest receipt for diagnostics, including equal-sequence replacements.
@@ -259,32 +287,6 @@ fn observe_receipt(received: &Cell<Option<(u64, u64)>>, document: &wire::Publica
     }
 }
 
-impl Codec for ObservedPublication {
-    type Document = wire::Publication;
-
-    type Version = u64;
-
-    type Error = Error;
-
-    fn version(&self, document: &Self::Document) -> u64 {
-        document.sequence.0
-    }
-
-    fn decode(&self, bytes: &[u8]) -> Result<Self::Document> {
-        PublicationCodec.decode(bytes)
-    }
-
-    fn delta(&self, base: &Self::Document, bytes: &[u8]) -> Result<Self::Document> {
-        PublicationCodec.delta(base, bytes)
-    }
-
-    fn digest(&self, document: &Self::Document) -> Result<String> {
-        let digest = PublicationCodec.digest(document)?;
-        observe_receipt(&self.received, document);
-        Ok(digest)
-    }
-}
-
 /// Keep domain installation local while delegating CPU projection to PublicationTarget.
 struct PublicationInstall {
     target: Rc<PublicationTarget>,
@@ -294,95 +296,52 @@ struct PublicationInstall {
     auth: Rc<Authentication>,
 }
 
-impl Target<ObservedPublication> for PublicationInstall {
-    type Prepared = Arc<super::Snapshot>;
-
-    fn prepare(
-        &self,
-        document: Arc<wire::Publication>,
-    ) -> Result<Preparation<Self::Prepared, Error>> {
+impl Install for PublicationInstall {
+    fn prepare(&self, document: Document) -> Result<Preparation> {
         self.auth.check()?;
-        observe_receipt(&self.received, &document);
+        self.received(&document);
         self.target.prepare(document)
     }
 
-    fn install(&self, document: &wire::Publication, prepared: &Self::Prepared) -> Result<()> {
+    fn install(&self, document: &Document, prepared: &Prepared) -> Result<()> {
         self.auth.check()?;
         self.target.install(document, prepared)
     }
-}
 
-/// Keyring documents have their own generation and no delta representation.
-struct BundleCodec;
-
-impl Codec for BundleCodec {
-    type Document = wire::KeyringBundle;
-
-    type Version = u64;
-
-    type Error = Error;
-
-    fn version(&self, document: &Self::Document) -> u64 {
-        document.generation.0
-    }
-
-    fn decode(&self, bytes: &[u8]) -> Result<Self::Document> {
-        Ok(wire::decode_bundle(bytes)?)
-    }
-
-    fn delta(&self, _: &Self::Document, _: &[u8]) -> Result<Self::Document> {
-        Err(Error::InvalidRequest)
-    }
-
-    /// Hash the canonical content directly: sorted roots and the compact
-    /// key table (canonical by construction), without re-encoding and
-    /// re-validating the whole JSON bundle on each poll.
-    fn digest(&self, document: &Self::Document) -> Result<String> {
-        let mut hash = Sha256::new();
-        hash.update(b"racer/keyring/digest/v3\0");
-        hash.update(document.schema_version.to_be_bytes());
-        hash.update((document.cluster.0.len() as u64).to_be_bytes());
-        hash.update(document.cluster.0.as_bytes());
-        hash.update(document.generation.0.to_be_bytes());
-        let mut roots: Vec<_> = document.peer_trust_roots.iter().collect();
-        roots.sort();
-        hash.update((roots.len() as u64).to_be_bytes());
-        for root in roots {
-            hash.update((root.len() as u64).to_be_bytes());
-            hash.update(root);
+    fn received(&self, document: &Document) {
+        if let Document::Publication(document) = document {
+            observe_receipt(&self.received, document);
         }
-        let keys = wire::encode_cache_keys(&document.cache_keys)?;
-        hash.update(&*keys);
-        Ok(format!("{:x}", hash.finalize()))
     }
 }
 
 /// Key acceptance is separate from publication acceptance and identity renewal.
-struct BundleTarget {
+struct BundleInstall {
     auth: Rc<Authentication>,
 
     error: Rc<Cell<Option<Error>>>,
 }
 
-impl Target<BundleCodec> for BundleTarget {
-    type Prepared = Arc<wire::KeyringBundle>;
-
-    fn prepare(
-        &self,
-        document: Arc<wire::KeyringBundle>,
-    ) -> Result<Preparation<Self::Prepared, Error>> {
+impl Install for BundleInstall {
+    fn prepare(&self, document: Document) -> Result<Preparation> {
         self.auth.check()?;
+        let Document::Keyring(document) = document else {
+            return Err(Error::InvalidRequest);
+        };
         if &document.cluster != self.auth.enrollment.cluster() {
             return Err(Error::Unauthorized);
         }
         Ok(Box::new(move || {
             super::verifier(&document.peer_trust_roots)?;
-            Ok(document)
+            Ok(Prepared::Keyring(document))
         }))
     }
 
-    fn install(&self, _: &wire::KeyringBundle, prepared: &Self::Prepared) -> Result<()> {
+    fn install(&self, _: &Document, prepared: &Prepared) -> Result<()> {
         let result = (|| {
+            let Prepared::Keyring(prepared) = prepared else {
+                return Err(Error::InvalidRequest);
+            };
             self.auth.check()?;
             if self.auth.started.get() {
                 self.auth.secrets.install((**prepared).clone())?;
@@ -454,51 +413,39 @@ impl Session {
             return Err(Error::InvalidConfiguration);
         }
         self.enrollment_transport.attach_io(io.clone());
-        let source = |policy| {
+        let client = |doc, started| {
             let transport = transport(&self.endpoint);
             transport.attach_io(io.clone());
-            Client::new(
+            Box::new(Client {
                 transport,
-                FeedCredentials {
-                    auth: self.auth.clone(),
-                    policy,
-                },
-                "X-Racer-Delta-Base".into(),
-            )
+                auth: self.auth.clone(),
+                doc,
+                started,
+            })
         };
-        *self.publications.borrow_mut() = Some(Sync::new(
+        *self.publications.borrow_mut() = Some(Poll::new(
             io.clone(),
-            Feed::new(
-                ObservedPublication {
-                    received: self.received.clone(),
-                },
-                wire::SNAPSHOT_PATH.into(),
-                wire::MAX_PUBLICATION_BYTES,
-            )?,
-            PublicationSource {
-                client: source(RejectionPolicy::IdentityOnly),
-                started: self.publication_fetch_started.clone(),
-            },
-            PublicationInstall {
+            Doc::Publication,
+            client(
+                Doc::Publication,
+                Some(self.publication_fetch_started.clone()),
+            ),
+            Box::new(PublicationInstall {
                 target: self.snapshots.clone(),
                 received: self.received.clone(),
                 auth: self.auth.clone(),
-            },
-            schedule(),
+            }),
+            Schedule::control(),
         )?);
-        *self.keyrings.borrow_mut() = Some(Sync::new(
+        *self.keyrings.borrow_mut() = Some(Poll::new(
             io.clone(),
-            Feed::new(
-                BundleCodec,
-                wire::KEYRING_PATH.into(),
-                wire::MAX_BUNDLE_BYTES,
-            )?,
-            source(RejectionPolicy::TokenFallback),
-            BundleTarget {
+            Doc::Keyring,
+            client(Doc::Keyring, None),
+            Box::new(BundleInstall {
                 auth: self.auth.clone(),
                 error: self.keyring_error.clone(),
-            },
-            schedule(),
+            }),
+            Schedule::control(),
         )?);
         Ok(())
     }
@@ -556,7 +503,7 @@ impl Session {
         self.renewal_next.get()
     }
 
-    /// Startup uses issuance retry policy; the generic feed schedules serving polls.
+    /// Startup uses issuance retry policy; the publication poll schedules serving polls.
     pub fn next_attempt(&self) -> Option<Instant> {
         if self.auth.started.get() {
             self.publication_next.get()
@@ -719,7 +666,7 @@ impl Session {
         self.block_devices.borrow().clone()
     }
 
-    /// One publication Sync turn, concurrent with independent renewal policy.
+    /// One publication poll turn, concurrent with independent renewal policy.
     pub fn progress<'a>(&'a self, scope: &'a RequestScope) -> Operation<'a, ()> {
         Box::pin(async move {
             self.auth.check()?;
@@ -757,7 +704,7 @@ impl Session {
             };
             let result = {
                 // A quick 204 must not repeatedly abandon the current issuance.
-                // Only authentication policy is coordinated here; Sync owns all
+                // Only authentication policy is coordinated here; the poll owns all
                 // feed receipt, preparation, installation, and retry scheduling.
                 let publication = async {
                     let mut completed = None;
@@ -766,7 +713,7 @@ impl Session {
                         let result = {
                             let mut turn = Box::pin(driver.turn(scope));
                             std::future::poll_fn(|cx| {
-                                // Sync must always be polled during backoff: it
+                                // The poll must always be polled during backoff: it
                                 // drives local preparation and worker barriers.
                                 let result = turn.as_mut().poll(cx);
                                 if result.is_ready() {
@@ -786,7 +733,7 @@ impl Session {
                             return result;
                         }
                         // A completed fetch may only have submitted preparation.
-                        // Keep Sync ticking while issuance is held; never restart
+                        // Keep the poll ticking while issuance is held; never restart
                         // an active long poll just because renewal completed.
                         completed = Some(result);
                     }
@@ -810,7 +757,7 @@ impl Session {
         })
     }
 
-    /// Independently advance key delivery, keeping generic retry and acceptance state.
+    /// Independently advance key delivery, keeping its own retry and acceptance state.
     pub fn keyring_progress<'a>(&'a self, scope: &'a RequestScope) -> Operation<'a, ()> {
         Box::pin(async move {
             self.auth.check()?;
@@ -972,23 +919,7 @@ impl Session {
 
 /// Validate the structured code/status agreement before retry or auth classification.
 pub(super) fn validate_response(response: &rest::Response) -> Result<()> {
-    if response.status == 200 || response.status == 204 {
-        return Ok(());
-    }
-    let (status, error) = match wire::decode_error(&response.body)?.code {
-        wire::ProtocolFailure::InvalidRequest => (400, Error::InvalidRequest),
-        wire::ProtocolFailure::Unauthenticated => (401, Error::Unauthorized),
-        wire::ProtocolFailure::Forbidden => (403, Error::Unauthorized),
-        wire::ProtocolFailure::Conflict => (409, Error::Replay),
-        wire::ProtocolFailure::TooLarge => (413, Error::InvalidRequest),
-        wire::ProtocolFailure::UnsupportedVersion => (426, Error::IncompatibleMembership),
-        wire::ProtocolFailure::Overloaded => (429, Error::Overloaded),
-        wire::ProtocolFailure::Unavailable => (503, Error::Unavailable),
-    };
-    if status != response.status {
-        return Err(Error::InvalidRequest);
-    }
-    Err(error)
+    poll::validate_response(response)
 }
 
 /// Separate REST pool per feed and for issuance. Managed pools follow the shared
@@ -1006,27 +937,13 @@ pub(super) fn transport(endpoint: &ControlEndpoint) -> rest::Transport<ReactorCo
     transport
 }
 
-/// Generic feed progress remains responsive during held polls and remote backoff.
-fn schedule() -> Schedule {
-    Schedule {
-        turn: wire::POLL_WAIT + Duration::from_secs(10),
-        tick: Duration::from_millis(10),
-        retry_min: Duration::from_secs(1),
-        retry_max: Duration::from_secs(30),
-    }
-}
-
 #[cfg(test)]
 pub(super) mod tests {
-    //! Scripted application policy over the real generic feed and synchronization owners.
+    //! Scripted application policy over the real long-poll owners.
 
     use super::*;
-    use crate::control::plane::feed::{FetchError, Source};
-    use std::{
-        collections::VecDeque,
-        future::Future,
-        task::{Context, Poll},
-    };
+    use std::sync::Arc;
+    use std::{collections::VecDeque, future::Future, task::Context};
 
     /// Receipts never regress by sequence and remain independent of acceptance.
     #[test]
@@ -1049,7 +966,7 @@ pub(super) mod tests {
         assert_eq!(received.get(), Some((1, publication.membership_version.0)));
     }
 
-    /// Scripted wire boundary; real Feed/Sync still owns all protocol progress.
+    /// Scripted wire boundary; the real Poll still owns all protocol progress.
     struct Script {
         responses: RefCell<VecDeque<rest::Response>>,
 
@@ -1058,14 +975,14 @@ pub(super) mod tests {
         requests: Rc<RefCell<Vec<(String, Option<String>)>>>,
     }
 
-    impl Source<ReactorControlIo> for Script {
+    impl Fetch for Script {
         fn get<'a>(
             &'a self,
             path: &'a str,
             digest: Option<&'a str>,
             _: usize,
             _: &'a RequestScope,
-        ) -> racer_io::Operation<'a, rest::Response, FetchError<Error>> {
+        ) -> racer_io::Operation<'a, rest::Response, FetchError> {
             Box::pin(async move {
                 self.requests
                     .borrow_mut()
@@ -1086,12 +1003,35 @@ pub(super) mod tests {
         fn close(&self) {}
     }
 
+    /// A poll over a scripted wire boundary with the session's real install hook.
+    fn scripted(env: &racer_io::Env, session: &Session, doc: Doc, source: Script) -> Poll {
+        let install: Box<dyn Install> = match doc {
+            Doc::Publication => Box::new(PublicationInstall {
+                target: session.snapshots.clone(),
+                received: session.received.clone(),
+                auth: session.auth.clone(),
+            }),
+            Doc::Keyring => Box::new(BundleInstall {
+                auth: session.auth.clone(),
+                error: session.keyring_error.clone(),
+            }),
+        };
+        Poll::new(
+            host(env),
+            doc,
+            Box::new(source),
+            install,
+            Schedule::control(),
+        )
+        .unwrap()
+    }
+
     /// Explicit simulated clock progression with a host watchdog and CPU yield.
     fn drive<T>(clock: &racer_io::SimClock, operation: impl Future<Output = T>) -> T {
         let mut operation = std::pin::pin!(operation);
         let until = Instant::now() + Duration::from_secs(5);
         loop {
-            if let Poll::Ready(result) = operation
+            if let std::task::Poll::Ready(result) = operation
                 .as_mut()
                 .poll(&mut Context::from_waker(futures::task::noop_waker_ref()))
             {
@@ -1117,7 +1057,7 @@ pub(super) mod tests {
         )))
     }
 
-    /// Long enough for several independent generic retry turns.
+    /// Long enough for several independent retry turns.
     fn scope(env: &racer_io::Env) -> RequestScope {
         RequestScope::on(
             &env.ctx.clock,
@@ -1209,29 +1149,22 @@ pub(super) mod tests {
                 retry_after: None,
             });
             let requests = Rc::new(RefCell::new(Vec::new()));
-            let mut sync = Sync::new(
+            let mut sync = Poll::new(
                 host(&env),
-                Feed::new(
-                    ObservedPublication {
-                        received: session.received.clone(),
-                    },
-                    wire::SNAPSHOT_PATH.into(),
-                    wire::MAX_PUBLICATION_BYTES,
-                )
-                .unwrap(),
-                Script {
+                Doc::Publication,
+                Box::new(Script {
                     responses: RefCell::new(responses),
                     requests: requests.clone(),
-                },
-                PublicationInstall {
+                }),
+                Box::new(PublicationInstall {
                     target: session.snapshots.clone(),
                     received: session.received.clone(),
                     auth: session.auth.clone(),
-                },
-                schedule(),
+                }),
+                Schedule::control(),
             )
             .unwrap();
-            sync.seed(Arc::new(first)).unwrap();
+            sync.seed(Document::Publication(Arc::new(first))).unwrap();
             let scope = scope(&env);
             if pending {
                 drive(&clock, sync.turn(&scope)).unwrap();
@@ -1332,20 +1265,6 @@ pub(super) mod tests {
             (true, vec![], true),
             (true, vec![b'x'], false),
         ] {
-            let feed = Feed::new(
-                BundleCodec,
-                wire::KEYRING_PATH.into(),
-                wire::MAX_BUNDLE_BYTES,
-            )
-            .unwrap();
-            if seed {
-                let bundle = wire::decode_bundle(include_bytes!(concat!(
-                    env!("CARGO_MANIFEST_DIR"),
-                    "/wire/testdata/bundle.json"
-                )))
-                .unwrap();
-                feed.restore(Some(Arc::new(bundle)));
-            }
             let source = Script {
                 responses: RefCell::new(VecDeque::from([rest::Response {
                     status: 204,
@@ -1354,10 +1273,16 @@ pub(super) mod tests {
                 }])),
                 requests: Rc::new(RefCell::new(vec![])),
             };
-            assert_eq!(
-                drive(&clock, feed.fetch::<ReactorControlIo, _>(&source, &scope)).is_ok(),
-                success
-            );
+            let feed = scripted(&env, &session, Doc::Keyring, source);
+            if seed {
+                let bundle = wire::decode_bundle(include_bytes!(concat!(
+                    env!("CARGO_MANIFEST_DIR"),
+                    "/wire/testdata/bundle.json"
+                )))
+                .unwrap();
+                feed.restore(Some(Document::Keyring(Arc::new(bundle))));
+            }
+            assert_eq!(drive(&clock, feed.fetch(&scope)).is_ok(), success);
         }
         assert!(
             session
@@ -1377,17 +1302,10 @@ pub(super) mod tests {
     pub(crate) fn canonical_delta_and_get_only(env: &racer_io::Env) {
         let clock = racer_io::SimClock::new(734);
         let env = racer_io::Env::new(env.driver.clone(), clock.ctx(0));
-        let feed = Feed::new(
-            PublicationCodec,
-            wire::SNAPSHOT_PATH.into(),
-            wire::MAX_PUBLICATION_BYTES,
-        )
-        .unwrap();
-        let p = document(1);
-        let digest = PublicationCodec.digest(&p).unwrap();
+        let p = Document::Publication(Arc::new(document(1)));
+        let digest = p.digest().unwrap();
         assert_eq!(digest.len(), 64);
         assert!(digest.bytes().all(|b| b.is_ascii_hexdigit()));
-        feed.restore(Some(Arc::new(p)));
         let requests = Rc::new(RefCell::new(vec![]));
         let source = Script {
             responses: RefCell::new(VecDeque::from([rest::Response {
@@ -1397,11 +1315,9 @@ pub(super) mod tests {
             }])),
             requests: requests.clone(),
         };
-        drive(
-            &clock,
-            feed.fetch::<ReactorControlIo, _>(&source, &scope(&env)),
-        )
-        .unwrap();
+        let feed = scripted(&env, &session(&env), Doc::Publication, source);
+        feed.restore(Some(p));
+        drive(&clock, feed.fetch(&scope(&env))).unwrap();
         assert_eq!(
             requests.borrow()[0],
             (format!("{}?after=1", wire::SNAPSHOT_PATH), Some(digest))
@@ -1412,12 +1328,15 @@ pub(super) mod tests {
     pub(crate) fn reject_future_identity(env: &racer_io::Env, identity: LocalSigningIdentity) {
         let session = session(env);
         *session.auth.identity.borrow_mut() = Some(identity);
-        let credentials = FeedCredentials {
+        let client = Client {
+            transport: transport(&session.endpoint),
             auth: session.auth.clone(),
-            policy: RejectionPolicy::IdentityOnly,
+            doc: Doc::Publication,
+            started: None,
         };
-        assert!(credentials.identity().unwrap().is_none());
-        assert_eq!(credentials.policy(), RejectionPolicy::IdentityOnly);
+        assert!(client.identity().unwrap().is_none());
+        assert_eq!(Doc::Publication.rejection(), Rejection::IdentityOnly);
+        assert_eq!(Doc::Keyring.rejection(), Rejection::TokenFallback);
     }
 
     /// Pending documents, not lossy reconstructed snapshots, form the next delta base.
@@ -1459,26 +1378,19 @@ pub(super) mod tests {
             ])),
             requests: requests.clone(),
         };
-        let mut sync = Sync::new(
+        let mut sync = Poll::new(
             host(&env),
-            Feed::new(
-                ObservedPublication {
-                    received: session.received.clone(),
-                },
-                wire::SNAPSHOT_PATH.into(),
-                wire::MAX_PUBLICATION_BYTES,
-            )
-            .unwrap(),
-            source,
-            PublicationInstall {
+            Doc::Publication,
+            Box::new(source),
+            Box::new(PublicationInstall {
                 target: session.snapshots.clone(),
                 received: session.received.clone(),
                 auth: session.auth.clone(),
-            },
-            schedule(),
+            }),
+            Schedule::control(),
         )
         .unwrap();
-        sync.seed(Arc::new(first)).unwrap();
+        sync.seed(Document::Publication(Arc::new(first))).unwrap();
         let scope = scope(&env);
         drive(&clock, sync.turn(&scope)).unwrap();
         drive(&clock, sync.turn(&scope)).unwrap();
