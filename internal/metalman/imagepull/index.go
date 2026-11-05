@@ -105,7 +105,10 @@ func (i *Image) buildIndexOnce(ctx context.Context, li int) (x *layerIndex, mirr
 
 	ls, err := i.openLayer(ctx, li)
 	if err != nil {
-		return nil, false, err
+		// A decoder that fails on its header at open time has already
+		// quarantined the mirror blob; report it as mirrored so the
+		// caller retries upstream.
+		return nil, errors.Is(err, errMirrorDecode), err
 	}
 	defer ls.Close() //nolint:errcheck // read-only stream
 	defer func() { mirrored = ls.blob.fromMirror() }()

@@ -486,3 +486,92 @@ func TestUndecodableLayerWithoutMirror(t *testing.T) {
 		t.Fatal("no blob request")
 	}
 }
+
+// badHeader overwrites the first bytes of a compressed blob so the
+// decoder rejects its header (gzip magic or zstd frame magic).
+func badHeader(b []byte) []byte {
+	out := bytes.Clone(b)
+	for k := 0; k < 8 && k < len(out); k++ {
+		out[k] = 0x00
+	}
+
+	return out
+}
+
+func pushBig(t *testing.T, reg *ipt.Registry, comp ipt.Compression, size int) (string, []byte, string) {
+	t.Helper()
+
+	content := randomBytes(size, 13)
+	ref, dgst := reg.Push(t, "img", "v1", ipt.ImageSpec{Layers: []ipt.Layer{{
+		Files:       map[string][]byte{"disk/big": content},
+		Compression: comp,
+	}}})
+
+	layers := reg.LayerDigests(dgst)
+	if len(layers) != 1 {
+		t.Fatalf("layers = %v", layers)
+	}
+
+	return ref, content, layers[0]
+}
+
+// TestBadHeaderMirrorOpenRetriedFromUpstream covers a cold Open (no index
+// yet) when the mirror serves a layer whose compression header does not
+// decode: the index build must quarantine the mirror blob and retry
+// upstream rather than fail.
+func TestBadHeaderMirrorOpenRetriedFromUpstream(t *testing.T) {
+	for name, comp := range map[string]ipt.Compression{"gzip": ipt.Gzip, "zstd": ipt.Zstd} {
+		t.Run(name, func(t *testing.T) {
+			upstream := ipt.NewRegistry(t)
+			ref, content, layer := pushBig(t, upstream, comp, 64*1024)
+			mirror, served := garbageMirror(t, upstream, layer, badHeader)
+
+			p := &imagepull.Puller{Mirror: mirror.URL, ChunkSize: 1024}
+			img := resolve(t, p, imagepull.Source{Ref: ref})
+
+			f, err := img.Open(t.Context(), "disk/big")
+			if err != nil {
+				t.Fatalf("Open: %v", err)
+			}
+			defer f.Close() //nolint:errcheck // test
+
+			data, err := io.ReadAll(f)
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			if !bytes.Equal(data, content) {
+				t.Fatal("content mismatch")
+			}
+
+			if served.Load() == 0 {
+				t.Fatal("mirror never served the bad blob")
+			}
+
+			if upstreamBlobReads(upstream, layer) == 0 {
+				t.Fatal("upstream received no blob request")
+			}
+
+			if got := imagepull.QuarantineLen(p); got != 1 {
+				t.Fatalf("quarantine len = %d, want 1", got)
+			}
+		})
+	}
+}
+
+func TestBadHeaderUpstreamOpenWithoutMirror(t *testing.T) {
+	for name, comp := range map[string]ipt.Compression{"gzip": ipt.Gzip, "zstd": ipt.Zstd} {
+		t.Run(name, func(t *testing.T) {
+			upstream := ipt.NewRegistry(t)
+			ref, _, layer := pushBig(t, upstream, comp, 64*1024)
+
+			img := resolve(t, &imagepull.Puller{ChunkSize: 1024}, imagepull.Source{Ref: ref})
+			upstream.SetBlob(layer, badHeader(upstreamBlob(t, upstream, layer)))
+
+			_, err := img.Open(t.Context(), "disk/big")
+			if !errors.Is(err, imagepull.ErrCorruptLayer) {
+				t.Fatalf("err = %v, want ErrCorruptLayer", err)
+			}
+		})
+	}
+}
