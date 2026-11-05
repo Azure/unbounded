@@ -57,9 +57,13 @@ spec:
                     description: |-
                       Mode ProtectedLabel projects only the fixed
                       node-restriction.kubernetes.io/project-signal-qualified=true contract.
-                      It requires the Node authorizer and NodeRestriction admission plugin.
-                      Controllers must fail closed instead of projecting the label when that
-                      protection is unavailable.
+                      The shared label is present only when protection is positively verified,
+                      at least one ProtectedLabel Policy exists, and every ProtectedLabel Policy
+                      has a Qualified, unexpired NodeCertification for the exact Node UID.
+                      Otherwise controllers must remove it. Protection requires the Node
+                      authorizer and NodeRestriction admission plugin; the API cannot discover
+                      their configuration. Deployment must provide verified configuration and
+                      RBAC must restrict non-node identities that can patch Nodes.
                     enum:
                     - None
                     - ProtectedLabel
@@ -171,6 +175,12 @@ spec:
                   - profile
                   - requiredPassCount
                   type: object
+                  x-kubernetes-validations:
+                  - message: minDistinctPlanDigests must not exceed the number of
+                      listed plan digests
+                    rule: self.acceptedPlans.mode != 'Listed' || !has(self.variation)
+                      || !has(self.variation.minDistinctPlanDigests) || self.variation.minDistinctPlanDigests
+                      <= size(self.acceptedPlans.digests)
                 maxItems: 32
                 minItems: 1
                 type: array
@@ -190,6 +200,9 @@ spec:
             x-kubernetes-validations:
             - message: invalidationFingerprintFields must include NodeUID
               rule: self.invalidationFingerprintFields.exists(x, x == 'NodeUID')
+            - message: the total required pass count must not exceed the contributing
+                Run limit
+              rule: self.requirements.map(x, x.requiredPassCount).sum() <= 64
             - message: validity must be positive
               rule: duration(self.validity) > duration('0s')
             - message: renewBefore must be positive

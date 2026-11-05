@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	apiextensionsv1 "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1"
@@ -249,6 +250,23 @@ func TestCertificationRunPlanAndEvidenceContract(t *testing.T) {
 		t.Fatalf("evidence URI maxLength = %v, want 2048", maxLength)
 	}
 
+	for _, rule := range []string{
+		"!has(oldSelf.uri) || oldSelf.uri.size() == 0 || (has(self.uri) && self.uri == oldSelf.uri)",
+		"!has(oldSelf.digest) || oldSelf.digest.size() == 0 || (has(self.digest) && self.digest == oldSelf.digest)",
+		"!has(oldSelf.identity) || (has(self.identity) && self.identity == oldSelf.identity)",
+	} {
+		if !hasValidationRule(&evidence, rule) {
+			t.Fatalf("evidence has no %q write-once rule", rule)
+		}
+	}
+
+	if !hasValidationRule(
+		root,
+		"!has(self.status) || !has(self.status.evidence) || !has(self.status.evidence.identity) || (has(self.spec.planDigest) && self.status.evidence.identity.planDigest == self.spec.planDigest)",
+	) {
+		t.Fatal("Run does not bind evidence identity to spec.planDigest")
+	}
+
 	identity := evidence.Properties["identity"]
 
 	participants := identity.Properties["participants"]
@@ -296,9 +314,30 @@ func TestCertificationPolicyContract(t *testing.T) {
 		t.Fatal("Policy does not require NodeUID invalidation")
 	}
 
+	if !hasValidationRule(&spec, "self.requirements.map(x, x.requiredPassCount).sum() <= 64") {
+		t.Fatal("Policy does not bound total required passes by ledger capacity")
+	}
+
+	if !hasValidationRule(
+		requirement,
+		"self.acceptedPlans.mode != 'Listed' || !has(self.variation) || !has(self.variation.minDistinctPlanDigests) || self.variation.minDistinctPlanDigests <= size(self.acceptedPlans.digests)",
+	) {
+		t.Fatal("Listed plans do not bound minDistinctPlanDigests by listed digest count")
+	}
+
 	gateMode := spec.Properties["gateProjection"].Properties["mode"]
 	if !containsJSONEnum(gateMode.Enum, `"ProtectedLabel"`) {
 		t.Fatalf("gate projection enum = %s, want ProtectedLabel", gateMode.Enum)
+	}
+
+	for _, contract := range []string{
+		"every ProtectedLabel Policy",
+		"NodeRestriction admission plugin",
+		"RBAC must restrict non-node identities",
+	} {
+		if !strings.Contains(gateMode.Description, contract) {
+			t.Fatalf("gate projection description does not contain %q", contract)
+		}
 	}
 }
 
@@ -329,10 +368,21 @@ func TestNodeCertificationContract(t *testing.T) {
 	}
 
 	root := crd.Spec.Versions[0].Schema.OpenAPIV3Schema
+	for _, contract := range []string{
+		"No ledger individually owns the shared qualification label",
+		"GateProjected=False",
+		"NodeRestrictionUnverified",
+	} {
+		if !strings.Contains(root.Description, contract) {
+			t.Fatalf("NodeCertification description does not contain %q", contract)
+		}
+	}
 
 	spec := root.Properties["spec"]
 	for _, rule := range []string{
-		"self.policy == oldSelf.policy",
+		"self.policy.name == oldSelf.policy.name",
+		"self.policy.uid == oldSelf.policy.uid",
+		"self.policy.generation >= oldSelf.policy.generation",
 		"self.nodeName == oldSelf.nodeName",
 		"self.nodeUID == oldSelf.nodeUID",
 	} {
@@ -342,12 +392,29 @@ func TestNodeCertificationContract(t *testing.T) {
 	}
 
 	status := root.Properties["status"]
+
+	observedGeneration := status.Properties["observedGeneration"]
+	if observedGeneration.Minimum == nil || *observedGeneration.Minimum != 0 {
+		t.Fatalf("observedGeneration minimum = %v, want 0", observedGeneration.Minimum)
+	}
+
 	if maxItems := status.Properties["contributingRuns"].MaxItems; maxItems == nil || *maxItems != 64 {
 		t.Fatalf("contributingRuns maxItems = %v, want 64", maxItems)
 	}
 
-	if maxItems := status.Properties["planDigests"].MaxItems; maxItems == nil || *maxItems != 32 {
-		t.Fatalf("planDigests maxItems = %v, want 32", maxItems)
+	if maxItems := status.Properties["planDigests"].MaxItems; maxItems == nil || *maxItems != MaxContributingRuns {
+		t.Fatalf("planDigests maxItems = %v, want %d", maxItems, MaxContributingRuns)
+	}
+
+	if NodeCertificationConditionGateProjected != "GateProjected" {
+		t.Fatalf("gate condition = %q, want GateProjected", NodeCertificationConditionGateProjected)
+	}
+
+	if NodeCertificationReasonProtectionUnverified != "NodeRestrictionUnverified" {
+		t.Fatalf(
+			"unverified protection reason = %q, want NodeRestrictionUnverified",
+			NodeCertificationReasonProtectionUnverified,
+		)
 	}
 
 	phase := status.Properties["phase"]

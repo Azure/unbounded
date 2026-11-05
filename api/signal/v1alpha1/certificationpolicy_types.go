@@ -13,6 +13,8 @@ const (
 	NodeQualificationValue = "true"
 )
 
+const MaxContributingRuns = 64
+
 type PolicyProfileReference struct {
 	// +kubebuilder:validation:MinLength=1
 	// +kubebuilder:validation:MaxLength=253
@@ -58,6 +60,7 @@ const (
 	QualificationCreditPerParticipant  QualificationCreditRule = "PerParticipant"
 )
 
+// +kubebuilder:validation:XValidation:rule="self.acceptedPlans.mode != 'Listed' || !has(self.variation) || !has(self.variation.minDistinctPlanDigests) || self.variation.minDistinctPlanDigests <= size(self.acceptedPlans.digests)",message="minDistinctPlanDigests must not exceed the number of listed plan digests"
 type CertificationRequirement struct {
 	// +kubebuilder:validation:MinLength=1
 	// +kubebuilder:validation:MaxLength=63
@@ -106,13 +109,18 @@ const (
 type GateProjection struct {
 	// Mode ProtectedLabel projects only the fixed
 	// node-restriction.kubernetes.io/project-signal-qualified=true contract.
-	// It requires the Node authorizer and NodeRestriction admission plugin.
-	// Controllers must fail closed instead of projecting the label when that
-	// protection is unavailable.
+	// The shared label is present only when protection is positively verified,
+	// at least one ProtectedLabel Policy exists, and every ProtectedLabel Policy
+	// has a Qualified, unexpired NodeCertification for the exact Node UID.
+	// Otherwise controllers must remove it. Protection requires the Node
+	// authorizer and NodeRestriction admission plugin; the API cannot discover
+	// their configuration. Deployment must provide verified configuration and
+	// RBAC must restrict non-node identities that can patch Nodes.
 	Mode GateProjectionMode `json:"mode"`
 }
 
 // +kubebuilder:validation:XValidation:rule="self.invalidationFingerprintFields.exists(x, x == 'NodeUID')",message="invalidationFingerprintFields must include NodeUID"
+// +kubebuilder:validation:XValidation:rule="self.requirements.map(x, x.requiredPassCount).sum() <= 64",message="the total required pass count must not exceed the contributing Run limit"
 // +kubebuilder:validation:XValidation:rule="duration(self.validity) > duration('0s')",message="validity must be positive"
 // +kubebuilder:validation:XValidation:rule="duration(self.renewBefore) > duration('0s')",message="renewBefore must be positive"
 // +kubebuilder:validation:XValidation:rule="duration(self.renewBefore) < duration(self.validity)",message="renewBefore must be less than validity"
