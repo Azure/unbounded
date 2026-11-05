@@ -248,6 +248,19 @@ func (f *FileResolver) ImageMetadata(ctx context.Context, src ImageSource) (*Ima
 	return f.Metadata.get(ctx, src, f.fetchMetadata)
 }
 
+// ImageMetadataOrStale is ImageMetadata for DHCP replies. When the lookup
+// fails or ctx expires, it falls back to the last successful metadata for src
+// (see MetadataMemo.StaleTTL) and reports stale with the lookup error. Without
+// a MetadataMemo it behaves like ImageMetadata.
+func (f *FileResolver) ImageMetadataOrStale(ctx context.Context, src ImageSource) (meta *ImageMetadata, stale bool, err error) {
+	if f.Metadata == nil {
+		meta, err = f.fetchMetadata(ctx, src)
+		return meta, false, err
+	}
+
+	return f.Metadata.getOrStale(ctx, src, f.fetchMetadata)
+}
+
 // PinnedImageMetadata returns the parsed metadata of an already resolved
 // image. Results are memoized by manifest digest, so they always describe
 // img itself even after the tag it was resolved from moves.

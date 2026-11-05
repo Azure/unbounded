@@ -19,6 +19,9 @@ const (
 	DefaultMetadataErrorTTL = 5 * time.Second
 	// DefaultMetadataFetchTimeout bounds one shared metadata fetch.
 	DefaultMetadataFetchTimeout = time.Minute
+	// DefaultMetadataStaleTTL is how long the last successful lookup stays
+	// usable as a fallback for DHCP replies after its TTL expires.
+	DefaultMetadataStaleTTL = time.Hour
 )
 
 // MetadataMemo memoizes parsed disk/metadata.yaml for a short time.
@@ -34,6 +37,12 @@ const (
 // up to TTL. Lookups for an already resolved image (HTTP and TFTP file
 // requests, which pin one image per request) are keyed by manifest digest,
 // so the metadata always matches the content served from that image.
+//
+// DHCP replies use ImageMetadataOrStale: when a refresh of an expired entry
+// fails or outlasts the DHCP wait, they fall back to the last successful
+// lookup for the same key (for up to StaleTTL) while the refresh keeps
+// running, so a slow or briefly unavailable registry does not strip the boot
+// file from replies. HTTP and TFTP file requests never use stale metadata.
 //
 // Only the parsed metadata is memoized. Image content is never cached:
 // every file request pulls the file from the registry or mirror again.
@@ -55,12 +64,19 @@ type MetadataMemo struct {
 	// a later fetch on a slow link joins that build instead of starting
 	// the layer download over.
 	FetchTimeout time.Duration
+	// StaleTTL is how long after it was fetched the last successful lookup
+	// for a key may be used as a fallback by getOrStale. Zero means
+	// DefaultMetadataStaleTTL; a negative value disables the fallback.
+	StaleTTL time.Duration
 	// Now returns the current time. Nil means time.Now.
 	Now func() time.Time
 
 	mu      sync.Mutex
 	entries map[string]metadataEntry
-	group   singleflight.Group
+	// good holds the last successful lookup per key, kept past its TTL
+	// until StaleTTL for getOrStale.
+	good  map[string]goodEntry
+	group singleflight.Group
 }
 
 type metadataKey struct {
@@ -72,6 +88,11 @@ type metadataEntry struct {
 	meta    *ImageMetadata
 	err     error
 	expires time.Time
+}
+
+type goodEntry struct {
+	meta    *ImageMetadata
+	fetched time.Time
 }
 
 func newMetadataKey(src ImageSource) metadataKey {
@@ -107,6 +128,14 @@ func (m *MetadataMemo) fetchTimeout() time.Duration {
 	return DefaultMetadataFetchTimeout
 }
 
+func (m *MetadataMemo) staleTTL() time.Duration {
+	if m.StaleTTL == 0 {
+		return DefaultMetadataStaleTTL
+	}
+
+	return m.StaleTTL
+}
+
 // ttl returns how long a lookup result is reused. Failures and images without
 // metadata.yaml use ErrorTTL, so a newly pushed metadata.yaml is seen quickly.
 func (m *MetadataMemo) ttl(meta *ImageMetadata, err error) time.Duration {
@@ -130,6 +159,47 @@ func (m *MetadataMemo) get(ctx context.Context, src ImageSource, fetch func(cont
 	return m.lookup(ctx, "ref "+newMetadataKey(src).flightKey(), func(ctx context.Context) (*ImageMetadata, error) {
 		return fetch(ctx, src)
 	})
+}
+
+// getOrStale is get for DHCP replies. When the lookup fails, including when
+// ctx expires while a refresh is still running, it returns the last
+// successful result for src if that was fetched within StaleTTL, with stale
+// set and err holding the lookup error. The refresh is not canceled and
+// updates the entry when it completes.
+func (m *MetadataMemo) getOrStale(ctx context.Context, src ImageSource, fetch func(context.Context, ImageSource) (*ImageMetadata, error)) (meta *ImageMetadata, stale bool, err error) {
+	key := "ref " + newMetadataKey(src).flightKey()
+
+	meta, err = m.lookup(ctx, key, func(ctx context.Context) (*ImageMetadata, error) {
+		return fetch(ctx, src)
+	})
+	if err == nil {
+		return meta, false, nil
+	}
+
+	if old, ok := m.lastGood(key); ok {
+		return old, true, err
+	}
+
+	return nil, false, err
+}
+
+// lastGood returns the last successful result for key if it is within
+// StaleTTL.
+func (m *MetadataMemo) lastGood(key string) (*ImageMetadata, bool) {
+	ttl := m.staleTTL()
+	if ttl < 0 {
+		return nil, false
+	}
+
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	g, ok := m.good[key]
+	if !ok || !m.now().Before(g.fetched.Add(ttl)) {
+		return nil, false
+	}
+
+	return g.meta, true
 }
 
 // getPinned returns the memoized metadata of the image with manifest digest
@@ -170,22 +240,7 @@ func (m *MetadataMemo) lookup(ctx context.Context, key string, fetch func(contex
 
 		meta, err := fetch(fetchCtx)
 
-		if ttl := m.ttl(meta, err); ttl > 0 {
-			m.mu.Lock()
-			if m.entries == nil {
-				m.entries = map[string]metadataEntry{}
-			}
-
-			now := m.now()
-			for k, e := range m.entries {
-				if !now.Before(e.expires) {
-					delete(m.entries, k)
-				}
-			}
-
-			m.entries[key] = metadataEntry{meta: meta, err: err, expires: now.Add(ttl)}
-			m.mu.Unlock()
-		}
+		m.store(key, meta, err)
 
 		return meta, err
 	})
@@ -201,5 +256,42 @@ func (m *MetadataMemo) lookup(ctx context.Context, key string, fetch func(contex
 		meta, _ := res.Val.(*ImageMetadata) //nolint:errcheck // the flight only returns *ImageMetadata
 
 		return meta, nil
+	}
+}
+
+// store records the result of a fetch for key and prunes expired entries.
+func (m *MetadataMemo) store(key string, meta *ImageMetadata, err error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	now := m.now()
+
+	for k, e := range m.entries {
+		if !now.Before(e.expires) {
+			delete(m.entries, k)
+		}
+	}
+
+	staleTTL := m.staleTTL()
+	for k, g := range m.good {
+		if staleTTL < 0 || !now.Before(g.fetched.Add(staleTTL)) {
+			delete(m.good, k)
+		}
+	}
+
+	if ttl := m.ttl(meta, err); ttl > 0 {
+		if m.entries == nil {
+			m.entries = map[string]metadataEntry{}
+		}
+
+		m.entries[key] = metadataEntry{meta: meta, err: err, expires: now.Add(ttl)}
+	}
+
+	if err == nil && meta != nil && staleTTL >= 0 {
+		if m.good == nil {
+			m.good = map[string]goodEntry{}
+		}
+
+		m.good[key] = goodEntry{meta: meta, fetched: now}
 	}
 }

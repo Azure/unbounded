@@ -114,7 +114,11 @@ Each TFTP or HTTP request resolves the image tag once and reads both
 that moves mid-boot never mixes one image's metadata with another's files.
 Metadata for a resolved digest is reused for about one minute. DHCP replies
 and Redfish boot settings look metadata up by tag and may use the previous
-image's metadata for up to one minute after the tag moves.
+image's metadata for up to one minute after the tag moves. If refreshing a
+tag's metadata fails or takes longer than the DHCP reply can wait, DHCP
+replies keep using the last metadata fetched for that tag (for up to one
+hour) while the refresh continues, so a slow or briefly unavailable registry
+does not remove the boot file from replies.
 
 Images are built, tagged, and pushed using standard container tooling:
 

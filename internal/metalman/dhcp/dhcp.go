@@ -224,9 +224,15 @@ func (s *Server) handler(conn net.PacketConn, peer net.Addr, m *dhcpv4.DHCPv4) {
 		}
 
 		metaCtx, cancel := context.WithTimeout(ctx, timeout)
-		meta, err := s.Images.ImageMetadata(metaCtx, src)
+		meta, stale, err := s.Images.ImageMetadataOrStale(metaCtx, src)
 
 		cancel()
+
+		if stale {
+			log.Info("using last known OCI image metadata", "image", netbootImage, "architecture", architecture, "err", err)
+
+			err = nil
+		}
 
 		if err != nil {
 			log.Warn("OCI image metadata not available", "image", netbootImage, "architecture", architecture, "err", err)
