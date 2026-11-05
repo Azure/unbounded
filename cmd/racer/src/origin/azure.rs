@@ -481,7 +481,7 @@ impl<T: AzureTransport, K: AzureTokenSource> AzureOrigin<T, K> {
                     || blob.content_length != last + 1
                     || blob.content_length != total.min(PAGE_BYTES)
                 {
-                    return Err(Error::Internal);
+                    return Err(Error::BadGateway);
                 }
                 (blob, total)
             }
@@ -491,7 +491,7 @@ impl<T: AzureTransport, K: AzureTokenSource> AzureOrigin<T, K> {
                 if response::field(head, "Content-Range")?.is_some()
                     || blob.content_length > PAGE_BYTES
                 {
-                    return Err(Error::Internal);
+                    return Err(Error::BadGateway);
                 }
                 let total = blob.content_length;
                 (blob, total)
@@ -624,7 +624,8 @@ impl<T: AzureTransport, K: AzureTokenSource> AzureOrigin<T, K> {
         let head = exchange.head();
         match status(head)? {
             206 => {}
-            200 => return Err(Error::Internal),
+            // The service ignored the page range.
+            200 => return Err(Error::BadGateway),
             _ => return Err(self.reject(exchange, true, &begun.scope).await),
         }
         let blob = response::blob(head, &begun.object)?;
@@ -636,7 +637,7 @@ impl<T: AzureTransport, K: AzureTokenSource> AzureOrigin<T, K> {
             || blob.content_length != got_last - got_first + 1
             || blob.content_length != (total - first).min(PAGE_BYTES)
         {
-            return Err(Error::Internal);
+            return Err(Error::BadGateway);
         }
         let metadata = metadata(
             &context.object,

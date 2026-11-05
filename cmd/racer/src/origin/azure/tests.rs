@@ -412,7 +412,7 @@ fn bootstrap_small_object_and_version_id() {
     h.blob(200, PAGE_BYTES + 1, None, &[]);
     assert_eq!(
         h.bootstrap(&context("k", "")).map(|_| ()),
-        Err(Error::Internal)
+        Err(Error::BadGateway)
     );
 }
 
@@ -525,13 +525,13 @@ fn page_rejects_version_changes_and_bad_framing() {
         h.blob(206, 5, Some(bad.into()), &[]);
         assert_eq!(
             h.page(&context, 0).map(|_| ()),
-            Err(Error::Internal),
+            Err(Error::BadGateway),
             "{bad}"
         );
     }
     // Content-Length disagrees with the range.
     h.blob(206, 4, range(), &[]);
-    assert_eq!(h.page(&context, 0).map(|_| ()), Err(Error::Internal));
+    assert_eq!(h.page(&context, 0).map(|_| ()), Err(Error::BadGateway));
     // Short body: the connection closed early.
     h.push(206, &fake_head(ETAG), vec![0; 3]);
     assert_eq!(h.page(&context, 0).map(|_| ()), Err(Error::Unavailable));
@@ -539,7 +539,7 @@ fn page_rejects_version_changes_and_bad_framing() {
     h.blob(206, 5, range(), &[("Transfer-Encoding", b"chunked")]);
     assert_eq!(h.page(&context, 0).map(|_| ()), Err(Error::BadGateway));
     h.blob(200, 5, None, &[]);
-    assert_eq!(h.page(&context, 0).map(|_| ()), Err(Error::Internal));
+    assert_eq!(h.page(&context, 0).map(|_| ()), Err(Error::BadGateway));
     h.blob(206, 5, range(), &[("x-ms-access-tier", b"Archive")]);
     assert_eq!(h.page(&context, 0).map(|_| ()), Err(Error::Internal));
     h.blob(206, 5, range(), &[("Content-Encoding", b"gzip")]);
