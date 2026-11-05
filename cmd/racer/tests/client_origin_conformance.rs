@@ -120,7 +120,12 @@ impl Rig {
     }
 }
 fn scope() -> RequestScope {
-    RequestScope::new(RequestId([7; 16]), Instant::now() + Duration::from_secs(8)).unwrap()
+    RequestScope::with_clock(
+        RequestId([7; 16]),
+        Instant::now() + Duration::from_secs(8),
+        racer_io::Clock::host(),
+    )
+    .unwrap()
 }
 fn object() -> ObjectId {
     ObjectId {

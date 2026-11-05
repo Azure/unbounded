@@ -640,10 +640,9 @@ fn retry_enrollment<T>(
 
 /// Create a bounded scope for application-owned lifecycle operations.
 fn scope(timeout: Duration) -> Result<RequestScope> {
-    RequestScope::new(
-        RequestId([0; 16]),
-        uring_runtime::environment::now() + timeout,
-    )
+    // MIGRATION: lifecycle scopes move onto the role's WorkerCtx.
+    let clock = crate::runtime::ambient_ctx().clock;
+    RequestScope::with_clock(RequestId([0; 16]), clock.now() + timeout, clock)
 }
 
 /// Retry enrollment under the original startup scope and the session's backoff.

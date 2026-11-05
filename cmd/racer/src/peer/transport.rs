@@ -844,11 +844,13 @@ pub(crate) async fn connect_link(
     peer: NodeId,
     rail: RailId,
 ) -> Result<()> {
+    let ctx = io.reactor().ctx();
     let mut request = [0; 16];
-    uring_runtime::environment::fill_random(&mut request).map_err(|_| Error::Unavailable)?;
-    let scope = RequestScope::new(
+    ctx.rng.fill(&mut request).map_err(|_| Error::Unavailable)?;
+    let scope = RequestScope::with_clock(
         crate::model::RequestId(request),
-        uring_runtime::environment::now() + crate::rdma::SETUP_DEADLINE,
+        ctx.now() + crate::rdma::SETUP_DEADLINE,
+        ctx.clock.clone(),
     )?;
     let connection = http
         .checkout_with_state(&endpoint, Default::default(), &scope)

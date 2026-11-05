@@ -47,7 +47,7 @@ pub(super) async fn serve(
         Ok(PrefetchRequest::Put { .. }) => timeout.max(PUT_TIMEOUT),
         _ => timeout,
     };
-    let scope = super::listener::new_scope(budget, cancellation)?;
+    let scope = super::listener::new_scope(io.reactor().ctx(), budget, cancellation)?;
     let response = match parsed {
         Err(error) => crate::prefetch::service::error(error),
         Ok(request) => {
@@ -67,12 +67,7 @@ pub(super) async fn serve(
                 None => &[],
             };
             // A client disconnect ends a long-poll wait.
-            let watch = crate::runtime::RequestScope {
-                body_deadlines: None,
-                request: scope.request,
-                deadline: scope.deadline,
-                cancellation: Cancellation::new()?,
-            };
+            let watch = scope.child(scope.request, scope.deadline.0)?;
             let socket = connection.socket();
             let mut disconnected = Some(io.disconnected(&connection, &watch));
             let mut handled = Box::pin(crate::prefetch::service::handle(

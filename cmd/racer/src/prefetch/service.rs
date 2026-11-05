@@ -625,7 +625,11 @@ async fn dispatch(
             .map(|&page| (unit(page), outcome, None))
             .collect::<Vec<_>>()
     };
-    let Ok(scope) = RequestScope::new(request_id(), now() + DISPATCH_TIMEOUT) else {
+    let Ok(scope) = RequestScope::with_clock(
+        request_id(),
+        now() + DISPATCH_TIMEOUT,
+        crate::runtime::ambient_ctx().clock,
+    ) else {
         return all(UnitOutcome::Retry(RetryKind::Unavailable, None));
     };
     let membership = match local.cache_membership(&version.object.cache) {
@@ -824,7 +828,11 @@ async fn resolve(
             })
         })
         .collect();
-    let scope = RequestScope::new(request_id(), now() + RESOLVE_TIMEOUT);
+    let scope = RequestScope::with_clock(
+        request_id(),
+        now() + RESOLVE_TIMEOUT,
+        crate::runtime::ambient_ctx().clock,
+    );
     let mut resolved: Vec<Option<Resolution>> = vec![None; distinct.len()];
     if let Ok(scope) = &scope {
         let mut work = futures::stream::iter(distinct.iter().enumerate().map(
@@ -904,7 +912,9 @@ async fn coverage(
     units: Vec<UnitKey>,
     deadline: Instant,
 ) -> u64 {
-    let Ok(scope) = RequestScope::new(request_id(), deadline) else {
+    let Ok(scope) =
+        RequestScope::with_clock(request_id(), deadline, crate::runtime::ambient_ctx().clock)
+    else {
         return 0;
     };
     let me = local.local_node();

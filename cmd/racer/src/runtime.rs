@@ -96,6 +96,13 @@ impl Cancellation {
         self.inner.cancel().map_err(Into::into)
     }
 }
+/// MIGRATION: the thread environment's worker context, for owners that do not
+/// yet receive a [`racer_io::WorkerCtx`] explicitly. Every caller is a site
+/// still to migrate; production returns host clocks and OS entropy.
+pub(crate) fn ambient_ctx() -> racer_io::WorkerCtx {
+    uring_runtime::environment::Environment::current().worker_ctx()
+}
+
 #[derive(Clone)]
 pub struct RequestScope {
     pub request: RequestId,
@@ -104,8 +111,15 @@ pub struct RequestScope {
     /// Local diagnostics only: original acquisition ceiling and candidate share.
     /// Never serialized or consulted by deadline/cancellation policy.
     pub(crate) body_deadlines: Option<(Instant, Instant)>,
+    /// Time source for deadline and candidate timer checks.
+    pub(crate) clock: racer_io::Clock,
 }
 impl RequestScope {
+    /// The scope's clock.
+    pub fn clock(&self) -> &racer_io::Clock {
+        &self.clock
+    }
+
     /// Local peer-exchange cap, including checkout and verification in the exchange.
     /// Set once; phase/body progress cannot renew it or change signed authority.
     pub(crate) fn set_candidate_total(&self, expires: Instant) -> Result<()> {
@@ -129,16 +143,13 @@ impl RequestScope {
         self.cancellation
             .state
             .candidate_idle
-            .set(Mutex::new((
-                allowance,
-                uring_runtime::environment::now() + allowance,
-            )))
+            .set(Mutex::new((allowance, self.clock.now() + allowance)))
             .map_err(|_| Error::Internal)?;
         Ok(())
     }
 
     pub(crate) fn candidate_progress(&self) -> Result<()> {
-        self.candidate_progress_at(uring_runtime::environment::now())
+        self.candidate_progress_at(self.clock.now())
     }
 
     /// [`RequestScope::candidate_progress`] at an explicit instant.
@@ -172,7 +183,7 @@ impl RequestScope {
     /// checkout/admission/head wait. Integer cross products avoid rate thresholds,
     /// division by zero and overflowing Instant additions. Completion is retained.
     pub(crate) fn candidate_body_progress(&self, received: usize, total: usize) -> Result<()> {
-        self.candidate_body_progress_at(received, total, uring_runtime::environment::now())
+        self.candidate_body_progress_at(received, total, self.clock.now())
     }
 
     /// [`RequestScope::candidate_body_progress`] at an explicit instant.
@@ -195,16 +206,35 @@ impl RequestScope {
         Ok(())
     }
 
-    pub fn new(request: RequestId, deadline: Instant) -> Result<Self> {
+    /// A scope whose deadline and timers are checked against `clock`.
+    pub fn with_clock(
+        request: RequestId,
+        deadline: Instant,
+        clock: racer_io::Clock,
+    ) -> Result<Self> {
         Ok(Self {
             request,
             deadline: Deadline(deadline),
             cancellation: Cancellation::new()?,
             body_deadlines: None,
+            clock,
         })
     }
+
+    /// A new scope for `request` with its own cancellation, on this scope's
+    /// clock.
+    pub fn child(&self, request: RequestId, deadline: Instant) -> Result<Self> {
+        Self::with_clock(request, deadline, self.clock.clone())
+    }
+
+    /// MIGRATION(test shim): a scope on the thread's test clock.
+    #[cfg(test)]
+    pub fn new(request: RequestId, deadline: Instant) -> Result<Self> {
+        Self::with_clock(request, deadline, crate::test_support::clock())
+    }
+
     pub fn check(&self) -> Result<()> {
-        self.check_at(uring_runtime::environment::now())
+        self.check_at(self.clock.now())
     }
     /// [`RequestScope::check`] against an explicit instant instead of the
     /// environment clock.

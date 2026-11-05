@@ -18,7 +18,6 @@ use crate::error::Operation;
 use crate::error::Result;
 use crate::model::RequestId;
 use crate::model::WorkerId;
-use crate::runtime::Cancellation;
 use crate::runtime::Reactor;
 use crate::runtime::RequestScope;
 use crate::security;
@@ -44,7 +43,6 @@ use std::time::Duration;
 #[cfg(test)]
 use std::time::Instant;
 use uring_runtime::drivers::drive_local_with;
-use uring_runtime::environment::Deadline;
 use uring_runtime::group::Factory;
 use uring_runtime::group::FailureReporter;
 use uring_runtime::group::Group;
@@ -504,12 +502,9 @@ fn lifecycle_scope() -> Result<RequestScope> {
 }
 
 fn startup_scope(budget: Duration) -> Result<RequestScope> {
-    Ok(RequestScope {
-        body_deadlines: None,
-        request: RequestId([0; 16]),
-        deadline: Deadline(uring_runtime::environment::now() + budget),
-        cancellation: Cancellation::new()?,
-    })
+    // MIGRATION: startup scopes move onto the role's WorkerCtx.
+    let clock = crate::runtime::ambient_ctx().clock;
+    RequestScope::with_clock(RequestId([0; 16]), clock.now() + budget, clock)
 }
 
 fn poll_runtime(runtime: &WorkerRuntime) -> Result<()> {
@@ -2101,7 +2096,8 @@ mod tests {
             let mut scope = scope();
             // Leave startup enough room under concurrent builds: this scenario checks
             // deadline-driven teardown after all eight jobs, not startup latency.
-            scope.deadline = Deadline(Instant::now() + Duration::from_secs(1));
+            scope.deadline =
+                uring_runtime::environment::Deadline(Instant::now() + Duration::from_secs(1));
             assert_eq!(
                 group.run_recipe_with_scope(&factory, &scope),
                 Err(Error::DeadlineExceeded)
@@ -2131,7 +2127,9 @@ mod tests {
                     let mut group = WorkerGroup::new(plan);
                     let mut scope = scope();
                     if failure == Failure::PendingStart {
-                        scope.deadline = Deadline(Instant::now() + Duration::from_millis(30));
+                        scope.deadline = uring_runtime::environment::Deadline(
+                            Instant::now() + Duration::from_millis(30),
+                        );
                     }
                     let expected = match failure {
                         Failure::PendingStart => Error::DeadlineExceeded,
@@ -2231,7 +2229,8 @@ mod tests {
             observed.release.store(true, Ordering::SeqCst);
             let mut group = WorkerGroup::new(plan);
             let mut scope = scope();
-            scope.deadline = Deadline(Instant::now() + Duration::from_millis(100));
+            scope.deadline =
+                uring_runtime::environment::Deadline(Instant::now() + Duration::from_millis(100));
             assert_eq!(
                 group.start_recipe(Arc::new(factory), &scope),
                 Err(Error::DeadlineExceeded)
@@ -2699,7 +2698,8 @@ mod tests {
                 max_threads: 2,
             });
             let mut scope = lifecycle_scope().unwrap();
-            scope.deadline = Deadline(Instant::now() + Duration::from_millis(50));
+            scope.deadline =
+                uring_runtime::environment::Deadline(Instant::now() + Duration::from_millis(50));
             assert_eq!(
                 scoped.run_recipe_with_scope(&factory, &scope),
                 Err(Error::DeadlineExceeded)

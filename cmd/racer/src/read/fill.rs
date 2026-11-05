@@ -264,7 +264,7 @@ impl Fill {
                 } else {
                     None
                 };
-                let owned_scope = RequestScope::new(scope.request, scope.deadline.0)?;
+                let owned_scope = scope.child(scope.request, scope.deadline.0)?;
                 let (receive, completion) = self
                     .local_plaintext
                     .start(page.clone(), Err(Error::Unavailable));
@@ -1655,7 +1655,7 @@ impl Fill {
             caller_scope.deadline.0,
             handover,
         );
-        let owned_scope = RequestScope::new(caller_scope.request, ceiling)?;
+        let owned_scope = caller_scope.child(caller_scope.request, ceiling)?;
         let mut operation = self.dependencies.flights.retain_driver_operation(
             &leader,
             self.metrics.lease(Gauge::ActiveFills)?,
@@ -2013,7 +2013,7 @@ impl Fill {
         } else {
             let permit = uring_runtime::drivers::reserve().map_err(Error::from)?;
             let flight = self.dependencies.flights.reserve_copy_flight(page, scope)?;
-            let owned_scope = RequestScope::new(scope.request, scope.deadline.0)?;
+            let owned_scope = scope.child(scope.request, scope.deadline.0)?;
             let (receive, completion) = self
                 .local_copies
                 .start(page.clone(), Err(Error::Unavailable));

@@ -283,8 +283,12 @@ fn failed_crypto_output_is_scrubbed(config: &Config) {
             ciphertext_length: length as u32 + 16,
         };
         let encrypt = fault == "cancel-encrypt";
-        let scope = RequestScope::new(RequestId([1; 16]), Instant::now() + Duration::from_secs(10))
-            .unwrap();
+        let scope = RequestScope::with_clock(
+            RequestId([1; 16]),
+            Instant::now() + Duration::from_secs(10),
+            racer_io::Clock::host(),
+        )
+        .unwrap();
         let input = if encrypt {
             let mut plaintext = pool
                 .plaintext(

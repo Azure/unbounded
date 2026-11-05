@@ -967,7 +967,15 @@ fn definition() -> CacheDefinition {
     }
 }
 fn scope() -> RequestScope {
-    new_scope(Duration::from_secs(5), Cancellation::new().unwrap()).unwrap()
+    new_scope(
+        &racer_io::WorkerCtx {
+            clock: crate::test_support::clock(),
+            rng: racer_io::Rng::os(),
+        },
+        Duration::from_secs(5),
+        Cancellation::new().unwrap(),
+    )
+    .unwrap()
 }
 struct Fixture {
     root: Root,

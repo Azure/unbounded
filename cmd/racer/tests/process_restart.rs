@@ -1101,9 +1101,10 @@ fn enrolled_identity(
         .unwrap();
     // Verify the persisted certificate's chain, SAN, validity, request correlation,
     // and local key pairing rather than comparing opaque identity.json bytes.
-    let scope = racer::runtime::RequestScope::new(
+    let scope = racer::runtime::RequestScope::with_clock(
         racer::model::RequestId([9; 16]),
         Instant::now() + Duration::from_secs(15),
+        racer_io::Clock::host(),
     )
     .unwrap();
     let identity = enrollment_io::drive(&reactor, enrollment.load_identity(&scope))

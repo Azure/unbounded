@@ -1117,6 +1117,7 @@ pub(crate) mod tests {
                 request: RequestId([0; 16]),
                 deadline: Deadline(Instant::now() + Duration::from_secs(5)),
                 cancellation: Cancellation::new().unwrap(),
+                clock: racer_io::Clock::host(),
             }
         }
         fn page(admission: &flow_control::Quotas<AdmissionPolicy>, bytes: Vec<u8>) -> VerifiedPage {

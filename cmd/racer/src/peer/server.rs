@@ -166,8 +166,8 @@ impl PeerServer {
         let deadline = scope
             .deadline
             .0
-            .min(uring_runtime::environment::now() + Duration::from_secs(2));
-        let diagnostic_scope = match RequestScope::new(scope.request, deadline) {
+            .min(scope.clock().now() + Duration::from_secs(2));
+        let diagnostic_scope = match scope.child(scope.request, deadline) {
             Ok(s) => s,
             Err(error) => {
                 sample.finish(Some(error));
@@ -550,8 +550,8 @@ impl PeerServer {
                                 Some(reservation.clone());
                             // Cancel only this downstream exchange on upstream FIN.
                             // Fence its I/O and disconnect watch before streaming.
-                            let exchange =
-                                RequestScope::new(request_scope.request, request_scope.deadline.0)?;
+                            let exchange = request_scope
+                                .child(request_scope.request, request_scope.deadline.0)?;
                             disconnect_fenced_exchange(
                                 &self.io,
                                 &received.connection,
@@ -658,7 +658,7 @@ impl PeerServer {
                         // this HTTP exchange may be canceled, including its local
                         // destination waiter, never independent shared-flight work.
                         let exchange =
-                            RequestScope::new(request_scope.request, request_scope.deadline.0)?;
+                            request_scope.child(request_scope.request, request_scope.deadline.0)?;
                         disconnect_fenced_exchange(
                             &self.io,
                             &received.connection,
@@ -1047,7 +1047,7 @@ async fn disconnect_fenced_exchange<T>(
         io,
         connection,
         parent,
-        || RequestScope::new(exchange.request, exchange.deadline.0),
+        || exchange.child(exchange.request, exchange.deadline.0),
         || {
             let _ = exchange.cancel();
         },

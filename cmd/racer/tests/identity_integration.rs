@@ -267,8 +267,12 @@ fn active_crypto_operation_completes_after_rotation_with_its_original_key_lease(
     };
     let lease = keys.active(&cache, KeyPurpose::Page).unwrap();
     let old_id = lease.id();
-    let scope =
-        RequestScope::new(RequestId([1; 16]), Instant::now() + Duration::from_secs(10)).unwrap();
+    let scope = RequestScope::with_clock(
+        RequestId([1; 16]),
+        Instant::now() + Duration::from_secs(10),
+        racer_io::Clock::host(),
+    )
+    .unwrap();
     let mut operation = client.execute(
         CryptoInput::Encrypt {
             page,

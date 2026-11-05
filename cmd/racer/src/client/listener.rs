@@ -946,7 +946,7 @@ async fn serve_connection(
             crate::admission::ResourceClass::RequestContext,
             super::MAX_HEAD_BYTES,
         )?;
-        let idle_scope = new_scope(timeout, cancellation.clone())?;
+        let idle_scope = new_scope(io.reactor().ctx(), timeout, cancellation.clone())?;
         deadline.set(idle_scope.deadline.0);
         // Read with recvmsg so a direct read's descriptor arrives with its head.
         let received = io
@@ -960,7 +960,7 @@ async fn serve_connection(
         let mut observation = metrics.request()?;
         // Idle/header admission has its own bound. A healthy pooled connection
         // gets a fresh operation budget only after each complete request head.
-        let scope = new_scope(timeout, cancellation.clone())?;
+        let scope = new_scope(io.reactor().ctx(), timeout, cancellation.clone())?;
         deadline.set(scope.deadline.0);
         let scope = &scope;
         // Prefetch tickets have their own JSON route and close the connection.
@@ -1025,12 +1025,7 @@ async fn serve_connection(
         let kind = request.kind.clone();
         let object = request.origin.object.clone();
         let socket = connection.socket();
-        let watch_scope = RequestScope {
-            body_deadlines: None,
-            request: scope.request,
-            deadline: scope.deadline,
-            cancellation: Cancellation::new()?,
-        };
+        let watch_scope = scope.child(scope.request, scope.deadline.0)?;
         let mut disconnected = Some(io.disconnected(&connection, &watch_scope));
         let mut disconnect_observed = false;
         #[cfg(test)]
@@ -1093,15 +1088,17 @@ async fn serve_connection(
     }
 }
 
-pub(super) fn new_scope(timeout: Duration, cancellation: Cancellation) -> Result<RequestScope> {
+pub(super) fn new_scope(
+    ctx: &racer_io::WorkerCtx,
+    timeout: Duration,
+    cancellation: Cancellation,
+) -> Result<RequestScope> {
     let mut id = [0; 16];
-    uring_runtime::environment::fill_random(&mut id).map_err(|_| Error::Unavailable)?;
-    Ok(RequestScope {
-        body_deadlines: None,
-        request: RequestId(id),
-        deadline: uring_runtime::environment::Deadline(uring_runtime::environment::now() + timeout),
-        cancellation,
-    })
+    ctx.rng.fill(&mut id).map_err(|_| Error::Unavailable)?;
+    let mut scope =
+        RequestScope::with_clock(RequestId(id), ctx.now() + timeout, ctx.clock.clone())?;
+    scope.cancellation = cancellation;
+    Ok(scope)
 }
 
 // Level-triggered listener index. Idle turns wait on one completion-owned poll.
@@ -1153,6 +1150,7 @@ impl ReadyListeners {
             }
             self.index = Some(ready);
             self.scope = Some(new_scope(
+                owner.io.reactor().ctx(),
                 Duration::from_secs(365 * 24 * 3600),
                 Cancellation::new()?,
             )?);

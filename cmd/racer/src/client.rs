@@ -157,7 +157,7 @@ async fn handle_read_result(
         responses.send_error(connection, error, scope).await?;
         return Ok(None);
     }
-    let watch_scope = RequestScope::new(scope.request, scope.deadline.0)?;
+    let watch_scope = scope.child(scope.request, scope.deadline.0)?;
     let socket = connection.socket();
     // Keep four slots for duplex sends, receives, and listener progress. Tiny
     // rings retain the synchronous fallback rather than losing delivery capacity.
@@ -674,10 +674,9 @@ impl Responses {
                 .await;
             if result.is_err() {
                 // Give device work a short, independent bound to settle.
-                if let Ok(final_scope) = RequestScope::new(
-                    scope.request,
-                    uring_runtime::environment::now() + Duration::from_secs(1),
-                ) {
+                if let Ok(final_scope) =
+                    scope.child(scope.request, scope.clock().now() + Duration::from_secs(1))
+                {
                     let _ = sink.finish(&final_scope).await;
                 }
             }
@@ -944,10 +943,8 @@ impl Responses {
             // only a short, independently bounded final head, then close.
             let final_scope;
             let scope = if scope.check().is_err() {
-                final_scope = RequestScope::new(
-                    scope.request,
-                    uring_runtime::environment::now() + Duration::from_secs(1),
-                )?;
+                final_scope =
+                    scope.child(scope.request, scope.clock().now() + Duration::from_secs(1))?;
                 &final_scope
             } else {
                 scope

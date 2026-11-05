@@ -387,7 +387,7 @@ impl MetadataService {
                     let caller_scope = scope.clone();
                     let caller_cancellation = caller_scope.cancellation.subscribe()?;
                     let owned_scope =
-                        RequestScope::new(caller_scope.request, caller_scope.deadline.0)?;
+                        caller_scope.child(caller_scope.request, caller_scope.deadline.0)?;
                     let mut owned_budget = budget.transfer();
                     let (send, mut receive) = futures::channel::oneshot::channel();
                     driver_permit.submit_detached(Box::pin(async move {

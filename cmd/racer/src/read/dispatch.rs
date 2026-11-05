@@ -543,9 +543,12 @@ impl WorkerDirectory {
             let Ok(permit) = uring_runtime::drivers::reserve() else {
                 continue;
             };
-            let Ok(scope) = RequestScope::new(
+            // MIGRATION: the directory receives a WorkerCtx in a later step.
+            let clock = crate::runtime::ambient_ctx().clock;
+            let Ok(scope) = RequestScope::with_clock(
                 request,
-                uring_runtime::environment::now() + std::time::Duration::from_secs(30),
+                clock.now() + std::time::Duration::from_secs(30),
+                clock,
             ) else {
                 continue;
             };
@@ -863,8 +866,8 @@ impl WorkerDirectory {
             return;
         };
         // The request may already be ending; the verdict must still arrive.
-        let deadline = uring_runtime::environment::now() + std::time::Duration::from_secs(5);
-        let Ok(detached) = RequestScope::new(scope.request, deadline) else {
+        let deadline = scope.clock().now() + std::time::Duration::from_secs(5);
+        let Ok(detached) = scope.child(scope.request, deadline) else {
             retain(report);
             return;
         };

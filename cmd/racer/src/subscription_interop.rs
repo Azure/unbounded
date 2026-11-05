@@ -377,9 +377,10 @@ impl SubscriptionFixture {
             admission.clone(),
         );
         clients.set_root(root.clone());
-        let scope = RequestScope::new(
+        let scope = RequestScope::with_clock(
             RequestId([1; 16]),
             Instant::now() + Duration::from_secs(180),
+            racer_io::Clock::host(),
         )
         .unwrap();
         futures::executor::block_on(clients.reconcile(std::slice::from_ref(&cache), &scope))

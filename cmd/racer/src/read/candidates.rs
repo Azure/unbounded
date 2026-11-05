@@ -348,9 +348,8 @@ impl CandidatePolicy {
         // remaining original links for serial candidates or one epoch refresh.
         let (mut secondary_budget, mut primary_budget) =
             racer_core::read::walk::hedge_budgets(budget)?;
-        let primary_scope =
-            RequestScope::new(scope.request, scope.deadline.0.min(budget.deadline()))?;
-        let secondary_scope = RequestScope::new(scope.request, primary_scope.deadline.0)?;
+        let primary_scope = scope.child(scope.request, scope.deadline.0.min(budget.deadline()))?;
+        let secondary_scope = scope.child(scope.request, primary_scope.deadline.0)?;
         let stale = std::cell::Cell::new(false);
         let primary_outcome = std::cell::Cell::new(None);
         let primary = async {
@@ -2139,7 +2138,7 @@ impl CandidatePolicy {
                 facts.cap = crate::telemetry::timestamp(attempt_end);
             }
             // A clone shares cancellation: timing it out would cancel the caller too.
-            let mut attempt_scope = RequestScope::new(scope.request, overall)?;
+            let mut attempt_scope = scope.child(scope.request, overall)?;
             attempt_scope.set_candidate_idle(plan.idle)?;
             attempt_scope.set_candidate_total(attempt_end)?;
             attempt_scope.body_deadlines = Some((overall, plan.share));
@@ -2480,10 +2479,13 @@ impl CandidatePolicy {
     /// classify the result (`racer_core::liveness::ping_verdict`).
     async fn ping(&self, peer: &NodeId, page: &crate::model::PageId) -> Option<bool> {
         use racer_core::read::hints::NOTICE_LINKS;
-        let deadline = uring_runtime::environment::now() + self.attempt_timeout;
+        // MIGRATION: the hint owner receives a WorkerCtx in a later step.
+        let ctx = crate::runtime::ambient_ctx();
+        let deadline = ctx.now() + self.attempt_timeout;
         let mut id = [0; 16];
-        uring_runtime::environment::fill_random(&mut id).ok()?;
-        let scope = RequestScope::new(crate::model::RequestId(id), deadline).ok()?;
+        ctx.rng.fill(&mut id).ok()?;
+        let scope =
+            RequestScope::with_clock(crate::model::RequestId(id), deadline, ctx.clock).ok()?;
         let membership = self.published.current().ok()??.membership.clone();
         let context = OriginContext {
             object: page.version.object.clone(),
@@ -2531,10 +2533,12 @@ impl CandidatePolicy {
     ) -> Result<OfferEnd> {
         use racer_core::read::hints::{NOTICE_LINKS, notice_target};
         let (page, index) = (&due.key.0, due.key.1);
-        let deadline = uring_runtime::environment::now() + self.attempt_timeout;
+        // MIGRATION: the hint owner receives a WorkerCtx in a later step.
+        let ctx = crate::runtime::ambient_ctx();
+        let deadline = ctx.now() + self.attempt_timeout;
         let mut id = [0; 16];
-        uring_runtime::environment::fill_random(&mut id).map_err(|_| Error::Unavailable)?;
-        let scope = RequestScope::new(crate::model::RequestId(id), deadline)?;
+        ctx.rng.fill(&mut id).map_err(|_| Error::Unavailable)?;
+        let scope = RequestScope::with_clock(crate::model::RequestId(id), deadline, ctx.clock)?;
         let membership = self
             .published
             .current()?

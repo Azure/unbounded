@@ -125,7 +125,12 @@ fn scope() -> RequestScope {
     static NEXT: AtomicUsize = AtomicUsize::new(1);
     let mut id = [0; 16];
     id[..8].copy_from_slice(&(NEXT.fetch_add(1, Ordering::Relaxed) as u64).to_le_bytes());
-    RequestScope::new(RequestId(id), Instant::now() + TIMEOUT).unwrap()
+    RequestScope::with_clock(
+        RequestId(id),
+        Instant::now() + TIMEOUT,
+        racer_io::Clock::host(),
+    )
+    .unwrap()
 }
 fn nz(value: usize) -> NonZeroUsize {
     NonZeroUsize::new(value).unwrap()
