@@ -1315,7 +1315,6 @@ mod scenarios {
                     for node in &harness.nodes {
                         for worker in &node.workers {
                             worker.app.memory.evict_idle(usize::MAX).unwrap();
-                            worker.runtime.admission.reclaim_buffers();
                             let admission = &worker.runtime.admission;
                             let free = admission.limit(ResourceClass::Ciphertext)
                                 - admission.used(ResourceClass::Ciphertext);

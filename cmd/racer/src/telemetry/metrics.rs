@@ -705,7 +705,7 @@ impl Metrics {
         Ok(())
     }
 
-    /// Write node-wide admission for every class, plus recycler and staging pools.
+    /// Write node-wide admission for every class, plus staging pools.
     fn write_worker_pools(&self, out: &mut impl Write) -> std::fmt::Result {
         let installed: Vec<_> = self
             .admission
@@ -731,11 +731,6 @@ impl Metrics {
                 }
             }
         }
-        let recycler: Vec<_> = installed
-            .iter()
-            .map(|(worker, usage)| (*worker, usage.buffer_pool_stats()))
-            .collect();
-        write_pools(out, "recycler", &recycler)?;
         let staging: Vec<_> = self.memory.staging.snapshots().flatten().collect();
         write_pools(out, "staging_pool", &staging)
     }
@@ -1505,17 +1500,9 @@ mod tests {
             std::thread::spawn(move || drop((relay, ciphertext)))
                 .join()
                 .unwrap();
-            // Recycler stats come from the live authority and reset once it exits;
-            // quota charges must still match the idle scrape.
-            let quotas = |text: &str| {
-                text.lines()
-                    .filter(|line| !line.contains("recycler_"))
-                    .collect::<Vec<_>>()
-                    .join("\n")
-            };
             assert_eq!(
-                quotas(&scrape()),
-                quotas(&idle),
+                scrape(),
+                idle,
                 "final release remains visible after owner exit"
             );
             assert_eq!(
@@ -1525,18 +1512,18 @@ mod tests {
                     .count(),
                 8
             );
-            // Four compatibility series and retained recycler bytes per worker.
+            // Four compatibility series per worker.
             assert_eq!(
                 idle.lines()
                     .filter(|line| line.contains("{worker="))
                     .count(),
-                2 * (4 + 1)
+                2 * 4
             );
             assert!(!idle.contains("request="));
         }
 
         #[test]
-        fn worker_quota_gauges_include_recycled_ciphertext_capacity() {
+        fn worker_quota_gauges_include_live_ciphertext_charges() {
             let metrics = Metrics::default();
             let admission = flow_control::Quotas::new(AdmissionPolicy::new(
                 crate::test_support::cluster::config(false).limits,
@@ -1544,16 +1531,13 @@ mod tests {
             metrics
                 .observe_admission(WorkerId(0), admission.shared())
                 .unwrap();
-            let mut reservation = admission
+            let reservation = admission
                 .reserve(None, ResourceClass::Ciphertext, 1 << 20)
                 .unwrap();
-            let bytes = reservation.buffer(1 << 20).unwrap();
-            reservation.recycle(bytes);
-            drop(reservation);
             let mut output = String::new();
             metrics.write_prometheus(&mut output).unwrap();
             assert!(output.contains("racer_worker_ciphertext_used_bytes{worker=\"0\"} 1048576\n"));
-            admission.stop();
+            drop(reservation);
             output.clear();
             metrics.write_prometheus(&mut output).unwrap();
             assert!(output.contains("racer_worker_ciphertext_used_bytes{worker=\"0\"} 0\n"));
@@ -1577,7 +1561,6 @@ mod tests {
             // Nothing installed: no admission, pool, or process memory series.
             for absent in [
                 "racer_admission_used",
-                "racer_recycler_entries",
                 "racer_staging_pool_entries",
                 "racer_process_resident_bytes",
             ] {
@@ -1595,15 +1578,10 @@ mod tests {
                     .observe_admission(WorkerId(3 + index as u16), admission.shared())
                     .unwrap();
             }
-            let mut reservation = quotas[0]
+            let _ciphertext = quotas[0]
                 .reserve(None, ResourceClass::Ciphertext, 1 << 20)
                 .unwrap();
-            let bytes = reservation.buffer(1 << 20).unwrap();
-            reservation.recycle(bytes);
-            drop(reservation);
             let _relay = quotas[1].reserve(None, ResourceClass::Relay, 1).unwrap();
-            let recycler = quotas[0].buffer_pool_stats();
-            assert!(recycler.bytes >= 1 << 20, "recycled buffer is retained");
             let staging = |entries, bytes, counter| flow_control::PoolStats {
                 entries,
                 bytes,
@@ -1635,14 +1613,6 @@ mod tests {
                     "racer_admission_limit{{class=\"plaintext\"}} {}\n",
                     sum(ResourceClass::Plaintext)
                 ),
-                format!("racer_recycler_entries {}\n", recycler.entries),
-                format!("racer_recycler_bytes {}\n", recycler.bytes),
-                "# TYPE racer_recycler_hits_total counter\n".to_string(),
-                format!(
-                    "racer_worker_recycler_bytes{{worker=\"3\"}} {}\n",
-                    recycler.bytes
-                ),
-                "racer_worker_recycler_bytes{worker=\"4\"} 0\n".to_string(),
                 "# TYPE racer_staging_pool_entries gauge\nracer_staging_pool_entries 3\n"
                     .to_string(),
                 "racer_staging_pool_bytes 5120\n".to_string(),
@@ -1663,6 +1633,7 @@ mod tests {
                     "missing {expected:?} in {output}"
                 );
             }
+            assert!(!output.contains("recycler"), "{output}");
             assert_eq!(
                 output
                     .lines()

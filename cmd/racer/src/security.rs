@@ -2162,7 +2162,6 @@ mod tests {
                 if let Some(thread) = thread {
                     thread.join().unwrap();
                 }
-                admission.reclaim_buffers();
                 assert_eq!(
                     failures,
                     if operation == "bad_tag" {
@@ -2251,7 +2250,6 @@ mod tests {
                 }
                 client.close_submissions().unwrap();
                 thread.join().unwrap();
-                admission.reclaim_buffers();
                 assert_eq!(client.outstanding(), 0);
                 assert!(client.executor.is_empty());
                 assert_eq!(admission.used(ResourceClass::Plaintext), 0);
@@ -4197,7 +4195,6 @@ mod tests {
                 (length + 16).next_multiple_of(page_alloc::buf::GRANULE)
             );
             drop(completion);
-            admission.reclaim_buffers();
             assert_eq!(admission.used(ResourceClass::Plaintext), 0);
             assert_eq!(admission.used(ResourceClass::Ciphertext), 0);
         }

@@ -413,7 +413,6 @@ dependencies = [
  "page-alloc",
  "racer-flow-core",
  "racer-io",
- "zeroize",
 ]
 
 [[package]]

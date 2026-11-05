@@ -1753,7 +1753,6 @@ fn assert_no_body_leases(fixture: &Fixture) {
 }
 
 fn assert_only_idle_pipes(fixture: &Fixture, pipes: &flow_control::PipePool<AdmissionPolicy>) {
-    fixture.listeners.admission.reclaim_buffers();
     use crate::admission::ResourceClass;
     assert_eq!(fixture.listeners.active_connections(), 0);
     assert_eq!(

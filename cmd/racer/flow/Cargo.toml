@@ -9,7 +9,6 @@ description = "Policy-driven quotas, keyed coalescing, completion-owned flights,
 [dependencies]
 futures = "0.3"
 libc = "0.2"
-zeroize = "1"
 page-alloc = { path = "../alloc" }
 racer-io = { path = "../io" }
 racer-flow-core = { path = "../flow-core" }

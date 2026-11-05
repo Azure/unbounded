@@ -474,9 +474,6 @@ impl SubscriptionFixture {
             self.reactor.wait(Duration::from_millis(1)).unwrap();
         }
         self.memory.remove_cache(&self.cache.id).unwrap();
-        // Returned allocation buffers remain charged until their reusable pool is
-        // reclaimed. They are not live subscription leases.
-        self.admission.reclaim_buffers();
         assert_eq!(
             self.admission.used(ResourceClass::Plaintext),
             0,

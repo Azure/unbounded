@@ -279,130 +279,6 @@ mod handoff_tests {
     }
 }
 
-/// Fixed backing and admission transfer contracts.
-mod buffer_tests {
-    use flow_control::{ChargedBuffer, Error, Policy, Quotas, Rejection};
-
-    /// Single fixture class for fixed backing.
-    #[derive(Clone, Copy)]
-    struct Class;
-
-    impl flow_control::Class for Class {
-        /// Number of fixed-backing resource classes.
-        const COUNT: usize = 1;
-
-        /// Select the fixture's sole counter.
-        fn index(self) -> usize {
-            0
-        }
-    }
-
-    /// Fixed four-MiB backing budget without wake or page coverage policy.
-    struct TestPolicy;
-
-    impl Policy for TestPolicy {
-        /// Single resource budget for fixed backing.
-        type Class = Class;
-
-        /// One possible keyed identity for this fixture.
-        type Key = ();
-
-        /// Allow four MiB of fixed backing.
-        fn limit(&self, _: Class) -> usize {
-            4 * 1024 * 1024
-        }
-
-        /// Permit one fixture key.
-        fn max_keys(&self) -> usize {
-            1
-        }
-
-        /// Buffer releases do not wake this synchronous fixture.
-        fn wakes(_: Class) -> bool {
-            false
-        }
-
-        /// This fixture does not admit page allocator backing.
-        fn covers(_: Class) -> bool {
-            false
-        }
-
-        /// Rejection details are irrelevant to these backing assertions.
-        fn rejected(&self, _: Rejection<Class>) {}
-    }
-
-    /// Moves, reuse, and final transfer preserve backing and its exact charge.
-    #[test]
-    fn fixed_backing_recycles_and_transfers_charge_without_early_release() {
-        let quotas = Quotas::new(TestPolicy);
-        let length = 1024 * 1024;
-        let mut buffer =
-            ChargedBuffer::new(quotas.reserve(None, Class, 2 * length).unwrap(), length).unwrap();
-        assert_eq!(quotas.used(Class), length);
-        assert_eq!(buffer.charge().amount(), length);
-        let pointer = buffer.bytes().as_ptr();
-        buffer.bytes_mut().fill(0xa7);
-        let moved = buffer;
-        assert_eq!(moved.bytes().as_ptr(), pointer);
-        drop(moved);
-        assert_eq!(quotas.used(Class), length);
-        let buffer =
-            ChargedBuffer::new(quotas.reserve(None, Class, length).unwrap(), length).unwrap();
-        assert_eq!(buffer.bytes().as_ptr(), pointer);
-        assert!(buffer.bytes().iter().all(|byte| *byte == 0));
-        let (bytes, charge) = buffer.into_parts();
-        assert_eq!(bytes.as_ptr(), pointer);
-        assert_eq!(quotas.used(Class), length);
-        drop((bytes, charge));
-        assert_eq!(quotas.used(Class), 0);
-    }
-
-    /// Invalid backing geometry releases the consumed reservation.
-    #[test]
-    fn invalid_lengths_return_charge() {
-        let quotas = Quotas::new(TestPolicy);
-        for length in [0, 9] {
-            assert!(matches!(
-                ChargedBuffer::new(quotas.reserve(None, Class, 8).unwrap(), length),
-                Err(Error::InvalidInput)
-            ));
-            assert_eq!(quotas.used(Class), 0);
-        }
-    }
-
-    /// Unpooled staging keeps excess credit and never retains backing on abandonment.
-    #[test]
-    fn unpooled_backing_preserves_reservation_and_releases_on_drop() {
-        let quotas = Quotas::new(TestPolicy);
-        let length = 1 << 20;
-        for transfer in [false, true] {
-            let buffer =
-                ChargedBuffer::unpooled(quotas.reserve(None, Class, 2 * length).unwrap(), length)
-                    .unwrap();
-            assert_eq!(buffer.charge().amount(), 2 * length);
-            assert_eq!(quotas.used(Class), 2 * length);
-            if transfer {
-                let pointer = buffer.bytes().as_ptr();
-                let (bytes, charge) = buffer.into_parts();
-                assert_eq!(bytes.as_ptr(), pointer);
-                assert_eq!(charge.amount(), 2 * length);
-                drop((bytes, charge));
-            } else {
-                drop(buffer);
-            }
-            assert_eq!(quotas.used(Class), 0);
-            assert_eq!(quotas.retained_buffer_bytes(), 0);
-        }
-        assert!(ChargedBuffer::unpooled(quotas.reserve(None, Class, 8).unwrap(), 9).is_err());
-        assert_eq!(quotas.used(Class), 0);
-        let empty = ChargedBuffer::unpooled(quotas.reserve(None, Class, 8).unwrap(), 0).unwrap();
-        assert!(empty.bytes().is_empty());
-        assert_eq!(empty.charge().amount(), 8);
-        drop(empty);
-        assert_eq!(quotas.used(Class), 0);
-    }
-}
-
 /// Quota transfers, retained key lifetimes, and exact release notifications.
 mod quota_tests {
     use flow_control::{Charge, Error, Policy, Quotas, Rejection, SharedQuotas};
@@ -567,80 +443,6 @@ mod quota_tests {
         assert_eq!(shared.used(Resource::Waking), 0);
     }
 
-    /// Retaining backing transfers surplus admission but not the donor's key owner.
-    #[test]
-    fn recycler_transfers_surplus_and_empty_donor_still_owns_key_until_drop() {
-        let size = 1 << 20;
-        let quotas = Quotas::new(TestPolicy::new(4 * size, 1));
-        let shared = quotas.shared();
-        let wake = Arc::new(WakeCount::default());
-        shared.register(&Waker::from(wake.clone()));
-        let mut donor = quotas
-            .reserve(Some(&1), Resource::Waking, 2 * size)
-            .unwrap();
-        let mut bytes = donor.buffer(size).unwrap();
-        bytes.fill(0xa7);
-        bytes.truncate(1);
-        donor.recycle(bytes);
-        assert_eq!(donor.amount(), 0);
-        assert_eq!(donor.key(), Some(&1));
-        assert_eq!(quotas.retained_buffer_bytes(), 2 * size);
-        assert_eq!(shared.used(Resource::Waking), 2 * size);
-        assert_eq!(wake.0.load(Ordering::SeqCst), 0);
-        assert_eq!(donor.shrink(1), Err(Error::InvalidInput));
-        assert!(matches!(donor.split(1), Err(Error::InvalidInput)));
-        quotas.reclaim_buffers();
-        assert_eq!(shared.used(Resource::Waking), 0);
-        assert_eq!(wake.0.load(Ordering::SeqCst), 1);
-        assert!(matches!(
-            quotas.reserve(Some(&2), Resource::Silent, 1),
-            Err(Error::Overloaded)
-        ));
-        assert!(matches!(
-            &quotas.policy().rejected.lock().unwrap()[..],
-            [
-                Rejection::Keys { used: 1, limit: 1 },
-                Rejection::Keys { used: 1, limit: 1 }
-            ]
-        ));
-        shared.register(&Waker::from(wake.clone()));
-        std::thread::spawn(move || drop(donor)).join().unwrap();
-        assert_eq!(wake.0.load(Ordering::SeqCst), 2, "empty drops still wake");
-        let next = quotas.reserve(Some(&2), Resource::Silent, 1).unwrap();
-        assert_eq!(shared.used(Resource::Waking), 0);
-        assert_eq!(shared.used(Resource::Silent), 1);
-        drop(next);
-        assert_eq!(shared.used(Resource::Silent), 0);
-    }
-
-    /// Failed retention leaves admission with its caller, including after stop.
-    #[test]
-    fn full_recycler_and_stopped_recycler_do_not_consume_charge() {
-        let size = 1 << 20;
-        // Full depth needs a warmed demand target and a class limit of twice
-        // the retained bytes.
-        let quotas = Quotas::new(TestPolicy::new(16 * size, 1))
-            .with_buffer_demand(flow_control::PoolDemand::new().with_target(8));
-        for _ in 0..8 {
-            let mut retained = quotas.reserve(None, Resource::Silent, size).unwrap();
-            retained.recycle(vec![0xa7; size]);
-            assert_eq!(retained.amount(), 0);
-        }
-        let mut rejected = quotas.reserve(None, Resource::Silent, size).unwrap();
-        rejected.recycle(vec![0xa7; size]);
-        assert_eq!(rejected.amount(), size);
-        assert_eq!(quotas.retained_buffer_bytes(), 8 * size);
-        assert_eq!(quotas.used(Resource::Silent), 9 * size);
-        quotas.stop();
-        assert_eq!(quotas.retained_buffer_bytes(), 0);
-        assert_eq!(quotas.used(Resource::Silent), size);
-        rejected.recycle(vec![0xa7; size]);
-        assert_eq!(rejected.amount(), size);
-        assert_eq!(quotas.retained_buffer_bytes(), 0);
-        drop(rejected);
-        assert_eq!(quotas.used(Resource::Silent), 0);
-    }
-
     /// Checked admission rejects arithmetic overflow with unchanged reported facts.
     #[test]
     fn full_width_rejections_preserve_usage_and_attempt_counts() {
@@ -661,11 +463,7 @@ mod quota_tests {
         ));
         {
             let rejected = quotas.policy().rejected.lock().unwrap();
-            assert_eq!(
-                rejected.len(),
-                5,
-                "shared attempts once; local retries once"
-            );
+            assert_eq!(rejected.len(), 3, "each failed attempt is reported once");
             for event in rejected.iter() {
                 assert!(matches!(
                     event,
@@ -691,7 +489,7 @@ mod quota_tests {
 
     /// A panicking key clone cannot strand fresh or transferred admission.
     #[test]
-    fn key_clone_panic_keeps_split_and_recycle_admission_with_donor() {
+    fn key_clone_panic_keeps_split_admission_with_donor() {
         use std::{
             panic::{AssertUnwindSafe, catch_unwind},
             sync::atomic::AtomicBool,
@@ -757,9 +555,6 @@ mod quota_tests {
         assert!(catch_unwind(AssertUnwindSafe(|| donor.split(size))).is_err());
         assert_eq!(donor.amount(), 2 * size);
         assert_eq!(quotas.used(Resource::Silent), 2 * size);
-        assert!(catch_unwind(AssertUnwindSafe(|| donor.recycle(vec![0xa7; size]))).is_err());
-        assert_eq!(donor.amount(), 2 * size);
-        assert_eq!(quotas.retained_buffer_bytes(), 0);
         assert_eq!(quotas.used(Resource::Silent), 2 * size);
         PANIC_ON_CLONE.store(false, Ordering::SeqCst);
         let split = donor.split(size).unwrap();

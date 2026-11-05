@@ -254,56 +254,8 @@ fn optional_persistence_full_page_residency_above_half_budget_makes_progress() {
     assert!(
         admission.used(ResourceClass::Ciphertext) <= admission.limit(ResourceClass::Ciphertext) / 2
     );
-    assert_eq!(
-        admission.retained_buffer_bytes(),
-        0,
-        "evicted full-page backing must release pooled charges"
-    );
     assert_eq!(last.plaintext.bytes()[0], 4);
     assert_eq!(deps.writer.discarded_count(), 0);
-}
-
-#[test]
-fn optional_persistence_recycler_pressure_does_not_evict_memory_unnecessarily() {
-    let queue = Rc::new(uring_runtime::drivers::DriverQueue::new(1024));
-    let _queue = queue.enter();
-    let f = fixture();
-    let deps = &f.fill.dependencies;
-    let admission = &deps.admission;
-    deps.writer.retention().set_ownership(Rc::new(|_| false));
-    let incoming = crate::memory::tests::bundle_for(admission, f.origin.metadata.immutable());
-    let mut metadata = f.origin.metadata.immutable();
-    metadata.version.etag = StrongEtag::test_value("keep-idle");
-    let idle = crate::memory::tests::bundle_for(admission, metadata);
-    let id = idle.plaintext.page().clone();
-    deps.memory.publish(idle).unwrap();
-    let mut recycled = admission
-        .reserve(
-            Some(&f.context.object.cache),
-            ResourceClass::Ciphertext,
-            1024 * 1024,
-        )
-        .unwrap();
-    let backing = recycled.buffer(1024 * 1024).unwrap();
-    recycled.recycle(backing);
-    drop(recycled);
-    assert_eq!(admission.retained_buffer_bytes(), 1024 * 1024);
-    let ceiling = admission.limit(ResourceClass::Ciphertext) / 2;
-    let held = admission
-        .reserve(
-            Some(&f.context.object.cache),
-            ResourceClass::Ciphertext,
-            ceiling - admission.used(ResourceClass::Ciphertext),
-        )
-        .unwrap();
-    f.fill.observe_verified(&incoming, &f.scope);
-    f.fill.observe_verified(&incoming, &f.scope);
-    assert_eq!(deps.writer.pending_count(), 1);
-    assert_eq!(admission.retained_buffer_bytes(), 0);
-    assert!(deps.memory.ciphertext(&id).unwrap().is_some());
-    assert!(admission.used(ResourceClass::Ciphertext) <= ceiling);
-    assert_eq!(deps.writer.discarded_count(), 0);
-    drop(held);
 }
 
 #[test]
@@ -1463,8 +1415,6 @@ fn idle_tiny_prefix_must_not_hide_reclaimable_full_page() {
         .unwrap();
     // Cached pages retain only ciphertext, so neither the tiny prefix nor the
     // large page charges plaintext and nothing must be reclaimed to admit.
-    // Released backing may sit in the recycler until reclaimed.
-    admission.reclaim_buffers();
     assert_eq!(admission.used(ResourceClass::Plaintext), 828_901_886);
     let mut reserve = Box::pin(f.fill.reserve_network_plaintext(&f.scope, &f.page));
     let mut cx = Context::from_waker(futures::task::noop_waker_ref());
@@ -1603,7 +1553,6 @@ fn cooperative_plaintext_reclaim_keeps_cached_ciphertext() {
     let first = crate::memory::tests::bundle_for(admission, f.origin.metadata.immutable());
     let id = first.plaintext.page().clone();
     cache.publish(first).unwrap();
-    admission.reclaim_buffers();
     assert_eq!(admission.used(ResourceClass::Plaintext), 0);
     assert_eq!(
         cache.reclaim_idle(ResourceClass::Plaintext, None, usize::MAX, |_, _| {
@@ -3852,7 +3801,6 @@ fn selected_owner_reclaims_foreign_receive_charges_across_full_pages() {
             .memory
             .remove_cache(&source.context.object.cache)
             .unwrap();
-        source.fill.dependencies.admission.reclaim_buffers();
         assert_eq!(
             source
                 .fill
@@ -4555,7 +4503,6 @@ fn local_tail_fixture(length: u64, disk: bool) -> Fixture {
         .memory
         .remove_cache(&f.context.object.cache)
         .unwrap();
-    f.fill.dependencies.admission.reclaim_buffers();
     assert!(
         f.fill
             .dependencies
@@ -4665,7 +4612,6 @@ fn cold_copy_full_page_boundary_and_canceled_disk_read_release_staging() {
         let mut f = local_tail_fixture(63_440_896, true);
         let admission = f.fill.dependencies.admission.clone();
         f.fill.dependencies.writer.slabs().reclaim_idle();
-        admission.reclaim_buffers();
         let before = admission.used(ResourceClass::Ciphertext);
         let scope = RequestScope::host(f.scope.request, f.scope.deadline.0).unwrap();
         if !pending {
@@ -4685,7 +4631,6 @@ fn cold_copy_full_page_boundary_and_canceled_disk_read_release_staging() {
         ));
         drive_disk(&f, f.reactor.drain()).unwrap();
         f.fill.dependencies.writer.slabs().reclaim_idle();
-        admission.reclaim_buffers();
         assert_eq!(f.reactor.in_flight(), 0);
         assert_eq!(admission.used(ResourceClass::Ciphertext), before);
         assert_eq!(admission.used(ResourceClass::Plaintext), 0);
@@ -5493,7 +5438,6 @@ fn disk_copy_reclaims_idle_ciphertext(bootstrap: bool) {
     // Fill the remaining quota after reclaiming idle buffers: a single slab
     // allocation fits without a separate staging copy.
     deps.writer.slabs().reclaim_idle();
-    deps.admission.reclaim_buffers();
     let pressure = deps
         .admission
         .reserve(
@@ -5558,7 +5502,6 @@ fn disk_copy_reclaims_idle_ciphertext(bootstrap: bool) {
     drop((read, copy, busy, pressure));
     deps.memory.evict_idle(usize::MAX).unwrap();
     deps.writer.slabs().reclaim_idle();
-    deps.admission.reclaim_buffers();
     assert_eq!(deps.admission.used(ResourceClass::Ciphertext), 0);
     assert_eq!(f.reactor.in_flight(), 0);
 }

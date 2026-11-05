@@ -2969,7 +2969,6 @@ impl Fill {
         if admission.used(class) <= available_used {
             return true;
         }
-        admission.reclaim_buffers();
         let deficit = admission.used(class).saturating_sub(available_used);
         if deficit != 0 {
             // Over-share caches' idle bytes go first. Zero callbacks never
@@ -2982,9 +2981,6 @@ impl Fill {
                 |_, _| 0,
                 |_, _| 0,
             );
-            // Evicted payloads may have returned backing to the recycler rather
-            // than releasing their charges. Drop those idle allocations too.
-            admission.reclaim_buffers();
         }
         optional_headroom(limit, admission.used(class), amount, one_page)
     }

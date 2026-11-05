@@ -279,10 +279,7 @@ impl Service {
                 // Keep idle pooled buffers: shedding them would make every
                 // measured disk hit allocate fresh page storage.
                 self.rig.memory.evict_idle_entries(usize::MAX)?;
-                assert!(
-                    self.rig.admission.used(ResourceClass::Plaintext)
-                        <= self.rig.admission.retained_buffer_bytes()
-                );
+                assert_eq!(self.rig.admission.used(ResourceClass::Plaintext), 0);
             }
             let entries = self.rig.writer.index().snapshot()?.entries.len();
             let _ = reply.send(Stats {

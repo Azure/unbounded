@@ -381,7 +381,6 @@ fn host_read_client_disconnect_closes_descriptor_and_releases_pages() {
     drop(socket);
     settle(&fixture);
     assert_eq!(memfd.open_copies(), 1);
-    fixture.listeners.admission.reclaim_buffers();
     assert_no_body_leases(&fixture);
 }
 

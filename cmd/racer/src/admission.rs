@@ -798,13 +798,12 @@ mod tests {
         assert_eq!(admission.used(ResourceClass::IngressConnection), 1);
         drop(connection);
         assert_eq!(admission.used(ResourceClass::Connection), 0);
-        let mut charge = admission
+        let charge = admission
             .reserve(None, ResourceClass::Ciphertext, 1 << 20)
             .unwrap();
-        charge.recycle(vec![0xa7; 1 << 20]);
-        drop(charge);
-        assert_eq!(usage.used(ResourceClass::Ciphertext), 1 << 20);
         drop(admission);
+        assert_eq!(usage.used(ResourceClass::Ciphertext), 1 << 20);
+        drop(charge);
         assert_eq!(usage.used(ResourceClass::Ciphertext), 0);
     }
 

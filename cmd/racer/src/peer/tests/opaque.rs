@@ -570,7 +570,6 @@ mod safety {
             drive(&f.reactors, reactor.drain(), || {}).unwrap();
         }
         f.ios[1].reclaim_buffer();
-        f.admissions[1].reclaim_buffers();
         for class in [
             ResourceClass::Connection,
             ResourceClass::Relay,
@@ -825,7 +824,6 @@ mod safety {
             2 * (length + 16) as u64
         );
         assert_eq!(relay_metrics.count(Event::OpaqueRelayBodyFailed), 0);
-        f.admissions[0].reclaim_buffers();
         assert_eq!(f.admissions[1].used(ResourceClass::Connection), 0);
         assert_eq!(f.admissions[1].used(ResourceClass::Relay), 0);
         assert_eq!(f.admissions[0].used(ResourceClass::Plaintext), 0);

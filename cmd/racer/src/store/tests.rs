@@ -3602,7 +3602,6 @@ mod records {
             assert_eq!(decoded.header.generation, Generation(9));
             assert_eq!(decoded.header.metadata, page.metadata.immutable());
         }
-        admission.reclaim_buffers();
         assert_eq!(admission.used(ResourceClass::Ciphertext), 0);
     }
 
@@ -4035,7 +4034,6 @@ mod records {
                 }
             }
         }
-        admission.reclaim_buffers();
     }
 
     #[test]
@@ -4080,7 +4078,6 @@ mod records {
             parse_bytes(&bytes[..1024], Extent::new(0, 1024).unwrap()).err(),
             Some(Error::CorruptRecord)
         );
-        admission.reclaim_buffers();
     }
 
     #[test]
@@ -4108,7 +4105,6 @@ mod records {
             parse_bytes(&bytes, extent).err(),
             Some(Error::CorruptRecord)
         );
-        admission.reclaim_buffers();
     }
 
     #[test]
@@ -4145,7 +4141,6 @@ mod records {
         let old = parse_bytes(&bytes, extent).unwrap();
         assert_eq!(old.ciphertext, 512..512 + 19);
         assert_eq!(old.direct_range(), None);
-        admission.reclaim_buffers();
     }
 
     #[test]

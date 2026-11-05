@@ -271,7 +271,6 @@ fn gpu_read_driver_fault_fails_the_read_and_releases_the_import() {
     );
     settle(&fixture);
     assert_released(&helper);
-    fixture.listeners.admission.reclaim_buffers();
     assert_no_body_leases(&fixture);
 }
 
@@ -293,7 +292,6 @@ fn gpu_read_client_disconnect_releases_the_import() {
     drop(socket);
     settle(&fixture);
     assert_released(&helper);
-    fixture.listeners.admission.reclaim_buffers();
     assert_no_body_leases(&fixture);
 }
 

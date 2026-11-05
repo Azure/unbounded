@@ -143,7 +143,6 @@ fn final_payload_owner_scrubs_full_allocation_on_reclaim_and_rejection() {
                 "{ciphertext} {scenario}"
             );
             if let Some(admission) = admission {
-                admission.reclaim_buffers();
                 assert_eq!(admission.used(class), 0);
             }
         }

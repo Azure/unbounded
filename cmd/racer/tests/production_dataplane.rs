@@ -1115,7 +1115,6 @@ fn zero_ttl_bootstrap_reclaims_idle_versions_and_new_objects_beyond_byte_budget(
             if version == 4 {
                 // The memory cache retains only ciphertext, so delivered
                 // plaintext is released once replies complete.
-                rig.admission.reclaim_buffers();
                 assert_eq!(rig.admission.used(ResourceClass::Plaintext), 0);
             }
         }

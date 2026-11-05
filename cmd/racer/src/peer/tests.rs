@@ -476,7 +476,6 @@ mod body_progress {
             drop(drain);
             drop(io);
             drop(binding);
-            admission.reclaim_buffers();
             assert_eq!(reactor.in_flight(), 0);
             drop(reactor);
             for class in [
@@ -3041,7 +3040,6 @@ mod timing {
         assert_eq!(reactor.in_flight(), 0);
         drop(io);
         drop(reactor);
-        admission.reclaim_buffers();
         for class in [
             ResourceClass::Connection,
             ResourceClass::IngressConnection,

@@ -2060,10 +2060,9 @@ impl WorkerApplication {
         Ok(())
     }
 
-    /// Advance demand sizing of the idle recycler, staging, and aligned pools.
+    /// Advance demand sizing of the idle staging and aligned pools.
     /// Each pool is O(1) until its observation window elapses.
     fn maintain_pools(&self, now: std::time::Instant) {
-        self.runtime.admission.maintain_buffers(now);
         self.store.writer.maintain_staging(now);
         // Expire idle cache entries first so their buffers reach the pools
         // before those decay.
@@ -2176,18 +2175,14 @@ impl WorkerApplication {
 
     /// Hold every idle pool at its minimum while memory is constrained.
     pub(crate) fn constrain_pools(&self, constrained: bool) {
-        self.runtime.admission.constrain_buffers(constrained);
         self.store.writer.constrain_staging(constrained);
         self.memory.buffers().constrain_idle_buffers(constrained);
     }
 
-    /// Idle pool statistics as `(recycler, staging slab)`.
+    /// Idle statistics of the staging slab pool.
     #[cfg(test)]
-    pub(crate) fn pool_stats(&self) -> (flow_control::PoolStats, flow_control::PoolStats) {
-        (
-            self.runtime.admission.buffer_pool_stats(),
-            self.store.writer.staging_pool_stats(),
-        )
+    pub(crate) fn staging_pool_stats(&self) -> flow_control::PoolStats {
+        self.store.writer.staging_pool_stats()
     }
 
     /// Idle and trimming counters of this worker's buffer pool.

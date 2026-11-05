@@ -1750,7 +1750,6 @@ fn memory_cache_retains_only_ciphertext_after_delivery() {
     let mut f = fixture();
     let ciphertext = fill_and_release(&mut f);
     let deps = &f.fill.dependencies;
-    deps.admission.reclaim_buffers();
     assert_eq!(deps.admission.used(ResourceClass::Plaintext), 0);
     assert!(deps.memory.get(&f.page).unwrap().is_none());
     let cached = deps.memory.ciphertext(&f.page).unwrap().unwrap();
@@ -1781,7 +1780,6 @@ fn cached_ciphertext_hit_decrypts_without_refetching() {
     assert!(Arc::ptr_eq(&shared.plaintext.inner, &again.plaintext.inner));
     drop((again, shared));
     f.fill.dependencies.flights.poll_budgeted(64).unwrap();
-    f.fill.dependencies.admission.reclaim_buffers();
     assert_eq!(
         f.fill.dependencies.admission.used(ResourceClass::Plaintext),
         0
@@ -1878,7 +1876,6 @@ fn cache_ciphertext_only(
         );
     }
     f.fill.dependencies.flights.poll_budgeted(64).unwrap();
-    f.fill.dependencies.admission.reclaim_buffers();
     assert_eq!(
         f.fill.dependencies.admission.used(ResourceClass::Plaintext),
         0

@@ -595,10 +595,8 @@ impl BufferPool {
     pub(crate) fn disk_capacity(&self, length: usize) -> Result<usize> {
         Ok(self.disk.borrow().capacity_for(length)?)
     }
-    /// Release idle recycled storage: the flow-control recycler and this
-    /// worker's pool, dropping the admission charges both retain.
+    /// Release this worker's idle pooled storage and the admission it retains.
     pub(crate) fn reclaim_idle_buffers(&self) {
-        self.admission.reclaim_buffers();
         self.shed_disk_buffers();
     }
     /// Admission a pooled aligned buffer of `length` bytes must be charged for.
@@ -2155,7 +2153,6 @@ pub(crate) mod tests {
         }
 
         fn occupancy(admission: &flow_control::Quotas<AdmissionPolicy>) -> [usize; 3] {
-            admission.reclaim_buffers();
             [
                 ResourceClass::Plaintext,
                 ResourceClass::Ciphertext,
@@ -2470,7 +2467,6 @@ pub(crate) mod tests {
                 }
                 assert_eq!(hits + refills, MEASURE);
                 cache.evict_idle(usize::MAX).unwrap();
-                admission.reclaim_buffers();
                 assert!(cache.entries.borrow().pages.is_empty());
                 assert_eq!(admission.used(ResourceClass::Plaintext), 0);
                 assert_eq!(admission.used(ResourceClass::Ciphertext), 0);

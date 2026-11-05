@@ -4998,43 +4998,47 @@ fn shared_pressure_constrains_pools_and_releases_retained_buffers() {
     worker.pressure.monitor = None;
     let shared = worker.node.pressure.clone();
     let admission = worker.runtime.admission.clone();
-    let mut reservation = admission
-        .reserve(None, ResourceClass::Ciphertext, 1 << 20)
+    let length = 1 << 20;
+    let capacity = worker.memory.buffers().aligned_capacity(length).unwrap();
+    let reservation = admission
+        .reserve(None, ResourceClass::Ciphertext, capacity)
         .unwrap();
-    let bytes = reservation.buffer(1 << 20).unwrap();
-    reservation.recycle(bytes);
-    drop(reservation);
-    let (recycler, staging) = worker.pool_stats();
-    assert!(recycler.bytes >= 1 << 20);
-    assert!(!recycler.constrained && !staging.constrained);
+    drop(
+        worker
+            .memory
+            .buffers()
+            .aligned_ciphertext(reservation, length)
+            .unwrap(),
+    );
+    let pool = worker.buffer_pool_stats();
+    assert!(pool.bytes >= length);
+    assert!(!pool.constrained && !worker.staging_pool_stats().constrained);
     let now = racer_io::Clock::host().now();
     // Normal is the initial level: polling changes nothing.
     worker.poll_pressure(now);
-    assert!(worker.pool_stats().0.bytes >= 1 << 20);
+    assert!(worker.buffer_pool_stats().bytes >= length);
 
     shared.store(PressureLevel::Elevated);
     worker.poll_pressure(now);
-    let (recycler, staging) = worker.pool_stats();
-    assert!(recycler.constrained && staging.constrained);
-    assert!(worker.buffer_pool_stats().constrained);
-    assert_eq!(recycler.bytes, 0);
+    let (pool, staging) = (worker.buffer_pool_stats(), worker.staging_pool_stats());
+    assert!(pool.constrained && staging.constrained);
+    assert_eq!(pool.bytes, 0);
     assert_eq!(staging.bytes, 0);
     assert_eq!(admission.used(ResourceClass::Ciphertext), 0);
     // Repeated polls at the same level are idempotent.
     worker.poll_pressure(now);
-    assert!(worker.pool_stats().0.constrained);
+    assert!(worker.buffer_pool_stats().constrained);
 
     shared.store(PressureLevel::Critical);
     worker.poll_pressure(now);
     assert_eq!(worker.pressure.responder.level(), PressureLevel::Critical);
     // Critical cache reclaim on an empty cache is a no-op, not an error.
     worker.reclaim_cache_under_pressure();
-    assert!(worker.pool_stats().1.constrained);
+    assert!(worker.staging_pool_stats().constrained);
 
     shared.store(PressureLevel::Normal);
     worker.poll_pressure(now);
-    let (recycler, staging) = worker.pool_stats();
-    assert!(!recycler.constrained && !staging.constrained);
+    assert!(!worker.staging_pool_stats().constrained);
     assert!(!worker.buffer_pool_stats().constrained);
     assert_eq!(
         worker
@@ -5060,7 +5064,7 @@ fn disabled_pressure_ignores_shared_level_but_still_reports_resident_memory() {
     let now = racer_io::Clock::host().now();
     worker.poll_pressure(now);
     assert_eq!(worker.pressure.responder.level(), PressureLevel::Normal);
-    assert!(!worker.pool_stats().0.constrained);
+    assert!(!worker.buffer_pool_stats().constrained);
     worker.observe_memory(now);
     let mut output = String::new();
     worker

@@ -1954,9 +1954,7 @@ pub(super) mod tests {
             drop(reader);
         }
         assert_eq!(stream.retained.len(), 2);
-        // Idle recycled buffers are still charged; reclaim only those to isolate
-        // the unreleased leases, which must remain charged despite reclamation.
-        admission.reclaim_buffers();
+        // Unreleased leases remain charged.
         assert_eq!(
             admission.used(ResourceClass::Plaintext),
             2 * PAGE_BYTES as usize
@@ -1971,13 +1969,11 @@ pub(super) mod tests {
             2 * PAGE_BYTES as usize
         );
         stream.release_page(PageNumber(0), 1).unwrap();
-        admission.reclaim_buffers();
         assert_eq!(
             admission.used(ResourceClass::Plaintext),
             PAGE_BYTES as usize
         );
         futures::executor::block_on(stream.cancel()).unwrap();
-        admission.reclaim_buffers();
         assert_eq!(admission.used(ResourceClass::Plaintext), 0);
         assert!(stream.retained.is_empty());
     }
@@ -2127,7 +2123,6 @@ pub(super) mod tests {
                     _ => drop((second, stream, held)),
                 }
                 assert_eq!(admission.used(ResourceClass::RequestContext), baseline);
-                admission.reclaim_buffers();
                 assert_eq!(admission.used(ResourceClass::Plaintext), 0);
                 assert_eq!(admission.used(ResourceClass::Ciphertext), 0);
             }
@@ -3076,7 +3071,6 @@ pub(super) mod tests {
                 assert!(Instant::now() < drain_deadline, "read worker did not drain");
             }
             worker.poll(&mut cx);
-            admission.reclaim_buffers();
             if progressing {
                 assert!(
                     uring_runtime::environment::now() > scope.deadline.0,

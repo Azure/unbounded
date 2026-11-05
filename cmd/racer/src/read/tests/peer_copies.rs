@@ -1182,7 +1182,6 @@ fn retained_small_copy_admits_actual_plaintext_with_live_pressure() {
         let mut f = fixture();
         let copy = encrypted_copy(&mut f);
         let admission = f.fill.dependencies.admission.clone();
-        admission.reclaim_buffers();
         let pressure = admission
             .reserve(
                 None,
@@ -1238,7 +1237,6 @@ fn known_copy_admission_validates_before_reclaim_and_preserves_failures() {
         let mut f = fixture();
         let mut copy = encrypted_copy(&mut f);
         let admission = f.fill.dependencies.admission.clone();
-        admission.reclaim_buffers();
         if case == "metadata" {
             copy.metadata.length = 4;
         }
@@ -1291,7 +1289,6 @@ fn known_copy_admission_validates_before_reclaim_and_preserves_failures() {
                     .unwrap()
                     .is_none()
             );
-            admission.reclaim_buffers();
             assert_eq!(admission.used(ResourceClass::Plaintext), before);
         }
     }
@@ -1302,7 +1299,6 @@ fn known_copy_reclaims_only_idle_bytes_after_validation() {
     let mut f = fixture();
     let copy = encrypted_copy(&mut f);
     let admission = f.fill.dependencies.admission.clone();
-    admission.reclaim_buffers();
     let mut descriptor = copy.metadata.immutable();
     descriptor.version.etag = StrongEtag::test_value("busy");
     let busy = crate::memory::tests::bundle_for(&admission, descriptor.clone());
@@ -1395,7 +1391,6 @@ fn known_copy_full_page_still_requires_full_plaintext_admission() {
         metadata: f.origin.metadata.clone(),
         ciphertext,
     };
-    admission.reclaim_buffers();
     let pressure = admission
         .reserve(
             None,
