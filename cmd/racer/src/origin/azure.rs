@@ -352,8 +352,8 @@ impl<T: AzureTransport, K: AzureTokenSource> AzureOrigin<T, K> {
         self.observe(&snapshot);
         let index = snapshot
             .caches
-            .iter()
-            .position(|cache| cache.id == object.cache && cache.origin.is_some())
+            .position(&object.cache)
+            .filter(|i| snapshot.caches[*i].origin.is_some())
             .ok_or(Error::Unavailable)?;
         Ok((snapshot, index))
     }

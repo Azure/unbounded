@@ -45,8 +45,8 @@ impl<U: Origin, T: AzureTransport, K: AzureTokenSource> OriginRouter<U, T, K> {
         azure.observe(&snapshot);
         let index = snapshot
             .caches
-            .iter()
-            .position(|cache| cache.id == object.cache && cache.origin.is_some())?;
+            .position(&object.cache)
+            .filter(|i| snapshot.caches[*i].origin.is_some())?;
         Some((azure, snapshot, index))
     }
 }

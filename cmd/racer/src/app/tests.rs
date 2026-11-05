@@ -4702,7 +4702,7 @@ mod cache_publication {
         let local = crate::topology::tests::fixtures::member(0, 4).node;
         let snapshot = |membership: &Arc<crate::topology::Membership>| {
             let mut snapshot = crate::control::Snapshot::membership_fixture(membership.clone());
-            snapshot.caches = vec![narrow.clone()];
+            snapshot.caches = Arc::new(vec![narrow.clone()].into());
             snapshot
         };
         let inside = Arc::new(pooled(1, 4, vec![0, 1, 2], None));
@@ -4719,7 +4719,7 @@ mod cache_publication {
         ));
         // A removed cache is not kept even on a pool member.
         let mut removed = snapshot(&inside);
-        removed.caches.clear();
+        removed.caches = Arc::default();
         assert!(!crate::app::prefetch_keeps(&removed, &local, &narrow.id));
     }
 }

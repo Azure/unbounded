@@ -2025,7 +2025,7 @@ impl WorkerApplication {
         let removed: std::collections::HashSet<_> = self
             .caches
             .iter()
-            .filter(|old| !snapshot.caches.iter().any(|new| new.id == old.id))
+            .filter(|old| !snapshot.caches.contains(&old.id))
             .map(|old| old.id.clone())
             .collect();
         self.memory.remove_caches(&removed)?;
@@ -2061,7 +2061,7 @@ impl WorkerApplication {
         if admission.policy().weights().update(&snapshot.caches) {
             admission.reweigh();
         }
-        self.caches = snapshot.caches.clone();
+        self.caches = snapshot.caches.to_vec();
         self.snapshot_sequence = Some(snapshot.sequence);
         Ok(())
     }
@@ -2888,7 +2888,7 @@ fn prefetch_keeps(
     local: &NodeId,
     cache: &racer_control_wire::CacheId,
 ) -> bool {
-    snapshot.caches.iter().any(|new| &new.id == cache) && snapshot.membership.serves(cache, local)
+    snapshot.caches.contains(cache) && snapshot.membership.serves(cache, local)
 }
 
 impl WorkerApplication {

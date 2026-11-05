@@ -172,8 +172,7 @@ impl OriginClient {
         let snapshot = self.snapshots.current()?.ok_or(Error::Unavailable)?;
         let cache = snapshot
             .caches
-            .iter()
-            .find(|cache| cache.id == context.object.cache)
+            .find(&context.object.cache)
             .ok_or(Error::Unavailable)?;
         Ok(Endpoint::Origin {
             cache: cache.id.clone(),

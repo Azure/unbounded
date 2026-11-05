@@ -249,7 +249,7 @@ fn project(
         cluster: publication.cluster,
         sequence: publication.sequence,
         membership,
-        caches: publication.caches,
+        caches: Arc::new(publication.caches.into()),
         pools: publication.pools,
         content_hash,
         membership_hash,

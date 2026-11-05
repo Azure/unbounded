@@ -364,10 +364,7 @@ impl Coordinator {
         Box::pin(async move {
             scope.check()?;
             let snapshot = self.snapshots.current()?.ok_or(Error::Unavailable)?;
-            if !snapshot
-                .caches
-                .iter()
-                .any(|c| c.id == request.origin.object.cache)
+            if !snapshot.caches.contains(&request.origin.object.cache)
                 || !self.availability.metadata(&request.origin.object.cache)
             {
                 return Err(Error::Unavailable);
@@ -473,7 +470,7 @@ impl Coordinator {
     ) -> Result<std::sync::Arc<crate::topology::Membership>> {
         let snapshot = self.snapshots.current()?.ok_or(Error::Unavailable)?;
         // Only the cache's pool members place, fill and track its pages.
-        if !snapshot.caches.iter().any(|c| &c.id == cache)
+        if !snapshot.caches.contains(cache)
             || !self.availability.metadata(cache)
             || !snapshot.membership.serves(cache, &self.local_node())
         {
@@ -656,14 +653,8 @@ impl LocalPageService for Coordinator {
                 return Err(error.into());
             }
             let object = object.ok_or(Error::InvalidRequest)?;
-            let cache_available = self
-                .snapshots
-                .current()?
-                .ok_or(Error::Unavailable)?
-                .caches
-                .iter()
-                .any(|c| c.id == object.cache)
-                && self.availability.metadata(&object.cache);
+            // `metadata` checks cache admission against the current publication.
+            let cache_available = self.availability.metadata(&object.cache);
             let action = serve_action(facts(cache_available));
             if action == ServeAction::Miss {
                 return Ok(PeerResponse::Miss);

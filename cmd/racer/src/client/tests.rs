@@ -2799,7 +2799,7 @@ fn production_snapshot_replacement_rejects_old_backlog_uid_with_503() {
     snapshots
         .apply_staged(publication.clone(), Some(Box::new(transition)))
         .unwrap();
-    assert_eq!(snapshots.current().unwrap().caches, publication.caches);
+    assert_eq!(**snapshots.current().unwrap().caches, *publication.caches);
     let response = fixture.receive(&mut socket, true);
     assert!(response.starts_with(b"HTTP/1.1 503"), "{response:?}");
     assert_eq!(

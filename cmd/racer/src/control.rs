@@ -139,8 +139,8 @@ pub struct Snapshot {
     /// Shared immutable topology retained by in-flight operations.
     pub membership: std::sync::Arc<crate::topology::Membership>,
 
-    /// Cache namespaces admitted by this publication.
-    pub caches: Vec<CacheDefinition>,
+    /// Cache namespaces admitted by this publication, indexed by id.
+    pub caches: Arc<Caches>,
 
     /// Node pools of `caches`, as validated from the publication. Placement
     /// reads them through `membership`.
@@ -159,7 +159,7 @@ impl Snapshot {
             cluster: ClusterId("test".into()),
             sequence: PublicationSequence(1),
             membership,
-            caches: Vec::new(),
+            caches: Arc::default(),
             pools: Vec::new(),
             content_hash: [0; 32],
             membership_hash: [0; 32],
@@ -190,30 +190,43 @@ pub struct Availability {
     publications: Arc<PublicationCell<Snapshot>>,
 
     keys: Rc<Keyring>,
+
+    /// Worker-local copy of the published cache index, reloaded on epoch change.
+    /// It holds only the cache index, never the membership, so idle workers do
+    /// not consume publication grace capacity.
+    caches: cell::EpochCopy<Arc<Caches>>,
 }
 
 impl Availability {
     /// Bind admission checks to current publications and worker-local keys.
     pub fn new(publications: Arc<PublicationCell<Snapshot>>, keys: Rc<Keyring>) -> Self {
-        Self { publications, keys }
+        Self {
+            publications,
+            keys,
+            caches: cell::EpochCopy::default(),
+        }
+    }
+
+    /// Run `f` over the current cache definition, if published. Takes no lock
+    /// and no shared reference count while the publication is unchanged.
+    #[inline]
+    fn with_cache<R>(&self, cache: &CacheId, f: impl FnOnce(Option<&CacheDefinition>) -> R) -> R {
+        self.caches.with(
+            &self.publications,
+            |s| s.caches.clone(),
+            |caches| f(caches.and_then(|c| c.find(cache))),
+        )
     }
 
     /// Check whether the current publication admits this cache.
     pub fn cache(&self, cache: &CacheId) -> bool {
-        self.publications
-            .current()
-            .is_ok_and(|s| s.is_some_and(|s| s.caches.iter().any(|c| &c.id == cache)))
+        self.with_cache(cache, |c| c.is_some())
     }
 
     /// Published mode of this cache. Unpublished caches report `Cached`; the
     /// other admission checks already refuse them.
     pub fn mode(&self, cache: &CacheId) -> racer_control_wire::CacheMode {
-        self.publications
-            .current()
-            .ok()
-            .flatten()
-            .and_then(|s| s.caches.iter().find(|c| &c.id == cache).map(|c| c.mode))
-            .unwrap_or_default()
+        self.with_cache(cache, |c| c.map(|c| c.mode).unwrap_or_default())
     }
 
     /// Whether this cache retains no pages or metadata.
@@ -223,7 +236,7 @@ impl Availability {
 
     /// Require both cache admission and an active page key for metadata reads.
     pub fn metadata(&self, cache: &CacheId) -> bool {
-        self.cache(cache) && self.keys.active(cache, KeyPurpose::Page).is_ok()
+        self.cache(cache) && self.keys.has_active(cache, KeyPurpose::Page)
     }
 
     /// Generation of the installed keyring, which changes whenever keys are
@@ -234,7 +247,62 @@ impl Availability {
 
     /// Require cache admission and the exact key needed by a stored page.
     pub fn page(&self, cache: &CacheId, key: KeyId) -> bool {
-        self.cache(cache) && self.keys.lease(Some(cache), key, KeyPurpose::Page).is_ok()
+        self.cache(cache) && self.keys.admits(cache, key, KeyPurpose::Page)
+    }
+}
+
+/// Published cache definitions in publication order, with an id index built
+/// once at publication so lookups by id are logarithmic, not linear.
+#[derive(Debug, Default)]
+pub struct Caches {
+    definitions: Vec<CacheDefinition>,
+
+    /// Positions into `definitions`, sorted by cache id.
+    by_id: Vec<u32>,
+}
+
+impl Caches {
+    /// Index definitions by id.
+    pub fn new(definitions: Vec<CacheDefinition>) -> Self {
+        let mut by_id: Vec<u32> = (0..definitions.len() as u32).collect();
+        by_id.sort_by(|a, b| {
+            definitions[*a as usize]
+                .id
+                .cmp(&definitions[*b as usize].id)
+        });
+        Self { definitions, by_id }
+    }
+
+    /// Position of `cache` in publication order.
+    pub fn position(&self, cache: &CacheId) -> Option<usize> {
+        self.by_id
+            .binary_search_by(|i| self.definitions[*i as usize].id.cmp(cache))
+            .ok()
+            .map(|i| self.by_id[i] as usize)
+    }
+
+    /// Definition of `cache`, if published.
+    pub fn find(&self, cache: &CacheId) -> Option<&CacheDefinition> {
+        self.position(cache).map(|i| &self.definitions[i])
+    }
+
+    /// Whether `cache` is published.
+    pub fn contains(&self, cache: &CacheId) -> bool {
+        self.position(cache).is_some()
+    }
+}
+
+impl std::ops::Deref for Caches {
+    type Target = [CacheDefinition];
+
+    fn deref(&self) -> &[CacheDefinition] {
+        &self.definitions
+    }
+}
+
+impl From<Vec<CacheDefinition>> for Caches {
+    fn from(definitions: Vec<CacheDefinition>) -> Self {
+        Self::new(definitions)
     }
 }
 
@@ -3106,5 +3174,39 @@ pub(crate) mod tests {
             );
             assert_eq!(r.in_flight(), 0);
         }
+    }
+}
+
+#[cfg(test)]
+mod caches_tests {
+    //! Indexed cache lookup agrees with publication order.
+
+    use super::*;
+
+    fn definition(id: &str, priority: u16) -> CacheDefinition {
+        CacheDefinition {
+            id: CacheId(id.into()),
+            name: id.into(),
+            client_socket: PathBuf::new(),
+            origin_socket: PathBuf::new(),
+            priority,
+            mode: racer_control_wire::CacheMode::default(),
+            origin: None,
+        }
+    }
+
+    #[test]
+    fn lookup_by_id_preserves_publication_order() {
+        let caches = Caches::new(vec![
+            definition("c", 0),
+            definition("a", 1),
+            definition("b", 2),
+        ]);
+        assert_eq!(caches.position(&CacheId("a".into())), Some(1));
+        assert_eq!(caches.find(&CacheId("b".into())).unwrap().priority, 2);
+        assert!(caches.contains(&CacheId("c".into())));
+        assert!(!caches.contains(&CacheId("d".into())));
+        assert_eq!(caches[0].id, CacheId("c".into()));
+        assert!(!Caches::default().contains(&CacheId("a".into())));
     }
 }
