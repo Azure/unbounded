@@ -9,8 +9,6 @@ impl Root {
     fn new() -> Self {
         static NEXT: AtomicU64 = AtomicU64::new(0);
         let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .parent()
-            .unwrap()
             .join("target/tmp")
             .join(format!(
                 "core-{}-{}",
@@ -142,7 +140,6 @@ fn non_permission_remove_bits_do_not_trigger_fchmod() {
     restrict_directory(&directory, libc::S_IFDIR).unwrap();
 }
 
-#[cfg(feature = "test-util")]
 #[test]
 fn explicit_unlock_releases_cloned_open_file_description() {
     let root = Root::new();

@@ -3218,13 +3218,7 @@ mod tests {
         let c = |ips: &str, listen: &str| {
             managed_env(&[("RACER_POD_IPS", ips), ("RACER_WEBHOOK_LISTEN", listen)])
         };
-        let alt = |ips, listen| {
-            c(ips, listen)
-                .unwrap()
-                .authority
-                .unwrap()
-                .webhook_alternate
-        };
+        let alt = |ips, listen| c(ips, listen).unwrap().authority.unwrap().webhook_alternate;
         assert_eq!(
             alt("10.0.0.5,fd00::5", webhook),
             Some("fd00::5".parse().unwrap())

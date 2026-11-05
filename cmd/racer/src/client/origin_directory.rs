@@ -137,7 +137,7 @@ fn prepare_with(
     privileged: bool,
     ops: &mut impl Ops,
 ) -> io::Result<Outcome> {
-    let directory = uds_endpoint::child_directory(cache, b"origin", ORIGIN_MODE)?;
+    let directory = crate::uds_endpoint::child_directory(cache, b"origin", ORIGIN_MODE)?;
     let before = directory.metadata()?;
     if !before.is_dir() {
         return Err(io::Error::from_raw_os_error(libc::ENOTDIR));

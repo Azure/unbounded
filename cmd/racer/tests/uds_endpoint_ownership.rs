@@ -1,10 +1,10 @@
+use racer::uds_endpoint::*;
 use std::fs::{self, File, OpenOptions};
 use std::os::fd::AsRawFd;
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt, symlink};
 use std::os::unix::net::UnixListener;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
-use uds_endpoint::*;
 
 fn layout() -> Layout {
     Layout::new("endpoint.lock", "endpoint.sock", "owned-", |name| {
@@ -255,7 +255,7 @@ fn bound_socket_accepts_and_cleans_up_published_names_before_unlock() {
     let root = Root::new();
     let directory = root.directory();
     let anchor = file_path(&directory);
-    use uds_endpoint::publication::{Publication, Replacement};
+    use racer::uds_endpoint::publication::{Publication, Replacement};
     let owner = Rc::new(EndpointOwner::acquire(&directory, layout()).unwrap());
     let bound = Rc::new(BoundSocket::bind(owner, "pending-a").unwrap());
     assert!(
@@ -586,8 +586,8 @@ fn long_components_and_unix_socket_paths_fail_without_staging_leaks() {
 #[test]
 #[ignore = "invoked by crash_recovery_subprocess_states with a private fixture"]
 fn crash_state_driver() {
+    use racer::uds_endpoint::publication::{Publication, Replacement};
     use std::rc::Rc;
-    use uds_endpoint::publication::{Publication, Replacement};
     let root = PathBuf::from(std::env::var_os("UDS_CRASH_ROOT").expect("subprocess root"));
     let state = std::env::var("UDS_CRASH_STATE").unwrap();
     let directory = open_directory(&root, 0o700).unwrap();

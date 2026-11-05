@@ -1,8 +1,8 @@
 //! Worker-local pathname publication, independent of service/control activation.
 //! Callers stage every endpoint before publishing and serialize directory access.
 
-use crate::directory::{Dir, component};
-use crate::{BoundSocket, Error, error, same_inode};
+use crate::uds_endpoint::directory::{Dir, component};
+use crate::uds_endpoint::{BoundSocket, Error, error, same_inode};
 use std::io;
 use std::os::unix::fs::{FileTypeExt, MetadataExt};
 use std::rc::Rc;

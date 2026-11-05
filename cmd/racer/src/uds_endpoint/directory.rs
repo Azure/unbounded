@@ -1,6 +1,6 @@
 //! Single-component, descriptor-relative operations. No helper follows a named symlink.
 
-use crate::{Error, error, file_path, same_inode};
+use crate::uds_endpoint::{Error, error, file_path, same_inode};
 use std::ffi::CString;
 use std::fs::{self, File, Metadata};
 use std::io;

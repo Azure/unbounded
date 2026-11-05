@@ -1,5 +1,9 @@
 //! End-to-end diagnostic ownership, formatting failure, and request-boundary workflows.
 
+use crate::telemetry::primitives::{
+    Lease, Metrics, Ring,
+    server::{self, Event, Handler, Response, Server},
+};
 use racer_io::Error;
 use racer_io::cancel::Cancellation;
 use racer_io::scoped::Reactor;
@@ -11,10 +15,6 @@ use std::{
     net::{SocketAddr, TcpListener, TcpStream},
     task::{Context, Poll, Waker},
     time::{Duration, Instant},
-};
-use crate::telemetry::primitives::{
-    Lease, Metrics, Ring,
-    server::{self, Event, Handler, Response, Server},
 };
 
 crate::metrics! { Counter, COUNTERS, COUNTER_COUNT;

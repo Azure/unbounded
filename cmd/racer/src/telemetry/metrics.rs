@@ -51,7 +51,8 @@ pub struct Metrics {
 
 /// Memory telemetry shared by every worker's handle, behind one pointer.
 struct MemoryShards {
-    staging: crate::telemetry::primitives::SnapshotShards<Option<(WorkerId, flow_control::PoolStats)>>,
+    staging:
+        crate::telemetry::primitives::SnapshotShards<Option<(WorkerId, flow_control::PoolStats)>>,
 
     // One node-wide slot written by the sampling worker.
     process: crate::telemetry::primitives::SnapshotShards<ProcessMemory>,
@@ -656,9 +657,12 @@ impl Metrics {
                 }
             }
         }
-        crate::telemetry::primitives::metrics::Exposition::new(RETENTION_METRICS).write(out, totals)?;
-        crate::telemetry::primitives::metrics::Exposition::new(DISK_CLASS_METRICS.map(|name| (name, "counter")))
-            .write_labeled(out, "classification", ["nonowned", "owned"], classes)
+        crate::telemetry::primitives::metrics::Exposition::new(RETENTION_METRICS)
+            .write(out, totals)?;
+        crate::telemetry::primitives::metrics::Exposition::new(
+            DISK_CLASS_METRICS.map(|name| (name, "counter")),
+        )
+        .write_labeled(out, "classification", ["nonowned", "owned"], classes)
     }
 
     pub(crate) fn opaque_relay_body(&self, bytes: usize) -> Option<OpaqueRelayBody<'_>> {

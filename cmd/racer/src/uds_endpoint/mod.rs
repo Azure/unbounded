@@ -310,7 +310,7 @@ impl EndpointOwner {
     ///
     /// # Errors
     /// Returns the underlying descriptor duplication error.
-    #[cfg(feature = "test-util")]
+    #[cfg(test)]
     pub fn clone_lock_for_test(&self) -> io::Result<File> {
         self.lock.try_clone()
     }
@@ -744,8 +744,6 @@ mod admission_tests {
     #[test]
     fn permissions_precede_listen() {
         let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .parent()
-            .unwrap()
             .join("target/tmp")
             .join(format!("admission-{}", std::process::id()));
         fs::create_dir_all(&root).unwrap();
@@ -755,7 +753,7 @@ mod admission_tests {
             .arg(std::env::current_exe().unwrap())
             .args([
                 "--exact",
-                "admission_tests::permissive_umask_driver",
+                "uds_endpoint::admission_tests::permissive_umask_driver",
                 "--ignored",
                 "--test-threads=1",
             ])

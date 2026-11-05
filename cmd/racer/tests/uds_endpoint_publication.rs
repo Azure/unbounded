@@ -1,3 +1,5 @@
+use racer::uds_endpoint::publication::{Endpoint, Publication, Rename, Replacement};
+use racer::uds_endpoint::{BoundSocket, EndpointOwner, Layout, file_path, open_directory};
 use std::cell::{Cell, RefCell};
 use std::fs::{self, File};
 use std::io;
@@ -6,8 +8,6 @@ use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use uds_endpoint::publication::{Endpoint, Publication, Rename, Replacement};
-use uds_endpoint::{BoundSocket, EndpointOwner, Layout, file_path, open_directory};
 
 const CANONICAL: &str = "endpoint.sock";
 fn layout() -> Layout {
@@ -485,8 +485,8 @@ fn completed_journals_reject_publish_after_commit_or_rollback() {
             error
                 .get_ref()
                 .unwrap()
-                .downcast_ref::<uds_endpoint::Error>(),
-            Some(&uds_endpoint::Error::PublicationCompleted)
+                .downcast_ref::<racer::uds_endpoint::Error>(),
+            Some(&racer::uds_endpoint::Error::PublicationCompleted)
         );
         assert!(next.owns("pending-next"));
         assert_eq!(next.basename(), "pending-next");

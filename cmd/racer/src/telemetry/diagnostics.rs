@@ -1142,9 +1142,11 @@ mod tests {
             assert_eq!(unsafe { libc::poll(&mut poll, 1, 5000) }, 1);
             assert_eq!(
                 session.result(),
-                Some(Err(crate::telemetry::primitives::server::BinaryError::Unavailable(
-                    "response_too_large"
-                )))
+                Some(Err(
+                    crate::telemetry::primitives::server::BinaryError::Unavailable(
+                        "response_too_large"
+                    )
+                ))
             );
         }
 

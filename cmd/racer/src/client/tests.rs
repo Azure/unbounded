@@ -196,7 +196,7 @@ mod directory {
     }
     #[test]
     fn secure_client_directory_permissions_are_unchanged() {
-        // Generic mode combinations live in uds-endpoint. Keep adapter coverage
+        // Generic mode combinations live in uds_endpoint. Keep adapter coverage
         // for read-only/sticky modes and no metadata mutation on the first call.
         for mode in [0o755, 0o711, 0o751, 0o511, 0o1711] {
             let root = Root::new();
@@ -361,7 +361,7 @@ mod directory {
     }
     #[test]
     fn client_directory_preparation_pins_inode_across_path_replacement() {
-        // uds-endpoint covers symlink replacement. Exercise the application's
+        // uds_endpoint covers symlink replacement. Exercise the application's
         // adapter with a real replacement directory and the retained old handle.
         let root = Root::new();
         let parent = open_directory(&root.0).unwrap();

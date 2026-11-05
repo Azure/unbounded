@@ -39,8 +39,8 @@ mod diagnostics;
 mod forensics;
 mod health;
 mod metrics;
-mod samples;
 pub mod primitives;
+mod samples;
 
 pub use diagnostics::*;
 pub use forensics::*;

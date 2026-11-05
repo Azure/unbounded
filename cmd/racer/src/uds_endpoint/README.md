@@ -1,7 +1,7 @@
-# uds-endpoint
+# uds_endpoint
 
-Private Linux filesystem-ownership helper for `racer`. This unpublished
-crate depends only on `libc`. It does not depend on an application model, runtime,
+Private Linux filesystem-ownership module in `racer` (`src/uds_endpoint`). It
+uses only `libc` and the `racer-io` simulation. It does not depend on an application model, runtime,
 protocol, reactor, or service-activation policy. It owns Unix stream socket names
 and a worker-local publication journal, not application readiness or admission.
 
@@ -132,18 +132,20 @@ for arbitrary changes to a bound socket's cleanup name.
 ## Validation
 
 Run from `cmd/racer`. No new dependencies or privileged test setup are
-needed. Integration fixtures use Cargo's `CARGO_TARGET_TMPDIR`; cleanup avoids a
+needed. Integration fixtures (`tests/uds_endpoint_ownership.rs` and
+`tests/uds_endpoint_publication.rs`) use Cargo's `CARGO_TARGET_TMPDIR`; cleanup avoids a
 second panic during unwinding. Crash/umask cases run in isolated subprocesses,
 not through process-wide umask changes or fork inside parallel test workers.
 
 ```sh
-timeout --signal=TERM --kill-after=10s 300s env CARGO_BUILD_JOBS=2 cargo test -p uds-endpoint --all-features
-timeout --signal=TERM --kill-after=10s 300s env CARGO_BUILD_JOBS=2 cargo clippy -p uds-endpoint --all-targets --all-features -- -D warnings -D clippy::undocumented_unsafe_blocks
+timeout --signal=TERM --kill-after=10s 300s env CARGO_BUILD_JOBS=2 cargo test -p racer --lib uds_endpoint
+timeout --signal=TERM --kill-after=10s 300s env CARGO_BUILD_JOBS=2 cargo test -p racer --test uds_endpoint_ownership --test uds_endpoint_publication
+timeout --signal=TERM --kill-after=10s 300s env CARGO_BUILD_JOBS=2 cargo clippy -p racer --all-targets --all-features -- -D warnings
 timeout --signal=TERM --kill-after=10s 300s cargo fmt --all --check
 ```
 
 The ignored `crash_state_driver` and `descriptor_limit_driver` tests are invoked
 by their parent integration tests with private fixture arguments; do not run them
-directly. The optional `test-util`
-feature exposes only a cloned lock descriptor for lifecycle tests. It does not
+directly. `EndpointOwner::clone_lock_for_test` exists only under `cfg(test)`
+and exposes only a cloned lock descriptor for lifecycle tests. It does not
 substitute a filesystem model for production syscalls.

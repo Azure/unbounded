@@ -1,7 +1,7 @@
 //! Simulated Unix socket ownership with inode-checked cleanup and publication.
 //! Layout and access policy are supplied by the application, just as for host sockets.
 
-use crate::publication::{Endpoint, Rename};
+use crate::uds_endpoint::publication::{Endpoint, Rename};
 use racer_io::{
     ring::{Descriptor, SocketAddress},
     sim::SimOs,
@@ -31,7 +31,7 @@ impl BoundSocket {
     /// Create the directory and bind one socket without choosing its permission mode.
     /// Reject invalid basename components before creating any directory.
     pub fn bind(sim: SimOs, directory: PathBuf, basename: &str) -> io::Result<Self> {
-        crate::directory::component(basename.as_bytes())?;
+        crate::uds_endpoint::directory::component(basename.as_bytes())?;
         sim.create_dir_all(&directory)?;
         let directory_handle = sim.open(None, &directory, libc::O_PATH | libc::O_DIRECTORY)?;
         let path = directory.join(basename);
@@ -61,7 +61,9 @@ impl BoundSocket {
     /// Reject bits outside 0777 with `InvalidMode` before checking ownership.
     pub fn set_mode(&self, mode: u32) -> io::Result<()> {
         if mode & !0o777 != 0 {
-            return Err(crate::error(crate::Error::InvalidMode));
+            return Err(crate::uds_endpoint::error(
+                crate::uds_endpoint::Error::InvalidMode,
+            ));
         }
         let basename = self.basename.borrow();
         if !self.owns(&basename) {
@@ -150,7 +152,7 @@ impl Drop for BoundSocket {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::publication::{Publication, Replacement};
+    use crate::uds_endpoint::publication::{Publication, Replacement};
     use racer_io::sim::Fault;
     use std::rc::Rc;
 
@@ -195,7 +197,7 @@ mod tests {
                 assert_eq!(error.kind(), io::ErrorKind::InvalidInput, "{basename:?}");
                 assert_eq!(
                     error.get_ref().unwrap().downcast_ref(),
-                    Some(&crate::Error::InvalidName),
+                    Some(&crate::uds_endpoint::Error::InvalidName),
                     "{basename:?}"
                 );
                 assert_eq!(
@@ -303,7 +305,7 @@ mod tests {
         assert_eq!(first_sim.metadata(&canonical).unwrap(), previous_before);
         assert_eq!(
             result.unwrap_err().get_ref().unwrap().downcast_ref(),
-            Some(&crate::Error::OwnershipChanged)
+            Some(&crate::uds_endpoint::Error::OwnershipChanged)
         );
         assert!(!previous.same_directory(&next).unwrap());
         assert!(!next.same_directory(&previous).unwrap());
@@ -399,7 +401,7 @@ mod tests {
             assert_eq!(error.kind(), io::ErrorKind::InvalidInput, "{mode:#o}");
             assert_eq!(
                 error.get_ref().unwrap().downcast_ref(),
-                Some(&crate::Error::InvalidMode),
+                Some(&crate::uds_endpoint::Error::InvalidMode),
                 "{mode:#o}"
             );
             assert_eq!(sim.metadata(&path).unwrap(), before, "{mode:#o}");
@@ -422,7 +424,7 @@ mod tests {
             assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
             assert_eq!(
                 error.get_ref().unwrap().downcast_ref(),
-                Some(&crate::Error::InvalidMode)
+                Some(&crate::uds_endpoint::Error::InvalidMode)
             );
             assert_eq!(sim.metadata(&path).unwrap(), before);
             assert_eq!(sim.read_file(&path).unwrap(), b"foreign");
@@ -433,7 +435,7 @@ mod tests {
         assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
         assert_eq!(
             error.get_ref().unwrap().downcast_ref(),
-            Some(&crate::Error::InvalidMode)
+            Some(&crate::uds_endpoint::Error::InvalidMode)
         );
         assert!(socket.absent("socket"));
     }
@@ -454,7 +456,7 @@ mod tests {
         assert_eq!(sim.metadata(&path).unwrap(), before);
         assert_eq!(
             result.unwrap_err().get_ref().unwrap().downcast_ref(),
-            Some(&crate::Error::OwnershipChanged)
+            Some(&crate::uds_endpoint::Error::OwnershipChanged)
         );
     }
 
@@ -476,7 +478,7 @@ mod tests {
         assert_eq!(sim.read_file(&path).unwrap(), b"foreign");
         assert_eq!(
             result.unwrap_err().get_ref().unwrap().downcast_ref(),
-            Some(&crate::Error::OwnershipChanged)
+            Some(&crate::uds_endpoint::Error::OwnershipChanged)
         );
     }
 
@@ -494,7 +496,7 @@ mod tests {
                 .get_ref()
                 .unwrap()
                 .downcast_ref(),
-            Some(&crate::Error::OwnershipChanged)
+            Some(&crate::uds_endpoint::Error::OwnershipChanged)
         );
         assert!(original.absent("socket"));
     }

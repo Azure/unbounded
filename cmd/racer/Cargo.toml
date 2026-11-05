@@ -1,5 +1,5 @@
 [workspace]
-members = [".", "io", "alloc", "crypto", "verbs", "gpu", "http", "topology", "flow", "flow-core", "control-wire", "controlplane", "uds-endpoint", "wire-codec", "peer-wire", "object-wire", "authority", "core", "dst"]
+members = [".", "io", "alloc", "crypto", "verbs", "gpu", "http", "topology", "flow", "flow-core", "control-wire", "controlplane", "wire-codec", "peer-wire", "object-wire", "authority", "core", "dst"]
 resolver = "3"
 
 [package]
@@ -29,7 +29,6 @@ controlplane = { path = "controlplane" }
 peer-wire = { path = "peer-wire" }
 racer-object-wire = { path = "object-wire" }
 racer-core = { path = "core" }
-uds-endpoint = { path = "uds-endpoint" }
 wire-codec = { path = "wire-codec", features = ["rest"] }
 racer-control-wire = { path = "control-wire" }
 racer-authority = { path = "authority" }
@@ -61,7 +60,6 @@ zeroize = "1"
 peer-wire = { path = "peer-wire", features = ["test-util"] }
 racer-object-wire = { path = "object-wire", features = ["test-util"] }
 racer-crypto = { path = "crypto", features = ["test-util"] }
-uds-endpoint = { path = "uds-endpoint", features = ["test-util"] }
 rdma-verbs = { path = "verbs", features = ["simulation"] }
 racer-gpu = { path = "gpu", features = ["simulation"] }
 http1 = { path = "http", features = ["test-util"] }

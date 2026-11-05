@@ -15,6 +15,11 @@ use crate::model::RequestId;
 use crate::read::Coordinator;
 use crate::runtime::Cancellation;
 use crate::runtime::RequestScope;
+#[cfg(test)]
+pub(super) use crate::uds_endpoint::file_path;
+use crate::uds_endpoint::publication::{Endpoint, Publication, Rename, Replacement};
+#[cfg(test)]
+pub(super) use crate::uds_endpoint::same_inode;
 use racer_control_wire::CacheDefinition;
 use racer_control_wire::CacheId;
 use racer_io::scoped::ready_set::ReadySet;
@@ -32,16 +37,11 @@ use std::sync::Arc;
 use std::task::Context;
 use std::task::Poll;
 use std::time::Duration;
-#[cfg(test)]
-pub(super) use uds_endpoint::file_path;
-use uds_endpoint::publication::{Endpoint, Publication, Rename, Replacement};
-#[cfg(test)]
-pub(super) use uds_endpoint::same_inode;
 
 enum Listener {
-    Real(uds_endpoint::BoundSocket),
+    Real(crate::uds_endpoint::BoundSocket),
     #[cfg(test)]
-    Sim(uds_endpoint::simulation::BoundSocket),
+    Sim(crate::uds_endpoint::simulation::BoundSocket),
 }
 impl Listener {
     fn accept(&self) -> std::io::Result<(racer_io::ring::Descriptor, ())> {
@@ -1307,11 +1307,11 @@ impl Drop for PreparedListeners {
 }
 
 pub(super) fn open_directory(path: &Path) -> Result<File> {
-    uds_endpoint::open_directory(path, 0o755).map_err(directory_error)
+    crate::uds_endpoint::open_directory(path, 0o755).map_err(directory_error)
 }
 
 pub(super) fn child_directory(parent: &File, name: &[u8]) -> Result<File> {
-    uds_endpoint::child_directory(parent, name, 0o755).map_err(directory_error)
+    crate::uds_endpoint::child_directory(parent, name, 0o755).map_err(directory_error)
 }
 
 fn directory_error(error: std::io::Error) -> Error {
@@ -1360,7 +1360,7 @@ const CLIENT_DIRECTORY_SEARCH: u32 = 0o011;
 /// are removed, and group and other search bits are added, so an existing
 /// 0700 or 0750 directory becomes 0711 or 0751. Ownership is not changed.
 pub(super) fn prepare_client_directory(directory: &File) -> Result<()> {
-    uds_endpoint::restrict_directory(directory, 0o022).map_err(directory_error)?;
+    crate::uds_endpoint::restrict_directory(directory, 0o022).map_err(directory_error)?;
     grant_client_search(directory)
 }
 
@@ -1384,7 +1384,7 @@ fn grant_client_search(directory: &File) -> Result<()> {
     // Linux may clear setgid when the caller is not in the group.
     if !after.is_dir()
         || (after.uid(), after.gid()) != (before.uid(), before.gid())
-        || !uds_endpoint::same_inode(&before, &after)
+        || !crate::uds_endpoint::same_inode(&before, &after)
         || (actual != wanted && actual != wanted & !0o2000)
     {
         return Err(directory_error(std::io::Error::other(
@@ -1403,7 +1403,7 @@ fn bind(
     #[cfg(test)]
     if let Some(sim) = crate::rt::reactor::simulation::Simulation::current() {
         let directory = root.join(&definition.name).join("client");
-        let listener = uds_endpoint::simulation::BoundSocket::bind(
+        let listener = crate::uds_endpoint::simulation::BoundSocket::bind(
             sim.os().clone(),
             directory.clone(),
             basename,
@@ -1436,8 +1436,8 @@ fn bind(
         None => Rc::new(EndpointOwner::acquire(&directory)?),
     };
     let directory = Rc::new(directory);
-    let listener =
-        uds_endpoint::BoundSocket::bind(owner.0.clone(), basename).map_err(directory_error)?;
+    let listener = crate::uds_endpoint::BoundSocket::bind(owner.0.clone(), basename)
+        .map_err(directory_error)?;
     #[cfg(test)]
     if FAIL_CHMOD.with(|fail| fail.replace(false)) {
         return Err(Error::Io);
@@ -1459,7 +1459,7 @@ impl Endpoint for BoundListener {
     type Error = Error;
 
     fn ownership_error() -> Error {
-        directory_error(<uds_endpoint::BoundSocket as Endpoint>::ownership_error())
+        directory_error(<crate::uds_endpoint::BoundSocket as Endpoint>::ownership_error())
     }
 
     fn owns(&self, basename: &str) -> bool {
@@ -1565,14 +1565,14 @@ impl Endpoint for BoundListener {
     }
 
     fn completed_error() -> Error {
-        directory_error(<uds_endpoint::BoundSocket as Endpoint>::completed_error())
+        directory_error(<crate::uds_endpoint::BoundSocket as Endpoint>::completed_error())
     }
 }
 
 // Persistent per-endpoint ownership. Never remove the lock inode, even on clean
 // shutdown. Socket hard links are crash witnesses, not connect-failure heuristics.
-fn endpoint_layout() -> Result<uds_endpoint::Layout> {
-    uds_endpoint::Layout::new(
+fn endpoint_layout() -> Result<crate::uds_endpoint::Layout> {
+    crate::uds_endpoint::Layout::new(
         ".racer-client.lock",
         "socket",
         ".racer-owned-",
@@ -1581,7 +1581,7 @@ fn endpoint_layout() -> Result<uds_endpoint::Layout> {
     .map_err(directory_error)
 }
 
-pub(super) struct EndpointOwner(Rc<uds_endpoint::EndpointOwner>);
+pub(super) struct EndpointOwner(Rc<crate::uds_endpoint::EndpointOwner>);
 
 impl EndpointOwner {
     #[cfg(test)]
@@ -1590,7 +1590,7 @@ impl EndpointOwner {
     }
 
     pub(super) fn acquire(directory: &File) -> Result<Self> {
-        uds_endpoint::EndpointOwner::acquire(directory, endpoint_layout()?)
+        crate::uds_endpoint::EndpointOwner::acquire(directory, endpoint_layout()?)
             .map(|owner| Self(Rc::new(owner)))
             .map_err(directory_error)
     }
