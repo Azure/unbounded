@@ -278,8 +278,8 @@ Scenarios: default pools of 512, 4k, and 20k nodes; a 256 node selector pool in 
 a hot page storm (v1 numbers are in the old reports); churn; and a primary failover that must
 give the same mesh.
 
-These are in `cmd/racer/sim/tests/mesh_scenarios.rs` and the `mesh` section of every sim report
-(see `designs/racer-core-simulation.md`). Findings (one Site):
+These are in `cmd/racer/topology/tests/mesh_scenarios.rs`; the hot page storm is racer-dst's
+`model-hot-page-storm-512` (see `designs/racer-core-simulation.md`). Findings (one Site):
 
 - Peers per node match the table: 61 at 512, 189 at 4,096, 408 at 20,000. Every sampled route
   without failures takes at most 2 links. Selector pool routes never leave the pool, and nearly

@@ -6,8 +6,8 @@
 //! typed observations, and returns a decision. Nothing here reads a clock,
 //! spawns a thread, or touches the filesystem or network; `tests/purity.rs`
 //! enforces this. The production tasks in `seat.rs`, `primary.rs`, and
-//! `server.rs` perform the I/O and interpret these rules, so the simulator
-//! (`racer-sim`) drives the same rules.
+//! `server.rs` perform the I/O and interpret these rules, so the deterministic
+//! simulation (`racer-dst`) drives the same rules.
 //!
 //! - [`shell`]: the authority shell machine: lease freshness, the state
 //!   write protocol (fencing, monotonic checks, conflict retries), and seat
