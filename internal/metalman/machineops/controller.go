@@ -15,7 +15,6 @@ import (
 	"sync"
 	"time"
 
-	"golang.org/x/sync/singleflight"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	apimeta "k8s.io/apimachinery/pkg/api/meta"
@@ -93,7 +92,7 @@ type Reconciler struct {
 	Now                    func() metav1.Time
 
 	// lookups deduplicates detached registry lookups across reconciles.
-	lookups singleflight.Group
+	lookups lookupGroup
 }
 
 // +kubebuilder:rbac:groups=unbounded-cloud.io,resources=machineoperations,verbs=get;list;watch;delete;update;patch

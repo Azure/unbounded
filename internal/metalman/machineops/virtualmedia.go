@@ -280,6 +280,8 @@ func (r *Reconciler) cleanupMediaTarget(ctx context.Context, op *v1alpha3.Machin
 			return false, fmt.Errorf("virtual media provider is not configured")
 		}
 
+		r.lookups.forget(mediaLookupKey(b.ID))
+
 		if err := r.BootMedia.Release(ctx, b.ID); err != nil {
 			return false, err
 		}
@@ -460,7 +462,7 @@ func (r *Reconciler) advanceVirtualMedia(ctx context.Context, op *v1alpha3.Machi
 		// The build may outlive this reconcile, so it gets its own copies.
 		buildMachine, buildOp := machine.DeepCopy(), op.DeepCopy()
 
-		source, err = boundedLookup(ctx, &r.lookups, "boot-media/"+b.ID, r.reconcileLookupTimeout(), func(ctx context.Context) (bootmedia.Source, error) {
+		source, err = boundedLookup(ctx, &r.lookups, mediaLookupKey(b.ID), r.reconcileLookupTimeout(), func(ctx context.Context) (bootmedia.Source, error) {
 			return r.BootMedia.Prepare(ctx, buildMachine, buildOp, b.ID)
 		})
 		if err == nil {
@@ -480,6 +482,7 @@ func (r *Reconciler) advanceVirtualMedia(ctx context.Context, op *v1alpha3.Machi
 		}
 
 		if err == nil {
+			r.lookups.forget(mediaLookupKey(b.ID))
 			err = r.BootMedia.Release(ctx, b.ID)
 		}
 
@@ -549,6 +552,11 @@ func (r *Reconciler) advanceVirtualMedia(ctx context.Context, op *v1alpha3.Machi
 	target.Message = "virtual media: " + b.Phase
 
 	return targetChange{target: target}
+}
+
+// mediaLookupKey names the detached Prepare lookup for a media ID.
+func mediaLookupKey(id string) string {
+	return "boot-media/" + id
 }
 
 // newMediaID returns 128 random bits as an unguessable capability. The
