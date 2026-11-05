@@ -1102,7 +1102,7 @@ All payload byte metrics exclude AEAD tags, record headers, and alignment paddin
 Victim counters exclude invalidation, replacement, cache removal, and pending-write
 discards. A mapping is counted only by the removal path that actually evicts it.
 Read bytes count repeated full-page reads, including internal/copy-only consumers;
-CRC and AEAD validation happen later in fill. They measure disk-to-reader payload,
+AEAD tag validation happens later in fill. They measure disk-to-reader payload,
 not authenticated client-delivered bytes, requested-range bytes, or device I/O.
 Use their rates to compare disk reuse in benchmarks, not as client throughput.
 The pending and indexed payload gauges are exact unclassified worker totals at sampling time, maintained
@@ -1289,7 +1289,7 @@ clocks synchronized.
 | `/metrics` | Prometheus metrics, including `racer_ready` and `racer_live` |
 | `/debug/membership` | Applied membership state |
 | `/debug/failures` | Bounded failure diagnostics |
-| `/debug/aead`, `/debug/decrypt-failures`, `/debug/send-crc` | Bounded crypto and checksum failure details |
+| `/debug/aead`, `/debug/decrypt-failures`, `/debug/send-tag` | Bounded crypto and tag check failure details |
 | `/debug/terminal`, `/debug/admission-final`, `/debug/candidate-final` | Bounded final-outcome records |
 | `/debug/gate-events`, `/debug/flight-expiry` | Bounded gate and in-flight expiry events |
 | `/debug/hardware` | Live JSON report of block devices, RDMA devices, and Racer's claimed disks and RDMA rails |
@@ -1402,7 +1402,7 @@ The rest are reported only when `racer_gpu_enabled` is 1:
 | `racer_gpu_cufile_disabled_total{reason}` | counter | Times cuFile was turned off for the node: `driver_open`, `staging_register`, or `file_open` (a file registration error other than unsupported). |
 | `racer_gpu_cufile_unsupported_total` | counter | Devices (`st_dev`) whose files cuFile reported as unsupported. Files on such a device are read through host memory; cuFile stays on for other devices. |
 | `racer_gpu_read_pages_total{decrypt}` | counter | Pages written to GPU memory: `gpu` (decrypted on the GPU) or `cpu` (plaintext from host memory, decrypted by the CPU or already cached). |
-| `racer_gpu_pages_rejected_total` | counter | Sealed pages the GPU rejected for a CRC or tag mismatch. |
+| `racer_gpu_pages_rejected_total` | counter | Sealed pages the GPU rejected for a tag mismatch. |
 | `racer_gpu_cufile_staged_pages_total` | counter | Pages cuFile read from disk straight into GPU staging. |
 | `racer_gpu_cufile_failures_total` | counter | cuFile reads or registrations that failed. The page is read through host memory instead. |
 | `racer_gpu_staging_exhausted_total` | counter | Disk reads that found no free staging slot and went through host memory. |

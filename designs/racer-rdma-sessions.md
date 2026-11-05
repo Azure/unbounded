@@ -169,7 +169,7 @@ The HTTP requester receives the page; the HTTP responder sends it.
    invalidation both succeeded, then constructs the ciphertext response.
 
 The transport does not treat in-band control as authentication. Signed HTTP
-heads bind the transfer metadata. Page checksum and AEAD checks remain at
+heads bind the transfer metadata. Page AEAD tag checks remain at
 their existing read and crypto boundaries; transport does not grant access
 to plaintext or encryption keys.
 
