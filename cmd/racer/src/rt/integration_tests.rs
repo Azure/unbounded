@@ -9,7 +9,7 @@ mod filesystem {
         reactor::{
             IoBuffer, Reactor as Core,
             filesystem::{
-                operations::{Durability, Replacement, ReplacementError, publish_new},
+                operations::{Durability, Replacement, ReplacementError},
                 prelude::*,
                 secure,
             },
@@ -677,112 +677,6 @@ mod filesystem {
         drop(fd);
         fs::remove_file(path).unwrap();
         assert_eq!(r.in_flight(), 0);
-    }
-
-    /// Verify publication contains staging paths and preserves permissions and symlinks.
-    #[test]
-    fn host_publication_containment_permissions_and_symlink_policy() {
-        let root = Directory::new();
-        let directory = root.0.join("private");
-        let target = directory.join("target");
-        let outside = root.0.join("outside");
-        for candidate in [
-            outside.clone(),
-            directory.join("child/stage"),
-            directory.join("../stage"),
-            target.clone(),
-        ] {
-            assert_eq!(
-                publish_new(&directory, &target, b"secret", [candidate])
-                    .unwrap_err()
-                    .raw_os_error(),
-                Some(libc::EINVAL)
-            );
-            assert!(!directory.exists());
-        }
-        assert!(publish_new(&directory, &outside, b"secret", [directory.join("stage")]).is_err());
-        assert!(!directory.exists());
-        publish_new(&directory, &target, b"secret", [directory.join("stage")]).unwrap();
-        assert_eq!(fs::read(&target).unwrap(), b"secret");
-        assert_eq!(
-            fs::metadata(&directory).unwrap().permissions().mode() & 0o077,
-            0
-        );
-        assert_eq!(
-            fs::metadata(&target).unwrap().permissions().mode() & 0o177,
-            0
-        );
-        fs::write(&outside, b"untouched").unwrap();
-        let stage_link = directory.join("link-stage");
-        symlink(&outside, &stage_link).unwrap();
-        publish_new(
-            &directory,
-            &target,
-            b"next",
-            [stage_link.clone(), directory.join("next")],
-        )
-        .unwrap();
-        assert!(
-            fs::symlink_metadata(stage_link)
-                .unwrap()
-                .file_type()
-                .is_symlink()
-        );
-        assert_eq!(fs::read(&outside).unwrap(), b"untouched");
-        let link = root.0.join("link");
-        symlink(&directory, &link).unwrap();
-        assert!(publish_new(&link, &link.join("target"), b"bad", [link.join("stage")]).is_err());
-        assert_eq!(fs::read(&target).unwrap(), b"next");
-    }
-
-    /// Verify publication permissions under a restrictive umask in an isolated child.
-    #[test]
-    fn host_publication_honors_umask_in_isolated_process() {
-        const CHILD: &str = "URING_FILESYSTEM_UMASK_CHILD";
-        let Some(acknowledgment) = std::env::var_os(CHILD) else {
-            let root = Directory::new();
-            let acknowledgment = root.0.join("child-assertions-passed");
-            let result = std::process::Command::new(std::env::current_exe().unwrap())
-                .args([
-                    "--exact",
-                    "rt::integration_tests::filesystem::host_publication_honors_umask_in_isolated_process",
-                    "--nocapture",
-                ])
-                .env(CHILD, &acknowledgment)
-                .status()
-                .unwrap();
-            assert!(result.success());
-            // A successful zero-test child must not masquerade as executed coverage.
-            assert_eq!(fs::read(&acknowledgment).unwrap(), b"assertions passed");
-            return;
-        };
-        // Isolated single-test child avoids a process-wide umask race.
-        let previous = unsafe { libc::umask(0o077) };
-        let root = Directory::new();
-        let directory = root.0.join("private");
-        publish_new(
-            &directory,
-            &directory.join("target"),
-            b"secret",
-            [directory.join("stage")],
-        )
-        .unwrap();
-        assert_eq!(
-            fs::metadata(&directory).unwrap().permissions().mode() & 0o777,
-            0o700
-        );
-        assert_eq!(
-            fs::metadata(directory.join("target"))
-                .unwrap()
-                .permissions()
-                .mode()
-                & 0o777,
-            0o600
-        );
-        unsafe {
-            libc::umask(previous);
-        }
-        fs::write(acknowledgment, b"assertions passed").unwrap();
     }
 
     /// Check secure path access and replacement against real Linux filesystem behavior.

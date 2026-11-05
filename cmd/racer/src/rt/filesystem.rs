@@ -1,7 +1,5 @@
 //! Filesystem SQEs use the parent reactor's original/cancel completion fences.
 //! Every pointer backing, descriptor, and quota lives in the submission closure.
-#[cfg(test)]
-use crate::rt::reactor::simulation;
 use crate::rt::{Error, Operation, Result, Scope};
 use racer_io::{
     ring::{IoBuffer, IoId},
