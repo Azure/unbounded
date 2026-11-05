@@ -18,8 +18,16 @@ use crate::workload::{Churn, Storm};
 pub struct Costs {
     /// AEAD seal/open cost per byte, in picoseconds.
     pub aead_ps_per_byte: u64,
+    /// Signing a peer request with no forwarder proofs (the requester's own head).
     pub sign_ns: Nanos,
+    /// Extra signing cost per forwarder proof already on a relayed request.
+    pub sign_hop_ns: Nanos,
+    /// Signing a peer response at its destination (`Forwarding::sign_response`).
+    pub sign_response_ns: Nanos,
+    /// Verifying a peer request or response with one proof.
     pub verify_ns: Nanos,
+    /// Extra verification cost per forwarder proof after the first.
+    pub verify_hop_ns: Nanos,
     /// Cost to score one ranking chunk.
     pub ranking_chunk_ns: Nanos,
     /// Path expansion cost per membership node visited.
@@ -34,8 +42,15 @@ impl Default for Costs {
     fn default() -> Self {
         Self {
             aead_ps_per_byte: 250,
-            sign_ns: 20 * MICROS,
-            verify_ns: 40 * MICROS,
+            // Peer wire v2 (certificate chains once per session), measured by the ignored
+            // `peer_crypto_cost_benchmark` (`src/peer/tests/opaque.rs`), release: direct sign
+            // 64 us, relayed sign 76 us, response sign 114 us, direct verify 73 us, relayed
+            // (two-proof) verify 160 us.
+            sign_ns: 64 * MICROS,
+            sign_hop_ns: 12 * MICROS,
+            sign_response_ns: 114 * MICROS,
+            verify_ns: 73 * MICROS,
+            verify_hop_ns: 87 * MICROS,
             ranking_chunk_ns: 2 * MICROS,
             path_expand_ns_per_node: 50,
             control_handshake_ns: 200 * MICROS,
@@ -45,6 +60,16 @@ impl Default for Costs {
 }
 
 impl Costs {
+    /// Signing a request carrying `proofs` proofs once signed (1 for the requester's own head).
+    pub fn sign_request(&self, proofs: usize) -> Nanos {
+        self.sign_ns + self.sign_hop_ns * proofs.saturating_sub(1) as Nanos
+    }
+
+    /// Verifying a head that carries `proofs` proofs.
+    pub fn verify(&self, proofs: usize) -> Nanos {
+        self.verify_ns + self.verify_hop_ns * proofs.saturating_sub(1) as Nanos
+    }
+
     pub fn aead(&self, bytes: u64) -> Nanos {
         (u128::from(bytes) * u128::from(self.aead_ps_per_byte)).div_ceil(1000) as Nanos
     }
@@ -373,7 +398,10 @@ impl Config {
                         let slot = match ck.as_str() {
                             "aead_ps_per_byte" => &mut c.aead_ps_per_byte,
                             "sign_ns" => &mut c.sign_ns,
+                            "sign_hop_ns" => &mut c.sign_hop_ns,
+                            "sign_response_ns" => &mut c.sign_response_ns,
                             "verify_ns" => &mut c.verify_ns,
+                            "verify_hop_ns" => &mut c.verify_hop_ns,
                             "ranking_chunk_ns" => &mut c.ranking_chunk_ns,
                             "path_expand_ns_per_node" => &mut c.path_expand_ns_per_node,
                             "control_handshake_ns" => &mut c.control_handshake_ns,
@@ -538,6 +566,18 @@ pub(crate) fn spec<'a>(
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn peer_crypto_costs_grow_with_carried_proofs() {
+        let c = Costs::default();
+        assert_eq!(c.sign_request(1), c.sign_ns);
+        assert_eq!(c.sign_request(0), c.sign_ns);
+        assert_eq!(c.sign_request(3), c.sign_ns + 2 * c.sign_hop_ns);
+        assert_eq!(c.verify(1), c.verify_ns);
+        assert_eq!(c.verify(2), c.verify_ns + c.verify_hop_ns);
+        // The Model reads the same table (`dst/costs.toml`).
+        assert_eq!((c.sign_ns, c.verify_ns), (64 * MICROS, 73 * MICROS));
+    }
 
     #[test]
     fn overrides_apply() {

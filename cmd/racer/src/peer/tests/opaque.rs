@@ -1674,3 +1674,68 @@ fn opaque_head_rejects_binding_length_authority_and_reverse_proof_substitution()
         assert_eq!(admission.used(ResourceClass::Ciphertext), 0);
     }
 }
+
+/// Per-operation cost of the peer request crypto path, the source of the racer-sim and racer-dst
+/// `sign_ns` / `verify_ns` constants. Run with
+/// `cargo test --release -p racer --lib peer_crypto_cost_benchmark -- --ignored --nocapture`.
+#[test]
+#[ignore = "release-only peer sign/verify cost benchmark; run explicitly"]
+fn peer_crypto_cost_benchmark() {
+    use std::hint::black_box;
+    #[allow(clippy::assertions_on_constants)]
+    {
+        assert!(!cfg!(debug_assertions), "run with --release");
+    }
+    let signers = signers();
+    let a = Forwarding::new(signers[0].clone());
+    let b = Forwarding::new(signers[1].clone());
+    let c = Forwarding::new(signers[2].clone());
+    let admission = Rc::new(flow_control::Quotas::new(AdmissionPolicy::new(
+        crate::test_support::cluster::config(false).limits,
+    )));
+    const ITERATIONS: u32 = 400;
+    let mut totals = [Duration::ZERO; 5];
+    for _ in 0..ITERATIONS {
+        let local = request(&admission, 1);
+        let start = Instant::now();
+        let (signed, _) = a.sign_request_to(local, signers[1].node()).unwrap();
+        let t1 = Instant::now();
+        let verified = b.verify_request(signed).unwrap();
+        let t2 = Instant::now();
+        let mut budget = verified.request().route.clone();
+        budget.visited.push(signers[1].node().clone());
+        budget.remaining_links -= 1;
+        let t3 = Instant::now();
+        let outbound = b
+            .append_request(verified, signers[2].node(), budget)
+            .unwrap();
+        let t4 = Instant::now();
+        let verified = c.verify_request(outbound).unwrap();
+        let t5 = Instant::now();
+        black_box(
+            c.sign_response(verified.binding(), PeerResponse::Miss)
+                .unwrap(),
+        );
+        let t6 = Instant::now();
+        totals[0] += t1 - start;
+        totals[1] += t2 - t1;
+        totals[2] += t4 - t3;
+        totals[3] += t5 - t4;
+        totals[4] += t6 - t5;
+    }
+    for (name, total) in [
+        "sign_direct",
+        "verify_direct",
+        "sign_relayed",
+        "verify_relayed",
+        "sign_response",
+    ]
+    .into_iter()
+    .zip(totals)
+    {
+        eprintln!(
+            "peer_crypto op={name} us_per_op={:.1}",
+            total.as_secs_f64() * 1e6 / f64::from(ITERATIONS)
+        );
+    }
+}

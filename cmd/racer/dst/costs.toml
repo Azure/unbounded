@@ -22,9 +22,17 @@ open_bytes_per_sec = 3_843_995_729
 tag_check_bytes_per_sec = 16_707_422_781
 # [baseline] "memcpy = 9.2 GiB/s".
 memcpy_bytes_per_sec = 9_878_424_781
-# [racer-sim] Costs::default sign_ns / verify_ns (20 us / 40 us).
-sign_ns = 20_000
-verify_ns = 40_000
+# Peer wire v2 (certificate chains sent once per session), release build of
+# `peer_crypto_cost_benchmark` (src/peer/tests/opaque.rs, ignored): direct
+# request sign 64 us, relayed (one forwarder) sign 76 us, response sign 114 us,
+# direct verify 73 us, two-proof verify 160 us. Same as racer-sim Costs::default.
+# A request carrying n proofs costs sign_ns + (n - 1) * sign_hop_ns to sign and
+# verify_ns + (n - 1) * verify_hop_ns to verify.
+sign_ns = 64_000
+sign_hop_ns = 12_000
+sign_response_ns = 114_000
+verify_ns = 73_000
+verify_hop_ns = 87_000
 
 [cpu]
 # [racer-sim] Config::default workers.

@@ -134,7 +134,9 @@ fn model_memory_per_node() {
             spec.relay_transfers = r.parse().unwrap();
         }
     }
-    let (outcome, report) = model::run(&scenario, Choices::seeded(8));
+    // `MODEL_SEED`: the cold start's seed, 8 by default.
+    let seed = std::env::var("MODEL_SEED").map_or(8, |s| s.parse().unwrap());
+    let (outcome, report) = model::run(&scenario, Choices::seeded(seed));
     let status = std::fs::read_to_string("/proc/self/status").unwrap();
     let hwm_kib: u64 = status
         .lines()

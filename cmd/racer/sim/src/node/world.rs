@@ -3489,7 +3489,10 @@ impl NodeWorld {
             }
             let costs = self.fabric.costs;
             let conn = self.conn_worker(mid);
-            let signed = self.fabric.crypto(now, holder, conn, costs.sign_ns);
+            let proofs = self.msgs[&mid].path.len();
+            let signed = self
+                .fabric
+                .crypto(now, holder, conn, costs.sign_request(proofs));
             let arrive = self.fabric.message(signed, holder, next);
             self.metrics.incr("peer_messages");
             // The receiver verifies when the message arrives (in `hop`), so no future slot is
@@ -3652,9 +3655,8 @@ impl NodeWorld {
                 self.fail_hop(mid, previous, fault);
                 return;
             }
-            let ready = self
-                .fabric
-                .crypto(now, at, conn, self.fabric.costs.verify_ns);
+            let verify = self.fabric.costs.verify(self.msgs[&mid].path.len());
+            let ready = self.fabric.crypto(now, at, conn, verify);
             self.msgs.get_mut(&mid).expect("message").verified = true;
             self.metrics.observe(wait_name, ready.saturating_sub(now));
             if ready > now {
@@ -4125,7 +4127,9 @@ impl NodeWorld {
         }
         let arrive = if reply == Reply::Response(ResponseKind::Page) {
             let bytes = self.config.page_bytes;
-            let sealed = self.fabric.crypto(ready, from, conn, costs.sign_ns);
+            let sealed = self
+                .fabric
+                .crypto(ready, from, conn, costs.sign_response_ns);
             // The body streams only while the requester still waits; relays hold their `Relay`
             // reservation until the body has passed (production keeps it on the connection while
             // streaming, `peer/server.rs` `relay.reservation`).
@@ -4159,7 +4163,9 @@ impl NodeWorld {
                 self.metrics
                     .observe("relay_hold_answer_ns", ready.saturating_sub(start));
             }
-            let mut t = self.fabric.crypto(ready, from, conn, costs.sign_ns);
+            let mut t = self
+                .fabric
+                .crypto(ready, from, conn, costs.sign_response_ns);
             for hop in route.windows(2) {
                 t = self.fabric.message(t, hop[0], hop[1]);
             }

@@ -1774,7 +1774,9 @@ impl<'s> Model<'s> {
                 };
                 return self.fail_hop(mid, previous, fault);
             }
-            let mut ready = self.fabric.crypto(now, at, conn, costs.crypto_verify_ns);
+            let mut ready = self
+                .fabric
+                .crypto(now, at, conn, costs.verify(m.path.len()));
             if at == m.dest {
                 let w = owner_worker(m.page, self.spec.workers.max(1)) as u8;
                 ready = self.fabric.cpu(ready, at, w, costs.cpu_request_ns);
@@ -2070,9 +2072,10 @@ impl<'s> Model<'s> {
         } else {
             self.conn_worker(mid)
         };
-        let signed = self
-            .fabric
-            .crypto(ready, holder, conn, self.fabric.costs.crypto_sign_ns);
+        let proofs = self.msgs[&mid].path.len();
+        let signed =
+            self.fabric
+                .crypto(ready, holder, conn, self.fabric.costs.sign_request(proofs));
         let arrive = self.fabric.message(signed, holder, next);
         self.engine.at(
             arrive,
@@ -2193,7 +2196,7 @@ impl<'s> Model<'s> {
         let now = self.now();
         let conn = self.conn_worker(mid);
         self.fabric
-            .crypto(now, node, conn, self.fabric.costs.crypto_sign_ns)
+            .crypto(now, node, conn, self.fabric.costs.crypto_sign_response_ns)
     }
 
     /// The worker of a node that holds request `mid`'s connection, as the Model spreads peer

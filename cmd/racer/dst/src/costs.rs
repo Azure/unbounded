@@ -21,7 +21,10 @@ pub struct Costs {
     pub crypto_tag_check_bytes_per_sec: u64,
     pub crypto_memcpy_bytes_per_sec: u64,
     pub crypto_sign_ns: Nanos,
+    pub crypto_sign_hop_ns: Nanos,
+    pub crypto_sign_response_ns: Nanos,
     pub crypto_verify_ns: Nanos,
+    pub crypto_verify_hop_ns: Nanos,
     pub cpu_workers: u64,
     pub cpu_request_ns: Nanos,
     pub cpu_ranking_chunk_ns: Nanos,
@@ -43,6 +46,17 @@ pub struct Costs {
 }
 
 impl Costs {
+    /// Signing a peer request carrying `proofs` proofs (1 for the requester's own head),
+    /// racer-sim `Costs::sign_request`.
+    pub fn sign_request(&self, proofs: usize) -> Nanos {
+        self.crypto_sign_ns + self.crypto_sign_hop_ns * proofs.saturating_sub(1) as Nanos
+    }
+
+    /// Verifying a peer head carrying `proofs` proofs, racer-sim `Costs::verify`.
+    pub fn verify(&self, proofs: usize) -> Nanos {
+        self.crypto_verify_ns + self.crypto_verify_hop_ns * proofs.saturating_sub(1) as Nanos
+    }
+
     /// Every `(section, key)` the table must contain.
     pub const KEYS: &[(&str, &str)] = &[
         ("crypto", "seal_bytes_per_sec"),
@@ -50,7 +64,10 @@ impl Costs {
         ("crypto", "tag_check_bytes_per_sec"),
         ("crypto", "memcpy_bytes_per_sec"),
         ("crypto", "sign_ns"),
+        ("crypto", "sign_hop_ns"),
+        ("crypto", "sign_response_ns"),
         ("crypto", "verify_ns"),
+        ("crypto", "verify_hop_ns"),
         ("cpu", "workers"),
         ("cpu", "request_ns"),
         ("cpu", "ranking_chunk_ns"),
@@ -78,7 +95,10 @@ impl Costs {
             ("crypto", "tag_check_bytes_per_sec") => &mut self.crypto_tag_check_bytes_per_sec,
             ("crypto", "memcpy_bytes_per_sec") => &mut self.crypto_memcpy_bytes_per_sec,
             ("crypto", "sign_ns") => &mut self.crypto_sign_ns,
+            ("crypto", "sign_hop_ns") => &mut self.crypto_sign_hop_ns,
+            ("crypto", "sign_response_ns") => &mut self.crypto_sign_response_ns,
             ("crypto", "verify_ns") => &mut self.crypto_verify_ns,
+            ("crypto", "verify_hop_ns") => &mut self.crypto_verify_hop_ns,
             ("cpu", "workers") => &mut self.cpu_workers,
             ("cpu", "request_ns") => &mut self.cpu_request_ns,
             ("cpu", "ranking_chunk_ns") => &mut self.cpu_ranking_chunk_ns,
@@ -205,6 +225,16 @@ mod tests {
         assert!((4_300_000..4_500_000).contains(&page), "{page}");
         assert!(costs.open(16 << 20) <= page);
         assert_eq!(costs.cpu_workers, 2);
+    }
+
+    #[test]
+    fn peer_crypto_costs_match_racer_sim() {
+        let costs = Costs::checked_in();
+        assert_eq!(costs.sign_request(1), 64_000);
+        assert_eq!(costs.sign_request(2), 76_000);
+        assert_eq!(costs.verify(1), 73_000);
+        assert_eq!(costs.verify(2), 160_000);
+        assert_eq!(costs.crypto_sign_response_ns, 114_000);
     }
 
     #[test]
