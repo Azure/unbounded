@@ -12,13 +12,16 @@ runc. This plan does.
 | Question | Scenarios |
 |---|---|
 | Does a host bootstrapped with no isolation setting behave exactly as before (nspawn)? | D01, D02 |
-| Does every agent and host operation work in each mode? | D02, N01, X01, C01 |
+| Does every agent and host operation work in each mode? | D02, N01, X01 |
+| Does `unbounded-agent reset` on the host remove the node stack of each mode, and leave no reprovision handoff behind? | R01, R02, R03 |
 | Can a node change mode by declaring it and repaving, and back, keeping its identity? | T01 |
-| Does Machine status report the applied mode and the change, and does drift appear, clear and report a failure? | T02 |
-| Does a failed mode change put the node and its shared host configuration back, and is it left alone afterwards? | T03 |
-| Does the uninstall script remove the node stack of each mode? | U01, U02, U03 |
-| Does container mode work on its intended platform? | A01 |
-| Do GPUs work in none and container mode? | G01 |
+| Does Machine status report the applied mode and the change, and does drift appear, clear and report a refusal? | T02 |
+| Does a change that cannot go ahead leave the node in its mode, and is it left alone afterward? | T03 |
+| Do GPUs work in none mode? | G01 |
+
+This plan covers the nspawn and none modes. A mode added later brings its own
+scenarios (all operations, reset, the pairs it changes in place, and the
+rollback of a failed in-place change) into the catalog and this table.
 
 ## 2. Environment
 
@@ -29,7 +32,9 @@ runc. This plan does.
 - This plan is run by hand, with `run-local.sh` or `isolation_plan.py`. The
   isolation suites are not added to the CI e2e workflow: each scenario builds a
   cluster and boots a VM, and the whole plan is too expensive to run on every
-  change. Run it when the agent's isolation code changes.
+  change. Run it when the agent's isolation code changes. The nightly workflow
+  `.github/workflows/agent-isolation-nightly.yaml` runs T01
+  (`isolation-matrix`) and T03 (`isolation-rollback`) every night.
 - Host needs: `docker`, `kind` v0.29 or newer, `kubectl`, `go`,
   `qemu-system-x86_64`, `qemu-img`, `genisoimage`, `iptables`, passwordless
   `sudo`, and read/write access to `/dev/kvm`.
@@ -47,20 +52,18 @@ Each scenario is one e2e suite, run with the stated `ISOLATION_MODE`.
 | D02 | Default (no flag): all operations | unset | `isolation-operations` | - |
 | N01 | Explicit nspawn: all operations | nspawn | `isolation-operations` | - |
 | X01 | none: all operations | none | `isolation-operations` | - |
-| C01 | container: all operations | container | `isolation-operations` | - |
-| U01 | Default (no flag): uninstall script | unset | `isolation-uninstall` | - |
-| U02 | none: uninstall script | none | `isolation-uninstall` | - |
-| U03 | container: uninstall script | container | `isolation-uninstall` | - |
+| R01 | Default (no flag): reset on the host | unset | `isolation-reset` | - |
+| R02 | none: reset on the host | none | `isolation-reset` | - |
+| R03 | Reset after a reprovision mode change | unset | `isolation-reset-after-reprovision` | - |
 | T01 | Every ordered pair of modes | unset | `isolation-matrix` | - |
 | T02 | Machine status and drift across mode changes | unset | `isolation-drift` | - |
-| T03 | Failed mode change: rollback and config restore | container | `isolation-rollback` | - |
-| A01 | container on Azure Container Linux | container | `isolation-operations` | `HOST_BASE_OS=acl` |
-| G01 | GPU workloads in none and container mode | none | none | GPU hardware |
+| T03 | Mode change that cannot go ahead | unset | `isolation-rollback` | - |
+| G01 | GPU workloads in none mode | none | none | GPU hardware |
 
 `python3 hack/agent/e2e-kind/isolation_plan.py plan` prints this table from the
 machine-readable catalog, which is the source the runner uses.
 
-### 3.1 Operations suite (D02, N01, X01, C01)
+### 3.1 Operations suite (D02, N01, X01)
 
 In order: bootstrap and join, mode check, host root layout, controller health,
 node config, persisted agent config, kube-proxy, Machine self-registration,
@@ -72,44 +75,61 @@ disk, join, mode check, `exec`, workload.
 
 Mode-specific expectations the steps assert:
 
-| Operation | nspawn | none | container |
-|---|---|---|---|
-| Node stack | `systemd-nspawn@kubeN` machine | `unbounded-containerd.service`, `unbounded-kubelet.service`, `/opt/unbounded/node/<version>` | one `unbounded-node-<slot>.service`, root `/var/lib/unbounded/containers/<slot>` |
-| exec / logs | `unbounded-agent exec` into the machine | `exec` on the host | `exec` into the container |
-| NodeReboot | node stack restarts | node stack restarts, host boot ID unchanged | node stack restarts |
-| Repave | other slot becomes active, bpffs is fresh (D01) | `current` link flips to a new version | other slot becomes active |
-| AgentReset | no machine left | no units, no `/opt/unbounded/node` | no container root |
-| Preflight | `nspawn-runtime` check runs | `none-backend` runs | `container-backend` runs |
+| Operation | nspawn | none |
+|---|---|---|
+| Node stack | `systemd-nspawn@kubeN` machine | `unbounded-containerd.service`, `unbounded-kubelet.service`, `/opt/unbounded/node/<version>` |
+| exec / logs | `unbounded-agent exec` into the machine | `exec` on the host |
+| NodeReboot | node stack restarts | node stack restarts, host boot ID unchanged |
+| Repave | other slot becomes active, bpffs is fresh (D01) | `current` link flips to a new version |
+| AgentReset | no machine left | no units, no `/opt/unbounded/node` |
+| Preflight | `nspawn-runtime` check runs | `none-backend` runs |
 
-### 3.2 Transitions (T01 to T03)
+### 3.2 Reset on the host (R01 to R03)
+
+`unbounded-agent reset`, run on the host over SSH as an operator does without
+the control plane, must leave a clean host: the node stack of the mode is gone
+(as for AgentReset in 3.1), the agent's files and units are gone, and no
+reprovision handoff is left: no `unbounded-agent-reprovision.service` unit, and
+no staged agent or target configuration (which carries the bootstrap token)
+under `/var/lib/unbounded-agent-reprovision`.
+
+- R01 and R02: bootstrap in nspawn or none, run a workload, reset on the host.
+- R03: bootstrap in nspawn, change to none by reprovision, check no handoff is
+  left once the change has succeeded, then reset on the host.
+
+### 3.3 Transitions (T01 to T03)
 
 A mode change is declared the way an operator does it: the harness patches
 `spec.isolation` on the Machine, checks that nothing moves and `IsolationDrift`
 is `True` with `AppliedModeDiffers`, deletes the Node to trigger the repave, and
-waits for `status.isolationChange`. Any pair that involves none is a reprovision;
-nspawn and container move in place. The suites assert the strategy the pair calls
-for. After every change they assert: `status.isolationChange` is `Succeeded`,
-same Node name, labels and taints, the new mode recorded in the applied config
-and in `status.isolation`, `IsolationDrift` `False` with
-`AppliedModeMatches`, a workload and DNS run, and `exec` works.
+waits for `status.isolationChange`. none has no slot to prepare a target in
+beside the source, so every change between nspawn and none is a reprovision: the
+host is reset and bootstrapped again in the new mode. A reprovision happens only
+when the Machine carries the annotation `unbounded-cloud.io/allow-reprovision:
+"true"`, so the harness sets it before it deletes the Node and removes it once
+the change is done. The suites assert the strategy the pair calls for. After
+every change they assert: `status.isolationChange` is `Succeeded`, same Node
+name, labels and taints, the new mode recorded in the applied config and in
+`status.isolation`, `IsolationDrift` `False` with `AppliedModeMatches`, a
+workload and DNS run, `exec` works, and no reprovision handoff is left.
 
-- T01: nspawn to container (in place), container to none, none to container,
-  container to nspawn (in place), nspawn to none, none to nspawn. All six ordered
-  pairs. The stops reached by reprovision to none and back to nspawn also run a
-  soft reboot and a host reboot, and none runs its preflight.
+- T01: nspawn to none and none to nspawn, both by reprovision. Both ordered
+  pairs. Each stop also runs a soft reboot and a host reboot, and none runs its
+  preflight.
 - T02: `IsolationDrift` in every state. An empty `spec.isolation` is
   `NoModeDeclared`. A declared unapplied mode is `AppliedModeDiffers` while
-  nothing moves, and `AppliedModeMatches` once it is set back. A failed change is
-  `ChangeFailed`. A change that succeeds ends at `AppliedModeMatches`; T01 asserts
-  that after every change, so T02 makes none.
-- T03: starts in container mode, the only mode that keeps its configuration at
-  the shared host paths. Declaring the applied mode moves nothing and records no
-  change. A change to nspawn is refused before the node is touched while the host
-  lacks the nspawn runtime. An in-place container to nspawn change is failed
-  after the source stopped; the source runs again, the recorded mode is
-  unchanged, `status.isolationChange` is `Failed` with a rollback, nothing
-  retries it, and a digest of the shared host configuration (containerd, kubelet,
-  CNI, PKI) is identical before and after.
+  nothing moves, and `AppliedModeMatches` once it is set back. A change refused
+  for want of the reprovision opt-in is `ChangeRefused`. A change that succeeds
+  ends at `AppliedModeMatches`; T01 asserts that after every change, so T02 makes
+  none. `ChangeInProgress` turns into `ChangeStale` after two hours without a
+  report from the agent; no scenario waits that long, so that rule is covered by
+  the controller's unit tests and the harness's own expectation by its tests.
+- T03: starts in nspawn. Declaring the applied mode moves nothing and records no
+  change. Declaring none without the allow-reprovision annotation and deleting
+  the Node is refused: `status.isolationChange` is `Failed` with reason
+  `ReprovisionNotAllowed`, `IsolationDrift` is `ChangeRefused`, the repave goes
+  ahead in nspawn and the Node comes back, no handoff is staged, nothing retries
+  the change, and a workload runs once the spec is set back.
 
 ## 4. Evidence and report
 
@@ -133,13 +153,14 @@ here, with the reason).
 
 ## 5. Applicability and limits
 
-- container mode is provisional. On `ubuntu2404` C01, T01 and T03 exercise the
-  runc runtime, the OCI bundle and the unit, not the Azure Container Linux
-  assumptions (SELinux label, PID 1 shutdown, mount propagation). A01 is the
-  scenario that checks those, and needs an ACL image.
 - G01 needs GPU passthrough. It is listed so the report shows the gap.
-- Rollback of a failed reprovision has no harness fault and is covered by unit
-  tests only.
+- A failed reprovision, including a handoff that gives up after its runs are
+  used up and must remove its unit and staged configuration, has no harness
+  fault and is covered by unit tests only. R03 and T01 check the handoff is gone
+  after a reprovision that succeeded, and T03 that a refused change stages none.
+- No pair of nspawn and none changes in place, so the rollback of a failed
+  in-place change and its restore of the shared host configuration are not
+  exercised here; they come with a mode that changes in place.
 - T02 and T03 set `spec.isolation` on the Machine; they are exploratory for
   side effects on generated agent config.
 - D01 contains nspawn-only checks (host and nspawn distro pair, bpffs isolation
@@ -153,7 +174,7 @@ here, with the reason).
 PATH="$PWD/tmp/bin:$PATH" python3 hack/agent/e2e-kind/isolation_plan.py run
 python3 hack/agent/e2e-kind/isolation_plan.py run --scenario D01 T01   # a selection
 python3 hack/agent/e2e-kind/isolation_plan.py run --category transitions --fail-fast
-python3 hack/agent/e2e-kind/isolation_plan.py run --exclude-tag provisional
+python3 hack/agent/e2e-kind/isolation_plan.py run --exclude-tag transition
 ```
 
 `--no-up` reuses a cluster and bridge you created; `--keep-env` leaves the

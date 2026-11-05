@@ -67,6 +67,16 @@ QGA_SOCK = TMPDIR / "qga.sock"
 # The nspawn machine name used by the agent (must match the constant in
 # cmd/agent/internal/goalstates/constants.go - NSpawnMachineKube1).
 NSPAWN_MACHINE = "kube1"
+# Isolation mode under test, from SMOKE_ISOLATION: nspawn or none. Empty
+# keeps today's behavior: no spec.isolation is set and the host runs the
+# default nspawn mode. none is not exercised by default. A new mode is added
+# to SMOKE_ISOLATION_MODES and to isolation_debug_commands.
+SMOKE_ISOLATION_MODES = ("nspawn", "none")
+SMOKE_ISOLATION = os.environ.get("SMOKE_ISOLATION", "")
+if SMOKE_ISOLATION and SMOKE_ISOLATION not in SMOKE_ISOLATION_MODES:
+    sys.exit(f"SMOKE_ISOLATION must be one of {', '.join(SMOKE_ISOLATION_MODES)}, got {SMOKE_ISOLATION!r}")
+# Agent-owned units of the none mode (pkg/agent/isolation/none/units.go).
+NONE_UNITS = ("unbounded-containerd.service", "unbounded-kubelet.service")
 
 KUBECTL = "kubectl"
 VIRSH = ["virsh", "--connect", "qemu:///system"]
@@ -208,6 +218,34 @@ def guest_exec(command: str, timeout: int = 30) -> tuple[int, str, str]:
         time.sleep(0.5)
 
 
+def isolation_debug_commands() -> list[tuple[str, str]]:
+    """Return the node-stack diagnostics for the isolation mode under test."""
+    if SMOKE_ISOLATION == "none":
+        # The node stack is agent-owned host units; there is no machine.
+        return [
+            ("node stack unit status (none)", f"systemctl --no-pager status {' '.join(NONE_UNITS)}"),
+            ("node stack journal (none)", (
+                "journalctl --no-pager -n 200 " + " ".join(f"-u {u}" for u in NONE_UNITS)
+            )),
+        ]
+    return [
+        ("machinectl list", "machinectl list --no-pager"),
+        ("nspawn machine status", f"machinectl status {NSPAWN_MACHINE} --no-pager"),
+        ("kubelet journal (nspawn)", (
+            f"systemd-run --pipe --wait --machine={NSPAWN_MACHINE} "
+            "journalctl --no-pager -n 200 -u kubelet.service"
+        )),
+        ("containerd journal (nspawn)", (
+            f"systemd-run --pipe --wait --machine={NSPAWN_MACHINE} "
+            "journalctl --no-pager -n 100 -u containerd.service"
+        )),
+        ("kubelet service status (nspawn)", (
+            f"systemd-run --pipe --wait --machine={NSPAWN_MACHINE} "
+            "systemctl --no-pager status kubelet.service"
+        )),
+    ]
+
+
 def collect_debug_logs() -> None:
     """Use the QEMU guest agent to dump kubelet and agent debug information.
 
@@ -226,20 +264,7 @@ def collect_debug_logs() -> None:
         # Agent and service logs.
         ("systemctl status", "systemctl --no-pager status"),
         ("unbounded-agent journal", "journalctl --no-pager -n 200 -u cloud-final.service"),
-        ("machinectl list", "machinectl list --no-pager"),
-        ("nspawn machine status", f"machinectl status {NSPAWN_MACHINE} --no-pager"),
-        ("kubelet journal (nspawn)", (
-            f"systemd-run --pipe --wait --machine={NSPAWN_MACHINE} "
-            "journalctl --no-pager -n 200 -u kubelet.service"
-        )),
-        ("containerd journal (nspawn)", (
-            f"systemd-run --pipe --wait --machine={NSPAWN_MACHINE} "
-            "journalctl --no-pager -n 100 -u containerd.service"
-        )),
-        ("kubelet service status (nspawn)", (
-            f"systemd-run --pipe --wait --machine={NSPAWN_MACHINE} "
-            "systemctl --no-pager status kubelet.service"
-        )),
+        *isolation_debug_commands(),
     ]
     for label, cmd in commands:
         log(f"  --- {label} ---")
@@ -941,6 +966,24 @@ def assert_log_contains(path: Path, needle: str) -> None:
         die(f"Expected {path} to contain {needle!r}")
 
 
+def assert_isolation_mode_applied() -> None:
+    """Check the host recorded the requested isolation mode and, for none, that
+    the agent-owned units are active and no nspawn machine exists."""
+    log(f"Checking applied isolation mode {SMOKE_ISOLATION!r}")
+    code, out, err = guest_exec(
+        "grep -h '\"Isolation\"' /etc/unbounded/agent/*-applied-config.json", timeout=30)
+    if code != 0 or SMOKE_ISOLATION not in out:
+        die(f"applied config does not record Isolation={SMOKE_ISOLATION}: {out.strip()} {err.strip()}")
+    if SMOKE_ISOLATION == "none":
+        for unit in NONE_UNITS:
+            code, out, _ = guest_exec(f"systemctl is-active {unit}", timeout=30)
+            if code != 0:
+                die(f"{unit} is not active in none mode: {out.strip()}")
+        code, out, _ = guest_exec("machinectl list --no-legend 2>/dev/null | wc -l", timeout=30)
+        if out.strip() not in ("", "0"):
+            die(f"none mode must not run an nspawn machine, machinectl lists: {out.strip()}")
+
+
 def run_operation_smoke_suite() -> None:
     log("Running bare-metal MachineOperation smoke suite")
 
@@ -967,6 +1010,16 @@ def run_operation_smoke_suite() -> None:
     wait_vm_state("running", timeout=180)
     wait_k8s_node(NODE_NAME, timeout=300)
     wait_node_boot_id_changed(NODE_NAME, boot_id, timeout=600)
+
+    if SMOKE_ISOLATION == "none":
+        # Soft reboot restarts the node stack only. In none mode the node
+        # shares the host kernel boot ID, so it must not change.
+        boot_id = get_node_boot_id(NODE_NAME)
+        node_reboot = create_machine_operation("smoke-node-reboot", "NodeReboot")
+        wait_machine_operation_complete(node_reboot, timeout=600)
+        wait_k8s_node(NODE_NAME, timeout=300)
+        if get_node_boot_id(NODE_NAME) != boot_id:
+            die("NodeReboot changed the host boot ID; it must restart only the node stack")
 
 
 def main() -> None:
@@ -1245,6 +1298,8 @@ def main() -> None:
             },
         },
     }
+    if SMOKE_ISOLATION:
+        protonode["spec"]["isolation"] = SMOKE_ISOLATION
     kubectl(["apply", "-f", "-"], input=json.dumps(protonode).encode(),
             stdout=DEVNULL)
     log("  Resources created")
@@ -1291,6 +1346,9 @@ def main() -> None:
     wait_k8s_node(NODE_NAME, timeout=900)
     assert_node_ready(NODE_NAME, timeout=720)
     assert_node_label(NODE_NAME, NODE_LABEL_KEY, NODE_LABEL_VALUE)
+
+    if SMOKE_ISOLATION:
+        assert_isolation_mode_applied()
 
     run_operation_smoke_suite()
 

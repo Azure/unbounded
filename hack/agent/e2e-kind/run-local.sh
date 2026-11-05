@@ -10,6 +10,11 @@
 # Scenario definitions are shared with CI in e2e.py. E2E_SUITE selects a focused
 # suite; the default runs lifecycle followed by configuration scenarios.
 #
+# ISOLATION_MODE (nspawn or none) selects where the node stack runs and is
+# passed to the bootstrap as --isolation. Unset keeps the default nspawn
+# behavior. Use E2E_SUITE=isolation-operations with any mode, and
+# E2E_SUITE=isolation-matrix with it unset. See README.md.
+#
 # Prerequisites (Fedora):
 #   sudo dnf install -y qemu-system-x86 qemu-img genisoimage iptables docker-ce docker-ce-cli containerd.io
 #   sudo systemctl enable --now docker
