@@ -922,3 +922,428 @@ fn sim_cancel_fences_and_file_ops() {
     assert_eq!(drops.get(), 1);
     assert_eq!(reactor.in_flight(), 0);
 }
+
+/// Behaviors ported from the legacy `uring-runtime` reactor tests that the
+/// racer-io suite above did not already exercise.
+mod legacy_reactor_ports {
+    use super::*;
+    use std::os::fd::{AsRawFd, OwnedFd};
+
+    #[test]
+    /// Positive short progress returns once without a retry; a zero-progress
+    /// `EINTR` on a positioned read reissues the same buffer and offset.
+    fn sim_short_progress_returns_once_and_positioned_retry_keeps_offset() {
+        let os = SimOs::new();
+        let clock = crate::ctx::VirtualClock::new();
+        let reactor = simulated(&os, &clock);
+        let (left, right) = os.socket_pair();
+        let (left, right) = (Rc::new(left), Rc::new(right));
+        let ctx = OpCtx::none();
+        let drops = Rc::new(Cell::new(0));
+        os.inject("send", Fault::Short(2)).unwrap();
+        let sent = block_on(
+            &reactor,
+            reactor.send(left, b"hello".to_vec(), Lease(drops.clone()), &ctx),
+        )
+        .unwrap();
+        assert_eq!((sent.bytes, &sent.buffer[..]), (2, &b"hello"[..]));
+        assert_eq!(reactor.stats().retries, 0);
+        drop(sent);
+        assert_eq!(drops.get(), 1);
+        let got = block_on(&reactor, reactor.recv(right, vec![0; 8], (), &ctx)).unwrap();
+        assert_eq!(&got.buffer[..got.bytes], b"he");
+
+        let file = Rc::new(sim_file(&reactor, "f"));
+        block_on(
+            &reactor,
+            reactor.write_at(file.clone(), 0, b"hello world".to_vec(), (), &ctx),
+        )
+        .unwrap();
+        os.inject("read", Fault::Errno(libc::EINTR)).unwrap();
+        let read = block_on(
+            &reactor,
+            reactor.read_at(file.clone(), 6, vec![0; 5], (), &ctx),
+        )
+        .unwrap();
+        assert_eq!(&read.buffer[..read.bytes], b"world");
+        assert_eq!(reactor.stats().retries, 1);
+
+        // Offsets the kernel would read as "current position" are rejected
+        // before publication.
+        let before = reactor.stats().rejected;
+        let bad = block_on(
+            &reactor,
+            reactor.write_at(file, i64::MAX as u64 + 1, b"x".to_vec(), (), &ctx),
+        );
+        assert_eq!(bad.unwrap_err(), Error::InvalidInput);
+        assert_eq!(reactor.stats().rejected, before);
+        assert_eq!(reactor.in_flight(), 0);
+    }
+
+    /// Create a simulated file `name` under the root.
+    fn sim_file(reactor: &Reactor, name: &str) -> Descriptor {
+        let ctx = OpCtx::none();
+        let path = std::ffi::CString::new(format!("/{name}")).unwrap();
+        block_on(
+            reactor,
+            reactor
+                .open(None, path, libc::O_CREAT | libc::O_RDWR, 0, &ctx)
+                .unwrap(),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    /// A vectored write returns short progress with both owners intact.
+    fn sim_vectored_write_reports_short_progress_with_owners() {
+        let os = SimOs::new();
+        let clock = crate::ctx::VirtualClock::new();
+        let reactor = simulated(&os, &clock);
+        let file = Rc::new(sim_file(&reactor, "v"));
+        os.inject("writev", Fault::Short(3)).unwrap();
+        let header: Rc<[u8]> = Rc::from(&b"HEAD"[..]);
+        let done = block_on(
+            &reactor,
+            reactor.write_vectored_at(
+                file,
+                0,
+                header.clone(),
+                b"BODY".to_vec(),
+                (),
+                &OpCtx::none(),
+            ),
+        )
+        .unwrap();
+        assert_eq!(done.bytes, 3);
+        assert_eq!(
+            (&done.header[..], &done.body[..]),
+            (&b"HEAD"[..], &b"BODY"[..])
+        );
+        assert_eq!(reactor.stats().retries, 0);
+        assert_eq!(os.read_file(std::path::Path::new("/v")).unwrap(), b"HEA");
+    }
+
+    #[test]
+    /// A rejected publication releases the owner exactly once, consumes no
+    /// slot, and the next submission reuses the queue.
+    fn sim_publication_rejection_rolls_back_owners() {
+        let os = SimOs::new();
+        let clock = crate::ctx::VirtualClock::new();
+        let reactor = simulated(&os, &clock);
+        let (left, right) = os.socket_pair();
+        let (left, right) = (Rc::new(left), Rc::new(right));
+        let drops = Rc::new(Cell::new(0));
+        os.reject_submissions(1).unwrap();
+        let rejected = block_on(
+            &reactor,
+            reactor.recv(
+                right.clone(),
+                vec![0; 1],
+                Lease(drops.clone()),
+                &OpCtx::none(),
+            ),
+        );
+        assert_eq!(rejected.unwrap_err(), Error::Overloaded);
+        assert_eq!(drops.get(), 1);
+        assert_eq!(reactor.in_flight(), 0);
+        assert_eq!(reactor.stats().rejected, 1);
+        left.try_send(b"y").unwrap();
+        let got = block_on(
+            &reactor,
+            reactor.recv(right, vec![0; 1], (), &OpCtx::none()),
+        )
+        .unwrap();
+        assert_eq!(got.bytes, 1);
+    }
+
+    #[test]
+    /// Cancellation that lands before a transient CQE is reaped prevents the
+    /// retry: the operation fences as canceled and owners drop once.
+    fn sim_cancel_before_transient_completion_prevents_resubmission() {
+        let os = SimOs::new();
+        let clock = crate::ctx::VirtualClock::new();
+        let reactor = simulated(&os, &clock);
+        let (_left, right) = os.socket_pair();
+        let drops = Rc::new(Cell::new(0));
+        os.inject("recv", Fault::Errno(libc::EINTR)).unwrap();
+        let mut recv = reactor.recv(
+            Rc::new(right),
+            vec![0; 1],
+            Lease(drops.clone()),
+            &OpCtx::none(),
+        );
+        let mut cx = Context::from_waker(Waker::noop());
+        assert!(Pin::new(&mut recv).poll(&mut cx).is_pending());
+        reactor.cancel_op(recv.id().unwrap(), Error::Cancelled);
+        let executor = LocalExecutor::new(Some(reactor.wake_handle()));
+        let result = executor.block_on(&reactor, recv).unwrap();
+        assert_eq!(result.unwrap_err(), Error::Cancelled);
+        assert_eq!(reactor.stats().retries, 0);
+        assert_eq!(drops.get(), 1);
+        assert_eq!(reactor.in_flight(), 0);
+    }
+
+    #[test]
+    /// Repeated polls refresh one fence registration instead of growing the
+    /// waiter list, and dropping a pending fence unregisters it.
+    fn fence_waiters_are_bounded_and_unregister_on_drop() {
+        let os = SimOs::new();
+        let clock = crate::ctx::VirtualClock::new();
+        let reactor = simulated(&os, &clock);
+        let (_left, right) = os.socket_pair();
+        let right = Rc::new(right);
+        let class = OpCtx::none().class(IoClass(2));
+        let mut recv = reactor.recv(right.clone(), vec![0; 1], (), &class);
+        let mut cx = Context::from_waker(Waker::noop());
+        assert!(Pin::new(&mut recv).poll(&mut cx).is_pending());
+        let id = recv.id().unwrap();
+        let waiters = |reactor: &Reactor| {
+            let state = reactor.state();
+            (state.fence_waiters.len(), state.id_waiters.len())
+        };
+        // A fence waiter that does not cancel: wait on an operation's id.
+        let mut ids = reactor.fence_ids(vec![id]);
+        let mut class_wait = FenceWait {
+            reactor: reactor.clone(),
+            class: Some(IoClass(2)),
+            registered: None,
+        };
+        for _ in 0..10 {
+            assert!(Pin::new(&mut ids).poll(&mut cx).is_pending());
+            assert!(Pin::new(&mut class_wait).poll(&mut cx).is_pending());
+        }
+        assert_eq!(waiters(&reactor), (1, 1));
+        drop(ids);
+        drop(class_wait);
+        assert_eq!(waiters(&reactor), (0, 0));
+        drop(recv);
+        let executor = LocalExecutor::new(Some(reactor.wake_handle()));
+        executor.block_on(&reactor, reactor.fence_all()).unwrap();
+        assert_eq!(waiters(&reactor), (0, 0));
+    }
+
+    /// An owner whose destructor re-enters the reactor.
+    struct Reentrant(Reactor, Rc<Cell<usize>>);
+
+    impl Drop for Reentrant {
+        fn drop(&mut self) {
+            // Panics with a borrow error if dropped under the reactor's state borrow.
+            let _ = self.0.in_flight();
+            let _ = self.0.stats();
+            self.1.set(self.1.get() + 1);
+        }
+    }
+
+    #[test]
+    /// Abandoned and delivered owners are destroyed outside the reactor's
+    /// state borrow, so their destructors may re-enter it.
+    fn owner_destructors_can_reenter_the_reactor() {
+        let os = SimOs::new();
+        let clock = crate::ctx::VirtualClock::new();
+        let reactor = simulated(&os, &clock);
+        let (left, right) = os.socket_pair();
+        let (left, right) = (Rc::new(left), Rc::new(right));
+        let drops = Rc::new(Cell::new(0));
+        let mut abandoned = reactor.recv(
+            right.clone(),
+            vec![0; 1],
+            Reentrant(reactor.clone(), drops.clone()),
+            &OpCtx::none(),
+        );
+        let mut cx = Context::from_waker(Waker::noop());
+        assert!(Pin::new(&mut abandoned).poll(&mut cx).is_pending());
+        drop(abandoned);
+        left.try_send(b"a").unwrap();
+        let executor = LocalExecutor::new(Some(reactor.wake_handle()));
+        executor.block_on(&reactor, reactor.fence_all()).unwrap();
+        assert_eq!(drops.get(), 1);
+
+        // Rejected before publication.
+        os.reject_submissions(1).unwrap();
+        let reactor = simulated(&os, &clock);
+        let rejected = block_on(
+            &reactor,
+            reactor.recv(
+                right,
+                vec![0; 1],
+                Reentrant(reactor.clone(), drops.clone()),
+                &OpCtx::none(),
+            ),
+        );
+        assert_eq!(rejected.err(), Some(Error::Overloaded));
+        assert_eq!(drops.get(), 2);
+    }
+
+    #[test]
+    /// EOF reads zero bytes and a send to a closed peer reports `EPIPE`
+    /// without raising `SIGPIPE`.
+    fn kernel_socket_eof_and_broken_pipe() {
+        let Some(reactor) = kernel(8) else {
+            return;
+        };
+        let (left, right) = UnixStream::pair().unwrap();
+        let left = Rc::new(Descriptor::from(left));
+        drop(right);
+        let ctx = OpCtx::none();
+        let eof = block_on(&reactor, reactor.recv(left.clone(), vec![0; 4], (), &ctx)).unwrap();
+        assert_eq!(eof.bytes, 0);
+        let drops = Rc::new(Cell::new(0));
+        let error = block_on(
+            &reactor,
+            reactor.send(left, b"x".to_vec(), Lease(drops.clone()), &ctx),
+        )
+        .unwrap_err();
+        assert_eq!(error, Error::Os(libc::EPIPE));
+        assert_eq!(drops.get(), 1);
+        assert_eq!(reactor.in_flight(), 0);
+    }
+
+    #[test]
+    /// A refused connect returns the errno and releases the lease once.
+    fn kernel_connect_error_releases_lease_once() {
+        let Some(reactor) = kernel(8) else {
+            return;
+        };
+        // Bind then close a listener to find a refusing port.
+        let address = {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            listener.local_addr().unwrap()
+        };
+        let client = Rc::new(Descriptor::socket(libc::AF_INET).unwrap());
+        let drops = Rc::new(Cell::new(0));
+        let error = block_on(
+            &reactor,
+            reactor.connect(
+                client,
+                SocketAddress::Inet(address),
+                Lease(drops.clone()),
+                &OpCtx::none(),
+            ),
+        )
+        .unwrap_err();
+        assert_eq!(error, Error::Os(libc::ECONNREFUSED));
+        assert_eq!(drops.get(), 1);
+        assert_eq!(reactor.in_flight(), 0);
+    }
+
+    #[test]
+    /// An abandoned accept that completes closes the accepted descriptor at
+    /// the fence instead of leaking it.
+    fn kernel_abandoned_accept_closes_descriptor_at_fence() {
+        let Some(reactor) = kernel(8) else {
+            return;
+        };
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let listener = Rc::new(Descriptor::from(OwnedFd::from(listener)));
+        let mut accept = reactor.accept(listener, &OpCtx::none());
+        let mut cx = Context::from_waker(Waker::noop());
+        assert!(Pin::new(&mut accept).poll(&mut cx).is_pending());
+        drop(accept);
+        let mut client = std::net::TcpStream::connect(address).unwrap();
+        reactor
+            .shutdown(Instant::now() + Duration::from_secs(5))
+            .unwrap();
+        assert_eq!(reactor.in_flight(), 0);
+        client
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        let mut byte = [0];
+        // The accepted server end was closed, so the client sees EOF or a
+        // reset rather than a timeout.
+        match client.read(&mut byte) {
+            Ok(n) => assert_eq!(n, 0),
+            Err(error) => assert_eq!(error.kind(), std::io::ErrorKind::ConnectionReset),
+        }
+    }
+
+    #[test]
+    /// An abandoned receive that already took descriptors closes them at the
+    /// fence.
+    fn kernel_abandoned_recv_msg_closes_received_descriptors() {
+        let Some(reactor) = kernel(8) else {
+            return;
+        };
+        let (left, right) = UnixStream::pair().unwrap();
+        let mut recv = reactor.recv_msg(
+            Rc::new(Descriptor::from(right)),
+            vec![0; 4],
+            (),
+            &OpCtx::none(),
+        );
+        let mut cx = Context::from_waker(Waker::noop());
+        assert!(Pin::new(&mut recv).poll(&mut cx).is_pending());
+        drop(recv);
+        let (passed, mut peer) = UnixStream::pair().unwrap();
+        send_fds(&left, b"fd", &[passed.as_raw_fd()]);
+        drop(passed);
+        reactor
+            .shutdown(Instant::now() + Duration::from_secs(5))
+            .unwrap();
+        peer.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        let mut byte = [0];
+        assert_eq!(
+            peer.read(&mut byte).unwrap(),
+            0,
+            "received descriptor closed"
+        );
+    }
+
+    #[test]
+    /// More descriptors than the receive accepts set `truncated`, and every
+    /// descriptor the kernel did install is returned.
+    fn kernel_recv_msg_reports_truncated_control_data() {
+        let Some(reactor) = kernel(8) else {
+            return;
+        };
+        let (left, right) = UnixStream::pair().unwrap();
+        let file = tempfile();
+        let fds: Vec<OwnedFd> = (0..ops::MAX_RECEIVED_DESCRIPTORS + 1)
+            .map(|_| OwnedFd::from(file.try_clone().unwrap()))
+            .collect();
+        let raw: Vec<_> = fds.iter().map(AsRawFd::as_raw_fd).collect();
+        send_fds(&left, b"many", &raw);
+        let message = block_on(
+            &reactor,
+            reactor.recv_msg(
+                Rc::new(Descriptor::from(right)),
+                vec![0; 8],
+                (),
+                &OpCtx::none(),
+            ),
+        )
+        .unwrap();
+        assert_eq!(&message.buffer[..message.bytes], b"many");
+        assert!(message.truncated);
+        assert!(message.descriptors.len() <= ops::MAX_RECEIVED_DESCRIPTORS);
+    }
+
+    /// Send `bytes` with `fds` as `SCM_RIGHTS` using plain `sendmsg`.
+    fn send_fds(socket: &UnixStream, bytes: &[u8], fds: &[std::os::fd::RawFd]) {
+        let payload = std::mem::size_of_val(fds);
+        // SAFETY: CMSG_SPACE only computes a size.
+        let space = unsafe { libc::CMSG_SPACE(payload as u32) } as usize;
+        let mut control = vec![0u64; space.div_ceil(8)];
+        let mut iov = libc::iovec {
+            iov_base: bytes.as_ptr().cast_mut().cast(),
+            iov_len: bytes.len(),
+        };
+        // SAFETY: msghdr is plain data; zero is valid.
+        let mut msg: libc::msghdr = unsafe { std::mem::zeroed() };
+        msg.msg_iov = &mut iov;
+        msg.msg_iovlen = 1;
+        msg.msg_control = control.as_mut_ptr().cast();
+        msg.msg_controllen = space;
+        // SAFETY: the control buffer holds one header sized for `fds`.
+        unsafe {
+            let header = libc::CMSG_FIRSTHDR(&msg);
+            (*header).cmsg_level = libc::SOL_SOCKET;
+            (*header).cmsg_type = libc::SCM_RIGHTS;
+            (*header).cmsg_len = libc::CMSG_LEN(payload as u32) as usize;
+            std::ptr::copy_nonoverlapping(fds.as_ptr(), libc::CMSG_DATA(header).cast(), fds.len());
+        }
+        // SAFETY: every pointer in msg is live for the call.
+        let sent = unsafe { libc::sendmsg(socket.as_raw_fd(), &msg, 0) };
+        assert_eq!(sent, bytes.len() as isize);
+    }
+}

@@ -302,8 +302,13 @@ impl Fence {
 /// Erased re-preparation for retries.
 type Prepare = unsafe fn(*mut InlineBytes, *mut Scratch) -> Result<Op>;
 
-/// Erased [`sealed::OpOwner::discard`]; empties the owner cell.
-type Discard = unsafe fn(&mut OwnerCell, i32);
+/// Erased [`sealed::OpOwner::discard`]; empties the owner cell and returns
+/// the release to run once the state borrow is gone.
+type Discard = unsafe fn(&mut OwnerCell, i32) -> Deferred;
+
+/// An owner release deferred until the reactor state is not borrowed, so
+/// owner destructors may re-enter the reactor.
+type Deferred = Box<dyn FnOnce()>;
 
 /// One preallocated operation slot.
 struct Slot {
@@ -524,6 +529,9 @@ struct State {
 
     /// Reused batch of wakers notified outside the state borrow.
     wakers: Vec<Waker>,
+
+    /// Owner releases run outside the state borrow.
+    graveyard: Vec<Deferred>,
 }
 
 impl State {
@@ -615,6 +623,7 @@ impl Reactor {
                 ordinary_live: 0,
                 reserved_live: 0,
                 wakers: Vec::new(),
+                graveyard: Vec::new(),
             })),
         }));
         reactor.arm_wake()?;
@@ -750,17 +759,23 @@ impl Reactor {
         let op = match prepared {
             Ok(op) => op,
             Err(error) => {
-                slot.owner.clear();
+                // SAFETY: the cell holds the O stored above.
+                let owner = unsafe { slot.owner.take::<O>() };
                 state.slab.release(id);
+                drop(state);
+                drop(owner);
                 return Err(error);
             }
         };
         slot_retry_fd(slot, &op);
         if let Err(error) = Self::push(&mut state, id.0, &op, ctx.offload) {
             let slot = state.slab.lookup(id).expect("fresh slot");
-            slot.owner.clear();
+            // SAFETY: the cell holds the O stored above.
+            let owner = unsafe { slot.owner.take::<O>() };
             state.slab.release(id);
             state.rejected += 1;
+            drop(state);
+            drop(owner);
             return Err(error);
         }
         if ctx.reserved {
@@ -860,10 +875,14 @@ impl Reactor {
         };
         if let Some(result) = slot.done {
             let returns_fd = slot.returns_fd;
-            discard_slot(slot, result);
+            let release = discard_slot(slot, result);
             state.release_slot(id);
             if returns_fd && result >= 0 {
                 Self::close_raw(&mut state, result);
+            }
+            drop(state);
+            if let Some(release) = release {
+                release();
             }
             return;
         }
@@ -969,7 +988,11 @@ impl Reactor {
                 }
             }
         }
+        let graveyard = std::mem::take(&mut state.graveyard);
         drop(state);
+        for release in graveyard {
+            release();
+        }
         for waker in wakers.drain(..) {
             waker.wake();
         }
@@ -1055,7 +1078,9 @@ impl Reactor {
         let slot = state.slab.lookup(id).expect("finished slot");
         if slot.abandoned {
             let returns_fd = slot.returns_fd;
-            discard_slot(slot, result);
+            if let Some(release) = discard_slot(slot, result) {
+                state.graveyard.push(release);
+            }
             state.release_slot(id);
             if returns_fd && result >= 0 {
                 Self::close_raw(state, result);
@@ -1181,6 +1206,7 @@ impl Reactor {
         FenceWait {
             reactor: self.clone(),
             class: Some(class),
+            registered: None,
         }
     }
 
@@ -1207,6 +1233,7 @@ impl Reactor {
         FenceIds {
             reactor: self.clone(),
             ids,
+            registered: None,
         }
     }
 
@@ -1232,6 +1259,7 @@ impl Reactor {
         FenceWait {
             reactor: self.clone(),
             class: None,
+            registered: None,
         }
     }
 
@@ -1286,18 +1314,18 @@ fn slot_retry_fd(slot: &mut Slot, op: &Op) {
 
 /// Erased [`sealed::OpOwner::prepare`].
 /// Erased [`sealed::OpOwner::discard`].
-unsafe fn discard_erased<O: sealed::OpOwner>(cell: &mut OwnerCell, result: i32) {
+unsafe fn discard_erased<O: sealed::OpOwner>(cell: &mut OwnerCell, result: i32) -> Deferred {
     // SAFETY: the caller passes the cell holding an O.
     let owner = unsafe { cell.take::<O>() };
-    owner.discard(result);
+    Box::new(move || owner.discard(result))
 }
 
-/// Release a fenced, undelivered slot's owners through their discard hook.
-fn discard_slot(slot: &mut Slot, result: i32) {
-    if let Some(discard) = slot.discard.take() {
-        // SAFETY: discard was built for the owner stored in this cell.
-        unsafe { discard(&mut slot.owner, result) };
-    }
+/// Take a fenced, undelivered slot's owners for release through their
+/// discard hook once the state borrow is gone.
+fn discard_slot(slot: &mut Slot, result: i32) -> Option<Deferred> {
+    let discard = slot.discard.take()?;
+    // SAFETY: discard was built for the owner stored in this cell.
+    Some(unsafe { discard(&mut slot.owner, result) })
 }
 
 unsafe fn prepare_erased<O: sealed::OpOwner>(
@@ -1453,23 +1481,53 @@ pub struct FenceWait {
     reactor: Reactor,
 
     class: Option<IoClass>,
+
+    /// Waker last registered in `fence_waiters`, replaced on each poll and
+    /// removed on drop so repeated polls and abandoned waits stay bounded.
+    registered: Option<Waker>,
 }
 
 impl Future for FenceWait {
     type Output = ();
 
     /// Ready once no matching operation is in flight.
-    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
-        let mut state = self.reactor.state();
-        let done = match self.class {
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
+        let this = &mut *self;
+        let mut state = this.reactor.state();
+        if let Some(old) = this.registered.take() {
+            unregister(&mut state.fence_waiters, &this.class, &old);
+        }
+        let done = match this.class {
             None => state.unfenced == 0,
             Some(class) => state.classes[class.0 as usize] == 0,
         };
         if done {
             return Poll::Ready(());
         }
-        state.fence_waiters.push((self.class, cx.waker().clone()));
+        let waker = cx.waker().clone();
+        state.fence_waiters.push((this.class, waker.clone()));
+        this.registered = Some(waker);
         Poll::Pending
+    }
+}
+
+impl Drop for FenceWait {
+    /// Remove a still-registered waker.
+    fn drop(&mut self) {
+        if let Some(old) = self.registered.take() {
+            unregister(&mut self.reactor.state().fence_waiters, &self.class, &old);
+        }
+    }
+}
+
+/// Remove one waiter registered under `key` with `waker`, if still present
+/// (a completed fence already removed it when waking).
+fn unregister<K: PartialEq>(waiters: &mut Vec<(K, Waker)>, key: &K, waker: &Waker) {
+    if let Some(index) = waiters
+        .iter()
+        .position(|(k, w)| k == key && w.will_wake(waker))
+    {
+        waiters.swap_remove(index);
     }
 }
 
@@ -1479,6 +1537,9 @@ pub struct FenceIds {
     reactor: Reactor,
 
     ids: Vec<IoId>,
+
+    /// Registration in `id_waiters`, replaced on each poll and removed on drop.
+    registered: Option<(IoId, Waker)>,
 }
 
 impl Future for FenceIds {
@@ -1488,12 +1549,26 @@ impl Future for FenceIds {
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
         let this = &mut *self;
         let mut state = this.reactor.state();
+        if let Some((id, old)) = this.registered.take() {
+            unregister(&mut state.id_waiters, &id, &old);
+        }
         this.ids.retain(|id| !Reactor::fenced(&mut state.slab, *id));
         let Some(id) = this.ids.last().copied() else {
             return Poll::Ready(());
         };
-        state.id_waiters.push((id, cx.waker().clone()));
+        let waker = cx.waker().clone();
+        state.id_waiters.push((id, waker.clone()));
+        this.registered = Some((id, waker));
         Poll::Pending
+    }
+}
+
+impl Drop for FenceIds {
+    /// Remove a still-registered waker.
+    fn drop(&mut self) {
+        if let Some((id, old)) = self.registered.take() {
+            unregister(&mut self.reactor.state().id_waiters, &id, &old);
+        }
     }
 }
 
