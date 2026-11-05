@@ -5,6 +5,7 @@ package netboot
 
 import (
 	"bytes"
+	"context"
 	"io"
 	"net"
 	"strings"
@@ -205,4 +206,110 @@ func TestTFTPUserDataTransferDoesNotRecordBootLoader(t *testing.T) {
 
 	require.NoError(t, srv.readHandler("shimx64.efi", &tftpReaderFrom{readerFrom: readerFrom{&shim}, ip: "10.0.1.60"}))
 	require.Equal(t, []string{"node-ud:shimx64.efi"}, recorder.calls)
+}
+
+// errAfterReader returns data and then err instead of io.EOF.
+type errAfterReader struct {
+	data []byte
+	err  error
+}
+
+func (r *errAfterReader) Read(p []byte) (int, error) {
+	if len(r.data) == 0 {
+		return 0, r.err
+	}
+
+	n := copy(p, r.data)
+	r.data = r.data[n:]
+
+	return n, nil
+}
+
+// blockingReader returns one chunk, then blocks until ctx ends and returns
+// io.ErrUnexpectedEOF, like a source that swallows cancellation.
+type blockingReader struct {
+	ctx  context.Context //nolint:containedctx // Test helper.
+	sent bool
+}
+
+func (r *blockingReader) Read(p []byte) (int, error) {
+	if !r.sent {
+		r.sent = true
+		return copy(p, "chunk"), nil
+	}
+
+	<-r.ctx.Done()
+
+	return 0, io.ErrUnexpectedEOF
+}
+
+func TestSendWithin(t *testing.T) {
+	t.Run("complete", func(t *testing.T) {
+		var out bytes.Buffer
+
+		n, err := sendWithin(t.Context(), &readerFrom{&out}, strings.NewReader("data"))
+		require.NoError(t, err)
+		require.EqualValues(t, 4, n)
+		require.Equal(t, "data", out.String())
+	})
+
+	t.Run("truncated source", func(t *testing.T) {
+		var out bytes.Buffer
+
+		_, err := sendWithin(t.Context(), &readerFrom{&out}, &errAfterReader{data: []byte("da"), err: io.ErrUnexpectedEOF})
+		require.ErrorIs(t, err, errTruncatedSource)
+	})
+
+	t.Run("deadline expires mid-transfer", func(t *testing.T) {
+		ctx, cancel := context.WithTimeout(t.Context(), 50*time.Millisecond)
+		defer cancel()
+
+		var out bytes.Buffer
+
+		_, err := sendWithin(ctx, &readerFrom{&out}, &blockingReader{ctx: ctx})
+		require.Error(t, err)
+	})
+
+	t.Run("deadline expired before read", func(t *testing.T) {
+		ctx, cancel := context.WithCancel(t.Context())
+		cancel()
+
+		var out bytes.Buffer
+
+		_, err := sendWithin(ctx, &readerFrom{&out}, strings.NewReader("data"))
+		require.ErrorIs(t, err, context.Canceled)
+		require.Empty(t, out.String())
+	})
+}
+
+func TestTFTPTransferTimeoutDoesNotRecordBootLoader(t *testing.T) {
+	puller := setupImagePuller(t, "ghcr.io/test/image:v1", map[string][]byte{"shimx64.efi": []byte("shim")})
+	node := &v1alpha3.Machine{
+		ObjectMeta: metav1.ObjectMeta{Name: "node-late"},
+		Spec: v1alpha3.MachineSpec{PXE: &v1alpha3.PXESpec{
+			Image:      "ghcr.io/test/image:v1",
+			DHCPLeases: []v1alpha3.DHCPLease{{MAC: "aa:bb:cc:dd:ee:0b", IPv4: "10.0.1.61", SubnetMask: "255.255.255.0"}},
+		}},
+	}
+	fc := fake.NewClientBuilder().WithScheme(newScheme(t)).WithObjects(node).
+		WithIndex(&v1alpha3.Machine{}, indexing.IndexNodeByIP, indexing.IndexNodeByIPFunc).Build()
+	recorder := &recordingTFTPStatusRecorder{}
+	srv := &TFTPServer{
+		FileResolver:    FileResolver{Puller: puller, Reader: fc},
+		StatusRecorder:  recorder,
+		TransferTimeout: 100 * time.Millisecond,
+	}
+
+	var out bytes.Buffer
+
+	rf := &slowTFTPReaderFrom{tftpReaderFrom: tftpReaderFrom{readerFrom: readerFrom{&out}, ip: "10.0.1.61"}, delay: 300 * time.Millisecond}
+	require.ErrorIs(t, srv.readHandler("shimx64.efi", rf), context.DeadlineExceeded)
+	require.Empty(t, recorder.calls)
+
+	srv.TransferTimeout = 0
+
+	out.Reset()
+	require.NoError(t, srv.readHandler("shimx64.efi", &tftpReaderFrom{readerFrom: readerFrom{&out}, ip: "10.0.1.61"}))
+	require.Equal(t, "shim", out.String())
+	require.Equal(t, []string{"node-late:shimx64.efi"}, recorder.calls)
 }

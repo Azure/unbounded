@@ -6,6 +6,7 @@ package netboot
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -102,7 +103,6 @@ func (t *TFTPServer) readHandler(filename string, rf io.ReaderFrom) error {
 			log = log.With("ip", transfer.RemoteAddr().IP.String())
 		}
 
-		// The ISO is a local file and is not bound to ctx.
 		file, err := t.Media.OpenISO(ctx, filename)
 		if err != nil {
 			log.Warn("rejecting boot media transfer", "err", err)
@@ -110,9 +110,15 @@ func (t *TFTPServer) readHandler(filename string, rf io.ReaderFrom) error {
 		}
 		defer file.Close() //nolint:errcheck // Best-effort close after transfer.
 
+		if transfer, ok := rf.(tftp.OutgoingTransfer); ok {
+			if info, err := file.Stat(); err == nil {
+				transfer.SetSize(info.Size())
+			}
+		}
+
 		log.Info("serving boot media")
 
-		n, err := rf.ReadFrom(file)
+		n, err := sendWithin(transferCtx, rf, file)
 		if err != nil {
 			log.Error("boot media transfer failed", "bytes", n, "err", err)
 			return err
@@ -191,6 +197,7 @@ func (t *TFTPServer) readHandler(filename string, rf io.ReaderFrom) error {
 	defer resolved.Close() //nolint:errcheck // read-only
 
 	var content io.Reader = bytes.NewReader(resolved.Data)
+
 	if resolved.File != nil {
 		content = resolved.File
 
@@ -200,10 +207,14 @@ func (t *TFTPServer) readHandler(filename string, rf io.ReaderFrom) error {
 
 		log.Info("serving image file", "node", node.Name, "size", resolved.File.Size())
 	} else {
+		if transfer, ok := rf.(tftp.OutgoingTransfer); ok {
+			transfer.SetSize(int64(len(resolved.Data)))
+		}
+
 		log.Info("serving file", "node", node.Name, "size", len(resolved.Data))
 	}
 
-	if _, err := rf.ReadFrom(content); err != nil {
+	if _, err := sendWithin(transferCtx, rf, content); err != nil {
 		log.Error("transfer failed", "node", node.Name, "err", err)
 		return err
 	}
@@ -216,6 +227,72 @@ func (t *TFTPServer) readHandler(filename string, rf io.ReaderFrom) error {
 
 	return nil
 }
+
+// sendWithin streams src through rf and reports success only if the whole
+// source was read before ctx ended. The tftp library treats
+// io.ErrUnexpectedEOF from the source as a short final block and reports
+// success, and it never sees ctx, so both are checked here.
+func sendWithin(ctx context.Context, rf io.ReaderFrom, src io.Reader) (int64, error) {
+	cr := &ctxReader{ctx: ctx, r: src}
+
+	n, err := rf.ReadFrom(cr)
+	if err != nil {
+		return n, err
+	}
+
+	if cr.err != nil {
+		return n, cr.err
+	}
+
+	if err := ctx.Err(); err != nil {
+		return n, fmt.Errorf("transfer deadline: %w", err)
+	}
+
+	if !cr.eof {
+		return n, fmt.Errorf("transfer ended before end of file: %w", io.ErrUnexpectedEOF)
+	}
+
+	return n, nil
+}
+
+// ctxReader fails reads once ctx ends and remembers the first read error
+// other than io.EOF, so a truncated or late transfer is not reported as
+// success.
+type ctxReader struct {
+	ctx context.Context //nolint:containedctx // Bounds reads of one transfer.
+	r   io.Reader
+	err error
+	eof bool
+}
+
+func (c *ctxReader) Read(p []byte) (int, error) {
+	if c.err != nil {
+		return 0, c.err
+	}
+
+	if err := c.ctx.Err(); err != nil {
+		c.err = fmt.Errorf("transfer deadline: %w", err)
+		return 0, c.err
+	}
+
+	n, err := c.r.Read(p)
+	switch {
+	case err == nil:
+	case errors.Is(err, io.EOF):
+		c.eof = true
+	case errors.Is(err, io.ErrUnexpectedEOF):
+		// Reported as a distinct error so the tftp library aborts instead of
+		// treating it as a short final block.
+		c.err = fmt.Errorf("reading source: %w: %w", errTruncatedSource, err)
+		return n, c.err
+	default:
+		c.err = err
+	}
+
+	return n, err
+}
+
+var errTruncatedSource = errors.New("source truncated")
 
 func (t *TFTPServer) recordBootLoaderDownloaded(ctx context.Context, log *slog.Logger, node *v1alpha3.Machine, img *imagepull.Image, filename string) {
 	if node == nil || t.StatusRecorder == nil || !t.isInitialBootLoaderDownload(ctx, img, filename) {
