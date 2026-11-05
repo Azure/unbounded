@@ -197,12 +197,12 @@ struct SubscriptionFixture {
 
 impl SubscriptionFixture {
     fn construct(root: PathBuf) -> Self {
+        use crate::control::cell::PublicationCell;
         use client::RequestParser;
         use client::Responses;
         use client::listener::ClientListeners;
         use control::Snapshot;
         use control::publication::PublicationTarget;
-        use controlplane::Published;
         use http::Delivery;
         use memory::BufferPool;
         use memory::MemoryCache;
@@ -237,7 +237,7 @@ impl SubscriptionFixture {
         reactor.init().unwrap();
         let buffers = BufferPool::new(admission.clone());
         let keys = Rc::new(interop_keys(&reactor.ctx().clock));
-        let published = Arc::new(Published::new(Snapshot::retention(2)));
+        let published = Arc::new(PublicationCell::new(Snapshot::retention(2)));
         let availability = Rc::new(control::Availability::new(published.clone(), keys.clone()));
         let snapshots = Rc::new(PublicationTarget::new(
             keys.cluster().clone(),
@@ -335,7 +335,7 @@ impl SubscriptionFixture {
             Rc::new(topology::Placement::new(16)),
             peers.clone(),
             credentials.clone(),
-            Arc::new(Published::new(Snapshot::retention(2))),
+            Arc::new(PublicationCell::new(Snapshot::retention(2))),
             racer_io::WorkerCtx::host(),
         ));
         let origin = Rc::new(GeneratedOrigin(buffers.clone()));

@@ -191,7 +191,7 @@ pub struct CandidatePolicy {
     placement: Rc<Placement>,
     peers: Rc<Requester>,
     credentials: Rc<CredentialCrypto>,
-    published: Arc<controlplane::Published<crate::control::Snapshot>>,
+    published: Arc<crate::control::cell::PublicationCell<crate::control::Snapshot>>,
     ownership_refresh: RefCell<OwnershipRefresh>,
     single_flight: RefCell<SingleFlightPeers>,
     /// Timer for waiting on a destination that is behind. Without one, the walk skips it as before.
@@ -687,7 +687,7 @@ impl CandidatePolicy {
         placement: Rc<Placement>,
         peers: Rc<Requester>,
         credentials: Rc<CredentialCrypto>,
-        published: Arc<controlplane::Published<crate::control::Snapshot>>,
+        published: Arc<crate::control::cell::PublicationCell<crate::control::Snapshot>>,
         ctx: racer_io::WorkerCtx,
     ) -> Self {
         Self {
@@ -1002,7 +1002,6 @@ impl CandidatePolicy {
         let membership = self
             .published
             .current()
-            .map_err(Error::from)
             .and_then(|s| s.map(|s| s.membership.clone()).ok_or(Error::Unavailable));
         let object = page.version.object.clone();
         let number = page.number;
@@ -1207,7 +1206,7 @@ impl CandidatePolicy {
                 let latest = match self.published.current() {
                     Ok(latest) => latest.map(|published| published.membership.clone()),
                     Err(error) => {
-                        let error = a.core_error(Error::from(error));
+                        let error = a.core_error(error);
                         return AcqInputOf::Membership {
                             id,
                             latest: Err(error),
@@ -3166,7 +3165,7 @@ pub(super) mod tests {
                 Routes::request_direct,
             ),
             credentials,
-            Arc::new(controlplane::Published::new(
+            Arc::new(crate::control::cell::PublicationCell::new(
                 crate::control::Snapshot::retention(2),
             )),
             racer_io::WorkerCtx::host(),
@@ -3859,7 +3858,7 @@ pub(super) mod tests {
                 ProbePeer::request_direct,
             ),
             credentials,
-            Arc::new(controlplane::Published::new(
+            Arc::new(crate::control::cell::PublicationCell::new(
                 crate::control::Snapshot::retention(2),
             )),
             racer_io::WorkerCtx::host(),
@@ -3913,7 +3912,7 @@ pub(super) mod tests {
                 ProbePeer::request_direct,
             ),
             credentials.clone(),
-            Arc::new(controlplane::Published::new(
+            Arc::new(crate::control::cell::PublicationCell::new(
                 crate::control::Snapshot::retention(2),
             )),
             racer_io::WorkerCtx::host(),
@@ -3955,7 +3954,7 @@ pub(super) mod tests {
                 ProbePeer::request_direct,
             ),
             credentials,
-            Arc::new(controlplane::Published::new(
+            Arc::new(crate::control::cell::PublicationCell::new(
                 crate::control::Snapshot::retention(2),
             )),
             racer_io::WorkerCtx::host(),
@@ -4006,7 +4005,7 @@ pub(super) mod tests {
                     ProbePeer::request_direct,
                 ),
                 credentials,
-                Arc::new(controlplane::Published::new(
+                Arc::new(crate::control::cell::PublicationCell::new(
                     crate::control::Snapshot::retention(2),
                 )),
                 racer_io::WorkerCtx::host(),
@@ -4046,7 +4045,7 @@ pub(super) mod tests {
                 ProbePeer::request_direct,
             ),
             credentials,
-            Arc::new(controlplane::Published::new(
+            Arc::new(crate::control::cell::PublicationCell::new(
                 crate::control::Snapshot::retention(2),
             )),
             racer_io::WorkerCtx::host(),
@@ -4090,7 +4089,7 @@ pub(super) mod tests {
                 ProbePeer::request_direct,
             ),
             credentials,
-            Arc::new(controlplane::Published::new(
+            Arc::new(crate::control::cell::PublicationCell::new(
                 crate::control::Snapshot::retention(2),
             )),
             racer_io::WorkerCtx::host(),
@@ -4297,7 +4296,7 @@ pub(super) mod tests {
                 admission,
                 racer_io::WorkerCtx::host().rng,
             )),
-            Arc::new(controlplane::Published::new(
+            Arc::new(crate::control::cell::PublicationCell::new(
                 crate::control::Snapshot::retention(2),
             )),
             racer_io::WorkerCtx::host(),

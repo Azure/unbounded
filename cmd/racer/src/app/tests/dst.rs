@@ -2437,7 +2437,7 @@ impl Harness {
         let worker_ids: Vec<_> = (0..worker_count).map(|i| WorkerId(i as u16)).collect();
         let mut state = NodeState::new(worker_ids.clone(), 64, crate::test_support::ctx()).unwrap();
         // Retention belongs to the shared publication authority, not worker handles.
-        state.publications = Arc::new(controlplane::Published::new(
+        state.publications = Arc::new(crate::control::cell::PublicationCell::new(
             crate::control::Snapshot::retention(config.limits.retained_snapshots.get()),
         ));
         let node = Arc::new(state);

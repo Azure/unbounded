@@ -143,7 +143,7 @@ struct Harness {
     admission: Rc<flow_control::Quotas<AdmissionPolicy>>,
     limits: Arc<AzureLimits>,
     definition: OriginDefinition,
-    snapshots: Arc<Published<Snapshot>>,
+    snapshots: Arc<PublicationCell<Snapshot>>,
 }
 
 fn harness() -> Harness {
@@ -175,7 +175,7 @@ fn harness() -> Harness {
     let fake = Rc::new(Fake::default());
     let tokens = Rc::new(Tokens::default());
     let shared = Arc::new(AzureLimits::default());
-    let snapshots = Arc::new(Published::new(Snapshot::retention(2)));
+    let snapshots = Arc::new(PublicationCell::new(Snapshot::retention(2)));
     let origin = AzureOrigin::new(
         fake.clone(),
         tokens.clone(),

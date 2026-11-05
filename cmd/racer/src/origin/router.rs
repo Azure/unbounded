@@ -9,23 +9,23 @@ use super::azure::{AzureOrigin, AzureTokenSource, AzureTransport};
 use super::{MetadataReply, Origin, OriginPage};
 use crate::admission::AdmissionPolicy;
 use crate::control::Snapshot;
+use crate::control::cell::PublicationCell;
 use crate::error::{Error, Operation};
 use crate::model::{MetadataSelector, ObjectId, PageId, PageNumber};
 use crate::read::candidates::OriginAuthority;
 use crate::runtime::RequestScope;
 use crate::security::OriginContext;
-use controlplane::Published;
 use std::sync::Arc;
 
 pub struct OriginRouter<U, T, K> {
-    snapshots: Arc<Published<Snapshot>>,
+    snapshots: Arc<PublicationCell<Snapshot>>,
     adapter: U,
     azure: Option<AzureOrigin<T, K>>,
 }
 
 impl<U: Origin, T: AzureTransport, K: AzureTokenSource> OriginRouter<U, T, K> {
     pub fn new(
-        snapshots: Arc<Published<Snapshot>>,
+        snapshots: Arc<PublicationCell<Snapshot>>,
         adapter: U,
         azure: Option<AzureOrigin<T, K>>,
     ) -> Self {

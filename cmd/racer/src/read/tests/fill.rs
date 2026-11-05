@@ -444,7 +444,7 @@ fn ready_memory_precedes_cold_ownership_refresh_and_preserves_one_interest() {
     let mut budget = AcquisitionBudget::new(f.scope.deadline.0, 4, 8);
     let page = acquire(&mut f, &mut budget).unwrap();
     f.fill.dependencies.writer.discard_unsubmitted();
-    let published = Arc::new(controlplane::Published::new(
+    let published = Arc::new(crate::control::cell::PublicationCell::new(
         crate::control::Snapshot::retention(2),
     ));
     let snapshots = crate::control::publication::PublicationTarget::new(
@@ -3167,22 +3167,24 @@ impl Fixture {
     ) -> (
         Rc<crate::read::Coordinator>,
         crate::read::dispatch::WorkerEndpoint,
-        Arc<controlplane::Published<crate::control::Snapshot>>,
+        Arc<crate::control::cell::PublicationCell<crate::control::Snapshot>>,
     ) {
         use crate::control::Availability;
         use crate::control::Snapshot;
+        use crate::control::cell::PublicationCell;
         use crate::control::publication::PublicationTarget;
         use crate::http::Delivery;
         use crate::read::Coordinator;
         use crate::read::metadata::MetadataDependencies;
         use crate::read::metadata::MetadataService;
         use crate::read::range_stream::RangeStreams;
-        use controlplane::Published;
         use racer_control_wire::CacheDefinition;
         use racer_control_wire::Publication;
         use racer_control_wire::PublicationSequence;
         use racer_control_wire::SCHEMA_VERSION;
-        let published = Arc::new(Published::new(Snapshot::retention(settings.snapshots)));
+        let published = Arc::new(PublicationCell::new(Snapshot::retention(
+            settings.snapshots,
+        )));
         let availability = Rc::new(Availability::new(published.clone(), self.keys.clone()));
         let snapshots = Rc::new(PublicationTarget::new(
             self.keys.cluster().clone(),
@@ -3429,7 +3431,7 @@ fn fixture_with_caches(
         Rc::new(Placement::new(16)),
         peers.clone(),
         credentials.clone(),
-        Arc::new(controlplane::Published::new(
+        Arc::new(crate::control::cell::PublicationCell::new(
             crate::control::Snapshot::retention(2),
         )),
         crate::test_support::ctx(),
@@ -3525,14 +3527,14 @@ pub(super) fn adapter_client(
     adapter: &crate::test_support::origin::AdapterOrigin,
 ) -> Rc<crate::origin::OriginClient> {
     use crate::control::Snapshot;
+    use crate::control::cell::PublicationCell;
     use crate::control::publication::PublicationTarget;
-    use controlplane::Published;
     use racer_control_wire::Publication;
     use racer_control_wire::PublicationSequence;
     use racer_control_wire::SCHEMA_VERSION;
     let snapshots = Rc::new(PublicationTarget::new(
         f.keys.cluster().clone(),
-        Arc::new(Published::new(Snapshot::retention(2))),
+        Arc::new(PublicationCell::new(Snapshot::retention(2))),
         crate::test_support::clock(),
     ));
     let (client_socket, origin_socket) =

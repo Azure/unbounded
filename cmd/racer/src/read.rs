@@ -9,6 +9,7 @@ use self::range_stream::RangeStreams;
 use crate::client::ClientRequest;
 use crate::client::ReadKind;
 use crate::control::Snapshot;
+use crate::control::cell::PublicationCell;
 use crate::error::Error;
 use crate::error::Operation;
 use crate::error::Result;
@@ -28,7 +29,6 @@ use crate::security::ChargedOriginContext;
 use crate::security::CredentialCrypto;
 use crate::security::OriginContext;
 use crate::security::PeerOriginContext;
-use controlplane::Published;
 use std::rc::Rc;
 
 pub mod candidates;
@@ -70,7 +70,7 @@ impl ReadPayload {
 
 /// Coordinate client admission and peer acquisition on the current worker.
 pub struct Coordinator {
-    snapshots: std::sync::Arc<Published<Snapshot>>,
+    snapshots: std::sync::Arc<PublicationCell<Snapshot>>,
 
     pub(super) metadata: Rc<MetadataService>,
 
@@ -114,7 +114,7 @@ impl Coordinator {
 
     /// Assemble worker-local services without transferring their reactor ownership.
     pub fn new(
-        snapshots: std::sync::Arc<Published<Snapshot>>,
+        snapshots: std::sync::Arc<PublicationCell<Snapshot>>,
         metadata: Rc<MetadataService>,
         fill: Rc<Fill>,
         streams: Rc<RangeStreams>,

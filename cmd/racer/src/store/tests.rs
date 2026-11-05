@@ -1430,12 +1430,12 @@ fn scope() -> RequestScope {
 fn storage_requires_published_cache_and_live_keys_including_restore() {
     use crate::control::Availability;
     use crate::control::Snapshot;
+    use crate::control::cell::PublicationCell;
     use crate::control::for_caches;
     use crate::memory::MemoryCache;
     use crate::memory::tests::bundle_for;
     use crate::test_support::security::keys;
     use crate::test_support::security::rotation_bundle;
-    use controlplane::Published;
     use std::sync::Arc;
 
     for mode in ["unpublished", "absent", "keyless", "available"] {
@@ -1443,7 +1443,7 @@ fn storage_requires_published_cache_and_live_keys_including_restore() {
         let cache = CacheId(crate::test_support::security::CACHE.into());
         let availability = match mode {
             "unpublished" => Rc::new(Availability::new(
-                Arc::new(Published::new(Snapshot::retention(2))),
+                Arc::new(PublicationCell::new(Snapshot::retention(2))),
                 keys.clone(),
             )),
             "absent" => for_caches(keys.clone(), vec![]),

@@ -1486,7 +1486,7 @@ fn composes_http_and_optional_rdma_without_operational_side_effects() {
             )
             .unwrap();
         let state = NodeState {
-            publications: Arc::new(Published::new(Snapshot::retention(
+            publications: Arc::new(PublicationCell::new(Snapshot::retention(
                 config.limits.retained_snapshots.get(),
             ))),
             ..NodeState::default()
@@ -1587,7 +1587,7 @@ fn multiworker_memberships_retire_after_request_leases_and_reuse_capacity() {
     .unwrap();
     let local = publication.members[0].node.clone();
     let neighbor = publication.members[1].node.clone();
-    let published = Arc::new(Published::new(Snapshot::retention(1)));
+    let published = Arc::new(PublicationCell::new(Snapshot::retention(1)));
     let store = PublicationTarget::new(
         publication.cluster.clone(),
         published.clone(),

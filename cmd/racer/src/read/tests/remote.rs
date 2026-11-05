@@ -284,8 +284,8 @@ fn remote_candidate_with_churn(absence: Option<Absence>, forbidden: bool, churn:
     let queue = Rc::new(uring_runtime::drivers::DriverQueue::new(1024));
     let _owner = queue.enter();
     use crate::control::Snapshot;
+    use crate::control::cell::PublicationCell;
     use crate::control::publication::PublicationTarget;
-    use controlplane::Published;
     use racer_control_wire::Publication;
     let object = ObjectId {
         cache: CacheId(CACHE.into()),
@@ -294,7 +294,7 @@ fn remote_candidate_with_churn(absence: Option<Absence>, forbidden: bool, churn:
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     listener.set_nonblocking(true).unwrap();
     let address = listener.local_addr().unwrap().to_string();
-    let source_publications = Arc::new(Published::new(Snapshot::retention(1)));
+    let source_publications = Arc::new(PublicationCell::new(Snapshot::retention(1)));
     let source_store = PublicationTarget::new(
         ClusterId(CLUSTER.into()),
         source_publications.clone(),
@@ -515,7 +515,7 @@ fn remote_candidate_with_churn(absence: Option<Absence>, forbidden: bool, churn:
             admission.clone(),
             racer_io::WorkerCtx::host().rng,
         )),
-        Arc::new(controlplane::Published::new(
+        Arc::new(crate::control::cell::PublicationCell::new(
             crate::control::Snapshot::retention(2),
         )),
         racer_io::WorkerCtx::host(),
@@ -915,6 +915,7 @@ fn metadata_coordinator_with_newer_publication(
     newer_publication: bool,
 ) -> (Rc<super::Coordinator>, super::dispatch::WorkerEndpoint) {
     use crate::control::Snapshot;
+    use crate::control::cell::PublicationCell;
     use crate::control::publication::PublicationTarget;
     use crate::http::Delivery;
     use crate::memory::MemoryCache;
@@ -924,9 +925,8 @@ fn metadata_coordinator_with_newer_publication(
     use crate::store::StoreReader;
     use crate::store::StoreWriter;
     use crate::store::catalog::Index;
-    use controlplane::Published;
     use racer_control_wire::Publication;
-    let published = Arc::new(Published::new(Snapshot::retention(4)));
+    let published = Arc::new(PublicationCell::new(Snapshot::retention(4)));
     let availability = Rc::new(crate::control::Availability::new(
         published.clone(),
         keys.clone(),
@@ -1010,7 +1010,7 @@ fn metadata_coordinator_with_newer_publication(
         Rc::new(Placement::new(16)),
         peers.clone(),
         credentials.clone(),
-        Arc::new(controlplane::Published::new(
+        Arc::new(crate::control::cell::PublicationCell::new(
             crate::control::Snapshot::retention(2),
         )),
         racer_io::WorkerCtx::host(),

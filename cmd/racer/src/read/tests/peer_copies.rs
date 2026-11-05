@@ -285,7 +285,7 @@ fn install_peers(f: &mut Fixture, rank: Option<usize>) -> (Rc<ScriptedPeers>, Ve
             ScriptedPeers::request_direct,
         ),
         dependencies.credentials.clone(),
-        Arc::new(controlplane::Published::new(
+        Arc::new(crate::control::cell::PublicationCell::new(
             crate::control::Snapshot::retention(2),
         )),
         crate::test_support::ctx(),
@@ -655,7 +655,7 @@ fn serial_zero_grant_copy_failures_and_positive_grant_acquire() {
                     Rc::new(Placement::new(16)),
                     peers.requester(),
                     deps.credentials.clone(),
-                    Arc::new(controlplane::Published::new(
+                    Arc::new(crate::control::cell::PublicationCell::new(
                         crate::control::Snapshot::retention(2),
                     )),
                     racer_io::WorkerCtx::host(),
@@ -1082,7 +1082,7 @@ fn hedge_suppresses_without_independent_route_credits_or_local_memory() {
                 Rc::new(Placement::new(16)),
                 peers.requester(),
                 deps.credentials.clone(),
-                Arc::new(controlplane::Published::new(
+                Arc::new(crate::control::cell::PublicationCell::new(
                     crate::control::Snapshot::retention(2),
                 )),
                 racer_io::WorkerCtx::host(),
@@ -1427,7 +1427,7 @@ fn enable_hedge(f: &mut Fixture, peers: &Rc<ScriptedPeers>) -> crate::telemetry:
             Rc::new(Placement::new(16)),
             peers.requester(),
             deps.credentials.clone(),
-            Arc::new(controlplane::Published::new(
+            Arc::new(crate::control::cell::PublicationCell::new(
                 crate::control::Snapshot::retention(2),
             )),
             crate::test_support::ctx(),
@@ -1768,7 +1768,7 @@ fn hedge_cold_backup_coordinators_probe_predecessors_then_reach_origin_with_orig
                     Peer::request_direct,
                 ),
                 f.fill.dependencies.credentials.clone(),
-                Arc::new(controlplane::Published::new(
+                Arc::new(crate::control::cell::PublicationCell::new(
                     crate::control::Snapshot::retention(2),
                 )),
                 racer_io::WorkerCtx::host(),
@@ -2672,7 +2672,7 @@ fn replica_selection_orders_first_acquire_and_non_primary_owner_fills() {
                     Peer::request_direct,
                 ),
                 f.fill.dependencies.credentials.clone(),
-                Arc::new(controlplane::Published::new(
+                Arc::new(crate::control::cell::PublicationCell::new(
                     crate::control::Snapshot::retention(2),
                 )),
                 racer_io::WorkerCtx::host(),
@@ -3073,7 +3073,7 @@ mod landing {
             )
             .with_scripted_landing(ordinal, land),
             dependencies.credentials.clone(),
-            Arc::new(controlplane::Published::new(
+            Arc::new(crate::control::cell::PublicationCell::new(
                 crate::control::Snapshot::retention(2),
             )),
             racer_io::WorkerCtx::host(),
@@ -3806,7 +3806,7 @@ fn install_versions(
     versions: &[(Arc<Membership>, u64)],
     wait: bool,
 ) -> Rc<Placement> {
-    let published = Arc::new(controlplane::Published::new(
+    let published = Arc::new(crate::control::cell::PublicationCell::new(
         crate::control::Snapshot::retention(2),
     ));
     let now = racer_io::Clock::host().now();
@@ -5530,7 +5530,7 @@ fn passthrough_peers_coalesces_reads_from_distinct_nodes_on_the_owner() {
                 Peer::request_direct,
             ),
             f.fill.dependencies.credentials.clone(),
-            Arc::new(controlplane::Published::new(
+            Arc::new(crate::control::cell::PublicationCell::new(
                 crate::control::Snapshot::retention(2),
             )),
             racer_io::WorkerCtx::host(),

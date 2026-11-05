@@ -2,6 +2,7 @@
 
 use crate::admission::AdmissionPolicy;
 use crate::control::Snapshot;
+use crate::control::cell::PublicationCell;
 use crate::control::publication::PublicationTarget;
 use crate::http::Delivery;
 use crate::memory::BufferPool;
@@ -31,7 +32,6 @@ use crate::store::catalog::SegmentClock;
 use crate::test_support::origin::AdapterOrigin;
 use crate::topology::Placement;
 use crate::worker::CryptoRuntime;
-use controlplane::Published;
 use racer_control_wire::CacheDefinition;
 use racer_control_wire::MembershipVersion;
 use racer_control_wire::Publication;
@@ -510,8 +510,8 @@ pub(crate) struct ReadWorker {
 /// Publish a topology-only fixture through the real generic publication authority.
 pub(crate) fn published_membership(
     membership: Arc<crate::topology::Membership>,
-) -> Arc<Published<Snapshot>> {
-    let published = Arc::new(Published::new(Snapshot::retention(2)));
+) -> Arc<PublicationCell<Snapshot>> {
+    let published = Arc::new(PublicationCell::new(Snapshot::retention(2)));
     published
         .publish(
             Arc::new(Snapshot::membership_fixture(membership)),
@@ -536,7 +536,7 @@ impl ReadWorker {
         let reactor_ctx = reactor.ctx().clone();
         let origin = AdapterOrigin::new(&cache.name, metadata);
         let keys = Rc::new(crate::test_support::security::keys());
-        let publications = Arc::new(Published::new(Snapshot::retention(2)));
+        let publications = Arc::new(PublicationCell::new(Snapshot::retention(2)));
         let availability = Rc::new(crate::control::Availability::new(
             publications.clone(),
             keys.clone(),
@@ -624,7 +624,7 @@ impl ReadWorker {
             Rc::new(Placement::new(16)),
             crate::test_support::NoPeers::requester(),
             credentials.clone(),
-            Arc::new(Published::new(Snapshot::retention(2))),
+            Arc::new(PublicationCell::new(Snapshot::retention(2))),
             reactor_ctx.clone(),
         ));
         let client = origin.client(

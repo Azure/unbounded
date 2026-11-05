@@ -7,6 +7,7 @@ use super::*;
 use crate::admission::{AdmissionPolicy, ResourceClass};
 use crate::config::Limits;
 use crate::control::Snapshot;
+use crate::control::cell::PublicationCell;
 use crate::memory::BufferPool;
 use crate::model::{
     MetadataSelector, ObjectId, ObjectVersion, PAGE_BYTES, PageId, PageNumber, StrongEtag,
@@ -17,7 +18,6 @@ use crate::remote::tests::{MapResolver, serve, test_identity};
 use crate::runtime::Reactor;
 use crate::security::{OpaqueMetadata, OriginContext};
 use crate::test_support::enrollment::{Directory, drive, scope};
-use controlplane::Published;
 use racer_control_wire::{AzureCredential, CacheId, OriginDefinition};
 use racer_io::ring::IoBuffer;
 use std::num::NonZeroUsize;
@@ -167,7 +167,7 @@ fn fixture<K: AzureTokenSource>(
     let origin = AzureOrigin::new(
         transport,
         tokens,
-        Arc::new(Published::new(Snapshot::retention(2))),
+        Arc::new(PublicationCell::new(Snapshot::retention(2))),
         admission.clone(),
         BufferPool::new(admission),
         Arc::new(AzureLimits::default()),

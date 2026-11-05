@@ -10,6 +10,7 @@ pub mod router;
 use crate::admission::AdmissionPolicy;
 use crate::admission::ResourceClass;
 use crate::control::Snapshot;
+use crate::control::cell::PublicationCell;
 use crate::error::Error;
 use crate::error::Operation;
 use crate::error::Result;
@@ -30,7 +31,6 @@ use crate::model::PageNumber;
 use crate::read::candidates::OriginAuthority;
 use crate::runtime::RequestScope;
 use crate::security::OriginContext;
-use controlplane::Published;
 use http1::Header;
 use http1::MessageHead;
 #[cfg(test)]
@@ -75,7 +75,7 @@ pub trait Origin {
 }
 pub struct OriginClient {
     health: crate::topology::LinkHealth,
-    snapshots: std::sync::Arc<Published<Snapshot>>,
+    snapshots: std::sync::Arc<PublicationCell<Snapshot>>,
     pool: Rc<HttpPool>,
     io: Rc<HttpIo>,
     admission: Rc<flow_control::Quotas<AdmissionPolicy>>,
@@ -90,7 +90,7 @@ impl OriginClient {
     /// the caller provisions and owns the directories (including any symlink policy).
     /// The complete resolved endpoint is checked against Linux's 107-byte UDS cap.
     pub fn new(
-        snapshots: std::sync::Arc<Published<Snapshot>>,
+        snapshots: std::sync::Arc<PublicationCell<Snapshot>>,
         pool: Rc<HttpPool>,
         io: Rc<HttpIo>,
         admission: Rc<flow_control::Quotas<AdmissionPolicy>>,

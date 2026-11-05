@@ -22,6 +22,7 @@ use crate::control::CacheTransition;
 use crate::control::ControlEndpoint;
 use crate::control::ReactorControlIo;
 use crate::control::Snapshot;
+use crate::control::cell::PublicationCell;
 use crate::control::publication::PublicationTarget;
 use crate::control::rails::RailJournal;
 use crate::control::session::Session;
@@ -85,7 +86,6 @@ use crate::worker::AffinityPlan;
 use crate::worker::CryptoRuntime;
 use crate::worker::WorkerGroup;
 use crate::worker::WorkerRuntime;
-use controlplane::Published;
 use racer_control_wire::CacheDefinition;
 use racer_control_wire::NodeId;
 use racer_crypto::identity::BundleInstaller;
@@ -110,6 +110,7 @@ use uring_runtime::drivers::poll_task;
 mod devices;
 mod native;
 mod recovery;
+pub(crate) mod rollout;
 
 use recovery::CheckpointCut;
 
@@ -162,7 +163,7 @@ pub struct NodeState {
 
     failures: crate::telemetry::Failures,
 
-    publications: Arc<Published<Snapshot>>,
+    publications: Arc<PublicationCell<Snapshot>>,
 
     keys: Arc<KeyEpochs>,
 
@@ -184,7 +185,7 @@ pub struct NodeState {
 
     native: native::NativeNode,
 
-    cache_rollout: controlplane::Rollout<WorkerId, Vec<CacheDefinition>>,
+    cache_rollout: crate::app::rollout::Rollout<WorkerId, Vec<CacheDefinition>>,
 
     /// Process-wide memory-pressure level, written only by the control worker.
     pressure: crate::pressure::SharedPressure,
@@ -241,12 +242,12 @@ impl NodeState {
             subscriptions: Arc::new(crate::peer::subscriptions::Subscriptions::new(
                 Default::default(),
             )?),
-            publications: Arc::new(Published::new(Snapshot::retention(2))),
+            publications: Arc::new(PublicationCell::new(Snapshot::retention(2))),
             metrics: workers.iter().copied().zip(metrics).collect(),
             failures: crate::telemetry::Failures::with_clock(clock.clone()),
             keys: Arc::new(KeyEpochs::with_clock(crate::enrollment::wall_clock(&clock))),
             control_worker: WorkerId(0),
-            cache_rollout: controlplane::Rollout::new(workers.iter().copied()),
+            cache_rollout: crate::app::rollout::Rollout::new(workers.iter().copied()),
             workers: Arc::new(WorkerDirectory::new(map, workers, capacity, ctx)?),
             count,
             prepared: AtomicUsize::new(0),
@@ -490,7 +491,7 @@ impl Application {
         self.node.workers.prefetch.configure(self.config.prefetch)?;
         Arc::get_mut(&mut self.node)
             .ok_or(Error::Internal)?
-            .publications = Arc::new(Published::new(Snapshot::retention(
+            .publications = Arc::new(PublicationCell::new(Snapshot::retention(
             self.config.limits.retained_snapshots.get(),
         )));
         self.node.inventory.update(self.discovered_nics.clone())?;
@@ -2799,7 +2800,7 @@ pub(crate) type ServedCaches = Rc<RefCell<Option<Arc<Vec<CacheDefinition>>>>>;
 
 /// Reserved worker barrier and the control worker's prepared listeners.
 struct Transition<'a> {
-    guard: Option<controlplane::rollout::Guard<'a, WorkerId, Vec<CacheDefinition>>>,
+    guard: Option<crate::app::rollout::Guard<'a, WorkerId, Vec<CacheDefinition>>>,
 
     listeners: Option<PreparedListeners>,
 }
@@ -2964,8 +2965,8 @@ impl WorkerApplication {
             }
         }
         match node.cache_rollout.ack(self.worker, generation) {
-            Ok(()) | Err(controlplane::Error::Stale) => (),
-            Err(error) => return Err(error.into()),
+            Ok(()) | Err(Error::StaleFlight) => (),
+            Err(error) => return Err(error),
         }
         Ok(())
     }

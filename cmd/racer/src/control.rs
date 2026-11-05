@@ -59,11 +59,12 @@ use wire_codec::rest;
 #[cfg(test)]
 use wire_codec::rest::Response;
 
+pub mod cell;
 pub mod managed;
 pub mod publication;
 pub mod rails;
 pub mod session;
-use controlplane::Published;
+use crate::control::cell::PublicationCell;
 #[cfg(test)]
 use publication::PublicationTarget;
 
@@ -186,14 +187,14 @@ pub trait CacheTransition {
 /// No removal history is needed: an absent UID/key is a miss. Reintroducing a UID
 /// denotes the same immutable namespace; a different namespace requires a new UID.
 pub struct Availability {
-    publications: Arc<Published<Snapshot>>,
+    publications: Arc<PublicationCell<Snapshot>>,
 
     keys: Rc<Keyring>,
 }
 
 impl Availability {
     /// Bind admission checks to current publications and worker-local keys.
-    pub fn new(publications: Arc<Published<Snapshot>>, keys: Rc<Keyring>) -> Self {
+    pub fn new(publications: Arc<PublicationCell<Snapshot>>, keys: Rc<Keyring>) -> Self {
         Self { publications, keys }
     }
 
@@ -256,7 +257,7 @@ pub(crate) fn for_cache_modes(
     caches: Vec<(CacheId, racer_control_wire::CacheMode)>,
 ) -> Rc<Availability> {
     let availability = Rc::new(Availability::new(
-        Arc::new(Published::new(Snapshot::retention(1))),
+        Arc::new(PublicationCell::new(Snapshot::retention(1))),
         keys,
     ));
     availability.publish_modes(caches);
@@ -809,7 +810,7 @@ pub(crate) mod tests {
                 BundleInstaller::new(keys),
                 Rc::new(PublicationTarget::new(
                     cluster,
-                    Arc::new(Published::new(Snapshot::retention(2))),
+                    Arc::new(PublicationCell::new(Snapshot::retention(2))),
                     racer_io::Clock::host(),
                 )),
             )
@@ -1259,7 +1260,7 @@ pub(crate) mod tests {
         fn store(retained: usize) -> PublicationTarget {
             PublicationTarget::new(
                 publication(1).cluster,
-                Arc::new(Published::new(Snapshot::retention(retained))),
+                Arc::new(PublicationCell::new(Snapshot::retention(retained))),
                 crate::test_support::clock(),
             )
         }
@@ -1478,7 +1479,7 @@ pub(crate) mod tests {
             for budget in [0, bytes] {
                 let mut policy = Snapshot::retention(2);
                 policy.grace_bytes = budget;
-                let published = Arc::new(Published::new(policy));
+                let published = Arc::new(PublicationCell::new(policy));
                 let target = PublicationTarget::new(
                     publication(1).cluster,
                     published.clone(),

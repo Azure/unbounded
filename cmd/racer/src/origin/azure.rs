@@ -33,6 +33,7 @@ use self::response::{classify, content_range, status, transport_error};
 use super::{MetadataReply, Origin, OriginPage};
 use crate::admission::{AdmissionPolicy, ResourceClass};
 use crate::control::Snapshot;
+use crate::control::cell::PublicationCell;
 use crate::error::{Error, Operation, Result};
 use crate::memory::{BufferPool, PlaintextBuffer};
 use crate::model::{
@@ -42,7 +43,6 @@ use crate::model::{
 use crate::read::candidates::OriginAuthority;
 use crate::runtime::RequestScope;
 use crate::security::OriginContext;
-use controlplane::Published;
 use http1::MessageHead;
 use racer_control_wire::{AzureContainerUrl, AzureCredential, CacheId, OriginDefinition};
 use std::collections::HashMap;
@@ -299,7 +299,7 @@ impl AzureNode {
 pub struct AzureOrigin<T, K> {
     transport: T,
     tokens: K,
-    snapshots: Arc<Published<Snapshot>>,
+    snapshots: Arc<PublicationCell<Snapshot>>,
     admission: Rc<flow_control::Quotas<AdmissionPolicy>>,
     buffers: BufferPool,
     limits: Arc<AzureLimits>,
@@ -312,7 +312,7 @@ impl<T: AzureTransport, K: AzureTokenSource> AzureOrigin<T, K> {
     pub fn new(
         transport: T,
         tokens: K,
-        snapshots: Arc<Published<Snapshot>>,
+        snapshots: Arc<PublicationCell<Snapshot>>,
         admission: Rc<flow_control::Quotas<AdmissionPolicy>>,
         buffers: BufferPool,
         limits: Arc<AzureLimits>,

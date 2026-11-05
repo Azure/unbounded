@@ -1,6 +1,6 @@
 //! Generation-tagged barriers over an explicit, immutable worker registration set.
 
-use crate::Error;
+use crate::error::Error;
 use std::{
     collections::{BTreeMap, BTreeSet},
     sync::{Arc, Mutex},
@@ -70,9 +70,9 @@ impl<W: Ord + Clone, T> Rollout<W, T> {
         let retired;
         let mut state = self.state.lock().map_err(|_| Error::Internal)?;
         if state.reserved {
-            return Err(Error::Pending);
+            return Err(Error::Unavailable);
         }
-        state.generation = state.generation.checked_add(1).ok_or(Error::Capacity)?;
+        state.generation = state.generation.checked_add(1).ok_or(Error::Overloaded)?;
         retired = state.value.replace(value);
         state.acknowledged.clear();
         state.committed = false;
@@ -84,7 +84,7 @@ impl<W: Ord + Clone, T> Rollout<W, T> {
 
     /// Return this registered worker's unacknowledged preparation request.
     pub fn pending(&self, worker: &W) -> Result<Option<Proposal<T>>, Error> {
-        let index = self.required.get(worker).ok_or(Error::Stale)?;
+        let index = self.required.get(worker).ok_or(Error::StaleFlight)?;
         let state = self.state.lock().map_err(|_| Error::Internal)?;
         if state.committed || state.acknowledged.contains(index) {
             return Ok(None);
@@ -97,10 +97,10 @@ impl<W: Ord + Clone, T> Rollout<W, T> {
 
     /// Acknowledge preparation only for the active generation and registered ID.
     pub fn ack(&self, worker: W, generation: u64) -> Result<(), Error> {
-        let index = *self.required.get(&worker).ok_or(Error::Stale)?;
+        let index = *self.required.get(&worker).ok_or(Error::StaleFlight)?;
         let mut state = self.state.lock().map_err(|_| Error::Internal)?;
         if state.value.is_none() || state.generation != generation || state.committed {
-            return Err(Error::Stale);
+            return Err(Error::StaleFlight);
         }
         // Store only inert indices. User-owned IDs may run arbitrary destructors,
         // including reentrant queries, when duplicates or rolled-back acks drop.
@@ -112,10 +112,10 @@ impl<W: Ord + Clone, T> Rollout<W, T> {
     pub fn stage(&self, generation: u64) -> Result<Guard<'_, W, T>, Error> {
         let mut state = self.state.lock().map_err(|_| Error::Internal)?;
         if state.value.is_none() || state.generation != generation || state.committed {
-            return Err(Error::Stale);
+            return Err(Error::StaleFlight);
         }
         if state.reserved || state.acknowledged.len() != self.required.len() {
-            return Err(Error::Pending);
+            return Err(Error::Unavailable);
         }
         state.reserved = true;
         Ok(Guard {
@@ -231,5 +231,37 @@ mod tests {
         rollout.ack(worker.clone(), generation).unwrap();
         rollout.stage(generation).unwrap().commit();
         assert!(rollout.committed(generation).unwrap());
+    }
+
+    /// Only current registered acknowledgments permit a cut, including after rollback.
+    #[test]
+    fn exact_worker_ids_stale_ack_supersession_and_rollback() {
+        let rollout = Rollout::new([10, 20]);
+        let one = rollout.propose(Arc::new("one")).unwrap();
+        assert_eq!(rollout.ack(30, one), Err(Error::StaleFlight));
+        rollout.ack(10, one).unwrap();
+        assert!(matches!(rollout.stage(one), Err(Error::Unavailable)));
+        let two = rollout.propose(Arc::new("two")).unwrap();
+        assert_eq!(rollout.ack(20, one), Err(Error::StaleFlight));
+        assert_eq!(rollout.pending(&10).unwrap().unwrap().generation, two);
+        rollout.ack(10, two).unwrap();
+        rollout.ack(10, two).unwrap();
+        assert!(matches!(rollout.stage(two), Err(Error::Unavailable)));
+        rollout.ack(20, two).unwrap();
+        {
+            let _guard = rollout.stage(two).unwrap();
+            assert_eq!(rollout.propose(Arc::new("three")), Err(Error::Unavailable));
+        }
+        assert!(rollout.pending(&10).unwrap().is_some());
+        assert!(matches!(rollout.stage(two), Err(Error::Unavailable)));
+        rollout.ack(10, two).unwrap();
+        rollout.ack(20, two).unwrap();
+        rollout.stage(two).unwrap().commit();
+        assert!(rollout.committed(two).unwrap());
+        assert_eq!(rollout.ack(20, two), Err(Error::StaleFlight));
+        assert!(rollout.pending(&20).unwrap().is_none());
+        let empty = Rollout::<u32, ()>::new([]);
+        let generation = empty.propose(Arc::new(())).unwrap();
+        empty.stage(generation).unwrap().commit();
     }
 }

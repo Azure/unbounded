@@ -1,15 +1,12 @@
-//! Bounded control feeds and atomic immutable publication without domain policy.
+//! Bounded control feeds without domain policy. Publication cells and rollout
+//! barriers live in the racer crate (`control::cell`, `app::rollout`).
 //!
 //! I/O, credentials, and install hooks stay on their owner thread. Only owned
 //! preparation closures and immutable shared generations cross thread boundaries.
 
 pub mod feed;
-pub mod published;
-pub mod rollout;
 
 pub use feed::{Client, Codec, Credentials, FailureClass, Feed, Host, Sync, Target};
-pub use published::{Generation, Published, Retention};
-pub use rollout::Rollout;
 
 /// Mechanism failures that adapters map to their domain error vocabulary.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

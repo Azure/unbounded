@@ -1,13 +1,13 @@
 //! Single-node production graph validation. Only control publication, origin data,
 //! and the worker polling loop are fixtures. No read/storage/crypto success doubles.
 use base64::Engine;
-use controlplane::Published;
 use racer::admission::AdmissionPolicy;
 use racer::admission::ResourceClass;
 use racer::client::RequestParser;
 use racer::client::Responses;
 use racer::config::Limits;
 use racer::control::Snapshot;
+use racer::control::cell::PublicationCell;
 use racer::control::publication::PublicationTarget;
 use racer::error::Error;
 use racer::error::Operation;
@@ -504,7 +504,7 @@ impl Rig {
         let http = Rc::new(racer::http::new_pool(reactor.clone(), admission.clone(), 8));
         let buffers = BufferPool::new(admission.clone());
         let (keys, sender_keys) = fixture_keys();
-        let published = Arc::new(Published::new(Snapshot::retention(4)));
+        let published = Arc::new(PublicationCell::new(Snapshot::retention(4)));
         let availability = Rc::new(racer::control::Availability::new(
             published.clone(),
             keys.clone(),

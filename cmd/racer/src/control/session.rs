@@ -1167,7 +1167,7 @@ pub(super) mod tests {
             BundleInstaller::new(keys),
             Rc::new(PublicationTarget::new(
                 p.cluster,
-                Arc::new(controlplane::Published::new(
+                Arc::new(crate::control::cell::PublicationCell::new(
                     super::super::Snapshot::retention(0),
                 )),
                 crate::test_support::clock(),

@@ -3,6 +3,7 @@ use super::fill::*;
 use crate::client::ClientRequest;
 use crate::client::ReadKind;
 use crate::control::Snapshot;
+use crate::control::cell::PublicationCell;
 use crate::http::Codec;
 use crate::http::Delivery;
 use crate::model::ByteRange;
@@ -18,7 +19,6 @@ use crate::test_support::security::network;
 use crate::test_support::security::node;
 use crate::topology::LinkHealth;
 use crate::topology::Paths;
-use controlplane::Published;
 use racer_control_wire::MembershipVersion;
 
 mod duplex_release {
@@ -721,7 +721,7 @@ pub(super) fn coordinator(
 ) -> (
     Rc<Coordinator>,
     crate::read::dispatch::WorkerEndpoint,
-    Arc<Published<Snapshot>>,
+    Arc<PublicationCell<Snapshot>>,
 ) {
     coordinator_with_window(f, signer, membership, peers, 2)
 }
@@ -736,7 +736,7 @@ pub(super) fn coordinator_with_window(
 ) -> (
     Rc<Coordinator>,
     crate::read::dispatch::WorkerEndpoint,
-    Arc<Published<Snapshot>>,
+    Arc<PublicationCell<Snapshot>>,
 ) {
     let mut deps = f.fill.dependencies.clone();
     deps.candidates = Rc::new(CandidatePolicy::new(
@@ -744,7 +744,9 @@ pub(super) fn coordinator_with_window(
         Rc::new(Placement::new(64)),
         peers.clone(),
         deps.credentials.clone(),
-        Arc::new(controlplane::Published::new(Snapshot::retention(2))),
+        Arc::new(crate::control::cell::PublicationCell::new(
+            Snapshot::retention(2),
+        )),
         crate::test_support::ctx(),
     ));
     f.read_graph(

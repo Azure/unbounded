@@ -1182,7 +1182,7 @@ fn incoming_header_timeout_closes_silent_partial_and_idle_keepalive_peers() {
             Rc::new(
                 PeerNetwork::new(
                     signers[2].node().clone(),
-                    Arc::new(controlplane::Published::new(
+                    Arc::new(crate::control::cell::PublicationCell::new(
                         crate::control::Snapshot::retention(2),
                     )),
                     racer_io::Clock::host(),
@@ -1198,7 +1198,7 @@ fn incoming_header_timeout_closes_silent_partial_and_idle_keepalive_peers() {
             Rc::new(
                 PeerNetwork::new(
                     signers[2].node().clone(),
-                    Arc::new(controlplane::Published::new(
+                    Arc::new(crate::control::cell::PublicationCell::new(
                         crate::control::Snapshot::retention(2),
                     )),
                     racer_io::Clock::host(),
@@ -1568,7 +1568,7 @@ fn outbound_lease_routes_without_registry_and_rejects_non_neighbors() {
     let local = membership.members()[0].node.clone();
     let network = PeerNetwork::new(
         local.clone(),
-        Arc::new(controlplane::Published::new(
+        Arc::new(crate::control::cell::PublicationCell::new(
             crate::control::Snapshot::retention(2),
         )),
         racer_io::Clock::host(),

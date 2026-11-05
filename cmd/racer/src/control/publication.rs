@@ -1,9 +1,10 @@
 //! Racer publication validation and topology projection over generic immutable state.
 
+use super::cell::{Generation, PublicationCell, Retention};
 use super::{CacheTransition, Snapshot};
 use crate::error::{Error, Result};
 use crate::topology::{Member, Membership};
-use controlplane::{Codec, Published, Target};
+use controlplane::{Codec, Target};
 use racer_control_wire::{self as wire, ClusterId, Publication, PublicationSequence};
 use sha2::{Digest, Sha256};
 use std::{cell::RefCell, rc::Rc, sync::Arc, time::Duration};
@@ -43,7 +44,7 @@ impl Codec for PublicationCodec {
 pub struct PublicationTarget {
     cluster: ClusterId,
 
-    pub(crate) published: Arc<Published<Snapshot>>,
+    pub(crate) published: Arc<PublicationCell<Snapshot>>,
 
     lifecycle: RefCell<Option<Rc<crate::app::CachePublication>>>,
     /// Stamps accepted publications.
@@ -54,7 +55,7 @@ impl PublicationTarget {
     /// Bind projection to the node-wide publication authority.
     pub fn new(
         cluster: ClusterId,
-        published: Arc<Published<Snapshot>>,
+        published: Arc<PublicationCell<Snapshot>>,
         clock: racer_io::Clock,
     ) -> Self {
         Self {
@@ -161,9 +162,9 @@ impl Target<PublicationCodec> for PublicationTarget {
 }
 
 impl Snapshot {
-    /// Racer late-request policy; retention accounting belongs entirely to Published.
-    pub fn retention(old_parts: usize) -> controlplane::Retention {
-        controlplane::Retention {
+    /// Racer late-request policy; retention accounting belongs entirely to PublicationCell.
+    pub fn retention(old_parts: usize) -> Retention {
+        Retention {
             old_parts,
             grace_parts: if old_parts >= 2 { old_parts } else { 0 },
             grace_bytes: 128 * 1024 * 1024,
@@ -180,7 +181,7 @@ impl Snapshot {
     }
 }
 
-impl controlplane::Generation for Snapshot {
+impl Generation for Snapshot {
     type Version = PublicationSequence;
 
     type PartVersion = u64;
@@ -227,15 +228,8 @@ fn project(
     let (content, membership) = wire::canonical_content(&publication)?;
     let content_hash: [u8; 32] = Sha256::digest(content).into();
     let membership_hash: [u8; 32] = Sha256::digest(membership).into();
-    if let Some(old) = current
-        && (publication.sequence < old.sequence
-            || publication.membership_version.0 < old.membership.version.0
-            || publication.sequence == old.sequence
-                && (content_hash != old.content_hash
-                    || publication.membership_version != old.membership.version))
-    {
-        return Err(Error::Replay);
-    }
+    // Replay and monotonicity are decided once, by `cell::accept`, when the
+    // projection is published. Here only reuse the accepted topology.
     let membership = if let Some(old) =
         current.filter(|old| old.membership.version == publication.membership_version)
     {

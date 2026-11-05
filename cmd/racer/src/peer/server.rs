@@ -1710,7 +1710,7 @@ mod tests {
                     Rc::new(
                         super::super::PeerNetwork::new(
                             signers[1].node().clone(),
-                            std::sync::Arc::new(controlplane::Published::new(
+                            std::sync::Arc::new(crate::control::cell::PublicationCell::new(
                                 crate::control::Snapshot::retention(2),
                             )),
                             crate::test_support::clock(),
@@ -1726,7 +1726,7 @@ mod tests {
                     Rc::new(
                         super::super::PeerNetwork::new(
                             signers[1].node().clone(),
-                            std::sync::Arc::new(controlplane::Published::new(
+                            std::sync::Arc::new(crate::control::cell::PublicationCell::new(
                                 crate::control::Snapshot::retention(2),
                             )),
                             crate::test_support::clock(),

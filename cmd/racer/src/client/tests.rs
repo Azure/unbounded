@@ -2748,13 +2748,13 @@ fn retirement_waits_for_admission_but_expires_without_capacity() {
 
 #[test]
 fn production_snapshot_replacement_rejects_old_backlog_uid_with_503() {
+    use crate::control::cell::PublicationCell;
     use crate::control::publication::PublicationTarget;
     use crate::control::{Availability, Snapshot};
-    use controlplane::Published;
     use racer_control_wire::{MembershipVersion, Publication, PublicationSequence};
     let mut fixture = Fixture::new();
     let keys = Rc::new(crate::test_support::security::keys());
-    let state = Arc::new(Published::new(Snapshot::retention(2)));
+    let state = Arc::new(PublicationCell::new(Snapshot::retention(2)));
     let snapshots = Rc::new(PublicationTarget::new(
         keys.cluster().clone(),
         state.clone(),

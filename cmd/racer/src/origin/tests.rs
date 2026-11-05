@@ -1,6 +1,7 @@
 use super::*;
 use crate::config::Limits;
 use crate::control::Snapshot;
+use crate::control::cell::PublicationCell;
 use crate::control::publication::PublicationTarget;
 use crate::http::Codec;
 use crate::model::CacheKey;
@@ -10,7 +11,6 @@ use crate::model::StrongEtag;
 use crate::runtime::Reactor;
 use crate::security::Authorization;
 use crate::security::OpaqueMetadata;
-use controlplane::Published;
 use futures::executor::block_on;
 use racer_control_wire::CacheId;
 use racer_control_wire::ClusterId;
@@ -147,7 +147,7 @@ fn client() -> (
         admission.clone(),
         PAGE_BYTES,
     ));
-    let snapshots = Arc::new(Published::new(Snapshot::retention(2)));
+    let snapshots = Arc::new(PublicationCell::new(Snapshot::retention(2)));
     let buffers = BufferPool::new(admission.clone());
     (
         OriginClient::new(
@@ -176,7 +176,7 @@ fn published_client() -> (
         "/control-wire/testdata/publication.json"
     )))
     .unwrap();
-    client.snapshots = Arc::new(Published::new(Snapshot::retention(2)));
+    client.snapshots = Arc::new(PublicationCell::new(Snapshot::retention(2)));
     let target = PublicationTarget::new(
         publication.cluster.clone(),
         client.snapshots.clone(),
@@ -315,7 +315,7 @@ fn real_uds_root_remapping_keeps_public_authority_and_http_validation() {
         Rc::new(Placement::new(2)),
         NoPeers::requester(),
         credentials(admission.clone()),
-        Arc::new(Published::new(Snapshot::retention(2))),
+        Arc::new(PublicationCell::new(Snapshot::retention(2))),
         racer_io::WorkerCtx::host(),
     );
     let scope = scope();
@@ -491,7 +491,7 @@ fn same_name_new_uid_dials_replacement_without_reusing_old_keepalive() {
     )))
     .unwrap();
     publication.sequence.0 = 1;
-    client.snapshots = Arc::new(Published::new(Snapshot::retention(2)));
+    client.snapshots = Arc::new(PublicationCell::new(Snapshot::retention(2)));
     let target = PublicationTarget::new(
         publication.cluster.clone(),
         client.snapshots.clone(),
@@ -994,7 +994,7 @@ fn public_operations_reject_wrong_authority_before_io() {
         Rc::new(Placement::new(2)),
         NoPeers::requester(),
         credentials(client().1),
-        Arc::new(Published::new(Snapshot::retention(2))),
+        Arc::new(PublicationCell::new(Snapshot::retention(2))),
         racer_io::WorkerCtx::host(),
     );
     let context = context();

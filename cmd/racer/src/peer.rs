@@ -230,14 +230,14 @@ impl AdaptivePeers {
 /// Outbound operations route directly from their retained membership lease.
 pub struct PeerNetwork {
     pub local: NodeId,
-    published: Arc<controlplane::Published<crate::control::Snapshot>>,
+    published: Arc<crate::control::cell::PublicationCell<crate::control::Snapshot>>,
     clock: racer_io::Clock,
 }
 
 impl PeerNetwork {
     pub fn new(
         local: NodeId,
-        published: Arc<controlplane::Published<crate::control::Snapshot>>,
+        published: Arc<crate::control::cell::PublicationCell<crate::control::Snapshot>>,
         clock: racer_io::Clock,
     ) -> Result<Self> {
         if local.0.is_empty() {

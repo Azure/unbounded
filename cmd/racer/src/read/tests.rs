@@ -2523,7 +2523,7 @@ mod timeouts {
                     Peers::request_direct,
                 ),
                 credentials,
-                Arc::new(controlplane::Published::new(
+                Arc::new(crate::control::cell::PublicationCell::new(
                     crate::control::Snapshot::retention(2),
                 )),
                 crate::test_support::ctx(),
