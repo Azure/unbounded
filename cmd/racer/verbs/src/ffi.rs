@@ -16,7 +16,10 @@ use std::{
     ffi::{CStr, c_char, c_int, c_void},
     ptr::NonNull,
     rc::{Rc, Weak},
-    sync::Arc,
+    sync::{
+        Arc, Mutex, PoisonError,
+        atomic::{AtomicBool, AtomicUsize, Ordering},
+    },
 };
 
 #[cfg(any(test, feature = "simulation"))]
@@ -880,14 +883,7 @@ impl NativeRegion {
         if length == 0 || u64::try_from(length).is_err() {
             return Err(Error::InvalidRange);
         }
-        // Registration mode has no windows: page buffers need no MW_BIND,
-        // and grants register them for remote write.
-        let bits = match device.mode {
-            Mode::Registration if access.bits() & Access::PAGES.bits() != 0 => {
-                Access::CONTROL.bits() | (access.bits() & Access::REMOTE_WRITE)
-            }
-            _ => access.bits(),
-        };
+        let bits = register_bits(&device, access);
         let raw = NonNull::new(unsafe {
             (device.api.register)(device.raw.as_ptr(), length as u64, bits)
         })
@@ -906,7 +902,9 @@ impl NativeRegion {
 
     /// Register all of `memory`'s dma-buf range as page buffers. `memory`
     /// stays alive until deregister succeeds, or forever if it fails.
-    /// Window mode only.
+    /// Window mode only. The owner registers through [`Registering::dmabuf`]
+    /// instead; tests build device pools with this synchronous form.
+    #[cfg(test)]
     pub(crate) fn dmabuf(
         device: Rc<NativeDevice>,
         memory: DeviceMemory,
@@ -1049,6 +1047,238 @@ impl NativeRegion {
             addr,
             length,
             lkey: self.lkey,
+        }
+    }
+}
+
+/// The native access bits for a region of `access` on `device`.
+fn register_bits(device: &NativeDevice, access: Access) -> u32 {
+    // Registration mode has no windows: page buffers need no MW_BIND, and
+    // grants register them for remote write.
+    match device.mode {
+        Mode::Registration if access.bits() & Access::PAGES.bits() != 0 => {
+            Access::CONTROL.bits() | (access.bits() & Access::REMOTE_WRITE)
+        }
+        _ => access.bits(),
+    }
+}
+
+/// Where a background registration leaves its result.
+struct RegisterSlot {
+    done: AtomicBool,
+
+    /// The native region handle, 0 on failure. Valid once `done`.
+    raw: AtomicUsize,
+}
+
+/// Wakes the owner when a background registration finishes.
+pub(crate) type RegisterWake = Arc<dyn Fn() + Send + Sync>;
+
+/// A region registration running off the owner thread.
+///
+/// Pinning and registering a large buffer (`ibv_reg_mr`, `ibv_reg_dmabuf_mr`)
+/// can block for a long time, so the native call runs on a short-lived
+/// helper thread while the owner keeps serving. Only that one call leaves
+/// the owner thread; the result becomes a [`NativeRegion`] on the owner in
+/// [`Self::finish`]. Under the simulation the call runs inline (the
+/// simulation is single-threaded) and [`crate::Simulation::hold_registrations`]
+/// keeps it pending.
+///
+/// Dropped unfinished, it frees a finished registration, but leaks the
+/// device, the dma-buf owner, and the charge (quarantined) if the helper is
+/// still running, since the helper may still use them.
+pub(crate) struct Registering {
+    device: Option<Rc<NativeDevice>>,
+
+    memory: Option<DeviceMemory>,
+
+    length: usize,
+
+    access: Access,
+
+    quota: Option<Arc<GuardOwner>>,
+
+    slot: Arc<RegisterSlot>,
+}
+
+impl Registering {
+    /// Start allocating and registering `length` bytes with `access`, as
+    /// [`NativeRegion::with_access`] does. `wake` runs once it finishes.
+    pub(crate) fn host(
+        device: Rc<NativeDevice>,
+        length: usize,
+        access: Access,
+        quota: Arc<GuardOwner>,
+        wake: RegisterWake,
+    ) -> Result<Self> {
+        if length == 0 || u64::try_from(length).is_err() {
+            return Err(Error::InvalidRange);
+        }
+        let bits = register_bits(&device, access);
+        let register = device.api.register;
+        let raw = device.raw.as_ptr() as usize;
+        Ok(Self::start(
+            device,
+            None,
+            length,
+            access,
+            quota,
+            wake,
+            move || unsafe { register(raw as *mut c_void, length as u64, bits) } as usize,
+        ))
+    }
+
+    /// Start registering all of `memory`'s dma-buf range, as
+    /// [`NativeRegion::dmabuf`] does. `wake` runs once it finishes.
+    pub(crate) fn dmabuf(
+        device: Rc<NativeDevice>,
+        memory: DeviceMemory,
+        quota: Arc<GuardOwner>,
+        wake: RegisterWake,
+    ) -> Result<Self> {
+        use std::os::fd::AsRawFd;
+
+        let length = memory.length();
+        if length == 0 || u64::try_from(length).is_err() {
+            return Err(Error::InvalidRange);
+        }
+        if device.mode != Mode::Window {
+            return Err(Error::Unavailable);
+        }
+        let register = device.api.register_dmabuf;
+        let raw = device.raw.as_ptr() as usize;
+        let (offset, iova, fd) = (memory.offset(), memory.iova(), memory.fd().as_raw_fd());
+        // `memory` (and so `fd`) lives in the returned value until the
+        // helper is done, or forever if it is dropped first.
+        Ok(Self::start(
+            device,
+            Some(memory),
+            length,
+            Access::DEVICE,
+            quota,
+            wake,
+            move || unsafe { register(raw as *mut c_void, offset, length as u64, iova, fd) }
+                as usize,
+        ))
+    }
+
+    fn start(
+        device: Rc<NativeDevice>,
+        memory: Option<DeviceMemory>,
+        length: usize,
+        access: Access,
+        quota: Arc<GuardOwner>,
+        wake: RegisterWake,
+        call: impl FnOnce() -> usize + Send + 'static,
+    ) -> Self {
+        let slot = Arc::new(RegisterSlot {
+            done: AtomicBool::new(false),
+            raw: AtomicUsize::new(0),
+        });
+        #[cfg(any(test, feature = "simulation"))]
+        let inline = simulation::is_api(&device.api);
+        #[cfg(not(any(test, feature = "simulation")))]
+        let inline = false;
+        let finish = {
+            let slot = slot.clone();
+            move |raw: usize| {
+                slot.raw.store(raw, Ordering::Release);
+                slot.done.store(true, Ordering::Release);
+                wake();
+            }
+        };
+        if inline {
+            finish(call());
+        } else {
+            // A shared slot so a failed spawn can still run the call here.
+            let call = Arc::new(Mutex::new(Some(call)));
+            let spawned = {
+                let call = call.clone();
+                let finish = finish.clone();
+                std::thread::Builder::new()
+                    .name("racer-rdma-register".into())
+                    .spawn(move || {
+                        let call = call.lock().unwrap_or_else(PoisonError::into_inner).take();
+                        if let Some(call) = call {
+                            finish(call());
+                        }
+                    })
+            };
+            if spawned.is_err() {
+                let call = call.lock().unwrap_or_else(PoisonError::into_inner).take();
+                if let Some(call) = call {
+                    finish(call());
+                }
+            }
+        }
+        Self {
+            device: Some(device),
+            memory,
+            length,
+            access,
+            quota: Some(quota),
+            slot,
+        }
+    }
+
+    /// True once [`Self::finish`] has a result.
+    pub(crate) fn ready(&self) -> bool {
+        if !self.slot.done.load(Ordering::Acquire) {
+            return false;
+        }
+        #[cfg(any(test, feature = "simulation"))]
+        if let Some(device) = &self.device
+            && simulation::is_api(&device.api)
+            && simulation::registrations_held(device.raw.as_ptr())
+        {
+            return false;
+        }
+        true
+    }
+
+    /// The registered region. Call once [`Self::ready`].
+    pub(crate) fn finish(mut self) -> Result<Rc<NativeRegion>> {
+        debug_assert!(self.ready());
+        self.take().ok_or(Error::Unavailable)
+    }
+
+    /// Turn a finished registration into its region; `None` if it failed.
+    fn take(&mut self) -> Option<Rc<NativeRegion>> {
+        let raw = NonNull::new(self.slot.raw.swap(0, Ordering::AcqRel) as *mut c_void);
+        let device = self.device.take()?;
+        let memory = self.memory.take();
+        let quota = self.quota.take();
+        let raw = raw?;
+        let lkey = unsafe { (device.api.lkey)(raw.as_ptr()) };
+        Some(Rc::new(NativeRegion {
+            device,
+            raw: Some(raw),
+            lkey,
+            memory,
+            length: self.length,
+            quota,
+            access: self.access,
+        }))
+    }
+}
+
+impl Drop for Registering {
+    fn drop(&mut self) {
+        if self.device.is_none() {
+            return;
+        }
+        if self.slot.done.load(Ordering::Acquire) {
+            // Deregisters (or leaks) through `NativeRegion::drop`.
+            drop(self.take());
+            return;
+        }
+        // The helper may still use the device and the dma-buf: leak them
+        // with the charge, which can then never drain.
+        std::mem::forget(self.device.take());
+        std::mem::forget(self.memory.take());
+        if let Some(quota) = self.quota.take() {
+            quota.quarantine();
+            std::mem::forget(quota);
         }
     }
 }
@@ -3191,5 +3421,117 @@ pub(crate) mod lifetime_tests {
         sender.stop().unwrap();
         let landed = unsafe { std::slice::from_raw_parts(destination.as_ptr(), 4096) };
         assert_eq!(landed, [0xa5; 4096]);
+    }
+
+    /// Wait up to a few seconds for a helper thread to finish.
+    fn settle(registering: &Registering) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !registering.ready() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "helper never finished"
+            );
+            std::thread::yield_now();
+        }
+    }
+
+    #[test]
+    /// A native registration runs on a helper thread, wakes the owner when
+    /// done, and its region deregisters normally.
+    fn registering_runs_off_thread_and_wakes() {
+        let (_qp, region, _charged) = fixture();
+        let (quota, charged) = quota();
+        let wakes = Arc::new(AtomicUsize::new(0));
+        let wake: RegisterWake = {
+            let wakes = wakes.clone();
+            Arc::new(move || {
+                wakes.fetch_add(1, Ordering::AcqRel);
+            })
+        };
+        let owner = std::thread::current().id();
+        let registering = Registering::start(
+            region.device.clone(),
+            None,
+            64,
+            Access::PAGES,
+            quota,
+            wake,
+            move || {
+                assert_ne!(std::thread::current().id(), owner, "ran on the owner");
+                Box::into_raw(Box::new(vec![0u8; 64])) as usize
+            },
+        );
+        settle(&registering);
+        assert_eq!(wakes.load(Ordering::Acquire), 1);
+        let built = registering.finish().unwrap();
+        assert_eq!(built.length(), 64);
+        drop(built);
+        assert_eq!(charged.get(), 0, "charge returned after deregister");
+    }
+
+    #[test]
+    /// A failed registration reports `Unavailable` and returns the charge.
+    fn registering_failure_returns_the_charge() {
+        let (_qp, region, _charged) = fixture();
+        let (quota, charged) = quota();
+        let registering = Registering::start(
+            region.device.clone(),
+            None,
+            64,
+            Access::PAGES,
+            quota,
+            Arc::new(|| {}),
+            || 0,
+        );
+        settle(&registering);
+        assert_eq!(registering.finish().err(), Some(Error::Unavailable));
+        assert_eq!(charged.get(), 0);
+    }
+
+    #[test]
+    /// Dropped while the helper still runs, a registration leaks its device
+    /// and charge (quarantined) instead of freeing what the helper uses; a
+    /// finished but unclaimed one deregisters.
+    fn registering_dropped_mid_flight_leaks() {
+        let (_qp, region, _charged) = fixture();
+        let (charge, charged) = quota();
+        let observed = charge.clone();
+        let (go, wait) = std::sync::mpsc::channel::<()>();
+        let (finished, done) = std::sync::mpsc::channel::<()>();
+        let registering = Registering::start(
+            region.device.clone(),
+            None,
+            64,
+            Access::PAGES,
+            charge,
+            Arc::new(move || {
+                let _ = finished.send(());
+            }),
+            move || {
+                wait.recv().unwrap();
+                0
+            },
+        );
+        assert!(!registering.ready());
+        drop(registering);
+        assert!(observed.quarantined());
+        drop(observed);
+        go.send(()).unwrap();
+        done.recv().unwrap();
+        assert_eq!(charged.get(), 1, "a leaked charge never returns");
+
+        let (quota, charged) = quota();
+        let registering = Registering::start(
+            region.device.clone(),
+            None,
+            64,
+            Access::PAGES,
+            quota,
+            Arc::new(|| {}),
+            || Box::into_raw(Box::new(vec![0u8; 64])) as usize,
+        );
+        settle(&registering);
+        drop(registering);
+        assert_eq!(charged.get(), 0, "an unclaimed region deregisters");
     }
 }

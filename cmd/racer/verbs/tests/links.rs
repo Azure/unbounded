@@ -1147,3 +1147,95 @@ fn registration_mode_requires_huge_page_buffers() {
     node.owner().poll_budgeted(4).unwrap();
     assert!(node.clients[0].drained());
 }
+
+#[test]
+/// Page pool registration runs off the owner loop: while it is pending the
+/// owner keeps answering commands (an early `open` fails `Unavailable`, a
+/// second activation is refused, breaks are accepted), and activation
+/// completes once the registration finishes.
+fn activation_registers_pools_without_blocking_the_owner() {
+    profiles(|| {
+        let sim = Simulation::new();
+        let clock = SimClock::new(7);
+        let mut node = node(&sim, 1, clock.ctx(1));
+        sim.hold_registrations(true);
+        let activation = node.clients[0].activate(config(&node.charge));
+        for _ in 0..4 {
+            node.owner().poll_budgeted(4).unwrap();
+        }
+        assert!(pending(&activation));
+        assert_eq!(node.owner().next_wake(), None, "no timer for a held MR");
+        let early = node.clients[1].open(TO_B);
+        let again = node.clients[1].activate(config(&node.charge));
+        node.clients[1].break_link(TO_B, Epoch(1));
+        node.owner().poll_budgeted(4).unwrap();
+        assert_eq!(ready(&early).err(), Some(Error::Unavailable));
+        assert_eq!(ready(&again).err(), Some(Error::InvalidRequest));
+        assert!(pending(&activation));
+        assert_eq!(node.clients[0].buffers(7, BufferState::Free), None);
+        sim.hold_registrations(false);
+        node.owner().poll_budgeted(4).unwrap();
+        assert_eq!(ready(&activation).unwrap()[0].tag, 7);
+        assert_eq!(node.clients[0].buffers(7, BufferState::Free), Some(BUFFERS));
+        let opened = node.clients[1].open(TO_B);
+        node.owner().poll_budgeted(4).unwrap();
+        assert!(ready(&opened).is_ok());
+    });
+}
+
+#[test]
+/// A close during a pending activation fails it `Unavailable` once the
+/// registration finishes, frees the registered pool, and then drains with
+/// the charge returned.
+fn close_during_registration_waits_and_drains() {
+    profiles(|| {
+        let sim = Simulation::new();
+        let clock = SimClock::new(7);
+        let mut node = node(&sim, 1, clock.ctx(1));
+        sim.hold_registrations(true);
+        let activation = node.clients[0].activate(config(&node.charge));
+        node.owner().poll_budgeted(4).unwrap();
+        node.clients[0].close();
+        for _ in 0..4 {
+            node.owner().poll_budgeted(4).unwrap();
+        }
+        assert!(pending(&activation));
+        assert!(!node.clients[0].drained(), "drain waits for the MR");
+        sim.hold_registrations(false);
+        node.owner().poll_budgeted(4).unwrap();
+        assert_eq!(ready(&activation).err(), Some(Error::Unavailable));
+        node.owner().poll_budgeted(4).unwrap();
+        assert!(node.clients[0].drained());
+        assert_eq!(node.charge.load(Ordering::Acquire), 0);
+        assert_eq!(sim.live_resources(), 0);
+    });
+}
+
+#[test]
+/// A dma-buf device pool registers off the owner loop: grants, writes, and
+/// releases on a live link keep completing while it is pending.
+fn device_attach_does_not_block_live_links() {
+    window_only(|| {
+        let mut w = world();
+        let (ea, eb) = link_up(&mut w);
+        w.sim.hold_registrations(true);
+        let attached = w.a.clients[0].attach_device(7, 0, device_memory());
+        pump(&mut w);
+        assert!(pending(&attached));
+        let duplicate = w.a.clients[1].attach_device(7, 0, device_memory());
+        assert_eq!(wait(&mut w, &duplicate).err(), Some(Error::InvalidRequest));
+        let deadline = w.now() + 5 * SECOND;
+        let granted = w.a.clients[0].grant(TO_B, ea, [1; 16], 3, deadline);
+        let granted = wait(&mut w, &granted).unwrap();
+        let written = w.b.clients[0].write(TO_A, eb, granted.tag, bytes(vec![4, 5, 6]), deadline);
+        assert_eq!(wait(&mut w, &written), Ok(()));
+        assert_eq!(page(ready(&granted.arrival)).bytes(), [4, 5, 6]);
+        assert!(pending(&attached));
+        w.sim.hold_registrations(false);
+        assert_eq!(wait(&mut w, &attached), Ok(2));
+        assert_eq!(
+            w.a.clients[0].device_buffers(7, 0, BufferState::Free),
+            Some(2)
+        );
+    });
+}

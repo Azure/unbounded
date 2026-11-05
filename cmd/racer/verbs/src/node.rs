@@ -25,7 +25,7 @@ use futures::task::AtomicWaker;
 use crate::{
     DeviceMemory, Endpoint, Error, Guard, GuardOwner, PortInfo, Result, Selection,
     channel::{self, Completer, Op, op},
-    ffi::{self, Access, NativeDevice, NativeRegion},
+    ffi::{self, Access, NativeDevice, NativeRegion, RegisterWake, Registering},
     link::{self, Break, Epoch, Granted, Limits, Link, Phase, Role, Source},
     pool::{BufferState, Pool, PoolShared},
 };
@@ -367,7 +367,9 @@ impl Client {
     }
 
     /// Discover ports, run the selector, and register one page pool per
-    /// selected device. Once per round.
+    /// selected device. Once per round. The pool registrations run on a
+    /// helper thread, so the owner keeps serving while they pin memory; the
+    /// op resolves once every pool is registered.
     pub fn activate(&self, config: NodeConfig) -> Op<Vec<Selection>> {
         self.submit(|done| Command::Activate(config, done))
     }
@@ -493,7 +495,8 @@ impl Client {
     /// per GPU, say); each id once per rail per round, after
     /// [`Self::activate`]. Resolves to the number of device buffers. The
     /// memory stays registered until the node drains, and the node holds
-    /// `memory` until then; it is never read or written by the CPU.
+    /// `memory` until then; it is never read or written by the CPU. The
+    /// registration runs on a helper thread; the owner keeps serving.
     pub fn attach_device(&self, rail: u16, id: u32, memory: DeviceMemory) -> Op<usize> {
         self.submit(|done| Command::AttachDevice {
             rail,
@@ -633,6 +636,44 @@ struct Settings {
     max_links: usize,
 }
 
+/// A selected device whose page pool is still registering.
+struct PendingDevice {
+    tag: u16,
+
+    /// `None` once finished into `region`.
+    registering: Option<Registering>,
+
+    region: Option<Result<Rc<NativeRegion>>>,
+
+    implicit: Rc<NativeRegion>,
+
+    device: Rc<NativeDevice>,
+}
+
+/// An activation waiting for its page pool registrations.
+struct Activation {
+    selected: Vec<Selection>,
+
+    devices: Vec<PendingDevice>,
+
+    buffer_len: usize,
+
+    settings: Settings,
+
+    done: Completer<Vec<Selection>>,
+}
+
+/// A device pool registration in flight.
+struct Attaching {
+    rail: u16,
+
+    id: u32,
+
+    registering: Option<Registering>,
+
+    done: Completer<usize>,
+}
+
 /// A link being destroyed.
 struct Dying {
     key: LinkKey,
@@ -677,6 +718,12 @@ pub struct Owner {
 
     settings: Option<Settings>,
 
+    /// An activation whose page pools are registering off this thread.
+    activating: Option<Activation>,
+
+    /// Device pools registering off this thread.
+    attaching: Vec<Attaching>,
+
     backoff: BTreeMap<LinkKey, Backoff>,
 
     next_epoch: u64,
@@ -718,6 +765,8 @@ impl Owner {
             devices: BTreeMap::new(),
             quota: None,
             settings: None,
+            activating: None,
+            attaching: Vec::new(),
             backoff: BTreeMap::new(),
             next_epoch: 1,
             closing: false,
@@ -846,6 +895,7 @@ impl Owner {
             self.retain_links(&keep, now);
         }
 
+        self.advance_registrations();
         self.progress(now);
         self.reap();
 
@@ -866,12 +916,11 @@ impl Owner {
 
         match command {
             Command::Activate(config, done) => {
-                let result = self.activate(config);
-                if result.is_err() {
+                // Completes once the page pools are registered.
+                if self.activate(config, done).is_err() {
                     self.abandon_activation();
+                    self.dirty = true;
                 }
-                self.dirty = true;
-                let _ = done.complete(result);
             }
             Command::Open(key, done) => {
                 // The initiator went away: do not leave the link Connecting.
@@ -903,7 +952,9 @@ impl Owner {
                 memory,
                 done,
             } => {
-                let _ = done.complete(self.attach_device(rail, id, memory));
+                if let Err((error, done)) = self.attach_device(rail, id, memory, done) {
+                    let _ = done.complete(Err(error));
+                }
             }
             Command::Grant {
                 key,
@@ -978,7 +1029,7 @@ impl Owner {
     /// regions are already dropped, so the charge returns unless a native
     /// object leaked against it.
     fn abandon_activation(&mut self) {
-        if self.settings.is_some() || !self.devices.is_empty() {
+        if self.settings.is_some() || !self.devices.is_empty() || self.activating.is_some() {
             return;
         }
 
@@ -991,21 +1042,96 @@ impl Owner {
         }
     }
 
-    /// Register `memory` as `rail`'s device pool `id`.
-    fn attach_device(&mut self, rail: u16, id: u32, memory: DeviceMemory) -> Result<usize> {
+    /// The owner's wake, for registrations finishing off this thread.
+    fn register_wake(&self) -> RegisterWake {
+        let shared = self.shared.clone();
+        Arc::new(move || shared.owner.wake())
+    }
+
+    /// Start registering `memory` as `rail`'s device pool `id`; `done`
+    /// completes once it is registered (see [`Self::advance_registrations`]).
+    #[allow(clippy::type_complexity)]
+    fn attach_device(
+        &mut self,
+        rail: u16,
+        id: u32,
+        memory: DeviceMemory,
+        done: Completer<usize>,
+    ) -> std::result::Result<(), (Error, Completer<usize>)> {
         #[cfg(any(test, feature = "simulation"))]
         let _simulation = self
             .simulation
             .as_ref()
             .map(crate::simulation::Simulation::enter);
-        let quota = self.quota.clone().ok_or(Error::InvalidRequest)?;
-        let state = self.devices.get_mut(&rail).ok_or(Error::InvalidRequest)?;
+        let Some(quota) = self.quota.clone() else {
+            return Err((Error::InvalidRequest, done));
+        };
+        let wake = self.register_wake();
+        let Some(state) = self.devices.get(&rail) else {
+            return Err((Error::InvalidRequest, done));
+        };
 
-        if state.pool.device_shared(id).is_some() {
-            return Err(Error::InvalidRequest);
+        if state.pool.device_shared(id).is_some()
+            || self.attaching.iter().any(|a| a.rail == rail && a.id == id)
+        {
+            return Err((Error::InvalidRequest, done));
         }
 
-        let region = NativeRegion::dmabuf(state.device.clone(), memory, quota)?;
+        match Registering::dmabuf(state.device.clone(), memory, quota, wake) {
+            Ok(registering) => {
+                self.attaching.push(Attaching {
+                    rail,
+                    id,
+                    registering: Some(registering),
+                    done,
+                });
+                Ok(())
+            }
+            Err(error) => Err((error, done)),
+        }
+    }
+
+    /// Finish registrations that completed off this thread: build the
+    /// activation's pools once all of them are in, and attach device pools.
+    fn advance_registrations(&mut self) {
+        if self.activating.is_none() && self.attaching.is_empty() {
+            return;
+        }
+
+        #[cfg(any(test, feature = "simulation"))]
+        let _simulation = self
+            .simulation
+            .as_ref()
+            .map(crate::simulation::Simulation::enter);
+        self.advance_activation();
+
+        let mut index = 0;
+
+        while index < self.attaching.len() {
+            if !self.attaching[index]
+                .registering
+                .as_ref()
+                .is_some_and(Registering::ready)
+            {
+                index += 1;
+                continue;
+            }
+
+            let mut attaching = self.attaching.swap_remove(index);
+            let region = attaching.registering.take().expect("ready").finish();
+            let result =
+                region.and_then(|region| self.attach_region(attaching.rail, attaching.id, region));
+            let _ = attaching.done.complete(result);
+        }
+    }
+
+    /// Attach a registered dma-buf region as `rail`'s device pool `id`.
+    fn attach_region(&mut self, rail: u16, id: u32, region: Rc<NativeRegion>) -> Result<usize> {
+        if self.closing {
+            return Err(Error::Unavailable);
+        }
+
+        let state = self.devices.get_mut(&rail).ok_or(Error::Unavailable)?;
         state.pool.attach_device(id, region)?;
         // The driver waker reaches the device pool on its next registration.
         let shared = state.pool.device_shared(id).expect("just attached").clone();
@@ -1018,8 +1144,120 @@ impl Owner {
         Ok(count)
     }
 
-    fn activate(&mut self, config: NodeConfig) -> Result<Vec<Selection>> {
-        if self.settings.is_some() || !self.devices.is_empty() {
+    /// Complete the activation once every page pool registration is done.
+    fn advance_activation(&mut self) {
+        let Some(activation) = &mut self.activating else {
+            return;
+        };
+        let mut pending = false;
+
+        for device in &mut activation.devices {
+            match device.registering.as_ref().map(Registering::ready) {
+                Some(true) => {
+                    device.region = Some(device.registering.take().expect("ready").finish());
+                }
+                Some(false) => pending = true,
+                None => {}
+            }
+        }
+
+        if pending {
+            return;
+        }
+
+        let activation = self.activating.take().expect("checked");
+        let result = self.install(
+            activation.devices,
+            activation.buffer_len,
+            activation.settings,
+        );
+        self.dirty = true;
+
+        match result {
+            Ok(()) => {
+                let _ = activation.done.complete(Ok(activation.selected));
+            }
+            Err(error) => {
+                self.abandon_activation();
+                let _ = activation.done.complete(Err(error));
+            }
+        }
+    }
+
+    /// Build the pools of a fully registered activation and serve them.
+    fn install(
+        &mut self,
+        devices: Vec<PendingDevice>,
+        buffer_len: usize,
+        settings: Settings,
+    ) -> Result<()> {
+        if self.closing {
+            return Err(Error::Unavailable);
+        }
+
+        let quota = self.quota.clone().ok_or(Error::Unavailable)?;
+        let mut built = BTreeMap::new();
+
+        for pending in devices {
+            let region = pending.region.ok_or(Error::Unavailable)??;
+            let pool = Pool::new(region, pending.implicit, buffer_len, quota.clone())?;
+            built.insert(
+                pending.tag,
+                DeviceState {
+                    pool,
+                    device: pending.device,
+                },
+            );
+        }
+
+        {
+            let mut pools = self
+                .shared
+                .pools
+                .write()
+                .unwrap_or_else(PoisonError::into_inner);
+            pools.clear();
+            pools.extend(
+                built
+                    .iter()
+                    .map(|(rail, d)| (*rail, d.pool.shared().clone())),
+            );
+        }
+
+        self.devices = built;
+        self.settings = Some(settings);
+        Ok(())
+    }
+
+    /// Discover, select, and start registering one page pool per selected
+    /// device off this thread. `done` completes once they are registered
+    /// (see [`Self::advance_activation`]); on an early error it completes
+    /// here and the error is returned.
+    fn activate(&mut self, config: NodeConfig, done: Completer<Vec<Selection>>) -> Result<()> {
+        match self.start_activation(config) {
+            Ok((selected, devices, buffer_len, settings)) => {
+                self.activating = Some(Activation {
+                    selected,
+                    devices,
+                    buffer_len,
+                    settings,
+                    done,
+                });
+                Ok(())
+            }
+            Err(error) => {
+                let _ = done.complete(Err(error));
+                Err(error)
+            }
+        }
+    }
+
+    #[allow(clippy::type_complexity)]
+    fn start_activation(
+        &mut self,
+        config: NodeConfig,
+    ) -> Result<(Vec<Selection>, Vec<PendingDevice>, usize, Settings)> {
+        if self.settings.is_some() || !self.devices.is_empty() || self.activating.is_some() {
             return Err(Error::InvalidRequest);
         }
 
@@ -1073,7 +1311,7 @@ impl Owner {
 
         let mut devices: Vec<Option<NativeDevice>> = discovered.into_iter().map(Some).collect();
         let count = config.pool_bytes / config.buffer_len;
-        let mut built = BTreeMap::new();
+        let mut pending = Vec::new();
 
         for selection in &selected {
             let device = Rc::new(
@@ -1093,40 +1331,37 @@ impl Owner {
             // fails before the receive pool is allocated and registered.
             let implicit =
                 NativeRegion::implicit(device.clone(), quota.clone()).ok_or(Error::Unavailable)?;
-            let region = NativeRegion::with_access(
-                device.clone(),
+            pending.push(PendingDevice {
+                tag: selection.tag as u16,
+                registering: None,
+                region: None,
+                implicit,
+                device,
+            });
+        }
+
+        // Every check passed: start the slow registrations.
+        let wake = self.register_wake();
+
+        for device in &mut pending {
+            device.registering = Some(Registering::host(
+                device.device.clone(),
                 count * config.buffer_len,
                 Access::PAGES,
                 quota.clone(),
-            )?;
-            let pool = Pool::new(region, implicit, config.buffer_len, quota.clone())?;
-            built.insert(selection.tag as u16, DeviceState { pool, device });
+                wake.clone(),
+            )?);
         }
 
-        {
-            let mut pools = self
-                .shared
-                .pools
-                .write()
-                .unwrap_or_else(PoisonError::into_inner);
-            pools.clear();
-            pools.extend(
-                built
-                    .iter()
-                    .map(|(rail, d)| (*rail, d.pool.shared().clone())),
-            );
-        }
-
-        self.devices = built;
-        self.settings = Some(Settings {
+        let settings = Settings {
             limits: Limits {
                 grants: config.grants_per_link,
                 buffer_len,
                 idle: config.idle,
             },
             max_links: config.max_links,
-        });
-        Ok(selected)
+        };
+        Ok((selected, pending, config.buffer_len, settings))
     }
 
     /// A new link on `key.rail`, if the rail exists and has room.
@@ -1410,6 +1645,8 @@ impl Owner {
     /// Free pools and devices once nothing uses them, then mark drained.
     fn finish_shutdown(&mut self) {
         if self.shared.drained.load(Ordering::Acquire)
+            || self.activating.is_some()
+            || !self.attaching.is_empty()
             || !self.links.is_empty()
             || !self.dying.is_empty()
         {

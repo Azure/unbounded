@@ -316,6 +316,9 @@ struct World {
     /// Devices report no implicit on-demand paging.
     no_implicit_odp: bool,
 
+    /// Finished background registrations stay pending.
+    hold_registrations: bool,
+
     /// Registration-profile maximum message size, if not the default.
     max_message: Option<u32>,
 
@@ -701,6 +704,13 @@ impl Simulation {
         self.world.borrow_mut().no_implicit_odp = !enabled;
     }
 
+    /// While `held`, finished background region registrations (page pools
+    /// and dma-buf device pools) stay pending, as a slow `ibv_reg_mr` would.
+    /// The owner keeps serving meanwhile.
+    pub fn hold_registrations(&self, held: bool) {
+        self.world.borrow_mut().hold_registrations = held;
+    }
+
     /// Set the maximum message size registration-profile devices report.
     /// Below 8 MiB such a device is unusable.
     pub fn max_message(&self, bytes: u32) {
@@ -817,6 +827,11 @@ struct Handle {
     sim: Simulation,
 
     id: u32,
+}
+
+/// True while [`Simulation::hold_registrations`] holds `device`'s world.
+pub(crate) fn registrations_held(device: *mut c_void) -> bool {
+    unsafe { handle(device) }.is_some_and(|h| h.sim.world.borrow().hold_registrations)
 }
 
 /// Return no handle for null. The caller keeps any non-null handle alive.
