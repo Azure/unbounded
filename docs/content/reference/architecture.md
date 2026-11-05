@@ -40,9 +40,11 @@ service host to a public FQDN.
 
 **Configuration:** ConfigMap mounted at `/etc/machina/config.yaml`
 (`metricsAddr`, `probeAddr`, `enableLeaderElection`, `maxConcurrentReconciles`,
-`provisioningTimeout`). The Go code defaults `maxConcurrentReconciles` to 10,
+`provisioningTimeout`, `experimentalContainerIsolation`). The Go code defaults `maxConcurrentReconciles` to 10,
 but the shipped ConfigMap (rendered from `deploy/machina/03-config.yaml.tmpl`) sets it to 50.
-`provisioningTimeout` defaults to 5 minutes.
+`provisioningTimeout` defaults to 5 minutes. `experimentalContainerIsolation`
+(default false) enables the experimental `container` isolation mode; see
+[Isolation modes]({{< relref "reference/agent/isolation" >}}).
 
 ### metalman -- Bare Metal PXE Controller
 

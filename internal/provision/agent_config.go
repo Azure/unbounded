@@ -26,6 +26,7 @@ type (
 	RuncConfig              = config.RuncConfig
 	CNIConfig               = config.CNIConfig
 	AgentOfflineArtifacts   = config.AgentOfflineArtifacts
+	ExperimentalConfig      = config.ExperimentalConfig
 )
 
 // UnboundedAgentConfig extends the shared AgentConfig with unbounded-specific
@@ -127,6 +128,12 @@ type BuildAgentConfigParams struct {
 	// NodeName overrides the Kubernetes Node name used by kubelet. When empty,
 	// the agent resolves the node name from the host hostname.
 	NodeName string
+
+	// ExperimentalContainerIsolation opts the agent in to the experimental
+	// container isolation mode (Experimental.ContainerIsolation). It is set
+	// for every Machine the caller provisions, not only for one that declares
+	// container, so a node can later be changed to that mode at a repave.
+	ExperimentalContainerIsolation bool
 }
 
 // BuildAgentConfig constructs an AgentConfig from a Machine and cluster-level
@@ -218,6 +225,10 @@ func BuildAgentConfig(params BuildAgentConfigParams) UnboundedAgentConfig {
 
 	if params.AttestURL != "" {
 		cfg.Attest = &AgentAttestConfig{URL: params.AttestURL}
+	}
+
+	if params.ExperimentalContainerIsolation {
+		cfg.Experimental = &ExperimentalConfig{ContainerIsolation: true}
 	}
 
 	return cfg

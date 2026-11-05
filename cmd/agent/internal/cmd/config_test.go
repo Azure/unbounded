@@ -372,6 +372,7 @@ func TestConfigOverrides_Isolation(t *testing.T) {
 		name    string
 		file    string
 		flag    string
+		optIn   bool
 		want    string
 		wantErr string
 	}{
@@ -380,7 +381,8 @@ func TestConfigOverrides_Isolation(t *testing.T) {
 		{name: "flag sets the mode when the file has none", flag: "none", want: "none"},
 		{name: "flag overrides the file", file: "nspawn", flag: "none", want: "none"},
 		{name: "flag nspawn overrides a non-default file value", file: "none", flag: "nspawn", want: "nspawn"},
-		{name: "a mode this agent cannot run is refused", flag: "container", wantErr: "invalid --isolation"},
+		{name: "an experimental mode is refused without the opt-in", flag: "container", wantErr: "Experimental.ContainerIsolation"},
+		{name: "an experimental mode is accepted with the opt-in", file: "nspawn", flag: "container", optIn: true, want: "container"},
 		{name: "invalid flag value", flag: "docker", wantErr: "invalid --isolation"},
 	}
 
@@ -388,6 +390,11 @@ func TestConfigOverrides_Isolation(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			cfg := sampleConfig()
 			cfg.Isolation = tt.file
+
+			if tt.optIn {
+				cfg.Experimental = &provision.ExperimentalConfig{ContainerIsolation: true}
+			}
+
 			t.Setenv(configFileEnv, writeConfigFile(t, cfg))
 
 			got, err := loadConfigWith(testLogger(), configOverrides{Isolation: tt.flag})
@@ -432,7 +439,7 @@ func TestIsolationFlagOnStartAndPreflight(t *testing.T) {
 		flag := cmd.Flags().Lookup("isolation")
 		require.NotNil(t, flag, "%s must take --isolation", name)
 		assert.Empty(t, flag.DefValue, "unset by default so the config file decides")
-		assert.Contains(t, flag.Usage, "nspawn or none")
+		assert.Contains(t, flag.Usage, "nspawn, none or container")
 	}
 
 	for name, cmd := range map[string]*cobra.Command{"daemon": newCmdDaemon(ctx), "reset": newCmdReset(ctx)} {

@@ -420,3 +420,33 @@ func TestBuildAgentConfig_Isolation(t *testing.T) {
 	// The value is passed through; the agent decides whether it can run it.
 	require.Equal(t, "none", build(v1alpha3.IsolationMode("none")).Isolation)
 }
+
+func TestBuildAgentConfig_ExperimentalContainerIsolation(t *testing.T) {
+	t.Parallel()
+
+	build := func(mode v1alpha3.IsolationMode, enabled bool) UnboundedAgentConfig {
+		return BuildAgentConfig(BuildAgentConfigParams{
+			Machine: &v1alpha3.Machine{
+				ObjectMeta: metav1.ObjectMeta{Name: "m"},
+				Spec:       v1alpha3.MachineSpec{Isolation: mode},
+			},
+			Cluster:                        ClusterEndpoint{APIServer: "api:443", ClusterDNS: "10.0.0.10", KubeVersion: "v1.34.0"},
+			ExperimentalContainerIsolation: enabled,
+		})
+	}
+
+	// Off emits nothing, so existing output is unchanged.
+	off := build(v1alpha3.IsolationContainer, false)
+	require.Nil(t, off.Experimental)
+	require.Equal(t, "container", off.Isolation, "the agent refuses it without the opt-in")
+
+	data, err := json.Marshal(off)
+	require.NoError(t, err)
+	require.NotContains(t, string(data), "Experimental")
+
+	// On opts in every Machine, so a node can change to container later.
+	for _, mode := range []v1alpha3.IsolationMode{"", v1alpha3.IsolationNSpawn, v1alpha3.IsolationContainer} {
+		cfg := build(mode, true)
+		require.True(t, cfg.ContainerIsolationEnabled(), mode)
+	}
+}

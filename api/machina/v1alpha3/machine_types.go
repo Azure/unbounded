@@ -154,7 +154,9 @@ type MachineSpec struct {
 	// already uses. Setting it does not move a running node: the node changes
 	// to this mode at its next repave, which the agent performs when the Node
 	// is deleted. The enum lists only the modes this release can run.
-	// +kubebuilder:validation:Enum="";nspawn;none
+	// container is experimental: machina provisions it, and the agent runs
+	// it, only when explicitly enabled (see the isolation reference docs).
+	// +kubebuilder:validation:Enum="";nspawn;none;container
 	// +optional
 	Isolation IsolationMode `json:"isolation,omitempty"`
 
@@ -590,6 +592,9 @@ const (
 	IsolationNSpawn IsolationMode = "nspawn"
 	// IsolationNone runs the node stack directly on the host.
 	IsolationNone IsolationMode = "none"
+	// IsolationContainer runs the node stack in a privileged OCI container.
+	// It is experimental and must be enabled explicitly.
+	IsolationContainer IsolationMode = "container"
 )
 
 // IsolationChangePhase is how far a mode change got.
@@ -630,6 +635,9 @@ const (
 	// IsolationChangeReasonReprovisionNotAllowed means the change needs a
 	// reprovision and the Machine does not carry AnnotationAllowReprovision.
 	IsolationChangeReasonReprovisionNotAllowed = "ReprovisionNotAllowed"
+	// IsolationChangeReasonExperimentalNotEnabled means the target mode is
+	// experimental and the agent's configuration does not opt in to it.
+	IsolationChangeReasonExperimentalNotEnabled = "ExperimentalNotEnabled"
 )
 
 // IsolationChangeMessageMaxLength is the longest IsolationChangeStatus.Message
@@ -862,7 +870,7 @@ type MachineStatus struct {
 	// Isolation is the isolation mode the agent reports as applied on the
 	// host. Empty means the agent has not reported one. It is compared with
 	// spec.isolation to report drift. Only the agent writes it.
-	// +kubebuilder:validation:Enum="";nspawn;none
+	// +kubebuilder:validation:Enum="";nspawn;none;container
 	// +optional
 	Isolation IsolationMode `json:"isolation,omitempty"`
 

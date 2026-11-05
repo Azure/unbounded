@@ -41,7 +41,8 @@ func addIsolationFlag(cmd *cobra.Command) *configOverrides {
 	ov := &configOverrides{}
 
 	cmd.Flags().StringVar(&ov.Isolation, "isolation", "",
-		"Isolation mode for the node stack: nspawn or none (overrides the config file; default nspawn)")
+		"Isolation mode for the node stack: nspawn, none or container (overrides the config file; default nspawn). "+
+			"container is experimental and needs Experimental.ContainerIsolation in the config file")
 
 	return ov
 }
@@ -54,6 +55,10 @@ func (o configOverrides) apply(cfg *provision.UnboundedAgentConfig) error {
 
 	mode, err := isolation.ParseMode(o.Isolation)
 	if err != nil {
+		return fmt.Errorf("invalid --isolation: %w", err)
+	}
+
+	if err := cfg.CheckModeEnabled(mode); err != nil {
 		return fmt.Errorf("invalid --isolation: %w", err)
 	}
 

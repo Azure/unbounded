@@ -312,7 +312,7 @@ func TestConfiguredMode(t *testing.T) {
 
 	// A mode this agent has no table entry for is refused, and so is the
 	// bootstrap plan for it.
-	for _, value := range []string{"container", "microvm"} {
+	for _, value := range []string{"microvm"} {
 		cfg := &provision.UnboundedAgentConfig{AgentConfig: provision.AgentConfig{Isolation: value}}
 
 		_, err = configuredMode(cfg)
@@ -321,6 +321,21 @@ func TestConfiguredMode(t *testing.T) {
 		_, err = (&agentStages{cfg: cfg}).plan()
 		require.Error(t, err, value)
 	}
+
+	// The experimental container mode runs only with the opt-in.
+	container := &provision.UnboundedAgentConfig{AgentConfig: provision.AgentConfig{Isolation: "container"}}
+
+	_, err = configuredMode(container)
+	require.ErrorContains(t, err, "experimental")
+
+	_, err = (&agentStages{cfg: container}).plan()
+	require.ErrorContains(t, err, "experimental")
+
+	container.Experimental = &provision.ExperimentalConfig{ContainerIsolation: true}
+
+	mode, err = configuredMode(container)
+	require.NoError(t, err)
+	require.Equal(t, isolation.ModeContainer, mode)
 }
 
 func TestRecordAttestation(t *testing.T) {
