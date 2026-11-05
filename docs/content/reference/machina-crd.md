@@ -31,7 +31,7 @@ This document describes the custom resource definitions shipped with machina: **
 
 | Property | Type | Required | Description |
 |----------|------|----------|-------------|
-| `spec.isolation` | string | No | Where the node stack (containerd, kubelet, CNI, CoreDNS) runs on the host. `nspawn` or `none`. Empty declares nothing: a node keeps the mode it runs, and a new node uses `nspawn`. Passed to the agent config as `Isolation`. The agent never writes this field on an existing Machine; it sets it only when it creates the Machine at self-registration. |
+| `spec.isolation` | string | No | Where the node stack (containerd, kubelet, CNI, CoreDNS) runs on the host. `nspawn`, `none`, or `container` (experimental; machina provisions it only with `experimentalContainerIsolation`). Empty declares nothing: a node keeps the mode it runs, and a new node uses `nspawn`. Passed to the agent config as `Isolation`. The agent never writes this field on an existing Machine; it sets it only when it creates the Machine at self-registration. |
 
 A change takes effect at the node's next repave. A change that needs a
 reprovision also needs the annotation `unbounded-cloud.io/allow-reprovision:
@@ -278,7 +278,7 @@ after a controller restart. Each entry includes:
 | `bootstrap.nodeName` | string | Kubernetes Node name the bootstrap token was issued for. Metalman approves the kubelet CSR only for this name. During a virtual-media `HostReplace` it is the name captured when the replacement started. |
 | `bootstrap.issuedAt` | time | When that bootstrap token was issued. |
 | `isolation` | string | The isolation mode the agent reports as applied on the host. Written by the agent daemon at startup. Empty until the agent reports one. Compared with `spec.isolation` to set the `IsolationDrift` condition. |
-| `isolationChange` | object | The agent's last attempt to change the node to the mode in `spec.isolation`, made during a repave. Fields: `targetMode`, `phase` (`InProgress`, `Succeeded`, or `Failed`), `strategy` (`InPlace` or `Reprovision`), `reason` (for a refused change: `UnsupportedMode` or `ReprovisionNotAllowed`), `message` (at most 4096 bytes), and `lastTransitionTime`. |
+| `isolationChange` | object | The agent's last attempt to change the node to the mode in `spec.isolation`, made during a repave. Fields: `targetMode`, `phase` (`InProgress`, `Succeeded`, or `Failed`), `strategy` (`InPlace` or `Reprovision`), `reason` (for a refused change: `UnsupportedMode`, `ExperimentalNotEnabled`, or `ReprovisionNotAllowed`), `message` (at most 4096 bytes), and `lastTransitionTime`. |
 | `conditions` | []Condition | Standard Kubernetes conditions (see below). |
 
 ### Conditions
