@@ -23,6 +23,10 @@ const (
 
 // +kubebuilder:validation:XValidation:rule="duration(self.backendActiveDeadline) > duration('0s')",message="backendActiveDeadline must be positive"
 // +kubebuilder:validation:XValidation:rule="self.backend != 'MPIJob' || (has(self.gpuCount) && self.gpuCount > 0)",message="MPIJob checks require a positive gpuCount"
+// +kubebuilder:validation:XValidation:rule="!has(self.minDuration) || duration(self.minDuration) > duration('0s')",message="minDuration must be positive"
+// +kubebuilder:validation:XValidation:rule="!has(self.minDuration) || duration(self.minDuration) <= duration(self.backendActiveDeadline)",message="minDuration must not exceed backendActiveDeadline"
+// +kubebuilder:validation:XValidation:rule="!has(self.continuity) || !has(self.continuity.maxSampleGap) || duration(self.continuity.maxSampleGap) <= duration(self.backendActiveDeadline)",message="maxSampleGap must not exceed backendActiveDeadline"
+// +kubebuilder:validation:XValidation:rule="!has(self.minDuration) || !has(self.continuity) || !has(self.continuity.maxSampleGap) || duration(self.continuity.maxSampleGap) <= duration(self.minDuration)",message="maxSampleGap must not exceed minDuration"
 type CertificationCheck struct {
 	// ID and Order are derived from the check's position and are never serialized.
 	ID    CheckID `json:"-"`
@@ -36,6 +40,11 @@ type CertificationCheck struct {
 	// +kubebuilder:validation:Minimum=0
 	GPUCount              int32           `json:"gpuCount,omitempty"`
 	BackendActiveDeadline metav1.Duration `json:"backendActiveDeadline"`
+	// MinDuration is the minimum uninterrupted observed execution duration
+	// required for this check to pass.
+	MinDuration *metav1.Duration `json:"minDuration,omitempty"`
+	// Continuity declares the evidence required to prove uninterrupted execution.
+	Continuity *ContinuityPolicy `json:"continuity,omitempty"`
 }
 
 // +kubebuilder:validation:Enum=Pod;MPIJob
@@ -45,6 +54,16 @@ const (
 	ExecutionBackendPod    ExecutionBackend = "Pod"
 	ExecutionBackendMPIJob ExecutionBackend = "MPIJob"
 )
+
+type ContinuityPolicy struct {
+	// MaxSampleGap is the maximum permitted gap between consecutive evidence samples.
+	// +kubebuilder:validation:XValidation:rule="duration(self) > duration('0s')",message="maxSampleGap must be positive"
+	MaxSampleGap *metav1.Duration `json:"maxSampleGap,omitempty"`
+	// RequireSameBootID rejects evidence spanning a participant reboot.
+	RequireSameBootID bool `json:"requireSameBootID,omitempty"`
+	// RequirePerDeviceCoverage requires evidence for every device in the starting inventory.
+	RequirePerDeviceCoverage bool `json:"requirePerDeviceCoverage,omitempty"`
+}
 
 // +kubebuilder:validation:XValidation:rule="self.mountPath.startsWith('/') && !self.mountPath.contains('//') && !self.mountPath.contains('/./') && !self.mountPath.contains('/../') && !self.mountPath.endsWith('/.') && !self.mountPath.endsWith('/..')",message="mountPath must be a clean absolute path"
 // +kubebuilder:validation:XValidation:rule="self.mountPath != '/scripts' && self.mountPath != '/results'",message="mountPath must not replace a reserved Project Signal mount"

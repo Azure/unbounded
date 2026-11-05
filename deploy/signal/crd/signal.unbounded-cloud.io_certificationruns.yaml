@@ -69,10 +69,30 @@ spec:
                       type: string
                     backendActiveDeadline:
                       type: string
+                    continuity:
+                      properties:
+                        maxSampleGap:
+                          description: MaxSampleGap is the maximum permitted gap between
+                            consecutive evidence samples.
+                          type: string
+                          x-kubernetes-validations:
+                          - message: maxSampleGap must be positive
+                            rule: duration(self) > duration('0s')
+                        requirePerDeviceCoverage:
+                          description: RequirePerDeviceCoverage requires evidence
+                            for every device in the starting inventory.
+                          type: boolean
+                        requireSameBootID:
+                          description: RequireSameBootID rejects evidence spanning
+                            a participant reboot.
+                          type: boolean
+                      type: object
                     gpuCount:
                       format: int32
                       minimum: 0
                       type: integer
+                    minDuration:
+                      type: string
                     runnerImage:
                       pattern: ^[^@\s]+@sha256:[0-9a-f]{64}$
                       type: string
@@ -211,6 +231,18 @@ spec:
                   - message: MPIJob checks require a positive gpuCount
                     rule: self.backend != 'MPIJob' || (has(self.gpuCount) && self.gpuCount
                       > 0)
+                  - message: minDuration must be positive
+                    rule: '!has(self.minDuration) || duration(self.minDuration) >
+                      duration(''0s'')'
+                  - message: minDuration must not exceed backendActiveDeadline
+                    rule: '!has(self.minDuration) || duration(self.minDuration) <=
+                      duration(self.backendActiveDeadline)'
+                  - message: maxSampleGap must not exceed backendActiveDeadline
+                    rule: '!has(self.continuity) || !has(self.continuity.maxSampleGap)
+                      || duration(self.continuity.maxSampleGap) <= duration(self.backendActiveDeadline)'
+                  - message: maxSampleGap must not exceed minDuration
+                    rule: '!has(self.minDuration) || !has(self.continuity) || !has(self.continuity.maxSampleGap)
+                      || duration(self.continuity.maxSampleGap) <= duration(self.minDuration)'
                 maxItems: 256
                 minItems: 1
                 type: array
@@ -239,6 +271,30 @@ spec:
                 maxItems: 8
                 minItems: 1
                 type: array
+              planDigest:
+                description: |-
+                  PlanDigest is the canonical digest of all execution-affecting inputs.
+                  It is optional only for backward decoding of Runs created before this contract.
+                pattern: ^sha256:[0-9a-f]{64}$
+                type: string
+              planProvenance:
+                description: PlanProvenance pins shared execution inputs not carried
+                  by individual checks.
+                properties:
+                  adapterImage:
+                    description: AdapterImage is the immutable adapter image included
+                      in the execution plan.
+                    pattern: ^[^@\s]+@sha256:[0-9a-f]{64}$
+                    type: string
+                  workflowTemplateDigest:
+                    description: WorkflowTemplateDigest identifies the rendered workflow/template
+                      semantics.
+                    pattern: ^sha256:[0-9a-f]{64}$
+                    type: string
+                required:
+                - adapterImage
+                - workflowTemplateDigest
+                type: object
               profile:
                 properties:
                   generation:
@@ -330,6 +386,12 @@ spec:
               rule: self.scriptBundle == oldSelf.scriptBundle
             - message: checks are immutable
               rule: self.checks == oldSelf.checks
+            - message: planDigest is immutable
+              rule: has(self.planDigest) == has(oldSelf.planDigest) && (!has(self.planDigest)
+                || self.planDigest == oldSelf.planDigest)
+            - message: planProvenance is immutable
+              rule: has(self.planProvenance) == has(oldSelf.planProvenance) && (!has(self.planProvenance)
+                || self.planProvenance == oldSelf.planProvenance)
             - message: participants must use unique nodeName values
               rule: self.participants.all(x, self.participants.filter(y, y.nodeName
                 == x.nodeName).size() == 1)
@@ -430,7 +492,188 @@ spec:
                       of the evidence bytes.
                     pattern: ^sha256:[0-9a-f]{64}$
                     type: string
+                  identity:
+                    description: |-
+                      Identity contains bounded qualification inputs. Large measurements remain
+                      in the durable evidence document addressed by URI and Digest.
+                    properties:
+                      checks:
+                        items:
+                          properties:
+                            completed:
+                              type: boolean
+                            finishedAt:
+                              format: date-time
+                              type: string
+                            maxSampleGap:
+                              type: string
+                              x-kubernetes-validations:
+                              - message: maxSampleGap must not be negative
+                                rule: duration(self) >= duration('0s')
+                            observedDuration:
+                              type: string
+                              x-kubernetes-validations:
+                              - message: observedDuration must not be negative
+                                rule: duration(self) >= duration('0s')
+                            order:
+                              format: int32
+                              maximum: 255
+                              minimum: 0
+                              type: integer
+                            perDeviceCoverage:
+                              type: boolean
+                            sameBootID:
+                              type: boolean
+                            startedAt:
+                              format: date-time
+                              type: string
+                          required:
+                          - completed
+                          - finishedAt
+                          - observedDuration
+                          - order
+                          - startedAt
+                          type: object
+                        maxItems: 256
+                        minItems: 1
+                        type: array
+                        x-kubernetes-list-type: atomic
+                      participants:
+                        items:
+                          properties:
+                            end:
+                              properties:
+                                bootID:
+                                  maxLength: 128
+                                  type: string
+                                driverVersion:
+                                  maxLength: 128
+                                  type: string
+                                gpuInventoryDigest:
+                                  pattern: ^sha256:[0-9a-f]{64}$
+                                  type: string
+                                kernelVersion:
+                                  maxLength: 256
+                                  type: string
+                                kubeletVersion:
+                                  maxLength: 128
+                                  type: string
+                                nodeUID:
+                                  description: |-
+                                    UID is a type that holds unique ID values, including UUIDs.  Because we
+                                    don't ONLY use UUIDs, this is an alias to string.  Being a type captures
+                                    intent and helps make sure that UIDs and names do not get conflated.
+                                  type: string
+                                osImage:
+                                  maxLength: 256
+                                  type: string
+                                systemUUID:
+                                  maxLength: 128
+                                  type: string
+                              required:
+                              - nodeUID
+                              type: object
+                              x-kubernetes-validations:
+                              - message: nodeUID is required
+                                rule: size(self.nodeUID) > 0
+                            index:
+                              format: int32
+                              maximum: 7
+                              minimum: 0
+                              type: integer
+                            role:
+                              enum:
+                              - Requester
+                              - Participant
+                              type: string
+                            start:
+                              properties:
+                                bootID:
+                                  maxLength: 128
+                                  type: string
+                                driverVersion:
+                                  maxLength: 128
+                                  type: string
+                                gpuInventoryDigest:
+                                  pattern: ^sha256:[0-9a-f]{64}$
+                                  type: string
+                                kernelVersion:
+                                  maxLength: 256
+                                  type: string
+                                kubeletVersion:
+                                  maxLength: 128
+                                  type: string
+                                nodeUID:
+                                  description: |-
+                                    UID is a type that holds unique ID values, including UUIDs.  Because we
+                                    don't ONLY use UUIDs, this is an alias to string.  Being a type captures
+                                    intent and helps make sure that UIDs and names do not get conflated.
+                                  type: string
+                                osImage:
+                                  maxLength: 256
+                                  type: string
+                                systemUUID:
+                                  maxLength: 128
+                                  type: string
+                              required:
+                              - nodeUID
+                              type: object
+                              x-kubernetes-validations:
+                              - message: nodeUID is required
+                                rule: size(self.nodeUID) > 0
+                            verdict:
+                              enum:
+                              - Pass
+                              - Fail
+                              - Inconclusive
+                              type: string
+                          required:
+                          - end
+                          - index
+                          - role
+                          - start
+                          - verdict
+                          type: object
+                        maxItems: 8
+                        minItems: 1
+                        type: array
+                        x-kubernetes-list-type: atomic
+                      planDigest:
+                        pattern: ^sha256:[0-9a-f]{64}$
+                        type: string
+                      provenance:
+                        properties:
+                          adapterImage:
+                            pattern: ^[^@\s]+@sha256:[0-9a-f]{64}$
+                            type: string
+                          controllerImage:
+                            pattern: ^[^@\s]+@sha256:[0-9a-f]{64}$
+                            type: string
+                          runnerImages:
+                            items:
+                              pattern: ^[^@\s]+@sha256:[0-9a-f]{64}$
+                              type: string
+                            maxItems: 256
+                            minItems: 1
+                            type: array
+                            x-kubernetes-list-type: set
+                          workflowTemplateDigest:
+                            pattern: ^sha256:[0-9a-f]{64}$
+                            type: string
+                        required:
+                        - adapterImage
+                        - controllerImage
+                        - runnerImages
+                        - workflowTemplateDigest
+                        type: object
+                    required:
+                    - checks
+                    - participants
+                    - planDigest
+                    - provenance
+                    type: object
                   uri:
+                    maxLength: 2048
                     type: string
                 type: object
               observedGeneration:
