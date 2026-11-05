@@ -20,6 +20,9 @@ type FakeBackend struct {
 
 	PrepareErr, StartErr, StopErr, RestartErr, DestroyErr, StatusErr, ExecErr error
 
+	// FakeStatus is what Status reports when StatusErr is nil.
+	FakeStatus Status
+
 	// ExecFunc, when set, produces the result of Exec.
 	ExecFunc func(ExecSpec) (ExecResult, error)
 
@@ -106,7 +109,7 @@ func (f *FakeBackend) Status(_ context.Context, r SlotRef) (Status, error) {
 		return Status{}, f.StatusErr
 	}
 
-	return Status{}, nil
+	return f.FakeStatus, nil
 }
 
 // Exec implements Backend.
