@@ -1,8 +1,8 @@
 //! Caller error conversion may inspect and close the mailbox that rejected work.
 
-use racer::rt::{
+use racer_io::{
     Error, Result, Scope,
-    mailbox::{Command, Mailbox},
+    xthread::command::{Command, Mailbox},
 };
 use std::{
     alloc::{GlobalAlloc, Layout, System},

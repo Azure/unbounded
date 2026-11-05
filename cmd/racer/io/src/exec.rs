@@ -440,6 +440,61 @@ impl<T: Tick> Role for Lane<T> {
     }
 }
 
+/// Per-future readiness with a thread-safe wake path to the polling owner.
+pub struct Runnable {
+    ready: AtomicBool,
+
+    owner: futures::task::AtomicWaker,
+}
+
+impl Runnable {
+    /// Create a runnable task that is initially ready for its first poll.
+    pub fn new() -> Arc<Self> {
+        Arc::new(Self {
+            ready: AtomicBool::new(true),
+            owner: futures::task::AtomicWaker::new(),
+        })
+    }
+
+    /// Register the polling owner notified by the next wake.
+    pub fn register_owner(&self, waker: &Waker) {
+        self.owner.register(waker);
+    }
+
+    /// Whether a wake is pending since the last poll.
+    pub fn is_ready(&self) -> bool {
+        self.ready.load(Ordering::Acquire)
+    }
+
+    /// Poll on first use or after a wake, unless the caller explicitly forces it.
+    pub fn poll<T>(
+        self: &Arc<Self>,
+        future: Pin<&mut (impl Future<Output = T> + ?Sized)>,
+        cx: &mut Context<'_>,
+        force: bool,
+    ) -> Poll<T> {
+        self.owner.register(cx.waker());
+        if !self.ready.swap(false, Ordering::AcqRel) && !force {
+            return Poll::Pending;
+        }
+        let waker = Waker::from(self.clone());
+        future.poll(&mut Context::from_waker(&waker))
+    }
+}
+
+impl std::task::Wake for Runnable {
+    /// Forward an owned wake through the shared readiness path.
+    fn wake(self: Arc<Self>) {
+        self.wake_by_ref();
+    }
+
+    /// Publish readiness before notifying the latest polling owner.
+    fn wake_by_ref(self: &Arc<Self>) {
+        self.ready.store(true, Ordering::Release);
+        self.owner.wake();
+    }
+}
+
 /// Worker-local exclusion flag. Dropping the guard makes the flag available.
 #[must_use = "dropping the guard releases the busy flag"]
 pub struct Busy<'a>(&'a Cell<bool>);

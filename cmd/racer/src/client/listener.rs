@@ -156,7 +156,7 @@ impl BoundListener {
 }
 
 pub(super) struct Active {
-    pub(super) runnable: Arc<crate::rt::drivers::Runnable>,
+    pub(super) runnable: Arc<racer_io::exec::Runnable>,
     pub(super) deadline: Rc<Cell<std::time::Instant>>,
     pub(super) expired: Option<std::time::Instant>,
     pub(super) cache: CacheId,
@@ -303,7 +303,7 @@ impl ClientListeners {
             .await
         });
         self.active.borrow_mut().push_back(Active {
-            runnable: crate::rt::drivers::Runnable::new(),
+            runnable: racer_io::exec::Runnable::new(),
             deadline,
             expired: None,
             cache,

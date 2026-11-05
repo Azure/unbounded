@@ -21,13 +21,13 @@ use crate::model::WorkerId;
 use crate::peer::forwarding::VerifiedRequest;
 use crate::peer::protocol::PeerResponse;
 use crate::peer::server::LocalPageService;
-use crate::rt::mailbox;
 use crate::runtime::Cancellation;
 use crate::runtime::HashMap;
 use crate::runtime::RequestScope;
 use crate::security::OriginContext;
 use crate::security::PeerOriginContext;
 use crate::store::holds::{HoldEpoch, HoldPages};
+use racer_io::xthread::command as mailbox;
 use std::cell::RefCell;
 #[cfg(test)]
 use std::future::Future;
