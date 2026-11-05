@@ -92,6 +92,26 @@ func TestCertificationCheckListContract(t *testing.T) {
 	}
 }
 
+func TestCertificationSuiteWorkloadPathBounds(t *testing.T) {
+	t.Parallel()
+
+	crd := readCRD(t, "signal.unbounded-cloud.io_certificationsuites.yaml")
+	hostPath := crd.Spec.Versions[0].Schema.OpenAPIV3Schema.
+		Properties["spec"].
+		Properties["checks"].
+		Items.Schema.
+		Properties["workloadPolicy"].
+		Properties["hostPaths"].
+		Items.Schema
+
+	for _, property := range []string{"mountPath", "path"} {
+		maxLength := hostPath.Properties[property].MaxLength
+		if maxLength == nil || *maxLength != MaxWorkloadPathLength {
+			t.Fatalf("%s maxLength = %v, want %d", property, maxLength, MaxWorkloadPathLength)
+		}
+	}
+}
+
 func TestCertificationProfileReferencesSuite(t *testing.T) {
 	t.Parallel()
 
