@@ -2456,8 +2456,10 @@ impl Executor {
         } = task;
         // If the I/O side stopped waiting, the page drops here. Its storage
         // is shared and thread safe, so that is fine.
-        let _ = reply.send((work, result));
+        // Count the page done before answering, so a caller that saw the
+        // answer never sees it still queued.
         self.device.queue.finished();
+        let _ = reply.send((work, result));
         let pending = self.waiting.iter().any(|task| task.id == id);
         if let Some(owned) = self.requests.get_mut(&id) {
             owned.busy = false;
