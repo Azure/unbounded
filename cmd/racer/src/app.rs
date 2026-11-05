@@ -560,7 +560,7 @@ impl Application {
         self.prepare_workers()?;
         let mut workers = WorkerGroup::new(plan);
         let result = if self.config.managed() {
-            workers.run_with_startup(&self, MANAGED_STARTUP)
+            workers.run_with_startup(&self, None)
         } else {
             workers.run(&self)
         };
@@ -580,10 +580,6 @@ fn signal_stop(error: Error, requested: bool) -> bool {
 /// Budget for one managed enrollment attempt, independent of data request deadlines.
 const MANAGED_ENROLLMENT_ATTEMPT: Duration = Duration::from_secs(60);
 
-/// Managed worker startup waits on election and the first publication until
-/// stopped; each control turn inside it stays bounded by [`CONTROL_TURN`].
-const MANAGED_STARTUP: Duration = Duration::from_secs(365 * 24 * 3600);
-
 /// Bound for one startup control turn (enrollment attempt or publication poll).
 const CONTROL_TURN: Duration = Duration::from_secs(racer_control_wire::POLL_WAIT.as_secs() + 30);
 
@@ -592,8 +588,10 @@ const CONTROL_TURN: Duration = Duration::from_secs(racer_control_wire::POLL_WAIT
 /// The turn owns its own cancellation so its expiry never cancels startup.
 fn control_turn(startup: &RequestScope, limit: Duration) -> Result<RequestScope> {
     let mut turn = scope(startup.clock(), limit)?;
-    if startup.deadline.0 < turn.deadline.0 {
-        turn.deadline = startup.deadline;
+    if let Some(deadline) = startup.deadline_at()
+        && deadline < turn.deadline.0
+    {
+        turn.deadline.0 = deadline;
     }
     Ok(turn)
 }
@@ -647,6 +645,10 @@ fn retry_enrollment<T>(
 /// Create a bounded scope for application-owned lifecycle operations.
 fn scope(clock: &racer_io::Clock, timeout: Duration) -> Result<RequestScope> {
     RequestScope::with_clock(RequestId([0; 16]), clock.now() + timeout, clock.clone())
+}
+
+fn untimed(clock: &racer_io::Clock) -> Result<RequestScope> {
+    RequestScope::untimed(RequestId([0; 16]), clock.clone())
 }
 
 /// Retry enrollment under the original startup scope and the session's backoff.
@@ -2601,7 +2603,7 @@ impl uring_runtime::group::Service<RequestScope> for WorkerApplication {
             }
             let clients = self.clients.clone();
             let flights = self.flights.clone();
-            let fence_scope = scope(&self.ctx().clock, Duration::from_secs(365 * 24 * 3600))?;
+            let fence_scope = untimed(&self.ctx().clock)?;
             let mut client_drain = clients.drain(&deadline);
             let mut flight_drain = flights.drain(&fence_scope);
             let mut clients_done = false;
@@ -3021,7 +3023,7 @@ impl WorkerApplication {
             .map_err(|_| Error::InvalidConfiguration)?;
         self.telemetry
             .attach_io(self.runtime.reactor.clone(), self.runtime.admission.clone())?;
-        let diagnostic_scope = scope(&self.ctx().clock, Duration::from_secs(365 * 24 * 3600))?;
+        let diagnostic_scope = untimed(&self.ctx().clock)?;
         let task_scope = diagnostic_scope.clone();
         let telemetry = self.telemetry.clone();
         let address = self.diagnostics_address;
@@ -3232,12 +3234,9 @@ impl WorkerApplication {
     /// Start diagnostics and bind the control worker's peer listener before readiness.
     async fn start_listeners(&mut self) -> Result<()> {
         std::future::poll_fn(|cx| Poll::Ready(self.start_diagnostics(cx))).await?;
-        self.task_scope = Some(scope(
-            &self.ctx().clock,
-            Duration::from_secs(365 * 24 * 3600),
-        )?);
+        self.task_scope = Some(untimed(&self.ctx().clock)?);
         if self.control.is_some() {
-            let listener_scope = scope(&self.ctx().clock, Duration::from_secs(365 * 24 * 3600))?;
+            let listener_scope = untimed(&self.ctx().clock)?;
             let peers = self.peers.clone();
             let peer_scope = listener_scope.clone();
             let address = self.peer_address;
@@ -3491,7 +3490,9 @@ mod lifecycle_policy_tests {
 
     #[test]
     fn control_turns_are_bounded_and_never_outlive_startup() {
-        let long = scope(&racer_io::Clock::host(), MANAGED_STARTUP).unwrap();
+        // Managed startup is untimed and ends only when stopped.
+        let long = RequestScope::untimed(RequestId([0; 16]), racer_io::Clock::host()).unwrap();
+        assert_eq!(long.deadline_at(), None);
         let turn = control_turn(&long, CONTROL_TURN).unwrap();
         let now = racer_io::Clock::host().now();
         assert!(turn.deadline.0 <= now + CONTROL_TURN);
@@ -3502,8 +3503,6 @@ mod lifecycle_policy_tests {
         let short = scope(&racer_io::Clock::host(), Duration::from_millis(5)).unwrap();
         let turn = control_turn(&short, CONTROL_TURN).unwrap();
         assert_eq!(turn.deadline.0, short.deadline.0);
-        // Managed startup outlives the fixed lifecycle policy.
-        assert!(MANAGED_STARTUP > crate::worker::LIFECYCLE_TIMEOUT * 100);
     }
 
     #[test]

@@ -66,8 +66,8 @@ impl uring_runtime::Scope for TestScope {
 
 impl Scope for TestScope {
     /// Return the fixture's absolute deadline.
-    fn deadline(&self) -> Instant {
-        self.0
+    fn deadline(&self) -> Option<Instant> {
+        Some(self.0)
     }
 
     /// Never extend an existing deadline.

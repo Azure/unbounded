@@ -295,19 +295,23 @@ impl WorkerGroup {
         self.runtime.start(factory, scope)
     }
     pub fn run(&mut self, factory: &dyn Factory<RequestScope>) -> Result<()> {
-        self.run_with_startup(factory, LIFECYCLE_TIMEOUT)
+        self.run_with_startup(factory, Some(LIFECYCLE_TIMEOUT))
     }
-    /// Like `run`, with an explicit budget for service startup only.
+    /// Like `run`, with an explicit budget for service startup only; `None`
+    /// waits until stopped.
     ///
     /// Managed startup waits on cluster election and the first publication, so
-    /// it needs more than the fixed lifecycle budget. Services bound their own
+    /// it has no startup deadline and ends only by success or stop. Services bound their own
     /// I/O and control turns; teardown keeps the fixed lifecycle budget.
     pub fn run_with_startup(
         &mut self,
         factory: &dyn Factory<RequestScope>,
-        startup: Duration,
+        startup: Option<Duration>,
     ) -> Result<()> {
-        let scope = startup_scope(startup)?;
+        let scope = match startup {
+            Some(budget) => startup_scope(budget)?,
+            None => untimed_startup_scope()?,
+        };
         self.prepare(true)?;
         self.runtime.run(factory, &scope)
     }
@@ -499,6 +503,11 @@ fn startup_scope(budget: Duration) -> Result<RequestScope> {
     // MIGRATION: startup scopes move onto the role's WorkerCtx.
     let clock = crate::runtime::ambient_ctx().clock;
     RequestScope::with_clock(RequestId([0; 16]), clock.now() + budget, clock)
+}
+
+fn untimed_startup_scope() -> Result<RequestScope> {
+    // MIGRATION: startup scopes move onto the role's WorkerCtx.
+    RequestScope::untimed(RequestId([0; 16]), crate::runtime::ambient_ctx().clock)
 }
 
 fn poll_runtime(runtime: &WorkerRuntime) -> Result<()> {

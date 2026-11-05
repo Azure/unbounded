@@ -285,8 +285,9 @@ pub mod rest {
 
     /// Narrowing must preserve cancellation and all caller policy, never extend time.
     pub trait Scope: uring_runtime::Scope {
-        /// Return the caller's absolute monotonic deadline.
-        fn deadline(&self) -> Instant;
+        /// Return the caller's absolute monotonic deadline, or `None` when the
+        /// scope is untimed and ends only by cancellation.
+        fn deadline(&self) -> Option<Instant>;
 
         /// Retain caller policy while limiting the deadline to `until`.
         fn narrowed(&self, until: Instant) -> Self;
@@ -799,9 +800,17 @@ pub mod rest {
                     continue;
                 };
                 let now = io.ctx().clock.now();
-                let share =
-                    scope.deadline().saturating_duration_since(now) / (order.len() - index) as u32;
-                let attempt = scope.narrowed(now + share);
+                let narrowed;
+                let attempt = match scope.deadline() {
+                    Some(deadline) => {
+                        narrowed = scope.narrowed(
+                            now + deadline.saturating_duration_since(now)
+                                / (order.len() - index) as u32,
+                        );
+                        &narrowed
+                    }
+                    None => scope,
+                };
                 let result = self
                     .handshake(
                         io.clone(),
@@ -810,7 +819,7 @@ pub mod rest {
                         identity,
                         epochs[*position],
                         owner.clone(),
-                        &attempt,
+                        attempt,
                     )
                     .await;
                 scope.check()?;
@@ -949,8 +958,9 @@ pub mod rest {
             // Reserve a share for every remaining address and one for TLS. A local
             // blackhole must not consume the parent's entire connection deadline.
             let now = io.ctx().clock.now();
-            let share = scope.deadline().saturating_duration_since(now)
-                / (addresses.len() - index + 1) as u32;
+            let share = scope.deadline().map_or(Duration::MAX, |deadline| {
+                deadline.saturating_duration_since(now) / (addresses.len() - index + 1) as u32
+            });
             let attempt = scope.narrowed(now + share.min(Duration::from_secs(5)));
             let charge = io.lease()?;
             if let Some(sim) = io.sim() {

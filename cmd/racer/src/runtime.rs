@@ -71,6 +71,10 @@ struct CancellationState {
     candidate_total: OnceLock<Instant>,
     candidate_idle: OnceLock<Mutex<(std::time::Duration, Instant)>>,
     candidate_body: OnceLock<Mutex<CandidateBody>>,
+    /// The placeholder `deadline` of an untimed scope, shared by its clones.
+    /// Any other `deadline` value, such as one narrowed by a header scope, is
+    /// a real bound.
+    untimed_at: OnceLock<Instant>,
 }
 type CandidateBody = flow_control::progress::ProgressBudget;
 impl Cancellation {
@@ -81,6 +85,7 @@ impl Cancellation {
                 candidate_total: OnceLock::new(),
                 candidate_idle: OnceLock::new(),
                 candidate_body: OnceLock::new(),
+                untimed_at: OnceLock::new(),
             }),
         })
     }
@@ -103,9 +108,17 @@ pub(crate) fn ambient_ctx() -> racer_io::WorkerCtx {
     uring_runtime::environment::Environment::current().worker_ctx()
 }
 
+/// Placeholder distance of an untimed scope's `deadline` field; never a bound.
+/// A century: far beyond any process lifetime, and still encodable on the wire.
+const UNTIMED_HORIZON: std::time::Duration = std::time::Duration::from_secs(100 * 365 * 24 * 3600);
+
 #[derive(Clone)]
 pub struct RequestScope {
     pub request: RequestId,
+    /// Absolute deadline. An untimed scope (see [`RequestScope::untimed`])
+    /// holds [`UNTIMED_HORIZON`] past creation here only so `min`-narrowing
+    /// arithmetic yields the narrower bound; checks, op contexts, and
+    /// [`RequestScope::deadline_at`] treat it as no deadline.
     pub deadline: Deadline,
     pub cancellation: Cancellation,
     /// Local diagnostics only: original acquisition ceiling and candidate share.
@@ -126,7 +139,10 @@ impl RequestScope {
         self.check()?;
         // A cap may elapse while setting up the exchange. Install it as expired,
         // not invalid input; the next scope check rejects work without renewal.
-        if expires > self.deadline.0 {
+        if self
+            .deadline_at()
+            .is_some_and(|deadline| expires > deadline)
+        {
             return Err(Error::InvalidRequest);
         }
         self.cancellation
@@ -169,7 +185,11 @@ impl RequestScope {
         observation: std::time::Duration,
         complete_by: Instant,
     ) -> Result<()> {
-        if observation.is_zero() || complete_by > self.deadline.0 {
+        if observation.is_zero()
+            || self
+                .deadline_at()
+                .is_some_and(|deadline| complete_by > deadline)
+        {
             return Err(Error::InvalidRequest);
         }
         self.cancellation
@@ -221,6 +241,28 @@ impl RequestScope {
         })
     }
 
+    /// A lifetime scope with no deadline; it ends only when cancelled.
+    pub fn untimed(request: RequestId, clock: racer_io::Clock) -> Result<Self> {
+        let placeholder = clock
+            .now()
+            .checked_add(UNTIMED_HORIZON)
+            .ok_or(Error::InvalidConfiguration)?;
+        let scope = Self::with_clock(request, placeholder, clock)?;
+        scope
+            .cancellation
+            .state
+            .untimed_at
+            .set(placeholder)
+            .map_err(|_| Error::Internal)?;
+        Ok(scope)
+    }
+
+    /// The deadline, or `None` for an untimed scope.
+    pub fn deadline_at(&self) -> Option<Instant> {
+        (self.cancellation.state.untimed_at.get() != Some(&self.deadline.0))
+            .then_some(self.deadline.0)
+    }
+
     /// A new scope for `request` with its own cancellation, on this scope's
     /// clock.
     pub fn child(&self, request: RequestId, deadline: Instant) -> Result<Self> {
@@ -254,7 +296,7 @@ impl RequestScope {
     pub fn check_at(&self, now: Instant) -> Result<()> {
         if self.cancellation.is_cancelled() {
             Err(Error::Cancelled)
-        } else if now >= self.deadline.0 {
+        } else if self.deadline_at().is_some_and(|deadline| now >= deadline) {
             Err(Error::DeadlineExceeded)
         } else {
             if let Some(expires) = self.cancellation.state.candidate_total.get()
@@ -292,7 +334,8 @@ impl uring_runtime::Scope for RequestScope {
     }
 
     fn recheck_within(&self) -> Option<std::time::Duration> {
-        Some(self.deadline.0.saturating_duration_since(self.clock.now()))
+        self.deadline_at()
+            .map(|deadline| deadline.saturating_duration_since(self.clock.now()))
     }
 
     fn polled_checks(&self) -> bool {
@@ -303,13 +346,15 @@ impl uring_runtime::Scope for RequestScope {
     }
 
     fn op_ctx(&self) -> racer_io::OpCtx {
-        racer_io::OpCtx::with_cancel(self.cancellation.inner.token())
-            .deadline(racer_io::Deadline::at(self.deadline.0))
+        racer_io::OpCtx::with_cancel(self.cancellation.inner.token()).deadline(
+            self.deadline_at()
+                .map_or(racer_io::Deadline::NEVER, racer_io::Deadline::at),
+        )
     }
 }
 impl wire_codec::rest::Scope for RequestScope {
-    fn deadline(&self) -> Instant {
-        self.deadline.0
+    fn deadline(&self) -> Option<Instant> {
+        self.deadline_at()
     }
 
     fn narrowed(&self, until: Instant) -> Self {
@@ -486,6 +531,34 @@ mod tests {
             use std::task::Waker;
             use std::time::Duration;
             #[test]
+            fn untimed_scope_ends_only_by_cancellation_and_narrows_to_bounded() {
+                use uring_runtime::Scope as _;
+                use wire_codec::rest::Scope;
+                let clock = racer_io::ctx::VirtualClock::new();
+                let scope =
+                    RequestScope::untimed(RequestId([2; 16]), clock.clone().into()).unwrap();
+                assert_eq!(scope.deadline_at(), None);
+                assert_eq!(Scope::deadline(&scope), None);
+                assert_eq!(scope.recheck_within(), None);
+                assert_eq!(scope.op_ctx().deadline, racer_io::Deadline::NEVER);
+                clock.advance(Duration::from_secs(400 * 24 * 3600)).unwrap();
+                assert_eq!(scope.check(), Ok(()));
+                let until = scope.clock().now() + Duration::from_secs(5);
+                let narrowed = scope.narrowed(until);
+                assert_eq!(narrowed.deadline_at(), Some(until));
+                clock.advance(Duration::from_secs(5)).unwrap();
+                assert_eq!(narrowed.check(), Err(Error::DeadlineExceeded));
+                assert_eq!(scope.check(), Ok(()));
+                // A clone whose deadline is narrowed by assignment is bounded.
+                let mut header = scope.clone();
+                header.deadline.0 = header.deadline.0.min(until);
+                assert_eq!(header.deadline_at(), Some(until));
+                assert_eq!(header.check(), Err(Error::DeadlineExceeded));
+                scope.cancel().unwrap();
+                assert_eq!(scope.check(), Err(Error::Cancelled));
+            }
+
+            #[test]
             fn rest_narrowing_preserves_policy_cancellation_and_parent_deadline() {
                 use wire_codec::rest::Scope;
                 let clock = uring_runtime::environment::SimulationClock::new(102);
@@ -499,8 +572,8 @@ mod tests {
                     .set_candidate_total(start + Duration::from_secs(10))
                     .unwrap();
                 let narrowed = scope.narrowed(start + Duration::from_secs(20));
-                assert_eq!(scope.deadline(), end);
-                assert_eq!(narrowed.deadline(), start + Duration::from_secs(20));
+                assert_eq!(scope.deadline(), Some(end));
+                assert_eq!(narrowed.deadline(), Some(start + Duration::from_secs(20)));
                 assert_eq!(narrowed.narrowed(end).deadline(), narrowed.deadline());
                 clock.advance(Duration::from_secs(10));
                 assert_eq!(narrowed.check(), Err(Error::DeadlineExceeded));

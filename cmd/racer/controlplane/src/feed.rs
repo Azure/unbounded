@@ -671,7 +671,7 @@ where
                             };
                             let now = self.host.ctx().clock.now();
                             self.state.next_fetch =
-                                now.checked_add(delay).unwrap_or(scope.deadline());
+                                now.checked_add(delay).or(scope.deadline()).unwrap_or(now);
                         }
                         return Err(failure.error);
                     }

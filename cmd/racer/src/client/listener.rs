@@ -1152,10 +1152,9 @@ impl ReadyListeners {
                 ready.insert(socket.as_raw_fd(), index)?;
             }
             self.index = Some(ready);
-            self.scope = Some(new_scope(
-                owner.io.reactor().ctx(),
-                Duration::from_secs(365 * 24 * 3600),
-                Cancellation::new()?,
+            self.scope = Some(RequestScope::untimed(
+                RequestId([0; 16]),
+                owner.io.reactor().ctx().clock.clone(),
             )?);
             self.generation = owner.generation.get();
         }

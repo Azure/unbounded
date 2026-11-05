@@ -394,8 +394,8 @@ impl uring_runtime::Scope for Scope {
 }
 
 impl rest::Scope for Scope {
-    fn deadline(&self) -> Instant {
-        self.deadline
+    fn deadline(&self) -> Option<Instant> {
+        Some(self.deadline)
     }
 
     fn narrowed(&self, until: Instant) -> Self {

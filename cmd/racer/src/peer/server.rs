@@ -1742,11 +1742,8 @@ mod tests {
                 .with_request_timeout(Duration::from_secs(
                     if end == "handshake-cap" { 60 } else { 4 },
                 ));
-                let scope = RequestScope::new(
-                    RequestId([5; 16]),
-                    uring_runtime::environment::now() + Duration::from_secs(365 * 24 * 3600),
-                )
-                .unwrap();
+                let scope = RequestScope::untimed(RequestId([5; 16]), crate::test_support::clock())
+                    .unwrap();
                 let (socket, mut peer) = UnixStream::pair().unwrap();
                 let mut writer = socket.try_clone().unwrap();
                 peer.set_nonblocking(true).unwrap();
