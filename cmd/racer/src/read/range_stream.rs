@@ -1761,12 +1761,11 @@ pub(super) mod tests {
             plaintext: VerifiedPage {
                 inner: Arc::new(VerifiedBytes {
                     page: page.clone(),
-                    storage: flow_control::ChargedBytes {
-                        bytes: vec![number as u8; length],
-                        reservation: admission
-                            .reserve(cache, ResourceClass::Plaintext, length)
-                            .unwrap(),
-                    },
+                    storage: crate::memory::fixture_plaintext(
+                        admission,
+                        cache,
+                        &vec![number as u8; length],
+                    ),
                 }),
             },
             ciphertext: CiphertextPage {

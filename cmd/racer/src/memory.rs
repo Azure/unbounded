@@ -196,10 +196,10 @@ pub struct BufferPool {
 }
 /// Mutable staging buffer, not proof of authentication and not client-deliverable.
 /// Fixed-size owned backing stays at the same address when this owner moves.
-pub struct PlaintextBuffer(flow_control::ChargedBuffer<AdmissionPolicy>);
+pub struct PlaintextBuffer(PlaintextBuf);
 impl PlaintextBuffer {
-    pub(crate) fn into_parts(self) -> (Box<[u8]>, flow_control::Charge<AdmissionPolicy>) {
-        self.0.into_parts()
+    pub(crate) fn into_buf(self) -> PlaintextBuf {
+        self.0
     }
     pub(crate) fn reservation(&self) -> &flow_control::Charge<AdmissionPolicy> {
         self.0.charge()
@@ -208,10 +208,10 @@ impl PlaintextBuffer {
 // SAFETY: private fixed backing and reservation remain exclusively owned.
 unsafe impl racer_io::ring::IoBuffer for PlaintextBuffer {
     fn bytes(&self) -> racer_io::Result<&[u8]> {
-        Ok(self.0.bytes())
+        Ok(&self.0)
     }
     fn bytes_mut(&mut self) -> racer_io::Result<&mut [u8]> {
-        Ok(self.0.bytes_mut())
+        Ok(&mut self.0)
     }
 }
 /// Only page authentication/origin validation may create this publishable type.
@@ -219,15 +219,45 @@ unsafe impl racer_io::ring::IoBuffer for PlaintextBuffer {
 pub struct VerifiedPage {
     pub(crate) inner: Arc<VerifiedBytes>,
 }
-/// Authenticated page identity paired with one recyclable payload owner.
+/// Authenticated page identity paired with one pooled, wipe-on-return payload.
 pub(crate) struct VerifiedBytes {
     pub page: PageId,
 
-    pub storage: flow_control::ChargedBytes<AdmissionPolicy>,
+    pub storage: PlaintextBuf,
+}
+
+/// Plaintext page storage checked out of a worker's buffer pool. The charge
+/// covers the pooled capacity; the buffer is wiped before it is reused.
+pub type PlaintextBuf = page_alloc::buf::Buf<PlaintextCharge>;
+
+/// Admission charge backing pooled plaintext storage.
+///
+/// [`AdmissionPolicy`] lets only ciphertext charges back page allocator
+/// storage, so slabs and aligned ciphertext pools can never hold plaintext.
+/// This wrapper is the one sanctioned exception: it covers a pooled
+/// plaintext buffer, which is always wiped before reuse or release.
+pub struct PlaintextCharge(pub(crate) flow_control::Charge<AdmissionPolicy>);
+
+impl page_alloc::Charge for PlaintextCharge {
+    fn covers(&self, bytes: usize) -> bool {
+        self.0.class() == ResourceClass::Plaintext && self.0.amount() >= bytes
+    }
+
+    fn requires_wipe(&self) -> bool {
+        true
+    }
+}
+
+impl std::ops::Deref for PlaintextCharge {
+    type Target = flow_control::Charge<AdmissionPolicy>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
 }
 
 impl std::ops::Deref for VerifiedBytes {
-    type Target = flow_control::ChargedBytes<AdmissionPolicy>;
+    type Target = PlaintextBuf;
 
     /// Borrow allocation and accounting without exposing mutable verified contents.
     fn deref(&self) -> &Self::Target {
@@ -241,6 +271,37 @@ impl std::ops::DerefMut for VerifiedBytes {
     fn deref_mut(&mut self) -> &mut Self::Target {
         &mut self.storage
     }
+}
+
+/// Fixture plaintext: copies `bytes` into unpooled storage charged to
+/// `admission` under `key` for the full buffer capacity.
+#[cfg(test)]
+pub(crate) fn fixture_plaintext(
+    admission: &flow_control::Quotas<AdmissionPolicy>,
+    key: Option<&racer_control_wire::CacheId>,
+    bytes: &[u8],
+) -> PlaintextBuf {
+    let capacity = bytes
+        .len()
+        .max(1)
+        .next_multiple_of(page_alloc::buf::GRANULE);
+    let charge = admission
+        .reserve(key, ResourceClass::Plaintext, capacity)
+        .expect("fixture plaintext admission");
+    fixture_storage(charge, bytes)
+}
+
+/// Fixture plaintext over a caller-made charge covering one granule-rounded
+/// buffer of `bytes.len()`.
+#[cfg(test)]
+pub(crate) fn fixture_storage(
+    charge: flow_control::Charge<AdmissionPolicy>,
+    bytes: &[u8],
+) -> PlaintextBuf {
+    let mut storage = page_alloc::buf::Buf::unpooled(bytes.len(), 1, PlaintextCharge(charge), true)
+        .expect("fixture buffer");
+    storage.copy_from_slice(bytes);
+    storage
 }
 /// A handle on immutable ciphertext.
 ///
@@ -555,7 +616,27 @@ impl BufferPool {
         reservation: flow_control::Charge<AdmissionPolicy>,
         length: usize,
     ) -> Result<PlaintextBuffer> {
-        if length == 0 || length > PAGE_BYTES as usize {
+        if length == 0 {
+            return Err(Error::InvalidConfiguration);
+        }
+        self.plaintext_storage(reservation, length)
+            .map(PlaintextBuffer)
+    }
+    /// Bytes charged for pooled plaintext of `length` bytes: the 4 KiB
+    /// granule-rounded capacity the pool hands out.
+    pub(crate) fn plaintext_capacity(&self, length: usize) -> Result<usize> {
+        Ok(self.disk.borrow().capacity_for(length)?)
+    }
+    /// Check out pooled, wipe-on-return plaintext storage of exactly `length`
+    /// bytes. `reservation` must be an owned Plaintext charge for at least
+    /// `length`; it is topped up to the pooled capacity under the same key.
+    /// Contents are unspecified until the producer overwrites them.
+    pub fn plaintext_storage(
+        &self,
+        mut reservation: flow_control::Charge<AdmissionPolicy>,
+        length: usize,
+    ) -> Result<PlaintextBuf> {
+        if length > PAGE_BYTES as usize {
             return Err(Error::InvalidConfiguration);
         }
         self.validate_reservation(
@@ -564,10 +645,23 @@ impl BufferPool {
             length,
             reservation.key(),
         )?;
-        Ok(PlaintextBuffer(flow_control::ChargedBuffer::new(
-            reservation,
-            length,
-        )?))
+        let capacity = self.disk.borrow().capacity_for(length)?;
+        if reservation.amount() < capacity {
+            let extra = self.admission.reserve(
+                reservation.key(),
+                ResourceClass::Plaintext,
+                capacity - reservation.amount(),
+            )?;
+            reservation
+                .merge(extra)
+                .map_err(|_| Error::InvalidConfiguration)?;
+        } else {
+            reservation.shrink(capacity)?;
+        }
+        Ok(self
+            .disk
+            .borrow_mut()
+            .take(length, PlaintextCharge(reservation), true)?)
     }
     pub fn ciphertext(
         &self,
@@ -794,9 +888,9 @@ impl BufferPool {
         page.validate_metadata()?;
         let cache = Some(&page.plaintext.page().version.object.cache);
         self.validate_reservation(
-            &page.plaintext.inner.reservation,
+            page.plaintext.inner.charge(),
             ResourceClass::Plaintext,
-            page.plaintext.inner.bytes.capacity(),
+            page.plaintext.inner.capacity(),
             cache,
         )?;
         self.validate_reservation(
@@ -851,7 +945,7 @@ impl VerifiedPage {
         &self.inner.page
     }
     pub fn bytes(&self) -> &[u8] {
-        &self.inner.bytes
+        &self.inner.storage
     }
 }
 
@@ -1495,7 +1589,7 @@ impl MemoryCache {
         }
         if let Some((_, entry)) = entries.pages.get_mut(id) {
             match entry.plaintext.upgrade() {
-                Some(live) if live.bytes != page.plaintext.inner.bytes => {
+                Some(live) if live.storage[..] != page.plaintext.inner.storage[..] => {
                     return Err(Error::CorruptRecord);
                 }
                 Some(_) => {}
@@ -1964,16 +2058,12 @@ pub(crate) mod tests {
             let pool = BufferPool::new(admission.clone());
             let mut plaintext = pool.plaintext(reserved.plaintext, length).unwrap();
             plaintext.bytes_mut().unwrap().fill(7);
-            let (bytes, reservation) = plaintext.into_parts();
             // Structural fixture only: production allocation and owner layout, not an
             // authentication oracle (security/aead.rs performs this transfer).
             let plaintext = VerifiedPage {
                 inner: Arc::new(VerifiedBytes {
                     page: id.clone(),
-                    storage: flow_control::ChargedBytes {
-                        bytes: bytes.into_vec(),
-                        reservation,
-                    },
+                    storage: plaintext.into_buf(),
                 }),
             };
             let ciphertext = pool
@@ -2149,20 +2239,22 @@ pub(crate) mod tests {
             let mut cx = Context::from_waker(futures::task::noop_waker_ref());
             assert!(work.as_mut().poll(&mut cx).is_pending());
             assert_eq!(client.outstanding(), 1);
-            assert_eq!(occupancy(&real), [3, CIPHER, 0], "accepted crypto");
+            assert_eq!(occupancy(&real), [4096, CIPHER, 0], "accepted crypto");
             scope.cancel().unwrap();
             assert!(work.as_mut().poll(&mut cx).is_pending());
             drop(work);
             real.stop();
             client.poll_budgeted(1).unwrap();
-            assert_eq!(occupancy(&real), [3, CIPHER, 0], "canceled caller");
+            assert_eq!(occupancy(&real), [4096, CIPHER, 0], "canceled caller");
             assert_eq!(client.outstanding(), 1);
             engine.poll_budgeted(&mut cx, 1).unwrap();
-            assert_eq!(occupancy(&real), [3, CIPHER, 0], "published, not reaped");
+            assert_eq!(occupancy(&real), [4096, CIPHER, 0], "published, not reaped");
             assert_eq!(client.outstanding(), 1);
             client.poll_budgeted(1).unwrap();
             assert_eq!(client.outstanding(), 0);
             assert_eq!(occupancy(&real), [0, 0, 0], "reaped");
+            // Reaped plaintext returns to the worker pool as idle Pool bytes.
+            buffers.reclaim_idle_buffers();
             assert!(
                 ResourceClass::ALL
                     .iter()
@@ -2261,14 +2353,15 @@ pub(crate) mod tests {
                                 Err(error) => panic!("unexpected admission error: {error:?}"),
                             };
                         let cipher_charge = reserve(ResourceClass::Ciphertext, 24);
-                        let plain_charge = reserve(ResourceClass::Plaintext, 8);
+                        let plain_charge =
+                            reserve(ResourceClass::Plaintext, page_alloc::buf::GRANULE);
                         let plaintext = VerifiedPage {
                             inner: Arc::new(VerifiedBytes {
                                 page: page.clone(),
-                                storage: flow_control::ChargedBytes {
-                                    bytes: (rank as u64).to_le_bytes().to_vec(),
-                                    reservation: plain_charge,
-                                },
+                                storage: crate::memory::fixture_storage(
+                                    plain_charge,
+                                    &(rank as u64).to_le_bytes(),
+                                ),
                             }),
                         };
                         let ciphertext = pool
@@ -3652,7 +3745,7 @@ pub(crate) mod tests {
                 assert!(cache.get(reader.plaintext.page()).unwrap().is_some());
             }
             // Only the readers' live plaintext stays charged.
-            assert_eq!(admission.used(ResourceClass::Plaintext), 256 * 3);
+            assert_eq!(admission.used(ResourceClass::Plaintext), 256 * 4096);
             assert_eq!(admission.used(ResourceClass::Ciphertext), 299 * 19);
             drop(busy);
             for _ in 0..3 {
@@ -3683,7 +3776,7 @@ pub(crate) mod tests {
             assert!(cache.get(&id).unwrap().is_some());
             assert_eq!(cache.evict_idle(0), Ok(0));
             assert_eq!(cache.evict_idle(1), Ok(19));
-            assert_eq!(admission.used(ResourceClass::Plaintext), 3);
+            assert_eq!(admission.used(ResourceClass::Plaintext), 4096);
             drop(plaintext);
             assert_eq!(admission.used(ResourceClass::Plaintext), 0);
             assert_eq!(admission.used(ResourceClass::Ciphertext), 0);
@@ -3794,16 +3887,23 @@ pub(crate) mod tests {
                 .pop();
             assert_eq!(cache.publish(malformed), Err(Error::CorruptRecord));
             let mut undercharged = bundle(&admission, "v1");
+            // Plaintext storage cannot carry a non-plaintext charge at all;
+            // a charge for another cache must still be refused at publish.
             let wrong = admission
                 .reserve(
-                    Some(&undercharged.metadata.version.object.cache),
-                    ResourceClass::Ciphertext,
-                    3,
+                    Some(&CacheId("other".into())),
+                    ResourceClass::Plaintext,
+                    page_alloc::buf::GRANULE,
                 )
                 .unwrap();
-            Arc::get_mut(&mut undercharged.plaintext.inner)
+            let storage = &mut Arc::get_mut(&mut undercharged.plaintext.inner)
                 .unwrap()
-                .reservation = wrong;
+                .storage;
+            let ciphertext = admission
+                .reserve(None, ResourceClass::Ciphertext, page_alloc::buf::GRANULE)
+                .unwrap();
+            assert!(storage.replace_charge(PlaintextCharge(ciphertext)).is_err());
+            assert!(storage.replace_charge(PlaintextCharge(wrong)).is_ok());
             assert_eq!(
                 cache.publish(undercharged),
                 Err(Error::InvalidConfiguration)
@@ -3816,7 +3916,7 @@ pub(crate) mod tests {
             let mut conflicting = bundle(&admission, "v1");
             Arc::get_mut(&mut conflicting.plaintext.inner)
                 .unwrap()
-                .bytes[0] ^= 1;
+                .storage[0] ^= 1;
             assert_eq!(cache.publish(conflicting), Err(Error::CorruptRecord));
             let mut inconsistent = bundle(&admission, "v2");
             let rejected_id = inconsistent.plaintext.page().clone();
@@ -3824,7 +3924,7 @@ pub(crate) mod tests {
             assert_eq!(cache.publish(inconsistent), Err(Error::CorruptRecord));
             assert_eq!(cache.get(&id).unwrap().unwrap().plaintext.bytes(), &[1; 3]);
             assert!(cache.get(&rejected_id).unwrap().is_none());
-            assert_eq!(admission.used(ResourceClass::Plaintext), 3);
+            assert_eq!(admission.used(ResourceClass::Plaintext), 4096);
             assert_eq!(admission.used(ResourceClass::Ciphertext), 19);
             drop(held);
             assert_eq!(admission.used(ResourceClass::Plaintext), 0);
@@ -3850,7 +3950,7 @@ pub(crate) mod tests {
             assert!(cache.ciphertext(&id).unwrap().is_none());
             assert!(cache.ciphertext(&other_id).unwrap().is_some());
             assert_eq!(page.plaintext.bytes(), &[1; 3]);
-            assert_eq!(admission.used(ResourceClass::Plaintext), 3);
+            assert_eq!(admission.used(ResourceClass::Plaintext), 4096);
             drop(page);
             assert_eq!(admission.used(ResourceClass::Plaintext), 0);
             let lease = cache.ciphertext(&other_id).unwrap().unwrap();
@@ -3980,12 +4080,7 @@ pub(crate) mod tests {
         let plaintext = VerifiedPage {
             inner: Arc::new(VerifiedBytes {
                 page: page.clone(),
-                storage: flow_control::ChargedBytes {
-                    bytes: vec![1; 3],
-                    reservation: admission
-                        .reserve(Some(cache), ResourceClass::Plaintext, 3)
-                        .unwrap(),
-                },
+                storage: crate::memory::fixture_plaintext(admission, Some(cache), &[1; 3]),
             }),
         };
         let ciphertext = BufferPool::new(admission.clone())
@@ -4464,24 +4559,39 @@ pub(crate) mod tests {
         assert_eq!(retained, text, "diagnostic facts do not retain page owners");
     }
     #[test]
-    fn plaintext_is_stable_zeroed_and_reservation_backed() {
+    fn plaintext_is_stable_pooled_and_reservation_backed() {
         let admission = admission(8);
         let pool = BufferPool::new(admission.clone());
         let cache = CacheId("cache".into());
+        let granule = page_alloc::buf::GRANULE;
         let reservation = admission
-            .reserve(Some(&cache), ResourceClass::Plaintext, 8)
+            .reserve(Some(&cache), ResourceClass::Plaintext, 3)
             .unwrap();
         let mut buffer = pool.plaintext(reservation, 3).unwrap();
-        assert_eq!(buffer.bytes().unwrap(), &[0; 3]);
         let pointer = buffer.bytes().unwrap().as_ptr();
         buffer.bytes_mut().unwrap().copy_from_slice(b"abc");
-        let (bytes, reservation) = buffer.into_parts();
-        assert_eq!(bytes.as_ptr(), pointer);
-        assert_eq!(&*bytes, b"abc");
-        assert_eq!(reservation.amount(), 3);
-        assert_eq!(admission.used(ResourceClass::Plaintext), 3);
-        drop((bytes, reservation));
+        // The charge is topped up to cover the pooled capacity.
+        assert_eq!(buffer.reservation().amount(), granule);
+        let storage = buffer.into_buf();
+        assert_eq!(storage.as_ptr(), pointer);
+        assert_eq!(&*storage, b"abc");
+        assert!(storage.wipes());
+        assert_eq!(admission.used(ResourceClass::Plaintext), granule);
+        drop(storage);
         assert_eq!(admission.used(ResourceClass::Plaintext), 0);
+        // The idle buffer is reused, charged to the pool while idle.
+        assert_eq!(admission.used(ResourceClass::Pool), granule);
+        let reused = pool
+            .plaintext_storage(
+                admission
+                    .reserve(Some(&cache), ResourceClass::Plaintext, granule)
+                    .unwrap(),
+                3,
+            )
+            .unwrap();
+        assert_eq!(reused.as_ptr(), pointer);
+        assert_eq!(&*reused, &[0; 3], "pooled plaintext is wiped on return");
+        assert_eq!(admission.used(ResourceClass::Pool), 0);
     }
     #[test]
     fn allocations_reject_wrong_provenance_class_cache_and_bounds() {
@@ -4572,7 +4682,7 @@ pub(crate) mod tests {
         let pointer = cipher.bytes().as_ptr();
         assert_eq!(page.ciphertext.bytes().as_ptr(), pointer);
         drop(page);
-        assert_eq!(admission.used(ResourceClass::Plaintext), 3);
+        assert_eq!(admission.used(ResourceClass::Plaintext), 4096);
         assert_eq!(admission.used(ResourceClass::Ciphertext), 19);
         std::thread::spawn(move || drop((plain, cipher)))
             .join()

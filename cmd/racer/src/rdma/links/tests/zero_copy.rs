@@ -103,8 +103,8 @@ fn registered_ciphertext_rejects_bad_length_and_reservation() {
     assert_eq!(free(&w), Some(2));
     assert_eq!(
         admission.used(ResourceClass::Plaintext),
-        3,
-        "only the bundle"
+        4096,
+        "only the bundle, at one plaintext granule"
     );
 }
 

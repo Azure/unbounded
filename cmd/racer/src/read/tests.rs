@@ -60,12 +60,7 @@ pub(crate) fn page(byte: u8) -> crate::memory::PageResult {
         plaintext: VerifiedPage {
             inner: Arc::new(VerifiedBytes {
                 page: page.clone(),
-                storage: flow_control::ChargedBytes {
-                    bytes: vec![byte],
-                    reservation: admission
-                        .reserve(None, ResourceClass::Plaintext, 1)
-                        .unwrap(),
-                },
+                storage: crate::memory::fixture_plaintext(&admission, None, &[byte]),
             }),
         },
         ciphertext: CiphertextPage {
@@ -1921,13 +1916,7 @@ mod flight {
             plaintext: VerifiedPage {
                 inner: Arc::new(VerifiedBytes {
                     page: page.clone(),
-                    storage: flow_control::ChargedBytes {
-                        bytes: vec![1, 2, 3],
-                        reservation: flights
-                            .admission
-                            .reserve(None, ResourceClass::Plaintext, 3)
-                            .unwrap(),
-                    },
+                    storage: crate::memory::fixture_plaintext(&flights.admission, None, &[1, 2, 3]),
                 }),
             },
             ciphertext: CiphertextPage {

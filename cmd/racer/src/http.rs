@@ -1139,12 +1139,7 @@ pub(crate) mod tests {
                         },
                         number: PageNumber(0),
                     },
-                    storage: flow_control::ChargedBytes {
-                        reservation: admission
-                            .reserve(None, ResourceClass::Plaintext, bytes.len().max(1))
-                            .unwrap(),
-                        bytes,
-                    },
+                    storage: crate::memory::fixture_plaintext(admission, None, &bytes),
                 }),
             }
         }
@@ -1257,7 +1252,11 @@ pub(crate) mod tests {
             let view = PageSendRange::new(page, 7..15).unwrap();
             assert_eq!(view.send_bytes().unwrap(), b"selected");
             assert_eq!(view.send_bytes().unwrap().as_ptr(), pointer);
-            assert_eq!(admission.used(ResourceClass::Plaintext), 22);
+            assert_eq!(
+                admission.used(ResourceClass::Plaintext),
+                4096,
+                "one plaintext granule"
+            );
             let moved = Box::new(view);
             assert_eq!(moved.send_bytes().unwrap().as_ptr(), pointer);
             drop(moved);

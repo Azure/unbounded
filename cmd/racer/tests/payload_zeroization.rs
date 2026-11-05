@@ -337,8 +337,13 @@ fn failed_crypto_output_is_scrubbed(config: &Config) {
                 .unwrap();
             CryptoInput::Decrypt {
                 ciphertext,
-                plaintext: admission
-                    .reserve(Some(&cache), ResourceClass::Plaintext, length)
+                plaintext: racer::memory::BufferPool::new(admission.clone())
+                    .plaintext_storage(
+                        admission
+                            .reserve(Some(&cache), ResourceClass::Plaintext, length)
+                            .unwrap(),
+                        length,
+                    )
                     .unwrap(),
             }
         };

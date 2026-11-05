@@ -836,10 +836,15 @@ impl Fill {
         copy: &crate::memory::CiphertextCopy,
     ) -> Result<flow_control::Charge<AdmissionPolicy>> {
         validate_copy(copy, page)?;
+        // Charge the pooled capacity up front so reclamation covers it.
+        let capacity = self
+            .dependencies
+            .buffers
+            .plaintext_capacity(copy.ciphertext.envelope().plaintext_length as usize)?;
         self.reserve_with_reclamation(
             &page.version.object.cache,
             ResourceClass::Plaintext,
-            copy.ciphertext.envelope().plaintext_length as usize,
+            capacity,
         )
     }
     pub fn new(dependencies: FillDependencies) -> Self {
@@ -2696,10 +2701,15 @@ impl Fill {
             validate_copy(&copy, page)?;
             // Keep the original immutable ciphertext lease across crypto submission.
             self.metrics.record(Event::PageDecrypt, 1);
+            let length = copy.ciphertext.envelope().plaintext_length as usize;
+            let storage = self
+                .dependencies
+                .buffers
+                .plaintext_storage(reservation, length)?;
             let plaintext = self
                 .dependencies
                 .crypto
-                .decrypt(copy.ciphertext.clone(), reservation, scope)
+                .decrypt(copy.ciphertext.clone(), storage, scope)
                 .await?;
             let result = PageResult {
                 metadata: copy.metadata,

@@ -1405,16 +1405,11 @@ fn idle_tiny_prefix_must_not_hide_reclaimable_full_page() {
         let plaintext = crate::memory::VerifiedPage {
             inner: Arc::new(crate::memory::VerifiedBytes {
                 page: id.clone(),
-                storage: flow_control::ChargedBytes {
-                    bytes: vec![1; length],
-                    reservation: admission
-                        .reserve(
-                            Some(&f.context.object.cache),
-                            ResourceClass::Plaintext,
-                            length,
-                        )
-                        .unwrap(),
-                },
+                storage: crate::memory::fixture_plaintext(
+                    admission,
+                    Some(&f.context.object.cache),
+                    &vec![1; length],
+                ),
             }),
         };
         let ciphertext = f
@@ -2612,12 +2607,7 @@ mod pressure {
             plaintext: crate::memory::VerifiedPage {
                 inner: Arc::new(crate::memory::VerifiedBytes {
                     page: id.clone(),
-                    storage: flow_control::ChargedBytes {
-                        bytes: vec![1; 3],
-                        reservation: admission
-                            .reserve(Some(cache), ResourceClass::Plaintext, 3)
-                            .unwrap(),
-                    },
+                    storage: crate::memory::fixture_plaintext(admission, Some(cache), &[1; 3]),
                 }),
             },
             ciphertext: f
@@ -2640,11 +2630,23 @@ mod pressure {
                 )
                 .unwrap(),
         };
-        // Small final pages may retain full-page admission slack.
+        // Small final pages may retain full-page admission slack. Pooled
+        // plaintext storage needs a charge covering its 4 KiB granule.
+        let amount = if matches!(class, ResourceClass::Plaintext) {
+            amount.max(4096)
+        } else {
+            amount
+        };
         let reservation = admission.reserve(Some(cache), class, amount).unwrap();
         match class {
             ResourceClass::Plaintext => {
-                Arc::get_mut(&mut page.plaintext.inner).unwrap().reservation = reservation
+                assert!(
+                    Arc::get_mut(&mut page.plaintext.inner)
+                        .unwrap()
+                        .storage
+                        .replace_charge(crate::memory::PlaintextCharge(reservation))
+                        .is_ok()
+                );
             }
             ResourceClass::Ciphertext => {
                 Arc::get_mut(&mut page.ciphertext.inner)
@@ -3813,7 +3815,7 @@ fn selected_owner_reclaims_foreign_receive_charges_across_full_pages() {
                 .fill
                 .dependencies
                 .admission
-                .owns(&result.plaintext.inner.reservation)
+                .owns(result.plaintext.inner.charge())
         );
         assert!(
             target
@@ -4565,7 +4567,8 @@ fn cold_partial_page_admits_exact_plaintext_from_disk_and_pending() {
     let queue = Rc::new(uring_runtime::drivers::DriverQueue::new(1024));
     let _owner = queue.enter();
     for disk in [true, false] {
-        for free in [13_109_248usize, 13_109_247, PAGE_BYTES as usize] {
+        // Pooled plaintext is charged at its 4 KiB-granule capacity.
+        for free in [13_111_296usize, 13_111_295, PAGE_BYTES as usize] {
             let mut f = local_tail_fixture(63_440_896, disk);
             let admission = f.fill.dependencies.admission.clone();
             let pressure = admission
@@ -4581,7 +4584,7 @@ fn cold_partial_page_admits_exact_plaintext_from_disk_and_pending() {
                 &mut f.engine,
                 &f.crypto,
             );
-            if free == 13_109_247 {
+            if free == 13_111_295 {
                 assert!(matches!(result, Err(Error::Overloaded)));
             } else {
                 let Some(crate::memory::AcquiredPage::Plaintext(page)) =
@@ -4594,7 +4597,7 @@ fn cold_partial_page_admits_exact_plaintext_from_disk_and_pending() {
                 assert_eq!(page.metadata.length, 63_440_896);
                 assert_eq!(
                     admission.used(ResourceClass::Plaintext),
-                    pressure.amount() + 13_109_248
+                    pressure.amount() + 13_111_296
                 );
             }
             assert_eq!(f.origin.calls.get(), 0);

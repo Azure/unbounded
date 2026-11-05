@@ -735,14 +735,7 @@ pub(super) fn page(app: &WorkerApplication) -> crate::memory::PageResult {
     let plaintext = VerifiedPage {
         inner: Arc::new(VerifiedBytes {
             page: id.clone(),
-            storage: flow_control::ChargedBytes {
-                bytes: vec![1; 3],
-                reservation: app
-                    .runtime
-                    .admission
-                    .reserve(Some(cache), ResourceClass::Plaintext, 3)
-                    .unwrap(),
-            },
+            storage: crate::memory::fixture_plaintext(&app.runtime.admission, Some(cache), &[1; 3]),
         }),
     };
     let ciphertext = BufferPool::new(app.runtime.admission.clone())

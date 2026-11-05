@@ -631,12 +631,7 @@ mod destination_disconnect {
             plaintext: VerifiedPage {
                 inner: Arc::new(VerifiedBytes {
                     page: page.clone(),
-                    storage: flow_control::ChargedBytes {
-                        bytes: vec![1, 2, 3],
-                        reservation: admission
-                            .reserve(None, ResourceClass::Plaintext, 3)
-                            .unwrap(),
-                    },
+                    storage: crate::memory::fixture_plaintext(admission, None, &[1, 2, 3]),
                 }),
             },
             ciphertext: CiphertextPage {
@@ -1354,11 +1349,11 @@ mod encrypted_http {
                 let clear = cryptos[0]
                     .decrypt(
                         ciphertext.clone(),
-                        admissions[0].reserve(
+                        crate::memory::fixture_plaintext(
+                            &admissions[0],
                             Some(&CacheId(CACHE.into())),
-                            ResourceClass::Plaintext,
-                            length,
-                        )?,
+                            &vec![0; length],
+                        ),
                         turn,
                     )
                     .await;

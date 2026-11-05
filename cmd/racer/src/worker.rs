@@ -1847,11 +1847,11 @@ mod tests {
                         let key = self.keys.active(&cache, KeyPurpose::Page)?;
                         let input = CryptoInput::Decrypt {
                             ciphertext,
-                            plaintext: self.runtime.admission.reserve(
+                            plaintext: crate::memory::fixture_plaintext(
+                                &self.runtime.admission,
                                 Some(&cache),
-                                ResourceClass::Plaintext,
-                                1,
-                            )?,
+                                &[0; 1],
+                            ),
                         };
                         let CryptoOutput::Decrypted(plain, _) =
                             self.runtime.crypto.execute(input, key, scope).await?

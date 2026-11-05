@@ -426,14 +426,14 @@ impl PageCrypto {
     ///     admission::AdmissionPolicy, runtime::RequestScope};
     /// fn require_send<T: Send>(_: T) {}
     /// fn move_future(crypto: &PageCrypto, page: CiphertextPage,
-    ///     output: flow_control::Charge<AdmissionPolicy>, scope: &RequestScope) {
+    ///     output: racer::memory::PlaintextBuf, scope: &RequestScope) {
     ///     require_send(crypto.decrypt(page, output, scope));
     /// }
     /// ```
     pub fn decrypt<'a>(
         &'a self,
         ciphertext: CiphertextPage,
-        plaintext: flow_control::Charge<AdmissionPolicy>,
+        plaintext: crate::memory::PlaintextBuf,
         scope: &'a RequestScope,
     ) -> Operation<'a, VerifiedPage> {
         Box::pin(async move {
@@ -701,23 +701,29 @@ impl PageCryptoEngine {
                     {
                         return Err(Error::CorruptRecord);
                     }
-                    plaintext
-                        .validate(ResourceClass::Plaintext, envelope.plaintext_length as usize)?;
-                    if plaintext.key() != Some(&envelope.page.version.object.cache) {
+                    let charge = plaintext.charge();
+                    if plaintext.len() != length
+                        || charge
+                            .validate(ResourceClass::Plaintext, plaintext.capacity())
+                            .is_err()
+                    {
                         return Err(Error::InvalidConfiguration);
                     }
-                    // Decryption allocates only plaintext-length storage,
-                    // never an uncharged tag-sized tail under plaintext admission.
-                    let mut bytes = Zeroizing::new(plaintext.buffer(length)?);
+                    if charge.key() != Some(&envelope.page.version.object.cache) {
+                        return Err(Error::InvalidConfiguration);
+                    }
                     key.open_page(
                         &envelope.page.version.object.cache,
                         envelope.key_id,
                         &envelope.nonce.0,
                         &aad,
                         ciphertext.bytes(),
-                        &mut bytes,
+                        &mut plaintext[..],
                     )
                     .map_err(|_| {
+                        // Erase partial output now; the storage outlives the
+                        // failure with the returned input.
+                        plaintext.fill(0);
                         permit.rejected(IntegrityRejection::Aead);
                         permit.aead_failure = Some(capture_aead_failure(
                             ciphertext,
@@ -727,7 +733,7 @@ impl PageCryptoEngine {
                         ));
                         Error::CorruptRecord
                     })?;
-                    (envelope.clone(), bytes)
+                    (envelope.clone(), Zeroizing::new(Vec::new()))
                 }
             }
         };
@@ -753,14 +759,10 @@ impl PageCryptoEngine {
                 plaintext,
                 ciphertext,
             } => {
-                let (plain, reservation) = plaintext.into_parts();
                 let plain = VerifiedPage {
                     inner: Arc::new(VerifiedBytes {
                         page,
-                        storage: flow_control::ChargedBytes {
-                            bytes: plain.into_vec(),
-                            reservation,
-                        },
+                        storage: plaintext.into_buf(),
                     }),
                 };
                 let encrypted = match ciphertext {
@@ -790,18 +792,12 @@ impl PageCryptoEngine {
             }
             CryptoInput::Decrypt {
                 ciphertext,
-                mut plaintext,
+                plaintext,
             } => {
-                plaintext
-                    .shrink(bytes.capacity())
-                    .expect("validated crypto capacity");
                 let page = VerifiedPage {
                     inner: Arc::new(VerifiedBytes {
                         page: envelope.page,
-                        storage: flow_control::ChargedBytes {
-                            bytes: std::mem::take(&mut *bytes),
-                            reservation: plaintext,
-                        },
+                        storage: plaintext,
                     }),
                 };
                 CryptoOutcome::Completed(CryptoOutput::Decrypted(page, ciphertext))
@@ -1199,9 +1195,11 @@ pub enum CryptoInput {
     VerifyEnvelope(Box<crate::peer::forwarding::EnvelopeJob>),
     /// Check the stored AEAD tag without allocating plaintext or decrypting.
     VerifyTag { ciphertext: CiphertextPage },
+    /// `plaintext` is pooled storage of exactly the plaintext length,
+    /// checked out by the requesting worker.
     Decrypt {
         ciphertext: CiphertextPage,
-        plaintext: flow_control::Charge<AdmissionPolicy>,
+        plaintext: crate::memory::PlaintextBuf,
     },
     Encrypt {
         page: PageId,
@@ -2509,9 +2507,20 @@ mod tests {
                                     KeyId([99; 16]);
                             }
                             if mode == "invalid_configuration" {
-                                *plaintext = admission
-                                    .reserve(Some(&cache), ResourceClass::Ciphertext, 1)
+                                // Storage refuses non-plaintext charges, so
+                                // configure a plaintext charge for another cache.
+                                let wrong = admission
+                                    .reserve(
+                                        Some(&CacheId("other".into())),
+                                        ResourceClass::Plaintext,
+                                        page_alloc::buf::GRANULE,
+                                    )
                                     .unwrap();
+                                assert!(
+                                    plaintext
+                                        .replace_charge(crate::memory::PlaintextCharge(wrong))
+                                        .is_ok()
+                                );
                             }
                             if mode == "malformed" {
                                 Arc::get_mut(&mut ciphertext.inner)
@@ -3267,9 +3276,11 @@ mod tests {
                     }
                     CryptoInput::Decrypt {
                         ciphertext,
-                        plaintext: admission
-                            .reserve(Some(cache), crate::admission::ResourceClass::Plaintext, 1)
-                            .unwrap(),
+                        plaintext: crate::memory::fixture_plaintext(
+                            admission,
+                            Some(cache),
+                            &[0; 1],
+                        ),
                     }
                 } else {
                     if corrupt && let CryptoInput::Encrypt { page, .. } = &mut data {
@@ -3412,9 +3423,11 @@ mod tests {
                             .unwrap();
                         CryptoInput::Decrypt {
                             ciphertext,
-                            plaintext: admission
-                                .reserve(Some(cache), ResourceClass::Plaintext, size)
-                                .unwrap(),
+                            plaintext: crate::memory::fixture_plaintext(
+                                admission,
+                                Some(cache),
+                                &vec![0; size],
+                            ),
                         }
                     }
                 }
@@ -3554,7 +3567,7 @@ mod tests {
                     assert!(future.as_mut().poll(&mut cx).is_pending());
                 }
                 assert_eq!(client.outstanding(), 1);
-                assert_eq!(admission.used(ResourceClass::Plaintext), 1);
+                assert_eq!(admission.used(ResourceClass::Plaintext), 4096);
                 let job = match engine.poll_job(&mut cx) {
                     Poll::Ready(Ok(Some(job))) => job,
                     _ => panic!("job"),
@@ -3832,7 +3845,7 @@ mod tests {
                 assert!(operation.as_mut().poll(&mut cx).is_pending());
                 drop(operation);
                 assert_eq!(client.outstanding(), 1);
-                assert_eq!(admission.used(ResourceClass::Plaintext), 3);
+                assert_eq!(admission.used(ResourceClass::Plaintext), 4096);
                 let job = match engine.poll_job(&mut cx) {
                     Poll::Ready(Ok(Some(job))) => job,
                     _ => panic!("accepted job"),
@@ -3856,7 +3869,7 @@ mod tests {
                         .is_ok()
                 );
                 assert_eq!(client.outstanding(), 1);
-                assert_eq!(admission.used(ResourceClass::Plaintext), 3);
+                assert_eq!(admission.used(ResourceClass::Plaintext), 4096);
                 assert_eq!(count.0.load(Ordering::Relaxed), 1);
                 client.poll_budgeted(1).unwrap();
                 assert!(
@@ -4213,9 +4226,11 @@ mod tests {
                 permit.job(
                     CryptoInput::Decrypt {
                         ciphertext: original,
-                        plaintext: admission
-                            .reserve(Some(cache), ResourceClass::Plaintext, length)
-                            .unwrap(),
+                        plaintext: crate::memory::fixture_plaintext(
+                            &admission,
+                            Some(cache),
+                            &vec![0; length],
+                        ),
                     },
                     keys.active(cache, KeyPurpose::Page).unwrap(),
                     RequestScope::host(
@@ -4234,7 +4249,10 @@ mod tests {
             assert_eq!(clear.bytes(), raw);
             assert_eq!(original.bytes().as_ptr(), pointer);
             assert_eq!(Sha256::digest(original.bytes()), current_digest);
-            assert_eq!(admission.used(ResourceClass::Plaintext), length);
+            assert_eq!(
+                admission.used(ResourceClass::Plaintext),
+                length.max(1).next_multiple_of(4096)
+            );
             assert_eq!(admission.used(ResourceClass::Ciphertext), length + 16);
             drop(completion);
             admission.reclaim_buffers();
@@ -4333,9 +4351,7 @@ mod tests {
             let original_pointer = cipher.bytes().as_ptr();
             let input = CryptoInput::Decrypt {
                 ciphertext: cipher,
-                plaintext: admission
-                    .reserve(Some(cache), ResourceClass::Plaintext, 5)
-                    .unwrap(),
+                plaintext: crate::memory::fixture_plaintext(&admission, Some(cache), &[0; 5]),
             };
             let scope = RequestScope::host(
                 RequestId([1; 16]),
@@ -4399,11 +4415,14 @@ mod tests {
                     );
                     assert_eq!(ciphertext.bytes(), bytes);
                     assert_eq!(ciphertext.bytes().as_ptr(), original_pointer);
-                    assert_eq!(plaintext.amount(), 5);
+                    assert_eq!(plaintext.charge().amount(), page_alloc::buf::GRANULE);
                 }
                 _ => panic!("wrong outcome"),
             }
-            assert_eq!(admission.used(ResourceClass::Plaintext), 5);
+            assert_eq!(
+                admission.used(ResourceClass::Plaintext),
+                page_alloc::buf::GRANULE
+            );
             assert_eq!(admission.used(ResourceClass::Ciphertext), 21);
             drop(completion);
             assert_eq!(admission.used(ResourceClass::Plaintext), 0);
@@ -4657,7 +4676,7 @@ mod tests {
                 )
                 .is_pending()
             );
-            assert_eq!(admission.used(ResourceClass::Plaintext), 5);
+            assert_eq!(admission.used(ResourceClass::Plaintext), 4096);
             drop(completion);
             assert_eq!(admission.used(ResourceClass::Plaintext), 0);
             assert_eq!(admission.used(ResourceClass::Ciphertext), 0);
@@ -4748,9 +4767,7 @@ mod tests {
             };
             let input = CryptoInput::Decrypt {
                 ciphertext: cipher,
-                plaintext: admission
-                    .reserve(Some(cache), ResourceClass::Plaintext, 5)
-                    .unwrap(),
+                plaintext: crate::memory::fixture_plaintext(&admission, Some(cache), &[0; 5]),
             };
             assert!(
                 io.try_submit(permit.job(
@@ -4792,7 +4809,7 @@ mod tests {
             drop(completion);
             assert_eq!(
                 admission.used(ResourceClass::Plaintext),
-                (9 - sequence) as usize * 5
+                (9 - sequence) as usize * 4096
             );
         }
         assert!(matches!(drain.as_mut().poll(&mut cx), Poll::Ready(Ok(()))));

@@ -775,11 +775,11 @@ mod safety {
                 let clear = cryptos[0]
                     .decrypt(
                         ciphertext.clone(),
-                        f.admissions[0].reserve(
+                        crate::memory::fixture_plaintext(
+                            &f.admissions[0],
                             Some(&CacheId(CACHE.into())),
-                            ResourceClass::Plaintext,
-                            length,
-                        )?,
+                            &vec![0; length],
+                        ),
                         &f.scope,
                     )
                     .await;
