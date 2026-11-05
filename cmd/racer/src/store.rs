@@ -1681,9 +1681,11 @@ impl Drop for DirtyCleanup<'_> {
 // Page record format version, stored after the magic. Readers treat any other
 // version as a cold miss.
 //
-// Version 4 layout (version 3 plus the page size after the cipher, so a store
+// Version 5 layout (version 3 plus the page size after the cipher, so a store
 // reopened under another published page size sees its pages as cut at the old
-// size):
+// size). Version 5 has the version 4 layout; its ciphertext is sealed under
+// page AAD v2, which also binds the page size, so version 4 records are a cold
+// miss rather than an authentication failure:
 // - `[0, real)`: header fields followed by a SHA-256 digest of the preceding
 //   header bytes. `real` is at most `MAX_RAW_HEADER_BYTES`.
 // - `[real, header_len)`: zero padding. `header_len` (stored at bytes 12..16)
@@ -1692,7 +1694,7 @@ impl Drop for DirtyCleanup<'_> {
 // - `[header_len, header_len + ciphertext_length)`: ciphertext, so it starts at
 //   a disk-aligned offset and can be written from its own aligned buffer.
 // - The remainder up to the record extent is zero padding.
-pub const FORMAT_VERSION: u32 = 4;
+pub const FORMAT_VERSION: u32 = 5;
 pub const MAX_ID_BYTES: usize = 4096;
 pub const MAX_ETAG_BYTES: usize = 8192;
 /// Upper bound on the unpadded header, including its digest.

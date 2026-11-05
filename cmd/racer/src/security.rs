@@ -186,18 +186,21 @@ pub(crate) fn field(out: &mut Vec<u8>, value: &[u8]) -> Result<()> {
 /// stream it into GHASH without building a per-page buffer.
 ///
 /// Layout: domain, cipher:u32 BE, cache(length:u32 BE, bytes), exact object key,
-/// quoted ETag(length:u32 BE, bytes), page:u64 BE, key ID, nonce, lengths:u32 BE.
+/// quoted ETag(length:u32 BE, bytes), page:u64 BE, page size:u32 BE, key ID,
+/// nonce, lengths:u32 BE. The page size binds the page number's meaning: a page
+/// claiming another size than it was sealed at fails authentication.
 pub(crate) struct PageAad<'a> {
     envelope: &'a PageEnvelope,
     cipher: [u8; 4],
     cache_length: [u8; 4],
     etag_length: [u8; 4],
     number: [u8; 8],
+    page_size: [u8; 4],
     plaintext_length: [u8; 4],
     ciphertext_length: [u8; 4],
 }
 impl<'a> PageAad<'a> {
-    const DOMAIN: &'static [u8] = b"racer/page/aead/v1\0";
+    const DOMAIN: &'static [u8] = b"racer/page/aead/v2\0";
 
     pub(crate) fn new(envelope: &'a PageEnvelope) -> Result<Self> {
         envelope.validate()?;
@@ -219,13 +222,17 @@ impl<'a> PageAad<'a> {
             cache_length: length(cache)?,
             etag_length: length(etag)?,
             number: envelope.page.number.0.to_be_bytes(),
+            // At most 16 MiB, so it always fits.
+            page_size: u32::try_from(envelope.page_size.get())
+                .map_err(|_| Error::CorruptRecord)?
+                .to_be_bytes(),
             plaintext_length: envelope.plaintext_length.to_be_bytes(),
             ciphertext_length: envelope.ciphertext_length.to_be_bytes(),
         })
     }
 
     /// The AAD is the concatenation of these parts.
-    pub(crate) fn parts(&self) -> [&[u8]; 12] {
+    pub(crate) fn parts(&self) -> [&[u8]; 13] {
         let envelope = self.envelope;
         [
             Self::DOMAIN,
@@ -236,6 +243,7 @@ impl<'a> PageAad<'a> {
             &self.etag_length,
             envelope.page.version.etag.as_bytes(),
             &self.number,
+            &self.page_size,
             &envelope.key_id.0,
             &envelope.nonce.0,
             &self.plaintext_length,
@@ -3967,7 +3975,7 @@ mod tests {
     fn page_cipher_id_is_authenticated_in_aad() {
         let descriptor = envelope();
         let mut aad = page_aad(&descriptor).unwrap();
-        let offset = b"racer/page/aead/v1\0".len();
+        let offset = b"racer/page/aead/v2\0".len();
         assert_eq!(&aad[offset..offset + 4], &1u32.to_be_bytes());
         let mut sealed = [0; 21];
         racer_crypto::seal(&[7; 32], &descriptor.nonce.0, &aad, b"hello", &mut sealed).unwrap();
@@ -3983,10 +3991,10 @@ mod tests {
     fn page_aad_is_domain_separated_and_binds_every_descriptor_field() {
         let original = envelope();
         let aad = page_aad(&original).unwrap();
-        assert!(aad.starts_with(b"racer/page/aead/v1\0\0\0\0\x01\0\0\0\x24"));
+        assert!(aad.starts_with(b"racer/page/aead/v2\0\0\0\0\x01\0\0\0\x24"));
         let mut bytes = vec![0; 5 + TAG_LEN];
         racer_crypto::seal(&[7; 32], &original.nonce.0, &aad, b"hello", &mut bytes).unwrap();
-        for index in 0..8 {
+        for index in 0..9 {
             let mut changed = original.clone();
             match index {
                 0 => {
@@ -4002,6 +4010,8 @@ mod tests {
                     changed.plaintext_length += 1;
                     changed.ciphertext_length += 1;
                 }
+                // D13: the same page number at another page size.
+                7 => changed.page_size = racer_wire::object::PageSize::new(64 << 10).unwrap(),
                 _ => changed.page.version.object.cache.0.replace_range(..1, "4"),
             }
             let mut tampered = vec![0; 5];
@@ -4047,8 +4057,8 @@ mod tests {
         assert_eq!(
             bytes,
             [
-                0xb2, 0xd4, 0x6c, 0x90, 0xe7, 0x98, 0x16, 0x03, 0x48, 0xb3, 0x6e, 0x1a, 0x89, 0xf2,
-                0xb4, 0xdc, 0x7d, 0x49, 0x17, 0x13, 0x15
+                0xb2, 0xd4, 0x6c, 0x90, 0xe7, 0xea, 0x51, 0xe0, 0x29, 0xb6, 0xe8, 0xd0, 0x20, 0x5d,
+                0x5a, 0x40, 0x2d, 0x98, 0x29, 0x24, 0x88
             ]
         );
     }
@@ -4067,51 +4077,51 @@ mod tests {
         let vectors = [
             (
                 1,
-                "e61324a8db298fa724eebace826484a4fe1741f3822483fcc041f7678cdd63e6",
+                "902d04fe2515d8e144bc18f48ec9828b4a44bbc94e4074cc512728a3d9bd83a2",
             ),
             (
                 15,
-                "7518184c786851a15dd1c5bb1611d4969323097202f2f8ba2751fc4f4d0da920",
+                "d71434e67dbe2cbd2f254293d7af6b496340706f95dc5eacf54ccc22cb94ffed",
             ),
             (
                 16,
-                "754db504aac0a9bf1937dbb234302a2ff17e45a5405bd1f01eabbf7e3602bfee",
+                "6f67d58769c63fdab1053d90563a1b94df60b16f2e6dc7db97071d4d3b8ca1e3",
             ),
             (
                 17,
-                "c847ecb579fee8b6438137ceb0e1d38fc86142a1261b6c130b9a3c21536aaaf3",
+                "817267b777ab2af3ed1f1a3dea907d8e3f9f6f359473a7399c7332f251770f8a",
             ),
             (
                 63,
-                "5fcaa5d16d48a9682b2b67c0f7e8a92c78b46d5faba8055be2374f62a6a22d8b",
+                "2ec02cd29dccaf7f31848a1c9356a5d4b316488cb8cd5669b092ede5bd88c06a",
             ),
             (
                 64,
-                "bbb570f99a4ade3980a969c74357172d935c577e6a2a9a7aa3337b2472a331f6",
+                "b37dc286b2c84a6fe79556aa79d8e53194536cd5f287706a0abf166f4056d2fa",
             ),
             (
                 65,
-                "27a4d9f672a859747e37434a6603cb514c1ea9434a4cea4783188df16d6c214b",
+                "dd719fe6bd5d0dd5805384d836e1e467e2887034d56c392d38df506c995e1380",
             ),
             (
                 255,
-                "7518946a4afcb1d1d1f3ef67d1f5868a69bf43898319fb8e52e49cfeb675b7cf",
+                "538f9ef2d45a671c3eb94cdc7d2c0329601533c53c7cdc030f67bea786aec6b5",
             ),
             (
                 256,
-                "ec9cf529f452314760ffcb2d7f28070e2423f4e483638a7ad1543bf7ab0ea379",
+                "9db1041bf3cde1aafc0f78367712fe1a6e81970f934cabddd8a85938c3b90923",
             ),
             (
                 257,
-                "98a258d3b9dcb5cee06085e2294b0094a915c5df6bd19850e22e754480bc646e",
+                "3939acb09041e32debc0183bffaa95a18a3594f7eeaaf0467a90da9f1fc9736b",
             ),
             (
                 16777215,
-                "f87d981e91a2843f17f5f08ab03d595ec8e43a462f70b69e2d71db0026a3d472",
+                "002a3c9d0a158493c46cd3cdb66d8dfe06b5edbeb527f12d2536e1d5b616c4d6",
             ),
             (
                 16777216,
-                "8b8ec02ea8cf51a61703c064e988f7a15837f26753ff31d5dc44b808eb4e6fcc",
+                "bbf1eee5774267cf76c4aea9e8426da764b7799d713e848c3b9850120864728d",
             ),
         ];
         let keys = crate::test_support::security::keys();
