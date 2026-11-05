@@ -124,7 +124,14 @@ func (r *MachineOperationReconciler) ReconcileAllocationOperation(ctx context.Co
 		case unboundedv1alpha3.OperationPhaseComplete:
 			return r.completeOperation(ctx, &op, target.ObservedGeneration, target.Message)
 		case unboundedv1alpha3.OperationPhaseFailed:
-			return r.failOperation(ctx, &op, "TargetFailed", target.Message)
+			// The update that failed the target set the reason on the
+			// Completed condition.
+			reason := "TargetFailed"
+			if completed := apimeta.FindStatusCondition(op.Status.Conditions, OperationConditionCompleted); completed != nil {
+				reason = completed.Reason
+			}
+
+			return r.failOperation(ctx, &op, reason, target.Message)
 		}
 
 		a.handle = target.ProviderOperation != nil
@@ -132,7 +139,7 @@ func (r *MachineOperationReconciler) ReconcileAllocationOperation(ctx context.Co
 
 		if a.handle && target.ProviderOperation.Provider != match.provider.Name() {
 			message := fmt.Sprintf("persisted provider operation belongs to %q, not %q", target.ProviderOperation.Provider, match.provider.Name())
-			return r.failOperationTarget(ctx, &op, machine.Name, "ProviderOperationMismatch", message)
+			return r.finishAllocationOperation(ctx, a, unboundedv1alpha3.OperationPhaseFailed, "ProviderOperationMismatch", message, nil, false)
 		}
 	}
 
@@ -341,6 +348,8 @@ func releaseBlocked(a *allocationOperation, allocate *unboundedv1alpha3.MachineO
 		return "the Machine is not fenced"
 	case a.allocation.Status.Operations.Allocate != nil && (allocate == nil || !allocate.Status.IsTerminal()):
 		return "the recorded HostAllocate is missing or not finished"
+	case allocate != nil && ownershipUnknown(allocate):
+		return "the recorded HostAllocate's ownership is unknown"
 	}
 
 	return ""
@@ -604,15 +613,30 @@ func (r *MachineOperationReconciler) beginAllocationOperation(
 	}
 
 	begin, beginErr := a.match.operation.Begin(ctx, r.allocationOperationRequest(a, target, auth, allocation))
-	if beginErr != nil {
+	if beginErr == nil && strings.TrimSpace(begin.Operation.OperationID) == "" {
+		beginErr = errors.New("provider returned an empty operation ID")
+	}
+
+	if beginErr == nil {
+		return r.applyBeginResult(ctx, a.op, a.machine, a.match, begin)
+	}
+
+	var permanentErr *publicmachineops.PermanentError
+	if !errors.As(beginErr, &permanentErr) {
 		return r.handleBeginError(ctx, a.op, a.machine.Name, beginErr)
 	}
 
-	if strings.TrimSpace(begin.Operation.OperationID) == "" {
-		return r.handleBeginError(ctx, a.op, a.machine.Name, errors.New("provider returned an empty operation ID"))
+	reason := valueOrDefault(permanentErr.Reason, "PermanentProviderFailure")
+	message = fmt.Sprintf("begin provider operation: %v", beginErr)
+
+	// A refusal is safe only on the first call: a HostAllocate Begin that
+	// may have run before can have created a host it no longer reports.
+	if a.begun && a.op.Spec.OperationKind == unboundedv1alpha3.OperationHostAllocate {
+		message = fmt.Sprintf("Begin may have run before and now returned %s: %s", reason, message)
+		reason = allocationReasonOwnershipUnknown
 	}
 
-	return r.applyBeginResult(ctx, a.op, a.machine, a.match, begin)
+	return r.finishAllocationOperation(ctx, a, unboundedv1alpha3.OperationPhaseFailed, reason, message, nil, true)
 }
 
 // pollAllocationOperation polls the persisted handle. A HostAllocate result
@@ -636,7 +660,13 @@ func (r *MachineOperationReconciler) pollAllocationOperation(
 
 		var permanentErr *publicmachineops.PermanentError
 		if errors.As(err, &permanentErr) {
-			return r.finishAllocationOperation(ctx, a, unboundedv1alpha3.OperationPhaseFailed, valueOrDefault(permanentErr.Reason, "PermanentPollFailure"), message, nil)
+			reason := valueOrDefault(permanentErr.Reason, "PermanentPollFailure")
+			if a.op.Spec.OperationKind == unboundedv1alpha3.OperationHostAllocate {
+				message = fmt.Sprintf("%s: %s", reason, message)
+				reason = allocationReasonOwnershipUnknown
+			}
+
+			return r.finishAllocationOperation(ctx, a, unboundedv1alpha3.OperationPhaseFailed, reason, message, nil, false)
 		}
 
 		delay := r.providerPollInterval()
@@ -648,8 +678,19 @@ func (r *MachineOperationReconciler) pollAllocationOperation(
 	}
 
 	var allocationResult *publicmachineops.AllocationResult
+
 	if a.op.Spec.OperationKind == unboundedv1alpha3.OperationHostAllocate {
 		allocationResult = result.Result.Allocation
+
+		terminal := result.State == publicmachineops.ProviderOperationStateSucceeded ||
+			result.State == publicmachineops.ProviderOperationStateFailed ||
+			result.State == publicmachineops.ProviderOperationStateCanceled
+		if terminal && allocationResult == nil {
+			message := fmt.Sprintf("provider operation %s ended %s with reason %q and reported no owned resources: %s",
+				providerOperation.OperationID, result.State, result.Reason, result.Message)
+
+			return r.finishAllocationOperation(ctx, a, unboundedv1alpha3.OperationPhaseFailed, allocationReasonOwnershipUnknown, message, nil, false)
+		}
 	}
 
 	switch result.State {
@@ -664,12 +705,12 @@ func (r *MachineOperationReconciler) pollAllocationOperation(
 	case publicmachineops.ProviderOperationStateSucceeded:
 		message := valueOrDefault(result.Message, fmt.Sprintf("%s completed via %s", a.op.Spec.OperationKind, a.match.provider.Name()))
 
-		return r.finishAllocationOperation(ctx, a, unboundedv1alpha3.OperationPhaseComplete, "Succeeded", message, allocationResult)
+		return r.finishAllocationOperation(ctx, a, unboundedv1alpha3.OperationPhaseComplete, "Succeeded", message, allocationResult, false)
 	case publicmachineops.ProviderOperationStateFailed, publicmachineops.ProviderOperationStateCanceled:
 		reason := valueOrDefault(result.Reason, string(result.State))
 		message := valueOrDefault(result.Message, fmt.Sprintf("provider operation %s %s", providerOperation.OperationID, strings.ToLower(string(result.State))))
 
-		return r.finishAllocationOperation(ctx, a, unboundedv1alpha3.OperationPhaseFailed, reason, message, allocationResult)
+		return r.finishAllocationOperation(ctx, a, unboundedv1alpha3.OperationPhaseFailed, reason, message, allocationResult, false)
 	default:
 		message := fmt.Sprintf("provider operation %s returned unknown state %q", providerOperation.OperationID, result.State)
 
@@ -677,8 +718,11 @@ func (r *MachineOperationReconciler) pollAllocationOperation(
 	}
 }
 
-// finishAllocationOperation makes the target terminal, with the HostAllocate
-// result in the same status update, and then the operation.
+// finishAllocationOperation makes the target terminal and then the
+// operation. In the update that makes the target terminal it also writes the
+// HostAllocate result, when there is one, and for a failure sets the
+// Completed condition to the reason, so a crash before the operation phase
+// is written keeps the reason. attempted counts a provider call that failed.
 func (r *MachineOperationReconciler) finishAllocationOperation(
 	ctx context.Context,
 	a *allocationOperation,
@@ -686,11 +730,17 @@ func (r *MachineOperationReconciler) finishAllocationOperation(
 	reason string,
 	message string,
 	result *publicmachineops.AllocationResult,
+	attempted bool,
 ) (ctrl.Result, error) {
+	failed := phase == unboundedv1alpha3.OperationPhaseFailed
+	reason = normalizeConditionReason(reason)
+
 	targetMessage := message
-	if phase == unboundedv1alpha3.OperationPhaseFailed {
+	if failed {
 		targetMessage = fmt.Sprintf("%s: %s", reason, message)
 	}
+
+	targetMessage = TruncateUTF8Bytes(targetMessage, MaxConditionMessageBytes)
 
 	if err := r.updateOperationStatus(ctx, a.op.Name, func(latest *unboundedv1alpha3.MachineOperation) {
 		target, ok := operationTarget(latest, a.machine.Name)
@@ -698,9 +748,19 @@ func (r *MachineOperationReconciler) finishAllocationOperation(
 			return
 		}
 
+		if attempted {
+			now := r.now()
+			target.Attempts++
+			target.LastAttemptAt = &now
+			target.Stage = ""
+
+			if target.StartedAt == nil {
+				target.StartedAt = &now
+			}
+		}
+
 		r.markOperationTargetFinished(target, phase, targetMessage)
-		target.Message = TruncateUTF8Bytes(target.Message, MaxConditionMessageBytes)
-		latest.Status.Message = target.Message
+		latest.Status.Message = targetMessage
 
 		if result != nil && latest.Status.Allocation == nil {
 			latest.Status.Allocation = &unboundedv1alpha3.MachineOperationAllocationResult{
@@ -711,11 +771,21 @@ func (r *MachineOperationReconciler) finishAllocationOperation(
 				OwnedResources:     slices.Clone(result.OwnedResources),
 			}
 		}
+
+		if failed {
+			apimeta.SetStatusCondition(&latest.Status.Conditions, normalizeCondition(metav1.Condition{
+				Type:               OperationConditionCompleted,
+				Status:             metav1.ConditionFalse,
+				Reason:             reason,
+				Message:            targetMessage,
+				ObservedGeneration: latest.Generation,
+			}))
+		}
 	}); err != nil {
 		return ctrl.Result{}, err
 	}
 
-	if phase == unboundedv1alpha3.OperationPhaseComplete {
+	if !failed {
 		return r.completeOperation(ctx, a.op, a.machine.Generation, message)
 	}
 
@@ -745,7 +815,7 @@ func (r *MachineOperationReconciler) failAllocationOperation(
 	message string,
 ) (ctrl.Result, error) {
 	if _, ok := operationTarget(a.op, a.machine.Name); ok {
-		return r.failOperationTarget(ctx, a.op, a.machine.Name, reason, message)
+		return r.finishAllocationOperation(ctx, a, unboundedv1alpha3.OperationPhaseFailed, reason, message, nil, false)
 	}
 
 	return r.failOperation(ctx, a.op, reason, message)

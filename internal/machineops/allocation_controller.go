@@ -59,6 +59,7 @@ const (
 	allocationReasonReleaseOperationMissing   = "ReleaseOperationMissing"
 	allocationReasonMachineMissing            = "MachineMissing"
 	allocationReasonBeginOutcomeUnknown       = "BeginOutcomeUnknown"
+	allocationReasonOwnershipUnknown          = "OwnershipUnknown"
 )
 
 const (
@@ -152,6 +153,9 @@ type allocationState struct {
 	status     *unboundedv1alpha3.MachineAllocationStatus
 	names      allocationNames
 	requeue    time.Duration
+	// wrote reports that this reconcile already wrote an object other than
+	// the allocation status.
+	wrote bool
 }
 
 func (s *allocationState) wait(after time.Duration) {
@@ -193,9 +197,15 @@ func (r *MachineAllocationReconciler) Reconcile(ctx context.Context, req ctrl.Re
 		names:      allocationNamesFor(allocation.UID),
 	}
 
-	// A finished allocation is left alone.
-	if !s.hasFinalizer() && apimeta.IsStatusConditionTrue(allocation.Status.Conditions, unboundedv1alpha3.MachineAllocationConditionReleased) {
-		return ctrl.Result{}, nil
+	if apimeta.IsStatusConditionTrue(allocation.Status.Conditions, unboundedv1alpha3.MachineAllocationConditionReleased) {
+		// A finished allocation is left alone.
+		if !s.hasFinalizer() {
+			return ctrl.Result{}, nil
+		}
+
+		// Released=True is the commit point: the host is released and the
+		// fence is complete, so only the finalizers are left to remove.
+		return ctrl.Result{}, r.cleanup(ctx, s)
 	}
 
 	signal, err := r.retirementSignal(ctx, s)
@@ -474,7 +484,12 @@ func (r *MachineAllocationReconciler) finishWrite(ctx context.Context, s *alloca
 // patchMetadata applies mutate to a deep copy of object and sends the
 // difference as a merge patch with an optimistic lock. Only metadata may
 // change.
-func (r *MachineAllocationReconciler) patchMetadata(ctx context.Context, object client.Object, mutate func(client.Object) bool) error {
+func (r *MachineAllocationReconciler) patchMetadata(
+	ctx context.Context,
+	s *allocationState,
+	object client.Object,
+	mutate func(client.Object) bool,
+) error {
 	base, ok := object.DeepCopyObject().(client.Object)
 	if !ok {
 		return fmt.Errorf("copy %T %s", object, object.GetName())
@@ -489,11 +504,9 @@ func (r *MachineAllocationReconciler) patchMetadata(ctx context.Context, object 
 		return nil
 	}
 
-	if err := r.Patch(ctx, updated, client.MergeFromWithOptions(base, client.MergeFromWithOptimisticLock{})); err != nil {
-		if apierrors.IsNotFound(err) {
-			return nil
-		}
+	s.wrote = true
 
+	if err := r.Patch(ctx, updated, client.MergeFromWithOptions(base, client.MergeFromWithOptimisticLock{})); err != nil {
 		return fmt.Errorf("patch %T %s metadata: %w", object, object.GetName(), err)
 	}
 
@@ -502,10 +515,15 @@ func (r *MachineAllocationReconciler) patchMetadata(ctx context.Context, object 
 
 // removeFinalizer removes finalizer from object, if it is there. A missing
 // object counts as done.
-func (r *MachineAllocationReconciler) removeFinalizer(ctx context.Context, object client.Object, finalizer string) error {
-	return r.patchMetadata(ctx, object, func(updated client.Object) bool {
+func (r *MachineAllocationReconciler) removeFinalizer(ctx context.Context, s *allocationState, object client.Object, finalizer string) error {
+	err := r.patchMetadata(ctx, s, object, func(updated client.Object) bool {
 		return controllerutil.RemoveFinalizer(updated, finalizer)
 	})
+	if apierrors.IsNotFound(err) {
+		return nil
+	}
+
+	return err
 }
 
 func (r *MachineAllocationReconciler) now() time.Time {
@@ -543,6 +561,10 @@ func (r *MachineAllocationReconciler) allocationsForClass(ctx context.Context, c
 }
 
 func (r *MachineAllocationReconciler) allocationsForNode(ctx context.Context, node client.Object) []reconcile.Request {
+	if !strings.HasPrefix(node.GetName(), allocationMachineNamePrefix) {
+		return nil
+	}
+
 	return r.allocationsMatching(ctx, func(allocation *unboundedv1alpha3.MachineAllocation) bool {
 		return allocationNamesFor(allocation.UID).machine == node.GetName()
 	})

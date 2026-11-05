@@ -9,7 +9,6 @@ import (
 
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
-	apimeta "k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	ctrl "sigs.k8s.io/controller-runtime"
@@ -66,15 +65,29 @@ func (r *MachineAllocationReconciler) reconcileRetired(ctx context.Context, s *a
 	}
 
 	released, err := r.release(ctx, s, allocate)
-	if err != nil || !released {
-		if err != nil {
-			return ctrl.Result{}, err
-		}
-
-		return r.finishWrite(ctx, s)
+	if err != nil {
+		return ctrl.Result{}, err
 	}
 
-	return r.finish(ctx, s)
+	if released {
+		r.commit(s)
+	}
+
+	return r.finishWrite(ctx, s)
+}
+
+// commit sets Released=True, the commit point of the finish, which is
+// written before any journal finalizer is removed. The status write that
+// carries it must be the only write of its reconcile, so a reconcile that
+// already wrote something else, such as the fence, commits in a later one.
+func (r *MachineAllocationReconciler) commit(s *allocationState) {
+	if s.wrote {
+		s.wait(allocationWaitInterval)
+		return
+	}
+
+	r.setCondition(s, unboundedv1alpha3.MachineAllocationConditionReleased, metav1.ConditionTrue, allocationReasonReleased,
+		"the host and the bootstrap token are released")
 }
 
 func (r *MachineAllocationReconciler) awaitRelease(s *allocationState, signal string) {
@@ -92,6 +105,8 @@ func (r *MachineAllocationReconciler) fence(ctx context.Context, s *allocationSt
 	}
 
 	if machine != nil && !machine.Spec.Fenced && machine.DeletionTimestamp.IsZero() {
+		s.wrote = true
+
 		if err := r.Patch(ctx, machine, machineFencePatch); err != nil && !apierrors.IsNotFound(err) {
 			return false, fmt.Errorf("fence Machine %s: %w", machine.Name, err)
 		}
@@ -139,6 +154,8 @@ func (r *MachineAllocationReconciler) revokeToken(ctx context.Context, s *alloca
 		}
 
 		uid := secret.UID
+		s.wrote = true
+
 		if err := r.Delete(ctx, &secret, client.Preconditions{UID: &uid}); err != nil && !apierrors.IsNotFound(err) {
 			return false, "", fmt.Errorf("delete bootstrap token Secret %s/%s: %w", key.Namespace, key.Name, err)
 		}
@@ -201,6 +218,14 @@ func (r *MachineAllocationReconciler) release(
 		r.setCondition(s, unboundedv1alpha3.MachineAllocationConditionReleased, metav1.ConditionFalse, allocationReasonAwaitingAllocateOperation,
 			fmt.Sprintf("waiting for HostAllocate MachineOperation %s to finish", allocate.Name))
 		s.wait(allocationWaitInterval)
+
+		return false, nil
+	}
+
+	if ownershipUnknown(allocate) {
+		r.setCondition(s, unboundedv1alpha3.MachineAllocationConditionReleased, metav1.ConditionFalse, allocationReasonOwnershipUnknown,
+			fmt.Sprintf("HostAllocate MachineOperation %s may have created a host and reported no owned resources; the host needs manual recovery",
+				allocate.Name))
 
 		return false, nil
 	}
@@ -269,53 +294,54 @@ func (r *MachineAllocationReconciler) release(
 	return false, nil
 }
 
-// finish removes the controller's finalizer from the operations, the Machine
-// and the input ConfigMaps, sets Released, and then removes the allocation
-// finalizer. Each step repeats safely.
-func (r *MachineAllocationReconciler) finish(ctx context.Context, s *allocationState) (ctrl.Result, error) {
+// ownershipUnknown reports whether a terminal HostAllocate may have created
+// a host whose resources it did not report: the engine failed it with
+// OwnershipUnknown, or it has a provider handle and no allocation result.
+func ownershipUnknown(allocate *unboundedv1alpha3.MachineOperation) bool {
+	if reason, _ := operationCompletion(allocate); reason == allocationReasonOwnershipUnknown {
+		return true
+	}
+
+	return hasProviderHandle(allocate) && allocate.Status.Allocation == nil
+}
+
+// cleanup runs after the commit. It removes the controller's finalizer from
+// the operations, the Machine and the input ConfigMaps, and then the
+// allocation finalizer. It observes no operation and writes no status, so a
+// step that crashes repeats safely, even when the objects are being deleted
+// and vanish with their last finalizer.
+func (r *MachineAllocationReconciler) cleanup(ctx context.Context, s *allocationState) error {
 	for _, name := range []string{s.names.allocateOperation, s.names.releaseOperation} {
 		var operation unboundedv1alpha3.MachineOperation
 
 		found, err := r.getConfirmed(ctx, client.ObjectKey{Name: name}, &operation)
 		if err != nil {
-			return ctrl.Result{}, err
+			return err
 		}
 
 		if found && sameUIDReference(operation.Spec.AllocationRef, s.reference()) {
-			if err := r.removeFinalizer(ctx, &operation, unboundedv1alpha3.MachineAllocationFinalizer); err != nil {
-				return ctrl.Result{}, err
+			if err := r.removeFinalizer(ctx, s, &operation, unboundedv1alpha3.MachineAllocationFinalizer); err != nil {
+				return err
 			}
 		}
 	}
 
 	machine, err := r.boundMachine(ctx, s)
 	if err != nil {
-		return ctrl.Result{}, err
+		return err
 	}
 
 	if machine != nil {
-		if err := r.removeFinalizer(ctx, machine, unboundedv1alpha3.MachineAllocationFinalizer); err != nil {
-			return ctrl.Result{}, err
+		if err := r.removeFinalizer(ctx, s, machine, unboundedv1alpha3.MachineAllocationFinalizer); err != nil {
+			return err
 		}
 	}
 
-	if err := r.unprotectInputs(ctx, s, s.status.Snapshot); err != nil {
-		return ctrl.Result{}, err
+	if snapshot := s.status.Snapshot; snapshot != nil {
+		if err := r.unprotectInputs(ctx, s, snapshot); err != nil {
+			return err
+		}
 	}
 
-	if !apimeta.IsStatusConditionTrue(s.status.Conditions, unboundedv1alpha3.MachineAllocationConditionReleased) {
-		r.setCondition(s, unboundedv1alpha3.MachineAllocationConditionReleased, metav1.ConditionTrue, allocationReasonReleased,
-			"the host and the bootstrap token are released")
-	}
-
-	updated, err := r.writeStatus(ctx, s)
-	if err != nil {
-		return ctrl.Result{}, err
-	}
-
-	if err := r.removeFinalizer(ctx, updated, unboundedv1alpha3.MachineAllocationFinalizer); err != nil {
-		return ctrl.Result{}, err
-	}
-
-	return ctrl.Result{}, nil
+	return r.removeFinalizer(ctx, s, s.allocation, unboundedv1alpha3.MachineAllocationFinalizer)
 }
