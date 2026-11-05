@@ -4,7 +4,6 @@
 //! independent reclaim policy for its allocator lifecycle traces.
 use page_alloc::{Error, Result, SegmentId, SegmentState, Segments};
 use std::cell::{Cell, RefCell};
-use std::collections::HashSet;
 use std::rc::Rc;
 
 /// Application-owned mappings; removal must compare current entries first.
@@ -606,20 +605,5 @@ mod phantom_tests {
         let (lease, _) = segments.append(512).unwrap();
         assert_ne!(lease.id(), id);
         assert_eq!(segments.free_count(), 0);
-    }
-
-    fn sealed(count: usize) -> Rc<Segments> {
-        let segments = Segments::new(512);
-        segments
-            .configure(
-                512 * count as u64,
-                count,
-                Alignment::new(512, 512, 512).unwrap(),
-            )
-            .unwrap();
-        for _ in 0..count {
-            drop(segments.append(512).unwrap());
-        }
-        Rc::new(segments)
     }
 }
