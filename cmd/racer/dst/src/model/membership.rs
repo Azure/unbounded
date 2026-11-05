@@ -73,6 +73,11 @@ pub struct Versions {
     dirty: bool,
     lag: Nanos,
     retained: u64,
+    /// Combined mode (racer-sim `Versions::external`): the version each node's control client
+    /// applied (0: none yet). Versions are committed by the control plane, not published here.
+    external: Option<Vec<u64>>,
+    /// Combined mode: version 0, the empty membership of a node without a snapshot.
+    none: Option<Version>,
     /// The Model's current time, set before every event so the cores' routing closures see the
     /// version their node adopted.
     pub now: Nanos,
@@ -103,8 +108,113 @@ impl Versions {
             dirty: false,
             lag,
             retained,
+            external: None,
+            none: None,
             now: 0,
         }
+    }
+
+    /// Combined mode: no node has a membership until its control client applies a committed
+    /// one. Version 0 is an empty placeholder no node is a member of.
+    pub fn external(nodes: u32, retained: u64) -> Self {
+        let empty = || Version {
+            number: 0,
+            published: 0,
+            members: Rc::new(Members::new(Vec::new()).expect("empty membership")),
+        };
+        let mut history = VecDeque::new();
+        history.push_back(empty());
+        Self {
+            live: vec![false; nodes as usize],
+            history,
+            dirty: false,
+            lag: 0,
+            retained,
+            external: Some(vec![0; nodes as usize]),
+            none: Some(empty()),
+            now: 0,
+        }
+    }
+
+    /// Combined mode: the control plane committed membership `number` with `members` at `now`.
+    /// Returns whether it is new.
+    pub fn commit(&mut self, number: u64, mut members: Vec<u32>, now: Nanos) -> bool {
+        if self.history.back().is_some_and(|v| v.number >= number) {
+            return false;
+        }
+        members.sort_unstable();
+        members.dedup();
+        members.retain(|n| (*n as usize) < self.live.len());
+        self.live.iter_mut().for_each(|l| *l = false);
+        for n in &members {
+            self.live[*n as usize] = true;
+        }
+        let list: Vec<ModelMember> = members
+            .into_iter()
+            .map(|n| ModelMember(n.to_be_bytes()))
+            .collect();
+        let latest = self.latest();
+        let next = Members::new_with_predecessor(list, &latest.members).expect("valid ids");
+        self.history.push_back(Version {
+            number,
+            published: now,
+            members: Rc::new(next),
+        });
+        true
+    }
+
+    /// Combined mode: `node`'s control client applied `number` (0 after a crash). Versions never
+    /// committed here are ignored.
+    pub fn apply(&mut self, node: u32, number: u64) {
+        if number != 0 && self.get(number).is_none() {
+            return;
+        }
+        if let Some(slot) = self
+            .external
+            .as_mut()
+            .and_then(|e| e.get_mut(node as usize))
+        {
+            *slot = number;
+        }
+    }
+
+    /// Combined mode: drop versions older than every live node's applied version, keeping
+    /// `retained` before the oldest. Returns whether any was dropped.
+    pub fn prune(&mut self, down: impl Fn(u32) -> bool) -> bool {
+        let Some(external) = &self.external else {
+            return false;
+        };
+        let latest = self.latest().number;
+        let oldest = external
+            .iter()
+            .enumerate()
+            .filter(|(n, v)| **v > 0 && !down(*n as u32))
+            .map(|(_, v)| *v)
+            .min()
+            .unwrap_or(latest);
+        let mut dropped = false;
+        while self.history.len() > 1
+            && self
+                .history
+                .get(self.retained as usize + 1)
+                .is_some_and(|v| v.number <= oldest)
+        {
+            self.history.pop_front();
+            dropped = true;
+        }
+        dropped
+    }
+
+    /// The version `node`'s client applied in combined mode (0: none); `None` standalone.
+    pub fn applied(&self, node: u32) -> Option<u64> {
+        self.external
+            .as_ref()
+            .map(|e| e.get(node as usize).copied().unwrap_or(0))
+    }
+
+    /// Versions retained.
+    pub fn retained_versions(&self) -> usize {
+        self.history.len()
     }
 
     /// Mark a change for the next publication; returns whether it changed.
@@ -122,7 +232,7 @@ impl Versions {
 
     /// Publish pending changes as a new version; returns whether one was published.
     pub fn publish(&mut self, now: Nanos) -> bool {
-        if !self.dirty {
+        if !self.dirty || self.external.is_some() {
             return false;
         }
         self.dirty = false;
@@ -167,6 +277,14 @@ impl Versions {
 
     /// The newest version `node` has adopted now.
     pub fn adopted(&self, node: u32) -> &Version {
+        if let Some(applied) = self.applied(node) {
+            if applied == 0 {
+                return self.none.as_ref().expect("combined mode");
+            }
+            return self
+                .get(applied)
+                .unwrap_or_else(|| self.history.front().expect("nonempty"));
+        }
         self.history
             .iter()
             .rev()
@@ -235,6 +353,32 @@ mod tests {
         v.publish(BATCH);
         let lagging = (0..64).filter(|n| !v.known(*n, 2)).count();
         assert!(lagging > 0, "every node adopted at once");
+    }
+
+    #[test]
+    fn external_versions_follow_applied_clients() {
+        let mut v = Versions::external(4, 1);
+        // No snapshot yet: nobody is a member.
+        assert_eq!(v.adopted(2).position(2), None);
+        assert!(v.commit(1, vec![0, 1, 2], 10));
+        assert!(!v.commit(1, vec![0], 11));
+        v.apply(2, 1);
+        v.apply(3, 9);
+        assert_eq!(v.applied(2), Some(1));
+        assert_eq!(v.applied(3), Some(0));
+        assert_eq!(v.adopted(2).position(2), Some(2));
+        assert!(v.known(2, 1) && !v.known(3, 1));
+        for n in 2..=4 {
+            assert!(v.commit(n, vec![0, 1, 2, 3], 10 * n));
+        }
+        v.apply(2, 4);
+        assert!(v.prune(|_| false));
+        // Version 4 and one retained before it.
+        assert!(v.get(3).is_some() && v.get(2).is_none());
+        assert!(v.known(2, 3) && !v.known(2, 2));
+        // A node back at no snapshot does not hold versions back.
+        v.apply(2, 0);
+        assert_eq!(v.adopted(2).number, 0);
     }
 
     #[test]
