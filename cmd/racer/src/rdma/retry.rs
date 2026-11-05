@@ -258,7 +258,8 @@ mod tests {
         let mut cx = Context::from_waker(std::task::Waker::noop());
         assert!(Pin::new(&mut active).poll_next(&mut cx).is_pending());
         assert_eq!(polls.get(), 1);
-        assert_eq!(reactor.in_flight(), 1);
+        // Alarms are reactor-local timers: they hold no kernel owner.
+        assert_eq!(reactor.in_flight(), 0);
         let end = std::time::Instant::now() + Duration::from_secs(2);
         loop {
             assert!(
@@ -293,11 +294,11 @@ mod tests {
             }),
         ));
         assert!(operation.as_mut().poll(&mut cx).is_pending());
-        assert_eq!(reactor.in_flight(), 1);
+        assert_eq!(reactor.in_flight(), 0);
         ready.set(true);
         assert_eq!(operation.as_mut().poll(&mut cx), Poll::Ready(Ok(())));
         drop(operation);
-        assert_eq!(reactor.in_flight(), 1, "drop is not a kernel fence");
+        assert_eq!(reactor.in_flight(), 0);
         while reactor.in_flight() != 0 {
             assert!(
                 std::time::Instant::now() < end,
@@ -326,7 +327,7 @@ mod tests {
                 ready.set(true);
                 assert_eq!(operation.as_mut().poll(&mut cx), Poll::Ready(Ok(())));
             }
-            assert_eq!(reactor.in_flight(), 8);
+            assert_eq!(reactor.in_flight(), 0);
             while reactor.in_flight() != 0 {
                 assert!(
                     std::time::Instant::now() < end,

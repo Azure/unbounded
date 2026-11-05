@@ -213,15 +213,7 @@ impl<S: Scope, B: Budget> Reactor<S, B> {
     ) -> Result<Buffer, S::Error> {
         while buffer.remaining() != 0 {
             let completion = self
-                .buffer_io(
-                    staged.clone(),
-                    buffer,
-                    (),
-                    scope,
-                    crate::reactor::BufferOperation::Write(*offset),
-                    crate::reactor::IssuePolicy::Offload,
-                    None,
-                )
+                .write_at(staged.clone(), *offset, buffer, (), scope)
                 .await?;
             buffer = completion.buffer;
             buffer.advance(completion.bytes)?;

@@ -217,11 +217,6 @@ impl SimDriver {
         drop(done);
     }
 
-    /// Drop a pending operation without completing it (legacy test support).
-    pub(crate) fn forget(&mut self, id: u64) {
-        self.pending.remove(&id);
-    }
-
     /// Pop the oldest completion.
     pub(crate) fn next_cqe(&mut self) -> Option<(u64, i32, u32)> {
         self.completed.pop_front()

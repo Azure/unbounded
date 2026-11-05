@@ -16,7 +16,6 @@ use std::{
 };
 
 #[doc(hidden)]
-pub mod compat;
 mod driver;
 mod network;
 #[cfg(test)]

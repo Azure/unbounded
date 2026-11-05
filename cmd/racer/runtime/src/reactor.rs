@@ -1,65 +1,42 @@
-//! Worker-local io_uring ownership and completion fences.
+//! Worker-local I/O adapter over [`racer_io::Reactor`].
 //!
-//! Before submission, the reactor must own the buffer, FD, and associated leases
-//! in its in-flight table, independently of the waiting future. Dropping a future
-//! only abandons its result; it cannot release submitted resources. Cancellation
-//! requests do not release them: original and cancellation completion accounting
-//! must both finish. Shutdown must fence kernel access before dropping the table.
-//! The worker drives CQEs explicitly. Operation futures never run an executor.
+//! MIGRATION: this keeps the scope-generic `Operation` API of the legacy
+//! reactor while every submission, completion fence, deadline, and retry is
+//! owned by `racer-io`. Delete with this crate once callers hold a
+//! `racer_io::Reactor` and an `OpCtx` directly.
 //!
-//! Degraded shutdown: a fatal driver error or expired Drop wait cannot establish a
-//! kernel fence. In that case the bounded ring and its resource owners are deliberately
-//! leaked for memory safety; shutdown is not successfully fenced. Explicit worker
-//! shutdown must keep driving its fence and report failures rather than rely on Drop.
+//! Dropping a waiting operation abandons its result only: `racer-io` keeps the
+//! buffer, descriptor, and lease until the original and any cancel completion
+//! have both arrived. A scope whose `check` fails while its operation is in
+//! flight is canceled from [`Reactor::poll_budgeted`], so policies that are not
+//! expressible as a cancel token or deadline still bound kernel work.
 
 use crate::{Budget, Error, Operation, Result, Scope};
 use descriptor::Descriptor;
-use io_uring::{IoUring, opcode, squeue, types};
+use racer_io::{
+    OpCtx,
+    ring::{Config, Driver, IoId, WakeHandle},
+};
 
 #[cfg(feature = "simulation")]
 /// Deterministic resource and completion backend for simulation runs.
 pub mod simulation;
 
-/// Construct only the selected backend's submission, keeping simulated handles
-/// out of host SQEs and preventing invented raw descriptor numbers.
-macro_rules! submission {
-    ($reactor:expr, $sim:expr, $real:expr) => {{
-        #[cfg(feature = "simulation")]
-        {
-            let simulated = $reactor.state.borrow().simulation.is_some();
-            if simulated {
-                Submission::Sim($sim)
-            } else {
-                Submission::Real($real)
-            }
-        }
-        #[cfg(not(feature = "simulation"))]
-        {
-            Submission::Real($real)
-        }
-    }};
-}
-
 /// Control-owned filesystem operations sharing this reactor's completion fences.
 pub mod filesystem;
 use std::{
-    cell::{Cell, RefCell},
-    collections::BTreeMap,
+    cell::{Cell, OnceCell, RefCell},
     future::Future,
-    net::SocketAddr,
-    os::{
-        fd::{AsRawFd, FromRawFd, OwnedFd as HostFd},
-        unix::ffi::OsStrExt,
-    },
-    path::PathBuf,
     pin::Pin,
     rc::{Rc, Weak},
-    sync::{
-        Arc,
-        atomic::{AtomicBool, Ordering},
-    },
-    task::{Context, Poll, Waker},
-    time::Duration,
+    sync::Arc,
+    task::{Context, Poll},
+    time::{Duration, Instant},
+};
+
+pub use racer_io::ring::{
+    Completion, IoBuffer, SendBuffer, SharedWriteBuffer, SocketAddress, VectoredCompletion,
+    ops::MessageCompletion,
 };
 
 /// Worker-local I/O owner, explicitly driven by [`Self::poll_budgeted`].
@@ -75,17 +52,40 @@ pub struct Reactor<S: Scope, B: Budget> {
     ctx: racer_io::WorkerCtx,
 
     /// Test support: a context selected after construction.
-    ctx_override: std::cell::OnceCell<racer_io::WorkerCtx>,
+    ctx_override: OnceCell<racer_io::WorkerCtx>,
+
+    #[cfg(feature = "simulation")]
+    simulation: Option<simulation::Simulation>,
 
     budget: B,
 
     queue_entries: usize,
 
-    state: RefCell<State<S>>,
+    io: OnceCell<racer_io::Reactor>,
 
-    ordinary: Rc<Cell<usize>>,
+    /// The kernel reactor runs on host time while scopes use a simulated
+    /// clock: scope deadlines are then enforced by the scope scan only.
+    foreign_clock: Cell<bool>,
+
+    ring_reservation: RefCell<Option<Charge>>,
+
+    stopped: Cell<bool>,
+
+    records: RefCell<Vec<Rc<Record<S>>>>,
+
+    /// Admissions of abandoned operations, released once `racer-io` reports
+    /// their kernel fences.
+    parked: RefCell<Vec<(IoId, Admission<S>)>>,
 
     reserved: RefCell<Weak<SubmissionCapacity>>,
+}
+
+/// One admitted operation: its scope (for scans and [`Reactor::fence_matching`])
+/// and its `racer-io` identity once submitted.
+struct Record<S> {
+    scope: S,
+
+    id: Cell<Option<IoId>>,
 }
 
 /// Caller-owned event sink, invoked only when admission fails.
@@ -126,874 +126,89 @@ pub struct SubmissionRejection {
     pub requested: usize,
 }
 
-/// Startup-owned partition of the existing entry and bookkeeping ceilings.
+/// Startup-owned partition of the queue reserved for control traffic.
 /// The caller supplies the retained charge; this capability grants no data authorization.
 pub struct SubmissionCapacity {
-    memory: Rc<Charge>,
+    _memory: Charge,
 
-    active: Rc<Cell<usize>>,
+    io: racer_io::Reactor,
 
     capacity: usize,
 }
 
-/// Maximum completion bookkeeping charged to one prepaid submission slot.
+impl Drop for SubmissionCapacity {
+    /// Return the partition to ordinary operations.
+    fn drop(&mut self) {
+        let _ = self.io.set_reserved_entries(0);
+    }
+}
+
+impl SubmissionCapacity {
+    /// Slots in the partition.
+    pub fn capacity(&self) -> usize {
+        self.capacity
+    }
+}
+
+/// Maximum completion bookkeeping charged to one submission.
 pub const SUBMISSION_BYTES: usize = 4096;
 
-/// An owned address; the encoded sockaddr remains pinned in the in-flight owner.
-pub use racer_io::ring::SocketAddress;
+/// Bookkeeping charged per ordinary operation.
+const OPERATION_BYTES: usize = 256;
+
+/// Longest single sleep in [`Reactor::wait`].
+const MAX_WAIT: Duration = Duration::from_millis(10);
+
+/// Bounded fence attempted when a reactor is dropped.
+const DROP_WAIT: Duration = Duration::from_millis(100);
+
+type Charge = Box<dyn std::any::Any>;
 
 /// Cloneable cross-thread wake endpoint for worker command/crypto producers.
 #[derive(Clone)]
 pub struct ReactorWake {
-    fd: Option<Arc<WakeState>>,
+    handle: Option<Arc<WakeHandle>>,
 }
 
-struct WakeState {
-    fd: HostFd,
-    owner: std::thread::ThreadId,
-    local: AtomicBool,
-    remote: AtomicBool,
-}
-
-impl AsRawFd for WakeState {
-    fn as_raw_fd(&self) -> std::os::fd::RawFd {
-        self.fd.as_raw_fd()
+impl ReactorWake {
+    /// Wake the owning worker; coalesced until its next turn.
+    pub fn wake(&self) -> Result<()> {
+        if let Some(handle) = &self.handle {
+            handle.wake();
+        }
+        Ok(())
     }
 }
 
-/// Resources return to the caller only after all applicable completion fences.
-/// On error or an abandoned future, the reactor releases them after those fences.
-/// Data I/O retries up to eight zero-progress EINTR/EAGAIN results internally,
-/// retaining owners between attempts. EAGAIN waits for readiness; each attempt
-/// checks scope. Exhaustion returns the last errno and releases the owners.
-/// Positive partial progress returns immediately, never repeats completed bytes.
-pub struct Completion<B: 'static, L: 'static = ()> {
-    /// Original allocation, returned only after all applicable CQEs.
-    pub buffer: B,
-
-    /// Bytes transferred by this operation, possibly less than the buffer length.
-    pub bytes: usize,
-
-    /// Caller-owned admission or reuse guard retained through completion.
-    pub lease: L,
-}
-
-/// Most `SCM_RIGHTS` descriptors one [`Reactor::recv_msg`] accepts. More set
-/// [`MessageCompletion::truncated`], and the kernel closes the excess.
+/// Most `SCM_RIGHTS` descriptors one [`Reactor::recv_msg`] accepts.
 pub const MAX_RECEIVED_DESCRIPTORS: usize = 8;
-
-/// A fenced `recvmsg` result with any descriptors that arrived with the bytes.
-pub struct MessageCompletion<B: 'static, L: 'static = ()> {
-    /// Original allocation, returned only after all applicable CQEs.
-    pub buffer: B,
-
-    /// Bytes received, possibly less than the buffer length.
-    pub bytes: usize,
-
-    /// Caller-owned admission or reuse guard retained through completion.
-    pub lease: L,
-
-    /// Received `SCM_RIGHTS` descriptors, already close-on-exec.
-    pub descriptors: Vec<HostFd>,
-
-    /// The kernel reported `MSG_CTRUNC`: ancillary data did not fit.
-    pub truncated: bool,
-
-    /// Kernel TLS record content type (`TLS_GET_RECORD_TYPE`) of the received
-    /// bytes, present only on kernel TLS receive sockets. 23 is application data.
-    pub tls_record_type: Option<u8>,
-}
 
 /// Linux `SOL_TLS` socket level.
 pub const SOL_TLS: i32 = 282;
 
-/// Linux `TLS_GET_RECORD_TYPE` control message type at [`SOL_TLS`].
+/// `TLS_GET_RECORD_TYPE` control message type.
 pub const TLS_GET_RECORD_TYPE: i32 = 2;
 
-/// Heap-pinned `msghdr`, `iovec`, and control storage for one `RecvMsg`.
-/// Any descriptors the kernel installed are closed when this is dropped.
-struct MessageHeader {
-    header: libc::msghdr,
+/// Present exclusive storage to `racer-io` writes, which only read it.
+struct Exclusive<B>(B);
 
-    iov: libc::iovec,
-
-    control: Vec<u64>,
-}
-
-impl MessageHeader {
-    /// Control bytes able to hold [`MAX_RECEIVED_DESCRIPTORS`] descriptors.
-    fn control_bytes() -> usize {
-        // SAFETY: CMSG_SPACE only computes an aligned size.
-        unsafe {
-            libc::CMSG_SPACE((MAX_RECEIVED_DESCRIPTORS * std::mem::size_of::<i32>()) as u32)
-                as usize
-        }
-    }
-
-    fn new() -> Box<Self> {
-        let words = Self::control_bytes().div_ceil(std::mem::size_of::<u64>());
-        Box::new(Self {
-            // SAFETY: msghdr is plain old data; all-zero is a valid empty value.
-            header: unsafe { std::mem::zeroed() },
-            iov: libc::iovec {
-                iov_base: std::ptr::null_mut(),
-                iov_len: 0,
-            },
-            control: vec![0; words],
-        })
-    }
-
-    /// Point the header at `ptr..ptr+len` and an empty control buffer.
-    fn prepare(&mut self, ptr: *mut u8, len: u32) -> *mut libc::msghdr {
-        // Close anything left by an earlier attempt before reusing the storage.
-        drop(self.take_descriptors());
-        self.control.fill(0);
-        self.iov = libc::iovec {
-            iov_base: ptr.cast(),
-            iov_len: len as usize,
-        };
-        // SAFETY: as in new().
-        self.header = unsafe { std::mem::zeroed() };
-        self.header.msg_iov = &mut self.iov;
-        self.header.msg_iovlen = 1;
-        self.header.msg_control = self.control.as_mut_ptr().cast();
-        self.header.msg_controllen = Self::control_bytes() as _;
-        &mut self.header
-    }
-
-    /// Whether the kernel truncated ancillary data on the completed receive.
-    fn truncated(&self) -> bool {
-        self.header.msg_flags & libc::MSG_CTRUNC != 0
-    }
-
-    /// Kernel TLS record type reported in the control buffer, if any.
-    // Control lengths are usize on glibc but narrower on other libcs.
-    #[allow(clippy::unnecessary_cast)]
-    fn tls_record_type(&self) -> Option<u8> {
-        let capacity = self.control.len() * std::mem::size_of::<u64>();
-        let used = (self.header.msg_controllen as usize).min(capacity);
-        if self.header.msg_control.is_null() {
-            return None;
-        }
-        let base = self.control.as_ptr().cast::<u8>();
-        // SAFETY: CMSG_LEN(0) is the aligned header size.
-        let data = unsafe { libc::CMSG_LEN(0) } as usize;
-        let mut offset = 0;
-        while offset + std::mem::size_of::<libc::cmsghdr>() <= used {
-            // SAFETY: the header lies inside the initialized control buffer.
-            let cmsg: libc::cmsghdr = unsafe { std::ptr::read_unaligned(base.add(offset).cast()) };
-            let length = cmsg.cmsg_len as usize;
-            if length < std::mem::size_of::<libc::cmsghdr>() || offset + length > used {
-                break;
-            }
-            if cmsg.cmsg_level == SOL_TLS && cmsg.cmsg_type == TLS_GET_RECORD_TYPE && length > data
-            {
-                // SAFETY: the one-byte payload is inside this control message.
-                return Some(unsafe { *base.add(offset + data) });
-            }
-            offset += length.next_multiple_of(std::mem::size_of::<usize>());
-        }
-        None
-    }
-
-    /// Take ownership of every `SCM_RIGHTS` descriptor in the control buffer.
-    /// The buffer is cleared, so a second call or the drop finds nothing.
-    // Control lengths are usize on glibc but narrower on other libcs.
-    #[allow(clippy::unnecessary_cast)]
-    fn take_descriptors(&mut self) -> Vec<HostFd> {
-        let mut descriptors = Vec::new();
-        let capacity = self.control.len() * std::mem::size_of::<u64>();
-        let used = (self.header.msg_controllen as usize).min(capacity);
-        if self.header.msg_control.is_null() || used < std::mem::size_of::<libc::cmsghdr>() {
-            return descriptors;
-        }
-        let base = self.control.as_ptr().cast::<u8>();
-        let mut offset = 0;
-        while offset + std::mem::size_of::<libc::cmsghdr>() <= used {
-            // SAFETY: the header lies inside the initialized control buffer;
-            // read_unaligned tolerates any alignment.
-            let cmsg: libc::cmsghdr = unsafe { std::ptr::read_unaligned(base.add(offset).cast()) };
-            let length = cmsg.cmsg_len as usize;
-            if length < std::mem::size_of::<libc::cmsghdr>() || offset + length > used {
-                break;
-            }
-            // SAFETY: CMSG_LEN(0) is the aligned header size.
-            let data = unsafe { libc::CMSG_LEN(0) } as usize;
-            if cmsg.cmsg_level == libc::SOL_SOCKET && cmsg.cmsg_type == libc::SCM_RIGHTS {
-                let count = (length.saturating_sub(data)) / std::mem::size_of::<i32>();
-                for index in 0..count {
-                    // SAFETY: the descriptor array is inside this control message.
-                    let fd: i32 = unsafe {
-                        std::ptr::read_unaligned(
-                            base.add(offset + data + index * std::mem::size_of::<i32>())
-                                .cast(),
-                        )
-                    };
-                    if fd >= 0 {
-                        // SAFETY: the kernel installed this descriptor for us alone.
-                        descriptors.push(unsafe { HostFd::from_raw_fd(fd) });
-                    }
-                }
-            }
-            // CMSG_NXTHDR advances by CMSG_ALIGN(cmsg_len).
-            let step = length.next_multiple_of(std::mem::size_of::<usize>());
-            offset += step;
-        }
-        self.control.fill(0);
-        self.header.msg_controllen = 0;
-        descriptors
+// SAFETY: the IoBuffer contract keeps the bytes stable and unaliased while the
+// reactor owns the buffer; writes and sends only read them.
+unsafe impl<B: IoBuffer> SendBuffer for Exclusive<B> {
+    fn send_bytes(&self) -> racer_io::Result<&[u8]> {
+        self.0.bytes()
     }
 }
 
-impl Drop for MessageHeader {
-    /// Close descriptors that no caller took, including after an abandoned wait.
-    fn drop(&mut self) {
-        drop(self.take_descriptors());
-    }
-}
+/// Admission retained by an operation until it is fenced and delivered.
+struct Admission<S> {
+    _charge: Option<Charge>,
 
-// MIGRATION: the buffer contracts are racer-io's; this re-export keeps old
-// import paths compiling until every crate imports racer_io directly.
-pub use racer_io::ring::{IoBuffer, SendBuffer, SharedWriteBuffer};
-
-/// Owners returned by [`Reactor::write_vectored_at`] after all applicable
-/// completion fences.
-pub struct VectoredCompletion<H: 'static, B: 'static, L: 'static = ()> {
-    /// Header allocation, written first.
-    pub header: H,
-
-    /// Body allocation, written immediately after the header.
-    pub body: B,
-
-    /// Bytes written across both segments, possibly less than their sum.
-    pub bytes: usize,
-
-    /// Caller-owned admission or reuse guard retained through completion.
-    pub lease: L,
-}
-
-/// Erased admission guard retained for the lifetime of its accounted owner.
-type Charge = Box<dyn std::any::Any>;
-
-/// An operation prepared only for the selected backend.
-enum Submission {
-    Real(squeue::Entry),
-    #[cfg(feature = "simulation")]
-    Sim(simulation::Op),
-}
-
-/// One active slot in either the ordinary or prepaid submission partition.
-struct SubmissionSlot {
-    active: Rc<Cell<usize>>,
+    _held: Option<Charge>,
 
     _capacity: Option<Rc<SubmissionCapacity>>,
-}
 
-impl Drop for SubmissionSlot {
-    /// Release exactly one admitted slot when its owning fence or reply retires.
-    fn drop(&mut self) {
-        self.active.set(self.active.get() - 1);
-    }
-}
-
-/// Monotonic operation identifier; its high bit is reserved for cancel CQEs.
-#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
-struct IoId(u64);
-
-const CANCEL_BIT: u64 = 1 << 63;
-
-const MAX_WAIT: Duration = Duration::from_millis(10);
-
-const DROP_WAIT: Duration = Duration::from_millis(100);
-
-// At most nine data attempts, each separated by a worker-driven CQE. A positive
-// partial result is never replayed. EAGAIN additionally requires a readiness CQE.
-const DATA_RETRIES: usize = 8;
-
-// Linux UAPI setup flags. Unknown modes still fail closed for suppression.
-const SETUP_CQSIZE: u32 = 1 << 3;
-const SETUP_SUBMIT_ALL: u32 = 1 << 7;
-const SETUP_SINGLE_ISSUER: u32 = 1 << 12;
-const SETUP_NORMAL: u32 = SETUP_CQSIZE | SETUP_SUBMIT_ALL | SETUP_SINGLE_ISSUER;
-
-/// Backend state and owners that must survive until both applicable CQEs arrive.
-struct State<S: Scope> {
-    ring: Option<IoUring>,
-
-    wake: Option<Arc<WakeState>>,
-
-    #[cfg(feature = "simulation")]
-    simulation: Option<simulation::Driver>,
-
-    #[cfg(test)]
-    submit_attempts: usize,
-
-    #[cfg(test)]
-    wait_attempts: usize,
-
-    #[cfg(test)]
-    submit_result: Option<std::io::Result<usize>>,
-
-    #[cfg(test)]
-    completions: std::collections::VecDeque<(u64, KernelResult)>,
-
-    ring_reservation: Option<Charge>,
-
-    entries: Table<Entry<S>>,
-
-    next: u64,
-
-    scan_after: IoId,
-
-    stopped: bool,
-
-    fence_waiters: BTreeMap<(Option<IoId>, u64), FenceWaiter>,
-
-    next_waiter: u64,
-
-    /// Reusable batch storage for poll_budgeted, empty between calls.
-    finished: Vec<FencedEntry<S>>,
-
-    /// Reusable cancellation scan snapshot, empty between calls.
-    scan_batch: Vec<ScanItem<S>>,
-}
-
-/// One scanned entry: its identifier, a retained view, and its policy result.
-type ScanItem<S> = (IoId, Rc<dyn Pending<S>>, Option<<S as Scope>::Error>);
-
-/// Independently charged wake registration for one fence caller.
-struct FenceWaiter {
-    waker: Waker,
-
-    _reservation: Charge,
-}
-
-impl FenceWaiter {
-    /// Consume this registration and notify its executor outside reactor borrows.
-    fn wake(self) {
-        self.waker.wake();
-    }
-}
-
-/// Cancellation request plus an independently removable completion notification.
-struct Fence<'a, S: Scope, B: Budget> {
-    reactor: &'a Reactor<S, B>,
-
-    target: Option<IoId>,
-
-    registration: Option<u64>,
-}
-
-impl<S: Scope, B: Budget> Future for Fence<'_, S, B> {
-    /// Successful fencing or a scope-specific notification-admission error.
-    type Output = Result<(), S::Error>;
-
-    /// Request cancellation and register an independently removable fence waiter.
-    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        let this = self.get_mut();
-        let cancelled = Error::Cancelled.into();
-        let waker = cx.waker().clone();
-        let mut state = this.reactor.state.borrow_mut();
-        let pending = match this.target {
-            Some(id) => match state.entries.get_mut(&id) {
-                Some(entry) => {
-                    entry.cancel_reason.get_or_insert(cancelled);
-                    true
-                }
-                None => false,
-            },
-            None => {
-                state.stopped = true;
-                !state.entries.is_empty()
-            }
-        };
-        if !pending {
-            let removed = this
-                .registration
-                .take()
-                .and_then(|id| state.fence_waiters.remove(&(this.target, id)));
-            drop(state);
-            drop(removed);
-            return Poll::Ready(Ok(()));
-        }
-        if let Some(id) = this.registration {
-            let waiter = state
-                .fence_waiters
-                .get_mut(&(this.target, id))
-                .expect("pending fence registration");
-            let old = std::mem::replace(&mut waiter.waker, waker);
-            drop(state);
-            drop(old);
-        } else {
-            // Separate bounded control registrations support independent callers,
-            // including callers using the same executor waker. Drop removes only
-            // its own registration. No quota is needed to submit cancellation.
-            if state.fence_waiters.len() >= this.reactor.queue_entries {
-                drop(state);
-                return Poll::Ready(Err(Error::Overloaded.into()));
-            }
-            let Some(next) = state.next_waiter.checked_add(1) else {
-                drop(state);
-                return Poll::Ready(Err(Error::Overloaded.into()));
-            };
-            let id = state.next_waiter;
-            state.next_waiter = next;
-            drop(state);
-            let reservation = this.reactor.charge(std::mem::size_of::<FenceWaiter>())?;
-            let mut state = this.reactor.state.borrow_mut();
-            if state.fence_waiters.len() >= this.reactor.queue_entries {
-                drop(state);
-                return Poll::Ready(Err(Error::Overloaded.into()));
-            }
-            let pending = this.target.map_or(!state.entries.is_empty(), |id| {
-                state.entries.contains_key(&id)
-            });
-            if !pending {
-                drop(state);
-                return Poll::Ready(Ok(()));
-            }
-            state.fence_waiters.insert(
-                (this.target, id),
-                FenceWaiter {
-                    waker,
-                    _reservation: reservation,
-                },
-            );
-            this.registration = Some(id);
-        }
-        Poll::Pending
-    }
-}
-
-impl<S: Scope, B: Budget> Drop for Fence<'_, S, B> {
-    /// Remove only this caller's notification without undoing cancellation.
-    fn drop(&mut self) {
-        if let Some(id) = self.registration {
-            let removed = self
-                .reactor
-                .state
-                .borrow_mut()
-                .fence_waiters
-                .remove(&(self.target, id));
-            drop(removed);
-        }
-    }
-}
-
-impl ReactorWake {
-    /// Notify the worker without blocking; an already readable eventfd is enough.
-    pub fn wake(&self) -> Result<()> {
-        let Some(fd) = &self.fd else {
-            return Ok(());
-        };
-        if std::thread::current().id() == fd.owner {
-            // Preserve the next-turn notification without waking our own eventfd.
-            fd.local.store(true, Ordering::Release);
-            return Ok(());
-        }
-        if fd.remote.swap(true, Ordering::AcqRel) {
-            return Ok(());
-        }
-        let value = 1u64;
-        loop {
-            // SAFETY: eventfd consumes this initialized, stack-local u64 synchronously.
-            let result = unsafe { libc::write(fd.as_raw_fd(), (&value as *const u64).cast(), 8) };
-            if result == 8 {
-                return Ok(());
-            }
-            match std::io::Error::last_os_error().raw_os_error() {
-                Some(libc::EINTR) => continue,
-                Some(libc::EAGAIN) => return Ok(()), // Already readable.
-                _ => {
-                    fd.remote.store(false, Ordering::Release);
-                    return Err(Error::Io);
-                }
-            }
-        }
-    }
-}
-
-/// Delivery state shared by the waiting future and completion owner.
-struct Signal {
-    abandoned: Cell<bool>,
-
-    waker: RefCell<Option<Waker>>,
-}
-
-/// Bookkeeping charge owned by one reply, or shared with a prepaid partition.
-enum Reservation {
-    /// An ordinary submission's own charge, released with its reply.
-    Owned(#[allow(dead_code)] Charge),
-
-    /// The prepaid partition's charge, released with its last reply.
-    Shared(#[allow(dead_code)] Rc<Charge>),
-}
-
-/// Fenced result and bookkeeping retained until consumed or abandoned.
-struct Reply<T, E> {
-    // A reserved slot includes completion bookkeeping, not just the SQE. Keep it
-    // until the result is consumed/dropped as well as the kernel being fenced.
-    _slot: Option<SubmissionSlot>,
-
-    result: Option<Result<T, E>>,
-
-    // Charge completed-but-unconsumed results as well as submitted work.
-    _reservation: Reservation,
-}
-
-/// One submission's scope, delivery state, and completion owners, sharing one
-/// allocation between the reactor table and the waiting future.
-struct Submitted<S: Scope, T, F> {
-    scope: S,
-
-    signal: Signal,
-
-    reply: RefCell<Reply<T, S::Error>>,
-
-    // An ordinary slot is released at the kernel fence, before the callback.
-    slot: Cell<Option<SubmissionSlot>>,
-
-    // The callback owns every FD, buffer, lease and sockaddr backing.
-    finish: Cell<Option<F>>,
-}
-
-/// The reactor table's type-erased view of one submission.
-trait Pending<S: Scope> {
-    /// Borrow the scope that decides cancellation.
-    fn scope(&self) -> &S;
-
-    /// Borrow the delivery signal shared with the waiting future.
-    fn signal(&self) -> &Signal;
-
-    /// Release the owners through the callback once and return the waker to notify.
-    fn finish(&self, result: Result<KernelResult, S::Error>) -> Option<Waker>;
-}
-
-impl<S, T, F> Pending<S> for Submitted<S, T, F>
-where
-    S: Scope,
-    F: FnOnce(Result<KernelResult, S::Error>) -> Result<T, S::Error>,
-{
-    /// Borrow the submission's own scope.
-    fn scope(&self) -> &S {
-        &self.scope
-    }
-
-    /// Borrow the signal stored beside the reply.
-    fn signal(&self) -> &Signal {
-        &self.signal
-    }
-
-    /// Deliver unless abandoned; an abandoned result drops its owners here.
-    fn finish(&self, result: Result<KernelResult, S::Error>) -> Option<Waker> {
-        drop(self.slot.take());
-        let finish = self.finish.take().expect("submission finishes once");
-        let result = finish(result);
-        if !self.signal.abandoned.get() {
-            self.reply.borrow_mut().result = Some(result);
-        }
-        let mut pending_waker = self.signal.waker.borrow_mut();
-        let waker = pending_waker.take();
-        drop(pending_waker);
-        waker
-    }
-}
-
-/// The waiting future's type-erased view of one submission.
-trait Delivery<T, E> {
-    /// Borrow the delivery signal.
-    fn signal(&self) -> &Signal;
-
-    /// Borrow the fenced reply.
-    fn reply(&self) -> &RefCell<Reply<T, E>>;
-}
-
-impl<S: Scope, T, F> Delivery<T, S::Error> for Submitted<S, T, F> {
-    /// Borrow the signal stored beside the reply.
-    fn signal(&self) -> &Signal {
-        &self.signal
-    }
-
-    /// Borrow the reply stored beside the signal.
-    fn reply(&self) -> &RefCell<Reply<T, S::Error>> {
-        &self.reply
-    }
-}
-
-/// Result-only future; dropping it never releases submitted kernel resources.
-struct Waiting<T, E> {
-    delivery: Rc<dyn Delivery<T, E>>,
-}
-
-impl<T, E> Future for Waiting<T, E> {
-    /// Fenced operation result with the caller's error classification.
-    type Output = Result<T, E>;
-
-    /// Consume a fenced reply or refresh delivery notification without driving I/O.
-    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        let result = self.delivery.reply().borrow_mut().result.take();
-        if let Some(result) = result {
-            Poll::Ready(result)
-        } else {
-            let waker = cx.waker().clone();
-            let old = self.delivery.signal().waker.borrow_mut().replace(waker);
-            drop(old);
-            // Clone/drop callbacks can drive completions before registration.
-            let result = self.delivery.reply().borrow_mut().result.take();
-            match result {
-                Some(result) => Poll::Ready(result),
-                None => Poll::Pending,
-            }
-        }
-    }
-}
-
-impl<T, E> Drop for Waiting<T, E> {
-    /// Abandon delivery while leaving submitted owners in the reactor table.
-    fn drop(&mut self) {
-        self.delivery.signal().abandoned.set(true);
-        let old = self.delivery.signal().waker.borrow_mut().take();
-        drop(old);
-    }
-}
-
-/// Scalar completion or an already owned descriptor from open/accept.
-enum KernelResult {
-    Value(i32),
-    Accepted(Descriptor),
-}
-
-impl KernelResult {
-    /// Preserve errno through zero-progress retries and application error mapping.
-    fn io_result(self) -> std::io::Result<i32> {
-        match self {
-            Self::Value(value) if value >= 0 => Ok(value),
-            Self::Value(value) => Err(std::io::Error::from_raw_os_error(
-                value.checked_neg().unwrap_or(libc::EIO),
-            )),
-            Self::Accepted(_) => Err(std::io::Error::from_raw_os_error(libc::EIO)),
-        }
-    }
-
-    /// Record failure attribution without consuming an accepted resource owner.
-    fn observe_errno(&self, errno: &std::cell::Cell<Option<i32>>) {
-        if let Self::Value(value) = self
-            && *value < 0
-        {
-            errno.set(value.checked_neg());
-        }
-    }
-
-    /// Translate a scalar completion into the runtime's error classification.
-    fn value(self) -> Result<i32> {
-        self.io_result().map_err(Error::from_io)
-    }
-}
-
-/// One published operation with independent original and cancellation accounting.
-struct Entry<S: Scope> {
-    // The submission owns every FD, buffer, lease and sockaddr backing.
-    pending: Rc<dyn Pending<S>>,
-
-    completion: CompletionState,
-
-    cancel_reason: Option<S::Error>,
-}
-
-/// Whether a successful original CQE transfers a descriptor or a scalar value.
-#[derive(Clone, Copy)]
-enum CompletionKind {
-    /// A nonnegative completion is a byte count or syscall status.
-    Value,
-
-    /// A nonnegative host completion transfers one uniquely owned descriptor.
-    Descriptor,
-}
-
-/// Cancellation accounting is independent of the reason delivery was canceled.
-#[derive(Clone, Copy)]
-enum CancellationFence {
-    /// No cancellation SQE was published for this original operation.
-    NotSubmitted,
-
-    /// The cancellation SQE is published but its CQE has not arrived.
-    Pending,
-
-    /// The cancellation CQE arrived before the original CQE.
-    Complete,
-}
-
-/// Own an original result only while its submitted cancellation still needs fencing.
-enum CompletionState {
-    /// The original CQE has not arrived; cancellation can finish independently.
-    Pending {
-        kind: CompletionKind,
-
-        cancellation: CancellationFence,
-    },
-
-    /// The original result is owned, but the published cancellation is still pending.
-    AwaitingCancel(KernelResult),
-
-    /// The original owner was transferred to a fenced retirement capability.
-    Retired,
-}
-
-impl CompletionState {
-    /// Start original completion accounting with its precise ownership interpretation.
-    fn new(kind: CompletionKind) -> Self {
-        Self::Pending {
-            kind,
-            cancellation: CancellationFence::NotSubmitted,
-        }
-    }
-
-    /// Cancellation can be published only before the original CQE and only once.
-    fn needs_cancel(&self) -> bool {
-        matches!(
-            self,
-            Self::Pending {
-                cancellation: CancellationFence::NotSubmitted,
-                ..
-            }
-        )
-    }
-
-    /// Record successful cancellation publication without claiming its completion.
-    fn cancel_submitted(&mut self) {
-        let Self::Pending { cancellation, .. } = self else {
-            unreachable!("cancellation requires a pending original")
-        };
-        assert!(matches!(cancellation, CancellationFence::NotSubmitted));
-        *cancellation = CancellationFence::Pending;
-    }
-
-    /// Account one CQE, transferring the original only when every required CQE arrived.
-    fn complete(&mut self, cancel: bool, result: KernelResult) -> Result<Option<KernelResult>> {
-        match self {
-            Self::Pending { cancellation, .. }
-                if cancel && matches!(cancellation, CancellationFence::Pending) =>
-            {
-                // Even ENOENT/EALREADY prove that the cancellation request finished.
-                *cancellation = CancellationFence::Complete;
-                Ok(None)
-            }
-            Self::AwaitingCancel(_) if cancel => {
-                let Self::AwaitingCancel(original) = std::mem::replace(self, Self::Retired) else {
-                    unreachable!("matched original owner")
-                };
-                Ok(Some(original))
-            }
-            Self::Pending { kind, cancellation } if !cancel => {
-                let original = match result {
-                    KernelResult::Value(fd)
-                        if matches!(kind, CompletionKind::Descriptor) && fd >= 0 =>
-                    {
-                        // SAFETY: this original CQE transfers unique descriptor ownership.
-                        KernelResult::Accepted(unsafe { Descriptor::from_raw_fd(fd) })
-                    }
-                    result => result,
-                };
-                if matches!(cancellation, CancellationFence::Pending) {
-                    *self = Self::AwaitingCancel(original);
-                    Ok(None)
-                } else {
-                    *self = Self::Retired;
-                    Ok(Some(original))
-                }
-            }
-            _ => Err(Error::Io),
-        }
-    }
-}
-
-/// Retirement authority carrying the original result after both applicable fences.
-struct FencedEntry<S: Scope> {
-    entry: Entry<S>,
-
-    original: KernelResult,
-}
-
-impl<S: Scope> FencedEntry<S> {
-    /// Deliver a fenced result with cancellation precedence outside reactor borrows.
-    fn finish(self) -> Option<Waker> {
-        let Self {
-            mut entry,
-            original,
-        } = self;
-        if entry.cancel_reason.is_none() {
-            entry.cancel_reason = entry.pending.scope().check().err();
-        }
-        let result = match entry.cancel_reason {
-            Some(error) => {
-                drop(original);
-                Err(error)
-            }
-            None => Ok(original),
-        };
-        entry.pending.finish(result)
-    }
-}
-
-/// Reactor-owned vectored write state. The iovec array lives in stable
-/// syscall backing so its address survives moves into completion closures.
-struct VectoredInFlight<H: 'static, B: 'static, L: 'static> {
-    file: Rc<Descriptor>,
-
-    header: H,
-
-    body: B,
-
-    lease: L,
-
-    iovecs: SyscallArg<[libc::iovec; 2]>,
-}
-
-impl<H: 'static, B: 'static, L: 'static> VectoredInFlight<H, B, L> {
-    /// Return both owners and admission only after the retry loop's final fence.
-    fn complete(self, bytes: usize) -> VectoredCompletion<H, B, L> {
-        let Self {
-            file,
-            header,
-            body,
-            lease,
-            iovecs,
-        } = self;
-        drop((file, iovecs));
-        VectoredCompletion {
-            header,
-            body,
-            bytes,
-            lease,
-        }
-    }
-}
-
-/// Reactor-owned submission state. `L` retains connection/segment/other leases.
-/// Stored before the kernel can see any pointer, including across partial I/O.
-struct InFlight<B: 'static, L: 'static> {
-    file: Rc<Descriptor>,
-
-    buffer: B,
-
-    lease: L,
-}
-
-impl<B: 'static, L: 'static> InFlight<B, L> {
-    /// Return storage and admission only after the retry loop's final fence.
-    fn complete(self, bytes: usize) -> Completion<B, L> {
-        let Self {
-            file,
-            buffer,
-            lease,
-        } = self;
-        drop(file);
-        Completion {
-            buffer,
-            bytes,
-            lease,
-        }
-    }
+    record: Rc<Record<S>>,
 }
 
 impl<S: Scope, Q: Budget> Reactor<S, Q> {
@@ -1006,11 +221,7 @@ impl<S: Scope, Q: Budget> Reactor<S, Q> {
     pub fn sim_os(&self) -> Option<racer_io::sim::SimOs> {
         #[cfg(feature = "simulation")]
         {
-            self.state
-                .borrow()
-                .simulation
-                .as_ref()
-                .map(|driver| driver.os().clone())
+            self.simulation.as_ref().map(|sim| sim.os().clone())
         }
         #[cfg(not(feature = "simulation"))]
         None
@@ -1026,40 +237,25 @@ impl<S: Scope, Q: Budget> Reactor<S, Q> {
         );
     }
 
-    /// Create an uninitialized reactor; kernel resources are acquired by [`Self::init`].
+    /// Create an uninitialized reactor; resources are acquired by [`Self::init`].
     pub fn new(queue_entries: usize, budget: Q) -> Self {
+        let environment = super::environment::Environment::current();
         Self {
             rejection_observer: None,
-            environment: super::environment::Environment::current(),
-            ctx: super::environment::Environment::current().worker_ctx(),
-            ctx_override: std::cell::OnceCell::new(),
+            ctx: environment.worker_ctx(),
+            environment,
+            ctx_override: OnceCell::new(),
+            #[cfg(feature = "simulation")]
+            simulation: simulation::Simulation::current(),
             budget,
             queue_entries,
-            ordinary: Rc::new(Cell::new(0)),
+            io: OnceCell::new(),
+            foreign_clock: Cell::new(false),
+            ring_reservation: RefCell::new(None),
+            stopped: Cell::new(false),
+            records: RefCell::new(Vec::new()),
+            parked: RefCell::new(Vec::new()),
             reserved: RefCell::default(),
-            state: RefCell::new(State {
-                ring: None,
-                wake: None,
-                #[cfg(feature = "simulation")]
-                simulation: simulation::Simulation::current().map(simulation::Driver::new),
-                #[cfg(test)]
-                submit_attempts: 0,
-                #[cfg(test)]
-                wait_attempts: 0,
-                #[cfg(test)]
-                submit_result: None,
-                #[cfg(test)]
-                completions: Default::default(),
-                ring_reservation: None,
-                entries: Table::default(),
-                next: 1,
-                scan_after: IoId(0),
-                stopped: false,
-                fence_waiters: BTreeMap::new(),
-                next_waiter: 0,
-                finished: Vec::new(),
-                scan_batch: Vec::new(),
-            }),
         }
     }
 
@@ -1080,107 +276,88 @@ impl<S: Scope, Q: Budget> Reactor<S, Q> {
 
     /// Initialize the selected backend once.
     pub fn init(&self) -> Result<()> {
-        let state = self.state.borrow();
-        if state.stopped {
+        self.io().map(|_| ())
+    }
+
+    /// The `racer-io` reactor, built on first use.
+    fn io(&self) -> Result<&racer_io::Reactor> {
+        if self.stopped.get() {
             return Err(Error::Unavailable);
         }
-        if state.ring_reservation.is_some() {
-            return Ok(());
+        if let Some(io) = self.io.get() {
+            return Ok(io);
         }
-        drop(state);
-        let capacity = self.queue_entries;
-        if capacity == 0 {
+        let entries = u32::try_from(self.queue_entries).map_err(|_| Error::InvalidConfiguration)?;
+        if entries == 0 {
             return Err(Error::InvalidConfiguration);
         }
-        // One original and one cancel per admitted operation, with no multishot
-        // CQEs. Dedicated SQ/CQ headroom cannot be consumed by new data work.
-        let sq = u32::try_from(capacity.checked_mul(2).ok_or(Error::InvalidConfiguration)?)
-            .map_err(|_| Error::InvalidConfiguration)?;
-        let cq = sq.checked_mul(2).ok_or(Error::InvalidConfiguration)?;
-        // Ring infrastructure is memory, not a permanently occupied control
-        // message. Cancellation headroom is structural and requires no new quota,
-        // even after ordinary admission stops or all request-context bytes fill.
-        let ring_bytes = (sq as usize)
+        // Ring infrastructure is charged as memory: SQ and CQ entries plus the
+        // operation slab.
+        let ring_bytes = (self.queue_entries * 2)
             .checked_next_power_of_two()
             .and_then(|sq| sq.checked_mul(128))
             .and_then(|bytes| bytes.checked_add(8192))
             .ok_or(Error::InvalidConfiguration)?;
-        let ring_reservation = self.charge(ring_bytes)?;
-        let mut state = self.state.borrow_mut();
+        let reservation = self.charge(ring_bytes)?;
         // The accounting hook may reenter and initialize or stop the reactor.
-        if state.stopped || state.ring_reservation.is_some() {
-            let stopped = state.stopped;
-            drop(state);
-            return if stopped {
-                Err(Error::Unavailable)
-            } else {
-                Ok(())
-            };
+        if self.stopped.get() {
+            return Err(Error::Unavailable);
         }
+        if let Some(io) = self.io.get() {
+            return Ok(io);
+        }
+        let ctx = self.ctx().clone();
         #[cfg(feature = "simulation")]
-        if state.simulation.is_some() {
-            state.ring_reservation = Some(ring_reservation);
-            return Ok(());
-        }
-        let ring = probe_ring(|flags| {
-            let mut builder = IoUring::builder();
-            builder.setup_cqsize(cq);
-            if flags & SETUP_SUBMIT_ALL != 0 {
-                builder.setup_submit_all();
-            }
-            if flags & SETUP_SINGLE_ISSUER != 0 {
-                builder.setup_single_issuer();
-            }
-            builder.build(sq)
-        })
-        .map_err(|_| Error::Io)?;
-        // SAFETY: no borrowed pointers; ownership of the returned descriptor is unique.
-        let fd = unsafe { libc::eventfd(0, libc::EFD_CLOEXEC | libc::EFD_NONBLOCK) };
-        if fd < 0 {
-            return Err(Error::Io);
-        }
-        state.wake = Some(Arc::new(WakeState {
-            fd: unsafe { HostFd::from_raw_fd(fd) },
-            owner: std::thread::current().id(),
-            local: AtomicBool::new(false),
-            remote: AtomicBool::new(false),
-        }));
-        state.ring_reservation = Some(ring_reservation);
-        state.ring = Some(ring);
-        Ok(())
+        let driver = match &self.simulation {
+            Some(sim) => Driver::Sim(sim.os().clone()),
+            None => Driver::Uring,
+        };
+        #[cfg(not(feature = "simulation"))]
+        let driver = Driver::Uring;
+        let ctx = if matches!(driver, Driver::Uring) && ctx.is_simulated() {
+            self.foreign_clock.set(true);
+            racer_io::WorkerCtx::host()
+        } else {
+            ctx
+        };
+        let io =
+            racer_io::Reactor::new(driver, Config::new(entries), ctx).map_err(
+                |error| match error {
+                    Error::InvalidConfiguration | Error::Overloaded => error,
+                    _ => Error::Io,
+                },
+            )?;
+        *self.ring_reservation.borrow_mut() = Some(reservation);
+        Ok(self.io.get_or_init(|| io))
     }
 
     /// Obtain after init, and attach to external worker queues before starting them.
     pub fn waker(&self) -> Result<ReactorWake> {
-        self.init()?;
         Ok(ReactorWake {
-            fd: self.state.borrow().wake.clone(),
+            handle: Some(self.io()?.wake_handle()),
         })
     }
 
     /// Count operations still awaiting their original or cancellation CQE.
     pub fn in_flight(&self) -> usize {
-        self.state.borrow().entries.len()
+        self.io.get().map_or(0, racer_io::Reactor::in_flight)
     }
 
-    /// Partition existing queue capacity using a caller-owned prepaid charge.
-    /// Only one live partition is allowed. Its slots include unread completions;
-    /// ordinary slots instead become reusable at the kernel fence.
+    /// Partition queue capacity for control traffic using a caller-owned
+    /// prepaid charge. Only one live partition is allowed.
     pub fn reserve_submissions<C: 'static>(
         &self,
         capacity: usize,
         charge: C,
     ) -> Result<Rc<SubmissionCapacity>> {
-        if self.reserved.borrow().upgrade().is_some()
-            || self.ordinary.get() > self.queue_entries.saturating_sub(capacity)
-            || capacity > self.queue_entries
-        {
+        if self.reserved.borrow().upgrade().is_some() || capacity > self.queue_entries {
             return Err(Error::InvalidConfiguration);
         }
-        self.init()?;
+        let io = self.io()?;
+        io.set_reserved_entries(u32::try_from(capacity).map_err(|_| Error::InvalidConfiguration)?)?;
         let reserved = Rc::new(SubmissionCapacity {
-            memory: Rc::new(Box::new(charge)),
-            active: Rc::new(Cell::new(0)),
+            _memory: Box::new(charge),
+            io: io.clone(),
             capacity,
         });
         *self.reserved.borrow_mut() = Rc::downgrade(&reserved);
@@ -1194,379 +371,160 @@ impl<S: Scope, Q: Budget> Reactor<S, Q> {
             .map(|charge| Box::new(charge) as Charge)
     }
 
-    /// Admit ordinary work, transferring all backing into a completion closure.
-    fn submit<T: 'static>(
+    /// Admit one operation: initialize, charge bookkeeping (ordinary) or check
+    /// the partition (reserved), register the scope, and build its context.
+    fn admit(
         &self,
-        sqe: Submission,
         scope: &S,
-        accept: bool,
-        finish: impl FnOnce(Result<KernelResult, S::Error>) -> Result<T, S::Error> + 'static,
-    ) -> Result<Waiting<T, S::Error>, S::Error> {
-        self.submit_reserved(sqe, scope, accept, None, finish)
-    }
-
-    /// Publish only after retaining owners, using ordinary or prepaid bookkeeping.
-    fn submit_reserved<T: 'static>(
-        &self,
-        sqe: Submission,
-        scope: &S,
-        accept: bool,
-        capacity: Option<Rc<SubmissionCapacity>>,
-        finish: impl FnOnce(Result<KernelResult, S::Error>) -> Result<T, S::Error> + 'static,
-    ) -> Result<Waiting<T, S::Error>, S::Error> {
-        self.submit_reserved_kind(
-            sqe,
-            scope,
-            accept,
-            capacity,
-            SubmissionKind::OtherIo,
-            finish,
-        )
-    }
-
-    fn submit_reserved_kind<T: 'static>(
-        &self,
-        sqe: Submission,
-        scope: &S,
-        accept: bool,
         capacity: Option<Rc<SubmissionCapacity>>,
         kind: SubmissionKind,
-        finish: impl FnOnce(Result<KernelResult, S::Error>) -> Result<T, S::Error> + 'static,
-    ) -> Result<Waiting<T, S::Error>, S::Error> {
+        held: Option<Charge>,
+    ) -> Result<(racer_io::Reactor, OpCtx, Admission<S>), S::Error> {
         scope.check()?;
-        let reserved_partition = capacity.is_some();
-        let reject = |reason, used, limit, requested| {
+        let reserved = capacity.is_some();
+        let reject = |reason, requested| {
             self.rejected(
                 scope,
                 SubmissionRejection {
                     reason,
                     kind,
-                    reserved: reserved_partition,
-                    used,
-                    limit,
+                    reserved,
+                    used: None,
+                    limit: None,
                     requested,
                 },
             );
         };
-        self.init().inspect_err(|error| {
-            if *error == Error::Overloaded {
-                reject(RejectionReason::Initialization, None, None, 1);
-            }
-        })?;
-        // Clone before borrowing reactor state: a scope's Clone may reenter.
-        let scope = scope.clone();
-        let bytes = std::mem::size_of::<Entry<S>>()
-            + std::mem::size_of::<S>()
-            + 2 * std::mem::size_of::<usize>()
-            + std::mem::size_of::<Reply<T, S::Error>>()
-            + std::mem::size_of_val(&finish)
-            + std::mem::size_of::<Signal>()
-            + std::mem::size_of::<libc::sockaddr_storage>();
-        let (reservation, active) = if let Some(pool) = &capacity {
-            if !self
-                .reserved
-                .borrow()
-                .upgrade()
-                .is_some_and(|own| Rc::ptr_eq(&own, pool))
-                || bytes > SUBMISSION_BYTES
-            {
-                return Err(Error::InvalidConfiguration.into());
-            }
-            if pool.active.get() >= pool.capacity {
-                reject(
-                    RejectionReason::ReservedFull,
-                    Some(pool.active.get()),
-                    Some(pool.capacity),
-                    1,
-                );
-                return Err(Error::Overloaded.into());
-            }
-            (
-                Reservation::Shared(pool.memory.clone()),
-                pool.active.clone(),
-            )
-        } else {
-            let reserved = self
-                .reserved
-                .borrow()
-                .upgrade()
-                .map_or(0, |pool| pool.capacity);
-            if self.ordinary.get() >= self.queue_entries - reserved {
-                reject(
-                    RejectionReason::OrdinaryFull,
-                    Some(self.ordinary.get()),
-                    Some(self.queue_entries - reserved),
-                    1,
-                );
-                return Err(Error::Overloaded.into());
-            }
-            let charge = self.charge(bytes).inspect_err(|error| {
+        let io = self
+            .io()
+            .inspect_err(|error| {
                 if *error == Error::Overloaded {
-                    reject(RejectionReason::Bookkeeping, None, None, bytes);
+                    reject(RejectionReason::Initialization, 1);
                 }
-            })?;
-            (Reservation::Owned(charge), self.ordinary.clone())
+            })?
+            .clone();
+        let charge = match &capacity {
+            Some(pool) => {
+                let own = self.reserved.borrow().upgrade();
+                if !own.is_some_and(|own| Rc::ptr_eq(&own, pool)) {
+                    return Err(Error::InvalidConfiguration.into());
+                }
+                None
+            }
+            None => Some(self.charge(OPERATION_BYTES).inspect_err(|error| {
+                if *error == Error::Overloaded {
+                    reject(RejectionReason::Bookkeeping, OPERATION_BYTES);
+                }
+            })?),
         };
-        let mut state = self.state.borrow_mut();
-        if state.stopped {
-            drop(state);
-            return Err(Error::Unavailable.into());
+        let mut ctx = scope.op_ctx();
+        if self.foreign_clock.get() {
+            ctx.deadline = racer_io::Deadline::default();
         }
-        let available = capacity.as_ref().map_or_else(
-            || self.queue_entries - self.reserved.borrow().upgrade().map_or(0, |p| p.capacity),
-            |pool| pool.capacity,
-        );
-        if state.entries.len() >= self.queue_entries || active.get() >= available {
-            let (reason, used, limit) = if state.entries.len() >= self.queue_entries {
-                (
-                    RejectionReason::EntriesFull,
-                    state.entries.len(),
-                    self.queue_entries,
-                )
-            } else {
-                (RejectionReason::PartitionFull, active.get(), available)
-            };
-            drop(state);
-            reject(reason, Some(used), Some(limit), 1);
-            return Err(Error::Overloaded.into());
-        }
-        let id = IoId(state.next);
-        if id.0 >= CANCEL_BIT {
-            drop(state);
-            reject(RejectionReason::IdExhausted, None, None, 1);
-            return Err(Error::Overloaded.into());
-        }
-        state.next += 1;
-        active.set(active.get() + 1);
-        let slot = SubmissionSlot {
-            active,
-            _capacity: capacity,
-        };
-        // Ordinary entries release their queue slot at the kernel fence, as
-        // before. Only the prepaid partition must also bound unconsumed replies.
-        let (ordinary_slot, reserved_slot) = if slot._capacity.is_some() {
-            (None, Some(slot))
-        } else {
-            (Some(slot), None)
-        };
-        let submitted = Rc::new(Submitted {
-            scope,
-            signal: Signal {
-                abandoned: Cell::new(false),
-                waker: RefCell::new(None),
-            },
-            reply: RefCell::new(Reply {
-                _slot: reserved_slot,
-                result: None,
-                _reservation: reservation,
-            }),
-            slot: Cell::new(ordinary_slot),
-            finish: Cell::new(Some(finish)),
+        ctx.reserved = reserved;
+        let record = Rc::new(Record {
+            scope: scope.clone(),
+            id: Cell::new(None),
         });
-        // Insert ownership BEFORE publishing the SQE. No fallible action may drop
-        // this entry after publication; even submission errors leave it retained.
-        state.entries.insert(
-            id,
-            Entry {
-                pending: submitted.clone(),
-                completion: CompletionState::new(if accept {
-                    CompletionKind::Descriptor
-                } else {
-                    CompletionKind::Value
-                }),
-                cancel_reason: None,
+        self.records.borrow_mut().push(record.clone());
+        Ok((
+            io,
+            ctx,
+            Admission {
+                _charge: charge,
+                _held: held,
+                _capacity: capacity,
+                record,
             },
-        );
-        // SAFETY: the inserted entry owns all SQE backing until both CQEs arrive.
-        let published = match sqe {
-            #[cfg(feature = "simulation")]
-            Submission::Sim(op) => state
-                .simulation
-                .as_mut()
-                .expect("simulation selected")
-                .push(id.0, op),
-            Submission::Real(sqe) => unsafe {
-                state
-                    .ring
-                    .as_mut()
-                    .unwrap()
-                    .submission()
-                    .push(&sqe.user_data(id.0))
-                    .map_err(|_| ())
-            },
-        };
-        if published.is_err() {
-            let entry = state.entries.remove(&id);
-            drop(state);
-            drop(entry);
-            reject(RejectionReason::SubmissionQueueFull, None, None, 1);
-            return Err(Error::Overloaded.into());
-        }
-        // Kernel submission is driven by poll_budgeted and by wait before sleeping,
-        // including SQEs queued in the intervening service turn. Polling a future
-        // only queues work; potentially blocking file operations use ASYNC.
-        Ok(Waiting {
-            delivery: submitted,
-        })
-    }
-
-    /// Only read/write/recv/send may use this helper. Connect and filesystem
-    /// mutations have distinct side effects and must not be automatically replayed.
-    async fn retry_data<O: 'static>(
-        &self,
-        mut owned: O,
-        fd: Rc<Descriptor>,
-        scope: &S,
-        capacity: Option<Rc<SubmissionCapacity>>,
-        interest: u32,
-        mut prepare: impl FnMut(&mut O) -> Result<Submission, S::Error>,
-    ) -> Result<(O, usize), S::Error> {
-        for attempt in 0..=DATA_RETRIES {
-            scope.check()?;
-            let sqe = prepare(&mut owned)?;
-            let (returned, result) = self
-                .submit_reserved(sqe, scope, false, capacity.clone(), move |result| {
-                    // Even a failed data CQE returns its owners internally. Scope
-                    // cancellation still wins, but only after both CQE fences.
-                    Ok((owned, result?.value()))
-                })?
-                .await?;
-            owned = returned;
-            let error = match result {
-                Ok(bytes) => return Ok((owned, bytes as usize)),
-                Err(error) => error,
-            };
-            if attempt == DATA_RETRIES || !matches!(error, Error::Os(libc::EINTR | libc::EAGAIN)) {
-                return Err(error.into());
-            }
-            scope.check()?;
-            if error == Error::Os(libc::EAGAIN) {
-                let sqe = self.readiness_submission(&fd, interest);
-                // Do not leave the buffer/lease in the waiting future while a
-                // readiness SQE is pending. Abandonment must retain them too.
-                let retained_fd = fd.clone();
-                owned = self
-                    .submit_reserved_kind(
-                        sqe,
-                        scope,
-                        false,
-                        capacity.clone(),
-                        SubmissionKind::Readiness,
-                        move |result| {
-                            drop(retained_fd);
-                            result?.value()?;
-                            Ok(owned)
-                        },
-                    )?
-                    .await?;
-            }
-        }
-        unreachable!("bounded retries return on the final attempt")
-    }
-
-    /// Derive one bounded region, borrowing exclusively only for kernel output.
-    fn buffer_region<B: IoBuffer>(
-        buffer: &mut B,
-        operation: BufferOperation,
-    ) -> Result<(*mut u8, u32), S::Error>
-where {
-        let (ptr, length) = match operation {
-            BufferOperation::Read(_) | BufferOperation::Recv => {
-                let bytes = buffer.bytes_mut()?;
-                (bytes.as_mut_ptr(), bytes.len())
-            }
-            BufferOperation::Write(_) | BufferOperation::Send => {
-                let bytes = buffer.bytes()?;
-                (bytes.as_ptr().cast_mut(), bytes.len())
-            }
-        };
-        let len = u32::try_from(length).map_err(|_| Error::InvalidInput)?;
-        Ok((ptr, len))
-    }
-
-    /// Prepare owned positioned or socket I/O using only the selected backend.
-    fn buffer_submission<B: IoBuffer, L: 'static>(
-        &self,
-        owned: &mut InFlight<B, L>,
-        operation: BufferOperation,
-        policy: IssuePolicy,
-    ) -> Result<Submission, S::Error>
-where {
-        Ok(submission!(
-            self,
-            {
-                let (ptr, len) = Self::buffer_region(&mut owned.buffer, operation)?;
-                simulation::Op::Buffer {
-                    fd: owned.file.clone(),
-                    operation,
-                    ptr,
-                    len: len as usize,
-                }
-            },
-            {
-                let fd = types::Fd(owned.file.as_raw_fd());
-                let (ptr, len) = Self::buffer_region(&mut owned.buffer, operation)?;
-                match operation {
-                    BufferOperation::Read(offset) => opcode::Read::new(fd, ptr, len)
-                        .offset(offset)
-                        .build()
-                        .flags(policy.flags()),
-                    BufferOperation::Write(offset) => opcode::Write::new(fd, ptr, len)
-                        .offset(offset)
-                        .build()
-                        .flags(policy.flags()),
-                    BufferOperation::Recv => opcode::Recv::new(fd, ptr, len).build(),
-                    BufferOperation::Send => opcode::Send::new(fd, ptr, len)
-                        .flags(libc::MSG_NOSIGNAL)
-                        .build(),
-                }
-            }
         ))
     }
 
-    /// Retain exclusive storage and admission through retries and return fenced progress.
-    #[allow(clippy::too_many_arguments)]
-    fn buffer_io<'a, B: IoBuffer, L: 'static>(
+    /// Submit and await one `racer-io` operation under `scope`. A scope
+    /// failure takes precedence over the operation's own error, but only after
+    /// the operation is fenced.
+    fn run<'a, T: 'static, F>(
         &'a self,
-        file: Rc<Descriptor>,
-        buffer: B,
-        lease: L,
         scope: &'a S,
-        operation: BufferOperation,
-        policy: IssuePolicy,
         capacity: Option<Rc<SubmissionCapacity>>,
-    ) -> Operation<'a, Completion<B, L>, S::Error>
-where {
+        kind: SubmissionKind,
+        make: impl FnOnce(&racer_io::Reactor, &OpCtx) -> F + 'a,
+        id: fn(&F) -> Option<IoId>,
+    ) -> Operation<'a, T, S::Error>
+    where
+        F: Future<Output = racer_io::Result<T>> + Unpin + 'a,
+    {
+        self.run_holding(scope, capacity, kind, None, make, id)
+    }
+
+    /// [`Self::run`], also retaining `held` until the operation is fenced,
+    /// even when the waiting future is dropped first.
+    fn run_holding<'a, T: 'static, F>(
+        &'a self,
+        scope: &'a S,
+        capacity: Option<Rc<SubmissionCapacity>>,
+        kind: SubmissionKind,
+        held: Option<Charge>,
+        make: impl FnOnce(&racer_io::Reactor, &OpCtx) -> F + 'a,
+        id: fn(&F) -> Option<IoId>,
+    ) -> Operation<'a, T, S::Error>
+    where
+        F: Future<Output = racer_io::Result<T>> + Unpin + 'a,
+    {
         Box::pin(async move {
-            scope.check()?;
-            if matches!(operation, BufferOperation::Read(offset) | BufferOperation::Write(offset) if offset > i64::MAX as u64)
-            {
-                return Err(Error::InvalidInput.into());
-            }
-            let owned = InFlight {
-                file,
-                buffer,
-                lease,
+            let reserved = capacity.is_some();
+            let (io, ctx, admission) = self.admit(scope, capacity, kind, held)?;
+            let mut guard = Waiting {
+                reactor: self,
+                io,
+                admission: Some(admission),
             };
-            // Positioned device I/O tries inline nonblocking issue; the kernel
-            // offloads if needed. Cold buffered filesystem callers force ASYNC.
-            // Socket opcodes always keep native nonblocking issue/poll behavior.
-            let fd = owned.file.clone();
-            let interest = match operation {
-                BufferOperation::Read(_) | BufferOperation::Recv => libc::POLLIN,
-                BufferOperation::Write(_) | BufferOperation::Send => libc::POLLOUT,
-            } as u32;
-            let (owned, bytes) = self
-                .retry_data(owned, fd, scope, capacity, interest, |owned| {
-                    self.buffer_submission(owned, operation, policy)
-                })
-                .await?;
-            Ok(owned.complete(bytes))
+            let mut future = make(&guard.io, &ctx);
+            let result = std::future::poll_fn(|cx| {
+                let result = Pin::new(&mut future).poll(cx);
+                let record = &guard.admission.as_ref().expect("admitted").record;
+                if record.id.get().is_none() {
+                    record.id.set(id(&future));
+                }
+                result
+            })
+            .await;
+            drop(future);
+            guard.admission.take();
+            match result {
+                Ok(value) => Ok(value),
+                Err(error) => {
+                    if error == Error::Overloaded {
+                        let partition = self.reserved.borrow().upgrade().map_or(0, |p| p.capacity);
+                        let limit = if reserved {
+                            partition
+                        } else {
+                            self.queue_entries - partition
+                        };
+                        self.rejected(
+                            scope,
+                            SubmissionRejection {
+                                reason: if reserved {
+                                    RejectionReason::ReservedFull
+                                } else {
+                                    RejectionReason::OrdinaryFull
+                                },
+                                kind,
+                                reserved,
+                                used: Some(limit),
+                                limit: Some(limit),
+                                requested: 1,
+                            },
+                        );
+                    }
+                    scope.check()?;
+                    Err(error.into())
+                }
+            }
         })
     }
 
-    /// Transfer the FD, buffer, and any reuse-preventing lease (`()` if none).
-    /// Owned resources can move from one completed operation to the next:
+    /// Read at an explicit offset into owned storage, retaining `lease`
+    /// (`()` if none) until every completion fence.
     /// ```no_run
     /// use std::rc::Rc;
     /// use uring_runtime::{Budget, Scope, Result, reactor::{descriptor::Descriptor, IoBuffer, Completion, Reactor}};
@@ -1595,16 +553,13 @@ where {
         buffer: B,
         lease: L,
         scope: &'a S,
-    ) -> Operation<'a, Completion<B, L>, S::Error>
-where {
-        self.buffer_io(
-            file,
-            buffer,
-            lease,
+    ) -> Operation<'a, Completion<B, L>, S::Error> {
+        self.run(
             scope,
-            BufferOperation::Read(offset),
-            IssuePolicy::Inline,
             None,
+            SubmissionKind::OtherIo,
+            move |io, ctx| io.read_at(file, offset, buffer, lease, ctx),
+            |f| f.id(),
         )
     }
 
@@ -1616,27 +571,46 @@ where {
         buffer: B,
         lease: L,
         scope: &'a S,
-    ) -> Operation<'a, Completion<B, L>, S::Error>
-where {
-        self.buffer_io(
-            file,
-            buffer,
-            lease,
+    ) -> Operation<'a, Completion<B, L>, S::Error> {
+        let write = self.run(
             scope,
-            BufferOperation::Write(offset),
-            IssuePolicy::Inline,
             None,
+            SubmissionKind::OtherIo,
+            move |io, ctx| io.write_at(file, offset, Exclusive(buffer), lease, ctx),
+            |f| f.id(),
+        );
+        Box::pin(async move {
+            let done = write.await?;
+            Ok(Completion {
+                buffer: done.buffer.0,
+                bytes: done.bytes,
+                lease: done.lease,
+            })
+        })
+    }
+
+    /// Write immutable shared storage at an explicit file offset, returning
+    /// short progress without replaying bytes.
+    pub fn write_shared_at<'a, B: SendBuffer, L: 'static>(
+        &'a self,
+        file: Rc<Descriptor>,
+        offset: u64,
+        buffer: B,
+        lease: L,
+        scope: &'a S,
+    ) -> Operation<'a, Completion<B, L>, S::Error> {
+        self.run(
+            scope,
+            None,
+            SubmissionKind::OtherIo,
+            move |io, ctx| io.write_at(file, offset, buffer, lease, ctx),
+            |f| f.id(),
         )
     }
 
     /// Write `header` then `body` contiguously at an explicit offset with one
-    /// vectored write, without copying either into a staging buffer.
-    ///
-    /// Both owners and the lease are retained until every completion fence.
-    /// Short progress is returned as is and may end inside either segment;
-    /// zero-progress `EINTR`/`EAGAIN` is retried like [`Self::write_at`]. A
-    /// combined length above `u32::MAX`, or an offset above `i64::MAX`, fails
-    /// with [`Error::InvalidInput`].
+    /// vectored write, without copying either into a staging buffer. Short
+    /// progress is returned as is and may end inside either segment.
     pub fn write_vectored_at<'a, H: IoBuffer, T: SharedWriteBuffer, L: 'static>(
         &'a self,
         file: Rc<Descriptor>,
@@ -1645,77 +619,23 @@ where {
         body: T,
         lease: L,
         scope: &'a S,
-    ) -> Operation<'a, VectoredCompletion<H, T, L>, S::Error>
-where {
+    ) -> Operation<'a, VectoredCompletion<H, T, L>, S::Error> {
+        let write = self.run(
+            scope,
+            None,
+            SubmissionKind::OtherIo,
+            move |io, ctx| io.write_vectored_at(file, offset, Exclusive(header), body, lease, ctx),
+            |f| f.id(),
+        );
         Box::pin(async move {
-            scope.check()?;
-            if offset > i64::MAX as u64 {
-                return Err(Error::InvalidInput.into());
-            }
-            let empty = libc::iovec {
-                iov_base: std::ptr::null_mut(),
-                iov_len: 0,
-            };
-            let owned = VectoredInFlight {
-                file,
-                header,
-                body,
-                lease,
-                iovecs: SyscallArg::new([empty; 2]),
-            };
-            let fd = owned.file.clone();
-            let (owned, bytes) = self
-                .retry_data(owned, fd, scope, None, libc::POLLOUT as u32, |owned| {
-                    self.vectored_submission(owned, offset)
-                })
-                .await?;
-            Ok(owned.complete(bytes))
+            let done = write.await?;
+            Ok(VectoredCompletion {
+                header: done.header.0,
+                body: done.body,
+                bytes: done.bytes,
+                lease: done.lease,
+            })
         })
-    }
-
-    /// Point the retained iovecs at both segments and prepare one positioned writev.
-    fn vectored_submission<H: IoBuffer, T: SharedWriteBuffer, L: 'static>(
-        &self,
-        owned: &mut VectoredInFlight<H, T, L>,
-        offset: u64,
-    ) -> Result<Submission, S::Error>
-where {
-        let header = owned.header.bytes()?;
-        let body = owned.body.write_bytes()?;
-        if header
-            .len()
-            .checked_add(body.len())
-            .is_none_or(|total| u32::try_from(total).is_err())
-        {
-            return Err(Error::InvalidInput.into());
-        }
-        let segments = [
-            libc::iovec {
-                iov_base: header.as_ptr().cast_mut().cast(),
-                iov_len: header.len(),
-            },
-            libc::iovec {
-                iov_base: body.as_ptr().cast_mut().cast(),
-                iov_len: body.len(),
-            },
-        ];
-        // SAFETY: the one-element backing is initialized and exclusively owned;
-        // the kernel only reads it after publication below.
-        unsafe { owned.iovecs.as_mut_ptr().write(segments) };
-        let iovecs = owned.iovecs.as_ptr().cast::<libc::iovec>();
-        Ok(submission!(
-            self,
-            simulation::Op::Writev {
-                fd: owned.file.clone(),
-                offset,
-                iovecs,
-                count: 2,
-            },
-            opcode::Writev::new(types::Fd(owned.file.as_raw_fd()), iovecs, 2)
-                .offset(offset)
-                .build()
-                .flags(IssuePolicy::Inline.flags())
-        ))
     }
 
     /// Receive into owned storage while retaining the caller's lease through fencing.
@@ -1725,57 +645,56 @@ where {
         buffer: B,
         lease: L,
         scope: &'a S,
-    ) -> Operation<'a, Completion<B, L>, S::Error>
-where {
-        self.buffer_io(
-            fd,
-            buffer,
-            lease,
+    ) -> Operation<'a, Completion<B, L>, S::Error> {
+        self.run(
             scope,
-            BufferOperation::Recv,
-            IssuePolicy::Inline,
             None,
+            SubmissionKind::OtherIo,
+            move |io, ctx| io.recv(fd, buffer, lease, ctx),
+            |f| f.id(),
         )
     }
 
-    /// Receive using prepaid capacity held until the fenced reply is consumed or dropped.
+    /// Receive using the reserved partition.
     pub fn recv_reserved<'a, B: IoBuffer>(
         &'a self,
         fd: Rc<Descriptor>,
         buffer: B,
         capacity: Rc<SubmissionCapacity>,
         scope: &'a S,
-    ) -> Operation<'a, Completion<B>, S::Error>
-where {
-        self.buffer_io(
-            fd,
-            buffer,
-            (),
+    ) -> Operation<'a, Completion<B>, S::Error> {
+        self.run(
             scope,
-            BufferOperation::Recv,
-            IssuePolicy::Inline,
             Some(capacity),
+            SubmissionKind::OtherIo,
+            move |io, ctx| io.recv(fd, buffer, (), ctx),
+            |f| f.id(),
         )
     }
 
-    /// Send using prepaid capacity held until the fenced reply is consumed or dropped.
+    /// Send using the reserved partition.
     pub fn send_reserved<'a, B: IoBuffer>(
         &'a self,
         fd: Rc<Descriptor>,
         buffer: B,
         capacity: Rc<SubmissionCapacity>,
         scope: &'a S,
-    ) -> Operation<'a, Completion<B>, S::Error>
-where {
-        self.buffer_io(
-            fd,
-            buffer,
-            (),
+    ) -> Operation<'a, Completion<B>, S::Error> {
+        let send = self.run(
             scope,
-            BufferOperation::Send,
-            IssuePolicy::Inline,
             Some(capacity),
-        )
+            SubmissionKind::OtherIo,
+            move |io, ctx| io.send(fd, Exclusive(buffer), (), ctx),
+            |f| f.id(),
+        );
+        Box::pin(async move {
+            let done = send.await?;
+            Ok(Completion {
+                buffer: done.buffer.0,
+                bytes: done.bytes,
+                lease: done.lease,
+            })
+        })
     }
 
     /// Send owned immutable storage, retaining its lease and suppressing SIGPIPE.
@@ -1785,184 +704,32 @@ where {
         buffer: B,
         lease: L,
         scope: &'a S,
-    ) -> Operation<'a, Completion<B, L>, S::Error>
-where {
-        Box::pin(async move {
-            let retained_fd = fd.clone();
-            let (owned, bytes) = self
-                .retry_data(
-                    InFlight {
-                        file: fd,
-                        buffer,
-                        lease,
-                    },
-                    retained_fd,
-                    scope,
-                    None,
-                    libc::POLLOUT as u32,
-                    |owned| {
-                        let bytes = owned.buffer.send_bytes()?;
-                        let len = u32::try_from(bytes.len()).map_err(|_| Error::InvalidInput)?;
-                        let sqe = submission!(
-                            self,
-                            simulation::Op::Buffer {
-                                fd: owned.file.clone(),
-                                operation: BufferOperation::Send,
-                                // Simulation creates a shared slice for Send, never a mutable one.
-                                ptr: bytes.as_ptr().cast_mut(),
-                                len: len as usize,
-                            },
-                            opcode::Send::new(
-                                types::Fd(owned.file.as_raw_fd()),
-                                bytes.as_ptr(),
-                                len
-                            )
-                            .flags(libc::MSG_NOSIGNAL)
-                            .build()
-                        );
-                        Ok(sqe)
-                    },
-                )
-                .await?;
-            Ok(owned.complete(bytes))
-        })
+    ) -> Operation<'a, Completion<B, L>, S::Error> {
+        self.run(
+            scope,
+            None,
+            SubmissionKind::OtherIo,
+            move |io, ctx| io.send(fd, buffer, lease, ctx),
+            |f| f.id(),
+        )
     }
 
     /// Receive like [`Self::recv`], also accepting `SCM_RIGHTS` descriptors with
-    /// `MSG_CMSG_CLOEXEC` and reporting kernel TLS record types. On a kernel TLS
-    /// socket a non-application record is returned here (instead of failing with
-    /// `EIO` as plain `recv` does) and never merged with application data. Descriptors are owned before this returns; a dropped
-    /// or failed wait closes any the kernel delivered. Simulated sockets carry
-    /// no ancillary data and always report none.
+    /// `MSG_CMSG_CLOEXEC` and reporting kernel TLS record types. Simulated
+    /// sockets carry no ancillary data and always report none.
     pub fn recv_msg<'a, B: IoBuffer, L: 'static>(
         &'a self,
         fd: Rc<Descriptor>,
         buffer: B,
         lease: L,
         scope: &'a S,
-    ) -> Operation<'a, MessageCompletion<B, L>, S::Error>
-where {
-        Box::pin(async move {
-            let retained_fd = fd.clone();
-            let ((owned, mut header), bytes) = self
-                .retry_data(
-                    (
-                        InFlight {
-                            file: fd,
-                            buffer,
-                            lease,
-                        },
-                        MessageHeader::new(),
-                    ),
-                    retained_fd,
-                    scope,
-                    None,
-                    libc::POLLIN as u32,
-                    |(owned, header)| {
-                        let (ptr, len) =
-                            Self::buffer_region(&mut owned.buffer, BufferOperation::Recv)?;
-                        let sqe = submission!(
-                            self,
-                            simulation::Op::Buffer {
-                                fd: owned.file.clone(),
-                                operation: BufferOperation::Recv,
-                                ptr,
-                                len: len as usize,
-                            },
-                            opcode::RecvMsg::new(
-                                types::Fd(owned.file.as_raw_fd()),
-                                header.prepare(ptr, len)
-                            )
-                            .flags(libc::MSG_CMSG_CLOEXEC as u32)
-                            .build()
-                        );
-                        Ok(sqe)
-                    },
-                )
-                .await?;
-            let truncated = header.truncated();
-            let tls_record_type = header.tls_record_type();
-            let descriptors = header.take_descriptors();
-            let Completion {
-                buffer,
-                bytes,
-                lease,
-            } = owned.complete(bytes);
-            Ok(MessageCompletion {
-                buffer,
-                bytes,
-                lease,
-                descriptors,
-                truncated,
-                tls_record_type,
-            })
-        })
-    }
-
-    /// Write immutable shared storage at an explicit file offset, returning
-    /// short progress without replaying bytes. Unlike [`Self::write_at`], the
-    /// buffer needs no mutable capability, so verified pages can be written.
-    pub fn write_shared_at<'a, B: SendBuffer, L: 'static>(
-        &'a self,
-        file: Rc<Descriptor>,
-        offset: u64,
-        buffer: B,
-        lease: L,
-        scope: &'a S,
-    ) -> Operation<'a, Completion<B, L>, S::Error>
-where {
-        Box::pin(async move {
-            if offset > i64::MAX as u64 {
-                return Err(Error::InvalidInput.into());
-            }
-            let retained_fd = file.clone();
-            let (owned, bytes) = self
-                .retry_data(
-                    InFlight {
-                        file,
-                        buffer,
-                        lease,
-                    },
-                    retained_fd,
-                    scope,
-                    None,
-                    libc::POLLOUT as u32,
-                    |owned| {
-                        let bytes = owned.buffer.send_bytes()?;
-                        let len = u32::try_from(bytes.len()).map_err(|_| Error::InvalidInput)?;
-                        let sqe = submission!(
-                            self,
-                            simulation::Op::Buffer {
-                                fd: owned.file.clone(),
-                                operation: BufferOperation::Write(offset),
-                                ptr: bytes.as_ptr().cast_mut(),
-                                len: len as usize,
-                            },
-                            opcode::Write::new(
-                                types::Fd(owned.file.as_raw_fd()),
-                                bytes.as_ptr(),
-                                len
-                            )
-                            .offset(offset)
-                            .build()
-                        );
-                        Ok(sqe)
-                    },
-                )
-                .await?;
-            Ok(owned.complete(bytes))
-        })
-    }
-
-    /// Select a readiness opcode without converting simulated owners to host FDs.
-    fn readiness_submission(&self, fd: &Rc<Descriptor>, interest: u32) -> Submission {
-        submission!(
-            self,
-            simulation::Op::Poll {
-                fd: fd.clone(),
-                interest
-            },
-            opcode::PollAdd::new(types::Fd(fd.as_raw_fd()), interest).build()
+    ) -> Operation<'a, MessageCompletion<B, L>, S::Error> {
+        self.run(
+            scope,
+            None,
+            SubmissionKind::OtherIo,
+            move |io, ctx| io.recv_msg(fd, buffer, lease, ctx),
+            |f| f.id(),
         )
     }
 
@@ -1984,10 +751,16 @@ where {
         lease: L,
         scope: &'a S,
     ) -> Operation<'a, u32, S::Error> {
-        self.readiness_capacity(fd, interest, lease, None, scope)
+        self.run(
+            scope,
+            None,
+            SubmissionKind::Readiness,
+            move |io, ctx| io.poll_ready(fd, interest, lease, ctx),
+            |f| f.id(),
+        )
     }
 
-    /// Wait with prepaid capacity and retain the descriptor and lease until fenced.
+    /// Wait using the reserved partition, retaining the descriptor and lease until fenced.
     pub fn readiness_reserved<'a, L: 'static>(
         &'a self,
         fd: Rc<Descriptor>,
@@ -1996,44 +769,13 @@ where {
         capacity: Rc<SubmissionCapacity>,
         scope: &'a S,
     ) -> Operation<'a, u32, S::Error> {
-        self.readiness_capacity(fd, interest, lease, Some(capacity), scope)
-    }
-
-    fn readiness_capacity<'a, L: 'static>(
-        &'a self,
-        fd: Rc<Descriptor>,
-        interest: u32,
-        lease: L,
-        capacity: Option<Rc<SubmissionCapacity>>,
-        scope: &'a S,
-    ) -> Operation<'a, u32, S::Error> {
-        Box::pin(async move {
-            if interest == 0
-                || interest
-                    & !((libc::POLLIN
-                        | libc::POLLOUT
-                        | libc::POLLRDHUP
-                        | libc::POLLHUP
-                        | libc::POLLERR) as u32)
-                    != 0
-            {
-                return Err(Error::InvalidInput.into());
-            }
-            let sqe = self.readiness_submission(&fd, interest);
-            self.submit_reserved_kind(
-                sqe,
-                scope,
-                false,
-                capacity,
-                SubmissionKind::Readiness,
-                move |result| {
-                    drop(fd);
-                    drop(lease);
-                    Ok(result?.value()? as u32)
-                },
-            )?
-            .await
-        })
+        self.run(
+            scope,
+            Some(capacity),
+            SubmissionKind::Readiness,
+            move |io, ctx| io.poll_ready(fd, interest, lease, ctx),
+            |f| f.id(),
+        )
     }
 
     /// Accept one nonblocking, close-on-exec socket into a typed owner.
@@ -2045,37 +787,20 @@ where {
         self.accept_reserved(fd, None, scope)
     }
 
-    /// Accept with optional prepaid capacity, retaining unread accepted descriptors.
+    /// Accept with an optional reserved partition.
     pub fn accept_reserved<'a>(
         &'a self,
         fd: Rc<Descriptor>,
         capacity: Option<Rc<SubmissionCapacity>>,
         scope: &'a S,
     ) -> Operation<'a, Descriptor, S::Error> {
-        Box::pin(async move {
-            let sqe = submission!(
-                self,
-                simulation::Op::Accept(fd.clone()),
-                opcode::Accept::new(
-                    types::Fd(fd.as_raw_fd()),
-                    std::ptr::null_mut(),
-                    std::ptr::null_mut(),
-                )
-                .flags(libc::SOCK_CLOEXEC | libc::SOCK_NONBLOCK)
-                .build()
-            );
-            self.submit_reserved(sqe, scope, true, capacity, move |result| {
-                drop(fd);
-                match result? {
-                    KernelResult::Accepted(fd) => Ok(fd),
-                    value => {
-                        value.value()?;
-                        Err(Error::Io.into())
-                    }
-                }
-            })?
-            .await
-        })
+        self.run(
+            scope,
+            capacity,
+            SubmissionKind::OtherIo,
+            move |io, ctx| io.accept(fd, ctx),
+            |f| f.id(),
+        )
     }
 
     /// Connect once to an owned address; connection side effects are never retried.
@@ -2088,9 +813,7 @@ where {
         self.connect_with_lease(fd, address, (), scope)
     }
 
-    /// Transfer the complete connection/admission owner before submission. Return
-    /// it only after the original and any cancellation CQE are fenced. A dropped
-    /// connect future cannot return its endpoint slot or quota prematurely.
+    /// Return the lease only after the original and any cancellation CQE are fenced.
     pub fn connect_with_lease<'a, L: 'static>(
         &'a self,
         fd: Rc<Descriptor>,
@@ -2107,823 +830,239 @@ where {
         fd: Rc<Descriptor>,
         address: SocketAddress,
         lease: L,
-        errno: Option<Rc<std::cell::Cell<Option<i32>>>>,
+        errno: Option<Rc<Cell<Option<i32>>>>,
         scope: &'a S,
     ) -> Operation<'a, L, S::Error> {
-        Box::pin(async move {
-            #[cfg(feature = "simulation")]
-            let destination = address.clone();
-            let (address, len) = encode_address(address)?;
-            let sqe = submission!(
-                self,
-                simulation::Op::Connect {
-                    fd: fd.clone(),
-                    address: destination
-                },
-                opcode::Connect::new(types::Fd(fd.as_raw_fd()), address.as_ptr().cast(), len,)
-                    .build()
-            );
-            self.submit(sqe, scope, false, move |result| {
-                drop((fd, address));
-                if let (Some(errno), Ok(result)) = (&errno, &result) {
-                    result.observe_errno(errno);
-                }
-                result?.value()?;
-                Ok(lease)
-            })?
-            .await
-        })
+        self.run(
+            scope,
+            None,
+            SubmissionKind::OtherIo,
+            move |io, ctx| ObservedConnect {
+                inner: io.connect(fd, address, lease, ctx),
+                errno,
+            },
+            |f| f.inner.id(),
+        )
     }
 
-    /// Process at most `budget` CQEs and inspect at most `budget` cancellation
-    /// candidates, round-robin. Returns CQEs consumed, including cancel CQEs.
+    /// Process at most `budget` completions and check at most `budget`
+    /// in-flight scopes, canceling operations whose scope failed. Returns the
+    /// completions consumed.
     pub fn poll_budgeted(&self, budget: usize) -> Result<usize> {
         let _environment = self.environment.enter();
         if budget == 0 {
             return Ok(0);
         }
-        let mut state = self.state.borrow_mut();
-        if state.ring_reservation.is_none() {
+        let Some(io) = self.io.get() else {
             return Ok(0);
-        }
-        // Reuse batch storage; a reentrant call finds it taken and allocates.
-        let mut finished = std::mem::take(&mut state.finished);
-        let mut fence_wakes = Vec::new();
-        let mut failure = None;
-        let mut completed = 0;
-        while completed < budget {
-            let cqe = state.next_completion();
-            let Some((tag, result)) = cqe else {
-                break;
-            };
-            completed += 1;
-            match state.complete(tag, result) {
-                Ok(Some(entry)) => {
-                    finished.push(entry);
-                    fence_wakes.extend(state.take_fence_wakers(Some(IoId(tag & !CANCEL_BIT))));
-                }
-                Ok(None) => (),
-                Err(error) => {
-                    state.stopped = true;
-                    failure = Some(error);
-                    break;
-                }
-            }
-        }
-        if state.entries.is_empty() {
-            fence_wakes.extend(state.take_fence_wakers(None));
-        }
-        drop(state);
-        // One panicking callback must not discard unrelated completed replies or
-        // notifications. Finish the batch outside all reactor borrows, then unwind.
-        let mut panic = None;
-        for entry in finished.drain(..) {
-            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                if let Some(waker) = entry.finish() {
-                    waker.wake();
-                }
-            }));
-            if let Err(payload) = result {
-                panic.get_or_insert(payload);
-            }
-        }
-        {
-            let mut state = self.state.borrow_mut();
-            if state.finished.capacity() == 0 {
-                state.finished = finished;
-            }
-        }
-        for waiter in fence_wakes {
-            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| waiter.wake()));
-            if let Err(payload) = result {
-                panic.get_or_insert(payload);
-            }
-        }
-        if let Some(payload) = panic {
-            std::panic::resume_unwind(payload);
-        }
-        if let Some(error) = failure {
-            return Err(error);
-        }
-        self.queue_cancellations(budget);
-        let mut state = self.state.borrow_mut();
-        let submitted = state.submit_pending();
-        if submitted.is_err() {
-            state.stopped = true;
-        }
-        submitted.map(|()| completed)
+        };
+        // Completions first, then scope checks: a cancel requested by this
+        // scan is reaped on a later turn, as with any other submission.
+        let reaped = io.reap(budget)?;
+        self.scan(io, budget);
+        Ok(reaped)
     }
 
-    /// Queue ASYNC_CANCEL for up to `budget` in-flight operations whose scope was
-    /// cancelled, resuming the round-robin scan where the previous call stopped.
-    fn queue_cancellations(&self, budget: usize) {
-        // Snapshot the next round-robin slice in one borrow, reusing the scratch
-        // storage; a reentrant scan finds it taken and allocates its own.
-        let mut batch = {
-            let mut state = self.state.borrow_mut();
-            let count = budget.min(state.entries.len());
-            if count == 0 {
+    /// Drop finished records and cancel up to `budget` operations whose
+    /// scope check fails. Checks run outside the records borrow.
+    fn scan(&self, io: &racer_io::Reactor, budget: usize) {
+        let mut checks = Vec::new();
+        self.records.borrow_mut().retain(|record| {
+            let waiting = Rc::strong_count(record) > 1;
+            match record.id.get() {
+                None => waiting,
+                Some(id) if io.is_fenced(id) => waiting,
+                Some(id) => {
+                    if checks.len() < budget {
+                        checks.push((id, record.clone()));
+                    }
+                    true
+                }
+            }
+        });
+        self.release_parked(io);
+        for (id, record) in checks {
+            if record.scope.check().is_err() {
+                io.cancel_op(id, Error::Cancelled);
+            }
+        }
+    }
+
+    /// Release admissions of abandoned operations that have fenced. Guards
+    /// drop outside the borrow, since budget hooks may reenter.
+    fn release_parked(&self, io: &racer_io::Reactor) {
+        let released: Vec<_> = {
+            let mut parked = self.parked.borrow_mut();
+            if parked.is_empty() {
                 return;
             }
-            let mut batch = std::mem::take(&mut state.scan_batch);
-            let after = state.scan_after;
-            let next = state
-                .entries
-                .after(after)
-                .take(count)
-                .map(|(id, entry)| (*id, entry.pending.clone(), None));
-            batch.extend(next);
-            if let Some((last, _, _)) = batch.last() {
-                state.scan_after = *last;
+            let mut released = Vec::new();
+            let mut index = 0;
+            while index < parked.len() {
+                if io.is_fenced(parked[index].0) {
+                    released.push(parked.swap_remove(index));
+                } else {
+                    index += 1;
+                }
             }
-            batch
+            released
         };
-        // Policy checks run outside reactor borrows and may reenter.
-        for (_, pending, checked) in &mut batch {
-            *checked = pending.scope().check().err();
-        }
-        {
-            let mut state = self.state.borrow_mut();
-            let stopped = state.stopped;
-            for (id, _, checked) in &mut batch {
-                let id = *id;
-                let Some(entry) = state.entries.get_mut(&id) else {
-                    continue;
-                };
-                if entry.cancel_reason.is_none() {
-                    entry.cancel_reason = if stopped || entry.pending.signal().abandoned.get() {
-                        Some(Error::Cancelled.into())
-                    } else {
-                        checked.take()
-                    };
-                }
-                if entry.cancel_reason.is_some() && entry.completion.needs_cancel() {
-                    #[cfg(feature = "simulation")]
-                    if let Some(driver) = &mut state.simulation {
-                        driver.cancel(id.0);
-                        state
-                            .entries
-                            .get_mut(&id)
-                            .unwrap()
-                            .completion
-                            .cancel_submitted();
-                        continue;
-                    }
-                    let sqe = opcode::AsyncCancel::new(id.0)
-                        .build()
-                        .user_data(id.0 | CANCEL_BIT);
-                    // SAFETY: cancel uses only an ID, and its target entry is retained.
-                    if unsafe { state.ring.as_mut().unwrap().submission().push(&sqe) }.is_ok() {
-                        state
-                            .entries
-                            .get_mut(&id)
-                            .unwrap()
-                            .completion
-                            .cancel_submitted();
-                    }
-                }
-            }
-        }
-        // Release snapshot owners outside reactor borrows, then keep the storage.
-        batch.clear();
-        let mut state = self.state.borrow_mut();
-        if state.scan_batch.capacity() == 0 {
-            state.scan_batch = batch;
-        }
+        drop(released);
     }
 
-    /// Sleep until a CQE/external wake, bounded by both duration and a 10ms timer
-    /// fallback for producers that cannot yet attach the eventfd wake endpoint.
+    /// Sleep until a completion or external wake, bounded by `duration` and a
+    /// short fallback for producers that cannot attach the wake endpoint.
     pub fn wait(&self, duration: Duration) -> Result<()> {
-        // A scope cancelled during the service turn wakes nothing, and its
-        // fenced operation completes only after ASYNC_CANCEL. Queue those
-        // cancels now so their CQEs end the sleep instead of the timeout. A
-        // pending local wake skips the sleep, so the next poll_budgeted scans.
-        let local_pending = || {
-            self.state
-                .borrow()
-                .wake
-                .as_ref()
-                .is_some_and(|wake| wake.local.load(Ordering::Acquire))
+        let Some(io) = self.io.get() else {
+            return Ok(());
         };
-        if !duration.is_zero() && !local_pending() {
-            // Scope checks read the ambient clock, so scan in the reactor's
-            // captured environment exactly as poll_budgeted does.
+        if !duration.is_zero() {
             let _environment = self.environment.enter();
-            let pending = self.state.borrow().entries.len();
-            self.queue_cancellations(pending);
+            self.scan(io, usize::MAX);
         }
-        let mut state = self.state.borrow_mut();
-        // Service polling can queue SQEs after poll_budgeted. Submit once before
-        // sleeping so that work can produce the CQEs we wait for. Transient errors
-        // defer progress to the next worker turn; completion/cancel budgets stay
-        // in poll_budgeted, and an absent ring remains uninitialized.
-        if let Err(error) = state.submit_pending() {
-            state.stopped = true;
-            return Err(error);
+        if duration.is_zero() || io.is_sim() {
+            return io.park(Some(io.now()));
         }
-        let local = state
-            .wake
-            .as_ref()
-            .is_some_and(|wake| wake.local.swap(false, Ordering::AcqRel));
-        if duration.is_zero() || local {
-            return Ok(());
-        }
-        #[cfg(feature = "simulation")]
-        if state.simulation.is_some() {
-            return Ok(());
-        }
-        // Completions already posted, for example by inline issue during the
-        // submit above, end the wait without a ppoll; the next poll_budgeted
-        // reaps them. A pending remote token stays for the next sleeping wait.
-        if state
-            .ring
-            .as_mut()
-            .is_some_and(|ring| !ring.completion().is_empty())
-        {
-            return Ok(());
-        }
-        let mut fds = [
-            libc::pollfd {
-                fd: state.ring.as_ref().map_or(-1, AsRawFd::as_raw_fd),
-                events: libc::POLLIN,
-                revents: 0,
-            },
-            libc::pollfd {
-                fd: state.wake.as_ref().map_or(-1, |fd| fd.as_raw_fd()),
-                events: libc::POLLIN,
-                revents: 0,
-            },
-        ];
-        let duration = duration.min(MAX_WAIT);
-        let timeout = libc::timespec {
-            tv_sec: 0,
-            tv_nsec: duration.as_nanos() as libc::c_long,
-        };
-        // SAFETY: poll only borrows initialized descriptor/timeout arrays for this call.
-        #[cfg(test)]
-        {
-            state.wait_attempts += 1;
-        }
-        let result = unsafe {
-            libc::ppoll(
-                fds.as_mut_ptr(),
-                fds.len() as libc::nfds_t,
-                &timeout,
-                std::ptr::null(),
-            )
-        };
-        if result < 0 && std::io::Error::last_os_error().raw_os_error() != Some(libc::EINTR) {
-            return Err(Error::Io);
-        }
-        if fds[1].revents & libc::POLLIN != 0 {
-            let mut value = 0u64;
-            // SAFETY: nonblocking eventfd read into an initialized local u64.
-            unsafe {
-                libc::read(fds[1].fd, (&mut value as *mut u64).cast(), 8);
-            }
-            // Clear after draining, never before: a racing coalesced producer is
-            // covered by the service turn we are about to run. A later producer
-            // writes a fresh token. Zero/local waits leave remote tokens intact.
-            state
-                .wake
-                .as_ref()
-                .unwrap()
-                .remote
-                .store(false, Ordering::Release);
-        }
-        if fds
-            .iter()
-            .any(|fd| fd.revents & (libc::POLLERR | libc::POLLNVAL) != 0)
-        {
-            return Err(Error::Io);
-        }
-        Ok(())
+        io.park(Some(io.now() + duration.min(MAX_WAIT)))
     }
 
-    /// Request cancellation and sleep until the original and any cancel CQEs arrive.
-    /// The worker must drive poll_budgeted. Notification registrations share a
-    /// queue_entries bound with drain waiters and charge completion metadata;
-    /// admission failure still leaves cancellation requested, but is not a fence.
-    fn cancel_and_fence(&self, id: IoId) -> Operation<'_, (), S::Error> {
-        Box::pin(Fence {
-            reactor: self,
-            target: Some(id),
-            registration: None,
-        })
-    }
-
-    /// Close admission and cancel outstanding work. The worker must keep driving
-    /// poll_budgeted while awaiting this fence, including after request deadlines.
-    /// Notification admission can fail as for cancel_and_fence; only Ok confirms
-    /// the fence. Failure leaves admission closed and cancellation requested.
+    /// Close admission and cancel outstanding work. The worker must keep
+    /// driving [`Self::poll_budgeted`] while awaiting this fence.
     pub fn drain(&self) -> Operation<'_, (), S::Error> {
-        Box::pin(Fence {
-            reactor: self,
-            target: None,
-            registration: None,
+        Box::pin(async move {
+            let fence = self.io.get().map(racer_io::Reactor::fence_all);
+            self.stopped.set(true);
+            if let Some(fence) = fence {
+                fence.await;
+            }
+            if let Some(io) = self.io.get() {
+                self.release_parked(io);
+            }
+            Ok(())
         })
     }
 
     /// Close admission and drive cancellation for at most `timeout` (host time).
-    /// Callbacks must terminate promptly. An error, including DeadlineExceeded,
-    /// is NEVER a fence: retained owners remain quarantined and this may be retried.
-    /// Drop makes one bounded attempt, then leaks the ring and unfenced owners.
+    /// An error, including DeadlineExceeded, is never a fence.
     pub fn shutdown(&self, timeout: Duration) -> Result<()> {
-        self.state.borrow_mut().stopped = true;
-        let started = std::time::Instant::now();
-        while self.in_flight() != 0 {
+        self.stopped.set(true);
+        let Some(io) = self.io.get() else {
+            return Ok(());
+        };
+        io.stop();
+        let started = Instant::now();
+        while io.in_flight() != 0 {
             if started.elapsed() >= timeout {
                 return Err(Error::DeadlineExceeded);
             }
-            self.poll_budgeted(256)?;
-            if self.in_flight() != 0 {
-                self.wait(timeout.saturating_sub(started.elapsed()).min(MAX_WAIT))?;
+            io.reap(256)?;
+            if io.in_flight() != 0 {
+                if io.is_sim() {
+                    io.park(None)?;
+                } else {
+                    let remaining = timeout.saturating_sub(started.elapsed()).min(MAX_WAIT);
+                    io.park(Some(io.now() + remaining))?;
+                }
             }
         }
+        self.release_parked(io);
         Ok(())
     }
 
-    /// Cancel all current matching operations before awaiting any fence. New work
-    /// submitted by the predicate or after the snapshot is not part of this fence.
-    /// The worker must drive completions; only Ok confirms ownership is released.
+    /// Cancel all current matching operations, then wait for their fences.
+    /// Work submitted after the snapshot is not part of this fence.
     pub fn fence_matching<'a>(
         &'a self,
         matches: impl Fn(&S) -> bool + 'a,
     ) -> Operation<'a, (), S::Error> {
         Box::pin(async move {
-            let scopes: Vec<_> = self
-                .state
-                .borrow()
-                .entries
+            let Some(io) = self.io.get() else {
+                return Ok(());
+            };
+            let records: Vec<_> = self.records.borrow().clone();
+            let ids: Vec<_> = records
                 .iter()
-                .map(|(id, entry)| (*id, entry.pending.clone()))
+                .filter(|record| matches(&record.scope))
+                .filter_map(|record| record.id.get())
+                .filter(|id| !io.is_fenced(*id))
                 .collect();
-            let ids: Vec<_> = scopes
-                .into_iter()
-                .filter(|(_, pending)| matches(pending.scope()))
-                .map(|(id, _)| id)
-                .collect();
-            let cancelled = Error::Cancelled.into();
-            {
-                let mut state = self.state.borrow_mut();
-                for id in &ids {
-                    if let Some(entry) = state.entries.get_mut(id) {
-                        entry.cancel_reason.get_or_insert(cancelled);
-                    }
-                }
+            drop(records);
+            for id in &ids {
+                io.cancel_op(*id, Error::Cancelled);
             }
-            for id in ids {
-                self.cancel_and_fence(id).await?;
-            }
+            io.fence_ids(ids).await;
+            self.release_parked(io);
             Ok(())
         })
     }
 }
 
-/// Data operation and, for positioned file I/O, its explicit byte offset.
-#[derive(Clone, Copy)]
-enum BufferOperation {
-    Read(u64),
-    Write(u64),
-    Recv,
-    Send,
+/// Parks an abandoned operation's admission until its kernel fences.
+struct Waiting<'a, S: Scope, Q: Budget> {
+    reactor: &'a Reactor<S, Q>,
+
+    io: racer_io::Reactor,
+
+    admission: Option<Admission<S>>,
 }
 
-#[derive(Clone, Copy)]
-enum IssuePolicy {
-    Inline,
-    Offload,
-}
-
-impl IssuePolicy {
-    fn flags(self) -> squeue::Flags {
-        match self {
-            Self::Inline => squeue::Flags::empty(),
-            Self::Offload => squeue::Flags::ASYNC,
-        }
-    }
-}
-
-impl<S: Scope> State<S> {
-    /// Retain every kernel-visible owner when no completion fence was established.
-    /// Closing the ring descriptor alone does not make submitted pointers safe.
-    fn quarantine(&mut self) {
-        std::mem::forget(std::mem::take(&mut self.entries));
-        std::mem::forget(self.ring.take());
-        std::mem::forget(self.ring_reservation.take());
-    }
-
-    /// Consume one backend CQE without releasing its entry's resources.
-    fn next_completion(&mut self) -> Option<(u64, KernelResult)> {
-        #[cfg(test)]
-        if let Some(cqe) = self.completions.pop_front() {
-            return Some(cqe);
-        }
-        #[cfg(feature = "simulation")]
-        if let Some(driver) = &mut self.simulation {
-            return driver.pop();
-        }
-        let cqe = self.ring.as_mut()?.completion().next()?;
-        Some((cqe.user_data(), KernelResult::Value(cqe.result())))
-    }
-
-    /// Publish queued SQEs when queue state or kernel flags require an enter call.
-    fn submit_pending(&mut self) -> Result<()> {
-        #[cfg(test)]
-        if self.ring.is_none()
-            && let Some(result) = self.submit_result.take()
-        {
-            self.submit_attempts += 1;
-            return submission_result(result);
-        }
-        #[cfg(feature = "simulation")]
-        if let Some(driver) = &mut self.simulation {
-            // This advances simulated kernel execution, not just SQ consumption.
-            // Guard tests below use real rings rather than this simulation path.
-            driver.submit();
-            return Ok(());
-        }
-        let Some(ring) = &mut self.ring else {
-            return Ok(());
+impl<S: Scope, Q: Budget> Drop for Waiting<'_, S, Q> {
+    fn drop(&mut self) {
+        let Some(admission) = self.admission.take() else {
+            return;
         };
-        let flags = ring_setup_flags(ring.params());
-        let required = {
-            // A fresh safe view observes the shared head, including consumption
-            // after partial submissions or transient errors. No dirty bit can
-            // substitute for the actual remaining SQ occupancy.
-            let sq = ring.submission();
-            submission_required(flags, sq.is_empty(), sq.cq_overflow(), sq.taskrun())
-        }; // Drop the SQ view before submitting.
-        if !required {
-            return Ok(());
-        }
-        #[cfg(test)]
+        if let Some(id) = admission.record.id.get()
+            && !self.io.is_fenced(id)
         {
-            self.submit_attempts += 1;
-            if let Some(result) = self.submit_result.take() {
-                return submission_result(result);
-            }
-        }
-        submission_result(ring.submit())
-    }
-
-    /// Remove matching registrations for notification outside the state borrow.
-    fn take_fence_wakers(&mut self, target: Option<IoId>) -> Vec<FenceWaiter> {
-        if self.fence_waiters.is_empty() {
-            return Vec::new();
-        }
-        let keys: Vec<_> = self
-            .fence_waiters
-            .range((target, 0)..=(target, u64::MAX))
-            .map(|(key, _)| *key)
-            .collect();
-        keys.into_iter()
-            .map(|key| self.fence_waiters.remove(&key).unwrap())
-            .collect()
-    }
-
-    /// Account one CQE and return its owner only after all applicable fences.
-    fn complete(
-        &mut self,
-        tag: u64,
-        result: impl Into<KernelResult>,
-    ) -> Result<Option<FencedEntry<S>>> {
-        let id = IoId(tag & !CANCEL_BIT);
-        // One lookup serves both the fence update and the owner's removal.
-        let index = self.entries.index_of(id).ok_or(Error::Io)?;
-        let Some(original) = self
-            .entries
-            .at_mut(index)
-            .completion
-            .complete(tag & CANCEL_BIT != 0, result.into())?
-        else {
-            return Ok(None);
-        };
-        let entry = self.entries.remove_at(index);
-        Ok(Some(FencedEntry { entry, original }))
-    }
-}
-
-/// In-flight entries ordered by their monotonic identifiers.
-///
-/// Identifiers are allocated in increasing order, so inserts append and the
-/// slots stay sorted for binary search. Removal leaves a tombstone that is
-/// trimmed from either end or compacted once tombstones outnumber live
-/// entries, which bounds the storage by the live count even when one old
-/// entry outlives many newer ones.
-struct Table<V> {
-    slots: std::collections::VecDeque<(IoId, Option<V>)>,
-
-    live: usize,
-}
-
-impl<V> Default for Table<V> {
-    /// Create an empty table.
-    fn default() -> Self {
-        Self {
-            slots: std::collections::VecDeque::new(),
-            live: 0,
+            self.reactor.parked.borrow_mut().push((id, admission));
         }
     }
 }
 
-impl<V> Table<V> {
-    /// Count live entries.
-    fn len(&self) -> usize {
-        self.live
-    }
+/// A connect that records its errno for attribution.
+struct ObservedConnect<L: 'static> {
+    inner: racer_io::ring::ops::Connect<L>,
 
-    /// Whether no entry is live.
-    fn is_empty(&self) -> bool {
-        self.live == 0
-    }
-
-    /// Find the slot holding a live entry for `id`.
-    fn index_of(&self, id: IoId) -> Option<usize> {
-        let index = self.slots.binary_search_by_key(&id, |(key, _)| *key).ok()?;
-        self.slots[index].1.is_some().then_some(index)
-    }
-
-    /// Borrow the live entry at a slot returned by [`Self::index_of`].
-    fn at_mut(&mut self, index: usize) -> &mut V {
-        self.slots[index].1.as_mut().expect("live table slot")
-    }
-
-    /// Borrow a live entry.
-    fn get(&self, id: &IoId) -> Option<&V> {
-        self.index_of(*id)
-            .and_then(|index| self.slots[index].1.as_ref())
-    }
-
-    /// Mutably borrow a live entry.
-    fn get_mut(&mut self, id: &IoId) -> Option<&mut V> {
-        let index = self.index_of(*id)?;
-        self.slots[index].1.as_mut()
-    }
-
-    /// Whether `id` is live.
-    fn contains_key(&self, id: &IoId) -> bool {
-        self.index_of(*id).is_some()
-    }
-
-    /// Insert or replace an entry, returning any replaced value.
-    fn insert(&mut self, id: IoId, value: V) -> Option<V> {
-        if self.slots.back().is_none_or(|(last, _)| *last < id) {
-            self.slots.push_back((id, Some(value)));
-            self.live += 1;
-            return None;
-        }
-        match self.slots.binary_search_by_key(&id, |(key, _)| *key) {
-            Ok(index) => {
-                let old = self.slots[index].1.replace(value);
-                if old.is_none() {
-                    self.live += 1;
-                }
-                old
-            }
-            Err(index) => {
-                self.slots.insert(index, (id, Some(value)));
-                self.live += 1;
-                None
-            }
-        }
-    }
-
-    /// Remove a live entry.
-    fn remove(&mut self, id: &IoId) -> Option<V> {
-        let index = self.index_of(*id)?;
-        Some(self.remove_at(index))
-    }
-
-    /// Remove the live entry at a slot returned by [`Self::index_of`].
-    fn remove_at(&mut self, index: usize) -> V {
-        let value = self.slots[index].1.take().expect("live table slot");
-        self.live -= 1;
-        while self.slots.front().is_some_and(|(_, value)| value.is_none()) {
-            self.slots.pop_front();
-        }
-        while self.slots.back().is_some_and(|(_, value)| value.is_none()) {
-            self.slots.pop_back();
-        }
-        if self.slots.len() > 2 * self.live + 16 {
-            self.slots.retain(|(_, value)| value.is_some());
-        }
-        value
-    }
-
-    /// Iterate live entries in identifier order.
-    fn iter(&self) -> impl Iterator<Item = (&IoId, &V)> {
-        self.slots
-            .iter()
-            .filter_map(|(id, value)| value.as_ref().map(|value| (id, value)))
-    }
-
-    /// Iterate live entries in identifier order.
-    #[cfg(test)]
-    fn values(&self) -> impl Iterator<Item = &V> {
-        self.iter().map(|(_, value)| value)
-    }
-
-    /// The live entry with the smallest identifier.
-    #[cfg(test)]
-    fn first_key_value(&self) -> Option<(&IoId, &V)> {
-        self.iter().next()
-    }
-
-    /// Iterate live entries after `id`, then wrap around to those at or before it.
-    fn after(&self, id: IoId) -> impl Iterator<Item = (&IoId, &V)> {
-        let split = self.slots.partition_point(|(key, _)| *key <= id);
-        self.slots
-            .range(split..)
-            .chain(self.slots.range(..split))
-            .filter_map(|(id, value)| value.as_ref().map(|value| (id, value)))
-    }
+    errno: Option<Rc<Cell<Option<i32>>>>,
 }
 
-impl<V> std::ops::Index<&IoId> for Table<V> {
-    type Output = V;
+impl<L: 'static> Future for ObservedConnect<L> {
+    type Output = racer_io::Result<L>;
 
-    /// Borrow a live entry, panicking if it is absent.
-    fn index(&self, id: &IoId) -> &V {
-        self.get(id).expect("live table entry")
-    }
-}
-
-impl From<i32> for KernelResult {
-    /// Preserve a raw scalar CQE until its entry determines ownership semantics.
-    fn from(value: i32) -> Self {
-        Self::Value(value)
-    }
-}
-
-/// Read setup flags from the documented transparent Linux parameter layout.
-fn ring_setup_flags(params: &io_uring::Parameters) -> u32 {
-    // io-uring 0.7 documents Parameters as repr(transparent) over Linux
-    // io_uring_params. Its third u32 is flags, after sq_entries and cq_entries.
-    // There are no public getters for COOP_TASKRUN, TASKRUN_FLAG or DEFER_TASKRUN.
-    // SAFETY: this reads an initialized, aligned u32 within that documented ABI;
-    // it neither accesses the mapped queues nor aliases a mutable reference.
-    unsafe {
-        (params as *const io_uring::Parameters)
-            .cast::<u32>()
-            .add(2)
-            .read()
-    }
-}
-
-/// Probe setup combinations, keeping the first ring the kernel accepts.
-fn probe_ring<T>(mut build: impl FnMut(u32) -> std::io::Result<T>) -> std::io::Result<T> {
-    for flags in [SETUP_NORMAL, SETUP_CQSIZE | SETUP_SUBMIT_ALL, SETUP_CQSIZE] {
-        match build(flags) {
-            Err(error) if error.raw_os_error() == Some(libc::EINVAL) && flags != SETUP_CQSIZE => (),
-            result => return result,
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let result = Pin::new(&mut self.inner).poll(cx);
+        if let (Poll::Ready(Err(Error::Os(errno))), Some(cell)) = (&result, &self.errno) {
+            cell.set(Some(*errno));
         }
-    }
-    unreachable!("the baseline setup returns its result")
-}
-
-/// Skip empty submissions only for known interrupt-driven modes.
-fn submission_required(setup_flags: u32, empty: bool, cq_overflow: bool, taskrun: bool) -> bool {
-    // SINGLE_ISSUER and SUBMIT_ALL do not change completion delivery. Deferred
-    // task work is not enabled: it needs a separate completion/fence audit.
-    // All task-run modes, polling modes, and unknown flags remain fail-closed.
-    setup_flags & !SETUP_NORMAL != 0 || !empty || cq_overflow || taskrun
-}
-
-/// Defer transient submit failures to the next worker turn; report fatal failures.
-fn submission_result(result: std::io::Result<usize>) -> Result<()> {
-    match result {
-        Ok(_) => Ok(()),
-        Err(error)
-            if matches!(
-                error.raw_os_error(),
-                Some(libc::EINTR | libc::EAGAIN | libc::EBUSY)
-            ) =>
-        {
-            Ok(())
-        }
-        Err(_) => Err(Error::Io),
+        result
     }
 }
 
 impl<S: Scope, B: Budget> Drop for Reactor<S, B> {
-    /// Attempt a bounded fence, quarantining all kernel owners if it fails.
+    /// Attempt a bounded fence; `racer-io` leaks its slots and ring if work
+    /// is still in flight afterwards.
     fn drop(&mut self) {
-        if std::thread::panicking() || self.shutdown(DROP_WAIT).is_err() {
-            // Closing an io_uring FD alone is NOT a synchronous memory fence.
-            // On an unrecoverable driver failure retain the bounded owners and
-            // ring forever rather than free memory the kernel may still use.
-            self.state.get_mut().quarantine();
-            return;
+        if !std::thread::panicking() {
+            let _ = self.shutdown(DROP_WAIT);
         }
-        // Every SQE (including cancellation SQEs) has now produced its CQE.
-        self.state.get_mut().ring.take();
-    }
-}
-
-impl<S: Scope> Drop for State<S> {
-    /// Quarantine unfinished owners even if a callback interrupted reactor shutdown.
-    fn drop(&mut self) {
-        // Also protect kernel ownership if an application lease destructor or a
-        // custom waker panics while Reactor::drop is driving its final fence.
-        if !self.entries.is_empty() {
-            self.quarantine();
+        self.records.get_mut().clear();
+        if self.in_flight() == 0 {
+            self.parked.get_mut().clear();
+        } else {
+            // Unfenced kernel work: keep its owners and charges forever.
+            std::mem::forget(std::mem::take(self.parked.get_mut()));
         }
     }
-}
-
-/// Stable syscall backing whose pointer provenance survives owner moves.
-/// Do not replace the private one-element Vec with a move-retagged Box.
-struct SyscallArg<T>(Vec<T>);
-
-impl<T> SyscallArg<T> {
-    /// Allocate initialized backing before publishing any derived pointer.
-    fn new(value: T) -> Self {
-        Self(vec![value])
-    }
-
-    /// Borrow the stable input pointer retained through the completion fence.
-    fn as_ptr(&self) -> *const T {
-        self.0.as_ptr()
-    }
-
-    /// Borrow the stable output pointer before transferring ownership to the kernel.
-    fn as_mut_ptr(&mut self) -> *mut T {
-        self.0.as_mut_ptr()
-    }
-
-    /// Recover output only after the caller has established its completion fence.
-    fn into_inner(mut self) -> T {
-        self.0.pop().expect("one syscall argument")
-    }
-}
-
-/// Encode an owned Internet or filesystem Unix address into stable syscall storage.
-fn encode_address(
-    address: SocketAddress,
-) -> Result<(SyscallArg<libc::sockaddr_storage>, libc::socklen_t)> {
-    // SAFETY: all-zero sockaddr storage is valid and sufficiently aligned for
-    // every supported sockaddr variant. The owner preserves pointer provenance
-    // as well as the allocation address across completion-closure moves.
-    let mut storage = SyscallArg::<libc::sockaddr_storage>::new(unsafe { std::mem::zeroed() });
-    let len = match address {
-        SocketAddress::Inet(SocketAddr::V4(address)) => {
-            let value = libc::sockaddr_in {
-                sin_family: libc::AF_INET as _,
-                sin_port: address.port().to_be(),
-                sin_addr: libc::in_addr {
-                    s_addr: u32::from_ne_bytes(address.ip().octets()),
-                },
-                sin_zero: [0; 8],
-            };
-            unsafe {
-                std::ptr::write(storage.as_mut_ptr().cast::<libc::sockaddr_in>(), value);
-            }
-            std::mem::size_of::<libc::sockaddr_in>()
-        }
-        SocketAddress::Inet(SocketAddr::V6(address)) => {
-            let value = libc::sockaddr_in6 {
-                sin6_family: libc::AF_INET6 as _,
-                sin6_port: address.port().to_be(),
-                sin6_flowinfo: address.flowinfo().to_be(),
-                sin6_addr: libc::in6_addr {
-                    s6_addr: address.ip().octets(),
-                },
-                sin6_scope_id: address.scope_id(),
-            };
-            unsafe {
-                std::ptr::write(storage.as_mut_ptr().cast::<libc::sockaddr_in6>(), value);
-            }
-            std::mem::size_of::<libc::sockaddr_in6>()
-        }
-        SocketAddress::Unix(path) => {
-            let bytes = path.as_os_str().as_bytes();
-            let mut value: libc::sockaddr_un = unsafe { std::mem::zeroed() };
-            if bytes.is_empty() || bytes.contains(&0) || bytes.len() >= value.sun_path.len() {
-                return Err(Error::InvalidInput);
-            }
-            value.sun_family = libc::AF_UNIX as _;
-            for (dst, src) in value.sun_path.iter_mut().zip(bytes) {
-                *dst = *src as libc::c_char;
-            }
-            unsafe {
-                std::ptr::write(storage.as_mut_ptr().cast::<libc::sockaddr_un>(), value);
-            }
-            std::mem::offset_of!(libc::sockaddr_un, sun_path) + bytes.len() + 1
-        }
-    };
-    Ok((storage, len as libc::socklen_t))
 }
 
 pub mod timer {
-    //! Explicit timer backend selection, sharing the reactor's completion fences.
+    //! Timers sharing the reactor's completion fences.
     use super::*;
 
     /// Choose kernel-owned waiting or cooperative observation of a simulated clock.
     #[derive(Clone, Copy, Debug)]
     pub enum SleepMode {
-        /// Submit an owned io_uring timeout on a host clock and driver.
+        /// Wait on the reactor's timer heap.
         Kernel,
         /// Poll the scoped clock cooperatively. The owner advances that clock.
         #[cfg(feature = "simulation")]
@@ -2931,14 +1070,11 @@ pub mod timer {
     }
 
     impl<S: Scope, B: Budget> Reactor<S, B> {
-        /// Sleep under caller-owned scope policy with an owned io_uring timeout.
-        /// `until` must belong to the currently entered clock domain. Instant itself
-        /// carries no domain ID, so an instant copied from another clock is unsupported.
-        /// Kernel mode rejects simulated clocks/drivers, including expired deadlines.
-        /// ClockPoll requires a simulated clock and cooperatively wakes its executor.
+        /// Sleep until `until` under the caller's scope. Kernel mode rejects
+        /// simulated clocks; ClockPoll requires one and wakes its executor.
         pub fn sleep_until<'a>(
             &'a self,
-            until: std::time::Instant,
+            until: Instant,
             mode: SleepMode,
             scope: &'a S,
         ) -> Operation<'a, (), S::Error> {
@@ -2948,7 +1084,7 @@ pub mod timer {
                 match mode {
                     SleepMode::Kernel
                         if crate::environment::simulation_seed().is_some()
-                            || self.state.borrow().simulation.is_some() =>
+                            || self.simulation.is_some() =>
                     {
                         return Err(Error::InvalidConfiguration.into());
                     }
@@ -2957,8 +1093,7 @@ pub mod timer {
                     }
                     _ => (),
                 }
-                let duration = until.saturating_duration_since(crate::environment::now());
-                if duration.is_zero() {
+                if until <= crate::environment::now() {
                     return Ok(());
                 }
                 match mode {
@@ -2977,118 +1112,31 @@ pub mod timer {
                     }
                     SleepMode::Kernel => (),
                 }
-                if duration.as_secs() > i64::MAX as u64 {
-                    return Err(Error::InvalidInput.into());
+                let io = self.io()?;
+                let ctx = scope.op_ctx();
+                let target = match ctx.deadline.instant() {
+                    Some(deadline) if !self.foreign_clock.get() => until.min(deadline),
+                    _ => until,
+                };
+                let mut sleep = io.sleep_until(target);
+                let mut key = None;
+                let result = std::future::poll_fn(|cx| {
+                    if let Some(token) = &ctx.cancel
+                        && token.register(&mut key, cx.waker()).is_some()
+                    {
+                        return Poll::Ready(scope.check().and(Err(Error::Cancelled.into())));
+                    }
+                    if let Err(error) = scope.check() {
+                        return Poll::Ready(Err(error));
+                    }
+                    Pin::new(&mut sleep).poll(cx).map(|()| scope.check())
+                })
+                .await;
+                if let Some(token) = &ctx.cancel {
+                    token.deregister(&mut key);
                 }
-                let timeout = SyscallArg::new(types::Timespec::from(duration));
-                let sqe = opcode::Timeout::new(timeout.as_ptr()).build();
-                self.submit_reserved_kind(
-                    Submission::Real(sqe),
-                    scope,
-                    false,
-                    None,
-                    SubmissionKind::Timeout,
-                    move |result| {
-                        drop(timeout);
-                        match result? {
-                            KernelResult::Value(value) if value == -libc::ETIME => Ok(()),
-                            other => {
-                                other.value()?;
-                                Ok(())
-                            }
-                        }
-                    },
-                )?
-                .await?;
-                scope.check()
+                result
             })
-        }
-    }
-
-    #[cfg(test)]
-    mod tests {
-        //! Kernel and cooperative timer selection, cancellation, and deadline contracts.
-        use super::*;
-        use crate::reactor::tests::{drive, kernel_reactor, poll, scope};
-
-        #[test]
-        /// Check timer completion and cancellation through the actual kernel fence.
-        fn kernel_timer_completes_and_cancel_retains_fence() {
-            let Some(reactor) = kernel_reactor(4) else {
-                return;
-            };
-            let scope = scope();
-            drive(
-                &reactor,
-                reactor.sleep_until(crate::environment::now(), SleepMode::Kernel, &scope),
-            )
-            .unwrap();
-            let until = crate::environment::now() + Duration::from_millis(2);
-            drive(
-                &reactor,
-                reactor.sleep_until(until, SleepMode::Kernel, &scope),
-            )
-            .unwrap();
-            assert!(crate::environment::now() >= until);
-            let mut future = reactor.sleep_until(
-                crate::environment::now() + Duration::from_secs(10),
-                SleepMode::Kernel,
-                &scope,
-            );
-            assert!(poll(&mut future).is_pending());
-            assert_eq!(reactor.in_flight(), 1);
-            scope.cancel().unwrap();
-            assert_eq!(drive(&reactor, future), Err(Error::Cancelled));
-            assert_eq!(reactor.in_flight(), 0);
-        }
-
-        #[cfg(feature = "simulation")]
-        #[test]
-        /// Verify simulated clock polling wakes cooperatively without submissions.
-        fn clock_poll_never_submits_and_preserves_scope_precedence() {
-            use crate::reactor::tests::fixtures::{Admission, Limits, Reactor};
-            use crate::test_util::WakeCounter;
-            let clock = crate::environment::SimulationClock::new(33);
-            let _clock = clock.environment(0).enter();
-            let reactor = Reactor::new(Rc::new(Admission::new(Limits {
-                queue_entries: std::num::NonZeroUsize::new(4).unwrap(),
-            })));
-            let scope = scope();
-            let until = crate::environment::now() + Duration::from_millis(5);
-            let count = Arc::new(WakeCounter::default());
-            let waker = Waker::from(count.clone());
-            let mut cx = Context::from_waker(&waker);
-            let mut future = reactor.sleep_until(until, SleepMode::ClockPoll, &scope);
-            assert!(future.as_mut().poll(&mut cx).is_pending());
-            assert_eq!(count.count(), 1);
-            assert_eq!(reactor.in_flight(), 0);
-            clock.advance(Duration::from_millis(5));
-            assert_eq!(future.as_mut().poll(&mut cx), Poll::Ready(Ok(())));
-            scope.cancel().unwrap();
-            assert_eq!(
-                poll(&mut reactor.sleep_until(until, SleepMode::ClockPoll, &scope)),
-                Poll::Ready(Err(Error::Cancelled))
-            );
-        }
-
-        #[cfg(feature = "simulation")]
-        #[test]
-        /// Reject mixed clock domains before even accepting an expired timer.
-        fn timer_rejects_mixed_clock_and_backend_even_for_expired_deadlines() {
-            let request = scope();
-            let reactor = Reactor::<crate::reactor::tests::fixtures::RequestScope, ()>::new(2, ());
-            let expired = crate::environment::now();
-            assert_eq!(
-                poll(&mut reactor.sleep_until(expired, SleepMode::ClockPoll, &request)),
-                Poll::Ready(Err(Error::InvalidConfiguration))
-            );
-            let clock = crate::environment::SimulationClock::new(4);
-            let _clock = clock.environment(0).enter();
-            assert_eq!(
-                poll(&mut reactor.sleep_until(expired, SleepMode::Kernel, &request)),
-                Poll::Ready(Err(Error::InvalidConfiguration))
-            );
-            assert_eq!(reactor.in_flight(), 0);
         }
     }
 }

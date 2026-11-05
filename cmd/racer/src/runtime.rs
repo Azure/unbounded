@@ -1469,8 +1469,8 @@ mod tests {
                     sim.inject("send", Fault::Delay(20)).unwrap();
                     let mut send = r.send(fd, page, (), &scope);
                     assert!(poll(&mut send).is_pending());
+                    // Abandonment requests the cancel at once; both fences follow.
                     drop(send);
-                    assert_eq!(r.poll_budgeted(1), Ok(0));
                     assert_eq!(r.poll_budgeted(1), Ok(1));
                     assert!(weak.upgrade().is_some());
                     assert_eq!(r.admission.used(ResourceClass::Ciphertext), 19);

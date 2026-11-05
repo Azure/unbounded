@@ -2,6 +2,14 @@
 //! Every pointer backing, descriptor, and quota lives in the submission closure.
 use super::*;
 use std::{ffi::CString, num::NonZeroUsize, ops::Deref};
+#[allow(unused_imports)]
+use std::{
+    os::{
+        fd::{AsRawFd, FromRawFd},
+        unix::ffi::OsStrExt,
+    },
+    path::PathBuf,
+};
 use zeroize::Zeroize;
 
 pub mod checkpoint;
@@ -135,15 +143,7 @@ impl<S: Scope, B: Budget> Reactor<S, B> {
             loop {
                 buffer.end = (probe - out.buffer.end).min(buffer.data.len());
                 let completion = self
-                    .buffer_io(
-                        fd.clone(),
-                        buffer,
-                        (),
-                        scope,
-                        super::BufferOperation::Read(out.buffer.end as u64),
-                        super::IssuePolicy::Offload,
-                        None,
-                    )
+                    .read_at(fd.clone(), out.buffer.end as u64, buffer, (), scope)
                     .await?;
                 let n = completion.bytes;
                 buffer = completion.buffer;
@@ -161,12 +161,10 @@ impl<S: Scope, B: Budget> Reactor<S, B> {
         })
     }
 
-    /// Open results use the same FD-owning CQE variant as accept, including when
-    /// cancellation wins after a successful open. No integer FD can leak on drop.
-    /// This secure convenience API creates owner-only files (0600, reduced by
-    /// umask); callers needing other modes must prepare their descriptor separately.
-    /// O_PATH accepts only DIRECTORY/NOFOLLOW/CLOEXEC, without forced NONBLOCK.
-    /// Linux's 4096-byte path limit includes NUL; filesystem NAME_MAX still applies.
+    /// Open a pathname relative to `dir` (or the working directory). Created
+    /// files are owner-only (0600, reduced by umask). O_PATH accepts only
+    /// DIRECTORY/NOFOLLOW/CLOEXEC, without forced NONBLOCK. Linux's 4096-byte
+    /// path limit includes NUL; filesystem NAME_MAX still applies.
     pub fn file_open<'a>(
         &'a self,
         dir: Option<Rc<Descriptor>>,
@@ -179,46 +177,25 @@ impl<S: Scope, B: Budget> Reactor<S, B> {
             if path.as_bytes().len() > PATH_BYTES {
                 return Err(Error::InvalidInput.into());
             }
-            let (flags, mode) = open_flags(flags)?;
+            open_flags(flags)?;
             let quota = self.charge(path.as_bytes().len() + 128)?;
-            let path = PathArg::new(path);
-            let how = SyscallArg::new(
-                types::OpenHow::new()
-                    .flags(flags as u64)
-                    .mode(mode)
-                    .resolve(resolve),
-            );
-            let sqe = submission!(
-                self,
-                simulation::Op::Open {
-                    dir: dir.clone(),
-                    path: path.simulated(),
-                    flags,
-                    resolve
-                },
-                opcode::OpenAt2::new(
-                    types::Fd(dir.as_ref().map_or(libc::AT_FDCWD, |d| d.as_raw_fd())),
-                    path.as_ptr(),
-                    how.as_ptr()
+            let opened = self
+                .run_holding(
+                    scope,
+                    None,
+                    SubmissionKind::OtherIo,
+                    Some(quota),
+                    move |io, ctx| {
+                        Deferred::new(io.open(dir, path, flags, resolve, ctx), |f| f.id())
+                    },
+                    Deferred::id,
                 )
-                .build()
-                .flags(squeue::Flags::ASYNC)
-            );
-            self.submit(sqe, scope, true, move |result| {
-                drop((dir, path, how, quota));
-                match result? {
-                    KernelResult::Accepted(fd) => Ok(Rc::new(fd)),
-                    result => {
-                        value::<S::Error>(Ok(result))?;
-                        Err(Error::Io.into())
-                    }
-                }
-            })?
-            .await
+                .await;
+            Ok(Rc::new(opened?))
         })
     }
 
-    /// Read basic metadata through an owned descriptor and stable output allocation.
+    /// Read basic metadata through an owned descriptor.
     pub fn file_stat<'a>(
         &'a self,
         fd: Rc<Descriptor>,
@@ -226,29 +203,14 @@ impl<S: Scope, B: Budget> Reactor<S, B> {
     ) -> Operation<'a, libc::statx, S::Error> {
         Box::pin(async move {
             let quota = self.charge(std::mem::size_of::<libc::statx>())?;
-            let mut stat = SyscallArg::<libc::statx>::new(unsafe { std::mem::zeroed() });
-            let sqe = submission!(
-                self,
-                simulation::Op::Stat {
-                    fd: fd.clone(),
-                    ptr: stat.as_mut_ptr()
-                },
-                opcode::Statx::new(
-                    types::Fd(fd.as_raw_fd()),
-                    c"".as_ptr(),
-                    stat.as_mut_ptr().cast()
-                )
-                .flags(libc::AT_EMPTY_PATH)
-                .mask(libc::STATX_BASIC_STATS)
-                .build()
-                .flags(squeue::Flags::ASYNC)
-            );
-            self.submit(sqe, scope, false, move |result| {
-                let _quota = quota;
-                value(result)?;
-                drop(fd);
-                Ok(stat.into_inner())
-            })?
+            self.run_holding(
+                scope,
+                None,
+                SubmissionKind::OtherIo,
+                Some(quota),
+                move |io, ctx| io.stat(fd, ctx),
+                |f| f.id(),
+            )
             .await
         })
     }
@@ -259,20 +221,13 @@ impl<S: Scope, B: Budget> Reactor<S, B> {
         fd: Rc<Descriptor>,
         scope: &'a S,
     ) -> Operation<'a, (), S::Error> {
-        Box::pin(async move {
-            let sqe = submission!(
-                self,
-                simulation::Op::Sync(fd.clone()),
-                opcode::Fsync::new(types::Fd(fd.as_raw_fd()))
-                    .build()
-                    .flags(squeue::Flags::ASYNC)
-            );
-            self.submit(sqe, scope, false, move |result| {
-                drop(fd);
-                value(result).map(|_| ())
-            })?
-            .await
-        })
+        self.run(
+            scope,
+            None,
+            SubmissionKind::OtherIo,
+            move |io, ctx| io.fsync(fd, false, ctx),
+            |f| f.id(),
+        )
     }
 
     /// Rename within a pinned directory; cancellation is not proof it did not execute.
@@ -286,28 +241,14 @@ impl<S: Scope, B: Budget> Reactor<S, B> {
     ) -> Operation<'a, (), S::Error> {
         Box::pin(async move {
             let quota = self.file_path_quota(&[&from, &to])?;
-            let from = PathArg::new(from);
-            let to = PathArg::new(to);
-            let sqe = submission!(
-                self,
-                simulation::Op::Rename {
-                    dir: dir.clone(),
-                    from: from.simulated(),
-                    to: to.simulated()
-                },
-                opcode::RenameAt::new(
-                    types::Fd(dir.as_raw_fd()),
-                    from.as_ptr(),
-                    types::Fd(dir.as_raw_fd()),
-                    to.as_ptr()
-                )
-                .build()
-                .flags(squeue::Flags::ASYNC)
-            );
-            self.submit(sqe, scope, false, move |result| {
-                drop((dir, from, to, quota));
-                value(result).map(|_| ())
-            })?
+            self.run_holding(
+                scope,
+                None,
+                SubmissionKind::OtherIo,
+                Some(quota),
+                move |io, ctx| Deferred::new(io.rename(dir, from, to, 0, ctx), |f| f.id()),
+                Deferred::id,
+            )
             .await
         })
     }
@@ -334,35 +275,35 @@ impl<S: Scope, B: Budget> Reactor<S, B> {
     ) -> Operation<'a, (), S::Error> {
         Box::pin(async move {
             let quota = self.file_path_quota(&[&name])?;
-            let name = PathArg::new(name);
-            let sqe = match change {
-                NamespaceChange::EnsureDirectory => submission!(
-                    self,
-                    simulation::Op::Mkdir {
-                        dir: dir.clone(),
-                        name: name.simulated()
-                    },
-                    opcode::MkDirAt::new(types::Fd(dir.as_raw_fd()), name.as_ptr())
-                        .mode(0o700)
-                        .build()
-                        .flags(squeue::Flags::ASYNC)
-                ),
-                NamespaceChange::Unlink | NamespaceChange::RemoveIfPresent => submission!(
-                    self,
-                    simulation::Op::Unlink {
-                        dir: dir.clone(),
-                        name: name.simulated()
-                    },
-                    opcode::UnlinkAt::new(types::Fd(dir.as_raw_fd()), name.as_ptr())
-                        .build()
-                        .flags(squeue::Flags::ASYNC)
-                ),
-            };
-            self.submit(sqe, scope, false, move |result| {
-                drop((dir, name, quota));
-                change.complete(result)
-            })?
-            .await
+            match change {
+                NamespaceChange::EnsureDirectory => {
+                    self.run_holding(
+                        scope,
+                        None,
+                        SubmissionKind::OtherIo,
+                        Some(quota),
+                        move |io, ctx| {
+                            Deferred::new(io.mkdir(dir, name, 0o700, true, ctx), |f| f.id())
+                        },
+                        Deferred::id,
+                    )
+                    .await
+                }
+                NamespaceChange::Unlink | NamespaceChange::RemoveIfPresent => {
+                    let missing_ok = matches!(change, NamespaceChange::RemoveIfPresent);
+                    self.run_holding(
+                        scope,
+                        None,
+                        SubmissionKind::OtherIo,
+                        Some(quota),
+                        move |io, ctx| {
+                            Deferred::new(io.unlink(dir, name, 0, missing_ok, ctx), |f| f.id())
+                        },
+                        Deferred::id,
+                    )
+                    .await
+                }
+            }
         })
     }
 
@@ -391,43 +332,6 @@ enum NamespaceChange {
     RemoveIfPresent,
 }
 
-impl NamespaceChange {
-    /// Decode a fenced completion without masking cancellation or other failures.
-    fn complete<E: From<Error>>(self, result: Result<KernelResult, E>) -> Result<(), E> {
-        let accepted = match self {
-            Self::EnsureDirectory => Some(-libc::EEXIST),
-            Self::Unlink => None,
-            Self::RemoveIfPresent => Some(-libc::ENOENT),
-        };
-        if matches!(result, Ok(KernelResult::Value(n)) if Some(n) == accepted) {
-            return Ok(());
-        }
-        value(result).map(|_| ())
-    }
-}
-
-/// Stable pathname backing that preserves pointer provenance across owner moves.
-/// Unlike CString's Box backing, this Vec must never resize after SQE publication.
-struct PathArg(Vec<u8>);
-
-impl PathArg {
-    /// Transfer a validated pathname into stable syscall storage.
-    fn new(path: CString) -> Self {
-        Self(path.into_bytes_with_nul())
-    }
-
-    /// Borrow a pointer retained by the submission's completion closure.
-    fn as_ptr(&self) -> *const libc::c_char {
-        self.0.as_ptr().cast()
-    }
-
-    /// Copy the pathname into the simulator's typed operation.
-    #[cfg(feature = "simulation")]
-    fn simulated(&self) -> CString {
-        CString::from_vec_with_nul(self.0.clone()).expect("validated path")
-    }
-}
-
 /// Validate openat2 flag combinations and choose secure creation permissions.
 fn open_flags(flags: i32) -> Result<(i32, u64)> {
     if flags & libc::O_PATH != 0 {
@@ -452,9 +356,36 @@ fn open_flags(flags: i32) -> Result<(i32, u64)> {
     ))
 }
 
-/// Translate a fenced scalar CQE through the caller's error boundary.
-fn value<E: From<Error>>(result: Result<KernelResult, E>) -> Result<i32, E> {
-    result?.value().map_err(Into::into)
+/// A `racer-io` operation whose construction may fail: the error is
+/// delivered on first poll so admission stays inside the adapter.
+struct Deferred<F>(Option<racer_io::Result<F>>, fn(&F) -> Option<IoId>);
+
+impl<F> Deferred<F> {
+    fn new(future: racer_io::Result<F>, id: fn(&F) -> Option<IoId>) -> Self {
+        Self(Some(future), id)
+    }
+
+    fn id(&self) -> Option<IoId> {
+        match &self.0 {
+            Some(Ok(future)) => (self.1)(future),
+            _ => None,
+        }
+    }
+}
+
+impl<F: Future<Output = racer_io::Result<T>> + Unpin, T> Future for Deferred<F> {
+    type Output = racer_io::Result<T>;
+
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        match self.0.as_mut() {
+            Some(Ok(future)) => Pin::new(future).poll(cx),
+            Some(Err(_)) => match self.0.take() {
+                Some(Err(error)) => Poll::Ready(Err(error)),
+                _ => unreachable!("checked above"),
+            },
+            None => Poll::Pending,
+        }
+    }
 }
 
 pub mod secure {
@@ -1414,7 +1345,6 @@ mod test_support {
 mod memory_tests {
     //! Delayed consumers exercise pointer provenance without kernel access.
     use super::*;
-    use std::ffi::CStr;
 
     /// Keep cursor mutations bounded and release quota on allocation failure or drop.
     #[test]
@@ -1441,94 +1371,12 @@ mod memory_tests {
         assert!(weak.upgrade().is_none());
         assert_eq!(Buffer::allocate(0, Box::new(())).unwrap().remaining(), 0);
     }
-
-    /// Preserve the pathname allocation when its owner moves into a completion.
-    #[test]
-    fn delayed_pathname_consumer_survives_owner_moves() {
-        let path = PathArg::new(CString::new("stage-to-publish").unwrap());
-        let pointer = path.as_ptr();
-        let entry = (path, pointer);
-        let completion: Box<dyn FnOnce()> = Box::new(move || {
-            let (path, pointer) = entry;
-            assert_eq!(path.as_ptr(), pointer);
-            // SAFETY: the moved owner retains the original terminating NUL.
-            assert_eq!(
-                unsafe { CStr::from_ptr(pointer) }.to_bytes(),
-                b"stage-to-publish"
-            );
-            drop(path);
-        });
-        completion();
-    }
-
-    /// Preserve syscall input and output pointers across completion-owner moves.
-    #[test]
-    fn delayed_syscall_read_and_write_survive_owner_moves() {
-        let input = SyscallArg::new([11u64, 22]);
-        let read = input.as_ptr();
-        let mut output = SyscallArg::new([0u64; 2]);
-        let write = output.as_mut_ptr();
-        let entry = (input, output);
-        let completion: Box<dyn FnOnce()> = Box::new(move || {
-            let (input, output) = entry;
-            // SAFETY: separate live allocations have no borrowed contents.
-            unsafe { write.write(read.read()) };
-            assert_eq!(output.into_inner(), [11, 22]);
-            assert_eq!(input.into_inner(), [11, 22]);
-        });
-        completion();
-    }
 }
 
 #[cfg(test)]
 mod kernel_tests {
     //! Private Linux flag validation; host behavior lives in tests/runtime.rs.
     use super::*;
-
-    /// Accept only the selected operation's idempotent errno, never scope failures.
-    #[test]
-    fn namespace_policy_is_bound_to_the_operation() {
-        for (change, exists, absent) in [
-            (
-                NamespaceChange::EnsureDirectory,
-                Ok(()),
-                Err(Error::NotFound),
-            ),
-            (
-                NamespaceChange::Unlink,
-                Err(Error::AlreadyExists),
-                Err(Error::NotFound),
-            ),
-            (
-                NamespaceChange::RemoveIfPresent,
-                Err(Error::AlreadyExists),
-                Ok(()),
-            ),
-        ] {
-            assert_eq!(change.complete::<Error>(Ok(KernelResult::Value(0))), Ok(()));
-            assert_eq!(
-                change.complete(Ok(KernelResult::Value(-libc::EEXIST))),
-                exists
-            );
-            assert_eq!(
-                change.complete(Ok(KernelResult::Value(-libc::ENOENT))),
-                absent
-            );
-            assert_eq!(
-                change.complete::<Error>(Ok(KernelResult::Value(-libc::EIO))),
-                Err(Error::Os(libc::EIO))
-            );
-            for error in [
-                Error::Cancelled,
-                Error::DeadlineExceeded,
-                Error::Overloaded,
-                Error::AlreadyExists,
-                Error::NotFound,
-            ] {
-                assert_eq!(change.complete::<Error>(Err(error)), Err(error));
-            }
-        }
-    }
 
     /// Keep secure flags and Linux pathname bounds independent of service limits.
     #[test]
