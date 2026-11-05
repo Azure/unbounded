@@ -12,20 +12,20 @@ use std::{
     task::{Context, Poll, Waker},
     time::{Duration, Instant},
 };
-use telemetry::{
+use crate::telemetry::primitives::{
     Lease, Metrics, Ring,
     server::{self, Event, Handler, Response, Server},
 };
 
-telemetry::metrics! { Counter, COUNTERS, COUNTER_COUNT;
+crate::metrics! { Counter, COUNTERS, COUNTER_COUNT;
     Self::Completed => "completed_total",
 }
 
-telemetry::metrics! { Gauge, GAUGES, GAUGE_COUNT;
+crate::metrics! { Gauge, GAUGES, GAUGE_COUNT;
     Self::Active => "active",
 }
 
-telemetry::metrics! { Empty, EMPTY, EMPTY_COUNT; }
+crate::metrics! { Empty, EMPTY, EMPTY_COUNT; }
 
 /// An empty schema exposes no identifiers and emits no samples for any writer.
 #[test]
@@ -33,7 +33,7 @@ fn empty_metric_schema_has_zero_count_and_no_output() {
     assert_eq!(EMPTY_COUNT, 0);
     assert_eq!(EMPTY, []);
     assert_eq!(Empty::ALL, &EMPTY);
-    assert_eq!(<Empty as telemetry::Metric>::ALL, &EMPTY);
+    assert_eq!(<Empty as crate::telemetry::primitives::Metric>::ALL, &EMPTY);
     for shards in [1, 3] {
         let workers = Metrics::<Empty, Empty>::shards(shards);
         assert_eq!(workers.len(), shards);

@@ -581,7 +581,7 @@ pub struct Delivery {
 }
 /// A reader pins an immutable page and its own socket-accepted cursor, without a pipe.
 pub struct ReaderLease {
-    _active: ::telemetry::Lease,
+    _active: crate::telemetry::primitives::Lease,
     page: VerifiedPage,
     slice: PageSlice,
     sent: usize,

@@ -3493,7 +3493,7 @@ fn size_workers_policy(
         let partition = partition_limits_with_cause(node, count, rdma).and_then(|limits| {
             if profiling {
                 let extra =
-                    ::telemetry::server::BINARY_CONTROL_SLOTS * racer_io::scoped::SUBMISSION_BYTES;
+                    crate::telemetry::primitives::server::BINARY_CONTROL_SLOTS * racer_io::scoped::SUBMISSION_BYTES;
                 let floor = crate::telemetry::RESERVED_BYTES
                     + crate::peer::protocol::MIN_REQUEST_CONTEXT_BYTES
                     + 4 * limits.header_bytes.get().max(crate::model::MAX_FIELD_BYTES);
@@ -3502,7 +3502,7 @@ fn size_workers_policy(
                 }
                 if limits.queue_entries.get()
                     < crate::telemetry::CONTROL_SLOTS
-                        + ::telemetry::server::BINARY_CONTROL_SLOTS
+                        + crate::telemetry::primitives::server::BINARY_CONTROL_SLOTS
                         + 2
                 {
                     return Err(("pprof_queue_entries", Error::InvalidConfiguration));
@@ -3831,7 +3831,7 @@ mod lifecycle_policy_tests {
         );
         assert!(
             limits.queue_entries.get()
-                >= crate::telemetry::CONTROL_SLOTS + ::telemetry::server::BINARY_CONTROL_SLOTS + 2
+                >= crate::telemetry::CONTROL_SLOTS + crate::telemetry::primitives::server::BINARY_CONTROL_SLOTS + 2
         );
         let mut small = config.limits.clone();
         small.queue_entries = NonZeroUsize::new(8).unwrap();

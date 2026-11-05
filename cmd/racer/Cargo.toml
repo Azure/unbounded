@@ -1,5 +1,5 @@
 [workspace]
-members = [".", "io", "alloc", "crypto", "verbs", "gpu", "http", "topology", "telemetry", "flow", "flow-core", "control-wire", "controlplane", "uds-endpoint", "wire-codec", "peer-wire", "object-wire", "authority", "core", "dst"]
+members = [".", "io", "alloc", "crypto", "verbs", "gpu", "http", "topology", "flow", "flow-core", "control-wire", "controlplane", "uds-endpoint", "wire-codec", "peer-wire", "object-wire", "authority", "core", "dst"]
 resolver = "3"
 
 [package]
@@ -35,7 +35,6 @@ racer-control-wire = { path = "control-wire" }
 racer-authority = { path = "authority" }
 flow-control = { path = "flow" }
 topology = { path = "topology" }
-telemetry = { path = "telemetry" }
 http1 = { path = "http" }
 racer-crypto = { path = "crypto" }
 rdma-verbs = { path = "verbs" }

@@ -297,7 +297,7 @@ impl flow_control::coalesce::flight::state::WaiterPolicy for WaiterRecord {
     }
 }
 pub(super) struct Retained {
-    _resources: telemetry::Lease,
+    _resources: crate::telemetry::primitives::Lease,
     _reservation: flow_control::Charge<AdmissionPolicy>,
 }
 pub(super) type Outcome = StateOutcome<AcquiredPage, Error>;
@@ -1547,7 +1547,7 @@ impl Flights {
     pub fn retain_operation(
         self: &Rc<Self>,
         leader: &FlightLeader,
-        resources: telemetry::Lease,
+        resources: crate::telemetry::primitives::Lease,
     ) -> Result<FlightOperation> {
         self.update(|table, wakes| {
             leader_entry(table, leader, wakes)?;
@@ -1586,7 +1586,7 @@ impl Flights {
     pub(crate) fn retain_driver_operation(
         self: &Rc<Self>,
         leader: &FlightLeader,
-        resources: telemetry::Lease,
+        resources: crate::telemetry::primitives::Lease,
         handover: bool,
     ) -> Result<FlightOperation> {
         if handover {

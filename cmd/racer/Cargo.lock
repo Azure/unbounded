@@ -883,7 +883,6 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2",
- "telemetry",
  "topology",
  "uds-endpoint",
  "wire-codec",
@@ -1306,15 +1305,6 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 2.0.119",
-]
-
-[[package]]
-name = "telemetry"
-version = "0.1.0"
-dependencies = [
- "httparse",
- "racer-io",
- "zeroize",
 ]
 
 [[package]]

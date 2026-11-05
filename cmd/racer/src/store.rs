@@ -444,7 +444,7 @@ struct Dirty {
 
     _payload: crate::retention::Payload,
 
-    _metric: ::telemetry::Lease,
+    _metric: crate::telemetry::primitives::Lease,
 
     ticket: u64,
 

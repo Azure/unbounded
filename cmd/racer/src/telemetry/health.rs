@@ -1,8 +1,8 @@
 use super::*;
 
 #[derive(Clone, Default)]
-pub struct Health(::telemetry::health::Health<Resources>);
-pub use ::telemetry::health::State;
+pub struct Health(crate::telemetry::primitives::health::Health<Resources>);
+pub use crate::telemetry::primitives::health::State;
 /// Complete worker observation; no identities or credentials enter health state.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct Resources {

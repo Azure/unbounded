@@ -8,17 +8,17 @@ use crate::model::RequestId;
 use crate::model::WorkerId;
 use crate::runtime::Reactor;
 use crate::runtime::RequestScope;
-use ::telemetry::Ring;
-use ::telemetry::SampleLimits;
-use ::telemetry::SharedRing;
+use crate::telemetry::primitives::Ring;
+use crate::telemetry::primitives::SampleLimits;
+use crate::telemetry::primitives::SharedRing;
 
 #[cfg(test)]
 use crate::rt::environment;
 use crate::rt::environment::Deadline;
-use ::telemetry::server;
-use ::telemetry::server::Handler;
-use ::telemetry::server::Response;
-use ::telemetry::server::Server;
+use crate::telemetry::primitives::server;
+use crate::telemetry::primitives::server::Handler;
+use crate::telemetry::primitives::server::Response;
+use crate::telemetry::primitives::server::Server;
 use racer_control_wire::NodeId;
 use racer_io::ring::Descriptor;
 use std::cell::OnceCell;
@@ -40,6 +40,7 @@ mod forensics;
 mod health;
 mod metrics;
 mod samples;
+pub mod primitives;
 
 pub use diagnostics::*;
 pub use forensics::*;

@@ -95,7 +95,7 @@ pub struct Slot(u8);
 
 const _: () = assert!(SLOTS <= u8::MAX as usize);
 
-impl ::telemetry::Metric for Slot {
+impl crate::telemetry::primitives::Metric for Slot {
     const ALL: &'static [Self] = &{
         let mut all = [Slot(0); SLOTS];
         let mut index = 0;
@@ -128,7 +128,7 @@ impl ::telemetry::Metric for Slot {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct GaugeSlot(u8);
 
-impl ::telemetry::Metric for GaugeSlot {
+impl crate::telemetry::primitives::Metric for GaugeSlot {
     const ALL: &'static [Self] = &[
         GaugeSlot(0),
         GaugeSlot(1),
@@ -172,7 +172,7 @@ fn histogram_slot(priority: Priority, offset: usize) -> Slot {
 /// records through the first attached worker's handle from any worker
 /// thread, so updates stay atomic `fetch_add`. Counters wrap.
 #[derive(Clone)]
-pub struct PrefetchMetrics(::telemetry::Metrics<Slot, GaugeSlot>);
+pub struct PrefetchMetrics(crate::telemetry::primitives::Metrics<Slot, GaugeSlot>);
 
 impl Default for PrefetchMetrics {
     fn default() -> Self {
@@ -183,7 +183,7 @@ impl Default for PrefetchMetrics {
 impl PrefetchMetrics {
     /// One handle per worker over a shared registry.
     pub fn shards(n: usize) -> Vec<Self> {
-        ::telemetry::Metrics::shards(n)
+        crate::telemetry::primitives::Metrics::shards(n)
             .into_iter()
             .map(Self)
             .collect()
@@ -352,7 +352,7 @@ mod tests {
         for (index, outcome) in Outcome::ALL.iter().enumerate() {
             assert_eq!(*outcome as usize, index);
         }
-        use ::telemetry::Metric;
+        use crate::telemetry::primitives::Metric;
         assert_eq!(Slot::ALL.len(), SLOTS);
         assert_eq!(
             Slot(SLOTS as u8 - 1).name(),

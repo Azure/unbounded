@@ -208,7 +208,7 @@ mod flight {
     use std::task::Waker;
     use std::time::Duration;
     use std::time::Instant;
-    fn metric_lease() -> telemetry::Lease {
+    fn metric_lease() -> crate::telemetry::primitives::Lease {
         crate::telemetry::Metrics::default()
             .lease(crate::telemetry::Gauge::ActiveFills)
             .unwrap()

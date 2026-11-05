@@ -1,7 +1,7 @@
 //! Fixed metrics and bounded diagnostics without application policy.
 //!
 //! Callers own metric names, label cardinality, resource policy, record payloads,
-//! and request lifetimes. This crate provides no dynamic metric registration and
+//! and request lifetimes. This module provides no dynamic metric registration and
 //! does not interpret application identities or errors.
 //!
 //! [`Metrics`] offers cache-line-isolated writer shards and relaxed observations;
@@ -15,6 +15,9 @@ use std::{
 };
 
 pub mod server;
+
+#[cfg(test)]
+mod workflow_tests;
 
 pub use metrics::{Lease, LocalLease, Metric, Metrics};
 
@@ -698,7 +701,7 @@ pub mod metrics {
     ///     Self::Hit => "reads_total" { "outcome=\"hit\"" },
     ///     Self::Miss => "reads_total" { "outcome=\"miss\"" },
     /// }
-    /// assert_eq!(telemetry::Metric::labels(Event::Miss), "outcome=\"miss\"");
+    /// assert_eq!(crate::telemetry::primitives::Metric::labels(Event::Miss), "outcome=\"miss\"");
     /// ```
     #[macro_export]
     macro_rules! metrics {
@@ -723,7 +726,7 @@ pub mod metrics {
                 }
             }
 
-            impl $crate::Metric for $kind {
+            impl $crate::telemetry::primitives::Metric for $kind {
                 const ALL: &'static [Self] = Self::ALL;
 
                 /// Return the index enforced by the enum's declaration order.
@@ -1048,7 +1051,7 @@ pub mod metrics {
 
 /// Shared lifecycle observations and fixed probe responses without resource policy.
 pub mod health {
-    use crate::server::Response;
+    use crate::telemetry::primitives::server::Response;
     use std::{
         sync::{Arc, Mutex},
         time::Instant,

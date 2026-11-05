@@ -1,5 +1,5 @@
 use super::*;
-use ::telemetry::metrics;
+use crate::metrics;
 
 // Fixed metric names; only installed runtime worker IDs are exposed as labels.
 //
@@ -25,20 +25,20 @@ pub(crate) enum LookupTier {
 /// Clones retain their writer shard; reads aggregate the fixed node registry.
 #[derive(Clone)]
 pub struct Metrics {
-    core: ::telemetry::Metrics<Event, Gauge>,
+    core: crate::telemetry::primitives::Metrics<Event, Gauge>,
 
     // Each registration pairs its worker identity with the shared quota view.
     #[allow(clippy::type_complexity)]
     admission: Arc<[OnceLock<(WorkerId, flow_control::SharedQuotas<AdmissionPolicy>)>]>,
 
-    retention: ::telemetry::SnapshotShards<crate::retention::Snapshot>,
+    retention: crate::telemetry::primitives::SnapshotShards<crate::retention::Snapshot>,
 
-    held: ::telemetry::SnapshotShards<crate::store::catalog::HeldSnapshot>,
+    held: crate::telemetry::primitives::SnapshotShards<crate::store::catalog::HeldSnapshot>,
 
-    disks: ::telemetry::SnapshotShards<Vec<DiskUsage>>,
+    disks: crate::telemetry::primitives::SnapshotShards<Vec<DiskUsage>>,
 
     memory: Arc<MemoryShards>,
-    cache_disks: ::telemetry::SnapshotShards<Vec<CacheDiskUsage>>,
+    cache_disks: crate::telemetry::primitives::SnapshotShards<Vec<CacheDiskUsage>>,
 
     /// GPU, cuFile, and GPU landing sources, shared by every worker.
     gpu: Arc<crate::gpu_telemetry::GpuTelemetry>,
@@ -51,10 +51,10 @@ pub struct Metrics {
 
 /// Memory telemetry shared by every worker's handle, behind one pointer.
 struct MemoryShards {
-    staging: ::telemetry::SnapshotShards<Option<(WorkerId, flow_control::PoolStats)>>,
+    staging: crate::telemetry::primitives::SnapshotShards<Option<(WorkerId, flow_control::PoolStats)>>,
 
     // One node-wide slot written by the sampling worker.
-    process: ::telemetry::SnapshotShards<ProcessMemory>,
+    process: crate::telemetry::primitives::SnapshotShards<ProcessMemory>,
 }
 
 /// Process and cgroup memory signals from the most recent sample.
@@ -451,7 +451,7 @@ impl Drop for OpaqueRelayBody<'_> {
 /// Holds one worker-local lease, which is also its counter handle, so opening
 /// a request clones a single pointer and touches only this worker's lines.
 pub(crate) struct RequestMetrics {
-    active: ::telemetry::LocalLease<Event>,
+    active: crate::telemetry::primitives::LocalLease<Event>,
     succeeded: bool,
     overloaded: bool,
     /// The first reported failure, which names why the request ended.
@@ -535,7 +535,7 @@ impl Metrics {
                 *total = total.saturating_add(value);
             }
         }
-        ::telemetry::metrics::Exposition::new(HELD_METRICS).write(out, totals)
+        crate::telemetry::primitives::metrics::Exposition::new(HELD_METRICS).write(out, totals)
     }
 
     /// Node-wide prefetch counters.
@@ -656,8 +656,8 @@ impl Metrics {
                 }
             }
         }
-        ::telemetry::metrics::Exposition::new(RETENTION_METRICS).write(out, totals)?;
-        ::telemetry::metrics::Exposition::new(DISK_CLASS_METRICS.map(|name| (name, "counter")))
+        crate::telemetry::primitives::metrics::Exposition::new(RETENTION_METRICS).write(out, totals)?;
+        crate::telemetry::primitives::metrics::Exposition::new(DISK_CLASS_METRICS.map(|name| (name, "counter")))
             .write_labeled(out, "classification", ["nonowned", "owned"], classes)
     }
 
@@ -783,17 +783,17 @@ impl Metrics {
             return Err(crate::error::Error::InvalidConfiguration);
         }
         let admission: Arc<[_]> = (0..count).map(|_| OnceLock::new()).collect();
-        let retention = ::telemetry::SnapshotShards::new(count);
-        let held = ::telemetry::SnapshotShards::new(count);
-        let disks = ::telemetry::SnapshotShards::new(count);
+        let retention = crate::telemetry::primitives::SnapshotShards::new(count);
+        let held = crate::telemetry::primitives::SnapshotShards::new(count);
+        let disks = crate::telemetry::primitives::SnapshotShards::new(count);
         let memory = Arc::new(MemoryShards {
-            staging: ::telemetry::SnapshotShards::new(count),
-            process: ::telemetry::SnapshotShards::new(1),
+            staging: crate::telemetry::primitives::SnapshotShards::new(count),
+            process: crate::telemetry::primitives::SnapshotShards::new(1),
         });
-        let cache_disks = ::telemetry::SnapshotShards::new(count);
+        let cache_disks = crate::telemetry::primitives::SnapshotShards::new(count);
         let gpu = Arc::new(crate::gpu_telemetry::GpuTelemetry::default());
         let prefetch = crate::prefetch::metrics::PrefetchMetrics::shards(count);
-        Ok(::telemetry::Metrics::shards(count)
+        Ok(crate::telemetry::primitives::Metrics::shards(count)
             .into_iter()
             .zip(prefetch)
             .enumerate()
@@ -882,7 +882,7 @@ impl Metrics {
         self.core.increase(gauge, value);
     }
     /// Keep with the actual resource, including through a submitted I/O fence.
-    pub fn lease(&self, gauge: Gauge) -> Result<::telemetry::Lease> {
+    pub fn lease(&self, gauge: Gauge) -> Result<crate::telemetry::primitives::Lease> {
         self.core
             .lease(gauge)
             .ok_or(crate::error::Error::Overloaded)
@@ -910,8 +910,8 @@ impl Metrics {
         // Quota labels use runtime worker IDs. Read the authority's actual charge,
         // including pooled ciphertext capacity, without sampling on worker polls.
         // A stalled worker therefore remains observable from another worker.
-        const QUOTAS: ::telemetry::metrics::LabeledGauges<4> =
-            ::telemetry::metrics::LabeledGauges::new(
+        const QUOTAS: crate::telemetry::primitives::metrics::LabeledGauges<4> =
+            crate::telemetry::primitives::metrics::LabeledGauges::new(
                 [
                     "racer_worker_relay_used",
                     "racer_worker_relay_limit",
@@ -1399,7 +1399,7 @@ mod tests {
             assert_eq!(
                 EVENTS
                     .iter()
-                    .map(|e| (e.name(), ::telemetry::Metric::labels(*e)))
+                    .map(|e| (e.name(), crate::telemetry::primitives::Metric::labels(*e)))
                     .collect::<std::collections::BTreeSet<_>>()
                     .len(),
                 EVENT_COUNT

@@ -33,12 +33,12 @@ impl Pair {
 }
 /// Racer's selected sender/receiver sampling policy and diagnostic records.
 #[derive(Clone)]
-pub struct Samples(::telemetry::Sampler<Sample, SEND_TAG_CAPACITY>);
+pub struct Samples(crate::telemetry::primitives::Sampler<Sample, SEND_TAG_CAPACITY>);
 
 impl Default for Samples {
     /// Apply Racer's fixed send-checksum sample limits.
     fn default() -> Self {
-        Self(::telemetry::Sampler::new(SEND_TAG_LIMITS))
+        Self(crate::telemetry::primitives::Sampler::new(SEND_TAG_LIMITS))
     }
 }
 struct Sample {
@@ -58,7 +58,7 @@ pub(crate) struct Ticket(Arc<Sample>);
 pub(crate) struct Work {
     sample: Arc<Sample>,
 
-    _lease: ::telemetry::SampleLease<Sample, SEND_TAG_CAPACITY>,
+    _lease: crate::telemetry::primitives::SampleLease<Sample, SEND_TAG_CAPACITY>,
 
     pub facts: Option<AeadFailure>,
 }
@@ -129,7 +129,7 @@ impl Samples {
     }
     pub fn write(&self, out: &mut impl std::fmt::Write) -> std::fmt::Result {
         let (entries, counts) = self.0.snapshot();
-        let ::telemetry::SampleCounts {
+        let crate::telemetry::primitives::SampleCounts {
             eligible,
             sampled,
             skipped,

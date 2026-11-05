@@ -116,8 +116,6 @@ COPY cmd/racer/http/src ./http/src
 COPY cmd/racer/http/tests ./http/tests
 COPY cmd/racer/topology/Cargo.toml ./topology/Cargo.toml
 COPY cmd/racer/topology/src ./topology/src
-COPY cmd/racer/telemetry/Cargo.toml ./telemetry/Cargo.toml
-COPY cmd/racer/telemetry/src ./telemetry/src
 COPY cmd/racer/uds-endpoint/Cargo.toml ./uds-endpoint/Cargo.toml
 COPY cmd/racer/uds-endpoint/src ./uds-endpoint/src
 COPY cmd/racer/wire-codec/Cargo.toml ./wire-codec/Cargo.toml

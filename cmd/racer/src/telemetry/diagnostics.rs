@@ -104,8 +104,8 @@ struct DiagnosticHandler<'a> {
     hardware: &'a HardwareCharge,
 }
 impl Handler for DiagnosticHandler<'_> {
-    type Connection = ::telemetry::Lease;
-    fn connect(&self) -> Option<::telemetry::Lease> {
+    type Connection = crate::telemetry::primitives::Lease;
+    fn connect(&self) -> Option<crate::telemetry::primitives::Lease> {
         self.telemetry
             .metrics
             .lease(Gauge::DiagnosticConnections)
@@ -465,10 +465,10 @@ pub(super) fn get(
 ) -> std::result::Result<Response, std::fmt::Error> {
     let now = telemetry.failures.now();
     let ready = admission_usable && telemetry.health.ready_at(now);
-    const LIVE_PROBE: ::telemetry::health::Probe =
-        ::telemetry::health::Probe::new("ok\n", "not live\n");
-    const READY_PROBE: ::telemetry::health::Probe =
-        ::telemetry::health::Probe::new("ready\n", "not ready\n");
+    const LIVE_PROBE: crate::telemetry::primitives::health::Probe =
+        crate::telemetry::primitives::health::Probe::new("ok\n", "not live\n");
+    const READY_PROBE: crate::telemetry::primitives::health::Probe =
+        crate::telemetry::primitives::health::Probe::new("ready\n", "not ready\n");
     let (response, body, event) = match path {
         "/healthz" => {
             let (response, body) = LIVE_PROBE.response(telemetry.health.live_at(now));
@@ -932,7 +932,7 @@ mod tests {
 
         #[test]
         fn hardware_cancel_reaches_the_running_walk() {
-            use ::telemetry::server::BinarySession;
+            use crate::telemetry::primitives::server::BinarySession;
             use std::sync::mpsc;
             let (started, running) = mpsc::channel::<()>();
             let (observed, seen) = mpsc::channel::<crate::hardware::Abort>();
@@ -1117,7 +1117,7 @@ mod tests {
 
         #[test]
         fn hardware_session_publishes_then_signals() {
-            use ::telemetry::server::BinarySession;
+            use crate::telemetry::primitives::server::BinarySession;
             let job: HardwareJob = Box::new(|_| Ok(crate::hardware::Report::default()));
             let session =
                 HardwareSession::start(job, crate::telemetry::HARDWARE_BODY_BYTES, test_charge())
@@ -1142,7 +1142,7 @@ mod tests {
             assert_eq!(unsafe { libc::poll(&mut poll, 1, 5000) }, 1);
             assert_eq!(
                 session.result(),
-                Some(Err(::telemetry::server::BinaryError::Unavailable(
+                Some(Err(crate::telemetry::primitives::server::BinaryError::Unavailable(
                     "response_too_large"
                 )))
             );
