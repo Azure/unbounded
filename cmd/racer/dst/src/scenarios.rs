@@ -1,7 +1,7 @@
 //! Built-in scenarios run by `make racer-dst` and the CI seed set.
 use crate::{
     Scenario,
-    engine::{MILLIS, SECONDS},
+    engine::{MILLIS, Nanos, SECONDS},
     fixture::lane_pair,
     invariants::{Class, all_roles_settled},
     model::{ModelSpec, Storm},
@@ -65,10 +65,152 @@ pub fn concurrent_cold_readers() -> Scenario {
         .end(4 * SECONDS)
 }
 
+fn error(report: &Value, name: &str) -> u64 {
+    report["metrics"]["errors"][name].as_u64().unwrap_or(0)
+}
+
+fn storm(at: Nanos, object: u64, nodes: u32, window: Nanos) -> Storm {
+    Storm {
+        at,
+        object,
+        first: 0,
+        nodes,
+        window,
+    }
+}
+
+/// Ported from racer-sim `cold_start_completes_with_bounded_origin_traffic` and
+/// `two_thousand_nodes_cold_start` (`sim/tests/contention_scenarios.rs`): every node cold-starts
+/// on one object within 10 ms. Every read ends; reads fail only with `Overloaded` or
+/// `Unavailable`, at most 1 in 100; each page reaches origin at most once per owner; pages are
+/// published. racer-sim's per-node memory bound has no Model counterpart (see MODEL.md).
+pub fn cold_start(nodes: u32) -> Scenario {
+    let spec = ModelSpec {
+        storms: vec![storm(0, 0, nodes, 10 * MILLIS)],
+        ..ModelSpec::default()
+    };
+    let total = u64::from(nodes) * u64::from(spec.pages_per_object);
+    let replicas = topology::REPLICAS as u64;
+    let spec = spec
+        .check("every-read-ends", move |r| {
+            let ended = counter(r, "reads_completed") + counter(r, "reads_failed");
+            (ended == total)
+                .then_some(())
+                .ok_or(format!("{ended} of {total} reads ended"))
+        })
+        .check("only-admission-or-unavailable-failures", move |r| {
+            let failed = counter(r, "reads_failed");
+            let allowed = error(r, "Overloaded") + error(r, "Unavailable");
+            (error(r, "HopBudgetExhausted") == 0 && failed == allowed && failed * 100 <= total)
+                .then_some(())
+                .ok_or(format!("failures: {}", r["metrics"]["errors"]))
+        })
+        .check("origin-at-most-once-per-owner", move |r| {
+            let max = r["origin_per_page"]["max_requests_per_page"]
+                .as_u64()
+                .unwrap_or(0);
+            (1..=replicas)
+                .contains(&max)
+                .then_some(())
+                .ok_or(format!("max origin requests per page {max}"))
+        })
+        .check("pages-published", |r| {
+            (counter(r, "disk_writes") > 0)
+                .then_some(())
+                .ok_or("no disk writes".into())
+        });
+    Scenario::new(format!("model-cold-start-{nodes}"))
+        .nodes(nodes)
+        .sites(4)
+        .model(spec)
+        .end(30 * SECONDS)
+        .max_steps(u64::MAX)
+}
+
+/// Ported from racer-sim `hot_page_storm` with `hot_page_readers_fan_out_through_helpers` and
+/// `mesh_hot_page_readers_fan_out_through_column_helpers`
+/// (`sim/tests/contention_scenarios.rs`): one node reads a one-page object, then 5 s later
+/// `nodes` nodes read it within 1 ms over 32 MiB/s NICs. Owners streaming their hot-page body
+/// limit shed readers to helpers; every read completes, helpers serve copies and the page
+/// reaches origin once.
+pub fn hot_page_storm(nodes: u32) -> Scenario {
+    let spec = ModelSpec {
+        pages_per_object: 1,
+        storms: vec![storm(0, 0, 1, 1), storm(5 * SECONDS, 0, nodes, MILLIS)],
+        ..ModelSpec::default()
+    };
+    let reads = u64::from(nodes) + 1;
+    let spec = spec
+        .check("every-read-completes", move |r| {
+            let (done, failed) = (counter(r, "reads_completed"), counter(r, "reads_failed"));
+            (done == reads && failed == 0)
+                .then_some(())
+                .ok_or(format!("{done} completed, {failed} failed of {reads}"))
+        })
+        .check("owners-shed-to-helpers", |r| {
+            (counter(r, "sheds") > 0 && counter(r, "helper_copies") > 0)
+                .then_some(())
+                .ok_or(format!("no helper fan-out: {}", r["metrics"]["counters"]))
+        })
+        .check("origin-once", |r| {
+            let origin = counter(r, "origin_requests");
+            (origin == 1)
+                .then_some(())
+                .ok_or(format!("{origin} origin requests"))
+        });
+    let mut costs = crate::costs::Costs::checked_in();
+    costs.nic_bytes_per_sec = 32 << 20;
+    Scenario::new(format!("model-hot-page-storm-{nodes}"))
+        .nodes(nodes)
+        .sites(4)
+        .costs(costs)
+        .model(spec)
+        .end(40 * SECONDS)
+        .max_steps(u64::MAX)
+}
+
+/// Ported from racer-sim `origin_forbidden_reelects_a_waiter`
+/// (`sim/tests/contention_scenarios.rs`): 64 nodes read one object while half of the origin
+/// fetches answer 403. A 403 fails only the leader that received it, so some reads fail with
+/// `OriginForbidden` and the rest complete through re-elected waiters.
+pub fn origin_forbidden() -> Scenario {
+    let spec = ModelSpec {
+        storms: vec![storm(0, 1, 64, MILLIS)],
+        origin_errors: crate::resources::OriginErrors {
+            p403: 0.5,
+            ..Default::default()
+        },
+        ..ModelSpec::default()
+    };
+    let total = 64 * u64::from(spec.pages_per_object);
+    let spec = spec
+        .check("forbidden-fails-reads", |r| {
+            (counter(r, "origin_403") > 0 && error(r, "OriginForbidden") > 0)
+                .then_some(())
+                .ok_or(format!("no 403 failures: {}", r["metrics"]))
+        })
+        .check("waiters-recover", move |r| {
+            let done = counter(r, "reads_completed");
+            let ended = done + counter(r, "reads_failed");
+            (ended == total && done > counter(r, "reads_failed"))
+                .then_some(())
+                .ok_or(format!("{done} of {total} reads completed"))
+        });
+    Scenario::new("model-origin-forbidden")
+        .nodes(64)
+        .sites(4)
+        .model(spec)
+        .end(3 * SECONDS)
+}
+
 /// Every built-in scenario.
 pub fn catalog() -> Vec<Scenario> {
     vec![
         concurrent_cold_readers(),
+        cold_start(400),
+        cold_start(2000),
+        hot_page_storm(512),
+        origin_forbidden(),
         Scenario::new("lane-pair")
             .roles(|env| lane_pair(env, 8))
             .with(all_roles_settled())

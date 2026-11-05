@@ -49,6 +49,8 @@ pub struct Counters {
     pub origin_403: u64,
     /// Injected origin server errors (5xx).
     pub origin_5xx: u64,
+    /// Client read attempts retried after a recoverable failure.
+    pub read_retries: u64,
     /// Most pages any node stores at the end of the run.
     pub stored_pages_max: u64,
 }
@@ -131,6 +133,7 @@ impl Report {
                     "origin_412": c.origin_412,
                     "origin_403": c.origin_403,
                     "origin_5xx": c.origin_5xx,
+                    "read_retries": c.read_retries,
                     "stored_pages_max": c.stored_pages_max,
                 },
                 "histograms": {

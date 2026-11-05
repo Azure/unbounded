@@ -27,6 +27,7 @@ use racer_core::{
         effect::EffectId,
         flight::FlightLimits,
         hints::{HINT_CAPACITY, HINT_TTL, SuccessorHints},
+        recoverable,
         serve::{Body, Decision, ServeDecision, ServeRequest},
         walk::{Features, FillConfig, HedgeEnd, Ranked, Reply},
         window::AcquisitionBudgetSpec,
@@ -186,8 +187,13 @@ type Input = acquisition::Input<Vec<u32>, u64, u32>;
 
 /// Engine events.
 enum Ev {
-    /// A client on `node` reads `page`.
-    Read { node: u32, page: Page },
+    /// A client on `node` reads `page`: attempt `attempt` of a read that began at `start`.
+    Read {
+        node: u32,
+        page: Page,
+        start: Nanos,
+        attempt: u8,
+    },
     /// Answer acquisition `read` of `(node, worker)`.
     Input {
         node: u32,
@@ -301,7 +307,7 @@ struct Model<'s> {
     placement: Rc<Placement<Phantom>>,
     nodes: Vec<Node>,
     /// Client reads by `(node, worker, request)`: start time.
-    clients: BTreeMap<(u32, u32, RequestId), Nanos>,
+    clients: BTreeMap<(u32, u32, RequestId), (Nanos, u8)>,
     /// Serving reads by `(node, worker, request)`.
     serving: BTreeMap<(u32, u32, RequestId), Asker>,
     /// Answered effect ids by `(node, worker)`.
@@ -309,6 +315,8 @@ struct Model<'s> {
     /// Bodies being written, by key.
     bodies: BTreeMap<u64, (u32, u32, Body<Page>)>,
     next_body: u64,
+    /// Whether a [`Ev::Tick`] is scheduled.
+    ticking: bool,
     report: Report,
     expected_reads: u64,
 }
@@ -316,6 +324,8 @@ struct Model<'s> {
 const TAG_EVENT: u64 = 1;
 const TAG_READ_END: u64 = 2;
 const TICK: Nanos = 50 * MILLIS;
+/// Client attempts per read, as in racer-sim.
+const MAX_ATTEMPTS: u8 = 4;
 
 /// The owners of `page` under `members` (member positions are node ids).
 fn owners(placement: &Placement<Phantom>, members: &Members, page: Page) -> Vec<u32> {
@@ -366,6 +376,7 @@ impl<'s> Model<'s> {
             answered: BTreeSet::new(),
             bodies: BTreeMap::new(),
             next_body: 0,
+            ticking: false,
             report: Report::default(),
             expected_reads: 0,
         }
@@ -398,12 +409,25 @@ impl<'s> Model<'s> {
                         object: storm.object,
                         number,
                     };
-                    self.engine.at(at, Ev::Read { node, page });
+                    let read = Ev::Read {
+                        node,
+                        page,
+                        start: at,
+                        attempt: 0,
+                    };
+                    self.engine.at(at, read);
                     self.expected_reads += 1;
                 }
             }
         }
-        self.engine.at(TICK, Ev::Tick);
+    }
+
+    /// Keep flight waiters expiring while reads run.
+    fn tick_soon(&mut self) {
+        if !self.ticking {
+            self.ticking = true;
+            self.engine.after(TICK, Ev::Tick);
+        }
     }
 
     fn run(&mut self, end: Nanos, max_steps: u64) {
@@ -418,12 +442,18 @@ impl<'s> Model<'s> {
     fn step(&mut self, event: Ev) {
         let now = self.now();
         match event {
-            Ev::Read { node, page } => {
+            Ev::Read {
+                node,
+                page,
+                start,
+                attempt,
+            } => {
                 self.trace.record(now, TAG_EVENT, 1, u64::from(node));
+                self.tick_soon();
                 if self.nodes[node as usize].stored.touch(page) {
                     self.report.counters.local_hits += 1;
                     self.report.counters.reads_completed += 1;
-                    self.report.latency(0);
+                    self.report.latency(now - start);
                     return;
                 }
                 let worker = owner_worker(page, self.spec.workers.max(1));
@@ -439,7 +469,8 @@ impl<'s> Model<'s> {
                 }
                 let mut out = Vec::new();
                 let request = core.read_page(page, budget, at, &mut out);
-                self.clients.insert((node, worker, request), now);
+                self.clients
+                    .insert((node, worker, request), (start, attempt));
                 self.dispatch(node, worker, out);
             }
             Ev::Input {
@@ -504,6 +535,7 @@ impl<'s> Model<'s> {
                 self.dispatch(node, worker, out);
             }
             Ev::Tick => {
+                self.ticking = false;
                 let at = self.instant(now);
                 for node in 0..self.nodes.len() {
                     for worker in 0..self.nodes[node].cores.len() {
@@ -513,7 +545,7 @@ impl<'s> Model<'s> {
                     }
                 }
                 if !self.clients.is_empty() || !self.serving.is_empty() {
-                    self.engine.after(TICK, Ev::Tick);
+                    self.tick_soon();
                 }
             }
         }
@@ -855,7 +887,7 @@ impl<'s> Model<'s> {
             }
             return;
         }
-        let Some(start) = self.clients.remove(&(node, worker, request)) else {
+        let Some((start, attempt)) = self.clients.remove(&(node, worker, request)) else {
             self.violation(format!("node {node} completed unknown read {request:?}"));
             return;
         };
@@ -869,6 +901,19 @@ impl<'s> Model<'s> {
             Ok(()) => {
                 self.report.counters.reads_completed += 1;
                 self.report.latency(now - start);
+            }
+            // racer-sim's client retries a recoverable failure (`resolve` in
+            // `sim/src/node/world.rs`) after a linear backoff.
+            Err(error) if recoverable(error) && attempt + 1 < MAX_ATTEMPTS => {
+                self.report.counters.read_retries += 1;
+                let backoff = 2 * self.fabric.rtt.rtt(0, 0).max(MILLIS) * u64::from(attempt + 1);
+                let retry = Ev::Read {
+                    node,
+                    page,
+                    start,
+                    attempt: attempt + 1,
+                };
+                self.engine.after(backoff, retry);
             }
             Err(error) => {
                 self.report.counters.reads_failed += 1;
