@@ -135,10 +135,23 @@ The agent also auto-mounts host storage and InfiniBand hardware:
   partitions as well as device-mapper (`/dev/dm-*`) and software RAID
   (`/dev/md*`) nodes. Pseudo and virtual devices are excluded: `loop*`,
   `ram*`, `zram*`, `fd*`, and `sr*` (optical).
-- **InfiniBand HCA devices.** Every character device under
-  `/dev/infiniband` (e.g. `uverbs0`, `umad0`, `issm0`, `rdma_cm`) is
-  bind-mounted so that RDMA workloads inside the container can reach the
-  host's HCAs.
+- **InfiniBand HCA devices.** The `/dev/infiniband` directory itself is
+  bind-mounted (not its individual nodes), so RDMA device nodes created after
+  the machine starts (`uverbs*`, `umad*`, `issm*`, `rdma_cm`) are visible
+  inside the machine without regenerating configuration or restarting it. The
+  agent grants cgroup device access with `DeviceAllow=` for the
+  `char-infiniband_verbs`, `char-infiniband_mad`, and `char-infiniband_cm`
+  device groups plus `/dev/infiniband/rdma_cm`. The agent also loads the
+  RDMA-CM modules and creates `rdma_cm` when needed.
+  If `/dev/infiniband` is absent at configuration time (no RDMA hardware or
+  drivers), nothing is mounted, because nspawn fails to start when a bind
+  source is missing; devices that appear later require a configuration
+  regeneration and machine restart. If it exists but is empty it is mounted
+  and devices added later are usable. Limitations: devices with a device
+  major outside the groups above are not allowed, and replacing the host
+  directory (for example unmounting or recreating `/dev/infiniband`) is not
+  tracked by the bind mount and requires a machine restart. Deploying this
+  mount layout over an older per-device layout needs a one-time restart.
 - **Configured extra devices.** `AdditionalHostDevices` can list either
   non-standard host device nodes under `/dev`, such as `/dev/uinput`, or systemd
   device group specifiers, such as `char-input`, `char-pts`, and `block-*`.
@@ -150,7 +163,13 @@ The agent also auto-mounts host storage and InfiniBand hardware:
   or `:`). `Target` is also a clean absolute path and defaults to `Source`
   when omitted. Set `ReadOnly` to `true` unless the machine requires write
   access. Sources are not created or required to exist during config
-  validation.
+  validation. To pass through a whole device directory, mount it and list the
+  cgroup device permissions in `DeviceAllow`, which takes device paths under
+  `/dev` or systemd device group specifiers (the same format as
+  `AdditionalHostDevices`). Mounting alone does not make device nodes usable.
+  This is the same representation the agent uses for `/dev/infiniband`; for
+  example, `{"Source": "/dev/dri", "DeviceAllow": ["char-drm"]}` exposes
+  GPU render nodes created after startup.
 
 Two systemd hooks run common lifecycle reconciliation around every nspawn
 start. The pre-start hook refreshes host devices, mounts, and GPU paths changed
@@ -289,7 +308,7 @@ image imports or every containerd client path.
 | `Bind=/dev/kvm` | nspawn config | KVM device bind-mount (auto-generated when `/dev/kvm` is present). |
 | `Bind=/dev/net/tun` / `DeviceAllow=/dev/net/tun rwm` | Both | Exposes the generic TUN/TAP device when it is present on the host. |
 | `Bind=<block device>` | nspawn config | Storage block device bind-mount (auto-generated for non-virtual `/sys/class/block` entries, including partitions, `dm-*`, and `md*`). |
-| `Bind=/dev/infiniband/*` | nspawn config | InfiniBand HCA device bind-mount (auto-generated when `/dev/infiniband` devices are present). |
+| `Bind=/dev/infiniband:/dev/infiniband` | nspawn config | InfiniBand directory bind-mount (auto-generated when `/dev/infiniband` exists). |
 | `Bind=<configured /dev path>` | nspawn config | Additional host device bind-mount (configured with agent config `AdditionalHostDevices`). |
 | `Bind=<source>:<target>` / `BindReadOnly=<source>:<target>` | nspawn config | Additional filesystem bind-mount configured through `AdditionalHostMounts`. |
 | `Bind=` / `BindReadOnly=` | nspawn config | GPU device and library bind-mounts (auto-generated when GPUs are present). |

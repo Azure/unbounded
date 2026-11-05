@@ -170,12 +170,13 @@ this invariant and must be treated as such.
 
 **3.4 The operator does not prune.** Nothing reconciles away an object the
 operator has stopped emitting. Cluster singletons are deliberately retained even
-when no Site enables them (`machina.go:57-69`). A mechanism that can rename or
+when no Sites remain (`internal/operator/components/machina/machina.go`). A mechanism that can rename or
 add resources therefore creates permanently orphaned objects.
 
-**3.5 Two different component scopes.** `net`, `machina`, and `gantry` are
-cluster singletons whose enablement is resolved as "any Site enables it"
-(`machina.go:47-55`, `gantry.go:81-95`). `metalman` is per-Site,
+**3.5 Two different component scopes.** `net` and `machina` are required cluster
+singletons whenever at least one Site exists. `gantry` is a cluster singleton
+whose enablement is resolved as "any Site enables it"
+(`internal/operator/components/gantry/gantry.go`). `metalman` is per-Site,
 producing objects named from the Site (`metalman.go:100`). Any
 configuration surface hung off an individual Site is ambiguous for the
 singletons.

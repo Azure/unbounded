@@ -175,10 +175,18 @@ type GantryConfig struct {
 
 // AdditionalHostMount configures a host path bind mount for the nspawn
 // machine. Target defaults to Source when omitted.
+//
+// Mounting a directory that holds device nodes does not by itself make the
+// nodes usable: the cgroup device controller must also allow them. DeviceAllow
+// lists the device paths or systemd device group specifiers (for example
+// char-infiniband_verbs) granted rwm to the machine, so that device nodes
+// created in the mounted directory after the machine starts are usable
+// without regenerating configuration.
 type AdditionalHostMount struct {
-	Source   string `json:"Source"`
-	Target   string `json:"Target,omitempty"`
-	ReadOnly bool   `json:"ReadOnly,omitempty"`
+	Source      string   `json:"Source"`
+	Target      string   `json:"Target,omitempty"`
+	ReadOnly    bool     `json:"ReadOnly,omitempty"`
+	DeviceAllow []string `json:"DeviceAllow,omitempty"`
 }
 
 // DeepCopy returns a copy of AgentOfflineArtifacts.
@@ -261,6 +269,10 @@ func (a *AgentConfig) DeepCopy() *AgentConfig {
 	out.AdditionalHostDevices = slices.Clone(a.AdditionalHostDevices)
 
 	out.AdditionalHostMounts = slices.Clone(a.AdditionalHostMounts)
+	for i := range out.AdditionalHostMounts {
+		out.AdditionalHostMounts[i].DeviceAllow = slices.Clone(out.AdditionalHostMounts[i].DeviceAllow)
+	}
+
 	if a.Gantry != nil {
 		out.Gantry = &GantryConfig{Disabled: a.Gantry.Disabled}
 	}
@@ -386,6 +398,12 @@ func ValidateAdditionalHostMounts(mounts []AdditionalHostMount) error {
 		if mount.Target != "" {
 			if err := validateAdditionalHostMountPath(mount.Target); err != nil {
 				errs = append(errs, fmt.Errorf("AdditionalHostMounts[%d].Target: %w", i, err))
+			}
+		}
+
+		for j, entry := range mount.DeviceAllow {
+			if err := validateAdditionalHostDevice(entry); err != nil {
+				errs = append(errs, fmt.Errorf("AdditionalHostMounts[%d].DeviceAllow[%d]: %w", i, j, err))
 			}
 		}
 	}

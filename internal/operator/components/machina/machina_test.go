@@ -58,12 +58,13 @@ func siteEnabling(name string) *unboundedv1alpha3.Site {
 }
 
 func TestEnabledFor(t *testing.T) {
-	if EnabledFor(&unboundedv1alpha3.Site{}) {
-		t.Fatal("machina enabled with no component spec")
-	}
+	disabled := siteEnabling("edge")
+	*disabled.Spec.Components.Machina.Enabled = false
 
-	if !EnabledFor(siteEnabling("edge")) {
-		t.Fatal("machina not enabled when spec enables it")
+	for _, site := range []*unboundedv1alpha3.Site{{}, siteEnabling("edge"), disabled} {
+		if !EnabledFor(site) {
+			t.Fatal("machina must be enabled regardless of the component spec")
+		}
 	}
 }
 
@@ -348,8 +349,8 @@ func TestReconcileDoesNotCreateFromNothingWithNoEnablingSites(t *testing.T) {
 	env, appliedHashes := retainedEnv(t)
 
 	res := reconcile(t, env, nil)
-	if !res.Ready || res.Reason != component.ReasonDisabled {
-		t.Fatalf("Reconcile = %+v, want ready with Disabled", res)
+	if !res.Ready || res.Reason != component.ReasonNoSites {
+		t.Fatalf("Reconcile = %+v, want ready with NoSites", res)
 	}
 
 	err := env.Client.Get(t.Context(), client.ObjectKey{Namespace: component.DefaultNamespace, Name: configName}, &corev1.ConfigMap{})
@@ -373,6 +374,59 @@ func TestReconcileAppliesWhenSiteEnables(t *testing.T) {
 
 	if appliedHashes[controllerName] != component.ConfigMapPayloadHash(&got) {
 		t.Fatalf("applied hash = %q, want %q", appliedHashes[controllerName], component.ConfigMapPayloadHash(&got))
+	}
+}
+
+func TestReconcileRequiredForEverySite(t *testing.T) {
+	disabled := siteEnabling("edge")
+	*disabled.Spec.Components.Machina.Enabled = false
+	unspecified := siteEnabling("edge")
+	unspecified.Spec.Components.Machina.Enabled = nil
+
+	for _, tc := range []struct {
+		name  string
+		sites []unboundedv1alpha3.Site
+	}{
+		{name: "no component spec", sites: []unboundedv1alpha3.Site{{ObjectMeta: metav1.ObjectMeta{Name: "edge"}}}},
+		{name: "empty machina spec", sites: []unboundedv1alpha3.Site{*unspecified}},
+		{name: "explicitly disabled", sites: []unboundedv1alpha3.Site{*disabled}},
+		{name: "multiple sites without opt-in", sites: []unboundedv1alpha3.Site{{}, *disabled}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			env, appliedHashes := retainedEnv(t)
+
+			res := reconcile(t, env, tc.sites)
+			if !res.Ready || res.Err != nil || res.Reason != component.ReasonReconciled {
+				t.Fatalf("Reconcile = %+v, want reconciled", res)
+			}
+
+			var config corev1.ConfigMap
+			if err := env.Client.Get(t.Context(), client.ObjectKey{Namespace: env.Namespace, Name: configName}, &config); err != nil {
+				t.Fatalf("get required machina config: %v", err)
+			}
+
+			if len(appliedHashes) != 1 || appliedHashes[controllerName] != component.ConfigMapPayloadHash(&config) {
+				t.Fatalf("required machina deployment hashes = %#v", appliedHashes)
+			}
+		})
+	}
+}
+
+func TestPlanRequiredPropagatesConfigReadError(t *testing.T) {
+	env, _ := retainedEnv(t)
+	wantErr := errors.New("config read failed")
+	env.Client = fake.NewClientBuilder().
+		WithScheme(env.Scheme).
+		WithInterceptorFuncs(interceptor.Funcs{
+			Get: func(context.Context, client.WithWatch, client.ObjectKey, client.Object, ...client.GetOption) error {
+				return wantErr
+			},
+		}).
+		Build()
+
+	plan, _, err := (Component{}).Plan(t.Context(), env, []unboundedv1alpha3.Site{{}})
+	if !errors.Is(err, wantErr) || plan != nil {
+		t.Fatalf("Plan = %v, %v, want no plan and config read error", plan, err)
 	}
 }
 
