@@ -511,6 +511,81 @@ fn reserved_partition_is_kept_for_reserved_operations() {
 }
 
 #[test]
+fn reserved_partition_can_be_resized_while_running() {
+    let os = SimOs::new();
+    let clock = crate::ctx::VirtualClock::new();
+    let reactor = Reactor::new(
+        Driver::Sim(os.clone()),
+        Config::new(3),
+        WorkerCtx::simulated(&clock, 1, 1),
+    )
+    .unwrap();
+    let (_left, right) = os.socket_pair();
+    let right = Rc::new(right);
+    let executor = LocalExecutor::new(Some(reactor.wake_handle()));
+    let ordinary = OpCtx::none();
+    let a = executor.spawn(reactor.recv(right.clone(), vec![0; 1], (), &ordinary));
+    let b = executor.spawn(reactor.recv(right.clone(), vec![0; 1], (), &ordinary));
+    executor.run_ready(16);
+    // Two live ordinary operations leave room for only one reserved slot.
+    assert_eq!(
+        reactor.set_reserved_entries(2),
+        Err(Error::InvalidConfiguration)
+    );
+    assert_eq!(
+        reactor.set_reserved_entries(4),
+        Err(Error::InvalidConfiguration)
+    );
+    reactor.set_reserved_entries(1).unwrap();
+    let c = executor.spawn(reactor.recv(right.clone(), vec![0; 1], (), &ordinary));
+    let d = executor.spawn(reactor.recv(right.clone(), vec![0; 1], (), &OpCtx::none().reserved()));
+    executor.run_ready(16);
+    assert_eq!(c.try_take().unwrap().unwrap_err(), Error::Overloaded);
+    assert_eq!(reactor.in_flight(), 3);
+    executor.block_on(&reactor, reactor.fence_all()).unwrap();
+    for handle in [a, b, d] {
+        assert_eq!(
+            executor.block_on(&reactor, handle).unwrap().unwrap_err(),
+            Error::Cancelled
+        );
+    }
+    reactor.set_reserved_entries(0).unwrap();
+}
+
+#[test]
+fn fence_ids_waits_for_named_operations_only() {
+    let os = SimOs::new();
+    let clock = crate::ctx::VirtualClock::new();
+    let reactor = simulated(&os, &clock);
+    let (_left, right) = os.socket_pair();
+    let right = Rc::new(right);
+    let executor = LocalExecutor::new(Some(reactor.wake_handle()));
+    let mut first = reactor.recv(right.clone(), vec![0; 1], (), &OpCtx::none());
+    let mut second = reactor.recv(right, vec![0; 1], (), &OpCtx::none());
+    let waker = std::task::Waker::noop();
+    let mut cx = Context::from_waker(waker);
+    assert!(Pin::new(&mut first).poll(&mut cx).is_pending());
+    assert!(Pin::new(&mut second).poll(&mut cx).is_pending());
+    let (first_id, second_id) = (first.id().unwrap(), second.id().unwrap());
+    assert!(!reactor.is_fenced(first_id));
+    // Abandoning the future cancels it; the fence still waits for the kernel.
+    drop(first);
+    executor
+        .block_on(&reactor, reactor.fence_ids(vec![first_id]))
+        .unwrap();
+    assert!(reactor.is_fenced(first_id));
+    assert!(!reactor.is_fenced(second_id));
+    reactor.cancel_op(second_id, Error::DeadlineExceeded);
+    executor
+        .block_on(&reactor, reactor.fence_ids(vec![first_id, second_id]))
+        .unwrap();
+    assert_eq!(
+        executor.block_on(&reactor, second).unwrap().unwrap_err(),
+        Error::DeadlineExceeded
+    );
+}
+
+#[test]
 fn sim_cost_model_charges_virtual_time() {
     let os = SimOs::new();
     let seen = Rc::new(std::cell::RefCell::new(Vec::new()));

@@ -482,6 +482,9 @@ struct State {
 
     fence_waiters: Vec<(Option<IoClass>, Waker)>,
 
+    /// Waiters of [`Reactor::fence_ids`], keyed by one unfenced operation.
+    id_waiters: Vec<(IoId, Waker)>,
+
     stopped: bool,
 
     /// Operations whose kernel fences have not all arrived.
@@ -585,6 +588,7 @@ impl Reactor {
                 cancel_backlog: Vec::new(),
                 classes: Box::new([0; 256]),
                 fence_waiters: Vec::new(),
+                id_waiters: Vec::new(),
                 stopped: false,
                 unfenced: 0,
                 wake_armed: false,
@@ -936,6 +940,17 @@ impl Reactor {
                 }
             }
         }
+        if !state.id_waiters.is_empty() {
+            let mut index = 0;
+            while index < state.id_waiters.len() {
+                let id = state.id_waiters[index].0;
+                if Self::fenced(&mut state.slab, id) {
+                    wakers.push(state.id_waiters.swap_remove(index).1);
+                } else {
+                    index += 1;
+                }
+            }
+        }
         drop(state);
         for waker in wakers.drain(..) {
             waker.wake();
@@ -1148,6 +1163,48 @@ impl Reactor {
             reactor: self.clone(),
             class: Some(class),
         }
+    }
+
+    /// Whether every kernel completion of `id` has arrived (or `id` is no
+    /// longer live). A delivered but untaken result counts as fenced.
+    pub fn is_fenced(&self, id: IoId) -> bool {
+        Self::fenced(&mut self.state().slab, id)
+    }
+
+    fn fenced(slab: &mut Slab, id: IoId) -> bool {
+        slab.lookup(id)
+            .is_none_or(|slot| slot.fence == Fence::Retired)
+    }
+
+    /// Cancel one in-flight operation with `reason`, as if its context had
+    /// been canceled. Unknown or fenced ids are ignored.
+    pub fn cancel_op(&self, id: IoId, reason: Error) {
+        self.cancel(id, reason);
+    }
+
+    /// Wait until every operation in `ids` has fenced, without canceling
+    /// them. Ids that are already fenced or unknown are skipped.
+    pub fn fence_ids(&self, ids: Vec<IoId>) -> FenceIds {
+        FenceIds {
+            reactor: self.clone(),
+            ids,
+        }
+    }
+
+    /// Change the reserved partition ([`Config::reserved_entries`]) of a
+    /// running reactor. Fails with [`Error::InvalidConfiguration`] when
+    /// `entries` exceeds the queue, or when live ordinary operations would
+    /// exceed the shrunken ordinary partition.
+    pub fn set_reserved_entries(&self, entries: u32) -> Result<()> {
+        let mut state = self.state();
+        let total = state.ordinary_limit + state.reserved_limit;
+        let entries = entries as usize;
+        if entries > total || state.ordinary_live > total - entries {
+            return Err(Error::InvalidConfiguration);
+        }
+        state.ordinary_limit = total - entries;
+        state.reserved_limit = entries;
+        Ok(())
     }
 
     /// Stop admission, cancel everything, and wait until nothing is in flight.
@@ -1393,6 +1450,30 @@ impl Future for FenceWait {
             return Poll::Ready(());
         }
         state.fence_waiters.push((self.class, cx.waker().clone()));
+        Poll::Pending
+    }
+}
+
+/// Waits for the operations named by [`Reactor::fence_ids`].
+#[must_use = "fences do nothing until polled"]
+pub struct FenceIds {
+    reactor: Reactor,
+
+    ids: Vec<IoId>,
+}
+
+impl Future for FenceIds {
+    type Output = ();
+
+    /// Ready once every named operation has fenced.
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
+        let this = &mut *self;
+        let mut state = this.reactor.state();
+        this.ids.retain(|id| !Reactor::fenced(&mut state.slab, *id));
+        let Some(id) = this.ids.last().copied() else {
+            return Poll::Ready(());
+        };
+        state.id_waiters.push((id, cx.waker().clone()));
         Poll::Pending
     }
 }
