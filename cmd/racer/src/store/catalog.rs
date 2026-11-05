@@ -2613,7 +2613,6 @@ mod tests {
         assert_eq!(retention.snapshot().heat_entries, 1);
         assert_eq!(retention.snapshot().indexed_payload_bytes, 17);
         assert_eq!(retention.score(&page), 1);
-        // Exhausted publication ages reject replacement atomically in page_alloc::index.
         drop(index);
         assert_eq!(retention.snapshot().heat_entries, 0);
     }
