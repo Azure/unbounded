@@ -135,6 +135,13 @@ pub struct Counters {
     /// Client reads not started on a node outside its own membership (racer-sim
     /// `reads_skipped_not_member`).
     pub reads_skipped_not_member: u64,
+    /// Combined runs: reads on a node whose control client holds no snapshot (racer-sim
+    /// `reads_skipped_not_enrolled`).
+    pub reads_skipped_not_enrolled: u64,
+    /// [`super::Workload`] range reads started.
+    pub range_reads: u64,
+    /// [`super::Workload`] reads started.
+    pub workload_reads: u64,
 }
 
 /// What a run observed.
@@ -250,6 +257,9 @@ impl Report {
                     "stale_waits": c.stale_waits,
                     "stale_links_refunded": c.stale_links_refunded,
                     "reads_skipped_not_member": c.reads_skipped_not_member,
+                    "workload_reads": c.workload_reads,
+                    "range_reads": c.range_reads,
+                    "reads_skipped_not_enrolled": c.reads_skipped_not_enrolled,
                     "relay_failures": c.relay_failures,
                     "route_unreachable": c.route_unreachable,
                     "silence_timeouts": c.silence_timeouts,

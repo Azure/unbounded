@@ -8,6 +8,7 @@
 //! node holds which page). It never decides where to probe, when to fetch from origin or
 //! whom to shed; the cores do. See `dst/MODEL.md` for what is and is not modeled yet.
 
+mod combined;
 pub mod control;
 pub mod coverage;
 #[allow(missing_docs)]
@@ -63,8 +64,11 @@ use topology::{Exhaustive, PathQuery, Paths, Placement, REPLICAS};
 
 pub use report::{Counters, Report};
 
+use racer_core::time::SplitMix64;
+
 use crate::{
     choices::Choices,
+    choices::mix as mix64,
     engine::{Engine, MILLIS, Nanos, SECONDS, TraceHash},
     invariants::Class,
     resources::{Fabric, Origin, OriginErrors, OriginOutcome},
@@ -106,6 +110,50 @@ impl Types for ModelTypes {
     type Page = Page;
     type Object = u64;
     type Metadata = u64;
+}
+
+/// A steady read load (racer-sim's Poisson arrivals and Zipf popularity, `workload.rs`): every
+/// node reads one uniformly drawn page of a Zipf-drawn object at Poisson arrivals of `rate`
+/// reads per second, while it is up and a member.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Workload {
+    /// Objects, ranked by popularity.
+    pub objects: u64,
+    /// Zipf exponent.
+    pub zipf_s: f64,
+    /// Reads per node per second.
+    pub rate: f64,
+    /// Fraction of reads that read `range_pages` consecutive pages (racer-sim `range_fraction`);
+    /// the Model issues them as concurrent page reads.
+    pub range_fraction: f64,
+    /// Pages of a range read, capped at the object's end.
+    pub range_pages: u32,
+}
+
+/// Origin errors injected during `[from, until)` on top of [`ModelSpec::origin_errors`]
+/// (racer-sim `Fault::OriginErrors`).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct OriginBurst {
+    /// Start.
+    pub from: Nanos,
+    /// End.
+    pub until: Nanos,
+    /// Error rates during the burst.
+    pub errors: OriginErrors,
+}
+
+/// Every link between site `a` and site `b` is cut during `[from, until)` (racer-sim
+/// `Fault::Partition { site_a, site_b }`).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct SiteCut {
+    /// Start.
+    pub from: Nanos,
+    /// End.
+    pub until: Nanos,
+    /// One site.
+    pub a: u16,
+    /// The other site.
+    pub b: u16,
 }
 
 /// `nodes` nodes, starting at `first`, each read every page of `object` once, starting at
@@ -233,6 +281,12 @@ pub struct ModelSpec {
     pub checks: Vec<(String, ReportCheck)>,
     /// The control plane ([`control`]), when the scenario models it.
     pub control: Option<control::ControlSpec>,
+    /// Steady Poisson/Zipf reads.
+    pub workload: Option<Workload>,
+    /// Timed origin error bursts.
+    pub origin_bursts: Vec<OriginBurst>,
+    /// Timed cuts between sites.
+    pub site_cuts: Vec<SiteCut>,
 }
 
 impl std::fmt::Debug for ModelSpec {
@@ -272,6 +326,9 @@ impl Default for ModelSpec {
             waiters_per_flight: flight_limits().waiters_per_flight,
             checks: Vec::new(),
             control: None,
+            workload: None,
+            origin_bursts: Vec::new(),
+            site_cuts: Vec::new(),
         }
     }
 }
@@ -292,6 +349,8 @@ type Input = acquisition::Input<Ranking, u64, u32>;
 
 /// Engine events.
 enum Ev {
+    /// The next [`Workload`] read of `node`.
+    Arrival { node: u32 },
     /// A client on `node` reads `page`: attempt `attempt` of a read that began at `start`.
     Read {
         node: u32,
@@ -544,6 +603,11 @@ struct Model<'s> {
     engine: Engine<Ev>,
     trace: TraceHash,
     choices: Choices,
+    /// [`Workload`] draws (racer-sim's workload stream) and its Zipf CDF.
+    workload_rng: SplitMix64,
+    zipf: Vec<f64>,
+    /// No [`Workload`] read starts after this, so every read ends by the scenario's end.
+    arrivals_until: Nanos,
     base: Instant,
     fabric: Fabric,
     origin: Origin,
@@ -640,6 +704,26 @@ fn owners(placement: &Placement<Phantom>, version: &Version, page: Page) -> Vec<
     ranked.into_iter().map(|p| version.node(p)).collect()
 }
 
+/// racer-sim's `Zipf::new` CDF over `objects` ranks with exponent `s`.
+fn zipf_cdf(objects: u64, s: f64) -> Vec<f64> {
+    let n = objects.max(1);
+    let mut cdf = Vec::with_capacity(n as usize);
+    let mut sum = 0.0;
+    for k in 1..=n {
+        sum += 1.0 / (k as f64).powf(s);
+        cdf.push(sum);
+    }
+    for v in &mut cdf {
+        *v /= sum;
+    }
+    cdf
+}
+
+/// Uniform in `[0, 1)` from 53 random bits (racer-sim `engine::unit`).
+fn unit(rng: &mut SplitMix64) -> f64 {
+    (rng.next_u64() >> 11) as f64 * (1.0 / (1u64 << 53) as f64)
+}
+
 /// The worker of a node that owns `page`'s flight.
 fn owner_worker(page: Page, workers: u32) -> u32 {
     (page.object.wrapping_mul(0x9e37_79b9_7f4a_7c15) ^ u64::from(page.number)) as u32 % workers
@@ -649,11 +733,13 @@ impl<'s> Model<'s> {
     fn new(scenario: &'s Scenario, spec: &'s ModelSpec, choices: Choices) -> Self {
         let n = scenario.nodes.max(1);
         let base = Instant::now();
-        let versions = Rc::new(RefCell::new(Versions::new(
-            n,
-            spec.membership_lag,
-            membership::RETAINED,
-        )));
+        let versions = Rc::new(RefCell::new(
+            if spec.control.as_ref().is_some_and(|c| c.combined) {
+                Versions::external(n, membership::RETAINED)
+            } else {
+                Versions::new(n, spec.membership_lag, membership::RETAINED)
+            },
+        ));
         let phantom = Phantom::new();
         let placement = Rc::new(Placement::with_rankings(4096, phantom));
         let fabric = Fabric::new(n, scenario.sites, &scenario.costs, &choices);
@@ -681,6 +767,13 @@ impl<'s> Model<'s> {
             spec,
             engine: Engine::new(),
             trace: TraceHash::default(),
+            workload_rng: SplitMix64::new(mix64(choices.seed() ^ 0x5741_524b)),
+            zipf: spec
+                .workload
+                .map_or_else(Vec::new, |w| zipf_cdf(w.objects, w.zipf_s)),
+            arrivals_until: scenario
+                .end
+                .saturating_sub(2 * spec.read_timeout + 10 * SECONDS),
             choices,
             base,
             fabric,
@@ -785,10 +878,57 @@ impl<'s> Model<'s> {
 
     /// Whether the link `a - b` is cut: partitioned, or `b` is down.
     fn cut(&self, a: u32, b: u32) -> bool {
-        self.nodes[b as usize].down || self.partitions.contains(&(a.min(b), a.max(b)))
+        self.nodes[b as usize].down
+            || self.partitions.contains(&(a.min(b), a.max(b)))
+            || self.site_cut(a, b)
+    }
+
+    /// Whether a [`SiteCut`] separates `a` and `b` now.
+    fn site_cut(&self, a: u32, b: u32) -> bool {
+        if self.spec.site_cuts.is_empty() {
+            return false;
+        }
+        let now = self.now();
+        let site = &self.fabric.site;
+        let (sa, sb) = (site[a as usize], site[b as usize]);
+        self.spec.site_cuts.iter().any(|c| {
+            (c.from..c.until).contains(&now) && ((c.a, c.b) == (sa, sb) || (c.b, c.a) == (sa, sb))
+        })
+    }
+
+    /// Origin error rates now: the scenario's plus active bursts.
+    fn origin_errors(&self) -> OriginErrors {
+        let now = self.now();
+        let mut e = self.spec.origin_errors;
+        for b in &self.spec.origin_bursts {
+            if (b.from..b.until).contains(&now) {
+                e.p412 += b.errors.p412;
+                e.p403 += b.errors.p403;
+                e.p5xx += b.errors.p5xx;
+            }
+        }
+        e
+    }
+
+    /// Schedule `node`'s next [`Workload`] read.
+    fn next_arrival(&mut self, node: u32) {
+        let Some(w) = self.spec.workload else {
+            return;
+        };
+        if w.rate <= 0.0 {
+            return;
+        }
+        let u = 1.0 - unit(&mut self.workload_rng);
+        let gap = ((-u.ln()) * (SECONDS as f64 / w.rate)).ceil().max(1.0) as Nanos;
+        if self.now().saturating_add(gap) <= self.arrivals_until {
+            self.engine.after(gap, Ev::Arrival { node });
+        }
     }
 
     fn schedule_storms(&mut self) {
+        for node in 0..self.nodes.len() as u32 {
+            self.next_arrival(node);
+        }
         let mut churn = self.spec.churn.clone();
         if let Some(random) = self.spec.random_churn {
             let n = self.nodes.len() as u64;
@@ -881,6 +1021,40 @@ impl<'s> Model<'s> {
         self.conns.advance(now);
         self.admit_queued();
         match event {
+            Ev::Arrival { node } => {
+                self.next_arrival(node);
+                if self.nodes[node as usize].down {
+                    return;
+                }
+                let u = unit(&mut self.workload_rng);
+                let object = (self.zipf.partition_point(|&c| c <= u) as u64)
+                    .min(self.zipf.len().max(1) as u64 - 1);
+                let number = self
+                    .workload_rng
+                    .below(u64::from(self.spec.pages_per_object.max(1)))
+                    as u32;
+                let w = self.spec.workload.expect("workload");
+                let pages = if unit(&mut self.workload_rng) < w.range_fraction {
+                    self.report.counters.range_reads += 1;
+                    w.range_pages
+                        .max(1)
+                        .min(self.spec.pages_per_object.max(1) - number)
+                } else {
+                    1
+                };
+                self.report.counters.workload_reads += 1;
+                for number in number..number + pages {
+                    self.expected_reads += 1;
+                    let page = Page { object, number };
+                    let read = Ev::Read {
+                        node,
+                        page,
+                        start: now,
+                        attempt: 0,
+                    };
+                    self.step(read);
+                }
+            }
             Ev::Membership { node, live } => {
                 if self.versions.borrow_mut().set(node, live) {
                     self.report.counters.membership_changes += 1;
@@ -924,6 +1098,11 @@ impl<'s> Model<'s> {
             } => {
                 self.trace.record(now, TAG_EVENT, 1, u64::from(node));
                 self.tick_soon();
+                if self.versions.borrow().applied(node) == Some(0) {
+                    // Combined: the node's control client holds no snapshot yet.
+                    self.report.counters.reads_skipped_not_enrolled += 1;
+                    return;
+                }
                 if !self.member(node) {
                     self.report.counters.reads_skipped_not_member += 1;
                     return;
@@ -2740,7 +2919,7 @@ impl<'s> Model<'s> {
                         now,
                         page.object,
                         self.spec.page_bytes,
-                        self.spec.origin_errors,
+                        self.origin_errors(),
                     );
                     // racer-sim's mapping (`sim/src/node/world.rs`, origin completion).
                     let c = &mut self.report.counters;
@@ -2795,9 +2974,9 @@ impl<'s> Model<'s> {
             Effect::Metadata { id, key } => {
                 // A metadata HEAD: origin latency and errors, no body.
                 self.report.counters.metadata_requests += 1;
-                let (at, outcome) =
-                    self.origin
-                        .request(now, key.object, 0, self.spec.origin_errors);
+                let (at, outcome) = self
+                    .origin
+                    .request(now, key.object, 0, self.origin_errors());
                 let result = match outcome {
                     OriginOutcome::Ok => Ok(1),
                     OriginOutcome::PreconditionFailed => Err(Error::VersionUnavailable),
@@ -2989,7 +3168,10 @@ impl<'s> Model<'s> {
         c.conn_idle_evicted = stats.idle_evicted;
         c.conn_refused = stats.refused;
         let c = &self.report.counters;
-        let ended = c.reads_completed + c.reads_failed + c.reads_skipped_not_member;
+        let ended = c.reads_completed
+            + c.reads_failed
+            + c.reads_skipped_not_member
+            + c.reads_skipped_not_enrolled;
         if ended != self.expected_reads {
             self.violation(format!("{} of {} reads ended", ended, self.expected_reads));
         }
@@ -3182,7 +3364,7 @@ fn flight_limits() -> FlightLimits {
 /// Run a Model scenario over `choices`: the outcome and the JSON report.
 pub fn run(scenario: &Scenario, choices: Choices) -> (Outcome, Value) {
     if let Some(spec) = scenario.model.as_deref()
-        && let Some(ctl) = &spec.control
+        && let Some(ctl) = spec.control.as_ref().filter(|c| !c.combined)
     {
         return control::run_scenario(scenario, spec, ctl, &choices);
     }
@@ -3216,14 +3398,28 @@ pub fn run(scenario: &Scenario, choices: Choices) -> (Outcome, Value) {
     };
     model.schedule_faults(faults);
     model.schedule_storms();
-    model.run(scenario.end, scenario.max_steps);
+    let mut ctl = spec.control.as_ref().map(|c| {
+        let mut ctl = control::combined(c, scenario.nodes, choices.seed(), scenario.end);
+        ctl.record = true;
+        ctl
+    });
+    match ctl.as_mut() {
+        Some(ctl) => combined::run(&mut model, ctl, scenario.end, scenario.max_steps),
+        None => model.run(scenario.end, scenario.max_steps),
+    }
     // A probe answered before its bound leaves its timeout queued; it would be a no-op.
     let quiescent =
         model.engine.pending() as u64 == model.timeouts_queued && model.probes.is_empty();
     model.finish();
-    let report = model
+    let mut report = model
         .report
         .json(scenario, spec, choices.seed(), model.now());
+    if let Some(ctl) = ctl.as_mut() {
+        combined::report(&mut report, &model, ctl, &scenario.name);
+        let control = report["control_trace_hash"].as_str().unwrap_or("0");
+        let control = u64::from_str_radix(control, 16).unwrap_or(0);
+        model.trace.record(model.now(), 5, control, 0);
+    }
     let steps = model.engine.processed();
     let mut failure = None;
     let hard = report["invariants"]["hard_failures"].as_u64().unwrap_or(0);

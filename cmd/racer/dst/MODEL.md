@@ -228,9 +228,8 @@ Findings:
 - Hedges (`Hedge` answers `NotStarted`; `FillConfig::hedge` is off), successor hint notes
   and orphan notices (`Hints` answers no hints, `Batch` answers no copy), so successor
   deferral (`Served::Defer`) never happens.
-- Membership changes come only from scenario churn; the control plane (racer-sim combined
-  mode, `Versions::external`, enrollment) is not modeled, and a node that left keeps serving
-  peers and relaying.
+- Membership changes come from scenario churn, or in combined scenarios from the control
+  plane (see Control plane below). A node that left keeps serving peers and relaying.
 - Link circuits (`Circuits`). Route searches run synchronously against one shared `Paths`
   cache (production keeps one per worker), so the Model has more cache hits and fewer
   searches needing a slot.
@@ -710,3 +709,143 @@ At 50,000 nodes the Model uses about 83% of racer-sim's per-node peak (85,616 B 
 103,189 B) and runs in minutes where racer-sim's `full-cold-start` takes 39 min. The
 workloads differ: racer-sim's `full-cold-start` runs the full control plane, and the Model
 runs the contention cold start (every node reads one 16-page object).
+
+## Control plane
+
+`model/control.rs` is racer-sim's `ControlSim` (`sim/src/control.rs`) moved onto the dst
+engine, with the primary pass replaced: every decision is a real `racer-cluster-control`
+rule. Each Pod runs the seat lottery and renewal (`rules::seat::{Lottery, SeatRenew}`),
+primary contention (`rules::primary::Contend`, `rules::election`), and a seat follower that
+installs records through `rules::seat::{admit, superseded, need_image}`. Each Pod's client
+enrolls and long-polls through seat admission (`rules::admission::{start_poll, WriteQueue,
+body_for}`) and bearer authorization (`rules::authz::{AuthCache, ApiBudget}`); all
+authorization API calls share one Kubernetes API token bucket. The primary pass is
+`rules::primary::plan_pass` and `discovery`, driven by the real `rules::shell::Shell` as
+`primary.rs` `reconcile` drives it (cluster-control/src/primary.rs:545-723):
+
+- `Shell::begin` asks for a state read. The read takes one API round trip
+  (`api_latency_ns`); the shell checks it against the process high water (rollback or wipe
+  fails closed) and the term fence (`Writer::observe`, with the live Lease UID only when
+  `Shell::needs_live_uid`).
+- The plan is fed back as `Event::Planned`; a changed record must be monotonic over the read
+  and the Lease fresh, else the pass aborts.
+- Right before the PUT, `Shell::recheck` refuses a write once the Lease went stale
+  (primary.rs:682-684). The PUT is a compare-and-swap on the resourceVersion the read
+  returned and takes another round trip; a write in between answers `Conflict` and the shell
+  re-reads and re-plans, at most `MAX_WRITE_ATTEMPTS` reads per pass.
+- `Settle` installs the record into the primary's own follower (fails closed on rollback),
+  installs the plan's image, and publishes discovery on the primary Lease.
+- An `Abort` with `StateError::fails_closed` ends the term and drops the served state
+  (`seat::fail_closed`, cluster-control/src/seat.rs:695), as `lead` does
+  (primary.rs:195-208). The primary Lease renewal feeds `Shell::renewed`, and
+  `ctl_single_primary` counts Pods whose shell is `fresh`.
+
+Divergences from racer-sim, where production decides (racer-sim is wrong in each):
+
+| racer-sim (`sim/src/control.rs` `reconcile`) | Model and production |
+|---|---|
+| Reads and the PUT are atomic in one event: no write can land between them | One API round trip each; a concurrent write is a CAS `Conflict` and the pass re-reads (shell.rs:262-266) |
+| No freshness recheck before the PUT | `Shell::recheck` refuses a stale term (shell.rs:198-204, primary.rs:684) |
+| A non-monotonic plan is skipped silently and the term keeps serving | `Abort(Rollback)`, fail closed (shell.rs:250-254, primary.rs:195-208) |
+| `ctl_single_primary` counts the seat Lease freshness of primaries | Counts primaries whose shell is fresh (Lease freshness from the last renewal start, state.rs:289) |
+| A seat that becomes primary plans from the old primary's global image | Plans from the image its follower copied (seat.rs:824), so its first commit is a delta when it held the previous image |
+
+New counters: `ctl_passes`, `ctl_put_conflicts`, `ctl_put_refused_stale`, `ctl_pass_aborts`,
+`ctl_fail_closed`. Unit tests in `model/control.rs` cover a CAS conflict that re-reads and
+commits, a stale Lease that refuses the PUT and fails closed, and a rolled-back record that
+fails closed; racer-sim's 21 control tests run unchanged against the Model.
+
+Not modeled (as racer-sim): webhook trust and endpoints, the CA keyring rotation schedule
+(`rules::keyring::Policy` defaults only), DaemonSet deletion, and the ready floor
+(`discovery` gets no previous sequence, primary.rs:744).
+
+### Combined scenarios
+
+`model/combined.rs` co-steps `ControlSim` with the read-path Model (racer-sim
+`combined.rs`): control events at or before a read-path event run first; committed
+memberships become `Versions::external` versions, each node adopts exactly the version its
+client applied (none: its reads count as `reads_skipped_not_enrolled` and it is not a member
+of anything it can resolve), and Pod crashes, restarts and removals crash or restart the
+node. The read load is racer-sim's: Poisson arrivals (`Workload::rate`), Zipf objects (4096,
+s = 1), uniform first page, 10% 8-page ranges. Data-plane faults are racer-sim's
+`DataFaults::plan` defaults: slow nodes (every 100th, 8x), origin error bursts
+(`OriginBurst`), a cut between sites 0 and 1 (`SiteCut`), and in `full-cold-start` a storm
+on object 0 by every node. The report adds racer-sim's `combined` object
+(`hard_failures`, `control_invariants`, `control_metrics`, `control`,
+`membership_skew_at_end`) plus `control_memory` and `versions_retained`.
+
+Differences from racer-sim's combined mode: range reads are issued as concurrent page
+reads, not through a `ReadWindow`; no read starts in the last `2 * read_timeout + 10 s` so
+every read ends (the Model checks that; racer-sim does not); the data-plane report is the
+Model's (`read_latency_ns`, Model counters), not racer-sim's node report.
+
+### Port status
+
+| racer-sim scenario | Measures | Invariants | racer-dst | Status |
+|---|---|---|---|---|
+| `enrollment-storm` | every client enrolls through seat admission and authorization within the spread; API QPS peak, 429s, enroll time, client lag | single primary, terms monotonic, sequence monotonic, client membership monotonic, client converges | `model-ctl-enrollment-storm-200` (CI), `scenarios::control(plan, n)` | ported |
+| `failover` | primary crash, two seat crashes, primary crash without restart: failover time, new terms, clients re-home | as above | `model-ctl-failover-200` | ported |
+| `ctl-churn` | 1/16 of Pods at start, 8 growth waves, 2 shrinks: membership versions, delta and full replies | as above | `model-ctl-churn-320` | ported |
+| `lagging` | 10% of clients partitioned, 5% slow, a shrink and a seat crash while they lag; catch-up lag | as above | `model-ctl-lagging-200` | ported |
+| `full-cold-start` | enrollment storm plus reads; reads skipped before enrollment; storm on object 0 after enrollment | control invariants plus read-path hard failures | `model-full-cold-start-200` | ported |
+| `full-failover` | failover plan plus reads, site cut, origin 5xx bursts | as above | `model-full-failover-200` | ported |
+| `full-churn` | ctl-churn plus reads and an origin 412 burst | as above | `model-full-churn-320` | ported |
+| `full-lagging` | lagging plus reads and slow nodes | as above | `model-full-lagging-300` | ported |
+
+Full fidelity counterparts: the `authority-*` scenarios (`authority.rs`) run three real
+authorities; enrolling clients against them are not modeled yet (see Gaps).
+
+### Parity
+
+racer-sim release binary against `cargo test --release -p racer-dst --test control`
+(`control_report`, `combined_report`, ignored) at the same seed and size. Control-only
+scenarios at racer-sim defaults (seed 1, and seed 2 where noted):
+
+| Scenario | Metric | racer-sim | Model |
+|---|---|---|---|
+| enrollment-storm 200 | enrolled, all enrolled at | 200, 4.98 s | 200, 5.00 s |
+| | client replies (full) | 471 (271) | 489 (289) |
+| | enroll p50/p99 ms | 2684 / 4832 | 2684 / 4832 |
+| failover 200 | enrolled, terms, failovers | 199, 2 failovers | 199, 2 failovers |
+| | failover p50/max s (seed 1) | 26.5 / 91.5 | 24.3 / 96.7 |
+| | failover p50/max s (seed 2) | 23.0 / 69.3 | 27.8 / 90.1 |
+| | full / delta replies | 243 / 399 | 242 / 399 |
+| ctl-churn 320 | enrolled, membership version | 304, 21 | 304, 21 |
+| | client replies | 3745 | 3743 |
+| lagging 200 | enrolled, unreachable polls (seed 1, 2) | 198, 190, 104 | 198, 142, 184 |
+| | client lag p99 ms | 77,309 | 77,309 |
+
+Every control run has zero hard failures in both. Combined scenarios at racer-sim's test
+sizes (seed 1):
+
+| Scenario | Metric | racer-sim | Model |
+|---|---|---|---|
+| full-cold-start 200, 120 s, 0.05/s | reads completed / failed | 4823 / 0 | 4450 / 0 |
+| | skipped not enrolled / not member | 35 / 113 | 34 / 104 |
+| | origin requests, origin/page | 1123, 1 | 918, 2 |
+| full-failover 200, 300 s, 0.2/s | reads completed / failed | 17123 / 10 | 15043 / 91 |
+| | skipped not enrolled / not member | 226 / 474 | 236 / 487 |
+| | origin requests, origin/page | 9149, 6 | 7923, 7 |
+| full-churn 320, 400 s, 0.1/s | reads completed / failed | 13969 / 0 | 12802 / 2 |
+| | skipped not enrolled | 3046 | 3001 |
+| | origin requests | 6627 | 6643 |
+| full-lagging 300, 600 s, 0.2/s | reads completed / failed | 52651 / 4 | 49670 / 0 |
+| | origin requests | 21055 | 16614 |
+
+Membership skew at the end, enrolled counts and membership versions match exactly in every
+combined run. Reads completed are 3-12% lower in the Model because its read load stops
+before the end (see above). Within tolerance except `full-failover` read failures (91 against
+10, all `Unavailable`): racer-sim attributes all ten to members whose clients are not ready
+(`reads_failed_while_members_unready`); the Model's come from the same window (members listed
+while their restarted clients hold no snapshot) and, by inference (not yet traced), from the site cut, which the
+Model enforces on every link between the two sites. Open; see Gaps.
+
+### Gaps blocking racer-sim deletion
+
+- `full-failover` read failures differ by 9x at 200 nodes (above).
+- No Full counterpart with enrolling clients against real authorities.
+- The Model has no racer-sim node report fields (`peer_requests_*`, `fills_failed`,
+  `origin_repeats_*` classification used by racer-sim's `failover_repeats_are_skips_or_their_orphans`),
+  so those racer-sim combined tests have no Model counterpart.
+- `--config` overrides (`"control"`, `"combined_faults"`) are not parsed; scenarios take
+  `ControlSpec::overrides` and spec fields instead.

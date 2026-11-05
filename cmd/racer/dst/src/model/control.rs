@@ -2399,6 +2399,8 @@ pub struct ControlSpec {
     pub plan: &'static str,
     /// racer-sim `"control"` overrides ([`Settings::apply_json`]).
     pub overrides: Option<Value>,
+    /// Co-step with the Model read path (racer-sim `combined.rs`).
+    pub combined: bool,
 }
 
 /// Run a control-only Model scenario: report checks and hard invariant
@@ -2469,6 +2471,19 @@ fn outcome(
         quiescent: false,
         failure,
     }
+}
+
+/// The control plane of a combined run: `ctl`'s plan at `nodes` Pods for
+/// `end`, with its overrides (racer-sim `combined::run`).
+pub fn combined(ctl: &ControlSpec, nodes: u32, seed: u64, end: Nanos) -> ControlSim {
+    let (mut settings, _, faults) = plan(ctl.plan, nodes, Some(end));
+    if let Some(o) = &ctl.overrides {
+        settings
+            .apply_json(o)
+            .expect("valid control overrides in a built-in scenario");
+        settings.initial_pods = settings.initial_pods.clamp(1, nodes);
+    }
+    ControlSim::new(settings, seed, faults)
 }
 
 /// Scenario defaults: duration and fault plan for `nodes` Pods.

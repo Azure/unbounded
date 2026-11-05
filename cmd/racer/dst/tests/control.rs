@@ -42,3 +42,26 @@ fn control_report() {
     }
     println!("failure {:?}", outcome.failure);
 }
+
+/// Write the report of combined scenario `CTL_PLAN` (`full-*`) at
+/// `CTL_NODES`, `CTL_RATE` reads per node per second, `CTL_SECS` and
+/// `CTL_SEED` to `CTL_OUT` (stdout if unset).
+#[test]
+#[ignore = "parity: run with --ignored --nocapture"]
+fn combined_report() {
+    let var = |k: &str| std::env::var(k).ok();
+    let name = var("CTL_PLAN").unwrap_or_else(|| "full-cold-start".into());
+    let nodes = var("CTL_NODES").map_or(200, |n| n.parse().unwrap());
+    let seed = var("CTL_SEED").map_or(1, |s| s.parse().unwrap());
+    let rate = var("CTL_RATE").map_or(0.05, |s| s.parse().unwrap());
+    let secs = var("CTL_SECS").map(|s| s.parse().unwrap());
+    let scenario = scenarios::combined(&name, nodes, rate, secs);
+    let started = std::time::Instant::now();
+    let (outcome, report) = model::run(&scenario, Choices::seeded(seed));
+    let text = serde_json::to_string_pretty(&report).unwrap();
+    match var("CTL_OUT") {
+        Some(path) => std::fs::write(path, text).unwrap(),
+        None => println!("{text}"),
+    }
+    println!("failure {:?} wall {:?}", outcome.failure, started.elapsed());
+}

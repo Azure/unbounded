@@ -5,7 +5,11 @@ use crate::{
     engine::{MILLIS, Nanos, SECONDS},
     fixture::lane_pair,
     invariants::{Class, all_roles_settled},
-    model::{ModelSpec, Outage, RandomChurn, RangeRead, Storm, control::ControlSpec},
+    model::{
+        ModelSpec, OriginBurst, Outage, RandomChurn, RangeRead, SiteCut, Storm, Workload,
+        control::ControlSpec,
+    },
+    resources::OriginErrors,
     scenario::FaultMix,
     world::Fault,
 };
@@ -726,6 +730,7 @@ pub fn control(plan: &'static str, nodes: u32) -> Scenario {
         control: Some(ControlSpec {
             plan,
             overrides: None,
+            combined: false,
         }),
         ..ModelSpec::default()
     }
@@ -783,9 +788,113 @@ pub fn control(plan: &'static str, nodes: u32) -> Scenario {
         .end(end)
 }
 
+/// racer-sim's combined scenario `name` (`sim/src/combined.rs`): the control
+/// plan it names plus the Model read path on one timeline, at `nodes` nodes
+/// over 4 sites with a Zipf read load of `rate` reads per node per second for
+/// `secs` (the racer-sim default duration when `None`), and racer-sim's
+/// default data-plane faults (`DataFaults::plan`): slow nodes, origin error
+/// bursts, a site cut, and in `full-cold-start` a storm on object 0 by every
+/// node at three quarters of the run.
+pub fn combined(name: &str, nodes: u32, rate: f64, secs: Option<u64>) -> Scenario {
+    let (plan, default) = match name {
+        "full-cold-start" => ("enrollment-storm", 400),
+        "full-failover" => ("failover", 900),
+        "full-churn" => ("ctl-churn", 1200),
+        _ => ("lagging", 900),
+    };
+    let d = secs.unwrap_or(default) * SECONDS;
+    let mut spec = ModelSpec {
+        control: Some(ControlSpec {
+            plan,
+            overrides: None,
+            combined: true,
+        }),
+        workload: Some(Workload {
+            objects: 4096,
+            zipf_s: 1.0,
+            rate,
+            range_fraction: 0.1,
+            range_pages: 8,
+        }),
+        ..ModelSpec::default()
+    };
+    let mut slow = Vec::new();
+    // `DataFaults::slow`: every 100th node (10 per thousand), 8x slower.
+    let mut slowed = |from: Nanos, until: Nanos| {
+        for node in (50..nodes).step_by(100) {
+            slow.push((from, Fault::SlowPeer { node, factor: 8 }));
+            slow.push((until, Fault::SlowPeer { node, factor: 1 }));
+        }
+    };
+    let burst = |from: Nanos, errors: OriginErrors| OriginBurst {
+        from,
+        until: from + 30 * SECONDS,
+        errors,
+    };
+    match name {
+        "full-cold-start" => {
+            slowed(d * 3 / 4 - d / 40, d * 3 / 4 + d / 20);
+            // `cold_start_window_ns`: twice the owner egress the storm needs.
+            let egress = u128::from(nodes) * u128::from(spec.page_bytes) * u128::from(SECONDS)
+                / (topology::REPLICAS as u128 * 1_250_000_000);
+            let window = (2 * egress).clamp(u128::from(SECONDS), u128::from(Nanos::MAX)) as Nanos;
+            spec.storms.push(storm(d * 3 / 4, 0, nodes, window));
+        }
+        "full-failover" => {
+            spec.site_cuts.push(SiteCut {
+                from: d * 2 / 5,
+                until: d / 2,
+                a: 0,
+                b: 1,
+            });
+            let errors = OriginErrors {
+                p5xx: 0.3,
+                ..OriginErrors::default()
+            };
+            spec.origin_bursts = vec![burst(d / 5, errors), burst(d * 3 / 5, errors)];
+        }
+        "full-churn" => {
+            let errors = OriginErrors {
+                p412: 0.1,
+                ..OriginErrors::default()
+            };
+            spec.origin_bursts = vec![burst(d / 2, errors)];
+        }
+        _ => slowed(d / 10, d * 9 / 10),
+    }
+    spec = spec
+        .check("everyone-enrolled", |r| {
+            let c = &r["combined"]["control"];
+            (c["enrolled"] == c["live_clients"] && c["enrolled"].as_u64() > Some(0))
+                .then_some(())
+                .ok_or(format!(
+                    "enrolled {} of {}",
+                    c["enrolled"], c["live_clients"]
+                ))
+        })
+        .check("reads-complete", |r| {
+            (counter(r, "reads_completed") > 0 && counter(r, "membership_publications") > 0)
+                .then_some(())
+                .ok_or(format!("counters {}", r["metrics"]["counters"]))
+        });
+    let mut scenario = Scenario::new(format!("model-{name}-{nodes}"))
+        .nodes(nodes)
+        .sites(4)
+        .model(spec)
+        .end(d);
+    for (at, fault) in slow {
+        scenario = scenario.fault(at, fault);
+    }
+    scenario
+}
+
 /// Every built-in scenario.
 pub fn catalog() -> Vec<Scenario> {
     vec![
+        combined("full-cold-start", 200, 0.05, Some(120)),
+        combined("full-failover", 200, 0.2, Some(300)),
+        combined("full-churn", 320, 0.1, Some(400)),
+        combined("full-lagging", 300, 0.2, Some(600)),
         control("enrollment-storm", 200),
         control("failover", 200),
         control("ctl-churn", 320),
