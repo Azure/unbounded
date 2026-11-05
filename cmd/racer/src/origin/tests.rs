@@ -1382,10 +1382,15 @@ mod metadata_tests {
             name: "Content-Type".into(),
             value: b"application/octet-stream".to_vec(),
         });
-        assert_eq!(validate_bootstrap(&response, &object()).unwrap().1, 0);
+        assert_eq!(
+            validate_bootstrap(&response, &object(), crate::model::PageSize::DEFAULT)
+                .unwrap()
+                .1,
+            0
+        );
         response.headers[0].value = b"3".to_vec();
         assert_eq!(
-            validate_bootstrap(&response, &object()),
+            validate_bootstrap(&response, &object(), crate::model::PageSize::DEFAULT),
             Err(Error::BadGateway)
         );
         response.start = StartLine::Response { status: 206 };
@@ -1394,12 +1399,15 @@ mod metadata_tests {
             value: b"bytes 0-2/3".to_vec(),
         });
         assert_eq!(
-            validate_bootstrap(&response, &object()).unwrap().0.length,
+            validate_bootstrap(&response, &object(), crate::model::PageSize::DEFAULT)
+                .unwrap()
+                .0
+                .length,
             3
         );
         response.headers.last_mut().unwrap().value = b"bytes 0-2/4".to_vec();
         assert_eq!(
-            validate_bootstrap(&response, &object()),
+            validate_bootstrap(&response, &object(), crate::model::PageSize::DEFAULT),
             Err(Error::BadGateway)
         );
     }
@@ -1452,11 +1460,16 @@ mod page_tests {
     fn pinned_final_page_accepts_only_exact_body_range_and_version() {
         let page = page();
         assert_eq!(
-            validate_page(&head(), &page, 3).unwrap().length,
+            validate_page(&head(), &page, crate::model::PageSize::DEFAULT, 3)
+                .unwrap()
+                .length,
             PAGE_BYTES + 3
         );
         for count in [0, 2, 4, PAGE_BYTES as usize] {
-            assert_eq!(validate_page(&head(), &page, count), Err(Error::BadGateway));
+            assert_eq!(
+                validate_page(&head(), &page, crate::model::PageSize::DEFAULT, count),
+                Err(Error::BadGateway)
+            );
         }
         for range in [
             "bytes 0-2/3",
@@ -1467,17 +1480,29 @@ mod page_tests {
         ] {
             let mut response = head();
             response.headers[2].value = range.as_bytes().to_vec();
-            assert_eq!(validate_page(&response, &page, 3), Err(Error::BadGateway));
+            assert_eq!(
+                validate_page(&response, &page, crate::model::PageSize::DEFAULT, 3),
+                Err(Error::BadGateway)
+            );
         }
         let mut response = head();
         response.headers[3].value = b"\"other\"".to_vec();
-        assert_eq!(validate_page(&response, &page, 3), Err(Error::BadGateway));
+        assert_eq!(
+            validate_page(&response, &page, crate::model::PageSize::DEFAULT, 3),
+            Err(Error::BadGateway)
+        );
         response = head();
         response.start = StartLine::Response { status: 200 };
-        assert_eq!(validate_page(&response, &page, 3), Err(Error::BadGateway));
+        assert_eq!(
+            validate_page(&response, &page, crate::model::PageSize::DEFAULT, 3),
+            Err(Error::BadGateway)
+        );
         response = head();
         response.headers[1].value = b"multipart/byteranges".to_vec();
-        assert_eq!(validate_page(&response, &page, 3), Err(Error::BadGateway));
+        assert_eq!(
+            validate_page(&response, &page, crate::model::PageSize::DEFAULT, 3),
+            Err(Error::BadGateway)
+        );
     }
 }
 mod protocol_tests {
@@ -1575,7 +1600,13 @@ mod protocol_tests {
                 let result = Codec::new(32768)
                     .decode_head(raw.as_bytes())
                     .map_err(|_| Error::BadGateway)
-                    .and_then(|head| validate_bootstrap(&head.unwrap().0, &object));
+                    .and_then(|head| {
+                        validate_bootstrap(
+                            &head.unwrap().0,
+                            &object,
+                            crate::model::PageSize::DEFAULT,
+                        )
+                    });
                 if prefix.is_empty() && suffix.is_empty() {
                     assert_eq!(result.unwrap().1, 1);
                 } else {

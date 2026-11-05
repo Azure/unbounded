@@ -25,9 +25,9 @@ use crate::model::ObjectId;
 use crate::model::ObjectMetadata;
 #[cfg(test)]
 use crate::model::ObjectVersion;
-use crate::model::PAGE_BYTES;
 use crate::model::PageId;
 use crate::model::PageNumber;
+use crate::model::{PAGE_BYTES, PageSize};
 use crate::read::candidates::OriginAuthority;
 use crate::runtime::RequestScope;
 use crate::security::OriginContext;
@@ -129,14 +129,15 @@ impl OriginClient {
     ) -> Result<MetadataReply> {
         scope.check()?;
         self.validate_reservation(&reservation, context)?;
+        let size = self.page_size()?;
         let mut head = request(context, "GET")?;
         // The first page, as the page fetch below would request it.
         head.headers.push(Header::new(
             "Range",
-            format!("bytes=0-{}", PAGE_BYTES - 1).as_bytes(),
+            format!("bytes=0-{}", size.get() - 1).as_bytes(),
         ));
         let mut response = self.exchange_head(endpoint, false, head, scope).await?;
-        let (metadata, length) = validate_bootstrap(&response.value, &context.object)?;
+        let (metadata, length) = validate_bootstrap(&response.value, &context.object, size)?;
         if length == 0 {
             scope.check()?;
             response
@@ -154,7 +155,7 @@ impl OriginClient {
             version: metadata.version.clone(),
             number: PageNumber(0),
         };
-        validate_page(&response.value, &page, body.bytes)?;
+        validate_page(&response.value, &page, size, body.bytes)?;
         scope.check()?;
         body.lease
             .finish_exchange()
@@ -166,6 +167,11 @@ impl OriginClient {
             }),
             metadata,
         })
+    }
+
+    /// The published cluster page size.
+    fn page_size(&self) -> Result<PageSize> {
+        Ok(PageSize::DEFAULT)
     }
 
     fn endpoint(&self, context: &OriginContext) -> Result<Endpoint> {
@@ -229,13 +235,14 @@ impl OriginClient {
         if page.version.object != context.object {
             return Err(Error::Unauthorized);
         }
+        let size = self.page_size()?;
         let first = page
             .number
             .0
-            .checked_mul(PAGE_BYTES)
+            .checked_mul(size.get())
             .ok_or(Error::InvalidRange)?;
         let last = first
-            .checked_add(PAGE_BYTES - 1)
+            .checked_add(size.get() - 1)
             .filter(|last| *last <= i64::MAX as u64)
             .ok_or(Error::InvalidRange)?;
         let mut head = request(context, "GET")?;
@@ -247,10 +254,10 @@ impl OriginClient {
             .push(Header::new("If-Match", page.version.etag.as_bytes()));
         self.validate_reservation(&reservation, context)?;
         let response = self.exchange_head(endpoint, false, head, scope).await?;
-        let (_, length) = validate_page_head(&response.value, page)?;
+        let (_, length) = validate_page_head(&response.value, page, size)?;
         let buffer = self.buffers.plaintext(reservation, length as usize)?;
         let mut body = self.read_page(response.connection, buffer, scope).await?;
-        let metadata = validate_page(&response.value, page, body.bytes)?;
+        let metadata = validate_page(&response.value, page, size, body.bytes)?;
         scope.check()?;
         body.lease
             .finish_exchange()
@@ -446,8 +453,12 @@ pub struct MetadataReply {
 }
 
 /// The initial GET selects metadata and page zero atomically at the adapter.
-pub fn validate_bootstrap(head: &MessageHead, object: &ObjectId) -> Result<(ObjectMetadata, u64)> {
-    racer_wire::object::origin::validate_bootstrap(head, object).map_err(Into::into)
+pub fn validate_bootstrap(
+    head: &MessageHead,
+    object: &ObjectId,
+    size: PageSize,
+) -> Result<(ObjectMetadata, u64)> {
+    racer_wire::object::origin::validate_bootstrap(head, object, size).map_err(Into::into)
 }
 pub fn validate_metadata(head: &MessageHead, object: &ObjectId) -> Result<ObjectMetadata> {
     racer_wire::object::origin::validate_metadata(head, object).map_err(Into::into)
@@ -463,14 +474,19 @@ pub struct OriginPage {
 pub fn validate_page(
     head: &MessageHead,
     page: &PageId,
+    size: PageSize,
     received_bytes: usize,
 ) -> Result<ObjectMetadata> {
-    racer_wire::object::origin::validate_page(head, page, received_bytes).map_err(Into::into)
+    racer_wire::object::origin::validate_page(head, page, size, received_bytes).map_err(Into::into)
 }
 
 /// Validate before allocating or receiving any payload.
-fn validate_page_head(head: &MessageHead, page: &PageId) -> Result<(ObjectMetadata, u64)> {
-    racer_wire::object::origin::validate_page_head(head, page).map_err(Into::into)
+fn validate_page_head(
+    head: &MessageHead,
+    page: &PageId,
+    size: PageSize,
+) -> Result<(ObjectMetadata, u64)> {
+    racer_wire::object::origin::validate_page_head(head, page, size).map_err(Into::into)
 }
 
 /// Validate framing before interpreting status; malformed errors are never miss proof.

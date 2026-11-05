@@ -531,7 +531,12 @@ fn raw_uds_origin_expiry_rejects_noncanonical_whitespace() {
 #[test]
 fn raw_uds_origin_bootstrap_and_aligned_final_page() {
     let empty = raw_response(head_response("Content-Length: 0\r\nContent-Type: application/octet-stream\r\nETag: \"v\"\r\nRacer-Expires-At: 0\r\n"), "GET").unwrap();
-    assert_eq!(validate_bootstrap(&empty, &object()).unwrap().1, 0);
+    assert_eq!(
+        validate_bootstrap(&empty, &object(), racer::model::PageSize::DEFAULT)
+            .unwrap()
+            .1,
+        0
+    );
     let page = PageId {
         version: ObjectVersion {
             object: object(),
@@ -548,10 +553,13 @@ fn raw_uds_origin_bootstrap_and_aligned_final_page() {
     ] {
         let raw = format!("HTTP/1.1 {status} Result\r\nContent-Length: {length}\r\nContent-Type: application/octet-stream\r\nContent-Range: {range}\r\nETag: {tag}\r\nRacer-Expires-At: 0\r\n\r\n").into_bytes();
         let head = raw_response(raw, "GET").unwrap();
-        assert_eq!(validate_page(&head, &page, length).is_ok(), valid);
+        assert_eq!(
+            validate_page(&head, &page, racer::model::PageSize::DEFAULT, length).is_ok(),
+            valid
+        );
         if valid {
             assert_eq!(
-                validate_page(&head, &page, length - 1),
+                validate_page(&head, &page, racer::model::PageSize::DEFAULT, length - 1),
                 Err(Error::BadGateway)
             );
         }
@@ -1390,7 +1398,9 @@ mod sdk {
                 assert_eq!(validate_metadata(&head, &object()).unwrap().length, 3);
             } else if !fields.contains("If-Match") {
                 assert_eq!(
-                    validate_bootstrap(&head, &object()).unwrap().1,
+                    validate_bootstrap(&head, &object(), racer::model::PageSize::DEFAULT)
+                        .unwrap()
+                        .1,
                     if key == 1 { 0 } else { 3 }
                 );
             } else {
@@ -1401,7 +1411,12 @@ mod sdk {
                     },
                     number: PageNumber(0),
                 };
-                assert_eq!(validate_page(&head, &page, 3).unwrap().length, 3);
+                assert_eq!(
+                    validate_page(&head, &page, racer::model::PageSize::DEFAULT, 3)
+                        .unwrap()
+                        .length,
+                    3
+                );
             }
         }
         child.0.stdin.take().unwrap().write_all(b"x").unwrap();
@@ -1442,7 +1457,10 @@ fn raw_uds_fixed_body_is_not_scanned_for_heads_and_short_eof_is_failure() {
                 .unwrap();
             let sent = rig.io.send_head(rig.lease(local), head, &scope).await?;
             let received = rig.io.receive_head(sent.connection, &scope).await?;
-            assert_eq!(validate_bootstrap(&received.value, &object())?.1, 9);
+            assert_eq!(
+                validate_bootstrap(&received.value, &object(), racer::model::PageSize::DEFAULT)?.1,
+                9
+            );
             let mut connection = received.connection;
             let mut body = Vec::new();
             while body.len() < 9 {

@@ -221,7 +221,11 @@ fn fixture_version_changes_discard_stale_body_but_refreshes_preserve_it() {
     let (head, body) = exchange(&fixture, "GET", 0);
     assert_eq!(body, b"old");
     assert_eq!(
-        origin::validate_bootstrap(&head, &current.version.object),
+        origin::validate_bootstrap(
+            &head,
+            &current.version.object,
+            racer_wire::object::PageSize::DEFAULT
+        ),
         Ok((current.clone(), 3))
     );
 
@@ -236,7 +240,11 @@ fn fixture_version_changes_discard_stale_body_but_refreshes_preserve_it() {
         };
         assert_eq!(body, expected);
         assert_eq!(
-            origin::validate_bootstrap(&head, &current.version.object),
+            origin::validate_bootstrap(
+                &head,
+                &current.version.object,
+                racer_wire::object::PageSize::DEFAULT
+            ),
             Ok((current.clone(), length))
         );
         fixture.set_body(vec![b'x'; length as usize]);
@@ -252,7 +260,11 @@ fn fixture_empty_explicit_body_does_not_slice_past_its_end() {
     let (head, body) = exchange(&fixture, "GET", PAGE_BYTES);
     assert!(body.is_empty());
     assert_eq!(
-        origin::validate_bootstrap(&head, &current.version.object),
+        origin::validate_bootstrap(
+            &head,
+            &current.version.object,
+            racer_wire::object::PageSize::DEFAULT
+        ),
         Ok((current, 0))
     );
 }
@@ -308,7 +320,11 @@ fn fixture_empty_bootstrap_and_head_remain_successful() {
         assert_eq!(head.unique("Content-Range").unwrap(), None);
         if method == "GET" {
             assert_eq!(
-                origin::validate_bootstrap(&head, &current.version.object),
+                origin::validate_bootstrap(
+                    &head,
+                    &current.version.object,
+                    racer_wire::object::PageSize::DEFAULT
+                ),
                 Ok((current.clone(), 0))
             );
         } else {

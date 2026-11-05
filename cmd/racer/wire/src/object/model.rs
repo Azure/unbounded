@@ -146,8 +146,60 @@ pub struct PageId {
 // Range
 // Overflow-checked single-range normalization and whole-page slice planning.
 
-/// Fixed logical page size; only the final page may be shorter.
-pub const PAGE_BYTES: u64 = 16 * 1024 * 1024;
+/// Largest and default logical page size; only the final page may be shorter. Buffers sized by
+/// this constant bound every [`PageSize`].
+pub const PAGE_BYTES: u64 = PageSize::MAX.get();
+
+/// Cluster-wide logical page size, published by the authority (D13).
+///
+/// A power of two in [`PageSize::MIN`]..=[`PageSize::MAX`]; test-support constructors also allow
+/// sizes down to [`PageSize::TEST_MIN`].
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct PageSize(u64);
+
+impl PageSize {
+    /// 16 MiB, the default and maximum.
+    pub const MAX: Self = Self(16 * 1024 * 1024);
+    pub const DEFAULT: Self = Self::MAX;
+    /// Smallest production page size.
+    pub const MIN: Self = Self(64 * 1024);
+    /// Smallest page size test-support constructors accept.
+    pub const TEST_MIN: Self = Self(4 * 1024);
+
+    /// Validate a production page size.
+    pub fn new(bytes: u64) -> Result<Self> {
+        Self::checked(bytes, Self::MIN)
+    }
+
+    /// Validate a page size down to [`Self::TEST_MIN`], for tests only.
+    #[cfg(any(test, feature = "test-util"))]
+    pub fn for_tests(bytes: u64) -> Result<Self> {
+        Self::checked(bytes, Self::TEST_MIN)
+    }
+
+    fn checked(bytes: u64, min: Self) -> Result<Self> {
+        if bytes.is_power_of_two() && (min.0..=Self::MAX.0).contains(&bytes) {
+            Ok(Self(bytes))
+        } else {
+            Err(Error::InvalidRequest)
+        }
+    }
+
+    pub const fn get(self) -> u64 {
+        self.0
+    }
+
+    /// Bytes as `usize`; every page size fits.
+    pub const fn bytes(self) -> usize {
+        self.0 as usize
+    }
+}
+
+impl Default for PageSize {
+    fn default() -> Self {
+        Self::DEFAULT
+    }
+}
 
 /// One canonical byte-range request, resolved against a version length later.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -163,6 +215,8 @@ pub struct ResolvedRange {
     start: u64,
 
     end: u64,
+
+    page: PageSize,
 }
 
 /// Requested portion of a single logical page.
@@ -218,8 +272,13 @@ impl ByteRange {
         }
     }
 
-    /// Resolve and clamp a range to a nonempty immutable object.
+    /// Resolve and clamp a range to a nonempty immutable object at the default page size.
     pub fn resolve(self, object_length: u64) -> Result<ResolvedRange> {
+        self.resolve_paged(object_length, PageSize::DEFAULT)
+    }
+
+    /// Resolve and clamp a range to a nonempty immutable object split into `page` pages.
+    pub fn resolve_paged(self, object_length: u64, page: PageSize) -> Result<ResolvedRange> {
         self.validate()?;
         if object_length > MAX_WIRE_INTEGER {
             return Err(Error::InvalidRange);
@@ -236,7 +295,7 @@ impl ByteRange {
         if start >= object_length {
             return Err(Error::UnsatisfiableRange);
         }
-        Ok(ResolvedRange { start, end })
+        Ok(ResolvedRange { start, end, page })
     }
 
     /// Encode a validated range using canonical SDK syntax.
@@ -271,25 +330,31 @@ impl ResolvedRange {
         false
     }
 
+    /// Page size the range is split by.
+    pub fn page_size(&self) -> PageSize {
+        self.page
+    }
+
     /// First page containing requested bytes.
     pub fn first_page(&self) -> PageNumber {
-        PageNumber(self.start / PAGE_BYTES)
+        PageNumber(self.start / self.page.get())
     }
 
     /// Last page containing requested bytes.
     pub fn last_page(&self) -> PageNumber {
-        PageNumber((self.end - 1) / PAGE_BYTES)
+        PageNumber((self.end - 1) / self.page.get())
     }
 
     /// Produce the next slice, not an allocation proportional to object length.
     pub fn slice_at(&self, page: PageNumber) -> Result<Option<PageSlice>> {
-        let page_start = page.0.checked_mul(PAGE_BYTES).ok_or(Error::InvalidRange)?;
+        let size = self.page.get();
+        let page_start = page.0.checked_mul(size).ok_or(Error::InvalidRange)?;
         if page_start >= self.end {
             return Ok(None);
         }
         // page_start is now below the validated signed-63-bit range end.
         let start = self.start.max(page_start);
-        let end = self.end.min(page_start + PAGE_BYTES);
+        let end = self.end.min(page_start + size);
         if start >= end {
             return Ok(None);
         }
@@ -478,8 +543,13 @@ impl VersionMetadata {
 
     /// Structural consistency only, not authentication of origin/peer/disk input.
     pub fn validate_page(&self, envelope: &impl PageDescriptor) -> Result<()> {
+        self.validate_page_in(envelope, PageSize::DEFAULT)
+    }
+
+    /// [`Self::validate_page`] for pages of `size`.
+    pub fn validate_page_in(&self, envelope: &impl PageDescriptor, size: PageSize) -> Result<()> {
         envelope.validate_structure()?;
-        if self.page_length(envelope.page())? != envelope.plaintext_length() {
+        if self.page_length_in(envelope.page(), size)? != envelope.plaintext_length() {
             return Err(Error::CorruptRecord);
         }
         Ok(())
@@ -487,15 +557,20 @@ impl VersionMetadata {
 
     /// Resolve a page's exact length, rejecting another version or an absent page.
     pub fn page_length(&self, page: &PageId) -> Result<u32> {
+        self.page_length_in(page, PageSize::DEFAULT)
+    }
+
+    /// [`Self::page_length`] for pages of `size`.
+    pub fn page_length_in(&self, page: &PageId, size: PageSize) -> Result<u32> {
         let start = page
             .number
             .0
-            .checked_mul(PAGE_BYTES)
+            .checked_mul(size.get())
             .ok_or(Error::CorruptRecord)?;
         if self.length > MAX_WIRE_INTEGER || page.version != self.version || start >= self.length {
             return Err(Error::CorruptRecord);
         }
-        Ok((self.length - start).min(PAGE_BYTES) as u32)
+        Ok((self.length - start).min(size.get()) as u32)
     }
 }
 
@@ -546,6 +621,48 @@ pub trait PageDescriptor {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn page_size_validation() {
+        assert_eq!(PageSize::default().get(), 16 << 20);
+        assert_eq!(PAGE_BYTES, PageSize::MAX.get());
+        for ok in [64 << 10, 1 << 20, 16 << 20] {
+            assert_eq!(PageSize::new(ok).map(PageSize::get), Ok(ok));
+        }
+        for bad in [0, 1, 4 << 10, 32 << 10, 96 << 10, 32 << 20, u64::MAX] {
+            assert_eq!(PageSize::new(bad), Err(Error::InvalidRequest), "{bad}");
+        }
+        assert_eq!(PageSize::for_tests(4 << 10).map(PageSize::get), Ok(4 << 10));
+        assert_eq!(PageSize::for_tests(2 << 10), Err(Error::InvalidRequest));
+        assert_eq!(PageSize::for_tests(5 << 10), Err(Error::InvalidRequest));
+    }
+
+    #[test]
+    fn small_pages_split_ranges_and_lengths() {
+        let size = PageSize::new(64 << 10).unwrap();
+        let range = ByteRange::From((64 << 10) - 2)
+            .resolve_paged(3 * (64 << 10) + 3, size)
+            .unwrap();
+        assert_eq!(range.page_size(), size);
+        assert_eq!(
+            (range.first_page(), range.last_page()),
+            (PageNumber(0), PageNumber(3))
+        );
+        let slices: Vec<_> = (0..=3)
+            .map(|p| range.slice_at(PageNumber(p)).unwrap().unwrap())
+            .map(|s| (s.page.0, s.offset, s.length))
+            .collect();
+        assert_eq!(
+            slices,
+            [
+                (0, (64 << 10) - 2, 2),
+                (1, 0, 64 << 10),
+                (2, 0, 64 << 10),
+                (3, 0, 3)
+            ]
+        );
+        assert_eq!(range.slice_at(PageNumber(4)), Ok(None));
+    }
 
     // Identity boundaries.
     #[test]

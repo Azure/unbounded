@@ -38,14 +38,17 @@ fn assert_content_type(mut head: MessageHead, expected: Option<&[u8]>) {
     head.headers
         .push(Header::new("Content-Range", b"bytes 0-0/1"));
     assert_eq!(
-        origin::validate_bootstrap(&head, &object),
+        origin::validate_bootstrap(&head, &object, racer_wire::object::PageSize::DEFAULT),
         Ok((metadata.clone(), 1))
     );
     let page = PageId {
         version: metadata.version.clone(),
         number: PageNumber(0),
     };
-    assert_eq!(origin::validate_page(&head, &page, 1), Ok(metadata));
+    assert_eq!(
+        origin::validate_page(&head, &page, racer_wire::object::PageSize::DEFAULT, 1),
+        Ok(metadata)
+    );
 }
 
 #[test]
@@ -134,7 +137,7 @@ fn opaque_numeric_and_range_fields_still_reject_padding() {
             head.headers
                 .push(Header::new(name, format!("{leading}{value}{trailing}")));
             assert_eq!(
-                origin::validate_bootstrap(&head, &object()),
+                origin::validate_bootstrap(&head, &object(), racer_wire::object::PageSize::DEFAULT),
                 Err(Error::BadGateway),
                 "{name}: {leading:?}{value}{trailing:?}"
             );
@@ -146,7 +149,7 @@ fn opaque_numeric_and_range_fields_still_reject_padding() {
                 number: PageNumber(0),
             };
             assert_eq!(
-                origin::validate_page(&head, &page, 1),
+                origin::validate_page(&head, &page, racer_wire::object::PageSize::DEFAULT, 1),
                 Err(Error::BadGateway)
             );
         }

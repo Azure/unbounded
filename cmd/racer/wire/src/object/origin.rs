@@ -2,8 +2,8 @@
 
 use crate::http::{MessageHead, StartLine};
 use crate::object::model::{
-    ContentType, ExpiresAt, MAX_FIELD_BYTES, ObjectId, ObjectMetadata, ObjectVersion, PAGE_BYTES,
-    PageId, StrongEtag,
+    ContentType, ExpiresAt, MAX_FIELD_BYTES, ObjectId, ObjectMetadata, ObjectVersion, PageId,
+    PageSize, StrongEtag,
 };
 use crate::object::{Error, Result};
 
@@ -56,7 +56,11 @@ pub fn opaque(bytes: &[u8]) -> Result<()> {
 }
 
 /// The initial GET selects metadata and page zero atomically at the adapter.
-pub fn validate_bootstrap(head: &MessageHead, object: &ObjectId) -> Result<(ObjectMetadata, u64)> {
+pub fn validate_bootstrap(
+    head: &MessageHead,
+    object: &ObjectId,
+    size: PageSize,
+) -> Result<(ObjectMetadata, u64)> {
     let (status, length) = validate_response(head, false)?;
     if required(head, "Content-Type")? != b"application/octet-stream" {
         return Err(Error::BadGateway);
@@ -69,7 +73,7 @@ pub fn validate_bootstrap(head: &MessageHead, object: &ObjectId) -> Result<(Obje
         0
     } else {
         let (first, last, total) = content_range(head)?;
-        if first != 0 || length != last + 1 || length != total.min(PAGE_BYTES) {
+        if first != 0 || length != last + 1 || length != total.min(size.get()) {
             return Err(Error::BadGateway);
         }
         total
@@ -92,9 +96,10 @@ pub fn validate_metadata(head: &MessageHead, object: &ObjectId) -> Result<Object
 pub fn validate_page(
     head: &MessageHead,
     page: &PageId,
+    size: PageSize,
     received_bytes: usize,
 ) -> Result<ObjectMetadata> {
-    let (metadata, length) = validate_page_head(head, page)?;
+    let (metadata, length) = validate_page_head(head, page, size)?;
     if received_bytes as u64 != length {
         return Err(Error::BadGateway);
     }
@@ -102,7 +107,11 @@ pub fn validate_page(
 }
 
 /// Validate before allocating or receiving any payload.
-pub fn validate_page_head(head: &MessageHead, page: &PageId) -> Result<(ObjectMetadata, u64)> {
+pub fn validate_page_head(
+    head: &MessageHead,
+    page: &PageId,
+    size: PageSize,
+) -> Result<(ObjectMetadata, u64)> {
     let (status, length) = validate_response(head, true)?;
     if status != 206 || required(head, "Content-Type")? != b"application/octet-stream" {
         return Err(Error::BadGateway);
@@ -111,11 +120,11 @@ pub fn validate_page_head(head: &MessageHead, page: &PageId) -> Result<(ObjectMe
     let expected_first = page
         .number
         .0
-        .checked_mul(PAGE_BYTES)
+        .checked_mul(size.get())
         .ok_or(Error::InvalidRange)?;
     if first != expected_first
         || length != last - first + 1
-        || length != (total - first).min(PAGE_BYTES)
+        || length != (total - first).min(size.get())
     {
         return Err(Error::BadGateway);
     }

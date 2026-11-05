@@ -286,7 +286,11 @@ fn portable_fixture_serves_pages_and_missing_pins() {
     let (head, body) = exchange(false);
     assert_eq!(body, b"abc");
     assert_eq!(
-        origin::validate_bootstrap(&head, &metadata.version.object),
+        origin::validate_bootstrap(
+            &head,
+            &metadata.version.object,
+            racer_wire::object::PageSize::DEFAULT
+        ),
         Ok((metadata.clone(), 3))
     );
     fixture.set_missing(true);
