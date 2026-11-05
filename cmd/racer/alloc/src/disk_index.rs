@@ -174,6 +174,11 @@ impl Writing {
     pub fn location(&self) -> RecordLocation {
         self.location
     }
+
+    /// The reserved slot.
+    pub fn slot(&self) -> PageSlot {
+        self.ticket.slot
+    }
 }
 
 /// Proof that a record's write completed.
@@ -606,6 +611,13 @@ impl DiskIndex {
     /// Whether a publication for `slot` is in flight.
     pub fn is_inflight(&self, slot: PageSlot) -> bool {
         self.entry(slot).is_ok_and(Entry::inflight)
+    }
+
+    /// Whether `slot` is stored (even in a draining cache), in flight, or held,
+    /// so its interned identity must be kept.
+    pub fn references(&self, slot: PageSlot) -> bool {
+        self.entry(slot)
+            .is_ok_and(|entry| entry.stored() || entry.inflight() || entry.holders != 0)
     }
 
     /// Every stored entry, in slot order (for checkpoints).
