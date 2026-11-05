@@ -2846,6 +2846,10 @@ func (r *RunReconciler) qualificationEvidenceIdentity(
 		participants[index].Verdict = qualificationVerdict(verdict)
 	}
 
+	if len(participants) > 1 {
+		return nil, verdict, reason, nil
+	}
+
 	return &signalv1.QualificationEvidenceIdentity{
 		PlanDigest:   run.Spec.PlanDigest,
 		Participants: participants,

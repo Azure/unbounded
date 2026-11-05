@@ -131,6 +131,58 @@ func TestQualificationEvidenceRejectsSameBootViolation(t *testing.T) {
 	}
 }
 
+func TestQualificationEvidenceDoesNotInferMultiParticipantVerdicts(t *testing.T) {
+	t.Parallel()
+
+	scheme := runtime.NewScheme()
+	if err := corev1.AddToScheme(scheme); err != nil {
+		t.Fatal(err)
+	}
+
+	requester := qualificationNode("requester", "requester-uid", "boot-a")
+	helper := qualificationNode("helper", "helper-uid", "boot-a")
+	kube := fake.NewClientBuilder().WithScheme(scheme).WithObjects(requester, helper).Build()
+	reconciler := &RunReconciler{
+		Client:          kube,
+		APIReader:       kube,
+		ControllerImage: pinnedImage("controller", "a"),
+	}
+
+	finishedAt := time.Now().UTC()
+	run := qualificationRun("run", requester, signalv1.QualificationVerdictPass, finishedAt)
+	run.Spec.Participants = append(run.Spec.Participants, signalv1.Participant{
+		NodeName: helper.Name,
+		NodeUID:  helper.UID,
+	})
+	run.Annotations = map[string]string{
+		RunStartIdentityAnnotation: `[` +
+			`{"nodeUID":"requester-uid","bootID":"boot-a"},` +
+			`{"nodeUID":"helper-uid","bootID":"boot-a"}]`,
+	}
+	refreshPlanDigest(run)
+
+	start := metav1.NewTime(finishedAt.Add(-time.Minute))
+	finish := metav1.NewTime(finishedAt)
+	identity, verdict, _, err := reconciler.qualificationEvidenceIdentity(
+		context.Background(),
+		run,
+		[]signalv1.CheckStatus{{
+			ID:         signalv1.CheckID("R01"),
+			Phase:      signalv1.CheckPhaseSucceeded,
+			StartedAt:  &start,
+			FinishedAt: &finish,
+		}},
+		"Pass",
+		"",
+	)
+	if err != nil {
+		t.Fatalf("qualificationEvidenceIdentity() error = %v", err)
+	}
+	if identity != nil || verdict != "Pass" {
+		t.Fatalf("multi-participant aggregate verdict produced qualification identity %#v, verdict %q", identity, verdict)
+	}
+}
+
 func TestEvaluateLedgerQualificationAndMigrationRules(t *testing.T) {
 	t.Parallel()
 
