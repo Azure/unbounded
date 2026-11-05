@@ -184,7 +184,7 @@ func BuildAgentConfig(params BuildAgentConfigParams) UnboundedAgentConfig {
 
 	if machine.Spec.Agent != nil {
 		if machine.Spec.Agent.Downloads != nil {
-			downloads = agentDownloadsFromSpec(machine.Spec.Agent.Downloads)
+			downloads = AgentDownloadsFromSpec(machine.Spec.Agent.Downloads)
 		}
 
 		if machine.Spec.Agent.LocalDNS != nil {
@@ -253,10 +253,10 @@ func LocalDNSFromSpec(spec *v1alpha3.LocalDNSSpec) *config.AgentLocalDNSConfig {
 	}
 }
 
-// agentDownloadsFromSpec converts the Machine API AgentDownloadsSpec into
+// AgentDownloadsFromSpec converts the Machine API AgentDownloadsSpec into
 // the agent-facing AgentDownloads config. Returns nil if every entry is
 // unset, so the resulting JSON config remains minimal.
-func agentDownloadsFromSpec(spec *v1alpha3.AgentDownloadsSpec) *AgentDownloads {
+func AgentDownloadsFromSpec(spec *v1alpha3.AgentDownloadsSpec) *AgentDownloads {
 	if spec == nil {
 		return nil
 	}

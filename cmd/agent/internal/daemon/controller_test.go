@@ -799,6 +799,38 @@ func TestResolveDesiredRepaveConfig_UsesLatestWhenVersionOmitted(t *testing.T) {
 	assert.Equal(t, "config-a-v3", appliedRef.VersionName)
 }
 
+func TestResolveDesiredRepaveConfig_TakesTheDownloadSourcesFromTheMachine(t *testing.T) {
+	tests := []struct {
+		name  string
+		agent *v1alpha3.AgentSpec
+		want  *provision.AgentDownloads
+	}{
+		{name: "no agent spec", agent: nil, want: nil},
+		{name: "no downloads", agent: &v1alpha3.AgentSpec{Image: "img"}, want: nil},
+		{name: "empty downloads", agent: &v1alpha3.AgentSpec{Downloads: &v1alpha3.AgentDownloadsSpec{}}, want: nil},
+		{
+			name: "a mirror",
+			agent: &v1alpha3.AgentSpec{Downloads: &v1alpha3.AgentDownloadsSpec{
+				Kubernetes: &v1alpha3.DownloadSource{BaseURL: "https://mirror.example/k8s"},
+			}},
+			want: &provision.AgentDownloads{Kubernetes: &provision.AgentDownloadSource{BaseURL: "https://mirror.example/k8s"}},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			machine := &v1alpha3.Machine{
+				ObjectMeta: metav1.ObjectMeta{Name: "test-machine"},
+				Spec:       v1alpha3.MachineSpec{Agent: tt.agent},
+			}
+
+			desired, _, err := resolveDesiredRepaveConfig(context.Background(), fakeStatusClient(machine), "test-machine", baseConfig())
+			require.NoError(t, err)
+			assert.Equal(t, tt.want, desired.Downloads)
+		})
+	}
+}
+
 func machineConfigurationVersion(
 	configurationName string,
 	version int32,
