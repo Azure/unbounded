@@ -517,3 +517,125 @@ fn expired_leaders_hand_their_fill_to_later_waiters() {
         "{o}"
     );
 }
+
+/// Latest read end of a report (`read_latency_ns` max).
+fn max_read_ns(r: &serde_json::Value) -> u64 {
+    r["metrics"]["histograms"]["read_latency_ns"]["max"]
+        .as_u64()
+        .unwrap()
+}
+
+/// A storm-only run with `costs` changed by `tune`.
+fn run_costs(
+    name: &str,
+    nodes: u32,
+    end: u64,
+    spec: model::ModelSpec,
+    seed: u64,
+    tune: impl FnOnce(&mut racer_dst::costs::Costs),
+) -> serde_json::Value {
+    let mut costs = racer_dst::costs::Costs::checked_in();
+    tune(&mut costs);
+    run(storms(name, nodes, end, spec).costs(costs), seed)
+}
+
+/// racer-sim `cold_nodes_contend_for_one_global_origin` (seed 1): each of 8 nodes reads a distinct
+/// cold object, so every byte comes from the one shared origin server. Slowing it slows the fleet,
+/// and the last read cannot finish before the origin has sent every byte once.
+#[test]
+fn cold_nodes_contend_for_one_global_origin() {
+    use racer_dst::engine::SECONDS;
+    let nodes = 8u32;
+    let build = |origin: u64| {
+        let spec = model::ModelSpec {
+            pages_per_object: 2,
+            storms: (0..u64::from(nodes))
+                .map(|object| model::Storm {
+                    first: object as u32,
+                    ..storm(0, object, 1, 1)
+                })
+                .collect(),
+            ..model::ModelSpec::default()
+        };
+        let pages = u64::from(spec.pages_per_object);
+        let page_bytes = spec.page_bytes;
+        let r = run_costs("one-origin", nodes, 20, spec, 1, |c| {
+            c.origin_bytes_per_sec = origin;
+        });
+        assert_eq!(counter(&r, "reads_completed"), u64::from(nodes) * pages);
+        (r, u64::from(nodes) * pages * page_bytes)
+    };
+    let (fast, _) = build(64 << 30);
+    let slow_bps = 64 << 20;
+    let (slow, requested) = build(slow_bps);
+    assert!(counter(&slow, "origin_bytes") >= requested);
+    assert!(max_read_ns(&slow) > max_read_ns(&fast));
+    let origin_ns = requested * SECONDS / slow_bps;
+    assert!(
+        max_read_ns(&slow) >= origin_ns,
+        "origin bandwidth was multiplied by node count: {} < {origin_ns}",
+        max_read_ns(&slow)
+    );
+}
+
+/// racer-sim `warm_peer_fanout_is_limited_by_source_node_network` (seed 3): one node warms a
+/// one-page object, then all 17 nodes read it at once over 64 MiB/s NICs. Origin is asked at most
+/// once per owner, peers serve the copies, and the few sources serialize them on their NICs: the
+/// fanout takes at least the aggregate NIC floor and far longer than one reader.
+#[test]
+fn warm_peer_fanout_is_limited_by_source_node_network() {
+    use racer_dst::engine::SECONDS;
+    let nodes = 17u32;
+    let nic = 64u64 << 20;
+    let build = |readers: u32| {
+        let spec = model::ModelSpec {
+            pages_per_object: 1,
+            storms: vec![storm(0, 0, 1, 1), storm(2 * SECONDS, 0, readers, 1)],
+            ..model::ModelSpec::default()
+        };
+        run_costs("warm-fanout", nodes, 30, spec, 3, |c| {
+            c.nic_bytes_per_sec = nic
+        })
+    };
+    let one = build(1);
+    let fanout = build(nodes);
+    let page = model::ModelSpec::default().page_bytes;
+    assert_eq!(counter(&fanout, "reads_completed"), u64::from(nodes) + 1);
+    assert!(counter(&fanout, "origin_requests") <= topology::REPLICAS as u64);
+    assert!(
+        counter(&fanout, "peer_bytes") >= u64::from(nodes - topology::REPLICAS as u32) * page,
+        "fanout must fetch copies from peers"
+    );
+    let floor = counter(&fanout, "peer_bytes") * SECONDS / (u64::from(nodes) * nic);
+    let fanout_max = max_read_ns(&fanout);
+    assert!(fanout_max >= floor, "{fanout_max} < {floor}");
+    let one_max = max_read_ns(&one).max(1);
+    assert!(
+        fanout_max >= 2 * one_max,
+        "fanout bypassed the source NIC: fanout {fanout_max} vs one reader {one_max}"
+    );
+}
+
+/// racer-sim `workers_share_node_network_bandwidth` (seed 5): NIC service is per node, not per
+/// worker, so four workers do not multiply a node's bandwidth for a fanout.
+#[test]
+fn workers_share_node_network_bandwidth() {
+    use racer_dst::engine::SECONDS;
+    let build = |workers: u8| {
+        let spec = model::ModelSpec {
+            workers: workers.into(),
+            pages_per_object: 4,
+            storms: vec![storm(0, 0, 1, 1), storm(2 * SECONDS, 0, 9, 1)],
+            ..model::ModelSpec::default()
+        };
+        let r = run_costs("workers-share-nic", 9, 30, spec, 5, |c| {
+            c.nic_bytes_per_sec = 64 << 20;
+        });
+        max_read_ns(&r)
+    };
+    let (one, four) = (build(1), build(4));
+    assert!(
+        four * 2 >= one,
+        "workers multiplied node bandwidth: {four} vs {one}"
+    );
+}
