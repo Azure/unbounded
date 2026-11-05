@@ -860,8 +860,8 @@ sizes (seed 1):
 | | read latency p50/p99/max ms | 42 / 218 / 3,551 | 47 / 157 / 3,473 |
 | | wall (release), peak RSS | 316 s, 1.15 GB | 268 s, 0.64 GB |
 
-The Model counts skipped reads per page (a range read skips each of its pages), which
-accounts for part of its higher skipped counts. The control model's own accounted memory at
+The Model counts skipped reads per page (a range read skips each of its pages); that this
+accounts for its higher skipped counts is an inference (racer-sim not traced). The control model's own accounted memory at
 50,000 nodes is 3,639 B/node (`combined.control_memory`).
 
 Membership skew at the end, enrolled counts and membership versions match exactly in every
