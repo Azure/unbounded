@@ -4,16 +4,23 @@
 
 ## Overview
 
-Project Signal establishes a reproducible certification lifecycle for compute
-capacity. **A Suite defines what runs, a Profile selects participants, and a Run
-pins the execution plan and records its outcome.**
+Project Signal is the common, open-source, provider-agnostic certification
+platform for compute and infrastructure capacity. All certification tests,
+including deployment-specific tests, execute through Signal workflows rather
+than a separate certification orchestrator. Diagnostic implementations are
+supplied as test images and scripts, not embedded in controller policy.
+
+**A Suite defines what runs, a Profile selects participants, and a Run pins the
+execution plan and records its outcome.**
 Signal owns certification policy and eligibility; Argo Workflows sequences
 execution; an adapter runs the selected backend and reports evidence.
 
-The initial design covers operator-requested certification, retained evidence,
-and eligibility projection. Recurring trust maintenance and automated lifecycle
-recovery are separate extensions. Existing controllers retain ownership of
-provisioning and host operations.
+The initial certification scope is Day 0 qualification, including sustained
+full-load testing and per-device health evidence. The current runtime provides
+operator-requested execution, retained evidence, and eligibility projection;
+it is a foundation, not complete coverage of that scope. Day 1 operations remain
+undefined. Existing controllers retain ownership of provisioning and host
+operations; this design adds no separate workload or recovery category.
 
 ## Problem and boundary
 
@@ -23,7 +30,9 @@ were tested; whether execution completed; what the diagnostic verdict was; and
 whether temporary workloads and reservations were released.
 
 Signal provides that certification record without becoming another provisioner,
-workload scheduler, or host-operation executor.
+workload scheduler, or host-operation executor. It is not limited to GPU
+diagnostics: test domain and deployment-specific behavior belong in supplied
+suites, while orchestration and result handling remain common.
 
 ```mermaid
 flowchart LR
@@ -36,6 +45,24 @@ flowchart LR
     Results --> Controller["Signal: validate and retain evidence"]
     Controller --> State["Run status and Node eligibility"]
 ```
+
+## Certification scope
+
+| Domain | Required coverage |
+|---|---|
+| Accelerators | Inventory, compute, device memory, device interconnect, and multi-node collective/RDMA behavior |
+| Sustained node burn | Approximately one week at full load, with per-device load coverage and health evidence throughout the run |
+| Storage | Scratch, shared, checkpoint, and attached-volume paths supplied by the deployment |
+| Networking | General pod and IP connectivity and data-path behavior |
+| Host | CPU and host-level checks |
+| Optional performance | Service-transfer and image-pull tests, enabled explicitly rather than assumed for every certification |
+
+These are platform fit requirements, not claims that packaged suites or
+qualification evidence already exist. Test owners supply diagnostic procedures,
+thresholds, and evidence requirements. A long-running process or elapsed week
+alone is insufficient: qualification must establish the required load and health
+coverage for each device. Interruptions and missing intervals must remain
+visible and must not silently count as successful burn time.
 
 ## Resource model
 
@@ -119,25 +146,49 @@ backend evidence. Logs are bounded, not an unlimited archive. This stack has no
 automatic final-evidence retention policy; operators own access and retention.
 See [evidence and projection](#implementation-references).
 
+## Extension boundaries and current gaps
+
+The existing script bundle, ordered checks, Pod/MPIJob backends, resource
+requirements, and immutable Run/result identities provide a shared execution
+foundation. Pod checks permit zero GPUs; the current MPIJob contract requires
+a positive GPU count. Backend availability does not establish that a domain's
+tests, resource access, or acceptance policy are implemented.
+
+| Area | Existing foundation | Extension or qualification needed |
+|---|---|---|
+| Test coverage | Supplied scripts, a deployment-selected runner image, and per-check workload policy | Package and validate the required domain suites; support their approved inputs and resource access, including storage volumes |
+| Sustained burn | Per-check deadlines, typed results, and bounded backend evidence | Define and verify full-load duration, per-device sampling, health thresholds, and missing-coverage behavior across the week |
+| Scale | Immutable participant set and coordinated execution | Extend and validate the current eight-participant bound for larger qualification groups |
+| Interruption | Cancellation and inconclusive outcomes | Specify attempt history, retry/resume policy, and whether an interrupted burn must restart; do not infer completion from retries |
+| Evidence and reporting | Immutable, bounded Kubernetes evidence tied to Run identity | Define export and reporting contracts for long-duration evidence without putting full telemetry in Kubernetes objects |
+
+The workload policy currently exposes resources, privileges, host networking,
+and restricted host paths, not arbitrary Pod templates or volume claims.
+The participant ceiling is explicit in the API. See
+[`certificationsuite_types.go:21-67`](https://github.com/Azure/unbounded/blob/bb5da95a4b7031bcb6832a7db8f3b89bc3147636/api/signal/v1alpha1/certificationsuite_types.go#L21-L67)
+and
+[`certificationprofile_types.go:10-16`](https://github.com/Azure/unbounded/blob/bb5da95a4b7031bcb6832a7db8f3b89bc3147636/api/signal/v1alpha1/certificationprofile_types.go#L10-L16).
+
+Deployment-specific tests remain supplied suites. External evidence sinks and
+product-facing reports are integration boundaries to define, not already
+implemented plugins. Export must preserve Run identity, provenance, and verdict
+semantics; a reporting integration must not become a competing certification
+authority. These gaps are addressed within Signal, not by bypassing it with
+another test platform.
+
 ## Non-goals
 
-- Recurring or idle-triggered certification, automatic retries, fleet-wide
-  concurrency policy, queue integration, draining, or eviction.
-- Automatic remediation or creation of `MachineOperation` requests.
-- Rack/fabric gate graphs, additional workload backends, backend registries,
-  dashboards, or an external evidence/audit service.
-- A universal diagnostic suite, hardware-specific thresholds, or equivalence
-  between different runners.
+- Provisioning, host lifecycle execution, automatic remediation, or creation of
+  `MachineOperation` requests.
+- Defining Day 1 operations or a separate workload/recovery category.
+- Workload scheduling, draining, eviction, or queue integration.
+- Embedding deployment-specific diagnostics, storage services, or reporting
+  systems in the provider-agnostic core.
 
 Argo Workflows is required. MPI suites additionally require the MPI operator;
 Pod suites do not. Runner packaging and actual diagnostic coverage remain
 separate concerns. The stack's execution contracts do not by themselves prove
 accelerator health, collective correctness, or soak qualification.
-
-Future Day 1 extensions cover evidence freshness and revalidation. Future Day 2
-extensions request existing lifecycle operations without taking over their
-execution. **Operation completion must not restore trust without new
-certification evidence.** Neither extension is part of the current stack.
 
 ## Design requirements
 
@@ -159,6 +210,10 @@ certification evidence.** Neither extension is part of the current stack.
 6. **Retained evidence:** Final evidence must be persisted before terminal status
    and retained independently of temporary execution resources. Operators own
    evidence access and retention policy.
+7. **Common certification path:** Accelerator, storage, networking, host, and
+   explicitly enabled performance tests must use Signal workflows and the same
+   Run/result contract. Deployment-specific implementations must not require a
+   second certification orchestrator.
 
 ## Acceptance criteria
 
@@ -171,6 +226,13 @@ not reinterpret admitted policy or release resources belonging to another Run.
 These criteria establish correctness of the certification control plane, not
 hardware qualification. Qualification requires separate end-to-end evidence for
 the selected runner and environment.
+
+Platform acceptance additionally requires demonstrated coverage of the
+certification domains above, including the sustained full-load burn, per-device
+health evidence, and documented interruption handling. The current stack alone
+does not satisfy that broader acceptance bar. Closing these gaps requires
+separately reviewed implementation work, not an implicit expansion of the
+existing four PRs.
 
 ## Implementation baseline
 
