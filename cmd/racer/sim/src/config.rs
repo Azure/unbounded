@@ -155,6 +155,12 @@ pub struct NodeConfig {
     pub flights: u32,
     pub waiters_per_flight: u32,
     pub relay_transfers: u32,
+    /// Crypto jobs one worker may have submitted or waiting before a new request's verification
+    /// fails `Overloaded` and the server answers the unsigned overload head (`peer/server.rs`,
+    /// `racer_core::route::unverified_failure`): production `queue_entries` (256)
+    /// port slots plus as many admission waiters (`src/security.rs` `CryptoClient::new`,
+    /// `runtime/src/offload.rs` `AdmissionQueue::enter`). Zero is unbounded.
+    pub crypto_queue: u32,
     pub plaintext_bytes: u64,
     pub ciphertext_bytes: u64,
     pub dirty_bytes: u64,
@@ -251,6 +257,7 @@ impl Default for NodeConfig {
             flights: 64,
             waiters_per_flight: 64,
             relay_transfers: 16,
+            crypto_queue: 512,
             plaintext_bytes: 64 * MIB,
             ciphertext_bytes: 128 * MIB,
             dirty_bytes: 160 * MIB,
@@ -396,6 +403,7 @@ impl Config {
                             "flights" => node.flights = small()?,
                             "waiters_per_flight" => node.waiters_per_flight = small()?,
                             "relay_transfers" => node.relay_transfers = small()?,
+                            "crypto_queue" => node.crypto_queue = small()?,
                             "plaintext_bytes" => node.plaintext_bytes = n,
                             "ciphertext_bytes" => node.ciphertext_bytes = n,
                             "dirty_bytes" => node.dirty_bytes = n,

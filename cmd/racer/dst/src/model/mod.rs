@@ -48,8 +48,8 @@ use racer_core::{
         },
     },
     route::{
-        Fault, Hop, MAX_LINKS, RelayFailure, RelayPlan, Response, RouteFault, decide_hop,
-        relay_failure, search_budget,
+        Fault, Hop, MAX_LINKS, RelayFailure, RelayPlan, Response, RouteFault, UnverifiedFailure,
+        decide_hop, relay_failure, search_budget, unverified_failure,
     },
 };
 use racer_object_wire::model::{CacheKey, ObjectId, PageNumber};
@@ -211,6 +211,10 @@ pub struct ModelSpec {
     /// `Relay` transfers per worker; production's default unless a scenario overrides it
     /// (racer-sim `NodeConfig::relay_transfers`).
     pub relay_transfers: usize,
+    /// Crypto jobs one worker may hold before a new request's verification fails `Overloaded`
+    /// and the server answers the unsigned overload head (racer-sim `NodeConfig::crypto_queue`);
+    /// zero is unbounded.
+    pub crypto_queue: usize,
     /// Waiters per flight; production's default unless a scenario overrides it (racer-sim
     /// `NodeConfig::waiters_per_flight`).
     pub waiters_per_flight: usize,
@@ -250,6 +254,7 @@ impl Default for ModelSpec {
             random_churn: None,
             membership_lag: membership::LAG,
             relay_transfers: relay_transfers(),
+            crypto_queue: crypto_queue(),
             waiters_per_flight: flight_limits().waiters_per_flight,
             checks: Vec::new(),
         }
@@ -1748,6 +1753,27 @@ impl<'s> Model<'s> {
             // (`src/worker.rs` `WorkerPair`).
             let costs = self.fabric.costs;
             let conn = self.conn_worker(mid);
+            let m = &self.msgs[&mid];
+            let bound = self.spec.crypto_queue;
+            if bound != 0 && self.fabric.crypto_outstanding(now, at, conn) >= bound {
+                // The crypto submission fails `Overloaded` before any key work (racer-sim `hop`).
+                self.report.counters.verify_sheds += 1;
+                // The last link's sender sees the connection fail or an unsigned overload at
+                // once: not silence.
+                self.last_hops.remove(&mid);
+                let m = self.msgs.get_mut(&mid).expect("message");
+                let previous = m.path.pop().expect("a request path");
+                if m.path.is_empty() {
+                    m.path.push(previous);
+                }
+                // Production answers the unsigned overload head (`peer/server.rs`); the previous
+                // holder reads it as `Overloaded` (`peer/transport.rs`).
+                let fault = match unverified_failure(Fault::Overloaded) {
+                    UnverifiedFailure::Overloaded => Fault::Overloaded,
+                    UnverifiedFailure::Close => Fault::Io,
+                };
+                return self.fail_hop(mid, previous, fault);
+            }
             let mut ready = self.fabric.crypto(now, at, conn, costs.crypto_verify_ns);
             if at == m.dest {
                 let w = owner_worker(m.page, self.spec.workers.max(1)) as u8;
@@ -2282,14 +2308,17 @@ impl<'s> Model<'s> {
     }
 
     fn reply(&mut self, asker: &Asker, to: u32, kind: ResponseKind) {
-        self.release_relays(asker.msg);
         let own = self.answering(asker, to, self.now());
         let route = Self::back(asker, to);
         if !self.alive(&route) {
+            self.release_relays(asker.msg);
             return;
         }
         let ready = self.sign(to, asker.msg);
         let at = self.message_back(ready, &route);
+        // Production keeps each relay's `Relay` reservation until it has written the answer
+        // upstream (`peer/server.rs` `send_http_response` clears `relay.reservation`).
+        self.release_relays_at(asker.msg, at);
         if let Some(ping) = asker.ping {
             // A signed answer: alive when the peer itself answered, silent when a relay
             // answered `Unavailable` (production `CandidatePolicy::ping`).
@@ -2935,6 +2964,13 @@ fn relay_transfers() -> usize {
     racer_core::admission::Limits::default()
         .relay_transfers
         .get()
+}
+
+/// Production crypto submissions per worker: `queue_entries` port slots plus as many admission
+/// waiters (`src/security.rs` `CryptoClient::new`, `runtime/src/offload.rs`
+/// `AdmissionQueue::enter`), racer-sim `NodeConfig::crypto_queue`.
+fn crypto_queue() -> usize {
+    2 * racer_core::admission::Limits::default().queue_entries.get()
 }
 
 /// Production per-worker flight bounds (`racer_core::admission::Limits::default`, racer-sim

@@ -265,6 +265,40 @@ fn two_thousand_nodes_cold_start() {
     cold_start(2000);
 }
 
+/// A crypto queue far below production's sheds request verifications at the owners. Each shed is
+/// the unsigned overload head (`racer_core::route::unverified_failure`), which the walk takes to
+/// the reader's helper: every read ends, failures stay admission or exhausted retries, and origin
+/// traffic stays bounded.
+#[test]
+fn verification_sheds_send_readers_to_helpers() {
+    let nodes = 400;
+    let mut config = quiet(nodes);
+    config.duration_ns = 30 * SECONDS;
+    config.storms = vec![Storm::new(0, 0, nodes, 10 * MILLIS)];
+    config.node.crypto_queue = 4;
+    let report = run(config.clone(), 8);
+    let total = u64::from(nodes) * pages(&config);
+    let failed = counter(&report, "reads_failed");
+    assert_eq!(
+        counter(&report, "reads_completed") + failed,
+        total,
+        "{report}"
+    );
+    assert!(counter(&report, "verify_sheds_dest") > 0, "{report}");
+    assert!(counter(&report, "helper_probes") > 0, "{report}");
+    assert_eq!(
+        failed,
+        counter(&report, "error_overloaded")
+            + counter(&report, "error_flight_full")
+            + counter(&report, "error_unavailable"),
+        "{report}"
+    );
+    let max = report["origin_per_page"]["max_requests_per_page"]
+        .as_u64()
+        .unwrap();
+    assert!((1..=topology::REPLICAS as u64).contains(&max), "{max}");
+}
+
 fn cold_start(nodes: u32) {
     let mut config = quiet(nodes);
     // Long enough for every read to end (read timeout is 10 s).

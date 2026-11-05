@@ -123,7 +123,17 @@ fn model_memory_per_node() {
             ms => ms * 1_000_000,
         }
     });
-    let scenario = scenarios::cold_start_with(nodes, attempt);
+    let mut scenario = scenarios::cold_start_with(nodes, attempt);
+    // `MODEL_CRYPTO_QUEUE`, `MODEL_RELAY_TRANSFERS`: override the production defaults.
+    if let Some(spec) = scenario.model.as_mut() {
+        let spec = std::rc::Rc::get_mut(spec).unwrap();
+        if let Ok(q) = std::env::var("MODEL_CRYPTO_QUEUE") {
+            spec.crypto_queue = q.parse().unwrap();
+        }
+        if let Ok(r) = std::env::var("MODEL_RELAY_TRANSFERS") {
+            spec.relay_transfers = r.parse().unwrap();
+        }
+    }
     let (outcome, report) = model::run(&scenario, Choices::seeded(8));
     let status = std::fs::read_to_string("/proc/self/status").unwrap();
     let hwm_kib: u64 = status

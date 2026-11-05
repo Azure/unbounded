@@ -59,3 +59,35 @@ fn model_scenario_checks_fail_the_run() {
     let failure = scenario.run(Choices::seeded(1)).failure.unwrap();
     assert_eq!(failure.name, "never");
 }
+
+/// A crypto queue far below production's sheds request verifications at the owners with the
+/// unsigned overload head (racer-sim `verification_sheds_send_readers_to_helpers`): every read
+/// ends and origin traffic stays bounded.
+#[test]
+fn verification_sheds_end_every_read() {
+    let spec = ModelSpec {
+        storms: vec![Storm {
+            at: 0,
+            object: 0,
+            first: 0,
+            nodes: 400,
+            window: 10_000_000,
+            range: None,
+        }],
+        crypto_queue: 4,
+        ..ModelSpec::default()
+    };
+    let total = 400 * u64::from(spec.pages_per_object);
+    let scenario = Scenario::new("verify-sheds").nodes(400).model(spec);
+    let (outcome, report) = model::run(&scenario, Choices::seeded(8));
+    assert_eq!(outcome.failure, None, "{report:#}");
+    let counters = &report["metrics"]["counters"];
+    let ended =
+        counters["reads_completed"].as_u64().unwrap() + counters["reads_failed"].as_u64().unwrap();
+    assert_eq!(ended, total);
+    assert!(counters["verify_sheds"].as_u64().unwrap() > 0, "{counters}");
+    let max = report["origin_per_page"]["max_requests_per_page"]
+        .as_u64()
+        .unwrap();
+    assert!((1..=topology::REPLICAS as u64 * 2).contains(&max), "{max}");
+}

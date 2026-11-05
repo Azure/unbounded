@@ -49,7 +49,10 @@ use racer_core::read::{
 use racer_core::read::{ServeAction, ServeFacts, copy_join_allowed, serve_action, serve_deadline};
 use racer_core::route::Fault;
 use racer_core::route::MAX_LINKS;
-use racer_core::route::{Hop, RelayFailure, RelayPlan, Response, decide_hop, relay_failure};
+use racer_core::route::{
+    Hop, RelayFailure, RelayPlan, Response, UnverifiedFailure, decide_hop, relay_failure,
+    unverified_failure,
+};
 use racer_core::time::SplitMix64;
 use serde_json::{Value, json};
 use topology::{PathQuery, Placement};
@@ -3623,10 +3626,37 @@ impl NodeWorld {
         if !m.verified {
             // Production verifies on the crypto helper and dispatches or relays only after.
             let conn = (m.probe % u64::from(self.fabric.workers)) as u8;
+            let bound = self.config.node.crypto_queue as usize;
+            let dest = m.dest == at;
+            let (shed_name, wait_name) = if dest {
+                ("verify_sheds_dest", "verify_wait_dest_ns")
+            } else {
+                ("verify_sheds_relay", "verify_wait_relay_ns")
+            };
+            if bound != 0 && self.fabric.crypto_outstanding(now, at, conn) >= bound {
+                self.metrics.incr(shed_name);
+                // The last link's sender sees the connection fail or an unsigned overload at
+                // once: not silence.
+                self.last_hops.remove(&mid);
+                let m = self.msgs.get_mut(&mid).expect("message");
+                let previous = m.path.pop().expect("a request path");
+                if m.path.is_empty() {
+                    m.path.push(previous);
+                }
+                // Production answers the unsigned overload head (`peer/server.rs`); the previous
+                // holder reads it as `Overloaded` (`peer/transport.rs`).
+                let fault = match unverified_failure(Fault::Overloaded) {
+                    UnverifiedFailure::Overloaded => Fault::Overloaded,
+                    UnverifiedFailure::Close => Fault::Io,
+                };
+                self.fail_hop(mid, previous, fault);
+                return;
+            }
             let ready = self
                 .fabric
                 .crypto(now, at, conn, self.fabric.costs.verify_ns);
             self.msgs.get_mut(&mid).expect("message").verified = true;
+            self.metrics.observe(wait_name, ready.saturating_sub(now));
             if ready > now {
                 self.engine.at(ready, Event::Hop { msg: mid });
                 return;
@@ -4132,6 +4162,14 @@ impl NodeWorld {
             let mut t = self.fabric.crypto(ready, from, conn, costs.sign_ns);
             for hop in route.windows(2) {
                 t = self.fabric.message(t, hop[0], hop[1]);
+            }
+            // Production keeps each relay's `Relay` reservation until it has written the answer
+            // upstream (`peer/server.rs` `send_http_response` clears `relay.reservation`): hold
+            // them until the answer arrives.
+            if !m.relays.is_empty() && t > now {
+                let id = self.fresh();
+                self.held.insert(id, m.relays);
+                self.engine.at(t, Event::Release { id });
             }
             t
         };

@@ -97,6 +97,10 @@ pub struct Fabric {
     /// `nodes * workers` entries: production pairs each worker with its own crypto helper
     /// (`src/worker.rs` `WorkerPair`).
     pub crypto_free: Vec<Nanos>,
+    /// `nodes * workers` entries: completion times of the jobs each crypto helper holds, oldest
+    /// first. Production bounds a worker's crypto submissions (`src/security.rs`
+    /// `CryptoClient::new`, `runtime/src/offload.rs` `AdmissionQueue::enter`).
+    pub crypto_jobs: Vec<std::collections::VecDeque<Nanos>>,
     pub workers: u8,
     pub nic_bps: u64,
     pub chunk_bytes: u64,
@@ -130,6 +134,7 @@ impl Fabric {
             disk_write_free: vec![0; n],
             cpu_free: vec![0; n * workers as usize],
             crypto_free: vec![0; n * workers as usize],
+            crypto_jobs: vec![std::collections::VecDeque::new(); n * workers as usize],
             workers,
             nic_bps: costs.nic_bytes_per_sec,
             chunk_bytes: costs.nic_chunk_bytes.max(1),
@@ -232,7 +237,19 @@ impl Fabric {
     pub fn crypto(&mut self, now: Nanos, node: u32, worker: u8, ns: Nanos) -> Nanos {
         let i = node as usize * self.workers as usize + (worker % self.workers) as usize;
         let service = self.scale(node, ns);
-        reserve(&mut self.crypto_free[i], now, service).1
+        let end = reserve(&mut self.crypto_free[i], now, service).1;
+        self.crypto_jobs[i].push_back(end);
+        end
+    }
+
+    /// Crypto jobs of one worker of `node` not yet complete at `now`.
+    pub fn crypto_outstanding(&mut self, now: Nanos, node: u32, worker: u8) -> usize {
+        let i = node as usize * self.workers as usize + (worker % self.workers) as usize;
+        let jobs = &mut self.crypto_jobs[i];
+        while jobs.front().is_some_and(|&end| end <= now) {
+            jobs.pop_front();
+        }
+        jobs.len()
     }
 
     /// Forget queued work on a crashed node.
@@ -253,6 +270,9 @@ impl Fabric {
         for v in &mut self.crypto_free[i * w..(i + 1) * w] {
             *v = now;
         }
+        for jobs in &mut self.crypto_jobs[i * w..(i + 1) * w] {
+            jobs.clear();
+        }
     }
 
     pub fn approximate_bytes(&self) -> usize {
@@ -263,8 +283,10 @@ impl Fabric {
                 + self.disk_read_free.capacity()
                 + self.disk_write_free.capacity()
                 + self.cpu_free.capacity()
-                + self.crypto_free.capacity())
+                + self.crypto_free.capacity()
+                + self.crypto_jobs.iter().map(|j| j.capacity()).sum::<usize>())
                 * 8
+            + self.crypto_jobs.capacity() * std::mem::size_of::<std::collections::VecDeque<Nanos>>()
             + self.rtt.approximate_bytes()
     }
 }

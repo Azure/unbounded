@@ -94,6 +94,8 @@ pub struct Counters {
     pub stored_pages_max: u64,
     /// Relays that found no free `Relay` transfer (racer-sim fails the hop `Overloaded`).
     pub relay_sheds: u64,
+    /// Requests whose verification found the crypto queue full (racer-sim `verify_sheds`).
+    pub verify_sheds: u64,
     /// Route searches refused with every search slot busy (racer-sim `route_search_overloaded`).
     pub search_sheds: u64,
     /// Membership changes (racer-sim `membership_changes`).
@@ -204,6 +206,7 @@ impl Report {
                     "late_answers": c.late_answers,
                     "relays": c.relays,
                     "relay_sheds": c.relay_sheds,
+                    "verify_sheds": c.verify_sheds,
                     "search_sheds": c.search_sheds,
                     "membership_changes": c.membership_changes,
                     "membership_publications": c.membership_publications,
