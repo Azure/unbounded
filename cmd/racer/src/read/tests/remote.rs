@@ -951,7 +951,12 @@ fn metadata_coordinator_with_newer_publication(
         // membership has advanced and no longer includes this candidate.
     }
     let buffers = BufferPool::new(admission.clone());
-    let index = Rc::new(Index::new(WorkerId(0), 16, availability.clone()));
+    let index = Rc::new(Index::new(
+        WorkerId(0),
+        16,
+        availability.clone(),
+        crate::test_support::clock(),
+    ));
     let segments = Rc::new(page_alloc::Segments::new(64 * 1024 * 1024));
     let slabs = Rc::new(crate::test_support::simulated_slab(page_alloc::Slab::new(
         "unused/absence-slabs/worker-0-slab-0.dat".into(),

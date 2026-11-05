@@ -335,6 +335,7 @@ fn disposable_loop_devices_read_only_bind_restart() {
         crate::model::WorkerId(0),
         16,
         crate::test_support::availability(),
+        crate::test_support::clock(),
     ));
     let checkpoint = crate::store::checkpoint::Checkpointer::new(
         config.slab_directory.clone(),

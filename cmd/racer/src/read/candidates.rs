@@ -4293,7 +4293,12 @@ pub(super) mod tests {
             error: Error::Unavailable,
         });
         let mut policy = policy(owner.clone(), peers.clone());
-        let index = Index::new(WorkerId(0), 8, crate::test_support::availability());
+        let index = Index::new(
+            WorkerId(0),
+            8,
+            crate::test_support::availability(),
+            crate::test_support::clock(),
+        );
         index.set_page_capacity(1).unwrap();
         index
             .restore(IndexSnapshot {
@@ -4442,6 +4447,7 @@ pub(super) mod tests {
                 crate::model::WorkerId(0),
                 1,
                 availability.clone(),
+                crate::test_support::clock(),
             ));
             let writer = Rc::new(crate::store::StoreWriter::new(
                 index,

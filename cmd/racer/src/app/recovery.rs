@@ -917,6 +917,7 @@ mod tests {
                     shard.worker,
                     4,
                     crate::test_support::availability(),
+                    crate::test_support::clock(),
                 ));
                 let segments = Rc::new(Segments::new(shard.geometry.segment_bytes));
                 segments
@@ -1239,6 +1240,7 @@ mod tests {
             WorkerId(0),
             16,
             crate::test_support::availability(),
+            crate::test_support::clock(),
         ));
         let segments = Rc::new(Segments::new(g.segment_bytes));
         segments
@@ -1481,7 +1483,12 @@ mod tests {
         )
         .unwrap();
         assert_eq!(chosen.sequence, 1);
-        let live = Index::new(WorkerId(0), 1, crate::test_support::availability());
+        let live = Index::new(
+            WorkerId(0),
+            1,
+            crate::test_support::availability(),
+            crate::test_support::clock(),
+        );
         live.set_page_capacity(16).unwrap();
         live.restore(chosen.shards.into_iter().next().unwrap().index)
             .unwrap();

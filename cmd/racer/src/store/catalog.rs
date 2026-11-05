@@ -56,6 +56,9 @@ pub struct Index {
     active_writes: Rc<RefCell<HashMap<SegmentId, usize>>>,
 
     holds: RefCell<super::holds::Holds>,
+
+    /// Worker time for freshness, retention scoring, and hold expiry.
+    clock: racer_io::Clock,
 }
 /// Production mappings use randomized hashing, as did the original catalog.
 #[cfg(not(test))]
@@ -579,7 +582,7 @@ impl Index {
     }
 
     pub(super) fn restore_holds(&self, segments: &[page_alloc::SegmentSnapshot]) -> Result<()> {
-        let now = uring_runtime::environment::wall_now();
+        let now = self.clock.wall_now();
         let mut deadlines = HashMap::default();
         for segment in segments {
             for (offset, until) in &segment.retained_records {
@@ -597,7 +600,7 @@ impl Index {
                 let Some(monotonic) = until
                     .duration_since(now)
                     .ok()
-                    .and_then(|ttl| uring_runtime::environment::now().checked_add(ttl))
+                    .and_then(|ttl| self.clock.now().checked_add(ttl))
                 else {
                     continue;
                 };
@@ -645,7 +648,7 @@ impl Index {
         snapshot: &IndexSnapshot,
         segments: &[page_alloc::SegmentSnapshot],
     ) -> Result<()> {
-        let now = uring_runtime::environment::wall_now();
+        let now = self.clock.wall_now();
         let mut offsets = HashSet::default();
         for segment in segments {
             for (offset, until) in &segment.retained_records {
@@ -677,8 +680,10 @@ impl Index {
         worker: WorkerId,
         metadata_capacity: usize,
         availability: Rc<crate::control::Availability>,
+        clock: racer_io::Clock,
     ) -> Self {
         Self {
+            clock,
             worker,
             metadata_capacity,
             page_capacity: Cell::new(65536),
@@ -798,7 +803,7 @@ impl Index {
     fn victim(&self, state: &State) -> Option<PageId> {
         const BUDGET: usize = 64;
         let retention = self.retention();
-        let scoring = retention.scoring_at(uring_runtime::environment::now(), self.disk_capacity());
+        let scoring = retention.scoring_at(self.clock.now(), self.disk_capacity());
         let eligible =
             |page: &PageId, _: &IndexedPage| (!self.is_held(page)).then(|| scoring.rank(page));
         let over = scoring.over_share_candidates(BUDGET);
@@ -956,7 +961,7 @@ impl Index {
             .borrow()
             .current
             .get(object)
-            .filter(|v| uring_runtime::environment::wall_now() < v.expires_at.as_system_time())
+            .filter(|v| self.clock.wall_now() < v.expires_at.as_system_time())
             .cloned())
     }
     /// Page-zero owner only, after fresh revalidation. Atomically retain the
@@ -969,7 +974,7 @@ impl Index {
         self.publish_version(metadata.immutable())?;
         let mut s = self.state.borrow_mut();
         s.current.remove(&metadata.version.object);
-        if uring_runtime::environment::wall_now() < metadata.expires_at.as_system_time() {
+        if self.clock.wall_now() < metadata.expires_at.as_system_time() {
             s.current.insert(
                 metadata.version.object.clone(),
                 CurrentVersion {
@@ -1109,6 +1114,7 @@ impl Index {
             self.worker,
             self.metadata_capacity,
             self.availability.clone(),
+            self.clock.clone(),
         );
         replacement.residency = self.residency.clone();
         replacement.set_page_capacity(self.page_capacity.get())?;
@@ -1176,7 +1182,7 @@ impl Index {
         let retention = self.retention();
         self.segment_score_with(
             segment,
-            &retention.scoring_at(uring_runtime::environment::now(), self.disk_capacity()),
+            &retention.scoring_at(self.clock.now(), self.disk_capacity()),
         )
     }
     fn segment_score_with(
@@ -1363,7 +1369,7 @@ impl SegmentClock {
     /// Rank at most 64 slots before eviction. Busy segments remain Evicting until
     /// a later poll; ownership and heat cannot prevent eventual reclamation.
     pub fn reclaim_now(&self) -> Result<()> {
-        self.reclaim_at(uring_runtime::environment::now())
+        self.reclaim_at(self.index.clock.now())
     }
     /// [`Self::reclaim_now`] with retention heat evaluated at an explicit time.
     pub fn reclaim_at(&self, now: std::time::Instant) -> Result<()> {
@@ -1408,6 +1414,7 @@ mod tests {
                 WorkerId(0),
                 1,
                 crate::test_support::availability(),
+                crate::test_support::clock(),
             )),
             segments.clone(),
             2,
@@ -1442,7 +1449,12 @@ mod tests {
         );
     }
     fn index(capacity: usize) -> Index {
-        Index::new(WorkerId(0), capacity, crate::test_support::availability())
+        Index::new(
+            WorkerId(0),
+            capacity,
+            crate::test_support::availability(),
+            crate::test_support::clock(),
+        )
     }
     #[test]
     fn reclaim_and_index_victim_prepare_one_scoring_pass() {
@@ -2714,6 +2726,7 @@ mod priority_tests {
             crate::test_support::availability_for(
                 weights.iter().map(|(name, _)| cache(name)).collect(),
             ),
+            crate::test_support::clock(),
         ));
         index.set_page_capacity(pages).unwrap();
         let table = crate::priority::Weights::default();
@@ -2930,6 +2943,7 @@ mod priority_tests {
             WorkerId(0),
             64,
             crate::test_support::availability_for(vec![cache("a"), cache("z")]),
+            crate::test_support::clock(),
         ));
         index.set_page_capacity(84).unwrap();
         let segments = segments(50);

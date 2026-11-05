@@ -232,6 +232,7 @@ mod index_pressure {
             WorkerId(0),
             2,
             crate::test_support::availability(),
+            crate::test_support::clock(),
         ));
         index.set_page_capacity(2).unwrap();
         let segments = Rc::new(Segments::new(512));
@@ -1357,7 +1358,12 @@ impl Fixture {
         )));
         let reactor = Rc::new(Reactor::new(admission.clone()));
         let pool = BufferPool::new(admission.clone());
-        let index = Rc::new(catalog::Index::new(WorkerId(0), 16, availability.clone()));
+        let index = Rc::new(catalog::Index::new(
+            WorkerId(0),
+            16,
+            availability.clone(),
+            crate::test_support::clock(),
+        ));
         let segments = Rc::new(Segments::new(32 * 1024 * 1024));
         let eviction = Rc::new(catalog::SegmentClock::new(
             index.clone(),
@@ -4476,6 +4482,7 @@ mod checkpoint {
             WorkerId(0),
             capacity,
             crate::test_support::availability(),
+            crate::test_support::clock(),
         ));
         let segments = Rc::new(Segments::new(g.segment_bytes));
         segments

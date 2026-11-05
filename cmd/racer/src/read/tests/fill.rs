@@ -3152,6 +3152,7 @@ impl Fixture {
             WorkerId(0),
             capacity,
             crate::control::for_caches(self.keys.clone(), vec![self.context.object.cache.clone()]),
+            crate::test_support::clock(),
         ))
     }
 
@@ -3258,6 +3259,7 @@ impl Fixture {
                     WorkerId(0),
                     settings.metadata,
                     availability.clone(),
+                    crate::test_support::clock(),
                 )),
                 owners: owners.clone(),
                 fill: fill.clone(),
@@ -3349,7 +3351,12 @@ fn fixture_with_caches(
     let buffers = BufferPool::new(admission.clone());
     let memory = Rc::new(MemoryCache::new(buffers.clone(), availability.clone()));
     let reactor = Rc::new(Reactor::new(admission.clone()));
-    let index = Rc::new(Index::new(worker, 16, availability.clone()));
+    let index = Rc::new(Index::new(
+        worker,
+        16,
+        availability.clone(),
+        crate::test_support::clock(),
+    ));
     let segments = Rc::new(page_alloc::Segments::new(64 * 1024 * 1024));
     static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let directory = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))

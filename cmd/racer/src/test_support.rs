@@ -569,7 +569,12 @@ impl ReadWorker {
             .unwrap(),
         );
         let buffers = BufferPool::new(admission.clone());
-        let index = Rc::new(Index::new(WorkerId(0), 16, availability.clone()));
+        let index = Rc::new(Index::new(
+            WorkerId(0),
+            16,
+            availability.clone(),
+            crate::test_support::clock(),
+        ));
         let segments = Rc::new(page_alloc::Segments::new(64 * 1024 * 1024));
         // Reads use an empty disk index. No slabs need to be opened or written.
         let slabs = Rc::new(crate::test_support::simulated_slab(page_alloc::Slab::new(
@@ -1052,4 +1057,13 @@ pub(crate) fn simulated_slab<C: page_alloc::Charge>(
         slab.simulate_in(sim.os().clone());
     }
     slab
+}
+
+/// The selected thread environment's clock, shared with any simulated world.
+// MIGRATION: test fixtures read the thread environment until tests pass a
+// WorkerCtx explicitly.
+pub fn clock() -> racer_io::Clock {
+    uring_runtime::environment::Environment::current()
+        .worker_ctx()
+        .clock
 }

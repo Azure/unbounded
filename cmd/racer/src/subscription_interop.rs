@@ -277,7 +277,12 @@ impl SubscriptionFixture {
             )
             .unwrap(),
         );
-        let index = Rc::new(Index::new(WorkerId(0), 16, availability.clone()));
+        let index = Rc::new(Index::new(
+            WorkerId(0),
+            16,
+            availability.clone(),
+            reactor.ctx().clock.clone(),
+        ));
         let segments = Rc::new(page_alloc::Segments::new(64 * 1024 * 1024));
         let slabs = Rc::new(page_alloc::Slab::new(
             root.join("slabs/worker-0-slab-0.dat"),

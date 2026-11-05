@@ -1711,6 +1711,7 @@ impl WorkerApplication {
             worker,
             limits.metadata_entries.get(),
             availability.clone(),
+            runtime.reactor.ctx().clock.clone(),
         ));
         let segments = Rc::new(page_alloc::Segments::new(config.segment_bytes));
         let eviction = Rc::new(SegmentClock::with_budget(

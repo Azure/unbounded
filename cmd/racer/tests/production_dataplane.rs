@@ -805,7 +805,12 @@ fn open_fixture_storage(
     buffers: BufferPool,
     availability: Rc<racer::control::Availability>,
 ) -> (Rc<Index>, Rc<StoreReader>, Rc<StoreWriter>) {
-    let index = Rc::new(Index::new(worker, entries, availability.clone()));
+    let index = Rc::new(Index::new(
+        worker,
+        entries,
+        availability.clone(),
+        reactor.ctx().clock.clone(),
+    ));
     let segments = Rc::new(page_alloc::Segments::new(64 * 1024 * 1024));
     let slabs = Rc::new(page_alloc::Slab::new(
         path.join(format!("worker-{}-slab-0.dat", worker.0)),

@@ -1282,7 +1282,12 @@ pub(crate) mod tests {
             mono + Duration::from_secs(4)
         ));
         assert_eq!(clock.inner.epoch(), 2);
-        let index = Index::new(WorkerId(0), 4, crate::test_support::availability());
+        let index = Index::new(
+            WorkerId(0),
+            4,
+            crate::test_support::availability(),
+            crate::test_support::clock(),
+        );
         let old = metadata("old", 7);
         let mut new = metadata("new", 900);
         new.expires_at = ExpiresAt::test_time(SystemTime::now() + Duration::from_secs(60));
