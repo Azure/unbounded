@@ -27,7 +27,9 @@
 //! monotonic clock only; a hold counts until swept. Eviction is one scored
 //! segment clock ([`DiskIndex::reclaim`]) that ages heat as it visits.
 //! Removing a cache or a segment walks only that cache's or segment's
-//! intrusive list. An entry is at most 48 bytes.
+//! intrusive list. An entry is at most 56 bytes: 48 for the record, segment
+//! and cache lists, plus 8 for the publish-order (age) list that
+//! [`AgeCursor`] walks.
 //!
 //! # Replaces (wiring map)
 //!
@@ -194,6 +196,17 @@ pub struct Written {
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct HoldId(u64);
 
+/// Number of independent [`AgeCursor`]s per index.
+pub const AGE_CURSORS: usize = 4;
+
+/// One of [`AGE_CURSORS`] resumable walks over stored entries in publish
+/// order (oldest first). The index repairs a cursor when the entry it last
+/// returned is removed, so a walk never skips an entry that was stored when
+/// the walk passed its position; a replaced entry moves to the tail and is
+/// visited again.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct AgeCursor(pub u8);
+
 /// Bounds for one [`DiskIndex::reclaim`] call.
 #[derive(Clone, Copy, Debug)]
 pub struct ReclaimBudget {
@@ -207,7 +220,7 @@ pub struct ReclaimBudget {
     pub max_entries: usize,
 }
 
-/// One slot's record. Kept at 48 bytes; see the size test.
+/// One slot's record. Kept at 56 bytes; see the size test.
 #[derive(Clone, Copy, Debug)]
 struct Entry {
     generation: u64,
@@ -226,6 +239,10 @@ struct Entry {
 
     cache_next: u32,
 
+    age_prev: u32,
+
+    age_next: u32,
+
     holders: u16,
 
     cache: u16,
@@ -243,6 +260,8 @@ impl Entry {
         seg_next: NIL,
         cache_prev: NIL,
         cache_next: NIL,
+        age_prev: NIL,
+        age_next: NIL,
         holders: 0,
         cache: 0,
         flags: 0,
@@ -358,6 +377,13 @@ pub struct DiskIndex {
     holds_unused: usize,
 
     hand: usize,
+
+    age_head: u32,
+
+    age_tail: u32,
+
+    /// Last entry returned per cursor; `NIL` restarts at the oldest entry.
+    cursors: [u32; AGE_CURSORS],
 }
 
 impl DiskIndex {
@@ -384,6 +410,9 @@ impl DiskIndex {
             next_hold: 0,
             holds_unused: 0,
             hand: 0,
+            age_head: NIL,
+            age_tail: NIL,
+            cursors: [NIL; AGE_CURSORS],
         })
     }
 
@@ -495,6 +524,7 @@ impl DiskIndex {
             meta.bytes += length;
             this.link(slot.0, List::Segment);
             this.link(slot.0, List::Cache);
+            this.age_push(slot.0);
         });
     }
 
@@ -502,6 +532,7 @@ impl DiskIndex {
         self.update(slot, |this| {
             this.unlink(slot.0, List::Segment);
             this.unlink(slot.0, List::Cache);
+            this.age_unlink(slot.0);
             let entry = &mut this.entries[slot.0 as usize];
             debug_assert!(entry.stored());
             let removed = Removed {
@@ -520,6 +551,89 @@ impl DiskIndex {
             this.settle_cache(removed.cache);
             removed
         })
+    }
+
+    fn age_push(&mut self, slot: u32) {
+        let tail = self.age_tail;
+        let entry = &mut self.entries[slot as usize];
+        entry.age_prev = tail;
+        entry.age_next = NIL;
+        if tail == NIL {
+            self.age_head = slot;
+        } else {
+            self.entries[tail as usize].age_next = slot;
+        }
+        self.age_tail = slot;
+    }
+
+    fn age_unlink(&mut self, slot: u32) {
+        let Entry {
+            age_prev: prev,
+            age_next: next,
+            ..
+        } = self.entries[slot as usize];
+        if prev == NIL {
+            self.age_head = next;
+        } else {
+            self.entries[prev as usize].age_next = next;
+        }
+        if next == NIL {
+            self.age_tail = prev;
+        } else {
+            self.entries[next as usize].age_prev = prev;
+        }
+        // A cursor parked on this entry resumes at its successor.
+        for cursor in &mut self.cursors {
+            if *cursor == slot {
+                *cursor = prev;
+            }
+        }
+    }
+
+    // ---- publish order ----
+
+    /// Restart `cursor` at the oldest stored entry.
+    pub fn age_reset(&mut self, cursor: AgeCursor) {
+        if let Some(position) = self.cursors.get_mut(usize::from(cursor.0)) {
+            *position = NIL;
+        }
+    }
+
+    /// Stored entries after `cursor`'s position, oldest first, skipping
+    /// caches being removed. Does not move the cursor; callers bound the walk
+    /// with [`Iterator::take`] and then call [`Self::age_seek`].
+    pub fn age_entries(
+        &self,
+        cursor: AgeCursor,
+    ) -> impl Iterator<Item = (PageSlot, EntryView)> + '_ {
+        let mut next = match self.cursors.get(usize::from(cursor.0)) {
+            Some(&NIL) | None => self.age_head,
+            Some(&slot) => self.entries[slot as usize].age_next,
+        };
+        std::iter::from_fn(move || {
+            while next != NIL {
+                let slot = PageSlot(next);
+                next = self.entries[next as usize].age_next;
+                if let Some(view) = self.get(slot) {
+                    return Some((slot, view));
+                }
+            }
+            None
+        })
+    }
+
+    /// Park `cursor` on stored `slot`, normally the last entry a walk
+    /// returned.
+    pub fn age_seek(&mut self, cursor: AgeCursor, slot: PageSlot) -> Result<()> {
+        if !self.entry(slot)?.stored() {
+            return Err(Error::Stale);
+        }
+        let position = self
+            .cursors
+            .get_mut(usize::from(cursor.0))
+            .ok_or(Error::InvalidConfiguration)?;
+        *position = slot.0;
+        Ok(())
     }
 
     // ---- caches ----
@@ -1107,6 +1221,20 @@ impl DiskIndex {
             assert_eq!(walked, meta.entries);
         }
         assert_eq!(self.expiry.len(), self.holds.len());
+        let stored = self.entries.iter().filter(|entry| entry.stored()).count();
+        let (mut walked, mut prev, mut cursor) = (0, NIL, self.age_head);
+        while cursor != NIL {
+            let entry = &self.entries[cursor as usize];
+            assert!(entry.stored());
+            assert_eq!(entry.age_prev, prev);
+            walked += 1;
+            prev = cursor;
+            cursor = entry.age_next;
+        }
+        assert_eq!((walked, prev), (stored, self.age_tail));
+        for cursor in self.cursors {
+            assert!(cursor == NIL || self.entries[cursor as usize].stored());
+        }
     }
 }
 
@@ -1150,10 +1278,57 @@ mod tests {
         index.publish(written)
     }
 
+    fn walk(index: &mut DiskIndex, cursor: AgeCursor, limit: usize) -> Vec<u32> {
+        let slots: Vec<u32> = index
+            .age_entries(cursor)
+            .take(limit)
+            .map(|(slot, _)| slot.0)
+            .collect();
+        if let Some(&last) = slots.last() {
+            index.age_seek(cursor, PageSlot(last)).unwrap();
+        }
+        slots
+    }
+
+    #[test]
+    fn age_cursors_resume_across_removal_and_replacement_without_skips() {
+        let segments = segments(8);
+        let mut index = DiskIndex::new(16, 16, 8).unwrap();
+        let cache = index.add_cache(CacheIdx(0)).unwrap();
+        for slot in [5, 1, 9, 3] {
+            write(&mut index, &segments, slot, cache, 512).unwrap();
+        }
+        let (a, b) = (AgeCursor(0), AgeCursor(1));
+        assert_eq!(walk(&mut index, a, 2), [5, 1]);
+        assert_eq!(walk(&mut index, b, 1), [5]);
+        // Removing the parked entry resumes at its successor.
+        index.remove(PageSlot(1)).unwrap();
+        // Replacing an entry moves it to the tail; it is visited again.
+        write(&mut index, &segments, 5, cache, 512).unwrap();
+        index.check_invariants();
+        assert_eq!(walk(&mut index, a, 8), [9, 3, 5]);
+        assert_eq!(walk(&mut index, b, 8), [9, 3, 5]);
+        // New publications are visited by a finished walk.
+        write(&mut index, &segments, 7, cache, 512).unwrap();
+        assert_eq!(walk(&mut index, a, 8), [7]);
+        // Removing the head and the parked tail restarts or resumes correctly.
+        index.remove(PageSlot(7)).unwrap();
+        index.remove(PageSlot(9)).unwrap();
+        index.check_invariants();
+        assert_eq!(walk(&mut index, a, 8), Vec::<u32>::new());
+        index.age_reset(b);
+        assert_eq!(walk(&mut index, b, 8), [3, 5]);
+        assert_eq!(index.age_seek(a, PageSlot(9)), Err(Error::Stale));
+        assert_eq!(
+            index.age_seek(AgeCursor(AGE_CURSORS as u8), PageSlot(3)),
+            Err(Error::InvalidConfiguration)
+        );
+    }
+
     #[test]
     fn entry_fits_target_size() {
         assert!(
-            std::mem::size_of::<Entry>() <= 48,
+            std::mem::size_of::<Entry>() <= 56,
             "{}",
             std::mem::size_of::<Entry>()
         );
