@@ -150,42 +150,48 @@ differences:
 ## Scale
 
 Tolerance for the scale cold start (seed 8, every node reads one 16-page object in 10 ms):
-Model failures within 2x of racer-sim's and the same order of magnitude. This is not met
-yet:
+Model failures within 2x of racer-sim's and the same order of magnitude. Met at 50,000; at
+10,000 the Model fails 2.7x racer-sim's count (same order, 0.31% against 0.11%); at 2,000
+racer-sim fails none, so a ratio does not apply (the Model fails 36 of 32,000).
 
-| Nodes | racer-sim failed | Model failed | Model retries | Model wall (release test) | Model peak RSS per node |
-|---|---|---|---|---|---|
-| 2,000 | 0 of 32,000 | 42 (0.13%) | 11,891 | 20 s with build | 77,365 B |
-| 10,000 | 180 (0.11%), 91,915 retries | 7,105 (4.4%) | 199,564 | 22 s with build | 87,821 B |
-| 50,000 | 24,742 (3.1%); 8 min 45 s, 8,041,764 KiB RSS | 235,631 (29%) | 1,695,494 | 3 min | 98,324 B |
+| Nodes | racer-sim failed | Model failed | Model retries | Model origin requests | Model wall (release test) | Model peak RSS per node |
+|---|---|---|---|---|---|---|
+| 2,000 | 0 of 32,000 | 36 (0.11%) | 10,608 | 34 | under 20 s with build | 77,365 B (not rerun) |
+| 10,000 | 180 (0.11%), 91,915 retries, 47 origin | 494 (0.31%) | 143,753 | 24 | 22 s with build | 77,869 B |
+| 50,000 | 24,742 (3.1%); 8 min 45 s, 8,041,764 KiB RSS | 10,046 (1.3%) | 865,291 | 16 | 2 min | 80,915 B |
 
-What changed, with evidence (`MODEL_DIAG=1`):
+What closed the gap, with evidence:
 
-- Every reader used to visit rank 0 first: the Model answered Rank with `Ranked::new`, whose
-  order is canonical, while production and racer-sim (`walk_ranking`, `world.rs:2324`) order a
-  non-owner's visits with `visit_order(Spread, ..)`. Only `owner0` ever shed. With Spread the
-  sheds split evenly over the three owners and median latency fell from 5.1 s to 0.24 s at 10k.
-- Flight tables used `FlightLimits::default` (1024 flights, 256 waiters); production and
-  racer-sim use 64 and 64 (`core/src/admission.rs`, `sim/src/config.rs` `NodeConfig`).
-  racer-sim rejects 153,034 serving-read joins at 10k, all `Overloaded` at owners.
-- Silence demotion (`demote_unanswered`) is production behavior and now modeled, but it
-  raises Model failures at 10k from 4,346 to 7,105; racer-sim has it on (`silence`,
-  `shed_busy`). Not explained yet; the Model lacks pings, which clear timed-out entries.
-- The 2 s attempt cap is now on by default; with Spread it no longer changes failure counts
-  (10k: 7,105 with, 6,923 without; 50k without silence: 219,355 with, 219,571 without).
+- Signatures. Production verifies every peer request on the crypto helper before the worker
+  dispatches it (`src/peer/server.rs` `verify_request_async`) and signs every response
+  (`sign_response`); racer-sim charges `sign_ns` per request and response and `verify_ns`
+  per hop (`send_reply`, `hop`). The Model charged neither, so an owner answered thousands
+  of sheds at once and walks failed within 250 ms, before any copy spread; four attempts
+  burned out in the first second. Now the requester signs, the destination verifies and
+  then takes `cpu.request_ns` on the page's worker FIFO, the responder signs before the
+  reply or body, and the requester charges `verify_ns` on arrival without waiting for it
+  (as racer-sim does). 10k: 7,105 to 494 failures; 50k: 235,631 to 10,046.
+  Divergence, production wins: racer-sim charges the destination's verify without delaying
+  dispatch; production awaits it. With racer-sim's form the Model fails 1,574 at 10k.
+- Visit order (`visit_order(Spread, ..)` for non-owners), production flight limits (64
+  flights, 64 waiters) and silence demotion, as before.
+- Silence pings are modeled (`poll_pings`, `ping_arrived`, `ping_done`; production
+  `CandidatePolicy::poll_pings` in `src/read/candidates.rs`). Only rank-0 timeouts ask for
+  one (`walk.rs` `RANK0_TIMEOUTS`); the cold start has none, so it sends no pings.
+  racer-sim's 3,986 pings at 10k come from relay last-hop timeouts, which the Model lacks.
+- The earlier 50k regression was the missing signature cost, not the waiter limit.
 
-Where the gap is: failed walks have the same shape in both. racer-sim (temporary counters on
-`fill.asked`) fails 74,985 walks as "owner shed, helper failed, other owners unfunded" and
-8,827 as "owner shed, owner shed, unfunded"; the Model fails 187,900 and 23,458 walks with
-those shapes. The difference is how often the helper fails: racer-sim helpers answer 225k
-serving reads (43k lead a flight, 182k join one) and fail at most 80k; Model helpers answer
-324k (9.5k lead, 315k join) and fail 167k, almost all within 250 ms. A Model helper's flight
-is mostly led by the helper's own client read, so one failed client walk fails every reader
-waiting on it. Owner fan-in matches racer-sim (Model streaming bodies at send: half under 9,
-99% under 40; racer-sim p50 9, p99 36), so the shed rule itself is not the difference.
-Next steps: why Model helper flights fail more often (compare the helper's own client walk
-in both, per step), and why 50k is now worse than with canonical order (the 64-waiter limit
-is the remaining candidate; it was not isolated).
+Flight failure semantics (checked, no change): when a leader's walk fails, production
+fails every waiter with the leader's error unless it is an origin rejection or a
+handed-over deadline/cancellation, which re-elect (`core/src/read/flight.rs` `fail`, used by
+`src/read/flight.rs` `Flights::fail` and `src/read/fill.rs` at the `flights.fail` call;
+waiters return the error in `fill.rs` `AcquisitionEvent::Failed`). racer-sim
+(`finish_fill`) and the core `FlightTable::finish` the Model uses call the same function.
+
+Remaining differences: racer-sim's p50 read latency is 335 ms at 10k, the Model's 2.2 s.
+Model helpers fail 93k serving reads at about 1.75 s (their own client attempt reaching the
+2 s cap), racer-sim helpers 36k. racer-sim routes requests through mesh relays (248k relays
+at 10k, each signing and verifying); the Model sends every probe in one hop.
 
 Not ported yet (they need the gaps above): `slow_disk_sheds_persistence...` (persistence
 shedding), `reads_recover_after_partition_heals` (partitions), the relay, hung-peer and
@@ -209,12 +215,11 @@ The racer-sim baseline is 103,189 B/node for `full-cold-start` at 50,000 nodes (
 
 | Nodes | Peak RSS | Per node | Wall (release) | Notes |
 |---|---|---|---|---|
-| 2,000 | 154,730,000 B | 77,365 B | under 1 s | 0.13% of reads fail |
-| 10,000 | 878,210,000 B | 87,821 B | 4 s | 4.4% fail (see Scale) |
-| 50,000 | 4,916,200,000 B | 98,324 B | 3 min | 29% fail (see Scale) |
+| 2,000 | 154,730,000 B | 77,365 B | under 1 s | measured before signature costs |
+| 10,000 | 778,698,752 B | 77,869 B | 4 s | 0.31% fail (see Scale) |
+| 50,000 | 4,045,778,944 B | 80,915 B | 2 min | 1.3% fail (see Scale) |
 
-At 50,000 nodes the Model uses about 95% of racer-sim's per-node peak (98,324 B against
+At 50,000 nodes the Model uses about 78% of racer-sim's per-node peak (80,915 B against
 103,189 B) and runs in minutes where racer-sim's `full-cold-start` takes 39 min. The
 workloads differ: racer-sim's `full-cold-start` runs the full control plane, and the Model
-runs the contention cold start (every node reads one 16-page object). The failure rate at
-this size is a parity gap, not a memory result.
+runs the contention cold start (every node reads one 16-page object).

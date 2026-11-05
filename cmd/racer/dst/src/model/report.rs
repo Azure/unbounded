@@ -64,6 +64,8 @@ pub struct Counters {
     pub flights_reelected: u64,
     /// Probes unanswered at their attempt bound (`AttemptPlan::attempt_end`).
     pub probe_timeouts: u64,
+    /// Silence pings sent (production `Event::SilencePingSent`).
+    pub silence_pings: u64,
     /// Page bodies dropped because their requester abandoned the exchange first.
     pub replies_abandoned: u64,
     /// Probe answers that arrived after their attempt timed out.
@@ -160,6 +162,7 @@ impl Report {
                     "metadata_requests": c.metadata_requests,
                     "stored_pages_max": c.stored_pages_max,
                     "probe_timeouts": c.probe_timeouts,
+                    "silence_pings": c.silence_pings,
                     "flights_reelected": c.flights_reelected,
                     "late_answers": c.late_answers,
                     "replies_abandoned": c.replies_abandoned,

@@ -21,7 +21,7 @@ use std::{
 
 use racer_control_wire::{CacheId, NodeId};
 use racer_core::{
-    liveness::{SILENCE_CAPACITY, Silence},
+    liveness::{MAX_PINGS_IN_FLIGHT, SILENCE_CAPACITY, Silence},
     prefetch::OwnerBudget,
     read::{
         Answering, Error, OperationKind, PageBudget, RefreshPurpose, ReplicaSelection,
@@ -269,6 +269,21 @@ enum Ev {
         /// The destination verified the request and its worker took it: serve now.
         verified: bool,
     },
+    /// A silence ping from `from` reaches `to` (`verified` once `to` checked its signature).
+    Ping {
+        from: u32,
+        to: u32,
+        page: Page,
+        verified: bool,
+    },
+    /// `from`'s ping to `to` ended: [`liveness::ping_verdict`] of its answer.
+    PingDone {
+        from: u32,
+        to: u32,
+        answered: Option<bool>,
+    },
+    /// `from` sends its due silence pings (production polls them every worker turn).
+    PollPings { from: u32 },
     /// Probe `id` of `(node, worker, read)` reached its attempt bound
     /// (`AttemptPlan::attempt_end`) unanswered.
     ProbeTimeout {
@@ -356,6 +371,8 @@ struct Node {
     /// Production `LinkHealth` silence, shared by the node's workers (racer-sim
     /// `NodeState::silence`): fed by [`Effect::Silence`], read by every non-owner ranking.
     silence: Silence<u32, Page>,
+    /// Silence pings in flight (production `CandidatePolicy::pings`).
+    pings: usize,
 }
 
 /// A node's published pages, bounded by least-recently-used eviction (racer-sim keeps a
@@ -504,6 +521,7 @@ impl<'s> Model<'s> {
                     Duration::from_nanos(spec.read_timeout / 2),
                     Duration::from_nanos(ATTEMPT_TIMEOUT),
                 ),
+                pings: 0,
             })
             .collect();
         Self {
@@ -791,6 +809,14 @@ impl<'s> Model<'s> {
                     },
                 );
             }
+            Ev::Ping {
+                from,
+                to,
+                page,
+                verified,
+            } => self.ping_arrived(from, to, page, verified),
+            Ev::PingDone { from, to, answered } => self.ping_done(from, to, answered),
+            Ev::PollPings { from } => self.poll_pings(from),
             Ev::ProbeTimeout {
                 node,
                 worker,
@@ -1333,6 +1359,77 @@ impl<'s> Model<'s> {
             .crypto(now, node, self.fabric.costs.crypto_sign_ns)
     }
 
+    /// Send `from`'s due silence pings, at most [`MAX_PINGS_IN_FLIGHT`] at once (production
+    /// `CandidatePolicy::poll_pings` in `src/read/candidates.rs`; racer-sim `poll_pings`).
+    fn poll_pings(&mut self, from: u32) {
+        let now = self.now();
+        let at = self.instant(now);
+        let n = &mut self.nodes[from as usize];
+        let room = MAX_PINGS_IN_FLIGHT.saturating_sub(n.pings);
+        if room == 0 {
+            return;
+        }
+        for (to, page) in n.silence.due_pings(at, room) {
+            self.nodes[from as usize].pings += 1;
+            self.report.counters.silence_pings += 1;
+            let signed = self.sign(from);
+            let arrive = self.fabric.message(signed, from, to);
+            // Production pings on a fresh grant bounded by the peer attempt timeout.
+            let ping = Ev::Ping {
+                from,
+                to,
+                page,
+                verified: false,
+            };
+            self.engine.at(arrive, ping);
+        }
+    }
+
+    /// `from`'s ping reached `to`: verify it, then answer `Miss` at once (production
+    /// `FetchMode::Ping`).
+    fn ping_arrived(&mut self, from: u32, to: u32, page: Page, verified: bool) {
+        let now = self.now();
+        if !verified {
+            let checked = self
+                .fabric
+                .crypto(now, to, self.fabric.costs.crypto_verify_ns);
+            let ping = Ev::Ping {
+                from,
+                to,
+                page,
+                verified: true,
+            };
+            return self.engine.at(checked, ping);
+        }
+        let signed = self.sign(to);
+        let back = self.fabric.message(signed, to, from);
+        // `ping_verdict`: a direct, signed `Miss` from the peer itself is alive.
+        let answered = racer_core::liveness::ping_verdict(Ok((true, false)));
+        let timeout = now + ATTEMPT_TIMEOUT;
+        let (at, answered) = if back <= timeout {
+            (back, answered)
+        } else {
+            (timeout, racer_core::liveness::ping_verdict(Err(true)))
+        };
+        self.engine.at(at, Ev::PingDone { from, to, answered });
+    }
+
+    /// `from`'s ping to `to` ended (racer-sim `ping_done`; production `LinkHealth::ping_outcome`).
+    fn ping_done(&mut self, from: u32, to: u32, answered: Option<bool>) {
+        let at = self.instant(self.now());
+        let n = &mut self.nodes[from as usize];
+        n.pings -= 1;
+        if answered.is_some() {
+            n.silence.ping_result(&to, answered, at);
+            if n.silence.silent(&to, at) {
+                // Ask again after the hold to learn that it recovered.
+                let hold = n.silence.hold().as_nanos() as Nanos;
+                self.engine.after(hold, Ev::PollPings { from });
+            }
+        }
+        self.poll_pings(from);
+    }
+
     /// The serving read on `to` failed without a peer response: a transport failure.
     fn fail_probe(&mut self, asker: &Asker, to: u32) {
         let at = self.fabric.message(self.now(), to, asker.from);
@@ -1649,15 +1746,16 @@ impl<'s> Model<'s> {
                 sent,
                 note,
             } => {
-                // Production `CandidatePolicy::apply` (racer-sim `apply`, `shed_busy` on). Pings
-                // are not modeled: a peer that wants one stays unanswered until it answers.
+                // Production `CandidatePolicy::apply` (racer-sim `apply`, `shed_busy` on).
                 let at = self.instant(now);
                 let silence = &mut self.nodes[node as usize].silence;
                 match note {
                     SilenceNote::Shed => silence.shed(dest, page, at),
                     SilenceNote::Answered => silence.answered(&dest, at),
                     SilenceNote::TimedOut { needed } => {
-                        let _ = silence.timed_out(dest, page, sent, at, needed);
+                        if silence.timed_out(dest, page, sent, at, needed) {
+                            self.poll_pings(node);
+                        }
                     }
                 }
             }
@@ -2024,6 +2122,32 @@ mod tests {
 
     fn page(number: u32) -> Page {
         Page { object: 0, number }
+    }
+
+    #[test]
+    fn a_rank0_timeout_pings_and_an_answer_clears_the_silence() {
+        let scenario = crate::scenarios::cold_start(16);
+        let spec = scenario.model.as_deref().expect("model spec");
+        let mut model = Model::new(&scenario, spec, Choices::seeded(1));
+        let sent = model.instant(0);
+        model.engine.at(SECONDS, Ev::PollPings { from: 0 });
+        model.run(SECONDS, u64::MAX);
+        let at = model.instant(model.now());
+        let needed = racer_core::liveness::RANK0_TIMEOUTS;
+        for _ in 0..needed {
+            model.nodes[0]
+                .silence
+                .timed_out(5, page(1), sent, at, needed);
+        }
+        assert!(model.nodes[0].silence.unanswered(&5, at));
+        model.poll_pings(0);
+        assert_eq!(model.report.counters.silence_pings, 1);
+        assert_eq!(model.nodes[0].pings, 1);
+        model.run(2 * SECONDS, u64::MAX);
+        assert_eq!(model.nodes[0].pings, 0);
+        let at = model.instant(model.now());
+        assert!(!model.nodes[0].silence.unanswered(&5, at));
+        assert!(!model.nodes[0].silence.silent(&5, at));
     }
 
     #[test]
