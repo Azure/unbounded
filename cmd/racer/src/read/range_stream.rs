@@ -46,7 +46,8 @@ use std::time::Instant;
 
 #[cfg(test)]
 use racer_core::read::SELECTIONS;
-use racer_core::read::{self, DIRECT_AHEAD, SlotKind};
+use racer_core::read::window::PAGE_RETRIES;
+use racer_core::read::{self, DIRECT_AHEAD, PageBudget, SlotKind};
 
 /// Flights requested per provider contract. A provider grants at most this
 /// many pending selections per contract, or one if it predates multi-flight.
@@ -426,63 +427,15 @@ fn window_error(error: flow_control::Error) -> Error {
     }
 }
 
-/// Client range progress admits independent pages under bounded child allowances.
-/// Restarts of one page's direct fill after transient failures. Each restart
-/// gets a fresh page budget, so this bounds total attempts per page.
-const PAGE_RETRIES: u8 = 16;
-
-enum RangeBudget {
-    ClientPages {
-        deadline: Instant,
-    },
-    ProgressingPages {
-        timeout: Duration,
-    },
-    #[cfg(test)]
-    Shared(AcquisitionBudget),
-}
 #[cfg(test)]
 pub(crate) fn client_page_budget_for_test(deadline: Instant) -> AcquisitionBudget {
-    RangeBudget::ClientPages { deadline }
-        .next_page(false, racer_io::Clock::host().now())
+    PageBudget::Client { deadline }
+        .next_page(racer_io::Clock::host().now())
         .unwrap()
-        .unwrap()
-}
-impl RangeBudget {
-    fn next_page(&mut self, _pending: bool, now: Instant) -> Result<Option<AcquisitionBudget>> {
-        match self {
-            Self::ProgressingPages { timeout } => {
-                Ok(Some(AcquisitionBudget::new(now + *timeout, 8, 16)))
-            }
-            Self::ClientPages { deadline } => {
-                if now >= *deadline {
-                    return Err(Error::DeadlineExceeded);
-                }
-                Ok(Some(AcquisitionBudget::new(*deadline, 8, 16)))
-            }
-            #[cfg(test)]
-            Self::Shared(budget) => {
-                let attempts = budget.remaining_attempts().min(8);
-                let links = budget.remaining_links().min(16);
-                if _pending && (attempts == 0 || links < 4) {
-                    return Ok(None);
-                }
-                budget
-                    .partition(attempts, links)
-                    .map(Some)
-                    .map_err(Into::into)
-            }
-        }
-    }
-    fn complete(&mut self, _remaining: AcquisitionBudget) -> Result<()> {
-        match self {
-            Self::ClientPages { .. } | Self::ProgressingPages { .. } => Ok(()),
-            #[cfg(test)]
-            Self::Shared(budget) => Ok(budget.reunite(_remaining)?),
-        }
-    }
 }
 
+/// A fill's result and its page budget's unused credits. Every page gets its
+/// own budget, so the credits are dropped.
 type Fetch = Operation<'static, (Result<PageResult>, AcquisitionBudget)>;
 
 /// A direct fill in sealed mode, which may return ciphertext for the GPU.
@@ -586,7 +539,7 @@ pub struct RangeStream {
 
     window_pages: usize,
 
-    budget: RangeBudget,
+    budget: PageBudget,
 
     /// Delivery cursor: the next page handed to the client.
     next: u64,
@@ -643,7 +596,7 @@ impl RangeStreams {
         membership: Arc<crate::topology::Membership>,
         scope: RequestScope,
     ) -> Result<RangeStream> {
-        let budget = RangeBudget::ClientPages {
+        let budget = PageBudget::Client {
             deadline: scope.deadline.0,
         };
         scope.check()?;
@@ -889,23 +842,12 @@ impl RangeStream {
     fn retry_or(&mut self, number: PageNumber, result: Result<PageResult>) -> Slot {
         match result {
             Err(Error::Overloaded | Error::Unavailable)
-                if self.per_page_budget()
-                    && self.scope.check().is_ok()
-                    && self.retry_page(number) =>
+                if self.scope.check().is_ok() && self.retry_page(number) =>
             {
                 Slot::Missing { select: false }
             }
             result => Slot::Ready(result),
         }
-    }
-
-    /// Whether every page fill gets its own fresh budget, so a restart does
-    /// not spend credits other pages need.
-    fn per_page_budget(&self) -> bool {
-        matches!(
-            self.budget,
-            RangeBudget::ClientPages { .. } | RangeBudget::ProgressingPages { .. }
-        )
     }
 
     /// Count one restart of `number`'s fill; false once its retries are spent.
@@ -941,36 +883,32 @@ impl RangeStream {
                 },
                 Slot::Fetching(fetch) => match fetch.as_mut().poll(cx) {
                     Poll::Pending => continue,
-                    Poll::Ready(Ok((result, remaining))) => {
+                    Poll::Ready(Ok((result, _))) => {
                         if let (Ok(page), Some(lease)) = (&result, &self.lease) {
                             lease.offer(page);
                         }
-                        let result = self.budget.complete(remaining).and(result);
                         self.retry_or(number, result)
                     }
                     Poll::Ready(Err(error)) => self.retry_or(number, Err(error)),
                 },
                 Slot::FetchingSealed(fetch) => match fetch.as_mut().poll(cx) {
                     Poll::Pending => continue,
-                    Poll::Ready(Ok((result, remaining))) => {
-                        let completed = self.budget.complete(remaining);
-                        match result {
-                            Ok(Fetched::Page(page)) => {
-                                if let Some(lease) = &self.lease {
-                                    lease.offer(&page);
-                                }
-                                Slot::Ready(completed.map(|()| page))
+                    Poll::Ready(Ok((result, _))) => match result {
+                        Ok(Fetched::Page(page)) => {
+                            if let Some(lease) = &self.lease {
+                                lease.offer(&page);
                             }
-                            Ok(Fetched::Sealed(sealed)) => match completed
-                                .and_then(|()| self.validate_sealed(&sealed, number))
-                            {
+                            Slot::Ready(Ok(page))
+                        }
+                        Ok(Fetched::Sealed(sealed)) => {
+                            match self.validate_sealed(&sealed, number) {
                                 Ok(()) => Slot::Sealed(sealed),
                                 Err(error) => Slot::Ready(Err(error)),
-                            },
-                            // Sealed fills share the plaintext retry policy.
-                            Err(error) => self.retry_or(number, completed.and(Err(error))),
+                            }
                         }
-                    }
+                        // Sealed fills share the plaintext retry policy.
+                        Err(error) => self.retry_or(number, Err(error)),
+                    },
                     Poll::Ready(Err(error)) => self.retry_or(number, Err(error)),
                 },
                 _ => continue,
@@ -1020,10 +958,7 @@ impl RangeStream {
             };
             let pending = self.selections.swap_remove(index);
             let result = match completion {
-                Ok((result, remaining)) => {
-                    self.budget.complete(remaining)?;
-                    result
-                }
+                Ok((result, _)) => result,
                 Err(error) => Err(error),
             };
             // The selected page was already offered. Pages the provider did not
@@ -1041,14 +976,6 @@ impl RangeStream {
             changed = true;
         }
         Ok(changed)
-    }
-
-    fn pending(&self) -> bool {
-        !self.selections.is_empty()
-            || self
-                .slots
-                .iter()
-                .any(|slot| matches!(slot, Slot::Fetching(_) | Slot::FetchingSealed(_)))
     }
 
     /// Start a direct fill for the head page, up to `direct_ahead` more holes,
@@ -1100,14 +1027,8 @@ impl RangeStream {
         }
     }
 
-    /// Returns false when the range budget admits no more work for now.
     fn start_fetch(&mut self, index: usize, scope: &RequestScope) -> Result<bool> {
-        let Some(child) = self
-            .budget
-            .next_page(self.pending(), self.scope.clock().now())?
-        else {
-            return Ok(false);
-        };
+        let child = self.budget.next_page(self.scope.clock().now())?;
         let mut child_scope = scope.clone();
         child_scope.deadline.0 = child.deadline();
         let page = PageId {
@@ -1185,12 +1106,7 @@ impl RangeStream {
         let Some((demand, pages)) = self.plan_selection()? else {
             return Ok(false);
         };
-        let Some(child) = self
-            .budget
-            .next_page(self.pending(), self.scope.clock().now())?
-        else {
-            return Ok(false);
-        };
+        let child = self.budget.next_page(self.scope.clock().now())?;
         let selection = Selection {
             scheduler: self.directory.subscriptions.clone(),
             version: self.metadata.version.clone(),
@@ -1473,13 +1389,13 @@ impl RangeStream {
     /// acquiring the first slice. Already admitted pages retain their original deadlines
     /// and retry budgets; only newly admitted, distinct pages get child scopes.
     pub(crate) fn enable_progress(&mut self, timeout: Duration) {
-        if matches!(self.budget, RangeBudget::ClientPages { .. }) {
-            self.budget = RangeBudget::ProgressingPages { timeout };
+        if matches!(self.budget, PageBudget::Client { .. }) {
+            self.budget = PageBudget::Progressing { timeout };
         }
     }
     fn operation_scope(&self) -> RequestScope {
         let mut scope = self.scope.clone();
-        if let RangeBudget::ProgressingPages { timeout } = self.budget {
+        if let PageBudget::Progressing { timeout } = self.budget {
             scope.deadline.0 = scope.clock().now() + timeout;
         }
         scope
@@ -1731,12 +1647,6 @@ pub(super) mod tests {
                 )
                 .unwrap()
         }
-    }
-    fn remaining_credits(budget: &RangeBudget) -> (u32, u8) {
-        let RangeBudget::Shared(budget) = budget else {
-            panic!("expected aggregate budget")
-        };
-        (budget.remaining_attempts(), budget.remaining_links())
     }
     pub(crate) fn page_result(
         admission: &flow_control::Quotas<AdmissionPolicy>,
@@ -2136,15 +2046,12 @@ pub(super) mod tests {
     #[test]
     fn client_page_progress_outlives_attempt_and_link_totals_without_refilling_retries() {
         let deadline = Instant::now() + std::time::Duration::from_secs(60);
-        let mut budget = RangeBudget::ClientPages { deadline };
+        let budget = PageBudget::Client { deadline };
         // Model a healthy remote page that spends a four-link route and transfers
         // acquisition credits to its destination. Neither spend can accumulate
         // into a range-length limit, and unused credits cannot grow later pages.
         for _ in 0..100 {
-            let mut page = budget
-                .next_page(false, racer_io::Clock::host().now())
-                .unwrap()
-                .unwrap();
+            let mut page = budget.next_page(racer_io::Clock::host().now()).unwrap();
             assert_eq!(page.remaining_attempts(), 8);
             assert_eq!(page.remaining_links(), 16);
             assert_eq!(page.begin_attempt(Instant::now(), deadline), Ok(deadline));
@@ -2157,12 +2064,8 @@ pub(super) mod tests {
                 remote.begin_attempt(Instant::now(), deadline),
                 Err(racer_core::read::Error::Unavailable)
             );
-            budget.complete(page).unwrap();
         }
-        let mut page = budget
-            .next_page(false, racer_io::Clock::host().now())
-            .unwrap()
-            .unwrap();
+        let mut page = budget.next_page(racer_io::Clock::host().now()).unwrap();
         for _ in 0..8 {
             page.begin_attempt(Instant::now(), deadline).unwrap();
         }
@@ -2179,45 +2082,13 @@ pub(super) mod tests {
             page.begin_attempt(deadline, deadline),
             Err(racer_core::read::Error::DeadlineExceeded)
         );
-        let mut expired = RangeBudget::ClientPages {
+        let expired = PageBudget::Client {
             deadline: Instant::now(),
         };
         assert!(matches!(
-            expired.next_page(false, racer_io::Clock::host().now()),
-            Err(Error::DeadlineExceeded)
+            expired.next_page(racer_io::Clock::host().now()),
+            Err(racer_core::read::Error::DeadlineExceeded)
         ));
-    }
-    #[test]
-    fn explicit_aggregate_range_budget_never_refills_spent_pages() {
-        let deadline = Instant::now() + std::time::Duration::from_secs(60);
-        let mut budget = RangeBudget::Shared(AcquisitionBudget::new(deadline, 2, 4));
-        let mut page = budget
-            .next_page(false, racer_io::Clock::host().now())
-            .unwrap()
-            .unwrap();
-        assert!(
-            budget
-                .next_page(true, racer_io::Clock::host().now())
-                .unwrap()
-                .is_none()
-        );
-        page.begin_attempt(Instant::now(), deadline).unwrap();
-        page.begin_attempt(Instant::now(), deadline).unwrap();
-        page.charge_links(4).unwrap();
-        budget.complete(page).unwrap();
-        let mut next = budget
-            .next_page(false, racer_io::Clock::host().now())
-            .unwrap()
-            .unwrap();
-        assert_eq!(next.deadline(), deadline);
-        assert_eq!(
-            next.begin_attempt(Instant::now(), deadline),
-            Err(racer_core::read::Error::Unavailable)
-        );
-        assert_eq!(
-            next.charge_links(1),
-            Err(racer_core::read::Error::HopBudgetExhausted)
-        );
     }
     #[test]
     fn pending_client_window_never_restarts_failed_pages_and_honors_original_deadline() {
@@ -2240,11 +2111,10 @@ pub(super) mod tests {
             let gate = Rc::new(Cell::new(false));
             // Script both admitted acquisitions, avoiding full-page allocation.
             // A full pending window must prevent admission of page two onward.
-            for number in 0..2 {
+            for _ in 0..2 {
                 let mut budget = stream
                     .budget
-                    .next_page(number != 0, racer_io::Clock::host().now())
-                    .unwrap()
+                    .next_page(racer_io::Clock::host().now())
                     .unwrap();
                 let attempts = attempts.clone();
                 let gate = gate.clone();
@@ -2330,7 +2200,7 @@ pub(super) mod tests {
     fn stream_with_budget(
         f: &Fixture,
         metadata: &ObjectMetadata,
-        budget: RangeBudget,
+        budget: PageBudget,
     ) -> RangeStream {
         let scope =
             RequestScope::host(RequestId([5; 16]), Instant::now() + Duration::from_secs(60))
@@ -2350,7 +2220,7 @@ pub(super) mod tests {
     fn transient_sealed_fill_failures_are_refetched_until_retries_run_out() {
         let f = Fixture::new(crate::test_support::cluster::config(false).limits, 2);
         let deadline = Instant::now() + Duration::from_secs(60);
-        let mut stream = stream_with_budget(&f, &metadata(), RangeBudget::ClientPages { deadline });
+        let mut stream = stream_with_budget(&f, &metadata(), PageBudget::Client { deadline });
         let mut cx = Context::from_waker(futures::task::noop_waker_ref());
         let failing = |error, transport: bool| -> Slot {
             let budget = AcquisitionBudget::new(deadline, 8, 16);
@@ -2377,7 +2247,7 @@ pub(super) mod tests {
             Slot::Ready(Err(Error::Overloaded))
         ));
         // A non-transient failure is not retried.
-        let mut stream = stream_with_budget(&f, &metadata(), RangeBudget::ClientPages { deadline });
+        let mut stream = stream_with_budget(&f, &metadata(), PageBudget::Client { deadline });
         stream.inject(failing(Error::OriginForbidden, false));
         stream.poll_slots(&mut cx).unwrap();
         assert!(matches!(
@@ -2389,7 +2259,7 @@ pub(super) mod tests {
     fn transient_fill_failures_are_refetched_until_retries_run_out() {
         let f = Fixture::new(crate::test_support::cluster::config(false).limits, 2);
         let deadline = Instant::now() + Duration::from_secs(60);
-        let mut stream = stream_with_budget(&f, &metadata(), RangeBudget::ClientPages { deadline });
+        let mut stream = stream_with_budget(&f, &metadata(), PageBudget::Client { deadline });
         let mut cx = Context::from_waker(futures::task::noop_waker_ref());
         let failing = |error| -> Slot {
             let budget = AcquisitionBudget::new(deadline, 8, 16);
@@ -2416,7 +2286,7 @@ pub(super) mod tests {
     fn non_transient_fill_failures_are_not_refetched() {
         let f = Fixture::new(crate::test_support::cluster::config(false).limits, 2);
         let deadline = Instant::now() + Duration::from_secs(60);
-        let mut stream = stream_with_budget(&f, &metadata(), RangeBudget::ClientPages { deadline });
+        let mut stream = stream_with_budget(&f, &metadata(), PageBudget::Client { deadline });
         let mut cx = Context::from_waker(futures::task::noop_waker_ref());
         let budget = AcquisitionBudget::new(deadline, 8, 16);
         stream.inject(Slot::Fetching(Box::pin(async move {
@@ -2430,67 +2300,7 @@ pub(super) mod tests {
     }
 
     #[test]
-    fn out_of_order_completion_waits_for_front_and_returns_only_unused_credits() {
-        let f = Fixture::new(crate::test_support::cluster::config(false).limits, 2);
-        let deadline = Instant::now() + Duration::from_secs(60);
-        let mut budget = AcquisitionBudget::new(deadline, 6, 8);
-        let mut first_budget = budget.partition(3, 4).unwrap();
-        let mut last_budget = budget.partition(3, 4).unwrap();
-        first_budget
-            .begin_attempt(Instant::now(), deadline)
-            .unwrap();
-        last_budget.begin_attempt(Instant::now(), deadline).unwrap();
-        last_budget.charge_links(3).unwrap();
-        let gate = Rc::new(std::cell::Cell::new(false));
-        let opened = gated(gate.clone());
-        let mut stream = stream_with_budget(&f, &metadata(), RangeBudget::Shared(budget));
-        stream.inject(Slot::Fetching(Box::pin(async move {
-            opened.await;
-            Ok((Err(Error::VersionUnavailable), first_budget))
-        })));
-        stream.inject(Slot::Fetching(Box::pin(async move {
-            Ok((Err(Error::Unavailable), last_budget))
-        })));
-        let mut cx = Context::from_waker(futures::task::noop_waker_ref());
-        stream.poll_prefetch(&mut cx);
-        assert!(matches!(
-            stream.slots[1],
-            Slot::Ready(Err(Error::Unavailable))
-        ));
-        assert!(matches!(stream.slots[0], Slot::Fetching(_)));
-        assert_eq!(remaining_credits(&stream.budget), (2, 1));
-        // Re-polling a completed page must not return its credits twice.
-        assert!(stream.next_slice().as_mut().poll(&mut cx).is_pending());
-        assert_eq!(remaining_credits(&stream.budget), (2, 1));
-        gate.set(true);
-        stream.poll_prefetch(&mut cx);
-        assert!(matches!(
-            stream.slots.front(),
-            Some(Slot::Ready(Err(Error::VersionUnavailable)))
-        ));
-        let RangeBudget::Shared(budget) = &stream.budget else {
-            unreachable!()
-        };
-        assert_eq!(
-            (
-                budget.remaining_attempts(),
-                budget.remaining_links(),
-                budget.deadline()
-            ),
-            (4, 5, deadline)
-        );
-        // The head error is delivered first; the later error never is.
-        assert!(matches!(
-            stream.next_slice().as_mut().poll(&mut cx),
-            Poll::Ready(Err(Error::VersionUnavailable))
-        ));
-        assert!(matches!(
-            stream.next_slice().as_mut().poll(&mut cx),
-            Poll::Ready(Ok(None))
-        ));
-    }
-    #[test]
-    fn abandoning_window_drops_waiters_without_refunding_outstanding_spends() {
+    fn abandoning_window_drops_waiters() {
         struct Dropped(Rc<std::cell::Cell<bool>>);
         impl Drop for Dropped {
             fn drop(&mut self) {
@@ -2499,11 +2309,10 @@ pub(super) mod tests {
         }
         let f = Fixture::new(crate::test_support::cluster::config(false).limits, 2);
         let deadline = Instant::now() + Duration::from_secs(60);
-        let mut budget = AcquisitionBudget::new(deadline, 3, 4);
-        let child = budget.partition(3, 4).unwrap();
+        let child = AcquisitionBudget::new(deadline, 3, 4);
         let mut metadata = metadata();
         metadata.length = 3;
-        let mut stream = stream_with_budget(&f, &metadata, RangeBudget::Shared(budget));
+        let mut stream = stream_with_budget(&f, &metadata, PageBudget::Client { deadline });
         let dropped = Rc::new(std::cell::Cell::new(false));
         let guard = Dropped(dropped.clone());
         stream.inject(Slot::Fetching(Box::pin(async move {
@@ -2515,13 +2324,12 @@ pub(super) mod tests {
         assert!(stream.next_slice().as_mut().poll(&mut cx).is_pending());
         futures::executor::block_on(stream.cancel()).unwrap();
         assert!(dropped.get());
-        assert_eq!(remaining_credits(&stream.budget), (0, 0));
     }
     #[test]
     fn later_failure_still_fills_earlier_pages_and_surfaces_in_order() {
         let f = Fixture::new(crate::test_support::cluster::config(false).limits, 2);
         let deadline = Instant::now() + Duration::from_secs(60);
-        let mut stream = stream_with_budget(&f, &metadata(), RangeBudget::ClientPages { deadline });
+        let mut stream = stream_with_budget(&f, &metadata(), PageBudget::Client { deadline });
         // The head probe misses only after the later page has already failed.
         let gate = Rc::new(std::cell::Cell::new(false));
         let opened = gated(gate.clone());
@@ -2531,8 +2339,7 @@ pub(super) mod tests {
         })));
         let budget = stream
             .budget
-            .next_page(false, racer_io::Clock::host().now())
-            .unwrap()
+            .next_page(racer_io::Clock::host().now())
             .unwrap();
         stream.inject(Slot::Fetching(Box::pin(async move {
             Ok((Err(Error::VersionUnavailable), budget))
@@ -2573,18 +2380,13 @@ pub(super) mod tests {
         let f = Fixture::new(crate::test_support::cluster::config(false).limits, 2);
         let metadata = metadata();
         let deadline = Instant::now() + Duration::from_secs(60);
-        let mut stream = stream_with_budget(
-            &f,
-            &metadata,
-            RangeBudget::Shared(AcquisitionBudget::new(deadline, 8, 16)),
-        );
+        let mut stream = stream_with_budget(&f, &metadata, PageBudget::Client { deadline });
         let gate = Rc::new(std::cell::Cell::new(false));
         let opened = gated(gate.clone());
         let head = page_result(&f.admission, &metadata, 0);
         let budget = stream
             .budget
-            .next_page(false, racer_io::Clock::host().now())
-            .unwrap()
+            .next_page(racer_io::Clock::host().now())
             .unwrap();
         stream.inject(Slot::Fetching(Box::pin(async move {
             opened.await;
@@ -2624,13 +2426,11 @@ pub(super) mod tests {
         let later = page_result(&f.admission, &metadata, 1);
         let first = stream
             .budget
-            .next_page(false, racer_io::Clock::host().now())
-            .unwrap()
+            .next_page(racer_io::Clock::host().now())
             .unwrap();
         let second = stream
             .budget
-            .next_page(true, racer_io::Clock::host().now())
-            .unwrap()
+            .next_page(racer_io::Clock::host().now())
             .unwrap();
         stream.inject(Slot::Fetching(Box::pin(async move {
             opened.await;
@@ -2736,8 +2536,7 @@ pub(super) mod tests {
             stream.inject(Slot::Selecting);
             let budget = stream
                 .budget
-                .next_page(false, racer_io::Clock::host().now())
-                .unwrap()
+                .next_page(racer_io::Clock::host().now())
                 .unwrap();
             stream.selections.push(Pending {
                 operation: Box::pin(async move { Ok((Err(error), budget)) }),
@@ -3249,12 +3048,9 @@ pub(super) mod tests {
         let sim_ctx = sim_env.worker_ctx();
         let timeout = Duration::from_millis(30);
         let old_deadline = sim_ctx.clock.now() + timeout;
-        let mut budget = RangeBudget::ProgressingPages { timeout };
+        let budget = PageBudget::Progressing { timeout };
         for _ in 0..12 {
-            let mut page = budget
-                .next_page(false, sim_ctx.clock.clone().now())
-                .unwrap()
-                .unwrap();
+            let mut page = budget.next_page(sim_ctx.clock.clone().now()).unwrap();
             let deadline = page.deadline();
             assert_eq!(deadline, sim_ctx.clock.now() + timeout);
             for _ in 0..8 {
@@ -3266,13 +3062,9 @@ pub(super) mod tests {
             );
             clock.advance(Duration::from_millis(20));
             assert_eq!(page.deadline(), deadline);
-            budget.complete(page).unwrap();
         }
         assert!(sim_ctx.clock.now() > old_deadline);
-        let mut stalled = budget
-            .next_page(false, sim_ctx.clock.clone().now())
-            .unwrap()
-            .unwrap();
+        let mut stalled = budget.next_page(sim_ctx.clock.clone().now()).unwrap();
         clock.advance(timeout);
         assert_eq!(
             stalled.begin_attempt(sim_ctx.clock.now(), stalled.deadline()),
