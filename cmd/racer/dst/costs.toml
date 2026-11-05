@@ -16,9 +16,11 @@
 # [baseline] "Crypto, 1 core, 16 MiB page: seal / open = 3.57 / 3.58 GiB/s".
 seal_bytes_per_sec = 3_833_258_311
 open_bytes_per_sec = 3_843_995_729
-# [baseline] "crc64 / copy_prefix_crc64 / memcpy = 10.2 / 5.74 / 9.2 GiB/s".
-# Kept for the D4 tag-only-vs-CRC comparison; CRC is removed in Phase 4.
-crc64_bytes_per_sec = 10_952_166_605
+# Disk-copy validation is an AEAD tag check (CRC was removed): 15.56 GiB/s
+# measured on 16 MiB pages, release build. The Model charges no copy validation
+# yet (it did not charge CRC either).
+tag_check_bytes_per_sec = 16_707_422_781
+# [baseline] "memcpy = 9.2 GiB/s".
 memcpy_bytes_per_sec = 9_878_424_781
 # [racer-sim] Costs::default sign_ns / verify_ns (20 us / 40 us).
 sign_ns = 20_000

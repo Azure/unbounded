@@ -18,7 +18,7 @@ pub const COSTS_TOML: &str = include_str!("../costs.toml");
 pub struct Costs {
     pub crypto_seal_bytes_per_sec: u64,
     pub crypto_open_bytes_per_sec: u64,
-    pub crypto_crc64_bytes_per_sec: u64,
+    pub crypto_tag_check_bytes_per_sec: u64,
     pub crypto_memcpy_bytes_per_sec: u64,
     pub crypto_sign_ns: Nanos,
     pub crypto_verify_ns: Nanos,
@@ -47,7 +47,7 @@ impl Costs {
     pub const KEYS: &[(&str, &str)] = &[
         ("crypto", "seal_bytes_per_sec"),
         ("crypto", "open_bytes_per_sec"),
-        ("crypto", "crc64_bytes_per_sec"),
+        ("crypto", "tag_check_bytes_per_sec"),
         ("crypto", "memcpy_bytes_per_sec"),
         ("crypto", "sign_ns"),
         ("crypto", "verify_ns"),
@@ -75,7 +75,7 @@ impl Costs {
         Some(match (section, key) {
             ("crypto", "seal_bytes_per_sec") => &mut self.crypto_seal_bytes_per_sec,
             ("crypto", "open_bytes_per_sec") => &mut self.crypto_open_bytes_per_sec,
-            ("crypto", "crc64_bytes_per_sec") => &mut self.crypto_crc64_bytes_per_sec,
+            ("crypto", "tag_check_bytes_per_sec") => &mut self.crypto_tag_check_bytes_per_sec,
             ("crypto", "memcpy_bytes_per_sec") => &mut self.crypto_memcpy_bytes_per_sec,
             ("crypto", "sign_ns") => &mut self.crypto_sign_ns,
             ("crypto", "verify_ns") => &mut self.crypto_verify_ns,
