@@ -111,3 +111,47 @@ mod tests {
         assert_eq!(Error::Os(5).to_string(), "OS error 5");
     }
 }
+
+/// Errno classification and standard error contracts.
+#[cfg(test)]
+mod classification_tests {
+    use super::*;
+
+    /// Common errno values retain classifications while other positive diagnostics survive.
+    #[test]
+    fn os_errors_preserve_errno_and_existing_classifications() {
+        for (errno, expected) in [
+            (libc::ENOENT, Error::NotFound),
+            (libc::EEXIST, Error::AlreadyExists),
+            (libc::ECANCELED, Error::Cancelled),
+            (libc::EIO, Error::Os(libc::EIO)),
+            (libc::EINTR, Error::Os(libc::EINTR)),
+        ] {
+            assert_eq!(
+                Error::from_io(std::io::Error::from_raw_os_error(errno)),
+                expected
+            );
+        }
+        assert_eq!(Error::from_io(std::io::Error::other("opaque")), Error::Io);
+    }
+
+    /// Portable failures describe themselves without fabricating nested error sources.
+    #[test]
+    fn classified_errors_implement_standard_error_without_fabricated_sources() {
+        for error in [
+            Error::Cancelled,
+            Error::DeadlineExceeded,
+            Error::Overloaded,
+            Error::Unavailable,
+            Error::InvalidInput,
+            Error::InvalidConfiguration,
+            Error::NotFound,
+            Error::AlreadyExists,
+            Error::Io,
+        ] {
+            let standard: &dyn std::error::Error = &error;
+            assert!(!standard.to_string().is_empty());
+            assert!(standard.source().is_none());
+        }
+    }
+}

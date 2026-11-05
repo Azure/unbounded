@@ -21,8 +21,6 @@ pub struct Environment {
     simulated: Option<Simulated>,
 }
 
-pub use racer_io::cancel::{Cancellation, CancellationRegistration};
-
 #[cfg(test)]
 thread_local! {
     static REQUIRE_SIMULATED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
@@ -335,12 +333,6 @@ impl SimulationClock {
         self.clock
             .set_wall_time(wall)
             .expect("simulated wall time is after the Unix epoch");
-    }
-
-    /// The racer-io virtual clock backing this world.
-    // MIGRATION: lets migrated roles build a WorkerCtx on the same world clock.
-    pub fn virtual_clock(&self) -> &racer_io::ctx::VirtualClock {
-        &self.clock
     }
 }
 

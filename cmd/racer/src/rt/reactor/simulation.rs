@@ -2,14 +2,14 @@
 //! legacy reactor and synchronous syscalls. The simulated OS itself, its
 //! resources, faults, and turn-based driver live in `racer-io`. Delete together
 //! with this crate; new code selects a world explicitly with `Driver::Sim`.
-pub use racer_io::sim::{CrashDisk, EndpointEnvironment, Event, Fault, Handle, SimOs};
+pub use racer_io::sim::{Fault, Handle, SimOs};
 use std::{cell::RefCell, ops::Deref};
 
 thread_local! { static CURRENT: RefCell<Option<Simulation>> = const { RefCell::new(None) }; }
 
 /// Crash-consistent storage images.
 pub mod disk {
-    pub use racer_io::sim::{CrashDisk, DiskState};
+    pub use racer_io::sim::DiskState;
 }
 
 /// Shared deterministic OS state retained by reactors and simulated descriptors.
