@@ -90,8 +90,14 @@ such as which node holds which page.
   (`src/app.rs:1320-1333`, `RACER_ACTIVE_PATH_SEARCHES_PER_WORKER` default 8,
   `src/worker.rs:261`) and no wait queue, so a search past 8 running on the worker fails
   `Overloaded` (`topology/src/paths.rs` `route`, `queue_limit` 0). The Model holds a slot until
-  the search's CPU work is done (`search_sheds`). Divergence: racer-sim adds a 64-entry queue
-  (`sim/src/node/state.rs:218-221`, `with_queue(search_queue)`), which production does not.
+  the search's CPU work is done (`search_sheds`). racer-sim's `search_queue` now defaults to 0
+  as well (`sim/src/config.rs` `NodeConfig::default`). A requester's own shed search fails the
+  probe `Overloaded` (production `request_network`, `src/peer.rs:919-931`), not `Unavailable`:
+  it is no evidence against the destination (Model `fail_hop`, racer-sim `Reply::Overloaded`).
+- Request verification: every holder verifies the request on the crypto helper of the
+  connection's worker and dispatches or relays only after (production `src/peer/server.rs:515-518`,
+  `:792`; `src/worker.rs` `WorkerPair`). racer-sim does the same since this commit (`hop`,
+  `Msg::verified`, per-worker `crypto_free`); before, it charged one helper per node and went on.
 - Pings: a silence ping is a peer request routed over the mesh (production
   `CandidatePolicy::ping` through `request_traced`, `src/read/candidates.rs:2488-2531`;
   racer-sim `launch_control`) on `NOTICE_LINKS` links with no remote attempts; the
@@ -155,29 +161,29 @@ Every racer-sim number below is from the racer-sim release binary at this commit
 |---|---|---|---|
 | cold readers, 64 nodes | completed / failed | 1024 / 0 | 1024 / 0 |
 | | origin requests, origin/page | 16, 1 | 16, 1 |
-| | flight joins | 1008 | 1008 |
-| | latency ms | 59 / 109 / 121 | 67 / 109 / 120 |
+| | flight joins | 998 | 1008 |
+| | latency ms | 58 / 117 / 131 | 67 / 109 / 120 |
 | cold start, 400 nodes | completed / failed | 6400 / 0 | 6400 / 0 |
 | | origin requests, origin/page | 16, 1 | 16, 1 |
 | | route unreachable | 7 | 8 |
-| | relays | 4167 | see Scale |
-| | flight joins | 6061 | 9418 |
-| | sheds / helper copies | 91 / 3332 | 35 / 3259 |
-| | latency ms | 92 / 185 / 220 (before `FlightFull`) | 111 / 2049 / 2097 |
-| cold start, 2000 nodes | completed / failed | 31998 / 2 (`FlightFull`) | 31998 / 2 (`FlightFull`) |
+| | relays | 5012 | see Scale |
+| | flight joins | 6434 | 10336 |
+| | sheds / helper copies | 604 / 3821 | 681 / 3896 |
+| | latency ms | 92 / 184 / 2097 | 111 / 2049 / 2097 |
+| cold start, 2000 nodes | completed / failed | 31997 / 3 (`FlightFull`) | 31998 / 2 (`FlightFull`) |
 | | origin requests, origin/page | 16, 1 | 17, 2 |
-| | flight joins | 30204 | 59431 |
-| | sheds / helper copies | 1536 / 27734 | 1088 / 26688 |
-| | latency ms | 126 / 2013 / 2125 | 128 / 2121 / 2194 |
+| | flight joins | 32322 | 60927 |
+| | sheds / helper copies | 6053 / 26056 | 4549 / 25587 |
+| | latency ms | 150 / 2147 / 2218 | 172 / 2154 / 2193 |
 | hot-page storm, 512 nodes | completed / failed | 513 / 0 | 513 / 0 |
 | | origin requests | 1 | 1 |
-| | sheds / helper probes / helper copies | 300 / 496 / 324 | 444 / 454 / 308 |
-| | flight joins | 614 | 606 |
-| | latency ms | 1879 / 2953 / 3192 | 1399 / 3163 / 3225 |
+| | sheds / helper probes / helper copies | 446 / 498 / 315 | 444 / 454 / 308 |
+| | flight joins | 616 | 606 |
+| | latency ms | 1879 / 3221 / 3307 | 1399 / 3163 / 3225 |
 | origin 403, 64 nodes | completed / failed | 1004 / 20 | 1007 / 17 |
 | | origin requests, origin/page | 36, 6 | 33, 12 |
-| | latency ms | 92 / 218 / 225 | 74 / 400 / 407 |
-| | flights reelected | 20 (`flight_reelected`) | 18 |
+| | latency ms | 83 / 218 / 232 | 75 / 402 / 410 |
+| | flights reelected | 21 (`flight_reelected`) | 19 |
 | partition heals, 32 nodes | completed / failed | at least 512 (racer-sim's check) | 1008 / 16 |
 | | link failures | not recorded | 191 |
 | hung peers, 200 nodes (`GRID`) | failed | at most 3 (racer-sim's bounds) | 0 of 12800 |
@@ -188,10 +194,9 @@ differences:
 
 - Origin requests: at most racer-sim's (exact on cold readers, the hot page and cold start
   400), except cold start 2000: 17 against 16, within `REPLICAS` per page as racer-sim's
-  check requires. Since `FlightFull` both reach origin once per page at 400 nodes (see
-  Scale). The rows above that predate `FlightFull` (counts other than failures and origin
-  requests) were not re-measured.
-- Completed and failed reads: equal, except origin 403 (fewer `OriginForbidden`
+  check requires. Both reach origin once per page at 400 nodes (see Scale). Every row was
+  re-measured after racer-sim adopted production's search slots and request verification.
+- Completed and failed reads: equal, except cold start 2000 (2 against 3 `FlightFull`) and origin 403 (fewer `OriginForbidden`
   failures; the 403 draw order differs because the Model's origin draws come from the
   DST `Choices` stream).
 - Latency: p50 within 1.5x of racer-sim; p99 within 1.1x except where a few reads wait out
@@ -229,9 +234,24 @@ at seed 8 (racer-sim from `NodeWorld` with the `cold_start` test's config, relea
 | 50,000 | 24,742 failed (3.1%), 47 origin | 1,094 failed (0.14%), 35 origin, 97,468 pings | 56,145 failed (7.0%), 21 origin | 30,697 failed (3.8%; 1,030,672 relay sheds), 21 origin, 35,011 pings, p50 0.96 s / p99 2.69 s, 92,488 B/node |
 
 At 10,000 the Model now fails 2.2x racer-sim's reads (was 3.8x). At 50,000 the gap grew to
-28x (was 2.3x): racer-sim gained more from the helper fix than the Model did, so the Model's
-50,000-node failures have another cause, not yet diagnosed. The cold start's own 1% failure
-check passes for racer-sim at 50,000 now and still fails for the Model.
+28x (was 2.3x): racer-sim gained more from the helper fix than the Model did. The cause was
+racer-sim's divergence from production, found below (50,000-node gap).
+
+Current parity (seed 8, failed reads / origin requests, racer-sim release binary on
+`tmp/parity/cold<N>.json`, Model `model_memory_per_node` with `MODEL_NODES`). racer-sim now has
+production's search slots (no queue) and request verification (see Modeled):
+
+| Nodes | racer-sim | Model | Model / racer-sim failures | relay sheds (racer-sim / Model) | latency p50 / p99 (racer-sim / Model) |
+|---|---|---|---|---|---|
+| 400 | 0 / 16 | 0 / 16 | equal | 12 / not recorded | 92 ms, 184 ms / 111 ms, 2.05 s |
+| 2,000 | 3 / 16 (`FlightFull`) | 2 / 17 (`FlightFull`) | 0.7x | 787 / 863 | 150 ms, 2.15 s / 172 ms, 2.15 s |
+| 10,000 | 204 / 16 | 118 / 16 | 0.6x | 25,023 / 15,768 | 268 ms, 2.15 s / 303 ms, 2.23 s |
+| 50,000 | 56,073 / 16 (7.0%) | 36,933 / 16 (4.6%) | 0.7x | 994,407 / 1,094,694 | 1.07 s, 2.68 s / 1.12 s, 2.90 s |
+
+Within tolerance at every size: failures within 2x and the same order of magnitude, origin
+requests equal (cold start 2000: 17 against 16, within `REPLICAS` per page). The cold start's
+own 1% failure check fails at 50,000 for both fidelities, so it is a production result (see
+the open question below), not a Model artifact.
 
 Since rank 0 answers `FlightFull` and the Model charges full first rankings (see below), seed
 8, failed reads / origin requests. "racer-sim, no queue" sets `search_queue` to 0, as in
@@ -245,7 +265,8 @@ production (see Route search slots):
 | 50,000 | 1,123 / 16 | 4,343 / 19 | 31,128 / 16 | 36,933 / 16 |
 
 Within tolerance at 400, 2,000 and 10,000 (1.7x racer-sim, 1.3x racer-sim without the
-queue). At 50,000 the Model fails 33x racer-sim and 8.5x racer-sim without the queue.
+queue). At 50,000 the Model fails 33x racer-sim and 8.5x racer-sim without the queue. Superseded
+by Current parity above.
 
 `FlightFull`. A flight at its waiter cap now answers `FlightFull`
 (`core/src/read/flight.rs` `JoinReject::WaiterCap`, `join_copy_existing`; production
@@ -270,41 +291,56 @@ per poll (`sim/src/node/world.rs` `spawn`), 157 M polls at 50,000 nodes. The Mod
 chunk per ranking; it now charges a worker's first ranking of a page in full
 (`ranking_polls`). This was a lead for the 50,000-node gap and did not close it.
 
-50,000-node gap (not closed). Findings, `MODEL_DIAG=1`, seed 8:
+50,000-node gap (closed). The earlier comparison was against a racer-sim that diverged
+from production in two ways, and the Model was the faithful side in both:
 
-- racer-sim's search queue hides most of its failures. Production builds `Paths` with
-  `with_limits` (`src/app.rs:1327`, `src/topology.rs:984-993`) and never calls `with_queue`, so
-  `queue_limit` is 0 (`topology/src/paths.rs:479`) and a search past the 8 slots fails
-  `Overloaded` (`paths.rs:612-614`). racer-sim queues 64 (`sim/src/node/state.rs:218-221`,
-  `topology::DEFAULT_SEARCH_QUEUE`). With the queue off racer-sim fails 4,343 reads, not 1,123,
-  and sheds 816,036 searches. racer-sim's default is the divergence; the comparison above
-  uses both.
-- Read attempts fail at the same rate in both, but the Model's failures cluster. racer-sim
-  (no queue) retries 828,485 times, the Model 616,891 times, yet the Model fails 8.5x more
-  reads: its four attempts of a failing read fail within a second of each other
-  (`Unavailable#3@0s`, 21,800 of 31,128 before the ranking change), where racer-sim's reads
-  run longer (p50 1.74 s, p99 4.0 s, max 5.4 s against the Model's 1.1 s, 2.9 s, 3.1 s).
-- Relay sheds are the cause of the failed attempts: 1,094,694 in the Model against 246,996
-  in racer-sim (no queue), for about the same relay volume (2.2 M against 1.9 M relay
-  attempts). The dominant failed walk is `Orela Orela OFail` (356,746): the first relay toward
-  owners 0 and 1 is out of `Relay` transfers, and the route failures exhaust the links
-  owner 2 needs (`HopBudgetExhausted`, unsent). Every shed is at the first relay (`hop1`).
-- Refuted: per-node route caches (10,000: 105 against 97 failures), the destination waiting
-  for request verification on the crypto helper (not waiting made 10,000 worse, 232
-  failures), and the ranking cost above.
-- Next lead: relay hold time. Model relay holds are mostly 64 to 256 ms (`relay_hold:*`); a
-  relay toward an owner holds its transfer while the owner waits on its flight. racer-sim has
-  the same rule (`send_reply`, `held`; production `src/peer/server.rs:540-560`, `:778`), so
-  compare how long racer-sim's relays hold a non-page answer: it only records page streams
-  (`relay_hold_stream_ns`, p50 27 ms).
+- Search queue. Production builds `Paths` with `with_limits` (`src/app.rs:1327`,
+  `src/topology.rs:984-993`) and never calls `with_queue`, so `queue_limit` is 0
+  (`topology/src/paths.rs:479`) and a search past the 8 slots fails `Overloaded`
+  (`paths.rs:612-614`). racer-sim queued 64. It now defaults to 0. A requester's own shed
+  search reached both fidelities' walks as a transport `Unavailable`, which counts against
+  rank 0 and let owners above rank 0 overlap rank 0's origin fetch (racer-sim's
+  `owners_above_rank_zero_do_not_overlap_a_slow_origin_fetch` failed once the queue was off).
+  Production returns `Error::Overloaded` (`src/peer.rs:919-931` through `observer.result`),
+  which `transport_outcome` (`core/src/read/errors.rs`) reads as `Overloaded`; both fidelities
+  now do the same.
+- Request verification (the root cause). Production verifies each request before it serves or
+  relays it (`src/peer/server.rs:515-518`, `:792`), on the crypto helper paired with the
+  connection's worker (`src/worker.rs` `WorkerPair`). A relay reserves its `Relay` transfer
+  after its own verification (`server.rs:539-546`) and keeps it until the answer is written back
+  (`:778`), so its hold includes the next holders' verification queues. The Model waits
+  (`Model::hop`, `verified`). racer-sim charged `verify_ns` on one helper per node and dispatched
+  at once (`hop`), so the destination answered, and the relays released their transfers, before
+  the destination's verification queue drained. Relay holds on non-page answers
+  (`relay_hold_answer_ns`, new) at 50,000: racer-sim p50 11.5 ms, p90 42 ms before; Model mostly
+  64 to 256 ms (`relay_hold:answered:*`); racer-sim p50 75 ms, p90 252 ms after. With verification
+  waited on one helper per node racer-sim failed 123,903 reads (1,438,866 relay sheds); with one
+  helper per worker, as production and the Model, 56,073.
+
+Relay sheds stay at the first relay in both: hot owners' verification queues hold every relay
+toward them, and 16 `Relay` transfers per worker (`src/worker.rs:265`) run out. Both
+fidelities release a relay when the destination decides its answer, before the answer is signed
+and carried back (Model `reply`, racer-sim `send_reply`); production holds it until the answer
+is written (`server.rs:778`), so both under-state holds slightly.
+
+Open question (production). With these costs (`verify_ns` 40 us, `sign_ns` 20 us, 2 workers)
+a 50,000-node cold start fails 4.6% (Model) to 7.0% (racer-sim) of reads, all from relay sheds
+behind hot owners' verification queues. Remedies (more `Relay` transfers, shedding before
+verification, or bounding a relay's hold) live in `src/peer/server.rs` and `src/worker.rs`,
+outside racer-core; not attempted here.
+
+Earlier leads, kept for the record: read attempts failed at similar rates but the Model's
+failures clustered (four attempts within a second); per-node route caches, the destination not
+waiting for verification (in the Model only, with one queue still coupling verify and sign),
+and the ranking cost did not close the gap.
 
 Crypto helpers (production-faithful, adopted). Production pairs each worker with its own
-crypto helper (`src/worker.rs:124-130` `WorkerPair { io, crypto }`); racer-sim has one per
-node. The Model now has one per worker (`resources.rs` `Fabric::crypto`), and a connection's
+crypto helper (`src/worker.rs:124-130` `WorkerPair { io, crypto }`); racer-sim had one per
+node and now has one per worker too. The Model now has one per worker (`resources.rs` `Fabric::crypto`), and a connection's
 worker is `probe % workers` (racer-sim `hop`; an inference about production's listener). The
 Model and production also wait for request verification before dispatch
-(`src/peer/forwarding.rs:368` `verify_request_async`); racer-sim charges `verify_ns` and goes
-on.
+(`src/peer/forwarding.rs:368` `verify_request_async`); racer-sim charged `verify_ns` and went
+on until it adopted the wait (see 50,000-node gap).
 
 Fixed: helper detours starved the remaining owners. Before the fix, the extra 10,000-node
 failures were walks `OOver HUnav OFail OFail` (`MODEL_DIAG=1`, `walk:*`). Owner 0 shed the
