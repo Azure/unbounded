@@ -477,7 +477,7 @@ impl Drop for WorkerGroup {
 
 fn driver_waker(runtime: Option<&WorkerRuntime>) -> Result<Waker> {
     let reactor = runtime.map(|runtime| runtime.reactor.waker()).transpose()?;
-    Ok(crate::rt::drivers::thread_waker(reactor))
+    Ok(crate::drivers::thread_waker(reactor))
 }
 
 /// Independently drive resource completions while a service future borrows its
@@ -2711,7 +2711,7 @@ mod tests {
 
         #[test]
         fn engine_driver_wake_survives_noop_operation_poll() {
-            use crate::rt::test_util::WakeCounter;
+            use crate::test_support::WakeCounter;
             let (_, factory) = fixture(3);
             let (io, port) = security::pair(WorkerId(0), 1, NonZeroUsize::new(1).unwrap());
             let mut engine = TestCrypto {

@@ -1496,7 +1496,7 @@ impl Flights {
     /// Reactor-facing variant registers its real waker with owned drivers. The
     /// worker must also poll at request deadlines to expire parked waiters.
     pub fn poll_with_context(&self, cx: &mut Context<'_>, work_budget: usize) -> Result<()> {
-        crate::rt::drivers::poll(cx, work_budget);
+        crate::drivers::poll(cx, work_budget);
         self.admission_deadlines.poll(self.clock.now(), work_budget);
         self.sweep_budgeted(work_budget)
     }
@@ -1534,8 +1534,7 @@ impl Flights {
                 self.poll_with_context(cx, self.limits.entries)?;
                 let waker = WakeTarget(cx.waker().clone());
                 let mut table = self.table.borrow_mut();
-                if table.is_empty() && self.waiting.is_empty() && crate::rt::drivers::pending() == 0
-                {
+                if table.is_empty() && self.waiting.is_empty() && crate::drivers::pending() == 0 {
                     return Poll::Ready(Ok(()));
                 }
                 scope.check()?;

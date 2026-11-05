@@ -1924,7 +1924,7 @@ fn two_worker_removal_preserves_late_driver_and_blocks_late_memory_and_disk_fill
     let memory = second.memory.clone();
     let late = late1.clone();
     let owner = second.drivers.enter();
-    crate::rt::drivers::reserve()
+    crate::drivers::reserve()
         .unwrap()
         .submit_detached(Box::pin(async move {
             receive.await.map_err(|_| Error::Cancelled)?;

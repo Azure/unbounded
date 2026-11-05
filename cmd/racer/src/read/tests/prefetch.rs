@@ -56,7 +56,7 @@ fn get(id: &str) -> PrefetchRequest<'static> {
 #[test]
 #[allow(clippy::disallowed_methods)] // Real disk writes need wall time.
 fn put_fills_every_page_through_the_owner_and_reports_success() {
-    let queue = Rc::new(crate::rt::drivers::DriverQueue::new(1024));
+    let queue = Rc::new(crate::drivers::DriverQueue::new(1024));
     let _queue = queue.enter();
     let signers = network(1);
     let mut f = fixture_with(2 * PAGE_BYTES + 7, None);
@@ -180,7 +180,7 @@ fn put_fills_every_page_through_the_owner_and_reports_success() {
 #[test]
 fn put_to_a_passthrough_cache_is_409_passthrough() {
     for mode in [CacheMode::PassthroughPeers, CacheMode::PassthroughLocal] {
-        let queue = Rc::new(crate::rt::drivers::DriverQueue::new(1024));
+        let queue = Rc::new(crate::drivers::DriverQueue::new(1024));
         let _queue = queue.enter();
         let signers = network(1);
         let mut f = fixture_with(PAGE_BYTES + 7, None);
@@ -209,7 +209,7 @@ fn put_to_a_passthrough_cache_is_409_passthrough() {
 
 #[test]
 fn bad_bodies_and_draining_nodes_get_json_errors() {
-    let queue = Rc::new(crate::rt::drivers::DriverQueue::new(1024));
+    let queue = Rc::new(crate::drivers::DriverQueue::new(1024));
     let _queue = queue.enter();
     let signers = network(1);
     let mut f = fixture_with(PAGE_BYTES + 7, None);
@@ -286,7 +286,7 @@ fn pooled_membership(
 /// node out of the cache's pool.
 #[test]
 fn a_node_that_left_the_cache_pool_refuses_retained_membership_requests() {
-    let queue = Rc::new(crate::rt::drivers::DriverQueue::new(1024));
+    let queue = Rc::new(crate::drivers::DriverQueue::new(1024));
     let _queue = queue.enter();
     let signers = network(2);
     let mut f = fixture_with(PAGE_BYTES + 7, None);
@@ -329,7 +329,7 @@ fn a_node_that_left_the_cache_pool_refuses_retained_membership_requests() {
 #[test]
 #[allow(clippy::disallowed_methods)] // Real disk writes need wall time.
 fn put_ranks_owners_only_within_the_cache_pool() {
-    let queue = Rc::new(crate::rt::drivers::DriverQueue::new(1024));
+    let queue = Rc::new(crate::drivers::DriverQueue::new(1024));
     let _queue = queue.enter();
     let signers = network(2);
     let mut f = fixture_with(4 * PAGE_BYTES + 7, None);
@@ -363,7 +363,7 @@ fn put_ranks_owners_only_within_the_cache_pool() {
 /// for peers: a peer that ranked it as owner used a stale membership.
 #[test]
 fn a_node_outside_the_cache_pool_refuses_tickets_and_fills() {
-    let queue = Rc::new(crate::rt::drivers::DriverQueue::new(1024));
+    let queue = Rc::new(crate::drivers::DriverQueue::new(1024));
     let _queue = queue.enter();
     let signers = network(2);
     let mut f = fixture_with(PAGE_BYTES + 7, None);

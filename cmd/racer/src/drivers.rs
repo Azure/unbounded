@@ -5,7 +5,7 @@
 //! original owner across nested scopes. No executor or application policy is hidden
 //! here. For example, a local proxy can drive detached cache writes alongside I/O.
 
-use crate::rt::{Error, Result, Scope, reactor::ReactorWake};
+use racer_io::{Error, Result, Scope, scoped::ReactorWake};
 use std::{
     cell::{Cell, RefCell},
     collections::VecDeque,
@@ -21,7 +21,7 @@ use std::{
 type Task = Pin<Box<dyn Future<Output = ()> + 'static>>;
 
 /// Child scopes must support cancellation requests independently of the parent.
-pub trait HedgeScope: crate::rt::Scope {
+pub trait HedgeScope: racer_io::Scope {
     /// Request cancellation without claiming that the child's work has finished.
     fn cancel(&self);
 }
@@ -74,7 +74,7 @@ thread_local! {
 ///
 /// Queues cannot move between workers:
 /// ```compile_fail
-/// use crate::rt::drivers::DriverQueue;
+/// use crate::drivers::DriverQueue;
 /// fn require_send<T: Send>() {}
 /// require_send::<DriverQueue>();
 /// ```
@@ -103,7 +103,7 @@ pub use racer_io::exec::Runnable;
 
 /// Restores the previous queue. Keep guards stack-nested, never across suspension.
 /// ```compile_fail
-/// use crate::rt::drivers::QueueGuard;
+/// use crate::drivers::QueueGuard;
 /// fn require_send<T: Send>() {}
 /// require_send::<QueueGuard>();
 /// ```
@@ -241,7 +241,7 @@ impl Drop for ActiveDriver<'_> {
 /// A future that selects its queue while polling and destroying its inner future.
 /// Even a Send inner future remains worker-local:
 /// ```compile_fail
-/// use crate::rt::drivers::Queued;
+/// use crate::drivers::Queued;
 /// fn require_send<T: Send>() {}
 /// require_send::<Queued<std::future::Ready<()>>>();
 /// ```
@@ -282,7 +282,7 @@ fn current() -> Option<Rc<DriverQueue>> {
 
 /// A reservation bound to its original worker, even if another queue is selected.
 /// ```compile_fail
-/// use crate::rt::drivers::Permit;
+/// use crate::drivers::Permit;
 /// fn require_send<T: Send>() {}
 /// require_send::<Permit>();
 /// ```
@@ -971,7 +971,7 @@ mod tests {
         assert_eq!(pending(), 0);
     }
 
-    use crate::rt::test_util::WakeCounter as WakeCount;
+    use crate::test_support::WakeCounter as WakeCount;
 
     /// Runnable ownership follows the latest poll without losing in-poll wakes or force.
     #[test]
@@ -1094,8 +1094,8 @@ mod tests {
 #[cfg(test)]
 mod scheduler_tests {
     use super::*;
-    use crate::rt::environment::Cancellation;
-    use crate::rt::test_util::WakeCounter;
+    use crate::test_support::WakeCounter;
+    use racer_io::cancel::Cancellation;
     use std::{future::Future, pin::pin, rc::Rc};
 
     /// Shares cancellation and a caller-controlled admission error across polls.
@@ -1247,7 +1247,7 @@ mod scheduler_tests {
 #[cfg(test)]
 mod hedge_tests {
     use super::*;
-    use crate::rt::{Error, environment::Cancellation};
+    use racer_io::{Error, cancel::Cancellation};
     use std::{cell::Cell, rc::Rc, task::Waker};
 
     /// Cancellation-only scope shared by a contender and its controlling fixture.
@@ -1261,7 +1261,7 @@ mod hedge_tests {
         }
     }
 
-    impl crate::rt::Scope for TestScope {
+    impl racer_io::Scope for TestScope {
         /// Hedge fixtures use portable runtime failures.
         type Error = Error;
 
@@ -1355,7 +1355,7 @@ mod hedge_tests {
             requests: Rc<Cell<usize>>,
         }
 
-        impl crate::rt::Scope for CountedScope {
+        impl racer_io::Scope for CountedScope {
             /// Preserve the wrapped scope's runtime failure type.
             type Error = Error;
 
@@ -1665,7 +1665,7 @@ mod hedge_tests {
             &parent,
             fixture.hooks(),
         ));
-        let wake = std::sync::Arc::new(crate::rt::test_util::WakeCounter::default());
+        let wake = std::sync::Arc::new(crate::test_support::WakeCounter::default());
         let waker = Waker::from(wake.clone());
         let mut cx = Context::from_waker(&waker);
         assert!(work.as_mut().poll(&mut cx).is_pending());

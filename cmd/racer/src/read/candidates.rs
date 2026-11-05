@@ -2408,7 +2408,7 @@ impl CandidatePolicy {
                 self.notices.borrow_mut().release(&group);
                 continue;
             }
-            let Ok(permit) = crate::rt::drivers::reserve() else {
+            let Ok(permit) = crate::drivers::reserve() else {
                 // No driver slot this turn: count it as a failed offer
                 // (local, so not a cut).
                 let _ = self
@@ -2457,7 +2457,7 @@ impl CandidatePolicy {
             return;
         }
         for (peer, page) in health.due_pings(now, room) {
-            let Ok(permit) = crate::rt::drivers::reserve() else {
+            let Ok(permit) = crate::drivers::reserve() else {
                 // No driver slot this turn: the ping's slot goes stale and
                 // the next timeout asks again.
                 return;
@@ -3034,12 +3034,12 @@ impl Permit {
         self.owner.metrics.record(Event::PageHedgeWon, 1);
     }
 }
-impl crate::rt::drivers::HedgeScope for RequestScope {
+impl crate::drivers::HedgeScope for RequestScope {
     fn cancel(&self) {
         let _ = RequestScope::cancel(self);
     }
 }
-impl crate::rt::drivers::HedgePolicy<Error> for &Permit {
+impl crate::drivers::HedgePolicy<Error> for &Permit {
     fn delay(&mut self, cx: &mut Context<'_>) -> Poll<()> {
         Permit::delay(self, cx)
     }
@@ -3049,8 +3049,8 @@ impl crate::rt::drivers::HedgePolicy<Error> for &Permit {
     fn failure(&mut self) -> Error {
         Error::Unavailable
     }
-    fn won(&mut self, contender: crate::rt::drivers::Contender) {
-        if contender == crate::rt::drivers::Contender::Secondary {
+    fn won(&mut self, contender: crate::drivers::Contender) {
+        if contender == crate::drivers::Contender::Secondary {
             Permit::won(self);
         }
     }
@@ -3066,7 +3066,7 @@ pub(crate) async fn race(
     parent: &crate::runtime::RequestScope,
     permit: &Permit,
 ) -> Result<crate::memory::PageResult> {
-    crate::rt::drivers::race(
+    crate::drivers::race(
         primary,
         secondary,
         primary_scope,
@@ -4894,14 +4894,14 @@ pub(super) mod tests {
             let _env = clock.environment(0).enter();
             let owner = controller(1, DUPLICATE_BYTES);
             let permit = owner.acquire().unwrap();
-            let queue = Rc::new(crate::rt::drivers::DriverQueue::new(1024));
+            let queue = Rc::new(crate::drivers::DriverQueue::new(1024));
             let _guard = queue.enter();
             let (send, receive) = futures::channel::oneshot::channel();
             let fence = Rc::new(Cell::new(false));
             let primary_fence = fence.clone();
             let completion = Rc::new(Cell::new(false));
             let done = completion.clone();
-            crate::rt::drivers::reserve()
+            crate::drivers::reserve()
                 .unwrap()
                 .submit_detached(Box::pin(async move {
                     let a = scope();

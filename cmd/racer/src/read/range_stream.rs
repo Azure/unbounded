@@ -1389,7 +1389,7 @@ impl RangeStream {
                 continue;
             };
             // A pending hold may still be applied; its completion fence says so.
-            let Ok(permit) = crate::rt::drivers::reserve() else {
+            let Ok(permit) = crate::drivers::reserve() else {
                 continue;
             };
             let directory = self.directory.clone();
@@ -1981,7 +1981,7 @@ pub(super) mod tests {
     #[test]
     fn optional_remote_observation_never_blocks_ready_delivery_or_duplicates_on_repoll() {
         for repoll in [false, true] {
-            let queue = Rc::new(crate::rt::drivers::DriverQueue::new(8));
+            let queue = Rc::new(crate::drivers::DriverQueue::new(8));
             let _queue = queue.enter();
             let f = Fixture::new(crate::test_support::cluster::config(false).limits, 2);
             let directory = f.streams.directory();

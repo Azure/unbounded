@@ -4,6 +4,7 @@ use crate::admission::AdmissionPolicy;
 use crate::control::Snapshot;
 use crate::control::cell::PublicationCell;
 use crate::control::publication::PublicationTarget;
+use crate::drivers::DriverQueue;
 use crate::http::Delivery;
 use crate::memory::BufferPool;
 use crate::memory::MemoryCache;
@@ -20,7 +21,6 @@ use crate::read::flight::Flights;
 use crate::read::metadata::MetadataDependencies;
 use crate::read::metadata::MetadataService;
 use crate::read::range_stream::RangeStreams;
-use crate::rt::drivers::DriverQueue;
 use crate::runtime::Reactor;
 use crate::security::CredentialCrypto;
 use crate::security::CryptoClient;
@@ -365,8 +365,6 @@ pub mod cluster {
         }
     }
 }
-
-pub use crate::rt::test_util::WakeCounter;
 
 /// Assemble the real worker without activating I/O for wake and quota scenarios.
 pub(crate) fn wake_test_worker() -> crate::app::WorkerApplication {
@@ -1108,4 +1106,37 @@ pub fn clock() -> racer_io::Clock {
     crate::rt::environment::Environment::current()
         .worker_ctx()
         .clock
+}
+
+/// Counts owned and borrowed wakes across threads.
+#[derive(Default)]
+pub struct WakeCounter(std::sync::atomic::AtomicUsize);
+
+impl WakeCounter {
+    /// Read the number of wake calls observed so far.
+    pub fn count(&self) -> usize {
+        self.0.load(std::sync::atomic::Ordering::SeqCst)
+    }
+}
+
+impl std::task::Wake for WakeCounter {
+    /// Count an owned wake; borrowed wakes use the trait's default forwarding.
+    fn wake(self: std::sync::Arc<Self>) {
+        self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+#[cfg(test)]
+mod wake_counter_tests {
+    use super::*;
+
+    /// Shared wake instrumentation counts owned and borrowed notifications equally.
+    #[test]
+    fn counts_owned_and_borrowed_wakes() {
+        let counter = std::sync::Arc::new(WakeCounter::default());
+        let waker = std::task::Waker::from(counter.clone());
+        waker.wake_by_ref();
+        waker.wake();
+        assert_eq!(counter.count(), 2);
+    }
 }

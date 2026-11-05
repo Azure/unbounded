@@ -170,7 +170,7 @@ impl PeerServer {
         let receiver = connection.state().session.as_ref()?.peer();
         let (ticket, sample) =
             samples.begin(pair, self.signatures.node(), receiver, scope.clock().now())?;
-        let permit = match crate::rt::drivers::reserve().map_err(Error::from) {
+        let permit = match crate::drivers::reserve().map_err(Error::from) {
             Ok(p) => p,
             Err(error) => {
                 sample.finish(Some(error));

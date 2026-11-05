@@ -184,7 +184,7 @@ struct SubscriptionFixture {
     root: PathBuf,
     clients: client::listener::ClientListeners,
     endpoint: read::dispatch::WorkerEndpoint,
-    drivers: Rc<crate::rt::drivers::DriverQueue>,
+    drivers: Rc<crate::drivers::DriverQueue>,
     engine: security::PageCryptoEngine,
     crypto: Rc<security::CryptoClient>,
     reactor: Rc<Reactor>,
@@ -408,7 +408,7 @@ impl SubscriptionFixture {
         futures::executor::block_on(clients.reconcile(std::slice::from_ref(&cache), &scope))
             .unwrap();
         std::fs::write(root.join("ready"), b"ready").unwrap();
-        let drivers = Rc::new(crate::rt::drivers::DriverQueue::new(1024));
+        let drivers = Rc::new(crate::drivers::DriverQueue::new(1024));
         Self {
             root,
             clients,

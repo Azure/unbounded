@@ -2,10 +2,10 @@
 
 #[cfg(test)]
 use crate::control::rest::Response;
+use crate::drivers::Busy;
 use crate::error::Error;
 use crate::error::Operation;
 use crate::error::Result;
-use crate::rt::drivers::Busy;
 #[cfg(test)]
 use crate::runtime::Reactor;
 use crate::runtime::RequestScope;
@@ -1199,7 +1199,7 @@ pub(crate) mod tests {
             {
                 Box::pin(async move {
                     if self.0.replace(true) {
-                        crate::rt::drivers::poll_scoped(scope, |_| {
+                        crate::drivers::poll_scoped(scope, |_| {
                             std::task::Poll::<Result<Response>>::Pending
                         })
                         .await

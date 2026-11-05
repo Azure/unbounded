@@ -973,7 +973,7 @@ fn send_tag_http_success_failure_drop_do_not_wait_for_crypto() {
     use crate::telemetry::Samples;
     for mode in ["success", "failure", "drop"] {
         let f = RelayFixture::new(true);
-        let queue = Rc::new(crate::rt::drivers::DriverQueue::new(1024));
+        let queue = Rc::new(crate::drivers::DriverQueue::new(1024));
         let _guard = queue.enter();
         let (_, ids) = identities();
         let (io, _engine) = pair(

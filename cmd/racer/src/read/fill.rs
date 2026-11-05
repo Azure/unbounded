@@ -256,7 +256,7 @@ impl Fill {
             } else {
                 self.dependencies.flights.admit_local(page, None)?;
                 started = true;
-                let permit = crate::rt::drivers::reserve().map_err(Error::from)?;
+                let permit = crate::drivers::reserve().map_err(Error::from)?;
                 let flight = if probe {
                     Some(self.dependencies.flights.reserve_copy_flight(page, scope)?)
                 } else {
@@ -319,7 +319,7 @@ impl Fill {
                 if probe {
                     scope.check()?;
                 }
-                crate::rt::drivers::poll(cx, 64);
+                crate::drivers::poll(cx, 64);
                 let result = std::task::ready!(std::pin::Pin::new(&mut receive).poll(cx));
                 scope.check()?;
                 std::task::Poll::Ready(result)
@@ -1640,7 +1640,7 @@ impl Fill {
                 cached
             }
         };
-        let driver_permit = crate::rt::drivers::reserve().map_err(Error::from)?;
+        let driver_permit = crate::drivers::reserve().map_err(Error::from)?;
         let acquisition = waiter.acquisition(&leader)?;
         // The driver stays on this owner. Admit an independent zeroizing context
         // without crossing an AEAD domain.
@@ -1820,7 +1820,7 @@ impl Fill {
             Ok(())
         }));
         let remaining = std::future::poll_fn(|cx| {
-            crate::rt::drivers::poll(cx, 64);
+            crate::drivers::poll(cx, 64);
             if !self.fence_acquisition || !acquisition.scope.cancellation.is_cancelled() {
                 acquisition.cancellation.register(cx.waker());
             }
@@ -2025,7 +2025,7 @@ impl Fill {
         let mut receive = if let Some(existing) = existing {
             existing
         } else {
-            let permit = crate::rt::drivers::reserve().map_err(Error::from)?;
+            let permit = crate::drivers::reserve().map_err(Error::from)?;
             let flight = self.dependencies.flights.reserve_copy_flight(page, scope)?;
             let owned_scope = scope.child(scope.request, scope.deadline.0)?;
             let (receive, completion) = self
@@ -2067,7 +2067,7 @@ impl Fill {
         std::future::poll_fn(|cx| {
             cancellation.register(cx.waker());
             scope.check()?;
-            crate::rt::drivers::poll(cx, 64);
+            crate::drivers::poll(cx, 64);
             std::pin::Pin::new(&mut receive).poll(cx)
         })
         .await
@@ -2797,7 +2797,7 @@ impl Fill {
         {
             return;
         }
-        let Ok(permit) = crate::rt::drivers::reserve() else {
+        let Ok(permit) = crate::drivers::reserve() else {
             return;
         };
         let mut fill = self.clone();

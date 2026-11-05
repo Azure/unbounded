@@ -246,7 +246,7 @@ impl WorkerDirectory {
         };
         // Reserve bounded worker-owned progress BEFORE retaining a mailbox
         // receipt. Dropping or delaying this optional task cannot hold delivery.
-        let Ok(permit) = crate::rt::drivers::reserve() else {
+        let Ok(permit) = crate::drivers::reserve() else {
             return;
         };
         if self.is_local(owner) {
@@ -546,7 +546,7 @@ impl WorkerDirectory {
                 }
                 continue;
             }
-            let Ok(permit) = crate::rt::drivers::reserve() else {
+            let Ok(permit) = crate::drivers::reserve() else {
                 continue;
             };
             let clock = self.ctx.clock.clone();
@@ -860,7 +860,7 @@ impl WorkerDirectory {
                 mailbox.retain_failed_verdict(report);
             }
         };
-        let Ok(permit) = crate::rt::drivers::reserve() else {
+        let Ok(permit) = crate::drivers::reserve() else {
             retain(report);
             return;
         };
@@ -1439,7 +1439,7 @@ mod tests {
     }
     #[test]
     fn failed_sealed_verdict_survives_full_driver_queue() {
-        let queue = Rc::new(crate::rt::drivers::DriverQueue::new(1));
+        let queue = Rc::new(crate::drivers::DriverQueue::new(1));
         let _queue = queue.enter();
         let workers = vec![WorkerId(0), WorkerId(1)];
         let directory = Arc::new(
@@ -1452,7 +1452,7 @@ mod tests {
             .unwrap(),
         );
         let page = page_owned_by(&directory, WorkerId(1));
-        let full = crate::rt::drivers::reserve().unwrap();
+        let full = crate::drivers::reserve().unwrap();
         {
             let (local, _fixture) = crate::read::tests::admission_coordinator();
             let _local = directory.simulation_scope(Some((WorkerId(0), local)));
@@ -1466,7 +1466,7 @@ mod tests {
     }
     #[test]
     fn failed_sealed_verdict_survives_full_mailbox() {
-        let queue = Rc::new(crate::rt::drivers::DriverQueue::new(64));
+        let queue = Rc::new(crate::drivers::DriverQueue::new(64));
         let _queue = queue.enter();
         let workers = vec![WorkerId(0), WorkerId(1)];
         let directory = Arc::new(
@@ -1493,7 +1493,7 @@ mod tests {
     /// Run `report_sealed` for a landed page owned by worker 1 from worker 0,
     /// and return worker 0's new CorruptMiss count and worker 1's mailbox.
     fn landed_verdict(passed: bool) -> (u64, usize) {
-        let queue = Rc::new(crate::rt::drivers::DriverQueue::new(64));
+        let queue = Rc::new(crate::drivers::DriverQueue::new(64));
         let _queue = queue.enter();
         let workers = vec![WorkerId(0), WorkerId(1)];
         let directory = Arc::new(
@@ -1987,7 +1987,7 @@ mod tests {
     /// A parked real acquisition cannot prevent an unrelated mailbox completion.
     #[test]
     fn bounded_admission_mailbox_keeps_other_work_progressing() {
-        let queue = Rc::new(crate::rt::drivers::DriverQueue::new(1024));
+        let queue = Rc::new(crate::drivers::DriverQueue::new(1024));
         let _owner = queue.enter();
         let directory = Arc::new(directory(4));
         let (local, _fixture) = crate::read::tests::admission_coordinator();
