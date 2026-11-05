@@ -33,7 +33,7 @@ use super::hints::{MAX_DEFERRALS, SuccessorHints, defer_allowed, successor_defer
 use super::serve::{Decision, ServeDecision, ServeRequest, Step};
 use super::walk::{Evidence, FillConfig, SilenceNote};
 use super::window::{self, AcquisitionBudgetSpec, Facts, Fetched, Next, ReadWindow, WindowConfig};
-use super::{Error, RefreshPurpose, acquisition_failure};
+use super::{Error, RefreshPurpose, Source, acquisition_failure};
 use crate::flow::coalesce::flight::state::Published;
 use crate::prefetch::OwnerBudget;
 use std::collections::hash_map::DefaultHasher;
@@ -51,6 +51,11 @@ pub trait Types: 'static {
     type Page: Clone + Debug + Eq + Hash + Ord;
     type Object: Clone + Debug + Eq + Hash;
     type Metadata: Clone + Debug + Eq;
+    /// The value a completed page flight publishes to its joiners and a client read ends with.
+    type Value: Clone + Debug + Eq + 'static;
+
+    /// The flight value for `page` acquired from `source`.
+    fn value(page: &Self::Page, source: Source) -> Self::Value;
 }
 
 /// One page acquisition of this worker.
@@ -129,7 +134,7 @@ pub enum Effect<T: Types> {
     Completed {
         request: RequestId,
         page: T::Page,
-        result: Result<(), Error>,
+        result: Result<T::Value, Error>,
     },
     /// Refresh `key`'s metadata from origin; answer [`WorkerCore::on_metadata`].
     Metadata {
@@ -362,13 +367,13 @@ struct Window<P> {
 
 type Hasher = BuildHasherDefault<DefaultHasher>;
 /// The worker's page flight payloads: the Model tracks flight structure, not bytes.
-pub struct ModelFlights<P>(std::marker::PhantomData<P>);
+pub struct ModelFlights<T>(std::marker::PhantomData<T>);
 
-impl<P: 'static> PageFlightTypes for ModelFlights<P> {
-    type Page = P;
-    type Complete = ();
-    type Partial = ();
-    type Outcome = ();
+impl<T: Types> PageFlightTypes for ModelFlights<T> {
+    type Page = T::Page;
+    type Complete = T::Value;
+    type Partial = T::Value;
+    type Outcome = T::Value;
     type Result = ();
     type Hash = Hasher;
     type Wake = Token;
@@ -377,9 +382,9 @@ impl<P: 'static> PageFlightTypes for ModelFlights<P> {
     type Retained = ();
 }
 
-type PageFlights<P> = PageFlightTable<ModelFlights<P>>;
+type PageFlights<T> = PageFlightTable<ModelFlights<T>>;
 
-fn complete(value: ()) -> Published<(), ()> {
+fn complete<V>(value: V) -> Published<V, V> {
     Published::Complete(value)
 }
 
@@ -388,7 +393,7 @@ pub struct WorkerCore<T: Types> {
     ids: EffectIds,
     next: u64,
     routing: Routing<T>,
-    flights: PageFlights<T::Page>,
+    flights: PageFlights<T>,
     flight: BTreeMap<T::Page, Flight>,
     requests: BTreeMap<RequestId, Request<T::Page>>,
     reads: BTreeMap<ReadId, Read<T>>,
@@ -555,9 +560,9 @@ impl<T: Types> WorkerCore<T> {
                 self.poll(request, now, out);
                 Some(request)
             }
-            Ok(Joined::Settled(_)) => {
+            Ok(Joined::Settled(Settled::Complete(value) | Settled::Partial(value))) => {
                 let request = RequestId(self.allocate());
-                self.reply(request, &page, reply, Ok(()), now, out);
+                self.reply(request, &page, reply, Ok(value), now, out);
                 Some(request)
             }
             Err(error) => {
@@ -619,7 +624,9 @@ impl<T: Types> WorkerCore<T> {
                     .insert(request);
                 self.poll(request, now, out);
             }
-            Ok(Joined::Settled(_)) => self.reply(request, &page, reply, Ok(()), now, out),
+            Ok(Joined::Settled(Settled::Complete(value) | Settled::Partial(value))) => {
+                self.reply(request, &page, reply, Ok(value), now, out)
+            }
             Ok(Joined::Miss) => self.reply(request, &page, reply, Err(Error::Internal), now, out),
             Err(error) => self.reply(request, &page, reply, Err(error), now, out),
         }
@@ -655,8 +662,8 @@ impl<T: Types> WorkerCore<T> {
                     }
                 }
             }
-            Ok(Wait::Ready(Settled::Complete(()) | Settled::Partial(()))) => {
-                self.respond(request, Ok(()), now, out)
+            Ok(Wait::Ready(Settled::Complete(value) | Settled::Partial(value))) => {
+                self.respond(request, Ok(value), now, out)
             }
             Ok(Wait::Failed(error)) | Err(error) => self.respond(request, Err(error), now, out),
         }
@@ -773,7 +780,9 @@ impl<T: Types> WorkerCore<T> {
                         continue;
                     }
                     Err(acquisition::Terminal::Done(done)) => {
-                        self.finish(read, done.result.map(|_| ()), now, out);
+                        let page = page.clone();
+                        let result = done.result.map(|source| T::value(&page, source));
+                        self.finish(read, result, now, out);
                         continue;
                     }
                 };
@@ -843,7 +852,7 @@ impl<T: Types> WorkerCore<T> {
     fn finish(
         &mut self,
         read: ReadId,
-        result: Result<(), Error>,
+        result: Result<T::Value, Error>,
         now: Instant,
         out: &mut Vec<Effect<T>>,
     ) {
@@ -886,7 +895,7 @@ impl<T: Types> WorkerCore<T> {
     fn respond(
         &mut self,
         request: RequestId,
-        result: Result<(), Error>,
+        result: Result<T::Value, Error>,
         now: Instant,
         out: &mut Vec<Effect<T>>,
     ) {
@@ -917,12 +926,12 @@ impl<T: Types> WorkerCore<T> {
         request: RequestId,
         page: &T::Page,
         reply: ReplyTo,
-        result: Result<(), Error>,
+        result: Result<T::Value, Error>,
         now: Instant,
         out: &mut Vec<Effect<T>>,
     ) {
         let fetched = |sealed: bool| {
-            result.map(|()| {
+            result.clone().map(|_| {
                 if sealed {
                     Fetched::Sealed
                 } else {

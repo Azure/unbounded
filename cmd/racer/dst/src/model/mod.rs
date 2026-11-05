@@ -113,6 +113,10 @@ impl Types for ModelTypes {
     type Page = Page;
     type Object = u64;
     type Metadata = u64;
+    /// The model tracks flight structure, not page bytes.
+    type Value = ();
+
+    fn value(_page: &Self::Page, _source: racer_core::read::Source) -> Self::Value {}
 }
 
 /// A steady read load (racer-sim's Poisson arrivals and Zipf popularity, `workload.rs`): every

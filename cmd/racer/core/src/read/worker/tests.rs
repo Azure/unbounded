@@ -4,7 +4,7 @@ use super::*;
 use crate::read::acquisition::{Input as AcqInput, RankAnswer};
 use crate::read::hints::{HINT_CAPACITY, HINT_TTL};
 use crate::read::walk::{Features, HedgeEnd, Ranked, Reply};
-use crate::read::{OperationKind, PageBudget, ResponseKind, ServeFacts};
+use crate::read::{OperationKind, PageBudget, ResponseKind, ServeFacts, Source};
 use std::collections::BTreeMap;
 use std::time::Duration;
 
@@ -18,6 +18,11 @@ impl Types for Ty {
     type Page = u64;
     type Object = u64;
     type Metadata = u64;
+    type Value = Source;
+
+    fn value(_page: &Self::Page, source: Source) -> Self::Value {
+        source
+    }
 }
 
 type Core = WorkerCore<Ty>;
@@ -136,7 +141,7 @@ fn run_to_publish(c: &mut Core, now: Instant, out: &mut Vec<Effect<Ty>>) {
     c.on_acquisition(read, published, now, out).unwrap();
 }
 
-fn completed(out: &[Effect<Ty>]) -> Vec<(RequestId, Result<(), Error>)> {
+fn completed(out: &[Effect<Ty>]) -> Vec<(RequestId, Result<Source, Error>)> {
     out.iter()
         .filter_map(|e| match e {
             Effect::Completed {
@@ -155,7 +160,7 @@ fn a_read_leads_its_flight_to_completion_and_the_flight_is_removed() {
     let request = c.read_page(7, spec(now), now, &mut out);
     assert_eq!((c.flights(), c.reads()), (1, 1));
     run_to_publish(&mut c, now, &mut out);
-    assert_eq!(completed(&out), vec![(request, Ok(()))]);
+    assert_eq!(completed(&out), vec![(request, Ok(Source::Peer))]);
     assert_eq!((c.flights(), c.reads(), c.requests()), (0, 0, 0));
     assert!(
         c.observed().evidence > 0,
@@ -192,7 +197,7 @@ fn waiters_join_the_leader_and_complete_together() {
     run_to_publish(&mut c, now, &mut out);
     let mut done = completed(&out);
     done.sort_by_key(|(r, _)| *r);
-    assert_eq!(done, vec![(a, Ok(())), (b, Ok(()))]);
+    assert_eq!(done, vec![(a, Ok(Source::Peer)), (b, Ok(Source::Peer))]);
     assert_eq!((c.flights(), c.reads(), c.requests()), (0, 0, 0));
 }
 
@@ -210,7 +215,7 @@ fn a_canceled_leader_hands_its_acquisition_over() {
     assert_eq!(c.reads(), 1, "the acquisition keeps running for b");
     out = effects;
     run_to_publish(&mut c, now, &mut out);
-    assert_eq!(completed(&out), vec![(b, Ok(()))]);
+    assert_eq!(completed(&out), vec![(b, Ok(Source::Peer))]);
     assert_eq!((c.flights(), c.reads(), c.requests()), (0, 0, 0));
 }
 
@@ -247,7 +252,7 @@ fn a_copy_only_request_waits_on_the_running_flight_and_never_leads() {
     run_to_publish(&mut c, now, &mut out);
     let mut done = completed(&out);
     done.sort_by_key(|(r, _)| *r);
-    assert_eq!(done, vec![(a, Ok(())), (copy, Ok(()))]);
+    assert_eq!(done, vec![(a, Ok(Source::Peer)), (copy, Ok(Source::Peer))]);
     assert_eq!((c.flights(), c.reads(), c.requests()), (0, 0, 0));
 }
 
