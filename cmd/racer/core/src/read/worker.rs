@@ -106,11 +106,12 @@ pub enum WorkerMsg<P> {
 /// One external effect of the worker.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum Effect<T: Types> {
-    /// An effect of a running acquisition (never `Report` or `Done`: the core consumes them).
+    /// An effect of a running acquisition. Its `Report`s and `Done` are consumed by the core and
+    /// cannot be expressed here.
     Acquisition {
         read: ReadId,
         page: T::Page,
-        effect: acquisition::Effect<T::Rank, T::Membership, T::Answer>,
+        effect: acquisition::Io<T::Rank, T::Membership, T::Answer>,
     },
     /// A window effect (never a `Fetch`: the core routes it).
     Window {
@@ -142,7 +143,7 @@ pub enum Effect<T: Types> {
 impl<T: Types> Effect<T> {
     /// The resource class of this effect.
     pub fn class(&self) -> Class {
-        use acquisition::Effect as Acq;
+        use acquisition::Io as Acq;
         use window::Effect as Win;
         match self {
             Effect::Acquisition { effect, .. } => match effect {
@@ -152,8 +153,6 @@ impl<T: Types> Effect<T> {
                 Acq::Sleep { .. } => Class::Timer,
                 Acq::Publish { .. } => Class::DiskWrite,
                 Acq::Rank { .. } | Acq::Hints { .. } | Acq::Refresh { .. } => Class::WorkerMsg,
-                // Consumed by the core; a stray one is a client-visible end.
-                Acq::Report(_) | Acq::Done(_) => Class::ClientDeliver,
             },
             Effect::Window { effect, .. } => match effect {
                 Win::Probe { .. } => Class::DiskRead,
@@ -172,7 +171,7 @@ impl<T: Types> Effect<T> {
     /// The id the interpreter answers, when the effect expects an answer. A
     /// [`WorkerMsg::Fetch`] is answered by the receiving worker.
     pub fn id(&self) -> Option<EffectId> {
-        use acquisition::Effect as Acq;
+        use acquisition::Io as Acq;
         use window::Effect as Win;
         match self {
             Effect::Acquisition { effect, .. } => match effect {
@@ -186,7 +185,6 @@ impl<T: Types> Effect<T> {
                 | Acq::Sleep { id, .. }
                 | Acq::Origin { id, .. }
                 | Acq::Publish { id, .. } => Some(*id),
-                Acq::Report(_) | Acq::Done(_) => None,
             },
             Effect::Window { effect, .. } => match effect {
                 Win::Probe { id, .. }
@@ -630,10 +628,19 @@ impl<T: Types> WorkerCore<T> {
                 .on(input, &mut entry.budget, now, &mut self.ids, &mut effects)?;
             let page = entry.page.clone();
             for effect in effects {
-                use acquisition::Effect as Acq;
+                use acquisition::Io as Acq;
+                let effect = match effect.split() {
+                    Ok(io) => io,
+                    Err(acquisition::Terminal::Report(report)) => {
+                        self.observe(report);
+                        continue;
+                    }
+                    Err(acquisition::Terminal::Done(done)) => {
+                        self.finish(read, done.result.map(|_| ()), now, out);
+                        continue;
+                    }
+                };
                 match effect {
-                    Acq::Report(report) => self.observe(report),
-                    Acq::Done(done) => self.finish(read, done.result.map(|_| ()), now, out),
                     Acq::Send {
                         id,
                         probe,

@@ -577,7 +577,7 @@ impl<'s> Model<'s> {
     }
 
     fn complete(&mut self, node: u32, worker: u32, effect: Effect<ModelTypes>) {
-        use acquisition::Effect as Acq;
+        use acquisition::Io as Acq;
         let now = self.now();
         let costs = self.fabric.costs;
         let input = |read, input| Ev::Input {
@@ -715,9 +715,6 @@ impl<'s> Model<'s> {
                     self.nodes[node as usize].stored.insert(page);
                     self.engine
                         .at(at, input(read, Input::Published { id, result: Ok(()) }));
-                }
-                Acq::Report(_) | Acq::Done(_) => {
-                    self.violation(format!("node {node} leaked an acquisition end"));
                 }
             },
             Effect::Completed {

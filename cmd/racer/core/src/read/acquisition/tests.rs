@@ -130,6 +130,18 @@ fn owner_to_hints(h: &mut Harness, rank: usize) {
 }
 
 #[test]
+fn split_separates_io_from_what_the_owner_consumes() {
+    let mut h = Harness::new(true);
+    let done = h.act(Input::Start { local_hit: true }).remove(0);
+    assert!(matches!(done.split(), Err(Terminal::Done(_))));
+    let mut h = Harness::new(true);
+    let first = start(&mut h).remove(0);
+    let io = first.clone().split().expect("a walk starts with I/O");
+    assert_eq!(kind(&first), "Rank");
+    assert!(matches!(io, Io::Rank { .. }));
+}
+
+#[test]
 fn local_hit_is_done_without_effects() {
     let mut h = Harness::new(true);
     let effects = h.act(Input::Start { local_hit: true });

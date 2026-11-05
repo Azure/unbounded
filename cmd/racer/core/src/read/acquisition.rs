@@ -62,6 +62,113 @@ pub struct RankAnswer<R, M> {
     pub recent: Option<M>,
 }
 
+/// An effect of a running acquisition that the interpreter performs: every [`Effect`] except the
+/// [`Effect::Report`]s and [`Effect::Done`] the owner consumes. Holding an `Io` proves the effect
+/// is neither, so code downstream of the owner cannot meet them.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum Io<R, M, A> {
+    /// Rank the page; answer [`Input::Ranked`].
+    Rank {
+        id: EffectId,
+        ranking: Ranking,
+        basis: RankBasis<R, M>,
+    },
+    /// Report successor hints and rank 0's state under `version`; answer [`Input::Hints`].
+    Hints { id: EffectId, version: u64 },
+    /// Race a hedge if enabled, eligible and admitted; answer [`Input::Hedged`].
+    Hedge {
+        id: EffectId,
+        eligible: bool,
+        first: usize,
+        second: usize,
+    },
+    /// Report the newest adopted membership and version - 1 of `version` when recent and listing
+    /// this node; answer [`Input::Membership`].
+    Refresh { id: EffectId, version: u64 },
+    /// Send `probe` to member position `dest` of `version` (`None`: the overflow helper) on
+    /// [`PageAcquisition::request_budget`]; answer [`Input::Replied`] or [`Input::NoHelper`].
+    Send {
+        id: EffectId,
+        probe: Probe,
+        dest: Option<u32>,
+        version: u64,
+    },
+    /// Validate the payload of the answer; answer [`Input::Validated`]. A usable copy is kept by
+    /// the interpreter.
+    Validate { id: EffectId, answer: A },
+    /// Send copy-only probes to `targets`, each on its own granted budget; answer
+    /// [`Input::Batched`].
+    Batch {
+        id: EffectId,
+        version: u64,
+        targets: Vec<u32>,
+        remaining_opportunities: u32,
+    },
+    /// Wake at `until`; answer [`Input::Timer`].
+    Sleep { id: EffectId, until: Instant },
+    /// Fetch the page from origin under `authority`; answer [`Input::Origin`].
+    Origin { id: EffectId, authority: Authority },
+    /// Publish the held page; answer [`Input::Published`].
+    Publish { id: EffectId, source: Source },
+}
+
+impl<R, M, A> Effect<R, M, A> {
+    /// Split an effect into what the interpreter performs and what the owner consumes.
+    pub fn split(self) -> Result<Io<R, M, A>, Terminal> {
+        Ok(match self {
+            Effect::Rank { id, ranking, basis } => Io::Rank { id, ranking, basis },
+            Effect::Hints { id, version } => Io::Hints { id, version },
+            Effect::Hedge {
+                id,
+                eligible,
+                first,
+                second,
+            } => Io::Hedge {
+                id,
+                eligible,
+                first,
+                second,
+            },
+            Effect::Refresh { id, version } => Io::Refresh { id, version },
+            Effect::Send {
+                id,
+                probe,
+                dest,
+                version,
+            } => Io::Send {
+                id,
+                probe,
+                dest,
+                version,
+            },
+            Effect::Validate { id, answer } => Io::Validate { id, answer },
+            Effect::Batch {
+                id,
+                version,
+                targets,
+                remaining_opportunities,
+            } => Io::Batch {
+                id,
+                version,
+                targets,
+                remaining_opportunities,
+            },
+            Effect::Sleep { id, until } => Io::Sleep { id, until },
+            Effect::Origin { id, authority } => Io::Origin { id, authority },
+            Effect::Publish { id, source } => Io::Publish { id, source },
+            Effect::Report(report) => return Err(Terminal::Report(report)),
+            Effect::Done(done) => return Err(Terminal::Done(done)),
+        })
+    }
+}
+
+/// The effects of an acquisition its owner consumes instead of performing.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Terminal {
+    Report(Report),
+    Done(Done),
+}
+
 /// One external effect.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum Effect<R, M, A> {

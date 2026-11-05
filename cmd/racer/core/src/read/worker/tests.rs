@@ -155,13 +155,6 @@ fn a_read_leads_its_flight_to_completion_and_the_flight_is_removed() {
     assert_eq!((c.flights(), c.reads()), (1, 1));
     run_to_publish(&mut c, now, &mut out);
     assert_eq!(completed(&out), vec![(request, Ok(()))]);
-    assert!(out.iter().all(|e| !matches!(
-        e,
-        Effect::Acquisition {
-            effect: acquisition::Effect::Done(_) | acquisition::Effect::Report(_),
-            ..
-        }
-    )));
     assert_eq!((c.flights(), c.reads(), c.requests()), (0, 0, 0));
     assert!(
         c.observed().evidence > 0,
@@ -466,7 +459,7 @@ fn a_shed_requester_asks_its_mesh_helper() {
         .iter()
         .filter_map(|e| match e {
             Effect::Acquisition {
-                effect: acquisition::Effect::Send { dest, .. },
+                effect: acquisition::Io::Send { dest, .. },
                 ..
             } => Some(*dest),
             _ => None,
@@ -487,7 +480,7 @@ fn a_shed_requester_without_a_helper_walks_on() {
     assert!(out.iter().all(|e| !matches!(
         e,
         Effect::Acquisition {
-            effect: acquisition::Effect::Send { dest: None, .. },
+            effect: acquisition::Io::Send { dest: None, .. },
             ..
         }
     )));
@@ -797,7 +790,7 @@ fn answer(
     out: &mut Vec<(usize, Effect<Ty>)>,
     ended: &mut BTreeSet<(usize, WindowId)>,
 ) {
-    use acquisition::Effect as Acq;
+    use acquisition::Io as Acq;
     let mut o = Vec::new();
     let c = &mut cores[w];
     let fail = rng.below(5) == 0;
@@ -869,7 +862,6 @@ fn answer(
                     },
                 },
                 Acq::Publish { id, .. } => AcqInput::Published { id, result: Ok(()) },
-                Acq::Report(_) | Acq::Done(_) => panic!("the core consumes reports and ends"),
             };
             let _ = c.on_acquisition(read, input, now, &mut o);
         }
