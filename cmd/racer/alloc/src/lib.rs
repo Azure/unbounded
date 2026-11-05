@@ -157,10 +157,12 @@
 #![deny(unsafe_op_in_unsafe_fn)]
 #![deny(missing_docs)]
 
+pub mod buf;
 mod demand;
 pub mod index;
 pub mod retention;
 mod segments;
+mod sync;
 
 mod slab;
 
