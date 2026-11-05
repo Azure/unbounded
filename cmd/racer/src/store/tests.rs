@@ -369,7 +369,10 @@ fn hard_hold_checkpoint_roundtrip_restores_only_live_disk_reservations() {
             .install_shard(image.shards.into_iter().next()),
     )
     .unwrap();
-    assert_eq!(index.hold_expiry(&id.version), Some(until));
+    // Only the remaining duration survives; the wall deadline is recomputed.
+    let restored_until = index.hold_expiry(&id.version).unwrap();
+    assert!(restored_until <= until + Duration::from_secs(1));
+    assert!(restored_until + Duration::from_secs(5) > until);
     // Holder identities are not persisted: a restored page has one holder.
     assert_eq!(index.hold_holders(&id), 1);
     // A restored hold is a new lifetime: releases issued before the restore
@@ -383,11 +386,9 @@ fn hard_hold_checkpoint_roundtrip_restores_only_live_disk_reservations() {
     assert_eq!(index.hold_holders(&id), 0);
     assert_eq!(index.hold_expiry(&id.version), None);
     let mut image = checkpoint::decode(&bytes).unwrap();
-    for segment in &mut image.shards[0].segments {
-        for (_, deadline) in &mut segment.retained_records {
-            *deadline = std::time::UNIX_EPOCH;
-        }
-    }
+    assert_eq!(image.shards[0].holds.len(), 1);
+    // A cut taken after the hold ended carries no hold record.
+    image.shards[0].holds.clear();
     futures::executor::block_on(
         f.store
             .recovery
@@ -471,14 +472,7 @@ fn hard_hold_checkpoint_fences_warm_owned_publication_and_restores_veto() {
     drive(&f.reactor, held).unwrap();
     let shard = drive(&f.reactor, snapshot).unwrap();
     assert_eq!(shard.index.entries.len(), 1);
-    assert_eq!(
-        shard
-            .segments
-            .iter()
-            .map(|s| s.retained_records.len())
-            .sum::<usize>(),
-        1
-    );
+    assert_eq!(shard.holds.len(), 1);
     f.store.checkpoint.finish_snapshot();
     let encoded = crate::store::checkpoint::encode(&crate::store::checkpoint::CheckpointImage {
         version: crate::store::checkpoint::CHECKPOINT_VERSION,
@@ -494,7 +488,8 @@ fn hard_hold_checkpoint_fences_warm_owned_publication_and_restores_veto() {
             .install_shard(restored.shards.into_iter().next()),
     )
     .unwrap();
-    assert_eq!(index.held_page_expiry(&id), Some(until));
+    let expiry = index.held_page_expiry(&id).unwrap();
+    assert!(expiry <= until + Duration::from_secs(1) && expiry + Duration::from_secs(5) > until);
     let segment = index.lookup(&id).unwrap().unwrap().location.segment;
     assert!(!page_alloc::SegmentEntries::can_reclaim(&**index, segment));
     drop(f.segments.append(32 * 1024 * 1024).unwrap());
@@ -564,17 +559,11 @@ fn hard_hold_checkpoint_captures_hold_added_during_index_traversal() {
     let until = racer_io::Clock::host().wall_now() + Duration::from_secs(60);
     index.reserve_hold(&id.version, 1, until).unwrap();
     let shard = futures::executor::block_on(snapshot).unwrap();
-    assert_eq!(
-        shard
-            .segments
-            .iter()
-            .map(|s| s.retained_records.len())
-            .sum::<usize>(),
-        1
-    );
+    assert_eq!(shard.holds.len(), 1);
     f.store.checkpoint.finish_snapshot();
     futures::executor::block_on(f.store.recovery.install_shard(Some(shard))).unwrap();
-    assert_eq!(index.held_page_expiry(&id), Some(until));
+    let expiry = index.held_page_expiry(&id).unwrap();
+    assert!(expiry <= until + Duration::from_secs(1) && expiry + Duration::from_secs(5) > until);
 }
 
 #[test]
@@ -1693,7 +1682,7 @@ fn checkpoint_infeasible_budget_does_not_pause_an_inflight_writer() {
     let base = super::checkpoint::snapshot_base_bytes(f.segments.count()).unwrap();
     let pages = base + super::checkpoint::snapshot_entry_bytes(&metadata);
     let descriptors = pages + super::checkpoint::snapshot_metadata_bytes(&metadata);
-    let held = descriptors + super::checkpoint::RETAINED_RECORD_BYTES;
+    let held = descriptors + super::checkpoint::HELD_RECORD_BYTES;
 
     let copy = f.copy(2, 113);
     let id = copy.ciphertext.envelope().page.clone();
@@ -1748,7 +1737,7 @@ fn checkpoint_exact_budget_matches_full_snapshot_with_holds() {
     let budget = super::checkpoint::snapshot_base_bytes(f.segments.count()).unwrap()
         + super::checkpoint::snapshot_entry_bytes(&metadata)
         + super::checkpoint::snapshot_metadata_bytes(&metadata)
-        + super::checkpoint::RETAINED_RECORD_BYTES;
+        + super::checkpoint::HELD_RECORD_BYTES;
     assert!(matches!(
         drive(
             &f.reactor,
@@ -1770,8 +1759,15 @@ fn checkpoint_exact_budget_matches_full_snapshot_with_holds() {
         })
         .unwrap()
     };
-    let full = bytes(full);
-    assert_eq!(bytes(incremental), full);
+    // Remaining hold time differs between the two cuts by the time elapsed.
+    let normalize = |mut shard: super::checkpoint::ShardImage| {
+        for (_, ttl) in &mut shard.holds {
+            *ttl = Duration::from_secs(60);
+        }
+        shard
+    };
+    let full = bytes(normalize(full));
+    assert_eq!(bytes(normalize(incremental)), full);
     assert_eq!(full.len(), budget + 32 + 36 + 4 + 32);
     f.store.checkpoint.finish_snapshot();
     assert!(!f.store.writer.paused.get());
@@ -4449,6 +4445,7 @@ mod checkpoint {
             geometry: geometry(),
             index: index.snapshot().unwrap(),
             segments: segments.snapshot(),
+            holds: vec![],
         }
     }
 
@@ -4554,7 +4551,7 @@ mod checkpoint {
     fn cluster_round_trips_and_binds_the_digest() {
         let original = image(3);
         let bytes = encode(&original).unwrap();
-        assert_eq!(CHECKPOINT_VERSION, 2);
+        assert_eq!(CHECKPOINT_VERSION, 3);
         assert_eq!(&bytes[32..68], original.cluster.0.as_bytes());
         let decoded = decode(&bytes).unwrap();
         assert_eq!(decoded.cluster, original.cluster);
@@ -4748,17 +4745,18 @@ mod checkpoint {
                 geometry: geometry(),
                 index: index.snapshot().unwrap(),
                 segments: segments.snapshot(),
+                holds: vec![],
             }],
         };
         let bytes = checkpoint_format::encode(&image).unwrap();
-        assert_eq!(bytes.len(), 256);
-        let digest: String = bytes[224..]
+        assert_eq!(bytes.len(), 252);
+        let digest: String = bytes[220..]
             .iter()
             .map(|byte| format!("{byte:02x}"))
             .collect();
         assert_eq!(
             digest,
-            "0a8d0b1b2ee0e087578382b7d98f70a95220ad3e3a9b4c5839bd4d994000e7b3"
+            "97f3dc695de6f0100f14f371fcf48fdf99b60469171e1e8e802e888d618e384d"
         );
     }
 
@@ -4766,19 +4764,20 @@ mod checkpoint {
     fn populated_cut_has_stable_current_binary_vector() {
         let bytes = checkpoint_format::encode(&image(7)).unwrap();
         // image(7) layout: header 32 + cluster UUID 36 + shard count 4 + worker 2 + geometry 80
-        // + segment count 4 + two segments 58 + page count 4 + descriptor 92
+        // + segment count 4 + two segments 50 + page count 4 + descriptor 92
         // (36-byte cache, 32-byte key, 4-byte quoted ETag, length 8, three
         // string lengths 12) + page fields 56 (page number, key ID, segment,
         // generation, extent offset and length) + descriptor count 4 + the
-        // standalone "empty" descriptor 95 = 467 body bytes, then the digest.
-        assert_eq!(bytes.len(), 499);
-        let digest: String = bytes[467..]
+        // standalone "empty" descriptor 95 + hold count 4 = 463 body bytes,
+        // then the digest.
+        assert_eq!(bytes.len(), 495);
+        let digest: String = bytes[463..]
             .iter()
             .map(|byte| format!("{byte:02x}"))
             .collect();
         assert_eq!(
             digest,
-            "b8d46e4aa27e93ec10d3df93a60687b0772d7d14926a77fb5b883b8990e5b34a"
+            "188367304f9eee50bf312335bc838c5277b171ac387e50c28f3d3f5bc02d4220"
         );
         let decoded = checkpoint_format::decode(&bytes).unwrap();
         assert_eq!(decoded.shards[0].index.entries.len(), 1);

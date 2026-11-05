@@ -48,10 +48,6 @@ pub struct SegmentSnapshot {
 
     /// Aligned occupied prefix, including record padding.
     pub used_bytes: u64,
-
-    /// Caller-owned checkpoint hints: record offsets and retention deadlines.
-    /// Allocation ignores these; the caller must restore its own eviction vetoes.
-    pub retained_records: Vec<(u64, std::time::SystemTime)>,
 }
 
 /// Unique worker-local lease that prevents reuse until its completion owner drops.
@@ -312,7 +308,6 @@ impl Segments {
                     generation: Generation(1),
                     state: SegmentState::Free,
                     used_bytes: 0,
-                    retained_records: Vec::new(),
                 },
                 leases: Rc::new(Cell::new(0)),
             })
@@ -601,7 +596,6 @@ impl Segments {
             *used = 0;
         }
         for (slot, mut image) in slots.iter_mut().zip(images) {
-            image.retained_records.clear();
             image.generation = Self::restored_generation(&image, &slot.image)?;
             if image.state == SegmentState::Open {
                 image.state = SegmentState::Sealed;

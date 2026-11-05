@@ -822,7 +822,6 @@ impl GeometryModel {
                 generation: Generation(1),
                 state: SegmentState::Sealed,
                 used_bytes: bytes,
-                retained_records: Vec::new(),
             });
         }
         assert_eq!(segments.snapshot(), expected);

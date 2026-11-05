@@ -566,72 +566,81 @@ impl Index {
         Ok(())
     }
 
+    /// Append every live published hold as (page, remaining duration). The
+    /// remaining time comes from the monotonic deadline only, so a wall-clock
+    /// step can neither extend nor shorten a hold across a restart.
     pub(super) fn snapshot_holds(
         &self,
-        segments: &mut [page_alloc::SegmentSnapshot],
+        out: &mut Vec<(PageId, std::time::Duration)>,
         remaining: &mut usize,
     ) -> Result<()> {
         let holds = self.holds.borrow();
-        for hold in holds.entries.values().filter(|hold| hold.live(&self.clock)) {
-            for location in hold.locations.values() {
+        let state = self.state.borrow();
+        let now = self.clock.now();
+        for (version, hold) in holds
+            .entries
+            .iter()
+            .filter(|(_, hold)| hold.live(&self.clock))
+        {
+            let ttl = hold.monotonic.saturating_duration_since(now);
+            for (number, location) in &hold.locations {
+                let page = PageId {
+                    version: version.clone(),
+                    number: *number,
+                };
+                if state
+                    .pages
+                    .get(&page)
+                    .is_none_or(|entry| entry.location != *location)
+                {
+                    continue;
+                }
                 *remaining = remaining
-                    .checked_sub(super::checkpoint::RETAINED_RECORD_BYTES)
+                    .checked_sub(super::checkpoint::HELD_RECORD_BYTES)
                     .ok_or(Error::Overloaded)?;
-                segments
-                    .get_mut(location.segment.0 as usize)
-                    .ok_or(Error::CorruptRecord)?
-                    .retained_records
-                    .push((location.extent.offset(), hold.until));
+                out.push((page, ttl));
             }
         }
         Ok(())
     }
 
-    pub(super) fn restore_holds(&self, segments: &[page_alloc::SegmentSnapshot]) -> Result<()> {
-        let now = self.clock.wall_now();
-        let mut deadlines = HashMap::default();
-        for segment in segments {
-            for (offset, until) in &segment.retained_records {
-                if *until > now {
-                    deadlines.insert(*offset, *until);
-                }
-            }
-        }
+    /// Rebuild holds from checkpointed remaining durations, measured from now.
+    pub(super) fn restore_holds(&self, held: &[(PageId, std::time::Duration)]) -> Result<()> {
+        let wall = self.clock.wall_now();
+        let now = self.clock.now();
         let mut versions: HashMap<ObjectVersion, super::holds::Hold> = HashMap::default();
-        // Pages are visited in hash order; collect them and sort each set once
-        // rather than paying a vector shift per out-of-order insert.
+        // Collect each version's pages and sort the set once.
         let mut members: HashMap<ObjectVersion, Vec<crate::model::PageNumber>> = HashMap::default();
-        for (page, entry) in self.state.borrow().pages.iter() {
-            if let Some(until) = deadlines.get(&entry.location.extent.offset()) {
-                let Some(monotonic) = until
-                    .duration_since(now)
-                    .ok()
-                    .and_then(|ttl| self.clock.now().checked_add(ttl))
-                else {
-                    continue;
-                };
-                let hold =
-                    versions
-                        .entry(page.version.clone())
-                        .or_insert_with(|| super::holds::Hold {
-                            until: *until,
-                            monotonic,
-                            pages: super::holds::HoldPages::default(),
-                            holders: HashMap::default(),
-                            epoch: super::holds::HoldEpoch::default(),
-                            inflight: Rc::default(),
-                            active: Rc::new(Cell::new(0)),
-                            locations: HashMap::default(),
-                        });
-                hold.until = hold.until.max(*until);
-                hold.monotonic = hold.monotonic.max(monotonic);
-                hold.locations.insert(page.number, entry.location.clone());
-                members
-                    .entry(page.version.clone())
-                    .or_default()
-                    .push(page.number);
-            }
+        let state = self.state.borrow();
+        for (page, ttl) in held {
+            let Some(entry) = state.pages.get(page) else {
+                continue;
+            };
+            let (Some(until), Some(monotonic)) = (wall.checked_add(*ttl), now.checked_add(*ttl))
+            else {
+                continue;
+            };
+            let hold = versions
+                .entry(page.version.clone())
+                .or_insert_with(|| super::holds::Hold {
+                    until,
+                    monotonic,
+                    pages: super::holds::HoldPages::default(),
+                    holders: HashMap::default(),
+                    epoch: super::holds::HoldEpoch::default(),
+                    inflight: Rc::default(),
+                    active: Rc::new(Cell::new(0)),
+                    locations: HashMap::default(),
+                });
+            hold.until = hold.until.max(until);
+            hold.monotonic = hold.monotonic.max(monotonic);
+            hold.locations.insert(page.number, entry.location.clone());
+            members
+                .entry(page.version.clone())
+                .or_default()
+                .push(page.number);
         }
+        drop(state);
         for (version, pages) in members {
             if let Some(hold) = versions.get_mut(&version) {
                 hold.pages = pages.into_iter().collect();
@@ -652,31 +661,22 @@ impl Index {
     pub(super) fn validate_restored_holds(
         &self,
         snapshot: &IndexSnapshot,
-        segments: &[page_alloc::SegmentSnapshot],
+        held: &[(PageId, std::time::Duration)],
+        segment_count: usize,
     ) -> Result<()> {
-        let now = self.clock.wall_now();
-        let mut offsets = HashSet::default();
-        for segment in segments {
-            for (offset, until) in &segment.retained_records {
-                if *until > now {
-                    super::holds::Holds::deadline(*until, &self.clock)?;
-                    offsets.insert(*offset);
-                }
+        let pages: HashSet<&PageId> = snapshot.entries.iter().map(|(page, _)| page).collect();
+        let mut count = 0;
+        for (page, ttl) in held {
+            if ttl.is_zero() || *ttl > super::holds::MAX_HOLD_TTL {
+                return Err(Error::InvalidConfiguration);
             }
+            count += usize::from(pages.contains(page));
         }
-        // Count exactly what `restore_holds` restores as held: entries whose
-        // offsets carry a live deadline. Cached nonmember pages of a held
-        // version are not pinned by sparse holds and must not be charged.
-        let pages = snapshot
-            .entries
-            .iter()
-            .filter(|(_, entry)| offsets.contains(&entry.location.extent.offset()))
-            .count();
         let holds = self.holds.borrow();
-        let limit = (segments.len() * holds.percent / 100)
-            .min(segments.len().saturating_sub(holds.free_reserve.max(1)))
+        let limit = (segment_count * holds.percent / 100)
+            .min(segment_count.saturating_sub(holds.free_reserve.max(1)))
             .min(self.page_capacity.get() * holds.percent / 100);
-        if pages > limit || (pages != 0 && holds.segments.is_none()) {
+        if count > limit || (count != 0 && holds.segments.is_none()) {
             return Err(Error::Overloaded);
         }
         Ok(())
@@ -1059,7 +1059,7 @@ impl Index {
             let bytes = hold
                 .locations
                 .len()
-                .checked_mul(super::checkpoint::RETAINED_RECORD_BYTES)
+                .checked_mul(super::checkpoint::HELD_RECORD_BYTES)
                 .ok_or(Error::Overloaded)?;
             *remaining = remaining.checked_sub(bytes).ok_or(Error::Overloaded)?;
         }
@@ -1940,7 +1940,7 @@ mod tests {
         index
             .reserve_hold_pages(&first.version, &page_set(&held), until)
             .unwrap();
-        let mut snapshots = segments.snapshot();
+        let mut snapshots = Vec::new();
         let mut remaining = usize::MAX;
         index
             .snapshot_holds(&mut snapshots, &mut remaining)
@@ -1978,7 +1978,7 @@ mod tests {
             .reserve_hold_pages(&first.version, &page_set(&[1]), until)
             .unwrap();
         assert_eq!(index.held_snapshot().pages, 1);
-        let mut snapshots = segments.snapshot();
+        let mut snapshots = Vec::new();
         let mut remaining = usize::MAX;
         index
             .snapshot_holds(&mut snapshots, &mut remaining)
@@ -1986,10 +1986,16 @@ mod tests {
         let image = index.snapshot().unwrap();
         index.holds.borrow_mut().entries.clear();
         // Three cached pages exceed the limit of two; one held page does not.
-        index.validate_restored_holds(&image, &snapshots).unwrap();
+        index
+            .validate_restored_holds(&image, &snapshots, segments.count())
+            .unwrap();
         index.restore_holds(&snapshots).unwrap();
         assert!(!index.is_held(&pages[0]), "nonmember stays evictable");
-        assert_eq!(index.held_page_expiry(&pages[1]), Some(until));
+        // Only the remaining duration is restored; the wall deadline is
+        // recomputed from it and so cannot be later than the original.
+        let restored = index.held_page_expiry(&pages[1]).unwrap();
+        assert!(restored <= until + std::time::Duration::from_secs(1));
+        assert!(restored + std::time::Duration::from_secs(5) > until);
         assert!(!index.is_held(&pages[2]), "nonmember stays evictable");
         assert_eq!(index.held_snapshot().pages, 1);
     }
@@ -2028,7 +2034,7 @@ mod tests {
                 segments: 1
             }
         );
-        let mut snapshots = segments.snapshot();
+        let mut snapshots = Vec::new();
         let mut remaining = usize::MAX;
         index
             .snapshot_holds(&mut snapshots, &mut remaining)

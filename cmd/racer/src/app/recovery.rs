@@ -852,6 +852,7 @@ mod tests {
                             metadata: vec![],
                         },
                         segments: segments.snapshot(),
+                        holds: vec![],
                     }
                 })
                 .collect(),
