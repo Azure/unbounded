@@ -217,7 +217,7 @@ fn transport(endpoints: Vec<DiscoveredEndpoint>) -> Transport<FixtureIo> {
         "https://static.invalid".into(),
         "/nonexistent/trust.pem".into(),
     ));
-    transport.attach_io(Rc::new(FixtureIo));
+    transport.attach_io(Rc::new(FixtureIo::default()));
     transport.set_endpoints(Arc::new(std::sync::RwLock::new(endpoints)));
     transport
 }

@@ -179,7 +179,7 @@ fn tls_fixture(trailing: bool) {
     });
     let transport =
         ControlTransport::new(testing::config(format!("https://127.0.0.1:{port}"), trust));
-    transport.attach_io(Rc::new(FixtureIo));
+    transport.attach_io(Rc::new(FixtureIo::default()));
     let scope = testing::scope();
     let run = |future: Operation<'_, wire_codec::rest::Response, Error>| {
         futures::executor::block_on(future)
@@ -265,7 +265,7 @@ fn discovered_transport(
         "https://static.invalid".into(),
         "/nonexistent/trust.pem".into(),
     ));
-    transport.attach_io(Rc::new(FixtureIo));
+    transport.attach_io(Rc::new(FixtureIo::default()));
     let shared = Arc::new(std::sync::RwLock::new(endpoints));
     transport.set_endpoints(shared.clone());
     (transport, shared)

@@ -307,6 +307,9 @@ pub mod rest {
         /// Caller-owned sensitive bytes, retaining any read admission charge.
         type FileBytes: AsRef<[u8]>;
 
+        /// Worker clock and entropy for every transport decision on this owner.
+        fn ctx(&self) -> &racer_io::WorkerCtx;
+
         /// Acquire an optional admission charge before opening a connection.
         fn lease(&self) -> Result<Option<Rc<Self::Lease>>, Self::Error>;
 
@@ -720,7 +723,9 @@ pub mod rest {
         ) -> Operation<'a, Connection<I>, I::Error> {
             Box::pin(async move {
                 scope.check()?;
-                if identity.is_some_and(|i| uring_runtime::environment::wall_now() >= i.expires) {
+                if let Some(identity) = identity
+                    && self.io()?.ctx().clock.wall_now() >= identity.expires
+                {
                     return Err(Error::Unauthorized.into());
                 }
                 let discovered = self.discovered.borrow().clone();
@@ -779,15 +784,9 @@ pub mod rest {
             {
                 return Ok(connection);
             }
-            let mut random = [0; 8];
-            uring_runtime::environment::fill_random(&mut random).map_err(|_| Error::Io)?;
+            let random = io.ctx().rng.next_u64().map_err(|_| Error::Io)?;
             let health = self.health.get();
-            let order = rank(
-                &epochs,
-                health.preferred,
-                health.avoid,
-                u64::from_ne_bytes(random),
-            );
+            let order = rank(&epochs, health.preferred, health.avoid, random);
             for (index, position) in order.iter().enumerate() {
                 scope.check()?;
                 let candidate = &endpoints[*position];
@@ -797,7 +796,7 @@ pub mod rest {
                 let Ok(config) = pinned_tls_config(&candidate.certificate, identity) else {
                     continue;
                 };
-                let now = uring_runtime::environment::now();
+                let now = io.ctx().clock.now();
                 let share =
                     scope.deadline().saturating_duration_since(now) / (order.len() - index) as u32;
                 let attempt = scope.narrowed(now + share);
@@ -855,7 +854,7 @@ pub mod rest {
             let mut tls = rustls::ClientConnection::new(Arc::new(config), server)
                 .map_err(|_| Error::Unauthorized)?;
             tls.set_buffer_limit(Some(64 * 1024));
-            let authentication = self.authentication(identity, epoch, owner)?;
+            let authentication = self.authentication(io.ctx(), identity, epoch, owner)?;
             let mut connection = Connection {
                 socket,
                 tls,
@@ -885,7 +884,12 @@ pub mod rest {
                 && epochs.contains(&auth.epoch)
                 && auth.owner.upgrade().is_some()
                 && connection.within_max_age()
-                && uring_runtime::environment::now().saturating_duration_since(auth.idle_since)
+                && connection
+                    .io
+                    .ctx()
+                    .clock
+                    .now()
+                    .saturating_duration_since(auth.idle_since)
                     < Duration::from_secs(20)
                 && connection.check(scope).is_ok()
             {
@@ -898,6 +902,7 @@ pub mod rest {
         /// Create pooling metadata only for authenticated connections, after socket setup.
         fn authentication(
             &self,
+            ctx: &racer_io::WorkerCtx,
             identity: Option<Identity<'_>>,
             epoch: [u8; 32],
             owner: std::rc::Weak<()>,
@@ -905,16 +910,15 @@ pub mod rest {
             let Some(identity) = identity else {
                 return Ok(Authentication::Bootstrap);
             };
-            let mut random = [0; 8];
-            uring_runtime::environment::fill_random(&mut random).map_err(|_| Error::Io)?;
-            let retire_at =
-                uring_runtime::environment::now() + authenticated_age(u64::from_ne_bytes(random));
+            let random = ctx.rng.next_u64().map_err(|_| Error::Io)?;
+            let now = ctx.clock.now();
+            let retire_at = now + authenticated_age(random);
             Ok(Authentication::Authenticated(Authenticated {
                 expires: identity.expires,
                 epoch,
                 idle: Rc::downgrade(&self.idle),
                 owner,
-                idle_since: uring_runtime::environment::now(),
+                idle_since: now,
                 retire_at,
             }))
         }
@@ -942,7 +946,7 @@ pub mod rest {
             scope.check()?;
             // Reserve a share for every remaining address and one for TLS. A local
             // blackhole must not consume the parent's entire connection deadline.
-            let now = uring_runtime::environment::now();
+            let now = io.ctx().clock.now();
             let share = scope.deadline().saturating_duration_since(now)
                 / (addresses.len() - index + 1) as u32;
             let attempt = scope.narrowed(now + share.min(Duration::from_secs(5)));
@@ -1105,9 +1109,7 @@ pub mod rest {
         fn within_max_age(&self) -> bool {
             match &self.authentication {
                 Authentication::Bootstrap => true,
-                Authentication::Authenticated(auth) => {
-                    uring_runtime::environment::now() < auth.retire_at
-                }
+                Authentication::Authenticated(auth) => self.io.ctx().clock.now() < auth.retire_at,
             }
         }
 
@@ -1115,7 +1117,7 @@ pub mod rest {
         fn check(&self, scope: &I::Scope) -> Result<(), I::Error> {
             scope.check()?;
             if let Authentication::Authenticated(auth) = &self.authentication
-                && uring_runtime::environment::wall_now() >= auth.expires
+                && self.io.ctx().clock.wall_now() >= auth.expires
             {
                 return Err(Error::Unauthorized.into());
             }
@@ -1152,9 +1154,9 @@ pub mod rest {
                 if let Authentication::Authenticated(auth) = &self.authentication {
                     let remaining = auth
                         .expires
-                        .duration_since(uring_runtime::environment::wall_now())
+                        .duration_since(self.io.ctx().clock.wall_now())
                         .map_err(|_| Error::Unauthorized)?;
-                    bounded = scope.narrowed(uring_runtime::environment::now() + remaining);
+                    bounded = scope.narrowed(self.io.ctx().clock.now() + remaining);
                 }
                 self.io
                     .ready(
@@ -1204,7 +1206,12 @@ pub mod rest {
             let mut received = zeroize::Zeroizing::new(Vec::new());
             let mut scratch = zeroize::Zeroizing::new([0; 16384]);
             let head = loop {
-                if let Some(head) = parse_head(&received, limit, self.max_error_body)? {
+                if let Some(head) = parse_head(
+                    &received,
+                    limit,
+                    self.max_error_body,
+                    self.io.ctx().clock.wall_now(),
+                )? {
                     break head;
                 }
                 if received.len() >= 16384 {
@@ -1262,7 +1269,7 @@ pub mod rest {
                 && auth.owner.upgrade().is_some()
                 && let Some(idle) = auth.idle.upgrade()
             {
-                auth.idle_since = uring_runtime::environment::now();
+                auth.idle_since = self.io.ctx().clock.now();
                 *idle.borrow_mut() = Some(self);
             }
         }
@@ -1773,6 +1780,7 @@ pub mod rest {
         bytes: &[u8],
         limit: usize,
         max_error_body: usize,
+        wall_now: SystemTime,
     ) -> Result<Option<ResponseHead>> {
         let mut headers = [httparse::EMPTY_HEADER; 64];
         let mut response = httparse::Response::new(&mut headers);
@@ -1825,7 +1833,7 @@ pub mod rest {
                 if retry.is_some() {
                     return Err(Error::InvalidRequest);
                 }
-                retry = Some(retry_delay(h.value)?);
+                retry = Some(retry_delay(h.value, wall_now)?);
             }
             if h.name.eq_ignore_ascii_case("connection") {
                 // Defer invalid UTF-8 until after framing validation.
@@ -1875,7 +1883,7 @@ pub mod rest {
     }
 
     /// Decode delta seconds or IMF-fixdate without locale or time-zone globals.
-    fn retry_delay(bytes: &[u8]) -> Result<Duration> {
+    fn retry_delay(bytes: &[u8], wall_now: SystemTime) -> Result<Duration> {
         let text = std::str::from_utf8(bytes).map_err(|_| Error::InvalidRequest)?;
         if !text.is_empty() && text.bytes().all(|b| b.is_ascii_digit()) {
             return text
@@ -1939,9 +1947,7 @@ pub mod rest {
         let seconds = days * 86400 + hour * 3600 + minute * 60 + second;
         let target = std::time::UNIX_EPOCH
             + Duration::from_secs(seconds.try_into().map_err(|_| Error::InvalidRequest)?);
-        Ok(target
-            .duration_since(uring_runtime::environment::wall_now())
-            .unwrap_or_default())
+        Ok(target.duration_since(wall_now).unwrap_or_default())
     }
 
     /// Accept printable extension headers but never overrides of transport metadata.
@@ -2048,8 +2054,7 @@ pub mod rest {
                 for server in &servers {
                     let mut addresses = Vec::new();
                     for kind in [1u16, 28] {
-                        let attempt = scope
-                            .narrowed(uring_runtime::environment::now() + Duration::from_secs(2));
+                        let attempt = scope.narrowed(io.ctx().clock.now() + Duration::from_secs(2));
                         match query(io, *server, &name, kind, &attempt).await {
                             Ok(ips) => addresses
                                 .extend(ips.into_iter().map(|ip| SocketAddr::new(ip, port))),
@@ -2149,7 +2154,7 @@ pub mod rest {
             scope: &I::Scope,
         ) -> Result<Vec<IpAddr>, I::Error> {
             let mut id = [0; 2];
-            uring_runtime::environment::fill_random(&mut id).map_err(|_| Error::Io)?;
+            io.ctx().rng.fill(&mut id).map_err(|_| Error::Io)?;
             let mut request = vec![id[0], id[1], 1, 0, 0, 1, 0, 0, 0, 0, 0, 0];
             if name.len() > 253 {
                 return Err(Error::InvalidConfiguration.into());
@@ -2413,8 +2418,8 @@ pub mod rest {
                 vec![vec![response(), response()], vec![response(), response()]],
             );
             let transport = Transport::new(endpoint);
-            let owner_a = Rc::new(FixtureIo);
-            let owner_b = Rc::new(FixtureIo);
+            let owner_a = Rc::new(FixtureIo::default());
+            let owner_b = Rc::new(FixtureIo::default());
             transport.attach_io(owner_a.clone());
             let scope = testing::scope();
             let complete = |connection: Connection<FixtureIo>| {
@@ -2476,7 +2481,7 @@ pub mod rest {
                 ],
             );
             let transport = Transport::new(endpoint);
-            transport.attach_io(Rc::new(FixtureIo));
+            transport.attach_io(Rc::new(FixtureIo::default()));
             let scope = testing::scope();
             let get = || {
                 futures::executor::block_on(async {
@@ -2751,7 +2756,7 @@ pub mod rest {
             &b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 2\r\nTransfer-Encoding: chunked\r\n\r\n"[..],
             &b"HTTP/1.1 204 No Content\r\nContent-Length: 1\r\n\r\n"[..],
             &b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 999999\r\n\r\n"[..],
-        ] { assert!(parse_head(bytes, 10, 65536).is_err()); }
+        ] { assert!(parse_head(bytes, 10, 65536, std::time::SystemTime::now()).is_err()); }
         }
 
         /// Maximum caller limits cannot permit overflowing frame sizes or body allocation.
@@ -2763,9 +2768,14 @@ pub mod rest {
                     "HTTP/1.1 {status} Result\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n",
                     usize::MAX
                 );
-                let head = parse_head(bytes.as_bytes(), usize::MAX, usize::MAX)
-                    .unwrap()
-                    .unwrap();
+                let head = parse_head(
+                    bytes.as_bytes(),
+                    usize::MAX,
+                    usize::MAX,
+                    std::time::SystemTime::now(),
+                )
+                .unwrap()
+                .unwrap();
                 let Framing::Length(length) = head.framing else {
                     panic!("expected content length framing");
                 };
@@ -2800,7 +2810,7 @@ pub mod rest {
             ] {
                 let bytes = format!("HTTP/1.1 204 No Content\r\n{headers}Retry-After: 2\r\n\r\n");
                 assert_eq!(
-                    parse_head(bytes.as_bytes(), 10, 20).unwrap(),
+                    parse_head(bytes.as_bytes(), 10, 20, std::time::SystemTime::now()).unwrap(),
                     Some(ResponseHead {
                         status: 204,
                         header_len: bytes.len(),
@@ -2810,7 +2820,15 @@ pub mod rest {
                     })
                 );
             }
-            assert_eq!(parse_head(b"HTTP/1.1 204 No Content\r\n", 10, 20), Ok(None));
+            assert_eq!(
+                parse_head(
+                    b"HTTP/1.1 204 No Content\r\n",
+                    10,
+                    20,
+                    std::time::SystemTime::now()
+                ),
+                Ok(None)
+            );
         }
 
         /// Ignored non-UTF-8 headers remain invalid, after framing and size errors.
@@ -2819,12 +2837,18 @@ pub mod rest {
             for name in ["X-Ignored", "Connection"] {
                 let mut bytes = format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 12\r\n{name}: ").into_bytes();
                 bytes.extend_from_slice(b"\xff\r\n\r\n");
-                assert_eq!(parse_head(&bytes, 10, 20), Err(Error::Overloaded));
-                assert_eq!(parse_head(&bytes, 12, 20), Err(Error::InvalidRequest));
+                assert_eq!(
+                    parse_head(&bytes, 10, 20, std::time::SystemTime::now()),
+                    Err(Error::Overloaded)
+                );
+                assert_eq!(
+                    parse_head(&bytes, 12, 20, std::time::SystemTime::now()),
+                    Err(Error::InvalidRequest)
+                );
             }
             let bytes = b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 2\r\n\r\n\xff\xff";
-            assert!(parse_head(bytes, 2, 20).is_ok());
-            assert_eq!(parse_head(b"HTTP/1.1 429 Busy\r\nContent-Type: application/json\r\nContent-Length: 12\r\n\r\n", 10, 20).unwrap().unwrap().framing, Framing::Length(12));
+            assert!(parse_head(bytes, 2, 20, std::time::SystemTime::now()).is_ok());
+            assert_eq!(parse_head(b"HTTP/1.1 429 Busy\r\nContent-Type: application/json\r\nContent-Length: 12\r\n\r\n", 10, 20, std::time::SystemTime::now()).unwrap().unwrap().framing, Framing::Length(12));
         }
 
         /// Chunked framing retains its status-specific bound, including zero limits.
@@ -2840,10 +2864,15 @@ pub mod rest {
                     "HTTP/1.1 {status} Result\r\nContent-Type: application/json\r\nTransfer-Encoding: chunked\r\n\r\n"
                 );
                 assert_eq!(
-                    parse_head(bytes.as_bytes(), limit, max_error_body)
-                        .unwrap()
-                        .unwrap()
-                        .framing,
+                    parse_head(
+                        bytes.as_bytes(),
+                        limit,
+                        max_error_body,
+                        std::time::SystemTime::now()
+                    )
+                    .unwrap()
+                    .unwrap()
+                    .framing,
                     Framing::Chunked { bound }
                 );
             }
@@ -2851,7 +2880,8 @@ pub mod rest {
                 parse_head(
                     b"HTTP/1.1 204 Empty\r\nTransfer-Encoding: chunked\r\n\r\n",
                     10,
-                    20
+                    20,
+                    std::time::SystemTime::now()
                 ),
                 Err(Error::InvalidRequest)
             );

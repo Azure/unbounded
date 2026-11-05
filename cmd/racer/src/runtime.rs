@@ -321,6 +321,11 @@ impl uring_runtime::Budget for AdmissionBudget {
 pub struct Reactor {
     core: uring_runtime::reactor::Reactor<RequestScope, AdmissionBudget>,
     admission: Rc<flow_control::Quotas<AdmissionPolicy>>,
+    ctx: racer_io::WorkerCtx,
+    /// Test support: a context selected after construction, for tests that
+    /// switch a running worker from host time to a simulated clock.
+    #[cfg(test)]
+    ctx_override: std::cell::OnceCell<racer_io::WorkerCtx>,
 }
 impl Deref for Reactor {
     type Target = uring_runtime::reactor::Reactor<RequestScope, AdmissionBudget>;
@@ -348,7 +353,27 @@ impl Reactor {
                 );
             }),
             admission,
+            // MIGRATION: the thread environment until workers receive a WorkerCtx.
+            ctx: uring_runtime::environment::Environment::current().worker_ctx(),
+            #[cfg(test)]
+            ctx_override: std::cell::OnceCell::new(),
         }
+    }
+    /// Worker clock and entropy for code driven by this reactor.
+    pub fn ctx(&self) -> &racer_io::WorkerCtx {
+        #[cfg(test)]
+        if let Some(ctx) = self.ctx_override.get() {
+            return ctx;
+        }
+        &self.ctx
+    }
+    /// Test support: replace the construction-time context once.
+    #[cfg(test)]
+    pub(crate) fn override_ctx(&self, ctx: racer_io::WorkerCtx) {
+        assert!(
+            self.ctx_override.set(ctx).is_ok(),
+            "context already overridden"
+        );
     }
     pub fn init(&self) -> Result<()> {
         self.core.init().map_err(Into::into)

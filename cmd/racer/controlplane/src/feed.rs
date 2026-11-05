@@ -525,7 +525,7 @@ where
         {
             return Err(rest::Error::InvalidConfiguration.into());
         }
-        let now = uring_runtime::environment::now();
+        let now = host.ctx().clock.now();
         if [schedule.turn, schedule.tick, schedule.retry_max]
             .into_iter()
             .any(|delay| now.checked_add(delay).is_none())
@@ -597,7 +597,7 @@ where
         if self.stopped.get() {
             return Err(racer_io::Error::Cancelled.into());
         }
-        let now = uring_runtime::environment::now();
+        let now = self.host.ctx().clock.now();
         let scope = scope.narrowed(now.checked_add(self.schedule.turn).unwrap_or(now));
         scope.check()?;
         let next_fetch = self.state.fetch_at();
@@ -610,7 +610,7 @@ where
             scope.check()?;
             self.state
                 .advance(&self.feed, &self.target, self.host.as_ref(), self.schedule)?;
-            let now = uring_runtime::environment::now();
+            let now = self.host.ctx().clock.now();
             let tick = self
                 .host
                 .sleep(now.checked_add(self.schedule.tick).unwrap_or(now), &scope);
@@ -618,8 +618,7 @@ where
                 futures::future::Either::Left((result, _)) => match result {
                     Ok(document) => {
                         self.state.failures = 0;
-                        self.state.next_fetch =
-                            uring_runtime::environment::now() + self.schedule.tick;
+                        self.state.next_fetch = self.host.ctx().clock.now() + self.schedule.tick;
                         if let Some(document) = document
                             && self.state.accepted.as_ref().is_none_or(|old| {
                                 self.feed.codec.version(&document) > self.feed.codec.version(old)
@@ -646,14 +645,18 @@ where
                         if self.host.classify(failure.error) != FailureClass::Cancelled {
                             self.state.error = Some(failure.error);
                             self.state.failures = self.state.failures.saturating_add(1);
-                            let delay = retry_delay(self.schedule, self.state.failures);
+                            let delay = retry_delay(
+                                &self.host.ctx().rng,
+                                self.schedule,
+                                self.state.failures,
+                            );
                             let delay = if self.host.classify(failure.error) == FailureClass::Retry
                             {
                                 delay.max(failure.retry_after.unwrap_or_default())
                             } else {
                                 delay
                             };
-                            let now = uring_runtime::environment::now();
+                            let now = self.host.ctx().clock.now();
                             self.state.next_fetch =
                                 now.checked_add(delay).unwrap_or(scope.deadline());
                         }
@@ -674,7 +677,7 @@ where
         if self.stopped.get() {
             return Err(racer_io::Error::Cancelled.into());
         }
-        let now = uring_runtime::environment::now();
+        let now = self.host.ctx().clock.now();
         let scope = scope.narrowed(now.checked_add(self.schedule.turn).unwrap_or(now));
         loop {
             scope.check()?;
@@ -686,7 +689,7 @@ where
             {
                 return Ok(());
             }
-            let now = uring_runtime::environment::now();
+            let now = self.host.ctx().clock.now();
             self.host
                 .sleep(now.checked_add(self.schedule.tick).unwrap_or(now), &scope)
                 .await?;
@@ -701,7 +704,7 @@ where
         self.state.queued.take();
         self.state.prepared.take();
         self.feed.restore(self.state.accepted.clone());
-        let now = uring_runtime::environment::now();
+        let now = self.host.ctx().clock.now();
         let scope = scope.narrowed(now.checked_add(self.schedule.turn).unwrap_or(now));
         while self
             .state
@@ -711,10 +714,7 @@ where
         {
             scope.check()?;
             self.host
-                .sleep(
-                    uring_runtime::environment::now() + self.schedule.tick,
-                    &scope,
-                )
+                .sleep(self.host.ctx().clock.now() + self.schedule.tick, &scope)
                 .await?;
         }
         if let Some(job) = self.state.job.take() {
@@ -737,7 +737,14 @@ impl<C: Codec, T: Target<C>> Progress<C, T> {
 
     /// Reject without advancing the delta base or resetting failure history on a
     /// successful receipt. Keep one version's history, bounded regardless of input.
-    fn reject(&mut self, version: C::Version, feed: &Feed<C>, schedule: Schedule, now: Instant) {
+    fn reject(
+        &mut self,
+        rng: &racer_io::Rng,
+        version: C::Version,
+        feed: &Feed<C>,
+        schedule: Schedule,
+        now: Instant,
+    ) {
         let failures = self
             .rejected
             .as_ref()
@@ -747,7 +754,7 @@ impl<C: Codec, T: Target<C>> Progress<C, T> {
             version,
             failures,
             until: now
-                .checked_add(retry_delay(schedule, failures))
+                .checked_add(retry_delay(rng, schedule, failures))
                 .unwrap_or(now),
         });
         feed.restore(self.accepted.clone());
@@ -761,7 +768,7 @@ impl<C: Codec, T: Target<C>> Progress<C, T> {
         host: &H,
         schedule: Schedule,
     ) -> Result<(), C::Error> {
-        let now = uring_runtime::environment::now();
+        let now = host.ctx().clock.now();
         if self
             .job
             .as_ref()
@@ -787,10 +794,17 @@ impl<C: Codec, T: Target<C>> Progress<C, T> {
                             || host.classify(error) == FailureClass::Cancelled
                         {
                             self.queued = Some(job.document);
-                            self.next_prepare =
-                                now.checked_add(jitter(schedule.retry_min)).unwrap_or(now);
+                            self.next_prepare = now
+                                .checked_add(jitter(&host.ctx().rng, schedule.retry_min))
+                                .unwrap_or(now);
                         } else {
-                            self.reject(feed.codec.version(&job.document), feed, schedule, now);
+                            self.reject(
+                                &host.ctx().rng,
+                                feed.codec.version(&job.document),
+                                feed,
+                                schedule,
+                                now,
+                            );
                             return Err(error);
                         }
                     }
@@ -820,7 +834,7 @@ impl<C: Codec, T: Target<C>> Progress<C, T> {
                     if host.classify(error) != FailureClass::Retry {
                         let version = feed.codec.version(document);
                         self.prepared.take();
-                        self.reject(version, feed, schedule, now);
+                        self.reject(&host.ctx().rng, version, feed, schedule, now);
                         return Err(error);
                     }
                 }
@@ -844,11 +858,18 @@ impl<C: Codec, T: Target<C>> Progress<C, T> {
                     match host.classify(error) {
                         FailureClass::Retry | FailureClass::Cancelled => {
                             self.queued = Some(document);
-                            self.next_prepare =
-                                now.checked_add(jitter(schedule.retry_min)).unwrap_or(now);
+                            self.next_prepare = now
+                                .checked_add(jitter(&host.ctx().rng, schedule.retry_min))
+                                .unwrap_or(now);
                         }
                         FailureClass::Rejected | FailureClass::Permanent => {
-                            self.reject(feed.codec.version(&document), feed, schedule, now);
+                            self.reject(
+                                &host.ctx().rng,
+                                feed.codec.version(&document),
+                                feed,
+                                schedule,
+                                now,
+                            );
                         }
                     }
                     if host.classify(error) != FailureClass::Cancelled {
@@ -864,7 +885,9 @@ impl<C: Codec, T: Target<C>> Progress<C, T> {
                 Ok(handle) => self.job = Some(Job { document, handle }),
                 Err(_) => {
                     self.queued = Some(document);
-                    self.next_prepare = now.checked_add(jitter(schedule.retry_min)).unwrap_or(now);
+                    self.next_prepare = now
+                        .checked_add(jitter(&host.ctx().rng, schedule.retry_min))
+                        .unwrap_or(now);
                     return Err(racer_io::Error::Io.into());
                 }
             }
@@ -874,8 +897,9 @@ impl<C: Codec, T: Target<C>> Progress<C, T> {
 }
 
 /// Capped exponential retry shared by independent network and candidate counters.
-fn retry_delay(schedule: Schedule, failures: u32) -> Duration {
+fn retry_delay(rng: &racer_io::Rng, schedule: Schedule, failures: u32) -> Duration {
     jitter(
+        rng,
         schedule
             .retry_min
             .saturating_mul(1 << failures.saturating_sub(1).min(20))
@@ -886,9 +910,9 @@ fn retry_delay(schedule: Schedule, failures: u32) -> Duration {
 /// Equal jitter in [half, full] of the capped exponential delay. Remote hints are
 /// applied afterward as a floor, so jitter never shortens Retry-After. If entropy
 /// fails, retain the full delay rather than spinning or discarding the real error.
-fn jitter(delay: Duration) -> Duration {
+fn jitter(rng: &racer_io::Rng, delay: Duration) -> Duration {
     let mut bytes = [0; 4];
-    if uring_runtime::environment::fill_random(&mut bytes).is_err() {
+    if rng.fill(&mut bytes).is_err() {
         return delay;
     }
     jitter_sample(delay, u32::from_le_bytes(bytes))

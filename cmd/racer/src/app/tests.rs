@@ -2361,6 +2361,7 @@ fn same_node_renewal_backs_off_expires_closed_and_recovers() {
     let clock = SimulationClock::new_at(3, Instant::now(), std::time::SystemTime::now());
     let environment = clock.environment(0);
     let _clock = environment.enter();
+    runtime.reactor.override_ctx(environment.worker_ctx());
     fixture.bootstrap_status.store(503, Ordering::Release);
     turn(&mut worker, &runtime, &mut engine, Some(&clock));
     assert_eq!(control.renewal_error(), Some(Error::Unavailable));

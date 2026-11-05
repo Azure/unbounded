@@ -89,9 +89,20 @@ pub fn scope() -> TestScope {
 }
 
 /// Blocking poll is confined to loopback tests; no io_uring or Racer dependency.
-pub struct FixtureIo;
+pub struct FixtureIo(pub racer_io::WorkerCtx);
+
+impl Default for FixtureIo {
+    /// Host clock and operating-system entropy.
+    fn default() -> Self {
+        Self(racer_io::WorkerCtx::host())
+    }
+}
 
 impl Io for FixtureIo {
+    fn ctx(&self) -> &racer_io::WorkerCtx {
+        &self.0
+    }
+
     type FileBytes = zeroize::Zeroizing<Vec<u8>>;
 
     type Error = Error;
@@ -487,7 +498,7 @@ impl RotationServer {
             format!("https://racer-controller.custom-system.svc:{}", self.port),
             trust_bundle,
         ));
-        transport.attach_io(Rc::new(FixtureIo));
+        transport.attach_io(Rc::new(FixtureIo::default()));
         transport
     }
 }

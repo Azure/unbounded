@@ -401,6 +401,12 @@ impl rest::Scope for Scope {
 struct TestHost;
 
 impl rest::Io for TestHost {
+    fn ctx(&self) -> &racer_io::WorkerCtx {
+        static HOST: std::sync::LazyLock<racer_io::WorkerCtx> =
+            std::sync::LazyLock::new(racer_io::WorkerCtx::host);
+        &HOST
+    }
+
     type Error = Failure;
 
     type Scope = Scope;
@@ -1369,9 +1375,13 @@ fn weak_upgrade_during_grace_retirement_preserves_live_resolution() {
 }
 
 /// Virtual timer host advances only when the test explicitly moves its clock.
-struct ClockHost;
+struct ClockHost(racer_io::WorkerCtx);
 
 impl rest::Io for ClockHost {
+    fn ctx(&self) -> &racer_io::WorkerCtx {
+        &self.0
+    }
+
     type Error = Failure;
 
     type Scope = Scope;
@@ -1472,7 +1482,9 @@ fn candidate_rejection_backoff_survives_successful_receipts_and_newer_recovers()
         let target = Installer::new();
         let script = Script::new([]);
         let mut sync = Sync::new(
-            Rc::new(ClockHost),
+            Rc::new(ClockHost(
+                uring_runtime::environment::Environment::current().worker_ctx(),
+            )),
             Feed::new(Numbers, "/watch".into(), 16).unwrap(),
             script.clone(),
             target.clone(),

@@ -331,7 +331,11 @@ impl secure::Host for ReactorControlIo {
         parent.check()?;
         let mut scope = parent.clone();
         let mut id = [0; 16];
-        uring_runtime::environment::fill_random(&mut id).map_err(|_| Error::Io)?;
+        self.reactor
+            .ctx()
+            .rng
+            .fill(&mut id)
+            .map_err(|_| Error::Io)?;
         scope.request = crate::model::RequestId(id);
         Ok(scope)
     }
@@ -361,6 +365,10 @@ impl controlplane::Host for ReactorControlIo {
 }
 
 impl rest::Io for ReactorControlIo {
+    fn ctx(&self) -> &racer_io::WorkerCtx {
+        self.reactor.ctx()
+    }
+
     type FileBytes = uring_runtime::reactor::filesystem::ReadBuffer;
 
     type Error = Error;
