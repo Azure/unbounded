@@ -1,0 +1,55 @@
+# Reusable ClusterRoles for a controller that installs the MachineClass
+# controller with pkg/machineops/controller.AddCapacityToManager. Nothing here
+# is bound: bind each role to the controller's ServiceAccount as described
+# below.
+#
+# Bind unbounded-machineclass-controller with a ClusterRoleBinding.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: unbounded-machineclass-controller
+  labels:
+    app.kubernetes.io/name: unbounded-machineclass-controller
+    app.kubernetes.io/component: controller
+rules:
+  - apiGroups: ["unbounded-cloud.io"]
+    resources: ["machineclasses"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["unbounded-cloud.io"]
+    resources: ["machineclasses/status"]
+    verbs: ["get", "update", "patch"]
+  - apiGroups: ["unbounded-cloud.io"]
+    resources: ["sites", "machineconfigurationversions", "machineoperationcredentials"]
+    verbs: ["get", "list", "watch"]
+
+---
+# Bind unbounded-machineclass-controller-provider-config with a RoleBinding in
+# the provider-config namespace (CapacityOptions.ProviderConfigNamespace) only.
+# A ClusterRoleBinding would let the controller read every ConfigMap.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: unbounded-machineclass-controller-provider-config
+  labels:
+    app.kubernetes.io/name: unbounded-machineclass-controller
+    app.kubernetes.io/component: controller
+rules:
+  - apiGroups: [""]
+    resources: ["configmaps"]
+    verbs: ["get", "list", "watch"]
+
+---
+# Bind unbounded-machineclass-controller-credentials with a RoleBinding in the
+# credential Secret namespace (CapacityOptions.CredentialSecretNamespace) only.
+# A ClusterRoleBinding would let the controller read every Secret.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: unbounded-machineclass-controller-credentials
+  labels:
+    app.kubernetes.io/name: unbounded-machineclass-controller
+    app.kubernetes.io/component: controller
+rules:
+  - apiGroups: [""]
+    resources: ["secrets"]
+    verbs: ["get"]
