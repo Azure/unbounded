@@ -18,6 +18,7 @@ pub mod effect;
 pub mod errors;
 pub mod flight;
 pub mod hints;
+pub mod serve;
 pub mod walk;
 
 // Read-path decision errors: a subset of the dataplane's, so core decisions never widen what the
