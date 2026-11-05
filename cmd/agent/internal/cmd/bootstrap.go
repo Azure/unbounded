@@ -35,6 +35,11 @@ type agentStages struct {
 	// stageplan.go. Nil is resolved from the mode composition table on first
 	// use. Tests set it to drive the stages with a plan of their own.
 	stagePlan stagePlan
+
+	// persistAttest records the attestation settings for a later
+	// reprovision. Nil is daemon.PersistAttestConfig; tests set it to keep
+	// off the host's agent configuration directory.
+	persistAttest func(*slog.Logger, *provision.AgentAttestConfig) phases.Task
 }
 
 // canonicalImageIdentity reduces an OCI image reference to the part that
@@ -115,6 +120,10 @@ func (s *agentStages) prepareCredentials(ctx context.Context) error {
 
 	syncAttestedKubeletConfig(&s.cfg.AgentConfig, s.gs.NodeStart)
 
+	if err := s.recordAttestation(ctx); err != nil {
+		return err
+	}
+
 	// The reporter is built here rather than in the constructor because it
 	// captures credentials at construction: an empty bootstrap token makes it a
 	// permanent no-op, and it registers the Machine over the API. On an attested
@@ -127,6 +136,36 @@ func (s *agentStages) prepareCredentials(ctx context.Context) error {
 	}
 
 	s.credentialsReady = true
+
+	return nil
+}
+
+// recordAttestation records the attestation settings so a reprovision can
+// attest again instead of reusing a token that has expired by then. It is
+// recorded in every mode, because a reprovision can start from any of them,
+// but only for a host that attests: with no attestation URL nothing is
+// written, so a host that does not attest is bootstrapped exactly as before.
+//
+// An nspawn host is bootstrapped as it was before the record existed, so a
+// record it cannot write is a warning there: a later reprovision from it
+// reuses the stored bootstrap token. The other modes fail, since a host must
+// not go on believing a reprovision can attest again when it cannot.
+func (s *agentStages) recordAttestation(ctx context.Context) error {
+	persist := s.persistAttest
+	if persist == nil {
+		persist = daemon.PersistAttestConfig
+	}
+
+	err := persist(s.log, s.cfg.Attest).Do(ctx)
+	if err == nil {
+		return nil
+	}
+
+	if mode, modeErr := s.cfg.IsolationMode(); modeErr != nil || mode != isolation.ModeNSpawn {
+		return err
+	}
+
+	s.log.Warn("could not record the attestation settings; a later reprovision will reuse the bootstrap token", "error", err)
 
 	return nil
 }
