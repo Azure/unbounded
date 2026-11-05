@@ -917,6 +917,11 @@ impl DiskIndex {
         Ok(())
     }
 
+    /// Segments in the table.
+    pub fn segment_count(&self) -> usize {
+        self.segments.len()
+    }
+
     /// Grow the segment table to at least `count` segments.
     pub fn ensure_segments(&mut self, count: usize) -> Result<()> {
         if count >= NIL as usize {

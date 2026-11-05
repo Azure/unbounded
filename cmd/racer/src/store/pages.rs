@@ -13,14 +13,18 @@ use crate::model::PageId;
 use crate::model::VersionMetadata;
 use crate::runtime::HashMap;
 use page_alloc::SegmentId;
+use page_alloc::Segments;
 use page_alloc::disk_index::AgeCursor;
 use page_alloc::disk_index::DiskIndex;
 use page_alloc::disk_index::EntryView;
 use page_alloc::disk_index::PageSlot;
 use page_alloc::intern::CacheTable;
 use page_alloc::intern::SlotInterner;
+use page_alloc::pending::PendingWrite;
 use racer_control_wire::CacheId;
 use racer_control_wire::KeyId;
+use std::cell::RefCell;
+use std::rc::Rc;
 
 /// Production interning uses randomized hashing, as the page map did.
 #[cfg(not(test))]
@@ -74,7 +78,7 @@ impl PageView<'_> {
 }
 
 struct Inner {
-    disk: DiskIndex,
+    disk: Rc<RefCell<DiskIndex>>,
     slots: Interner,
     caches: CacheTable<CacheId>,
     keys: Vec<KeyId>,
@@ -84,7 +88,41 @@ struct Inner {
 pub(super) struct Pages {
     inner: Option<Inner>,
     slots: u32,
+    /// Stored pages (in-flight reservations excluded).
+    stored: usize,
     versions: HashMap<ObjectVersion, (VersionMetadata, usize)>,
+}
+
+/// A reserved publication of one page: the disk index reservation, then
+/// the appended record while its write is in flight. Dropping it cancels
+/// the reservation or fails the write; [`Pages::release`] then frees the
+/// interned slot.
+pub(super) struct Reservation {
+    write: PendingWrite,
+    disk: Rc<RefCell<DiskIndex>>,
+    slot: PageSlot,
+    location: Option<RecordLocation>,
+}
+impl Reservation {
+    /// Append `length` bytes; the reservation survives an error for a retry.
+    pub fn append(
+        &mut self,
+        segments: &Segments,
+        length: usize,
+    ) -> Result<(page_alloc::SegmentLease, RecordLocation)> {
+        if self.location.is_some() {
+            return Err(Error::InvalidConfiguration);
+        }
+        self.disk.borrow_mut().ensure_segments(segments.count())?;
+        let (lease, location) = self.write.append(segments, length)?;
+        let location = RecordLocation {
+            segment: location.segment(),
+            generation: location.generation(),
+            extent: location.extent(),
+        };
+        self.location = Some(location.clone());
+        Ok((lease, location))
+    }
 }
 
 fn location(view: &EntryView) -> RecordLocation {
@@ -98,7 +136,9 @@ fn location(view: &EntryView) -> RecordLocation {
 impl Inner {
     fn new(slots: u32) -> Result<Self> {
         Ok(Self {
-            disk: DiskIndex::new(slots, slots as usize, 0).map_err(Error::from)?,
+            disk: Rc::new(RefCell::new(
+                DiskIndex::new(slots, slots as usize, 0).map_err(Error::from)?,
+            )),
             slots: Interner::new(slots),
             caches: CacheTable::default(),
             keys: vec![KeyId([0; 16]); slots as usize],
@@ -112,12 +152,14 @@ impl Pages {
         Self {
             inner: None,
             slots,
+            stored: 0,
             versions: HashMap::default(),
         }
     }
 
+    /// Stored pages, excluding in-flight reservations.
     pub fn len(&self) -> usize {
-        self.inner.as_ref().map_or(0, |inner| inner.disk.len())
+        self.stored
     }
 
     /// Interned page capacity.
@@ -127,14 +169,22 @@ impl Pages {
     }
 
     /// Resize the slot arena, re-inserting every page in publish order.
-    /// Startup only: O(pages).
+    /// Startup only (O(pages)); in-flight reservations are refused.
     pub fn resize(&mut self, slots: u32) -> Result<()> {
-        if slots as usize > u32::MAX as usize - 1 || (slots as usize) < self.len() {
+        if slots == u32::MAX || (slots as usize) < self.len() {
             return Err(Error::InvalidConfiguration);
+        }
+        if self
+            .inner
+            .as_ref()
+            .is_some_and(|inner| inner.disk.borrow().len() != self.stored)
+        {
+            return Err(Error::Overloaded);
         }
         let entries = self.drain_all();
         self.slots = slots;
         self.inner = None;
+        self.stored = 0;
         for (page, entry) in entries {
             self.insert(page, entry)?;
         }
@@ -145,9 +195,9 @@ impl Pages {
         let Some(inner) = self.inner.as_mut() else {
             return Vec::new();
         };
-        inner.disk.age_reset(Walk::Rebuild.cursor());
-        let entries: Vec<_> = inner
-            .disk
+        let mut disk = inner.disk.borrow_mut();
+        disk.age_reset(Walk::Rebuild.cursor());
+        let entries: Vec<_> = disk
             .age_entries(Walk::Rebuild.cursor())
             .map(|(slot, view)| {
                 let page = inner.slots.key(slot).expect("interned page");
@@ -161,14 +211,22 @@ impl Pages {
                 )
             })
             .collect();
+        drop(disk);
         self.versions.clear();
         entries
+    }
+
+    fn inner_mut(&mut self) -> Result<&mut Inner> {
+        if self.inner.is_none() {
+            self.inner = Some(Inner::new(self.slots)?);
+        }
+        Ok(self.inner.as_mut().expect("initialized page table"))
     }
 
     fn slot(&self, page: &PageId) -> Option<(&Inner, PageSlot, EntryView)> {
         let inner = self.inner.as_ref()?;
         let slot = inner.slots.get(page)?;
-        let view = inner.disk.get(slot)?;
+        let view = inner.disk.borrow().get(slot)?;
         Some((inner, slot, view))
     }
 
@@ -200,41 +258,146 @@ impl Pages {
         self.versions.get(version).map(|(metadata, _)| metadata)
     }
 
-    /// Store `entry`, replacing any record of `page` (which moves to the
-    /// publish-order tail). `Overloaded` when the slot arena or the cache
-    /// table is full; nothing changes on error.
+    /// Whether no in-flight write targets `segment`.
+    pub fn can_reclaim(&self, segment: SegmentId) -> bool {
+        self.inner.as_ref().is_none_or(|inner| {
+            let disk = inner.disk.borrow();
+            // Segments beyond the table have never been appended to.
+            disk.can_reclaim(segment) || segment.0 >= disk.segment_count() as u64
+        })
+    }
+
+    fn intern(&mut self, page: &PageId) -> Result<(PageSlot, page_alloc::disk_index::CacheKey)> {
+        let inner = self.inner_mut()?;
+        let cache = {
+            let mut disk = inner.disk.borrow_mut();
+            inner
+                .caches
+                .add(&mut disk, &page.version.object.cache)
+                .map_err(|_| Error::Overloaded)?
+        };
+        let slot = inner.slots.intern(page).map_err(|_| Error::Overloaded)?;
+        Ok((slot, cache))
+    }
+
+    /// Reserve a publication of `page`. `Overloaded` when the slot arena or
+    /// cache table is full, `Busy` when `page` is already being written.
+    pub fn reserve(&mut self, page: &PageId) -> Result<Reservation> {
+        let (slot, cache) = self.intern(page)?;
+        let inner = self.inner.as_mut().expect("initialized page table");
+        match PendingWrite::reserve(&inner.disk, slot, cache) {
+            Ok(write) => Ok(Reservation {
+                write,
+                disk: inner.disk.clone(),
+                slot,
+                location: None,
+            }),
+            Err(error) => {
+                inner.slots.release_unused(&inner.disk.borrow(), slot);
+                Err(error.into())
+            }
+        }
+    }
+
+    /// Free what a dropped reservation of this table left: its interned slot
+    /// and any cache that finished draining.
+    pub fn release(&mut self, reservation: Reservation) {
+        let Reservation {
+            write, disk, slot, ..
+        } = reservation;
+        drop(write);
+        let Some(inner) = self.inner.as_mut() else {
+            return;
+        };
+        if !Rc::ptr_eq(&inner.disk, &disk) {
+            return;
+        }
+        inner.slots.release_unused(&inner.disk.borrow(), slot);
+        self.settle();
+    }
+
+    /// Publish a written reservation. Returns `Ok(false)` without change when
+    /// its cache was removed or the table was rebuilt meanwhile.
+    pub fn publish(
+        &mut self,
+        reservation: Reservation,
+        page: &PageId,
+        entry: IndexedPage,
+    ) -> Result<bool> {
+        let IndexedPage {
+            location,
+            metadata,
+            key_id,
+        } = entry;
+        let same = self
+            .inner
+            .as_ref()
+            .is_some_and(|inner| Rc::ptr_eq(&inner.disk, &reservation.disk))
+            && self.inner.as_ref().and_then(|inner| inner.slots.get(page))
+                == Some(reservation.slot);
+        if !same || reservation.location.as_ref() != Some(&location) {
+            let mismatch = same;
+            self.release(reservation);
+            return if mismatch {
+                Err(Error::InvalidConfiguration)
+            } else {
+                Ok(false)
+            };
+        }
+        let Reservation { write, slot, .. } = reservation;
+        let inner = self.inner.as_mut().expect("initialized page table");
+        let replaced = match write.publish() {
+            Ok(replaced) => replaced,
+            Err(page_alloc::Error::Stale) => {
+                inner.slots.release_unused(&inner.disk.borrow(), slot);
+                self.settle();
+                return Ok(false);
+            }
+            Err(error) => {
+                inner.slots.release_unused(&inner.disk.borrow(), slot);
+                return Err(error.into());
+            }
+        };
+        inner.keys[slot.0 as usize] = key_id;
+        if replaced.is_none() {
+            self.stored += 1;
+            self.versions
+                .entry(page.version.clone())
+                .or_insert_with(|| (metadata, 0))
+                .1 += 1;
+        }
+        Ok(true)
+    }
+
+    /// Store `entry` at its already validated location, replacing any
+    /// record of `page` (which moves to the publish-order tail). `Overloaded`
+    /// when the slot arena or the cache table is full; nothing changes on error.
     pub fn insert(&mut self, page: PageId, entry: IndexedPage) -> Result<()> {
         let IndexedPage {
             location,
             metadata,
             key_id,
         } = entry;
-        let versions = &mut self.versions;
-        if self.inner.is_none() {
-            self.inner = Some(Inner::new(self.slots)?);
-        }
+        let (slot, cache) = self.intern(&page)?;
         let inner = self.inner.as_mut().expect("initialized page table");
-        let cache = inner
-            .caches
-            .add(&mut inner.disk, &page.version.object.cache)
-            .map_err(|_| Error::Overloaded)?;
-        let slot = inner.slots.intern(&page).map_err(|_| Error::Overloaded)?;
-        let replaced = match inner.disk.place(
+        let placed = inner.disk.borrow_mut().place(
             slot,
             cache,
             location.segment,
             location.generation,
             location.extent,
-        ) {
+        );
+        let replaced = match placed {
             Ok(replaced) => replaced,
             Err(error) => {
-                inner.slots.release_unused(&inner.disk, slot);
+                inner.slots.release_unused(&inner.disk.borrow(), slot);
                 return Err(error.into());
             }
         };
         inner.keys[slot.0 as usize] = key_id;
         if replaced.is_none() {
-            versions
+            self.stored += 1;
+            self.versions
                 .entry(page.version.clone())
                 .or_insert_with(|| (metadata, 0))
                 .1 += 1;
@@ -266,18 +429,21 @@ impl Pages {
         let Some(slot) = inner.slots.get(page) else {
             return false;
         };
-        let Some(view) = inner.disk.get(slot) else {
+        let mut disk = inner.disk.borrow_mut();
+        let Some(view) = disk.get(slot) else {
             return false;
         };
         if expected.is_some_and(|expected| *expected != location(&view)) {
             return false;
         }
-        inner.disk.remove(slot).expect("stored page");
-        Self::forget(&mut self.versions, &mut inner.slots, &inner.disk, slot);
+        disk.remove(slot).expect("stored page");
+        self.stored -= 1;
+        Self::forget(&mut self.versions, &mut inner.slots, &disk, slot);
         true
     }
 
-    /// Remove every page of `caches` (cache lists only; no full scan).
+    /// Remove every page of `caches` (cache lists only; no full scan). A
+    /// cache with writes in flight finishes draining when they end.
     pub fn remove_caches<'a>(&mut self, caches: impl IntoIterator<Item = &'a CacheId>) {
         let Some(inner) = self.inner.as_mut() else {
             return;
@@ -286,7 +452,16 @@ impl Pages {
         for cache in caches {
             any |= inner.caches.remove(cache);
         }
-        if !any {
+        if any {
+            self.settle();
+        }
+    }
+
+    fn settle(&mut self) {
+        let Some(inner) = self.inner.as_mut() else {
+            return;
+        };
+        if inner.caches.draining() == 0 {
             return;
         }
         let Inner {
@@ -295,20 +470,21 @@ impl Pages {
             caches,
             ..
         } = inner;
-        let versions = &mut self.versions;
+        let mut disk = disk.borrow_mut();
         let mut removed = Vec::new();
-        caches.drain(disk, usize::MAX, |slot, _| removed.push(slot));
+        caches.drain(&mut disk, usize::MAX, |slot, _| removed.push(slot));
+        self.stored -= removed.len();
         for slot in removed {
-            Self::forget(versions, slots, disk, slot);
+            Self::forget(&mut self.versions, slots, &disk, slot);
         }
     }
 
     /// Every stored page, in slot order.
     pub fn iter(&self) -> impl Iterator<Item = PageView<'_>> {
         self.inner.iter().flat_map(move |inner| {
-            inner
-                .disk
-                .iter()
+            let entries: Vec<_> = inner.disk.borrow().iter().collect();
+            entries
+                .into_iter()
                 .map(move |(slot, view)| self.view(inner, slot, &view))
         })
     }
@@ -326,16 +502,16 @@ impl Pages {
         mut visit: impl FnMut(PageView<'_>) -> Option<T>,
     ) -> (u64, Vec<T>) {
         let cursor = walk.cursor();
-        let Some(inner) = self.inner.as_mut() else {
+        let Some(inner) = self.inner.as_ref() else {
             return (token, Vec::new());
         };
+        let mut disk = inner.disk.borrow_mut();
         if token == 0 {
-            inner.disk.age_reset(cursor);
+            disk.age_reset(cursor);
         }
-        let inner = self.inner.as_ref().expect("initialized page table");
         let mut last = None;
         let mut out = Vec::new();
-        for (slot, view) in inner.disk.age_entries(cursor).take(limit) {
+        for (slot, view) in disk.age_entries(cursor).take(limit) {
             let Some(item) = visit(self.view(inner, slot, &view)) else {
                 break;
             };
@@ -345,12 +521,7 @@ impl Pages {
         let Some(last) = last else {
             return (token, out);
         };
-        self.inner
-            .as_mut()
-            .expect("initialized page table")
-            .disk
-            .age_seek(cursor, last)
-            .expect("walked page is stored");
+        disk.age_seek(cursor, last).expect("walked page is stored");
         (token.saturating_add(out.len() as u64).max(1), out)
     }
 
@@ -361,6 +532,7 @@ impl Pages {
         };
         inner
             .disk
+            .borrow()
             .segment_entries(segment)
             .take(budget)
             .map(|(slot, view)| {
@@ -375,7 +547,7 @@ impl Pages {
     pub fn segment_empty(&self, segment: SegmentId) -> bool {
         self.inner
             .as_ref()
-            .is_none_or(|inner| inner.disk.segment_usage(segment).0 == 0)
+            .is_none_or(|inner| inner.disk.borrow().segment_usage(segment).0 == 0)
     }
 
     /// Sum a bounded prefix and conservatively charge the unseen suffix.
@@ -389,16 +561,15 @@ impl Pages {
         let Some(inner) = self.inner.as_ref() else {
             return 0;
         };
-        let count = inner.disk.segment_usage(segment).0 as usize;
-        let known =
-            inner
-                .disk
-                .segment_entries(segment)
-                .take(budget)
-                .fold(0u64, |sum, (slot, _)| {
-                    let page = inner.slots.key(slot).expect("interned page");
-                    sum.saturating_add(score(page, &self.versions[&page.version].0))
-                });
+        let disk = inner.disk.borrow();
+        let count = disk.segment_usage(segment).0 as usize;
+        let known = disk
+            .segment_entries(segment)
+            .take(budget)
+            .fold(0u64, |sum, (slot, _)| {
+                let page = inner.slots.key(slot).expect("interned page");
+                sum.saturating_add(score(page, &self.versions[&page.version].0))
+            });
         known.saturating_add((count.saturating_sub(budget) as u64).saturating_mul(unseen_value))
     }
 
@@ -407,7 +578,10 @@ impl Pages {
         let Some(inner) = self.inner.as_ref() else {
             return;
         };
-        assert_eq!(inner.slots.len(), inner.disk.len());
+        let disk = inner.disk.borrow();
+        assert_eq!(inner.slots.len(), disk.len());
+        assert_eq!(self.stored, disk.iter().count());
+        drop(disk);
         let mut counts: HashMap<&ObjectVersion, usize> = HashMap::default();
         for view in self.iter() {
             *counts.entry(&view.page.version).or_default() += 1;

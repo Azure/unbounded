@@ -1369,7 +1369,7 @@ impl StoreWriter {
             return Ok(());
         }
         // Capacity is owned across the await, including invalidation/replacement.
-        let index_ticket = match self.index.reserve_page_for(id) {
+        let mut index_ticket = match self.index.reserve_page_for(id) {
             Err(Error::Overloaded) if self.clock.borrow().is_some() => {
                 let clock = self.clock.borrow().clone().expect("checked clock");
                 // Index full: evict a whole low-value segment, then retry.
@@ -1401,22 +1401,19 @@ impl StoreWriter {
         };
         let mut buffer = self.slabs.allocate(staged, staging)?;
         buffer.retain(dirty);
-        let (segment, extent) = match self.segments.append(disk_bytes).map_err(Error::from) {
+        // The appended record keeps its segment from eviction until the
+        // ticket publishes or drops (including future cancellation).
+        let (segment, location) = match index_ticket.append(id, &self.segments, disk_bytes) {
             Ok(append) => append,
             Err(Error::Overloaded) => {
                 if let Some(clock) = self.clock.borrow().clone() {
                     clock.reclaim_now()?;
                 }
-                self.segments.append(disk_bytes)?
+                index_ticket.append(id, &self.segments, disk_bytes)?
             }
             Err(error) => return Err(error),
         };
-        let location = RecordLocation {
-            segment: segment.id(),
-            generation: segment.generation(),
-            extent,
-        };
-        let _publication_guard = self.index.publishing(location.segment);
+        let extent = location.extent;
         let _publication_lease = self.segments.lease(location.segment, location.generation)?;
         if zero_copy {
             if extent.length() != disk_bytes {

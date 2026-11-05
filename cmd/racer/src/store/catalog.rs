@@ -52,8 +52,6 @@ pub struct Index {
 
     residency: Rc<Residency>,
 
-    active_writes: Rc<RefCell<HashMap<SegmentId, usize>>>,
-
     holds: RefCell<super::holds::Holds>,
 
     /// Keyring generation and age cursor of the unavailable-key sweep.
@@ -113,22 +111,6 @@ pub(super) struct Resident {
     page: PageId,
     payload: Option<crate::retention::Payload>,
 }
-pub(super) struct PublicationGuard {
-    active: Rc<RefCell<HashMap<SegmentId, usize>>>,
-    segment: SegmentId,
-}
-impl Drop for PublicationGuard {
-    fn drop(&mut self) {
-        let mut active = self.active.borrow_mut();
-        let count = active
-            .get_mut(&self.segment)
-            .expect("active publication owner");
-        *count -= 1;
-        if *count == 0 {
-            active.remove(&self.segment);
-        }
-    }
-}
 impl Drop for Resident {
     fn drop(&mut self) {
         let mut counts = self.residency.counts.borrow_mut();
@@ -140,24 +122,65 @@ impl Drop for Resident {
         }
     }
 }
-/// Capacity ownership acquired before a disk SQE. Drop releases unused capacity.
+/// Capacity ownership acquired before a disk SQE. [`Self::append`] then
+/// reserves the page's index slot and its record, whose write in flight keeps
+/// the segment from eviction. Drop, including cancellation of the persisting
+/// future, releases all of it.
 pub struct PageTicket {
     index: Rc<Index>,
     hold: Option<(Rc<super::holds::Inflight>, crate::model::PageNumber)>,
+    counted: bool,
+    reservation: Option<super::pages::Reservation>,
 }
 impl Drop for PageTicket {
     fn drop(&mut self) {
-        self.index.reserved.set(self.index.reserved.get() - 1);
-        if let Some((inflight, page)) = &self.hold {
-            inflight.remove(*page);
+        if let Some((inflight, page)) = self.hold.take() {
+            inflight.remove(page);
+        }
+        if std::mem::take(&mut self.counted) {
+            self.index.reserved.set(self.index.reserved.get() - 1);
+        }
+        if let Some(reservation) = self.reservation.take() {
+            self.index.state.borrow_mut().pages.release(reservation);
         }
     }
 }
 impl PageTicket {
-    pub fn publish(self, page: PageId, entry: IndexedPage) -> Result<()> {
+    /// Reserve `page`'s index slot and append `length` bytes for it. Keep the
+    /// lease until the write completes. On error the ticket is unchanged and
+    /// may be retried. `Overloaded` while another write of `page` is in flight.
+    pub fn append(
+        &mut self,
+        page: &PageId,
+        segments: &Segments,
+        length: usize,
+    ) -> Result<(page_alloc::SegmentLease, RecordLocation)> {
+        if self.reservation.is_none() {
+            self.reservation = Some(self.index.state.borrow_mut().pages.reserve(page)?);
+        }
+        self.reservation
+            .as_mut()
+            .expect("reserved page")
+            .append(segments, length)
+    }
+
+    /// Publish the completed write at the location [`Self::append`] returned.
+    pub fn publish(mut self, page: PageId, entry: IndexedPage) -> Result<()> {
+        if let Some((inflight, number)) = self.hold.take() {
+            inflight.remove(number);
+        }
+        if std::mem::take(&mut self.counted) {
+            self.index.reserved.set(self.index.reserved.get() - 1);
+        }
+        let reservation = self.reservation.take();
+        // Only tests publish a caller-chosen location through a ticket.
+        #[cfg(not(test))]
+        if reservation.is_none() {
+            return Err(Error::InvalidConfiguration);
+        }
         let index = self.index.clone();
         drop(self);
-        index.publish(page, entry)
+        index.publish_with(page, entry, reservation)
     }
 }
 #[derive(Clone, Debug)]
@@ -723,7 +746,6 @@ impl Index {
                 )),
                 counts: RefCell::new(HashMap::default()),
             }),
-            active_writes: Rc::new(RefCell::new(HashMap::default())),
             holds: RefCell::new(super::holds::Holds::new(clock.clone())),
             key_sweep: Cell::default(),
         }
@@ -795,13 +817,6 @@ impl Index {
     pub fn retention(&self) -> Rc<Retention> {
         self.residency.retention.borrow().clone()
     }
-    pub(super) fn publishing(&self, segment: SegmentId) -> PublicationGuard {
-        *self.active_writes.borrow_mut().entry(segment).or_default() += 1;
-        PublicationGuard {
-            active: self.active_writes.clone(),
-            segment,
-        }
-    }
     pub fn set_retention(&self, retention: Rc<Retention>) {
         // Startup wiring only: replacing a live policy would invalidate read-side
         // clones and require a capacity-sized heat migration in a request turn.
@@ -848,11 +863,35 @@ impl Index {
         Ok(PageTicket {
             index: self.clone(),
             hold,
+            counted: true,
+            reservation: None,
         })
     }
     /// Atomically publish a completed record with its immutable descriptor. Reject
     /// conflicting lengths for one version; never update current-version freshness.
     pub fn publish(&self, page: PageId, entry: IndexedPage) -> Result<()> {
+        self.publish_with(page, entry, None)
+    }
+    /// [`Self::publish`] of a reserved write, or of a validated location
+    /// when `reservation` is `None`. A reservation is always consumed.
+    fn publish_with(
+        &self,
+        page: PageId,
+        entry: IndexedPage,
+        mut reservation: Option<super::pages::Reservation>,
+    ) -> Result<()> {
+        let result = self.try_publish(page, entry, &mut reservation);
+        if let Some(reservation) = reservation {
+            self.state.borrow_mut().pages.release(reservation);
+        }
+        result
+    }
+    fn try_publish(
+        &self,
+        page: PageId,
+        entry: IndexedPage,
+        reservation: &mut Option<super::pages::Reservation>,
+    ) -> Result<()> {
         if !self
             .availability
             .page(&page.version.object.cache, entry.key_id)
@@ -877,7 +916,11 @@ impl Index {
                 .indexed_payload(&page.version.object.cache, payload_bytes),
         );
         self.hold_published(&page, &entry.location)?;
-        if let Err(error) = state.pages.insert(page.clone(), entry) {
+        let inserted = match reservation.take() {
+            Some(reservation) => state.pages.publish(reservation, &page, entry),
+            None => state.pages.insert(page.clone(), entry).map(|()| true),
+        };
+        if inserted != Ok(true) {
             // The previous mapping, if any, is unchanged; forget a new hold location.
             let location = state.pages.location(&page);
             if let Some(hold) = self.holds.borrow_mut().entries.get_mut(&page.version) {
@@ -890,7 +933,7 @@ impl Index {
                     }
                 }
             }
-            return Err(error);
+            return inserted.map(drop);
         }
         state.residents.insert(resident.page.clone(), resident);
         Ok(())
@@ -1294,8 +1337,7 @@ impl page_alloc::SegmentEntries for Index {
         !self.holds.borrow().segment_held(segment)
     }
     fn can_evict(&self, segment: SegmentId) -> bool {
-        !self.active_writes.borrow().contains_key(&segment)
-            && !self.holds.borrow().segment_held(segment)
+        self.state.borrow().pages.can_reclaim(segment) && !self.holds.borrow().segment_held(segment)
     }
     fn remove_bounded(&self, segment: SegmentId, budget: usize) -> usize {
         if !self.can_evict(segment) {
@@ -1513,6 +1555,76 @@ mod tests {
     /// An unheld page for capacity probes.
     fn probe() -> PageId {
         indexed(descriptor("probe", 17), 0).0
+    }
+    #[test]
+    fn page_ticket_publishes_appended_write_and_cancellation_releases_everything() {
+        use page_alloc::SegmentEntries;
+        use std::future::Future;
+        let segments = Rc::new(segments(1024, 2));
+        let index = Rc::new(index(8));
+        index.set_page_capacity(1).unwrap();
+        let _clock = SegmentClock::new(index.clone(), segments.clone(), 1);
+        let (page, entry) = indexed(descriptor("a", 17), 0);
+        let persist = {
+            let (index, segments, page) = (index.clone(), segments.clone(), page.clone());
+            async move {
+                let mut ticket = index.reserve_page_for(&page)?;
+                let (_lease, location) = ticket.append(&page, &segments, 512)?;
+                std::future::pending::<()>().await; // the disk write never completes
+                ticket.publish(page, IndexedPage { location, ..entry })
+            }
+        };
+        let mut persist = Box::pin(persist);
+        let mut context = std::task::Context::from_waker(std::task::Waker::noop());
+        assert!(persist.as_mut().poll(&mut context).is_pending());
+        let written = SegmentId(0);
+        assert!(!index.can_evict(written));
+        assert_eq!(index.preflight_capacity(&probe()), Err(Error::Overloaded));
+        drop(persist);
+        assert!(index.can_evict(written));
+        assert_eq!(index.reserved.get(), 0);
+        index.preflight_capacity(&probe()).unwrap();
+        assert!(index.lookup(&page).unwrap().is_none());
+        index.state.borrow().pages.check();
+        // A location other than the appended one is refused and releases the ticket.
+        let mut ticket = index.reserve_page_for(&page).unwrap();
+        let (lease, location) = ticket.append(&page, &segments, 512).unwrap();
+        drop(lease);
+        let mut wrong = location.clone();
+        wrong.generation = Generation(location.generation.0 + 1);
+        let (_, entry) = indexed(descriptor("a", 17), 0);
+        assert_eq!(
+            ticket.publish(
+                page.clone(),
+                IndexedPage {
+                    location: wrong,
+                    ..entry.clone()
+                }
+            ),
+            Err(Error::InvalidConfiguration)
+        );
+        assert_eq!(index.reserved.get(), 0);
+        assert!(index.can_evict(location.segment));
+        // The same steps publish the appended location.
+        let mut ticket = index.reserve_page_for(&page).unwrap();
+        let (lease, location) = ticket.append(&page, &segments, 512).unwrap();
+        drop(lease);
+        assert_eq!(
+            index.reserve_page_for(&probe()).err(),
+            Some(Error::Overloaded)
+        );
+        ticket
+            .publish(
+                page.clone(),
+                IndexedPage {
+                    location: location.clone(),
+                    ..entry
+                },
+            )
+            .unwrap();
+        assert_eq!(index.lookup(&page).unwrap().unwrap().location, location);
+        assert!(index.can_evict(location.segment));
+        index.state.borrow().pages.check();
     }
     #[test]
     fn hard_hold_capacity_dedup_extension_release_and_eviction() {
@@ -2513,10 +2625,12 @@ mod tests {
         drop(segments.append(1024).unwrap());
         index.publish(published.clone(), entry).unwrap();
         index.retention().touch(&published);
-        let (write, extent) = segments.append(1024).unwrap();
-        let publication = index.publishing(write.id());
-        let (other_write, _) = segments.append(1024).unwrap();
-        let other_publication = index.publishing(other_write.id());
+        let (page, entry) = indexed(descriptor("completed", 17), 1);
+        let (other, _) = indexed(descriptor("other", 17), 2);
+        let mut ticket = index.reserve_page_for(&page).unwrap();
+        let (write, location) = ticket.append(&page, &segments, 1024).unwrap();
+        let mut other_ticket = index.reserve_page_for(&other).unwrap();
+        let (other_write, _) = other_ticket.append(&other, &segments, 1024).unwrap();
         let clock = SegmentClock::new(index.clone(), segments.clone(), 1);
         clock.reclaim_now().unwrap();
         assert!(index.lookup(&published).unwrap().is_none());
@@ -2525,15 +2639,14 @@ mod tests {
             Ok(page_alloc::SegmentState::Sealed)
         );
         segments
-            .validate(write.id(), write.generation(), &extent)
+            .validate(write.id(), write.generation(), &location.extent)
             .unwrap();
-        let (page, mut entry) = indexed(descriptor("completed", 17), 1);
-        entry.location.extent = extent;
-        index.publish(page.clone(), entry).unwrap();
-        drop(publication);
+        ticket
+            .publish(page.clone(), IndexedPage { location, ..entry })
+            .unwrap();
         drop(write);
         assert!(index.lookup(&page).unwrap().is_some());
-        drop(other_publication);
+        drop(other_ticket);
         drop(other_write);
     }
     #[test]
