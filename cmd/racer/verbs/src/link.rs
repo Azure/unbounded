@@ -473,6 +473,10 @@ pub(crate) struct Link {
 
     /// Ops were failed by `destroy`.
     failed: bool,
+
+    /// The last poll read a full completion batch: more may wait in the CQ
+    /// without raising a new channel event.
+    more: bool,
 }
 
 impl Link {
@@ -548,6 +552,7 @@ impl Link {
             last_used: now,
             close_sent: false,
             established: false,
+            more: false,
             failed: false,
         })
     }
@@ -887,6 +892,44 @@ impl Link {
         }
     }
 
+    /// When this link next needs a poll without a wake source: `Some(t)`
+    /// with `t` in the past means at once. Completions, connection manager
+    /// events, commands, and returned buffers wake the owner on their own;
+    /// this covers timers and work that raises no event.
+    pub(crate) fn next_deadline(&self) -> Option<Instant> {
+        if self.more || self.qp.has_synthetic() {
+            return Some(self.created);
+        }
+        let mut next: Option<Instant> = None;
+        let mut at = |t: Instant| next = Some(next.map_or(t, |n| n.min(t)));
+        if matches!(self.phase, Phase::Created | Phase::Connecting) || !self.established {
+            at(self.created + SETUP_TIMEOUT);
+        }
+        for grant in self.grants.values() {
+            if matches!(grant.state, GrantState::Bound | GrantState::Exposed) {
+                at(grant.deadline);
+            }
+        }
+        for waiting in self.waiting.values() {
+            match waiting {
+                Waiting::Write { deadline, .. } | Waiting::Release { deadline, .. } => {
+                    at(*deadline);
+                }
+            }
+        }
+        for outgoing in &self.outbox {
+            if let Outgoing::Write { deadline, .. } = outgoing {
+                at(*deadline);
+            }
+        }
+        match self.phase {
+            Phase::Ready => at(self.last_used + self.limits.idle),
+            Phase::Closing { until } => at(until),
+            Phase::Created | Phase::Connecting => {}
+        }
+        next
+    }
+
     /// Reap completions, run timers, and post queued work.
     pub(crate) fn poll(&mut self, pool: &Pool, now: Instant) -> std::result::Result<(), Break> {
         self.established |= self.qp.ready();
@@ -905,6 +948,9 @@ impl Link {
             self.qp
                 .progress_with(|c, record| completions.push((c, record)))
         };
+        self.more = progressed
+            .as_ref()
+            .is_ok_and(|&n| n >= crate::ffi::POLL_BATCH);
 
         // Completions before a failed one are still valid. A `Close` among
         // them means the peer closed first; anything else is an error.

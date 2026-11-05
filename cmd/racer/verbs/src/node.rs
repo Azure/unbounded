@@ -4,9 +4,9 @@
 //! `designs/racer-rdma-sessions.md`, "Link table and state machine".
 //!
 //! [`node`] returns one [`Client`] per I/O worker and one [`OwnerPort`].
-//! Build the [`Owner`] from the port on the native thread and host it with
-//! [`crate::WithNative::with_host`] (or poll it with
-//! [`Owner::poll_budgeted`]). Every libibverbs call runs on that thread.
+//! Build the [`Owner`] from the port on the native thread and run it with
+//! [`crate::OwnerRole`] (or poll it with [`Owner::poll_budgeted`]). Every
+//! libibverbs call runs on that thread.
 //! Clients queue commands and get results through [`Op`]s.
 
 use std::{
@@ -573,10 +573,14 @@ struct Backoff {
     delay: Duration,
 }
 
+/// Retry delay for owner work that raises no wake event: snapshot lock
+/// contention, failed destroys, and shutdown checks.
+pub const RETRY_SOON: Duration = Duration::from_millis(1);
+
 /// Runs on the native thread and owns every link, pool, and device.
 ///
-/// Not `Send`. Poll it with [`Self::poll_budgeted`], or host it with
-/// [`crate::WithNative::with_host`].
+/// Not `Send`. Poll it with [`Self::poll_budgeted`], or run it on its own
+/// thread with [`crate::OwnerRole`].
 pub struct Owner {
     ctx: racer_io::WorkerCtx,
 
@@ -613,6 +617,9 @@ pub struct Owner {
 
     /// A native object leaked against this round's charge: never drained.
     leaked: bool,
+
+    /// The last poll left commands in the queue: poll again at once.
+    backlog: bool,
 }
 
 impl Owner {
@@ -642,6 +649,7 @@ impl Owner {
             dirty: false,
             expiry: None,
             leaked: false,
+            backlog: false,
         }
     }
 
@@ -666,6 +674,37 @@ impl Owner {
             .values()
             .flat_map(|device| device.device.fds())
             .collect()
+    }
+
+    /// When the owner next needs a poll that no wake source announces:
+    /// `None` means only a wake source (a command, a close, a returned
+    /// buffer, or a [`Self::poll_fds`] descriptor) brings new work. A time
+    /// at or before now means poll again at once (a full completion batch,
+    /// queued commands, or synthetic completions).
+    pub fn next_wake(&self) -> Option<Instant> {
+        let now = self.ctx.now();
+        let mut next: Option<Instant> = self.expiry;
+        let mut at = |t: Instant| next = Some(next.map_or(t, |n| n.min(t)));
+        if self.backlog {
+            return Some(now);
+        }
+        // Lock contention on the snapshot or pools, destroys to retry, and
+        // shutdown checks retry on a short timer.
+        if self.dirty || !self.dying.is_empty() || (self.closing && !self.leaked && !self.drained())
+        {
+            at(now + RETRY_SOON);
+        }
+        for link in self.links.values() {
+            if let Some(t) = link.next_deadline() {
+                at(t);
+            }
+        }
+        next
+    }
+
+    /// The owner's clock.
+    pub fn ctx_now(&self) -> Instant {
+        self.ctx.now()
     }
 
     /// Close from the owner side. Same as [`Client::close`].
@@ -702,6 +741,7 @@ impl Owner {
         let mut commands = Vec::new();
         self.channel
             .try_drain(budget, |_, command| commands.push(command));
+        self.backlog = commands.len() >= budget;
 
         for command in commands {
             self.handle(command, now);
@@ -1447,34 +1487,6 @@ fn jitter(delay: Duration, rng: &racer_io::Rng) -> Duration {
     // 0..=400 per mille, centered: 800..=1200.
     let per_mille = 800 + u64::from(u16::from_be_bytes(bytes)) % 401;
     delay * per_mille as u32 / 1000
-}
-
-impl crate::NativeHost for Owner {
-    fn register_driver(&self, waker: &Waker) {
-        Owner::register_driver(self, waker);
-    }
-
-    fn poll_budgeted(&mut self, budget: usize) -> Result<()> {
-        Owner::poll_budgeted(self, budget)
-    }
-
-    /// Devices poll completion queues and timers; an idle owner without
-    /// devices waits for commands alone.
-    fn wait_timeout(&self, maximum: std::time::Duration) -> std::time::Duration {
-        if self.devices.is_empty() && !self.closing {
-            maximum
-        } else {
-            maximum.min(std::time::Duration::from_millis(1))
-        }
-    }
-
-    fn close(&self) {
-        Owner::close(self);
-    }
-
-    fn drained(&self) -> bool {
-        Owner::drained(self)
-    }
 }
 
 #[cfg(test)]

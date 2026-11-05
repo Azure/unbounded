@@ -31,13 +31,18 @@ The main source files are:
 ## Threading
 
 `rdma_verbs::node` creates one `Client` per I/O worker and one `OwnerPort`.
-The owner runs on the crypto thread paired with the first I/O worker, through
-`WithOwner`, Racer's `WithNative<PageCryptoEngine, Owner>` alias. No separate
-RDMA thread is created, and the verbs adapter spawns none: in registration
-mode the RDMA connection manager is an event-driven state machine the owner
-advances on each poll, reading nonblocking event channels. `Owner::poll_fds`
-exposes the completion and connection manager channel fds for a future
-dedicated owner thread. Only this owner posts verbs operations.
+The owner runs on its own thread, `racer-rdma-owner`, pinned to the crypto CPU
+paired with the first I/O worker so registered memory is first touched on that
+NUMA node. The thread counts against `max_threads`. It runs
+`rdma_verbs::OwnerRole`, which parks on an eventfd (commands, closes, returned
+buffers, stop) and on `Owner::poll_fds` (completion and connection manager
+channels) with a timeout from `Owner::next_wake`; an idle owner has no periodic
+tick. The verbs adapter spawns no threads: in registration mode the RDMA
+connection manager is an event-driven state machine the owner advances on each
+poll. The owner thread starts before the worker group and stops after it
+joins; stopping waits until every page buffer has returned, printing a
+diagnostic every `DRAIN_REPORT`, and never frees early. Only this owner posts
+verbs operations.
 
 Each worker has a `Links` facade and a bounded command queue. Results return
 through one-shot `Op` cells. The owner publishes link snapshots; a worker that

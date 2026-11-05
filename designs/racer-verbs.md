@@ -109,13 +109,15 @@ without waiting on the fds still works.
 | `src/registration.rs` | Registration mode: per-grant and per-write registrations, connection manager state machine |
 | `native/verbs.c` | Thin libibverbs and librdmacm wrappers |
 | `src/simulation.rs` | Deterministic fabric and fault injection |
-| `src/lib.rs` | Public exports and `WithNative` service wrapper |
+| `src/lib.rs` | Public exports |
+| `src/role.rs` | `OwnerRole`: the owner as its own thread's role, parked on its wake sources |
 
 ## Public API
 
 `node(workers)` returns one `Client` per worker and an `OwnerPort`.
 `Owner::new` runs on the native thread and captures its environment.
-`WithNative::with_host` combines it with another service through `NativeHost`.
+`OwnerRole::new` wraps it as a `racer_io::exec::Role` for a dedicated thread;
+`OwnerStop::stop` closes it, and the role finishes once the owner drained.
 Clients are `Send`; they contain shared handles, not native resources.
 
 Each worker has a FIFO command queue with capacity 64. The owner drains them
@@ -360,8 +362,9 @@ resources and their admission guard. A leak prevents a later reopen.
 
 Ready links send `Close` during shutdown; other links break immediately.
 Draining waits for links, pending destruction, and held pages, then withdraws
-the pools. `WithNative` drives the inner service's drain or fence alongside
-the owner, holding the result until both finish. Native teardown ignores
+the pools. Pages held on other threads (crypto jobs) return on their own; the
+pool wakes the owner role when they do, and the role waits for them however
+long that takes, reporting every `DRAIN_REPORT`. Native teardown ignores
 request deadlines because abandoning it could permit DMA into freed memory.
 
 ## Simulation and tests

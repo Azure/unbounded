@@ -1635,8 +1635,6 @@ pub fn drive_local_with<'a, T: 'a, E: Copy + PartialEq + From<racer_io::Error> +
     }))
 }
 
-mod native;
-
 /// Lifecycle ordering, failure injection, affinity, and cooperative fencing regressions.
 #[cfg(test)]
 mod tests;

@@ -101,39 +101,37 @@ impl AffinityPlan {
     /// Plan from discovered constraints and accepted rails. NIC/NUMA compatibility
     /// never changes membership or page-to-rail selection; unavailable hardware
     /// preserves HTTP fallback. No extra control/diagnostic threads are created.
+    /// With RDMA enabled, one thread of `max_threads` is kept for the RDMA
+    /// owner, which runs outside the worker group.
     pub fn from_topology(
         config: &Config,
         mut topology: EffectiveTopology,
         rails: &[RailMapping],
     ) -> Result<Self> {
+        let max_threads = config
+            .max_threads
+            .checked_sub(usize::from(config.enable_rdma))
+            .ok_or(Error::InvalidConfiguration)?;
         if let (Some(io), Some(helpers)) = (config.io_workers, config.crypto_helpers) {
             topology.nics.retain(|nic| {
                 nic.numa_node.is_some()
                     && (rails.is_empty()
                         || rails.iter().any(|rail| rail.numa_node == nic.numa_node))
             });
-            let pairs = crate::affinity::place_exact(
-                topology,
-                config.max_threads,
-                io,
-                helpers,
-                config.allow_smt,
-            )?
-            .into_iter()
-            .enumerate()
-            .map(|(index, placement)| WorkerPair {
-                worker: WorkerId(index as u16),
-                io: placement.lane,
-                crypto: placement.helper,
-                nic: placement.nic,
-            })
-            .collect();
-            return Ok(Self {
-                pairs,
-                max_threads: config.max_threads,
-            });
+            let pairs =
+                crate::affinity::place_exact(topology, max_threads, io, helpers, config.allow_smt)?
+                    .into_iter()
+                    .enumerate()
+                    .map(|(index, placement)| WorkerPair {
+                        worker: WorkerId(index as u16),
+                        io: placement.lane,
+                        crypto: placement.helper,
+                        nic: placement.nic,
+                    })
+                    .collect();
+            return Ok(Self { pairs, max_threads });
         }
-        Self::place_with_policy(config.max_threads, topology, rails, config.allow_smt)
+        Self::place_with_policy(max_threads, topology, rails, config.allow_smt)
     }
     #[cfg(test)]
     fn place(
@@ -1721,7 +1719,6 @@ mod tests {
             io_draining: AtomicUsize,
             shutdown: AtomicUsize,
             completed: AtomicUsize,
-            native: Mutex<Vec<rdma_verbs::Client>>,
         }
         impl Observed {
             fn event(&self, worker: WorkerId, name: &'static str) {
@@ -1752,7 +1749,6 @@ mod tests {
             roundtrip: bool,
             cpu: usize,
             second_crypto_cpu: usize,
-            native: bool,
         }
 
         fn fixture(cap: usize, failure: Failure, jobs: bool) -> (AffinityPlan, Factory) {
@@ -1767,7 +1763,6 @@ mod tests {
                     roundtrip: false,
                     cpu,
                     second_crypto_cpu: cpu,
-                    native: false,
                 },
             )
         }
@@ -1819,18 +1814,8 @@ mod tests {
                 if worker.0 == 1 && self.failure == Failure::BuildCrypto {
                     return Err(Error::Unauthorized);
                 }
-                let page = PageCryptoEngine::new(runtime);
-                let ctx = page.ctx().clone();
-                let engine: Box<dyn Service<RequestScope>> = if self.native {
-                    let (mut clients, port) = rdma_verbs::node(1)?;
-                    self.observed.native.lock().unwrap().push(clients.remove(0));
-                    Box::new(rdma_verbs::WithNative::with_host(
-                        page,
-                        rdma_verbs::Owner::new(port, ctx),
-                    ))
-                } else {
-                    Box::new(page)
-                };
+                let engine: Box<dyn Service<RequestScope>> =
+                    Box::new(PageCryptoEngine::new(runtime));
                 Ok(Box::new(Engine {
                     worker,
                     engine: Some(engine),
@@ -2374,54 +2359,6 @@ mod tests {
                 .map(|(_, _, id)| *id)
                 .collect::<HashSet<_>>();
             assert_eq!(crypto.len(), 2);
-        }
-
-        #[test]
-        fn shared_native_wrappers_are_drained_and_destroyed_on_owner_thread() {
-            let (plan, mut factory) = fixture(4, Failure::None, true);
-            factory.native = true;
-            let observed = factory.observed.clone();
-            let mut group = WorkerGroup::new(plan, crate::test_support::ctx());
-            let scope = scope();
-            group.start_recipe(Arc::new(factory), &scope).unwrap();
-            assert_eq!(observed.native.lock().unwrap().len(), 2);
-            group.drain(&scope).unwrap();
-            for io in observed.native.lock().unwrap().iter() {
-                assert!(io.closed());
-                assert!(io.drained());
-            }
-            group.shutdown(&scope).unwrap();
-            group.join().unwrap();
-            for io in observed.native.lock().unwrap().iter() {
-                assert_eq!(
-                    io.reopen().map_err(Error::from),
-                    Err(Error::Unavailable),
-                    "native owner was destroyed"
-                );
-            }
-            assert_eq!(observed.shutdown.load(Ordering::SeqCst), 2);
-            assert_eq!(group.runtime.stats().done, 3);
-            let events = observed.events.lock().unwrap();
-            for worker in 0..2 {
-                let event = |name| {
-                    events
-                        .iter()
-                        .enumerate()
-                        .find(|(_, (id, kind, _))| *id == worker && *kind == name)
-                        .unwrap()
-                };
-                let (built, (_, _, owner)) = event("crypto-build");
-                let (drained, (_, _, drain_thread)) = event("crypto-drain");
-                let (shutdown, (_, _, shutdown_thread)) = event("crypto-shutdown");
-                let (dropped, (_, _, drop_thread)) = event("crypto-drop");
-                assert!(built < drained && drained < shutdown && shutdown < dropped);
-                assert_eq!(owner, drain_thread);
-                assert_eq!(owner, shutdown_thread);
-                assert_eq!(
-                    owner, drop_thread,
-                    "outer observer records completed native destruction"
-                );
-            }
         }
     }
 

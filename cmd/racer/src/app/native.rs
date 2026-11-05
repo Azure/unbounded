@@ -1,15 +1,14 @@
-//! One RDMA owner per node, hosted beside crypto on the thread paired with the
-//! first I/O worker; every I/O worker gets a client (`designs/racer-rdma-sessions.md`,
-//! "Threading").
+//! One RDMA owner per node on its own thread, pinned to the crypto CPU paired
+//! with the first I/O worker; every I/O worker gets a client
+//! (`designs/racer-rdma-sessions.md`, "Threading").
 
 use super::*;
-use crate::rdma::WithOwner;
 use crate::runtime::HashMap;
 
 #[derive(Default)]
 pub(super) struct NativeNode {
     clients: Mutex<HashMap<WorkerId, rdma_verbs::Client>>,
-    owner: Mutex<Option<(WorkerId, rdma_verbs::OwnerPort)>>,
+    owner: Mutex<Option<rdma_verbs::OwnerPort>>,
     owner_worker: Mutex<Option<WorkerId>>,
     links: Arc<crate::rdma::LinkNode>,
     numa: Mutex<HashMap<WorkerId, NativePlacement>>,
@@ -47,8 +46,9 @@ impl NativeNode {
             .get(&worker)
             .copied())
     }
-    /// Create the node owner and one client per worker. The first worker's
-    /// crypto thread hosts the owner.
+    /// Create the node owner and one client per worker. The first worker
+    /// drives activation; the owner runs on its own thread (see
+    /// [`Self::start_owner`]).
     pub(super) fn prepare(
         &self,
         workers: impl Iterator<Item = WorkerId>,
@@ -65,7 +65,7 @@ impl NativeNode {
         let (clients, port) = rdma_verbs::node(workers.len())?;
         let mut map = self.clients.lock().map_err(|_| Error::Unavailable)?;
         map.extend(workers.into_iter().zip(clients));
-        *self.owner.lock().map_err(|_| Error::Unavailable)? = Some((first, port));
+        *self.owner.lock().map_err(|_| Error::Unavailable)? = Some(port);
         *self.owner_worker.lock().map_err(|_| Error::Unavailable)? = Some(first);
         Ok(())
     }
@@ -77,7 +77,8 @@ impl NativeNode {
             .map_err(|_| Error::Unavailable)?
             .remove(&worker))
     }
-    /// The worker whose paired crypto thread hosts the owner.
+    /// The worker that drives activation. The owner thread runs on its paired
+    /// crypto CPU, so registered memory is first touched on its NUMA node.
     pub(super) fn owner_worker(&self) -> Option<WorkerId> {
         *self
             .owner_worker
@@ -87,23 +88,107 @@ impl NativeNode {
     pub(super) fn link_node(&self) -> Arc<crate::rdma::LinkNode> {
         self.links.clone()
     }
-    pub(super) fn crypto(
+    /// Start the owner thread on `cpu`, once. `None` without RDMA funding.
+    pub(super) fn start_owner(
         &self,
-        worker: WorkerId,
-        engine: PageCryptoEngine,
-    ) -> Result<Box<dyn crate::lifecycle::Service<RequestScope>>> {
-        let mut owner = self.owner.lock().map_err(|_| Error::Unavailable)?;
-        let ctx = engine.ctx().clone();
-        Ok(match owner.take_if(|(hosted, _)| *hosted == worker) {
-            // Build the owner here, on the native thread that polls it.
-            Some((_, port)) => Box::new(WithOwner::with_host(
-                engine,
-                rdma_verbs::Owner::new(port, ctx),
-            )),
-            None => Box::new(engine),
-        })
+        cpu: usize,
+        ctx: racer_io::WorkerCtx,
+    ) -> Result<Option<OwnerThread>> {
+        let Some(port) = self.owner.lock().map_err(|_| Error::Unavailable)?.take() else {
+            return Ok(None);
+        };
+        OwnerThread::spawn(port, cpu, ctx).map(Some)
+    }
+
+    /// The owner, built on the calling thread, for tests that step it.
+    #[cfg(test)]
+    pub(super) fn take_owner(&self, ctx: racer_io::WorkerCtx) -> Option<rdma_verbs::Owner> {
+        let port = self.owner.lock().unwrap().take()?;
+        Some(rdma_verbs::Owner::new(port, ctx))
     }
 }
+
+/// The node's RDMA owner thread. Dropping it stops the owner and joins the
+/// thread once the owner drained: a page buffer still held elsewhere keeps
+/// it waiting (with a periodic diagnostic), so memory the NIC may write is
+/// never freed early.
+pub(super) struct OwnerThread {
+    stop: Arc<rdma_verbs::OwnerStop>,
+
+    handle: Option<std::thread::JoinHandle<Result<()>>>,
+}
+
+impl OwnerThread {
+    /// Spawn `racer-rdma-owner`, pinned to `cpu`, and build the owner there.
+    fn spawn(port: rdma_verbs::OwnerPort, cpu: usize, ctx: racer_io::WorkerCtx) -> Result<Self> {
+        let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+        let handle = std::thread::Builder::new()
+            .name("racer-rdma-owner".into())
+            .spawn(move || -> Result<()> {
+                let started = racer_io::pin::pin_cpu(cpu)
+                    .map_err(Error::from)
+                    .and_then(|()| {
+                        rdma_verbs::OwnerRole::new(rdma_verbs::Owner::new(port, ctx))
+                            .map_err(Error::from)
+                    });
+                let mut role = match started {
+                    Ok((role, stop)) => {
+                        let _ = sender.send(Ok(stop));
+                        role
+                    }
+                    Err(error) => {
+                        let _ = sender.send(Err(error));
+                        return Err(error);
+                    }
+                };
+                racer_io::exec::run(&mut role).map_err(Error::from)
+            })
+            .map_err(|_| Error::Io)?;
+        match receiver.recv() {
+            Ok(Ok(stop)) => Ok(Self {
+                stop,
+                handle: Some(handle),
+            }),
+            Ok(Err(error)) => {
+                let _ = handle.join();
+                Err(error)
+            }
+            Err(_) => {
+                let _ = handle.join();
+                Err(Error::Io)
+            }
+        }
+    }
+
+    /// Times the owner woke from a park.
+    #[cfg(test)]
+    pub(super) fn wakes(&self) -> u64 {
+        self.stop.wakes()
+    }
+
+    /// Stop the owner and wait until it drained and its thread exited.
+    pub(super) fn shutdown(mut self) -> Result<()> {
+        self.finish()
+    }
+
+    fn finish(&mut self) -> Result<()> {
+        self.stop.stop();
+        match self.handle.take().map(std::thread::JoinHandle::join) {
+            None => Ok(()),
+            Some(Ok(result)) => result,
+            Some(Err(_)) => Err(Error::Internal),
+        }
+    }
+}
+
+impl Drop for OwnerThread {
+    fn drop(&mut self) {
+        if let Err(error) = self.finish() {
+            eprintln!("racer: stage=rdma-owner state=failed error={error:?}");
+        }
+    }
+}
+
 impl WorkerApplication {
     fn native_owner(&self) -> bool {
         self.links.is_some() && self.node.native.owner_worker() == Some(self.worker)
@@ -437,7 +522,7 @@ mod tests {
         let _environment = sim.enter();
         let app = configured();
         let (mut worker, engine) = worker(&app, true, true);
-        let mut service = app.build_crypto(WorkerId(0), engine).unwrap();
+        let mut service = test_owner(&app, engine);
         let mut cx = Context::from_waker(futures::task::noop_waker_ref());
         let mut publication = racer_control_wire::Publication {
             pools: Vec::new(),
@@ -514,6 +599,20 @@ mod tests {
         assert!(worker.native_publication().unwrap().is_empty());
         drop(service);
         assert_eq!(sim.live_resources(), 0);
+    }
+
+    /// The node owner stepped by hand on the test thread, standing in for
+    /// its own thread.
+    struct TestOwner(rdma_verbs::Owner);
+
+    impl TestOwner {
+        fn poll_budgeted(&mut self, _: &mut Context<'_>, budget: usize) -> Result<()> {
+            Ok(self.0.poll_budgeted(budget)?)
+        }
+    }
+
+    fn test_owner(app: &Application, engine: CryptoRuntime) -> TestOwner {
+        TestOwner(app.node.native.take_owner(engine.ctx).unwrap())
     }
 
     fn default_config(rdma: bool) -> Config {
@@ -913,6 +1012,50 @@ mod tests {
     }
 
     #[test]
+    /// The owner runs on its own pinned thread: it sleeps without periodic
+    /// wakes while idle, a command wakes it and its op completes on the
+    /// worker side without a timer, and shutdown drains and joins it.
+    fn owner_thread_parks_idle_serves_commands_and_joins() {
+        let mut limits = default_config(true).limits;
+        limits.registered_bytes = NonZeroUsize::new(crate::rdma::BUFFER_LEN).unwrap();
+        let native = NativeNode::default();
+        native
+            .prepare(std::iter::once(WorkerId(0)), &limits)
+            .unwrap();
+        let client = native.client(WorkerId(0)).unwrap().unwrap();
+        let cpu = *racer_io::pin::current_cpus().unwrap().first().unwrap();
+        let owner = native
+            .start_owner(cpu, racer_io::WorkerCtx::host())
+            .unwrap()
+            .unwrap();
+        assert!(
+            native
+                .start_owner(cpu, racer_io::WorkerCtx::host())
+                .unwrap()
+                .is_none(),
+            "one owner per node"
+        );
+        let idle = owner.wakes();
+        std::thread::sleep(Duration::from_millis(200));
+        assert!(owner.wakes() - idle <= 1, "idle owner woke periodically");
+        // Not activated: the op fails, but the owner must still answer it.
+        let key = rdma_verbs::LinkKey {
+            peer: [1; 32],
+            rail: 0,
+        };
+        let opened = client.open(key);
+        let started = std::time::Instant::now();
+        let result = futures::executor::block_on(std::future::poll_fn(|cx| opened.poll(cx)));
+        assert!(result.is_err());
+        assert!(started.elapsed() < Duration::from_secs(5));
+        assert!(owner.wakes() > idle);
+        let started = std::time::Instant::now();
+        owner.shutdown().unwrap();
+        assert!(started.elapsed() < Duration::from_secs(5));
+        assert!(client.closed() && client.drained());
+    }
+
+    #[test]
     fn activation_turn_scales_with_registered_bytes() {
         assert_eq!(activation_turn(0), Duration::from_secs(5));
         assert_eq!(activation_turn(1), Duration::from_secs(6));
@@ -928,7 +1071,8 @@ mod tests {
         config.scale_limits(plan.pairs.len()).unwrap();
         let limits = size_workers(&config.limits, &mut plan, true).unwrap();
         assert_eq!(plan.pairs.len(), 5);
-        assert_eq!(plan.max_threads, usize::MAX);
+        // One thread of the budget is kept for the RDMA owner.
+        assert_eq!(plan.max_threads, usize::MAX - 1);
         for (worker, pair) in plan.pairs.iter().enumerate() {
             assert_eq!(pair.worker, WorkerId(worker as u16));
         }
@@ -1211,7 +1355,7 @@ mod tests {
         app.discovered_nics[0].device = "test-device".into();
         let (mut worker, engine) = worker(&app, true, true);
         assert_eq!(worker.native_publication().unwrap().len(), 1);
-        let mut service = app.build_crypto(WorkerId(0), engine).unwrap();
+        let mut service = test_owner(&app, engine);
         let mut cx = Context::from_waker(futures::task::noop_waker_ref());
         for _ in 0..20 {
             worker.poll_native(&mut cx).unwrap();
@@ -1420,7 +1564,7 @@ mod tests {
             )),
             Ok(())
         );
-        let mut service = app.build_crypto(WorkerId(0), engine).unwrap();
+        let mut service = test_owner(&app, engine);
         let mut cx = Context::from_waker(futures::task::noop_waker_ref());
         worker.native_retry = racer_io::Clock::host().now();
         worker.poll_native(&mut cx).unwrap();
@@ -1473,7 +1617,7 @@ mod tests {
         std::thread::scope(|threads| {
             threads
                 .spawn(|| {
-                    let mut service = app.build_crypto(WorkerId(0), engine).unwrap();
+                    let mut service = test_owner(&app, engine);
                     service
                         .poll_budgeted(&mut Context::from_waker(futures::task::noop_waker_ref()), 1)
                         .unwrap();

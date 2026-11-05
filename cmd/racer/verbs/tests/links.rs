@@ -12,10 +12,13 @@ use std::{
     time::{Duration, Instant},
 };
 
-use racer_io::SimClock;
+use racer_io::{
+    SimClock,
+    exec::{Next, Role},
+};
 use rdma_verbs::{
-    Arrival, BACKOFF_MIN, BufferState, COMMAND_QUEUE, Client, Epoch, Error, Granted, LinkKey,
-    LinkState, NodeConfig, Op, Opened, Owner, SETUP_TIMEOUT, Setup, Source,
+    Arrival, BACKOFF_MIN, BufferState, COMMAND_QUEUE, Client, DRAIN_REPORT, Epoch, Error, Granted,
+    LinkKey, LinkState, NodeConfig, Op, Opened, Owner, OwnerRole, SETUP_TIMEOUT, Setup, Source,
     simulation::{
         Device, Fault, MemfdMemory, Operation, Profile, Simulation, current_profile,
         default_profile,
@@ -732,24 +735,26 @@ fn worker_drop() {
     });
 }
 
+/// Step `role` until it finishes, at most `turns` times.
+fn finish(role: &mut OwnerRole, turns: usize) -> bool {
+    (0..turns).any(|_| role.step().unwrap() == Next::Done)
+}
+
 #[test]
-/// The owner can be hosted by `WithNative` and drained by its fence.
-fn owner_hosted_by_with_native() {
+/// The owner runs as its own role: it serves commands, and once stopped it
+/// closes, drains, and finishes.
+fn owner_role_serves_and_drains_on_stop() {
     profiles(|| {
         let mut w = world();
-        let owner = w.a.owner.take().unwrap();
-        let mut service = rdma_verbs::WithNative::with_host((), owner);
-        let cx = Context::from_waker(futures::task::noop_waker_ref());
-        service.native().register_driver(cx.waker());
+        let (mut role, stop) = OwnerRole::new(w.a.owner.take().unwrap()).unwrap();
         let opened = w.a.clients[0].open(TO_B);
-        service.native_mut().poll_budgeted(8).unwrap();
+        role.step().unwrap();
         assert!(ready(&opened).is_ok());
-        futures::executor::block_on(
-            service.close_alongside(|_| Box::pin(async { Ok::<(), rdma_verbs::Error>(()) })),
-        )
-        .unwrap();
+        assert!(!stop.requested());
+        stop.stop();
+        assert!(finish(&mut role, 64), "owner role did not finish");
         assert!(w.a.clients[0].drained());
-        drop(service);
+        drop(role);
         w.b.clients[0].close();
         pump(&mut w);
         assert_eq!(w.sim.live_resources(), 0);
@@ -757,10 +762,10 @@ fn owner_hosted_by_with_native() {
 }
 
 #[test]
-/// Drain and fence drive inner work alongside the native drain. The inner
-/// side holds a received page that it only returns while its own drain or
-/// fence runs; draining the native side first would wait forever.
-fn with_native_drives_inner_work_holding_buffers() {
+/// A stopped owner waits for a page buffer held elsewhere (by a crypto job,
+/// say): it reports the slow drain but never finishes early, and the
+/// buffer's return wakes it without any timer.
+fn owner_role_drain_waits_for_held_buffer() {
     profiles(|| {
         let mut w = world();
         let (ea, eb) = link_up(&mut w);
@@ -770,32 +775,77 @@ fn with_native_drives_inner_work_holding_buffers() {
         let written = w.b.clients[0].write(TO_A, eb, granted.tag, bytes(vec![2; 4]), deadline);
         assert_eq!(wait(&mut w, &written), Ok(()));
         let held = page(ready(&granted.arrival));
-        assert_eq!(
-            w.a.clients[1].buffers(7, BufferState::Free),
-            Some(BUFFERS - 1)
-        );
-        let owner = w.a.owner.take().unwrap();
-        let mut cx = Context::from_waker(futures::task::noop_waker_ref());
-        let mut service = rdma_verbs::WithNative::with_host(Some(held), owner);
-        service.native().register_driver(cx.waker());
-        service.native_mut().poll_budgeted(8).unwrap();
-        let mut teardown = service.close_alongside(|holder| {
-            Box::pin(async move {
-                holder.take();
-                Ok::<(), rdma_verbs::Error>(())
-            })
-        });
-        let mut finished = None;
-        for _ in 0..64 {
-            if let Poll::Ready(result) = teardown.as_mut().poll(&mut cx) {
-                finished = Some(result);
+        let (mut role, stop) = OwnerRole::new(w.a.owner.take().unwrap()).unwrap();
+        stop.stop();
+        assert!(!finish(&mut role, 64), "drained with a buffer still held");
+        // Past the report period: still waiting, never freeing early.
+        w.clock.advance(DRAIN_REPORT + SECOND);
+        assert!(!finish(&mut role, 4));
+        assert!(!w.a.clients[0].drained());
+        // The return wakes the parked role at once: no tick needed.
+        drop(held);
+        let parked = Instant::now();
+        role.park(Next::Idle).unwrap();
+        assert!(parked.elapsed() < Duration::from_secs(5));
+        assert!(finish(&mut role, 64), "owner role did not finish");
+        assert!(w.a.clients[0].drained());
+        drop(role);
+        w.b.clients[0].close();
+        pump(&mut w);
+        assert_eq!(w.sim.live_resources(), 0);
+    });
+}
+
+#[test]
+/// An idle owner with a ready link needs no periodic poll: its next wake is
+/// the link's idle timer, far in the future. A peer write wakes it through
+/// the completion channel, and a command through the eventfd.
+fn owner_role_parks_on_wake_sources_without_ticks() {
+    profiles(|| {
+        let mut w = world();
+        let (ea, eb) = link_up(&mut w);
+        let (mut role, stop) = OwnerRole::new(w.a.owner.take().unwrap()).unwrap();
+        let mut next = role.step().unwrap();
+        for _ in 0..8 {
+            if next != Next::Ready {
                 break;
             }
+            next = role.step().unwrap();
         }
-        assert!(matches!(finished, Some(Ok(()))), "teardown stalled");
-        drop(teardown);
-        assert!(w.a.clients[0].drained());
-        drop(service);
+        match next {
+            Next::Idle => {}
+            Next::WaitUntil(at) => assert!(at >= w.now() + Duration::from_secs(60), "ticks"),
+            other => panic!("owner not idle: {other:?}"),
+        }
+        // A command wakes the parked owner.
+        let deadline = w.now() + 5 * SECOND;
+        let granted = w.a.clients[0].grant(TO_B, ea, [3; 16], 4, deadline);
+        let parked = Instant::now();
+        role.park(Next::Idle).unwrap();
+        assert!(parked.elapsed() < Duration::from_secs(5));
+        for _ in 0..8 {
+            role.step().unwrap();
+            w.b.owner().poll_budgeted(64).unwrap();
+        }
+        let granted = ready(&granted).unwrap();
+        // A peer write wakes it through its completion channel.
+        let written = w.b.clients[0].write(TO_A, eb, granted.tag, bytes(vec![4; 4]), deadline);
+        for _ in 0..4 {
+            w.b.owner().poll_budgeted(64).unwrap();
+        }
+        let parked = Instant::now();
+        role.park(Next::Idle).unwrap();
+        assert!(parked.elapsed() < Duration::from_secs(5));
+        for _ in 0..8 {
+            role.step().unwrap();
+            w.b.owner().poll_budgeted(64).unwrap();
+        }
+        assert_eq!(ready(&written), Ok(()));
+        assert_eq!(page(ready(&granted.arrival)).bytes(), [4; 4]);
+        assert!(stop.wakes() >= 2);
+        stop.stop();
+        assert!(finish(&mut role, 64));
+        drop(role);
         w.b.clients[0].close();
         pump(&mut w);
         assert_eq!(w.sim.live_resources(), 0);

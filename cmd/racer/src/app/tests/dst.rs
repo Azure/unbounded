@@ -2211,6 +2211,44 @@ struct Node {
     adapter: Adapter,
     control: Option<Rc<Session>>,
 }
+/// Page crypto plus, for the first worker built, the node's RDMA owner, both
+/// stepped on the harness thread. Production runs the owner on its own
+/// thread; this harness is single-threaded and deterministic.
+struct SteppedCrypto {
+    engine: crate::security::PageCryptoEngine,
+    owner: Option<rdma_verbs::Owner>,
+}
+
+impl crate::lifecycle::Service<RequestScope> for SteppedCrypto {
+    fn start<'a>(&'a mut self, scope: &'a RequestScope) -> Operation<'a, ()> {
+        self.engine.start(scope)
+    }
+
+    fn poll_budgeted(&mut self, cx: &mut Context<'_>, budget: usize) -> Result<()> {
+        self.engine.poll_budgeted(cx, budget)?;
+        if let Some(owner) = &mut self.owner {
+            owner.poll_budgeted(budget)?;
+        }
+        Ok(())
+    }
+
+    fn drain<'a>(&'a mut self, scope: &'a RequestScope) -> Operation<'a, ()> {
+        self.engine.drain(scope)
+    }
+
+    fn shutdown<'a>(&'a mut self, scope: &'a RequestScope) -> Operation<'a, ()> {
+        self.engine.shutdown(scope)
+    }
+}
+
+fn stepped_crypto(
+    node: &NodeState,
+    engine: crate::security::PageCryptoEngine,
+) -> Box<dyn crate::lifecycle::Service<RequestScope>> {
+    let owner = node.native.take_owner(engine.ctx().clone());
+    Box::new(SteppedCrypto { engine, owner })
+}
+
 struct LocalWorker {
     app: WorkerApplication,
     runtime: WorkerRuntime,
@@ -2459,7 +2497,7 @@ impl Harness {
         };
         let (mut app, runtime, engine) =
             crate::app::tests::local_worker_with_fabric(&config, &node, 0, discovered_nics);
-        let crypto = node.native.crypto(WorkerId(0), engine).unwrap();
+        let crypto = stepped_crypto(&node, engine);
         app.keys
             .install(self.bundle(&config, u64::from(self.key_epoch) + 1))
             .unwrap();
@@ -2496,7 +2534,7 @@ impl Harness {
                 worker as u16,
                 workers[0].app.discovered_nics.clone(),
             );
-            let crypto = node.native.crypto(WorkerId(worker as u16), engine).unwrap();
+            let crypto = stepped_crypto(&node, engine);
             workers.push(LocalWorker {
                 app,
                 runtime,

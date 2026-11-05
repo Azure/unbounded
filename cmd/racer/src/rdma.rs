@@ -10,7 +10,6 @@ use crate::model::PageId;
 use crate::model::TransferId;
 use crate::peer::protocol::VerifiedHead;
 use crate::runtime::RequestScope;
-use crate::security::PageCryptoEngine;
 use crate::topology::FAILURE_LINKS;
 use crate::topology::Route;
 use base64::Engine;
@@ -49,13 +48,10 @@ pub use links::grants_per_link;
 pub use links::link_key;
 use retry::NativeRetry;
 
-/// Host the node's link owner beside page crypto on its paired thread.
-pub type WithOwner = rdma_verbs::WithNative<PageCryptoEngine, rdma_verbs::Owner>;
-
 // Match discovered ports to trusted local fabric associations and publication.
 // Fabric strings are opaque labels: a GID or enumeration order is never a label.
 // Public contracts always compile; native FFI is gated by `rdma`. The node owner
-// runs on one crypto thread (`WithOwner`); I/O workers use `Links`.
+// runs on its own thread (`rdma_verbs::OwnerRole`); I/O workers use `Links`.
 
 /// Signed setup extension of an `RdmaLink` request and response.
 pub const SETUP_HEADER: &str = "racer-rdma-setup";

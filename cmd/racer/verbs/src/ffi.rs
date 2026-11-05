@@ -235,6 +235,10 @@ const WC_IMM: u32 = 1;
 #[cfg(any(test, all(feature = "native", target_os = "linux")))]
 const ABI_VERSION: u32 = 7;
 
+/// Completions one [`NativeQueuePair::progress_with`] call reads. A full
+/// batch means more may be waiting without a new channel event.
+pub(crate) const POLL_BATCH: usize = 32;
+
 /// Completion opcodes (`enum ibv_wc_opcode`), pinned by C static asserts.
 pub(crate) mod opcode {
     /// `IBV_WC_SEND`.
@@ -1431,6 +1435,13 @@ impl<T> NativeQueuePair<T> {
     }
 
     /// True if connected, established, and not stopping.
+    /// Completions this QP made up itself (registration mode binds and
+    /// invalidates) that the next progress call reports. They raise no
+    /// channel event, so the owner must poll again without waiting.
+    pub(crate) fn has_synthetic(&self) -> bool {
+        !self.synthetic.borrow().is_empty()
+    }
+
     pub(crate) fn ready(&self) -> bool {
         self.connected.get()
             && !self.stopped.get()
@@ -1527,7 +1538,7 @@ impl<T> NativeQueuePair<T> {
             let _ = unsafe { (api.req_notify)(self.cq.as_ptr()) };
             self.armed.set(true);
         }
-        let mut completions = [Completion::default(); 32];
+        let mut completions = [Completion::default(); POLL_BATCH];
         let mut n = 0;
         {
             let mut synthetic = self.synthetic.borrow_mut();

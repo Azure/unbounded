@@ -15,8 +15,8 @@
 //! and one node-wide pool of registered page buffers per rail.
 //!
 //! 1. Call [`node()`] to get one [`Client`] per I/O worker and an [`OwnerPort`].
-//! 2. On the native thread, build the [`Owner`] and poll it, or host it in a
-//!    lifecycle service with [`WithNative::with_host`].
+//! 2. On the native thread, build the [`Owner`] and poll it, or run it as
+//!    its own thread's role with [`OwnerRole`].
 //! 3. Call [`Client::activate`] with a [`NodeConfig`]. The owner finds RDMA
 //!    ports, your selector picks some, and each picked port gets a page pool.
 //! 4. Set up a link with [`Client::open`] and [`Client::accept`], exchanging
@@ -59,8 +59,10 @@
 //!
 //! [`Client::close`] breaks every link. The owner frees everything once no
 //! page is held. Once it has drained, [`Client::reopen`] can start a new
-//! round. [`WithNative`] adds a native host to a lifecycle service so
-//! drain and fence also finish the native side.
+//! round. [`OwnerRole`] runs the owner on a dedicated thread, parked on its
+//! wake sources, and finishes once [`OwnerStop::stop`] was called and the
+//! owner drained. Drain waits for every page buffer to come back, however
+//! long that takes: the NIC may still own memory that is freed early.
 //!
 //! # Backends
 //!
@@ -83,6 +85,7 @@ mod ffi;
 mod link;
 mod node;
 mod pool;
+mod role;
 
 pub use channel::Op;
 pub use ffi::Endpoint;
@@ -92,6 +95,7 @@ pub use node::{
     LinkState, NodeConfig, Opened, Owner, OwnerPort, SETUP_TIMEOUT, Setup, node,
 };
 pub use pool::{BufferState, DevicePage, RegisteredPage};
+pub use role::{DRAIN_REPORT, OwnerRole, OwnerStop};
 
 #[cfg(any(test, feature = "simulation"))]
 pub use ffi::simulation;
@@ -219,44 +223,6 @@ pub struct Selection {
     pub port: PortInfo,
 }
 
-/// A lifecycle service (implemented in `racer::lifecycle`) with a [`NativeHost`] attached.
-///
-/// - Poll: polls both with the same budget.
-/// - Stop admission: only the inner service. Native work keeps going.
-/// - Drain and fence: close the native side, then drive it and the inner
-///   drain or fence together until both finish. The native side always
-///   drains fully, even if the scope has expired or the inner side failed.
-///   Driving them together matters: inner work (such as a queued crypto job)
-///   can own a pool buffer the native side waits for.
-/// - Close: closes both, native first.
-pub struct WithNative<T, N> {
-    inner: T,
-
-    native: N,
-}
-
-/// A native-thread service [`WithNative`] can host, such as the link
-/// [`Owner`].
-pub trait NativeHost {
-    /// Wake `waker` when the I/O side has work.
-    fn register_driver(&self, waker: &Waker);
-
-    /// Do up to `budget` steps of work.
-    fn poll_budgeted(&mut self, budget: usize) -> Result<()>;
-
-    /// Longest the host may park before polling again: work without a wake
-    /// source (completion queues without a channel, timers) reports a bound.
-    fn wait_timeout(&self, maximum: std::time::Duration) -> std::time::Duration {
-        maximum
-    }
-
-    /// Start shutdown. Does not wait.
-    fn close(&self);
-
-    /// True once shutdown finished.
-    fn drained(&self) -> bool;
-}
-
 impl Endpoint {
     /// Size of the wire encoding.
     pub const ENCODED_LEN: usize = 32;
@@ -293,100 +259,10 @@ impl Endpoint {
     }
 }
 
-use std::{
-    future::Future,
-    pin::Pin,
-    sync::{
-        Arc,
-        atomic::{AtomicBool, Ordering},
-    },
-    task::{Poll, Waker},
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
 };
-
-/// A boxed lifecycle future borrowing the hosted service.
-pub type Operation<'a, T, E> = Pin<Box<dyn Future<Output = std::result::Result<T, E>> + 'a>>;
-
-impl<T, N: NativeHost> WithNative<T, N> {
-    /// Wrap `inner` with an already built native host, for example an
-    /// [`Owner`]. Call on the native thread.
-    pub fn with_host(inner: T, native: N) -> Self {
-        Self { inner, native }
-    }
-
-    /// The hosted service.
-    pub fn inner(&self) -> &T {
-        &self.inner
-    }
-
-    /// The hosted service, mutably.
-    pub fn inner_mut(&mut self) -> &mut T {
-        &mut self.inner
-    }
-
-    /// The native host.
-    pub fn native(&self) -> &N {
-        &self.native
-    }
-
-    /// The native host, mutably.
-    pub fn native_mut(&mut self) -> &mut N {
-        &mut self.native
-    }
-
-    /// Drive native activation while the inner service's `start` runs.
-    pub fn start_alongside<'a, E: From<Error> + 'a>(
-        &'a mut self,
-        start: impl FnOnce(&'a mut T) -> Operation<'a, (), E>,
-    ) -> Operation<'a, (), E> {
-        let mut startup = start(&mut self.inner);
-        let native = &mut self.native;
-        Box::pin(std::future::poll_fn(move |cx| {
-            native.register_driver(cx.waker());
-            native.poll_budgeted(1)?;
-            startup.as_mut().poll(cx)
-        }))
-    }
-
-    /// Close the native side and drive it alongside the inner operation built
-    /// by `inner` (a drain or fence) until both finish.
-    pub fn close_alongside<'a, E: From<Error> + 'a>(
-        &'a mut self,
-        inner: impl FnOnce(&'a mut T) -> Operation<'a, (), E>,
-    ) -> Operation<'a, (), E> {
-        let operation = inner(&mut self.inner);
-        close_alongside(&mut self.native, operation)
-    }
-}
-
-/// Close `native`, then poll it and `inner` until both finish. Ignores scope
-/// deadlines for the native side: the NIC must be stopped before memory is
-/// freed, so an inner error is held until the native side has drained. A
-/// native error returns at once, as before.
-fn close_alongside<'a, N: NativeHost, E: From<Error> + 'a>(
-    native: &'a mut N,
-    mut inner: Operation<'a, (), E>,
-) -> Operation<'a, (), E> {
-    native.close();
-    let mut outcome: Option<std::result::Result<(), E>> = None;
-    Box::pin(std::future::poll_fn(move |cx| {
-        native.register_driver(cx.waker());
-        if outcome.is_none()
-            && let Poll::Ready(result) = inner.as_mut().poll(cx)
-        {
-            outcome = Some(result);
-        }
-        // Poll after the inner side so buffers it just returned count.
-        native.poll_budgeted(1)?;
-        if !native.drained() {
-            // Relies on the runtime's periodic ticks to retry.
-            return Poll::Pending;
-        }
-        match outcome.take() {
-            Some(result) => Poll::Ready(result),
-            None => Poll::Pending,
-        }
-    }))
-}
 
 /// Our own `Arc` around a caller's [`Guard`].
 ///

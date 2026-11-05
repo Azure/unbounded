@@ -566,6 +566,16 @@ impl Application {
             .ok_or(Error::InvalidConfiguration)?
             .node = identity;
         self.prepare_workers()?;
+        // The owner thread outlives the worker group: lanes and crypto jobs
+        // return its page buffers while they drain, and dropping it after the
+        // group joins waits for the owner to drain.
+        let owner = match plan.pairs.first() {
+            Some(first) if self.config.enable_rdma => self
+                .node
+                .native
+                .start_owner(first.crypto.cpu, self.ctx.clone())?,
+            _ => None,
+        };
         let mut workers = WorkerGroup::new(plan, self.ctx.clone());
         // A stop signal is a clean stop, not an error; failures recorded
         // before or after it still fail the run.
@@ -575,8 +585,10 @@ impl Application {
         } else {
             workers.run(&self)
         };
+        drop(workers);
+        let stopped = owner.map_or(Ok(()), native::OwnerThread::shutdown);
         drop(signals);
-        result
+        result.and(stopped)
     }
 }
 
@@ -2566,15 +2578,13 @@ impl Application {
         Ok(Box::new(application))
     }
 
-    /// Build the crypto service and attach any configured native resources.
+    /// Build the crypto service. The RDMA owner runs on its own thread.
     fn build_crypto(
         &self,
-        worker: WorkerId,
+        _worker: WorkerId,
         runtime: CryptoRuntime,
     ) -> Result<Box<dyn crate::lifecycle::Service<RequestScope>>> {
-        self.node
-            .native
-            .crypto(worker, PageCryptoEngine::new(runtime))
+        Ok(Box::new(PageCryptoEngine::new(runtime)))
     }
 }
 
