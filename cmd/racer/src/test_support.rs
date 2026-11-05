@@ -482,7 +482,7 @@ pub(crate) mod enrollment {
             }
             Err(e) => panic!("io_uring setup: {e}"),
         }
-        Some(io::reactor())
+        Some(io::reactor_in(&crate::test_support::env()))
     }
 }
 

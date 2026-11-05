@@ -23,7 +23,16 @@ pub fn default_config(cluster: &str) -> dataplane::config::Config {
     .unwrap()
 }
 
+/// A production reactor on the host io_uring backend.
 pub fn reactor() -> Rc<Reactor> {
+    reactor_in(&racer_io::Env::new(
+        racer_io::Driver::Uring,
+        racer_io::WorkerCtx::host(),
+    ))
+}
+
+/// A production reactor on an explicit backend, such as a simulated world.
+pub fn reactor_in(env: &racer_io::Env) -> Rc<Reactor> {
     let n = NonZeroUsize::new(1024 * 1024).unwrap();
     let reactor = Rc::new(Reactor::new(
         Rc::new(flow_control::Quotas::new(AdmissionPolicy::new(Limits {
@@ -50,7 +59,7 @@ pub fn reactor() -> Rc<Reactor> {
             metadata_entries: n,
             relay_transfers: n,
         }))),
-        &racer_io::Env::new(racer_io::Driver::Uring, racer_io::WorkerCtx::host()),
+        env,
     ));
     reactor.init().unwrap();
     reactor
