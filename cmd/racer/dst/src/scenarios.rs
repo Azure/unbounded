@@ -4,7 +4,7 @@ use crate::{
     engine::{MILLIS, Nanos, SECONDS},
     fixture::lane_pair,
     invariants::{Class, all_roles_settled},
-    model::{ModelSpec, RangeRead, Storm},
+    model::{ModelSpec, Outage, RangeRead, Storm},
     scenario::FaultMix,
     world::Fault,
 };
@@ -293,6 +293,67 @@ pub fn metadata_readers() -> Scenario {
         .end(4 * SECONDS)
 }
 
+/// Model-only fault mix: 32 nodes read one object page by page and another as ranges while
+/// 20% of origin fetches answer 403 and 5% answer 5xx, and four nodes lose their caches for the
+/// first 300 ms (they answer peers with `Miss`). Every read ends; reads fail only with
+/// `OriginForbidden` (not retried) or `Unavailable` (after retries); a failed range read
+/// discards its buffered pages.
+pub fn faults() -> Scenario {
+    const NODES: u32 = 32;
+    let range = Some(RangeRead {
+        window_pages: 4,
+        spill: 0,
+        leased: false,
+    });
+    let spec = ModelSpec {
+        storms: vec![
+            storm(0, 0, NODES, MILLIS),
+            Storm {
+                range,
+                ..storm(0, 1, NODES, MILLIS)
+            },
+        ],
+        origin_errors: crate::resources::OriginErrors {
+            p403: 0.2,
+            p5xx: 0.05,
+            ..Default::default()
+        },
+        outages: (0..4)
+            .map(|node| Outage {
+                node: node * 7,
+                at: 0,
+                until: 300 * MILLIS,
+            })
+            .collect(),
+        ..ModelSpec::default()
+    };
+    let total = 2 * u64::from(NODES) * u64::from(spec.pages_per_object);
+    let spec = spec
+        .check("every-read-ends", move |r| {
+            let ended = counter(r, "reads_completed") + counter(r, "reads_failed");
+            (ended == total)
+                .then_some(())
+                .ok_or(format!("{ended} of {total} reads ended"))
+        })
+        .check("failures-are-origin-errors", |r| {
+            let failed = counter(r, "reads_failed");
+            let explained = error(r, "OriginForbidden") + error(r, "Unavailable");
+            (failed == explained && counter(r, "reads_completed") > failed)
+                .then_some(())
+                .ok_or(format!("failures: {}", r["metrics"]["errors"]))
+        })
+        .check("outages-answer-miss", |r| {
+            (r["coverage"]["Served::Miss"].as_u64().unwrap_or(0) > 0)
+                .then_some(())
+                .ok_or("no outage misses".into())
+        });
+    Scenario::new("model-faults")
+        .nodes(NODES)
+        .sites(4)
+        .model(spec)
+        .end(10 * SECONDS)
+}
+
 /// Every built-in scenario.
 pub fn catalog() -> Vec<Scenario> {
     vec![
@@ -303,6 +364,7 @@ pub fn catalog() -> Vec<Scenario> {
         origin_forbidden(),
         range_readers(),
         metadata_readers(),
+        faults(),
         Scenario::new("lane-pair")
             .roles(|env| lane_pair(env, 8))
             .with(all_roles_settled())

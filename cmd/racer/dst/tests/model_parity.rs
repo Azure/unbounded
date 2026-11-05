@@ -45,3 +45,12 @@ fn metadata_readers_coalesce_refreshes() {
     let report = run(scenarios::metadata_readers(), 3);
     println!("{:#}", report["coverage"]);
 }
+
+#[test]
+fn faults_end_every_read() {
+    let report = run(
+        scenarios::faults(),
+        std::env::var("SEED").map_or(3, |s| s.parse().unwrap()),
+    );
+    println!("{:#}", report["coverage"]);
+}

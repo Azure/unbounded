@@ -55,6 +55,8 @@ pub struct Counters {
     pub spill_holds: u64,
     /// Metadata refreshes sent to origin.
     pub metadata_requests: u64,
+    /// Stored pages lost to cache outages.
+    pub outage_lost_pages: u64,
     /// Client read attempts retried after a recoverable failure.
     pub read_retries: u64,
     /// Most pages any node stores at the end of the run.
@@ -140,6 +142,7 @@ impl Report {
                     "origin_403": c.origin_403,
                     "origin_5xx": c.origin_5xx,
                     "read_retries": c.read_retries,
+                    "outage_lost_pages": c.outage_lost_pages,
                     "disk_reads": c.disk_reads,
                     "spill_holds": c.spill_holds,
                     "metadata_requests": c.metadata_requests,

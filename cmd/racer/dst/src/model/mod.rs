@@ -8,6 +8,7 @@
 //! node holds which page). It never decides where to probe, when to fetch from origin or
 //! whom to shed; the cores do. See `dst/MODEL.md` for what is and is not modeled yet.
 
+pub mod coverage;
 pub mod phantom;
 mod report;
 
@@ -120,6 +121,19 @@ pub struct Storm {
     pub range: Option<RangeRead>,
 }
 
+/// Node `node`'s cache is unavailable from `at` until `until`: its stored pages are lost at
+/// `at`, and it answers peer probes with `Miss` (`ServeFacts::cache_available` false) until
+/// `until`. Its client reads still run.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct Outage {
+    /// Affected node.
+    pub node: u32,
+    /// Start of the outage.
+    pub at: Nanos,
+    /// End of the outage.
+    pub until: Nanos,
+}
+
 /// The shape of a client range read ([`racer_core::read::window::WindowConfig`]).
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct RangeRead {
@@ -151,6 +165,8 @@ pub struct ModelSpec {
     pub stored_pages: usize,
     /// Injected origin error rates.
     pub origin_errors: OriginErrors,
+    /// Cache outages.
+    pub outages: Vec<Outage>,
     /// Client page reads refresh the object's metadata through the worker's
     /// `MetadataCohort` first.
     pub metadata: bool,
@@ -183,6 +199,7 @@ impl Default for ModelSpec {
             stored_pages: 0,
             origin_errors: OriginErrors::default(),
             metadata: false,
+            outages: Vec::new(),
             checks: Vec::new(),
         }
     }
@@ -258,6 +275,8 @@ enum Ev {
         worker: u32,
         window: WindowId,
     },
+    /// A cache outage of `node` begins.
+    Outage { node: u32 },
     /// Answer metadata refresh `id` of `(node, worker)`.
     MetadataInput {
         node: u32,
@@ -452,11 +471,22 @@ impl<'s> Model<'s> {
         self.engine.now()
     }
 
+    /// Count coverage name `name`; a name [`coverage::VARIANTS`] lacks is a hard failure.
+    fn cover(&mut self, name: &'static str) {
+        if !coverage::VARIANTS.contains(&name) {
+            self.violation(format!("coverage name {name} is not in coverage::VARIANTS"));
+        }
+        *self.report.coverage.entry(name).or_default() += 1;
+    }
+
     fn violation(&mut self, message: String) {
         self.report.violation(message);
     }
 
     fn schedule_storms(&mut self) {
+        for outage in self.spec.outages.clone() {
+            self.engine.at(outage.at, Ev::Outage { node: outage.node });
+        }
         let n = self.nodes.len() as u32;
         for storm in self.spec.storms.clone() {
             for i in 0..storm.nodes {
@@ -556,6 +586,13 @@ impl<'s> Model<'s> {
                 worker,
                 window,
             } => self.pump(node, worker, window),
+            Ev::Outage { node } => {
+                self.trace.record(now, TAG_EVENT, 9, u64::from(node));
+                let capacity = self.spec.stored_pages;
+                let lost = self.nodes[node as usize].stored.len() as u64;
+                self.report.counters.outage_lost_pages += lost;
+                self.nodes[node as usize].stored = Store::new(capacity);
+            }
             Ev::MetadataInput {
                 node,
                 worker,
@@ -586,6 +623,7 @@ impl<'s> Model<'s> {
                 let _ = self.nodes[node as usize].cores[worker as usize]
                     .on_acquisition(read, input, at, &mut out);
                 self.dispatch(node, worker, out);
+                self.pump_all(node, worker);
             }
             Ev::Probe {
                 from,
@@ -626,13 +664,18 @@ impl<'s> Model<'s> {
                 self.trace.record(now, TAG_EVENT, 5, u64::from(node));
                 let mut out = Vec::new();
                 let at = self.instant(now);
+                // A fetch answer may arrive after its window closed (the range read failed);
+                // the core refuses it. A refused fetch request is a hard failure.
+                let late = matches!(msg, WorkerMsg::Fetched { .. });
                 if self.nodes[node as usize].cores[worker as usize]
                     .on_worker_msg(msg, at, &mut out)
                     .is_err()
+                    && !late
                 {
                     self.violation(format!("node {node} worker {worker} refused a message"));
                 }
                 self.dispatch(node, worker, out);
+                self.pump_all(node, worker);
             }
             Ev::Tick => {
                 self.ticking = false;
@@ -642,6 +685,7 @@ impl<'s> Model<'s> {
                         let mut out = Vec::new();
                         self.nodes[node].cores[worker].tick(at, &mut out);
                         self.dispatch(node as u32, worker as u32, out);
+                        self.pump_all(node as u32, worker as u32);
                     }
                 }
                 if !self.clients.is_empty() || !self.serving.is_empty() {
@@ -730,6 +774,19 @@ impl<'s> Model<'s> {
         };
         self.ranges.insert((node, worker, window), state);
         self.pump(node, worker, window);
+    }
+
+    /// Pump every open window of `(node, worker)`: a fill that ended inside the core (a
+    /// flight settled, a worker fetch answered) may have freed or failed a slot.
+    fn pump_all(&mut self, node: u32, worker: u32) {
+        let windows: Vec<_> = self
+            .ranges
+            .range((node, worker, WindowId(0))..=(node, worker, WindowId(u64::MAX)))
+            .map(|(key, _)| key.2)
+            .collect();
+        for window in windows {
+            self.pump(node, worker, window);
+        }
     }
 
     /// Plan window work and deliver what is ready.
@@ -872,7 +929,11 @@ impl<'s> Model<'s> {
                 operation: OperationKind::Page,
                 copy_only,
                 object_matches: true,
-                cache_available: true,
+                cache_available: !self
+                    .spec
+                    .outages
+                    .iter()
+                    .any(|o| o.node == to && (o.at..o.until).contains(&now)),
             },
             body: true,
             local_flight: core.acquiring(&page),
@@ -884,11 +945,7 @@ impl<'s> Model<'s> {
             column_mate: false,
         };
         let served = core.serve(&page, request, &view, at);
-        *self
-            .report
-            .coverage
-            .entry(served_name(&served))
-            .or_default() += 1;
+        self.cover(served_name(&served));
         let decision = match served {
             Served::Defer(_) => {
                 self.report.counters.deferrals += 1;
@@ -983,11 +1040,7 @@ impl<'s> Model<'s> {
     /// world, never a choice of where to go next.
     fn dispatch(&mut self, node: u32, worker: u32, effects: Vec<Effect<ModelTypes>>) {
         for effect in effects {
-            *self
-                .report
-                .coverage
-                .entry(effect_name(&effect))
-                .or_default() += 1;
+            self.cover(effect_name(&effect));
             if let Some(id) = effect.id()
                 && !self.answered.insert((node, worker, id))
             {
@@ -1306,7 +1359,7 @@ impl<'s> Model<'s> {
 }
 
 /// The coverage name of an effect: the variant path, exhaustively, so a new core variant fails
-/// to compile here until the coverage-parity list (`coverage::EFFECTS`) names it.
+/// to compile here until it has a name (see [`coverage`]).
 pub fn effect_name(effect: &Effect<ModelTypes>) -> &'static str {
     use acquisition::Io as Acq;
     use racer_core::read::window::{Effect as Win, Next};

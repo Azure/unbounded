@@ -9,6 +9,8 @@ use std::process::ExitCode;
 use racer_dst::{
     choices::{SeedEntry, Source, parse_seeds},
     determinism::{run_twice, shrink_failure},
+    model,
+    scenario::Fidelity,
     scenarios,
 };
 
@@ -45,6 +47,31 @@ fn entries() -> Result<Vec<SeedEntry>, String> {
     }
 }
 
+/// Plan section 9.2: the Model entries of the seed set together exercise every core effect and
+/// serve outcome variant ([`model::coverage`]). Returns 1 on a gap, 0 otherwise.
+fn coverage_parity(entries: &[SeedEntry]) -> u32 {
+    let mut seen = std::collections::BTreeSet::new();
+    for entry in entries {
+        let Some(scenario) = scenarios::find(&entry.scenario) else {
+            continue;
+        };
+        if scenario.fidelity != Fidelity::Model {
+            continue;
+        }
+        let (_, report) = model::run(&scenario, entry.source.choices());
+        if let Some(coverage) = report["coverage"].as_object() {
+            seen.extend(coverage.keys().cloned());
+        }
+    }
+    let (missing, stale) = model::coverage::check(&seen);
+    if missing.is_empty() && stale.is_empty() {
+        println!("ok   coverage parity: {} variants seen", seen.len());
+        return 0;
+    }
+    eprintln!("FAIL coverage parity: missing {missing:?}, exercised but exempt {stale:?}");
+    1
+}
+
 fn main() -> ExitCode {
     let entries = match entries() {
         Ok(entries) => entries,
@@ -62,6 +89,7 @@ fn main() -> ExitCode {
         }
     };
     let filter = var("DST_FILTER").unwrap_or_default();
+    let entries_for_coverage = entries.clone();
     let (mut ran, mut failed) = (0u32, 0u32);
     for entry in entries {
         if !entry.scenario.contains(&filter) {
@@ -99,6 +127,9 @@ fn main() -> ExitCode {
                 }
             },
         }
+    }
+    if filter.is_empty() && var("DST_SEEDS").is_none() {
+        failed += coverage_parity(&entries_for_coverage);
     }
     println!("racer-dst: {ran} entries, {failed} failed");
     if failed == 0 && ran > 0 {
