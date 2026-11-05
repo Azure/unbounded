@@ -51,9 +51,6 @@ pub struct Reactor<S: Scope, B: Budget> {
     // workers receive a WorkerCtx explicitly.
     ctx: racer_io::WorkerCtx,
 
-    /// Test support: a context selected after construction.
-    ctx_override: OnceCell<racer_io::WorkerCtx>,
-
     #[cfg(feature = "simulation")]
     simulation: Option<simulation::Simulation>,
 
@@ -214,7 +211,7 @@ struct Admission<S> {
 impl<S: Scope, Q: Budget> Reactor<S, Q> {
     /// Worker clock and entropy for code driven by this reactor.
     pub fn ctx(&self) -> &racer_io::WorkerCtx {
-        self.ctx_override.get().unwrap_or(&self.ctx)
+        &self.ctx
     }
 
     /// The simulated OS this reactor drives, or `None` on the kernel.
@@ -225,16 +222,6 @@ impl<S: Scope, Q: Budget> Reactor<S, Q> {
         }
         #[cfg(not(feature = "simulation"))]
         None
-    }
-
-    /// Test support: replace the construction-time context once, for tests
-    /// that switch a running worker from host time to a simulated clock.
-    #[doc(hidden)]
-    pub fn override_ctx_for_test(&self, ctx: racer_io::WorkerCtx) {
-        assert!(
-            self.ctx_override.set(ctx).is_ok(),
-            "context already overridden"
-        );
     }
 
     /// The environment captured when this reactor was constructed. Owners
@@ -250,7 +237,6 @@ impl<S: Scope, Q: Budget> Reactor<S, Q> {
             rejection_observer: None,
             ctx: environment.worker_ctx(),
             environment,
-            ctx_override: OnceCell::new(),
             #[cfg(feature = "simulation")]
             simulation: simulation::Simulation::current(),
             budget,

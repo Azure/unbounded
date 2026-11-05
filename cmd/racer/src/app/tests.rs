@@ -2383,11 +2383,17 @@ fn same_node_renewal_backs_off_expires_closed_and_recovers() {
     fixture
         .certificate_age
         .store(16 * 3600 + 60, Ordering::Release);
+    // The worker runs on a virtual clock from construction; startup waits on
+    // virtual timers, so it is driven by a loop that advances the clock.
+    let clock = SimulationClock::new_at(3, Instant::now(), std::time::SystemTime::now());
+    let environment = clock.environment(0);
+    let _clock = environment.enter();
     let (mut worker, runtime, mut engine) = local_worker(&config, &node, 0);
-    drive(
+    drive_advancing(
         &runtime,
         &mut engine,
         worker.start(&scope(&racer_io::Clock::host(), Duration::from_secs(15)).unwrap()),
+        Some(&clock),
     )
     .unwrap();
     assert!(node.observations.health.ready());
@@ -2405,12 +2411,6 @@ fn same_node_renewal_backs_off_expires_closed_and_recovers() {
     let baseline = fixture.bootstrap_requests.lock().unwrap().len();
     let polls = fixture.polls.load(Ordering::Acquire);
 
-    let clock = SimulationClock::new_at(3, Instant::now(), std::time::SystemTime::now());
-    let environment = clock.environment(0);
-    let _clock = environment.enter();
-    runtime
-        .reactor
-        .override_ctx_for_test(environment.worker_ctx());
     fixture.bootstrap_status.store(503, Ordering::Release);
     turn(&mut worker, &runtime, &mut engine, Some(&clock));
     assert_eq!(control.renewal_error(), Some(Error::Unavailable));
@@ -3167,6 +3167,17 @@ fn drive<T>(
     engine: &mut dyn crate::lifecycle::Service<RequestScope>,
     future: Operation<'_, T>,
 ) -> Result<T> {
+    drive_advancing(runtime, engine, future, None)
+}
+
+/// Like [`drive`], advancing `clock` by one virtual millisecond on each idle
+/// turn so virtual timers awaited by the future fire.
+fn drive_advancing<T>(
+    runtime: &WorkerRuntime,
+    engine: &mut dyn crate::lifecycle::Service<RequestScope>,
+    future: Operation<'_, T>,
+    clock: Option<&uring_runtime::environment::SimulationClock>,
+) -> Result<T> {
     let mut future = future;
     let until = Instant::now() + Duration::from_secs(15);
     loop {
@@ -3187,6 +3198,9 @@ fn drive<T>(
             "application lifecycle did not progress"
         );
         runtime.reactor.wait(Duration::from_millis(1))?;
+        if let Some(clock) = clock {
+            clock.advance(Duration::from_millis(1));
+        }
     }
 }
 #[test]
