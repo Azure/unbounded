@@ -8,12 +8,13 @@
 
 use crate::{
     auth,
-    http::{self, Conn, Head, HttpError, TlsStream},
+    conn::{self as http, Conn, Head, HttpError},
     limits,
     pki::{self, PkiError},
     rt::{self, Listener, Slot, Slots},
     rules::publication::Image,
     shared::Shared,
+    tls::TlsStream,
 };
 use racer_control_wire::{self as wire, ErrorResponse, ProtocolFailure};
 use std::{
@@ -1700,7 +1701,7 @@ mod tests {
         revoke_after: Option<Duration>,
         caller_after: Option<Duration>,
     ) -> (bool, Duration, usize) {
-        let (server, client) = crate::http::tests::tls_pair();
+        let (server, client) = crate::conn::tests::tls_pair();
         let mut ex = Executor::new(8).unwrap();
         ex.block_on(async move {
             let listener = Listener::bind("127.0.0.1:0".parse().unwrap()).unwrap();

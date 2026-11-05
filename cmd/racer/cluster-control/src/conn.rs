@@ -1,140 +1,27 @@
-//! TLS streams and strict HTTP/1.1 framing over the control reactor.
+//! Strict HTTP/1.1 framing over [`TlsStream`], using the pure `http1` codec.
 //!
-//! Servers accept only `Content-Length` request bodies. Clients accept
-//! `Content-Length`, chunked, and close-delimited response bodies. Every read
-//! has a caller limit.
+//! Heads are decoded by [`http1::Codec`]. Servers accept only
+//! `Content-Length` request bodies (the request codec rejects transfer
+//! coding). Clients accept `Content-Length`, chunked, and close-delimited
+//! response bodies through [`http1::small::Decoder`]. Every read has a caller
+//! limit.
 
-use crate::rt::Tcp;
-use rustls::pki_types::ServerName;
-use std::{
-    io::{self, Read, Write},
-    sync::Arc,
+use crate::tls::TlsStream;
+use http1::{
+    Codec, StartLine,
+    small::{self, Decoder, Framing, Status},
 };
+use std::io;
 
-/// TLS over a nonblocking TCP stream.
-pub struct TlsStream {
-    tcp: Tcp,
-    conn: rustls::Connection,
-    /// Received ciphertext not yet taken by rustls.
-    rx: Vec<u8>,
-}
+/// Most trailer bytes accepted after a final chunk.
+const MAX_TRAILER_BYTES: usize = 64 * 1024;
+
+/// Most bytes in one chunk-size line.
+const MAX_CHUNK_LINE: usize = 1024;
 
 fn invalid<E>(_: E) -> io::Error {
-    io::Error::new(io::ErrorKind::InvalidData, "tls")
+    io::Error::new(io::ErrorKind::InvalidData, "http")
 }
-
-impl TlsStream {
-    /// Connect TLS as a client and finish the handshake.
-    pub async fn client(
-        tcp: Tcp,
-        config: Arc<rustls::ClientConfig>,
-        name: ServerName<'static>,
-    ) -> io::Result<Self> {
-        let conn = rustls::ClientConnection::new(config, name).map_err(invalid)?;
-        let mut s = Self {
-            tcp,
-            conn: conn.into(),
-            rx: Vec::new(),
-        };
-        s.handshake().await?;
-        Ok(s)
-    }
-
-    /// Accept TLS as a server and finish the handshake.
-    pub async fn server(tcp: Tcp, config: Arc<rustls::ServerConfig>) -> io::Result<Self> {
-        let conn = rustls::ServerConnection::new(config).map_err(invalid)?;
-        let mut s = Self {
-            tcp,
-            conn: conn.into(),
-            rx: Vec::new(),
-        };
-        s.handshake().await?;
-        Ok(s)
-    }
-
-    async fn handshake(&mut self) -> io::Result<()> {
-        while self.conn.is_handshaking() {
-            self.flush().await?;
-            if self.conn.is_handshaking() && self.conn.wants_read() && self.read_tls().await? == 0 {
-                return Err(io::ErrorKind::UnexpectedEof.into());
-            }
-        }
-        self.flush().await
-    }
-
-    /// DER chain sent by the peer, if any.
-    pub fn peer_certificates(&self) -> Vec<Vec<u8>> {
-        self.conn
-            .peer_certificates()
-            .map(|c| c.iter().map(|c| c.to_vec()).collect())
-            .unwrap_or_default()
-    }
-
-    async fn read_tls(&mut self) -> io::Result<usize> {
-        if self.rx.is_empty() && self.tcp.recv_into(&mut self.rx).await? == 0 {
-            return Ok(0);
-        }
-        let mut slice = &self.rx[..];
-        let n = self.conn.read_tls(&mut slice)?;
-        self.rx.drain(..n);
-        if let Err(e) = self.conn.process_new_packets() {
-            let _ = self.flush().await;
-            return Err(invalid(e));
-        }
-        // Buffered ciphertext counts as progress even if rustls took none.
-        Ok(n.max(1))
-    }
-
-    /// Write all pending TLS records.
-    pub async fn flush(&mut self) -> io::Result<()> {
-        while self.conn.wants_write() {
-            let mut out = Vec::new();
-            while self.conn.wants_write() {
-                self.conn.write_tls(&mut out)?;
-            }
-            self.tcp.send_all(out).await?;
-        }
-        Ok(())
-    }
-
-    /// Read plaintext. Returns 0 at a clean end of stream.
-    pub async fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        loop {
-            match self.conn.reader().read(buf) {
-                Ok(n) => return Ok(n),
-                Err(e) if e.kind() == io::ErrorKind::WouldBlock => {}
-                Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => return Ok(0),
-                Err(e) => return Err(e),
-            }
-            self.flush().await?;
-            if self.read_tls().await? == 0 {
-                return Ok(0);
-            }
-        }
-    }
-
-    /// Write and flush all plaintext.
-    pub async fn write_all(&mut self, mut data: &[u8]) -> io::Result<()> {
-        while !data.is_empty() {
-            let n = self
-                .conn
-                .writer()
-                .write(&data[..data.len().min(64 * 1024)])?;
-            data = &data[n..];
-            self.flush().await?;
-        }
-        self.flush().await
-    }
-
-    /// Send close_notify. Errors are ignored.
-    pub async fn close(&mut self) {
-        self.conn.send_close_notify();
-        let _ = self.flush().await;
-    }
-}
-
-/// Most trailer lines accepted after a final chunk.
-const MAX_TRAILERS: usize = 64;
 
 /// Buffered HTTP connection.
 pub struct Conn {
@@ -149,6 +36,8 @@ pub struct Head {
     pub target: String,
     pub status: u16,
     pub headers: Vec<(String, String)>,
+    /// Response body framing; `None` for requests.
+    framing: Option<Framing>,
 }
 
 impl Head {
@@ -182,6 +71,20 @@ impl Head {
             }
             Some(_) => Err(invalid(())),
         }
+    }
+
+    /// Body decoder for this response head, capped at `limit` undrained bytes.
+    fn decoder(&self, limit: usize) -> io::Result<Decoder> {
+        let framing = self.framing.ok_or_else(|| invalid(()))?;
+        Decoder::new(
+            framing,
+            small::Limits {
+                body: limit,
+                line: MAX_CHUNK_LINE,
+                trailers: MAX_TRAILER_BYTES,
+            },
+        )
+        .map_err(invalid)
     }
 }
 
@@ -233,52 +136,21 @@ impl Conn {
         request: bool,
         limit: usize,
     ) -> Result<Option<Head>, HttpError> {
+        let codec = Codec::<()>::new(limit).trim_ows();
+        let codec = if request {
+            codec
+        } else {
+            codec.transfer_coding()
+        };
         loop {
-            let mut headers = [httparse::EMPTY_HEADER; 96];
-            let parsed = if request {
-                let mut r = httparse::Request::new(&mut headers);
-                match r.parse(&self.buf) {
-                    Ok(httparse::Status::Complete(n)) => Some((
-                        n,
-                        Head {
-                            method: r.method.unwrap_or_default().into(),
-                            target: r.path.unwrap_or_default().into(),
-                            status: 0,
-                            headers: collect(r.headers)?,
-                        },
-                        r.version,
-                    )),
-                    Ok(httparse::Status::Partial) => None,
-                    Err(_) => return Err(HttpError::Invalid),
+            match codec.decode_head(&self.buf) {
+                Ok(Some((message, n))) => {
+                    self.buf.drain(..n);
+                    return convert(message, request).map(Some);
                 }
-            } else {
-                let mut r = httparse::Response::new(&mut headers);
-                match r.parse(&self.buf) {
-                    Ok(httparse::Status::Complete(n)) => Some((
-                        n,
-                        Head {
-                            status: r.code.unwrap_or_default(),
-                            headers: collect(r.headers)?,
-                            ..Head::default()
-                        },
-                        r.version,
-                    )),
-                    Ok(httparse::Status::Partial) => None,
-                    Err(_) => return Err(HttpError::Invalid),
-                }
-            };
-            if let Some((n, head, version)) = parsed {
-                if n > limit {
-                    return Err(HttpError::TooLarge);
-                }
-                if version != Some(1) {
-                    return Err(HttpError::Invalid);
-                }
-                self.buf.drain(..n);
-                return Ok(Some(head));
-            }
-            if self.buf.len() > limit {
-                return Err(HttpError::TooLarge);
+                Ok(None) => {}
+                Err(http1::Error::HeadTooLarge) => return Err(HttpError::TooLarge),
+                Err(http1::Error::Malformed) => return Err(HttpError::Invalid),
             }
             if self.fill().await? == 0 {
                 return if self.buf.is_empty() {
@@ -318,111 +190,84 @@ impl Conn {
         Ok(self.exact(n).await?)
     }
 
-    async fn line(&mut self, limit: usize) -> io::Result<Vec<u8>> {
-        loop {
-            if let Some(i) = self.buf.windows(2).position(|w| w == b"\r\n") {
-                let line = self.buf.drain(..i + 2).take(i).collect();
-                return Ok(line);
+    /// Feed buffered bytes, reading more when none are buffered. Returns
+    /// whether the body is complete; read-ahead stays buffered.
+    async fn feed(&mut self, decoder: &mut Decoder) -> io::Result<bool> {
+        if decoder.is_done() {
+            return Ok(true);
+        }
+        if self.buf.is_empty() && self.fill().await? == 0 {
+            decoder.finish().map_err(invalid)?;
+            return Ok(true);
+        }
+        match decoder.feed(&self.buf).map_err(invalid)? {
+            Status::Done(n) => {
+                self.buf.drain(..n);
+                Ok(true)
             }
-            if self.buf.len() > limit {
-                return Err(invalid(()));
-            }
-            if self.fill().await? == 0 {
-                return Err(io::ErrorKind::UnexpectedEof.into());
+            Status::Need => {
+                self.buf.clear();
+                Ok(false)
             }
         }
-    }
-
-    /// Read the next chunk of a chunked body. Empty means the end.
-    pub async fn read_chunk(&mut self, limit: usize) -> io::Result<Vec<u8>> {
-        let line = self.line(1024).await?;
-        let size = line.split(|b| *b == b';').next().unwrap_or_default();
-        let size = std::str::from_utf8(size)
-            .map_err(invalid)?
-            .trim_end_matches([' ', '\t']);
-        // Strict hex: `from_str_radix` would also accept a sign.
-        if size.is_empty() || size.len() > 15 || !size.bytes().all(|b| b.is_ascii_hexdigit()) {
-            return Err(invalid(()));
-        }
-        let n = usize::from_str_radix(size, 16).map_err(invalid)?;
-        if n > limit {
-            return Err(invalid(()));
-        }
-        if n == 0 {
-            // Trailers are ignored up to the final empty line.
-            for _ in 0..MAX_TRAILERS {
-                if self.line(8 * 1024).await?.is_empty() {
-                    return Ok(Vec::new());
-                }
-            }
-            return Err(invalid(()));
-        }
-        let data = self.exact(n).await?;
-        if !self.exact(2).await?.eq(b"\r\n") {
-            return Err(invalid(()));
-        }
-        Ok(data)
     }
 
     /// Read a full response body by its framing.
     pub async fn read_response_body(&mut self, head: &Head, limit: usize) -> io::Result<Vec<u8>> {
-        if is_chunked(head)? {
-            let mut body = Vec::new();
-            loop {
-                let chunk = self.read_chunk(limit).await?;
-                if chunk.is_empty() {
-                    return Ok(body);
-                }
-                if body.len() + chunk.len() > limit {
-                    return Err(invalid(()));
-                }
-                body.extend(chunk);
-            }
-        }
-        if let Some(n) = head.content_length()? {
-            if n > limit {
-                return Err(invalid(()));
-            }
-            return self.exact(n).await;
-        }
-        if matches!(head.status, 204 | 304) {
-            return Ok(Vec::new());
-        }
-        loop {
-            if self.buf.len() > limit {
-                return Err(invalid(()));
-            }
-            if self.fill().await? == 0 {
-                return Ok(std::mem::take(&mut self.buf));
-            }
-        }
+        let mut decoder = head.decoder(limit)?;
+        while !self.feed(&mut decoder).await? {}
+        Ok(decoder.into_body())
     }
-}
 
-/// Whether the response uses chunked transfer coding.
-pub fn is_chunked(head: &Head) -> io::Result<bool> {
-    match head.count("transfer-encoding") {
-        0 => Ok(false),
-        1 if head
-            .one("transfer-encoding")
-            .ok()
-            .flatten()
-            .is_some_and(|v| v.eq_ignore_ascii_case("chunked")) =>
-        {
-            Ok(true)
-        }
-        _ => Err(invalid(())),
-    }
-}
-
-fn collect(headers: &[httparse::Header<'_>]) -> Result<Vec<(String, String)>, HttpError> {
-    headers
-        .iter()
-        .map(|h| {
-            let v = std::str::from_utf8(h.value).map_err(|_| HttpError::Invalid)?;
-            Ok((h.name.to_owned(), v.to_owned()))
+    /// Start streaming a response body, such as a watch.
+    pub fn body_stream(&self, head: &Head, window: usize) -> io::Result<BodyStream> {
+        Ok(BodyStream {
+            decoder: head.decoder(window)?,
+            done: false,
         })
-        .collect()
+    }
+
+    /// Read the next decoded part of a streamed body. Empty means the end.
+    pub async fn read_part(&mut self, stream: &mut BodyStream) -> io::Result<Vec<u8>> {
+        while !stream.done {
+            stream.done = self.feed(&mut stream.decoder).await?;
+            let part = stream.decoder.take_body();
+            if !part.is_empty() {
+                return Ok(part);
+            }
+        }
+        Ok(Vec::new())
+    }
+}
+
+/// A response body read in parts; each undrained part is capped.
+pub struct BodyStream {
+    decoder: Decoder,
+    done: bool,
+}
+
+fn convert(message: http1::MessageHead, request: bool) -> Result<Head, HttpError> {
+    let mut head = Head::default();
+    match &message.start {
+        StartLine::Request { method, target } if request => {
+            head.method.clone_from(method);
+            head.target.clone_from(target);
+        }
+        StartLine::Response { status } if !request => {
+            head.status = *status;
+            head.framing = Some(if matches!(status, 204 | 304) {
+                Framing::Length(0)
+            } else {
+                Framing::from_response(&message).map_err(|_| HttpError::Invalid)?
+            });
+        }
+        _ => return Err(HttpError::Invalid),
+    }
+    for h in &message.headers {
+        let v = std::str::from_utf8(&h.value).map_err(|_| HttpError::Invalid)?;
+        head.headers.push((h.name.clone(), v.to_owned()));
+    }
+    Ok(head)
 }
 
 /// Serialize a response head with `Content-Length`.
@@ -489,6 +334,9 @@ pub fn split_target(target: &str) -> (&str, Option<&str>) {
 pub(crate) mod tests {
     use super::*;
     use crate::rt::{Executor, Listener};
+    use crate::{rt::Tcp, tls::TlsStream};
+    use rustls::pki_types::ServerName;
+    use std::sync::Arc;
 
     /// Self-signed server config and matching client config for tests.
     pub fn tls_pair() -> (Arc<rustls::ServerConfig>, Arc<rustls::ClientConfig>) {

@@ -903,7 +903,7 @@ dependencies = [
  "base64",
  "futures",
  "getrandom",
- "httparse",
+ "http1",
  "libc",
  "racer-control-wire",
  "racer-core",

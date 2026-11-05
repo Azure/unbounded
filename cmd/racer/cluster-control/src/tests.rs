@@ -3,9 +3,10 @@
 use crate::{
     Config, SeatPolicy, annotations,
     config::Rotation,
-    http::{self, Conn, TlsStream},
+    conn::{self as http, Conn},
     kube::{Kube, KubeConfig, fake, str_at},
     rt::{self, Executor, Tcp},
+    tls::TlsStream,
 };
 use base64::{
     Engine,

@@ -8,7 +8,7 @@
 use crate::rules::seat::{self as rules, Lottery, SeatRenew};
 use crate::{
     DiscoveredEndpoint, DiscoveredEndpoints, Error, annotations,
-    http::{self, Conn, TlsStream},
+    conn::{self as http, Conn},
     kube::{KubeError, escape, paths, str_at},
     lease, limits,
     pki::{self, SeatIssuer, ServingIdentity},
@@ -20,6 +20,7 @@ use crate::{
     },
     server,
     shared::{CachedIssuer, PrimaryView, Seat, Shared},
+    tls::TlsStream,
 };
 use base64::{Engine, engine::general_purpose::STANDARD};
 use racer_control_wire as wire;

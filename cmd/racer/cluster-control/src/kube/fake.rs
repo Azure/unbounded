@@ -6,8 +6,9 @@
 
 use super::{Kube, KubeConfig};
 use crate::{
-    http::{self, Conn, TlsStream},
+    conn::{self as http, Conn},
     rt::{self, Executor, Listener, Signal},
+    tls::TlsStream,
 };
 use serde_json::{Value, json};
 use std::{

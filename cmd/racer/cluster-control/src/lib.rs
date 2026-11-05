@@ -39,9 +39,9 @@
 pub mod annotations;
 mod auth;
 mod config;
+mod conn;
 mod control;
 pub mod entropy;
-mod http;
 mod kube;
 mod lease;
 pub mod limits;
@@ -55,6 +55,7 @@ mod shared;
 mod sync;
 #[cfg(test)]
 mod tests;
+mod tls;
 pub mod webhook;
 
 pub use config::{Config, Rotation, SeatPolicy};

@@ -6,9 +6,10 @@
 //! `410 Gone` as [`KubeError::Gone`] so callers relist.
 
 use crate::{
-    http::{self, Conn, TlsStream},
+    conn::{self as http, Conn},
     limits,
     rt::{self, Slots, Tcp},
+    tls::TlsStream,
 };
 use rustls::pki_types::{CertificateDer, ServerName};
 use serde_json::Value;
@@ -412,10 +413,12 @@ impl Kube {
             if let Some(e) = status_error(head.status) {
                 return Err(e);
             }
-            let chunked = http::is_chunked(&head).map_err(|_| KubeError::Invalid)?;
+            let body = conn
+                .body_stream(&head, limits::MAX_WATCH_EVENT)
+                .map_err(|_| KubeError::Invalid)?;
             Ok(Watch {
                 conn,
-                chunked,
+                body,
                 pending: Vec::new(),
                 done: false,
                 deadline: Instant::now() + limits::WATCH_TIMEOUT + Duration::from_secs(30),
@@ -429,7 +432,7 @@ impl Kube {
 /// An open watch stream.
 pub struct Watch {
     conn: Conn,
-    chunked: bool,
+    body: http::BodyStream,
     pending: Vec<u8>,
     done: bool,
     deadline: Instant,
@@ -459,19 +462,10 @@ impl Watch {
             if self.done {
                 return Ok(None);
             }
-            let chunk = rt::deadline(self.deadline, async {
-                if self.chunked {
-                    self.conn.read_chunk(limits::MAX_WATCH_EVENT).await
-                } else {
-                    let mut buf = vec![0u8; 64 * 1024];
-                    let n = self.conn.tls.read(&mut buf).await?;
-                    buf.truncate(n);
-                    Ok(buf)
-                }
-            })
-            .await
-            .map_err(|_| KubeError::Unavailable)?
-            .map_err(|_| KubeError::Unavailable)?;
+            let chunk = rt::deadline(self.deadline, self.conn.read_part(&mut self.body))
+                .await
+                .map_err(|_| KubeError::Unavailable)?
+                .map_err(|_| KubeError::Unavailable)?;
             if chunk.is_empty() {
                 self.done = true;
             }
