@@ -185,6 +185,9 @@ pub struct ModelSpec {
     pub origin_errors: OriginErrors,
     /// Cache outages.
     pub outages: Vec<Outage>,
+    /// Hung peer servers (racer-sim `Fault::Hang`): during `[at, until)` the node accepts every
+    /// peer request, as destination or relay, and never answers or forwards it.
+    pub hangs: Vec<Outage>,
     /// Client page reads refresh the object's metadata through the worker's
     /// `MetadataCohort` first.
     pub metadata: bool,
@@ -219,6 +222,7 @@ impl Default for ModelSpec {
             origin_errors: OriginErrors::default(),
             metadata: false,
             outages: Vec::new(),
+            hangs: Vec::new(),
             checks: Vec::new(),
         }
     }
@@ -314,6 +318,10 @@ enum Ev {
     },
     /// A cache outage of `node` begins.
     Outage { node: u32 },
+    /// A scheduled node or network fault ([`crate::world::Fault`]).
+    Fault(crate::world::Fault),
+    /// The link from `holder` for `msg` failed to connect.
+    LinkDown { msg: u64, holder: u32 },
     /// Answer metadata refresh `id` of `(node, worker)`.
     MetadataInput {
         node: u32,
@@ -389,6 +397,8 @@ struct Node {
     /// Production `LinkHealth` detours (racer-sim `NodeState::detours`): first hops a route
     /// skips after timeouts.
     detours: Detours<u32>,
+    /// Crashed and not yet restarted: its peer server takes no connections.
+    down: bool,
 }
 
 /// A node's published pages, bounded by least-recently-used eviction (racer-sim keeps a
@@ -491,6 +501,8 @@ struct Model<'s> {
     /// Last links awaiting their destination's answer: sender, destination, page, send time
     /// (racer-sim `last_hops`).
     last_hops: BTreeMap<u64, (u32, u32, Page, Nanos)>,
+    /// Partitioned node pairs, smaller id first.
+    partitions: BTreeSet<(u32, u32)>,
     /// Route searches: the real `topology::Paths` over exhaustive mesh searches, one cache
     /// shared by every node. racer-sim keeps one per node over a shared memo; per-node caches
     /// gave the same 10,000-node cold start (78 against 79 failures) at 40% more memory.
@@ -509,6 +521,8 @@ pub const NO_ATTEMPT_CAP: Nanos = Nanos::MAX;
 const SERVE_TIMEOUT: Nanos = 5 * SECONDS;
 /// Client attempts per read, as in racer-sim.
 const MAX_ATTEMPTS: u8 = 4;
+/// A link to an unreachable peer fails after this (racer-sim `NodeConfig::connect_timeout_ns`).
+const CONNECT_TIMEOUT: Nanos = 100 * MILLIS;
 /// Entries of the shared route cache.
 const ROUTE_CACHE_ENTRIES: usize = 1 << 16;
 
@@ -552,6 +566,7 @@ impl<'s> Model<'s> {
                 ),
                 pings: 0,
                 detours: Detours::new(SILENCE_CAPACITY),
+                down: false,
             })
             .collect();
         Self {
@@ -582,6 +597,7 @@ impl<'s> Model<'s> {
             msgs: BTreeMap::new(),
             next_msg: 0,
             last_hops: BTreeMap::new(),
+            partitions: BTreeSet::new(),
             paths: Paths::with_limits(ROUTE_CACHE_ENTRIES, ROUTE_CACHE_ENTRIES * 256, 8),
         }
     }
@@ -608,6 +624,26 @@ impl<'s> Model<'s> {
 
     fn violation(&mut self, message: String) {
         self.report.violation(message);
+    }
+
+    fn schedule_faults(&mut self, faults: Vec<(Nanos, crate::world::Fault)>) {
+        for (at, fault) in faults {
+            self.engine.at(at, Ev::Fault(fault));
+        }
+    }
+
+    /// Whether `node`'s peer server hangs now.
+    fn hung(&self, node: u32) -> bool {
+        let now = self.now();
+        self.spec
+            .hangs
+            .iter()
+            .any(|h| h.node == node && (h.at..h.until).contains(&now))
+    }
+
+    /// Whether the link `a - b` is cut: partitioned, or `b` is down.
+    fn cut(&self, a: u32, b: u32) -> bool {
+        self.nodes[b as usize].down || self.partitions.contains(&(a.min(b), a.max(b)))
     }
 
     fn schedule_storms(&mut self) {
@@ -720,6 +756,27 @@ impl<'s> Model<'s> {
                 self.report.counters.outage_lost_pages += lost;
                 self.nodes[node as usize].stored = Store::new(capacity);
             }
+            Ev::Fault(fault) => {
+                use crate::world::Fault as F;
+                self.trace.record(now, TAG_EVENT, 11, fault_code(fault));
+                match fault {
+                    F::Crash { node } => {
+                        self.report.counters.crashes += 1;
+                        self.nodes[node as usize].down = true;
+                    }
+                    F::Restart { node } => self.nodes[node as usize].down = false,
+                    F::Partition { a, b } if a != b => {
+                        self.partitions.insert((a.min(b), a.max(b)));
+                    }
+                    F::Heal { a, b } => {
+                        self.partitions.remove(&(a.min(b), a.max(b)));
+                    }
+                    F::SlowPeer { node, factor } => self.fabric.slow[node as usize] = factor.max(1),
+                    // The Model has no wall or monotonic clock per node.
+                    _ => {}
+                }
+            }
+            Ev::LinkDown { msg, holder } => self.fail_hop(msg, holder, Fault::Unavailable),
             Ev::MetadataInput {
                 node,
                 worker,
@@ -1295,6 +1352,9 @@ impl<'s> Model<'s> {
         self.answering(&asker, to, now);
         let sealed = self.sign(to);
         let route = Self::back(&asker, to);
+        if !self.alive(&route) {
+            return self.engine.at(now, Ev::BodyEnd { body: key });
+        }
         let Some(end) =
             self.fabric
                 .transfer_until(sealed, &route, self.spec.page_bytes, asker.abandon)
@@ -1350,6 +1410,19 @@ impl<'s> Model<'s> {
             return;
         };
         let at = m.at;
+        if self.nodes[at as usize].down {
+            // A crash fails the connection: link health, not silence.
+            self.report.counters.messages_lost += 1;
+            self.last_hops.remove(&mid);
+            self.msgs.remove(&mid);
+            return;
+        }
+        if self.hung(at) {
+            // Accepted, never answered or forwarded; the requester's attempt times out.
+            self.report.counters.messages_lost += 1;
+            self.msgs.remove(&mid);
+            return;
+        }
         if now >= m.abandon {
             // The requester gave up: relays and the destination see the upstream connection
             // close and drop the exchange.
@@ -1491,6 +1564,12 @@ impl<'s> Model<'s> {
             m.route.links = outbound;
         }
         m.at = next;
+        if self.cut(holder, next) {
+            self.report.counters.link_failures += 1;
+            let failed = Ev::LinkDown { msg: mid, holder };
+            return self.engine.at(now + CONNECT_TIMEOUT, failed);
+        }
+        let m = self.msgs.get_mut(&mid).expect("message");
         if next == m.dest {
             // The last link: this sender learns whether the destination answers.
             self.last_hops.insert(mid, (holder, next, m.page, now));
@@ -1580,6 +1659,17 @@ impl<'s> Model<'s> {
         own
     }
 
+    /// Whether every link of `route` is up (racer-sim `send_reply`: a reply over a cut link is
+    /// lost and the requester times out).
+    fn alive(&mut self, route: &[u32]) -> bool {
+        let alive = !self.nodes[route[0] as usize].down
+            && route.windows(2).all(|hop| !self.cut(hop[0], hop[1]));
+        if !alive {
+            self.report.counters.replies_lost += 1;
+        }
+        alive
+    }
+
     /// A message from `asker`'s replier back over `route`, leaving at `ready`.
     fn message_back(&self, ready: Nanos, route: &[u32]) -> Nanos {
         route
@@ -1608,6 +1698,16 @@ impl<'s> Model<'s> {
         for (to, page) in n.silence.due_pings(at, room) {
             self.nodes[from as usize].pings += 1;
             self.report.counters.silence_pings += 1;
+            if self.cut(from, to) {
+                // The link fails: a transport error, inconclusive.
+                let done = Ev::PingDone {
+                    from,
+                    to,
+                    answered: racer_core::liveness::ping_verdict(Err(false)),
+                };
+                self.engine.at(now + CONNECT_TIMEOUT, done);
+                continue;
+            }
             let signed = self.sign(from);
             let arrive = self.fabric.message(signed, from, to);
             // Production pings on a fresh grant bounded by the peer attempt timeout.
@@ -1625,6 +1725,12 @@ impl<'s> Model<'s> {
     /// `FetchMode::Ping`).
     fn ping_arrived(&mut self, from: u32, to: u32, page: Page, verified: bool) {
         let now = self.now();
+        if self.hung(to) {
+            // Unanswered within the ping's bound.
+            let answered = racer_core::liveness::ping_verdict(Err(true));
+            let done = Ev::PingDone { from, to, answered };
+            return self.engine.at(now + ATTEMPT_TIMEOUT, done);
+        }
         if !verified {
             let checked = self
                 .fabric
@@ -1670,7 +1776,11 @@ impl<'s> Model<'s> {
     fn fail_probe(&mut self, asker: &Asker, to: u32) {
         let now = self.now();
         self.answering(asker, to, now);
-        let at = self.message_back(now, &Self::back(asker, to));
+        let route = Self::back(asker, to);
+        if !self.alive(&route) {
+            return;
+        }
+        let at = self.message_back(now, &route);
         self.engine.at(
             at,
             Ev::Input {
@@ -1692,8 +1802,12 @@ impl<'s> Model<'s> {
 
     fn reply(&mut self, asker: &Asker, to: u32, kind: ResponseKind) {
         let own = self.answering(asker, to, self.now());
+        let route = Self::back(asker, to);
+        if !self.alive(&route) {
+            return;
+        }
         let ready = self.sign(to);
-        let at = self.message_back(ready, &Self::back(asker, to));
+        let at = self.message_back(ready, &route);
         self.engine.at(
             at,
             Ev::Input {
@@ -2307,6 +2421,14 @@ pub fn run(scenario: &Scenario, choices: Choices) -> (Outcome, Value) {
         );
     };
     let mut model = Model::new(scenario, spec, choices.clone());
+    // Draw a fault schedule only when the scenario asks for one, so fault-free scenarios keep
+    // their choice streams.
+    let faults = if scenario.fault_mix.max_faults == 0 {
+        scenario.faults.clone()
+    } else {
+        scenario.fault_schedule(&choices)
+    };
+    model.schedule_faults(faults);
     model.schedule_storms();
     model.run(scenario.end, scenario.max_steps);
     // A probe answered before its bound leaves its timeout queued; it would be a no-op.
@@ -2361,6 +2483,19 @@ pub fn run(scenario: &Scenario, choices: Choices) -> (Outcome, Value) {
         },
         report,
     )
+}
+
+/// A trace code for `fault`.
+fn fault_code(fault: crate::world::Fault) -> u64 {
+    use crate::world::Fault as F;
+    match fault {
+        F::Crash { node } => u64::from(node),
+        F::Restart { node } => 1 << 32 | u64::from(node),
+        F::Partition { a, b } => 2 << 32 | u64::from(a) << 16 | u64::from(b),
+        F::Heal { a, b } => 3 << 32 | u64::from(a) << 16 | u64::from(b),
+        F::SlowPeer { node, factor } => 4 << 32 | u64::from(factor) << 16 | u64::from(node),
+        _ => 5 << 32,
+    }
 }
 
 /// The response kind a relay signs for `r` (racer-sim `response_kind`).

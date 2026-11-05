@@ -81,6 +81,15 @@ pub struct Counters {
     /// Requests dropped at a relay or destination after the requester gave up (racer-sim
     /// `requests_abandoned`).
     pub requests_abandoned: u64,
+    /// Node crashes.
+    pub crashes: u64,
+    /// Requests lost at a crashed or hung holder (racer-sim `messages_lost_to_crash`,
+    /// `messages_lost_to_hang`).
+    pub messages_lost: u64,
+    /// Links that failed to connect (racer-sim `link_failures`).
+    pub link_failures: u64,
+    /// Replies lost on a cut route (racer-sim `replies_lost`).
+    pub replies_lost: u64,
     /// Most pages any node stores at the end of the run.
     pub stored_pages_max: u64,
 }
@@ -181,6 +190,10 @@ impl Report {
                     "route_unreachable": c.route_unreachable,
                     "silence_timeouts": c.silence_timeouts,
                     "requests_abandoned": c.requests_abandoned,
+                    "crashes": c.crashes,
+                    "messages_lost": c.messages_lost,
+                    "link_failures": c.link_failures,
+                    "replies_lost": c.replies_lost,
                     "replies_abandoned": c.replies_abandoned,
                 },
                 "histograms": {

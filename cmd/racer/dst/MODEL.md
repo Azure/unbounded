@@ -24,6 +24,14 @@ such as which node holds which page.
   origin error mix.
 - Origin errors (`ModelSpec::origin_errors`): racer-sim's mapping (412 to
   `VersionUnavailable`, 403 to `OriginForbidden`, 5xx to `Unavailable`).
+- Node and network faults from the scenario's schedule (`Scenario::faults` and, when
+  `fault_mix.max_faults` is set, the drawn `fault_schedule`): `Crash`/`Restart` take a node's
+  peer server down (racer-sim `link`, `hop`: a link to it fails after the 100 ms connect
+  timeout, a request at it is lost, a reply from or through it is lost); `Partition`/`Heal`
+  cut a node pair (links fail, replies over the cut are lost, racer-sim `send_reply`);
+  `SlowPeer` scales the node's service times (`Fabric::slow`, as racer-sim `Fault::Slow`).
+  Hung peer servers (`ModelSpec::hangs`, racer-sim `Fault::Hang`) accept requests as
+  destination or relay and never answer; pings to them time out.
 - Cache outages (`ModelSpec::outages`): the node loses its stored pages and answers peer
   probes with `Miss` (`ServeFacts::cache_available` false) until the outage ends.
 - Page store: published pages per node, bounded by `ModelSpec::stored_pages` with
@@ -84,7 +92,10 @@ such as which node holds which page.
   route search queueing. Route searches run synchronously against one shared `Paths`
   cache, so a search never waits for a slot (racer-sim queued 514,580 at 50,000 nodes).
 - Pings travel one direct link; racer-sim routes them (`launch_control`).
-- Node crash/restart, partitions and slow peers. Cache outages are the only node fault.
+- A crash keeps the node's cores and stored pages (production keeps the disk; racer-sim
+  drops memory state and in-flight reads). A crashed node's own client reads keep running;
+  only its peer server and its replies are gone. Clock faults (`ClockSkew`, `ClockRate`,
+  `ClockJump`) are ignored: Model nodes share one clock.
 - Admission quotas, persistence shedding (`persist_no_headroom`), memory tiers and the
   DiskIndex; per-node memory accounting (`memory.accounted_bytes_per_node`).
 - Provider selection streams (`Offered`), prefetch traffic.
@@ -104,6 +115,8 @@ Every racer-sim number below is from the racer-sim release binary at this commit
 | `model-cold-start-400`, `model-cold-start-2000` | `cold_start_completes_with_bounded_origin_traffic`, `two_thousand_nodes_cold_start` (8) | every read ends, failures only `Overloaded`/`Unavailable` and at most 1%, no `HopBudgetExhausted`, origin/page in `1..=REPLICAS`, pages published |
 | `model-hot-page-storm-512` | `hot_page_readers_fan_out_through_helpers`, `mesh_hot_page_readers_fan_out_through_column_helpers` (5) | every read completes, owners shed, helpers serve copies, origin once |
 | `model-origin-forbidden` | `origin_forbidden_reelects_a_waiter` (11) | 403s fail reads with `OriginForbidden`, the rest complete |
+| `model-partition-heals` | `reads_recover_after_partition_heals` (6) | at least one storm's reads complete (Model: also every read ends, links crossed the cut) |
+| `model-hung-peers` | `hung_relays_are_routed_around`, `hung_peers_are_found_and_recovered_peers_are_used_again` (`GRID`, silence on; 5) | requests are lost to hung peers and found by silence; racer-sim's bounds are at most 2 failures in the first storm and 1 in the second, the Model checks at most 3 in total (its peers hang until 40 s rather than for good, so the run drains) |
 
 | Scenario | Metric | racer-sim | Model |
 |---|---|---|---|
@@ -132,6 +145,10 @@ Every racer-sim number below is from the racer-sim release binary at this commit
 | | origin requests, origin/page | 36, 6 | 33, 12 |
 | | latency ms | 92 / 218 / 225 | 74 / 400 / 407 |
 | | flights reelected | 20 (`flight_reelected`) | 18 |
+| partition heals, 32 nodes | completed / failed | at least 512 (racer-sim's check) | 1008 / 16 |
+| | link failures | not recorded | 191 |
+| hung peers, 200 nodes (`GRID`) | failed | at most 3 (racer-sim's bounds) | 0 of 12800 |
+| | requests lost to hangs / silence timeouts / pings | not recorded | 691 / 505 / 1452 (seed 1) |
 
 Tolerances. The Model passes every racer-sim check above, with these documented
 differences:
@@ -209,7 +226,8 @@ waiters return the error in `fill.rs` `AcquisitionEvent::Failed`). racer-sim
 (`finish_fill`) and the core `FlightTable::finish` the Model uses call the same function.
 
 Not ported yet (they need the gaps above): `slow_disk_sheds_persistence...` (persistence
-shedding), `reads_recover_after_partition_heals` (partitions), the relay quota, hung-peer and
+shedding), the relay quota (`relays_hold_their_reservation_only_while_the_body_streams`,
+`relay_shed_rank0_probes...`), the full-mesh and watch-off variants of the hung-peer test, and
 quota tests in `contention_scenarios.rs`, `sim/tests/mesh_scenarios.rs` (relays and
 routes) and `sim/tests/phantom_memory.rs` (racer-sim memory accounting; see the memory
 section).
@@ -221,6 +239,7 @@ section).
 | `model-range-readers` | range reads through `ReadWindow` with credits, spill holds, selections, worker fetches; a second pass reads every page from disk |
 | `model-metadata-readers` | page reads behind `MetadataCohort` refreshes with 10% origin 5xx; refreshes coalesce per cohort |
 | `model-faults` | origin 403/5xx mix, four cache outages, page and range readers; failed windows discard buffered pages |
+| `model-node-faults` | 64 nodes read twelve objects, one a second, under a drawn schedule of up to 16 crash/restarts, node-pair partitions and slow peers; every read ends and failures are only `Unavailable`/`Overloaded` (seeds 1..6: none fail) |
 
 ## Memory
 

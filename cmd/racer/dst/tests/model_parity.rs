@@ -35,6 +35,34 @@ fn hot_page_storm_fans_out_through_helpers() {
 }
 
 #[test]
+fn reads_recover_after_partition_heals() {
+    let report = run(scenarios::partition_heals(), 6);
+    let counters = &report["metrics"]["counters"];
+    assert!(
+        counters["link_failures"].as_u64().unwrap() > 0,
+        "{counters}"
+    );
+}
+
+#[test]
+fn hung_peers_are_routed_around() {
+    let report = run(scenarios::hung_peers(), 1);
+    let counters = &report["metrics"]["counters"];
+    assert!(
+        counters["silence_pings"].as_u64().unwrap() > 0,
+        "{counters}"
+    );
+}
+
+#[test]
+fn node_faults_end_every_read() {
+    let report = run(scenarios::node_faults(), 2);
+    let counters = &report["metrics"]["counters"];
+    assert!(counters["crashes"].as_u64().unwrap() > 0, "{counters}");
+    assert!(counters["replies_lost"].as_u64().unwrap() > 0, "{counters}");
+}
+
+#[test]
 fn cold_start_400() {
     let report = run(scenarios::cold_start(400), 8);
     let counters = &report["metrics"]["counters"];

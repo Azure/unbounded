@@ -360,6 +360,142 @@ pub fn faults() -> Scenario {
         .end(10 * SECONDS)
 }
 
+/// Ported from racer-sim `reads_recover_after_partition_heals`
+/// (`sim/tests/contention_scenarios.rs`, seed 6): 32 nodes in 4 sites; sites 0 and 1 cannot
+/// reach each other for the first 2 s while every node reads object 0, and every node reads
+/// object 1 at 4 s, after the heal. racer-sim's check: at least one object's worth of reads
+/// completes; the Model also requires every read to end and every second-storm read to
+/// complete.
+pub fn partition_heals() -> Scenario {
+    const NODES: u32 = 32;
+    const SITES: u32 = 4;
+    let spec = ModelSpec {
+        storms: vec![
+            storm(0, 0, NODES, MILLIS),
+            storm(4 * SECONDS, 1, NODES, MILLIS),
+        ],
+        ..ModelSpec::default()
+    };
+    let pages = u64::from(NODES) * u64::from(spec.pages_per_object);
+    let spec = spec
+        .check("every-read-ends", move |r| {
+            let ended = counter(r, "reads_completed") + counter(r, "reads_failed");
+            (ended == 2 * pages)
+                .then_some(())
+                .ok_or(format!("{ended} of {} reads ended", 2 * pages))
+        })
+        .check("reads-recover", move |r| {
+            let completed = counter(r, "reads_completed");
+            (completed >= pages)
+                .then_some(())
+                .ok_or(format!("{completed} completed"))
+        })
+        .check("partition-cut-links", |r| {
+            (counter(r, "link_failures") > 0)
+                .then_some(())
+                .ok_or("no link crossed the partition".into())
+        });
+    let mut scenario = Scenario::new("model-partition-heals")
+        .nodes(NODES)
+        .sites(SITES)
+        .model(spec)
+        .end(8 * SECONDS);
+    for a in (0..NODES).filter(|n| n % SITES == 0) {
+        for b in (0..NODES).filter(|n| n % SITES == 1) {
+            scenario = scenario
+                .fault(0, Fault::Partition { a, b })
+                .fault(2 * SECONDS, Fault::Heal { a, b });
+        }
+    }
+    scenario
+}
+
+/// Ported from racer-sim `hung_relays_are_routed_around` and
+/// `hung_peers_are_found_and_recovered_peers_are_used_again` (the `GRID` layout, silence on):
+/// 200 nodes, every 20th node's peer server hangs until 40 s (it accepts requests, as owner or
+/// relay, and never answers), past both storms, and 100 readers read one 64-page object twice, 30 s apart.
+/// Readers find the hung peers (silence timeouts and pings) and route around them: at most 2
+/// reads fail in the first storm and at most 1 in the second (racer-sim's bounds).
+pub fn hung_peers() -> Scenario {
+    const NODES: u32 = 200;
+    let spec = ModelSpec {
+        pages_per_object: 64,
+        storms: vec![
+            storm(0, 0, 100, 100 * MILLIS),
+            storm(30 * SECONDS, 0, 100, 100 * MILLIS),
+        ],
+        hangs: (0..10)
+            .map(|i| Outage {
+                node: i * 20,
+                at: 0,
+                until: 40 * SECONDS,
+            })
+            .collect(),
+        ..ModelSpec::default()
+    };
+    let spec = spec
+        .check("hung-peers-lose-requests", |r| {
+            (counter(r, "messages_lost") > 0 && counter(r, "silence_timeouts") > 0)
+                .then_some(())
+                .ok_or("no request reached a hung peer".into())
+        })
+        .check("few-reads-fail", |r| {
+            let failed = counter(r, "reads_failed");
+            (failed <= 3)
+                .then_some(())
+                .ok_or(format!("{failed} reads failed: {}", r["metrics"]["errors"]))
+        });
+    // Long enough for the silence rechecks (every 10 s) to find the recovered peers.
+    Scenario::new("model-hung-peers")
+        .nodes(NODES)
+        .model(spec)
+        .end(60 * SECONDS)
+}
+
+/// Model-only node faults: 64 nodes read twelve objects, one a second, while a drawn schedule crashes and
+/// restarts nodes, partitions node pairs and slows peers. Every read ends, and reads fail only
+/// with `Unavailable` or `Overloaded` after retries.
+pub fn node_faults() -> Scenario {
+    const NODES: u32 = 64;
+    let spec = ModelSpec {
+        storms: (0..12)
+            .map(|i| storm(i * SECONDS, i, NODES, 500 * MILLIS))
+            .collect(),
+        ..ModelSpec::default()
+    };
+    let total = 12 * u64::from(NODES) * u64::from(spec.pages_per_object);
+    let spec = spec
+        .check("every-read-ends", move |r| {
+            let ended = counter(r, "reads_completed") + counter(r, "reads_failed");
+            (ended == total)
+                .then_some(())
+                .ok_or(format!("{ended} of {total} reads ended"))
+        })
+        .check("failures-are-transient", |r| {
+            let failed = counter(r, "reads_failed");
+            let explained = error(r, "Unavailable") + error(r, "Overloaded");
+            (failed == explained && counter(r, "reads_completed") > failed)
+                .then_some(())
+                .ok_or(format!("failures: {}", r["metrics"]["errors"]))
+        });
+    Scenario::new("model-node-faults")
+        .nodes(NODES)
+        .sites(4)
+        .model(spec)
+        .fault_mix(FaultMix {
+            max_faults: 16,
+            crash_restart: 2,
+            partition: 2,
+            slow_peer: 1,
+            clock_skew: 0,
+            max_downtime: 2 * SECONDS,
+            max_skew_ns: 0,
+            clock_rate: 0,
+            max_rate_ppm: 0,
+        })
+        .end(24 * SECONDS)
+}
+
 /// Every built-in scenario.
 pub fn catalog() -> Vec<Scenario> {
     vec![
@@ -371,6 +507,9 @@ pub fn catalog() -> Vec<Scenario> {
         range_readers(),
         metadata_readers(),
         faults(),
+        partition_heals(),
+        hung_peers(),
+        node_faults(),
         Scenario::new("lane-pair")
             .roles(|env| lane_pair(env, 8))
             .with(all_roles_settled())
