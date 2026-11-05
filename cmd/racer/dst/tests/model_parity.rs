@@ -300,3 +300,34 @@ fn range_deadline_discards_held_pages() {
         report["coverage"]
     );
 }
+
+/// Gap closed by link circuits (`dst/MODEL.md`, Combined scenarios, Parity): `full-failover`
+/// cuts sites 0 and 1. Production opens a worker's circuit to a peer whose connect failed
+/// (`src/peer.rs` `request_network`, `src/topology.rs` `LinkHealth`) and routes around it
+/// (`Paths::blocked`). Without circuits the Model failed 86 reads at seed 8 against racer-sim's
+/// 12; with them it fails 13.
+#[test]
+fn site_cut_opens_link_circuits_and_routes_around() {
+    let measure = |circuits: bool| {
+        let mut scenario = scenarios::combined("full-failover", 200, 0.2, Some(300));
+        let spec = std::rc::Rc::get_mut(scenario.model.as_mut().unwrap()).unwrap();
+        spec.circuits = circuits;
+        let (outcome, report) = model::run(&scenario, Choices::seeded(8));
+        assert_eq!(outcome.failure, None, "{}", report["metrics"]);
+        let counters = report["metrics"]["counters"].clone();
+        let n = |k: &str| counters[k].as_u64().unwrap();
+        (n("reads_failed"), n("link_failures"))
+    };
+    let (failed, links) = measure(true);
+    let (failed_off, links_off) = measure(false);
+    assert!(
+        links < links_off,
+        "{links} links failed, {links_off} without circuits"
+    );
+    assert!(
+        failed < failed_off,
+        "{failed} reads failed, {failed_off} without circuits"
+    );
+    // racer-sim fails 12 reads at this seed; the scale tolerance is 2x.
+    assert!(failed <= 24, "{failed} reads failed");
+}

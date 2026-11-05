@@ -88,6 +88,8 @@ pub struct Counters {
     pub messages_lost: u64,
     /// Links that failed to connect (racer-sim `link_failures`).
     pub link_failures: u64,
+    /// Sends refused by an open link circuit (racer-sim `link_circuit_open`).
+    pub link_circuit_open: u64,
     /// Replies lost on a cut route (racer-sim `replies_lost`).
     pub replies_lost: u64,
     /// Most pages any node stores at the end of the run.
@@ -267,6 +269,7 @@ impl Report {
                     "crashes": c.crashes,
                     "messages_lost": c.messages_lost,
                     "link_failures": c.link_failures,
+                    "link_circuit_open": c.link_circuit_open,
                     "replies_lost": c.replies_lost,
                     "replies_abandoned": c.replies_abandoned,
                 },

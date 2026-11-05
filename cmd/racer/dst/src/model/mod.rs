@@ -28,6 +28,7 @@ use racer_control_wire::{CacheId, NodeId};
 pub use racer_core::connections::Config as ConnectionConfig;
 use racer_core::{
     connections::{Acquire, ConnId, Connections},
+    flow::Circuits,
     liveness::{Detours, LINK_TIMEOUTS},
     liveness::{MAX_PINGS_IN_FLIGHT, SILENCE_CAPACITY, Silence},
     prefetch::OwnerBudget,
@@ -272,6 +273,10 @@ pub struct ModelSpec {
     /// ingress, and idle reuse. Production's by default (see `dst/MODEL.md`, "Peer connection
     /// slots").
     pub connections: PeerConnections,
+    /// Link circuits (production `LinkHealth` in `src/topology.rs`, one per worker): a link
+    /// that failed to connect backs off (`racer_core::route::link_backoff`), sends over it fail
+    /// at once, and route searches route around it. On by default; off only for ablation.
+    pub circuits: bool,
     /// Waiters per flight; production's default unless a scenario overrides it (racer-sim
     /// `NodeConfig::waiters_per_flight`).
     pub waiters_per_flight: usize,
@@ -332,6 +337,7 @@ impl Default for ModelSpec {
             relay_transfers: relay_transfers(),
             crypto_queue: crypto_queue(),
             connections: PeerConnections::Production,
+            circuits: true,
             waiters_per_flight: flight_limits().waiters_per_flight,
             checks: Vec::new(),
             control: None,
@@ -449,7 +455,12 @@ enum Ev {
     /// A scheduled node or network fault ([`crate::world::Fault`]).
     Fault(crate::world::Fault),
     /// The link from `holder` for `msg` failed to connect.
-    LinkDown { msg: u64, holder: u32 },
+    LinkDown {
+        msg: u64,
+        holder: u32,
+        worker: u8,
+        next: u32,
+    },
     /// Answer metadata refresh `id` of `(node, worker)`.
     MetadataInput {
         node: u32,
@@ -541,6 +552,36 @@ struct Node {
     detours: Detours<u32>,
     /// Crashed and not yet restarted: its peer server takes no connections.
     down: bool,
+}
+
+/// One worker's link circuits (production `LinkHealth::inner`, `src/topology.rs`).
+struct Links {
+    circuits: Circuits<u32>,
+    /// Peers with a failure record, for route searches' blocked neighbors (production
+    /// `Paths::blocked` asks the circuit of every mesh neighbor).
+    failed: BTreeSet<u32>,
+}
+
+impl Links {
+    fn new() -> Self {
+        Self {
+            // Production `LINK_HEALTH_CAPACITY` and a 1 s half-open probe timeout.
+            circuits: Circuits::new(LINK_HEALTH_CAPACITY, Duration::from_secs(1)),
+            failed: BTreeSet::new(),
+        }
+    }
+}
+
+/// Production `LINK_HEALTH_CAPACITY` (`src/topology.rs`).
+const LINK_HEALTH_CAPACITY: usize = 4096;
+
+/// Production link backoff (`racer_core::route::link_backoff`); the jitter is a fixed mix of
+/// the peer and failure count instead of SHA-256 of the node name (as racer-sim).
+fn link_backoff(node: &u32, failures: u32) -> Duration {
+    racer_core::route::link_backoff(
+        failures,
+        mix64((u64::from(*node) << 32) | u64::from(failures)),
+    )
 }
 
 /// A node's published pages, bounded by least-recently-used eviction (racer-sim keeps a
@@ -649,6 +690,8 @@ struct Model<'s> {
     relays_active: BTreeMap<(u32, u8), usize>,
     /// When each running route search of a `(node, worker)` finishes.
     searches: BTreeMap<(u32, u8), Vec<Nanos>>,
+    /// Link circuits per `(node, worker)` (production `LinkHealth`, worker-local).
+    links: BTreeMap<(u32, u8), Links>,
     report: Report,
     expected_reads: u64,
     /// Queued [`Ev::ProbeTimeout`], [`Ev::PingTimeout`] and [`Ev::LastHop`] events: bounds that
@@ -823,6 +866,7 @@ impl<'s> Model<'s> {
             relay_charges: BTreeMap::new(),
             relays_active: BTreeMap::new(),
             searches: BTreeMap::new(),
+            links: BTreeMap::new(),
             report: Report::default(),
             expected_reads: 0,
             timeouts_queued: 0,
@@ -1204,7 +1248,18 @@ impl<'s> Model<'s> {
                 }
             }
             Ev::Release { msg } => self.release_relays_after(msg, true),
-            Ev::LinkDown { msg, holder } => self.fail_hop(msg, holder, Fault::Unavailable),
+            Ev::LinkDown {
+                msg,
+                holder,
+                worker,
+                next,
+            } => {
+                // Production `request_network` (`src/peer.rs`): a socket failure is evidence
+                // against the link (`route::exchange_evidence`, `LinkOutcome::Refused`), recorded
+                // when the connect attempt fails.
+                self.link_failed(holder, worker, next);
+                self.fail_hop(msg, holder, Fault::Unavailable)
+            }
             Ev::MetadataInput {
                 node,
                 worker,
@@ -2297,7 +2352,20 @@ impl<'s> Model<'s> {
             .filter_map(|p| position(*p))
             .filter(|p| members.is_neighbor(from, *p))
             .collect();
+        // Production `Paths::blocked` (`src/topology.rs`): neighbors whose circuit is open, on
+        // the worker that searches.
+        if let Some(links) = self.links.get(&(holder, self.link_worker(mid, holder))) {
+            blocked.extend(
+                links
+                    .failed
+                    .iter()
+                    .filter(|p| !links.circuits.available(p, at))
+                    .filter_map(|p| position(*p))
+                    .filter(|p| members.is_neighbor(from, *p)),
+            );
+        }
         blocked.sort_unstable();
+        blocked.dedup();
         let mut level = node.detours.level(&dest, at);
         if own_ping {
             level = level.max(1);
@@ -2392,11 +2460,18 @@ impl<'s> Model<'s> {
         if plan.is_some_and(|plan| plan.outbound.is_err()) {
             return self.fail_hop(mid, holder, Fault::HopBudgetExhausted);
         }
-        let conn = if holder == self.msgs[&mid].from {
-            self.msgs[&mid].worker as u8
-        } else {
-            self.conn_worker(mid)
-        };
+        let conn = self.link_worker(mid, holder);
+        // Production `request_network` acquires the link's circuit before the exchange
+        // (`health.acquire(&next)?`, `src/peer.rs`); an open circuit fails it `Unavailable`.
+        if self.spec.circuits {
+            let at = self.instant(now);
+            if let Some(links) = self.links.get(&(holder, conn))
+                && links.circuits.acquire(&next, at).is_err()
+            {
+                self.report.counters.link_circuit_open += 1;
+                return self.fail_hop(mid, holder, Fault::Unavailable);
+            }
+        }
         let cut = self.cut(holder, next);
         // The sender's pool hands out a connection before any I/O (`racer_core::connections`).
         let acquired = (!cut && self.spec.connections != PeerConnections::Off)
@@ -2430,8 +2505,20 @@ impl<'s> Model<'s> {
         m.at = next;
         if cut {
             self.report.counters.link_failures += 1;
-            let failed = Ev::LinkDown { msg: mid, holder };
+            let failed = Ev::LinkDown {
+                msg: mid,
+                holder,
+                worker: conn,
+                next,
+            };
             return self.engine.at(now + CONNECT_TIMEOUT, failed);
+        }
+        // The link connected: production records `LinkOutcome::Success` once the exchange
+        // completes (`route::exchange_evidence`); the Model records it on connect, as racer-sim.
+        if let Some(links) = self.links.get_mut(&(holder, conn))
+            && links.failed.remove(&next)
+        {
+            links.circuits.success(&next);
         }
         let m = self.msgs.get_mut(&mid).expect("message");
         if next == m.dest {
@@ -2585,6 +2672,30 @@ impl<'s> Model<'s> {
     /// The worker of a node that holds request `mid`'s connection, as the Model spreads peer
     /// connections over workers (racer-sim `hop`: `probe % workers`). An inference: production
     /// assigns accepted connections to workers by its listener, not by request.
+    /// The worker whose link health a send from `holder` uses: the requester's read worker,
+    /// or the connection's worker at a relay.
+    fn link_worker(&self, mid: u64, holder: u32) -> u8 {
+        match self.msgs.get(&mid) {
+            Some(m) if holder == m.from => m.worker as u8,
+            _ => self.conn_worker(mid),
+        }
+    }
+
+    /// The link `holder` to `next` failed to connect on `worker`: open or extend its circuit.
+    fn link_failed(&mut self, holder: u32, worker: u8, next: u32) {
+        if !self.spec.circuits {
+            return;
+        }
+        let at = self.instant(self.now());
+        let links = self
+            .links
+            .entry((holder, worker))
+            .or_insert_with(Links::new);
+        if links.circuits.failure(&next, at, link_backoff).is_ok() {
+            links.failed.insert(next);
+        }
+    }
+
     fn conn_worker(&self, mid: u64) -> u8 {
         (mid % u64::from(self.spec.workers.max(1))) as u8
     }
