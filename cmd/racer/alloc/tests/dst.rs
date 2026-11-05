@@ -11,8 +11,6 @@
 //! consecutive seeds from `DST_START_SEED` (default zero). Tune with `DST_STEPS`.
 //! A failure prints the case, step, and operation.
 
-#![cfg(feature = "simulation")]
-
 use page_alloc::{
     AlignedBuffer, Alignment, Charge, Error, Extent, FreezeGuard, Generation, SegmentClock,
     SegmentEntries, SegmentId, SegmentLease, SegmentSnapshot, SegmentState, Segments, Slab,
@@ -539,7 +537,7 @@ struct Table {
 impl Table {
     /// Open the slab and an unconfigured table, checking simulated alignment.
     fn open() -> Self {
-        let slab = Slab::new(PATH.into(), CAPACITY, SEGMENT, SEGMENT as usize);
+        let slab = slab_new(PATH.into(), CAPACITY, SEGMENT, SEGMENT as usize);
         let segments = Rc::new(Segments::new(SEGMENT));
         let alignment = slab.open_configured(&segments).unwrap();
         assert_eq!(alignment.length() as u64, PAGE);
@@ -1247,7 +1245,7 @@ impl<'t, 'w> Phase<'t, 'w> {
                 );
                 assert!(other.snapshot().is_empty());
                 assert!(!other.is_configured());
-                let huge = Slab::<Counted>::new(
+                let huge = slab_new::<Counted>(
                     "/dst/huge".into(),
                     SEGMENT * (page_alloc::MAX_SEGMENTS + 1),
                     SEGMENT,
@@ -1260,7 +1258,7 @@ impl<'t, 'w> Phase<'t, 'w> {
             }
             6 => {
                 let slab =
-                    Slab::<Counted>::new("/dst/config".into(), CAPACITY, SEGMENT, PAGE as usize);
+                    slab_new::<Counted>("/dst/config".into(), CAPACITY, SEGMENT, PAGE as usize);
                 let _ = slab.open_now().unwrap();
                 let wrong = Segments::new(PAGE);
                 assert_eq!(
@@ -1288,10 +1286,10 @@ impl<'t, 'w> Phase<'t, 'w> {
             7 => {
                 {
                     let slab =
-                        Slab::<Counted>::new("/dst/size".into(), CAPACITY, SEGMENT, PAGE as usize);
+                        slab_new::<Counted>("/dst/size".into(), CAPACITY, SEGMENT, PAGE as usize);
                     let _ = slab.open_now().unwrap();
                 }
-                let slab = Slab::<Counted>::new(
+                let slab = slab_new::<Counted>(
                     "/dst/size".into(),
                     CAPACITY + SEGMENT,
                     SEGMENT,
@@ -1303,7 +1301,7 @@ impl<'t, 'w> Phase<'t, 'w> {
                 let charge = RebindCharge {
                     remaining: Cell::new(usize::MAX),
                 };
-                let slab = Slab::<RebindCharge>::new(
+                let slab = slab_new::<RebindCharge>(
                     "/dst/rebind-pool".into(),
                     CAPACITY,
                     SEGMENT,
@@ -3064,4 +3062,18 @@ fn restore_cross_product() {
     assert!(c.restore_busy > 0, "{c:?}");
     assert!(c.restore_corrupt > 0, "{c:?}");
     assert!(c.reissues > 0, "{c:?}");
+}
+
+/// Construct a file-mode slab in the thread's current simulation, if any.
+fn slab_new<C: page_alloc::Charge>(
+    path: std::path::PathBuf,
+    capacity_bytes: u64,
+    segment_bytes: u64,
+    max_record_bytes: usize,
+) -> Slab<C> {
+    let slab = Slab::new(path, capacity_bytes, segment_bytes, max_record_bytes);
+    if let Some(sim) = uring_runtime::reactor::simulation::Simulation::current() {
+        slab.simulate_in(sim.os().clone());
+    }
+    slab
 }

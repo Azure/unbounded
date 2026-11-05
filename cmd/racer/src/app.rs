@@ -1754,6 +1754,10 @@ impl WorkerApplication {
             // checkpoint that outlives its payload.
             .reset_mismatched_size()
         });
+        #[cfg(test)]
+        if let Some(sim) = uring_runtime::reactor::simulation::Simulation::current() {
+            slabs.simulate_in(sim.os().clone());
+        }
         let reader = Rc::new(
             StoreReader::new(
                 eviction.clone(),

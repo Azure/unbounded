@@ -68,6 +68,9 @@ pub struct Slab<C: Charge> {
     /// Recreate a regular slab file whose size differs from the configured capacity.
     reset_mismatched: bool,
 
+    /// Simulated filesystem for file-mode backing; `None` opens real files.
+    sim: RefCell<Option<racer_io::sim::SimOs>>,
+
     opened: RefCell<Option<OpenSlab>>,
 
     writes: Rc<WriteState>,
@@ -89,6 +92,7 @@ impl<C: Charge> Slab<C> {
             segment_bytes,
             max_record_bytes,
             reset_mismatched: false,
+            sim: RefCell::new(None),
             opened: RefCell::new(None),
             writes: Rc::new(WriteState::default()),
             idle_buffer: Rc::new(RefCell::new(crate::BufferPool::default())),
@@ -103,6 +107,13 @@ impl<C: Charge> Slab<C> {
     pub fn reset_mismatched_size(mut self) -> Self {
         self.reset_mismatched = true;
         self
+    }
+
+    /// Test support: open file-mode backing in `os` instead of the host
+    /// filesystem. Must be called before the slab is opened.
+    #[doc(hidden)]
+    pub fn simulate_in(&self, os: racer_io::sim::SimOs) {
+        *self.sim.borrow_mut() = Some(os);
     }
 
     /// Describe device ranges in logical segment order, without creating, sizing,
@@ -295,7 +306,7 @@ impl<C: Charge> Slab<C> {
 
     /// Configure an empty table, or validate an already configured partial table,
     /// and permanently bind this slab to that table's identity.
-    #[cfg(any(test, feature = "simulation"))]
+    #[doc(hidden)]
     pub fn configure_segments(&self, segments: &Segments) -> Result<()> {
         self.bind(segments)
     }
@@ -353,7 +364,7 @@ impl<C: Charge> Slab<C> {
     /// rename/unlink by other users. Linux traversal rejects symlinks and `..`;
     /// newly created directories are private. Existing files must be owned by the
     /// effective user, regular, singly linked, and mode 0600.
-    #[cfg(any(test, feature = "simulation"))]
+    #[doc(hidden)]
     pub fn open_now(&self) -> Result<Alignment> {
         self.open_file()
     }
@@ -409,8 +420,8 @@ impl<C: Charge> Slab<C> {
         {
             return Err(Error::InvalidConfiguration);
         }
-        #[cfg(feature = "simulation")]
-        if let Some(sim) = uring_runtime::reactor::simulation::Simulation::current() {
+        let sim = self.sim.borrow().clone();
+        if let Some(sim) = sim {
             if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
                 sim.create_dir_all(parent)
                     .map_err(|e| system_error("mkdir", e))?;
@@ -765,14 +776,12 @@ impl<C: Charge> Slab<C> {
     }
 
     /// Replace file-mode backing for fault tests; device mode is rejected.
-    #[cfg(feature = "simulation")]
     #[doc(hidden)]
     pub fn replace_file_for_test(&self, file: File) -> Result<()> {
         self.replace_descriptor_for_test(file.into())
     }
 
     /// Accept a virtual descriptor for file-mode fault tests; geometry stays unchanged.
-    #[cfg(feature = "simulation")]
     #[doc(hidden)]
     pub fn replace_descriptor_for_test(&self, file: Descriptor) -> Result<()> {
         if self.writes_in_flight() != 0 {
@@ -1617,7 +1626,6 @@ mod tests {
     }
 
     /// Device submissions keep completion error handling and release their fences.
-    #[cfg(feature = "simulation")]
     #[test]
     fn device_io_faults_release_completion_resources() {
         use uring_runtime::reactor::simulation::{Fault, Simulation};

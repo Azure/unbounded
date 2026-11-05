@@ -953,12 +953,12 @@ fn metadata_coordinator_with_newer_publication(
     let buffers = BufferPool::new(admission.clone());
     let index = Rc::new(Index::new(WorkerId(0), 16, availability.clone()));
     let segments = Rc::new(page_alloc::Segments::new(64 * 1024 * 1024));
-    let slabs = Rc::new(page_alloc::Slab::new(
+    let slabs = Rc::new(crate::test_support::simulated_slab(page_alloc::Slab::new(
         "unused/absence-slabs/worker-0-slab-0.dat".into(),
         1024 * 1024 * 1024,
         64 * 1024 * 1024,
         crate::model::PAGE_BYTES as usize + crate::store::MAX_HEADER_BYTES + 16,
-    ));
+    )));
     let disk = Rc::new(StoreReader::new(
         Rc::new(SegmentClock::new(index.clone(), segments.clone(), 1)),
         index.clone(),

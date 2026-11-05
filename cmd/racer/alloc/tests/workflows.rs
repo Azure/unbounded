@@ -1,9 +1,7 @@
 //! Public allocator workflows across restart, cancellation, accounting, and real I/O.
 
 use page_alloc::{Alignment, DevicePlacement, Error, Generation, SegmentId, Segments, Slab};
-#[cfg(feature = "simulation")]
 use page_alloc::{Charge, SegmentState};
-#[cfg(feature = "simulation")]
 use std::{cell::Cell, path::Path, rc::Rc};
 use std::{
     fs::File,
@@ -14,7 +12,6 @@ use std::{
     sync::Arc,
     task::{Context, Poll, Waker},
 };
-#[cfg(feature = "simulation")]
 use uring_runtime::reactor::simulation::{Fault, Simulation};
 use uring_runtime::{Operation, Scope, reactor::Reactor};
 
@@ -61,7 +58,6 @@ fn poll<T>(future: &mut Pin<Box<dyn Future<Output = T> + '_>>) -> Poll<T> {
 }
 
 /// Drive a simulated operation with a fixed, finite reactor-turn budget.
-#[cfg(feature = "simulation")]
 fn drive<T>(
     reactor: &Reactor<TestScope, ()>,
     mut operation: Pin<Box<dyn Future<Output = T> + '_>>,
@@ -76,14 +72,12 @@ fn drive<T>(
 }
 
 /// Caller-owned accounting for live buffers and the single idle slot.
-#[cfg(feature = "simulation")]
 struct CountingCharge {
     used: Rc<Cell<usize>>,
 
     bytes: usize,
 }
 
-#[cfg(feature = "simulation")]
 impl CountingCharge {
     /// Record admission before passing the guard into allocator ownership.
     fn new(used: &Rc<Cell<usize>>, bytes: usize) -> Self {
@@ -95,7 +89,6 @@ impl CountingCharge {
     }
 }
 
-#[cfg(feature = "simulation")]
 impl Charge for CountingCharge {
     /// Cover only the bytes actually admitted by this guard.
     fn covers(&self, bytes: usize) -> bool {
@@ -103,7 +96,6 @@ impl Charge for CountingCharge {
     }
 }
 
-#[cfg(feature = "simulation")]
 impl Drop for CountingCharge {
     /// Return admission when the final owner releases this guard.
     fn drop(&mut self) {
@@ -112,13 +104,12 @@ impl Drop for CountingCharge {
 }
 
 /// Restored records remain readable and the sealed recovery tail is not overwritten.
-#[cfg(feature = "simulation")]
 #[test]
 fn reopen_snapshot_reads_old_record_and_appends_without_overwriting_it() {
     let simulation = Simulation::new();
     let _environment = simulation.enter();
     let reactor = Reactor::<TestScope, ()>::new(16, ());
-    let make_slab = || Slab::<()>::new("/alloc-workflows/restart".into(), 16384, 8192, 1024);
+    let make_slab = || slab_new::<()>("/alloc-workflows/restart".into(), 16384, 8192, 1024);
     let slab = make_slab();
     let segments = Segments::new(slab.segment_bytes());
     let alignment = slab.open_configured(&segments).unwrap();
@@ -239,12 +230,11 @@ fn reopen_snapshot_reads_old_record_and_appends_without_overwriting_it() {
 }
 
 /// Public pooling enforces admission, zeroization, exact-size reuse, and bounded retention.
-#[cfg(feature = "simulation")]
 #[test]
 fn buffer_pool_keeps_only_zeroed_accounted_storage_and_rejects_undercharging() {
     let simulation = Simulation::new();
     let _environment = simulation.enter();
-    let slab = Slab::new("/alloc-workflows/pool".into(), 8192, 4096, 1024);
+    let slab = slab_new("/alloc-workflows/pool".into(), 8192, 4096, 1024);
     let segments = Segments::new(slab.segment_bytes());
     let alignment = slab.open_configured(&segments).unwrap();
     let size = alignment.extent(0, 31).unwrap().length();
@@ -317,12 +307,11 @@ fn buffer_pool_keeps_only_zeroed_accounted_storage_and_rejects_undercharging() {
 
 /// Demand maintenance grows under miss pressure, trims idle storage oldest
 /// first, releases its accounting, and holds a constrained pool empty.
-#[cfg(feature = "simulation")]
 #[test]
 fn idle_pool_adapts_to_demand_and_constraint() {
     let simulation = Simulation::new();
     let _environment = simulation.enter();
-    let slab = Slab::new("/alloc-workflows/demand".into(), 8192, 4096, 1024);
+    let slab = slab_new("/alloc-workflows/demand".into(), 8192, 4096, 1024);
     let segments = Segments::new(slab.segment_bytes());
     let alignment = slab.open_configured(&segments).unwrap();
     let size = alignment.extent(0, 31).unwrap().length();
@@ -372,13 +361,12 @@ fn idle_pool_adapts_to_demand_and_constraint() {
 }
 
 /// Bound submissions reject foreign identity and bytes beyond the captured prefix.
-#[cfg(feature = "simulation")]
 #[test]
 fn bound_io_rejects_foreign_tables_and_ranges_appended_after_lease_acquisition() {
     let simulation = Simulation::new();
     let _environment = simulation.enter();
     let reactor = Reactor::<TestScope, ()>::new(16, ());
-    let slab = Slab::<()>::new("/alloc-workflows/bound".into(), 16384, 8192, 512);
+    let slab = slab_new::<()>("/alloc-workflows/bound".into(), 16384, 8192, 512);
     let segments = Segments::new(slab.segment_bytes());
     let alignment = slab.open_configured(&segments).unwrap();
     let other = Segments::from_geometry(segments.geometry().unwrap()).unwrap();
@@ -468,7 +456,6 @@ fn bound_io_rejects_foreign_tables_and_ranges_appended_after_lease_acquisition()
 }
 
 /// Thawing and write completion are independent prerequisites for recovery.
-#[cfg(feature = "simulation")]
 #[test]
 fn restore_waits_for_freeze_guard_and_abandoned_write_completion_independently() {
     for cancel_first in [false, true] {
@@ -476,7 +463,7 @@ fn restore_waits_for_freeze_guard_and_abandoned_write_completion_independently()
         simulation.set_cancel_first(cancel_first);
         let _environment = simulation.enter();
         let reactor = Reactor::<TestScope, ()>::new(16, ());
-        let slab = Slab::<()>::new("/alloc-workflows/freeze".into(), 8192, 4096, 512);
+        let slab = slab_new::<()>("/alloc-workflows/freeze".into(), 8192, 4096, 512);
         let segments = Segments::new(slab.segment_bytes());
         let alignment = slab.open_configured(&segments).unwrap();
         let size = alignment.extent(0, 31).unwrap().length();
@@ -518,16 +505,14 @@ fn restore_waits_for_freeze_guard_and_abandoned_write_completion_independently()
 }
 
 /// Build and bind a deterministic simulated slab with two segments.
-#[cfg(feature = "simulation")]
 fn setup<C: Charge>() -> (Slab<C>, Segments) {
-    let slab = Slab::new(PathBuf::from("/virtual/slab.dat"), 8192, 4096, 512);
+    let slab = slab_new(PathBuf::from("/virtual/slab.dat"), 8192, 4096, 512);
     let segments = Segments::new(4096);
     let _ = slab.open_configured(&segments).unwrap();
     (slab, segments)
 }
 
 /// Public reads and writes preserve payloads and reject short or failed completions.
-#[cfg(feature = "simulation")]
 #[test]
 fn roundtrip_short_io_and_runtime_errors() {
     let sim = Simulation::new();
@@ -592,7 +577,6 @@ fn roundtrip_short_io_and_runtime_errors() {
 }
 
 /// Abandonment cannot release kernel-visible memory, charges, leases, or write count.
-#[cfg(feature = "simulation")]
 #[test]
 fn abandoned_write_retains_lease_charges_and_counter_until_completion() {
     for cancel_first in [false, true] {
@@ -643,7 +627,6 @@ fn abandoned_write_retains_lease_charges_and_counter_until_completion() {
 }
 
 /// An unpolled write owns no runtime work, but an abandoned accepted read still does.
-#[cfg(feature = "simulation")]
 #[test]
 fn abandoned_read_and_unpolled_write_release_at_the_correct_fence() {
     let sim = Simulation::new();
@@ -700,19 +683,18 @@ fn abandoned_read_and_unpolled_write_release_at_the_correct_fence() {
 }
 
 /// Simulation preserves file locks, size validation, and synchronous error categories.
-#[cfg(feature = "simulation")]
 #[test]
 fn simulation_open_lock_size_and_faults() {
     let sim = Simulation::new();
     let _environment = sim.enter();
     let (slab, _) = setup::<()>();
-    let conflicting = Slab::<()>::new(PathBuf::from("/virtual/slab.dat"), 8192, 4096, 512);
+    let conflicting = slab_new::<()>(PathBuf::from("/virtual/slab.dat"), 8192, 4096, 512);
     assert_eq!(conflicting.open_now(), Err(Error::Unavailable));
     assert_eq!(slab.open_now(), slab.alignment());
     drop(slab);
     let _ = conflicting.open_now().unwrap();
     drop(conflicting);
-    let wrong_size = Slab::<()>::new(PathBuf::from("/virtual/slab.dat"), 16384, 4096, 512);
+    let wrong_size = slab_new::<()>(PathBuf::from("/virtual/slab.dat"), 16384, 4096, 512);
     assert_eq!(wrong_size.open_now(), Err(Error::InvalidConfiguration));
     sim.inject("open", Fault::Errno(libc::EOPNOTSUPP)).unwrap();
     assert_eq!(wrong_size.open_now(), Err(Error::Unsupported));
@@ -727,7 +709,6 @@ fn simulation_open_lock_size_and_faults() {
 }
 
 /// Fault hooks cannot swap descriptors while a write completion owns the old file.
-#[cfg(feature = "simulation")]
 #[test]
 fn replacement_hooks_are_fallible_and_refuse_live_writes() {
     let sim = Simulation::new();
@@ -740,7 +721,7 @@ fn replacement_hooks_are_fallible_and_refuse_live_writes() {
         )
         .unwrap()
     };
-    let unopened = Slab::<()>::new(PathBuf::from("/unopened"), 8192, 4096, 512);
+    let unopened = slab_new::<()>(PathBuf::from("/unopened"), 8192, 4096, 512);
     assert_eq!(
         unopened.replace_descriptor_for_test(replacement()),
         Err(Error::Unavailable)
@@ -913,7 +894,7 @@ fn io_uring_roundtrip_and_completion_fence() {
         return;
     };
     let (_, segment_bytes) = device_placement_sizes(alignment);
-    let slab = Slab::<()>::new(
+    let slab = slab_new::<()>(
         directory.0.join("uring.dat"),
         2 * segment_bytes,
         segment_bytes,
@@ -1172,12 +1153,9 @@ fn unbound_and_failed_binding_reject_reads_and_writes_before_reactor_admission()
         return;
     };
     let (_, segment_bytes) = device_placement_sizes(alignment);
-    #[cfg(feature = "simulation")]
     let failures = ["unbound", "wrong-geometry", "frozen-table"].as_slice();
-    #[cfg(not(feature = "simulation"))]
-    let failures = ["wrong-geometry", "frozen-table"].as_slice();
     for &failure in failures {
-        let slab = Slab::<()>::new(
+        let slab = slab_new::<()>(
             directory.0.join(failure),
             2 * segment_bytes,
             segment_bytes,
@@ -1185,7 +1163,6 @@ fn unbound_and_failed_binding_reject_reads_and_writes_before_reactor_admission()
         );
         let correct = Segments::new(segment_bytes);
         match failure {
-            #[cfg(feature = "simulation")]
             "unbound" => {
                 assert_eq!(slab.open_now(), Ok(alignment));
             }
@@ -1234,13 +1211,12 @@ fn unbound_and_failed_binding_reject_reads_and_writes_before_reactor_admission()
 }
 
 /// Partial tables preserve file geometry, lease-fenced reuse, and unchanged disk bytes.
-#[cfg(feature = "simulation")]
 #[test]
 fn partial_table_reclamation_changes_authority_without_erasing_storage() {
     let simulation = Simulation::new();
     let _environment = simulation.enter();
     let reactor = Reactor::<TestScope, ()>::new(16, ());
-    let slab = Slab::<()>::new("/alloc-workflows/partial".into(), 16384, 4096, 512);
+    let slab = slab_new::<()>("/alloc-workflows/partial".into(), 16384, 4096, 512);
     let alignment = slab.open_now().unwrap();
     let physical = slab.geometry().unwrap();
     let partial = page_alloc::SegmentGeometry::new(16384, 4096, 2, alignment).unwrap();
@@ -1359,12 +1335,10 @@ fn partial_table_reclamation_changes_authority_without_erasing_storage() {
 }
 
 /// Shared body with arbitrary bytes, for exercising vectored validation.
-#[cfg(feature = "simulation")]
 struct SharedBody(Rc<page_alloc::AlignedBuffer<()>>, std::ops::Range<usize>);
 
 // SAFETY: the Rc keeps the immutable allocation alive and unmoved; no alias
 // mutates it while the body is owned by a write.
-#[cfg(feature = "simulation")]
 unsafe impl racer_io::ring::SharedWriteBuffer for SharedBody {
     fn write_bytes(&self) -> racer_io::Result<&[u8]> {
         Ok(&self.0.as_slice()[self.1.clone()])
@@ -1372,12 +1346,11 @@ unsafe impl racer_io::ring::SharedWriteBuffer for SharedBody {
 }
 
 /// Vectored writes land header then body, validate layout, and fail closed.
-#[cfg(feature = "simulation")]
 #[test]
 fn vectored_write_roundtrip_validation_and_faults() {
     let sim = Simulation::new();
     let _environment = sim.enter();
-    let slab = Slab::<()>::new(PathBuf::from("/virtual/vectored.dat"), 65536, 32768, 16384);
+    let slab = slab_new::<()>(PathBuf::from("/virtual/vectored.dat"), 65536, 32768, 16384);
     let segments = Segments::new(32768);
     let unit = slab.open_configured(&segments).unwrap().length();
     assert!(unit * 2 <= 16384);
@@ -1505,4 +1478,18 @@ fn vectored_write_roundtrip_validation_and_faults() {
     drive(&reactor, fence).unwrap();
     assert_eq!(slab.writes_in_flight(), 0);
     assert_eq!(Rc::strong_count(&page), 1);
+}
+
+/// Construct a file-mode slab in the thread's current simulation, if any.
+fn slab_new<C: page_alloc::Charge>(
+    path: std::path::PathBuf,
+    capacity_bytes: u64,
+    segment_bytes: u64,
+    max_record_bytes: usize,
+) -> Slab<C> {
+    let slab = Slab::new(path, capacity_bytes, segment_bytes, max_record_bytes);
+    if let Some(sim) = uring_runtime::reactor::simulation::Simulation::current() {
+        slab.simulate_in(sim.os().clone());
+    }
+    slab
 }

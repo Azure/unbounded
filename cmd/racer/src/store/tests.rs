@@ -1364,12 +1364,12 @@ impl Fixture {
             segments.clone(),
             1,
         ));
-        let slabs = Rc::new(Slab::new(
+        let slabs = Rc::new(crate::test_support::simulated_slab(Slab::new(
             directory.0.join("worker-0-slab-0.dat"),
             64 * 1024 * 1024,
             32 * 1024 * 1024,
             crate::model::PAGE_BYTES as usize + crate::store::MAX_HEADER_BYTES + 16,
-        ));
+        )));
         let reader = Rc::new(
             StoreReader::new(
                 eviction.clone(),

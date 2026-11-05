@@ -14,7 +14,7 @@ path = "src/main.rs"
 racer-core = { path = "../core" }
 topology = { path = "../topology" }
 flow-control = { path = "../flow" }
-page-alloc = { path = "../alloc", features = ["simulation"] }
+page-alloc = { path = "../alloc" }
 racer-cluster-control = { path = "../cluster-control" }
 racer-object-wire = { path = "../object-wire" }
 racer-control-wire = { path = "../control-wire" }

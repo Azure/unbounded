@@ -572,12 +572,12 @@ impl ReadWorker {
         let index = Rc::new(Index::new(WorkerId(0), 16, availability.clone()));
         let segments = Rc::new(page_alloc::Segments::new(64 * 1024 * 1024));
         // Reads use an empty disk index. No slabs need to be opened or written.
-        let slabs = Rc::new(page_alloc::Slab::new(
+        let slabs = Rc::new(crate::test_support::simulated_slab(page_alloc::Slab::new(
             Self::disk_root(&origin).join("slabs/worker-0-slab-0.dat"),
             256 * 1024 * 1024,
             64 * 1024 * 1024,
             crate::model::PAGE_BYTES as usize + crate::store::MAX_HEADER_BYTES + 16,
-        ));
+        )));
         let writer = Rc::new(StoreWriter::new(
             index.clone(),
             segments.clone(),
@@ -1042,4 +1042,14 @@ pub(crate) mod security {
             );
         }
     }
+}
+
+/// Bind a file-mode slab to the thread's current simulation, if one is entered.
+pub(crate) fn simulated_slab<C: page_alloc::Charge>(
+    slab: page_alloc::Slab<C>,
+) -> page_alloc::Slab<C> {
+    if let Some(sim) = uring_runtime::reactor::simulation::Simulation::current() {
+        slab.simulate_in(sim.os().clone());
+    }
+    slab
 }

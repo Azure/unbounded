@@ -3359,12 +3359,12 @@ fn fixture_with_caches(
             std::process::id(),
             NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
         ));
-    let slabs = Rc::new(page_alloc::Slab::new(
+    let slabs = Rc::new(crate::test_support::simulated_slab(page_alloc::Slab::new(
         directory.join(format!("worker-{}-slab-0.dat", worker.0)),
         1024 * 1024 * 1024,
         64 * 1024 * 1024,
         crate::model::PAGE_BYTES as usize + crate::store::MAX_HEADER_BYTES + 16,
-    ));
+    )));
     let _ = slabs
         .open_configured(&segments)
         .expect("read fixture filesystem supports direct slab alignment");

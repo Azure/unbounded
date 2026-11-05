@@ -112,7 +112,7 @@
 //! publication, seals an open tail, rebuilds free slots, and advances an epoch
 //! that clears the eviction cursor and recent-read state. Invalid or busy restores
 //! never partially publish.
-//! Raw file opening, table configuration, and manual eviction are simulation-only
+//! Raw file opening, table configuration, and manual eviction are test-support
 //! escape hatches. Production startup binds with [`Slab::open_configured`], and
 //! [`SegmentClock`] owns the ordering of mapping removal before physical reuse.
 //! The table, slab, and clock are cache-line aligned to isolate worker-local state;
@@ -169,7 +169,6 @@ pub use demand::{
     DEFAULT_WINDOW, PoolDemand, PoolStats,
 };
 use racer_io::ring::IoBuffer;
-#[cfg(feature = "simulation")]
 pub use segments::PhantomEntries;
 pub use segments::{
     FreezeGuard, Generation, SegmentClock, SegmentEntries, SegmentId, SegmentLease,

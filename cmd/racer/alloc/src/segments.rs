@@ -283,7 +283,7 @@ impl Segments {
     }
 
     /// Install an entirely free bounded table exactly once, unless frozen.
-    #[cfg(any(test, feature = "simulation"))]
+    #[doc(hidden)]
     pub fn configure(&self, capacity: u64, count: usize, alignment: Alignment) -> Result<()> {
         self.configure_table(capacity, count, alignment)
     }
@@ -432,7 +432,7 @@ impl Segments {
     }
 
     /// Stop new leases for a sealed slot; repeating eviction is harmless.
-    #[cfg(any(test, feature = "simulation"))]
+    #[doc(hidden)]
     pub fn begin_evict(&self, id: SegmentId) -> Result<()> {
         self.begin_eviction(id)
     }
@@ -458,7 +458,7 @@ impl Segments {
     }
 
     /// Reuse only an evicting, unleased slot, incrementing generation without wrap.
-    #[cfg(any(test, feature = "simulation"))]
+    #[doc(hidden)]
     pub fn recycle(&self, id: SegmentId) -> Result<()> {
         self.recycle_evicted(id)
     }
@@ -708,7 +708,6 @@ pub trait SegmentEntries {
     fn is_empty(&self, segment: SegmentId) -> bool;
 }
 
-#[cfg(feature = "simulation")]
 /// Payload-free [`SegmentEntries`] for simulation: page to segment mappings,
 /// page lengths, read holds, and active writes, but no data or metadata.
 ///
@@ -726,7 +725,6 @@ pub struct PhantomEntries<K, H = std::collections::hash_map::RandomState> {
     evicted: RefCell<Vec<(K, u32)>>,
 }
 
-#[cfg(feature = "simulation")]
 impl<K: Eq + std::hash::Hash + Clone, H: std::hash::BuildHasher + Default> Default
     for PhantomEntries<K, H>
 {
@@ -740,7 +738,6 @@ impl<K: Eq + std::hash::Hash + Clone, H: std::hash::BuildHasher + Default> Defau
     }
 }
 
-#[cfg(feature = "simulation")]
 impl<K: Eq + std::hash::Hash + Clone, H: std::hash::BuildHasher + Default> PhantomEntries<K, H> {
     /// Publish `page` with `bytes` of payload in `segment`, replacing any
     /// older mapping. Returns the replaced length.
@@ -814,7 +811,6 @@ impl<K: Eq + std::hash::Hash + Clone, H: std::hash::BuildHasher + Default> Phant
     }
 }
 
-#[cfg(feature = "simulation")]
 impl<K: Eq + std::hash::Hash + Clone, H: std::hash::BuildHasher + Default> SegmentEntries
     for PhantomEntries<K, H>
 {
@@ -1999,7 +1995,7 @@ mod clock_tests {
 }
 
 /// Payload-free entries used by the simulator.
-#[cfg(all(test, feature = "simulation"))]
+#[cfg(test)]
 mod phantom_tests {
     use super::*;
 

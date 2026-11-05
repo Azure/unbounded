@@ -68,7 +68,6 @@ wire-codec = { path = "wire-codec", features = ["simulation"] }
 rdma-verbs = { path = "verbs", features = ["simulation"] }
 racer-gpu = { path = "gpu", features = ["simulation"] }
 http1 = { path = "http", features = ["test-util"] }
-page-alloc = { path = "alloc", features = ["simulation"] }
 uring-runtime = { path = "runtime", features = ["simulation", "test-util"] }
 
 # Keep source locations and inline frames for Parca.
