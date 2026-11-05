@@ -1,7 +1,7 @@
 use super::*;
 use crate::admission::ResourceClass;
 use crate::model::AttemptId;
-use racer_control_wire::CacheId;
+use racer_wire::control::CacheId;
 
 mod fill;
 
@@ -122,11 +122,11 @@ fn remote_budget_charges_final_incoming_link_and_never_restores_attempts() {
     )
     .unwrap();
     let mut route = crate::topology::RouteBudget {
-        membership: racer_control_wire::MembershipVersion(1),
+        membership: racer_wire::control::MembershipVersion(1),
         request: scope.request,
         attempt: AttemptId([2; 16]),
-        destination: racer_control_wire::NodeId("destination".into()),
-        visited: vec![racer_control_wire::NodeId("sender".into())],
+        destination: racer_wire::control::NodeId("destination".into()),
+        visited: vec![racer_wire::control::NodeId("sender".into())],
         remaining_links: 1,
         remaining_attempts: 0,
         deadline: scope.deadline,
@@ -201,7 +201,7 @@ mod flight {
     use crate::read::flight::*;
     use crate::runtime::RequestScope;
     use crate::security::OriginContext;
-    use racer_control_wire::CacheId;
+    use racer_wire::control::CacheId;
     use std::rc::Rc;
     use std::task::Context;
     use std::task::Poll;
@@ -230,7 +230,7 @@ mod flight {
                 let mut budgets: Vec<_> = (0..count).map(|_| budget()).collect();
                 let membership = std::sync::Arc::new(
                     crate::topology::Membership::validate(
-                        racer_control_wire::MembershipVersion(1),
+                        racer_wire::control::MembershipVersion(1),
                         vec![],
                     )
                     .unwrap(),
@@ -631,7 +631,7 @@ mod flight {
             let (mut first_budget, mut second_budget) = (budget(), budget());
             let membership = std::sync::Arc::new(
                 crate::topology::Membership::validate(
-                    racer_control_wire::MembershipVersion(1),
+                    racer_wire::control::MembershipVersion(1),
                     vec![],
                 )
                 .unwrap(),
@@ -1804,8 +1804,11 @@ mod flight {
         budget: &'a mut AcquisitionBudget,
     ) -> AcquisitionWaiter<'a> {
         let membership = std::sync::Arc::new(
-            crate::topology::Membership::validate(racer_control_wire::MembershipVersion(1), vec![])
-                .unwrap(),
+            crate::topology::Membership::validate(
+                racer_wire::control::MembershipVersion(1),
+                vec![],
+            )
+            .unwrap(),
         );
         match flights
             .join(test_page(), membership, context, scope, budget)
@@ -2276,8 +2279,8 @@ mod timeouts {
     use crate::topology::Candidates;
     use crate::topology::Member;
     use crate::topology::Membership;
-    use racer_control_wire::MembershipVersion;
-    use racer_control_wire::NodeId;
+    use racer_wire::control::MembershipVersion;
+    use racer_wire::control::NodeId;
     use std::cell::Cell;
     use std::cell::RefCell;
     use std::future::Future;

@@ -5,7 +5,7 @@ use crate::model::PageId;
 use crate::priority::{ShareBasis, Unpublished, Weights};
 use crate::runtime::HashMap;
 mod second_sight;
-use racer_control_wire::CacheId;
+use racer_wire::control::CacheId;
 use second_sight::SecondSight;
 use std::cell::{Cell, OnceCell, RefCell};
 use std::rc::Rc;
@@ -624,7 +624,7 @@ mod tests {
     use std::cell::Cell;
     #[test]
     fn lazy_scoring_classification_matches_telemetry_cache_disk() {
-        use racer_control_wire::CacheDefinition;
+        use racer_wire::control::CacheDefinition;
         let clock = crate::rt::environment::SimulationClock::new(52);
         let sim_env = clock.environment(0);
         let _environment = sim_env.enter();
@@ -637,7 +637,7 @@ mod tests {
             client_socket: "/client".into(),
             origin_socket: "/origin".into(),
             priority,
-            mode: racer_control_wire::CacheMode::Cached,
+            mode: racer_wire::control::CacheMode::Cached,
             origin: None,
         };
         // "u" holds payload but is unpublished; "e" is published but empty.
@@ -676,7 +676,7 @@ mod tests {
     }
     #[test]
     fn share_basis_is_incremental_across_passes_and_membership_changes() {
-        use racer_control_wire::CacheDefinition;
+        use racer_wire::control::CacheDefinition;
         let clock = crate::rt::environment::SimulationClock::new(53);
         let sim_env = clock.environment(0);
         let _environment = sim_env.enter();
@@ -689,7 +689,7 @@ mod tests {
             client_socket: "/client".into(),
             origin_socket: "/origin".into(),
             priority,
-            mode: racer_control_wire::CacheMode::Cached,
+            mode: racer_wire::control::CacheMode::Cached,
             origin: None,
         };
         // Reference: a fresh full count over the current resident set.
@@ -772,7 +772,7 @@ mod tests {
     }
     #[test]
     fn over_share_candidates_are_bounded_and_exact_with_many_caches() {
-        use racer_control_wire::CacheDefinition;
+        use racer_wire::control::CacheDefinition;
         let clock = crate::rt::environment::SimulationClock::new(59);
         let sim_env = clock.environment(0);
         let _environment = sim_env.enter();
@@ -785,7 +785,7 @@ mod tests {
             client_socket: "/client".into(),
             origin_socket: "/origin".into(),
             priority,
-            mode: racer_control_wire::CacheMode::Cached,
+            mode: racer_wire::control::CacheMode::Cached,
             origin: None,
         };
         const CACHES: usize = 2000;
@@ -922,7 +922,7 @@ mod tests {
         PageId {
             version: crate::model::ObjectVersion {
                 object: crate::model::ObjectId {
-                    cache: racer_control_wire::CacheId("cache".into()),
+                    cache: racer_wire::control::CacheId("cache".into()),
                     key: crate::model::CacheKey([7; 32]),
                 },
                 etag: crate::model::StrongEtag::test_value("v1"),

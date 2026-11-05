@@ -6,6 +6,10 @@
 
 #![deny(unsafe_op_in_unsafe_fn)]
 
+// REST loopback fixtures are shared by unit and integration tests and name `racer::`.
+#[cfg(test)]
+extern crate self as racer;
+
 pub mod admission;
 pub mod affinity;
 pub mod app;

@@ -2,7 +2,7 @@
 
 use super::pools::Selector;
 use crate::kube;
-use racer_control_wire::{self as wire, CacheDefinition, CacheId};
+use racer_wire::control::{self as wire, CacheDefinition, CacheId};
 use serde_json::Value;
 use std::collections::{BTreeMap, HashSet};
 

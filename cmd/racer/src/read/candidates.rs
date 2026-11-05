@@ -33,8 +33,8 @@ use crate::telemetry::{
 use crate::topology::Candidates;
 use crate::topology::Placement;
 use crate::topology::RouteBudget;
-use racer_control_wire::NodeId;
 use racer_core::read::hints::OfferEnd;
+use racer_wire::control::NodeId;
 use std::cell::RefCell;
 use std::rc::Rc;
 use std::sync::Arc;
@@ -46,7 +46,7 @@ use std::time::Instant;
 
 fn reserve_hedge_pages(
     admission: &flow_control::Quotas<crate::admission::AdmissionPolicy>,
-    cache: &racer_control_wire::CacheId,
+    cache: &racer_wire::control::CacheId,
     pages: usize,
 ) -> Result<(
     flow_control::Charge<crate::admission::AdmissionPolicy>,
@@ -1690,9 +1690,9 @@ impl CandidatePolicy {
         membership: std::sync::Arc<crate::topology::Membership>,
         object: &ObjectId,
         page: PageNumber,
-        mode: racer_control_wire::CacheMode,
+        mode: racer_wire::control::CacheMode,
     ) -> Result<OriginAuthority> {
-        if mode != racer_control_wire::CacheMode::PassthroughLocal {
+        if mode != racer_wire::control::CacheMode::PassthroughLocal {
             return Err(Error::Unauthorized);
         }
         let authority = OriginAuthority {
@@ -3111,7 +3111,7 @@ pub(super) mod tests {
     use crate::model::ObjectMetadata;
     use crate::model::ObjectVersion;
     use crate::model::StrongEtag;
-    use racer_control_wire::CacheId;
+    use racer_wire::control::CacheId;
     #[test]
     fn candidate_failure_routes_spend_initial_allowance_with_four_then_eight_link_ceiling() {
         struct Routes(RefCell<Vec<(u8, u32)>>);
@@ -3246,10 +3246,10 @@ pub(super) mod tests {
         use crate::model::RequestId;
         use crate::topology::Member;
         use crate::topology::Membership;
-        use racer_control_wire::ClusterId;
-        use racer_control_wire::MembershipVersion;
         use racer_crypto::identity::KeyEpochs;
         use racer_crypto::identity::Keyring;
+        use racer_wire::control::ClusterId;
+        use racer_wire::control::MembershipVersion;
         let membership = std::sync::Arc::new(
             Membership::validate(
                 MembershipVersion(1),
@@ -3303,7 +3303,7 @@ pub(super) mod tests {
         use crate::topology::Membership;
         std::sync::Arc::new(
             Membership::validate(
-                racer_control_wire::MembershipVersion(1),
+                racer_wire::control::MembershipVersion(1),
                 (0..count)
                     .map(|i| Member {
                         node: NodeId(format!("33333333-3333-4333-8333-{i:012}")),
@@ -3390,7 +3390,7 @@ pub(super) mod tests {
             let newest = ranked.ordered[0].clone();
             // `newest` arrives in version 2; the others were in version 1.
             let before = Membership::validate(
-                racer_control_wire::MembershipVersion(1),
+                racer_wire::control::MembershipVersion(1),
                 all.members()
                     .iter()
                     .filter(|m| m.node != newest)
@@ -3400,7 +3400,7 @@ pub(super) mod tests {
             .unwrap();
             let chain = std::sync::Arc::new(
                 Membership::validate_with_predecessor(
-                    racer_control_wire::MembershipVersion(2),
+                    racer_wire::control::MembershipVersion(2),
                     all.members().to_vec(),
                     Some(&before),
                 )
@@ -3665,7 +3665,7 @@ pub(super) mod tests {
             let nodes: Vec<NodeId> = (0..count).map(node).collect();
             let membership = std::sync::Arc::new(
                 crate::topology::Membership::validate(
-                    racer_control_wire::MembershipVersion(1),
+                    racer_wire::control::MembershipVersion(1),
                     nodes
                         .iter()
                         .enumerate()
@@ -4242,7 +4242,7 @@ pub(super) mod tests {
     fn membership() -> std::sync::Arc<crate::topology::Membership> {
         use crate::topology::Member;
         use crate::topology::Membership;
-        use racer_control_wire::MembershipVersion;
+        use racer_wire::control::MembershipVersion;
         std::sync::Arc::new(
             Membership::validate(
                 MembershipVersion(1),
@@ -4369,7 +4369,7 @@ pub(super) mod tests {
         );
         let next = Arc::new(
             crate::topology::Membership::validate(
-                racer_control_wire::MembershipVersion(2),
+                racer_wire::control::MembershipVersion(2),
                 members
                     .members()
                     .iter()
@@ -4458,7 +4458,7 @@ pub(super) mod tests {
             ));
             let published = crate::test_support::published_membership(Arc::new(
                 crate::topology::Membership::validate(
-                    racer_control_wire::MembershipVersion(1),
+                    racer_wire::control::MembershipVersion(1),
                     vec![crate::topology::Member {
                         node: config.node.clone(),
                         shares: std::num::NonZeroU32::new(1).unwrap(),

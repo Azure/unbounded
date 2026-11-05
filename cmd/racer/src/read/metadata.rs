@@ -611,7 +611,7 @@ impl MetadataService {
         self.observe_clock()?;
         let clock_epoch = self.clock.borrow().inner.epoch();
         let mode = self.storage.fill.mode(&context.object.cache);
-        let resolution = if mode == racer_control_wire::CacheMode::PassthroughLocal {
+        let resolution = if mode == racer_wire::control::CacheMode::PassthroughLocal {
             // The local route asks this node's own origin and never a peer.
             CandidateResolution::Origin(self.candidates.local_authority(
                 membership.clone(),
@@ -1004,8 +1004,8 @@ pub(crate) mod tests {
     use crate::model::ExpiresAt;
     use crate::model::WorkerId;
     use futures::task::noop_waker;
-    use racer_control_wire::CacheId;
     use racer_core::read::{MAX_REFRESH_ATTEMPTS, MAX_WAITERS};
+    use racer_wire::control::CacheId;
     use std::time::UNIX_EPOCH;
 
     fn metadata(etag: &str, length: u64) -> ObjectMetadata {

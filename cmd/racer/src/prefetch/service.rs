@@ -19,9 +19,9 @@ use crate::security::{Authorization, OpaqueMetadata, OriginContext};
 use crate::topology::Membership;
 use futures::StreamExt;
 use http1::MessageHead;
-use racer_control_wire::{CacheId, NodeId};
 use racer_core::prefetch::{Deferral, FailCode, OwnerBudget, OwnerLease, PageResult};
-use racer_object_wire::prefetch::{ErrorCode, PrefetchError, PrefetchRequest, StatusQuery};
+use racer_wire::control::{CacheId, NodeId};
+use racer_wire::object::prefetch::{ErrorCode, PrefetchError, PrefetchRequest, StatusQuery};
 use std::collections::{BTreeMap, HashMap};
 use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -985,7 +985,7 @@ pub struct Response {
 fn json(status: u16, value: &impl serde::Serialize) -> Response {
     match serde_json::to_vec(value) {
         Ok(body) => Response {
-            head: racer_object_wire::prefetch::json_head(status, body.len()),
+            head: racer_wire::object::prefetch::json_head(status, body.len()),
             body,
         },
         Err(_) => error(PrefetchError::new(

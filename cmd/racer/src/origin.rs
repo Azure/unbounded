@@ -35,11 +35,11 @@ use http1::Header;
 use http1::MessageHead;
 #[cfg(test)]
 use http1::StartLine;
-use racer_control_wire::CacheDefinition;
-use racer_control_wire::canonical_socket_paths;
 use racer_io::ring::Completion;
 #[cfg(test)]
 use racer_io::ring::IoBuffer;
+use racer_wire::control::CacheDefinition;
+use racer_wire::control::canonical_socket_paths;
 use std::path::Path;
 use std::path::PathBuf;
 use std::rc::Rc;
@@ -351,7 +351,7 @@ impl Origin for OriginClient {
             let endpoint = self.endpoint(context)?;
             self.health
                 .run(
-                    &racer_control_wire::NodeId(format!("{endpoint:?}")),
+                    &racer_wire::control::NodeId(format!("{endpoint:?}")),
                     self.bootstrap_reserved_at(&endpoint, context, reservation, scope),
                 )
                 .await
@@ -374,7 +374,7 @@ impl Origin for OriginClient {
             let endpoint = self.endpoint(context)?;
             self.health
                 .run(
-                    &racer_control_wire::NodeId(format!("{endpoint:?}")),
+                    &racer_wire::control::NodeId(format!("{endpoint:?}")),
                     self.page_reserved_at(&endpoint, context, page, reservation, scope),
                 )
                 .await
@@ -393,7 +393,7 @@ impl Origin for OriginClient {
             let endpoint = self.endpoint(context)?;
             self.health
                 .run(
-                    &racer_control_wire::NodeId(format!("{endpoint:?}")),
+                    &racer_wire::control::NodeId(format!("{endpoint:?}")),
                     self.metadata_at(&endpoint, context, selector, scope),
                 )
                 .await
@@ -418,7 +418,7 @@ fn response_error(error: Error) -> Error {
 /// name, so after a ClusterCache is deleted and recreated an origin for the old
 /// UID can still be listening; a UID-bound origin refuses mismatched requests.
 fn request(context: &OriginContext, method: &str) -> Result<MessageHead> {
-    let mut head = racer_object_wire::origin::request(
+    let mut head = racer_wire::object::origin::request(
         &context.object.key,
         method,
         context.metadata.as_ref().map(|value| value.as_header()),
@@ -436,7 +436,7 @@ fn request(context: &OriginContext, method: &str) -> Result<MessageHead> {
 
 #[cfg(test)]
 fn opaque(bytes: &[u8]) -> Result<()> {
-    racer_object_wire::origin::opaque(bytes).map_err(Into::into)
+    racer_wire::object::origin::opaque(bytes).map_err(Into::into)
 }
 
 /// HEAD/initial-GET validation; empty objects produce metadata without a page.
@@ -447,10 +447,10 @@ pub struct MetadataReply {
 
 /// The initial GET selects metadata and page zero atomically at the adapter.
 pub fn validate_bootstrap(head: &MessageHead, object: &ObjectId) -> Result<(ObjectMetadata, u64)> {
-    racer_object_wire::origin::validate_bootstrap(head, object).map_err(Into::into)
+    racer_wire::object::origin::validate_bootstrap(head, object).map_err(Into::into)
 }
 pub fn validate_metadata(head: &MessageHead, object: &ObjectId) -> Result<ObjectMetadata> {
-    racer_object_wire::origin::validate_metadata(head, object).map_err(Into::into)
+    racer_wire::object::origin::validate_metadata(head, object).map_err(Into::into)
 }
 
 /// Conditional full-page GET validation before authenticated publication.
@@ -465,17 +465,17 @@ pub fn validate_page(
     page: &PageId,
     received_bytes: usize,
 ) -> Result<ObjectMetadata> {
-    racer_object_wire::origin::validate_page(head, page, received_bytes).map_err(Into::into)
+    racer_wire::object::origin::validate_page(head, page, received_bytes).map_err(Into::into)
 }
 
 /// Validate before allocating or receiving any payload.
 fn validate_page_head(head: &MessageHead, page: &PageId) -> Result<(ObjectMetadata, u64)> {
-    racer_object_wire::origin::validate_page_head(head, page).map_err(Into::into)
+    racer_wire::object::origin::validate_page_head(head, page).map_err(Into::into)
 }
 
 /// Validate framing before interpreting status; malformed errors are never miss proof.
 fn validate_response(head: &MessageHead, pinned: bool) -> Result<(u16, u64)> {
-    racer_object_wire::origin::validate_response(head, pinned).map_err(Into::into)
+    racer_wire::object::origin::validate_response(head, pinned).map_err(Into::into)
 }
 
 #[cfg(test)]
@@ -483,10 +483,10 @@ mod tests;
 
 #[cfg(test)]
 fn decimal(bytes: &[u8]) -> Result<u64> {
-    racer_object_wire::parse_decimal(bytes).map_err(|_| Error::BadGateway)
+    racer_wire::object::parse_decimal(bytes).map_err(|_| Error::BadGateway)
 }
 
 #[cfg(test)]
 fn metadata(head: &MessageHead, object: &ObjectId, length: u64) -> Result<ObjectMetadata> {
-    racer_object_wire::origin::metadata(head, object, length).map_err(Into::into)
+    racer_wire::object::origin::metadata(head, object, length).map_err(Into::into)
 }

@@ -452,19 +452,19 @@ fn ready_memory_precedes_cold_ownership_refresh_and_preserves_one_interest() {
         published.clone(),
         racer_io::Clock::host(),
     );
-    let mut publication = racer_control_wire::Publication {
+    let mut publication = racer_wire::control::Publication {
         pools: Vec::new(),
-        schema_version: racer_control_wire::SCHEMA_VERSION,
+        schema_version: racer_wire::control::SCHEMA_VERSION,
         cluster: f.keys.cluster().clone(),
-        sequence: racer_control_wire::PublicationSequence(1),
-        membership_version: racer_control_wire::MembershipVersion(1),
+        sequence: racer_wire::control::PublicationSequence(1),
+        membership_version: racer_wire::control::MembershipVersion(1),
         members: vec![],
         caches: vec![],
     }
     .with_default_pool();
     publication.members = (0..1000)
-        .map(|i| racer_control_wire::Member {
-            node: racer_control_wire::NodeId(format!("22222222-2222-4222-8222-{i:012}")),
+        .map(|i| racer_wire::control::Member {
+            node: racer_wire::control::NodeId(format!("22222222-2222-4222-8222-{i:012}")),
             shares: NonZeroU32::new(1).unwrap(),
             peer_endpoint: format!("127.0.0.1:{}", 8000 + i),
             rails: vec![],
@@ -474,7 +474,7 @@ fn ready_memory_precedes_cold_ownership_refresh_and_preserves_one_interest() {
     snapshots.apply(publication).unwrap();
     let mut deps = f.fill.dependencies.clone();
     deps.candidates = Rc::new(CandidatePolicy::new(
-        racer_control_wire::NodeId("22222222-2222-4222-8222-000000000000".into()),
+        racer_wire::control::NodeId("22222222-2222-4222-8222-000000000000".into()),
         Rc::new(Placement::new(16)),
         NoPeer::requester(),
         deps.credentials.clone(),
@@ -676,13 +676,13 @@ fn optional_persistence_owned_dirty_pressure_keeps_disk_share_order() {
     assert!(deps.writer.copy_only(&kept_id).unwrap().is_some());
     let owned = incoming_id.clone();
     policy.set_ownership(Rc::new(move |id| id == &owned));
-    let definition = |id: &CacheId, priority| racer_control_wire::CacheDefinition {
+    let definition = |id: &CacheId, priority| racer_wire::control::CacheDefinition {
         id: id.clone(),
         name: id.0.clone(),
         client_socket: "/c".into(),
         origin_socket: "/o".into(),
         priority,
-        mode: racer_control_wire::CacheMode::Cached,
+        mode: racer_wire::control::CacheMode::Cached,
         origin: None,
     };
     let weigh = |under_priority, over_priority| {
@@ -2762,13 +2762,13 @@ mod pressure {
             let f = fixture_with_caches(3, Some(limits), vec![under.clone(), over.clone()]);
             let deps = &f.fill.dependencies;
             let admission = &deps.admission;
-            let definition = |id: &CacheId, priority| racer_control_wire::CacheDefinition {
+            let definition = |id: &CacheId, priority| racer_wire::control::CacheDefinition {
                 id: id.clone(),
                 name: id.0.clone(),
                 client_socket: "/c".into(),
                 origin_socket: "/o".into(),
                 priority,
-                mode: racer_control_wire::CacheMode::Cached,
+                mode: racer_wire::control::CacheMode::Cached,
                 origin: None,
             };
             let weigh = |under_priority, over_priority| {
@@ -2972,7 +2972,7 @@ pub(super) use crate::runtime::Reactor;
 pub(super) use crate::security;
 pub(super) use crate::security::CryptoClient;
 pub(super) use crate::worker::CryptoRuntime;
-pub(super) use racer_control_wire::CacheId;
+pub(super) use racer_wire::control::CacheId;
 
 pub(super) use crate::security::PageCryptoEngine;
 pub(super) use crate::store::catalog::Index;
@@ -3102,7 +3102,7 @@ pub(super) struct Fixture {
     pub(super) directory: std::path::PathBuf,
     /// Node pools that [`Fixture::read_graph`] publishes; the default pool
     /// holding this fixture's cache when `None`.
-    pub(super) pools: Option<Vec<racer_control_wire::Pool>>,
+    pub(super) pools: Option<Vec<racer_wire::control::Pool>>,
 }
 impl Drop for Fixture {
     fn drop(&mut self) {
@@ -3111,7 +3111,7 @@ impl Drop for Fixture {
 }
 impl Fixture {
     /// Republish this fixture's cache in `mode`, as a ClusterCache edit would.
-    pub(super) fn set_mode(&self, mode: racer_control_wire::CacheMode) {
+    pub(super) fn set_mode(&self, mode: racer_wire::control::CacheMode) {
         self.fill
             .dependencies
             .memory
@@ -3178,10 +3178,10 @@ impl Fixture {
         use crate::read::metadata::MetadataDependencies;
         use crate::read::metadata::MetadataService;
         use crate::read::range_stream::RangeStreams;
-        use racer_control_wire::CacheDefinition;
-        use racer_control_wire::Publication;
-        use racer_control_wire::PublicationSequence;
-        use racer_control_wire::SCHEMA_VERSION;
+        use racer_wire::control::CacheDefinition;
+        use racer_wire::control::Publication;
+        use racer_wire::control::PublicationSequence;
+        use racer_wire::control::SCHEMA_VERSION;
         let published = Arc::new(PublicationCell::new(Snapshot::retention(
             settings.snapshots,
         )));
@@ -3192,7 +3192,7 @@ impl Fixture {
             crate::test_support::clock(),
         ));
         let (client_socket, origin_socket) =
-            racer_control_wire::canonical_socket_paths(settings.name).unwrap();
+            racer_wire::control::canonical_socket_paths(settings.name).unwrap();
         let publication = Publication {
             pools: Vec::new(),
             schema_version: SCHEMA_VERSION,
@@ -3210,8 +3210,8 @@ impl Fixture {
                 name: settings.name.into(),
                 client_socket,
                 origin_socket,
-                priority: racer_control_wire::DEFAULT_PRIORITY,
-                mode: racer_control_wire::CacheMode::Cached,
+                priority: racer_wire::control::DEFAULT_PRIORITY,
+                mode: racer_wire::control::CacheMode::Cached,
                 origin: None,
             }],
         };
@@ -3391,10 +3391,10 @@ fn fixture_with_flight_clock(
         metadata: None,
         authorization: None,
     };
-    let node = racer_control_wire::NodeId("22222222-2222-4222-8222-222222222222".into());
+    let node = racer_wire::control::NodeId("22222222-2222-4222-8222-222222222222".into());
     let membership = Arc::new(
         Membership::validate(
-            racer_control_wire::MembershipVersion(1),
+            racer_wire::control::MembershipVersion(1),
             vec![Member {
                 node: node.clone(),
                 shares: NonZeroU32::new(4).unwrap(),
@@ -3536,16 +3536,16 @@ pub(super) fn adapter_client(
     use crate::control::Snapshot;
     use crate::control::cell::PublicationCell;
     use crate::control::publication::PublicationTarget;
-    use racer_control_wire::Publication;
-    use racer_control_wire::PublicationSequence;
-    use racer_control_wire::SCHEMA_VERSION;
+    use racer_wire::control::Publication;
+    use racer_wire::control::PublicationSequence;
+    use racer_wire::control::SCHEMA_VERSION;
     let snapshots = Rc::new(PublicationTarget::new(
         f.keys.cluster().clone(),
         Arc::new(PublicationCell::new(Snapshot::retention(2))),
         crate::test_support::clock(),
     ));
     let (client_socket, origin_socket) =
-        racer_control_wire::canonical_socket_paths("fixture").unwrap();
+        racer_wire::control::canonical_socket_paths("fixture").unwrap();
     snapshots
         .apply(
             Publication {
@@ -3561,13 +3561,13 @@ pub(super) fn adapter_client(
                     .cloned()
                     .map(Into::into)
                     .collect(),
-                caches: vec![racer_control_wire::CacheDefinition {
+                caches: vec![racer_wire::control::CacheDefinition {
                     id: f.context.object.cache.clone(),
                     name: "fixture".into(),
                     client_socket,
                     origin_socket,
-                    priority: racer_control_wire::DEFAULT_PRIORITY,
-                    mode: racer_control_wire::CacheMode::Cached,
+                    priority: racer_wire::control::DEFAULT_PRIORITY,
+                    mode: racer_wire::control::CacheMode::Cached,
                     origin: None,
                 }],
             }

@@ -20,8 +20,8 @@ use crate::telemetry::Metrics;
 use crate::telemetry::Observer;
 use crate::telemetry::Stage;
 use crate::topology::Paths;
-use racer_control_wire::MembershipVersion;
-use racer_control_wire::NodeId;
+use racer_wire::control::MembershipVersion;
+use racer_wire::control::NodeId;
 use std::rc::Rc;
 use std::sync::Arc;
 use std::time::Duration;
@@ -544,7 +544,7 @@ pub enum Requester {
         available: Box<
             dyn Fn(
                 &std::sync::Arc<crate::topology::Membership>,
-                &racer_control_wire::NodeId,
+                &racer_wire::control::NodeId,
             ) -> bool,
         >,
         #[expect(
@@ -578,7 +578,7 @@ impl Requester {
         available: fn(
             &T,
             &std::sync::Arc<crate::topology::Membership>,
-            &racer_control_wire::NodeId,
+            &racer_wire::control::NodeId,
         ) -> bool,
         request: for<'a> fn(
             &'a T,
@@ -681,7 +681,7 @@ impl Requester {
     pub fn direct_hedge_available(
         &self,
         membership: &std::sync::Arc<crate::topology::Membership>,
-        destination: &racer_control_wire::NodeId,
+        destination: &racer_wire::control::NodeId,
     ) -> bool {
         match self {
             Self::Network {

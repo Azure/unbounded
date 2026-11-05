@@ -658,7 +658,7 @@ mod tests {
             .insert(key.into(), value.into());
     }
 
-    fn pools_of(p: &PassPlan) -> Vec<racer_control_wire::Pool> {
+    fn pools_of(p: &PassPlan) -> Vec<racer_wire::control::Pool> {
         p.image.as_ref().unwrap().publication.pools.clone()
     }
 
@@ -694,7 +694,7 @@ mod tests {
         let sel = pools.iter().find(|p| !p.id.is_default()).unwrap();
         assert_eq!(
             sel.rank,
-            (1 << 32) | u64::from(racer_control_wire::DEFAULT_PRIORITY)
+            (1 << 32) | u64::from(racer_wire::control::DEFAULT_PRIORITY)
         );
         assert_eq!(sel.members, Some(vec![1, 3]));
         assert_eq!(sel.caches.len(), 2);

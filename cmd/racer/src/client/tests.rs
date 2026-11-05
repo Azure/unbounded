@@ -16,7 +16,7 @@ use crate::runtime::Reactor;
 use crate::runtime::RequestScope;
 use crate::test_support::ReadWorker;
 use crate::test_support::origin::RequestKind;
-use racer_control_wire::CacheDefinition;
+use racer_wire::control::CacheDefinition;
 use std::cell::Cell;
 use std::cell::RefCell;
 use std::ffi::CString;
@@ -963,8 +963,8 @@ fn definition() -> CacheDefinition {
         name: "example".into(),
         client_socket: "/run/racer/example/client/socket".into(),
         origin_socket: "/run/racer/example/origin/socket".into(),
-        priority: racer_control_wire::DEFAULT_PRIORITY,
-        mode: racer_control_wire::CacheMode::Cached,
+        priority: racer_wire::control::DEFAULT_PRIORITY,
+        mode: racer_wire::control::CacheMode::Cached,
         origin: None,
     }
 }
@@ -2753,7 +2753,7 @@ fn production_snapshot_replacement_rejects_old_backlog_uid_with_503() {
     use crate::control::cell::PublicationCell;
     use crate::control::publication::PublicationTarget;
     use crate::control::{Availability, Snapshot};
-    use racer_control_wire::{MembershipVersion, Publication, PublicationSequence};
+    use racer_wire::control::{MembershipVersion, Publication, PublicationSequence};
     let mut fixture = Fixture::new();
     let keys = Rc::new(crate::test_support::security::keys());
     let state = Arc::new(PublicationCell::new(Snapshot::retention(2)));
@@ -2764,11 +2764,11 @@ fn production_snapshot_replacement_rejects_old_backlog_uid_with_503() {
     ));
     let mut publication = Publication {
         pools: Vec::new(),
-        schema_version: racer_control_wire::SCHEMA_VERSION,
+        schema_version: racer_wire::control::SCHEMA_VERSION,
         cluster: keys.cluster().clone(),
         sequence: PublicationSequence(1),
         membership_version: MembershipVersion(1),
-        members: vec![racer_control_wire::Member {
+        members: vec![racer_wire::control::Member {
             node: keys.node().clone(),
             shares: std::num::NonZeroU32::new(1).unwrap(),
             peer_endpoint: "127.0.0.1:1".into(),
@@ -2793,7 +2793,7 @@ fn production_snapshot_replacement_rejects_old_backlog_uid_with_503() {
     socket.write_all(&request("HEAD", "")).unwrap();
     publication.sequence = PublicationSequence(2);
     publication.caches[0].id = CacheId("00000000-0000-4000-8000-000000000003".into());
-    publication.pools = racer_control_wire::default_pools(&publication.caches);
+    publication.pools = racer_wire::control::default_pools(&publication.caches);
     publication.membership_version.0 += 1;
     let transition =
         futures::executor::block_on(fixture.listeners.prepare(&publication.caches, &scope()))
@@ -2938,8 +2938,8 @@ fn priority_only_changes_reuse_listeners_beyond_retirement_bound() {
                 client_socket: format!("/run/racer/{name}/client/socket").into(),
                 origin_socket: format!("/run/racer/{name}/origin/socket").into(),
                 name,
-                priority: racer_control_wire::DEFAULT_PRIORITY,
-                mode: racer_control_wire::CacheMode::Cached,
+                priority: racer_wire::control::DEFAULT_PRIORITY,
+                mode: racer_wire::control::CacheMode::Cached,
                 origin: None,
             }
         })
@@ -2953,9 +2953,9 @@ fn priority_only_changes_reuse_listeners_beyond_retirement_bound() {
         cache.priority = 7;
         // Mode changes in either direction reuse the socket too.
         cache.mode = [
-            racer_control_wire::CacheMode::PassthroughPeers,
-            racer_control_wire::CacheMode::PassthroughLocal,
-            racer_control_wire::CacheMode::Cached,
+            racer_wire::control::CacheMode::PassthroughPeers,
+            racer_wire::control::CacheMode::PassthroughLocal,
+            racer_wire::control::CacheMode::Cached,
         ][n % 3];
     }
     let prepared =
@@ -2986,8 +2986,8 @@ fn listener_reuse_ignores_only_priority() {
     next.priority = 0;
     assert!(same_endpoint(&current, &next));
     for mode in [
-        racer_control_wire::CacheMode::PassthroughPeers,
-        racer_control_wire::CacheMode::PassthroughLocal,
+        racer_wire::control::CacheMode::PassthroughPeers,
+        racer_wire::control::CacheMode::PassthroughLocal,
     ] {
         next.mode = mode;
         assert!(same_endpoint(&current, &next));

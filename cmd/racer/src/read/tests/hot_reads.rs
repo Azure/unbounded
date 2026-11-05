@@ -19,7 +19,7 @@ use crate::test_support::security::network;
 use crate::test_support::security::node;
 use crate::topology::LinkHealth;
 use crate::topology::Paths;
-use racer_control_wire::MembershipVersion;
+use racer_wire::control::MembershipVersion;
 
 mod duplex_release {
     //! Exercise release credit through the real duplex response, not release_page.
@@ -591,7 +591,7 @@ mod duplex_release {
 struct Link {
     client: Rc<Requester>,
     /// The only node with a reachable peer endpoint.
-    provider: racer_control_wire::NodeId,
+    provider: racer_wire::control::NodeId,
     demands: Rc<RefCell<Vec<u64>>>,
     stats: Rc<LinkStats>,
 }
@@ -609,7 +609,7 @@ impl Link {
     fn direct_hedge_available(
         &self,
         _: &std::sync::Arc<crate::topology::Membership>,
-        _: &racer_control_wire::NodeId,
+        _: &racer_wire::control::NodeId,
     ) -> bool {
         false
     }
@@ -1007,15 +1007,15 @@ fn zero_priority_read_beside_active_cache_progresses_while_first_page_is_held() 
     f.reactor.init().unwrap();
     let admission = f.fill.dependencies.admission.clone();
     let cold = f.page.version.object.cache.clone();
-    let hot = racer_control_wire::CacheId("hot".into());
+    let hot = racer_wire::control::CacheId("hot".into());
     let definition =
-        |id: &racer_control_wire::CacheId, priority| racer_control_wire::CacheDefinition {
+        |id: &racer_wire::control::CacheId, priority| racer_wire::control::CacheDefinition {
             id: id.clone(),
             name: id.0.clone(),
             client_socket: "/c".into(),
             origin_socket: "/o".into(),
             priority,
-            mode: racer_control_wire::CacheMode::Cached,
+            mode: racer_wire::control::CacheMode::Cached,
             origin: None,
         };
     admission

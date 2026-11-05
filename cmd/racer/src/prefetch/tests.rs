@@ -5,8 +5,8 @@ use super::api::{self, Reason, RefError, RefOutcome, State};
 use super::registry::{PutCheck, Registry, Resolution, RetryKind, UnitKey, UnitOutcome};
 use super::{Config, metrics::Counter, metrics::Outcome};
 use crate::model::{CacheKey, ObjectId, ObjectVersion, PAGE_BYTES, StrongEtag, VersionMetadata};
-use racer_control_wire::{CacheId, NodeId};
-use racer_object_wire::prefetch::{ErrorCode, RefsFilter};
+use racer_wire::control::{CacheId, NodeId};
+use racer_wire::object::prefetch::{ErrorCode, RefsFilter};
 use std::time::{Duration, Instant};
 
 const KEY_A: &str = "aa00000000000000000000000000000000000000000000000000000000000000";

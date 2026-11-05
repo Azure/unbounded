@@ -14,7 +14,7 @@ use std::hash::Hash;
 pub const MAX_SUBSCRIPTION_FLIGHTS: u16 = 64;
 
 /// Bytes the requester debits per selection when it issues a request.
-const RESERVE: u64 = racer_object_wire::PAGE_BYTES + 16;
+const RESERVE: u64 = racer_wire::object::PAGE_BYTES + 16;
 
 /// Retained spent contracts outlive their deadline by the signature freshness
 /// window, so replaying one cannot renew it.

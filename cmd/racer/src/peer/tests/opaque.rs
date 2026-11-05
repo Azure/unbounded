@@ -13,10 +13,10 @@ use crate::topology::Member;
 use crate::topology::Membership;
 use crate::topology::Paths;
 use http1::connection::BufferRange;
-use racer_control_wire::CacheId;
-use racer_control_wire::ClusterId;
 use racer_crypto::{TAG_LEN, open, seal};
 use racer_io::ring::IoBuffer;
+use racer_wire::control::CacheId;
+use racer_wire::control::ClusterId;
 use std::cell::Cell;
 use std::net::TcpListener;
 use std::net::TcpStream;
@@ -411,10 +411,10 @@ mod safety {
     use crate::security::PageCryptoEngine;
     use crate::telemetry::Event;
     use crate::telemetry::Metrics;
-    use racer_control_wire::CacheEncryptionKey;
-    use racer_control_wire::CacheKeyPurpose;
-    use racer_control_wire::CacheKeyRef;
-    use racer_control_wire::CacheKeyState;
+    use racer_wire::control::CacheEncryptionKey;
+    use racer_wire::control::CacheKeyPurpose;
+    use racer_wire::control::CacheKeyRef;
+    use racer_wire::control::CacheKeyState;
     use std::cell::RefCell;
     use std::net::Shutdown;
 

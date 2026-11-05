@@ -15,10 +15,10 @@ use crate::topology::Route;
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD;
 #[cfg(test)]
-use racer_control_wire::MembershipVersion;
-use racer_control_wire::NodeId;
-use racer_control_wire::RailId;
-use racer_control_wire::RailMapping;
+use racer_wire::control::MembershipVersion;
+use racer_wire::control::NodeId;
+use racer_wire::control::RailId;
+use racer_wire::control::RailMapping;
 #[cfg(test)]
 use rdma_verbs::PortInfo;
 use sha2::Digest;
@@ -132,8 +132,8 @@ pub fn select(route: &Route, page: &PageId) -> Result<TransportPlan> {
 pub fn select_hop(
     route: &Route,
     page: &PageId,
-    local: &racer_control_wire::NodeId,
-    peer: &racer_control_wire::NodeId,
+    local: &racer_wire::control::NodeId,
+    peer: &racer_wire::control::NodeId,
 ) -> Result<TransportPlan> {
     validate_route(route)?;
     if !route.nodes.windows(2).any(|pair| {
@@ -163,8 +163,8 @@ pub fn select_hop(
 pub fn is_overflow(
     membership: &crate::topology::Membership,
     page: &PageId,
-    local: &racer_control_wire::NodeId,
-    peer: &racer_control_wire::NodeId,
+    local: &racer_wire::control::NodeId,
+    peer: &racer_wire::control::NodeId,
 ) -> bool {
     let (Ok(a), Ok(b)) = (membership.member(local), membership.member(peer)) else {
         return false;
@@ -239,8 +239,8 @@ impl RdmaEdges {
 /// [`crate::topology::RDMA_PEERS`] best ranked eligible edges.
 pub fn is_rdma_edge(
     membership: &crate::topology::Membership,
-    a: &racer_control_wire::NodeId,
-    b: &racer_control_wire::NodeId,
+    a: &racer_wire::control::NodeId,
+    b: &racer_wire::control::NodeId,
 ) -> bool {
     let (Ok(pa), Ok(pb)) = (membership.position(a), membership.position(b)) else {
         return false;
@@ -265,8 +265,8 @@ pub fn is_rdma_edge(
 /// Empty when `local` is not a member.
 pub fn rdma_edge_peers(
     membership: &crate::topology::Membership,
-    local: &racer_control_wire::NodeId,
-) -> Vec<racer_control_wire::NodeId> {
+    local: &racer_wire::control::NodeId,
+) -> Vec<racer_wire::control::NodeId> {
     let Ok(position) = membership.position(local) else {
         return Vec::new();
     };
@@ -354,12 +354,12 @@ pub(crate) mod tests {
             use http1::Header;
             use http1::MessageHead;
             use http1::StartLine;
-            use racer_control_wire::BundleGeneration;
-            use racer_control_wire::ClusterId;
-            use racer_control_wire::KeyringBundle;
             use racer_crypto::identity::Certificates;
             use racer_crypto::identity::KeyEpochs;
             use racer_crypto::identity::Keyring;
+            use racer_wire::control::BundleGeneration;
+            use racer_wire::control::ClusterId;
+            use racer_wire::control::KeyringBundle;
             use std::sync::Arc;
             let (pending, chain, roots) = issued();
             let cluster = ClusterId(CLUSTER.into());
@@ -381,7 +381,7 @@ pub(crate) mod tests {
                 ))),
             ));
             keys.install(KeyringBundle {
-                schema_version: racer_control_wire::KEYRING_SCHEMA_VERSION,
+                schema_version: racer_wire::control::KEYRING_SCHEMA_VERSION,
                 cluster: cluster.clone(),
                 generation: BundleGeneration(1),
                 peer_trust_roots: roots,

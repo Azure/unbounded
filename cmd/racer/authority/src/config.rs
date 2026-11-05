@@ -25,7 +25,7 @@ pub struct Rotation {
 
     pub prepare_for: Duration,
 
-    /// Readable page keys per cache, in `1..=`[`racer_control_wire::MAX_RETAINED_PAGE_KEYS`].
+    /// Readable page keys per cache, in `1..=`[`racer_wire::control::MAX_RETAINED_PAGE_KEYS`].
     pub retained_page_keys: usize,
 }
 
@@ -103,7 +103,7 @@ impl Config {
             || !label(&self.daemonset)
             || !label(&self.service_account)
             || self.node_name.is_empty()
-            || !racer_control_wire::valid_uuid(&self.pod_uid)
+            || !racer_wire::control::valid_uuid(&self.pod_uid)
             || (self.control_listen.port() != 0
                 && self.control_listen.port() == self.webhook_listen.port())
         {

@@ -11,7 +11,7 @@ use crate::model::StrongEtag;
 use http1::Header;
 use http1::MessageHead;
 use http1::StartLine;
-use racer_control_wire::AzureContainerUrl;
+use racer_wire::control::AzureContainerUrl;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 /// The service version azblob v1.8.2 (the Go SDK in go.mod) sends.

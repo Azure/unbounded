@@ -19,8 +19,8 @@ pub mod table;
 use crate::error::Error;
 use crate::error::Result;
 use crate::model::PAGE_BYTES;
-use racer_control_wire::ClusterId;
-use racer_control_wire::NodeId;
+use racer_wire::control::ClusterId;
+use racer_wire::control::NodeId;
 pub use spec::ConfigError;
 use spec::Values;
 use std::collections::BTreeMap;
@@ -969,7 +969,7 @@ fn authority(
     let namespace = label("RACER_NAMESPACE", namespace)?;
     let pod_name = label("RACER_POD_NAME", &need("RACER_POD_NAME")?)?;
     let pod_uid = need("RACER_POD_UID")?;
-    if !racer_control_wire::valid_uuid(&pod_uid) {
+    if !racer_wire::control::valid_uuid(&pod_uid) {
         return Err(ConfigError::value(
             "RACER_POD_UID",
             &pod_uid,
@@ -1103,7 +1103,7 @@ fn to_usize(value: u64) -> Result<usize> {
 }
 
 fn valid_uuid(value: &str) -> bool {
-    racer_control_wire::valid_uuid(value) && value != "00000000-0000-0000-0000-000000000000"
+    racer_wire::control::valid_uuid(value) && value != "00000000-0000-0000-0000-000000000000"
 }
 
 // Kubernetes expands a single bracketed Pod IP template for both IP families.
@@ -1218,7 +1218,7 @@ fn absolute_path(path: &Path, maximum: usize, component_maximum: usize) -> Resul
 mod tests {
     use super::*;
     use crate::store::MAX_HEADER_BYTES;
-    use racer_control_wire::DEFAULT_SHARES;
+    use racer_wire::control::DEFAULT_SHARES;
     use std::io::Read;
 
     /// `RACER_CACHE_ORIGIN_CONNECTIONS_PER_WORKER` default.
@@ -1264,7 +1264,7 @@ mod tests {
         );
         assert_eq!(
             config.shares.get(),
-            racer_control_wire::DEFAULT_SHARES,
+            racer_wire::control::DEFAULT_SHARES,
             "RACER_SHARES default"
         );
         assert_eq!(config.origin, OriginSettings::default());
@@ -1659,8 +1659,8 @@ mod tests {
     #[test]
     fn configured_ports_do_not_override_membership_or_discovered_hardware() {
         use crate::rdma::match_publication;
-        use racer_control_wire::RailId;
-        use racer_control_wire::RailMapping;
+        use racer_wire::control::RailId;
+        use racer_wire::control::RailMapping;
         let nic = RailMapping {
             device: "a".into(),
             port: 1,
@@ -1705,17 +1705,15 @@ mod tests {
 
     // RDMA NIC configuration arrives only through authenticated enrollment wire NICs.
     fn nic_request(nics: &str) -> Vec<u8> {
-        String::from_utf8(
-            include_bytes!("../control-wire/testdata/bootstrap-request.json").to_vec(),
-        )
-        .unwrap()
-        .replace("\"rdma_nics\":[]", &format!("\"rdma_nics\":{nics}"))
-        .into_bytes()
+        String::from_utf8(include_bytes!("../wire/testdata/bootstrap-request.json").to_vec())
+            .unwrap()
+            .replace("\"rdma_nics\":[]", &format!("\"rdma_nics\":{nics}"))
+            .into_bytes()
     }
     #[test]
     fn enrollment_nics_reject_malformed_ambiguous_or_unsafe_entries() {
         assert!(
-            racer_control_wire::decode_enrollment_request(&nic_request(
+            racer_wire::control::decode_enrollment_request(&nic_request(
                 r#"[{"device":"a","port":1,"rail":0}]"#
             ))
             .is_ok()
@@ -1732,7 +1730,7 @@ mod tests {
             r#"[{"device":"a","port":1,"rail":0},{"device":"a","port":1,"rail":1}]"#,
         ] {
             assert!(
-                racer_control_wire::decode_enrollment_request(&nic_request(nics)).is_err(),
+                racer_wire::control::decode_enrollment_request(&nic_request(nics)).is_err(),
                 "{nics}"
             );
         }
@@ -1743,23 +1741,23 @@ mod tests {
             .map(|i| format!(r#"{{"device":"d{i}","port":1,"rail":0}}"#))
             .collect();
         assert!(
-            racer_control_wire::decode_enrollment_request(&nic_request(&format!(
+            racer_wire::control::decode_enrollment_request(&nic_request(&format!(
                 "[{}]",
                 entries[..64].join(",")
             )))
             .is_ok()
         );
         assert!(
-            racer_control_wire::decode_enrollment_request(&nic_request(&format!(
+            racer_wire::control::decode_enrollment_request(&nic_request(&format!(
                 "[{}]",
                 entries.join(",")
             )))
             .is_err()
         );
         assert!(
-            racer_control_wire::decode_enrollment_request(&vec![
+            racer_wire::control::decode_enrollment_request(&vec![
                 b' ';
-                racer_control_wire::MAX_ENROLLMENT_BYTES
+                racer_wire::control::MAX_ENROLLMENT_BYTES
                     + 1
             ])
             .is_err()

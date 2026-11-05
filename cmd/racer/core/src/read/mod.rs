@@ -2,8 +2,8 @@
 //! classification, fill/serve policy, and the candidate walk.
 
 pub use budget::AcquisitionBudget;
-use racer_control_wire::NodeId;
-use racer_object_wire::model::{
+use racer_wire::control::NodeId;
+use racer_wire::object::model::{
     MetadataSelector, ObjectId, ObjectMetadata, PageNumber, StrongEtag, WorkerId,
 };
 use sha2::{Digest, Sha256};
@@ -112,8 +112,8 @@ impl WorkerMap {
 #[allow(clippy::disallowed_methods)] // Tests build instants to feed the API.
 mod worker_tests {
     use super::*;
-    use racer_control_wire::CacheId;
-    use racer_object_wire::model::CacheKey;
+    use racer_wire::control::CacheId;
+    use racer_wire::object::model::CacheKey;
 
     #[test]
     fn rejects_empty_and_duplicates_and_is_order_independent() {
@@ -1381,8 +1381,8 @@ mod candidates_tests {
     }
 
     use super::*;
-    use racer_control_wire::CacheId;
-    use racer_object_wire::model::CacheKey;
+    use racer_wire::control::CacheId;
+    use racer_wire::object::model::CacheKey;
 
     fn ranks(order: VisitOrder) -> Vec<usize> {
         order.ranks().collect()

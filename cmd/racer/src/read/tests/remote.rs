@@ -35,13 +35,13 @@ use crate::topology::Member;
 use crate::topology::Membership;
 use crate::topology::Paths;
 use crate::topology::Placement;
-use racer_control_wire::CacheId;
-use racer_control_wire::ClusterId;
-use racer_control_wire::MembershipVersion;
-use racer_control_wire::NodeId;
-use racer_control_wire::PublicationSequence;
-use racer_control_wire::SCHEMA_VERSION;
 use racer_crypto::identity::Keyring;
+use racer_wire::control::CacheId;
+use racer_wire::control::ClusterId;
+use racer_wire::control::MembershipVersion;
+use racer_wire::control::NodeId;
+use racer_wire::control::PublicationSequence;
+use racer_wire::control::SCHEMA_VERSION;
 use std::cell::Cell;
 use std::cell::RefCell;
 use std::net::TcpListener;
@@ -60,13 +60,13 @@ fn node(n: usize) -> NodeId {
 fn identities(nodes: &[NodeId]) -> Vec<Identity> {
     crate::test_support::security::identities(ClusterId(CLUSTER.into()), nodes, || {
         let mut keys = crate::test_support::security::mac_test_key(CACHE);
-        keys.push(racer_control_wire::CacheEncryptionKey::new(
-            racer_control_wire::CacheKeyRef {
+        keys.push(racer_wire::control::CacheEncryptionKey::new(
+            racer_wire::control::CacheKeyRef {
                 cache: CacheId(CACHE.into()),
                 id: crate::model::key_id_from_generation(1, 1).unwrap(),
-                purpose: racer_control_wire::CacheKeyPurpose::Page,
+                purpose: racer_wire::control::CacheKeyPurpose::Page,
             },
-            racer_control_wire::CacheKeyState::Active,
+            racer_wire::control::CacheKeyState::Active,
             zeroize::Zeroizing::new([7; 32]),
         ));
         keys
@@ -286,7 +286,7 @@ fn remote_candidate_with_churn(absence: Option<Absence>, forbidden: bool, churn:
     use crate::control::Snapshot;
     use crate::control::cell::PublicationCell;
     use crate::control::publication::PublicationTarget;
-    use racer_control_wire::Publication;
+    use racer_wire::control::Publication;
     let object = ObjectId {
         cache: CacheId(CACHE.into()),
         key: CacheKey([3; 32]),
@@ -302,21 +302,21 @@ fn remote_candidate_with_churn(absence: Option<Absence>, forbidden: bool, churn:
     );
     let mut publication = Publication {
         pools: Vec::new(),
-        schema_version: racer_control_wire::SCHEMA_VERSION,
+        schema_version: racer_wire::control::SCHEMA_VERSION,
         cluster: ClusterId(CLUSTER.into()),
         sequence: PublicationSequence(1),
         membership_version: MembershipVersion(1),
-        caches: vec![racer_control_wire::CacheDefinition {
+        caches: vec![racer_wire::control::CacheDefinition {
             id: CacheId(CACHE.into()),
             name: "remote".into(),
             client_socket: "/run/racer/remote/client/socket".into(),
             origin_socket: "/run/racer/remote/origin/socket".into(),
-            priority: racer_control_wire::DEFAULT_PRIORITY,
-            mode: racer_control_wire::CacheMode::Cached,
+            priority: racer_wire::control::DEFAULT_PRIORITY,
+            mode: racer_wire::control::CacheMode::Cached,
             origin: None,
         }],
         members: (0..4)
-            .map(|i| racer_control_wire::Member {
+            .map(|i| racer_wire::control::Member {
                 node: node(i),
                 shares: std::num::NonZeroU32::new(4).unwrap(),
                 peer_endpoint: address.clone(),
@@ -920,7 +920,7 @@ fn metadata_coordinator_with_newer_publication(
     use crate::store::StoreReader;
     use crate::store::StoreWriter;
     use crate::store::catalog::Index;
-    use racer_control_wire::Publication;
+    use racer_wire::control::Publication;
     let published = Arc::new(PublicationCell::new(Snapshot::retention(4)));
     let availability = Rc::new(crate::control::Availability::new(
         published.clone(),
@@ -943,13 +943,13 @@ fn metadata_coordinator_with_newer_publication(
             .cloned()
             .map(Into::into)
             .collect(),
-        caches: vec![racer_control_wire::CacheDefinition {
+        caches: vec![racer_wire::control::CacheDefinition {
             id: CacheId(CACHE.into()),
             name: "remote".into(),
             client_socket: "/run/racer/remote/client/socket".into(),
             origin_socket: "/run/racer/remote/origin/socket".into(),
-            priority: racer_control_wire::DEFAULT_PRIORITY,
-            mode: racer_control_wire::CacheMode::Cached,
+            priority: racer_wire::control::DEFAULT_PRIORITY,
+            mode: racer_wire::control::CacheMode::Cached,
             origin: None,
         }],
     }

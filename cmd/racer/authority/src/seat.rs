@@ -23,7 +23,7 @@ use crate::{
     tls::TlsStream,
 };
 use base64::{Engine, engine::general_purpose::STANDARD};
-use racer_control_wire as wire;
+use racer_wire::control as wire;
 use std::{
     cell::RefCell,
     collections::BTreeMap,
@@ -63,7 +63,7 @@ pub fn parse_endpoints(value: Option<&String>) -> Vec<DiscoveredEndpoint> {
                 generation: i["generation"].as_str()?.to_owned(),
             })
         })
-        .take(wire_codec::MAX_DISCOVERED_ENDPOINTS)
+        .take(racer_wire::control::MAX_DISCOVERED_ENDPOINTS)
         .collect()
 }
 
@@ -729,7 +729,7 @@ pub fn install_record(
             .bundle(&cluster)
             .ok()
             .filter(|b| !b.peer_trust_roots.is_empty() && generation != 0)
-            .and_then(|b| racer_control_wire::encode_bundle(&b).ok())
+            .and_then(|b| racer_wire::control::encode_bundle(&b).ok())
             .map(|bytes| (generation, Arc::new(bytes)));
         s.roots = record.keyring.root_ders();
         shared.verifier.set_roots(&s.roots);
@@ -794,7 +794,7 @@ async fn fetch_image(shared: &Shared) -> Result<(), Error> {
         if head.status != 200 {
             return Err(Error::Unavailable);
         }
-        conn.read_response_body(&head, racer_control_wire::MAX_PUBLICATION_BYTES)
+        conn.read_response_body(&head, racer_wire::control::MAX_PUBLICATION_BYTES)
             .await
             .map_err(|_| Error::Unavailable)
     })

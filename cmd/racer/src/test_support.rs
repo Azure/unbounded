@@ -34,10 +34,10 @@ use crate::store::catalog::SegmentClock;
 use crate::test_support::origin::AdapterOrigin;
 use crate::topology::Placement;
 use crate::worker::CryptoRuntime;
-use racer_control_wire::CacheDefinition;
-use racer_control_wire::MembershipVersion;
-use racer_control_wire::Publication;
-use racer_control_wire::PublicationSequence;
+use racer_wire::control::CacheDefinition;
+use racer_wire::control::MembershipVersion;
+use racer_wire::control::Publication;
+use racer_wire::control::PublicationSequence;
 use std::cell::RefCell;
 use std::num::NonZeroU32;
 use std::rc::Rc;
@@ -122,7 +122,7 @@ pub mod clock {
         use crate::model::ObjectVersion;
         use crate::model::StrongEtag;
         use crate::model::VersionMetadata;
-        use racer_control_wire::CacheId;
+        use racer_wire::control::CacheId;
         let clock = Clock::default();
         let descriptor = VersionMetadata {
             content_type: None,
@@ -170,14 +170,14 @@ pub mod origin {
     use crate::model::PAGE_BYTES;
     use crate::origin::OriginClient;
     use crate::runtime::Reactor;
-    pub use racer_object_wire::test_util::RequestKind;
+    pub use racer_wire::object::test_util::RequestKind;
     use std::rc::Rc;
 
     /// Application client factory around the portable protocol fixture.
-    pub struct AdapterOrigin(racer_object_wire::test_util::AdapterOrigin);
+    pub struct AdapterOrigin(racer_wire::object::test_util::AdapterOrigin);
 
     impl std::ops::Deref for AdapterOrigin {
-        type Target = racer_object_wire::test_util::AdapterOrigin;
+        type Target = racer_wire::object::test_util::AdapterOrigin;
 
         fn deref(&self) -> &Self::Target {
             &self.0
@@ -188,7 +188,7 @@ pub mod origin {
         /// With no explicit body, three-byte objects contain `abc`; other pages
         /// contain their page number repeated. Large fixtures need no object allocation.
         pub fn new(cache_name: &str, metadata: ObjectMetadata) -> Self {
-            Self(racer_object_wire::test_util::AdapterOrigin::new(
+            Self(racer_wire::object::test_util::AdapterOrigin::new(
                 cache_name, metadata,
             ))
         }
@@ -223,12 +223,12 @@ pub mod origin {
 /// Minimal real control-plane state for storage and flight fixtures. Callers with
 /// rotating keys or publications should share their own Availability instead.
 pub fn availability() -> std::rc::Rc<crate::control::Availability> {
-    availability_for(vec![racer_control_wire::CacheId(
+    availability_for(vec![racer_wire::control::CacheId(
         crate::test_support::security::CACHE.into(),
     )])
 }
 pub fn availability_for(
-    caches: Vec<racer_control_wire::CacheId>,
+    caches: Vec<racer_wire::control::CacheId>,
 ) -> std::rc::Rc<crate::control::Availability> {
     crate::control::for_caches(
         std::rc::Rc::new(crate::test_support::security::keys_for(&caches)),
@@ -250,7 +250,7 @@ impl NoPeers {
     fn direct_hedge_available(
         &self,
         _: &std::sync::Arc<crate::topology::Membership>,
-        _: &racer_control_wire::NodeId,
+        _: &racer_wire::control::NodeId,
     ) -> bool {
         false
     }
@@ -276,8 +276,8 @@ impl NoPeers {
 pub mod cluster {
     use crate::config::Config;
     use crate::config::Limits;
-    use racer_control_wire::ClusterId;
-    use racer_control_wire::NodeId;
+    use racer_wire::control::ClusterId;
+    use racer_wire::control::NodeId;
     use std::num::NonZeroU32;
     use std::num::NonZeroUsize;
     use std::time::Duration;
@@ -499,7 +499,7 @@ pub(crate) struct ReadWorker {
     crypto: Rc<CryptoClient>,
     writer: Rc<StoreWriter>,
     memory: Rc<MemoryCache>,
-    cache: racer_control_wire::CacheId,
+    cache: racer_wire::control::CacheId,
     admission: Rc<flow_control::Quotas<AdmissionPolicy>>,
     clock: Rc<SegmentClock>,
     reactor: Rc<Reactor>,
@@ -551,11 +551,11 @@ impl ReadWorker {
             .apply(
                 Publication {
                     pools: Vec::new(),
-                    schema_version: racer_control_wire::SCHEMA_VERSION,
+                    schema_version: racer_wire::control::SCHEMA_VERSION,
                     cluster: keys.cluster().clone(),
                     sequence: PublicationSequence(1),
                     membership_version: MembershipVersion(1),
-                    members: vec![racer_control_wire::Member {
+                    members: vec![racer_wire::control::Member {
                         node: keys.node().clone(),
                         shares: NonZeroU32::new(1).unwrap(),
                         peer_endpoint: "127.0.0.1:1".into(),
@@ -824,20 +824,20 @@ pub(crate) mod security {
     use crate::peer::protocol;
     use crate::peer::protocol::Signatures;
     use crate::peer::protocol::SignedHead;
-    use racer_control_wire::BundleGeneration;
-    use racer_control_wire::CacheEncryptionKey;
-    use racer_control_wire::CacheId;
-    use racer_control_wire::CacheKeyPurpose;
-    use racer_control_wire::CacheKeyRef;
-    use racer_control_wire::CacheKeyState;
-    use racer_control_wire::ClusterId;
-    use racer_control_wire::KeyringBundle;
-    use racer_control_wire::NodeId;
     use racer_crypto::identity::Certificates;
     use racer_crypto::identity::KeyEpochs;
     use racer_crypto::identity::KeyLease;
     use racer_crypto::identity::Keyring;
     use racer_crypto::identity::PendingIdentity;
+    use racer_wire::control::BundleGeneration;
+    use racer_wire::control::CacheEncryptionKey;
+    use racer_wire::control::CacheId;
+    use racer_wire::control::CacheKeyPurpose;
+    use racer_wire::control::CacheKeyRef;
+    use racer_wire::control::CacheKeyState;
+    use racer_wire::control::ClusterId;
+    use racer_wire::control::KeyringBundle;
+    use racer_wire::control::NodeId;
     use std::rc::Rc;
     use std::sync::Arc;
 
@@ -913,7 +913,7 @@ pub(crate) mod security {
     }
     pub(crate) fn rotation_bundle(generation: u64, roots: Vec<Vec<u8>>) -> KeyringBundle {
         KeyringBundle {
-            schema_version: racer_control_wire::KEYRING_SCHEMA_VERSION,
+            schema_version: racer_wire::control::KEYRING_SCHEMA_VERSION,
             cluster: ClusterId(CLUSTER.into()),
             generation: BundleGeneration(generation),
             peer_trust_roots: roots,
@@ -1009,7 +1009,7 @@ pub(crate) mod security {
                     ))),
                 ));
                 keys.install(KeyringBundle {
-                    schema_version: racer_control_wire::KEYRING_SCHEMA_VERSION,
+                    schema_version: racer_wire::control::KEYRING_SCHEMA_VERSION,
                     cluster: cluster.clone(),
                     generation: BundleGeneration(1),
                     peer_trust_roots: roots.clone(),

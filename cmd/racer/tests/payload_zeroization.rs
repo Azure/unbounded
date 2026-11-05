@@ -17,8 +17,8 @@ use racer::model::PageEnvelope;
 use racer::model::PageId;
 use racer::model::PageNumber;
 use racer::model::StrongEtag;
-use racer_control_wire::CacheId;
-use racer_control_wire::KeyId;
+use racer_wire::control::CacheId;
+use racer_wire::control::KeyId;
 use std::alloc::GlobalAlloc;
 use std::alloc::Layout;
 use std::alloc::System;
@@ -159,12 +159,12 @@ fn failed_crypto_output_is_scrubbed(config: &Config) {
     use racer::security::PageCryptoEngine;
     use racer::security::page_aad;
     use racer::security::pair;
-    use racer_control_wire::ClusterId;
-    use racer_control_wire::NodeId;
     use racer_crypto::identity::KeyEpochs;
     use racer_crypto::identity::KeyPurpose;
     use racer_crypto::identity::Keyring;
     use racer_crypto::{TAG_LEN, seal};
+    use racer_wire::control::ClusterId;
+    use racer_wire::control::NodeId;
     use std::sync::Arc;
     use std::task::Context;
     use std::task::Poll;
@@ -178,9 +178,9 @@ fn failed_crypto_output_is_scrubbed(config: &Config) {
             &racer_io::Clock::host(),
         ))),
     );
-    let mut bundle = racer_control_wire::decode_bundle(include_bytes!(concat!(
+    let mut bundle = racer_wire::control::decode_bundle(include_bytes!(concat!(
         env!("CARGO_MANIFEST_DIR"),
-        "/control-wire/testdata/bundle.json"
+        "/wire/testdata/bundle.json"
     )))
     .unwrap();
     bundle.cache_keys = std::mem::take(&mut bundle.cache_keys)
@@ -188,7 +188,7 @@ fn failed_crypto_output_is_scrubbed(config: &Config) {
         .enumerate()
         .map(|(i, key)| {
             let (key, state, _) = key.into_installation();
-            racer_control_wire::CacheEncryptionKey::new(
+            racer_wire::control::CacheEncryptionKey::new(
                 key,
                 state,
                 zeroize::Zeroizing::new([i as u8 + 7; 32]),

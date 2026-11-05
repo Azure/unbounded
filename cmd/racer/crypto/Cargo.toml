@@ -14,7 +14,7 @@ test-util = []
 base64 = "0.22"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-racer-control-wire = { path = "../control-wire" }
+racer-wire = { path = "../wire" }
 getrandom = "0.2"
 rcgen = { version = "0.13", features = ["pem", "x509-parser"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }

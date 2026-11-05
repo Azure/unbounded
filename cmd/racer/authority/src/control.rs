@@ -29,7 +29,7 @@ use std::{
 /// Result of [`Handle::bootstrap`].
 #[derive(Clone, Debug)]
 pub struct Bootstrap {
-    pub cluster: racer_control_wire::ClusterId,
+    pub cluster: racer_wire::control::ClusterId,
     pub block_devices: Option<String>,
 }
 
@@ -335,7 +335,7 @@ impl Authority {
     pub fn report(
         &mut self,
         shares: u32,
-        rdma_nics: Vec<racer_control_wire::RailMapping>,
+        rdma_nics: Vec<racer_wire::control::RailMapping>,
     ) -> Result<(), Error> {
         self.ctl.outer.set_report(shares, rdma_nics)?;
         self.executor.notifier().notify();
@@ -403,7 +403,7 @@ impl Outer {
     fn set_report(
         &self,
         shares: u32,
-        rdma_nics: Vec<racer_control_wire::RailMapping>,
+        rdma_nics: Vec<racer_wire::control::RailMapping>,
     ) -> Result<(), Error> {
         let report = Report {
             shares: NonZeroU32::new(shares).ok_or(Error::InvalidConfiguration)?,
@@ -461,7 +461,7 @@ async fn bootstrap(shared: Rc<Shared>, outer: Arc<Outer>) {
                 .get(&paths::state(&shared.config.namespace))
                 .await?;
             let uid = str_at(&secret, &["metadata", "uid"]).to_owned();
-            if !racer_control_wire::valid_uuid(&uid) {
+            if !racer_wire::control::valid_uuid(&uid) {
                 return Err(Error::InvalidState);
             }
             let initialized = !str_at(
@@ -485,7 +485,7 @@ async fn bootstrap(shared: Rc<Shared>, outer: Arc<Outer>) {
             let block =
                 server::block_devices(&crate::kube::map_at(&node, &["metadata", "annotations"]));
             Ok(Bootstrap {
-                cluster: racer_control_wire::ClusterId(uid),
+                cluster: racer_wire::control::ClusterId(uid),
                 block_devices: block,
             })
         }
@@ -614,7 +614,7 @@ impl Handle {
     pub fn report(
         &self,
         shares: u32,
-        rdma_nics: Vec<racer_control_wire::RailMapping>,
+        rdma_nics: Vec<racer_wire::control::RailMapping>,
     ) -> Result<(), Error> {
         self.outer.set_report(shares, rdma_nics)?;
         self.notifier.notify();

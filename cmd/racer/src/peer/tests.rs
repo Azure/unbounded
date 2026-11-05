@@ -23,12 +23,12 @@ use crate::runtime::RequestScope;
 use crate::security::EncryptedAuthorization;
 use crate::security::PeerOriginContext;
 use crate::topology::RouteBudget;
-use racer_control_wire::CacheId;
-use racer_control_wire::ClusterId;
-use racer_control_wire::KeyId;
 use racer_crypto::identity::Certificates;
 use racer_crypto::identity::Keyring;
 use racer_io::ring::IoBuffer;
+use racer_wire::control::CacheId;
+use racer_wire::control::ClusterId;
+use racer_wire::control::KeyId;
 use std::rc::Rc;
 use std::sync::Arc;
 use std::time::Duration;
@@ -1035,10 +1035,10 @@ mod encrypted_http {
     use crate::security::PageCryptoEngine;
     use crate::telemetry::Event;
     use crate::telemetry::Metrics;
-    use racer_control_wire::CacheEncryptionKey;
-    use racer_control_wire::CacheKeyPurpose;
-    use racer_control_wire::CacheKeyRef;
-    use racer_control_wire::CacheKeyState;
+    use racer_wire::control::CacheEncryptionKey;
+    use racer_wire::control::CacheKeyPurpose;
+    use racer_wire::control::CacheKeyRef;
+    use racer_wire::control::CacheKeyState;
     use std::cell::Cell;
     use std::future::Future;
     use std::net::TcpListener;
@@ -1426,7 +1426,7 @@ mod requester_safety {
     use crate::topology::LinkHealth;
     use crate::topology::Member;
     use crate::topology::Membership;
-    use racer_control_wire::MembershipVersion;
+    use racer_wire::control::MembershipVersion;
     use std::sync::Arc;
     use std::task::Context;
     use std::task::Poll;
@@ -1454,7 +1454,7 @@ mod requester_safety {
                 MembershipVersion(1),
                 (0..1500)
                     .map(|i| Member {
-                        node: racer_control_wire::NodeId(format!(
+                        node: racer_wire::control::NodeId(format!(
                             "{i:08x}-1111-4111-8111-111111111111"
                         )),
                         shares: std::num::NonZeroU32::new(1).unwrap(),
@@ -1767,9 +1767,9 @@ mod subscriptions {
     use crate::topology::Membership;
     use crate::topology::Paths;
     use flow_control::subscriptions::Interval;
-    use racer_control_wire::BundleGeneration;
-    use racer_control_wire::KeyringBundle;
     use racer_core::subscriptions::Demand;
+    use racer_wire::control::BundleGeneration;
+    use racer_wire::control::KeyringBundle;
     use std::cell::Cell;
     use std::task::Context;
     use std::task::Poll;
@@ -2646,10 +2646,10 @@ mod subscriptions {
             key.key.id.0[4..12].copy_from_slice(&2u64.to_be_bytes());
             let (reference, state, mut material) = key.clone().into_installation();
             material[0] ^= 1;
-            *key = racer_control_wire::CacheEncryptionKey::new(reference, state, material);
+            *key = racer_wire::control::CacheEncryptionKey::new(reference, state, material);
         }
         keys.install(KeyringBundle {
-            schema_version: racer_control_wire::KEYRING_SCHEMA_VERSION,
+            schema_version: racer_wire::control::KEYRING_SCHEMA_VERSION,
             cluster: ClusterId(CLUSTER.into()),
             generation: BundleGeneration(2),
             peer_trust_roots: (*keys.peer_trust_roots().unwrap()).clone(),
@@ -2670,7 +2670,7 @@ mod timing {
     use crate::rdma::TransportPlan;
     use crate::telemetry::Event;
     use crate::telemetry::Metrics;
-    use racer_control_wire::RailId;
+    use racer_wire::control::RailId;
 
     fn page_request(admission: &flow_control::Quotas<AdmissionPolicy>, attempt: u8) -> PeerRequest {
         let mut local = request(admission, attempt);
@@ -3690,8 +3690,8 @@ mod explicit_clock {
     use crate::peer::Outcome;
     use crate::telemetry::Metrics;
     use crate::topology::LinkHealth;
-    use racer_control_wire::NodeId;
     use racer_core::route::LinkOutcome;
+    use racer_wire::control::NodeId;
     use std::sync::OnceLock;
     use std::sync::atomic::AtomicU64;
     use std::sync::atomic::Ordering;

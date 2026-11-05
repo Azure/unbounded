@@ -6,7 +6,7 @@ use crate::{
     error::{Error, Operation},
     runtime::RequestScope,
 };
-use racer_control_wire::RailMapping;
+use racer_wire::control::RailMapping;
 use std::{cell::Cell, path::PathBuf, rc::Rc, sync::Arc};
 
 /// Own one journal namespace and fence abandoned writes before reusing its stage name.

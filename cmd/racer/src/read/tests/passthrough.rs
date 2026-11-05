@@ -4,7 +4,7 @@
 
 use super::fill::*;
 use crate::read::flight::AcquisitionBudget;
-use racer_control_wire::CacheMode;
+use racer_wire::control::CacheMode;
 
 const MODES: [CacheMode; 2] = [CacheMode::PassthroughPeers, CacheMode::PassthroughLocal];
 
@@ -161,7 +161,7 @@ fn passthrough_local_route_never_asks_page_owners() {
     let local = f.fill.dependencies.candidates.node.clone();
     let mut members: Vec<_> = (0..8)
         .map(|i| Member {
-            node: racer_control_wire::NodeId(format!("{i:08x}-0000-4000-8000-000000000000")),
+            node: racer_wire::control::NodeId(format!("{i:08x}-0000-4000-8000-000000000000")),
             shares: std::num::NonZeroU32::new(64).unwrap(),
             peer_endpoint: format!("127.0.0.1:{}", 9100 + i),
             rails: vec![],
@@ -176,7 +176,7 @@ fn passthrough_local_route_never_asks_page_owners() {
         site: String::new(),
     });
     f.membership =
-        Arc::new(Membership::validate(racer_control_wire::MembershipVersion(1), members).unwrap());
+        Arc::new(Membership::validate(racer_wire::control::MembershipVersion(1), members).unwrap());
     let ranked =
         Placement::new(16).rank(f.membership.clone(), &f.page.version.object, f.page.number);
     assert!(
@@ -234,9 +234,9 @@ fn local_origin_authority_requires_local_route() {
     // A node outside the membership gets no grant.
     let outsider = Arc::new(
         Membership::validate(
-            racer_control_wire::MembershipVersion(2),
+            racer_wire::control::MembershipVersion(2),
             vec![Member {
-                node: racer_control_wire::NodeId("99999999-9999-4999-8999-999999999999".into()),
+                node: racer_wire::control::NodeId("99999999-9999-4999-8999-999999999999".into()),
                 shares: std::num::NonZeroU32::new(1).unwrap(),
                 peer_endpoint: "127.0.0.1:9000".into(),
                 rails: vec![],

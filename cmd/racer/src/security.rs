@@ -21,12 +21,12 @@ use crate::model::WorkerId;
 use crate::rt::offload;
 use crate::runtime::RequestScope;
 use crate::telemetry::AeadFailure;
-use racer_control_wire::KeyId;
 use racer_crypto::TAG_LEN;
 use racer_crypto::identity::KeyLease;
 use racer_crypto::identity::KeyPurpose;
 use racer_crypto::identity::Keyring;
 use racer_io::ring::IoBuffer;
+use racer_wire::control::KeyId;
 use std::cell::RefCell;
 use std::fmt;
 use std::num::NonZeroUsize;
@@ -1652,8 +1652,8 @@ mod tests {
     use super::*;
     use crate::lifecycle::Service;
     use crate::model::*;
-    use racer_control_wire::CacheId;
-    use racer_control_wire::KeyId;
+    use racer_wire::control::CacheId;
+    use racer_wire::control::KeyId;
 
     /// Publication retries reset only queue timing, not execution or ownership.
     #[test]
@@ -1781,7 +1781,7 @@ mod tests {
     mod credentials {
         use super::*;
         use crate::model::CacheKey;
-        use racer_control_wire::CacheId;
+        use racer_wire::control::CacheId;
 
         #[test]
         fn local_context_is_independently_charged_and_keeps_exact_sensitive_fields() {
@@ -2016,7 +2016,7 @@ mod tests {
         //! request latency.
 
         use crate::security::*;
-        use racer_control_wire::CacheId;
+        use racer_wire::control::CacheId;
 
         #[cfg(test)]
         mod measurement {
@@ -2401,7 +2401,7 @@ mod tests {
                             crate::rt::environment::now() + Duration::from_secs(10),
                         )
                         .unwrap();
-                        let cache = racer_control_wire::CacheId(
+                        let cache = racer_wire::control::CacheId(
                             "00000000-0000-4000-8000-000000000003".into(),
                         );
                         let lease = || {
@@ -2671,7 +2671,7 @@ mod tests {
                 )));
                 let keys = keyring();
                 let cache =
-                    racer_control_wire::CacheId("00000000-0000-4000-8000-000000000003".into());
+                    racer_wire::control::CacheId("00000000-0000-4000-8000-000000000003".into());
                 let lease = || {
                     keys.active(&cache, racer_crypto::identity::KeyPurpose::Page)
                         .unwrap()
@@ -2743,7 +2743,7 @@ mod tests {
                 )));
                 let keys = keyring();
                 let cache =
-                    racer_control_wire::CacheId("00000000-0000-4000-8000-000000000003".into());
+                    racer_wire::control::CacheId("00000000-0000-4000-8000-000000000003".into());
                 let lease = || {
                     keys.active(&cache, racer_crypto::identity::KeyPurpose::Page)
                         .unwrap()
@@ -2846,7 +2846,7 @@ mod tests {
                             content_type: None,
                             version: crate::model::ObjectVersion {
                                 object: crate::model::ObjectId {
-                                    cache: racer_control_wire::CacheId(
+                                    cache: racer_wire::control::CacheId(
                                         "00000000-0000-4000-8000-000000000003".into(),
                                     ),
                                     key: crate::model::CacheKey([3; 32]),
@@ -2859,14 +2859,14 @@ mod tests {
                     .ciphertext;
                     let inner = Arc::get_mut(&mut page.inner).unwrap();
                     inner.envelope.page.version.object.cache =
-                        racer_control_wire::CacheId("00000000-0000-4000-8000-000000000003".into());
+                        racer_wire::control::CacheId("00000000-0000-4000-8000-000000000003".into());
                     if mode == "mismatch" {
                         // Flip a body byte so the stored tag no longer matches.
                         inner.fixture_bytes_mut()[0] ^= 1;
                     }
                     if mode == "missing" {
                         // The fixture keyring installs [1;16], also the bundle's default.
-                        inner.envelope.key_id = racer_control_wire::KeyId([99; 16]);
+                        inner.envelope.key_id = racer_wire::control::KeyId([99; 16]);
                     }
                     let cache = page.envelope().page.version.object.cache.clone();
                     let lease = keys
@@ -2993,7 +2993,7 @@ mod tests {
                 )));
                 let keys = keyring();
                 let cache =
-                    racer_control_wire::CacheId("00000000-0000-4000-8000-000000000003".into());
+                    racer_wire::control::CacheId("00000000-0000-4000-8000-000000000003".into());
                 let lease = || {
                     keys.active(&cache, racer_crypto::identity::KeyPurpose::Page)
                         .unwrap()
@@ -3680,19 +3680,21 @@ mod tests {
             pub(super) fn key() -> KeyLease {
                 keyring()
                     .active(
-                        &racer_control_wire::CacheId("00000000-0000-4000-8000-000000000003".into()),
+                        &racer_wire::control::CacheId(
+                            "00000000-0000-4000-8000-000000000003".into(),
+                        ),
                         racer_crypto::identity::KeyPurpose::Page,
                     )
                     .unwrap()
             }
 
             pub(super) fn keyring() -> racer_crypto::identity::Keyring {
-                use racer_control_wire::CacheId;
-                use racer_control_wire::ClusterId;
-                use racer_control_wire::NodeId;
-                use racer_control_wire::*;
                 use racer_crypto::identity::KeyEpochs;
                 use racer_crypto::identity::Keyring;
+                use racer_wire::control::CacheId;
+                use racer_wire::control::ClusterId;
+                use racer_wire::control::NodeId;
+                use racer_wire::control::*;
                 let ca_key = rcgen::KeyPair::generate_for(&rcgen::PKCS_ED25519).unwrap();
                 let mut params = rcgen::CertificateParams::default();
                 params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
@@ -3706,7 +3708,7 @@ mod tests {
                 );
                 let cache = CacheId("00000000-0000-4000-8000-000000000003".into());
                 keys.install(KeyringBundle {
-                    schema_version: racer_control_wire::KEYRING_SCHEMA_VERSION,
+                    schema_version: racer_wire::control::KEYRING_SCHEMA_VERSION,
                     cluster: ClusterId("00000000-0000-4000-8000-000000000001".into()),
                     generation: BundleGeneration(1),
                     peer_trust_roots: vec![ca.der().to_vec()],

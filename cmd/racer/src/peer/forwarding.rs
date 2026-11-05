@@ -5,7 +5,7 @@
 //! historical originals and hops are cryptographically verified without readmission.
 //!
 //! ```no_run
-//! use racer_control_wire::NodeId;
+//! use racer_wire::control::NodeId;
 //! use racer::{
 //!     error::Result,
 //!     peer::{server::LocalPageService, protocol::PeerRequest},
@@ -57,12 +57,12 @@ use crate::peer::protocol::signed_digest;
 use crate::topology::RouteBudget;
 use http1::MessageHead;
 use http1::StartLine;
-#[cfg(test)]
-use racer_control_wire::CacheId;
-#[cfg(test)]
-use racer_control_wire::MembershipVersion;
-use racer_control_wire::NodeId;
 use racer_crypto::identity::VerifiedPeer;
+#[cfg(test)]
+use racer_wire::control::CacheId;
+#[cfg(test)]
+use racer_wire::control::MembershipVersion;
+use racer_wire::control::NodeId;
 use std::rc::Rc;
 use std::sync::Arc;
 
@@ -1077,7 +1077,7 @@ mod tests {
     use crate::test_support::security::clone_head;
     use crate::test_support::security::network;
     use crate::test_support::security::node;
-    use racer_control_wire::KeyId;
+    use racer_wire::control::KeyId;
     use std::time::Duration;
     use std::time::Instant;
     fn wire_ciphertext(envelope: PageEnvelope, length: usize) -> crate::memory::CiphertextPage {
@@ -1544,7 +1544,7 @@ mod tests {
         #[test]
         fn offloaded_verification_observes_rotation_after_submission() {
             use crate::test_support::security::{ca, identities, mac_test_keys};
-            use racer_control_wire::{BundleGeneration, ClusterId, KeyringBundle};
+            use racer_wire::control::{BundleGeneration, ClusterId, KeyringBundle};
             for retire_roots in [false, true] {
                 let identities = identities(
                     ClusterId(node(99).0),
@@ -1572,7 +1572,7 @@ mod tests {
                 identities[2]
                     .keys
                     .install(KeyringBundle {
-                        schema_version: racer_control_wire::KEYRING_SCHEMA_VERSION,
+                        schema_version: racer_wire::control::KEYRING_SCHEMA_VERSION,
                         cluster: ClusterId(node(99).0),
                         generation: BundleGeneration(2),
                         peer_trust_roots: roots,

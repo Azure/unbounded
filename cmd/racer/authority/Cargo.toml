@@ -7,11 +7,10 @@ publish = false
 description = "Racer control plane embedded in racer: Lease seats, primary, and control API"
 
 [dependencies]
-racer-control-wire = { path = "../control-wire" }
+racer-wire = { path = "../wire" }
 racer-core = { path = "../core" }
 racer-io = { path = "../io" }
 regex = "1"
-wire-codec = { path = "../wire-codec" }
 base64 = "0.22"
 futures = "0.3"
 getrandom = "0.2"

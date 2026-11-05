@@ -3103,7 +3103,7 @@ mod tests {
             content_type: None,
             version: ObjectVersion {
                 object: ObjectId {
-                    cache: racer_control_wire::CacheId(
+                    cache: racer_wire::control::CacheId(
                         "00000000-0000-4000-8000-000000000001".into(),
                     ),
                     key: CacheKey([0; 32]),

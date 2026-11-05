@@ -201,15 +201,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2459377285ad874054d797f3ccebf984978aa39129f6eafde5cdc8315b612f8"
 
 [[package]]
-name = "controlplane"
-version = "0.1.0"
-dependencies = [
- "futures",
- "racer-io",
- "wire-codec",
-]
-
-[[package]]
 name = "cpubits"
 version = "0.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -534,9 +525,9 @@ version = "0.1.0"
 dependencies = [
  "flow-control",
  "futures",
- "httparse",
  "libc",
  "racer-io",
+ "racer-wire",
  "rustls",
  "zeroize",
 ]
@@ -710,10 +701,9 @@ version = "0.1.0"
 dependencies = [
  "base64",
  "http1",
- "racer-control-wire",
- "racer-core",
  "racer-crypto",
  "racer-io",
+ "racer-wire",
  "sha2",
 ]
 
@@ -824,7 +814,6 @@ name = "racer"
 version = "0.1.0"
 dependencies = [
  "base64",
- "controlplane",
  "flow-control",
  "futures",
  "getrandom 0.2.17",
@@ -836,21 +825,20 @@ dependencies = [
  "peer-wire",
  "prost",
  "racer-authority",
- "racer-control-wire",
  "racer-core",
  "racer-crypto",
  "racer-gpu",
  "racer-io",
- "racer-object-wire",
+ "racer-wire",
  "rcgen",
  "rdma-verbs",
  "regex",
  "rustls",
+ "rustls-pemfile",
  "serde",
  "serde_json",
  "sha2",
  "topology",
- "wire-codec",
  "x509-parser",
  "zeroize",
 ]
@@ -864,9 +852,9 @@ dependencies = [
  "getrandom 0.2.17",
  "http1",
  "libc",
- "racer-control-wire",
  "racer-core",
  "racer-io",
+ "racer-wire",
  "rcgen",
  "regex",
  "rustls",
@@ -874,20 +862,6 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2",
- "wire-codec",
- "x509-parser",
- "zeroize",
-]
-
-[[package]]
-name = "racer-control-wire"
-version = "0.1.0"
-dependencies = [
- "base64",
- "serde",
- "serde_json",
- "sha2",
- "wire-codec",
  "x509-parser",
  "zeroize",
 ]
@@ -896,9 +870,8 @@ dependencies = [
 name = "racer-core"
 version = "0.1.0"
 dependencies = [
- "racer-control-wire",
  "racer-flow-core",
- "racer-object-wire",
+ "racer-wire",
  "sha2",
  "topology",
 ]
@@ -915,7 +888,7 @@ dependencies = [
  "getrandom 0.2.17",
  "ghash",
  "poly1305",
- "racer-control-wire",
+ "racer-wire",
  "rcgen",
  "ring",
  "rustls",
@@ -942,7 +915,7 @@ dependencies = [
  "page-alloc",
  "peer-wire",
  "racer",
- "racer-control-wire",
+ "racer-wire",
 ]
 
 [[package]]
@@ -966,12 +939,16 @@ dependencies = [
 ]
 
 [[package]]
-name = "racer-object-wire"
+name = "racer-wire"
 version = "0.1.0"
 dependencies = [
- "http1",
- "racer-control-wire",
- "wire-codec",
+ "base64",
+ "httparse",
+ "serde",
+ "serde_json",
+ "sha2",
+ "x509-parser",
+ "zeroize",
 ]
 
 [[package]]
@@ -1004,7 +981,6 @@ dependencies = [
  "futures",
  "libc",
  "racer-io",
- "serde_json",
 ]
 
 [[package]]
@@ -1410,19 +1386,6 @@ name = "windows_x86_64_msvc"
 version = "0.52.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "589f6da84c646204747d1270a2a5661ea66ed1cced2631d546fdfb155959f9ec"
-
-[[package]]
-name = "wire-codec"
-version = "0.1.0"
-dependencies = [
- "httparse",
- "libc",
- "racer-io",
- "rustls",
- "rustls-pemfile",
- "sha2",
- "zeroize",
-]
 
 [[package]]
 name = "x509-parser"

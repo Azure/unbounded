@@ -25,8 +25,8 @@ use page_alloc::intern::CacheTable;
 use page_alloc::intern::KeyedState;
 use page_alloc::intern::SlotInterner;
 use page_alloc::pending::PendingWrite;
-use racer_control_wire::CacheId;
-use racer_control_wire::KeyId;
+use racer_wire::control::CacheId;
+use racer_wire::control::KeyId;
 use std::cell::RefCell;
 use std::rc::Rc;
 

@@ -33,8 +33,8 @@ use racer::read::ReadPayload;
 use racer::read::ReadResponse;
 use racer::runtime::Reactor;
 use racer::runtime::RequestScope;
-use racer_control_wire::CacheId;
 use racer_io::ring::IoBuffer;
+use racer_wire::control::CacheId;
 use std::future::Future;
 use std::io::Read;
 use std::io::Write;
@@ -1524,7 +1524,7 @@ fn raw_uds_sequential_requests_do_not_inherit_opaque_context() {
 
 #[test]
 fn cache_names_validate_dns_labels_and_complete_socket_path() {
-    use racer_control_wire::canonical_socket_paths;
+    use racer_wire::control::canonical_socket_paths;
     for name in ["a", "a-b.c9", "0"] {
         assert!(canonical_socket_paths(name).is_ok());
     }

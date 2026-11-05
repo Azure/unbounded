@@ -16,7 +16,7 @@ use crate::model::PageId;
 use crate::model::VersionMetadata;
 use crate::runtime::HashMap;
 use crate::runtime::HashSet;
-use racer_control_wire::CacheId;
+use racer_wire::control::CacheId;
 use std::cell::RefCell;
 use std::rc::Rc;
 use std::sync::Arc;
@@ -221,7 +221,7 @@ impl std::ops::DerefMut for VerifiedBytes {
 #[cfg(test)]
 pub(crate) fn fixture_plaintext(
     admission: &flow_control::Quotas<AdmissionPolicy>,
-    key: Option<&racer_control_wire::CacheId>,
+    key: Option<&racer_wire::control::CacheId>,
     bytes: &[u8],
 ) -> PlaintextBuf {
     let capacity = bytes
@@ -2979,15 +2979,16 @@ pub(crate) mod tests {
                     let admission =
                         Rc::new(flow_control::Quotas::new(AdmissionPolicy::new(limits)));
                     let (low, high) = (id("low"), id("high"));
-                    let definition = |id: &CacheId, priority| racer_control_wire::CacheDefinition {
-                        id: id.clone(),
-                        name: id.0.clone(),
-                        client_socket: "/c".into(),
-                        origin_socket: "/o".into(),
-                        priority,
-                        mode: racer_control_wire::CacheMode::Cached,
-                        origin: None,
-                    };
+                    let definition =
+                        |id: &CacheId, priority| racer_wire::control::CacheDefinition {
+                            id: id.clone(),
+                            name: id.0.clone(),
+                            client_socket: "/c".into(),
+                            origin_socket: "/o".into(),
+                            priority,
+                            mode: racer_wire::control::CacheMode::Cached,
+                            origin: None,
+                        };
                     let weigh = |low_priority, high_priority| {
                         admission.policy().weights().update(&[
                             definition(&low, low_priority),
@@ -4081,7 +4082,7 @@ pub(crate) mod tests {
                 BufferPool::new(admission.clone()),
                 for_caches(keys.clone(), caches.clone()),
             );
-            use racer_control_wire::{CacheEncryptionKey, CacheKeyPurpose, CacheKeyState};
+            use racer_wire::control::{CacheEncryptionKey, CacheKeyPurpose, CacheKeyState};
             // The authority default: the active page key plus RETAINED - 1
             // decrypt keys stay readable. Pages of a key stay readable for
             // RETAINED - 1 rotations and become unreadable after the next.
@@ -4096,8 +4097,9 @@ pub(crate) mod tests {
                         key.key.cache = CacheId(format!("{cache:08x}-0000-4000-8000-000000000000"));
                         let (reference, state, mut material) = key.clone().into_installation();
                         material[8..16].copy_from_slice(&cache.to_be_bytes());
-                        key =
-                            racer_control_wire::CacheEncryptionKey::new(reference, state, material);
+                        key = racer_wire::control::CacheEncryptionKey::new(
+                            reference, state, material,
+                        );
                         next.cache_keys.push(key);
                     }
                 }

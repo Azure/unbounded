@@ -770,7 +770,7 @@ impl Flights {
     pub(super) fn admit_local(
         &self,
         page: &PageId,
-        key: Option<racer_control_wire::KeyId>,
+        key: Option<racer_wire::control::KeyId>,
     ) -> Result<()> {
         let cache = &page.version.object.cache;
         if !self.availability.cache(cache) {
@@ -1813,7 +1813,7 @@ mod admission_wake_tests {
             crate::model::VersionMetadata {
                 version: crate::model::ObjectVersion {
                     object: crate::model::ObjectId {
-                        cache: racer_control_wire::CacheId(
+                        cache: racer_wire::control::CacheId(
                             crate::test_support::security::CACHE.into(),
                         ),
                         key: crate::model::CacheKey([0; 32]),

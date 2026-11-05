@@ -1,7 +1,7 @@
 //! Signed control-phase chains; native transport state and policy remain outside.
 
 use crate::*;
-use racer_control_wire::RailId;
+use racer_wire::control::RailId;
 
 /// Exact signed correlation fields shared by every phase of a payload exchange.
 #[derive(Clone, Debug, PartialEq, Eq)]

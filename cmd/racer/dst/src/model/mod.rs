@@ -25,7 +25,6 @@ use std::{
     time::{Duration, Instant},
 };
 
-use racer_control_wire::{CacheId, NodeId};
 pub use racer_core::connections::Config as ConnectionConfig;
 use racer_core::{
     connections::{Acquire, ConnId, Connections},
@@ -60,7 +59,8 @@ use racer_core::{
         decide_hop, relay_failure, search_budget, unverified_failure,
     },
 };
-use racer_object_wire::model::{CacheKey, ObjectId, PageNumber};
+use racer_wire::control::{CacheId, NodeId};
+use racer_wire::object::model::{CacheKey, ObjectId, PageNumber};
 use serde_json::Value;
 use topology::{Exhaustive, PathQuery, Paths, Placement, REPLICAS};
 

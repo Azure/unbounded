@@ -1,8 +1,8 @@
 //! Acquisition credits: deadline, attempts, and route links.
 
 use crate::read::{Error, Result};
-use racer_control_wire::NodeId;
-use racer_object_wire::model::{ObjectId, PageNumber};
+use racer_wire::control::NodeId;
+use racer_wire::object::model::{ObjectId, PageNumber};
 use std::time::Instant;
 
 /// Original acquisition budget, owned by one metadata/bootstrap operation or page acquisition.
@@ -615,8 +615,8 @@ pub fn fanout_helper(
 #[cfg(test)]
 mod fanout_tests {
     use super::*;
-    use racer_control_wire::CacheId;
-    use racer_object_wire::model::CacheKey;
+    use racer_wire::control::CacheId;
+    use racer_wire::object::model::CacheKey;
 
     fn object() -> ObjectId {
         ObjectId {

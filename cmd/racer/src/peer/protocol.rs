@@ -33,13 +33,13 @@ use base64::engine::general_purpose::STANDARD;
 use http1::Header;
 use http1::MessageHead;
 use http1::StartLine;
-use racer_control_wire::CacheId;
-use racer_control_wire::KeyId;
-use racer_control_wire::MembershipVersion;
-use racer_control_wire::NodeId;
 use racer_crypto::identity::Certificates;
 use racer_crypto::identity::Keyring;
 use racer_crypto::identity::VerifiedPeer;
+use racer_wire::control::CacheId;
+use racer_wire::control::KeyId;
+use racer_wire::control::MembershipVersion;
+use racer_wire::control::NodeId;
 use std::rc::Rc;
 #[cfg(test)]
 use std::sync::Arc;
@@ -429,7 +429,11 @@ pub fn decode_nodes(value: &[u8]) -> Result<Vec<NodeId>> {
 fn object_fields(head: &mut MessageHead, object: &ObjectId) -> Result<()> {
     uuid(&object.cache.0)?;
     push(head, "racer-cache", &object.cache.0);
-    push(head, "racer-key", wire_codec::encode_hex(&object.key.0));
+    push(
+        head,
+        "racer-key",
+        racer_wire::codec::encode_hex(&object.key.0),
+    );
     Ok(())
 }
 fn version_fields(head: &mut MessageHead, version: &ObjectVersion) -> Result<()> {
@@ -988,7 +992,8 @@ fn object(head: &MessageHead) -> Result<ObjectId> {
         return Err(Error::InvalidRequest);
     }
     let key = field(head, "racer-key")?;
-    let decoded = wire_codec::decode_hex(key.as_bytes()).map_err(|_| Error::InvalidRequest)?;
+    let decoded =
+        racer_wire::codec::decode_hex(key.as_bytes()).map_err(|_| Error::InvalidRequest)?;
     Ok(ObjectId {
         cache: CacheId(cache),
         key: CacheKey(decoded),
@@ -2713,7 +2718,7 @@ pub(crate) mod tests {
         }
         #[test]
         fn request_mac_rotates_and_rejects_missing_retired_or_mutated_tags() {
-            use racer_control_wire::*;
+            use racer_wire::control::*;
             let network = network(2);
             let make = || {
                 let mut request = head(1);
@@ -2749,12 +2754,12 @@ pub(crate) mod tests {
                     key.key.id.0[4..12].copy_from_slice(&2u64.to_be_bytes());
                     let (reference, state, mut material) = key.clone().into_installation();
                     material[0] ^= 1;
-                    *key = racer_control_wire::CacheEncryptionKey::new(reference, state, material);
+                    *key = racer_wire::control::CacheEncryptionKey::new(reference, state, material);
                 }
                 signer
                     .keys
                     .install(KeyringBundle {
-                        schema_version: racer_control_wire::KEYRING_SCHEMA_VERSION,
+                        schema_version: racer_wire::control::KEYRING_SCHEMA_VERSION,
                         cluster: signer.keys.cluster().clone(),
                         generation: BundleGeneration(2),
                         peer_trust_roots: (*signer.keys.peer_trust_roots().unwrap()).clone(),

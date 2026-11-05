@@ -21,7 +21,7 @@ fn spill_reader(
     f.reactor.init().unwrap();
     let membership = Arc::new(
         Membership::validate(
-            racer_control_wire::MembershipVersion(1),
+            racer_wire::control::MembershipVersion(1),
             vec![Member {
                 node: node(0),
                 shares: NonZeroU32::new(1).unwrap(),

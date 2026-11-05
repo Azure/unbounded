@@ -440,7 +440,7 @@ impl PeerServer {
     fn shed_hot_page(
         &self,
         page: &crate::model::PageId,
-        requester: &racer_control_wire::NodeId,
+        requester: &racer_wire::control::NodeId,
         membership: &std::sync::Arc<crate::topology::Membership>,
     ) -> bool {
         if !self.serve.borrow().hot(page) {

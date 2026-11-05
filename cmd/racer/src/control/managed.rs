@@ -8,7 +8,7 @@
 use super::Managed;
 use crate::config::Config;
 use crate::error::{Error, Result};
-use racer_control_wire::ClusterId;
+use racer_wire::control::ClusterId;
 use std::io::{Read, Write};
 use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
@@ -26,10 +26,10 @@ pub trait ClusterControl: Send + Sync + 'static {
     fn bootstrap(&self, timeout: Duration) -> std::result::Result<Bootstrapped, BootstrapError>;
 
     /// Shared, discovery-refreshed elected endpoint set.
-    fn endpoints(&self) -> wire_codec::DiscoveredEndpoints;
+    fn endpoints(&self) -> crate::control::rest::DiscoveredEndpoints;
 
     /// Enqueue a Pod report of shares and rails; must not block the caller.
-    fn report(&self, shares: u32, rails: Vec<racer_control_wire::RailMapping>);
+    fn report(&self, shares: u32, rails: Vec<racer_wire::control::RailMapping>);
 }
 
 /// Cluster state returned once cluster control has initialized or joined it.
@@ -228,7 +228,7 @@ fn read_sentinel(path: &Path) -> Result<Option<String>> {
         .read_to_string(&mut text)
         .map_err(|_| Error::CorruptRecord)?;
     let recorded = text.trim_end_matches('\n');
-    if !racer_control_wire::valid_uuid(recorded) {
+    if !racer_wire::control::valid_uuid(recorded) {
         return Err(Error::CorruptRecord);
     }
     Ok(Some(recorded.to_owned()))
@@ -422,7 +422,7 @@ mod tests {
 
         reports: std::sync::Mutex<Vec<(u32, usize)>>,
 
-        endpoints: wire_codec::DiscoveredEndpoints,
+        endpoints: crate::control::rest::DiscoveredEndpoints,
     }
 
     impl Scripted {
@@ -440,11 +440,11 @@ mod tests {
             self.results.lock().unwrap().remove(0)
         }
 
-        fn endpoints(&self) -> wire_codec::DiscoveredEndpoints {
+        fn endpoints(&self) -> crate::control::rest::DiscoveredEndpoints {
             self.endpoints.clone()
         }
 
-        fn report(&self, shares: u32, rails: Vec<racer_control_wire::RailMapping>) {
+        fn report(&self, shares: u32, rails: Vec<racer_wire::control::RailMapping>) {
             self.reports.lock().unwrap().push((shares, rails.len()));
         }
     }

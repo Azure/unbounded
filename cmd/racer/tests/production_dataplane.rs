@@ -46,12 +46,12 @@ use racer::security;
 use racer::security::CryptoClient;
 use racer::security::{Authorization, OpaqueMetadata, OriginContext};
 use racer::worker::CryptoRuntime;
-use racer_control_wire as wire;
-use racer_control_wire::CacheDefinition;
-use racer_control_wire::Publication;
-use racer_control_wire::PublicationSequence;
-use racer_control_wire::canonical_socket_paths;
-use racer_control_wire::{CacheId, ClusterId, MembershipVersion, NodeId};
+use racer_wire::control as wire;
+use racer_wire::control::CacheDefinition;
+use racer_wire::control::Publication;
+use racer_wire::control::PublicationSequence;
+use racer_wire::control::canonical_socket_paths;
+use racer_wire::control::{CacheId, ClusterId, MembershipVersion, NodeId};
 
 use racer::peer::forwarding::Forwarding;
 use racer::peer::protocol::Signatures;
@@ -528,9 +528,10 @@ impl Rig {
             reactor.ctx().clock.clone(),
         ));
         let document = Arc::new(fixture_publication());
-        let snapshot =
-            controlplane::Target::prepare(snapshots.as_ref(), document.clone()).unwrap()().unwrap();
-        controlplane::Target::install(snapshots.as_ref(), &document, &snapshot).unwrap();
+        let snapshot = racer::control::plane::Target::prepare(snapshots.as_ref(), document.clone())
+            .unwrap()()
+        .unwrap();
+        racer::control::plane::Target::install(snapshots.as_ref(), &document, &snapshot).unwrap();
         let network = Rc::new(
             PeerNetwork::new(
                 NodeId(NODE.into()),
@@ -886,11 +887,11 @@ fn fixture_publication() -> Publication {
     let (client_socket, origin_socket) = canonical_socket_paths("production-fixture").unwrap();
     Publication {
         pools: Vec::new(),
-        schema_version: racer_control_wire::SCHEMA_VERSION,
+        schema_version: racer_wire::control::SCHEMA_VERSION,
         cluster: ClusterId(CLUSTER.into()),
         sequence: PublicationSequence(1),
         membership_version: MembershipVersion(1),
-        members: vec![racer_control_wire::Member {
+        members: vec![racer_wire::control::Member {
             node: NodeId(NODE.into()),
             shares: NonZeroU32::new(4).unwrap(),
             peer_endpoint: "127.0.0.1:8000".into(),
@@ -902,8 +903,8 @@ fn fixture_publication() -> Publication {
             name: "production-fixture".into(),
             client_socket,
             origin_socket,
-            priority: racer_control_wire::DEFAULT_PRIORITY,
-            mode: racer_control_wire::CacheMode::Cached,
+            priority: racer_wire::control::DEFAULT_PRIORITY,
+            mode: racer_wire::control::CacheMode::Cached,
             origin: None,
         }],
     }
@@ -922,7 +923,7 @@ fn fixture_keys() -> (Rc<Keyring>, Rc<Keyring>) {
     // requires distinct material. These are deterministic test-only keys.
     let mut decoded = wire::decode_bundle(include_bytes!(concat!(
         env!("CARGO_MANIFEST_DIR"),
-        "/control-wire/testdata/bundle.json"
+        "/wire/testdata/bundle.json"
     )))
     .unwrap();
     decoded.cache_keys = std::mem::take(&mut decoded.cache_keys)
@@ -930,8 +931,8 @@ fn fixture_keys() -> (Rc<Keyring>, Rc<Keyring>) {
         .enumerate()
         .map(|(i, key)| {
             let (mut key, state, _) = key.into_installation();
-            key.id = racer_control_wire::KeyId::from_generation(1, i as u32 + 1).unwrap();
-            racer_control_wire::CacheEncryptionKey::new(
+            key.id = racer_wire::control::KeyId::from_generation(1, i as u32 + 1).unwrap();
+            racer_wire::control::CacheEncryptionKey::new(
                 key,
                 state,
                 zeroize::Zeroizing::new([i as u8 + 7; 32]),

@@ -34,8 +34,8 @@ use http1::Header;
 use http1::MessageHead;
 #[cfg(test)]
 use http1::StartLine;
-use racer_control_wire::CacheId;
 use racer_io::ring::IoBuffer;
+use racer_wire::control::CacheId;
 use std::collections::BTreeMap;
 use std::rc::Rc;
 use std::sync::Arc;
@@ -53,9 +53,9 @@ use direct::DirectPage;
 use direct::DirectSink;
 use direct::GpuService;
 
-use racer_object_wire::client::MAX_HEAD_BYTES;
-pub use racer_object_wire::client::ReadKind;
-use racer_object_wire::client::frame;
+use racer_wire::object::client::MAX_HEAD_BYTES;
+pub use racer_wire::object::client::ReadKind;
+use racer_wire::object::client::frame;
 
 /// A validated client operation and its byte-preserving origin context.
 pub struct ClientRequest {
@@ -67,14 +67,14 @@ pub struct ClientRequest {
 /// Apply the shared wire parser before attaching the socket's authorized cache.
 #[derive(Clone)]
 pub struct RequestParser {
-    wire: racer_object_wire::client::RequestParser,
+    wire: racer_wire::object::client::RequestParser,
 }
 
 impl RequestParser {
     /// Set the raw HTTP head cap used by both framing and semantic validation.
     pub fn new(header_limit: usize) -> Self {
         Self {
-            wire: racer_object_wire::client::RequestParser::new(header_limit),
+            wire: racer_wire::object::client::RequestParser::new(header_limit),
         }
     }
 
@@ -259,7 +259,7 @@ fn subscription_head(
     metadata: &ObjectMetadata,
     range: Option<ResolvedRange>,
 ) -> Result<MessageHead> {
-    racer_object_wire::client::subscription_head(metadata, range).map_err(Into::into)
+    racer_wire::object::client::subscription_head(metadata, range).map_err(Into::into)
 }
 /// Retain a partial release across polls without an unbounded input queue.
 struct Releases {
@@ -697,7 +697,7 @@ impl Responses {
     ) -> Result<ConnectionLease> {
         let delivery = kind.direct().ok_or(Error::Internal)?;
         let destination = kind.destination().ok_or(Error::Internal)?;
-        let head = racer_object_wire::client::direct_head(
+        let head = racer_wire::object::client::direct_head(
             &response.metadata,
             response.payload.range(),
             delivery,
@@ -986,7 +986,7 @@ impl Responses {
                     return Err(Error::InvalidRequest);
                 }
                 let delivery = kind.direct().ok_or(Error::Internal)?;
-                racer_object_wire::client::direct_head(
+                racer_wire::object::client::direct_head(
                     &response.metadata,
                     response.payload.range(),
                     delivery,
@@ -1037,7 +1037,7 @@ impl Responses {
             if !matches!(&response.payload, ReadPayload::Empty) {
                 return Err(Error::BadGateway);
             }
-            let head = racer_object_wire::client::success_head(&response.metadata, None)?;
+            let head = racer_wire::object::client::success_head(&response.metadata, None)?;
             connection = self.io.send_head(connection, head, scope).await?.connection;
             connection.finish_exchange()?;
             if let Some(observation) = observation.as_mut() {
@@ -1094,12 +1094,12 @@ fn error_head(error: Error) -> Result<MessageHead> {
         Error::UnsatisfiableRangeWithLength(length) => Some(length),
         _ => None,
     };
-    racer_object_wire::client::error_head(status, length).map_err(Into::into)
+    racer_wire::object::client::error_head(status, length).map_err(Into::into)
 }
 
 /// Encode metadata-only success headers using the shared wire contract.
 fn success_head(metadata: &ObjectMetadata, range: Option<ResolvedRange>) -> Result<MessageHead> {
-    racer_object_wire::client::success_head(metadata, range).map_err(Into::into)
+    racer_wire::object::client::success_head(metadata, range).map_err(Into::into)
 }
 
 #[cfg(test)]

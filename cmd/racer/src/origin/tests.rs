@@ -12,8 +12,8 @@ use crate::runtime::Reactor;
 use crate::security::Authorization;
 use crate::security::OpaqueMetadata;
 use futures::executor::block_on;
-use racer_control_wire::CacheId;
-use racer_control_wire::ClusterId;
+use racer_wire::control::CacheId;
+use racer_wire::control::ClusterId;
 use std::future::Future;
 use std::io::Read;
 use std::io::Write;
@@ -100,7 +100,7 @@ fn credentials(
     Rc::new(CredentialCrypto::new(
         Rc::new(Keyring::new(
             ClusterId("cluster".into()),
-            racer_control_wire::NodeId("local".into()),
+            racer_wire::control::NodeId("local".into()),
             Arc::new(KeyEpochs::with_clock(crate::enrollment::wall_clock(
                 &racer_io::Clock::host(),
             ))),
@@ -173,9 +173,9 @@ fn published_client() -> (
     std::sync::Arc<crate::control::Snapshot>,
 ) {
     let (mut client, admission, reactor) = client();
-    let publication = racer_control_wire::decode_publication(include_bytes!(concat!(
+    let publication = racer_wire::control::decode_publication(include_bytes!(concat!(
         env!("CARGO_MANIFEST_DIR"),
-        "/control-wire/testdata/publication.json"
+        "/wire/testdata/publication.json"
     )))
     .unwrap();
     client.snapshots = Arc::new(PublicationCell::new(Snapshot::retention(2)));
@@ -487,9 +487,9 @@ fn same_name_new_uid_dials_replacement_without_reusing_old_keepalive() {
     let old_listener = UnixListener::bind(&socket).unwrap();
     old_listener.set_nonblocking(true).unwrap();
     let (mut client, admission, reactor) = self::client();
-    let mut publication = racer_control_wire::decode_publication(include_bytes!(concat!(
+    let mut publication = racer_wire::control::decode_publication(include_bytes!(concat!(
         env!("CARGO_MANIFEST_DIR"),
-        "/control-wire/testdata/publication.json"
+        "/wire/testdata/publication.json"
     )))
     .unwrap();
     publication.sequence.0 = 1;
@@ -546,7 +546,7 @@ fn same_name_new_uid_dials_replacement_without_reusing_old_keepalive() {
     replacement_listener.set_nonblocking(true).unwrap();
     publication.sequence.0 += 2; // The worker can skip the intervening removal.
     publication.caches[0].id = CacheId("55555555-5555-4555-8555-555555555555".into());
-    publication.pools = racer_control_wire::default_pools(&publication.caches);
+    publication.pools = racer_wire::control::default_pools(&publication.caches);
     publication.membership_version.0 += 1;
     let mut new_context = context();
     new_context.object.cache = publication.caches[0].id.clone();
@@ -975,8 +975,8 @@ fn public_operations_reject_wrong_authority_before_io() {
     use crate::topology::Member;
     use crate::topology::Membership;
     use crate::topology::Placement;
-    use racer_control_wire::MembershipVersion;
-    use racer_control_wire::NodeId;
+    use racer_wire::control::MembershipVersion;
+    use racer_wire::control::NodeId;
     let node = NodeId("node".into());
     let membership = Arc::new(
         Membership::validate(

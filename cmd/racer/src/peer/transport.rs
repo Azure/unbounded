@@ -38,13 +38,13 @@ use crate::telemetry::timestamp;
 use http1::Header;
 use http1::MessageHead;
 use http1::StartLine;
-#[cfg(test)]
-use racer_control_wire::CacheId;
-#[cfg(test)]
-use racer_control_wire::MembershipVersion;
-use racer_control_wire::NodeId;
-use racer_control_wire::RailId;
 use racer_io::ring::IoBuffer;
+#[cfg(test)]
+use racer_wire::control::CacheId;
+#[cfg(test)]
+use racer_wire::control::MembershipVersion;
+use racer_wire::control::NodeId;
+use racer_wire::control::RailId;
 use std::rc::Rc;
 use std::sync::Arc;
 use std::time::Duration;
@@ -562,7 +562,7 @@ impl Transfers {
     async fn read_ciphertext(
         &self,
         connection: ConnectionLease,
-        cache: Option<&racer_control_wire::CacheId>,
+        cache: Option<&racer_wire::control::CacheId>,
         length: usize,
         scope: &RequestScope,
     ) -> Result<(ConnectionLease, WireBuffer)> {
@@ -1048,7 +1048,7 @@ unsafe impl IoBuffer for WireBuffer {
     }
 }
 
-type ReclaimCiphertext = dyn Fn(&racer_control_wire::CacheId, usize);
+type ReclaimCiphertext = dyn Fn(&racer_wire::control::CacheId, usize);
 
 /// Generic Io has lost errno and may mean local ENOBUFS/ENOMEM. It is not link
 /// evidence. Only an observed orderly EOF is classified here; connect preserves
@@ -1120,8 +1120,8 @@ pub(crate) fn overflow_hop(
     plan: TransportPlan,
     membership: Option<&crate::topology::Membership>,
     operation: &super::protocol::Operation,
-    local: &racer_control_wire::NodeId,
-    peer: &racer_control_wire::NodeId,
+    local: &racer_wire::control::NodeId,
+    peer: &racer_wire::control::NodeId,
 ) -> bool {
     plan == TransportPlan::Http
         && membership
@@ -1240,7 +1240,7 @@ impl Transfers {
     }
     pub(crate) fn with_reclamation(
         mut self,
-        reclaim: impl Fn(&racer_control_wire::CacheId, usize) + 'static,
+        reclaim: impl Fn(&racer_wire::control::CacheId, usize) + 'static,
     ) -> Self {
         self.reclaim = Some(Rc::new(reclaim));
         self
@@ -1848,7 +1848,7 @@ mod tests {
             racer_io::Clock::host(),
         )
         .unwrap();
-        let node = racer_control_wire::NodeId("peer".into());
+        let node = racer_wire::control::NodeId("peer".into());
         let permit = Some(owner.acquire(&node).unwrap());
         let failed = Rc::new(std::cell::Cell::new(false));
         for error in [
@@ -1888,7 +1888,7 @@ mod tests {
         use crate::peer::protocol as p;
         use crate::peer::protocol::Signatures;
         use crate::runtime::Reactor;
-        use racer_control_wire::KeyId;
+        use racer_wire::control::KeyId;
         use std::os::unix::net::UnixStream;
         use std::rc::Rc;
         use std::sync::Arc;
@@ -1925,8 +1925,8 @@ mod tests {
         ) -> std::sync::Arc<crate::topology::Membership> {
             use crate::topology::Member;
             use crate::topology::Membership;
-            use racer_control_wire::RailId;
-            use racer_control_wire::RailMapping;
+            use racer_wire::control::RailId;
+            use racer_wire::control::RailMapping;
             Arc::new(
                 Membership::validate(
                     MembershipVersion(1),
@@ -2318,7 +2318,7 @@ mod tests {
                             node: signers[i].node().clone(),
                             shares: std::num::NonZeroU32::new(1).unwrap(),
                             peer_endpoint: format!("127.0.0.1:{}", 9000 + i),
-                            rails: vec![racer_control_wire::RailMapping {
+                            rails: vec![racer_wire::control::RailMapping {
                                 rail: RailId(7),
                                 device: "test-provider".into(),
                                 port: 1,

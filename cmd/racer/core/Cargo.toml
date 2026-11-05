@@ -11,10 +11,9 @@ name = "racer_core"
 
 [dependencies]
 topology = { path = "../topology" }
-racer-object-wire = { path = "../object-wire" }
-racer-control-wire = { path = "../control-wire" }
+racer-wire = { path = "../wire" }
 racer-flow-core = { path = "../flow-core" }
 sha2 = "0.10"
 
 [dev-dependencies]
-racer-object-wire = { path = "../object-wire", features = ["test-util"] }
+racer-wire = { path = "../wire", features = ["test-util"] }

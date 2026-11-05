@@ -4,8 +4,8 @@ use crate::config::Limits;
 use crate::model::{CacheKey, ContentType, RequestId};
 use crate::security::OpaqueMetadata;
 use futures::executor::block_on;
-use racer_control_wire::{AzureOriginDefinition, CacheId};
 use racer_io::ring::IoBuffer;
+use racer_wire::control::{AzureOriginDefinition, CacheId};
 use std::cell::{Cell, RefCell};
 use std::collections::VecDeque;
 use std::num::NonZeroUsize;
@@ -827,7 +827,7 @@ mod router {
     use crate::origin::router::OriginRouter;
     use crate::read::candidates::CandidatePolicy;
     use crate::topology::{Member, Membership, Placement};
-    use racer_control_wire::{CacheMode, ClusterId, MembershipVersion, NodeId};
+    use racer_wire::control::{CacheMode, ClusterId, MembershipVersion, NodeId};
 
     /// Counts adapter calls; never performs I/O.
     #[derive(Default)]
@@ -869,9 +869,9 @@ mod router {
 
     /// Publish the shared fixture, with an Azure origin when `native`.
     fn publish(h: &Harness, native: bool) -> CacheId {
-        let mut publication = racer_control_wire::decode_publication(include_bytes!(concat!(
+        let mut publication = racer_wire::control::decode_publication(include_bytes!(concat!(
             env!("CARGO_MANIFEST_DIR"),
-            "/control-wire/testdata/publication.json"
+            "/wire/testdata/publication.json"
         )))
         .unwrap();
         if native {
@@ -952,12 +952,12 @@ mod router {
     fn new_snapshots_prune_worker_state_once() {
         let h = harness();
         let apply = |native: bool, sequence: u64| {
-            let mut publication = racer_control_wire::decode_publication(include_bytes!(concat!(
+            let mut publication = racer_wire::control::decode_publication(include_bytes!(concat!(
                 env!("CARGO_MANIFEST_DIR"),
-                "/control-wire/testdata/publication.json"
+                "/wire/testdata/publication.json"
             )))
             .unwrap();
-            publication.sequence = racer_control_wire::PublicationSequence(sequence);
+            publication.sequence = racer_wire::control::PublicationSequence(sequence);
             if native {
                 publication.caches[0].origin = Some(h.definition.clone());
             }

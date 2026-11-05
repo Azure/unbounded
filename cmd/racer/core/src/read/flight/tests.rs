@@ -5,8 +5,10 @@
 use super::table::Waiter;
 #[cfg(test)]
 use super::*;
-use racer_control_wire::CacheId;
-use racer_object_wire::model::{CacheKey, ObjectId, ObjectVersion, PageId, PageNumber, StrongEtag};
+use racer_wire::control::CacheId;
+use racer_wire::object::model::{
+    CacheKey, ObjectId, ObjectVersion, PageId, PageNumber, StrongEtag,
+};
 use std::cell::Cell;
 use std::collections::hash_map::RandomState;
 use std::rc::Rc;

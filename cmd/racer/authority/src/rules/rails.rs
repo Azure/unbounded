@@ -1,9 +1,9 @@
 //! RDMA NIC JSON and the Pod report annotation.
 //!
-//! The NIC record codec in control-wire is private. These helpers reuse it by
+//! The NIC record codec in `racer_wire::control` is private. These helpers reuse it by
 //! wrapping NICs in a one-member publication, so both sides stay identical.
 
-use racer_control_wire::{self as wire, Member, NodeId, Publication, RailMapping};
+use racer_wire::control::{self as wire, Member, NodeId, Publication, RailMapping};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::num::NonZeroU32;

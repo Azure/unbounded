@@ -135,7 +135,7 @@ pub(crate) fn page_with(
 
 pub(crate) fn envelope(length: u32) -> PageEnvelope {
     use crate::model::*;
-    let cache = racer_control_wire::CacheId("cccccccc-1111-4111-8111-111111111111".into());
+    let cache = racer_wire::control::CacheId("cccccccc-1111-4111-8111-111111111111".into());
     PageEnvelope {
         cipher: PageCipher::Xaes256Gcm,
         page: PageId {
@@ -148,7 +148,7 @@ pub(crate) fn envelope(length: u32) -> PageEnvelope {
             },
             number: PageNumber(0),
         },
-        key_id: racer_control_wire::KeyId([1; 16]),
+        key_id: racer_wire::control::KeyId([1; 16]),
         nonce: Nonce([2; 24]),
         plaintext_length: length - 16,
         ciphertext_length: length,

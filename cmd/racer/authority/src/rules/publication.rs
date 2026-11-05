@@ -6,7 +6,7 @@
 //! rebuilt content differs from the committed hash always takes new counters.
 
 use super::pools::{self, PoolPlan};
-use racer_control_wire::{
+use racer_wire::control::{
     self as wire, CacheDefinition, ClusterId, Member, MembershipVersion, Publication,
     PublicationSequence,
 };

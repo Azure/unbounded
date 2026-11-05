@@ -1389,7 +1389,7 @@ mod tests {
     use crate::model::CacheKey;
     use crate::model::RequestId;
     use crate::model::StrongEtag;
-    use racer_control_wire::CacheId;
+    use racer_wire::control::CacheId;
     use std::time::Duration;
     use std::time::Instant;
     /// A page owned by `worker` in the two-worker test map.
@@ -1613,7 +1613,7 @@ mod tests {
         use crate::model::ObjectVersion;
         use crate::model::PageNumber;
         use crate::model::StrongEtag;
-        use racer_control_wire::CacheId;
+        use racer_wire::control::CacheId;
         let map = WorkerMap::new(vec![WorkerId(9), WorkerId(3), WorkerId(1)]).unwrap();
         let ordered = WorkerMap::new(vec![WorkerId(1), WorkerId(3), WorkerId(9)]).unwrap();
         let object = ObjectId {
@@ -2011,7 +2011,7 @@ mod tests {
             number: crate::model::PageNumber(0),
         };
         page.version.object.cache =
-            racer_control_wire::CacheId(crate::test_support::security::CACHE.into());
+            racer_wire::control::CacheId(crate::test_support::security::CACHE.into());
         let context = OriginContext {
             object: page.version.object.clone(),
             metadata: None,
@@ -2022,8 +2022,11 @@ mod tests {
             .seal(&context, AttemptId([3; 16]), &caller)
             .unwrap();
         let membership = Arc::new(
-            crate::topology::Membership::validate(racer_control_wire::MembershipVersion(1), vec![])
-                .unwrap(),
+            crate::topology::Membership::validate(
+                racer_wire::control::MembershipVersion(1),
+                vec![],
+            )
+            .unwrap(),
         );
         let mut waiting = directory
             .submit(

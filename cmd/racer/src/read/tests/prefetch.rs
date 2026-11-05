@@ -4,8 +4,8 @@ use super::fill::*;
 use super::hot_reads::{coordinator, local_membership};
 use crate::prefetch::service::{Response, handle};
 use crate::test_support::security::network;
-use racer_control_wire::CacheMode;
-use racer_object_wire::prefetch::{PrefetchRequest, StatusQuery};
+use racer_wire::control::CacheMode;
+use racer_wire::object::prefetch::{PrefetchRequest, StatusQuery};
 
 fn status_code(response: &Response) -> u16 {
     match response.head.start {
@@ -245,7 +245,7 @@ fn pooled_membership(
     pool: &[usize],
 ) -> std::sync::Arc<crate::topology::Membership> {
     use crate::topology::Member;
-    use racer_control_wire::{MembershipVersion, Pool, PoolId};
+    use racer_wire::control::{MembershipVersion, Pool, PoolId};
     let mut nodes: Vec<_> = signers.iter().map(|s| s.node().clone()).collect();
     nodes.sort();
     let members = nodes

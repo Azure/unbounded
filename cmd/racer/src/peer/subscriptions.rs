@@ -13,8 +13,8 @@ use crate::model::ObjectMetadata;
 use crate::model::ObjectVersion;
 use crate::model::PageId;
 use crate::model::PageNumber;
-use racer_control_wire::MembershipVersion;
-use racer_control_wire::NodeId;
+use racer_wire::control::MembershipVersion;
+use racer_wire::control::NodeId;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::Mutex;
@@ -508,7 +508,7 @@ mod tests {
     use crate::model::ObjectId;
     use crate::model::StrongEtag;
     use flow_control::subscriptions::Interval;
-    use racer_control_wire::CacheId;
+    use racer_wire::control::CacheId;
     use std::rc::Rc;
 
     fn subscription(id: u8, start: u64, end: u64) -> Subscription {
@@ -829,7 +829,7 @@ mod tests {
                 PageEnvelope {
                     cipher: crate::model::PageCipher::Xaes256Gcm,
                     page: page.clone(),
-                    key_id: racer_control_wire::KeyId([1; 16]),
+                    key_id: racer_wire::control::KeyId([1; 16]),
                     nonce: Nonce([2; 24]),
                     plaintext_length: 3,
                     ciphertext_length: 19,
@@ -928,7 +928,7 @@ mod tests {
         let envelope = PageEnvelope {
             cipher: crate::model::PageCipher::Xaes256Gcm,
             page: page.clone(),
-            key_id: racer_control_wire::KeyId([1; 16]),
+            key_id: racer_wire::control::KeyId([1; 16]),
             nonce: Nonce([2; 24]),
             plaintext_length: 3,
             ciphertext_length: 19,

@@ -45,7 +45,7 @@ use crate::rt::environment::Deadline;
 use crate::runtime::RequestScope;
 use crate::security::OriginContext;
 use http1::MessageHead;
-use racer_control_wire::{AzureContainerUrl, AzureCredential, CacheId, OriginDefinition};
+use racer_wire::control::{AzureContainerUrl, AzureCredential, CacheId, OriginDefinition};
 use std::collections::HashMap;
 use std::fmt;
 use std::rc::Rc;

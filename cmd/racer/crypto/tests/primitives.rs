@@ -5,12 +5,12 @@ use racer_crypto::{SigningKey, TAG_LEN, VerifyingKey, ct_eq, hmac_sha256, open, 
 /// The identity module keeps its public types and classified errors beside primitives.
 #[test]
 fn identity_module_public_api_preserves_key_and_error_contracts() {
-    use racer_control_wire::{CacheId, ClusterId, NodeId};
     use racer_crypto::identity::{
         Certificates, Error as IdentityError, KeyEpochs, KeyLease, KeyPurpose, Keyring,
         PendingIdentity, Result as IdentityResult, SigningIdentity, VerifiedPeer, WallClock,
         canonical_uuid,
     };
+    use racer_wire::control::{CacheId, ClusterId, NodeId};
     use std::{rc::Rc, sync::Arc};
 
     let cluster = ClusterId("11111111-1111-4111-8111-111111111111".into());
@@ -510,13 +510,13 @@ fn array<const N: usize>(bytes: &str) -> [u8; N] {
 
 /// Identity workflows exercise the same public boundary used by the dataplane.
 mod identity_workflows {
-    use racer_control_wire::{
-        BundleGeneration, CacheEncryptionKey, CacheId, CacheKeyRef, CacheKeyState, ClusterId,
-        KeyId, KeyringBundle, NodeId,
-    };
     use racer_crypto::identity::{
         Certificates, Error, KeyEpochs, KeyPurpose, Keyring, PendingIdentity, SigningIdentity,
         WallClock,
+    };
+    use racer_wire::control::{
+        BundleGeneration, CacheEncryptionKey, CacheId, CacheKeyRef, CacheKeyState, ClusterId,
+        KeyId, KeyringBundle, NodeId,
     };
     use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
     use std::{
@@ -1176,7 +1176,7 @@ mod identity_workflows {
     /// Construct fresh generation-bound keys with distinct purpose-specific material.
     fn bundle(generation: u64, roots: Vec<Vec<u8>>) -> KeyringBundle {
         KeyringBundle {
-            schema_version: racer_control_wire::KEYRING_SCHEMA_VERSION,
+            schema_version: racer_wire::control::KEYRING_SCHEMA_VERSION,
             cluster: ClusterId(CLUSTER.into()),
             generation: BundleGeneration(generation),
             peer_trust_roots: roots,

@@ -326,7 +326,7 @@ impl racer_io::Scope for RequestScope {
         )
     }
 }
-impl wire_codec::rest::Scope for RequestScope {
+impl crate::control::rest::Scope for RequestScope {
     fn deadline(&self) -> Option<Instant> {
         self.deadline_at()
     }
@@ -492,8 +492,8 @@ mod tests {
             use std::time::Duration;
             #[test]
             fn untimed_scope_ends_only_by_cancellation_and_narrows_to_bounded() {
+                use crate::control::rest::Scope;
                 use racer_io::Scope as _;
-                use wire_codec::rest::Scope;
                 let clock = racer_io::ctx::VirtualClock::new();
                 let scope =
                     RequestScope::untimed(RequestId([2; 16]), clock.clone().into()).unwrap();
@@ -520,7 +520,7 @@ mod tests {
 
             #[test]
             fn rest_narrowing_preserves_policy_cancellation_and_parent_deadline() {
-                use wire_codec::rest::Scope;
+                use crate::control::rest::Scope;
                 let clock = crate::rt::environment::SimulationClock::new(102);
                 let sim_env = clock.environment(0);
                 let _env = sim_env.enter();
@@ -922,7 +922,7 @@ mod tests {
                     pool.plaintext(
                         admission
                             .reserve(
-                                Some(&racer_control_wire::CacheId("provenance".into())),
+                                Some(&racer_wire::control::CacheId("provenance".into())),
                                 ResourceClass::Plaintext,
                                 3,
                             )
@@ -1487,7 +1487,7 @@ mod tests {
                             content_type: None,
                             version: ObjectVersion {
                                 object: ObjectId {
-                                    cache: racer_control_wire::CacheId("cache".into()),
+                                    cache: racer_wire::control::CacheId("cache".into()),
                                     key: CacheKey([0; 32]),
                                 },
                                 etag: StrongEtag::test_value("v1"),

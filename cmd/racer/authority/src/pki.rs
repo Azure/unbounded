@@ -6,7 +6,7 @@
 //! `spiffe://<cluster>/node/<node uid>`, issued for the CSR key and chained to
 //! the seat root. Issuer private keys live only in memory.
 
-use racer_control_wire as wire;
+use racer_wire::control as wire;
 use rcgen::{
     BasicConstraints, CertificateParams, DnType, ExtendedKeyUsagePurpose, IsCa, KeyPair,
     KeyUsagePurpose, SanType, SerialNumber, SubjectPublicKeyInfo,

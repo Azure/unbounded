@@ -30,10 +30,10 @@ use page_alloc::SegmentId;
 use page_alloc::SegmentSnapshot;
 use page_alloc::SegmentState;
 use page_alloc::Segments;
-use racer_control_wire::CacheId;
-use racer_control_wire::ClusterId;
-use racer_control_wire::KeyId;
 use racer_io::exec::yield_now;
+use racer_wire::control::CacheId;
+use racer_wire::control::ClusterId;
+use racer_wire::control::KeyId;
 use sha2::Digest;
 use sha2::Sha256;
 use std::cell::Cell;
@@ -362,8 +362,8 @@ impl Recovery {
     /// has no key ID, so it requires both a current cache UID and an active page key.
     pub fn filter_available(
         image: &mut CheckpointImage,
-        mut metadata_available: impl FnMut(&racer_control_wire::CacheId) -> bool,
-        mut available: impl FnMut(&racer_control_wire::CacheId, KeyId) -> bool,
+        mut metadata_available: impl FnMut(&racer_wire::control::CacheId) -> bool,
+        mut available: impl FnMut(&racer_wire::control::CacheId, KeyId) -> bool,
     ) {
         for shard in &mut image.shards {
             shard
@@ -1162,11 +1162,11 @@ fn validate_image(image: &CheckpointImage) -> Result<()> {
 
 struct Encoder(Vec<u8>);
 impl Encoder {
-    fn writer(&mut self) -> wire_codec::Writer<'_> {
-        wire_codec::Writer::new(
+    fn writer(&mut self) -> racer_wire::codec::Writer<'_> {
+        racer_wire::codec::Writer::new(
             &mut self.0,
             MAX_CHECKPOINT_BYTES - DIGEST_BYTES,
-            wire_codec::Endian::Little,
+            racer_wire::codec::Endian::Little,
         )
     }
     fn bytes(&mut self, bytes: &[u8]) -> Result<()> {

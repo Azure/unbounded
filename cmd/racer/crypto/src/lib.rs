@@ -578,11 +578,11 @@ pub mod identity {
     //! key without consuming additional entropy. Production does not enable it.
     use crate::{SigningKey, VerifyingKey};
     #[cfg(test)]
-    use racer_control_wire::CacheKeyPurpose;
+    use racer_wire::control::CacheKeyPurpose;
 
     /// Check the canonical UUID spelling used by Racer identity bindings.
-    pub use racer_control_wire::valid_uuid as canonical_uuid;
-    use racer_control_wire::{
+    pub use racer_wire::control::valid_uuid as canonical_uuid;
+    use racer_wire::control::{
         BundleGeneration, CacheId, CacheKeyRef, CacheKeyState, ClusterId, KEYRING_SCHEMA_VERSION,
         KeyId, MAX_BUNDLE_KEYS, MAX_RETAINED_PAGE_KEYS, NodeId,
     };
@@ -755,7 +755,7 @@ pub mod identity {
         Replay,
 
         /// Canonical wire validation failed.
-        Wire(racer_control_wire::Error),
+        Wire(racer_wire::control::Error),
 
         /// The keyring rejected the proposed epoch.
         Identity(Error),
@@ -795,7 +795,7 @@ pub mod identity {
         /// Canonicalize unordered records, reject replay, and atomically install keys.
         pub fn install(
             &self,
-            mut bundle: racer_control_wire::KeyringBundle,
+            mut bundle: racer_wire::control::KeyringBundle,
         ) -> std::result::Result<(BundleGeneration, Vec<Vec<u8>>), BundleError> {
             bundle.peer_trust_roots.sort();
             bundle
@@ -832,7 +832,7 @@ pub mod identity {
     }
 
     /// The wire-defined purpose permanently bound to a key epoch.
-    pub use racer_control_wire::CacheKeyPurpose as KeyPurpose;
+    pub use racer_wire::control::CacheKeyPurpose as KeyPurpose;
 
     /// Worker-local verifier caching exact chains against the current trust roots.
     /// ```compile_fail
@@ -867,7 +867,7 @@ pub mod identity {
 
     /// Only successful certificate validation can construct a verified peer.
     /// ```compile_fail
-    /// let peer = racer_crypto::identity::VerifiedPeer { node: racer_control_wire::NodeId("forged".into()) };
+    /// let peer = racer_crypto::identity::VerifiedPeer { node: racer_wire::control::NodeId("forged".into()) };
     /// ```
     pub struct VerifiedPeer {
         node: NodeId,
@@ -907,9 +907,9 @@ pub mod identity {
         cache_keys: Vec<CacheEncryptionKey>,
     }
 
-    impl From<racer_control_wire::KeyringBundle> for KeyringBundle {
+    impl From<racer_wire::control::KeyringBundle> for KeyringBundle {
         /// Move transferred material into private, zeroizing validation staging.
-        fn from(bundle: racer_control_wire::KeyringBundle) -> Self {
+        fn from(bundle: racer_wire::control::KeyringBundle) -> Self {
             Self {
                 schema_version: bundle.schema_version,
                 cluster: bundle.cluster,
@@ -1621,7 +1621,7 @@ pub mod identity {
         /// Validate a wire transfer and atomically publish a complete key epoch.
         pub fn install(
             &self,
-            bundle: racer_control_wire::KeyringBundle,
+            bundle: racer_wire::control::KeyringBundle,
         ) -> Result<BundleGeneration> {
             // Bound private staging before allocating it, including direct callers
             // that do not pass through the wire decoder's byte limit.
@@ -2235,8 +2235,8 @@ pub mod identity {
             let installer = BundleInstaller::new(keys.clone());
             let (old_ca, _) = ca();
             let (new_ca, _) = ca();
-            let old = racer_control_wire::KeyringBundle {
-                schema_version: racer_control_wire::KEYRING_SCHEMA_VERSION,
+            let old = racer_wire::control::KeyringBundle {
+                schema_version: racer_wire::control::KEYRING_SCHEMA_VERSION,
                 cluster,
                 generation: BundleGeneration(2),
                 peer_trust_roots: vec![old_ca.der().to_vec()],
@@ -2281,8 +2281,8 @@ pub mod identity {
             };
             let installer = BundleInstaller::new(keys());
             assert_eq!(installer.generation(), None);
-            let mut bundle = racer_control_wire::KeyringBundle {
-                schema_version: racer_control_wire::KEYRING_SCHEMA_VERSION,
+            let mut bundle = racer_wire::control::KeyringBundle {
+                schema_version: racer_wire::control::KEYRING_SCHEMA_VERSION,
                 cluster,
                 generation: BundleGeneration(2),
                 peer_trust_roots: vec![first.der().to_vec(), second.der().to_vec()],
@@ -2351,8 +2351,8 @@ pub mod identity {
                 NodeId(NODE.into()),
                 Arc::new(KeyEpochs::with_clock(clock.clone())),
             ));
-            let bundle = |generation, roots| racer_control_wire::KeyringBundle {
-                schema_version: racer_control_wire::KEYRING_SCHEMA_VERSION,
+            let bundle = |generation, roots| racer_wire::control::KeyringBundle {
+                schema_version: racer_wire::control::KEYRING_SCHEMA_VERSION,
                 cluster: ClusterId(CLUSTER.into()),
                 generation: BundleGeneration(generation),
                 peer_trust_roots: roots,
@@ -2648,12 +2648,12 @@ pub mod identity {
                 KeyId(*b"RKG1\0\0\0\0\0\0\0\0\0\0\0\0"),
                 KeyId::from_generation(3, 0).unwrap(),
             ] {
-                let bundle = racer_control_wire::KeyringBundle {
-                    schema_version: racer_control_wire::KEYRING_SCHEMA_VERSION,
+                let bundle = racer_wire::control::KeyringBundle {
+                    schema_version: racer_wire::control::KEYRING_SCHEMA_VERSION,
                     cluster: ClusterId(CLUSTER.into()),
                     generation: BundleGeneration(2),
                     peer_trust_roots: roots.clone(),
-                    cache_keys: vec![racer_control_wire::CacheEncryptionKey::new(
+                    cache_keys: vec![racer_wire::control::CacheEncryptionKey::new(
                         CacheKeyRef {
                             cache: CacheId(CACHE.into()),
                             id,
@@ -2671,7 +2671,7 @@ pub mod identity {
         /// Build a default pair with generation-one key IDs and configurable admission.
         fn bundle(generation: u64, roots: Vec<Vec<u8>>, state: CacheKeyState) -> KeyringBundle {
             KeyringBundle {
-                schema_version: racer_control_wire::KEYRING_SCHEMA_VERSION,
+                schema_version: racer_wire::control::KEYRING_SCHEMA_VERSION,
                 cluster: ClusterId(CLUSTER.into()),
                 generation: BundleGeneration(generation),
                 peer_trust_roots: roots,

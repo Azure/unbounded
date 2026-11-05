@@ -19,8 +19,8 @@ use crate::error::{Error, Operation, Result};
 use crate::origin::azure_auth::{self, AuthEndpoints, AuthError, AzureTokenCache};
 use crate::remote::Resolver;
 use crate::runtime::{Reactor, RequestScope};
-use racer_control_wire::AzureCredential;
-use racer_control_wire::OriginDefinition;
+use racer_wire::control::AzureCredential;
+use racer_wire::control::OriginDefinition;
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
@@ -461,7 +461,7 @@ mod tests {
         let tokens = AzureTokens::new(caches.clone(), reactor);
         let origin = |credential: AzureCredential| {
             OriginDefinition::azure(
-                racer_control_wire::AzureContainerUrl::parse(
+                racer_wire::control::AzureContainerUrl::parse(
                     "https://acct.blob.core.windows.net/models",
                 )
                 .unwrap(),

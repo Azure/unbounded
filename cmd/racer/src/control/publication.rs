@@ -2,17 +2,17 @@
 
 use super::cell::{Generation, PublicationCell, Retention};
 use super::{CacheTransition, Snapshot};
+use crate::control::plane::{Codec, Target};
 use crate::error::{Error, Result};
 use crate::topology::{Member, Membership};
-use controlplane::{Codec, Target};
-use racer_control_wire::{self as wire, ClusterId, Publication, PublicationSequence};
+use racer_wire::control::{self as wire, ClusterId, Publication, PublicationSequence};
 use sha2::{Digest, Sha256};
 use std::{cell::RefCell, rc::Rc, sync::Arc, time::Duration};
 
 /// Wire publication codec. The exact document remains available as a delta base.
 /// The REST method surface cannot represent arbitrary string methods:
 /// ```compile_fail
-/// let method = wire_codec::rest::Method::Delete;
+/// let method = crate::control::rest::Method::Delete;
 /// ```
 pub struct PublicationCodec;
 
@@ -145,7 +145,7 @@ impl Target<PublicationCodec> for PublicationTarget {
     fn prepare(
         &self,
         document: Arc<Publication>,
-    ) -> Result<controlplane::feed::Preparation<Self::Prepared, Error>> {
+    ) -> Result<crate::control::plane::feed::Preparation<Self::Prepared, Error>> {
         let cluster = self.cluster.clone();
         let predecessor = self.published.current()?;
         Ok(Box::new(move || {

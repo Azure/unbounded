@@ -10,14 +10,14 @@ use crate::model::*;
 use crate::rt::environment::SimulationClock;
 use crate::rt::reactor::simulation::Fault;
 use crate::rt::reactor::simulation::Simulation;
-use racer_control_wire as wire;
-use racer_control_wire::CacheDefinition;
-use racer_control_wire::CacheId;
-use racer_control_wire::MembershipVersion;
 use racer_crypto::identity::PendingIdentity;
 use racer_crypto::identity::SigningIdentity;
 use racer_io::ring::Descriptor;
 use racer_io::ring::SocketAddress;
+use racer_wire::control as wire;
+use racer_wire::control::CacheDefinition;
+use racer_wire::control::CacheId;
+use racer_wire::control::MembershipVersion;
 use sha2::Digest;
 use sha2::Sha256;
 use std::cell::RefCell;
@@ -2023,14 +2023,15 @@ fn node_id(id: usize) -> NodeId {
 }
 fn cache(id: usize) -> CacheDefinition {
     let name = format!("dst-{id}");
-    let (client_socket, origin_socket) = racer_control_wire::canonical_socket_paths(&name).unwrap();
+    let (client_socket, origin_socket) =
+        racer_wire::control::canonical_socket_paths(&name).unwrap();
     CacheDefinition {
         name,
         id: CacheId("33333333-3333-4333-8333-333333333333".into()),
         client_socket,
         origin_socket,
-        priority: racer_control_wire::DEFAULT_PRIORITY,
-        mode: racer_control_wire::CacheMode::Cached,
+        priority: racer_wire::control::DEFAULT_PRIORITY,
+        mode: racer_wire::control::CacheMode::Cached,
         origin: None,
     }
 }
@@ -2485,8 +2486,8 @@ impl Harness {
                 .unwrap();
         }
         let discovered_nics = if self.native {
-            vec![racer_control_wire::RailMapping {
-                rail: racer_control_wire::RailId(0),
+            vec![racer_wire::control::RailMapping {
+                rail: racer_wire::control::RailId(0),
                 numa_node: None,
                 device,
                 port: 1,
@@ -2635,7 +2636,7 @@ impl Harness {
     }
     fn bundle(&self, config: &Config, _generation: u64) -> wire::KeyringBundle {
         wire::KeyringBundle {
-            schema_version: racer_control_wire::KEYRING_SCHEMA_VERSION,
+            schema_version: racer_wire::control::KEYRING_SCHEMA_VERSION,
             cluster: config.cluster.clone(),
             generation: wire::BundleGeneration(u64::from(self.key_epoch) + 1),
             peer_trust_roots: vec![self.ca.der().to_vec()],
@@ -2852,7 +2853,7 @@ impl Harness {
     /// both ends are ready, waiting out any backoff. If `a` is ready but `b`
     /// is not (`b` restarted under `a`'s link), `b` initiates instead.
     fn connect_links(&mut self, a: usize, b: usize) {
-        let rail = racer_control_wire::RailId(0);
+        let rail = racer_wire::control::RailId(0);
         for _ in 0..64 {
             let (local, peer) = (
                 self.nodes[a].config.node.clone(),
@@ -3731,8 +3732,8 @@ fn member(config: &Config) -> crate::topology::Member {
         shares: std::num::NonZeroU32::new(1).unwrap(),
         peer_endpoint: config.peer_listen.to_string(),
         rails: if config.enable_rdma {
-            vec![racer_control_wire::RailMapping {
-                rail: racer_control_wire::RailId(0),
+            vec![racer_wire::control::RailMapping {
+                rail: racer_wire::control::RailId(0),
                 device: format!(
                     "dst-rnic-{}",
                     usize::from_str_radix(&config.node.0[..8], 16).unwrap()

@@ -37,10 +37,7 @@ fn rejects(source: &str, code: &str, message: &str) {
             library("racer_crypto").display()
         ))
         .arg("--extern")
-        .arg(format!(
-            "racer_control_wire={}",
-            library("racer_control_wire").display()
-        ))
+        .arg(format!("racer_wire={}", library("racer_wire").display()))
         .args(["-o", "/dev/null", "-"])
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -92,7 +89,7 @@ fn certificates_are_not_send() {
 
 #[test]
 fn verified_peer_cannot_be_constructed() {
-    // Infer NodeId from crypto so separately built control-wire rlibs cannot conflict.
+    // Infer NodeId from crypto so separately built racer-wire rlibs cannot conflict.
     rejects(
         "fn forge(identity: &racer_crypto::identity::SigningIdentity) {
             let peer = racer_crypto::identity::VerifiedPeer { node: identity.node().clone() };
@@ -105,7 +102,7 @@ fn verified_peer_cannot_be_constructed() {
 #[test]
 fn cache_encryption_key_is_not_debug() {
     rejects(
-        "fn diagnostic(key: racer_control_wire::CacheEncryptionKey) {
+        "fn diagnostic(key: racer_wire::control::CacheEncryptionKey) {
             println!(\"{key:?}\");
         }",
         "E0277",
@@ -116,7 +113,7 @@ fn cache_encryption_key_is_not_debug() {
 #[test]
 fn cache_encryption_key_material_is_private() {
     rejects(
-        "fn expose(key: racer_control_wire::CacheEncryptionKey) -> [u8; 32] {
+        "fn expose(key: racer_wire::control::CacheEncryptionKey) -> [u8; 32] {
             key.material
         }",
         "E0616",
@@ -127,7 +124,7 @@ fn cache_encryption_key_material_is_private() {
 #[test]
 fn into_installation_consumes_receiver() {
     rejects(
-        "fn transfer_twice(key: racer_control_wire::CacheEncryptionKey) {
+        "fn transfer_twice(key: racer_wire::control::CacheEncryptionKey) {
             let _first = key.into_installation();
             let _second = key.into_installation();
         }",

@@ -86,13 +86,13 @@ use crate::worker::AffinityPlan;
 use crate::worker::CryptoRuntime;
 use crate::worker::WorkerGroup;
 use crate::worker::WorkerRuntime;
-use racer_control_wire::CacheDefinition;
-use racer_control_wire::NodeId;
 use racer_crypto::identity::BundleInstaller;
 use racer_crypto::identity::Certificates;
 use racer_crypto::identity::KeyEpochs;
 use racer_crypto::identity::KeyPurpose;
 use racer_crypto::identity::Keyring;
+use racer_wire::control::CacheDefinition;
+use racer_wire::control::NodeId;
 use std::cell::RefCell;
 use std::num::NonZeroUsize;
 use std::rc::Rc;
@@ -124,7 +124,7 @@ pub struct Application {
 
     limits: Limits,
 
-    discovered_nics: Vec<racer_control_wire::RailMapping>,
+    discovered_nics: Vec<racer_wire::control::RailMapping>,
 
     /// Worker context every lane, helper, and lifecycle scope runs on.
     ctx: racer_io::WorkerCtx,
@@ -604,7 +604,7 @@ fn signal_stop(error: Error, requested: bool) -> bool {
 const MANAGED_ENROLLMENT_ATTEMPT: Duration = Duration::from_secs(60);
 
 /// Bound for one startup control turn (enrollment attempt or publication poll).
-const CONTROL_TURN: Duration = Duration::from_secs(racer_control_wire::POLL_WAIT.as_secs() + 30);
+const CONTROL_TURN: Duration = Duration::from_secs(racer_wire::control::POLL_WAIT.as_secs() + 30);
 
 /// A fresh scope for one control turn, never outliving `startup`.
 ///
@@ -1011,13 +1011,13 @@ pub struct WorkerApplication {
 
     links: Option<Rc<Links>>,
 
-    discovered_nics: Vec<racer_control_wire::RailMapping>,
+    discovered_nics: Vec<racer_wire::control::RailMapping>,
 
-    actual_rails: Vec<racer_control_wire::RailMapping>,
+    actual_rails: Vec<racer_wire::control::RailMapping>,
 
     inventory_generation: u64,
 
-    native_task: Option<Operation<'static, Vec<racer_control_wire::RailMapping>>>,
+    native_task: Option<Operation<'static, Vec<racer_wire::control::RailMapping>>>,
 
     native_retry: std::time::Instant,
 
@@ -1091,11 +1091,11 @@ pub struct WorkerApplication {
 
     stopping: bool,
 
-    snapshot_sequence: Option<racer_control_wire::PublicationSequence>,
+    snapshot_sequence: Option<racer_wire::control::PublicationSequence>,
 
     memory: Rc<MemoryCache>,
 
-    caches: Vec<racer_control_wire::CacheDefinition>,
+    caches: Vec<racer_wire::control::CacheDefinition>,
 
     slab_directory: std::path::PathBuf,
 
@@ -1285,7 +1285,7 @@ impl WorkerApplication {
         node: Arc<NodeState>,
         worker: WorkerId,
         runtime: WorkerRuntime,
-        discovered_nics: Vec<racer_control_wire::RailMapping>,
+        discovered_nics: Vec<racer_wire::control::RailMapping>,
     ) -> Result<Self> {
         let started = runtime.reactor.ctx().now();
         let metrics = node
@@ -1991,7 +1991,7 @@ impl WorkerApplication {
         admission: Rc<flow_control::Quotas<AdmissionPolicy>>,
         memory: Rc<MemoryCache>,
         writer: Rc<StoreWriter>,
-    ) -> impl Fn(&racer_control_wire::CacheId, usize) {
+    ) -> impl Fn(&racer_wire::control::CacheId, usize) {
         move |cache, amount| {
             let class = crate::admission::ResourceClass::Ciphertext;
             for _ in 0..2 {
@@ -2463,7 +2463,7 @@ impl WorkerApplication {
             let control = control.clone();
             let turn = scope(
                 &self.ctx().clock,
-                racer_control_wire::POLL_WAIT + Duration::from_secs(10),
+                racer_wire::control::POLL_WAIT + Duration::from_secs(10),
             )?;
             self.control_scope = Some(turn.clone());
             self.control_task = Some(Box::pin(async move { control.progress(&turn).await }));
@@ -2851,7 +2851,7 @@ impl CachePublication {
         definitions: &[CacheDefinition],
         membership: Option<&crate::topology::Membership>,
     ) -> Result<Box<dyn CacheTransition + '_>> {
-        racer_control_wire::validate_definitions(definitions)?;
+        racer_wire::control::validate_definitions(definitions)?;
         let served: Vec<CacheDefinition> = match (&self.local, membership) {
             (Some(local), Some(membership)) => definitions
                 .iter()
@@ -2903,7 +2903,7 @@ impl CachePublication {
 fn prefetch_keeps(
     snapshot: &crate::control::Snapshot,
     local: &NodeId,
-    cache: &racer_control_wire::CacheId,
+    cache: &racer_wire::control::CacheId,
 ) -> bool {
     snapshot.caches.contains(cache) && snapshot.membership.serves(cache, local)
 }
@@ -2994,7 +2994,8 @@ impl WorkerApplication {
 struct Observations {
     pub health: Health,
 
-    workers: Mutex<HashMap<WorkerId, (Resources, Option<racer_control_wire::PublicationSequence>)>>,
+    workers:
+        Mutex<HashMap<WorkerId, (Resources, Option<racer_wire::control::PublicationSequence>)>>,
 }
 
 impl Observations {
@@ -3016,7 +3017,7 @@ impl Observations {
         worker: WorkerId,
         resources: Resources,
         count: usize,
-        sequence: Option<racer_control_wire::PublicationSequence>,
+        sequence: Option<racer_wire::control::PublicationSequence>,
         now: std::time::Instant,
     ) -> Result<()> {
         let mut workers = self.workers.lock().map_err(|_| Error::Unavailable)?;
@@ -3593,7 +3594,7 @@ mod lifecycle_policy_tests {
         let turn = control_turn(&long, CONTROL_TURN).unwrap();
         let now = racer_io::Clock::host().now();
         assert!(turn.deadline.0 <= now + CONTROL_TURN);
-        assert!(turn.deadline.0 > now + racer_control_wire::POLL_WAIT);
+        assert!(turn.deadline.0 > now + racer_wire::control::POLL_WAIT);
         // Expiry of a turn must not cancel startup.
         let _ = turn.cancel();
         assert_eq!(long.check(), Ok(()));

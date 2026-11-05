@@ -7,7 +7,7 @@
 
 use super::rails;
 use crate::{annotations, kube};
-use racer_control_wire::{self as wire, Member, NodeId, RailMapping};
+use racer_wire::control::{self as wire, Member, NodeId, RailMapping};
 use serde_json::Value;
 use std::{
     collections::{BTreeMap, HashSet},

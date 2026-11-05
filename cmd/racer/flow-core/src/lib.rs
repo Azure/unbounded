@@ -3,8 +3,8 @@
 //!
 //! `racer-core` re-exports this crate as `racer_core::flow`; `flow-control` re-exports it under the
 //! historical paths and adds the IO-bound parts (charged buffers, quotas over `page-alloc`, kernel
-//! pipes). It is a separate crate only because `racer-core -> racer-object-wire -> http1 ->
-//! flow-control` would otherwise form a cycle; it folds into `racer-core` once that edge is gone.
+//! pipes). It was split out because `racer-core -> racer-object-wire -> http1 -> flow-control` formed
+//! a cycle; that edge is gone (core depends on the pure `racer-wire`), so it can fold into `racer-core`.
 //!
 //! Callers pass time in; the crate never reads clocks, spawns threads, or reads OS randomness.
 

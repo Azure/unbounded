@@ -144,15 +144,15 @@ impl TryFrom<Error> for racer_core::read::Error {
     }
 }
 
-impl From<controlplane::Error> for Error {
-    fn from(error: controlplane::Error) -> Self {
+impl From<crate::control::plane::Error> for Error {
+    fn from(error: crate::control::plane::Error) -> Self {
         match error {
-            controlplane::Error::Replay => Self::Replay,
-            controlplane::Error::Conflict => Self::IncompatibleMembership,
-            controlplane::Error::Capacity => Self::Overloaded,
-            controlplane::Error::Stale => Self::StaleFlight,
-            controlplane::Error::Pending => Self::Unavailable,
-            controlplane::Error::Internal => Self::Internal,
+            crate::control::plane::Error::Replay => Self::Replay,
+            crate::control::plane::Error::Conflict => Self::IncompatibleMembership,
+            crate::control::plane::Error::Capacity => Self::Overloaded,
+            crate::control::plane::Error::Stale => Self::StaleFlight,
+            crate::control::plane::Error::Pending => Self::Unavailable,
+            crate::control::plane::Error::Internal => Self::Internal,
         }
     }
 }
@@ -189,9 +189,9 @@ impl From<crate::rt::filesystem::secure::AccessError> for Error {
     }
 }
 
-impl From<racer_object_wire::Error> for Error {
-    fn from(error: racer_object_wire::Error) -> Self {
-        use racer_object_wire::Error as Wire;
+impl From<racer_wire::object::Error> for Error {
+    fn from(error: racer_wire::object::Error) -> Self {
+        use racer_wire::object::Error as Wire;
         match error {
             Wire::InvalidRequest => Self::InvalidRequest,
             Wire::MethodNotAllowed => Self::MethodNotAllowed,
@@ -224,16 +224,16 @@ impl From<flow_control::Error> for Error {
     }
 }
 
-impl From<wire_codec::rest::Error> for Error {
-    fn from(error: wire_codec::rest::Error) -> Self {
+impl From<crate::control::rest::Error> for Error {
+    fn from(error: crate::control::rest::Error) -> Self {
         match error {
-            wire_codec::rest::Error::InvalidConfiguration => Self::InvalidConfiguration,
-            wire_codec::rest::Error::InvalidRequest => Self::InvalidRequest,
-            wire_codec::rest::Error::Unauthorized => Self::Unauthorized,
-            wire_codec::rest::Error::Unavailable => Self::Unavailable,
-            wire_codec::rest::Error::Overloaded => Self::Overloaded,
-            wire_codec::rest::Error::Io => Self::Io,
-            wire_codec::rest::Error::Internal => Self::Internal,
+            crate::control::rest::Error::InvalidConfiguration => Self::InvalidConfiguration,
+            crate::control::rest::Error::InvalidRequest => Self::InvalidRequest,
+            crate::control::rest::Error::Unauthorized => Self::Unauthorized,
+            crate::control::rest::Error::Unavailable => Self::Unavailable,
+            crate::control::rest::Error::Overloaded => Self::Overloaded,
+            crate::control::rest::Error::Io => Self::Io,
+            crate::control::rest::Error::Internal => Self::Internal,
         }
     }
 }
@@ -377,12 +377,15 @@ mod tests {
         use crate::rt::filesystem::secure::AccessError;
         use racer_crypto::identity::BundleError;
         for (source, expected) in [
-            (controlplane::Error::Replay, Error::Replay),
-            (controlplane::Error::Conflict, Error::IncompatibleMembership),
-            (controlplane::Error::Capacity, Error::Overloaded),
-            (controlplane::Error::Stale, Error::StaleFlight),
-            (controlplane::Error::Pending, Error::Unavailable),
-            (controlplane::Error::Internal, Error::Internal),
+            (crate::control::plane::Error::Replay, Error::Replay),
+            (
+                crate::control::plane::Error::Conflict,
+                Error::IncompatibleMembership,
+            ),
+            (crate::control::plane::Error::Capacity, Error::Overloaded),
+            (crate::control::plane::Error::Stale, Error::StaleFlight),
+            (crate::control::plane::Error::Pending, Error::Unavailable),
+            (crate::control::plane::Error::Internal, Error::Internal),
         ] {
             assert_eq!(Error::from(source), expected);
         }
@@ -398,10 +401,10 @@ mod tests {
             assert_eq!(Error::from(source), expected);
         }
         for wire in [
-            racer_control_wire::Error::InvalidRequest,
-            racer_control_wire::Error::IncompatibleMembership,
-            racer_control_wire::Error::Overloaded,
-            racer_control_wire::Error::Replay,
+            racer_wire::control::Error::InvalidRequest,
+            racer_wire::control::Error::IncompatibleMembership,
+            racer_wire::control::Error::Overloaded,
+            racer_wire::control::Error::Replay,
         ] {
             assert_eq!(Error::from(Enrollment::Wire(wire)), Error::from(wire));
             assert_eq!(Error::from(BundleError::Wire(wire)), Error::from(wire));
@@ -423,7 +426,7 @@ mod tests {
     /// Wire failures retain their exact application taxonomy at the adapter boundary.
     #[test]
     fn object_wire_errors_keep_racer_boundary_meanings() {
-        use racer_object_wire::Error as Wire;
+        use racer_wire::object::Error as Wire;
         for (wire, app) in [
             (Wire::InvalidRequest, Error::InvalidRequest),
             (Wire::MethodNotAllowed, Error::MethodNotAllowed),

@@ -139,7 +139,7 @@ impl Coordinator {
         membership: std::sync::Arc<crate::topology::Membership>,
         page: &crate::model::PageId,
         scope: &RequestScope,
-    ) -> Option<Vec<racer_control_wire::NodeId>> {
+    ) -> Option<Vec<racer_wire::control::NodeId>> {
         let mut owners = self
             .fill
             .dependencies
@@ -160,7 +160,7 @@ impl Coordinator {
     fn note_successor(
         &self,
         page: &crate::model::PageId,
-        requester: &racer_control_wire::NodeId,
+        requester: &racer_wire::control::NodeId,
         membership: &crate::topology::Membership,
         copy_only: bool,
     ) {
@@ -198,7 +198,7 @@ impl Coordinator {
     async fn defer_to_successor(
         &self,
         page: &crate::model::PageId,
-        requester: &racer_control_wire::NodeId,
+        requester: &racer_wire::control::NodeId,
         membership: std::sync::Arc<crate::topology::Membership>,
         scope: &RequestScope,
     ) -> bool {
@@ -255,7 +255,7 @@ impl Coordinator {
     async fn copy_join_allowed(
         &self,
         page: &crate::model::PageId,
-        requester: &racer_control_wire::NodeId,
+        requester: &racer_wire::control::NodeId,
         membership: std::sync::Arc<crate::topology::Membership>,
         scope: &RequestScope,
     ) -> bool {
@@ -295,7 +295,7 @@ impl Coordinator {
     fn serve_offer(
         &self,
         page: &crate::model::PageId,
-        requester: &racer_control_wire::NodeId,
+        requester: &racer_wire::control::NodeId,
     ) -> Result<PeerResponse> {
         let holds = self.fill.holds(page);
         let acquiring = self.fill.dependencies.flights.acquiring(page);
@@ -466,7 +466,7 @@ impl Coordinator {
     /// not published or not ready.
     pub(crate) fn cache_membership(
         &self,
-        cache: &racer_control_wire::CacheId,
+        cache: &racer_wire::control::CacheId,
     ) -> Result<std::sync::Arc<crate::topology::Membership>> {
         let snapshot = self.snapshots.current()?.ok_or(Error::Unavailable)?;
         // Only the cache's pool members place, fill and track its pages.
@@ -479,11 +479,11 @@ impl Coordinator {
         Ok(snapshot.membership.clone())
     }
 
-    pub(crate) fn cache_passthrough(&self, cache: &racer_control_wire::CacheId) -> bool {
+    pub(crate) fn cache_passthrough(&self, cache: &racer_wire::control::CacheId) -> bool {
         self.fill.passthrough(cache)
     }
 
-    pub(crate) fn local_node(&self) -> racer_control_wire::NodeId {
+    pub(crate) fn local_node(&self) -> racer_wire::control::NodeId {
         self.fill.dependencies.candidates.node.clone()
     }
 
@@ -494,7 +494,7 @@ impl Coordinator {
         object: &ObjectId,
         page: u64,
         scope: &RequestScope,
-    ) -> Result<Option<racer_control_wire::NodeId>> {
+    ) -> Result<Option<racer_wire::control::NodeId>> {
         Ok(self
             .fill
             .dependencies
@@ -510,7 +510,7 @@ impl Coordinator {
     pub(crate) async fn peer_prefetch(
         &self,
         membership: &std::sync::Arc<crate::topology::Membership>,
-        owner: &racer_control_wire::NodeId,
+        owner: &racer_wire::control::NodeId,
         context: &OriginContext,
         operation: &PeerOperation,
         scope: &RequestScope,

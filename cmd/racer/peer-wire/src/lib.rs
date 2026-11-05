@@ -50,8 +50,8 @@ pub mod test_util {
 
 use base64::{Engine, engine::general_purpose::STANDARD};
 use http1::{Header, MessageHead, StartLine};
-use racer_control_wire::NodeId;
 use racer_crypto::identity::{Certificates, Keyring, VerifiedPeer};
+use racer_wire::control::NodeId;
 use sha2::{Digest, Sha256};
 use std::{
     collections::BTreeSet,
@@ -537,8 +537,8 @@ pub fn signed_digest(head: &SignedHead) -> Result<[u8; 32]> {
 pub const VERSION: &str = "2";
 /// Current exchange target.
 pub const REQUEST_TARGET: &str = "/racer/peer/v1/exchange";
-/// Maximum carried hop count (links on one route), shared with `racer_core::route`.
-pub const MAX_HOPS: usize = racer_core::route::MAX_LINKS as usize;
+/// Maximum carried hop count (links on one route), shared with `racer_wire::route`.
+pub const MAX_HOPS: usize = racer_wire::route::MAX_LINKS as usize;
 /// Maximum retained signed HTTP head (one proof).
 ///
 /// Proofs name their chain by fingerprint, so this bounds only logical fields.
@@ -565,7 +565,7 @@ pub const MAX_BODY: usize = 16 * 1024 * 1024 + 16;
 
 /// Reject noncanonical UUID spelling at the trust boundary.
 pub fn uuid(value: &str) -> Result<()> {
-    if !racer_control_wire::valid_uuid(value) {
+    if !racer_wire::control::valid_uuid(value) {
         return Err(Error::InvalidRequest);
     }
     Ok(())

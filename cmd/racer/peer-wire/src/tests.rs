@@ -1,11 +1,11 @@
 //! Mechanism fixtures and byte/authentication regression tests.
 
 use super::*;
-use racer_control_wire::{BundleGeneration, ClusterId, KeyringBundle};
 use racer_crypto::identity::{
     KeyEpochs,
     test_util::{ca, issue},
 };
+use racer_wire::control::{BundleGeneration, ClusterId, KeyringBundle};
 
 /// Deterministic canonical fixture identity.
 fn wall_clock(ctx: &racer_io::WorkerCtx) -> racer_crypto::identity::WallClock {
@@ -53,7 +53,7 @@ pub(crate) fn network(count: usize, ctx: &racer_io::WorkerCtx) -> Vec<Rc<Signatu
                 Arc::new(KeyEpochs::with_clock(wall_clock(ctx))),
             ));
             keys.install(KeyringBundle {
-                schema_version: racer_control_wire::KEYRING_SCHEMA_VERSION,
+                schema_version: racer_wire::control::KEYRING_SCHEMA_VERSION,
                 cluster: cluster.clone(),
                 generation: BundleGeneration(1),
                 peer_trust_roots: roots.clone(),
@@ -253,7 +253,7 @@ fn signature_base_preserves_obs_text_and_rejects_controls() {
 
 #[test]
 fn object_context_signature_base_vector_and_proof_preserve_opaque_bytes() {
-    use racer_object_wire::{CacheKey, client::RequestParser, origin};
+    use racer_wire::object::{CacheKey, client::RequestParser, origin};
 
     let metadata = b"a,\\b\x80";
     let authorization = b"Bearer \xff";
@@ -509,7 +509,7 @@ fn control_chain_rejects_phase_previous_identity_and_extension_substitution() {
             racer_io::Clock::host().now() + Duration::from_secs(30),
         )
         .unwrap(),
-        rail: racer_control_wire::RailId(1),
+        rail: racer_wire::control::RailId(1),
     };
     let grant = || {
         vec![Header::new(
@@ -637,7 +637,7 @@ fn request_builders_supply_host_for_strict_http_codec() {
         transfer: [3; 16],
         membership: 1,
         deadline: 1,
-        rail: racer_control_wire::RailId(1),
+        rail: racer_wire::control::RailId(1),
     };
     let grant = vec![Header::new(
         "racer-rdma-grant",

@@ -3,13 +3,14 @@
 use super::publication::{PublicationCodec, PublicationTarget};
 use super::rails::RailJournal;
 use super::{ControlEndpoint, ReactorControlIo, transient};
+use crate::control::plane::feed::{Identity, Preparation, RejectionPolicy, Schedule};
+use crate::control::plane::{Client, Codec, Credentials, Feed, Sync, Target};
+use crate::control::rest;
 use crate::enrollment::{Enrollment, LocalSigningIdentity};
 use crate::error::{Error, Operation, Result};
 use crate::runtime::RequestScope;
-use controlplane::feed::{Identity, Preparation, RejectionPolicy, Schedule};
-use controlplane::{Client, Codec, Credentials, Feed, Sync, Target};
-use racer_control_wire as wire;
 use racer_crypto::identity::{BundleInstaller, Keyring};
+use racer_wire::control as wire;
 use sha2::{Digest, Sha256};
 use std::{
     cell::{Cell, RefCell},
@@ -18,7 +19,6 @@ use std::{
     sync::Arc,
     time::{Duration, Instant},
 };
-use wire_codec::rest;
 use zeroize::Zeroizing;
 
 /// Owner-local session. Only generic Sync owns cursors, retry, and preparation jobs.
@@ -173,14 +173,15 @@ struct PublicationSource {
     started: Rc<Cell<bool>>,
 }
 
-impl controlplane::feed::Source<ReactorControlIo> for PublicationSource {
+impl crate::control::plane::feed::Source<ReactorControlIo> for PublicationSource {
     fn get<'a>(
         &'a self,
         path: &'a str,
         digest: Option<&'a str>,
         limit: usize,
         scope: &'a RequestScope,
-    ) -> racer_io::Operation<'a, rest::Response, controlplane::feed::FetchError<Error>> {
+    ) -> racer_io::Operation<'a, rest::Response, crate::control::plane::feed::FetchError<Error>>
+    {
         self.started.set(true);
         self.client.get(path, digest, limit, scope)
     }
@@ -1020,7 +1021,7 @@ pub(super) mod tests {
     //! Scripted application policy over the real generic feed and synchronization owners.
 
     use super::*;
-    use controlplane::feed::{FetchError, Source};
+    use crate::control::plane::feed::{FetchError, Source};
     use std::{
         collections::VecDeque,
         future::Future,
@@ -1133,7 +1134,7 @@ pub(super) mod tests {
     fn document(sequence: u64) -> wire::Publication {
         let mut p = wire::decode_publication(include_bytes!(concat!(
             env!("CARGO_MANIFEST_DIR"),
-            "/control-wire/testdata/publication.json"
+            "/wire/testdata/publication.json"
         )))
         .unwrap();
         p.sequence.0 = sequence;
@@ -1343,7 +1344,7 @@ pub(super) mod tests {
             if seed {
                 let bundle = wire::decode_bundle(include_bytes!(concat!(
                     env!("CARGO_MANIFEST_DIR"),
-                    "/control-wire/testdata/bundle.json"
+                    "/wire/testdata/bundle.json"
                 )))
                 .unwrap();
                 feed.restore(Some(Arc::new(bundle)));

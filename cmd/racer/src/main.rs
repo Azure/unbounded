@@ -43,11 +43,11 @@ impl ClusterControl for Embedded {
         }
     }
 
-    fn endpoints(&self) -> wire_codec::DiscoveredEndpoints {
+    fn endpoints(&self) -> racer::control::rest::DiscoveredEndpoints {
         self.0.endpoints()
     }
 
-    fn report(&self, shares: u32, rails: Vec<racer_control_wire::RailMapping>) {
+    fn report(&self, shares: u32, rails: Vec<racer_wire::control::RailMapping>) {
         // Reports are retried by control; a refused enqueue is logged, never fatal.
         if let Err(error) = self.0.report(shares, rails) {
             eprintln!("racer: stage=cluster-report error={error}");

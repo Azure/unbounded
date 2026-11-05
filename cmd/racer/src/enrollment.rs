@@ -14,12 +14,12 @@ use crate::rt::filesystem::{
     secure::{self, Attempts, Host},
 };
 use base64::{Engine, engine::general_purpose::STANDARD};
-use racer_control_wire::{
+use racer_crypto::identity;
+use racer_io::{Operation, Scope};
+use racer_wire::control::{
     self as wire, ClusterId, EnrollmentId, EnrollmentRequest, EnrollmentResponse, NodeId,
     RailMapping,
 };
-use racer_crypto::identity;
-use racer_io::{Operation, Scope};
 use serde::{Deserialize, Serialize};
 use std::{
     cell::RefCell,
@@ -996,7 +996,7 @@ mod tests {
         customize(&mut csr.params);
         EnrollmentResponse {
             block_devices: None,
-            schema_version: racer_control_wire::SCHEMA_VERSION,
+            schema_version: racer_wire::control::SCHEMA_VERSION,
             cluster: request.cluster.clone(),
             node: NodeId(NODE.into()),
             enrollment: request.enrollment.clone(),

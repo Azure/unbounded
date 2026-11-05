@@ -69,7 +69,7 @@ struct Reader {
 }
 
 /// One provider contract: (version, membership, provider).
-type ContractKey = (ObjectVersion, u64, racer_control_wire::NodeId);
+type ContractKey = (ObjectVersion, u64, racer_wire::control::NodeId);
 
 /// A peer subscription contract and the selections it has in flight.
 struct Contract {
@@ -107,8 +107,8 @@ impl Scheduler {
     pub(crate) fn contract(
         &self,
         selection: &Selection,
-        membership: racer_control_wire::MembershipVersion,
-        provider: racer_control_wire::NodeId,
+        membership: racer_wire::control::MembershipVersion,
+        provider: racer_wire::control::NodeId,
         requested: Option<u16>,
         deadline: Instant,
     ) -> Result<(crate::peer::subscriptions::Subscription, Instant)> {
@@ -196,7 +196,7 @@ impl Scheduler {
     pub(crate) fn granted(
         &self,
         selection: &Selection,
-        provider: &racer_control_wire::NodeId,
+        provider: &racer_wire::control::NodeId,
         flights: u16,
     ) {
         let Some(key) = selection.contract.lock().unwrap().clone() else {
@@ -211,7 +211,7 @@ impl Scheduler {
     }
 
     /// The provider refused a multi-flight request: one flight from now on.
-    pub(crate) fn refused(&self, selection: &Selection, provider: &racer_control_wire::NodeId) {
+    pub(crate) fn refused(&self, selection: &Selection, provider: &racer_wire::control::NodeId) {
         let Some(key) = selection.contract.lock().unwrap().clone() else {
             return;
         };
@@ -1711,8 +1711,8 @@ pub(super) mod tests {
     use crate::model::WorkerId;
     use crate::runtime::Reactor;
     use crate::topology::Membership;
-    use racer_control_wire::CacheId;
-    use racer_control_wire::MembershipVersion;
+    use racer_wire::control::CacheId;
+    use racer_wire::control::MembershipVersion;
 
     struct Fixture {
         admission: Rc<flow_control::Quotas<AdmissionPolicy>>,
@@ -2720,7 +2720,7 @@ pub(super) mod tests {
         // A grant of several flights on a contract of the version lets the
         // read split its holes over several concurrent selections.
         let scheduler = &f.streams.directory.subscriptions;
-        let provider = racer_control_wire::NodeId("provider".into());
+        let provider = racer_wire::control::NodeId("provider".into());
         let granted = Selection::for_test(
             scheduler,
             metadata.version.clone(),
@@ -2878,15 +2878,15 @@ pub(super) mod tests {
             metadata.length = total;
             metadata.version.object.cache = CacheId(crate::test_support::security::CACHE.into());
             let (client_socket, origin_socket) =
-                racer_control_wire::canonical_socket_paths("framing").unwrap();
+                racer_wire::control::canonical_socket_paths("framing").unwrap();
             let worker = crate::test_support::ReadWorker::new(
-                racer_control_wire::CacheDefinition {
+                racer_wire::control::CacheDefinition {
                     id: metadata.version.object.cache.clone(),
                     name: "framing".into(),
                     client_socket,
                     origin_socket,
-                    priority: racer_control_wire::DEFAULT_PRIORITY,
-                    mode: racer_control_wire::CacheMode::Cached,
+                    priority: racer_wire::control::DEFAULT_PRIORITY,
+                    mode: racer_wire::control::CacheMode::Cached,
                     origin: None,
                 },
                 metadata.clone(),
@@ -3045,7 +3045,7 @@ pub(super) mod tests {
                     && headers_sent.load(std::sync::atomic::Ordering::Acquire)
                     && worker
                         .origin
-                        .completed(racer_object_wire::test_util::RequestKind::PinnedGet)
+                        .completed(racer_wire::object::test_util::RequestKind::PinnedGet)
                         == 4
                     && worker.is_drained()
                 {
@@ -3123,10 +3123,10 @@ pub(super) mod tests {
         use crate::model::StrongEtag;
         use flow_control::Quotas;
         use flow_control::subscriptions::Interval;
-        use racer_control_wire::CacheId;
-        use racer_control_wire::MembershipVersion;
-        use racer_control_wire::NodeId;
         use racer_core::subscriptions::Demand as WireDemand;
+        use racer_wire::control::CacheId;
+        use racer_wire::control::MembershipVersion;
+        use racer_wire::control::NodeId;
         fn version() -> ObjectVersion {
             ObjectVersion {
                 object: ObjectId {

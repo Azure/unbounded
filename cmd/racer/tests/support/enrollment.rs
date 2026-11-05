@@ -111,11 +111,11 @@ pub fn fields(head: &str) -> std::collections::BTreeMap<String, String> {
 pub use racer_crypto::identity::test_util::ca;
 
 pub fn issue(
-    request: &racer_control_wire::EnrollmentRequest,
+    request: &racer_wire::control::EnrollmentRequest,
     ca: &rcgen::Certificate,
     key: &rcgen::KeyPair,
     node: &str,
-) -> racer_control_wire::EnrollmentResponse {
+) -> racer_wire::control::EnrollmentResponse {
     issue_at(
         request,
         ca,
@@ -126,12 +126,12 @@ pub fn issue(
 }
 
 pub fn issue_at(
-    request: &racer_control_wire::EnrollmentRequest,
+    request: &racer_wire::control::EnrollmentRequest,
     ca: &rcgen::Certificate,
     key: &rcgen::KeyPair,
     node: &str,
     not_before: std::time::SystemTime,
-) -> racer_control_wire::EnrollmentResponse {
+) -> racer_wire::control::EnrollmentResponse {
     let der = rustls::pki_types::CertificateSigningRequestDer::from(request.csr_der.clone());
     let mut csr = rcgen::CertificateSigningRequestParams::from_der(&der).unwrap();
     csr.params.not_before = not_before.into();
@@ -144,11 +144,11 @@ pub fn issue_at(
     csr.params.key_usages = vec![rcgen::KeyUsagePurpose::DigitalSignature];
     csr.params.extended_key_usages = vec![rcgen::ExtendedKeyUsagePurpose::ClientAuth];
     let cert = csr.signed_by(ca, key).unwrap();
-    racer_control_wire::EnrollmentResponse {
+    racer_wire::control::EnrollmentResponse {
         block_devices: None,
-        schema_version: racer_control_wire::SCHEMA_VERSION,
+        schema_version: racer_wire::control::SCHEMA_VERSION,
         cluster: request.cluster.clone(),
-        node: racer_control_wire::NodeId(node.into()),
+        node: racer_wire::control::NodeId(node.into()),
         enrollment: request.enrollment.clone(),
         certificate_chain: vec![cert.der().to_vec()],
     }
@@ -158,8 +158,8 @@ pub fn signing_identity(
     pending: racer_crypto::identity::PendingIdentity,
     ca: &rcgen::Certificate,
     ca_key: &rcgen::KeyPair,
-    cluster: racer_control_wire::ClusterId,
-    node: racer_control_wire::NodeId,
+    cluster: racer_wire::control::ClusterId,
+    node: racer_wire::control::NodeId,
 ) -> std::sync::Arc<racer_crypto::identity::SigningIdentity> {
     let (pending, chain) = racer_crypto::identity::test_util::issue_pending(
         pending,

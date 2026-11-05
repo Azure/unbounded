@@ -220,7 +220,7 @@ impl WorkerApplication {
         Ok(())
     }
     /// The node's rails: one device per published rail, chosen near the owner.
-    pub(super) fn native_publication(&self) -> Result<Vec<racer_control_wire::RailMapping>> {
+    pub(super) fn native_publication(&self) -> Result<Vec<racer_wire::control::RailMapping>> {
         let snapshot = self.snapshots.current()?;
         let member = snapshot.membership.member(self.keys.node())?;
         let owner = self.node.native.owner_worker();
@@ -408,8 +408,8 @@ fn publication_capacity(links: bool) -> usize {
 /// Activation truncates the publication to the budget-funded prefix, so the
 /// comparison applies the same truncation before matching.
 pub(super) fn rails_compatible(
-    mut published: Vec<racer_control_wire::RailMapping>,
-    actual: &[racer_control_wire::RailMapping],
+    mut published: Vec<racer_wire::control::RailMapping>,
+    actual: &[racer_wire::control::RailMapping],
     registered_bytes: usize,
 ) -> bool {
     crate::rdma::links::fund_publication(&mut published, registered_bytes);
@@ -434,7 +434,7 @@ mod tests {
     #[test]
     fn rails_compatible_applies_registered_budget() {
         use crate::rdma::links::BUFFER_LEN;
-        let nic = |device: &str, rail| racer_control_wire::RailMapping {
+        let nic = |device: &str, rail| racer_wire::control::RailMapping {
             device: device.into(),
             port: 1,
             rail: RailId(rail),
@@ -477,16 +477,16 @@ mod tests {
     use crate::admission::ResourceClass;
     use crate::security;
     use crate::security::CryptoClient;
-    use racer_control_wire::MembershipVersion;
-    use racer_control_wire::Publication;
-    use racer_control_wire::PublicationSequence;
-    use racer_control_wire::RailId;
+    use racer_wire::control::MembershipVersion;
+    use racer_wire::control::Publication;
+    use racer_wire::control::PublicationSequence;
+    use racer_wire::control::RailId;
     use std::num::NonZeroUsize;
 
     #[test]
     fn publication_selects_every_rail_and_budget_limits_activation() {
         use crate::rdma::links::{BUFFER_LEN, funded_devices};
-        let nic = |device: &str, rail| racer_control_wire::RailMapping {
+        let nic = |device: &str, rail| racer_wire::control::RailMapping {
             device: device.into(),
             port: 1,
             rail: RailId(rail),
@@ -524,17 +524,17 @@ mod tests {
         let (mut worker, engine) = worker(&app, true, true);
         let mut service = test_owner(&app, engine);
         let mut cx = Context::from_waker(futures::task::noop_waker_ref());
-        let mut publication = racer_control_wire::Publication {
+        let mut publication = racer_wire::control::Publication {
             pools: Vec::new(),
-            schema_version: racer_control_wire::SCHEMA_VERSION,
+            schema_version: racer_wire::control::SCHEMA_VERSION,
             cluster: app.config.cluster.clone(),
             sequence: PublicationSequence(2),
             membership_version: MembershipVersion(2),
-            members: vec![racer_control_wire::Member {
+            members: vec![racer_wire::control::Member {
                 node: app.config.node.clone(),
                 shares: std::num::NonZeroU32::new(1).unwrap(),
                 peer_endpoint: "127.0.0.1:7443".into(),
-                rails: vec![racer_control_wire::RailMapping {
+                rails: vec![racer_wire::control::RailMapping {
                     device: "new".into(),
                     port: 1,
                     gid: None,
@@ -1234,7 +1234,7 @@ mod tests {
             .reserve(None, ResourceClass::Registered, 1)
             .unwrap();
         let startup = scope(&racer_io::Clock::host(), Duration::from_secs(10)).unwrap();
-        let publication = vec![racer_control_wire::RailMapping {
+        let publication = vec![racer_wire::control::RailMapping {
             device: "missing".into(),
             port: 1,
             gid: None,
@@ -1271,7 +1271,7 @@ mod tests {
         // Stand in only for the identity returned by authenticated enrollment.
         config.node = NodeId("00000000-0000-4000-8000-000000000002".into());
         let mut app = Application::assemble(config).unwrap();
-        app.discovered_nics = vec![racer_control_wire::RailMapping {
+        app.discovered_nics = vec![racer_wire::control::RailMapping {
             device: "missing".into(),
             port: 1,
             gid: Some([1; 16]),
@@ -1313,11 +1313,11 @@ mod tests {
             .apply(
                 Publication {
                     pools: Vec::new(),
-                    schema_version: racer_control_wire::SCHEMA_VERSION,
+                    schema_version: racer_wire::control::SCHEMA_VERSION,
                     cluster: app.config.cluster.clone(),
                     sequence: PublicationSequence(1),
                     membership_version: MembershipVersion(1),
-                    members: vec![racer_control_wire::Member {
+                    members: vec![racer_wire::control::Member {
                         node: app.config.node.clone(),
                         shares: std::num::NonZeroU32::new(1).unwrap(),
                         peer_endpoint: "127.0.0.1:7443".into(),
@@ -1392,11 +1392,11 @@ mod tests {
             .apply(
                 Publication {
                     pools: Vec::new(),
-                    schema_version: racer_control_wire::SCHEMA_VERSION,
+                    schema_version: racer_wire::control::SCHEMA_VERSION,
                     cluster: app.config.cluster.clone(),
                     sequence: PublicationSequence(2),
                     membership_version: MembershipVersion(2),
-                    members: vec![racer_control_wire::Member {
+                    members: vec![racer_wire::control::Member {
                         node: app.config.node.clone(),
                         shares: std::num::NonZeroU32::new(1).unwrap(),
                         peer_endpoint: "127.0.0.1:7443".into(),
@@ -1464,7 +1464,7 @@ mod tests {
             .apply(
                 Publication {
                     pools: Vec::new(),
-                    schema_version: racer_control_wire::SCHEMA_VERSION,
+                    schema_version: racer_wire::control::SCHEMA_VERSION,
                     cluster: app.config.cluster.clone(),
                     sequence: PublicationSequence(2),
                     membership_version: MembershipVersion(2),
@@ -1510,7 +1510,7 @@ mod tests {
             .apply(
                 Publication {
                     pools: Vec::new(),
-                    schema_version: racer_control_wire::SCHEMA_VERSION,
+                    schema_version: racer_wire::control::SCHEMA_VERSION,
                     cluster: app.config.cluster.clone(),
                     sequence: PublicationSequence(2),
                     membership_version: MembershipVersion(2),
@@ -1548,7 +1548,7 @@ mod tests {
             .apply(
                 Publication {
                     pools: Vec::new(),
-                    schema_version: racer_control_wire::SCHEMA_VERSION,
+                    schema_version: racer_wire::control::SCHEMA_VERSION,
                     cluster: app.config.cluster.clone(),
                     sequence: PublicationSequence(2),
                     membership_version: MembershipVersion(2),
@@ -1575,11 +1575,11 @@ mod tests {
             .apply(
                 Publication {
                     pools: Vec::new(),
-                    schema_version: racer_control_wire::SCHEMA_VERSION,
+                    schema_version: racer_wire::control::SCHEMA_VERSION,
                     cluster: app.config.cluster.clone(),
                     sequence: PublicationSequence(3),
                     membership_version: MembershipVersion(3),
-                    members: vec![racer_control_wire::Member {
+                    members: vec![racer_wire::control::Member {
                         node: app.config.node.clone(),
                         shares: member.shares,
                         peer_endpoint: member.peer_endpoint.clone(),

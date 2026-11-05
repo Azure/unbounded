@@ -1,5 +1,7 @@
 //! Racer control policy and reactor adapters for enrollment and immutable publications.
 
+#[cfg(test)]
+use crate::control::rest::Response;
 use crate::error::Error;
 use crate::error::Operation;
 use crate::error::Result;
@@ -16,27 +18,27 @@ use crate::runtime::Reactor;
 use crate::runtime::RequestScope;
 #[cfg(test)]
 use crate::topology::Membership;
-use racer_control_wire as wire;
-#[cfg(test)]
-use racer_control_wire::BundleGeneration;
-use racer_control_wire::CacheDefinition;
-use racer_control_wire::CacheId;
-use racer_control_wire::ClusterId;
-#[cfg(test)]
-use racer_control_wire::EnrollmentId;
-use racer_control_wire::KeyId;
-#[cfg(test)]
-use racer_control_wire::MembershipVersion;
-#[cfg(test)]
-use racer_control_wire::NodeId;
-#[cfg(test)]
-use racer_control_wire::Publication;
-use racer_control_wire::PublicationSequence;
 #[cfg(test)]
 use racer_crypto::identity::BundleInstaller;
 use racer_crypto::identity::KeyPurpose;
 use racer_crypto::identity::Keyring;
 use racer_io::ring::Descriptor;
+use racer_wire::control as wire;
+#[cfg(test)]
+use racer_wire::control::BundleGeneration;
+use racer_wire::control::CacheDefinition;
+use racer_wire::control::CacheId;
+use racer_wire::control::ClusterId;
+#[cfg(test)]
+use racer_wire::control::EnrollmentId;
+use racer_wire::control::KeyId;
+#[cfg(test)]
+use racer_wire::control::MembershipVersion;
+#[cfg(test)]
+use racer_wire::control::NodeId;
+#[cfg(test)]
+use racer_wire::control::Publication;
+use racer_wire::control::PublicationSequence;
 use std::cell::Cell;
 #[cfg(test)]
 use std::cell::RefCell;
@@ -57,14 +59,13 @@ use std::time::Duration;
 use std::time::Instant;
 #[cfg(test)]
 use std::time::SystemTime;
-use wire_codec::rest;
-#[cfg(test)]
-use wire_codec::rest::Response;
 
 pub mod cell;
 pub mod managed;
+pub mod plane;
 pub mod publication;
 pub mod rails;
+pub mod rest;
 pub mod session;
 use crate::control::cell::PublicationCell;
 #[cfg(test)]
@@ -146,7 +147,7 @@ pub struct Snapshot {
 
     /// Node pools of `caches`, as validated from the publication. Placement
     /// reads them through `membership`.
-    pub pools: Vec<racer_control_wire::Pool>,
+    pub pools: Vec<racer_wire::control::Pool>,
 
     content_hash: [u8; 32],
 
@@ -227,7 +228,7 @@ impl Availability {
 
     /// Published mode of this cache. Unpublished caches report `Cached`; the
     /// other admission checks already refuse them.
-    pub fn mode(&self, cache: &CacheId) -> racer_control_wire::CacheMode {
+    pub fn mode(&self, cache: &CacheId) -> racer_wire::control::CacheMode {
         self.with_cache(cache, |c| c.map(|c| c.mode).unwrap_or_default())
     }
 
@@ -315,7 +316,7 @@ pub(crate) fn for_caches(keys: Rc<Keyring>, caches: Vec<CacheId>) -> Rc<Availabi
         keys,
         caches
             .into_iter()
-            .map(|id| (id, racer_control_wire::CacheMode::Cached))
+            .map(|id| (id, racer_wire::control::CacheMode::Cached))
             .collect(),
     )
 }
@@ -324,7 +325,7 @@ pub(crate) fn for_caches(keys: Rc<Keyring>, caches: Vec<CacheId>) -> Rc<Availabi
 #[cfg(test)]
 pub(crate) fn for_cache_modes(
     keys: Rc<Keyring>,
-    caches: Vec<(CacheId, racer_control_wire::CacheMode)>,
+    caches: Vec<(CacheId, racer_wire::control::CacheMode)>,
 ) -> Rc<Availability> {
     let availability = Rc::new(Availability::new(
         Arc::new(PublicationCell::new(Snapshot::retention(1))),
@@ -338,8 +339,8 @@ pub(crate) fn for_cache_modes(
 impl Availability {
     /// Publish the next single-node fixture with `caches` in their modes, as a
     /// controller would after a ClusterCache edit.
-    pub(crate) fn publish_modes(&self, caches: Vec<(CacheId, racer_control_wire::CacheMode)>) {
-        use racer_control_wire::SCHEMA_VERSION;
+    pub(crate) fn publish_modes(&self, caches: Vec<(CacheId, racer_wire::control::CacheMode)>) {
+        use racer_wire::control::SCHEMA_VERSION;
         let sequence = self
             .publications
             .current()
@@ -356,7 +357,7 @@ impl Availability {
                 schema_version: SCHEMA_VERSION,
                 cluster: self.keys.cluster().clone(),
                 sequence: PublicationSequence(sequence),
-                membership_version: racer_control_wire::MembershipVersion(1),
+                membership_version: racer_wire::control::MembershipVersion(1),
                 members: vec![wire::Member {
                     node: self.keys.node().clone(),
                     shares: std::num::NonZeroU32::new(1).unwrap(),
@@ -376,7 +377,7 @@ impl Availability {
                             name,
                             client_socket,
                             origin_socket,
-                            priority: racer_control_wire::DEFAULT_PRIORITY,
+                            priority: racer_wire::control::DEFAULT_PRIORITY,
                             mode,
                             origin: None,
                         }
@@ -428,17 +429,17 @@ impl secure::Host for ReactorControlIo {
     }
 }
 
-impl controlplane::Host for ReactorControlIo {
+impl crate::control::plane::Host for ReactorControlIo {
     fn sleep<'a>(&'a self, until: Instant, scope: &'a RequestScope) -> Operation<'a, ()> {
         ReactorControlIo::sleep(self, until, scope)
     }
 
-    fn classify(&self, error: Error) -> controlplane::FailureClass {
+    fn classify(&self, error: Error) -> crate::control::plane::FailureClass {
         match error {
-            Error::Cancelled => controlplane::FailureClass::Cancelled,
-            Error::Unauthorized => controlplane::FailureClass::Rejected,
-            error if transient(error) => controlplane::FailureClass::Retry,
-            _ => controlplane::FailureClass::Permanent,
+            Error::Cancelled => crate::control::plane::FailureClass::Cancelled,
+            Error::Unauthorized => crate::control::plane::FailureClass::Rejected,
+            error if transient(error) => crate::control::plane::FailureClass::Retry,
+            _ => crate::control::plane::FailureClass::Permanent,
         }
     }
 }
@@ -568,18 +569,18 @@ pub(crate) mod tests {
     use crate::test_support::enrollment as testing;
     use crate::test_support::projected_file;
     use futures::TryFutureExt;
-    use racer_control_wire::canonical_socket_paths;
-    use racer_control_wire::decode_enrollment_request;
-    use racer_control_wire::decode_publication;
-    use racer_control_wire::encode_enrollment_request;
-    use racer_control_wire::encode_publication;
-    use racer_control_wire::validate_definitions;
+    use racer_wire::control::canonical_socket_paths;
+    use racer_wire::control::decode_enrollment_request;
+    use racer_wire::control::decode_publication;
+    use racer_wire::control::encode_enrollment_request;
+    use racer_wire::control::encode_publication;
+    use racer_wire::control::validate_definitions;
     use std::num::NonZeroU32;
 
     #[test]
     fn socket_readiness_errno_is_transient_but_file_errno_is_not() {
+        use crate::control::rest::Io;
         use crate::rt::reactor::simulation::{Fault, Simulation};
-        use wire_codec::rest::Io;
         let sim = Simulation::new();
         let _os = sim.enter();
         let r = Rc::new(Reactor::new(
@@ -719,9 +720,9 @@ pub(crate) mod tests {
         fn bundle_installation_is_idempotent_and_rejects_rollback() {
             use racer_crypto::identity::KeyEpochs;
             use racer_crypto::identity::KeyPurpose;
-            let publication = racer_control_wire::decode_publication(include_bytes!(concat!(
+            let publication = racer_wire::control::decode_publication(include_bytes!(concat!(
                 env!("CARGO_MANIFEST_DIR"),
-                "/control-wire/testdata/publication.json"
+                "/wire/testdata/publication.json"
             )))
             .unwrap();
             let keys = Rc::new(Keyring::new(
@@ -735,7 +736,7 @@ pub(crate) mod tests {
             let (ca, _) = testing::ca();
             let mut bundle = wire::decode_bundle(include_bytes!(concat!(
                 env!("CARGO_MANIFEST_DIR"),
-                "/control-wire/testdata/bundle.json"
+                "/wire/testdata/bundle.json"
             )))
             .unwrap();
             bundle.generation = BundleGeneration(2);
@@ -803,7 +804,7 @@ pub(crate) mod tests {
                 d.0.join("epoch-a/bundle.json"),
                 include_bytes!(concat!(
                     env!("CARGO_MANIFEST_DIR"),
-                    "/control-wire/testdata/bundle.json"
+                    "/wire/testdata/bundle.json"
                 )),
             )
             .unwrap();
@@ -828,9 +829,9 @@ pub(crate) mod tests {
         use super::session::Session;
         use super::*;
         use crate::test_support::enrollment as testing;
-        use racer_control_wire::ClusterId;
-        use racer_control_wire::NodeId;
         use racer_crypto::identity::KeyEpochs;
+        use racer_wire::control::ClusterId;
+        use racer_wire::control::NodeId;
         use std::sync::Arc;
         #[test]
         fn busy_guard_rejects_overlap_without_releasing_the_owner() {
@@ -977,14 +978,14 @@ pub(crate) mod tests {
         //! Shared control wire codecs preserve application contract validation.
 
         use super::*;
-        use racer_control_wire::decode_bundle;
-        use racer_control_wire::decode_enrollment_response;
-        use racer_control_wire::encode_bundle;
-        use racer_control_wire::encode_enrollment_response;
+        use racer_wire::control::decode_bundle;
+        use racer_wire::control::decode_enrollment_response;
+        use racer_wire::control::encode_bundle;
+        use racer_wire::control::encode_enrollment_response;
 
         #[test]
         fn application_roundtrips_preserve_exact_wire_records() {
-            const ROOT: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/control-wire/testdata/");
+            const ROOT: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/wire/testdata/");
             for name in [
                 "publication.json",
                 "bootstrap-request.json",
@@ -1053,7 +1054,7 @@ pub(crate) mod tests {
         fn replacement_definitions_and_socket_paths_are_validated() {
             let mut defs = decode_publication(include_bytes!(concat!(
                 env!("CARGO_MANIFEST_DIR"),
-                "/control-wire/testdata/publication.json"
+                "/wire/testdata/publication.json"
             )))
             .unwrap()
             .caches;
@@ -1116,7 +1117,7 @@ pub(crate) mod tests {
         fn background_preparation_keeps_cpu_work_off_the_polling_thread() {
             let store = store(2);
             let before = crate::topology::scored_members();
-            let job = controlplane::Target::<publication::PublicationCodec>::prepare(
+            let job = crate::control::plane::Target::<publication::PublicationCodec>::prepare(
                 &store,
                 Arc::new(publication(1)),
             )
@@ -1151,20 +1152,21 @@ pub(crate) mod tests {
             submissions: Rc<Cell<usize>>,
         }
 
-        impl controlplane::Target<publication::PublicationCodec> for GatedTarget {
+        impl crate::control::plane::Target<publication::PublicationCodec> for GatedTarget {
             type Prepared = Arc<Snapshot>;
 
             fn prepare(
                 &self,
                 document: Arc<Publication>,
-            ) -> Result<controlplane::feed::Preparation<Self::Prepared, Error>> {
+            ) -> Result<crate::control::plane::feed::Preparation<Self::Prepared, Error>>
+            {
                 self.submissions.set(self.submissions.get() + 1);
                 let wait = self
                     .wait
                     .borrow_mut()
                     .take()
                     .expect("only one job admitted");
-                let job = controlplane::Target::prepare(&self.target, document)?;
+                let job = crate::control::plane::Target::prepare(&self.target, document)?;
                 Ok(Box::new(move || {
                     wait.recv_timeout(Duration::from_secs(5))
                         .map_err(|_| Error::DeadlineExceeded)?;
@@ -1173,21 +1175,21 @@ pub(crate) mod tests {
             }
 
             fn install(&self, document: &Publication, prepared: &Arc<Snapshot>) -> Result<()> {
-                controlplane::Target::install(&self.target, document, prepared)
+                crate::control::plane::Target::install(&self.target, document, prepared)
             }
         }
 
         /// One full publication followed by a held long poll.
         struct PublicationSource(Cell<bool>);
 
-        impl controlplane::feed::Source<ReactorControlIo> for PublicationSource {
+        impl crate::control::plane::feed::Source<ReactorControlIo> for PublicationSource {
             fn get<'a>(
                 &'a self,
                 _: &'a str,
                 _: Option<&'a str>,
                 _: usize,
                 scope: &'a RequestScope,
-            ) -> racer_io::Operation<'a, Response, controlplane::feed::FetchError<Error>>
+            ) -> racer_io::Operation<'a, Response, crate::control::plane::feed::FetchError<Error>>
             {
                 Box::pin(async move {
                     if self.0.replace(true) {
@@ -1230,9 +1232,9 @@ pub(crate) mod tests {
             let published = target.published.clone();
             let submissions = Rc::new(Cell::new(0));
             let (release, wait) = std::sync::mpsc::channel();
-            let mut sync = controlplane::Sync::new(
+            let mut sync = crate::control::plane::Sync::new(
                 Rc::new(ReactorControlIo::new(reactor.clone())),
-                controlplane::Feed::new(
+                crate::control::plane::Feed::new(
                     publication::PublicationCodec,
                     wire::SNAPSHOT_PATH.into(),
                     wire::MAX_PUBLICATION_BYTES,
@@ -1244,7 +1246,7 @@ pub(crate) mod tests {
                     wait: RefCell::new(Some(wait)),
                     submissions: submissions.clone(),
                 },
-                controlplane::feed::Schedule {
+                crate::control::plane::feed::Schedule {
                     turn: Duration::from_secs(5),
                     tick: Duration::from_millis(1),
                     retry_min: Duration::from_millis(1),
@@ -1310,7 +1312,7 @@ pub(crate) mod tests {
         fn publication(sequence: u64) -> Publication {
             let mut p = decode_publication(include_bytes!(concat!(
                 env!("CARGO_MANIFEST_DIR"),
-                "/control-wire/testdata/publication.json"
+                "/wire/testdata/publication.json"
             )))
             .unwrap();
             p.sequence.0 = sequence;
@@ -1509,7 +1511,7 @@ pub(crate) mod tests {
         /// Same-version races cannot swap topology allocations or commit resources.
         #[test]
         fn stale_projection_and_foreign_cluster_leave_publication_unchanged() {
-            use controlplane::Target;
+            use crate::control::plane::Target;
             let target = store(2);
             target.apply(publication(1)).unwrap();
             let old_job = target.prepare(Arc::new(membership(3, 2))).unwrap();
@@ -1871,7 +1873,7 @@ pub(crate) mod tests {
         ) -> LocalSigningIdentity {
             let scope = testing::scope();
             let enrollment = Enrollment::new(
-                racer_control_wire::ClusterId("11111111-1111-4111-8111-111111111111".into()),
+                racer_wire::control::ClusterId("11111111-1111-4111-8111-111111111111".into()),
                 d.0.join("token"),
                 d.0.join("identity"),
                 Rc::new(ReactorControlIo::new(r.clone())),
@@ -2161,7 +2163,7 @@ pub(crate) mod tests {
             let d = testing::Directory::new();
             let scope = testing::scope();
             let enrollment = Enrollment::new(
-                racer_control_wire::ClusterId("11111111-1111-4111-8111-111111111111".into()),
+                racer_wire::control::ClusterId("11111111-1111-4111-8111-111111111111".into()),
                 d.0.join("token"),
                 d.0.join("identity"),
                 Rc::new(ReactorControlIo::new(r.clone())),
@@ -2224,7 +2226,7 @@ pub(crate) mod tests {
                 io.clone(),
             );
             let enrollment = Enrollment::new(
-                racer_control_wire::ClusterId("11111111-1111-4111-8111-111111111111".into()),
+                racer_wire::control::ClusterId("11111111-1111-4111-8111-111111111111".into()),
                 d.0.join("token"),
                 d.0.join("identity"),
                 io,
@@ -2690,8 +2692,8 @@ pub(crate) mod tests {
         #[test]
         fn saturated_rail_journal_still_persists_and_enrolls_known_ports() {
             use crate::rdma::MAX_JOURNAL_BYTES;
-            use racer_control_wire::RailId;
-            use racer_control_wire::RailMapping;
+            use racer_wire::control::RailId;
+            use racer_wire::control::RailMapping;
             let Some(r) = testing::reactor() else { return };
             let scope = testing::scope();
             let directory = testing::Directory::new();
@@ -2888,7 +2890,7 @@ pub(crate) mod tests {
             let scope = testing::scope();
             let enrollment = |path| {
                 Enrollment::new(
-                    racer_control_wire::ClusterId("11111111-1111-4111-8111-111111111111".into()),
+                    racer_wire::control::ClusterId("11111111-1111-4111-8111-111111111111".into()),
                     d.0.join("token"),
                     path,
                     Rc::new(ReactorControlIo::new(r.clone())),
@@ -3079,7 +3081,7 @@ pub(crate) mod tests {
             let d = testing::Directory::new();
             let scope = testing::scope();
             let e = Enrollment::new(
-                racer_control_wire::ClusterId("11111111-1111-4111-8111-111111111111".into()),
+                racer_wire::control::ClusterId("11111111-1111-4111-8111-111111111111".into()),
                 d.0.join("token"),
                 d.0.join("identity"),
                 Rc::new(ReactorControlIo::new(r.clone())),
@@ -3188,7 +3190,7 @@ mod caches_tests {
             client_socket: PathBuf::new(),
             origin_socket: PathBuf::new(),
             priority,
-            mode: racer_control_wire::CacheMode::default(),
+            mode: racer_wire::control::CacheMode::default(),
             origin: None,
         }
     }

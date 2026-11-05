@@ -14,8 +14,8 @@ use super::api::{
 use super::metrics::{Counter, Outcome};
 use super::{Config, Priority, REFS_PAGE};
 use crate::model::{CacheKey, ObjectId, ObjectVersion, PAGE_BYTES, StrongEtag, VersionMetadata};
-use racer_control_wire::{CacheId, NodeId};
-use racer_object_wire::prefetch::{ErrorCode, PrefetchError, RefsFilter};
+use racer_wire::control::{CacheId, NodeId};
+use racer_wire::object::prefetch::{ErrorCode, PrefetchError, RefsFilter};
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::sync::Arc;
 use std::time::{Duration, Instant};

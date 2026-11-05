@@ -373,7 +373,7 @@ where
 #[allow(clippy::disallowed_methods)] // Tests build instants to feed the API.
 mod tests {
     use super::*;
-    use racer_object_wire::model::StrongEtag;
+    use racer_wire::object::model::StrongEtag;
     use std::time::Duration;
 
     type Cohorts = MetadataCohort<u32, u64>;

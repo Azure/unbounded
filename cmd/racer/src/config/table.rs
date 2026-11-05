@@ -870,7 +870,7 @@ const BASE: &[Var] = &[
     control(var(
         "RACER_RETAINED_PAGE_KEYS",
         Group::Kubernetes,
-        uint(1, racer_control_wire::MAX_RETAINED_PAGE_KEYS as u64, COUNT),
+        uint(1, racer_wire::control::MAX_RETAINED_PAGE_KEYS as u64, COUNT),
         Value("7"),
         "Readable page keys per cache: the active key plus older decrypt keys. Read by the authority.",
     )),

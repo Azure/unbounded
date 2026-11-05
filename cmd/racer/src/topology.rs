@@ -7,13 +7,13 @@ use crate::model::PageNumber;
 use crate::model::RequestId;
 use crate::rt::environment::Deadline;
 use crate::runtime::RequestScope;
-#[cfg(test)]
-use racer_control_wire::CacheId;
-use racer_control_wire::MembershipVersion;
-use racer_control_wire::NodeId;
-use racer_control_wire::RailMapping;
 use racer_core::liveness::Silence;
 use racer_core::route::LinkOutcome;
+#[cfg(test)]
+use racer_wire::control::CacheId;
+use racer_wire::control::MembershipVersion;
+use racer_wire::control::NodeId;
+use racer_wire::control::RailMapping;
 use sha2::Digest;
 use sha2::Sha256;
 use std::future::Future;
@@ -274,13 +274,13 @@ pub struct Membership {
     pub version: MembershipVersion,
     pub(crate) inner: ::topology::Membership<Member>,
     retained_bytes: usize,
-    rail_domain: Vec<racer_control_wire::RailId>,
+    rail_domain: Vec<racer_wire::control::RailId>,
     /// Lazily computed RDMA peer sets, one per queried position.
     pub(crate) rdma_edges: crate::rdma::RdmaEdges,
     /// Published pools, in publication order.
     pools: Vec<PoolView>,
     /// Which entry of `pools` each published cache uses.
-    cache_pools: std::collections::HashMap<racer_control_wire::CacheId, usize>,
+    cache_pools: std::collections::HashMap<racer_wire::control::CacheId, usize>,
 }
 
 /// One published pool as placement sees it.
@@ -303,8 +303,8 @@ pub(crate) struct CachePool<'a> {
     pub(crate) mesh: Option<&'a ::topology::Pool>,
 }
 
-impl From<racer_control_wire::Member> for Member {
-    fn from(value: racer_control_wire::Member) -> Self {
+impl From<racer_wire::control::Member> for Member {
+    fn from(value: racer_wire::control::Member) -> Self {
         Self {
             node: value.node,
             shares: value.shares,
@@ -314,7 +314,7 @@ impl From<racer_control_wire::Member> for Member {
         }
     }
 }
-impl From<Member> for racer_control_wire::Member {
+impl From<Member> for racer_wire::control::Member {
     fn from(value: Member) -> Self {
         Self {
             node: value.node,
@@ -345,7 +345,7 @@ impl Membership {
     pub(crate) fn validate_with_pools(
         version: MembershipVersion,
         members: Vec<Member>,
-        pools: Vec<racer_control_wire::Pool>,
+        pools: Vec<racer_wire::control::Pool>,
         old: Option<&Self>,
     ) -> Result<Self> {
         Self::build(version, members, Some(pools), old)
@@ -356,7 +356,7 @@ impl Membership {
     fn build(
         version: MembershipVersion,
         mut members: Vec<Member>,
-        pools: Option<Vec<racer_control_wire::Pool>>,
+        pools: Option<Vec<racer_wire::control::Pool>>,
         old: Option<&Self>,
     ) -> Result<Self> {
         if version.0 == 0 || members.len() > MAX_MEMBERS {
@@ -366,8 +366,8 @@ impl Membership {
             if !valid_identity(&member.node.0) {
                 return Err(Error::InvalidConfiguration);
             }
-            racer_control_wire::validate_member_metadata(&member.peer_endpoint, &member.site)
-                .and_then(|()| racer_control_wire::normalize_rails(&mut member.rails))
+            racer_wire::control::validate_member_metadata(&member.peer_endpoint, &member.site)
+                .and_then(|()| racer_wire::control::normalize_rails(&mut member.rails))
                 .map_err(|_| Error::InvalidConfiguration)?;
         }
         // Compute once per publication, never from a request's selected route.
@@ -379,7 +379,7 @@ impl Membership {
             .into_iter()
             .collect();
         let retained_bytes = std::mem::size_of::<Self>()
-            + rail_domain.capacity() * std::mem::size_of::<racer_control_wire::RailId>()
+            + rail_domain.capacity() * std::mem::size_of::<racer_wire::control::RailId>()
             + members
                 .iter()
                 .map(|m| {
@@ -391,8 +391,8 @@ impl Membership {
                 })
                 .sum::<usize>();
         let wire_pools = pools.unwrap_or_else(|| {
-            vec![racer_control_wire::Pool {
-                id: racer_control_wire::PoolId::default_pool(),
+            vec![racer_wire::control::Pool {
+                id: racer_wire::control::PoolId::default_pool(),
                 rank: 0,
                 members: None,
                 caches: Vec::new(),
@@ -501,7 +501,7 @@ impl Membership {
 
     /// The pool `cache` uses. A cache no pool lists (fixtures without
     /// published pools) uses every member.
-    pub(crate) fn cache_pool(&self, cache: &racer_control_wire::CacheId) -> CachePool<'_> {
+    pub(crate) fn cache_pool(&self, cache: &racer_wire::control::CacheId) -> CachePool<'_> {
         match self.cache_pools.get(cache).map(|&i| &self.pools[i]) {
             Some(view) => CachePool {
                 id: &view.id,
@@ -509,11 +509,11 @@ impl Membership {
                 mesh: self.inner.pool(&view.id),
             },
             None => CachePool {
-                id: racer_control_wire::PoolId::DEFAULT.as_bytes(),
+                id: racer_wire::control::PoolId::DEFAULT.as_bytes(),
                 members: &self.inner,
                 mesh: self
                     .inner
-                    .pool(racer_control_wire::PoolId::DEFAULT.as_bytes()),
+                    .pool(racer_wire::control::PoolId::DEFAULT.as_bytes()),
             },
         }
     }
@@ -527,7 +527,7 @@ impl Membership {
 
     /// Whether `node` is a member of `cache`'s pool: it stores, serves, and
     /// reads that cache.
-    pub fn serves(&self, cache: &racer_control_wire::CacheId, node: &NodeId) -> bool {
+    pub fn serves(&self, cache: &racer_wire::control::CacheId, node: &NodeId) -> bool {
         self.cache_pool(cache)
             .members
             .position(node.0.as_bytes())
@@ -535,12 +535,17 @@ impl Membership {
     }
 
     /// Members of `cache`'s pool.
-    pub fn pool_size(&self, cache: &racer_control_wire::CacheId) -> usize {
+    pub fn pool_size(&self, cache: &racer_wire::control::CacheId) -> usize {
         self.cache_pool(cache).members.members().len()
     }
 
     /// Whether `a` and `b` are in the same column of `cache`'s pool mesh.
-    pub fn same_column(&self, cache: &racer_control_wire::CacheId, a: &NodeId, b: &NodeId) -> bool {
+    pub fn same_column(
+        &self,
+        cache: &racer_wire::control::CacheId,
+        a: &NodeId,
+        b: &NodeId,
+    ) -> bool {
         let (Some(a), Some(b)) = (
             self.inner.position(a.0.as_bytes()),
             self.inner.position(b.0.as_bytes()),
@@ -557,7 +562,7 @@ impl Membership {
     /// if they share a column or either is not in the pool.
     pub fn helper(
         &self,
-        cache: &racer_control_wire::CacheId,
+        cache: &racer_wire::control::CacheId,
         reader: &NodeId,
         owner: &NodeId,
     ) -> Option<NodeId> {
@@ -583,7 +588,7 @@ impl Membership {
     pub fn members(&self) -> &[Member] {
         self.inner.members()
     }
-    pub fn rail_domain(&self) -> &[racer_control_wire::RailId] {
+    pub fn rail_domain(&self) -> &[racer_wire::control::RailId] {
         &self.rail_domain
     }
     pub fn position(&self, node: &NodeId) -> Result<usize> {
@@ -898,7 +903,7 @@ pub struct Route {
 /// Signed forwarding state. Retries preserve deadline and consumed link budget.
 #[derive(Clone, Debug)]
 pub struct RouteBudget {
-    pub membership: racer_control_wire::MembershipVersion,
+    pub membership: racer_wire::control::MembershipVersion,
     pub request: RequestId,
     pub attempt: AttemptId,
     pub destination: NodeId,
@@ -1455,7 +1460,7 @@ pub(crate) mod tests {
         use super::*;
         use crate::model::{CacheKey, PageNumber};
         use crate::topology::tests::fixtures::member;
-        use racer_control_wire::{Pool, PoolId};
+        use racer_wire::control::{Pool, PoolId};
 
         pub(crate) const NARROW: &str = "44444444-4444-4444-8444-444444444444";
         const SELECTED: &str = "sel-0123456789abcdef0123456789abcdef";
@@ -1631,14 +1636,14 @@ pub(crate) mod tests {
     pub(crate) mod membership_tests {
         use super::*;
         use crate::topology::tests::fixtures::member;
-        use racer_control_wire::RailId;
-        use racer_control_wire::RailMapping;
+        use racer_wire::control::RailId;
+        use racer_wire::control::RailMapping;
 
         #[test]
         fn wire_member_adapter_preserves_publication_fields_at_validation() {
-            let publication = racer_control_wire::decode_publication(include_bytes!(concat!(
+            let publication = racer_wire::control::decode_publication(include_bytes!(concat!(
                 env!("CARGO_MANIFEST_DIR"),
-                "/control-wire/testdata/publication.json"
+                "/wire/testdata/publication.json"
             )))
             .unwrap();
             let membership = Membership::validate(
@@ -1663,7 +1668,7 @@ pub(crate) mod tests {
                 });
                 assert_eq!(local.rails, expected);
             }
-            let roundtrip = racer_control_wire::Publication {
+            let roundtrip = racer_wire::control::Publication {
                 members: membership
                     .members()
                     .iter()
@@ -1673,8 +1678,8 @@ pub(crate) mod tests {
                 ..publication.clone()
             };
             assert_eq!(
-                racer_control_wire::canonical_content(&roundtrip).unwrap(),
-                racer_control_wire::canonical_content(&publication).unwrap()
+                racer_wire::control::canonical_content(&roundtrip).unwrap(),
+                racer_wire::control::canonical_content(&publication).unwrap()
             );
         }
 
@@ -1750,7 +1755,7 @@ pub(crate) mod tests {
                     + nested
                     // The default pool view: no separate placement members.
                     + std::mem::size_of::<PoolView>()
-                    + racer_control_wire::PoolId::DEFAULT.len()
+                    + racer_wire::control::PoolId::DEFAULT.len()
             );
         }
 
@@ -1893,7 +1898,7 @@ pub(crate) mod tests {
         use crate::topology::tests::fixtures::member;
         use crate::topology::tests::fixtures::membership;
         use crate::topology::tests::fixtures::object;
-        use racer_control_wire::MembershipVersion;
+        use racer_wire::control::MembershipVersion;
         use std::sync::Arc;
 
         #[test]
@@ -2406,7 +2411,7 @@ pub(crate) mod tests {
                 member.shares = std::num::NonZeroU32::new(if i % 3 == 0 { 1 } else { 4 }).unwrap();
             }
             let members = Arc::new(
-                Membership::validate(racer_control_wire::MembershipVersion(1), input).unwrap(),
+                Membership::validate(racer_wire::control::MembershipVersion(1), input).unwrap(),
             );
             let cached = Paths::new(Rc::new(LinkHealth::default()), 1);
             let cold = Paths::new(Rc::new(LinkHealth::default()), 0);
@@ -2443,7 +2448,7 @@ pub(crate) mod tests {
             let favored_index = members.position(&favored).unwrap();
             changed[favored_index].shares = std::num::NonZeroU32::new(u32::MAX).unwrap();
             let changed = Arc::new(
-                Membership::validate(racer_control_wire::MembershipVersion(2), changed).unwrap(),
+                Membership::validate(racer_wire::control::MembershipVersion(2), changed).unwrap(),
             );
             let route = cached
                 .shortest(
@@ -2729,7 +2734,7 @@ pub(crate) mod tests {
                     .unwrap_err(),
                     expected
                 );
-                fresh.membership = racer_control_wire::MembershipVersion(2);
+                fresh.membership = racer_wire::control::MembershipVersion(2);
                 assert_eq!(
                     paths.shortest(members.clone(), source, &fresh).unwrap_err(),
                     Error::IncompatibleMembership

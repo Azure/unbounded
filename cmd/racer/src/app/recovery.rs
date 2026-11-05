@@ -575,7 +575,7 @@ fn select(
     workers: &WorkerDirectory,
     (page_capacity, metadata_capacity): (usize, usize),
     keys: &Keyring,
-    caches: &[racer_control_wire::CacheDefinition],
+    caches: &[racer_wire::control::CacheDefinition],
 ) -> Option<CheckpointImage> {
     // The disk scanner supplies newest-first images, never retaining a second
     // decoded candidate while validating the first.
@@ -603,7 +603,7 @@ fn validate_candidate(
     workers: &WorkerDirectory,
     (page_capacity, metadata_capacity): (usize, usize),
     keys: &Keyring,
-    caches: &[racer_control_wire::CacheDefinition],
+    caches: &[racer_wire::control::CacheDefinition],
 ) -> Option<CheckpointImage> {
     // Key and cache IDs can repeat across clusters, so a foreign cut is only a stale hint.
     if &image.cluster != keys.cluster() {
@@ -613,7 +613,7 @@ fn validate_candidate(
     if ids.len() != image.shards.len() || ids != geometry.keys().copied().collect() {
         return None;
     }
-    let available = |cache: &racer_control_wire::CacheId| caches.iter().any(|c| &c.id == cache);
+    let available = |cache: &racer_wire::control::CacheId| caches.iter().any(|c| &c.id == cache);
     Recovery::filter_available(
         &mut image,
         |cache| available(cache) && keys.active(cache, KeyPurpose::Page).is_ok(),
@@ -870,9 +870,9 @@ mod tests {
     fn geometry() -> CheckpointGeometry {
         CheckpointGeometry::new(8192, 4096, 2, Alignment::new(4096, 4096, 4096).unwrap()).unwrap()
     }
-    fn caches() -> Vec<racer_control_wire::CacheDefinition> {
+    fn caches() -> Vec<racer_wire::control::CacheDefinition> {
         let mut cache = crate::app::tests::definition();
-        cache.id = racer_control_wire::CacheId(crate::test_support::security::CACHE.into());
+        cache.id = racer_wire::control::CacheId(crate::test_support::security::CACHE.into());
         vec![cache]
     }
     fn image(sequence: u64, ids: &[WorkerId]) -> CheckpointImage {
@@ -1127,7 +1127,7 @@ mod tests {
         );
         let mut oversized = image(3, &[WorkerId(0), WorkerId(1)]);
         let object = crate::model::ObjectId {
-            cache: racer_control_wire::CacheId(crate::test_support::security::CACHE.into()),
+            cache: racer_wire::control::CacheId(crate::test_support::security::CACHE.into()),
             key: crate::model::CacheKey([9; 32]),
         };
         let owner = node.workers.metadata_owner(&object).unwrap();
@@ -1254,7 +1254,7 @@ mod tests {
         assert_eq!(retained.shards[0].index.entries.len(), 1);
         assert_eq!(retained.shards[0].index.metadata, vec![standalone]);
         let mut missing_page = decoded();
-        missing_page.shards[0].index.entries[0].1.key_id = racer_control_wire::KeyId([99; 16]);
+        missing_page.shards[0].index.entries[0].1.key_id = racer_wire::control::KeyId([99; 16]);
         let filtered = select(
             vec![missing_page],
             &geometry,
@@ -1266,10 +1266,10 @@ mod tests {
         .unwrap();
         assert!(filtered.shards[0].index.entries.is_empty());
         assert_eq!(filtered.shards[0].index.metadata.len(), 1);
-        keys.install(racer_control_wire::KeyringBundle {
-            schema_version: racer_control_wire::KEYRING_SCHEMA_VERSION,
+        keys.install(racer_wire::control::KeyringBundle {
+            schema_version: racer_wire::control::KEYRING_SCHEMA_VERSION,
             cluster: keys.cluster().clone(),
-            generation: racer_control_wire::BundleGeneration(2),
+            generation: racer_wire::control::BundleGeneration(2),
             peer_trust_roots: (*keys.peer_trust_roots().unwrap()).clone(),
             cache_keys: vec![],
         })
@@ -1369,7 +1369,7 @@ mod tests {
         let same = checkpoint::encode(&cut).unwrap();
         let mut foreign_cut = checkpoint::decode(&same).unwrap();
         foreign_cut.cluster =
-            racer_control_wire::ClusterId("44444444-4444-4444-8444-444444444444".into());
+            racer_wire::control::ClusterId("44444444-4444-4444-8444-444444444444".into());
         foreign_cut.sequence = 6;
         let foreign = checkpoint::encode(&foreign_cut).unwrap();
         let decode = |bytes: &[u8]| checkpoint::decode(bytes).unwrap();
@@ -1411,7 +1411,7 @@ mod tests {
             .into_iter()
             .collect();
         let object = ObjectId {
-            cache: racer_control_wire::CacheId(crate::test_support::security::CACHE.into()),
+            cache: racer_wire::control::CacheId(crate::test_support::security::CACHE.into()),
             key: CacheKey([3; 32]),
         };
         let owner = node.workers.metadata_owner(&object).unwrap();

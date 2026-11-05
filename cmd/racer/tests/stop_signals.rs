@@ -33,11 +33,11 @@ impl ClusterControl for Outage {
         Err(BootstrapError::Pending)
     }
 
-    fn endpoints(&self) -> wire_codec::DiscoveredEndpoints {
+    fn endpoints(&self) -> racer::control::rest::DiscoveredEndpoints {
         Default::default()
     }
 
-    fn report(&self, _: u32, _: Vec<racer_control_wire::RailMapping>) {}
+    fn report(&self, _: u32, _: Vec<racer_wire::control::RailMapping>) {}
 }
 
 fn bootstrap_stops_on(signal: libc::c_int) {

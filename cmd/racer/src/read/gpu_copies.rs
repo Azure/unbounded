@@ -394,7 +394,7 @@ mod tests {
         PageId {
             version: ObjectVersion {
                 object: ObjectId {
-                    cache: racer_control_wire::CacheId(
+                    cache: racer_wire::control::CacheId(
                         "00000000-0000-4000-8000-000000000001".into(),
                     ),
                     key: CacheKey([0; 32]),
@@ -545,7 +545,7 @@ mod tests {
                 envelope: PageEnvelope {
                     cipher: PageCipher::Xaes256Gcm,
                     page: page(0),
-                    key_id: racer_control_wire::KeyId([0; 16]),
+                    key_id: racer_wire::control::KeyId([0; 16]),
                     nonce: Nonce([0; 24]),
                     plaintext_length: 1,
                     ciphertext_length: 17,

@@ -15,7 +15,7 @@ use page_alloc::Extent;
 use page_alloc::Generation;
 use page_alloc::SegmentId;
 use page_alloc::Segments;
-use racer_control_wire::KeyId;
+use racer_wire::control::KeyId;
 use std::cell::Cell;
 use std::cell::RefCell;
 use std::collections::VecDeque;
@@ -803,7 +803,7 @@ impl Index {
     pub fn clock(&self) -> &racer_io::Clock {
         &self.clock
     }
-    fn available(&self, cache: &racer_control_wire::CacheId) -> bool {
+    fn available(&self, cache: &racer_wire::control::CacheId) -> bool {
         self.availability.metadata(cache)
     }
     pub fn worker(&self) -> WorkerId {
@@ -1317,12 +1317,12 @@ impl Index {
         )
     }
     #[cfg(test)]
-    pub fn remove_cache(&self, cache: &racer_control_wire::CacheId) {
+    pub fn remove_cache(&self, cache: &racer_wire::control::CacheId) {
         self.remove_caches(&std::collections::HashSet::from([cache.clone()]));
     }
     /// Remove holds, pages, and metadata for every cache in `caches` in one
     /// pass over each table.
-    pub fn remove_caches(&self, caches: &std::collections::HashSet<racer_control_wire::CacheId>) {
+    pub fn remove_caches(&self, caches: &std::collections::HashSet<racer_wire::control::CacheId>) {
         if caches.is_empty() {
             return;
         }
@@ -1518,7 +1518,7 @@ mod tests {
     use super::*;
     use crate::model::CacheKey;
     use crate::model::StrongEtag;
-    use racer_control_wire::CacheId;
+    use racer_wire::control::CacheId;
 
     fn segments(bytes: u64, count: usize) -> Segments {
         let s = Segments::new(bytes);
@@ -2704,7 +2704,7 @@ mod tests {
 mod priority_tests {
     use super::*;
     use crate::model::{CacheKey, StrongEtag};
-    use racer_control_wire::{CacheDefinition, CacheId};
+    use racer_wire::control::{CacheDefinition, CacheId};
 
     const PAGE: u64 = crate::model::PAGE_BYTES;
 
@@ -2728,7 +2728,7 @@ mod priority_tests {
             client_socket: "/client".into(),
             origin_socket: "/origin".into(),
             priority,
-            mode: racer_control_wire::CacheMode::Cached,
+            mode: racer_wire::control::CacheMode::Cached,
             origin: None,
         }
     }

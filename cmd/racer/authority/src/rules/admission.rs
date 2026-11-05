@@ -7,7 +7,7 @@
 //! what the seat serves answers 503 (`Unavailable`). A snapshot reply is a
 //! delta when the client names the exact base, else the full image.
 
-use racer_control_wire::ProtocolFailure;
+use racer_wire::control::ProtocolFailure;
 use std::collections::{HashSet, VecDeque};
 
 /// Outcome of [`WriteQueue::admit`].

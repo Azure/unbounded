@@ -32,8 +32,8 @@ use page_alloc::Generation;
 use page_alloc::SegmentLease;
 use page_alloc::Segments;
 use page_alloc::Slab;
-use racer_control_wire::CacheId;
-use racer_control_wire::KeyId;
+use racer_wire::control::CacheId;
+use racer_wire::control::KeyId;
 use sha2::Digest;
 use sha2::Sha256;
 use std::cell::Cell;
@@ -482,7 +482,7 @@ struct PendingVersion {
     pages: usize,
     metadata: VersionMetadata,
     /// The key of every queued page, or `None` once two keys were seen.
-    key: Option<racer_control_wire::KeyId>,
+    key: Option<racer_wire::control::KeyId>,
 }
 
 /// Queued dirty copies keyed by page, with a per-version summary kept in step
@@ -685,7 +685,7 @@ impl StoreWriter {
         self.metrics.observe_disks(samples);
     }
     /// Sample per-cache resident bytes and fair shares for published caches.
-    pub(crate) fn observe_cache_disks(&self, caches: &[racer_control_wire::CacheDefinition]) {
+    pub(crate) fn observe_cache_disks(&self, caches: &[racer_wire::control::CacheDefinition]) {
         let usage = self.retention().cache_disk(self.index.disk_capacity());
         self.metrics
             .observe_cache_disks(cache_disk_samples(caches, usage));
@@ -2242,9 +2242,9 @@ pub(super) struct Decoder<'a>(pub(super) &'a [u8]);
 impl<'a> Decoder<'a> {
     fn read<T>(
         &mut self,
-        read: impl FnOnce(&mut wire_codec::Reader<'a>) -> wire_codec::Result<T>,
+        read: impl FnOnce(&mut racer_wire::codec::Reader<'a>) -> racer_wire::codec::Result<T>,
     ) -> Result<T> {
-        let mut reader = wire_codec::Reader::new(self.0, wire_codec::Endian::Little);
+        let mut reader = racer_wire::codec::Reader::new(self.0, racer_wire::codec::Endian::Little);
         let result = read(&mut reader);
         self.0 = reader.remaining();
         result.map_err(|_| Error::CorruptRecord)
@@ -2270,7 +2270,7 @@ impl<'a> Decoder<'a> {
 /// catalog size and the usage list. Usage for caches that are no longer
 /// published is dropped.
 fn cache_disk_samples(
-    caches: &[racer_control_wire::CacheDefinition],
+    caches: &[racer_wire::control::CacheDefinition],
     usage: Vec<crate::retention::CacheDisk>,
 ) -> Vec<crate::telemetry::CacheDiskUsage> {
     let names: std::collections::HashMap<&CacheId, &str> = caches

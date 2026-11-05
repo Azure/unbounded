@@ -14,7 +14,7 @@ use flow_control::Policy;
 use flow_control::Quotas;
 use flow_control::Rejection;
 use flow_control::SharedQuotas;
-use racer_control_wire::CacheId;
+use racer_wire::control::CacheId;
 use std::os::fd::OwnedFd;
 use std::sync::Arc;
 use std::sync::OnceLock;
@@ -111,13 +111,13 @@ mod observer_tests {
         let floor = quotas.policy().floor(class);
         let a = CacheId("a".into());
         let b = CacheId("b".into());
-        let definition = |id: &CacheId, priority| racer_control_wire::CacheDefinition {
+        let definition = |id: &CacheId, priority| racer_wire::control::CacheDefinition {
             id: id.clone(),
             name: id.0.clone(),
             client_socket: "/c".into(),
             origin_socket: "/o".into(),
             priority,
-            mode: racer_control_wire::CacheMode::Cached,
+            mode: racer_wire::control::CacheMode::Cached,
             origin: None,
         };
         // Unknown caches use the default priority, so shares start equal.
@@ -156,13 +156,13 @@ mod observer_tests {
         let quotas = Quotas::new(AdmissionPolicy::new(limits));
         let a = CacheId("a".into());
         let z = CacheId("z".into());
-        let definition = |id: &CacheId, priority| racer_control_wire::CacheDefinition {
+        let definition = |id: &CacheId, priority| racer_wire::control::CacheDefinition {
             id: id.clone(),
             name: id.0.clone(),
             client_socket: "/c".into(),
             origin_socket: "/o".into(),
             priority,
-            mode: racer_control_wire::CacheMode::Cached,
+            mode: racer_wire::control::CacheMode::Cached,
             origin: None,
         };
         quotas
@@ -170,7 +170,7 @@ mod observer_tests {
             .weights()
             .update(&[definition(&a, 1000), definition(&z, 0)]);
         quotas.reweigh();
-        let context = racer_object_wire::client::MAX_HEAD_BYTES;
+        let context = racer_wire::object::client::MAX_HEAD_BYTES;
         let _active = quotas
             .reserve(Some(&a), ResourceClass::RequestContext, context)
             .unwrap();
@@ -661,13 +661,13 @@ mod tests {
         }
         // With a small budget the allowance is clipped to the equal split, so
         // a priority-0 cache cannot take more than an equal-priority peer.
-        let definition = |id: &CacheId, priority| racer_control_wire::CacheDefinition {
+        let definition = |id: &CacheId, priority| racer_wire::control::CacheDefinition {
             id: id.clone(),
             name: id.0.clone(),
             client_socket: "/c".into(),
             origin_socket: "/o".into(),
             priority,
-            mode: racer_control_wire::CacheMode::Cached,
+            mode: racer_wire::control::CacheMode::Cached,
             origin: None,
         };
         limits.range_window_pages = std::num::NonZeroUsize::new(2).unwrap();
@@ -1025,7 +1025,7 @@ mod tests {
     /// Owner contracts for node-wide and cache-keyed admission classes.
     mod capacity {
         use super::*;
-        use racer_control_wire::CacheId;
+        use racer_wire::control::CacheId;
         use std::num::NonZeroUsize;
 
         const PLAIN: usize = PAGE_BYTES as usize;

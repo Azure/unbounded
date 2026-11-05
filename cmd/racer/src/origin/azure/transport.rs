@@ -21,7 +21,7 @@ use crate::remote::{RemoteEndpoint, Resolver};
 use crate::runtime::RequestScope;
 use http1::tls::rustls::ClientConfig;
 use http1::{MessageHead, StartLine};
-use racer_control_wire::{AzureContainerUrl, OriginDefinition};
+use racer_wire::control::{AzureContainerUrl, OriginDefinition};
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;

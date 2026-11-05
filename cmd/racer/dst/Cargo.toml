@@ -14,7 +14,6 @@ path = "src/main.rs"
 racer-authority = { path = "../authority" }
 racer-io = { path = "../io" }
 racer-core = { path = "../core" }
-racer-control-wire = { path = "../control-wire" }
-racer-object-wire = { path = "../object-wire" }
+racer-wire = { path = "../wire" }
 topology = { path = "../topology" }
 serde_json = "1"

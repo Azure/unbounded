@@ -7,8 +7,8 @@
 
 use crate::error::Error;
 use crate::error::Result;
-use racer_control_wire::NodeId;
-use racer_control_wire::RailId;
+use racer_wire::control::NodeId;
+use racer_wire::control::RailId;
 use sha2::Digest;
 use sha2::Sha256;
 

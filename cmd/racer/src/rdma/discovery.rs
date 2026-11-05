@@ -10,8 +10,8 @@ use std::sync::Mutex;
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
 
-use racer_control_wire::RailId;
-use racer_control_wire::RailMapping;
+use racer_wire::control::RailId;
+use racer_wire::control::RailMapping;
 use rdma_verbs::PortInfo;
 use rdma_verbs::discovery::valid_device;
 

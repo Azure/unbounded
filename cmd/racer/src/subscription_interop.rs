@@ -26,16 +26,16 @@ use crate::worker::CryptoRuntime;
 use error::Operation;
 use model::PAGE_BYTES;
 use model::*;
-use racer_control_wire::BundleGeneration;
-use racer_control_wire::CacheEncryptionKey;
-use racer_control_wire::CacheKeyPurpose;
-use racer_control_wire::CacheKeyRef;
-use racer_control_wire::CacheKeyState;
-use racer_control_wire::KeyringBundle;
-use racer_control_wire::{CacheId, ClusterId, NodeId};
 use racer_crypto::identity::KeyEpochs;
 use racer_crypto::identity::Keyring;
 use racer_io::ring::IoBuffer;
+use racer_wire::control::BundleGeneration;
+use racer_wire::control::CacheEncryptionKey;
+use racer_wire::control::CacheKeyPurpose;
+use racer_wire::control::CacheKeyRef;
+use racer_wire::control::CacheKeyState;
+use racer_wire::control::KeyringBundle;
+use racer_wire::control::{CacheId, ClusterId, NodeId};
 use runtime::Reactor;
 use runtime::RequestScope;
 use security::OriginContext;
@@ -145,7 +145,7 @@ impl NoPeer {
     fn direct_hedge_available(
         &self,
         _: &std::sync::Arc<crate::topology::Membership>,
-        _: &racer_control_wire::NodeId,
+        _: &racer_wire::control::NodeId,
     ) -> bool {
         false
     }
@@ -191,7 +191,7 @@ struct SubscriptionFixture {
     writer: Rc<store::StoreWriter>,
     memory: Rc<memory::MemoryCache>,
     admission: Rc<flow_control::Quotas<AdmissionPolicy>>,
-    cache: racer_control_wire::CacheDefinition,
+    cache: racer_wire::control::CacheDefinition,
     scope: RequestScope,
 }
 
@@ -206,9 +206,9 @@ impl SubscriptionFixture {
         use http::Delivery;
         use memory::BufferPool;
         use memory::MemoryCache;
-        use racer_control_wire::CacheDefinition;
-        use racer_control_wire::Publication;
-        use racer_control_wire::*;
+        use racer_wire::control::CacheDefinition;
+        use racer_wire::control::Publication;
+        use racer_wire::control::*;
         use read::Coordinator;
         use read::candidates::CandidatePolicy;
         use read::dispatch::WorkerDirectory;
@@ -245,23 +245,23 @@ impl SubscriptionFixture {
             reactor.ctx().clock.clone(),
         ));
         let (client_socket, origin_socket) =
-            racer_control_wire::canonical_socket_paths("interop").unwrap();
+            racer_wire::control::canonical_socket_paths("interop").unwrap();
         let cache = CacheDefinition {
             id: CacheId("33333333-3333-4333-8333-333333333333".into()),
             name: "interop".into(),
             client_socket,
             origin_socket,
-            priority: racer_control_wire::DEFAULT_PRIORITY,
-            mode: racer_control_wire::CacheMode::Cached,
+            priority: racer_wire::control::DEFAULT_PRIORITY,
+            mode: racer_wire::control::CacheMode::Cached,
             origin: None,
         };
         snapshots
             .apply(Publication {
-                schema_version: racer_control_wire::SCHEMA_VERSION,
+                schema_version: racer_wire::control::SCHEMA_VERSION,
                 cluster: keys.cluster().clone(),
                 sequence: PublicationSequence(1),
                 membership_version: MembershipVersion(1),
-                members: vec![racer_control_wire::Member {
+                members: vec![racer_wire::control::Member {
                     node: keys.node().clone(),
                     shares: std::num::NonZeroU32::new(1).unwrap(),
                     peer_endpoint: "127.0.0.1:1".into(),
@@ -269,7 +269,7 @@ impl SubscriptionFixture {
                     site: String::new(),
                 }],
                 caches: vec![cache.clone()],
-                pools: racer_control_wire::default_pools(std::slice::from_ref(&cache)),
+                pools: racer_wire::control::default_pools(std::slice::from_ref(&cache)),
             })
             .unwrap();
         let directory = Arc::new(
@@ -526,7 +526,7 @@ fn interop_keys(clock: &racer_io::Clock) -> racer_crypto::identity::Keyring {
         .self_signed(&rcgen::KeyPair::generate().unwrap())
         .unwrap();
     keys.install(KeyringBundle {
-        schema_version: racer_control_wire::KEYRING_SCHEMA_VERSION,
+        schema_version: racer_wire::control::KEYRING_SCHEMA_VERSION,
         cluster,
         generation: BundleGeneration(1),
         peer_trust_roots: vec![ca.der().to_vec()],

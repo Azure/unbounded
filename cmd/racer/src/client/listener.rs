@@ -20,9 +20,9 @@ pub(super) use crate::uds_endpoint::file_path;
 use crate::uds_endpoint::publication::{Endpoint, Publication, Rename, Replacement};
 #[cfg(test)]
 pub(super) use crate::uds_endpoint::same_inode;
-use racer_control_wire::CacheDefinition;
-use racer_control_wire::CacheId;
 use racer_io::scoped::ready_set::ReadySet;
+use racer_wire::control::CacheDefinition;
+use racer_wire::control::CacheId;
 use std::cell::Cell;
 use std::cell::RefCell;
 use std::collections::BTreeMap;
@@ -373,7 +373,7 @@ impl ClientListeners {
     ) -> Operation<'a, PreparedListeners> {
         Box::pin(async move {
             scope.check()?;
-            racer_control_wire::validate_definitions(definitions)?;
+            racer_wire::control::validate_definitions(definitions)?;
             if !self.accepting.get() {
                 return Err(Error::Unavailable);
             }

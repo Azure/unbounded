@@ -743,7 +743,7 @@ fn owner_key(cache: &str, page: u64, owner: u16) -> u64 {
     use racer::model::StrongEtag;
     use racer::model::WorkerId;
     use racer::read::dispatch::WorkerMap;
-    use racer_control_wire::CacheId;
+    use racer_wire::control::CacheId;
     let map = WorkerMap::new((0..4).map(WorkerId).collect()).unwrap();
     (0..10000)
         .find(|key| {
@@ -767,7 +767,7 @@ fn owner_key(cache: &str, page: u64, owner: u16) -> u64 {
 #[test]
 #[ignore = "requires root, mount namespaces, io_uring and O_DIRECT; blocked listener publication and recovery"]
 fn production_blocked_listener_publication() {
-    use racer_control_wire::PublicationSequence;
+    use racer_wire::control::PublicationSequence;
     let scratch = Scratch::new();
     let profile = Profile::new(2, 113, 2);
     let control = control::Control::start_with(&scratch.0, profile.caches.clone());
@@ -898,9 +898,9 @@ fn production_peer_and_failed_neighbor_progress() {
     use racer::topology::Member;
     use racer::topology::Membership;
     use racer::topology::Placement;
-    use racer_control_wire::CacheId;
-    use racer_control_wire::MembershipVersion;
-    use racer_control_wire::NodeId;
+    use racer_wire::control::CacheId;
+    use racer_wire::control::MembershipVersion;
+    use racer_wire::control::NodeId;
     const OTHER: &str = "33333333-3333-4333-8333-333333333333";
     for pairs in [1, 2, 4] {
         let first_root = Scratch::new();
@@ -1005,7 +1005,7 @@ fn production_peer_and_failed_neighbor_progress() {
         // Preserve failed neighbor membership: deletion would hide the failure.
         assert_eq!(
             control.publication.lock().unwrap().sequence,
-            racer_control_wire::PublicationSequence(1)
+            racer_wire::control::PublicationSequence(1)
         );
         for origin in &origins[receiver] {
             origin.offline.store(false, Ordering::Release);
@@ -1037,9 +1037,9 @@ fn production_remote_bootstrap_one_get_and_empty() {
     use racer::topology::Member;
     use racer::topology::Membership;
     use racer::topology::Placement;
-    use racer_control_wire::CacheId;
-    use racer_control_wire::MembershipVersion;
-    use racer_control_wire::NodeId;
+    use racer_wire::control::CacheId;
+    use racer_wire::control::MembershipVersion;
+    use racer_wire::control::NodeId;
     for length in [0, 113] {
         let roots: Vec<_> = (0..4).map(|_| Scratch::new()).collect();
         let profile = Profile::new(1, length, 1);

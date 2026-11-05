@@ -1,8 +1,8 @@
 //! Object protocol values plus application-owned page encryption descriptors.
 
 use crate::error::{Error, Result};
-use racer_control_wire::KeyId;
-pub use racer_object_wire::model::*;
+use racer_wire::control::KeyId;
+pub use racer_wire::object::model::*;
 
 /// Authentication tag size in the application's page encryption format.
 pub const AEAD_TAG_BYTES: u32 = 16;
@@ -66,9 +66,9 @@ impl PageEnvelope {
 }
 
 impl PageDescriptor for PageEnvelope {
-    fn validate_structure(&self) -> racer_object_wire::Result<()> {
+    fn validate_structure(&self) -> racer_wire::object::Result<()> {
         self.validate()
-            .map_err(|_| racer_object_wire::Error::CorruptRecord)
+            .map_err(|_| racer_wire::object::Error::CorruptRecord)
     }
 
     fn page(&self) -> &PageId {
@@ -83,7 +83,7 @@ impl PageDescriptor for PageEnvelope {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use racer_control_wire::CacheId;
+    use racer_wire::control::CacheId;
 
     fn descriptor(etag: &str, length: u64) -> VersionMetadata {
         VersionMetadata {
@@ -121,7 +121,7 @@ mod tests {
             plaintext_length: 3,
             ciphertext_length: 19,
         };
-        let corrupt = Err(racer_object_wire::Error::CorruptRecord);
+        let corrupt = Err(racer_wire::object::Error::CorruptRecord);
         assert_eq!(descriptor.validate_page(&envelope), Ok(()));
         envelope.ciphertext_length = 18;
         assert_eq!(descriptor.validate_page(&envelope), corrupt);

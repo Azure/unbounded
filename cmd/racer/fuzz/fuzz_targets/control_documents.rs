@@ -4,9 +4,9 @@
 use libfuzzer_sys::fuzz_target;
 
 fuzz_target!(|data: &[u8]| {
-    let _ = racer_control_wire::decode_publication(data);
-    let _ = racer_control_wire::decode_bundle(data);
-    let _ = racer_control_wire::decode_error(data);
-    let _ = racer_control_wire::decode_enrollment_request(data);
-    let _ = racer_control_wire::decode_enrollment_response(data);
+    let _ = racer_wire::control::decode_publication(data);
+    let _ = racer_wire::control::decode_bundle(data);
+    let _ = racer_wire::control::decode_error(data);
+    let _ = racer_wire::control::decode_enrollment_request(data);
+    let _ = racer_wire::control::decode_enrollment_response(data);
 });

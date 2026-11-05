@@ -33,8 +33,8 @@ use racer_authority::{
         state::{StateError, StateRecord, Term},
     },
 };
-use racer_control_wire::ProtocolFailure;
 use racer_core::time::SplitMix64;
+use racer_wire::control::ProtocolFailure;
 use serde_json::{Value, json};
 
 use super::ctl_report::{Invariants, Metrics, peak_rss_bytes};
@@ -1222,7 +1222,7 @@ impl ControlSim {
     /// queue grace (`server.rs` `queued_write_slot`).
     fn reply(&mut self, c: u32, s: u8, now: Nanos) {
         let e = self.epoch[c as usize];
-        let wait = racer_control_wire::POLL_WAIT.as_nanos() as Nanos;
+        let wait = racer_wire::control::POLL_WAIT.as_nanos() as Nanos;
         let start = self.poll_ns[c as usize].min(now);
         let deadline_ns = start
             + (now - start) / wait * wait

@@ -1171,8 +1171,8 @@ mod tests {
         gid[1] = 0x80;
         gid[15] = 0x02;
         inventory
-            .update(vec![racer_control_wire::RailMapping {
-                rail: racer_control_wire::RailId(0),
+            .update(vec![racer_wire::control::RailMapping {
+                rail: racer_wire::control::RailId(0),
                 device: "mlx5_0".into(),
                 port: 1,
                 gid: Some(gid),

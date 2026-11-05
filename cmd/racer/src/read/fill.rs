@@ -73,7 +73,7 @@ type LocalPlaintext = super::shared::Table<PageId, Result<Option<PageResult>>>;
 /// Source key of each running local plaintext job, once its copy is chosen.
 /// New followers are admitted only while that key remains available.
 type LocalPlaintextKeys = std::cell::RefCell<
-    std::collections::BTreeMap<PageId, Rc<std::cell::Cell<Option<racer_control_wire::KeyId>>>>,
+    std::collections::BTreeMap<PageId, Rc<std::cell::Cell<Option<racer_wire::control::KeyId>>>>,
 >;
 
 /// A host descriptor to hand to cuFile, or None for simulated descriptors.
@@ -163,13 +163,13 @@ impl Fill {
     /// Published mode of `cache`.
     pub(crate) fn mode(
         &self,
-        cache: &racer_control_wire::CacheId,
-    ) -> racer_control_wire::CacheMode {
+        cache: &racer_wire::control::CacheId,
+    ) -> racer_wire::control::CacheMode {
         self.dependencies.memory.availability().mode(cache)
     }
 
     /// Whether `cache` retains no pages or metadata on this node.
-    pub(crate) fn passthrough(&self, cache: &racer_control_wire::CacheId) -> bool {
+    pub(crate) fn passthrough(&self, cache: &racer_wire::control::CacheId) -> bool {
         self.mode(cache).passthrough()
     }
 
@@ -342,7 +342,7 @@ impl Fill {
         &self,
         page: &PageId,
         scope: &RequestScope,
-        source_key: &std::cell::Cell<Option<racer_control_wire::KeyId>>,
+        source_key: &std::cell::Cell<Option<racer_wire::control::KeyId>>,
     ) -> Result<Option<PageResult>> {
         let Some(cached) = self.metrics.lookup(
             LookupTier::Ciphertext,
@@ -633,7 +633,7 @@ impl Fill {
     }
     pub(super) fn reserve_with_reclamation(
         &self,
-        cache: &racer_control_wire::CacheId,
+        cache: &racer_wire::control::CacheId,
         class: ResourceClass,
         amount: usize,
     ) -> Result<flow_control::Charge<AdmissionPolicy>> {
@@ -647,7 +647,7 @@ impl Fill {
 
     pub(super) fn reserve_reclaiming(
         &self,
-        cache: &racer_control_wire::CacheId,
+        cache: &racer_wire::control::CacheId,
         class: ResourceClass,
         amount: usize,
         reserve: impl Fn() -> Result<flow_control::Charge<AdmissionPolicy>>,
@@ -821,7 +821,7 @@ impl Fill {
     /// before origin I/O using the same bounded reclamation as ordinary fills.
     pub(crate) fn reserve_bootstrap(
         &self,
-        cache: &racer_control_wire::CacheId,
+        cache: &racer_wire::control::CacheId,
     ) -> Result<flow_control::Charge<AdmissionPolicy>> {
         self.reserve_with_reclamation(cache, ResourceClass::Plaintext, PAGE_BYTES as usize)
     }
@@ -978,7 +978,7 @@ impl Fill {
         // never contacts peers.
         let mode = self.mode(&page.version.object.cache);
         if !cached
-            && mode != racer_control_wire::CacheMode::PassthroughLocal
+            && mode != racer_wire::control::CacheMode::PassthroughLocal
             && let Some(fetched) = self
                 .shared_gpu_copy(&page, membership.clone(), context, scope, budget, target)
                 .await?
@@ -1151,7 +1151,7 @@ impl Fill {
                 Err(_) => {}
             }
         }
-        if self.mode(&page.version.object.cache) == racer_control_wire::CacheMode::PassthroughLocal
+        if self.mode(&page.version.object.cache) == racer_wire::control::CacheMode::PassthroughLocal
         {
             return Ok(None);
         }
@@ -1858,7 +1858,7 @@ impl Fill {
             return Err(Error::CorruptRecord);
         }
         let mode = self.mode(&page.version.object.cache);
-        if mode == racer_control_wire::CacheMode::PassthroughLocal {
+        if mode == racer_wire::control::CacheMode::PassthroughLocal {
             // A local-route bootstrap comes from this node's own origin.
             self.dependencies.candidates.local_authority(
                 membership,
@@ -2092,7 +2092,7 @@ impl Fill {
         page: &PageId,
         scope: &RequestScope,
         want_plaintext: bool,
-        source_key: Option<&std::cell::Cell<Option<racer_control_wire::KeyId>>>,
+        source_key: Option<&std::cell::Cell<Option<racer_wire::control::KeyId>>>,
     ) -> Result<Option<AcquiredPage>> {
         scope.check()?;
         // Residual copies from before a switch to passthrough are never served.
@@ -2269,7 +2269,7 @@ impl Fill {
         use racer_core::read::Source;
         use racer_core::read::acquisition::Terminal;
         let mode = self.mode(&page.version.object.cache);
-        if mode == racer_control_wire::CacheMode::PassthroughLocal {
+        if mode == racer_wire::control::CacheMode::PassthroughLocal {
             return self
                 .acquire_local_origin(
                     page,
@@ -2562,7 +2562,7 @@ impl Fill {
         scope: &RequestScope,
         budget: &mut AcquisitionBudget,
         want_plaintext: bool,
-        mode: racer_control_wire::CacheMode,
+        mode: racer_wire::control::CacheMode,
     ) -> Result<AcquiredPage> {
         let authority = self.dependencies.candidates.local_authority(
             membership,
@@ -3140,7 +3140,7 @@ mod tests {
     use crate::model::ObjectVersion;
     use crate::model::StrongEtag;
     use crate::model::VersionMetadata;
-    use racer_control_wire::CacheId;
+    use racer_wire::control::CacheId;
     #[test]
     fn decrypt_source_counters_preserve_results_and_ignore_non_corruption() {
         let metrics = Metrics::default();

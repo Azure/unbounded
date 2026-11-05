@@ -37,7 +37,7 @@ use crate::security;
 use crate::security::CryptoClient;
 use crate::security::CryptoPort;
 use crate::security::IoCryptoPort;
-use racer_control_wire::RailMapping;
+use racer_wire::control::RailMapping;
 use std::collections::BTreeMap;
 use std::collections::HashMap;
 use std::collections::HashSet;
@@ -885,7 +885,7 @@ fn colocated_plan(max_threads: usize, workers: u16) -> AffinityPlan {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use racer_control_wire::CacheId;
+    use racer_wire::control::CacheId;
     use std::thread;
 
     #[test]

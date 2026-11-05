@@ -30,10 +30,10 @@ use crate::topology::RouteBudget;
 use http1::Header;
 use http1::MessageHead;
 use http1::StartLine;
-use racer_control_wire as state;
-use racer_control_wire as wire;
-use racer_control_wire::CacheId;
-use racer_control_wire::MembershipVersion;
+use racer_wire::control as state;
+use racer_wire::control as wire;
+use racer_wire::control::CacheId;
+use racer_wire::control::MembershipVersion;
 use std::collections::VecDeque;
 use std::future::Future;
 use std::io::Read;
@@ -416,7 +416,7 @@ impl ControlFixture {
         std::fs::write(&config.service_account_token, b"fixture.token").unwrap();
         let mut fixture = Self {
             bundle: Arc::new(Mutex::new(wire::KeyringBundle {
-                schema_version: racer_control_wire::KEYRING_SCHEMA_VERSION,
+                schema_version: racer_wire::control::KEYRING_SCHEMA_VERSION,
                 cluster: config.cluster.clone(),
                 generation: wire::BundleGeneration(1),
                 peer_trust_roots: vec![ca.der().to_vec()],
@@ -649,7 +649,7 @@ pub(super) fn local_worker_with_fabric(
     config: &Config,
     node: &Arc<NodeState>,
     id: u16,
-    discovered_nics: Vec<racer_control_wire::RailMapping>,
+    discovered_nics: Vec<racer_wire::control::RailMapping>,
 ) -> (WorkerApplication, WorkerRuntime, PageCryptoEngine) {
     let worker = WorkerId(id);
     let admission = Rc::new(flow_control::Quotas::new(AdmissionPolicy::new(
@@ -678,16 +678,16 @@ pub(super) fn local_worker_with_fabric(
     )
 }
 
-pub(super) fn definition() -> racer_control_wire::CacheDefinition {
+pub(super) fn definition() -> racer_wire::control::CacheDefinition {
     let (client_socket, origin_socket) =
-        racer_control_wire::canonical_socket_paths("app-lifecycle").unwrap();
-    racer_control_wire::CacheDefinition {
-        id: racer_control_wire::CacheId("33333333-3333-4333-8333-333333333333".into()),
+        racer_wire::control::canonical_socket_paths("app-lifecycle").unwrap();
+    racer_wire::control::CacheDefinition {
+        id: racer_wire::control::CacheId("33333333-3333-4333-8333-333333333333".into()),
         name: "app-lifecycle".into(),
         client_socket,
         origin_socket,
-        priority: racer_control_wire::DEFAULT_PRIORITY,
-        mode: racer_control_wire::CacheMode::Cached,
+        priority: racer_wire::control::DEFAULT_PRIORITY,
+        mode: racer_wire::control::CacheMode::Cached,
         origin: None,
     }
 }
@@ -695,16 +695,16 @@ pub(super) fn definition() -> racer_control_wire::CacheDefinition {
 pub(super) fn publication(
     config: &Config,
     sequence: u64,
-    caches: Vec<racer_control_wire::CacheDefinition>,
+    caches: Vec<racer_wire::control::CacheDefinition>,
 ) -> state::Publication {
     state::Publication {
         pools: Vec::new(),
-        schema_version: racer_control_wire::SCHEMA_VERSION,
+        schema_version: racer_wire::control::SCHEMA_VERSION,
         cluster: config.cluster.clone(),
         sequence: wire::PublicationSequence(sequence),
         // Pools cover the caches, so each catalog takes its own version.
-        membership_version: racer_control_wire::MembershipVersion(sequence),
-        members: vec![racer_control_wire::Member {
+        membership_version: racer_wire::control::MembershipVersion(sequence),
+        members: vec![racer_wire::control::Member {
             node: config.node.clone(),
             shares: std::num::NonZeroU32::new(1).unwrap(),
             peer_endpoint: "127.0.0.1:7443".into(),
@@ -1556,9 +1556,9 @@ fn composes_http_and_optional_rdma_without_operational_side_effects() {
         assert_eq!(worker.poll_budgeted(&mut cx, 0), Err(Error::Unavailable));
         assert_eq!(worker.poll_budgeted(&mut cx, 1), Err(Error::Unavailable));
         // Admission bounds retained generations once across the node.
-        let mut publication = racer_control_wire::decode_publication(include_bytes!(concat!(
+        let mut publication = racer_wire::control::decode_publication(include_bytes!(concat!(
             env!("CARGO_MANIFEST_DIR"),
-            "/control-wire/testdata/publication.json"
+            "/wire/testdata/publication.json"
         )))
         .unwrap();
         publication.cluster = config.cluster.clone();
@@ -1588,10 +1588,10 @@ fn shared_factory_is_send_and_sync_without_moving_worker_graphs() {
 #[test]
 fn multiworker_memberships_retire_after_request_leases_and_reuse_capacity() {
     use crate::peer::PeerNetwork;
-    use racer_control_wire::MembershipVersion;
-    let mut publication = racer_control_wire::decode_publication(include_bytes!(concat!(
+    use racer_wire::control::MembershipVersion;
+    let mut publication = racer_wire::control::decode_publication(include_bytes!(concat!(
         env!("CARGO_MANIFEST_DIR"),
-        "/control-wire/testdata/publication.json"
+        "/wire/testdata/publication.json"
     )))
     .unwrap();
     let local = publication.members[0].node.clone();
@@ -1688,7 +1688,7 @@ fn removal_visibility_changes_without_worker_or_checkpoint_barriers() {
 
 #[test]
 fn snapshot_refresh_purges_cache_entering_passthrough() {
-    use racer_control_wire as wire;
+    use racer_wire::control as wire;
     let config = crate::test_support::cluster::config(false);
     let node = Arc::new(NodeState::default());
     let (mut worker, _, _) = local_worker(&config, &node, 1);
@@ -1784,7 +1784,7 @@ fn snapshot_refresh_purges_cache_entering_passthrough() {
 
 #[test]
 fn snapshot_refresh_retries_canceled_publication_and_applies_skipped_removal() {
-    use racer_control_wire as wire;
+    use racer_wire::control as wire;
     let config = crate::test_support::cluster::config(false);
     let node = Arc::new(NodeState::default());
     let (mut worker, _, _) = local_worker(&config, &node, 1);
@@ -1842,7 +1842,7 @@ fn snapshot_refresh_retries_canceled_publication_and_applies_skipped_removal() {
         .apply(publication(&config, 2, vec![]))
         .unwrap();
     let mut replacement = original.clone();
-    replacement.id = racer_control_wire::CacheId("55555555-5555-4555-8555-555555555555".into());
+    replacement.id = racer_wire::control::CacheId("55555555-5555-4555-8555-555555555555".into());
     worker
         .snapshots
         .apply(publication(&config, 3, vec![replacement.clone()]))
@@ -1889,7 +1889,7 @@ fn two_worker_removal_preserves_late_driver_and_blocks_late_memory_and_disk_fill
     first
         .keys
         .install(wire::KeyringBundle {
-            schema_version: racer_control_wire::KEYRING_SCHEMA_VERSION,
+            schema_version: racer_wire::control::KEYRING_SCHEMA_VERSION,
             cluster: config.cluster.clone(),
             generation: wire::BundleGeneration(2),
             peer_trust_roots: (*first.keys.peer_trust_roots().unwrap()).clone(),
@@ -2602,13 +2602,13 @@ fn removal_publication_finishes_locally_after_controller_disappears() {
     let diagnostic_address = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     config.diagnostics_listen = diagnostic_address.local_addr().unwrap();
     drop(diagnostic_address);
-    let keep = racer_control_wire::CacheDefinition {
+    let keep = racer_wire::control::CacheDefinition {
         id: CacheId("44444444-4444-4444-8444-444444444444".into()),
         name: "keep".into(),
         client_socket: "/run/racer/keep/client/socket".into(),
         origin_socket: "/run/racer/keep/origin/socket".into(),
-        priority: racer_control_wire::DEFAULT_PRIORITY,
-        mode: racer_control_wire::CacheMode::Cached,
+        priority: racer_wire::control::DEFAULT_PRIORITY,
+        mode: racer_wire::control::CacheMode::Cached,
         origin: None,
     };
     *fixture.publication.lock().unwrap() =
@@ -2637,7 +2637,7 @@ fn removal_publication_finishes_locally_after_controller_disappears() {
     worker
         .keys
         .install(wire::KeyringBundle {
-            schema_version: racer_control_wire::KEYRING_SCHEMA_VERSION,
+            schema_version: racer_wire::control::KEYRING_SCHEMA_VERSION,
             cluster: config.cluster.clone(),
             generation: wire::BundleGeneration(2),
             peer_trust_roots: (*worker.keys.peer_trust_roots().unwrap()).clone(),
@@ -3035,7 +3035,7 @@ fn two_worker_real_control_key_lease_drain_and_checkpoint_cut() {
         .unwrap();
     assert_eq!(node.prepared.load(Ordering::Acquire), 2);
     assert!(node.observations.health.ready());
-    let cache = racer_control_wire::CacheId("33333333-3333-4333-8333-333333333333".into());
+    let cache = racer_wire::control::CacheId("33333333-3333-4333-8333-333333333333".into());
     let key = wire::CacheKeyRef {
         cache: cache.clone(),
         id: crate::model::key_id_from_generation(2, 8).unwrap(),
@@ -3043,7 +3043,7 @@ fn two_worker_real_control_key_lease_drain_and_checkpoint_cut() {
     };
     let roots = (*keys.peer_trust_roots().unwrap()).clone();
     keys.install(wire::KeyringBundle {
-        schema_version: racer_control_wire::KEYRING_SCHEMA_VERSION,
+        schema_version: racer_wire::control::KEYRING_SCHEMA_VERSION,
         cluster: app.config.cluster.clone(),
         generation: wire::BundleGeneration(2),
         peer_trust_roots: roots.clone(),
@@ -3056,7 +3056,7 @@ fn two_worker_real_control_key_lease_drain_and_checkpoint_cut() {
     .unwrap();
     let lease = keys.lease(Some(&cache), key.id, KeyPurpose::Page).unwrap();
     keys.install(wire::KeyringBundle {
-        schema_version: racer_control_wire::KEYRING_SCHEMA_VERSION,
+        schema_version: racer_wire::control::KEYRING_SCHEMA_VERSION,
         cluster: app.config.cluster.clone(),
         generation: wire::BundleGeneration(3),
         peer_trust_roots: roots,
@@ -3525,7 +3525,7 @@ fn real_control_bootstrap_recovery_publication_readiness_and_shutdown() {
     assert!(fixture.polls.load(Ordering::Acquire) >= 1);
     assert_eq!(
         worker.snapshots.current().unwrap().sequence,
-        racer_control_wire::PublicationSequence(1)
+        racer_wire::control::PublicationSequence(1)
     );
     assert_eq!(
         fixture.enrollments.load(Ordering::Acquire),
@@ -3543,7 +3543,7 @@ fn real_control_bootstrap_recovery_publication_readiness_and_shutdown() {
     }
     // Retire an omitted epoch through the actual serving loop. Accepted crypto
     // retains its key and buffers, without pausing listeners or deleting checkpoints.
-    let cache = racer_control_wire::CacheId("33333333-3333-4333-8333-333333333333".into());
+    let cache = racer_wire::control::CacheId("33333333-3333-4333-8333-333333333333".into());
     let reference = wire::CacheKeyRef {
         cache: cache.clone(),
         id: crate::model::key_id_from_generation(2, 7).unwrap(),
@@ -3553,7 +3553,7 @@ fn real_control_bootstrap_recovery_publication_readiness_and_shutdown() {
     worker
         .keys
         .install(wire::KeyringBundle {
-            schema_version: racer_control_wire::KEYRING_SCHEMA_VERSION,
+            schema_version: racer_wire::control::KEYRING_SCHEMA_VERSION,
             cluster: config.cluster.clone(),
             generation: wire::BundleGeneration(2),
             peer_trust_roots: roots.clone(),
@@ -3641,7 +3641,7 @@ fn real_control_bootstrap_recovery_publication_readiness_and_shutdown() {
     worker
         .keys
         .install(wire::KeyringBundle {
-            schema_version: racer_control_wire::KEYRING_SCHEMA_VERSION,
+            schema_version: racer_wire::control::KEYRING_SCHEMA_VERSION,
             cluster: config.cluster.clone(),
             generation: wire::BundleGeneration(3),
             peer_trust_roots: roots,
@@ -4758,7 +4758,7 @@ mod cache_publication {
         assert_eq!(adapter.proposal.borrow().as_ref().unwrap().0, previous + 1);
         assert_eq!(
             store.cursor().unwrap(),
-            Some(racer_control_wire::PublicationSequence(1))
+            Some(racer_wire::control::PublicationSequence(1))
         );
     }
 
@@ -4772,7 +4772,7 @@ mod cache_publication {
         let (mut worker, _, _) = crate::app::tests::local_worker(&config, &node, 0);
         let (mut second, _, _) = crate::app::tests::local_worker(&config, &node, 1);
         let mut narrow = crate::app::tests::definition();
-        narrow.id = racer_control_wire::CacheId(NARROW.into());
+        narrow.id = racer_wire::control::CacheId(NARROW.into());
         let local = crate::topology::tests::fixtures::member(0, 4).node;
         let adapter = CachePublication {
             proposal: RefCell::new(None),
@@ -4843,7 +4843,7 @@ mod cache_publication {
     fn prefetch_tickets_are_kept_only_on_pool_members() {
         use crate::topology::tests::pool_tests::{NARROW, pooled};
         let mut narrow = crate::app::tests::definition();
-        narrow.id = racer_control_wire::CacheId(NARROW.into());
+        narrow.id = racer_wire::control::CacheId(NARROW.into());
         let local = crate::topology::tests::fixtures::member(0, 4).node;
         let snapshot = |membership: &Arc<crate::topology::Membership>| {
             let mut snapshot = crate::control::Snapshot::membership_fixture(membership.clone());
@@ -4873,7 +4873,7 @@ mod lifecycle {
     use super::*;
     #[test]
     fn membership_attestation_requires_fresh_matching_workers() {
-        use racer_control_wire::PublicationSequence;
+        use racer_wire::control::PublicationSequence;
         let observations = Observations::default();
         let now = racer_io::Clock::host().now();
         let resources = Resources {
@@ -5280,7 +5280,7 @@ fn maintain_pools_releases_idle_aligned_storage() {
 #[test]
 fn maintain_pools_expires_idle_cache_entries_then_their_aligned_storage() {
     use crate::admission::ResourceClass;
-    use racer_control_wire as wire;
+    use racer_wire::control as wire;
     let config = crate::test_support::cluster::config(false);
     let node = Arc::new(NodeState::default());
     let (mut worker, _, _) = local_worker(&config, &node, 1);

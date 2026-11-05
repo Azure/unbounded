@@ -6,7 +6,7 @@
 //! Caches without a selector, or with an empty one, use the `default` pool of
 //! every member.
 
-use racer_control_wire::{CacheDefinition, CacheId, Pool, PoolId, Publication};
+use racer_wire::control::{CacheDefinition, CacheId, Pool, PoolId, Publication};
 use serde::Serialize;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
@@ -355,14 +355,14 @@ mod tests {
     fn cache(n: u8, priority: u16) -> CacheDefinition {
         let name = format!("c{n}");
         let (client_socket, origin_socket) =
-            racer_control_wire::canonical_socket_paths(&name).unwrap();
+            racer_wire::control::canonical_socket_paths(&name).unwrap();
         CacheDefinition {
             id: CacheId(format!("{n:08x}-0000-4000-8000-000000000000")),
             name,
             client_socket,
             origin_socket,
             priority,
-            mode: racer_control_wire::CacheMode::Cached,
+            mode: racer_wire::control::CacheMode::Cached,
             origin: None,
         }
     }

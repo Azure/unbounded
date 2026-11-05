@@ -1,6 +1,6 @@
 //! Minimal real TLS controller fixture: bearer enrollment, then mTLS publication.
 use super::*;
-use racer_control_wire::{
+use racer_wire::control::{
     self as wire, CacheDefinition, CacheId, ClusterId, Member, MembershipVersion, NodeId,
     canonical_socket_paths,
 };
@@ -81,7 +81,7 @@ impl Control {
             })
             .collect();
         let bundle = wire::encode_bundle(&wire::KeyringBundle {
-            schema_version: racer_control_wire::KEYRING_SCHEMA_VERSION,
+            schema_version: racer_wire::control::KEYRING_SCHEMA_VERSION,
             cluster: ClusterId(CLUSTER.into()),
             generation: wire::BundleGeneration(1),
             peer_trust_roots: vec![ca.der().to_vec()],
@@ -92,7 +92,7 @@ impl Control {
         let publication = Arc::new(Mutex::new(
             wire::Publication {
                 pools: Vec::new(),
-                schema_version: racer_control_wire::SCHEMA_VERSION,
+                schema_version: racer_wire::control::SCHEMA_VERSION,
                 cluster: ClusterId(CLUSTER.into()),
                 sequence: wire::PublicationSequence(1),
                 membership_version: MembershipVersion(1),
@@ -112,8 +112,8 @@ impl Control {
                             name,
                             client_socket,
                             origin_socket,
-                            priority: racer_control_wire::DEFAULT_PRIORITY,
-                            mode: racer_control_wire::CacheMode::Cached,
+                            priority: racer_wire::control::DEFAULT_PRIORITY,
+                            mode: racer_wire::control::CacheMode::Cached,
                             origin: None,
                         }
                     })
@@ -225,7 +225,7 @@ impl Control {
                         200,
                         wire::encode_enrollment_response(&wire::EnrollmentResponse {
                             block_devices: None,
-                            schema_version: racer_control_wire::SCHEMA_VERSION,
+                            schema_version: racer_wire::control::SCHEMA_VERSION,
                             cluster: request.cluster,
                             node: NodeId(node.into()),
                             enrollment: request.enrollment,

@@ -13,7 +13,7 @@ test-util = []
 futures = "0.3"
 flow-control = { path = "../flow" }
 racer-io = { path = "../io" }
-httparse = "1"
+racer-wire = { path = "../wire" }
 zeroize = "1"
 libc = "0.2"
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }

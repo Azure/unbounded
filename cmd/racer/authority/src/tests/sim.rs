@@ -13,8 +13,8 @@ use crate::{
     rules::state::Term,
 };
 use base64::{Engine, engine::general_purpose::STANDARD};
-use racer_control_wire as wire;
 use racer_io::{ctx::VirtualClock, ring::SocketAddress, sim::SimOs};
+use racer_wire::control as wire;
 use serde_json::{Value, json};
 use std::{
     cell::RefCell,

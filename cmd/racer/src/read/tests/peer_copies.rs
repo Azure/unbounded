@@ -7,7 +7,7 @@ use crate::peer::forwarding::VerifiedResponse;
 use crate::peer::protocol::PeerRequest;
 use crate::test_support::security::network;
 use crate::test_support::security::node;
-use racer_control_wire::NodeId;
+use racer_wire::control::NodeId;
 use std::collections::VecDeque;
 
 enum Reply {
@@ -242,7 +242,7 @@ impl ScriptedPeers {
 fn install_peers(f: &mut Fixture, rank: Option<usize>) -> (Rc<ScriptedPeers>, Vec<NodeId>) {
     f.membership = Arc::new(
         Membership::validate(
-            racer_control_wire::MembershipVersion(1),
+            racer_wire::control::MembershipVersion(1),
             (0..4)
                 .map(|i| Member {
                     node: node(i),
@@ -934,7 +934,7 @@ fn open_subscription_selects_no_peers_after_switching_to_passthrough_local() {
     let scheduler = crate::read::range_stream::Scheduler::new(1, racer_io::WorkerCtx::host());
     let selection =
         crate::read::range_stream::Selection::for_test(&scheduler, f.page.version.clone(), demand);
-    f.set_mode(racer_control_wire::CacheMode::PassthroughLocal);
+    f.set_mode(racer_wire::control::CacheMode::PassthroughLocal);
     let mut budget = AcquisitionBudget::new(f.scope.deadline.0, 10, 18);
     let mut work = Box::pin(f.fill.select_subscription(
         &selection,
@@ -1510,7 +1510,7 @@ fn hedge_stale_membership_refreshes_once_without_fresh_credits() {
             let metrics = enable_hedge(&mut f, &peers);
             let latest = Arc::new(
                 Membership::validate(
-                    racer_control_wire::MembershipVersion(2),
+                    racer_wire::control::MembershipVersion(2),
                     f.membership.members().to_vec(),
                 )
                 .unwrap(),
@@ -2219,7 +2219,7 @@ fn unusable_copy(f: &Fixture, good: &CiphertextCopy, missing_key: bool) -> Ciphe
     let mut envelope = good.ciphertext.envelope().clone();
     let mut bytes = good.ciphertext.bytes().to_vec();
     if missing_key {
-        envelope.key_id = racer_control_wire::KeyId([99; 16]);
+        envelope.key_id = racer_wire::control::KeyId([99; 16]);
     } else {
         bytes[0] ^= 1;
     }
@@ -2832,8 +2832,10 @@ fn registered_copy(
 }
 
 fn free_buffers(w: &crate::rdma::links::tests::World) -> Option<usize> {
-    w.a.links
-        .buffers(racer_control_wire::RailId(7), rdma_verbs::BufferState::Free)
+    w.a.links.buffers(
+        racer_wire::control::RailId(7),
+        rdma_verbs::BufferState::Free,
+    )
 }
 
 #[test]
@@ -3719,7 +3721,7 @@ mod landing {
     fn passthrough_local_sealed_read_never_asks_peers() {
         let _owner = Rc::new(crate::rt::drivers::DriverQueue::new(1024)).enter();
         let mut l = landing(0, true);
-        l.f.set_mode(racer_control_wire::CacheMode::PassthroughLocal);
+        l.f.set_mode(racer_wire::control::CacheMode::PassthroughLocal);
         let fetched = acquire_sealed(&mut l);
         assert!(fetched.is_ok(), "{:?}", fetched.err());
         assert_eq!(l.asked.get(), 0);
@@ -3741,8 +3743,8 @@ mod landing {
     /// sealed read in either passthrough mode.
     fn passthrough_sealed_read_does_not_stage_a_residual_disk_copy() {
         for mode in [
-            racer_control_wire::CacheMode::PassthroughPeers,
-            racer_control_wire::CacheMode::PassthroughLocal,
+            racer_wire::control::CacheMode::PassthroughPeers,
+            racer_wire::control::CacheMode::PassthroughLocal,
         ] {
             let _owner = Rc::new(crate::rt::drivers::DriverQueue::new(1024)).enter();
             let mut l = landing(0, false);
@@ -3792,7 +3794,7 @@ fn version(
     let members = f.membership.members().iter().filter(|m| keep(&m.node));
     Arc::new(
         Membership::validate_with_predecessor(
-            racer_control_wire::MembershipVersion(v),
+            racer_wire::control::MembershipVersion(v),
             members.cloned().collect(),
             old,
         )
@@ -3815,7 +3817,7 @@ fn install_versions(
     let now = racer_io::Clock::host().now();
     for (i, (membership, ago)) in versions.iter().enumerate() {
         let mut snapshot = crate::control::Snapshot::membership_fixture(membership.clone());
-        snapshot.sequence = racer_control_wire::PublicationSequence(i as u64 + 1);
+        snapshot.sequence = racer_wire::control::PublicationSequence(i as u64 + 1);
         let at = now - Duration::from_secs(*ago);
         published
             .publish(Arc::new(snapshot), at, |_, _| Ok::<_, Error>(()), || ())
@@ -5443,7 +5445,8 @@ fn refreshed_owner_order_keys_orphan_notice_and_failure_hold() {
                     })
                     .collect();
                 let latest = Arc::new(
-                    Membership::validate(racer_control_wire::MembershipVersion(2), members).ok()?,
+                    Membership::validate(racer_wire::control::MembershipVersion(2), members)
+                        .ok()?,
                 );
                 let next = placement
                     .rank(latest.clone(), &f.context.object, f.page.number)
@@ -5548,7 +5551,7 @@ fn passthrough_peers_coalesces_reads_from_distinct_nodes_on_the_owner() {
         let mut deps = f.fill.dependencies.clone();
         deps.candidates = Rc::new(policy);
         f.fill = Fill::new(deps);
-        f.set_mode(racer_control_wire::CacheMode::PassthroughPeers);
+        f.set_mode(racer_wire::control::CacheMode::PassthroughPeers);
         f.origin.blocked_pages.borrow_mut().insert(0);
         let (coordinator, endpoint, _) = f.read_graph(
             Rc::new(f.fill.clone()),

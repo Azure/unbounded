@@ -438,9 +438,9 @@ mod tests {
         assert!(text.contains("# TYPE racer_gpu_landing_enabled gauge\n"));
         assert!(text.contains("# TYPE racer_gpu_landing_slots gauge\n"));
         assert!(text.contains("# TYPE racer_gpu_landing_exhausted_total counter\n"));
-        links.count_landing_exhausted(racer_control_wire::RailId(2), 0);
-        links.count_landing_exhausted(racer_control_wire::RailId(2), 0);
-        links.count_landing_exhausted(racer_control_wire::RailId(1), 3);
+        links.count_landing_exhausted(racer_wire::control::RailId(2), 0);
+        links.count_landing_exhausted(racer_wire::control::RailId(2), 0);
+        links.count_landing_exhausted(racer_wire::control::RailId(1), 3);
         let text = render(&telemetry);
         assert!(text.contains(
             "racer_gpu_landing_exhausted_total{rail=\"1\",ordinal=\"3\"} 1\n\

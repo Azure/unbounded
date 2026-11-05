@@ -1,8 +1,8 @@
 //! Signed envelopes, routing contracts, and real socket/session exchanges.
 
 use super::*;
-use racer_control_wire::CacheId;
 use racer_io::ring::IoBuffer;
+use racer_wire::control::CacheId;
 
 #[test]
 fn signed_opaque_relay_roundtrip_and_exact_attempt_binding() {
@@ -1328,8 +1328,8 @@ fn real_http_ciphertext_fragmentation_pool_reuse_and_truncation() {
     use crate::topology::Member;
     use crate::topology::Membership;
     use crate::topology::Route;
-    use racer_control_wire::RailId;
-    use racer_control_wire::RailMapping;
+    use racer_wire::control::RailId;
+    use racer_wire::control::RailMapping;
     use std::net::TcpListener;
     use std::task::Context;
     use std::task::Poll;

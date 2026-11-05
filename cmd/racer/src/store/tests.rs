@@ -25,7 +25,7 @@ use page_alloc::SegmentId;
 use page_alloc::SegmentState;
 use page_alloc::Segments;
 use page_alloc::Slab;
-use racer_control_wire::CacheId;
+use racer_wire::control::CacheId;
 use std::future::Future;
 use std::path::PathBuf;
 use std::sync::atomic::AtomicU64;
@@ -3385,8 +3385,10 @@ fn registered_page_cached_then_persisted_is_copied_out_once() {
     drop((cached, again));
     crate::rdma::links::tests::pump(&mut w.a.owner, &mut w.b.owner);
     assert_eq!(
-        w.a.links
-            .buffers(racer_control_wire::RailId(7), rdma_verbs::BufferState::Free),
+        w.a.links.buffers(
+            racer_wire::control::RailId(7),
+            rdma_verbs::BufferState::Free
+        ),
         Some(2)
     );
 }
@@ -4154,7 +4156,7 @@ mod checkpoint {
     use page_alloc::Extent;
     use page_alloc::SegmentState;
     use page_alloc::Segments;
-    use racer_control_wire::CacheId;
+    use racer_wire::control::CacheId;
     use sha2::Digest;
     use sha2::Sha256;
     use std::fs;
@@ -4569,7 +4571,7 @@ mod checkpoint {
             "11111111x1111-4111-8111-111111111111",
         ] {
             let mut cut = image(1);
-            cut.cluster = racer_control_wire::ClusterId(bad.into());
+            cut.cluster = racer_wire::control::ClusterId(bad.into());
             assert!(encode(&cut).is_err(), "{bad}");
         }
         // Same-length invalid bytes with a valid digest still fail to decode.
@@ -5393,13 +5395,13 @@ fn over_share_fixture() -> (Fixture, CacheId, CacheId) {
         crate::test_support::availability_for(vec![over.clone(), under.clone()]),
     );
     let _ = futures::executor::block_on(f.store.open()).unwrap();
-    let definition = |id: &CacheId, priority| racer_control_wire::CacheDefinition {
+    let definition = |id: &CacheId, priority| racer_wire::control::CacheDefinition {
         id: id.clone(),
         name: id.0.clone(),
         client_socket: "/c".into(),
         origin_socket: "/o".into(),
         priority,
-        mode: racer_control_wire::CacheMode::Cached,
+        mode: racer_wire::control::CacheMode::Cached,
         origin: None,
     };
     f.store
@@ -5489,14 +5491,14 @@ fn optional_admission_pressure_requires_over_share_and_reserved_free_segments() 
     assert!(!writer.over_share_under_pressure(&under));
 }
 
-fn cache_definition(id: &str, name: &str) -> racer_control_wire::CacheDefinition {
-    racer_control_wire::CacheDefinition {
+fn cache_definition(id: &str, name: &str) -> racer_wire::control::CacheDefinition {
+    racer_wire::control::CacheDefinition {
         id: CacheId(id.into()),
         name: name.into(),
         client_socket: "/c".into(),
         origin_socket: "/o".into(),
         priority: 1,
-        mode: racer_control_wire::CacheMode::Cached,
+        mode: racer_wire::control::CacheMode::Cached,
         origin: None,
     }
 }
@@ -5634,13 +5636,13 @@ fn owned_reclaim_never_lets_unheld_over_share_page_take_under_share_write() {
     let other_id = other.ciphertext.envelope().page.clone();
     f.enqueue(other).unwrap();
     assert_eq!(writer.reclaim_optional_for_owned(&unheld, None, 1, 0), 0);
-    let definition = |id: &CacheId, priority| racer_control_wire::CacheDefinition {
+    let definition = |id: &CacheId, priority| racer_wire::control::CacheDefinition {
         id: id.clone(),
         name: id.0.clone(),
         client_socket: "/c".into(),
         origin_socket: "/o".into(),
         priority,
-        mode: racer_control_wire::CacheMode::Cached,
+        mode: racer_wire::control::CacheMode::Cached,
         origin: None,
     };
     writer
@@ -5661,7 +5663,7 @@ fn owned_reclaim_never_lets_unheld_over_share_page_take_under_share_write() {
 /// disk.
 #[test]
 fn passthrough_cache_never_enqueues_or_publishes_to_disk() {
-    use racer_control_wire::CacheMode;
+    use racer_wire::control::CacheMode;
     let simulation = crate::rt::reactor::simulation::Simulation::new();
     let _environment = simulation.enter();
     let availability = crate::test_support::availability();

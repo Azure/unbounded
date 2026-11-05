@@ -17,7 +17,7 @@ members = ["."]
 libfuzzer-sys = "0.4"
 http1 = { path = "../http" }
 peer-wire = { path = "../peer-wire" }
-racer-control-wire = { path = "../control-wire" }
+racer-wire = { path = "../wire" }
 racer = { path = ".." }
 page-alloc = { path = "../alloc" }
 

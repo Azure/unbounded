@@ -71,7 +71,7 @@ impl Resolver for DnsResolver {
         port: u16,
         scope: &'a RequestScope,
     ) -> Operation<'a, Vec<SocketAddr>> {
-        wire_codec::rest::Io::resolve(&self.0, host, port, scope)
+        crate::control::rest::Io::resolve(&self.0, host, port, scope)
     }
 }
 

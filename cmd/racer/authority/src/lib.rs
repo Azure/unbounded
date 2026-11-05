@@ -69,7 +69,7 @@ pub use shared::PrimaryView;
 /// Threads started by [`start`]. The dataplane counts this against its budget.
 pub const CONTROL_THREADS: usize = 1;
 
-pub use wire_codec::{DiscoveredEndpoint, DiscoveredEndpoints};
+pub use racer_wire::control::{DiscoveredEndpoint, DiscoveredEndpoints};
 
 /// Payload-free runtime failures.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

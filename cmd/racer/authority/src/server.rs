@@ -16,7 +16,7 @@ use crate::{
     shared::Shared,
     tls::TlsStream,
 };
-use racer_control_wire::{self as wire, ErrorResponse, ProtocolFailure};
+use racer_wire::control::{self as wire, ErrorResponse, ProtocolFailure};
 use std::{
     cell::RefCell,
     collections::HashSet,

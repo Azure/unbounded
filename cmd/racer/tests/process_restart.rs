@@ -1078,7 +1078,7 @@ fn enrolled_identity(
     processes: usize,
 ) -> racer::enrollment::LocalSigningIdentity {
     use racer::enrollment::Enrollment;
-    use racer_control_wire::ClusterId;
+    use racer_wire::control::ClusterId;
     assert_eq!(
         control.enrollments.load(Ordering::Acquire),
         2 * processes,
@@ -1095,7 +1095,7 @@ fn enrolled_identity(
         scratch.0.join("identity"),
         std::rc::Rc::new(racer::control::ReactorControlIo::new(reactor.clone())),
     );
-    let bundle = racer_control_wire::decode_bundle(&control.bundle).unwrap();
+    let bundle = racer_wire::control::decode_bundle(&control.bundle).unwrap();
     enrollment
         .set_peer_trust_roots(bundle.peer_trust_roots)
         .unwrap();

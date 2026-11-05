@@ -403,7 +403,7 @@ pub fn client_io(
 pub enum Endpoint {
     Unix(PathBuf),
     Origin {
-        cache: racer_control_wire::CacheId,
+        cache: racer_wire::control::CacheId,
         path: PathBuf,
     },
     Peer(String),
@@ -886,7 +886,7 @@ pub(crate) mod tests {
                     .unwrap();
                     let peer = adaptive.then(|| {
                         peers
-                            .acquire(&racer_control_wire::NodeId("peer".into()))
+                            .acquire(&racer_wire::control::NodeId("peer".into()))
                             .unwrap()
                     });
                     let receiver = if receive {
@@ -937,7 +937,7 @@ pub(crate) mod tests {
             racer_io::Clock::host(),
         )
         .unwrap();
-        let node = racer_control_wire::NodeId("peer".into());
+        let node = racer_wire::control::NodeId("peer".into());
         let mut exchange = PeerExchange::new(Some(peers.acquire(&node).unwrap()), None, None);
         exchange.verified_response(true);
         exchange.verified_response(false);
@@ -1129,7 +1129,7 @@ pub(crate) mod tests {
         use crate::rt::environment::Deadline;
         use crate::runtime::Cancellation;
         use crate::runtime::Reactor;
-        use racer_control_wire::CacheId;
+        use racer_wire::control::CacheId;
         use std::io::Read;
         use std::os::fd::AsRawFd;
         use std::os::unix::net::UnixStream;
@@ -2250,7 +2250,7 @@ pub(crate) mod tests {
                 Endpoint::Unix(path.clone()),
                 Endpoint::Origin {
                     path,
-                    cache: racer_control_wire::CacheId("nodelay-test".into()),
+                    cache: racer_wire::control::CacheId("nodelay-test".into()),
                 },
             ] {
                 let scope = scope();
@@ -2338,7 +2338,7 @@ pub(crate) mod tests {
                 unreachable!()
             };
             let origin = |uid: usize| Endpoint::Origin {
-                cache: racer_control_wire::CacheId(format!("cache-{uid}")),
+                cache: racer_wire::control::CacheId(format!("cache-{uid}")),
                 path: path.clone(),
             };
             let (first, peer) = held(&pool, &reactor, &admission, &origin(0), &listener);
@@ -2365,7 +2365,7 @@ pub(crate) mod tests {
                 unreachable!()
             };
             let origin = Endpoint::Origin {
-                cache: racer_control_wire::CacheId("cache".into()),
+                cache: racer_wire::control::CacheId("cache".into()),
                 path,
             };
             let (first, a) = held(&pool, &reactor, &admission, &origin, &listener);
@@ -2402,7 +2402,7 @@ pub(crate) mod tests {
                 unreachable!()
             };
             let endpoint = Endpoint::Origin {
-                cache: racer_control_wire::CacheId("cache".into()),
+                cache: racer_wire::control::CacheId("cache".into()),
                 path,
             };
             let (first, a) = held(&pool, &reactor, &admission, &endpoint, &listener);
@@ -2435,7 +2435,7 @@ pub(crate) mod tests {
                 unreachable!()
             };
             let origin = |cache: &str| Endpoint::Origin {
-                cache: racer_control_wire::CacheId(cache.into()),
+                cache: racer_wire::control::CacheId(cache.into()),
                 path: path.clone(),
             };
             let (a, b) = (origin("cache-a"), origin("cache-b"));
@@ -2490,7 +2490,7 @@ pub(crate) mod tests {
                 unreachable!()
             };
             let origin = Endpoint::Origin {
-                cache: racer_control_wire::CacheId("cache".into()),
+                cache: racer_wire::control::CacheId("cache".into()),
                 path,
             };
             let ordinary = outbound - racer_core::admission::METADATA_OUTBOUND_RESERVE;
@@ -2543,7 +2543,7 @@ pub(crate) mod tests {
                 unreachable!()
             };
             let origin = |cache: &str| Endpoint::Origin {
-                cache: racer_control_wire::CacheId(cache.into()),
+                cache: racer_wire::control::CacheId(cache.into()),
                 path: path.clone(),
             };
             let (a, b) = (origin("cache-a"), origin("cache-b"));
@@ -2669,7 +2669,7 @@ pub(crate) mod tests {
                     racer_io::Clock::host(),
                 )
                 .unwrap();
-                let node = racer_control_wire::NodeId("peer".into());
+                let node = racer_wire::control::NodeId("peer".into());
                 let permit = peers.acquire(&node).unwrap();
                 let failure = Rc::new(std::cell::Cell::new(false));
                 let scope = RequestScope::host(

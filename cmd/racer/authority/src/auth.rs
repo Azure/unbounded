@@ -17,7 +17,7 @@ use crate::{
     shared::Shared,
 };
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
-use racer_control_wire::{ProtocolFailure, TOKEN_AUDIENCE};
+use racer_wire::control::{ProtocolFailure, TOKEN_AUDIENCE};
 use serde_json::{Value, json};
 use std::time::Duration;
 

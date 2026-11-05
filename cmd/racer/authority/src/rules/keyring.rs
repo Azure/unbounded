@@ -17,7 +17,7 @@
 
 use crate::entropy::Entropy;
 use base64::{Engine, engine::general_purpose::STANDARD};
-use racer_control_wire::{
+use racer_wire::control::{
     self as wire, BundleGeneration, CacheDefinition, CacheEncryptionKey, CacheId, CacheKeyPurpose,
     CacheKeyRef, CacheKeyState, ClusterId, KeyId, KeyringBundle,
 };
