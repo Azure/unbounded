@@ -231,6 +231,8 @@ pub struct ModelSpec {
     pub waiters_per_flight: usize,
     /// Report checks, by name.
     pub checks: Vec<(String, ReportCheck)>,
+    /// The control plane ([`control`]), when the scenario models it.
+    pub control: Option<control::ControlSpec>,
 }
 
 impl std::fmt::Debug for ModelSpec {
@@ -269,6 +271,7 @@ impl Default for ModelSpec {
             connections: None,
             waiters_per_flight: flight_limits().waiters_per_flight,
             checks: Vec::new(),
+            control: None,
         }
     }
 }
@@ -3178,6 +3181,11 @@ fn flight_limits() -> FlightLimits {
 
 /// Run a Model scenario over `choices`: the outcome and the JSON report.
 pub fn run(scenario: &Scenario, choices: Choices) -> (Outcome, Value) {
+    if let Some(spec) = scenario.model.as_deref()
+        && let Some(ctl) = &spec.control
+    {
+        return control::run_scenario(scenario, spec, ctl, &choices);
+    }
     let Some(spec) = scenario.model.as_deref() else {
         let failure = Failure {
             class: Class::Safety,

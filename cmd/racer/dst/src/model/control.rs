@@ -2386,6 +2386,86 @@ impl ControlSim {
     }
 }
 
+/// The control part of a Model scenario: a racer-sim control plan run at
+/// the scenario's node count and end time.
+#[derive(Clone, Debug)]
+pub struct ControlSpec {
+    /// racer-sim control scenario whose plan ([`plan`]) is used.
+    pub plan: &'static str,
+    /// racer-sim `"control"` overrides ([`Settings::apply_json`]).
+    pub overrides: Option<Value>,
+}
+
+/// Run a control-only Model scenario: report checks and hard invariant
+/// failures fail it.
+pub fn run_scenario(
+    scenario: &crate::Scenario,
+    spec: &super::ModelSpec,
+    ctl: &ControlSpec,
+    choices: &crate::Choices,
+) -> (crate::world::Outcome, Value) {
+    use crate::{invariants::Class, world::Failure};
+    let seed = choices.seed();
+    let report = run(
+        ctl.plan,
+        scenario.nodes,
+        seed,
+        Some(scenario.end),
+        ctl.overrides.as_ref(),
+    );
+    let fail = |name: &str, message: String, report: &Value| Failure {
+        class: Class::Safety,
+        name: name.into(),
+        at: report["duration_ns"].as_u64().unwrap_or(0),
+        step: report["events"].as_u64().unwrap_or(0),
+        message,
+    };
+    let report = match report {
+        Ok(r) => r,
+        Err(e) => {
+            let failure = fail("control-settings", e, &Value::Null);
+            return (outcome(0, 0, 0, Some(failure)), Value::Null);
+        }
+    };
+    let mut failure = None;
+    if report["invariants"]["hard_failures"].as_u64().unwrap_or(0) != 0 {
+        let message = report["invariants"].to_string();
+        failure = Some(fail("hard-failures", message, &report));
+    }
+    for (name, check) in &spec.checks {
+        if failure.is_some() {
+            break;
+        }
+        if let Err(message) = check(&report) {
+            failure = Some(fail(name, message, &report));
+        }
+    }
+    let mut hash = TraceHash::default();
+    let control = u64::from_str_radix(report["trace_hash"].as_str().unwrap_or("0"), 16);
+    hash.record(scenario.end, 1, control.unwrap_or(0), 0);
+    hash.record_bytes(scenario.end, 2, report["metrics"].to_string().as_bytes());
+    let trace = hash.value();
+    let steps = report["events"].as_u64().unwrap_or(0);
+    (outcome(trace, steps, scenario.end, failure), report)
+}
+
+fn outcome(
+    trace: u64,
+    steps: u64,
+    end: Nanos,
+    failure: Option<crate::world::Failure>,
+) -> crate::world::Outcome {
+    crate::world::Outcome {
+        trace,
+        steps,
+        end,
+        draws: 0,
+        // Leases renew and clients poll forever.
+        quiescent: false,
+        failure,
+    }
+}
+
 /// Scenario defaults: duration and fault plan for `nodes` Pods.
 pub fn plan(
     scenario: &str,

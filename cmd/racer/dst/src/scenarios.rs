@@ -5,7 +5,7 @@ use crate::{
     engine::{MILLIS, Nanos, SECONDS},
     fixture::lane_pair,
     invariants::{Class, all_roles_settled},
-    model::{ModelSpec, Outage, RandomChurn, RangeRead, Storm},
+    model::{ModelSpec, Outage, RandomChurn, RangeRead, Storm, control::ControlSpec},
     scenario::FaultMix,
     world::Fault,
 };
@@ -711,9 +711,85 @@ pub fn authority_api_faults() -> Scenario {
     )
 }
 
+/// The racer-sim control scenario `plan` (`sim/src/control.rs` `plan`) at
+/// `nodes` Pods for its default duration, in Model fidelity: real seat,
+/// election, admission and authorization rules, and primary passes driven
+/// by the real `Shell`. Checks: every live client enrolled, and the plan's
+/// own effect (failover, growth and shrink, partitioned clients) happened.
+pub fn control(plan: &'static str, nodes: u32) -> Scenario {
+    let end = match plan {
+        "enrollment-storm" => 600 * SECONDS,
+        "ctl-churn" => 1200 * SECONDS,
+        _ => 900 * SECONDS,
+    };
+    let mut spec = ModelSpec {
+        control: Some(ControlSpec {
+            plan,
+            overrides: None,
+        }),
+        ..ModelSpec::default()
+    }
+    .check("everyone-enrolled", |r| {
+        let c = &r["control"];
+        (c["enrolled"] == c["live_clients"] && c["enrolled"].as_u64() > Some(0))
+            .then_some(())
+            .ok_or(format!(
+                "enrolled {} of {}",
+                c["enrolled"], c["live_clients"]
+            ))
+    })
+    .check("published", |r| {
+        (counter(r, "ctl_commits") > 0 && r["control"]["ready_seats"].as_u64() > Some(0))
+            .then_some(())
+            .ok_or("nothing committed or no ready seat".into())
+    })
+    .check("converges-checked", |r| {
+        let checks = r["invariants"]["invariants"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .find(|i| i["name"] == "ctl_client_converges")
+            .and_then(|i| i["checks"].as_u64())
+            .unwrap_or(0);
+        (checks > 0)
+            .then_some(())
+            .ok_or("convergence never checked".into())
+    });
+    spec = match plan {
+        "failover" => spec.check("failover", |r| {
+            let n = r["metrics"]["histograms"]["ctl_failover_ns"]["count"]
+                .as_u64()
+                .unwrap_or(0);
+            (n >= 2 && counter(r, "ctl_primary_terms") >= 3)
+                .then_some(())
+                .ok_or(format!("{n} failovers"))
+        }),
+        "ctl-churn" => spec.check("churn", |r| {
+            (counter(r, "ctl_pods_added") > 0 && counter(r, "ctl_pods_removed") > 0)
+                .then_some(())
+                .ok_or("no growth or shrink".into())
+        }),
+        "lagging" => spec.check("lagging", |r| {
+            (counter(r, "ctl_unreachable") > 0 && counter(r, "ctl_crashes") > 0)
+                .then_some(())
+                .ok_or("no partitioned client or crash".into())
+        }),
+        _ => spec,
+    };
+    let short = plan.trim_start_matches("ctl-");
+    Scenario::new(format!("model-ctl-{short}-{nodes}"))
+        .nodes(nodes)
+        .model(spec)
+        .end(end)
+}
+
 /// Every built-in scenario.
 pub fn catalog() -> Vec<Scenario> {
     vec![
+        control("enrollment-storm", 200),
+        control("failover", 200),
+        control("ctl-churn", 320),
+        control("lagging", 200),
         concurrent_cold_readers(),
         cold_start(400),
         cold_start(2000),
