@@ -42,8 +42,8 @@ use racer_crypto::identity::VerifiedPeer;
 use std::rc::Rc;
 #[cfg(test)]
 use std::sync::Arc;
-#[cfg(test)]
 use std::time::Duration;
+use std::time::Instant;
 use std::time::SystemTime;
 #[cfg(test)]
 use std::time::UNIX_EPOCH;
@@ -397,8 +397,20 @@ pub fn millis(time: SystemTime) -> Result<u64> {
 }
 /// Stable environment clock mapping. Decode wire deadlines with `decode_deadline`,
 /// never reconstruct them from a new relative timeout at each hop.
+///
+/// Deadlines farther than [`MAX_WIRE_DEADLINE_HORIZON`] from now are clamped:
+/// an untimed scope's placeholder deadline (about a century out) must never
+/// grant a peer unbounded authority.
 pub fn encode_deadline(deadline: Deadline) -> Result<u64> {
-    peer_wire::encode_deadline(deadline).map_err(Into::into)
+    peer_wire::encode_deadline(clamp_wire_deadline(deadline, Instant::now())).map_err(Into::into)
+}
+/// Longest deadline horizon ever placed on the wire.
+pub const MAX_WIRE_DEADLINE_HORIZON: Duration = Duration::from_secs(24 * 3600);
+fn clamp_wire_deadline(deadline: Deadline, now: Instant) -> Deadline {
+    match now.checked_add(MAX_WIRE_DEADLINE_HORIZON) {
+        Some(bound) if deadline.0 > bound => Deadline(bound),
+        _ => deadline,
+    }
 }
 pub fn decode_deadline(value: u64) -> Result<Deadline> {
     peer_wire::decode_deadline(value).map_err(Into::into)
@@ -2088,7 +2100,6 @@ pub(crate) mod tests {
         use std::future::Future;
         use std::task::Context;
         use std::task::Poll;
-        use std::time::Instant;
         fn frame() -> MessageHead {
             MessageHead {
                 start: StartLine::Request {
@@ -2768,6 +2779,19 @@ pub(crate) mod tests {
             }
         }
 
+        #[test]
+        fn untimed_scope_wire_deadline_is_bounded() {
+            let scope =
+                crate::runtime::RequestScope::untimed(RequestId([7; 16]), racer_io::Clock::host())
+                    .unwrap();
+            let before = Instant::now();
+            let encoded = encode_deadline(scope.deadline).unwrap();
+            let decoded = decode_deadline(encoded).unwrap();
+            assert!(decoded.0 <= Instant::now() + MAX_WIRE_DEADLINE_HORIZON);
+            assert!(decoded.0 + Duration::from_secs(1) >= before + MAX_WIRE_DEADLINE_HORIZON);
+            let near = Deadline(before + Duration::from_secs(30));
+            assert_eq!(clamp_wire_deadline(near, before).0, near.0);
+        }
         #[test]
         fn canonical_binary_numbers_node_lists_and_deadline_round_trip() {
             assert_eq!(binary(&[0, 1, 255]), "AAH/");
