@@ -17,6 +17,8 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+
+	"github.com/Azure/unbounded/internal/fsutil"
 )
 
 // DefaultBase is the agent-owned directory that holds versioned artifacts.
@@ -124,6 +126,12 @@ func (l Layout) Flip(version string) (string, error) {
 		_ = os.Remove(tmp) //nolint:errcheck // best effort cleanup of the unused link
 
 		return "", fmt.Errorf("activate version %q: %w", version, err)
+	}
+
+	// The flip is what decides the version the node boots into, so it must
+	// survive a power loss once Flip returns.
+	if err := fsutil.SyncDir(l.base()); err != nil {
+		return "", fmt.Errorf("activate version %q: sync %s: %w", version, l.base(), err)
 	}
 
 	return prev, nil
