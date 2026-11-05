@@ -390,14 +390,8 @@ fn ed25519_rfc9421_base_tamper_replay_and_receiver_challenge() {
 
 #[test]
 fn timestamp_window_and_retained_deadline_revalidate_authority() {
-    let clock = uring_runtime::environment::SimulationClock::new_at(
-        87,
-        std::time::Instant::now(),
-        SystemTime::now(),
-    );
-    let sim_env = clock.environment(0);
-    let _guard = sim_env.enter();
-    let sim_ctx = sim_env.worker_ctx();
+    let clock = racer_io::SimClock::new_at(87, std::time::Instant::now(), SystemTime::now());
+    let sim_ctx = clock.ctx(0);
     let n = network(2, &sim_ctx);
     let mut head = head();
     head.headers.retain(|h| h.name != "racer-kind");

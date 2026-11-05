@@ -1022,14 +1022,9 @@ mod tests {
             os::unix::net::UnixStream,
             task::{Context, Waker},
         };
-        let clock = uring_runtime::environment::SimulationClock::new_at(
-            1,
-            Instant::now(),
-            std::time::SystemTime::UNIX_EPOCH,
-        );
-        let sim_env = clock.environment(0);
-        let _clock = sim_env.enter();
-        let sim_ctx = sim_env.worker_ctx();
+        let clock =
+            racer_io::SimClock::new_at(1, Instant::now(), std::time::SystemTime::UNIX_EPOCH);
+        let sim_ctx = clock.ctx(0);
         let env = racer_io::Env::new(racer_io::Driver::Uring, sim_ctx.clone());
         let reactor = Reactor::<TestScope, ()>::new(12, (), &env);
         let owner = setup(
@@ -1312,7 +1307,6 @@ mod tests {
             os::unix::net::UnixStream,
             task::{Context, Waker},
         };
-        use uring_runtime::environment::SimulationClock;
         for outcome in [
             "success",
             "timeout",
@@ -1324,10 +1318,8 @@ mod tests {
             "backpressure",
         ] {
             let now = Instant::now();
-            let clock = SimulationClock::new_at(1, now, std::time::SystemTime::UNIX_EPOCH);
-            let sim_env = clock.environment(0);
-            let _clock = sim_env.enter();
-            let sim_ctx = sim_env.worker_ctx();
+            let clock = racer_io::SimClock::new_at(1, now, std::time::SystemTime::UNIX_EPOCH);
+            let sim_ctx = clock.ctx(0);
             let env = racer_io::Env::new(racer_io::Driver::Uring, sim_ctx.clone());
             let reactor = Reactor::<TestScope, ()>::new(12, (), &env);
             let submissions = reactor
@@ -1973,15 +1965,12 @@ mod tests {
     #[test]
     fn exchange_deadline_overflow_returns_invalid_input_without_io() {
         use std::task::{Context, Waker};
-        use uring_runtime::environment::SimulationClock;
 
         let limit = near_instant_limit();
         let now = limit - Duration::from_secs(1);
         assert!(now.checked_add(CONNECTION_TIMEOUT).is_none());
-        let clock = SimulationClock::new_at(1, now, std::time::SystemTime::UNIX_EPOCH);
-        let sim_env = clock.environment(0);
-        let _clock = sim_env.enter();
-        let sim_ctx = sim_env.worker_ctx();
+        let clock = racer_io::SimClock::new_at(1, now, std::time::SystemTime::UNIX_EPOCH);
+        let sim_ctx = clock.ctx(0);
         let simulation = racer_io::sim::SimOs::new();
         let env = racer_io::Env::sim(&simulation, sim_ctx.clone());
         let reactor = Reactor::<TestScope, ()>::new(8, (), &env);
@@ -2023,7 +2012,6 @@ mod tests {
     #[test]
     fn exchange_deadline_preserves_timeout_and_parent_limit() {
         use std::task::{Context, Waker};
-        use uring_runtime::environment::SimulationClock;
 
         for (now, parent_timeout, timeout) in [
             (Instant::now(), Duration::from_secs(10), CONNECTION_TIMEOUT),
@@ -2038,10 +2026,8 @@ mod tests {
                 CONNECTION_TIMEOUT,
             ),
         ] {
-            let clock = SimulationClock::new_at(1, now, std::time::SystemTime::UNIX_EPOCH);
-            let sim_env = clock.environment(0);
-            let _clock = sim_env.enter();
-            let sim_ctx = sim_env.worker_ctx();
+            let clock = racer_io::SimClock::new_at(1, now, std::time::SystemTime::UNIX_EPOCH);
+            let sim_ctx = clock.ctx(0);
             let simulation = racer_io::sim::SimOs::new();
             let env = racer_io::Env::sim(&simulation, sim_ctx.clone());
             let reactor = Reactor::<TestScope, ()>::new(8, (), &env);
@@ -2083,13 +2069,11 @@ mod tests {
     #[test]
     fn serve_classifies_exchange_deadline_without_stopping_listener() {
         use std::task::{Context, Waker};
-        use uring_runtime::{environment::SimulationClock, reactor::SocketAddress};
+        use uring_runtime::reactor::SocketAddress;
 
         let now = Instant::now();
-        let clock = SimulationClock::new_at(1, now, std::time::SystemTime::UNIX_EPOCH);
-        let sim_env = clock.environment(0);
-        let _clock = sim_env.enter();
-        let sim_ctx = sim_env.worker_ctx();
+        let clock = racer_io::SimClock::new_at(1, now, std::time::SystemTime::UNIX_EPOCH);
+        let sim_ctx = clock.ctx(0);
         let simulation = racer_io::sim::SimOs::new();
         let env = racer_io::Env::sim(&simulation, sim_ctx.clone());
         let reactor = Reactor::<TestScope, ()>::new(8, (), &env);

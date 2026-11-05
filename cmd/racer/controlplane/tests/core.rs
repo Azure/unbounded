@@ -1124,12 +1124,9 @@ fn candidate_rejection_backoff_survives_successful_receipts_and_newer_recovers()
         future::Future as _,
         task::{Context, Poll},
     };
-    use uring_runtime::environment::SimulationClock;
     for phase in 0..3 {
-        let clock = SimulationClock::new(42);
-        let sim_env = clock.environment(0);
-        let _environment = sim_env.enter();
-        let sim_ctx = sim_env.worker_ctx();
+        let clock = racer_io::SimClock::new(42);
+        let sim_ctx = clock.ctx(0);
         let now = || sim_ctx.clock.now();
         let target = Installer::new();
         let script = Script::new([]);
