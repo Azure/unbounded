@@ -406,6 +406,63 @@ pub(crate) mod tests {
         });
     }
 
+    /// The same TLS and framing code runs on the simulated driver with a
+    /// virtual clock: a roundtrip completes and a timer fires without any
+    /// wall-clock wait.
+    #[test]
+    fn roundtrip_and_timeout_on_the_simulated_driver() {
+        let (server, client) = tls_pair();
+        let clock = racer_io::ctx::VirtualClock::new();
+        let reactor = racer_io::Reactor::new(
+            racer_io::Driver::Sim(racer_io::sim::SimOs::seeded(7)),
+            racer_io::ring::Config::default(),
+            racer_io::WorkerCtx::simulated(&clock, 7, 0),
+        )
+        .unwrap();
+        let mut ex = crate::rt::Executor::with_reactor(reactor, 8);
+        let wall = std::time::Instant::now();
+        let started = clock.now();
+        ex.block_on(async move {
+            let address = "10.0.0.1:443".parse().unwrap();
+            let listener = crate::rt::Listener::bind(address).unwrap();
+            let serve = async {
+                let (tcp, _) = listener.accept().await.unwrap();
+                let mut c = Conn::new(TlsStream::server(tcp, server).await.unwrap());
+                let head = c.read_head(true, 4096).await.unwrap().unwrap();
+                assert_eq!(head.target, "/sim");
+                c.tls
+                    .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok")
+                    .await
+                    .unwrap();
+            };
+            let call = async {
+                let tcp = Tcp::connect(address).await.unwrap();
+                let tls =
+                    TlsStream::client(tcp, client, ServerName::try_from("localhost").unwrap())
+                        .await
+                        .unwrap();
+                let mut c = Conn::new(tls);
+                c.tls
+                    .write_all(&request("GET", "h", "/sim", &[], b""))
+                    .await
+                    .unwrap();
+                let head = c.read_head(false, 4096).await.unwrap().unwrap();
+                assert_eq!(c.read_response_body(&head, 100).await.unwrap(), b"ok");
+            };
+            futures::join!(serve, call);
+            assert_eq!(
+                crate::rt::timeout(
+                    std::time::Duration::from_secs(3600),
+                    crate::rt::sleep(std::time::Duration::from_secs(7200))
+                )
+                .await,
+                Err(crate::Error::Timeout)
+            );
+        });
+        assert!(clock.now() - started >= std::time::Duration::from_secs(3600));
+        assert!(wall.elapsed() < std::time::Duration::from_secs(60));
+    }
+
     #[test]
     fn malformed_and_oversized_chunks_fail() {
         let cases: [&[u8]; 6] = [

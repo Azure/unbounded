@@ -988,3 +988,67 @@ fn start_serves_the_webhook_on_both_pod_ip_families() {
     }
     h.shutdown();
 }
+
+/// Two Pods race for the primary Lease through the fake API at the same
+/// time. Exactly one wins and commits under its term. When the winner
+/// stops, the other takes over through the real reconcile path: the state
+/// record moves to the new holder's term and its sequence never goes back.
+#[test]
+fn racing_primaries_are_fenced_by_term_and_resource_version() {
+    let cluster = FakeCluster::start(2);
+    let mut configs = [cluster.config(1), cluster.config(2)];
+    for c in &mut configs {
+        c.seats = SeatPolicy::Fixed(2);
+    }
+    let [c1, c2] = configs;
+    // Start both before either can finish its first contention.
+    let (h1, h2) = std::thread::scope(|s| {
+        let a = s.spawn(|| crate::start(c1).unwrap());
+        let b = s.spawn(|| crate::start(c2).unwrap());
+        (a.join().unwrap(), b.join().unwrap())
+    });
+    let primaries = |hs: &[&crate::Handle]| {
+        hs.iter()
+            .filter(|h| matches!(h.diagnostics().role, crate::Role::Primary(_)))
+            .count()
+    };
+    let mut timeline = Timeline::default();
+    assert!(
+        wait_for(Duration::from_secs(60), || {
+            timeline.sample(&cluster, &[&h1, &h2]);
+            primaries(&[&h1, &h2]) == 1
+                && h1.diagnostics().ready
+                && h2.diagnostics().ready
+                && record_of(&cluster)["sequence"].as_u64() >= Some(1)
+        }),
+        "{timeline}"
+    );
+    let (_, holder) = holders(&cluster);
+    let (winner, loser) = if matches!(h1.diagnostics().role, crate::Role::Primary(_)) {
+        (h1, h2)
+    } else {
+        (h2, h1)
+    };
+    let loser_name = if holder == "p1" { "p2" } else { "p1" };
+    let before = record_of(&cluster);
+    let path = format!(
+        "/apis/coordination.k8s.io/v1/namespaces/{NS}/leases/{}",
+        annotations::PRIMARY_LEASE
+    );
+    winner.shutdown();
+    let mut timeline = Timeline::default();
+    assert!(
+        wait_for(Duration::from_secs(90), || {
+            timeline.sample(&cluster, &[&loser]);
+            let lease = cluster.inspect(async |k| k.get(&path).await.unwrap());
+            str_at(&lease, &["spec", "holderIdentity"]).starts_with(loser_name)
+                && matches!(loser.diagnostics().role, crate::Role::Primary(_))
+                && loser.diagnostics().ready
+                && record_of(&cluster)["term"] != before["term"]
+        }),
+        "{timeline}"
+    );
+    let after = record_of(&cluster);
+    assert!(after["sequence"].as_u64() >= before["sequence"].as_u64());
+    assert!(after["keyring"]["generation"].as_u64() >= before["keyring"]["generation"].as_u64());
+}
