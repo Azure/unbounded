@@ -55,8 +55,7 @@ use uring_runtime::group::affinity::NicLocality;
 #[cfg(test)]
 use uring_runtime::group::affinity::current_cpus;
 
-const WORK_BUDGET: usize = 64;
-const IDLE_WAIT: Duration = Duration::from_millis(1);
+use uring_runtime::group::{IDLE_WAIT, WORK_BUDGET};
 /// One I/O shard and its crypto execution placement. Equal crypto CPU IDs identify
 /// the same execution thread. NIC locality never overrides the end-to-end rail.
 #[derive(Clone, Debug)]
@@ -758,12 +757,12 @@ impl Service<RequestScope> for IoService {
         if let Ok(service) = &mut self.built {
             service.poll_budgeted(cx, budget)?;
         }
-        uring_runtime::drivers::fire_alarms(uring_runtime::environment::now());
+        uring_runtime::drivers::fire_alarms(self.runtime.reactor.ctx().clock.now());
         Ok(())
     }
     fn wait_timeout(&self, maximum: Duration) -> Duration {
         let maximum = uring_runtime::drivers::next_alarm().map_or(maximum, |at| {
-            maximum.min(at.saturating_duration_since(uring_runtime::environment::now()))
+            maximum.min(at.saturating_duration_since(self.runtime.reactor.ctx().clock.now()))
         });
         self.built.as_ref().map_or(maximum, |service| {
             service.wait_timeout(maximum).min(maximum)
