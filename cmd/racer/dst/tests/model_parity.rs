@@ -474,3 +474,46 @@ fn full_outbound_pools_refuse_links() {
         assert_eq!(counter(&off, key), 0, "{key}: {}", off["metrics"]);
     }
 }
+
+/// racer-sim `expired_leaders_hand_their_fill_to_later_waiters` (seed 7): origin at 1 MiB/s is
+/// slower than the read deadline while 16 readers arrive every second for 12 s. An expired
+/// leader's fill keeps running for later waiters (`WorkerCore::poll` passes `Wait::Lead` through
+/// `allow_handover` and `retain_operation`, `core/src/read/worker.rs`), so no page is fetched
+/// again while its fill runs. racer-sim compares handover on and off; production has no switch
+/// and the Model never cancels an origin request, so the port checks the handover side only.
+#[test]
+fn expired_leaders_hand_their_fill_to_later_waiters() {
+    use racer_dst::engine::{MILLIS, SECONDS};
+    let spec = model::ModelSpec {
+        storms: (0..12)
+            .map(|i| storm(i * SECONDS, 1, 16, 500 * MILLIS))
+            .collect(),
+        ..model::ModelSpec::default()
+    };
+    let mut costs = racer_dst::costs::Costs::checked_in();
+    costs.origin_bytes_per_sec = 1 << 20;
+    let scenario = storms("expired-leaders", 64, 40, spec).costs(costs);
+    let (outcome, r) = model::run(&scenario, Choices::seeded(7));
+    assert!(outcome.quiescent, "{}", r["invariants"]);
+    let o = &r["origin_per_page"];
+    // Every read ends, and no fill restarts after its leader expired: no origin request follows
+    // a failed one and no flight re-elects a leader.
+    assert_eq!(
+        counter(&r, "reads_completed") + counter(&r, "reads_failed"),
+        12 * 16 * 16
+    );
+    assert!(
+        counter(&r, "reads_failed") > 0,
+        "origin is slower than the deadline"
+    );
+    assert_eq!(o["repeats"]["after_failure"], 0, "{o}");
+    assert_eq!(o["max_failure_retries_per_page"], 0, "{o}");
+    assert_eq!(counter(&r, "flights_reelected"), 0);
+    // The repeats are ranks 1 and 2 fetching while rank 0 still does (the slow origin gap in
+    // `dst/MODEL.md`), never a restart.
+    assert_eq!(
+        o["repeats"]["concurrent"].as_u64().unwrap() + 16,
+        counter(&r, "origin_requests"),
+        "{o}"
+    );
+}
