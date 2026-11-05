@@ -278,8 +278,10 @@ These are bounded behaviors, not bugs, and are covered by tests or the invariant
   (`origin_repeat_explained`).
 - A relay-signed `Overloaded` on the route to rank 0 can give an owner above rank 0 origin
   authority, allowing at most one overlapping origin request per such walk.
-- A minimum-funded walk cannot fund both a helper probe (`HELPER_FLOOR_ATTEMPTS`) and an
-  out-of-order rank 1 probe. When the helper misses, the read retries.
+- A helper probe spends its own grant (`walk::helper_grant`: `HELPER_ATTEMPTS`, `HELPER_LINKS`),
+  never the walk's, once per walk, so a helper that fails still leaves the remaining owners
+  funded. A page read that asks a helper may therefore send up to `HELPER_ATTEMPTS` attempts and
+  `HELPER_LINKS` links beyond its page budget.
 - Silence pings add peer messages under many probe timeouts. Each ping follows a timeout or a
   recheck, and a node has at most `MAX_PINGS_IN_FLIGHT` pings and `MAX_OFFERS_IN_FLIGHT` copy
   offers in flight, as in production.
