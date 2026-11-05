@@ -647,7 +647,11 @@ impl ReadWorker {
                     availability.clone(),
                     reactor_ctx.clock.clone(),
                 )),
-                crypto: Rc::new(PageCrypto::new(keys, crypto.clone())),
+                crypto: Rc::new(PageCrypto::new(
+                    keys,
+                    crypto.clone(),
+                    crate::memory::BufferPool::new(admission.clone()),
+                )),
                 credentials: credentials.clone(),
                 admission,
                 metadata_owner: directory.clone(),

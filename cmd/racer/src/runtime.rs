@@ -1472,7 +1472,10 @@ mod tests {
                     assert_eq!(completed.bytes, 3);
                     assert_eq!(completed.buffer.bytes().as_ptr(), pointer);
                     assert_eq!(page.bytes(), &[2; 19]);
-                    assert_eq!(r.admission.used(ResourceClass::Ciphertext), 19);
+                    assert_eq!(
+                        r.admission.used(ResourceClass::Ciphertext),
+                        page_alloc::buf::GRANULE
+                    );
                     let mut received = [0; 3];
                     assert_eq!(peer.try_recv(&mut received).unwrap(), 3);
                     assert_eq!(received, [2; 3]);
@@ -1484,7 +1487,10 @@ mod tests {
                     drop(send);
                     assert_eq!(r.poll_budgeted(1), Ok(1));
                     assert!(weak.upgrade().is_some());
-                    assert_eq!(r.admission.used(ResourceClass::Ciphertext), 19);
+                    assert_eq!(
+                        r.admission.used(ResourceClass::Ciphertext),
+                        page_alloc::buf::GRANULE
+                    );
                     assert_eq!(r.poll_budgeted(1), Ok(1));
                     assert!(weak.upgrade().is_none());
                     assert_eq!(r.admission.used(ResourceClass::Ciphertext), 0);

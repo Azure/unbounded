@@ -76,13 +76,7 @@ pub(crate) fn page(byte: u8) -> crate::memory::PageResult {
                     plaintext_length: 1,
                     ciphertext_length: 17,
                 },
-                storage: flow_control::ChargedBytes {
-                    bytes: vec![0; 17],
-                    reservation: admission
-                        .reserve(None, ResourceClass::Ciphertext, 17)
-                        .unwrap(),
-                }
-                .into(),
+                storage: crate::memory::fixture_ciphertext_storage(&admission, None, &[0; 17]),
             }),
         },
     }
@@ -1932,14 +1926,11 @@ mod flight {
                         plaintext_length: 3,
                         ciphertext_length: 19,
                     },
-                    storage: flow_control::ChargedBytes {
-                        bytes: vec![0; 19],
-                        reservation: flights
-                            .admission
-                            .reserve(None, ResourceClass::Ciphertext, 19)
-                            .unwrap(),
-                    }
-                    .into(),
+                    storage: crate::memory::fixture_ciphertext_storage(
+                        &flights.admission,
+                        None,
+                        &[0; 19],
+                    ),
                 }),
             },
         }

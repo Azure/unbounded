@@ -280,10 +280,15 @@ fn active_crypto_operation_completes_after_rotation_with_its_original_key_lease(
         CryptoInput::Encrypt {
             page,
             plaintext,
-            ciphertext: admission
-                .reserve(Some(&cache), ResourceClass::Ciphertext, 19)
-                .unwrap()
-                .into(),
+            ciphertext: Box::new(
+                pool.encryption_output(
+                    admission
+                        .reserve(Some(&cache), ResourceClass::Ciphertext, 19)
+                        .unwrap(),
+                    19,
+                )
+                .unwrap(),
+            ),
         },
         lease,
         &scope,

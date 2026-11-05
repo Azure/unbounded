@@ -1288,9 +1288,11 @@ impl WorkerApplication {
                 }),
         );
         let memory = Rc::new(MemoryCache::new(buffers.clone(), availability.clone()));
-        let crypto = Rc::new(
-            PageCrypto::new(keys.clone(), runtime.crypto.clone()).with_buffers(buffers.clone()),
-        );
+        let crypto = Rc::new(PageCrypto::new(
+            keys.clone(),
+            runtime.crypto.clone(),
+            buffers.clone(),
+        ));
         let pipes = Rc::new(new_pipe_pool(admission.clone()));
         let delivery = Rc::new(
             Delivery::new(reactor.clone(), config.reader_stall_timeout)

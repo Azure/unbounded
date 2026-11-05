@@ -1653,7 +1653,6 @@ pub(super) mod tests {
         metadata: &ObjectMetadata,
         number: u64,
     ) -> PageResult {
-        use crate::admission::ResourceClass;
         use crate::memory::CiphertextBytes;
         use crate::memory::CiphertextPage;
         use crate::memory::VerifiedBytes;
@@ -1691,13 +1690,11 @@ pub(super) mod tests {
                         plaintext_length: length as u32,
                         ciphertext_length: length as u32 + 16,
                     },
-                    storage: flow_control::ChargedBytes {
-                        bytes: vec![0; length + 16],
-                        reservation: admission
-                            .reserve(cache, ResourceClass::Ciphertext, length + 16)
-                            .unwrap(),
-                    }
-                    .into(),
+                    storage: crate::memory::fixture_ciphertext_storage(
+                        admission,
+                        cache,
+                        &vec![0; length + 16],
+                    ),
                 }),
             },
         }

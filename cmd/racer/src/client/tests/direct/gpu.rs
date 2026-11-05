@@ -666,22 +666,17 @@ fn tamper_retained(fixture: &Fixture, in_tag: bool) {
     let mut bytes = copy.ciphertext.bytes().to_vec();
     let index = if in_tag { bytes.len() - 1 } else { 3 };
     bytes[index] ^= 0x40;
-    let reservation = fixture
-        .listeners
-        .admission
-        .reserve(
-            Some(&definition().id),
-            crate::admission::ResourceClass::Ciphertext,
-            bytes.len(),
-        )
-        .unwrap();
     let tampered = CiphertextPage {
         pinned: true,
         provenance: None,
         inner: Arc::new(CiphertextBytes {
             pins: Default::default(),
             envelope: copy.ciphertext.envelope().clone(),
-            storage: flow_control::ChargedBytes { bytes, reservation }.into(),
+            storage: crate::memory::fixture_ciphertext_storage(
+                &fixture.listeners.admission,
+                Some(&definition().id),
+                &bytes,
+            ),
         }),
     };
     memory.remove_cache(&definition().id).unwrap();

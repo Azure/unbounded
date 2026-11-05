@@ -853,7 +853,10 @@ mod tests {
         let a = first.try_result(2).unwrap().unwrap();
         let b = second.try_result(2).unwrap().unwrap();
         assert_eq!(a.ciphertext.bytes().as_ptr(), b.ciphertext.bytes().as_ptr());
-        assert_eq!(admission.used(ResourceClass::Ciphertext), 19);
+        assert_eq!(
+            admission.used(ResourceClass::Ciphertext),
+            page_alloc::buf::GRANULE
+        );
         assert_eq!(a.grant.remaining_page_budget, 9);
         assert_eq!(b.grant.remaining_byte_budget, 1005);
         assert_ne!(a.grant.receiver, b.grant.receiver);

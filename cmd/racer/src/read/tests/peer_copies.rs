@@ -180,7 +180,7 @@ impl ScriptedPeers {
                                     ciphertext.bytes().len(),
                                 )?,
                                 ciphertext.envelope().clone(),
-                                ciphertext.bytes().to_vec(),
+                                ciphertext.bytes(),
                             )?;
                             PeerResponse::Page {
                                 metadata,
@@ -1247,7 +1247,7 @@ fn known_copy_admission_validates_before_reclaim_and_preserves_failures() {
         }
         if case == "corrupt" {
             let inner = Arc::get_mut(&mut copy.ciphertext.inner).unwrap();
-            inner.bytes[0] ^= 1;
+            inner.fixture_bytes_mut()[0] ^= 1;
         }
         let free = if case == "short" { 4095 } else { 4096 };
         let pressure = admission
@@ -1720,7 +1720,7 @@ impl Peer {
                             ciphertext.bytes().len(),
                         )?,
                         ciphertext.envelope().clone(),
-                        ciphertext.bytes().to_vec(),
+                        ciphertext.bytes(),
                     )?;
                     PeerResponse::Page {
                         metadata,

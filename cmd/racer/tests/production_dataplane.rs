@@ -624,7 +624,11 @@ impl Rig {
             origin: origin.clone(),
             candidates: candidates.clone(),
             flights: flights.clone(),
-            crypto: Rc::new(PageCrypto::new(keys, crypto.clone())),
+            crypto: Rc::new(PageCrypto::new(
+                keys,
+                crypto.clone(),
+                racer::memory::BufferPool::new(admission.clone()),
+            )),
             credentials: credentials.clone(),
             admission: admission.clone(),
             metadata_owner: directory.clone(),

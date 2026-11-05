@@ -1062,11 +1062,13 @@ mod tests {
             inner: Arc::new(crate::memory::CiphertextBytes {
                 pins: Default::default(),
                 envelope,
-                storage: flow_control::ChargedBytes {
-                    bytes: vec![0; length],
-                    reservation: request(5).origin.reservation,
-                }
-                .into(),
+                storage: crate::memory::fixture_ciphertext_storage(
+                    &flow_control::Quotas::new(AdmissionPolicy::new(
+                        crate::test_support::cluster::config(false).limits,
+                    )),
+                    None,
+                    &vec![0; length],
+                ),
             }),
         }
     }

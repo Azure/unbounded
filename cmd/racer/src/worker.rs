@@ -1817,12 +1817,13 @@ mod tests {
                             1,
                         )
                         .unwrap(),
-                    ciphertext: self
-                        .runtime
-                        .admission
-                        .reserve(Some(&cache), ResourceClass::Ciphertext, 17)
-                        .unwrap()
-                        .into(),
+                    ciphertext: crate::memory::fixture_encrypt_output(
+                        &self.runtime.admission,
+                        self.runtime
+                            .admission
+                            .reserve(Some(&cache), ResourceClass::Ciphertext, 17)
+                            .unwrap(),
+                    ),
                 }
             }
         }

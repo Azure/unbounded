@@ -142,7 +142,7 @@ fn retainable_and_rehome_copy_out_and_release_the_buffer() {
         .reserve(
             Some(&page.metadata.version.object.cache),
             ResourceClass::Ciphertext,
-            19,
+            page_alloc::buf::GRANULE,
         )
         .unwrap();
     let moved = ciphertext.rehome(reservation).unwrap();

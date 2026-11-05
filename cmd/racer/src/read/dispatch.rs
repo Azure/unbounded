@@ -1759,7 +1759,10 @@ mod tests {
             assert!(selected.as_mut().poll(&mut cx).is_pending());
             assert!(mailbox.has_queued());
             assert_eq!(mailbox.outstanding(), 1);
-            assert_eq!(admission.used(ResourceClass::Ciphertext), 19);
+            assert_eq!(
+                admission.used(ResourceClass::Ciphertext),
+                page_alloc::buf::GRANULE
+            );
             if cancel_caller {
                 caller.cancel().unwrap();
                 assert!(selected.as_mut().poll(&mut cx).is_pending());

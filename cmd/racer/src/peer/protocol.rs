@@ -1633,7 +1633,10 @@ pub(crate) mod tests {
             ),
             Err(Error::InvalidRequest)
         ));
-        assert_eq!(admission.used(ResourceClass::Ciphertext), 19);
+        assert_eq!(
+            admission.used(ResourceClass::Ciphertext),
+            page_alloc::buf::GRANULE
+        );
         for (response, status, outcome) in [
             (PeerResponse::NotFound, 404, "not-found"),
             (PeerResponse::OriginRejected, 401, "origin-rejected"),
@@ -1666,7 +1669,7 @@ pub(crate) mod tests {
             opaque_page_response(&metadata, &invalid, PageOutcome::Page, &[0; 32], &[]).is_err()
         );
         let mut page = page;
-        Arc::get_mut(&mut page.inner).unwrap().bytes.pop();
+        Arc::get_mut(&mut page.inner).unwrap().fixture_pop();
         assert!(matches!(
             response_head(
                 &PeerResponse::Bootstrap {
@@ -1687,7 +1690,9 @@ pub(crate) mod tests {
             let signers = crate::peer::tests::signers();
             let cache = CacheId("cccccccc-1111-4111-8111-111111111111".into());
             let mut limits = crate::test_support::cluster::config(false).limits;
-            limits.ciphertext_bytes = std::num::NonZeroUsize::new(19).unwrap();
+            // One pooled page: a second charge would exceed the limit.
+            limits.ciphertext_bytes =
+                std::num::NonZeroUsize::new(page_alloc::buf::GRANULE).unwrap();
             let admission = Rc::new(flow_control::Quotas::new(AdmissionPolicy::new(
                 limits.clone(),
             )));
@@ -1766,7 +1771,10 @@ pub(crate) mod tests {
                 let result = codec.response_reserved(auth, vec![9; 19], Some(reservation), &scope);
                 if case == 0 {
                     let result = result.unwrap();
-                    assert_eq!(admission.used(ResourceClass::Ciphertext), 19);
+                    assert_eq!(
+                        admission.used(ResourceClass::Ciphertext),
+                        page_alloc::buf::GRANULE
+                    );
                     let PeerResponse::Page { ciphertext, .. } = result.response else {
                         panic!("page required")
                     };

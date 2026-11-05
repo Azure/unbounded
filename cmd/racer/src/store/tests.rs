@@ -3466,13 +3466,11 @@ mod records {
                         plaintext_length: length as u32,
                         ciphertext_length: length as u32 + 16,
                     },
-                    storage: flow_control::ChargedBytes {
-                        bytes: vec![2; length + 16],
-                        reservation: admission
-                            .reserve(None, ResourceClass::Ciphertext, length + 16)
-                            .unwrap(),
-                    }
-                    .into(),
+                    storage: crate::memory::fixture_ciphertext_storage(
+                        admission,
+                        None,
+                        &vec![2; length + 16],
+                    ),
                 }),
             },
             metadata: metadata.for_pin(),
@@ -3584,14 +3582,14 @@ mod records {
             if length > 1 {
                 inner.envelope.plaintext_length -= 1;
                 inner.envelope.ciphertext_length -= 1;
-                inner.bytes.pop();
+                inner.fixture_pop();
                 page.metadata.length -= 1;
             }
-            inner.bytes.fill(0x6b);
+            inner.fixture_bytes_mut().fill(0x6b);
             // At a rounding boundary, use a same-length replacement instead.
             if record_length(&page, alignment).unwrap() != record {
                 let inner = Arc::get_mut(&mut page.ciphertext.inner).unwrap();
-                inner.bytes.push(0x6b);
+                inner.fixture_push(0x6b);
                 inner.envelope.plaintext_length += 1;
                 inner.envelope.ciphertext_length += 1;
                 page.metadata.length += 1;
@@ -3656,9 +3654,13 @@ mod records {
                     .ciphertext_length = 18
             },
             |p| {
-                Arc::get_mut(&mut p.ciphertext.inner).unwrap().bytes.pop();
+                Arc::get_mut(&mut p.ciphertext.inner).unwrap().fixture_pop();
             },
-            |p| Arc::get_mut(&mut p.ciphertext.inner).unwrap().bytes.push(0),
+            |p| {
+                Arc::get_mut(&mut p.ciphertext.inner)
+                    .unwrap()
+                    .fixture_push(0)
+            },
             |p| {
                 p.metadata.version.object.cache.0.clear();
                 Arc::get_mut(&mut p.ciphertext.inner)
@@ -5716,6 +5718,8 @@ fn warm_disk_reads_reuse_pooled_buffers_charged_to_pool_class() {
     let id = copy.ciphertext.envelope().page.clone();
     f.enqueue(copy).unwrap();
     drive(&f.reactor, f.store.writer.progress(1, &scope())).unwrap();
+    // The written copy's pooled buffer is idle now; start from an empty pool.
+    f.store.reader.buffers.shed_disk_buffers();
     let read = || {
         drive(&f.reactor, f.store.reader.read(&id, &scope()))
             .unwrap()

@@ -159,7 +159,7 @@ fn owned_writeback_staging_reclaims_only_idle_memory_after_hard_quota_rejection(
             ResourceClass::DirtyCiphertext
         };
         let amount = if ciphertext {
-            crate::store::record_length(&incoming.copy(), deps.writer.slabs().alignment().unwrap())
+            crate::store::staging_bytes(&incoming.copy(), deps.writer.slabs().alignment().unwrap())
                 .unwrap()
         } else {
             19
@@ -168,7 +168,13 @@ fn owned_writeback_staging_reclaims_only_idle_memory_after_hard_quota_rejection(
             .reserve(
                 None,
                 class,
-                admission.limit(class) - admission.used(class) - amount + 19,
+                // One idle cached entry's charge: pooled ciphertext or dirty bytes.
+                admission.limit(class) - admission.used(class) - amount
+                    + if ciphertext {
+                        page_alloc::buf::GRANULE
+                    } else {
+                        19
+                    },
             )
             .unwrap();
         assert!(
@@ -203,7 +209,8 @@ fn optional_persistence_full_page_residency_above_half_budget_makes_progress() {
     let _queue = queue.enter();
     let mut limits = crate::test_support::cluster::config(false).limits;
     limits.plaintext_bytes = std::num::NonZeroUsize::new(8 * PAGE_BYTES as usize).unwrap();
-    limits.ciphertext_bytes = std::num::NonZeroUsize::new(8 * (PAGE_BYTES as usize + 16)).unwrap();
+    limits.ciphertext_bytes =
+        std::num::NonZeroUsize::new(8 * (PAGE_BYTES as usize + page_alloc::buf::GRANULE)).unwrap();
     let mut f = fixture_with(5 * PAGE_BYTES, Some(limits));
     f.fill
         .dependencies
@@ -320,10 +327,10 @@ fn optional_persistence_idle_memory_reclaim_is_bounded_and_stops_at_deficit() {
         deps.memory.publish(page).unwrap();
     }
     let staging =
-        crate::store::record_length(&incoming.copy(), deps.writer.slabs().alignment().unwrap())
+        crate::store::staging_bytes(&incoming.copy(), deps.writer.slabs().alignment().unwrap())
             .unwrap();
     let ceiling = admission.limit(ResourceClass::Ciphertext) / 2;
-    let deficit = 256 * 19 + 1;
+    let deficit = 256 * page_alloc::buf::GRANULE + 1;
     let held = admission
         .reserve(
             Some(&f.context.object.cache),
@@ -362,7 +369,10 @@ fn optional_persistence_idle_memory_reclaim_is_bounded_and_stops_at_deficit() {
             .count(),
         43
     );
-    assert_eq!(admission.used(ResourceClass::Ciphertext), ceiling - 18);
+    assert_eq!(
+        admission.used(ResourceClass::Ciphertext),
+        ceiling + 1 - page_alloc::buf::GRANULE
+    );
     assert_eq!(deps.writer.discarded_count(), 0);
     drop(held);
 }
@@ -441,7 +451,7 @@ fn optional_persistence_reclaims_completed_idle_slab_before_pressure_rejection()
         writer.retention().set_ownership(Rc::new(move |_| owned));
         let admission = &f.fill.dependencies.admission;
         let staging =
-            crate::store::record_length(&page.copy(), writer.slabs().alignment().unwrap()).unwrap();
+            crate::store::staging_bytes(&page.copy(), writer.slabs().alignment().unwrap()).unwrap();
         let ceiling = if owned {
             admission.limit(ResourceClass::Ciphertext)
         } else {
@@ -1642,6 +1652,8 @@ fn final_fill_reclaim_success_and_ignored_writeback_are_silent() {
     failures.write_protected(true, &mut text).unwrap();
     assert!(text.contains("total=0 retained=0"));
     drop((reserved, pressure));
+    // No idle entry may fund the writeback's staging once Ciphertext is full.
+    f.fill.dependencies.memory.evict_idle(usize::MAX).unwrap();
     let page = crate::memory::tests::bundle_for(admission, f.origin.metadata.immutable());
     let _cipher_pressure = admission
         .reserve(
@@ -2448,8 +2460,10 @@ mod pressure {
         {
             let mut limits = crate::test_support::cluster::config(false).limits;
             limits.plaintext_bytes = std::num::NonZeroUsize::new(2 * PAGE_BYTES as usize).unwrap();
-            limits.ciphertext_bytes =
-                std::num::NonZeroUsize::new(ciphertext_pages * (PAGE_BYTES as usize + 16)).unwrap();
+            limits.ciphertext_bytes = std::num::NonZeroUsize::new(
+                ciphertext_pages * (PAGE_BYTES as usize + page_alloc::buf::GRANULE),
+            )
+            .unwrap();
             limits.dirty_bytes =
                 std::num::NonZeroUsize::new(dirty_pages * (PAGE_BYTES as usize + 16)).unwrap();
             // Byte pressure must occur before entry-count eviction in every case.
@@ -2631,12 +2645,8 @@ mod pressure {
                 .unwrap(),
         };
         // Small final pages may retain full-page admission slack. Pooled
-        // plaintext storage needs a charge covering its 4 KiB granule.
-        let amount = if matches!(class, ResourceClass::Plaintext) {
-            amount.max(4096)
-        } else {
-            amount
-        };
+        // storage needs a charge covering its 4 KiB granule.
+        let amount = amount.max(page_alloc::buf::GRANULE);
         let reservation = admission.reserve(Some(cache), class, amount).unwrap();
         match class {
             ResourceClass::Plaintext => {
@@ -2648,11 +2658,9 @@ mod pressure {
                         .is_ok()
                 );
             }
-            ResourceClass::Ciphertext => {
-                Arc::get_mut(&mut page.ciphertext.inner)
-                    .unwrap()
-                    .reservation = reservation
-            }
+            ResourceClass::Ciphertext => Arc::get_mut(&mut page.ciphertext.inner)
+                .unwrap()
+                .fixture_replace_charge(reservation),
             _ => panic!("page class required"),
         }
         let id = page.plaintext.page().clone();
@@ -2751,8 +2759,10 @@ mod pressure {
         for class in [ResourceClass::Plaintext, ResourceClass::Ciphertext] {
             let amount = PAGE_BYTES as usize + 16;
             let mut limits = crate::test_support::cluster::config(false).limits;
-            limits.plaintext_bytes = std::num::NonZeroUsize::new(6 * amount + 64).unwrap();
-            limits.ciphertext_bytes = std::num::NonZeroUsize::new(6 * amount + 64).unwrap();
+            // Slack for each fixture page's pooled 4 KiB ciphertext buffer.
+            let slack = 64 + 8 * page_alloc::buf::GRANULE;
+            limits.plaintext_bytes = std::num::NonZeroUsize::new(6 * amount + slack).unwrap();
+            limits.ciphertext_bytes = std::num::NonZeroUsize::new(6 * amount + slack).unwrap();
             let other_cache = CacheId("44444444-4444-4444-8444-444444444444".into());
             let f = fixture_with_caches(
                 3,
@@ -3499,7 +3509,11 @@ fn fixture_with_caches(
         origin: origin.clone(),
         candidates,
         flights,
-        crypto: Rc::new(PageCrypto::new(keys.clone(), crypto.clone())),
+        crypto: Rc::new(PageCrypto::new(
+            keys.clone(),
+            crypto.clone(),
+            crate::memory::BufferPool::new(admission.clone()),
+        )),
         credentials,
         admission,
         metadata_owner,
@@ -3769,7 +3783,8 @@ fn selected_owner_reclaims_foreign_receive_charges_across_full_pages() {
     use std::num::NonZeroUsize;
     let mut limits = crate::test_support::cluster::config(false).limits;
     limits.plaintext_bytes = NonZeroUsize::new(2 * PAGE_BYTES as usize).unwrap();
-    limits.ciphertext_bytes = NonZeroUsize::new(3 * (PAGE_BYTES as usize + 16)).unwrap();
+    limits.ciphertext_bytes =
+        NonZeroUsize::new(3 * (PAGE_BYTES as usize + page_alloc::buf::GRANULE)).unwrap();
     let mut source = fixture_with(8 * PAGE_BYTES, Some(limits.clone()));
     let mut target = fixture_with(8 * PAGE_BYTES, Some(limits));
     for number in 0..8 {

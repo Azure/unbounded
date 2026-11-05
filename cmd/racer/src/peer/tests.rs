@@ -647,13 +647,7 @@ mod destination_disconnect {
                         plaintext_length: 3,
                         ciphertext_length: 19,
                     },
-                    storage: flow_control::ChargedBytes {
-                        bytes: vec![7; 19],
-                        reservation: admission
-                            .reserve(None, ResourceClass::Ciphertext, 19)
-                            .unwrap(),
-                    }
-                    .into(),
+                    storage: crate::memory::fixture_ciphertext_storage(admission, None, &[7; 19]),
                 }),
             },
         }
@@ -1112,7 +1106,11 @@ mod encrypted_http {
             if i == 0 {
                 client.set_metrics(metrics.clone());
             }
-            cryptos.push(PageCrypto::new(identity.keys.clone(), client.clone()));
+            cryptos.push(PageCrypto::new(
+                identity.keys.clone(),
+                client.clone(),
+                BufferPool::new(admissions[i].clone()),
+            ));
             clients.push(client);
             engines.push(PageCryptoEngine::new(CryptoRuntime {
                 port,

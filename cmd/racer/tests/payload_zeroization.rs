@@ -23,37 +23,19 @@ use std::alloc::GlobalAlloc;
 use std::alloc::Layout;
 use std::alloc::System;
 use std::rc::Rc;
-use std::sync::Mutex;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::AtomicPtr;
-use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering;
 
 struct InspectAllocator;
 static WATCH: AtomicPtr<u8> = AtomicPtr::new(std::ptr::null_mut());
 static FREED: AtomicBool = AtomicBool::new(false);
 static ZEROED: AtomicBool = AtomicBool::new(false);
-static NEXT_SIZE: AtomicUsize = AtomicUsize::new(0);
-static CANCEL_AT_ALLOCATION: Mutex<Option<racer::runtime::RequestScope>> = Mutex::new(None);
 
 // SAFETY: All allocation operations delegate to System with the original layout.
 unsafe impl GlobalAlloc for InspectAllocator {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-        let pointer = unsafe { System.alloc(layout) };
-        if !pointer.is_null()
-            && NEXT_SIZE
-                .compare_exchange(layout.size(), 0, Ordering::SeqCst, Ordering::SeqCst)
-                .is_ok()
-        {
-            WATCH.store(pointer, Ordering::SeqCst);
-            // This scope has no registered waiters; cancellation allocates nothing.
-            // Trigger after the engine's first scope check, before it transforms
-            // the initialized output, to exercise the final publication check.
-            if let Some(scope) = CANCEL_AT_ALLOCATION.lock().unwrap().take() {
-                scope.cancel().unwrap();
-            }
-        }
-        pointer
+        unsafe { System.alloc(layout) }
     }
     unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
         if WATCH.load(Ordering::SeqCst) == ptr {
@@ -100,24 +82,6 @@ fn final_payload_owner_scrubs_full_allocation_on_reclaim_and_rejection() {
             } else {
                 ResourceClass::Plaintext
             };
-            if scenario == "full" && ciphertext {
-                // Different geometry prevents the watched owner from consuming a
-                // slot, so its final release exercises full-recycler rejection.
-                // Plaintext no longer uses the recycler, so fill it directly.
-                // Check every buffer out before any returns, so none is reused.
-                let buffers: Vec<_> = (0..8)
-                    .map(|_| {
-                        let charge = admission
-                            .reserve(Some(&cache), ResourceClass::Ciphertext, capacity + 1)
-                            .unwrap();
-                        let bytes = charge.buffer(capacity + 1).unwrap();
-                        (charge, bytes)
-                    })
-                    .collect();
-                for (mut charge, bytes) in buffers {
-                    charge.recycle(bytes);
-                }
-            }
             let reservation = admission.reserve(Some(&cache), class, capacity).unwrap();
             let owner: Box<dyn Send> = if ciphertext {
                 // Ciphertext needs no secure wipe, including its truncated tail.
@@ -169,30 +133,9 @@ fn final_payload_owner_scrubs_full_allocation_on_reclaim_and_rejection() {
                 Some(admission)
             };
             std::thread::spawn(move || drop(owner)).join().unwrap();
-            // Plaintext lives in the worker's pooled storage, which the dropped
-            // pool has closed: its last owner wipes and frees it at once, so
-            // only ciphertext exercises recycler retention and trimming.
-            if scenario == "retained" && ciphertext {
-                assert!(!FREED.load(Ordering::SeqCst));
-                let admission = admission.as_ref().unwrap();
-                assert_eq!(admission.used(class), capacity);
-                admission.reclaim_buffers();
-                assert_eq!(admission.used(class), 0);
-            }
-            if scenario == "trimmed" && ciphertext {
-                // Demand maintenance frees an entry left idle for a whole window.
-                assert!(!FREED.load(Ordering::SeqCst));
-                let admission = admission.as_ref().unwrap();
-                assert_eq!(admission.used(class), capacity);
-                let start = std::time::Instant::now();
-                assert_eq!(admission.maintain_buffers(start), 0);
-                assert_eq!(
-                    admission.maintain_buffers(start + std::time::Duration::from_secs(1)),
-                    capacity
-                );
-                assert_eq!(admission.used(class), 0);
-                assert_eq!(admission.buffer_pool_stats().trimmed, 1);
-            }
+            // Both payloads live in the worker's pooled storage, which the
+            // dropped pool has closed: the last owner frees it at once, and
+            // wipes it first only for plaintext.
             assert!(FREED.load(Ordering::SeqCst), "{ciphertext} {scenario}");
             assert_eq!(
                 ZEROED.load(Ordering::SeqCst),
@@ -304,13 +247,19 @@ fn failed_crypto_output_is_scrubbed(config: &Config) {
                 )
                 .unwrap();
             plaintext.bytes_mut().unwrap().fill(0xa7);
+            watch(plaintext.bytes().unwrap().as_ptr());
             CryptoInput::Encrypt {
                 page: descriptor.page,
                 plaintext,
-                ciphertext: admission
-                    .reserve(Some(&cache), ResourceClass::Ciphertext, length + 16)
-                    .unwrap()
-                    .into(),
+                ciphertext: Box::new(
+                    pool.encryption_output(
+                        admission
+                            .reserve(Some(&cache), ResourceClass::Ciphertext, length + 16)
+                            .unwrap(),
+                        length + 16,
+                    )
+                    .unwrap(),
+                ),
             }
         } else {
             let plaintext = vec![0xa7; length];
@@ -370,36 +319,15 @@ fn failed_crypto_output_is_scrubbed(config: &Config) {
             panic!("reserve")
         };
         let job = permit.job(input, key, scope.clone());
-        if encrypt {
-            *CANCEL_AT_ALLOCATION.lock().unwrap() = Some(scope.clone());
-            FREED.store(false, Ordering::SeqCst);
-            ZEROED.store(false, Ordering::SeqCst);
-            NEXT_SIZE.store(length + 16, Ordering::SeqCst);
-        } else if fault.starts_with("cancel") {
-            // Decrypt allocates no output to hook, so cancel up front.
+        if fault.starts_with("cancel") {
+            // Outputs are checked out before submission, so cancel up front.
             scope.cancel().unwrap();
         }
         let completion = PageCryptoEngine::process(job, &racer_io::WorkerCtx::host());
-        if encrypt {
-            assert_eq!(
-                NEXT_SIZE.load(Ordering::SeqCst),
-                0,
-                "{fault}: output allocated"
-            );
-            assert!(
-                FREED.load(Ordering::SeqCst),
-                "{fault}: output not published"
-            );
-            assert!(
-                ZEROED.load(Ordering::SeqCst),
-                "{fault}: entire output wiped before dealloc"
-            );
-        } else {
-            assert!(
-                !FREED.load(Ordering::SeqCst),
-                "{fault}: failures never consume the input storage"
-            );
-        }
+        assert!(
+            !FREED.load(Ordering::SeqCst),
+            "{fault}: failures never consume the input storage"
+        );
         if fault.starts_with("cancel") {
             assert!(scope.check().is_err());
         }

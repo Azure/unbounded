@@ -6,7 +6,6 @@ use crate::error::Error;
 use crate::error::Operation;
 use crate::error::Result;
 use crate::memory::BufferPool;
-use crate::memory::CiphertextBytes;
 use crate::memory::CiphertextPage;
 use crate::memory::PlaintextBuffer;
 use crate::memory::VerifiedBytes;
@@ -328,7 +327,7 @@ pub(crate) fn capture_aead_failure(
 pub struct PageCrypto {
     keys: Rc<Keyring>,
     client: Rc<CryptoClient>,
-    buffers: Option<BufferPool>,
+    buffers: BufferPool,
 }
 impl PageCrypto {
     pub(crate) async fn sample_send(
@@ -385,22 +384,17 @@ impl PageCrypto {
     }
     /// I/O-local facade. Only owned page inputs and an immutable key lease cross
     /// to the engine; this Rc graph and its futures stay on I/O.
-    pub fn new(keys: Rc<Keyring>, client: Rc<CryptoClient>) -> Self {
+    ///
+    /// Page ciphertext is sealed directly into `buffers`, this worker's
+    /// aligned pool. The I/O thread checks the buffer out before submission,
+    /// so a crypto thread shared by several workers always fills, and the
+    /// page later returns, storage owned by the requesting worker.
+    pub fn new(keys: Rc<Keyring>, client: Rc<CryptoClient>, buffers: BufferPool) -> Self {
         Self {
             keys,
             client,
-            buffers: None,
+            buffers,
         }
-    }
-    /// Seal page ciphertext directly into this worker's aligned pool.
-    ///
-    /// The I/O thread checks the buffer out before submission, so a crypto
-    /// thread shared by several workers always fills, and the page later
-    /// returns, storage owned by the requesting worker.
-    #[must_use]
-    pub fn with_buffers(mut self, buffers: BufferPool) -> Self {
-        self.buffers = Some(buffers);
-        self
     }
     /// Derive the AES-256-GCM key and nonce that XAES-256-GCM uses for this
     /// page, so a GPU can authenticate and decrypt it. Checks the cache, key ID
@@ -474,20 +468,14 @@ impl PageCrypto {
             let key = self
                 .keys
                 .active(&page.version.object.cache, KeyPurpose::Page)?;
-            let ciphertext = match &self.buffers {
-                Some(buffers) => {
-                    use racer_io::ring::IoBuffer;
-                    let length = plaintext
-                        .bytes()?
-                        .len()
-                        .checked_add(TAG_LEN)
-                        .ok_or(Error::InvalidRequest)?;
-                    match buffers.encryption_output(ciphertext, length)? {
-                        Ok(buffer) => EncryptOutput::Aligned(Box::new(buffer)),
-                        Err(reservation) => EncryptOutput::Unaligned(reservation),
-                    }
-                }
-                None => EncryptOutput::Unaligned(ciphertext),
+            let ciphertext = {
+                use racer_io::ring::IoBuffer;
+                let length = plaintext
+                    .bytes()?
+                    .len()
+                    .checked_add(TAG_LEN)
+                    .ok_or(Error::InvalidRequest)?;
+                Box::new(self.buffers.encryption_output(ciphertext, length)?)
             };
             match self
                 .client
@@ -584,7 +572,7 @@ impl PageCryptoEngine {
                 }
                 CryptoOutcome::Failed { input, error }
             }
-            Ok((envelope, bytes)) => Self::complete(input, envelope, bytes),
+            Ok(envelope) => Self::complete(input, envelope),
         };
         permit.executed(ctx.clock.now(), measurement_start);
         CryptoCompletion {
@@ -601,17 +589,17 @@ impl PageCryptoEngine {
         scope: &RequestScope,
         permit: &mut CryptoPermit,
         ctx: &racer_io::WorkerCtx,
-    ) -> Result<(PageEnvelope, Zeroizing<Vec<u8>>)> {
+    ) -> Result<PageEnvelope> {
         scope.check().inspect_err(|error| {
             permit.measurement.scope_failure = crate::telemetry::DecryptScopeFailure::Entry(*error);
         })?;
         if let CryptoInput::VerifyTag { ciphertext } = input {
             verify_stored_tag(key, ciphertext)?;
             scope.check()?;
-            return Ok((ciphertext.envelope().clone(), Zeroizing::new(Vec::new())));
+            return Ok(ciphertext.envelope().clone());
         }
         key.require_purpose(KeyPurpose::Page)?;
-        let (envelope, mut bytes) = match input {
+        let envelope = match input {
             CryptoInput::VerifyEnvelope(_) => unreachable!("envelope handled above"),
             CryptoInput::VerifyTag { .. } => unreachable!("tag check handled above"),
             CryptoInput::Encrypt {
@@ -639,40 +627,16 @@ impl PageCryptoEngine {
                     ciphertext_length: length.checked_add(16).ok_or(Error::InvalidRequest)?,
                 };
                 let aad = page_aad(&envelope)?;
-                let charge = match &*ciphertext {
-                    EncryptOutput::Unaligned(reservation) => {
-                        reservation.validate(
-                            ResourceClass::Ciphertext,
-                            envelope.ciphertext_length as usize,
-                        )?;
-                        reservation
-                    }
-                    EncryptOutput::Aligned(buffer) => {
-                        buffer
-                            .charge()
-                            .validate(ResourceClass::Ciphertext, buffer.capacity())?;
-                        buffer.charge()
-                    }
-                };
+                let charge = ciphertext.charge();
+                charge.validate(ResourceClass::Ciphertext, ciphertext.capacity())?;
                 if charge.key() != Some(&page.version.object.cache) {
                     return Err(Error::InvalidConfiguration);
                 }
-                let mut bytes = Zeroizing::new(Vec::new());
                 let cache = &page.version.object.cache;
-                let output = match ciphertext {
-                    EncryptOutput::Unaligned(reservation) => {
-                        bytes = Zeroizing::new(
-                            reservation.buffer(envelope.ciphertext_length as usize)?,
-                        );
-                        &mut bytes[..]
-                    }
-                    EncryptOutput::Aligned(buffer) => {
-                        if buffer.len() != envelope.ciphertext_length as usize {
-                            return Err(Error::InvalidConfiguration);
-                        }
-                        buffer.as_mut_slice()
-                    }
-                };
+                if ciphertext.len() != envelope.ciphertext_length as usize {
+                    return Err(Error::InvalidConfiguration);
+                }
+                let output = ciphertext.as_mut_slice();
                 // Plaintext input remains immutable until the final cancellation
                 // check. AEAD output is erased if sealing fails part way, since
                 // pooled ciphertext storage is recycled without a wipe.
@@ -681,7 +645,7 @@ impl PageCryptoEngine {
                     output.fill(0);
                     return Err(error.into());
                 }
-                (envelope, bytes)
+                envelope
             }
             CryptoInput::Decrypt {
                 ciphertext,
@@ -733,22 +697,18 @@ impl PageCryptoEngine {
                         ));
                         Error::CorruptRecord
                     })?;
-                    (envelope.clone(), Zeroizing::new(Vec::new()))
+                    envelope.clone()
                 }
             }
         };
         scope.check().inspect_err(|error| {
             permit.measurement.scope_failure = crate::telemetry::DecryptScopeFailure::Final(*error);
         })?;
-        Ok((envelope, std::mem::take(&mut bytes)))
+        Ok(envelope)
     }
 
     /// Infallible ownership transfer after preparation; failures never consume input.
-    fn complete(
-        input: CryptoInput,
-        envelope: PageEnvelope,
-        mut bytes: Zeroizing<Vec<u8>>,
-    ) -> CryptoOutcome {
+    fn complete(input: CryptoInput, envelope: PageEnvelope) -> CryptoOutcome {
         match input {
             CryptoInput::VerifyEnvelope(_) => unreachable!("envelope handled above"),
             CryptoInput::VerifyTag { ciphertext } => {
@@ -765,29 +725,7 @@ impl PageCryptoEngine {
                         storage: plaintext.into_buf(),
                     }),
                 };
-                let encrypted = match ciphertext {
-                    EncryptOutput::Unaligned(mut reservation) => {
-                        reservation
-                            .shrink(bytes.capacity())
-                            .expect("validated crypto capacity");
-                        CiphertextPage {
-                            pinned: true,
-                            provenance: None,
-                            inner: Arc::new(CiphertextBytes {
-                                pins: Default::default(),
-                                envelope,
-                                storage: flow_control::ChargedBytes {
-                                    bytes: std::mem::take(&mut *bytes),
-                                    reservation,
-                                }
-                                .into(),
-                            }),
-                        }
-                    }
-                    EncryptOutput::Aligned(buffer) => {
-                        CiphertextPage::from_aligned(*buffer, envelope)
-                    }
-                };
+                let encrypted = CiphertextPage::from_aligned(*ciphertext, envelope);
                 CryptoOutcome::Completed(CryptoOutput::Encrypted(plain, encrypted))
             }
             CryptoInput::Decrypt {
@@ -1204,21 +1142,10 @@ pub enum CryptoInput {
     Encrypt {
         page: PageId,
         plaintext: PlaintextBuffer,
-        ciphertext: EncryptOutput,
+        /// Aligned AEAD output checked out of the requesting worker's pool,
+        /// already charged; the page is held as disk-aligned ciphertext.
+        ciphertext: Box<crate::memory::CiphertextBuffer>,
     },
-}
-/// Where AEAD output is written.
-pub enum EncryptOutput {
-    /// A fresh `Vec` charged to this Ciphertext reservation.
-    Unaligned(flow_control::Charge<AdmissionPolicy>),
-    /// Aligned storage checked out of the requesting worker's pool, already
-    /// charged; the page is held as disk-aligned ciphertext.
-    Aligned(Box<crate::memory::CiphertextBuffer>),
-}
-impl From<flow_control::Charge<AdmissionPolicy>> for EncryptOutput {
-    fn from(reservation: flow_control::Charge<AdmissionPolicy>) -> Self {
-        Self::Unaligned(reservation)
-    }
 }
 pub enum CryptoOutput {
     EnvelopeVerified(Box<crate::peer::forwarding::EnvelopeOutput>),
@@ -2532,7 +2459,7 @@ mod tests {
                                 // A valid descriptor with a mismatched body is malformed,
                                 // not an authentication rejection from the primitive.
                                 let inner = Arc::get_mut(&mut ciphertext.inner).unwrap();
-                                inner.bytes.pop();
+                                inner.fixture_pop();
                             }
                         }
                         // Admission delay must not leak into residence.
@@ -2791,14 +2718,14 @@ mod tests {
                 ] {
                     let mut page = sealed();
                     let inner = Arc::get_mut(&mut page.inner).unwrap();
-                    let last = inner.bytes.len() - 1;
+                    let last = inner.fixture_bytes_mut().len() - 1;
                     match case {
-                        "body" => inner.bytes[0] ^= 1,
-                        "tag" => inner.bytes[last] ^= 1,
+                        "body" => inner.fixture_bytes_mut()[0] ^= 1,
+                        "tag" => inner.fixture_bytes_mut()[last] ^= 1,
                         "nonce" => inner.envelope.nonce.0[0] ^= 1,
                         "page" => inner.envelope.page.number.0 += 1,
                         "short" => {
-                            inner.bytes.pop();
+                            inner.fixture_pop();
                         }
                         _ => inner.envelope.key_id = KeyId([99; 16]),
                     }
@@ -2935,7 +2862,7 @@ mod tests {
                         racer_control_wire::CacheId("00000000-0000-4000-8000-000000000003".into());
                     if mode == "mismatch" {
                         // Flip a body byte so the stored tag no longer matches.
-                        inner.bytes[0] ^= 1;
+                        inner.fixture_bytes_mut()[0] ^= 1;
                     }
                     if mode == "missing" {
                         // The fixture keyring installs [1;16], also the bundle's default.
@@ -2964,7 +2891,11 @@ mod tests {
                     ticket.finish(true);
                     let mut cx = Context::from_waker(futures::task::noop_waker_ref());
                     if mode == "missing" {
-                        let crypto = PageCrypto::new(keys.clone(), client.clone());
+                        let crypto = PageCrypto::new(
+                            keys.clone(),
+                            client.clone(),
+                            crate::memory::fixture_buffer_pool(),
+                        );
                         let mut future = Box::pin(crypto.sample_send(page, &scope, sample));
                         assert!(
                             future.as_mut().poll(&mut cx).is_ready(),
@@ -3272,7 +3203,9 @@ mod tests {
                     };
                     drop(plain);
                     if corrupt {
-                        Arc::get_mut(&mut ciphertext.inner).unwrap().bytes[0] ^= 1;
+                        Arc::get_mut(&mut ciphertext.inner)
+                            .unwrap()
+                            .fixture_bytes_mut()[0] ^= 1;
                     }
                     CryptoInput::Decrypt {
                         ciphertext,
@@ -3404,10 +3337,12 @@ mod tests {
                         CryptoInput::Encrypt {
                             page: page.clone(),
                             plaintext: plain,
-                            ciphertext: admission
-                                .reserve(Some(cache), ResourceClass::Ciphertext, size + 16)
-                                .unwrap()
-                                .into(),
+                            ciphertext: crate::memory::fixture_encrypt_output(
+                                admission,
+                                admission
+                                    .reserve(Some(cache), ResourceClass::Ciphertext, size + 16)
+                                    .unwrap(),
+                            ),
                         }
                     } else {
                         // Fresh received allocation state, as on disk/peer ingress.
@@ -3522,10 +3457,12 @@ mod tests {
                             1,
                         )
                         .unwrap(),
-                    ciphertext: admission
-                        .reserve(Some(&cache), ResourceClass::Ciphertext, 17)
-                        .unwrap()
-                        .into(),
+                    ciphertext: crate::memory::fixture_encrypt_output(
+                        admission,
+                        admission
+                            .reserve(Some(&cache), ResourceClass::Ciphertext, 17)
+                            .unwrap(),
+                    ),
                 }
             }
 
@@ -3821,10 +3758,12 @@ mod tests {
                         number: PageNumber(0),
                     },
                     plaintext,
-                    ciphertext: admission
-                        .reserve(Some(&cache), ResourceClass::Ciphertext, 19)
-                        .unwrap()
-                        .into(),
+                    ciphertext: crate::memory::fixture_encrypt_output(
+                        &admission,
+                        admission
+                            .reserve(Some(&cache), ResourceClass::Ciphertext, 19)
+                            .unwrap(),
+                    ),
                 };
                 let (io, mut engine) = pair(WorkerId(0), 1, NonZeroUsize::new(1).unwrap());
                 let client = CryptoClient::new(io);
@@ -3920,7 +3859,7 @@ mod tests {
                     CryptoInput::Encrypt {
                         page,
                         plaintext,
-                        ciphertext: ciphertext.into(),
+                        ciphertext: crate::memory::fixture_encrypt_output(&admission, ciphertext),
                     },
                     key(),
                     &scope,
@@ -4253,7 +4192,10 @@ mod tests {
                 admission.used(ResourceClass::Plaintext),
                 length.max(1).next_multiple_of(4096)
             );
-            assert_eq!(admission.used(ResourceClass::Ciphertext), length + 16);
+            assert_eq!(
+                admission.used(ResourceClass::Ciphertext),
+                (length + 16).next_multiple_of(page_alloc::buf::GRANULE)
+            );
             drop(completion);
             admission.reclaim_buffers();
             assert_eq!(admission.used(ResourceClass::Plaintext), 0);
@@ -4423,7 +4365,10 @@ mod tests {
                 admission.used(ResourceClass::Plaintext),
                 page_alloc::buf::GRANULE
             );
-            assert_eq!(admission.used(ResourceClass::Ciphertext), 21);
+            assert_eq!(
+                admission.used(ResourceClass::Ciphertext),
+                page_alloc::buf::GRANULE
+            );
             drop(completion);
             assert_eq!(admission.used(ResourceClass::Plaintext), 0);
             assert_eq!(admission.used(ResourceClass::Ciphertext), 0);
@@ -4448,8 +4393,8 @@ mod tests {
             )));
             let pool = BufferPool::new(admission.clone());
             let (io, port) = pair(WorkerId(worker), 1, NonZeroUsize::new(1).unwrap());
-            let crypto = PageCrypto::new(keys.clone(), Rc::new(CryptoClient::new(io)))
-                .with_buffers(pool.clone());
+            let crypto =
+                PageCrypto::new(keys.clone(), Rc::new(CryptoClient::new(io)), pool.clone());
             holders.push((admission, pool, crypto));
             // One crypto thread (this one) drives both workers' queues.
             engines.push(PageCryptoEngine::new(CryptoRuntime {
@@ -4610,7 +4555,7 @@ mod tests {
                     CryptoInput::Encrypt {
                         page: page.clone(),
                         plaintext,
-                        ciphertext: ciphertext.into()
+                        ciphertext: crate::memory::fixture_encrypt_output(&admission, ciphertext)
                     },
                     keys.active(cache, KeyPurpose::Page).unwrap(),
                     scope
@@ -4659,10 +4604,7 @@ mod tests {
                     );
                     assert_eq!(plaintext.bytes().unwrap().as_ptr(), pointer);
                     assert_eq!(plaintext.bytes().unwrap(), b"hello");
-                    let EncryptOutput::Unaligned(ciphertext) = ciphertext else {
-                        panic!("unaligned output");
-                    };
-                    assert_eq!(ciphertext.amount(), if undersized { 20 } else { 21 });
+                    assert_eq!(ciphertext.len(), if undersized { 20 } else { 21 });
                 }
                 _ => panic!("wrong outcome"),
             }
@@ -4753,16 +4695,14 @@ mod tests {
             let cipher = CiphertextPage {
                 pinned: true,
                 provenance: None,
-                inner: Arc::new(CiphertextBytes {
+                inner: Arc::new(crate::memory::CiphertextBytes {
                     pins: Default::default(),
                     envelope: descriptor.clone(),
-                    storage: flow_control::ChargedBytes {
-                        bytes,
-                        reservation: admission
-                            .reserve(Some(cache), ResourceClass::Ciphertext, 21)
-                            .unwrap(),
-                    }
-                    .into(),
+                    storage: crate::memory::fixture_ciphertext_storage(
+                        &admission,
+                        Some(cache),
+                        &bytes,
+                    ),
                 }),
             };
             let input = CryptoInput::Decrypt {

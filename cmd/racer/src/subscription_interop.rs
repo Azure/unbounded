@@ -352,7 +352,11 @@ impl SubscriptionFixture {
                 availability.clone(),
                 racer_io::Clock::host(),
             )),
-            crypto: Rc::new(PageCrypto::new(keys, crypto.clone())),
+            crypto: Rc::new(PageCrypto::new(
+                keys,
+                crypto.clone(),
+                crate::memory::BufferPool::new(admission.clone()),
+            )),
             credentials: credentials.clone(),
             admission: admission.clone(),
             metadata_owner: directory.clone(),

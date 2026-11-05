@@ -1044,7 +1044,11 @@ fn metadata_coordinator_with_newer_publication(
                 availability.clone(),
                 racer_io::Clock::host(),
             )),
-            crypto: Rc::new(PageCrypto::new(keys, Rc::new(CryptoClient::new(port)))),
+            crypto: Rc::new(PageCrypto::new(
+                keys,
+                Rc::new(CryptoClient::new(port)),
+                crate::memory::BufferPool::new(admission.clone()),
+            )),
             credentials: credentials.clone(),
             admission: admission.clone(),
             metadata_owner: owners.clone(),

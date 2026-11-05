@@ -625,7 +625,11 @@ mod safety {
             if index == 0 {
                 client.set_metrics(metrics.clone());
             }
-            cryptos.push(PageCrypto::new(identity.keys.clone(), client.clone()));
+            cryptos.push(PageCrypto::new(
+                identity.keys.clone(),
+                client.clone(),
+                BufferPool::new(f.admissions[2].clone()),
+            ));
             clients.push(client);
             engines
                 .borrow_mut()
@@ -962,6 +966,7 @@ fn send_tag_http_success_failure_drop_do_not_wait_for_crypto() {
         let crypto = Rc::new(PageCrypto::new(
             ids[1].0.clone(),
             Rc::new(CryptoClient::new(io)),
+            crate::memory::fixture_buffer_pool(),
         ));
         let samples = Samples::default();
         let server = f.server.with_send_tag(
