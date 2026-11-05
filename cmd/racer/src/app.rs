@@ -806,11 +806,10 @@ fn drive_bootstrap<T>(
             scope.check()?;
         }
         reactor.poll_budgeted(64)?;
-        uring_runtime::drivers::fire_alarms(reactor.ctx().clock.now());
         if let Poll::Ready(result) = operation.as_mut().poll(&mut cx) {
             return result;
         }
-        let mut wait = uring_runtime::drivers::next_alarm().map_or(BOOTSTRAP_MAX_PARK, |at| {
+        let mut wait = reactor.next_deadline().map_or(BOOTSTRAP_MAX_PARK, |at| {
             at.saturating_duration_since(reactor.ctx().clock.now())
         });
         if let Some(recheck) = scope.and_then(racer_io::Scope::recheck_within) {

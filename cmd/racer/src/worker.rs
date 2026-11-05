@@ -489,19 +489,17 @@ fn drive_local<'a>(
 ) -> Operation<'a, ()> {
     drive_local_with(operation, reporter, move |waker| {
         runtime.crypto.register_driver(waker);
-        let polled = poll_runtime(runtime);
-        uring_runtime::drivers::fire_alarms(runtime.reactor.ctx().clock.now());
-        polled
+        poll_runtime(runtime)
     })
 }
 
 /// Parks a lifecycle driver in the worker's reactor: completions, its wake
-/// handle (cross-thread and phase-change wakes), and this thread's alarms.
+/// handle (cross-thread and phase-change wakes), and its timers.
 struct ReactorPark(Rc<Reactor>);
 
 impl crate::lifecycle::Park<Error> for ReactorPark {
     fn wait_timeout(&self, maximum: Duration) -> Duration {
-        uring_runtime::drivers::next_alarm().map_or(maximum, |at| {
+        self.0.next_deadline().map_or(maximum, |at| {
             maximum.min(at.saturating_duration_since(self.0.ctx().clock.now()))
         })
     }
@@ -801,11 +799,10 @@ impl Service<RequestScope> for IoService {
         if let Ok(service) = &mut self.built {
             service.poll_budgeted(cx, budget)?;
         }
-        uring_runtime::drivers::fire_alarms(self.runtime.reactor.ctx().clock.now());
         Ok(())
     }
     fn wait_timeout(&self, maximum: Duration) -> Duration {
-        let maximum = uring_runtime::drivers::next_alarm().map_or(maximum, |at| {
+        let maximum = self.runtime.reactor.next_deadline().map_or(maximum, |at| {
             maximum.min(at.saturating_duration_since(self.runtime.reactor.ctx().clock.now()))
         });
         self.built.as_ref().map_or(maximum, |service| {

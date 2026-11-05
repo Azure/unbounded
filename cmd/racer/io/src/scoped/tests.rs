@@ -279,3 +279,142 @@ fn kernel_reactor_reads_and_writes_files() {
     let read = drive(&r, r.read_at(fd, 0, vec![9; 6], (), &scope)).unwrap();
     assert_eq!(read.buffer, [0, 0, 0, b'a', b'b', b'c']);
 }
+
+mod retry {
+    //! Overload pacing on the reactor's timer heap.
+    use super::super::retry::RetryOptions;
+    use super::*;
+    use crate::{Env, SimClock, sim::SimOs, xthread::tests::WakeCounter};
+    use std::{cell::Cell, sync::Arc, task::Waker};
+
+    /// Scope whose failure the fixture selects.
+    #[derive(Clone, Default)]
+    struct TestScope(Rc<Cell<Option<Error>>>);
+
+    impl Scope for TestScope {
+        type Error = Error;
+
+        fn check(&self) -> Result<()> {
+            self.0.get().map_or(Ok(()), Err)
+        }
+    }
+
+    /// A simulated reactor on a virtual clock.
+    fn sim(seed: u64) -> (SimClock, super::super::Reactor<TestScope>) {
+        let clock = SimClock::new(seed);
+        let reactor = super::super::Reactor::new(8, &Env::sim(&SimOs::new(), clock.ctx(0)));
+        (clock, reactor)
+    }
+
+    /// Retry bounds and invalid intervals fail without unbounded or immediate resubmission.
+    #[test]
+    fn configured_retry_limit_interval_zero_and_overflow() {
+        let (clock, r) = sim(4);
+        let scope = TestScope::default();
+        let attempts = Cell::new(0);
+        let mut future = r.retry_with(
+            &scope,
+            RetryOptions {
+                interval: Duration::from_millis(3),
+                max_retries: Some(1),
+            },
+            || {
+                attempts.set(attempts.get() + 1);
+                Box::pin(async { Err::<(), _>(Error::Overloaded) })
+            },
+        );
+        let mut cx = Context::from_waker(Waker::noop());
+        assert!(future.as_mut().poll(&mut cx).is_pending());
+        clock.advance(Duration::from_millis(2));
+        assert!(future.as_mut().poll(&mut cx).is_pending());
+        assert_eq!(attempts.get(), 1);
+        clock.advance(Duration::from_millis(1));
+        assert_eq!(
+            future.as_mut().poll(&mut cx),
+            Poll::Ready(Err(Error::Overloaded))
+        );
+        assert_eq!(attempts.get(), 2);
+        for (interval, error) in [
+            (Duration::ZERO, Error::InvalidConfiguration),
+            (Duration::MAX, Error::InvalidInput),
+        ] {
+            let mut future = r.retry_with(
+                &scope,
+                RetryOptions {
+                    interval,
+                    max_retries: None,
+                },
+                || Box::pin(async { Err::<(), _>(Error::Overloaded) }),
+            );
+            assert_eq!(future.as_mut().poll(&mut cx), Poll::Ready(Err(error)));
+        }
+    }
+
+    /// Default pacing waits 10ms on a reactor timer, without self-wakes, and
+    /// rechecks the scope before resubmission.
+    #[test]
+    fn retries_only_after_ten_ms_without_self_wakes_and_checks_scope() {
+        for cancel in [false, true] {
+            let (clock, r) = sim(45);
+            let scope = TestScope::default();
+            let attempts = Cell::new(0);
+            let wake = Arc::new(WakeCounter::default());
+            let waker = Waker::from(wake.clone());
+            let mut cx = Context::from_waker(&waker);
+            let mut future = r.retry_overloaded(&scope, || {
+                let attempt = attempts.get();
+                attempts.set(attempt + 1);
+                Box::pin(async move {
+                    if attempt == 0 {
+                        Err(Error::Overloaded)
+                    } else {
+                        Ok(7)
+                    }
+                })
+            });
+            assert!(future.as_mut().poll(&mut cx).is_pending());
+            clock.advance(Duration::from_millis(9));
+            r.poll_budgeted(8).unwrap();
+            assert!(future.as_mut().poll(&mut cx).is_pending());
+            assert_eq!(attempts.get(), 1);
+            assert_eq!(wake.count(), 0);
+            if cancel {
+                scope.0.set(Some(Error::Cancelled));
+            }
+            clock.advance(Duration::from_millis(1));
+            r.poll_budgeted(8).unwrap();
+            assert_eq!(wake.count(), 1, "the backoff timer wakes the task once");
+            assert_eq!(
+                future.as_mut().poll(&mut cx),
+                Poll::Ready(if cancel { Err(Error::Cancelled) } else { Ok(7) })
+            );
+            assert_eq!(attempts.get(), if cancel { 1 } else { 2 });
+        }
+    }
+
+    /// Scope failure cannot truncate an accepted operation's completion fence.
+    #[test]
+    fn accepted_pending_operation_is_not_truncated_by_scope_failure() {
+        let (_clock, r) = sim(47);
+        let scope = TestScope::default();
+        let completed = Cell::new(false);
+        let attempts = Cell::new(0);
+        let mut future = r.retry_overloaded(&scope, || {
+            attempts.set(attempts.get() + 1);
+            Box::pin(std::future::poll_fn(|_| {
+                if completed.get() {
+                    Poll::Ready(Err::<(), _>(Error::Io))
+                } else {
+                    Poll::Pending
+                }
+            }))
+        });
+        let mut cx = Context::from_waker(Waker::noop());
+        assert!(future.as_mut().poll(&mut cx).is_pending());
+        scope.0.set(Some(Error::Cancelled));
+        assert!(future.as_mut().poll(&mut cx).is_pending());
+        completed.set(true);
+        assert_eq!(future.as_mut().poll(&mut cx), Poll::Ready(Err(Error::Io)));
+        assert_eq!(attempts.get(), 1);
+    }
+}

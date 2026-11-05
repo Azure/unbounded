@@ -258,10 +258,11 @@ impl PeerServer {
             loop {
                 scope.check()?;
                 if let AcceptMode::Distributed(ingress) = &self.accept {
-                    uring_runtime::drivers::retry_listener(scope, scope.clock().clone(), || {
-                        reactor.readiness_with_lease(fd.clone(), libc::POLLIN as u32, (), scope)
-                    })
-                    .await?;
+                    reactor
+                        .retry_overloaded(scope, || {
+                            reactor.readiness_with_lease(fd.clone(), libc::POLLIN as u32, (), scope)
+                        })
+                        .await?;
                     let cancellation = scope.cancellation.subscribe()?;
                     let offer = std::future::poll_fn(|cx| {
                         cancellation.register(cx.waker());
@@ -300,9 +301,7 @@ impl PeerServer {
                     continue;
                 }
                 let accepted = next_accepted(
-                    uring_runtime::drivers::retry_listener(scope, scope.clock().clone(), || {
-                        reactor.accept(fd.clone(), scope)
-                    }),
+                    reactor.retry_overloaded(scope, || reactor.accept(fd.clone(), scope)),
                     &mut active,
                     scope,
                 )

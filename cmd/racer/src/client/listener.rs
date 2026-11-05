@@ -1166,15 +1166,16 @@ impl ReadyListeners {
             let scope = self.scope.clone();
             Box::pin(async move {
                 let scope = scope.ok_or(Error::Internal)?;
-                uring_runtime::drivers::retry_listener(&scope, scope.clock().clone(), || {
-                    reactor.readiness_with_lease(
-                        fd.clone(),
-                        libc::POLLIN as u32,
-                        fd.clone(),
-                        &scope,
-                    )
-                })
-                .await
+                reactor
+                    .retry_overloaded(&scope, || {
+                        reactor.readiness_with_lease(
+                            fd.clone(),
+                            libc::POLLIN as u32,
+                            fd.clone(),
+                            &scope,
+                        )
+                    })
+                    .await
             })
         })?;
         Ok(ready.and_then(|index| self.listeners[index].upgrade()))

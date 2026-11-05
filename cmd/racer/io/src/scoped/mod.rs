@@ -276,6 +276,17 @@ impl<S: Scope> Reactor<S> {
         })
     }
 
+    /// Earliest instant, on [`Self::ctx`]'s clock, at which
+    /// [`Self::poll_budgeted`] has timed work such as a timer or operation
+    /// deadline. `None` when idle, uninitialized, or when the kernel reactor
+    /// runs on host time under a simulated worker clock.
+    pub fn next_deadline(&self) -> Option<Instant> {
+        if self.foreign_clock.get() {
+            return None;
+        }
+        self.io.get().and_then(crate::Reactor::next_deadline)
+    }
+
     /// Count operations still awaiting their original or cancellation CQE.
     pub fn in_flight(&self) -> usize {
         self.io.get().map_or(0, crate::Reactor::in_flight)
@@ -1493,3 +1504,5 @@ pub mod ready_set {
 
 #[cfg(test)]
 mod tests;
+
+mod retry;
