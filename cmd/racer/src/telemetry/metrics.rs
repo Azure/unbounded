@@ -43,7 +43,7 @@ pub struct Metrics {
     /// GPU, cuFile, and GPU landing sources, shared by every worker.
     gpu: Arc<crate::gpu_telemetry::GpuTelemetry>,
 
-    /// Node-wide prefetch counters, shared by every worker.
+    /// This worker's handle on the prefetch registry.
     prefetch: Arc<crate::prefetch::metrics::PrefetchMetrics>,
 
     shard: usize,
@@ -786,11 +786,12 @@ impl Metrics {
         });
         let cache_disks = ::telemetry::SnapshotShards::new(count);
         let gpu = Arc::new(crate::gpu_telemetry::GpuTelemetry::default());
-        let prefetch = Arc::new(crate::prefetch::metrics::PrefetchMetrics::default());
+        let prefetch = crate::prefetch::metrics::PrefetchMetrics::shards(count);
         Ok(::telemetry::Metrics::shards(count)
             .into_iter()
+            .zip(prefetch)
             .enumerate()
-            .map(|(shard, core)| Self {
+            .map(|(shard, (core, prefetch))| Self {
                 core,
                 admission: admission.clone(),
                 retention: retention.clone(),
@@ -799,7 +800,7 @@ impl Metrics {
                 memory: memory.clone(),
                 cache_disks: cache_disks.clone(),
                 gpu: gpu.clone(),
-                prefetch: prefetch.clone(),
+                prefetch: Arc::new(prefetch),
                 shard,
             })
             .collect())
