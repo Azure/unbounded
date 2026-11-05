@@ -11,8 +11,10 @@ use std::collections::BTreeSet;
 use std::ops::Range;
 use std::time::{Duration, Instant};
 
+pub mod acquisition;
 pub mod budget;
 pub mod cohort;
+pub mod effect;
 pub mod errors;
 pub mod flight;
 pub mod hints;

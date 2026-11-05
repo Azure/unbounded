@@ -396,7 +396,9 @@ mod tests {
     fn elections_are_capped_per_cohort() {
         let mut f = fx();
         let k = key(RefreshPurpose::Current);
-        let ids: Vec<u64> = (0..=MAX_REFRESH_ATTEMPTS as u64).map(|_| f.waiter(&k)).collect();
+        let ids: Vec<u64> = (0..=MAX_REFRESH_ATTEMPTS as u64)
+            .map(|_| f.waiter(&k))
+            .collect();
         for &id in &ids[..MAX_REFRESH_ATTEMPTS] {
             let started = f.lead(&k, id);
             f.c.settle(&k, started, Err(Error::OriginRejected), 1, &mut f.wakes)
