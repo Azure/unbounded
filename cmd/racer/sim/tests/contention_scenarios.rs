@@ -1432,3 +1432,74 @@ fn readers_handle_owners_that_are_behind() {
         }
     }
 }
+
+/// Production peer connection slots (`racer_core::connections`) on the 400-node cold start:
+/// connections queue at hot nodes' full listeners, partly behind idle connections peers keep
+/// pooled for 30 s. Evicting the longest-idle inbound connection (the proposed fix, not
+/// production) cuts the queued waits that outlive their attempt. Mirrors the Model's
+/// `idle_connections_pin_ingress_slots` (`dst/MODEL.md`, "Peer connection slots").
+#[test]
+fn idle_connections_pin_ingress_slots() {
+    let report = |evict: bool| {
+        let mut config = quiet(400);
+        config.duration_ns = 30 * SECONDS;
+        config.storms = vec![Storm::new(0, 0, 400, 10 * MILLIS)];
+        config.node.connections = true;
+        config.node.conn_evict_idle = evict;
+        run(config, 8)
+    };
+    let conn = |r: &Value, k: &str| r["connections"][k].as_u64().unwrap();
+    let production = report(false);
+    let evicting = report(true);
+    assert!(
+        conn(&production, "queued") > 0,
+        "{}",
+        production["connections"]
+    );
+    assert!(
+        conn(&production, "reused") > 0,
+        "{}",
+        production["connections"]
+    );
+    assert_eq!(conn(&production, "idle_evicted"), 0);
+    assert!(
+        conn(&evicting, "idle_evicted") > 0,
+        "{}",
+        evicting["connections"]
+    );
+    assert!(
+        counter(&evicting, "conn_queue_abandoned") < counter(&production, "conn_queue_abandoned"),
+        "{} {}",
+        counter(&production, "conn_queue_abandoned"),
+        counter(&evicting, "conn_queue_abandoned")
+    );
+}
+
+/// With connection slots on, a node's outbound pool refuses a link past its per-endpoint or
+/// pool cap at once (`Overloaded`, production `checkout_with_state`), so a burst of many
+/// concurrent reads per worker sees refusals.
+#[test]
+fn full_outbound_pools_refuse_links() {
+    let mut config = quiet(400);
+    config.duration_ns = 30 * SECONDS;
+    config.storms = vec![Storm::new(0, 0, 400, 10 * MILLIS)];
+    config.node.connections = true;
+    let report = run(config.clone(), 8);
+    let conn = |r: &Value, k: &str| r["connections"][k].as_u64().unwrap();
+    assert!(
+        conn(&report, "overloaded_endpoint") > 0,
+        "{}",
+        report["connections"]
+    );
+    assert_eq!(
+        counter(&report, "conn_overloaded"),
+        conn(&report, "overloaded_endpoint") + conn(&report, "overloaded_pool")
+    );
+    // Off, nothing is counted.
+    config.node.connections = false;
+    let off = run(config, 8);
+    assert_eq!(
+        conn(&off, "accepted") + conn(&off, "overloaded_endpoint"),
+        0
+    );
+}

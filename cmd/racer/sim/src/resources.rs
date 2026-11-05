@@ -232,6 +232,24 @@ impl Fabric {
         reserve(&mut self.cpu_free[i], now, service).1
     }
 
+    /// Run `ns` on a worker of `node` for work whose input is ready at `ready`, possibly after
+    /// `now`, without holding the worker idle until then: [`reserve`] keeps one free time per
+    /// server, so booking at a future start would also block every earlier job that arrives in
+    /// between. The worker is charged from `now` instead, and the work ends no earlier than
+    /// `ready + ns`. Exact when `ready <= now`; otherwise the charge moves earlier by at most
+    /// `ready - now`.
+    pub fn cpu_from(
+        &mut self,
+        now: Nanos,
+        ready: Nanos,
+        node: u32,
+        worker: u8,
+        ns: Nanos,
+    ) -> Nanos {
+        let end = self.cpu(now, node, worker, ns);
+        end.max(ready.saturating_add(self.scale(node, ns)))
+    }
+
     /// Run `ns` on the crypto helper of one worker of `node`.
     pub fn crypto(&mut self, now: Nanos, node: u32, worker: u8, ns: Nanos) -> Nanos {
         let i = node as usize * self.workers as usize + (worker % self.workers) as usize;
@@ -670,6 +688,17 @@ mod tests {
         assert_eq!(service_ns(1, SECONDS), 1);
         assert_eq!(service_ns(1, 3 * SECONDS), 1);
         assert_eq!(service_ns(1 << 20, 1 << 20), SECONDS);
+    }
+
+    #[test]
+    fn work_ready_later_does_not_hold_the_worker_idle() {
+        let mut f = fabric(1, 1);
+        // Ready in 1 ms: ends 1 ms plus its cost from now.
+        assert_eq!(f.cpu_from(0, 1_000_000, 0, 0, 10), 1_000_010);
+        // The worker is not booked until then: a job arriving now runs at once.
+        assert_eq!(f.cpu(0, 0, 0, 10), 20);
+        // Ready now: an ordinary FIFO reservation.
+        assert_eq!(f.cpu_from(20, 0, 0, 0, 5), 25);
     }
 
     #[test]

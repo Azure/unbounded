@@ -16,6 +16,7 @@ use std::time::{Duration, Instant};
 use crate::phantom::{Phantom, SharedRoutes};
 use page_alloc::SegmentId;
 use racer_core::cache::{SCAN_BUDGET, page_value, unseen_value};
+use racer_core::connections::{Acquire, ConnId, Connections};
 use racer_core::liveness::{
     LINK_TIMEOUTS, MAX_OFFERS_IN_FLIGHT, MAX_PINGS_IN_FLIGHT, NO_PING, ping_verdict,
 };
@@ -212,6 +213,14 @@ pub enum Event {
         from: u32,
         to: u32,
     },
+    /// The requester of `msg` gave up: it closes its connection and the relays see theirs close.
+    Abandon {
+        msg: u64,
+    },
+    /// Close the connections of a lost request held under `id`.
+    CloseHeld {
+        id: u64,
+    },
 }
 
 impl Event {
@@ -256,6 +265,8 @@ impl Event {
             Self::Notice { node } => (22, node.into(), 0),
             Self::LastHop { msg } => (23, msg, 0),
             Self::SilenceRecheck { from, to } => (25, (u64::from(from) << 32) | u64::from(to), 0),
+            Self::Abandon { msg } => (26, msg, 0),
+            Self::CloseHeld { id } => (27, id, 0),
         }
     }
 }
@@ -524,6 +535,8 @@ struct Msg {
     /// When the requester abandons this exchange (its attempt timeout).
     abandon: Nanos,
     relays: Vec<SimCharge>,
+    /// The connections the request holds, one per link in route order; dropping one closes it.
+    conns: Vec<SimConn>,
     /// When the first relay took its `Relay` transfer.
     relayed_at: Option<Nanos>,
     /// The current holder verified the request (production `verify_request_async` before
@@ -535,6 +548,31 @@ struct Msg {
     offer: bool,
     /// A silence ping: answered `Miss` at once.
     ping: bool,
+}
+
+/// A peer connection a request holds (`racer_core::connections`). Dropping it closes the
+/// connection, as production closes a failed or abandoned exchange's socket
+/// (`src/peer/transport.rs`); [`SimConn::keep`] hands it back for reuse instead.
+struct SimConn {
+    id: ConnId,
+    closed: Rc<std::cell::RefCell<Vec<ConnId>>>,
+    armed: bool,
+}
+
+impl SimConn {
+    /// The answer passed: the connection goes idle rather than closing.
+    fn keep(mut self) -> ConnId {
+        self.armed = false;
+        self.id
+    }
+}
+
+impl Drop for SimConn {
+    fn drop(&mut self) {
+        if self.armed {
+            self.closed.borrow_mut().push(self.id);
+        }
+    }
 }
 
 /// An outstanding silence ping.
@@ -814,6 +852,15 @@ pub struct NodeWorld {
     writes: HashMap<u64, SimCharge, Fixed>,
     /// Relay reservations of replies still streaming (see `Event::Release`).
     held: HashMap<u64, Vec<SimCharge>, Fixed>,
+    /// Peer connection slots of every node (`racer_core::connections`).
+    conns: Connections,
+    /// Connections dropped since the last event, to close.
+    conns_closed: Rc<std::cell::RefCell<Vec<ConnId>>>,
+    /// Requests whose next hop waits in an accept queue: the request and when it arrives.
+    conns_waiting: HashMap<ConnId, (u64, Nanos), Fixed>,
+    /// Connections of answered requests, kept for reuse once the answer passes (`Event::Release`),
+    /// or of lost requests, closed when their requester gives up (`Event::Abandon`).
+    conns_held: HashMap<u64, (Vec<SimConn>, bool), Fixed>,
     /// End times of page bodies each (node, page) is still streaming (production: page responses
     /// being written, `send_http_response`).
     streaming: HashMap<(u32, u64), Vec<Nanos>, Fixed>,
@@ -932,6 +979,10 @@ impl NodeWorld {
             ranges: HashMap::default(),
             writes: HashMap::default(),
             held: HashMap::default(),
+            conns: Connections::new(config.node.connection_config(config.workers.into())),
+            conns_closed: Rc::default(),
+            conns_waiting: HashMap::default(),
+            conns_held: HashMap::default(),
             streaming: HashMap::default(),
             last_hops: HashMap::default(),
             pings: HashMap::default(),
@@ -1027,8 +1078,63 @@ impl NodeWorld {
         let now = self.engine.now();
         let (tag, a, b) = event.tag();
         self.engine.trace.record(now, tag, a, b);
+        // Idle connections that timed out free their ingress slots first.
+        self.conns.advance(now);
+        self.settle_conns();
         self.handle(event);
+        self.settle_conns();
         true
+    }
+
+    /// Close dropped connections, then start the hops whose connections an ingress slot accepted.
+    fn settle_conns(&mut self) {
+        let now = self.now();
+        loop {
+            let closed = std::mem::take(&mut *self.conns_closed.borrow_mut());
+            if closed.is_empty() {
+                break;
+            }
+            for id in closed {
+                if self.conns_waiting.remove(&id).is_some() {
+                    self.metrics.incr("conn_queue_abandoned");
+                }
+                self.conns.close(id);
+            }
+        }
+        for id in self.conns.take_admitted() {
+            if let Some((mid, arrive)) = self.conns_waiting.remove(&id) {
+                self.engine.at(arrive.max(now), Event::Hop { msg: mid });
+            }
+        }
+    }
+
+    /// Keep `conns` until `at`, then hand them back for reuse (`keep`) or close them.
+    fn hold_conns(&mut self, conns: Vec<SimConn>, at: Nanos, keep: bool) {
+        if conns.is_empty() {
+            return;
+        }
+        if at <= self.now() {
+            return self.release_conns(conns, keep);
+        }
+        let id = self.fresh();
+        self.conns_held.insert(id, (conns, keep));
+        let event = if keep {
+            Event::Release { id }
+        } else {
+            Event::CloseHeld { id }
+        };
+        self.engine.at(at, event);
+    }
+
+    fn release_conns(&mut self, conns: Vec<SimConn>, keep: bool) {
+        let now = self.now();
+        for conn in conns {
+            if keep {
+                let id = conn.keep();
+                self.conns_waiting.remove(&id);
+                self.conns.finish(now, id);
+            }
+        }
     }
 
     /// Combined mode: the control plane committed membership `number` with `members` (node ids) at
@@ -1186,6 +1292,26 @@ impl NodeWorld {
             Event::OriginWake => self.origin_wake(),
             Event::Release { id } => {
                 self.held.remove(&id);
+                if let Some((conns, keep)) = self.conns_held.remove(&id) {
+                    self.release_conns(conns, keep);
+                }
+            }
+            Event::CloseHeld { id } => {
+                self.conns_held.remove(&id);
+            }
+            Event::Abandon { msg } => {
+                let waiting = self.msgs.get(&msg).is_some_and(|m| {
+                    m.conns
+                        .iter()
+                        .any(|c| self.conns_waiting.contains_key(&c.id))
+                });
+                if waiting {
+                    // Never accepted: no holder will see it again.
+                    self.metrics.incr("requests_abandoned");
+                    self.msgs.remove(&msg);
+                } else if let Some(m) = self.msgs.get_mut(&msg) {
+                    m.conns.clear();
+                }
             }
         }
     }
@@ -3092,6 +3218,7 @@ impl NodeWorld {
             deadline,
             abandon: self.nanos(plan.attempt_end).max(now + 1),
             relays: Vec::new(),
+            conns: Vec::new(),
             relayed_at: None,
             verified: false,
             direct,
@@ -3330,6 +3457,7 @@ impl NodeWorld {
             deadline: timeout,
             abandon: timeout,
             relays: Vec::new(),
+            conns: Vec::new(),
             relayed_at: None,
             verified: false,
             direct: false,
@@ -3477,6 +3605,36 @@ impl NodeWorld {
             self.note_cut(mid, cut);
         }
         let unready = cut == Some(Cut::NotServing);
+        // The sender's pool hands out a connection before any I/O (`racer_core::connections`).
+        let acquired = (up && self.config.node.connections).then(|| {
+            let worker = self.conn_worker(mid);
+            self.conns.acquire(now, holder, worker, next)
+        });
+        match acquired {
+            Some(Acquire::Overloaded) => {
+                self.metrics.incr("conn_overloaded");
+                return self.fail_hop(mid, holder, Fault::Overloaded);
+            }
+            Some(
+                Acquire::Reused(id)
+                | Acquire::Accepted(id)
+                | Acquire::Queued(id)
+                | Acquire::Dropped(id),
+            ) => {
+                let conn = SimConn {
+                    id,
+                    closed: self.conns_closed.clone(),
+                    armed: true,
+                };
+                let m = self.msgs.get_mut(&mid).expect("message");
+                if m.conns.is_empty() {
+                    let abandon = m.abandon.max(now + 1);
+                    self.engine.at(abandon, Event::Abandon { msg: mid });
+                }
+                m.conns.push(conn);
+            }
+            None => {}
+        }
         let n = &mut self.nodes[holder as usize];
         if up {
             n.links.success(&next);
@@ -3489,13 +3647,12 @@ impl NodeWorld {
             }
             let costs = self.fabric.costs;
             let conn = self.conn_worker(mid);
-            // Charged on the crypto helper, though production signs inline on the I/O worker
-            // (`src/peer.rs` `sign_request_to`, `append_request`); see `dst/MODEL.md`, "Signing
-            // placement".
+            // Production signs inline on the I/O worker (`src/peer.rs` `sign_request_to`,
+            // `append_request`); only verification goes to the crypto helper.
             let proofs = self.msgs[&mid].path.len();
             let signed = self
                 .fabric
-                .crypto(now, holder, conn, costs.sign_request(proofs));
+                .cpu(now, holder, conn, costs.sign_request(proofs));
             let arrive = self.fabric.message(signed, holder, next);
             self.metrics.incr("peer_messages");
             // The receiver verifies when the message arrives (in `hop`), so no future slot is
@@ -3503,7 +3660,23 @@ impl NodeWorld {
             if let Some(m) = self.msgs.get_mut(&mid) {
                 m.verified = false;
             }
-            self.engine.at(arrive, Event::Hop { msg: mid });
+            match acquired {
+                Some(Acquire::Queued(id)) => {
+                    // Production stops accepting with every ingress slot held; the connection
+                    // waits in the kernel accept queue (`peer/server.rs` `listen`).
+                    self.metrics.incr("conn_queued_hops");
+                    self.conns_waiting.insert(id, (mid, arrive));
+                }
+                Some(Acquire::Dropped(_)) => {
+                    // A full accept queue drops the handshake: the sender hears nothing and its
+                    // attempt times out.
+                    self.metrics.incr("messages_lost_to_backlog");
+                    if let Some(m) = self.msgs.remove(&mid) {
+                        self.hold_conns(m.conns, m.abandon, false);
+                    }
+                }
+                _ => self.engine.at(arrive, Event::Hop { msg: mid }),
+            }
         } else {
             self.metrics.incr("link_failures");
             if partitioned
@@ -3616,7 +3789,10 @@ impl NodeWorld {
             // A hung peer server: accepted, never answered or forwarded; the requester's attempt
             // times out.
             self.metrics.incr("messages_lost_to_hang");
-            self.msgs.remove(&mid);
+            if let Some(m) = self.msgs.remove(&mid) {
+                // Nobody answers or closes the connections before the requester gives up.
+                self.hold_conns(m.conns, m.abandon, false);
+            }
             return;
         }
         if now >= m.abandon {
@@ -3641,6 +3817,11 @@ impl NodeWorld {
             };
             if bound != 0 && self.fabric.crypto_outstanding(now, at, conn) >= bound {
                 self.metrics.incr(shed_name);
+                // The unsigned overload head ends the last link's exchange cleanly
+                // (`peer/server.rs` `serve_connection` returns the connection for reuse).
+                if let Some(conn) = self.msgs.get_mut(&mid).and_then(|m| m.conns.pop()) {
+                    self.release_conns(vec![conn], true);
+                }
                 // The last link's sender sees the connection fail or an unsigned overload at
                 // once: not silence.
                 self.last_hops.remove(&mid);
@@ -4074,7 +4255,7 @@ impl NodeWorld {
     /// Send `reply` for `mid` from `from` back along the reverse route, starting at `ready`. Pages
     /// travel as cut-through transfers.
     fn send_reply(&mut self, mid: u64, from: u32, reply: Reply, ready: Nanos) {
-        let Some(m) = self.msgs.remove(&mid) else {
+        let Some(mut m) = self.msgs.remove(&mid) else {
             return;
         };
         if from != m.dest && self.offers.contains_key(&m.probe) {
@@ -4132,12 +4313,15 @@ impl NodeWorld {
             let bytes = self.config.page_bytes;
             let sealed = self
                 .fabric
-                .crypto(ready, from, conn, costs.sign_response_ns);
+                .cpu_from(now, ready, from, conn, costs.sign_response_ns);
             // The body streams only while the requester still waits; relays hold their `Relay`
             // reservation until the body has passed (production keeps it on the connection while
             // streaming, `peer/server.rs` `relay.reservation`).
             let done = self.fabric.transfer_until(sealed, &route, bytes, m.abandon);
             let release = done.unwrap_or(m.abandon);
+            // Production keeps each connection until the body is written upstream; an abandoned
+            // body closes them.
+            self.hold_conns(std::mem::take(&mut m.conns), release, done.is_some());
             if !m.relays.is_empty() {
                 self.metrics
                     .observe("relay_hold_stream_ns", release.saturating_sub(ready));
@@ -4168,13 +4352,14 @@ impl NodeWorld {
             }
             let mut t = self
                 .fabric
-                .crypto(ready, from, conn, costs.sign_response_ns);
+                .cpu_from(now, ready, from, conn, costs.sign_response_ns);
             for hop in route.windows(2) {
                 t = self.fabric.message(t, hop[0], hop[1]);
             }
             // Production keeps each relay's `Relay` reservation until it has written the answer
             // upstream (`peer/server.rs` `send_http_response` clears `relay.reservation`): hold
             // them until the answer arrives.
+            self.hold_conns(std::mem::take(&mut m.conns), t, true);
             if !m.relays.is_empty() && t > now {
                 let id = self.fresh();
                 self.held.insert(id, m.relays);
@@ -5412,6 +5597,19 @@ impl NodeWorld {
         let c = |k: &str| self.metrics.get(k);
         let requests: u64 = self.origin_per_page.values().map(|c| u64::from(*c)).sum();
         let pages = self.origin_per_page.len();
+        let st = self.conns.stats();
+        let connections = json!({
+            "reused": st.reused,
+            "accepted": st.accepted,
+            "queued": st.queued,
+            "dropped": st.dropped,
+            "overloaded_endpoint": st.overloaded_endpoint,
+            "overloaded_pool": st.overloaded_pool,
+            "idle_cleared": st.idle_cleared,
+            "idle_expired": st.idle_expired,
+            "idle_evicted": st.idle_evicted,
+            "most_queued": st.most_queued,
+        });
         json!({
             "scenario": scenario,
             "logic": "real",
@@ -5452,6 +5650,7 @@ impl NodeWorld {
                     .map(|(k, sk, _)| (k.to_string(), json!(c(sk))))
                     .collect::<serde_json::Map<_, _>>(),
             },
+            "connections": connections,
             "rejections": self.rejections(),
             "mesh": self.mesh_report(),
             "membership": {

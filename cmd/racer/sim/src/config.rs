@@ -186,6 +186,21 @@ pub struct NodeConfig {
     /// port slots plus as many admission waiters (`src/security.rs` `CryptoClient::new`,
     /// `runtime/src/offload.rs` `AdmissionQueue::enter`). Zero is unbounded.
     pub crypto_queue: u32,
+    /// Model peer connection slots (`racer_core::connections`): per-worker outbound pools, per-node
+    /// ingress with its accept queue, and idle reuse, as production holds them. Off (the
+    /// default, so existing scenarios keep their transport), every link connects at once;
+    /// production's semantics fail several scenarios (`dst/MODEL.md`, "Peer connection slots").
+    pub connections: bool,
+    /// Overrides of the production connection limits (`connections::Config::production`); zero
+    /// keeps production's. Ingress is per node.
+    pub conn_ingress: u32,
+    pub conn_outbound: u32,
+    pub conn_per_endpoint: u32,
+    pub conn_backlog: u32,
+    pub conn_idle_ms: u64,
+    /// Not production: a full listener closes its longest-idle inbound connection
+    /// (`connections::Config::evict_idle`), the proposed fix for idle pinning.
+    pub conn_evict_idle: bool,
     pub plaintext_bytes: u64,
     pub ciphertext_bytes: u64,
     pub dirty_bytes: u64,
@@ -283,6 +298,13 @@ impl Default for NodeConfig {
             waiters_per_flight: 64,
             relay_transfers: 16,
             crypto_queue: racer_core::admission::Limits::default().crypto_submissions() as u32,
+            connections: false,
+            conn_ingress: 0,
+            conn_outbound: 0,
+            conn_per_endpoint: 0,
+            conn_backlog: 0,
+            conn_idle_ms: 0,
+            conn_evict_idle: false,
             plaintext_bytes: 64 * MIB,
             ciphertext_bytes: 128 * MIB,
             dirty_bytes: 160 * MIB,
@@ -327,6 +349,27 @@ impl Default for NodeConfig {
 }
 
 const MIB: u64 = 1 << 20;
+
+impl NodeConfig {
+    /// Connection limits for `workers` I/O workers: production's, with any overrides.
+    pub fn connection_config(&self, workers: u32) -> racer_core::connections::Config {
+        let mut config = racer_core::connections::Config::production(workers);
+        let set = |value: u32, slot: &mut usize| {
+            if value != 0 {
+                *slot = value as usize;
+            }
+        };
+        set(self.conn_ingress, &mut config.ingress);
+        set(self.conn_outbound, &mut config.outbound);
+        set(self.conn_per_endpoint, &mut config.per_endpoint);
+        set(self.conn_backlog, &mut config.backlog);
+        if self.conn_idle_ms != 0 {
+            config.idle_timeout = self.conn_idle_ms * 1_000_000;
+        }
+        config.evict_idle = self.conn_evict_idle;
+        config
+    }
+}
 
 fn u64_of(key: &str, v: &Value) -> Result<u64, String> {
     v.as_u64()
@@ -432,6 +475,13 @@ impl Config {
                             "waiters_per_flight" => node.waiters_per_flight = small()?,
                             "relay_transfers" => node.relay_transfers = small()?,
                             "crypto_queue" => node.crypto_queue = small()?,
+                            "connections" if n <= 1 => node.connections = n == 1,
+                            "conn_ingress" => node.conn_ingress = small()?,
+                            "conn_outbound" => node.conn_outbound = small()?,
+                            "conn_per_endpoint" => node.conn_per_endpoint = small()?,
+                            "conn_backlog" => node.conn_backlog = small()?,
+                            "conn_idle_ms" => node.conn_idle_ms = n,
+                            "conn_evict_idle" if n <= 1 => node.conn_evict_idle = n == 1,
                             "plaintext_bytes" => node.plaintext_bytes = n,
                             "ciphertext_bytes" => node.ciphertext_bytes = n,
                             "dirty_bytes" => node.dirty_bytes = n,
