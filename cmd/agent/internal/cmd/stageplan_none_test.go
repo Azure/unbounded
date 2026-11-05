@@ -203,6 +203,7 @@ func TestNonePlanEnsureHostCleanRunsTheOwnershipCheck(t *testing.T) {
 	require.ErrorContains(t, err, "kubelet.service")
 
 	p.ownership = func() error { return nil }
+
 	require.NoError(t, s.EnsureHostClean(t.Context()))
 }
 

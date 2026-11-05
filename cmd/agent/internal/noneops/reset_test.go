@@ -312,6 +312,7 @@ func TestTeardownDestroyKeepsOtherCNIPlugins(t *testing.T) {
 
 	version := filepath.Join(td.Layout.VersionDir("v1"), "cni", "bin")
 	put(t, "/", filepath.Join(version, "bridge"), "ours")
+
 	_, err := td.Layout.Flip("v1")
 	require.NoError(t, err)
 

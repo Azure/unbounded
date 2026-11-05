@@ -609,6 +609,7 @@ func TestInstallAndSwitchFromTarGzRunsTheCandidateCheck(t *testing.T) {
 				HTTPClient:     server.Client(),
 				Check: func(_ context.Context, path string) error {
 					checked = path
+
 					if refuse {
 						return errors.New("cannot operate isolation mode none")
 					}

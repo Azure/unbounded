@@ -653,6 +653,7 @@ func TestUpgradeRollbackRestoresTheLocalDNSUnitItRetired(t *testing.T) {
 	require.ErrorContains(t, err, "rolled back to v1")
 
 	require.Equal(t, "systemctl stop "+UnitLocalDNS, rec.calls[2], "LocalDNS stops with the stack, last")
+
 	stops := 0
 
 	for _, c := range rec.calls {
