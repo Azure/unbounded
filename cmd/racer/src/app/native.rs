@@ -1083,13 +1083,13 @@ mod tests {
             NodeId("node".into()),
             2,
             None,
-            crate::test_support::ctx(),
+            racer_io::WorkerCtx::host(),
         );
         let admission = flow_control::Quotas::new(AdmissionPolicy::new(limits.clone()));
         let held = admission
             .reserve(None, ResourceClass::Registered, 1)
             .unwrap();
-        let startup = scope(&crate::test_support::clock(), Duration::from_secs(10)).unwrap();
+        let startup = scope(&racer_io::Clock::host(), Duration::from_secs(10)).unwrap();
         let publication = vec![racer_control_wire::RailMapping {
             device: "missing".into(),
             port: 1,
@@ -1193,7 +1193,7 @@ mod tests {
             worker,
             CryptoRuntime {
                 port: engine,
-                ctx: crate::test_support::ctx(),
+                ctx: racer_io::WorkerCtx::host(),
             },
         )
     }
@@ -1231,7 +1231,7 @@ mod tests {
             )
             .unwrap();
         assert_eq!(worker.runtime.admission.used(ResourceClass::Registered), 0);
-        worker.native_retry = uring_runtime::environment::now();
+        worker.native_retry = racer_io::Clock::host().now();
         for _ in 0..20 {
             worker.poll_native(&mut cx).unwrap();
             service
@@ -1265,9 +1265,7 @@ mod tests {
             )
             .unwrap();
         worker
-            .refresh_snapshot(
-                &scope(&crate::test_support::clock(), Duration::from_secs(1)).unwrap(),
-            )
+            .refresh_snapshot(&scope(&racer_io::Clock::host(), Duration::from_secs(1)).unwrap())
             .unwrap();
         assert!(worker.actual_rails.is_empty());
         assert!(!worker.links.as_ref().unwrap().rail_ready(RailId(7)));
@@ -1304,7 +1302,7 @@ mod tests {
             }
             let (mut worker, _engine) = worker(&app, aligned, published_rails);
             futures::executor::block_on(worker.activate_native(
-                &scope(&crate::test_support::clock(), Duration::from_secs(1)).unwrap(),
+                &scope(&racer_io::Clock::host(), Duration::from_secs(1)).unwrap(),
             ))
             .unwrap();
             assert!(worker.actual_rails.is_empty());
@@ -1336,7 +1334,7 @@ mod tests {
         // configuration does not stand in for the missing membership.
         assert_eq!(
             futures::executor::block_on(worker.activate_native(
-                &scope(&crate::test_support::clock(), Duration::from_secs(1)).unwrap()
+                &scope(&racer_io::Clock::host(), Duration::from_secs(1)).unwrap()
             )),
             Ok(())
         );
@@ -1345,7 +1343,7 @@ mod tests {
             Err(Error::IncompatibleMembership)
         );
         let mut cx = Context::from_waker(futures::task::noop_waker_ref());
-        worker.native_retry = uring_runtime::environment::now();
+        worker.native_retry = racer_io::Clock::host().now();
         worker.poll_native(&mut cx).unwrap();
         assert!(worker.native_task.is_none());
         assert!(worker.actual_rails.is_empty());
@@ -1418,13 +1416,13 @@ mod tests {
             .unwrap();
         assert_eq!(
             futures::executor::block_on(worker.activate_native(
-                &scope(&crate::test_support::clock(), Duration::from_secs(1)).unwrap()
+                &scope(&racer_io::Clock::host(), Duration::from_secs(1)).unwrap()
             )),
             Ok(())
         );
         let mut service = app.build_crypto(WorkerId(0), engine).unwrap();
         let mut cx = Context::from_waker(futures::task::noop_waker_ref());
-        worker.native_retry = uring_runtime::environment::now();
+        worker.native_retry = racer_io::Clock::host().now();
         worker.poll_native(&mut cx).unwrap();
         assert!(!worker.links.as_ref().unwrap().rail_ready(RailId(7)));
         let member = listed.member(&app.config.node).unwrap().clone();
@@ -1449,7 +1447,7 @@ mod tests {
                 .with_default_pool(),
             )
             .unwrap();
-        worker.native_retry = uring_runtime::environment::now();
+        worker.native_retry = racer_io::Clock::host().now();
         for _ in 0..20 {
             worker.poll_native(&mut cx).unwrap();
             service

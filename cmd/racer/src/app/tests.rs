@@ -371,7 +371,7 @@ impl ControlFixture {
             NodeState::new(
                 (0..workers).map(WorkerId).collect(),
                 64,
-                crate::test_support::ctx(),
+                racer_io::WorkerCtx::host(),
             )
             .unwrap(),
         );
@@ -379,7 +379,7 @@ impl ControlFixture {
             &config,
             &node,
             &config.limits,
-            &scope(&crate::test_support::clock(), timeout).unwrap(),
+            &scope(&racer_io::Clock::host(), timeout).unwrap(),
         )
         .unwrap()
         .0;
@@ -1045,7 +1045,7 @@ fn worker_sizing_funds_diagnostics_and_ordinary_progress() {
             .unwrap();
         let (reader, _writer) = sim.socket_pair();
         let reader = Rc::new(reader);
-        let scope = scope(&crate::test_support::clock(), Duration::from_secs(30)).unwrap();
+        let scope = scope(&racer_io::Clock::host(), Duration::from_secs(30)).unwrap();
         let mut cx = Context::from_waker(futures::task::noop_waker_ref());
         let mut pending = Vec::new();
         for _ in 0..entries - crate::telemetry::CONTROL_SLOTS {
@@ -1339,7 +1339,7 @@ fn placement_maintenance_retries_pressure_without_spinning_or_log_floods() {
     let count = Arc::new(crate::test_support::WakeCounter::default());
     let waker = std::task::Waker::from(count.clone());
     let mut cx = Context::from_waker(&waker);
-    let now = uring_runtime::environment::now();
+    let now = racer_io::Clock::host().now();
     worker.observe_placement_maintenance(Maintenance::Idle, now, &mut cx);
     assert_eq!(count.count(), 0);
     worker.observe_placement_maintenance(Maintenance::Progress, now, &mut cx);
@@ -1364,13 +1364,15 @@ fn metadata_wait_uses_worker_clock_and_keeps_due_backlog_runnable() {
     use uring_runtime::environment::SimulationClock;
     let clock = SimulationClock::new(913);
     let worker = {
-        let _environment = clock.environment(0).enter();
+        let sim_env = clock.environment(0);
+        let _environment = sim_env.enter();
+        let sim_ctx = sim_env.worker_ctx();
         let mut worker = wake_test_worker();
         // Settle the independently due ownership timer before isolating metadata
         // deadlines. Construct every worker timer in the same simulated clock.
         worker
             .ownership_maintenance
-            .poll(uring_runtime::environment::now(), false, || {
+            .poll(sim_ctx.clock.now(), false, || {
                 Ok(crate::topology::Maintenance::Idle)
             });
         worker
@@ -1378,7 +1380,7 @@ fn metadata_wait_uses_worker_clock_and_keeps_due_backlog_runnable() {
     let maximum = Duration::from_millis(1);
     let now = {
         let _environment = worker.environment.enter();
-        uring_runtime::environment::now()
+        worker.environment.worker_ctx().clock.now()
     };
     // Require the hook to enter the worker environment, not sample host time.
     let _required = uring_runtime::environment::require_simulated();
@@ -1485,7 +1487,7 @@ fn composes_http_and_optional_rdma_without_operational_side_effects() {
                 WorkerId(0),
                 CryptoRuntime {
                     port: engine,
-                    ctx: crate::test_support::ctx(),
+                    ctx: racer_io::WorkerCtx::host(),
                 },
             )
             .unwrap();
@@ -1531,7 +1533,7 @@ fn composes_http_and_optional_rdma_without_operational_side_effects() {
                 WorkerId(1),
                 CryptoRuntime {
                     port: second_engine,
-                    ctx: crate::test_support::ctx(),
+                    ctx: racer_io::WorkerCtx::host(),
                 },
             )
             .unwrap();
@@ -1595,16 +1597,11 @@ fn multiworker_memberships_retire_after_request_leases_and_reuse_capacity() {
     let store = PublicationTarget::new(
         publication.cluster.clone(),
         published.clone(),
-        crate::test_support::clock(),
+        racer_io::Clock::host(),
     );
     let networks = [
-        PeerNetwork::new(
-            local.clone(),
-            published.clone(),
-            crate::test_support::clock(),
-        )
-        .unwrap(),
-        PeerNetwork::new(local, published, crate::test_support::clock()).unwrap(),
+        PeerNetwork::new(local.clone(), published.clone(), racer_io::Clock::host()).unwrap(),
+        PeerNetwork::new(local, published, racer_io::Clock::host()).unwrap(),
     ];
     let mut publish = |sequence, version| {
         publication.sequence.0 = sequence;
@@ -1693,7 +1690,7 @@ fn snapshot_refresh_purges_cache_entering_passthrough() {
     let node = Arc::new(NodeState::default());
     let (mut worker, _, _) = local_worker(&config, &node, 1);
     let cached = definition();
-    let current_scope = scope(&crate::test_support::clock(), Duration::from_secs(1)).unwrap();
+    let current_scope = scope(&racer_io::Clock::host(), Duration::from_secs(1)).unwrap();
     worker
         .snapshots
         .apply(publication(&config, 1, vec![cached.clone()]))
@@ -1789,7 +1786,7 @@ fn snapshot_refresh_retries_canceled_publication_and_applies_skipped_removal() {
     let node = Arc::new(NodeState::default());
     let (mut worker, _, _) = local_worker(&config, &node, 1);
     let original = definition();
-    let current_scope = scope(&crate::test_support::clock(), Duration::from_secs(1)).unwrap();
+    let current_scope = scope(&racer_io::Clock::host(), Duration::from_secs(1)).unwrap();
     assert_eq!(
         worker.refresh_snapshot(&current_scope),
         Err(Error::Unavailable)
@@ -1849,7 +1846,7 @@ fn snapshot_refresh_retries_canceled_publication_and_applies_skipped_removal() {
         .unwrap();
     assert_eq!(retained_ciphertext.strong_count(), 1);
     assert_eq!(index.snapshot_metadata(), vec![metadata]);
-    let canceled = scope(&crate::test_support::clock(), Duration::from_secs(1)).unwrap();
+    let canceled = scope(&racer_io::Clock::host(), Duration::from_secs(1)).unwrap();
     canceled.cancel().unwrap();
     assert_eq!(worker.refresh_snapshot(&canceled), Err(Error::Cancelled));
     assert_eq!(worker.caches, vec![original]);
@@ -2035,9 +2032,7 @@ fn two_workers_start_from_real_control_and_checkpoint_one_complete_cut() {
                 drive(
                     &runtime,
                     &mut engine,
-                    app.start(
-                        &scope(&crate::test_support::clock(), Duration::from_secs(15)).unwrap(),
-                    ),
+                    app.start(&scope(&racer_io::Clock::host(), Duration::from_secs(15)).unwrap()),
                 )
                 .unwrap();
                 ready.wait();
@@ -2070,8 +2065,7 @@ fn startup_finishes_local_snapshot_installation_while_next_long_poll_is_held() {
                 let (mut worker, runtime, mut engine) = local_worker(config, node, id);
                 // Generous budget: this finishes in well under a second alone,
                 // but the full parallel suite can starve it past a tight one.
-                let startup =
-                    scope(&crate::test_support::clock(), Duration::from_secs(15)).unwrap();
+                let startup = scope(&racer_io::Clock::host(), Duration::from_secs(15)).unwrap();
                 // Force the first publication to wait for the second worker,
                 // then allow local preparation after the next poll is held.
                 if id == 1 {
@@ -2090,8 +2084,7 @@ fn startup_finishes_local_snapshot_installation_while_next_long_poll_is_held() {
                     assert!(worker.snapshots.current().is_ok());
                 }
                 finished.wait();
-                let shutdown =
-                    scope(&crate::test_support::clock(), Duration::from_secs(5)).unwrap();
+                let shutdown = scope(&racer_io::Clock::host(), Duration::from_secs(5)).unwrap();
                 drive(&runtime, &mut engine, worker.drain(&shutdown)).unwrap();
                 drive(&runtime, &mut engine, worker.shutdown(&shutdown)).unwrap();
                 result
@@ -2128,7 +2121,7 @@ fn cache_removal_installs_while_renewal_and_next_publication_poll_are_held() {
     drive(
         &runtime,
         &mut engine,
-        worker.start(&scope(&crate::test_support::clock(), Duration::from_secs(15)).unwrap()),
+        worker.start(&scope(&racer_io::Clock::host(), Duration::from_secs(15)).unwrap()),
     )
     .unwrap();
     worker.control_task.take();
@@ -2137,20 +2130,20 @@ fn cache_removal_installs_while_renewal_and_next_publication_poll_are_held() {
         control
             .identity()
             .unwrap()
-            .renewal_due_at(crate::test_support::clock().wall_now())
+            .renewal_due_at(racer_io::Clock::host().wall_now())
     );
     assert!(
         control
             .identity()
             .unwrap()
-            .valid_at(crate::test_support::clock().wall_now())
+            .valid_at(racer_io::Clock::host().wall_now())
     );
     let accepted = fixture.enrollments.load(Ordering::Acquire);
     let baseline_polls = fixture.long_polls.load(Ordering::Acquire);
     fixture.hold_renewal.store(true, Ordering::Release);
     fixture.hold_long_poll.store(true, Ordering::Release);
     *fixture.publication.lock().unwrap() = Some(publication(&config, 2, vec![]));
-    let turn_scope = scope(&crate::test_support::clock(), Duration::from_secs(15)).unwrap();
+    let turn_scope = scope(&racer_io::Clock::host(), Duration::from_secs(15)).unwrap();
     let mut progress = control.progress(&turn_scope);
     let until = Instant::now() + Duration::from_secs(5);
     let mut cx = Context::from_waker(futures::task::noop_waker_ref());
@@ -2233,7 +2226,7 @@ fn cache_removal_during_retry_after(delay_renewal_entry: bool) {
     drive(
         &runtime,
         &mut engine,
-        worker.start(&scope(&crate::test_support::clock(), Duration::from_secs(15)).unwrap()),
+        worker.start(&scope(&racer_io::Clock::host(), Duration::from_secs(15)).unwrap()),
     )
     .unwrap();
     worker.control_task.take();
@@ -2242,13 +2235,13 @@ fn cache_removal_during_retry_after(delay_renewal_entry: bool) {
         control
             .identity()
             .unwrap()
-            .renewal_due_at(crate::test_support::clock().wall_now())
+            .renewal_due_at(racer_io::Clock::host().wall_now())
     );
     assert!(
         control
             .identity()
             .unwrap()
-            .valid_at(crate::test_support::clock().wall_now())
+            .valid_at(racer_io::Clock::host().wall_now())
     );
     let accepted = fixture.enrollments.load(Ordering::Acquire);
     fixture.hold_renewal.store(true, Ordering::Release);
@@ -2257,7 +2250,7 @@ fn cache_removal_during_retry_after(delay_renewal_entry: bool) {
         .store(delay_renewal_entry, Ordering::Release);
     fixture.publication_retry_after.store(60, Ordering::Release);
     *fixture.publication.lock().unwrap() = Some(publication(&config, 2, vec![]));
-    let turn_scope = scope(&crate::test_support::clock(), Duration::from_secs(15)).unwrap();
+    let turn_scope = scope(&racer_io::Clock::host(), Duration::from_secs(15)).unwrap();
     let mut progress = control.progress(&turn_scope);
     let until = Instant::now() + Duration::from_secs(5);
     let mut cx = Context::from_waker(futures::task::noop_waker_ref());
@@ -2400,7 +2393,7 @@ fn same_node_renewal_backs_off_expires_closed_and_recovers() {
     drive(
         &runtime,
         &mut engine,
-        worker.start(&scope(&crate::test_support::clock(), Duration::from_secs(15)).unwrap()),
+        worker.start(&scope(&racer_io::Clock::host(), Duration::from_secs(15)).unwrap()),
     )
     .unwrap();
     assert!(node.observations.health.ready());
@@ -2410,8 +2403,8 @@ fn same_node_renewal_backs_off_expires_closed_and_recovers() {
     let control = worker.control.clone().unwrap();
     let old = control.identity().unwrap();
     assert!(
-        old.renewal_due_at(crate::test_support::clock().wall_now())
-            && old.valid_at(crate::test_support::clock().wall_now())
+        old.renewal_due_at(racer_io::Clock::host().wall_now())
+            && old.valid_at(racer_io::Clock::host().wall_now())
     );
     let old_signing = worker.keys.signing_identity().unwrap();
     let committed = std::fs::read(config.identity_directory.join("identity.json")).unwrap();
@@ -2617,12 +2610,13 @@ fn removal_publication_finishes_locally_after_controller_disappears() {
     };
     *fixture.publication.lock().unwrap() =
         Some(publication(&config, 1, vec![definition(), keep.clone()]));
-    let node = Arc::new(NodeState::new(vec![WorkerId(0)], 64, crate::test_support::ctx()).unwrap());
+    let node =
+        Arc::new(NodeState::new(vec![WorkerId(0)], 64, racer_io::WorkerCtx::host()).unwrap());
     config.node = bootstrap(
         &config,
         &node,
         &config.limits,
-        &scope(&crate::test_support::clock(), Duration::from_secs(15)).unwrap(),
+        &scope(&racer_io::Clock::host(), Duration::from_secs(15)).unwrap(),
     )
     .unwrap()
     .0;
@@ -2633,7 +2627,7 @@ fn removal_publication_finishes_locally_after_controller_disappears() {
     drive(
         &runtime,
         &mut engine,
-        worker.start(&scope(&crate::test_support::clock(), Duration::from_secs(15)).unwrap()),
+        worker.start(&scope(&racer_io::Clock::host(), Duration::from_secs(15)).unwrap()),
     )
     .unwrap();
     worker
@@ -2772,7 +2766,7 @@ fn removal_publication_finishes_locally_after_controller_disappears() {
         assert!(Instant::now() < until, "diagnostics stopped during removal");
     }
     assert!(response.starts_with(b"HTTP/1.1 200"));
-    let shutdown = scope(&crate::test_support::clock(), Duration::from_secs(5)).unwrap();
+    let shutdown = scope(&racer_io::Clock::host(), Duration::from_secs(5)).unwrap();
     drive(&runtime, &mut engine, worker.drain(&shutdown)).unwrap();
     drive(&runtime, &mut engine, runtime.reactor.drain()).unwrap();
     drive(&runtime, &mut engine, worker.shutdown(&shutdown)).unwrap();
@@ -2790,14 +2784,14 @@ fn startup_retries_tls_internal_error_before_enrollment_and_worker_snapshot() {
     drive(
         &runtime,
         &mut engine,
-        worker.start(&scope(&crate::test_support::clock(), Duration::from_secs(15)).unwrap()),
+        worker.start(&scope(&racer_io::Clock::host(), Duration::from_secs(15)).unwrap()),
     )
     .unwrap();
     assert!(node.observations.health.ready());
     assert_eq!(fixture.enrollments.load(Ordering::Acquire), 2);
     assert!(fixture.polls.load(Ordering::Acquire) > 0);
     assert!(!fixture.poll_certificates.lock().unwrap().is_empty());
-    let shutdown = scope(&crate::test_support::clock(), Duration::from_secs(5)).unwrap();
+    let shutdown = scope(&racer_io::Clock::host(), Duration::from_secs(5)).unwrap();
     drive(&runtime, &mut engine, worker.drain(&shutdown)).unwrap();
     drive(&runtime, &mut engine, worker.shutdown(&shutdown)).unwrap();
 }
@@ -2806,14 +2800,14 @@ fn startup_retries_tls_internal_error_before_enrollment_and_worker_snapshot() {
 fn startup_tls_authentication_alert_remains_terminal() {
     let mut fixture = ControlFixture::new();
     let config = fixture.config.take().unwrap();
-    let node = NodeState::new(vec![WorkerId(0)], 64, crate::test_support::ctx()).unwrap();
+    let node = NodeState::new(vec![WorkerId(0)], 64, racer_io::WorkerCtx::host()).unwrap();
     fixture.handshake_alerts.lock().unwrap().push_back(42);
     assert_eq!(
         bootstrap(
             &config,
             &node,
             &config.limits,
-            &scope(&crate::test_support::clock(), Duration::from_secs(5)).unwrap()
+            &scope(&racer_io::Clock::host(), Duration::from_secs(5)).unwrap()
         ),
         Err(Error::Unauthorized)
     );
@@ -2827,14 +2821,14 @@ fn startup_tls_authentication_alert_remains_terminal() {
 fn startup_tls_internal_error_respects_deadline() {
     let mut fixture = ControlFixture::new();
     let config = fixture.config.take().unwrap();
-    let node = NodeState::new(vec![WorkerId(0)], 64, crate::test_support::ctx()).unwrap();
+    let node = NodeState::new(vec![WorkerId(0)], 64, racer_io::WorkerCtx::host()).unwrap();
     fixture.handshake_alerts.lock().unwrap().extend([80; 16]);
     assert_eq!(
         bootstrap(
             &config,
             &node,
             &config.limits,
-            &scope(&crate::test_support::clock(), Duration::from_millis(500)).unwrap()
+            &scope(&racer_io::Clock::host(), Duration::from_millis(500)).unwrap()
         ),
         Err(Error::DeadlineExceeded)
     );
@@ -2849,12 +2843,12 @@ fn startup_reauthenticates_retained_identity_and_fails_closed() {
     let mut fixture = ControlFixture::new();
     let config = fixture.config.take().unwrap();
     let start = || {
-        let node = NodeState::new(vec![WorkerId(0)], 64, crate::test_support::ctx()).unwrap();
+        let node = NodeState::new(vec![WorkerId(0)], 64, racer_io::WorkerCtx::host()).unwrap();
         bootstrap(
             &config,
             &node,
             &config.limits,
-            &scope(&crate::test_support::clock(), Duration::from_secs(5)).unwrap(),
+            &scope(&racer_io::Clock::host(), Duration::from_secs(5)).unwrap(),
         )
     };
     let (old, selector) = start().unwrap();
@@ -2913,7 +2907,7 @@ fn node_replacement_drains_all_workers_and_restart_converges() {
         group
             .start(
                 app.clone(),
-                &scope(&crate::test_support::clock(), Duration::from_secs(15)).unwrap(),
+                &scope(&racer_io::Clock::host(), Duration::from_secs(15)).unwrap(),
             )
             .unwrap();
         assert!(node.observations.health.ready());
@@ -2950,7 +2944,7 @@ fn node_replacement_drains_all_workers_and_restart_converges() {
         fixture.poll_status.store(200, Ordering::Release);
         fixture.certificate_age.store(1, Ordering::Release);
         let fresh =
-            Arc::new(NodeState::new(vec![WorkerId(0)], 64, crate::test_support::ctx()).unwrap());
+            Arc::new(NodeState::new(vec![WorkerId(0)], 64, racer_io::WorkerCtx::host()).unwrap());
         drop(group);
         let app = Arc::try_unwrap(app).ok().unwrap();
         let mut config = Arc::try_unwrap(app.config).ok().unwrap();
@@ -2958,7 +2952,7 @@ fn node_replacement_drains_all_workers_and_restart_converges() {
             &config,
             &fresh,
             &config.limits,
-            &scope(&crate::test_support::clock(), Duration::from_secs(15)).unwrap(),
+            &scope(&racer_io::Clock::host(), Duration::from_secs(15)).unwrap(),
         )
         .unwrap()
         .0;
@@ -2967,7 +2961,7 @@ fn node_replacement_drains_all_workers_and_restart_converges() {
         drive(
             &runtime,
             &mut engine,
-            worker.start(&scope(&crate::test_support::clock(), Duration::from_secs(15)).unwrap()),
+            worker.start(&scope(&racer_io::Clock::host(), Duration::from_secs(15)).unwrap()),
         )
         .unwrap();
         assert!(fresh.observations.health.ready());
@@ -3023,7 +3017,7 @@ fn two_worker_real_control_key_lease_drain_and_checkpoint_cut() {
     group
         .start(
             app.clone(),
-            &scope(&crate::test_support::clock(), Duration::from_secs(15)).unwrap(),
+            &scope(&racer_io::Clock::host(), Duration::from_secs(15)).unwrap(),
         )
         .unwrap();
     assert_eq!(node.prepared.load(Ordering::Acquire), 2);
@@ -3069,7 +3063,7 @@ fn two_worker_real_control_key_lease_drain_and_checkpoint_cut() {
         thread::sleep(Duration::from_millis(1));
     }
     assert!(keys.active(&cache, KeyPurpose::Page).is_err());
-    let shutdown = scope(&crate::test_support::clock(), Duration::from_secs(10)).unwrap();
+    let shutdown = scope(&racer_io::Clock::host(), Duration::from_secs(10)).unwrap();
     group.drain(&shutdown).unwrap();
     group.shutdown(&shutdown).unwrap();
     group.join().unwrap();
@@ -3088,14 +3082,14 @@ fn stop_worker(
     drive(
         runtime,
         engine,
-        worker.drain(&scope(&crate::test_support::clock(), Duration::from_secs(5)).unwrap()),
+        worker.drain(&scope(&racer_io::Clock::host(), Duration::from_secs(5)).unwrap()),
     )
     .unwrap();
     drive(runtime, engine, runtime.reactor.drain()).unwrap();
     drive(
         runtime,
         engine,
-        worker.shutdown(&scope(&crate::test_support::clock(), Duration::from_secs(5)).unwrap()),
+        worker.shutdown(&scope(&racer_io::Clock::host(), Duration::from_secs(5)).unwrap()),
     )
     .unwrap();
 }
@@ -3119,7 +3113,7 @@ fn oversized_populated_shutdown_cut_thaws_and_finishes_drain_without_publication
     drive(
         &runtime,
         &mut engine,
-        worker.start(&scope(&crate::test_support::clock(), Duration::from_secs(15)).unwrap()),
+        worker.start(&scope(&racer_io::Clock::host(), Duration::from_secs(15)).unwrap()),
     )
     .unwrap();
     let index = worker.store.writer.index();
@@ -3151,7 +3145,7 @@ fn oversized_populated_shutdown_cut_thaws_and_finishes_drain_without_publication
         })
         .sum();
     worker.checkpoint_budget = 4 * (metadata_bytes - 1);
-    let deadline = scope(&crate::test_support::clock(), Duration::from_secs(5)).unwrap();
+    let deadline = scope(&racer_io::Clock::host(), Duration::from_secs(5)).unwrap();
     assert_eq!(
         drive(&runtime, &mut engine, worker.drain(&deadline)),
         Err(Error::Overloaded)
@@ -3204,7 +3198,7 @@ fn blocked_publication_is_superseded_while_projection_rotates() {
     drive(
         &runtime,
         &mut engine,
-        worker.start(&scope(&crate::test_support::clock(), Duration::from_secs(15)).unwrap()),
+        worker.start(&scope(&racer_io::Clock::host(), Duration::from_secs(15)).unwrap()),
     )
     .unwrap();
     let control = worker.control.clone().unwrap();
@@ -3216,7 +3210,7 @@ fn blocked_publication_is_superseded_while_projection_rotates() {
     drive(
         &runtime,
         &mut engine,
-        control.progress(&scope(&crate::test_support::clock(), Duration::from_secs(5)).unwrap()),
+        control.progress(&scope(&racer_io::Clock::host(), Duration::from_secs(5)).unwrap()),
     )
     .unwrap();
     assert_eq!(
@@ -3231,16 +3225,14 @@ fn blocked_publication_is_superseded_while_projection_rotates() {
     drive(
         &runtime,
         &mut engine,
-        control.keyring_progress(
-            &scope(&crate::test_support::clock(), Duration::from_secs(5)).unwrap(),
-        ),
+        control.keyring_progress(&scope(&racer_io::Clock::host(), Duration::from_secs(5)).unwrap()),
     )
     .unwrap();
     *fixture.publication.lock().unwrap() = Some(publication(&config, 3, vec![]));
     drive(
         &runtime,
         &mut engine,
-        control.progress(&scope(&crate::test_support::clock(), Duration::from_secs(5)).unwrap()),
+        control.progress(&scope(&racer_io::Clock::host(), Duration::from_secs(5)).unwrap()),
     )
     .unwrap();
     assert!(
@@ -3280,7 +3272,8 @@ fn blocked_publication_is_superseded_while_projection_rotates() {
 fn network_keyring_bootstrap_rotation_recovery_and_failure_retention() {
     let mut fixture = ControlFixture::new();
     let mut config = fixture.config.take().unwrap();
-    let node = Arc::new(NodeState::new(vec![WorkerId(0)], 64, crate::test_support::ctx()).unwrap());
+    let node =
+        Arc::new(NodeState::new(vec![WorkerId(0)], 64, racer_io::WorkerCtx::host()).unwrap());
     {
         let mut bundle = fixture.bundle.lock().unwrap();
         *bundle =
@@ -3291,7 +3284,7 @@ fn network_keyring_bootstrap_rotation_recovery_and_failure_retention() {
         &config,
         &node,
         &config.limits,
-        &scope(&crate::test_support::clock(), Duration::from_secs(15)).unwrap(),
+        &scope(&racer_io::Clock::host(), Duration::from_secs(15)).unwrap(),
     )
     .unwrap()
     .0;
@@ -3304,7 +3297,7 @@ fn network_keyring_bootstrap_rotation_recovery_and_failure_retention() {
     drive(
         &runtime,
         &mut engine,
-        worker.start(&scope(&crate::test_support::clock(), Duration::from_secs(15)).unwrap()),
+        worker.start(&scope(&racer_io::Clock::host(), Duration::from_secs(15)).unwrap()),
     )
     .unwrap();
     worker.keyring_task.take();
@@ -3320,9 +3313,9 @@ fn network_keyring_bootstrap_rotation_recovery_and_failure_retention() {
         .seal_page(&cache, &[1; 24], b"retained", b"abc", &mut old_sealed)
         .unwrap();
     fixture.hold_long_poll.store(true, Ordering::Release);
-    let poll_scope = scope(&crate::test_support::clock(), Duration::from_secs(30)).unwrap();
+    let poll_scope = scope(&racer_io::Clock::host(), Duration::from_secs(30)).unwrap();
     let mut topology = control.progress(&poll_scope);
-    let key_scope = scope(&crate::test_support::clock(), Duration::from_secs(15)).unwrap();
+    let key_scope = scope(&racer_io::Clock::host(), Duration::from_secs(15)).unwrap();
     {
         let mut bundle = fixture.bundle.lock().unwrap();
         *bundle =
@@ -3386,7 +3379,7 @@ fn network_keyring_bootstrap_rotation_recovery_and_failure_retention() {
             &runtime,
             &mut engine,
             control.keyring_progress(
-                &scope(&crate::test_support::clock(), Duration::from_secs(40)).unwrap(),
+                &scope(&racer_io::Clock::host(), Duration::from_secs(40)).unwrap(),
             ),
         )
         .unwrap();
@@ -3400,7 +3393,7 @@ fn network_keyring_bootstrap_rotation_recovery_and_failure_retention() {
             &runtime,
             &mut engine,
             control.keyring_progress(
-                &scope(&crate::test_support::clock(), Duration::from_secs(10)).unwrap(),
+                &scope(&racer_io::Clock::host(), Duration::from_secs(10)).unwrap(),
             ),
         )
         .unwrap();
@@ -3415,7 +3408,7 @@ fn network_keyring_bootstrap_rotation_recovery_and_failure_retention() {
             crate::test_support::security::rotation_bundle(3, bundle.peer_trust_roots.clone());
         bundle.cluster = config.cluster.clone();
     }
-    let recovery_scope = scope(&crate::test_support::clock(), Duration::from_secs(40)).unwrap();
+    let recovery_scope = scope(&racer_io::Clock::host(), Duration::from_secs(40)).unwrap();
     let mut recovery = control.keyring_progress(&recovery_scope);
     drive(
         &runtime,
@@ -3450,9 +3443,8 @@ fn network_keyring_bootstrap_rotation_recovery_and_failure_retention() {
     drive(
         &runtime,
         &mut engine,
-        control.keyring_progress(
-            &scope(&crate::test_support::clock(), Duration::from_secs(10)).unwrap(),
-        ),
+        control
+            .keyring_progress(&scope(&racer_io::Clock::host(), Duration::from_secs(10)).unwrap()),
     )
     .unwrap();
     assert_eq!(control.projection_error(), None);
@@ -3468,9 +3460,8 @@ fn network_keyring_bootstrap_rotation_recovery_and_failure_retention() {
     drive(
         &runtime,
         &mut engine,
-        control.keyring_progress(
-            &scope(&crate::test_support::clock(), Duration::from_secs(10)).unwrap(),
-        ),
+        control
+            .keyring_progress(&scope(&racer_io::Clock::host(), Duration::from_secs(10)).unwrap()),
     )
     .unwrap();
     assert_eq!(control.projection_error(), Some(Error::Unauthorized));
@@ -3486,14 +3477,15 @@ fn network_keyring_bootstrap_rotation_recovery_and_failure_retention() {
 fn real_control_bootstrap_recovery_publication_readiness_and_shutdown() {
     let mut fixture = ControlFixture::new();
     let mut config = fixture.config.take().unwrap();
-    let node = Arc::new(NodeState::new(vec![WorkerId(0)], 64, crate::test_support::ctx()).unwrap());
-    let startup = scope(&crate::test_support::clock(), Duration::from_secs(15)).unwrap();
+    let node =
+        Arc::new(NodeState::new(vec![WorkerId(0)], 64, racer_io::WorkerCtx::host()).unwrap());
+    let startup = scope(&racer_io::Clock::host(), Duration::from_secs(15)).unwrap();
     config.node = bootstrap(&config, &node, &config.limits, &startup)
         .unwrap()
         .0;
     assert_eq!(fixture.enrollments.load(Ordering::Acquire), 1);
     let (mut worker, runtime, mut engine) = local_worker(&config, &node, 0);
-    let startup = scope(&crate::test_support::clock(), Duration::from_secs(15)).unwrap();
+    let startup = scope(&racer_io::Clock::host(), Duration::from_secs(15)).unwrap();
     drive(&runtime, &mut engine, worker.start(&startup)).unwrap();
     assert!(node.observations.health.ready());
     assert!(fixture.polls.load(Ordering::Acquire) >= 1);
@@ -3570,7 +3562,7 @@ fn real_control_bootstrap_recovery_publication_readiness_and_shutdown() {
             24,
         )
         .unwrap();
-    let accepted_scope = scope(&crate::test_support::clock(), Duration::from_secs(10)).unwrap();
+    let accepted_scope = scope(&racer_io::Clock::host(), Duration::from_secs(10)).unwrap();
     let mut accepted = runtime.crypto.execute(
         crate::security::CryptoInput::Encrypt {
             page,
@@ -3701,7 +3693,7 @@ fn real_control_bootstrap_recovery_publication_readiness_and_shutdown() {
         )
         .unwrap();
     assert!(node.observations.health.ready());
-    let shutdown = scope(&crate::test_support::clock(), Duration::from_secs(5)).unwrap();
+    let shutdown = scope(&racer_io::Clock::host(), Duration::from_secs(5)).unwrap();
     drive(&runtime, &mut engine, worker.drain(&shutdown)).unwrap();
     assert!(!node.observations.health.ready());
     drive(&runtime, &mut engine, runtime.reactor.drain()).unwrap();
@@ -3717,11 +3709,11 @@ fn profiling_enabled_without_capture_stops_and_drains_without_timer() {
     let (mut config, node) = fixture.bootstrap_node(1, Duration::from_secs(15));
     config.pprof_enabled = true;
     let (mut worker, runtime, mut engine) = local_worker(&config, &node, 0);
-    let startup = scope(&crate::test_support::clock(), Duration::from_secs(15)).unwrap();
+    let startup = scope(&racer_io::Clock::host(), Duration::from_secs(15)).unwrap();
     drive(&runtime, &mut engine, worker.start(&startup)).unwrap();
     let controller = node.profiling.get().unwrap();
     assert!(controller.poll_stopped());
-    let deadline = scope(&crate::test_support::clock(), Duration::from_secs(5)).unwrap();
+    let deadline = scope(&racer_io::Clock::host(), Duration::from_secs(5)).unwrap();
     // No helper means this fence completes in one poll, without a kernel timer.
     let mut fence = Box::pin(worker.stop_profiling(&deadline));
     assert_eq!(
@@ -3767,7 +3759,7 @@ fn peer_tcp_nodelay_assembled_outbound_and_distributed_accept() {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let address = listener.local_addr().unwrap();
         drop(listener);
-        let scope = scope(&crate::test_support::clock(), Duration::from_secs(5)).unwrap();
+        let scope = scope(&racer_io::Clock::host(), Duration::from_secs(5)).unwrap();
         let mut serving = app.peers.listen(address, &scope);
         let mut cx = Context::from_waker(futures::task::noop_waker_ref());
         assert!(serving.as_mut().poll(&mut cx).is_pending());
@@ -3905,7 +3897,7 @@ fn worker_requesters_share_configured_admission_and_production_metrics() {
             vec![WorkerId(0), WorkerId(1)],
             16,
             config.peer_admission,
-            crate::test_support::ctx(),
+            racer_io::WorkerCtx::host(),
         )
         .unwrap(),
     );
@@ -3965,25 +3957,22 @@ fn receive_gate_two_workers_share_capacity_and_wake_expiry_without_cqe() {
     use futures::Stream;
     use futures::stream::FuturesUnordered;
     let clock = uring_runtime::environment::SimulationClock::new(919);
-    let _env = clock.environment(0).enter();
+    let sim_env = clock.environment(0);
+    let _env = sim_env.enter();
+    let sim_ctx = sim_env.worker_ctx();
     let mut config = crate::test_support::cluster::config(false);
     config.peer_receive.active = 1;
     config.peer_receive.wait = Duration::from_millis(10);
-    let node = Arc::new(
-        NodeState::new(
-            vec![WorkerId(0), WorkerId(1)],
-            16,
-            crate::test_support::ctx(),
-        )
-        .unwrap(),
-    );
+    let node =
+        Arc::new(NodeState::new(vec![WorkerId(0), WorkerId(1)], 16, sim_ctx.clone()).unwrap());
     let (mut first, _, _) = local_worker(&config, &node, 0);
     let (second, _, _) = local_worker(&config, &node, 1);
     let gate = node.peer_receive.get().unwrap().clone();
     assert!(Arc::ptr_eq(&gate, second.node.peer_receive.get().unwrap()));
-    let scope = crate::runtime::RequestScope::new(
+    let scope = crate::runtime::RequestScope::on(
+        &sim_ctx.clock,
         crate::model::RequestId([19; 16]),
-        uring_runtime::environment::now() + Duration::from_secs(1),
+        sim_ctx.clock.now() + Duration::from_secs(1),
     )
     .unwrap();
     let permit = futures::executor::block_on(gate.acquire(&first.runtime.admission, &scope))
@@ -4059,7 +4048,7 @@ fn distributed_peer_listener_recovers_from_queue_pressure() {
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let address = listener.local_addr().unwrap();
     drop(listener);
-    let scope = scope(&crate::test_support::clock(), Duration::from_secs(5)).unwrap();
+    let scope = scope(&racer_io::Clock::host(), Duration::from_secs(5)).unwrap();
     let mut serving = app.peers.listen(address, &scope);
     let mut cx = Context::from_waker(futures::task::noop_waker_ref());
     let (reader, _writer) = std::os::unix::net::UnixStream::pair().unwrap();
@@ -4115,7 +4104,7 @@ fn assembly_uses_node_metrics_for_sparse_worker_ids() {
         NodeState::new(
             vec![WorkerId(9), WorkerId(2)],
             16,
-            crate::test_support::ctx(),
+            racer_io::WorkerCtx::host(),
         )
         .unwrap(),
     );
@@ -4178,9 +4167,9 @@ fn assembled_peer_io_carries_maximum_client_context_over_eight_signed_links() {
     let crypto = CredentialCrypto::new(
         Rc::new(crate::test_support::security::keys()),
         admission.clone(),
-        crate::test_support::ctx().rng,
+        racer_io::WorkerCtx::host().rng,
     );
-    let scope = scope(&crate::test_support::clock(), Duration::from_secs(30)).unwrap();
+    let scope = scope(&racer_io::Clock::host(), Duration::from_secs(30)).unwrap();
     let cache = CacheId(crate::test_support::security::CACHE.into());
     let metadata = vec![b'm'; 8192];
     let authorization = vec![b'a'; 8192];
@@ -4447,7 +4436,7 @@ fn assembled_peer_io_rejects_oversize_and_admission_pressure_before_submission()
     let reactor = &runtime.reactor;
     reactor.init().unwrap();
     let baseline = admission.used(ResourceClass::RequestContext);
-    let scope = scope(&crate::test_support::clock(), Duration::from_secs(30)).unwrap();
+    let scope = scope(&racer_io::Clock::host(), Duration::from_secs(30)).unwrap();
     let head = || MessageHead {
         start: StartLine::Request {
             method: "POST".into(),
@@ -4583,7 +4572,7 @@ mod cache_publication {
         let store = PublicationTarget::new(
             config.cluster.clone(),
             node.publications.clone(),
-            crate::test_support::clock(),
+            racer_io::Clock::host(),
         );
         store
             .apply(crate::app::tests::publication(
@@ -4732,7 +4721,7 @@ mod lifecycle {
     fn membership_attestation_requires_fresh_matching_workers() {
         use racer_control_wire::PublicationSequence;
         let observations = Observations::default();
-        let now = uring_runtime::environment::now();
+        let now = racer_io::Clock::host().now();
         let resources = Resources {
             workers_usable: true,
             observed_until: Some(now + Duration::from_secs(2)),
@@ -4750,7 +4739,7 @@ mod lifecycle {
                 resources,
                 2,
                 Some(PublicationSequence(9)),
-                crate::test_support::clock().now(),
+                racer_io::Clock::host().now(),
             )
             .unwrap();
         observations
@@ -4759,11 +4748,11 @@ mod lifecycle {
                 resources,
                 2,
                 Some(PublicationSequence(8)),
-                crate::test_support::clock().now(),
+                racer_io::Clock::host().now(),
             )
             .unwrap();
         observations
-            .membership_workers(&mut diagnostic, 2, crate::test_support::clock().now())
+            .membership_workers(&mut diagnostic, 2, racer_io::Clock::host().now())
             .unwrap();
         assert_eq!(diagnostic.matching_workers, 1);
         assert!(!diagnostic.fully_applied());
@@ -4773,11 +4762,11 @@ mod lifecycle {
                 resources,
                 2,
                 Some(PublicationSequence(9)),
-                crate::test_support::clock().now(),
+                racer_io::Clock::host().now(),
             )
             .unwrap();
         observations
-            .membership_workers(&mut diagnostic, 2, crate::test_support::clock().now())
+            .membership_workers(&mut diagnostic, 2, racer_io::Clock::host().now())
             .unwrap();
         assert!(diagnostic.fully_applied());
         diagnostic.pending_sequence = 10;
@@ -4793,18 +4782,18 @@ mod lifecycle {
                 },
                 2,
                 Some(PublicationSequence(9)),
-                crate::test_support::clock().now(),
+                racer_io::Clock::host().now(),
             )
             .unwrap();
         observations
-            .membership_workers(&mut diagnostic, 2, crate::test_support::clock().now())
+            .membership_workers(&mut diagnostic, 2, racer_io::Clock::host().now())
             .unwrap();
         assert!(!diagnostic.fully_applied());
     }
     #[test]
     fn readiness_requires_every_worker_and_expires_without_progress() {
         let observations = Observations::default();
-        let now = uring_runtime::environment::now();
+        let now = racer_io::Clock::host().now();
         let resources = Resources {
             workers_usable: true,
             storage_usable: true,
@@ -4844,7 +4833,7 @@ mod lifecycle {
     #[test]
     fn concurrent_observations_never_fail_readiness_transition() {
         let observations = Arc::new(Observations::default());
-        let now = uring_runtime::environment::now();
+        let now = racer_io::Clock::host().now();
         let usable = Resources {
             workers_usable: true,
             storage_usable: true,
@@ -4893,7 +4882,7 @@ mod lifecycle {
     #[test]
     fn observation_expiring_during_readiness_transition_is_not_an_error() {
         let observations = Observations::default();
-        let now = uring_runtime::environment::now();
+        let now = racer_io::Clock::host().now();
         let usable = Resources {
             workers_usable: true,
             storage_usable: true,
@@ -4908,7 +4897,7 @@ mod lifecycle {
             // Sweep a stale peer's expiry across the few microseconds the next
             // observation spends between its usability check and transition.
             let until =
-                uring_runtime::environment::now() + Duration::from_nanos(u64::from(turn % 4_000));
+                racer_io::Clock::host().now() + Duration::from_nanos(u64::from(turn % 4_000));
             observations
                 .record(
                     WorkerId(1),
@@ -4924,7 +4913,7 @@ mod lifecycle {
                 .unwrap_or_else(|error| panic!("turn {turn}: {error:?}"));
         }
         let expired = Resources {
-            observed_until: Some(uring_runtime::environment::now()),
+            observed_until: Some(racer_io::Clock::host().now()),
             ..usable
         };
         observations.record(WorkerId(1), expired, 2).unwrap();
@@ -4979,7 +4968,7 @@ mod lifecycle {
     #[test]
     fn observation_after_drain_is_not_an_error() {
         let observations = Observations::default();
-        let now = uring_runtime::environment::now();
+        let now = racer_io::Clock::host().now();
         let resources = Resources {
             workers_usable: true,
             storage_usable: true,
@@ -5020,7 +5009,7 @@ fn shared_pressure_constrains_pools_and_releases_retained_buffers() {
     let (recycler, staging) = worker.pool_stats();
     assert!(recycler.bytes >= 1 << 20);
     assert!(!recycler.constrained && !staging.constrained);
-    let now = uring_runtime::environment::now();
+    let now = racer_io::Clock::host().now();
     // Normal is the initial level: polling changes nothing.
     worker.poll_pressure(now);
     assert!(worker.pool_stats().0.bytes >= 1 << 20);
@@ -5066,11 +5055,11 @@ fn disabled_pressure_ignores_shared_level_but_still_reports_resident_memory() {
         false,
         &worker.node.pressure,
         true,
-        crate::test_support::clock().now(),
+        racer_io::Clock::host().now(),
     );
     assert!(worker.pressure.monitor.is_none());
     worker.node.pressure.store(PressureLevel::Critical);
-    let now = uring_runtime::environment::now();
+    let now = racer_io::Clock::host().now();
     worker.poll_pressure(now);
     assert_eq!(worker.pressure.responder.level(), PressureLevel::Normal);
     assert!(!worker.pool_stats().0.constrained);
@@ -5091,9 +5080,9 @@ fn disabled_pressure_ignores_shared_level_but_still_reports_resident_memory() {
 #[test]
 fn sampling_worker_owns_the_monitor_and_others_do_not() {
     let shared = crate::pressure::SharedPressure::default();
-    let sampler = WorkerPressure::new(true, &shared, true, crate::test_support::clock().now());
+    let sampler = WorkerPressure::new(true, &shared, true, racer_io::Clock::host().now());
     assert!(sampler.monitor.is_some() && sampler.shared.is_some() && sampler.samples_memory);
-    let other = WorkerPressure::new(true, &shared, false, crate::test_support::clock().now());
+    let other = WorkerPressure::new(true, &shared, false, racer_io::Clock::host().now());
     assert!(other.monitor.is_none() && other.shared.is_some() && !other.samples_memory);
 }
 
@@ -5139,7 +5128,7 @@ fn maintain_pools_expires_idle_cache_entries_then_their_aligned_storage() {
     let node = Arc::new(NodeState::default());
     let (mut worker, _, _) = local_worker(&config, &node, 1);
     let original = definition();
-    let current_scope = scope(&crate::test_support::clock(), Duration::from_secs(1)).unwrap();
+    let current_scope = scope(&racer_io::Clock::host(), Duration::from_secs(1)).unwrap();
     worker
         .snapshots
         .apply(publication(&config, 1, vec![original.clone()]))
@@ -5216,7 +5205,7 @@ fn snapshot_refresh_applies_priority_live_and_reweighs_memory() {
     let node = Arc::new(NodeState::default());
     let (mut worker, _, _) = local_worker(&config, &node, 1);
     let mut cache = definition();
-    let current_scope = scope(&crate::test_support::clock(), Duration::from_secs(1)).unwrap();
+    let current_scope = scope(&racer_io::Clock::host(), Duration::from_secs(1)).unwrap();
     let admission = worker.runtime.admission.clone();
     let class = crate::admission::ResourceClass::Plaintext;
     let _charge = admission.reserve(Some(&cache.id), class, 1).unwrap();

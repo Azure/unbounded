@@ -2891,7 +2891,7 @@ impl Observations {
             resources,
             count,
             None,
-            crate::test_support::clock().now(),
+            racer_io::Clock::host().now(),
         )
     }
 
@@ -3441,7 +3441,7 @@ mod lifecycle_policy_tests {
             || {
                 attempts.set(attempts.get() + 1);
                 // Each attempt runs under its own deadline that expires first.
-                let attempt = scope(&crate::test_support::clock(), Duration::from_millis(1))?;
+                let attempt = scope(&racer_io::Clock::host(), Duration::from_millis(1))?;
                 std::thread::sleep(Duration::from_millis(2));
                 if attempts.get() < 4 {
                     attempt.check()?;
@@ -3474,15 +3474,15 @@ mod lifecycle_policy_tests {
 
     #[test]
     fn control_turns_are_bounded_and_never_outlive_startup() {
-        let long = scope(&crate::test_support::clock(), MANAGED_STARTUP).unwrap();
+        let long = scope(&racer_io::Clock::host(), MANAGED_STARTUP).unwrap();
         let turn = control_turn(&long, CONTROL_TURN).unwrap();
-        let now = uring_runtime::environment::now();
+        let now = racer_io::Clock::host().now();
         assert!(turn.deadline.0 <= now + CONTROL_TURN);
         assert!(turn.deadline.0 > now + racer_control_wire::POLL_WAIT);
         // Expiry of a turn must not cancel startup.
         let _ = turn.cancel();
         assert_eq!(long.check(), Ok(()));
-        let short = scope(&crate::test_support::clock(), Duration::from_millis(5)).unwrap();
+        let short = scope(&racer_io::Clock::host(), Duration::from_millis(5)).unwrap();
         let turn = control_turn(&short, CONTROL_TURN).unwrap();
         assert_eq!(turn.deadline.0, short.deadline.0);
         // Managed startup outlives the fixed lifecycle policy.

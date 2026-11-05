@@ -917,7 +917,7 @@ mod tests {
                     shard.worker,
                     4,
                     crate::test_support::availability(),
-                    crate::test_support::clock(),
+                    racer_io::Clock::host(),
                 ));
                 let segments = Rc::new(Segments::new(shard.geometry.segment_bytes));
                 segments
@@ -1130,7 +1130,7 @@ mod tests {
         use crate::store::catalog::IndexedPage;
         use crate::store::catalog::RecordLocation;
         use crate::store::checkpoint;
-        let node = NodeState::new(vec![WorkerId(0)], 16, crate::test_support::ctx()).unwrap();
+        let node = NodeState::new(vec![WorkerId(0)], 16, racer_io::WorkerCtx::host()).unwrap();
         let keys = crate::test_support::security::keys();
         let caches = caches();
         let cache = caches[0].id.clone();
@@ -1240,7 +1240,7 @@ mod tests {
             WorkerId(0),
             16,
             crate::test_support::availability(),
-            crate::test_support::clock(),
+            racer_io::Clock::host(),
         ));
         let segments = Rc::new(Segments::new(g.segment_bytes));
         segments
@@ -1269,7 +1269,7 @@ mod tests {
         use crate::store::catalog::IndexedPage;
         use crate::store::catalog::RecordLocation;
         use crate::store::checkpoint;
-        let node = NodeState::new(vec![WorkerId(0)], 16, crate::test_support::ctx()).unwrap();
+        let node = NodeState::new(vec![WorkerId(0)], 16, racer_io::WorkerCtx::host()).unwrap();
         let keys = crate::test_support::security::keys();
         let caches = caches();
         let g = geometry();
@@ -1407,7 +1407,7 @@ mod tests {
             let mut config = fixture.config.take().unwrap();
             config.checkpoint_bytes = std::num::NonZeroUsize::new(budget).unwrap();
             let node = Arc::new(
-                NodeState::new(vec![WorkerId(0)], 16, crate::test_support::ctx()).unwrap(),
+                NodeState::new(vec![WorkerId(0)], 16, racer_io::WorkerCtx::host()).unwrap(),
             );
             let (app, _runtime, _crypto) = local_worker(&config, &node, 0);
             app.snapshots
@@ -1427,7 +1427,7 @@ mod tests {
             std::fs::write(config.slab_directory.join("checkpoint.0"), bytes).unwrap();
             futures::executor::block_on(app.recover_node(
                 geometry,
-                &scope(&crate::test_support::clock(), Duration::from_secs(5)).unwrap(),
+                &scope(&racer_io::Clock::host(), Duration::from_secs(5)).unwrap(),
             ))
             .unwrap();
             let cut = node.recovery.lock().unwrap();
@@ -1451,7 +1451,7 @@ mod tests {
 
     #[test]
     fn distinct_live_catalog_and_page_capacities_select_an_installable_cut() {
-        let node = NodeState::new(vec![WorkerId(0)], 16, crate::test_support::ctx()).unwrap();
+        let node = NodeState::new(vec![WorkerId(0)], 16, racer_io::WorkerCtx::host()).unwrap();
         let keys = crate::test_support::security::keys();
         let geometry = [(WorkerId(0), geometry())].into_iter().collect();
         let candidate = |sequence, count| {
@@ -1490,7 +1490,7 @@ mod tests {
             WorkerId(0),
             1,
             crate::test_support::availability(),
-            crate::test_support::clock(),
+            racer_io::Clock::host(),
         );
         live.set_page_capacity(16).unwrap();
         live.restore(chosen.shards.into_iter().next().unwrap().index)
