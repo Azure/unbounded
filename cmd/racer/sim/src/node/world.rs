@@ -616,6 +616,7 @@ fn err_name(e: Error) -> &'static str {
         Error::VersionUnavailable => "error_version_unavailable",
         Error::Unavailable => "error_unavailable",
         Error::Overloaded => "error_overloaded",
+        Error::FlightFull => "error_flight_full",
         Error::DeadlineExceeded => "error_deadline_exceeded",
         Error::Cancelled => "error_cancelled",
         Error::Unauthorized => "error_unauthorized",
@@ -4220,7 +4221,7 @@ impl NodeWorld {
                         self.set_race(probe.fill, |r| r.stale = true);
                         Err(Error::Unavailable)
                     }
-                    Ok(Outcome::Shed) => {
+                    Ok(Outcome::Shed | Outcome::Fetching) => {
                         if primary {
                             self.set_race(probe.fill, |r| {
                                 r.primary_outcome = Some(ProbeOutcome::Overloaded)

@@ -2445,6 +2445,7 @@ fn actual_uds_read_failures_and_immutable_result_validation() {
         (Error::OriginRejected, "", 401, None),
         (Error::OriginForbidden, "", 403, None),
         (Error::Overloaded, "", 503, None),
+        (Error::FlightFull, "", 503, None),
     ] {
         let kind = if fields.is_empty() {
             ReadKind::Head
@@ -2463,7 +2464,7 @@ fn actual_uds_read_failures_and_immutable_result_validation() {
         }
         assert!(text.ends_with("\r\n\r\n"));
     }
-    fixture.assert_metrics(7, 7, 0);
+    fixture.assert_metrics(8, 8, 0);
     assert_eq!(
         fixture
             .listeners

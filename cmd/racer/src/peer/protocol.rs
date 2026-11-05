@@ -715,6 +715,7 @@ pub fn response_head(
         PeerResponse::VersionUnavailable => ("version-unavailable", 0),
         PeerResponse::Unavailable => ("unavailable", 0),
         PeerResponse::Overloaded => ("overloaded", 0),
+        PeerResponse::FlightFull => ("flight-full", 0),
         PeerResponse::OriginRejected => ("origin-rejected", 0),
         PeerResponse::OriginForbidden => ("origin-forbidden", 0),
         PeerResponse::StaleMembership => ("stale-membership", 0),
@@ -1120,6 +1121,7 @@ fn bodyless_response(head: &MessageHead, outcome: &str) -> Result<PeerResponse> 
         "version-unavailable" => PeerResponse::VersionUnavailable,
         "unavailable" => PeerResponse::Unavailable,
         "overloaded" => PeerResponse::Overloaded,
+        "flight-full" => PeerResponse::FlightFull,
         "origin-rejected" => PeerResponse::OriginRejected,
         "origin-forbidden" => PeerResponse::OriginForbidden,
         "stale-membership" => PeerResponse::StaleMembership,
@@ -1637,6 +1639,7 @@ pub(crate) mod tests {
             (PeerResponse::OriginRejected, 401, "origin-rejected"),
             (PeerResponse::OriginForbidden, 403, "origin-forbidden"),
             (PeerResponse::Overloaded, 200, "overloaded"),
+            (PeerResponse::FlightFull, 200, "flight-full"),
         ] {
             let head = response_head(&response, &[0; 32], &[]).unwrap();
             assert!(

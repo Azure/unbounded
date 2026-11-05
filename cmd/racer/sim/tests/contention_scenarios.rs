@@ -283,7 +283,9 @@ fn cold_start(nodes: u32) {
     );
     assert_eq!(
         failed,
-        counter(&report, "error_overloaded") + counter(&report, "error_unavailable"),
+        counter(&report, "error_overloaded")
+            + counter(&report, "error_flight_full")
+            + counter(&report, "error_unavailable"),
         "only admission or exhausted retries may fail reads: {report}"
     );
     assert!(failed * 100 <= total, "{report}");

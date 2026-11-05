@@ -577,7 +577,7 @@ impl ReadWindow {
                         sealed: kind == Fetched::Sealed,
                     },
                     // Sealed fills share the plaintext retry policy.
-                    Err(Error::Overloaded | Error::Unavailable)
+                    Err(Error::Overloaded | Error::FlightFull | Error::Unavailable)
                         if scope_live && self.retry_page(number) =>
                     {
                         Slot::Missing { select: false }

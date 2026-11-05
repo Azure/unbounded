@@ -1548,9 +1548,10 @@ mod flight {
             let (mut a_budget, mut b_budget, mut extra_budget) = (budget(), budget(), budget());
             let mut a = join(&flights, &context, &scope, &mut a_budget);
             let mut b = join(&flights, &context, &scope, &mut b_budget);
+            // A full flight proves the fetch; a full table below does not.
             assert!(matches!(
                 flights.join_copy(&fence().page, &scope),
-                Err(Error::Overloaded)
+                Err(Error::FlightFull)
             ));
             let mut another_page = fence().page;
             another_page.number = PageNumber(1);

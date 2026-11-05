@@ -5674,3 +5674,79 @@ fn passthrough_peers_coalesces_reads_from_distinct_nodes_on_the_owner() {
     }
     drop(endpoints);
 }
+
+/// A full flight is proof the owner is fetching: a peer asking that owner hears `FlightFull`,
+/// not `Overloaded`, so the walk leaves origin to it instead of asking a second time.
+#[test]
+fn a_peer_joining_a_waiter_capped_flight_hears_flight_full() {
+    use crate::peer::server::LocalPageService;
+    let _owner = Rc::new(uring_runtime::drivers::DriverQueue::new(1024)).enter();
+    let mut limits = crate::test_support::cluster::config(false).limits;
+    limits.waiters_per_flight = std::num::NonZeroUsize::new(1).unwrap();
+    let mut target = fixture_with(3, Some(limits));
+    let (peers, _) = install_peers(&mut target, Some(0));
+    let (receiver, _endpoint, _) = target.read_graph(
+        Rc::new(target.fill.clone()),
+        &target.membership,
+        ReadGraphSettings {
+            name: "flight-full",
+            snapshots: 4,
+            metadata: 16,
+            window: 1,
+            stall: Duration::from_secs(10),
+            seed: None,
+        },
+    );
+    // The one waiter the flight admits.
+    let mut budget = AcquisitionBudget::new(target.scope.deadline.0, 4, 8);
+    let held = target
+        .fill
+        .dependencies
+        .flights
+        .join(
+            target.page.clone(),
+            target.membership.clone(),
+            &target.context,
+            &target.scope,
+            &mut budget,
+        )
+        .unwrap();
+    let requester = (peers.local + 1) % 4;
+    let attempt = crate::model::AttemptId([73; 16]);
+    let request = PeerRequest {
+        operation: PeerOperation::Page {
+            page: target.page.clone(),
+            mode: FetchMode::Acquire,
+        },
+        route: crate::topology::RouteBudget {
+            membership: target.membership.version,
+            request: target.scope.request,
+            attempt,
+            destination: node(peers.local),
+            visited: vec![node(requester)],
+            remaining_links: 4,
+            remaining_attempts: 4,
+            deadline: target.scope.deadline,
+        },
+        origin: target
+            .fill
+            .dependencies
+            .credentials
+            .seal(&target.context, attempt, &target.scope)
+            .unwrap(),
+    };
+    let (signed, _) = peers.signing[requester].sign_request(request).unwrap();
+    let verified = peers.signing[peers.local].verify_request(signed).unwrap();
+    let response = drive(
+        receiver.serve_peer(verified, target.membership.clone(), &target.scope),
+        &mut target.engine,
+        &target.crypto,
+    );
+    assert!(
+        matches!(response, Ok(PeerResponse::FlightFull)),
+        "{:?}",
+        response.map(|r| r.kind())
+    );
+    assert_eq!(target.origin.calls.get(), 0);
+    drop(held);
+}

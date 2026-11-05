@@ -484,7 +484,7 @@ impl Drop for RequestMetrics {
 fn request_error_reason(failure: Option<crate::error::Error>) -> Event {
     use crate::error::Error;
     match failure {
-        Some(Error::Overloaded) => Event::RequestErrorOverloaded,
+        Some(Error::Overloaded | Error::FlightFull) => Event::RequestErrorOverloaded,
         Some(Error::Unavailable) => Event::RequestErrorUnavailable,
         Some(Error::DeadlineExceeded) => Event::RequestErrorDeadline,
         Some(Error::Cancelled) => Event::RequestErrorCancelled,

@@ -371,6 +371,10 @@ pub enum Outcome {
     /// The destination itself (not a relay) answered `Overloaded`. Like
     /// `Probe(Overloaded)` without a route failure; asks a reader's helper.
     Shed,
+    /// The destination itself answered `FlightFull`: like [`Outcome::Shed`], but it proved it is
+    /// fetching the page. An owner's probe of rank 0 then withholds origin authority, so ranks 1
+    /// and 2 leave the fetch to rank 0 instead of asking origin a second time.
+    Fetching,
     /// Unanswered within the attempt's time bound. Like `Transport(Unreachable)`, except that an
     /// owner's probe of rank 0 withholds origin authority unless rank 0 is `Overdue`.
     TimedOut,
@@ -947,7 +951,7 @@ impl CandidateWalk {
             };
         }
         self.index += 1;
-        if self.helper == Helper::Armed && outcome == Outcome::Shed {
+        if self.helper == Helper::Armed && matches!(outcome, Outcome::Shed | Outcome::Fetching) {
             self.helper = Helper::Due;
         }
         match outcome {
@@ -959,7 +963,10 @@ impl CandidateWalk {
             }
             // A previous owner that lags or leads this membership is only a
             // missing copy: never refresh the owner's walk for it.
-            Outcome::StaleMembership | Outcome::StaleDestination | Outcome::Shed
+            Outcome::StaleMembership
+            | Outcome::StaleDestination
+            | Outcome::Shed
+            | Outcome::Fetching
                 if pending.handoff =>
             {
                 Ok(None)
@@ -996,7 +1003,10 @@ impl CandidateWalk {
                 Ok(None)
             }
             // The route worked; the destination is busy.
-            Outcome::Shed => {
+            Outcome::Shed | Outcome::Fetching => {
+                // Rank 0 proved its fetch is running: leave it to rank 0, whatever its watch
+                // says (`Overdue` is about silence, which this answer disproves).
+                self.rank0_unanswered |= outcome == Outcome::Fetching && pending.rank0;
                 self.saw_busy = true;
                 self.saw_transient = true;
                 self.evidence.push(ProbeOutcome::Overloaded);
@@ -1100,7 +1110,7 @@ impl RemainingWalk {
         match outcome {
             Outcome::Copy => return Some(RemainingEnd::Copy),
             Outcome::Probe(outcome) => self.transient |= transient(outcome),
-            Outcome::Shed | Outcome::Failed => self.transient = true,
+            Outcome::Shed | Outcome::Fetching | Outcome::Failed => self.transient = true,
             Outcome::Transport(_) | Outcome::TimedOut => {
                 self.transient = true;
                 budget.note_route_failure();
@@ -1287,6 +1297,7 @@ pub fn hedge_fallback(error: Error) -> bool {
             | Error::Io
             | Error::Os(_)
             | Error::Overloaded
+            | Error::FlightFull
             | Error::CorruptRecord
             | Error::MissingKey
             | Error::InvalidRequest
@@ -2134,7 +2145,8 @@ impl Fill {
                 if signed {
                     // The destination answered this node: it is not hung. One that shed the request
                     // is busy.
-                    self.out.silence = Some(if kind == ResponseKind::Overloaded && page {
+                    let busy = matches!(kind, ResponseKind::Overloaded | ResponseKind::FlightFull);
+                    self.out.silence = Some(if busy && page {
                         SilenceNote::Shed
                     } else {
                         SilenceNote::Answered
@@ -2144,6 +2156,8 @@ impl Fill {
                     // The destination itself, not a relay, shed the request (for example a hot-page
                     // owner): the walk may ask the page's helper.
                     ResponseKind::Overloaded if signed => Outcome::Shed,
+                    // The destination is fetching the page and its flight is full.
+                    ResponseKind::FlightFull if signed => Outcome::Fetching,
                     ResponseKind::StaleMembership if remaining => {
                         self.out.outcome = Some(Err(Error::IncompatibleMembership));
                         return Err(Error::IncompatibleMembership);
@@ -2265,6 +2279,8 @@ impl Fill {
                 Outcome::Probe(ProbeOutcome::Overloaded)
                 | Outcome::Transport(ProbeOutcome::Overloaded) => Some(Rank0Note::TimedOut),
                 Outcome::Failed => Some(Rank0Note::Failed),
+                // Rank 0 answered and is fetching: alive.
+                Outcome::Fetching => Some(Rank0Note::Answered),
                 Outcome::Copy
                 | Outcome::Probe(
                     ProbeOutcome::CopyMiss

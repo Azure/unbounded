@@ -536,6 +536,7 @@ impl Coordinator {
         Ok(match response.response() {
             PeerResponse::Prefetch(results) => PeerResponse::Prefetch(results.clone()),
             PeerResponse::Overloaded => PeerResponse::Overloaded,
+            PeerResponse::FlightFull => PeerResponse::FlightFull,
             PeerResponse::Unavailable => PeerResponse::Unavailable,
             PeerResponse::Miss => PeerResponse::Miss,
             PeerResponse::StaleMembership => PeerResponse::StaleMembership,
@@ -881,6 +882,7 @@ fn peer_error(error: Error) -> Result<PeerResponse> {
         Some(ResponseKind::NotFound) => PeerResponse::NotFound,
         Some(ResponseKind::VersionUnavailable) => PeerResponse::VersionUnavailable,
         Some(ResponseKind::Overloaded) => PeerResponse::Overloaded,
+        Some(ResponseKind::FlightFull) => PeerResponse::FlightFull,
         Some(ResponseKind::OriginRejected) => PeerResponse::OriginRejected,
         Some(ResponseKind::OriginForbidden) => PeerResponse::OriginForbidden,
         Some(ResponseKind::Unavailable) => PeerResponse::Unavailable,

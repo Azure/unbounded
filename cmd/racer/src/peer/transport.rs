@@ -193,7 +193,7 @@ fn extension(name: &str, value: Vec<u8>) -> Header {
 fn recoverable(error: Error) -> bool {
     matches!(
         error,
-        Error::Unavailable | Error::Io | Error::Os(_) | Error::Overloaded
+        Error::Unavailable | Error::Io | Error::Os(_) | Error::Overloaded | Error::FlightFull
     )
 }
 fn native_scope(scope: &RequestScope) -> RequestScope {

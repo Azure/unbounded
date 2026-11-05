@@ -2892,7 +2892,8 @@ fn relay_transfers() -> usize {
 }
 
 /// Production per-worker flight bounds (`racer_core::admission::Limits::default`, racer-sim
-/// `NodeConfig`): 64 flights of 64 waiters each. A join past them is answered `Overloaded`.
+/// `NodeConfig`): 64 flights of 64 waiters each. A join past the entry cap is answered
+/// `Overloaded`; past a flight's waiter cap, `FlightFull`.
 fn flight_limits() -> FlightLimits {
     let limits = racer_core::admission::Limits::default();
     FlightLimits {

@@ -141,6 +141,7 @@ const UNR: Outcome = Outcome::Probe(ProbeOutcome::Unreachable);
 const T_UNR: Outcome = Outcome::Transport(ProbeOutcome::Unreachable);
 const T_OVL: Outcome = Outcome::Transport(ProbeOutcome::Overloaded);
 const SHED: Outcome = Outcome::Shed;
+const FETCHING: Outcome = Outcome::Fetching;
 const TIMEOUT: Outcome = Outcome::TimedOut;
 const FAILED: Outcome = Outcome::Failed;
 const STALE: Outcome = Outcome::StaleMembership;
@@ -307,6 +308,14 @@ fn walks() {
         ("rank 0 overloaded", owner(1), budget(8, 32), nothing, &[OVL], "0A2F:2/4/4 => Exhausted { funding: false } 8/32/8 r0"),
         ("rank 0 miss", owner(1), budget(8, 32), nothing, &[MISS], "0A2F:2/4/4 => Origin { rank: 1, evidence: [CopyMiss] } 8/32/4"),
         ("rank 0 shed", owner(1), budget(8, 32), nothing, &[SHED], "0A2F:2/4/4 => Origin { rank: 1, evidence: [Overloaded] } 8/32/4"),
+        // Rank 0's flight is full: proof it is fetching, so origin is left to it in every watch
+        // state; a later predecessor's copy still wins, and other owners' full flights are a shed.
+        ("rank 0 fetching", owner(1), budget(8, 32), nothing, &[FETCHING], "0A2F:2/4/4 => Exhausted { funding: false } 8/32/4 r0"),
+        ("rank 0 fetching, overdue", rank0(1, Rank0State::Overdue), budget(8, 32), nothing, &[FETCHING], "0A2F:2/4/4 => Exhausted { funding: false } 8/32/4 r0"),
+        ("rank 0 fetching, failed", rank0(1, Rank0State::Failed), budget(8, 32), nothing, &[FETCHING], "0A2F:2/4/4 => Exhausted { funding: false } 8/32/4 r0"),
+        ("rank 0 fetching, copy", owner(2), budget(8, 32), nothing, &[FETCHING, COPY], "0A3F:2/4/4 1C2S:8/32/4 => Copy 8/32/4 r0"),
+        ("rank 1 fetching", owner(2), budget(8, 32), nothing, &[MISS, FETCHING], "0A3F:2/4/4 1C2S:8/32/4 => Origin { rank: 2, evidence: [CopyMiss, Overloaded] } 8/32/4"),
+        ("reader, rank 0 fetching", reader(3), budget(8, 32), nothing, &[FETCHING], "0A3S:8/32/4 1A2S:8/32/4 2A1S:8/32/4 => Exhausted { funding: false } 8/32/4"),
         ("rank 1 silent", owner(2), budget(8, 32), nothing, &[MISS, TIMEOUT], "0A3F:2/4/4 1C2S:8/32/4 => Origin { rank: 2, evidence: [CopyMiss, Unreachable] } 8/32/8"),
         ("metadata silent", with(owner(1), &|c| c.page_operation = false), budget(8, 32), nothing, &[TIMEOUT], "0C2S:8/32/4 => Origin { rank: 1, evidence: [Unreachable] } 8/32/8"),
         ("handoff silent", with(owner(0), &|c| c.handoff = 1), budget(8, 32), nothing, &[TIMEOUT], "3C2Sh:8/32/4 => Origin { rank: 0, evidence: [] } 8/32/8"),

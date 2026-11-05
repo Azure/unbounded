@@ -75,6 +75,14 @@ pub const fn disposition(error: Error) -> Disposition {
             Some(K::Overloaded),
             F::Overloaded,
         ),
+        // Busy like `Overloaded`, but the destination proved it is fetching the page; the walk
+        // tells the two apart only on a signed peer response (`ResponseKind::FlightFull`).
+        Error::FlightFull => row(
+            SameCandidateLater,
+            Some(P::Overloaded),
+            Some(K::FlightFull),
+            F::Overloaded,
+        ),
         Error::Unauthorized
         | Error::InvalidRequest
         | Error::HeaderTooLarge
@@ -121,6 +129,7 @@ pub const fn response_error(kind: ResponseKind) -> Option<Error> {
         ResponseKind::NotFound => Error::NotFound,
         ResponseKind::VersionUnavailable => Error::VersionUnavailable,
         ResponseKind::Overloaded => Error::Overloaded,
+        ResponseKind::FlightFull => Error::FlightFull,
         ResponseKind::OriginRejected => Error::OriginRejected,
         ResponseKind::OriginForbidden => Error::OriginForbidden,
     })
@@ -130,7 +139,7 @@ pub const fn response_error(kind: ResponseKind) -> Option<Error> {
 mod tests {
     use super::*;
 
-    const ALL: [Error; 19] = [
+    const ALL: [Error; 20] = [
         Error::InvalidConfiguration,
         Error::InvalidRequest,
         Error::HeaderTooLarge,
@@ -139,6 +148,7 @@ mod tests {
         Error::VersionUnavailable,
         Error::Unavailable,
         Error::Overloaded,
+        Error::FlightFull,
         Error::DeadlineExceeded,
         Error::Cancelled,
         Error::Unauthorized,
@@ -165,6 +175,7 @@ mod tests {
                 | Error::VersionUnavailable
                 | Error::Unavailable
                 | Error::Overloaded
+                | Error::FlightFull
                 | Error::DeadlineExceeded
                 | Error::Cancelled
                 | Error::Unauthorized
@@ -205,6 +216,12 @@ mod tests {
                 SameCandidateLater,
                 Some(P::Overloaded),
                 Some(K::Overloaded),
+                F::Overloaded,
+            ),
+            Error::FlightFull => (
+                SameCandidateLater,
+                Some(P::Overloaded),
+                Some(K::FlightFull),
                 F::Overloaded,
             ),
             Error::DeadlineExceeded => (Never, None, Some(K::Unavailable), F::Unavailable),
@@ -275,6 +292,7 @@ mod tests {
             ResponseKind::VersionUnavailable,
             ResponseKind::Unavailable,
             ResponseKind::Overloaded,
+            ResponseKind::FlightFull,
             ResponseKind::OriginRejected,
             ResponseKind::OriginForbidden,
         ] {

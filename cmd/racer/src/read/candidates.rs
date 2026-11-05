@@ -713,6 +713,7 @@ impl CandidatePolicy {
             WalkOutcome::Transport(_) | WalkOutcome::TimedOut => true,
             WalkOutcome::Copy
             | WalkOutcome::Shed
+            | WalkOutcome::Fetching
             | WalkOutcome::Failed
             | WalkOutcome::Probe(ProbeOutcome::CopyMiss | ProbeOutcome::VersionUnavailable) => {
                 false
@@ -2222,6 +2223,7 @@ impl CandidatePolicy {
                         CandidateOutcome::ResponseError(Error::Unavailable)
                     }
                     PeerResponse::Overloaded => CandidateOutcome::ResponseError(Error::Overloaded),
+                    PeerResponse::FlightFull => CandidateOutcome::ResponseError(Error::FlightFull),
                     PeerResponse::VersionUnavailable => {
                         CandidateOutcome::ResponseError(Error::VersionUnavailable)
                     }
@@ -2252,6 +2254,7 @@ impl CandidatePolicy {
                 Ok(Delivered::Response(response)) => {
                     let error = match response.response() {
                         PeerResponse::Overloaded => Some(Error::Overloaded),
+                        PeerResponse::FlightFull => Some(Error::FlightFull),
                         PeerResponse::Unavailable => Some(Error::Unavailable),
                         PeerResponse::VersionUnavailable => Some(Error::VersionUnavailable),
                         PeerResponse::StaleMembership => Some(Error::IncompatibleMembership),

@@ -75,7 +75,7 @@ pub enum Settled<C, P> {
 pub enum JoinReject<E = Error> {
     /// The flight settled to this failure.
     Failed(E),
-    /// The flight holds `waiters_per_flight` waiters.
+    /// The flight holds `waiters_per_flight` waiters ([`Error::FlightFull`]: it is fetching).
     WaiterCap,
 }
 
@@ -83,7 +83,7 @@ impl<E: From<Error>> JoinReject<E> {
     pub fn error(self) -> E {
         match self {
             JoinReject::Failed(error) => error,
-            JoinReject::WaiterCap => Error::Overloaded.into(),
+            JoinReject::WaiterCap => Error::FlightFull.into(),
         }
     }
 }
@@ -135,7 +135,7 @@ pub enum CopyJoin<C, P> {
 }
 
 /// Gates of a copy-only join on an existing, refreshed flight: a settled result first, then a
-/// failed or draining phase (a miss), then the waiter cap (`Overloaded`). A copy join never
+/// failed or draining phase (a miss), then the waiter cap (`FlightFull`). A copy join never
 /// creates a flight.
 pub fn join_copy_existing<
     C: Clone,
@@ -158,7 +158,7 @@ pub fn join_copy_existing<
         return Ok(CopyJoin::Miss);
     }
     if state.waiters.len() >= limits.waiters_per_flight {
-        return Err(Error::Overloaded.into());
+        return Err(Error::FlightFull.into());
     }
     Ok(CopyJoin::Register)
 }

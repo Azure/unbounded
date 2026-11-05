@@ -525,6 +525,7 @@ impl MetadataService {
                 PeerResponse::VersionUnavailable => return Err(Error::VersionUnavailable.into()),
                 PeerResponse::NotFound => return Err(Error::NotFound.into()),
                 PeerResponse::Overloaded => return Err(Error::Overloaded.into()),
+                PeerResponse::FlightFull => return Err(Error::FlightFull.into()),
                 PeerResponse::Miss | PeerResponse::Unavailable => {
                     return Err(Error::Unavailable.into());
                 }

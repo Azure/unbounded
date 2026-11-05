@@ -308,7 +308,8 @@ fn gates_follow_production_order() {
     assert_eq!(f.join_at(6, 10, 10, 2, true), Err(Error::DeadlineExceeded));
     assert_eq!(f.join(6, 0, true), Err(Error::Unavailable));
     f.waiter(6);
-    assert_eq!(f.join(6, 2, true), Err(Error::Overloaded));
+    // A full flight proves its fetch; a full table proves nothing.
+    assert_eq!(f.join(6, 2, true), Err(Error::FlightFull));
     assert_eq!(f.join(7, 2, true), Err(Error::Overloaded));
     // One generation: the first election succeeds, a retry cannot elect another waiter and fails
     // the cohort.
@@ -337,7 +338,7 @@ fn budget_gates() {
     );
     assert_eq!(join_budget_gate(now, later, 0, true), Ok(()));
     let limits = FlightLimits::default();
-    assert_eq!(Error::from(JoinReject::WaiterCap), Error::Overloaded);
+    assert_eq!(Error::from(JoinReject::WaiterCap), Error::FlightFull);
     assert_eq!(Error::from(JoinReject::Failed(Error::Io)), Error::Io);
     assert_eq!(entry_cap_gate(1023, &limits), Ok(()));
     assert_eq!(entry_cap_gate(1024, &limits), Err(Error::Overloaded));
@@ -644,7 +645,7 @@ fn copy_joins() {
     let a = f.waiter(3);
     assert_eq!(f.poll(3, a, 0, 1), Ok(Wait::Lead));
     let c = waiter(f.copy(3));
-    assert_eq!(f.copy(3), Err(Error::Overloaded));
+    assert_eq!(f.copy(3), Err(Error::FlightFull));
     assert_eq!(f.poll(3, c, 0, 2), Ok(Wait::Pending));
     // The leader goes away; the copy waiter cannot adopt or lead.
     f.t.abandon(&page(3), a, &mut f.wakes);

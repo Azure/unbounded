@@ -429,7 +429,7 @@ impl Prefetch {
 /// Classify a whole-operation or whole-page error.
 pub(crate) fn classify(error: Error) -> UnitOutcome {
     match error {
-        Error::Overloaded => UnitOutcome::Retry(RetryKind::Overloaded, None),
+        Error::Overloaded | Error::FlightFull => UnitOutcome::Retry(RetryKind::Overloaded, None),
         Error::VersionUnavailable => UnitOutcome::Failed(RefError::VersionChanged),
         Error::NotFound => UnitOutcome::Failed(RefError::NotFound),
         Error::OriginRejected | Error::OriginForbidden | Error::Forbidden => {
@@ -469,7 +469,7 @@ fn fail_code(error: Error) -> FailCode {
         Error::VersionUnavailable => FailCode::VersionChanged,
         Error::NotFound => FailCode::NotFound,
         Error::OriginRejected | Error::OriginForbidden | Error::Forbidden => FailCode::Forbidden,
-        Error::Overloaded => FailCode::Overloaded,
+        Error::Overloaded | Error::FlightFull => FailCode::Overloaded,
         Error::CorruptRecord | Error::BadGateway | Error::Internal => FailCode::OriginError,
         _ => FailCode::Unavailable,
     }

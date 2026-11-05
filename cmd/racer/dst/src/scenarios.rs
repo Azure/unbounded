@@ -83,7 +83,7 @@ fn storm(at: Nanos, object: u64, nodes: u32, window: Nanos) -> Storm {
 
 /// Ported from racer-sim `cold_start_completes_with_bounded_origin_traffic` and
 /// `two_thousand_nodes_cold_start` (`sim/tests/contention_scenarios.rs`): every node cold-starts
-/// on one object within 10 ms. Every read ends; reads fail only with `Overloaded` or
+/// on one object within 10 ms. Every read ends; reads fail only with `Overloaded`, `FlightFull` or
 /// `Unavailable`, at most 1 in 100; each page reaches origin at most once per owner; pages are
 /// published. racer-sim's per-node memory bound has no Model counterpart (see MODEL.md).
 pub fn cold_start(nodes: u32) -> Scenario {
@@ -108,7 +108,7 @@ pub fn cold_start_with(nodes: u32, attempt_timeout: Nanos) -> Scenario {
         })
         .check("only-admission-or-unavailable-failures", move |r| {
             let failed = counter(r, "reads_failed");
-            let allowed = error(r, "Overloaded") + error(r, "Unavailable");
+            let allowed = error(r, "Overloaded") + error(r, "FlightFull") + error(r, "Unavailable");
             (error(r, "HopBudgetExhausted") == 0 && failed == allowed && failed * 100 <= total)
                 .then_some(())
                 .ok_or(format!("failures: {}", r["metrics"]["errors"]))
@@ -522,7 +522,8 @@ pub fn node_faults() -> Scenario {
         })
         .check("failures-are-transient", |r| {
             let failed = counter(r, "reads_failed");
-            let explained = error(r, "Unavailable") + error(r, "Overloaded");
+            let explained =
+                error(r, "Unavailable") + error(r, "Overloaded") + error(r, "FlightFull");
             (failed == explained && counter(r, "reads_completed") > failed)
                 .then_some(())
                 .ok_or(format!("failures: {}", r["metrics"]["errors"]))
@@ -583,7 +584,8 @@ pub fn membership_churn() -> Scenario {
         })
         .check("failures-are-transient", |r| {
             let failed = counter(r, "reads_failed");
-            let explained = error(r, "Unavailable") + error(r, "Overloaded");
+            let explained =
+                error(r, "Unavailable") + error(r, "Overloaded") + error(r, "FlightFull");
             (failed == explained && counter(r, "reads_completed") > failed)
                 .then_some(())
                 .ok_or(format!("failures: {}", r["metrics"]["errors"]))

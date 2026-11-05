@@ -1081,7 +1081,7 @@ fn error_head(error: Error) -> Result<MessageHead> {
         Error::VersionUnavailable => 412,
         Error::UnsatisfiableRangeWithLength(length) if length <= i64::MAX as u64 => 416,
         Error::BadGateway | Error::CorruptRecord => 502,
-        Error::Unavailable | Error::Overloaded | Error::DeadlineExceeded | Error::Cancelled | Error::StaleFlight | Error::IncompatibleMembership | Error::HopBudgetExhausted | Error::MissingKey
+        Error::Unavailable | Error::Overloaded | Error::FlightFull | Error::DeadlineExceeded | Error::Cancelled | Error::StaleFlight | Error::IncompatibleMembership | Error::HopBudgetExhausted | Error::MissingKey
         // Clock rollback or peer restart can reject an otherwise valid attempt's
         // freshness. It is unavailable to this client, not an internal failure.
         | Error::Replay | Error::Io | Error::Os(_) => 503,

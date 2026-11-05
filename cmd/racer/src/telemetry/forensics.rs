@@ -114,7 +114,7 @@ impl DecryptReason {
             Error::MissingKey => Self::MissingKey,
             Error::InvalidConfiguration => Self::InvalidConfiguration,
             Error::InvalidRequest => Self::InvalidRequest,
-            Error::Overloaded => Self::Overloaded,
+            Error::Overloaded | Error::FlightFull => Self::Overloaded,
             Error::CorruptRecord => match rejection {
                 Some(IntegrityRejection::Aead) => Self::CorruptAead,
                 None => Self::CorruptUnclassified,

@@ -37,6 +37,9 @@ pub enum Error {
     VersionUnavailable,
     Unavailable,
     Overloaded,
+    /// The page's flight is fetching and holds its waiter cap: busy, but proof the destination is
+    /// acquiring the page, unlike [`Error::Overloaded`].
+    FlightFull,
     DeadlineExceeded,
     Cancelled,
     Unauthorized,
@@ -159,6 +162,8 @@ pub enum PeerResponse<P, G> {
     VersionUnavailable,
     Unavailable,
     Overloaded,
+    /// The page's flight is fetching and holds its waiter cap.
+    FlightFull,
     OriginRejected,
     OriginForbidden,
     /// Authenticated peer no longer retains the requested routing epoch.
@@ -180,6 +185,7 @@ impl<P, G> PeerResponse<P, G> {
             Self::VersionUnavailable => ResponseKind::VersionUnavailable,
             Self::Unavailable => ResponseKind::Unavailable,
             Self::Overloaded => ResponseKind::Overloaded,
+            Self::FlightFull => ResponseKind::FlightFull,
             Self::OriginRejected => ResponseKind::OriginRejected,
             Self::OriginForbidden => ResponseKind::OriginForbidden,
             Self::StaleMembership => ResponseKind::StaleMembership,
@@ -473,6 +479,7 @@ pub fn recoverable(error: Error) -> bool {
             | Error::Io
             | Error::Os(_)
             | Error::Overloaded
+            | Error::FlightFull
             | Error::CorruptRecord
             | Error::MissingKey
             | Error::Cancelled
@@ -569,6 +576,7 @@ mod policy_tests {
             Error::Io,
             Error::Os(5),
             Error::Overloaded,
+            Error::FlightFull,
             Error::CorruptRecord,
             Error::MissingKey,
             Error::Cancelled,
@@ -983,7 +991,7 @@ pub fn acquisition_failure(error: Error) -> FailureKind {
 pub fn ciphertext_publish_tolerated(error: Error) -> bool {
     matches!(
         error,
-        Error::Overloaded | Error::MissingKey | Error::Unavailable
+        Error::Overloaded | Error::FlightFull | Error::MissingKey | Error::Unavailable
     )
 }
 
@@ -1228,6 +1236,8 @@ pub enum ResponseKind {
     VersionUnavailable,
     Unavailable,
     Overloaded,
+    /// The destination's flight for the page is fetching and full ([`Error::FlightFull`]).
+    FlightFull,
     OriginRejected,
     OriginForbidden,
     StaleMembership,
@@ -1284,7 +1294,7 @@ pub fn classify<E: From<Error>>(
         }
         ResponseKind::VersionUnavailable => ProbeOutcome::VersionUnavailable,
         ResponseKind::Unavailable => ProbeOutcome::Unreachable,
-        ResponseKind::Overloaded => ProbeOutcome::Overloaded,
+        ResponseKind::Overloaded | ResponseKind::FlightFull => ProbeOutcome::Overloaded,
         ResponseKind::OriginRejected => return Err(Error::OriginRejected.into()),
         ResponseKind::OriginForbidden => return Err(Error::OriginForbidden.into()),
         ResponseKind::StaleMembership => return Err(Error::IncompatibleMembership.into()),
@@ -1565,6 +1575,10 @@ mod candidates_tests {
         );
         assert_eq!(
             classify(R::Overloaded, O::Page, true, ok),
+            Ok(Some(ProbeOutcome::Overloaded))
+        );
+        assert_eq!(
+            classify(R::FlightFull, O::Page, true, ok),
             Ok(Some(ProbeOutcome::Overloaded))
         );
         assert_eq!(

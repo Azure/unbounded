@@ -973,7 +973,7 @@ impl Flights {
                 |waiting| waiting == &page,
             );
         }
-        if matches!(result, Err(Error::Overloaded)) {
+        if matches!(result, Err(Error::Overloaded | Error::FlightFull)) {
             self.admission.policy().observer().gate_rejection(
                 scope,
                 Some(page_number),
@@ -1384,7 +1384,7 @@ impl Flights {
                 scope,
             }))
         });
-        if matches!(result, Err(Error::Overloaded)) {
+        if matches!(result, Err(Error::Overloaded | Error::FlightFull)) {
             self.admission.policy().observer().gate_rejection(
                 scope,
                 Some(page.number.0),
