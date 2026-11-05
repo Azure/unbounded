@@ -44,6 +44,7 @@ use std::rc::Rc;
 pub mod catalog;
 pub mod checkpoint;
 pub mod holds;
+mod pages;
 
 pub struct Store {
     pub reader: Rc<StoreReader>,

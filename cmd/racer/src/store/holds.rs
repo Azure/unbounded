@@ -175,6 +175,9 @@ impl Hold {
     }
 }
 
+/// Default hold cap, as a percentage of page slots and segments.
+pub const DEFAULT_HOLD_PERCENT: usize = 50;
+
 pub(super) struct Holds {
     pub entries: HashMap<ObjectVersion, Hold>,
     pub segments: Option<Rc<Segments>>,
@@ -193,7 +196,7 @@ impl Holds {
             entries: HashMap::default(),
             segments: None,
             free_reserve: 1,
-            percent: 50,
+            percent: DEFAULT_HOLD_PERCENT,
             last_epoch: 0,
         }
     }

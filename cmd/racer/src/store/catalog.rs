@@ -62,18 +62,26 @@ pub struct Index {
     /// Worker time for freshness, retention scoring, and hold expiry.
     clock: racer_io::Clock,
 }
-/// Production mappings use randomized hashing, as did the original catalog.
-#[cfg(not(test))]
-type Pages = page_alloc::index::PageIndex<PageId, IndexedPage, std::hash::RandomState>;
-/// Simulation keeps its deterministic hash state across the extraction boundary.
-#[cfg(test)]
-type Pages = page_alloc::index::PageIndex<PageId, IndexedPage, crate::runtime::HashState>;
+use super::pages::Pages;
+use super::pages::Walk;
 
-#[derive(Default)]
+/// Default page capacity before startup configuration.
+const DEFAULT_PAGE_CAPACITY: usize = 65536;
+
+/// Interned page slots: the page capacity plus headroom for held pages that
+/// are not stored yet, at the hold percentage of the capacity.
+fn page_slots(capacity: usize, hold_percent: usize) -> Result<u32> {
+    capacity
+        .checked_mul(hold_percent)
+        .map(|held| held / 100)
+        .and_then(|held| held.checked_add(capacity))
+        .and_then(|slots| u32::try_from(slots).ok())
+        .filter(|slots| *slots < u32::MAX)
+        .ok_or(Error::InvalidConfiguration)
+}
+
 struct State {
     pages: Pages,
-
-    versions: HashMap<ObjectVersion, (VersionMetadata, usize)>,
 
     metadata: HashMap<ObjectVersion, VersionMetadata>,
 
@@ -82,6 +90,17 @@ struct State {
     current: HashMap<ObjectId, CurrentVersion>,
 
     residents: HashMap<PageId, Resident>,
+}
+impl State {
+    fn new(slots: u32) -> Self {
+        Self {
+            pages: Pages::new(slots),
+            metadata: HashMap::default(),
+            order: VecDeque::new(),
+            current: HashMap::default(),
+            residents: HashMap::default(),
+        }
+    }
 }
 /// One worker's exact union of pending and indexed pages. Guards release heat
 /// only when the final storage owner disappears, including cancellation/drop.
@@ -203,6 +222,8 @@ impl Index {
         if percent > 100 || !holds.entries.is_empty() {
             return Err(Error::InvalidConfiguration);
         }
+        let slots = page_slots(self.page_capacity.get(), percent)?;
+        self.state.borrow_mut().pages.resize(slots)?;
         holds.percent = percent;
         Ok(())
     }
@@ -278,17 +299,13 @@ impl Index {
         };
         for number in members.iter() {
             page.number = number;
-            let Some(entry) = state.pages.get(&page) else {
+            let Some(location) = state.pages.location(&page) else {
                 continue;
             };
             segments
-                .validate(
-                    entry.location.segment,
-                    entry.location.generation,
-                    &entry.location.extent,
-                )
+                .validate(location.segment, location.generation, &location.extent)
                 .map_err(|_| Error::Overloaded)?;
-            locations.insert(number, entry.location.clone());
+            locations.insert(number, location);
         }
         let count = members.len();
         let total = holds
@@ -590,8 +607,8 @@ impl Index {
                 };
                 if state
                     .pages
-                    .get(&page)
-                    .is_none_or(|entry| entry.location != *location)
+                    .location(&page)
+                    .is_none_or(|stored| stored != *location)
                 {
                     continue;
                 }
@@ -613,7 +630,7 @@ impl Index {
         let mut members: HashMap<ObjectVersion, Vec<crate::model::PageNumber>> = HashMap::default();
         let state = self.state.borrow();
         for (page, ttl) in held {
-            let Some(entry) = state.pages.get(page) else {
+            let Some(location) = state.pages.location(page) else {
                 continue;
             };
             let (Some(until), Some(monotonic)) = (wall.checked_add(*ttl), now.checked_add(*ttl))
@@ -634,7 +651,7 @@ impl Index {
                 });
             hold.until = hold.until.max(until);
             hold.monotonic = hold.monotonic.max(monotonic);
-            hold.locations.insert(page.number, entry.location.clone());
+            hold.locations.insert(page.number, location);
             members
                 .entry(page.version.clone())
                 .or_default()
@@ -692,8 +709,11 @@ impl Index {
             clock: clock.clone(),
             worker,
             metadata_capacity,
-            page_capacity: Cell::new(65536),
-            state: RefCell::new(State::default()),
+            page_capacity: Cell::new(DEFAULT_PAGE_CAPACITY),
+            state: RefCell::new(State::new(
+                page_slots(DEFAULT_PAGE_CAPACITY, super::holds::DEFAULT_HOLD_PERCENT)
+                    .expect("default page slots"),
+            )),
             availability,
             reserved: Cell::new(0),
             residency: Rc::new(Residency {
@@ -744,6 +764,8 @@ impl Index {
         {
             return Err(Error::InvalidConfiguration);
         }
+        let slots = page_slots(capacity, self.holds.borrow().percent)?;
+        self.state.borrow_mut().pages.resize(slots)?;
         self.page_capacity.set(capacity);
         Ok(())
     }
@@ -754,7 +776,7 @@ impl Index {
             .pages
             .get(page)
             .filter(|e| self.availability.page(&page.version.object.cache, e.key_id))
-            .cloned())
+            .map(|e| e.into_owned().1))
     }
     /// Allocation-free capacity preflight, not a slot reservation. Replacements
     /// remain admissible at capacity; new pages require an existing free slot.
@@ -848,10 +870,6 @@ impl Index {
         {
             return Err(Error::Overloaded);
         }
-        // Fail before removing a mapping or acquiring a residency owner.
-        if !state.pages.can_publish() {
-            return Err(Error::Unavailable);
-        }
         // Acquire first: replacement retains its existing heat without a gap.
         let mut resident = self.track(&page)?;
         resident.payload = Some(
@@ -859,17 +877,21 @@ impl Index {
                 .indexed_payload(&page.version.object.cache, payload_bytes),
         );
         self.hold_published(&page, &entry.location)?;
-        Self::remove_page(&mut state, &page);
-        let version = state
-            .versions
-            .entry(page.version.clone())
-            .or_insert((entry.metadata.clone(), 0));
-        version.1 += 1;
-        let segment = entry.location.segment;
-        state
-            .pages
-            .insert(page, entry, segment)
-            .expect("preflighted publication age");
+        if let Err(error) = state.pages.insert(page.clone(), entry) {
+            // The previous mapping, if any, is unchanged; forget a new hold location.
+            let location = state.pages.location(&page);
+            if let Some(hold) = self.holds.borrow_mut().entries.get_mut(&page.version) {
+                match location {
+                    Some(location) => {
+                        hold.locations.insert(page.number, location);
+                    }
+                    None => {
+                        hold.locations.remove(&page.number);
+                    }
+                }
+            }
+            return Err(error);
+        }
         state.residents.insert(resident.page.clone(), resident);
         Ok(())
     }
@@ -880,11 +902,11 @@ impl Index {
             return Ok(None);
         }
         let s = self.state.borrow();
-        let descriptor = s.metadata.get(version).cloned().or_else(|| {
-            s.versions
-                .get(version)
-                .map(|(metadata, _)| metadata.clone())
-        });
+        let descriptor = s
+            .metadata
+            .get(version)
+            .or_else(|| s.pages.version(version))
+            .cloned();
         Ok(descriptor)
     }
     /// Page-zero owner only. Supports metadata-only objects without a dirty page,
@@ -971,28 +993,23 @@ impl Index {
         let Some(after) = cursor else {
             return 0;
         };
-        let mut next = None;
-        let mut examined = 0;
-        let stale: Vec<(PageId, RecordLocation)> = {
-            let state = self.state.borrow();
-            state
+        let (next, visited) =
+            self.state
+                .borrow_mut()
                 .pages
-                .after(after, budget)
-                .inspect(|(age, _, _)| {
-                    next = Some(*age);
-                    examined += 1;
-                })
-                .filter(|(_, page, entry)| {
-                    !self
-                        .availability
-                        .page(&page.version.object.cache, entry.key_id)
-                        && !self.is_held(page)
-                })
-                .map(|(_, page, entry)| (page.clone(), entry.location.clone()))
-                .collect()
-        };
+                .walk(Walk::KeySweep, after, budget, |view| {
+                    Some(
+                        (!self
+                            .availability
+                            .page(&view.page.version.object.cache, view.key_id)
+                            && !self.is_held(view.page))
+                        .then(|| (view.page.clone(), view.location.clone())),
+                    )
+                });
+        let examined = visited.len();
         self.key_sweep
-            .set((generation, next.filter(|_| examined == budget)));
+            .set((generation, (examined == budget).then_some(next)));
+        let stale: Vec<_> = visited.into_iter().flatten().collect();
         let removed = stale.len();
         for (page, location) in stale {
             self.remove_if_matches(&page, &location);
@@ -1001,8 +1018,8 @@ impl Index {
     }
     pub fn remove_if_matches(&self, page: &PageId, location: &RecordLocation) {
         let mut s = self.state.borrow_mut();
-        if s.pages.get(page).is_some_and(|p| &p.location == location) {
-            Self::remove_page(&mut s, page);
+        if s.pages.remove(page, Some(location)) {
+            s.residents.remove(page);
             if let Some(hold) = self.holds.borrow_mut().entries.get_mut(&page.version) {
                 hold.locations.remove(&page.number);
             }
@@ -1011,28 +1028,20 @@ impl Index {
     pub fn snapshot(&self) -> Result<IndexSnapshot> {
         let s = self.state.borrow();
         Ok(IndexSnapshot {
-            entries: s
-                .pages
-                .iter()
-                .map(|(p, e)| (p.clone(), e.clone()))
-                .collect(),
+            entries: s.pages.iter().map(|view| view.into_owned()).collect(),
             metadata: s.metadata.values().cloned().collect(),
         })
     }
-    /// Owner-local bounded cut. Appends are frozen by Checkpointer; removals are
-    /// safe omissions. The age tree avoids rescanning a growing hash table.
+    /// Resumable publish-order walk for ownership refresh. Token 0 restarts at
+    /// the oldest page; pass back the returned token to continue. Removals are
+    /// safe omissions; a replaced page is visited again at the tail.
     pub fn snapshot_pages(&self, after: u64, limit: usize) -> (u64, Vec<(PageId, IndexedPage)>) {
-        let state = self.state.borrow();
-        let mut cursor = after;
-        let entries = state
+        self.state
+            .borrow_mut()
             .pages
-            .after(after, limit)
-            .map(|(age, page, entry)| {
-                cursor = age;
-                (page.clone(), entry.clone())
+            .walk(Walk::Ownership, after, limit, |view| {
+                Some(view.into_owned())
             })
-            .collect();
-        (cursor, entries)
     }
     pub fn snapshot_metadata(&self) -> Vec<VersionMetadata> {
         self.state.borrow().metadata.values().cloned().collect()
@@ -1044,7 +1053,7 @@ impl Index {
         for bytes in state
             .pages
             .iter()
-            .map(|(_, entry)| super::checkpoint::snapshot_entry_bytes(&entry.metadata))
+            .map(|view| super::checkpoint::snapshot_entry_bytes(view.metadata))
             .chain(
                 state
                     .metadata
@@ -1080,29 +1089,36 @@ impl Index {
         Ok(state.metadata.values().cloned().collect())
     }
 
-    /// Check the whole bounded batch before cloning its first mapping.
+    /// Checkpoint walk (token 0 restarts). Each mapping is charged before it
+    /// is cloned; an exhausted budget fails the whole checkpoint.
     pub(super) fn snapshot_pages_budgeted(
         &self,
         after: u64,
         limit: usize,
         remaining: &mut usize,
     ) -> Result<(u64, Vec<(PageId, IndexedPage)>)> {
-        let state = self.state.borrow();
-        for (_, _, entry) in state.pages.after(after, limit) {
-            *remaining = remaining
-                .checked_sub(super::checkpoint::snapshot_entry_bytes(&entry.metadata))
-                .ok_or(Error::Overloaded)?;
-        }
-        let mut cursor = after;
-        let entries = state
+        let mut over = false;
+        let result = self
+            .state
+            .borrow_mut()
             .pages
-            .after(after, limit)
-            .map(|(age, page, entry)| {
-                cursor = age;
-                (page.clone(), entry.clone())
-            })
-            .collect();
-        Ok((cursor, entries))
+            .walk(Walk::Checkpoint, after, limit, |view| {
+                match remaining.checked_sub(super::checkpoint::snapshot_entry_bytes(view.metadata))
+                {
+                    Some(left) => {
+                        *remaining = left;
+                        Some(view.into_owned())
+                    }
+                    None => {
+                        over = true;
+                        None
+                    }
+                }
+            });
+        if over {
+            return Err(Error::Overloaded);
+        }
+        Ok(result)
     }
     /// Install only with the matching recovered segment state before admission.
     /// Validate identity/length agreement and catalog bounds; clear all freshness.
@@ -1163,11 +1179,7 @@ impl Index {
         segment: SegmentId,
         budget: usize,
     ) -> Vec<(PageId, RecordLocation)> {
-        let s = self.state.borrow();
-        s.pages
-            .segment(segment, budget)
-            .map(|(p, e)| (p.clone(), e.location.clone()))
-            .collect()
+        self.state.borrow().pages.segment(segment, budget)
     }
     pub fn segment_empty(&self, segment: SegmentId) -> bool {
         self.state.borrow().pages.segment_empty(segment)
@@ -1193,9 +1205,9 @@ impl Index {
             segment,
             racer_core::cache::SCAN_BUDGET,
             racer_core::cache::unseen_value_for(crate::model::PAGE_BYTES, scoring.any_over_share()),
-            |page, entry| {
+            |page, metadata| {
                 racer_core::cache::page_value(
-                    entry.metadata.page_length(page).ok(),
+                    metadata.page_length(page).ok(),
                     crate::model::PAGE_BYTES as u32,
                     page_value(scoring, page),
                 )
@@ -1217,23 +1229,17 @@ impl Index {
             .entries
             .retain(|version, _| !caches.contains(&version.object.cache));
         let mut s = self.state.borrow_mut();
-        let pages: Vec<_> = s
-            .pages
-            .keys()
-            .filter(|p| caches.contains(&p.version.object.cache))
-            .cloned()
-            .collect();
-        for p in pages {
-            Self::remove_page(&mut s, &p);
-        }
+        s.pages.remove_caches(caches);
+        s.residents
+            .retain(|page, _| !caches.contains(&page.version.object.cache));
         s.metadata.retain(|v, _| !caches.contains(&v.object.cache));
         s.order.retain(|v| !caches.contains(&v.object.cache));
         s.current.retain(|o, _| !caches.contains(&o.cache));
     }
     fn check_length(s: &State, m: &VersionMetadata) -> Result<()> {
-        if s.versions
-            .get(&m.version)
-            .is_some_and(|(v, _)| !v.compatible(m))
+        if s.pages
+            .version(&m.version)
+            .is_some_and(|v| !v.compatible(m))
             || s.metadata.get(&m.version).is_some_and(|v| !v.compatible(m))
         {
             return Err(Error::CorruptRecord);
@@ -1249,17 +1255,6 @@ impl Index {
             return Err(Error::CorruptRecord);
         }
         Ok(())
-    }
-    fn remove_page(s: &mut State, page: &PageId) {
-        if s.pages.remove(page).is_some() {
-            s.residents.remove(page);
-            if let Some((_, count)) = s.versions.get_mut(&page.version) {
-                *count -= 1;
-                if *count == 0 {
-                    s.versions.remove(&page.version);
-                }
-            }
-        }
     }
     fn evict_one(s: &mut State) {
         if let Some(version) = s.order.pop_front() {
@@ -2746,9 +2741,10 @@ mod priority_tests {
     /// Per-cache counters must equal a recomputation from live mappings.
     fn assert_accounting(index: &Index) {
         let mut expected = crate::runtime::HashMap::<CacheId, u64>::default();
-        for page in index.state.borrow().pages.keys() {
+        index.state.borrow().pages.check();
+        for view in index.state.borrow().pages.iter() {
             *expected
-                .entry(page.version.object.cache.clone())
+                .entry(view.page.version.object.cache.clone())
                 .or_default() += PAGE;
         }
         let retention = index.retention();
@@ -2821,7 +2817,11 @@ mod priority_tests {
         assert_eq!(index.retention().cache_payload_bytes(&cache("b")), PAGE);
         let s = index.state.borrow();
         assert_eq!(s.pages.len(), 1);
-        assert!(s.pages.keys().all(|p| p.version.object.cache == cache("b")));
+        assert!(
+            s.pages
+                .iter()
+                .all(|view| view.page.version.object.cache == cache("b"))
+        );
         assert!(s.metadata.keys().all(|v| v.object.cache == cache("b")));
     }
 

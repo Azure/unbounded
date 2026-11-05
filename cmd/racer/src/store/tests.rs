@@ -2309,9 +2309,18 @@ fn real_writer_rechecks_index_capacity_and_replaces_same_page_when_full() {
         .unwrap();
     assert_eq!(read.ciphertext.bytes(), &[1; 80]);
     drop(read);
-    // A resident duplicate consumes neither a write nor a new publication age.
+    // A resident duplicate consumes neither a write nor a new publication age:
+    // the publish order (and every location) is unchanged.
     let images = f.segments.snapshot();
-    let order = index.snapshot_pages(0, 8).0;
+    let publish_order = |index: &catalog::Index| {
+        index
+            .snapshot_pages(0, 8)
+            .1
+            .into_iter()
+            .map(|(page, entry)| (page, entry.location))
+            .collect::<Vec<_>>()
+    };
+    let order = publish_order(index);
     assert_eq!(f.enqueue(f.copy(1, 64)), Ok(0));
     assert_eq!(f.store.writer.pending_count(), 0);
     assert_eq!(
@@ -2323,7 +2332,7 @@ fn real_writer_rechecks_index_capacity_and_replaces_same_page_when_full() {
         replacement
     );
     assert_eq!(f.segments.snapshot(), images);
-    assert_eq!(index.snapshot_pages(0, 8).0, order);
+    assert_eq!(publish_order(index), order);
     // Once invalidated, an actual same-key replacement remains admissible.
     index.remove_if_matches(&first_id, &replacement);
     f.enqueue(f.copy(1, 64)).unwrap();
