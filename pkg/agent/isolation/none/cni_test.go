@@ -117,6 +117,7 @@ func TestPrepareAndDestroyManageTheCNIPluginLinks(t *testing.T) {
 	require.Equal(t, filepath.Join(b.Layout.CNIBinDir(), "loopback"), target)
 
 	require.NoError(t, b.Destroy(context.Background(), root("v1")))
+
 	_, err = os.Lstat(link)
 	require.ErrorIs(t, err, os.ErrNotExist)
 }

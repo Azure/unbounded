@@ -156,6 +156,7 @@ func TestNoneOperatorRestartNode(t *testing.T) {
 	assert.Equal(t, []string{"restart"}, *events)
 
 	node.restart = errors.New("kubelet down")
+
 	require.ErrorContains(t, op.RestartNode(t.Context(), discardLogger(), noneActive()), "restart node: kubelet down")
 }
 
@@ -169,6 +170,7 @@ func TestNoneOperatorEnsureLifecycleMigrationRecoversAnInterruptedUpgrade(t *tes
 	assert.Equal(t, active.Config.Cluster.Version, node.params.Config.Cluster.Version)
 
 	node.recover = errors.New("cannot roll back")
+
 	require.ErrorContains(t, op.EnsureLifecycleMigration(t.Context(), discardLogger(), active), "recover an interrupted node upgrade")
 }
 

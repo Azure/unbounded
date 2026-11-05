@@ -188,6 +188,7 @@ func TestRecoveryScriptRefusesALastGoodThatCannotOperateTheMode(t *testing.T) {
 
 			cmd := exec.CommandContext(t.Context(), "bash", "-s")
 			cmd.Stdin = &script
+
 			cmd.Env = append(os.Environ(), "PATH="+dir+":"+os.Getenv("PATH"), "CALLS="+calls)
 
 			output, err := cmd.CombinedOutput()
