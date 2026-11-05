@@ -100,11 +100,11 @@ spec:
                           items:
                             properties:
                               mountPath:
-                                maxLength: 4096
+                                maxLength: 1024
                                 minLength: 1
                                 type: string
                               path:
-                                maxLength: 4096
+                                maxLength: 1024
                                 minLength: 1
                                 type: string
                             required:
