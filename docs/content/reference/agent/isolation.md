@@ -115,19 +115,46 @@ from its applied config, as the agent daemon does.
 `spec.isolation` declares the mode a node moves to at its next repave, which the
 agent performs when the Node is deleted. Setting it never moves a running node.
 
-The agent in this release cannot change the mode of a running node. A node is
-put in `none` by bootstrapping the host in that mode. If a repave finds a
-different mode declared, the agent refuses the change, reports it in
-`status.isolationChange` as `Failed` with reason `UnsupportedMode`, and repaves
-in the mode the node already runs so version and configuration rollouts
-continue. To move a host to another mode, run `unbounded-agent reset` on it and
-bootstrap it again in that mode.
+A change between `nspawn` and `none` resets the host and bootstraps it again in
+the new mode (a `Reprovision`). Because it wipes the node stack, it needs an
+explicit opt-in separate from `spec.isolation`: the annotation
+`unbounded-cloud.io/allow-reprovision: "true"` on the Machine. Without it, the
+agent refuses the change, reports it in `status.isolationChange` as `Failed`
+with reason `ReprovisionNotAllowed`, and repaves in the mode the node already
+runs so version and configuration rollouts continue. A mode the agent cannot
+run is refused the same way with reason `UnsupportedMode`.
 
-A change that resets and bootstraps the host again (a `Reprovision`) also needs
-an explicit opt-in separate from `spec.isolation`: the annotation
-`unbounded-cloud.io/allow-reprovision: "true"` on the Machine. Without it, an
-agent that supports such a change refuses it with reason
-`ReprovisionNotAllowed` and repaves in the current mode.
+To change the mode:
+
+1. Set `spec.isolation` to the new mode and add the annotation.
+2. Cordon and drain the node, then delete its Node object, as for any repave.
+
+The agent then:
+
+1. Checks the new mode's host requirements and, for a host that joins with a
+   bootstrap token, that the API server still accepts the token. An expired
+   token is caught when the API server can be reached; renew it, or bootstrap
+   the host with attestation, and the change is tried again at the next
+   repave. An attested host attests again instead.
+2. Stages a copy of itself, the target configuration (with the Machine's
+   download sources) and a journal in `/var/lib/unbounded-agent-reprovision`,
+   and checks that the target configuration resolves. Nothing is reset if any
+   of this fails.
+3. Starts `unbounded-agent-reprovision.service`, which runs the agent reset and
+   then the bootstrap in the new mode. For `none`, the bootstrap first refuses
+   a host that still runs a kubelet or containerd the agent does not own.
+
+The change is `InProgress` until the agent the bootstrap installs reports it
+`Succeeded`, with `status.isolation` set in the same update. The service
+retries a failing run, waiting longer each time, for 90 minutes from the start
+of the change. It then gives up, reports `Failed` while it still has the
+bootstrap token, and removes its staged files; the next agent to run on the
+host reports it too. A change still `InProgress` after two hours shows as
+`ChangeStale`.
+
+A failed change is not retried on its own: the node keeps the mode it had and
+the next repave tries again. Removing the annotation after the change stops
+later changes from resetting the host.
 
 ## Drift
 

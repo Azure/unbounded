@@ -219,7 +219,9 @@ sets the `IsolationDrift` condition:
 | `AppliedModeMatches` | `False` | the declared mode runs |
 | `AppliedModeDiffers` | `True` | a different mode is declared; it applies at the next repave |
 | `ChangeInProgress` | `True` | `status.isolationChange` is `InProgress` for the declared mode |
+| `ChangeStale` | `True` | `InProgress` for more than two hours by `lastTransitionTime` |
 | `ChangeFailed` | `True` | `status.isolationChange` is `Failed` for the declared mode |
+| `ChangeRefused` | `True` | `Failed` with a reason (`UnsupportedMode`, `ReprovisionNotAllowed`) |
 
 The condition is absent until the agent has reported a mode. The mode changes
 when the node is next repaved (section 10).
@@ -505,6 +507,14 @@ before deleting it, as for any repave.
 An empty `spec.isolation` declares nothing, so a repave never changes the mode
 of a node whose Machine does not declare one.
 
+A reprovision wipes the node stack, so it also needs an opt-in that is separate
+from the declaration: the Machine annotation
+`unbounded-cloud.io/allow-reprovision: "true"`. Without it the agent records the
+change `Failed` with reason `ReprovisionNotAllowed` and repaves in the current
+mode, so version rollouts continue (`planIsolationChange` in
+`controller_node.go`). When nothing else restarts the node stack, the agent
+restarts it so the deleted Node registers again.
+
 ### 10.2 Supported strategies
 
 The strategy follows from the pair; the operator does not choose it.
@@ -547,29 +557,53 @@ change) starts a new attempt.
 Pod data and the image store are re-pulled. Host-global state (invariant 2)
 is untouched.
 
-**Status.** Implemented for both strategies, driven from the repave.
+**Status.** Implemented for both strategies, driven from the repave. Only
+`nspawn` and `none` exist so far, so every change is a reprovision; the in-place
+engine is built and tested between the two nspawn slots and gets its first real
+pair with `container`.
 
 - *In place (nspawn <-> container).* `migrate.RunInPlace` with real hooks:
   the target mode's host preflight, the repave's download resolution and archive
   staging, prepare in the alternate slot, the repave's network cleanup, persist
   the target's applied config, and the repave's local kubelet check within five
-  minutes. Rollback removes the target's record and restores the source's.
-  Success removes the source and updates `status.isolation`. Kubelet
-  credentials are fresh because the target boots a new kubelet from the
-  configuration's bootstrap token, as a repave does; nothing is copied.
+  minutes. Rollback removes the target's record and restores the source's, and
+  starts the source again only once the target is stopped, destroyed and no
+  longer reported running; otherwise the change ends `Failed` and the node needs
+  attention. Success removes the source. Kubelet credentials are fresh because
+  the target boots a new kubelet from the configuration's bootstrap token, as a
+  repave does; nothing is copied.
 - *Crash safety.* `migrate.Journal` is a write-ahead step file at
-  `/etc/unbounded/agent/isolation-migration.json`. The daemon resolves a leftover
-  journal at start (before the source stopped: drop the target; once it may have
-  stopped: roll back; `awaiting-ready`: wait again; `ready`: finish cleanup) and
-  records the outcome in `status.isolationChange`. While both slots have an
-  applied config, the journal decides which one is active.
+  `/etc/unbounded/agent/isolation-migration.json`, written durably (file and
+  directory synced). The daemon resolves a leftover journal at start, on the
+  host alone, before it reads which slot is active and before it needs
+  credentials or the API server (before the source stopped: drop the target;
+  once it may have stopped: roll back; `awaiting-ready`: wait again; `ready`:
+  finish cleanup). It reports the outcome in `status.isolationChange` once it
+  has a client. A journal is removed only when it is terminal and its outcome
+  was reported; one that is not over, or cannot be read, is kept and blocks new
+  changes. While both slots have an applied config, the journal decides which
+  one is active; with no journal, the only recorded node stack that runs is
+  active, and otherwise the daemon refuses to pick one.
+- *Settling at repave.* A repave first settles any journal. When that resolved
+  a change, the repave is requeued rather than consumed, and the requeued
+  repave does not try a change that just failed again; the next Node deletion
+  does.
 - *Reprovision (any pair, required for `none`).* The reset removes the daemon,
   so the daemon stages `/var/lib/unbounded-agent-reprovision` (binary copy,
-  target config, journal) and starts `unbounded-agent-reprovision.service`,
-  whose hidden `isolation-reprovision` command runs the existing reset, then the
-  target mode's bootstrap, retried by systemd up to
-  `daemon.ReprovisionMaxAttempts` runs. The daemon that bootstrap installs
-  records the outcome once the applied config is in the target mode.
+  target config with the Machine's download sources, journal) and starts
+  `unbounded-agent-reprovision.service`, whose hidden `isolation-reprovision`
+  command runs the existing reset, then the target mode's bootstrap. Before the
+  journal is written, the staged binary's `--check` validates the configuration
+  and resolves the target plan's inputs. systemd reruns a failed run; the
+  command waits longer each time (doubling up to ten minutes) and gives up
+  `daemon.ReprovisionGiveUpAfter` (90 minutes) after the handoff started, below
+  machina's two hour `ChangeStale` threshold. Giving up records `Failed` in the
+  journal, reports it with the staged bootstrap token when there is one, and
+  removes the unit and staged files. The daemon that bootstrap installs records
+  the outcome once the applied config is in the target mode. A journal at
+  `reprovisioning` whose unit was never installed and enabled reset nothing; it
+  is concluded `Failed` and the staged files are removed. While a handoff runs,
+  the old daemon starts no repave and no MachineOperation.
 - *Shared configuration.* `confsnap` saves, byte for byte, the host files both
   stacks write at the same paths before an in-place change, a `none` upgrade
   and a container upgrade, and restores them before the source starts again on
@@ -578,15 +612,26 @@ is untouched.
   restored for an in-place change (through `migrate.Journal`) and for a `none`
   upgrade (through the none upgrade journal); a container upgrade restores it
   only within the same process.
-- *Preflight and tokens.* The `none` target's static preflight runs before the
-  reset and the ownership half after. An attested host records its attestation
-  URL at bootstrap and attests again on reprovision; any other host is checked
-  for a still-valid bootstrap token before the reset. An invalid token cannot
-  be renewed from the agent: the operator must renew it or bootstrap with
-  attestation. A change to nspawn is refused up front when the host lacks the
-  nspawn runtime, because a change installs nothing.
-- *Gaps.* After a reprovision that never bootstraps, `status.isolationChange` is
-  recorded `Failed` only once an agent next runs on the host.
+- *Preflight and tokens.* The `none` target's static preflight
+  (`PreflightStatic`) runs before the reset. Its ownership half
+  (`PreflightOwnership`) cannot run then, since the node being changed runs a
+  kubelet and containerd the none backend does not own; it runs after the
+  reset as the first step of the bootstrap in mode `none`
+  (`nonePlan.EnsureHostClean`), before anything is installed. An attested host
+  records its attestation URL at bootstrap and attests again on reprovision;
+  any other host has its bootstrap token checked against the API server before
+  the reset, so an expired token is caught when the API server can be reached.
+  When it cannot be reached the change goes ahead and the handoff's bounded
+  retry reports a real failure. An invalid token cannot be renewed from the
+  agent: the operator must renew it or bootstrap with attestation. A change to
+  nspawn is refused up front when the host lacks the nspawn runtime, because a
+  change installs nothing.
+- *Gaps.* The handoff does not fetch the target's artifacts before the reset:
+  `--check` resolves the goal state (which verifies an offline bundle), but an
+  unreachable download source is found only by the bootstrap after the reset,
+  and is retried until the deadline. An attested host that gives up cannot
+  report from the handoff; it is reported by the next agent on the host, or
+  shows `ChangeStale`.
 
 ### 10.5 Future: in-place upgrades without deleting the Node
 
