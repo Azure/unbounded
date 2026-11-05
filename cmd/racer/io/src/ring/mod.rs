@@ -83,6 +83,12 @@ pub struct OpCtx {
     /// Draw from the reserved partition ([`Config::reserved_entries`]) so
     /// control traffic is never starved by data operations.
     pub reserved: bool,
+
+    /// Issue positioned file reads and writes with `IOSQE_ASYNC` so cold
+    /// buffered filesystem I/O runs on a kernel worker instead of blocking
+    /// the lane inline. Device `O_DIRECT` and socket I/O leave this unset;
+    /// filesystem metadata operations are always offloaded.
+    pub offload: bool,
 }
 
 impl OpCtx {
@@ -114,6 +120,12 @@ impl OpCtx {
     /// Use the reserved partition.
     pub fn reserved(mut self) -> Self {
         self.reserved = true;
+        self
+    }
+
+    /// Offload positioned file I/O (see [`OpCtx::offload`]).
+    pub fn offload(mut self) -> Self {
+        self.offload = true;
         self
     }
 
@@ -320,6 +332,8 @@ struct Slot {
 
     retry_interest: u32,
 
+    offload: bool,
+
     retry_fd: RawFd,
 
     attempts: u8,
@@ -350,6 +364,7 @@ impl Slot {
             returns_fd: false,
             reserved: false,
             retry_interest: 0,
+            offload: false,
             retry_fd: -1,
             attempts: 0,
             polling: false,
@@ -677,7 +692,8 @@ impl Reactor {
             multi: true,
         };
         if let Backend::Uring(ring) = &mut state.backend {
-            ring.push(WAKE_TAG, &op).map_err(|_| Error::Overloaded)?;
+            ring.push(WAKE_TAG, &op, false)
+                .map_err(|_| Error::Overloaded)?;
             state.wake_armed = true;
         }
         Ok(())
@@ -721,6 +737,7 @@ impl Reactor {
         };
         let slot = state.slab.lookup(id).expect("fresh slot");
         slot.reserved = ctx.reserved;
+        slot.offload = ctx.offload;
         slot.owner.put(owner);
         slot.class = ctx.class;
         slot.deadline = ctx.deadline.instant();
@@ -739,7 +756,7 @@ impl Reactor {
             }
         };
         slot_retry_fd(slot, &op);
-        if let Err(error) = Self::push(&mut state, id.0, &op) {
+        if let Err(error) = Self::push(&mut state, id.0, &op, ctx.offload) {
             let slot = state.slab.lookup(id).expect("fresh slot");
             slot.owner.clear();
             state.slab.release(id);
@@ -760,14 +777,15 @@ impl Reactor {
     }
 
     /// Queue one SQE, flushing the SQ once if it is full.
-    fn push(state: &mut State, user_data: u64, op: &Op) -> Result<()> {
+    fn push(state: &mut State, user_data: u64, op: &Op, offload: bool) -> Result<()> {
         match &mut state.backend {
             Backend::Uring(ring) => {
-                if ring.push(user_data, op).is_ok() {
+                if ring.push(user_data, op, offload).is_ok() {
                     return Ok(());
                 }
                 ring.submit()?;
-                ring.push(user_data, op).map_err(|_| Error::Overloaded)
+                ring.push(user_data, op, offload)
+                    .map_err(|_| Error::Overloaded)
             }
             Backend::Sim(driver) => driver.push(user_data, op).map_err(|_| Error::Overloaded),
         }
@@ -825,7 +843,7 @@ impl Reactor {
             return;
         }
         let op = Op::Cancel { target: id.0 };
-        if Self::push(state, id.0 | CANCEL_BIT, &op).is_ok() {
+        if Self::push(state, id.0 | CANCEL_BIT, &op, false).is_ok() {
             if let Some(slot) = state.slab.lookup(id) {
                 slot.fence = Fence::Pending(CancelFence::Pending);
             }
@@ -1008,7 +1026,8 @@ impl Reactor {
                     unsafe { prepare(slot.owner.raw(), &mut slot.scratch) }
                 };
                 slot.fence = Fence::Pending(CancelFence::NotSubmitted);
-                let pushed = op.and_then(|op| Self::push(state, id.0, &op));
+                let offload = slot.offload;
+                let pushed = op.and_then(|op| Self::push(state, id.0, &op, offload));
                 match pushed {
                     Ok(()) => return Ok(()),
                     Err(error) => {

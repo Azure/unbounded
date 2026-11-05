@@ -135,6 +135,29 @@ impl Op {
         }
     }
 
+    /// Lower to a kernel SQE, adding `IOSQE_ASYNC` to positioned file reads
+    /// and writes when `offload` is set. Returns whether the SQE is offloaded.
+    pub fn issue(&self, offload: bool) -> (squeue::Entry, bool) {
+        let sqe = self.sqe();
+        let positioned = matches!(
+            self,
+            Self::Read { .. } | Self::Write { .. } | Self::Readv { .. } | Self::Writev { .. }
+        );
+        if offload && positioned {
+            return (sqe.flags(squeue::Flags::ASYNC), true);
+        }
+        let metadata = matches!(
+            self,
+            Self::Fsync { .. }
+                | Self::OpenAt2 { .. }
+                | Self::Statx { .. }
+                | Self::RenameAt { .. }
+                | Self::UnlinkAt { .. }
+                | Self::MkdirAt { .. }
+        );
+        (sqe, metadata)
+    }
+
     /// Lower to a kernel SQE. Filesystem metadata ops may block, so they are
     /// issued with `IOSQE_ASYNC`; data I/O is always issued inline.
     pub fn sqe(&self) -> squeue::Entry {

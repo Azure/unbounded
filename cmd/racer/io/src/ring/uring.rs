@@ -21,6 +21,9 @@ pub struct EnterStats {
 
     /// Submission requests skipped because the SQ was empty.
     pub skipped: u64,
+
+    /// SQEs queued with `IOSQE_ASYNC`.
+    pub offloaded: u64,
 }
 
 /// The kernel ring and its setup facts.
@@ -69,10 +72,18 @@ impl UringDriver {
     }
 
     /// Queue one SQE; `Err` when the SQ is full.
-    pub(crate) fn push(&mut self, user_data: u64, op: &Op) -> std::result::Result<(), ()> {
-        let sqe = op.sqe().user_data(user_data);
+    pub(crate) fn push(
+        &mut self,
+        user_data: u64,
+        op: &Op,
+        offload: bool,
+    ) -> std::result::Result<(), ()> {
+        let (sqe, offloaded) = op.issue(offload);
+        let sqe = sqe.user_data(user_data);
         // SAFETY: the slot owning every pointer in `op` outlives both CQEs.
-        unsafe { self.ring.submission().push(&sqe) }.map_err(|_| ())
+        unsafe { self.ring.submission().push(&sqe) }.map_err(|_| ())?;
+        self.stats.offloaded += u64::from(offloaded);
+        Ok(())
     }
 
     /// Pop one CQE.

@@ -169,6 +169,136 @@ fn kernel_file_reads_writes_and_vectors() {
     assert_eq!(reactor.in_flight(), 0);
 }
 
+#[test]
+/// Offloaded positioned file I/O carries `IOSQE_ASYNC` on the queued SQE while
+/// socket I/O and inline positioned I/O do not; metadata is always offloaded.
+fn offload_policy_sets_async_only_on_positioned_file_io() {
+    let mut buf = [0u8; 1];
+    let iov = [libc::iovec {
+        iov_base: buf.as_mut_ptr().cast(),
+        iov_len: 1,
+    }];
+    let positioned = [
+        Op::Read {
+            fd: 3,
+            ptr: buf.as_mut_ptr(),
+            len: 1,
+            offset: 7,
+        },
+        Op::Write {
+            fd: 3,
+            ptr: buf.as_ptr(),
+            len: 1,
+            offset: 7,
+        },
+        Op::Readv {
+            fd: 3,
+            iov: iov.as_ptr(),
+            count: 1,
+            offset: 0,
+        },
+        Op::Writev {
+            fd: 3,
+            iov: iov.as_ptr(),
+            count: 1,
+            offset: 0,
+        },
+    ];
+    let sockets = [
+        Op::Recv {
+            fd: 3,
+            ptr: buf.as_mut_ptr(),
+            len: 1,
+        },
+        Op::Send {
+            fd: 3,
+            ptr: buf.as_ptr(),
+            len: 1,
+        },
+        Op::Accept { fd: 3 },
+        Op::Poll {
+            fd: 3,
+            mask: 1,
+            multi: false,
+        },
+    ];
+    let metadata = [
+        Op::Fsync {
+            fd: 3,
+            datasync: false,
+        },
+        Op::Statx {
+            fd: 3,
+            out: std::ptr::null_mut(),
+        },
+        Op::UnlinkAt {
+            dir: 3,
+            path: c"x".as_ptr(),
+            flags: 0,
+        },
+        Op::MkdirAt {
+            dir: 3,
+            path: c"x".as_ptr(),
+            mode: 0o700,
+        },
+    ];
+    let async_ = io_uring::squeue::Flags::ASYNC.bits();
+    // Entry has no flag getter; Debug exposes the actual SQE flag byte.
+    let flags = |op: &Op, offload| {
+        let (sqe, offloaded) = op.issue(offload);
+        let flag = format!("{sqe:?}").contains(&format!("flags: {async_},"));
+        assert_eq!(flag, offloaded, "{}", op.name());
+        flag
+    };
+    for op in &positioned {
+        assert!(!flags(op, false), "{}", op.name());
+        assert!(flags(op, true), "{}", op.name());
+    }
+    for op in &sockets {
+        assert!(!flags(op, false), "{}", op.name());
+        assert!(!flags(op, true), "{}", op.name());
+    }
+    for op in &metadata {
+        assert!(flags(op, false), "{}", op.name());
+        assert!(flags(op, true), "{}", op.name());
+    }
+}
+
+#[test]
+/// A kernel ring queues offloaded reads and writes with `IOSQE_ASYNC`,
+/// including the resubmission after a retry, and they still complete.
+fn kernel_offloaded_file_io_is_queued_async() {
+    let Some(reactor) = kernel(8) else {
+        return;
+    };
+    let file = Rc::new(Descriptor::from(tempfile()));
+    let inline = OpCtx::none();
+    let offload = OpCtx::none().offload();
+    block_on(
+        &reactor,
+        reactor.write_at(file.clone(), 0, b"abc".to_vec(), (), &inline),
+    )
+    .unwrap();
+    assert_eq!(reactor.stats().enters.offloaded, 0);
+    let written = block_on(
+        &reactor,
+        reactor.write_at(file.clone(), 3, b"def".to_vec(), (), &offload),
+    )
+    .unwrap();
+    assert_eq!(written.bytes, 3);
+    assert_eq!(reactor.stats().enters.offloaded, 1);
+    let read = block_on(
+        &reactor,
+        reactor.read_at(file.clone(), 0, vec![0; 6], (), &offload),
+    )
+    .unwrap();
+    assert_eq!(read.buffer, b"abcdef");
+    assert_eq!(reactor.stats().enters.offloaded, 2);
+    block_on(&reactor, reactor.fsync(file, false, &inline)).unwrap();
+    assert_eq!(reactor.stats().enters.offloaded, 3);
+    assert_eq!(reactor.in_flight(), 0);
+}
+
 /// An unlinked temporary file in the project-local tmp directory.
 fn tempfile() -> std::fs::File {
     let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../../tmp");

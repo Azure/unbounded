@@ -563,6 +563,25 @@ impl<S: Scope, Q: Budget> Reactor<S, Q> {
         )
     }
 
+    /// Read at an explicit offset with `IOSQE_ASYNC`, for cold buffered
+    /// filesystem reads that must not block the lane inline.
+    pub(crate) fn read_at_offloaded<'a, B: IoBuffer, L: 'static>(
+        &'a self,
+        file: Rc<Descriptor>,
+        offset: u64,
+        buffer: B,
+        lease: L,
+        scope: &'a S,
+    ) -> Operation<'a, Completion<B, L>, S::Error> {
+        self.run(
+            scope,
+            None,
+            SubmissionKind::OtherIo,
+            move |io, ctx| io.read_at(file, offset, buffer, lease, &ctx.clone().offload()),
+            |f| f.id(),
+        )
+    }
+
     /// Write at an explicit offset, returning short progress without replaying bytes.
     pub fn write_at<'a, B: IoBuffer, L: 'static>(
         &'a self,
