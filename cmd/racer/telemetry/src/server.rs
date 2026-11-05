@@ -9,7 +9,8 @@
 //! future is abandoned. Drain the reactor before releasing worker resources.
 //!
 //! Each server permits one listener, four concurrent connections, 1024 request
-//! bytes, 64KiB text buffers, and two-second text/header deadlines. An optional
+//! bytes, [`MAX_RESPONSE_BYTES`] text buffers, and two-second text/header deadlines.
+//! A streamed text route reuses its buffer for each chunk, so its body is unbounded. An optional
 //! asynchronous producer (a binary profile or a JSON report, each with its own single
 //! in-flight slot) has separate prepaid capacity and a bounded deadline. [`Scope`]
 //! must narrow the caller's deadline while preserving cancellation and metadata.
@@ -41,12 +42,21 @@ pub const MAX_REQUEST_BYTES: usize = 1024;
 
 /// Fixed buffer capacity shared by request parsing and response formatting.
 ///
-/// `/metrics` is rendered whole into this buffer, so it must fit the largest
-/// catalog: about 624 caches with 253-byte names, two cache-labeled series
-/// each (about 400 KiB), plus 64 workers' quota series and the fixed GPU and
-/// prefetch families. 1 MiB leaves headroom; `racer` tests check the size at
-/// maximum cardinality.
+/// Synchronous text routes render whole into this buffer. Streamed routes
+/// ([`Handler::stream`], used by `/metrics`) send it repeatedly as one HTTP
+/// chunk at a time, so their total body has no fixed cap; only a single
+/// piece must fit.
 pub const MAX_RESPONSE_BYTES: usize = 1024 * 1024;
+
+/// Bytes reserved before each streamed chunk for its fixed-width size line.
+const CHUNK_HEAD_BYTES: usize = 10;
+
+/// The terminating zero-length chunk of a streamed body.
+const LAST_CHUNK: &[u8] = b"0\r\n\r\n";
+
+const JSON: &str = "application/json";
+const TEXT: &str = "text/plain; charset=utf-8";
+const METRICS: &str = "text/plain; version=0.0.4; charset=utf-8";
 
 /// Bytes at the front of each response buffer reserved for the status line and headers.
 const HEAD_BYTES: usize = 256;
@@ -155,6 +165,15 @@ pub enum Event {
     Timeout,
 }
 
+/// A successful text body written in pieces, so its total size is unbounded.
+pub trait TextStream {
+    /// Write the next whole piece of trusted output and return `Ok(true)`
+    /// while more remain. On `Err` the transport discards the partial piece
+    /// and calls again with fresh space, so state must advance only on
+    /// success. A piece that cannot fit an empty chunk fails the exchange.
+    fn next(&mut self, out: &mut dyn Write) -> Result<bool, fmt::Error>;
+}
+
 /// Application admission, trusted response formatting, and event reporting.
 pub trait Handler {
     /// Retained in reactor-owned buffers until the completion fence.
@@ -168,6 +187,13 @@ pub trait Handler {
 
     /// None preserves the synchronous text route without allocating a session.
     fn binary(&self, _path: &str) -> Option<Result<BinaryResponse, BinaryError>> {
+        None
+    }
+
+    /// None keeps the synchronous route. Otherwise the body is sent with
+    /// chunked transfer encoding and status 200; the response selects the
+    /// content type (`Text`, `Metrics`, or `Json`; other variants send text).
+    fn stream<'a>(&'a self, _path: &str) -> Option<(Response, Box<dyn TextStream + 'a>)> {
         None
     }
 
@@ -427,6 +453,14 @@ impl Server {
                     .binary_exchange(reactor, fd, buffer, parent, &scope, response)
                     .await;
             }
+            if let Route::Get(value) = route
+                && let Some((response, stream)) = handler.stream(value)
+            {
+                path.zeroize();
+                return self
+                    .stream_exchange(reactor, fd, buffer, &scope, response, stream)
+                    .await;
+            }
             let length = respond(handler, route, &mut buffer.bytes).map_err(|_| Error::Io)?;
             path.zeroize();
             buffer.pending = 0..length;
@@ -444,6 +478,51 @@ impl Server {
             }
             Ok(())
         })
+    }
+
+    /// Send a streamed body as fixed-width HTTP chunks, one buffer at a time.
+    async fn stream_exchange<S: Scope, B: Budget, C: 'static>(
+        &self,
+        reactor: &Reactor<S, B>,
+        fd: Rc<Descriptor>,
+        mut buffer: Buffer<C>,
+        scope: &S,
+        response: Response,
+        mut stream: Box<dyn TextStream + '_>,
+    ) -> Result<(), S::Error> {
+        let content_type = match response {
+            Response::Metrics => METRICS,
+            Response::Json => JSON,
+            _ => TEXT,
+        };
+        let mut head = Output {
+            bytes: &mut buffer.bytes,
+            used: 0,
+        };
+        write!(head, "HTTP/1.1 200 OK\r\nContent-Type: {content_type}\r\nTransfer-Encoding: chunked\r\nConnection: close\r\nCache-Control: no-store\r\nX-Content-Type-Options: nosniff\r\n\r\n").map_err(|_| Error::Io)?;
+        let mut length = head.used;
+        loop {
+            let (length_after, done) = fill_chunk(&mut buffer.bytes, length, stream.as_mut())?;
+            length = length_after;
+            buffer.pending = 0..length;
+            while !buffer.pending.is_empty() {
+                let completed = reactor
+                    .send_reserved(
+                        fd.clone(),
+                        buffer,
+                        self.resources.submissions.clone(),
+                        scope,
+                    )
+                    .await?;
+                buffer = completed.buffer;
+                buffer.advance(completed.bytes)?;
+            }
+            if done {
+                return Ok(());
+            }
+            buffer.bytes[..length].zeroize();
+            length = 0;
+        }
     }
 
     async fn binary_exchange<S: Scope, B: Budget, C: 'static>(
@@ -735,6 +814,59 @@ impl Write for Output<'_> {
     }
 }
 
+/// Append one chunk of whole pieces after `start`, plus the last chunk once
+/// the stream ends. Returns the bytes to send and whether the body is done.
+fn fill_chunk(
+    bytes: &mut [u8],
+    start: usize,
+    stream: &mut dyn TextStream,
+) -> Result<(usize, bool)> {
+    let data = start + CHUNK_HEAD_BYTES;
+    // Leave room for the data's CRLF and the terminating chunk.
+    let limit = bytes
+        .len()
+        .checked_sub(2 + LAST_CHUNK.len())
+        .filter(|limit| *limit > data)
+        .ok_or(Error::Io)?;
+    let mut output = Output {
+        bytes: &mut bytes[data..limit],
+        used: 0,
+    };
+    let done = loop {
+        let mark = output.used;
+        match stream.next(&mut output) {
+            Ok(true) => (),
+            Ok(false) => break true,
+            Err(_) => {
+                output.bytes[mark..output.used].zeroize();
+                output.used = mark;
+                // A piece too large for an empty chunk can never be sent.
+                if mark == 0 && start == 0 {
+                    return Err(Error::Io);
+                }
+                break false;
+            }
+        }
+    };
+    let used = output.used;
+    let mut end = start;
+    if used > 0 {
+        let mut size = Output {
+            bytes: &mut bytes[start..data],
+            used: 0,
+        };
+        write!(size, "{used:08x}\r\n").map_err(|_| Error::Io)?;
+        end = data + used;
+        bytes[end..end + 2].copy_from_slice(b"\r\n");
+        end += 2;
+    }
+    if done {
+        bytes[end..end + LAST_CHUNK.len()].copy_from_slice(LAST_CHUNK);
+        end += LAST_CHUNK.len();
+    }
+    Ok((end, done))
+}
+
 /// Format a complete response, replacing rejected handler output with fixed text.
 fn respond(
     handler: &impl Handler,
@@ -742,9 +874,6 @@ fn respond(
     bytes: &mut [u8],
 ) -> Result<usize, fmt::Error> {
     const HEAD: usize = HEAD_BYTES;
-    const JSON: &str = "application/json";
-    const TEXT: &str = "text/plain; charset=utf-8";
-    const METRICS: &str = "text/plain; version=0.0.4; charset=utf-8";
     if bytes.len() < HEAD {
         return Err(fmt::Error);
     }
@@ -1480,6 +1609,106 @@ mod tests {
     }
 
     /// Reject unsupported versions, headers, bodies, and methods without relaxing parsing.
+    /// Emits `count` pieces of `size` bytes each.
+    struct Pieces {
+        size: usize,
+        count: usize,
+        calls: usize,
+    }
+
+    impl TextStream for Pieces {
+        fn next(&mut self, out: &mut dyn Write) -> Result<bool, fmt::Error> {
+            self.calls += 1;
+            // Write in two parts so a failure leaves a partial piece behind.
+            let half = self.size / 2;
+            out.write_str(&"a".repeat(half))?;
+            out.write_str(&"b".repeat(self.size - half))?;
+            self.count -= 1;
+            Ok(self.count > 0)
+        }
+    }
+
+    /// Decode fixed-width chunks, returning the body and whether it ended.
+    fn dechunk(mut bytes: &[u8], body: &mut Vec<u8>) -> bool {
+        while !bytes.is_empty() {
+            let line = bytes.windows(2).position(|w| w == b"\r\n").unwrap();
+            let size =
+                usize::from_str_radix(std::str::from_utf8(&bytes[..line]).unwrap(), 16).unwrap();
+            if size == 0 {
+                assert_eq!(&bytes[line..], b"\r\n\r\n");
+                return true;
+            }
+            let data = &bytes[line + 2..];
+            body.extend_from_slice(&data[..size]);
+            assert_eq!(&data[size..size + 2], b"\r\n");
+            bytes = &data[size + 2..];
+        }
+        false
+    }
+
+    /// Streamed bodies span many buffers, keep whole pieces, and end once.
+    #[test]
+    fn streamed_chunks_carry_whole_pieces_beyond_one_buffer() {
+        let mut stream = Pieces {
+            size: 30,
+            count: 10,
+            calls: 0,
+        };
+        let mut buffer = vec![0u8; 100];
+        let mut body = Vec::new();
+        let mut start = 7;
+        let mut sends = 0;
+        loop {
+            let (end, done) = fill_chunk(&mut buffer, start, &mut stream).unwrap();
+            assert!(end <= buffer.len());
+            assert_eq!(dechunk(&buffer[start..end], &mut body), done);
+            sends += 1;
+            start = 0;
+            if done {
+                break;
+            }
+        }
+        assert_eq!(body.len(), 300);
+        assert!(body.chunks(30).all(|piece| {
+            piece
+                == [b'a'; 15]
+                    .iter()
+                    .chain(&[b'b'; 15])
+                    .copied()
+                    .collect::<Vec<_>>()
+        }));
+        assert!(sends >= 4, "{sends}");
+        // Each refused piece is retried once in the next chunk.
+        assert_eq!(stream.calls, 10 + sends - 1);
+    }
+
+    /// A piece that cannot fit an empty chunk fails instead of truncating,
+    /// but one that only misses a buffer shared with the head is retried.
+    #[test]
+    fn streamed_piece_larger_than_a_chunk_fails() {
+        let mut buffer = vec![0u8; 64];
+        let mut stream = Pieces {
+            size: 60,
+            count: 1,
+            calls: 0,
+        };
+        assert!(fill_chunk(&mut buffer, 0, &mut stream).is_err());
+        let mut stream = Pieces {
+            size: 40,
+            count: 1,
+            calls: 0,
+        };
+        assert_eq!(
+            fill_chunk(&mut buffer, 20, &mut stream).unwrap(),
+            (20, false)
+        );
+        let (end, done) = fill_chunk(&mut buffer, 0, &mut stream).unwrap();
+        assert!(done);
+        let mut body = Vec::new();
+        assert!(dechunk(&buffer[..end], &mut body));
+        assert_eq!(body.len(), 40);
+    }
+
     #[test]
     fn fixed_parser_restrictions_and_header_limit() {
         for request in [
