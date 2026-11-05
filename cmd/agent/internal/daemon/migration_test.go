@@ -23,7 +23,7 @@ func TestDaemonStartupRunsLifecycleMigrationBeforeControllerSetup(t *testing.T) 
 		Name:   "kube1",
 		Config: &provision.AgentConfig{MachineName: "machine-1", NodeName: "node-1"},
 	}}
-	err := run(context.Background(), discardLogger(), runOptions{NodeOperator: op, installation: installstate.NewStore(t.TempDir(), filepath.Join(t.TempDir(), "lock"))})
+	err := run(context.Background(), discardLogger(), runOptions{NodeOperator: op, installation: installstate.NewStore(t.TempDir(), filepath.Join(t.TempDir(), "lock")), Migration: testMigrationEnv(t)})
 	require.ErrorContains(t, err, "build daemon controller credentials")
 	require.Equal(t, 1, op.lifecycleCalls)
 }
@@ -46,7 +46,7 @@ func TestStartupLockWaitStandsDownWithoutMigration(t *testing.T) {
 	defer cancel()
 
 	op := &fakeNodeOperator{}
-	_, err = discoverAndMigrate(ctx, discardLogger(), store, op)
+	_, _, err = discoverAndMigrate(ctx, discardLogger(), store, op, &migrationEnv{ConfigDir: t.TempDir(), ReprovisionDir: t.TempDir()})
 	require.ErrorIs(t, err, ErrDeferred, "waiting out a live bootstrap must defer, not fail")
 	require.Zero(t, op.lifecycleCalls)
 }
@@ -66,7 +66,7 @@ func TestStartupStandsDownWhileInstallationUnfinished(t *testing.T) {
 	require.NoError(t, store.Save(record))
 
 	op := &fakeNodeOperator{}
-	_, err = discoverAndMigrate(t.Context(), discardLogger(), store, op)
+	_, _, err = discoverAndMigrate(t.Context(), discardLogger(), store, op, &migrationEnv{ConfigDir: t.TempDir(), ReprovisionDir: t.TempDir()})
 	require.ErrorIs(t, err, ErrDeferred, "an unfinished installation must defer, not fail")
 	require.Zero(t, op.lifecycleCalls)
 }
@@ -82,7 +82,21 @@ func TestDaemonStartupFailsLifecycleMigrationWithoutRetry(t *testing.T) {
 		},
 		lifecycleErrs: []error{resolveErr},
 	}
-	err := run(context.Background(), discardLogger(), runOptions{NodeOperator: op, installation: installstate.NewStore(t.TempDir(), filepath.Join(t.TempDir(), "lock"))})
+	err := run(context.Background(), discardLogger(), runOptions{NodeOperator: op, installation: installstate.NewStore(t.TempDir(), filepath.Join(t.TempDir(), "lock")), Migration: testMigrationEnv(t)})
 	require.ErrorIs(t, err, resolveErr)
 	require.Equal(t, 1, op.lifecycleCalls)
+}
+
+// testMigrationEnv keeps every mode change file in temporary directories and
+// never waits for a Node to come back.
+func testMigrationEnv(t *testing.T) *migrationEnv {
+	t.Helper()
+
+	return &migrationEnv{
+		ConfigDir:      t.TempDir(),
+		ReprovisionDir: filepath.Join(t.TempDir(), "reprovision"),
+		UnitDir:        t.TempDir(),
+		NodeReturnWait: time.Millisecond,
+		NodeReturnPoll: time.Millisecond,
+	}
 }

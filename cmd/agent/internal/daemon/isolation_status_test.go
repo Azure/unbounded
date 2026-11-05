@@ -385,17 +385,20 @@ func repaveFixture(t *testing.T, spec api.IsolationMode, version string) (*repav
 		Client:       c,
 		log:          discardLogger(),
 		machineName:  "test-machine",
+		nodeName:     "test-node",
 		nodeOperator: op,
+		env:          testMigrationEnv(t),
 	}, op, c
 }
 
 // A declared mode this agent cannot change to is refused and reported, and the
 // repave goes ahead in the current mode so a version rollout continues. A mode
-// this agent knows is refused too: it has no way to change a running node.
+// this agent knows but can reach only by a reprovision is refused too while
+// the Machine does not allow one.
 func TestReconcileRepave_RefusesAModeChangeAndRepavesInTheCurrentMode(t *testing.T) {
-	for target, wantMsg := range map[string]string{
-		"none":      "cannot change the isolation mode of a running node",
-		"container": "cannot run isolation \"container\"",
+	for target, want := range map[string]struct{ reason, msg string }{
+		"none":      {api.IsolationChangeReasonReprovisionNotAllowed, api.AnnotationAllowReprovision},
+		"container": {api.IsolationChangeReasonUnsupportedMode, "cannot run isolation \"container\""},
 	} {
 		t.Run(target, func(t *testing.T) {
 			r, op, c := repaveFixture(t, api.IsolationMode(target), "1.34.9")
@@ -413,8 +416,8 @@ func TestReconcileRepave_RefusesAModeChangeAndRepavesInTheCurrentMode(t *testing
 			require.NotNil(t, got.Status.IsolationChange)
 			assert.Equal(t, api.IsolationMode(target), got.Status.IsolationChange.TargetMode)
 			assert.Equal(t, api.IsolationChangeFailed, got.Status.IsolationChange.Phase)
-			assert.Equal(t, api.IsolationChangeReasonUnsupportedMode, got.Status.IsolationChange.Reason)
-			assert.Contains(t, got.Status.IsolationChange.Message, wantMsg)
+			assert.Equal(t, want.reason, got.Status.IsolationChange.Reason)
+			assert.Contains(t, got.Status.IsolationChange.Message, want.msg)
 			assert.False(t, got.Status.IsolationChange.LastTransitionTime.IsZero())
 		})
 	}
@@ -427,6 +430,7 @@ func TestReconcileRepave_ARefusedModeChangeAloneDoesNotRepave(t *testing.T) {
 	_, err := r.ReconcileRepave(t.Context(), "node-delete")
 	require.NoError(t, err)
 	assert.Nil(t, op.repaveConfig)
+	assert.True(t, op.restartCalled, "the Node deleted for the change must register again")
 
 	var got api.Machine
 	require.NoError(t, c.Get(t.Context(), client.ObjectKey{Name: "test-machine"}, &got))
