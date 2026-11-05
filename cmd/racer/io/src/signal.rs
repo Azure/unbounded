@@ -163,3 +163,86 @@ mod tests {
         .unwrap();
     }
 }
+
+/// Descriptor of the process stop eventfd, or -1 before [`stop_fd`].
+static STOP_FD: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(-1);
+
+/// Serializes creation of the process stop eventfd.
+static STOP_INIT: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// The process stop eventfd, created on first use and never closed.
+///
+/// Kernel reactors created after this call poll it once, so a stop request
+/// raised by a signal handler wakes every parked lane without a tick.
+pub fn stop_fd() -> Result<RawFd> {
+    use std::sync::atomic::Ordering;
+    let _init = STOP_INIT.lock().unwrap_or_else(|e| e.into_inner());
+    let fd = STOP_FD.load(Ordering::Acquire);
+    if fd >= 0 {
+        return Ok(fd);
+    }
+    // SAFETY: eventfd returns a fresh descriptor or fails.
+    let fd = unsafe { libc::eventfd(0, libc::EFD_CLOEXEC | libc::EFD_NONBLOCK) };
+    if fd < 0 {
+        return Err(Error::last_os_error());
+    }
+    STOP_FD.store(fd, Ordering::Release);
+    Ok(fd)
+}
+
+/// The process stop eventfd if [`stop_fd`] created it.
+pub(crate) fn existing_stop_fd() -> Option<RawFd> {
+    let fd = STOP_FD.load(std::sync::atomic::Ordering::Acquire);
+    (fd >= 0).then_some(fd)
+}
+
+/// Make the stop eventfd readable. Async-signal-safe: one atomic load and
+/// one `write(2)`; does nothing before [`stop_fd`].
+pub fn raise_stop() {
+    if let Some(fd) = existing_stop_fd() {
+        let value = 1u64;
+        // SAFETY: the descriptor is never closed; the value is a live u64.
+        unsafe { libc::write(fd, (&value as *const u64).cast(), 8) };
+    }
+}
+
+/// Consume a raised stop so later reactors do not wake for it.
+pub fn reset_stop() {
+    if let Some(fd) = existing_stop_fd() {
+        let mut value = 0u64;
+        // SAFETY: nonblocking read into a local u64.
+        unsafe { libc::read(fd, (&mut value as *mut u64).cast(), 8) };
+    }
+}
+
+#[cfg(test)]
+mod stop_tests {
+    use super::*;
+
+    /// A raised stop wakes a parked kernel reactor created after `stop_fd`.
+    #[test]
+    fn raised_stop_wakes_parked_reactor() {
+        stop_fd().unwrap();
+        reset_stop();
+        let reactor = match crate::Reactor::new(
+            crate::Driver::Uring,
+            crate::ring::Config::default(),
+            crate::WorkerCtx::host(),
+        ) {
+            Ok(reactor) => reactor,
+            Err(_) if std::env::var_os("RUNTIME_REQUIRE_IO_URING").is_none() => return,
+            Err(error) => panic!("{error:?}"),
+        };
+        let raiser = std::thread::spawn(|| {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            raise_stop();
+        });
+        let started = std::time::Instant::now();
+        reactor
+            .park(Some(started + std::time::Duration::from_secs(10)))
+            .unwrap();
+        assert!(started.elapsed() < std::time::Duration::from_secs(5));
+        raiser.join().unwrap();
+        reset_stop();
+    }
+}

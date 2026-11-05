@@ -291,6 +291,17 @@ impl uring_runtime::Scope for RequestScope {
         Some(&self.cancellation.inner)
     }
 
+    fn recheck_within(&self) -> Option<std::time::Duration> {
+        Some(self.deadline.0.saturating_duration_since(self.clock.now()))
+    }
+
+    fn polled_checks(&self) -> bool {
+        let state = &self.cancellation.state;
+        state.candidate_total.get().is_some()
+            || state.candidate_body.get().is_some()
+            || state.candidate_idle.get().is_some()
+    }
+
     fn op_ctx(&self) -> racer_io::OpCtx {
         racer_io::OpCtx::with_cancel(self.cancellation.inner.token())
             .deadline(racer_io::Deadline::at(self.deadline.0))

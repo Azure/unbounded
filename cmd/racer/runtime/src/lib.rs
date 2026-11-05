@@ -72,6 +72,20 @@ pub trait Scope: Clone + 'static {
         None
     }
 
+    /// Longest a checked steady-state run may park before rechecking this
+    /// scope; its cancellation wakes the run sooner. `None` means only
+    /// cancellation can fail the scope. The default polls every millisecond.
+    fn recheck_within(&self) -> Option<std::time::Duration> {
+        Some(std::time::Duration::from_millis(1))
+    }
+
+    /// Whether [`Self::check`] can fail for in-flight operations without the
+    /// [`Self::op_ctx`] cancel token or deadline firing. The reactor then
+    /// rescans such operations on a short interval while it is parked.
+    fn polled_checks(&self) -> bool {
+        true
+    }
+
     /// The reactor operation context: cancellation token and deadline.
     fn op_ctx(&self) -> racer_io::OpCtx {
         match self.cancellation() {

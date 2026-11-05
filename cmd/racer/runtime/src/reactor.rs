@@ -942,7 +942,29 @@ impl<S: Scope, Q: Budget> Reactor<S, Q> {
         if duration.is_zero() || io.is_sim() {
             return io.park(Some(io.now()));
         }
-        io.park(Some(io.now() + duration.min(MAX_WAIT)))
+        // In-flight scopes whose checks only a scan observes need a bounded
+        // park; otherwise completions, wakes, and the ring's own deadlines
+        // and timers end it.
+        let duration = if self.needs_scan() {
+            duration.min(MAX_WAIT)
+        } else {
+            duration
+        };
+        let until = [io.now().checked_add(duration), io.next_deadline()]
+            .into_iter()
+            .flatten()
+            .min();
+        io.park(until)
+    }
+
+    /// Whether some in-flight operation can fail its scope check without its
+    /// operation context's cancel token or deadline firing.
+    fn needs_scan(&self) -> bool {
+        let foreign = self.foreign_clock.get();
+        self.records
+            .borrow()
+            .iter()
+            .any(|record| record.id.get().is_some() && (foreign || record.scope.polled_checks()))
     }
 
     /// Close admission and cancel outstanding work. The worker must keep

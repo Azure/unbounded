@@ -5,13 +5,24 @@
 //! external I/O stopped referencing storage. We never detach or drop such owners.
 use crate::{Error, Operation, Result, Scope};
 use std::{
-    sync::{Arc, Condvar, Mutex, MutexGuard},
+    cell::Cell,
+    rc::Rc,
+    sync::{
+        Arc, Condvar, Mutex, MutexGuard,
+        atomic::{AtomicBool, Ordering},
+    },
     task::{Context, Poll, Waker},
     thread::{self, JoinHandle},
     time::Duration,
 };
 
+/// Poll interval of lifecycle phases (startup, drain, fences, barriers).
 const IDLE_WAIT: Duration = Duration::from_millis(1);
+
+/// Longest steady-state park. Lanes and helpers park until a wake source
+/// fires (completion, cross-thread wake, phase change, stop signal) or a
+/// service-reported deadline; this only bounds the arithmetic.
+const MAX_PARK: Duration = Duration::from_secs(3600);
 
 const WORK_BUDGET: usize = 64;
 
@@ -99,8 +110,19 @@ pub trait Service<S: Scope> {
     fn poll_budgeted(&mut self, cx: &mut Context<'_>, budget: usize) -> Result<(), S::Error>;
 
     /// Bound the next steady-state wait after polling. Due work returns zero.
+    /// Work without a wake source must report its next poll time here.
     fn wait_timeout(&self, maximum: Duration) -> Duration {
         maximum
+    }
+
+    /// Park the owning thread for at most `timeout`, returning early when the
+    /// service's waker fires. Always called after a steady-state turn, even
+    /// with a zero timeout, so a reactor can submit work queued by the turn.
+    fn park(&mut self, timeout: Duration) -> Result<(), S::Error> {
+        if !timeout.is_zero() {
+            thread::park_timeout(timeout);
+        }
+        Ok(())
     }
 
     /// Reject new work before draining accepted work.
@@ -235,6 +257,9 @@ impl<S: Scope + Send> Group<S> {
             self.plan.helpers.len(),
             caller_is_lane,
         ));
+        self.control
+            .check_scope
+            .store(check_scope, Ordering::Relaxed);
         let mut state = self.control.lock();
         state.check_scope = check_scope;
         state.helper_ready.fill(true);
@@ -379,6 +404,19 @@ struct Control<E> {
     state: Mutex<State<E>>,
 
     changed: Condvar,
+
+    /// Mirrors `State::phase != Running`, read once per lane turn without
+    /// taking the coordinator lock.
+    stopping: AtomicBool,
+
+    /// Mirrors `State::check_scope`.
+    check_scope: AtomicBool,
+
+    /// Set once any lane closed its helper submissions.
+    closing: AtomicBool,
+
+    /// Wakes of every parked lane and helper, fired on each phase change.
+    wakers: Mutex<Vec<Waker>>,
 }
 
 impl<E: Copy + PartialEq + From<Error>> Control<E> {
@@ -399,6 +437,31 @@ impl<E: Copy + PartialEq + From<Error>> Control<E> {
                 check_scope: false,
             }),
             changed: Condvar::new(),
+            stopping: AtomicBool::new(false),
+            check_scope: AtomicBool::new(false),
+            closing: AtomicBool::new(false),
+            wakers: Mutex::new(Vec::new()),
+        }
+    }
+
+    /// Wake `waker` on every later phase change, close, or fence.
+    fn subscribe(&self, waker: &Waker) {
+        self.wakers
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(waker.clone());
+    }
+
+    /// Notify condition waiters and wake every parked lane and helper.
+    fn notify(&self) {
+        self.changed.notify_all();
+        let wakers = self
+            .wakers
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        for waker in wakers {
+            waker.wake();
         }
     }
 
@@ -416,7 +479,10 @@ impl<E: Copy + PartialEq + From<Error>> Control<E> {
     fn set_phase(&self, phase: Phase) {
         let mut state = self.lock();
         state.phase = state.phase.max(phase);
-        self.changed.notify_all();
+        self.stopping
+            .store(state.phase != Phase::Running, Ordering::Release);
+        drop(state);
+        self.notify();
     }
 
     /// Retain the first error and notify all threads to begin draining.
@@ -435,19 +501,22 @@ impl<E: Copy + PartialEq + From<Error>> Control<E> {
             Some(_) => {}
         }
         state.phase = state.phase.max(Phase::Drain);
-        self.changed.notify_all();
+        self.stopping.store(true, Ordering::Release);
+        drop(state);
+        self.notify();
     }
 
     /// Announce that a lane has closed its helper submissions.
     fn close(&self, lane: usize) {
         self.lock().closed[lane] = true;
-        self.changed.notify_all();
+        self.closing.store(true, Ordering::Release);
+        self.notify();
     }
 
     /// Announce a completed lane ownership fence to its helper.
     fn fence(&self, lane: usize) {
         self.lock().fenced[lane] = true;
-        self.changed.notify_all();
+        self.notify();
     }
 
     /// Wait for a barrier while checking caller policy outside the state lock.
@@ -485,11 +554,10 @@ impl<E: Copy + PartialEq + From<Error>> Control<E> {
     where
         E: From<Error>,
     {
-        let check = self.lock().check_scope;
-        if check {
+        if self.check_scope.load(Ordering::Relaxed) {
             record(self, scope.check());
         }
-        self.lock().phase != Phase::Running
+        self.stopping.load(Ordering::Acquire)
     }
 
     /// Publish a completed drain and wait for permission to shut down.
@@ -835,16 +903,22 @@ fn drive<S: Scope>(
     }
 }
 
-/// Poll one bounded service turn and compute its post-poll idle limit.
+/// Poll one bounded service turn and compute its post-poll park limit:
+/// the service's next deadline and, when the run scope is checked, the
+/// scope's own recheck bound.
 fn poll_turn<S: Scope>(
     service: &mut dyn Service<S>,
     cx: &mut Context<'_>,
+    scope: &S,
+    check_scope: bool,
 ) -> Result<Duration, S::Error> {
-    {
-        service.register_driver(cx.waker());
-        service.poll_budgeted(cx, WORK_BUDGET)?;
-        Ok(service.wait_timeout(IDLE_WAIT).min(IDLE_WAIT))
+    service.register_driver(cx.waker());
+    service.poll_budgeted(cx, WORK_BUDGET)?;
+    let mut wait = service.wait_timeout(MAX_PARK).min(MAX_PARK);
+    if check_scope && let Some(recheck) = scope.recheck_within() {
+        wait = wait.min(recheck);
     }
+    Ok(wait)
 }
 
 /// Run a pinned lane through startup, steady-state work, and both teardown fences.
@@ -880,11 +954,13 @@ fn lane_thread<S: Scope>(
         control.fail(error);
         crate::drivers::thread_waker(None)
     });
+    control.subscribe(&waker);
     let started = drive(service.start(&startup), &startup, control, true, &waker);
     if started.is_ok() {
         control.lock().stats.ready += 1;
         control.changed.notify_all();
-        let registration = if control.lock().check_scope {
+        let check_scope = control.check_scope.load(Ordering::Relaxed);
+        let registration = if check_scope {
             subscribe_cancellation(&startup, control)
         } else {
             None
@@ -894,12 +970,10 @@ fn lane_thread<S: Scope>(
         }
         let mut cx = Context::from_waker(&waker);
         while !control.stopping(&startup) {
-            match poll_turn(&mut *service, &mut cx) {
-                Ok(wait) => {
-                    if !wait.is_zero() {
-                        thread::park_timeout(wait);
-                    }
-                }
+            match poll_turn(&mut *service, &mut cx, &startup, check_scope)
+                .and_then(|wait| service.park(wait))
+            {
+                Ok(()) => {}
                 Err(error) => {
                     control.fail(error);
                     break;
@@ -959,15 +1033,22 @@ fn helper_thread<S: Scope>(
     if let Some(registration) = &registration {
         registration.register(&waker);
     }
+    control.subscribe(&waker);
     let indices: Vec<_> = services.iter().map(|(i, _)| *i).collect();
     let mut ready = false;
+    let park = Cell::new(MAX_PARK);
     let operations = services
         .iter_mut()
-        .map(|(index, service)| helper_service(*index, service, factory, &startup, control, &waker))
+        .map(|(index, service)| {
+            helper_service(*index, service, factory, &startup, control, &waker, &park)
+        })
         .collect();
-    drive_helpers(operations, control, &waker, || {
+    drive_helpers(operations, control, &waker, Some(&park), || {
+        if ready {
+            return;
+        }
         let mut state = control.lock();
-        if !ready && !indices.is_empty() && indices.iter().all(|i| state.helper_ready[*i]) {
+        if !indices.is_empty() && indices.iter().all(|i| state.helper_ready[*i]) {
             state.stats.ready += 1;
             ready = true;
             control.changed.notify_all();
@@ -979,7 +1060,7 @@ fn helper_thread<S: Scope>(
         .iter_mut()
         .map(|(_, service)| service.shutdown_helper(teardown, control, &waker))
         .collect();
-    drive_helpers(operations, control, &waker, || {});
+    drive_helpers(operations, control, &waker, None, || {});
     for (_, service) in &mut services {
         service.release();
     }
@@ -994,8 +1075,12 @@ fn helper_service<'a, S: Scope>(
     startup: &'a S,
     control: &'a Control<S::Error>,
     waker: &'a Waker,
+    park: &'a Cell<Duration>,
 ) -> Operation<'a, (), S::Error> {
-    Box::pin(async move {
+    // Outside the steady state, lifecycle futures are polled at `IDLE_WAIT`.
+    let steady = Rc::new(Cell::new(false));
+    let phase = steady.clone();
+    let mut operation: Operation<'a, (), S::Error> = Box::pin(async move {
         let started = Box::pin(async {
             service.register_driver(waker);
             let mut operation = service.start(startup);
@@ -1015,18 +1100,22 @@ fn helper_service<'a, S: Scope>(
         } else {
             record(control, started);
         }
+        phase.set(true);
         std::future::poll_fn(|cx| {
             record(control, {
                 service.register_driver(waker);
                 service.poll_budgeted(cx, 1)
             });
-            if control.lock().closed[index] {
+            park.set(park.get().min(service.wait_timeout(MAX_PARK)));
+            // Skip the coordinator lock until some lane has closed.
+            if control.closing.load(Ordering::Acquire) && control.lock().closed[index] {
                 Poll::Ready(())
             } else {
                 Poll::Pending
             }
         })
         .await;
+        phase.set(false);
         let teardown = &factory.teardown_scope(startup);
         record(control, service.stop_admission());
         record(
@@ -1059,7 +1148,14 @@ fn helper_service<'a, S: Scope>(
         // Fence those before publishing drained, polling sibling futures fairly.
         service.fence_helper(teardown, control, waker).await?;
         Ok(())
-    })
+    });
+    Box::pin(std::future::poll_fn(move |cx| {
+        let result = operation.as_mut().poll(cx);
+        if !steady.get() {
+            park.set(park.get().min(IDLE_WAIT));
+        }
+        result
+    }))
 }
 
 /// Subscribe to caller cancellation, recording a subscription failure.
@@ -1127,19 +1223,24 @@ fn diagnose_operation<'a, S: Scope>(
     }))
 }
 
-/// Rotate helper polling fairly and retain every future through its final fence.
+/// Rotate helper polling fairly and retain every future through its final
+/// fence. After each pass the thread parks until a wake or the bound the
+/// futures reported in `park` (`IDLE_WAIT` without one).
 fn drive_helpers<E: Copy + PartialEq + From<Error>>(
     operations: Vec<Operation<'_, (), E>>,
     control: &Control<E>,
     waker: &Waker,
+    park: Option<&Cell<Duration>>,
     mut after_pass: impl FnMut(),
 ) {
     let mut operations: Vec<_> = operations.into_iter().map(Some).collect();
     let mut remaining = operations.len();
     let mut first = 0;
-    let mut passes = 0;
     let mut cx = Context::from_waker(waker);
     while remaining != 0 {
+        if let Some(park) = park {
+            park.set(MAX_PARK);
+        }
         for offset in 0..operations.len() {
             let index = (first + offset) % operations.len();
             if let Some(operation) = &mut operations[index]
@@ -1152,10 +1253,11 @@ fn drive_helpers<E: Copy + PartialEq + From<Error>>(
         }
         after_pass();
         first = (first + 1) % operations.len();
-        passes += 1;
-        if remaining != 0 && passes == WORK_BUDGET {
-            thread::park_timeout(IDLE_WAIT);
-            passes = 0;
+        if remaining != 0 {
+            let wait = park.map_or(IDLE_WAIT, Cell::get);
+            if !wait.is_zero() {
+                thread::park_timeout(wait);
+            }
         }
     }
 }
@@ -2131,7 +2233,7 @@ mod tests {
             /// Assert post-poll ordering.
             fn wait_timeout(&self, maximum: Duration) -> Duration {
                 assert!(self.polled, "wait policy must observe the completed poll");
-                assert_eq!(maximum, IDLE_WAIT);
+                assert_eq!(maximum, MAX_PARK);
                 self.wait
             }
 
@@ -2151,7 +2253,15 @@ mod tests {
                 polled: false,
                 wait,
             };
-            assert_eq!(poll_turn(&mut service, &mut cx), Ok(wait.min(IDLE_WAIT)));
+            assert_eq!(
+                poll_turn(&mut service, &mut cx, &TestScope, false),
+                Ok(wait)
+            );
+            service.polled = false;
+            assert_eq!(
+                poll_turn(&mut service, &mut cx, &TestScope, true),
+                Ok(wait.min(IDLE_WAIT))
+            );
         }
     }
 
@@ -2186,6 +2296,7 @@ mod tests {
                     vec![Box::pin(owner.fence_helper(&TestScope, &control, &waker))],
                     &control,
                     &waker,
+                    None,
                     || {},
                 );
             } else {
@@ -2198,6 +2309,7 @@ mod tests {
                     vec![owner.shutdown_helper(&TestScope, &control, &waker)],
                     &control,
                     &waker,
+                    None,
                     || {},
                 );
             } else {
@@ -2355,10 +2467,17 @@ mod tests {
                 let waker = crate::drivers::thread_waker(None);
                 drive_helpers(
                     vec![helper_service(
-                        0, &mut owner, &factory, &TestScope, &control, &waker,
+                        0,
+                        &mut owner,
+                        &factory,
+                        &TestScope,
+                        &control,
+                        &waker,
+                        &Cell::new(MAX_PARK),
                     )],
                     &control,
                     &waker,
+                    None,
                     || {},
                 );
                 // Exercise the post-shutdown helper fence as a separate pass.
@@ -2366,6 +2485,7 @@ mod tests {
                     vec![owner.shutdown_helper(&TestScope, &control, &waker)],
                     &control,
                     &waker,
+                    None,
                     || {},
                 );
             } else {
@@ -2441,6 +2561,7 @@ mod tests {
             vec![diagnose_operation(operation, &Expired, &control)],
             &control,
             &waker,
+            None,
             || {},
         );
         assert_eq!(polls.get(), 4);

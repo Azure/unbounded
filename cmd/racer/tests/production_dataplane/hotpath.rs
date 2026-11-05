@@ -298,6 +298,10 @@ impl uring_runtime::group::Service<RequestScope> for Service {
     fn poll_budgeted(&mut self, cx: &mut Context<'_>, _: usize) -> Result<()> {
         self.poll(cx)
     }
+    /// Fixture commands arrive on a std channel without a lane wake.
+    fn wait_timeout(&self, maximum: std::time::Duration) -> std::time::Duration {
+        maximum.min(std::time::Duration::from_millis(1))
+    }
     fn stop_admission(&mut self) -> Result<()> {
         Ok(())
     }

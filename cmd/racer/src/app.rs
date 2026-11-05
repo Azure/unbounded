@@ -831,9 +831,11 @@ async fn stoppable_by<T>(
 
 static STOP_REQUESTED: AtomicBool = AtomicBool::new(false);
 
-/// Record a process stop request using only a signal-safe atomic store.
+/// Record a process stop request and wake parked lanes, using only a
+/// signal-safe atomic store and an eventfd write.
 extern "C" fn request_stop(_: libc::c_int) {
     STOP_REQUESTED.store(true, Ordering::Relaxed);
+    racer_io::signal::raise_stop();
 }
 
 /// Installed handler state shared by every live [`StopSignals`] guard.
@@ -864,7 +866,9 @@ impl StopSignals {
     pub fn install() -> Result<Self> {
         let mut installed = INSTALLED.lock().map_err(|_| Error::Internal)?;
         if installed.guards == 0 {
+            racer_io::signal::stop_fd()?;
             STOP_REQUESTED.store(false, Ordering::Relaxed);
+            racer_io::signal::reset_stop();
             let mut previous = Vec::new();
             for signal in [libc::SIGINT, libc::SIGTERM] {
                 // SAFETY: initialized sigaction records and a signal-safe atomic handler.

@@ -244,6 +244,12 @@ pub trait NativeHost {
     /// Do up to `budget` steps of work.
     fn poll_budgeted(&mut self, budget: usize) -> Result<()>;
 
+    /// Longest the host may park before polling again: work without a wake
+    /// source (completion queues without a channel, timers) reports a bound.
+    fn wait_timeout(&self, maximum: std::time::Duration) -> std::time::Duration {
+        maximum
+    }
+
     /// Start shutdown. Does not wait.
     fn close(&self);
 
@@ -349,9 +355,9 @@ where
         self.native.poll_budgeted(budget).map_err(Into::into)
     }
 
-    /// Pass through to the inner service.
+    /// The earlier of the inner service's and the native side's bounds.
     fn wait_timeout(&self, maximum: std::time::Duration) -> std::time::Duration {
-        self.inner.wait_timeout(maximum)
+        self.native.wait_timeout(self.inner.wait_timeout(maximum))
     }
 
     /// Stop the inner service only. Native work keeps going.

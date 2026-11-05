@@ -57,6 +57,9 @@ const CANCEL_BIT: u64 = 1 << 63;
 /// `user_data` of the multishot poll on the lane eventfd.
 const WAKE_TAG: u64 = u64::MAX;
 
+/// `user_data` of the one-shot poll on the process stop eventfd.
+const STOP_TAG: u64 = u64::MAX - 1;
+
 /// Zero-progress `EINTR`/`EAGAIN` retries per data operation.
 const DATA_RETRIES: u8 = 8;
 
@@ -627,7 +630,26 @@ impl Reactor {
             })),
         }));
         reactor.arm_wake()?;
+        reactor.arm_stop()?;
         Ok(reactor)
+    }
+
+    /// Poll the process stop eventfd once, so a raised stop wakes this lane.
+    /// One-shot: a lane that observed the stop never needs another wake.
+    fn arm_stop(&self) -> Result<()> {
+        let Some(fd) = crate::signal::existing_stop_fd() else {
+            return Ok(());
+        };
+        let op = Op::Poll {
+            fd,
+            mask: libc::POLLIN as u32,
+            multi: false,
+        };
+        if let Backend::Uring(ring) = &mut self.state().backend {
+            ring.push(STOP_TAG, &op, false)
+                .map_err(|_| Error::Overloaded)?;
+        }
+        Ok(())
     }
 
     /// This reactor's worker context.
@@ -935,6 +957,9 @@ impl Reactor {
                 break;
             };
             completed += 1;
+            if user_data == STOP_TAG {
+                continue;
+            }
             if user_data == WAKE_TAG {
                 self.0.wake.drain();
                 self.0.wake.clear();

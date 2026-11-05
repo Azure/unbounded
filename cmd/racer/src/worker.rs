@@ -38,7 +38,6 @@ use std::sync::Mutex;
 use std::task::Context;
 use std::task::Poll;
 use std::task::Waker;
-use std::thread;
 use std::time::Duration;
 #[cfg(test)]
 use std::time::Instant;
@@ -759,18 +758,23 @@ impl Service<RequestScope> for IoService {
         if let Ok(service) = &mut self.built {
             service.poll_budgeted(cx, budget)?;
         }
-        // Even a zero wait submits SQEs queued during the service turn.
-        self.runtime
-            .reactor
-            .wait(self.wait_timeout(IDLE_WAIT))
-            .inspect_err(|error| log_fatal("io-reactor-wait", *error))?;
-        thread::current().unpark();
+        uring_runtime::drivers::fire_alarms(uring_runtime::environment::now());
         Ok(())
     }
     fn wait_timeout(&self, maximum: Duration) -> Duration {
+        let maximum = uring_runtime::drivers::next_alarm().map_or(maximum, |at| {
+            maximum.min(at.saturating_duration_since(uring_runtime::environment::now()))
+        });
         self.built.as_ref().map_or(maximum, |service| {
             service.wait_timeout(maximum).min(maximum)
         })
+    }
+    fn park(&mut self, timeout: Duration) -> Result<()> {
+        // Even a zero wait submits SQEs queued during the service turn.
+        self.runtime
+            .reactor
+            .wait(timeout)
+            .inspect_err(|error| log_fatal("io-reactor-wait", *error))
     }
     fn stop_admission(&mut self) -> Result<()> {
         self.runtime.admission.stop();
@@ -846,6 +850,7 @@ fn colocated_plan(max_threads: usize, workers: u16) -> AffinityPlan {
 mod tests {
     use super::*;
     use racer_control_wire::CacheId;
+    use std::thread;
 
     #[test]
     fn exact_twenty_endpoint_pairs_close_independently() {
@@ -994,8 +999,9 @@ mod tests {
             .poll_budgeted(&mut Context::from_waker(Waker::noop()), 1)
             .unwrap();
         assert!(polled.get());
-        assert_eq!(observed.get(), 2, "the reactor wait queries after polling");
+        assert_eq!(observed.get(), 1, "polling does not wait");
         assert_eq!(service.wait_timeout(IDLE_WAIT), Duration::ZERO);
+        assert_eq!(observed.get(), 2);
         service.built = Err(Error::Unavailable);
         assert_eq!(service.wait_timeout(IDLE_WAIT), IDLE_WAIT);
     }
@@ -2079,9 +2085,16 @@ mod tests {
             }
             // While both shards remain active, every pass grants each a single page and
             // reverses its starting order on the next pass, even with saturated queues.
+            // Passes after one shard leaves the steady state are excluded.
             let polls = observed.polls.lock().unwrap();
-            assert!(polls.len() >= 8);
-            assert_eq!(&polls[..8], &[0, 1, 1, 0, 0, 1, 1, 0]);
+            let pairs: Vec<_> = polls
+                .chunks_exact(2)
+                .take_while(|pair| pair[0] != pair[1])
+                .collect();
+            assert!(pairs.len() >= 2, "{polls:?}");
+            for (pass, pair) in pairs.iter().enumerate() {
+                assert_eq!(pair[0], (pass % 2) as u16, "{polls:?}");
+            }
         }
 
         #[test]
@@ -2497,6 +2510,10 @@ mod tests {
                     .crypto_polls
                     .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                 Ok(())
+            }
+            /// The I/O drain observes helper polls, so ask to be polled.
+            fn wait_timeout(&self, maximum: Duration) -> Duration {
+                maximum.min(IDLE_WAIT)
             }
             fn drain<'a>(&'a mut self, _: &'a RequestScope) -> Operation<'a, ()> {
                 Box::pin(async move {

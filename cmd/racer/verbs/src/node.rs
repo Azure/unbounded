@@ -1458,6 +1458,16 @@ impl crate::NativeHost for Owner {
         Owner::poll_budgeted(self, budget)
     }
 
+    /// Devices poll completion queues and timers; an idle owner without
+    /// devices waits for commands alone.
+    fn wait_timeout(&self, maximum: std::time::Duration) -> std::time::Duration {
+        if self.devices.is_empty() && !self.closing {
+            maximum
+        } else {
+            maximum.min(std::time::Duration::from_millis(1))
+        }
+    }
+
     fn close(&self) {
         Owner::close(self);
     }

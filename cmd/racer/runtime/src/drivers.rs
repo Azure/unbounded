@@ -543,6 +543,52 @@ where
     retry_listener_with(scope, RetryOptions::default(), submit)
 }
 
+thread_local! {
+    /// Wakes owed at an instant on this thread, for waits without a reactor.
+    static ALARMS: std::cell::RefCell<Vec<(std::time::Instant, Waker)>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Wake `waker` once the owning thread's driver reaches `at`. The driver
+/// fires due alarms with [`fire_alarms`] and parks no later than the next.
+pub fn alarm(at: std::time::Instant, waker: &Waker) {
+    ALARMS.with(|alarms| {
+        let mut alarms = alarms.borrow_mut();
+        if !alarms
+            .iter()
+            .any(|(due, owner)| *due == at && owner.will_wake(waker))
+        {
+            alarms.push((at, waker.clone()));
+        }
+    });
+}
+
+/// Wake every alarm due at `now`; return the earliest one still pending.
+pub fn fire_alarms(now: std::time::Instant) -> Option<std::time::Instant> {
+    let due: Vec<Waker> = ALARMS.with(|alarms| {
+        let mut alarms = alarms.borrow_mut();
+        let mut due = Vec::new();
+        alarms.retain(|(at, waker)| {
+            if *at <= now {
+                due.push(waker.clone());
+                false
+            } else {
+                true
+            }
+        });
+        due
+    });
+    for waker in due {
+        waker.wake();
+    }
+    next_alarm()
+}
+
+/// The earliest pending alarm on this thread.
+pub fn next_alarm() -> Option<std::time::Instant> {
+    ALARMS.with(|alarms| alarms.borrow().iter().map(|(at, _)| *at).min())
+}
+
 /// Retry overload using caller-selected limits without allocating a backend timer.
 fn retry_listener_with<'a, S: Scope, T: 'a>(
     scope: &'a S,
@@ -567,6 +613,7 @@ where
                     cancellation.register(cx.waker());
                 }
                 if environment::now() < retry_at {
+                    alarm(retry_at, cx.waker());
                     return Poll::Pending;
                 }
                 operation = Some(submit());
@@ -581,6 +628,7 @@ where
                     retry_at = environment::now()
                         .checked_add(options.interval)
                         .ok_or(Error::InvalidInput)?;
+                    alarm(retry_at, cx.waker());
                     Poll::Pending
                 }
                 result => result,
