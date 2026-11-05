@@ -2118,6 +2118,70 @@ mod tests {
             priority: racer_core::prefetch::Priority::High,
         }
     }
+    /// The largest request proof (8 KiB metadata, 8 KiB plus tag of sealed
+    /// authorization, and a 256-page prefetch list) fits `MAX_SIGNED_HEAD`, and
+    /// nine such proofs with the most chains one message can attach and the outer
+    /// session fields fit `MAX_ENVELOPE_HEAD`.
+    #[test]
+    fn maximum_request_proof_and_nine_proof_envelope_fit_their_limits() {
+        use crate::peer::protocol::{MAX_ENVELOPE_HEAD, MAX_SIGNED_HEAD, encode_envelope};
+        let signatures = network(2);
+        let forwarding = Forwarding::new(signatures[0].clone());
+        let mut request = prefetch_request(
+            31,
+            crate::peer::protocol::PrefetchAction::Fill {
+                pages: (0..racer_core::prefetch::MAX_OPERATION_PAGES as u64).collect(),
+                length: racer_core::prefetch::MAX_OPERATION_PAGES as u64 * PAGE_BYTES,
+                content_type: Some(
+                    crate::model::ContentType::parse(b"application/octet-stream").unwrap(),
+                ),
+                priority: racer_core::prefetch::Priority::High,
+            },
+        );
+        request.origin.metadata = Some(OpaqueMetadata::from_header(&[b'm'; 8192]).unwrap());
+        request.origin.authorization = Some(EncryptedAuthorization {
+            key_id: KeyId([3; 16]),
+            nonce: Nonce([4; 24]),
+            ciphertext: vec![0xff; 8192 + 16],
+        });
+        let (signed, _) = forwarding.sign_request(request).unwrap();
+        let codec = crate::http::Codec::new(MAX_ENVELOPE_HEAD);
+        let proof = codec
+            .encode_head(&signed.authentication.original.head)
+            .unwrap()
+            .len();
+        assert!(
+            proof > 22 * 1024,
+            "fixture reaches the documented size: {proof}"
+        );
+        assert!(proof <= MAX_SIGNED_HEAD, "{proof} > {MAX_SIGNED_HEAD}");
+
+        let original = &signed.authentication.original;
+        let auth = ForwardedHead {
+            original: original.clone(),
+            hops: (0..protocol::MAX_HOPS)
+                .map(|_| crate::test_support::security::clone_head(original))
+                .collect(),
+        };
+        let mut head = encode_envelope(&auth, false, 0).unwrap();
+        head.headers
+            .retain(|h| !h.name.eq_ignore_ascii_case("racer-proof-signers"));
+        push(&mut head, "racer-receiver", &node(1).0);
+        push(&mut head, "racer-session", protocol::binary(&[0; 32]));
+        push(&mut head, "racer-direction", 0);
+        push(&mut head, "racer-sequence", u64::MAX);
+        push(
+            &mut head,
+            "racer-chains",
+            "A".repeat(peer_wire::MAX_CHAINS_FIELD),
+        );
+        let outer = signatures[0].sign_fields(head).unwrap().head;
+        let envelope = codec.encode_head(&outer).unwrap().len();
+        assert!(
+            envelope <= MAX_ENVELOPE_HEAD,
+            "{envelope} > {MAX_ENVELOPE_HEAD}"
+        );
+    }
     #[test]
     fn prefetch_actions_round_trip_and_bind_their_results() {
         use crate::peer::protocol::PrefetchAction;
