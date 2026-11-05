@@ -16,7 +16,7 @@
 //! are outside the pipe capacity budget. [`pipe::PipePool::simulated`] creates
 //! pipes in a simulated world without changing admission policy.
 //!
-//! [`coalesce`] provides worker-local keyed cohorts, shared results, and flight
+//! [`coalesce`] provides worker-local shared results and flight
 //! lifecycle tracking. Callers retain execution, admission, and result policy;
 //! cancellation never substitutes for real operation completion.
 #![deny(unsafe_op_in_unsafe_fn)]
