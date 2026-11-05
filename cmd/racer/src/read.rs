@@ -17,8 +17,8 @@ use crate::model::ByteRange;
 use crate::model::MetadataSelector;
 use crate::model::ObjectId;
 use crate::model::ObjectMetadata;
-use crate::model::PAGE_BYTES;
 use crate::model::ResolvedRange;
+use crate::model::{PAGE_BYTES, PageSize};
 use crate::peer::forwarding::VerifiedRequest;
 use crate::peer::protocol::FetchMode;
 use crate::peer::protocol::Operation as PeerOperation;
@@ -419,8 +419,11 @@ impl Coordinator {
                             payload: ReadPayload::Empty,
                         });
                     }
-                    let range =
-                        resolve_range(range.unwrap_or(ByteRange::From(0)), metadata.length)?;
+                    let range = resolve_range(
+                        range.unwrap_or(ByteRange::From(0)),
+                        metadata.length,
+                        snapshot.page_size,
+                    )?;
                     let passthrough = self.fill.passthrough(&origin.object.cache);
                     let mut body = self.streams.open(
                         metadata.clone(),
@@ -855,9 +858,9 @@ fn validate_metadata(
 }
 
 /// Preserve the object's length when translating an unsatisfiable client range.
-fn resolve_range(range: ByteRange, length: u64) -> Result<ResolvedRange> {
+fn resolve_range(range: ByteRange, length: u64, page: PageSize) -> Result<ResolvedRange> {
     range
-        .resolve(length)
+        .resolve_paged(length, page)
         .map_err(|error| match Error::from(error) {
             Error::UnsatisfiableRange => Error::UnsatisfiableRangeWithLength(length),
             other => other,

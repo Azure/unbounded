@@ -701,10 +701,14 @@ impl RangeStream {
         if self.lease.is_some() {
             return Err(Error::InvalidRequest);
         }
-        if !(1..=64).contains(&pages) || !(PAGE_BYTES..=64 * PAGE_BYTES).contains(&bytes) {
+        // Credits cover at least one page of the cluster page size. The ceiling
+        // stays at the largest page size so a client sized for 16 MiB pages is
+        // still accepted; byte credits only bound, never size, a delivery.
+        let size = self.range.page_size().get();
+        if !(1..=64).contains(&pages) || !(size..=64 * PAGE_BYTES).contains(&bytes) {
             return Err(Error::InvalidRequest);
         }
-        let credits = Window::new(pages, bytes, PAGE_BYTES).map_err(window_error)?;
+        let credits = Window::new(pages, bytes, size).map_err(window_error)?;
         let lease = self
             .directory
             .subscriptions
@@ -1802,6 +1806,7 @@ pub(super) mod tests {
                 inner: Arc::new(CiphertextBytes {
                     pins: Default::default(),
                     envelope: PageEnvelope {
+                        page_size: racer_wire::object::PageSize::DEFAULT,
                         cipher: crate::model::PageCipher::Xaes256Gcm,
                         page,
                         key_id: crate::model::key_id_from_generation(1, 1).unwrap(),
@@ -3500,6 +3505,26 @@ pub(super) mod tests {
                     Err(Error::InvalidRequest)
                 );
             }
+        }
+        #[test]
+        fn small_page_credits_are_bounded_by_the_range_page_size() {
+            let f = super::Fixture::new(crate::test_support::cluster::config(false).limits, 1);
+            let size = racer_wire::object::PageSize::new(64 << 10).unwrap();
+            let metadata = super::metadata();
+            let range = crate::model::ByteRange::From(0)
+                .resolve_paged(1, size)
+                .unwrap();
+            // One small page of credit is enough; less is not.
+            let mut reader = stream(&f, &metadata, range);
+            assert_eq!(
+                reader.configure_subscription(1, size.get() - 1),
+                Err(Error::InvalidRequest)
+            );
+            reader.configure_subscription(1, size.get()).unwrap();
+            drop(reader);
+            // Credits sized for the largest page stay accepted.
+            let mut reader = stream(&f, &metadata, range);
+            reader.configure_subscription(4, 4 * PAGE_BYTES).unwrap();
         }
         #[test]
         fn invalid_credit_contracts_never_admit_demand() {
