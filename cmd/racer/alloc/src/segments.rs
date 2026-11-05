@@ -1821,6 +1821,26 @@ mod phantom_tests {
     use super::*;
 
     /// Build a table where every slot is sealed.
+    #[test]
+    fn seal_open_seals_only_the_open_tail() {
+        let segments = Segments::new(1024);
+        segments
+            .configure(2048, 2, Alignment::new(512, 512, 512).unwrap())
+            .unwrap();
+        assert!(!segments.seal_open(), "nothing open yet");
+        let (lease, _) = segments.append(512).unwrap();
+        let id = lease.id();
+        drop(lease);
+        assert_eq!(segments.state(id).unwrap(), SegmentState::Open);
+        assert!(segments.seal_open());
+        assert_eq!(segments.state(id).unwrap(), SegmentState::Sealed);
+        assert!(!segments.seal_open(), "already sealed");
+        // The next append opens a fresh slot instead of the sealed tail.
+        let (lease, _) = segments.append(512).unwrap();
+        assert_ne!(lease.id(), id);
+        assert_eq!(segments.free_count(), 0);
+    }
+
     fn sealed(count: usize) -> Rc<Segments> {
         let segments = Segments::new(512);
         segments

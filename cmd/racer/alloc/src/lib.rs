@@ -136,7 +136,11 @@
 //! blocked. Use [`Segments::free_count`] to check capacity and retry bounded
 //! reclamation when more free slots are needed rather than spinning.
 //! A zero reserve is a no-op, not a drain request; a zero entry budget
-//! can recycle empty slots but cannot begin populated eviction. There is no
+//! can recycle empty slots but cannot begin populated eviction. Scored
+//! reclamation is the only eviction: there is no per-page victim selection and
+//! no second-chance read mark. To free index entries rather than space, ask for
+//! one more free slot than is free or evicting; [`Segments::seal_open`] makes
+//! the open tail eligible when it holds every reclaimable record. There is no
 //! compaction. [`SegmentEntries`] implementations
 //! must compare current mappings before removal and report within budget; an
 //! error cannot undo callback side effects. Freeze does not block index sweeps.

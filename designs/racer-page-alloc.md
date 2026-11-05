@@ -10,9 +10,12 @@
    or devices, with leases that stop reuse while I/O still points at a segment.
 3. Async read and write of that storage through the `uring-runtime` reactor.
 
-The crate stores bytes only. It does not know about page keys, record headers,
-encryption, checksums, or versions. The caller owns the page index and
-tells the crate how to remove entries when a segment is evicted.
+The crate stores bytes and payload-agnostic index state. It does not know
+record headers, encryption, checksums, or object versions. Pages are known only
+as caller-interned `PageSlot` numbers in `disk_index::DiskIndex`; the caller
+maps its page identities to slots and owns every per-page payload field. Until
+`DiskIndex` is wired into the store, the store's catalog owns the page index
+and tells the crate how to remove entries when a segment is evicted.
 
 ## Goals and non-goals
 
@@ -153,17 +156,24 @@ table keeps the image generations, so recovered mappings stay valid.
 
 ## Reclaim
 
-`SegmentClock::reclaim` in `alloc/src/segments.rs` is a bounded clock
-(second-chance) sweep over sealed segments. The caller calls `mark_read` when it
-serves a read from a segment. The sweep clears that mark once before it picks the
-segment. Each call has limits on the number of segments it visits and the number
-of index entries it removes.
-For a nonzero reserve, `reclaim` and `reclaim_scored` succeed only when the reserve
-(capped at the slot count) is met and no evictions remain. They intentionally
-return `Busy` while evictions remain, even if enough slots are already free.
-Callers should use `Segments::free_count` to check capacity and keep retrying
-bounded reclamation later to drain pending evictions. A zero reserve is a no-op,
-not a drain request.
+`SegmentClock::reclaim_scored` in `alloc/src/segments.rs` is the only
+reclaim. It visits at most `min(slot count, max_visits, 64)` slots from a shared
+cursor, ranks eligible Sealed and Evicting slots (Evicting first, then the
+lowest caller score), and removes at most `max_entries` index entries per call.
+There is no second-chance read mark; the caller's score carries heat and cache
+priority (over-share caches score lower, so they lose space first).
+For a nonzero reserve, the call returns early with success only when the reserve
+(capped at the slot count) is met and no evictions remain. After a sweep it
+succeeds whenever the reserve is met, even with evictions still draining, and
+returns `Busy` otherwise. Success is not a drain guarantee: callers use
+`Segments::free_count` to check capacity and retry bounded reclamation later.
+A zero reserve is a no-op, not a drain request.
+
+The store also reclaims when its page index is full rather than when slab
+space is low: it asks for one more free segment than is currently free or
+evicting, so the lowest-scored whole segment goes. If every reclaimable record
+is in the open segment, `Segments::seal_open` seals it first. There is no
+per-page eviction.
 
 Evicting a segment happens in this order:
 
