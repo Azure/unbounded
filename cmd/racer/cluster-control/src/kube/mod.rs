@@ -6,9 +6,9 @@
 //! `410 Gone` as [`KubeError::Gone`] so callers relist.
 
 use crate::{
-    exec::{self, Slots, Tcp},
     http::{self, Conn, TlsStream},
     limits,
+    rt::{self, Slots, Tcp},
 };
 use rustls::pki_types::{CertificateDer, ServerName};
 use serde_json::Value;
@@ -199,7 +199,7 @@ impl Kube {
         limit: usize,
     ) -> Result<(u16, Vec<u8>), KubeError> {
         let _slot = self.slots.try_acquire().ok_or(KubeError::Unavailable)?;
-        exec::timeout(
+        rt::timeout(
             limits::API_TIMEOUT,
             self.call_inner(method, path, content_type, body, limit),
         )
@@ -398,7 +398,7 @@ impl Kube {
             &[("Authorization", &bearer), ("Accept", "application/json")],
             &[],
         ));
-        exec::timeout(limits::API_TIMEOUT, async {
+        rt::timeout(limits::API_TIMEOUT, async {
             let mut conn = self.connect(tls).await?;
             conn.tls
                 .write_all(&request)
@@ -459,7 +459,7 @@ impl Watch {
             if self.done {
                 return Ok(None);
             }
-            let chunk = exec::deadline(self.deadline, async {
+            let chunk = rt::deadline(self.deadline, async {
                 if self.chunked {
                     self.conn.read_chunk(limits::MAX_WATCH_EVENT).await
                 } else {
@@ -722,8 +722,8 @@ mod tests {
             assert!(!rv.is_empty());
             let mut w = kube.watch("/api/v1/nodes", "", &rv).await.unwrap();
             let k2 = server.clone();
-            exec::spawn(async move {
-                exec::sleep(Duration::from_millis(10)).await;
+            rt::spawn(async move {
+                rt::sleep(Duration::from_millis(10)).await;
                 k2.put_object(
                     "/api/v1/nodes/c",
                     serde_json::json!({"metadata":{"name":"c"}}),

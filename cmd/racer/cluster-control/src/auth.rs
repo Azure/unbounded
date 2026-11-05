@@ -223,7 +223,7 @@ pub async fn authorize(
         .reserve(calls, Instant::now(), limits::AUTH_BUDGET_WAIT)
         .ok_or(ProtocolFailure::Overloaded)?;
     if !wait.is_zero() {
-        crate::exec::sleep(wait).await;
+        crate::rt::sleep(wait).await;
     }
     let user = reviewed(shared, token, &key, expires, now).await?;
     let refuse = |bindings: bool| {

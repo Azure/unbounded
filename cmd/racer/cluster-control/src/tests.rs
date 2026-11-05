@@ -3,9 +3,9 @@
 use crate::{
     Config, SeatPolicy, annotations,
     config::Rotation,
-    exec::{self, Executor, Tcp},
     http::{self, Conn, TlsStream},
     kube::{Kube, KubeConfig, fake, str_at},
+    rt::{self, Executor, Tcp},
 };
 use base64::{
     Engine,
@@ -142,7 +142,7 @@ impl FakeCluster {
                 api.count_into(r);
                 tx.send(fake::serve(api, &d.join("api"))).unwrap();
                 while !s.load(Ordering::SeqCst) {
-                    exec::sleep(Duration::from_millis(50)).await;
+                    rt::sleep(Duration::from_millis(50)).await;
                 }
             });
         });

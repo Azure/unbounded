@@ -8,11 +8,11 @@
 use crate::rules::seat::{self as rules, Lottery, SeatRenew};
 use crate::{
     DiscoveredEndpoint, DiscoveredEndpoints, Error, annotations,
-    exec::{self, Tcp},
     http::{self, Conn, TlsStream},
     kube::{KubeError, escape, paths, str_at},
     lease, limits,
     pki::{self, SeatIssuer, ServingIdentity},
+    rt::{self, Tcp},
     rules::{
         election::{self, LeaseObservation},
         publication::{self, Image},
@@ -165,7 +165,7 @@ pub async fn discovery(
                 }
                 Err(_) => {
                     failures = (failures + 1).min(6);
-                    exec::sleep(
+                    rt::sleep(
                         Duration::from_secs(1 << failures)
                             + jitter(&shared, failures, Duration::from_secs(5)),
                     )
@@ -176,7 +176,7 @@ pub async fn discovery(
         }
         let Ok(mut watch) = shared.api.watch(&paths::leases(&ns), &query, &rv).await else {
             rv.clear();
-            exec::sleep(Duration::from_secs(2) + jitter(&shared, 7, Duration::from_secs(5))).await;
+            rt::sleep(Duration::from_secs(2) + jitter(&shared, 7, Duration::from_secs(5))).await;
             continue;
         };
         loop {
@@ -377,11 +377,11 @@ pub async fn lottery(shared: Rc<Shared>, primary_changed: Rc<RefCell<(String, Op
         );
         let index = match plan {
             rules::Plan::Idle(d) | rules::Plan::NoVacancy(d) => {
-                exec::sleep(d).await;
+                rt::sleep(d).await;
                 continue;
             }
             rules::Plan::Attempt { delay, index } => {
-                exec::sleep(delay).await;
+                rt::sleep(delay).await;
                 index
             }
         };
@@ -422,9 +422,9 @@ pub async fn lottery(shared: Rc<Shared>, primary_changed: Rc<RefCell<(String, Op
                 shared.changed.notify();
                 lottery.won();
                 let s = shared.clone();
-                let _ = exec::spawn(seat_task(s.clone(), seat.clone(), v));
-                let _ = exec::spawn(follower(s.clone(), seat.clone()));
-                let _ = exec::spawn(crate::primary::contend(s, seat));
+                let _ = rt::spawn(seat_task(s.clone(), seat.clone(), v));
+                let _ = rt::spawn(follower(s.clone(), seat.clone()));
+                let _ = rt::spawn(crate::primary::contend(s, seat));
             }
             Err(_) => continue,
         }
@@ -506,7 +506,7 @@ pub async fn seat_task(shared: Rc<Shared>, seat: Rc<Seat>, mut object: serde_jso
     let mut schedule = SeatRenew::new(Instant::now());
     loop {
         let generation = shared.changed.generation();
-        let _ = exec::deadline(schedule.next, shared.changed.changed(generation)).await;
+        let _ = rt::deadline(schedule.next, shared.changed.changed(generation)).await;
         if !seat_still_mine(&shared, &seat) {
             return;
         }
@@ -532,7 +532,7 @@ pub async fn seat_task(shared: Rc<Shared>, seat: Rc<Seat>, mut object: serde_jso
                 // Held across the clear so shutdown waits for the PUT.
                 let _releasing = shared.releasing();
                 shared.lose_seat();
-                let _ = exec::timeout(
+                let _ = rt::timeout(
                     limits::API_TIMEOUT,
                     lease::put(&shared.lease_api, &ns, &lease::with(&object, &spec, &a)),
                 )
@@ -547,7 +547,7 @@ pub async fn seat_task(shared: Rc<Shared>, seat: Rc<Seat>, mut object: serde_jso
         let body = lease::with(&object, &spec, &my_seat_annotations(&shared, &seat));
         let started = Instant::now();
         schedule.put_started(started);
-        match exec::timeout(
+        match rt::timeout(
             limits::LEASE_RENEW,
             lease::put(&shared.lease_api, &ns, &body),
         )
@@ -606,7 +606,7 @@ pub async fn follower(shared: Rc<Shared>, seat: Rc<Seat>) {
         let lease = shared.primary_lease.generation();
         let _ = follow_once(&shared, started).await;
         let generation = shared.changed.generation();
-        let _ = exec::timeout(
+        let _ = rt::timeout(
             crate::limits::FOLLOW_INTERVAL,
             futures::future::select(
                 std::pin::pin!(shared.primary_lease.changed(lease)),
@@ -615,7 +615,7 @@ pub async fn follower(shared: Rc<Shared>, seat: Rc<Seat>) {
         )
         .await;
         // Wake on every change, but read at most every second.
-        exec::sleep_until(started + Duration::from_secs(1)).await;
+        rt::sleep_until(started + Duration::from_secs(1)).await;
     }
 }
 
@@ -759,7 +759,7 @@ async fn fetch_image(shared: &Shared) -> Result<(), Error> {
         std::fs::read_to_string(&shared.config.control_token).map_err(|_| Error::Unavailable)?;
     let token = zeroize::Zeroizing::new(token.trim().to_owned());
     let tls = server::pinned_client(&cert)?;
-    let body = exec::timeout(Duration::from_secs(60), async {
+    let body = rt::timeout(Duration::from_secs(60), async {
         let tcp = Tcp::connect(address)
             .await
             .map_err(|_| Error::Unavailable)?;
@@ -1180,7 +1180,7 @@ mod tests {
             api.delay_gets(delay);
             let read = follow_once(&shared, Instant::now());
             let commit = async {
-                exec::sleep(Duration::from_millis(100)).await;
+                rt::sleep(Duration::from_millis(100)).await;
                 // `primary.rs` `reconcile`: write, then install.
                 put(&record(5));
                 install_record(&shared, record(5), Instant::now()).unwrap();
@@ -1224,9 +1224,9 @@ mod tests {
             let seat = Rc::new(new_seat(&shared, 0).unwrap());
             *shared.seat.borrow_mut() = Some(seat.clone());
             let started = Instant::now();
-            exec::spawn(follower(shared.clone(), seat)).unwrap();
+            rt::spawn(follower(shared.clone(), seat)).unwrap();
             // The first read is in flight and answers sequence 4.
-            exec::sleep(Duration::from_millis(100)).await;
+            rt::sleep(Duration::from_millis(100)).await;
             put(&record(5));
             let endpoints: DiscoveredEndpoints = Default::default();
             let changed = RefCell::new((String::new(), None));
@@ -1239,14 +1239,14 @@ mod tests {
                 .insert(annotations::SEQUENCE.into(), "5".into());
             apply_primary(&shared, &lease, &endpoints, &changed);
             let sequence = || shared.serving.borrow().record.as_ref().map(|r| r.sequence);
-            exec::sleep_until(started + Duration::from_millis(600)).await;
+            rt::sleep_until(started + Duration::from_millis(600)).await;
             assert_eq!(
                 sequence(),
                 Some(4),
                 "the in-flight read predates the change"
             );
             // Next read at the 1 s floor, answered 400 ms later.
-            exec::sleep_until(started + Duration::from_millis(2_500)).await;
+            rt::sleep_until(started + Duration::from_millis(2_500)).await;
             assert_eq!(sequence(), Some(5), "woken by the change during the read");
             shared.stopping.set(true);
             shared.changed.notify();

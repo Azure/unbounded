@@ -908,6 +908,7 @@ dependencies = [
  "racer-control-wire",
  "racer-core",
  "racer-crypto",
+ "racer-io",
  "rcgen",
  "regex",
  "rustls",

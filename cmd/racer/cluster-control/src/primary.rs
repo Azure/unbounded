@@ -10,9 +10,9 @@
 use crate::rules::primary::{Contend, Inventory, PassInputs, PassPlan, discovery, plan_pass};
 use crate::{
     annotations,
-    exec::{self, Signal},
     kube::{KubeError, paths, str_at},
     lease, limits,
+    rt::{self, Signal},
     rules::{
         catalog::CacheInfo,
         election::{self, LeaseObservation, Observer},
@@ -82,7 +82,7 @@ pub async fn contend(shared: Rc<Shared>, seat: Rc<Seat>) {
             }
         }
         let wait = Contend::wait(&mut **shared.rng.borrow_mut());
-        exec::sleep(wait).await;
+        rt::sleep(wait).await;
     }
 }
 
@@ -180,18 +180,18 @@ async fn lead(shared: &Rc<Shared>, seat: &Rc<Seat>, object: Value, started: Inst
     let _releasing = shared.releasing();
     shared.is_primary.set(true);
     shared.changed.notify();
-    let _ = exec::spawn(renew(t.clone()));
+    let _ = rt::spawn(renew(t.clone()));
     for kind in [Kind::Nodes, Kind::Pods, Kind::Caches] {
-        let _ = exec::spawn(watch(t.clone(), kind));
+        let _ = rt::spawn(watch(t.clone(), kind));
     }
     let mut next = Instant::now();
     while t.alive.get() && seat_mine(shared, seat) && !shared.stopping.get() {
         let generation = t.changed.generation();
-        let _ = exec::deadline(next, wake(shared, seat, &t.changed, generation)).await;
+        let _ = rt::deadline(next, wake(shared, seat, &t.changed, generation)).await;
         if shared.stopping.get() || !seat_mine(shared, seat) {
             break;
         }
-        exec::sleep(DEBOUNCE).await;
+        rt::sleep(DEBOUNCE).await;
         if !t.alive.get() {
             break;
         }
@@ -221,7 +221,7 @@ async fn lead(shared: &Rc<Shared>, seat: &Rc<Seat>, object: Value, started: Inst
             .into_keys()
             .map(|k| (k, None))
             .collect();
-        let _ = exec::timeout(
+        let _ = rt::timeout(
             limits::API_TIMEOUT,
             lease::put(
                 &shared.lease_api,
@@ -265,7 +265,7 @@ async fn renew(t: Rc<Term_>) {
             &spec,
             &primary_annotations(&t.shared, &t.seat, &t.extra.borrow()),
         );
-        match exec::timeout(
+        match rt::timeout(
             limits::LEASE_RENEW,
             lease::put(&t.shared.lease_api, &ns, &body),
         )
@@ -301,7 +301,7 @@ async fn renew(t: Rc<Term_>) {
             return;
         }
         // Renew on schedule, or early to publish changed discovery.
-        let _ = exec::deadline(Shell::next_renewal(started), t.publish.changed(publish)).await;
+        let _ = rt::deadline(Shell::next_renewal(started), t.publish.changed(publish)).await;
     }
 }
 
@@ -393,11 +393,11 @@ async fn watch(t: Rc<Term_>, kind: Kind) {
                     inv.caches_synced = true;
                 }
                 t.changed.notify();
-                exec::sleep(RESYNC).await;
+                rt::sleep(RESYNC).await;
                 continue;
             }
             Err(_) => {
-                exec::sleep(Duration::from_secs(backoff)).await;
+                rt::sleep(Duration::from_secs(backoff)).await;
                 backoff = (backoff * 2).min(30);
                 continue;
             }

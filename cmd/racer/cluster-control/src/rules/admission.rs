@@ -22,7 +22,7 @@ pub enum Admit {
 }
 
 /// A counting gate with a bounded FIFO of waiters, the pure core of
-/// `exec::Slots`. A released slot passes straight to the oldest live waiter,
+/// `rt::Slots`. A released slot passes straight to the oldest live waiter,
 /// so the count does not drop and a newcomer cannot jump the queue.
 ///
 /// Waiters that give up (deadline, disconnect) are not removed eagerly:

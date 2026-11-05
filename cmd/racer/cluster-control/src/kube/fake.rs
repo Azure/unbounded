@@ -6,8 +6,8 @@
 
 use super::{Kube, KubeConfig};
 use crate::{
-    exec::{self, Executor, Listener, Signal},
     http::{self, Conn, TlsStream},
+    rt::{self, Executor, Listener, Signal},
 };
 use serde_json::{Value, json};
 use std::{
@@ -208,14 +208,14 @@ pub fn serve(api: FakeApi, dir: &std::path::Path) -> KubeConfig {
     let config = Arc::new(config);
     let listener = Rc::new(Listener::bind("127.0.0.1:0".parse().unwrap()).unwrap());
     let address = listener.local_addr().unwrap();
-    exec::spawn(async move {
+    rt::spawn(async move {
         loop {
             let Ok((tcp, _)) = listener.accept().await else {
                 return;
             };
             let api = api.clone();
             let config = config.clone();
-            let _ = exec::spawn(async move {
+            let _ = rt::spawn(async move {
                 let Ok(tls) = TlsStream::server(tcp, config).await else {
                     return;
                 };
@@ -241,12 +241,12 @@ pub fn serve(api: FakeApi, dir: &std::path::Path) -> KubeConfig {
                     // Delays are re-read while waiting.
                     let received = std::time::Instant::now();
                     while received.elapsed() < api.delays(&head.method).0 {
-                        exec::sleep(Duration::from_millis(20)).await;
+                        rt::sleep(Duration::from_millis(20)).await;
                     }
                     let (status, value) = api.handle(&head.method, &head.target, &body);
                     let answered = std::time::Instant::now();
                     while answered.elapsed() < api.delays(&head.method).1 {
-                        exec::sleep(Duration::from_millis(20)).await;
+                        rt::sleep(Duration::from_millis(20)).await;
                     }
                     let body = serde_json::to_vec(&value).unwrap();
                     let mut out = http::response_head(

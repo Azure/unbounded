@@ -4,7 +4,7 @@
 //! `Content-Length`, chunked, and close-delimited response bodies. Every read
 //! has a caller limit.
 
-use crate::exec::{self, Interest, Tcp};
+use crate::rt::Tcp;
 use rustls::pki_types::ServerName;
 use std::{
     io::{self, Read, Write},
@@ -15,6 +15,8 @@ use std::{
 pub struct TlsStream {
     tcp: Tcp,
     conn: rustls::Connection,
+    /// Received ciphertext not yet taken by rustls.
+    rx: Vec<u8>,
 }
 
 fn invalid<E>(_: E) -> io::Error {
@@ -32,6 +34,7 @@ impl TlsStream {
         let mut s = Self {
             tcp,
             conn: conn.into(),
+            rx: Vec::new(),
         };
         s.handshake().await?;
         Ok(s)
@@ -43,6 +46,7 @@ impl TlsStream {
         let mut s = Self {
             tcp,
             conn: conn.into(),
+            rx: Vec::new(),
         };
         s.handshake().await?;
         Ok(s)
@@ -67,35 +71,28 @@ impl TlsStream {
     }
 
     async fn read_tls(&mut self) -> io::Result<usize> {
-        loop {
-            match self.conn.read_tls(self.tcp.std()) {
-                Ok(n) => {
-                    if let Err(e) = self.conn.process_new_packets() {
-                        let _ = self.flush().await;
-                        return Err(invalid(e));
-                    }
-                    return Ok(n);
-                }
-                Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
-                    exec::ready(self.tcp.fd(), Interest::Read).await
-                }
-                Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
-                Err(e) => return Err(e),
-            }
+        if self.rx.is_empty() && self.tcp.recv_into(&mut self.rx).await? == 0 {
+            return Ok(0);
         }
+        let mut slice = &self.rx[..];
+        let n = self.conn.read_tls(&mut slice)?;
+        self.rx.drain(..n);
+        if let Err(e) = self.conn.process_new_packets() {
+            let _ = self.flush().await;
+            return Err(invalid(e));
+        }
+        // Buffered ciphertext counts as progress even if rustls took none.
+        Ok(n.max(1))
     }
 
     /// Write all pending TLS records.
     pub async fn flush(&mut self) -> io::Result<()> {
         while self.conn.wants_write() {
-            match self.conn.write_tls(self.tcp.std()) {
-                Ok(_) => {}
-                Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
-                    exec::ready(self.tcp.fd(), Interest::Write).await
-                }
-                Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
-                Err(e) => return Err(e),
+            let mut out = Vec::new();
+            while self.conn.wants_write() {
+                self.conn.write_tls(&mut out)?;
             }
+            self.tcp.send_all(out).await?;
         }
         Ok(())
     }
@@ -491,7 +488,7 @@ pub fn split_target(target: &str) -> (&str, Option<&str>) {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
-    use crate::exec::{Executor, Listener};
+    use crate::rt::{Executor, Listener};
 
     /// Self-signed server config and matching client config for tests.
     pub fn tls_pair() -> (Arc<rustls::ServerConfig>, Arc<rustls::ClientConfig>) {

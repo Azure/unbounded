@@ -2,10 +2,10 @@
 
 use crate::{
     Config,
-    exec::Signal,
     kube::Kube,
     limits,
     pki::{DynamicClientVerifier, SeatIssuer, ServingIdentity},
+    rt::Signal,
     rules::{
         publication::Image,
         state::{Freshness, StateRecord},

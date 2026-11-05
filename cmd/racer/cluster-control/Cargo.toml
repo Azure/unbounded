@@ -9,6 +9,7 @@ description = "Racer control plane embedded in racer: Lease seats, primary, and 
 [dependencies]
 racer-control-wire = { path = "../control-wire" }
 racer-core = { path = "../core" }
+racer-io = { path = "../io" }
 regex = "1"
 wire-codec = { path = "../wire-codec" }
 base64 = "0.22"

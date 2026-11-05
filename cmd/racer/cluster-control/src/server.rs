@@ -8,10 +8,10 @@
 
 use crate::{
     auth,
-    exec::{self, Listener, Slot, Slots},
     http::{self, Conn, Head, HttpError, TlsStream},
     limits,
     pki::{self, PkiError},
+    rt::{self, Listener, Slot, Slots},
     rules::publication::Image,
     shared::Shared,
 };
@@ -290,7 +290,7 @@ pub(crate) async fn write_fenced(
         } else {
             deadline
         };
-        if !matches!(exec::deadline(at, tls.write_all(part)).await, Ok(Ok(()))) {
+        if !matches!(rt::deadline(at, tls.write_all(part)).await, Ok(Ok(()))) {
             return false;
         }
     }
@@ -322,11 +322,11 @@ fn wants_close(head: &Head) -> bool {
 /// Read the next request head: up to `idle` for the first byte, then `io`
 /// for the rest, so a slow head cannot hold a connection past `idle + io`.
 async fn next_head(conn: &mut Conn, idle: Duration, io: Duration) -> Result<Head, Option<Vec<u8>>> {
-    match exec::timeout(idle, conn.wait_for_data()).await {
+    match rt::timeout(idle, conn.wait_for_data()).await {
         Ok(Ok(true)) => {}
         _ => return Err(None),
     }
-    match exec::timeout(io, conn.read_head(true, limits::MAX_HEAD_BYTES)).await {
+    match rt::timeout(io, conn.read_head(true, limits::MAX_HEAD_BYTES)).await {
         Ok(Ok(Some(h))) => Ok(h),
         Ok(Err(HttpError::TooLarge)) => Err(Some(error_response(ProtocolFailure::TooLarge))),
         _ => Err(None),
@@ -355,7 +355,7 @@ impl Server {
     pub async fn run(self: Rc<Self>, listener: Listener) {
         while !self.shared.stopping.get() {
             let Ok((tcp, _)) = listener.accept().await else {
-                exec::sleep(Duration::from_millis(100)).await;
+                rt::sleep(Duration::from_millis(100)).await;
                 continue;
             };
             // Over capacity: close at once. Clients retry with backoff.
@@ -376,9 +376,9 @@ impl Server {
                 continue;
             };
             let this = self.clone();
-            let _ = exec::spawn(async move {
+            let _ = rt::spawn(async move {
                 let _slot = slot;
-                let stream = exec::timeout(this.budget.io, TlsStream::server(tcp, tls)).await;
+                let stream = rt::timeout(this.budget.io, TlsStream::server(tcp, tls)).await;
                 drop(handshake);
                 let Ok(Ok(stream)) = stream else {
                     return;
@@ -393,7 +393,7 @@ impl Server {
             let head = match next_head(&mut conn, self.budget.idle, self.budget.io).await {
                 Ok(h) => h,
                 Err(Some(reply)) => {
-                    let _ = exec::timeout(self.budget.io, conn.tls.write_all(&reply)).await;
+                    let _ = rt::timeout(self.budget.io, conn.tls.write_all(&reply)).await;
                     return;
                 }
                 Err(None) => return,
@@ -438,7 +438,7 @@ impl Server {
             // Permits are released only now, after the last byte.
             drop(reply);
             if close || self.shared.stopping.get() {
-                let _ = exec::timeout(self.budget.io, conn.tls.close()).await;
+                let _ = rt::timeout(self.budget.io, conn.tls.close()).await;
                 return;
             }
         }
@@ -460,7 +460,7 @@ impl Server {
                     .bootstraps
                     .try_acquire()
                     .ok_or(ProtocolFailure::Overloaded)?;
-                let body = match exec::timeout(
+                let body = match rt::timeout(
                     self.budget.io,
                     conn.read_request_body(head, wire::MAX_ENROLLMENT_BYTES),
                 )
@@ -555,7 +555,7 @@ impl Server {
         let authorization = head
             .one("authorization")
             .map_err(|_| ProtocolFailure::Unauthenticated)?;
-        let caller = exec::timeout(
+        let caller = rt::timeout(
             self.budget.io,
             auth::authorize(&self.shared, authorization, unix_now()),
         )
@@ -621,7 +621,7 @@ impl Server {
             if let Some(v) = ready() {
                 return Some(v);
             }
-            let _ = exec::deadline(deadline, self.shared.changed.changed(generation)).await;
+            let _ = rt::deadline(deadline, self.shared.changed.changed(generation)).await;
         }
     }
 
@@ -694,7 +694,7 @@ impl Server {
         let authorization = head
             .one("authorization")
             .map_err(|_| ProtocolFailure::Unauthenticated)?;
-        exec::timeout(
+        rt::timeout(
             self.budget.io,
             auth::authorize(&self.shared, authorization, unix_now()),
         )
@@ -797,7 +797,7 @@ impl Server {
         let authorization = head
             .one("authorization")
             .map_err(|_| ProtocolFailure::Unauthenticated)?;
-        let expires = exec::timeout(
+        let expires = rt::timeout(
             self.budget.io,
             auth::authorize_seat(&self.shared, authorization, unix_now()),
         )
@@ -823,7 +823,7 @@ impl Server {
                 // is normally cached). The primary term can also end while
                 // this reply waits, and a follower seat stays ready, so
                 // recheck the role, then readiness.
-                exec::timeout(
+                rt::timeout(
                     self.budget.io,
                     auth::authorize_seat(&self.shared, authorization, unix_now()),
                 )
@@ -898,7 +898,7 @@ pub fn spawn_webhooks(
 ) -> Result<(), crate::Error> {
     let budget = WebhookBudget::new(limits::MAX_WEBHOOK_CONNECTIONS, MAX_ADMISSION_BODIES);
     for listener in listeners {
-        exec::spawn(serve_webhook(
+        rt::spawn(serve_webhook(
             shared.clone(),
             listener,
             budget.clone(),
@@ -922,7 +922,7 @@ pub(crate) async fn serve_webhook(
     } = budget;
     while !shared.stopping.get() {
         let Ok((tcp, _)) = listener.accept().await else {
-            exec::sleep(Duration::from_millis(100)).await;
+            rt::sleep(Duration::from_millis(100)).await;
             continue;
         };
         let Some(slot) = slots.try_acquire() else {
@@ -938,9 +938,9 @@ pub(crate) async fn serve_webhook(
         };
         let shared = shared.clone();
         let bodies = bodies.clone();
-        let _ = exec::spawn(async move {
+        let _ = rt::spawn(async move {
             let _slot = slot;
-            let Ok(Ok(stream)) = exec::timeout(io, TlsStream::server(tcp, tls)).await else {
+            let Ok(Ok(stream)) = rt::timeout(io, TlsStream::server(tcp, tls)).await else {
                 return;
             };
             webhook_connection(&shared, &bodies, Conn::new(stream), idle, io).await;
@@ -993,7 +993,7 @@ async fn webhook_connection(
         let head = match next_head(&mut conn, idle, io).await {
             Ok(h) => h,
             Err(Some(_)) => {
-                let _ = exec::timeout(io, conn.tls.write_all(&status(413, true))).await;
+                let _ = rt::timeout(io, conn.tls.write_all(&status(413, true))).await;
                 return;
             }
             Err(None) => return,
@@ -1007,7 +1007,7 @@ async fn webhook_connection(
                 None => Err(status(429, true)),
                 Some(slot) => {
                     permit = Some(slot);
-                    match exec::timeout(
+                    match rt::timeout(
                         io,
                         conn.read_request_body(&head, crate::webhook::MAX_REQUEST_BYTES),
                     )
@@ -1041,7 +1041,7 @@ async fn webhook_connection(
         }
         drop(permit);
         if close || shared.stopping.get() {
-            let _ = exec::timeout(io, conn.tls.close()).await;
+            let _ = rt::timeout(io, conn.tls.close()).await;
             return;
         }
     }
@@ -1073,7 +1073,7 @@ pub(crate) async fn cache_lookups(
             crate::kube::paths::CACHES,
             crate::kube::escape(&name)
         );
-        let found = match exec::deadline(at, api.get(&path)).await {
+        let found = match rt::deadline(at, api.get(&path)).await {
             Ok(Ok(cache)) => match cache.get("spec").and_then(|s| s.get("nodeSelector")) {
                 None | Some(serde_json::Value::Null) => CacheLookup::Found(None),
                 Some(sel) => CacheLookup::Found(Some(sel.clone())),
@@ -1098,7 +1098,7 @@ pub(crate) async fn node_lookup(
 ) -> crate::webhook::NodeLookup {
     use crate::webhook::NodeLookup;
     let path = crate::kube::paths::node(&crate::kube::escape(name));
-    match exec::deadline(at, api.get(&path)).await {
+    match rt::deadline(at, api.get(&path)).await {
         Ok(Ok(node)) => {
             let labels = node
                 .get("metadata")
@@ -1314,9 +1314,9 @@ fn bearer_recheck(found: bool, immediate: bool, age: Duration) -> bool {
 mod tests {
     use super::*;
     use crate::{
-        exec::{Executor, Tcp},
         kube::fake,
         pki::ServingIdentity,
+        rt::{Executor, Tcp},
     };
     use rustls::pki_types::ServerName;
 
@@ -1420,13 +1420,13 @@ mod tests {
     /// The server ends the connection without a response, promptly.
     async fn closed_without_reply(conn: &mut Conn) -> bool {
         matches!(
-            exec::timeout(Duration::from_secs(3), conn.read_head(false, 4096)).await,
+            rt::timeout(Duration::from_secs(3), conn.read_head(false, 4096)).await,
             Ok(Ok(None) | Err(_))
         )
     }
 
     async fn response(conn: &mut Conn) -> (u16, Vec<(String, String)>) {
-        let head = exec::timeout(Duration::from_secs(3), conn.read_head(false, 4096))
+        let head = rt::timeout(Duration::from_secs(3), conn.read_head(false, 4096))
             .await
             .unwrap()
             .unwrap()
@@ -1594,7 +1594,7 @@ mod tests {
             let (shared, pin) = seated(kube);
             let listener = Listener::bind(format!("{POD_IP}:0").parse().unwrap()).unwrap();
             let address = listener.local_addr().unwrap();
-            exec::spawn(Server::with_budget(shared.clone(), budget()).run(listener)).unwrap();
+            rt::spawn(Server::with_budget(shared.clone(), budget()).run(listener)).unwrap();
 
             // Idle: no request byte at all.
             let started = Instant::now();
@@ -1645,13 +1645,13 @@ mod tests {
                 held.push(connect(address, &pin).await.unwrap());
             }
             assert!(
-                exec::timeout(Duration::from_secs(3), connect(address, &pin))
+                rt::timeout(Duration::from_secs(3), connect(address, &pin))
                     .await
                     .unwrap()
                     .is_err()
             );
             drop(held);
-            exec::sleep(Duration::from_millis(50)).await;
+            rt::sleep(Duration::from_millis(50)).await;
             // Capacity returns once connections end.
             let mut again = connect(address, &pin).await.unwrap();
             again
@@ -1670,20 +1670,20 @@ mod tests {
             let (shared, pin) = seated(kube);
             let listener = Listener::bind(format!("{POD_IP}:0").parse().unwrap()).unwrap();
             let address = listener.local_addr().unwrap();
-            exec::spawn(Server::with_budget(shared.clone(), budget()).run(listener)).unwrap();
+            rt::spawn(Server::with_budget(shared.clone(), budget()).run(listener)).unwrap();
             // Two raw TCP connections that never send a ClientHello hold
             // both handshake slots.
             let a = Tcp::connect(address).await.unwrap();
             let b = Tcp::connect(address).await.unwrap();
-            exec::sleep(Duration::from_millis(50)).await;
+            rt::sleep(Duration::from_millis(50)).await;
             assert!(
-                exec::timeout(Duration::from_secs(3), connect(address, &pin))
+                rt::timeout(Duration::from_secs(3), connect(address, &pin))
                     .await
                     .unwrap()
                     .is_err()
             );
             // The handshake deadline frees them.
-            exec::sleep(Duration::from_millis(500)).await;
+            rt::sleep(Duration::from_millis(500)).await;
             assert!(connect(address, &pin).await.is_ok());
             drop((a, b));
             shared.stopping.set(true);
@@ -1733,16 +1733,15 @@ mod tests {
                 let mut got = 0;
                 let mut buf = vec![0u8; 16 * 1024];
                 while got < read {
-                    match exec::timeout(Duration::from_secs(5), tls.read(&mut buf)).await {
+                    match rt::timeout(Duration::from_secs(5), tls.read(&mut buf)).await {
                         Ok(Ok(0)) | Ok(Err(_)) | Err(_) => break,
                         Ok(Ok(n)) => got += n,
                     }
                     // Slow reader.
-                    exec::sleep(Duration::from_millis(1)).await;
+                    rt::sleep(Duration::from_millis(1)).await;
                 }
                 // Hold the connection open without reading.
-                exec::sleep(deadline.min(Duration::from_secs(2)) + Duration::from_millis(300))
-                    .await;
+                rt::sleep(deadline.min(Duration::from_secs(2)) + Duration::from_millis(300)).await;
                 got
             };
             let ((ok, took), got) = futures::join!(serve, call);
@@ -1820,7 +1819,7 @@ mod tests {
             let (shared, pin) = seated(kube);
             let listener = Listener::bind(format!("{POD_IP}:0").parse().unwrap()).unwrap();
             let address = listener.local_addr().unwrap();
-            exec::spawn(Server::with_budget(shared.clone(), budget()).run(listener)).unwrap();
+            rt::spawn(Server::with_budget(shared.clone(), budget()).run(listener)).unwrap();
             // Each body is itself a complete request that would get a
             // different (401) answer if it were parsed as the next request.
             let smuggled = http::request("GET", "x", wire::KEYRING_PATH, &[], &[]);
@@ -1870,14 +1869,14 @@ mod tests {
                 idle: Duration::from_secs(5),
                 ..budget()
             };
-            exec::spawn(Server::with_budget(shared.clone(), budget).run(listener)).unwrap();
+            rt::spawn(Server::with_budget(shared.clone(), budget).run(listener)).unwrap();
             let mut a = connect(address, &pin).await.unwrap();
             a.tls
                 .write_all(&post_head(wire::BOOTSTRAP_PATH, 100))
                 .await
                 .unwrap();
             a.tls.write_all(b"{").await.unwrap();
-            exec::sleep(Duration::from_millis(100)).await;
+            rt::sleep(Duration::from_millis(100)).await;
             // A second enrollment is refused before its body is buffered.
             let mut b = connect(address, &pin).await.unwrap();
             let mut req = post_head(wire::BOOTSTRAP_PATH, 2);
@@ -1949,7 +1948,7 @@ mod tests {
             let ip: std::net::IpAddr = ip.parse().unwrap();
             let listener = Listener::bind(std::net::SocketAddr::new(ip, 0)).unwrap();
             let address = listener.local_addr().unwrap();
-            exec::spawn(serve_webhook(
+            rt::spawn(serve_webhook(
                 shared.clone(),
                 listener,
                 budget.clone(),
@@ -1969,11 +1968,11 @@ mod tests {
             let (shared, pin) = seated(kube);
             let [v4, v6] = dual_stack_webhooks(&shared, &WebhookBudget::new(1, 1));
             let held = connect(v4, &pin).await.unwrap();
-            exec::sleep(Duration::from_millis(100)).await;
+            rt::sleep(Duration::from_millis(100)).await;
             let refused = connect(v6, &pin).await;
             assert!(refused.is_err() || closed_without_reply(&mut refused.unwrap()).await);
             drop(held);
-            exec::sleep(Duration::from_millis(100)).await;
+            rt::sleep(Duration::from_millis(100)).await;
             let mut c = connect(v6, &pin).await.unwrap();
             c.tls.write_all(&post_head("/other", 0)).await.unwrap();
             assert_eq!(response(&mut c).await.0, 404);
@@ -1993,7 +1992,7 @@ mod tests {
                 .write_all(&post_head(crate::webhook::PATH, 100))
                 .await
                 .unwrap();
-            exec::sleep(Duration::from_millis(100)).await;
+            rt::sleep(Duration::from_millis(100)).await;
             let mut req = post_head(crate::webhook::PATH, 2);
             req.extend_from_slice(b"{}");
             let mut b = connect(v6, &pin).await.unwrap();
@@ -2014,7 +2013,7 @@ mod tests {
             let (shared, pin) = seated(kube);
             let listener = Listener::bind(format!("{POD_IP}:0").parse().unwrap()).unwrap();
             let address = listener.local_addr().unwrap();
-            exec::spawn(run_webhook_with(
+            rt::spawn(run_webhook_with(
                 shared.clone(),
                 listener,
                 1,
@@ -2027,7 +2026,7 @@ mod tests {
                 .write_all(&post_head(crate::webhook::PATH, 100))
                 .await
                 .unwrap();
-            exec::sleep(Duration::from_millis(100)).await;
+            rt::sleep(Duration::from_millis(100)).await;
             let mut req = post_head(crate::webhook::PATH, 2);
             req.extend_from_slice(b"{}");
             let mut b = connect(address, &pin).await.unwrap();
@@ -2062,7 +2061,7 @@ mod tests {
             let (shared, pin) = seated(kube);
             let listener = Listener::bind(format!("{POD_IP}:0").parse().unwrap()).unwrap();
             let address = listener.local_addr().unwrap();
-            exec::spawn(run_webhook_with(
+            rt::spawn(run_webhook_with(
                 shared.clone(),
                 listener,
                 8,
@@ -2249,15 +2248,15 @@ mod tests {
             // 429, then rechecks readiness (this seat is not ready: 503).
             let result = Rc::new(RefCell::new(None));
             let (s, r) = (server.clone(), result.clone());
-            exec::spawn(async move {
+            rt::spawn(async move {
                 let out = s.queued_write_slot(Instant::now(), expires).await;
                 *r.borrow_mut() = Some(out.err());
             })
             .unwrap();
-            exec::sleep(Duration::from_millis(20)).await;
+            rt::sleep(Duration::from_millis(20)).await;
             assert!(result.borrow().is_none());
             drop(held);
-            exec::sleep(Duration::from_millis(20)).await;
+            rt::sleep(Duration::from_millis(20)).await;
             assert_eq!(*result.borrow(), Some(Some(ProtocolFailure::Unavailable)));
             assert!(server.write_slot().is_ok());
             shared.stopping.set(true);

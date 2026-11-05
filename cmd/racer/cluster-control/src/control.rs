@@ -3,10 +3,10 @@
 use crate::{
     Config, DiscoveredEndpoints, Error, annotations,
     entropy::{Entropy, OsEntropy},
-    exec::{self, Executor, Listener, Notifier, Signal},
     kube::{Kube, KubeConfig, paths, str_at},
     limits,
     pki::DynamicClientVerifier,
+    rt::{self, Executor, Listener, Notifier, Signal},
     rules::rails::{self, Report},
     seat, server,
     shared::{Serving, Shared},
@@ -196,17 +196,17 @@ fn run(
         let outer = outer.clone();
         let report_signal = report_signal.clone();
         move || -> Result<(), Error> {
-            exec::spawn(bootstrap(shared.clone(), outer.clone()))?;
-            exec::spawn(seat::discovery(
+            rt::spawn(bootstrap(shared.clone(), outer.clone()))?;
+            rt::spawn(seat::discovery(
                 shared.clone(),
                 endpoints.clone(),
                 primary_changed.clone(),
             ))?;
-            exec::spawn(seat::lottery(shared.clone(), primary_changed.clone()))?;
-            exec::spawn(server::Server::new(shared.clone()).run(control))?;
+            rt::spawn(seat::lottery(shared.clone(), primary_changed.clone()))?;
+            rt::spawn(server::Server::new(shared.clone()).run(control))?;
             // One budget across both Pod IP families.
             server::spawn_webhooks(&shared, std::iter::once(webhook).chain(webhook_alternate))?;
-            exec::spawn(reporter(shared.clone(), outer.clone(), report_signal))?;
+            rt::spawn(reporter(shared.clone(), outer.clone(), report_signal))?;
             Ok(())
         }
     };
@@ -260,7 +260,7 @@ fn update_diagnostics(shared: &Shared, outer: &Outer) {
                 .as_ref()
                 .map_or(0, |r| r.sequence),
             ready: shared.ready(),
-            tasks: exec::task_count(),
+            tasks: rt::task_count(),
             last_error: shared.last_error.get(),
         };
     }
@@ -323,7 +323,7 @@ async fn bootstrap(shared: Rc<Shared>, outer: Arc<Outer>) {
                 return;
             }
             Err(_) => {
-                exec::sleep(Duration::from_secs(backoff)).await;
+                rt::sleep(Duration::from_secs(backoff)).await;
                 backoff = (backoff * 2).min(30);
             }
         }
@@ -383,13 +383,13 @@ async fn reporter(shared: Rc<Shared>, outer: Arc<Outer>, signal: Signal) {
                     backoff = 1;
                 }
                 Err(_) => {
-                    exec::sleep(Duration::from_secs(backoff)).await;
+                    rt::sleep(Duration::from_secs(backoff)).await;
                     backoff = (backoff * 2).min(60);
                     continue;
                 }
             }
         }
-        let _ = exec::timeout(Duration::from_secs(60), signal.changed(generation)).await;
+        let _ = rt::timeout(Duration::from_secs(60), signal.changed(generation)).await;
     }
 }
 
