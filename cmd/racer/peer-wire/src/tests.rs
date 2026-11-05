@@ -8,6 +8,11 @@ use racer_crypto::identity::{
 };
 
 /// Deterministic canonical fixture identity.
+fn wall_clock(ctx: &racer_io::WorkerCtx) -> racer_crypto::identity::WallClock {
+    let clock = ctx.clock.clone();
+    racer_crypto::identity::WallClock::new(move || clock.wall_now())
+}
+
 pub(crate) fn node(n: usize) -> NodeId {
     NodeId(format!("{n:08x}-1111-4111-8111-111111111111"))
 }
@@ -24,7 +29,8 @@ impl RequestMac for NoMac {
 }
 
 /// Independent certificate network without application credential policy.
-pub(crate) fn network(count: usize) -> Vec<Rc<Signatures>> {
+/// Signing identities whose wall clocks and signatures read `ctx`.
+pub(crate) fn network(count: usize, ctx: &racer_io::WorkerCtx) -> Vec<Rc<Signatures>> {
     let (ca, key) = ca();
     let roots = vec![ca.der().to_vec()];
     let cluster = ClusterId(node(99).0);
@@ -38,15 +44,13 @@ pub(crate) fn network(count: usize) -> Vec<Rc<Signatures>> {
                     node.clone(),
                     chain,
                     &roots,
-                    &racer_crypto::identity::WallClock::new(uring_runtime::environment::wall_now),
+                    &wall_clock(ctx),
                 )
                 .unwrap();
             let keys = Rc::new(Keyring::new(
                 cluster.clone(),
                 node,
-                Arc::new(KeyEpochs::with_clock(
-                    racer_crypto::identity::WallClock::new(uring_runtime::environment::wall_now),
-                )),
+                Arc::new(KeyEpochs::with_clock(wall_clock(ctx))),
             ));
             keys.install(KeyringBundle {
                 schema_version: racer_control_wire::KEYRING_SCHEMA_VERSION,
@@ -62,7 +66,7 @@ pub(crate) fn network(count: usize) -> Vec<Rc<Signatures>> {
                 keys,
                 certificates,
                 Rc::new(NoMac),
-                uring_runtime::environment::Environment::current().worker_ctx(),
+                ctx.clone(),
             ))
         })
         .collect()
@@ -281,7 +285,7 @@ fn object_context_signature_base_vector_and_proof_preserve_opaque_bytes() {
 
     head.headers.retain(|h| !is_auth_field(&h.name));
     push(&mut head, "racer-receiver", node(1).0);
-    let n = network(2);
+    let n = network(2, &racer_io::WorkerCtx::host());
     let signed = n[0].sign(head).unwrap();
     let digest = signed_digest(&signed).unwrap();
     let encoded = encode_signed(&signed).unwrap();
@@ -338,7 +342,7 @@ fn rfc9421_exact_request_and_response_signature_base_vectors() {
 
 #[test]
 fn ed25519_rfc9421_base_tamper_replay_and_receiver_challenge() {
-    let n = network(3);
+    let n = network(3, &racer_io::WorkerCtx::host());
     let original = n[0].sign(head()).unwrap();
     let clone = || decode_signed(&encode_signed(&original).unwrap()).unwrap();
     let base = String::from_utf8(signature_base(&original.head).unwrap()).unwrap();
@@ -381,12 +385,14 @@ fn timestamp_window_and_retained_deadline_revalidate_authority() {
         std::time::Instant::now(),
         SystemTime::now(),
     );
-    let _guard = clock.environment(0).enter();
-    let n = network(2);
+    let sim_env = clock.environment(0);
+    let _guard = sim_env.enter();
+    let sim_ctx = sim_env.worker_ctx();
+    let n = network(2, &sim_ctx);
     let mut head = head();
     head.headers.retain(|h| h.name != "racer-kind");
     push(&mut head, "racer-kind", "request");
-    let deadline = millis(uring_runtime::environment::wall_now()).unwrap() + 120_000;
+    let deadline = millis(sim_ctx.clock.wall_now()).unwrap() + 120_000;
     push(&mut head, "racer-route-deadline", deadline);
     let signed = n[0].sign(head).unwrap();
     clock.advance(Duration::from_secs(60));
@@ -408,7 +414,7 @@ fn timestamp_window_and_retained_deadline_revalidate_authority() {
 
 #[test]
 fn envelope_limits_and_canonical_fields_preserve_exact_bytes() {
-    let n = network(2);
+    let n = network(2, &racer_io::WorkerCtx::host());
     let signed = n[0].sign(head()).unwrap();
     let encoded = encode_signed(&signed).unwrap();
     let auth = ForwardedHead {
@@ -484,14 +490,14 @@ fn node_list_encoding_rejects_duplicates_invalid_ids_and_excess_hops() {
 #[test]
 fn control_chain_rejects_phase_previous_identity_and_extension_substitution() {
     use crate::control::{Binding, Phase};
-    let n = network(3);
+    let n = network(3, &racer_io::WorkerCtx::host());
     let binding = Binding {
         request: [1; 32],
         response: [2; 32],
         transfer: [3; 16],
         membership: 1,
         deadline: encode_deadline(Deadline(
-            uring_runtime::environment::now() + Duration::from_secs(30),
+            racer_io::Clock::host().now() + Duration::from_secs(30),
         ))
         .unwrap(),
         rail: racer_control_wire::RailId(1),
@@ -581,7 +587,7 @@ fn route_transition_consumes_one_link_without_refilling_authority() {
 #[test]
 fn request_builders_supply_host_for_strict_http_codec() {
     use crate::control::{Binding, Phase};
-    let n = network(2);
+    let n = network(2, &racer_io::WorkerCtx::host());
     let original = n[0].sign(head()).unwrap();
     let hop = forwarding::hop_head("request-hop", &original, &original).unwrap();
     assert_eq!(hop.unique("host").unwrap(), Some(b"".as_slice()));
@@ -635,13 +641,13 @@ fn credential_policy_runs_after_profile_checks_before_signature_verification() {
         }
     }
 
-    let n = network(2);
+    let n = network(2, &racer_io::WorkerCtx::host());
     let policy = Rc::new(Reject(std::cell::Cell::new(0)));
     let verifier = Signatures::new(
         n[1].keys.clone(),
         n[1].certificates.clone(),
         policy.clone(),
-        uring_runtime::environment::Environment::current().worker_ctx(),
+        racer_io::WorkerCtx::host(),
     );
     let mut signed = n[0].sign(head()).unwrap();
     signed.signature[0] ^= 1;
@@ -668,7 +674,7 @@ fn credential_policy_runs_after_profile_checks_before_signature_verification() {
 #[test]
 fn rdma_link_request_and_response_roundtrip_and_reject_substitution() {
     use crate::link::{BINDING_FIELD, KIND, MAX_SETUP, RdmaLink, SETUP_FIELD, TARGET};
-    let n = network(3);
+    let n = network(3, &racer_io::WorkerCtx::host());
     let request = RdmaLink {
         setup: vec![7; 74],
         binding: None,

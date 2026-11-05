@@ -160,13 +160,14 @@ impl Harness {
     fn new() -> Self {
         let reactor = Rc::new(TestReactor(Reactor::new(32, ())));
         let hooks = Rc::new(Hooks::default());
+        let identities = crate::tests::network(3, reactor.0.ctx());
         Self {
             io: HttpIo::new(reactor.clone(), Codec::new(MAX_HEAD), hooks.clone(), 0, 0),
             pool: HttpPool::new(reactor.clone(), hooks.clone(), PoolConfig::default()),
             reactor,
             hooks,
             scope: TestScope::new(Duration::from_secs(30)),
-            identities: crate::tests::network(3),
+            identities,
         }
     }
 

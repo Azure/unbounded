@@ -14,7 +14,7 @@ use std::{
     sync::Arc,
     time::{Duration, Instant, UNIX_EPOCH},
 };
-use uring_runtime::environment::{Deadline, SimulationClock, now};
+use uring_runtime::environment::{Deadline, SimulationClock};
 
 struct NoMac;
 
@@ -40,14 +40,14 @@ fn signatures() -> Signatures {
             node.clone(),
             chain,
             &roots,
-            &racer_crypto::identity::WallClock::new(uring_runtime::environment::wall_now),
+            &racer_crypto::identity::WallClock::host(),
         )
         .unwrap();
     let keys = Rc::new(Keyring::new(
         cluster.clone(),
         node,
         Arc::new(KeyEpochs::with_clock(
-            racer_crypto::identity::WallClock::new(uring_runtime::environment::wall_now),
+            racer_crypto::identity::WallClock::host(),
         )),
     ));
     keys.install(KeyringBundle {
@@ -64,7 +64,7 @@ fn signatures() -> Signatures {
         keys,
         certificates,
         Rc::new(NoMac),
-        uring_runtime::environment::Environment::current().worker_ctx(),
+        racer_io::WorkerCtx::host(),
     )
 }
 
@@ -176,7 +176,12 @@ fn representable_deadline_boundaries_preserve_verification_policy() {
 #[test]
 fn future_deadline_signs_and_verifies() {
     let signatures = signatures();
-    let binding = binding(encode_deadline(Deadline(now() + Duration::from_secs(30))).unwrap());
+    let binding = binding(
+        encode_deadline(Deadline(
+            racer_io::Clock::host().now() + Duration::from_secs(30),
+        ))
+        .unwrap(),
+    );
     let signed = binding
         .sign(
             &signatures,

@@ -508,7 +508,7 @@ mod tests {
             }
         }
 
-        let n = crate::tests::network(3);
+        let n = crate::tests::network(3, &racer_io::WorkerCtx::host());
         let policy = Rc::new(BorrowedMac {
             expected: std::cell::Cell::new(std::ptr::null()),
             calls: std::cell::Cell::new(0),
@@ -517,7 +517,7 @@ mod tests {
             n[1].keys.clone(),
             n[1].certificates.clone(),
             policy.clone(),
-            uring_runtime::environment::Environment::current().worker_ctx(),
+            racer_io::WorkerCtx::host(),
         );
         for response in [false, true] {
             let phase = if response { "challenge" } else { "hello" };
@@ -557,7 +557,7 @@ mod tests {
 
     #[test]
     fn handshake_accepts_header_case_but_rejects_unknown_fields() {
-        let n = crate::tests::network(2);
+        let n = crate::tests::network(2, &racer_io::WorkerCtx::host());
         for response in [false, true] {
             let phase = if response { "challenge" } else { "hello" };
             let mut head =
@@ -586,7 +586,7 @@ mod tests {
 
     #[test]
     fn duplicate_wrong_session_direction_identity_and_forged_high_sequence() {
-        let n = crate::tests::network(2);
+        let n = crate::tests::network(2, &racer_io::WorkerCtx::host());
         let id = test_util::random().unwrap();
         let mut a = Session::new(n[0].clone(), n[1].node().clone(), id, 0);
         let mut b = Session::new(n[1].clone(), n[0].node().clone(), id, 1);
@@ -625,7 +625,7 @@ mod tests {
 
     #[test]
     fn reconnect_restart_expiry_and_counter_overflow_fail_closed() {
-        let n = crate::tests::network(2);
+        let n = crate::tests::network(2, &racer_io::WorkerCtx::host());
         let id = test_util::random().unwrap();
         let mut a = Session::new(n[0].clone(), n[1].node().clone(), id, 0);
         let mut b = Session::new(n[1].clone(), n[0].node().clone(), id, 1);
