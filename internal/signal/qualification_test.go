@@ -341,6 +341,7 @@ func TestEvaluateLedgerRequalifiesAfterFingerprintChange(t *testing.T) {
 	if err != nil {
 		t.Fatalf("evaluateLedger() error = %v", err)
 	}
+
 	if status.Phase != signalv1.NodeCertificationPhaseQualified ||
 		len(status.ContributingRuns) != 1 ||
 		status.ContributingRuns[0].UID != newPass.UID {
@@ -356,6 +357,7 @@ func TestEvaluateLedgerRequalifiesAfterFingerprintChange(t *testing.T) {
 	if err != nil {
 		t.Fatalf("evaluateLedger(changed within Run) error = %v", err)
 	}
+
 	if status.Phase == signalv1.NodeCertificationPhaseQualified {
 		t.Fatalf("same-Run fingerprint change received credit: %#v", status)
 	}
@@ -393,6 +395,7 @@ func TestQualificationEvidenceRetriesTransientNodeRead(t *testing.T) {
 	if err == nil || !apierrors.IsServiceUnavailable(err) {
 		t.Fatalf("qualificationEvidenceIdentity() error = %v, want service unavailable", err)
 	}
+
 	if identity != nil || verdict != "Pass" || reason != "" {
 		t.Fatalf("transient failure changed result: identity %#v, verdict %q, reason %q", identity, verdict, reason)
 	}
@@ -442,6 +445,7 @@ func TestQualificationReconcileIsolatesCorruptEvidenceAndListsRunsOnce(t *testin
 	if err == nil {
 		t.Fatal("Reconcile() error = nil, want corrupt evidence error")
 	}
+
 	if kube.runLists != 1 {
 		t.Fatalf("CertificationRun lists = %d, want 1", kube.runLists)
 	}
@@ -454,6 +458,7 @@ func TestQualificationReconcileIsolatesCorruptEvidenceAndListsRunsOnce(t *testin
 	); err != nil {
 		t.Fatal(err)
 	}
+
 	if _, exists := currentCleanup.Labels[signalv1.NodeQualificationLabel]; exists {
 		t.Fatalf("corrupt evidence prevented unrelated label cleanup: %#v", currentCleanup.Labels)
 	}
@@ -466,6 +471,7 @@ func TestQualificationReconcileIsolatesCorruptEvidenceAndListsRunsOnce(t *testin
 	); err != nil {
 		t.Fatal(err)
 	}
+
 	condition := apimeta.FindStatusCondition(currentCorrupt.Status.Conditions, "EvidenceHealthy")
 	if condition == nil || condition.Status != metav1.ConditionFalse {
 		t.Fatalf("corrupt evidence condition = %#v", condition)
@@ -557,6 +563,7 @@ func TestEvaluateLedgerRevokeWatermarkSurvivesFailedRunDeletion(t *testing.T) {
 	if err != nil {
 		t.Fatalf("evaluateLedger(with failed Run) error = %v", err)
 	}
+
 	if status.Phase != signalv1.NodeCertificationPhaseRevoked ||
 		status.LatestNonPass == nil ||
 		status.LatestNonPass.UID != failed.UID {
@@ -572,6 +579,7 @@ func TestEvaluateLedgerRevokeWatermarkSurvivesFailedRunDeletion(t *testing.T) {
 	if err != nil {
 		t.Fatalf("evaluateLedger(after failed Run deletion) error = %v", err)
 	}
+
 	if status.Phase != signalv1.NodeCertificationPhaseRevoked ||
 		status.LatestNonPass == nil ||
 		status.LatestNonPass.UID != failed.UID {
@@ -587,6 +595,7 @@ func TestEvaluateLedgerRevokeWatermarkSurvivesFailedRunDeletion(t *testing.T) {
 	if err != nil {
 		t.Fatalf("evaluateLedger(with later pass) error = %v", err)
 	}
+
 	if status.Phase != signalv1.NodeCertificationPhaseQualified ||
 		len(status.ContributingRuns) != 1 ||
 		status.ContributingRuns[0].UID != newPass.UID {
@@ -628,6 +637,7 @@ func TestEvaluateLedgerResetWatermarkSurvivesFailedRunDeletion(t *testing.T) {
 	if err != nil {
 		t.Fatalf("evaluateLedger(with failed Run) error = %v", err)
 	}
+
 	if status.Phase == signalv1.NodeCertificationPhaseQualified ||
 		status.LatestNonPass == nil ||
 		status.LatestNonPass.UID != failed.UID ||
@@ -652,6 +662,7 @@ func TestEvaluateLedgerResetWatermarkSurvivesFailedRunDeletion(t *testing.T) {
 	if err != nil {
 		t.Fatalf("evaluateLedger(after failed Run deletion) error = %v", err)
 	}
+
 	if status.Phase == signalv1.NodeCertificationPhaseQualified ||
 		status.LatestNonPass == nil ||
 		status.LatestNonPass.UID != failed.UID ||
@@ -676,6 +687,7 @@ func TestEvaluateLedgerResetWatermarkSurvivesFailedRunDeletion(t *testing.T) {
 	if err != nil {
 		t.Fatalf("evaluateLedger(with replacement passes) error = %v", err)
 	}
+
 	if status.Phase != signalv1.NodeCertificationPhaseQualified ||
 		len(status.ContributingRuns) != 2 {
 		t.Fatalf("replacement passes did not qualify after reset: %#v", status)

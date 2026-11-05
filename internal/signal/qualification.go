@@ -132,9 +132,11 @@ func (r *QualificationReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 	if err != nil {
 		return ctrl.Result{}, err
 	}
+
 	ctx = context.WithValue(ctx, qualificationRunIndexContextKey{}, runIndex)
 
 	var reconcileErrors []error
+
 	for index := range nodes.Items {
 		if err := r.reconcileNodeLedger(ctx, &policy, &nodes.Items[index]); err != nil {
 			reconcileErrors = append(reconcileErrors, err)
@@ -242,6 +244,7 @@ func (r *QualificationReconciler) reconcileNodeLedger(
 	status, err := r.evaluateLedger(ctx, policy, node, &ledger)
 
 	before := ledger.DeepCopy()
+
 	ledger.Status = status
 	if reflect.DeepEqual(before.Status, ledger.Status) {
 		return err
@@ -295,6 +298,7 @@ func (r *QualificationReconciler) evaluateLedger(
 			Message:            "All retained evidence references were verified",
 		})
 	}
+
 	evidenceErr := err
 
 	var liveNonPass *signalv1.LatestNonPassWatermark
@@ -303,6 +307,7 @@ func (r *QualificationReconciler) evaluateLedger(
 	if policy.Spec.NonPassBehavior != signalv1.NonPassBehaviorIgnore {
 		liveNonPass, watermarkErr = latestNonPassWatermark(policy, records)
 	}
+
 	evidenceErr = errors.Join(evidenceErr, watermarkErr)
 	if watermarkErr != nil {
 		clearQualificationStatus(&status)
@@ -358,6 +363,7 @@ func (r *QualificationReconciler) evaluateLedger(
 					requirement.Name,
 				)
 			}
+
 			status.ContributingRuns = recordReferences(contributions)
 			status.PlanDigests = recordPlanDigests(contributions)
 			status.QualifiedAt = nil
@@ -445,6 +451,7 @@ func latestNonPassWatermark(
 		if !ok {
 			continue
 		}
+
 		if !signalv1.IsSHA256Digest(record.Reference.EvidenceDigest) {
 			return nil, fmt.Errorf(
 				"non-pass Run %s has no valid evidence digest",
@@ -487,12 +494,15 @@ func watermarkAfter(
 	if candidate == nil {
 		return false
 	}
+
 	if current == nil {
 		return true
 	}
+
 	if candidate.FinishedAt.After(current.FinishedAt.Time) {
 		return true
 	}
+
 	if !candidate.FinishedAt.Equal(&current.FinishedAt) {
 		return false
 	}
@@ -515,6 +525,7 @@ func (r *QualificationReconciler) qualificationRecords(
 ) ([]qualificationRecord, error) {
 	records := make([]qualificationRecord, 0, len(ledger.Status.ContributingRuns))
 	seen := map[types.UID]struct{}{}
+
 	var evidenceErrors []error
 
 	for index := range ledger.Status.ContributingRuns {
@@ -535,13 +546,14 @@ func (r *QualificationReconciler) qualificationRecords(
 		if !found || !recordIncludesNode(record, nodeUID) {
 			continue
 		}
-		records = append(records, record)
+
 		records = append(records, record)
 	}
 
 	runIndex, ok := ctx.Value(qualificationRunIndexContextKey{}).(qualificationRunIndex)
 	if !ok {
 		var err error
+
 		runIndex, err = r.buildQualificationRunIndex(ctx)
 		if err != nil {
 			evidenceErrors = append(evidenceErrors, err)
@@ -573,6 +585,7 @@ func (r *QualificationReconciler) buildQualificationRunIndex(
 	}
 
 	index := make(qualificationRunIndex)
+
 	for runIndex := range runs.Items {
 		run := &runs.Items[runIndex]
 		if !run.Status.Phase.Terminal() || run.Status.Evidence.Identity == nil ||
@@ -634,6 +647,7 @@ func (r *QualificationReconciler) recordFromEvidence(
 	if err != nil {
 		return qualificationRecord{}, false, err
 	}
+
 	if !found {
 		return qualificationRecord{}, false, errors.New("evidence document is missing")
 	}
@@ -677,9 +691,11 @@ func (r *QualificationReconciler) recordFromEvidence(
 	if err != nil {
 		return qualificationRecord{}, false, fmt.Errorf("derive evidence plan digest: %w", err)
 	}
+
 	if canonical != reference.PlanDigest {
 		return qualificationRecord{}, false, errors.New("evidence plan digest is not canonical")
 	}
+
 	if !qualificationIdentityProvenanceValid(document.QualificationIdentity) {
 		return qualificationRecord{}, false, errors.New("evidence provenance is incomplete")
 	}
@@ -770,6 +786,7 @@ func (r *QualificationReconciler) acceptedRecords(
 		if !found || participant.Verdict != signalv1.QualificationVerdictPass {
 			continue
 		}
+
 		if !participantFingerprintMatches(
 			fingerprintFields,
 			participant,
