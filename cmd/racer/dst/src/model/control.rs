@@ -2370,8 +2370,13 @@ impl ControlSim {
                 && rules::need_image(&r, f.image.as_ref(), is_primary)
                 && let Some(i) = &self.image
                 && i.record.sequence == r.sequence
+                && f.install_image(i.record.clone())
             {
-                f.install_image(i.record.clone());
+                // The copy keeps the publication and its delta from the
+                // seat's previous image (`seat.rs` `fetch_image`,
+                // cluster-control/src/seat.rs:824), so a seat that becomes
+                // primary plans deltas from it.
+                p.follower_image = Some(i.clone());
             }
             if f.ready(now) {
                 self.seats[index as usize].lease_served = Some(r.sequence);
