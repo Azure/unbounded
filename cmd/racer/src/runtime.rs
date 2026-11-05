@@ -14,7 +14,6 @@ use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::OnceLock;
 use std::time::Instant;
-use uring_runtime::environment::CancellationRegistration;
 use uring_runtime::environment::Deadline;
 use uring_runtime::reactor::ReactorWake;
 use uring_runtime::reactor::SUBMISSION_BYTES;
@@ -64,7 +63,7 @@ impl std::hash::BuildHasher for HashState {
 /// Racer candidate policy shares the cancellation lifetime, but is not runtime policy.
 #[derive(Clone)]
 pub struct Cancellation {
-    inner: uring_runtime::environment::Cancellation,
+    inner: racer_io::CancelToken,
     state: Arc<CancellationState>,
 }
 struct CancellationState {
@@ -80,7 +79,7 @@ type CandidateBody = flow_control::progress::ProgressBudget;
 impl Cancellation {
     pub fn new() -> Result<Self> {
         Ok(Self {
-            inner: uring_runtime::environment::Cancellation::new()?,
+            inner: racer_io::CancelToken::new(),
             state: Arc::new(CancellationState {
                 candidate_total: OnceLock::new(),
                 candidate_idle: OnceLock::new(),
@@ -93,12 +92,17 @@ impl Cancellation {
         self.inner.is_cancelled()
     }
     /// Subscribe for one operation's lifetime, even when several operations share
-    /// an executor waker. Dropping the subscription reclaims its capacity and wake.
-    pub fn subscribe(&self) -> Result<CancellationRegistration> {
-        self.inner.subscribe().map_err(Into::into)
+    /// an executor waker. Dropping the subscription removes its wake. Never fails.
+    pub fn subscribe(&self) -> Result<racer_io::CancelWait> {
+        Ok(self.inner.wait())
+    }
+    /// Live wake registrations (diagnostics and tests).
+    pub fn waiters(&self) -> usize {
+        self.inner.waiters()
     }
     pub fn cancel(&self) -> Result<()> {
-        self.inner.cancel().map_err(Into::into)
+        self.inner.cancel();
+        Ok(())
     }
 }
 
@@ -318,7 +322,7 @@ impl uring_runtime::Scope for RequestScope {
     }
 
     fn cancel_token(&self) -> Option<&racer_io::CancelToken> {
-        Some(self.cancellation.inner.token())
+        Some(&self.cancellation.inner)
     }
 
     fn recheck_within(&self) -> Option<std::time::Duration> {
@@ -334,7 +338,7 @@ impl uring_runtime::Scope for RequestScope {
     }
 
     fn op_ctx(&self) -> racer_io::OpCtx {
-        racer_io::OpCtx::with_cancel(self.cancellation.inner.token()).deadline(
+        racer_io::OpCtx::with_cancel(&self.cancellation.inner).deadline(
             self.deadline_at()
                 .map_or(racer_io::Deadline::NEVER, racer_io::Deadline::at),
         )

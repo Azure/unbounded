@@ -430,7 +430,7 @@ pub struct AcquisitionWaiter<'a> {
 
 pub(super) struct Registration {
     flights: Rc<Flights>,
-    cancellation: uring_runtime::environment::CancellationRegistration,
+    cancellation: racer_io::CancelWait,
     // Waiters survive acquisition generations: match page, incarnation, and id.
     page: PageId,
     incarnation: u64,
@@ -475,7 +475,7 @@ pub enum AcquisitionEvent {
 pub struct AcquisitionContext<'a> {
     pub origin: &'a OriginContext,
     pub scope: &'a RequestScope,
-    pub(crate) cancellation: &'a uring_runtime::environment::CancellationRegistration,
+    pub(crate) cancellation: &'a racer_io::CancelWait,
     pub membership: &'a std::sync::Arc<crate::topology::Membership>,
     pub budget: &'a mut AcquisitionBudget,
 }

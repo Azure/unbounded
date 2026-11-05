@@ -2672,14 +2672,7 @@ mod tests {
             assert!(events.contains(&"io-shutdown"));
             assert_eq!(group.runtime.stats().done, 2);
             // Completed workers cannot retain cancellation slots in the caller's scope.
-            let registrations = (0..1024)
-                .map(|_| scope.cancellation.subscribe().unwrap())
-                .collect::<Vec<_>>();
-            assert!(matches!(
-                scope.cancellation.subscribe(),
-                Err(Error::Overloaded)
-            ));
-            drop(registrations);
+            assert_eq!(scope.cancellation.waiters(), 0);
         }
 
         #[test]
