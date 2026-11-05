@@ -1295,6 +1295,10 @@ clocks synchronized.
 | `/debug/hardware` | Live JSON report of block devices, RDMA devices, and Racer's claimed disks and RDMA rails |
 | `/debug/pprof/profile?seconds=30` | Opt-in native CPU profile |
 
+`/metrics` is sent with chunked transfer encoding, so its size grows with the
+cache catalog without a fixed limit. Counters wrap at 2^64; Prometheus treats
+the wrap as a counter reset.
+
 `/debug/hardware` reads sysfs on every request. It never opens block devices.
 The read runs on a helper thread, so a slow read does not delay health checks.
 Values it cannot read are `null`, and section failures are listed in `errors`.
