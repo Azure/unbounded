@@ -34,6 +34,7 @@ func Run() {
 		newCmdReset(cmdCtx),
 		newCmdVersion(),
 		newCmdNSpawnLifecycle(cmdCtx),
+		newCmdNodeLifecycle(cmdCtx),
 		newCmdHostAgentUpgrade(cmdCtx),
 		newCmdRecordAgentUpgradeFailureSignal(),
 		newCmdExec(cmdCtx),

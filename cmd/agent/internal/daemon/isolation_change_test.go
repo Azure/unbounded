@@ -114,7 +114,7 @@ func TestRecover_ReportsAnInterruptedInPlaceChangeAndClearsItsJournal(t *testing
 	res := recoverChanges(t, h, c)
 
 	assert.True(t, res.resolved)
-	assert.Equal(t, isolation.ModeNSpawn, res.failedTarget)
+	assert.Equal(t, isolation.ModeContainer, res.failedTarget)
 	assert.Contains(t, h.source.Calls(), "start kube1", "rolled back to the source")
 
 	change := getChange(t, c)

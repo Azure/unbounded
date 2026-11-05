@@ -58,8 +58,8 @@ func TestLookupEmptyModeIsTheDefault(t *testing.T) {
 func TestLookupRefusesAModeWithNoEntry(t *testing.T) {
 	t.Parallel()
 
-	_, err := agentModes().lookup("container")
-	require.ErrorContains(t, err, `cannot operate isolation mode "container"`)
+	_, err := agentModes().lookup("microvm")
+	require.ErrorContains(t, err, `cannot operate isolation mode "microvm"`)
 }
 
 func TestLookupNoneIsFullyWired(t *testing.T) {

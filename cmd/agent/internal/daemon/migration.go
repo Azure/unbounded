@@ -94,6 +94,10 @@ func preflightMigrationTarget(ctx context.Context, log *slog.Logger, mode isolat
 	switch mode {
 	case isolation.ModeNSpawn:
 		return runMigrationPreflight(ctx, mode, strategy == migrate.InPlace, []preflight.Checker{host.CheckNSpawnRuntime(log)})
+	case isolation.ModeContainer:
+		// The runtime is installed when the target slot is prepared, before
+		// the source is stopped, so a missing runtime is not a failure here.
+		return runMigrationPreflight(ctx, mode, strategy == migrate.InPlace, []preflight.Checker{host.CheckContainerBackend(log)})
 	case isolation.ModeNone:
 		// The none backend's ownership check refuses a host that runs a kubelet
 		// or containerd it does not own, and the node being migrated is one, so
