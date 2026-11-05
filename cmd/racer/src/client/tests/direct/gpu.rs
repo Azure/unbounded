@@ -46,8 +46,19 @@ fn live(helper: &GpuHelper) -> Live {
 }
 
 /// No request holds GPU resources. Contexts stay retained by the helper.
+///
+/// A dropped sink queues its release on the executor without waiting, so
+/// the release may still be in flight when the connection closes. Wait for
+/// it, bounded, before asserting.
 fn assert_released(helper: &GpuHelper) {
-    let live = live(helper);
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut live = live(helper);
+    while (live.imports, live.streams) != (0, helper.executor_streams())
+        && Instant::now() < deadline
+    {
+        std::thread::sleep(Duration::from_millis(1));
+        live = self::live(helper);
+    }
     // The executors keep their streams between requests; no request holds
     // one.
     assert_eq!(
