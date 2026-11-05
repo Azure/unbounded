@@ -1836,8 +1836,6 @@ mod tests {
                         disk: [crate::retention::DiskClassSnapshot {
                             published_pages: u64::MAX,
                             published_payload_bytes: u64::MAX,
-                            index_evicted_pages: u64::MAX,
-                            index_evicted_payload_bytes: u64::MAX,
                             segment_evicted_pages: u64::MAX,
                             segment_evicted_payload_bytes: u64::MAX,
                             read_payload_bytes: u64::MAX,

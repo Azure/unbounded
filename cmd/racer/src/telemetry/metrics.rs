@@ -199,11 +199,9 @@ pub(super) const HELD_METRICS: [(&str, &str); 3] = [
     ("racer_held_payload_bytes", "gauge"),
     ("racer_held_segments", "gauge"),
 ];
-const DISK_CLASS_METRICS: [&str; 7] = [
+const DISK_CLASS_METRICS: [&str; 5] = [
     "racer_disk_class_publications_total",
     "racer_disk_class_published_payload_bytes_total",
-    "racer_disk_class_index_evicted_pages_total",
-    "racer_disk_class_index_evicted_payload_bytes_total",
     "racer_disk_class_segment_evicted_pages_total",
     "racer_disk_class_segment_evicted_payload_bytes_total",
     "racer_disk_class_read_payload_bytes_total",
@@ -651,8 +649,6 @@ impl Metrics {
                 for (total, value) in totals.iter_mut().zip([
                     class.published_pages,
                     class.published_payload_bytes,
-                    class.index_evicted_pages,
-                    class.index_evicted_payload_bytes,
                     class.segment_evicted_pages,
                     class.segment_evicted_payload_bytes,
                     class.read_payload_bytes,
@@ -1184,8 +1180,6 @@ mod retention_metric_tests {
             snapshot.disk[i] = crate::retention::DiskClassSnapshot {
                 published_pages: 1,
                 published_payload_bytes: 17,
-                index_evicted_pages: 2,
-                index_evicted_payload_bytes: 34,
                 segment_evicted_pages: 3,
                 segment_evicted_payload_bytes: 51,
                 read_payload_bytes: u64::MAX,
@@ -1196,10 +1190,7 @@ mod retention_metric_tests {
         let mut output = String::new();
         workers[0].write_retention(&mut output).unwrap();
         for class in ["nonowned", "owned"] {
-            for (name, value) in DISK_CLASS_METRICS
-                .into_iter()
-                .zip([1, 17, 2, 34, 3, 51, u64::MAX])
-            {
+            for (name, value) in DISK_CLASS_METRICS.into_iter().zip([1, 17, 3, 51, u64::MAX]) {
                 assert!(output.contains(&format!("# TYPE {name} counter\n")));
                 assert!(
                     output.contains(&format!("{name}{{classification=\"{class}\"}} {value}\n"))
@@ -1211,7 +1202,7 @@ mod retention_metric_tests {
                 .lines()
                 .filter(|line| line.contains("{classification="))
                 .count(),
-            14
+            10
         );
         assert!(output.contains("racer_disk_pending_payload_bytes 6\n"));
         assert!(output.contains("racer_disk_indexed_payload_bytes 34\n"));

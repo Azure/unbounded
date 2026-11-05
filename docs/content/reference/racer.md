@@ -1071,8 +1071,6 @@ Ownership refresh affects subsequent events only, never rewrites old counters.
 | `racer_disk_used_bytes{disk}` | Gauge of reserved record bytes on this backing disk, including headers, tags, and alignment padding, until segment recycling |
 | `racer_disk_class_publications_total{classification}` | Completed writer publications; excludes checkpoint restoration and deduplicated enqueue |
 | `racer_disk_class_published_payload_bytes_total{classification}` | Logical page payload bytes in those publications |
-| `racer_disk_class_index_evicted_pages_total{classification}` | Victim mappings removed to reserve page-index capacity |
-| `racer_disk_class_index_evicted_payload_bytes_total{classification}` | Logical payload bytes of those index victims |
 | `racer_disk_class_segment_evicted_pages_total{classification}` | Victim mappings removed by bounded segment reclamation, including index-only segment reclamation |
 | `racer_disk_class_segment_evicted_payload_bytes_total{classification}` | Logical payload bytes of those segment victims, not physical reclaimed disk space |
 | `racer_disk_class_read_payload_bytes_total{classification}` | Logical page payload bytes returned successfully by StoreReader after framing and mapping checks |

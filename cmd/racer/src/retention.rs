@@ -55,8 +55,6 @@ pub struct Snapshot {
 pub struct DiskClassSnapshot {
     pub published_pages: u64,
     pub published_payload_bytes: u64,
-    pub index_evicted_pages: u64,
-    pub index_evicted_payload_bytes: u64,
     pub segment_evicted_pages: u64,
     pub segment_evicted_payload_bytes: u64,
     pub read_payload_bytes: u64,
@@ -622,21 +620,10 @@ impl Retention {
             c.published_payload_bytes = c.published_payload_bytes.saturating_add(bytes);
         });
     }
-    pub(crate) fn evicted(&self, page: &PageId, bytes: u64, segment: bool) {
+    pub(crate) fn evicted(&self, page: &PageId, bytes: u64) {
         self.disk_event(page, |c| {
-            let (pages, payload) = if segment {
-                (
-                    &mut c.segment_evicted_pages,
-                    &mut c.segment_evicted_payload_bytes,
-                )
-            } else {
-                (
-                    &mut c.index_evicted_pages,
-                    &mut c.index_evicted_payload_bytes,
-                )
-            };
-            *pages = pages.saturating_add(1);
-            *payload = payload.saturating_add(bytes);
+            c.segment_evicted_pages = c.segment_evicted_pages.saturating_add(1);
+            c.segment_evicted_payload_bytes = c.segment_evicted_payload_bytes.saturating_add(bytes);
         });
     }
     pub(crate) fn disk_read(&self, page: &PageId, bytes: u64) {
@@ -996,9 +983,8 @@ mod tests {
         policy.published(&page(0), 17);
         owned.set(true);
         policy.disk_read(&page(0), 17);
-        policy.evicted(&page(0), 17, false);
         owned.set(false);
-        policy.evicted(&page(1), 3, true);
+        policy.evicted(&page(1), 3);
         let before = calls.get();
         for _ in 0..10 {
             let snapshot = policy.snapshot();
@@ -1008,8 +994,6 @@ mod tests {
             assert_eq!(snapshot.disk[0].published_payload_bytes, 17);
             assert_eq!(snapshot.disk[1].published_pages, 0);
             assert_eq!(snapshot.disk[1].read_payload_bytes, 17);
-            assert_eq!(snapshot.disk[1].index_evicted_pages, 1);
-            assert_eq!(snapshot.disk[1].index_evicted_payload_bytes, 17);
             assert_eq!(snapshot.disk[0].segment_evicted_pages, 1);
             assert_eq!(snapshot.disk[0].segment_evicted_payload_bytes, 3);
             assert_eq!(snapshot.observations, 0);

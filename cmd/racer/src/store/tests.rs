@@ -929,7 +929,6 @@ fn disk_observability_failed_write_and_read_do_not_credit_bytes() {
     );
     assert_eq!(retention.snapshot().disk[0].read_payload_bytes, 0);
     assert_eq!(retention.snapshot().indexed_payload_bytes, 0);
-    assert_eq!(retention.snapshot().disk[0].index_evicted_pages, 0);
     assert_eq!(retention.snapshot().disk[0].segment_evicted_pages, 0);
     assert!(
         f.segments.usage()[0].1 > reserved,

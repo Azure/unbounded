@@ -1319,7 +1319,7 @@ impl page_alloc::SegmentEntries for Index {
                 .metadata
                 .page_length(&page)
                 .expect("validated indexed page");
-            self.retention().evicted(&page, u64::from(bytes), true);
+            self.retention().evicted(&page, u64::from(bytes));
             self.remove_if_matches(&page, &location);
         }
         removed
