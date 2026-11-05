@@ -676,6 +676,16 @@ spec:
                     maxLength: 2048
                     type: string
                 type: object
+                x-kubernetes-validations:
+                - message: evidence URI is write-once
+                  rule: '!has(oldSelf.uri) || oldSelf.uri.size() == 0 || (has(self.uri)
+                    && self.uri == oldSelf.uri)'
+                - message: evidence digest is write-once
+                  rule: '!has(oldSelf.digest) || oldSelf.digest.size() == 0 || (has(self.digest)
+                    && self.digest == oldSelf.digest)'
+                - message: evidence identity is write-once
+                  rule: '!has(oldSelf.identity) || (has(self.identity) && self.identity
+                    == oldSelf.identity)'
               observedGeneration:
                 format: int64
                 type: integer
@@ -704,6 +714,11 @@ spec:
         required:
         - spec
         type: object
+        x-kubernetes-validations:
+        - message: evidence identity requires and must match spec.planDigest
+          rule: '!has(self.status) || !has(self.status.evidence) || !has(self.status.evidence.identity)
+            || (has(self.spec.planDigest) && self.status.evidence.identity.planDigest
+            == self.spec.planDigest)'
     served: true
     storage: true
     subresources:

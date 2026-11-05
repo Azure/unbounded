@@ -17,7 +17,14 @@ type PinnedPolicy struct {
 	Generation int64 `json:"generation"`
 }
 
-// +kubebuilder:validation:XValidation:rule="self.policy == oldSelf.policy",message="policy is immutable"
+const (
+	NodeCertificationConditionGateProjected     = "GateProjected"
+	NodeCertificationReasonProtectionUnverified = "NodeRestrictionUnverified"
+)
+
+// +kubebuilder:validation:XValidation:rule="self.policy.name == oldSelf.policy.name",message="policy name is immutable"
+// +kubebuilder:validation:XValidation:rule="self.policy.uid == oldSelf.policy.uid",message="policy UID is immutable"
+// +kubebuilder:validation:XValidation:rule="self.policy.generation >= oldSelf.policy.generation",message="policy generation cannot decrease"
 // +kubebuilder:validation:XValidation:rule="self.nodeName == oldSelf.nodeName",message="nodeName is immutable"
 // +kubebuilder:validation:XValidation:rule="self.nodeUID == oldSelf.nodeUID",message="nodeUID is immutable"
 // +kubebuilder:validation:XValidation:rule="size(self.nodeUID) > 0",message="nodeUID is required"
@@ -56,13 +63,15 @@ type ContributingRunReference struct {
 }
 
 type NodeCertificationStatus struct {
+	// ObservedGeneration is the Policy generation reflected by this status.
+	// +kubebuilder:validation:Minimum=0
 	ObservedGeneration int64                  `json:"observedGeneration,omitempty"`
 	Phase              NodeCertificationPhase `json:"phase,omitempty"`
 	// +kubebuilder:validation:MaxLength=1024
 	Reason string `json:"reason,omitempty"`
 	// +kubebuilder:validation:Pattern=`^sha256:[0-9a-f]{64}$`
 	PolicyDigest string `json:"policyDigest,omitempty"`
-	// +kubebuilder:validation:MaxItems=32
+	// +kubebuilder:validation:MaxItems=64
 	// +listType=set
 	// +kubebuilder:validation:items:Pattern=`^sha256:[0-9a-f]{64}$`
 	PlanDigests []string         `json:"planDigests,omitempty"`
@@ -79,7 +88,12 @@ type NodeCertificationStatus struct {
 }
 
 // NodeCertification is the qualification ledger for one Policy UID and Node UID.
-// Qualification is fail-closed: deleting this object removes its gate projection.
+// No ledger individually owns the shared qualification label. The controller
+// combines every ProtectedLabel Policy fail-closed and removes the label unless
+// all have a Qualified, unexpired ledger for the exact Node UID. While
+// NodeRestriction protection is disabled or unverified, the controller removes
+// the label from every Node and sets GateProjected=False with reason
+// NodeRestrictionUnverified.
 // +kubebuilder:object:root=true
 // +kubebuilder:resource:scope=Namespaced,shortName=nodecert
 // +kubebuilder:subresource:status

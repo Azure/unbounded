@@ -36,7 +36,12 @@ spec:
       openAPIV3Schema:
         description: |-
           NodeCertification is the qualification ledger for one Policy UID and Node UID.
-          Qualification is fail-closed: deleting this object removes its gate projection.
+          No ledger individually owns the shared qualification label. The controller
+          combines every ProtectedLabel Policy fail-closed and removes the label unless
+          all have a Qualified, unexpired ledger for the exact Node UID. While
+          NodeRestriction protection is disabled or unverified, the controller removes
+          the label from every Node and sets GateProjected=False with reason
+          NodeRestrictionUnverified.
         properties:
           apiVersion:
             description: |-
@@ -96,8 +101,12 @@ spec:
             - policy
             type: object
             x-kubernetes-validations:
-            - message: policy is immutable
-              rule: self.policy == oldSelf.policy
+            - message: policy name is immutable
+              rule: self.policy.name == oldSelf.policy.name
+            - message: policy UID is immutable
+              rule: self.policy.uid == oldSelf.policy.uid
+            - message: policy generation cannot decrease
+              rule: self.policy.generation >= oldSelf.policy.generation
             - message: nodeName is immutable
               rule: self.nodeName == oldSelf.nodeName
             - message: nodeUID is immutable
@@ -240,7 +249,10 @@ spec:
                 - message: nodeUID is required
                   rule: size(self.nodeUID) > 0
               observedGeneration:
+                description: ObservedGeneration is the Policy generation reflected
+                  by this status.
                 format: int64
+                minimum: 0
                 type: integer
               phase:
                 enum:
@@ -255,7 +267,7 @@ spec:
                 items:
                   pattern: ^sha256:[0-9a-f]{64}$
                   type: string
-                maxItems: 32
+                maxItems: 64
                 type: array
                 x-kubernetes-list-type: set
               policyDigest:

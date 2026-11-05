@@ -167,6 +167,9 @@ type WorkflowStatus struct {
 	Phase string `json:"phase,omitempty"`
 }
 
+// +kubebuilder:validation:XValidation:rule="!has(oldSelf.uri) || oldSelf.uri.size() == 0 || (has(self.uri) && self.uri == oldSelf.uri)",message="evidence URI is write-once"
+// +kubebuilder:validation:XValidation:rule="!has(oldSelf.digest) || oldSelf.digest.size() == 0 || (has(self.digest) && self.digest == oldSelf.digest)",message="evidence digest is write-once"
+// +kubebuilder:validation:XValidation:rule="!has(oldSelf.identity) || (has(self.identity) && self.identity == oldSelf.identity)",message="evidence identity is write-once"
 type EvidenceStatus struct {
 	// +kubebuilder:validation:MaxLength=2048
 	URI string `json:"uri,omitempty"`
@@ -241,6 +244,7 @@ type CertificationRunStatus struct {
 	Conditions []metav1.Condition `json:"conditions,omitempty"`
 }
 
+// +kubebuilder:validation:XValidation:rule="!has(self.status) || !has(self.status.evidence) || !has(self.status.evidence.identity) || (has(self.spec.planDigest) && self.status.evidence.identity.planDigest == self.spec.planDigest)",message="evidence identity requires and must match spec.planDigest"
 // +kubebuilder:object:root=true
 // +kubebuilder:resource:scope=Namespaced,shortName=certrun
 // +kubebuilder:subresource:status
