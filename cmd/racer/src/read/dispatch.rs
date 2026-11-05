@@ -1070,10 +1070,14 @@ impl WorkerEndpoint {
         let waker = futures::task::noop_waker();
         self.poll(&mut Context::from_waker(&waker), work_budget)
     }
-    /// Earliest caller deadline. The I/O loop currently uses its bounded 1 ms tick
-    /// to check deadlines rather than scheduling this value directly.
+    /// Earliest instant [`Self::poll`] has timed work: a caller deadline or a
+    /// node-wide prefetch expiry. The owning lane parks no later than this.
     pub fn next_deadline(&self) -> Option<std::time::Instant> {
-        self.active.next_deadline(&self.mailbox)
+        self.active
+            .next_deadline(&self.mailbox)
+            .into_iter()
+            .chain(self.directory.prefetch.next_wake())
+            .min()
     }
     pub fn uninstall(&mut self) -> Result<()> {
         self.stop_admission();

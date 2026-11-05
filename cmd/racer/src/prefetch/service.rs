@@ -232,7 +232,15 @@ impl Prefetch {
             let (queued, tickets) = registry.gauges();
             metrics.set_gauges(queued, tickets);
         }
-        *self.next_wake.lock().unwrap() = registry.next_deadline();
+        // Keep a pending status-wait wake from `wake_at`: the registry does not
+        // know it, and replacing it would leave that waiter parked past `until`.
+        let now = self.now();
+        let mut next = self.next_wake.lock().unwrap();
+        *next = registry
+            .next_deadline()
+            .into_iter()
+            .chain(next.filter(|at| *at > now))
+            .min();
     }
 
     /// Called from every worker's poll: expire tickets and wake the pump and
@@ -255,8 +263,14 @@ impl Prefetch {
         self.wake_waiters();
     }
 
+    /// When the next [`Self::tick`] has expiries to run. A contended lock
+    /// reports none; its holder publishes the next deadline itself.
+    pub fn next_wake(&self) -> Option<Instant> {
+        self.next_wake.try_lock().ok().and_then(|next| *next)
+    }
+
     /// Ask the next tick at or after `at` to wake waiters.
-    fn wake_at(&self, at: Instant) {
+    pub(super) fn wake_at(&self, at: Instant) {
         let mut next = self.next_wake.lock().unwrap();
         if next.is_none_or(|current| at < current) {
             *next = Some(at);

@@ -2525,6 +2525,11 @@ impl uring_runtime::group::Service<RequestScope> for WorkerApplication {
             .next_deadline()
             .into_iter()
             .chain(self.flights.next_deadline())
+            .chain(
+                self.endpoint
+                    .as_ref()
+                    .and_then(WorkerEndpoint::next_deadline),
+            )
             .min()
             .map_or(maximum, |deadline| {
                 maximum.min(deadline.saturating_duration_since(self.ctx().now()))

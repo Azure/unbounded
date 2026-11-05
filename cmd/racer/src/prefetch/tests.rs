@@ -1089,3 +1089,18 @@ fn put_replaces_the_ticket_credential() {
     assert_eq!(r.outcome("t").0, RefOutcome::Succeeded);
     assert_eq!(r.outcome("other").0, RefOutcome::Succeeded);
 }
+
+/// A status-wait wake survives registry changes and is reported to the
+/// owning lane's park deadline.
+#[test]
+fn status_wait_wake_survives_registry_changes() {
+    let prefetch = super::service::Prefetch::new(racer_io::WorkerCtx::host());
+    assert_eq!(prefetch.next_wake(), None);
+    let until = Instant::now() + Duration::from_secs(60);
+    prefetch.wake_at(until);
+    assert_eq!(prefetch.next_wake(), Some(until));
+    prefetch.passthrough_caches(&std::collections::HashSet::from([cache()]));
+    assert_eq!(prefetch.next_wake(), Some(until));
+    prefetch.tick();
+    assert_eq!(prefetch.next_wake(), Some(until));
+}
