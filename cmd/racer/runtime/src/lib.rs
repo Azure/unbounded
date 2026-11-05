@@ -71,6 +71,14 @@ pub trait Scope: Clone + 'static {
     fn cancellation(&self) -> Option<&environment::Cancellation> {
         None
     }
+
+    /// The reactor operation context: cancellation token and deadline.
+    fn op_ctx(&self) -> racer_io::OpCtx {
+        match self.cancellation() {
+            Some(cancellation) => racer_io::OpCtx::with_cancel(cancellation.token()),
+            None => racer_io::OpCtx::none(),
+        }
+    }
 }
 
 /// Accounting hook. Charges stay alive until their resources are fenced.

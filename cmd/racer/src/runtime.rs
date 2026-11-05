@@ -277,6 +277,11 @@ impl uring_runtime::Scope for RequestScope {
     fn cancellation(&self) -> Option<&uring_runtime::environment::Cancellation> {
         Some(&self.cancellation.inner)
     }
+
+    fn op_ctx(&self) -> racer_io::OpCtx {
+        racer_io::OpCtx::with_cancel(self.cancellation.inner.token())
+            .deadline(racer_io::Deadline::at(self.deadline.0))
+    }
 }
 impl wire_codec::rest::Scope for RequestScope {
     fn deadline(&self) -> Instant {
