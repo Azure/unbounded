@@ -100,6 +100,14 @@ func resolveDesiredRepaveConfig(
 		desired.Isolation = string(machine.Spec.Isolation)
 	}
 
+	// The download sources are not part of the applied agent config, so they
+	// come from the Machine every time: without them a repave, and the
+	// bootstrap after a reprovision, would fetch from the upstream defaults on
+	// a host that can only reach the mirrors the Machine names.
+	if machine.Spec.Agent != nil {
+		desired.Downloads = provision.AgentDownloadsFromSpec(machine.Spec.Agent.Downloads)
+	}
+
 	var appliedRef *v1alpha3.MachineConfigurationRefStatus
 
 	if machine.Spec.ConfigurationRef != nil {
