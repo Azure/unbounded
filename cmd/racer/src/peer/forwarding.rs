@@ -1100,7 +1100,8 @@ mod tests {
             cache: CacheId(node(88).0),
             key: CacheKey([7; 32]),
         };
-        let scope = RequestScope::new(
+        let scope = RequestScope::on(
+            &crate::test_support::clock(),
             RequestId([id; 16]),
             Instant::now() + Duration::from_secs(30),
         )

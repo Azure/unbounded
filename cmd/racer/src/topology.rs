@@ -1000,7 +1000,11 @@ impl Paths {
         from: &NodeId,
         budget: &RouteBudget,
     ) -> Result<Route> {
-        let scope = RequestScope::new(budget.request, budget.deadline.0)?;
+        let scope = RequestScope::on(
+            &crate::test_support::clock(),
+            budget.request,
+            budget.deadline.0,
+        )?;
         futures::executor::block_on(self.shortest_async(membership, from, budget, &scope))
     }
 

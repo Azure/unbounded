@@ -2067,7 +2067,8 @@ pub(crate) mod tests {
             }
         }
         fn scope() -> RequestScope {
-            RequestScope::new(
+            RequestScope::on(
+                &crate::test_support::clock(),
                 RequestId([7; 16]),
                 uring_runtime::environment::now() + Duration::from_secs(5),
             )

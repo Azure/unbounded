@@ -2896,7 +2896,8 @@ pub(super) mod tests {
                 4,
             );
             let _queue = worker.drivers.enter();
-            let scope = RequestScope::new(
+            let scope = RequestScope::on(
+                &crate::test_support::clock(),
                 RequestId([7; 16]),
                 uring_runtime::environment::now()
                     + if progressing {

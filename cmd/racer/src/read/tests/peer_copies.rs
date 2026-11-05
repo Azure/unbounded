@@ -4579,7 +4579,8 @@ impl SuccessorFixture {
 
     /// Restart the request scope with a deadline `secs` from now.
     fn deadline(&mut self, secs: u64) {
-        self.f.scope = RequestScope::new(
+        self.f.scope = RequestScope::on(
+            &crate::test_support::clock(),
             self.f.scope.request,
             uring_runtime::environment::now() + Duration::from_secs(secs),
         )

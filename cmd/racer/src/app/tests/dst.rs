@@ -1012,7 +1012,8 @@ mod scenarios {
         );
         let previous = harness.nodes[source].config.node.clone();
         for round in 0u64..1100 {
-            let scope = RequestScope::new(
+            let scope = RequestScope::on(
+                &crate::test_support::clock(),
                 RequestId([1; 16]),
                 uring_runtime::environment::now() + Duration::from_secs(5),
             )

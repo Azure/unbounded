@@ -1780,7 +1780,8 @@ mod flight {
         )
     }
     fn scope() -> RequestScope {
-        RequestScope::new(
+        RequestScope::on(
+            &crate::test_support::clock(),
             crate::model::RequestId([0; 16]),
             Instant::now() + Duration::from_secs(60),
         )
@@ -2466,7 +2467,12 @@ mod timeouts {
     impl Fixture {
         fn bounded(mut self, request: u8, seconds: u64, links: u8) -> Self {
             let deadline = uring_runtime::environment::now() + Duration::from_secs(seconds);
-            self.scope = RequestScope::new(RequestId([request; 16]), deadline).unwrap();
+            self.scope = RequestScope::on(
+                &crate::test_support::clock(),
+                RequestId([request; 16]),
+                deadline,
+            )
+            .unwrap();
             self.budget = AcquisitionBudget::new(deadline, 16, links);
             self
         }
@@ -2522,9 +2528,12 @@ mod timeouts {
                 )),
                 crate::test_support::ctx(),
             );
-            let scope =
-                RequestScope::new(RequestId([3; 16]), Instant::now() + Duration::from_secs(1))
-                    .unwrap();
+            let scope = RequestScope::on(
+                &crate::test_support::clock(),
+                RequestId([3; 16]),
+                Instant::now() + Duration::from_secs(1),
+            )
+            .unwrap();
             let budget = AcquisitionBudget::new(scope.deadline.0, 16, 24);
             Self {
                 policy,

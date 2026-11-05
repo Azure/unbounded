@@ -3280,7 +3280,8 @@ pub(super) mod tests {
             metadata: None,
             authorization: None,
         };
-        let scope = RequestScope::new(
+        let scope = RequestScope::on(
+            &crate::test_support::clock(),
             RequestId([0; 16]),
             Instant::now() + std::time::Duration::from_secs(60),
         )
@@ -4755,7 +4756,12 @@ pub(super) mod tests {
         use uring_runtime::environment::SimulationClock;
         use uring_runtime::environment::now;
         fn scope() -> RequestScope {
-            RequestScope::new(RequestId([1; 16]), now() + Duration::from_secs(10)).unwrap()
+            RequestScope::on(
+                &crate::test_support::clock(),
+                RequestId([1; 16]),
+                now() + Duration::from_secs(10),
+            )
+            .unwrap()
         }
         fn controller(slots: usize, bytes: usize) -> Arc<Hedges> {
             Hedges::new(

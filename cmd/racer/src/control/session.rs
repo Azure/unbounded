@@ -1118,7 +1118,8 @@ pub(super) mod tests {
 
     /// Long enough for several independent generic retry turns.
     fn scope() -> RequestScope {
-        RequestScope::new(
+        RequestScope::on(
+            &crate::test_support::clock(),
             crate::model::RequestId([8; 16]),
             uring_runtime::environment::now() + Duration::from_secs(300),
         )

@@ -1266,7 +1266,7 @@ impl WorkerApplication {
         runtime: WorkerRuntime,
         discovered_nics: Vec<racer_control_wire::RailMapping>,
     ) -> Result<Self> {
-        let environment = uring_runtime::environment::Environment::current();
+        let environment = runtime.reactor.environment().clone();
         let started = runtime.reactor.ctx().now();
         let metrics = node
             .metrics

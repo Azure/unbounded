@@ -42,7 +42,8 @@ fn mapping(n: u8) -> RailMapping {
 }
 
 pub(crate) fn scope() -> RequestScope {
-    RequestScope::new(
+    RequestScope::on(
+        &crate::test_support::clock(),
         crate::model::RequestId([1; 16]),
         uring_runtime::environment::now() + Duration::from_secs(5),
     )

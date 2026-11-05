@@ -276,12 +276,6 @@ impl RequestScope {
         Self::with_clock(request, deadline, clock.clone())
     }
 
-    /// MIGRATION(test shim): a scope on the thread's test clock.
-    #[cfg(test)]
-    pub fn new(request: RequestId, deadline: Instant) -> Result<Self> {
-        Self::with_clock(request, deadline, crate::test_support::clock())
-    }
-
     pub fn check(&self) -> Result<()> {
         self.check_at(self.clock.now())
     }
@@ -1715,7 +1709,12 @@ mod tests {
         let _guard = role.enter();
         let start = now();
         let wall = wall_now();
-        let scope = RequestScope::new(RequestId([1; 16]), start + Duration::from_secs(2)).unwrap();
+        let scope = RequestScope::on(
+            &crate::test_support::clock(),
+            RequestId([1; 16]),
+            start + Duration::from_secs(2),
+        )
+        .unwrap();
         let wire = crate::peer::protocol::encode_deadline(scope.deadline).unwrap();
         let mut first = [0; 64];
         fill_random(&mut first[..3]).unwrap();
@@ -1762,7 +1761,8 @@ mod tests {
             let clock = SimulationClock::new(1);
             let environment = clock.environment(0);
             let _time = environment.enter();
-            let scope = RequestScope::new(
+            let scope = RequestScope::on(
+                &crate::test_support::clock(),
                 RequestId([0; 16]),
                 uring_runtime::environment::now() + Duration::from_secs(1),
             )
@@ -1799,7 +1799,8 @@ mod tests {
             let _time = environment.enter();
             let mut cx = Context::from_waker(futures::task::noop_waker_ref());
             for expected in [Error::Cancelled, Error::DeadlineExceeded] {
-                let scope = RequestScope::new(
+                let scope = RequestScope::on(
+                    &crate::test_support::clock(),
                     RequestId([0; 16]),
                     uring_runtime::environment::now() + Duration::from_millis(1),
                 )
@@ -1815,7 +1816,8 @@ mod tests {
                 }
                 assert_eq!(operation.as_mut().poll(&mut cx), Poll::Ready(Err(expected)));
             }
-            let scope = RequestScope::new(
+            let scope = RequestScope::on(
+                &crate::test_support::clock(),
                 RequestId([0; 16]),
                 uring_runtime::environment::now() + Duration::from_secs(1),
             )
@@ -1847,7 +1849,8 @@ mod tests {
                 crate::test_support::cluster::config(false).limits,
             )));
             let reactor = Reactor::new(admission);
-            let scope = RequestScope::new(
+            let scope = RequestScope::on(
+                &crate::test_support::clock(),
                 RequestId([0; 16]),
                 uring_runtime::environment::now() + Duration::from_secs(1),
             )

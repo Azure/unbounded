@@ -2214,7 +2214,8 @@ mod tests {
                         );
                     }
                 });
-                let scope = RequestScope::new(
+                let scope = RequestScope::on(
+                    &crate::test_support::clock(),
                     RequestId([0; 16]),
                     uring_runtime::environment::now() + Duration::from_secs(240),
                 )
@@ -2394,7 +2395,8 @@ mod tests {
                         let failures =
                             crate::telemetry::Failures::with_clock(crate::test_support::clock());
                         client.set_failure_observer(failures.observer(WorkerId(0)));
-                        let scope = RequestScope::new(
+                        let scope = RequestScope::on(
+                            &crate::test_support::clock(),
                             crate::model::RequestId([0; 16]),
                             uring_runtime::environment::now() + Duration::from_secs(10),
                         )
@@ -3001,7 +3003,8 @@ mod tests {
                 for mode in ["success", "failure", "cancel", "abandon"] {
                     let mut cx = Context::from_waker(futures::task::noop_waker_ref());
                     let scopes = [0, 1].map(|id| {
-                        RequestScope::new(
+                        RequestScope::on(
+                            &crate::test_support::clock(),
                             crate::model::RequestId([id; 16]),
                             uring_runtime::environment::now() + Duration::from_secs(10),
                         )
@@ -3420,7 +3423,8 @@ mod tests {
                         admission,
                         client: CryptoClient::new(io),
                         engine,
-                        scope: RequestScope::new(
+                        scope: RequestScope::on(
+                            &crate::test_support::clock(),
                             crate::model::RequestId([0; 16]),
                             uring_runtime::environment::now() + std::time::Duration::from_secs(5),
                         )

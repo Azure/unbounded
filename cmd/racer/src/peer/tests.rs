@@ -3076,8 +3076,12 @@ pub(super) fn request(
     admission: &flow_control::Quotas<AdmissionPolicy>,
     attempt: u8,
 ) -> PeerRequest {
-    let scope =
-        RequestScope::new(RequestId([1; 16]), Instant::now() + Duration::from_secs(30)).unwrap();
+    let scope = RequestScope::on(
+        &crate::test_support::clock(),
+        RequestId([1; 16]),
+        Instant::now() + Duration::from_secs(30),
+    )
+    .unwrap();
     let object = ObjectId {
         cache: CacheId(CACHE.into()),
         key: CacheKey([3; 32]),

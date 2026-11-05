@@ -225,7 +225,8 @@ mod duplex_release {
         let membership = local_membership(&signers[0]);
         let (local, mut endpoint, _publication) =
             coordinator(&f, &signers[0], &membership, NoPeer::requester());
-        let scope = RequestScope::new(
+        let scope = RequestScope::on(
+            &crate::test_support::clock(),
             f.scope.request,
             uring_runtime::environment::now() + Duration::from_secs(60),
         )
@@ -322,7 +323,12 @@ mod duplex_release {
             "blocked send owns a completion fence"
         );
         // An independent reader retains the same immutable page with its own pipe.
-        let other_scope = RequestScope::new(f.scope.request, scope.deadline.0).unwrap();
+        let other_scope = RequestScope::on(
+            &crate::test_support::clock(),
+            f.scope.request,
+            scope.deadline.0,
+        )
+        .unwrap();
         let other = delivery
             .attach(
                 f.fill

@@ -3489,7 +3489,8 @@ fn fixture_with_caches(
         membership,
         page,
         pools: None,
-        scope: RequestScope::new(
+        scope: RequestScope::on(
+            &crate::test_support::clock(),
             RequestId([1; 16]),
             Instant::now() + Duration::from_secs(600),
         )

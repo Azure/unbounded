@@ -237,6 +237,12 @@ impl<S: Scope, Q: Budget> Reactor<S, Q> {
         );
     }
 
+    /// The environment captured when this reactor was constructed. Owners
+    /// built on the reactor's thread reuse it instead of reading the ambient one.
+    pub fn environment(&self) -> &super::environment::Environment {
+        &self.environment
+    }
+
     /// Create an uninitialized reactor; resources are acquired by [`Self::init`].
     pub fn new(queue_entries: usize, budget: Q) -> Self {
         let environment = super::environment::Environment::current();

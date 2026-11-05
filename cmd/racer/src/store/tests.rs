@@ -1451,7 +1451,12 @@ impl Fixture {
     }
 }
 fn scope() -> RequestScope {
-    RequestScope::new(RequestId([0; 16]), Instant::now() + Duration::from_secs(10)).unwrap()
+    RequestScope::on(
+        &crate::test_support::clock(),
+        RequestId([0; 16]),
+        Instant::now() + Duration::from_secs(10),
+    )
+    .unwrap()
 }
 
 #[test]
