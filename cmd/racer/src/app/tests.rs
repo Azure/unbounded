@@ -5062,7 +5062,12 @@ fn shared_pressure_constrains_pools_and_releases_retained_buffers() {
 fn disabled_pressure_ignores_shared_level_but_still_reports_resident_memory() {
     use crate::pressure::PressureLevel;
     let mut worker = wake_test_worker();
-    worker.pressure = WorkerPressure::new(false, &worker.node.pressure, true);
+    worker.pressure = WorkerPressure::new(
+        false,
+        &worker.node.pressure,
+        true,
+        crate::test_support::clock().now(),
+    );
     assert!(worker.pressure.monitor.is_none());
     worker.node.pressure.store(PressureLevel::Critical);
     let now = uring_runtime::environment::now();
@@ -5086,9 +5091,9 @@ fn disabled_pressure_ignores_shared_level_but_still_reports_resident_memory() {
 #[test]
 fn sampling_worker_owns_the_monitor_and_others_do_not() {
     let shared = crate::pressure::SharedPressure::default();
-    let sampler = WorkerPressure::new(true, &shared, true);
+    let sampler = WorkerPressure::new(true, &shared, true, crate::test_support::clock().now());
     assert!(sampler.monitor.is_some() && sampler.shared.is_some() && sampler.samples_memory);
-    let other = WorkerPressure::new(true, &shared, false);
+    let other = WorkerPressure::new(true, &shared, false, crate::test_support::clock().now());
     assert!(other.monitor.is_none() && other.shared.is_some() && !other.samples_memory);
 }
 

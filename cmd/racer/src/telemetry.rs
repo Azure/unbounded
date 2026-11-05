@@ -3626,9 +3626,16 @@ impl Metrics {
     pub fn record(&self, event: Event, amount: u64) {
         self.core.add(event, amount);
     }
-    /// Add one observation of the time since `start` to a count and nanosecond sum pair.
-    pub fn record_duration(&self, count: Event, sum: Event, start: std::time::Instant) {
-        let elapsed = uring_runtime::environment::now().saturating_duration_since(start);
+    /// Add one observation of the time from `start` to `now` to a count and
+    /// nanosecond sum pair.
+    pub fn record_duration(
+        &self,
+        count: Event,
+        sum: Event,
+        start: std::time::Instant,
+        now: std::time::Instant,
+    ) {
+        let elapsed = now.saturating_duration_since(start);
         self.record(sum, u64::try_from(elapsed.as_nanos()).unwrap_or(u64::MAX));
         self.record(count, 1);
     }

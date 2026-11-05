@@ -1602,7 +1602,12 @@ impl WorkerApplication {
             cache_preparing_generation: 0,
             control_scope: None,
             next_health: started,
-            pressure: WorkerPressure::new(config.memory_pressure, &node_pressure, is_sampler),
+            pressure: WorkerPressure::new(
+                config.memory_pressure,
+                &node_pressure,
+                is_sampler,
+                started,
+            ),
         })
     }
 
@@ -3825,7 +3830,12 @@ struct WorkerPressure {
 }
 
 impl WorkerPressure {
-    fn new(enabled: bool, shared: &crate::pressure::SharedPressure, sampler: bool) -> Self {
+    fn new(
+        enabled: bool,
+        shared: &crate::pressure::SharedPressure,
+        sampler: bool,
+        now: std::time::Instant,
+    ) -> Self {
         Self {
             shared: enabled.then(|| shared.clone()),
             responder: Default::default(),
@@ -3833,7 +3843,7 @@ impl WorkerPressure {
                 .then(|| crate::pressure::PressureMonitor::new(shared.clone())),
             trims: Default::default(),
             samples_memory: sampler,
-            next_memory_sample: uring_runtime::environment::now(),
+            next_memory_sample: now,
         }
     }
 }

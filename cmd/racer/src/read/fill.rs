@@ -414,7 +414,12 @@ impl Fill {
         let start = self.dependencies.flights.clock().now();
         let result = work.await;
         if let Some((count, sum)) = stage_events(stage) {
-            self.metrics.record_duration(count, sum, start);
+            self.metrics.record_duration(
+                count,
+                sum,
+                start,
+                self.dependencies.flights.clock().now(),
+            );
         }
         result
     }
@@ -428,7 +433,8 @@ impl Fill {
     ) -> T {
         let start = self.dependencies.flights.clock().now();
         let result = work.await;
-        self.metrics.record_duration(count, sum, start);
+        self.metrics
+            .record_duration(count, sum, start, self.dependencies.flights.clock().now());
         result
     }
 
@@ -1676,6 +1682,7 @@ impl Fill {
                 Event::FillDriverStartCount,
                 Event::FillDriverStartNs,
                 submitted,
+                fill.dependencies.flights.clock().now(),
             );
             let started = fill.dependencies.flights.clock().now();
             let _diagnostic_lifetime = diagnostic_lifetime;
@@ -1768,8 +1775,12 @@ impl Fill {
             })
             .await;
             fill.stage(DriverStage::WorkReturned);
-            fill.metrics
-                .record_duration(Event::FillDriverCount, Event::FillDriverNs, started);
+            fill.metrics.record_duration(
+                Event::FillDriverCount,
+                Event::FillDriverNs,
+                started,
+                fill.dependencies.flights.clock().now(),
+            );
             drop(work);
             operation.complete()?;
             match result {
@@ -2363,6 +2374,7 @@ impl Fill {
                                                 Event::FillPeerResponseCount,
                                                 Event::FillPeerResponseNs,
                                                 hedge_start,
+                                                self.dependencies.flights.clock().now(),
                                             );
                                             let copy = response_copy(response.response(), page)?;
                                             if let Some(existing) = self
