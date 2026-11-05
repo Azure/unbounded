@@ -3,9 +3,9 @@
 //! The caller owns execution, payloads, scope policy and result classification.
 //! Dropping a waiter abandons delivery, not the accepted job or its credit.
 
-use crate::rt::Scope;
+use crate::Scope;
+use crate::xthread::spsc::{self as channel, Receiver, Sender};
 use futures::task::AtomicWaker;
-use racer_io::xthread::spsc::{self as channel, Receiver, Sender};
 use std::{
     cell::{Cell, RefCell},
     collections::{BTreeMap, VecDeque, btree_map::Entry},
@@ -45,14 +45,16 @@ where
         &self,
         port: &ClientPort<I, J, C>,
         scope: &S,
+        now: std::time::Instant,
         identify: impl FnOnce(u64) -> I,
         build: impl FnOnce(Permit<I>) -> J,
         submitted: impl FnOnce(&mut J),
-    ) -> crate::rt::Result<C, S::Error> {
+    ) -> crate::Result<C, S::Error> {
         scope.check()?;
         let cancellation = scope.cancel_wait();
         let capacity_waiter =
-            std::future::poll_fn(|cx| Poll::Ready(self.pending.enter(scope.clone(), cx))).await?;
+            std::future::poll_fn(|cx| Poll::Ready(self.pending.enter(scope.clone(), now, cx)))
+                .await?;
         let id = identify(capacity_waiter.sequence());
         let permit = std::future::poll_fn(|cx| {
             if let Some(cancellation) = &cancellation {
@@ -78,7 +80,7 @@ where
                 Poll::Ready(Ok(completion))
             }
             Poll::Pending if port.completions_closed() && port.outstanding() == 0 => {
-                Poll::Ready(Err(crate::rt::Error::Unavailable.into()))
+                Poll::Ready(Err(crate::Error::Unavailable.into()))
             }
             Poll::Pending => Poll::Pending,
         })
@@ -93,7 +95,7 @@ where
         port: &ClientPort<I, J, C>,
         budget: usize,
         mut observe: impl FnMut(&C),
-    ) -> crate::rt::Result<(), S::Error> {
+    ) -> crate::Result<(), S::Error> {
         for _ in 0..budget {
             let Some(completion) = port.receive()? else {
                 break;
@@ -127,7 +129,7 @@ where
         port: &ClientPort<I, J, C>,
         scope: &S,
         mut observe: impl FnMut(&C),
-    ) -> crate::rt::Result<(), S::Error> {
+    ) -> crate::Result<(), S::Error> {
         let cancellation = scope.cancel_wait();
         /// Clear stale driver wake registrations even when the drain future is dropped.
         struct Guard<'a, S>(&'a RefCell<Option<(S, Waker)>>);
@@ -166,7 +168,6 @@ where
     }
 
     /// Inspect bounded admission and delivery registrations in integration tests.
-    #[cfg(test)]
     pub fn waiter_counts(&self) -> (usize, usize) {
         (self.pending.len(), self.waiters.len())
     }
@@ -262,12 +263,12 @@ pub enum Error {
     /// The owner, generation, sequence, or pair does not match.
     Stale,
     /// The runtime rejected work because of capacity or availability.
-    Runtime(crate::rt::Error),
+    Runtime(crate::Error),
 }
 
-impl From<crate::rt::Error> for Error {
+impl From<crate::Error> for Error {
     /// Preserve the runtime failure as an offload admission or delivery error.
-    fn from(error: crate::rt::Error) -> Self {
+    fn from(error: crate::Error) -> Self {
         Self::Runtime(error)
     }
 }
@@ -349,7 +350,7 @@ type PortPair<I, J, C> = (ClientPort<I, J, C>, WorkerPort<I, J, C>);
 pub fn try_pair<I: Identity, J: Reserved<I>, C: Reserved<I>>(
     identity: I,
     capacity: NonZeroUsize,
-) -> crate::rt::Result<PortPair<I, J, C>> {
+) -> crate::Result<PortPair<I, J, C>> {
     let (jobs_tx, jobs_rx) = channel::bounded(capacity.get())?;
     let (results_tx, results_rx) = channel::bounded(capacity.get())?;
     let handoff = Arc::new(Handoff {
@@ -416,7 +417,7 @@ impl<I: Identity, J: Reserved<I>, C: Reserved<I>> ClientPort<I, J, C> {
     pub fn poll_reserve(&self, cx: &mut Context<'_>, id: I) -> Poll<Result<Permit<I>, Error>> {
         self.register_capacity(cx.waker());
         if self.submissions_closed() {
-            return Poll::Ready(Err(crate::rt::Error::Unavailable.into()));
+            return Poll::Ready(Err(crate::Error::Unavailable.into()));
         }
         if id.owner() != self.handoff.identity.owner()
             || id.generation() != self.handoff.identity.generation()
@@ -454,7 +455,7 @@ impl<I: Identity, J: Reserved<I>, C: Reserved<I>> ClientPort<I, J, C> {
         if !Arc::ptr_eq(&self.handoff, &job.permit().handoff) || self.submissions_closed() {
             return Err(SendFailure {
                 command: job,
-                error: crate::rt::Error::Unavailable.into(),
+                error: crate::Error::Unavailable.into(),
             });
         }
         before_publish(&mut job);
@@ -464,12 +465,12 @@ impl<I: Identity, J: Reserved<I>, C: Reserved<I>> ClientPort<I, J, C> {
     }
 
     /// Poll the sole completion waiter; `None` means publication closed and drained.
-    pub fn poll_completion(&self, cx: &mut Context<'_>) -> Poll<crate::rt::Result<Option<C>>> {
+    pub fn poll_completion(&self, cx: &mut Context<'_>) -> Poll<crate::Result<Option<C>>> {
         self.completions.poll_receive_shared(cx)
     }
 
     /// Take one completion without waiting; `None` may mean temporarily empty.
-    pub fn receive(&self) -> crate::rt::Result<Option<C>> {
+    pub fn receive(&self) -> crate::Result<Option<C>> {
         self.completions.receive_shared()
     }
 
@@ -505,7 +506,7 @@ impl<I: Identity, J: Reserved<I>, C: Reserved<I>> WorkerPort<I, J, C> {
     }
 
     /// None means closed and all accepted jobs consumed, not temporarily empty.
-    pub fn poll_job(&mut self, cx: &mut Context<'_>) -> Poll<crate::rt::Result<Option<J>>> {
+    pub fn poll_job(&mut self, cx: &mut Context<'_>) -> Poll<crate::Result<Option<J>>> {
         self.jobs
             .as_mut()
             .expect("live worker endpoint")
@@ -609,21 +610,27 @@ impl<S> AdmissionQueue<S> {
     /// Admission consumes a sequence even if the guard is subsequently dropped.
     /// Saturation consumes neither a queue slot nor a sequence. Overflow requires
     /// draining and a new pair generation, never sequence reuse.
-    pub fn enter(&self, scope: S, cx: &Context<'_>) -> crate::rt::Result<CapacityWaiter<'_, S>> {
+    /// `now` stamps the admission in the caller's clock domain.
+    pub fn enter(
+        &self,
+        scope: S,
+        now: std::time::Instant,
+        cx: &Context<'_>,
+    ) -> crate::Result<CapacityWaiter<'_, S>> {
         // RawWaker clone/drop are caller code, just like wake. Snapshot before
         // borrowing, then validate capacity/sequence after any reentrant clone.
         let waker = Rc::new(cx.waker().clone());
         let scope = Rc::new(scope);
-        let entered = crate::rt::environment::now();
+        let entered = now;
         let mut pending = self.pending.borrow_mut();
         if pending.len() >= self.capacity.get() {
-            return Err(crate::rt::Error::Overloaded);
+            return Err(crate::Error::Overloaded);
         }
         let sequence = self
             .sequence
             .get()
             .checked_add(1)
-            .ok_or(crate::rt::Error::Unavailable)?;
+            .ok_or(crate::Error::Unavailable)?;
         self.sequence.set(sequence);
         pending.push_back(Pending {
             sequence,
@@ -732,27 +739,23 @@ mod expiry_snapshot_tests {
     /// Reading endpoint ages leaves tickets and wake ownership unchanged.
     #[test]
     fn expiry_snapshot_queue_endpoint_ages() {
-        let clock = crate::rt::environment::SimulationClock::new(918);
-        let _environment = clock.environment(0).enter();
+        let clock = crate::SimClock::new(918);
         let queue = AdmissionQueue::new(NonZeroUsize::new(3).unwrap());
         let cx = Context::from_waker(Waker::noop());
-        let head = queue.enter((), &cx).unwrap();
+        let head = queue.enter((), clock.now(), &cx).unwrap();
         clock.advance(std::time::Duration::from_millis(30));
-        let tail = queue.enter((), &cx).unwrap();
+        let tail = queue.enter((), clock.now(), &cx).unwrap();
         clock.advance(std::time::Duration::from_millis(20));
-        let snapshot = queue.snapshot(crate::rt::environment::now());
+        let snapshot = queue.snapshot(clock.now());
         assert_eq!(snapshot.queued, 2);
         assert_eq!(snapshot.head, Some(head.sequence()));
         assert_eq!(snapshot.head_age_us, Some(50_000));
         assert_eq!(snapshot.tail_age_us, Some(20_000));
         assert_ne!(snapshot.head, Some(tail.sequence()));
         drop(head);
-        assert_eq!(
-            queue.snapshot(crate::rt::environment::now()).head,
-            Some(tail.sequence())
-        );
+        assert_eq!(queue.snapshot(clock.now()).head, Some(tail.sequence()));
         drop(tail);
-        let snapshot = queue.snapshot(crate::rt::environment::now());
+        let snapshot = queue.snapshot(clock.now());
         assert_eq!(snapshot.queued, 0);
         assert_eq!(snapshot.head_age_us, None);
         assert_eq!(snapshot.tail_age_us, None);
@@ -812,17 +815,17 @@ impl<I: Copy + Ord, C> Waiters<I, C> {
     /// Insert a unique accepted identity and return its exact registration generation.
     /// Duplicate live registrations are rejected, never replaced; exhausted
     /// generations fail before inserting any entry.
-    fn try_register(&self, id: I, waker: &Waker) -> crate::rt::Result<u64> {
+    fn try_register(&self, id: I, waker: &Waker) -> crate::Result<u64> {
         let waker = Rc::new(waker.clone());
         let mut entries = self.entries.borrow_mut();
         let Entry::Vacant(entry) = entries.entry(id) else {
-            return Err(crate::rt::Error::AlreadyExists);
+            return Err(crate::Error::AlreadyExists);
         };
         let generation = self
             .generation
             .get()
             .checked_add(1)
-            .ok_or(crate::rt::Error::Unavailable)?;
+            .ok_or(crate::Error::Unavailable)?;
         self.generation.set(generation);
         entry.insert(Waiter {
             generation,
@@ -885,11 +888,11 @@ impl<I: Copy + Ord, C> Waiters<I, C> {
 
     /// A missing registration or abandoned completed result is canceled. Scope
     /// checks belong after Ready: cancellation cannot bypass the completion fence.
-    pub fn poll_result(&self, id: I, cx: &mut Context<'_>) -> Poll<crate::rt::Result<C>> {
+    pub fn poll_result(&self, id: I, cx: &mut Context<'_>) -> Poll<crate::Result<C>> {
         let waker = Rc::new(cx.waker().clone());
         let mut entries = self.entries.borrow_mut();
         let Some(waiter) = entries.get_mut(&id) else {
-            return Poll::Ready(Err(crate::rt::Error::Cancelled));
+            return Poll::Ready(Err(crate::Error::Cancelled));
         };
         let old = std::mem::replace(&mut waiter.waker, waker);
         if let Some(result) = waiter.result.take() {
@@ -898,7 +901,7 @@ impl<I: Copy + Ord, C> Waiters<I, C> {
             drop(entries);
             drop((old, removed));
             if abandoned {
-                Poll::Ready(Err(crate::rt::Error::Cancelled))
+                Poll::Ready(Err(crate::Error::Cancelled))
             } else {
                 Poll::Ready(Ok(result))
             }
@@ -1037,22 +1040,22 @@ struct Waiter<C> {
 mod tests {
     /// Cancellation policy for the generic client lifecycle tests.
     #[derive(Clone)]
-    struct ClientScope(crate::rt::environment::Cancellation);
-    impl crate::rt::Scope for ClientScope {
+    struct ClientScope(crate::cancel::Cancellation);
+    impl crate::Scope for ClientScope {
         /// Preserve offload identity errors alongside portable runtime failures.
         type Error = super::Error;
 
         /// Reject canceled admission without ending accepted work.
         fn check(&self) -> Result<(), Self::Error> {
             if self.0.is_cancelled() {
-                Err(crate::rt::Error::Cancelled.into())
+                Err(crate::Error::Cancelled.into())
             } else {
                 Ok(())
             }
         }
 
         /// Register wakes for cancellation independently of completion delivery.
-        fn cancel_token(&self) -> Option<&racer_io::CancelToken> {
+        fn cancel_token(&self) -> Option<&crate::CancelToken> {
             Some(self.0.token())
         }
     }
@@ -1065,11 +1068,12 @@ mod tests {
             let (port, mut worker) = pair(7, 1);
             let client =
                 super::Client::<Id, Message, ClientScope>::new(NonZeroUsize::new(1).unwrap());
-            let scope = ClientScope(crate::rt::environment::Cancellation::new().unwrap());
+            let scope = ClientScope(crate::cancel::Cancellation::new().unwrap());
             let drops = Arc::new(AtomicUsize::new(0));
             let mut operation = Box::pin(client.execute(
                 &port,
                 &scope,
+                std::time::Instant::now(),
                 |sequence| Id(1, 7, sequence),
                 |permit| Message {
                     payload: Payload(drops.clone()),
@@ -1103,7 +1107,7 @@ mod tests {
             if let Some(mut operation) = operation {
                 assert!(matches!(
                     operation.as_mut().poll(&mut cx),
-                    Poll::Ready(Err(Error::Runtime(crate::rt::Error::Cancelled)))
+                    Poll::Ready(Err(Error::Runtime(crate::Error::Cancelled)))
                 ));
             }
             assert_eq!(port.outstanding(), 0);
@@ -1126,7 +1130,7 @@ mod tests {
         let mut cx = Context::from_waker(futures::task::noop_waker_ref());
         assert_eq!(
             executor.poll(&mut worker, &mut cx, 1, |job| job),
-            Err(Error::Runtime(crate::rt::Error::Unavailable))
+            Err(Error::Runtime(crate::Error::Unavailable))
         );
         assert_eq!(drops.load(Ordering::SeqCst), 0);
         assert!(!executor.is_drained());
@@ -1258,11 +1262,15 @@ mod tests {
         let drops = Rc::new(Cell::new(0));
         let waker = callback_waker();
         let mut cx = Context::from_waker(&waker);
-        let first = queue.enter(ScopeHook(drops.clone()), &cx).unwrap();
-        let second = queue.enter(ScopeHook(drops.clone()), &cx).unwrap();
+        let first = queue
+            .enter(ScopeHook(drops.clone()), std::time::Instant::now(), &cx)
+            .unwrap();
+        let second = queue
+            .enter(ScopeHook(drops.clone()), std::time::Instant::now(), &cx)
+            .unwrap();
         assert!(matches!(
-            queue.enter(ScopeHook(drops.clone()), &cx),
-            Err(crate::rt::Error::Overloaded)
+            queue.enter(ScopeHook(drops.clone()), std::time::Instant::now(), &cx),
+            Err(crate::Error::Overloaded)
         ));
         assert!(first.poll(&mut cx, |_| Poll::<()>::Pending).is_pending());
         assert!(
@@ -1298,7 +1306,7 @@ mod tests {
         waiters.register(1, &waker);
         assert_eq!(
             waiters.try_register(1, &waker),
-            Err(crate::rt::Error::AlreadyExists)
+            Err(crate::Error::AlreadyExists)
         );
         assert!(waiters.poll_result(1, &mut cx).is_pending());
         waiters.deliver(1, ());
@@ -1353,7 +1361,7 @@ mod tests {
         let old = waiters.register_guard(1, waker);
         assert_eq!(
             waiters.try_register(1, waker),
-            Err(crate::rt::Error::AlreadyExists)
+            Err(crate::Error::AlreadyExists)
         );
         waiters.deliver(1, 7);
         waiters.deliver(1, 9);
@@ -1375,7 +1383,7 @@ mod tests {
         assert_eq!(first.generation, u64::MAX - 1);
         assert_eq!(
             waiters.try_register(1, Waker::noop()),
-            Err(crate::rt::Error::AlreadyExists)
+            Err(crate::Error::AlreadyExists)
         );
         assert_eq!(waiters.generation.get(), first.generation);
         let last = waiters.register_guard(2, Waker::noop());
@@ -1383,7 +1391,7 @@ mod tests {
         for _ in 0..2 {
             assert_eq!(
                 waiters.try_register(3, Waker::noop()),
-                Err(crate::rt::Error::Unavailable)
+                Err(crate::Error::Unavailable)
             );
             assert_eq!(waiters.generation.get(), u64::MAX);
             assert_eq!(waiters.len(), 2);
@@ -1416,7 +1424,7 @@ mod tests {
         assert_eq!(count.0.load(Ordering::SeqCst), 1);
         assert_eq!(
             waiters.poll_result(7, &mut cx),
-            Poll::Ready(Err(crate::rt::Error::Cancelled))
+            Poll::Ready(Err(crate::Error::Cancelled))
         );
 
         let waker = callback_waker();
@@ -1508,11 +1516,15 @@ mod tests {
         let mut old_cx = Context::from_waker(&old_wake);
         let mut head_cx = Context::from_waker(&head_wake);
         let mut next_cx = Context::from_waker(&next_wake);
-        let first = pending.enter((), &old_cx).unwrap();
-        let second = pending.enter((), &next_cx).unwrap();
+        let first = pending
+            .enter((), std::time::Instant::now(), &old_cx)
+            .unwrap();
+        let second = pending
+            .enter((), std::time::Instant::now(), &next_cx)
+            .unwrap();
         assert!(matches!(
-            pending.enter((), &next_cx),
-            Err(crate::rt::Error::Overloaded)
+            pending.enter((), std::time::Instant::now(), &next_cx),
+            Err(crate::Error::Overloaded)
         ));
         assert_eq!(pending.sequence.get(), 2);
         assert!(
@@ -1579,14 +1591,15 @@ mod tests {
         let wait = |scope: Rc<Cell<bool>>| {
             let pending = &pending;
             async move {
-                let guard =
-                    futures::future::poll_fn(|cx| Poll::Ready(pending.enter(scope.clone(), cx)))
-                        .await?;
+                let guard = futures::future::poll_fn(|cx| {
+                    Poll::Ready(pending.enter(scope.clone(), std::time::Instant::now(), cx))
+                })
+                .await?;
                 futures::future::poll_fn(|cx| {
                     if scope.get() {
-                        return Poll::Ready(Err(crate::rt::Error::Cancelled));
+                        return Poll::Ready(Err(crate::Error::Cancelled));
                     }
-                    guard.poll(cx, |_| Poll::<crate::rt::Result<()>>::Pending)
+                    guard.poll(cx, |_| Poll::<crate::Result<()>>::Pending)
                 })
                 .await
             }
@@ -1601,11 +1614,17 @@ mod tests {
         assert_eq!(next_count.0.load(Ordering::SeqCst), 0);
         assert!(matches!(
             first.as_mut().poll(&mut first_cx),
-            Poll::Ready(Err(crate::rt::Error::Cancelled))
+            Poll::Ready(Err(crate::Error::Cancelled))
         ));
         assert_eq!(pending.len(), 1);
         assert_eq!(next_count.0.load(Ordering::SeqCst), 1);
-        let third = pending.enter(Rc::new(Cell::new(false)), &first_cx).unwrap();
+        let third = pending
+            .enter(
+                Rc::new(Cell::new(false)),
+                std::time::Instant::now(),
+                &first_cx,
+            )
+            .unwrap();
         assert_eq!(third.sequence(), 3, "canceled sequence is not reused");
         drop(third); // Tail drop retains the head and wakes it.
         assert_eq!(pending.len(), 1);
@@ -1621,17 +1640,17 @@ mod tests {
         let pending = AdmissionQueue::new(NonZeroUsize::new(1).unwrap());
         let cx = Context::from_waker(futures::task::noop_waker_ref());
         pending.sequence.set(u64::MAX - 1);
-        let last = pending.enter((), &cx).unwrap();
+        let last = pending.enter((), std::time::Instant::now(), &cx).unwrap();
         assert_eq!(last.sequence(), u64::MAX);
         assert!(matches!(
-            pending.enter((), &cx),
-            Err(crate::rt::Error::Overloaded)
+            pending.enter((), std::time::Instant::now(), &cx),
+            Err(crate::Error::Overloaded)
         ));
         drop(last);
         for _ in 0..2 {
             assert!(matches!(
-                pending.enter((), &cx),
-                Err(crate::rt::Error::Unavailable)
+                pending.enter((), std::time::Instant::now(), &cx),
+                Err(crate::Error::Unavailable)
             ));
             assert_eq!(pending.sequence.get(), u64::MAX);
             assert!(pending.is_empty());
@@ -1647,8 +1666,12 @@ mod tests {
         let (next_count, next_wake) = wake_counter();
         let mut first_cx = Context::from_waker(&first_wake);
         let next_cx = Context::from_waker(&next_wake);
-        let first = pending.enter((), &first_cx).unwrap();
-        let second = pending.enter((), &next_cx).unwrap();
+        let first = pending
+            .enter((), std::time::Instant::now(), &first_cx)
+            .unwrap();
+        let second = pending
+            .enter((), std::time::Instant::now(), &next_cx)
+            .unwrap();
         client.close_submissions();
         pending.wake_if(0, |_| panic!("zero budget inspected scope"));
         pending.wake_if(1, |_| client.submissions_closed());
@@ -1659,7 +1682,7 @@ mod tests {
         assert!(matches!(
             first.poll(&mut first_cx, |cx| client
                 .poll_reserve(cx, Id(1, 7, first.sequence()))),
-            Poll::Ready(Err(Error::Runtime(crate::rt::Error::Unavailable)))
+            Poll::Ready(Err(Error::Runtime(crate::Error::Unavailable)))
         ));
         assert_eq!(client.outstanding(), 0);
         drop((first, second));
@@ -1848,7 +1871,7 @@ mod tests {
             .try_submit(job, |_| panic!("invalid pair hook"))
             .err()
             .unwrap();
-        assert_eq!(failure.error, Error::Runtime(crate::rt::Error::Unavailable));
+        assert_eq!(failure.error, Error::Runtime(crate::Error::Unavailable));
         assert_eq!(failure.command.permit.id(), Id(1, 7, 1));
         assert!(client.try_submit(failure.command, |_| {}).is_ok());
         let failure = other_worker.complete(dequeue(&mut worker)).err().unwrap();
@@ -1862,7 +1885,7 @@ mod tests {
             .try_submit(job, |_| panic!("closed pair hook"))
             .err()
             .unwrap();
-        assert_eq!(failure.error, Error::Runtime(crate::rt::Error::Unavailable));
+        assert_eq!(failure.error, Error::Runtime(crate::Error::Unavailable));
         assert_eq!(other.outstanding(), 1);
         drop(failure);
         assert_eq!(other.outstanding(), 0);
@@ -2010,14 +2033,14 @@ mod tests {
             })
             .err()
             .unwrap();
-        assert_eq!(failure.error, Error::Runtime(crate::rt::Error::Unavailable));
+        assert_eq!(failure.error, Error::Runtime(crate::Error::Unavailable));
         assert_eq!(failure.command.permit.id(), Id(1, 7, 2));
         assert_eq!(client.outstanding(), 2);
         assert_eq!(drops.load(Ordering::SeqCst), 0);
         drop(failure);
         assert!(matches!(
             client.poll_reserve(&mut Context::from_waker(Waker::noop()), Id(1, 7, 3)),
-            Poll::Ready(Err(Error::Runtime(crate::rt::Error::Unavailable)))
+            Poll::Ready(Err(Error::Runtime(crate::Error::Unavailable)))
         ));
         assert_eq!(client.outstanding(), 1);
         let job = dequeue(&mut worker);
@@ -2048,7 +2071,7 @@ mod tests {
         let job = dequeue(&mut worker);
         drop(client);
         let failure = worker.complete(job).err().unwrap();
-        assert_eq!(failure.error, Error::Runtime(crate::rt::Error::Unavailable));
+        assert_eq!(failure.error, Error::Runtime(crate::Error::Unavailable));
         assert_eq!(drops.load(Ordering::SeqCst), 0);
         drop(failure);
         assert_eq!(drops.load(Ordering::SeqCst), 1);
@@ -2071,7 +2094,7 @@ mod tests {
         assert_eq!(client.outstanding(), 1);
         assert!(matches!(
             waiters.poll_result(Id(1, 7, 1), &mut cx),
-            Poll::Ready(Err(crate::rt::Error::Cancelled))
+            Poll::Ready(Err(crate::Error::Cancelled))
         ));
         waiters.worker_closed(1, false);
         assert_eq!(waiters.len(), 2);

@@ -4,6 +4,7 @@
 //! Producers on other threads can wake a consumer parked in its ring through
 //! a [`Notify`] (the lane's [`crate::ring::WakeHandle`] implements it).
 pub mod mailbox;
+pub mod offload;
 pub mod spsc;
 
 use std::sync::Arc;

@@ -18,7 +18,6 @@ use crate::model::PageEnvelope;
 use crate::model::PageId;
 use crate::model::RequestId;
 use crate::model::WorkerId;
-use crate::rt::offload;
 use crate::runtime::RequestScope;
 use crate::telemetry::AeadFailure;
 use racer_crypto::TAG_LEN;
@@ -26,6 +25,7 @@ use racer_crypto::identity::KeyLease;
 use racer_crypto::identity::KeyPurpose;
 use racer_crypto::identity::Keyring;
 use racer_io::ring::IoBuffer;
+use racer_io::xthread::offload;
 use racer_wire::control::KeyId;
 use std::cell::RefCell;
 use std::fmt;
@@ -1566,6 +1566,7 @@ impl CryptoClient {
                 .execute(
                     &self.port.queue,
                     scope,
+                    scope.clock().now(),
                     |sequence| CryptoId {
                         worker: self.port.queue.identity().worker,
                         generation: self.port.queue.identity().generation,

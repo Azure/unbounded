@@ -49,7 +49,7 @@ pub struct Flights {
 
     pub(super) table: RefCell<Table>,
 
-    waiting: crate::rt::offload::AdmissionQueue<PageId>,
+    waiting: racer_io::xthread::offload::AdmissionQueue<PageId>,
 
     admission_deadlines: Rc<crate::rt::environment::Registry>,
 
@@ -64,7 +64,7 @@ type CapacityWake = Rc<RefCell<Option<(u64, Waker)>>>;
 
 /// Retire only this ticket's wake before its queue guard can wake a successor.
 struct AdmissionTicket<'a> {
-    ticket: Option<crate::rt::offload::CapacityWaiter<'a, PageId>>,
+    ticket: Option<racer_io::xthread::offload::CapacityWaiter<'a, PageId>>,
 
     wake: CapacityWake,
 
@@ -696,7 +696,7 @@ impl Flights {
                 clock.now(),
                 FlightHashState::default(),
             )),
-            waiting: crate::rt::offload::AdmissionQueue::new(
+            waiting: racer_io::xthread::offload::AdmissionQueue::new(
                 admission.policy().limits().queue_entries,
             ),
             admission_deadlines: Rc::default(),
@@ -729,7 +729,7 @@ impl Flights {
                 clock.now(),
                 FlightHashState::default(),
             )),
-            waiting: crate::rt::offload::AdmissionQueue::new(
+            waiting: racer_io::xthread::offload::AdmissionQueue::new(
                 admission.policy().limits().queue_entries,
             ),
             admission_deadlines: Rc::default(),
@@ -1092,7 +1092,7 @@ impl Flights {
                 return Poll::Ready(Err(Error::Unavailable));
             }
             if ticket.is_none() {
-                let entered = match self.waiting.enter(page.clone(), cx) {
+                let entered = match self.waiting.enter(page.clone(), self.clock.now(), cx) {
                     Ok(ticket) => ticket,
                     Err(error) => {
                         reason = if error == racer_io::Error::Overloaded {
@@ -1835,13 +1835,21 @@ mod admission_wake_tests {
         .clone();
         let head = flights
             .waiting
-            .enter(page.clone(), &Context::from_waker(Waker::noop()))
+            .enter(
+                page.clone(),
+                flights.clock().now(),
+                &Context::from_waker(Waker::noop()),
+            )
             .unwrap();
         let head_id = head.sequence();
         let reentrant = Waker::from(std::sync::Arc::new(Reenter));
         let tail = flights
             .waiting
-            .enter(page, &Context::from_waker(&reentrant))
+            .enter(
+                page,
+                flights.clock().now(),
+                &Context::from_waker(&reentrant),
+            )
             .unwrap();
         let tail_id = tail.sequence();
         let count = std::sync::Arc::new(crate::test_support::WakeCounter::default());

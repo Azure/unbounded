@@ -472,7 +472,7 @@ pub(crate) struct FlightExpiry {
 
     pub overshoot_us: u64,
 
-    pub queue: crate::rt::offload::AdmissionSnapshot,
+    pub queue: racer_io::xthread::offload::AdmissionSnapshot,
 
     pub caller_head: Option<bool>,
 
@@ -1155,7 +1155,7 @@ mod gate_event_tests {
         let facts = FlightExpiry {
             observed_unix_ms: u64::MAX,
             overshoot_us: u64::MAX,
-            queue: crate::rt::offload::AdmissionSnapshot {
+            queue: racer_io::xthread::offload::AdmissionSnapshot {
                 queued: usize::MAX,
                 capacity: usize::MAX,
                 head: Some(u64::MAX),

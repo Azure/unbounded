@@ -7,8 +7,6 @@ pub mod drivers;
 
 pub mod environment;
 
-pub mod offload;
-
 pub mod reactor;
 
 #[cfg(test)]
