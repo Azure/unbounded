@@ -491,7 +491,7 @@ fn hard_hold_checkpoint_fences_warm_owned_publication_and_restores_veto() {
     let expiry = index.held_page_expiry(&id).unwrap();
     assert!(expiry <= until + Duration::from_secs(1) && expiry + Duration::from_secs(5) > until);
     let segment = index.lookup(&id).unwrap().unwrap().location.segment;
-    assert!(!page_alloc::SegmentEntries::can_reclaim(&**index, segment));
+    assert!(!index.can_reclaim(segment));
     drop(f.segments.append(32 * 1024 * 1024).unwrap());
     f.store.eviction.reclaim_now().unwrap();
     assert!(index.lookup(&id).unwrap().is_some());

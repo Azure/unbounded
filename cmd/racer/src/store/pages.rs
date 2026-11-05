@@ -265,6 +265,7 @@ impl Pages {
         self.versions.get(version).map(|(metadata, _)| metadata)
     }
 
+    #[cfg(test)]
     /// Whether no in-flight write targets `segment`.
     pub fn can_reclaim(&self, segment: SegmentId) -> bool {
         self.inner.as_ref().is_none_or(|inner| {
@@ -624,6 +625,7 @@ impl Pages {
         }
     }
 
+    #[cfg(test)]
     /// Whether a held record is stored in `segment`.
     pub fn segment_held(&self, segment: SegmentId) -> bool {
         self.inner
@@ -677,6 +679,60 @@ impl Pages {
         (token.saturating_add(out.len() as u64).max(1), out)
     }
 
+    /// Run the scored segment clock ([`DiskIndex::reclaim_scored`]) until
+    /// `budget.free_reserve` segments are free or the budget is spent. A
+    /// segment's score sums `value` over its newest `scan` pages and charges
+    /// `unseen` for each page beyond; the lowest score is evicted first. A
+    /// held or written segment is never evicted. `evicted` sees each removed
+    /// page before it is forgotten.
+    pub fn reclaim(
+        &mut self,
+        segments: &Segments,
+        budget: page_alloc::disk_index::ReclaimBudget,
+        scan: usize,
+        unseen: u64,
+        mut value: impl FnMut(&PageId, &VersionMetadata) -> u64,
+        mut evicted: impl FnMut(&PageId, &VersionMetadata),
+    ) -> Result<()> {
+        self.inner_mut()?;
+        let Self {
+            inner,
+            versions,
+            stored,
+            ..
+        } = self;
+        let inner = inner.as_mut().expect("initialized page table");
+        let mut disk = inner.disk.borrow_mut();
+        disk.ensure_segments(segments.count())?;
+        let slots = &inner.slots;
+        let mut removed = Vec::new();
+        let result = disk.reclaim_scored(
+            segments,
+            budget,
+            |disk, segment, _heat| {
+                let count = disk.segment_usage(segment).0 as usize;
+                let known =
+                    disk.segment_entries(segment)
+                        .take(scan)
+                        .fold(0u64, |sum, (slot, _)| {
+                            let page = slots.key(slot).expect("interned page");
+                            sum.saturating_add(value(page, &versions[&page.version].0))
+                        });
+                known.saturating_add((count.saturating_sub(scan) as u64).saturating_mul(unseen))
+            },
+            |slot, _| removed.push(slot),
+        );
+        *stored -= removed.len();
+        for slot in removed {
+            let page = inner.slots.key(slot).expect("interned page");
+            evicted(page, &versions[&page.version].0);
+            Self::forget(versions, &mut inner.slots, &disk, slot);
+        }
+        drop(disk);
+        self.settle();
+        result.map_err(Into::into)
+    }
+
     /// Up to `budget` stored pages of `segment`.
     pub fn segment(&self, segment: SegmentId, budget: usize) -> Vec<(PageId, RecordLocation)> {
         let Some(inner) = self.inner.as_ref() else {
@@ -702,6 +758,7 @@ impl Pages {
             .is_none_or(|inner| inner.disk.borrow().segment_usage(segment).0 == 0)
     }
 
+    #[cfg(test)]
     /// Sum a bounded prefix and conservatively charge the unseen suffix.
     pub fn segment_score(
         &self,

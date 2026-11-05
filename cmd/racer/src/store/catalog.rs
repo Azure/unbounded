@@ -1321,6 +1321,7 @@ impl Index {
             &retention.scoring_at(self.clock.now(), self.disk_capacity()),
         )
     }
+    #[cfg(test)]
     fn segment_score_with(
         &self,
         segment: SegmentId,
@@ -1408,7 +1409,6 @@ pub struct SegmentClock {
     free_reserve: usize,
     budget: ReclaimBudget,
     segments: Rc<Segments>,
-    clock: page_alloc::SegmentClock,
 }
 
 /// Per-call reactor work limits, selected by the application, not the allocator.
@@ -1423,22 +1423,27 @@ pub const FOREGROUND_RECLAIM_BUDGET: ReclaimBudget = ReclaimBudget {
     segment_visits: 64,
     mapping_removals: 256,
 };
-impl page_alloc::SegmentEntries for Index {
-    fn can_reclaim(&self, segment: SegmentId) -> bool {
+impl Index {
+    /// Whether no held record keeps `segment`.
+    #[cfg(test)]
+    pub(crate) fn can_reclaim(&self, segment: SegmentId) -> bool {
         !self.state.borrow().pages.segment_held(segment)
     }
-    fn can_evict(&self, segment: SegmentId) -> bool {
+    /// Whether `segment` may be evicted: no held record and no write in flight.
+    #[cfg(test)]
+    pub(crate) fn can_evict(&self, segment: SegmentId) -> bool {
         let state = self.state.borrow();
         state.pages.can_reclaim(segment) && !state.pages.segment_held(segment)
     }
-    fn remove_bounded(&self, segment: SegmentId, budget: usize) -> usize {
+    /// Test helper: remove up to `budget` pages of an evictable `segment`.
+    #[cfg(test)]
+    pub(crate) fn remove_bounded(&self, segment: SegmentId, budget: usize) -> usize {
         if !self.can_evict(segment) {
             return 0;
         }
         let entries = self.segment_entries_bounded(segment, budget);
         let removed = entries.len();
         for (page, location) in entries {
-            // This synchronous bounded traversal cannot interleave with replacement.
             let bytes = self
                 .state
                 .borrow()
@@ -1452,9 +1457,6 @@ impl page_alloc::SegmentEntries for Index {
             self.remove_if_matches(&page, &location);
         }
         removed
-    }
-    fn is_empty(&self, segment: SegmentId) -> bool {
-        self.segment_empty(segment)
     }
 }
 impl SegmentClock {
@@ -1475,7 +1477,6 @@ impl SegmentClock {
             index,
             free_reserve,
             budget,
-            clock: page_alloc::SegmentClock::new(segments.clone()),
             segments,
         }
     }
@@ -1509,15 +1510,35 @@ impl SegmentClock {
     fn reclaim_to(&self, now: std::time::Instant, free_reserve: usize) -> Result<()> {
         let retention = self.index.retention();
         let scoring = retention.scoring_at(now, self.index.disk_capacity());
-        self.clock
-            .reclaim_scored(
-                &*self.index,
+        let unseen =
+            racer_core::cache::unseen_value_for(crate::model::PAGE_BYTES, scoring.any_over_share());
+        let mut evicted = Vec::new();
+        let result = self.index.state.borrow_mut().pages.reclaim(
+            &self.segments,
+            page_alloc::disk_index::ReclaimBudget {
                 free_reserve,
-                self.budget.segment_visits,
-                self.budget.mapping_removals,
-                |segment| self.index.segment_score_with(segment, &scoring),
-            )
-            .map_err(Into::into)
+                max_visits: self.budget.segment_visits,
+                max_entries: self.budget.mapping_removals,
+            },
+            racer_core::cache::SCAN_BUDGET,
+            unseen,
+            |page, metadata| {
+                racer_core::cache::page_value(
+                    metadata.page_length(page).ok(),
+                    crate::model::PAGE_BYTES as u32,
+                    page_value(&scoring, page),
+                )
+            },
+            |page, metadata| {
+                evicted.push((page.clone(), metadata.page_length(page).unwrap_or(0)));
+            },
+        );
+        let mut state = self.index.state.borrow_mut();
+        for (page, bytes) in evicted {
+            retention.evicted(&page, u64::from(bytes));
+            state.residents.remove(&page);
+        }
+        result
     }
 }
 
@@ -1650,7 +1671,6 @@ mod tests {
     }
     #[test]
     fn page_ticket_publishes_appended_write_and_cancellation_releases_everything() {
-        use page_alloc::SegmentEntries;
         use std::future::Future;
         let segments = Rc::new(segments(1024, 2));
         let index = Rc::new(index(8));
@@ -1720,7 +1740,6 @@ mod tests {
     }
     #[test]
     fn hard_hold_capacity_dedup_extension_release_and_eviction() {
-        use page_alloc::SegmentEntries;
         let segments = Rc::new(segments(1024, 6));
         let index = Rc::new(index(8));
         index.set_page_capacity(6).unwrap();
@@ -1737,10 +1756,7 @@ mod tests {
         assert_eq!(index.hold_expiry(&page.version), Some(until));
         assert!(!index.can_evict(SegmentId(0)));
         assert_eq!(index.remove_bounded(SegmentId(0), 1), 0);
-        assert!(!page_alloc::SegmentEntries::can_evict(
-            &*index,
-            SegmentId(0)
-        ));
+        assert!(!index.can_evict(SegmentId(0)));
         let other = descriptor("other", 17).version;
         assert_eq!(index.reserve_hold(&other, 2, until), Err(Error::Overloaded));
         index.release_hold(&page.version).unwrap();
@@ -1808,10 +1824,7 @@ mod tests {
         assert!(index.is_held(&at(0)));
         assert!(index.is_held(&at(2)));
         assert_eq!(index.hold_holders(&at(0)), 1);
-        assert!(!page_alloc::SegmentEntries::can_evict(
-            &*index,
-            SegmentId(0)
-        ));
+        assert!(!index.can_evict(SegmentId(0)));
         // Releasing the last holder makes the published page evictable and
         // returns its capacity; unknown pages are ignored.
         index.release_hold_pages(&version, &page_set(&[0, 1, 9]), epoch);
@@ -1819,7 +1832,7 @@ mod tests {
         assert!(!index.is_held(&at(1)));
         assert_eq!(index.held_page_expiry(&at(0)), None);
         assert_eq!(index.hold_holders(&at(0)), 0);
-        assert!(page_alloc::SegmentEntries::can_evict(&*index, SegmentId(0)));
+        assert!(index.can_evict(SegmentId(0)));
         assert!(index.is_held(&at(2)));
         index.reserve_hold(&other, 2, until).unwrap();
         // The last page leaving removes the whole hold.
@@ -1863,15 +1876,12 @@ mod tests {
         assert_eq!(index.hold_holders(&page), 1);
         assert!(index.is_held(&page));
         assert_eq!(index.held_page_expiry(&page), Some(until));
-        assert!(!page_alloc::SegmentEntries::can_evict(
-            &*index,
-            SegmentId(0)
-        ));
+        assert!(!index.can_evict(SegmentId(0)));
         // The replacement's own release still works.
         index.release_hold_pages(&version, &page_set(&[0]), replacement);
         assert!(!index.is_held(&page));
         assert_eq!(index.hold_expiry(&version), None);
-        assert!(page_alloc::SegmentEntries::can_evict(&*index, SegmentId(0)));
+        assert!(index.can_evict(SegmentId(0)));
     }
 
     #[test]
@@ -2000,7 +2010,7 @@ mod tests {
         assert!(!index.is_held(&cached), "cached nonmember stays evictable");
         assert!(index.is_held(&primary));
         assert_eq!(index.hold_unused(), 1, "the missing member keeps its slot");
-        assert!(page_alloc::SegmentEntries::can_evict(&*index, SegmentId(0)));
+        assert!(index.can_evict(SegmentId(0)));
         // Capacity 2 holds the cached page plus the reserved member slot.
         assert!(matches!(
             index.reserve_page_for(&probe()),
@@ -2433,7 +2443,6 @@ mod tests {
     }
     #[test]
     fn disk_observability_index_lifecycle_and_victims() {
-        use page_alloc::SegmentEntries;
         let index = Rc::new(index(4));
         index.set_page_capacity(1).unwrap();
         let retention = index.retention();
@@ -2521,7 +2530,6 @@ mod tests {
             index
                 .retention()
                 .set_ownership(Rc::new(move |page| classify.borrow().contains(page)));
-            let real = SegmentClock::new(index.clone(), real_segments.clone(), 1);
             let phantom_clock = page_alloc::SegmentClock::new(phantom_segments.clone());
             let phantom = page_alloc::PhantomEntries::<PageId>::default();
             let now = racer_io::Clock::host().now();
@@ -2562,13 +2570,8 @@ mod tests {
                 let reserve = 1 + usize::try_from(draw() % 3).unwrap();
                 let retention = index.retention();
                 let scoring = retention.scoring_at(now, index.disk_capacity());
-                let expected = real.clock.reclaim_scored(
-                    &*real.index,
-                    reserve,
-                    FOREGROUND_RECLAIM_BUDGET.segment_visits,
-                    FOREGROUND_RECLAIM_BUDGET.mapping_removals,
-                    |segment| real.index.segment_score_with(segment, &scoring),
-                );
+                let expected = SegmentClock::new(index.clone(), real_segments.clone(), reserve)
+                    .reclaim_at(now);
                 let actual = phantom_clock.reclaim_scored(
                     &phantom,
                     reserve,
@@ -2589,7 +2592,11 @@ mod tests {
                         )
                     },
                 );
-                assert_eq!(expected, actual, "seed {seed} round {round}");
+                assert_eq!(
+                    expected,
+                    actual.map_err(Error::from),
+                    "seed {seed} round {round}"
+                );
                 let evicted = phantom.take_evicted();
                 total_evicted += evicted.len();
                 for (page, _) in evicted {
@@ -2898,7 +2905,6 @@ mod tests {
 mod priority_tests {
     use super::*;
     use crate::model::{CacheKey, StrongEtag};
-    use page_alloc::SegmentEntries;
     use racer_control_wire::{CacheDefinition, CacheId};
 
     const PAGE: u64 = crate::model::PAGE_BYTES;
