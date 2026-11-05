@@ -50,6 +50,7 @@ fn model_scenario_checks_fail_the_run() {
             first: 0,
             nodes: 4,
             window: 1,
+            range: None,
         }],
         ..ModelSpec::default()
     }

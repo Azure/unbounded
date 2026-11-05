@@ -22,3 +22,7 @@ model-hot-page-storm-512 seed=2
 model-origin-forbidden seed=1
 model-origin-forbidden seed=2
 model-origin-forbidden seed=3
+model-range-readers seed=1
+model-range-readers seed=2
+model-metadata-readers seed=1
+model-metadata-readers seed=2

@@ -49,6 +49,12 @@ pub struct Counters {
     pub origin_403: u64,
     /// Injected origin server errors (5xx).
     pub origin_5xx: u64,
+    /// Window probes that found the page on disk.
+    pub disk_reads: u64,
+    /// Spill holds taken by range reads.
+    pub spill_holds: u64,
+    /// Metadata refreshes sent to origin.
+    pub metadata_requests: u64,
     /// Client read attempts retried after a recoverable failure.
     pub read_retries: u64,
     /// Most pages any node stores at the end of the run.
@@ -134,6 +140,9 @@ impl Report {
                     "origin_403": c.origin_403,
                     "origin_5xx": c.origin_5xx,
                     "read_retries": c.read_retries,
+                    "disk_reads": c.disk_reads,
+                    "spill_holds": c.spill_holds,
+                    "metadata_requests": c.metadata_requests,
                     "stored_pages_max": c.stored_pages_max,
                 },
                 "histograms": {

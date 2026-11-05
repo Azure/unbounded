@@ -4,7 +4,7 @@ use crate::{
     engine::{MILLIS, Nanos, SECONDS},
     fixture::lane_pair,
     invariants::{Class, all_roles_settled},
-    model::{ModelSpec, Storm},
+    model::{ModelSpec, RangeRead, Storm},
     scenario::FaultMix,
     world::Fault,
 };
@@ -27,6 +27,7 @@ pub fn concurrent_cold_readers() -> Scenario {
             first: 0,
             nodes: NODES,
             window: MILLIS,
+            range: None,
         }],
         ..ModelSpec::default()
     };
@@ -76,6 +77,7 @@ fn storm(at: Nanos, object: u64, nodes: u32, window: Nanos) -> Storm {
         first: 0,
         nodes,
         window,
+        range: None,
     }
 }
 
@@ -203,6 +205,94 @@ pub fn origin_forbidden() -> Scenario {
         .end(3 * SECONDS)
 }
 
+/// Model-only (racer-sim's range reads do not run through `ReadWindow`): 32 nodes read one
+/// cold object as a range through windows of 4 pages with 4 spill pages, then read it again
+/// 1 s later from their local copies. Every page is delivered in order, origin traffic stays
+/// per owner, and the second pass reads from disk.
+pub fn range_readers() -> Scenario {
+    const NODES: u32 = 32;
+    let range = Some(RangeRead {
+        window_pages: 4,
+        spill: 4,
+        leased: true,
+    });
+    let spec = ModelSpec {
+        storms: vec![
+            Storm {
+                range,
+                ..storm(0, 0, NODES, MILLIS)
+            },
+            Storm {
+                range,
+                ..storm(SECONDS, 0, NODES, MILLIS)
+            },
+        ],
+        ..ModelSpec::default()
+    };
+    let pages = u64::from(spec.pages_per_object);
+    let replicas = topology::REPLICAS as u64;
+    let spec = spec
+        .check("every-page-delivered", move |r| {
+            let done = counter(r, "reads_completed");
+            (done == 2 * u64::from(NODES) * pages && counter(r, "reads_failed") == 0)
+                .then_some(())
+                .ok_or(format!("{done} pages delivered: {}", r["metrics"]))
+        })
+        .check("origin-per-owner", move |r| {
+            let origin = counter(r, "origin_requests");
+            (origin <= pages * replicas)
+                .then_some(())
+                .ok_or(format!("origin {origin}"))
+        })
+        .check("second-pass-reads-disk", move |r| {
+            (counter(r, "disk_reads") >= u64::from(NODES) * pages)
+                .then_some(())
+                .ok_or(format!("disk reads: {}", r["metrics"]["counters"]))
+        });
+    Scenario::new("model-range-readers")
+        .nodes(NODES)
+        .sites(4)
+        .model(spec)
+        .end(4 * SECONDS)
+}
+
+/// Model-only: [`concurrent_cold_readers`] where every page read first refreshes its object's
+/// metadata through the worker's `MetadataCohort`, with 10% of origin requests failing with a
+/// 5xx. Refreshes coalesce per cohort, and failures surface only as `Unavailable` after the
+/// client's retries.
+pub fn metadata_readers() -> Scenario {
+    const NODES: u32 = 32;
+    let spec = ModelSpec {
+        storms: vec![storm(0, 0, NODES, MILLIS)],
+        metadata: true,
+        origin_errors: crate::resources::OriginErrors {
+            p5xx: 0.1,
+            ..Default::default()
+        },
+        ..ModelSpec::default()
+    };
+    let total = u64::from(NODES) * u64::from(spec.pages_per_object);
+    let spec = spec
+        .check("every-read-ends", move |r| {
+            let ended = counter(r, "reads_completed") + counter(r, "reads_failed");
+            let failed = counter(r, "reads_failed");
+            (ended == total && failed == error(r, "Unavailable"))
+                .then_some(())
+                .ok_or(format!("{ended} of {total} ended: {}", r["metrics"]))
+        })
+        .check("refreshes-coalesce", move |r| {
+            let refreshes = counter(r, "metadata_requests");
+            (refreshes > 0 && refreshes < total / 4)
+                .then_some(())
+                .ok_or(format!("{refreshes} metadata requests for {total} reads"))
+        });
+    Scenario::new("model-metadata-readers")
+        .nodes(NODES)
+        .sites(4)
+        .model(spec)
+        .end(4 * SECONDS)
+}
+
 /// Every built-in scenario.
 pub fn catalog() -> Vec<Scenario> {
     vec![
@@ -211,6 +301,8 @@ pub fn catalog() -> Vec<Scenario> {
         cold_start(2000),
         hot_page_storm(512),
         origin_forbidden(),
+        range_readers(),
+        metadata_readers(),
         Scenario::new("lane-pair")
             .roles(|env| lane_pair(env, 8))
             .with(all_roles_settled())

@@ -33,3 +33,15 @@ fn cold_start_400() {
 fn cold_start_2000() {
     run(scenarios::cold_start(2000), 8);
 }
+
+#[test]
+fn range_readers_deliver_every_page() {
+    let report = run(scenarios::range_readers(), 3);
+    println!("{:#}", report["coverage"]);
+}
+
+#[test]
+fn metadata_readers_coalesce_refreshes() {
+    let report = run(scenarios::metadata_readers(), 3);
+    println!("{:#}", report["coverage"]);
+}

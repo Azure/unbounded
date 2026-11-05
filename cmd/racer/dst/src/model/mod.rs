@@ -21,7 +21,7 @@ use std::{
 use racer_core::{
     prefetch::OwnerBudget,
     read::{
-        Error, OperationKind, ResponseKind, ServeFacts,
+        Error, OperationKind, PageBudget, RefreshPurpose, ResponseKind, ServeFacts,
         acquisition::{self, RankAnswer},
         budget::helper_start,
         effect::EffectId,
@@ -30,10 +30,10 @@ use racer_core::{
         recoverable,
         serve::{Body, Decision, ServeDecision, ServeRequest},
         walk::{Features, FillConfig, HedgeEnd, Ranked, Reply},
-        window::AcquisitionBudgetSpec,
+        window::{self, AcquisitionBudgetSpec, Facts, Next, WindowConfig},
         worker::{
-            Effect, Mesh, ReadId, RequestId, Routing, ServeView, Served, Types, WorkerCore,
-            WorkerMsg,
+            Effect, Mesh, ReadId, RequestId, Routing, ServeView, Served, Types, WindowId,
+            WorkerCore, WorkerMsg,
         },
     },
 };
@@ -116,6 +116,19 @@ pub struct Storm {
     pub nodes: u32,
     /// Start spread.
     pub window: Nanos,
+    /// Read the object as one range through a [`ReadWindow`] instead of page by page.
+    pub range: Option<RangeRead>,
+}
+
+/// The shape of a client range read ([`racer_core::read::window::WindowConfig`]).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct RangeRead {
+    /// Pages admitted into memory at once (the client's credits).
+    pub window_pages: usize,
+    /// Pages past the window that may be held on disk.
+    pub spill: usize,
+    /// The read holds a scheduler lease, so the window may select providers.
+    pub leased: bool,
 }
 
 /// A report check: `Err` fails the run as a [`Class::Safety`] invariant.
@@ -138,6 +151,9 @@ pub struct ModelSpec {
     pub stored_pages: usize,
     /// Injected origin error rates.
     pub origin_errors: OriginErrors,
+    /// Client page reads refresh the object's metadata through the worker's
+    /// `MetadataCohort` first.
+    pub metadata: bool,
     /// Report checks, by name.
     pub checks: Vec<(String, ReportCheck)>,
 }
@@ -166,6 +182,7 @@ impl Default for ModelSpec {
             read_timeout: 10_000 * MILLIS,
             stored_pages: 0,
             origin_errors: OriginErrors::default(),
+            metadata: false,
             checks: Vec::new(),
         }
     }
@@ -222,6 +239,41 @@ enum Ev {
     },
     /// Expire flight waiters.
     Tick,
+    /// A client on `node` opens a range read of `object`.
+    Open {
+        node: u32,
+        object: u64,
+        range: RangeRead,
+    },
+    /// Answer window `window` of `(node, worker)`.
+    WindowInput {
+        node: u32,
+        worker: u32,
+        window: WindowId,
+        input: window::Input,
+    },
+    /// The client consumed a delivery: plan more window work.
+    Pump {
+        node: u32,
+        worker: u32,
+        window: WindowId,
+    },
+    /// Answer metadata refresh `id` of `(node, worker)`.
+    MetadataInput {
+        node: u32,
+        worker: u32,
+        id: EffectId,
+        result: Result<u64, Error>,
+    },
+}
+
+/// A client range read.
+struct RangeState {
+    object: u64,
+    start: Nanos,
+    delivered: u64,
+    total: u64,
+    leased: bool,
 }
 
 /// Who waits for a serving read's completion.
@@ -308,6 +360,10 @@ struct Model<'s> {
     nodes: Vec<Node>,
     /// Client reads by `(node, worker, request)`: start time.
     clients: BTreeMap<(u32, u32, RequestId), (Nanos, u8)>,
+    /// Client page reads waiting for their metadata refresh, by `(node, worker, request)`.
+    refreshing: BTreeMap<(u32, u32, RequestId), (Page, Nanos, u8)>,
+    /// Client range reads by `(node, worker, window)`.
+    ranges: BTreeMap<(u32, u32, WindowId), RangeState>,
     /// Serving reads by `(node, worker, request)`.
     serving: BTreeMap<(u32, u32, RequestId), Asker>,
     /// Answered effect ids by `(node, worker)`.
@@ -372,6 +428,8 @@ impl<'s> Model<'s> {
             placement,
             nodes,
             clients: BTreeMap::new(),
+            refreshing: BTreeMap::new(),
+            ranges: BTreeMap::new(),
             serving: BTreeMap::new(),
             answered: BTreeSet::new(),
             bodies: BTreeMap::new(),
@@ -404,6 +462,19 @@ impl<'s> Model<'s> {
             for i in 0..storm.nodes {
                 let node = (storm.first + i) % n;
                 let at = storm.at + self.choices.below(storm.window.max(1));
+                if let Some(range) = storm.range {
+                    let object = storm.object;
+                    self.engine.at(
+                        at,
+                        Ev::Open {
+                            node,
+                            object,
+                            range,
+                        },
+                    );
+                    self.expected_reads += u64::from(self.spec.pages_per_object);
+                    continue;
+                }
                 for number in 0..self.spec.pages_per_object {
                     let page = Page {
                         object: storm.object,
@@ -450,27 +521,56 @@ impl<'s> Model<'s> {
             } => {
                 self.trace.record(now, TAG_EVENT, 1, u64::from(node));
                 self.tick_soon();
-                if self.nodes[node as usize].stored.touch(page) {
-                    self.report.counters.local_hits += 1;
-                    self.report.counters.reads_completed += 1;
-                    self.report.latency(now - start);
-                    return;
+                if self.spec.metadata {
+                    self.refresh(node, page, start, attempt);
+                } else {
+                    self.client_read(node, page, start, attempt);
                 }
-                let worker = owner_worker(page, self.spec.workers.max(1));
-                let budget = AcquisitionBudgetSpec {
-                    deadline: self.instant(now + self.spec.read_timeout),
-                    attempts: 8,
-                    links: 16,
-                };
-                let at = self.instant(now);
-                let core = &mut self.nodes[node as usize].cores[worker as usize];
-                if core.acquiring(&page) {
-                    self.report.counters.flight_joins += 1;
-                }
+            }
+            Ev::Open {
+                node,
+                object,
+                range,
+            } => {
+                self.trace.record(now, TAG_EVENT, 6, u64::from(node));
+                self.tick_soon();
+                self.open(node, object, range);
+            }
+            Ev::WindowInput {
+                node,
+                worker,
+                window,
+                input,
+            } => {
+                self.trace.record(now, TAG_EVENT, 7, u64::from(node));
                 let mut out = Vec::new();
-                let request = core.read_page(page, budget, at, &mut out);
-                self.clients
-                    .insert((node, worker, request), (start, attempt));
+                let at = self.instant(now);
+                // A closed window refuses its late answers.
+                let _ = self.nodes[node as usize].cores[worker as usize]
+                    .on_window(window, input, true, at, &mut out);
+                self.dispatch(node, worker, out);
+                self.pump(node, worker, window);
+            }
+            Ev::Pump {
+                node,
+                worker,
+                window,
+            } => self.pump(node, worker, window),
+            Ev::MetadataInput {
+                node,
+                worker,
+                id,
+                result,
+            } => {
+                self.trace.record(now, TAG_EVENT, 8, u64::from(node));
+                let mut out = Vec::new();
+                let at = self.instant(now);
+                if self.nodes[node as usize].cores[worker as usize]
+                    .on_metadata(id, result, at, &mut out)
+                    .is_err()
+                {
+                    self.violation(format!("node {node} refused metadata answer {id:?}"));
+                }
                 self.dispatch(node, worker, out);
             }
             Ev::Input {
@@ -547,6 +647,214 @@ impl<'s> Model<'s> {
                 if !self.clients.is_empty() || !self.serving.is_empty() {
                     self.tick_soon();
                 }
+            }
+        }
+    }
+
+    /// Start client read attempt `attempt` of `page` on `node`.
+    fn client_read(&mut self, node: u32, page: Page, start: Nanos, attempt: u8) {
+        let now = self.now();
+        if self.nodes[node as usize].stored.touch(page) {
+            self.report.counters.local_hits += 1;
+            self.report.counters.reads_completed += 1;
+            self.report.latency(now - start);
+            return;
+        }
+        let worker = owner_worker(page, self.spec.workers.max(1));
+        let budget = AcquisitionBudgetSpec {
+            deadline: self.instant(now + self.spec.read_timeout),
+            attempts: 8,
+            links: 16,
+        };
+        let at = self.instant(now);
+        let core = &mut self.nodes[node as usize].cores[worker as usize];
+        if core.acquiring(&page) {
+            self.report.counters.flight_joins += 1;
+        }
+        let mut out = Vec::new();
+        let request = core.read_page(page, budget, at, &mut out);
+        self.clients
+            .insert((node, worker, request), (start, attempt));
+        self.dispatch(node, worker, out);
+    }
+
+    /// Refresh `page`'s object metadata through the owning worker's cohort, then read.
+    fn refresh(&mut self, node: u32, page: Page, start: Nanos, attempt: u8) {
+        let now = self.now();
+        let worker = owner_worker(page, self.spec.workers.max(1));
+        let (at, deadline) = (
+            self.instant(now),
+            self.instant(now + self.spec.read_timeout),
+        );
+        let mut out = Vec::new();
+        let request = self.nodes[node as usize].cores[worker as usize].refresh_metadata(
+            page.object,
+            RefreshPurpose::Current,
+            deadline,
+            3,
+            at,
+            &mut out,
+        );
+        self.refreshing
+            .insert((node, worker, request), (page, start, attempt));
+        self.dispatch(node, worker, out);
+    }
+
+    /// Open a client range read of `object` on `node`. Its window lives on worker
+    /// `node % workers`, so pages owned by the other workers cross as worker fetches.
+    fn open(&mut self, node: u32, object: u64, range: RangeRead) {
+        let now = self.now();
+        let worker = node % self.spec.workers.max(1);
+        let config = WindowConfig {
+            start: 0,
+            end: u64::from(self.spec.pages_per_object),
+            window_pages: range.window_pages.max(1),
+            sealed: false,
+            passthrough: false,
+            spill: range.spill,
+            budget: PageBudget::Client {
+                deadline: self.instant(now + self.spec.read_timeout),
+            },
+        };
+        let key_of = Box::new(move |number: u64| Page {
+            object,
+            number: number as u32,
+        });
+        let window = self.nodes[node as usize].cores[worker as usize].open(config, key_of);
+        let state = RangeState {
+            object,
+            start: now,
+            delivered: 0,
+            total: u64::from(self.spec.pages_per_object),
+            leased: range.leased,
+        };
+        self.ranges.insert((node, worker, window), state);
+        self.pump(node, worker, window);
+    }
+
+    /// Plan window work and deliver what is ready.
+    fn pump(&mut self, node: u32, worker: u32, window: WindowId) {
+        let Some(state) = self.ranges.get(&(node, worker, window)) else {
+            return;
+        };
+        let facts = Facts {
+            leased: state.leased,
+            ..Facts::default()
+        };
+        let at = self.instant(self.now());
+        let mut out = Vec::new();
+        let _ = self.nodes[node as usize].cores[worker as usize].pump(
+            window,
+            at,
+            &facts,
+            |_| true,
+            &mut out,
+        );
+        self.dispatch(node, worker, out);
+    }
+
+    /// Complete window effect `effect` of `(node, worker, window)`.
+    fn window_effect(&mut self, node: u32, worker: u32, window: WindowId, effect: window::Effect) {
+        use window::Effect as Win;
+        let now = self.now();
+        let costs = self.fabric.costs;
+        let Some(object) = self.ranges.get(&(node, worker, window)).map(|r| r.object) else {
+            // Effects of a closed window (releases, discards) need no answer.
+            return;
+        };
+        let key = |number: u64| Page {
+            object,
+            number: number as u32,
+        };
+        let answer = |input| Ev::WindowInput {
+            node,
+            worker,
+            window,
+            input,
+        };
+        match effect {
+            Win::Probe { id, page, .. } => {
+                let found = self.nodes[node as usize].stored.touch(key(page));
+                let at = if found {
+                    self.report.counters.disk_reads += 1;
+                    self.fabric.disk_read(now, node, self.spec.page_bytes)
+                } else {
+                    now + costs.cpu_request_ns
+                };
+                self.engine
+                    .at(at, answer(window::Input::Probed { id, found }));
+            }
+            // Provider selection is not modeled: the selection cannot start and its pages
+            // are filled directly.
+            Win::Select { id, .. } => {
+                let input = window::Input::Selected {
+                    id,
+                    ok: false,
+                    started: false,
+                };
+                self.engine.at(now + costs.cpu_request_ns, answer(input));
+            }
+            Win::Hold { id, .. } => {
+                self.report.counters.spill_holds += 1;
+                let at = self.fabric.disk_write(now, node, 0);
+                let input = window::Input::Held {
+                    id,
+                    result: Ok(id.0),
+                };
+                self.engine.at(at, answer(input));
+            }
+            // The held page is persisted when the node already stores it; otherwise the spill
+            // fill fails and the window fills the page directly.
+            Win::SpillFill { id, page } => {
+                let ok = self.nodes[node as usize].stored.contains(&key(page));
+                let at = self.fabric.disk_write(now, node, self.spec.page_bytes);
+                self.engine
+                    .at(at, answer(window::Input::SpillFilled { id, ok }));
+            }
+            Win::Fetch { .. } => self.violation(format!("node {node} leaked a window fetch")),
+            Win::Release(_) | Win::Discard(_) => {}
+        }
+    }
+
+    /// The client of `(node, worker, window)` received `next`.
+    fn deliver(&mut self, node: u32, worker: u32, window: WindowId, next: Next) {
+        let now = self.now();
+        let Some(state) = self.ranges.get_mut(&(node, worker, window)) else {
+            return self.violation(format!("node {node} delivered to a closed window"));
+        };
+        match next {
+            Next::Wait => {}
+            Next::Page { .. } => {
+                state.delivered += 1;
+                let start = state.start;
+                self.report.counters.reads_completed += 1;
+                self.report.latency(now - start);
+                let at = now + self.fabric.costs.cpu_request_ns;
+                let pump = Ev::Pump {
+                    node,
+                    worker,
+                    window,
+                };
+                self.engine.at(at, pump);
+            }
+            Next::End | Next::Fail(_) => {
+                let state = self
+                    .ranges
+                    .remove(&(node, worker, window))
+                    .expect("present");
+                let missing = state.total - state.delivered;
+                if let Next::Fail(error) = next {
+                    self.report.counters.reads_failed += missing;
+                    *self.report.errors.entry(format!("{error:?}")).or_default() += missing;
+                } else if missing != 0 {
+                    self.violation(format!("window ended with {missing} pages undelivered"));
+                }
+                let at = self.instant(now);
+                let mut out = Vec::new();
+                let core = &mut self.nodes[node as usize].cores[worker as usize];
+                core.close(window, at, &mut out);
+                core.drop_window(window);
+                self.dispatch(node, worker, out);
             }
         }
     }
@@ -861,11 +1169,37 @@ impl<'s> Model<'s> {
                     },
                 );
             }
-            Effect::Window { .. } | Effect::Deliver { .. } => {
-                self.violation("windows are not modeled yet".into());
+            Effect::Window { window, effect } => self.window_effect(node, worker, window, effect),
+            Effect::Deliver { window, next } => self.deliver(node, worker, window, next),
+            Effect::Metadata { id, key } => {
+                // A metadata HEAD: origin latency and errors, no body.
+                self.report.counters.metadata_requests += 1;
+                let (at, outcome) =
+                    self.origin
+                        .request(now, key.object, 0, self.spec.origin_errors);
+                let result = match outcome {
+                    OriginOutcome::Ok => Ok(1),
+                    OriginOutcome::PreconditionFailed => Err(Error::VersionUnavailable),
+                    OriginOutcome::Forbidden => Err(Error::OriginForbidden),
+                    OriginOutcome::ServerError => Err(Error::Unavailable),
+                };
+                let answer = Ev::MetadataInput {
+                    node,
+                    worker,
+                    id,
+                    result,
+                };
+                self.engine.at(at, answer);
             }
-            Effect::Metadata { .. } | Effect::MetadataReady { .. } => {
-                self.violation("metadata cohorts are not modeled yet".into());
+            Effect::MetadataReady { request, result } => {
+                let Some((page, start, attempt)) = self.refreshing.remove(&(node, worker, request))
+                else {
+                    return self.violation(format!("node {node} unknown metadata {request:?}"));
+                };
+                match result {
+                    Ok(_) => self.client_read(node, page, start, attempt),
+                    Err(error) => self.client_failed(node, page, start, attempt, error),
+                }
             }
         }
     }
@@ -902,9 +1236,16 @@ impl<'s> Model<'s> {
                 self.report.counters.reads_completed += 1;
                 self.report.latency(now - start);
             }
+            Err(error) => self.client_failed(node, page, start, attempt, error),
+        }
+    }
+
+    /// A client read attempt failed with `error`: retry or fail the read.
+    fn client_failed(&mut self, node: u32, page: Page, start: Nanos, attempt: u8, error: Error) {
+        match error {
             // racer-sim's client retries a recoverable failure (`resolve` in
             // `sim/src/node/world.rs`) after a linear backoff.
-            Err(error) if recoverable(error) && attempt + 1 < MAX_ATTEMPTS => {
+            error if recoverable(error) && attempt + 1 < MAX_ATTEMPTS => {
                 self.report.counters.read_retries += 1;
                 let backoff = 2 * self.fabric.rtt.rtt(0, 0).max(MILLIS) * u64::from(attempt + 1);
                 let retry = Ev::Read {
@@ -915,7 +1256,7 @@ impl<'s> Model<'s> {
                 };
                 self.engine.after(backoff, retry);
             }
-            Err(error) => {
+            error => {
                 self.report.counters.reads_failed += 1;
                 *self.report.errors.entry(format!("{error:?}")).or_default() += 1;
             }
@@ -933,7 +1274,9 @@ impl<'s> Model<'s> {
             let max = &mut self.report.counters.stored_pages_max;
             *max = (*max).max(stored);
             for (w, core) in node.cores.iter().enumerate() {
-                if core.flights() + core.requests() + core.reads() != 0 {
+                let refreshes = core.metadata().0;
+                if core.flights() + core.requests() + core.reads() + core.windows() + refreshes != 0
+                {
                     let message = format!(
                         "node {n} worker {w} not quiescent: {} flights {} requests {} reads",
                         core.flights(),
@@ -946,6 +1289,12 @@ impl<'s> Model<'s> {
                 self.report.counters.helpers += observed.helpers;
                 self.report.counters.no_helper += observed.no_helper;
             }
+        }
+        if !self.ranges.is_empty() || !self.refreshing.is_empty() {
+            let (r, m) = (self.ranges.len(), self.refreshing.len());
+            self.violation(format!(
+                "{r} range reads and {m} metadata refreshes unended"
+            ));
         }
         if !self.serving.is_empty() {
             self.violation(format!("{} serving reads unanswered", self.serving.len()));
