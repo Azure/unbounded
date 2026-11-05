@@ -179,6 +179,9 @@ impl Control {
                 let (status, body) = if head.starts_with("GET /v1/keyring") {
                     assert!(stream.conn.peer_certificates().is_some() || fields["authorization"].starts_with("Bearer fixture.token"));
                     if head.starts_with("GET /v1/keyring?after=1 ") {
+                        // Production holds an unchanged poll open. Hold briefly so
+                        // idle clients are not measured against a busy loop.
+                        thread::sleep(Duration::from_secs(1));
                         (204, Vec::new())
                     } else {
                         (200, bundle.to_vec())
