@@ -26,8 +26,8 @@ use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::rc::Rc;
-use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::sync::Arc;
+use std::time::Duration;
 
 /// Largest response head accepted from Azure.
 pub const MAX_RESPONSE_HEAD: usize = 32 * 1024;
@@ -63,69 +63,48 @@ fn attempt_scope(scope: &RequestScope, remaining: usize) -> RequestScope {
     attempt
 }
 
-/// How long a failed trust bundle load is reported before loading again.
-const TRUST_RETRY: Duration = Duration::from_secs(30);
-
-/// Process-wide TLS client configuration, loaded on first HTTPS use so nodes
-/// whose caches use only plain HTTP never need a trust bundle.
+/// Process-wide TLS client configuration for HTTPS origins, loaded once when
+/// the node is assembled, before any worker serves, so no worker reactor ever
+/// blocks on the file. A bundle that fails to load is logged then and fails
+/// each HTTPS request with `Unavailable` until restart; plain-HTTP origins
+/// never need it. A successful load was never reread before either.
 pub struct TrustRoots {
     path: PathBuf,
-    state: Mutex<TrustState>,
-}
-
-#[derive(Default)]
-struct TrustState {
     config: Option<Arc<ClientConfig>>,
-    failed: Option<Instant>,
 }
 
 impl TrustRoots {
-    /// Load from `path` when needed.
-    pub fn at(path: PathBuf) -> Self {
-        Self {
-            path,
-            state: Mutex::default(),
-        }
+    /// Load `path` now. Call off the worker reactors (node assembly).
+    pub fn load(path: PathBuf) -> Self {
+        let config = match http1::tls::load_trust_bundle(&path) {
+            Ok(roots) => Some(http1::tls::client_config(roots)),
+            Err(error) => {
+                eprintln!(
+                    "racer: stage=azure-origin-trust path={} error={error} https_origins=unavailable",
+                    path.display()
+                );
+                None
+            }
+        };
+        Self { path, config }
+    }
+
+    /// No trust roots: every HTTPS request fails with `Unavailable`.
+    pub fn unavailable(path: PathBuf) -> Self {
+        Self { path, config: None }
     }
 
     /// Use a fixed configuration.
     pub fn fixed(config: Arc<ClientConfig>) -> Self {
         Self {
             path: PathBuf::new(),
-            state: Mutex::new(TrustState {
-                config: Some(config),
-                failed: None,
-            }),
+            config: Some(config),
         }
     }
 
-    /// The shared configuration. A load failure fails this request with
-    /// `Unavailable` and is retried after [`TRUST_RETRY`].
+    /// The shared configuration, or `Unavailable` if the bundle failed to load.
     pub fn config(&self) -> Result<Arc<ClientConfig>> {
-        let mut state = self.state.lock().map_err(|_| Error::Internal)?;
-        if let Some(config) = &state.config {
-            return Ok(config.clone());
-        }
-        let now = Instant::now();
-        if state.failed.is_some_and(|at| now < at + TRUST_RETRY) {
-            return Err(Error::Unavailable);
-        }
-        match http1::tls::load_trust_bundle(&self.path) {
-            Ok(roots) => {
-                let config = http1::tls::client_config(roots);
-                state.config = Some(config.clone());
-                state.failed = None;
-                Ok(config)
-            }
-            Err(error) => {
-                eprintln!(
-                    "racer: stage=azure-origin-trust path={} error={error}",
-                    self.path.display()
-                );
-                state.failed = Some(now);
-                Err(Error::Unavailable)
-            }
-        }
+        self.config.clone().ok_or(Error::Unavailable)
     }
 }
 

@@ -257,7 +257,7 @@ impl NodeState {
             observations: Observations::default(),
             native: native::NativeNode::default(),
             clock: clock.clone(),
-            azure: crate::origin::azure::AzureNode::new(&Default::default()),
+            azure: crate::origin::azure::AzureNode::unconfigured(),
             pressure: Default::default(),
         })
     }

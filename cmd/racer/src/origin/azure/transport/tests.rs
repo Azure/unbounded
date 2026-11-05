@@ -21,7 +21,9 @@ use controlplane::Published;
 use racer_control_wire::{AzureCredential, CacheId, OriginDefinition};
 use racer_io::ring::IoBuffer;
 use std::num::NonZeroUsize;
+use std::sync::Mutex;
 use std::sync::atomic::Ordering;
+use std::time::Instant;
 
 const SIZE: usize = 2 * PAGE_BYTES as usize + 5;
 
@@ -267,7 +269,7 @@ fn plain_http_reads_pages_and_classifies_errors_on_one_connection() {
         &url,
         AzureCredential::Anonymous,
         MapResolver::new(vec![]),
-        TrustRoots::at("/nonexistent/racer-bundle.pem".into()),
+        TrustRoots::unavailable("/nonexistent/racer-bundle.pem".into()),
         AnonymousOnly,
     );
 
@@ -371,9 +373,9 @@ fn https_with_a_private_ca_by_name() {
 
 #[test]
 fn https_without_a_trust_bundle_fails_per_request() {
-    let trust = TrustRoots::at("/nonexistent/racer-bundle.pem".into());
+    // The load happens once, at construction; requests never reread it.
+    let trust = TrustRoots::load("/nonexistent/racer-bundle.pem".into());
     assert_eq!(trust.config().err(), Some(Error::Unavailable));
-    // Failures are remembered rather than reloaded on every request.
     assert_eq!(trust.config().err(), Some(Error::Unavailable));
     let Some(reactor) = reactor() else { return };
     let f = fixture(
@@ -428,7 +430,6 @@ fn workload_identity_learns_its_tenant_from_the_storage_challenge() {
         authority: format!("https://login.example:{}/", login.port()),
         federated_token_file: Some(token_file),
         tls: Some(http1::tls::client_config(identity.roots.clone())),
-        trust_bundle: http1::tls::DEFAULT_TRUST_BUNDLE.into(),
     }));
     let tokens = AzureTokens::new(caches, reactor.clone())
         .with_resolver(Rc::new(MapResolver::new(vec![login])));
@@ -440,7 +441,7 @@ fn workload_identity_learns_its_tenant_from_the_storage_challenge() {
             tenant_id: None,
         },
         MapResolver::new(vec![]),
-        TrustRoots::at("/nonexistent/racer-bundle.pem".into()),
+        TrustRoots::unavailable("/nonexistent/racer-bundle.pem".into()),
         tokens,
     );
     assert_eq!(f.metadata("small").unwrap().metadata.length, 5);
@@ -473,7 +474,7 @@ fn decoded_response_head_stays_charged_while_the_exchange_lives() {
         &url,
         AzureCredential::Anonymous,
         MapResolver::new(vec![]),
-        TrustRoots::at("/nonexistent/racer-bundle.pem".into()),
+        TrustRoots::unavailable("/nonexistent/racer-bundle.pem".into()),
         AnonymousOnly,
     );
     let container = AzureContainerUrl::parse(&url).unwrap();
@@ -592,7 +593,7 @@ fn connect_failure_on_every_address_is_reported() {
         &url,
         AzureCredential::Anonymous,
         MapResolver::new(vec![dead, refused_address()]),
-        TrustRoots::at("/nonexistent/racer-bundle.pem".into()),
+        TrustRoots::unavailable("/nonexistent/racer-bundle.pem".into()),
         AnonymousOnly,
     );
     assert!(f.bootstrap("big").is_err());
@@ -690,7 +691,9 @@ fn endpoints_for_unpublished_origins_are_dropped() {
         Rc::new(crate::http::new_pool(reactor.clone(), admission.clone(), 4)),
         Rc::new(crate::http::client_io(reactor, admission)),
         Rc::new(MapResolver::new(Vec::new())),
-        Arc::new(TrustRoots::at(http1::tls::DEFAULT_TRUST_BUNDLE.into())),
+        Arc::new(TrustRoots::unavailable(
+            http1::tls::DEFAULT_TRUST_BUNDLE.into(),
+        )),
     );
     let origin = |url: &str| {
         OriginDefinition::azure(
@@ -733,7 +736,9 @@ fn admission_wait_does_not_spend_an_address_attempt() {
         Rc::new(crate::http::new_pool(reactor.clone(), admission.clone(), 1)),
         Rc::new(crate::http::client_io(reactor.clone(), admission)),
         Rc::new(MapResolver::new(vec![address, dead])),
-        Arc::new(TrustRoots::at("/nonexistent/racer-bundle.pem".into())),
+        Arc::new(TrustRoots::unavailable(
+            "/nonexistent/racer-bundle.pem".into(),
+        )),
     );
     let url = format!(
         "http://account.blob.example:{}/account/models",
@@ -818,7 +823,7 @@ fn reused_connection_closed_before_response_retries_on_fresh_connection() {
         &url,
         AzureCredential::Anonymous,
         MapResolver::new(vec![]),
-        TrustRoots::at("/nonexistent/racer-bundle.pem".into()),
+        TrustRoots::unavailable("/nonexistent/racer-bundle.pem".into()),
         AnonymousOnly,
     );
     assert_eq!(f.metadata("small").unwrap().metadata.length, 5);

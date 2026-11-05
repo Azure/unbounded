@@ -256,7 +256,7 @@ impl AzureLimits {
 }
 
 /// Process-wide Azure origin state shared by every worker: the concurrency
-/// limits, the token caches, and the lazily loaded TLS trust roots.
+/// limits, the token caches, and the TLS trust roots loaded at assembly.
 #[derive(Clone, Debug)]
 pub struct AzureNode {
     pub limits: Arc<AzureLimits>,
@@ -265,15 +265,32 @@ pub struct AzureNode {
 }
 
 impl AzureNode {
-    /// Token endpoints and the trust bundle path come from configuration.
-    /// Nothing is read from disk or the network until a cache needs it.
+    /// Token endpoints come from configuration, and the trust bundle is
+    /// loaded now (see [`transport::TrustRoots`]): call this at node
+    /// assembly, never on a worker reactor. Nothing touches the network until
+    /// a cache needs it.
     pub fn new(settings: &crate::config::OriginSettings) -> Self {
+        Self::with_trust(
+            settings,
+            transport::TrustRoots::load(settings.trust_bundle.clone()),
+        )
+    }
+
+    /// Default settings with no trust roots and no file I/O; HTTPS origins
+    /// fail with `Unavailable`.
+    pub fn unconfigured() -> Self {
+        let settings = crate::config::OriginSettings::default();
+        let trust = transport::TrustRoots::unavailable(settings.trust_bundle.clone());
+        Self::with_trust(&settings, trust)
+    }
+
+    fn with_trust(settings: &crate::config::OriginSettings, trust: transport::TrustRoots) -> Self {
         Self {
             limits: Arc::default(),
             tokens: Arc::new(tokens::AzureTokenCaches::new(
-                crate::origin::azure_auth::AuthEndpoints::new(settings),
+                crate::origin::azure_auth::AuthEndpoints::new(settings, trust.config().ok()),
             )),
-            trust: Arc::new(transport::TrustRoots::at(settings.trust_bundle.clone())),
+            trust: Arc::new(trust),
         }
     }
 }

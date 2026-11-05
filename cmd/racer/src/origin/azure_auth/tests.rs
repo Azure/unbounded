@@ -11,7 +11,6 @@ fn imds_endpoints(port: u16) -> AuthEndpoints {
         authority: DEFAULT_AUTHORITY_HOST.into(),
         federated_token_file: None,
         tls: None,
-        trust_bundle: http1::tls::DEFAULT_TRUST_BUNDLE.into(),
     }
 }
 
@@ -172,17 +171,14 @@ fn form_encoding_and_configuration_validation() {
         "https://h:x/",
         "https://h/?q",
     ] {
-        assert!(
-            parse_authority(bad, None, std::path::Path::new("/unused")).is_err(),
-            "{bad}"
-        );
+        assert!(parse_authority(bad, None).is_err(), "{bad}");
     }
-    let (endpoint, prefix) = parse_authority(
-        "http://login.example:8080/base",
-        None,
-        std::path::Path::new("/unused"),
-    )
-    .unwrap();
+    // An https authority needs the node's trust roots.
+    assert_eq!(
+        parse_authority("https://login.example/", None).err(),
+        Some(AuthError::Configuration)
+    );
+    let (endpoint, prefix) = parse_authority("http://login.example:8080/base", None).unwrap();
     assert_eq!(endpoint.authority(), "login.example:8080");
     assert_eq!(prefix, "/base/");
 }
@@ -296,7 +292,6 @@ fn workload_identity_exchanges_federated_token_with_discovered_tenant() {
             authority: format!("https://login.example:{}/", address.port()),
             federated_token_file: Some(token_file.clone()),
             tls: Some(http1::tls::client_config(identity.roots.clone())),
-            trust_bundle: http1::tls::DEFAULT_TRUST_BUNDLE.into(),
         },
     )
     .unwrap();
@@ -454,4 +449,20 @@ fn concurrent_workers_share_one_refresh() {
     }
     server.join().unwrap();
     assert_eq!(accepted.load(Ordering::SeqCst), 1);
+}
+
+#[test]
+fn federated_assertions_are_trimmed_and_bounded() {
+    assert_eq!(&*parse_assertion(b" jwt\n").unwrap(), "jwt");
+    for bad in [&b""[..], b" \n", b"\xff"] {
+        assert_eq!(
+            parse_assertion(bad).err(),
+            Some(AuthError::Configuration),
+            "{bad:?}"
+        );
+    }
+    let full = vec![b'a'; MAX_ASSERTION as usize];
+    assert_eq!(parse_assertion(&full).unwrap().len(), full.len());
+    let over = vec![b'a'; MAX_ASSERTION as usize + 1];
+    assert_eq!(parse_assertion(&over).err(), Some(AuthError::Configuration));
 }

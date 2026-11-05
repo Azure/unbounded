@@ -152,24 +152,24 @@ pub struct AuthEndpoints {
     /// Federated token file for workload identity.
     pub federated_token_file: Option<PathBuf>,
 
-    /// TLS configuration for the authority; `None` loads `trust_bundle` when
-    /// the cache is created.
+    /// TLS configuration for an `https` authority: the node's origin trust
+    /// roots, loaded at assembly. `None` (no usable bundle) makes workload
+    /// identity over `https` a configuration error.
     pub tls: Option<Arc<rustls::ClientConfig>>,
-
-    /// Origin trust bundle, used when `tls` is `None`.
-    pub trust_bundle: PathBuf,
 }
 
 impl AuthEndpoints {
-    /// IMDS at 169.254.169.254:80 and the configured authority, federated
-    /// token file, and trust bundle.
-    pub fn new(settings: &crate::config::OriginSettings) -> Self {
+    /// IMDS at 169.254.169.254:80, the configured authority and federated
+    /// token file, and the node's loaded trust roots.
+    pub fn new(
+        settings: &crate::config::OriginSettings,
+        tls: Option<Arc<rustls::ClientConfig>>,
+    ) -> Self {
         Self {
             imds: RemoteEndpoint::http(IMDS_ADDRESS, 80).expect("IMDS literal"),
             authority: settings.azure_authority_host.clone(),
             federated_token_file: settings.azure_federated_token_file.clone(),
-            tls: None,
-            trust_bundle: settings.trust_bundle.clone(),
+            tls,
         }
     }
 }
@@ -306,7 +306,6 @@ impl AzureTokenCache {
             AzureCredential::WorkloadIdentity { .. } => Some(parse_authority(
                 &endpoints.authority,
                 endpoints.tls.clone(),
-                &endpoints.trust_bundle,
             )?),
             AzureCredential::ManagedIdentity { .. } => None,
         };
@@ -591,12 +590,15 @@ impl AzureTokenSource {
                     .as_ref()
                     .ok_or(AuthError::Configuration)?;
                 let assertion = read_assertion(
+                    &self.reactor,
                     self.cache
                         .endpoints
                         .federated_token_file
                         .as_deref()
                         .ok_or(AuthError::Configuration)?,
-                )?;
+                    scope,
+                )
+                .await?;
                 let mut body = Zeroizing::new(String::with_capacity(assertion.len() + 256));
                 body.push_str("client_assertion=");
                 body.push_str(&form_encode(&assertion));
@@ -649,7 +651,6 @@ impl AzureTokenSource {
 fn parse_authority(
     url: &str,
     tls: Option<Arc<rustls::ClientConfig>>,
-    trust_bundle: &std::path::Path,
 ) -> Result<(RemoteEndpoint, String), AuthError> {
     let (https, rest) = if let Some(rest) = url.strip_prefix("https://") {
         (true, rest)
@@ -678,15 +679,9 @@ fn parse_authority(
         prefix.push('/');
     }
     let endpoint = if https {
-        let config = match tls {
-            Some(config) => config,
-            None => {
-                // An unreadable trust bundle is a configuration error at construction.
-                let roots = http1::tls::load_trust_bundle(trust_bundle)
-                    .map_err(|_| AuthError::Configuration)?;
-                http1::tls::client_config(roots)
-            }
-        };
+        // Without usable trust roots an https authority is a configuration
+        // error; no file is read here, on a worker.
+        let config = tls.ok_or(AuthError::Configuration)?;
         RemoteEndpoint::https(host, port, config)
     } else {
         RemoteEndpoint::http(host, port)
@@ -704,19 +699,32 @@ fn valid_id(id: &str) -> bool {
             .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'.')
 }
 
-/// Read and trim the federated token. It is reread for every exchange because
-/// the kubelet rotates the projected file.
-fn read_assertion(path: &std::path::Path) -> Result<Zeroizing<String>, AuthError> {
-    use std::io::Read as _;
-    let file = std::fs::File::open(path).map_err(|_| AuthError::Configuration)?;
-    let mut bytes = Zeroizing::new(Vec::new());
-    file.take(MAX_ASSERTION + 1)
-        .read_to_end(&mut bytes)
-        .map_err(|_| AuthError::Configuration)?;
+/// Read and trim the federated token through the worker's io_uring file
+/// operations, so the reactor never blocks on the file. It is reread for
+/// every exchange because the kubelet rotates the projected file.
+async fn read_assertion(
+    reactor: &Reactor,
+    path: &std::path::Path,
+    scope: &RequestScope,
+) -> Result<Zeroizing<String>, AuthError> {
+    use uring_runtime::reactor::filesystem::secure;
+    // One byte over the cap tells an oversized file from a full one.
+    let bytes = secure::read_path(reactor, path, MAX_ASSERTION as usize + 1, scope)
+        .await
+        .map_err(|error| match error {
+            Error::Cancelled => AuthError::Cancelled,
+            Error::DeadlineExceeded => AuthError::DeadlineExceeded,
+            _ => AuthError::Configuration,
+        })?;
+    parse_assertion(&bytes)
+}
+
+/// Validate and trim a federated token read from its file.
+fn parse_assertion(bytes: &[u8]) -> Result<Zeroizing<String>, AuthError> {
     if bytes.len() as u64 > MAX_ASSERTION {
         return Err(AuthError::Configuration);
     }
-    let text = std::str::from_utf8(&bytes).map_err(|_| AuthError::Configuration)?;
+    let text = std::str::from_utf8(bytes).map_err(|_| AuthError::Configuration)?;
     let text = text.trim();
     if text.is_empty() {
         return Err(AuthError::Configuration);

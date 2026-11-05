@@ -629,7 +629,7 @@ const BASE: &[Var] = &[
         Group::Origin,
         text(TextKind::Path),
         Value(http1::tls::DEFAULT_TRUST_BUNDLE),
-        "CA bundle for HTTPS origins and the Entra authority, loaded at first HTTPS use. Empty selects the default.",
+        "CA bundle for HTTPS origins and the Entra authority, loaded once at startup; if it cannot be loaded, HTTPS origins fail until restart. Empty selects the default.",
     ),
     var(
         "RACER_AZURE_AUTHORITY_HOST",

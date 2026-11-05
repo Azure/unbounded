@@ -443,7 +443,7 @@ each worker and are never divided.
 | Variable | Default | Scope | Accepted | Description |
 | --- | --- | --- | --- | --- |
 | `RACER_CACHE_ORIGIN_CONNECTIONS_PER_WORKER` | `32` | Per I/O worker | 1..1,024 | Origin connections per cache in each I/O worker, independent of peer connections; at most the client connections. When unset it is lowered to fit them. Also caps connections to each Azure Blob endpoint, which caches in one storage account share. |
-| `RACER_ORIGIN_TRUST_BUNDLE` | `/etc/ssl/certs/ca-certificates.crt` | Node | absolute path | CA bundle for HTTPS origins and the Entra authority, loaded at first HTTPS use. Empty selects the default. |
+| `RACER_ORIGIN_TRUST_BUNDLE` | `/etc/ssl/certs/ca-certificates.crt` | Node | absolute path | CA bundle for HTTPS origins and the Entra authority, loaded once at startup; if it cannot be loaded, HTTPS origins fail until restart. Empty selects the default. |
 | `RACER_AZURE_AUTHORITY_HOST` | `https://login.microsoftonline.com/` | Node | `https://` URL | Microsoft Entra authority, ending in `/`. Empty selects the default. |
 | `RACER_AZURE_FEDERATED_TOKEN_FILE` | Unset: workload identity is unavailable | Node | absolute path | Projected token exchanged for Entra tokens when an origin uses `workloadIdentity`. |
 
