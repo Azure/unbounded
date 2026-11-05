@@ -69,7 +69,7 @@ func (b *Backend) checkGrant(g isolation.Grant) error {
 		}
 
 		if g.Target != "" && g.Target != g.Source {
-			return fmt.Errorf("device grant %s at %s cannot be honored in isolation mode %s: the node stack sees the host's device nodes, so a device cannot appear at another path; use it at its own path or use isolation mode nspawn or container",
+			return fmt.Errorf("device grant %s at %s cannot be honored in isolation mode %s: the node stack sees the host's device nodes, so a device cannot appear at another path; use it at its own path or use isolation mode nspawn",
 				g.Source, g.Target, isolation.ModeNone)
 		}
 
@@ -84,7 +84,7 @@ func (b *Backend) checkGrant(g isolation.Grant) error {
 		}
 
 		if g.Target != "" && g.Target != g.Source && !nativeRemap(g.Purpose) {
-			return fmt.Errorf("mount grant %s at %s cannot be honored in isolation mode %s: the node stack sees the host, so a path cannot be remapped; mount it at its own path or use isolation mode nspawn or container",
+			return fmt.Errorf("mount grant %s at %s cannot be honored in isolation mode %s: the node stack sees the host, so a path cannot be remapped; mount it at its own path or use isolation mode nspawn",
 				g.Source, g.Target, isolation.ModeNone)
 		}
 

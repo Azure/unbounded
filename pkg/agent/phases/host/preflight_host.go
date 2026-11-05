@@ -20,6 +20,7 @@ import (
 	"github.com/Azure/unbounded/pkg/agent/config"
 	"github.com/Azure/unbounded/pkg/agent/goalstates"
 	"github.com/Azure/unbounded/pkg/agent/internal/utilio"
+	"github.com/Azure/unbounded/pkg/agent/isolation"
 	"github.com/Azure/unbounded/pkg/agent/preflight"
 )
 
@@ -28,6 +29,7 @@ const (
 	checkHostPackagesName        = "host-packages"
 	checkHostOSConfigurationName = "host-os-configuration"
 	checkNSpawnRuntimeName       = "nspawn-runtime"
+	checkIsolationModeName       = "isolation-mode"
 	checkDockerActiveName        = "docker-active"
 	checkContainerdActiveName    = "containerd-active"
 	checkKubeletActiveName       = "kubelet-active"
@@ -55,7 +57,7 @@ type hostCheckDeps struct {
 func defaultHostCheckDeps() hostCheckDeps {
 	return hostCheckDeps{
 		lookupPath:           exec.LookPath,
-		detectPackageManager: detectHostPackageManager,
+		detectPackageManager: detectHostPackageManagerForMode(isolation.DefaultMode),
 		uid:                  os.Geteuid,
 		statfs:               syscall.Statfs,
 		readFile:             os.ReadFile,
@@ -77,13 +79,42 @@ func (c simpleHostChecker) Check(ctx context.Context) []preflight.Result { retur
 
 // Preflight returns the standard host environment checks required before
 // provisioning an nspawn machine.
+//
+// The mode comes from cfg. For nspawn the list is the one this package has
+// always returned. For none the nspawn runtime check is replaced by the none
+// backend's own preflight, which refuses a host that already runs a kubelet or
+// containerd the agent does not own, or whose /etc, /opt or /var is read only,
+// and the systemd-container package is not required. The kubelet and
+// containerd "active" checks stay: they report the same conflict early with the
+// check names operators already know.
 func Preflight(log *slog.Logger, cfg config.AgentConfig, _ *goalstates.MachineGoalState) []preflight.Checker {
+	mode, err := cfg.IsolationMode()
+	if err != nil {
+		// Validation rejects this before preflight runs; report it rather than
+		// guessing a mode.
+		return []preflight.Checker{simpleHostChecker{name: checkIsolationModeName, check: func(context.Context) []preflight.Result {
+			return preflight.ResultsError(checkIsolationModeName, "isolation mode", "%s", err.Error())
+		}}}
+	}
+
+	deps := defaultHostCheckDeps()
+	deps.detectPackageManager = detectHostPackageManagerForMode(mode)
+
 	checks := []preflight.Checker{
 		CheckIsPrivilegedUser(log),
-		CheckExistingDeployment(log),
-		checkHostPackages(log, cfg.OfflineArtifactsConfigured(), defaultHostCheckDeps()),
+		CheckExistingDeploymentFor(log, mode),
+		checkHostPackages(log, cfg.OfflineArtifactsConfigured(), deps),
 		CheckHostOSConfiguration(log),
-		CheckNSpawnRuntime(log),
+	}
+
+	switch mode {
+	case isolation.ModeNone:
+		checks = append(checks, CheckNoneBackend(log))
+	case isolation.ModeNSpawn:
+		checks = append(checks, CheckNSpawnRuntime(log))
+	}
+
+	return append(checks,
 		CheckDockerActive(log),
 		CheckContainerdActive(log),
 		CheckKubeletActive(log),
@@ -92,9 +123,7 @@ func Preflight(log *slog.Logger, cfg config.AgentConfig, _ *goalstates.MachineGo
 		CheckCgroups(log),
 		CheckNvidiaDriver(log),
 		checkLocalDNSConntrack(log, cfg, defaultLocalDNSConntrackDeps()),
-	}
-
-	return checks
+	)
 }
 
 // CheckIsPrivilegedUser verifies preflight is running as root.

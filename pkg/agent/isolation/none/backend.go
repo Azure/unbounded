@@ -188,7 +188,7 @@ func (b *Backend) PreflightOwnership() error {
 		errs = append(errs, errors.New(f))
 	}
 
-	errs = append(errs, errors.New("use isolation mode nspawn or container, or remove the existing kubelet and containerd"))
+	errs = append(errs, errors.New("use isolation mode nspawn, or remove the existing kubelet and containerd"))
 
 	return errors.Join(errs...)
 }

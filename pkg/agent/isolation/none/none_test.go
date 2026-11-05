@@ -190,7 +190,7 @@ func TestPreflightRefusesUnmanagedStack(t *testing.T) {
 	b := &Backend{Layout: Layout{Base: filepath.Join(t.TempDir(), "node")}, Host: &h}
 	err := b.Preflight()
 	require.ErrorContains(t, err, "not managed by the agent")
-	require.ErrorContains(t, err, "isolation mode nspawn or container")
+	require.ErrorContains(t, err, "use isolation mode nspawn")
 }
 
 func TestCheckWritable(t *testing.T) {
