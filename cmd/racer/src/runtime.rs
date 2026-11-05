@@ -227,6 +227,19 @@ impl RequestScope {
         Self::with_clock(request, deadline, self.clock.clone())
     }
 
+    /// Test support: a scope on the host clock.
+    #[cfg(test)]
+    pub fn host(request: RequestId, deadline: Instant) -> Result<Self> {
+        Self::with_clock(request, deadline, racer_io::Clock::host())
+    }
+
+    /// Test support: a scope on `clock`, with the clock first so tests read
+    /// left to right.
+    #[cfg(test)]
+    pub fn on(clock: &racer_io::Clock, request: RequestId, deadline: Instant) -> Result<Self> {
+        Self::with_clock(request, deadline, clock.clone())
+    }
+
     /// MIGRATION(test shim): a scope on the thread's test clock.
     #[cfg(test)]
     pub fn new(request: RequestId, deadline: Instant) -> Result<Self> {
@@ -465,10 +478,12 @@ mod tests {
             fn rest_narrowing_preserves_policy_cancellation_and_parent_deadline() {
                 use wire_codec::rest::Scope;
                 let clock = uring_runtime::environment::SimulationClock::new(102);
-                let _env = clock.environment(0).enter();
-                let start = uring_runtime::environment::now();
+                let sim_env = clock.environment(0);
+                let _env = sim_env.enter();
+                let sim_ctx = sim_env.worker_ctx();
+                let start = sim_ctx.clock.now();
                 let end = start + Duration::from_secs(30);
-                let scope = RequestScope::new(RequestId([102; 16]), end).unwrap();
+                let scope = RequestScope::on(&sim_ctx.clock, RequestId([102; 16]), end).unwrap();
                 scope
                     .set_candidate_total(start + Duration::from_secs(10))
                     .unwrap();
@@ -485,10 +500,16 @@ mod tests {
             #[test]
             fn candidate_total_survives_body_completion_and_never_changes_authority() {
                 let clock = uring_runtime::environment::SimulationClock::new(97);
-                let _env = clock.environment(0).enter();
-                let start = uring_runtime::environment::now();
-                let scope = RequestScope::new(RequestId([97; 16]), start + Duration::from_secs(60))
-                    .unwrap();
+                let sim_env = clock.environment(0);
+                let _env = sim_env.enter();
+                let sim_ctx = sim_env.worker_ctx();
+                let start = sim_ctx.clock.now();
+                let scope = RequestScope::on(
+                    &sim_ctx.clock,
+                    RequestId([97; 16]),
+                    start + Duration::from_secs(60),
+                )
+                .unwrap();
                 let signed = crate::peer::protocol::encode_deadline(scope.deadline).unwrap();
                 scope
                     .set_candidate_total(start + Duration::from_secs(30))
@@ -526,10 +547,12 @@ mod tests {
             #[test]
             fn candidate_body_budget_accepts_original_ceiling_and_rejects_invalid_bounds() {
                 let clock = uring_runtime::environment::SimulationClock::new(98);
-                let _env = clock.environment(0).enter();
-                let start = uring_runtime::environment::now();
+                let sim_env = clock.environment(0);
+                let _env = sim_env.enter();
+                let sim_ctx = sim_env.worker_ctx();
+                let start = sim_ctx.clock.now();
                 let end = start + Duration::from_secs(30);
-                let scope = RequestScope::new(RequestId([98; 16]), end).unwrap();
+                let scope = RequestScope::on(&sim_ctx.clock, RequestId([98; 16]), end).unwrap();
                 assert_eq!(
                     scope.set_candidate_total(end + Duration::from_secs(1)),
                     Err(Error::InvalidRequest)
@@ -560,7 +583,7 @@ mod tests {
                     scope.candidate_body_progress(1000, 1000),
                     Err(Error::DeadlineExceeded)
                 );
-                let elapsed = RequestScope::new(RequestId([99; 16]), end).unwrap();
+                let elapsed = RequestScope::on(&sim_ctx.clock, RequestId([99; 16]), end).unwrap();
                 elapsed.set_candidate_total(start).unwrap();
                 assert_eq!(elapsed.check(), Err(Error::DeadlineExceeded));
             }
@@ -568,11 +591,16 @@ mod tests {
             #[test]
             fn candidate_body_reserve_keeps_healthy_progress_and_ignores_unknown_lengths() {
                 let clock = uring_runtime::environment::SimulationClock::new(91);
-                let _env = clock.environment(0).enter();
-                let start = uring_runtime::environment::now();
-                let healthy =
-                    RequestScope::new(RequestId([91; 16]), start + Duration::from_secs(30))
-                        .unwrap();
+                let sim_env = clock.environment(0);
+                let _env = sim_env.enter();
+                let sim_ctx = sim_env.worker_ctx();
+                let start = sim_ctx.clock.now();
+                let healthy = RequestScope::on(
+                    &sim_ctx.clock,
+                    RequestId([91; 16]),
+                    start + Duration::from_secs(30),
+                )
+                .unwrap();
                 healthy.set_candidate_idle(Duration::from_secs(10)).unwrap();
                 healthy
                     .set_candidate_body_budget(
@@ -585,16 +613,19 @@ mod tests {
                     clock.advance(Duration::from_secs(2));
                     healthy.candidate_body_progress(received, 80).unwrap();
                 }
-                assert!(uring_runtime::environment::now() > start + Duration::from_secs(10));
+                assert!(sim_ctx.clock.now() > start + Duration::from_secs(10));
                 assert_eq!(healthy.deadline.0, start + Duration::from_secs(30));
                 // Completed network body does not subject later verification to the reserve.
                 clock.advance(Duration::from_secs(7));
                 healthy.check().unwrap();
                 for reserve in [false, true] {
-                    let now = uring_runtime::environment::now();
-                    let scope =
-                        RequestScope::new(RequestId([92; 16]), now + Duration::from_secs(30))
-                            .unwrap();
+                    let now = sim_ctx.clock.now();
+                    let scope = RequestScope::on(
+                        &sim_ctx.clock,
+                        RequestId([92; 16]),
+                        now + Duration::from_secs(30),
+                    )
+                    .unwrap();
                     scope.set_candidate_idle(Duration::from_secs(10)).unwrap();
                     if reserve {
                         scope
@@ -622,10 +653,16 @@ mod tests {
             #[test]
             fn candidate_body_rate_starts_at_first_bytes_and_expiry_is_sticky() {
                 let clock = uring_runtime::environment::SimulationClock::new(93);
-                let _env = clock.environment(0).enter();
-                let start = uring_runtime::environment::now();
-                let scope = RequestScope::new(RequestId([93; 16]), start + Duration::from_secs(30))
-                    .unwrap();
+                let sim_env = clock.environment(0);
+                let _env = sim_env.enter();
+                let sim_ctx = sim_env.worker_ctx();
+                let start = sim_ctx.clock.now();
+                let scope = RequestScope::on(
+                    &sim_ctx.clock,
+                    RequestId([93; 16]),
+                    start + Duration::from_secs(30),
+                )
+                .unwrap();
                 scope.set_candidate_idle(Duration::from_secs(10)).unwrap();
                 scope
                     .set_candidate_body_budget(
@@ -650,16 +687,22 @@ mod tests {
                     scope.candidate_body_progress(usize::MAX, usize::MAX),
                     Err(Error::DeadlineExceeded)
                 );
-                assert!(uring_runtime::environment::now() < scope.deadline.0);
+                assert!(sim_ctx.clock.now() < scope.deadline.0);
             }
 
             #[test]
             fn candidate_idle_progress_never_renews_hard_deadline_or_revives_expiry() {
                 let clock = uring_runtime::environment::SimulationClock::new(39);
-                let _env = clock.environment(0).enter();
-                let start = uring_runtime::environment::now();
-                let scope =
-                    RequestScope::new(RequestId([39; 16]), start + Duration::from_secs(3)).unwrap();
+                let sim_env = clock.environment(0);
+                let _env = sim_env.enter();
+                let sim_ctx = sim_env.worker_ctx();
+                let start = sim_ctx.clock.now();
+                let scope = RequestScope::on(
+                    &sim_ctx.clock,
+                    RequestId([39; 16]),
+                    start + Duration::from_secs(3),
+                )
+                .unwrap();
                 scope.set_candidate_idle(Duration::from_secs(1)).unwrap();
                 let signed = crate::peer::protocol::encode_deadline(scope.deadline).unwrap();
                 for _ in 0..5 {
@@ -672,9 +715,12 @@ mod tests {
                 }
                 clock.advance(Duration::from_millis(500));
                 assert_eq!(scope.candidate_progress(), Err(Error::DeadlineExceeded));
-                let stalled =
-                    RequestScope::new(RequestId([40; 16]), start + Duration::from_secs(10))
-                        .unwrap();
+                let stalled = RequestScope::on(
+                    &sim_ctx.clock,
+                    RequestId([40; 16]),
+                    start + Duration::from_secs(10),
+                )
+                .unwrap();
                 stalled.set_candidate_idle(Duration::from_secs(1)).unwrap();
                 clock.advance(Duration::from_secs(1));
                 assert_eq!(stalled.check(), Err(Error::DeadlineExceeded));
@@ -689,11 +735,16 @@ mod tests {
             #[test]
             fn runtime_scope_retains_candidate_policy_and_shared_cancellation() {
                 let clock = uring_runtime::environment::SimulationClock::new(101);
-                let _env = clock.environment(0).enter();
-                let start = uring_runtime::environment::now();
-                let scope =
-                    RequestScope::new(RequestId([101; 16]), start + Duration::from_secs(30))
-                        .unwrap();
+                let sim_env = clock.environment(0);
+                let _env = sim_env.enter();
+                let sim_ctx = sim_env.worker_ctx();
+                let start = sim_ctx.clock.now();
+                let scope = RequestScope::on(
+                    &sim_ctx.clock,
+                    RequestId([101; 16]),
+                    start + Duration::from_secs(30),
+                )
+                .unwrap();
                 scope
                     .set_candidate_total(start + Duration::from_secs(10))
                     .unwrap();
@@ -717,8 +768,8 @@ mod tests {
             #[test]
             fn check_at_uses_explicit_instant() {
                 let start = Instant::now();
-                let scope =
-                    RequestScope::new(RequestId([7; 16]), start + Duration::from_secs(30)).unwrap();
+                let scope = RequestScope::host(RequestId([7; 16]), start + Duration::from_secs(30))
+                    .unwrap();
                 scope
                     .set_candidate_total(start + Duration::from_secs(10))
                     .unwrap();
@@ -728,7 +779,7 @@ mod tests {
                     scope.check_at(start + Duration::from_secs(10)),
                     Err(Error::DeadlineExceeded)
                 );
-                let late = RequestScope::new(RequestId([8; 16]), start).unwrap();
+                let late = RequestScope::host(RequestId([8; 16]), start).unwrap();
                 assert_eq!(late.check_at(start), Err(Error::DeadlineExceeded));
                 assert_eq!(late.check_at(start - Duration::from_secs(1)), Ok(()));
                 late.cancel().unwrap();
@@ -740,7 +791,7 @@ mod tests {
             #[test]
             fn clones_preserve_deadline_and_wake_independent_waiters() {
                 let scope =
-                    RequestScope::new(RequestId([0; 16]), Instant::now() + Duration::from_secs(2))
+                    RequestScope::host(RequestId([0; 16]), Instant::now() + Duration::from_secs(2))
                         .unwrap();
                 let a = Arc::new(Count(AtomicUsize::new(0)));
                 let b = Arc::new(Count(AtomicUsize::new(0)));
@@ -755,7 +806,7 @@ mod tests {
                 assert_eq!(a.0.load(Ordering::Relaxed), 1);
                 assert_eq!(b.0.load(Ordering::Relaxed), 1);
                 assert_eq!(
-                    RequestScope::new(RequestId([1; 16]), Instant::now())
+                    RequestScope::host(RequestId([1; 16]), Instant::now())
                         .unwrap()
                         .check(),
                     Err(Error::DeadlineExceeded)
@@ -851,7 +902,7 @@ mod tests {
                 limits
             }
             pub(super) fn scope() -> RequestScope {
-                RequestScope::new(
+                RequestScope::host(
                     crate::model::RequestId([0; 16]),
                     Instant::now() + Duration::from_secs(5),
                 )
@@ -919,7 +970,7 @@ mod tests {
                     .unwrap();
                 let first = scope();
                 let second =
-                    RequestScope::new(crate::model::RequestId([1; 16]), first.deadline.0).unwrap();
+                    RequestScope::host(crate::model::RequestId([1; 16]), first.deadline.0).unwrap();
                 sim.inject("open", simulation::Fault::Delay(100)).unwrap();
                 let mut a = reactor.file_open(
                     None,
@@ -1313,15 +1364,18 @@ mod tests {
             fn candidate_total_cancels_pending_receive_without_bytes_and_retains_both_fences() {
                 for cancel_first in [false, true] {
                     let clock = uring_runtime::environment::SimulationClock::new(99);
-                    let _clock = clock.environment(0).enter();
+                    let sim_env = clock.environment(0);
+                    let _clock = sim_env.enter();
+                    let sim_ctx = sim_env.worker_ctx();
                     let sim = Simulation::new();
                     sim.set_cancel_first(cancel_first);
                     let _environment = sim.enter();
                     let r = reactor();
                     r.init().unwrap();
                     let baseline = r.admission.used(ResourceClass::RequestContext);
-                    let start = uring_runtime::environment::now();
-                    let request = RequestScope::new(
+                    let start = sim_ctx.clock.now();
+                    let request = RequestScope::on(
+                        &sim_ctx.clock,
                         crate::model::RequestId([99; 16]),
                         start + Duration::from_secs(60),
                     )
@@ -1615,7 +1669,6 @@ mod tests {
         use std::task::Waker;
         use std::time::Duration;
         use uring_runtime::drivers::retry_listener as retry;
-        use uring_runtime::environment;
         use uring_runtime::environment::SimulationClock;
 
         #[test]
@@ -1625,7 +1678,7 @@ mod tests {
             let _time = environment.enter();
             let scope = RequestScope::new(
                 RequestId([0; 16]),
-                environment::now() + Duration::from_secs(1),
+                uring_runtime::environment::now() + Duration::from_secs(1),
             )
             .unwrap();
             let calls = Cell::new(0);
@@ -1662,7 +1715,7 @@ mod tests {
             for expected in [Error::Cancelled, Error::DeadlineExceeded] {
                 let scope = RequestScope::new(
                     RequestId([0; 16]),
-                    environment::now() + Duration::from_millis(1),
+                    uring_runtime::environment::now() + Duration::from_millis(1),
                 )
                 .unwrap();
                 let mut operation = retry::<_, ()>(&scope, || {
@@ -1678,7 +1731,7 @@ mod tests {
             }
             let scope = RequestScope::new(
                 RequestId([0; 16]),
-                environment::now() + Duration::from_secs(1),
+                uring_runtime::environment::now() + Duration::from_secs(1),
             )
             .unwrap();
             for error in [
@@ -1709,7 +1762,7 @@ mod tests {
             let reactor = Reactor::new(admission);
             let scope = RequestScope::new(
                 RequestId([0; 16]),
-                environment::now() + Duration::from_secs(1),
+                uring_runtime::environment::now() + Duration::from_secs(1),
             )
             .unwrap();
             let (reader, _writer) = sim.socket_pair();

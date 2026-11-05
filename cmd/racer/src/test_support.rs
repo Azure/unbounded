@@ -456,7 +456,7 @@ pub(crate) mod enrollment {
         }
     }
     pub(crate) fn scope() -> crate::runtime::RequestScope {
-        crate::runtime::RequestScope::new(
+        crate::runtime::RequestScope::host(
             crate::model::RequestId([7; 16]),
             std::time::Instant::now() + std::time::Duration::from_secs(10),
         )
@@ -515,7 +515,7 @@ pub(crate) fn published_membership(
     published
         .publish(
             Arc::new(Snapshot::membership_fixture(membership)),
-            uring_runtime::environment::now(),
+            racer_io::Clock::host().now(),
             |_, _| Ok::<_, crate::error::Error>(()),
             || (),
         )
@@ -532,6 +532,8 @@ impl ReadWorker {
         delivery: Rc<Delivery>,
         window: usize,
     ) -> Self {
+        // Fixture time and entropy come from the reactor that drives it.
+        let reactor_ctx = reactor.ctx().clone();
         let origin = AdapterOrigin::new(&cache.name, metadata);
         let keys = Rc::new(crate::test_support::security::keys());
         let publications = Arc::new(Published::new(Snapshot::retention(2)));
@@ -542,7 +544,7 @@ impl ReadWorker {
         let snapshots = Rc::new(PublicationTarget::new(
             keys.cluster().clone(),
             publications,
-            crate::test_support::clock(),
+            reactor_ctx.clock.clone(),
         ));
         snapshots
             .apply(
@@ -569,7 +571,7 @@ impl ReadWorker {
                 Arc::new(WorkerMap::new(vec![WorkerId(0)]).unwrap()),
                 vec![WorkerId(0)],
                 16,
-                crate::test_support::ctx(),
+                reactor_ctx.clone(),
             )
             .unwrap(),
         );
@@ -578,7 +580,7 @@ impl ReadWorker {
             WorkerId(0),
             16,
             availability.clone(),
-            crate::test_support::clock(),
+            reactor_ctx.clock.clone(),
         ));
         let segments = Rc::new(page_alloc::Segments::new(64 * 1024 * 1024));
         // Reads use an empty disk index. No slabs need to be opened or written.
@@ -616,7 +618,7 @@ impl ReadWorker {
         let credentials = Rc::new(CredentialCrypto::new(
             keys.clone(),
             admission.clone(),
-            crate::test_support::ctx().rng,
+            reactor_ctx.rng.clone(),
         ));
         let candidates = Rc::new(CandidatePolicy::new(
             keys.node().clone(),
@@ -624,7 +626,7 @@ impl ReadWorker {
             crate::test_support::NoPeers::requester(),
             credentials.clone(),
             Arc::new(Published::new(Snapshot::retention(2))),
-            crate::test_support::ctx(),
+            reactor_ctx.clone(),
         ));
         let client = origin.client(
             snapshots.clone(),
@@ -644,7 +646,7 @@ impl ReadWorker {
                 flights: Rc::new(Flights::new(
                     admission.clone(),
                     availability.clone(),
-                    crate::test_support::clock(),
+                    reactor_ctx.clock.clone(),
                 )),
                 crypto: Rc::new(PageCrypto::new(keys, crypto.clone())),
                 credentials: credentials.clone(),
@@ -684,7 +686,7 @@ impl ReadWorker {
             endpoint: RefCell::new(endpoint),
             engine: RefCell::new(PageCryptoEngine::new(CryptoRuntime {
                 port: engine,
-                ctx: crate::test_support::ctx(),
+                ctx: reactor_ctx.clone(),
             })),
             crypto,
             writer,
@@ -742,7 +744,7 @@ impl ReadWorker {
             )
             .unwrap();
         self.writer.enqueue(copy, dirty).unwrap();
-        let scope = crate::runtime::RequestScope::new(
+        let scope = crate::runtime::RequestScope::host(
             crate::model::RequestId([1; 16]),
             std::time::Instant::now() + std::time::Duration::from_secs(10),
         )
