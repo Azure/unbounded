@@ -276,8 +276,13 @@ impl Service {
             && let Some((evict, reply)) = self.inspection.take()
         {
             if evict {
-                self.rig.memory.evict_idle(usize::MAX)?;
-                assert_eq!(self.rig.admission.used(ResourceClass::Plaintext), 0);
+                // Keep idle pooled buffers: shedding them would make every
+                // measured disk hit allocate fresh page storage.
+                self.rig.memory.evict_idle_entries(usize::MAX)?;
+                assert!(
+                    self.rig.admission.used(ResourceClass::Plaintext)
+                        <= self.rig.admission.retained_buffer_bytes()
+                );
             }
             let entries = self.rig.writer.index().snapshot()?.entries.len();
             let _ = reply.send(Stats {

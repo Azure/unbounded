@@ -1548,6 +1548,13 @@ impl MemoryCache {
     /// Busy ciphertext protects a retained page; live plaintext does not, since
     /// the cache holds it only weakly.
     pub fn evict_idle(&self, bytes: usize) -> Result<usize> {
+        let released = self.evict_idle_entries(bytes)?;
+        self.pool.reclaim_buffers();
+        Ok(released)
+    }
+    /// Like [`Self::evict_idle`], but keeps idle pooled buffers so later
+    /// reads reuse them instead of allocating.
+    pub fn evict_idle_entries(&self, bytes: usize) -> Result<usize> {
         let mut released = self.reclaim_ciphertext(None, bytes);
         let mut entries = self.entries.borrow_mut();
         let mut versions = Vec::new();
@@ -1565,7 +1572,6 @@ impl MemoryCache {
         for id in versions {
             entries.forget_version(&id);
         }
-        self.pool.reclaim_buffers();
         Ok(released)
     }
     /// One bounded LRU pass over ciphertext. The callback may release a queued
