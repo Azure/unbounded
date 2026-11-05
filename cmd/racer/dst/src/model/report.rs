@@ -72,6 +72,9 @@ pub struct Report {
     pub latencies: Vec<Nanos>,
     /// Failed reads by error.
     pub errors: BTreeMap<String, u64>,
+    /// Failed client read attempts (retried or final), by error and by attempt elapsed time
+    /// rounded down to a second, as `"<error>@<seconds>s"`.
+    pub attempt_errors: BTreeMap<String, u64>,
     /// Origin requests by page.
     pub origin_per_page: BTreeMap<Page, u64>,
     /// Core effect and serve outcome variants seen, by [`super::effect_name`].
@@ -158,6 +161,7 @@ impl Report {
                     },
                 },
                 "errors": self.errors,
+                "attempt_errors": self.attempt_errors,
             },
             "origin_per_page": {
                 "pages": pages,

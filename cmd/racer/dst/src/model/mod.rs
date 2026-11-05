@@ -28,7 +28,7 @@ use racer_core::{
         effect::EffectId,
         flight::FlightLimits,
         hints::{HINT_CAPACITY, HINT_TTL, SuccessorHints},
-        recoverable,
+        peer_error, recoverable,
         serve::{Body, Decision, ServeDecision, ServeRequest},
         walk::{Features, FillConfig, HedgeEnd, Ranked, Reply},
         window::{self, AcquisitionBudgetSpec, Facts, Next, WindowConfig},
@@ -45,7 +45,7 @@ pub use report::{Counters, Report};
 
 use crate::{
     choices::Choices,
-    engine::{Engine, MILLIS, Nanos, TraceHash},
+    engine::{Engine, MILLIS, Nanos, SECONDS, TraceHash},
     invariants::Class,
     resources::{Fabric, Origin, OriginErrors, OriginOutcome},
     scenario::Scenario,
@@ -1019,6 +1019,28 @@ impl<'s> Model<'s> {
         );
     }
 
+    /// The serving read on `to` failed without a peer response: a transport failure.
+    fn fail_probe(&mut self, asker: &Asker, to: u32) {
+        let at = self.fabric.message(self.now(), to, asker.from);
+        self.engine.at(
+            at,
+            Ev::Input {
+                node: asker.from,
+                worker: asker.worker,
+                read: asker.read,
+                input: Input::Replied {
+                    id: asker.id,
+                    reply: Reply::Failed {
+                        error: Error::Unavailable,
+                        sent: true,
+                        scope_live: true,
+                    },
+                    answer: None,
+                },
+            },
+        );
+    }
+
     fn reply(&mut self, asker: &Asker, to: u32, kind: ResponseKind) {
         let at = self.fabric.message(self.now(), to, asker.from);
         self.engine.at(
@@ -1270,7 +1292,19 @@ impl<'s> Model<'s> {
             if result.is_ok() && self.nodes[node as usize].stored.contains(&page) {
                 self.send_page(asker, node, page);
             } else {
-                self.reply(&asker, node, ResponseKind::Unavailable);
+                // Production `peer_error` (`src/read.rs`, racer-sim `err_reply`): an expected
+                // acquisition failure is answered with its response kind; any other is a
+                // transport failure.
+                let error = result.err().unwrap_or(Error::Unavailable);
+                *self
+                    .report
+                    .attempt_errors
+                    .entry(format!("serve:{error:?}"))
+                    .or_default() += 1;
+                match peer_error(error) {
+                    Some(kind) => self.reply(&asker, node, kind),
+                    None => self.fail_probe(&asker, node),
+                }
             }
             return;
         }
@@ -1295,6 +1329,12 @@ impl<'s> Model<'s> {
 
     /// A client read attempt failed with `error`: retry or fail the read.
     fn client_failed(&mut self, node: u32, page: Page, start: Nanos, attempt: u8, error: Error) {
+        let elapsed = (self.now() - start) / SECONDS;
+        *self
+            .report
+            .attempt_errors
+            .entry(format!("{error:?}#{attempt}@{elapsed}s"))
+            .or_default() += 1;
         match error {
             // racer-sim's client retries a recoverable failure (`resolve` in
             // `sim/src/node/world.rs`) after a linear backoff.

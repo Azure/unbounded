@@ -70,11 +70,52 @@ fn model_memory_per_node() {
         .and_then(|v| v.trim().trim_end_matches("kB").trim().parse().ok())
         .unwrap();
     println!(
-        "nodes {nodes} peak_rss {} B per_node {} B steps {} failure {:?} counters {}",
+        "nodes {nodes} peak_rss {} B per_node {} B steps {} failure {:?} counters {} latency {} attempt_errors {}",
         hwm_kib * 1024,
         hwm_kib * 1024 / u64::from(nodes),
         outcome.steps,
         outcome.failure.as_ref().map(|f| &f.name),
-        report["metrics"]["counters"]
+        report["metrics"]["counters"],
+        report["metrics"]["histograms"]["read_latency_ns"],
+        report["metrics"]["attempt_errors"]
     );
+}
+
+/// One line per parity scenario with the numbers `dst/MODEL.md` tabulates.
+#[test]
+#[ignore = "summary: run with --release --ignored --nocapture"]
+fn parity_summary() {
+    let cases = [
+        (scenarios::concurrent_cold_readers(), 2),
+        (scenarios::cold_start(400), 8),
+        (scenarios::cold_start(2000), 8),
+        (scenarios::hot_page_storm(512), 5),
+        (scenarios::origin_forbidden(), 11),
+    ];
+    for (scenario, seed) in cases {
+        let (outcome, r) = model::run(&scenario, Choices::seeded(seed));
+        let c = &r["metrics"]["counters"];
+        let l = &r["metrics"]["histograms"]["read_latency_ns"];
+        let ms = |k: &str| l[k].as_u64().unwrap_or(0) / 1_000_000;
+        println!(
+            "{} failure={:?} completed={} failed={} errors={} origin={} per_page={} joins={} \
+             reelected={} sheds={} helper_probes={} helper_copies={} retries={} latency={}/{}/{}",
+            scenario.name,
+            outcome.failure.as_ref().map(|f| &f.name),
+            c["reads_completed"],
+            c["reads_failed"],
+            r["metrics"]["errors"],
+            c["origin_requests"],
+            r["origin_per_page"]["max_requests_per_page"],
+            c["flight_joins"],
+            c["flights_reelected"],
+            c["sheds"],
+            c["helper_probes"],
+            c["helper_copies"],
+            c["read_retries"],
+            ms("p50"),
+            ms("p99"),
+            ms("max"),
+        );
+    }
 }
