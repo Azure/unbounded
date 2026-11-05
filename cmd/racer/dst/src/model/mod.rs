@@ -951,7 +951,7 @@ impl<'s> Model<'s> {
                     _ => {}
                 }
             }
-            Ev::Release { msg } => self.release_relays(msg),
+            Ev::Release { msg } => self.release_relays_after(msg, true),
             Ev::LinkDown { msg, holder } => self.fail_hop(msg, holder, Fault::Unavailable),
             Ev::MetadataInput {
                 node,
@@ -1821,11 +1821,17 @@ impl<'s> Model<'s> {
 
     /// The relays of `mid` release their `Relay` transfers.
     fn release_relays(&mut self, mid: u64) {
+        self.release_relays_after(mid, false);
+    }
+
+    /// As [`Self::release_relays`]; `body` labels the hold (`MODEL_DIAG`) as a page body's.
+    fn release_relays_after(&mut self, mid: u64, body: bool) {
         let now = self.now();
         let kind = if self.diag {
             match self.msgs.get(&mid) {
                 Some(m) if m.ping.is_some() => "ping",
                 Some(_) => "unanswered",
+                None if body => "page",
                 None => "answered",
             }
         } else {
@@ -1852,7 +1858,7 @@ impl<'s> Model<'s> {
     /// on the connection while the body streams, `peer/server.rs` `relay.reservation`).
     fn release_relays_at(&mut self, mid: u64, at: Nanos) {
         if at <= self.now() {
-            self.release_relays(mid);
+            self.release_relays_after(mid, true);
         } else if self.relay_charges.contains_key(&mid) {
             self.engine.at(at, Ev::Release { msg: mid });
         }
