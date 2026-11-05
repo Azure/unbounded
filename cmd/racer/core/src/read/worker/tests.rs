@@ -231,6 +231,62 @@ fn a_flight_nobody_waits_for_stops_its_acquisition() {
 }
 
 #[test]
+fn a_copy_only_request_waits_on_the_running_flight_and_never_leads() {
+    let now = Instant::now();
+    let mut c = core(now);
+    let mut out = Vec::new();
+    let deadline = now + Duration::from_secs(2);
+    // No flight: a miss, and none is started.
+    assert_eq!(c.copy_page(7, deadline, now, &mut out), None);
+    assert!(out.is_empty());
+    assert_eq!((c.flights(), c.reads(), c.requests()), (0, 0, 0));
+    let a = c.read_page(7, spec(now), now, &mut out);
+    let copy = c.copy_page(7, deadline, now, &mut out).unwrap();
+    assert_eq!((c.flights(), c.reads(), c.requests()), (1, 1, 2));
+    assert!(completed(&out).is_empty(), "the copy waits for the fill");
+    run_to_publish(&mut c, now, &mut out);
+    let mut done = completed(&out);
+    done.sort_by_key(|(r, _)| *r);
+    assert_eq!(done, vec![(a, Ok(())), (copy, Ok(()))]);
+    assert_eq!((c.flights(), c.reads(), c.requests()), (0, 0, 0));
+}
+
+#[test]
+fn a_copy_only_request_past_the_waiter_cap_is_flight_full() {
+    let now = Instant::now();
+    let mut c = core(now);
+    let mut out = Vec::new();
+    let deadline = now + Duration::from_secs(2);
+    c.read_page(7, spec(now), now, &mut out);
+    let mut full = None;
+    for _ in 0..1_000 {
+        out.clear();
+        let request = c.copy_page(7, deadline, now, &mut out).unwrap();
+        if let [(done, Err(error))] = completed(&out)[..] {
+            assert_eq!(done, request);
+            full = Some(error);
+            break;
+        }
+    }
+    assert_eq!(full, Some(Error::FlightFull));
+}
+
+#[test]
+fn a_copy_waiter_fails_when_its_deadline_passes() {
+    let now = Instant::now();
+    let mut c = core(now);
+    let mut out = Vec::new();
+    c.read_page(7, spec(now), now, &mut out);
+    let copy = c
+        .copy_page(7, now + Duration::from_secs(1), now, &mut out)
+        .unwrap();
+    out.clear();
+    c.tick(now + Duration::from_secs(2), &mut out);
+    assert_eq!(completed(&out), vec![(copy, Err(Error::DeadlineExceeded))]);
+    assert_eq!(c.reads(), 1, "the leader keeps fetching");
+}
+
+#[test]
 fn expired_waiters_fail_on_tick() {
     let now = Instant::now();
     let mut c = core(now);

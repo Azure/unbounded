@@ -492,6 +492,65 @@ impl<T: Types> WorkerCore<T> {
         self.join(page, budget, ReplyTo::Client, now, out)
     }
 
+    /// A copy-only peer request may wait on `page`'s running acquisition (production
+    /// `Fill::copy_only_joining` through `Flights::join_copy`): it never leads, adopts or starts
+    /// an acquisition. `None` when no flight is running (the request is a miss); otherwise the
+    /// request completes with [`Effect::Completed`] like [`Self::read_page`], for example
+    /// `FlightFull` past the flight's waiter cap.
+    pub fn copy_page(
+        &mut self,
+        page: T::Page,
+        deadline: Instant,
+        now: Instant,
+        out: &mut Vec<Effect<T>>,
+    ) -> Option<RequestId> {
+        let mut wakes = Vec::new();
+        let joined = self
+            .flights
+            .join_copy(&page, now, deadline, |_| Ok(()), &mut wakes);
+        let reply = ReplyTo::Client;
+        let request = match joined {
+            Ok(Joined::Miss) => None,
+            Ok(Joined::Waiter(waiter)) => {
+                let request = RequestId(self.allocate());
+                self.requests.insert(
+                    request,
+                    Request {
+                        page: page.clone(),
+                        waiter,
+                        // A copy waiter has no election rights, so it never spends attempts.
+                        budget: AcquisitionBudgetSpec {
+                            deadline,
+                            attempts: 0,
+                            links: 0,
+                            route_failed: false,
+                        },
+                        reply,
+                    },
+                );
+                self.flight
+                    .entry(page)
+                    .or_default()
+                    .requests
+                    .insert(request);
+                self.poll(request, now, out);
+                Some(request)
+            }
+            Ok(Joined::Settled(_)) => {
+                let request = RequestId(self.allocate());
+                self.reply(request, &page, reply, Ok(()), now, out);
+                Some(request)
+            }
+            Err(error) => {
+                let request = RequestId(self.allocate());
+                self.reply(request, &page, reply, Err(error), now, out);
+                Some(request)
+            }
+        };
+        self.wake(wakes, now, out);
+        request
+    }
+
     /// The scope of client request `request` ended. A leader hands its acquisition over.
     pub fn cancel(&mut self, request: RequestId, now: Instant, out: &mut Vec<Effect<T>>) {
         let Some(r) = self.requests.get(&request) else {
