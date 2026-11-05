@@ -1067,7 +1067,6 @@ dependencies = [
  "libc",
  "racer-io",
  "serde_json",
- "uring-runtime",
 ]
 
 [[package]]

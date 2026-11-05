@@ -12,6 +12,7 @@ use std::{
     time::{Duration, Instant},
 };
 
+use racer_io::SimClock;
 use rdma_verbs::{
     Arrival, BACKOFF_MIN, BufferState, COMMAND_QUEUE, Client, Epoch, Error, Granted, LinkKey,
     LinkState, NodeConfig, Op, Opened, Owner, SETUP_TIMEOUT, Setup, Source,
@@ -20,7 +21,6 @@ use rdma_verbs::{
         default_profile,
     },
 };
-use uring_runtime::environment::{Environment, SimulationClock};
 
 /// Page buffer length: registration mode needs whole 2 MiB pages.
 fn len() -> usize {
@@ -74,9 +74,7 @@ impl Node {
 struct World {
     sim: Simulation,
 
-    clock: SimulationClock,
-
-    _environment: uring_runtime::environment::Guard,
+    clock: SimClock,
 
     a: Node,
 
@@ -110,14 +108,14 @@ fn config(charge: &Arc<AtomicUsize>) -> NodeConfig {
     }
 }
 
-fn node(sim: &Simulation, n: u8, environment: &Environment) -> Node {
+fn node(sim: &Simulation, n: u8, ctx: racer_io::WorkerCtx) -> Node {
     let view = sim
         .with_devices(vec![Device::new(format!("sim{n}"), [n; 16])])
         .unwrap();
     let (clients, port) = rdma_verbs::node(2).unwrap();
     let owner = {
         let _scope = view.enter();
-        Owner::new(port, environment.worker_ctx())
+        Owner::new(port, ctx)
     };
     Node {
         clients,
@@ -128,11 +126,9 @@ fn node(sim: &Simulation, n: u8, environment: &Environment) -> Node {
 
 fn world() -> World {
     let sim = Simulation::new();
-    let clock = SimulationClock::new(7);
-    let environment = clock.environment(1);
-    let mut a = node(&sim, 1, &environment);
-    let mut b = node(&sim, 2, &environment);
-    let guard = environment.enter();
+    let clock = SimClock::new(7);
+    let mut a = node(&sim, 1, clock.ctx(1));
+    let mut b = node(&sim, 2, clock.ctx(1));
     for node in [&mut a, &mut b] {
         let activation = node.clients[0].activate(config(&node.charge));
         node.owner().poll_budgeted(4).unwrap();
@@ -140,13 +136,7 @@ fn world() -> World {
         assert_eq!(selected[0].tag, 7);
         assert_eq!(node.clients[0].buffers(7, BufferState::Free), Some(BUFFERS));
     }
-    World {
-        sim,
-        clock,
-        _environment: guard,
-        a,
-        b,
-    }
+    World { sim, clock, a, b }
 }
 
 impl World {
@@ -293,10 +283,8 @@ fn pages_flow_both_ways_over_one_link() {
 fn activation_requires_implicit_odp_and_releases_on_failure() {
     window_only(|| {
         let sim = Simulation::new();
-        let clock = SimulationClock::new(7);
-        let environment = clock.environment(1);
-        let mut node = node(&sim, 1, &environment);
-        let _guard = environment.enter();
+        let clock = SimClock::new(7);
+        let mut node = node(&sim, 1, clock.ctx(1));
         sim.implicit_odp(false);
         let activation = node.clients[0].activate(config(&node.charge));
         node.owner().poll_budgeted(4).unwrap();
@@ -1060,10 +1048,8 @@ fn failed_deregister_leaks_device_memory_owner() {
 fn registration_mode_requires_huge_page_buffers() {
     let _profile = default_profile(Profile::Registration);
     let sim = Simulation::new();
-    let clock = SimulationClock::new(7);
-    let environment = clock.environment(1);
-    let mut node = node(&sim, 1, &environment);
-    let _guard = environment.enter();
+    let clock = SimClock::new(7);
+    let mut node = node(&sim, 1, clock.ctx(1));
     let mut small = config(&node.charge);
     small.buffer_len = 4096;
     small.pool_bytes = BUFFERS * 4096;
