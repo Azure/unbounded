@@ -62,6 +62,29 @@ type ContributingRunReference struct {
 	EvidenceDigest string `json:"evidenceDigest"`
 }
 
+// +kubebuilder:validation:Enum=Failed;Inconclusive;Canceled
+type NonPassClassification string
+
+const (
+	NonPassClassificationFailed       NonPassClassification = "Failed"
+	NonPassClassificationInconclusive NonPassClassification = "Inconclusive"
+	NonPassClassificationCanceled     NonPassClassification = "Canceled"
+)
+
+// +kubebuilder:validation:XValidation:rule="size(self.uid) > 0",message="uid is required"
+type LatestNonPassWatermark struct {
+	// +kubebuilder:validation:MinLength=1
+	// +kubebuilder:validation:MaxLength=253
+	Name string    `json:"name"`
+	UID  types.UID `json:"uid"`
+	// FinishedAt is the terminal Run completion time used to order watermarks.
+	FinishedAt     metav1.Time           `json:"finishedAt"`
+	Classification NonPassClassification `json:"classification"`
+	// +kubebuilder:validation:Pattern=`^sha256:[0-9a-f]{64}$`
+	EvidenceDigest string `json:"evidenceDigest"`
+}
+
+// +kubebuilder:validation:XValidation:rule="!has(oldSelf.latestNonPass) || (has(self.latestNonPass) && (self.latestNonPass.finishedAt > oldSelf.latestNonPass.finishedAt || (self.latestNonPass.finishedAt == oldSelf.latestNonPass.finishedAt && (self.latestNonPass.uid > oldSelf.latestNonPass.uid || (self.latestNonPass.uid == oldSelf.latestNonPass.uid && self.latestNonPass == oldSelf.latestNonPass)))))",message="latestNonPass must advance by finishedAt and UID and is immutable for the same Run"
 type NodeCertificationStatus struct {
 	// ObservedGeneration is the Policy generation reflected by this status.
 	// +kubebuilder:validation:Minimum=0
@@ -78,6 +101,11 @@ type NodeCertificationStatus struct {
 	Fingerprint *NodeFingerprint `json:"fingerprint,omitempty"`
 	QualifiedAt *metav1.Time     `json:"qualifiedAt,omitempty"`
 	ExpiresAt   *metav1.Time     `json:"expiresAt,omitempty"`
+	// LatestNonPass is the durable latest terminal non-pass that affects
+	// Reset or Revoke semantics. It survives Run and evidence deletion so
+	// passes completed before it cannot regain credit.
+	LatestNonPass *LatestNonPassWatermark `json:"latestNonPass,omitempty"`
+	// ContributingRuns contains credited passing Runs only.
 	// +kubebuilder:validation:MaxItems=64
 	// +listType=atomic
 	ContributingRuns []ContributingRunReference `json:"contributingRuns,omitempty"`

@@ -176,6 +176,7 @@ spec:
                 - type
                 x-kubernetes-list-type: map
               contributingRuns:
+                description: ContributingRuns contains credited passing Runs only.
                 items:
                   properties:
                     evidenceDigest:
@@ -248,6 +249,46 @@ spec:
                 x-kubernetes-validations:
                 - message: nodeUID is required
                   rule: size(self.nodeUID) > 0
+              latestNonPass:
+                description: |-
+                  LatestNonPass is the durable latest terminal non-pass that affects
+                  Reset or Revoke semantics. It survives Run and evidence deletion so
+                  passes completed before it cannot regain credit.
+                properties:
+                  classification:
+                    enum:
+                    - Failed
+                    - Inconclusive
+                    - Canceled
+                    type: string
+                  evidenceDigest:
+                    pattern: ^sha256:[0-9a-f]{64}$
+                    type: string
+                  finishedAt:
+                    description: FinishedAt is the terminal Run completion time used
+                      to order watermarks.
+                    format: date-time
+                    type: string
+                  name:
+                    maxLength: 253
+                    minLength: 1
+                    type: string
+                  uid:
+                    description: |-
+                      UID is a type that holds unique ID values, including UUIDs.  Because we
+                      don't ONLY use UUIDs, this is an alias to string.  Being a type captures
+                      intent and helps make sure that UIDs and names do not get conflated.
+                    type: string
+                required:
+                - classification
+                - evidenceDigest
+                - finishedAt
+                - name
+                - uid
+                type: object
+                x-kubernetes-validations:
+                - message: uid is required
+                  rule: size(self.uid) > 0
               observedGeneration:
                 description: ObservedGeneration is the Policy generation reflected
                   by this status.
@@ -280,6 +321,14 @@ spec:
                 maxLength: 1024
                 type: string
             type: object
+            x-kubernetes-validations:
+            - message: latestNonPass must advance by finishedAt and UID and is immutable
+                for the same Run
+              rule: '!has(oldSelf.latestNonPass) || (has(self.latestNonPass) && (self.latestNonPass.finishedAt
+                > oldSelf.latestNonPass.finishedAt || (self.latestNonPass.finishedAt
+                == oldSelf.latestNonPass.finishedAt && (self.latestNonPass.uid > oldSelf.latestNonPass.uid
+                || (self.latestNonPass.uid == oldSelf.latestNonPass.uid && self.latestNonPass
+                == oldSelf.latestNonPass)))))'
         required:
         - spec
         type: object
