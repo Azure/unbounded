@@ -2331,8 +2331,11 @@ mod subscriptions {
             page: page.clone(),
             membership: MembershipVersion(1),
             receiver: NodeId(A.into()),
-            deadline: crate::peer::protocol::encode_deadline(admitted.request().route.deadline)
-                .unwrap(),
+            deadline: crate::peer::protocol::encode_deadline(
+                &crate::test_support::clock(),
+                admitted.request().route.deadline,
+            )
+            .unwrap(),
             remaining_page_budget: 1,
             remaining_byte_budget: subscription.byte_budget - 19,
             flights: None,
@@ -2416,7 +2419,7 @@ mod subscriptions {
             };
             let mut local = subscribe(&admission, A, 1, 0, FetchMode::CopyOnly);
             set(&mut local, requested);
-            let head = protocol::request_head(&local).unwrap();
+            let head = protocol::request_head(&crate::test_support::clock(), &local).unwrap();
             assert_eq!(
                 head.unique(protocol::SUBSCRIPTION_FLIGHTS).unwrap(),
                 requested.map(|_| b"4".as_slice()),
@@ -2426,7 +2429,7 @@ mod subscriptions {
                 // An older provider decodes without the field and re-encodes,
                 // so its exact agreement check refuses the request.
                 set(&mut local, None);
-                let older = protocol::request_head(&local).unwrap();
+                let older = protocol::request_head(&crate::test_support::clock(), &local).unwrap();
                 assert!(matches!(
                     protocol::agrees(&head, &older, false),
                     Err(Error::Unauthorized)
@@ -2451,6 +2454,7 @@ mod subscriptions {
                     membership: MembershipVersion(1),
                     receiver: NodeId(A.into()),
                     deadline: crate::peer::protocol::encode_deadline(
+                        &crate::test_support::clock(),
                         admitted.request().route.deadline,
                     )
                     .unwrap(),

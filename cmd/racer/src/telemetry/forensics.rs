@@ -362,8 +362,8 @@ pub struct BodyProgress {
     pub tuple: Option<(std::net::SocketAddr, std::net::SocketAddr)>,
 }
 
-pub(crate) fn timestamp(at: std::time::Instant) -> u64 {
-    crate::peer::protocol::encode_deadline(uring_runtime::environment::Deadline(at))
+pub(crate) fn timestamp(clock: &racer_io::Clock, at: std::time::Instant) -> u64 {
+    crate::peer::protocol::encode_deadline(clock, uring_runtime::environment::Deadline(at))
         .unwrap_or_default()
 }
 

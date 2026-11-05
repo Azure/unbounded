@@ -64,13 +64,14 @@ impl Binding {
     #[cfg(test)]
     fn head(
         &self,
+        clock: &racer_io::Clock,
         phase: Phase,
         previous: &[u8; 32],
         length: usize,
         extensions: Vec<Header>,
     ) -> Result<MessageHead> {
         self.wire()
-            .head(phase, previous, length, extensions)
+            .head(clock, phase, previous, length, extensions)
             .map_err(Into::into)
     }
 
@@ -98,7 +99,7 @@ impl Binding {
             response: [0; 32],
             transfer: TransferId(transfer),
             membership,
-            deadline: p::encode_deadline(scope.deadline)?,
+            deadline: p::encode_deadline(scope.clock(), scope.deadline)?,
             rail,
         })
     }
@@ -324,7 +325,7 @@ impl Transfers {
             bounded.deadline.0 = bounded
                 .deadline
                 .0
-                .min(crate::peer::protocol::decode_deadline(binding.deadline)?.0);
+                .min(crate::peer::protocol::decode_deadline(scope.clock(), binding.deadline)?.0);
             bounded.check()?;
             let plan = self.response_plan(
                 &connection,
@@ -530,7 +531,10 @@ impl Transfers {
             || binding.response != [0; 32]
             || binding.membership != request.request.route.membership.0
             || binding.deadline
-                > crate::peer::protocol::encode_deadline(request.request.route.deadline)?
+                > crate::peer::protocol::encode_deadline(
+                    &signatures.ctx().clock,
+                    request.request.route.deadline,
+                )?
         {
             return Err(Error::Unauthorized);
         }
@@ -1545,18 +1549,22 @@ impl Transfers {
                             received: offset as u32,
                             expected: length as u32,
                             reads,
-                            first: first.map(timestamp).unwrap_or_default(),
-                            last: last.map(timestamp).unwrap_or_default(),
-                            now: timestamp(scope.clock().now()),
+                            first: first
+                                .map(|at| timestamp(scope.clock(), at))
+                                .unwrap_or_default(),
+                            last: last
+                                .map(|at| timestamp(scope.clock(), at))
+                                .unwrap_or_default(),
+                            now: timestamp(scope.clock(), scope.clock().now()),
                             original: scope
                                 .body_deadlines
-                                .map(|d| timestamp(d.0))
+                                .map(|d| timestamp(scope.clock(), d.0))
                                 .unwrap_or_default(),
                             share: scope
                                 .body_deadlines
-                                .map(|d| timestamp(d.1))
+                                .map(|d| timestamp(scope.clock(), d.1))
                                 .unwrap_or_default(),
-                            signed: timestamp(request.request.route.deadline.0),
+                            signed: timestamp(scope.clock(), request.request.route.deadline.0),
                             remote,
                             tuple,
                         })),
@@ -2446,7 +2454,7 @@ mod tests {
                 response: [0; 32],
                 transfer: TransferId([6; 16]),
                 membership: 1,
-                deadline: p::encode_deadline(scope.deadline).unwrap(),
+                deadline: p::encode_deadline(scope.clock(), scope.deadline).unwrap(),
                 rail: RailId(7),
             };
             let sender_membership = page_membership(&signers, case.sender_site);
@@ -2817,7 +2825,7 @@ mod tests {
                 response: [5; 32],
                 transfer: TransferId([6; 16]),
                 membership: 1,
-                deadline: p::encode_deadline(scope.deadline).unwrap(),
+                deadline: p::encode_deadline(scope.clock(), scope.deadline).unwrap(),
                 rail: RailId(7),
             };
             let admission = w.a.admission.clone();
@@ -2954,7 +2962,7 @@ mod tests {
                 response: [2; 32],
                 transfer: TransferId([3; 16]),
                 membership: 1,
-                deadline: p::encode_deadline(scope.deadline).unwrap(),
+                deadline: p::encode_deadline(scope.clock(), scope.deadline).unwrap(),
                 rail: RailId(7),
             }
         }
@@ -3059,7 +3067,15 @@ mod tests {
                         .is_err()
                 );
             }
-            let mut head = original.head(Phase::Finish, &[9; 32], 0, vec![]).unwrap();
+            let mut head = original
+                .head(
+                    &crate::test_support::clock(),
+                    Phase::Finish,
+                    &[9; 32],
+                    0,
+                    vec![],
+                )
+                .unwrap();
             p::push(&mut head, "racer-receiver", &nodes[1].node().0);
             p::push(&mut head, "racer-extra", 1);
             assert!(
@@ -3111,9 +3127,29 @@ mod tests {
                 ),
                 (Phase::Finish, usize::MAX, vec![]),
             ] {
-                assert!(binding.head(phase, &[0; 32], length, extensions).is_err());
+                assert!(
+                    binding
+                        .head(
+                            &crate::test_support::clock(),
+                            phase,
+                            &[0; 32],
+                            length,
+                            extensions
+                        )
+                        .is_err()
+                );
             }
-            assert!(binding.head(Phase::Finish, &[0; 32], 17, vec![]).is_ok());
+            assert!(
+                binding
+                    .head(
+                        &crate::test_support::clock(),
+                        Phase::Finish,
+                        &[0; 32],
+                        17,
+                        vec![]
+                    )
+                    .is_ok()
+            );
         }
     }
 }

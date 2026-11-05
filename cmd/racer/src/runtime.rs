@@ -568,7 +568,8 @@ mod tests {
                     start + Duration::from_secs(60),
                 )
                 .unwrap();
-                let signed = crate::peer::protocol::encode_deadline(scope.deadline).unwrap();
+                let signed =
+                    crate::peer::protocol::encode_deadline(scope.clock(), scope.deadline).unwrap();
                 scope
                     .set_candidate_total(start + Duration::from_secs(30))
                     .unwrap();
@@ -597,7 +598,7 @@ mod tests {
                     Err(Error::DeadlineExceeded)
                 );
                 assert_eq!(
-                    crate::peer::protocol::encode_deadline(scope.deadline).unwrap(),
+                    crate::peer::protocol::encode_deadline(scope.clock(), scope.deadline).unwrap(),
                     signed
                 );
             }
@@ -762,12 +763,14 @@ mod tests {
                 )
                 .unwrap();
                 scope.set_candidate_idle(Duration::from_secs(1)).unwrap();
-                let signed = crate::peer::protocol::encode_deadline(scope.deadline).unwrap();
+                let signed =
+                    crate::peer::protocol::encode_deadline(scope.clock(), scope.deadline).unwrap();
                 for _ in 0..5 {
                     clock.advance(Duration::from_millis(500));
                     scope.candidate_progress().unwrap();
                     assert_eq!(
-                        crate::peer::protocol::encode_deadline(scope.deadline).unwrap(),
+                        crate::peer::protocol::encode_deadline(scope.clock(), scope.deadline)
+                            .unwrap(),
                         signed
                     );
                 }
@@ -1704,7 +1707,7 @@ mod tests {
             start + Duration::from_secs(2),
         )
         .unwrap();
-        let wire = crate::peer::protocol::encode_deadline(scope.deadline).unwrap();
+        let wire = crate::peer::protocol::encode_deadline(scope.clock(), scope.deadline).unwrap();
         let mut first = [0; 64];
         fill_random(&mut first[..3]).unwrap();
         fill_random(&mut first[3..]).unwrap();
@@ -1723,11 +1726,13 @@ mod tests {
         clock.set_wall_time(wall - Duration::from_secs(60));
         assert_eq!(now(), start + Duration::from_secs(2));
         assert_eq!(
-            crate::peer::protocol::encode_deadline(scope.deadline).unwrap(),
+            crate::peer::protocol::encode_deadline(scope.clock(), scope.deadline).unwrap(),
             wire
         );
         assert_eq!(
-            crate::peer::protocol::decode_deadline(wire).unwrap().0,
+            crate::peer::protocol::decode_deadline(&crate::test_support::clock(), wire)
+                .unwrap()
+                .0,
             scope.deadline.0
         );
     }

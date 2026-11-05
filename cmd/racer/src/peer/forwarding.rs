@@ -322,7 +322,7 @@ impl Forwarding {
     /// Retain the locally emitted route for verification at the transport boundary.
     /// Response verification still authenticates the original signature and path.
     pub(crate) fn outbound_binding(&self, request: &SignedRequest) -> Result<RequestBinding> {
-        let route = RouteState::from_budget(&request.request.route)?;
+        let route = RouteState::from_budget(&self.signatures.ctx().clock, &request.request.route)?;
         if route.visited.last() != Some(self.signatures.node()) {
             return Err(Error::Unauthorized);
         }
@@ -459,7 +459,7 @@ impl Forwarding {
         request: PeerRequest,
         next: &NodeId,
     ) -> Result<(SignedRequest, RequestBinding)> {
-        let route = RouteState::from_budget(&request.route)?;
+        let route = RouteState::from_budget(&self.signatures.ctx().clock, &request.route)?;
         if route.deadline <= protocol::millis(self.signatures.ctx().clock.wall_now())? {
             return Err(Error::DeadlineExceeded);
         }
@@ -469,7 +469,7 @@ impl Forwarding {
         {
             return Err(Error::HopBudgetExhausted);
         }
-        let mut head = protocol::request_head(&request)?;
+        let mut head = protocol::request_head(&self.signatures.ctx().clock, &request)?;
         push(&mut head, "racer-receiver", &next.0);
         let original = Arc::new(self.signatures.sign(head)?);
         let binding = RequestBinding {
@@ -510,7 +510,7 @@ impl Forwarding {
         let origin = self.signatures.verify_historical(&auth.original)?;
         protocol::agrees(
             &auth.original.head,
-            &protocol::request_head(&request.request)?,
+            &protocol::request_head(&self.signatures.ctx().clock, &request.request)?,
             true,
         )?;
         let mut route = RouteState::from_head(&auth.original.head)?;
@@ -534,7 +534,7 @@ impl Forwarding {
             previous = hop;
             forwarders.push(peer);
         }
-        if route != RouteState::from_budget(&request.request.route)?
+        if route != RouteState::from_budget(&self.signatures.ctx().clock, &request.request.route)?
             || route.visited.contains(&receiver(&previous.head)?)
         {
             return Err(Error::Unauthorized);
@@ -800,8 +800,9 @@ impl Forwarding {
         if request.binding.path.last() != Some(self.signatures.node()) {
             return Err(Error::Unauthorized);
         }
-        let old = RouteState::from_budget(&request.signed.request.route)?;
-        let next = RouteState::from_budget(&budget)?;
+        let old =
+            RouteState::from_budget(&self.signatures.ctx().clock, &request.signed.request.route)?;
+        let next = RouteState::from_budget(&self.signatures.ctx().clock, &budget)?;
         if next.deadline <= protocol::millis(self.signatures.ctx().clock.wall_now())? {
             return Err(Error::DeadlineExceeded);
         }
@@ -812,7 +813,7 @@ impl Forwarding {
         let auth = &mut request.signed.authentication;
         let previous = auth.hops.last().unwrap_or(&auth.original);
         let mut head = hop_head("request-hop", &auth.original, previous)?;
-        protocol::route_headers(&mut head, &budget)?;
+        protocol::route_headers(&self.signatures.ctx().clock, &mut head, &budget)?;
         push(&mut head, "racer-receiver", &next_hop.0);
         auth.hops.push(self.signatures.sign(head)?);
         request.signed.request.route = budget;
@@ -873,12 +874,12 @@ impl std::ops::Deref for RouteState {
     }
 }
 impl RouteState {
-    fn from_budget(budget: &RouteBudget) -> Result<Self> {
+    fn from_budget(clock: &racer_io::Clock, budget: &RouteBudget) -> Result<Self> {
         let mut head = MessageHead {
             start: StartLine::Response { status: 200 },
             headers: Vec::new(),
         };
-        protocol::route_headers(&mut head, budget)?;
+        protocol::route_headers(clock, &mut head, budget)?;
         Self::from_head(&head)
     }
     fn from_head(head: &MessageHead) -> Result<Self> {
@@ -1680,7 +1681,7 @@ mod tests {
             mode: FetchMode::Acquire,
         };
         request.route.remaining_attempts = 2;
-        let head = protocol::request_head(&request).unwrap();
+        let head = protocol::request_head(&crate::test_support::clock(), &request).unwrap();
         let mut metadata = ObjectMetadata {
             content_type: None,
             version: ObjectVersion {
@@ -1759,7 +1760,7 @@ mod tests {
         assert!(
             response_matches(
                 &response,
-                &protocol::request_head(&request).unwrap(),
+                &protocol::request_head(&crate::test_support::clock(), &request).unwrap(),
                 &racer_io::Clock::host()
             )
             .is_err()
@@ -1781,10 +1782,12 @@ mod tests {
     fn every_signed_request_field_must_agree_with_the_logical_request() {
         let signatures = network(3);
         let receiver = Forwarding::new(signatures[1].clone());
-        let fields = protocol::request_head(&request(1)).unwrap().headers;
+        let fields = protocol::request_head(&crate::test_support::clock(), &request(1))
+            .unwrap()
+            .headers;
         for field in fields {
             let logical = request(1);
-            let mut head = protocol::request_head(&logical).unwrap();
+            let mut head = protocol::request_head(&crate::test_support::clock(), &logical).unwrap();
             head.headers
                 .iter_mut()
                 .find(|h| h.name == field.name)
@@ -1825,7 +1828,7 @@ mod tests {
             ("racer-route-attempt", protocol::binary(&[2; 17])),
         ] {
             let logical = request(1);
-            let mut head = protocol::request_head(&logical).unwrap();
+            let mut head = protocol::request_head(&crate::test_support::clock(), &logical).unwrap();
             head.headers
                 .iter_mut()
                 .find(|h| h.name == name)
@@ -1902,7 +1905,8 @@ mod tests {
             logical
         };
         for value in ["4294967296", "-1", "01", "+1"] {
-            let mut head = protocol::request_head(&acquire(9)).unwrap();
+            let mut head =
+                protocol::request_head(&crate::test_support::clock(), &acquire(9)).unwrap();
             head.headers
                 .iter_mut()
                 .find(|h| h.name == "racer-route-attempts")
@@ -1983,7 +1987,7 @@ mod tests {
         .unwrap();
         let mut refill = final_request.request.route.clone();
         refill.remaining_attempts = 5;
-        protocol::route_headers(&mut forged, &refill).unwrap();
+        protocol::route_headers(&crate::test_support::clock(), &mut forged, &refill).unwrap();
         push(&mut forged, "racer-receiver", &node(3).0);
         let bad_hop = signatures[2].sign(forged).unwrap();
         let genuine_hop = std::mem::replace(&mut final_request.authentication.hops[1], bad_hop);
@@ -2013,7 +2017,8 @@ mod tests {
         // A forged but correctly signed CopyOnly original cannot hide credits by
         // lowering them to zero in the effective route at a subsequent relay.
         let mut copy = request(12);
-        let mut original_head = protocol::request_head(&copy).unwrap();
+        let mut original_head =
+            protocol::request_head(&crate::test_support::clock(), &copy).unwrap();
         original_head
             .headers
             .iter_mut()
@@ -2025,7 +2030,7 @@ mod tests {
         copy.route.visited.push(node(1));
         copy.route.remaining_links -= 1;
         let mut hop = hop_head("request-hop", &original, &original).unwrap();
-        protocol::route_headers(&mut hop, &copy.route).unwrap();
+        protocol::route_headers(&crate::test_support::clock(), &mut hop, &copy.route).unwrap();
         push(&mut hop, "racer-receiver", &node(2).0);
         let hop = signatures[1].sign(hop).unwrap();
         assert!(
@@ -2311,15 +2316,19 @@ mod tests {
             PrefetchAction::Probe { pages: vec![4, 4] },
         ] {
             assert!(
-                request_head(&prefetch_request(31, action.clone())).is_err(),
+                request_head(
+                    &crate::test_support::clock(),
+                    &prefetch_request(31, action.clone())
+                )
+                .is_err(),
                 "{action:?}"
             );
         }
         assert!(
-            request_head(&prefetch_request(
-                31,
-                fill((0..256).collect(), 256 * PAGE_BYTES)
-            ))
+            request_head(
+                &crate::test_support::clock(),
+                &prefetch_request(31, fill((0..256).collect(), 256 * PAGE_BYTES))
+            )
             .is_ok()
         );
         let signatures = network(2);
@@ -2882,9 +2891,12 @@ mod tests {
     fn deadline_roundtrip_and_verified_mailbox_ownership() {
         let deadline =
             uring_runtime::environment::Deadline(Instant::now() + Duration::from_secs(20));
-        let value = protocol::encode_deadline(deadline).unwrap();
-        let decoded = protocol::decode_deadline(value).unwrap();
-        assert_eq!(protocol::encode_deadline(decoded).unwrap(), value);
+        let value = protocol::encode_deadline(&crate::test_support::clock(), deadline).unwrap();
+        let decoded = protocol::decode_deadline(&crate::test_support::clock(), value).unwrap();
+        assert_eq!(
+            protocol::encode_deadline(&crate::test_support::clock(), decoded).unwrap(),
+            value
+        );
         assert!(decoded.0 <= deadline.0);
         fn send<T: Send>() {}
         send::<VerifiedRequest>();

@@ -2088,7 +2088,7 @@ impl CandidatePolicy {
             attempts: budget.remaining_attempts(),
             links: budget.remaining_links(),
             overall: if trail.is_some() {
-                crate::telemetry::timestamp(budget.deadline())
+                crate::telemetry::timestamp(scope.clock(), budget.deadline())
             } else {
                 0
             },
@@ -2134,9 +2134,9 @@ impl CandidatePolicy {
             // the latter per attempt would make a later update renew provider authority.
             let signed_deadline = overall;
             if trail.is_some() {
-                facts.overall = crate::telemetry::timestamp(overall);
-                facts.share = crate::telemetry::timestamp(plan.share);
-                facts.cap = crate::telemetry::timestamp(attempt_end);
+                facts.overall = crate::telemetry::timestamp(scope.clock(), overall);
+                facts.share = crate::telemetry::timestamp(scope.clock(), plan.share);
+                facts.cap = crate::telemetry::timestamp(scope.clock(), attempt_end);
             }
             // A clone shares cancellation: timing it out would cancel the caller too.
             let mut attempt_scope = scope.child(scope.request, overall)?;

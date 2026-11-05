@@ -262,7 +262,7 @@ impl Subscriptions {
             subscription,
             membership.version,
             receiver,
-            encode_deadline(scope.deadline)?,
+            encode_deadline(scope.clock(), scope.deadline)?,
             now()?,
         )?;
         // Free the flight slot on failure or cancellation. The sequence stays

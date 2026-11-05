@@ -1220,7 +1220,7 @@ impl Flights {
             })
         });
         crate::telemetry::FlightExpiry {
-            observed_unix_ms: crate::telemetry::timestamp(now),
+            observed_unix_ms: crate::telemetry::timestamp(&self.clock, now),
             overshoot_us: age(cutoff),
             queue,
             caller_head: ticket.map(|ticket| Some(ticket.sequence()) == queue.head),

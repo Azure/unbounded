@@ -64,12 +64,13 @@ impl Binding {
     /// Construct the canonical unsigned phase head.
     pub fn head(
         &self,
+        clock: &racer_io::Clock,
         phase: Phase,
         previous: &[u8; 32],
         length: usize,
         extensions: Vec<Header>,
     ) -> Result<MessageHead> {
-        decode_deadline(self.deadline)?;
+        decode_deadline(clock, self.deadline)?;
         if self.membership == 0
             || self.transfer == [0; 16]
             || extensions.len() != phase.fields().len()
@@ -131,7 +132,7 @@ impl Binding {
         length: usize,
         extensions: Vec<Header>,
     ) -> Result<SignedHead> {
-        let mut h = self.head(phase, previous, length, extensions)?;
+        let mut h = self.head(&signatures.ctx().clock, phase, previous, length, extensions)?;
         push(&mut h, "racer-receiver", &to.0);
         signatures.sign(h)
     }
@@ -148,7 +149,9 @@ impl Binding {
         previous: &[u8; 32],
         length: usize,
     ) -> Result<(VerifiedHead, Phase)> {
-        if decode_deadline(self.deadline)?.0 <= signatures.ctx().clock.now() {
+        if decode_deadline(&signatures.ctx().clock, self.deadline)?.0
+            <= signatures.ctx().clock.now()
+        {
             return Err(Error::DeadlineExceeded);
         }
         let kind = field(&signed.head, "racer-kind")?;
@@ -168,7 +171,7 @@ impl Binding {
             .collect::<Result<Vec<_>>>()?;
         agrees(
             &signed.head,
-            &self.head(phase, previous, length, extensions)?,
+            &self.head(&signatures.ctx().clock, phase, previous, length, extensions)?,
             false,
         )?;
         if node_field(&signed.head, "racer-signer")? != *from {

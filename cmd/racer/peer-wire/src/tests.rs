@@ -504,9 +504,10 @@ fn control_chain_rejects_phase_previous_identity_and_extension_substitution() {
         response: [2; 32],
         transfer: [3; 16],
         membership: 1,
-        deadline: encode_deadline(Deadline(
-            racer_io::Clock::host().now() + Duration::from_secs(30),
-        ))
+        deadline: encode_deadline(
+            &racer_io::Clock::host(),
+            Deadline(racer_io::Clock::host().now() + Duration::from_secs(30)),
+        )
         .unwrap(),
         rail: racer_control_wire::RailId(1),
     };
@@ -548,15 +549,37 @@ fn control_chain_rejects_phase_previous_identity_and_extension_substitution() {
                 .is_err()
         );
     }
-    assert!(binding.head(Phase::Accept, &previous, 0, vec![]).is_err());
     assert!(
         binding
-            .head(Phase::Finish, &previous, MAX_BODY, vec![])
+            .head(
+                &racer_io::Clock::host(),
+                Phase::Accept,
+                &previous,
+                0,
+                vec![]
+            )
+            .is_err()
+    );
+    assert!(
+        binding
+            .head(
+                &racer_io::Clock::host(),
+                Phase::Finish,
+                &previous,
+                MAX_BODY,
+                vec![]
+            )
             .is_ok()
     );
     assert!(
         binding
-            .head(Phase::Finish, &previous, MAX_BODY + 1, vec![])
+            .head(
+                &racer_io::Clock::host(),
+                Phase::Finish,
+                &previous,
+                MAX_BODY + 1,
+                vec![]
+            )
             .is_err()
     );
 }
@@ -621,7 +644,9 @@ fn request_builders_supply_host_for_strict_http_codec() {
         binary(&[7; 38]).into_bytes(),
     )];
     for (phase, extensions) in [(Phase::Accept, grant), (Phase::Finish, vec![])] {
-        let head = binding.head(phase, &[0; 32], 0, extensions).unwrap();
+        let head = binding
+            .head(&racer_io::Clock::host(), phase, &[0; 32], 0, extensions)
+            .unwrap();
         assert_eq!(
             head.unique("host").unwrap(),
             (!phase.response()).then_some(b"".as_slice())

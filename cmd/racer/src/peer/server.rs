@@ -961,7 +961,7 @@ impl PeerServer {
                     subscription.clone(),
                     membership.version,
                     request.origin().node().clone(),
-                    encode_deadline(scope.deadline)?,
+                    encode_deadline(scope.clock(), scope.deadline)?,
                     millis(scope.clock().wall_now())?,
                 )?
             } else {

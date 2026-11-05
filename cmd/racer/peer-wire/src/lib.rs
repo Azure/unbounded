@@ -618,13 +618,16 @@ pub fn push_binary(head: &mut MessageHead, name: &str, bytes: &[u8]) {
 pub fn millis(time: SystemTime) -> Result<u64> {
     racer_io::ctx::unix_millis(time).map_err(Into::into)
 }
-/// Encode a deadline using the environment's stable clock mapping.
-pub fn encode_deadline(deadline: Deadline) -> Result<u64> {
-    deadline.to_unix_millis().map_err(Into::into)
+/// Encode a deadline using `clock`'s stable anchor.
+pub fn encode_deadline(clock: &racer_io::Clock, deadline: Deadline) -> Result<u64> {
+    racer_io::ctx::instant_to_unix_millis(deadline.0, clock.anchor()).map_err(Into::into)
 }
-/// Decode a deadline without renewing its authority at each hop.
-pub fn decode_deadline(value: u64) -> Result<Deadline> {
-    Deadline::from_unix_millis(value).map_err(Into::into)
+/// Decode a deadline through `clock`'s stable anchor without renewing its
+/// authority at each hop.
+pub fn decode_deadline(clock: &racer_io::Clock, value: u64) -> Result<Deadline> {
+    racer_io::ctx::unix_millis_to_instant(value, clock.anchor())
+        .map(Deadline)
+        .map_err(Into::into)
 }
 /// Encode a bounded node list with big-endian length prefixes and padded base64.
 pub fn nodes(nodes: &[NodeId]) -> Result<String> {

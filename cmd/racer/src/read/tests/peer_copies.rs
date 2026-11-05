@@ -206,7 +206,10 @@ impl ScriptedPeers {
                             membership: request.route.membership,
                             receiver: node(self.local),
                             deadline: crate::peer::protocol::number(
-                                &crate::peer::protocol::request_head(&request)?,
+                                &crate::peer::protocol::request_head(
+                                    &crate::test_support::clock(),
+                                    &request,
+                                )?,
                                 "racer-route-deadline",
                             )?,
                             remaining_page_budget: subscription.page_budget - 1,
@@ -4974,11 +4977,16 @@ fn offer_encoding_is_restricted_to_credential_free_page_requests() {
         metadata: None,
         authorization: None,
     };
-    assert!(crate::peer::protocol::request_head(&base(1, &bare)).is_err());
+    assert!(
+        crate::peer::protocol::request_head(&crate::test_support::clock(), &base(1, &bare))
+            .is_err()
+    );
     // Origin credentials (the fixture's context carries them).
     let sealed = base(0, &f.context);
     if sealed.origin.authorization.is_some() || sealed.origin.metadata.is_some() {
-        assert!(crate::peer::protocol::request_head(&sealed).is_err());
+        assert!(
+            crate::peer::protocol::request_head(&crate::test_support::clock(), &sealed).is_err()
+        );
     }
     // Not a page.
     let mut metadata = base(0, &bare);
@@ -4987,8 +4995,10 @@ fn offer_encoding_is_restricted_to_credential_free_page_requests() {
         selector: crate::model::MetadataSelector::Fresh,
         mode: FetchMode::Offer,
     };
-    assert!(crate::peer::protocol::request_head(&metadata).is_err());
-    assert!(crate::peer::protocol::request_head(&base(0, &bare)).is_ok());
+    assert!(crate::peer::protocol::request_head(&crate::test_support::clock(), &metadata).is_err());
+    assert!(
+        crate::peer::protocol::request_head(&crate::test_support::clock(), &base(0, &bare)).is_ok()
+    );
 }
 
 /// Drive this node's due copy offers until `n` more of them ended.
@@ -5388,15 +5398,15 @@ fn a_ping_is_answered_miss_at_once_without_a_body() {
             .seal(&bare, crate::model::AttemptId([0x41; 16]), &f.scope)
             .unwrap(),
     };
-    assert!(crate::peer::protocol::request_head(&base(0)).is_ok());
-    assert!(crate::peer::protocol::request_head(&base(1)).is_err());
+    assert!(crate::peer::protocol::request_head(&crate::test_support::clock(), &base(0)).is_ok());
+    assert!(crate::peer::protocol::request_head(&crate::test_support::clock(), &base(1)).is_err());
     let mut metadata = base(0);
     metadata.operation = PeerOperation::Metadata {
         object: f.context.object.clone(),
         selector: crate::model::MetadataSelector::Fresh,
         mode: FetchMode::Ping,
     };
-    assert!(crate::peer::protocol::request_head(&metadata).is_err());
+    assert!(crate::peer::protocol::request_head(&crate::test_support::clock(), &metadata).is_err());
 }
 
 /// An owner whose walk refreshed to a newer membership after a

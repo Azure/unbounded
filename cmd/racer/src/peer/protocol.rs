@@ -401,8 +401,9 @@ pub fn millis(time: SystemTime) -> Result<u64> {
 /// Deadlines farther than [`MAX_WIRE_DEADLINE_HORIZON`] from now are clamped:
 /// an untimed scope's placeholder deadline (about a century out) must never
 /// grant a peer unbounded authority.
-pub fn encode_deadline(deadline: Deadline) -> Result<u64> {
-    peer_wire::encode_deadline(clamp_wire_deadline(deadline, Instant::now())).map_err(Into::into)
+pub fn encode_deadline(clock: &racer_io::Clock, deadline: Deadline) -> Result<u64> {
+    peer_wire::encode_deadline(clock, clamp_wire_deadline(deadline, clock.now()))
+        .map_err(Into::into)
 }
 /// Longest deadline horizon ever placed on the wire.
 pub const MAX_WIRE_DEADLINE_HORIZON: Duration = Duration::from_secs(24 * 3600);
@@ -412,8 +413,8 @@ fn clamp_wire_deadline(deadline: Deadline, now: Instant) -> Deadline {
         _ => deadline,
     }
 }
-pub fn decode_deadline(value: u64) -> Result<Deadline> {
-    peer_wire::decode_deadline(value).map_err(Into::into)
+pub fn decode_deadline(clock: &racer_io::Clock, value: u64) -> Result<Deadline> {
+    peer_wire::decode_deadline(clock, value).map_err(Into::into)
 }
 /// Canonical node-list encoding: concatenated u32 big-endian length + UTF-8 ID,
 /// then padded base64. Empty lists encode as an empty header value.
@@ -434,7 +435,11 @@ fn version_fields(head: &mut MessageHead, version: &ObjectVersion) -> Result<()>
     push(head, "racer-etag", version.etag.as_str());
     Ok(())
 }
-pub fn route_headers(head: &mut MessageHead, route: &RouteBudget) -> Result<()> {
+pub fn route_headers(
+    clock: &racer_io::Clock,
+    head: &mut MessageHead,
+    route: &RouteBudget,
+) -> Result<()> {
     if route.membership.0 == 0 {
         return Err(Error::InvalidRequest);
     }
@@ -449,13 +454,13 @@ pub fn route_headers(head: &mut MessageHead, route: &RouteBudget) -> Result<()> 
     push(
         head,
         "racer-route-deadline",
-        encode_deadline(route.deadline)?,
+        encode_deadline(clock, route.deadline)?,
     );
     Ok(())
 }
 /// Encode every logical request field, including absent/present opaque context.
 /// Authentication headers are added only by `Signatures`.
-pub fn request_head(request: &PeerRequest) -> Result<MessageHead> {
+pub fn request_head(clock: &racer_io::Clock, request: &PeerRequest) -> Result<MessageHead> {
     if request
         .origin
         .metadata
@@ -623,7 +628,7 @@ pub fn request_head(request: &PeerRequest) -> Result<MessageHead> {
         push_binary(&mut head, "racer-authorization-nonce", &auth.nonce.0);
         push_binary(&mut head, "racer-authorization", &auth.ciphertext);
     }
-    route_headers(&mut head, &request.route)?;
+    route_headers(clock, &mut head, &request.route)?;
     Ok(head)
 }
 /// Prefetch operations carry origin credentials for the owner's fill.
@@ -1157,7 +1162,7 @@ fn bodyless_response(head: &MessageHead, outcome: &str) -> Result<PeerResponse> 
         _ => return Err(Error::InvalidRequest),
     })
 }
-fn route(head: &MessageHead) -> Result<RouteBudget> {
+fn route(clock: &racer_io::Clock, head: &MessageHead) -> Result<RouteBudget> {
     let remaining_links = number(head, "racer-route-links")?
         .try_into()
         .map_err(|_| Error::InvalidRequest)?;
@@ -1175,7 +1180,7 @@ fn route(head: &MessageHead) -> Result<RouteBudget> {
         remaining_attempts: number(head, "racer-route-attempts")?
             .try_into()
             .map_err(|_| Error::InvalidRequest)?,
-        deadline: decode_deadline(number(head, "racer-route-deadline")?)?,
+        deadline: decode_deadline(clock, number(head, "racer-route-deadline")?)?,
     })
 }
 impl SecurityCodec {
@@ -1255,8 +1260,12 @@ impl SecurityCodec {
             }
             _ => return Err(Error::InvalidRequest),
         };
-        let original_route = route(head)?;
-        let effective_route = route(authentication.hops.last().map(|h| &h.head).unwrap_or(head))?;
+        let clock = scope.clock();
+        let original_route = route(clock, head)?;
+        let effective_route = route(
+            clock,
+            authentication.hops.last().map(|h| &h.head).unwrap_or(head),
+        )?;
         let mut origin_scope = scope.clone();
         origin_scope.request = original_route.request;
         origin_scope.deadline.0 = origin_scope.deadline.0.min(effective_route.deadline.0);
@@ -1289,7 +1298,7 @@ impl SecurityCodec {
             origin,
             route: original_route,
         };
-        agrees(head, &request_head(&request)?, false)?;
+        agrees(head, &request_head(clock, &request)?, false)?;
         request.route = effective_route;
         Ok(SignedRequest {
             authentication,
@@ -2814,8 +2823,8 @@ pub(crate) mod tests {
                 crate::runtime::RequestScope::untimed(RequestId([7; 16]), racer_io::Clock::host())
                     .unwrap();
             let before = Instant::now();
-            let encoded = encode_deadline(scope.deadline).unwrap();
-            let decoded = decode_deadline(encoded).unwrap();
+            let encoded = encode_deadline(scope.clock(), scope.deadline).unwrap();
+            let decoded = decode_deadline(&crate::test_support::clock(), encoded).unwrap();
             assert!(decoded.0 <= Instant::now() + MAX_WIRE_DEADLINE_HORIZON);
             assert!(decoded.0 + Duration::from_secs(1) >= before + MAX_WIRE_DEADLINE_HORIZON);
             let near = Deadline(before + Duration::from_secs(30));
@@ -2852,9 +2861,12 @@ pub(crate) mod tests {
             }
             assert!(decode_nodes(binary(&duplicate).as_bytes()).is_err());
             let deadline = Deadline(Instant::now() + Duration::from_secs(30));
-            let encoded = encode_deadline(deadline).unwrap();
-            let decoded = decode_deadline(encoded).unwrap();
-            assert_eq!(encode_deadline(decoded).unwrap(), encoded);
+            let encoded = encode_deadline(&crate::test_support::clock(), deadline).unwrap();
+            let decoded = decode_deadline(&crate::test_support::clock(), encoded).unwrap();
+            assert_eq!(
+                encode_deadline(&crate::test_support::clock(), decoded).unwrap(),
+                encoded
+            );
             assert!(decoded.0 <= deadline.0);
             const { assert!(MAX_SIGNED_HEAD <= MAX_HEAD) };
         }

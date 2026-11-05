@@ -3389,7 +3389,11 @@ mod timeouts {
                     subscription.clone(),
                     f.candidates.membership.version,
                     f.policy.node.clone(),
-                    crate::peer::protocol::encode_deadline(Deadline(call.signed_deadline)).unwrap(),
+                    crate::peer::protocol::encode_deadline(
+                        &crate::test_support::clock(),
+                        Deadline(call.signed_deadline),
+                    )
+                    .unwrap(),
                     crate::peer::protocol::millis(racer_io::Clock::host().wall_now()).unwrap(),
                 )
                 .expect("later exchange must not renew the provider contract");
