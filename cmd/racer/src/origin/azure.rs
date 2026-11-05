@@ -406,6 +406,7 @@ impl<T: AzureTransport, K: AzureTokenSource> AzureOrigin<T, K> {
                 range,
                 if_match,
                 token.as_ref().map(BearerToken::as_bytes),
+                begun.scope.clock().wall_now(),
             )?;
             let exchange = self
                 .transport
@@ -516,6 +517,7 @@ impl<T: AzureTransport, K: AzureTokenSource> AzureOrigin<T, K> {
             blob.content_type,
             total,
             definition,
+            begun.scope.clock().wall_now(),
         )?;
         if blob.content_length == 0 {
             exchange.finish().map_err(transport_error)?;
@@ -563,6 +565,7 @@ impl<T: AzureTransport, K: AzureTokenSource> AzureOrigin<T, K> {
             blob.content_type,
             blob.content_length,
             definition,
+            begun.scope.clock().wall_now(),
         )
     }
 
@@ -641,6 +644,7 @@ impl<T: AzureTransport, K: AzureTokenSource> AzureOrigin<T, K> {
             blob.content_type,
             total,
             definition,
+            begun.scope.clock().wall_now(),
         )?;
         let plaintext = self
             .read(exchange, reservation, blob.content_length, &begun.scope)
@@ -666,8 +670,9 @@ fn metadata(
     content_type: Option<crate::model::ContentType>,
     length: u64,
     definition: &OriginDefinition,
+    now: SystemTime,
 ) -> Result<ObjectMetadata> {
-    let expires = SystemTime::now()
+    let expires = now
         .checked_add(definition.metadata_ttl)
         .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
         .ok_or(Error::Internal)?;

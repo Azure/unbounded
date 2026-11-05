@@ -101,6 +101,7 @@ fn token_parsing_and_refresh_schedule() {
         )
         .as_bytes(),
         now,
+        now,
     )
     .unwrap();
     assert_eq!(&*on.token, "t1");
@@ -110,7 +111,7 @@ fn token_parsing_and_refresh_schedule() {
     );
     let lead = on.expires.duration_since(on.refresh).unwrap();
     assert!(lead.as_secs() == REFRESH_LEAD.as_secs(), "{lead:?}");
-    let within = parse_token(token_json("t2", "\"expires_in\":60").as_bytes(), now).unwrap();
+    let within = parse_token(token_json("t2", "\"expires_in\":60").as_bytes(), now, now).unwrap();
     let lead = within.expires.duration_since(within.refresh).unwrap();
     assert!(
         (29..=31).contains(&lead.as_secs()),
@@ -124,7 +125,7 @@ fn token_parsing_and_refresh_schedule() {
         token_json("t", "\"expires_in\":\"soon\""),
         "not json".to_owned(),
     ] {
-        assert!(parse_token(bad.as_bytes(), now).is_err(), "{bad}");
+        assert!(parse_token(bad.as_bytes(), now, now).is_err(), "{bad}");
     }
     assert_eq!(
         refresh_time(now, Duration::from_secs(3600)),
@@ -354,8 +355,8 @@ fn refresh_lock_wait_observes_waiter_deadline() {
     let Some(source) = stalled_source() else {
         return;
     };
-    // A stalled fetch holds the single-flight lock.
-    let fetch = source.flight.try_lock().unwrap();
+    // A stalled fetch leads the node-wide refresh.
+    let fetch = source.cache.begin().ok().unwrap();
     let started = Instant::now();
     let short = RequestScope::host(
         crate::model::RequestId([8; 16]),
@@ -373,7 +374,7 @@ fn refresh_lock_wait_observes_waiter_deadline() {
         refresh: SystemTime::now() + Duration::from_secs(600),
         expires: SystemTime::now() + Duration::from_secs(3600),
     });
-    drop(fetch);
+    fetch.finish(None);
     assert_eq!(&*bearer(&source).unwrap(), "late");
 }
 
@@ -382,7 +383,7 @@ fn refresh_lock_wait_observes_waiter_cancellation() {
     let Some(source) = stalled_source() else {
         return;
     };
-    let fetch = source.flight.try_lock().unwrap();
+    let fetch = source.cache.begin().ok().unwrap();
     let waiter = scope();
     let canceller = waiter.cancellation.clone();
     let started = Instant::now();
@@ -397,6 +398,60 @@ fn refresh_lock_wait_observes_waiter_cancellation() {
     assert!(started.elapsed() < Duration::from_secs(5));
     thread.join().unwrap();
     drop(fetch);
-    // The lock is free again for the next refresh.
-    assert!(source.flight.try_lock().is_some());
+    // Leadership is free again for the next refresh.
+    assert!(source.cache.begin().is_ok());
+}
+
+/// Requests on many workers that find the token due at once share one
+/// fetch: one worker leads it and the others wait for its token.
+#[test]
+fn concurrent_workers_share_one_refresh() {
+    const WORKERS: usize = 8;
+    let (address, accepted, server) = serve(None, 1, move |_, _| {
+        // Hold the fetch open so every worker finds it running.
+        std::thread::sleep(Duration::from_millis(300));
+        ok(&token_json("shared", "\"expires_in\":\"3600\""), false)
+    });
+    let cache = Arc::new(
+        AzureTokenCache::new(
+            AzureCredential::ManagedIdentity { client_id: None },
+            imds_endpoints(address.port()),
+        )
+        .unwrap(),
+    );
+    // A token at its refresh time is due on every worker.
+    cache.store(CachedToken {
+        token: Arc::from("old"),
+        expires: SystemTime::now() + Duration::from_secs(30),
+        refresh: SystemTime::now() - Duration::from_secs(1),
+    });
+    let barrier = Arc::new(std::sync::Barrier::new(WORKERS));
+    let workers: Vec<_> = (0..WORKERS)
+        .map(|_| {
+            let cache = cache.clone();
+            let barrier = barrier.clone();
+            std::thread::spawn(move || {
+                let reactor = reactor();
+                barrier.wait();
+                let reactor = reactor?;
+                let source = AzureTokenSource::with_resolver(
+                    cache,
+                    reactor,
+                    Rc::new(MapResolver::new(Vec::new())),
+                );
+                Some(bearer(&source).map(|token| token.to_string()))
+            })
+        })
+        .collect();
+    let results: Vec<_> = workers.into_iter().map(|w| w.join().unwrap()).collect();
+    if results.iter().any(Option::is_none) {
+        let _ = std::net::TcpStream::connect(address);
+        server.join().unwrap();
+        return;
+    }
+    for result in results {
+        assert_eq!(result.unwrap().unwrap(), "shared");
+    }
+    server.join().unwrap();
+    assert_eq!(accepted.load(Ordering::SeqCst), 1);
 }

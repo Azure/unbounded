@@ -192,7 +192,7 @@ impl AzureTokenSource for AzureTokens {
         challenge: Option<&[u8]>,
         sent: Option<&[u8]>,
     ) -> bool {
-        self.rejected_at(credential, challenge, sent, Instant::now())
+        self.rejected_at(credential, challenge, sent, self.reactor.ctx().clock.now())
     }
 
     /// Drop sources for credentials no published origin uses. A request in
