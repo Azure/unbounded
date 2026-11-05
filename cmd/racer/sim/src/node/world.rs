@@ -3489,6 +3489,9 @@ impl NodeWorld {
             }
             let costs = self.fabric.costs;
             let conn = self.conn_worker(mid);
+            // Charged on the crypto helper, though production signs inline on the I/O worker
+            // (`src/peer.rs` `sign_request_to`, `append_request`); see `dst/MODEL.md`, "Signing
+            // placement".
             let proofs = self.msgs[&mid].path.len();
             let signed = self
                 .fabric

@@ -2072,6 +2072,9 @@ impl<'s> Model<'s> {
         } else {
             self.conn_worker(mid)
         };
+        // Charged on the crypto helper, though production signs inline on the I/O worker
+        // (`src/peer.rs` `sign_request_to`, `append_request`); see `dst/MODEL.md`, "Signing
+        // placement".
         let proofs = self.msgs[&mid].path.len();
         let signed =
             self.fabric
@@ -2189,9 +2192,10 @@ impl<'s> Model<'s> {
             .fold(ready, |t, hop| self.fabric.message(t, hop[0], hop[1]))
     }
 
-    /// `node` signs a peer response on its crypto helper (production `sign_response` in
-    /// `peer/server.rs`; racer-sim `send_reply`); returns when the signature is ready.
-    /// The helper is the one paired with the worker holding `mid`'s connection.
+    /// `node` signs a peer response on the crypto helper paired with the worker holding `mid`'s
+    /// connection (racer-sim `send_reply`); returns when the signature is ready. Production
+    /// signs inline on the I/O worker (`Forwarding::sign_response` from `peer/server.rs`); see
+    /// `dst/MODEL.md`, "Signing placement".
     fn sign(&mut self, node: u32, mid: u64) -> Nanos {
         let now = self.now();
         let conn = self.conn_worker(mid);
@@ -2973,7 +2977,7 @@ fn relay_transfers() -> usize {
 /// waiters (`src/security.rs` `CryptoClient::new`, `runtime/src/offload.rs`
 /// `AdmissionQueue::enter`), racer-sim `NodeConfig::crypto_queue`.
 fn crypto_queue() -> usize {
-    2 * racer_core::admission::Limits::default().queue_entries.get()
+    racer_core::admission::Limits::default().crypto_submissions()
 }
 
 /// Production per-worker flight bounds (`racer_core::admission::Limits::default`, racer-sim

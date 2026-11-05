@@ -282,7 +282,7 @@ impl Default for NodeConfig {
             flights: 64,
             waiters_per_flight: 64,
             relay_transfers: 16,
-            crypto_queue: 512,
+            crypto_queue: racer_core::admission::Limits::default().crypto_submissions() as u32,
             plaintext_bytes: 64 * MIB,
             ciphertext_bytes: 128 * MIB,
             dirty_bytes: 160 * MIB,
