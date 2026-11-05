@@ -141,7 +141,8 @@ pub enum Effect<T: Types> {
     /// What a probe of `page` to member position `dest`, sent at `sent`, showed about `dest`'s
     /// liveness (production `CandidatePolicy::apply` into the node's `LinkHealth`): the
     /// interpreter records it in its node-wide [`crate::liveness::Silence`] and orders later
-    /// rankings with [`crate::read::demote_unanswered`]. Overflow helper probes report none.
+    /// rankings with [`crate::read::demote_unanswered`]. For an overflow helper probe, `dest` is the
+    /// helper.
     Silence {
         page: T::Page,
         dest: u32,
@@ -321,6 +322,10 @@ struct Read<T: Types> {
     machine: PageAcquisition<T::Rank, T::Membership, T::Answer>,
     budget: AcquisitionBudget,
     page: T::Page,
+    /// The overflow helper the read's latest probe went to, if it went to one: the acquisition
+    /// asks for a helper without a destination ([`Self::helper`] resolves it), so its evidence
+    /// about that probe names none.
+    helper: Option<u32>,
 }
 
 #[derive(Default)]
@@ -615,6 +620,7 @@ impl<T: Types> WorkerCore<T> {
             read,
             Read {
                 machine: PageAcquisition::new(config, initial, now),
+                helper: None,
                 budget: budget.build(),
                 page,
             },
@@ -653,6 +659,7 @@ impl<T: Types> WorkerCore<T> {
                 .machine
                 .on(input, &mut entry.budget, now, &mut self.ids, &mut effects)?;
             let page = entry.page.clone();
+            let mut helper_dest = entry.helper;
             for effect in effects {
                 use acquisition::Io as Acq;
                 let effect = match effect.split() {
@@ -664,10 +671,14 @@ impl<T: Types> WorkerCore<T> {
                                     silence: Some(note),
                                     ..
                                 },
-                            dest: Some(dest),
+                            dest,
                             sent,
                             ..
                         } = report
+                            // Production names the helper (`CandidatePolicy::apply`,
+                            // `ProbeDest::Helper`), so a helper probe's timeout counts against
+                            // the helper too.
+                            && let Some(dest) = dest.or(helper_dest)
                         {
                             out.push(Effect::Silence {
                                 page: page.clone(),
@@ -684,6 +695,9 @@ impl<T: Types> WorkerCore<T> {
                         continue;
                     }
                 };
+                if let Acq::Send { .. } | Acq::Hedge { .. } | Acq::Batch { .. } = effect {
+                    helper_dest = None;
+                }
                 match effect {
                     Acq::Send {
                         id,
@@ -692,6 +706,7 @@ impl<T: Types> WorkerCore<T> {
                         version,
                     } => match self.helper(&page, version) {
                         Some(helper) => {
+                            helper_dest = Some(helper);
                             self.observed.helpers += 1;
                             out.push(Effect::Acquisition {
                                 read,
@@ -715,6 +730,9 @@ impl<T: Types> WorkerCore<T> {
                         effect,
                     }),
                 }
+            }
+            if let Some(entry) = self.reads.get_mut(&read) {
+                entry.helper = helper_dest;
             }
         }
         Ok(())

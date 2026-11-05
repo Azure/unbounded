@@ -471,7 +471,7 @@ fn a_shed_requester_asks_its_mesh_helper() {
 }
 
 #[test]
-fn a_signed_shed_reports_the_owner_busy_and_a_helper_reports_nothing() {
+fn a_signed_shed_reports_the_owner_busy_and_a_helper_answer_reports_the_helper() {
     let now = Instant::now();
     let mut c = core(now);
     let mut out = Vec::new();
@@ -516,7 +516,8 @@ fn a_signed_shed_reports_the_owner_busy_and_a_helper_reports_nothing() {
         "{out:?}"
     );
     assert_eq!(silence[0].id(), None, "a silence report expects no answer");
-    // The helper's answer is not liveness evidence about a member position.
+    // Production names the helper as the destination (`CandidatePolicy::apply`,
+    // `ProbeDest::Helper`): its answer says it is not hung.
     let (read, id, _) = acq(&out).unwrap();
     out.clear();
     let miss = AcqInput::Replied {
@@ -528,10 +529,55 @@ fn a_signed_shed_reports_the_owner_busy_and_a_helper_reports_nothing() {
         answer: None,
     };
     c.on_acquisition(read, miss, now, &mut out).unwrap();
-    assert!(
-        out.iter().all(|e| !matches!(e, Effect::Silence { .. })),
+    let silence: Vec<_> = out
+        .iter()
+        .filter_map(|e| match e {
+            Effect::Silence { dest, note, .. } => Some((*dest, *note)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(silence, vec![(20, SilenceNote::Answered)], "{out:?}");
+}
+
+#[test]
+fn a_helper_probe_timeout_counts_against_the_helper() {
+    let now = Instant::now();
+    let mut c = core(now);
+    let mut out = Vec::new();
+    shed(&mut c, now, &mut out);
+    let (read, id, _) = acq(&out).unwrap();
+    out.clear();
+    c.on_acquisition(
+        read,
+        AcqInput::Replied {
+            id,
+            reply: Reply::TimedOut,
+            answer: None,
+        },
+        now,
+        &mut out,
+    )
+    .unwrap();
+    let silence: Vec<_> = out
+        .iter()
+        .filter_map(|e| match e {
+            Effect::Silence { dest, note, .. } => Some((*dest, *note)),
+            _ => None,
+        })
+        .collect();
+    // Not rank 0: the timeout demotes the helper and never asks a ping by itself.
+    assert_eq!(
+        silence,
+        vec![(
+            20,
+            SilenceNote::TimedOut {
+                needed: crate::liveness::NO_PING
+            }
+        )],
         "{out:?}"
     );
+    // The next probe goes to an owner; its evidence is not about the helper.
+    assert!(acq(&out).is_some(), "{out:?}");
 }
 
 #[test]
