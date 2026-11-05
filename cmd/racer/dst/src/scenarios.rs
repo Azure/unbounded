@@ -87,8 +87,14 @@ fn storm(at: Nanos, object: u64, nodes: u32, window: Nanos) -> Storm {
 /// `Unavailable`, at most 1 in 100; each page reaches origin at most once per owner; pages are
 /// published. racer-sim's per-node memory bound has no Model counterpart (see MODEL.md).
 pub fn cold_start(nodes: u32) -> Scenario {
+    cold_start_with(nodes, ModelSpec::default().attempt_timeout)
+}
+
+/// [`cold_start`] with per-attempt cap `attempt_timeout` ([`ModelSpec::attempt_timeout`]).
+pub fn cold_start_with(nodes: u32, attempt_timeout: Nanos) -> Scenario {
     let spec = ModelSpec {
         storms: vec![storm(0, 0, nodes, 10 * MILLIS)],
+        attempt_timeout,
         ..ModelSpec::default()
     };
     let total = u64::from(nodes) * u64::from(spec.pages_per_object);

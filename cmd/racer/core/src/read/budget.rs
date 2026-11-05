@@ -111,6 +111,10 @@ impl AcquisitionBudget {
     pub fn route_links(&self) -> u8 {
         self.links.min(if self.failed_route { 8 } else { 4 })
     }
+    /// Whether a route failure was noted ([`Self::note_route_failure`]).
+    pub fn route_failed(&self) -> bool {
+        self.failed_route
+    }
     pub fn note_route_failure(&mut self) {
         self.failed_route = true;
     }

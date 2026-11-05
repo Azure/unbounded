@@ -145,11 +145,31 @@ pub struct AcquisitionBudgetSpec {
     pub deadline: Instant,
     pub attempts: u32,
     pub links: u8,
+    /// A route failure was observed (an inherited budget past the normal route links), so each
+    /// attempt may reserve the failure route ceiling.
+    pub route_failed: bool,
 }
 
 impl AcquisitionBudgetSpec {
     pub fn build(self) -> AcquisitionBudget {
-        AcquisitionBudget::new(self.deadline, self.attempts, self.links)
+        let mut budget = AcquisitionBudget::new(self.deadline, self.attempts, self.links);
+        if self.route_failed {
+            budget.note_route_failure();
+        }
+        budget
+    }
+}
+
+impl From<&AcquisitionBudget> for AcquisitionBudgetSpec {
+    /// The spec of an unspent budget, such as a serving read's
+    /// [`super::budget::inherited_budget`].
+    fn from(budget: &AcquisitionBudget) -> Self {
+        Self {
+            deadline: budget.deadline(),
+            attempts: budget.remaining_attempts(),
+            links: budget.remaining_links(),
+            route_failed: budget.route_failed(),
+        }
     }
 }
 
@@ -468,11 +488,7 @@ impl ReadWindow {
 
     fn page_budget(&self, now: Instant) -> Result<AcquisitionBudgetSpec, Error> {
         let budget = self.config.budget.next_page(now)?;
-        Ok(AcquisitionBudgetSpec {
-            deadline: budget.deadline(),
-            attempts: budget.remaining_attempts(),
-            links: budget.remaining_links(),
-        })
+        Ok(AcquisitionBudgetSpec::from(&budget))
     }
 
     fn admit_spill(&mut self, now: Instant, ids: &mut EffectIds, out: &mut Vec<Effect>) {

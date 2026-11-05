@@ -14,7 +14,14 @@ fn run(scenario: Scenario, seed: u64) -> serde_json::Value {
 
 #[test]
 fn origin_forbidden_fails_only_the_leader() {
-    run(scenarios::origin_forbidden(), 11);
+    let report = run(scenarios::origin_forbidden(), 11);
+    let counters = &report["metrics"]["counters"];
+    // Each 403 fails its leader and re-elects a waiter (racer-sim `flight_reelected`).
+    assert!(
+        counters["flights_reelected"].as_u64().unwrap() > 0,
+        "{counters}"
+    );
+    assert_eq!(counters["flights_reelected"], counters["origin_403"]);
 }
 
 #[test]
@@ -62,7 +69,12 @@ fn faults_end_every_read() {
 #[ignore = "large: run alone with --release --ignored"]
 fn model_memory_per_node() {
     let nodes: u32 = std::env::var("MODEL_NODES").map_or(10_000, |n| n.parse().unwrap());
-    let (outcome, report) = model::run(&scenarios::cold_start(nodes), Choices::seeded(8));
+    // `MODEL_ATTEMPT_MS`: per-attempt cap (production 2000); unset is no cap.
+    let attempt = std::env::var("MODEL_ATTEMPT_MS").map_or(model::NO_ATTEMPT_CAP, |ms| {
+        ms.parse::<u64>().unwrap() * 1_000_000
+    });
+    let scenario = scenarios::cold_start_with(nodes, attempt);
+    let (outcome, report) = model::run(&scenario, Choices::seeded(8));
     let status = std::fs::read_to_string("/proc/self/status").unwrap();
     let hwm_kib: u64 = status
         .lines()
@@ -118,4 +130,20 @@ fn parity_summary() {
             ms("max"),
         );
     }
+}
+
+/// Diagnostic report of one scenario (`MODEL_SCENARIO`, `MODEL_SEED`).
+#[test]
+#[ignore = "diagnostic: run with --ignored --nocapture"]
+fn scenario_report() {
+    let name = std::env::var("MODEL_SCENARIO").unwrap_or_else(|_| "model-cold-start-400".into());
+    let seed = std::env::var("MODEL_SEED").map_or(1, |s| s.parse().unwrap());
+    let scenario = scenarios::find(&name).expect("known scenario");
+    let (outcome, r) = model::run(&scenario, Choices::seeded(seed));
+    println!(
+        "failure {:?} counters {} attempt_errors {}",
+        outcome.failure.as_ref().map(|f| &f.name),
+        r["metrics"]["counters"],
+        r["metrics"]["attempt_errors"]
+    );
 }

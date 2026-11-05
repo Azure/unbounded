@@ -261,6 +261,9 @@ pub struct Observed {
     /// Overflow helper probes sent, and shed requesters with no helper to ask.
     pub helpers: u64,
     pub no_helper: u64,
+    /// Waiters elected to lead a flight after an earlier leader of it ended without
+    /// settling it (production `Flights::fail`; racer-sim `flight_reelected`).
+    pub reelected: u64,
 }
 
 /// A serve-side decision with successor deferral.
@@ -314,6 +317,8 @@ struct Flight {
     /// over instead of revoking it.
     read: Option<(ReadId, Operation)>,
     requests: BTreeSet<RequestId>,
+    /// A leader was elected before.
+    led: bool,
 }
 
 struct MetaRequest<Obj> {
@@ -435,6 +440,13 @@ impl<T: Types> WorkerCore<T> {
         read: ReadId,
     ) -> Option<&PageAcquisition<T::Rank, T::Membership, T::Answer>> {
         self.reads.get(&read).map(|r| &r.machine)
+    }
+
+    /// The budget the outstanding `Send` of acquisition `read` spends
+    /// ([`PageAcquisition::request_budget`]): plan the attempt on it before sending.
+    pub fn request_budget(&mut self, read: ReadId) -> Option<&mut AcquisitionBudget> {
+        let r = self.reads.get_mut(&read)?;
+        Some(r.machine.request_budget(&mut r.budget))
     }
 
     pub fn window(&self, window: WindowId) -> Option<&ReadWindow> {
@@ -584,6 +596,8 @@ impl<T: Types> WorkerCore<T> {
         let flight = self.flight.entry(page.clone()).or_default();
         // A new generation is elected only after the previous operation completed.
         debug_assert!(flight.read.is_none());
+        self.observed.reelected += u64::from(flight.led);
+        flight.led = true;
         flight.read = Some((read, operation));
         self.reads.insert(
             read,

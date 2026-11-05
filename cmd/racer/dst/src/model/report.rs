@@ -59,6 +59,15 @@ pub struct Counters {
     pub outage_lost_pages: u64,
     /// Client read attempts retried after a recoverable failure.
     pub read_retries: u64,
+    /// Flight waiters elected to lead after an earlier leader failed (racer-sim
+    /// `flight_reelected`).
+    pub flights_reelected: u64,
+    /// Probes unanswered at their attempt bound (`AttemptPlan::attempt_end`).
+    pub probe_timeouts: u64,
+    /// Page bodies dropped because their requester abandoned the exchange first.
+    pub replies_abandoned: u64,
+    /// Probe answers that arrived after their attempt timed out.
+    pub late_answers: u64,
     /// Most pages any node stores at the end of the run.
     pub stored_pages_max: u64,
 }
@@ -150,6 +159,10 @@ impl Report {
                     "spill_holds": c.spill_holds,
                     "metadata_requests": c.metadata_requests,
                     "stored_pages_max": c.stored_pages_max,
+                    "probe_timeouts": c.probe_timeouts,
+                    "flights_reelected": c.flights_reelected,
+                    "late_answers": c.late_answers,
+                    "replies_abandoned": c.replies_abandoned,
                 },
                 "histograms": {
                     "read_latency_ns": {

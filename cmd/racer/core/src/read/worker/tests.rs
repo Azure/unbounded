@@ -66,6 +66,7 @@ fn spec(now: Instant) -> AcquisitionBudgetSpec {
         deadline: now + Duration::from_secs(30),
         attempts: 8,
         links: 16,
+        route_failed: false,
     }
 }
 
@@ -919,4 +920,20 @@ fn randomized_worker_cores_keep_their_invariants() {
         ended += e;
     }
     assert!(served > 40 && ended > 40, "served {served} ended {ended}");
+}
+
+#[test]
+fn request_budget_is_the_outstanding_sends_budget() {
+    let now = Instant::now();
+    let mut c = core(now);
+    let mut out = Vec::new();
+    shed(&mut c, now, &mut out);
+    let (read, _, _) = acq(&out).unwrap();
+    let budget = c.request_budget(read).expect("a running read has a budget");
+    assert!(budget.remaining_attempts() > 0);
+    assert!(
+        budget.route_failed(),
+        "a helper probe forwards every funded link"
+    );
+    assert!(c.request_budget(ReadId(999)).is_none());
 }

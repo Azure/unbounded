@@ -24,19 +24,20 @@ use racer_core::{
     read::{
         Error, OperationKind, PageBudget, RefreshPurpose, ResponseKind, ServeFacts,
         acquisition::{self, RankAnswer},
-        budget::helper_start,
+        budget::{helper_start, inherited_budget},
         effect::EffectId,
         flight::FlightLimits,
         hints::{HINT_CAPACITY, HINT_TTL, SuccessorHints},
         peer_error, recoverable,
         serve::{Body, Decision, ServeDecision, ServeRequest},
-        walk::{Features, FillConfig, HedgeEnd, Ranked, Reply},
+        walk::{AttemptInputs, Features, FillConfig, HedgeEnd, Ranked, Reply, plan_attempt},
         window::{self, AcquisitionBudgetSpec, Facts, Next, WindowConfig},
         worker::{
             Effect, Mesh, ReadId, RequestId, Routing, ServeView, Served, Types, WindowId,
             WorkerCore, WorkerMsg,
         },
     },
+    route::MAX_LINKS,
 };
 use serde_json::Value;
 use topology::{Member, Placement, REPLICAS};
@@ -161,6 +162,11 @@ pub struct ModelSpec {
     pub storms: Vec<Storm>,
     /// Client read deadline.
     pub read_timeout: Nanos,
+    /// Per-attempt exchange cap of a peer probe (`AttemptInputs::attempt_timeout`); a probe
+    /// unanswered by then times out (`Reply::TimedOut`). Production and racer-sim use
+    /// [`ATTEMPT_TIMEOUT`]; the default [`NO_ATTEMPT_CAP`] bounds an attempt by its signed
+    /// overall deadline only, until the Model matches racer-sim under the 2 s cap (see MODEL.md).
+    pub attempt_timeout: Nanos,
     /// Pages each node keeps; the least recently used page is evicted past it. 0 is unbounded.
     pub stored_pages: usize,
     /// Injected origin error rates.
@@ -196,6 +202,7 @@ impl Default for ModelSpec {
             page_bytes: 1 << 20,
             storms: Vec::new(),
             read_timeout: 10_000 * MILLIS,
+            attempt_timeout: NO_ATTEMPT_CAP,
             stored_pages: 0,
             origin_errors: OriginErrors::default(),
             metadata: false,
@@ -244,7 +251,21 @@ enum Ev {
         to: u32,
         page: Page,
         copy_only: bool,
+        /// The attempt's signed overall deadline (`AttemptPlan::overall`).
         deadline: Nanos,
+        /// Remote acquisition credits and route links the probe carries.
+        attempts: u32,
+        links: u8,
+        /// When the requester abandons the exchange.
+        abandon: Nanos,
+    },
+    /// Probe `id` of `(node, worker, read)` reached its attempt bound
+    /// (`AttemptPlan::attempt_end`) unanswered.
+    ProbeTimeout {
+        node: u32,
+        worker: u32,
+        read: ReadId,
+        id: EffectId,
     },
     /// Body `body` (a key of `Model::bodies`) landed.
     BodyEnd { body: u64 },
@@ -295,12 +316,28 @@ struct RangeState {
     leased: bool,
 }
 
+/// A sent probe: destination, page, copy-only, and send time.
+type Sent = (u32, Page, bool, Nanos);
+
+/// What a probe carries to its destination.
+#[derive(Clone, Copy)]
+struct Route {
+    copy_only: bool,
+    deadline: Nanos,
+    attempts: u32,
+    links: u8,
+}
+
 /// Who waits for a serving read's completion.
 struct Asker {
     from: u32,
     worker: u32,
     read: ReadId,
     id: EffectId,
+    /// When the probe arrived.
+    at: Nanos,
+    /// When the requester abandons the exchange (its `AttemptPlan::attempt_end`).
+    abandon: Nanos,
 }
 
 struct Node {
@@ -385,6 +422,8 @@ struct Model<'s> {
     ranges: BTreeMap<(u32, u32, WindowId), RangeState>,
     /// Serving reads by `(node, worker, request)`.
     serving: BTreeMap<(u32, u32, RequestId), Asker>,
+    /// Sent probes not yet answered or timed out, by `(node, worker, effect)`.
+    probes: BTreeMap<(u32, u32, EffectId), Sent>,
     /// Answered effect ids by `(node, worker)`.
     answered: BTreeSet<(u32, u32, EffectId)>,
     /// Bodies being written, by key.
@@ -394,11 +433,21 @@ struct Model<'s> {
     ticking: bool,
     report: Report,
     expected_reads: u64,
+    /// Queued [`Ev::ProbeTimeout`] events.
+    timeouts_queued: u64,
+    /// `MODEL_DIAG` set: record probe, serve and send breakdowns in `attempt_errors`.
+    diag: bool,
 }
 
 const TAG_EVENT: u64 = 1;
 const TAG_READ_END: u64 = 2;
 const TICK: Nanos = 50 * MILLIS;
+/// Per-attempt exchange cap (racer-sim `NodeConfig::attempt_timeout_ns`).
+pub const ATTEMPT_TIMEOUT: Nanos = 2 * SECONDS;
+/// No per-attempt cap: an attempt ends at its overall deadline.
+pub const NO_ATTEMPT_CAP: Nanos = Nanos::MAX;
+/// A serving read's own scope (racer-sim `NodeConfig::serve_timeout_ns`).
+const SERVE_TIMEOUT: Nanos = 5 * SECONDS;
 /// Client attempts per read, as in racer-sim.
 const MAX_ATTEMPTS: u8 = 4;
 
@@ -450,12 +499,15 @@ impl<'s> Model<'s> {
             refreshing: BTreeMap::new(),
             ranges: BTreeMap::new(),
             serving: BTreeMap::new(),
+            probes: BTreeMap::new(),
             answered: BTreeSet::new(),
             bodies: BTreeMap::new(),
             next_body: 0,
             ticking: false,
             report: Report::default(),
             expected_reads: 0,
+            timeouts_queued: 0,
+            diag: std::env::var_os("MODEL_DIAG").is_some(),
         }
     }
 
@@ -617,6 +669,27 @@ impl<'s> Model<'s> {
                 input,
             } => {
                 self.trace.record(now, TAG_EVENT, 2, u64::from(node));
+                if let Input::Replied { id, reply, .. } = &input {
+                    let Some((to, page, _, sent)) = self.probes.remove(&(node, worker, *id)) else {
+                        // The attempt timed out first; its late answer is dropped.
+                        self.report.counters.late_answers += 1;
+                        return;
+                    };
+                    if self.diag {
+                        let owners = owners(&self.placement, &self.members, page);
+                        let role = |n: u32| match owners.iter().position(|o| *o == n) {
+                            Some(r) => format!("owner{r}"),
+                            None => "x".into(),
+                        };
+                        let kind = match reply {
+                            Reply::Answer { kind, .. } => format!("{kind:?}"),
+                            other => format!("{other:?}"),
+                        };
+                        let ms = (now - sent) / (250 * MILLIS) * 250;
+                        let key = format!("reply:{}->{}:{kind}:{ms}ms", role(node), role(to));
+                        *self.report.attempt_errors.entry(key).or_default() += 1;
+                    }
+                }
                 let mut out = Vec::new();
                 let at = self.instant(now);
                 // A stopped acquisition refuses its late answers.
@@ -634,6 +707,9 @@ impl<'s> Model<'s> {
                 page,
                 copy_only,
                 deadline,
+                attempts,
+                links,
+                abandon,
             } => {
                 self.trace.record(now, TAG_EVENT, 3, u64::from(to));
                 self.serve(
@@ -642,12 +718,75 @@ impl<'s> Model<'s> {
                         worker,
                         read,
                         id,
+                        at: now,
+                        abandon,
                     },
                     to,
                     page,
-                    copy_only,
-                    deadline,
+                    Route {
+                        copy_only,
+                        deadline,
+                        attempts,
+                        links,
+                    },
                 );
+            }
+            Ev::ProbeTimeout {
+                node,
+                worker,
+                read,
+                id,
+            } => {
+                self.timeouts_queued -= 1;
+                if let Some((to, page, copy_only, _)) = self.probes.remove(&(node, worker, id)) {
+                    if self.diag {
+                        let owners = owners(&self.placement, &self.members, page);
+                        let role = match owners.iter().position(|o| *o == to) {
+                            Some(r) => format!("owner{r}"),
+                            None => "helper".into(),
+                        };
+                        let me = match owners.iter().position(|o| *o == node) {
+                            Some(r) => format!("owner{r}"),
+                            None => "reader".into(),
+                        };
+                        // Does `to` wait on a probe of the same page, and to whom?
+                        let waits = self
+                            .probes
+                            .iter()
+                            .filter(|((n, _, _), (_, p, _, _))| *n == to && *p == page)
+                            .map(|(_, (t, _, _, _))| {
+                                if *t == node {
+                                    "back"
+                                } else if owners.contains(t) {
+                                    "owner"
+                                } else {
+                                    "other"
+                                }
+                            })
+                            .next()
+                            .unwrap_or("none");
+                        *self
+                            .report
+                            .attempt_errors
+                            .entry(format!(
+                                "timeout:{me}->{role}:copy{copy_only}:waits-{waits}"
+                            ))
+                            .or_default() += 1;
+                    }
+                    self.trace.record(now, TAG_EVENT, 10, u64::from(node));
+                    self.report.counters.probe_timeouts += 1;
+                    let mut out = Vec::new();
+                    let at = self.instant(now);
+                    let timed_out = Input::Replied {
+                        id,
+                        reply: Reply::TimedOut,
+                        answer: None,
+                    };
+                    let _ = self.nodes[node as usize].cores[worker as usize]
+                        .on_acquisition(read, timed_out, at, &mut out);
+                    self.dispatch(node, worker, out);
+                    self.pump_all(node, worker);
+                }
             }
             Ev::BodyEnd { body } => {
                 self.trace.record(now, TAG_EVENT, 4, body);
@@ -709,6 +848,7 @@ impl<'s> Model<'s> {
             deadline: self.instant(now + self.spec.read_timeout),
             attempts: 8,
             links: 16,
+            route_failed: false,
         };
         let at = self.instant(now);
         let core = &mut self.nodes[node as usize].cores[worker as usize];
@@ -917,7 +1057,8 @@ impl<'s> Model<'s> {
     }
 
     /// Answer `asker`'s probe at node `to`.
-    fn serve(&mut self, asker: Asker, to: u32, page: Page, copy_only: bool, deadline: Nanos) {
+    fn serve(&mut self, asker: Asker, to: u32, page: Page, route: Route) {
+        let copy_only = route.copy_only;
         let now = self.now();
         let worker = owner_worker(page, self.spec.workers.max(1));
         let owners = owners(&self.placement, &self.members, page);
@@ -942,7 +1083,13 @@ impl<'s> Model<'s> {
             owners: &owners,
             local: to,
             requester: asker.from,
-            column_mate: false,
+            // Production `Membership::same_column` in the default pool (racer-sim
+            // `column_mates`): an owner never sheds its own column mates below the exempt cap.
+            column_mate: self
+                .members
+                .pools()
+                .first()
+                .is_some_and(|pool| pool.same_column(to as usize, asker.from as usize)),
         };
         let served = core.serve(&page, request, &view, at);
         self.cover(served_name(&served));
@@ -965,10 +1112,25 @@ impl<'s> Model<'s> {
             }
             Decision::CopyOnly { .. } => self.reply(&asker, to, ResponseKind::Miss),
             Decision::Acquire => {
-                let budget = AcquisitionBudgetSpec {
-                    deadline: self.instant(deadline.max(now + 1)),
-                    attempts: 4,
-                    links: 8,
+                // Production `inherited_budget` (`src/read.rs`; racer-sim `serve`): the serving
+                // read spends the probe's credits within its own serve scope and the route's
+                // signed deadline. The probe travelled one hop.
+                let scope = self.instant(now + SERVE_TIMEOUT);
+                let inherited = inherited_budget(
+                    scope,
+                    self.instant(route.deadline),
+                    route.attempts,
+                    route.links,
+                    1,
+                );
+                let budget = match inherited {
+                    Ok(budget) => AcquisitionBudgetSpec::from(&budget),
+                    Err(error) => {
+                        return match peer_error(error) {
+                            Some(kind) => self.reply(&asker, to, kind),
+                            None => self.fail_probe(&asker, to),
+                        };
+                    }
                 };
                 let mut out = Vec::new();
                 let core = &mut self.nodes[to as usize].cores[worker as usize];
@@ -992,9 +1154,30 @@ impl<'s> Model<'s> {
         self.next_body += 1;
         let key = self.next_body;
         self.bodies.insert(key, (to, worker, body));
-        let end = self
-            .fabric
-            .transfer(now, &[to, asker.from], self.spec.page_bytes);
+        // Production drops an exchange its requester abandoned: no chunk starts at or after the
+        // requester's attempt bound (racer-sim `transfer_until`, `replies_abandoned`).
+        let Some(end) =
+            self.fabric
+                .transfer_until(now, &[to, asker.from], self.spec.page_bytes, asker.abandon)
+        else {
+            self.report.counters.replies_abandoned += 1;
+            self.engine
+                .at(asker.abandon.max(now), Ev::BodyEnd { body: key });
+            return;
+        };
+        if self.diag {
+            let owner = owners(&self.placement, &self.members, page).contains(&to);
+            let secs = (end - now) / (MILLIS * 250);
+            *self
+                .report
+                .attempt_errors
+                .entry(format!(
+                    "send:{}:{}q",
+                    if owner { "owner" } else { "helper" },
+                    secs
+                ))
+                .or_default() += 1;
+        }
         self.report.counters.peer_bytes += self.spec.page_bytes;
         self.report.counters.peer_pages += 1;
         if !owners(&self.placement, &self.members, page).contains(&to) {
@@ -1135,6 +1318,8 @@ impl<'s> Model<'s> {
                 } => {
                     self.report.counters.peer_probes += 1;
                     let Some(to) = dest.filter(|d| (*d as usize) < self.nodes.len()) else {
+                        self.probes
+                            .insert((node, worker, id), (node, page, false, now));
                         let failed = Input::Replied {
                             id,
                             reply: Reply::Failed {
@@ -1147,8 +1332,58 @@ impl<'s> Model<'s> {
                         self.engine.at(now, input(read, failed));
                         return;
                     };
-                    // The serving read inherits half the client deadline (see MODEL.md).
-                    let deadline = now + self.spec.read_timeout / 2;
+                    // Production `request_traced` (racer-sim `probe`): reserve the route and
+                    // the remote credits on the read's request budget, then bound the exchange.
+                    let at_now = self.instant(now);
+                    let Some(budget) =
+                        self.nodes[node as usize].cores[worker as usize].request_budget(read)
+                    else {
+                        return self.violation(format!("node {node} sent for unknown {read:?}"));
+                    };
+                    let caller_deadline = budget.deadline();
+                    let plan = plan_attempt(
+                        budget,
+                        AttemptInputs {
+                            now: at_now,
+                            caller_deadline,
+                            remaining_opportunities: probe.remaining_opportunities,
+                            route: probe.route,
+                            mode: probe.mode,
+                            attempt_timeout: Duration::from_nanos(self.spec.attempt_timeout),
+                            failure_links: MAX_LINKS,
+                        },
+                    );
+                    let copy_only = probe.mode == racer_core::read::walk::Mode::CopyOnly;
+                    self.probes
+                        .insert((node, worker, id), (to, page, copy_only, now));
+                    let plan = match plan {
+                        Ok(plan) => plan,
+                        Err(error) => {
+                            let failed = Input::Replied {
+                                id,
+                                reply: Reply::Failed {
+                                    error,
+                                    sent: false,
+                                    scope_live: false,
+                                },
+                                answer: None,
+                            };
+                            self.engine.at(now, input(read, failed));
+                            return;
+                        }
+                    };
+                    let deadline = self.nanos(plan.overall);
+                    let timeout = self.nanos(plan.attempt_end).max(now + 1);
+                    self.timeouts_queued += 1;
+                    self.engine.at(
+                        timeout,
+                        Ev::ProbeTimeout {
+                            node,
+                            worker,
+                            read,
+                            id,
+                        },
+                    );
                     let at = self.fabric.message(now, node, to) + costs.cpu_request_ns;
                     self.engine.at(
                         at,
@@ -1161,6 +1396,9 @@ impl<'s> Model<'s> {
                             page,
                             copy_only: probe.mode == racer_core::read::walk::Mode::CopyOnly,
                             deadline,
+                            attempts: plan.remote_attempts,
+                            links: plan.links,
+                            abandon: timeout,
                         },
                     );
                 }
@@ -1289,6 +1527,23 @@ impl<'s> Model<'s> {
     ) {
         let now = self.now();
         if let Some(asker) = self.serving.remove(&(node, worker, request)) {
+            if self.diag {
+                let owners = owners(&self.placement, &self.members, page);
+                let me = match owners.iter().position(|o| *o == node) {
+                    Some(r) => format!("owner{r}"),
+                    None => "helper".into(),
+                };
+                let ms = (now - asker.at) / (250 * MILLIS) * 250;
+                let r = match result {
+                    Ok(()) => "ok".to_string(),
+                    Err(e) => format!("{e:?}"),
+                };
+                *self
+                    .report
+                    .attempt_errors
+                    .entry(format!("served:{me}:{r}:{ms}ms"))
+                    .or_default() += 1;
+            }
             if result.is_ok() && self.nodes[node as usize].stored.contains(&page) {
                 self.send_page(asker, node, page);
             } else {
@@ -1381,6 +1636,7 @@ impl<'s> Model<'s> {
                 let observed = core.observed();
                 self.report.counters.helpers += observed.helpers;
                 self.report.counters.no_helper += observed.no_helper;
+                self.report.counters.flights_reelected += observed.reelected;
             }
         }
         if !self.ranges.is_empty() || !self.refreshing.is_empty() {
@@ -1530,7 +1786,9 @@ pub fn run(scenario: &Scenario, choices: Choices) -> (Outcome, Value) {
     let mut model = Model::new(scenario, spec, choices.clone());
     model.schedule_storms();
     model.run(scenario.end, scenario.max_steps);
-    let quiescent = model.engine.pending() == 0;
+    // A probe answered before its bound leaves its timeout queued; it would be a no-op.
+    let quiescent =
+        model.engine.pending() as u64 == model.timeouts_queued && model.probes.is_empty();
     model.finish();
     let report = model
         .report
