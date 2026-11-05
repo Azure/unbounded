@@ -11,6 +11,7 @@ import (
 
 	apiextensionsv1 "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/util/validation"
 	"k8s.io/apimachinery/pkg/util/yaml"
 )
 
@@ -298,6 +299,24 @@ func TestCertificationPolicyContract(t *testing.T) {
 	gateMode := spec.Properties["gateProjection"].Properties["mode"]
 	if !containsJSONEnum(gateMode.Enum, `"ProtectedLabel"`) {
 		t.Fatalf("gate projection enum = %s, want ProtectedLabel", gateMode.Enum)
+	}
+}
+
+func TestNodeQualificationLabelContract(t *testing.T) {
+	t.Parallel()
+
+	const want = "node-restriction.kubernetes.io/project-signal-qualified"
+
+	if NodeQualificationLabel != want {
+		t.Fatalf("NodeQualificationLabel = %q, want %q", NodeQualificationLabel, want)
+	}
+
+	if errors := validation.IsQualifiedName(NodeQualificationLabel); len(errors) > 0 {
+		t.Fatalf("NodeQualificationLabel is not a valid Kubernetes label key: %v", errors)
+	}
+
+	if NodeQualificationValue != "true" {
+		t.Fatalf("NodeQualificationValue = %q, want true", NodeQualificationValue)
 	}
 }
 
