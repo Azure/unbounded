@@ -14,6 +14,7 @@ import (
 
 	"github.com/Azure/unbounded/pkg/agent/goalstates"
 	"github.com/Azure/unbounded/pkg/agent/isolation"
+	"github.com/Azure/unbounded/pkg/agent/isolation/container"
 	"github.com/Azure/unbounded/pkg/agent/isolation/none"
 	"github.com/Azure/unbounded/pkg/agent/preflight"
 )
@@ -103,7 +104,28 @@ func existingDeploymentResultsFor(ctx context.Context, log *slog.Logger, deps ho
 		results = appendExistingDeploymentArtifactResult(results, deps, artifact)
 	}
 
+	if mode == isolation.ModeContainer {
+		for _, artifact := range existingDeploymentContainerArtifacts() {
+			results = appendExistingDeploymentArtifactResult(results, deps, artifact)
+		}
+	}
+
 	return results
+}
+
+func existingDeploymentContainerArtifacts() []existingDeploymentArtifact {
+	artifacts := []existingDeploymentArtifact{
+		{description: "container node directory", path: container.DefaultBase},
+	}
+
+	for _, slot := range []string{goalstates.NSpawnMachineKube1, goalstates.NSpawnMachineKube2} {
+		artifacts = append(artifacts, existingDeploymentArtifact{
+			description: "container node unit",
+			path:        filepath.Join(goalstates.SystemdSystemDir, container.UnitName(slot)),
+		})
+	}
+
+	return artifacts
 }
 
 func existingDeploymentNoneArtifacts() []existingDeploymentArtifact {

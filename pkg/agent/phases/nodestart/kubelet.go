@@ -86,6 +86,13 @@ func (c *configureKubelet) ensureRuntimeFolders() error {
 	return nil
 }
 
+// ConfigureKubeletTracked returns the task ConfigureKubelet runs with change
+// tracking, for a node stack in its own root that restarts the kubelet only
+// when this changed.
+func ConfigureKubeletTracked(goalState *goalstates.NodeStart) HostConfigTask {
+	return &configureKubelet{goalState: goalState}
+}
+
 // ConfigureKubeletOnHost returns a task that writes the kubelet configuration,
 // CA, kubeconfig and the environment drop-ins for the host-native unit named
 // unit. The unit file itself belongs to the backend.

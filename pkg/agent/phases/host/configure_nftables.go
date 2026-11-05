@@ -18,6 +18,7 @@ import (
 	"github.com/Azure/unbounded/pkg/agent/goalstates"
 	"github.com/Azure/unbounded/pkg/agent/internal/utilio"
 	"github.com/Azure/unbounded/pkg/agent/isolation"
+	"github.com/Azure/unbounded/pkg/agent/isolation/container"
 	"github.com/Azure/unbounded/pkg/agent/isolation/none"
 	"github.com/Azure/unbounded/pkg/agent/phases"
 	"github.com/Azure/unbounded/pkg/agent/phases/reset"
@@ -75,6 +76,10 @@ func ConfigureNFTablesFor(log *slog.Logger, mode isolation.Mode) phases.Task {
 	switch mode {
 	case isolation.ModeNone:
 		units := []string{none.UnitContainerd, none.UnitKubelet}
+
+		return &configureNFTables{log: log, nodeUnits: units, machineRegistered: anyUnitActive(units)}
+	case isolation.ModeContainer:
+		units := []string{container.UnitName(goalstates.NSpawnMachineKube1), container.UnitName(goalstates.NSpawnMachineKube2)}
 
 		return &configureNFTables{log: log, nodeUnits: units, machineRegistered: anyUnitActive(units)}
 	default:

@@ -25,6 +25,13 @@ func TestRootOverridesReplaceNSpawnRoot(t *testing.T) {
 	require.Equal(t, "/tmp/host/etc/x", hostNode.Root().Path("/etc/x"))
 	require.True(t, hostNode.HostNative())
 
+	// A container node stack replaces the machine root too, but keeps a
+	// private root, so it is not host native.
+	containerNode := &NodeStart{MachineName: "kube1", RootOverride: override, InContainer: true}
+	require.Equal(t, "/tmp/host/etc/x", containerNode.Root().Path("/etc/x"))
+	require.False(t, containerNode.HostNative())
+	require.False(t, containerNode.NSpawnMachine())
+
 	rootFS := &RootFS{MachineDir: "/var/lib/machines/kube1", RootOverride: override}
 	require.Equal(t, "/tmp/host/etc/x", rootFS.Root().Path("/etc/x"))
 	require.Equal(t, "/var/lib/machines/kube1/etc/x", (&RootFS{MachineDir: "/var/lib/machines/kube1"}).Root().Path("/etc/x"))
