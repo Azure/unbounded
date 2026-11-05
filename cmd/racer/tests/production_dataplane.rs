@@ -1358,6 +1358,8 @@ fn writeback_staging_preserves_live_readers_and_recovers_after_release() {
         .reserve(
             None,
             ResourceClass::Ciphertext,
+            // Room for three pooled pages but not the third page's staging:
+            // aligned pages persist with only a header block of staging.
             rig.admission.limit(ResourceClass::Ciphertext) - 64 * 1024 * 1024,
         )
         .unwrap();
@@ -1378,8 +1380,8 @@ fn writeback_staging_preserves_live_readers_and_recovers_after_release() {
     rig.flush();
     assert_eq!(
         rig.writer.index().snapshot().unwrap().entries.len(),
-        2,
-        "live leases cannot be reclaimed to force persistence"
+        3,
+        "aligned pages stage only a header block, so persistence fits beside live leases"
     );
     for (index, copy) in held.iter().enumerate() {
         let id = &copy.ciphertext.envelope().page;
