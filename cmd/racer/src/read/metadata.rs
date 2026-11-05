@@ -266,13 +266,13 @@ impl Drop for RegistrationOwner {
 
 #[derive(Default)]
 struct IngressDeadlines {
-    inner: Rc<crate::rt::environment::Registry>,
+    inner: Rc<racer_io::deadline::Registry>,
 }
 /// One entry per admitted resolve, shared across its follower and leader waits.
 /// The refresh registration quota bounds these entries. Drivers never own this
 /// guard: ingress expiry must not release their acquisition or completion fences.
 struct IngressDeadline {
-    inner: crate::rt::environment::Registration,
+    inner: racer_io::deadline::Registration,
 }
 impl IngressDeadlines {
     fn register(self: &Rc<Self>, deadline: Instant) -> Result<IngressDeadline> {
@@ -300,7 +300,7 @@ impl IngressDeadline {
 
 #[derive(Default)]
 struct Clock {
-    inner: crate::rt::environment::Observer,
+    inner: racer_io::deadline::Observer,
 }
 impl Clock {
     fn observe(&mut self, wall: SystemTime, monotonic: Instant) -> bool {
@@ -1226,7 +1226,7 @@ pub(crate) mod tests {
         assert_eq!(refreshes.active_count(), 0);
         assert_eq!(refreshes.registration_count(), 0);
         let table = Rc::new(IngressDeadlines {
-            inner: Rc::new(crate::rt::environment::Registry::with_next_id(u64::MAX)),
+            inner: Rc::new(racer_io::deadline::Registry::with_next_id(u64::MAX)),
         });
         assert!(matches!(table.register(due), Err(Error::Overloaded)));
         assert!(table.inner.is_empty());

@@ -2152,8 +2152,7 @@ mod tests {
             let mut scope = scope();
             // Leave startup enough room under concurrent builds: this scenario checks
             // deadline-driven teardown after all eight jobs, not startup latency.
-            scope.deadline =
-                crate::rt::environment::Deadline(Instant::now() + Duration::from_secs(1));
+            scope.deadline = racer_io::deadline::Deadline(Instant::now() + Duration::from_secs(1));
             assert_eq!(
                 group.run_recipe_with_scope(&factory, &scope),
                 Err(Error::DeadlineExceeded)
@@ -2184,7 +2183,7 @@ mod tests {
                     let mut group = WorkerGroup::new(plan, crate::test_support::ctx());
                     let mut scope = scope();
                     if failure == Failure::PendingStart {
-                        scope.deadline = crate::rt::environment::Deadline(
+                        scope.deadline = racer_io::deadline::Deadline(
                             Instant::now() + Duration::from_millis(30),
                         );
                     }
@@ -2287,7 +2286,7 @@ mod tests {
             let mut group = WorkerGroup::new(plan, crate::test_support::ctx());
             let mut scope = scope();
             scope.deadline =
-                crate::rt::environment::Deadline(Instant::now() + Duration::from_millis(100));
+                racer_io::deadline::Deadline(Instant::now() + Duration::from_millis(100));
             assert_eq!(
                 group.start_recipe(Arc::new(factory), &scope),
                 Err(Error::DeadlineExceeded)
@@ -2702,7 +2701,7 @@ mod tests {
             );
             let mut scope = lifecycle_scope(&crate::test_support::clock()).unwrap();
             scope.deadline =
-                crate::rt::environment::Deadline(Instant::now() + Duration::from_millis(50));
+                racer_io::deadline::Deadline(Instant::now() + Duration::from_millis(50));
             assert_eq!(
                 scoped.run_recipe_with_scope(&factory, &scope),
                 Err(Error::DeadlineExceeded)

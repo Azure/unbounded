@@ -363,7 +363,7 @@ pub struct BodyProgress {
 }
 
 pub(crate) fn timestamp(clock: &racer_io::Clock, at: std::time::Instant) -> u64 {
-    crate::peer::protocol::encode_deadline(clock, crate::rt::environment::Deadline(at))
+    crate::peer::protocol::encode_deadline(clock, racer_io::deadline::Deadline(at))
         .unwrap_or_default()
 }
 

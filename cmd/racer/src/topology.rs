@@ -5,10 +5,10 @@ use crate::model::AttemptId;
 use crate::model::ObjectId;
 use crate::model::PageNumber;
 use crate::model::RequestId;
-use crate::rt::environment::Deadline;
 use crate::runtime::RequestScope;
 use racer_core::liveness::Silence;
 use racer_core::route::LinkOutcome;
+use racer_io::deadline::Deadline;
 #[cfg(test)]
 use racer_wire::control::CacheId;
 use racer_wire::control::MembershipVersion;

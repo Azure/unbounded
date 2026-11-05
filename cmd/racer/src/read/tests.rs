@@ -2272,13 +2272,13 @@ mod timeouts {
     use crate::peer::protocol::Signatures;
     use crate::read::candidates::*;
     use crate::read::flight::AcquisitionBudget;
-    use crate::rt::environment::Deadline;
     use crate::runtime::RequestScope;
     use crate::security::OriginContext;
     use crate::test_support::security::network;
     use crate::topology::Candidates;
     use crate::topology::Member;
     use crate::topology::Membership;
+    use racer_io::deadline::Deadline;
     use racer_wire::control::MembershipVersion;
     use racer_wire::control::NodeId;
     use std::cell::Cell;

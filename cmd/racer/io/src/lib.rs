@@ -9,6 +9,7 @@
 
 pub mod cancel;
 pub mod ctx;
+pub mod deadline;
 pub mod error;
 pub mod exec;
 pub mod fs;

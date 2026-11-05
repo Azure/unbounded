@@ -8,7 +8,7 @@ use crate::error::Error;
 use crate::error::Operation;
 use crate::error::Result;
 use crate::model::RequestId;
-use crate::rt::environment::Deadline;
+use racer_io::deadline::Deadline;
 use racer_io::scoped::ReactorWake;
 use racer_io::scoped::SUBMISSION_BYTES;
 use racer_io::scoped::SubmissionCapacity;

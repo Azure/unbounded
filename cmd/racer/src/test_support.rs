@@ -47,7 +47,7 @@ use std::task::Context;
 pub mod clock {
     use crate::error::Error;
     use crate::error::Result;
-    use crate::rt::environment::Deadline;
+    use racer_io::deadline::Deadline;
     use std::cell::Cell;
     use std::time::Duration;
     use std::time::Instant;

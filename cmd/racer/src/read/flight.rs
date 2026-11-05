@@ -51,7 +51,7 @@ pub struct Flights {
 
     waiting: racer_io::xthread::offload::AdmissionQueue<PageId>,
 
-    admission_deadlines: Rc<crate::rt::environment::Registry>,
+    admission_deadlines: Rc<racer_io::deadline::Registry>,
 
     capacity_wake: CapacityWake,
 
@@ -334,7 +334,7 @@ pub struct FlightOperation {
     pub(super) operation: flight::Operation,
     /// Wake at the deadline of the waiter the operation currently serves, so
     /// a handed-over operation observes the end of its last adopter.
-    alarm: Option<(Instant, crate::rt::environment::Registration)>,
+    alarm: Option<(Instant, racer_io::deadline::Registration)>,
 }
 impl FlightOperation {
     pub fn complete(self) -> Result<()> {

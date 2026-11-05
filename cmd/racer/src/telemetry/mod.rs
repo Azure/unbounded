@@ -14,11 +14,11 @@ use crate::telemetry::primitives::SharedRing;
 
 #[cfg(test)]
 use crate::rt::environment;
-use crate::rt::environment::Deadline;
 use crate::telemetry::primitives::server;
 use crate::telemetry::primitives::server::Handler;
 use crate::telemetry::primitives::server::Response;
 use crate::telemetry::primitives::server::Server;
+use racer_io::deadline::Deadline;
 use racer_io::ring::Descriptor;
 use racer_wire::control::NodeId;
 use std::cell::OnceCell;

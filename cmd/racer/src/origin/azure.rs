@@ -41,10 +41,10 @@ use crate::model::{
     PageNumber, StrongEtag,
 };
 use crate::read::candidates::OriginAuthority;
-use crate::rt::environment::Deadline;
 use crate::runtime::RequestScope;
 use crate::security::OriginContext;
 use http1::MessageHead;
+use racer_io::deadline::Deadline;
 use racer_wire::control::{AzureContainerUrl, AzureCredential, CacheId, OriginDefinition};
 use std::collections::HashMap;
 use std::fmt;

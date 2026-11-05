@@ -1126,9 +1126,9 @@ pub(crate) mod tests {
         use crate::model::PageNumber;
         use crate::model::RequestId;
         use crate::model::StrongEtag;
-        use crate::rt::environment::Deadline;
         use crate::runtime::Cancellation;
         use crate::runtime::Reactor;
+        use racer_io::deadline::Deadline;
         use racer_wire::control::CacheId;
         use std::io::Read;
         use std::os::fd::AsRawFd;
