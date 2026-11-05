@@ -601,7 +601,11 @@ checkpoint scratch, not just the configured admission budgets. The automatic
 checkpoint budget is not an RSS limit or a guarantee that a full cache can be
 checkpointed. Limit warnings explain discarded capacity and checkpoint pressure.
 
-Checkpoints store completed-page hold deadlines and bind each worker to
+Checkpoints store the remaining time of each completed-page hold, measured
+on the monotonic clock, so a restart re-arms holds without consulting wall
+time. Time between the checkpoint and the restart does not count against a
+hold, so a restored hold can outlast its original deadline by that gap. They
+bind each worker to
 file mode or its raw-device IDs, sizes, and segment offsets. The raw-layout
 digest also includes both guard sizes. Each checkpoint candidate is
 validated for the whole node: one mismatched worker rejects the entire candidate.
