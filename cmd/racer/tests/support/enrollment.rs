@@ -109,7 +109,7 @@ pub fn issue(
         ca,
         key,
         node,
-        uring_runtime::environment::wall_now() - std::time::Duration::from_secs(1),
+        std::time::SystemTime::now() - std::time::Duration::from_secs(1),
     )
 }
 
@@ -164,7 +164,7 @@ pub fn signing_identity(
                 node,
                 chain,
                 &[ca.der().to_vec()],
-                &racer_crypto::identity::WallClock::new(uring_runtime::environment::wall_now),
+                &racer_crypto::identity::WallClock::host(),
             )
             .unwrap(),
     )

@@ -1366,7 +1366,7 @@ mod identity_workflows {
 }
 
 /// Deterministic xorshift filler so oracle tests are reproducible.
-fn fill_random(state: &mut u64, bytes: &mut [u8]) {
+fn fill_pseudorandom(state: &mut u64, bytes: &mut [u8]) {
     for byte in bytes {
         *state ^= *state << 13;
         *state ^= *state >> 7;
@@ -1392,10 +1392,10 @@ fn verify_tag_matches_open_and_reference_and_rejects_tampering() {
         let mut nonce = [0; 24];
         let mut aad = vec![0; round * 11 + (round % 3)];
         let mut plaintext = vec![0; length];
-        fill_random(&mut state, &mut key);
-        fill_random(&mut state, &mut nonce);
-        fill_random(&mut state, &mut aad);
-        fill_random(&mut state, &mut plaintext);
+        fill_pseudorandom(&mut state, &mut key);
+        fill_pseudorandom(&mut state, &mut nonce);
+        fill_pseudorandom(&mut state, &mut aad);
+        fill_pseudorandom(&mut state, &mut plaintext);
         let mut body = plaintext.clone();
         let tag = Xaes256Gcm::new((&key).into())
             .encrypt_inout_detached((&nonce).into(), &aad, InOutBuf::from(&mut body[..]))
@@ -1456,10 +1456,10 @@ fn xaes_matches_reference_oracle_in_both_directions() {
         let mut nonce = [0; 24];
         let mut aad = vec![0; round * 7];
         let mut plaintext = vec![0; length];
-        fill_random(&mut state, &mut key);
-        fill_random(&mut state, &mut nonce);
-        fill_random(&mut state, &mut aad);
-        fill_random(&mut state, &mut plaintext);
+        fill_pseudorandom(&mut state, &mut key);
+        fill_pseudorandom(&mut state, &mut nonce);
+        fill_pseudorandom(&mut state, &mut aad);
+        fill_pseudorandom(&mut state, &mut plaintext);
         let oracle = Xaes256Gcm::new((&key).into());
 
         let mut ours = vec![0xa5; length + TAG_LEN];
@@ -1493,7 +1493,7 @@ fn xaes_matches_reference_oracle_in_both_directions() {
 fn xaes_tamper_zeroes_output_and_length_errors_do_not() {
     let mut state = 7;
     let mut plaintext = vec![0; 4097];
-    fill_random(&mut state, &mut plaintext);
+    fill_pseudorandom(&mut state, &mut plaintext);
     let (key, nonce, aad) = ([9; 32], *b"ABCDEFGHIJKLMNOPQRSTUVWX", b"page aad");
     let mut sealed = vec![0; plaintext.len() + TAG_LEN];
     seal(&key, &nonce, aad, &plaintext, &mut sealed).unwrap();
