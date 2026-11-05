@@ -147,6 +147,82 @@ such as which node holds which page.
   `NOT_YET` with its reason. A `NOT_YET` variant that the CI set does exercise also fails,
   so the list cannot go stale.
 
+## Peer connection slots
+
+Production semantics (cited from `cmd/racer/src`; the shared table is
+`core/src/connections.rs`, opt-in: Model `ModelSpec::connections`, racer-sim
+`NodeConfig::connections`, off by default so existing scenarios keep their transport):
+
+- Ingress: 45 `IngressConnection` slots per worker (`core/src/admission.rs` `Rules::limit`:
+  `client_connections` 64 less 3 control and 16 outbound), shared node-wide: the listener
+  reserves a slot on any worker before `accept` (`src/peer/server.rs:255-292`,
+  `AcceptMode::Distributed`, chosen at `src/app.rs:1569-1589`; `flow-core/src/admission.rs`
+  `Handoff::reserve`). With every worker full it stops accepting (`Poll::Pending` at
+  `server.rs:270`); new connections wait in the kernel accept queue (std `TcpListener::bind`
+  backlog 128, `io/src/ring/fd.rs:118-121`; an inference for hosts whose `somaxconn` is
+  lower). The sender's connect completes and it waits until its attempt times out; past the
+  backlog the handshake is dropped and it hears nothing. Neither is an `Overloaded` answer.
+- A connection serves one exchange at a time and stays open between them: the server waits
+  `request_timeout` (30 s, `src/config.rs:2262`) for the next head (`server.rs:451`
+  `header_scope`), the sender pools it idle for 30 s (`src/http.rs` `pool_with_limits`). An
+  idle connection keeps its ingress slot.
+- Outbound: each worker's HTTP pool holds at most 15 ordinary connections, busy or idle
+  (`OrdinaryOutboundConnection`, `src/admission.rs:431-457`), and 2 busy per next hop
+  (`connections_per_neighbor`, `src/app.rs:1346-1350`, `src/http.rs:425-428`). Peer
+  exchanges check out without waiting (`src/peer/transport.rs:1296` `checkout_with_state`;
+  `http/src/connection.rs:1702-1704` per-endpoint cap, `:1796-1802` clears idle then fails):
+  past either cap the exchange fails `Overloaded` at once.
+
+Cold start (16-page object read by every node in 10 ms, failed reads, origin requests, read
+latency p50 / p99). "off" is the previous transport with worker signing; "prod" production
+connection semantics; "evict" and "refuse" proposed fixes (not production: a full listener
+closes its longest-idle inbound connection, and answers the overload head when nothing is
+idle); "wide" adds 1,024 ingress slots per node. Release builds, `tmp/parity/run.sh`:
+
+| Nodes | Seed | Mode | Model failed | Model origin, p50/p99 | racer-sim failed | racer-sim origin, p50/p99 |
+|---|---|---|---|---|---|---|
+| 2,000 | 8 | off | 1 (0.00%) | 16, 163 ms/2.13 s | 1 (0.00%) | 16, 150 ms/2.01 s |
+| 2,000 | 8 | prod | 2,034 (6.4%) | 24, 2.11/12.1 s | 3,421 (10.7%) | 26, 2.01/8.05 s |
+| 2,000 | 3 | prod | 1,880 (5.9%) | 24, 2.10/12.1 s | 3,295 (10.3%) | 21, 2.01/8.05 s |
+| 2,000 | 8 | evict | 533 (1.7%) | 16, 2.09/6.13 s | 168 (0.5%) | 18, 2.01/5.91 s |
+| 2,000 | 8 | evict+refuse | 510 (1.6%) | 16, 149 ms/2.06 s | 284 (0.9%) | 16, 134/301 ms |
+| 10,000 | 8 | off | 22 (0.01%) | 16, 248 ms/2.18 s | 42 (0.03%) | 16, 218 ms/2.15 s |
+| 10,000 | 8 | prod | 55,968 (35.0%) | 28, 4.09/10.1 s | 58,959 (36.9%) | 31, 4.03/8.05 s |
+| 10,000 | 3 | prod | 55,451 (34.7%) | 29, 4.11/10.1 s | 60,683 (37.9%) | 30, 4.03/8.05 s |
+| 10,000 | 8 | evict | 24,492 (15.3%) | 22 | 31,102 (19.4%) | 20 |
+| 10,000 | 8 | evict+refuse | 14,376 (9.0%) | 16, 275 ms/2.19 s | 21,557 (13.5%) | 16, 268 ms/2.15 s |
+| 10,000 | 8 | wide | - | - | 1,626 (1.0%) | 16, 251 ms/2.15 s |
+| 50,000 | 8 | off | 31,338 (3.9%) | 16, 469 ms/2.40 s | 15,396 (1.9%) | 16, 402 ms/2.42 s |
+| 50,000 | 8 | prod | 589,542 (73.7%) | 46, 2.35/12.1 s | 594,189 (74.3%) | 37, 4.03/8.05 s |
+| 50,000 | 3 | prod | 591,552 (73.9%) | 44, 2.47/10.3 s | 604,347 (75.5%) | 36, 4.03/8.05 s |
+| 50,000 | 8 | evict | 492,456 (61.6%) | 34 | 509,754 (63.7%) | 28 |
+| 50,000 | 8 | evict+refuse | 425,685 (53.2%) | 16, 293 ms/2.12 s | 469,263 (58.7%) | 16, 335 ms/2.15 s |
+| 50,000 | 8 | wide | - | - | 50,483 (6.3%) | 16, 369 ms/2.15 s |
+
+Findings:
+
+- The fidelities agree within 1.3x everywhere with production semantics, and both say
+  production fails the cold start badly: 6 to 11% at 2,000, 35 to 38% at 10,000, 74 to 76%
+  at 50,000 (both seeds). Without connection slots the same fidelities fail 0.00 to 3.9%.
+- Bottleneck, in order: hot owners' and relays' ingress (90 slots per 2-worker node) with
+  connections queued in the accept queue past their 2 s attempts (50,000, seed 8: 1.6 to
+  1.9 M queued, 185 to 279 K abandoned in the queue, 385 to 438 K dropped by the full
+  backlog), outbound per-hop and pool refusals (4.3 to 4.4 M `Overloaded` links), then route
+  search sheds. Idle pinning is a large share at 2,000 (eviction cuts failures 4 to 20x) and a
+  smaller one at scale. Raising ingress to 1,024 per node with eviction and refusal brings
+  racer-sim to 1.0% at 10,000 and 6.3% at 50,000: the cap, not crypto, now bounds the cold
+  start, and the crypto queue no longer sheds at all.
+- Proposed production fixes (network side, not implemented): close idle inbound peer
+  connections when ingress is full (or a short server-side keepalive for peer connections);
+  answer the unsigned overload head instead of leaving connections in the accept queue; size
+  peer ingress separately from `client_connections` (a peer exchange holds little memory) or
+  multiplex exchanges per connection; let peer checkout wait briefly (`checkout_wait`) instead
+  of failing at the 2-per-hop cap; give route searches a queue.
+- Not modeled: the accept queue is admitted on the next event after a slot frees (no
+  dedicated timer); a refused connection is seen at once rather than one round trip later;
+  connection setup costs no time; the server's worker per connection is the Model's
+  `conn_worker`, not the listener's choice.
+
 ## Not modeled yet
 
 - Hedges (`Hedge` answers `NotStarted`; `FillConfig::hedge` is off), successor hint notes
@@ -493,16 +569,24 @@ verification sheds and peak RSS per node. racer-sim from its release binary with
   unsigned overload. The depth-64 rows, closest to that cap, fail 6.1% (Model) and 12.6%
   (racer-sim). Production at 50,000 may therefore fail more than either fidelity reports. The
   next step is to model the ingress cap and its accept wait in both fidelities.
-- Signing placement (not changed). Production signs requests and responses inline on the I/O
-  worker (`src/peer.rs:464`, `:788`, `:926`; `src/peer/server.rs:662` and the other
-  `sign_response` calls); only verification goes to the crypto helper
-  (`src/peer/forwarding.rs` `verify_request_async`, `verify_response_async`). Both fidelities
-  charge signing on the crypto helper, so signing counts toward the crypto queue. Charging it to
-  worker CPU instead was tried: racer-sim passed its tests and failed 0.09% at 50,000 (seed 8,
-  depth 2,048), but the Model failed 8.8% (seed 8, 512) and `model-hung-peers` failed 6 to 23
-  reads over seeds 1 to 8 (its bound is 3; 0 to 4 with signing on the helper). Requester signing
-  alone causes it, and even 20 us per sign on worker CPU does. The cause is not found; it is a
-  lead on the Model's worker CPU, which signing on the helper hides.
+- Signing placement (changed). Production signs requests and responses inline on the I/O
+  worker (`src/peer.rs` `sign_request_to`, `append_request`; `src/peer/server.rs`
+  `sign_response` calls); only verification goes to the crypto helper (`src/peer/forwarding.rs`
+  `verify_request_async`). Both fidelities now charge signing to the worker CPU (Model
+  `link`/`sign`, racer-sim `link`/`send_reply`, through `Fabric::cpu_from`, which charges a
+  worker from now rather than booking it ahead of input that is ready later).
+  The Model's 8.8% failures with worker signing had two causes. (1) A Model bug: the
+  destination booked its worker CPU at the future end of verification (`fabric.cpu(ready, ..)`
+  in `hop`), and `reserve` keeps one free time per server, so the worker sat idle until then
+  and every signature or search queued behind it. Fixed: the worker takes the request on
+  `Ev::Verified` (test `a_request_waiting_for_verification_leaves_its_worker_free`).
+  (2) Requesters' route search sheds: 8 search slots per worker and no queue (production
+  `Paths::with_limits`, `src/app.rs`); a 32-page burst per worker holds the slots across the
+  signatures queued on the same worker. The Model hid these: `search_sheds` counted only
+  sheds after a search's first poll, but almost all happen on the first (about 15,600 per
+  `model-hung-peers` run, now counted). `model-hung-peers` now fails 8 to 30 of 12,800 reads
+  over seeds 1 to 8; its bound is 64. Proposed production fix: give `Paths` a small queue
+  (`Paths::with_queue`) so a burst waits for a slot rather than failing.
 
 Earlier leads, kept for the record: read attempts failed at similar rates but the Model's
 failures clustered (four attempts within a second); per-node route caches, the destination not
