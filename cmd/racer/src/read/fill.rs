@@ -2267,8 +2267,9 @@ impl Fill {
         budget: &mut AcquisitionBudget,
         want_plaintext: bool,
     ) -> Result<AcquiredPage> {
+        use super::candidates::{AcqInput, AcqIo};
         use racer_core::read::Source;
-        use racer_core::read::walk::{Action, Event as FillEvent};
+        use racer_core::read::acquisition::Terminal;
         let mode = self.mode(&page.version.object.cache);
         if mode == racer_control_wire::CacheMode::PassthroughLocal {
             return self
@@ -2335,29 +2336,48 @@ impl Fill {
         let mut acquisition =
             policy.acquisition(candidates, &operation, scope, want_plaintext, false);
         let mut acquired = None;
-        let mut event = FillEvent::Start { local_hit: false };
+        acquisition.feed(
+            AcqInput::Start { local_hit: false },
+            budget,
+            scope.clock().now(),
+        )?;
         loop {
-            let action = self
-                .call(
-                    DriverStage::CandidateCompositeCall,
-                    Box::pin(policy.drive(
-                        &mut acquisition,
-                        event,
-                        context,
-                        &operation,
-                        scope,
-                        budget,
-                        &mut |response| peer_page(response, plaintext.take()),
-                        &mut acquired,
-                    )),
-                )
-                .await?;
-            event = match action {
-                Action::Hedge {
+            let input = match acquisition.next()?.split() {
+                Err(Terminal::Report(report)) => {
+                    policy.report(&acquisition, report, &operation, scope, budget);
+                    continue;
+                }
+                Err(Terminal::Done(done)) => {
+                    return match done.result {
+                        Ok(source) => {
+                            match source {
+                                Source::Local => {}
+                                Source::Origin => self.metrics.record(Event::OriginFill, 1),
+                                Source::Hedge | Source::Peer => {
+                                    self.metrics.record(Event::PeerHit, 1)
+                                }
+                            }
+                            Ok(acquired.expect("acquired page"))
+                        }
+                        Err(error) => {
+                            let error = acquisition.error(error);
+                            Err(policy.failed(
+                                &mut acquisition,
+                                error,
+                                done.notes,
+                                &operation,
+                                scope,
+                                budget,
+                            ))
+                        }
+                    };
+                }
+                Ok(AcqIo::Hedge {
+                    id,
                     eligible,
                     first,
                     second,
-                } => {
+                }) => {
                     let hedge_start = self.dependencies.flights.clock().now();
                     let (result, end) = self
                         .timed(
@@ -2418,12 +2438,16 @@ impl Fill {
                     acquisition.trail.hedge_history_unavailable =
                         !matches!(end, racer_core::read::walk::HedgeEnd::NotStarted);
                     acquired = result.map(AcquiredPage::from);
-                    FillEvent::Hedge(end)
+                    AcqInput::Hedged {
+                        id,
+                        end,
+                        copy: acquired.is_some(),
+                    }
                 }
-                Action::Origin { rank } => {
-                    let authority = policy.authority(&mut acquisition, rank, &operation);
+                Ok(AcqIo::Origin { id, authority }) => {
+                    // The machine funded the attempt before planning the fetch.
+                    let authority = policy.authority(&mut acquisition, authority.rank, &operation);
                     authority.validate(&context.object, page.number)?;
-                    budget.begin_attempt(scope.clock().now(), scope.deadline.0)?;
                     scope.check()?;
                     // Peer reception owns its ciphertext allocation. Reserve encryption
                     // output only when this candidate actually needs an origin fill.
@@ -2474,7 +2498,7 @@ impl Fill {
                                     .await?
                                     .into(),
                             );
-                            FillEvent::Origin(Ok(()))
+                            AcqInput::Origin { id, result: Ok(()) }
                         }
                         Err(error) => {
                             if error != Error::VersionUnavailable {
@@ -2485,11 +2509,14 @@ impl Fill {
                                     &error,
                                 );
                             }
-                            FillEvent::Origin(Err(error.try_into()?))
+                            AcqInput::Origin {
+                                id,
+                                result: Err(error.try_into()?),
+                            }
                         }
                     }
                 }
-                Action::Publish(_) => {
+                Ok(AcqIo::Publish { id, .. }) => {
                     let result = acquired.as_ref().expect("acquired page");
                     result.validate_for(page)?;
                     scope.check()?;
@@ -2502,18 +2529,26 @@ impl Fill {
                         )
                         .await?;
                     }
-                    FillEvent::Published(Ok(()))
+                    AcqInput::Published { id, result: Ok(()) }
                 }
-                Action::Done(Ok(source)) => {
-                    match source {
-                        Source::Local => {}
-                        Source::Origin => self.metrics.record(Event::OriginFill, 1),
-                        Source::Hedge | Source::Peer => self.metrics.record(Event::PeerHit, 1),
-                    }
-                    return Ok(acquired.expect("acquired page"));
+                Ok(io) => {
+                    self.call(
+                        DriverStage::CandidateCompositeCall,
+                        policy.perform(
+                            &mut acquisition,
+                            io,
+                            context,
+                            &operation,
+                            scope,
+                            budget,
+                            &mut |response| peer_page(response, plaintext.take()),
+                            &mut acquired,
+                        ),
+                    )
+                    .await
                 }
-                action => unreachable!("the acquisition driver performs {action:?}"),
             };
+            acquisition.feed(input, budget, scope.clock().now())?;
         }
     }
 
