@@ -189,7 +189,13 @@ type Snapshot struct {
 
 // TakeSnapshot saves the shared configuration files below hostRoot into dir.
 func TakeSnapshot(log *slog.Logger, dir, hostRoot string) (*Snapshot, error) {
-	if err := confsnap.Take(dir, hostRoot, confsnap.SharedPaths()); err != nil {
+	return TakeSnapshotOf(log, dir, hostRoot, confsnap.SharedPaths())
+}
+
+// TakeSnapshotOf is TakeSnapshot of the given paths, for a mode whose node
+// stack writes more of the host in place (see confsnap.PathsFor).
+func TakeSnapshotOf(log *slog.Logger, dir, hostRoot string, paths []string) (*Snapshot, error) {
+	if err := confsnap.Take(dir, hostRoot, paths); err != nil {
 		return nil, fmt.Errorf("save shared configuration: %w", err)
 	}
 

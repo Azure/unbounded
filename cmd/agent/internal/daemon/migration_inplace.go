@@ -95,7 +95,7 @@ func (e *migrationEnv) newInPlaceMigration(
 		// The files both stacks write at the same host paths, such as the kubelet
 		// identity. A rollback restarts the source, which needs them as they were.
 		SnapshotConfig: func(context.Context) error {
-			return confsnap.Take(e.snapshotDir(), e.ConfigRoot, e.configPaths())
+			return confsnap.Take(e.snapshotDir(), e.ConfigRoot, e.configPaths(j.From, j.To))
 		},
 		RestoreConfig: func(context.Context) error {
 			err := confsnap.Restore(e.snapshotDir(), e.ConfigRoot)

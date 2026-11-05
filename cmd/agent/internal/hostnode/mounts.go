@@ -25,7 +25,24 @@ import (
 // mountInfo is the mount table (empty means /proc/self/mountinfo) and run
 // executes host commands (nil uses the real host).
 func UnmountBelow(ctx context.Context, log *slog.Logger, run none.Runner, mountInfo string, prefixes ...string) error {
-	failed, err := unmountBelow(ctx, log, run, mountInfo, prefixes...)
+	failed, err := unmountBelow(ctx, log, run, mountInfo, true, prefixes...)
+
+	return joinFailures(failed, err, prefixes)
+}
+
+// UnmountStrictlyBelow is UnmountBelow for the mounts strictly below the
+// prefixes: a mount at a prefix itself is left in place. A container node
+// uses it on /var/lib/kubelet before a slot starts, to clear the pod volumes
+// the previous slot left there without detaching the directory's own mount
+// (the shared bind its unit makes, or a dedicated disk), which the next slot's
+// pod mounts propagate through.
+func UnmountStrictlyBelow(ctx context.Context, log *slog.Logger, run none.Runner, mountInfo string, prefixes ...string) error {
+	failed, err := unmountBelow(ctx, log, run, mountInfo, false, prefixes...)
+
+	return joinFailures(failed, err, prefixes)
+}
+
+func joinFailures(failed map[string]error, err error, prefixes []string) error {
 	if err != nil {
 		return err
 	}
@@ -47,10 +64,12 @@ func UnmountBelow(ctx context.Context, log *slog.Logger, run none.Runner, mountI
 // them and to remove the rest. The error is for an unreadable mount table, in
 // which case no prefix can be trusted.
 func UnmountBelowByPrefix(ctx context.Context, log *slog.Logger, run none.Runner, mountInfo string, prefixes ...string) (map[string]error, error) {
-	return unmountBelow(ctx, log, run, mountInfo, prefixes...)
+	return unmountBelow(ctx, log, run, mountInfo, true, prefixes...)
 }
 
-func unmountBelow(ctx context.Context, log *slog.Logger, run none.Runner, mountInfo string, prefixes ...string) (map[string]error, error) {
+// unmountBelow unmounts the mounts below the prefixes, and at a prefix itself
+// when atPrefix is set.
+func unmountBelow(ctx context.Context, log *slog.Logger, run none.Runner, mountInfo string, atPrefix bool, prefixes ...string) (map[string]error, error) {
 	log = Logger(log)
 
 	override := mountInfo != ""
@@ -78,7 +97,7 @@ func unmountBelow(ctx context.Context, log *slog.Logger, run none.Runner, mountI
 
 		mp := unescapeMount(fields[4])
 		for _, p := range prefixes {
-			if mp == p || strings.HasPrefix(mp, p+"/") {
+			if (atPrefix && mp == p) || strings.HasPrefix(mp, p+"/") {
 				mounts = append(mounts, mount{point: mp, prefix: p})
 			}
 		}

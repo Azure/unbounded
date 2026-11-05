@@ -189,12 +189,14 @@ func (e *migrationEnv) snapshotDir() string {
 	return filepath.Join(e.configDir(), inPlaceConfigSnapshotName)
 }
 
-func (e *migrationEnv) configPaths() []string {
+// configPaths are the host files saved before a change between the modes, so
+// a rollback can put back whatever either node stack writes in place.
+func (e *migrationEnv) configPaths(modes ...isolation.Mode) []string {
 	if e.ConfigPaths != nil {
 		return e.ConfigPaths()
 	}
 
-	return confsnap.SharedPaths()
+	return confsnap.PathsFor(modes...)
 }
 
 func (e *migrationEnv) attestPath() string {

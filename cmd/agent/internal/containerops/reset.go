@@ -10,6 +10,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"time"
 
 	"github.com/Azure/unbounded/cmd/agent/internal/hostnode"
 	"github.com/Azure/unbounded/cmd/agent/internal/noneops"
@@ -35,6 +36,9 @@ type Teardown struct {
 	Root string
 	// MountInfo is the mount table. Empty means /proc/self/mountinfo.
 	MountInfo string
+	// GoneTimeout and PollInterval are as in Params.
+	GoneTimeout  time.Duration
+	PollInterval time.Duration
 }
 
 func (t *Teardown) logger() *slog.Logger { return hostnode.Logger(t.Log) }
@@ -46,8 +50,11 @@ func (t *Teardown) unitDir() string { return hostnode.OrDefault(t.SystemdDir, co
 func (t *Teardown) node(slot string) *Node {
 	return New(Params{
 		Log: t.logger(), Slot: slot,
-		Overrides: Overrides{Layout: t.Layout, SystemdDir: t.SystemdDir, RuntimePath: t.RuntimePath, Run: t.Run, MountInfoPath: t.MountInfo},
-		Hooks:     hostnode.Hooks{HostRoot: t.Root},
+		Overrides: Overrides{
+			Layout: t.Layout, SystemdDir: t.SystemdDir, RuntimePath: t.RuntimePath, Run: t.Run, MountInfoPath: t.MountInfo,
+			GoneTimeout: t.GoneTimeout, PollInterval: t.PollInterval,
+		},
+		Hooks: hostnode.Hooks{HostRoot: t.Root},
 	})
 }
 
@@ -122,20 +129,17 @@ func (t *Teardown) RemoveConfig() phases.Task {
 // bundle and rootfs through the backend, then the shared data the node left on
 // the host (pod mounts, kubelet state, CNI binaries and configuration), the
 // layout directory and the host runtime.
+//
+// The shared data goes only once every slot is destroyed, which the backend
+// reports only after the runtime confirmed its container gone: a container
+// still running holds those paths, and its pod volumes are mounted below
+// /var/lib/kubelet. The mounts there are unmounted after the slots are gone,
+// so none of them is recreated behind the unmount, and the kubelet directory
+// is kept if one stays, since RemoveAll would delete a volume's data through
+// it.
 func (t *Teardown) Destroy() phases.Task {
 	return hostnode.Func("remove-container-node", func(ctx context.Context) error {
 		var errs []error
-
-		// Pod volumes propagate to the host under /var/lib/kubelet, so unmount
-		// before any removal that could follow a bind mount. When a mount stays,
-		// RemoveAll would delete the volume's data through it, so the kubelet
-		// directory is kept and the failure reported.
-		keepKubelet := false
-
-		if err := t.unmountShared(ctx); err != nil {
-			errs = append(errs, err)
-			keepKubelet = true
-		}
 
 		for _, slot := range slots {
 			if !t.slotPresent(slot) {
@@ -147,8 +151,21 @@ func (t *Teardown) Destroy() phases.Task {
 			}
 		}
 
-		for _, d := range []string{"/var/lib/kubelet", goalstates.CNIConfigDir, goalstates.CNIBinDir, "/var/lib/unbounded/container-images"} {
-			if keepKubelet && d == "/var/lib/kubelet" {
+		if len(errs) > 0 {
+			t.logger().Warn("keeping the shared kubelet, CNI and image directories while a container slot remains")
+
+			return errors.Join(errs...)
+		}
+
+		keepKubelet := false
+
+		if err := t.unmountShared(ctx); err != nil {
+			errs = append(errs, err)
+			keepKubelet = true
+		}
+
+		for _, d := range []string{hostnode.KubeletDir, goalstates.CNIConfigDir, goalstates.CNIBinDir, container.ImageArchiveDir} {
+			if keepKubelet && d == hostnode.KubeletDir {
 				t.logger().Warn("keeping the kubelet directory because mounts below it could not be unmounted", "dir", d)
 
 				continue
@@ -159,8 +176,8 @@ func (t *Teardown) Destroy() phases.Task {
 			}
 		}
 
-		// Last, and only when the slots are gone, so a failed destroy keeps the
-		// directory that explains what is left.
+		// Last, and only when everything else went, so a failed destroy keeps
+		// the directory that explains what is left.
 		if len(errs) == 0 {
 			errs = append(errs, t.removeLayout()...)
 		}
