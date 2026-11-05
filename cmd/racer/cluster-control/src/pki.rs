@@ -461,9 +461,10 @@ impl ServingIdentity {
         &self,
         clients: Option<Arc<dyn ClientCertVerifier>>,
     ) -> Result<Arc<rustls::ServerConfig>, PkiError> {
-        let builder = rustls::ServerConfig::builder_with_provider(Arc::new(
-            rustls::crypto::ring::default_provider(),
-        ))
+        let builder = rustls::ServerConfig::builder_with_details(
+            Arc::new(rustls::crypto::ring::default_provider()),
+            crate::rt::time_provider(),
+        )
         .with_safe_default_protocol_versions()
         .map_err(|_| PkiError::Unavailable)?;
         let builder = match clients {

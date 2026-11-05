@@ -119,9 +119,10 @@ pub fn tls_config(ca_pem: &[u8]) -> Result<Arc<rustls::ClientConfig>, KubeError>
     if roots.is_empty() {
         return Err(KubeError::Invalid);
     }
-    let config = rustls::ClientConfig::builder_with_provider(Arc::new(
-        rustls::crypto::ring::default_provider(),
-    ))
+    let config = rustls::ClientConfig::builder_with_details(
+        Arc::new(rustls::crypto::ring::default_provider()),
+        rt::time_provider(),
+    )
     .with_safe_default_protocol_versions()
     .map_err(|_| KubeError::Invalid)?
     .with_root_certificates(roots)

@@ -217,21 +217,40 @@ async fn lead(shared: &Rc<Shared>, seat: &Rc<Seat>, object: Value, started: Inst
     *shared.term.borrow_mut() = None;
     shared.changed.notify();
     if shared.stopping.get() || !seat_mine(shared, seat) {
-        let object = t.object.borrow().clone();
+        let _ = rt::timeout(limits::API_TIMEOUT, release(&t)).await;
+    }
+}
+
+/// Release the primary Lease. A renewal still in flight when the term
+/// ended may have moved the Lease on: re-read it once, and release it only
+/// if it is still this term.
+async fn release(t: &Term_) {
+    let shared = &t.shared;
+    let ns = &shared.config.namespace;
+    let a: BTreeMap<_, _> = primary_annotations(shared, &t.seat, &t.extra.borrow())
+        .into_keys()
+        .map(|k| (k, None))
+        .collect();
+    let mut object = t.object.borrow().clone();
+    for _ in 0..2 {
         let spec = election::release(&lease::observe(&object).spec);
-        let a: BTreeMap<_, _> = primary_annotations(shared, seat, &t.extra.borrow())
-            .into_keys()
-            .map(|k| (k, None))
-            .collect();
-        let _ = rt::timeout(
-            limits::API_TIMEOUT,
-            lease::put(
-                &shared.lease_api,
-                &shared.config.namespace,
-                &lease::with(&object, &spec, &a),
-            ),
-        )
-        .await;
+        match lease::put(&shared.lease_api, ns, &lease::with(&object, &spec, &a)).await {
+            Err(KubeError::Conflict) => {
+                match lease::get(&shared.lease_api, ns, annotations::PRIMARY_LEASE).await {
+                    Ok(v)
+                        if same_term(
+                            &lease::observe(&v),
+                            &shared.identity,
+                            t.shell.borrow().term(),
+                        ) =>
+                    {
+                        object = v
+                    }
+                    _ => return,
+                }
+            }
+            _ => return,
+        }
     }
 }
 

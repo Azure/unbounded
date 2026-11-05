@@ -283,6 +283,28 @@ pub fn wall_now() -> std::time::SystemTime {
     })
 }
 
+/// Certificate validity time for rustls: the wall clock of the runtime
+/// current when this is called, or the host clock outside a runtime. A
+/// simulated authority then checks peer certificates against virtual time.
+pub fn time_provider() -> Arc<dyn rustls::time_provider::TimeProvider> {
+    let clock = try_current().map_or_else(racer_io::Clock::host, |c| c.reactor.ctx().clock.clone());
+    Arc::new(WallTime(clock))
+}
+
+#[derive(Debug)]
+struct WallTime(racer_io::Clock);
+
+impl rustls::time_provider::TimeProvider for WallTime {
+    fn current_time(&self) -> Option<rustls::pki_types::UnixTime> {
+        let since = self
+            .0
+            .wall_now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .ok()?;
+        Some(rustls::pki_types::UnixTime::since_unix_epoch(since))
+    }
+}
+
 /// The simulated OS of the current runtime, if it is simulated.
 #[cfg(test)]
 pub fn sim_os() -> Option<racer_io::sim::SimOs> {

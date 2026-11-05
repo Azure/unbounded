@@ -293,7 +293,7 @@ impl Authority {
             ctl.done = true;
             return Next::Done;
         }
-        self.executor.next()
+        self.next()
     }
 
     /// What [`Self::turn`] would report, without doing work.
@@ -301,7 +301,12 @@ impl Authority {
         if self.ctl.done {
             return Next::Done;
         }
-        self.executor.next()
+        match (self.executor.next(), self.ctl.stop_at) {
+            // The stop grace period ends even if no task wakes then.
+            (Next::WaitUntil(at), Some(stop)) => Next::WaitUntil(at.min(stop)),
+            (Next::Idle, Some(stop)) => Next::WaitUntil(stop),
+            (next, _) => next,
+        }
     }
 
     /// Ask the authority to stop. Held Leases are released within a bounded

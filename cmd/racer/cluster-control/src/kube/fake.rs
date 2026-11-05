@@ -31,7 +31,6 @@ struct Inner {
     store: RefCell<Store>,
     changed: Signal,
     requests: RefCell<Vec<(String, String)>>,
-    counter: RefCell<Option<Arc<AtomicUsize>>>,
     put_delay: RefCell<Option<Arc<AtomicU64>>>,
     get_delay: RefCell<Option<Arc<AtomicU64>>>,
     token: RefCell<String>,
@@ -43,7 +42,6 @@ impl FakeApi {
             store: RefCell::new(Store::new()),
             changed: Signal::default(),
             requests: RefCell::new(Vec::new()),
-            counter: RefCell::new(None),
             put_delay: RefCell::new(None),
             get_delay: RefCell::new(None),
             token: RefCell::new(TOKEN.into()),
@@ -53,11 +51,6 @@ impl FakeApi {
     /// Accept only `token` as the bearer from now on.
     pub fn set_token(&self, token: &str) {
         *self.0.token.borrow_mut() = token.into();
-    }
-
-    /// Count every request in `counter`, readable from other threads.
-    pub fn count_into(&self, counter: Arc<AtomicUsize>) {
-        *self.0.counter.borrow_mut() = Some(counter);
     }
 
     /// Hold each PUT until it is `delay_ms` old; `u64::MAX` hangs PUTs as a
@@ -127,9 +120,6 @@ impl FakeApi {
             .requests
             .borrow_mut()
             .push((method.into(), target.into()));
-        if let Some(c) = self.0.counter.borrow().as_ref() {
-            c.fetch_add(1, SeqCst);
-        }
         let (status, value) = self.0.store.borrow_mut().handle(method, target, body);
         if (200..300).contains(&status) && method != "GET" {
             self.0.changed.notify();
