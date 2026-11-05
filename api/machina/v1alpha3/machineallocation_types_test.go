@@ -524,3 +524,67 @@ func TestMachineAllocationStatusWriteOnce(t *testing.T) {
 		},
 	})
 }
+
+func TestMachineAllocationOperationsWriteOnce(t *testing.T) {
+	t.Parallel()
+
+	reference := func(name, uid string) map[string]any {
+		return map[string]any{"name": name, "uid": uid}
+	}
+
+	for _, operation := range []string{"allocate", "release"} {
+		message := "operations." + operation + " is immutable once set"
+		path := []string{"status", "operations", operation}
+		recorded := reference("ub-alloc-"+operation, "11111111-2222-4333-8444-555555555555")
+
+		storedWithRecord := func(t *testing.T) map[string]any {
+			obj := newMachineAllocationObject(t)
+			setField(t, obj, recorded, path...)
+
+			return obj
+		}
+
+		t.Run(operation, func(t *testing.T) {
+			t.Parallel()
+
+			runAllocationUpdateCases(t, []allocationUpdateCase{
+				{
+					name:   "set reference",
+					stored: newMachineAllocationObject,
+					mutate: func(t *testing.T, obj map[string]any) { setField(t, obj, recorded, path...) },
+				},
+				{
+					name:   "rewrite reference unchanged",
+					stored: storedWithRecord,
+					mutate: func(t *testing.T, obj map[string]any) { setField(t, obj, reference("ub-alloc-"+operation, "11111111-2222-4333-8444-555555555555"), path...) },
+				},
+				{
+					name:   "change reference UID",
+					stored: storedWithRecord,
+					mutate: func(t *testing.T, obj map[string]any) {
+						setField(t, obj, reference("ub-alloc-"+operation, "99999999-2222-4333-8444-555555555555"), path...)
+					},
+					want: []string{"status.operations." + operation + ": Invalid value", message},
+				},
+				{
+					name:   "remove reference",
+					stored: storedWithRecord,
+					mutate: func(_ *testing.T, obj map[string]any) { unstructured.RemoveNestedField(obj, path...) },
+					want:   []string{"status.operations." + operation + ": Invalid value", message},
+				},
+				{
+					name:   "remove operations",
+					stored: storedWithRecord,
+					mutate: func(_ *testing.T, obj map[string]any) { unstructured.RemoveNestedField(obj, "status", "operations") },
+					want:   []string{"status.operations." + operation + ": Invalid value", message},
+				},
+				{
+					name:   "drop whole status",
+					stored: storedWithRecord,
+					mutate: func(_ *testing.T, obj map[string]any) { unstructured.RemoveNestedField(obj, "status") },
+					want:   []string{"status.operations." + operation + ": Invalid value", message},
+				},
+			})
+		})
+	}
+}
