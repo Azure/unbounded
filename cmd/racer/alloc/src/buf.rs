@@ -389,6 +389,9 @@ pub struct Pool {
     alignment: usize,
 
     granule: usize,
+
+    // Buffers checked out since creation, for demand-driven idle trimming.
+    takes: u64,
 }
 
 impl fmt::Debug for Pool {
@@ -417,7 +420,14 @@ impl Pool {
             local: std::array::from_fn(|_| Vec::new()),
             alignment: config.alignment,
             granule: config.alignment.max(GRANULE),
+            takes: 0,
         })
+    }
+
+    /// Buffers checked out since creation. Owners compare samples across a
+    /// maintenance window to tell an idle pool from one in use.
+    pub fn takes(&self) -> u64 {
+        self.takes
     }
 
     /// Memory alignment of every buffer from this pool.
@@ -481,6 +491,7 @@ impl Pool {
             return Err(Error::InvalidConfiguration);
         }
         let class = self.class_for(capacity);
+        self.takes = self.takes.wrapping_add(1);
         let region = match (class != NO_CLASS).then(|| self.pop(class)).flatten() {
             Some(region) => region,
             None => Region::allocate(capacity, self.alignment, class)?,
@@ -888,6 +899,19 @@ mod tests {
         let empty = pool.take(0, (), false).unwrap();
         assert!(empty.is_empty());
         assert_eq!(empty.capacity(), GRANULE);
+    }
+
+    #[test]
+    fn takes_counts_checkouts() {
+        let limit = std::sync::Arc::new(IdleLimit::new(1 << 20));
+        let mut pool = pool(&limit);
+        assert_eq!(pool.takes(), 0);
+        drop(pool.take(10, (), false).unwrap());
+        drop(pool.take(10, (), false).unwrap());
+        assert_eq!(pool.takes(), 2);
+        // A refused charge is not a checkout.
+        assert!(pool.take(4097, Bytes(4096), false).is_err());
+        assert_eq!(pool.takes(), 2);
     }
 
     #[test]

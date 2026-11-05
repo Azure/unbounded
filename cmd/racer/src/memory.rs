@@ -30,75 +30,27 @@ pub(crate) fn default_disk_alignment() -> page_alloc::Alignment {
     page_alloc::Alignment::new(4096, 4096, 4096).expect("valid default alignment")
 }
 
-/// Idle full-page buffers each worker's aligned ciphertext pool may keep.
+/// Idle buffers each worker's pool keeps per capacity class.
 ///
-/// Unlike the flow-control recycler, whose idle `Vec`s keep their admission
-/// charge until reclaimed, aligned buffers release their Ciphertext charge as
-/// soon as they become idle (see [`PoolCharge`]): a retained charge would pin
-/// admission that unrelated reservations, which cannot reach this pool, then
-/// fail on. Idle aligned storage is therefore unaccounted, so the budget is
-/// kept to a few pages per worker, and every path that reclaims the recycler
-/// ([`BufferPool::reclaim_idle_buffers`]) also empties this pool.
-///
-/// This is a ceiling, not a steady state: the pool's demand controller
-/// ([`page_alloc::PoolDemand`]) releases buffers that stay idle for a whole
-/// maintenance window, oldest first, so an idle worker's pool empties within a
-/// few windows of [`BufferPool::maintain_idle_buffers`] while continuous reuse
-/// keeps it full. Memory pressure constrains the pool to hold nothing.
-pub(crate) const ALIGNED_POOL_IDLE_PAGES: usize = 4;
-
-/// Accounting for aligned ciphertext storage.
-///
-/// Live buffers hold their Ciphertext reservation. When a page or unfrozen
-/// buffer is dropped, the reservation is released before the storage returns
-/// to its worker pool, so idle storage never holds admission.
-pub(crate) enum PoolCharge {
-    Held(CiphertextCharge),
-    /// Idle storage. `wipe` preserves the released charge's erase policy.
-    Released {
-        wipe: bool,
-    },
-}
-impl PoolCharge {
-    /// The live reservation, absent only while storage is going idle.
-    pub(crate) fn held(&self) -> Option<&CiphertextCharge> {
-        match self {
-            Self::Held(charge) => Some(charge),
-            Self::Released { .. } => None,
-        }
-    }
-    fn released(&self) -> Self {
-        Self::Released {
-            wipe: page_alloc::Charge::requires_wipe(self),
-        }
-    }
-}
-impl page_alloc::Charge for PoolCharge {
-    fn covers(&self, bytes: usize) -> bool {
-        match self {
-            Self::Held(charge) => charge.covers(bytes),
-            // Only applied to storage already accounted by its allocation.
-            Self::Released { .. } => true,
-        }
-    }
-    fn requires_wipe(&self) -> bool {
-        match self {
-            Self::Held(charge) => charge.requires_wipe(),
-            Self::Released { wipe } => *wipe,
-        }
-    }
-}
+/// Idle storage stays charged to [`ResourceClass::Pool`], so the bound is kept
+/// to a few pages per class. This is a ceiling, not a steady state:
+/// [`BufferPool::maintain_idle_buffers`] sheds half of the idle storage after
+/// each window without a checkout, so an idle worker's pool empties within a
+/// few windows while continuous reuse keeps it warm. Memory pressure sheds it
+/// at once.
+pub(crate) const POOL_IDLE_PER_CLASS: usize = 4;
 
 /// Writable aligned ciphertext storage from one worker's pool. Dropping it
-/// unfrozen releases its reservation and returns the storage to that pool.
-pub struct CiphertextBuffer(Option<page_alloc::DetachedBuffer<PoolCharge>>);
+/// unfrozen returns the storage to that pool and releases its reservation.
+pub struct CiphertextBuffer {
+    buffer: DiskBuffer,
+    /// Length through the next device length-unit boundary.
+    padded: usize,
+}
 impl CiphertextBuffer {
-    fn inner(&self) -> &page_alloc::DetachedBuffer<PoolCharge> {
-        self.0.as_ref().expect("live ciphertext buffer")
-    }
     /// Requested length in bytes.
     pub fn len(&self) -> usize {
-        self.inner().len()
+        self.buffer.len()
     }
     /// Always false: pools reject zero-length buffers.
     pub fn is_empty(&self) -> bool {
@@ -106,46 +58,41 @@ impl CiphertextBuffer {
     }
     /// Allocation capacity the reservation covers.
     pub fn capacity(&self) -> usize {
-        self.inner().capacity()
+        self.buffer.capacity()
     }
     /// The Ciphertext reservation accounting for this storage.
     pub(crate) fn charge(&self) -> &CiphertextCharge {
-        self.inner().charge().held().expect("held while live")
+        self.buffer.charge()
     }
     /// Bytes, which may hold stale ciphertext until fully written.
     pub fn as_slice(&self) -> &[u8] {
-        self.inner().as_slice()
+        &self.buffer
     }
     /// Exclusively borrow exactly the requested bytes.
     pub fn as_mut_slice(&mut self) -> &mut [u8] {
-        self.0
-            .as_mut()
-            .expect("live ciphertext buffer")
-            .as_mut_slice()
+        &mut self.buffer
     }
-    /// Zero the pad and freeze without copying.
-    fn freeze(mut self) -> AlignedBody {
-        AlignedBody(self.0.take().expect("live ciphertext buffer").freeze())
-    }
-}
-impl Drop for CiphertextBuffer {
-    fn drop(&mut self) {
-        if let Some(buffer) = self.0.take() {
-            // Freezing only zero-fills the pad; the body's drop releases the
-            // reservation before the storage goes idle.
-            drop(AlignedBody(buffer.freeze()));
-        }
+    /// Zero the pad and freeze without copying. The returned buffer's length
+    /// is the padded length; the second value is the ciphertext length.
+    fn freeze(self) -> (DiskBuffer, usize) {
+        let Self { mut buffer, padded } = self;
+        let length = buffer.len();
+        buffer.spare_mut()[length..padded].fill(0);
+        buffer
+            .set_len(padded)
+            .expect("padded length is within capacity");
+        (buffer, length)
     }
 }
 impl std::fmt::Debug for CiphertextBuffer {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("CiphertextBuffer")
-            .field("length", &self.0.as_ref().map(|b| b.len()))
+            .field("length", &self.buffer.len())
             .finish_non_exhaustive()
     }
 }
-// SAFETY: the detached allocation is exclusively owned, stable, and live
-// until Drop, and is only exposed through these borrows.
+// SAFETY: the pooled allocation is exclusively owned, stable, and live until
+// Drop, and is only exposed through these borrows.
 unsafe impl racer_io::ring::IoBuffer for CiphertextBuffer {
     fn bytes(&self) -> racer_io::Result<&[u8]> {
         Ok(self.as_slice())
@@ -155,44 +102,32 @@ unsafe impl racer_io::ring::IoBuffer for CiphertextBuffer {
     }
 }
 
-/// Frozen aligned ciphertext that releases its reservation before the storage
-/// returns to its worker pool.
-pub(crate) struct AlignedBody(page_alloc::FrozenBuffer<PoolCharge>);
-impl AlignedBody {
-    pub(crate) fn charge(&self) -> &CiphertextCharge {
-        self.0.charge().held().expect("held while live")
-    }
-    fn rebind(&mut self, charge: CiphertextCharge) -> Result<()> {
-        self.0.rebind(PoolCharge::Held(charge)).map_err(Into::into)
-    }
-}
-impl std::ops::Deref for AlignedBody {
-    type Target = page_alloc::FrozenBuffer<PoolCharge>;
-    fn deref(&self) -> &Self::Target {
-        &self.0
-    }
-}
-impl Drop for AlignedBody {
-    fn drop(&mut self) {
-        let released = self.0.charge().released();
-        // Released covers any capacity, so rebinding cannot fail.
-        let _ = self.0.rebind(released);
-    }
+/// Demand state for trimming one worker's idle pooled storage.
+#[derive(Clone, Copy, Debug, Default)]
+struct IdleDemand {
+    window_start: Option<std::time::Instant>,
+    takes_at_start: u64,
+    idle_at_start: usize,
+    constrained: bool,
+    trimmed: u64,
 }
 
 /// Per-worker ciphertext and plaintext allocation front end.
 ///
-/// Cloned handles share one [`page_alloc::WorkerBufferPool`], so aligned
-/// ciphertext buffers return to the worker that created them even when they are
-/// filled or dropped on a shared crypto thread.
+/// Cloned handles share one [`page_alloc::buf::Pool`], so buffers return to
+/// the worker that created them even when they are filled or dropped on a
+/// shared crypto thread.
 #[derive(Clone)]
 pub struct BufferPool {
     admission: Rc<flow_control::Quotas<AdmissionPolicy>>,
-    aligned: page_alloc::WorkerBufferPool<PoolCharge>,
-    /// Disk read buffers. Idle storage is charged to [`ResourceClass::Pool`]
-    /// and returns here from any thread, so a warm disk hit reuses a mapping
-    /// instead of mapping and unmapping a fresh one.
+    /// Direct-I/O alignment of this worker's store devices.
+    alignment: page_alloc::Alignment,
+    /// Every pooled buffer: aligned ciphertext, disk reads, and wipe-on-return
+    /// plaintext. Idle storage is charged to [`ResourceClass::Pool`] and
+    /// returns here from any thread, so a warm path reuses a mapping instead
+    /// of mapping and unmapping a fresh one.
     disk: Rc<std::cell::RefCell<page_alloc::buf::Pool>>,
+    demand: Rc<std::cell::Cell<IdleDemand>>,
 }
 /// Mutable staging buffer, not proof of authentication and not client-deliverable.
 /// Fixed-size owned backing stays at the same address when this owner moves.
@@ -383,12 +318,12 @@ pub(crate) enum CiphertextStorage {
     /// Ciphertext produced directly into direct-I/O aligned storage.
     ///
     /// Invariant, established by construction: the bytes start at offset 0 of
-    /// an allocation aligned to its pool's memory unit, and
-    /// `buffer.padded_slice()` holds the ciphertext followed only by zeros up
-    /// to a length-unit boundary. The store may write `padded_slice()`
-    /// directly; see [`CiphertextPage::disk_body`].
+    /// an allocation aligned to its pool's memory unit, and `buffer` (its
+    /// whole logical length) holds the ciphertext followed only by zeros up
+    /// to a length-unit boundary. The store may write it directly; see
+    /// [`CiphertextPage::disk_body`].
     Aligned {
-        buffer: AlignedBody,
+        buffer: DiskBuffer,
         length: usize,
     },
     /// A received RDMA page still in registered pool memory. Request-scoped
@@ -468,45 +403,87 @@ impl BufferPool {
         admission: Rc<flow_control::Quotas<AdmissionPolicy>>,
         alignment: page_alloc::Alignment,
     ) -> Self {
-        let budget = aligned_capacity(alignment, PAGE_BYTES as usize + 16)
-            .map_or(0, |page| page.saturating_mul(ALIGNED_POOL_IDLE_PAGES));
         let disk = page_alloc::buf::Pool::new(
             page_alloc::buf::PoolConfig {
                 alignment: alignment.memory(),
-                max_idle_per_class: ALIGNED_POOL_IDLE_PAGES,
+                max_idle_per_class: POOL_IDLE_PER_CLASS,
             },
             flow_control::QuotaPoolAccount::new(admission.shared(), ResourceClass::Pool),
         )
         .expect("disk alignment is a valid pool alignment");
         Self {
             admission,
-            aligned: page_alloc::WorkerBufferPool::with_budget(alignment, budget),
+            alignment,
             disk: Rc::new(std::cell::RefCell::new(disk)),
+            demand: Default::default(),
         }
     }
     /// Direct-I/O alignment of aligned ciphertext buffers from this worker.
+    #[cfg(test)]
     pub(crate) fn alignment(&self) -> page_alloc::Alignment {
-        self.aligned.alignment()
+        self.alignment
     }
-    /// Idle counters of this worker's aligned ciphertext pool.
+    /// Idle and trimming counters of this worker's pool. `bytes` is the
+    /// charged idle storage; `entries` is not tracked.
     #[cfg(test)]
-    pub(crate) fn aligned_stats(&self) -> page_alloc::SharedPoolStats {
-        self.aligned.stats()
+    pub(crate) fn pool_stats(&self) -> page_alloc::PoolStats {
+        let demand = self.demand.get();
+        page_alloc::PoolStats {
+            bytes: self.disk.borrow().idle_bytes(),
+            max_depth: POOL_IDLE_PER_CLASS,
+            trimmed: demand.trimmed,
+            constrained: demand.constrained,
+            ..Default::default()
+        }
     }
-    /// Demand counters of this worker's aligned ciphertext pool.
-    #[cfg(test)]
-    pub(crate) fn aligned_pool_stats(&self) -> page_alloc::PoolStats {
-        self.aligned.pool_stats()
-    }
-    /// Advance demand sizing of the aligned pool, releasing storage that stayed
-    /// idle. O(1) until the observation window elapses; returns bytes freed.
+    /// Release idle storage that went unused for a whole maintenance window:
+    /// half of what was idle when the window opened, provided nothing was
+    /// checked out since, or all of it while constrained. O(1) until
+    /// the window elapses; returns bytes released.
     pub(crate) fn maintain_idle_buffers(&self, now: std::time::Instant) -> usize {
-        self.aligned.maintain(now)
+        let mut demand = self.demand.get();
+        let Ok(mut pool) = self.disk.try_borrow_mut() else {
+            return 0;
+        };
+        let takes = pool.takes();
+        if demand.constrained {
+            let released = pool.shed(usize::MAX);
+            if released > 0 {
+                demand.trimmed = demand.trimmed.saturating_add(1);
+                self.demand.set(demand);
+            }
+            return released;
+        }
+        let Some(start) = demand.window_start else {
+            demand.window_start = Some(now);
+            demand.takes_at_start = takes;
+            demand.idle_at_start = pool.idle_bytes();
+            self.demand.set(demand);
+            return 0;
+        };
+        let mut released = 0;
+        if now.saturating_duration_since(start) >= page_alloc::DEFAULT_WINDOW {
+            // Only storage idle since the window started counts as unused.
+            let stale = pool.idle_bytes().min(demand.idle_at_start);
+            if takes == demand.takes_at_start && stale > 0 {
+                released = pool.shed(stale.div_ceil(2));
+            }
+            demand.window_start = Some(now);
+            demand.takes_at_start = takes;
+            demand.idle_at_start = pool.idle_bytes();
+        }
+        if released > 0 {
+            demand.trimmed = demand.trimmed.saturating_add(1);
+        }
+        self.demand.set(demand);
+        released
     }
-    /// Refuse aligned returns and release idle storage at the next maintenance
-    /// while memory is constrained.
+    /// Release idle storage now, and at every maintenance while memory is
+    /// constrained.
     pub(crate) fn constrain_idle_buffers(&self, constrained: bool) {
-        self.aligned.set_constrained(constrained);
+        let mut demand = self.demand.get();
+        demand.constrained = constrained;
+        self.demand.set(demand);
         if constrained {
             self.shed_disk_buffers();
         }
@@ -541,15 +518,14 @@ impl BufferPool {
         Ok(self.disk.borrow().capacity_for(length)?)
     }
     /// Release idle recycled storage: the flow-control recycler and this
-    /// worker's aligned pool, dropping the admission charges both retain.
+    /// worker's pool, dropping the admission charges both retain.
     pub(crate) fn reclaim_idle_buffers(&self) {
         self.admission.reclaim_buffers();
-        self.aligned.clear();
         self.shed_disk_buffers();
     }
     /// Admission a pooled aligned buffer of `length` bytes must be charged for.
     pub(crate) fn aligned_capacity(&self, length: usize) -> Result<usize> {
-        aligned_capacity(self.alignment(), length)
+        self.disk_capacity(padded_length(self.alignment, length)?)
     }
     /// Check out aligned ciphertext storage for exactly `length` bytes.
     ///
@@ -565,10 +541,10 @@ impl BufferPool {
             return Err(Error::InvalidConfiguration);
         }
         reservation.validate(ResourceClass::Ciphertext, self.aligned_capacity(length)?)?;
-        self.aligned
-            .take(length, PoolCharge::Held(reservation))
-            .map(|buffer| CiphertextBuffer(Some(buffer)))
-            .map_err(Into::into)
+        let padded = padded_length(self.alignment, length)?;
+        let mut buffer = self.disk.borrow_mut().take(padded, reservation, false)?;
+        buffer.set_len(length)?;
+        Ok(CiphertextBuffer { buffer, padded })
     }
     /// Check out aligned storage for AEAD output, replacing an exact-length
     /// reservation with one covering the pooled capacity when needed.
@@ -600,7 +576,7 @@ impl BufferPool {
             .reserve(key.as_ref(), ResourceClass::Ciphertext, capacity);
         if larger.is_err() {
             // Idle pooled buffers may be what pins this worker's admission.
-            self.aligned.clear();
+            self.shed_disk_buffers();
             larger = self
                 .admission
                 .reserve(key.as_ref(), ResourceClass::Ciphertext, capacity);
@@ -927,17 +903,16 @@ fn note_registered_copy_out() {
 pub(crate) fn registered_copy_outs() -> u64 {
     REGISTERED_COPY_OUTS.with(std::cell::Cell::get)
 }
+/// Capacity of an unpooled buffer of `padded` bytes at `alignment`.
+fn unpooled_capacity(alignment: page_alloc::Alignment, padded: usize) -> usize {
+    padded.next_multiple_of(alignment.memory().max(page_alloc::buf::GRANULE))
+}
 /// Bytes from the start of `length` through the next length-unit boundary.
 fn padded_length(alignment: page_alloc::Alignment, length: usize) -> Result<usize> {
     let unit = alignment.length();
     length
         .checked_next_multiple_of(unit)
         .filter(|padded| length != 0 && *padded <= page_alloc::Alignment::MAX_TRANSFER_LENGTH)
-        .ok_or(Error::InvalidConfiguration)
-}
-/// Capacity of the pooled size class holding `length` padded bytes.
-fn aligned_capacity(alignment: page_alloc::Alignment, length: usize) -> Result<usize> {
-    page_alloc::buffer_capacity(padded_length(alignment, length)?)
         .ok_or(Error::InvalidConfiguration)
 }
 impl VerifiedPage {
@@ -981,6 +956,7 @@ impl CiphertextPage {
     /// `alignment`, so a disk write can use it without another copy.
     pub(crate) fn rehome_capacity(&self, alignment: page_alloc::Alignment) -> Result<usize> {
         padded_length(alignment, self.bytes().len())
+            .map(|padded| unpooled_capacity(alignment, padded))
     }
     /// [`Self::rehome`], copying into storage aligned for `alignment` (the
     /// device's) when `reservation` covers [`Self::rehome_capacity`].
@@ -1004,7 +980,11 @@ impl CiphertextPage {
                         .replace_charge(reservation)
                         .map_err(|_| Error::from(page_alloc::Error::InvalidConfiguration))?;
                 }
-                CiphertextStorage::Aligned { buffer, .. } => buffer.rebind(reservation)?,
+                CiphertextStorage::Aligned { buffer, .. } => {
+                    buffer
+                        .replace_charge(reservation)
+                        .map_err(|_| Error::from(page_alloc::Error::InvalidConfiguration))?;
+                }
                 CiphertextStorage::Registered { .. } => unreachable!(),
             }
             return Ok(self);
@@ -1014,20 +994,18 @@ impl CiphertextPage {
         // another copy; fall back to a Vec when the charge only covers the
         // exact length.
         let copy = if let Ok(padded) = padded_length(alignment, length)
-            && reservation.amount() >= padded
+            && reservation.amount() >= unpooled_capacity(alignment, padded)
         {
-            let mut buffer = alignment.allocate(padded, PoolCharge::Held(reservation))?;
             // Fresh allocations are zeroed, so the pad past `length` stays zero.
-            buffer.as_mut_slice()[..length].copy_from_slice(self.bytes());
+            let mut buffer =
+                page_alloc::buf::Buf::unpooled(padded, alignment.memory(), reservation, false)?;
+            buffer[..length].copy_from_slice(self.bytes());
             Self {
                 pinned: true,
                 inner: Arc::new(CiphertextBytes {
                     pins: Default::default(),
                     envelope: self.envelope().clone(),
-                    storage: CiphertextStorage::Aligned {
-                        buffer: AlignedBody(buffer.freeze()?),
-                        length,
-                    },
+                    storage: CiphertextStorage::Aligned { buffer, length },
                 }),
                 provenance: self.provenance,
             }
@@ -1072,17 +1050,14 @@ impl CiphertextPage {
     /// Freeze aligned output into a page. Callers have validated the length
     /// against `envelope` and the buffer's Ciphertext charge.
     pub(crate) fn from_aligned(buffer: CiphertextBuffer, envelope: PageEnvelope) -> Self {
-        let length = buffer.len();
+        let (buffer, length) = buffer.freeze();
         Self {
             pinned: true,
             provenance: None,
             inner: Arc::new(CiphertextBytes {
                 pins: Default::default(),
                 envelope,
-                storage: CiphertextStorage::Aligned {
-                    buffer: buffer.freeze(),
-                    length,
-                },
+                storage: CiphertextStorage::Aligned { buffer, length },
             }),
         }
     }
@@ -1093,7 +1068,7 @@ impl CiphertextPage {
         match &self.inner.storage {
             CiphertextStorage::Owned(storage) => &storage.bytes,
             CiphertextStorage::Slab { buffer, range } => &buffer[range.clone()],
-            CiphertextStorage::Aligned { buffer, length } => &buffer.as_slice()[..*length],
+            CiphertextStorage::Aligned { buffer, length } => &buffer[..*length],
             CiphertextStorage::Registered { page, .. } => page.bytes(),
         }
     }
@@ -1109,7 +1084,7 @@ impl CiphertextPage {
         let CiphertextStorage::Aligned { buffer, .. } = &self.inner.storage else {
             return None;
         };
-        let padded = buffer.padded_slice();
+        let padded: &[u8] = buffer;
         ((padded.as_ptr() as usize).is_multiple_of(alignment.memory())
             && padded.len().is_multiple_of(alignment.length()))
         .then_some(padded)
@@ -4320,13 +4295,13 @@ pub(crate) mod tests {
             pool.aligned_ciphertext_page(buffer, envelope.clone()),
             Err(Error::InvalidConfiguration)
         ));
-        assert_eq!(pool.aligned_stats().idle_buffers, 1);
+        assert_eq!(pool.disk_idle_bytes(), capacity);
         assert_eq!(source.used(ResourceClass::Ciphertext), length);
 
         let mut buffer = pool
             .aligned_ciphertext(reserve(&source, &cache, capacity), length)
             .unwrap();
-        assert_eq!(pool.aligned_stats().idle_buffers, 0, "storage is recycled");
+        assert_eq!(pool.disk_idle_bytes(), 0, "storage is recycled");
         buffer
             .as_mut_slice()
             .copy_from_slice(base.ciphertext.bytes());
@@ -4352,13 +4327,13 @@ pub(crate) mod tests {
         assert!(moved.is_disk_aligned(alignment));
         assert!(target.owns(moved.inner.reservation()));
         drop(retained);
-        assert_eq!(pool.aligned_stats().idle_buffers, 1);
+        assert_eq!(pool.disk_idle_bytes(), capacity);
         assert_eq!(source.used(ResourceClass::Ciphertext), length);
         drop(moved);
         assert_eq!(target.used(ResourceClass::Ciphertext), 0);
         // Releasing idle storage keeps admission untouched.
         pool.reclaim_idle_buffers();
-        assert_eq!(pool.aligned_stats().idle_buffers, 0);
+        assert_eq!(pool.disk_idle_bytes(), 0);
     }
 
     #[test]
@@ -4377,34 +4352,41 @@ pub(crate) mod tests {
             let buffers: Vec<_> = (0..count).map(|_| take()).collect();
             drop(buffers);
         };
-        burst(ALIGNED_POOL_IDLE_PAGES);
-        assert_eq!(pool.aligned_stats().idle_buffers, ALIGNED_POOL_IDLE_PAGES);
+        let full = POOL_IDLE_PER_CLASS * capacity;
+        burst(POOL_IDLE_PER_CLASS);
+        assert_eq!(pool.disk_idle_bytes(), full);
         let window = page_alloc::DEFAULT_WINDOW;
         let start = std::time::Instant::now();
         assert_eq!(pool.maintain_idle_buffers(start), 0);
         // Active reuse every window keeps the pool full.
         for turn in 1..=20 {
-            burst(ALIGNED_POOL_IDLE_PAGES);
+            burst(POOL_IDLE_PER_CLASS);
             assert_eq!(pool.maintain_idle_buffers(start + window * turn), 0);
-            assert_eq!(pool.aligned_stats().idle_buffers, ALIGNED_POOL_IDLE_PAGES);
+            assert_eq!(pool.disk_idle_bytes(), full);
         }
-        // Once idle, a few windows release everything.
-        let mut now = start + window * 20;
-        for _ in 0..ALIGNED_POOL_IDLE_PAGES {
+        // Once idle, each window releases half; a few windows release all.
+        let mut now = start + window * 21;
+        assert_eq!(pool.maintain_idle_buffers(now), full / 2);
+        for _ in 0..POOL_IDLE_PER_CLASS {
             now += window;
             pool.maintain_idle_buffers(now);
         }
-        assert_eq!(pool.aligned_stats(), page_alloc::SharedPoolStats::default());
-        assert!(pool.aligned_pool_stats().trimmed >= ALIGNED_POOL_IDLE_PAGES as u64);
+        assert_eq!(pool.disk_idle_bytes(), 0);
+        assert!(pool.pool_stats().trimmed >= 2);
         assert_eq!(admission.used(ResourceClass::Ciphertext), 0);
+        assert_eq!(admission.used(ResourceClass::Pool), 0);
 
-        // Constrained pools refuse returns.
-        pool.constrain_idle_buffers(true);
+        // A constrained pool sheds at once and at every maintenance.
         burst(1);
-        assert_eq!(pool.aligned_stats().idle_buffers, 0);
+        pool.constrain_idle_buffers(true);
+        assert!(pool.pool_stats().constrained);
+        assert_eq!(pool.disk_idle_bytes(), 0);
+        burst(1);
+        assert_eq!(pool.maintain_idle_buffers(now), capacity);
+        assert_eq!(pool.disk_idle_bytes(), 0);
         pool.constrain_idle_buffers(false);
         burst(1);
-        assert_eq!(pool.aligned_stats().idle_buffers, 1);
+        assert_eq!(pool.disk_idle_bytes(), capacity);
     }
 
     #[test]

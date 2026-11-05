@@ -5011,7 +5011,7 @@ fn shared_pressure_constrains_pools_and_releases_retained_buffers() {
     worker.poll_pressure(now);
     let (recycler, staging) = worker.pool_stats();
     assert!(recycler.constrained && staging.constrained);
-    assert!(worker.aligned_pool_stats().constrained);
+    assert!(worker.buffer_pool_stats().constrained);
     assert_eq!(recycler.bytes, 0);
     assert_eq!(staging.bytes, 0);
     assert_eq!(admission.used(ResourceClass::Ciphertext), 0);
@@ -5030,7 +5030,7 @@ fn shared_pressure_constrains_pools_and_releases_retained_buffers() {
     worker.poll_pressure(now);
     let (recycler, staging) = worker.pool_stats();
     assert!(!recycler.constrained && !staging.constrained);
-    assert!(!worker.aligned_pool_stats().constrained);
+    assert!(!worker.buffer_pool_stats().constrained);
     assert_eq!(
         worker
             .telemetry
@@ -5095,7 +5095,7 @@ fn maintain_pools_releases_idle_aligned_storage() {
         buffers.aligned_ciphertext(reservation, length).unwrap()
     };
     drop([take(), take()]);
-    assert_eq!(worker.aligned_pool_stats().entries, 2);
+    assert_eq!(worker.buffer_pool_stats().bytes, 2 * capacity);
     let window = page_alloc::DEFAULT_WINDOW;
     let start = std::time::Instant::now();
     worker.maintain_pools(start);
@@ -5103,14 +5103,13 @@ fn maintain_pools_releases_idle_aligned_storage() {
     for turn in 1..=3 {
         drop([take(), take()]);
         worker.maintain_pools(start + window * turn);
-        assert_eq!(worker.aligned_pool_stats().entries, 2);
+        assert_eq!(worker.buffer_pool_stats().bytes, 2 * capacity);
     }
     // An idle worker releases it within a few windows.
     for turn in 4..=6 {
         worker.maintain_pools(start + window * turn);
     }
-    let stats = worker.aligned_pool_stats();
-    assert_eq!((stats.entries, stats.bytes), (0, 0));
+    assert_eq!(worker.buffer_pool_stats().bytes, 0);
 }
 
 #[test]
@@ -5163,7 +5162,7 @@ fn maintain_pools_expires_idle_cache_entries_then_their_aligned_storage() {
     let shared = page.ciphertext.clone();
     page.ciphertext = buffers.rehome_aligned(shared, reservation).unwrap();
     worker.memory.publish(page).unwrap();
-    assert_eq!(worker.aligned_pool_stats().entries, 0);
+    assert_eq!(worker.buffer_pool_stats().bytes, 0);
 
     let start = std::time::Instant::now();
     let second = Duration::from_secs(1);
@@ -5177,19 +5176,18 @@ fn maintain_pools_expires_idle_cache_entries_then_their_aligned_storage() {
     let renewed = now;
     while now < renewed + racer_core::cache::IDLE_TTL {
         worker.maintain_pools(now);
-        assert_eq!(worker.aligned_pool_stats().entries, 0);
+        assert_eq!(worker.buffer_pool_stats().bytes, 0);
         now += second;
     }
     worker.maintain_pools(now);
     assert!(worker.memory.ciphertext(&page_id).unwrap().is_none());
     // The released buffer is pooled, then decays once nothing reuses it.
-    assert_eq!(worker.aligned_pool_stats().entries, 1);
+    assert!(worker.buffer_pool_stats().bytes > 0);
     for _ in 0..6 {
         now += page_alloc::DEFAULT_WINDOW;
         worker.maintain_pools(now);
     }
-    let stats = worker.aligned_pool_stats();
-    assert_eq!((stats.entries, stats.bytes), (0, 0));
+    assert_eq!(worker.buffer_pool_stats().bytes, 0);
 }
 
 #[test]

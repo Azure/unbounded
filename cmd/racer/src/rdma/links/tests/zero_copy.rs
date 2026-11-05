@@ -309,9 +309,9 @@ fn detach_registered_returns_the_buffer_to_the_worker_pool() {
     let ciphertext = registered(&mut w, &admission, &page.ciphertext);
     let charge = aligned_charge(&pool, &admission, &ciphertext);
     let detached = pool.detach_registered(ciphertext, charge).unwrap();
-    let idle = pool.aligned_stats();
+    let idle = pool.disk_idle_bytes();
     drop(detached);
-    assert!(pool.aligned_stats() != idle, "the copy is pooled storage");
+    assert!(pool.disk_idle_bytes() > idle, "the copy is pooled storage");
     pump!(w);
     assert_eq!(free(&w), Some(2));
 }

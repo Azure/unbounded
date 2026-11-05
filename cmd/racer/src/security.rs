@@ -4533,13 +4533,13 @@ mod tests {
             assert!(decrypted.iter().all(|byte| *byte == *index as u8 + 1));
         }
         for (_, pool, _) in &holders {
-            assert_eq!(pool.aligned_stats().idle_buffers, 0);
+            assert_eq!(pool.disk_idle_bytes(), 0);
         }
         drop(results);
         for (admission, pool, _) in &holders {
             // Each page returned to the pool of the worker that requested it,
             // and idle storage keeps no Ciphertext admission.
-            assert_eq!(pool.aligned_stats().idle_buffers, 1);
+            assert!(pool.disk_idle_bytes() > 0);
             assert_eq!(admission.used(ResourceClass::Ciphertext), 0);
         }
     }

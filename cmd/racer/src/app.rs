@@ -2174,10 +2174,10 @@ impl WorkerApplication {
         )
     }
 
-    /// Demand counters of this worker's aligned ciphertext pool.
+    /// Idle and trimming counters of this worker's buffer pool.
     #[cfg(test)]
-    pub(crate) fn aligned_pool_stats(&self) -> page_alloc::PoolStats {
-        self.memory.buffers().aligned_pool_stats()
+    pub(crate) fn buffer_pool_stats(&self) -> page_alloc::PoolStats {
+        self.memory.buffers().pool_stats()
     }
 
     /// Schedule placement progress or back off pinned capacity with a bounded warning rate.

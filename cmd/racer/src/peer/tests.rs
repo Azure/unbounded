@@ -1260,11 +1260,10 @@ mod encrypted_http {
                         prefix_sent.set(true);
                         // Do not let cancellation race ahead of receive admission:
                         // the partial exchange must own a full aligned ciphertext
-                        // allocation, charged for its whole pooled size class.
+                        // allocation, charged for its whole granule-rounded capacity.
                         futures::future::poll_fn(|_| {
                             if admissions[0].used(ResourceClass::Ciphertext)
-                                == page_alloc::buffer_capacity((length + 16).next_multiple_of(4096))
-                                    .unwrap()
+                                == (length + 16).next_multiple_of(page_alloc::buf::GRANULE)
                             {
                                 Poll::Ready(())
                             } else {
