@@ -981,7 +981,11 @@ impl<'s> Model<'s> {
                             None => "x".into(),
                         };
                         let kind = match reply {
-                            Reply::Answer { kind, .. } => format!("{kind:?}"),
+                            Reply::Answer { kind, signed: true } => format!("{kind:?}"),
+                            Reply::Answer {
+                                kind,
+                                signed: false,
+                            } => format!("relay{kind:?}"),
                             other => format!("{other:?}"),
                         };
                         let ms = (now - sent) / (250 * MILLIS) * 250;
@@ -2456,6 +2460,14 @@ impl<'s> Model<'s> {
                 Acq::Origin { id, .. } => {
                     self.report.counters.origin_requests += 1;
                     *self.report.origin_per_page.entry(page).or_default() += 1;
+                    if self.diag {
+                        // Which owner asked origin, after what walk.
+                        let owners = self.latest_owners(page);
+                        let rank = owners.iter().position(|o| *o == node);
+                        let walk = self.walks.get(&(node, worker, read)).cloned();
+                        let key = format!("origin:rank{rank:?}:{}", walk.unwrap_or_default());
+                        *self.report.attempt_errors.entry(key).or_default() += 1;
+                    }
                     let (at, outcome) = self.origin.request(
                         now,
                         page.object,
