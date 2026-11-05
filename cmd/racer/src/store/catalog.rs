@@ -15,7 +15,6 @@ use page_alloc::Extent;
 use page_alloc::Generation;
 use page_alloc::SegmentId;
 use page_alloc::Segments;
-use racer_control_wire::CacheId;
 use racer_control_wire::KeyId;
 use std::cell::Cell;
 use std::cell::RefCell;
@@ -65,10 +64,10 @@ pub struct Index {
 }
 /// Production mappings use randomized hashing, as did the original catalog.
 #[cfg(not(test))]
-type Pages = page_alloc::index::PageIndex<PageId, IndexedPage, std::hash::RandomState, CacheId>;
+type Pages = page_alloc::index::PageIndex<PageId, IndexedPage, std::hash::RandomState>;
 /// Simulation keeps its deterministic hash state across the extraction boundary.
 #[cfg(test)]
-type Pages = page_alloc::index::PageIndex<PageId, IndexedPage, crate::runtime::HashState, CacheId>;
+type Pages = page_alloc::index::PageIndex<PageId, IndexedPage, crate::runtime::HashState>;
 
 #[derive(Default)]
 struct State {
@@ -802,77 +801,22 @@ impl Index {
             payload: None,
         })
     }
-    /// Pick one victim with bounded work and separate cursors. Publication
-    /// ordering is never changed by retention, so checkpoint traversal remains
-    /// monotonic.
-    ///
-    /// Over-share caches are scanned first through their own per-cache order,
-    /// so a full window of under-share pages cannot hide them. Candidates are
-    /// the over-share caches among the 64 with the highest pressure, and the
-    /// 64-page budget is split across them, at least one page each. Only when
-    /// that finds no unheld page does the global window rank all caches.
-    /// Work is at most 64 caches and 128 pages, independent of cache count,
-    /// except for one rebuild of the pressure order after a catalog change.
-    fn victim(&self, state: &State) -> Option<PageId> {
-        const BUDGET: usize = 64;
-        let retention = self.retention();
-        let scoring = retention.scoring_at(self.clock.now(), self.disk_capacity());
-        let eligible =
-            |page: &PageId, _: &IndexedPage| (!self.is_held(page)).then(|| scoring.rank(page));
-        let over = scoring.over_share_candidates(BUDGET);
-        if !over.is_empty() {
-            let per_cache = (BUDGET / over.len()).max(1);
-            if let Some(victim) = state.pages.victim_in_groups(&over, per_cache, eligible) {
-                return Some(victim);
-            }
-        }
-        // Over-share pages go first, then lower score; the index breaks ties by age.
-        state.pages.victim_if(BUDGET, eligible)
-    }
-    /// Reserve one potential new mapping, optionally evicting a low-value mapping.
-    /// Replacement writes also reserve: concurrent invalidation may remove the old
-    /// mapping while the SQE is in flight. No segment bytes are recycled here.
-    pub fn reserve_page(self: &Rc<Self>, evict: bool) -> Result<PageTicket> {
-        self.reserve_page_inner(None, evict)
-    }
-
-    pub(super) fn reserve_page_for(
-        self: &Rc<Self>,
-        page: &PageId,
-        evict: bool,
-    ) -> Result<PageTicket> {
-        self.reserve_page_inner(Some(page), evict)
-    }
-
-    fn reserve_page_inner(
-        self: &Rc<Self>,
-        page: Option<&PageId>,
-        evict: bool,
-    ) -> Result<PageTicket> {
-        let held = page.filter(|page| self.hold_available(page));
-        let mut state = self.state.borrow_mut();
+    /// Reserve one potential new mapping for `page`. A full index returns
+    /// `Overloaded`; the caller frees entries with
+    /// [`SegmentClock::reclaim_entries`], which evicts whole segments by score,
+    /// so over-share caches lose space first. Replacement writes also reserve:
+    /// concurrent invalidation may remove the old mapping while the SQE is in
+    /// flight.
+    pub(super) fn reserve_page_for(self: &Rc<Self>, page: &PageId) -> Result<PageTicket> {
+        let held = self.hold_available(page).then_some(page);
+        let state = self.state.borrow();
         if state.pages.len() + self.reserved.get() + self.hold_unused()
             - usize::from(held.is_some())
             >= self.page_capacity.get()
         {
-            if !evict {
-                return Err(Error::Overloaded);
-            }
-            let victim = self.victim(&state).ok_or(Error::Overloaded)?;
-            self.retention().evicted(
-                &victim,
-                u64::from(
-                    state
-                        .pages
-                        .get(&victim)
-                        .expect("victim mapping")
-                        .metadata
-                        .page_length(&victim)?,
-                ),
-                false,
-            );
-            Self::remove_page(&mut state, &victim);
+            return Err(Error::Overloaded);
         }
+        drop(state);
         self.reserved.set(self.reserved.get() + 1);
         let hold = held.map(|page| {
             let inflight = self.holds.borrow().entries[&page.version].inflight.clone();
@@ -922,10 +866,9 @@ impl Index {
             .or_insert((entry.metadata.clone(), 0));
         version.1 += 1;
         let segment = entry.location.segment;
-        let cache = page.version.object.cache.clone();
         state
             .pages
-            .insert_in(page, entry, segment, cache)
+            .insert(page, entry, segment)
             .expect("preflighted publication age");
         state.residents.insert(resident.page.clone(), resident);
         Ok(())
@@ -1335,6 +1278,7 @@ pub struct SegmentClock {
     index: Rc<Index>,
     free_reserve: usize,
     budget: ReclaimBudget,
+    segments: Rc<Segments>,
     clock: page_alloc::SegmentClock,
 }
 
@@ -1402,7 +1346,8 @@ impl SegmentClock {
             index,
             free_reserve,
             budget,
-            clock: page_alloc::SegmentClock::new(segments),
+            clock: page_alloc::SegmentClock::new(segments.clone()),
+            segments,
         }
     }
     /// Rank at most 64 slots before eviction. Busy segments remain Evicting until
@@ -1412,12 +1357,33 @@ impl SegmentClock {
     }
     /// [`Self::reclaim_now`] with retention heat evaluated at an explicit time.
     pub fn reclaim_at(&self, now: std::time::Instant) -> Result<()> {
+        self.reclaim_to(now, self.free_reserve)
+    }
+    /// Free index entries when the index is full: evict at least one more
+    /// segment than is free or evicting now, chosen by the same score as
+    /// space reclaim (lowest value first, over-share caches first).
+    /// When nothing sealed can be evicted, the open tail is sealed and
+    /// reclaimed instead (its unused bytes are recycled with it).
+    pub fn reclaim_entries(&self) -> Result<()> {
+        let before = self.index.state.borrow().pages.len();
+        let result = self.reclaim_one();
+        if self.index.state.borrow().pages.len() < before || !self.segments.seal_open() {
+            return result;
+        }
+        self.reclaim_one()
+    }
+    fn reclaim_one(&self) -> Result<()> {
+        let segments = &self.segments;
+        let target = segments.free_count() + segments.evicting_count() + 1;
+        self.reclaim_to(self.index.clock.now(), target.max(self.free_reserve))
+    }
+    fn reclaim_to(&self, now: std::time::Instant, free_reserve: usize) -> Result<()> {
         let retention = self.index.retention();
         let scoring = retention.scoring_at(now, self.index.disk_capacity());
         self.clock
             .reclaim_scored(
                 &*self.index,
-                self.free_reserve,
+                free_reserve,
                 self.budget.segment_visits,
                 self.budget.mapping_removals,
                 |segment| self.index.segment_score_with(segment, &scoring),
@@ -1495,7 +1461,7 @@ mod tests {
         )
     }
     #[test]
-    fn reclaim_and_index_victim_prepare_one_scoring_pass() {
+    fn reclaim_prepares_one_scoring_pass() {
         let index = Rc::new(index(8));
         index.set_page_capacity(4).unwrap();
         let segments = Rc::new(segments(1024, 2));
@@ -1514,11 +1480,9 @@ mod tests {
                 Rc::new(|_| true)
             }
         }));
-        assert!(index.victim(&index.state.borrow()).is_some());
-        assert_eq!(calls.get(), 1);
         let clock = SegmentClock::new(index.clone(), segments, 1);
         clock.reclaim_now().unwrap();
-        assert_eq!(calls.get(), 2);
+        assert_eq!(calls.get(), 1);
         assert_eq!(index.snapshot().unwrap().entries.len(), 2);
     }
     fn descriptor(etag: &str, length: u64) -> VersionMetadata {
@@ -1551,6 +1515,10 @@ mod tests {
             },
         )
     }
+    /// An unheld page for capacity probes.
+    fn probe() -> PageId {
+        indexed(descriptor("probe", 17), 0).0
+    }
     #[test]
     fn hard_hold_capacity_dedup_extension_release_and_eviction() {
         use page_alloc::SegmentEntries;
@@ -1570,7 +1538,10 @@ mod tests {
         assert_eq!(index.hold_expiry(&page.version), Some(until));
         assert!(!index.can_evict(SegmentId(0)));
         assert_eq!(index.remove_bounded(SegmentId(0), 1), 0);
-        assert!(index.victim(&index.state.borrow()).is_none());
+        assert!(!page_alloc::SegmentEntries::can_evict(
+            &*index,
+            SegmentId(0)
+        ));
         let other = descriptor("other", 17).version;
         assert_eq!(index.reserve_hold(&other, 2, until), Err(Error::Overloaded));
         index.release_hold(&page.version).unwrap();
@@ -1638,7 +1609,10 @@ mod tests {
         assert!(index.is_held(&at(0)));
         assert!(index.is_held(&at(2)));
         assert_eq!(index.hold_holders(&at(0)), 1);
-        assert!(index.victim(&index.state.borrow()).is_none());
+        assert!(!page_alloc::SegmentEntries::can_evict(
+            &*index,
+            SegmentId(0)
+        ));
         // Releasing the last holder makes the published page evictable and
         // returns its capacity; unknown pages are ignored.
         index.release_hold_pages(&version, &page_set(&[0, 1, 9]), epoch);
@@ -1646,7 +1620,7 @@ mod tests {
         assert!(!index.is_held(&at(1)));
         assert_eq!(index.held_page_expiry(&at(0)), None);
         assert_eq!(index.hold_holders(&at(0)), 0);
-        assert_eq!(index.victim(&index.state.borrow()), Some(page.clone()));
+        assert!(page_alloc::SegmentEntries::can_evict(&*index, SegmentId(0)));
         assert!(index.is_held(&at(2)));
         index.reserve_hold(&other, 2, until).unwrap();
         // The last page leaving removes the whole hold.
@@ -1690,12 +1664,15 @@ mod tests {
         assert_eq!(index.hold_holders(&page), 1);
         assert!(index.is_held(&page));
         assert_eq!(index.held_page_expiry(&page), Some(until));
-        assert!(index.victim(&index.state.borrow()).is_none());
+        assert!(!page_alloc::SegmentEntries::can_evict(
+            &*index,
+            SegmentId(0)
+        ));
         // The replacement's own release still works.
         index.release_hold_pages(&version, &page_set(&[0]), replacement);
         assert!(!index.is_held(&page));
         assert_eq!(index.hold_expiry(&version), None);
-        assert_eq!(index.victim(&index.state.borrow()), Some(page.clone()));
+        assert!(page_alloc::SegmentEntries::can_evict(&*index, SegmentId(0)));
     }
 
     #[test]
@@ -1826,11 +1803,14 @@ mod tests {
         assert_eq!(index.hold_unused(), 1, "the missing member keeps its slot");
         assert!(page_alloc::SegmentEntries::can_evict(&*index, SegmentId(0)));
         // Capacity 2 holds the cached page plus the reserved member slot.
-        assert!(matches!(index.reserve_page(false), Err(Error::Overloaded)));
+        assert!(matches!(
+            index.reserve_page_for(&probe()),
+            Err(Error::Overloaded)
+        ));
         let (_, mut entry) = indexed(descriptor("primary", 2 * crate::model::PAGE_BYTES), 1);
         drop(segments.append(1024).unwrap());
         entry.location.extent = Extent::new(1024, 512).unwrap();
-        let ticket = index.reserve_page_for(&primary, false).unwrap();
+        let ticket = index.reserve_page_for(&primary).unwrap();
         ticket.publish(primary.clone(), entry).unwrap();
         assert_eq!(index.held_page_expiry(&primary), Some(until));
         assert_eq!(index.held_page_expiry(&cached), None);
@@ -1860,7 +1840,7 @@ mod tests {
             .reserve_hold_pages(&version, &page_set(&[0, 1]), until)
             .unwrap();
         assert_eq!(index.hold_unused(), 2);
-        let writing = index.reserve_page_for(&at(0), false).unwrap();
+        let writing = index.reserve_page_for(&at(0)).unwrap();
         assert_eq!(index.hold_unused(), 1);
         index.release_hold_pages(&version, &page_set(&[0]), epoch);
         assert!(!index.is_held(&at(0)));
@@ -1868,11 +1848,14 @@ mod tests {
         assert_eq!(index.hold_epoch(&version), Some(epoch));
         // Ordinary writes cannot take page 1's slot.
         let ordinary = [
-            index.reserve_page(false).unwrap(),
-            index.reserve_page(false).unwrap(),
+            index.reserve_page_for(&probe()).unwrap(),
+            index.reserve_page_for(&probe()).unwrap(),
         ];
-        assert!(matches!(index.reserve_page(false), Err(Error::Overloaded)));
-        let held = index.reserve_page_for(&at(1), false).unwrap();
+        assert!(matches!(
+            index.reserve_page_for(&probe()),
+            Err(Error::Overloaded)
+        ));
+        let held = index.reserve_page_for(&at(1)).unwrap();
         assert_eq!(index.hold_unused(), 0);
         drop((held, ordinary));
         assert_eq!(index.hold_unused(), 1);
@@ -2019,7 +2002,7 @@ mod tests {
         let until = racer_io::Clock::host().wall_now() + std::time::Duration::from_secs(60);
         let (first, entry) = indexed(descriptor("first", 17), 0);
         index.reserve_hold(&first.version, 2, until).unwrap();
-        let pending = index.reserve_page_for(&first, false).unwrap();
+        let pending = index.reserve_page_for(&first).unwrap();
         assert_eq!(index.held_snapshot(), HeldSnapshot::default());
         drop(segments.append(1024).unwrap());
         pending.publish(first.clone(), entry).unwrap();
@@ -2143,14 +2126,17 @@ mod tests {
         index
             .reserve_hold(&version, 2, now + std::time::Duration::from_secs(60))
             .unwrap();
-        let a = index.reserve_page(false).unwrap();
-        let b = index.reserve_page(false).unwrap();
-        assert!(matches!(index.reserve_page(true), Err(Error::Overloaded)));
+        let a = index.reserve_page_for(&probe()).unwrap();
+        let b = index.reserve_page_for(&probe()).unwrap();
+        assert!(matches!(
+            index.reserve_page_for(&probe()),
+            Err(Error::Overloaded)
+        ));
         let page = PageId {
             version: version.clone(),
             number: crate::model::PageNumber(0),
         };
-        let held = index.reserve_page_for(&page, false).unwrap();
+        let held = index.reserve_page_for(&page).unwrap();
         assert_eq!(index.release_hold(&version), Err(Error::Overloaded));
         drop(held);
         drop((a, b));
@@ -2159,7 +2145,7 @@ mod tests {
         index
             .reserve_hold(&version, 1, now + std::time::Duration::from_secs(60))
             .unwrap();
-        let old_ticket = index.reserve_page_for(&page, false).unwrap();
+        let old_ticket = index.reserve_page_for(&page).unwrap();
         index.remove_cache(&version.object.cache);
         index
             .reserve_hold(&version, 1, now + std::time::Duration::from_secs(60))
@@ -2221,9 +2207,13 @@ mod tests {
         );
         assert_eq!(retention.snapshot().indexed_payload_bytes, 17);
         retention.set_ownership(Rc::new(|_| true));
-        drop(index.reserve_page(true).unwrap());
+        // A full index never evicts a single page; segment reclaim frees space.
+        assert!(matches!(
+            index.reserve_page_for(&other),
+            Err(Error::Overloaded)
+        ));
+        index.remove_if_matches(&page, &entry.location);
         assert_eq!(retention.snapshot().indexed_payload_bytes, 0);
-        assert_eq!(retention.snapshot().disk[1].index_evicted_payload_bytes, 17);
         index.publish(other.clone(), other_entry.clone()).unwrap();
         retention.set_ownership(Rc::new(|_| false));
         assert_eq!(index.remove_bounded(SegmentId(1), 1), 1);
@@ -2259,68 +2249,6 @@ mod tests {
             conflict.content_type = Some(crate::model::ContentType::parse(b"text/html").unwrap());
             assert_eq!(index.publish_version(conflict), Err(Error::CorruptRecord));
         }
-    }
-    #[test]
-    fn second_sight_index_owned_bias_is_soft_and_snapshot_order_is_unchanged() {
-        for hot_nonowned in [false, true] {
-            let index = Rc::new(index(4));
-            index.set_page_capacity(2).unwrap();
-            let (owned, first) = indexed(descriptor("owned", 17), 0);
-            let (other, second) = indexed(descriptor("other", 17), 1);
-            let owner = owned.clone();
-            let retention = index.retention();
-            retention.set_ownership(Rc::new(move |page| page == &owner));
-            index.publish(owned.clone(), first).unwrap();
-            index.publish(other.clone(), second).unwrap();
-            if hot_nonowned {
-                for _ in 0..3 {
-                    retention.touch(&other);
-                }
-            }
-            let before = index.snapshot_pages(0, 1);
-            let ticket = index.reserve_page(true).unwrap();
-            assert_eq!(index.lookup(&owned).unwrap().is_some(), !hot_nonowned);
-            assert_eq!(index.lookup(&other).unwrap().is_some(), hot_nonowned);
-            if hot_nonowned {
-                let after = index.snapshot_pages(before.0, 2);
-                assert_eq!(after.1.len(), 1);
-                assert_eq!(after.1[0].0, other);
-            }
-            drop(ticket);
-        }
-    }
-    #[test]
-    fn second_sight_index_candidate_cursor_is_bounded_and_ownership_is_current() {
-        let index = Rc::new(index(1));
-        index.set_page_capacity(65).unwrap();
-        let retention = index.retention();
-        let calls = Rc::new(Cell::new(0));
-        let counted = calls.clone();
-        let owned = Rc::new(Cell::new(true));
-        let current = owned.clone();
-        retention.set_ownership(Rc::new(move |_| {
-            counted.set(counted.get() + 1);
-            current.get()
-        }));
-        for i in 0..65 {
-            let (page, entry) = indexed(descriptor(&format!("v{i}"), 17), 0);
-            index.publish(page, entry).unwrap();
-        }
-        let ticket = index.reserve_page(true).unwrap();
-        assert_eq!(
-            calls.get(),
-            65,
-            "64 candidates plus one victim classification"
-        );
-        drop(ticket);
-        let (page, entry) = indexed(descriptor("new", 17), 0);
-        index.publish(page.clone(), entry).unwrap();
-        owned.set(false);
-        let ticket = index.reserve_page(true).unwrap();
-        assert_eq!(calls.get(), 130);
-        // Cursor progression and wrap are asserted in page_alloc::index tests.
-        assert_eq!(retention.score(&page), 0);
-        drop(ticket);
     }
     /// The simulator's payload-free `PhantomEntries` makes the same CLOCK
     /// eviction decisions as the catalog index when given the same scores.
@@ -2855,11 +2783,9 @@ mod priority_tests {
         index.publish(a0, entry).unwrap();
         assert_accounting(&index);
         assert_eq!(index.retention().cache_payload_bytes(&cache("a")), PAGE);
-        // Index eviction releases the victim's charge.
         publish(&index, "a", "1", 0);
-        drop(index.reserve_page(true).unwrap());
         assert_accounting(&index);
-        assert_eq!(index.state.borrow().pages.len(), 3);
+        assert_eq!(index.state.borrow().pages.len(), 4);
         // Segment removal releases charges too.
         index.remove_bounded(SegmentId(1), 8);
         assert_accounting(&index);
@@ -2891,259 +2817,6 @@ mod priority_tests {
         assert_eq!(s.pages.len(), 1);
         assert!(s.pages.keys().all(|p| p.version.object.cache == cache("b")));
         assert!(s.metadata.keys().all(|v| v.object.cache == cache("b")));
-    }
-
-    #[test]
-    fn index_victim_takes_over_share_cache_first_and_keeps_holds() {
-        // Capacity 4 pages: "a" (900) gets 3.6 pages, "b" (100) gets 0.4.
-        let index = index(4, &[("a", 900), ("b", 100)]);
-        let segments = segments(4);
-        let _clock = SegmentClock::new(index.clone(), segments.clone(), 1);
-        drop(segments.append(4 * PAGE as usize).unwrap());
-        let a = [publish(&index, "a", "0", 0), publish(&index, "a", "1", 0)];
-        let b = [publish(&index, "b", "0", 0), publish(&index, "b", "1", 0)];
-        // Make the over-share cache hotter: score alone would evict "a".
-        for page in &b {
-            for _ in 0..8 {
-                index.retention().touch(page);
-            }
-        }
-        let victim = index.victim(&index.state.borrow()).unwrap();
-        assert_eq!(victim.version.object.cache, cache("b"));
-        // Holds still veto eviction even for over-share pages.
-        let until = racer_io::Clock::host().wall_now() + std::time::Duration::from_secs(60);
-        for page in &b {
-            index.reserve_hold(&page.version, 1, until).unwrap();
-        }
-        let victim = index.victim(&index.state.borrow()).unwrap();
-        assert!(a.contains(&victim));
-        // Equal priorities: neither cache is over share, so score decides.
-        let even = self::index(4, &[("a", 500), ("b", 500)]);
-        publish(&even, "a", "0", 0);
-        let hot = publish(&even, "b", "0", 0);
-        for _ in 0..8 {
-            even.retention().touch(&hot);
-        }
-        let victim = even.victim(&even.state.borrow()).unwrap();
-        assert_eq!(victim.version.object.cache, cache("a"));
-    }
-
-    /// 64 older under-share pages fill the global window ahead of one newer
-    /// over-share page. The index holds 65 mappings.
-    fn window_hides_over_share(index: &Index) -> (Vec<PageId>, PageId) {
-        let a = (0..64)
-            .map(|n| publish(index, "a", &n.to_string(), 0))
-            .collect();
-        let z = publish(index, "z", "0", 0);
-        assert!(
-            index
-                .retention()
-                .over_share(&cache("z"), index.disk_capacity())
-        );
-        assert!(
-            !index
-                .retention()
-                .over_share(&cache("a"), index.disk_capacity())
-        );
-        (a, z)
-    }
-
-    #[test]
-    fn index_victim_finds_over_share_page_beyond_global_window() {
-        let index = index(65, &[("a", 1000), ("z", 0)]);
-        let (a, z) = window_hides_over_share(&index);
-        // Make every under-share page cold and the over-share page hot.
-        for _ in 0..8 {
-            index.retention().touch(&z);
-        }
-        assert_eq!(index.victim(&index.state.borrow()), Some(z));
-        drop(index.reserve_page(true).unwrap());
-        assert_accounting(&index);
-        assert_eq!(index.retention().cache_payload_bytes(&cache("z")), 0);
-        assert_eq!(
-            index.retention().cache_payload_bytes(&cache("a")),
-            64 * PAGE
-        );
-        // Nothing is over share any more: the global window decides.
-        let victim = index.victim(&index.state.borrow()).unwrap();
-        assert!(a.contains(&victim));
-    }
-
-    #[test]
-    fn index_victim_work_is_bounded_with_many_resident_caches() {
-        const PHANTOMS: usize = 3000;
-        let index = Rc::new(Index::new(
-            WorkerId(0),
-            64,
-            crate::test_support::availability_for(vec![cache("a"), cache("z")]),
-            racer_io::Clock::host(),
-        ));
-        index.set_page_capacity(84).unwrap();
-        let segments = segments(50);
-        let _clock = SegmentClock::new(index.clone(), segments.clone(), 1);
-        drop(segments.append(4 * PAGE as usize).unwrap());
-        // Many resident caches without index pages, each with weight 1, so
-        // "a" stays under share. Every tenth one is over share.
-        let mut definitions = vec![definition("a", 60000), definition("z", 0)];
-        let phantom = |n: usize| CacheId(format!("phantom-{n}"));
-        definitions.extend((0..PHANTOMS).map(|n| CacheDefinition {
-            id: phantom(n),
-            ..definition("a", 1)
-        }));
-        let table = crate::priority::Weights::default();
-        table.update(&definitions);
-        let retention = index.retention();
-        retention.set_weights(table.clone());
-        let phantoms: Vec<_> = (0..PHANTOMS)
-            .map(|n| {
-                let bytes = if n % 10 == 0 { PAGE } else { 1 };
-                retention.indexed_payload(&phantom(n), bytes)
-            })
-            .collect();
-        let calls = Rc::new(Cell::new(0u64));
-        let counted = calls.clone();
-        retention.set_ownership(Rc::new(move |_| {
-            counted.set(counted.get() + 1);
-            false
-        }));
-        for n in 0..64 {
-            publish(&index, "a", &n.to_string(), 0);
-        }
-        let z: Vec<_> = (0..20)
-            .map(|n| publish(&index, "z", &n.to_string(), 0))
-            .collect();
-        let capacity = index.disk_capacity();
-        assert!(!retention.over_share(&cache("a"), capacity));
-        assert!(retention.over_share(&cache("z"), capacity));
-        // Repeated decisions: the 64-page global window holds only "a".
-        let (rebuilds, _) = retention.pressure_counters();
-        for n in 0..10 {
-            let (_, visits) = retention.pressure_counters();
-            calls.set(0);
-            let before = retention.cache_payload_bytes(&cache("z"));
-            drop(index.reserve_page(true).unwrap());
-            assert_eq!(
-                retention.cache_payload_bytes(&cache("z")),
-                before - PAGE,
-                "decision {n}"
-            );
-            // Refill with an under-share page so the next decision evicts.
-            publish(&index, "a", &format!("new{n}"), 0);
-            assert!(calls.get() <= 2 * 128, "decision {n}: {}", calls.get());
-            assert!(retention.pressure_counters().1 - visits <= 2 * 64);
-        }
-        // Only the first decision builds the order.
-        assert_eq!(retention.pressure_counters().0, rebuilds + 1);
-        // Held over-share pages fall back to the global window, still bounded.
-        let until = racer_io::Clock::host().wall_now() + std::time::Duration::from_secs(60);
-        let live: Vec<_> = z
-            .iter()
-            .filter(|page| index.state.borrow().pages.contains_key(page))
-            .cloned()
-            .collect();
-        assert_eq!(live.len(), 10);
-        for page in &live {
-            index.reserve_hold(&page.version, 1, until).unwrap();
-        }
-        calls.set(0);
-        let victim = index.victim(&index.state.borrow()).unwrap();
-        assert_eq!(victim.version.object.cache, cache("a"));
-        assert!(calls.get() <= 128);
-        // A catalog update rebuilds the order once.
-        definitions[0].priority = 59999;
-        table.update(&definitions);
-        index.victim(&index.state.borrow());
-        index.victim(&index.state.borrow());
-        assert_eq!(retention.pressure_counters().0, rebuilds + 2);
-        drop(phantoms);
-        assert_accounting(&index);
-    }
-
-    #[test]
-    fn index_victim_beyond_window_falls_back_when_over_share_is_held() {
-        let index = index(65, &[("a", 1000), ("z", 0)]);
-        let segments = segments(17);
-        let _clock = SegmentClock::new(index.clone(), segments.clone(), 1);
-        drop(segments.append(4 * PAGE as usize).unwrap());
-        let (a, z) = window_hides_over_share(&index);
-        let until = racer_io::Clock::host().wall_now() + std::time::Duration::from_secs(60);
-        index.reserve_hold(&z.version, 1, until).unwrap();
-        // A held over-share page is never taken; an under-share page is.
-        let victim = index.victim(&index.state.borrow()).unwrap();
-        assert!(a.contains(&victim));
-        assert_ne!(victim, z);
-    }
-
-    #[test]
-    fn index_victim_beyond_window_takes_unavailable_over_share_cache() {
-        let index = index(65, &[("a", 1000), ("z", 0)]);
-        let (_, z) = window_hides_over_share(&index);
-        // "z" leaves the publication: its pages stay indexed but unreadable.
-        let mut index = Rc::into_inner(index).unwrap();
-        index.availability = crate::test_support::availability_for(vec![cache("a")]);
-        assert!(index.lookup(&z).unwrap().is_none());
-        assert_eq!(index.victim(&index.state.borrow()), Some(z));
-    }
-
-    #[test]
-    fn index_victim_beyond_window_follows_live_reweight() {
-        let index = index(65, &[("a", 1000), ("z", 0)]);
-        let (a, z) = window_hides_over_share(&index);
-        assert_eq!(index.victim(&index.state.borrow()), Some(z.clone()));
-        // Reweight without republishing: "a" is now over share and "z" is not.
-        let weights = index.retention().weights();
-        weights.update(&[definition("a", 0), definition("z", 1000)]);
-        let victim = index.victim(&index.state.borrow()).unwrap();
-        assert!(a.contains(&victim));
-        // Restore: the next decision sees the old weights again.
-        weights.update(&[definition("a", 1000), definition("z", 0)]);
-        assert_eq!(index.victim(&index.state.borrow()), Some(z));
-    }
-
-    #[test]
-    fn index_victim_splits_budget_across_over_share_caches() {
-        // A 16-page disk with 110 mappings: both caches are over share.
-        let index = index(200, &[("a", 500), ("b", 500)]);
-        let segments = segments(4);
-        let _clock = SegmentClock::new(index.clone(), segments.clone(), 1);
-        let a: Vec<_> = (0..100)
-            .map(|n| publish(&index, "a", &n.to_string(), 0))
-            .collect();
-        let b: Vec<_> = (0..10)
-            .map(|n| publish(&index, "b", &n.to_string(), 0))
-            .collect();
-        let capacity = index.disk_capacity();
-        assert_eq!(capacity, 16 * PAGE);
-        assert!(index.retention().over_share(&cache("a"), capacity));
-        assert!(index.retention().over_share(&cache("b"), capacity));
-        // The global window holds only hot "a" pages; "b" is cold.
-        for page in &a {
-            for _ in 0..8 {
-                index.retention().touch(page);
-            }
-        }
-        assert_eq!(index.victim(&index.state.borrow()), Some(b[0].clone()));
-    }
-
-    #[test]
-    fn priority_zero_keeps_idle_space_but_goes_first_under_pressure() {
-        let index = index(4, &[("a", 1000), ("z", 0)]);
-        for n in 0..3 {
-            publish(&index, "z", &n.to_string(), 0);
-        }
-        // Idle capacity: priority 0 data is still cached.
-        assert_eq!(index.retention().cache_payload_bytes(&cache("z")), 3 * PAGE);
-        let hot = publish(&index, "a", "0", 0);
-        for _ in 0..8 {
-            index.retention().touch(&hot);
-        }
-        for n in 1..4 {
-            drop(index.reserve_page(true).unwrap());
-            publish(&index, "a", &n.to_string(), 0);
-            assert_accounting(&index);
-        }
-        assert_eq!(index.retention().cache_payload_bytes(&cache("z")), 0);
-        assert_eq!(index.retention().cache_payload_bytes(&cache("a")), 4 * PAGE);
     }
 
     #[test]
@@ -3201,13 +2874,52 @@ mod priority_tests {
         assert!(!retention.over_share(&cache("b"), capacity));
     }
 
-    /// Deterministic churn: both caches insert one new page per round into a
-    /// full index. Returns resident pages of ("a", "b") after `rounds`.
-    fn churn(index: &Rc<Index>, rounds: usize, start: usize) -> (u64, u64) {
+    /// Publish four `name` pages into one fresh full segment, freeing index
+    /// entries first by segment reclaim, as the store does when the index is
+    /// full. Returns the pages.
+    fn fill_segment(
+        index: &Rc<Index>,
+        clock: &SegmentClock,
+        segments: &Segments,
+        name: &str,
+        round: usize,
+    ) -> Vec<PageId> {
+        for _ in 0..8 {
+            if index.page_capacity() - index.state.borrow().pages.len() >= 4 {
+                break;
+            }
+            let _ = clock.reclaim_entries();
+        }
+        let (id, generation) = (0..8)
+            .find_map(|_| match segments.append(4 * PAGE as usize) {
+                Ok((lease, _)) => Some((lease.id(), lease.generation())),
+                Err(_) => {
+                    let _ = clock.reclaim_now();
+                    None
+                }
+            })
+            .expect("segment space");
+        (0..4)
+            .map(|n| {
+                let (page, mut entry) = page(name, &format!("{round}-{n}"), id.0);
+                entry.location.generation = generation;
+                index
+                    .reserve_page_for(&page)
+                    .unwrap()
+                    .publish(page.clone(), entry)
+                    .unwrap();
+                page
+            })
+            .collect()
+    }
+
+    /// Deterministic churn: both caches insert one full segment per round
+    /// into a full index. Returns resident pages of ("a", "b") after `rounds`.
+    fn churn(index: &Rc<Index>, clock: &SegmentClock, rounds: usize, start: usize) -> (u64, u64) {
+        let segments = clock.segments.clone();
         for round in start..start + rounds {
             for name in ["a", "b"] {
-                drop(index.reserve_page(true).unwrap());
-                publish(index, name, &format!("{round}"), 0);
+                fill_segment(index, clock, &segments, name, round);
             }
             assert_accounting(index);
         }
@@ -3219,9 +2931,127 @@ mod priority_tests {
     }
 
     #[test]
+    fn index_full_reclaims_over_share_segment_first_and_keeps_holds() {
+        // 8 index pages, 4 per segment: "a" (900) is under share, "b" over.
+        let index = index(8, &[("a", 900), ("b", 100)]);
+        let clock = SegmentClock::new(index.clone(), segments(8), 1);
+        let segments = clock.segments.clone();
+        let b = fill_segment(&index, &clock, &segments, "b", 0);
+        let a = fill_segment(&index, &clock, &segments, "a", 0);
+        // Make the over-share cache hotter: heat alone would evict "a".
+        for page in &b {
+            for _ in 0..8 {
+                index.retention().touch(page);
+            }
+        }
+        assert!(matches!(
+            index.reserve_page_for(&page("a", "probe", 0).0),
+            Err(Error::Overloaded)
+        ));
+        clock.reclaim_entries().unwrap();
+        assert!(b.iter().all(|page| index.lookup(page).unwrap().is_none()));
+        assert!(a.iter().all(|page| index.lookup(page).unwrap().is_some()));
+        assert_accounting(&index);
+        // A held over-share segment is kept; the under-share one goes instead.
+        let b = fill_segment(&index, &clock, &segments, "b", 1);
+        let until = racer_io::Clock::host().wall_now() + std::time::Duration::from_secs(60);
+        index.reserve_hold(&b[0].version, 1, until).unwrap();
+        clock.reclaim_entries().unwrap();
+        assert!(index.lookup(&b[0]).unwrap().is_some());
+        assert!(a.iter().all(|page| index.lookup(page).unwrap().is_none()));
+        assert_accounting(&index);
+    }
+
+    #[test]
+    fn index_full_reclaim_work_is_bounded_with_many_resident_caches() {
+        const PHANTOMS: usize = 3000;
+        let index = index(32, &[("a", 1), ("z", 1)]);
+        let clock = SegmentClock::new(index.clone(), segments(16), 1);
+        let segments = clock.segments.clone();
+        // Many resident caches without index pages, each with weight 1, so
+        // "a" stays under share. Every tenth one is over share.
+        let mut definitions = vec![definition("a", 60000), definition("z", 0)];
+        let phantom = |n: usize| CacheId(format!("phantom-{n}"));
+        definitions.extend((0..PHANTOMS).map(|n| CacheDefinition {
+            id: phantom(n),
+            ..definition("a", 1)
+        }));
+        let table = crate::priority::Weights::default();
+        table.update(&definitions);
+        let retention = index.retention();
+        retention.set_weights(table);
+        let _phantoms: Vec<_> = (0..PHANTOMS)
+            .map(|n| retention.indexed_payload(&phantom(n), if n % 10 == 0 { PAGE } else { 1 }))
+            .collect();
+        let z = fill_segment(&index, &clock, &segments, "z", 0);
+        let a: Vec<_> = (0..7)
+            .flat_map(|round| fill_segment(&index, &clock, &segments, "a", round))
+            .collect();
+        let (rebuilds, visits) = retention.pressure_counters();
+        clock.reclaim_entries().unwrap();
+        let (after_rebuilds, after_visits) = retention.pressure_counters();
+        // One scoring pass: at most one pressure-order rebuild and a constant
+        // number of candidates, independent of the number of caches.
+        assert!(
+            after_rebuilds - rebuilds <= 1,
+            "{rebuilds} -> {after_rebuilds}"
+        );
+        assert!(after_visits - visits <= 2, "{visits} -> {after_visits}");
+        assert!(z.iter().all(|page| index.lookup(page).unwrap().is_none()));
+        assert!(a.iter().all(|page| index.lookup(page).unwrap().is_some()));
+    }
+
+    #[test]
+    fn index_full_reclaim_follows_live_reweight() {
+        let index = index(8, &[("a", 900), ("b", 100)]);
+        let clock = SegmentClock::new(index.clone(), segments(4), 1);
+        let segments = clock.segments.clone();
+        let a = fill_segment(&index, &clock, &segments, "a", 0);
+        let b = fill_segment(&index, &clock, &segments, "b", 0);
+        index
+            .retention()
+            .weights()
+            .update(&[definition("a", 100), definition("b", 900)]);
+        clock.reclaim_entries().unwrap();
+        assert!(a.iter().all(|page| index.lookup(page).unwrap().is_none()));
+        assert!(b.iter().all(|page| index.lookup(page).unwrap().is_some()));
+    }
+
+    #[test]
+    fn priority_zero_keeps_idle_space_but_goes_first_under_pressure() {
+        let index = index(16, &[("a", 1000), ("z", 0)]);
+        let clock = SegmentClock::new(index.clone(), segments(8), 1);
+        let segments = clock.segments.clone();
+        for round in 0..3 {
+            fill_segment(&index, &clock, &segments, "z", round);
+        }
+        // Idle capacity: priority 0 data is still cached.
+        assert_eq!(
+            index.retention().cache_payload_bytes(&cache("z")),
+            12 * PAGE
+        );
+        for page in fill_segment(&index, &clock, &segments, "a", 0) {
+            for _ in 0..8 {
+                index.retention().touch(&page);
+            }
+        }
+        for round in 1..4 {
+            fill_segment(&index, &clock, &segments, "a", round);
+            assert_accounting(&index);
+        }
+        assert_eq!(index.retention().cache_payload_bytes(&cache("z")), 0);
+        assert_eq!(
+            index.retention().cache_payload_bytes(&cache("a")),
+            16 * PAGE
+        );
+    }
+
+    #[test]
     fn simulated_churn_converges_to_priority_ratio_and_follows_live_change() {
+        let clock = |index: &Rc<Index>| SegmentClock::new(index.clone(), segments(32), 1);
         let index = index(100, &[("a", 900), ("b", 100)]);
-        let (a, b) = churn(&index, 500, 0);
+        let eviction = clock(&index);
+        let (a, b) = churn(&index, &eviction, 100, 0);
         assert_eq!(a + b, 100);
         assert!((6 * b..=14 * b).contains(&a), "{a}:{b}");
         // Live change: the ratio moves toward the new weights without restart.
@@ -3229,10 +3059,11 @@ mod priority_tests {
             .retention()
             .weights()
             .update(&[definition("a", 100), definition("b", 900)]);
-        let (a, b) = churn(&index, 500, 500);
+        let (a, b) = churn(&index, &eviction, 100, 100);
         assert!((6 * a..=14 * a).contains(&b), "{a}:{b}");
         let even = self::index(100, &[("a", 500), ("b", 500)]);
-        let (a, b) = churn(&even, 500, 0);
-        assert!(a.abs_diff(b) <= 4, "{a}:{b}");
+        let eviction = clock(&even);
+        let (a, b) = churn(&even, &eviction, 100, 0);
+        assert!(a.abs_diff(b) <= 8, "{a}:{b}");
     }
 }

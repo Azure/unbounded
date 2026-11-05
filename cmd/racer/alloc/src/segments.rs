@@ -389,6 +389,17 @@ impl Segments {
         Ok((lease, extent))
     }
 
+    /// Seal the open segment, if any, so reclaim may evict it. Used when
+    /// every reclaimable record lives in the open tail. Returns whether a
+    /// segment was sealed.
+    pub fn seal_open(&self) -> bool {
+        let Some(position) = self.open.take() else {
+            return false;
+        };
+        self.slots.borrow_mut()[position].image.state = SegmentState::Sealed;
+        true
+    }
+
     /// Capture a checked prefix and increment its counter before publishing a lease.
     fn take_lease(&self, slot: &Slot, used_bytes: u64) -> Result<SegmentLease> {
         let start = slot
@@ -651,7 +662,7 @@ impl Segments {
     }
 
     /// Number of slots in eviction, waiting for leases to drain.
-    pub(crate) fn evicting_count(&self) -> usize {
+    pub fn evicting_count(&self) -> usize {
         self.evicting.get()
     }
 

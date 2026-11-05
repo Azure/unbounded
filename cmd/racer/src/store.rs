@@ -1368,9 +1368,15 @@ impl StoreWriter {
             return Ok(());
         }
         // Capacity is owned across the await, including invalidation/replacement.
-        let index_ticket = self
-            .index
-            .reserve_page_for(id, self.clock.borrow().is_some())?;
+        let index_ticket = match self.index.reserve_page_for(id) {
+            Err(Error::Overloaded) if self.clock.borrow().is_some() => {
+                let clock = self.clock.borrow().clone().expect("checked clock");
+                // Index full: evict a whole low-value segment, then retry.
+                let _ = clock.reclaim_entries();
+                self.index.reserve_page_for(id)?
+            }
+            ticket => ticket?,
+        };
         let alignment = self.slabs.alignment()?;
         let disk_bytes = record_length(page, alignment)?;
         let (staging, dirty, ticket) = {
