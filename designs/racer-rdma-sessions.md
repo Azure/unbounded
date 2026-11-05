@@ -111,6 +111,48 @@ Dropping an open or setup attempt clears only its own reservation and breaks
 only its own epoch, including when the owner completed an open that the
 caller never read. An old guard cannot remove a newer setup attempt.
 
+## Peer wire v2: certificate chains per session
+
+Link setup and every per-page control head ride the peer wire profile
+`racer-peer-v2` (envelope `racer-peer-version: 2`). The profile has no
+compatibility with v1.
+
+- Every signed head, both proofs and outer session frames, names its
+  signer's chain by a signed 32-byte fingerprint in `racer-certificate`.
+  The fingerprint is a SHA-256 of the length-prefixed chain bytes.
+- The session handshake heads carry the full chain in
+  `racer-certificates`. Each side seeds the new session with the peer's
+  chain.
+- Each session keeps a chain cache, keyed by fingerprint, of every chain the
+  peer has sent. It never evicts entries while the session lives, and it
+  holds at most 512 chains. A repeated chain or a cache overflow is a
+  protocol error. Decoding a message resolves each proof's fingerprint from
+  the carrying session while the connection is held. A miss is a protocol
+  error. A retained request binding keeps its resolved chain so it can be
+  verified again later.
+- The sender keeps a sent-set of fingerprints per session. A chain the peer
+  has not yet seen, for the outer signer or any proof signer (original or
+  hop), rides once in a signed `racer-chains` field on the outer head. A
+  relay therefore forwards the chains of signers that are new to its
+  outbound session.
+- A chain counts as sent once the head is signed for sending, as the
+  sequence number does. A send that fails after signing leaves the
+  connection unusable, so it is never reused. A session that could overflow
+  either chain set on its next message fails its reuse check and the sender
+  reconnects.
+- Limits:
+  - A chain is at most 16 KiB.
+  - A proof head is at most 32 KiB. The largest request proof, with 8 KiB
+    of metadata, 8 KiB plus a tag of sealed authorization, and 256 prefetch
+    pages, is over 22 KiB.
+  - `MAX_ENVELOPE_HEAD` covers nine proofs, the ten chains one message can
+    attach, and 16 KiB of outer fields. That is about 615 KiB, down from
+    1.125 MiB in v1.
+  - `MIN_REQUEST_CONTEXT_BYTES` is eight times `MAX_ENVELOPE_HEAD`.
+- The crypto layer still caches chain validation, keyed by fingerprint. That
+  cache is only an optimization. The session cache is the authority for
+  which chain a fingerprint names.
+
 ## Link table and state machine
 
 The owner reports `Idle`, `Connecting`, `Ready`, `Breaking`, and `Backoff`.
