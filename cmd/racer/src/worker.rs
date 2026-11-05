@@ -2035,7 +2035,7 @@ mod tests {
         }
 
         fn scope() -> RequestScope {
-            RequestScope::new(RequestId([7; 16]), Instant::now() + Duration::from_secs(3)).unwrap()
+            RequestScope::host(RequestId([7; 16]), Instant::now() + Duration::from_secs(3)).unwrap()
         }
 
         #[test]
@@ -2922,7 +2922,7 @@ mod tests {
                     max_threads: 4,
                 });
                 let scope =
-                    RequestScope::new(RequestId([0; 16]), Instant::now() + Duration::from_secs(3))
+                    RequestScope::host(RequestId([0; 16]), Instant::now() + Duration::from_secs(3))
                         .unwrap();
                 let started = Instant::now();
                 assert_eq!(group.start(factory.clone(), &scope), Err(Error::Io));
@@ -3084,7 +3084,7 @@ mod tests {
                     max_threads: 3,
                 });
                 let scope =
-                    RequestScope::new(RequestId([0; 16]), Instant::now() + Duration::from_secs(3))
+                    RequestScope::host(RequestId([0; 16]), Instant::now() + Duration::from_secs(3))
                         .unwrap();
                 group.start(factory.clone(), &scope).unwrap();
                 // Startup completion can precede the first serving-loop turn.

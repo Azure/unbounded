@@ -2942,7 +2942,7 @@ pub(crate) mod testing {
 
     /// A test scope with a few seconds on the real clock.
     pub(crate) fn scope() -> RequestScope {
-        RequestScope::new(
+        RequestScope::host(
             crate::model::RequestId([1; 16]),
             std::time::Instant::now() + std::time::Duration::from_secs(5),
         )

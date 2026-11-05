@@ -503,14 +503,14 @@ pub(crate) mod tests {
                     node.clone(),
                     chain,
                     &roots,
-                    &crate::enrollment::wall_clock(&crate::test_support::clock()),
+                    &crate::enrollment::wall_clock(&racer_io::Clock::host()),
                 )
                 .unwrap();
             let keys = Rc::new(Keyring::new(
                 cluster.clone(),
                 node.clone(),
                 Arc::new(KeyEpochs::with_clock(crate::enrollment::wall_clock(
-                    &crate::test_support::clock(),
+                    &racer_io::Clock::host(),
                 ))),
             ));
             keys.install(KeyringBundle {
@@ -523,7 +523,7 @@ pub(crate) mod tests {
             .unwrap();
             keys.install_signing_identity(Arc::new(identity)).unwrap();
             let certificates = Rc::new(Certificates::new(cluster, keys.clone()));
-            let signatures = Signatures::new(keys, certificates, crate::test_support::ctx());
+            let signatures = Signatures::new(keys, certificates, racer_io::WorkerCtx::host());
             let setup = link_setup::Setup::new(RailId(9), [1; 32], 8, 2, &racer_io::Rng::os())
                 .unwrap()
                 .encode();

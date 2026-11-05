@@ -1177,7 +1177,9 @@ pub(super) mod tests {
     /// Preserve the former lagging-replica scenario through real generic scheduling.
     pub(crate) fn lagging_replica() {
         let clock = uring_runtime::environment::SimulationClock::new(731);
-        let _time = clock.environment(0).enter();
+        let sim_env = clock.environment(0);
+        let _time = sim_env.enter();
+        let sim_ctx = sim_env.worker_ctx();
         for pending in [false, true] {
             let session = session();
             let first = document(10);
@@ -1234,10 +1236,7 @@ pub(super) mod tests {
             }
             for error in [Error::Unavailable, Error::Overloaded] {
                 assert_eq!(drive(&clock, sync.turn(&scope)), Err(error));
-                assert!(
-                    sync.status().next_fetch
-                        >= uring_runtime::environment::now() + Duration::from_secs(7)
-                );
+                assert!(sync.status().next_fetch >= sim_ctx.clock.now() + Duration::from_secs(7));
                 assert_eq!(sync.status().accepted, Some(10));
                 assert_eq!(sync.status().pending, pending.then_some(11));
                 assert!(Arc::ptr_eq(

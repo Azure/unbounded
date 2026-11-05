@@ -41,7 +41,7 @@ fn context() -> OriginContext {
     }
 }
 fn scope() -> RequestScope {
-    RequestScope::new(RequestId([1; 16]), Instant::now() + Duration::from_secs(5)).unwrap()
+    RequestScope::host(RequestId([1; 16]), Instant::now() + Duration::from_secs(5)).unwrap()
 }
 pub(super) fn response_head(status: u16, fields: &[(&str, &[u8])]) -> MessageHead {
     MessageHead {
@@ -102,11 +102,11 @@ fn credentials(
             ClusterId("cluster".into()),
             racer_control_wire::NodeId("local".into()),
             Arc::new(KeyEpochs::with_clock(crate::enrollment::wall_clock(
-                &crate::test_support::clock(),
+                &racer_io::Clock::host(),
             ))),
         )),
         admission,
-        crate::test_support::ctx().rng,
+        racer_io::WorkerCtx::host().rng,
     ))
 }
 fn client() -> (
@@ -180,7 +180,7 @@ fn published_client() -> (
     let target = PublicationTarget::new(
         publication.cluster.clone(),
         client.snapshots.clone(),
-        crate::test_support::clock(),
+        racer_io::Clock::host(),
     );
     let snapshot = target.apply(publication).unwrap();
     (client, admission, reactor, snapshot)
@@ -316,7 +316,7 @@ fn real_uds_root_remapping_keeps_public_authority_and_http_validation() {
         NoPeers::requester(),
         credentials(admission.clone()),
         Arc::new(Published::new(Snapshot::retention(2))),
-        crate::test_support::ctx(),
+        racer_io::WorkerCtx::host(),
     );
     let scope = scope();
     let CandidateResolution::Origin(authority) = block_on(policy.resolve(
@@ -495,7 +495,7 @@ fn same_name_new_uid_dials_replacement_without_reusing_old_keepalive() {
     let target = PublicationTarget::new(
         publication.cluster.clone(),
         client.snapshots.clone(),
-        crate::test_support::clock(),
+        racer_io::Clock::host(),
     );
     let snapshot = target.apply(publication.clone()).unwrap();
     let client = remap(client, root).unwrap();
@@ -995,7 +995,7 @@ fn public_operations_reject_wrong_authority_before_io() {
         NoPeers::requester(),
         credentials(client().1),
         Arc::new(Published::new(Snapshot::retention(2))),
-        crate::test_support::ctx(),
+        racer_io::WorkerCtx::host(),
     );
     let context = context();
     let scope = scope();
@@ -1151,7 +1151,7 @@ fn real_uds_bounds_raw_heads_even_with_a_larger_shared_codec() {
 fn real_uds_canceled_and_expired_reads_release_owned_resources() {
     for cancel in [false, true] {
         let (_path, listener, endpoint) = listen();
-        let scope = RequestScope::new(
+        let scope = RequestScope::host(
             RequestId([4; 16]),
             Instant::now() + Duration::from_millis(250),
         )

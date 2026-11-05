@@ -1068,15 +1068,12 @@ mod tests {
             e.accept_response(issue(&request, &ca, &key, |_| {}), &scope),
         )
         .unwrap();
-        assert!(identity.valid_at(crate::test_support::clock().wall_now()));
-        assert!(!identity.renewal_due_at(crate::test_support::clock().wall_now()));
+        assert!(identity.valid_at(racer_io::Clock::host().wall_now()));
+        assert!(!identity.renewal_due_at(racer_io::Clock::host().wall_now()));
         assert!(!identity.private_key_der().is_empty());
         assert!(
             identity
-                .signing_identity(
-                    &[ca.der().to_vec()],
-                    &wall_clock(&crate::test_support::clock())
-                )
+                .signing_identity(&[ca.der().to_vec()], &wall_clock(&racer_io::Clock::host()))
                 .is_ok()
         );
         sim.disk().crash().unwrap();
@@ -1204,9 +1201,8 @@ mod tests {
                     .subject_alt_names
                     .push(rcgen::SanType::DnsName("extra.example".try_into().unwrap())),
                 "lifetime" => {
-                    params.not_after = (crate::test_support::clock().wall_now()
-                        + Duration::from_secs(90000))
-                    .into()
+                    params.not_after =
+                        (racer_io::Clock::host().wall_now() + Duration::from_secs(90000)).into()
                 }
                 "usage" => {
                     params.extended_key_usages = vec![rcgen::ExtendedKeyUsagePurpose::ServerAuth]
@@ -1278,13 +1274,13 @@ mod tests {
                 "missing-usage" => params.key_usages.clear(),
                 "future" => {
                     params.not_before =
-                        (crate::test_support::clock().wall_now() + Duration::from_secs(600)).into()
+                        (racer_io::Clock::host().wall_now() + Duration::from_secs(600)).into()
                 }
                 "expired" => {
                     params.not_before =
-                        (crate::test_support::clock().wall_now() - Duration::from_secs(600)).into();
+                        (racer_io::Clock::host().wall_now() - Duration::from_secs(600)).into();
                     params.not_after =
-                        (crate::test_support::clock().wall_now() - Duration::from_secs(300)).into();
+                        (racer_io::Clock::host().wall_now() - Duration::from_secs(300)).into();
                 }
                 _ => unreachable!(),
             });
@@ -1306,7 +1302,7 @@ mod tests {
             assert_eq!(recovered.certificate_chain(), prior.certificate_chain());
             assert!(
                 recovered
-                    .signing_identity(&roots, &wall_clock(&crate::test_support::clock()))
+                    .signing_identity(&roots, &wall_clock(&racer_io::Clock::host()))
                     .unwrap()
                     .sign(b"still usable")
                     .is_ok()
@@ -1340,7 +1336,7 @@ mod tests {
         .unwrap();
         assert!(
             accepted
-                .signing_identity(&roots, &wall_clock(&crate::test_support::clock()))
+                .signing_identity(&roots, &wall_clock(&racer_io::Clock::host()))
                 .is_ok()
         );
         assert!(sim.metadata(Path::new("/private/pending.json")).is_err());
@@ -1382,7 +1378,7 @@ mod tests {
             "too-many",
             "oversized",
         ] {
-            let now = crate::test_support::clock().wall_now();
+            let now = racer_io::Clock::host().wall_now();
             let mut params = rcgen::CertificateParams::new(Vec::<String>::new()).unwrap();
             params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
             params.not_before = (now - Duration::from_secs(600)).into();
@@ -1435,7 +1431,7 @@ mod tests {
             assert_eq!(recovered.certificate_chain(), prior.certificate_chain());
             assert!(
                 recovered
-                    .signing_identity(&good, &wall_clock(&crate::test_support::clock()))
+                    .signing_identity(&good, &wall_clock(&racer_io::Clock::host()))
                     .unwrap()
                     .sign(b"still usable")
                     .is_ok()
@@ -1449,7 +1445,9 @@ mod tests {
         let sim = Simulation::new();
         let _environment = sim.enter();
         let clock = uring_runtime::environment::SimulationClock::new(105);
-        let _time = clock.environment(0).enter();
+        let sim_env = clock.environment(0);
+        let _time = sim_env.enter();
+        let sim_ctx = sim_env.worker_ctx();
         let (files, e, scope) = fixture();
         let (ca, key) = identity::test_util::ca();
         let good = vec![ca.der().to_vec()];
@@ -1473,7 +1471,7 @@ mod tests {
         let pending = sim.read_file(Path::new("/private/pending.json")).unwrap();
         let mut params = rcgen::CertificateParams::new(Vec::<String>::new()).unwrap();
         params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
-        let now = crate::test_support::clock().wall_now();
+        let now = sim_ctx.clock.clone().wall_now();
         params.not_before = (now - Duration::from_secs(60)).into();
         params.not_after = (now + Duration::from_secs(60)).into();
         let short = params.self_signed(&key).unwrap();
@@ -1497,7 +1495,7 @@ mod tests {
         assert_eq!(recovered.certificate_chain(), prior.certificate_chain());
         assert!(
             recovered
-                .signing_identity(&good, &wall_clock(&crate::test_support::clock()))
+                .signing_identity(&good, &wall_clock(&sim_ctx.clock.clone()))
                 .unwrap()
                 .sign(b"still usable")
                 .is_ok()
@@ -1629,7 +1627,9 @@ mod tests {
         let sim = Simulation::new();
         let _environment = sim.enter();
         let clock = uring_runtime::environment::SimulationClock::new(99);
-        let _time = clock.environment(0).enter();
+        let sim_env = clock.environment(0);
+        let _time = sim_env.enter();
+        let sim_ctx = sim_env.worker_ctx();
         let (files, e, scope) = fixture();
         let request = drive(
             &files,
@@ -1646,15 +1646,15 @@ mod tests {
         let start = UNIX_EPOCH + Duration::from_secs(identity.not_before);
         let lifetime = identity.not_after - identity.not_before;
         clock.set_wall_time(start + Duration::from_secs(lifetime * 2 / 3 - 1));
-        assert!(!identity.renewal_due_at(crate::test_support::clock().wall_now()));
+        assert!(!identity.renewal_due_at(sim_ctx.clock.clone().wall_now()));
         clock.set_wall_time(start + Duration::from_secs(lifetime * 2 / 3 + 1));
-        assert!(identity.renewal_due_at(crate::test_support::clock().wall_now()));
-        assert!(identity.valid_at(crate::test_support::clock().wall_now()));
+        assert!(identity.renewal_due_at(sim_ctx.clock.clone().wall_now()));
+        assert!(identity.valid_at(sim_ctx.clock.clone().wall_now()));
         clock.set_wall_time(identity.expires_at() + Duration::from_secs(1));
-        assert!(!identity.valid_at(crate::test_support::clock().wall_now()));
+        assert!(!identity.valid_at(sim_ctx.clock.clone().wall_now()));
         assert!(drive(&files, e.load_identity(&scope)).unwrap().is_none());
         clock.set_wall_time(start - Duration::from_secs(1));
-        assert!(!identity.valid_at(crate::test_support::clock().wall_now()));
+        assert!(!identity.valid_at(sim_ctx.clock.clone().wall_now()));
     }
 
     /// Shared secure helpers keep symlink policy, permissions and size errors intact.

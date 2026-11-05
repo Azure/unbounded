@@ -65,7 +65,7 @@ struct Rig {
 #[allow(clippy::disallowed_methods)] // Tests build instants to feed the API.
 fn rig(config: Config) -> Rig {
     Rig {
-        registry: Registry::new(config, 7, crate::test_support::clock()),
+        registry: Registry::new(config, 7, racer_io::Clock::host()),
         now: Instant::now(),
         a: version(KEY_A, "a1"),
         b: version(KEY_B, "b1"),
@@ -742,7 +742,7 @@ fn gauges_count_queued_bytes_and_live_tickets_per_priority() {
 
 #[test]
 fn owner_promotion_releases_the_prefetch_slot() {
-    let prefetch = super::service::Prefetch::new(crate::test_support::ctx());
+    let prefetch = super::service::Prefetch::new(racer_io::WorkerCtx::host());
     prefetch
         .configure(Config {
             concurrent_fills: 1,
@@ -782,7 +782,7 @@ fn owner_promotion_releases_the_prefetch_slot() {
 /// keeps the slot until it is dropped too.
 #[test]
 fn owner_fill_slot_is_released_on_drop_and_refcounted() {
-    let prefetch = super::service::Prefetch::new(crate::test_support::ctx());
+    let prefetch = super::service::Prefetch::new(racer_io::WorkerCtx::host());
     prefetch
         .configure(Config {
             concurrent_fills: 1,
@@ -834,7 +834,7 @@ fn owner_fill_slot_is_released_on_drop_and_refcounted() {
 /// when it ends.
 #[test]
 fn status_waiters_are_deduplicated_and_removed() {
-    let prefetch = super::service::Prefetch::new(crate::test_support::ctx());
+    let prefetch = super::service::Prefetch::new(racer_io::WorkerCtx::host());
     let waker = futures::task::noop_waker();
     assert_eq!(prefetch.wait_for_test(&waker, 100), 1);
 }

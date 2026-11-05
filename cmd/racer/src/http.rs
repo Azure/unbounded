@@ -805,7 +805,7 @@ pub(crate) mod tests {
                             ..Default::default()
                         },
                         metrics.clone(),
-                        crate::test_support::clock(),
+                        racer_io::Clock::host(),
                     )
                     .unwrap();
                     let gate = crate::peer::receive::Gate::with_metrics(
@@ -866,7 +866,7 @@ pub(crate) mod tests {
         let peers = crate::peer::AdaptivePeers::new(
             Default::default(),
             metrics.clone(),
-            crate::test_support::clock(),
+            racer_io::Clock::host(),
         )
         .unwrap();
         let node = racer_control_wire::NodeId("peer".into());
@@ -2515,7 +2515,7 @@ pub(crate) mod tests {
             let (listener, endpoint) = Listener::peer();
             let (mut connection, peer) = held(&pool, &reactor, &admission, &endpoint, &listener);
             let scope =
-                RequestScope::new(RequestId([9; 16]), Instant::now() + Duration::from_secs(5))
+                RequestScope::host(RequestId([9; 16]), Instant::now() + Duration::from_secs(5))
                     .unwrap();
             let metrics = crate::telemetry::Metrics::default();
             let gate = crate::peer::receive::Gate::with_metrics(
@@ -2594,15 +2594,15 @@ pub(crate) mod tests {
                         ..Default::default()
                     },
                     metrics.clone(),
-                    crate::test_support::clock(),
+                    racer_io::Clock::host(),
                 )
                 .unwrap();
                 let node = racer_control_wire::NodeId("peer".into());
                 let permit = peers.acquire(&node).unwrap();
                 let failure = Rc::new(std::cell::Cell::new(false));
-                let scope = RequestScope::new(
+                let scope = RequestScope::host(
                     crate::model::RequestId([88; 16]),
-                    uring_runtime::environment::now() + Duration::from_secs(5),
+                    racer_io::Clock::host().now() + Duration::from_secs(5),
                 )
                 .unwrap();
                 let endpoint = Endpoint::Peer("127.0.0.1:9999".into());
@@ -2706,7 +2706,7 @@ pub(crate) mod tests {
                     pipes: new_pipe_pool(admission.clone()),
                     admission,
                     reactor,
-                    scope: RequestScope::new(
+                    scope: RequestScope::host(
                         RequestId([3; 16]),
                         Instant::now() + Duration::from_secs(8),
                     )
@@ -3015,8 +3015,9 @@ pub(crate) mod tests {
             admission.clone(),
             8 * 1024 * 1024,
         );
-        let scope = RequestScope::new(RequestId([1; 16]), Instant::now() + Duration::from_secs(10))
-            .unwrap();
+        let scope =
+            RequestScope::host(RequestId([1; 16]), Instant::now() + Duration::from_secs(10))
+                .unwrap();
         (admission, reactor, io, scope)
     }
     pub(crate) fn drive<T>(reactor: &Reactor, future: impl Future<Output = T>) -> T {

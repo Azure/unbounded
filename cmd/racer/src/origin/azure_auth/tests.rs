@@ -357,7 +357,7 @@ fn refresh_lock_wait_observes_waiter_deadline() {
     // A stalled fetch holds the single-flight lock.
     let fetch = source.flight.try_lock().unwrap();
     let started = Instant::now();
-    let short = RequestScope::new(
+    let short = RequestScope::host(
         crate::model::RequestId([8; 16]),
         started + Duration::from_millis(100),
     )

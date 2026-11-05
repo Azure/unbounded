@@ -658,7 +658,7 @@ pub(crate) mod tests {
                 publication.cluster,
                 publication.members[0].node.clone(),
                 Arc::new(KeyEpochs::with_clock(crate::enrollment::wall_clock(
-                    &crate::test_support::clock(),
+                    &racer_io::Clock::host(),
                 ))),
             ));
             let installer = BundleInstaller::new(keys.clone());
@@ -782,7 +782,7 @@ pub(crate) mod tests {
                 cluster.clone(),
                 NodeId("22222222-2222-4222-8222-222222222222".into()),
                 Arc::new(KeyEpochs::with_clock(crate::enrollment::wall_clock(
-                    &crate::test_support::clock(),
+                    &racer_io::Clock::host(),
                 ))),
             ));
             Session::new(
@@ -804,7 +804,7 @@ pub(crate) mod tests {
                 Rc::new(PublicationTarget::new(
                     cluster,
                     Arc::new(Published::new(Snapshot::retention(2))),
-                    crate::test_support::clock(),
+                    racer_io::Clock::host(),
                 )),
             )
         }
@@ -1143,7 +1143,9 @@ pub(crate) mod tests {
         fn preparation_fence(cancel_wait: bool) {
             use std::future::Future;
             let clock = uring_runtime::environment::SimulationClock::new(407);
-            let _time = clock.environment(0).enter();
+            let sim_env = clock.environment(0);
+            let _time = sim_env.enter();
+            let sim_ctx = sim_env.worker_ctx();
             let sim = uring_runtime::reactor::simulation::Simulation::new();
             let _os = sim.enter();
             let reactor = Rc::new(Reactor::new(Rc::new(flow_control::Quotas::new(
@@ -1177,9 +1179,10 @@ pub(crate) mod tests {
                 },
             )
             .unwrap();
-            let scope = RequestScope::new(
+            let scope = RequestScope::on(
+                &sim_ctx.clock,
                 crate::model::RequestId([7; 16]),
-                uring_runtime::environment::now() + Duration::from_secs(10),
+                sim_ctx.clock.now() + Duration::from_secs(10),
             )
             .unwrap();
             testing::drive(&reactor, Box::pin(sync.turn(&scope))).unwrap();
@@ -1208,9 +1211,10 @@ pub(crate) mod tests {
                 Err(Error::Cancelled)
             );
             release.send(()).unwrap();
-            let shutdown_scope = RequestScope::new(
+            let shutdown_scope = RequestScope::on(
+                &sim_ctx.clock,
                 crate::model::RequestId([8; 16]),
-                uring_runtime::environment::now() + Duration::from_secs(10),
+                sim_ctx.clock.now() + Duration::from_secs(10),
             )
             .unwrap();
             let mut shutdown = Box::pin(sync.shutdown(&shutdown_scope));
@@ -1267,7 +1271,7 @@ pub(crate) mod tests {
                     assert_eq!(
                         store
                             .published
-                            .resolve(old, uring_runtime::environment::now())
+                            .resolve(old, racer_io::Clock::host().now())
                             .unwrap()
                             .unwrap()
                             .version
@@ -1279,7 +1283,7 @@ pub(crate) mod tests {
                     assert!(
                         store
                             .published
-                            .resolve(version - 3, uring_runtime::environment::now())
+                            .resolve(version - 3, racer_io::Clock::host().now())
                             .unwrap()
                             .is_none()
                     );
@@ -1300,7 +1304,7 @@ pub(crate) mod tests {
                 assert!(
                     store
                         .published
-                        .resolve(2, uring_runtime::environment::now())
+                        .resolve(2, racer_io::Clock::host().now())
                         .unwrap()
                         .is_none()
                 );
@@ -1317,14 +1321,14 @@ pub(crate) mod tests {
                 assert!(
                     store
                         .published
-                        .resolve(version, uring_runtime::environment::now())
+                        .resolve(version, racer_io::Clock::host().now())
                         .unwrap()
                         .is_some()
                 );
                 assert!(
                     store
                         .published
-                        .resolve(version - 1, uring_runtime::environment::now())
+                        .resolve(version - 1, racer_io::Clock::host().now())
                         .unwrap()
                         .is_none()
                 );
@@ -1342,7 +1346,7 @@ pub(crate) mod tests {
                 ready_tx.send(()).unwrap();
                 release_rx.recv().unwrap();
                 let incoming = published
-                    .resolve(1, uring_runtime::environment::now())
+                    .resolve(1, racer_io::Clock::host().now())
                     .unwrap()
                     .unwrap();
                 assert!(Arc::ptr_eq(&snapshot.membership, &incoming));
@@ -1450,7 +1454,7 @@ pub(crate) mod tests {
             let other = PublicationTarget::new(
                 ClusterId("foreign".into()),
                 target.published.clone(),
-                crate::test_support::clock(),
+                racer_io::Clock::host(),
             );
             assert!(matches!(
                 other.accept(current.clone(), None),
@@ -1472,11 +1476,11 @@ pub(crate) mod tests {
                 let target = PublicationTarget::new(
                     publication(1).cluster,
                     published.clone(),
-                    crate::test_support::clock(),
+                    racer_io::Clock::host(),
                 );
                 target.apply(publication(1)).unwrap();
                 target.apply(membership(2, 2)).unwrap();
-                let now = uring_runtime::environment::now();
+                let now = racer_io::Clock::host().now();
                 let held = published.resolve(1, now).unwrap();
                 assert_eq!(held.is_some(), budget >= bytes);
                 let expired = now + Duration::from_secs(31);
@@ -1715,7 +1719,7 @@ pub(crate) mod tests {
                         assert_disconnected(&mut socket);
                     })
                 });
-                let scope = RequestScope::new(
+                let scope = RequestScope::host(
                     crate::model::RequestId([7; 16]),
                     Instant::now() + Duration::from_millis(300),
                 )
@@ -2063,7 +2067,7 @@ pub(crate) mod tests {
             let d = testing::Directory::new();
             let (ca, key) = testing::ca();
             let identity = enrolled(&r, &d, &ca, &key);
-            assert!(identity.valid_at(crate::test_support::clock().wall_now()));
+            assert!(identity.valid_at(racer_io::Clock::host().wall_now()));
             let clock = uring_runtime::environment::SimulationClock::new(17);
             let environment = clock.environment(1);
             // Roll only the scoped wall clock back after real enrollment. The generic
@@ -2110,7 +2114,7 @@ pub(crate) mod tests {
                 let der =
                     rustls::pki_types::CertificateSigningRequestDer::from(request.csr_der.clone());
                 let mut csr = rcgen::CertificateSigningRequestParams::from_der(&der).unwrap();
-                let now = uring_runtime::environment::wall_now();
+                let now = racer_io::Clock::host().wall_now();
                 csr.params.not_before = (now - Duration::from_secs(1)).into();
                 csr.params.not_after = (now + Duration::from_secs(3600)).into();
                 csr.params.subject_alt_names = vec![
@@ -2241,14 +2245,16 @@ pub(crate) mod tests {
                     std::time::Instant::now(),
                     wall + Duration::from_secs(due - 1),
                 );
-                let _time = clock.environment(1).enter();
-                assert!(!identity.renewal_due_at(crate::test_support::clock().wall_now()));
+                let sim_env = clock.environment(1);
+                let _time = sim_env.enter();
+                let sim_ctx = sim_env.worker_ctx();
+                assert!(!identity.renewal_due_at(sim_ctx.clock.clone().wall_now()));
                 clock.advance(Duration::from_secs(1));
-                assert!(identity.renewal_due_at(crate::test_support::clock().wall_now()));
-                assert!(identity.valid_at(crate::test_support::clock().wall_now()));
+                assert!(identity.renewal_due_at(sim_ctx.clock.clone().wall_now()));
+                assert!(identity.valid_at(sim_ctx.clock.clone().wall_now()));
                 clock.advance(Duration::from_secs(lifetime - due));
-                assert!(!identity.valid_at(crate::test_support::clock().wall_now()));
-                assert!(identity.renewal_due_at(crate::test_support::clock().wall_now()));
+                assert!(!identity.valid_at(sim_ctx.clock.clone().wall_now()));
+                assert!(identity.renewal_due_at(sim_ctx.clock.clone().wall_now()));
             }
         }
 
@@ -2508,8 +2514,8 @@ pub(crate) mod tests {
             assert!(testing::drive(&r, again.accept_response(wrong, &scope)).is_err());
             assert!(directory.0.join("identity/pending.json").exists());
             let identity = testing::drive(&r, again.accept_response(response, &scope)).unwrap();
-            assert!(identity.valid_at(crate::test_support::clock().wall_now()));
-            assert!(!identity.renewal_due_at(crate::test_support::clock().wall_now()));
+            assert!(identity.valid_at(racer_io::Clock::host().wall_now()));
+            assert!(!identity.renewal_due_at(racer_io::Clock::host().wall_now()));
             assert_eq!(
                 testing::drive(&r, again.load_identity(&scope))
                     .unwrap()

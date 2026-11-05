@@ -2551,9 +2551,9 @@ mod gate_event_tests {
     fn expiry_snapshot_ring_is_bounded_private_and_independent() {
         let failures = Failures::default();
         let observer = failures.observer(WorkerId(u16::MAX));
-        let scope = RequestScope::new(
+        let scope = RequestScope::host(
             RequestId([255; 16]),
-            uring_runtime::environment::now() + std::time::Duration::from_secs(5),
+            racer_io::Clock::host().now() + std::time::Duration::from_secs(5),
         )
         .unwrap();
         let facts = FlightExpiry {
@@ -2608,9 +2608,9 @@ mod gate_event_tests {
     fn gate_events_wrap_without_losing_counts_or_accepting_noise() {
         let failures = Failures::default();
         let observer = failures.observer(WorkerId(u16::MAX));
-        let scope = RequestScope::new(
+        let scope = RequestScope::host(
             RequestId([255; 16]),
-            uring_runtime::environment::now() + std::time::Duration::from_secs(5),
+            racer_io::Clock::host().now() + std::time::Duration::from_secs(5),
         )
         .unwrap();
         for _ in 0..65 {
@@ -2804,9 +2804,9 @@ mod protected_failure_tests {
     fn terminal_and_final_fill_survive_noise_and_wrap_independently() {
         let failures = Failures::default();
         let observer = failures.observer(WorkerId(u16::MAX));
-        let scope = RequestScope::new(
+        let scope = RequestScope::host(
             RequestId([255; 16]),
-            uring_runtime::environment::now() + std::time::Duration::from_secs(10),
+            racer_io::Clock::host().now() + std::time::Duration::from_secs(10),
         )
         .unwrap();
         observer.record(
@@ -3796,7 +3796,8 @@ pub(crate) mod tests {
         use std::task::Context;
 
         fn scope() -> RequestScope {
-            RequestScope::new(RequestId([0; 16]), Instant::now() + Duration::from_secs(15)).unwrap()
+            RequestScope::host(RequestId([0; 16]), Instant::now() + Duration::from_secs(15))
+                .unwrap()
         }
         fn setup() -> (
             Rc<flow_control::Quotas<AdmissionPolicy>>,
@@ -4590,7 +4591,7 @@ pub(crate) mod tests {
             use crate::telemetry::Stage;
             let telemetry = Telemetry::default();
             let observer = telemetry.failures.observer(WorkerId(u16::MAX));
-            let scope = RequestScope::new(
+            let scope = RequestScope::host(
                 RequestId([255; 16]),
                 Instant::now() + Duration::from_secs(10),
             )
@@ -5301,7 +5302,7 @@ pub(crate) mod tests {
         #[test]
         fn lifecycle_probes_keep_resource_policy_bodies_and_irreversible_drain() {
             let telemetry = Telemetry::default();
-            let now = environment::now();
+            let now = racer_io::Clock::host().now();
             let usable = Resources {
                 workers_usable: true,
                 storage_usable: true,
@@ -5358,7 +5359,7 @@ pub(crate) mod tests {
         }
         #[test]
         fn observation_and_credential_expiry_are_inclusive() {
-            let now = uring_runtime::environment::now();
+            let now = racer_io::Clock::host().now();
             for (observed, boundary) in [(5, 5), (20, 10)] {
                 let health = Health::default();
                 health
@@ -5953,7 +5954,7 @@ pub(crate) mod tests {
         fn shared_workers_bounded_oldest_first_and_success_is_silent() {
             let failures = Failures::default();
             let observer = failures.observer(WorkerId(3));
-            let scope = RequestScope::new(
+            let scope = RequestScope::host(
                 RequestId([0xab; 16]),
                 std::time::Instant::now() + std::time::Duration::from_secs(10),
             )

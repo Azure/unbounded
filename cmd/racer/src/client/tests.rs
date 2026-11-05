@@ -969,7 +969,7 @@ fn definition() -> CacheDefinition {
 fn scope() -> RequestScope {
     new_scope(
         &racer_io::WorkerCtx {
-            clock: crate::test_support::clock(),
+            clock: racer_io::Clock::host(),
             rng: racer_io::Rng::os(),
         },
         Duration::from_secs(5),
@@ -2758,7 +2758,7 @@ fn production_snapshot_replacement_rejects_old_backlog_uid_with_503() {
     let snapshots = Rc::new(PublicationTarget::new(
         keys.cluster().clone(),
         state.clone(),
-        crate::test_support::clock(),
+        racer_io::Clock::host(),
     ));
     let mut publication = Publication {
         pools: Vec::new(),

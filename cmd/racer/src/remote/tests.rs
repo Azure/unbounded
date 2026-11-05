@@ -186,10 +186,10 @@ fn endpoint_identity_authority_and_validation() {
     let a = RemoteEndpoint::http("Account.Blob.Core.Windows.Net", 80).unwrap();
     assert_eq!(a.host(), "account.blob.core.windows.net");
     assert_eq!(a.authority(), "account.blob.core.windows.net");
-    assert!(a.needs_resolve(crate::test_support::clock().now()));
+    assert!(a.needs_resolve(racer_io::Clock::host().now()));
     let v6 = RemoteEndpoint::http("[::1]", 10000).unwrap();
     assert_eq!(v6.authority(), "[::1]:10000");
-    assert!(!v6.needs_resolve(crate::test_support::clock().now()));
+    assert!(!v6.needs_resolve(racer_io::Clock::host().now()));
     assert_eq!(v6.address().unwrap(), "[::1]:10000".parse().unwrap());
     let imds = RemoteEndpoint::http("169.254.169.254", 80).unwrap();
     assert_eq!(imds.authority(), "169.254.169.254");

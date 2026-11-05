@@ -1153,7 +1153,9 @@ pub(crate) mod tests {
     #[test]
     fn a_silent_peer_is_routed_around_until_it_answers() {
         let clock = uring_runtime::environment::SimulationClock::new(1);
-        let _env = clock.environment(0).enter();
+        let sim_env = clock.environment(0);
+        let _env = sim_env.enter();
+        let sim_ctx = sim_env.worker_ctx();
         let health =
             LinkHealth::default().with_silence(Duration::from_secs(10), Duration::from_secs(2));
         let peer = NodeId("peer".into());
@@ -1167,7 +1169,7 @@ pub(crate) mod tests {
             },
             number: PageNumber(3),
         };
-        let sent = uring_runtime::environment::now();
+        let sent = sim_ctx.clock.now();
         clock.advance(Duration::from_secs(2));
         // One unanswered exchange over the last link asks nothing yet.
         assert!(!health.silence_timed_out(
@@ -1182,7 +1184,7 @@ pub(crate) mod tests {
             sent,
             racer_core::liveness::LINK_TIMEOUTS
         ));
-        let now = uring_runtime::environment::now();
+        let now = sim_ctx.clock.now();
         assert_eq!(health.due_pings(now, 8), vec![(peer.clone(), page.clone())]);
         assert!(health.available(&peer).unwrap());
         // A relay's overload proves nothing; an unanswered ping does.
@@ -1194,7 +1196,7 @@ pub(crate) mod tests {
         // Pinged again after the hold; an answer clears it.
         assert!(health.due_pings(now, 8).is_empty());
         clock.advance(Duration::from_secs(20));
-        let later = uring_runtime::environment::now();
+        let later = sim_ctx.clock.now();
         assert_eq!(health.due_pings(later, 8).len(), 1);
         assert!(!health.ping_outcome(&peer, Some(true), later));
         assert!(!health.silent(&peer));
@@ -1249,13 +1251,13 @@ pub(crate) mod tests {
         use crate::topology::tests::fixtures::object;
         #[test]
         fn owned_half_open_probe_remains_exclusive_until_completion_or_drop() {
-            let health = LinkHealth::new(1, crate::test_support::clock());
+            let health = LinkHealth::new(1, racer_io::Clock::host());
             let node = NodeId("peer".into());
             health
                 .observe_at(
                     &node,
                     LinkOutcome::Timeout,
-                    uring_runtime::environment::now() - Duration::from_secs(60),
+                    racer_io::Clock::host().now() - Duration::from_secs(60),
                 )
                 .unwrap();
             let probe = health.acquire(&node).unwrap();
@@ -1263,7 +1265,7 @@ pub(crate) mod tests {
                 !health
                     .try_acquire_at(
                         &node,
-                        uring_runtime::environment::now() + Duration::from_secs(60)
+                        racer_io::Clock::host().now() + Duration::from_secs(60)
                     )
                     .unwrap()
             );
@@ -1272,14 +1274,14 @@ pub(crate) mod tests {
                 health
                     .try_acquire_at(
                         &node,
-                        uring_runtime::environment::now() + Duration::from_secs(60)
+                        racer_io::Clock::host().now() + Duration::from_secs(60)
                     )
                     .unwrap()
             );
         }
         #[test]
         fn endpoint_application_errors_do_not_open_circuits_and_probes_are_bounded() {
-            let health = LinkHealth::new(2, crate::test_support::clock());
+            let health = LinkHealth::new(2, racer_io::Clock::host());
             let endpoint = NodeId("origin".into());
             for error in [
                 Error::Unauthorized,
@@ -1311,8 +1313,8 @@ pub(crate) mod tests {
         }
         #[test]
         fn circuit_backoff_probes_success_and_isolation() {
-            let first = LinkHealth::new(2, crate::test_support::clock());
-            let second = LinkHealth::new(2, crate::test_support::clock());
+            let first = LinkHealth::new(2, racer_io::Clock::host());
+            let second = LinkHealth::new(2, racer_io::Clock::host());
             let node = NodeId("a".into());
             let now = Instant::now();
             assert!(first.try_acquire_at(&node, now).unwrap());
@@ -1349,7 +1351,7 @@ pub(crate) mod tests {
         }
         #[test]
         fn capacity_and_placement_are_independent() {
-            let health = LinkHealth::new(1, crate::test_support::clock());
+            let health = LinkHealth::new(1, racer_io::Clock::host());
             let members = membership(3);
             let placement = Placement::new(1);
             let before = placement
@@ -2048,9 +2050,9 @@ pub(crate) mod tests {
             use crate::runtime::RequestScope;
             let placement = Placement::with_memory_budget(4 * RANKING_BYTES);
             let members = membership(100_000);
-            let scope = RequestScope::new(
+            let scope = RequestScope::host(
                 RequestId([1; 16]),
-                uring_runtime::environment::now() + std::time::Duration::from_secs(30),
+                racer_io::Clock::host().now() + std::time::Duration::from_secs(30),
             )
             .unwrap();
             let mut future = placement.rank_scoped(members, &object(), PageNumber(0), Some(&scope));
@@ -2170,7 +2172,7 @@ pub(crate) mod tests {
             request: &RouteBudget,
             ping: bool,
         ) -> Result<Route> {
-            let scope = RequestScope::new(request.request, request.deadline.0).unwrap();
+            let scope = RequestScope::host(request.request, request.deadline.0).unwrap();
             futures::executor::block_on(paths.shortest_probe_async(
                 members.clone(),
                 source,
@@ -2294,7 +2296,7 @@ pub(crate) mod tests {
             let source = &members.members()[0].node;
             let paths = Paths::with_limits(Rc::new(LinkHealth::default()), 0, 1, 1);
             let request = budget(&members, 80_003, NORMAL_LINKS);
-            let scope = RequestScope::new(request.request, request.deadline.0).unwrap();
+            let scope = RequestScope::host(request.request, request.deadline.0).unwrap();
             let mut first = paths.shortest_async(members.clone(), source, &request, &scope);
             let mut cx = std::task::Context::from_waker(futures::task::noop_waker_ref());
             assert!(first.as_mut().poll(&mut cx).is_pending());
@@ -2328,7 +2330,7 @@ pub(crate) mod tests {
                 .collect();
             let scopes: Vec<_> = budgets
                 .iter()
-                .map(|b| RequestScope::new(b.request, b.deadline.0).unwrap())
+                .map(|b| RequestScope::host(b.request, b.deadline.0).unwrap())
                 .collect();
             let mut running: Vec<_> = budgets[..8]
                 .iter()
@@ -2371,7 +2373,7 @@ pub(crate) mod tests {
                 let actual = cached.shortest(members.clone(), from, &request).unwrap();
                 assert_eq!(actual.nodes[1], members.members()[expected].node);
                 assert!(members.neighbors(from).unwrap().contains(&actual.nodes[1]));
-                let scope = RequestScope::new(request.request, request.deadline.0).unwrap();
+                let scope = RequestScope::host(request.request, request.deadline.0).unwrap();
                 assert_eq!(
                     actual.nodes,
                     futures::executor::block_on(cold.shortest_async(
@@ -2473,7 +2475,7 @@ pub(crate) mod tests {
                 vec![source.clone()]
             );
             let request = budget(&members, 1499, 4);
-            let scope = RequestScope::new(request.request, request.deadline.0).unwrap();
+            let scope = RequestScope::host(request.request, request.deadline.0).unwrap();
             let mut operation = cold.shortest_async(members.clone(), source, &request, &scope);
             let mut cx = std::task::Context::from_waker(futures::task::noop_waker_ref());
             let _ = operation.as_mut().poll(&mut cx);
@@ -2489,7 +2491,7 @@ pub(crate) mod tests {
             let request = budget(&members, 99, 4);
             let from = &members.members()[0].node;
             let next = &members.members()[1].node;
-            let now = uring_runtime::environment::now();
+            let now = racer_io::Clock::host().now();
             let forward = |visited: &[NodeId], holder: &NodeId, to: &NodeId, links: u8| {
                 racer_core::route::forward(
                     visited,
@@ -2570,7 +2572,7 @@ pub(crate) mod tests {
             health
                 .observe(&NodeId("retired".into()), LinkOutcome::Timeout)
                 .unwrap();
-            let scope = RequestScope::new(request.request, request.deadline.0).unwrap();
+            let scope = RequestScope::host(request.request, request.deadline.0).unwrap();
             let mut operation = paths.shortest_async(members.clone(), source, &request, &scope);
             let mut cx = std::task::Context::from_waker(futures::task::noop_waker_ref());
             assert!(operation.as_mut().poll(&mut cx).is_pending());
@@ -2597,21 +2599,20 @@ pub(crate) mod tests {
             use crate::peer::Config;
             use crate::peer::Outcome;
             let clock = uring_runtime::environment::SimulationClock::new(110);
-            let _env = clock.environment(0).enter();
+            let sim_env = clock.environment(0);
+            let _env = sim_env.enter();
+            let sim_ctx = sim_env.worker_ctx();
             let members = membership(100_000);
             let source = &members.members()[0].node;
-            let admission = AdaptivePeers::new(
-                Config::default(),
-                Default::default(),
-                crate::test_support::clock(),
-            )
-            .unwrap();
+            let admission =
+                AdaptivePeers::new(Config::default(), Default::default(), sim_ctx.clock.clone())
+                    .unwrap();
             let paths = Paths::new(Rc::new(LinkHealth::default()), 1)
                 .with_peer_admission(admission.clone());
             let mut request = budget(&members, 80_003, 4);
-            request.deadline =
-                Deadline(uring_runtime::environment::now() + Duration::from_secs(60));
-            let scope = RequestScope::new(request.request, request.deadline.0).unwrap();
+            request.deadline = Deadline(sim_ctx.clock.now() + Duration::from_secs(60));
+            let scope =
+                RequestScope::on(&sim_ctx.clock, request.request, request.deadline.0).unwrap();
             let mut operation = paths.shortest_async(members.clone(), source, &request, &scope);
             let mut cx = std::task::Context::from_waker(futures::task::noop_waker_ref());
             assert!(operation.as_mut().poll(&mut cx).is_pending());
@@ -2636,17 +2637,20 @@ pub(crate) mod tests {
         #[test]
         fn yielded_and_cached_searches_enforce_scope_budget_and_membership() {
             let clock = uring_runtime::environment::SimulationClock::new(109);
-            let _env = clock.environment(0).enter();
+            let sim_env = clock.environment(0);
+            let _env = sim_env.enter();
+            let sim_ctx = sim_env.worker_ctx();
             let members = membership(100_000);
             let source = &members.members()[0].node;
             let mut cx = std::task::Context::from_waker(futures::task::noop_waker_ref());
             for case in 0..3 {
                 let paths = Paths::new(Rc::new(LinkHealth::default()), 1);
                 let mut request = budget(&members, 80_003, 4);
-                let now = uring_runtime::environment::now();
+                let now = sim_ctx.clock.now();
                 request.deadline =
                     Deadline(now + Duration::from_secs(if case == 1 { 1 } else { 60 }));
-                let scope = RequestScope::new(
+                let scope = RequestScope::on(
+                    &sim_ctx.clock,
                     request.request,
                     now + Duration::from_secs(if case == 2 { 1 } else { 60 }),
                 )
@@ -2669,8 +2673,7 @@ pub(crate) mod tests {
                 );
                 // Failure drops the algorithm admission before a new request starts.
                 let mut fresh = request.clone();
-                fresh.deadline =
-                    Deadline(uring_runtime::environment::now() + Duration::from_secs(60));
+                fresh.deadline = Deadline(sim_ctx.clock.now() + Duration::from_secs(60));
                 paths.shortest(members.clone(), source, &fresh).unwrap();
                 assert_eq!(
                     futures::executor::block_on(paths.shortest_async(

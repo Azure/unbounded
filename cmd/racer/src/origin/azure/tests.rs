@@ -217,7 +217,7 @@ fn context(key: &str, version: &str) -> OriginContext {
 }
 
 fn scope() -> RequestScope {
-    RequestScope::new(RequestId([1; 16]), Instant::now() + Duration::from_secs(5)).unwrap()
+    RequestScope::host(RequestId([1; 16]), Instant::now() + Duration::from_secs(5)).unwrap()
 }
 
 fn page(context: &OriginContext, number: u64) -> PageId {
@@ -878,7 +878,7 @@ mod router {
         let target = PublicationTarget::new(
             publication.cluster.clone(),
             h.snapshots.clone(),
-            crate::test_support::clock(),
+            racer_io::Clock::host(),
         );
         target.apply(publication).unwrap();
         h.snapshots.current().unwrap().unwrap().caches[0].id.clone()
@@ -904,11 +904,11 @@ mod router {
                 ClusterId("cluster".into()),
                 node.clone(),
                 Arc::new(racer_crypto::identity::KeyEpochs::with_clock(
-                    crate::enrollment::wall_clock(&crate::test_support::clock()),
+                    crate::enrollment::wall_clock(&racer_io::Clock::host()),
                 )),
             )),
             h.admission.clone(),
-            crate::test_support::ctx().rng,
+            racer_io::WorkerCtx::host().rng,
         ));
         CandidatePolicy::new(
             node,
@@ -916,7 +916,7 @@ mod router {
             crate::test_support::NoPeers::requester(),
             credentials,
             h.snapshots.clone(),
-            crate::test_support::ctx(),
+            racer_io::WorkerCtx::host(),
         )
         .local_authority(
             membership,
@@ -962,7 +962,7 @@ mod router {
             PublicationTarget::new(
                 publication.cluster.clone(),
                 h.snapshots.clone(),
-                crate::test_support::clock(),
+                racer_io::Clock::host(),
             )
             .apply(publication)
             .unwrap();
