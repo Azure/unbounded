@@ -98,6 +98,25 @@ change. A private or air-gapped install sets `--image-registry` (e.g.
 already), so a private or air-gapped setup runs `install --image-registry ...`
 first, then `site init`.
 
+The operator objects are defined once, as the Helm chart in
+`deploy/unbounded-operator/chart`. `install` applies manifests rendered from
+that chart at build time (`make unbounded-operator-manifests`), and the same
+render is published with each release as `unbounded-operator-<tag>.yaml`. Platforms
+that manage cluster add-ons with Helm, such as AKS cluster extensions, can
+install the chart directly; `imageRegistry`, `image.tag`,
+`apiServerEndpoint` and `reapLegacyResources` correspond to the flags above.
+Install it into the operator namespace:
+
+```bash
+helm install unbounded-operator deploy/unbounded-operator/chart \
+  --namespace unbounded-system --create-namespace \
+  --set image.tag=<release>
+```
+
+Use one method per cluster. The chart refuses to install over an operator that
+`install` created. `helm uninstall` removes the operator and its RBAC; the CRDs,
+Sites and the components the operator reconciled remain.
+
 > **Breaking change:** `--image-registry` is now a full image-repository prefix
 > (registry host plus org/namespace), not a bare host the operator appends
 > `/azure/` to. `--operator-image` is now a `name:tag` with no registry (the

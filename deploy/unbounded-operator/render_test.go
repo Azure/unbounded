@@ -18,7 +18,6 @@ import (
 
 	"gopkg.in/yaml.v3"
 
-	"github.com/Azure/unbounded/hack/cmd/render-manifests/render"
 	"github.com/Azure/unbounded/internal/operator"
 )
 
@@ -31,20 +30,13 @@ import (
 func TestOperatorConfigEndpointAndHashRender(t *testing.T) {
 	t.Parallel()
 
-	const endpoint = `https://api.example.test:6443/path?mode="strict"&ready=true`
+	const endpoint = `https://api.example.test:6443/path,tenant?mode="strict"&ready=true`
 
-	templatesDir := filepath.Join(repoRoot(t), "deploy", "unbounded-operator")
-	outputDir := t.TempDir()
-
-	data := map[string]string{
-		"Namespace":         "unbounded-system",
-		"OperatorImage":     "operator:test",
-		"ImageRegistry":     "registry.example.com/mirror",
-		"APIServerEndpoint": endpoint,
-	}
-	if err := render.Render(templatesDir, outputDir, data); err != nil {
-		t.Fatalf("render.Render: %v", err)
-	}
+	outputDir := renderStatic(t, staticRender{
+		image:    "operator:test",
+		registry: "registry.example.com/mirror",
+		endpoint: endpoint,
+	})
 
 	// The ConfigMap carries the endpoint that the operator reads via envFrom.
 	var cm struct {
@@ -189,16 +181,12 @@ func TestOperatorConfigHashChangesWithEachConfigValue(t *testing.T) {
 	renderHash := func(endpoint, registry, reapLegacyResources string) string {
 		t.Helper()
 
-		outputDir := t.TempDir()
-		if err := render.Render(filepath.Join(repoRoot(t), "deploy", "unbounded-operator"), outputDir, map[string]string{
-			"Namespace":           "unbounded-system",
-			"OperatorImage":       "operator:test",
-			"ImageRegistry":       registry,
-			"APIServerEndpoint":   endpoint,
-			"ReapLegacyResources": reapLegacyResources,
-		}); err != nil {
-			t.Fatalf("render.Render: %v", err)
-		}
+		outputDir := renderStatic(t, staticRender{
+			image:    "operator:test",
+			registry: registry,
+			endpoint: endpoint,
+			reap:     reapLegacyResources,
+		})
 
 		var cm struct {
 			Data map[string]string `yaml:"data"`
@@ -257,14 +245,7 @@ func TestOperatorConfigHashChangesWithEachConfigValue(t *testing.T) {
 func TestOperatorRBACIncludesCachedReadKinds(t *testing.T) {
 	t.Parallel()
 
-	outputDir := t.TempDir()
-	if err := render.Render(filepath.Join(repoRoot(t), "deploy", "unbounded-operator"), outputDir, map[string]string{
-		"Namespace":     "unbounded-system",
-		"OperatorImage": "operator:test",
-		"ImageRegistry": "ghcr.io",
-	}); err != nil {
-		t.Fatalf("render.Render: %v", err)
-	}
+	outputDir := renderStatic(t, staticRender{image: "operator:test", registry: "ghcr.io"})
 
 	var role struct {
 		Rules []struct {
@@ -324,15 +305,14 @@ func TestOperatorImageAndComponentRegistryShareRegistry(t *testing.T) {
 		operatorImage = "ghcr.io/azure/unbounded-operator:" + tag
 	)
 
-	outputDir := t.TempDir()
-	// Omit ImageRegistry so the ConfigMap default is exercised; supply
-	// OperatorImage as the make/release render path does.
-	if err := render.Render(filepath.Join(repoRoot(t), "deploy", "unbounded-operator"), outputDir, map[string]string{
-		"Namespace":     "unbounded-system",
-		"OperatorImage": operatorImage,
-	}); err != nil {
-		t.Fatalf("render.Render: %v", err)
-	}
+	// Use the chart's default imageRegistry so its value is exercised; supply
+	// the operator image as the make/release render path does.
+	chartDefaults := struct {
+		ImageRegistry string `yaml:"imageRegistry"`
+	}{}
+	readYAML(t, filepath.Join(repoRoot(t), "deploy", "unbounded-operator", "chart", "values.yaml"), &chartDefaults)
+
+	outputDir := renderStatic(t, staticRender{image: operatorImage, registry: chartDefaults.ImageRegistry})
 
 	var cm struct {
 		Data map[string]string `yaml:"data"`
@@ -389,12 +369,7 @@ func TestOperatorImageAndComponentRegistryShareRegistry(t *testing.T) {
 }
 
 func TestRegistryAuthMigrationLeaseDeletionIsNamespaceAndNameScoped(t *testing.T) {
-	outputDir := t.TempDir()
-	if err := render.Render(filepath.Join(repoRoot(t), "deploy", "unbounded-operator"), outputDir, map[string]string{
-		"Namespace": "custom-system", "OperatorImage": "operator:test", "ImageRegistry": "ghcr.io",
-	}); err != nil {
-		t.Fatal(err)
-	}
+	outputDir := renderStatic(t, staticRender{namespace: "custom-system", image: "operator:test", registry: "ghcr.io"})
 
 	data, err := os.ReadFile(filepath.Join(outputDir, "02-rbac.yaml"))
 	if err != nil {

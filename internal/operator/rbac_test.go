@@ -36,10 +36,9 @@ var kindToResource = map[string]string{
 	"RoleBinding":    "rolebindings",
 }
 
-// loadOperatorClusterRole parses the operator ClusterRole from its template. The
-// ClusterRole document contains no Go-template actions (only the accompanying
-// ClusterRoleBinding does), so it parses as plain YAML directly from the source
-// of truth without needing the manifests to be rendered.
+// loadOperatorClusterRole parses the operator ClusterRole from the static
+// manifests rendered from deploy/unbounded-operator/chart by
+// `make unbounded-operator-manifests` (a prerequisite of `make test`).
 func loadOperatorClusterRole(t *testing.T) *rbacv1.ClusterRole {
 	t.Helper()
 
@@ -49,17 +48,16 @@ func loadOperatorClusterRole(t *testing.T) *rbacv1.ClusterRole {
 	}
 
 	path := filepath.Join(filepath.Dir(thisFile), "..", "..",
-		"deploy", "unbounded-operator", "02-rbac.yaml.tmpl")
+		"deploy", "unbounded-operator", "rendered", "02-rbac.yaml")
 
 	data, err := os.ReadFile(path)
 	if err != nil {
-		t.Fatalf("read operator rbac template: %v", err)
+		t.Fatalf("read rendered operator rbac (run `make unbounded-operator-manifests`): %v", err)
 	}
 
 	for _, doc := range strings.Split(string(data), "\n---") {
 		doc = strings.TrimSpace(doc)
-		// Skip empty docs and the templated ClusterRoleBinding.
-		if doc == "" || strings.Contains(doc, "{{") {
+		if doc == "" {
 			continue
 		}
 

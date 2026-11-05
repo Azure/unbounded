@@ -39,7 +39,6 @@ func TestSystemNamespace_MatchesTemplateDefaults(t *testing.T) {
 		{"machina", filepath.Join("deploy", "machina"), "01-namespace.yaml"},
 		{"machine-ops", filepath.Join("deploy", "machine-ops"), "00-namespace.yaml"},
 		{"orca", filepath.Join("deploy", "orca"), "01-namespace.yaml"},
-		{"unbounded-operator", filepath.Join("deploy", "unbounded-operator"), "00-namespace.yaml"},
 		{"net", filepath.Join("deploy", "net"), "00-namespace.yaml"},
 		{"inventory", filepath.Join("deploy", "inventory"), filepath.Join("common", "01-namespace.yaml")},
 	}
@@ -69,9 +68,9 @@ func TestSystemNamespace_MatchesTemplateDefaults(t *testing.T) {
 	}
 }
 
-// Gantry's chart uses Helm's release namespace rather than a hardcoded template
-// fallback. The Makefile default passed to Helm is therefore its namespace
-// source of truth.
+// Gantry's and unbounded-operator's charts use Helm's release namespace rather
+// than a hardcoded template fallback. The Makefile defaults passed to Helm are
+// therefore their namespace source of truth.
 func TestSystemNamespace_MatchesGantryMakeDefault(t *testing.T) {
 	root := repoRoot(t)
 
@@ -83,9 +82,10 @@ func TestSystemNamespace_MatchesGantryMakeDefault(t *testing.T) {
 	for _, assignment := range []string{
 		"UNBOUNDED_NAMESPACE ?= " + systemNamespace,
 		"GANTRY_NAMESPACE ?= $(UNBOUNDED_NAMESPACE)",
+		"UNBOUNDED_OPERATOR_NAMESPACE ?= $(UNBOUNDED_NAMESPACE)",
 	} {
 		if !strings.Contains(string(raw), assignment) {
-			t.Fatalf("Makefile is missing %q; keep Gantry's render default aligned with systemNamespace %q", assignment, systemNamespace)
+			t.Fatalf("Makefile is missing %q; keep the Helm render defaults aligned with systemNamespace %q", assignment, systemNamespace)
 		}
 	}
 }
