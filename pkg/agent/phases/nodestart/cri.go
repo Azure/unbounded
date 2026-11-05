@@ -179,8 +179,9 @@ func (c *configureContainerd) ensureGPUDropInConfigs() error {
 	)
 }
 
-// HostConfigTask is a configuration task for a host-native node stack that can
-// say whether it changed any file, so a reapply restarts only what it altered.
+// HostConfigTask is a configuration task that can say whether it changed any
+// file, so a reapply restarts only what it altered. The host-native and
+// container node stacks use it.
 type HostConfigTask interface {
 	phases.Task
 	// Changed reports whether Do wrote content that differed from disk.
@@ -188,6 +189,14 @@ type HostConfigTask interface {
 }
 
 func (c *changeTracker) Changed() bool { return c.changed }
+
+// ConfigureContainerdTracked returns the task ConfigureContainerd runs (the
+// configuration and the service unit in the node root) with change tracking.
+// The container backend uses it: its node stack has a private root like the
+// nspawn machine, and a reapply restarts containerd only when this changed.
+func ConfigureContainerdTracked(goalState *goalstates.NodeStart) HostConfigTask {
+	return &configureContainerd{goalState: goalState}
+}
 
 // ConfigureContainerdOnHost returns a task that writes the containerd
 // configuration for a host-native node stack and leaves the service unit to the
