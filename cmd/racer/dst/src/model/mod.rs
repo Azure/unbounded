@@ -972,7 +972,7 @@ impl<'s> Model<'s> {
                         // The requester verifies the signed response on its crypto helper; like
                         // racer-sim (`reply`), the walk does not wait for the slot.
                         let verify = self.fabric.costs.crypto_verify_ns;
-                        self.fabric.crypto(now, node, verify);
+                        self.fabric.crypto(now, node, worker as u8, verify);
                     }
                     if self.diag {
                         let owners = self.latest_owners(page);
@@ -1603,7 +1603,7 @@ impl<'s> Model<'s> {
         // Production drops an exchange its requester abandoned: no chunk starts at or after the
         // requester's attempt bound (racer-sim `transfer_until`, `replies_abandoned`).
         self.answering(&asker, to, now);
-        let sealed = self.sign(to);
+        let sealed = self.sign(to, asker.msg);
         let route = Self::back(&asker, to);
         if !self.alive(&route) {
             self.release_relays(asker.msg);
@@ -1692,8 +1692,11 @@ impl<'s> Model<'s> {
             // Production verifies every request's signature on the crypto helper
             // (`peer/server.rs` `verify_request_async`) before it dispatches or relays it; the
             // destination's worker then takes it (racer-sim `want`, `request_ns`).
+            // The helper is the one paired with the worker holding the connection
+            // (`src/worker.rs` `WorkerPair`).
             let costs = self.fabric.costs;
-            let mut ready = self.fabric.crypto(now, at, costs.crypto_verify_ns);
+            let conn = self.conn_worker(mid);
+            let mut ready = self.fabric.crypto(now, at, conn, costs.crypto_verify_ns);
             if at == m.dest {
                 let w = owner_worker(m.page, self.spec.workers.max(1)) as u8;
                 ready = self.fabric.cpu(ready, at, w, costs.cpu_request_ns);
@@ -1978,9 +1981,14 @@ impl<'s> Model<'s> {
             self.timeouts_queued += 1;
             self.engine.at(abandon, Ev::LastHop { msg: mid });
         }
+        let conn = if holder == self.msgs[&mid].from {
+            self.msgs[&mid].worker as u8
+        } else {
+            self.conn_worker(mid)
+        };
         let signed = self
             .fabric
-            .crypto(ready, holder, self.fabric.costs.crypto_sign_ns);
+            .crypto(ready, holder, conn, self.fabric.costs.crypto_sign_ns);
         let arrive = self.fabric.message(signed, holder, next);
         self.engine.at(
             arrive,
@@ -2089,10 +2097,19 @@ impl<'s> Model<'s> {
 
     /// `node` signs a peer response on its crypto helper (production `sign_response` in
     /// `peer/server.rs`; racer-sim `send_reply`); returns when the signature is ready.
-    fn sign(&mut self, node: u32) -> Nanos {
+    /// The helper is the one paired with the worker holding `mid`'s connection.
+    fn sign(&mut self, node: u32, mid: u64) -> Nanos {
         let now = self.now();
+        let conn = self.conn_worker(mid);
         self.fabric
-            .crypto(now, node, self.fabric.costs.crypto_sign_ns)
+            .crypto(now, node, conn, self.fabric.costs.crypto_sign_ns)
+    }
+
+    /// The worker of a node that holds request `mid`'s connection, as the Model spreads peer
+    /// connections over workers (racer-sim `hop`: `probe % workers`). An inference: production
+    /// assigns accepted connections to workers by its listener, not by request.
+    fn conn_worker(&self, mid: u64) -> u8 {
+        (mid % u64::from(self.spec.workers.max(1))) as u8
     }
 
     /// Send `from`'s due silence pings, at most [`MAX_PINGS_IN_FLIGHT`] at once (production
@@ -2206,7 +2223,7 @@ impl<'s> Model<'s> {
         if !self.alive(&route) {
             return;
         }
-        let ready = self.sign(to);
+        let ready = self.sign(to, asker.msg);
         let at = self.message_back(ready, &route);
         if let Some(ping) = asker.ping {
             // A signed answer: alive when the peer itself answered, silent when a relay
@@ -2410,9 +2427,12 @@ impl<'s> Model<'s> {
                     self.forward(mid, node, None);
                 }
                 Acq::Validate { id, .. } => {
-                    let at = self
-                        .fabric
-                        .crypto(now, node, costs.open(self.spec.page_bytes));
+                    let at = self.fabric.crypto(
+                        now,
+                        node,
+                        worker as u8,
+                        costs.open(self.spec.page_bytes),
+                    );
                     let answer = Input::Validated {
                         id,
                         result: Ok(None),
