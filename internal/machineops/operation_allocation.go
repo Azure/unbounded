@@ -119,6 +119,14 @@ func (r *MachineOperationReconciler) ReconcileAllocationOperation(ctx context.Co
 	}
 
 	if target, ok := operationTarget(&op, machine.Name); ok {
+		// The target finished, and the operation did not record it.
+		switch target.Phase {
+		case unboundedv1alpha3.OperationPhaseComplete:
+			return r.completeOperation(ctx, &op, target.ObservedGeneration, target.Message)
+		case unboundedv1alpha3.OperationPhaseFailed:
+			return r.failOperation(ctx, &op, "TargetFailed", target.Message)
+		}
+
 		a.handle = target.ProviderOperation != nil
 		a.begun = target.Phase == unboundedv1alpha3.OperationPhaseInProgress || target.Attempts > 0 || a.handle
 
