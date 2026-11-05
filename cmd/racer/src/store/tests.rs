@@ -5855,3 +5855,48 @@ fn pending_metadata_follows_queue_membership_per_version() {
     f.store.writer.remove_cache(&version.object.cache).unwrap();
     assert!(f.store.writer.pending.borrow().versions.is_empty());
 }
+#[test]
+fn retention_sweep_drops_pages_whose_key_left_the_keyring() {
+    use crate::control::for_caches;
+    use crate::memory::MemoryCache;
+    use crate::memory::tests::bundle_for;
+    use crate::test_support::security::keys;
+    use crate::test_support::security::rotation_bundle;
+
+    let keys = Rc::new(keys());
+    let cache = CacheId(crate::test_support::security::CACHE.into());
+    let availability = for_caches(keys.clone(), vec![cache]);
+    let f = Fixture::assemble(Directory::new(), availability.clone());
+    let memory = MemoryCache::new(f.pool.clone(), availability);
+    let _ = futures::executor::block_on(f.store.open()).unwrap();
+    f.reactor.init().unwrap();
+    let index = f.store.writer.index();
+    for number in 1..=3 {
+        let copy = f.copy(number, 3);
+        let page = bundle_for(&f.admission, copy.metadata.immutable());
+        f.enqueue(copy).unwrap();
+        drive(&f.reactor, f.store.writer.progress(1, &scope())).unwrap();
+        memory.publish(page).unwrap();
+    }
+    // The first pass after startup finds every key still installed.
+    assert_eq!(memory.sweep_unavailable(1), 0);
+    assert_eq!(index.sweep_unavailable(8), 0);
+    assert_eq!(memory.resident().len(), 3);
+    assert_eq!(index.snapshot().unwrap().entries.len(), 3);
+    // Retiring the page key starts a new pass that removes the pages in
+    // bounded batches, without a lookup touching them first.
+    let mut next = rotation_bundle(2, (*keys.peer_trust_roots().unwrap()).clone());
+    next.cache_keys.clear();
+    keys.install(next).unwrap();
+    assert_eq!(index.sweep_unavailable(2), 2);
+    assert_eq!(index.snapshot().unwrap().entries.len(), 1);
+    assert_eq!(index.sweep_unavailable(2), 1);
+    assert_eq!(index.sweep_unavailable(2), 0);
+    assert!(index.snapshot().unwrap().entries.is_empty());
+    let mut removed = 0;
+    for _ in 0..4 {
+        removed += memory.sweep_unavailable(1);
+    }
+    assert_eq!(removed, 3);
+    assert!(memory.resident().is_empty());
+}

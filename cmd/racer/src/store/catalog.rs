@@ -57,6 +57,9 @@ pub struct Index {
 
     holds: RefCell<super::holds::Holds>,
 
+    /// Keyring generation and age cursor of the unavailable-key sweep.
+    key_sweep: Cell<(Option<u64>, Option<u64>)>,
+
     /// Worker time for freshness, retention scoring, and hold expiry.
     clock: racer_io::Clock,
 }
@@ -703,6 +706,7 @@ impl Index {
             }),
             active_writes: Rc::new(RefCell::new(HashMap::default())),
             holds: RefCell::new(super::holds::Holds::new(clock.clone())),
+            key_sweep: Cell::default(),
         }
     }
     /// Worker time for this index's freshness and expiry decisions.
@@ -1010,6 +1014,48 @@ impl Index {
         Ok(count)
     }
     /// Compare the complete mapping before removing, preserving replacement writes.
+    /// Drop published pages whose cache or page key is no longer admitted,
+    /// examining at most `budget` entries in age order. Idle until the keyring
+    /// generation changes, then resumes each call until one pass completes.
+    /// Held pages are kept; their hold decides their lifetime. Returns the
+    /// number of pages removed.
+    pub fn sweep_unavailable(&self, budget: usize) -> usize {
+        let generation = self.availability.key_generation();
+        let (known, mut cursor) = self.key_sweep.get();
+        if generation != known {
+            cursor = Some(0);
+        }
+        let Some(after) = cursor else {
+            return 0;
+        };
+        let mut next = None;
+        let mut examined = 0;
+        let stale: Vec<(PageId, RecordLocation)> = {
+            let state = self.state.borrow();
+            state
+                .pages
+                .after(after, budget)
+                .inspect(|(age, _, _)| {
+                    next = Some(*age);
+                    examined += 1;
+                })
+                .filter(|(_, page, entry)| {
+                    !self
+                        .availability
+                        .page(&page.version.object.cache, entry.key_id)
+                        && !self.is_held(page)
+                })
+                .map(|(_, page, entry)| (page.clone(), entry.location.clone()))
+                .collect()
+        };
+        self.key_sweep
+            .set((generation, next.filter(|_| examined == budget)));
+        let removed = stale.len();
+        for (page, location) in stale {
+            self.remove_if_matches(&page, &location);
+        }
+        removed
+    }
     pub fn remove_if_matches(&self, page: &PageId, location: &RecordLocation) {
         let mut s = self.state.borrow_mut();
         if s.pages.get(page).is_some_and(|p| &p.location == location) {

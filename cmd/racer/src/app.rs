@@ -2049,6 +2049,13 @@ impl WorkerApplication {
         // Expire idle cache entries first so their buffers reach the pools
         // before those decay.
         self.memory.expire_idle(now);
+        // Drop pages whose key left the keyring, a bounded batch per turn.
+        self.memory
+            .sweep_unavailable(racer_core::cache::EXPIRY_BATCH);
+        self.store
+            .writer
+            .index()
+            .sweep_unavailable(racer_core::cache::EXPIRY_BATCH);
         self.memory.buffers().maintain_idle_buffers(now);
     }
 

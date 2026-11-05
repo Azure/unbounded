@@ -1192,6 +1192,18 @@ pub struct MemoryCache {
     pressure_cursor: RefCell<Option<CacheId>>,
     availability: Rc<crate::control::Availability>,
     expiry: RefCell<racer_core::cache::Expiry>,
+    key_sweep: RefCell<KeySweep>,
+}
+
+/// Progress of a bounded pass that drops entries whose page key the node no
+/// longer holds. A pass starts whenever the keyring generation changes and
+/// walks each table in recency order; entries touched during the pass move
+/// past the cursor and are still visited.
+#[derive(Default)]
+struct KeySweep {
+    generation: Option<u64>,
+    verified: Option<u64>,
+    ciphertext: Option<u64>,
 }
 
 impl MemoryCache {
@@ -1213,6 +1225,7 @@ impl MemoryCache {
             pressure_cursor: RefCell::new(None),
             availability,
             expiry: RefCell::new(racer_core::cache::Expiry::default()),
+            key_sweep: RefCell::default(),
         }
     }
     /// Published cache admission and modes shared with the read path.
@@ -1530,6 +1543,47 @@ impl MemoryCache {
             entries.remove(&id);
         }
         Ok(())
+    }
+    /// Drop at most `budget` examined entries per table whose cache or page
+    /// key is no longer admitted. Idle until the keyring generation changes,
+    /// then resumes each call until both tables have been walked once.
+    /// Returns the number of entries removed.
+    pub(crate) fn sweep_unavailable(&self, budget: usize) -> usize {
+        let mut sweep = self.key_sweep.borrow_mut();
+        let generation = self.availability.key_generation();
+        if generation != sweep.generation {
+            *sweep = KeySweep {
+                generation,
+                verified: Some(0),
+                ciphertext: Some(0),
+            };
+        }
+        let mut removed = 0;
+        if let Some(after) = sweep.verified {
+            let mut entries = self.entries.borrow_mut();
+            let (selected, next) = entries.expiring(after, u64::MAX, budget);
+            sweep.verified = next;
+            for (_, id) in selected {
+                if !self.available(&entries.pages[&id].1) {
+                    entries.remove(&id);
+                    removed += 1;
+                }
+            }
+        }
+        if let Some(after) = sweep.ciphertext {
+            let mut entries = self.ciphertext_entries.borrow_mut();
+            let (selected, next) = entries.expiring(after, u64::MAX, budget);
+            sweep.ciphertext = next;
+            for (_, id) in selected {
+                let cache = &id.version.object.cache;
+                let key = entries[&id].copy.ciphertext.envelope().key_id;
+                if self.availability.passthrough(cache) || !self.availability.page(cache, key) {
+                    entries.remove(&id);
+                    removed += 1;
+                }
+            }
+        }
+        removed
     }
     /// Release entries not inserted or hit for at least `racer_core::cache::IDLE_TTL`,
     /// skipping any still referenced elsewhere (retried on the next pass).

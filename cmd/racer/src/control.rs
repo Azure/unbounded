@@ -225,6 +225,12 @@ impl Availability {
         self.cache(cache) && self.keys.active(cache, KeyPurpose::Page).is_ok()
     }
 
+    /// Generation of the installed keyring, which changes whenever keys are
+    /// added or retired. Retention sweeps restart when it changes.
+    pub fn key_generation(&self) -> Option<u64> {
+        self.keys.generation().ok().flatten()
+    }
+
     /// Require cache admission and the exact key needed by a stored page.
     pub fn page(&self, cache: &CacheId, key: KeyId) -> bool {
         self.cache(cache) && self.keys.lease(Some(cache), key, KeyPurpose::Page).is_ok()
