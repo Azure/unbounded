@@ -160,7 +160,22 @@ tests, resource access, or acceptance policy are implemented.
 | Sustained burn | Per-check deadlines, typed results, and bounded backend evidence | Define and verify full-load duration, per-device sampling, health thresholds, and missing-coverage behavior across the week |
 | Scale | Immutable participant set and coordinated execution | Extend and validate the current eight-participant bound for larger qualification groups |
 | Interruption | Cancellation and inconclusive outcomes | Specify attempt history, retry/resume policy, and whether an interrupted burn must restart; do not infer completion from retries |
+| Multi-run coordination | Individually requested immutable Runs | Define Signal-owned successive cohorts, replacement Runs, coverage accounting, cooldowns, and aggregate metrics without a second orchestrator |
 | Evidence and reporting | Immutable, bounded Kubernetes evidence tied to Run identity | Define export and reporting contracts for long-duration evidence without putting full telemetry in Kubernetes objects |
+
+Multi-run coordination belongs above individual Runs within Signal. A future
+campaign model may select successive node cohorts and track coverage, but its
+resource name and API remain undefined. It must preserve each Run's identity,
+evidence, and verdict rather than rewrite history. Campaign scheduling and
+automatic retries are not implemented by the four-layer baseline.
+
+The burn policy must explicitly define whether the required week is continuous
+or permits evidenced resumption. A conservative option is one uninterrupted
+burn check in one Run, with an interrupted attempt remaining Inconclusive and a
+replacement Run starting its duration from zero. This option is not yet a
+selected policy. Until continuity and resumption rules are defined and
+validated, neither transparent workflow retries nor aggregation of shorter Runs
+establishes week-long burn qualification.
 
 The workload policy currently exposes resources, privileges, host networking,
 and restricted host paths, not arbitrary Pod templates or volume claims.
