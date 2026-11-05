@@ -37,6 +37,10 @@ const (
 type configureContainerd struct {
 	goalState *goalstates.NodeStart
 
+	// skipUnit leaves the containerd service unit alone. Host-native backends
+	// own their unit and must never write the distro's containerd.service.
+	skipUnit bool
+
 	changeTracker
 }
 
@@ -46,8 +50,10 @@ type configureContainerd struct {
 //
 // The agent reaches this work through StartNode, which builds the task directly
 // so it can tell whether the configuration it wrote differed. This entry point
-// remains for callers outside the agent that compose phases themselves.
-func ConfigureContainerd(goalState *goalstates.NodeStart) phases.Task {
+// remains for callers outside the agent that compose phases themselves. The
+// task reports through Changed whether it wrote anything, for a caller that
+// restarts containerd only then.
+func ConfigureContainerd(goalState *goalstates.NodeStart) HostConfigTask {
 	return &configureContainerd{goalState: goalState}
 }
 
@@ -64,8 +70,10 @@ func (c *configureContainerd) Do(_ context.Context) error {
 		}
 	}
 
-	if err := c.ensureContainerdServiceUnit(); err != nil {
-		return fmt.Errorf("ensure containerd service unit: %w", err)
+	if !c.skipUnit {
+		if err := c.ensureContainerdServiceUnit(); err != nil {
+			return fmt.Errorf("ensure containerd service unit: %w", err)
+		}
 	}
 
 	if err := c.ensureGPUDropInConfigs(); err != nil {
@@ -162,6 +170,23 @@ func (c *configureContainerd) ensureGPUDropInConfigs() error {
 	)
 }
 
+// HostConfigTask is a configuration task for a host-native node stack that can
+// say whether it changed any file, so a reapply restarts only what it altered.
+type HostConfigTask interface {
+	phases.Task
+	// Changed reports whether Do wrote content that differed from disk.
+	Changed() bool
+}
+
+func (c *changeTracker) Changed() bool { return c.changed }
+
+// ConfigureContainerdOnHost returns a task that writes the containerd
+// configuration at its host paths (the same paths the nspawn machine sees) and
+// leaves the service unit to the host-native backend.
+func ConfigureContainerdOnHost(goalState *goalstates.NodeStart) HostConfigTask {
+	return &configureContainerd{goalState: goalState, skipUnit: true}
+}
+
 type startContainerd struct {
 	log       *slog.Logger
 	goalState *goalstates.NodeStart
@@ -170,6 +195,16 @@ type startContainerd struct {
 type importContainerImages struct {
 	log       *slog.Logger
 	goalState *goalstates.NodeStart
+}
+
+func (i *importContainerImages) archivePath(a stagedContainerImageArchive) string {
+	// The nspawn machine sees the staged directory bind mounted at a fixed
+	// path. A host-native node stack reads the staged files where they are.
+	if i.goalState.HostNative() {
+		return a.hostPath
+	}
+
+	return a.machinePath
 }
 
 // StartContainerd returns a task that enables and starts the containerd systemd service
@@ -205,15 +240,15 @@ func (i *importContainerImages) Do(ctx context.Context) error {
 
 	for _, archive := range archives {
 		i.log.Info("importing container image archive",
-			"archive", archive.machinePath,
+			"archive", i.archivePath(archive),
 			"host_archive", archive.hostPath,
 		)
 
-		if _, err := i.goalState.Exec(ctx, i.log, "ctr", "--namespace", "k8s.io", "images", "import", archive.machinePath); err != nil {
-			return fmt.Errorf("import container image archive %s in %s: %w", archive.machinePath, i.goalState.MachineName, err)
+		if _, err := i.goalState.Exec(ctx, i.log, "ctr", "--namespace", "k8s.io", "images", "import", i.archivePath(archive)); err != nil {
+			return fmt.Errorf("import container image archive %s in %s: %w", i.archivePath(archive), i.goalState.MachineName, err)
 		}
 
-		i.log.Info("imported container image archive", "archive", archive.machinePath)
+		i.log.Info("imported container image archive", "archive", i.archivePath(archive))
 	}
 
 	return nil
