@@ -64,3 +64,30 @@ func newTestProvider(t *testing.T, name string) *machineops.Provider {
 
 	return provider
 }
+
+func TestAllocationPathForProviders(t *testing.T) {
+	t.Parallel()
+
+	cloud := newTestCapacityProvider(t, "ExampleCloud")
+	plain := newTestProvider(t, "PlainCloud")
+
+	tests := []struct {
+		name         string
+		providers    []*machineops.Provider
+		providerName string
+		want         bool
+	}{
+		{name: "capacity registration", providers: []*machineops.Provider{plain, cloud}, want: true},
+		{name: "no capacity registration", providers: []*machineops.Provider{plain}},
+		{name: "scoped to the capacity registration", providers: []*machineops.Provider{plain, cloud}, providerName: "ExampleCloud", want: true},
+		{name: "scoped to a registration without capacity", providers: []*machineops.Provider{plain, cloud}, providerName: "PlainCloud"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			require.Equal(t, tt.want, allocationPathEnabled(tt.providers, tt.providerName))
+		})
+	}
+}
