@@ -650,6 +650,11 @@ impl Segments {
         lease.validate_extent(extent)
     }
 
+    /// Number of slots in eviction, waiting for leases to drain.
+    pub(crate) fn evicting_count(&self) -> usize {
+        self.evicting.get()
+    }
+
     /// Number of immediately appendable slots, excluding pending eviction.
     pub fn free_count(&self) -> usize {
         self.free.borrow().len()

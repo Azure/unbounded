@@ -159,6 +159,7 @@
 
 pub mod buf;
 mod demand;
+pub mod disk_index;
 pub mod index;
 pub mod retention;
 mod segments;
