@@ -482,6 +482,15 @@ impl Coordinator {
         Ok(snapshot.membership.clone())
     }
 
+    /// The page size the cluster publication fixed; unavailable before one is adopted.
+    pub(crate) fn page_size(&self) -> Result<PageSize> {
+        Ok(self
+            .snapshots
+            .current()?
+            .ok_or(Error::Unavailable)?
+            .page_size)
+    }
+
     pub(crate) fn cache_passthrough(&self, cache: &racer_wire::control::CacheId) -> bool {
         self.fill.passthrough(cache)
     }

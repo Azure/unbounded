@@ -304,6 +304,7 @@ fn a_node_that_left_the_cache_pool_refuses_retained_membership_requests() {
     for action in [
         crate::peer::protocol::PrefetchAction::Probe { pages: vec![0] },
         crate::peer::protocol::PrefetchAction::Fill {
+            page_size: crate::model::PageSize::DEFAULT,
             pages: vec![0],
             length: PAGE_BYTES + 7,
             content_type: None,
@@ -321,6 +322,42 @@ fn a_node_that_left_the_cache_pool_refuses_retained_membership_requests() {
         .unwrap();
         assert!(matches!(response, PeerResponse::StaleMembership));
     }
+    endpoint.uninstall().unwrap();
+}
+
+/// D13: an owner refuses a fill whose pages were cut at another page size
+/// than the cluster's, before probing or filling anything.
+#[test]
+fn owner_refuses_a_fill_cut_at_another_page_size() {
+    let queue = Rc::new(crate::drivers::DriverQueue::new(1024));
+    let _queue = queue.enter();
+    let signers = network(2);
+    let mut f = fixture_with(PAGE_BYTES + 7, None);
+    f.reactor.init().unwrap();
+    let membership = pooled_membership(&mut f, &signers, &[0]);
+    let (local, mut endpoint, _publication) =
+        coordinator(&f, &signers[0], &membership, NoPeer::requester());
+    assert_eq!(local.page_size(), Ok(crate::model::PageSize::DEFAULT));
+    let context = crate::security::OriginContext {
+        object: f.context.object.clone(),
+        metadata: None,
+        authorization: None,
+    };
+    let result = futures::executor::block_on(crate::prefetch::service::serve(
+        &local,
+        f.page.version.clone(),
+        crate::peer::protocol::PrefetchAction::Fill {
+            page_size: crate::model::PageSize::new(64 << 10).unwrap(),
+            pages: vec![0],
+            length: PAGE_BYTES + 7,
+            content_type: None,
+            priority: racer_core::prefetch::Priority::default(),
+        },
+        membership.clone(),
+        &context,
+        &f.scope,
+    ));
+    assert!(matches!(result, Err(Error::InvalidRequest)));
     endpoint.uninstall().unwrap();
 }
 
@@ -388,6 +425,7 @@ fn a_node_outside_the_cache_pool_refuses_tickets_and_fills() {
     for action in [
         crate::peer::protocol::PrefetchAction::Probe { pages: vec![0] },
         crate::peer::protocol::PrefetchAction::Fill {
+            page_size: crate::model::PageSize::DEFAULT,
             pages: vec![0],
             length: PAGE_BYTES + 7,
             content_type: None,

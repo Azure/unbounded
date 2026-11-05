@@ -162,6 +162,41 @@ fn idempotency_and_ordering_table() {
     );
 }
 
+/// D13: refs are cut at the cluster page size, so a 16 MiB range of a
+/// 64 KiB-page cluster is 256 units and every byte count uses 64 KiB.
+#[test]
+fn refs_are_cut_at_the_cluster_page_size() {
+    let small = crate::model::PageSize::new(64 << 10).unwrap();
+    let mut r = rig(Config::default());
+    r.registry.set_page_size(small);
+    let offset = small.get() - 1;
+    let (code, status) = r
+        .put(
+            "t",
+            spec(
+                "",
+                &[&format!(
+                    "\"key\":\"{KEY_A}\",\"offset\":{offset},\"length\":{}",
+                    small.get() + 2
+                )],
+            ),
+        )
+        .unwrap();
+    assert_eq!(code, 201);
+    // Bytes small-1 ..= 2*small cover pages 0, 1, and 2.
+    assert_eq!(status.bytes.aligned_requested, 3 * small.get());
+    assert_eq!(r.registry.pending_bytes(), 3 * small.get());
+    let units = r.drain(|_| UnitOutcome::Admitted);
+    assert_eq!(
+        units.iter().map(|u| u.page).collect::<Vec<_>>(),
+        vec![0, 1, 2]
+    );
+    let status = r.status("t");
+    assert_eq!(status.state, State::Succeeded);
+    assert_eq!(status.bytes.admitted, 3 * small.get());
+    assert_eq!(r.registry.pending_bytes(), 0);
+}
+
 #[test]
 fn batch_succeeds_and_reports_bytes() {
     let mut r = rig(Config::default());

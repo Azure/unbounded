@@ -9,7 +9,7 @@ use super::registry::{
 use super::{Config, Priority};
 use crate::error::{Error, Result};
 use crate::model::{
-    MetadataSelector, ObjectId, ObjectVersion, PAGE_BYTES, PageId, PageNumber, RequestId,
+    MetadataSelector, ObjectId, ObjectVersion, PageId, PageNumber, PageSize, RequestId,
     VersionMetadata,
 };
 use crate::peer::protocol::{Operation as PeerOperation, PeerResponse, PrefetchAction};
@@ -420,7 +420,7 @@ impl Prefetch {
         page: &PageId,
         priority: Priority,
     ) -> std::result::Result<OwnerFill<'_>, PageResult> {
-        self.owner_admit(page, PAGE_BYTES, priority)
+        self.owner_admit(page, crate::model::PAGE_BYTES, priority)
     }
 
     #[cfg(test)]
@@ -505,8 +505,9 @@ fn origin_context(object: &ObjectId, context: &UnitContext) -> Result<OriginCont
     })
 }
 
-fn page_length(length: u64, page: u64) -> u64 {
-    length.saturating_sub(page * PAGE_BYTES).min(PAGE_BYTES)
+fn page_length(length: u64, page: u64, size: PageSize) -> u64 {
+    let size = size.get();
+    length.saturating_sub(page.saturating_mul(size)).min(size)
 }
 
 /// Owner side of `prefetch fill`: one result per page, in order. Pages are
@@ -527,6 +528,10 @@ pub(crate) async fn serve_fill(
     if local.cache_passthrough(&version.object.cache) {
         return vec![PageResult::Failed(FailCode::Unavailable); pages.len()];
     }
+    let size = match local.page_size() {
+        Ok(size) => size,
+        Err(error) => return vec![PageResult::Failed(fail_code(error)); pages.len()],
+    };
     let fills = pages.iter().map(|&number| {
         let page = PageId {
             version: version.clone(),
@@ -540,11 +545,14 @@ pub(crate) async fn serve_fill(
                 Err(error) => return PageResult::Failed(fail_code(error)),
             }
             // Held across the fill: dropping this future releases the slot too.
-            let _fill =
-                match prefetch.owner_admit(&page, page_length(metadata.length, number), priority) {
-                    Ok(fill) => fill,
-                    Err(deferred) => return deferred,
-                };
+            let _fill = match prefetch.owner_admit(
+                &page,
+                page_length(metadata.length, number, size),
+                priority,
+            ) {
+                Ok(fill) => fill,
+                Err(deferred) => return deferred,
+            };
             let result = directory
                 .prefetch_page(page.clone(), metadata.clone(), membership, context, scope)
                 .await;
@@ -607,7 +615,12 @@ pub(crate) async fn serve(
             length,
             content_type,
             priority,
+            page_size,
         } => {
+            // Pages are numbered at the sender's page size; the cluster has one.
+            if local.page_size()? != page_size {
+                return Err(Error::InvalidRequest);
+            }
             let metadata = VersionMetadata {
                 content_type,
                 version: version.clone(),
@@ -649,6 +662,10 @@ async fn dispatch(
     let context = match origin_context(&version.object, &batch.context) {
         Ok(context) => context,
         Err(_) => return all(UnitOutcome::Failed(RefError::OriginError)),
+    };
+    let page_size = match local.page_size() {
+        Ok(size) => size,
+        Err(error) => return all(classify(error)),
     };
     let me = local.local_node();
     let mut groups: BTreeMap<NodeId, Vec<u64>> = BTreeMap::new();
@@ -699,6 +716,7 @@ async fn dispatch(
                         length: batch.metadata.length,
                         content_type: batch.metadata.content_type.clone(),
                         priority: batch.priority,
+                        page_size,
                     },
                 };
                 let answer = local
@@ -938,6 +956,9 @@ async fn coverage(
             .or_default()
             .push(unit.page);
     }
+    let Ok(page_size) = local.page_size() else {
+        return 0;
+    };
     let mut resident = 0u64;
     for ((owner, version), pages) in groups {
         for chunk in pages.chunks(racer_core::prefetch::MAX_OPERATION_PAGES) {
@@ -970,7 +991,7 @@ async fn coverage(
                 .iter()
                 .filter(|r| **r == PageResult::Resident)
                 .count() as u64
-                * PAGE_BYTES;
+                * page_size.get();
         }
     }
     resident
@@ -1066,7 +1087,12 @@ async fn handle_inner(
             }
             let resolved = resolve(local, cache, &membership, &spec, authorization.as_ref()).await;
             scope.check().map_err(|_| unavailable("request expired"))?;
+            // The cluster adopts one page size and never changes it.
+            let page_size = local
+                .page_size()
+                .map_err(|_| unavailable("cache is not ready"))?;
             let (status, body) = prefetch.with_registry(|r| {
+                r.set_page_size(page_size);
                 r.apply_put(cache, &id, spec, resolved, authorization, prefetch.now())
             })?;
             if let Ok(local) = directory.local_coordinator() {

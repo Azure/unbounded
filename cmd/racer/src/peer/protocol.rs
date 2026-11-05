@@ -305,6 +305,8 @@ pub enum PrefetchAction {
         length: u64,
         content_type: Option<crate::model::ContentType>,
         priority: racer_core::prefetch::Priority,
+        /// Page size the requester cut `pages` at; the owner refuses another.
+        page_size: crate::model::PageSize,
     },
     /// Report which pages are resident, without filling.
     Probe { pages: Vec<u64> },
@@ -330,11 +332,10 @@ impl PrefetchAction {
     }
 }
 
-/// Every filled page must exist in a nonempty object.
-fn prefetch_fill_in_range(pages: &[u64], length: u64) -> bool {
+/// Every filled page, cut at `size`, must exist in a nonempty object.
+fn prefetch_fill_in_range(pages: &[u64], length: u64, size: crate::model::PageSize) -> bool {
     pages.last().is_some_and(|last| {
-        // Prefetch still cuts at the default page size (D13 remaining work).
-        last.checked_mul(PAGE_BYTES)
+        last.checked_mul(size.get())
             .is_some_and(|start| start < length)
     })
 }
@@ -535,10 +536,19 @@ pub fn request_head(clock: &racer_io::Clock, request: &PeerRequest) -> Result<Me
         Operation::Page { page, mode } => {
             push(&mut head, "racer-operation", "page");
             version_fields(&mut head, &page.version)?;
-            // The page number is the whole request: the provider cuts it at the
-            // published page size, so no byte range (which would need that size
-            // here) travels with it. Decoders never read one.
             push(&mut head, "racer-page", page.number.0);
+            // Informational only: no decoder reads it, the provider cuts the
+            // page at the published page size. It spans the largest page so
+            // request heads keep their size whatever the cluster page size.
+            let start = page
+                .number
+                .0
+                .checked_mul(PAGE_BYTES)
+                .ok_or(Error::InvalidRange)?;
+            let end = start
+                .checked_add(PAGE_BYTES - 1)
+                .ok_or(Error::InvalidRange)?;
+            push(&mut head, "range", format!("bytes={start}-{end}"));
             (&page.version.object, mode)
         }
         Operation::Metadata {
@@ -569,12 +579,14 @@ pub fn request_head(clock: &racer_io::Clock, request: &PeerRequest) -> Result<Me
                 length,
                 content_type,
                 priority,
+                page_size,
             } = action
             {
-                if !prefetch_fill_in_range(pages, *length) {
+                if !prefetch_fill_in_range(pages, *length, *page_size) {
                     return Err(Error::InvalidRequest);
                 }
                 push(&mut head, "racer-object-length", *length);
+                push(&mut head, "racer-page-size", page_size.get());
                 if let Some(content_type) = content_type {
                     push(&mut head, "racer-content-type", content_type.as_str());
                 }
@@ -641,12 +653,16 @@ fn prefetch_action(head: &MessageHead) -> Result<PrefetchAction> {
     Ok(match field(head, "racer-prefetch-action")?.as_str() {
         "fill" => {
             let length = number(head, "racer-object-length")?;
-            if !prefetch_fill_in_range(&pages, length) {
+            let page_size =
+                racer_wire::object::PageSize::from_wire(number(head, "racer-page-size")?)
+                    .map_err(|_| Error::InvalidRequest)?;
+            if !prefetch_fill_in_range(&pages, length, page_size) {
                 return Err(Error::InvalidRequest);
             }
             PrefetchAction::Fill {
                 pages,
                 length,
+                page_size,
                 content_type: head
                     .unique("racer-content-type")?
                     .map(crate::model::ContentType::parse)

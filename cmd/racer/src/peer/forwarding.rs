@@ -2117,6 +2117,7 @@ mod tests {
     }
     fn prefetch_fill(pages: Vec<u64>) -> crate::peer::protocol::PrefetchAction {
         crate::peer::protocol::PrefetchAction::Fill {
+            page_size: crate::model::PageSize::DEFAULT,
             pages,
             length: 8 * PAGE_BYTES + 1,
             content_type: Some(
@@ -2137,6 +2138,7 @@ mod tests {
         let mut request = prefetch_request(
             31,
             crate::peer::protocol::PrefetchAction::Fill {
+                page_size: crate::model::PageSize::DEFAULT,
                 pages: (0..racer_core::prefetch::MAX_OPERATION_PAGES as u64).collect(),
                 length: racer_core::prefetch::MAX_OPERATION_PAGES as u64 * PAGE_BYTES,
                 content_type: Some(
@@ -2302,6 +2304,7 @@ mod tests {
         use crate::peer::protocol::SecurityCodec;
         use crate::peer::protocol::request_head;
         let fill = |pages: Vec<u64>, length| PrefetchAction::Fill {
+            page_size: crate::model::PageSize::DEFAULT,
             pages,
             length,
             content_type: None,
@@ -2381,6 +2384,8 @@ mod tests {
             ("racer-priority", b"urgent".to_vec()),
             ("racer-content-type", b"not a type".to_vec()),
             ("racer-mode", b"copy".to_vec()),
+            ("racer-page-size", b"12345".to_vec()),
+            ("racer-page-size", b"33554432".to_vec()),
         ] {
             assert!(
                 decode(&set(name, value.clone())).is_err(),
@@ -2392,6 +2397,7 @@ mod tests {
             "racer-prefetch-action",
             "racer-object-length",
             "racer-priority",
+            "racer-page-size",
         ] {
             assert!(
                 decode(&|headers: &mut Vec<http1::Header>| headers.retain(|h| h.name != name))
@@ -2399,6 +2405,55 @@ mod tests {
                 "accepted missing {name}"
             );
         }
+    }
+    /// D13: a fill names the page size its pages were cut at, and the range
+    /// check runs at that size: a page past the end at 64 KiB is refused even
+    /// though it would be page zero's neighbor at 16 MiB.
+    #[test]
+    fn prefetch_fill_carries_and_checks_its_page_size() {
+        use crate::peer::protocol::{PrefetchAction, SecurityCodec, request_head};
+        let small = crate::model::PageSize::new(64 << 10).unwrap();
+        let fill = |pages: Vec<u64>| PrefetchAction::Fill {
+            page_size: small,
+            pages,
+            length: 2 * small.get() + 1,
+            content_type: None,
+            priority: racer_core::prefetch::Priority::Normal,
+        };
+        let clock = crate::test_support::clock();
+        assert!(request_head(&clock, &prefetch_request(31, fill(vec![3]))).is_err());
+        let head = request_head(&clock, &prefetch_request(31, fill(vec![0, 2]))).unwrap();
+        assert_eq!(
+            head.unique("racer-page-size").unwrap().as_deref(),
+            Some(b"65536".as_slice())
+        );
+        let signatures = network(2);
+        let sender = Forwarding::new(signatures[0].clone());
+        let admission = Rc::new(flow_control::Quotas::new(AdmissionPolicy::new(
+            crate::test_support::cluster::config(false).limits,
+        )));
+        let codec =
+            SecurityCodec::new(admission.clone(), crate::memory::BufferPool::new(admission));
+        let (signed, _) = sender
+            .sign_request_to(prefetch_request(32, fill(vec![0, 2])), &node(1))
+            .unwrap();
+        let scope = signed.request.origin.scope().clone();
+        let decoded = codec
+            .request(
+                ForwardedHead {
+                    original: Arc::new(clone_head(&signed.authentication.original)),
+                    hops: vec![],
+                },
+                &scope,
+            )
+            .unwrap();
+        assert!(matches!(
+            decoded.request.operation,
+            Operation::Prefetch {
+                action: PrefetchAction::Fill { page_size, .. },
+                ..
+            } if page_size == small
+        ));
     }
     #[test]
     fn signed_round_trip_reverse_path_response_substitution_and_replay() {

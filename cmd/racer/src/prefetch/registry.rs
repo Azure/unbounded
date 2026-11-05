@@ -13,7 +13,7 @@ use super::api::{
 };
 use super::metrics::{Counter, Outcome};
 use super::{Config, Priority, REFS_PAGE};
-use crate::model::{CacheKey, ObjectId, ObjectVersion, PAGE_BYTES, StrongEtag, VersionMetadata};
+use crate::model::{CacheKey, ObjectId, ObjectVersion, PageSize, StrongEtag, VersionMetadata};
 use racer_wire::control::{CacheId, NodeId};
 use racer_wire::object::prefetch::{ErrorCode, PrefetchError, RefsFilter};
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
@@ -126,10 +126,6 @@ struct Unit {
     dispatcher: Option<TicketKey>,
 }
 
-fn page_bytes() -> u64 {
-    PAGE_BYTES
-}
-
 /// One ref after version resolution.
 struct TicketRef {
     key: CacheKey,
@@ -212,6 +208,8 @@ pub struct Registry {
     rng: u64,
     events: Vec<CounterEvent>,
     finished: Vec<(Priority, Outcome)>,
+    /// Cluster page size refs are cut at.
+    page: PageSize,
 }
 
 /// Wall-clock milliseconds for status timestamps.
@@ -234,7 +232,14 @@ impl Registry {
             rng: seed | 1,
             events: Vec::new(),
             finished: Vec::new(),
+            page: PageSize::DEFAULT,
         }
+    }
+
+    /// Cut refs into pages of `size`, the cluster page size. Set before the
+    /// first ticket; a cluster never changes its page size once adopted.
+    pub fn set_page_size(&mut self, size: PageSize) {
+        self.page = size;
     }
 
     pub fn configure(&mut self, config: Config) {
@@ -288,7 +293,7 @@ impl Registry {
                 .map(|t| t.priority)
                 .min()
                 .unwrap_or_default();
-            queued[priority.index()] += page_bytes();
+            queued[priority.index()] += self.page.get();
         }
         (queued, tickets)
     }
@@ -442,7 +447,8 @@ impl Registry {
                             .length
                             .map_or(length, |l| raw.offset.saturating_add(l).min(length));
                         entry.length = end - raw.offset;
-                        entry.pages = raw.offset / PAGE_BYTES..end.div_ceil(PAGE_BYTES);
+                        let page = self.page.get();
+                        entry.pages = raw.offset / page..end.div_ceil(page);
                         logical = logical.saturating_add(entry.length);
                         for page in entry.pages.clone() {
                             let unit = UnitKey {
@@ -472,7 +478,7 @@ impl Registry {
             let priority = old.priority;
             for unit in dropped {
                 if self.drop_interest(&key, &unit) {
-                    self.event(Counter::WindowDroppedBytes, priority, page_bytes());
+                    self.event(Counter::WindowDroppedBytes, priority, self.page.get());
                 }
             }
         }
@@ -506,7 +512,7 @@ impl Registry {
             open: 0,
             in_flight_bytes: 0,
             logical_requested: logical,
-            aligned_requested: desired.len() as u64 * page_bytes(),
+            aligned_requested: desired.len() as u64 * self.page.get(),
             already_resident: 0,
             joined: 0,
             fetched: 0,
@@ -551,10 +557,13 @@ impl Registry {
                     if unit.state.open() {
                         ticket.open += 1;
                     } else if unit.state == UnitState::Admitted && !already {
-                        ticket.already_resident += page_bytes();
-                        ticket.admitted += page_bytes();
-                        self.events
-                            .push((Counter::AlreadyResidentBytes, priority, page_bytes()));
+                        ticket.already_resident += self.page.get();
+                        ticket.admitted += self.page.get();
+                        self.events.push((
+                            Counter::AlreadyResidentBytes,
+                            priority,
+                            self.page.get(),
+                        ));
                     }
                 }
                 None => {
@@ -573,7 +582,7 @@ impl Registry {
                             dispatcher: None,
                         },
                     );
-                    self.pending_bytes += page_bytes();
+                    self.pending_bytes += self.page.get();
                     ticket.open += 1;
                 }
             }
@@ -619,7 +628,7 @@ impl Registry {
             UnitState::InFlight => false,
             UnitState::Queued => {
                 self.units.remove(unit_key);
-                self.pending_bytes = self.pending_bytes.saturating_sub(page_bytes());
+                self.pending_bytes = self.pending_bytes.saturating_sub(self.page.get());
                 true
             }
             UnitState::Admitted | UnitState::Failed(_) => {
@@ -687,7 +696,7 @@ impl Registry {
         // An idle ticket may always dispatch one page, even under a bound
         // smaller than a page.
         let floor = usize::from(ticket.in_flight_bytes == 0);
-        let room = usize::try_from(budget / page_bytes())
+        let room = usize::try_from(budget / self.page.get())
             .unwrap_or(usize::MAX)
             .max(floor)
             .min(max_pages);
@@ -763,7 +772,7 @@ impl Registry {
         pages.sort_unstable();
         pages.dedup();
         if let Some(ticket) = self.tickets.get_mut(key) {
-            ticket.in_flight_bytes += chosen.len() as u64 * page_bytes();
+            ticket.in_flight_bytes += chosen.len() as u64 * self.page.get();
         }
         Some(Batch {
             dispatcher: key.clone(),
@@ -854,7 +863,7 @@ impl Registry {
         }
         let dispatcher = unit.dispatcher.take();
         if let Some(ticket) = dispatcher.as_ref().and_then(|k| self.tickets.get_mut(k)) {
-            ticket.in_flight_bytes = ticket.in_flight_bytes.saturating_sub(page_bytes());
+            ticket.in_flight_bytes = ticket.in_flight_bytes.saturating_sub(self.page.get());
         }
         let dispatch_priority = dispatcher
             .as_ref()
@@ -896,7 +905,7 @@ impl Registry {
                         .is_some_and(|u| u.interest.is_empty())
                     {
                         self.units.remove(unit_key);
-                        self.pending_bytes = self.pending_bytes.saturating_sub(page_bytes());
+                        self.pending_bytes = self.pending_bytes.saturating_sub(self.page.get());
                     }
                     return;
                 }
@@ -906,7 +915,7 @@ impl Registry {
         unit.state = next;
         unit.owner = owner;
         unit.not_before = None;
-        self.pending_bytes = self.pending_bytes.saturating_sub(page_bytes());
+        self.pending_bytes = self.pending_bytes.saturating_sub(self.page.get());
         let interested: Vec<TicketKey> = unit.interest.iter().cloned().collect();
         let resident = outcome == UnitOutcome::Resident;
         for key in &interested {
@@ -916,20 +925,20 @@ impl Registry {
             ticket.open = ticket.open.saturating_sub(1);
             let priority = ticket.priority;
             if next == UnitState::Admitted {
-                ticket.admitted += page_bytes();
+                ticket.admitted += self.page.get();
                 let counter = if resident {
-                    ticket.already_resident += page_bytes();
+                    ticket.already_resident += self.page.get();
                     Counter::AlreadyResidentBytes
                 } else if Some(key) == dispatcher.as_ref() {
-                    ticket.fetched += page_bytes();
+                    ticket.fetched += self.page.get();
                     Counter::FetchedBytes
                 } else {
-                    ticket.joined += page_bytes();
+                    ticket.joined += self.page.get();
                     Counter::JoinedBytes
                 };
-                self.events.push((counter, priority, page_bytes()));
+                self.events.push((counter, priority, self.page.get()));
                 self.events
-                    .push((Counter::AdmittedBytes, priority, page_bytes()));
+                    .push((Counter::AdmittedBytes, priority, self.page.get()));
             }
         }
         if interested.is_empty() {
@@ -976,13 +985,13 @@ impl Registry {
             }
         }
         for interested in requeued {
-            self.pending_bytes += page_bytes();
+            self.pending_bytes += self.page.get();
             for key in interested {
                 if let Some(ticket) = self.tickets.get_mut(&key) {
                     ticket.open += 1;
                     ticket.cursor = 0;
                     ticket.finished_recorded = false;
-                    ticket.admitted = ticket.admitted.saturating_sub(page_bytes());
+                    ticket.admitted = ticket.admitted.saturating_sub(self.page.get());
                 }
                 self.schedule(&key);
             }
@@ -1214,7 +1223,7 @@ impl Registry {
             .iter()
             .zip(&ticket.refs)
             .filter(|((o, _), _)| *o == RefOutcome::Failed)
-            .map(|(_, r)| (r.pages.end - r.pages.start) * page_bytes())
+            .map(|(_, r)| (r.pages.end - r.pages.start) * self.page.get())
             .sum()
     }
 
@@ -1228,8 +1237,8 @@ impl Registry {
                 .filter(|k| !ticket.rejected.contains(*k))
             {
                 match self.units.get(key).map(|u| u.state) {
-                    Some(UnitState::Queued) => queued += page_bytes(),
-                    Some(UnitState::InFlight) => in_flight += page_bytes(),
+                    Some(UnitState::Queued) => queued += self.page.get(),
+                    Some(UnitState::InFlight) => in_flight += self.page.get(),
                     _ => {}
                 }
             }
