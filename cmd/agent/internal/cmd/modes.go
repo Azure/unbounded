@@ -101,3 +101,19 @@ func (t agentModeTable) operators() (daemon.ModeOperators, error) {
 
 	return ops, nil
 }
+
+// backends returns the backend factory of every mode in the table.
+func (t agentModeTable) backends() (daemon.ModeBackends, error) {
+	out := make(daemon.ModeBackends, len(t))
+
+	for mode := range t {
+		m, err := t.lookup(mode)
+		if err != nil {
+			return nil, err
+		}
+
+		out[mode] = m.newBackend
+	}
+
+	return out, nil
+}
