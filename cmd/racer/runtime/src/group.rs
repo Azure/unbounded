@@ -16,13 +16,24 @@ use std::{
     time::Duration,
 };
 
-/// Poll interval of lifecycle phases (startup, drain, fences, barriers).
+/// Short recheck interval offered to tests and services that poll a condition
+/// without a wake source. The group itself never polls on it: lifecycle phases,
+/// barriers, closes, and fences wake every waiter through its condvar or waker.
 pub const IDLE_WAIT: Duration = Duration::from_millis(1);
 
-/// Longest steady-state park. Lanes and helpers park until a wake source
-/// fires (completion, cross-thread wake, phase change, stop signal) or a
-/// service-reported deadline; this only bounds the arithmetic.
-const MAX_PARK: Duration = Duration::from_secs(3600);
+/// Unbounded park. Lanes and helpers park until a wake source fires
+/// (completion, cross-thread wake, phase change, stop signal) or a deadline
+/// reported by a service or scope.
+const FOREVER: Duration = Duration::MAX;
+
+/// Park the calling thread until unparked or `timeout` elapses.
+fn park_thread(timeout: Duration) {
+    if timeout == FOREVER {
+        thread::park();
+    } else if !timeout.is_zero() {
+        thread::park_timeout(timeout);
+    }
+}
 
 /// Work steps one service turn may run before the lane parks or yields.
 pub const WORK_BUDGET: usize = 64;
@@ -120,9 +131,7 @@ pub trait Service<S: Scope> {
     /// service's waker fires. Always called after a steady-state turn, even
     /// with a zero timeout, so a reactor can submit work queued by the turn.
     fn park(&mut self, timeout: Duration) -> Result<(), S::Error> {
-        if !timeout.is_zero() {
-            thread::park_timeout(timeout);
-        }
+        park_thread(timeout);
         Ok(())
     }
 
@@ -173,9 +182,7 @@ struct ThreadPark;
 
 impl<E> Park<E> for ThreadPark {
     fn park(&mut self, timeout: Duration) -> Result<(), E> {
-        if !timeout.is_zero() {
-            thread::park_timeout(timeout);
-        }
+        park_thread(timeout);
         Ok(())
     }
 }
@@ -552,14 +559,20 @@ impl<E: Copy + PartialEq + From<Error>> Control<E> {
     }
 
     /// Wait for a barrier while checking caller policy outside the state lock.
+    /// Barrier changes and scope cancellation notify the condvar; only the
+    /// scope's own recheck bound limits a wait, never a fixed poll interval.
     fn wait_for<S: Scope<Error = E>>(
-        &self,
+        self: &Arc<Self>,
         scope: &S,
         done: impl Fn(&State<E>) -> bool,
     ) -> Result<(), E>
     where
-        E: From<Error>,
+        E: From<Error> + Send + 'static,
     {
+        let registration = scope.cancellation().map(|c| c.subscribe()).transpose()?;
+        if let Some(registration) = &registration {
+            registration.register(&Waker::from(Arc::new(ConditionWake(self.clone()))));
+        }
         let mut state = self.lock();
         loop {
             if let Some(error) = state.error {
@@ -572,12 +585,20 @@ impl<E: Copy + PartialEq + From<Error>> Control<E> {
             // while holding coordinator state.
             drop(state);
             scope.check()?;
+            let recheck = scope.recheck_within();
             state = self.lock();
-            state = self
-                .changed
-                .wait_timeout(state, IDLE_WAIT)
-                .unwrap_or_else(|e| e.into_inner())
-                .0;
+            if state.error.is_some() || done(&state) {
+                continue;
+            }
+            state = match recheck {
+                None => self.changed.wait(state).unwrap_or_else(|e| e.into_inner()),
+                Some(recheck) => {
+                    self.changed
+                        .wait_timeout(state, recheck)
+                        .unwrap_or_else(|e| e.into_inner())
+                        .0
+                }
+            };
         }
     }
 
@@ -600,6 +621,21 @@ impl<E: Copy + PartialEq + From<Error>> Control<E> {
         while state.phase != Phase::Shutdown && !state.auto_shutdown && state.error.is_none() {
             state = self.changed.wait(state).unwrap_or_else(|e| e.into_inner());
         }
+    }
+}
+
+/// Wakes condition waiters when a caller's scope is canceled. Notifying under
+/// the state lock orders the wake after any waiter's last check.
+struct ConditionWake<E>(Arc<Control<E>>);
+
+impl<E: Copy + PartialEq + From<Error> + Send + 'static> std::task::Wake for ConditionWake<E> {
+    fn wake(self: Arc<Self>) {
+        self.wake_by_ref();
+    }
+
+    fn wake_by_ref(self: &Arc<Self>) {
+        let _state = self.0.lock();
+        self.0.changed.notify_all();
     }
 }
 
@@ -944,7 +980,7 @@ fn drive<S: Scope>(
         // phase-change wake, cancellation, the parker's own deadline, or the
         // scope deadline. An expired teardown scope is only diagnosed, so it
         // does not bound the wait.
-        let mut wait = park.wait_timeout(MAX_PARK).min(MAX_PARK);
+        let mut wait = park.wait_timeout(FOREVER);
         if let Some(recheck) = scope.recheck_within()
             && !recheck.is_zero()
         {
@@ -970,7 +1006,7 @@ fn poll_turn<S: Scope>(
 ) -> Result<Duration, S::Error> {
     service.register_driver(cx.waker());
     service.poll_budgeted(cx, WORK_BUDGET)?;
-    let mut wait = service.wait_timeout(MAX_PARK).min(MAX_PARK);
+    let mut wait = service.wait_timeout(FOREVER);
     if check_scope && let Some(recheck) = scope.recheck_within() {
         wait = wait.min(recheck);
     }
@@ -1108,7 +1144,7 @@ fn helper_thread<S: Scope>(
     control.subscribe(&waker);
     let indices: Vec<_> = services.iter().map(|(i, _)| *i).collect();
     let mut ready = false;
-    let park = Cell::new(MAX_PARK);
+    let park = Cell::new(FOREVER);
     let operations = services
         .iter_mut()
         .map(|(index, service)| {
@@ -1149,7 +1185,8 @@ fn helper_service<'a, S: Scope>(
     waker: &'a Waker,
     park: &'a Cell<Duration>,
 ) -> Operation<'a, (), S::Error> {
-    // Outside the steady state, lifecycle futures are polled at `IDLE_WAIT`.
+    // Outside the steady state, lifecycle futures wake through `waker`; only
+    // startup's scope recheck bounds the helper's park.
     let steady = Rc::new(Cell::new(false));
     let phase = steady.clone();
     let mut operation: Operation<'a, (), S::Error> = Box::pin(async move {
@@ -1178,7 +1215,7 @@ fn helper_service<'a, S: Scope>(
                 service.register_driver(waker);
                 service.poll_budgeted(cx, 1)
             });
-            park.set(park.get().min(service.wait_timeout(MAX_PARK)));
+            park.set(park.get().min(service.wait_timeout(FOREVER)));
             // Skip the coordinator lock until some lane has closed.
             if control.closing.load(Ordering::Acquire) && control.lock().closed[index] {
                 Poll::Ready(())
@@ -1223,8 +1260,10 @@ fn helper_service<'a, S: Scope>(
     });
     Box::pin(std::future::poll_fn(move |cx| {
         let result = operation.as_mut().poll(cx);
-        if !steady.get() {
-            park.set(park.get().min(IDLE_WAIT));
+        if !steady.get()
+            && let Some(recheck) = startup.recheck_within()
+        {
+            park.set(park.get().min(recheck));
         }
         result
     }))
@@ -1299,8 +1338,8 @@ fn diagnose_operation<'a, S: Scope>(
 
 /// Rotate helper polling fairly and retain every future through its final
 /// fence. After `WORK_BUDGET` passes the thread parks until a wake or the
-/// bound the futures reported in `park` (`IDLE_WAIT` without one); the
-/// short spin keeps wake latency off a busy helper's path.
+/// bound the futures reported in `park` (unbounded without one); the short
+/// spin keeps wake latency off a busy helper's path.
 fn drive_helpers<E: Copy + PartialEq + From<Error>>(
     operations: Vec<Operation<'_, (), E>>,
     control: &Control<E>,
@@ -1315,7 +1354,7 @@ fn drive_helpers<E: Copy + PartialEq + From<Error>>(
     let mut cx = Context::from_waker(waker);
     while remaining != 0 {
         if let Some(park) = park {
-            park.set(MAX_PARK);
+            park.set(FOREVER);
         }
         for offset in 0..operations.len() {
             let index = (first + offset) % operations.len();
@@ -1332,10 +1371,7 @@ fn drive_helpers<E: Copy + PartialEq + From<Error>>(
         passes += 1;
         if remaining != 0 && passes == WORK_BUDGET {
             passes = 0;
-            let wait = park.map_or(IDLE_WAIT, Cell::get);
-            if !wait.is_zero() {
-                thread::park_timeout(wait);
-            }
+            park_thread(park.map_or(FOREVER, Cell::get));
         }
     }
 }
@@ -2311,7 +2347,7 @@ mod tests {
             /// Assert post-poll ordering.
             fn wait_timeout(&self, maximum: Duration) -> Duration {
                 assert!(self.polled, "wait policy must observe the completed poll");
-                assert_eq!(maximum, MAX_PARK);
+                assert_eq!(maximum, FOREVER);
                 self.wait
             }
 
@@ -2551,7 +2587,7 @@ mod tests {
                         &TestScope,
                         &control,
                         &waker,
-                        &Cell::new(MAX_PARK),
+                        &Cell::new(FOREVER),
                     )],
                     &control,
                     &waker,

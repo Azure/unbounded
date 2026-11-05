@@ -2031,7 +2031,9 @@ mod tests {
                     self.observed.event(self.worker, "crypto-drain");
                     // A pending drain of one shard needs the other shard to drain. This
                     // deadlocks if the shared thread blocks on lifecycle futures in order.
-                    std::future::poll_fn(|_| {
+                    // The sibling may run on another helper thread without a wake
+                    // source here, so ask to be polled again.
+                    std::future::poll_fn(|cx| {
                         let sibling_entered =
                             self.observed
                                 .events
@@ -2045,6 +2047,7 @@ mod tests {
                             && self.failure != Failure::BuildCrypto
                             && !sibling_entered
                         {
+                            cx.waker().wake_by_ref();
                             Poll::Pending
                         } else {
                             Poll::Ready(())
@@ -2063,7 +2066,8 @@ mod tests {
                 Box::pin(async move {
                     self.observed.event(self.worker, "crypto-shutdown");
                     self.observed.shutdown.fetch_add(1, Ordering::SeqCst);
-                    std::future::poll_fn(|_| {
+                    // The sibling shard may be on another helper thread.
+                    std::future::poll_fn(|cx| {
                         let expected = if self.failure == Failure::BuildCrypto {
                             1
                         } else {
@@ -2072,6 +2076,7 @@ mod tests {
                         if self.observed.shutdown.load(Ordering::SeqCst) == expected {
                             Poll::Ready(())
                         } else {
+                            cx.waker().wake_by_ref();
                             Poll::Pending
                         }
                     })
