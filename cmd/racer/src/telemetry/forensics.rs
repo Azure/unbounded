@@ -408,17 +408,25 @@ impl Failure {
 }
 
 #[derive(Clone, Default)]
-pub struct Failures(
-    SharedRing<(WorkerId, Failure), FAILURE_CAPACITY>,
-    AeadRing,
-    SharedRing<ProtectedFailure, 64>,
-    SharedRing<ProtectedFailure, 64>,
-    SharedRing<(WorkerId, CandidateFinal), 16>,
-    std::sync::Arc<GateEvents>,
-    SharedRing<(WorkerId, RequestId, u64, FlightExpiry), 16>,
-    SharedRing<DecryptFailure, DECRYPT_FAILURE_CAPACITY>,
-    FailureClock,
-);
+pub struct Failures {
+    /// Terminal client-request failures, one per failed request.
+    terminal: SharedRing<(WorkerId, Failure), FAILURE_CAPACITY>,
+    /// AEAD open failures with their peer provenance.
+    aead: AeadRing,
+    /// Protected-path failures outside admission.
+    protected: SharedRing<ProtectedFailure, 64>,
+    /// Protected-path failures at fill admission.
+    admission: SharedRing<ProtectedFailure, 64>,
+    /// Final candidate trails for requests that exhausted every source.
+    candidates: SharedRing<(WorkerId, CandidateFinal), 16>,
+    /// Join and wait gate events with per-kind counts.
+    gates: std::sync::Arc<GateEvents>,
+    /// Single-flight expiries.
+    expiries: SharedRing<(WorkerId, RequestId, u64, FlightExpiry), 16>,
+    /// Decrypt scope failures.
+    decrypts: SharedRing<DecryptFailure, DECRYPT_FAILURE_CAPACITY>,
+    clock: FailureClock,
+}
 
 /// Wall clock that stamps failures when they are recorded.
 #[derive(Clone)]
@@ -603,19 +611,19 @@ impl Failures {
     /// Failures stamped from `clock` instead of the host wall clock.
     pub fn with_clock(clock: racer_io::Clock) -> Self {
         Self {
-            8: FailureClock(std::sync::Arc::new(clock)),
+            clock: FailureClock(std::sync::Arc::new(clock)),
             ..Self::default()
         }
     }
     pub(crate) fn unix_millis(&self) -> u64 {
-        unix_millis(self.8.0.wall_now())
+        unix_millis(self.clock.0.wall_now())
     }
     pub(crate) fn now(&self) -> Instant {
-        self.8.0.now()
+        self.clock.0.now()
     }
     /// Write the independent bounded expiry ring without changing gate counters.
     pub(crate) fn write_flight_expiry(&self, out: &mut impl std::fmt::Write) -> std::fmt::Result {
-        let snapshot = self.6.snapshot();
+        let snapshot = self.expiries.snapshot();
         writeln!(
             out,
             "schema_version=1 capacity=16 sample_limit=6 selection=index_order_not_oldest capture=expiry_poll_before_unwind quota_counters=separate_non_atomic_samples stage=driver_call_not_backend_execution candidate_stage=composite_including_nested_validation absent_stage=unknown completing=flight_resource_destruction_fence backend_phase=unknown total={} retained={} overwritten={}",
@@ -670,7 +678,7 @@ impl Failures {
     }
 
     pub(crate) fn write_gate_events(&self, out: &mut impl std::fmt::Write) -> std::fmt::Result {
-        let snapshot = self.5.ring.snapshot();
+        let snapshot = self.gates.ring.snapshot();
         writeln!(
             out,
             "schema_version=1 counter_rows=58 coverage=flight_join_and_reactor_submit_events terminal_cause=false operation_identity=not_recorded page_identity=request_relative_number existing_failed=propagated_not_new_rejection unclassified=join_overload_origin_unknown wait_events=terminal_once wait_cause=prior_observation_not_terminal_capacity counters_and_ring=non_atomic_snapshot total={} retained={} overwritten={} capacity=64",
@@ -678,7 +686,7 @@ impl Failures {
             snapshot.len(),
             snapshot.total().saturating_sub(snapshot.len() as u64)
         )?;
-        for (index, count) in self.5.counts.iter().enumerate() {
+        for (index, count) in self.gates.counts.iter().enumerate() {
             let reason = if index < 24 {
                 [
                     "Initialization",
@@ -748,7 +756,7 @@ impl Failures {
         Ok(())
     }
     pub(crate) fn write_candidate_final(&self, out: &mut impl std::fmt::Write) -> std::fmt::Result {
-        let snapshot = self.4.snapshot();
+        let snapshot = self.candidates.snapshot();
         writeln!(
             out,
             "schema_version=1 total={} retained={} overwritten={} capacity=16 coverage=candidate_operation_final operations=resolve,remaining_copy,origin_miss excluded=standalone_subscribe,hedge_errors origin_miss_trail=predecessors_only trail_capacity=4 trail_unit=events",
@@ -820,7 +828,11 @@ impl Failures {
         admission: bool,
         out: &mut impl std::fmt::Write,
     ) -> std::fmt::Result {
-        let ring = if admission { &self.3 } else { &self.2 };
+        let ring = if admission {
+            &self.admission
+        } else {
+            &self.protected
+        };
         let snapshot = ring.snapshot();
         writeln!(
             out,
@@ -873,7 +885,7 @@ impl Failures {
         Ok(())
     }
     pub fn write_aead(&self, out: &mut impl std::fmt::Write) -> std::fmt::Result {
-        let ring = self.1.snapshot();
+        let ring = self.aead.snapshot();
         let (total, len) = (ring.total(), ring.len());
         writeln!(
             out,
@@ -910,7 +922,7 @@ impl Failures {
         Ok(())
     }
     pub fn write_decrypt(&self, out: &mut impl std::fmt::Write) -> std::fmt::Result {
-        let ring = self.7.snapshot();
+        let ring = self.decrypts.snapshot();
         let (total, len) = (ring.total(), ring.len());
         writeln!(
             out,
@@ -960,7 +972,7 @@ impl Failures {
     }
     pub fn write(&self, out: &mut impl std::fmt::Write) -> std::fmt::Result {
         // Copy bounded records before formatting; never hold the lock across I/O.
-        let ring = self.0.snapshot();
+        let ring = self.terminal.snapshot();
         let (total, len) = (ring.total(), ring.len());
         writeln!(
             out,
@@ -1034,7 +1046,9 @@ impl Observer {
     /// Publish already frozen facts after all worker-local borrows have ended.
     pub(crate) fn flight_expiry(&self, scope: &RequestScope, page: u64, facts: FlightExpiry) {
         if let Some((failures, worker)) = &self.0 {
-            failures.6.push((*worker, scope.request, page, facts));
+            failures
+                .expiries
+                .push((*worker, scope.request, page, facts));
         }
     }
 
@@ -1042,8 +1056,8 @@ impl Observer {
         let Some((failures, worker)) = &self.0 else {
             return;
         };
-        failures.5.counts[facts.index()].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        failures.5.ring.push(GateEvent {
+        failures.gates.counts[facts.index()].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        failures.gates.ring.push(GateEvent {
             worker: *worker,
             failure: Failure::new(
                 Stage::Admission,
@@ -1063,18 +1077,18 @@ impl Observer {
             if record.failure.unix_millis == 0 {
                 record.failure.unix_millis = failures.unix_millis();
             }
-            failures.4.push((*worker, record));
+            failures.candidates.push((*worker, record));
         }
     }
     pub(crate) fn record_aead(&self, id: crate::security::CryptoId, failure: AeadFailure) {
         let Some((failures, _)) = &self.0 else {
             return;
         };
-        failures.1.push((id, failure));
+        failures.aead.push((id, failure));
     }
     pub(crate) fn record_decrypt(&self, failure: DecryptFailure) {
         if let Some((failures, _)) = &self.0 {
-            failures.7.push(failure);
+            failures.decrypts.push(failure);
         }
     }
     pub fn record(&self, mut failure: Failure) {
@@ -1084,12 +1098,12 @@ impl Observer {
         if failure.unix_millis == 0 {
             failure.unix_millis = failures.unix_millis();
         }
-        failures.0.push((*worker, failure));
+        failures.terminal.push((*worker, failure));
         if matches!(
             failure.stage,
             Stage::ClientRead | Stage::FirstSlice | Stage::NextSlice | Stage::ClientWrite
         ) {
-            failures.2.push(ProtectedFailure {
+            failures.protected.push(ProtectedFailure {
                 worker: *worker,
                 failure,
                 site: None,
@@ -1107,7 +1121,7 @@ impl Observer {
         let Some((failures, worker)) = &self.0 else {
             return;
         };
-        failures.3.push(ProtectedFailure {
+        failures.admission.push(ProtectedFailure {
             worker: *worker,
             failure: Failure::new(Stage::Admission, Error::Overloaded)
                 .request(scope)
@@ -1306,7 +1320,7 @@ mod protected_failure_tests {
         }
         impl std::fmt::Write for Output<'_> {
             fn write_str(&mut self, text: &str) -> std::fmt::Result {
-                assert!(self.failures.4.try_snapshot().is_some());
+                assert!(self.failures.candidates.try_snapshot().is_some());
                 if self.fail {
                     return Err(std::fmt::Error);
                 }
@@ -1350,10 +1364,10 @@ mod protected_failure_tests {
         }
         impl std::fmt::Write for Output<'_> {
             fn write_str(&mut self, s: &str) -> std::fmt::Result {
-                assert!(self.failures.0.try_snapshot().is_some());
-                assert!(self.failures.1.try_snapshot().is_some());
-                assert!(self.failures.2.try_snapshot().is_some());
-                assert!(self.failures.3.try_snapshot().is_some());
+                assert!(self.failures.terminal.try_snapshot().is_some());
+                assert!(self.failures.aead.try_snapshot().is_some());
+                assert!(self.failures.protected.try_snapshot().is_some());
+                assert!(self.failures.admission.try_snapshot().is_some());
                 if self.fail {
                     return Err(std::fmt::Error);
                 }
@@ -1534,7 +1548,7 @@ mod tests {
             }
             impl std::fmt::Write for Output<'_> {
                 fn write_str(&mut self, text: &str) -> std::fmt::Result {
-                    assert!(self.failures.7.try_snapshot().is_some());
+                    assert!(self.failures.decrypts.try_snapshot().is_some());
                     if self.fail {
                         return Err(std::fmt::Error);
                     }
@@ -1639,8 +1653,8 @@ mod tests {
             }
             impl std::fmt::Write for Unlocked<'_> {
                 fn write_str(&mut self, value: &str) -> std::fmt::Result {
-                    assert!(self.failures.0.try_snapshot().is_some());
-                    assert!(self.failures.1.try_snapshot().is_some());
+                    assert!(self.failures.terminal.try_snapshot().is_some());
+                    assert!(self.failures.aead.try_snapshot().is_some());
                     self.text.push_str(value);
                     Ok(())
                 }
@@ -1779,7 +1793,7 @@ mod tests {
             )
             .unwrap();
             observer.result(Stage::ClientRead, &scope, Ok(())).unwrap();
-            assert_eq!(failures.0.snapshot().total(), 0);
+            assert_eq!(failures.terminal.snapshot().total(), 0);
             std::thread::spawn(move || {
                 for _ in 0..FAILURE_CAPACITY + 2 {
                     observer.record(
