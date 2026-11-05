@@ -719,6 +719,38 @@ pub fn encode_envelope(
     Ok(head)
 }
 
+/// Status of the unsigned answer to a request its holder could not verify for overload.
+pub const OVERLOADED_STATUS: u16 = 429;
+
+/// The unsigned overload answer: status [`OVERLOADED_STATUS`] and an empty body. A holder sends
+/// it when it sheds a request before verifying it, for example with its crypto queue full. It
+/// carries nothing from the request and costs no key operation, so it reveals only that the
+/// holder is busy, which closing the connection would reveal as well.
+pub fn overloaded_head() -> MessageHead {
+    MessageHead {
+        start: StartLine::Response {
+            status: OVERLOADED_STATUS,
+        },
+        headers: vec![Header {
+            name: "content-length".into(),
+            value: b"0".to_vec(),
+        }],
+    }
+}
+
+/// Whether `head` is exactly [`overloaded_head`]. Anything else keeps the signed envelope path.
+pub fn is_overloaded(head: &MessageHead) -> bool {
+    matches!(
+        head.start,
+        StartLine::Response {
+            status: OVERLOADED_STATUS
+        }
+    ) && matches!(
+        head.headers.as_slice(),
+        [Header { name, value }] if name.eq_ignore_ascii_case("content-length") && value == b"0"
+    )
+}
+
 /// Decode framing; callers separately verify proofs and admit the carrying session.
 pub fn decode_envelope(head: MessageHead, response: bool) -> Result<(ForwardedHead, usize)> {
     match (&head.start, response) {

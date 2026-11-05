@@ -850,3 +850,29 @@ fn route_state_accepts_eight_links_and_rejects_nine() {
         );
     }
 }
+
+#[test]
+fn overloaded_head_is_exact_and_bodiless() {
+    let head = overloaded_head();
+    assert!(is_overloaded(&head));
+    // The encoded answer carries nothing but the status and an empty body.
+    let bytes = Codec::new(MAX_HEAD).encode_head(&head).unwrap();
+    assert_eq!(
+        bytes,
+        b"HTTP/1.1 429 \r\ncontent-length: 0\r\n\r\n".to_vec()
+    );
+    let mut other = overloaded_head();
+    other.start = StartLine::Response { status: 503 };
+    assert!(!is_overloaded(&other));
+    let mut body = overloaded_head();
+    body.headers[0].value = b"1".to_vec();
+    assert!(!is_overloaded(&body));
+    let mut extra = overloaded_head();
+    extra.headers.push(Header {
+        name: "racer-peer-version".into(),
+        value: VERSION.as_bytes().to_vec(),
+    });
+    assert!(!is_overloaded(&extra));
+    // A signed envelope is never mistaken for it, and it never decodes as one.
+    assert!(decode_envelope(overloaded_head(), true).is_err());
+}
