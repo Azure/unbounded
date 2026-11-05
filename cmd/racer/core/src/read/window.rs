@@ -81,7 +81,7 @@ pub enum Slot {
 }
 
 impl Slot {
-    fn kind(&self) -> SlotKind {
+    pub fn kind(&self) -> SlotKind {
         match self {
             Slot::Probing(_) => SlotKind::Probing,
             Slot::Missing { select } => SlotKind::Missing { select: *select },
@@ -263,6 +263,8 @@ pub struct ReadWindow {
     orphans: BTreeMap<EffectId, u64>,
     error: Option<Error>,
     terminated: bool,
+    /// Scratch slot kinds for planning, reused across pumps.
+    kinds: Vec<SlotKind>,
 }
 
 impl ReadWindow {
@@ -281,6 +283,36 @@ impl ReadWindow {
             orphans: BTreeMap::new(),
             error: None,
             terminated: false,
+            kinds: Vec::new(),
+        }
+    }
+
+    pub fn config(&self) -> &WindowConfig {
+        &self.config
+    }
+
+    /// Replace the page budget of pages admitted from now on; admitted pages keep theirs.
+    pub fn set_budget(&mut self, budget: PageBudget) {
+        self.config.budget = budget;
+    }
+
+    /// Whether the read ended (delivered its range, failed or was canceled).
+    pub fn terminated(&self) -> bool {
+        self.terminated
+    }
+
+    /// Place `slot` at window index `index`, appending when `index` is the window length. For
+    /// interpreter tests that script a window; the caller owns any client credit of the page.
+    #[doc(hidden)]
+    pub fn place(&mut self, index: usize, slot: Slot) {
+        let number = self.page_at(index);
+        if let Slot::Selecting(id) = slot {
+            self.selections.entry(id).or_default().insert(number);
+        }
+        if index == self.slots.len() {
+            self.slots.push_back(slot);
+        } else {
+            self.slots[index] = slot;
         }
     }
 
@@ -289,7 +321,7 @@ impl ReadWindow {
         self.next
     }
 
-    pub fn slots(&self) -> impl Iterator<Item = &Slot> {
+    pub fn slots(&self) -> impl ExactSizeIterator<Item = &Slot> {
         self.slots.iter()
     }
 
@@ -302,6 +334,14 @@ impl ReadWindow {
     pub fn interest(&self) -> (BTreeSet<u64>, BTreeSet<u64>) {
         let mut wants = BTreeSet::new();
         let mut busy = BTreeSet::new();
+        self.interest_into(&mut wants, &mut busy);
+        (wants, busy)
+    }
+
+    /// [`Self::interest`] into existing sets, which are cleared first.
+    pub fn interest_into(&self, wants: &mut BTreeSet<u64>, busy: &mut BTreeSet<u64>) {
+        wants.clear();
+        busy.clear();
         for (index, slot) in self.slots.iter().enumerate() {
             let number = self.page_at(index);
             match slot {
@@ -318,7 +358,6 @@ impl ReadWindow {
                 Slot::Ready { .. } | Slot::Failed(_) => {}
             }
         }
-        (wants, busy)
     }
 
     /// Spill pages held and not yet released.
@@ -330,7 +369,8 @@ impl ReadWindow {
         self.next + index as u64
     }
 
-    fn direct_ahead(&self) -> usize {
+    /// Direct fills kept in flight beyond the head page.
+    pub fn direct_ahead(&self) -> usize {
         if self.config.sealed || self.config.passthrough {
             self.config.window_pages.saturating_sub(1).max(DIRECT_AHEAD)
         } else {
@@ -420,8 +460,9 @@ impl ReadWindow {
         }
     }
 
-    fn kinds(&self) -> Vec<SlotKind> {
-        self.slots.iter().map(Slot::kind).collect()
+    fn refresh_kinds(&mut self) {
+        self.kinds.clear();
+        self.kinds.extend(self.slots.iter().map(Slot::kind));
     }
 
     fn admit(
@@ -431,10 +472,10 @@ impl ReadWindow {
         ids: &mut EffectIds,
         out: &mut Vec<Effect>,
     ) -> Result<(), Error> {
-        let kinds = self.kinds();
-        let failed = first_failure(&kinds);
+        self.refresh_kinds();
+        let failed = first_failure(&self.kinds);
         let next = self.next;
-        let plan = direct_fills(&kinds, self.direct_ahead(), |index| {
+        let plan = direct_fills(&self.kinds, self.direct_ahead(), |index| {
             facts.elsewhere.contains(&(next + index as u64))
         });
         for index in plan {
@@ -459,8 +500,9 @@ impl ReadWindow {
                 .filter(|slot| **slot == Slot::Missing { select: true })
                 .count();
             let limit = share(holes, self.selections.len(), facts.spare);
+            self.refresh_kinds();
             let Some((intervals, pages)) = selection_demand(
-                &self.kinds(),
+                &self.kinds,
                 self.next,
                 |number| facts.elsewhere.contains(&number),
                 limit,

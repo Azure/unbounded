@@ -291,7 +291,7 @@ impl WorkerDirectory {
         context: &OriginContext,
         scope: &RequestScope,
         budget: AcquisitionBudget,
-    ) -> Result<Operation<'static, (Result<PageResult>, AcquisitionBudget)>> {
+    ) -> Result<Operation<'static, PageResult>> {
         // Always use the owned worker driver, even for local ingress. Detaching the
         // stream must not free the provider contract before accepted I/O fences.
         let owner = self.metadata_owner(&version.object)?;
@@ -302,13 +302,10 @@ impl WorkerDirectory {
             Some(budget),
         )?;
         Ok(Box::pin(async move {
-            let completion = receipt.await?;
-            let budget = completion.budget.ok_or(Error::StaleFlight)?;
-            let result = completion.value.and_then(|value| match value {
+            match receipt.await?.value? {
                 Value::Page(result) => Ok(result),
                 _ => Err(Error::StaleFlight),
-            });
-            Ok((result, budget))
+            }
         }))
     }
     pub(crate) async fn accept_selected(
@@ -789,7 +786,7 @@ impl WorkerDirectory {
         context: &OriginContext,
         scope: &RequestScope,
         budget: AcquisitionBudget,
-    ) -> Result<Operation<'static, (Result<PageResult>, AcquisitionBudget)>> {
+    ) -> Result<Operation<'static, PageResult>> {
         if page.version.object != context.object {
             return Err(Error::InvalidRequest);
         }
@@ -801,13 +798,10 @@ impl WorkerDirectory {
             Some(budget),
         )?;
         Ok(Box::pin(async move {
-            let completion = receipt.await?;
-            let budget = completion.budget.ok_or(Error::StaleFlight)?;
-            let value = completion.value.and_then(|value| match value {
+            match receipt.await?.value? {
                 Value::Page(value) => Ok(value),
                 _ => Err(Error::StaleFlight),
-            });
-            Ok((value, budget))
+            }
         }))
     }
     /// Like [`Self::start_page`], but ciphertext the GPU behind `target`
@@ -820,7 +814,7 @@ impl WorkerDirectory {
         scope: &RequestScope,
         budget: AcquisitionBudget,
         target: super::sealed::SealedTarget,
-    ) -> Result<Operation<'static, (Result<super::sealed::Fetched>, AcquisitionBudget)>> {
+    ) -> Result<Operation<'static, super::sealed::Fetched>> {
         if page.version.object != context.object {
             return Err(Error::InvalidRequest);
         }
@@ -832,13 +826,10 @@ impl WorkerDirectory {
             Some(budget),
         )?;
         Ok(Box::pin(async move {
-            let completion = receipt.await?;
-            let budget = completion.budget.ok_or(Error::StaleFlight)?;
-            let value = completion.value.and_then(|value| match value {
+            match receipt.await?.value? {
                 Value::Fetched(value) => Ok(value),
                 _ => Err(Error::StaleFlight),
-            });
-            Ok((value, budget))
+            }
         }))
     }
 
