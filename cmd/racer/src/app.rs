@@ -125,6 +125,9 @@ pub struct Application {
     limits: Limits,
 
     discovered_nics: Vec<racer_control_wire::RailMapping>,
+
+    /// Worker context every lane, helper, and lifecycle scope runs on.
+    ctx: racer_io::WorkerCtx,
 }
 
 /// Shared immutable-publication and partitioned-admission roots. No Rc worker
@@ -452,6 +455,7 @@ impl Application {
             config: Arc::new(config),
             node: Arc::new(NodeState::default()),
             discovered_nics: Vec::new(),
+            ctx: racer_io::WorkerCtx::host(),
         })
     }
 
@@ -479,7 +483,7 @@ impl Application {
             plan.pairs.iter().map(|p| p.worker).collect(),
             self.limits.queue_entries.get(),
             self.config.peer_admission,
-            racer_io::WorkerCtx::host(),
+            self.ctx.clone(),
         )?;
         node.azure = crate::origin::azure::AzureNode::new(&self.config.origin);
         self.node = Arc::new(node);
@@ -558,7 +562,7 @@ impl Application {
             .ok_or(Error::InvalidConfiguration)?
             .node = identity;
         self.prepare_workers()?;
-        let mut workers = WorkerGroup::new(plan);
+        let mut workers = WorkerGroup::new(plan, self.ctx.clone());
         let result = if self.config.managed() {
             workers.run_with_startup(&self, None)
         } else {
@@ -2462,6 +2466,7 @@ impl Application {
                 .map(|(worker, _)| *worker)
                 .collect(),
             1,
+            self.ctx.clone(),
         )?;
         self.resources
             .set(resources)

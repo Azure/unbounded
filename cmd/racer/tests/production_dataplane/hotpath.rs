@@ -514,7 +514,7 @@ fn shared_directory_routes_cold_and_offline_reads_to_both_owners() {
         })
         .collect();
     let factory = Arc::new(Factory {
-        resources: Resources::new(budgets(), ids.clone(), 1).unwrap(),
+        resources: Resources::new(budgets(), ids.clone(), 1, racer_io::WorkerCtx::host()).unwrap(),
         root: scratch.path.clone(),
         commands: Mutex::new(receivers),
         directory: Arc::new(
@@ -522,7 +522,7 @@ fn shared_directory_routes_cold_and_offline_reads_to_both_owners() {
         ),
         slab_bytes: 256 * MIB,
     });
-    let mut group = WorkerGroup::new(plan);
+    let mut group = WorkerGroup::new(plan, racer_io::WorkerCtx::host());
     group.start(factory, &scope()).unwrap();
     for (owner, key) in keys.iter().enumerate() {
         let mut client = connect(&commands[1 - owner]);
@@ -606,7 +606,7 @@ fn warm_page_allocations() {
     let (send, receive) = mpsc::sync_channel(256);
     let commands = vec![send];
     let factory = Arc::new(Factory {
-        resources: Resources::new(budgets(), ids.clone(), 1).unwrap(),
+        resources: Resources::new(budgets(), ids.clone(), 1, racer_io::WorkerCtx::host()).unwrap(),
         root: scratch.path.clone(),
         commands: Mutex::new(BTreeMap::from([(0, receive)])),
         directory: Arc::new(
@@ -614,7 +614,7 @@ fn warm_page_allocations() {
         ),
         slab_bytes: 256 * MIB,
     });
-    let mut group = WorkerGroup::new(plan);
+    let mut group = WorkerGroup::new(plan, racer_io::WorkerCtx::host());
     group.start(factory, &scope()).unwrap();
     for key in &keys {
         assert_eq!(get(&mut connect(&commands[0]), *key, true).unwrap(), 200);
@@ -697,13 +697,13 @@ fn run_case(root: &std::path::Path, default: &AffinityPlan, mode: &str, concurre
     let plan = owned_plan(default);
     let crypto_threads = plan.crypto_groups().len();
     let factory = Arc::new(Factory {
-        resources: Resources::new(budgets(), ids.clone(), 1).unwrap(),
+        resources: Resources::new(budgets(), ids.clone(), 1, racer_io::WorkerCtx::host()).unwrap(),
         root: root.into(),
         commands: Mutex::new(receivers),
         directory,
         slab_bytes: slab_bytes(workers),
     });
-    let mut group = WorkerGroup::new(plan);
+    let mut group = WorkerGroup::new(plan, racer_io::WorkerCtx::host());
     group.start(factory, &scope()).unwrap();
     println!(
         "case={mode} concurrency={concurrency} io_shards={workers} crypto_threads={crypto_threads} worker_threads={} driver_threads=1 plaintext_MiB_per_worker=256 ciphertext_MiB_per_worker=512 dirty_MiB_per_worker=128 page_MiB=16",

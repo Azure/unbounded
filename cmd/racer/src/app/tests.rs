@@ -2883,19 +2883,23 @@ fn node_replacement_drains_all_workers_and_restart_converges() {
             config: Arc::new(config),
             node: node.clone(),
             discovered_nics: vec![],
+            ctx: crate::test_support::ctx(),
         });
         let cpu = EffectiveTopology::discover().unwrap().cpus[0].clone();
-        let mut group = WorkerGroup::new(AffinityPlan {
-            max_threads: 5,
-            pairs: (0..2)
-                .map(|id| WorkerPair {
-                    worker: WorkerId(id),
-                    io: cpu.clone(),
-                    crypto: cpu.clone(),
-                    nic: None,
-                })
-                .collect(),
-        });
+        let mut group = WorkerGroup::new(
+            AffinityPlan {
+                max_threads: 5,
+                pairs: (0..2)
+                    .map(|id| WorkerPair {
+                        worker: WorkerId(id),
+                        io: cpu.clone(),
+                        crypto: cpu.clone(),
+                        nic: None,
+                    })
+                    .collect(),
+            },
+            crate::test_support::ctx(),
+        );
         app.prepare_workers().unwrap();
         group
             .start(
@@ -2992,6 +2996,7 @@ fn two_worker_real_control_key_lease_drain_and_checkpoint_cut() {
         node: node.clone(),
         limits,
         discovered_nics: vec![],
+        ctx: crate::test_support::ctx(),
     });
     let cpu = EffectiveTopology::discover().unwrap().cpus[0].clone();
     let plan = AffinityPlan {
@@ -3005,7 +3010,7 @@ fn two_worker_real_control_key_lease_drain_and_checkpoint_cut() {
             })
             .collect(),
     };
-    let mut group = WorkerGroup::new(plan);
+    let mut group = WorkerGroup::new(plan, crate::test_support::ctx());
     app.prepare_workers().unwrap();
     group
         .start(

@@ -69,7 +69,7 @@ impl Samples {
             "8816d91d-e896-49bf-ba8a-da97ede93818,11111111-1111-4111-8111-111111111111",
         )
         .unwrap();
-        let now = environment::now();
+        let now = crate::test_support::clock().now();
         for i in 0..SEND_TAG_CAPACITY {
             let (ticket, mut work) = self
                 .begin_at(&pair, &pair.sender, &pair.receiver, || {

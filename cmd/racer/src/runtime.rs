@@ -101,12 +101,6 @@ impl Cancellation {
         self.inner.cancel().map_err(Into::into)
     }
 }
-/// MIGRATION: the thread environment's worker context, for owners that do not
-/// yet receive a [`racer_io::WorkerCtx`] explicitly. Every caller is a site
-/// still to migrate; production returns host clocks and OS entropy.
-pub(crate) fn ambient_ctx() -> racer_io::WorkerCtx {
-    uring_runtime::environment::Environment::current().worker_ctx()
-}
 
 /// Placeholder distance of an untimed scope's `deadline` field; never a bound.
 /// A century: far beyond any process lifetime, and still encodable on the wire.

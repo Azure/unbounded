@@ -233,6 +233,7 @@ pub struct WorkerGroup {
     plan: AffinityPlan,
     runtime: Group<RequestScope>,
     generation: u64,
+    ctx: racer_io::WorkerCtx,
 }
 
 #[cfg(test)]
@@ -278,11 +279,12 @@ trait FaultRecipe: Sync {
 }
 
 impl WorkerGroup {
-    pub fn new(plan: AffinityPlan) -> Self {
+    pub fn new(plan: AffinityPlan, ctx: racer_io::WorkerCtx) -> Self {
         Self {
             runtime: Group::new(runtime_plan(&plan)),
             plan,
             generation: 0,
+            ctx,
         }
     }
     /// Driver-controlled adapter over the same scoped execution used by `run`.
@@ -311,8 +313,8 @@ impl WorkerGroup {
         startup: Option<Duration>,
     ) -> Result<()> {
         let scope = match startup {
-            Some(budget) => startup_scope(budget)?,
-            None => untimed_startup_scope()?,
+            Some(budget) => startup_scope(budget, &self.ctx.clock)?,
+            None => RequestScope::untimed(RequestId([0; 16]), self.ctx.clock.clone())?,
         };
         self.prepare(true)?;
         self.runtime.run(factory, &scope)
@@ -365,7 +367,7 @@ impl WorkerGroup {
     /// Ordered start, budgeted drive, drain, shutdown, and join (also on failure).
     #[cfg(test)]
     fn run_recipe(&mut self, factory: &dyn FaultRecipe) -> Result<()> {
-        let scope = lifecycle_scope()?;
+        let scope = lifecycle_scope(&self.ctx.clock)?;
         self.run_inner(factory, &scope, false)
     }
 
@@ -424,6 +426,7 @@ impl WorkerGroup {
             factory.limits(),
             self.plan.pairs.iter().map(|pair| pair.worker).collect(),
             self.generation,
+            self.ctx.clone(),
             &mut allocate,
         )
     }
@@ -513,19 +516,12 @@ fn log_fatal(stage: &str, error: Error) {
 /// Fixed budget for lifecycle phases: standalone startup and every teardown.
 pub(crate) const LIFECYCLE_TIMEOUT: Duration = Duration::from_secs(30);
 
-fn lifecycle_scope() -> Result<RequestScope> {
-    startup_scope(LIFECYCLE_TIMEOUT)
+fn lifecycle_scope(clock: &racer_io::Clock) -> Result<RequestScope> {
+    startup_scope(LIFECYCLE_TIMEOUT, clock)
 }
 
-fn startup_scope(budget: Duration) -> Result<RequestScope> {
-    // MIGRATION: startup scopes move onto the role's WorkerCtx.
-    let clock = crate::runtime::ambient_ctx().clock;
-    RequestScope::with_clock(RequestId([0; 16]), clock.now() + budget, clock)
-}
-
-fn untimed_startup_scope() -> Result<RequestScope> {
-    // MIGRATION: startup scopes move onto the role's WorkerCtx.
-    RequestScope::untimed(RequestId([0; 16]), crate::runtime::ambient_ctx().clock)
+fn startup_scope(budget: Duration, clock: &racer_io::Clock) -> Result<RequestScope> {
+    RequestScope::with_clock(RequestId([0; 16]), clock.now() + budget, clock.clone())
 }
 
 fn poll_runtime(runtime: &WorkerRuntime) -> Result<()> {
@@ -542,7 +538,7 @@ fn fence_runtime<'a>(
     // Service drain has ended: detach any delivery waiters it left behind, while
     // still retaining every accepted job until the engine returns its completion.
     Box::pin(async move {
-        let fence_scope = lifecycle_scope().unwrap_or_else(|_| scope.clone());
+        let fence_scope = lifecycle_scope(scope.clock()).unwrap_or_else(|_| scope.clone());
         let cancelled = fence_scope.cancel();
         let drained = drive_local(
             Box::pin(async {
@@ -608,12 +604,19 @@ pub struct Resources {
     workers: Vec<WorkerId>,
 
     ports: Vec<Mutex<(Option<IoCryptoPort>, Option<CryptoPort>)>>,
+
+    ctx: racer_io::WorkerCtx,
 }
 
 impl Resources {
     /// Allocate all paired endpoints before any service thread starts.
-    pub fn new(limits: Limits, workers: Vec<WorkerId>, generation: u64) -> Result<Self> {
-        Self::with_allocator(limits, workers, generation, security::try_pair)
+    pub fn new(
+        limits: Limits,
+        workers: Vec<WorkerId>,
+        generation: u64,
+        ctx: racer_io::WorkerCtx,
+    ) -> Result<Self> {
+        Self::with_allocator(limits, workers, generation, ctx, security::try_pair)
     }
 
     /// Share transactional endpoint construction with fault-injected startup tests.
@@ -621,6 +624,7 @@ impl Resources {
         limits: Limits,
         workers: Vec<WorkerId>,
         generation: u64,
+        ctx: racer_io::WorkerCtx,
         mut allocate: impl FnMut(
             WorkerId,
             u64,
@@ -643,6 +647,7 @@ impl Resources {
             limits,
             workers,
             ports,
+            ctx,
         })
     }
 
@@ -716,7 +721,7 @@ impl Resources {
             self.workers[lane],
             CryptoRuntime {
                 port,
-                ctx: crate::runtime::ambient_ctx(),
+                ctx: self.ctx.clone(),
             },
         )
     }
@@ -745,7 +750,7 @@ where
         })
     }
     fn teardown_scope(&self, startup: &RequestScope) -> RequestScope {
-        lifecycle_scope().unwrap_or_else(|_| startup.clone())
+        lifecycle_scope(startup.clock()).unwrap_or_else(|_| startup.clone())
     }
 }
 struct IoService {
@@ -884,7 +889,13 @@ mod tests {
     #[test]
     fn exact_twenty_endpoint_pairs_close_independently() {
         let limits = crate::test_support::cluster::config(false).limits;
-        let resources = Resources::new(limits, (0..20).map(WorkerId).collect(), 42).unwrap();
+        let resources = Resources::new(
+            limits,
+            (0..20).map(WorkerId).collect(),
+            42,
+            crate::test_support::ctx(),
+        )
+        .unwrap();
         let mut peers = resources
             .ports
             .iter()
@@ -913,9 +924,13 @@ mod tests {
         let limits = crate::test_support::cluster::config(false).limits;
         for workers in [vec![], vec![WorkerId(7), WorkerId(7)]] {
             assert!(matches!(
-                Resources::with_allocator(limits.clone(), workers, 9, |_, _, _| {
-                    panic!("invalid worker set reached allocator")
-                }),
+                Resources::with_allocator(
+                    limits.clone(),
+                    workers,
+                    9,
+                    crate::test_support::ctx(),
+                    |_, _, _| { panic!("invalid worker set reached allocator") }
+                ),
                 Err(Error::InvalidConfiguration)
             ));
         }
@@ -925,6 +940,7 @@ mod tests {
                 limits.clone(),
                 vec![WorkerId(7), WorkerId(3), WorkerId(9)],
                 42,
+                crate::test_support::ctx(),
                 |worker, generation, capacity| {
                     calls.push(worker);
                     assert_eq!(generation, 42);
@@ -956,6 +972,7 @@ mod tests {
             limits,
             vec![WorkerId(0), WorkerId(1)],
             42,
+            crate::test_support::ctx(),
             |worker, generation, capacity| {
                 if worker == WorkerId(1) {
                     return Err(Error::Overloaded);
@@ -1041,11 +1058,17 @@ mod tests {
         let limits = crate::test_support::cluster::config(false).limits;
         for workers in [vec![], vec![WorkerId(7), WorkerId(7)]] {
             assert!(matches!(
-                Resources::new(limits.clone(), workers, 9),
+                Resources::new(limits.clone(), workers, 9, crate::test_support::ctx()),
                 Err(Error::InvalidConfiguration)
             ));
         }
-        let resources = Resources::new(limits.clone(), vec![WorkerId(7)], 9).unwrap();
+        let resources = Resources::new(
+            limits.clone(),
+            vec![WorkerId(7)],
+            9,
+            crate::test_support::ctx(),
+        )
+        .unwrap();
         assert_eq!(resources.abandon_lane(1), Err(Error::InvalidConfiguration));
         resources.abandon_lane(0).unwrap();
         resources.abandon_lane(0).unwrap();
@@ -1083,7 +1106,7 @@ mod tests {
                 self.0.abandon_lane(lane)
             }
             fn teardown_scope(&self, _: &RequestScope) -> RequestScope {
-                lifecycle_scope().unwrap()
+                lifecycle_scope(&crate::test_support::clock()).unwrap()
             }
         }
         struct Local;
@@ -1101,11 +1124,11 @@ mod tests {
                 Box::pin(async { Ok(()) })
             }
         }
-        let mut group = WorkerGroup::new(colocated_plan(3, 1));
+        let mut group = WorkerGroup::new(colocated_plan(3, 1), crate::test_support::ctx());
         let factory = Arc::new(DirectFactory(
-            Resources::new(limits, vec![WorkerId(0)], 10).unwrap(),
+            Resources::new(limits, vec![WorkerId(0)], 10, crate::test_support::ctx()).unwrap(),
         ));
-        let scope = lifecycle_scope().unwrap();
+        let scope = lifecycle_scope(&crate::test_support::clock()).unwrap();
         group.start(factory, &scope).unwrap();
         group.drain(&scope).unwrap();
         group.shutdown(&scope).unwrap();
@@ -2071,7 +2094,7 @@ mod tests {
         fn two_io_share_one_actual_crypto_thread_and_drain_outstanding_jobs() {
             let (plan, factory) = fixture(4, Failure::None, true);
             let observed = factory.observed.clone();
-            let mut group = WorkerGroup::new(plan);
+            let mut group = WorkerGroup::new(plan, crate::test_support::ctx());
             let scope = scope();
             group.start_recipe(Arc::new(factory), &scope).unwrap();
             assert_eq!(
@@ -2130,7 +2153,7 @@ mod tests {
         #[test]
         fn shared_crypto_borrowed_run_counts_caller_and_restores_affinity() {
             let (plan, factory) = fixture(3, Failure::None, true);
-            let mut group = WorkerGroup::new(plan);
+            let mut group = WorkerGroup::new(plan, crate::test_support::ctx());
             let before = current_cpus().unwrap();
             let mut scope = scope();
             // Leave startup enough room under concurrent builds: this scenario checks
@@ -2146,7 +2169,8 @@ mod tests {
             assert_eq!(factory.observed.submitted.load(Ordering::SeqCst), 8);
             let (plan, factory) = fixture(3, Failure::None, false);
             assert_eq!(
-                WorkerGroup::new(plan).start_recipe(Arc::new(factory), &scope),
+                WorkerGroup::new(plan, crate::test_support::ctx())
+                    .start_recipe(Arc::new(factory), &scope),
                 Err(Error::InvalidConfiguration)
             );
         }
@@ -2163,7 +2187,7 @@ mod tests {
                 for borrowed in [false, true] {
                     let (plan, factory) = fixture(if borrowed { 3 } else { 4 }, failure, true);
                     let observed = factory.observed.clone();
-                    let mut group = WorkerGroup::new(plan);
+                    let mut group = WorkerGroup::new(plan, crate::test_support::ctx());
                     let mut scope = scope();
                     if failure == Failure::PendingStart {
                         scope.deadline = uring_runtime::environment::Deadline(
@@ -2213,7 +2237,7 @@ mod tests {
             ] {
                 let (plan, factory) = fixture(4, failure, false);
                 let observed = factory.observed.clone();
-                let mut group = WorkerGroup::new(plan);
+                let mut group = WorkerGroup::new(plan, crate::test_support::ctx());
                 let scope = scope();
                 let started = group.start_recipe(Arc::new(factory), &scope);
                 if failure == Failure::PollCrypto {
@@ -2236,7 +2260,7 @@ mod tests {
             factory.roundtrip = true;
             let observed = factory.observed.clone();
             observed.release.store(true, Ordering::SeqCst);
-            let mut group = WorkerGroup::new(plan);
+            let mut group = WorkerGroup::new(plan, crate::test_support::ctx());
             let scope = scope();
             group.start_recipe(Arc::new(factory), &scope).unwrap();
             assert_eq!(observed.completed.load(Ordering::SeqCst), 2);
@@ -2248,7 +2272,7 @@ mod tests {
         #[test]
         fn shared_group_cancellation_during_live_jobs_fences_before_join() {
             let (plan, factory) = fixture(4, Failure::None, true);
-            let mut group = WorkerGroup::new(plan);
+            let mut group = WorkerGroup::new(plan, crate::test_support::ctx());
             let scope = scope();
             group.start_recipe(Arc::new(factory), &scope).unwrap();
             scope.cancel().unwrap();
@@ -2266,7 +2290,7 @@ mod tests {
             factory.roundtrip = true;
             let observed = factory.observed.clone();
             observed.release.store(true, Ordering::SeqCst);
-            let mut group = WorkerGroup::new(plan);
+            let mut group = WorkerGroup::new(plan, crate::test_support::ctx());
             let mut scope = scope();
             scope.deadline =
                 uring_runtime::environment::Deadline(Instant::now() + Duration::from_millis(100));
@@ -2292,7 +2316,7 @@ mod tests {
                 plan.pairs[1].crypto.cpu = second_cpu;
                 factory.second_crypto_cpu = second_cpu;
                 let observed = factory.observed.clone();
-                let mut group = WorkerGroup::new(plan);
+                let mut group = WorkerGroup::new(plan, crate::test_support::ctx());
                 let scope = scope();
                 let allocator_observed = observed.clone();
                 let allocate = move |worker, generation, capacity| {
@@ -2326,7 +2350,7 @@ mod tests {
             plan.pairs[1].crypto.cpu = second_cpu;
             factory.second_crypto_cpu = second_cpu;
             let observed = factory.observed.clone();
-            let mut group = WorkerGroup::new(plan);
+            let mut group = WorkerGroup::new(plan, crate::test_support::ctx());
             let scope = scope();
             group.start_recipe(Arc::new(factory), &scope).unwrap();
             assert_eq!(group.runtime.stats().coordinators, 1);
@@ -2348,7 +2372,7 @@ mod tests {
             let (plan, mut factory) = fixture(4, Failure::None, true);
             factory.native = true;
             let observed = factory.observed.clone();
-            let mut group = WorkerGroup::new(plan);
+            let mut group = WorkerGroup::new(plan, crate::test_support::ctx());
             let scope = scope();
             group.start_recipe(Arc::new(factory), &scope).unwrap();
             assert_eq!(observed.native.lock().unwrap().len(), 2);
@@ -2562,7 +2586,7 @@ mod tests {
             let plan = colocated_plan(max_threads, 1);
             let cpu = plan.pairs[0].io.cpu;
             (
-                WorkerGroup::new(plan),
+                WorkerGroup::new(plan, crate::test_support::ctx()),
                 TestFactory {
                     events: Arc::new(Mutex::new(Vec::new())),
                     crypto_polls: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
@@ -2627,7 +2651,7 @@ mod tests {
         fn owned_start_drains_and_joins_both_pinned_local_services() {
             let (mut group, factory) = fixture(3);
             let events = factory.events.clone();
-            let scope = lifecycle_scope().unwrap();
+            let scope = lifecycle_scope(&crate::test_support::clock()).unwrap();
             group.start_recipe(Arc::new(factory), &scope).unwrap();
             group.drain(&scope).unwrap();
             group.shutdown(&scope).unwrap();
@@ -2655,7 +2679,7 @@ mod tests {
         fn cancellation_subscription_failure_tears_down_built_services() {
             let (mut group, factory) = fixture(3);
             let events = factory.events.clone();
-            let scope = lifecycle_scope().unwrap();
+            let scope = lifecycle_scope(&crate::test_support::clock()).unwrap();
             let _registrations = (0..1024)
                 .map(|_| scope.cancellation.subscribe().unwrap())
                 .collect::<Vec<_>>();
@@ -2670,7 +2694,7 @@ mod tests {
 
         #[test]
         fn startup_failure_rolls_back_and_owned_start_counts_caller() {
-            let scope = lifecycle_scope().unwrap();
+            let scope = lifecycle_scope(&crate::test_support::clock()).unwrap();
             let (mut group, factory) = fixture(2);
             assert_eq!(
                 group.start_recipe(Arc::new(factory), &scope),
@@ -2701,7 +2725,7 @@ mod tests {
             };
             factory.stop_on_poll = true;
             let before = current_cpus().unwrap();
-            let mut group = WorkerGroup::new(plan);
+            let mut group = WorkerGroup::new(plan, crate::test_support::ctx());
             assert_eq!(group.run_recipe(&factory), Err(Error::Cancelled));
             assert_eq!(current_cpus().unwrap(), before);
             assert_eq!(group.runtime.stats().done, 2);
@@ -2722,8 +2746,8 @@ mod tests {
                 };
                 factory.stop_on_poll = true;
                 factory.start_delay = Duration::from_millis(300);
-                let mut group = WorkerGroup::new(plan);
-                let scope = startup_scope(budget).unwrap();
+                let mut group = WorkerGroup::new(plan, crate::test_support::ctx());
+                let scope = startup_scope(budget, &crate::test_support::clock()).unwrap();
                 let result = group.run_inner(&factory, &scope, false);
                 // A long budget reaches steady state (which this fixture stops);
                 // a short one fails startup. Both fully join every service.
@@ -2736,11 +2760,14 @@ mod tests {
         #[test]
         fn borrowed_run_scope_stops_and_joins_on_deadline() {
             let (group, factory) = fixture(2);
-            let mut scoped = WorkerGroup::new(AffinityPlan {
-                pairs: group.plan.pairs.clone(),
-                max_threads: 2,
-            });
-            let mut scope = lifecycle_scope().unwrap();
+            let mut scoped = WorkerGroup::new(
+                AffinityPlan {
+                    pairs: group.plan.pairs.clone(),
+                    max_threads: 2,
+                },
+                crate::test_support::ctx(),
+            );
+            let mut scope = lifecycle_scope(&crate::test_support::clock()).unwrap();
             scope.deadline =
                 uring_runtime::environment::Deadline(Instant::now() + Duration::from_millis(50));
             assert_eq!(
@@ -2873,6 +2900,7 @@ mod tests {
                         crate::test_support::cluster::config(false).limits,
                         vec![WorkerId(0), WorkerId(1)],
                         1,
+                        crate::test_support::ctx(),
                     )
                     .unwrap(),
                     sibling_started: Arc::default(),
@@ -3041,6 +3069,7 @@ mod tests {
                         crate::test_support::cluster::config(false).limits,
                         vec![WorkerId(0)],
                         1,
+                        crate::test_support::ctx(),
                     )
                     .unwrap(),
                     release: Arc::default(),
@@ -3108,7 +3137,7 @@ mod tests {
             let mut second = group.plan.pairs[0].clone();
             second.worker = WorkerId(1);
             group.plan.pairs.push(second);
-            let scope = lifecycle_scope().unwrap();
+            let scope = lifecycle_scope(&crate::test_support::clock()).unwrap();
             let result = group.start_with_allocator(
                 Arc::new(factory),
                 &scope,
@@ -3137,8 +3166,8 @@ mod tests {
             let mut second = plan.pairs[0].clone();
             second.worker = WorkerId(1);
             plan.pairs.push(second);
-            let mut scoped = WorkerGroup::new(plan);
-            let scope = lifecycle_scope().unwrap();
+            let mut scoped = WorkerGroup::new(plan, crate::test_support::ctx());
+            let scope = lifecycle_scope(&crate::test_support::clock()).unwrap();
             let before = current_cpus().unwrap();
             let result = scoped.run_with_allocator(
                 &factory,
