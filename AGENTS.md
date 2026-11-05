@@ -20,6 +20,7 @@ unbounded-kube is organized into several directories:
   - `kubectl-unbounded` - sources for the `kubectl unbounded` plugin (includes `net` subcommand).
   - `machina` - sources for the machina controller.
   - `metalman` - sources for the metalman controller.
+  - `racer-block` - sources for racer-block, a host daemon that serves one Racer object as a read-only ublk block device.
   - `unbounded-net-controller` - sources for the unbounded-net network controller.
   - `unbounded-net-node` - sources for the unbounded-net node agent.
   - `unbounded-net-routeplan-debug` - debugging tool for route plans.
@@ -42,6 +43,8 @@ unbounded-kube is organized into several directories:
 - `internal/` - where shared but internal to this project packages are located.
   - `gantry/` - gantry shared packages (21 sub-packages: config, mirror, transfer, discovery, coord, hrw, coldstart, members, metrics, etc.). Includes `internal/gantry/proto/coord/v1/` for the libp2p coordination RPC messages (pull intent, please-pull); kept under internal/ so the wire schema isn't an exported API surface.
   - `net/` - unbounded-net shared packages (APIs, controllers, networking, metrics, webhooks, etc.).
+  - `racerblock/` - racer-block packages: `ublk/` (minimal in-house Linux ublk server over io_uring), `backend/`
+    (chunk cache and readahead over the Racer client UDS), and the server that joins them.
 - `tmp/` - project local temporary directory for intermediate stuff that will be cleaned up quickly.
 
 ## Building and Testing

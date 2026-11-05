@@ -134,6 +134,66 @@ jobs:
           retention-days: 7
           if-no-files-found: ignore
 
+  # ---------- Racer block device ----------
+  racer-block:
+    name: Racer Block Device (Linux ${{ matrix.kernel }})
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    # 6.8 is the minimum supported kernel. 7.0 catches regressions in newer
+    # ublk drivers. Neither result hides the other.
+    strategy:
+      fail-fast: false
+      matrix:
+        kernel: ["6.8", "7.0"]
+    env:
+      GUEST_KERNEL: ${{ matrix.kernel }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Set up Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+          cache-dependency-path: go.sum
+
+      # The device tests run as root inside a disposable QEMU guest booting the
+      # Ubuntu generic kernel for GUEST_KERNEL: 6.8 from 24.04 or 7.0 from 26.04,
+      # downloaded with signed private APT lists and never installed. The
+      # runner's Azure kernel does not ship ublk_drv, and a kernel bug in the
+      # guest cannot wedge the runner. The harness fails if any suite reports
+      # no result, exits nonzero, or skips for missing root, ublk, or io_uring.
+      - name: Install VM tools
+        run: |
+          # Ubuntu runner sources share this list; bypass the stalled Azure mirror.
+          printf '%s\n' 'https://archive.ubuntu.com/ubuntu/' | timeout --signal=TERM --kill-after=10s 300s sudo tee /etc/apt/apt-mirrors.txt > /dev/null
+          apt_options=(-o Acquire::http::Timeout=10 -o Acquire::https::Timeout=10 -o Acquire::Retries=2)
+          timeout --signal=TERM --kill-after=10s 300s sudo apt-get "${apt_options[@]}" update
+          timeout --signal=TERM --kill-after=10s 300s sudo apt-get "${apt_options[@]}" install -y --no-install-recommends qemu-system-x86 busybox-static cpio zstd
+
+      - name: Enable KVM
+        # Optional: the harness falls back to TCG when /dev/kvm is unusable.
+        run: |
+          if [ -e /dev/kvm ]; then
+            echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+            sudo udevadm control --reload-rules
+            sudo udevadm trigger --name-match=kvm
+          fi
+
+      - name: Check VM harness
+        run: timeout --signal=TERM --kill-after=10s 60s hack/scripts/racer-block-vm-test.sh self-test
+
+      - name: Build race-enabled device tests
+        run: |
+          mkdir -p bin/racer-block-tests
+          timeout --signal=TERM --kill-after=10s 300s go test -race -c -o bin/racer-block-tests/ublk.test ./internal/racerblock/ublk
+          timeout --signal=TERM --kill-after=10s 300s go test -race -c -o bin/racer-block-tests/racerblock.test ./internal/racerblock
+
+      # Budget: up to 300s each for the private APT update and the kernel
+      # download, plus the harness's 600s VM limit and initramfs build.
+      - name: Test ublk devices in a ${{ matrix.kernel }} VM
+        run: timeout --signal=TERM --kill-after=30s 1260s hack/scripts/racer-block-vm-test.sh run
+
   # ---------- Racer Rust workspace ----------
   # Lint, the two workspace feature sets, and the production gates run as
   # separate jobs so they build and test concurrently. Lint runs no tests, so
