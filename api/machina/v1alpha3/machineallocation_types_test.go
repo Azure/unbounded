@@ -556,7 +556,9 @@ func TestMachineAllocationOperationsWriteOnce(t *testing.T) {
 				{
 					name:   "rewrite reference unchanged",
 					stored: storedWithRecord,
-					mutate: func(t *testing.T, obj map[string]any) { setField(t, obj, reference("ub-alloc-"+operation, "11111111-2222-4333-8444-555555555555"), path...) },
+					mutate: func(t *testing.T, obj map[string]any) {
+						setField(t, obj, reference("ub-alloc-"+operation, "11111111-2222-4333-8444-555555555555"), path...)
+					},
 				},
 				{
 					name:   "change reference UID",
