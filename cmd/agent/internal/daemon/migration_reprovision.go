@@ -108,6 +108,11 @@ func (e *migrationEnv) migrateReprovision(ctx context.Context, log *slog.Logger,
 	// the reset fetches from the same mirrors a repave would.
 	targetCfg := &provision.UnboundedAgentConfig{AgentConfig: *desired.DeepCopy(), Downloads: desired.Downloads}
 
+	// The toolkit location describes the host install that only mode none uses.
+	if target != isolation.ModeNone {
+		targetCfg.NvidiaToolkit = nil
+	}
+
 	if err := targetCfg.Validate(); err != nil {
 		return fmt.Errorf("configuration for isolation mode %s is invalid: %w", target, err)
 	}
