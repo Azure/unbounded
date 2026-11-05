@@ -134,10 +134,11 @@ fn model_memory_per_node() {
             spec.relay_transfers = r.parse().unwrap();
         }
         // `MODEL_CONNECTIONS`: `production` models production's peer connection slots,
-        // `evict` adds the proposed eviction of idle inbound connections; unset leaves them off.
+        // `evict` and `refuse` (or both) add the proposed fixes; unset leaves them off.
         if let Ok(mode) = std::env::var("MODEL_CONNECTIONS") {
             let mut config = model::ConnectionConfig::production(spec.workers);
-            config.evict_idle = mode == "evict";
+            config.evict_idle = mode.contains("evict");
+            config.refuse_when_full = mode.contains("refuse");
             spec.connections = Some(config);
         }
     }
@@ -269,5 +270,15 @@ fn idle_connections_pin_ingress_slots() {
     assert!(
         count(&evicting, "reads_failed") < count(&production, "reads_failed"),
         "{production} {evicting}"
+    );
+}
+
+#[test]
+fn range_deadline_discards_held_pages() {
+    let report = run(scenarios::range_deadline(), 1);
+    assert!(
+        report["coverage"].to_string().contains("Window::Discard"),
+        "{}",
+        report["coverage"]
     );
 }

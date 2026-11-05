@@ -3611,7 +3611,8 @@ impl NodeWorld {
             self.conns.acquire(now, holder, worker, next)
         });
         match acquired {
-            Some(Acquire::Overloaded) => {
+            Some(Acquire::Overloaded | Acquire::Refused) => {
+                // A refusal is the receiver's unsigned overload head, read as `Overloaded` too.
                 self.metrics.incr("conn_overloaded");
                 return self.fail_hop(mid, holder, Fault::Overloaded);
             }
@@ -5608,6 +5609,7 @@ impl NodeWorld {
             "idle_cleared": st.idle_cleared,
             "idle_expired": st.idle_expired,
             "idle_evicted": st.idle_evicted,
+            "refused": st.refused,
             "most_queued": st.most_queued,
         });
         json!({

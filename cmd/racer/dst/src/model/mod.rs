@@ -2183,7 +2183,10 @@ impl<'s> Model<'s> {
         let acquired = (!cut && self.spec.connections.is_some())
             .then(|| self.conns.acquire(now, holder, conn, next));
         match acquired {
-            Some(Acquire::Overloaded) => return self.fail_hop(mid, holder, Fault::Overloaded),
+            // A refusal is the receiver's unsigned overload head, read as `Overloaded` too.
+            Some(Acquire::Overloaded | Acquire::Refused) => {
+                return self.fail_hop(mid, holder, Fault::Overloaded);
+            }
             Some(
                 Acquire::Reused(id)
                 | Acquire::Accepted(id)
@@ -2978,6 +2981,7 @@ impl<'s> Model<'s> {
         c.conn_idle_expired = stats.idle_expired;
         c.conn_most_queued = stats.most_queued as u64;
         c.conn_idle_evicted = stats.idle_evicted;
+        c.conn_refused = stats.refused;
         let c = &self.report.counters;
         let ended = c.reads_completed + c.reads_failed + c.reads_skipped_not_member;
         if ended != self.expected_reads {

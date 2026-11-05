@@ -201,6 +201,9 @@ pub struct NodeConfig {
     /// Not production: a full listener closes its longest-idle inbound connection
     /// (`connections::Config::evict_idle`), the proposed fix for idle pinning.
     pub conn_evict_idle: bool,
+    /// Not production: a full listener refuses with the overload head
+    /// (`connections::Config::refuse_when_full`).
+    pub conn_refuse: bool,
     pub plaintext_bytes: u64,
     pub ciphertext_bytes: u64,
     pub dirty_bytes: u64,
@@ -305,6 +308,7 @@ impl Default for NodeConfig {
             conn_backlog: 0,
             conn_idle_ms: 0,
             conn_evict_idle: false,
+            conn_refuse: false,
             plaintext_bytes: 64 * MIB,
             ciphertext_bytes: 128 * MIB,
             dirty_bytes: 160 * MIB,
@@ -367,6 +371,7 @@ impl NodeConfig {
             config.idle_timeout = self.conn_idle_ms * 1_000_000;
         }
         config.evict_idle = self.conn_evict_idle;
+        config.refuse_when_full = self.conn_refuse;
         config
     }
 }
@@ -482,6 +487,7 @@ impl Config {
                             "conn_backlog" => node.conn_backlog = small()?,
                             "conn_idle_ms" => node.conn_idle_ms = n,
                             "conn_evict_idle" if n <= 1 => node.conn_evict_idle = n == 1,
+                            "conn_refuse" if n <= 1 => node.conn_refuse = n == 1,
                             "plaintext_bytes" => node.plaintext_bytes = n,
                             "ciphertext_bytes" => node.ciphertext_bytes = n,
                             "dirty_bytes" => node.dirty_bytes = n,

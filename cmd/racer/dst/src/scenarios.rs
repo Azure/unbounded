@@ -212,6 +212,31 @@ pub fn origin_forbidden() -> Scenario {
         .end(3 * SECONDS)
 }
 
+/// Model-only: range readers whose read deadline (150 ms) passes while their windows still hold
+/// delivered-but-unread pages, so ending the read discards them (`Window::Discard`). Every read
+/// ends, completed or failed.
+pub fn range_deadline() -> Scenario {
+    const NODES: u32 = 32;
+    let range = Some(RangeRead {
+        window_pages: 4,
+        spill: 4,
+        leased: true,
+    });
+    let spec = ModelSpec {
+        storms: vec![Storm {
+            range,
+            ..storm(0, 0, NODES, MILLIS)
+        }],
+        read_timeout: 150 * MILLIS,
+        ..ModelSpec::default()
+    };
+    Scenario::new("model-range-deadline")
+        .nodes(NODES)
+        .sites(4)
+        .model(spec)
+        .end(3 * SECONDS)
+}
+
 /// Model-only (racer-sim's range reads do not run through `ReadWindow`): 32 nodes read one
 /// cold object as a range through windows of 4 pages with 4 spill pages, then read it again
 /// 1 s later from their local copies. Every page is delivered in order, origin traffic stays
@@ -695,6 +720,7 @@ pub fn catalog() -> Vec<Scenario> {
         hot_page_storm(512),
         origin_forbidden(),
         range_readers(),
+        range_deadline(),
         metadata_readers(),
         faults(),
         partition_heals(),

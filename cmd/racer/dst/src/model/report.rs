@@ -116,6 +116,8 @@ pub struct Counters {
     pub conn_most_queued: u64,
     /// Idle inbound connections a full listener closed (not production).
     pub conn_idle_evicted: u64,
+    /// Connections a full listener refused (not production).
+    pub conn_refused: u64,
     /// Requests whose accept-queue wait outlived their requester's attempt.
     pub conn_queue_abandoned: u64,
     /// Route searches refused with every search slot busy (racer-sim `route_search_overloaded`).
@@ -239,6 +241,7 @@ impl Report {
                     "conn_idle_expired": c.conn_idle_expired,
                     "conn_most_queued": c.conn_most_queued,
                     "conn_idle_evicted": c.conn_idle_evicted,
+                    "conn_refused": c.conn_refused,
                     "conn_queue_abandoned": c.conn_queue_abandoned,
                     "search_sheds": c.search_sheds,
                     "membership_changes": c.membership_changes,
