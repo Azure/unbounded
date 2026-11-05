@@ -471,6 +471,70 @@ fn a_shed_requester_asks_its_mesh_helper() {
 }
 
 #[test]
+fn a_signed_shed_reports_the_owner_busy_and_a_helper_reports_nothing() {
+    let now = Instant::now();
+    let mut c = core(now);
+    let mut out = Vec::new();
+    c.read_page(7, spec(now), now, &mut out);
+    let (read, id, _) = acq(&out).unwrap();
+    out.clear();
+    c.on_acquisition(read, with_id(ranked(), id), now, &mut out)
+        .unwrap();
+    let owner = out
+        .iter()
+        .find_map(|e| match e {
+            Effect::Acquisition {
+                effect: acquisition::Io::Send { dest, .. },
+                ..
+            } => *dest,
+            _ => None,
+        })
+        .unwrap();
+    let (read, id, _) = acq(&out).unwrap();
+    out.clear();
+    let overloaded = AcqInput::Replied {
+        id,
+        reply: Reply::Answer {
+            kind: ResponseKind::Overloaded,
+            signed: true,
+        },
+        answer: None,
+    };
+    c.on_acquisition(read, overloaded, now, &mut out).unwrap();
+    let silence: Vec<_> = out
+        .iter()
+        .filter(|e| matches!(e, Effect::Silence { .. }))
+        .collect();
+    assert_eq!(
+        silence,
+        vec![&Effect::Silence {
+            page: 7,
+            dest: owner,
+            sent: now,
+            note: SilenceNote::Shed,
+        }],
+        "{out:?}"
+    );
+    assert_eq!(silence[0].id(), None, "a silence report expects no answer");
+    // The helper's answer is not liveness evidence about a member position.
+    let (read, id, _) = acq(&out).unwrap();
+    out.clear();
+    let miss = AcqInput::Replied {
+        id,
+        reply: Reply::Answer {
+            kind: ResponseKind::Miss,
+            signed: true,
+        },
+        answer: None,
+    };
+    c.on_acquisition(read, miss, now, &mut out).unwrap();
+    assert!(
+        out.iter().all(|e| !matches!(e, Effect::Silence { .. })),
+        "{out:?}"
+    );
+}
+
+#[test]
 fn a_shed_requester_without_a_helper_walks_on() {
     let now = Instant::now();
     let mut c = core(now);
@@ -903,7 +967,7 @@ fn answer(
             return;
         }
         Effect::Completed { .. } => panic!("completions are checked by the caller"),
-        Effect::MetadataReady { .. } => {}
+        Effect::MetadataReady { .. } | Effect::Silence { .. } => {}
         Effect::Metadata { id, .. } => {
             let _ = c.on_metadata(id, Ok(1), now, &mut o);
         }

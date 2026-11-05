@@ -37,6 +37,7 @@ pub const VARIANTS: &[&str] = &[
     "Metadata",
     "MetadataReady::Ok",
     "MetadataReady::Err",
+    "Silence",
     "Served::Defer",
     "Served::Reject",
     "Served::Miss",

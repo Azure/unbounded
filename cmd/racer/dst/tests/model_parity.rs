@@ -16,12 +16,17 @@ fn run(scenario: Scenario, seed: u64) -> serde_json::Value {
 fn origin_forbidden_fails_only_the_leader() {
     let report = run(scenarios::origin_forbidden(), 11);
     let counters = &report["metrics"]["counters"];
-    // Each 403 fails its leader and re-elects a waiter (racer-sim `flight_reelected`).
-    assert!(
-        counters["flights_reelected"].as_u64().unwrap() > 0,
-        "{counters}"
+    // Each 403 fails only its leader and re-elects a waiter (racer-sim `flight_reelected`). A
+    // leader whose walk fails otherwise (shed by every owner) re-elects a waiter too.
+    let reelected = counters["flights_reelected"].as_u64().unwrap();
+    let forbidden = counters["origin_403"].as_u64().unwrap();
+    assert!(forbidden > 0 && reelected >= forbidden, "{counters}");
+    assert_eq!(
+        report["metrics"]["errors"]["OriginForbidden"].as_u64(),
+        Some(forbidden),
+        "{}",
+        report["metrics"]
     );
-    assert_eq!(counters["flights_reelected"], counters["origin_403"]);
 }
 
 #[test]
@@ -69,9 +74,13 @@ fn faults_end_every_read() {
 #[ignore = "large: run alone with --release --ignored"]
 fn model_memory_per_node() {
     let nodes: u32 = std::env::var("MODEL_NODES").map_or(10_000, |n| n.parse().unwrap());
-    // `MODEL_ATTEMPT_MS`: per-attempt cap (production 2000); unset is no cap.
-    let attempt = std::env::var("MODEL_ATTEMPT_MS").map_or(model::NO_ATTEMPT_CAP, |ms| {
-        ms.parse::<u64>().unwrap() * 1_000_000
+    // `MODEL_ATTEMPT_MS`: per-attempt cap; unset is production's `model::ATTEMPT_TIMEOUT`, 0 is
+    // no cap.
+    let attempt = std::env::var("MODEL_ATTEMPT_MS").map_or(model::ATTEMPT_TIMEOUT, |ms| {
+        match ms.parse::<u64>().unwrap() {
+            0 => model::NO_ATTEMPT_CAP,
+            ms => ms * 1_000_000,
+        }
     });
     let scenario = scenarios::cold_start_with(nodes, attempt);
     let (outcome, report) = model::run(&scenario, Choices::seeded(8));

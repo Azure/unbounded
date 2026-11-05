@@ -28,7 +28,7 @@ use super::effect::{EffectId, EffectIds, Stale};
 use super::flight::{FlightLimits, FlightTable, Joined, Operation, Settled, Wait};
 use super::hints::{MAX_DEFERRALS, SuccessorHints, defer_allowed, successor_deferral};
 use super::serve::{Decision, ServeDecision, ServeRequest, Step};
-use super::walk::FillConfig;
+use super::walk::{Evidence, FillConfig, SilenceNote};
 use super::window::{self, AcquisitionBudgetSpec, Facts, Fetched, Next, ReadWindow, WindowConfig};
 use super::{Error, RefreshPurpose, acquisition_failure};
 use crate::flow::coalesce::flight::state::Published;
@@ -138,6 +138,16 @@ pub enum Effect<T: Types> {
         request: RequestId,
         result: Result<T::Metadata, Error>,
     },
+    /// What a probe of `page` to member position `dest`, sent at `sent`, showed about `dest`'s
+    /// liveness (production `CandidatePolicy::apply` into the node's `LinkHealth`): the
+    /// interpreter records it in its node-wide [`crate::liveness::Silence`] and orders later
+    /// rankings with [`crate::read::demote_unanswered`]. Overflow helper probes report none.
+    Silence {
+        page: T::Page,
+        dest: u32,
+        sent: Instant,
+        note: SilenceNote,
+    },
 }
 
 impl<T: Types> Effect<T> {
@@ -165,6 +175,7 @@ impl<T: Types> Effect<T> {
             Effect::Deliver { .. } | Effect::Completed { .. } | Effect::MetadataReady { .. } => {
                 Class::ClientDeliver
             }
+            Effect::Silence { .. } => Class::WorkerMsg,
         }
     }
 
@@ -199,9 +210,10 @@ impl<T: Types> Effect<T> {
                 WorkerMsg::Fetched { .. } => None,
             },
             Effect::Metadata { id, .. } => Some(*id),
-            Effect::Deliver { .. } | Effect::Completed { .. } | Effect::MetadataReady { .. } => {
-                None
-            }
+            Effect::Deliver { .. }
+            | Effect::Completed { .. }
+            | Effect::MetadataReady { .. }
+            | Effect::Silence { .. } => None,
         }
     }
 }
@@ -646,6 +658,24 @@ impl<T: Types> WorkerCore<T> {
                 let effect = match effect.split() {
                     Ok(io) => io,
                     Err(acquisition::Terminal::Report(report)) => {
+                        if let acquisition::Report::Evidence {
+                            evidence:
+                                Evidence {
+                                    silence: Some(note),
+                                    ..
+                                },
+                            dest: Some(dest),
+                            sent,
+                            ..
+                        } = report
+                        {
+                            out.push(Effect::Silence {
+                                page: page.clone(),
+                                dest,
+                                sent,
+                                note,
+                            });
+                        }
                         self.observe(report);
                         continue;
                     }

@@ -19,18 +19,25 @@ use std::{
     time::{Duration, Instant},
 };
 
+use racer_control_wire::{CacheId, NodeId};
 use racer_core::{
+    liveness::{SILENCE_CAPACITY, Silence},
     prefetch::OwnerBudget,
     read::{
-        Error, OperationKind, PageBudget, RefreshPurpose, ResponseKind, ServeFacts,
+        Answering, Error, OperationKind, PageBudget, RefreshPurpose, ReplicaSelection,
+        ResponseKind, ServeFacts, VisitOrder,
         acquisition::{self, RankAnswer},
         budget::{helper_start, inherited_budget},
+        demote_unanswered,
         effect::EffectId,
         flight::FlightLimits,
         hints::{HINT_CAPACITY, HINT_TTL, SuccessorHints},
-        peer_error, recoverable,
+        peer_error, recoverable, replica_score,
         serve::{Body, Decision, ServeDecision, ServeRequest},
-        walk::{AttemptInputs, Features, FillConfig, HedgeEnd, Ranked, Reply, plan_attempt},
+        visit_order,
+        walk::{
+            AttemptInputs, Features, FillConfig, HedgeEnd, Ranked, Reply, SilenceNote, plan_attempt,
+        },
         window::{self, AcquisitionBudgetSpec, Facts, Next, WindowConfig},
         worker::{
             Effect, Mesh, ReadId, RequestId, Routing, ServeView, Served, Types, WindowId,
@@ -39,6 +46,7 @@ use racer_core::{
     },
     route::MAX_LINKS,
 };
+use racer_object_wire::model::{CacheKey, ObjectId, PageNumber};
 use serde_json::Value;
 use topology::{Member, Placement, REPLICAS};
 
@@ -164,8 +172,8 @@ pub struct ModelSpec {
     pub read_timeout: Nanos,
     /// Per-attempt exchange cap of a peer probe (`AttemptInputs::attempt_timeout`); a probe
     /// unanswered by then times out (`Reply::TimedOut`). Production and racer-sim use
-    /// [`ATTEMPT_TIMEOUT`]; the default [`NO_ATTEMPT_CAP`] bounds an attempt by its signed
-    /// overall deadline only, until the Model matches racer-sim under the 2 s cap (see MODEL.md).
+    /// [`ATTEMPT_TIMEOUT`], the default; [`NO_ATTEMPT_CAP`] bounds an attempt by its signed
+    /// overall deadline only.
     pub attempt_timeout: Nanos,
     /// Pages each node keeps; the least recently used page is evicted past it. 0 is unbounded.
     pub stored_pages: usize,
@@ -202,7 +210,7 @@ impl Default for ModelSpec {
             page_bytes: 1 << 20,
             storms: Vec::new(),
             read_timeout: 10_000 * MILLIS,
-            attempt_timeout: NO_ATTEMPT_CAP,
+            attempt_timeout: ATTEMPT_TIMEOUT,
             stored_pages: 0,
             origin_errors: OriginErrors::default(),
             metadata: false,
@@ -343,6 +351,9 @@ struct Asker {
 struct Node {
     cores: Vec<WorkerCore<ModelTypes>>,
     stored: Store,
+    /// Production `LinkHealth` silence, shared by the node's workers (racer-sim
+    /// `NodeState::silence`): fed by [`Effect::Silence`], read by every non-owner ranking.
+    silence: Silence<u32, Page>,
 }
 
 /// A node's published pages, bounded by least-recently-used eviction (racer-sim keeps a
@@ -437,6 +448,8 @@ struct Model<'s> {
     timeouts_queued: u64,
     /// `MODEL_DIAG` set: record probe, serve and send breakdowns in `attempt_errors`.
     diag: bool,
+    /// `MODEL_DIAG`: each acquisition's probe outcomes (`O`wner or `H`elper, answer kind).
+    walks: BTreeMap<(u32, u32, ReadId), String>,
 }
 
 const TAG_EVENT: u64 = 1;
@@ -482,6 +495,13 @@ impl<'s> Model<'s> {
                     .map(|worker| core(node, worker, workers, &members, &placement, base))
                     .collect(),
                 stored: Store::new(spec.stored_pages),
+                // Production: half the client request timeout, and the peer attempt timeout for
+                // one ping.
+                silence: Silence::new(
+                    SILENCE_CAPACITY,
+                    Duration::from_nanos(spec.read_timeout / 2),
+                    Duration::from_nanos(ATTEMPT_TIMEOUT),
+                ),
             })
             .collect();
         Self {
@@ -508,6 +528,7 @@ impl<'s> Model<'s> {
             expected_reads: 0,
             timeouts_queued: 0,
             diag: std::env::var_os("MODEL_DIAG").is_some(),
+            walks: BTreeMap::new(),
         }
     }
 
@@ -688,6 +709,10 @@ impl<'s> Model<'s> {
                         let ms = (now - sent) / (250 * MILLIS) * 250;
                         let key = format!("reply:{}->{}:{kind}:{ms}ms", role(node), role(to));
                         *self.report.attempt_errors.entry(key).or_default() += 1;
+                        let walk = self.walks.entry((node, worker, read)).or_default();
+                        walk.push(if owners.contains(&to) { 'O' } else { 'H' });
+                        walk.extend(kind.chars().take(4));
+                        walk.push(' ');
                     }
                 }
                 let mut out = Vec::new();
@@ -1056,6 +1081,46 @@ impl<'s> Model<'s> {
         }
     }
 
+    /// A non-owner's visit order over `owners` (production `CandidatePolicy::visit_order`,
+    /// racer-sim `walk_ranking`): `Spread` visits mesh neighbors first, then by descending
+    /// `replica_score`, so readers spread over the owners instead of all asking rank 0. One
+    /// membership version, so `lineage_first` never moves an owner. Owners that left this
+    /// node's requests unanswered or shed them go last (`demote_unanswered`).
+    fn visit_order(&self, node: u32, page: Page, owners: &[u32]) -> VisitOrder {
+        let id = |n: u32| NodeId(format!("n{n:08}"));
+        let mut key = [0u8; 32];
+        key[..8].copy_from_slice(&page.object.to_be_bytes());
+        let object = ObjectId {
+            cache: CacheId("model".to_owned()),
+            key: CacheKey(key),
+        };
+        let requester = id(node);
+        let order = visit_order(
+            ReplicaSelection::Spread,
+            owners.len(),
+            |r| self.members.is_neighbor(node as usize, owners[r] as usize),
+            |r| {
+                replica_score(
+                    &requester,
+                    &object,
+                    PageNumber(u64::from(page.number)),
+                    &id(owners[r]),
+                )
+            },
+        );
+        let at = self.instant(self.now());
+        let silence = &self.nodes[node as usize].silence;
+        demote_unanswered(order, |r| {
+            if silence.silent(&owners[r], at) {
+                Answering::Silent
+            } else if silence.unanswered(&owners[r], at) {
+                Answering::Unanswered
+            } else {
+                Answering::Answers
+            }
+        })
+    }
+
     /// Answer `asker`'s probe at node `to`.
     fn serve(&mut self, asker: Asker, to: u32, page: Page, route: Route) {
         let copy_only = route.copy_only;
@@ -1134,9 +1199,19 @@ impl<'s> Model<'s> {
                 };
                 let mut out = Vec::new();
                 let core = &mut self.nodes[to as usize].cores[worker as usize];
-                if core.acquiring(&page) {
+                let joined = core.acquiring(&page);
+                if joined {
                     self.report.counters.flight_joins += 1;
                 }
+                if self.diag {
+                    let own = owners.contains(&to);
+                    *self
+                        .report
+                        .attempt_errors
+                        .entry(format!("srv:owner{own}:joined{joined}"))
+                        .or_default() += 1;
+                }
+                let core = &mut self.nodes[to as usize].cores[worker as usize];
                 let request = core.read_page(page, budget, at, &mut out);
                 self.serving.insert((to, worker, request), asker);
                 self.dispatch(to, worker, out);
@@ -1148,6 +1223,16 @@ impl<'s> Model<'s> {
     fn send_page(&mut self, asker: Asker, to: u32, page: Page) {
         let now = self.now();
         let worker = owner_worker(page, self.spec.workers.max(1));
+        if self.diag {
+            let (page_bodies, _) = self.nodes[to as usize].cores[worker as usize]
+                .serve
+                .streaming(&page);
+            *self
+                .report
+                .attempt_errors
+                .entry(format!("fanin:{:03}", page_bodies / 8 * 8))
+                .or_default() += 1;
+        }
         let body = self.nodes[to as usize].cores[worker as usize]
             .serve
             .begin_body(page);
@@ -1273,10 +1358,13 @@ impl<'s> Model<'s> {
                     let at = self
                         .fabric
                         .cpu(now, node, worker as u8, costs.cpu_ranking_chunk_ns);
-                    let ranked = Ranked {
+                    let mut ranked = Ranked {
                         members: self.nodes.len(),
                         ..Ranked::new(1, &owners, rank)
                     };
+                    if rank.is_none() {
+                        ranked.order = self.visit_order(node, page, &owners);
+                    }
                     let answer = Input::Ranked {
                         id,
                         result: Ok(RankAnswer {
@@ -1504,6 +1592,24 @@ impl<'s> Model<'s> {
                 };
                 self.engine.at(at, answer);
             }
+            Effect::Silence {
+                page,
+                dest,
+                sent,
+                note,
+            } => {
+                // Production `CandidatePolicy::apply` (racer-sim `apply`, `shed_busy` on). Pings
+                // are not modeled: a peer that wants one stays unanswered until it answers.
+                let at = self.instant(now);
+                let silence = &mut self.nodes[node as usize].silence;
+                match note {
+                    SilenceNote::Shed => silence.shed(dest, page, at),
+                    SilenceNote::Answered => silence.answered(&dest, at),
+                    SilenceNote::TimedOut { needed } => {
+                        let _ = silence.timed_out(dest, page, sent, at, needed);
+                    }
+                }
+            }
             Effect::MetadataReady { request, result } => {
                 let Some((page, start, attempt)) = self.refreshing.remove(&(node, worker, request))
                 else {
@@ -1613,6 +1719,15 @@ impl<'s> Model<'s> {
 
     /// End-of-run checks: every read ended and every core is quiescent.
     fn finish(&mut self) {
+        for walk in std::mem::take(&mut self.walks).into_values() {
+            if !walk.ends_with("Page ") {
+                *self
+                    .report
+                    .attempt_errors
+                    .entry(format!("walk:{walk}"))
+                    .or_default() += 1;
+            }
+        }
         let ended = self.report.counters.reads_completed + self.report.counters.reads_failed;
         if ended != self.expected_reads {
             self.violation(format!("{} of {} reads ended", ended, self.expected_reads));
@@ -1694,6 +1809,7 @@ pub fn effect_name(effect: &Effect<ModelTypes>) -> &'static str {
         Effect::Completed { result: Ok(()), .. } => "Completed::Ok",
         Effect::Completed { result: Err(_), .. } => "Completed::Err",
         Effect::Metadata { .. } => "Metadata",
+        Effect::Silence { .. } => "Silence",
         Effect::MetadataReady { result: Ok(_), .. } => "MetadataReady::Ok",
         Effect::MetadataReady { result: Err(_), .. } => "MetadataReady::Err",
     }
@@ -1752,13 +1868,24 @@ fn core(
             mesh,
             helper_of,
         },
-        FlightLimits::default(),
+        flight_limits(),
         64,
         ServeDecision::new(1 << 20),
         SuccessorHints::new(HINT_CAPACITY, HINT_TTL),
         OwnerBudget::new(4, 0),
         base,
     )
+}
+
+/// Production per-worker flight bounds (`racer_core::admission::Limits::default`, racer-sim
+/// `NodeConfig`): 64 flights of 64 waiters each. A join past them is answered `Overloaded`.
+fn flight_limits() -> FlightLimits {
+    let limits = racer_core::admission::Limits::default();
+    FlightLimits {
+        entries: limits.flights.get(),
+        waiters_per_flight: limits.waiters_per_flight.get(),
+        ..FlightLimits::default()
+    }
 }
 
 /// Run a Model scenario over `choices`: the outcome and the JSON report.
