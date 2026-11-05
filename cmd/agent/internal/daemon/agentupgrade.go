@@ -10,10 +10,13 @@ import (
 	"fmt"
 	"log/slog"
 	"os"
+	"os/exec"
+	"slices"
 	"strings"
 
 	"github.com/Azure/unbounded/pkg/agent/agentbinary"
 	"github.com/Azure/unbounded/pkg/agent/goalstates"
+	"github.com/Azure/unbounded/pkg/agent/isolation"
 )
 
 const (
@@ -61,6 +64,65 @@ func parseAgentUpgradeRequest(parameters map[string]string) (agentUpgradeRequest
 }
 
 func upgradeDaemonBinary(ctx context.Context, log *slog.Logger, request agentUpgradeRequest) error {
+	return upgradeDaemonBinaryFor(ctx, log, request, hostIsolationModes(goalstates.AppliedConfigPath), runSupportsIsolation)
+}
+
+// hostIsolationModes returns the modes other than nspawn whose applied config
+// exists on the host, found through pathOf. It looks only at which files exist,
+// as the recovery script does, so it answers on a host whose applied config
+// cannot be decoded.
+func hostIsolationModes(pathOf func(name string) string) []isolation.Mode {
+	var modes []isolation.Mode
+
+	for _, loc := range goalstates.AppliedConfigLocations() {
+		if loc.Mode == isolation.ModeNSpawn {
+			continue
+		}
+
+		if _, err := os.Lstat(pathOf(loc.Name)); err == nil && !slices.Contains(modes, loc.Mode) {
+			modes = append(modes, loc.Mode)
+		}
+	}
+
+	return modes
+}
+
+// runSupportsIsolation asks the agent binary at path whether it can operate
+// mode. An agent that predates the question fails it, as an unknown
+// subcommand, which is the right answer.
+func runSupportsIsolation(ctx context.Context, path string, mode isolation.Mode) error {
+	out, err := exec.CommandContext(ctx, path, SupportsIsolationCommand, string(mode)).CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("the candidate agent cannot operate isolation mode %q: %w: %s", mode, err, strings.TrimSpace(string(out)))
+	}
+
+	return nil
+}
+
+// candidateCheck returns the check a candidate agent must pass: it can operate
+// every mode in modes.
+func candidateCheck(modes []isolation.Mode, supports func(ctx context.Context, path string, mode isolation.Mode) error) func(context.Context, string) error {
+	return func(ctx context.Context, path string) error {
+		for _, mode := range modes {
+			if err := supports(ctx, path, mode); err != nil {
+				return err
+			}
+		}
+
+		return nil
+	}
+}
+
+// upgradeDaemonBinaryFor stages the candidate and refuses it, before anything
+// is switched, unless it can operate every mode in modes. An nspawn host has
+// none to check: every agent operates nspawn.
+func upgradeDaemonBinaryFor(
+	ctx context.Context,
+	log *slog.Logger,
+	request agentUpgradeRequest,
+	modes []isolation.Mode,
+	supports func(ctx context.Context, path string, mode isolation.Mode) error,
+) error {
 	paths, err := goalstates.ResolvedAgentUpgradePaths()
 	if err != nil {
 		return fmt.Errorf("resolve current daemon binary symlink: %w", err)
@@ -79,6 +141,7 @@ func upgradeDaemonBinary(ctx context.Context, log *slog.Logger, request agentUpg
 		ExpectedMember: goalstates.AgentUpgradeBinaryName,
 		Mode:           agentUpgradeBinaryMode,
 		ExactMember:    true,
+		Check:          candidateCheck(modes, supports),
 	})
 
 	return err

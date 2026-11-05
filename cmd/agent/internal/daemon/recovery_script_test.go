@@ -73,6 +73,10 @@ func TestRecoveryScript(t *testing.T) {
 				"DaemonBinaryLastGoodPath":     lastGood,
 				"DaemonAgentUpgradeSignalPath": filepath.Join(dir, "signal"),
 				"DaemonUnit":                   "test-agent.service",
+				// No mode other than nspawn on this host: the check is
+				// skipped whatever the last-good binary is.
+				"IsolationModeConfigs":     "none=" + filepath.Join(dir, "absent-none-applied-config.json"),
+				"SupportsIsolationCommand": SupportsIsolationCommand,
 			}))
 
 			stub := `#!/bin/bash
@@ -132,4 +136,84 @@ if test "$MODE" = selection-changed; then ln -sfn /bin/false "$CURRENT"; fi
 			}
 		})
 	}
+}
+
+// On a host whose node runs in a mode other than nspawn, the last-good binary
+// must answer the support check for that mode, or recovery refuses to switch to
+// it: an agent that predates the mode would operate the node as an nspawn
+// machine, or not find it.
+func TestRecoveryScriptRefusesALastGoodThatCannotOperateTheMode(t *testing.T) {
+	t.Parallel()
+
+	for _, tc := range []struct {
+		name     string
+		answer   string
+		wantErr  bool
+		restarts int
+	}{
+		{name: "unsupported", answer: "exit 1", wantErr: true},
+		{name: "unknown subcommand of an older agent", answer: `echo "unknown command" >&2; exit 1`, wantErr: true},
+		// The script then goes on to the normal recovery; the stub systemctl
+		// fails the liveness check, which is not what this test is about.
+		{name: "supported", answer: "exit 0", restarts: 1},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			dir := t.TempDir()
+			calls := filepath.Join(dir, "calls")
+			appliedNone := filepath.Join(dir, "none-kube1-applied-config.json")
+			require.NoError(t, os.WriteFile(appliedNone, []byte("{}"), 0o600))
+
+			lastGood := filepath.Join(dir, "last-good-agent")
+			require.NoError(t, os.WriteFile(lastGood, []byte("#!/bin/bash\necho \"agent $*\" >> \"$CALLS\"\n"+tc.answer+"\n"), 0o755))
+
+			lastGoodLink := filepath.Join(dir, "last-good")
+			require.NoError(t, os.Symlink(lastGood, lastGoodLink))
+			require.NoError(t, os.WriteFile(filepath.Join(dir, "systemctl"), []byte("#!/bin/bash\necho \"$*\" >> \"$CALLS\"\nexit 1\n"), 0o755))
+			require.NoError(t, os.WriteFile(filepath.Join(dir, "sleep"), []byte("#!/bin/bash\n"), 0o755))
+
+			var script bytes.Buffer
+
+			tmpl, err := template.New("recovery").Parse(string(daemonRecoveryScriptContent))
+			require.NoError(t, err)
+			require.NoError(t, tmpl.Execute(&script, map[string]string{
+				"DaemonBinaryCurrentPath":      filepath.Join(dir, "current"),
+				"DaemonBinaryLastGoodPath":     lastGoodLink,
+				"DaemonAgentUpgradeSignalPath": filepath.Join(dir, "signal"),
+				"DaemonUnit":                   "test-agent.service",
+				"IsolationModeConfigs":         "none=" + appliedNone,
+				"SupportsIsolationCommand":     SupportsIsolationCommand,
+			}))
+
+			cmd := exec.CommandContext(t.Context(), "bash", "-s")
+			cmd.Stdin = &script
+			cmd.Env = append(os.Environ(), "PATH="+dir+":"+os.Getenv("PATH"), "CALLS="+calls)
+
+			output, err := cmd.CombinedOutput()
+			require.Error(t, err, "%s", output)
+
+			data, rerr := os.ReadFile(calls)
+			require.NoError(t, rerr)
+			require.Contains(t, string(data), "agent supports-isolation none\n")
+
+			if tc.wantErr {
+				require.Contains(t, string(output), "cannot operate isolation mode none")
+				require.NotContains(t, string(data), "restart", "nothing is switched")
+
+				_, lerr := os.Lstat(filepath.Join(dir, "current"))
+				require.ErrorIs(t, lerr, os.ErrNotExist)
+
+				return
+			}
+
+			require.Equal(t, tc.restarts, strings.Count(string(data), "restart test-agent.service\n"))
+		})
+	}
+}
+
+func TestIsolationModeConfigsNamesEveryModeButNSpawn(t *testing.T) {
+	t.Parallel()
+
+	require.Equal(t, "none=/etc/unbounded/agent/none-kube1-applied-config.json", isolationModeConfigs())
 }
