@@ -209,6 +209,11 @@ impl Driver {
         Self(LegacyDriver::new(sim.0, clock))
     }
 
+    /// The simulated OS this driver runs on.
+    pub(super) fn os(&self) -> &SimOs {
+        self.0.os()
+    }
+
     /// Publishes an operation, capturing its fault and affected disk paths once.
     pub(super) fn push(&mut self, id: u64, op: Op) -> Result<(), ()> {
         self.0.push(id, op.into())

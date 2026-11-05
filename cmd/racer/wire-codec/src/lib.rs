@@ -310,6 +310,12 @@ pub mod rest {
         /// Worker clock and entropy for every transport decision on this owner.
         fn ctx(&self) -> &racer_io::WorkerCtx;
 
+        /// The simulated OS that owns this endpoint's sockets, or `None` for
+        /// kernel sockets.
+        fn sim(&self) -> Option<racer_io::sim::SimOs> {
+            None
+        }
+
         /// Acquire an optional admission charge before opening a connection.
         fn lease(&self) -> Result<Option<Rc<Self::Lease>>, Self::Error>;
 
@@ -555,7 +561,6 @@ pub mod rest {
         Real(TcpStream),
 
         /// Simulated TCP stream and readiness share one owner-local descriptor.
-        #[cfg(feature = "simulation")]
         Sim(Rc<Descriptor>),
     }
 
@@ -564,7 +569,6 @@ pub mod rest {
         fn read(&mut self, bytes: &mut [u8]) -> std::io::Result<usize> {
             match self {
                 Self::Real(stream) => stream.read(bytes),
-                #[cfg(feature = "simulation")]
                 Self::Sim(fd) => fd.try_recv(bytes),
             }
         }
@@ -575,7 +579,6 @@ pub mod rest {
         fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
             match self {
                 Self::Real(stream) => stream.write(bytes),
-                #[cfg(feature = "simulation")]
                 Self::Sim(fd) => fd.try_send(bytes),
             }
         }
@@ -584,7 +587,6 @@ pub mod rest {
         fn flush(&mut self) -> std::io::Result<()> {
             match self {
                 Self::Real(stream) => stream.flush(),
-                #[cfg(feature = "simulation")]
                 Self::Sim(_) => Ok(()),
             }
         }
@@ -951,8 +953,7 @@ pub mod rest {
                 / (addresses.len() - index + 1) as u32;
             let attempt = scope.narrowed(now + share.min(Duration::from_secs(5)));
             let charge = io.lease()?;
-            #[cfg(feature = "simulation")]
-            if let Some(sim) = uring_runtime::reactor::simulation::Simulation::current() {
+            if let Some(sim) = io.sim() {
                 if let Ok(fd) = sim.connect(uring_runtime::reactor::SocketAddress::Inet(*address)) {
                     let fd = Rc::new(fd);
                     return Ok(Connected {
@@ -2081,15 +2082,16 @@ pub mod rest {
             Real(UdpSocket),
 
             /// Simulated socket restricted to one resolver peer.
-            #[cfg(feature = "simulation")]
             Sim(Rc<Descriptor>),
         }
 
         impl Datagram {
             /// Bind an ephemeral socket and restrict its peer to the chosen resolver.
-            fn connect(server: SocketAddr) -> Result<(Self, Rc<Descriptor>)> {
-                #[cfg(feature = "simulation")]
-                if let Some(sim) = uring_runtime::reactor::simulation::Simulation::current() {
+            fn connect(
+                server: SocketAddr,
+                sim: Option<racer_io::sim::SimOs>,
+            ) -> Result<(Self, Rc<Descriptor>)> {
+                if let Some(sim) = sim {
                     let fd = sim
                         .bind_datagram(
                             if server.is_ipv4() {
@@ -2124,7 +2126,6 @@ pub mod rest {
             fn send(&self, bytes: &[u8]) -> std::io::Result<usize> {
                 match self {
                     Self::Real(socket) => socket.send(bytes),
-                    #[cfg(feature = "simulation")]
                     Self::Sim(fd) => {
                         let Some(h) = fd.as_sim() else { unreachable!() };
                         h.send_datagram(bytes)
@@ -2136,7 +2137,6 @@ pub mod rest {
             fn recv(&self, bytes: &mut [u8]) -> std::io::Result<usize> {
                 match self {
                     Self::Real(socket) => socket.recv(bytes),
-                    #[cfg(feature = "simulation")]
                     Self::Sim(fd) => {
                         let Some(h) = fd.as_sim() else { unreachable!() };
                         h.recv_from(bytes).map(|(n, _)| n)
@@ -2169,7 +2169,7 @@ pub mod rest {
             request.push(0);
             request.extend_from_slice(&kind.to_be_bytes());
             request.extend_from_slice(&[0, 1]);
-            let (socket, fd) = Datagram::connect(server)?;
+            let (socket, fd) = Datagram::connect(server, io.sim())?;
             loop {
                 scope.check()?;
                 match socket.send(&request) {

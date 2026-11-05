@@ -1002,6 +1002,20 @@ impl<S: Scope, Q: Budget> Reactor<S, Q> {
         self.ctx_override.get().unwrap_or(&self.ctx)
     }
 
+    /// The simulated OS this reactor drives, or `None` on the kernel.
+    pub fn sim_os(&self) -> Option<racer_io::sim::SimOs> {
+        #[cfg(feature = "simulation")]
+        {
+            self.state
+                .borrow()
+                .simulation
+                .as_ref()
+                .map(|driver| driver.os().clone())
+        }
+        #[cfg(not(feature = "simulation"))]
+        None
+    }
+
     /// Test support: replace the construction-time context once, for tests
     /// that switch a running worker from host time to a simulated clock.
     #[doc(hidden)]

@@ -373,6 +373,10 @@ impl rest::Io for ReactorControlIo {
         self.reactor.ctx()
     }
 
+    fn sim(&self) -> Option<racer_io::sim::SimOs> {
+        self.reactor.sim_os()
+    }
+
     type FileBytes = uring_runtime::reactor::filesystem::ReadBuffer;
 
     type Error = Error;
