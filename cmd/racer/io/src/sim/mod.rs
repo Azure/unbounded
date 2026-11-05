@@ -94,6 +94,12 @@ struct World {
 
     next_event: u64,
 
+    /// Events that changed world state. A blocked attempt (`blocked:*`) is
+    /// traced but changes nothing, so it must not make another reactor's
+    /// waiting operations runnable again, or two reactors sharing a world
+    /// would wake each other forever.
+    changes: u64,
+
     stream_capacity: usize,
 
     max_chunk: usize,
@@ -287,6 +293,9 @@ impl World {
             result,
         });
         self.next_event += 1;
+        if !op.starts_with("blocked:") {
+            self.changes += 1;
+        }
     }
 
     /// Consumes the first matching fault unless the driver already selected one.
@@ -339,6 +348,7 @@ impl SimOs {
             faults: VecDeque::new(),
             trace: Vec::new(),
             next_event: 0,
+            changes: 0,
             stream_capacity: 64 * 1024,
             max_chunk: usize::MAX,
             executing: false,

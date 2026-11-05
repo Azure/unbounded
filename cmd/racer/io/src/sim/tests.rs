@@ -143,6 +143,22 @@ mod world {
         assert_eq!(code(local.try_send(b"x")), libc::EPIPE);
     }
 
+    /// A blocked attempt is traced but is not a world change, so it does not
+    /// make waiting operations of other reactors runnable again.
+    #[test]
+    fn blocked_attempts_are_traced_but_change_nothing() {
+        let sim = SimOs::new();
+        let (local, _peer) = sim.socket_pair();
+        let a = SocketAddress::Inet("127.0.0.1:101".parse().unwrap());
+        let b = SocketAddress::Inet("127.0.0.1:102".parse().unwrap());
+        sim.label_stream(&local, a.clone(), b.clone()).unwrap();
+        sim.partition(a, b);
+        let (events, changes) = (sim.0.borrow().next_event, sim.0.borrow().changes);
+        assert_eq!(code(local.try_send(b"x")), libc::EAGAIN);
+        assert_eq!(sim.0.borrow().next_event, events + 1);
+        assert_eq!(sim.0.borrow().changes, changes);
+    }
+
     #[test]
     /// Exercise short sparse I/O, append, locks, bounds, and invalid fault inputs.
     fn short_files_zero_writes_append_locks_and_bounds() {

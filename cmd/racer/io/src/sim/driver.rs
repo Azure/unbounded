@@ -168,7 +168,7 @@ impl SimDriver {
             return false;
         }
         self.dirty
-            || self.seen != self.os.0.borrow().next_event
+            || self.seen != self.os.0.borrow().changes
             || due.any(|p| p.delay != 0 || p.result.is_some() || !p.attempted)
     }
 
@@ -186,7 +186,7 @@ impl SimDriver {
         self.dirty = false;
         // Remember the world before this turn: any change made by the turn
         // itself (a send that unblocks an earlier receive) earns another turn.
-        self.seen = self.os.0.borrow().next_event;
+        self.seen = self.os.0.borrow().changes;
         let mut ids: Vec<u64> = self.pending.keys().copied().collect();
         if let Some(choices) = &mut self.os.0.borrow_mut().choices {
             // Fisher-Yates where a zero draw keeps the element in place.
