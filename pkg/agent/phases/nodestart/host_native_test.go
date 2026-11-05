@@ -8,6 +8,7 @@ import (
 	"errors"
 	"log/slog"
 	"net/netip"
+	"os"
 	"path/filepath"
 	"testing"
 
@@ -83,14 +84,15 @@ func TestConfigureContainerdOnHostSkipsUnit(t *testing.T) {
 	t.Parallel()
 
 	gs, dir := hostNativeGoalState(t)
-	task := ConfigureContainerdOnHost(gs)
+	task := ConfigureContainerdOnHost(gs, "/etc/unbounded/containerd/config.toml")
 	require.NoError(t, task.Do(context.Background()))
 	require.True(t, task.Changed())
 
-	require.FileExists(t, filepath.Join(dir, "etc/containerd/config.toml"))
+	require.FileExists(t, filepath.Join(dir, "etc/unbounded/containerd/config.toml"))
+	require.NoFileExists(t, filepath.Join(dir, "etc/containerd/config.toml"), "the distro's containerd configuration is never written")
 	require.NoFileExists(t, filepath.Join(dir, "etc/systemd/system/containerd.service"))
 
-	again := ConfigureContainerdOnHost(gs)
+	again := ConfigureContainerdOnHost(gs, "/etc/unbounded/containerd/config.toml")
 	require.NoError(t, again.Do(context.Background()))
 	require.False(t, again.Changed())
 }
@@ -105,6 +107,28 @@ func TestConfigureLocalDNSLeavesHostResolver(t *testing.T) {
 	require.FileExists(t, filepath.Join(dir, "etc/unbounded/localdns/resolv.conf"))
 	require.FileExists(t, filepath.Join(dir, "etc/systemd/system/localdns.slice"))
 	require.NoFileExists(t, filepath.Join(dir, "etc/resolv.conf"), "the host resolver file must not be rewritten")
+}
+
+// CoreDNS runs as a DynamicUser on the host, so its configuration directories
+// must be traversable even when something created them root-only first.
+func TestConfigureLocalDNSMakesItsDirectoriesTraversableOnTheHost(t *testing.T) {
+	t.Parallel()
+
+	gs, dir := hostNativeGoalState(t)
+	require.NoError(t, os.MkdirAll(filepath.Join(dir, "etc/unbounded/agent"), 0o700))
+	require.NoError(t, os.Chmod(filepath.Join(dir, "etc/unbounded"), 0o700))
+
+	require.NoError(t, ConfigureLocalDNS(gs).Do(context.Background()))
+
+	for _, d := range []string{"etc/unbounded", "etc/unbounded/localdns"} {
+		info, err := os.Stat(filepath.Join(dir, d))
+		require.NoError(t, err)
+		require.Equal(t, os.FileMode(0o755), info.Mode().Perm(), d)
+	}
+
+	info, err := os.Stat(filepath.Join(dir, "etc/unbounded/agent"))
+	require.NoError(t, err)
+	require.Equal(t, os.FileMode(0o700), info.Mode().Perm(), "the agent's own directory keeps its mode")
 }
 
 func TestWaitForKubeletOnHostUsesExecutorAndUnit(t *testing.T) {

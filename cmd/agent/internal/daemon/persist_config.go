@@ -13,6 +13,7 @@ import (
 
 	"github.com/Azure/unbounded/pkg/agent/config"
 	"github.com/Azure/unbounded/pkg/agent/goalstates"
+	"github.com/Azure/unbounded/pkg/agent/isolation"
 	"github.com/Azure/unbounded/pkg/agent/phases"
 )
 
@@ -27,6 +28,13 @@ type persistAppliedConfig struct {
 // startup to detect configuration drift.
 func PersistAppliedConfig(log *slog.Logger, machineName string, cfg *config.AgentConfig) phases.Task {
 	return &persistAppliedConfig{log: log, machineName: machineName, cfg: cfg}
+}
+
+// PersistAppliedConfigFor is PersistAppliedConfig for the node of slot in mode.
+// nspawn keeps the file names older agents read; every other mode stores its
+// config where they do not look (see goalstates.AppliedConfigName).
+func PersistAppliedConfigFor(log *slog.Logger, mode isolation.Mode, slot string, cfg *config.AgentConfig) phases.Task {
+	return PersistAppliedConfig(log, goalstates.AppliedConfigName(mode, slot), cfg)
 }
 
 func (p *persistAppliedConfig) Name() string { return "persist-applied-config" }

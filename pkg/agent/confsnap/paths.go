@@ -19,6 +19,8 @@ import (
 func SharedPaths() []string {
 	return []string{
 		goalstates.ContainerdConfigPath,
+		// The none mode's containerd runs with the agent's own configuration.
+		none.ContainerdConfigPath,
 		goalstates.ContainerdConfDropInDir,
 		goalstates.ContainerdCertsDir,
 		goalstates.KubeletConfigurationPath,
