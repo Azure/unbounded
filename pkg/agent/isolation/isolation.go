@@ -33,6 +33,10 @@ const (
 	ModeNSpawn Mode = "nspawn"
 	// ModeNone runs the node stack as agent-owned units directly on the host.
 	ModeNone Mode = "none"
+	// ModeContainer runs the node stack in a privileged OCI container
+	// supervised by an agent-owned systemd unit. It is experimental: the agent
+	// operates it only when its configuration opts in.
+	ModeContainer Mode = "container"
 )
 
 // DefaultMode is the mode used when none is configured or recorded.

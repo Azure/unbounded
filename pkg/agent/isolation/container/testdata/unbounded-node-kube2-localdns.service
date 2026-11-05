@@ -1,0 +1,26 @@
+[Unit]
+Description=Unbounded node container (kube2)
+Wants=network-online.target
+Requires=unbounded-localdns-network.service
+After=network-online.target local-fs.target unbounded-localdns-network.service
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+Delegate=yes
+KillMode=mixed
+KillSignal=SIGRTMIN+3
+TimeoutStartSec=300
+TimeoutStopSec=120
+Restart=always
+RestartSec=1
+RestartMaxDelaySec=60
+RestartSteps=10
+ExecStartPre=-/opt/unbounded/runtime/runc delete --force unbounded-kube2
+ExecStartPre=/opt/unbounded/agent/bin/unbounded-agent-lifecycle node-lifecycle pre-start kube2
+ExecStart=/opt/unbounded/runtime/runc run --bundle /var/lib/unbounded/containers/bundles/kube2 unbounded-kube2
+ExecStartPost=/opt/unbounded/agent/bin/unbounded-agent-lifecycle node-lifecycle post-start kube2
+ExecStopPost=-/opt/unbounded/runtime/runc delete --force unbounded-kube2
+
+[Install]
+WantedBy=multi-user.target
