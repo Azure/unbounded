@@ -27,6 +27,16 @@ This document describes the custom resource definitions shipped with machina: **
 | K8s Version | `.spec.kubernetes.version` | Desired Kubernetes version |
 | Age | standard | Time since creation |
 
+### spec.isolation
+
+| Property | Type | Required | Description |
+|----------|------|----------|-------------|
+| `spec.isolation` | string | No | Where the node stack (containerd, kubelet, CNI, CoreDNS) runs on the host. Empty or `nspawn`, the only mode in this release. Empty declares nothing: a node keeps the mode it runs, and a new node uses `nspawn`. Passed to the agent config as `Isolation`. The agent never writes this field on an existing Machine; it sets it only when it creates the Machine at self-registration. |
+
+A change takes effect at the node's next repave. A change that needs a
+reprovision also needs the annotation `unbounded-cloud.io/allow-reprovision:
+"true"`. See [Isolation Modes]({{< relref "reference/agent/isolation" >}}).
+
 ### spec.ssh
 
 SSH connection details. When `ssh` is nil, the machina controller skips the Machine entirely.
@@ -267,6 +277,8 @@ after a controller restart. Each entry includes:
 | `bootstrap.credentialID` | string | Credential ID (`JTI=<jti>`) of the last bootstrap token issued by metalman attestation. Used by metalman to approve the node's kubelet CSR. |
 | `bootstrap.nodeName` | string | Kubernetes Node name the bootstrap token was issued for. Metalman approves the kubelet CSR only for this name. During a virtual-media `HostReplace` it is the name captured when the replacement started. |
 | `bootstrap.issuedAt` | time | When that bootstrap token was issued. |
+| `isolation` | string | The isolation mode the agent reports as applied on the host. Written by the agent daemon at startup. Empty until the agent reports one. Compared with `spec.isolation` to set the `IsolationDrift` condition. |
+| `isolationChange` | object | The agent's last attempt to change the node to the mode in `spec.isolation`, made during a repave. Fields: `targetMode`, `phase` (`InProgress`, `Succeeded`, or `Failed`), `strategy` (`InPlace` or `Reprovision`), `reason` (for a refused change: `UnsupportedMode` or `ReprovisionNotAllowed`), `message` (at most 4096 bytes), and `lastTransitionTime`. |
 | `conditions` | []Condition | Standard Kubernetes conditions (see below). |
 
 ### Conditions
@@ -277,6 +289,7 @@ after a controller restart. Each entry includes:
 | `Provisioning` | machina | `True` while the install script is running over SSH. `lastTransitionTime` records when provisioning started, used to detect stale provisioning attempts (e.g. after a controller restart). |
 | `Provisioned` | machina | `True` after successful SSH provisioning. `ObservedGeneration` tracks the spec generation. |
 | `CloudInitDone` | metalman | Observed first-boot cloud-init result for PXE machines. Metalman also mirrors cloud-init progress to active `HostReplace` `MachineOperation` conditions. |
+| `IsolationDrift` | machina | Compares `spec.isolation` with `status.isolation` and `status.isolationChange`. Absent until the agent has reported a mode. The reasons are listed under [Drift]({{< relref "reference/agent/isolation#drift" >}}). |
 
 ### Phase lifecycle
 
