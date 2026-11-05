@@ -201,7 +201,7 @@ func TestJournalStoreRoundTrip(t *testing.T) {
 	require.ErrorIs(t, err, ErrNoJournal)
 
 	in := Journal{
-		Strategy: InPlace, From: isolation.ModeNSpawn, To: slotTargetMode,
+		Strategy: InPlace, From: isolation.ModeNSpawn, To: isolation.ModeContainer,
 		SourceSlot: "kube1", TargetSlot: "kube2", Step: StepStoppingSource,
 	}
 	require.NoError(t, s.Save(in))

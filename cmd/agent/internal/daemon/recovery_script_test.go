@@ -216,5 +216,7 @@ func TestRecoveryScriptRefusesALastGoodThatCannotOperateTheMode(t *testing.T) {
 func TestIsolationModeConfigsNamesEveryModeButNSpawn(t *testing.T) {
 	t.Parallel()
 
-	require.Equal(t, "none=/etc/unbounded/agent/none-kube1-applied-config.json", isolationModeConfigs())
+	require.Equal(t, "none=/etc/unbounded/agent/none-kube1-applied-config.json"+
+		" container=/etc/unbounded/agent/container-kube1-applied-config.json"+
+		" container=/etc/unbounded/agent/container-kube2-applied-config.json", isolationModeConfigs())
 }

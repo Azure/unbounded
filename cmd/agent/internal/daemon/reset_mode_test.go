@@ -16,26 +16,33 @@ import (
 	"github.com/Azure/unbounded/pkg/agent/phases"
 )
 
-type stubTeardown struct{}
+// stubTeardown names its tasks after its mode, as the real teardowns do.
+type stubTeardown struct{ mode string }
 
-func (stubTeardown) Stop() phases.Task {
-	return hostnode.Func("stop-none-node", func(context.Context) error { return nil })
+func (s stubTeardown) Stop() phases.Task {
+	return hostnode.Func("stop-"+s.mode+"-node", func(context.Context) error { return nil })
 }
 
-func (stubTeardown) RemoveConfig() phases.Task {
-	return hostnode.Func("remove-none-config", func(context.Context) error { return nil })
+func (s stubTeardown) RemoveConfig() phases.Task {
+	return hostnode.Func("remove-"+s.mode+"-config", func(context.Context) error { return nil })
 }
 
-func (stubTeardown) Destroy() phases.Task {
-	return hostnode.Func("remove-none-node", func(context.Context) error { return nil })
+func (s stubTeardown) Destroy() phases.Task {
+	return hostnode.Func("remove-"+s.mode+"-node", func(context.Context) error { return nil })
 }
 
 func stubResetHost(nonePresent bool) (resetHost, *int) {
+	return stubResetHostWith(nonePresent, false)
+}
+
+func stubResetHostWith(nonePresent, containerPresent bool) (resetHost, *int) {
 	asked := 0
 
 	return resetHost{
-		nonePresent:  func() bool { asked++; return nonePresent },
-		noneTeardown: func(*slog.Logger) hostNodeTeardown { return stubTeardown{} },
+		nonePresent:       func() bool { asked++; return nonePresent },
+		noneTeardown:      func(*slog.Logger) hostNodeTeardown { return stubTeardown{mode: "none"} },
+		containerPresent:  func() bool { return containerPresent },
+		containerTeardown: func(*slog.Logger) hostNodeTeardown { return stubTeardown{mode: "container"} },
 	}, &asked
 }
 
@@ -103,9 +110,64 @@ func TestResetOrderWithANoneNode(t *testing.T) {
 	}
 }
 
-// The production host inspection is the none node's own traces.
-func TestDefaultResetHostLooksForNoneTraces(t *testing.T) {
+// A host with no trace of a container node gets no container teardown: it
+// never removes the shared kubelet, CNI or image directories of a host that
+// never ran one.
+func TestResetRunsTheContainerTeardownOnlyWhereAContainerNodeLeftTraces(t *testing.T) {
+	h, _ := stubResetHostWith(false, false)
+	name := resetResourcesOn(discardLogger(), h).Name()
+
+	for _, step := range []string{"stop-container-node", "remove-container-config", "remove-container-node"} {
+		assert.NotContains(t, name, step)
+	}
+
+	h, _ = stubResetHostWith(false, true)
+	name = resetResourcesOn(discardLogger(), h).Name()
+
+	for _, step := range nspawnTeardownSteps {
+		assert.Contains(t, name, step, "the nspawn teardown still runs")
+	}
+
+	last := -1
+
+	for _, step := range []string{
+		"remove-daemon-unit", "stop-machine", "stop-container-node", "remove-wireguard-keys",
+		"remove-nspawn-config", "remove-container-config",
+		"remove-machine", "remove-container-node", "remove-bpffs-mount",
+		"cleanup-routes", "remove-first-boot-unit", "remove-agent-artifacts", "reload-systemd",
+	} {
+		idx := strings.Index(name, step)
+		require.GreaterOrEqual(t, idx, 0, "%s missing from %s", step, name)
+		require.Greater(t, idx, last, "%s out of order in %s", step, name)
+
+		last = idx
+	}
+
+	assert.NotContains(t, name, "none-node")
+}
+
+// A host with traces of both (for example a change between them that was
+// interrupted) gets both teardowns, none first, in each position.
+func TestResetRunsEveryPresentModesTeardown(t *testing.T) {
+	h, _ := stubResetHostWith(true, true)
+	name := resetResourcesOn(discardLogger(), h).Name()
+
+	for _, pair := range [][2]string{
+		{"stop-none-node", "stop-container-node"},
+		{"remove-none-config", "remove-container-config"},
+		{"remove-none-node", "remove-container-node"},
+	} {
+		first, second := strings.Index(name, pair[0]), strings.Index(name, pair[1])
+		require.GreaterOrEqual(t, first, 0, pair[0])
+		require.Greater(t, second, first, "%s before %s", pair[0], pair[1])
+	}
+}
+
+// The production host inspection is each mode's own traces.
+func TestDefaultResetHostLooksForEachModesTraces(t *testing.T) {
 	h := defaultResetHost()
 	require.NotNil(t, h.nonePresent)
 	require.NotNil(t, h.noneTeardown(discardLogger()))
+	require.NotNil(t, h.containerPresent)
+	require.NotNil(t, h.containerTeardown(discardLogger()))
 }

@@ -184,7 +184,11 @@ func TestBackendForMode(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, isolation.ModeNone, b.Mode())
 
-	for _, mode := range []isolation.Mode{"microvm", "container"} {
+	b, err = backendForMode(isolation.ModeContainer, slog.Default(), cfg)
+	require.NoError(t, err)
+	require.Equal(t, isolation.ModeContainer, b.Mode())
+
+	for _, mode := range []isolation.Mode{"microvm"} {
 		_, err = backendForMode(mode, slog.Default(), cfg)
 		require.ErrorContains(t, err, "not supported by exec and logs", mode)
 	}

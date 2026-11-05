@@ -13,14 +13,10 @@ import (
 	"github.com/Azure/unbounded/pkg/agent/isolation"
 )
 
-// slotTargetMode stands for a second mode that runs in a slot. Only nspawn
-// does today, and the in-place engine is written against any pair of them.
-const slotTargetMode isolation.Mode = "fake-slot-mode"
-
 func TestPlan(t *testing.T) {
 	t.Parallel()
 
-	n, no := isolation.ModeNSpawn, isolation.ModeNone
+	n, c, no := isolation.ModeNSpawn, isolation.ModeContainer, isolation.ModeNone
 
 	tests := []struct {
 		name     string
@@ -28,9 +24,14 @@ func TestPlan(t *testing.T) {
 		want     Strategy
 		wantErr  string
 	}{
+		{name: "nspawn to container is in place", from: n, to: c, want: InPlace},
+		{name: "container to nspawn is in place", from: c, to: n, want: InPlace},
 		{name: "nspawn to none is a reprovision", from: n, to: no, want: Reprovision},
 		{name: "none to nspawn is a reprovision", from: no, to: n, want: Reprovision},
+		{name: "none to container is a reprovision", from: no, to: c, want: Reprovision},
+		{name: "container to none is a reprovision", from: c, to: no, want: Reprovision},
 		{name: "same mode rejected", from: n, to: n, wantErr: "already in isolation mode"},
+		{name: "container to container rejected", from: c, to: c, wantErr: "already in isolation mode"},
 		{name: "none to none rejected", from: no, to: no, wantErr: "already in isolation mode"},
 		{name: "unknown target rejected", from: n, to: "microvm", wantErr: "unsupported isolation mode"},
 		{name: "unknown source rejected", from: "microvm", to: n, wantErr: "unsupported isolation mode"},
@@ -66,7 +67,7 @@ func newHarness() *harness {
 
 	h := &harness{
 		source: &isolation.FakeBackend{FakeMode: isolation.ModeNSpawn},
-		target: &isolation.FakeBackend{FakeMode: slotTargetMode, Dir: "/var/lib/machines/kube2"},
+		target: &isolation.FakeBackend{FakeMode: isolation.ModeContainer, Dir: "/var/lib/machines/kube2"},
 		log:    &log,
 		fail:   map[string]error{},
 	}

@@ -213,6 +213,8 @@ func (e *migrationEnv) newBackend(log *slog.Logger, ep migrationEndpoint) (isola
 	switch ep.Mode {
 	case isolation.ModeNSpawn:
 		return nspawnops.Backend(nspawnops.Params{Log: log, Config: ep.Config, Downloads: ep.Downloads}), nspawn.Root(ep.Slot), nil
+	case isolation.ModeContainer:
+		return newContainerMigrationEndpoint(log, ep)
 	default:
 		return nil, nil, fmt.Errorf("in-place migration is not supported for isolation mode %q", ep.Mode)
 	}
@@ -274,7 +276,7 @@ func (e *migrationEnv) waitReady(ctx context.Context, log *slog.Logger, mode iso
 	}
 
 	// The readiness check a repave uses: the kubelet is active and has its
-	// credentials.
+	// credentials. A container waits for it inside Activate.
 	if mode != isolation.ModeNSpawn {
 		return nil
 	}
