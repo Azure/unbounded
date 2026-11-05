@@ -373,6 +373,7 @@ help: ## Show this help
 	@echo "  racer-sim                        Run the Racer simulator (ARGS='--scenario smoke --nodes 16')"
 	@echo "  racer-fuzz                       Run each Racer libFuzzer target briefly (FUZZ_SECONDS, default 30)"
 	@echo "  racer-dst                        Run the Racer DST seed set twice each (DST_SEEDS, DST_STEPS, DST_FILTER)"
+	@echo "  racer-dst-report                 Write one Model scenario's JSON report (ARGS='--scenario full-failover --nodes 200')"
 	@echo "  racer-envtest                    Run Racer API-server tests with KUBEBUILDER_ASSETS"
 	@echo "  racer-envtest-ci                 Provision pinned assets and run Racer API-server tests"
 	@echo "  racer-generate                   Generate Racer deepcopy and CRD artifacts"
@@ -652,6 +653,11 @@ RACER_DST_TIMEOUT ?= 1200s
 .PHONY: racer-dst
 racer-dst: ## Run the Racer deterministic simulation tests; every seed runs twice and must match
 	DST_SEEDS="$(DST_SEEDS)" DST_STEPS="$(DST_STEPS)" DST_FILTER="$(DST_FILTER)" timeout --signal=TERM --kill-after=10s $(RACER_DST_TIMEOUT) cargo +$(RACER_RUST_TOOLCHAIN) run --locked --profile test --manifest-path cmd/racer/Cargo.toml -p racer-dst --bin racer-dst
+
+# racer-sim's command line on the Model fidelity: --scenario, --nodes, --seed, --duration, --config, --out.
+.PHONY: racer-dst-report
+racer-dst-report: ## Write one Racer Model scenario's JSON report; pass racer-sim options with ARGS='--scenario full-failover --nodes 200'
+	timeout --signal=TERM --kill-after=10s $(RACER_SIM_TIMEOUT) cargo +$(RACER_RUST_TOOLCHAIN) run --release --locked --manifest-path cmd/racer/Cargo.toml -p racer-dst --bin racer-dst -- $(ARGS)
 
 $(SETUP_ENVTEST):
 	@mkdir -p bin tmp/envtest-tools
