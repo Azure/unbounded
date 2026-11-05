@@ -410,6 +410,14 @@ impl PeerServer {
         }
     }
 
+    /// The hot-page counters, for tests that observe them while a request is served.
+    #[cfg(test)]
+    pub(crate) fn serve_counters(
+        &self,
+    ) -> Rc<std::cell::RefCell<ServeDecision<crate::model::PageId>>> {
+        self.serve.clone()
+    }
+
     /// Count `n` bodies of `page` as being written until the result drops.
     #[cfg(test)]
     pub(crate) fn hold_streaming(
@@ -922,11 +930,18 @@ impl PeerServer {
             let binding = request.binding().clone();
             // A copy offer or a silence ping carries no body, so hot-page
             // shedding does not apply.
-            if let super::protocol::Operation::Page { page, mode } = &request.request().operation
-                && !matches!(
-                    mode,
-                    super::protocol::FetchMode::Offer | super::protocol::FetchMode::Ping
-                )
+            let body = match &request.request().operation {
+                super::protocol::Operation::Page { page, mode }
+                    if !matches!(
+                        mode,
+                        super::protocol::FetchMode::Offer | super::protocol::FetchMode::Ping
+                    ) =>
+                {
+                    Some(page)
+                }
+                _ => None,
+            };
+            if let Some(page) = body
                 && self.shed_hot_page(page, request.origin().node(), &membership)
             {
                 self.metrics.record(crate::telemetry::Event::Overload, 1);
@@ -934,6 +949,13 @@ impl PeerServer {
                     .forwarding
                     .sign_response(&binding, PeerResponse::Overloaded);
             }
+            // An admitted body request counts toward the page's hot-page fan-in while it waits
+            // (for example on the running fill), not only once its body is written: otherwise
+            // every request admitted while the page is cold streams at once when the fill lands,
+            // past `hot_page_exempt_bodies`. It ends when the response is ready, and
+            // `page_streaming` counts the body from its head (the exchange's disconnect fence
+            // may run in between).
+            let _admitted = body.map(|page| Streaming::new(&self.serve, page.clone()));
             let reservation = self
                 .admission
                 .reserve(None, ResourceClass::Waiter, 1)

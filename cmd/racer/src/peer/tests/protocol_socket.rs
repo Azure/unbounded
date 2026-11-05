@@ -1994,16 +1994,28 @@ fn hot_page_shedding(mate: bool) {
     use std::cell::Cell;
     use std::num::NonZeroU32;
     let hot = crate::peer::server::hot_page_threshold();
-    struct Service(Rc<Cell<usize>>);
+    type Counters =
+        Rc<std::cell::RefCell<racer_core::read::serve::ServeDecision<crate::model::PageId>>>;
+    /// Counts served requests and records the requested page's hot-page count while serving.
+    struct Service(
+        Rc<Cell<usize>>,
+        Rc<std::cell::RefCell<Option<Counters>>>,
+        Rc<Cell<usize>>,
+    );
     impl server::LocalPageService for Service {
         fn serve_peer<'a>(
             &'a self,
-            _: crate::peer::forwarding::VerifiedRequest,
+            request: crate::peer::forwarding::VerifiedRequest,
             _: std::sync::Arc<crate::topology::Membership>,
             _: &'a RequestScope,
         ) -> crate::error::Operation<'a, PeerResponse> {
             Box::pin(async move {
                 self.0.set(self.0.get() + 1);
+                if let (Some(counters), Operation::Page { page, .. }) =
+                    (&*self.1.borrow(), &request.request().operation)
+                {
+                    self.2.set(counters.borrow().streaming(page).0);
+                }
                 Ok(PeerResponse::Miss)
             })
         }
@@ -2086,11 +2098,13 @@ fn hot_page_shedding(mate: bool) {
         16777232,
     ));
     let calls = Rc::new(Cell::new(0));
+    let counters = Rc::new(std::cell::RefCell::new(None));
+    let seen = Rc::new(Cell::new(0));
     let server = server::PeerServer::for_test(
         io,
         destination,
         admission.clone(),
-        Rc::new(Service(calls.clone())),
+        Rc::new(Service(calls.clone(), counters.clone(), seen.clone())),
         relay,
         Rc::new(codec(&admission)),
         signers[2].clone(),
@@ -2142,10 +2156,15 @@ fn hot_page_shedding(mate: bool) {
             PeerResponse::Overloaded
         )
     };
-    // Below the threshold every page is served.
+    *counters.borrow_mut() = Some(server.serve_counters());
+    // Below the threshold every page is served. The admitted request counts toward the page's
+    // fan-in while it is served, so requests waiting on a cold page's fill are counted before
+    // their bodies start.
     let held = server.hold_streaming(&page_id(shed_page), hot - 1);
     assert!(!ask(shed_page));
     assert_eq!(calls.get(), 1);
+    assert_eq!(seen.get(), hot);
+    assert_eq!(server.streaming(&page_id(shed_page)), (hot - 1, hot - 1));
     drop(held);
     assert_eq!(server.streaming(&page_id(shed_page)), (0, 0));
     // At the threshold a non-owner outside C's column is shed unserved, and
