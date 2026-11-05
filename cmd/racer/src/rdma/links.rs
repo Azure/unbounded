@@ -7,6 +7,7 @@
 //! background.
 
 use super::link_setup;
+use super::setup::{Opened, SetupTable};
 use super::*;
 use rdma_verbs::Arrival;
 use rdma_verbs::Client;
@@ -16,12 +17,10 @@ use rdma_verbs::LinkKey;
 use rdma_verbs::LinkState;
 use rdma_verbs::Op;
 use rdma_verbs::Source;
-use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::PoisonError;
 use std::time::Duration;
-use std::time::Instant;
 
 /// Signed `Accept` extension naming the receiver's in-band grant.
 pub const GRANT_HEADER: &str = "racer-rdma-grant";
@@ -93,14 +92,9 @@ pub struct LinkNode {
     /// Activation finished (successfully or not) for the current round.
     settled: std::sync::atomic::AtomicBool,
 
-    /// Last accepted incoming setup per key, for the rate limit.
-    setups: Mutex<HashMap<LinkKey, Instant>>,
-
-    /// Setups this node initiated and has not finished.
-    initiating: Mutex<HashMap<LinkKey, Initiating>>,
-
-    /// Source of reservation tokens for `initiating`.
-    reservations: std::sync::atomic::AtomicU64,
+    /// Every key's setup state and the responder rate limit (see
+    /// [`super::setup`]).
+    setup: Mutex<SetupTable>,
 
     /// The membership whose RDMA edges links were last trimmed to, so only
     /// the first worker to see a new membership sends the request.
@@ -147,19 +141,11 @@ pub fn plan_landing(
     plan
 }
 
-/// One setup this node initiated: reserved before the owner answers, then
-/// keyed by the epoch the owner opened.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum Initiating {
-    Reserved(u64),
-    Opened(Epoch),
-}
-
-/// Holds an `Initiating::Reserved` entry while `open` waits on the owner.
-/// Dropping it (error or cancellation) clears only its own reservation and,
-/// if the owner already opened a link the caller never read, breaks that
-/// epoch so the link does not sit in `Connecting`. The owner breaks links
-/// it opens after the op is gone.
+/// Holds a [`super::setup::SetupState::Opening`] attempt while `open` waits
+/// on the owner. Dropping it (error or cancellation) cancels only its own
+/// attempt and, if the owner already opened a link the caller never read,
+/// breaks that epoch so the link does not sit in `Connecting`. The owner
+/// breaks links it opens after the op is gone.
 struct Reservation<'a> {
     node: &'a LinkNode,
     key: LinkKey,
@@ -174,10 +160,7 @@ impl Drop for Reservation<'_> {
         {
             client.break_link(self.key, opened.epoch);
         }
-        let mut initiating = LinkNode::lock(&self.node.initiating);
-        if initiating.get(&self.key) == Some(&Initiating::Reserved(self.token)) {
-            initiating.remove(&self.key);
-        }
+        LinkNode::lock(&self.node.setup).cancel(self.key, self.token);
     }
 }
 
@@ -295,18 +278,7 @@ impl Drop for SetupAttempt<'_> {
     }
 }
 
-/// Result of checking an incoming setup before it reaches the owner.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum SetupAdmission {
-    /// Accept the offer.
-    Accept,
-
-    /// Our own concurrent offer wins: answer `409 Conflict`.
-    Conflict,
-
-    /// Rate limited or overloaded: answer `429 Too Many Requests`.
-    Busy,
-}
+pub use super::setup::SetupAdmission;
 
 /// Per-worker facade over the node owner.
 pub struct Links {
@@ -735,7 +707,7 @@ impl Links {
         self.rail_ready(rail)
             && peer != &self.local
             && self.state(peer, rail) == LinkState::Idle
-            && !LinkNode::lock(&self.node.initiating).contains_key(&link_key(peer, rail))
+            && LinkNode::lock(&self.node.setup).idle(&link_key(peer, rail))
     }
 
     /// Initiator: open the link and return its epoch and encoded v2 setup.
@@ -747,16 +719,10 @@ impl Links {
     ) -> Result<(Epoch, Vec<u8>)> {
         let key = link_key(peer, rail);
         let mut reservation = {
-            let mut initiating = LinkNode::lock(&self.node.initiating);
-            if initiating.contains_key(&key) {
-                return Err(Error::Overloaded);
-            }
-            // Reserve the key before the owner answers; replaced with the epoch.
-            let token = self
-                .node
-                .reservations
-                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            initiating.insert(key, Initiating::Reserved(token));
+            // Claim the key before the owner answers.
+            let token = LinkNode::lock(&self.node.setup)
+                .begin(key)
+                .ok_or(Error::Overloaded)?;
             Reservation {
                 node: &self.node,
                 key,
@@ -770,13 +736,10 @@ impl Links {
         };
         // Read: the caller now owns the epoch.
         reservation.pending = None;
-        {
-            let mut initiating = LinkNode::lock(&self.node.initiating);
-            // A responder-side accept may have replaced our reservation.
-            if initiating.get(&key) == Some(&Initiating::Reserved(reservation.token)) {
-                initiating.insert(key, Initiating::Opened(opened.epoch));
-            }
-        }
+        // A responder-side accept may have superseded the attempt; then the
+        // owner already replaced this epoch and `connect` fails on it.
+        let _: Opened =
+            LinkNode::lock(&self.node.setup).opened(key, reservation.token, opened.epoch);
         drop(reservation);
         let setup = link_setup::Setup::new(
             rail,
@@ -835,10 +798,7 @@ impl Links {
     }
 
     fn finish_initiating(&self, key: LinkKey, epoch: Epoch) {
-        let mut initiating = LinkNode::lock(&self.node.initiating);
-        if initiating.get(&key) == Some(&Initiating::Opened(epoch)) {
-            initiating.remove(&key);
-        }
+        LinkNode::lock(&self.node.setup).finish(key, epoch);
     }
 
     /// Responder: rate limit and tie-break an authenticated offer from `peer`.
@@ -848,22 +808,8 @@ impl Links {
         if !self.rail_ready(rail) || peer == &self.local {
             return SetupAdmission::Busy;
         }
-        if LinkNode::lock(&self.node.initiating).contains_key(&key)
-            && link_setup::tie_break(&self.local, peer) == link_setup::TieBreak::Reject
-        {
-            return SetupAdmission::Conflict;
-        }
-        let now = self.ctx.clock.now();
-        let mut setups = LinkNode::lock(&self.node.setups);
-        if setups
-            .get(&key)
-            .is_some_and(|last| now < *last + SETUP_INTERVAL)
-        {
-            return SetupAdmission::Busy;
-        }
-        setups.retain(|_, last| now < *last + SETUP_INTERVAL);
-        setups.insert(key, now);
-        SetupAdmission::Accept
+        let we_win = link_setup::tie_break(&self.local, peer) == link_setup::TieBreak::Reject;
+        LinkNode::lock(&self.node.setup).admit(key, we_win, self.ctx.clock.now(), SETUP_INTERVAL)
     }
 
     /// Responder: accept `remote` (already authenticated and admitted) and
@@ -899,7 +845,7 @@ impl Links {
             )
             .await?;
         // Our own concurrent offer, if any, lost the tie-break.
-        LinkNode::lock(&self.node.initiating).remove(&key);
+        LinkNode::lock(&self.node.setup).accepted(key);
         let setup = link_setup::Setup {
             rail,
             nonce,

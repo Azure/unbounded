@@ -33,6 +33,7 @@ use std::task::Poll;
 pub(crate) mod link_setup;
 pub(crate) mod links;
 mod retry;
+mod setup;
 pub use links::AuthenticatedGrant;
 pub use links::BUFFER_LEN;
 pub use links::GRANT_HEADER;

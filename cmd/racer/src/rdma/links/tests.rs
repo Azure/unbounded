@@ -506,7 +506,7 @@ fn cancelled_open_clears_its_reservation() {
         assert!(!w.a.links.wants(&b, RAIL), "reserved while waiting");
     }
     pump!(w);
-    assert!(LinkNode::lock(&w.a.links.node.initiating).is_empty());
+    assert_eq!(LinkNode::lock(&w.a.links.node.setup).len(), 0);
     // The owner broke the link it opened for the dropped request; after the
     // backoff, a later attempt is allowed and succeeds.
     assert!(matches!(
@@ -538,7 +538,7 @@ fn open_dropped_after_the_owner_answered_breaks_its_epoch() {
         ));
     }
     pump!(w);
-    assert!(LinkNode::lock(&w.a.links.node.initiating).is_empty());
+    assert_eq!(LinkNode::lock(&w.a.links.node.setup).len(), 0);
     assert!(matches!(
         w.a.links.state(&b, RAIL),
         LinkState::Backoff(_) | LinkState::Breaking
@@ -559,7 +559,7 @@ fn dropped_setup_attempt_abandons_its_epoch() {
     let (epoch, _) = drive!(w, w.a.links.open(&b, RAIL, &scope)).unwrap();
     drop(SetupAttempt::new(&w.a.links, &b, RAIL, epoch));
     pump!(w);
-    assert!(LinkNode::lock(&w.a.links.node.initiating).is_empty());
+    assert_eq!(LinkNode::lock(&w.a.links.node.setup).len(), 0);
     assert!(matches!(
         w.a.links.state(&b, RAIL),
         LinkState::Backoff(_) | LinkState::Breaking
@@ -589,13 +589,13 @@ fn stale_setup_guards_leave_a_newer_attempt() {
     drop(SetupAttempt::new(&w.a.links, &b, RAIL, Epoch(epoch.0 + 1)));
     pump!(w);
     assert_eq!(
-        LinkNode::lock(&w.a.links.node.initiating).get(&key),
-        Some(&Initiating::Opened(epoch))
+        LinkNode::lock(&w.a.links.node.setup).state(&key),
+        Some(crate::rdma::setup::SetupState::Exchanging(epoch))
     );
     assert!(!w.a.links.wants(&b, RAIL));
     // The live attempt still finishes normally.
     SetupAttempt::new(&w.a.links, &b, RAIL, epoch).finish();
-    assert!(LinkNode::lock(&w.a.links.node.initiating).contains_key(&key));
+    assert!(!LinkNode::lock(&w.a.links.node.setup).idle(&key));
 }
 
 #[test]
