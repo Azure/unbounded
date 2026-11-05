@@ -916,6 +916,34 @@ impl DiskIndex {
             .is_some_and(|meta| meta.writes == 0 && meta.held == 0)
     }
 
+    /// Stored entries in `segment`, most recently stored first. Callers bound
+    /// the walk with [`Iterator::take`].
+    pub fn segment_entries(
+        &self,
+        segment: SegmentId,
+    ) -> impl Iterator<Item = (PageSlot, EntryView)> + '_ {
+        let mut cursor = self
+            .segments
+            .get(segment.0 as usize)
+            .map_or(NIL, |meta| meta.head);
+        std::iter::from_fn(move || {
+            if cursor == NIL {
+                return None;
+            }
+            let slot = PageSlot(cursor);
+            let entry = &self.entries[cursor as usize];
+            cursor = entry.seg_next;
+            Some((
+                slot,
+                EntryView {
+                    cache: CacheIdx(entry.cache),
+                    location: entry.location(),
+                    holders: entry.holders,
+                },
+            ))
+        })
+    }
+
     /// Stored records and bytes in `segment`.
     pub fn segment_usage(&self, segment: SegmentId) -> (u32, u64) {
         self.segments
@@ -932,6 +960,20 @@ impl DiskIndex {
         &mut self,
         segments: &Segments,
         budget: ReclaimBudget,
+        removed: impl FnMut(PageSlot, Removed),
+    ) -> Result<()> {
+        self.reclaim_scored(segments, budget, |_, _, heat| u64::from(heat), removed)
+    }
+
+    /// [`Self::reclaim`] with a caller-supplied retention score. `score` sees
+    /// the index, the visited segment, and its heat before this visit halves
+    /// it; sealed candidates with the lowest score are evicted first. Callers
+    /// use this to fold cache fairness into victim choice.
+    pub fn reclaim_scored(
+        &mut self,
+        segments: &Segments,
+        budget: ReclaimBudget,
+        mut score: impl FnMut(&Self, SegmentId, u32) -> u64,
         mut removed: impl FnMut(PageSlot, Removed),
     ) -> Result<()> {
         if budget.free_reserve == 0 {
@@ -951,9 +993,8 @@ impl DiskIndex {
             self.hand = (index + 1) % count;
             let id = SegmentId(index as u64);
             let state = segments.state(id)?;
-            let meta = &mut self.segments[index];
-            let heat = meta.heat;
-            meta.heat /= 2;
+            let heat = self.segments[index].heat;
+            self.segments[index].heat /= 2;
             let evicting = state == SegmentState::Evicting;
             if !(evicting || state == SegmentState::Sealed) || !self.can_reclaim(id) {
                 continue;
@@ -961,7 +1002,8 @@ impl DiskIndex {
             if !evicting && !self.can_evict(id) {
                 continue;
             }
-            candidates.push((!evicting, if evicting { 0 } else { heat }, visit, id));
+            let value = if evicting { 0 } else { score(self, id, heat) };
+            candidates.push((!evicting, value, visit, id));
         }
         candidates.sort_unstable_by_key(|(sealed, heat, visit, _)| (*sealed, *heat, *visit));
         let mut entries_left = budget.max_entries;
@@ -1367,6 +1409,62 @@ mod tests {
         index
             .reclaim(&segments, none, |_, _| panic!("no reserve"))
             .unwrap();
+        index.check_invariants();
+    }
+
+    #[test]
+    fn scored_reclaim_follows_caller_score_and_walks_segments() {
+        let segments = segments(4);
+        let mut index = DiskIndex::new(16, 16, 4).unwrap();
+        let fair = index.add_cache(CacheIdx(0)).unwrap();
+        let over = index.add_cache(CacheIdx(1)).unwrap();
+        // Segment of slots 0,1 belongs to `over`; 2..5 to `fair`.
+        for slot in 0..7 {
+            let cache = if slot < 2 { over } else { fair };
+            write(&mut index, &segments, slot, cache, 2048).unwrap();
+        }
+        let seg = |index: &DiskIndex, slot| index.get(PageSlot(slot)).unwrap().location.segment();
+        let target = seg(&index, 0);
+        // The over-share segment is the hottest; heat alone would spare it.
+        for _ in 0..10 {
+            index.touch(PageSlot(0));
+        }
+        let mut walked: Vec<_> = index
+            .segment_entries(target)
+            .map(|(slot, view)| (slot, view.cache))
+            .collect();
+        walked.sort();
+        assert_eq!(
+            walked,
+            [(PageSlot(0), CacheIdx(1)), (PageSlot(1), CacheIdx(1))]
+        );
+        assert_eq!(index.segment_entries(target).take(1).count(), 1);
+        assert_eq!(index.segment_entries(SegmentId(99)).count(), 0);
+        let budget = ReclaimBudget {
+            free_reserve: 1,
+            max_visits: 64,
+            max_entries: 64,
+        };
+        let mut scored = Vec::new();
+        let mut removed = Vec::new();
+        index
+            .reclaim_scored(
+                &segments,
+                budget,
+                |index, segment, heat| {
+                    scored.push((segment, heat));
+                    let over_share = index
+                        .segment_entries(segment)
+                        .any(|(_, view)| view.cache == CacheIdx(1));
+                    if over_share { 0 } else { 1 + u64::from(heat) }
+                },
+                |slot, _| removed.push(slot),
+            )
+            .unwrap();
+        removed.sort();
+        assert_eq!(removed, [PageSlot(0), PageSlot(1)]);
+        assert!(scored.contains(&(target, 10)), "score sees pre-visit heat");
+        assert_eq!(segments.state(target).unwrap(), SegmentState::Free);
         index.check_invariants();
     }
 
