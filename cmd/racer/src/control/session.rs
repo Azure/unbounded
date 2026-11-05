@@ -1169,6 +1169,7 @@ pub(super) mod tests {
                 Arc::new(controlplane::Published::new(
                     super::super::Snapshot::retention(0),
                 )),
+                crate::test_support::clock(),
             )),
         )
     }

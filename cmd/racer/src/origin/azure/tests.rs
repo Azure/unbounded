@@ -875,7 +875,11 @@ mod router {
         if native {
             publication.caches[0].origin = Some(h.definition.clone());
         }
-        let target = PublicationTarget::new(publication.cluster.clone(), h.snapshots.clone());
+        let target = PublicationTarget::new(
+            publication.cluster.clone(),
+            h.snapshots.clone(),
+            crate::test_support::clock(),
+        );
         target.apply(publication).unwrap();
         h.snapshots.current().unwrap().unwrap().caches[0].id.clone()
     }
@@ -955,9 +959,13 @@ mod router {
             if native {
                 publication.caches[0].origin = Some(h.definition.clone());
             }
-            PublicationTarget::new(publication.cluster.clone(), h.snapshots.clone())
-                .apply(publication)
-                .unwrap();
+            PublicationTarget::new(
+                publication.cluster.clone(),
+                h.snapshots.clone(),
+                crate::test_support::clock(),
+            )
+            .apply(publication)
+            .unwrap();
             h.snapshots.current().unwrap().unwrap().caches[0].id.clone()
         };
         let object = in_cache(&apply(true, 1)).object;

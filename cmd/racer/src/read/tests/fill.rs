@@ -485,6 +485,7 @@ fn ready_memory_precedes_cold_ownership_refresh_and_preserves_one_interest() {
     let snapshots = crate::control::publication::PublicationTarget::new(
         f.keys.cluster().clone(),
         published.clone(),
+        crate::test_support::clock(),
     );
     let mut publication = racer_control_wire::Publication {
         pools: Vec::new(),
@@ -3216,6 +3217,7 @@ impl Fixture {
         let snapshots = Rc::new(PublicationTarget::new(
             self.keys.cluster().clone(),
             published.clone(),
+            crate::test_support::clock(),
         ));
         let (client_socket, origin_socket) =
             racer_control_wire::canonical_socket_paths(settings.name).unwrap();
@@ -3556,6 +3558,7 @@ pub(super) fn adapter_client(
     let snapshots = Rc::new(PublicationTarget::new(
         f.keys.cluster().clone(),
         Arc::new(Published::new(Snapshot::retention(2))),
+        crate::test_support::clock(),
     ));
     let (client_socket, origin_socket) =
         racer_control_wire::canonical_socket_paths("fixture").unwrap();

@@ -59,6 +59,7 @@ fn node(sim: &Simulation, n: u8, id: NodeId, environment: Option<&Environment>) 
         let ctx = environment.map_or_else(racer_io::WorkerCtx::host, Environment::worker_ctx);
         Owner::new(port, ctx)
     };
+    let ctx = environment.map_or_else(crate::test_support::ctx, Environment::worker_ctx);
     let limits = crate::test_support::cluster::config(true).limits;
     Node {
         links: Rc::new(Links::new(
@@ -67,6 +68,7 @@ fn node(sim: &Simulation, n: u8, id: NodeId, environment: Option<&Environment>) 
             id,
             2,
             None,
+            ctx,
         )),
         owner,
         admission: Rc::new(flow_control::Quotas::new(AdmissionPolicy::new(limits))),

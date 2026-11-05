@@ -240,7 +240,11 @@ impl SubscriptionFixture {
         let keys = Rc::new(interop_keys(&reactor.ctx().clock));
         let published = Arc::new(Published::new(Snapshot::retention(2)));
         let availability = Rc::new(control::Availability::new(published.clone(), keys.clone()));
-        let snapshots = Rc::new(PublicationTarget::new(keys.cluster().clone(), published));
+        let snapshots = Rc::new(PublicationTarget::new(
+            keys.cluster().clone(),
+            published,
+            reactor.ctx().clock.clone(),
+        ));
         let (client_socket, origin_socket) =
             racer_control_wire::canonical_socket_paths("interop").unwrap();
         let cache = CacheDefinition {

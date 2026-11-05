@@ -524,7 +524,7 @@ pub(crate) mod tests {
             keys.install_signing_identity(Arc::new(identity)).unwrap();
             let certificates = Rc::new(Certificates::new(cluster, keys.clone()));
             let signatures = Signatures::new(keys, certificates, crate::test_support::ctx());
-            let setup = link_setup::Setup::new(RailId(9), [1; 32], 8, 2)
+            let setup = link_setup::Setup::new(RailId(9), [1; 32], 8, 2, &racer_io::Rng::os())
                 .unwrap()
                 .encode();
             let value = STANDARD.encode(&setup).into_bytes();

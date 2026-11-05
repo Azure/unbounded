@@ -746,6 +746,7 @@ fn bootstrap(
         Rc::new(PublicationTarget::new(
             config.cluster.clone(),
             node.publications.clone(),
+            reactor.ctx().clock.clone(),
         )),
         node.inventory.clone(),
     );
@@ -1215,6 +1216,7 @@ impl WorkerApplication {
         let snapshots = Rc::new(PublicationTarget::new(
             config.cluster.clone(),
             node.publications.clone(),
+            reactor.ctx().clock.clone(),
         ));
         let keys = Rc::new(Keyring::new(
             config.cluster.clone(),
@@ -1312,6 +1314,7 @@ impl WorkerApplication {
                         config.node.clone(),
                         limits.connections_per_neighbor.get(),
                         Some(reactor.clone()),
+                        reactor.ctx().clone(),
                     )
                     .with_metrics(metrics.clone()),
                 )

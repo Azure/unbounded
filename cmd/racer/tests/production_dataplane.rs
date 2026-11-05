@@ -523,6 +523,7 @@ impl Rig {
         let snapshots = Rc::new(PublicationTarget::new(
             ClusterId(CLUSTER.into()),
             published.clone(),
+            reactor.ctx().clock.clone(),
         ));
         let document = Arc::new(fixture_publication());
         let snapshot =

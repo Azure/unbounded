@@ -1592,7 +1592,11 @@ fn multiworker_memberships_retire_after_request_leases_and_reuse_capacity() {
     let local = publication.members[0].node.clone();
     let neighbor = publication.members[1].node.clone();
     let published = Arc::new(Published::new(Snapshot::retention(1)));
-    let store = PublicationTarget::new(publication.cluster.clone(), published.clone());
+    let store = PublicationTarget::new(
+        publication.cluster.clone(),
+        published.clone(),
+        crate::test_support::clock(),
+    );
     let networks = [
         PeerNetwork::new(
             local.clone(),
@@ -4576,7 +4580,11 @@ mod cache_publication {
         let config = crate::test_support::cluster::config(false);
         let node = Arc::new(NodeState::default());
         let definition = crate::app::tests::definition();
-        let store = PublicationTarget::new(config.cluster.clone(), node.publications.clone());
+        let store = PublicationTarget::new(
+            config.cluster.clone(),
+            node.publications.clone(),
+            crate::test_support::clock(),
+        );
         store
             .apply(crate::app::tests::publication(
                 &config,

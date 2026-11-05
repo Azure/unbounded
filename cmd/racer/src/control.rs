@@ -268,43 +268,47 @@ impl Availability {
             .current()
             .unwrap()
             .map_or(1, |snapshot| snapshot.sequence.0 + 1);
-        PublicationTarget::new(self.keys.cluster().clone(), self.publications.clone())
-            .apply(
-                Publication {
-                    pools: Vec::new(),
-                    schema_version: SCHEMA_VERSION,
-                    cluster: self.keys.cluster().clone(),
-                    sequence: PublicationSequence(sequence),
-                    membership_version: racer_control_wire::MembershipVersion(1),
-                    members: vec![wire::Member {
-                        node: self.keys.node().clone(),
-                        shares: std::num::NonZeroU32::new(1).unwrap(),
-                        peer_endpoint: "127.0.0.1:7443".into(),
-                        rails: vec![],
-                        site: String::new(),
-                    }],
-                    caches: caches
-                        .into_iter()
-                        .enumerate()
-                        .map(|(i, (id, mode))| {
-                            let name = format!("rotation-{i}");
-                            let (client_socket, origin_socket) =
-                                wire::canonical_socket_paths(&name).unwrap();
-                            CacheDefinition {
-                                id,
-                                name,
-                                client_socket,
-                                origin_socket,
-                                priority: racer_control_wire::DEFAULT_PRIORITY,
-                                mode,
-                                origin: None,
-                            }
-                        })
-                        .collect(),
-                }
-                .with_default_pool(),
-            )
-            .unwrap();
+        PublicationTarget::new(
+            self.keys.cluster().clone(),
+            self.publications.clone(),
+            crate::test_support::clock(),
+        )
+        .apply(
+            Publication {
+                pools: Vec::new(),
+                schema_version: SCHEMA_VERSION,
+                cluster: self.keys.cluster().clone(),
+                sequence: PublicationSequence(sequence),
+                membership_version: racer_control_wire::MembershipVersion(1),
+                members: vec![wire::Member {
+                    node: self.keys.node().clone(),
+                    shares: std::num::NonZeroU32::new(1).unwrap(),
+                    peer_endpoint: "127.0.0.1:7443".into(),
+                    rails: vec![],
+                    site: String::new(),
+                }],
+                caches: caches
+                    .into_iter()
+                    .enumerate()
+                    .map(|(i, (id, mode))| {
+                        let name = format!("rotation-{i}");
+                        let (client_socket, origin_socket) =
+                            wire::canonical_socket_paths(&name).unwrap();
+                        CacheDefinition {
+                            id,
+                            name,
+                            client_socket,
+                            origin_socket,
+                            priority: racer_control_wire::DEFAULT_PRIORITY,
+                            mode,
+                            origin: None,
+                        }
+                    })
+                    .collect(),
+            }
+            .with_default_pool(),
+        )
+        .unwrap();
     }
 }
 
@@ -796,6 +800,7 @@ pub(crate) mod tests {
                 Rc::new(PublicationTarget::new(
                     cluster,
                     Arc::new(Published::new(Snapshot::retention(2))),
+                    crate::test_support::clock(),
                 )),
             )
         }
@@ -1241,6 +1246,7 @@ pub(crate) mod tests {
             PublicationTarget::new(
                 publication(1).cluster,
                 Arc::new(Published::new(Snapshot::retention(retained))),
+                crate::test_support::clock(),
             )
         }
         fn membership(sequence: u64, version: u64) -> Publication {
@@ -1437,8 +1443,11 @@ pub(crate) mod tests {
             let mut foreign = membership(3, 3);
             foreign.cluster = ClusterId("00000000-0000-4000-8000-000000000001".into());
             assert!(matches!(target.project(foreign), Err(Error::Unauthorized)));
-            let other =
-                PublicationTarget::new(ClusterId("foreign".into()), target.published.clone());
+            let other = PublicationTarget::new(
+                ClusterId("foreign".into()),
+                target.published.clone(),
+                crate::test_support::clock(),
+            );
             assert!(matches!(
                 other.accept(current.clone(), None),
                 Err(Error::Unauthorized)
@@ -1456,7 +1465,11 @@ pub(crate) mod tests {
                 let mut policy = Snapshot::retention(2);
                 policy.grace_bytes = budget;
                 let published = Arc::new(Published::new(policy));
-                let target = PublicationTarget::new(publication(1).cluster, published.clone());
+                let target = PublicationTarget::new(
+                    publication(1).cluster,
+                    published.clone(),
+                    crate::test_support::clock(),
+                );
                 target.apply(publication(1)).unwrap();
                 target.apply(membership(2, 2)).unwrap();
                 let now = uring_runtime::environment::now();

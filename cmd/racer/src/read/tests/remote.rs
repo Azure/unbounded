@@ -295,8 +295,11 @@ fn remote_candidate_with_churn(absence: Option<Absence>, forbidden: bool, churn:
     listener.set_nonblocking(true).unwrap();
     let address = listener.local_addr().unwrap().to_string();
     let source_publications = Arc::new(Published::new(Snapshot::retention(1)));
-    let source_store =
-        PublicationTarget::new(ClusterId(CLUSTER.into()), source_publications.clone());
+    let source_store = PublicationTarget::new(
+        ClusterId(CLUSTER.into()),
+        source_publications.clone(),
+        crate::test_support::clock(),
+    );
     let mut publication = Publication {
         pools: Vec::new(),
         schema_version: racer_control_wire::SCHEMA_VERSION,
@@ -934,7 +937,11 @@ fn metadata_coordinator_with_newer_publication(
         published.clone(),
         keys.clone(),
     ));
-    let snapshots = Rc::new(PublicationTarget::new(ClusterId(CLUSTER.into()), published));
+    let snapshots = Rc::new(PublicationTarget::new(
+        ClusterId(CLUSTER.into()),
+        published,
+        crate::test_support::clock(),
+    ));
     let mut publication = Publication {
         pools: Vec::new(),
         schema_version: SCHEMA_VERSION,

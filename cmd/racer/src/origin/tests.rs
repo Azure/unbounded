@@ -177,7 +177,11 @@ fn published_client() -> (
     )))
     .unwrap();
     client.snapshots = Arc::new(Published::new(Snapshot::retention(2)));
-    let target = PublicationTarget::new(publication.cluster.clone(), client.snapshots.clone());
+    let target = PublicationTarget::new(
+        publication.cluster.clone(),
+        client.snapshots.clone(),
+        crate::test_support::clock(),
+    );
     let snapshot = target.apply(publication).unwrap();
     (client, admission, reactor, snapshot)
 }
@@ -488,7 +492,11 @@ fn same_name_new_uid_dials_replacement_without_reusing_old_keepalive() {
     .unwrap();
     publication.sequence.0 = 1;
     client.snapshots = Arc::new(Published::new(Snapshot::retention(2)));
-    let target = PublicationTarget::new(publication.cluster.clone(), client.snapshots.clone());
+    let target = PublicationTarget::new(
+        publication.cluster.clone(),
+        client.snapshots.clone(),
+        crate::test_support::clock(),
+    );
     let snapshot = target.apply(publication.clone()).unwrap();
     let client = remap(client, root).unwrap();
     let mut old_context = context();

@@ -2758,6 +2758,7 @@ fn production_snapshot_replacement_rejects_old_backlog_uid_with_503() {
     let snapshots = Rc::new(PublicationTarget::new(
         keys.cluster().clone(),
         state.clone(),
+        crate::test_support::clock(),
     ));
     let mut publication = Publication {
         pools: Vec::new(),

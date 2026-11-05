@@ -539,7 +539,11 @@ impl ReadWorker {
             publications.clone(),
             keys.clone(),
         ));
-        let snapshots = Rc::new(PublicationTarget::new(keys.cluster().clone(), publications));
+        let snapshots = Rc::new(PublicationTarget::new(
+            keys.cluster().clone(),
+            publications,
+            crate::test_support::clock(),
+        ));
         snapshots
             .apply(
                 Publication {

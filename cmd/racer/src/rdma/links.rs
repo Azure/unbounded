@@ -326,6 +326,10 @@ pub struct Links {
 
     /// Transfer counters, so benchmarks can tell which path pages took.
     metrics: Option<crate::telemetry::Metrics>,
+
+    /// This worker's clock (setup rate limits, stage timing) and entropy
+    /// (setup nonces).
+    ctx: racer_io::WorkerCtx,
 }
 
 impl Links {
@@ -336,10 +340,10 @@ impl Links {
         local: NodeId,
         connections_per_neighbor: usize,
         reactor: Option<Rc<crate::runtime::Reactor>>,
+        ctx: racer_io::WorkerCtx,
     ) -> Self {
         // Simulation uses explicitly fired one-shot alarms, never ClockPoll.
-        #[cfg(test)]
-        let reactor = reactor.filter(|_| uring_runtime::environment::simulation_seed().is_none());
+        let reactor = reactor.filter(|_| !ctx.is_simulated());
         Self {
             client,
             node,
@@ -349,6 +353,7 @@ impl Links {
             tasks: RefCell::new(Vec::new()),
             draining: Cell::new(false),
             metrics: None,
+            ctx,
         }
     }
 
@@ -372,7 +377,7 @@ impl Links {
         sum: crate::telemetry::Event,
         start: std::time::Instant,
     ) {
-        let elapsed = uring_runtime::environment::now().saturating_duration_since(start);
+        let elapsed = self.ctx.clock.now().saturating_duration_since(start);
         self.record(sum, u64::try_from(elapsed.as_nanos()).unwrap_or(u64::MAX));
         self.record(count, 1);
     }
@@ -778,6 +783,7 @@ impl Links {
             opened.setup.endpoint.to_bytes(),
             opened.setup.recv_credits,
             self.grants_per_link,
+            &self.ctx.rng,
         );
         match setup {
             Ok(setup) => Ok((opened.epoch, setup.encode())),
@@ -847,7 +853,7 @@ impl Links {
         {
             return SetupAdmission::Conflict;
         }
-        let now = uring_runtime::environment::now();
+        let now = self.ctx.clock.now();
         let mut setups = LinkNode::lock(&self.node.setups);
         if setups
             .get(&key)
@@ -874,7 +880,7 @@ impl Links {
         // The link id needs our nonce before the owner returns our endpoint.
         let mut nonce = [0; 16];
         while nonce == [0; 16] {
-            uring_runtime::environment::fill_random(&mut nonce).map_err(|_| Error::Io)?;
+            self.ctx.rng.fill(&mut nonce).map_err(|_| Error::Io)?;
         }
         let link_id = link_setup::LinkId::for_setup(remote, &nonce);
         let opened = self

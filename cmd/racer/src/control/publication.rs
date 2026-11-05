@@ -46,15 +46,22 @@ pub struct PublicationTarget {
     pub(crate) published: Arc<Published<Snapshot>>,
 
     lifecycle: RefCell<Option<Rc<crate::app::CachePublication>>>,
+    /// Stamps accepted publications.
+    clock: racer_io::Clock,
 }
 
 impl PublicationTarget {
     /// Bind projection to the node-wide publication authority.
-    pub fn new(cluster: ClusterId, published: Arc<Published<Snapshot>>) -> Self {
+    pub fn new(
+        cluster: ClusterId,
+        published: Arc<Published<Snapshot>>,
+        clock: racer_io::Clock,
+    ) -> Self {
         Self {
             cluster,
             published,
             lifecycle: RefCell::new(None),
+            clock,
         }
     }
 
@@ -78,7 +85,7 @@ impl PublicationTarget {
     ) -> Result<Arc<Snapshot>> {
         self.published.publish(
             snapshot,
-            uring_runtime::environment::now(),
+            self.clock.now(),
             |_, next| {
                 if next.cluster != self.cluster {
                     return Err(Error::Unauthorized);
