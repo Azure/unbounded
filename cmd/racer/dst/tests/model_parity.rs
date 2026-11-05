@@ -54,3 +54,27 @@ fn faults_end_every_read() {
     );
     println!("{:#}", report["coverage"]);
 }
+
+/// Peak RSS per node of a Model cold start at `MODEL_NODES` nodes (default 10,000); compare with
+/// racer-sim's ~103 KB/node at 5x10^4 nodes. Run alone:
+/// `MODEL_NODES=50000 cargo test --release -p racer-dst --test model_parity model_memory -- --ignored --nocapture`.
+#[test]
+#[ignore = "large: run alone with --release --ignored"]
+fn model_memory_per_node() {
+    let nodes: u32 = std::env::var("MODEL_NODES").map_or(10_000, |n| n.parse().unwrap());
+    let (outcome, report) = model::run(&scenarios::cold_start(nodes), Choices::seeded(8));
+    let status = std::fs::read_to_string("/proc/self/status").unwrap();
+    let hwm_kib: u64 = status
+        .lines()
+        .find_map(|l| l.strip_prefix("VmHWM:"))
+        .and_then(|v| v.trim().trim_end_matches("kB").trim().parse().ok())
+        .unwrap();
+    println!(
+        "nodes {nodes} peak_rss {} B per_node {} B steps {} failure {:?} counters {}",
+        hwm_kib * 1024,
+        hwm_kib * 1024 / u64::from(nodes),
+        outcome.steps,
+        outcome.failure.as_ref().map(|f| &f.name),
+        report["metrics"]["counters"]
+    );
+}
