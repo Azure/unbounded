@@ -328,11 +328,11 @@ impl<S: Scope> ReplaceSteps<S> for Reactor<S> {
 mod chunked_tests {
     //! Reused scratch and publication faults exercised through simulated completions.
     use super::*;
-    use crate::rt::reactor::{
-        filesystem::fixtures::{Admission, Limits, Reactor, scope},
-        filesystem::test_support::{drive, poll},
-        simulation::{Fault, Simulation},
+    use crate::scoped::fs::{
+        fixtures::{Admission, Limits, Reactor, scope},
+        test_support::{drive, poll},
     };
+    use crate::sim::{Fault, SimOs};
     use std::path::Path;
 
     /// Prepare a fresh private stage with namespace-only durability.
@@ -357,11 +357,13 @@ mod chunked_tests {
     #[test]
     fn chunked_publication_handles_short_writes_empty_and_non_durable_crash() {
         for bytes in [vec![], vec![7; 1024 * 1024 + 3]] {
-            let sim = Simulation::new();
-            let _environment = sim.enter();
-            let r = Reactor::new(Rc::new(Admission::new(Limits {
-                queue_entries: NonZeroUsize::new(8).unwrap(),
-            })));
+            let sim = SimOs::new();
+            let r = Reactor::new(
+                Rc::new(Admission::new(Limits {
+                    queue_entries: NonZeroUsize::new(8).unwrap(),
+                })),
+                &sim,
+            );
             sim.write_file(Path::new("/target"), b"old").unwrap();
             sim.disk().sync_all().unwrap();
             sim.set_max_chunk(8191).unwrap();
@@ -395,11 +397,13 @@ mod chunked_tests {
     #[test]
     fn chunked_failures_and_abandonment_leave_target_and_fence_stage_owners() {
         for fault in ["write", "zero", "rename", "cancel", "abandon"] {
-            let sim = Simulation::new();
-            let _environment = sim.enter();
-            let r = Reactor::new(Rc::new(Admission::new(Limits {
-                queue_entries: NonZeroUsize::new(8).unwrap(),
-            })));
+            let sim = SimOs::new();
+            let r = Reactor::new(
+                Rc::new(Admission::new(Limits {
+                    queue_entries: NonZeroUsize::new(8).unwrap(),
+                })),
+                &sim,
+            );
             let request = scope();
             sim.write_file(Path::new("/target"), b"old").unwrap();
             let replacement = replacement(&r);
@@ -467,18 +471,21 @@ mod chunked_tests {
 mod tests {
     //! Bounded output ownership and staged publication phase regressions.
     use super::*;
-    use crate::rt::reactor::{
-        filesystem::fixtures::{Admission, Limits, Reactor, scope},
-        filesystem::test_support::{drive, poll},
-        simulation::{Fault, Simulation},
+    use crate::scoped::fs::{
+        fixtures::{Admission, Limits, Reactor, scope},
+        test_support::{drive, poll},
     };
+    use crate::sim::{Fault, SimOs};
     use std::path::Path;
 
     /// Construct an eight-entry counting reactor in the current environment.
-    fn reactor() -> Reactor {
-        Reactor::new(Rc::new(Admission::new(Limits {
-            queue_entries: NonZeroUsize::new(8).unwrap(),
-        })))
+    fn reactor(sim: &SimOs) -> Reactor {
+        Reactor::new(
+            Rc::new(Admission::new(Limits {
+                queue_entries: NonZeroUsize::new(8).unwrap(),
+            })),
+            sim,
+        )
     }
 
     /// Open one test pathname through the same completion path as production.
@@ -493,9 +500,8 @@ mod tests {
     /// Probe beyond the requested bound while respecting short reads and cancellation.
     #[test]
     fn bounded_reads_cover_empty_exact_short_growth_and_errors() {
-        let sim = Simulation::new();
-        let _environment = sim.enter();
-        let r = reactor();
+        let sim = SimOs::new();
+        let r = reactor(&sim);
         let request = scope();
         sim.write_file(Path::new("/data"), b"abcdef").unwrap();
         let fd = open(&r, "/data", libc::O_RDONLY);
@@ -555,9 +561,8 @@ mod tests {
     #[test]
     fn shared_pipeline_preserves_scratch_through_publication() {
         for chunked in [false, true] {
-            let sim = Simulation::new();
-            let _environment = sim.enter();
-            let r = reactor();
+            let sim = SimOs::new();
+            let r = reactor(&sim);
             let request = scope();
             let replacement = replacement(&r, Durability::Publish);
             let directory = Rc::downgrade(&replacement.directory);
@@ -597,9 +602,8 @@ mod tests {
     #[test]
     fn replacement_durability_is_explicit_and_short_writes_are_complete() {
         for durability in [Durability::Publish, Durability::FileAndDirectory] {
-            let sim = Simulation::new();
-            let _environment = sim.enter();
-            let r = reactor();
+            let sim = SimOs::new();
+            let r = reactor(&sim);
             let request = scope();
             sim.write_file(Path::new("/target"), b"old").unwrap();
             sim.disk().sync_all().unwrap();
@@ -643,9 +647,8 @@ mod tests {
             "empty-reused",
             "mismatched",
         ] {
-            let sim = Simulation::new();
-            let _environment = sim.enter();
-            let r = reactor();
+            let sim = SimOs::new();
+            let r = reactor(&sim);
             let mut replacement = replacement(&r, Durability::FileAndDirectory);
             sim.write_file(Path::new("/target"), b"old").unwrap();
             match case {
@@ -687,9 +690,8 @@ mod tests {
     /// Interpret prefixes at the current cursor.
     #[test]
     fn read_output_prefix_uses_current_cursor() {
-        let sim = Simulation::new();
-        let _environment = sim.enter();
-        let r = reactor();
+        let sim = SimOs::new();
+        let r = reactor(&sim);
         let mut buffer = r.file_bytes(b"abcdef").unwrap();
         buffer.advance(2).unwrap();
         assert_eq!(buffer.prefix(2).unwrap(), b"cd");
@@ -715,9 +717,8 @@ mod tests {
     #[test]
     fn post_rename_sync_failure_and_held_cancellation_report_publication_phase() {
         for cancel in [false, true] {
-            let sim = Simulation::new();
-            let _environment = sim.enter();
-            let r = reactor();
+            let sim = SimOs::new();
+            let r = reactor(&sim);
             let request = scope();
             sim.write_file(Path::new("/target"), b"old").unwrap();
             let replacement = replacement(&r, Durability::FileAndDirectory);
@@ -761,9 +762,8 @@ mod tests {
     /// Maintain positioned offsets when a completion consumes only part of scratch.
     #[test]
     fn explicitly_injected_short_completions_preserve_offsets_and_reused_scratch() {
-        let sim = Simulation::new();
-        let _environment = sim.enter();
-        let r = reactor();
+        let sim = SimOs::new();
+        let r = reactor(&sim);
         let request = scope();
         sim.write_file(Path::new("/data"), b"abcdef").unwrap();
         let fd = open(&r, "/data", libc::O_RDONLY);
@@ -807,9 +807,8 @@ mod tests {
     #[test]
     fn failed_or_abandoned_stage_never_publishes_partial_data() {
         for operation in ["write", "fsync", "rename", "abandon"] {
-            let sim = Simulation::new();
-            let _environment = sim.enter();
-            let r = reactor();
+            let sim = SimOs::new();
+            let r = reactor(&sim);
             let request = scope();
             sim.write_file(Path::new("/target"), b"old").unwrap();
             let replacement = replacement(&r, Durability::FileAndDirectory);
@@ -843,9 +842,8 @@ mod tests {
     /// Retain a held rename's directory but do not invent a later durability sync.
     #[test]
     fn abandoned_held_rename_keeps_directory_owned_until_fenced() {
-        let sim = Simulation::new();
-        let _environment = sim.enter();
-        let r = reactor();
+        let sim = SimOs::new();
+        let r = reactor(&sim);
         let request = scope();
         let synced_directories = sim
             .trace()
@@ -883,9 +881,8 @@ mod tests {
     #[test]
     fn empty_replacement_and_zero_write_completion_are_distinct() {
         for empty in [true, false] {
-            let sim = Simulation::new();
-            let _environment = sim.enter();
-            let r = reactor();
+            let sim = SimOs::new();
+            let r = reactor(&sim);
             let request = scope();
             let replacement = replacement(&r, Durability::Publish);
             if !empty {

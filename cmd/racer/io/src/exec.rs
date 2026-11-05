@@ -440,6 +440,28 @@ impl<T: Tick> Role for Lane<T> {
     }
 }
 
+/// Worker-local exclusion flag. Dropping the guard makes the flag available.
+#[must_use = "dropping the guard releases the busy flag"]
+pub struct Busy<'a>(&'a Cell<bool>);
+
+impl<'a> Busy<'a> {
+    /// Enter an idle flag, returning overload without disturbing an active owner.
+    pub fn try_enter(flag: &'a Cell<bool>) -> crate::Result<Self> {
+        if flag.replace(true) {
+            Err(crate::Error::Overloaded)
+        } else {
+            Ok(Self(flag))
+        }
+    }
+}
+
+impl Drop for Busy<'_> {
+    /// Release exclusion on normal return and panic unwinding alike.
+    fn drop(&mut self) {
+        self.0.set(false);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

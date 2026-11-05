@@ -698,7 +698,7 @@ async fn read_assertion(
     path: &std::path::Path,
     scope: &RequestScope,
 ) -> Result<Zeroizing<String>, AuthError> {
-    use crate::rt::filesystem::secure;
+    use racer_io::scoped::fs::secure;
     // One byte over the cap tells an oversized file from a full one.
     let bytes = secure::read_path(reactor, path, MAX_ASSERTION as usize + 1, scope)
         .await

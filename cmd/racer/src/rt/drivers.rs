@@ -414,27 +414,7 @@ pub fn pending() -> usize {
     current().map_or(0, |queue| queue.pending())
 }
 
-/// Worker-local exclusion flag. Dropping the guard makes the flag available.
-#[must_use = "dropping the guard releases the busy flag"]
-pub struct Busy<'a>(&'a Cell<bool>);
-
-impl<'a> Busy<'a> {
-    /// Enter an idle flag, returning overload without disturbing an active owner.
-    pub fn try_enter(flag: &'a Cell<bool>) -> Result<Self> {
-        if flag.replace(true) {
-            Err(Error::Overloaded)
-        } else {
-            Ok(Self(flag))
-        }
-    }
-}
-
-impl Drop for Busy<'_> {
-    /// Release exclusion on normal return and panic unwinding alike.
-    fn drop(&mut self) {
-        self.0.set(false);
-    }
-}
+pub use racer_io::exec::Busy;
 
 /// Yield exactly one cooperative turn, waking the current task for its next poll.
 pub use racer_io::exec::yield_now;

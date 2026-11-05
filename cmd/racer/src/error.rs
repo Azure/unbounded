@@ -179,9 +179,9 @@ impl From<crate::enrollment::Error> for Error {
     }
 }
 
-impl From<crate::rt::filesystem::secure::AccessError> for Error {
-    fn from(error: crate::rt::filesystem::secure::AccessError) -> Self {
-        use crate::rt::filesystem::secure::AccessError;
+impl From<racer_io::scoped::fs::secure::AccessError> for Error {
+    fn from(error: racer_io::scoped::fs::secure::AccessError) -> Self {
+        use racer_io::scoped::fs::secure::AccessError;
         match error {
             AccessError::MissingMetadata => Self::Io,
             AccessError::PermissionDenied => Self::Unauthorized,
@@ -312,9 +312,9 @@ impl From<racer_io::fs::ReplacementError> for Error {
     }
 }
 
-impl From<crate::rt::filesystem::operations::ReplacementError<Error>> for Error {
-    fn from(error: crate::rt::filesystem::operations::ReplacementError<Error>) -> Self {
-        use crate::rt::filesystem::operations::ReplacementError;
+impl From<racer_io::scoped::fs::operations::ReplacementError<Error>> for Error {
+    fn from(error: racer_io::scoped::fs::operations::ReplacementError<Error>) -> Self {
+        use racer_io::scoped::fs::operations::ReplacementError;
         match error {
             ReplacementError::BeforeRename(cause) => cause,
             ReplacementError::RenameUncertain(cause) => Self::RenameUncertain(cause.into()),
@@ -374,8 +374,8 @@ mod tests {
     #[test]
     fn control_foundation_errors_preserve_boundary_meanings() {
         use crate::enrollment::Error as Enrollment;
-        use crate::rt::filesystem::secure::AccessError;
         use racer_crypto::identity::BundleError;
+        use racer_io::scoped::fs::secure::AccessError;
         for (source, expected) in [
             (crate::control::plane::Error::Replay, Error::Replay),
             (
@@ -560,7 +560,7 @@ mod tests {
 
     #[test]
     fn replacement_outcomes_preserve_publication_phase() {
-        use crate::rt::filesystem::operations::ReplacementError;
+        use racer_io::scoped::fs::operations::ReplacementError;
         assert_eq!(
             Error::from(ReplacementError::BeforeRename(Error::Os(libc::ENOSPC))),
             Error::Os(libc::ENOSPC)

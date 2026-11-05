@@ -8,13 +8,13 @@
 //! returning an identity. Cancellation and abandoned writes are fenced through
 //! the caller's host; transport retries and inventory remain application policy.
 
-use crate::rt::filesystem::prelude::*;
-use crate::rt::filesystem::{
+use base64::{Engine, engine::general_purpose::STANDARD};
+use racer_crypto::identity;
+use racer_io::scoped::fs::prelude::*;
+use racer_io::scoped::fs::{
     operations::ReplacementError,
     secure::{self, Attempts, Host},
 };
-use base64::{Engine, engine::general_purpose::STANDARD};
-use racer_crypto::identity;
 use racer_io::{Operation, Scope};
 use racer_wire::control::{
     self as wire, ClusterId, EnrollmentId, EnrollmentRequest, EnrollmentResponse, NodeId,

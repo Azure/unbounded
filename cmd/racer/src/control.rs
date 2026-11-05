@@ -7,13 +7,6 @@ use crate::error::Operation;
 use crate::error::Result;
 use crate::rt::drivers::Busy;
 #[cfg(test)]
-use crate::rt::filesystem::prelude::*;
-use crate::rt::filesystem::secure;
-#[cfg(test)]
-use crate::rt::filesystem::secure::{
-    BENEATH, NO_MAGICLINKS, atomic_write, directory, read_at, read_path,
-};
-#[cfg(test)]
 use crate::runtime::Reactor;
 use crate::runtime::RequestScope;
 #[cfg(test)]
@@ -23,6 +16,13 @@ use racer_crypto::identity::BundleInstaller;
 use racer_crypto::identity::KeyPurpose;
 use racer_crypto::identity::Keyring;
 use racer_io::ring::Descriptor;
+#[cfg(test)]
+use racer_io::scoped::fs::prelude::*;
+use racer_io::scoped::fs::secure;
+#[cfg(test)]
+use racer_io::scoped::fs::secure::{
+    BENEATH, NO_MAGICLINKS, atomic_write, directory, read_at, read_path,
+};
 use racer_wire::control as wire;
 #[cfg(test)]
 use racer_wire::control::BundleGeneration;
@@ -459,7 +459,7 @@ impl rest::Io for ReactorControlIo {
         self.reactor.sim_os()
     }
 
-    type FileBytes = crate::rt::filesystem::ReadBuffer;
+    type FileBytes = racer_io::scoped::fs::ReadBuffer;
 
     type Error = Error;
 

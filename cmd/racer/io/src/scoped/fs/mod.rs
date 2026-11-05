@@ -1,7 +1,7 @@
 //! Filesystem SQEs use the parent reactor's original/cancel completion fences.
 //! Every pointer backing, descriptor, and quota lives in the submission closure.
-use crate::rt::{Error, Operation, Result, Scope};
-use racer_io::{
+use crate::{
+    Error, Operation, Result, Scope,
     ring::{IoBuffer, IoId},
     scoped::{Reactor, SubmissionKind, descriptor::Descriptor},
 };
@@ -29,6 +29,9 @@ pub mod operations;
 
 #[cfg(test)]
 mod fixtures;
+
+#[cfg(test)]
+mod host_tests;
 
 pub use operations::ReplaceFiles;
 pub use secure::SecureFiles;
@@ -74,7 +77,7 @@ impl AsRef<[u8]> for ReadBuffer {
 // SAFETY: private non-resizing Vec retains allocation and quota through completion.
 unsafe impl IoBuffer for Buffer {
     /// Borrow the unconsumed region while retaining its stable allocation.
-    fn bytes(&self) -> crate::rt::Result<&[u8]> {
+    fn bytes(&self) -> crate::Result<&[u8]> {
         Ok(&self.data[self.start..self.end])
     }
 
@@ -448,10 +451,10 @@ fn open_flags(flags: i32) -> Result<(i32, u64)> {
 
 /// A `racer-io` operation whose construction may fail: the error is
 /// delivered on first poll so admission stays inside the adapter.
-struct Deferred<F>(Option<racer_io::Result<F>>, fn(&F) -> Option<IoId>);
+struct Deferred<F>(Option<crate::Result<F>>, fn(&F) -> Option<IoId>);
 
 impl<F> Deferred<F> {
-    fn new(future: racer_io::Result<F>, id: fn(&F) -> Option<IoId>) -> Self {
+    fn new(future: crate::Result<F>, id: fn(&F) -> Option<IoId>) -> Self {
         Self(Some(future), id)
     }
 
@@ -463,8 +466,8 @@ impl<F> Deferred<F> {
     }
 }
 
-impl<F: Future<Output = racer_io::Result<T>> + Unpin, T> Future for Deferred<F> {
-    type Output = racer_io::Result<T>;
+impl<F: Future<Output = crate::Result<T>> + Unpin, T> Future for Deferred<F> {
+    type Output = crate::Result<T>;
 
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         match self.0.as_mut() {
@@ -598,9 +601,9 @@ pub mod secure {
             &self,
             host: &H,
             parent: &S,
-        ) -> Result<(crate::rt::drivers::Busy<'_>, S), S::Error> {
+        ) -> Result<(crate::exec::Busy<'_>, S), S::Error> {
             parent.check()?;
-            let guard = crate::rt::drivers::Busy::try_enter(&self.busy)?;
+            let guard = crate::exec::Busy::try_enter(&self.busy)?;
             let previous = self.previous.borrow().clone();
             if let Some(previous) = previous {
                 host.fence(&previous).await?;
@@ -631,7 +634,6 @@ pub mod secure {
         stat: &libc::statx,
         regular: bool,
     ) -> Result<(), AccessError> {
-        #[cfg(test)]
         if fd.as_sim().is_some() {
             return check_access(
                 stat,
@@ -642,8 +644,6 @@ pub mod secure {
                 },
             );
         }
-        #[cfg(not(test))]
-        let _ = fd;
         check_private(stat, regular)
     }
 
@@ -1066,7 +1066,7 @@ pub mod secure {
             }
 
             let host = Rc::new(Hosting {
-                reactor: Reactor::new(4, &crate::rt::reactor::simulation::ambient_env()),
+                reactor: Reactor::new(4, &crate::Env::host()),
                 next: Cell::new(0),
                 fences: RefCell::default(),
                 ready: Cell::new(false),
@@ -1224,18 +1224,21 @@ pub mod secure {
 mod secure_tests {
     //! Simulated namespace fault sequences complement host integration coverage.
     use super::*;
-    use crate::rt::filesystem::{
+    use crate::scoped::fs::{
         fixtures::{Admission, Limits, Reactor, scope},
         test_support::{drive, poll},
     };
-    use crate::rt::reactor::simulation::{Fault, Simulation};
+    use crate::sim::{Fault, SimOs};
     use std::{num::NonZeroUsize, path::Path};
 
     /// Construct the counting reactor used to observe simulated namespace fences.
-    fn reactor() -> Reactor {
-        Reactor::new(Rc::new(Admission::new(Limits {
-            queue_entries: NonZeroUsize::new(8).unwrap(),
-        })))
+    fn reactor(sim: &SimOs) -> Reactor {
+        Reactor::new(
+            Rc::new(Admission::new(Limits {
+                queue_entries: NonZeroUsize::new(8).unwrap(),
+            })),
+            sim,
+        )
     }
 
     /// Keep common namespace backing and charges until abandoned SQEs are fenced.
@@ -1246,9 +1249,8 @@ mod secure_tests {
             NamespaceChange::Unlink,
             NamespaceChange::RemoveIfPresent,
         ] {
-            let sim = Simulation::new();
-            let _environment = sim.enter();
-            let r = reactor();
+            let sim = SimOs::new();
+            let r = reactor(&sim);
             let request = scope();
             let directory =
                 drive(&r, r.file_directory(Path::new("/"), false, 4096, &request)).unwrap();
@@ -1276,9 +1278,8 @@ mod secure_tests {
     /// Validate paths before mutation and reject symlinks during pinned traversal.
     #[test]
     fn traversal_pins_private_directories_and_rejects_parents_symlinks_and_bad_names() {
-        let sim = Simulation::new();
-        let _environment = sim.enter();
-        let r = reactor();
+        let sim = SimOs::new();
+        let r = reactor(&sim);
         let request = scope();
         for path in [
             "/must-not-create/../child",
@@ -1327,9 +1328,8 @@ mod secure_tests {
     /// Sync even existing directories and propagate both mkdir and fsync failures.
     #[test]
     fn existing_directory_creation_reestablishes_fsync_and_propagates_failure() {
-        let sim = Simulation::new();
-        let _environment = sim.enter();
-        let r = reactor();
+        let sim = SimOs::new();
+        let r = reactor(&sim);
         sim.create_dir_all(Path::new("/existing")).unwrap();
         sim.inject("fsync", Fault::Errno(libc::EIO)).unwrap();
         assert!(matches!(
@@ -1359,9 +1359,8 @@ mod secure_tests {
     /// Fence stage cleanup without following links or publishing abandoned work.
     #[test]
     fn stage_removes_only_the_link_and_requires_cleanup_fence_before_exclusive_open() {
-        let sim = Simulation::new();
-        let _environment = sim.enter();
-        let r = reactor();
+        let sim = SimOs::new();
+        let r = reactor(&sim);
         let request = scope();
         let dir = drive(&r, r.file_directory(Path::new("/"), false, 4096, &request)).unwrap();
         sim.write_file(Path::new("/target"), b"keep").unwrap();
@@ -1424,7 +1423,7 @@ mod secure_tests {
 mod test_support {
     //! Bounded explicit driving for filesystem operations with arbitrary errors.
     use super::*;
-    use crate::rt::filesystem::fixtures::Reactor;
+    use crate::scoped::fs::fixtures::Reactor;
     use std::time::Instant;
 
     /// Poll one reply without implicitly advancing the backend.

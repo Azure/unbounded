@@ -21,7 +21,6 @@ use crate::read::metadata::MetadataDependencies;
 use crate::read::metadata::MetadataService;
 use crate::read::range_stream::RangeStreams;
 use crate::rt::drivers::DriverQueue;
-use crate::rt::filesystem::prelude::*;
 use crate::runtime::Reactor;
 use crate::security::CredentialCrypto;
 use crate::security::CryptoClient;
@@ -34,6 +33,7 @@ use crate::store::catalog::SegmentClock;
 use crate::test_support::origin::AdapterOrigin;
 use crate::topology::Placement;
 use crate::worker::CryptoRuntime;
+use racer_io::scoped::fs::prelude::*;
 use racer_wire::control::CacheDefinition;
 use racer_wire::control::MembershipVersion;
 use racer_wire::control::Publication;
@@ -400,10 +400,10 @@ pub(crate) async fn projected_file(
     file: &str,
     limit: usize,
     scope: &crate::runtime::RequestScope,
-) -> crate::error::Result<crate::rt::filesystem::ReadBuffer> {
-    use crate::rt::filesystem::secure::{BENEATH, NO_MAGICLINKS};
+) -> crate::error::Result<racer_io::scoped::fs::ReadBuffer> {
+    use racer_io::scoped::fs::secure::{BENEATH, NO_MAGICLINKS};
 
-    let dir = crate::rt::filesystem::secure::directory(r, path, false, false, scope).await?;
+    let dir = racer_io::scoped::fs::secure::directory(r, path, false, false, scope).await?;
     // One openat2 resolves ..data and pins the target directory across rotation.
     // BENEATH rejects absolute/escaping links; NO_MAGICLINKS rejects proc escapes.
     let generation = r
@@ -415,7 +415,7 @@ pub(crate) async fn projected_file(
             scope,
         )
         .await?;
-    crate::rt::filesystem::secure::read_at(r, &generation, file, limit, false, scope).await
+    racer_io::scoped::fs::secure::read_at(r, &generation, file, limit, false, scope).await
 }
 
 /// Enrollment I/O and certificate fixtures shared by control and application tests.

@@ -9,11 +9,11 @@ use crate::error::Operation;
 use crate::error::Result;
 use crate::model::RequestId;
 use crate::rt::environment::Deadline;
-use crate::rt::filesystem::Buffer;
-use crate::rt::filesystem::prelude::*;
 use racer_io::scoped::ReactorWake;
 use racer_io::scoped::SUBMISSION_BYTES;
 use racer_io::scoped::SubmissionCapacity;
+use racer_io::scoped::fs::Buffer;
+use racer_io::scoped::fs::prelude::*;
 use std::ops::Deref;
 use std::rc::Rc;
 use std::sync::Arc;
@@ -884,7 +884,7 @@ mod tests {
                     Err(Error::InvalidConfiguration)
                 ));
                 assert_eq!(admission.used(ResourceClass::RequestContext), 0);
-                let mut buffer: crate::rt::filesystem::Buffer = reactor.file_bytes(b"abc").unwrap();
+                let mut buffer: racer_io::scoped::fs::Buffer = reactor.file_bytes(b"abc").unwrap();
                 assert_eq!(buffer.prefix(3).unwrap(), b"abc");
                 assert!(buffer.prefix(4).is_err());
                 assert!(buffer.advance(4).is_err());
@@ -1267,12 +1267,12 @@ mod tests {
             use crate::admission::AdmissionPolicy;
             use crate::admission::ResourceClass;
             use crate::error::Error;
-            use crate::rt::filesystem::prelude::*;
             use crate::rt::reactor::simulation::Environment;
             use crate::rt::reactor::simulation::Fault;
             use crate::rt::reactor::simulation::Simulation;
             use crate::rt::reactor::simulation::disk::DiskState;
             use crate::runtime::RequestScope;
+            use racer_io::scoped::fs::prelude::*;
             use std::cell::Cell;
             use std::ffi::CString;
             use std::path::Path;
@@ -1603,7 +1603,7 @@ mod tests {
                 assert_eq!(&*bytes, b"first");
                 let private = drive(
                     &r,
-                    Box::pin(crate::rt::filesystem::secure::directory(
+                    Box::pin(racer_io::scoped::fs::secure::directory(
                         &r,
                         Path::new("/private"),
                         true,
@@ -1616,7 +1616,7 @@ mod tests {
                 drive(
                     &r,
                     Box::pin(async {
-                        crate::rt::filesystem::secure::atomic_write(
+                        racer_io::scoped::fs::secure::atomic_write(
                             &r, &private, "identity", b"secret", &scope,
                         )
                         .await

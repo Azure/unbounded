@@ -1,11 +1,11 @@
 //! Durable physical-port reservations supplied to crypto enrollment by the dataplane.
 
 use super::ReactorControlIo;
-use crate::rt::filesystem::secure::{self, Attempts, Host};
 use crate::{
     error::{Error, Operation},
     runtime::RequestScope,
 };
+use racer_io::scoped::fs::secure::{self, Attempts, Host};
 use racer_wire::control::RailMapping;
 use std::{cell::Cell, path::PathBuf, rc::Rc, sync::Arc};
 
