@@ -98,9 +98,36 @@ impl<P: Clone + Eq + Hash> ServeDecision<P> {
     }
 
     /// First step: a hot body request or a joinable copy-only request needs the ranking.
+    /// Whether `page` is hot: a body request for it needs the page's ranking to decide whether
+    /// to shed.
+    pub fn hot(&self, page: &P) -> bool {
+        self.streaming(page).0 >= self.limits.threshold.max(1)
+    }
+
+    /// Whether to shed a body request for `page` from `requester`, given the page's ranked
+    /// `owners` (`budget::shed_hot_page` over this machine's streaming counters).
+    pub fn shed<N: PartialEq>(
+        &self,
+        page: &P,
+        owners: &[N],
+        local: &N,
+        requester: &N,
+        column_mate: impl FnOnce() -> bool,
+    ) -> bool {
+        let (streaming, all) = self.streaming(page);
+        shed_hot_page(
+            owners,
+            local,
+            requester,
+            column_mate,
+            streaming,
+            all,
+            self.limits,
+        )
+    }
+
     pub fn decide(&self, page: &P, request: ServeRequest) -> Step {
-        let (streaming, _) = self.streaming(page);
-        if request.body && streaming >= self.limits.threshold.max(1) {
+        if request.body && self.hot(page) {
             return Step::Rank;
         }
         match self.dispatch(request) {
@@ -120,18 +147,7 @@ impl<P: Clone + Eq + Hash> ServeDecision<P> {
         requester: &N,
         column_mate: impl FnOnce() -> bool,
     ) -> Decision {
-        let (streaming, all) = self.streaming(page);
-        if request.body
-            && shed_hot_page(
-                owners,
-                local,
-                requester,
-                column_mate,
-                streaming,
-                all,
-                self.limits,
-            )
-        {
+        if request.body && self.shed(page, owners, local, requester, column_mate) {
             return Decision::Shed;
         }
         match self.dispatch(request) {
@@ -315,5 +331,23 @@ mod tests {
         assert_eq!(m.limits.threshold, 2);
         let m: ServeDecision<u32> = ServeDecision::new(1 << 20);
         assert_eq!(m.limits.threshold, 32);
+    }
+
+    #[test]
+    fn hot_pages_shed_only_past_the_threshold() {
+        let mut m = machine(2);
+        let owners = [1u32, 2, 3];
+        assert!(!m.hot(&7));
+        let a = m.begin_body(7);
+        assert!(!m.hot(&7));
+        let b = m.begin_body(7);
+        assert!(m.hot(&7));
+        // Rank 0 sheds a non-owner reader; another owner is never shed.
+        assert!(m.shed(&7, &owners, &1, &9, || false));
+        assert!(!m.shed(&7, &owners, &1, &2, || false));
+        m.end_body(a);
+        assert!(!m.hot(&7));
+        m.end_body(b);
+        assert_eq!(m.streaming(&7), (0, 0));
     }
 }

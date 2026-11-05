@@ -11,6 +11,7 @@ use crate::error::Operation;
 use crate::peer::forwarding::Forwarding;
 use crate::peer::forwarding::VerifiedRequest;
 use crate::runtime::RequestScope;
+use racer_core::read::serve::{Body, ServeDecision};
 use std::rc::Rc;
 use std::time::Duration;
 use std::time::Instant;
@@ -71,44 +72,40 @@ pub struct PeerServer {
     signatures: Rc<crate::peer::protocol::Signatures>,
     transfers: Rc<super::transport::Transfers>,
     request_timeout: Duration,
-    /// Page response bodies this server is writing, per page
-    /// (`racer_core::read::budget::shed_hot_page`).
-    streaming: Rc<std::cell::RefCell<std::collections::HashMap<crate::model::PageId, usize>>>,
+    /// Hot-page shedding over the page response bodies this server is
+    /// writing ([`ServeDecision`]).
+    serve: Rc<std::cell::RefCell<ServeDecision<crate::model::PageId>>>,
 }
 
 /// Bodies of one page an owner writes before it may shed readers of that page:
 /// `racer_core::read::budget::HOT_PAGE_QUEUE_BYTES` of production pages.
+#[cfg(test)]
 pub(crate) const fn hot_page_threshold() -> usize {
     racer_core::read::budget::hot_page_bodies(crate::model::PAGE_BYTES)
 }
 
+type Serve = Rc<std::cell::RefCell<ServeDecision<crate::model::PageId>>>;
+
 /// Counts one page body being written until dropped.
 struct Streaming {
-    pages: Rc<std::cell::RefCell<std::collections::HashMap<crate::model::PageId, usize>>>,
-    page: crate::model::PageId,
+    serve: Serve,
+    body: Option<Body<crate::model::PageId>>,
 }
 
 impl Streaming {
-    fn new(
-        pages: &Rc<std::cell::RefCell<std::collections::HashMap<crate::model::PageId, usize>>>,
-        page: crate::model::PageId,
-    ) -> Self {
-        *pages.borrow_mut().entry(page.clone()).or_default() += 1;
+    fn new(serve: &Serve, page: crate::model::PageId) -> Self {
+        let body = serve.borrow_mut().begin_body(page);
         Self {
-            pages: pages.clone(),
-            page,
+            serve: serve.clone(),
+            body: Some(body),
         }
     }
 }
 
 impl Drop for Streaming {
     fn drop(&mut self) {
-        let mut pages = self.pages.borrow_mut();
-        if let Some(count) = pages.get_mut(&self.page) {
-            *count -= 1;
-            if *count == 0 {
-                pages.remove(&self.page);
-            }
+        if let Some(body) = self.body.take() {
+            self.serve.borrow_mut().end_body(body);
         }
     }
 }
@@ -360,14 +357,16 @@ impl PeerServer {
             signatures,
             transfers,
             request_timeout: settings.request_timeout,
-            streaming: Rc::default(),
+            serve: Rc::new(std::cell::RefCell::new(ServeDecision::new(
+                crate::model::PAGE_BYTES,
+            ))),
         }
     }
 
     /// Bodies of `page` this server is writing now, and of all pages.
+    #[cfg(test)]
     pub(crate) fn streaming(&self, page: &crate::model::PageId) -> (usize, usize) {
-        let pages = self.streaming.borrow();
-        (pages.get(page).copied().unwrap_or(0), pages.values().sum())
+        self.serve.borrow().streaming(page)
     }
 
     /// Count a page response's body as being written until the result drops
@@ -375,7 +374,7 @@ impl PeerServer {
     pub(crate) fn page_streaming(&self, response: &PeerResponse) -> Option<impl Sized + use<>> {
         match response {
             PeerResponse::Page { ciphertext, .. } if !ciphertext.bytes().is_empty() => Some(
-                Streaming::new(&self.streaming, ciphertext.envelope().page.clone()),
+                Streaming::new(&self.serve, ciphertext.envelope().page.clone()),
             ),
             _ => None,
         }
@@ -389,12 +388,12 @@ impl PeerServer {
         n: usize,
     ) -> impl Sized + use<> {
         (0..n)
-            .map(|_| Streaming::new(&self.streaming, page.clone()))
+            .map(|_| Streaming::new(&self.serve, page.clone()))
             .collect::<Vec<_>>()
     }
 
     /// Whether to answer a page request with `Overloaded` because this node owns the page and is
-    /// already writing [`hot_page_threshold`] bodies of it to other requesters, at least half of
+    /// already writing `hot_page_threshold()` bodies of it to other requesters, at least half of
     /// all the bodies it is writing. The page's other owners are never shed. This node's column
     /// mates in the page's pool (the helpers shed readers ask) are shed only past
     /// `hot_page_exempt_bodies`, so owner fan-in for one page stays near the threshold whatever
@@ -406,25 +405,16 @@ impl PeerServer {
         requester: &racer_control_wire::NodeId,
         membership: &std::sync::Arc<crate::topology::Membership>,
     ) -> bool {
-        use racer_core::read::budget::{HotPageLimits, shed_hot_page};
-        let threshold = hot_page_threshold();
-        let (streaming, all) = self.streaming(page);
-        if streaming < threshold {
+        if !self.serve.borrow().hot(page) {
             return false;
         }
         let (object, number) = (&page.version.object, page.number);
         let owners = self.placement.rank(membership.clone(), object, number);
         let local = &self.relay.network.local;
         let column_mate = || membership.same_column(&object.cache, local, requester);
-        shed_hot_page(
-            &owners.ordered,
-            local,
-            requester,
-            column_mate,
-            streaming,
-            all,
-            HotPageLimits::mesh(threshold),
-        )
+        self.serve
+            .borrow()
+            .shed(page, &owners.ordered, local, requester, column_mate)
     }
     /// Bound incoming heads and the complete connection handshake, including writes.
     /// Authenticated page dispatch and transfer retain their signed request deadline.
