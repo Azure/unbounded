@@ -567,8 +567,17 @@ fn hotpath() {
     if std::env::var_os("RACER_BENCH_FAIL_SETUP").is_some() {
         panic!("requested cleanup probe");
     }
+    // Optional comma-separated `mode:concurrency` filter, e.g. `memory:32,disk:32`.
+    let cases = std::env::var("RACER_HOTPATH_CASES").ok();
     for mode in ["memory", "disk", "fill"] {
         for concurrency in [1, 32, 128] {
+            if let Some(cases) = &cases
+                && !cases
+                    .split(',')
+                    .any(|case| case == format!("{mode}:{concurrency}"))
+            {
+                continue;
+            }
             run_case(&disk.mount(), &plan, mode, concurrency);
         }
     }

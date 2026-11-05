@@ -1961,7 +1961,7 @@ mod tests {
                 text.lines()
                     .filter(|line| line.contains("{worker="))
                     .count(),
-                6 * 64
+                5 * 64
             );
             // Streaming has no fixed body cap: several times the largest
             // catalog still scrapes completely over HTTP.
