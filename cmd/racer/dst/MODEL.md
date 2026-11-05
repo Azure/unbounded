@@ -254,10 +254,20 @@ is relay load, not the quota itself. Leads checked:
   once because the helper is itself a reader whose own walk failed, and the reader's link
   budget is spent before owners 1 and 2 (`HopBudgetExhausted`, not sent).
 
-Pings: the Model now routes pings like racer-sim and production, but sends few (0 at
-10,000, 39 at 50,000) against racer-sim's 3,986 and 15,254: pings start only from silence
-(rank 0 timeouts and last-link timeouts), and the Model sees fewer of them. Not yet
-explained.
+Pings (diagnosed in part, not fixed). racer-sim at 10,000 (seed 8, this commit): 4,058 last-link
+timeouts and 3,986 pings, about one ping per timeout; the Model: 1,289 last-link timeouts and 0
+pings. Production asks a ping after `LINK_TIMEOUTS` (2) last-link timeouts of the same peer
+(`src/peer.rs:1146`) or one rank 0 probe timeout (`core/src/read/walk.rs:2184-2195`), and the
+probe's `TimedOut` note reaches `LinkHealth` only through `CandidatePolicy::apply`
+(`src/read/candidates.rs:1546-1580`). So a single last-link timeout pings only when the same
+peer already counts a timeout, which in racer-sim is the requester's own probe timeout
+(`ProbeTimeout` runs before `LastHop` at the same instant). `MODEL_DIAG=1` shows the Model's
+1,476 probe timeouts (all of helpers, `timeout:reader->helper:*`) are fed to the core
+(`probe_timeout_fed:Ok`) but yield no `Effect::Silence` (`probe_timeout_fed:*:silence0`, no
+`silence_timeout:*` keys), so each last link is the peer's first timeout
+(`lasthop:knownfalse:wantfalse` 1,288 of 1,289). Next step: find why the acquisition reports no
+evidence for a helper probe's `TimedOut` (`core/src/read/acquisition.rs:633-642` needs a held
+ranking and a destination) and whether production behaves the same.
 
 Cold start 400 origin requests (36 against 30) are not yet investigated further than the
 note under Tolerances.

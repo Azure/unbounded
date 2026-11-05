@@ -1007,13 +1007,19 @@ impl<'s> Model<'s> {
                 if let Some((sender, dest, page, sent)) = self.last_hops.remove(&msg) {
                     self.report.counters.silence_timeouts += 1;
                     let (sent, at) = (self.instant(sent), self.instant(now));
-                    if self.nodes[sender as usize].silence.timed_out(
+                    let known = self.nodes[sender as usize].silence.unanswered(&dest, at);
+                    let want = self.nodes[sender as usize].silence.timed_out(
                         dest,
                         page,
                         sent,
                         at,
                         LINK_TIMEOUTS,
-                    ) {
+                    );
+                    if self.diag {
+                        let key = format!("lasthop:known{known}:want{want}");
+                        *self.report.attempt_errors.entry(key).or_default() += 1;
+                    }
+                    if want {
                         self.poll_pings(sender);
                     }
                 }
@@ -1083,8 +1089,16 @@ impl<'s> Model<'s> {
                         reply: Reply::TimedOut,
                         answer: None,
                     };
-                    let _ = self.nodes[node as usize].cores[worker as usize]
+                    let fed = self.nodes[node as usize].cores[worker as usize]
                         .on_acquisition(read, timed_out, at, &mut out);
+                    if self.diag {
+                        let silence = out
+                            .iter()
+                            .filter(|e| matches!(e, Effect::Silence { .. }))
+                            .count();
+                        let key = format!("probe_timeout_fed:{fed:?}:silence{silence}");
+                        *self.report.attempt_errors.entry(key).or_default() += 1;
+                    }
                     self.dispatch(node, worker, out);
                     self.pump_all(node, worker);
                 }
@@ -2514,6 +2528,14 @@ impl<'s> Model<'s> {
                         // Production `LinkHealth::silence_timed_out`: later routes to `dest`
                         // skip the relay that may have eaten this exchange.
                         self.nodes[node as usize].detours.timed_out(dest, sent, at);
+                        if self.diag {
+                            let key = format!(
+                                "silence_timeout:needed{}:waited{}ms",
+                                needed.min(9),
+                                at.saturating_duration_since(sent).as_millis() / 500 * 500
+                            );
+                            *self.report.attempt_errors.entry(key).or_default() += 1;
+                        }
                         let silence = &mut self.nodes[node as usize].silence;
                         if silence.timed_out(dest, page, sent, at, needed) {
                             self.poll_pings(node);
