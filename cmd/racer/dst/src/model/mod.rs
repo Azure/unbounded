@@ -2035,6 +2035,11 @@ impl<'s> Model<'s> {
         let body = self.nodes[to as usize].cores[worker as usize]
             .serve
             .begin_body(page);
+        let (page_bodies, _) = self.nodes[to as usize].cores[worker as usize]
+            .serve
+            .streaming(&page);
+        let peak = &mut self.report.counters.page_peak_fanin;
+        *peak = (*peak).max(page_bodies as u64);
         self.next_body += 1;
         let key = self.next_body;
         self.bodies.insert(key, (to, worker, body));

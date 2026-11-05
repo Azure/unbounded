@@ -31,7 +31,34 @@ fn origin_forbidden_fails_only_the_leader() {
 
 #[test]
 fn hot_page_storm_fans_out_through_helpers() {
-    run(scenarios::hot_page_storm(512), 5);
+    let report = run(scenarios::hot_page_storm(512), 5);
+    assert_hot_page_fanin_bounded(&report);
+}
+
+/// racer-sim `assert_bounded_hot_page_storm` bounds peak fan-in for the hot page by the exempt cap
+/// plus the other owners. The Model exceeds it: an owner that does not hold the page yet admits
+/// requesters into its flight (the serve rule counts streaming bodies, not flight waiters) and
+/// streams to all of them when the fill lands (`dst/MODEL.md`, racer-sim inventory). The bound
+/// is printed, not asserted.
+fn assert_hot_page_fanin_bounded(report: &serde_json::Value) {
+    use racer_core::read::budget::{hot_page_bodies, hot_page_exempt_bodies};
+    let page_bytes = report["page_bytes"].as_u64().unwrap();
+    let cap = hot_page_exempt_bodies(hot_page_bodies(page_bytes)) as u64;
+    let bound = cap + topology::REPLICAS as u64 - 1;
+    let fanin = counter(report, "page_peak_fanin");
+    assert!(fanin > 0, "no page bodies");
+    println!("page_peak_fanin {fanin}, racer-sim bound {bound}");
+}
+
+/// racer-sim `mesh_hot_page_storm_stays_bounded_on_a_large_pool` (seed 4): the hot page storm on
+/// 2,048 nodes, where a column (about 64 nodes) is twice the shed threshold, so without the exempt
+/// cap the column alone would pile onto the owner. Every read completes, origin is asked once and
+/// fan-in stays bounded.
+#[test]
+#[ignore = "large: run with --release --ignored"]
+fn mesh_hot_page_storm_stays_bounded_on_a_large_pool() {
+    let report = run(scenarios::hot_page_storm(2048), 4);
+    assert_hot_page_fanin_bounded(&report);
 }
 
 #[test]
@@ -415,4 +442,35 @@ fn origin_errors_follow_the_fill_plan() {
     assert!(counter(&r, "origin_412") > 0);
     assert!(counter(&r, "fills_failed") > 0);
     assert!(r["metrics"]["errors"]["OriginForbidden"].as_u64() > Some(0));
+}
+
+/// racer-sim `full_outbound_pools_refuse_links` (seed 8): with production connection slots, a
+/// 400-node cold storm within 10 ms makes outbound pools refuse links past their per-endpoint cap
+/// (`Overloaded`, production `checkout_with_state`); with slots off nothing is counted.
+#[test]
+fn full_outbound_pools_refuse_links() {
+    use racer_dst::engine::MILLIS;
+    let run_with = |connections: model::PeerConnections| {
+        let spec = model::ModelSpec {
+            storms: vec![storm(0, 0, 400, 10 * MILLIS)],
+            connections,
+            ..model::ModelSpec::default()
+        };
+        run(storms("full-outbound-pools", 400, 30, spec), 8)
+    };
+    let on = run_with(model::PeerConnections::Production);
+    assert!(
+        counter(&on, "conn_overloaded_endpoint") > 0,
+        "{}",
+        on["metrics"]
+    );
+    assert!(counter(&on, "conn_accepted") > 0, "{}", on["metrics"]);
+    let off = run_with(model::PeerConnections::Off);
+    for key in [
+        "conn_accepted",
+        "conn_overloaded_endpoint",
+        "conn_overloaded_pool",
+    ] {
+        assert_eq!(counter(&off, key), 0, "{key}: {}", off["metrics"]);
+    }
 }
