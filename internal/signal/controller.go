@@ -46,22 +46,23 @@ import (
 )
 
 const (
-	RequestLabel           = "signal.unbounded-cloud.io/certification-request"
-	ReservationLabel       = "signal.unbounded-cloud.io/reserved-by"
-	RunNodeLabel           = "signal.unbounded-cloud.io/request-node"
-	RunProfileLabel        = "signal.unbounded-cloud.io/profile"
-	RunSuiteLabel          = "signal.unbounded-cloud.io/suite"
-	RunTriggerAnnotation   = "signal.unbounded-cloud.io/trigger"
-	RunAdmissionAnnotation = "signal.unbounded-cloud.io/admission"
-	RunFinalizer           = "signal.unbounded-cloud.io/cleanup"
-	SnapshotRunLabel       = "signal.unbounded-cloud.io/run"
-	checkResultDigest      = "signal.unbounded-cloud.io/check-result-digest"
-	checkResultRunUID      = "signal.unbounded-cloud.io/check-result-run-uid"
-	checkResultCheckID     = "signal.unbounded-cloud.io/check-result-check-id"
-	checkResultCheckOrder  = "signal.unbounded-cloud.io/check-result-check-order"
-	runAdmissionReady      = "ready"
-	runAdmissionPending    = "pending"
-	profileSuiteNameField  = "spec.suite.name"
+	RequestLabel               = "signal.unbounded-cloud.io/certification-request"
+	ReservationLabel           = "signal.unbounded-cloud.io/reserved-by"
+	RunNodeLabel               = "signal.unbounded-cloud.io/request-node"
+	RunProfileLabel            = "signal.unbounded-cloud.io/profile"
+	RunSuiteLabel              = "signal.unbounded-cloud.io/suite"
+	RunTriggerAnnotation       = "signal.unbounded-cloud.io/trigger"
+	RunAdmissionAnnotation     = "signal.unbounded-cloud.io/admission"
+	RunStartIdentityAnnotation = "signal.unbounded-cloud.io/start-fingerprints"
+	RunFinalizer               = "signal.unbounded-cloud.io/cleanup"
+	SnapshotRunLabel           = "signal.unbounded-cloud.io/run"
+	checkResultDigest          = "signal.unbounded-cloud.io/check-result-digest"
+	checkResultRunUID          = "signal.unbounded-cloud.io/check-result-run-uid"
+	checkResultCheckID         = "signal.unbounded-cloud.io/check-result-check-id"
+	checkResultCheckOrder      = "signal.unbounded-cloud.io/check-result-check-order"
+	runAdmissionReady          = "ready"
+	runAdmissionPending        = "pending"
+	profileSuiteNameField      = "spec.suite.name"
 
 	maxAdapterParticipants         = 8
 	maxAdapterReasonBytes          = 512
@@ -331,6 +332,8 @@ type AdmissionReconciler struct {
 	Namespace       string
 	ScriptNamespace string
 	RunnerImage     string
+	AdapterImage    string
+	WorkflowDigest  string
 	Recorder        recorder.EventRecorder
 	Now             func() time.Time
 	admissionMu     sync.Mutex
@@ -345,6 +348,7 @@ type RunReconciler struct {
 	Now               func() time.Time
 	MaxConcurrentRuns int
 	Recorder          recorder.EventRecorder
+	ControllerImage   string
 }
 
 func (r *AdmissionReconciler) SetupWithManager(mgr ctrl.Manager) error {
@@ -426,6 +430,10 @@ func (r *RunReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		r.APIReader = mgr.GetAPIReader()
 	}
 
+	if !signalv1.IsDigestPinnedImage(r.ControllerImage) {
+		return errors.New("controller image must use an immutable sha256 digest")
+	}
+
 	workflow := &unstructured.Unstructured{}
 	workflow.SetGroupVersionKind(workflowGVK)
 
@@ -468,6 +476,10 @@ func (r *AdmissionReconciler) admitNode(ctx context.Context, node *corev1.Node, 
 		return err
 	}
 
+	if err := validatePlanProvenance(r.AdapterImage, r.WorkflowDigest); err != nil {
+		return err
+	}
+
 	if runName := node.Annotations[ReservationLabel]; runName != "" {
 		handled, err := r.resumeOrReleaseReservation(ctx, runName)
 		if err != nil || handled {
@@ -491,6 +503,11 @@ func (r *AdmissionReconciler) admitNode(ctx context.Context, node *corev1.Node, 
 	}
 
 	participants, err := r.selectParticipants(ctx, node, &profile, checks)
+	if err != nil {
+		return err
+	}
+
+	startFingerprints, err := r.captureParticipantFingerprints(ctx, participants)
 	if err != nil {
 		return err
 	}
@@ -576,7 +593,7 @@ func (r *AdmissionReconciler) admitNode(ctx context.Context, node *corev1.Node, 
 		return err
 	}
 
-	run := newCertificationRun(
+	run, err := newCertificationRun(
 		runName,
 		r.Namespace,
 		node,
@@ -585,7 +602,15 @@ func (r *AdmissionReconciler) admitNode(ctx context.Context, node *corev1.Node, 
 		participants,
 		snapshot,
 		checkSnapshots,
+		signalv1.ExecutionPlanProvenance{
+			AdapterImage:           r.AdapterImage,
+			WorkflowTemplateDigest: r.WorkflowDigest,
+		},
+		startFingerprints,
 	)
+	if err != nil {
+		return fmt.Errorf("build immutable CertificationRun execution plan: %w", err)
+	}
 	if _, err := buildWorkflow(run); err != nil {
 		deleteErr := r.Delete(context.WithoutCancel(ctx), snapshot)
 
@@ -634,7 +659,24 @@ func newCertificationRun(
 	participants []signalv1.Participant,
 	snapshot *corev1.ConfigMap,
 	checkSnapshots []signalv1.CertificationCheckSnapshot,
-) *signalv1.CertificationRun {
+	provenance signalv1.ExecutionPlanProvenance,
+	startFingerprints []signalv1.NodeFingerprint,
+) (*signalv1.CertificationRun, error) {
+	planDigest, err := signalv1.DeriveExecutionPlanDigest(
+		int32(len(participants)),
+		suite.Spec.ScriptBundle.Digest,
+		checkSnapshots,
+		provenance,
+	)
+	if err != nil {
+		return nil, err
+	}
+
+	startIdentity, err := json.Marshal(startFingerprints)
+	if err != nil {
+		return nil, fmt.Errorf("encode participant start fingerprints: %w", err)
+	}
+
 	return &signalv1.CertificationRun{
 		TypeMeta: metav1.TypeMeta{APIVersion: signalv1.GroupVersion.String(), Kind: "CertificationRun"},
 		ObjectMeta: metav1.ObjectMeta{
@@ -646,8 +688,9 @@ func newCertificationRun(
 				RunSuiteLabel:   suite.Name,
 			},
 			Annotations: map[string]string{
-				RunTriggerAnnotation:   "manual",
-				RunAdmissionAnnotation: runAdmissionPending,
+				RunTriggerAnnotation:       "manual",
+				RunAdmissionAnnotation:     runAdmissionPending,
+				RunStartIdentityAnnotation: string(startIdentity),
 			},
 			Finalizers: []string{RunFinalizer},
 		},
@@ -668,9 +711,31 @@ func newCertificationRun(
 				UID:    snapshot.UID,
 				Digest: suite.Spec.ScriptBundle.Digest,
 			},
-			Checks: checkSnapshots,
+			Checks:         checkSnapshots,
+			PlanDigest:     planDigest,
+			PlanProvenance: &provenance,
 		},
+	}, nil
+}
+
+func ValidateExecutionProvenance(controllerImage, adapterImage, workflowDigest string) error {
+	if !signalv1.IsDigestPinnedImage(controllerImage) {
+		return errors.New("controller image must use an immutable sha256 digest")
 	}
+
+	return validatePlanProvenance(adapterImage, workflowDigest)
+}
+
+func validatePlanProvenance(adapterImage, workflowDigest string) error {
+	if !signalv1.IsDigestPinnedImage(adapterImage) {
+		return errors.New("adapter image must use an immutable sha256 digest")
+	}
+
+	if !signalv1.IsSHA256Digest(workflowDigest) {
+		return errors.New("workflow template digest must be an algorithm-qualified sha256 digest")
+	}
+
+	return nil
 }
 
 func (r *AdmissionReconciler) resolveSuite(
@@ -872,6 +937,37 @@ func (r *AdmissionReconciler) selectParticipants(
 	}
 
 	return participants, nil
+}
+
+func (r *AdmissionReconciler) captureParticipantFingerprints(
+	ctx context.Context,
+	participants []signalv1.Participant,
+) ([]signalv1.NodeFingerprint, error) {
+	fingerprints := make([]signalv1.NodeFingerprint, len(participants))
+
+	for index := range participants {
+		var node corev1.Node
+		if err := r.APIReader.Get(
+			ctx,
+			client.ObjectKey{Name: participants[index].NodeName},
+			&node,
+		); err != nil {
+			return nil, fmt.Errorf("read participant %s fingerprint: %w", participants[index].NodeName, err)
+		}
+
+		if node.UID != participants[index].NodeUID {
+			return nil, fmt.Errorf(
+				"participant %s UID changed from %s to %s",
+				participants[index].NodeName,
+				participants[index].NodeUID,
+				node.UID,
+			)
+		}
+
+		fingerprints[index] = nodeFingerprint(&node)
+	}
+
+	return fingerprints, nil
 }
 
 func (r *AdmissionReconciler) releaseOrphanedReservations(ctx context.Context, runName string) error {
@@ -1181,6 +1277,8 @@ func (r *AdmissionReconciler) createSnapshot(
 			WorkloadPolicy:        *check.WorkloadPolicy.DeepCopy(),
 			GPUCount:              check.GPUCount,
 			BackendActiveDeadline: check.BackendActiveDeadline,
+			MinDuration:           check.MinDuration.DeepCopy(),
+			Continuity:            check.Continuity.DeepCopy(),
 		}
 	}
 
@@ -1781,11 +1879,19 @@ func (r *RunReconciler) finishGrouped(
 		}
 	}
 
+	identity, enforcedVerdict, enforcedReason, err := r.qualificationEvidenceIdentity(ctx, run, checks, verdict, reason)
+	if err != nil {
+		return ctrl.Result{}, err
+	}
+	verdict = enforcedVerdict
+	reason = enforcedReason
+
 	evidenceRun := run.DeepCopy()
 	evidenceRun.Status.Checks = checks
 	evidenceRun.Status.Reason = reason
 	evidenceRun.Status.Phase = runPhaseForVerdict(verdict)
 	evidenceRun.Status.Workflow.Phase = workflowPhase
+	evidenceRun.Status.Evidence.Identity = identity
 
 	startedAt := groupedStartedAt(workflow, run)
 	finishedAt := groupedFinishedAt(workflow, run)
@@ -1811,7 +1917,7 @@ func (r *RunReconciler) finishGrouped(
 	before := run.DeepCopy()
 	run.Status = evidenceRun.Status
 	run.Status.Checks = compactCheckStatuses(checks)
-	run.Status.Evidence = signalv1.EvidenceStatus{URI: uri, Digest: digest}
+	run.Status.Evidence = signalv1.EvidenceStatus{URI: uri, Digest: digest, Identity: identity}
 	run.Status.Phase = runPhaseForVerdict(verdict)
 	run.Status.Reason = boundedStatusText(reason)
 
@@ -1836,15 +1942,16 @@ func (r *RunReconciler) resumeGroupedEvidence(
 	}
 
 	var document struct {
-		RunID          string                  `json:"runID"`
-		RunName        string                  `json:"runName"`
-		Workflow       signalv1.WorkflowStatus `json:"workflow"`
-		CheckStatus    []evidenceCheckStatus   `json:"checkStatus"`
-		ExecutionState string                  `json:"executionState"`
-		Verdict        string                  `json:"verdict"`
-		Reason         string                  `json:"reason"`
-		Phase          signalv1.RunPhase       `json:"phase"`
-		FinishedAt     string                  `json:"finishedAt"`
+		RunID            string                                  `json:"runID"`
+		RunName          string                                  `json:"runName"`
+		Workflow         signalv1.WorkflowStatus                 `json:"workflow"`
+		CheckStatus      []evidenceCheckStatus                   `json:"checkStatus"`
+		ExecutionState   string                                  `json:"executionState"`
+		Verdict          string                                  `json:"verdict"`
+		Reason           string                                  `json:"reason"`
+		Phase            signalv1.RunPhase                       `json:"phase"`
+		FinishedAt       string                                  `json:"finishedAt"`
+		EvidenceIdentity *signalv1.QualificationEvidenceIdentity `json:"qualificationIdentity,omitempty"`
 	}
 	if err := json.Unmarshal(data, &document); err != nil {
 		return ctrl.Result{}, false, fmt.Errorf("decode persisted grouped evidence: %w", err)
@@ -1895,7 +2002,11 @@ func (r *RunReconciler) resumeGroupedEvidence(
 	run.Status.Checks = compactEvidenceCheckStatuses(document.CheckStatus)
 	run.Status.Reason = boundedStatusText(document.Reason)
 	run.Status.Workflow = document.Workflow
-	run.Status.Evidence = signalv1.EvidenceStatus{URI: uri, Digest: digest}
+	run.Status.Evidence = signalv1.EvidenceStatus{
+		URI:      uri,
+		Digest:   digest,
+		Identity: document.EvidenceIdentity,
+	}
 
 	if document.Phase == "" {
 		run.Status.Phase = runPhaseForVerdict(document.Verdict)
@@ -2582,26 +2693,216 @@ func (r *RunReconciler) evidenceDocument(
 	}
 
 	doc := map[string]any{
-		"apiVersion":     "signal.unbounded-cloud.io/evidence/v1alpha1",
-		"runID":          string(run.UID),
-		"runName":        run.Name,
-		"profile":        run.Spec.Profile,
-		"suite":          run.Spec.Suite,
-		"participants":   run.Spec.Participants,
-		"scriptBundle":   run.Spec.ScriptBundle,
-		"workflow":       run.Status.Workflow,
-		"checks":         checks,
-		"checkStatus":    checkStatuses,
-		"scriptContents": scriptContents,
-		"executionState": executionState,
-		"verdict":        verdict,
-		"reason":         reason,
-		"phase":          run.Status.Phase,
-		"startedAt":      startedAt.UTC().Format(time.RFC3339Nano),
-		"finishedAt":     finishedAt.UTC().Format(time.RFC3339Nano),
+		"apiVersion":            "signal.unbounded-cloud.io/evidence/v1alpha1",
+		"runID":                 string(run.UID),
+		"runName":               run.Name,
+		"profile":               run.Spec.Profile,
+		"suite":                 run.Spec.Suite,
+		"participants":          run.Spec.Participants,
+		"scriptBundle":          run.Spec.ScriptBundle,
+		"workflow":              run.Status.Workflow,
+		"checks":                checks,
+		"checkStatus":           checkStatuses,
+		"scriptContents":        scriptContents,
+		"executionState":        executionState,
+		"verdict":               verdict,
+		"reason":                reason,
+		"phase":                 run.Status.Phase,
+		"qualificationIdentity": run.Status.Evidence.Identity,
+		"startedAt":             startedAt.UTC().Format(time.RFC3339Nano),
+		"finishedAt":            finishedAt.UTC().Format(time.RFC3339Nano),
 	}
 
 	return json.MarshalIndent(doc, "", "  ")
+}
+
+func (r *RunReconciler) qualificationEvidenceIdentity(
+	ctx context.Context,
+	run *signalv1.CertificationRun,
+	statuses []signalv1.CheckStatus,
+	verdict string,
+	reason string,
+) (*signalv1.QualificationEvidenceIdentity, string, string, error) {
+	if run.Spec.PlanDigest == "" || run.Spec.PlanProvenance == nil {
+		return nil, verdict, reason, nil
+	}
+
+	canonical, err := signalv1.DeriveExecutionPlanDigest(
+		int32(len(run.Spec.Participants)),
+		run.Spec.ScriptBundle.Digest,
+		run.Spec.Checks,
+		*run.Spec.PlanProvenance,
+	)
+	if err != nil || canonical != run.Spec.PlanDigest {
+		return nil, "Inconclusive", "ExecutionPlanIdentityInvalid: immutable plan provenance is invalid", nil
+	}
+
+	starts, err := decodeStartFingerprints(run)
+	if err != nil {
+		return nil, "Inconclusive", "ParticipantIdentityMissing: " + err.Error(), nil
+	}
+
+	ends := make([]signalv1.NodeFingerprint, len(run.Spec.Participants))
+	participants := make([]signalv1.ParticipantEvidenceIdentity, len(run.Spec.Participants))
+	for index := range run.Spec.Participants {
+		var node corev1.Node
+		if err := r.APIReader.Get(
+			ctx,
+			client.ObjectKey{Name: run.Spec.Participants[index].NodeName},
+			&node,
+		); err != nil {
+			return nil, "Inconclusive", "ParticipantIdentityMissing: end fingerprint unavailable", nil
+		}
+
+		if node.UID != run.Spec.Participants[index].NodeUID {
+			return nil, "Inconclusive", "ParticipantIdentityChanged: node UID changed during execution", nil
+		}
+
+		ends[index] = nodeFingerprint(&node)
+		role := signalv1.ParticipantRoleParticipant
+		if index == 0 {
+			role = signalv1.ParticipantRoleRequester
+		}
+
+		participants[index] = signalv1.ParticipantEvidenceIdentity{
+			Index:   int32(index),
+			Role:    role,
+			Verdict: qualificationVerdict(verdict),
+			Start:   starts[index],
+			End:     ends[index],
+		}
+	}
+
+	summaries := make([]signalv1.CheckContinuitySummary, len(statuses))
+	for index := range statuses {
+		status := &statuses[index]
+		if status.StartedAt == nil || status.FinishedAt == nil || status.FinishedAt.Before(status.StartedAt) {
+			return nil,
+				"Inconclusive",
+				fmt.Sprintf("CheckTimingMissing: check %s has no trustworthy execution interval", run.Spec.Checks[index].ID),
+				nil
+		}
+
+		duration := status.FinishedAt.Sub(status.StartedAt.Time)
+		sameBoot := true
+		for participantIndex := range starts {
+			if starts[participantIndex].BootID == "" ||
+				ends[participantIndex].BootID == "" ||
+				starts[participantIndex].BootID != ends[participantIndex].BootID {
+				sameBoot = false
+				break
+			}
+		}
+
+		summaries[index] = signalv1.CheckContinuitySummary{
+			Order:            int32(index),
+			StartedAt:        *status.StartedAt,
+			FinishedAt:       *status.FinishedAt,
+			ObservedDuration: metav1.Duration{Duration: duration},
+			Completed:        status.Phase == signalv1.CheckPhaseSucceeded,
+			SameBootID:       sameBoot,
+		}
+
+		check := &run.Spec.Checks[index]
+		if verdict == "Pass" && check.MinDuration != nil && duration < check.MinDuration.Duration {
+			verdict = "Inconclusive"
+			reason = fmt.Sprintf(
+				"MinimumDurationNotMet: check %s ran for %s, requires %s",
+				check.ID,
+				duration,
+				check.MinDuration.Duration,
+			)
+		}
+
+		if verdict == "Pass" && check.Continuity != nil {
+			switch {
+			case check.Continuity.RequireSameBootID && !sameBoot:
+				verdict = "Inconclusive"
+				reason = fmt.Sprintf("ContinuityNotProven: check %s lacks same-boot evidence", check.ID)
+			case check.Continuity.MaxSampleGap != nil:
+				verdict = "Inconclusive"
+				reason = fmt.Sprintf("ContinuityNotProven: check %s lacks sample-gap evidence", check.ID)
+			case check.Continuity.RequirePerDeviceCoverage:
+				verdict = "Inconclusive"
+				reason = fmt.Sprintf("ContinuityNotProven: check %s lacks per-device coverage evidence", check.ID)
+			}
+		}
+	}
+
+	runnerImages := make([]string, 0, len(run.Spec.Checks))
+	seenImages := map[string]struct{}{}
+	for index := range run.Spec.Checks {
+		image := run.Spec.Checks[index].RunnerImage
+		if _, exists := seenImages[image]; exists {
+			continue
+		}
+
+		seenImages[image] = struct{}{}
+		runnerImages = append(runnerImages, image)
+	}
+	sort.Strings(runnerImages)
+
+	for index := range participants {
+		participants[index].Verdict = qualificationVerdict(verdict)
+	}
+
+	return &signalv1.QualificationEvidenceIdentity{
+		PlanDigest:   run.Spec.PlanDigest,
+		Participants: participants,
+		Checks:       summaries,
+		Provenance: signalv1.EvidenceProvenance{
+			ControllerImage:        r.ControllerImage,
+			AdapterImage:           run.Spec.PlanProvenance.AdapterImage,
+			WorkflowTemplateDigest: run.Spec.PlanProvenance.WorkflowTemplateDigest,
+			RunnerImages:           runnerImages,
+		},
+	}, verdict, reason, nil
+}
+
+func decodeStartFingerprints(run *signalv1.CertificationRun) ([]signalv1.NodeFingerprint, error) {
+	value := run.Annotations[RunStartIdentityAnnotation]
+	if value == "" {
+		return nil, errors.New("start fingerprints are absent")
+	}
+
+	var fingerprints []signalv1.NodeFingerprint
+	if err := json.Unmarshal([]byte(value), &fingerprints); err != nil {
+		return nil, errors.New("start fingerprints are invalid")
+	}
+
+	if len(fingerprints) != len(run.Spec.Participants) {
+		return nil, errors.New("start fingerprint count does not match participants")
+	}
+
+	for index := range fingerprints {
+		if fingerprints[index].NodeUID != run.Spec.Participants[index].NodeUID {
+			return nil, errors.New("start fingerprint identity does not match participants")
+		}
+	}
+
+	return fingerprints, nil
+}
+
+func qualificationVerdict(verdict string) signalv1.QualificationVerdict {
+	switch verdict {
+	case "Pass":
+		return signalv1.QualificationVerdictPass
+	case "Fail":
+		return signalv1.QualificationVerdictFail
+	default:
+		return signalv1.QualificationVerdictInconclusive
+	}
+}
+
+func nodeFingerprint(node *corev1.Node) signalv1.NodeFingerprint {
+	return signalv1.NodeFingerprint{
+		NodeUID:        node.UID,
+		BootID:         node.Status.NodeInfo.BootID,
+		KernelVersion:  node.Status.NodeInfo.KernelVersion,
+		OSImage:        node.Status.NodeInfo.OSImage,
+		KubeletVersion: node.Status.NodeInfo.KubeletVersion,
+		SystemUUID:     node.Status.NodeInfo.SystemUUID,
+	}
 }
 
 func backendResourceReferences(

@@ -328,7 +328,7 @@ func TestSuiteSnapshotAndRunPinning(t *testing.T) {
 
 	node := &corev1.Node{ObjectMeta: metav1.ObjectMeta{Name: "node"}}
 	participants := []signalv1.Participant{{NodeName: node.Name, NodeUID: types.UID("node-uid")}}
-	run := newCertificationRun(
+	run, err := newCertificationRun(
 		"run",
 		reconciler.Namespace,
 		node,
@@ -337,7 +337,15 @@ func TestSuiteSnapshotAndRunPinning(t *testing.T) {
 		participants,
 		snapshot,
 		checkSnapshots,
+		signalv1.ExecutionPlanProvenance{
+			AdapterImage:           "registry.invalid/adapter@sha256:" + strings.Repeat("b", 64),
+			WorkflowTemplateDigest: "sha256:" + strings.Repeat("c", 64),
+		},
+		[]signalv1.NodeFingerprint{{NodeUID: types.UID("node-uid")}},
 	)
+	if err != nil {
+		t.Fatalf("newCertificationRun() error = %v", err)
+	}
 
 	if run.Spec.Suite.Name != suite.Name ||
 		run.Spec.Suite.UID != suite.UID ||
@@ -350,6 +358,9 @@ func TestSuiteSnapshotAndRunPinning(t *testing.T) {
 		run.Spec.Checks[0].Script.Digest != digestString(scripts["first.sh"]) ||
 		run.Spec.Checks[1].Script.Digest != digestString(scripts["second.sh"]) {
 		t.Fatalf("Run did not retain resolved script/check snapshots: %#v", run.Spec)
+	}
+	if run.Spec.PlanDigest == "" || run.Spec.PlanProvenance == nil {
+		t.Fatalf("Run omitted immutable execution plan identity: %#v", run.Spec)
 	}
 
 	suite.Generation++

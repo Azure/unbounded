@@ -32,6 +32,10 @@ type config struct {
 	namespace         string
 	scriptNamespace   string
 	runnerImage       string
+	controllerImage   string
+	adapterImage      string
+	workflowDigest    string
+	gateProtected     bool
 	metricsAddress    string
 	probeAddress      string
 	leaderElect       bool
@@ -56,6 +60,15 @@ func main() {
 	cmd.Flags().StringVar(&cfg.namespace, "namespace", "project-signal", "Namespace for CertificationRuns and Workflows")
 	cmd.Flags().StringVar(&cfg.scriptNamespace, "script-namespace", "project-signal", "Namespace containing immutable source script ConfigMaps")
 	cmd.Flags().StringVar(&cfg.runnerImage, "runner-image", "", "Digest-pinned certification runner image")
+	cmd.Flags().StringVar(&cfg.controllerImage, "controller-image", "", "Digest-pinned controller image recorded in evidence")
+	cmd.Flags().StringVar(&cfg.adapterImage, "adapter-image", "", "Digest-pinned adapter image included in execution plans")
+	cmd.Flags().StringVar(&cfg.workflowDigest, "workflow-template-digest", "", "SHA-256 digest of rendered WorkflowTemplate semantics")
+	cmd.Flags().BoolVar(
+		&cfg.gateProtected,
+		"qualification-gate-protected",
+		false,
+		"Allow protected qualification label projection after deployment verifies Node authorizer and NodeRestriction",
+	)
 	cmd.Flags().StringVar(&cfg.metricsAddress, "metrics-bind-address", ":8080", "Address for metrics")
 	cmd.Flags().StringVar(&cfg.probeAddress, "health-probe-bind-address", ":8081", "Address for health probes")
 	cmd.Flags().BoolVar(&cfg.leaderElect, "leader-elect", true, "Enable leader election")
@@ -76,6 +89,14 @@ func run(ctx context.Context, cfg config) error {
 	}
 
 	if err := projectsignal.ValidateRunnerImage(cfg.runnerImage); err != nil {
+		return err
+	}
+
+	if err := projectsignal.ValidateExecutionProvenance(
+		cfg.controllerImage,
+		cfg.adapterImage,
+		cfg.workflowDigest,
+	); err != nil {
 		return err
 	}
 
@@ -120,6 +141,8 @@ func run(ctx context.Context, cfg config) error {
 		Namespace:       cfg.namespace,
 		ScriptNamespace: cfg.scriptNamespace,
 		RunnerImage:     cfg.runnerImage,
+		AdapterImage:    cfg.adapterImage,
+		WorkflowDigest:  cfg.workflowDigest,
 		Recorder:        mgr.GetEventRecorder(controllerName),
 	}
 	if err := admission.SetupWithManager(mgr); err != nil {
@@ -131,10 +154,22 @@ func run(ctx context.Context, cfg config) error {
 		APIReader:         mgr.GetAPIReader(),
 		Evidence:          evidence,
 		MaxConcurrentRuns: cfg.maxConcurrentRuns,
+		ControllerImage:   cfg.controllerImage,
 		Recorder:          mgr.GetEventRecorder(controllerName),
 	}
 	if err := runs.SetupWithManager(mgr); err != nil {
 		return fmt.Errorf("register run reconciler: %w", err)
+	}
+
+	qualification := &projectsignal.QualificationReconciler{
+		Client:        mgr.GetClient(),
+		APIReader:     mgr.GetAPIReader(),
+		Evidence:      evidence,
+		Namespace:     cfg.namespace,
+		GateProtected: cfg.gateProtected,
+	}
+	if err := qualification.SetupWithManager(mgr); err != nil {
+		return fmt.Errorf("register qualification reconciler: %w", err)
 	}
 
 	if err := mgr.AddHealthzCheck("healthz", healthz.Ping); err != nil {

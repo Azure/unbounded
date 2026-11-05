@@ -94,7 +94,7 @@ func projectTerminal(
 		switch run.Status.Phase {
 		case signalv1.RunPhaseSucceeded:
 			node.Labels[StateLabel] = "passed"
-			node.Labels[EligibilityLabel] = "production"
+			delete(node.Labels, EligibilityLabel)
 
 			if !projectionTimeAfter(node.Annotations[LastSuccessfulAtAnnotation], completedAt) {
 				node.Annotations[LastSuccessfulRunAnnotation] = boundedAnnotationValue(run.Name)
@@ -102,10 +102,10 @@ func projectTerminal(
 			}
 		case signalv1.RunPhaseFailed:
 			node.Labels[StateLabel] = "failed"
-			node.Labels[EligibilityLabel] = "blocked"
+			delete(node.Labels, EligibilityLabel)
 		default:
 			node.Labels[StateLabel] = "inconclusive"
-			node.Labels[EligibilityLabel] = "blocked"
+			delete(node.Labels, EligibilityLabel)
 		}
 
 		return nil
