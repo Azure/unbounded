@@ -58,7 +58,12 @@ pub(crate) fn network(count: usize) -> Vec<Rc<Signatures>> {
             .unwrap();
             keys.install_signing_identity(Arc::new(identity)).unwrap();
             let certificates = Rc::new(Certificates::new(cluster.clone(), keys.clone()));
-            Rc::new(Signatures::new(keys, certificates, Rc::new(NoMac)))
+            Rc::new(Signatures::new(
+                keys,
+                certificates,
+                Rc::new(NoMac),
+                uring_runtime::environment::Environment::current().worker_ctx(),
+            ))
         })
         .collect()
 }
@@ -632,7 +637,12 @@ fn credential_policy_runs_after_profile_checks_before_signature_verification() {
 
     let n = network(2);
     let policy = Rc::new(Reject(std::cell::Cell::new(0)));
-    let verifier = Signatures::new(n[1].keys.clone(), n[1].certificates.clone(), policy.clone());
+    let verifier = Signatures::new(
+        n[1].keys.clone(),
+        n[1].certificates.clone(),
+        policy.clone(),
+        uring_runtime::environment::Environment::current().worker_ctx(),
+    );
     let mut signed = n[0].sign(head()).unwrap();
     signed.signature[0] ^= 1;
     assert!(matches!(

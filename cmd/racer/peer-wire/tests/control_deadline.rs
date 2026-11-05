@@ -60,7 +60,12 @@ fn signatures() -> Signatures {
     .unwrap();
     keys.install_signing_identity(Arc::new(identity)).unwrap();
     let certificates = Rc::new(Certificates::new(cluster, keys.clone()));
-    Signatures::new(keys, certificates, Rc::new(NoMac))
+    Signatures::new(
+        keys,
+        certificates,
+        Rc::new(NoMac),
+        uring_runtime::environment::Environment::current().worker_ctx(),
+    )
 }
 
 fn binding(deadline: u64) -> Binding {

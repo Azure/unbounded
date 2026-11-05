@@ -148,7 +148,7 @@ impl Binding {
         previous: &[u8; 32],
         length: usize,
     ) -> Result<(VerifiedHead, Phase)> {
-        if decode_deadline(self.deadline)?.0 <= uring_runtime::environment::now() {
+        if decode_deadline(self.deadline)?.0 <= signatures.ctx().clock.now() {
             return Err(Error::DeadlineExceeded);
         }
         let kind = field(&signed.head, "racer-kind")?;

@@ -127,6 +127,9 @@ pub struct Signatures {
     certificates: Rc<Certificates>,
 
     request_mac: Rc<dyn RequestMac>,
+
+    /// Worker clock and entropy for timestamps, deadlines, and challenges.
+    ctx: racer_io::WorkerCtx,
 }
 
 /// Unverified signed HTTP provenance, excluding payload bytes.
@@ -177,12 +180,19 @@ impl Signatures {
         keys: Rc<Keyring>,
         certificates: Rc<Certificates>,
         request_mac: Rc<dyn RequestMac>,
+        ctx: racer_io::WorkerCtx,
     ) -> Self {
         Self {
             keys,
             certificates,
             request_mac,
+            ctx,
         }
+    }
+
+    /// Worker clock and entropy used by this signer and its sessions.
+    pub fn ctx(&self) -> &racer_io::WorkerCtx {
+        &self.ctx
     }
 
     /// Return the local authenticated node identity.
@@ -222,7 +232,7 @@ impl Signatures {
         push(
             &mut head,
             "racer-timestamp",
-            millis(uring_runtime::environment::wall_now())?,
+            millis(self.ctx.clock.wall_now())?,
         );
         self.request_mac.sign(&self.keys, &mut head)?;
         let input = signature_input(&head)?;
@@ -261,7 +271,7 @@ impl Signatures {
         signed: &SignedHead,
         deadline: u64,
     ) -> Result<VerifiedPeer> {
-        if deadline <= millis(uring_runtime::environment::wall_now())? {
+        if deadline <= millis(self.ctx.clock.wall_now())? {
             return Err(Error::DeadlineExceeded);
         }
         if field(&signed.head, "racer-kind")? != "request"
@@ -298,7 +308,7 @@ impl Signatures {
         let timestamp = UNIX_EPOCH
             .checked_add(Duration::from_millis(number(head, "racer-timestamp")?))
             .ok_or(Error::Unauthorized)?;
-        let now = uring_runtime::environment::wall_now();
+        let now = self.ctx.clock.wall_now();
         if timestamp
             > now
                 .checked_add(Duration::from_secs(5))
@@ -566,7 +576,7 @@ pub fn push_binary(head: &mut MessageHead, name: &str, bytes: &[u8]) {
 }
 /// Map a wall-clock timestamp to canonical milliseconds.
 pub fn millis(time: SystemTime) -> Result<u64> {
-    uring_runtime::environment::unix_millis(time).map_err(Into::into)
+    racer_io::ctx::unix_millis(time).map_err(Into::into)
 }
 /// Encode a deadline using the environment's stable clock mapping.
 pub fn encode_deadline(deadline: Deadline) -> Result<u64> {

@@ -99,6 +99,8 @@ impl Signatures {
                 keys,
                 certificates,
                 Rc::new(RequestMac),
+                // MIGRATION: the thread environment until workers receive a WorkerCtx.
+                uring_runtime::environment::Environment::current().worker_ctx(),
             )),
         }
     }

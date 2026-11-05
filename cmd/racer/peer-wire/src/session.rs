@@ -74,13 +74,13 @@ impl Session {
     fn new(signatures: Rc<Signatures>, peer: NodeId, id: [u8; 32], direction: u8) -> Self {
         Self {
             state: SessionState {
-                signatures,
                 peer,
                 id,
                 direction,
                 tx: 0,
                 rx: 0,
-                expires: uring_runtime::environment::now() + Duration::from_secs(3600),
+                expires: signatures.ctx().clock.now() + Duration::from_secs(3600),
+                signatures,
             },
         }
     }
@@ -91,7 +91,7 @@ impl Session {
     }
 
     fn check(&self) -> Result<()> {
-        if uring_runtime::environment::now() >= self.state.expires {
+        if self.state.signatures.ctx().clock.now() >= self.state.expires {
             return Err(Error::DeadlineExceeded);
         }
         Ok(())
@@ -193,7 +193,7 @@ where
     }
     let scope = C::handshake_scope(parent)?;
     let io = &io.capped(65536);
-    let a = random()?;
+    let a = random(&signatures.ctx().rng)?;
     let response = io
         .exchange_head(
             connection,
@@ -265,7 +265,7 @@ where
         return Err(Error::Unauthorized.into());
     }
     scope.check()?;
-    let b = random()?;
+    let b = random(&signatures.ctx().rng)?;
     connection = io
         .send_head(
             incoming.connection,
@@ -321,9 +321,9 @@ fn signature(head: &MessageHead) -> Result<Vec<u8>> {
     decode_binary(value.as_bytes())
 }
 
-fn random() -> Result<[u8; 32]> {
+fn random(rng: &racer_io::Rng) -> Result<[u8; 32]> {
     let mut bytes = [0; 32];
-    uring_runtime::environment::fill_random(&mut bytes).map_err(|_| Error::Unavailable)?;
+    rng.fill(&mut bytes).map_err(|_| Error::Unavailable)?;
     Ok(bytes)
 }
 
@@ -426,9 +426,9 @@ pub mod test_util {
         Session::new(signatures, peer, id, direction)
     }
 
-    /// Generate one challenge using the active environment.
+    /// Generate one challenge from operating-system entropy.
     pub fn random() -> Result<[u8; 32]> {
-        super::random()
+        super::random(&racer_io::Rng::os())
     }
 
     /// Reconstruct the challenge transcript for regression assertions.
@@ -513,8 +513,12 @@ mod tests {
             expected: std::cell::Cell::new(std::ptr::null()),
             calls: std::cell::Cell::new(0),
         });
-        let verifier =
-            Signatures::new(n[1].keys.clone(), n[1].certificates.clone(), policy.clone());
+        let verifier = Signatures::new(
+            n[1].keys.clone(),
+            n[1].certificates.clone(),
+            policy.clone(),
+            uring_runtime::environment::Environment::current().worker_ctx(),
+        );
         for response in [false, true] {
             let phase = if response { "challenge" } else { "hello" };
             let mut head =
@@ -583,7 +587,7 @@ mod tests {
     #[test]
     fn duplicate_wrong_session_direction_identity_and_forged_high_sequence() {
         let n = crate::tests::network(2);
-        let id = random().unwrap();
+        let id = test_util::random().unwrap();
         let mut a = Session::new(n[0].clone(), n[1].node().clone(), id, 0);
         let mut b = Session::new(n[1].clone(), n[0].node().clone(), id, 1);
         let valid = a.sign(frame()).unwrap();
@@ -622,14 +626,19 @@ mod tests {
     #[test]
     fn reconnect_restart_expiry_and_counter_overflow_fail_closed() {
         let n = crate::tests::network(2);
-        let id = random().unwrap();
+        let id = test_util::random().unwrap();
         let mut a = Session::new(n[0].clone(), n[1].node().clone(), id, 0);
         let mut b = Session::new(n[1].clone(), n[0].node().clone(), id, 1);
         let old = a.sign(frame()).unwrap();
-        let mut reconnected = Session::new(n[1].clone(), n[0].node().clone(), random().unwrap(), 1);
+        let mut reconnected = Session::new(
+            n[1].clone(),
+            n[0].node().clone(),
+            test_util::random().unwrap(),
+            1,
+        );
         assert!(reconnected.admit(copy(&old)).is_err());
         assert_eq!(reconnected.state.rx, 0);
-        b.state.expires = uring_runtime::environment::now();
+        b.state.expires = b.state.signatures.ctx().clock.now();
         assert!(matches!(b.admit(old), Err(Error::DeadlineExceeded)));
         a.state.tx = u64::MAX;
         assert!(matches!(a.sign(frame()), Err(Error::Replay)));
