@@ -2201,7 +2201,6 @@ mod tests {
             let share = config.admission_history_per_worker(workers).unwrap();
             let policy = crate::retention::Retention::configured(
                 share,
-                1,
                 config.admission_period,
                 true,
                 racer_io::Clock::host(),

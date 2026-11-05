@@ -269,14 +269,12 @@ struct State {
     history: SecondSight,
 }
 impl Retention {
-    /// `heat_entries` is unused: read heat lives on the disk index per segment.
-    pub fn new(history_bytes: usize, heat_entries: usize, clock: racer_io::Clock) -> Result<Self> {
-        Self::configured(history_bytes, heat_entries, PERIOD, true, clock)
+    pub fn new(history_bytes: usize, clock: racer_io::Clock) -> Result<Self> {
+        Self::configured(history_bytes, PERIOD, true, clock)
     }
     /// History rotation starts at the clock's current time.
     pub fn configured(
         history_bytes: usize,
-        _heat_entries: usize,
         period: Duration,
         enabled: bool,
         clock: racer_io::Clock,
@@ -631,7 +629,7 @@ mod tests {
         let sim_env = clock.environment(0);
         let _environment = sim_env.enter();
         let sim_ctx = sim_env.worker_ctx();
-        let policy = Rc::new(Retention::new(4096, 1, sim_ctx.clock.clone()).unwrap());
+        let policy = Rc::new(Retention::new(4096, sim_ctx.clock.clone()).unwrap());
         let id = |n: &str| CacheId(n.into());
         let def = |n: &str, priority: u16| CacheDefinition {
             id: id(n),
@@ -683,7 +681,7 @@ mod tests {
         let sim_env = clock.environment(0);
         let _environment = sim_env.enter();
         let sim_ctx = sim_env.worker_ctx();
-        let policy = Rc::new(Retention::new(4096, 1, sim_ctx.clock.clone()).unwrap());
+        let policy = Rc::new(Retention::new(4096, sim_ctx.clock.clone()).unwrap());
         let id = |n: &str| CacheId(n.into());
         let def = |n: &str, priority: u16| CacheDefinition {
             id: id(n),
@@ -779,7 +777,7 @@ mod tests {
         let sim_env = clock.environment(0);
         let _environment = sim_env.enter();
         let sim_ctx = sim_env.worker_ctx();
-        let policy = Rc::new(Retention::new(4096, 1, sim_ctx.clock.clone()).unwrap());
+        let policy = Rc::new(Retention::new(4096, sim_ctx.clock.clone()).unwrap());
         let id = |n: usize| CacheId(format!("c{n:04}"));
         let def = |n: usize, priority: u16| CacheDefinition {
             id: id(n),
@@ -884,7 +882,7 @@ mod tests {
         let sim_env = clock.environment(0);
         let _environment = sim_env.enter();
         let sim_ctx = sim_env.worker_ctx();
-        let policy = Retention::new(4096, 1, sim_ctx.clock.clone()).unwrap();
+        let policy = Retention::new(4096, sim_ctx.clock.clone()).unwrap();
         let owned = Rc::new(Cell::new(true));
         let calls = Rc::new(Cell::new(0));
         policy.set_ownership_pass(Rc::new({
@@ -916,8 +914,7 @@ mod tests {
         policy.set_ownership(Rc::new(|_| true));
         assert_eq!(policy.scoring_at(now, u64::MAX).score(&page(1), 0), 1);
         assert_eq!(calls.get(), 2);
-        let disabled =
-            Retention::configured(4096, 1, PERIOD, false, sim_ctx.clock.clone()).unwrap();
+        let disabled = Retention::configured(4096, PERIOD, false, sim_ctx.clock.clone()).unwrap();
         disabled.set_ownership(Rc::new(|_| true));
         assert_eq!(disabled.scoring_at(now, u64::MAX).score(&page(0), 3), 0);
     }
@@ -935,7 +932,7 @@ mod tests {
     }
     #[test]
     fn disk_observability_samples_current_class_without_scrape_classification() {
-        let policy = Rc::new(Retention::new(4096, 2, racer_io::Clock::host()).unwrap());
+        let policy = Rc::new(Retention::new(4096, racer_io::Clock::host()).unwrap());
         let owned = Rc::new(Cell::new(false));
         let current = owned.clone();
         let calls = Rc::new(Cell::new(0));
@@ -972,7 +969,7 @@ mod tests {
     }
     #[test]
     fn readers_latch_before_insert_and_retries_do_not_promote() {
-        let policy = Retention::new(32, 1, racer_io::Clock::host()).unwrap();
+        let policy = Retention::new(32, racer_io::Clock::host()).unwrap();
         let first = Interest::default();
         assert!(!policy.observe(&page(0), &first).eligible());
         for n in 1..1000 {
@@ -989,7 +986,7 @@ mod tests {
     fn rotation_retains_three_to_four_minutes_and_clears_long_idle() {
         for period in [Duration::from_secs(60), Duration::from_millis(10)] {
             let policy =
-                Retention::configured(4096, 1, period, true, racer_io::Clock::host()).unwrap();
+                Retention::configured(4096, period, true, racer_io::Clock::host()).unwrap();
             let start = racer_io::Clock::host().now();
             let first = Interest::default();
             assert!(!policy.observe_at(&page(0), &first, start).eligible());
@@ -999,7 +996,7 @@ mod tests {
                     .eligible()
             );
             let retained =
-                Retention::configured(4096, 1, period, true, racer_io::Clock::host()).unwrap();
+                Retention::configured(4096, period, true, racer_io::Clock::host()).unwrap();
             retained.observe_at(&page(0), &Interest::default(), start);
             assert!(
                 retained
@@ -1015,8 +1012,7 @@ mod tests {
     }
     #[test]
     fn disabled_is_owned_only_and_metrics_count_once() {
-        let policy =
-            Retention::configured(4096, 1, PERIOD, false, racer_io::Clock::host()).unwrap();
+        let policy = Retention::configured(4096, PERIOD, false, racer_io::Clock::host()).unwrap();
         for _ in 0..10 {
             assert!(!policy.observe(&page(0), &Interest::default()).eligible());
         }
@@ -1034,12 +1030,12 @@ mod tests {
         assert_eq!(snapshot.persistence_accepted, 1);
         assert_eq!(snapshot.filter_set_bits, 0);
         assert!(
-            Retention::configured(4096, 1, Duration::ZERO, true, racer_io::Clock::host()).is_err()
+            Retention::configured(4096, Duration::ZERO, true, racer_io::Clock::host()).is_err()
         );
     }
     #[test]
     fn full_identity_and_memory_bounds() {
-        let policy = Retention::new(4096, 2, racer_io::Clock::host()).unwrap();
+        let policy = Retention::new(4096, racer_io::Clock::host()).unwrap();
         let a = page(0);
         let mut b = a.clone();
         b.version.etag = crate::model::StrongEtag::test_value("v2");
@@ -1049,6 +1045,6 @@ mod tests {
             policy.observe(&page(n), &Interest::default());
         }
         assert_eq!(policy.snapshot().filter_bits, 4096 * 8);
-        assert!(Retention::new(31, 1, racer_io::Clock::host()).is_err());
+        assert!(Retention::new(31, racer_io::Clock::host()).is_err());
     }
 }

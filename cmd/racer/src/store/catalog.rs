@@ -797,7 +797,7 @@ impl Index {
             availability,
             reserved: Cell::new(0),
             retention: RefCell::new(Rc::new(
-                Retention::new(256 * 1024, 65536 + 64, clock.clone())
+                Retention::new(256 * 1024, clock.clone())
                     .expect("valid bounded retention"),
             )),
             holds: RefCell::new(super::holds::Holds::new(&clock)),

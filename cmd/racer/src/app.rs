@@ -1936,9 +1936,6 @@ impl WorkerApplication {
         // writer, index, and segment clock all consult this same worker policy.
         writer.set_retention(Rc::new(crate::retention::Retention::configured(
             config.admission_history_per_worker(node.count)?,
-            disk_page_entries
-                .checked_add(limits.queue_entries.get())
-                .ok_or(Error::InvalidConfiguration)?,
             config.admission_period,
             config.admission_mode == crate::config::AdmissionMode::SecondSight,
             runtime.reactor.ctx().clock.clone(),
