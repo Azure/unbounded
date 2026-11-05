@@ -21,15 +21,16 @@ use racer_cluster_control::{
     rules::{
         admission::{Admit, Body, Poll, WriteQueue, body_for, start_poll},
         authz::{ApiBudget, AuthCache, Bindings, Reviewed, TokenKey},
-        primary::{Contend, Inventory, PassInputs, discovery, plan_pass},
+        primary::{Contend, Inventory, PassInputs, PassPlan, discovery, plan_pass},
         seat::{self as rules, Lottery, SeatRenew},
+        shell::{Effect, Event as ShellEvent, PutResult, Shell},
     },
     rules::{
         election::{self, LeaseObservation, LeaseSpec},
         keyring::Policy,
         members::{NodeInfo, Owner, Ownership, PodInfo, Readiness},
         publication::{Image, Record},
-        state::{self, StateError, StateRecord, Term, Writer},
+        state::{StateError, StateRecord, Term},
     },
 };
 use racer_control_wire::ProtocolFailure;
@@ -381,6 +382,10 @@ pub(crate) enum PodEv {
     /// A watched Pod changed: one debounced primary pass that does not
     /// reschedule.
     Wake,
+    /// The pass's state read answered.
+    PassRead,
+    /// The pass's state PUT answered.
+    PassPut,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -458,7 +463,31 @@ struct Pod {
     /// A primary Lease change arrived during that read.
     woken_during_read: bool,
     lease_fresh_until: Option<u64>,
-    primary: Option<Writer>,
+    /// The primary term's shell, while this Pod leads.
+    primary: Option<Shell>,
+    /// The primary pass in flight.
+    pass: Option<Box<Pass>>,
+    /// The state PUT in flight: the record and the resourceVersion it
+    /// replaces.
+    put: Option<(StateRecord, u64)>,
+    /// A wake arrived during the pass.
+    rewake: bool,
+    /// The image this Pod's primary serves (`shared::Serving::image`).
+    follower_image: Option<Image>,
+}
+
+/// One primary pass in flight.
+struct Pass {
+    /// Live seats, read at the pass start.
+    live: BTreeMap<usize, LeaseObservation>,
+    /// When the current read or PUT started.
+    started: u64,
+    /// State resourceVersion the last read returned.
+    read_rv: u64,
+    /// (sequence, membership version) the last read returned.
+    read_counters: Option<(u64, u64)>,
+    /// The plan's image, desired and eligible seats.
+    plan: Option<(Option<Image>, usize, usize)>,
 }
 
 /// Committed state as a seat follower holds it, the fields production
@@ -530,6 +559,10 @@ impl Pod {
             woken_during_read: false,
             lease_fresh_until: None,
             primary: None,
+            pass: None,
+            put: None,
+            rewake: false,
+            follower_image: None,
         }
     }
 }
@@ -616,6 +649,10 @@ pub struct ControlSim {
     committed: Option<StateRecord>,
     image: Option<Image>,
     commit_at: BTreeMap<u64, u64>,
+    /// The state Secret's resourceVersion (one per committed PUT).
+    state_rv: u64,
+    /// Pods holding a primary shell (normally at most one).
+    primaries: Vec<u32>,
     inventory: Inventory,
     ownership: Ownership,
     policy: Policy,
@@ -700,6 +737,8 @@ impl ControlSim {
             committed: None,
             image: None,
             commit_at: BTreeMap::new(),
+            state_rv: 1,
+            primaries: Vec::new(),
             inventory: Inventory {
                 nodes_synced: true,
                 pods_synced: true,
@@ -1646,7 +1685,7 @@ impl ControlSim {
         p.epoch += 1;
         p.seat = None;
         p.renew = None;
-        p.primary = None;
+        self.end_term(pod);
         if self.settings.node_monitor_grace_ns > 0 {
             let d = Duration::from_nanos(self.settings.node_monitor_grace_ns);
             self.after(d, pod, PodEv::NodeNotReady);
@@ -1724,17 +1763,19 @@ impl ControlSim {
             PodEv::PrimaryRenew => self.primary_renew(pod),
             PodEv::Reconcile => self.reconcile(pod, true),
             PodEv::Wake => self.reconcile(pod, false),
+            PodEv::PassRead => self.pass_read(pod),
+            PodEv::PassPut => self.pass_put(pod),
             PodEv::NodeNotReady => {}
         }
         // At most one Pod holds a fresh primary term with a writable fence.
         let now = self.engine.now();
+        let t = self.at(now);
         let fresh = self
-            .pods
+            .primaries
             .iter()
-            .filter(|p| {
-                p.alive
-                    && p.primary.as_ref().is_some_and(Writer::may_write)
-                    && p.lease_fresh_until.is_some_and(|t| t > now)
+            .filter(|q| {
+                let p = &self.pods[**q as usize];
+                p.alive && p.primary.as_ref().is_some_and(|s| s.fresh(t))
             })
             .count();
         self.invariants
@@ -1866,7 +1907,7 @@ impl ControlSim {
         if lost {
             p.seat = None;
             p.renew = None;
-            p.primary = None;
+            self.end_term(pod);
             return;
         }
         p.renew = Some(schedule);
@@ -1916,8 +1957,11 @@ impl ControlSim {
             transitions: self.primary.spec.transitions,
             holder: identity(pod),
         };
+        let claimed = self.at(ns);
         let p = &mut self.pods[pod as usize];
-        p.primary = Some(Writer::new(term));
+        p.primary = Some(Shell::new(term, claimed));
+        self.primaries.retain(|q| *q != pod);
+        self.primaries.push(pod);
         p.contend.term_ended();
         // In-memory, per term, like `primary.rs`.
         self.membership_changed = None;
@@ -1956,8 +2000,12 @@ impl ControlSim {
         }
         self.api_calls(1);
         if self.primary.holder != Some(pod) {
-            self.pods[pod as usize].primary = None;
+            self.end_term(pod);
             return;
+        }
+        let started = self.at(self.engine.now());
+        if let Some(shell) = self.pods[pod as usize].primary.as_mut() {
+            shell.renewed(started);
         }
         self.primary.rv += 1;
         self.primary.spec = election::renew(&self.primary.spec, &self.wall_micro());
@@ -1965,24 +2013,32 @@ impl ControlSim {
         self.after(limits::LEASE_RENEW, pod, PodEv::PrimaryRenew);
     }
 
-    /// One primary pass. A `periodic` pass schedules the next one.
+    /// Start one primary pass. A `periodic` pass schedules the next one.
+    /// The pass runs as production's `primary.rs` `reconcile` loop
+    /// (cluster-control/src/primary.rs:545-723): the real [`Shell`] decides
+    /// every step, and its state read and PUT each take an API round trip, so
+    /// another term can write in between (a CAS conflict re-reads and
+    /// re-plans) and the Lease can go stale before the PUT (`recheck`).
     fn reconcile(&mut self, pod: u32, periodic: bool) {
         if self.pods[pod as usize].primary.is_none() {
-            return;
-        }
-        // Seat reads, primary Lease and state reads.
-        self.api_calls(annotations::MAX_SEATS as u64 + 2);
-        let ns = self.engine.now();
-        let current = self.committed.clone();
-        let lease_uid = format!("lease-{}", self.primary.uid);
-        let writer = self.pods[pod as usize].primary.as_mut().expect("primary");
-        if writer.observe(current.as_ref(), Some(&lease_uid)).is_err() {
-            self.pods[pod as usize].primary = None;
             return;
         }
         if periodic {
             self.after(limits::LEASE_RENEW, pod, PodEv::Reconcile);
         }
+        if self.pods[pod as usize].pass.is_some() {
+            // One pass at a time (`lead` runs them in a loop); a wake during
+            // it runs another once it ends.
+            self.pods[pod as usize].rewake = true;
+            return;
+        }
+        let effect = self.pods[pod as usize]
+            .primary
+            .as_mut()
+            .expect("primary")
+            .begin();
+        // Seat reads and the DaemonSet GET (primary.rs:551-576).
+        self.api_calls(annotations::MAX_SEATS as u64 + 1);
         let live: BTreeMap<usize, LeaseObservation> = self
             .seats
             .iter()
@@ -1994,7 +2050,97 @@ impl ControlSim {
             })
             .map(|(i, s)| (i, self.observe(&s.lease, annotations::seat_lease(i))))
             .collect();
-        let Ok(plan) = plan_pass(
+        self.pods[pod as usize].pass = Some(Box::new(Pass {
+            live,
+            started: 0,
+            read_rv: 0,
+            read_counters: None,
+            plan: None,
+        }));
+        self.metrics.incr("ctl_passes");
+        self.pass_effect(pod, effect);
+    }
+
+    /// Perform one [`Effect`] of `pod`'s pass (primary.rs:597-721).
+    fn pass_effect(&mut self, pod: u32, effect: Effect) {
+        let ns = self.engine.now();
+        match effect {
+            Effect::ReadState => {
+                // The state GET, and the live Lease UID when the record was
+                // stamped under another Lease, answer one round trip later.
+                self.pods[pod as usize].pass.as_mut().expect("pass").started = ns;
+                self.api_calls(1);
+                let d = self.settings.api_latency_ns;
+                self.schedule(ns + d, pod, PodEv::PassRead);
+            }
+            Effect::Plan => self.pass_plan(pod),
+            Effect::Put(next) => {
+                // Recheck right before the write (primary.rs:682-684).
+                let shell = self.pods[pod as usize].primary.as_ref().expect("primary");
+                if let Err(e) = shell.recheck(self.at(ns)) {
+                    self.metrics.incr("ctl_put_refused_stale");
+                    return self.pass_effect(pod, Effect::Abort(e));
+                }
+                self.api_calls(1);
+                let p = &mut self.pods[pod as usize];
+                let pass = p.pass.as_mut().expect("pass");
+                pass.started = ns;
+                p.put = Some((*next, pass.read_rv));
+                let d = self.settings.api_latency_ns;
+                self.schedule(ns + d, pod, PodEv::PassPut);
+            }
+            Effect::Settle {
+                record,
+                confirmed,
+                committed,
+            } => self.pass_settle(pod, record.map(|r| *r), confirmed, committed),
+            Effect::Done => self.pass_end(pod),
+            Effect::Abort(e) => {
+                self.metrics.incr("ctl_pass_aborts");
+                self.engine.trace.record(ns, 0xC5, u64::from(pod), e as u64);
+                if e.fails_closed() {
+                    // `lead` stops the term and `seat::fail_closed` drops
+                    // the served state (primary.rs:195-208, seat.rs:695).
+                    self.metrics.incr("ctl_fail_closed");
+                    self.end_term(pod);
+                    let p = &mut self.pods[pod as usize];
+                    (p.follower.record, p.follower.confirmed, p.follower.image) =
+                        (None, None, None);
+                }
+                self.pass_end(pod);
+            }
+        }
+    }
+
+    /// The state read answered: the record as of now, read at `started`.
+    fn pass_read(&mut self, pod: u32) {
+        let current = self.committed.clone();
+        let lease_uid = format!("lease-{}", self.primary.uid);
+        let p = &mut self.pods[pod as usize];
+        let (Some(shell), Some(pass)) = (p.primary.as_mut(), p.pass.as_mut()) else {
+            return;
+        };
+        pass.read_counters = current.as_ref().map(|c| (c.sequence, c.membership_version));
+        pass.read_rv = self.state_rv;
+        let live_uid = shell.needs_live_uid(current.as_ref()).then_some(lease_uid);
+        let started = self.base + Duration::from_nanos(pass.started);
+        let effect = shell.on(ShellEvent::StateRead {
+            started,
+            current: Ok(current),
+            high_water: p.follower.high_water.as_ref(),
+            live_lease_uid: live_uid.as_deref(),
+        });
+        self.pass_effect(pod, effect);
+    }
+
+    /// Plan the pass with the real `plan_pass` on the shell's read.
+    fn pass_plan(&mut self, pod: u32) {
+        let ns = self.engine.now();
+        let p = &self.pods[pod as usize];
+        let (Some(shell), Some(pass)) = (p.primary.as_ref(), p.pass.as_ref()) else {
+            return;
+        };
+        let plan = plan_pass(
             &PassInputs {
                 cluster: &self.cluster,
                 pod_uid: &uuid(u64::from(pod), 1),
@@ -2004,57 +2150,147 @@ impl ControlSim {
                 inventory: &self.inventory,
                 synced: self.inventory.synced(),
                 ownership: &self.ownership,
-                current: current.as_ref(),
-                previous_image: self.image.as_ref(),
-                live: &live,
-                writer: self.pods[pod as usize].primary.as_ref().expect("primary"),
+                current: shell.current(),
+                previous_image: p.follower_image.as_ref(),
+                live: &pass.live,
+                writer: shell.writer(),
                 wall_unix: self.wall_secs(),
                 membership_changed_unix: self.membership_changed,
             },
             &mut self.rng,
-        ) else {
+        );
+        let plan = match plan {
+            Ok(plan) => plan,
+            Err(e) => return self.pass_effect(pod, Effect::Abort(e)),
+        };
+        let PassPlan {
+            next,
+            image,
+            desired,
+            eligible,
+            changed,
+            ..
+        } = plan;
+        let now = self.at(ns);
+        let p = &mut self.pods[pod as usize];
+        p.pass.as_mut().expect("pass").plan = Some((image, desired, eligible));
+        let effect = p
+            .primary
+            .as_mut()
+            .expect("primary")
+            .on(ShellEvent::Planned {
+                now,
+                next: changed.then_some(next),
+            });
+        self.pass_effect(pod, effect);
+    }
+
+    /// The PUT answered: a compare-and-swap on the resourceVersion the last
+    /// read returned.
+    fn pass_put(&mut self, pod: u32) {
+        let p = &mut self.pods[pod as usize];
+        let (Some((next, rv)), Some(pass)) = (p.put.take(), p.pass.as_ref()) else {
             return;
         };
+        let started = self.base + Duration::from_nanos(pass.started);
+        let result = if rv == self.state_rv {
+            self.state_rv += 1;
+            self.committed = Some(next);
+            PutResult::Ok
+        } else {
+            self.metrics.incr("ctl_put_conflicts");
+            PutResult::Conflict
+        };
+        let effect = self.pods[pod as usize]
+            .primary
+            .as_mut()
+            .expect("primary")
+            .on(ShellEvent::PutDone { started, result });
+        self.pass_effect(pod, effect);
+    }
+
+    /// `pod`'s primary term ended: drop its shell and any pass in flight.
+    fn end_term(&mut self, pod: u32) {
+        let p = &mut self.pods[pod as usize];
+        p.primary = None;
+        p.pass = None;
+        p.put = None;
+        p.rewake = false;
+        self.primaries.retain(|q| *q != pod);
+    }
+
+    fn pass_end(&mut self, pod: u32) {
+        let p = &mut self.pods[pod as usize];
+        p.pass = None;
+        p.put = None;
+        if std::mem::take(&mut p.rewake) && p.primary.is_some() {
+            self.after(DEBOUNCE, pod, PodEv::Wake);
+        }
+    }
+
+    /// Settle the pass (primary.rs:696-718): bookkeeping for a commit,
+    /// install the record and image the primary serves, publish discovery.
+    fn pass_settle(
+        &mut self,
+        pod: u32,
+        record: Option<StateRecord>,
+        confirmed: Instant,
+        committed: bool,
+    ) {
+        let ns = self.engine.now();
+        let mut pass = self.pods[pod as usize].pass.take().expect("pass");
+        let (image, desired, eligible) = pass.plan.take().unwrap_or((None, 0, 0));
         let mut published = false;
-        if plan.changed
-            && current
-                .as_ref()
-                .is_none_or(|c| state::check_monotonic(c, &plan.next).is_ok())
+        if let Some(r) = &record
+            && committed
         {
-            self.api_calls(1);
             self.metrics.incr("ctl_commits");
-            if current
-                .as_ref()
-                .is_none_or(|c| c.membership_version != plan.next.membership_version)
+            if pass
+                .read_counters
+                .is_none_or(|(_, m)| m != r.membership_version)
             {
                 self.membership_changed = Some(self.wall_secs());
             }
             // A new sequence goes on the primary Lease
             // (`annotations::SEQUENCE`), which wakes the seat followers.
-            published = current
-                .as_ref()
-                .is_none_or(|c| c.sequence != plan.next.sequence);
-            self.committed = Some(plan.next);
+            published = pass.read_counters.is_none_or(|(s, _)| s != r.sequence);
         }
-        if let Some(image) = plan.image
-            && self
-                .committed
-                .as_ref()
-                .is_some_and(|r| r.sequence == image.record.sequence)
-        {
-            self.image = Some(image);
+        if let Some(r) = record {
+            let f = &mut self.pods[pod as usize].follower;
+            if let Err(e) = f.install(r.clone(), confirmed) {
+                self.pods[pod as usize].pass = Some(pass);
+                return self.pass_effect(pod, Effect::Abort(e));
+            }
+            if let Some(i) = image
+                && i.record.sequence == r.sequence
+                && i.record.content_hash == r.content_hash
+            {
+                f.install_image(i.record.clone());
+                self.pods[pod as usize].follower_image = Some(i.clone());
+                if self
+                    .committed
+                    .as_ref()
+                    .is_some_and(|c| c.sequence == r.sequence)
+                {
+                    self.image = Some(i);
+                }
+            }
         }
         if published {
             let seq = self.committed.as_ref().expect("committed").sequence;
             self.commit_at.insert(seq, ns);
             self.committed_at(ns);
         }
-        let sequence = self.committed.as_ref().map(|r| r.sequence);
-        let d = discovery(&live, plan.desired, plan.eligible, sequence, None);
+        let sequence = self.pods[pod as usize]
+            .follower
+            .record
+            .as_ref()
+            .map(|r| r.sequence);
+        let d = discovery(&pass.live, desired, eligible, sequence, None);
         let desired = d.extra[annotations::SEATS]
             .as_deref()
             .and_then(|v| v.parse().ok())
-            .unwrap_or(plan.desired);
+            .unwrap_or(desired);
         let nodes: Vec<String> = d.extra[annotations::SEAT_NODES]
             .as_deref()
             .and_then(|v| serde_json::from_str(v).ok())
@@ -2075,15 +2311,8 @@ impl ControlSim {
             self.primary.rv += 1;
             self.primary_changed();
         }
-        // The primary serves its own image.
-        if let Some(r) = self.committed.clone() {
-            let now = self.at(ns);
-            let f = &mut self.pods[pod as usize].follower;
-            let _ = f.install(r, now);
-            if let Some(i) = &self.image {
-                f.install_image(i.record.clone());
-            }
-        }
+        self.pods[pod as usize].pass = None;
+        self.pass_end(pod);
     }
 
     /// Schedule `pod`'s next follower read at `at`, superseding any other.
@@ -2556,7 +2785,7 @@ mod tests {
     #[test]
     fn follower_installs_and_serves() {
         let record = |sequence: u64| StateRecord {
-            version: state::VERSION,
+            version: racer_cluster_control::rules::state::VERSION,
             cluster: "c".into(),
             sequence,
             membership_version: sequence,
@@ -2863,5 +3092,80 @@ mod tests {
         sim.advance_to(sim.engine.now() + 60 * S);
         assert!(mv(&sim) > v);
         assert_eq!(sim.seat_served(99), None);
+    }
+
+    /// A converged 20-Pod cluster and its primary.
+    fn converged() -> (ControlSim, u32) {
+        let settings = Settings {
+            pods: 21,
+            initial_pods: 20,
+            report_at_start: true,
+            ..Settings::default()
+        };
+        let mut sim = ControlSim::new(settings, 3, Vec::new());
+        sim.advance_to(120 * SECONDS);
+        let p = sim.primary.holder.expect("primary");
+        assert!(sim.committed.is_some());
+        (sim, p)
+    }
+
+    /// Step events until `done`.
+    fn step_until(sim: &mut ControlSim, done: impl Fn(&ControlSim) -> bool) {
+        while !done(sim) {
+            let t = sim.engine.next_at().expect("events");
+            sim.advance_to(t);
+        }
+    }
+
+    #[test]
+    fn a_put_conflict_rereads_and_replans() {
+        let (mut sim, p) = converged();
+        let seq = sim.committed.as_ref().unwrap().sequence;
+        sim.add_client();
+        sim.reconcile(p, false);
+        step_until(&mut sim, |s| s.pods[p as usize].put.is_some());
+        // Another writer moved the resourceVersion under the PUT.
+        sim.state_rv += 1;
+        step_until(&mut sim, |s| s.pods[p as usize].pass.is_none());
+        assert_eq!(sim.metrics.get("ctl_put_conflicts"), 1);
+        assert_eq!(sim.metrics.get("ctl_pass_aborts"), 0);
+        assert!(sim.committed.as_ref().unwrap().sequence > seq);
+        assert_eq!(sim.primary.holder, Some(p));
+    }
+
+    #[test]
+    fn a_stale_lease_refuses_the_put_and_fails_closed() {
+        let (mut sim, p) = converged();
+        let seq = sim.committed.as_ref().unwrap().sequence;
+        sim.add_client();
+        // The last successful renewal started longer ago than the Lease
+        // freshness: the planned write must not go out.
+        let term = sim.pods[p as usize]
+            .primary
+            .as_ref()
+            .unwrap()
+            .term()
+            .clone();
+        let stale = sim.at(sim.engine.now()) - limits::LEASE_FRESHNESS - Duration::from_secs(1);
+        sim.pods[p as usize].primary = Some(Shell::new(term, stale));
+        sim.reconcile(p, false);
+        step_until(&mut sim, |s| s.pods[p as usize].pass.is_none());
+        assert_eq!(sim.metrics.get("ctl_fail_closed"), 1);
+        assert!(sim.pods[p as usize].primary.is_none());
+        assert!(sim.pods[p as usize].follower.record.is_none());
+        assert_eq!(sim.committed.as_ref().unwrap().sequence, seq);
+    }
+
+    #[test]
+    fn a_rolled_back_record_fails_closed() {
+        let (mut sim, p) = converged();
+        // The Secret went behind what this process accepted.
+        let r = sim.committed.as_mut().unwrap();
+        r.sequence -= 1;
+        sim.state_rv += 1;
+        sim.reconcile(p, false);
+        step_until(&mut sim, |s| s.pods[p as usize].pass.is_none());
+        assert_eq!(sim.metrics.get("ctl_fail_closed"), 1);
+        assert!(sim.pods[p as usize].primary.is_none());
     }
 }
