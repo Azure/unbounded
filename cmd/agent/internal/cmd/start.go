@@ -20,6 +20,8 @@ import (
 )
 
 func newCmdStart(cmdCtx *CommandContext) *cobra.Command {
+	var overrides *configOverrides
+
 	cmd := &cobra.Command{
 		Use:   "start",
 		Short: "Bootstrap the host, rootfs, and start the node",
@@ -39,7 +41,7 @@ func newCmdStart(cmdCtx *CommandContext) *cobra.Command {
 				return err
 			}
 
-			cfg, err := loadConfig(cmdCtx.Logger)
+			cfg, err := loadConfigWith(cmdCtx.Logger, *overrides)
 			if err != nil {
 				return err
 			}
@@ -73,6 +75,8 @@ func newCmdStart(cmdCtx *CommandContext) *cobra.Command {
 			return nil
 		},
 	}
+
+	overrides = addIsolationFlag(cmd)
 
 	return cmd
 }

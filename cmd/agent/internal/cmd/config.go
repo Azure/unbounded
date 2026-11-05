@@ -10,7 +10,10 @@ import (
 	"os"
 	"strings"
 
+	"github.com/spf13/cobra"
+
 	"github.com/Azure/unbounded/internal/provision"
+	"github.com/Azure/unbounded/pkg/agent/isolation"
 )
 
 const configFileEnv = "UNBOUNDED_AGENT_CONFIG_FILE"
@@ -24,11 +27,52 @@ func requiredEnv(n string) (string, error) {
 	return v, nil
 }
 
+// configOverrides are command line values that take precedence over the
+// loaded configuration. The zero value overrides nothing.
+type configOverrides struct {
+	// Isolation, when set, replaces the configuration's Isolation.
+	Isolation string
+}
+
+// addIsolationFlag registers --isolation on cmd and returns the overrides the
+// flag fills in. The flag is validated when the configuration is loaded, so a
+// bad value is reported the same way as a bad Isolation in the config file.
+func addIsolationFlag(cmd *cobra.Command) *configOverrides {
+	ov := &configOverrides{}
+
+	cmd.Flags().StringVar(&ov.Isolation, "isolation", "",
+		"Isolation mode for the node stack: nspawn or none (overrides the config file; default nspawn)")
+
+	return ov
+}
+
+// apply sets the overridden values on cfg and rejects an invalid mode.
+func (o configOverrides) apply(cfg *provision.UnboundedAgentConfig) error {
+	if o.Isolation == "" {
+		return nil
+	}
+
+	mode, err := isolation.ParseMode(o.Isolation)
+	if err != nil {
+		return fmt.Errorf("invalid --isolation: %w", err)
+	}
+
+	cfg.Isolation = string(mode)
+
+	return nil
+}
+
 // loadConfig returns an AgentConfig populated from the JSON file pointed to by
 // UNBOUNDED_AGENT_CONFIG_FILE.  When that variable is unset the function falls
 // back to the legacy per-field environment variables so that existing
 // deployments keep working without changes.
 func loadConfig(log *slog.Logger) (*provision.UnboundedAgentConfig, error) {
+	return loadConfigWith(log, configOverrides{})
+}
+
+// loadConfigWith is loadConfig with command line overrides applied before the
+// configuration is normalized.
+func loadConfigWith(log *slog.Logger, ov configOverrides) (*provision.UnboundedAgentConfig, error) {
 	var (
 		cfg *provision.UnboundedAgentConfig
 		err error
@@ -41,6 +85,10 @@ func loadConfig(log *slog.Logger) (*provision.UnboundedAgentConfig, error) {
 	}
 
 	if err != nil {
+		return nil, err
+	}
+
+	if err := ov.apply(cfg); err != nil {
 		return nil, err
 	}
 
