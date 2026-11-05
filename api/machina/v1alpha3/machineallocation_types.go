@@ -51,11 +51,14 @@ const (
 	// its Machine, its MachineOperations and its bootstrap token Secret.
 	LabelAllocationUID = "unbounded-cloud.io/allocation-uid"
 
-	// LabelConsumerUID carries the consumer UID on a MachineAllocation.
+	// LabelConsumerUID carries spec.consumerRef.uid, as written, on a
+	// MachineAllocation. An allocation whose consumer UID is not a valid label
+	// value fails with InvalidRequest.
 	LabelConsumerUID = "unbounded-cloud.io/consumer-uid"
 
-	// LabelMachineClass carries the MachineClass name on a MachineAllocation
-	// and its Machine.
+	// LabelMachineClass carries spec.classRef.name, as written, on a
+	// MachineAllocation and its Machine. An allocation whose class name is not
+	// a valid label value fails with InvalidRequest.
 	LabelMachineClass = "unbounded-cloud.io/machine-class"
 
 	// LabelCapacityType is the offering label derived from an offering's
