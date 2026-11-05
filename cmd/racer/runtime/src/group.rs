@@ -126,6 +126,13 @@ pub trait Service<S: Scope> {
         Ok(())
     }
 
+    /// The lifecycle parker. Lifecycle futures (start, drain, fence, shutdown)
+    /// borrow the service, so their driver parks through this independent
+    /// handle until a wake source fires or the parker's next deadline.
+    fn parker(&self) -> Box<dyn Park<S::Error>> {
+        Box::new(ThreadPark)
+    }
+
     /// Reject new work before draining accepted work.
     fn stop_admission(&mut self) -> Result<(), S::Error> {
         Ok(())
@@ -147,6 +154,30 @@ pub trait Service<S: Scope> {
 
     /// Shut down after drain; a second ownership fence runs before destruction.
     fn shutdown<'a>(&'a mut self, scope: &'a S) -> Operation<'a, (), S::Error>;
+}
+
+/// Parks a lifecycle driver between polls of a service's lifecycle future.
+pub trait Park<E> {
+    /// Bound the next wait by deadlines without another wake source.
+    fn wait_timeout(&self, maximum: Duration) -> Duration {
+        maximum
+    }
+
+    /// Wait at most `timeout`, returning early when the driver's waker fires.
+    /// Always called after a pending poll, even with a zero timeout.
+    fn park(&mut self, timeout: Duration) -> Result<(), E>;
+}
+
+/// The default parker: the driver's waker unparks this thread.
+struct ThreadPark;
+
+impl<E> Park<E> for ThreadPark {
+    fn park(&mut self, timeout: Duration) -> Result<(), E> {
+        if !timeout.is_zero() {
+            thread::park_timeout(timeout);
+        }
+        Ok(())
+    }
 }
 
 /// Error-only group capability: cannot advance phases or authorize resource release.
@@ -659,9 +690,17 @@ impl<S: Scope> ServiceOwner<S> {
     /// Record shutdown errors but require a successful second lane fence.
     fn shutdown_lane(&mut self, scope: &S, control: &Control<S::Error>, waker: &Waker) {
         assert_eq!(self.stage, ReleaseStage::Drained);
+        let mut park = self.parker();
         record(
             control,
-            drive(self.shutdown(scope), scope, control, false, waker),
+            drive(
+                self.shutdown(scope),
+                scope,
+                control,
+                false,
+                waker,
+                &mut *park,
+            ),
         );
         drive_fence(&mut **self, scope, control, waker);
         self.stage = ReleaseStage::ShutdownFenced;
@@ -877,6 +916,7 @@ fn drive<S: Scope>(
     control: &Control<S::Error>,
     startup: bool,
     waker: &Waker,
+    park: &mut dyn Park<S::Error>,
 ) -> Result<(), S::Error> {
     let registration = if startup {
         scope.cancellation().map(|c| c.subscribe()).transpose()?
@@ -897,9 +937,24 @@ fn drive<S: Scope>(
             // Deadlines diagnose a stuck teardown, never cancel its ownership.
             record(control, scope.check());
         }
-        match operation.as_mut().poll(&mut cx) {
-            Poll::Ready(result) => return result,
-            Poll::Pending => thread::park_timeout(IDLE_WAIT),
+        if let Poll::Ready(result) = operation.as_mut().poll(&mut cx) {
+            return result;
+        }
+        // Park until a wake source fires: a completion, a cross-thread or
+        // phase-change wake, cancellation, the parker's own deadline, or the
+        // scope deadline. An expired teardown scope is only diagnosed, so it
+        // does not bound the wait.
+        let mut wait = park.wait_timeout(MAX_PARK).min(MAX_PARK);
+        if let Some(recheck) = scope.recheck_within()
+            && !recheck.is_zero()
+        {
+            wait = wait.min(recheck);
+        }
+        let parked = park.park(wait);
+        if startup {
+            parked?;
+        } else {
+            record(control, parked);
         }
     }
 }
@@ -956,7 +1011,15 @@ fn lane_thread<S: Scope>(
         crate::drivers::thread_waker(None)
     });
     control.subscribe(&waker);
-    let started = drive(service.start(&startup), &startup, control, true, &waker);
+    let mut park = service.parker();
+    let started = drive(
+        service.start(&startup),
+        &startup,
+        control,
+        true,
+        &waker,
+        &mut *park,
+    );
     if started.is_ok() {
         control.lock().stats.ready += 1;
         control.changed.notify_all();
@@ -989,7 +1052,14 @@ fn lane_thread<S: Scope>(
     let teardown = &factory.teardown_scope(&startup);
     record(
         control,
-        drive(service.drain(teardown), teardown, control, false, &waker),
+        drive(
+            service.drain(teardown),
+            teardown,
+            control,
+            false,
+            &waker,
+            &mut *park,
+        ),
     );
     record(control, service.close());
     control.close(index);
@@ -1186,6 +1256,7 @@ fn drive_fence<S: Scope>(
     control: &Control<S::Error>,
     waker: &Waker,
 ) {
+    let mut park = service.parker();
     require_fence(control, {
         drive(
             fence_operation(service.fence(scope), control),
@@ -1193,6 +1264,7 @@ fn drive_fence<S: Scope>(
             control,
             false,
             waker,
+            &mut *park,
         )
     });
 }

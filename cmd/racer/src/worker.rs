@@ -55,7 +55,9 @@ use uring_runtime::group::affinity::NicLocality;
 #[cfg(test)]
 use uring_runtime::group::affinity::current_cpus;
 
-use uring_runtime::group::{IDLE_WAIT, WORK_BUDGET};
+#[cfg(test)]
+use uring_runtime::group::IDLE_WAIT;
+use uring_runtime::group::WORK_BUDGET;
 /// One I/O shard and its crypto execution placement. Equal crypto CPU IDs identify
 /// the same execution thread. NIC locality never overrides the end-to-end rail.
 #[derive(Clone, Debug)]
@@ -473,15 +475,31 @@ fn drive_local<'a>(
     runtime: &'a WorkerRuntime,
     reporter: Option<&'a FailureReporter<Error>>,
 ) -> Operation<'a, ()> {
-    drive_local_with(
-        operation,
-        reporter,
-        move |waker| {
-            runtime.crypto.register_driver(waker);
-            poll_runtime(runtime)
-        },
-        move || runtime.reactor.wait(IDLE_WAIT),
-    )
+    drive_local_with(operation, reporter, move |waker| {
+        runtime.crypto.register_driver(waker);
+        let polled = poll_runtime(runtime);
+        uring_runtime::drivers::fire_alarms(runtime.reactor.ctx().clock.now());
+        polled
+    })
+}
+
+/// Parks a lifecycle driver in the worker's reactor: completions, its wake
+/// handle (cross-thread and phase-change wakes), and this thread's alarms.
+struct ReactorPark(Rc<Reactor>);
+
+impl uring_runtime::group::Park<Error> for ReactorPark {
+    fn wait_timeout(&self, maximum: Duration) -> Duration {
+        uring_runtime::drivers::next_alarm().map_or(maximum, |at| {
+            maximum.min(at.saturating_duration_since(self.0.ctx().clock.now()))
+        })
+    }
+
+    fn park(&mut self, timeout: Duration) -> Result<()> {
+        // Even a zero wait submits SQEs queued during the lifecycle poll.
+        self.0
+            .wait(timeout)
+            .inspect_err(|error| log_fatal("io-reactor-wait", *error))
+    }
 }
 
 /// Attribute a runtime error that is about to end the worker group. The process
@@ -776,6 +794,9 @@ impl Service<RequestScope> for IoService {
         self.built.as_ref().map_or(maximum, |service| {
             service.wait_timeout(maximum).min(maximum)
         })
+    }
+    fn parker(&self) -> Box<dyn uring_runtime::group::Park<Error>> {
+        Box::new(ReactorPark(self.runtime.reactor.clone()))
     }
     fn park(&mut self, timeout: Duration) -> Result<()> {
         // Even a zero wait submits SQEs queued during the service turn.
@@ -2760,7 +2781,7 @@ mod tests {
                 sibling_started: Arc<AtomicBool>,
                 sibling_drained: Arc<AtomicBool>,
                 fences: Arc<AtomicUsize>,
-                fail_wait: bool,
+                wake: Arc<std::sync::Mutex<Option<Waker>>>,
             }
             struct BackendService {
                 sibling_started: Arc<AtomicBool>,
@@ -2768,7 +2789,7 @@ mod tests {
                 reporter: Option<FailureReporter<Error>>,
                 sibling_drained: Arc<AtomicBool>,
                 fences: Arc<AtomicUsize>,
-                fail_wait: bool,
+                wake: Arc<std::sync::Mutex<Option<Waker>>>,
             }
             impl Factory<RequestScope> for BackendFactory {
                 fn build_lane(&self, lane: usize) -> Result<Box<dyn Service<RequestScope>>> {
@@ -2779,7 +2800,7 @@ mod tests {
                             reporter: None,
                             sibling_drained: self.sibling_drained.clone(),
                             fences: self.fences.clone(),
-                            fail_wait: self.fail_wait,
+                            wake: self.wake.clone(),
                         }))
                     })
                 }
@@ -2796,25 +2817,22 @@ mod tests {
                 fn start<'a>(&'a mut self, _: &'a RequestScope) -> Operation<'a, ()> {
                     if self.lane != 0 {
                         self.sibling_started.store(true, Ordering::SeqCst);
+                        if let Some(waker) = self.wake.lock().unwrap().take() {
+                            waker.wake();
+                        }
                         return Box::pin(async { Ok(()) });
                     }
-                    let fail_wait = self.fail_wait;
                     let poll_ready = self.sibling_started.clone();
-                    let wait_ready = self.sibling_started.clone();
+                    let wake = self.wake.clone();
                     // Exercise the exact resource-driver wrapper with a permanently
-                    // pending application future and either backend failure site.
+                    // pending application future; the backend fails once the sibling
+                    // starts, and the sibling's start is this lane's wake source.
                     drive_local_with(
                         Box::pin(std::future::pending()),
                         self.reporter.as_ref(),
-                        move |_| {
-                            if !fail_wait && poll_ready.load(Ordering::SeqCst) {
-                                Err(Error::Io)
-                            } else {
-                                Ok(())
-                            }
-                        },
-                        move || {
-                            if fail_wait && wait_ready.load(Ordering::SeqCst) {
+                        move |waker| {
+                            *wake.lock().unwrap() = Some(waker.clone());
+                            if poll_ready.load(Ordering::SeqCst) {
                                 Err(Error::Io)
                             } else {
                                 Ok(())
@@ -2848,7 +2866,7 @@ mod tests {
                     Box::pin(async { Ok(()) })
                 }
             }
-            for fail_wait in [false, true] {
+            {
                 let cpu = *current_cpus().unwrap().first().unwrap();
                 let factory = Arc::new(BackendFactory {
                     resources: Resources::new(
@@ -2860,7 +2878,7 @@ mod tests {
                     sibling_started: Arc::default(),
                     sibling_drained: Arc::default(),
                     fences: Arc::default(),
-                    fail_wait,
+                    wake: Arc::default(),
                 });
                 let mut group = Group::new(Plan {
                     lanes: (0..2)
@@ -2903,6 +2921,7 @@ mod tests {
                 drivers: Arc<AtomicUsize>,
                 drops: Arc<AtomicUsize>,
                 pending_fence: bool,
+                wake: Arc<std::sync::Mutex<Option<Waker>>>,
             }
             struct PendingDrain {
                 owner: thread::ThreadId,
@@ -2913,6 +2932,7 @@ mod tests {
                 drivers: Arc<AtomicUsize>,
                 drops: Arc<AtomicUsize>,
                 pending_fence: bool,
+                wake: Arc<std::sync::Mutex<Option<Waker>>>,
             }
             impl Factory<RequestScope> for PendingFactory {
                 fn build_lane(&self, lane: usize) -> Result<Box<dyn Service<RequestScope>>> {
@@ -2926,6 +2946,7 @@ mod tests {
                             drivers: self.drivers.clone(),
                             drops: self.drops.clone(),
                             pending_fence: self.pending_fence,
+                            wake: self.wake.clone(),
                         }))
                     })
                 }
@@ -2960,8 +2981,10 @@ mod tests {
                         return Box::pin(async { Ok(()) });
                     }
                     let release = self.release.clone();
+                    let wake = self.wake.clone();
                     drive_local_with(
-                        Box::pin(std::future::poll_fn(move |_| {
+                        Box::pin(std::future::poll_fn(move |cx| {
+                            *wake.lock().unwrap() = Some(cx.waker().clone());
                             if release.load(Ordering::SeqCst) {
                                 Poll::Ready(Ok(()))
                             } else {
@@ -2970,7 +2993,6 @@ mod tests {
                         })),
                         self.reporter.as_ref(),
                         |_| Err(Error::Io),
-                        || Ok(()),
                     )
                 }
                 fn fence<'a>(&'a mut self, _: &'a RequestScope) -> Operation<'a, ()> {
@@ -2978,7 +3000,9 @@ mod tests {
                         let release = self.release.clone();
                         let fences = self.fences.clone();
                         let reporter = self.reporter.clone();
-                        return Box::pin(std::future::poll_fn(move |_| {
+                        let wake = self.wake.clone();
+                        return Box::pin(std::future::poll_fn(move |cx| {
+                            *wake.lock().unwrap() = Some(cx.waker().clone());
                             if release.load(Ordering::SeqCst) {
                                 fences.fetch_add(1, Ordering::SeqCst);
                                 Poll::Ready(Ok(()))
@@ -3025,6 +3049,7 @@ mod tests {
                     drivers: Arc::default(),
                     drops: Arc::default(),
                     pending_fence,
+                    wake: Arc::default(),
                 });
                 let mut group = Group::new(Plan {
                     lanes: vec![Lane {
@@ -3057,6 +3082,9 @@ mod tests {
                 let drops_before = factory.drops.load(Ordering::SeqCst);
                 // Release before assertions so a failed regression cannot hang Drop.
                 factory.release.store(true, Ordering::SeqCst);
+                if let Some(waker) = factory.wake.lock().unwrap().take() {
+                    waker.wake();
+                }
                 let joined = group.join();
                 assert_eq!(result, Err(Error::Io));
                 assert!(elapsed < Duration::from_secs(1));

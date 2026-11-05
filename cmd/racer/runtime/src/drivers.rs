@@ -479,34 +479,30 @@ pub fn thread_waker(reactor: Option<ReactorWake>) -> Waker {
 
 /// Drive resource completions while a local operation borrows its service graph.
 ///
+/// Each poll first drives the resources (`poll`, which also registers the
+/// task's waker with them), then the operation. Nothing here waits or wakes
+/// itself: the surrounding lifecycle driver parks on the resources' wake
+/// sources (completions, cross-thread wakes, alarms, and scope deadlines).
+///
 /// Backend failures are reported immediately but do not abandon the operation.
 /// Its completion fence runs to completion, then the first backend error wins.
-/// `wait` must be bounded. After it returns, wake the polling task so a surrounding
-/// driver schedules another turn before sleeping, including non-thread executors.
 pub fn drive_local_with<'a, T: 'a, E: Copy + PartialEq + From<crate::Error> + 'a>(
     mut operation: Operation<'a, T, E>,
     reporter: Option<&'a FailureReporter<E>>,
     mut poll: impl FnMut(&Waker) -> Result<(), E> + 'a,
-    mut wait: impl FnMut() -> Result<(), E> + 'a,
 ) -> Operation<'a, T, E> {
     let mut error = None;
     Box::pin(std::future::poll_fn(move |cx| {
-        // Report every failure while keeping the first as the eventual result.
-        let mut record = |result| {
-            if let Err(failure) = result {
-                if let Some(reporter) = reporter {
-                    reporter.report(failure);
-                }
-                error.get_or_insert(failure);
+        if let Err(failure) = poll(cx.waker()) {
+            if let Some(reporter) = reporter {
+                reporter.report(failure);
             }
-        };
-        record(poll(cx.waker()));
-        if let Poll::Ready(result) = operation.as_mut().poll(cx) {
-            return Poll::Ready(error.map_or(result, Err));
+            error.get_or_insert(failure);
         }
-        record(wait());
-        cx.waker().wake_by_ref();
-        Poll::Pending
+        match operation.as_mut().poll(cx) {
+            Poll::Ready(result) => Poll::Ready(error.map_or(result, Err)),
+            Poll::Pending => Poll::Pending,
+        }
     }))
 }
 
@@ -1339,9 +1335,9 @@ mod scheduler_tests {
     use crate::test_util::WakeCounter;
     use std::{future::Future, pin::pin, rc::Rc};
 
-    /// A bounded wait wakes a surrounding wake-gated scheduler for the next turn.
+    /// A pending operation does not wake its own task; only its resources do.
     #[test]
-    fn driver_composes_with_wake_gated_local_scheduler() {
+    fn driver_does_not_self_wake() {
         let ready = Cell::new(false);
         let mut driver = drive_local_with(
             Box::pin(std::future::poll_fn(|_| {
@@ -1353,21 +1349,14 @@ mod scheduler_tests {
             })),
             None,
             |_| Ok(()),
-            || {
-                ready.set(true);
-                Ok(())
-            },
         );
-        let runnable = crate::drivers::Runnable::new();
         let count = Arc::new(WakeCounter::default());
         let waker = Waker::from(count.clone());
         let mut cx = Context::from_waker(&waker);
-        assert!(runnable.poll(driver.as_mut(), &mut cx, false).is_pending());
-        assert_eq!(count.count(), 1);
-        assert_eq!(
-            runnable.poll(driver.as_mut(), &mut cx, false),
-            Poll::Ready(Ok(7))
-        );
+        assert!(driver.as_mut().poll(&mut cx).is_pending());
+        assert_eq!(count.count(), 0);
+        ready.set(true);
+        assert_eq!(driver.as_mut().poll(&mut cx), Poll::Ready(Ok(7)));
     }
 
     /// Shares cancellation and a caller-controlled admission error across polls.
@@ -1508,7 +1497,6 @@ mod scheduler_tests {
     fn driver_retains_operation_and_first_backend_error_until_completion() {
         for fail_poll in [false, true] {
             let ready = Cell::new(false);
-            let waits = Cell::new(0);
             let operation = Box::pin(std::future::poll_fn(|_| {
                 if ready.get() {
                     Poll::Ready(Err::<(), _>(Error::Unavailable))
@@ -1516,15 +1504,9 @@ mod scheduler_tests {
                     Poll::Pending
                 }
             }));
-            let mut future = drive_local_with(
-                operation,
-                None,
-                |_| if fail_poll { Err(Error::Io) } else { Ok(()) },
-                || {
-                    waits.set(waits.get() + 1);
-                    Err(Error::Overloaded)
-                },
-            );
+            let mut future = drive_local_with(operation, None, |_| {
+                if fail_poll { Err(Error::Io) } else { Ok(()) }
+            });
             let mut cx = Context::from_waker(Waker::noop());
             assert!(future.as_mut().poll(&mut cx).is_pending());
             ready.set(true);
@@ -1533,23 +1515,17 @@ mod scheduler_tests {
                 Poll::Ready(Err(if fail_poll {
                     Error::Io
                 } else {
-                    Error::Overloaded
+                    Error::Unavailable
                 }))
             );
-            assert_eq!(waits.get(), 1);
         }
     }
 
-    /// An already completed operation preserves its result and never invokes waiting.
+    /// An already completed operation preserves its result.
     #[test]
     fn driver_preserves_ready_value_and_does_not_wait() {
         for result in [Ok(7), Err(Error::Unavailable)] {
-            let mut future = drive_local_with(
-                Box::pin(async move { result }),
-                None,
-                |_| Ok(()),
-                || panic!("ready operation must not wait"),
-            );
+            let mut future = drive_local_with(Box::pin(async move { result }), None, |_| Ok(()));
             assert_eq!(
                 future
                     .as_mut()
