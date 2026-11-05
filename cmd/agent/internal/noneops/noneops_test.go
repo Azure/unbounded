@@ -194,7 +194,7 @@ func TestGoalStateIsPointedAtTheHost(t *testing.T) {
 
 	// Installers write into the version; configuration stays at the same path.
 	require.Equal(t, filepath.Join(f.node.p.Layout.VersionDir(v), "bin"), gs.RootFS.Root().Path(goalstates.BinDir))
-	require.Equal(t, f.hostPath("/opt/cni/bin"), gs.RootFS.Root().Path("opt/cni/bin"))
+	require.Equal(t, filepath.Join(f.node.p.Layout.VersionDir(v), "cni", "bin"), gs.RootFS.Root().Path("opt/cni/bin"), "the CNI plugins are versioned too")
 	require.Equal(t, f.hostPath("/etc/containerd/config.toml"), gs.NodeStart.Root().Path(goalstates.ContainerdConfigPath))
 
 	// Commands run on the host through the backend.
@@ -555,7 +555,7 @@ func TestUpgradeRollbackPutsTheSharedConfigurationBack(t *testing.T) {
 	assert.NoDirExists(t, f.node.configSnapshotDir(), "the snapshot is dropped once restored")
 }
 
-func TestUpgradeSuccessKeepsTheNewConfigurationAndDropsTheSnapshot(t *testing.T) {
+func TestUpgradeSuccessKeepsTheNewConfigurationAndCommitDropsTheSnapshot(t *testing.T) {
 	f := newFixture(t, false, nil)
 	installPrevious(t, f, "1.33.0-aaaaaaaa")
 	seedSharedConfig(t, f)
@@ -563,7 +563,16 @@ func TestUpgradeSuccessKeepsTheNewConfigurationAndDropsTheSnapshot(t *testing.T)
 	require.NoError(t, f.node.Upgrade(t.Context()))
 
 	assert.NotEqual(t, "version = 2 # old\n", readHost(t, f, "/etc/unbounded/containerd/config.toml"), "configure wrote the new containerd configuration")
+
+	// Until the caller has persisted the applied config, a crash must still be
+	// able to roll back: the journal and the saved configuration stay.
+	assert.DirExists(t, f.node.configSnapshotDir())
+	assert.FileExists(t, f.node.journalPath())
+
+	require.NoError(t, f.node.Commit())
 	assert.NoDirExists(t, f.node.configSnapshotDir())
+	assert.NoFileExists(t, f.node.journalPath())
+	require.NoError(t, f.node.Commit(), "committing twice is not an error")
 }
 
 func TestUpgradeFailureBeforeTheSwitchRestoresTheSharedConfiguration(t *testing.T) {

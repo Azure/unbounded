@@ -34,6 +34,7 @@ import (
 	"github.com/Azure/unbounded/cmd/agent/internal/hostnode"
 	"github.com/Azure/unbounded/internal/fsutil"
 	"github.com/Azure/unbounded/pkg/agent/config"
+	"github.com/Azure/unbounded/pkg/agent/confsnap"
 	"github.com/Azure/unbounded/pkg/agent/goalstates"
 	"github.com/Azure/unbounded/pkg/agent/isolation"
 	"github.com/Azure/unbounded/pkg/agent/isolation/none"
@@ -56,6 +57,14 @@ type Params struct {
 	// the goal state it has already resolved so GPU and device discovery happens
 	// once.
 	GoalState *goalstates.MachineGoalState
+
+	// Previous is the configuration the node runs with before an Upgrade: the
+	// applied config. A rollback restores its units and host networking, so the
+	// previous version starts on what it ran with. PreviousGoalState, when set,
+	// is used instead of resolving Previous. With neither, a rollback uses this
+	// configuration's.
+	Previous          *config.AgentConfig
+	PreviousGoalState *goalstates.MachineGoalState
 
 	// Overrides and Hooks are left zero in production, which is the real host.
 	// Tests set them to run a node against a temporary tree and a fake host.
@@ -319,11 +328,7 @@ func (n *Node) Prepare(ctx context.Context) (isolation.NodeRoot, error) {
 		return nil, err
 	}
 
-	return n.backend.Prepare(ctx, isolation.NodeSpec{
-		Slot:    n.version,
-		Version: n.gs.RootFS.KubernetesVersion,
-		Grants:  n.gs.RootFS.Grants(),
-	})
+	return n.backend.Prepare(ctx, n.nodeSpec())
 }
 
 // Provision installs the version, writes the units and points the current link
@@ -428,32 +433,59 @@ func (n *Node) Restart(ctx context.Context) error {
 }
 
 // Upgrade installs this configuration's version beside the active one, writes
-// the new configuration, and switches over: stop the stack, clean host
-// networking as repave does, flip the current link, start, and wait for kubelet.
-// If the new version does not come up the link is flipped back and the previous
-// version is started again. The caller has already drained the node and removed
-// it from the cluster, as for an nspawn repave, and persists the applied config
-// after a nil return.
+// the new configuration, and switches over: stop the stack, end its pods, clean
+// host networking as repave does, flip the current link, start, and wait for
+// kubelet. If the new version does not come up the link is flipped back and the
+// previous version is started again with the units, configuration and host
+// networking of Params.Previous. The caller has already drained the node and
+// removed it from the cluster, as for an nspawn repave.
 //
 // Configuration lives at the same host paths for every version, so the files
 // the stacks share are saved before anything is written (see confsnap) and put
-// back on every failure: before the flip, and before the previous version
-// starts on a rollback.
+// back on every failure. Before anything changes an upgrade journal records the
+// version the node runs, so a crash in the middle is finished at the next start
+// by RecoverUpgrade. On success the journal and the saved configuration are
+// kept until the caller has persisted the applied config and calls Commit; a
+// failed upgrade removes them itself.
 func (n *Node) Upgrade(ctx context.Context) (err error) {
 	if err := n.resolve(); err != nil {
 		return err
 	}
 
-	snapshot, err := hostnode.TakeSnapshot(n.p.Log, n.configSnapshotDir(), n.p.HostRoot)
+	prev, err := n.previous()
 	if err != nil {
 		return err
 	}
 
+	current, err := n.p.Layout.Current()
+	if err != nil {
+		return err
+	}
+
+	if _, jerr := n.readJournal(); jerr == nil {
+		return fmt.Errorf("an earlier upgrade was interrupted and has not been recovered (%s); restart the agent to finish it", n.journalPath())
+	} else if !errors.Is(jerr, os.ErrNotExist) {
+		return jerr
+	}
+
+	if err := n.writeJournal(upgradeJournal{Previous: current, Target: n.version}); err != nil {
+		return err
+	}
+
+	snapshot, err := hostnode.TakeSnapshot(n.p.Log, n.configSnapshotDir(), n.p.HostRoot)
+	if err != nil {
+		return errors.Join(err, n.removeJournal())
+	}
+
 	defer func() {
-		if err != nil && !snapshot.Restored() {
+		if err == nil {
+			return
+		}
+
+		if !snapshot.Restored() {
 			// A failure the backend did not roll back from, such as an install or
-			// configuration error, or a stop that failed. The snapshot stays when
-			// the restore fails, so it can be tried again.
+			// configuration error, or a stop that failed. The snapshot and the
+			// journal stay when the restore fails, so the next start tries again.
 			if rerr := snapshot.Restore(); rerr != nil {
 				err = errors.Join(err, rerr)
 
@@ -462,9 +494,11 @@ func (n *Node) Upgrade(ctx context.Context) (err error) {
 		}
 
 		snapshot.Discard()
+
+		err = errors.Join(err, n.removeJournal())
 	}()
 
-	r, err := n.Prepare(ctx)
+	r, err := n.backend.PrepareVersion(ctx, n.nodeSpec())
 	if err != nil {
 		return err
 	}
@@ -473,16 +507,20 @@ func (n *Node) Upgrade(ctx context.Context) (err error) {
 		return err
 	}
 
-	n.backend.BeforeRollbackStart = func(context.Context) error { return snapshot.Restore() }
+	prevUnits := prev.unitSpec()
+	n.backend.RollbackUnits = &prevUnits
+	n.backend.BeforeRollbackStart = func(ctx context.Context) error {
+		if err := snapshot.Restore(); err != nil {
+			return err
+		}
+
+		return prev.resetHostNetwork(ctx)
+	}
 
 	first := true
 
 	n.backend.BeforeUpgradeStart = func(ctx context.Context) error {
-		if err := n.cleanupNetwork(ctx); err != nil {
-			return err
-		}
-
-		if err := n.setupNetwork(ctx); err != nil {
+		if err := n.resetHostNetwork(ctx); err != nil {
 			return err
 		}
 
@@ -504,6 +542,165 @@ func (n *Node) Upgrade(ctx context.Context) (err error) {
 
 		return n.waitBootstrap(ctx)
 	})
+}
+
+// Commit ends a successful upgrade once the caller has persisted the applied
+// config: the saved configuration is dropped, then the journal. A crash in
+// between leaves a journal without a snapshot, which RecoverUpgrade finishes.
+func (n *Node) Commit() error {
+	if err := confsnap.Discard(n.configSnapshotDir()); err != nil {
+		return fmt.Errorf("remove the saved configuration: %w", err)
+	}
+
+	return n.removeJournal()
+}
+
+// RecoverUpgrade finishes an upgrade a crash interrupted. The daemon calls it
+// at startup with the applied config, which is the configuration the node ran
+// before the upgrade unless the upgrade had already succeeded and been
+// persisted. In that case only Commit is left. Otherwise the node is rolled
+// back: the stack is stopped, its pods ended, the link pointed at the version
+// the journal recorded, the units written for this configuration, the saved
+// configuration restored, host networking set up again, and the stack started.
+// It does nothing when no upgrade was in progress.
+func (n *Node) RecoverUpgrade(ctx context.Context) error {
+	j, err := n.readJournal()
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+
+	if err != nil {
+		return err
+	}
+
+	if err := n.resolve(); err != nil {
+		return err
+	}
+
+	current, err := n.p.Layout.Current()
+	if err != nil {
+		return err
+	}
+
+	if j.Target == n.version && current == n.version {
+		n.p.Log.Info("finishing an upgrade that succeeded before the agent stopped", "version", n.version)
+
+		return n.Commit()
+	}
+
+	if j.Previous == "" {
+		return fmt.Errorf("upgrade journal %s names no version to roll back to", n.journalPath())
+	}
+
+	n.p.Log.Warn("rolling back an upgrade the agent did not finish", "from", j.Target, "to", j.Previous)
+
+	snapshotDir := n.configSnapshotDir()
+	units := n.unitSpec()
+	n.backend.RollbackUnits = &units
+	n.backend.BeforeRollbackStart = func(ctx context.Context) error {
+		if confsnap.Exists(snapshotDir) {
+			if err := hostnode.RestoreSnapshot(n.p.Log, snapshotDir, n.p.HostRoot); err != nil {
+				return err
+			}
+		}
+
+		return n.resetHostNetwork(ctx)
+	}
+
+	if err := n.backend.Rollback(ctx, j.Previous); err != nil {
+		// The journal stays, so the next start tries again.
+		return fmt.Errorf("roll back the interrupted upgrade to %s: %w", j.Previous, err)
+	}
+
+	return n.Commit()
+}
+
+// upgradeJournal is what Upgrade records before it changes anything.
+type upgradeJournal struct {
+	// Previous is the version the node ran before the upgrade.
+	Previous string `json:"previous"`
+	// Target is the version the upgrade installs.
+	Target string `json:"target"`
+}
+
+func (n *Node) journalPath() string {
+	return filepath.Join(filepath.Dir(n.configSnapshotDir()), "none-upgrade-journal.json")
+}
+
+func (n *Node) readJournal() (upgradeJournal, error) {
+	var j upgradeJournal
+
+	data, err := os.ReadFile(n.journalPath())
+	if err != nil {
+		return j, err
+	}
+
+	if err := json.Unmarshal(data, &j); err != nil {
+		return j, fmt.Errorf("decode upgrade journal %s: %w", n.journalPath(), err)
+	}
+
+	return j, nil
+}
+
+func (n *Node) writeJournal(j upgradeJournal) error {
+	data, err := json.Marshal(j)
+	if err != nil {
+		return err
+	}
+
+	if err := fsutil.WriteFileDurable(n.journalPath(), data, 0o600); err != nil {
+		return fmt.Errorf("write upgrade journal: %w", err)
+	}
+
+	return nil
+}
+
+func (n *Node) removeJournal() error {
+	if err := os.Remove(n.journalPath()); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return fmt.Errorf("remove upgrade journal: %w", err)
+	}
+
+	return fsutil.SyncDir(filepath.Dir(n.journalPath()))
+}
+
+// previous is the node the configuration ran with before an upgrade.
+func (n *Node) previous() (*Node, error) {
+	if n.p.Previous == nil && n.p.PreviousGoalState == nil {
+		return n, nil
+	}
+
+	p := n.p
+	p.Config, p.GoalState, p.Previous, p.PreviousGoalState = n.p.Previous, n.p.PreviousGoalState, nil, nil
+
+	prev := New(p)
+	if err := prev.resolve(); err != nil {
+		return nil, fmt.Errorf("resolve the configuration the node runs: %w", err)
+	}
+
+	return prev, nil
+}
+
+// unitSpec is the unit spec this configuration's units are written with.
+func (n *Node) unitSpec() none.UnitSpec {
+	return n.backend.Units
+}
+
+// resetHostNetwork cleans host networking a stopped stack left and sets it up
+// for this configuration.
+func (n *Node) resetHostNetwork(ctx context.Context) error {
+	if err := n.cleanupNetwork(ctx); err != nil {
+		return err
+	}
+
+	return n.setupNetwork(ctx)
+}
+
+func (n *Node) nodeSpec() isolation.NodeSpec {
+	return isolation.NodeSpec{
+		Slot:    n.version,
+		Version: n.gs.RootFS.KubernetesVersion,
+		Grants:  n.gs.RootFS.Grants(),
+	}
 }
 
 func (n *Node) configSnapshotDir() string {
