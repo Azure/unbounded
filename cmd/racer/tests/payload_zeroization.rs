@@ -100,21 +100,23 @@ fn final_payload_owner_scrubs_full_allocation_on_reclaim_and_rejection() {
             } else {
                 ResourceClass::Plaintext
             };
-            if scenario == "full" {
+            if scenario == "full" && ciphertext {
                 // Different geometry prevents the watched owner from consuming a
-                // slot, so its final release exercises full-pool rejection.
+                // slot, so its final release exercises full-recycler rejection.
+                // Plaintext no longer uses the recycler, so fill it directly.
+                // Check every buffer out before any returns, so none is reused.
                 let buffers: Vec<_> = (0..8)
                     .map(|_| {
-                        pool.plaintext(
-                            admission
-                                .reserve(Some(&cache), ResourceClass::Plaintext, capacity + 1)
-                                .unwrap(),
-                            capacity + 1,
-                        )
-                        .unwrap()
+                        let charge = admission
+                            .reserve(Some(&cache), ResourceClass::Ciphertext, capacity + 1)
+                            .unwrap();
+                        let bytes = charge.buffer(capacity + 1).unwrap();
+                        (charge, bytes)
                     })
                     .collect();
-                drop(buffers);
+                for (mut charge, bytes) in buffers {
+                    charge.recycle(bytes);
+                }
             }
             let reservation = admission.reserve(Some(&cache), class, capacity).unwrap();
             let owner: Box<dyn Send> = if ciphertext {
@@ -167,14 +169,17 @@ fn final_payload_owner_scrubs_full_allocation_on_reclaim_and_rejection() {
                 Some(admission)
             };
             std::thread::spawn(move || drop(owner)).join().unwrap();
-            if scenario == "retained" {
+            // Plaintext lives in the worker's pooled storage, which the dropped
+            // pool has closed: its last owner wipes and frees it at once, so
+            // only ciphertext exercises recycler retention and trimming.
+            if scenario == "retained" && ciphertext {
                 assert!(!FREED.load(Ordering::SeqCst));
                 let admission = admission.as_ref().unwrap();
                 assert_eq!(admission.used(class), capacity);
                 admission.reclaim_buffers();
                 assert_eq!(admission.used(class), 0);
             }
-            if scenario == "trimmed" {
+            if scenario == "trimmed" && ciphertext {
                 // Demand maintenance frees an entry left idle for a whole window.
                 assert!(!FREED.load(Ordering::SeqCst));
                 let admission = admission.as_ref().unwrap();
@@ -335,16 +340,20 @@ fn failed_crypto_output_is_scrubbed(config: &Config) {
                     bytes,
                 )
                 .unwrap();
+            // Decrypt opens into pooled storage checked out before submission.
+            // Its pool is gone, so the last owner wipes and frees it.
+            let plaintext = racer::memory::BufferPool::new(admission.clone())
+                .plaintext_storage(
+                    admission
+                        .reserve(Some(&cache), ResourceClass::Plaintext, length)
+                        .unwrap(),
+                    length,
+                )
+                .unwrap();
+            watch(plaintext.as_ptr());
             CryptoInput::Decrypt {
                 ciphertext,
-                plaintext: racer::memory::BufferPool::new(admission.clone())
-                    .plaintext_storage(
-                        admission
-                            .reserve(Some(&cache), ResourceClass::Plaintext, length)
-                            .unwrap(),
-                        length,
-                    )
-                    .unwrap(),
+                plaintext,
             }
         };
         let cipher_charge = admission.used(ResourceClass::Ciphertext);
@@ -361,32 +370,53 @@ fn failed_crypto_output_is_scrubbed(config: &Config) {
             panic!("reserve")
         };
         let job = permit.job(input, key, scope.clone());
-        if fault.starts_with("cancel") {
+        if encrypt {
             *CANCEL_AT_ALLOCATION.lock().unwrap() = Some(scope.clone());
+            FREED.store(false, Ordering::SeqCst);
+            ZEROED.store(false, Ordering::SeqCst);
+            NEXT_SIZE.store(length + 16, Ordering::SeqCst);
+        } else if fault.starts_with("cancel") {
+            // Decrypt allocates no output to hook, so cancel up front.
+            scope.cancel().unwrap();
         }
-        FREED.store(false, Ordering::SeqCst);
-        ZEROED.store(false, Ordering::SeqCst);
-        NEXT_SIZE.store(if encrypt { length + 16 } else { length }, Ordering::SeqCst);
         let completion = PageCryptoEngine::process(job, &racer_io::WorkerCtx::host());
-        assert_eq!(
-            NEXT_SIZE.load(Ordering::SeqCst),
-            0,
-            "{fault}: output allocated"
-        );
-        assert!(
-            FREED.load(Ordering::SeqCst),
-            "{fault}: output not published"
-        );
-        assert!(
-            ZEROED.load(Ordering::SeqCst),
-            "{fault}: entire output wiped before dealloc"
-        );
+        if encrypt {
+            assert_eq!(
+                NEXT_SIZE.load(Ordering::SeqCst),
+                0,
+                "{fault}: output allocated"
+            );
+            assert!(
+                FREED.load(Ordering::SeqCst),
+                "{fault}: output not published"
+            );
+            assert!(
+                ZEROED.load(Ordering::SeqCst),
+                "{fault}: entire output wiped before dealloc"
+            );
+        } else {
+            assert!(
+                !FREED.load(Ordering::SeqCst),
+                "{fault}: failures never consume the input storage"
+            );
+        }
         if fault.starts_with("cancel") {
             assert!(scope.check().is_err());
         }
-        assert_eq!(admission.used(ResourceClass::Plaintext), length);
+        // Pooled plaintext is charged at its 4 KiB granule.
+        assert_eq!(
+            admission.used(ResourceClass::Plaintext),
+            length.next_multiple_of(4096)
+        );
         assert_eq!(admission.used(ResourceClass::Ciphertext), cipher_charge);
         drop(completion);
+        if !encrypt {
+            assert!(FREED.load(Ordering::SeqCst), "{fault}: storage released");
+            assert!(
+                ZEROED.load(Ordering::SeqCst),
+                "{fault}: entire storage wiped before dealloc"
+            );
+        }
         assert_eq!(admission.used(ResourceClass::Plaintext), 0);
         assert_eq!(admission.used(ResourceClass::Ciphertext), 0);
     }
