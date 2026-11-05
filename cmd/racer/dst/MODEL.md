@@ -840,6 +840,16 @@ sizes (seed 1):
 | full-lagging 300, 600 s, 0.2/s | reads completed / failed | 52651 / 4 | 49670 / 0 |
 | | origin requests | 21055 | 16614 |
 
+| full-cold-start 10,000, 400 s, 0.02/s | reads completed / failed | 275,251 / 0 | 266,048 / 0 |
+| | skipped not enrolled / not member | 3,051 / 1,164 | 4,568 / 1,718 |
+| | origin requests, origin/page | 27,623, 2 | 26,899, 4 |
+| | read latency p50/p99/max ms | 42 / 168 / 3,472 | 47 / 132 / 3,496 |
+| | wall (release), peak RSS | 155 s, 1.02 GB | 142 s, 0.66 GB |
+| full-failover 10,000, 900 s, 0.02/s | reads completed / failed | 268,752 / 187 | 258,424 / 1,462 |
+| | origin requests, origin/page | 44,199, 6 | 44,715, 8 |
+| | read latency p50/p99/max ms | 42 / 218 / 3,551 | 47 / 157 / 3,473 |
+| | wall (release), peak RSS | 316 s, 1.15 GB | 268 s, 0.64 GB |
+
 Membership skew at the end, enrolled counts and membership versions match exactly in every
 combined run. Reads completed are 3-12% lower in the Model because its read load stops
 before the end (see above). Within tolerance except `full-failover` read failures (91 against 10, all `Unavailable`).
@@ -853,8 +863,8 @@ Open; see Gaps.
 
 ### Gaps blocking racer-sim deletion
 
-- `full-failover` read failures differ by 9x at 200 nodes, from the site cut (above); needs
-  link circuits in the Model or a traced explanation.
+- `full-failover` read failures differ by 9x at 200 nodes and 8x at 10,000, from the site
+  cut (above); needs link circuits in the Model or a traced explanation.
 - No Full counterpart with enrolling clients against real authorities.
 - The Model has no racer-sim node report fields (`peer_requests_*`, `fills_failed`,
   `origin_repeats_*` classification used by racer-sim's `failover_repeats_are_skips_or_their_orphans`),
