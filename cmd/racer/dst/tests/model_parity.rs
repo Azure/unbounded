@@ -198,3 +198,23 @@ fn scenario_report() {
         r["metrics"]["attempt_errors"]
     );
 }
+
+#[test]
+fn membership_churn_refreshes_falls_back_and_waits() {
+    let report = run(scenarios::membership_churn(), 1);
+    let counters = &report["metrics"]["counters"];
+    let n = |k: &str| counters[k].as_u64().unwrap();
+    // Lagging destinations answer `StaleMembership`; the requester gets the unused links back,
+    // and readers that cannot fall back to the previous membership wait.
+    assert!(n("stale_membership_replies") > 0, "{counters}");
+    assert!(n("stale_links_refunded") > 0, "{counters}");
+    assert!(n("stale_waits") > 0, "{counters}");
+    assert!(n("reads_skipped_not_member") > 0, "{counters}");
+    let coverage = &report["coverage"];
+    for name in ["Acquisition::Refresh", "Acquisition::Sleep"] {
+        assert!(
+            coverage[name].as_u64().unwrap_or(0) > 0,
+            "{name}: {coverage}"
+        );
+    }
+}

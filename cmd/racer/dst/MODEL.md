@@ -37,8 +37,20 @@ such as which node holds which page.
 - Page store: published pages per node, bounded by `ModelSpec::stored_pages` with
   least-recently-used eviction (0 is unbounded).
 - Placement: a real `topology::Placement` over `Phantom` rankings (copied from
-  racer-sim's `phantom.rs`) and a real `topology::Membership`. Member positions are
-  node ids.
+  racer-sim's `phantom.rs`) and real `topology::Membership` versions.
+- Membership versions (`src/model/membership.rs`, racer-sim `Versions` in standalone mode):
+  `ModelSpec::churn` and `random_churn` make nodes leave and rejoin; changes publish in
+  250 ms batches, each node adopts a version up to `membership_lag` (100 ms) late and
+  resolves the 2 versions before it (`RETAINED`). Rankings carry their version: the core's
+  `plan`, `mesh` and `helper_of` closures read the version their node adopted, `Rank` answers
+  `Verify`, `Latest`, `Previous` (non-members as `NOT_MEMBER`, `recent` within
+  `PREVIOUS_MEMBERSHIP_WITHIN`) and `Fallback` under the named version, and `Refresh` reports
+  the adopted version and the recent previous one. A holder that does not resolve a
+  request's version answers `StaleMembership` (`decide_hop`), and the requester gets the
+  unused remote credits and links back (production `request_traced`,
+  `stale_unused_links`). Routes, neighbors, columns and helpers map node ids to the
+  version's member positions. A node outside the membership it adopted takes no client
+  reads (`reads_skipped_not_member`; production `/readyz`).
 - Page flights: joins, leader election, handover and settlement run in the core's
   `FlightTable`, including on owners that serve peer `Acquire` probes.
 - Acquisition walks: ranking, peer probes, validation, origin fetches and publication
@@ -86,8 +98,9 @@ such as which node holds which page.
 - Hedges (`Hedge` answers `NotStarted`; `FillConfig::hedge` is off), successor hint notes
   and orphan notices (`Hints` answers no hints, `Batch` answers no copy), so successor
   deferral (`Served::Defer`) never happens.
-- Membership changes: every read uses version 1 of one membership, so `Refresh` and the
-  stale-membership `Sleep` never run.
+- Membership changes come only from scenario churn; the control plane (racer-sim combined
+  mode, `Versions::external`, enrollment) is not modeled, and a node that left keeps serving
+  peers and relaying.
 - Relay quotas (`ResourceClass::Relay`) and so relay sheds; link circuits (`Circuits`) and
   route search queueing. Route searches run synchronously against one shared `Paths`
   cache, so a search never waits for a slot (racer-sim queued 514,580 at 50,000 nodes).
@@ -239,7 +252,26 @@ section).
 | `model-range-readers` | range reads through `ReadWindow` with credits, spill holds, selections, worker fetches; a second pass reads every page from disk |
 | `model-metadata-readers` | page reads behind `MetadataCohort` refreshes with 10% origin 5xx; refreshes coalesce per cohort |
 | `model-faults` | origin 403/5xx mix, four cache outages, page and range readers; failed windows discard buffered pages |
+| `model-membership-churn` | port of racer-sim's `churn` scenario (`sim/src/lib.rs` `scenario_schedules`: a tenth of the nodes leave and rejoin a quarter of the run later) on 200 nodes reading a new object every 250 ms; see below |
 | `model-node-faults` | 64 nodes read twelve objects, one a second, under a drawn schedule of up to 16 crash/restarts, node-pair partitions and slow peers; every read ends and failures are only `Unavailable`/`Overloaded` (seeds 1..6: none fail) |
+
+### Membership churn
+
+racer-sim `--scenario churn --nodes 200 --seed 1` (2 s, its Poisson workload) against the
+Model's `model-membership-churn` seed 1 (200 nodes, 8 storms of one 16-page object, 2 s of
+churn). The workloads differ, so only the membership counters compare in kind:
+
+| Metric | racer-sim | Model |
+|---|---|---|
+| reads completed / failed | 11,801 / 12 (`Unavailable`) | 24,960 / 0 |
+| reads skipped on non-members | 166 | 640 |
+| membership changes / publications | 37 / 8 | 40 / 9 |
+| `StaleMembership` replies | 516 | 1,472 |
+| stale waits (`Sleep`) | 7 | 11 |
+| links refunded | 2,833 | 8,066 |
+
+The Model's CI churn seeds exercise `Acquisition::Refresh`, `Acquisition::Sleep` and
+`Acquisition::Batch` (handoff targets under the previous membership).
 
 ## Memory
 

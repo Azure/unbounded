@@ -38,3 +38,6 @@ model-node-faults seed=1
 model-node-faults seed=2
 model-node-faults seed=3
 model-node-faults seed=6
+model-membership-churn seed=1
+model-membership-churn seed=2
+model-membership-churn seed=3

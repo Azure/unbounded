@@ -4,7 +4,7 @@ use crate::{
     engine::{MILLIS, Nanos, SECONDS},
     fixture::lane_pair,
     invariants::{Class, all_roles_settled},
-    model::{ModelSpec, Outage, RangeRead, Storm},
+    model::{ModelSpec, Outage, RandomChurn, RangeRead, Storm},
     scenario::FaultMix,
     world::Fault,
 };
@@ -496,6 +496,55 @@ pub fn node_faults() -> Scenario {
         .end(24 * SECONDS)
 }
 
+/// Ported from racer-sim's `churn` scenario (`sim/src/lib.rs` `scenario_schedules`): a tenth of
+/// the nodes leave at a drawn time and rejoin a quarter of the run later. Changes publish every
+/// 250 ms and each node adopts a version up to 100 ms late, so requests meet destinations that
+/// are behind (`StaleMembership`) and readers refresh, fall back to the previous membership or
+/// wait. racer-sim drives a Poisson workload; here 200 nodes read a new object every 250 ms.
+/// Every read ends, and reads fail only with transient errors.
+pub fn membership_churn() -> Scenario {
+    const NODES: u32 = 200;
+    const STORMS: u64 = 8;
+    let duration = 2 * SECONDS;
+    let spec = ModelSpec {
+        storms: (0..STORMS)
+            .map(|i| storm(i * 250 * MILLIS, i, NODES, 250 * MILLIS))
+            .collect(),
+        random_churn: Some(RandomChurn {
+            events: NODES / 10,
+            within: duration,
+            away: duration / 4,
+        }),
+        ..ModelSpec::default()
+    };
+    let total = STORMS * u64::from(NODES) * u64::from(spec.pages_per_object);
+    let spec = spec
+        .check("every-read-ends", move |r| {
+            let ended = counter(r, "reads_completed")
+                + counter(r, "reads_failed")
+                + counter(r, "reads_skipped_not_member");
+            (ended == total)
+                .then_some(())
+                .ok_or(format!("{ended} of {total} reads ended"))
+        })
+        .check("membership-changes", |r| {
+            (counter(r, "membership_changes") > 0 && counter(r, "membership_publications") > 0)
+                .then_some(())
+                .ok_or("no membership change".into())
+        })
+        .check("failures-are-transient", |r| {
+            let failed = counter(r, "reads_failed");
+            let explained = error(r, "Unavailable") + error(r, "Overloaded");
+            (failed == explained && counter(r, "reads_completed") > failed)
+                .then_some(())
+                .ok_or(format!("failures: {}", r["metrics"]["errors"]))
+        });
+    Scenario::new("model-membership-churn")
+        .nodes(NODES)
+        .model(spec)
+        .end(20 * SECONDS)
+}
+
 /// Every built-in scenario.
 pub fn catalog() -> Vec<Scenario> {
     vec![
@@ -510,6 +559,7 @@ pub fn catalog() -> Vec<Scenario> {
         partition_heals(),
         hung_peers(),
         node_faults(),
+        membership_churn(),
         Scenario::new("lane-pair")
             .roles(|env| lane_pair(env, 8))
             .with(all_roles_settled())

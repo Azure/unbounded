@@ -9,12 +9,13 @@
 //! whom to shed; the cores do. See `dst/MODEL.md` for what is and is not modeled yet.
 
 pub mod coverage;
+pub mod membership;
 pub mod phantom;
 mod report;
 
 use std::{
+    cell::RefCell,
     collections::{BTreeMap, BTreeSet},
-    num::NonZeroU32,
     rc::Rc,
     time::{Duration, Instant},
 };
@@ -27,8 +28,8 @@ use racer_core::{
     read::{
         Answering, Error, OperationKind, PageBudget, RefreshPurpose, ReplicaSelection,
         ResponseKind, ServeFacts, VisitOrder,
-        acquisition::{self, RankAnswer},
-        budget::{helper_start, inherited_budget},
+        acquisition::{self, RankAnswer, RankBasis},
+        budget::{helper_start, inherited_budget, stale_unused_links},
         demote_unanswered,
         effect::EffectId,
         flight::FlightLimits,
@@ -37,7 +38,8 @@ use racer_core::{
         serve::{Body, Decision, ServeDecision, ServeRequest},
         visit_order,
         walk::{
-            AttemptInputs, Features, FillConfig, HedgeEnd, Ranked, Reply, SilenceNote, plan_attempt,
+            AttemptInputs, Features, FillConfig, HedgeEnd, NOT_MEMBER, Ranked, Reply, SilenceNote,
+            plan_attempt,
         },
         window::{self, AcquisitionBudgetSpec, Facts, Next, WindowConfig},
         worker::{
@@ -52,7 +54,7 @@ use racer_core::{
 };
 use racer_object_wire::model::{CacheKey, ObjectId, PageNumber};
 use serde_json::Value;
-use topology::{Exhaustive, Member, PathQuery, Paths, Placement, REPLICAS};
+use topology::{Exhaustive, PathQuery, Paths, Placement, REPLICAS};
 
 pub use report::{Counters, Report};
 
@@ -64,6 +66,7 @@ use crate::{
     scenario::Scenario,
     world::{Failure, Outcome},
 };
+use membership::{Members, Version, Versions};
 use phantom::Phantom;
 
 /// A page of an object.
@@ -84,37 +87,21 @@ impl Page {
     }
 }
 
+/// A ranking: its membership version and its owners (boxed to keep [`Ev`] small).
+pub type Ranking = Box<(u64, Vec<u32>)>;
+
 /// Payload types of the model: rankings are owner lists, answers name the serving node.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ModelTypes;
 
 impl Types for ModelTypes {
-    type Rank = Vec<u32>;
+    type Rank = Ranking;
     type Membership = u64;
     type Answer = u32;
     type Page = Page;
     type Object = u64;
     type Metadata = u64;
 }
-
-/// A model node as a topology member: node `n` has the 4-byte big-endian id of `n`, so member
-/// positions are node ids.
-#[derive(Clone, Copy, Debug)]
-struct ModelMember([u8; 4]);
-
-impl Member for ModelMember {
-    const DOMAIN: &'static str = "racer-sim";
-
-    fn id(&self) -> &[u8] {
-        &self.0
-    }
-
-    fn weight(&self) -> NonZeroU32 {
-        NonZeroU32::MIN
-    }
-}
-
-type Members = topology::Membership<ModelMember>;
 
 /// `nodes` nodes, starting at `first`, each read every page of `object` once, starting at
 /// `at` plus a draw below `window`.
@@ -145,6 +132,30 @@ pub struct Outage {
     pub at: Nanos,
     /// End of the outage.
     pub until: Nanos,
+}
+
+/// Membership churn (racer-sim `Churn`): `node` joins or leaves at `at`. A node that left keeps
+/// running; it is only absent from the memberships published after.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct Churn {
+    /// When the change is made.
+    pub at: Nanos,
+    /// The node that joins or leaves.
+    pub node: u32,
+    /// Joins (`true`) or leaves.
+    pub join: bool,
+}
+
+/// Random churn (racer-sim `Churn::random`): `events` leave and rejoin pairs, each leave drawn
+/// below `within` on a drawn node that rejoins `away` later.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct RandomChurn {
+    /// Leave and rejoin pairs.
+    pub events: u32,
+    /// Leaves are drawn below this time.
+    pub within: Nanos,
+    /// How long each node stays away.
+    pub away: Nanos,
 }
 
 /// The shape of a client range read ([`racer_core::read::window::WindowConfig`]).
@@ -191,6 +202,12 @@ pub struct ModelSpec {
     /// Client page reads refresh the object's metadata through the worker's
     /// `MetadataCohort` first.
     pub metadata: bool,
+    /// Membership changes, published in batches of [`membership::BATCH`].
+    pub churn: Vec<Churn>,
+    /// Drawn membership changes, added to [`Self::churn`].
+    pub random_churn: Option<RandomChurn>,
+    /// Most adoption lag of a node (racer-sim `membership_lag_ns`, at most one batch).
+    pub membership_lag: Nanos,
     /// Report checks, by name.
     pub checks: Vec<(String, ReportCheck)>,
 }
@@ -223,6 +240,9 @@ impl Default for ModelSpec {
             metadata: false,
             outages: Vec::new(),
             hangs: Vec::new(),
+            churn: Vec::new(),
+            random_churn: None,
+            membership_lag: membership::LAG,
             checks: Vec::new(),
         }
     }
@@ -240,7 +260,7 @@ impl ModelSpec {
     }
 }
 
-type Input = acquisition::Input<Vec<u32>, u64, u32>;
+type Input = acquisition::Input<Ranking, u64, u32>;
 
 /// Engine events.
 enum Ev {
@@ -318,6 +338,19 @@ enum Ev {
     },
     /// A cache outage of `node` begins.
     Outage { node: u32 },
+    /// A `StaleMembership` answer returns `remote` credits and `links` to `(node, worker,
+    /// read)`'s request budget, just before the answer.
+    Refund {
+        node: u32,
+        worker: u32,
+        read: ReadId,
+        remote: u32,
+        links: u8,
+    },
+    /// `node` joins (`live`) or leaves the membership.
+    Membership { node: u32, live: bool },
+    /// Publish the pending membership changes.
+    Publish,
     /// A scheduled node or network fault ([`crate::world::Fault`]).
     Fault(crate::world::Fault),
     /// The link from `holder` for `msg` failed to connect.
@@ -346,10 +379,14 @@ type Sent = (u32, Page, bool, Nanos);
 /// What a probe carries to its destination.
 #[derive(Clone, Copy)]
 struct Route {
+    /// The membership version the request is signed under (`Io::Send::version`).
+    version: u64,
     copy_only: bool,
     deadline: Nanos,
     attempts: u32,
     links: u8,
+    /// Links the requester charged (`links` shrinks at each relay).
+    charged: u8,
 }
 
 /// A peer request on its route (racer-sim `Msg`; production `peer/forwarding.rs`).
@@ -384,6 +421,12 @@ struct Asker {
     dest: u32,
     /// The request's key in `Model::msgs` (and `Model::last_hops`).
     msg: u64,
+    /// The membership version the request is signed under.
+    version: u64,
+    /// Remote credits the request carried (`AttemptPlan::remote_attempts`).
+    attempts: u32,
+    /// Links the requester charged for the whole route (`AttemptPlan::links`).
+    links: u8,
 }
 
 struct Node {
@@ -467,7 +510,8 @@ struct Model<'s> {
     base: Instant,
     fabric: Fabric,
     origin: Origin,
-    members: Rc<Members>,
+    /// Published memberships, shared with every core's routing closures.
+    versions: Rc<RefCell<Versions>>,
     placement: Rc<Placement<Phantom>>,
     nodes: Vec<Node>,
     /// Client reads by `(node, worker, request)`: start time.
@@ -487,6 +531,8 @@ struct Model<'s> {
     next_body: u64,
     /// Whether a [`Ev::Tick`] is scheduled.
     ticking: bool,
+    /// Whether an [`Ev::Publish`] is scheduled.
+    publishing: bool,
     report: Report,
     expected_reads: u64,
     /// Queued [`Ev::ProbeTimeout`] events.
@@ -526,11 +572,11 @@ const CONNECT_TIMEOUT: Nanos = 100 * MILLIS;
 /// Entries of the shared route cache.
 const ROUTE_CACHE_ENTRIES: usize = 1 << 16;
 
-/// The owners of `page` under `members` (member positions are node ids).
-fn owners(placement: &Placement<Phantom>, members: &Members, page: Page) -> Vec<u32> {
-    let mut ranked = placement.rank(members, &page.key());
+/// The owners of `page` under `version`, as node ids.
+fn owners(placement: &Placement<Phantom>, version: &Version, page: Page) -> Vec<u32> {
+    let mut ranked = placement.rank(&version.members, &page.key());
     ranked.truncate(REPLICAS);
-    ranked.into_iter().map(|p| p as u32).collect()
+    ranked.into_iter().map(|p| version.node(p)).collect()
 }
 
 /// The worker of a node that owns `page`'s flight.
@@ -542,10 +588,11 @@ impl<'s> Model<'s> {
     fn new(scenario: &'s Scenario, spec: &'s ModelSpec, choices: Choices) -> Self {
         let n = scenario.nodes.max(1);
         let base = Instant::now();
-        let members = Rc::new(
-            Members::new((0..n).map(|node| ModelMember(node.to_be_bytes())).collect())
-                .expect("valid membership"),
-        );
+        let versions = Rc::new(RefCell::new(Versions::new(
+            n,
+            spec.membership_lag,
+            membership::RETAINED,
+        )));
         let phantom = Phantom::new();
         let placement = Rc::new(Placement::with_rankings(4096, phantom));
         let fabric = Fabric::new(n, scenario.sites, &scenario.costs, &choices);
@@ -554,7 +601,7 @@ impl<'s> Model<'s> {
         let nodes = (0..n)
             .map(|node| Node {
                 cores: (0..workers)
-                    .map(|worker| core(node, worker, workers, &members, &placement, base))
+                    .map(|worker| core(node, worker, workers, &versions, &placement, base))
                     .collect(),
                 stored: Store::new(spec.stored_pages),
                 // Production: half the client request timeout, and the peer attempt timeout for
@@ -577,7 +624,7 @@ impl<'s> Model<'s> {
             base,
             fabric,
             origin,
-            members,
+            versions,
             placement,
             nodes,
             clients: BTreeMap::new(),
@@ -589,6 +636,7 @@ impl<'s> Model<'s> {
             bodies: BTreeMap::new(),
             next_body: 0,
             ticking: false,
+            publishing: false,
             report: Report::default(),
             expected_reads: 0,
             timeouts_queued: 0,
@@ -600,6 +648,27 @@ impl<'s> Model<'s> {
             partitions: BTreeSet::new(),
             paths: Paths::with_limits(ROUTE_CACHE_ENTRIES, ROUTE_CACHE_ENTRIES * 256, 8),
         }
+    }
+
+    /// Whether `node` is listed in the membership it adopted. A node that is not is not ready
+    /// (production `/readyz`, `WorkerApplication::membership_usable`), so its clients do not
+    /// read through it (racer-sim `reads_skipped_not_member`).
+    fn member(&self, node: u32) -> bool {
+        let versions = self.versions.borrow();
+        versions.adopted(node).position(node).is_some()
+    }
+
+    /// The owners of `page` under the latest membership (diagnostics).
+    fn latest_owners(&self, page: Page) -> Vec<u32> {
+        owners(&self.placement, self.versions.borrow().latest(), page)
+    }
+
+    /// The owners of `page` under membership `number`, while it is retained.
+    fn owners_at(&self, number: u64, page: Page) -> Option<Vec<u32>> {
+        let versions = self.versions.borrow();
+        versions
+            .get(number)
+            .map(|v| owners(&self.placement, v, page))
     }
 
     fn instant(&self, at: Nanos) -> Instant {
@@ -647,6 +716,34 @@ impl<'s> Model<'s> {
     }
 
     fn schedule_storms(&mut self) {
+        let mut churn = self.spec.churn.clone();
+        if let Some(random) = self.spec.random_churn {
+            let n = self.nodes.len() as u64;
+            for _ in 0..random.events {
+                let node = self.choices.below(n) as u32;
+                let at = self.choices.below(random.within.max(1));
+                churn.push(Churn {
+                    at,
+                    node,
+                    join: false,
+                });
+                churn.push(Churn {
+                    at: at + random.away,
+                    node,
+                    join: true,
+                });
+            }
+        }
+        for churn in churn {
+            let live = churn.join;
+            self.engine.at(
+                churn.at,
+                Ev::Membership {
+                    node: churn.node,
+                    live,
+                },
+            );
+        }
         for outage in self.spec.outages.clone() {
             self.engine.at(outage.at, Ev::Outage { node: outage.node });
         }
@@ -705,7 +802,43 @@ impl<'s> Model<'s> {
 
     fn step(&mut self, event: Ev) {
         let now = self.now();
+        self.versions.borrow_mut().now = now;
         match event {
+            Ev::Membership { node, live } => {
+                if self.versions.borrow_mut().set(node, live) {
+                    self.report.counters.membership_changes += 1;
+                    if !self.publishing {
+                        self.publishing = true;
+                        let batch = membership::BATCH;
+                        self.engine.at((now / batch + 1) * batch, Ev::Publish);
+                    }
+                }
+            }
+            Ev::Refund {
+                node,
+                worker,
+                read,
+                remote,
+                links,
+            } => {
+                let core = &mut self.nodes[node as usize].cores[worker as usize];
+                // A read that already ended has nothing to refund.
+                if let Some(budget) = core.request_budget(read) {
+                    let refunded = budget
+                        .refund_remote(remote)
+                        .and_then(|()| budget.refund_links(links));
+                    if let Err(error) = refunded {
+                        self.violation(format!("stale refund grew the budget: {error:?}"));
+                    }
+                    self.report.counters.stale_links_refunded += u64::from(links);
+                }
+            }
+            Ev::Publish => {
+                self.publishing = false;
+                if self.versions.borrow_mut().publish(now) {
+                    self.report.counters.membership_publications += 1;
+                }
+            }
             Ev::Read {
                 node,
                 page,
@@ -714,6 +847,10 @@ impl<'s> Model<'s> {
             } => {
                 self.trace.record(now, TAG_EVENT, 1, u64::from(node));
                 self.tick_soon();
+                if !self.member(node) {
+                    self.report.counters.reads_skipped_not_member += 1;
+                    return;
+                }
                 if self.spec.metadata {
                     self.refresh(node, page, start, attempt);
                 } else {
@@ -727,6 +864,11 @@ impl<'s> Model<'s> {
             } => {
                 self.trace.record(now, TAG_EVENT, 6, u64::from(node));
                 self.tick_soon();
+                if !self.member(node) {
+                    let pages = u64::from(self.spec.pages_per_object);
+                    self.report.counters.reads_skipped_not_member += pages;
+                    return;
+                }
                 self.open(node, object, range);
             }
             Ev::WindowInput {
@@ -814,7 +956,7 @@ impl<'s> Model<'s> {
                         self.fabric.crypto(now, node, verify);
                     }
                     if self.diag {
-                        let owners = owners(&self.placement, &self.members, page);
+                        let owners = self.latest_owners(page);
                         let role = |n: u32| match owners.iter().position(|o| *o == n) {
                             Some(r) => format!("owner{r}"),
                             None => "x".into(),
@@ -873,7 +1015,7 @@ impl<'s> Model<'s> {
                 self.timeouts_queued -= 1;
                 if let Some((to, page, copy_only, _)) = self.probes.remove(&(node, worker, id)) {
                     if self.diag {
-                        let owners = owners(&self.placement, &self.members, page);
+                        let owners = self.latest_owners(page);
                         let role = match owners.iter().position(|o| *o == to) {
                             Some(r) => format!("owner{r}"),
                             None => "helper".into(),
@@ -1189,12 +1331,71 @@ impl<'s> Model<'s> {
         }
     }
 
+    /// Rank `page` for `node` (production `CandidatePolicy::rank_for`, racer-sim `rank_for`).
+    fn rank(
+        &self,
+        node: u32,
+        page: Page,
+        basis: RankBasis<Ranking, u64>,
+    ) -> Result<RankAnswer<Ranking, u64>, Error> {
+        let versions = self.versions.borrow();
+        let number = match &basis {
+            RankBasis::Verify(ranking) => ranking.0,
+            RankBasis::Latest(number) | RankBasis::Fallback(number) => *number,
+            RankBasis::Previous { version } => *version,
+        };
+        let version = versions.get(number).ok_or(Error::IncompatibleMembership)?;
+        let owners = owners(&self.placement, version, page);
+        if let RankBasis::Previous { version: previous } = basis {
+            // Previous owners that are not members of the walked version are not asked.
+            let walked = versions.get(previous + 1).ok_or(Error::Unavailable)?;
+            let owners: Vec<u32> = owners
+                .iter()
+                .map(|o| {
+                    if walked.position(*o).is_some() {
+                        *o
+                    } else {
+                        NOT_MEMBER
+                    }
+                })
+                .collect();
+            let recent = versions.previous_recent_member(node, previous + 1);
+            return Ok(RankAnswer {
+                ranked: Ranked {
+                    recent_member: recent,
+                    ..Ranked::new(previous, &owners, None)
+                },
+                ranking: None,
+                recent: recent.then_some(previous),
+            });
+        }
+        if let RankBasis::Verify(initial) = &basis
+            && initial.1 != owners
+        {
+            // Public rankings are not authority.
+            return Err(Error::IncompatibleMembership);
+        }
+        let rank = owners.iter().position(|o| *o == node);
+        let mut ranked = Ranked {
+            members: version.count(),
+            ..Ranked::new(number, &owners, rank)
+        };
+        if rank.is_none() {
+            ranked.order = self.visit_order(node, page, &owners, version);
+        }
+        Ok(RankAnswer {
+            ranked,
+            ranking: Some(Box::new((number, owners))),
+            recent: None,
+        })
+    }
+
     /// A non-owner's visit order over `owners` (production `CandidatePolicy::visit_order`,
     /// racer-sim `walk_ranking`): `Spread` visits mesh neighbors first, then by descending
     /// `replica_score`, so readers spread over the owners instead of all asking rank 0. One
     /// membership version, so `lineage_first` never moves an owner. Owners that left this
     /// node's requests unanswered or shed them go last (`demote_unanswered`).
-    fn visit_order(&self, node: u32, page: Page, owners: &[u32]) -> VisitOrder {
+    fn visit_order(&self, node: u32, page: Page, owners: &[u32], version: &Version) -> VisitOrder {
         let id = |n: u32| NodeId(format!("n{n:08}"));
         let mut key = [0u8; 32];
         key[..8].copy_from_slice(&page.object.to_be_bytes());
@@ -1206,7 +1407,10 @@ impl<'s> Model<'s> {
         let order = visit_order(
             ReplicaSelection::Spread,
             owners.len(),
-            |r| self.members.is_neighbor(node as usize, owners[r] as usize),
+            |r| match (version.position(node), version.position(owners[r])) {
+                (Some(a), Some(b)) => version.members.is_neighbor(a, b),
+                _ => false,
+            },
             |r| {
                 replica_score(
                     &requester,
@@ -1234,7 +1438,22 @@ impl<'s> Model<'s> {
         let copy_only = route.copy_only;
         let now = self.now();
         let worker = owner_worker(page, self.spec.workers.max(1));
-        let owners = owners(&self.placement, &self.members, page);
+        // The destination resolved the request's version (`decide_hop`).
+        let (owners, column_mate) = {
+            let versions = self.versions.borrow();
+            let version = versions.get(route.version).expect("a known version");
+            // Production `Membership::same_column` in the default pool (racer-sim
+            // `column_mates`): an owner never sheds its own column mates below the exempt cap.
+            let column_mate = match (version.position(to), version.position(asker.from)) {
+                (Some(a), Some(b)) => version
+                    .members
+                    .pools()
+                    .first()
+                    .is_some_and(|pool| pool.same_column(a, b)),
+                _ => false,
+            };
+            (owners(&self.placement, version, page), column_mate)
+        };
         let stored = self.nodes[to as usize].stored.contains(&page);
         let at = self.instant(now);
         let core = &mut self.nodes[to as usize].cores[worker as usize];
@@ -1256,13 +1475,7 @@ impl<'s> Model<'s> {
             owners: &owners,
             local: to,
             requester: asker.from,
-            // Production `Membership::same_column` in the default pool (racer-sim
-            // `column_mates`): an owner never sheds its own column mates below the exempt cap.
-            column_mate: self
-                .members
-                .pools()
-                .first()
-                .is_some_and(|pool| pool.same_column(to as usize, asker.from as usize)),
+            column_mate,
         };
         let served = core.serve(&page, request, &view, at);
         self.cover(served_name(&served));
@@ -1365,7 +1578,7 @@ impl<'s> Model<'s> {
             return;
         };
         if self.diag {
-            let owner = owners(&self.placement, &self.members, page).contains(&to);
+            let owner = self.latest_owners(page).contains(&to);
             let secs = (end - now) / (MILLIS * 250);
             *self
                 .report
@@ -1380,7 +1593,10 @@ impl<'s> Model<'s> {
         self.report.counters.peer_bytes += self.spec.page_bytes;
         self.report.counters.peer_pages += 1;
         self.report.counters.peer_bytes += self.spec.page_bytes * (route.len() as u64 - 2);
-        if !owners(&self.placement, &self.members, page).contains(&to) {
+        if !self
+            .owners_at(asker.version, page)
+            .is_some_and(|owners| owners.contains(&to))
+        {
             self.report.counters.helper_copies += 1;
         }
         self.engine.at(end, Ev::BodyEnd { body: key });
@@ -1450,22 +1666,18 @@ impl<'s> Model<'s> {
             return;
         }
         self.trace.record(now, TAG_EVENT, 3, u64::from(at));
-        match decide_hop(&at, &m.path, &m.dest, m.route.links, true) {
-            Hop::StaleMembership => self.violation(format!("node {at} lacks the one membership")),
+        let known = self.versions.borrow().known(at, m.route.version);
+        match decide_hop(&at, &m.path, &m.dest, m.route.links, known) {
+            Hop::StaleMembership => {
+                // Production `peer/server.rs`: a node that does not resolve the request's
+                // version answers `StaleMembership`, signed (racer-sim `hop`).
+                self.report.counters.stale_membership_replies += 1;
+                let asker = self.asker(mid, now);
+                self.reply(&asker, at, ResponseKind::StaleMembership);
+            }
             Hop::Serve => {
-                let m = self.msgs.remove(&mid).expect("message");
                 let (page, route) = (m.page, m.route);
-                let asker = Asker {
-                    from: m.from,
-                    worker: m.worker,
-                    read: m.read,
-                    id: m.id,
-                    at: now,
-                    abandon: m.abandon,
-                    path: m.path,
-                    dest: m.dest,
-                    msg: mid,
-                };
+                let asker = self.asker(mid, now);
                 self.serve(asker, at, page, route);
             }
             Hop::Relay(plan) => {
@@ -1476,6 +1688,25 @@ impl<'s> Model<'s> {
                 self.report.counters.relays += 1;
                 self.forward(mid, at, Some(plan));
             }
+        }
+    }
+
+    /// Take `mid` off its route: whoever answers it now answers its requester.
+    fn asker(&mut self, mid: u64, now: Nanos) -> Asker {
+        let m = self.msgs.remove(&mid).expect("message");
+        Asker {
+            from: m.from,
+            worker: m.worker,
+            read: m.read,
+            id: m.id,
+            at: now,
+            abandon: m.abandon,
+            path: m.path,
+            dest: m.dest,
+            msg: mid,
+            version: m.route.version,
+            attempts: m.route.attempts,
+            links: m.route.charged,
         }
     }
 
@@ -1497,27 +1728,46 @@ impl<'s> Model<'s> {
         let Ok((keep, links)) = search else {
             return self.fail_hop(mid, holder, Fault::HopBudgetExhausted);
         };
-        let visited: Vec<usize> = m.path[..keep].iter().map(|n| *n as usize).collect();
+        let Some(members) = self
+            .versions
+            .borrow()
+            .get(m.route.version)
+            .map(|v| v.members.clone())
+        else {
+            // racer-sim `forward`: the request's version is no longer resolvable here.
+            return self.fail_hop(mid, holder, Fault::IncompatibleMembership);
+        };
+        let position = |n: u32| members.position(&n.to_be_bytes());
+        let (Some(from), Some(to)) = (position(holder), position(dest)) else {
+            return self.fail_hop(mid, holder, Fault::Unavailable);
+        };
+        let Some(visited) = m.path[..keep]
+            .iter()
+            .map(|n| position(*n))
+            .collect::<Option<Vec<usize>>>()
+        else {
+            return self.fail_hop(mid, holder, Fault::Unavailable);
+        };
         let node = &self.nodes[holder as usize];
         let mut blocked: Vec<usize> = node
             .silence
             .silent_peers(at)
-            .map(|p| *p as usize)
-            .filter(|p| self.members.is_neighbor(holder as usize, *p))
+            .filter_map(|p| position(*p))
+            .filter(|p| members.is_neighbor(from, *p))
             .collect();
         blocked.sort_unstable();
         let level = node.detours.level(&dest, at);
-        blocked.extend(self.members.detour(holder as usize, dest as usize, level));
+        blocked.extend(members.detour(from, to, level));
         let seed = mid.to_be_bytes();
         let query = PathQuery {
-            from: holder as usize,
-            to: dest as usize,
+            from,
+            to,
             links,
             visited: &visited,
             blocked: &blocked,
             seed: &seed,
         };
-        let (route, polls) = self.route(query);
+        let (route, polls) = self.route(&members, query);
         // racer-sim `spawn`: a cache hit answers on the first poll, each further poll expands
         // up to 32 nodes, on one worker's CPU.
         let costs = self.fabric.costs;
@@ -1534,12 +1784,17 @@ impl<'s> Model<'s> {
                 return self.fail_hop(mid, holder, Fault::Unavailable);
             }
         };
-        self.link(mid, holder, plan, route[1] as u32, ready);
+        let next = u32::from_be_bytes(members.members()[route[1]].0);
+        self.link(mid, holder, plan, next, ready);
     }
 
     /// Run one route search to completion; returns the route and the polls it took.
-    fn route(&self, query: PathQuery<'_>) -> (Result<Vec<usize>, topology::Error>, u64) {
-        let mut future = std::pin::pin!(self.paths.route(&*self.members, query));
+    fn route(
+        &self,
+        members: &Members,
+        query: PathQuery<'_>,
+    ) -> (Result<Vec<usize>, topology::Error>, u64) {
+        let mut future = std::pin::pin!(self.paths.route(members, query));
         let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
         let mut polls = 0;
         loop {
@@ -1605,6 +1860,9 @@ impl<'s> Model<'s> {
             path: m.path,
             dest: m.dest,
             msg: mid,
+            version: m.route.version,
+            attempts: m.route.attempts,
+            links: m.route.charged,
         };
         if holder == asker.from && asker.path.len() == 1 {
             // The requester's own send failed: a transport error.
@@ -1808,6 +2066,19 @@ impl<'s> Model<'s> {
         }
         let ready = self.sign(to);
         let at = self.message_back(ready, &route);
+        if kind == ResponseKind::StaleMembership {
+            // Production `request_traced`: the answering node could not resolve the request's
+            // membership, so the remote credits it carried were never used, and neither were the
+            // links past the hops that carried it there (racer-sim `stale_links_refunded`).
+            let refund = Ev::Refund {
+                node: asker.from,
+                worker: asker.worker,
+                read: asker.read,
+                remote: asker.attempts,
+                links: stale_unused_links(asker.links, asker.path.len()),
+            };
+            self.engine.at(at, refund);
+        }
         self.engine.at(
             at,
             Ev::Input {
@@ -1850,28 +2121,13 @@ impl<'s> Model<'s> {
         };
         match effect {
             Effect::Acquisition { read, page, effect } => match effect {
-                Acq::Rank { id, .. } => {
-                    let owners = owners(&self.placement, &self.members, page);
-                    let rank = owners.iter().position(|o| *o == node);
+                Acq::Rank { id, basis, .. } => {
                     let at = self
                         .fabric
                         .cpu(now, node, worker as u8, costs.cpu_ranking_chunk_ns);
-                    let mut ranked = Ranked {
-                        members: self.nodes.len(),
-                        ..Ranked::new(1, &owners, rank)
-                    };
-                    if rank.is_none() {
-                        ranked.order = self.visit_order(node, page, &owners);
-                    }
-                    let answer = Input::Ranked {
-                        id,
-                        result: Ok(RankAnswer {
-                            ranked,
-                            ranking: Some(owners),
-                            recent: None,
-                        }),
-                    };
-                    self.engine.at(at, input(read, answer));
+                    let result = self.rank(node, page, basis);
+                    self.engine
+                        .at(at, input(read, Input::Ranked { id, result }));
                 }
                 Acq::Hints { id, .. } => {
                     let answer = Input::Hints {
@@ -1890,17 +2146,28 @@ impl<'s> Model<'s> {
                     };
                     self.engine.at(now, input(read, answer));
                 }
-                Acq::Refresh { id, .. } => {
+                Acq::Refresh { id, version } => {
+                    // racer-sim `Action::Refresh`: the newest version this node adopted, and
+                    // version - 1 while it is recent and lists this node.
+                    let versions = self.versions.borrow();
+                    let latest = versions.adopted(node).number;
+                    let recent_previous = versions
+                        .previous_recent_member(node, version)
+                        .then(|| version - 1);
+                    drop(versions);
                     let answer = Input::Membership {
                         id,
-                        latest: Ok(None),
-                        recent_previous: None,
+                        latest: Ok(Some((latest, latest))),
+                        recent_previous,
                     };
                     self.engine
                         .at(now + costs.cpu_request_ns, input(read, answer));
                 }
                 Acq::Send {
-                    id, probe, dest, ..
+                    id,
+                    probe,
+                    dest,
+                    version,
                 } => {
                     self.report.counters.peer_probes += 1;
                     let Some(to) = dest.filter(|d| (*d as usize) < self.nodes.len()) else {
@@ -1980,10 +2247,12 @@ impl<'s> Model<'s> {
                         dest: to,
                         page,
                         route: Route {
+                            version,
                             copy_only,
                             deadline,
                             attempts: plan.remote_attempts,
                             links: plan.links,
+                            charged: plan.links,
                         },
                         path: vec![node],
                         at: node,
@@ -2011,6 +2280,7 @@ impl<'s> Model<'s> {
                         .at(now + costs.cpu_request_ns, input(read, answer));
                 }
                 Acq::Sleep { id, until } => {
+                    self.report.counters.stale_waits += 1;
                     let at = self.nanos(until).max(now);
                     self.engine
                         .at(at, input(read, Input::Timer { id, result: Ok(()) }));
@@ -2141,7 +2411,7 @@ impl<'s> Model<'s> {
         let now = self.now();
         if let Some(asker) = self.serving.remove(&(node, worker, request)) {
             if self.diag {
-                let owners = owners(&self.placement, &self.members, page);
+                let owners = self.latest_owners(page);
                 let me = match owners.iter().position(|o| *o == node) {
                     Some(r) => format!("owner{r}"),
                     None => "helper".into(),
@@ -2238,7 +2508,8 @@ impl<'s> Model<'s> {
         if !self.msgs.is_empty() {
             self.violation(format!("{} peer requests never ended", self.msgs.len()));
         }
-        let ended = self.report.counters.reads_completed + self.report.counters.reads_failed;
+        let c = &self.report.counters;
+        let ended = c.reads_completed + c.reads_failed + c.reads_skipped_not_member;
         if ended != self.expected_reads {
             self.violation(format!("{} of {} reads ended", ended, self.expected_reads));
         }
@@ -2342,11 +2613,12 @@ fn core(
     node: u32,
     worker: u32,
     workers: u32,
-    members: &Rc<Members>,
+    versions: &Rc<RefCell<Versions>>,
     placement: &Rc<Placement<Phantom>>,
     base: Instant,
 ) -> WorkerCore<ModelTypes> {
-    let (m, p) = (members.clone(), placement.clone());
+    // Every closure reads the version this node adopted when the core calls it.
+    let (v, p) = (versions.clone(), placement.clone());
     let plan = Box::new(move |page: &Page, budget: &AcquisitionBudgetSpec| {
         let config = FillConfig {
             operation: OperationKind::Page,
@@ -2355,20 +2627,29 @@ fn core(
             scope: budget.deadline,
             features: Features::PRODUCTION,
         };
-        (config, owners(&p, &m, *page))
+        let versions = v.borrow();
+        let version = versions.adopted(node);
+        (
+            config,
+            Box::new((version.number, owners(&p, version, *page))),
+        )
     });
-    let (m, p) = (members.clone(), placement.clone());
-    let mesh = Box::new(move |page: &Page, _version: u64| {
+    let (v, p) = (versions.clone(), placement.clone());
+    let mesh = Box::new(move |page: &Page, version: u64| {
+        let versions = v.borrow();
         Some(Mesh {
-            owners: owners(&p, &m, *page),
+            owners: owners(&p, versions.get(version)?, *page),
             start: helper_start(&node.to_be_bytes()),
             reader: node,
         })
     });
-    let m = members.clone();
+    let v = versions.clone();
     let helper_of = Box::new(move |owner: u32| {
-        let pool = m.pools().first()?;
-        pool.helper(node as usize, owner as usize).map(|h| h as u32)
+        let versions = v.borrow();
+        let version = versions.adopted(node);
+        let pool = version.members.pools().first()?;
+        let helper = pool.helper(version.position(node)?, version.position(owner)?)?;
+        Some(version.node(helper))
     });
     WorkerCore::new(
         Routing {

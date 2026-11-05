@@ -92,6 +92,19 @@ pub struct Counters {
     pub replies_lost: u64,
     /// Most pages any node stores at the end of the run.
     pub stored_pages_max: u64,
+    /// Membership changes (racer-sim `membership_changes`).
+    pub membership_changes: u64,
+    /// Membership versions published (racer-sim `membership_publications`).
+    pub membership_publications: u64,
+    /// Requests answered `StaleMembership` (racer-sim `stale_membership_replies`).
+    pub stale_membership_replies: u64,
+    /// Stale-destination waits (racer-sim `stale_waits`).
+    pub stale_waits: u64,
+    /// Links returned after `StaleMembership` answers (racer-sim `stale_links_refunded`).
+    pub stale_links_refunded: u64,
+    /// Client reads not started on a node outside its own membership (racer-sim
+    /// `reads_skipped_not_member`).
+    pub reads_skipped_not_member: u64,
 }
 
 /// What a run observed.
@@ -186,6 +199,12 @@ impl Report {
                     "flights_reelected": c.flights_reelected,
                     "late_answers": c.late_answers,
                     "relays": c.relays,
+                    "membership_changes": c.membership_changes,
+                    "membership_publications": c.membership_publications,
+                    "stale_membership_replies": c.stale_membership_replies,
+                    "stale_waits": c.stale_waits,
+                    "stale_links_refunded": c.stale_links_refunded,
+                    "reads_skipped_not_member": c.reads_skipped_not_member,
                     "relay_failures": c.relay_failures,
                     "route_unreachable": c.route_unreachable,
                     "silence_timeouts": c.silence_timeouts,

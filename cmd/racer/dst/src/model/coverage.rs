@@ -64,10 +64,6 @@ pub const UNREACHABLE: &[(&str, &str)] = &[
 /// exercise fails the check, so the list cannot go stale.
 pub const NOT_YET: &[(&str, &str)] = &[
     (
-        "Acquisition::Sleep",
-        "walks wait only on stale memberships, and membership changes are not modeled",
-    ),
-    (
         "Served::Reject",
         "serving rejects mismatched objects or operations; Model probes always match",
     ),
@@ -78,14 +74,6 @@ pub const NOT_YET: &[(&str, &str)] = &[
     (
         "Acquisition::Hedge",
         "hedged reads need FillConfig::hedge and hedge budgets the Model does not grant",
-    ),
-    (
-        "Acquisition::Refresh",
-        "membership changes are not modeled; every read uses one membership version",
-    ),
-    (
-        "Acquisition::Batch",
-        "remaining-copy batches follow orphan notices, which the Model does not answer",
     ),
 ];
 
