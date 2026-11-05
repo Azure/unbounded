@@ -45,16 +45,20 @@ type Backend struct {
 	// AfterRestart is AfterStart for Restart.
 	AfterRestart map[string]func(ctx context.Context) error
 	// BeforeUpgradeStart runs during Upgrade after the old version has stopped
-	// and the link has flipped, before the new version starts, and again before
-	// the previous version starts on rollback. The agent uses it to clean up
-	// host networking as repave does.
+	// and the link has flipped, before the new version starts. The agent uses
+	// it to clean up host networking as repave does and set it up for the new
+	// configuration.
 	BeforeUpgradeStart func(ctx context.Context) error
 	// BeforeRollbackStart runs during a failed Upgrade before the previous
-	// version starts again, so it starts on the configuration it was running
-	// with: after the link has flipped back on a rollback, and without a flip
-	// when the stop or the activation failed. A failure is reported with the
-	// rollback and does not stop it.
+	// version starts again, so it starts on the configuration and host
+	// networking it was running with: after the link has flipped back on a
+	// rollback, and without a flip when the stop or the activation failed. A
+	// failure is reported with the rollback and does not stop it.
 	BeforeRollbackStart func(ctx context.Context) error
+	// RollbackUnits is the unit spec of the version a rollback returns to. Nil
+	// leaves the unit files as they are, which is right when they were never
+	// rewritten; the agent sets it from the configuration the node ran with.
+	RollbackUnits *UnitSpec
 
 	// BeforeStart runs at the start of Start and Restart, before any unit is
 	// touched. The agent uses it to prepare GPU support, which depends on the
@@ -246,68 +250,100 @@ func root(version string) isolation.SlotRef {
 
 // Prepare installs the version directory and writes the agent-owned units. The
 // artifacts themselves are placed in the returned layout's bin directory by the
-// installers; the current link is not touched until Activate.
+// installers; the current link is not touched until Activate. It is for a node
+// that is not running: a LocalDNS unit a previous configuration left is stopped
+// before its file is removed.
 func (b *Backend) Prepare(ctx context.Context, n isolation.NodeSpec) (isolation.NodeRoot, error) {
+	r, err := b.PrepareVersion(ctx, n)
+	if err != nil {
+		return nil, err
+	}
+
+	if err := b.writeUnits(ctx, b.Units, true); err != nil {
+		return nil, err
+	}
+
+	return r, nil
+}
+
+// PrepareVersion installs the version directory without touching the units, so
+// a running node keeps running the units it started with. Upgrade writes the
+// units once the old stack has stopped.
+func (b *Backend) PrepareVersion(ctx context.Context, n isolation.NodeSpec) (Root, error) {
 	// Refuse a grant the host-native stack cannot honor before anything is
 	// written, so a failed Prepare leaves the node as it was.
 	if err := b.checkGrants(n.Grants); err != nil {
-		return nil, fmt.Errorf("grants: %w", err)
+		return Root{}, fmt.Errorf("grants: %w", err)
 	}
 
 	if _, err := b.Layout.Ensure(n.Slot); err != nil {
-		return nil, err
+		return Root{}, err
 	}
 
 	r := Root{Layout: b.Layout, Version: n.Slot}
 
 	if b.Install != nil {
 		if err := b.Install(ctx, r); err != nil {
-			return nil, fmt.Errorf("install %s: %w", n.Slot, err)
+			return Root{}, fmt.Errorf("install %s: %w", n.Slot, err)
 		}
 	}
 
-	units := b.Units
-	if units.BinDir == "" {
-		units.BinDir = b.Layout.BinDir()
-	}
-
-	if units.KubeletConfigPath == "" {
-		units.KubeletConfigPath = DefaultKubeletConfigPath
-	}
-
-	if !units.LocalDNS {
-		if err := b.retireLocalDNS(ctx); err != nil {
-			return nil, err
-		}
-	}
-
-	if _, err := WriteUnits(b.unitDir(), units); err != nil {
-		return nil, fmt.Errorf("write units: %w", err)
-	}
-
-	if _, err := WriteDropIns(b.unitDir(), units); err != nil {
-		return nil, fmt.Errorf("write unit drop-ins: %w", err)
-	}
-
-	if err := b.systemctl(ctx, "daemon-reload"); err != nil {
-		return nil, fmt.Errorf("daemon-reload: %w", err)
+	if err := b.LinkCNIPlugins(n.Slot); err != nil {
+		return Root{}, err
 	}
 
 	return r, nil
 }
 
-// retireLocalDNS stops and disables a LocalDNS unit left by a configuration
-// that had LocalDNS on, before WriteUnits deletes its file. The stack is derived
-// from the unit files, so a deleted unit would never be stopped again and
-// CoreDNS would keep the node's listeners. A unit that cannot be stopped is not
-// deleted.
-func (b *Backend) retireLocalDNS(ctx context.Context) error {
+// writeUnits writes the units and drop-ins for spec and reloads systemd. A
+// LocalDNS unit spec no longer has is disabled before its file goes, and also
+// stopped when stop is set; Upgrade clears stop because the stack is already
+// down, so retiring LocalDNS cannot take the running node with it (containerd
+// and kubelet Require it).
+func (b *Backend) writeUnits(ctx context.Context, spec UnitSpec, stop bool) error {
+	if spec.BinDir == "" {
+		spec.BinDir = b.Layout.BinDir()
+	}
+
+	if spec.KubeletConfigPath == "" {
+		spec.KubeletConfigPath = DefaultKubeletConfigPath
+	}
+
+	if !spec.LocalDNS {
+		if err := b.retireLocalDNS(ctx, stop); err != nil {
+			return err
+		}
+	}
+
+	if _, err := WriteUnits(b.unitDir(), spec); err != nil {
+		return fmt.Errorf("write units: %w", err)
+	}
+
+	if _, err := WriteDropIns(b.unitDir(), spec); err != nil {
+		return fmt.Errorf("write unit drop-ins: %w", err)
+	}
+
+	if err := b.systemctl(ctx, "daemon-reload"); err != nil {
+		return fmt.Errorf("daemon-reload: %w", err)
+	}
+
+	return nil
+}
+
+// retireLocalDNS disables a LocalDNS unit left by a configuration that had
+// LocalDNS on, stopping it first when stop is set, before WriteUnits deletes its
+// file. The stack is derived from the unit files, so a deleted unit would never
+// be stopped again and CoreDNS would keep the node's listeners. A unit that
+// cannot be stopped is not deleted.
+func (b *Backend) retireLocalDNS(ctx context.Context, stop bool) error {
 	if !b.unitExists(UnitLocalDNS) {
 		return nil
 	}
 
-	if err := b.systemctl(ctx, "stop", UnitLocalDNS); err != nil {
-		return fmt.Errorf("stop %s before removing it: %w", UnitLocalDNS, err)
+	if stop {
+		if err := b.systemctl(ctx, "stop", UnitLocalDNS); err != nil {
+			return fmt.Errorf("stop %s before removing it: %w", UnitLocalDNS, err)
+		}
 	}
 
 	if err := b.systemctl(ctx, "disable", UnitLocalDNS); err != nil {
@@ -391,6 +427,11 @@ func (b *Backend) Destroy(ctx context.Context, _ isolation.SlotRef) error {
 
 	owned := []string{UnitLocalDNS, UnitContainerd, UnitKubelet}
 
+	// A unit that did not stop keeps its file: removing it would leave a
+	// running service systemd can no longer name, and the next reset would not
+	// find it to stop.
+	stillRunning := map[string]bool{}
+
 	// Reverse start order: kubelet, containerd, LocalDNS.
 	for i := len(owned) - 1; i >= 0; i-- {
 		if !b.unitExists(owned[i]) {
@@ -399,22 +440,19 @@ func (b *Backend) Destroy(ctx context.Context, _ isolation.SlotRef) error {
 
 		if err := b.systemctl(ctx, "stop", owned[i]); err != nil {
 			errs = append(errs, fmt.Errorf("stop %s: %w", owned[i], err))
+			stillRunning[owned[i]] = true
 		}
 	}
 
-	if b.Proc != "" {
-		if err := killShims(b.Proc, b.kill); err != nil {
-			errs = append(errs, err)
-		}
-	}
-
-	if b.CgroupRoot != "" {
-		if err := killPodCgroups(b.CgroupRoot, b.kill); err != nil {
-			errs = append(errs, err)
-		}
+	if err := b.reapPods(); err != nil {
+		errs = append(errs, err)
 	}
 
 	for _, u := range owned {
+		if stillRunning[u] {
+			continue
+		}
+
 		if b.unitExists(u) {
 			if err := b.systemctl(ctx, "disable", u); err != nil {
 				errs = append(errs, fmt.Errorf("disable %s: %w", u, err))
@@ -435,9 +473,42 @@ func (b *Backend) Destroy(ctx context.Context, _ isolation.SlotRef) error {
 	}
 
 	// The active version cannot be removed individually, so a destroy of the
-	// whole node removes everything the agent installed.
+	// whole node removes everything the agent installed. A unit that is still
+	// running executes from it, so the versions stay until it is stopped.
+	if len(stillRunning) > 0 {
+		errs = append(errs, errors.New("keeping the installed versions because a unit did not stop"))
+
+		return errors.Join(errs...)
+	}
+
+	if err := b.UnlinkCNIPlugins(); err != nil {
+		errs = append(errs, err)
+	}
+
 	if err := b.Layout.RemoveAll(); err != nil {
 		errs = append(errs, err)
+	}
+
+	return errors.Join(errs...)
+}
+
+// reapPods ends what stopping the units leaves running: containerd runs with
+// KillMode=process so pods survive a containerd restart, which also means they
+// survive stopping it. The shims of the agent's containerd are killed, then the
+// pods' cgroups. Proc and CgroupRoot unset skip each step.
+func (b *Backend) reapPods() error {
+	var errs []error
+
+	if b.Proc != "" {
+		if err := killShims(b.Proc, b.kill); err != nil {
+			errs = append(errs, err)
+		}
+	}
+
+	if b.CgroupRoot != "" {
+		if err := killPodCgroups(b.CgroupRoot, b.kill); err != nil {
+			errs = append(errs, err)
+		}
 	}
 
 	return errors.Join(errs...)
@@ -514,10 +585,15 @@ func agentUnit(name string) string {
 	}
 }
 
-// Upgrade switches to an installed version: stop the stack, flip the link,
-// start the stack, and wait for ready. If any step after the flip fails the
-// link is flipped back and the previous version is started again. The node is
-// briefly down.
+// Upgrade switches to an installed version prepared with PrepareVersion: stop
+// the stack, end its pods, flip the link, write the units for b.Units, start the
+// stack, and wait for ready. If any step after the flip fails the stack is
+// stopped and its pods ended again, the link is flipped back, the units are
+// written for RollbackUnits, and the previous version is started again. The node
+// is briefly down.
+//
+// Pods are ended before BeforeUpgradeStart because that hook cleans the host
+// networking the old pods use. A soft reboot (Restart) leaves them alone.
 func (b *Backend) Upgrade(ctx context.Context, r isolation.SlotRef, waitReady func(context.Context) error) error {
 	if err := b.Stop(ctx, r); err != nil {
 		// Whatever stopped is restarted so a failed stop does not leave the
@@ -525,12 +601,20 @@ func (b *Backend) Upgrade(ctx context.Context, r isolation.SlotRef, waitReady fu
 		return errors.Join(fmt.Errorf("stop before upgrade: %w", err), b.restartUnchanged(ctx, r))
 	}
 
+	if err := b.reapPods(); err != nil {
+		return errors.Join(fmt.Errorf("end the pods before upgrade: %w", err), b.restartUnchanged(ctx, r))
+	}
+
 	prev, err := b.Activate(r)
 	if err != nil {
 		return errors.Join(fmt.Errorf("activate %s: %w", r.Slot(), err), b.restartUnchanged(ctx, r))
 	}
 
-	err = b.beforeUpgradeStart(ctx)
+	err = b.writeUnits(ctx, b.Units, false)
+	if err == nil {
+		err = b.beforeUpgradeStart(ctx)
+	}
+
 	if err == nil {
 		err = b.Start(ctx, r)
 	}
@@ -549,39 +633,50 @@ func (b *Backend) Upgrade(ctx context.Context, r isolation.SlotRef, waitReady fu
 		return err
 	}
 
-	// Roll back with a context that survives the cancellation that may have
-	// caused the failure.
-	rb := context.WithoutCancel(ctx)
-
-	var rbErrs []error
-
-	if serr := b.Stop(rb, r); serr != nil {
-		rbErrs = append(rbErrs, serr)
-	}
-
-	if _, ferr := b.Layout.Flip(prev); ferr != nil {
-		rbErrs = append(rbErrs, fmt.Errorf("flip back to %s: %w", prev, ferr))
-	}
-
-	if b.BeforeRollbackStart != nil {
-		if herr := b.BeforeRollbackStart(rb); herr != nil {
-			rbErrs = append(rbErrs, fmt.Errorf("restore configuration for %s: %w", prev, herr))
-		}
-	}
-
-	if herr := b.beforeUpgradeStart(rb); herr != nil {
-		rbErrs = append(rbErrs, fmt.Errorf("prepare host for %s: %w", prev, herr))
-	}
-
-	if serr := b.Start(rb, root(prev)); serr != nil {
-		rbErrs = append(rbErrs, fmt.Errorf("start %s: %w", prev, serr))
-	}
-
-	if len(rbErrs) > 0 {
-		return errors.Join(err, fmt.Errorf("rollback to %s failed: %w", prev, errors.Join(rbErrs...)))
+	if rbErr := b.Rollback(context.WithoutCancel(ctx), prev); rbErr != nil {
+		return errors.Join(err, fmt.Errorf("rollback to %s failed: %w", prev, rbErr))
 	}
 
 	return fmt.Errorf("%w (rolled back to %s)", err, prev)
+}
+
+// Rollback stops the stack and its pods, points the current link at prev,
+// writes the units for RollbackUnits (when set), runs BeforeRollbackStart and
+// starts prev. Upgrade calls it after a failure past the flip; the agent also
+// calls it at startup to finish an upgrade a crash interrupted. Every step is
+// attempted; the errors are joined.
+func (b *Backend) Rollback(ctx context.Context, prev string) error {
+	var errs []error
+
+	if err := b.Stop(ctx, root(prev)); err != nil {
+		errs = append(errs, err)
+	}
+
+	if err := b.reapPods(); err != nil {
+		errs = append(errs, err)
+	}
+
+	if _, err := b.Layout.Flip(prev); err != nil {
+		errs = append(errs, fmt.Errorf("flip back to %s: %w", prev, err))
+	}
+
+	if b.RollbackUnits != nil {
+		if err := b.writeUnits(ctx, *b.RollbackUnits, false); err != nil {
+			errs = append(errs, fmt.Errorf("restore the units of %s: %w", prev, err))
+		}
+	}
+
+	if b.BeforeRollbackStart != nil {
+		if err := b.BeforeRollbackStart(ctx); err != nil {
+			errs = append(errs, fmt.Errorf("restore configuration for %s: %w", prev, err))
+		}
+	}
+
+	if err := b.Start(ctx, root(prev)); err != nil {
+		errs = append(errs, fmt.Errorf("start %s: %w", prev, err))
+	}
+
+	return errors.Join(errs...)
 }
 
 // restartUnchanged starts the stack again after an upgrade failed before the

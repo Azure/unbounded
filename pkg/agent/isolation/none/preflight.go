@@ -52,7 +52,7 @@ func (h HostFS) DetectUnmanaged(ownedBase string) []string {
 	for _, f := range foreign {
 		for _, dir := range h.UnitDirs {
 			path := filepath.Join(dir, f.unit)
-			if _, err := os.Lstat(path); err == nil {
+			if _, err := os.Lstat(path); err == nil && !masked(path) {
 				findings = append(findings, fmt.Sprintf("%s unit %s exists and is not managed by the agent", f.binary, path))
 			}
 		}
@@ -68,6 +68,16 @@ func (h HostFS) DetectUnmanaged(ownedBase string) []string {
 	findings = append(findings, h.runningProcesses(ownedBase)...)
 
 	return findings
+}
+
+// masked reports whether the unit file at path is a mask: a link to /dev/null.
+// A masked unit cannot start, so it is no kubelet or containerd of its own. The
+// nspawn mode masks the distro's containerd and kubelet, which is what a host
+// that once ran nspawn keeps.
+func masked(path string) bool {
+	target, err := filepath.EvalSymlinks(path)
+
+	return err == nil && target == os.DevNull
 }
 
 func (h HostFS) runningProcesses(ownedBase string) []string {

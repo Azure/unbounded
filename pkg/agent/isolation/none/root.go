@@ -17,12 +17,20 @@ import (
 const (
 	installBinDir     = "/usr/local/bin"
 	installLibexecDir = "/usr/local/libexec"
+	// installCNIBinDir is where the CNI installer puts the plugins. They go in
+	// the version directory too, so a rollback also rolls them back; the host
+	// directory gets a link per plugin (see Backend.LinkCNIPlugins).
+	installCNIBinDir = "/opt/cni/bin"
 )
+
+// cniBinSubdir is where a version keeps its CNI plugins, relative to the
+// version directory.
+const cniBinSubdir = "cni/bin"
 
 // Root is the NodeRoot of one installed version. Every path is the identity
 // mapping, which is the same-path contract for /etc/containerd, /var/lib/kubelet,
-// /opt/cni and the rest, except the installer's bin and libexec directories,
-// which resolve into the version directory. That is what lets the installers
+// /etc/cni and the rest, except the installer's bin, libexec and CNI plugin
+// directories, which resolve into the version directory. That is what lets the installers
 // the nspawn rootfs uses place binaries in <base>/<version>/bin unchanged.
 type Root struct {
 	Layout  Layout
@@ -44,6 +52,7 @@ func (r Root) Path(inNode string) string {
 	for _, m := range []struct{ from, to string }{
 		{installBinDir, "bin"},
 		{installLibexecDir, "libexec"},
+		{installCNIBinDir, cniBinSubdir},
 	} {
 		if p == m.from || strings.HasPrefix(p, m.from+"/") {
 			return filepath.Join(r.Layout.VersionDir(r.Version), m.to, strings.TrimPrefix(p, m.from))

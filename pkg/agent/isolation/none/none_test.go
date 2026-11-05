@@ -6,6 +6,7 @@ package none
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"os"
@@ -174,6 +175,48 @@ func TestDetectUnmanagedIgnoresAgentOwnedProcess(t *testing.T) {
 	require.NoError(t, os.Symlink(filepath.Join(base, "v1", "bin", "containerd"), filepath.Join(proc, "exe")))
 
 	require.Empty(t, h.DetectUnmanaged(base))
+}
+
+// A unit masked to /dev/null cannot start; the nspawn mode leaves the distro's
+// containerd and kubelet masked, and a mask is not a foreign stack. A dangling
+// link or a link anywhere else still is.
+func TestDetectUnmanagedTreatsAMaskedUnitAsAbsent(t *testing.T) {
+	h, _ := fakeHost(t)
+	require.NoError(t, os.Symlink(os.DevNull, filepath.Join(h.UnitDirs[0], "kubelet.service")))
+	require.NoError(t, os.Symlink(os.DevNull, filepath.Join(h.UnitDirs[0], "containerd.service")))
+	require.Empty(t, h.DetectUnmanaged("/opt/unbounded/node"))
+
+	for _, u := range []string{"kubelet.service", "containerd.service"} {
+		require.NoError(t, os.Remove(filepath.Join(h.UnitDirs[0], u)))
+	}
+
+	real := filepath.Join(t.TempDir(), "containerd.service")
+	require.NoError(t, os.WriteFile(real, nil, 0o644))
+	require.NoError(t, os.Symlink(real, filepath.Join(h.UnitDirs[0], "containerd.service")))
+	require.NoError(t, os.Symlink(filepath.Join(t.TempDir(), "missing"), filepath.Join(h.UnitDirs[0], "kubelet.service")))
+
+	got := strings.Join(h.DetectUnmanaged("/opt/unbounded/node"), "\n")
+	require.Contains(t, got, "containerd unit")
+	require.Contains(t, got, "kubelet unit")
+}
+
+// Flip is durable: the link change is synced to the base directory, and a
+// version that is not installed is refused before anything changes.
+func TestFlipSyncsAndRefusesAMissingVersion(t *testing.T) {
+	l := Layout{Base: filepath.Join(t.TempDir(), "node")}
+	_, err := l.Ensure("v1")
+	require.NoError(t, err)
+
+	prev, err := l.Flip("v1")
+	require.NoError(t, err)
+	require.Empty(t, prev)
+
+	_, err = l.Flip("v2")
+	require.ErrorContains(t, err, "not installed")
+
+	cur, err := l.Current()
+	require.NoError(t, err)
+	require.Equal(t, "v1", cur)
 }
 
 func TestDetectUnmanagedAgentUnitsAreNotForeign(t *testing.T) {
@@ -377,8 +420,22 @@ func TestDestroyReportsFailuresButContinues(t *testing.T) {
 
 	rec.fail["systemctl stop "+UnitKubelet] = errors.New("stuck")
 
-	require.ErrorContains(t, b.Destroy(context.Background(), root("v1")), "stuck")
-	require.NoFileExists(t, filepath.Join(b.SystemdDir, UnitKubelet), "removal proceeds past a failed stop")
+	err = b.Destroy(context.Background(), root("v1"))
+	require.ErrorContains(t, err, "stuck")
+	require.ErrorContains(t, err, "keeping the installed versions")
+
+	// The unit that did not stop keeps its file, so it can still be named and
+	// stopped, and so do the binaries it runs. The rest is removed.
+	require.FileExists(t, filepath.Join(b.SystemdDir, UnitKubelet), "a unit whose stop failed is not removed")
+	require.NotContains(t, rec.calls, "systemctl disable "+UnitKubelet)
+	require.NoFileExists(t, filepath.Join(b.SystemdDir, UnitContainerd), "removal proceeds for the units that stopped")
+	require.DirExists(t, b.Layout.VersionDir("v1"))
+
+	// Once it stops, a second Destroy finishes the job.
+	delete(rec.fail, "systemctl stop "+UnitKubelet)
+	require.NoError(t, b.Destroy(context.Background(), root("v1")))
+	require.NoFileExists(t, filepath.Join(b.SystemdDir, UnitKubelet))
+	require.NoDirExists(t, b.Layout.base())
 }
 
 // ---- upgrade ----
@@ -409,9 +466,11 @@ func TestUpgradeSuccess(t *testing.T) {
 	require.Equal(t, []string{
 		"systemctl stop " + UnitKubelet,
 		"systemctl stop " + UnitContainerd,
+		"systemctl daemon-reload",
 		"systemctl enable --now " + UnitContainerd,
 		"systemctl enable --now " + UnitKubelet,
-	}, rec.calls)
+	}, rec.calls, "the units are written for the new version after the old stack stopped")
+	require.FileExists(t, filepath.Join(b.SystemdDir, UnitKubelet))
 }
 
 func TestUpgradeRollsBackWhenKubeletNeverReady(t *testing.T) {
@@ -425,8 +484,9 @@ func TestUpgradeRollsBackWhenKubeletNeverReady(t *testing.T) {
 	cur, _ := b.Layout.Current()
 	require.Equal(t, "v1", cur, "current flipped back")
 
-	// Stop, flip, start, wait fails, stop, flip back, start.
-	require.Len(t, rec.calls, 8)
+	// Stop, flip, write units, start, wait fails, stop, flip back, start. The
+	// rollback rewrites no units: RollbackUnits is not set.
+	require.Len(t, rec.calls, 9)
 	require.Equal(t, "systemctl enable --now "+UnitKubelet, rec.calls[len(rec.calls)-1])
 }
 
@@ -525,4 +585,117 @@ func TestNewDefault(t *testing.T) {
 	require.Equal(t, "/sys/fs/cgroup", b.CgroupRoot)
 	require.Equal(t, DefaultBase, b.Layout.base())
 	require.Nil(t, b.Kill)
+}
+
+// An upgrade ends the old pods after the stack stops and before the hook that
+// cleans host networking runs, so no pod outlives the networking it uses.
+func TestUpgradeEndsThePodsBeforeCleaningHostNetworking(t *testing.T) {
+	b, rec := newBackend(t)
+	installVersions(t, b, "v1", "v2")
+
+	var order []string
+
+	b.Proc = fakeProc(t, map[int]string{7: "containerd-shim"})
+	b.Kill = func(pid int) error { order = append(order, fmt.Sprintf("kill %d", pid)); return nil }
+	b.BeforeUpgradeStart = func(context.Context) error { order = append(order, "cleanup network"); return nil }
+
+	require.NoError(t, b.Upgrade(context.Background(), root("v2"), nil))
+	require.Equal(t, []string{"kill 7", "cleanup network"}, order)
+	require.Equal(t, "systemctl stop "+UnitContainerd, rec.calls[1], "the stack stopped first")
+}
+
+// A soft reboot restarts the units and leaves the pods running.
+func TestRestartLeavesThePodsRunning(t *testing.T) {
+	b, _ := newBackend(t)
+	installVersions(t, b, "v1")
+
+	killed := 0
+	b.Proc = fakeProc(t, map[int]string{7: "containerd-shim"})
+	b.Kill = func(int) error { killed++; return nil }
+
+	require.NoError(t, b.Restart(context.Background(), root("v1")))
+	require.Zero(t, killed)
+}
+
+// A pod that cannot be ended stops the upgrade before the flip, and the old
+// version comes back up.
+func TestUpgradeThatCannotEndThePodsRestartsTheOldVersion(t *testing.T) {
+	b, rec := newBackend(t)
+	installVersions(t, b, "v1", "v2")
+
+	b.Proc = fakeProc(t, map[int]string{7: "containerd-shim"})
+	b.Kill = func(int) error { return errors.New("denied") }
+
+	err := b.Upgrade(context.Background(), root("v2"), nil)
+	require.ErrorContains(t, err, "end the pods before upgrade")
+
+	cur, _ := b.Layout.Current()
+	require.Equal(t, "v1", cur)
+	require.Equal(t, "systemctl enable --now "+UnitKubelet, rec.calls[len(rec.calls)-1])
+}
+
+// LocalDNS on, then an upgrade to a configuration without it that fails: the
+// LocalDNS unit is retired only once the stack is down, and the rollback puts
+// it back so the previous version starts with the LocalDNS it ran with.
+func TestUpgradeRollbackRestoresTheLocalDNSUnitItRetired(t *testing.T) {
+	b, rec := newBackend(t)
+	b.Units.LocalDNS = true
+	_, err := b.Prepare(context.Background(), isolation.NodeSpec{Slot: "v1"})
+	require.NoError(t, err)
+	installVersions(t, b, "v1", "v2")
+
+	previous := b.Units
+	b.Units.LocalDNS = false
+	b.RollbackUnits = &previous
+	rec.calls = nil
+
+	err = b.Upgrade(context.Background(), root("v2"), func(context.Context) error { return errors.New("not Ready") })
+	require.ErrorContains(t, err, "rolled back to v1")
+
+	require.Equal(t, "systemctl stop "+UnitLocalDNS, rec.calls[2], "LocalDNS stops with the stack, last")
+	stops := 0
+
+	for _, c := range rec.calls {
+		if c == "systemctl stop "+UnitLocalDNS {
+			stops++
+		}
+	}
+
+	require.Equal(t, 1, stops, "the retirement does not stop it again")
+	require.Contains(t, rec.calls, "systemctl disable "+UnitLocalDNS)
+	require.FileExists(t, filepath.Join(b.SystemdDir, UnitLocalDNS), "the rollback wrote the LocalDNS unit back")
+	require.Equal(t, "systemctl enable --now "+UnitKubelet, rec.calls[len(rec.calls)-1])
+	require.Contains(t, rec.calls, "systemctl enable --now "+UnitLocalDNS, "the previous version starts LocalDNS again")
+}
+
+// LocalDNS off, then an upgrade that turns it on and fails: the rollback
+// removes the LocalDNS unit the upgrade added.
+func TestUpgradeRollbackRemovesTheLocalDNSUnitItAdded(t *testing.T) {
+	b, rec := newBackend(t)
+	_, err := b.Prepare(context.Background(), isolation.NodeSpec{Slot: "v1"})
+	require.NoError(t, err)
+	installVersions(t, b, "v1", "v2")
+
+	previous := b.Units
+	b.Units.LocalDNS = true
+	b.RollbackUnits = &previous
+	rec.calls = nil
+
+	err = b.Upgrade(context.Background(), root("v2"), func(context.Context) error { return errors.New("not Ready") })
+	require.ErrorContains(t, err, "rolled back to v1")
+	require.NoFileExists(t, filepath.Join(b.SystemdDir, UnitLocalDNS))
+	require.Equal(t, "systemctl enable --now "+UnitKubelet, rec.calls[len(rec.calls)-1])
+	require.NotContains(t, rec.calls[len(rec.calls)-2:], "systemctl enable --now "+UnitLocalDNS)
+}
+
+// PrepareVersion installs without touching the units of the running node.
+func TestPrepareVersionLeavesTheUnitsAlone(t *testing.T) {
+	b, rec := newBackend(t)
+
+	r, err := b.PrepareVersion(context.Background(), isolation.NodeSpec{Slot: "v1"})
+	require.NoError(t, err)
+	require.Equal(t, "v1", r.Slot())
+	require.DirExists(t, b.Layout.VersionDir("v1"))
+	require.NoFileExists(t, filepath.Join(b.SystemdDir, UnitKubelet))
+	require.Empty(t, rec.calls)
 }

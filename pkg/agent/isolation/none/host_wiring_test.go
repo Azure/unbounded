@@ -30,7 +30,9 @@ func TestRootMapsInstallDirsIntoVersionAndKeepsEverythingElse(t *testing.T) {
 	require.Equal(t, "/opt/unbounded/node/v1/bin/coredns", r.Path("/usr/local/bin/../bin/coredns"))
 
 	// Same-path contract: these resolve identically for every consumer.
-	for _, p := range []string{"/etc/containerd/config.toml", "/var/lib/kubelet/config.yaml", "/opt/cni/bin", "/run/containerd/containerd.sock", "/etc/containerd/certs.d/_default/hosts.toml"} {
+	require.Equal(t, "/opt/unbounded/node/v1/cni/bin/bridge", r.Path("/opt/cni/bin/bridge"), "the CNI plugins are versioned")
+
+	for _, p := range []string{"/etc/containerd/config.toml", "/var/lib/kubelet/config.yaml", "/etc/cni/net.d", "/run/containerd/containerd.sock", "/etc/containerd/certs.d/_default/hosts.toml"} {
 		require.Equal(t, p, r.Path(p))
 		require.Equal(t, p, r.Path(p[1:]))
 	}
@@ -279,24 +281,31 @@ func TestDestroyKillsShimsOnlyWhenProcIsSet(t *testing.T) {
 	require.Empty(t, killed)
 }
 
-func TestUpgradeRunsBeforeStartHookAndAgainOnRollback(t *testing.T) {
+// The upgrade hook prepares the host for the new version; the rollback hook,
+// not the upgrade hook, prepares it for the previous one, so the previous
+// version never starts on host networking set up for the new configuration.
+func TestUpgradeRunsTheUpgradeHookForTheNewVersionAndTheRollbackHookForThePrevious(t *testing.T) {
 	b, rec := newBackend(t)
 	installVersions(t, b, "v1", "v2")
 
 	var hooks []string
 
-	b.BeforeUpgradeStart = func(context.Context) error {
-		cur, err := b.Layout.Current()
-		require.NoError(t, err)
+	record := func(name string) func(context.Context) error {
+		return func(context.Context) error {
+			cur, err := b.Layout.Current()
+			require.NoError(t, err)
 
-		hooks = append(hooks, cur)
+			hooks = append(hooks, name+":"+cur)
 
-		return nil
+			return nil
+		}
 	}
+	b.BeforeUpgradeStart = record("upgrade")
+	b.BeforeRollbackStart = record("rollback")
 
 	err := b.Upgrade(context.Background(), root("v2"), func(context.Context) error { return errors.New("never ready") })
 	require.ErrorContains(t, err, "rolled back to v1")
-	require.Equal(t, []string{"v2", "v1"}, hooks, "cleanup runs with the new link, then with the restored one")
+	require.Equal(t, []string{"upgrade:v2", "rollback:v1"}, hooks)
 	require.NotEmpty(t, rec.calls)
 }
 
