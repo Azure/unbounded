@@ -38,6 +38,13 @@ such as which node holds which page.
 - Serve side: `WorkerCore::serve` (dispatch table, hot-page shedding over live body
   counters, copy-only answers, successor deferral). A body counts as streaming from
   its first byte until its last byte lands.
+- Visit order: a non-owner's Rank is answered with production `visit_order` (`Spread` over
+  `replica_score`, mesh neighbors first) and `demote_unanswered` over a node-wide
+  `liveness::Silence`, fed by the core's `Effect::Silence` (production `CandidatePolicy::apply`
+  into `LinkHealth`; racer-sim `apply`). Silence pings are not modeled, so a timed-out owner
+  stays demoted until it answers this node again.
+- Flight tables use production admission limits (`admission::Limits::default`: 64 flights of 64
+  waiters per worker, as racer-sim's `NodeConfig`); a join past them is answered `Overloaded`.
 - Overflow helpers: the core resolves a shed requester's helper with `mesh_helper`
   over `Pool::helper` of the real membership mesh.
 - Costs: ranking and dispatch on per-worker CPU servers, page transfers on per-node
@@ -65,13 +72,7 @@ such as which node holds which page.
   stale-membership `Sleep` never run.
 - Mesh relays and route failures (racer-sim's `SharedRoutes` in `sim/src/phantom.rs`):
   probes and transfers go directly between nodes. Relay quotas and relay sheds are absent.
-- The production 2 s per-attempt cap is implemented (`ModelSpec::attempt_timeout`,
-  `model::ATTEMPT_TIMEOUT`) but off by default (`NO_ATTEMPT_CAP`: an attempt ends at its
-  planned overall deadline). With the cap the Model fails more reads than racer-sim (see
-  Scale) and fails one read of `model-hot-page-storm-512`, so it stays off until that gap is
-  understood. Probes are otherwise planned as production does: `plan_attempt` on the read's
-  request budget, serving reads on `inherited_budget` within a 5 s serve scope, abandoned
-  exchanges stop their transfer.
+- Silence pings (`Silence::due_pings`, `ping_result`) and relay detours.
 - Node crash/restart, partitions and slow peers. Cache outages are the only node fault.
 - Admission quotas, persistence shedding (`persist_no_headroom`), memory tiers and the
   DiskIndex; per-node memory accounting (`memory.accounted_bytes_per_node`).
@@ -100,36 +101,37 @@ Every racer-sim number below is from the racer-sim release binary at this commit
 | | flight joins | 1008 | 1008 |
 | | latency ms | 59 / 109 / 121 | 77 / 148 / 153 |
 | cold start, 400 nodes | completed / failed | 6400 / 0 | 6400 / 0 |
-| | origin requests, origin/page | 30, 3 | 30, 3 |
-| | flight joins | 6061 | 8638 |
-| | sheds / helper copies | 91 / 3332 | 0 / 2250 |
-| | latency ms | 92 / 185 / 220 | 167 / 457 / 5093 |
-| cold start, 2000 nodes | completed / failed | 32000 / 0 | 31959 / 41 (33 `Unavailable`, 8 `Overloaded`) |
-| | origin requests, origin/page | 43, 3 | 40, 3 |
-| | flight joins | 30204 | 66227 |
-| | sheds / helper copies | 1536 / 27734 | 6229 / 26890 |
-| | latency ms | 126 / 2013 / 2125 | 244 / 10214 / 15326 |
+| | origin requests, origin/page | 30, 3 | 16, 1 |
+| | flight joins | 6061 | 9724 |
+| | sheds / helper copies | 91 / 3332 | 31 / 3220 |
+| | latency ms | 92 / 185 / 220 | 103 / 2047 / 2054 |
+| cold start, 2000 nodes | completed / failed | 32000 / 0 | 31958 / 42 (14 `Unavailable`, 28 `Overloaded`) |
+| | origin requests, origin/page | 43, 3 | 33, 3 |
+| | flight joins | 30204 | 68214 |
+| | sheds / helper copies | 1536 / 27734 | 6754 / 24629 |
+| | latency ms | 126 / 2013 / 2125 | 160 / 4130 / 6110 |
 | hot-page storm, 512 nodes | completed / failed | 513 / 0 | 513 / 0 |
 | | origin requests | 1 | 1 |
-| | sheds / helper probes / helper copies | 300 / 496 / 324 | 848 / 847 / 441 |
-| | flight joins | 614 | 841 |
-| | latency ms | 1879 / 2953 / 3192 | 5812 / 7097 / 7247 |
+| | sheds / helper probes / helper copies | 300 / 496 / 324 | 383 / 484 / 311 |
+| | flight joins | 614 | 642 |
+| | latency ms | 1879 / 2953 / 3192 | 1308 / 3204 / 3281 |
 | origin 403, 64 nodes | completed / failed | 1004 / 20 | 1007 / 17 |
 | | origin requests, origin/page | 36, 6 | 33, 12 |
-| | latency ms | 92 / 218 / 225 | 82 / 409 / 418 |
-| | flights reelected | 20 (`flight_reelected`) | 17 |
+| | latency ms | 92 / 218 / 225 | 74 / 400 / 407 |
+| | flights reelected | 20 (`flight_reelected`) | 19 |
 
 Tolerances. The Model passes every racer-sim check above, with these documented
 differences:
 
-- Origin requests: within 10% of racer-sim on every scenario (exact on cold readers,
-  cold start 400 and the hot page).
+- Origin requests: at most racer-sim's (exact on cold readers and the hot page; cold start
+  400 and 2000 reach origin less, 16 against 30 and 33 against 43, because spread readers
+  rarely send a non-rank-0 owner to origin before rank 0 publishes).
 - Completed and failed reads: equal, except cold start 2000 (41 of 32000 failures, inside racer-sim's own 1% bound) and origin 403 (fewer `OriginForbidden`
   failures; the 403 draw order differs because the Model's origin draws come from the
   DST `Choices` stream).
-- Latency: the Model is slower in the tail (p99 up to 5x on cold start 2000, where reads
-  wait out helper chains up to the 5 s serve scope; see Scale). The 2 s attempt cap is off
-  by default and there are no relays. Treat Model latency as an upper bound, not a match.
+- Latency: p50 within 1.5x of racer-sim; the Model is slower in the tail (p99 2x on cold
+  start 2000, about 11x on cold start 400, where a few reads wait out one 2 s attempt). There
+  are no relays. Treat Model tail latency as an upper bound, not a match.
 - Sheds, flight joins and helper copies: within an order of magnitude, not closer. The
   Model counts a join for every client or serving read that finds a running flight on its
   worker, including retries; racer-sim's counter may count differently (inference, not
@@ -138,41 +140,52 @@ differences:
   without relays owners never stream enough bodies at once to cross the hot-page threshold.
 - Origin/page under 403s: an interpreter draw-order difference, not a core decision
   difference. In both racer-sim and the Model every 403 fails exactly its leader and re-elects
-  one waiter (`flights_reelected` equals `origin_403`, asserted in
-  `origin_forbidden_fails_only_the_leader`), so origin requests are always pages + 403s
+  one waiter (`origin_forbidden_fails_only_the_leader` asserts one `OriginForbidden` failure
+  per 403 and at least as many re-elections; a leader shed by every owner re-elects too, 2 of
+  19 here), so origin requests are always pages + 403s
   (racer-sim 16 + 20 = 36, Model 16 + 17 = 33). The per-page maximum is the longest run of
   403 draws on one page; over Model seeds 1..20 it ranges 3..12 (mean 6), and seed 11 happens
   to be the 12 tail.
 
 ## Scale
 
-Root cause of the old 16% (10k) and 63% (50k) cold-start failures, with evidence from the
-`attempt_errors` breakdown (`MODEL_DIAG=1` adds probe, serve and send breakdowns): serving reads
-that failed were always answered `Unavailable`. 433,028 of them failed `Overloaded` (their owner
-shed them or its flight was full), so the requester saw `Unavailable` instead of a shed and never
-asked its helper; attempts failed within a second and retries burned out. The Model now answers
-a failed serving read with production `peer_error` (racer-sim `err_reply`); at 10k that alone
-took failures from 24,938 to 15. Two more interpreter facts were wrong and are fixed: owners
-never exempted their column mates (`ServeView::column_mate` was always false) and serving reads
-ran on a fixed budget instead of the probe's inherited one.
+Tolerance for the scale cold start (seed 8, every node reads one 16-page object in 10 ms):
+Model failures within 2x of racer-sim's and the same order of magnitude. This is not met
+yet:
 
-With faithful inherited budgets the numbers below are worse than with the old fixed serving
-budget, and worse than racer-sim (cold start, seed 8, `racer-sim --scenario empty` with the
-same storm; Model `model_memory_per_node`, release, no attempt cap):
+| Nodes | racer-sim failed | Model failed | Model retries | Model wall (release test) | Model peak RSS per node |
+|---|---|---|---|---|---|
+| 2,000 | 0 of 32,000 | 42 (0.13%) | 11,891 | 20 s with build | 77,365 B |
+| 10,000 | 180 (0.11%), 91,915 retries | 7,105 (4.4%) | 199,564 | 22 s with build | 87,821 B |
+| 50,000 | 24,742 (3.1%); 8 min 45 s, 8,041,764 KiB RSS | 235,631 (29%) | 1,695,494 | 3 min | 98,324 B |
 
-| Nodes | racer-sim failed | Model failed | Model wall | Model peak RSS per node |
-|---|---|---|---|---|
-| 2,000 | 0 of 32,000 | 41 (0.13%) | under 1 s run | 75,216 B |
-| 10,000 | 180 (0.11%), 5,139 probe timeouts | 3,944 (2.5%); 10,707 (6.7%) with the 2 s cap | 4 s run | 79,405 B |
-| 50,000 | 24,742 (3.1%), 16,379 probe timeouts; 8 min 45 s, 8,041,764 KiB RSS | 67,712 (8.5%) | 2 min 20 s | 82,272 B |
+What changed, with evidence (`MODEL_DIAG=1`):
 
-The remaining gap is inferred, not proven: with the 2 s cap every Model timeout is a reader's
-probe to its overflow helper (`timeout:reader->helper`), and at the moment it fires the helper is
-itself waiting on a probe to another non-owner (32,147 of 53,014) or an owner (16,054): helper
-flights chain through further helpers when owners shed column mates past the exempt cap, and
-serving reads that join such a flight wait out the chain. racer-sim reports 75k fast
-`helper_misses` where the Model's helpers wait. Next steps: relays (racer-sim routes through the
-delegate, which is also the helper), and comparing racer-sim's helper serve path line by line.
+- Every reader used to visit rank 0 first: the Model answered Rank with `Ranked::new`, whose
+  order is canonical, while production and racer-sim (`walk_ranking`, `world.rs:2324`) order a
+  non-owner's visits with `visit_order(Spread, ..)`. Only `owner0` ever shed. With Spread the
+  sheds split evenly over the three owners and median latency fell from 5.1 s to 0.24 s at 10k.
+- Flight tables used `FlightLimits::default` (1024 flights, 256 waiters); production and
+  racer-sim use 64 and 64 (`core/src/admission.rs`, `sim/src/config.rs` `NodeConfig`).
+  racer-sim rejects 153,034 serving-read joins at 10k, all `Overloaded` at owners.
+- Silence demotion (`demote_unanswered`) is production behavior and now modeled, but it
+  raises Model failures at 10k from 4,346 to 7,105; racer-sim has it on (`silence`,
+  `shed_busy`). Not explained yet; the Model lacks pings, which clear timed-out entries.
+- The 2 s attempt cap is now on by default; with Spread it no longer changes failure counts
+  (10k: 7,105 with, 6,923 without; 50k without silence: 219,355 with, 219,571 without).
+
+Where the gap is: failed walks have the same shape in both. racer-sim (temporary counters on
+`fill.asked`) fails 74,985 walks as "owner shed, helper failed, other owners unfunded" and
+8,827 as "owner shed, owner shed, unfunded"; the Model fails 187,900 and 23,458 walks with
+those shapes. The difference is how often the helper fails: racer-sim helpers answer 225k
+serving reads (43k lead a flight, 182k join one) and fail at most 80k; Model helpers answer
+324k (9.5k lead, 315k join) and fail 167k, almost all within 250 ms. A Model helper's flight
+is mostly led by the helper's own client read, so one failed client walk fails every reader
+waiting on it. Owner fan-in matches racer-sim (Model streaming bodies at send: half under 9,
+99% under 40; racer-sim p50 9, p99 36), so the shed rule itself is not the difference.
+Next steps: why Model helper flights fail more often (compare the helper's own client walk
+in both, per step), and why 50k is now worse than with canonical order (the 64-waiter limit
+is the remaining candidate; it was not isolated).
 
 Not ported yet (they need the gaps above): `slow_disk_sheds_persistence...` (persistence
 shedding), `reads_recover_after_partition_heals` (partitions), the relay, hung-peer and
@@ -196,11 +209,11 @@ The racer-sim baseline is 103,189 B/node for `full-cold-start` at 50,000 nodes (
 
 | Nodes | Peak RSS | Per node | Wall (release) | Notes |
 |---|---|---|---|---|
-| 2,000 | 150,433,792 B | 75,216 B | under 1 s | 0.13% of reads fail |
-| 10,000 | 794,058,752 B | 79,405 B | 4 s | 2.5% fail (see Scale) |
-| 50,000 | 4,113,645,568 B | 82,272 B | 2 min 20 s | 8.5% fail (see Scale) |
+| 2,000 | 154,730,000 B | 77,365 B | under 1 s | 0.13% of reads fail |
+| 10,000 | 878,210,000 B | 87,821 B | 4 s | 4.4% fail (see Scale) |
+| 50,000 | 4,916,200,000 B | 98,324 B | 3 min | 29% fail (see Scale) |
 
-At 50,000 nodes the Model uses about 80% of racer-sim's per-node peak (82,272 B against
+At 50,000 nodes the Model uses about 95% of racer-sim's per-node peak (98,324 B against
 103,189 B) and runs in minutes where racer-sim's `full-cold-start` takes 39 min. The
 workloads differ: racer-sim's `full-cold-start` runs the full control plane, and the Model
 runs the contention cold start (every node reads one 16-page object). The failure rate at
