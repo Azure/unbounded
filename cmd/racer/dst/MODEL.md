@@ -97,6 +97,16 @@ such as which node holds which page.
   as well (`sim/src/config.rs` `NodeConfig::default`). A requester's own shed search fails the
   probe `Overloaded` (production `request_network`, `src/peer.rs:919-931`), not `Unavailable`:
   it is no evidence against the destination (Model `fail_hop`, racer-sim `Reply::Overloaded`).
+- Peer crypto costs (peer wire v2): signing a request with n proofs costs `sign_ns + (n - 1) *
+  sign_hop_ns`, verifying it `verify_ns + (n - 1) * verify_hop_ns`, signing a response
+  `sign_response_ns` (racer-sim `Costs::sign_request`/`verify`, `sim/src/config.rs`; Model
+  `costs.toml` `[crypto]`, `Costs::sign_request`/`verify`). Values come from the ignored
+  `peer_crypto_cost_benchmark` (`src/peer/tests/opaque.rs`, release): 64, 76 and 114 us to sign
+  a direct request, a relayed request and a response; 73 and 160 us to verify one and two
+  proofs. They were 20 us per sign and 40 us per verify. A response is verified at
+  `verify_ns` whatever its relays (an inference; it was not measured). Head bytes are not
+  charged: peer messages are latency only (`Fabric::message`), and a v2 head (2,075 B direct,
+  3,208 B relayed) is small next to a 16 MiB page.
 - Request verification: every holder verifies the request on the crypto helper of the
   connection's worker and dispatches or relays only after (production `src/peer/server.rs:515-518`,
   `:792`; `src/worker.rs` `WorkerPair`). racer-sim does the same since this commit (`hop`,
@@ -111,8 +121,8 @@ such as which node holds which page.
   overload head (`peer_wire::overloaded_head`, `racer_core::route::unverified_failure`), which
   the previous holder reads as `Overloaded` (`src/peer/transport.rs`). Both fidelities count
   every crypto job a worker's helper holds (`Fabric::crypto_outstanding`) and shed a
-  verification at `crypto_queue` (racer-sim `NodeConfig::crypto_queue` 512, Model
-  `ModelSpec::crypto_queue` from `Limits::default`) through the same table (`verify_sheds`,
+  verification at `crypto_queue` (racer-sim `NodeConfig::crypto_queue`, Model
+  `ModelSpec::crypto_queue`, both `Limits::crypto_submissions`, `core/src/admission.rs`) through the same table (`verify_sheds`,
   racer-sim `verify_sheds_dest`/`verify_sheds_relay`). The shed is not silence: the last-hop
   record is dropped. Before this, both fidelities queued verifications without bound.
 - Pings: a silence ping is a peer request routed over the mesh (production
@@ -254,7 +264,23 @@ At 10,000 the Model now fails 2.2x racer-sim's reads (was 3.8x). At 50,000 the g
 28x (was 2.3x): racer-sim gained more from the helper fix than the Model did. The cause was
 racer-sim's divergence from production, found below (50,000-node gap).
 
-Current parity (seed 8, failed reads / origin requests, racer-sim release binary on
+Current parity, peer wire v2 costs and crypto queue 512 (seed 8, failed reads / origin
+requests, relay sheds, latency p50 / p99; other seeds and depths under Crypto queue depth
+below):
+
+| Nodes | racer-sim | Model | relay sheds (racer-sim / Model) | latency p50 / p99 (racer-sim / Model) |
+|---|---|---|---|---|
+| 400 | 0 / 16 | 0 / 16 | 21 / 20 | 101 ms, 0.20 s / 114 ms, 0.24 s |
+| 2,000 | 0 / 16 | 1 / 16 | 2,629 / 2,500 | 185 ms, 2.01 s / 197 ms, 2.13 s |
+| 10,000 | 582 / 16 (0.36%) | 17 / 16 (0.01%) | 32,599 / 20,485 | 403 ms, 2.68 s / 416 ms, 2.48 s |
+| 50,000 | 74,077 / 16 (9.3%) | 6,575 / 16 (0.82%) | 234,649 / 199,964 | 805 ms, 2.68 s / 757 ms, 2.84 s |
+
+The Model now fails fewer reads than racer-sim at 10,000 and 50,000, by more than the 2x
+tolerance (seed 3 at 50,000: 1.7% against 7.9%). Both fidelities share the crypto queue rule;
+the gap is in how many requests each lets reach a hot owner at once, which production caps
+(see Crypto queue depth below).
+
+Earlier parity, before the v2 costs (seed 8, failed reads / origin requests, racer-sim release binary on
 `tmp/parity/cold<N>.json`, Model `model_memory_per_node` with `MODEL_NODES`). racer-sim now has
 production's search slots (no queue) and request verification (see Modeled):
 
@@ -395,7 +421,88 @@ admission (`src/app.rs:480`); raising it, or giving the crypto pair its own limi
 too or touches `src/worker.rs` beyond one line, so it is not done here. Operators can raise it
 with `RACER_QUEUE_ENTRIES`. racer-sim fails 2.6x the Model at 50,000 with the fix (outside the
 2x tolerance); relay holds to the written answer moved racer-sim from 25,207 to 47,915 and the
-Model from 22,978 to 18,615, so the gap is in how long relays hold, not verification.
+Model from 22,978 to 18,615, so the gap is in how long relays hold, not verification. Answered with the v2 costs below.
+
+Crypto queue depth with peer wire v2 costs (decided: keep 512). Every row below uses the v2
+costs (see Peer crypto costs in Modeled). Cold start, failed reads (share of all reads),
+origin requests / most per page (racer-sim only), client read latency, relay sheds,
+verification sheds and peak RSS per node. racer-sim from its release binary with
+`"node": {"crypto_queue": <depth>}`; the Model from `model_memory_per_node` with
+`MODEL_CRYPTO_QUEUE` and `MODEL_SEED`:
+
+| Nodes | Seed | Depth | Fidelity | failed (%) | origin / most per page | p50 / p99 | relay sheds | verify sheds | peak B/node |
+|---|---|---|---|---|---|---|---|---|---|
+| 10,000 | 3 | 512 | model | 55 (0.03%) | 16 / - | 462 ms / 2.76 s | 21,213 | 106,354 | 89,165 |
+| 10,000 | 3 | 512 | sim | 37 (0.02%) | 16 / 1 | 403 ms / 2.42 s | 31,081 | 78,006 | 144,877 |
+| 10,000 | 3 | 1024 | model | 26 (0.02%) | 16 / - | 544 ms / 2.87 s | 23,422 | 31,516 | 88,892 |
+| 10,000 | 3 | 1024 | sim | 25 (0.02%) | 16 / 1 | 503 ms / 2.42 s | 33,517 | 24,865 | 144,425 |
+| 10,000 | 3 | 2048 | model | 26 (0.02%) | 16 / - | 610 ms / 2.76 s | 23,398 | 0 | 88,436 |
+| 10,000 | 3 | 2048 | sim | 26 (0.02%) | 16 / 1 | 537 ms / 2.15 s | 33,443 | 0 | 130,276 |
+| 10,000 | 8 | 64 | model | 154 (0.10%) | 16 / - | 357 ms / 2.43 s | 12,025 | 208,228 | 90,279 |
+| 10,000 | 8 | 64 | sim | 558 (0.35%) | 16 / 1 | 336 ms / 2.15 s | 20,052 | 209,130 | 145,537 |
+| 10,000 | 8 | 512 | model | 17 (0.01%) | 16 / - | 416 ms / 2.48 s | 20,485 | 85,816 | 89,137 |
+| 10,000 | 8 | 512 | sim | 582 (0.36%) | 16 / 1 | 403 ms / 2.68 s | 32,599 | 95,026 | 144,830 |
+| 10,000 | 8 | 1024 | model | 16 (0.01%) | 16 / - | 503 ms / 2.49 s | 23,368 | 30,573 | 88,659 |
+| 10,000 | 8 | 1024 | sim | 37 (0.02%) | 16 / 1 | 503 ms / 2.42 s | 33,491 | 24,967 | 144,527 |
+| 10,000 | 8 | 2048 | model | 16 (0.01%) | 16 / - | 560 ms / 2.36 s | 23,391 | 0 | 88,073 |
+| 10,000 | 8 | 2048 | sim | 23 (0.01%) | 16 / 1 | 537 ms / 2.68 s | 33,498 | 0 | 144,012 |
+| 50,000 | 3 | 512 | model | 13,357 (1.67%) | 16 / - | 946 ms / 2.93 s | 202,242 | 925,853 | 91,069 |
+| 50,000 | 3 | 512 | sim | 63,354 (7.92%) | 16 / 1 | 872 ms / 2.95 s | 236,859 | 1,348,636 | 137,659 |
+| 50,000 | 3 | 1024 | model | 5,569 (0.70%) | 16 / - | 1054 ms / 3.14 s | 221,589 | 657,770 | 91,203 |
+| 50,000 | 3 | 1024 | sim | 78,053 (9.76%) | 16 / 1 | 940 ms / 3.22 s | 279,221 | 1,175,956 | 137,288 |
+| 50,000 | 3 | 2048 | model | 13,975 (1.75%) | 16 / - | 1481 ms / 4.54 s | 290,987 | 625,946 | 90,983 |
+| 50,000 | 3 | 2048 | sim | 34,132 (4.27%) | 16 / 1 | 1208 ms / 4.29 s | 337,006 | 609,865 | 136,867 |
+| 50,000 | 8 | 64 | model | 48,394 (6.05%) | 16 / - | 622 ms / 2.59 s | 171,961 | 1,824,671 | 104,636 |
+| 50,000 | 8 | 64 | sim | 100,763 (12.60%) | 16 / 1 | 604 ms / 2.42 s | 189,300 | 2,257,055 | 166,936 |
+| 50,000 | 8 | 512 | model | 6,575 (0.82%) | 16 / - | 757 ms / 2.84 s | 199,964 | 801,822 | 90,116 |
+| 50,000 | 8 | 512 | sim | 74,077 (9.26%) | 16 / 1 | 805 ms / 2.68 s | 234,649 | 1,401,652 | 137,732 |
+| 50,000 | 8 | 1024 | model | 12,625 (1.58%) | 16 / - | 1013 ms / 3.29 s | 223,533 | 715,771 | 90,855 |
+| 50,000 | 8 | 1024 | sim | 56,027 (7.00%) | 16 / 1 | 1007 ms / 3.22 s | 266,702 | 982,175 | 137,374 |
+| 50,000 | 8 | 2048 | model | 10,366 (1.30%) | 16 / - | 1424 ms / 4.46 s | 298,377 | 534,842 | 90,707 |
+| 50,000 | 8 | 2048 | sim | 34,374 (4.30%) | 16 / 1 | 1342 ms / 4.29 s | 319,325 | 561,505 | 137,534 |
+
+- No depth brings both fidelities under 1% at 50,000. The Model stays between 0.7% and 1.8%
+  and is not monotonic in depth; racer-sim fails 7.0 to 9.8% at 512
+  and 1,024 and 4.3% at 2,048. A deeper queue raises p50 from about 0.8 s to 1.4 s and p99 from 2.7 s to 4.5 s.
+  At 10,000 every depth from 512 up fails at most 0.36%.
+- Memory does not depend on the depth. Each byte a queued verification pins is charged to
+  `RequestContext`: the receive buffer and decoded head (`http/src/connection.rs:444`, `:710`
+  through `HttpContext::charge`, `src/http.rs:79-83`) and `3 * head_bytes` held through
+  verification (`src/peer/server.rs:461-468`). That class is 32 MiB per worker
+  (`core/src/admission.rs` `request_context_bytes`), so a full queue pins at most 32 MiB per
+  worker and `32 MiB * workers` per node at 512, 1,024 or 2,048. A v2 head costs about 13 KB
+  this way (3,208 B relayed: buffer plus 3 copies), a head at `MAX_ENVELOPE_HEAD` (629,452 B)
+  up to about 3.1 MB, so about 10 of those fill the budget. Past it the reservation fails
+  `Overloaded` and the connection closes (`server.rs:468`). Without that cap, 2,048 such heads
+  would pin about 6.4 GB per worker.
+- Production cannot fill even 512. Inbound peer connections are capped at `IngressConnection`,
+  45 per worker by default (`core/src/admission.rs` `Rules::limit`, `client_connections` 64
+  minus 3 control and 16 outbound), by the listener (`src/peer/server.rs:252-255`, `:295`) or
+  the ingress handoff (`src/admission.rs` `reserve_ingress`). A connection serves one exchange
+  at a time (`server.rs:315-322`). So a worker holds at most 45 inbound and 16 outbound peer
+  crypto jobs (`Rules::peer_crypto_jobs`, 61), well under `Limits::crypto_submissions` (512);
+  the test `crypto_queue_holds_every_peer_exchange_of_a_worker` pins this. Raising the depth
+  would change nothing in production and would also raise flight queues, `ControlProgress`,
+  pipe waiters and the store queue, which share `queue_entries`.
+- Remaining failure cause (a fidelity gap, not fixed here). Neither fidelity models the ingress
+  cap: both let any number of requests reach a hot owner's worker at once and shed them only at
+  the crypto queue (racer-sim `hop`, Model `Model::hop`). The 1.4 M (racer-sim) and 0.8 M
+  (Model) verification sheds at 50,000 mean hundreds of requests at once on hot owners'
+  workers, which production would hold at 45 connections. Past that production does not
+  accept (`server.rs:295-297`) and the sender waits for its attempt to time out, not for an
+  unsigned overload. The depth-64 rows, closest to that cap, fail 6.1% (Model) and 12.6%
+  (racer-sim). Production at 50,000 may therefore fail more than either fidelity reports. The
+  next step is to model the ingress cap and its accept wait in both fidelities.
+- Signing placement (not changed). Production signs requests and responses inline on the I/O
+  worker (`src/peer.rs:464`, `:788`, `:926`; `src/peer/server.rs:662` and the other
+  `sign_response` calls); only verification goes to the crypto helper
+  (`src/peer/forwarding.rs` `verify_request_async`, `verify_response_async`). Both fidelities
+  charge signing on the crypto helper, so signing counts toward the crypto queue. Charging it to
+  worker CPU instead was tried: racer-sim passed its tests and failed 0.09% at 50,000 (seed 8,
+  depth 2,048), but the Model failed 8.8% (seed 8, 512) and `model-hung-peers` failed 6 to 23
+  reads over seeds 1 to 8 (its bound is 3; 0 to 4 with signing on the helper). Requester signing
+  alone causes it, and even 20 us per sign on worker CPU does. The cause is not found; it is a
+  lead on the Model's worker CPU, which signing on the helper hides.
 
 Earlier leads, kept for the record: read attempts failed at similar rates but the Model's
 failures clustered (four attempts within a second); per-node route caches, the destination not
