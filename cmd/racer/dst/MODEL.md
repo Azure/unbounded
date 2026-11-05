@@ -150,78 +150,76 @@ such as which node holds which page.
 ## Peer connection slots
 
 Production semantics (cited from `cmd/racer/src`; the shared table is
-`core/src/connections.rs`, opt-in: Model `ModelSpec::connections`, racer-sim
-`NodeConfig::connections`, off by default so existing scenarios keep their transport):
+`core/src/connections.rs`, on by default: Model `ModelSpec::connections`
+(`PeerConnections::Production`), racer-sim `NodeConfig::connections`):
 
-- Ingress: 45 `IngressConnection` slots per worker (`core/src/admission.rs` `Rules::limit`:
-  `client_connections` 64 less 3 control and 16 outbound), shared node-wide: the listener
-  reserves a slot on any worker before `accept` (`src/peer/server.rs:255-292`,
-  `AcceptMode::Distributed`, chosen at `src/app.rs:1569-1589`; `flow-core/src/admission.rs`
-  `Handoff::reserve`). With every worker full it stops accepting (`Poll::Pending` at
-  `server.rs:270`); new connections wait in the kernel accept queue (std `TcpListener::bind`
-  backlog 128, `io/src/ring/fd.rs:118-121`; an inference for hosts whose `somaxconn` is
-  lower). The sender's connect completes and it waits until its attempt times out; past the
-  backlog the handshake is dropped and it hears nothing. Neither is an `Overloaded` answer.
+- Ingress: `PeerIngressConnection` slots, `RACER_PEER_CONNECTIONS_PER_WORKER` (2,048) per
+  worker, apart from client connections (`core/src/admission.rs` `Rules::limit`), shared
+  node-wide: the listener reserves a slot on any worker before `accept` (`src/peer/server.rs`
+  `listen`, `AcceptMode::Distributed` with the peer handoff `NodeState::peer_ingress`,
+  `src/app.rs`). With every worker full it accepts the connection only to write the unsigned
+  overload head and close it (`PeerServer::refuse`); the sender's handshake reads it in place
+  of the challenge and fails `Overloaded` at once (`peer-wire/src/session.rs` `connect`).
 - A connection serves one exchange at a time and stays open between them: the server waits
-  `request_timeout` (30 s, `src/config.rs:2262`) for the next head (`server.rs:451`
-  `header_scope`), the sender pools it idle for 30 s (`src/http.rs` `pool_with_limits`). An
-  idle connection keeps its ingress slot.
-- Outbound: each worker's HTTP pool holds at most 15 ordinary connections, busy or idle
-  (`OrdinaryOutboundConnection`, `src/admission.rs:431-457`), and 2 busy per next hop
-  (`connections_per_neighbor`, `src/app.rs:1346-1350`, `src/http.rs:425-428`). Peer
-  exchanges check out without waiting (`src/peer/transport.rs:1296` `checkout_with_state`;
-  `http/src/connection.rs:1702-1704` per-endpoint cap, `:1796-1802` clears idle then fails):
-  past either cap the exchange fails `Overloaded` at once.
+  `request_timeout` (30 s) for the next head, the sender pools it idle for 30 s. An idle
+  connection keeps its ingress slot.
+- Outbound: each worker's HTTP pool holds at most `RACER_OUTBOUND_CONNECTIONS_PER_WORKER` (64)
+  connections, 63 ordinary (one kept for origin metadata), busy or idle, and
+  `RACER_NEIGHBOR_CONNECTIONS_PER_WORKER` (8) busy per next hop. Peer exchanges check out
+  without waiting (`src/peer/transport.rs` `checkout_with_state`): past either cap the exchange
+  fails `Overloaded` at once.
+- Route searches: 8 per worker run at once and 64 more wait in arrival order
+  (`src/app.rs` `with_queue(DEFAULT_SEARCH_QUEUE)`; Model `search_start`).
 
-Cold start (16-page object read by every node in 10 ms, failed reads, origin requests, read
-latency p50 / p99). "off" is the previous transport with worker signing; "prod" production
-connection semantics; "evict" and "refuse" proposed fixes (not production: a full listener
-closes its longest-idle inbound connection, and answers the overload head when nothing is
-idle); "wide" adds 1,024 ingress slots per node. Release builds, `tmp/parity/run.sh`:
+`ConnectionConfig::legacy` (racer-sim `conn_legacy`) keeps the earlier listener for
+comparison: 45 ingress slots per worker taken from `client_connections`, 15 outbound, 2 per
+hop, and a full listener that leaves connections in the kernel accept queue (backlog 128)
+until the sender's attempt times out.
 
-| Nodes | Seed | Mode | Model failed | Model origin, p50/p99 | racer-sim failed | racer-sim origin, p50/p99 |
-|---|---|---|---|---|---|---|
-| 2,000 | 8 | off | 1 (0.00%) | 16, 163 ms/2.13 s | 1 (0.00%) | 16, 150 ms/2.01 s |
-| 2,000 | 8 | prod | 2,034 (6.4%) | 24, 2.11/12.1 s | 3,421 (10.7%) | 26, 2.01/8.05 s |
-| 2,000 | 3 | prod | 1,880 (5.9%) | 24, 2.10/12.1 s | 3,295 (10.3%) | 21, 2.01/8.05 s |
-| 2,000 | 8 | evict | 533 (1.7%) | 16, 2.09/6.13 s | 168 (0.5%) | 18, 2.01/5.91 s |
-| 2,000 | 8 | evict+refuse | 510 (1.6%) | 16, 149 ms/2.06 s | 284 (0.9%) | 16, 134/301 ms |
-| 10,000 | 8 | off | 22 (0.01%) | 16, 248 ms/2.18 s | 42 (0.03%) | 16, 218 ms/2.15 s |
-| 10,000 | 8 | prod | 55,968 (35.0%) | 28, 4.09/10.1 s | 58,959 (36.9%) | 31, 4.03/8.05 s |
-| 10,000 | 3 | prod | 55,451 (34.7%) | 29, 4.11/10.1 s | 60,683 (37.9%) | 30, 4.03/8.05 s |
-| 10,000 | 8 | evict | 24,492 (15.3%) | 22 | 31,102 (19.4%) | 20 |
-| 10,000 | 8 | evict+refuse | 14,376 (9.0%) | 16, 275 ms/2.19 s | 21,557 (13.5%) | 16, 268 ms/2.15 s |
-| 10,000 | 8 | wide | - | - | 1,626 (1.0%) | 16, 251 ms/2.15 s |
-| 50,000 | 8 | off | 31,338 (3.9%) | 16, 469 ms/2.40 s | 15,396 (1.9%) | 16, 402 ms/2.42 s |
-| 50,000 | 8 | prod | 589,542 (73.7%) | 46, 2.35/12.1 s | 594,189 (74.3%) | 37, 4.03/8.05 s |
-| 50,000 | 3 | prod | 591,552 (73.9%) | 44, 2.47/10.3 s | 604,347 (75.5%) | 36, 4.03/8.05 s |
-| 50,000 | 8 | evict | 492,456 (61.6%) | 34 | 509,754 (63.7%) | 28 |
-| 50,000 | 8 | evict+refuse | 425,685 (53.2%) | 16, 293 ms/2.12 s | 469,263 (58.7%) | 16, 335 ms/2.15 s |
-| 50,000 | 8 | wide | - | - | 50,483 (6.3%) | 16, 369 ms/2.15 s |
+Cold start (16-page object read by every node in 10 ms; failed reads, origin requests, read
+latency p50 / p99), production defaults, release builds (`tmp/p8/run.sh`):
 
-Findings:
+| Nodes | Seed | Model failed | Model origin, p50/p99 | racer-sim failed | racer-sim origin, p50/p99 |
+|---|---|---|---|---|---|
+| 2,000 | 8 | 1 (0.00%) | 16, 165 ms/2.14 s | 0 (0.00%) | 16, 150 ms/2.01 s |
+| 2,000 | 3 | 2 (0.01%) | 16, 163 ms/2.16 s | 1 (0.00%) | 16, 150 ms/2.01 s |
+| 10,000 | 8 | 20 (0.01%) | 16, 264 ms/2.30 s | 26 (0.02%) | 16, 218 ms/2.15 s |
+| 10,000 | 3 | 28 (0.02%) | 16, 267 ms/2.31 s | 21 (0.01%) | 16, 218 ms/2.15 s |
+| 50,000 | 8 | 3,772 (0.47%) | 16, 499 ms/2.46 s | 8,457 (1.06%) | 16, 436 ms/2.42 s |
+| 50,000 | 3 | 4,083 (0.51%) | 16, 485 ms/2.49 s | 10,521 (1.32%) | 16, 436 ms/2.42 s |
 
-- The fidelities agree within 1.3x everywhere with production semantics, and both say
-  production fails the cold start badly: 6 to 11% at 2,000, 35 to 38% at 10,000, 74 to 76%
-  at 50,000 (both seeds). Without connection slots the same fidelities fail 0.00 to 3.9%.
-- Bottleneck, in order: hot owners' and relays' ingress (90 slots per 2-worker node) with
-  connections queued in the accept queue past their 2 s attempts (50,000, seed 8: 1.6 to
-  1.9 M queued, 185 to 279 K abandoned in the queue, 385 to 438 K dropped by the full
-  backlog), outbound per-hop and pool refusals (4.3 to 4.4 M `Overloaded` links), then route
-  search sheds. Idle pinning is a large share at 2,000 (eviction cuts failures 4 to 20x) and a
-  smaller one at scale. Raising ingress to 1,024 per node with eviction and refusal brings
-  racer-sim to 1.0% at 10,000 and 6.3% at 50,000: the cap, not crypto, now bounds the cold
-  start, and the crypto queue no longer sheds at all.
-- Proposed production fixes (network side, not implemented): close idle inbound peer
-  connections when ingress is full (or a short server-side keepalive for peer connections);
-  answer the unsigned overload head instead of leaving connections in the accept queue; size
-  peer ingress separately from `client_connections` (a peer exchange holds little memory) or
-  multiplex exchanges per connection; let peer checkout wait briefly (`checkout_wait`) instead
-  of failing at the 2-per-hop cap; give route searches a queue.
-- Not modeled: the accept queue is admitted on the next event after a slot frees (no
-  dedicated timer); a refused connection is seen at once rather than one round trip later;
+With the legacy limits the same cold start failed 6 to 11% at 2,000, 35 to 38% at 10,000
+and 74 to 76% at 50,000 nodes in both fidelities.
+
+How the combination was chosen (racer-sim, 50,000 nodes, seed 8, failed reads):
+
+| Variant | Failed |
+|---|---|
+| legacy | 74.3% |
+| legacy + idle eviction + refusal | 58.7% |
+| + 1,024 ingress per node, eviction, refusal | 6.3% |
+| + route search queue | 5.7% |
+| 4,096 per node, 8 per hop, 64 outbound, queue, no refusal | 7.7% |
+| same with idle eviction, no refusal | 6.3% |
+| 2,048 per node, refusal, 8 per hop, 64 outbound, queue | 2.75% |
+| same with idle eviction | 0.83% |
+| 4,096 per node (2,048 per worker), refusal, 8 per hop, 64 outbound, queue (production) | 1.06% |
+| 8,192 per node, refusal, 8 per hop, 64 outbound, queue | 0.86% (nothing refused) |
+
+- Refusal is required at every ingress size: without it hot owners' queued connections
+  outlive their attempts. Idle eviction (`Config::evict_idle`) helps only while ingress is
+  small; production would need cross-worker coordination to close another worker's idle
+  connection, so it stays a fidelity option. A shorter idle timeout (2 s or 250 ms) helped
+  less than eviction (2.0 to 2.4%).
+- The route search queue removes about 1 M search sheds per run; outbound and per-hop caps
+  matter once ingress no longer binds (4 per hop 1.3%, 8 per hop 1.1%). A bounded checkout
+  wait was not needed.
+- With 8,192 ingress per node nothing is refused and 0.86% still fails: the rest is hot-page
+  and relay shedding, not connection slots.
+- Not modeled: a refused connection is seen at once rather than one round trip later;
   connection setup costs no time; the server's worker per connection is the Model's
-  `conn_worker`, not the listener's choice.
+  `conn_worker`, not the listener's choice; a queued route search does not leave the queue on
+  its deadline in the Model.
 
 ## Not modeled yet
 
