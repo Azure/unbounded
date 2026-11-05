@@ -29,7 +29,6 @@ poly1305 = { version = "0.9", features = ["zeroize"] }
 ed25519-dalek = { version = "2", features = ["pkcs8"] }
 sha2 = "0.10"
 zeroize = "1"
-crc64fast = "1.1.0"
 # Tag-only page verification (GHASH without decrypting).
 ghash = { version = "0.6", features = ["zeroize"] }
 

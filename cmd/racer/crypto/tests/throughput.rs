@@ -3,10 +3,9 @@
 //! Run pinned to one CPU:
 //! `taskset -c 2 cargo test --release -p racer-crypto --test throughput -- --ignored --nocapture`
 use racer_crypto::TAG_LEN;
-use racer_crypto::copy_prefix_crc64;
-use racer_crypto::crc64;
 use racer_crypto::open;
 use racer_crypto::seal;
+use racer_crypto::verify_tag;
 use std::hint::black_box;
 use std::time::Instant;
 
@@ -50,17 +49,15 @@ fn page_crypto_throughput() {
         open(&key, &nonce(0), &aad, &sealed, &mut opened).unwrap();
     });
     assert_eq!(opened, plaintext);
-    let crc_rate = rate(iterations, |_| {
-        black_box(crc64(black_box(&sealed[..PAGE])));
-    });
-    let copy_crc_rate = rate(iterations, |_| {
-        black_box(copy_prefix_crc64(black_box(&sealed[..PAGE]), &mut opened).unwrap());
+    let (body, tag) = sealed.split_at(PAGE);
+    let verify_rate = rate(iterations, |_| {
+        verify_tag(&key, &nonce(0), &[&aad], black_box(body), tag).unwrap();
     });
     let copy_rate = rate(iterations, |_| {
-        opened.copy_from_slice(black_box(&sealed[..PAGE]));
+        opened.copy_from_slice(black_box(body));
         black_box(&opened);
     });
     println!(
-        "CRYPTO_BENCH {{\"page_bytes\":{PAGE},\"pages\":{iterations},\"seal_gib_s\":{seal_rate:.3},\"open_gib_s\":{open_rate:.3},\"crc64_gib_s\":{crc_rate:.3},\"copy_prefix_crc64_gib_s\":{copy_crc_rate:.3},\"memcpy_gib_s\":{copy_rate:.3}}}"
+        "CRYPTO_BENCH {{\"page_bytes\":{PAGE},\"pages\":{iterations},\"seal_gib_s\":{seal_rate:.3},\"open_gib_s\":{open_rate:.3},\"verify_tag_gib_s\":{verify_rate:.3},\"memcpy_gib_s\":{copy_rate:.3}}}"
     );
 }

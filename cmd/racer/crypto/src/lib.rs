@@ -3,7 +3,7 @@
 //! Primitive callers supply entropy, ensure nonce uniqueness for each key, and
 //! choose domain separation. AEAD borrows input and writes directly to caller-owned
 //! output without allocating or staging plaintext. Public-key parsing does not
-//! establish identity or trust. CRC detects accidental corruption, not forgery.
+//! establish identity or trust.
 //!
 //! Callers must protect and erase their input seeds, key buffers, and imported
 //! DER. Secret-key ownership and explicit PKCS#8 export retain upstream
@@ -13,8 +13,6 @@
 //! Public workflows and standard vectors live in `tests/primitives.rs`; private
 //! epoch/cache state-space tests remain here. Tests do not establish timing or
 //! secret-erasure guarantees. Run `cargo test -p racer-crypto` from the workspace.
-//! Select ignored CRC hardware tests individually on supported hosts; they fail
-//! on unsupported hardware rather than silently skipping.
 
 // `deny` rather than `forbid` so the single SIMD GHASH module can opt in with a
 // scoped `allow`; every other module still rejects `unsafe`.
@@ -542,37 +540,6 @@ pub fn ct_eq(a: &[u8], b: &[u8]) -> bool {
     a.iter().zip(b).fold(0u8, |diff, (a, b)| diff | (a ^ b)) == 0
 }
 
-/// CRC-64/XZ checksum. Detects accidental corruption, not malicious changes.
-pub fn crc64(bytes: &[u8]) -> u64 {
-    let mut digest = crc64fast::Digest::new();
-    digest.write(bytes);
-    digest.sum64()
-}
-
-/// Bytes copied and then checksummed while they are still cache resident.
-const COPY_CRC_CHUNK: usize = 128 * 1024;
-
-/// Copy the leading `out.len()` bytes of `input` into `out` and return the
-/// CRC-64/XZ of all of `input`, reading `input` from memory only once.
-///
-/// Each chunk is checksummed from `out` right after it is copied, while it is
-/// still in cache, so this costs about one pass instead of a copy plus a
-/// separate checksum scan. Fails without touching `out` when `out` is longer
-/// than `input`.
-pub fn copy_prefix_crc64(input: &[u8], out: &mut [u8]) -> Result<u64, Error> {
-    let (prefix, rest) = input.split_at_checked(out.len()).ok_or(Error(()))?;
-    let mut digest = crc64fast::Digest::new();
-    for (from, to) in prefix
-        .chunks(COPY_CRC_CHUNK)
-        .zip(out.chunks_mut(COPY_CRC_CHUNK))
-    {
-        to.copy_from_slice(from);
-        digest.write(to);
-    }
-    digest.write(rest);
-    Ok(digest.sum64())
-}
-
 pub mod identity {
     //! Trust roots, certificate validation, and locally generated Ed25519 identities.
     //!
@@ -588,7 +555,7 @@ pub mod identity {
     //! caller-owned. Purpose, cache, and key ID checks do not consult current admission.
     //!
     //! Callers own nonce uniqueness, canonical AAD/messages, quotas, cancellation,
-    //! CRC checks, telemetry, and completion ownership. PKCS8 persistence export is
+    //! integrity checks, telemetry, and completion ownership. PKCS8 persistence export is
     //! explicit and zeroizing. Errors contain no input data. Certificate caches are
     //! worker-local and non-Send; verified peers cannot be constructed by callers.
     //! This module has no dependency on the dataplane worker or service graph.

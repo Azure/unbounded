@@ -1,5 +1,5 @@
-//! Phase 0 benchmark gate: tag-only XAES-256-GCM verification versus the
-//! CRC64 integrity check and a full open, on 16 MiB pages.
+//! Tag-only XAES-256-GCM verification versus a full open and a plain copy,
+//! on 16 MiB pages.
 //!
 //! Run with:
 //! `cargo test --release -p racer-crypto --test page_verify_bench -- --ignored --nocapture`
@@ -7,7 +7,7 @@
 use std::hint::black_box;
 use std::time::{Duration, Instant};
 
-use racer_crypto::{TAG_LEN, crc64, open, seal, verify_tag};
+use racer_crypto::{TAG_LEN, open, seal, verify_tag};
 
 const PAGE: usize = 16 << 20;
 const ROUNDS: usize = 24;
@@ -28,7 +28,7 @@ fn time(mut work: impl FnMut()) -> Duration {
 
 #[test]
 #[ignore = "release-mode throughput benchmark"]
-fn tag_verify_versus_crc64_versus_open_on_16_mib_pages() {
+fn tag_verify_versus_open_and_memcpy_on_16_mib_pages() {
     let key = [7u8; 32];
     let nonce = [9u8; 24];
     let aad = [3u8; 96];
@@ -38,8 +38,9 @@ fn tag_verify_versus_crc64_versus_open_on_16_mib_pages() {
     let (body, tag) = sealed.split_at(PAGE);
     let mut out = vec![0u8; PAGE];
 
-    let crc = time(|| {
-        black_box(crc64(black_box(&sealed)));
+    let copy = time(|| {
+        out.copy_from_slice(black_box(body));
+        black_box(&out);
     });
     let tag_verify = time(|| {
         verify_tag(&key, &nonce, &[&aad], black_box(body), tag).unwrap();
@@ -47,10 +48,14 @@ fn tag_verify_versus_crc64_versus_open_on_16_mib_pages() {
     let full = time(|| {
         open(&key, &nonce, &aad, black_box(&sealed), &mut out).unwrap();
     });
-    let (crc, tag_verify, full) = (gib_per_sec(crc), gib_per_sec(tag_verify), gib_per_sec(full));
+    let (copy, tag_verify, full) = (
+        gib_per_sec(copy),
+        gib_per_sec(tag_verify),
+        gib_per_sec(full),
+    );
     eprintln!(
-        "crc64 {crc:.2} GiB/s, verify_tag {tag_verify:.2} GiB/s, open {full:.2} GiB/s, \
-         tag time / crc time {:.3}",
-        crc / tag_verify
+        "memcpy {copy:.2} GiB/s, verify_tag {tag_verify:.2} GiB/s, open {full:.2} GiB/s, \
+         open time / tag time {:.3}",
+        tag_verify / full
     );
 }

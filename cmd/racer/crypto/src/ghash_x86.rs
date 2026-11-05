@@ -3,7 +3,7 @@
 //! This is the only module in the crate that uses `unsafe`. It exists because
 //! the `ghash`/`polyval` crates process at most four blocks per reduction and
 //! re-check CPU features and byte-reverse through a generic copy on every
-//! call, which caps tag-only page verification well below CRC64 speed.
+//! call, which caps tag-only page verification well below memory bandwidth.
 //!
 //! GHASH is computed in the POLYVAL domain (RFC 8452, appendix A):
 //! `GHASH(H, X) = rev(POLYVAL(mulX(rev(H)), rev(X_1), ..., rev(X_n)))`.
