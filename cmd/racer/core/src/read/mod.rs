@@ -21,6 +21,7 @@ pub mod hints;
 pub mod serve;
 pub mod walk;
 pub mod window;
+pub mod worker;
 
 // Read-path decision errors: a subset of the dataplane's, so core decisions never widen what the
 // dataplane can observe.
