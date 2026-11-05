@@ -99,6 +99,10 @@ type ScriptSnapshot struct {
 
 // +kubebuilder:validation:XValidation:rule="duration(self.backendActiveDeadline) > duration('0s')",message="backendActiveDeadline must be positive"
 // +kubebuilder:validation:XValidation:rule="self.backend != 'MPIJob' || (has(self.gpuCount) && self.gpuCount > 0)",message="MPIJob checks require a positive gpuCount"
+// +kubebuilder:validation:XValidation:rule="!has(self.minDuration) || duration(self.minDuration) > duration('0s')",message="minDuration must be positive"
+// +kubebuilder:validation:XValidation:rule="!has(self.minDuration) || duration(self.minDuration) <= duration(self.backendActiveDeadline)",message="minDuration must not exceed backendActiveDeadline"
+// +kubebuilder:validation:XValidation:rule="!has(self.continuity) || !has(self.continuity.maxSampleGap) || duration(self.continuity.maxSampleGap) <= duration(self.backendActiveDeadline)",message="maxSampleGap must not exceed backendActiveDeadline"
+// +kubebuilder:validation:XValidation:rule="!has(self.minDuration) || !has(self.continuity) || !has(self.continuity.maxSampleGap) || duration(self.continuity.maxSampleGap) <= duration(self.minDuration)",message="maxSampleGap must not exceed minDuration"
 type CertificationCheckSnapshot struct {
 	// ID and Order are derived from the check's position and are never serialized.
 	ID     CheckID        `json:"-"`
@@ -109,8 +113,19 @@ type CertificationCheckSnapshot struct {
 	Backend        ExecutionBackend `json:"backend"`
 	WorkloadPolicy WorkloadPolicy   `json:"workloadPolicy,omitempty"`
 	// +kubebuilder:validation:Minimum=0
-	GPUCount              int32           `json:"gpuCount,omitempty"`
-	BackendActiveDeadline metav1.Duration `json:"backendActiveDeadline"`
+	GPUCount              int32             `json:"gpuCount,omitempty"`
+	BackendActiveDeadline metav1.Duration   `json:"backendActiveDeadline"`
+	MinDuration           *metav1.Duration  `json:"minDuration,omitempty"`
+	Continuity            *ContinuityPolicy `json:"continuity,omitempty"`
+}
+
+type ExecutionPlanProvenance struct {
+	// AdapterImage is the immutable adapter image included in the execution plan.
+	// +kubebuilder:validation:Pattern=`^[^@\s]+@sha256:[0-9a-f]{64}$`
+	AdapterImage string `json:"adapterImage"`
+	// WorkflowTemplateDigest identifies the rendered workflow/template semantics.
+	// +kubebuilder:validation:Pattern=`^sha256:[0-9a-f]{64}$`
+	WorkflowTemplateDigest string `json:"workflowTemplateDigest"`
 }
 
 // +kubebuilder:validation:XValidation:rule="self.profile == oldSelf.profile",message="profile is immutable"
@@ -118,6 +133,8 @@ type CertificationCheckSnapshot struct {
 // +kubebuilder:validation:XValidation:rule="self.participants == oldSelf.participants",message="participants are immutable"
 // +kubebuilder:validation:XValidation:rule="self.scriptBundle == oldSelf.scriptBundle",message="scriptBundle is immutable"
 // +kubebuilder:validation:XValidation:rule="self.checks == oldSelf.checks",message="checks are immutable"
+// +kubebuilder:validation:XValidation:rule="has(self.planDigest) == has(oldSelf.planDigest) && (!has(self.planDigest) || self.planDigest == oldSelf.planDigest)",message="planDigest is immutable"
+// +kubebuilder:validation:XValidation:rule="has(self.planProvenance) == has(oldSelf.planProvenance) && (!has(self.planProvenance) || self.planProvenance == oldSelf.planProvenance)",message="planProvenance is immutable"
 // +kubebuilder:validation:XValidation:rule="self.participants.all(x, self.participants.filter(y, y.nodeName == x.nodeName).size() == 1)",message="participants must use unique nodeName values"
 // +kubebuilder:validation:XValidation:rule="!has(oldSelf.cancel) || !oldSelf.cancel || (has(self.cancel) && self.cancel)",message="cancel cannot be cleared"
 // +kubebuilder:validation:XValidation:rule="!has(oldSelf.release) || !oldSelf.release || (has(self.release) && self.release)",message="release cannot be cleared"
@@ -133,9 +150,15 @@ type CertificationRunSpec struct {
 	// +kubebuilder:validation:MinItems=1
 	// +kubebuilder:validation:MaxItems=256
 	// +listType=atomic
-	Checks  []CertificationCheckSnapshot `json:"checks"`
-	Cancel  bool                         `json:"cancel,omitempty"`
-	Release bool                         `json:"release,omitempty"`
+	Checks []CertificationCheckSnapshot `json:"checks"`
+	// PlanDigest is the canonical digest of all execution-affecting inputs.
+	// It is optional only for backward decoding of Runs created before this contract.
+	// +kubebuilder:validation:Pattern=`^sha256:[0-9a-f]{64}$`
+	PlanDigest string `json:"planDigest,omitempty"`
+	// PlanProvenance pins shared execution inputs not carried by individual checks.
+	PlanProvenance *ExecutionPlanProvenance `json:"planProvenance,omitempty"`
+	Cancel         bool                     `json:"cancel,omitempty"`
+	Release        bool                     `json:"release,omitempty"`
 }
 
 type WorkflowStatus struct {
@@ -145,10 +168,14 @@ type WorkflowStatus struct {
 }
 
 type EvidenceStatus struct {
+	// +kubebuilder:validation:MaxLength=2048
 	URI string `json:"uri,omitempty"`
 	// Digest is the algorithm-qualified SHA-256 digest of the evidence bytes.
 	// +kubebuilder:validation:Pattern=`^sha256:[0-9a-f]{64}$`
 	Digest string `json:"digest,omitempty"`
+	// Identity contains bounded qualification inputs. Large measurements remain
+	// in the durable evidence document addressed by URI and Digest.
+	Identity *QualificationEvidenceIdentity `json:"identity,omitempty"`
 }
 
 // +kubebuilder:validation:Enum=Pending;Running;Succeeded;Failed;Inconclusive;Skipped
