@@ -1009,7 +1009,7 @@ pub(crate) mod tests {
         due: Instant,
     ) -> Operation<'static, ()> {
         let deadline = service.deadlines.register(due).unwrap();
-        let scope = RequestScope::new(
+        let scope = RequestScope::host(
             crate::model::RequestId([0; 16]),
             Instant::now() + Duration::from_secs(600),
         )
@@ -1036,7 +1036,7 @@ pub(crate) mod tests {
         let table = Rc::new(IngressDeadlines::default());
         let now = Instant::now();
         let due = now + Duration::from_secs(60);
-        let scope = RequestScope::new(crate::model::RequestId([0; 16]), due).unwrap();
+        let scope = RequestScope::host(crate::model::RequestId([0; 16]), due).unwrap();
         let old = Arc::new(crate::test_support::WakeCounter::default());
         let latest = Arc::new(crate::test_support::WakeCounter::default());
         let later = table.register(due + Duration::from_secs(1)).unwrap();
@@ -1289,7 +1289,7 @@ pub(crate) mod tests {
             WorkerId(0),
             4,
             crate::test_support::availability(),
-            crate::test_support::clock(),
+            racer_io::Clock::host(),
         );
         let old = metadata("old", 7);
         let mut new = metadata("new", 900);

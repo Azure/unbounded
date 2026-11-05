@@ -658,7 +658,7 @@ fn serial_zero_grant_copy_failures_and_positive_grant_acquire() {
                     Arc::new(controlplane::Published::new(
                         crate::control::Snapshot::retention(2),
                     )),
-                    crate::test_support::ctx(),
+                    racer_io::WorkerCtx::host(),
                 )
                 .with_observer(failures.observer(WorkerId(0))),
             );
@@ -866,7 +866,7 @@ fn invalid_signed_selection_falls_back_without_resetting_acquisition_budget() {
             ])
             .unwrap();
             let scheduler =
-                crate::read::range_stream::Scheduler::new(1, crate::test_support::ctx());
+                crate::read::range_stream::Scheduler::new(1, racer_io::WorkerCtx::host());
             let selection = crate::read::range_stream::Selection::for_test(
                 &scheduler,
                 f.page.version.clone(),
@@ -928,7 +928,7 @@ fn open_subscription_selects_no_peers_after_switching_to_passthrough_local() {
         }])
         .unwrap();
     // The subscription and its selection exist before the switch.
-    let scheduler = crate::read::range_stream::Scheduler::new(1, crate::test_support::ctx());
+    let scheduler = crate::read::range_stream::Scheduler::new(1, racer_io::WorkerCtx::host());
     let selection =
         crate::read::range_stream::Selection::for_test(&scheduler, f.page.version.clone(), demand);
     f.set_mode(racer_control_wire::CacheMode::PassthroughLocal);
@@ -1071,7 +1071,7 @@ fn hedge_suppresses_without_independent_route_credits_or_local_memory() {
                 bytes: crate::read::candidates::DUPLICATE_BYTES,
             },
             metrics.clone(),
-            crate::test_support::clock(),
+            racer_io::Clock::host(),
         )
         .unwrap();
         let _slot = (reason == "slots").then(|| hedges.acquire().unwrap());
@@ -1085,7 +1085,7 @@ fn hedge_suppresses_without_independent_route_credits_or_local_memory() {
                 Arc::new(controlplane::Published::new(
                     crate::control::Snapshot::retention(2),
                 )),
-                crate::test_support::ctx(),
+                racer_io::WorkerCtx::host(),
             )
             .with_hedges(hedges),
         );
@@ -1447,11 +1447,14 @@ fn hedge_stalled_primary_copy_miss_keeps_time_and_credits_for_later_acquire() {
     let _owner = Rc::new(uring_runtime::drivers::DriverQueue::new(1024)).enter();
     for third in [false, true] {
         let clock = uring_runtime::environment::SimulationClock::new(920);
-        let _env = clock.environment(0).enter();
+        let sim_env = clock.environment(0);
+        let _env = sim_env.enter();
+        let sim_ctx = sim_env.worker_ctx();
         let mut f = fixture();
-        f.scope = RequestScope::new(
+        f.scope = RequestScope::on(
+            &sim_ctx.clock,
             f.scope.request,
-            uring_runtime::environment::now() + Duration::from_secs(30),
+            sim_ctx.clock.now() + Duration::from_secs(30),
         )
         .unwrap();
         let (peers, ordered) = install_peers(&mut f, None);
@@ -1474,13 +1477,13 @@ fn hedge_stalled_primary_copy_miss_keeps_time_and_credits_for_later_acquire() {
         if third {
             peers.reply(&ordered[2], Reply::Copy(good));
         }
-        let start = uring_runtime::environment::now();
+        let start = sim_ctx.clock.now();
         let mut budget = AcquisitionBudget::new(f.scope.deadline.0, 10, 18);
         let result = acquire(&mut f, &mut budget).unwrap();
         assert_eq!(result.plaintext.bytes(), b"abc");
         assert!(peers.canceled_primary.get());
-        assert!(uring_runtime::environment::now() < f.scope.deadline.0);
-        assert!(uring_runtime::environment::now().duration_since(start) <= Duration::from_secs(12));
+        assert!(sim_ctx.clock.now() < f.scope.deadline.0);
+        assert!(sim_ctx.clock.now().duration_since(start) <= Duration::from_secs(12));
         let calls = peers.calls.borrow();
         assert_eq!(calls.len(), if third { 4 } else { 3 });
         assert!(calls[1].1);
@@ -1521,7 +1524,7 @@ fn hedge_stale_membership_refreshes_once_without_fresh_credits() {
                     peers.requester(),
                     deps.credentials.clone(),
                     crate::test_support::published_membership(latest.clone()),
-                    crate::test_support::ctx(),
+                    racer_io::WorkerCtx::host(),
                 )
                 .with_hedges(deps.candidates.hedge_owner().unwrap().clone()),
             );
@@ -1772,7 +1775,7 @@ fn hedge_cold_backup_coordinators_probe_predecessors_then_reach_origin_with_orig
                 Arc::new(controlplane::Published::new(
                     crate::control::Snapshot::retention(2),
                 )),
-                crate::test_support::ctx(),
+                racer_io::WorkerCtx::host(),
             );
             if i == source {
                 policy = policy.with_hedges(
@@ -1783,7 +1786,7 @@ fn hedge_cold_backup_coordinators_probe_predecessors_then_reach_origin_with_orig
                             bytes: crate::read::candidates::DUPLICATE_BYTES,
                         },
                         hedge_metrics.clone(),
-                        crate::test_support::clock(),
+                        racer_io::Clock::host(),
                     )
                     .unwrap(),
                 );
@@ -2149,7 +2152,7 @@ fn expiry_snapshot_overlapped_hedge_validation_stays_composite() {
     let flights = &f.fill.dependencies.flights;
     for _ in 0..2 {
         let entry = flights
-            .expiry_snapshot_without_ticket(uring_runtime::environment::now())
+            .expiry_snapshot_without_ticket(racer_io::Clock::host().now())
             .entries[0]
             .unwrap();
         assert_eq!(
@@ -2170,7 +2173,7 @@ fn hedge_child_cancellation_removes_crypto_admission_wait_without_canceling_acce
     limits.queue_entries = std::num::NonZeroUsize::new(1).unwrap();
     let mut f = fixture_with(3, Some(limits));
     let copy = encrypted_copy(&mut f);
-    let child = RequestScope::new(f.scope.request, f.scope.deadline.0).unwrap();
+    let child = RequestScope::host(f.scope.request, f.scope.deadline.0).unwrap();
     let mut accepted = Box::pin(f.fill.decrypt(
         &f.page,
         copy.clone(),
@@ -2588,14 +2591,16 @@ fn unauthorized_after_corrupt_copy_falls_through_to_local_origin() {
 #[test]
 fn corrupt_copy_cannot_extend_original_budget_deadline() {
     let clock = uring_runtime::environment::SimulationClock::new(921);
-    let _environment = clock.environment(0).enter();
+    let sim_env = clock.environment(0);
+    let _environment = sim_env.enter();
+    let sim_ctx = sim_env.worker_ctx();
     let _owner = Rc::new(uring_runtime::drivers::DriverQueue::new(1024)).enter();
     let mut f = fixture();
     let (peers, ordered) = install_peers(&mut f, Some(2));
     let good = encrypted_copy(&mut f);
     let bad = unusable_copy(&f, &good, false);
     peers.reply(&ordered[0], Reply::Copy(bad));
-    let deadline = uring_runtime::environment::now() + Duration::from_millis(100);
+    let deadline = sim_ctx.clock.now() + Duration::from_millis(100);
     let mut budget = AcquisitionBudget::new(deadline, 8, 16);
     let mut future = Box::pin(f.fill.acquire_once(
         &f.page,
@@ -2674,7 +2679,7 @@ fn replica_selection_orders_first_acquire_and_non_primary_owner_fills() {
                 Arc::new(controlplane::Published::new(
                     crate::control::Snapshot::retention(2),
                 )),
-                crate::test_support::ctx(),
+                racer_io::WorkerCtx::host(),
             )
             .with_replica_selection(selection);
             if i == source {
@@ -3074,7 +3079,7 @@ mod landing {
             Arc::new(controlplane::Published::new(
                 crate::control::Snapshot::retention(2),
             )),
-            crate::test_support::ctx(),
+            racer_io::WorkerCtx::host(),
         ));
         f.fill = Fill::new(dependencies);
         own(&f, false);
@@ -3642,7 +3647,7 @@ mod landing {
             Err(Error::Cancelled)
         ));
         assert_eq!(l.f.fill.gpu_copies.len(), 0);
-        l.f.scope = RequestScope::new(l.f.scope.request, l.f.scope.deadline.0).unwrap();
+        l.f.scope = RequestScope::host(l.f.scope.request, l.f.scope.deadline.0).unwrap();
         let page = sealed(acquire_sealed_on(&mut l, 0));
         assert_eq!(l.asked.get(), 1);
         assert_decrypts(&l.helper, 1, 0, page);
@@ -3807,7 +3812,7 @@ fn install_versions(
     let published = Arc::new(controlplane::Published::new(
         crate::control::Snapshot::retention(2),
     ));
-    let now = uring_runtime::environment::now();
+    let now = racer_io::Clock::host().now();
     for (i, (membership, ago)) in versions.iter().enumerate() {
         let mut snapshot = crate::control::Snapshot::membership_fixture(membership.clone());
         snapshot.sequence = racer_control_wire::PublicationSequence(i as u64 + 1);
@@ -3824,7 +3829,7 @@ fn install_versions(
         peers.requester(),
         deps.credentials.clone(),
         published,
-        crate::test_support::ctx(),
+        racer_io::WorkerCtx::host(),
     );
     policy.instant_stale_wait.set(wait);
     deps.candidates = Rc::new(policy);
@@ -3841,7 +3846,7 @@ fn publish_same_membership(f: &mut Fixture, peers: &Rc<ScriptedPeers>) {
         peers.requester(),
         deps.credentials.clone(),
         crate::test_support::published_membership(f.membership.clone()),
-        crate::test_support::ctx(),
+        racer_io::WorkerCtx::host(),
     ));
     f.fill = Fill::new(deps);
 }
@@ -4278,7 +4283,7 @@ fn a_granted_batch_feeds_silence_evidence() {
     // No ping is due for a granted target.
     assert!(
         health
-            .due_pings(uring_runtime::environment::now(), 8)
+            .due_pings(racer_io::Clock::host().now(), 8)
             .is_empty()
     );
 }
@@ -5039,7 +5044,7 @@ fn owner_after_rank_zero_offers_its_origin_fetch_later() {
     assert_eq!(f.fill.metrics.count(Event::OrphanNotice), 1);
     let candidates = f.fill.dependencies.candidates.clone();
     assert_eq!(candidates.notices.borrow().len(), 1);
-    let start = uring_runtime::environment::now();
+    let start = racer_io::Clock::host().now();
     // Not due yet: nothing is sent.
     let fill = f.fill.clone();
     candidates.poll_offers(start, |page| fill.holds(page), &fill.metrics);
@@ -5094,7 +5099,7 @@ fn offers_wait_out_a_cut_toward_their_site() {
     let mut budget = AcquisitionBudget::new(f.scope.deadline.0, 8, 16);
     assert!(acquire(&mut f, &mut budget).is_ok());
     let candidates = f.fill.dependencies.candidates.clone();
-    let start = uring_runtime::environment::now();
+    let start = racer_io::Clock::host().now();
     let poll = |f: &mut Fixture, now: Instant, n: u64| drive_offers(f, now, n, true);
     // The first offer fails in transport: the group is blocked until its
     // next offer, 15 s after the failure. The offer task reports at the
@@ -5188,7 +5193,7 @@ fn rank_two_offers_its_origin_fetch_to_rank_one_too() {
                 peers.reply(&ordered[1], Reply::Miss);
             }
             candidates.poll_offers(
-                uring_runtime::environment::now() + NOTICE_DELAYS[0] + Duration::from_secs(30 * i),
+                racer_io::Clock::host().now() + NOTICE_DELAYS[0] + Duration::from_secs(30 * i),
                 |page| fill.holds(page),
                 &fill.metrics,
             );
@@ -5231,7 +5236,7 @@ fn offers_need_a_held_copy_and_an_owner_after_rank_zero() {
     assert!(acquire(&mut f, &mut budget).is_ok());
     let candidates = f.fill.dependencies.candidates.clone();
     assert_eq!(candidates.notices.borrow().len(), 1);
-    let due = uring_runtime::environment::now() + NOTICE_DELAYS[0];
+    let due = racer_io::Clock::host().now() + NOTICE_DELAYS[0];
     candidates.poll_offers(due, |_| false, &f.fill.metrics);
     assert!(candidates.notices.borrow().is_empty());
     assert_eq!(peers.calls.borrow().len(), 1);
@@ -5294,7 +5299,7 @@ fn an_owner_pings_a_rank_zero_that_timed_out_and_skips_it_while_silent() {
     assert!(!health.silent(&ordered[0]));
     // The ping goes unanswered: rank 0 is silent.
     peers.reply(&ordered[0], Reply::Deadline);
-    let now = uring_runtime::environment::now();
+    let now = racer_io::Clock::host().now();
     drive_pings(&mut f, now, 1);
     {
         let calls = peers.calls.borrow();
@@ -5315,7 +5320,7 @@ fn an_owner_pings_a_rank_zero_that_timed_out_and_skips_it_while_silent() {
     assert_eq!(peers.calls.borrow().len(), sent);
     // Recovered: the recheck ping (due at once with no hold) is answered.
     peers.reply(&ordered[0], Reply::Miss);
-    drive_pings(&mut f, uring_runtime::environment::now(), 1);
+    drive_pings(&mut f, racer_io::Clock::host().now(), 1);
     assert!(!health.silent(&ordered[0]));
     assert_eq!(f.fill.metrics.count(Event::SilencePeerSilent), 1);
 }
@@ -5448,7 +5453,7 @@ fn refreshed_owner_order_keys_orphan_notice_and_failure_hold() {
             peers.requester(),
             deps.credentials.clone(),
             crate::test_support::published_membership(latest.clone()),
-            crate::test_support::ctx(),
+            racer_io::WorkerCtx::host(),
         ));
         f.fill = Fill::new(deps);
         own(&f, true);
@@ -5466,7 +5471,7 @@ fn refreshed_owner_order_keys_orphan_notice_and_failure_hold() {
         assert_eq!(f.origin.calls.get(), 1);
         assert_eq!(peers.calls.borrow().len(), 1 + rank);
         let candidates = &f.fill.dependencies.candidates;
-        let now = uring_runtime::environment::now();
+        let now = racer_io::Clock::host().now();
         if fail {
             assert!(candidates.notices.borrow().is_empty());
             // The hold names the version 2 rank 0, not the version 1 one.
@@ -5530,7 +5535,7 @@ fn passthrough_peers_coalesces_reads_from_distinct_nodes_on_the_owner() {
             Arc::new(controlplane::Published::new(
                 crate::control::Snapshot::retention(2),
             )),
-            crate::test_support::ctx(),
+            racer_io::WorkerCtx::host(),
         );
         let mut deps = f.fill.dependencies.clone();
         deps.candidates = Rc::new(policy);

@@ -409,7 +409,7 @@ fn passthrough_refuses_holds_and_prefetch_fills() {
         let (_local, mut endpoint, _publication) =
             super::hot_reads::coordinator(&f, &signers[0], &membership, NoPeer::requester());
         let directory = f.fill.dependencies.metadata_owner.clone();
-        let until = uring_runtime::environment::wall_now() + Duration::from_secs(60);
+        let until = racer_io::Clock::host().wall_now() + Duration::from_secs(60);
         let mut cx = Context::from_waker(futures::task::noop_waker_ref());
         let mut future = Box::pin(directory.hold_read_page(&f.page, until, &f.scope));
         let mut output = None;
@@ -574,7 +574,7 @@ fn passthrough_stream_keeps_its_whole_window_of_origin_reads_in_flight() {
         let (local, mut endpoint, _publication) =
             coordinator_with_window(&f, &signers[0], &membership, NoPeer::requester(), WINDOW);
         f.origin.blocked_pages.borrow_mut().extend(0..7);
-        let scope = RequestScope::new(f.scope.request, f.scope.deadline.0).unwrap();
+        let scope = RequestScope::host(f.scope.request, f.scope.deadline.0).unwrap();
         let request = ClientRequest {
             kind: ReadKind::Subscription {
                 pin: Some(f.page.version.etag.clone()),

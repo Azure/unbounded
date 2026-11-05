@@ -779,7 +779,7 @@ fn concurrent_reads_share_page_work_and_bound_fetch_by_credit() {
                 authorization: None,
             },
         };
-        let scope = RequestScope::new(f.scope.request, f.scope.deadline.0).unwrap();
+        let scope = RequestScope::host(f.scope.request, f.scope.deadline.0).unwrap();
         match futures::executor::block_on(local.read(request, &scope))
             .unwrap()
             .payload
@@ -892,7 +892,7 @@ fn fetch_window_is_not_an_unreleased_credit_ceiling() {
         let membership = local_membership(&signers[0]);
         let (local, mut endpoint, _publication) =
             coordinator(&f, &signers[0], &membership, NoPeer::requester());
-        let scope = RequestScope::new(f.scope.request, f.scope.deadline.0).unwrap();
+        let scope = RequestScope::host(f.scope.request, f.scope.deadline.0).unwrap();
         let mut stream = match futures::executor::block_on(local.read(
             ClientRequest {
                 kind: ReadKind::Subscription {
@@ -1026,7 +1026,7 @@ fn zero_priority_read_beside_active_cache_progresses_while_first_page_is_held() 
     let membership = local_membership(&signers[0]);
     let (local, mut endpoint, _publication) =
         coordinator(&f, &signers[0], &membership, NoPeer::requester());
-    let scope = RequestScope::new(f.scope.request, f.scope.deadline.0).unwrap();
+    let scope = RequestScope::host(f.scope.request, f.scope.deadline.0).unwrap();
     let mut stream = match futures::executor::block_on(local.read(
         ClientRequest {
             kind: ReadKind::Subscription {
@@ -1109,7 +1109,7 @@ fn later_page_completes_before_head_and_cancellation_keeps_completion_fence() {
         let membership = local_membership(&signers[0]);
         let (local, mut endpoint, _publication) =
             coordinator(&f, &signers[0], &membership, NoPeer::requester());
-        let scope = RequestScope::new(f.scope.request, f.scope.deadline.0).unwrap();
+        let scope = RequestScope::host(f.scope.request, f.scope.deadline.0).unwrap();
         let request = ClientRequest {
             kind: ReadKind::Subscription {
                 pin: Some(f.page.version.etag.clone()),
@@ -1397,7 +1397,7 @@ fn production_range_windows(old_provider: bool) -> Vec<Rc<LinkStats>> {
                     PeerNetwork::new(
                         node(i),
                         crate::test_support::published_membership(membership.clone()),
-                        crate::test_support::clock(),
+                        racer_io::Clock::host(),
                     )
                     .unwrap(),
                 ),
@@ -1428,12 +1428,7 @@ fn production_range_windows(old_provider: bool) -> Vec<Rc<LinkStats>> {
     let admission = fixtures[2].fill.dependencies.admission.clone();
     let auth = Rc::new(Forwarding::new(signers[2].clone()));
     let network = Rc::new(
-        PeerNetwork::new(
-            node(2),
-            publications[2].clone(),
-            crate::test_support::clock(),
-        )
-        .unwrap(),
+        PeerNetwork::new(node(2), publications[2].clone(), racer_io::Clock::host()).unwrap(),
     );
     let outbound = crate::peer::tests::NoOutbound::new(signers[2].clone(), network.clone());
     let relay = Rc::new(crate::peer::Relay::new(
@@ -1461,7 +1456,7 @@ fn production_range_windows(old_provider: bool) -> Vec<Rc<LinkStats>> {
         codec,
         signers[2].clone(),
     );
-    let serving_scope = RequestScope::new(
+    let serving_scope = RequestScope::host(
         RequestId([99; 16]),
         Instant::now() + Duration::from_secs(30),
     )
@@ -1913,7 +1908,7 @@ fn read_range(
     endpoint: &mut crate::read::dispatch::WorkerEndpoint,
     pages: u64,
 ) -> Vec<u64> {
-    let scope = RequestScope::new(f.scope.request, f.scope.deadline.0).unwrap();
+    let scope = RequestScope::host(f.scope.request, f.scope.deadline.0).unwrap();
     let request = ClientRequest {
         kind: ReadKind::Subscription {
             pin: Some(f.page.version.etag.clone()),

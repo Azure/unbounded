@@ -3163,7 +3163,7 @@ pub(super) mod tests {
             Arc::new(controlplane::Published::new(
                 crate::control::Snapshot::retention(2),
             )),
-            crate::test_support::ctx(),
+            racer_io::WorkerCtx::host(),
         );
         let mut budget = AcquisitionBudget::new(scope.deadline.0, 16, 24);
         let result = futures::executor::block_on(policy.resolve_with_budget(
@@ -3524,7 +3524,7 @@ pub(super) mod tests {
                     ),
                     probe.credentials.clone(),
                     probe.published.clone(),
-                    crate::test_support::ctx(),
+                    racer_io::WorkerCtx::host(),
                 )
                 .with_replica_selection(selection);
                 let context = OriginContext {
@@ -3719,7 +3719,7 @@ pub(super) mod tests {
                     ),
                     probe.credentials.clone(),
                     probe.published.clone(),
-                    crate::test_support::ctx(),
+                    racer_io::WorkerCtx::host(),
                 );
                 let context = OriginContext {
                     object: object(),
@@ -3857,7 +3857,7 @@ pub(super) mod tests {
             Arc::new(controlplane::Published::new(
                 crate::control::Snapshot::retention(2),
             )),
-            crate::test_support::ctx(),
+            racer_io::WorkerCtx::host(),
         );
         let candidates = policy.candidates(membership, &context.object, PageNumber(0));
         let mut budget = AcquisitionBudget::new(scope.deadline.0, attempts, 8);
@@ -3911,7 +3911,7 @@ pub(super) mod tests {
             Arc::new(controlplane::Published::new(
                 crate::control::Snapshot::retention(2),
             )),
-            crate::test_support::ctx(),
+            racer_io::WorkerCtx::host(),
         );
         let mut budget = AcquisitionBudget::new(scope.deadline.0, 4, 8);
         let result = futures::executor::block_on(policy.resolve_with_budget(
@@ -3953,7 +3953,7 @@ pub(super) mod tests {
             Arc::new(controlplane::Published::new(
                 crate::control::Snapshot::retention(2),
             )),
-            crate::test_support::ctx(),
+            racer_io::WorkerCtx::host(),
         );
         let mut budget = AcquisitionBudget::new(scope.deadline.0, 16, 24);
         let result = futures::executor::block_on(policy.resolve_with_budget(
@@ -4004,7 +4004,7 @@ pub(super) mod tests {
                 Arc::new(controlplane::Published::new(
                     crate::control::Snapshot::retention(2),
                 )),
-                crate::test_support::ctx(),
+                racer_io::WorkerCtx::host(),
             );
             let mut budget = AcquisitionBudget::new(scope.deadline.0, 16, 24);
             let result = futures::executor::block_on(policy.resolve_with_budget(
@@ -4044,7 +4044,7 @@ pub(super) mod tests {
             Arc::new(controlplane::Published::new(
                 crate::control::Snapshot::retention(2),
             )),
-            crate::test_support::ctx(),
+            racer_io::WorkerCtx::host(),
         );
         let mut budget = AcquisitionBudget::new(scope.deadline.0, 16, 24);
         let result = futures::executor::block_on(policy.resolve_with_budget(
@@ -4088,7 +4088,7 @@ pub(super) mod tests {
             Arc::new(controlplane::Published::new(
                 crate::control::Snapshot::retention(2),
             )),
-            crate::test_support::ctx(),
+            racer_io::WorkerCtx::host(),
         );
         let destination = membership.members()[0].node.clone();
         let operation = PeerOperation::Metadata {
@@ -4275,7 +4275,7 @@ pub(super) mod tests {
             config.cluster,
             node.clone(),
             std::sync::Arc::new(KeyEpochs::with_clock(crate::enrollment::wall_clock(
-                &crate::test_support::clock(),
+                &racer_io::Clock::host(),
             ))),
         ));
         CandidatePolicy::new(
@@ -4290,16 +4290,16 @@ pub(super) mod tests {
             Rc::new(CredentialCrypto::new(
                 keys,
                 admission,
-                crate::test_support::ctx().rng,
+                racer_io::WorkerCtx::host().rng,
             )),
             Arc::new(controlplane::Published::new(
                 crate::control::Snapshot::retention(2),
             )),
-            crate::test_support::ctx(),
+            racer_io::WorkerCtx::host(),
         )
     }
     fn scope() -> RequestScope {
-        RequestScope::new(
+        RequestScope::host(
             crate::model::RequestId([7; 16]),
             Instant::now() + std::time::Duration::from_secs(60),
         )
@@ -4331,7 +4331,7 @@ pub(super) mod tests {
             WorkerId(0),
             8,
             crate::test_support::availability(),
-            crate::test_support::clock(),
+            racer_io::Clock::host(),
         );
         index.set_page_capacity(1).unwrap();
         index
@@ -4455,7 +4455,7 @@ pub(super) mod tests {
                 config.cluster.clone(),
                 config.node.clone(),
                 Arc::new(KeyEpochs::with_clock(crate::enrollment::wall_clock(
-                    &crate::test_support::clock(),
+                    &racer_io::Clock::host(),
                 ))),
             ));
             let published = crate::test_support::published_membership(Arc::new(
@@ -4481,7 +4481,7 @@ pub(super) mod tests {
                 crate::model::WorkerId(0),
                 1,
                 availability.clone(),
-                crate::test_support::clock(),
+                racer_io::Clock::host(),
             ));
             let writer = Rc::new(crate::store::StoreWriter::new(
                 index,
@@ -4511,7 +4511,7 @@ pub(super) mod tests {
             let signatures = Rc::new(Signatures::new(
                 keys.clone(),
                 Rc::new(Certificates::new(config.cluster, keys.clone())),
-                crate::test_support::ctx(),
+                racer_io::WorkerCtx::host(),
             ));
             // Real network requester/transport plus the same strong reclamation
             // captures as production. No I/O or slab file is opened in this test.
@@ -4544,7 +4544,7 @@ pub(super) mod tests {
                     crate::peer::PeerNetwork::new(
                         config.node.clone(),
                         published.clone(),
-                        crate::test_support::clock(),
+                        racer_io::Clock::host(),
                     )
                     .unwrap(),
                 ),
@@ -4556,10 +4556,10 @@ pub(super) mod tests {
                 Rc::new(CredentialCrypto::new(
                     keys,
                     admission,
-                    crate::test_support::ctx().rng,
+                    racer_io::WorkerCtx::host().rng,
                 )),
                 published,
-                crate::test_support::ctx(),
+                racer_io::WorkerCtx::host(),
             ));
             let weak_policy = Rc::downgrade(&policy);
             let callback = policy.ownership_callback();
@@ -4720,7 +4720,7 @@ pub(super) mod tests {
                     delay: Duration::from_millis(1),
                 },
                 metrics[0].clone(),
-                crate::test_support::clock(),
+                racer_io::Clock::host(),
             )
             .unwrap();
             let second = first.for_worker(metrics[1].clone());
@@ -4933,7 +4933,9 @@ pub(super) mod tests {
         #[test]
         fn shared_slots_bytes_and_alarm_wake_are_bounded() {
             let clock = SimulationClock::new(901);
-            let _env = clock.environment(0).enter();
+            let sim_env = clock.environment(0);
+            let _env = sim_env.enter();
+            let sim_ctx = sim_env.worker_ctx();
             let owner = controller(2, DUPLICATE_BYTES);
             let permit = owner.acquire().unwrap();
             assert!(matches!(owner.clone().acquire(), Err(Error::Overloaded)));
@@ -4953,7 +4955,7 @@ pub(super) mod tests {
                 !Hedges::new(
                     HedgeConfig::default(),
                     Metrics::default(),
-                    crate::test_support::clock()
+                    sim_ctx.clock.clone()
                 )
                 .unwrap()
                 .enabled()

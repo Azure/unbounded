@@ -169,7 +169,7 @@ fn read_spill_hold_refused_falls_back_to_memory_window() {
     let mut other = f.page.version.clone();
     other.etag = crate::model::StrongEtag::test_value("hold-capacity");
     let index = f.fill.dependencies.writer.index();
-    let until = uring_runtime::environment::wall_now() + Duration::from_secs(300);
+    let until = racer_io::Clock::host().wall_now() + Duration::from_secs(300);
     let mut capacity = 1 << 20;
     while capacity > 0 && index.reserve_hold(&other, capacity, until).is_err() {
         capacity /= 2;

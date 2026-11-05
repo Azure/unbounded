@@ -198,7 +198,7 @@ fn coordinator_copy_miss_is_not_origin_absence_and_pinned_missing_is_412() {
     .into_iter()
     .enumerate()
     {
-        let scope = RequestScope::new(
+        let scope = RequestScope::host(
             RequestId([index as u8; 16]),
             Instant::now() + Duration::from_secs(10),
         )
@@ -225,7 +225,7 @@ fn coordinator_copy_miss_is_not_origin_absence_and_pinned_missing_is_412() {
             origin: CredentialCrypto::new(
                 ids[0].keys.clone(),
                 admission.clone(),
-                crate::test_support::ctx().rng,
+                racer_io::WorkerCtx::host().rng,
             )
             .seal(&context, attempt, &scope)
             .unwrap(),
@@ -298,7 +298,7 @@ fn remote_candidate_with_churn(absence: Option<Absence>, forbidden: bool, churn:
     let source_store = PublicationTarget::new(
         ClusterId(CLUSTER.into()),
         source_publications.clone(),
-        crate::test_support::clock(),
+        racer_io::Clock::host(),
     );
     let mut publication = Publication {
         pools: Vec::new(),
@@ -371,12 +371,7 @@ fn remote_candidate_with_churn(absence: Option<Absence>, forbidden: bool, churn:
         a.signatures.clone(),
     ));
     let source_network = Rc::new(
-        PeerNetwork::new(
-            source.clone(),
-            source_publications,
-            crate::test_support::clock(),
-        )
-        .unwrap(),
+        PeerNetwork::new(source.clone(), source_publications, racer_io::Clock::host()).unwrap(),
     );
     let destination_membership =
         Arc::new(Membership::validate(membership.version, membership.members().to_vec()).unwrap());
@@ -384,7 +379,7 @@ fn remote_candidate_with_churn(absence: Option<Absence>, forbidden: bool, churn:
         PeerNetwork::new(
             destination.clone(),
             crate::test_support::published_membership(destination_membership),
-            crate::test_support::clock(),
+            racer_io::Clock::host(),
         )
         .unwrap(),
     );
@@ -518,12 +513,12 @@ fn remote_candidate_with_churn(absence: Option<Absence>, forbidden: bool, churn:
         Rc::new(CredentialCrypto::new(
             a.keys.clone(),
             admission.clone(),
-            crate::test_support::ctx().rng,
+            racer_io::WorkerCtx::host().rng,
         )),
         Arc::new(controlplane::Published::new(
             crate::control::Snapshot::retention(2),
         )),
-        crate::test_support::ctx(),
+        racer_io::WorkerCtx::host(),
     );
     let context = OriginContext {
         object: object.clone(),
@@ -531,7 +526,7 @@ fn remote_candidate_with_churn(absence: Option<Absence>, forbidden: bool, churn:
         authorization: None,
     };
     let scope =
-        RequestScope::new(RequestId([9; 16]), Instant::now() + Duration::from_secs(30)).unwrap();
+        RequestScope::host(RequestId([9; 16]), Instant::now() + Duration::from_secs(30)).unwrap();
     let mut budget = AcquisitionBudget::new(scope.deadline.0, 16, 24);
     let operation = protocol::Operation::Metadata {
         object,
@@ -940,7 +935,7 @@ fn metadata_coordinator_with_newer_publication(
     let snapshots = Rc::new(PublicationTarget::new(
         ClusterId(CLUSTER.into()),
         published,
-        crate::test_support::clock(),
+        racer_io::Clock::host(),
     ));
     let mut publication = Publication {
         pools: Vec::new(),
@@ -979,7 +974,7 @@ fn metadata_coordinator_with_newer_publication(
         WorkerId(0),
         16,
         availability.clone(),
-        crate::test_support::clock(),
+        racer_io::Clock::host(),
     ));
     let segments = Rc::new(page_alloc::Segments::new(64 * 1024 * 1024));
     let slabs = Rc::new(crate::test_support::simulated_slab(page_alloc::Slab::new(
@@ -1008,7 +1003,7 @@ fn metadata_coordinator_with_newer_publication(
     let credentials = Rc::new(CredentialCrypto::new(
         keys.clone(),
         admission.clone(),
-        crate::test_support::ctx().rng,
+        racer_io::WorkerCtx::host().rng,
     ));
     let candidates = Rc::new(CandidatePolicy::new(
         node.clone(),
@@ -1018,7 +1013,7 @@ fn metadata_coordinator_with_newer_publication(
         Arc::new(controlplane::Published::new(
             crate::control::Snapshot::retention(2),
         )),
-        crate::test_support::ctx(),
+        racer_io::WorkerCtx::host(),
     ));
     let origin = adapter.client(
         snapshots.clone(),
@@ -1031,7 +1026,7 @@ fn metadata_coordinator_with_newer_publication(
             Arc::new(WorkerMap::new(vec![WorkerId(0)]).unwrap()),
             vec![WorkerId(0)],
             16,
-            crate::test_support::ctx(),
+            racer_io::WorkerCtx::host(),
         )
         .unwrap(),
     );
@@ -1047,7 +1042,7 @@ fn metadata_coordinator_with_newer_publication(
             flights: Rc::new(crate::read::flight::Flights::new(
                 admission.clone(),
                 availability.clone(),
-                crate::test_support::clock(),
+                racer_io::Clock::host(),
             )),
             crypto: Rc::new(PageCrypto::new(keys, Rc::new(CryptoClient::new(port)))),
             credentials: credentials.clone(),

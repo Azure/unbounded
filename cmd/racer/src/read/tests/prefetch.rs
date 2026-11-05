@@ -130,8 +130,8 @@ fn put_fills_every_page_through_the_owner_and_reports_success() {
     // With no request budget left for probing, for example after a long-poll
     // wait or a slow owner, the status is still answered without probing.
     let request = f.scope.clone();
-    f.scope = crate::runtime::RequestScope::new(f.scope.request, uring_runtime::environment::now())
-        .unwrap();
+    f.scope =
+        crate::runtime::RequestScope::host(f.scope.request, racer_io::Clock::host().now()).unwrap();
     let response = run(
         &mut f,
         &mut endpoint,

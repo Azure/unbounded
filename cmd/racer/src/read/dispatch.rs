@@ -1452,7 +1452,7 @@ mod tests {
                 Arc::new(WorkerMap::new(workers.clone()).unwrap()),
                 workers,
                 4,
-                crate::test_support::ctx(),
+                racer_io::WorkerCtx::host(),
             )
             .unwrap(),
         );
@@ -1479,7 +1479,7 @@ mod tests {
                 Arc::new(WorkerMap::new(workers.clone()).unwrap()),
                 workers,
                 1,
-                crate::test_support::ctx(),
+                racer_io::WorkerCtx::host(),
             )
             .unwrap(),
         );
@@ -1506,7 +1506,7 @@ mod tests {
                 Arc::new(WorkerMap::new(workers.clone()).unwrap()),
                 workers,
                 4,
-                crate::test_support::ctx(),
+                racer_io::WorkerCtx::host(),
             )
             .unwrap(),
         );
@@ -1650,7 +1650,7 @@ mod tests {
             Arc::new(WorkerMap::new(workers.clone()).unwrap()),
             workers,
             capacity,
-            crate::test_support::ctx(),
+            racer_io::WorkerCtx::host(),
         )
         .unwrap();
         for mailbox in &directory.mailboxes {
@@ -1659,7 +1659,7 @@ mod tests {
         directory
     }
     fn scope() -> RequestScope {
-        RequestScope::new(RequestId([1; 16]), Instant::now() + Duration::from_secs(60)).unwrap()
+        RequestScope::host(RequestId([1; 16]), Instant::now() + Duration::from_secs(60)).unwrap()
     }
     fn version() -> ObjectVersion {
         ObjectVersion {
@@ -1760,7 +1760,7 @@ mod tests {
                 caller.cancel().unwrap();
                 assert!(selected.as_mut().poll(&mut cx).is_pending());
             }
-            let shutdown = RequestScope::new(RequestId([2; 16]), Instant::now()).unwrap();
+            let shutdown = RequestScope::host(RequestId([2; 16]), Instant::now()).unwrap();
             assert_eq!(shutdown.check(), Err(Error::DeadlineExceeded));
             let mut drain = endpoint.drain(&shutdown);
             let before = count.count();
@@ -1813,7 +1813,7 @@ mod tests {
                 .unwrap();
             let mut cx = Context::from_waker(futures::task::noop_waker_ref());
             assert!(Pin::new(&mut receipt).poll(&mut cx).is_pending());
-            let shutdown = RequestScope::new(RequestId([2; 16]), Instant::now()).unwrap();
+            let shutdown = RequestScope::host(RequestId([2; 16]), Instant::now()).unwrap();
             let mut drain = endpoint.drain(&shutdown);
             if detach {
                 drop(receipt);

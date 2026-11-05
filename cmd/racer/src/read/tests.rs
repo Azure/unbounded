@@ -125,8 +125,8 @@ fn detached_operation_errors_release_capacity() {
 }
 #[test]
 fn remote_budget_charges_final_incoming_link_and_never_restores_attempts() {
-    let now = uring_runtime::environment::now();
-    let scope = RequestScope::new(
+    let now = racer_io::Clock::host().now();
+    let scope = RequestScope::host(
         crate::model::RequestId([1; 16]),
         now + std::time::Duration::from_secs(60),
     )
@@ -258,7 +258,7 @@ mod flight {
                     waiters.push(waiter);
                 }
                 let held = flights.reserve_copy_flight(&fence().page, &scope).unwrap();
-                let now = uring_runtime::environment::now();
+                let now = racer_io::Clock::host().now();
                 let facts = flights.expiry_snapshot_without_ticket(now);
                 assert_eq!(facts.total, count);
                 assert_eq!(facts.entries.iter().flatten().count(), count.min(6));
@@ -353,7 +353,9 @@ mod flight {
         fn expiry_snapshot_scope_deadline_is_excluded() {
             use std::future::Future;
             let clock = uring_runtime::environment::SimulationClock::new(743);
-            let _environment = clock.environment(0).enter();
+            let sim_env = clock.environment(0);
+            let _environment = sim_env.enter();
+            let sim_ctx = sim_env.worker_ctx();
             let flights = flights(FlightLimits {
                 entries: 1,
                 ..FlightLimits::default()
@@ -364,9 +366,10 @@ mod flight {
                 .policy()
                 .set_observer(failures.observer(crate::model::WorkerId(0)));
             let (context, owner_scope) = (origin(), scope());
-            let short = RequestScope::new(
+            let short = RequestScope::on(
+                &sim_ctx.clock,
                 crate::model::RequestId([3; 16]),
-                uring_runtime::environment::now() + Duration::from_millis(50),
+                sim_ctx.clock.now() + Duration::from_millis(50),
             )
             .unwrap();
             let (mut active_budget, mut next_budget) = (budget(), budget());
@@ -420,7 +423,7 @@ mod flight {
                 let mut cx = Context::from_waker(Waker::noop());
                 assert!(queued.as_mut().poll(&mut cx).is_pending());
                 assert!(scope.check().is_ok());
-                let mut expired = AcquisitionBudget::new(uring_runtime::environment::now(), 0, 8);
+                let mut expired = AcquisitionBudget::new(racer_io::Clock::host().now(), 0, 8);
                 assert!(matches!(
                     flights.join_for(
                         absent.clone(),
@@ -569,7 +572,7 @@ mod flight {
                         entries: 1,
                         ..FlightLimits::default()
                     },
-                    crate::test_support::clock(),
+                    racer_io::Clock::host(),
                 )
                 .unwrap(),
             );
@@ -720,8 +723,10 @@ mod flight {
             use std::future::Future;
             for original_expires in [false, true] {
                 let clock = uring_runtime::environment::SimulationClock::new(741);
-                let _environment = clock.environment(0).enter();
-                let now = uring_runtime::environment::now();
+                let sim_env = clock.environment(0);
+                let _environment = sim_env.enter();
+                let sim_ctx = sim_env.worker_ctx();
+                let now = sim_ctx.clock.now();
                 let flights = flights(FlightLimits {
                     entries: 1,
                     ..FlightLimits::default()
@@ -732,7 +737,8 @@ mod flight {
                     .policy()
                     .set_observer(failures.observer(crate::model::WorkerId(0)));
                 let context = origin();
-                let scope = RequestScope::new(
+                let scope = RequestScope::on(
+                    &sim_ctx.clock,
                     crate::model::RequestId([0; 16]),
                     now + Duration::from_secs(30),
                 )
@@ -1182,7 +1188,7 @@ mod flight {
             old_diagnostic.set(DriverStage::WorkReturned);
             assert_eq!(
                 flights
-                    .expiry_snapshot_without_ticket(uring_runtime::environment::now())
+                    .expiry_snapshot_without_ticket(racer_io::Clock::host().now())
                     .entries[0]
                     .unwrap()
                     .stage,
@@ -1704,7 +1710,7 @@ mod flight {
                 Phase::Draining(_)
             ));
             let expired =
-                RequestScope::new(crate::model::RequestId([1; 16]), Instant::now()).unwrap();
+                RequestScope::host(crate::model::RequestId([1; 16]), Instant::now()).unwrap();
             assert!(matches!(
                 poll(flights.drain(&expired)),
                 Poll::Ready(Err(Error::DeadlineExceeded))
@@ -2606,7 +2612,9 @@ mod timeouts {
             Instant::now(),
             std::time::SystemTime::now(),
         );
-        let _env = clock.environment(0).enter();
+        let sim_env = clock.environment(0);
+        let _env = sim_env.enter();
+        let sim_ctx = sim_env.worker_ctx();
         let mut f = Fixture::new(None, 1, true).bounded(94, 30, 24);
         let original = f.scope.deadline.0;
         f.peers.fenced.set(false);
@@ -2658,7 +2666,7 @@ mod timeouts {
         );
         assert_eq!(f.budget.remaining_links(), 12);
         assert_eq!(f.budget.deadline(), original);
-        assert!(uring_runtime::environment::now() < original);
+        assert!(sim_ctx.clock.now() < original);
     }
 
     #[test]
@@ -2727,7 +2735,9 @@ mod timeouts {
                 Instant::now(),
                 std::time::SystemTime::now(),
             );
-            let _env = clock.environment(0).enter();
+            let sim_env = clock.environment(0);
+            let _env = sim_env.enter();
+            let sim_ctx = sim_env.worker_ctx();
             let mut f = Fixture::new(None, 1, false).bounded(100, 30, links);
             let original = f.scope.deadline.0;
             let operation = f.operation();
@@ -2750,7 +2760,7 @@ mod timeouts {
                 assert!(poll(request.as_mut()).is_pending());
                 assert!(!first.cancellation.is_cancelled());
             }
-            assert!(uring_runtime::environment::now() > first.body_deadlines.unwrap().1);
+            assert!(sim_ctx.clock.now() > first.body_deadlines.unwrap().1);
             assert_eq!(f.peers.calls.borrow()[0].signed_deadline, original);
             f.scope.cancel().unwrap();
             assert!(matches!(
@@ -3082,7 +3092,9 @@ mod timeouts {
     fn reader_visits_an_owner_that_shed_it_after_the_others() {
         use racer_core::read::Answering;
         let clock = uring_runtime::environment::SimulationClock::new(212);
-        let _env = clock.environment(0).enter();
+        let sim_env = clock.environment(0);
+        let _env = sim_env.enter();
+        let sim_ctx = sim_env.worker_ctx();
         let mut f = Fixture::new(None, 0, false).bounded(212, 60, 24);
         f.policy = f
             .policy
@@ -3110,7 +3122,7 @@ mod timeouts {
         assert!(
             f.policy
                 .link_health()
-                .due_pings(uring_runtime::environment::now(), 16)
+                .due_pings(sim_ctx.clock.now(), 16)
                 .is_empty()
         );
         // The next walk visits it last; it answers, which restores its place.
@@ -3269,7 +3281,7 @@ mod timeouts {
     fn subscription_stall_must_leave_time_for_fixed_page_fallback() {
         let mut f = Fixture::new(Some(1), 1, false);
         f.peers.fenced.set(false);
-        let scheduler = crate::read::range_stream::Scheduler::new(1, crate::test_support::ctx());
+        let scheduler = crate::read::range_stream::Scheduler::new(1, racer_io::WorkerCtx::host());
         let demand =
             racer_core::subscriptions::Demand::new(vec![flow_control::subscriptions::Interval {
                 start: 0,
@@ -3369,7 +3381,7 @@ mod timeouts {
                     f.candidates.membership.version,
                     f.policy.node.clone(),
                     crate::peer::protocol::encode_deadline(Deadline(call.signed_deadline)).unwrap(),
-                    crate::peer::protocol::millis(uring_runtime::environment::wall_now()).unwrap(),
+                    crate::peer::protocol::millis(racer_io::Clock::host().wall_now()).unwrap(),
                 )
                 .expect("later exchange must not renew the provider contract");
             let crate::peer::subscriptions::Selection::Leader { work, waiter } = selected else {
@@ -3394,7 +3406,7 @@ mod timeouts {
         use crate::read::candidates::ProviderSelection;
         let mut f = Fixture::new(Some(1), 0, false);
         f.peers.refuse_flights.set(true);
-        let scheduler = crate::read::range_stream::Scheduler::new(1, crate::test_support::ctx());
+        let scheduler = crate::read::range_stream::Scheduler::new(1, racer_io::WorkerCtx::host());
         let demand =
             racer_core::subscriptions::Demand::new(vec![flow_control::subscriptions::Interval {
                 start: 0,
@@ -3468,7 +3480,7 @@ mod timeouts {
         // Every Subscribe reaches the provider through a relay that signs
         // `Unavailable` for the dropped exchange.
         f.peers.relay_unavailable.set(true);
-        let scheduler = crate::read::range_stream::Scheduler::new(1, crate::test_support::ctx());
+        let scheduler = crate::read::range_stream::Scheduler::new(1, racer_io::WorkerCtx::host());
         let demand =
             racer_core::subscriptions::Demand::new(vec![flow_control::subscriptions::Interval {
                 start: 0,
@@ -3539,7 +3551,7 @@ mod timeouts {
     fn subscription_parent_cancellation_waits_for_fence_without_fallback() {
         let mut f = Fixture::new(Some(1), 1, false);
         f.peers.fenced.set(false);
-        let scheduler = crate::read::range_stream::Scheduler::new(1, crate::test_support::ctx());
+        let scheduler = crate::read::range_stream::Scheduler::new(1, racer_io::WorkerCtx::host());
         let demand =
             racer_core::subscriptions::Demand::new(vec![flow_control::subscriptions::Interval {
                 start: 0,

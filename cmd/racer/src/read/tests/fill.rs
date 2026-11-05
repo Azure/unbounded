@@ -45,7 +45,9 @@ fn bounded_admission_two_owners_peer_failfast_and_local_finite_exit() {
     let queue = Rc::new(uring_runtime::drivers::DriverQueue::new(1024));
     let _owner = queue.enter();
     let clock = uring_runtime::environment::SimulationClock::new(751);
-    let _environment = clock.environment(0).enter();
+    let sim_env = clock.environment(0);
+    let _environment = sim_env.enter();
+    let sim_ctx = sim_env.worker_ctx();
     // Crypto captures its clock at construction; match the request clock even
     // when this test runs long after the process-wide simulation anchor.
     let mut fixtures = [fixture(), fixture()];
@@ -58,13 +60,14 @@ fn bounded_admission_two_owners_peer_failfast_and_local_finite_exit() {
                 admission.limit(ResourceClass::Flight),
             )
             .unwrap();
-        let scope = RequestScope::new(
+        let scope = RequestScope::on(
+            &sim_ctx.clock,
             f.scope.request,
-            uring_runtime::environment::now() + Duration::from_secs(30),
+            sim_ctx.clock.now() + Duration::from_secs(30),
         )
         .unwrap();
         let mut peer_budget = AcquisitionBudget::new(scope.deadline.0, 4, 8);
-        let before = uring_runtime::environment::now();
+        let before = sim_ctx.clock.now();
         let peer = drive(
             f.fill.acquire_ciphertext(
                 f.page.clone(),
@@ -77,7 +80,7 @@ fn bounded_admission_two_owners_peer_failfast_and_local_finite_exit() {
             &f.crypto,
         );
         assert!(matches!(peer, Err(Error::Overloaded)));
-        assert_eq!(uring_runtime::environment::now(), before);
+        assert_eq!(sim_ctx.clock.now(), before);
         assert_eq!(f.fill.dependencies.flights.admission_state(), (0, 0, false));
         let mut local_budget = AcquisitionBudget::new(scope.deadline.0, 4, 8);
         let mut local = f.fill.acquire(
@@ -485,7 +488,7 @@ fn ready_memory_precedes_cold_ownership_refresh_and_preserves_one_interest() {
     let snapshots = crate::control::publication::PublicationTarget::new(
         f.keys.cluster().clone(),
         published.clone(),
-        crate::test_support::clock(),
+        racer_io::Clock::host(),
     );
     let mut publication = racer_control_wire::Publication {
         pools: Vec::new(),
@@ -514,7 +517,7 @@ fn ready_memory_precedes_cold_ownership_refresh_and_preserves_one_interest() {
         NoPeer::requester(),
         deps.credentials.clone(),
         published,
-        crate::test_support::ctx(),
+        racer_io::WorkerCtx::host(),
     ));
     f.fill = Fill::new(deps);
     let before = f
@@ -958,7 +961,7 @@ fn second_sight_memory_hit_persists_original_ciphertext_and_retry_does_not() {
         1
     );
     assert_eq!(first.ciphertext.bytes(), again.ciphertext.bytes());
-    f.scope = RequestScope::new(RequestId([2; 16]), f.scope.deadline.0).unwrap();
+    f.scope = RequestScope::host(RequestId([2; 16]), f.scope.deadline.0).unwrap();
     let second = acquire(&mut f, &mut budget).unwrap();
     let retained = f
         .fill
@@ -1009,7 +1012,7 @@ fn second_sight_selected_and_optional_pressure_preserve_read_success() {
                 )
                 .unwrap()
         });
-        let scope = RequestScope::new(RequestId([2; 16]), f.scope.deadline.0).unwrap();
+        let scope = RequestScope::host(RequestId([2; 16]), f.scope.deadline.0).unwrap();
         let second = drive(
             f.fill.accept_selected(first.copy(), &scope),
             &mut f.engine,
@@ -1036,7 +1039,7 @@ fn second_sight_simultaneous_followers_persist_without_second_acquisition() {
         .writer
         .retention()
         .set_ownership(Rc::new(|_| false));
-    let other = RequestScope::new(RequestId([2; 16]), f.scope.deadline.0).unwrap();
+    let other = RequestScope::host(RequestId([2; 16]), f.scope.deadline.0).unwrap();
     let mut one = AcquisitionBudget::new(f.scope.deadline.0, 4, 8);
     let mut two = AcquisitionBudget::new(f.scope.deadline.0, 4, 8);
     let (a, b) = drive(
@@ -1124,7 +1127,7 @@ fn second_sight_completed_flight_and_current_ownership_promote_verified_copy() {
             .remove_cache(&f.context.object.cache)
             .unwrap();
         ownership.set(owned);
-        let next_scope = RequestScope::new(RequestId([2; 16]), f.scope.deadline.0).unwrap();
+        let next_scope = RequestScope::host(RequestId([2; 16]), f.scope.deadline.0).unwrap();
         let second = drive(
             f.fill.acquire(
                 f.page.clone(),
@@ -1287,13 +1290,16 @@ fn network_plaintext_cleared_pressure_retry_is_bounded_and_reports_latest_failur
 fn network_plaintext_cleared_pressure_retry_checks_original_scope() {
     for deadline in [false, true] {
         let clock = uring_runtime::environment::SimulationClock::new(913);
-        let _clock = clock.environment(0).enter();
+        let sim_env = clock.environment(0);
+        let _clock = sim_env.enter();
+        let sim_ctx = sim_env.worker_ctx();
         let f = fixture();
         let admission = &f.fill.dependencies.admission;
         let cache = &f.context.object.cache;
-        let scope = RequestScope::new(
+        let scope = RequestScope::on(
+            &sim_ctx.clock,
             f.scope.request,
-            uring_runtime::environment::now() + Duration::from_secs(60),
+            sim_ctx.clock.now() + Duration::from_secs(60),
         )
         .unwrap();
         let mut held = Some(
@@ -1473,7 +1479,9 @@ fn cooperative_reclaim_bounds_busy_cycle_and_preserves_cancellation() {
     for mode in ["busy", "cancel", "deadline"] {
         let cancel = mode != "busy";
         let clock = uring_runtime::environment::SimulationClock::new(912);
-        let _clock = clock.environment(0).enter();
+        let sim_env = clock.environment(0);
+        let _clock = sim_env.enter();
+        let sim_ctx = sim_env.worker_ctx();
         let mut limits = crate::test_support::cluster::config(false).limits;
         limits.metadata_entries = std::num::NonZeroUsize::new(819).unwrap();
         let f = fixture_with(3, Some(limits));
@@ -1498,9 +1506,10 @@ fn cooperative_reclaim_bounds_busy_cycle_and_preserves_cancellation() {
         admission
             .policy()
             .set_observer(failures.observer(WorkerId(0)));
-        let scope = RequestScope::new(
+        let scope = RequestScope::on(
+            &sim_ctx.clock,
             f.scope.request,
-            uring_runtime::environment::now() + Duration::from_secs(60),
+            sim_ctx.clock.now() + Duration::from_secs(60),
         )
         .unwrap();
         let mut reserve = Box::pin(f.fill.reserve_network_plaintext(&scope, &f.page));
@@ -1910,7 +1919,7 @@ mod metadata {
         adapter.reject_next(RequestKind::InitialGet, 403);
         let origin = adapter_client(&f, &adapter);
         let service = f.metadata_service_with_index(origin, 8, f.metadata_index(8));
-        let second_scope = RequestScope::new(RequestId([93; 16]), f.scope.deadline.0).unwrap();
+        let second_scope = RequestScope::host(RequestId([93; 16]), f.scope.deadline.0).unwrap();
         let second_context = OriginContext {
             object: f.context.object.clone(),
             metadata: None,
@@ -2214,7 +2223,8 @@ mod metadata {
                 }),
                 4,
             );
-            let follower_scope = RequestScope::new(RequestId([2; 16]), f.scope.deadline.0).unwrap();
+            let follower_scope =
+                RequestScope::host(RequestId([2; 16]), f.scope.deadline.0).unwrap();
             let mut leader = service.resolve(
                 MetadataSelector::Fresh,
                 f.membership.clone(),
@@ -2311,7 +2321,7 @@ mod metadata {
             });
             let service = f.metadata_service(origin.clone(), 1);
             let due = Instant::now() + Duration::from_secs(60);
-            let follower_scope = RequestScope::new(
+            let follower_scope = RequestScope::host(
                 RequestId([2; 16]),
                 if budget_earlier {
                     f.scope.deadline.0
@@ -3781,7 +3791,7 @@ fn selected_owner_reclaims_foreign_receive_charges_across_full_pages() {
         .unwrap();
         // Hold an alias to model a transport completion owner. Rehoming must not
         // revoke its bytes/charge, even when a copy is necessary.
-        let canceled = RequestScope::new(target.scope.request, target.scope.deadline.0).unwrap();
+        let canceled = RequestScope::host(target.scope.request, target.scope.deadline.0).unwrap();
         canceled.cancel().unwrap();
         assert!(matches!(
             drive(
@@ -4640,7 +4650,7 @@ fn cold_copy_full_page_boundary_and_canceled_disk_read_release_staging() {
         f.fill.dependencies.writer.slabs().reclaim_idle();
         admission.reclaim_buffers();
         let before = admission.used(ResourceClass::Ciphertext);
-        let scope = RequestScope::new(f.scope.request, f.scope.deadline.0).unwrap();
+        let scope = RequestScope::host(f.scope.request, f.scope.deadline.0).unwrap();
         if !pending {
             scope.cancel().unwrap();
         }
@@ -4969,7 +4979,7 @@ fn detached_copy_only_keeps_disk_fence_and_independent_waiters() {
     let queue = Rc::new(uring_runtime::drivers::DriverQueue::new(1024));
     let _owner = queue.enter();
     let mut f = cold_disk_fixture();
-    let caller = RequestScope::new(RequestId([9; 16]), f.scope.deadline.0).unwrap();
+    let caller = RequestScope::host(RequestId([9; 16]), f.scope.deadline.0).unwrap();
     let mut first = f.fill.copy_only(&f.page, &caller);
     let mut second = f.fill.copy_only(&f.page, &f.scope);
     let mut cx = Context::from_waker(futures::task::noop_waker_ref());
@@ -5014,7 +5024,7 @@ fn bounded_admission_private_copy_completion_wakes_queued_read() {
     let mut cx = Context::from_waker(futures::task::noop_waker_ref());
     assert!(copy.as_mut().poll(&mut cx).is_pending());
     assert_eq!(admission.used(ResourceClass::Flight), 1);
-    let facts = flights.expiry_snapshot_without_ticket(uring_runtime::environment::now());
+    let facts = flights.expiry_snapshot_without_ticket(racer_io::Clock::host().now());
     assert_eq!(facts.total, 0);
     assert_eq!(facts.flight_used, 1);
     assert!(facts.entries.iter().all(Option::is_none));
@@ -5089,7 +5099,7 @@ fn expiry_snapshot_disk_driver_stage_survives_caller_drop() {
     assert!(acquire.as_mut().poll(&mut cx).is_pending());
     let flights = &f.fill.dependencies.flights;
     let entry = flights
-        .expiry_snapshot_without_ticket(uring_runtime::environment::now())
+        .expiry_snapshot_without_ticket(racer_io::Clock::host().now())
         .entries[0]
         .unwrap();
     assert_eq!(
@@ -5099,7 +5109,7 @@ fn expiry_snapshot_disk_driver_stage_survives_caller_drop() {
     assert_eq!(entry.operations, 1);
     drop(acquire);
     let entry = flights
-        .expiry_snapshot_without_ticket(uring_runtime::environment::now())
+        .expiry_snapshot_without_ticket(racer_io::Clock::host().now())
         .entries[0]
         .unwrap();
     assert_eq!(
@@ -5110,7 +5120,7 @@ fn expiry_snapshot_disk_driver_stage_survives_caller_drop() {
     f.scope.cancel().unwrap();
     uring_runtime::drivers::poll(&mut cx, 64);
     let entry = flights
-        .expiry_snapshot_without_ticket(uring_runtime::environment::now())
+        .expiry_snapshot_without_ticket(racer_io::Clock::host().now())
         .entries[0]
         .unwrap();
     assert!(entry.cancel_request_seen_age_us.is_some());
@@ -5134,7 +5144,7 @@ fn canceled_leader_fill_driver_continues_for_remaining_caller() {
     let queue = Rc::new(uring_runtime::drivers::DriverQueue::new(1024));
     let _owner = queue.enter();
     let mut f = cold_disk_fixture();
-    let other = RequestScope::new(f.scope.request, f.scope.deadline.0).unwrap();
+    let other = RequestScope::host(f.scope.request, f.scope.deadline.0).unwrap();
     let mut a_budget = AcquisitionBudget::new(f.scope.deadline.0, 4, 8);
     let mut b_budget = AcquisitionBudget::new(other.deadline.0, 4, 8);
     let mut a = f.fill.acquire(
@@ -5163,7 +5173,7 @@ fn canceled_leader_fill_driver_continues_for_remaining_caller() {
     uring_runtime::drivers::poll(&mut cx, 64);
     let flights = &f.fill.dependencies.flights;
     let entry = flights
-        .expiry_snapshot_without_ticket(uring_runtime::environment::now())
+        .expiry_snapshot_without_ticket(racer_io::Clock::host().now())
         .entries[0]
         .unwrap();
     assert_eq!(entry.cancel_request_seen_age_us, None, "driver handed over");
@@ -5638,7 +5648,7 @@ fn canceled_supplier_retains_crypto_fence_before_replacement_origin_work() {
     let _owner = queue.enter();
     let mut f = fixture();
     let mut a = AcquisitionBudget::new(f.scope.deadline.0, 4, 8);
-    let second_scope = RequestScope::new(RequestId([2; 16]), f.scope.deadline.0).unwrap();
+    let second_scope = RequestScope::host(RequestId([2; 16]), f.scope.deadline.0).unwrap();
     let mut b = AcquisitionBudget::new(second_scope.deadline.0, 4, 8);
     let mut first = f.fill.acquire(
         f.page.clone(),
@@ -6071,7 +6081,7 @@ fn canceled_acquisition_led_local_plaintext_retains_flight_until_job_completes()
     };
     assert!(result.is_err(), "canceled acquisition reports its error");
     // Let the shared job finish through a fresh joiner.
-    let fresh = RequestScope::new(f.scope.request, f.scope.deadline.0).unwrap();
+    let fresh = RequestScope::host(f.scope.request, f.scope.deadline.0).unwrap();
     let joined = drive(f.fill.warm_local(&f.page, &fresh), &mut f.engine, &f.crypto);
     if let Ok(page) = &joined {
         assert_eq!(page.plaintext.bytes(), b"abc");
@@ -6140,7 +6150,7 @@ fn local_plaintext_follower_after_key_retirement_misses_but_leader_finishes() {
 
 /// A scope whose deadline passes before the crypto service next runs.
 fn short_scope() -> RequestScope {
-    RequestScope::new(
+    RequestScope::host(
         RequestId([7; 16]),
         Instant::now() + Duration::from_millis(30),
     )
@@ -6244,7 +6254,7 @@ fn expired_follower_of_expired_probe_reports_its_own_deadline() {
     let mut f = fixture();
     let metrics = retained_ciphertext_only(&mut f);
     let short = short_scope();
-    let follower_scope = RequestScope::new(RequestId([8; 16]), short.deadline.0).unwrap();
+    let follower_scope = RequestScope::host(RequestId([8; 16]), short.deadline.0).unwrap();
     let mut cx = Context::from_waker(futures::task::noop_waker_ref());
     let mut probe = Box::pin(f.fill.warm_local(&f.page, &short));
     assert!(probe.as_mut().poll(&mut cx).is_pending());

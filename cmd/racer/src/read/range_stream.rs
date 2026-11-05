@@ -444,7 +444,7 @@ enum RangeBudget {
 #[cfg(test)]
 pub(crate) fn client_page_budget_for_test(deadline: Instant) -> AcquisitionBudget {
     RangeBudget::ClientPages { deadline }
-        .next_page(false, crate::test_support::clock().now())
+        .next_page(false, racer_io::Clock::host().now())
         .unwrap()
         .unwrap()
 }
@@ -1695,7 +1695,7 @@ pub(super) mod tests {
                     Arc::new(WorkerMap::new(vec![WorkerId(0)]).unwrap()),
                     vec![WorkerId(0)],
                     capacity,
-                    crate::test_support::ctx(),
+                    racer_io::WorkerCtx::host(),
                 )
                 .unwrap(),
             );
@@ -1801,7 +1801,7 @@ pub(super) mod tests {
             metadata.length = 16 * PAGE_BYTES;
             let range = ByteRange::From(0).resolve(metadata.length).unwrap();
             let scope =
-                RequestScope::new(RequestId([9; 16]), Instant::now() + Duration::from_secs(60))
+                RequestScope::host(RequestId([9; 16]), Instant::now() + Duration::from_secs(60))
                     .unwrap();
             let mut stream = f.open(&metadata, range, scope);
             assert_eq!(stream.direct_ahead(), DIRECT_AHEAD);
@@ -1823,7 +1823,7 @@ pub(super) mod tests {
             metadata.length = 16 * PAGE_BYTES;
             let range = ByteRange::From(0).resolve(metadata.length).unwrap();
             let scope =
-                RequestScope::new(RequestId([9; 16]), Instant::now() + Duration::from_secs(60))
+                RequestScope::host(RequestId([9; 16]), Instant::now() + Duration::from_secs(60))
                     .unwrap();
             let mut stream = f.open(&metadata, range, scope);
             assert_eq!(stream.direct_ahead(), DIRECT_AHEAD);
@@ -1845,7 +1845,8 @@ pub(super) mod tests {
         .resolve(metadata.length)
         .unwrap();
         let scope = || {
-            RequestScope::new(RequestId([9; 16]), Instant::now() + Duration::from_secs(60)).unwrap()
+            RequestScope::host(RequestId([9; 16]), Instant::now() + Duration::from_secs(60))
+                .unwrap()
         };
         let mut stream = f.open(&metadata, range, scope());
         stream.configure_subscription(4, 4 * PAGE_BYTES).unwrap();
@@ -1908,8 +1909,9 @@ pub(super) mod tests {
         }
         .resolve(metadata.length)
         .unwrap();
-        let scope = RequestScope::new(RequestId([9; 16]), Instant::now() + Duration::from_secs(60))
-            .unwrap();
+        let scope =
+            RequestScope::host(RequestId([9; 16]), Instant::now() + Duration::from_secs(60))
+                .unwrap();
         let mut stream = f.open(&metadata, range, scope);
         stream.configure_subscription(4, PAGE_BYTES).unwrap();
         for number in 0..2 {
@@ -1962,7 +1964,7 @@ pub(super) mod tests {
             assert_eq!(directory.test_observation_mailbox(), 0);
             let mut metadata = metadata();
             metadata.length = 3;
-            let scope = RequestScope::new(
+            let scope = RequestScope::host(
                 RequestId([12; 16]),
                 Instant::now() + Duration::from_secs(60),
             )
@@ -2019,9 +2021,11 @@ pub(super) mod tests {
                 let admission = &f.admission;
                 let pipes = &f.pipes;
                 let metadata = metadata();
-                let scope =
-                    RequestScope::new(RequestId([8; 16]), Instant::now() + Duration::from_secs(60))
-                        .unwrap();
+                let scope = RequestScope::host(
+                    RequestId([8; 16]),
+                    Instant::now() + Duration::from_secs(60),
+                )
+                .unwrap();
                 let range = ByteRange::From(PAGE_BYTES - 1)
                     .resolve(metadata.length)
                     .unwrap();
@@ -2104,8 +2108,9 @@ pub(super) mod tests {
         let directory = &f.streams.directory;
         let metadata = metadata();
         let range = ByteRange::From(0).resolve(metadata.length).unwrap();
-        let scope = RequestScope::new(RequestId([7; 16]), Instant::now() + Duration::from_secs(60))
-            .unwrap();
+        let scope =
+            RequestScope::host(RequestId([7; 16]), Instant::now() + Duration::from_secs(60))
+                .unwrap();
         let mut stream = f.open(&metadata, range, scope.clone());
         stream.configure_subscription(1, PAGE_BYTES).unwrap();
         stream.inject(Slot::Ready(Ok(page_result(admission, &metadata, 0))));
@@ -2137,7 +2142,7 @@ pub(super) mod tests {
         // into a range-length limit, and unused credits cannot grow later pages.
         for _ in 0..100 {
             let mut page = budget
-                .next_page(false, crate::test_support::clock().now())
+                .next_page(false, racer_io::Clock::host().now())
                 .unwrap()
                 .unwrap();
             assert_eq!(page.remaining_attempts(), 8);
@@ -2155,7 +2160,7 @@ pub(super) mod tests {
             budget.complete(page).unwrap();
         }
         let mut page = budget
-            .next_page(false, crate::test_support::clock().now())
+            .next_page(false, racer_io::Clock::host().now())
             .unwrap()
             .unwrap();
         for _ in 0..8 {
@@ -2178,7 +2183,7 @@ pub(super) mod tests {
             deadline: Instant::now(),
         };
         assert!(matches!(
-            expired.next_page(false, crate::test_support::clock().now()),
+            expired.next_page(false, racer_io::Clock::host().now()),
             Err(Error::DeadlineExceeded)
         ));
     }
@@ -2187,12 +2192,12 @@ pub(super) mod tests {
         let deadline = Instant::now() + std::time::Duration::from_secs(60);
         let mut budget = RangeBudget::Shared(AcquisitionBudget::new(deadline, 2, 4));
         let mut page = budget
-            .next_page(false, crate::test_support::clock().now())
+            .next_page(false, racer_io::Clock::host().now())
             .unwrap()
             .unwrap();
         assert!(
             budget
-                .next_page(true, crate::test_support::clock().now())
+                .next_page(true, racer_io::Clock::host().now())
                 .unwrap()
                 .is_none()
         );
@@ -2201,7 +2206,7 @@ pub(super) mod tests {
         page.charge_links(4).unwrap();
         budget.complete(page).unwrap();
         let mut next = budget
-            .next_page(false, crate::test_support::clock().now())
+            .next_page(false, racer_io::Clock::host().now())
             .unwrap()
             .unwrap();
         assert_eq!(next.deadline(), deadline);
@@ -2223,7 +2228,7 @@ pub(super) mod tests {
             let mut metadata = metadata();
             metadata.length = 100 * PAGE_BYTES;
             let scope =
-                RequestScope::new(RequestId([1; 16]), Instant::now() + Duration::from_secs(60))
+                RequestScope::host(RequestId([1; 16]), Instant::now() + Duration::from_secs(60))
                     .unwrap();
             let mut stream = f.open(
                 &metadata,
@@ -2238,7 +2243,7 @@ pub(super) mod tests {
             for number in 0..2 {
                 let mut budget = stream
                     .budget
-                    .next_page(number != 0, crate::test_support::clock().now())
+                    .next_page(number != 0, racer_io::Clock::host().now())
                     .unwrap()
                     .unwrap();
                 let attempts = attempts.clone();
@@ -2327,8 +2332,9 @@ pub(super) mod tests {
         metadata: &ObjectMetadata,
         budget: RangeBudget,
     ) -> RangeStream {
-        let scope = RequestScope::new(RequestId([5; 16]), Instant::now() + Duration::from_secs(60))
-            .unwrap();
+        let scope =
+            RequestScope::host(RequestId([5; 16]), Instant::now() + Duration::from_secs(60))
+                .unwrap();
         let mut stream = f.open(
             metadata,
             ByteRange::From(0).resolve(metadata.length).unwrap(),
@@ -2525,7 +2531,7 @@ pub(super) mod tests {
         })));
         let budget = stream
             .budget
-            .next_page(false, crate::test_support::clock().now())
+            .next_page(false, racer_io::Clock::host().now())
             .unwrap()
             .unwrap();
         stream.inject(Slot::Fetching(Box::pin(async move {
@@ -2577,7 +2583,7 @@ pub(super) mod tests {
         let head = page_result(&f.admission, &metadata, 0);
         let budget = stream
             .budget
-            .next_page(false, crate::test_support::clock().now())
+            .next_page(false, racer_io::Clock::host().now())
             .unwrap()
             .unwrap();
         stream.inject(Slot::Fetching(Box::pin(async move {
@@ -2603,8 +2609,9 @@ pub(super) mod tests {
     fn out_of_order_direct_fill_is_buffered_and_delivered_in_order() {
         let f = Fixture::new(crate::test_support::cluster::config(false).limits, 2);
         let metadata = metadata();
-        let scope = RequestScope::new(RequestId([6; 16]), Instant::now() + Duration::from_secs(60))
-            .unwrap();
+        let scope =
+            RequestScope::host(RequestId([6; 16]), Instant::now() + Duration::from_secs(60))
+                .unwrap();
         let mut stream = f.open(
             &metadata,
             ByteRange::From(0).resolve(metadata.length).unwrap(),
@@ -2617,12 +2624,12 @@ pub(super) mod tests {
         let later = page_result(&f.admission, &metadata, 1);
         let first = stream
             .budget
-            .next_page(false, crate::test_support::clock().now())
+            .next_page(false, racer_io::Clock::host().now())
             .unwrap()
             .unwrap();
         let second = stream
             .budget
-            .next_page(true, crate::test_support::clock().now())
+            .next_page(true, racer_io::Clock::host().now())
             .unwrap()
             .unwrap();
         stream.inject(Slot::Fetching(Box::pin(async move {
@@ -2654,8 +2661,11 @@ pub(super) mod tests {
                 let mut stream = f.open(
                     &metadata,
                     ByteRange::From(0).resolve(metadata.length).unwrap(),
-                    RequestScope::new(RequestId([4; 16]), Instant::now() + Duration::from_secs(60))
-                        .unwrap(),
+                    RequestScope::host(
+                        RequestId([4; 16]),
+                        Instant::now() + Duration::from_secs(60),
+                    )
+                    .unwrap(),
                 );
                 stream.configure_subscription(2, 2 * PAGE_BYTES).unwrap();
                 stream.inject(Slot::Ready(Ok(page_result(&f.admission, &metadata, 0))));
@@ -2714,7 +2724,7 @@ pub(super) mod tests {
             Error::DeadlineExceeded,
         ] {
             let scope =
-                RequestScope::new(RequestId([3; 16]), Instant::now() + Duration::from_secs(60))
+                RequestScope::host(RequestId([3; 16]), Instant::now() + Duration::from_secs(60))
                     .unwrap();
             let mut stream = f.open(
                 &metadata,
@@ -2726,7 +2736,7 @@ pub(super) mod tests {
             stream.inject(Slot::Selecting);
             let budget = stream
                 .budget
-                .next_page(false, crate::test_support::clock().now())
+                .next_page(false, racer_io::Clock::host().now())
                 .unwrap()
                 .unwrap();
             stream.selections.push(Pending {
@@ -2760,7 +2770,7 @@ pub(super) mod tests {
         let mut stream = f.open(
             &metadata,
             ByteRange::From(0).resolve(metadata.length).unwrap(),
-            RequestScope::new(RequestId([2; 16]), Instant::now() + Duration::from_secs(60))
+            RequestScope::host(RequestId([2; 16]), Instant::now() + Duration::from_secs(60))
                 .unwrap(),
         );
         stream.configure_subscription(4, 4 * PAGE_BYTES).unwrap();
@@ -2782,7 +2792,7 @@ pub(super) mod tests {
             let mut stream = f.open(
                 &metadata,
                 ByteRange::From(0).resolve(metadata.length).unwrap(),
-                RequestScope::new(RequestId([3; 16]), Instant::now() + Duration::from_secs(60))
+                RequestScope::host(RequestId([3; 16]), Instant::now() + Duration::from_secs(60))
                     .unwrap(),
             );
             if passthrough {
@@ -2811,7 +2821,7 @@ pub(super) mod tests {
             let mut stream = f.open(
                 &metadata,
                 ByteRange::From(0).resolve(metadata.length).unwrap(),
-                RequestScope::new(RequestId([5; 16]), Instant::now() + Duration::from_secs(60))
+                RequestScope::host(RequestId([5; 16]), Instant::now() + Duration::from_secs(60))
                     .unwrap(),
             );
             stream.configure_subscription(8, 8 * PAGE_BYTES).unwrap();
@@ -2932,7 +2942,7 @@ pub(super) mod tests {
         let mut stream = f.open(
             &metadata,
             ByteRange::From(0).resolve(metadata.length).unwrap(),
-            RequestScope::new(RequestId([2; 16]), Instant::now() + Duration::from_secs(60))
+            RequestScope::host(RequestId([2; 16]), Instant::now() + Duration::from_secs(60))
                 .unwrap(),
         );
         stream.configure_subscription(8, 8 * PAGE_BYTES).unwrap();
@@ -3234,37 +3244,38 @@ pub(super) mod tests {
     #[test]
     fn progressing_page_children_keep_deadlines_and_retry_limits_across_long_streams() {
         let clock = uring_runtime::environment::SimulationClock::new(81);
-        let _environment = clock.environment(0).enter();
+        let sim_env = clock.environment(0);
+        let _environment = sim_env.enter();
+        let sim_ctx = sim_env.worker_ctx();
         let timeout = Duration::from_millis(30);
-        let old_deadline = uring_runtime::environment::now() + timeout;
+        let old_deadline = sim_ctx.clock.now() + timeout;
         let mut budget = RangeBudget::ProgressingPages { timeout };
         for _ in 0..12 {
             let mut page = budget
-                .next_page(false, crate::test_support::clock().now())
+                .next_page(false, sim_ctx.clock.clone().now())
                 .unwrap()
                 .unwrap();
             let deadline = page.deadline();
-            assert_eq!(deadline, uring_runtime::environment::now() + timeout);
+            assert_eq!(deadline, sim_ctx.clock.now() + timeout);
             for _ in 0..8 {
-                page.begin_attempt(uring_runtime::environment::now(), deadline)
-                    .unwrap();
+                page.begin_attempt(sim_ctx.clock.now(), deadline).unwrap();
             }
             assert_eq!(
-                page.begin_attempt(uring_runtime::environment::now(), deadline),
+                page.begin_attempt(sim_ctx.clock.now(), deadline),
                 Err(racer_core::read::Error::Unavailable)
             );
             clock.advance(Duration::from_millis(20));
             assert_eq!(page.deadline(), deadline);
             budget.complete(page).unwrap();
         }
-        assert!(uring_runtime::environment::now() > old_deadline);
+        assert!(sim_ctx.clock.now() > old_deadline);
         let mut stalled = budget
-            .next_page(false, crate::test_support::clock().now())
+            .next_page(false, sim_ctx.clock.clone().now())
             .unwrap()
             .unwrap();
         clock.advance(timeout);
         assert_eq!(
-            stalled.begin_attempt(uring_runtime::environment::now(), stalled.deadline()),
+            stalled.begin_attempt(sim_ctx.clock.now(), stalled.deadline()),
             Err(racer_core::read::Error::DeadlineExceeded)
         );
     }
@@ -3342,8 +3353,8 @@ pub(super) mod tests {
         }
         #[test]
         fn contracts_never_refill_and_start_with_one_selection_per_provider() {
-            let scheduler = Scheduler::new(4, crate::test_support::ctx());
-            let deadline = uring_runtime::environment::now() + std::time::Duration::from_secs(30);
+            let scheduler = Scheduler::new(4, racer_io::WorkerCtx::host());
+            let deadline = racer_io::Clock::host().now() + std::time::Duration::from_secs(30);
             let (first, one) = issue(&scheduler, 0, "provider", Some(4), deadline);
             let (one, _) = one.unwrap();
             // Until the provider grants more, a second concurrent selection
@@ -3382,8 +3393,8 @@ pub(super) mod tests {
         }
         #[test]
         fn contract_serves_up_to_granted_flights_and_refusal_resets_to_one() {
-            let scheduler = Scheduler::new(4, crate::test_support::ctx());
-            let deadline = uring_runtime::environment::now() + std::time::Duration::from_secs(30);
+            let scheduler = Scheduler::new(4, racer_io::WorkerCtx::host());
+            let deadline = racer_io::Clock::host().now() + std::time::Duration::from_secs(30);
             let provider = NodeId("provider".into());
             let (first, result) = issue(&scheduler, 0, "provider", Some(3), deadline);
             result.unwrap();
@@ -3425,13 +3436,13 @@ pub(super) mod tests {
         }
         #[test]
         fn expired_contract_drains_before_a_fresh_one_replaces_it() {
-            let scheduler = Scheduler::new(4, crate::test_support::ctx());
-            let deadline = uring_runtime::environment::now() + std::time::Duration::from_millis(20);
+            let scheduler = Scheduler::new(4, racer_io::WorkerCtx::host());
+            let deadline = racer_io::Clock::host().now() + std::time::Duration::from_millis(20);
             let (first, result) = issue(&scheduler, 0, "provider", Some(2), deadline);
             let (old, _) = result.unwrap();
             scheduler.granted(&first, &NodeId("provider".into()), 2);
             std::thread::sleep(std::time::Duration::from_millis(30));
-            let later = uring_runtime::environment::now() + std::time::Duration::from_secs(30);
+            let later = racer_io::Clock::host().now() + std::time::Duration::from_secs(30);
             // The expired contract never signs another request.
             let (_, draining) = issue(&scheduler, 1, "provider", Some(2), later);
             assert_eq!(draining, Err(Error::Overloaded));
@@ -3471,7 +3482,7 @@ pub(super) mod tests {
         }
         #[test]
         fn scheduler_windows_are_bounded_and_drop_frees_capacity() {
-            let scheduler = Scheduler::new(2, crate::test_support::ctx());
+            let scheduler = Scheduler::new(2, racer_io::WorkerCtx::host());
             let first = scheduler.open(version()).unwrap();
             let second = scheduler.open(version()).unwrap();
             assert!(matches!(scheduler.open(version()), Err(Error::Overloaded)));
@@ -3482,7 +3493,7 @@ pub(super) mod tests {
         }
         #[test]
         fn offer_fans_out_to_every_window_that_wants_the_page() {
-            let scheduler = Scheduler::new(4, crate::test_support::ctx());
+            let scheduler = Scheduler::new(4, racer_io::WorkerCtx::host());
             let first = scheduler.open(version()).unwrap();
             let second = scheduler.open(version()).unwrap();
             let slow = scheduler.open(version()).unwrap();
@@ -3505,7 +3516,7 @@ pub(super) mod tests {
         }
         #[test]
         fn offers_outside_wanted_pages_are_dropped_and_inbox_stays_bounded() {
-            let scheduler = Scheduler::new(1, crate::test_support::ctx());
+            let scheduler = Scheduler::new(1, racer_io::WorkerCtx::host());
             let reader = scheduler.open(version()).unwrap();
             want(&reader, &[0, 1]);
             let selection = Selection::for_test(&scheduler, version(), demand(0, 1_000_000));
@@ -3524,7 +3535,7 @@ pub(super) mod tests {
         }
         #[test]
         fn dropped_window_is_removed_from_fanout_and_busy_elsewhere() {
-            let scheduler = Scheduler::new(2, crate::test_support::ctx());
+            let scheduler = Scheduler::new(2, racer_io::WorkerCtx::host());
             let supplier = scheduler.open(version()).unwrap();
             let reader = scheduler.open(version()).unwrap();
             supplier.sync(
@@ -3560,7 +3571,7 @@ pub(super) mod tests {
             f.open(
                 metadata,
                 range,
-                RequestScope::new(
+                RequestScope::host(
                     crate::model::RequestId([1; 16]),
                     Instant::now() + Duration::from_secs(60),
                 )

@@ -1803,16 +1803,18 @@ mod admission_wake_tests {
     #[test]
     fn expiry_snapshot_call_guards_and_generation_cells() {
         let clock = uring_runtime::environment::SimulationClock::new(920);
-        let _environment = clock.environment(0).enter();
+        let sim_env = clock.environment(0);
+        let _environment = sim_env.enter();
+        let sim_ctx = sim_env.worker_ctx();
         let make = || {
             DriverDiagnostic(
                 Rc::new(std::cell::Cell::new(DriverObservation {
                     stage: DriverStage::Starting,
-                    since: uring_runtime::environment::now(),
+                    since: sim_ctx.clock.now(),
                     cancel_seen: None,
                     abandoned: false,
                 })),
-                crate::test_support::clock(),
+                sim_ctx.clock.clone(),
             )
         };
         let old = make();
@@ -1871,7 +1873,7 @@ mod admission_wake_tests {
         let flights = Rc::new(Flights::new(
             admission.clone(),
             crate::test_support::availability(),
-            crate::test_support::clock(),
+            racer_io::Clock::host(),
         ));
         let page = crate::memory::tests::bundle_for(
             &admission,
