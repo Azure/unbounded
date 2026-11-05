@@ -1,5 +1,5 @@
 //! Worker-local hard holds. Each reserved page charges one whole segment.
-//! Live expiry requires both clocks to pass the deadline. Restart uses wall time
+//! Live expiry follows the monotonic clock only. Restart uses wall time
 //! only; checkpoints and payloads keep the store's existing no-fsync crash limits.
 
 use super::catalog::RecordLocation;
@@ -161,8 +161,11 @@ impl Hold {
             .collect()
     }
 
+    /// Whether the hold has not expired. Expiry follows the monotonic clock
+    /// only: `until` is the wall-clock deadline a client asked for, kept for
+    /// persistence and reporting, and a wall-clock step must not extend it.
     pub fn live(&self, clock: &racer_io::Clock) -> bool {
-        clock.wall_now() < self.until || clock.now() < self.monotonic
+        clock.now() < self.monotonic
     }
 
     pub fn unused(&self) -> usize {
@@ -242,5 +245,46 @@ pub(super) struct HoldGuard(pub Rc<Cell<usize>>);
 impl Drop for HoldGuard {
     fn drop(&mut self) {
         self.0.set(self.0.get() - 1);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn hold(clock: &racer_io::Clock, ttl: Duration) -> Hold {
+        let until = clock.wall_now() + ttl;
+        Hold {
+            until,
+            monotonic: Holds::deadline(until, clock).unwrap(),
+            pages: HoldPages::default(),
+            holders: HashMap::default(),
+            epoch: HoldEpoch::default(),
+            inflight: Rc::default(),
+            active: Rc::default(),
+            locations: HashMap::default(),
+        }
+    }
+
+    #[test]
+    fn live_follows_monotonic_time_and_ignores_wall_steps() {
+        let virtual_clock = racer_io::ctx::VirtualClock::new();
+        let clock = racer_io::Clock::from(virtual_clock.clone());
+        let held = hold(&clock, Duration::from_secs(10));
+        assert!(held.live(&clock));
+        // A backward wall step does not extend the hold past its monotonic deadline.
+        virtual_clock
+            .set_wall_time(clock.wall_now() - Duration::from_secs(3600))
+            .unwrap();
+        virtual_clock.advance(Duration::from_secs(10)).unwrap();
+        assert!(clock.wall_now() < held.until);
+        assert!(!held.live(&clock));
+        // A forward wall step does not end a hold whose monotonic deadline is ahead.
+        let held = hold(&clock, Duration::from_secs(10));
+        virtual_clock
+            .set_wall_time(clock.wall_now() + Duration::from_secs(3600))
+            .unwrap();
+        assert!(clock.wall_now() > held.until);
+        assert!(held.live(&clock));
     }
 }
