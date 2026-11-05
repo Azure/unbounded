@@ -34,7 +34,13 @@ func TestNodeLifecycleCommand(t *testing.T) {
 }
 
 func TestNodeLifecycleRegistered(t *testing.T) {
-	require.NotNil(t, newNodeLifecycle(testLogger()))
+	l := newNodeLifecycle(testLogger())
+	require.NotNil(t, l)
+
+	// Pre-start checks the other slot before it starts one.
+	require.NotNil(t, l.Peer)
+	require.Equal(t, "kube2", l.Peer("kube1"))
+	require.Equal(t, "kube1", l.Peer("kube2"))
 }
 
 func TestNodeLifecycleWiresTheGPUHooks(t *testing.T) {

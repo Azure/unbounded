@@ -38,6 +38,40 @@ func ValidSlot(slot string) error {
 	return nil
 }
 
+// OtherSlot is the blue/green slot that is not slot.
+func OtherSlot(slot string) string {
+	if slot == slotKube1 {
+		return slotKube2
+	}
+
+	return slotKube1
+}
+
+// BPFFSDir holds one private bpffs mount per slot, at the same host path the
+// nspawn machine of the slot uses, so each node gets its own pinned-object
+// namespace and reset removes either mode's with one task.
+const BPFFSDir = "/run/bpffs"
+
+// BPFFSPath is the host bpffs mount a slot's container sees at /sys/fs/bpf.
+func BPFFSPath(slot string) string { return filepath.Join(BPFFSDir, slot) }
+
+// The supervising unit's cgroup is delegated to the agent and split in two:
+// runc, the unit's own process, runs in the supervisor subgroup
+// (DelegateSubgroup=), and the container's processes in the payload subgroup.
+// Both are inside the unit's cgroup, so stopping the unit kills the container
+// too, and cgroup v2's no-internal-processes rule is kept.
+const (
+	unitSlice          = "system.slice"
+	supervisorSubgroup = "supervisor"
+	payloadSubgroup    = "payload"
+)
+
+// CgroupPath is the absolute cgroup (below the cgroup2 root) the container of
+// a slot runs in.
+func CgroupPath(slot string) string {
+	return "/" + unitSlice + "/" + UnitName(slot) + "/" + payloadSubgroup
+}
+
 // ContainerID is the OCI container id for a slot.
 func ContainerID(slot string) string { return "unbounded-" + slot }
 

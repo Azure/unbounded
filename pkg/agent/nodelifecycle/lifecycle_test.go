@@ -178,10 +178,7 @@ func TestPostStartAfterStartIsNotLimitedByTheReadinessBudget(t *testing.T) {
 func TestPostStartAfterStartIsBoundedByItsOwnTimeout(t *testing.T) {
 	l := newLifecycle(&fakeController{})
 
-	original := afterStartTimeout
-	afterStartTimeout = 20 * time.Millisecond
-
-	t.Cleanup(func() { afterStartTimeout = original })
+	l.AfterStartTimeout = 20 * time.Millisecond
 
 	l.AfterStart = func(ctx context.Context, _ string) error {
 		<-ctx.Done()
@@ -206,4 +203,57 @@ func TestPostStartAfterStartStopsWhenTheCallerCancels(t *testing.T) {
 	}
 
 	require.ErrorIs(t, l.PostStart(ctx, "kube1"), context.Canceled)
+}
+
+// slotController reports running per slot.
+type slotController struct {
+	fakeController
+
+	running map[string]bool
+	err     map[string]error
+}
+
+func (c *slotController) Running(_ context.Context, slot string) (bool, string, error) {
+	c.calls = append(c.calls, "running "+slot)
+
+	return c.running[slot], "", c.err[slot]
+}
+
+func peerOf(slot string) string {
+	if slot == "kube1" {
+		return "kube2"
+	}
+
+	return "kube1"
+}
+
+// A slot never starts while the other slot's node stack is alive, so a stop
+// that failed cannot leave two node stacks running.
+func TestPreStartRefusesWhileThePeerRuns(t *testing.T) {
+	c := &slotController{running: map[string]bool{"kube1": true}}
+	l := newLifecycle(c)
+	l.Peer = peerOf
+
+	err := l.PreStart(context.Background(), "kube2")
+	require.ErrorContains(t, err, "refusing to start kube2 while kube1 is still running")
+	require.Equal(t, []string{"running kube1"}, c.calls, "nothing is regenerated")
+
+	// A peer whose state cannot be read is not assumed stopped.
+	c = &slotController{err: map[string]error{"kube1": errors.New("runtime missing")}}
+	l = newLifecycle(c)
+	l.Peer = peerOf
+
+	require.ErrorContains(t, l.PreStart(context.Background(), "kube2"), "cannot tell whether kube1 is still running")
+
+	// A stopped peer is the normal case.
+	c = &slotController{}
+	l = newLifecycle(c)
+	l.Peer = peerOf
+
+	require.NoError(t, l.PreStart(context.Background(), "kube2"))
+	require.Equal(t, []string{"running kube1", "regenerate kube2"}, c.calls)
+}
+
+func TestDefaultBudgetIsTheSumOfThePostStartWaits(t *testing.T) {
+	require.Equal(t, DefaultReadyTimeout+DefaultAfterStartTimeout, PostStartBudget)
 }

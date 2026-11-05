@@ -85,6 +85,9 @@ func newNodeLifecycleWith(log *slog.Logger, gpu containerops.NVIDIAHooks) *nodel
 	return &nodelifecycle.Lifecycle{
 		Log:        log,
 		Controller: containerController{b: b},
+		// Both slots' units conflict, and a container that outlived its unit's
+		// stop still holds the shared host paths: never start beside it.
+		Peer: container.OtherSlot,
 		AfterStart: func(ctx context.Context, slot string) error {
 			return containerops.ReconcileNVIDIA(ctx, log, b, slot, gpu)
 		},

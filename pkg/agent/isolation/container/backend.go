@@ -100,7 +100,20 @@ type Backend struct {
 	// UnitRequires lists host units the supervising unit requires and orders
 	// after, such as the LocalDNS network unit.
 	UnitRequires []string
+	// GoneTimeout bounds how long Stop waits for the runtime to report the
+	// container gone, before and again after killing it. Zero is
+	// DefaultGoneTimeout.
+	GoneTimeout time.Duration
+	// PollInterval is the wait between runtime state checks. Zero is
+	// DefaultPollInterval.
+	PollInterval time.Duration
 }
+
+// Defaults for Stop's check that the container is gone.
+const (
+	DefaultGoneTimeout  = 30 * time.Second
+	DefaultPollInterval = 500 * time.Millisecond
+)
 
 var _ isolation.Backend = (*Backend)(nil)
 
@@ -217,6 +230,7 @@ func (b *Backend) statDevice(path string) (DeviceInfo, error) {
 // SELinux state and the devices on the host. It is idempotent and atomic.
 func (b *Backend) RenderBundle(slot string, grants []isolation.Grant) error {
 	in := BundleInput{
+		Slot:      slot,
 		RootfsDir: b.Layout.RootfsDir(slot),
 		SELinux:   b.host().SELinuxMode(),
 		Grants:    slices.Clone(grants),
@@ -224,6 +238,23 @@ func (b *Backend) RenderBundle(slot string, grants []isolation.Grant) error {
 	}
 
 	for i, g := range grants {
+		if g.Kind == isolation.GrantMount {
+			// The device paths a device directory allows that exist now get
+			// an explicit rule; one that is missing, or a device class, does
+			// not, and the container's allow-all baseline covers it.
+			for _, allow := range g.DeviceAllow {
+				if !filepath.IsAbs(allow) {
+					continue
+				}
+
+				if info, err := b.statDevice(allow); err == nil {
+					in.Devices[allow] = info
+				}
+			}
+
+			continue
+		}
+
 		if g.Kind != isolation.GrantDevice || g.Source == "" {
 			continue
 		}
@@ -413,6 +444,10 @@ func (b *Backend) Prepare(ctx context.Context, n isolation.NodeSpec) (isolation.
 		return nil, fmt.Errorf("rootfs %s is not present and no unpacker is configured", rootfs)
 	}
 
+	if err := maskUnits(rootfs); err != nil {
+		return nil, err
+	}
+
 	if err := b.ensureSamePathDirs(); err != nil {
 		return nil, err
 	}
@@ -439,6 +474,44 @@ func (b *Backend) Prepare(ctx context.Context, n isolation.NodeSpec) (isolation.
 	}
 
 	return b.root(n.Slot), nil
+}
+
+// MaskedUnits are masked in the container's rootfs. udev belongs to the host:
+// the container sees the host's devices but must not run a second udev that
+// processes their events and rewrites their nodes and permissions.
+var MaskedUnits = []string{
+	"systemd-udevd.service",
+	"systemd-udevd-control.socket",
+	"systemd-udevd-kernel.socket",
+	"systemd-udev-trigger.service",
+	"systemd-udev-settle.service",
+}
+
+// maskUnits links each MaskedUnits entry to /dev/null under the rootfs's
+// /etc/systemd/system, which is what `systemctl mask` does. It is idempotent.
+func maskUnits(rootfs string) error {
+	dir := filepath.Join(rootfs, "etc/systemd/system")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return fmt.Errorf("mask units: %w", err)
+	}
+
+	for _, unit := range MaskedUnits {
+		path := filepath.Join(dir, unit)
+
+		if target, err := os.Readlink(path); err == nil && target == os.DevNull {
+			continue
+		}
+
+		if err := os.RemoveAll(path); err != nil {
+			return fmt.Errorf("mask %s: %w", unit, err)
+		}
+
+		if err := os.Symlink(os.DevNull, path); err != nil {
+			return fmt.Errorf("mask %s: %w", unit, err)
+		}
+	}
+
+	return nil
 }
 
 func (b *Backend) writeUnit(slot string) error {
@@ -476,9 +549,13 @@ func (b *Backend) RewriteUnit(ctx context.Context, slot string) error {
 	return nil
 }
 
-// Start enables and starts the unit. Starting a running unit is a no-op.
+// Start enables and starts the unit. Starting a running unit is a no-op. The
+// other slot's unit is disabled first, so only this slot comes back at boot,
+// and a failed state left by the unit's start limit is cleared, so the agent
+// can always start a slot again.
 func (b *Backend) Start(ctx context.Context, r isolation.SlotRef) error {
-	if err := ValidSlot(r.Slot()); err != nil {
+	slot := r.Slot()
+	if err := ValidSlot(slot); err != nil {
 		return err
 	}
 
@@ -488,27 +565,114 @@ func (b *Backend) Start(ctx context.Context, r isolation.SlotRef) error {
 		}
 	}
 
-	if err := b.systemctl(ctx, "enable", "--now", UnitName(r.Slot())); err != nil {
-		return fmt.Errorf("start %s: %w", UnitName(r.Slot()), err)
+	if other := UnitName(OtherSlot(slot)); b.unitPresent(OtherSlot(slot)) {
+		if err := b.systemctl(ctx, "disable", other); err != nil {
+			return fmt.Errorf("disable %s before starting %s: %w", other, UnitName(slot), err)
+		}
+	}
+
+	if err := b.systemctl(ctx, "reset-failed", UnitName(slot)); err != nil {
+		b.logger().Debug("reset-failed (best effort)", "unit", UnitName(slot), "error", err)
+	}
+
+	if err := b.systemctl(ctx, "enable", "--now", UnitName(slot)); err != nil {
+		return fmt.Errorf("start %s: %w", UnitName(slot), err)
 	}
 
 	return nil
 }
 
-// Stop stops the unit and removes any stale runtime state. Stopping a stopped
-// container succeeds.
+func (b *Backend) unitPresent(slot string) bool {
+	_, err := os.Lstat(filepath.Join(b.unitDir(), UnitName(slot)))
+
+	return err == nil
+}
+
+// Stop stops and disables the unit, so the slot does not come back at boot,
+// and returns only once the runtime reports the container gone. A container
+// that outlives the stop is killed and deleted; one that survives that too is
+// an error, because it still holds the host paths both slots share. Stopping a
+// stopped container succeeds.
 func (b *Backend) Stop(ctx context.Context, r isolation.SlotRef) error {
-	if err := ValidSlot(r.Slot()); err != nil {
+	slot := r.Slot()
+	if err := ValidSlot(slot); err != nil {
 		return err
 	}
 
-	if err := b.systemctl(ctx, "stop", UnitName(r.Slot())); err != nil {
-		return fmt.Errorf("stop %s: %w", UnitName(r.Slot()), err)
+	var errs []error
+
+	if err := b.systemctl(ctx, "stop", UnitName(slot)); err != nil {
+		errs = append(errs, fmt.Errorf("stop %s: %w", UnitName(slot), err))
 	}
 
-	b.deleteContainer(ctx, r.Slot())
+	if b.unitPresent(slot) {
+		if err := b.systemctl(ctx, "disable", UnitName(slot)); err != nil {
+			errs = append(errs, fmt.Errorf("disable %s: %w", UnitName(slot), err))
+		}
+	}
 
-	return nil
+	if err := b.ensureGone(ctx, slot); err != nil {
+		errs = append(errs, err)
+	}
+
+	return errors.Join(errs...)
+}
+
+// ensureGone waits for the runtime to report the slot's container gone. If it
+// does not go, it is killed and its state deleted, and waited for again. The
+// stale runtime state of a container that is gone is removed.
+func (b *Backend) ensureGone(ctx context.Context, slot string) error {
+	if b.waitGone(ctx, slot) {
+		b.deleteContainer(ctx, slot)
+
+		return nil
+	}
+
+	id := ContainerID(slot)
+	b.logger().Warn("container outlived its unit's stop; killing it", "container", id)
+
+	if _, err := b.run(ctx, b.runtimePath(), "kill", "--all", id, "KILL"); err != nil {
+		b.logger().Debug("runtime kill (best effort)", "container", id, "error", err)
+	}
+
+	b.deleteContainer(ctx, slot)
+
+	if b.waitGone(ctx, slot) {
+		return nil
+	}
+
+	return fmt.Errorf("container %s is still alive after stopping, killing and deleting it", id)
+}
+
+// waitGone polls containerAlive until it reports false or GoneTimeout passes.
+func (b *Backend) waitGone(ctx context.Context, slot string) bool {
+	timeout := b.GoneTimeout
+	if timeout <= 0 {
+		timeout = DefaultGoneTimeout
+	}
+
+	interval := b.PollInterval
+	if interval <= 0 {
+		interval = DefaultPollInterval
+	}
+
+	deadline := time.Now().Add(timeout)
+
+	for {
+		if !b.containerAlive(ctx, slot) {
+			return true
+		}
+
+		if time.Now().After(deadline) {
+			return false
+		}
+
+		select {
+		case <-ctx.Done():
+			return !b.containerAlive(context.WithoutCancel(ctx), slot)
+		case <-time.After(interval):
+		}
+	}
 }
 
 // deleteContainer removes leftover runtime state. A container that does not
@@ -548,10 +712,13 @@ func (b *Backend) SlotExists(slot string) bool {
 	return false
 }
 
-// Destroy stops and removes the unit, then removes the bundle and rootfs. Every
-// step is attempted so a failure on one does not strand the others. The rootfs
-// is not removed while anything is still mounted below it, since removing a
-// live bind mount would delete host data.
+// Destroy stops the container, then removes the unit, the bundle, the rootfs
+// and the slot's bpffs mount. Nothing is removed while the runtime still has
+// a live container for the slot: it owns its rootfs, and the binds inside its
+// private mount namespace are not in the host mount table that removeRootfs
+// checks, so removing the files could delete host data through them. A later
+// destroy removes them once the container is gone. The rootfs is also kept
+// while anything is mounted below it on the host.
 func (b *Backend) Destroy(ctx context.Context, r isolation.SlotRef) error {
 	slot := r.Slot()
 	if err := ValidSlot(slot); err != nil {
@@ -563,38 +730,31 @@ func (b *Backend) Destroy(ctx context.Context, r isolation.SlotRef) error {
 	// A slot whose unit was never written (an interrupted Prepare) or is
 	// already gone has nothing for systemd to stop; asking would fail with
 	// "not loaded" and hide the cleanup that follows.
-	unitPath := filepath.Join(b.unitDir(), UnitName(slot))
-	stopFailed := false
-
-	if _, err := os.Lstat(unitPath); err == nil {
+	unitPresent := b.unitPresent(slot)
+	if unitPresent {
 		if err := b.Stop(ctx, r); err != nil {
 			errs = append(errs, err)
-			stopFailed = true
 		}
+	} else if err := b.ensureGone(ctx, slot); err != nil {
+		errs = append(errs, err)
+	}
 
-		if err := b.systemctl(ctx, "disable", UnitName(slot)); err != nil {
-			errs = append(errs, fmt.Errorf("disable %s: %w", UnitName(slot), err))
-		}
+	// Checked whatever the stop reported: a stop that claimed success is not
+	// taken on trust before files are deleted.
+	if b.containerAlive(ctx, slot) {
+		errs = append(errs, fmt.Errorf("container %s is still alive; its unit, bundle and rootfs are kept", ContainerID(slot)))
 
-		if err := os.Remove(unitPath); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return errors.Join(errs...)
+	}
+
+	if unitPresent {
+		if err := os.Remove(filepath.Join(b.unitDir(), UnitName(slot))); err != nil && !errors.Is(err, os.ErrNotExist) {
 			errs = append(errs, err)
 		}
 
 		if err := b.systemctl(ctx, "daemon-reload"); err != nil {
 			errs = append(errs, fmt.Errorf("daemon-reload: %w", err))
 		}
-	} else {
-		b.deleteContainer(ctx, slot)
-	}
-
-	// A container that survived a failed stop owns its rootfs, and the binds
-	// inside its private mount namespace are not in the host mount table that
-	// removeRootfs checks. Keep the files; a later destroy removes them once the
-	// container is gone. A stopped or absent container is no reason to keep them.
-	if stopFailed && b.containerAlive(ctx, slot) {
-		errs = append(errs, fmt.Errorf("container %s is still alive after the failed stop; its bundle and rootfs are kept", ContainerID(slot)))
-
-		return errors.Join(errs...)
 	}
 
 	if err := b.removeTree(b.Layout.BundleDir(slot)); err != nil {
@@ -602,6 +762,10 @@ func (b *Backend) Destroy(ctx context.Context, r isolation.SlotRef) error {
 	}
 
 	if err := b.removeRootfs(slot); err != nil {
+		errs = append(errs, err)
+	}
+
+	if err := b.removeBPFFS(ctx, slot); err != nil {
 		errs = append(errs, err)
 	}
 
@@ -613,6 +777,37 @@ func (b *Backend) Destroy(ctx context.Context, r isolation.SlotRef) error {
 	}
 
 	return errors.Join(errs...)
+}
+
+func (b *Backend) mountInfoPath() string {
+	if b.MountInfoPath == "" {
+		return "/proc/self/mountinfo"
+	}
+
+	return b.MountInfoPath
+}
+
+// removeBPFFS unmounts and removes the slot's private bpffs mount, which the
+// unit's ExecStartPre created on the host.
+func (b *Backend) removeBPFFS(ctx context.Context, slot string) error {
+	dir := filepath.Join(b.SourceRoot, BPFFSPath(slot))
+
+	mounted, err := mountsBelow(b.mountInfoPath(), dir)
+	if err != nil {
+		return fmt.Errorf("check bpffs mount %s: %w", dir, err)
+	}
+
+	if slices.Contains(mounted, dir) {
+		if _, err := b.run(ctx, "umount", dir); err != nil {
+			return fmt.Errorf("unmount bpffs %s: %w", dir, err)
+		}
+	}
+
+	if err := os.Remove(dir); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return fmt.Errorf("remove bpffs mount point %s: %w", dir, err)
+	}
+
+	return nil
 }
 
 // containerAlive reports whether the runtime still has a container for the
@@ -640,12 +835,7 @@ func (b *Backend) removeTree(dir string) error {
 func (b *Backend) removeRootfs(slot string) error {
 	dir := b.Layout.RootfsDir(slot)
 
-	path := b.MountInfoPath
-	if path == "" {
-		path = "/proc/self/mountinfo"
-	}
-
-	mounted, err := mountsBelow(path, dir)
+	mounted, err := mountsBelow(b.mountInfoPath(), dir)
 	if err != nil {
 		return fmt.Errorf("refusing to remove %s: %w", dir, err)
 	}
