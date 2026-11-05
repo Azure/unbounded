@@ -61,7 +61,8 @@ type OperationResult struct {
 	ProviderID        string
 	CleanupProviderID string
 	// Allocation is the allocation result reported by HostAllocate. It is
-	// nil for every other operation kind.
+	// nil for every other operation kind. Every terminal HostAllocate Poll
+	// result must set it, as AllocationResult describes.
 	Allocation *AllocationResult
 }
 
