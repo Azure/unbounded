@@ -106,9 +106,9 @@ fn azure(head: &str, blobs: &Mutex<Blobs>) -> Vec<u8> {
     response
 }
 
-fn reactor() -> Option<Rc<Reactor>> {
+fn reactor(env: &racer_io::Env) -> Option<Rc<Reactor>> {
     // Probe io_uring availability the same way other socket tests do.
-    crate::test_support::enrollment::reactor()?;
+    crate::test_support::enrollment::reactor(env)?;
     let n = NonZeroUsize::new(1024).unwrap();
     let bytes = NonZeroUsize::new(4 * PAGE_BYTES as usize).unwrap();
     let reactor = Rc::new(Reactor::new(
@@ -136,7 +136,7 @@ fn reactor() -> Option<Rc<Reactor>> {
             metadata_entries: n,
             relay_transfers: n,
         }))),
-        &crate::test_support::env(),
+        env,
     ));
     reactor.init().unwrap();
     Some(reactor)
@@ -260,7 +260,8 @@ impl<K: AzureTokenSource> Fixture<K> {
 
 #[test]
 fn plain_http_reads_pages_and_classifies_errors_on_one_connection() {
-    let Some(reactor) = reactor() else { return };
+    let env = racer_io::Env::host();
+    let Some(reactor) = reactor(&env) else { return };
     let blobs = Arc::new(Mutex::new(Blobs {
         etag: "\"v1\"".into(),
     }));
@@ -337,7 +338,8 @@ fn plain_http_reads_pages_and_classifies_errors_on_one_connection() {
 
 #[test]
 fn https_with_a_private_ca_by_name() {
-    let Some(reactor) = reactor() else { return };
+    let env = racer_io::Env::host();
+    let Some(reactor) = reactor(&env) else { return };
     let identity = test_identity(&["account.blob.example"]);
     let blobs = Arc::new(Mutex::new(Blobs {
         etag: "\"v1\"".into(),
@@ -376,11 +378,12 @@ fn https_with_a_private_ca_by_name() {
 
 #[test]
 fn https_without_a_trust_bundle_fails_per_request() {
+    let env = racer_io::Env::host();
     // The load happens once, at construction; requests never reread it.
     let trust = TrustRoots::load("/nonexistent/racer-bundle.pem".into());
     assert_eq!(trust.config().err(), Some(Error::Unavailable));
     assert_eq!(trust.config().err(), Some(Error::Unavailable));
-    let Some(reactor) = reactor() else { return };
+    let Some(reactor) = reactor(&env) else { return };
     let f = fixture(
         reactor,
         "https://account.blob.example/models",
@@ -396,7 +399,8 @@ fn https_without_a_trust_bundle_fails_per_request() {
 /// the storage challenge names the tenant, and the retry carries a token.
 #[test]
 fn workload_identity_learns_its_tenant_from_the_storage_challenge() {
-    let Some(reactor) = reactor() else { return };
+    let env = racer_io::Env::host();
+    let Some(reactor) = reactor(&env) else { return };
     let identity = test_identity(&["login.example"]);
     let directory = Directory::new();
     let token_file = directory.0.join("token");
@@ -465,7 +469,8 @@ fn workload_identity_learns_its_tenant_from_the_storage_challenge() {
 
 #[test]
 fn decoded_response_head_stays_charged_while_the_exchange_lives() {
-    let Some(reactor) = reactor() else { return };
+    let env = racer_io::Env::host();
+    let Some(reactor) = reactor(&env) else { return };
     let blobs = Arc::new(Mutex::new(Blobs {
         etag: "\"v1\"".into(),
     }));
@@ -553,7 +558,8 @@ fn refused_address() -> std::net::SocketAddr {
 
 #[test]
 fn connect_failure_fails_over_to_the_next_resolved_address() {
-    let Some(reactor) = reactor() else { return };
+    let env = racer_io::Env::host();
+    let Some(reactor) = reactor(&env) else { return };
     let identity = test_identity(&["account.blob.example"]);
     let blobs = Arc::new(Mutex::new(Blobs {
         etag: "\"v1\"".into(),
@@ -588,7 +594,8 @@ fn connect_failure_fails_over_to_the_next_resolved_address() {
 
 #[test]
 fn connect_failure_on_every_address_is_reported() {
-    let Some(reactor) = reactor() else { return };
+    let env = racer_io::Env::host();
+    let Some(reactor) = reactor(&env) else { return };
     let dead = refused_address();
     let url = format!("http://account.blob.example:{}/account/models", dead.port());
     let f = fixture(
@@ -628,7 +635,8 @@ fn attempt_scope_narrows_only_non_final_attempts() {
 
 #[test]
 fn stalled_handshake_fails_over_before_the_request_deadline() {
-    let Some(reactor) = reactor() else { return };
+    let env = racer_io::Env::host();
+    let Some(reactor) = reactor(&env) else { return };
     let identity = test_identity(&["account.blob.example"]);
     let blobs = Arc::new(Mutex::new(Blobs {
         etag: "\"v1\"".into(),
@@ -688,7 +696,8 @@ fn stalled_handshake_fails_over_before_the_request_deadline() {
 
 #[test]
 fn endpoints_for_unpublished_origins_are_dropped() {
-    let Some(reactor) = reactor() else { return };
+    let env = racer_io::Env::host();
+    let Some(reactor) = reactor(&env) else { return };
     let admission = reactor.admission().clone();
     let transport = PoolTransport::new(
         Rc::new(crate::http::new_pool(reactor.clone(), admission.clone(), 4)),
@@ -726,7 +735,8 @@ fn endpoints_for_unpublished_origins_are_dropped() {
 
 #[test]
 fn admission_wait_does_not_spend_an_address_attempt() {
-    let Some(reactor) = reactor() else { return };
+    let env = racer_io::Env::host();
+    let Some(reactor) = reactor(&env) else { return };
     let blobs = Arc::new(Mutex::new(Blobs {
         etag: "\"v1\"".into(),
     }));
@@ -802,7 +812,8 @@ fn admission_wait_does_not_spend_an_address_attempt() {
 #[test]
 fn reused_connection_closed_before_response_retries_on_fresh_connection() {
     use std::io::{Read as _, Write as _};
-    let Some(reactor) = reactor() else { return };
+    let env = racer_io::Env::host();
+    let Some(reactor) = reactor(&env) else { return };
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let address = listener.local_addr().unwrap();
     let blobs = Arc::new(Mutex::new(Blobs {

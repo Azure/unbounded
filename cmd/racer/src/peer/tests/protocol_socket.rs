@@ -6,7 +6,8 @@ use racer_wire::control::CacheId;
 
 #[test]
 fn signed_opaque_relay_roundtrip_and_exact_attempt_binding() {
-    let signers = signers();
+    let env = racer_io::Env::host();
+    let signers = signers(&env);
     let auth = signers
         .iter()
         .map(|s| Forwarding::new(s.clone()))
@@ -15,7 +16,7 @@ fn signed_opaque_relay_roundtrip_and_exact_attempt_binding() {
         crate::test_support::cluster::config(false).limits,
     )));
     let codec = codec(&admission);
-    let local = request(&admission, 7);
+    let local = request(&env, &admission, 7);
     let scope = local.origin.scope().clone();
     let (signed, outstanding) = auth[0].sign_request_to(local, signers[1].node()).unwrap();
     let signature = signed.authentication.original.signature.clone();
@@ -76,7 +77,7 @@ fn signed_opaque_relay_roundtrip_and_exact_attempt_binding() {
     .unwrap();
     let decoded = codec.response(envelope, vec![], &scope).unwrap();
     let (_, other) = auth[0]
-        .sign_request_to(request(&admission, 8), signers[1].node())
+        .sign_request_to(request(&env, &admission, 8), signers[1].node())
         .unwrap();
     assert!(auth[0].verify_response(decoded, &other).is_err());
     assert!(matches!(
@@ -92,14 +93,15 @@ fn signed_opaque_relay_roundtrip_and_exact_attempt_binding() {
 fn not_found_is_authenticated_through_relay_and_restricted_to_fresh_acquire() {
     use crate::peer::protocol as p;
     use http1::StartLine;
-    let signers = signers();
+    let env = racer_io::Env::host();
+    let signers = signers(&env);
     let auth: Vec<_> = signers.iter().map(|s| Forwarding::new(s.clone())).collect();
     let admission = Rc::new(flow_control::Quotas::new(AdmissionPolicy::new(
         crate::test_support::cluster::config(false).limits,
     )));
     let codec = codec(&admission);
     for role in ["fresh", "copy", "pinned", "page", "relay"] {
-        let mut local = request(&admission, 20);
+        let mut local = request(&env, &admission, 20);
         let object = local.origin.object.clone();
         local.operation = if role == "page" {
             Operation::Page {
@@ -210,7 +212,7 @@ fn not_found_is_authenticated_through_relay_and_restricted_to_fresh_acquire() {
         assert_eq!(length, 0);
         let decoded = codec.response(envelope, vec![], &scope).unwrap();
         let (_, other) = auth[0]
-            .sign_request_to(request(&admission, 21), signers[1].node())
+            .sign_request_to(request(&env, &admission, 21), signers[1].node())
             .unwrap();
         assert!(auth[0].verify_response(decoded, &other).is_err());
         assert!(matches!(
@@ -269,14 +271,15 @@ fn not_found_is_authenticated_through_relay_and_restricted_to_fresh_acquire() {
 
 #[test]
 fn changed_operation_credentials_replay_and_deadlines_fail() {
-    let signers = signers();
+    let env = racer_io::Env::host();
+    let signers = signers(&env);
     let sender = Forwarding::new(signers[0].clone());
     let receiver = Forwarding::new(signers[2].clone());
     let admission = Rc::new(flow_control::Quotas::new(AdmissionPolicy::new(
         crate::test_support::cluster::config(false).limits,
     )));
     let codec = codec(&admission);
-    let local = request(&admission, 1);
+    let local = request(&env, &admission, 1);
     let scope = local.origin.scope().clone();
     let (mut signed, _) = sender.sign_request(local).unwrap();
     signed
@@ -287,7 +290,7 @@ fn changed_operation_credentials_replay_and_deadlines_fail() {
         .unwrap()
         .ciphertext[0] ^= 1;
     assert!(receiver.verify_request(signed).is_err());
-    let (signed, _) = sender.sign_request(request(&admission, 2)).unwrap();
+    let (signed, _) = sender.sign_request(request(&env, &admission, 2)).unwrap();
     let (envelope, _) = decode_envelope(
         encode_envelope(&signed.authentication, false, 0).unwrap(),
         false,
@@ -298,13 +301,13 @@ fn changed_operation_credentials_replay_and_deadlines_fail() {
     receiver
         .verify_request(codec.request(envelope, &scope).unwrap())
         .unwrap();
-    let mut expired = request(&admission, 3);
+    let mut expired = request(&env, &admission, 3);
     expired.route.deadline = Deadline(Instant::now() - Duration::from_secs(1));
     assert!(matches!(
         request_scope(&expired, &scope),
         Err(Error::DeadlineExceeded)
     ));
-    let local = request(&admission, 4);
+    let local = request(&env, &admission, 4);
     let narrowed = request_scope(&local, &scope).unwrap();
     scope.cancel().unwrap();
     assert_eq!(narrowed.check(), Err(Error::Cancelled));
@@ -312,10 +315,11 @@ fn changed_operation_credentials_replay_and_deadlines_fail() {
 
 #[test]
 fn search_view_consumes_ingress_without_changing_signed_route() {
+    let env = racer_io::Env::host();
     let admission = flow_control::Quotas::new(AdmissionPolicy::new(
         crate::test_support::cluster::config(false).limits,
     ));
-    let request = request(&admission, 1);
+    let request = request(&env, &admission, 1);
     let initial = search_budget(&request.route, &NodeId(A.into())).unwrap();
     assert!(initial.visited.is_empty());
     assert_eq!(initial.remaining_links, 4);
@@ -336,6 +340,7 @@ fn server_authenticates_before_copy_only_service_and_signs_failures() {
     use crate::topology::Paths;
     use std::cell::Cell;
     use std::num::NonZeroU32;
+    let env = racer_io::Env::host();
     struct Service(Rc<Cell<usize>>);
     impl server::LocalPageService for Service {
         fn serve_peer<'a>(
@@ -357,7 +362,7 @@ fn server_authenticates_before_copy_only_service_and_signs_failures() {
             })
         }
     }
-    let signers = signers();
+    let signers = signers(&env);
     let sender = Forwarding::new(signers[0].clone());
     let destination = Rc::new(Forwarding::new(signers[2].clone()));
     let admission = Rc::new(flow_control::Quotas::new(AdmissionPolicy::new(
@@ -388,8 +393,11 @@ fn server_authenticates_before_copy_only_service_and_signs_failures() {
         )
         .unwrap(),
     );
-    let paths = Rc::new(Paths::new(Rc::new(LinkHealth::default()), 4));
-    let outbound = NoOutbound::new(signers[2].clone(), network.clone());
+    let paths = Rc::new(Paths::new(
+        Rc::new(LinkHealth::on(env.ctx.clock.clone())),
+        4,
+    ));
+    let outbound = NoOutbound::new(&env, signers[2].clone(), network.clone());
     let relay = Rc::new(Relay::new(
         paths,
         destination.clone(),
@@ -397,7 +405,7 @@ fn server_authenticates_before_copy_only_service_and_signs_failures() {
         admission.clone(),
         network.clone(),
     ));
-    let reactor = Rc::new(Reactor::new(admission.clone(), &crate::test_support::env()));
+    let reactor = Rc::new(Reactor::new(admission.clone(), &env));
     let io = Rc::new(crate::http::new_io(
         reactor,
         Codec::new(65536),
@@ -414,7 +422,7 @@ fn server_authenticates_before_copy_only_service_and_signs_failures() {
         Rc::new(codec(&admission)),
         signers[2].clone(),
     );
-    let local = request(&admission, 1);
+    let local = request(&env, &admission, 1);
     let scope = local.origin.scope().clone();
     let (mut forged, _) = sender.sign_request(local).unwrap();
     if let Some(head) = Arc::get_mut(&mut forged.authentication.original) {
@@ -424,7 +432,7 @@ fn server_authenticates_before_copy_only_service_and_signs_failures() {
     forged.request.route.destination = NodeId(B.into());
     assert!(futures::executor::block_on(server.dispatch(forged, &scope)).is_err());
     assert_eq!(calls.get(), 0);
-    let (valid, binding) = sender.sign_request(request(&admission, 2)).unwrap();
+    let (valid, binding) = sender.sign_request(request(&env, &admission, 2)).unwrap();
     let response = futures::executor::block_on(server.dispatch(valid, &scope)).unwrap();
     assert_eq!(calls.get(), 1);
     assert!(matches!(
@@ -442,11 +450,12 @@ fn relay_dispatch_preserves_reverse_path_and_fails_closed_on_link_loss() {
     use crate::topology::Member;
     use crate::topology::Membership;
     use crate::topology::Paths;
+    let env = racer_io::Env::host();
     for fail in [false, true] {
-        let signers = signers();
+        let signers = signers(&env);
         let origin = Forwarding::new(signers[0].clone());
         let forwarding = Rc::new(Forwarding::new(signers[1].clone()));
-        let socket = SocketFixture::new(2);
+        let socket = SocketFixture::new(&env, 2);
         let admission = socket.admission.clone();
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         listener.set_nonblocking(true).unwrap();
@@ -475,7 +484,10 @@ fn relay_dispatch_preserves_reverse_path_and_fails_closed_on_link_loss() {
             )
             .unwrap(),
         );
-        let paths = Rc::new(Paths::new(Rc::new(LinkHealth::default()), 1));
+        let paths = Rc::new(Paths::new(
+            Rc::new(LinkHealth::on(env.ctx.clock.clone())),
+            1,
+        ));
         let requester = Rc::new(Requester::new(
             paths.clone(),
             forwarding.clone(),
@@ -489,7 +501,7 @@ fn relay_dispatch_preserves_reverse_path_and_fails_closed_on_link_loss() {
             admission.clone(),
             network,
         );
-        let local = request(&admission, 9);
+        let local = request(&env, &admission, 9);
         let scope = local.origin.scope().clone();
         let (signed, binding) = origin.sign_request_to(local, signers[1].node()).unwrap();
         let ingress = forwarding.verify_request(signed).unwrap();
@@ -579,10 +591,11 @@ fn relay_fails_a_request_for_a_silent_destination_at_once() {
     use crate::topology::Member;
     use crate::topology::Membership;
     use crate::topology::Paths;
-    let signers = signers();
+    let env = racer_io::Env::host();
+    let signers = signers(&env);
     let origin = Forwarding::new(signers[0].clone());
     let forwarding = Rc::new(Forwarding::new(signers[1].clone()));
-    let socket = SocketFixture::new(2);
+    let socket = SocketFixture::new(&env, 2);
     let admission = socket.admission.clone();
     let membership = Arc::new(
         Membership::validate(
@@ -609,7 +622,7 @@ fn relay_fails_a_request_for_a_silent_destination_at_once() {
         .unwrap(),
     );
     let health = Rc::new(
-        LinkHealth::default()
+        LinkHealth::on(env.ctx.clock.clone())
             .with_silence(std::time::Duration::ZERO, std::time::Duration::from_secs(1)),
     );
     let destination = NodeId(C.into());
@@ -641,7 +654,7 @@ fn relay_fails_a_request_for_a_silent_destination_at_once() {
         admission.clone(),
         network,
     );
-    let local = request(&admission, 11);
+    let local = request(&env, &admission, 11);
     assert_eq!(local.route.destination, destination);
     let scope = local.origin.scope().clone();
     let (signed, _) = origin.sign_request_to(local, signers[1].node()).unwrap();
@@ -664,7 +677,8 @@ fn equal_cost_signed_receiver_survives_wire_recompute_and_cache_eviction() {
     use crate::topology::Membership;
     use crate::topology::Paths;
     use racer_core::route::LinkOutcome;
-    let signers = signers();
+    let env = racer_io::Env::host();
+    let signers = signers(&env);
     let admission = Rc::new(flow_control::Quotas::new(AdmissionPolicy::new(
         crate::test_support::cluster::config(false).limits,
     )));
@@ -687,12 +701,12 @@ fn equal_cost_signed_receiver_survives_wire_recompute_and_cache_eviction() {
         )
         .unwrap(),
     );
-    let paths = Paths::new(Rc::new(LinkHealth::default()), 1);
-    let health = Rc::new(LinkHealth::default());
+    let paths = Paths::new(Rc::new(LinkHealth::on(env.ctx.clock.clone())), 1);
+    let health = Rc::new(LinkHealth::on(env.ctx.clock.clone()));
     let cold = Paths::new(health.clone(), 0);
     let mut selected = std::collections::BTreeSet::new();
     for attempt in 1..=32 {
-        let original = request(&admission, attempt);
+        let original = request(&env, &admission, attempt);
         let scope = original.origin.scope().clone();
         let budget = super::search_budget(&original.route, &NodeId(A.into())).unwrap();
         let planned = futures::executor::block_on(paths.shortest_async(
@@ -734,7 +748,7 @@ fn equal_cost_signed_receiver_survives_wire_recompute_and_cache_eviction() {
             )
             .unwrap();
         let changed = cold
-            .shortest(members.clone(), &NodeId(A.into()), &search)
+            .shortest(&env, members.clone(), &NodeId(A.into()), &search)
             .unwrap();
         assert_ne!(changed.nodes[1], receiver);
         assert_eq!(changed.nodes.len(), planned.nodes.len());
@@ -743,11 +757,11 @@ fn equal_cost_signed_receiver_survives_wire_recompute_and_cache_eviction() {
         let mut other = budget.clone();
         other.destination = members.members()[1498].node.clone();
         paths
-            .shortest(members.clone(), &NodeId(A.into()), &other)
+            .shortest(&env, members.clone(), &NodeId(A.into()), &other)
             .unwrap();
         assert_eq!(
             paths
-                .shortest(members.clone(), &NodeId(A.into()), &search)
+                .shortest(&env, members.clone(), &NodeId(A.into()), &search)
                 .unwrap()
                 .nodes,
             planned.nodes
@@ -767,11 +781,12 @@ fn refused_socket_opens_only_immediate_link_and_selects_bounded_alternate() {
     use crate::topology::Paths;
     use std::task::Context;
     use std::task::Poll;
-    let (signers, _) = identities();
+    let env = racer_io::Env::host();
+    let (signers, _) = identities(&env);
     let admission = Rc::new(flow_control::Quotas::new(AdmissionPolicy::new(
         crate::test_support::cluster::config(false).limits,
     )));
-    let reactor = Rc::new(Reactor::new(admission.clone(), &crate::test_support::env()));
+    let reactor = Rc::new(Reactor::new(admission.clone(), &env));
     let io = Rc::new(crate::http::new_io(
         reactor.clone(),
         Codec::new(protocol::MAX_ENVELOPE_HEAD),
@@ -820,15 +835,15 @@ fn refused_socket_opens_only_immediate_link_and_selects_bounded_alternate() {
             .unwrap(),
         ),
     );
-    let original = request(&admission, 1);
+    let original = request(&env, &admission, 1);
     let budget = super::search_budget(&original.route, &NodeId(A.into())).unwrap();
     let scope = original.origin.scope().clone();
     let direct = paths
-        .shortest(members.clone(), &NodeId(A.into()), &budget)
+        .shortest(&env, members.clone(), &NodeId(A.into()), &budget)
         .unwrap();
     assert_eq!(direct.nodes, vec![NodeId(A.into()), NodeId(C.into())]);
     // Reject a signed receiver that differs from wire recomputation before I/O.
-    let mut page_request = request(&admission, 2);
+    let mut page_request = request(&env, &admission, 2);
     page_request.operation = Operation::Page {
         page: PageId {
             version: ObjectVersion {
@@ -881,7 +896,7 @@ fn refused_socket_opens_only_immediate_link_and_selects_bounded_alternate() {
     assert!(!health.available(&NodeId(C.into())).unwrap());
     assert!(health.available(&NodeId(B.into())).unwrap());
     let alternate = paths
-        .shortest(members.clone(), &NodeId(A.into()), &budget)
+        .shortest(&env, members.clone(), &NodeId(A.into()), &budget)
         .unwrap();
     assert_eq!(
         alternate.nodes,
@@ -892,7 +907,7 @@ fn refused_socket_opens_only_immediate_link_and_selects_bounded_alternate() {
     exhausted.remaining_links = 1;
     assert!(
         paths
-            .shortest(members, &NodeId(A.into()), &exhausted)
+            .shortest(&env, members, &NodeId(A.into()), &exhausted)
             .is_err()
     );
     drop(attempt);
@@ -901,6 +916,7 @@ fn refused_socket_opens_only_immediate_link_and_selects_bounded_alternate() {
 
 #[test]
 fn requester_and_server_negotiate_and_exchange_over_real_tcp() {
+    let env = racer_io::Env::host();
     for case in [
         "success",
         "scope",
@@ -909,11 +925,11 @@ fn requester_and_server_negotiate_and_exchange_over_real_tcp() {
         "cancel",
         "deadline",
     ] {
-        signed_tcp_case(case);
+        signed_tcp_case(&env, case);
     }
 }
 
-fn signed_tcp_case(case: &str) {
+fn signed_tcp_case(env: &racer_io::Env, case: &str) {
     use crate::topology::LinkHealth;
     use crate::topology::Member;
     use crate::topology::Membership;
@@ -948,8 +964,8 @@ fn signed_tcp_case(case: &str) {
             })
         }
     }
-    let (signers, _) = identities();
-    let fixture = SocketFixture::new(2);
+    let (signers, _) = identities(env);
+    let fixture = SocketFixture::new(env, 2);
     let transfers = fixture.transfers(signers[0].clone());
     let SocketFixture {
         admission,
@@ -1008,9 +1024,10 @@ fn signed_tcp_case(case: &str) {
         racer_io::Clock::host(),
     )
     .unwrap();
-    let paths =
-        Rc::new(Paths::new(Rc::new(LinkHealth::default()), 4).with_peer_admission(adaptive));
-    let outbound = NoOutbound::new(signers[2].clone(), destination_network.clone());
+    let paths = Rc::new(
+        Paths::new(Rc::new(LinkHealth::on(env.ctx.clock.clone())), 4).with_peer_admission(adaptive),
+    );
+    let outbound = NoOutbound::new(env, signers[2].clone(), destination_network.clone());
     let relay = Rc::new(Relay::new(
         paths.clone(),
         destination_auth.clone(),
@@ -1035,7 +1052,7 @@ fn signed_tcp_case(case: &str) {
         transfers,
         source_network,
     );
-    let mut local = request(&admission, 1);
+    let mut local = request(env, &admission, 1);
     let scope = local.origin.scope().clone();
     let expected = match case {
         "scope" => {
@@ -1121,6 +1138,7 @@ fn incoming_header_timeout_closes_silent_partial_and_idle_keepalive_peers() {
     use std::os::unix::net::UnixStream;
     use std::task::Context;
     use std::task::Poll;
+    let env = racer_io::Env::host();
 
     struct Never;
     impl server::LocalPageService for Never {
@@ -1156,7 +1174,7 @@ fn incoming_header_timeout_closes_silent_partial_and_idle_keepalive_peers() {
         let admission = Rc::new(flow_control::Quotas::new(AdmissionPolicy::new(
             crate::test_support::cluster::config(false).limits,
         )));
-        let reactor = Rc::new(Reactor::new(admission.clone(), &crate::test_support::env()));
+        let reactor = Rc::new(Reactor::new(admission.clone(), &env));
         reactor.init().unwrap();
         let baseline = admission.used(ResourceClass::RequestContext);
         let io = Rc::new(crate::http::new_io(
@@ -1165,9 +1183,10 @@ fn incoming_header_timeout_closes_silent_partial_and_idle_keepalive_peers() {
             admission.clone(),
             crate::model::PAGE_BYTES + 16,
         ));
-        let (signers, _) = identities();
+        let (signers, _) = identities(&env);
         let forwarding = Rc::new(Forwarding::new(signers[2].clone()));
         let outbound = NoOutbound::new(
+            &env,
             signers[2].clone(),
             Rc::new(
                 PeerNetwork::new(
@@ -1181,7 +1200,10 @@ fn incoming_header_timeout_closes_silent_partial_and_idle_keepalive_peers() {
             ),
         );
         let relay = Rc::new(Relay::new(
-            Rc::new(Paths::new(Rc::new(LinkHealth::default()), 4)),
+            Rc::new(Paths::new(
+                Rc::new(LinkHealth::on(env.ctx.clock.clone())),
+                4,
+            )),
             forwarding.clone(),
             outbound.requester.clone(),
             admission.clone(),
@@ -1333,10 +1355,11 @@ fn real_http_ciphertext_fragmentation_pool_reuse_and_truncation() {
     use std::net::TcpListener;
     use std::task::Context;
     use std::task::Poll;
+    let env = racer_io::Env::host();
     let admission = Rc::new(flow_control::Quotas::new(AdmissionPolicy::new(
         crate::test_support::cluster::config(false).limits,
     )));
-    let reactor = Rc::new(Reactor::new(admission.clone(), &crate::test_support::env()));
+    let reactor = Rc::new(Reactor::new(admission.clone(), &env));
     let io = Rc::new(crate::http::new_io(
         reactor.clone(),
         Codec::new(64 * 1024),
@@ -1344,7 +1367,7 @@ fn real_http_ciphertext_fragmentation_pool_reuse_and_truncation() {
         crate::model::PAGE_BYTES + 16,
     ));
     let pool = Rc::new(crate::http::new_pool(reactor.clone(), admission.clone(), 1));
-    let signers = signers();
+    let signers = signers(&env);
     let transfers = transport::Transfers::new(
         pool,
         io.clone(),
@@ -1470,7 +1493,7 @@ fn real_http_ciphertext_fragmentation_pool_reuse_and_truncation() {
     };
     let client = async {
         for attempt in 0..3 {
-            let mut local = request(&admission, attempt);
+            let mut local = request(&env, &admission, attempt);
             let page = match &response {
                 PeerResponse::Page { ciphertext, .. } => ciphertext.envelope().page.clone(),
                 _ => unreachable!(),
@@ -1536,6 +1559,7 @@ fn real_http_ciphertext_fragmentation_pool_reuse_and_truncation() {
 fn outbound_lease_routes_without_registry_and_rejects_non_neighbors() {
     use crate::topology::Member;
     use crate::topology::Membership;
+    let env = racer_io::Env::host();
     let membership = Arc::new(
         Membership::validate(
             MembershipVersion(7),
@@ -1581,7 +1605,7 @@ fn outbound_lease_routes_without_registry_and_rejects_non_neighbors() {
     let admission = flow_control::Quotas::new(crate::admission::AdmissionPolicy::new(
         crate::test_support::cluster::config(false).limits,
     ));
-    let mut request = request(&admission, 1);
+    let mut request = request(&env, &admission, 1);
     assert_eq!(
         super::check_membership(&request, &membership),
         Err(Error::IncompatibleMembership)
@@ -1633,14 +1657,17 @@ mod established_sessions {
         scope: RequestScope,
     }
     impl Fixture {
-        fn new() -> Self {
-            Self::with_forwarding(|signers| Forwarding::new(signers[2].clone()))
+        fn new(env: &racer_io::Env) -> Self {
+            Self::with_forwarding(env, |signers| Forwarding::new(signers[2].clone()))
         }
-        fn with_forwarding(forwarding: impl FnOnce(&[Rc<Signatures>]) -> Forwarding) -> Self {
+        fn with_forwarding(
+            env: &racer_io::Env,
+            forwarding: impl FnOnce(&[Rc<Signatures>]) -> Forwarding,
+        ) -> Self {
             let admission = Rc::new(flow_control::Quotas::new(AdmissionPolicy::new(
                 crate::test_support::cluster::config(false).limits,
             )));
-            let reactor = Rc::new(Reactor::new(admission.clone(), &crate::test_support::env()));
+            let reactor = Rc::new(Reactor::new(admission.clone(), env));
             reactor.init().unwrap();
             let io = Rc::new(crate::http::new_io(
                 reactor.clone(),
@@ -1648,7 +1675,7 @@ mod established_sessions {
                 admission.clone(),
                 crate::model::PAGE_BYTES + 16,
             ));
-            let signers = signers();
+            let signers = signers(env);
             let forwarding = Rc::new(forwarding(&signers));
             let calls = Rc::new(Cell::new(0));
             let service = Rc::new(CountedService(calls.clone()));
@@ -1677,9 +1704,12 @@ mod established_sessions {
                 )
                 .unwrap(),
             );
-            let outbound = NoOutbound::new(signers[2].clone(), network.clone());
+            let outbound = NoOutbound::new(env, signers[2].clone(), network.clone());
             let relay = Rc::new(Relay::new(
-                Rc::new(Paths::new(Rc::new(LinkHealth::default()), 4)),
+                Rc::new(Paths::new(
+                    Rc::new(LinkHealth::on(env.ctx.clock.clone())),
+                    4,
+                )),
                 forwarding.clone(),
                 outbound.requester.clone(),
                 admission.clone(),
@@ -1728,8 +1758,8 @@ mod established_sessions {
                 crate::http::from_accepted(b.into(), &self.admission).unwrap(),
             )
         }
-        fn frame(&self, large: bool) -> http1::MessageHead {
-            let mut request = request(&self.admission, 1);
+        fn frame(&self, env: &racer_io::Env, large: bool) -> http1::MessageHead {
+            let mut request = request(env, &self.admission, 1);
             if large {
                 request.origin.metadata =
                     Some(crate::security::OpaqueMetadata::from_header(&vec![b'm'; 8192]).unwrap());
@@ -1741,7 +1771,7 @@ mod established_sessions {
             encode_envelope(&signed.authentication, false, 0).unwrap()
         }
         // First successful dispatch uses the production server's accept path.
-        fn first(&self) -> (ConnectionLease, ConnectionLease) {
+        fn first(&self, env: &racer_io::Env) -> (ConnectionLease, ConnectionLease) {
             let (a, b) = self.sockets();
             self.drive(async {
                 let client = async {
@@ -1755,7 +1785,7 @@ mod established_sessions {
                     .await?;
                     let response = self
                         .io
-                        .exchange_head(a, self.frame(false), &self.scope)
+                        .exchange_head(a, self.frame(env, false), &self.scope)
                         .await?;
                     let mut a = response.connection;
                     a.finish_exchange()?;
@@ -1770,17 +1800,18 @@ mod established_sessions {
     #[test]
     fn crypto_queue_full_answers_unsigned_overload_before_verification() {
         use std::num::NonZeroUsize;
+        let env = racer_io::Env::host();
         let (crypto_io, _port) =
             crate::security::pair(crate::model::WorkerId(0), 1, NonZeroUsize::new(1).unwrap());
         let client = Rc::new(crate::security::CryptoClient::new(crypto_io));
-        let f = Fixture::with_forwarding(|signers| {
+        let f = Fixture::with_forwarding(&env, |signers| {
             Forwarding::with_crypto(signers[2].clone(), client.clone())
         });
         // Fill the one port slot and the one admission waiter; nothing completes them.
         let forwarding = Forwarding::with_crypto(f.signers[2].clone(), client.clone());
         let signed = |n| {
             Forwarding::new(f.signers[0].clone())
-                .sign_request(request(&f.admission, n))
+                .sign_request(request(&env, &f.admission, n))
                 .unwrap()
                 .0
         };
@@ -1802,7 +1833,7 @@ mod established_sessions {
                     &f.scope,
                 )
                 .await?;
-                f.io.exchange_head(a, f.frame(false), &f.scope).await
+                f.io.exchange_head(a, f.frame(&env, false), &f.scope).await
             };
             futures::join!(client, f.server.serve_connection(b, &f.scope))
         });
@@ -1818,17 +1849,18 @@ mod established_sessions {
     #[test]
     fn established_server_rejects_duplicate_wrong_direction_session_and_corruption_before_dispatch()
     {
+        let env = racer_io::Env::host();
         for attack in ["duplicate", "direction", "session", "signature"] {
-            let f = Fixture::new();
+            let f = Fixture::new(&env);
             let baseline = f.admission.used(ResourceClass::RequestContext);
-            let (mut a, b) = f.first();
+            let (mut a, b) = f.first(&env);
             assert_eq!(f.calls.get(), 1);
             let mut head = a
                 .state_mut()
                 .session
                 .as_mut()
                 .unwrap()
-                .sign(f.frame(false))
+                .sign(f.frame(&env, false))
                 .unwrap();
             // Re-sign incorrect bindings with the real peer key. Rejection must
             // test ordering/session/direction rather than signature corruption.
@@ -1896,9 +1928,10 @@ mod established_sessions {
     #[test]
     fn partial_signed_head_cancel_closes_socket_and_fresh_handshake_dispatches() {
         use std::os::fd::AsRawFd;
-        let f = Fixture::new();
+        let env = racer_io::Env::host();
+        let f = Fixture::new(&env);
         let baseline = f.admission.used(ResourceClass::RequestContext);
-        let (a, b) = f.first();
+        let (a, b) = f.first(&env);
         let socket = a.socket();
         let size: libc::c_int = 1024;
         // SAFETY: setsockopt synchronously reads this correctly sized integer.
@@ -1916,7 +1949,7 @@ mod established_sessions {
         );
         drop(socket);
         let scope = RequestScope::host(f.scope.request, f.scope.deadline.0).unwrap();
-        let mut sending = f.io.send_head(a, f.frame(true), &scope);
+        let mut sending = f.io.send_head(a, f.frame(&env, true), &scope);
         let mut cx = Context::from_waker(futures::task::noop_waker_ref());
         assert!(sending.as_mut().poll(&mut cx).is_pending());
         let mut prefix = vec![0; 65536];
@@ -1954,7 +1987,7 @@ mod established_sessions {
             baseline + f.io.retained_buffer_bytes()
         );
         // A newly handshaken socket starts at sequence one and dispatches normally.
-        drop(f.first());
+        drop(f.first(&env));
         assert_eq!(f.calls.get(), 2);
         assert_eq!(f.admission.used(ResourceClass::Connection), 0);
         assert_eq!(
@@ -1971,7 +2004,8 @@ mod established_sessions {
 /// own, or for a helper requester, it serves.
 #[test]
 fn hot_page_owner_sheds_non_helper_readers_with_signed_overload() {
-    hot_page_shedding(false);
+    let env = racer_io::Env::host();
+    hot_page_shedding(&env, false);
 }
 
 /// A hot owner sheds a requester in its own mesh column of the page's pool
@@ -1980,12 +2014,13 @@ fn hot_page_owner_sheds_non_helper_readers_with_signed_overload() {
 /// served to one in the owner's column until the cap.
 #[test]
 fn hot_page_owner_serves_its_column_mates() {
-    hot_page_shedding(true);
+    let env = racer_io::Env::host();
+    hot_page_shedding(&env, true);
 }
 
 /// Drive a hot owner C with requester A, where A is in C's mesh column of the
 /// cache's pool exactly when `mate`.
-fn hot_page_shedding(mate: bool) {
+fn hot_page_shedding(env: &racer_io::Env, mate: bool) {
     use crate::http::Codec;
     use crate::runtime::Reactor;
     use crate::topology::LinkHealth;
@@ -2066,6 +2101,7 @@ fn hot_page_shedding(mate: bool) {
         .expect("a requester in or outside C's column as asked")
         .as_str();
     let signers: Vec<_> = crate::test_support::security::identities(
+        env,
         ClusterId(CLUSTER.into()),
         &[A, B, C, requester_name].map(|name| NodeId(name.into())),
         || crate::test_support::security::mac_test_key(CACHE),
@@ -2083,8 +2119,11 @@ fn hot_page_shedding(mate: bool) {
         )
         .unwrap(),
     );
-    let paths = Rc::new(Paths::new(Rc::new(LinkHealth::default()), 4));
-    let outbound = NoOutbound::new(signers[2].clone(), network.clone());
+    let paths = Rc::new(Paths::new(
+        Rc::new(LinkHealth::on(env.ctx.clock.clone())),
+        4,
+    ));
+    let outbound = NoOutbound::new(env, signers[2].clone(), network.clone());
     let relay = Rc::new(Relay::new(
         paths,
         destination.clone(),
@@ -2093,7 +2132,7 @@ fn hot_page_shedding(mate: bool) {
         network.clone(),
     ));
     let io = Rc::new(crate::http::new_io(
-        Rc::new(Reactor::new(admission.clone(), &crate::test_support::env())),
+        Rc::new(Reactor::new(admission.clone(), env)),
         Codec::new(65536),
         admission.clone(),
         16777232,
@@ -2140,7 +2179,7 @@ fn hot_page_shedding(mate: bool) {
     let mut attempt = 0u8;
     let mut ask = |number: u64| {
         attempt += 1;
-        let mut request = request(&admission, attempt);
+        let mut request = request(env, &admission, attempt);
         request.operation = Operation::Page {
             page: page_id(number),
             mode: FetchMode::CopyOnly,

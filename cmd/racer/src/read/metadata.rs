@@ -1492,6 +1492,7 @@ pub(crate) mod tests {
 
     #[test]
     fn clock_discontinuities_invalidate_freshness_but_preserve_old_descriptors() {
+        let env = racer_io::Env::host();
         let mut clock = Clock::default();
         let wall = UNIX_EPOCH + Duration::from_secs(100);
         let mono = Instant::now();
@@ -1506,7 +1507,7 @@ pub(crate) mod tests {
         let index = Index::new(
             WorkerId(0),
             4,
-            crate::test_support::availability(),
+            crate::test_support::availability(&env),
             racer_io::Clock::host(),
         );
         let old = metadata("old", 7);

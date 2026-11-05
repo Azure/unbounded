@@ -329,6 +329,7 @@ impl SubscriptionFixture {
             reactor.ctx().rng.clone(),
         ));
         let peers = peer::Requester::scripted(
+            reactor.ctx().clock.clone(),
             Rc::new(NoPeer),
             NoPeer::direct_hedge_available,
             NoPeer::request,

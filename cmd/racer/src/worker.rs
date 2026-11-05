@@ -890,14 +890,10 @@ mod tests {
 
     #[test]
     fn exact_twenty_endpoint_pairs_close_independently() {
+        let env = racer_io::Env::host();
         let limits = crate::test_support::cluster::config(false).limits;
-        let resources = Resources::new(
-            limits,
-            (0..20).map(WorkerId).collect(),
-            42,
-            crate::test_support::ctx(),
-        )
-        .unwrap();
+        let resources =
+            Resources::new(limits, (0..20).map(WorkerId).collect(), 42, env.ctx.clone()).unwrap();
         let mut peers = resources
             .ports
             .iter()
@@ -923,6 +919,7 @@ mod tests {
     /// Validate before allocation and stop at the first failed endpoint pair.
     #[test]
     fn endpoint_allocator_preserves_order_generation_and_failure_boundary() {
+        let env = racer_io::Env::host();
         let limits = crate::test_support::cluster::config(false).limits;
         for workers in [vec![], vec![WorkerId(7), WorkerId(7)]] {
             assert!(matches!(
@@ -930,7 +927,7 @@ mod tests {
                     limits.clone(),
                     workers,
                     9,
-                    crate::test_support::ctx(),
+                    env.ctx.clone(),
                     |_, _, _| { panic!("invalid worker set reached allocator") }
                 ),
                 Err(Error::InvalidConfiguration)
@@ -942,7 +939,7 @@ mod tests {
                 limits.clone(),
                 vec![WorkerId(7), WorkerId(3), WorkerId(9)],
                 42,
-                crate::test_support::ctx(),
+                env.ctx.clone(),
                 |worker, generation, capacity| {
                     calls.push(worker);
                     assert_eq!(generation, 42);
@@ -968,13 +965,14 @@ mod tests {
     /// A later failure drops previously allocated I/O endpoints, closing their peers.
     #[test]
     fn endpoint_allocator_failure_releases_earlier_ports() {
+        let env = racer_io::Env::host();
         let limits = crate::test_support::cluster::config(false).limits;
         let mut retained_peer = None;
         let result = Resources::with_allocator(
             limits,
             vec![WorkerId(0), WorkerId(1)],
             42,
-            crate::test_support::ctx(),
+            env.ctx.clone(),
             |worker, generation, capacity| {
                 if worker == WorkerId(1) {
                     return Err(Error::Overloaded);
@@ -997,6 +995,7 @@ mod tests {
     #[test]
     fn io_wait_forwards_and_observes_post_poll_policy() {
         use std::cell::Cell;
+        let env = racer_io::Env::host();
         struct Waiting {
             polled: Rc<Cell<bool>>,
             observed: Rc<Cell<usize>>,
@@ -1031,7 +1030,7 @@ mod tests {
         let observed = Rc::new(Cell::new(0));
         let mut service = IoService {
             runtime: WorkerRuntime {
-                reactor: Rc::new(Reactor::new(admission.clone(), &crate::test_support::env())),
+                reactor: Rc::new(Reactor::new(admission.clone(), &env)),
                 admission,
                 crypto: Rc::new(CryptoClient::new(port)),
             },
@@ -1057,20 +1056,16 @@ mod tests {
     #[test]
     fn direct_factory_resources_validate_sets_consume_once_and_fence() {
         use crate::lifecycle::Factory;
+        let env = racer_io::Env::host();
         let limits = crate::test_support::cluster::config(false).limits;
         for workers in [vec![], vec![WorkerId(7), WorkerId(7)]] {
             assert!(matches!(
-                Resources::new(limits.clone(), workers, 9, crate::test_support::ctx()),
+                Resources::new(limits.clone(), workers, 9, env.ctx.clone()),
                 Err(Error::InvalidConfiguration)
             ));
         }
-        let resources = Resources::new(
-            limits.clone(),
-            vec![WorkerId(7)],
-            9,
-            crate::test_support::ctx(),
-        )
-        .unwrap();
+        let resources =
+            Resources::new(limits.clone(), vec![WorkerId(7)], 9, env.ctx.clone()).unwrap();
         assert_eq!(resources.abandon_lane(1), Err(Error::InvalidConfiguration));
         resources.abandon_lane(0).unwrap();
         resources.abandon_lane(0).unwrap();
@@ -1108,7 +1103,7 @@ mod tests {
                 self.0.abandon_lane(lane)
             }
             fn teardown_scope(&self, _: &RequestScope) -> RequestScope {
-                lifecycle_scope(&crate::test_support::clock()).unwrap()
+                lifecycle_scope(&racer_io::Clock::host()).unwrap()
             }
         }
         struct Local;
@@ -1126,11 +1121,11 @@ mod tests {
                 Box::pin(async { Ok(()) })
             }
         }
-        let mut group = WorkerGroup::new(colocated_plan(3, 1), crate::test_support::ctx());
+        let mut group = WorkerGroup::new(colocated_plan(3, 1), env.ctx.clone());
         let factory = Arc::new(DirectFactory(
-            Resources::new(limits, vec![WorkerId(0)], 10, crate::test_support::ctx()).unwrap(),
+            Resources::new(limits, vec![WorkerId(0)], 10, env.ctx.clone()).unwrap(),
         ));
-        let scope = lifecycle_scope(&crate::test_support::clock()).unwrap();
+        let scope = lifecycle_scope(&env.ctx.clock).unwrap();
         group.start(factory, &scope).unwrap();
         group.drain(&scope).unwrap();
         group.shutdown(&scope).unwrap();
@@ -1790,7 +1785,7 @@ mod tests {
                     worker,
                     runtime,
                     observed: self.observed.clone(),
-                    keys: crate::test_support::security::keys(),
+                    keys: crate::test_support::security::keys(&racer_io::Env::host()),
                     failure: self.failure,
                     jobs: self.jobs,
                     roundtrip: self.roundtrip,
@@ -2087,9 +2082,10 @@ mod tests {
 
         #[test]
         fn two_io_share_one_actual_crypto_thread_and_drain_outstanding_jobs() {
+            let env = racer_io::Env::host();
             let (plan, factory) = fixture(4, Failure::None, true);
             let observed = factory.observed.clone();
-            let mut group = WorkerGroup::new(plan, crate::test_support::ctx());
+            let mut group = WorkerGroup::new(plan, env.ctx.clone());
             let scope = scope();
             group.start_recipe(Arc::new(factory), &scope).unwrap();
             assert_eq!(
@@ -2147,8 +2143,9 @@ mod tests {
 
         #[test]
         fn shared_crypto_borrowed_run_counts_caller_and_restores_affinity() {
+            let env = racer_io::Env::host();
             let (plan, factory) = fixture(3, Failure::None, true);
-            let mut group = WorkerGroup::new(plan, crate::test_support::ctx());
+            let mut group = WorkerGroup::new(plan, env.ctx.clone());
             let before = current_cpus().unwrap();
             let mut scope = scope();
             // Leave startup enough room under concurrent builds: this scenario checks
@@ -2163,14 +2160,14 @@ mod tests {
             assert_eq!(factory.observed.submitted.load(Ordering::SeqCst), 8);
             let (plan, factory) = fixture(3, Failure::None, false);
             assert_eq!(
-                WorkerGroup::new(plan, crate::test_support::ctx())
-                    .start_recipe(Arc::new(factory), &scope),
+                WorkerGroup::new(plan, env.ctx.clone()).start_recipe(Arc::new(factory), &scope),
                 Err(Error::InvalidConfiguration)
             );
         }
 
         #[test]
         fn partial_group_build_start_and_pending_start_failures_teardown_every_built_service() {
+            let env = racer_io::Env::host();
             for failure in [
                 Failure::BuildCrypto,
                 Failure::StartCrypto,
@@ -2181,7 +2178,7 @@ mod tests {
                 for borrowed in [false, true] {
                     let (plan, factory) = fixture(if borrowed { 3 } else { 4 }, failure, true);
                     let observed = factory.observed.clone();
-                    let mut group = WorkerGroup::new(plan, crate::test_support::ctx());
+                    let mut group = WorkerGroup::new(plan, env.ctx.clone());
                     let mut scope = scope();
                     if failure == Failure::PendingStart {
                         scope.deadline = racer_io::deadline::Deadline(
@@ -2224,6 +2221,7 @@ mod tests {
 
         #[test]
         fn shared_crypto_errors_do_not_skip_sibling_drain_or_shutdown() {
+            let env = racer_io::Env::host();
             for failure in [
                 Failure::PollCrypto,
                 Failure::DrainCrypto,
@@ -2231,7 +2229,7 @@ mod tests {
             ] {
                 let (plan, factory) = fixture(4, failure, false);
                 let observed = factory.observed.clone();
-                let mut group = WorkerGroup::new(plan, crate::test_support::ctx());
+                let mut group = WorkerGroup::new(plan, env.ctx.clone());
                 let scope = scope();
                 let started = group.start_recipe(Arc::new(factory), &scope);
                 if failure == Failure::PollCrypto {
@@ -2250,11 +2248,12 @@ mod tests {
 
         #[test]
         fn shared_services_deliver_independent_real_encrypt_decrypt_results() {
+            let env = racer_io::Env::host();
             let (plan, mut factory) = fixture(4, Failure::None, false);
             factory.roundtrip = true;
             let observed = factory.observed.clone();
             observed.release.store(true, Ordering::SeqCst);
-            let mut group = WorkerGroup::new(plan, crate::test_support::ctx());
+            let mut group = WorkerGroup::new(plan, env.ctx.clone());
             let scope = scope();
             group.start_recipe(Arc::new(factory), &scope).unwrap();
             assert_eq!(observed.completed.load(Ordering::SeqCst), 2);
@@ -2265,8 +2264,9 @@ mod tests {
 
         #[test]
         fn shared_group_cancellation_during_live_jobs_fences_before_join() {
+            let env = racer_io::Env::host();
             let (plan, factory) = fixture(4, Failure::None, true);
-            let mut group = WorkerGroup::new(plan, crate::test_support::ctx());
+            let mut group = WorkerGroup::new(plan, env.ctx.clone());
             let scope = scope();
             group.start_recipe(Arc::new(factory), &scope).unwrap();
             scope.cancel().unwrap();
@@ -2280,11 +2280,12 @@ mod tests {
 
         #[test]
         fn pending_shard_start_does_not_block_ready_sibling_crypto_work() {
+            let env = racer_io::Env::host();
             let (plan, mut factory) = fixture(4, Failure::PendingStart, false);
             factory.roundtrip = true;
             let observed = factory.observed.clone();
             observed.release.store(true, Ordering::SeqCst);
-            let mut group = WorkerGroup::new(plan, crate::test_support::ctx());
+            let mut group = WorkerGroup::new(plan, env.ctx.clone());
             let mut scope = scope();
             scope.deadline =
                 racer_io::deadline::Deadline(Instant::now() + Duration::from_millis(100));
@@ -2298,6 +2299,7 @@ mod tests {
 
         #[test]
         fn later_crypto_group_allocation_failure_rolls_back_live_first_group() {
+            let env = racer_io::Env::host();
             let allowed = current_cpus().unwrap();
             let Some(&second_cpu) = allowed.iter().nth(1) else {
                 return;
@@ -2310,7 +2312,7 @@ mod tests {
                 plan.pairs[1].crypto.cpu = second_cpu;
                 factory.second_crypto_cpu = second_cpu;
                 let observed = factory.observed.clone();
-                let mut group = WorkerGroup::new(plan, crate::test_support::ctx());
+                let mut group = WorkerGroup::new(plan, env.ctx.clone());
                 let scope = scope();
                 let allocator_observed = observed.clone();
                 let allocate = move |worker, generation, capacity| {
@@ -2336,6 +2338,7 @@ mod tests {
 
         #[test]
         fn distinct_crypto_cpus_create_distinct_execution_threads() {
+            let env = racer_io::Env::host();
             let allowed = current_cpus().unwrap();
             let Some(&second_cpu) = allowed.iter().nth(1) else {
                 return;
@@ -2344,7 +2347,7 @@ mod tests {
             plan.pairs[1].crypto.cpu = second_cpu;
             factory.second_crypto_cpu = second_cpu;
             let observed = factory.observed.clone();
-            let mut group = WorkerGroup::new(plan, crate::test_support::ctx());
+            let mut group = WorkerGroup::new(plan, env.ctx.clone());
             let scope = scope();
             group.start_recipe(Arc::new(factory), &scope).unwrap();
             assert_eq!(group.runtime.stats().coordinators, 1);
@@ -2534,11 +2537,11 @@ mod tests {
                 })
             }
         }
-        fn fixture(max_threads: usize) -> (WorkerGroup, TestFactory) {
+        fn fixture(env: &racer_io::Env, max_threads: usize) -> (WorkerGroup, TestFactory) {
             let plan = colocated_plan(max_threads, 1);
             let cpu = plan.pairs[0].io.cpu;
             (
-                WorkerGroup::new(plan, crate::test_support::ctx()),
+                WorkerGroup::new(plan, env.ctx.clone()),
                 TestFactory {
                     events: Arc::new(Mutex::new(Vec::new())),
                     crypto_polls: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
@@ -2553,7 +2556,8 @@ mod tests {
 
         #[test]
         fn prepare_rejects_known_numa_mismatch() {
-            let (mut group, _) = fixture(3);
+            let env = racer_io::Env::host();
+            let (mut group, _) = fixture(&env, 3);
             group.plan.pairs[0].io.numa_node = Some(0);
             group.plan.pairs[0].crypto.numa_node = Some(1);
             assert_eq!(group.prepare(false), Err(Error::InvalidConfiguration));
@@ -2562,8 +2566,9 @@ mod tests {
 
         #[test]
         fn prepare_rejects_contradictory_shared_crypto_metadata() {
+            let env = racer_io::Env::host();
             for dimension in 0..3 {
-                let (mut group, _) = fixture(4);
+                let (mut group, _) = fixture(&env, 4);
                 let mut second = group.plan.pairs[0].clone();
                 second.worker = WorkerId(1);
                 match dimension {
@@ -2579,13 +2584,14 @@ mod tests {
 
         #[test]
         fn prepare_accepts_colocated_io_and_unknown_numa() {
+            let env = racer_io::Env::host();
             for (io, crypto) in [
                 (None, None),
                 (Some(0), None),
                 (None, Some(0)),
                 (Some(0), Some(0)),
             ] {
-                let (mut group, _) = fixture(4);
+                let (mut group, _) = fixture(&env, 4);
                 group.plan.pairs[0].io.numa_node = io;
                 group.plan.pairs[0].crypto.numa_node = crypto;
                 let mut second = group.plan.pairs[0].clone();
@@ -2601,9 +2607,10 @@ mod tests {
 
         #[test]
         fn owned_start_drains_and_joins_both_pinned_local_services() {
-            let (mut group, factory) = fixture(3);
+            let env = racer_io::Env::host();
+            let (mut group, factory) = fixture(&env, 3);
             let events = factory.events.clone();
-            let scope = lifecycle_scope(&crate::test_support::clock()).unwrap();
+            let scope = lifecycle_scope(&env.ctx.clock).unwrap();
             group.start_recipe(Arc::new(factory), &scope).unwrap();
             group.drain(&scope).unwrap();
             group.shutdown(&scope).unwrap();
@@ -2622,14 +2629,15 @@ mod tests {
 
         #[test]
         fn startup_failure_rolls_back_and_owned_start_counts_caller() {
-            let scope = lifecycle_scope(&crate::test_support::clock()).unwrap();
-            let (mut group, factory) = fixture(2);
+            let env = racer_io::Env::host();
+            let scope = lifecycle_scope(&env.ctx.clock).unwrap();
+            let (mut group, factory) = fixture(&env, 2);
             assert_eq!(
                 group.start_recipe(Arc::new(factory), &scope),
                 Err(Error::InvalidConfiguration)
             );
             for fail_crypto in [false, true] {
-                let (mut group, mut factory) = fixture(3);
+                let (mut group, mut factory) = fixture(&env, 3);
                 factory.fail_crypto = fail_crypto;
                 factory.fail_io = !fail_crypto;
                 let expected = if fail_crypto {
@@ -2645,7 +2653,8 @@ mod tests {
 
         #[test]
         fn borrowed_run_uses_caller_and_restores_affinity_on_failure() {
-            let (group, mut factory) = fixture(2);
+            let env = racer_io::Env::host();
+            let (group, mut factory) = fixture(&env, 2);
             // Reconstruct to infer the borrowed factory lifetime instead of 'static.
             let plan = AffinityPlan {
                 pairs: group.plan.pairs.clone(),
@@ -2653,7 +2662,7 @@ mod tests {
             };
             factory.stop_on_poll = true;
             let before = current_cpus().unwrap();
-            let mut group = WorkerGroup::new(plan, crate::test_support::ctx());
+            let mut group = WorkerGroup::new(plan, env.ctx.clone());
             // A requested stop is a clean exit with a recorded reason.
             assert_eq!(group.run_recipe(&factory), Ok(()));
             assert_eq!(
@@ -2667,20 +2676,21 @@ mod tests {
 
         #[test]
         fn startup_budget_outlives_lifecycle_and_still_bounds_startup() {
+            let env = racer_io::Env::host();
             assert!(crate::worker::LIFECYCLE_TIMEOUT == Duration::from_secs(30));
             for (budget, expected) in [
                 (Duration::from_millis(50), Err(Error::DeadlineExceeded)),
                 (Duration::from_secs(3600), Ok(())),
             ] {
-                let (group, mut factory) = fixture(2);
+                let (group, mut factory) = fixture(&env, 2);
                 let plan = AffinityPlan {
                     pairs: group.plan.pairs.clone(),
                     max_threads: 2,
                 };
                 factory.stop_on_poll = true;
                 factory.start_delay = Duration::from_millis(300);
-                let mut group = WorkerGroup::new(plan, crate::test_support::ctx());
-                let scope = startup_scope(budget, &crate::test_support::clock()).unwrap();
+                let mut group = WorkerGroup::new(plan, env.ctx.clone());
+                let scope = startup_scope(budget, &env.ctx.clock).unwrap();
                 let result = group.run_inner(&factory, &scope, false);
                 // A long budget reaches steady state (which this fixture stops);
                 // a short one fails startup. Both fully join every service.
@@ -2692,15 +2702,16 @@ mod tests {
 
         #[test]
         fn borrowed_run_scope_stops_and_joins_on_deadline() {
-            let (group, factory) = fixture(2);
+            let env = racer_io::Env::host();
+            let (group, factory) = fixture(&env, 2);
             let mut scoped = WorkerGroup::new(
                 AffinityPlan {
                     pairs: group.plan.pairs.clone(),
                     max_threads: 2,
                 },
-                crate::test_support::ctx(),
+                env.ctx.clone(),
             );
-            let mut scope = lifecycle_scope(&crate::test_support::clock()).unwrap();
+            let mut scope = lifecycle_scope(&env.ctx.clock).unwrap();
             scope.deadline =
                 racer_io::deadline::Deadline(Instant::now() + Duration::from_millis(50));
             assert_eq!(
@@ -2713,7 +2724,8 @@ mod tests {
         #[test]
         fn engine_driver_wake_survives_noop_operation_poll() {
             use crate::test_support::WakeCounter;
-            let (_, factory) = fixture(3);
+            let env = racer_io::Env::host();
+            let (_, factory) = fixture(&env, 3);
             let (io, port) = security::pair(WorkerId(0), 1, NonZeroUsize::new(1).unwrap());
             let mut engine = TestCrypto {
                 factory,
@@ -2736,6 +2748,7 @@ mod tests {
             use std::sync::atomic::AtomicBool;
             use std::sync::atomic::AtomicUsize;
             use std::sync::atomic::Ordering;
+            let env = racer_io::Env::host();
             struct BackendFactory {
                 resources: Resources,
                 sibling_started: Arc<AtomicBool>,
@@ -2833,7 +2846,7 @@ mod tests {
                         crate::test_support::cluster::config(false).limits,
                         vec![WorkerId(0), WorkerId(1)],
                         1,
-                        crate::test_support::ctx(),
+                        env.ctx.clone(),
                     )
                     .unwrap(),
                     sibling_started: Arc::default(),
@@ -2874,6 +2887,7 @@ mod tests {
             use std::sync::atomic::AtomicBool;
             use std::sync::atomic::AtomicUsize;
             use std::sync::atomic::Ordering;
+            let env = racer_io::Env::host();
             struct PendingFactory {
                 resources: Resources,
                 release: Arc<AtomicBool>,
@@ -3002,7 +3016,7 @@ mod tests {
                         crate::test_support::cluster::config(false).limits,
                         vec![WorkerId(0)],
                         1,
-                        crate::test_support::ctx(),
+                        env.ctx.clone(),
                     )
                     .unwrap(),
                     release: Arc::default(),
@@ -3065,12 +3079,13 @@ mod tests {
 
         #[test]
         fn later_pair_allocation_failure_stops_and_joins_started_pair() {
-            let (mut group, factory) = fixture(5);
+            let env = racer_io::Env::host();
+            let (mut group, factory) = fixture(&env, 5);
             let events = factory.events.clone();
             let mut second = group.plan.pairs[0].clone();
             second.worker = WorkerId(1);
             group.plan.pairs.push(second);
-            let scope = lifecycle_scope(&crate::test_support::clock()).unwrap();
+            let scope = lifecycle_scope(&env.ctx.clock).unwrap();
             let result = group.start_with_allocator(
                 Arc::new(factory),
                 &scope,
@@ -3091,7 +3106,8 @@ mod tests {
 
         #[test]
         fn scoped_allocation_failure_joins_started_crypto_and_restores_affinity() {
-            let (group, factory) = fixture(4);
+            let env = racer_io::Env::host();
+            let (group, factory) = fixture(&env, 4);
             let mut plan = AffinityPlan {
                 pairs: group.plan.pairs.clone(),
                 max_threads: 4,
@@ -3099,8 +3115,8 @@ mod tests {
             let mut second = plan.pairs[0].clone();
             second.worker = WorkerId(1);
             plan.pairs.push(second);
-            let mut scoped = WorkerGroup::new(plan, crate::test_support::ctx());
-            let scope = lifecycle_scope(&crate::test_support::clock()).unwrap();
+            let mut scoped = WorkerGroup::new(plan, env.ctx.clone());
+            let scope = lifecycle_scope(&env.ctx.clock).unwrap();
             let before = current_cpus().unwrap();
             let result = scoped.run_with_allocator(
                 &factory,

@@ -2167,11 +2167,12 @@ pub(crate) mod tests {
         /// ciphertext; lookup removal is not a completion fence.
         #[test]
         fn duplicate_owners_charge_once_until_each_last_owner() {
+            let env = racer_io::Env::host();
             let real = admission(2, CIPHER);
             let cache = CacheId(crate::test_support::security::CACHE.into());
             let memory = MemoryCache::new(
                 BufferPool::new(real.clone()),
-                crate::test_support::availability(),
+                crate::test_support::availability(&env),
             );
             let page = allocated_page(&real, &cache, "v1", PLAIN);
             let id = page.plaintext.page().clone();
@@ -2210,13 +2211,14 @@ pub(crate) mod tests {
         /// by the cache, which holds plaintext weakly.
         #[test]
         fn fair_reclamation_keeps_other_cache() {
+            let env = racer_io::Env::host();
             for class in [ResourceClass::Plaintext, ResourceClass::Ciphertext] {
                 let real = admission(4, CIPHER);
                 let a = CacheId(crate::test_support::security::CACHE.into());
                 let b = CacheId("44444444-4444-4444-8444-444444444444".into());
                 let memory = MemoryCache::new(
                     BufferPool::new(real.clone()),
-                    crate::test_support::availability_for(vec![a.clone(), b.clone()]),
+                    crate::test_support::availability_for(&env, vec![a.clone(), b.clone()]),
                 );
                 let mut ids = Vec::new();
                 for (cache, version) in [(&b, "other"), (&a, "old"), (&a, "new")] {
@@ -2279,6 +2281,7 @@ pub(crate) mod tests {
         /// after admission stops.
         #[test]
         fn canceled_crypto_holds_owners_until_completion_reap() {
+            let env = racer_io::Env::host();
             let real = admission(1, CIPHER);
             let cache = CacheId(crate::test_support::security::CACHE.into());
             let reserved = crate::admission::reserve_fill(&real, &cache, false).unwrap();
@@ -2287,7 +2290,7 @@ pub(crate) mod tests {
             let (port, engine_port) = security::pair(WorkerId(0), 0, NonZeroUsize::new(1).unwrap());
             let client = Rc::new(CryptoClient::new(port));
             let crypto = PageCrypto::new(
-                Rc::new(crate::test_support::security::keys()),
+                Rc::new(crate::test_support::security::keys(&env)),
                 client.clone(),
                 buffers.clone(),
             );
@@ -2341,6 +2344,7 @@ pub(crate) mod tests {
         #[ignore = "deterministic cache refill trace experiment"]
         fn reclaim_trace_experiment() {
             use sha2::{Digest, Sha256};
+            let env = racer_io::Env::host();
             const WARMUP: usize = 2048;
             const MEASURE: usize = 20000;
             let cache_id = CacheId(crate::test_support::security::CACHE.into());
@@ -2361,7 +2365,7 @@ pub(crate) mod tests {
                 limits.metadata_entries = std::num::NonZeroUsize::new(512).unwrap();
                 let admission = Rc::new(flow_control::Quotas::new(AdmissionPolicy::new(limits)));
                 let pool = BufferPool::new(admission.clone());
-                let cache = MemoryCache::new(pool.clone(), crate::test_support::availability());
+                let cache = MemoryCache::new(pool.clone(), crate::test_support::availability(&env));
                 let mut random = 0x6a09_e667_f3bc_c909u64;
                 let mut hash = Sha256::new();
                 let mut hits = 0;
@@ -2526,10 +2530,11 @@ pub(crate) mod tests {
                     CacheId(format!("{hash:08x}-4444-4444-8444-444444444444"))
                 }
 
-                fn memory(caches: &[&str], entries: usize) -> MemoryCache {
+                fn memory(env: &racer_io::Env, caches: &[&str], entries: usize) -> MemoryCache {
                     MemoryCache::new(
                         BufferPool::new(admission(entries)),
                         crate::test_support::availability_for(
+                            env,
                             caches.iter().map(|cache| id(cache)).collect(),
                         ),
                     )
@@ -2636,7 +2641,8 @@ pub(crate) mod tests {
 
                 #[test]
                 fn global_reclaim_prefers_over_share_cache_after_live_reweight() {
-                    let cache = memory(&["low", "high"], 1000);
+                    let env = racer_io::Env::host();
+                    let cache = memory(&env, &["low", "high"], 1000);
                     let admission = cache.pool.admission.clone();
                     // High pages are oldest, so an unweighted pass picks them first.
                     let high: Vec<_> = (0..20)
@@ -2692,7 +2698,8 @@ pub(crate) mod tests {
 
                 #[test]
                 fn busy_over_share_pages_survive_and_fallback_releases_idle_bytes() {
-                    let cache = memory(&["low", "high"], 100);
+                    let env = racer_io::Env::host();
+                    let cache = memory(&env, &["low", "high"], 100);
                     let high = verified_in(&cache, "high", "h");
                     let low: Vec<_> = (0..3)
                         .map(|i| verified_in(&cache, "low", &format!("l{i}")))
@@ -2749,7 +2756,8 @@ pub(crate) mod tests {
 
                 #[test]
                 fn reclaim_credits_queued_and_writer_bytes() {
-                    let cache = memory(&["low", "high"], 100);
+                    let env = racer_io::Env::host();
+                    let cache = memory(&env, &["low", "high"], 100);
                     let low = verified_in(&cache, "low", "l");
                     // A queued writer shares the page, so it is not idle.
                     let copy = cache.ciphertext(&low).unwrap().unwrap();
@@ -2796,7 +2804,8 @@ pub(crate) mod tests {
 
                 #[test]
                 fn plaintext_pressure_releases_nothing() {
-                    let cache = memory(&["low"], 100);
+                    let env = racer_io::Env::host();
+                    let cache = memory(&env, &["low"], 100);
                     verified_in(&cache, "low", "l");
                     unverified_in(&cache, "low", "u");
                     for owner in [None, Some(&id("low"))] {
@@ -2818,7 +2827,8 @@ pub(crate) mod tests {
 
                 #[test]
                 fn lanes_track_insert_touch_remove_and_cache_removal() {
-                    let cache = memory(&["a", "b", "c"], 100);
+                    let env = racer_io::Env::host();
+                    let cache = memory(&env, &["a", "b", "c"], 100);
                     let a = verified_in(&cache, "a", "a0");
                     let b = unverified_in(&cache, "b", "b0");
                     verified_in(&cache, "c", "c0");
@@ -2845,11 +2855,12 @@ pub(crate) mod tests {
 
                 #[test]
                 fn window_rotation_and_lane_scans_are_bounded() {
+                    let env = racer_io::Env::host();
                     const CACHES: usize = 1000;
                     let names: Vec<_> = (0..CACHES).map(|i| format!("c{i:04}")).collect();
                     let mut all: Vec<&str> = names.iter().map(String::as_str).collect();
                     all.push("target");
-                    let cache = memory(&all, 4 * CACHES);
+                    let cache = memory(&env, &all, 4 * CACHES);
                     // Older busy entries of other caches fill a whole scan window.
                     let busy: Vec<_> = (0..racer_core::cache::RECLAIM_WINDOW + 44)
                         .map(|i| {
@@ -2921,12 +2932,13 @@ pub(crate) mod tests {
 
                 #[test]
                 fn early_success_rotation_reaches_every_cache() {
+                    let env = racer_io::Env::host();
                     // A multiple of the window, so a cursor that jumped to the
                     // last prefetched cache would revisit only every eighth.
                     const CACHES: usize = 2 * racer_core::cache::PRESSURE_WINDOW;
                     let names: Vec<_> = (0..CACHES).map(|i| format!("r{i:02}")).collect();
                     let all: Vec<&str> = names.iter().map(String::as_str).collect();
-                    let cache = memory(&all, 8 * CACHES);
+                    let cache = memory(&env, &all, 8 * CACHES);
                     // Each cache keeps a held entry, so its lane survives, and
                     // two idle entries, so every call can succeed at once.
                     let held: Vec<_> = names
@@ -2974,6 +2986,7 @@ pub(crate) mod tests {
                 /// other live or writer-owned bytes, so no 16 MiB pages are needed.
                 #[test]
                 fn real_quotas_choose_over_share_cache_after_live_reweight() {
+                    let env = racer_io::Env::host();
                     let page = PAGE_BYTES as usize;
                     let class = ResourceClass::Ciphertext;
                     let mut limits = crate::test_support::cluster::config(false).limits;
@@ -3002,7 +3015,10 @@ pub(crate) mod tests {
                     weigh(900, 100);
                     let cache = MemoryCache::new(
                         BufferPool::new(admission.clone()),
-                        crate::test_support::availability_for(vec![low.clone(), high.clone()]),
+                        crate::test_support::availability_for(
+                            &env,
+                            vec![low.clone(), high.clone()],
+                        ),
                     );
                     // High activates first, alone, with 20 pages of accounted bytes.
                     let high_pages: Vec<_> = (0..4)
@@ -3067,11 +3083,12 @@ pub(crate) mod tests {
 
             #[test]
             fn capacity_and_eviction_resume_after_examined_victim() {
+                let env = racer_io::Env::host();
                 for capacity in [false, true] {
                     let admission = admission(if capacity { 3 } else { 8 });
                     let cache = MemoryCache::new(
                         BufferPool::new(admission.clone()),
-                        crate::test_support::availability(),
+                        crate::test_support::availability(&env),
                     );
                     let a = publish(&cache, &admission, "a");
                     let b = publish(&cache, &admission, "b");
@@ -3097,11 +3114,12 @@ pub(crate) mod tests {
 
             #[test]
             fn zero_targets_and_ciphertext_sufficiency_leave_paired_cursor_untouched() {
+                let env = racer_io::Env::host();
                 for evict in [false, true] {
                     let admission = admission(8);
                     let cache = MemoryCache::new(
                         BufferPool::new(admission.clone()),
-                        crate::test_support::availability(),
+                        crate::test_support::availability(&env),
                     );
                     let paired = publish(&cache, &admission, "paired");
                     let cipher = publish_ciphertext(&cache, &admission, "cipher");
@@ -3134,10 +3152,11 @@ pub(crate) mod tests {
 
             #[test]
             fn examined_filters_and_staging_callback_advance_cursor() {
+                let env = racer_io::Env::host();
                 let admission = admission(8);
                 let cache = MemoryCache::new(
                     BufferPool::new(admission.clone()),
-                    crate::test_support::availability(),
+                    crate::test_support::availability(&env),
                 );
                 let a = publish(&cache, &admission, "a");
                 let b = publish(&cache, &admission, "b");
@@ -3200,10 +3219,11 @@ pub(crate) mod tests {
 
             #[test]
             fn expire_idle_releases_untouched_entries_and_keeps_recent_hits() {
+                let env = racer_io::Env::host();
                 let admission = admission(8);
                 let cache = MemoryCache::new(
                     BufferPool::new(admission.clone()),
-                    crate::test_support::availability(),
+                    crate::test_support::availability(&env),
                 );
                 let start = std::time::Instant::now();
                 let cold = publish(&cache, &admission, "cold");
@@ -3246,10 +3266,11 @@ pub(crate) mod tests {
 
             #[test]
             fn pinned_readers_keep_entries_busy_and_unpinned_observers_do_not() {
+                let env = racer_io::Env::host();
                 let admission = admission(8);
                 let cache = MemoryCache::new(
                     BufferPool::new(admission.clone()),
-                    crate::test_support::availability(),
+                    crate::test_support::availability(&env),
                 );
                 let start = std::time::Instant::now();
                 let pinned = publish(&cache, &admission, "pinned");
@@ -3294,10 +3315,11 @@ pub(crate) mod tests {
 
             #[test]
             fn republishing_verified_ciphertext_does_not_pin_it() {
+                let env = racer_io::Env::host();
                 let admission = admission(8);
                 let cache = MemoryCache::new(
                     BufferPool::new(admission.clone()),
-                    crate::test_support::availability(),
+                    crate::test_support::availability(&env),
                 );
                 let start = std::time::Instant::now();
                 let page = publish(&cache, &admission, "page");
@@ -3322,10 +3344,11 @@ pub(crate) mod tests {
 
             #[test]
             fn publish_ciphertext_still_caches_pages_without_verified_entry() {
+                let env = racer_io::Env::host();
                 let admission = admission(8);
                 let cache = MemoryCache::new(
                     BufferPool::new(admission.clone()),
-                    crate::test_support::availability(),
+                    crate::test_support::availability(&env),
                 );
                 let verified = publish(&cache, &admission, "verified");
                 let other = publish_ciphertext(&cache, &admission, "other");
@@ -3336,10 +3359,11 @@ pub(crate) mod tests {
 
             #[test]
             fn expire_idle_skips_entries_in_use_until_released() {
+                let env = racer_io::Env::host();
                 let admission = admission(8);
                 let cache = MemoryCache::new(
                     BufferPool::new(admission.clone()),
-                    crate::test_support::availability(),
+                    crate::test_support::availability(&env),
                 );
                 let start = std::time::Instant::now();
                 let page = publish(&cache, &admission, "page");
@@ -3366,11 +3390,12 @@ pub(crate) mod tests {
 
             #[test]
             fn expire_idle_bounds_work_per_call() {
+                let env = racer_io::Env::host();
                 let count = racer_core::cache::EXPIRY_BATCH * 2 + 3;
                 let admission = admission(count * 2 + 8);
                 let cache = MemoryCache::new(
                     BufferPool::new(admission.clone()),
-                    crate::test_support::availability(),
+                    crate::test_support::availability(&env),
                 );
                 for n in 0..count {
                     publish(&cache, &admission, &format!("p{n:03}"));
@@ -3398,12 +3423,13 @@ pub(crate) mod tests {
 
             #[test]
             fn expire_idle_resumes_past_busy_prefix_across_checkpoints() {
+                let env = racer_io::Env::host();
                 let busy = racer_core::cache::EXPIRY_BATCH + 1;
                 let idle = 3;
                 let admission = admission((busy + idle) * 2 + 8);
                 let cache = MemoryCache::new(
                     BufferPool::new(admission.clone()),
-                    crate::test_support::availability(),
+                    crate::test_support::availability(&env),
                 );
                 let mut held = Vec::new();
                 for n in 0..busy {
@@ -3440,10 +3466,11 @@ pub(crate) mod tests {
 
             #[test]
             fn expiry_checkpoints_stay_bounded() {
+                let env = racer_io::Env::host();
                 let admission = admission(8);
                 let cache = MemoryCache::new(
                     BufferPool::new(admission.clone()),
-                    crate::test_support::availability(),
+                    crate::test_support::availability(&env),
                 );
                 let start = std::time::Instant::now();
                 expire_through(&cache, start, racer_core::cache::IDLE_TTL * 10);
@@ -3460,10 +3487,11 @@ pub(crate) mod tests {
 
             #[test]
             fn ciphertext_partial_scan_preserves_unexamined_keys_after_insertion() {
+                let env = racer_io::Env::host();
                 let admission = admission(8);
                 let cache = MemoryCache::new(
                     BufferPool::new(admission.clone()),
-                    crate::test_support::availability(),
+                    crate::test_support::availability(&env),
                 );
                 let a = publish_ciphertext(&cache, &admission, "a");
                 let b = publish_ciphertext(&cache, &admission, "b");
@@ -3483,10 +3511,11 @@ pub(crate) mod tests {
 
             #[test]
             fn ciphertext_busy_prefix_and_wrong_cache_advance_bounded_scan() {
+                let env = racer_io::Env::host();
                 let admission = admission(300);
                 let cache = MemoryCache::new(
                     BufferPool::new(admission.clone()),
-                    crate::test_support::availability(),
+                    crate::test_support::availability(&env),
                 );
                 for n in 0..257 {
                     publish_ciphertext(&cache, &admission, &format!("v{n:03}"));
@@ -3518,10 +3547,11 @@ pub(crate) mod tests {
 
             #[test]
             fn empty_and_maximum_clock_selection_is_nonmutating_and_wraps() {
+                let env = racer_io::Env::host();
                 let admission = admission(8);
                 let cache = MemoryCache::new(
                     BufferPool::new(admission.clone()),
-                    crate::test_support::availability(),
+                    crate::test_support::availability(&env),
                 );
                 cache.entries.borrow_mut().reclaim_after = u64::MAX;
                 assert!(cache.entries.borrow().candidates().is_empty());
@@ -3558,11 +3588,11 @@ pub(crate) mod tests {
                 Touch,
             }
 
-            fn check(class: ResourceClass, change: Change) {
+            fn check(env: &racer_io::Env, class: ResourceClass, change: Change) {
                 let admission = admission(8);
                 let cache = MemoryCache::new(
                     BufferPool::new(admission.clone()),
-                    crate::test_support::availability(),
+                    crate::test_support::availability(env),
                 );
                 let mut ids = Vec::new();
                 for name in ["a", "b", "c"] {
@@ -3635,41 +3665,48 @@ pub(crate) mod tests {
 
             #[test]
             fn plaintext_without_new_ticks_reclaims_older_idle_page() {
-                check(ResourceClass::Plaintext, Change::None);
+                let env = racer_io::Env::host();
+                check(&env, ResourceClass::Plaintext, Change::None);
             }
 
             #[test]
             fn ciphertext_without_new_ticks_reclaims_older_idle_page() {
-                check(ResourceClass::Ciphertext, Change::None);
+                let env = racer_io::Env::host();
+                check(&env, ResourceClass::Ciphertext, Change::None);
             }
 
             #[test]
             fn plaintext_preserves_newly_published_page() {
-                check(ResourceClass::Plaintext, Change::Publish);
+                let env = racer_io::Env::host();
+                check(&env, ResourceClass::Plaintext, Change::Publish);
             }
 
             #[test]
             fn ciphertext_preserves_newly_published_page() {
-                check(ResourceClass::Ciphertext, Change::Publish);
+                let env = racer_io::Env::host();
+                check(&env, ResourceClass::Ciphertext, Change::Publish);
             }
 
             #[test]
             fn plaintext_preserves_recently_touched_page() {
-                check(ResourceClass::Plaintext, Change::Touch);
+                let env = racer_io::Env::host();
+                check(&env, ResourceClass::Plaintext, Change::Touch);
             }
 
             #[test]
             fn ciphertext_preserves_recently_touched_page() {
-                check(ResourceClass::Ciphertext, Change::Touch);
+                let env = racer_io::Env::host();
+                check(&env, ResourceClass::Ciphertext, Change::Touch);
             }
         }
 
         #[test]
         fn ciphertext_residency_is_distinct_bounded_and_conditionally_invalidated() {
+            let env = racer_io::Env::host();
             let admission = admission(2);
             let cache = MemoryCache::new(
                 BufferPool::new(admission.clone()),
-                crate::test_support::availability(),
+                crate::test_support::availability(&env),
             );
             let first = bundle(&admission, "cipher");
             let id = first.plaintext.page().clone();
@@ -3707,10 +3744,11 @@ pub(crate) mod tests {
         }
         #[test]
         fn publication_retains_ciphertext_and_only_a_weak_plaintext_handle() {
+            let env = racer_io::Env::host();
             let admission = admission(8);
             let cache = MemoryCache::new(
                 BufferPool::new(admission.clone()),
-                crate::test_support::availability(),
+                crate::test_support::availability(&env),
             );
             let page = bundle(&admission, "v1");
             let id = page.plaintext.page().clone();
@@ -3755,10 +3793,11 @@ pub(crate) mod tests {
         }
         #[test]
         fn failed_decrypt_of_verified_ciphertext_invalidates_the_entry() {
+            let env = racer_io::Env::host();
             let admission = admission(8);
             let cache = MemoryCache::new(
                 BufferPool::new(admission.clone()),
-                crate::test_support::availability(),
+                crate::test_support::availability(&env),
             );
             let page = bundle(&admission, "v1");
             let id = page.plaintext.page().clone();
@@ -3778,10 +3817,11 @@ pub(crate) mod tests {
         }
         #[test]
         fn expiry_releases_verified_ciphertext_while_a_reader_holds_plaintext() {
+            let env = racer_io::Env::host();
             let admission = admission(8);
             let cache = MemoryCache::new(
                 BufferPool::new(admission.clone()),
-                crate::test_support::availability(),
+                crate::test_support::availability(&env),
             );
             let page = bundle(&admission, "v1");
             let id = page.plaintext.page().clone();
@@ -3799,10 +3839,11 @@ pub(crate) mod tests {
         }
         #[test]
         fn bounded_reclamation_advances_past_a_busy_prefix() {
+            let env = racer_io::Env::host();
             let admission = admission(300);
             let cache = MemoryCache::new(
                 BufferPool::new(admission.clone()),
-                crate::test_support::availability(),
+                crate::test_support::availability(&env),
             );
             let mut busy = Vec::new();
             let mut ids = Vec::new();
@@ -3844,10 +3885,11 @@ pub(crate) mod tests {
         }
         #[test]
         fn busy_leases_protect_both_allocations_and_eviction_releases_idle_bytes() {
+            let env = racer_io::Env::host();
             let admission = admission(8);
             let cache = MemoryCache::new(
                 BufferPool::new(admission.clone()),
-                crate::test_support::availability(),
+                crate::test_support::availability(&env),
             );
             let page = bundle(&admission, "v1");
             let id = page.plaintext.page().clone();
@@ -3870,10 +3912,11 @@ pub(crate) mod tests {
         }
         #[test]
         fn duplicate_preserves_original_ciphertext_metadata_and_expired_deadline() {
+            let env = racer_io::Env::host();
             let admission = admission(8);
             let cache = MemoryCache::new(
                 BufferPool::new(admission.clone()),
-                crate::test_support::availability(),
+                crate::test_support::availability(&env),
             );
             let page = bundle(&admission, "v1");
             let id = page.plaintext.page().clone();
@@ -3908,10 +3951,11 @@ pub(crate) mod tests {
         /// keeps the same order).
         #[test]
         fn duplicate_publish_does_not_touch() {
+            let env = racer_io::Env::host();
             let admission = admission(2);
             let cache = MemoryCache::new(
                 BufferPool::new(admission.clone()),
-                crate::test_support::availability(),
+                crate::test_support::availability(&env),
             );
             let id = |v: &str| bundle(&admission, v).plaintext.page().clone();
             for version in ["v0", "v1", "v0", "v2"] {
@@ -3923,10 +3967,11 @@ pub(crate) mod tests {
         }
         #[test]
         fn capacity_evicts_least_recent_idle_entry_and_rejects_all_busy() {
+            let env = racer_io::Env::host();
             let admission = admission(2);
             let cache = MemoryCache::new(
                 BufferPool::new(admission.clone()),
-                crate::test_support::availability(),
+                crate::test_support::availability(&env),
             );
             let first = bundle(&admission, "v1");
             let first_id = first.plaintext.page().clone();
@@ -3962,10 +4007,11 @@ pub(crate) mod tests {
         }
         #[test]
         fn publication_rejects_foreign_undercharged_and_conflicting_bundles() {
+            let env = racer_io::Env::host();
             let admission = admission(8);
             let cache = MemoryCache::new(
                 BufferPool::new(admission.clone()),
-                crate::test_support::availability(),
+                crate::test_support::availability(&env),
             );
             assert_eq!(
                 cache.publish(bundle(&self::admission(8), "v1")),
@@ -4024,12 +4070,16 @@ pub(crate) mod tests {
         }
         #[test]
         fn eviction_is_cache_scoped_and_preserves_live_leases() {
+            let env = racer_io::Env::host();
             let admission = admission(8);
             let other_cache = CacheId("44444444-4444-4444-8444-444444444444".into());
-            let availability = crate::test_support::availability_for(vec![
-                CacheId(crate::test_support::security::CACHE.into()),
-                other_cache.clone(),
-            ]);
+            let availability = crate::test_support::availability_for(
+                &env,
+                vec![
+                    CacheId(crate::test_support::security::CACHE.into()),
+                    other_cache.clone(),
+                ],
+            );
             let cache = MemoryCache::new(BufferPool::new(admission.clone()), availability);
             let page = bundle(&admission, "v1");
             let id = page.plaintext.page().clone();
@@ -4058,10 +4108,11 @@ pub(crate) mod tests {
         }
         #[test]
         fn eviction_is_idempotent_and_churn_needs_no_tombstones() {
+            let env = racer_io::Env::host();
             let admission = admission(1);
             let cache = MemoryCache::new(
                 BufferPool::new(admission),
-                crate::test_support::availability(),
+                crate::test_support::availability(&env),
             );
             let id = CacheId("cache".into());
             assert_eq!(cache.remove_cache(&id), Ok(()));
@@ -4075,15 +4126,16 @@ pub(crate) mod tests {
         fn empty_stable_catalog_rotates_without_consuming_page_metadata_capacity() {
             use crate::control::for_caches;
             use crate::test_support::security::rotation_bundle;
+            let env = racer_io::Env::host();
             let admission = admission(1024);
-            let keys = Rc::new(crate::test_support::security::keys());
+            let keys = Rc::new(crate::test_support::security::keys(&env));
             let roots = (*keys.peer_trust_roots().unwrap()).clone();
             let caches: Vec<_> = (0..356)
                 .map(|cache| CacheId(format!("{cache:08x}-0000-4000-8000-000000000000")))
                 .collect();
             let memory = MemoryCache::new(
                 BufferPool::new(admission.clone()),
-                for_caches(keys.clone(), caches.clone()),
+                for_caches(&env, keys.clone(), caches.clone()),
             );
             use racer_wire::control::{CacheEncryptionKey, CacheKeyPurpose, CacheKeyState};
             // The authority default: the active page key plus RETAINED - 1
@@ -4956,8 +5008,9 @@ pub(crate) mod tests {
             use std::task::Poll;
             use std::time::Duration;
             use std::time::Instant;
+            let env = racer_io::Env::host();
             let admission = admission(1);
-            let pool = new_pipe_pool(admission.clone());
+            let pool = new_pipe_pool(admission.clone(), env.sim_os().cloned());
             let scope =
                 RequestScope::host(RequestId([0; 16]), Instant::now() + Duration::from_secs(5))
                     .unwrap();
@@ -4984,6 +5037,7 @@ pub(crate) mod tests {
             use std::task::Poll;
             use std::time::Duration;
             use std::time::Instant;
+            let env = racer_io::Env::host();
             for failure in [
                 Some(Error::Cancelled),
                 Some(Error::DeadlineExceeded),
@@ -4991,7 +5045,7 @@ pub(crate) mod tests {
                 None,
             ] {
                 let admission = admission(1);
-                let pool = new_pipe_pool(admission.clone());
+                let pool = new_pipe_pool(admission.clone(), env.sim_os().cloned());
                 let held = pool.acquire().unwrap();
                 let scope = RequestScope::host(
                     RequestId([0; 16]),

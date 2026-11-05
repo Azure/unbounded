@@ -57,10 +57,10 @@ pub struct LinkHealth {
 }
 pub type LinkProbe<'a> = flow_control::Probe<'a, NodeId>;
 #[cfg(test)]
-impl Default for LinkHealth {
-    /// Construct independent worker-local circuit state on the selected clock.
-    fn default() -> Self {
-        Self::new(LINK_HEALTH_CAPACITY, crate::test_support::clock())
+impl LinkHealth {
+    /// Construct independent worker-local circuit state on `clock`.
+    pub fn on(clock: racer_io::Clock) -> Self {
+        Self::new(LINK_HEALTH_CAPACITY, clock)
     }
 }
 impl LinkHealth {
@@ -1008,15 +1008,12 @@ impl Paths {
     #[cfg(test)]
     pub fn shortest(
         &self,
+        env: &racer_io::Env,
         membership: std::sync::Arc<crate::topology::Membership>,
         from: &NodeId,
         budget: &RouteBudget,
     ) -> Result<Route> {
-        let scope = RequestScope::on(
-            &crate::test_support::clock(),
-            budget.request,
-            budget.deadline.0,
-        )?;
+        let scope = RequestScope::on(&env.ctx.clock, budget.request, budget.deadline.0)?;
         futures::executor::block_on(self.shortest_async(membership, from, budget, &scope))
     }
 
@@ -1168,12 +1165,12 @@ pub(crate) mod tests {
     /// silent: unavailable for routing until it answers anything.
     #[test]
     fn a_silent_peer_is_routed_around_until_it_answers() {
-        let clock = crate::rt::environment::SimulationClock::new(1);
-        let sim_env = clock.environment(0);
-        let _env = sim_env.enter();
-        let sim_ctx = sim_env.worker_ctx();
-        let health =
-            LinkHealth::default().with_silence(Duration::from_secs(10), Duration::from_secs(2));
+        let env = racer_io::Env::host();
+        let clock = racer_io::SimClock::new(1);
+        let sim_env = clock.ctx(0);
+        let sim_ctx = sim_env.clone();
+        let health = LinkHealth::on(env.ctx.clock.clone())
+            .with_silence(Duration::from_secs(10), Duration::from_secs(2));
         let peer = NodeId("peer".into());
         let page = crate::model::PageId {
             version: crate::model::ObjectVersion {
@@ -1389,8 +1386,9 @@ pub(crate) mod tests {
         }
         #[test]
         fn default_tracks_link_health_capacity_without_eviction() {
-            let health = LinkHealth::default();
-            let independent = LinkHealth::default();
+            let env = racer_io::Env::host();
+            let health = LinkHealth::on(env.ctx.clock.clone());
+            let independent = LinkHealth::on(env.ctx.clock.clone());
             let now = Instant::now();
             for i in 0..LINK_HEALTH_CAPACITY {
                 health
@@ -2203,6 +2201,7 @@ pub(crate) mod tests {
         /// relay, and the destination is never marked silent by the detour.
         #[test]
         fn timeouts_detour_routes_and_pings_around_the_primary_relay() {
+            let env = racer_io::Env::host();
             let members = membership(1500);
             let source = &members.members()[0].node;
             let to = 1499;
@@ -2212,7 +2211,7 @@ pub(crate) mod tests {
             let alternate = &members.members()[pool.alternate(0, to).unwrap()].node;
             assert_ne!(primary, alternate);
             let destination = &members.members()[to].node;
-            let health = Rc::new(LinkHealth::default());
+            let health = Rc::new(LinkHealth::on(env.ctx.clock.clone()));
             let paths = Paths::new(health.clone(), 8);
             let request = budget(&members, to, NORMAL_LINKS);
             let route = |ping| probe(&paths, &members, source, &request, ping).unwrap();
@@ -2255,6 +2254,7 @@ pub(crate) mod tests {
         /// and an open circuit or a silent intermediate still blocks.
         #[test]
         fn a_ping_reaches_the_silent_neighbor_it_tests() {
+            let env = racer_io::Env::host();
             // Above the 64 member full mesh, so a non-neighbor exists.
             let members = membership(200);
             let source = &members.members()[0].node;
@@ -2262,7 +2262,8 @@ pub(crate) mod tests {
             let target = neighbors[0].clone();
             let to = members.position(&target).unwrap();
             let health = Rc::new(
-                LinkHealth::default().with_silence(Duration::from_secs(1), Duration::from_secs(1)),
+                LinkHealth::on(env.ctx.clock.clone())
+                    .with_silence(Duration::from_secs(1), Duration::from_secs(1)),
             );
             let paths = Paths::new(health.clone(), 0);
             let request = budget(&members, to, 1);
@@ -2308,9 +2309,10 @@ pub(crate) mod tests {
         }
         #[test]
         fn path_search_limit_is_independent_of_cache_and_released_on_drop() {
+            let env = racer_io::Env::host();
             let members = membership(100_000);
             let source = &members.members()[0].node;
-            let paths = Paths::with_limits(Rc::new(LinkHealth::default()), 0, 1, 1);
+            let paths = Paths::with_limits(Rc::new(LinkHealth::on(env.ctx.clock.clone())), 0, 1, 1);
             let request = budget(&members, 80_003, NORMAL_LINKS);
             let scope = RequestScope::host(request.request, request.deadline.0).unwrap();
             let mut first = paths.shortest_async(members.clone(), source, &request, &scope);
@@ -2318,11 +2320,17 @@ pub(crate) mod tests {
             assert!(first.as_mut().poll(&mut cx).is_pending());
             let other = budget(&members, 80_004, NORMAL_LINKS);
             assert_eq!(
-                paths.shortest(members.clone(), source, &other).unwrap_err(),
+                paths
+                    .shortest(&env, members.clone(), source, &other)
+                    .unwrap_err(),
                 Error::Overloaded
             );
             drop(first);
-            assert!(paths.shortest(members.clone(), source, &other).is_ok());
+            assert!(
+                paths
+                    .shortest(&env, members.clone(), source, &other)
+                    .is_ok()
+            );
             assert_eq!(
                 map_error(::topology::Error::SamplingExhausted),
                 Error::Internal
@@ -2336,9 +2344,11 @@ pub(crate) mod tests {
         /// and a queue of one, a second search waits and a third fails `Overloaded`.
         #[test]
         fn with_queue_lets_searches_wait_up_to_the_queue_limit() {
+            let env = racer_io::Env::host();
             let members = membership(100_000);
             let source = &members.members()[0].node;
-            let paths = Paths::with_limits(Rc::new(LinkHealth::default()), 0, 1, 1).with_queue(1);
+            let paths = Paths::with_limits(Rc::new(LinkHealth::on(env.ctx.clock.clone())), 0, 1, 1)
+                .with_queue(1);
             let mut cx = std::task::Context::from_waker(futures::task::noop_waker_ref());
             let budgets: Vec<_> = (0..3)
                 .map(|i| budget(&members, 80_003 + i, NORMAL_LINKS))
@@ -2353,7 +2363,7 @@ pub(crate) mod tests {
             assert!(second.as_mut().poll(&mut cx).is_pending());
             assert_eq!(
                 paths
-                    .shortest(members.clone(), source, &budgets[2])
+                    .shortest(&env, members.clone(), source, &budgets[2])
                     .unwrap_err(),
                 Error::Overloaded
             );
@@ -2370,9 +2380,10 @@ pub(crate) mod tests {
         /// when a slot frees, and a cancelled one leaves the queue.
         #[test]
         fn searches_beyond_the_slot_limit_wait_for_a_slot() {
+            let env = racer_io::Env::host();
             let members = membership(100_000);
             let source = &members.members()[0].node;
-            let paths = Paths::new(Rc::new(LinkHealth::default()), 0);
+            let paths = Paths::new(Rc::new(LinkHealth::on(env.ctx.clock.clone())), 0);
             let mut cx = std::task::Context::from_waker(futures::task::noop_waker_ref());
             let budgets: Vec<_> = (0..10)
                 .map(|i| budget(&members, 80_003 + i, NORMAL_LINKS))
@@ -2406,6 +2417,7 @@ pub(crate) mod tests {
         }
         #[test]
         fn independent_hash_vectors_cache_reselection_and_snapshot_weights() {
+            let env = racer_io::Env::host();
             let mut input = membership(1500).members().to_vec();
             for (i, member) in input.iter_mut().enumerate() {
                 member.shares = std::num::NonZeroU32::new(if i % 3 == 0 { 1 } else { 4 }).unwrap();
@@ -2413,13 +2425,15 @@ pub(crate) mod tests {
             let members = Arc::new(
                 Membership::validate(racer_wire::control::MembershipVersion(1), input).unwrap(),
             );
-            let cached = Paths::new(Rc::new(LinkHealth::default()), 1);
-            let cold = Paths::new(Rc::new(LinkHealth::default()), 0);
+            let cached = Paths::new(Rc::new(LinkHealth::on(env.ctx.clock.clone())), 1);
+            let cold = Paths::new(Rc::new(LinkHealth::on(env.ctx.clock.clone())), 0);
             for (attempt, expected) in crate::topology::tests::fixtures::NEXT_HOPS {
                 let mut request = budget(&members, 1499, NORMAL_LINKS);
                 request.attempt = AttemptId(attempt.to_be_bytes());
                 let from = &members.members()[0].node;
-                let actual = cached.shortest(members.clone(), from, &request).unwrap();
+                let actual = cached
+                    .shortest(&env, members.clone(), from, &request)
+                    .unwrap();
                 assert_eq!(actual.nodes[1], members.members()[expected].node);
                 assert!(members.neighbors(from).unwrap().contains(&actual.nodes[1]));
                 let scope = RequestScope::host(request.request, request.deadline.0).unwrap();
@@ -2438,6 +2452,7 @@ pub(crate) mod tests {
             let mut changed = members.members().to_vec();
             let favored = cached
                 .shortest(
+                    &env,
                     members.clone(),
                     &members.members()[0].node,
                     &budget(&members, 1499, 4),
@@ -2452,6 +2467,7 @@ pub(crate) mod tests {
             );
             let route = cached
                 .shortest(
+                    &env,
                     changed.clone(),
                     &changed.members()[0].node,
                     &budget(&changed, 1499, 4),
@@ -2462,15 +2478,20 @@ pub(crate) mod tests {
         }
         #[test]
         fn health_eviction_budget_deadline_and_cancellation() {
+            let env = racer_io::Env::host();
             let members = membership(1500);
             let source = &members.members()[0].node;
-            let health = Rc::new(LinkHealth::default());
+            let health = Rc::new(LinkHealth::on(env.ctx.clock.clone()));
             let paths = Paths::new(health.clone(), 1);
             let request = budget(&members, 1499, NORMAL_LINKS);
-            let original = paths.shortest(members.clone(), source, &request).unwrap();
+            let original = paths
+                .shortest(&env, members.clone(), source, &request)
+                .unwrap();
             let mut blocked = request.clone();
             blocked.visited.push(original.nodes[1].clone());
-            let alternate = paths.shortest(members.clone(), source, &blocked).unwrap();
+            let alternate = paths
+                .shortest(&env, members.clone(), source, &blocked)
+                .unwrap();
             assert_eq!(alternate.nodes.len(), original.nodes.len());
             assert!(!alternate.nodes.contains(&original.nodes[1]));
             health
@@ -2482,7 +2503,7 @@ pub(crate) mod tests {
                 .unwrap();
             assert_ne!(
                 paths
-                    .shortest(members.clone(), source, &request)
+                    .shortest(&env, members.clone(), source, &request)
                     .unwrap()
                     .nodes[1],
                 original.nodes[1]
@@ -2511,14 +2532,14 @@ pub(crate) mod tests {
                 }
                 assert_eq!(
                     paths
-                        .shortest(members.clone(), source, &blocked)
+                        .shortest(&env, members.clone(), source, &blocked)
                         .unwrap_err(),
                     expected
                 );
             }
-            let cold = Paths::new(Rc::new(LinkHealth::default()), 0);
+            let cold = Paths::new(Rc::new(LinkHealth::on(env.ctx.clock.clone())), 0);
             assert_eq!(
-                cold.shortest(members.clone(), source, &budget(&members, 0, 0))
+                cold.shortest(&env, members.clone(), source, &budget(&members, 0, 0))
                     .unwrap()
                     .nodes,
                 vec![source.clone()]
@@ -2530,7 +2551,10 @@ pub(crate) mod tests {
             let _ = operation.as_mut().poll(&mut cx);
             drop(operation);
             // A fresh cold search succeeds after dropping the previous operation.
-            assert!(cold.shortest(members.clone(), source, &request).is_ok());
+            assert!(
+                cold.shortest(&env, members.clone(), source, &request)
+                    .is_ok()
+            );
         }
         /// Forwarding a search-form budget goes through the one rule in
         /// `racer_core::route`; the signed wire form is checked in peer-wire.
@@ -2613,9 +2637,10 @@ pub(crate) mod tests {
 
         #[test]
         fn yielded_search_rechecks_health_and_retains_only_current_neighbors() {
+            let env = racer_io::Env::host();
             let members = membership(100_000);
             let source = &members.members()[0].node;
-            let health = Rc::new(LinkHealth::default());
+            let health = Rc::new(LinkHealth::on(env.ctx.clock.clone()));
             let paths = Paths::new(health.clone(), 1);
             let request = budget(&members, 80_003, 4);
             health
@@ -2638,7 +2663,9 @@ pub(crate) mod tests {
                 futures::executor::block_on(operation).unwrap_err(),
                 Error::Unavailable
             );
-            let retried = paths.shortest(members.clone(), source, &request).unwrap();
+            let retried = paths
+                .shortest(&env, members.clone(), source, &request)
+                .unwrap();
             assert_ne!(retried.nodes[1], neighbor);
         }
 
@@ -2647,16 +2674,16 @@ pub(crate) mod tests {
             use crate::peer::AdaptivePeers;
             use crate::peer::Config;
             use crate::peer::Outcome;
-            let clock = crate::rt::environment::SimulationClock::new(110);
-            let sim_env = clock.environment(0);
-            let _env = sim_env.enter();
-            let sim_ctx = sim_env.worker_ctx();
+            let clock = racer_io::SimClock::new(110);
+            let sim_env = clock.ctx(0);
+            let env = racer_io::Env::new(racer_io::Driver::Uring, sim_env.clone());
+            let sim_ctx = sim_env.clone();
             let members = membership(100_000);
             let source = &members.members()[0].node;
             let admission =
                 AdaptivePeers::new(Config::default(), Default::default(), sim_ctx.clock.clone())
                     .unwrap();
-            let paths = Paths::new(Rc::new(LinkHealth::default()), 1)
+            let paths = Paths::new(Rc::new(LinkHealth::on(env.ctx.clock.clone())), 1)
                 .with_peer_admission(admission.clone());
             let mut request = budget(&members, 80_003, 4);
             request.deadline = Deadline(sim_ctx.clock.now() + Duration::from_secs(60));
@@ -2675,7 +2702,7 @@ pub(crate) mod tests {
             );
             assert_ne!(
                 paths
-                    .shortest(members.clone(), source, &request)
+                    .shortest(&env, members.clone(), source, &request)
                     .unwrap()
                     .nodes[1],
                 neighbor
@@ -2685,15 +2712,15 @@ pub(crate) mod tests {
 
         #[test]
         fn yielded_and_cached_searches_enforce_scope_budget_and_membership() {
-            let clock = crate::rt::environment::SimulationClock::new(109);
-            let sim_env = clock.environment(0);
-            let _env = sim_env.enter();
-            let sim_ctx = sim_env.worker_ctx();
+            let clock = racer_io::SimClock::new(109);
+            let sim_env = clock.ctx(0);
+            let env = racer_io::Env::new(racer_io::Driver::Uring, sim_env.clone());
+            let sim_ctx = sim_env.clone();
             let members = membership(100_000);
             let source = &members.members()[0].node;
             let mut cx = std::task::Context::from_waker(futures::task::noop_waker_ref());
             for case in 0..3 {
-                let paths = Paths::new(Rc::new(LinkHealth::default()), 1);
+                let paths = Paths::new(Rc::new(LinkHealth::on(env.ctx.clock.clone())), 1);
                 let mut request = budget(&members, 80_003, 4);
                 let now = sim_ctx.clock.now();
                 request.deadline =
@@ -2723,7 +2750,9 @@ pub(crate) mod tests {
                 // Failure drops the algorithm admission before a new request starts.
                 let mut fresh = request.clone();
                 fresh.deadline = Deadline(sim_ctx.clock.now() + Duration::from_secs(60));
-                paths.shortest(members.clone(), source, &fresh).unwrap();
+                paths
+                    .shortest(&env, members.clone(), source, &fresh)
+                    .unwrap();
                 assert_eq!(
                     futures::executor::block_on(paths.shortest_async(
                         members.clone(),
@@ -2736,7 +2765,9 @@ pub(crate) mod tests {
                 );
                 fresh.membership = racer_wire::control::MembershipVersion(2);
                 assert_eq!(
-                    paths.shortest(members.clone(), source, &fresh).unwrap_err(),
+                    paths
+                        .shortest(&env, members.clone(), source, &fresh)
+                        .unwrap_err(),
                     Error::IncompatibleMembership
                 );
             }

@@ -85,6 +85,7 @@ mod materialized_pairing {
 
     #[test]
     fn materialized_pairing_survives_concurrent_short_reads_cancel_and_pool_reuse() {
+        let env = racer_io::Env::host();
         let RelayFixture {
             signers,
             admissions,
@@ -98,7 +99,7 @@ mod materialized_pairing {
             scope,
             mut metadata,
             ..
-        } = RelayFixture::with_pool_limit(true, 2);
+        } = RelayFixture::with_pool_limit(&env, true, 2);
         assert!(!server.opaque_relay());
         metadata.length = 3 * crate::model::PAGE_BYTES;
         metadata.expires_at = ExpiresAt::test_time(
@@ -266,7 +267,7 @@ mod materialized_pairing {
             Ok::<_, Error>(())
         };
         let signed_request = |number: usize| {
-            let mut request = request(&admissions[0], number as u8 + 1);
+            let mut request = request(&env, &admissions[0], number as u8 + 1);
             request.operation = protocol::Operation::Page {
                 page: pages[number].envelope().page.clone(),
                 mode: protocol::FetchMode::CopyOnly,
@@ -421,21 +422,24 @@ mod safety {
 
     #[test]
     fn upstream_fin_before_response_head_recovers_quota_by_signed_deadline() {
-        abandoned_head(false, false);
+        let env = racer_io::Env::host();
+        abandoned_head(&env, false, false);
     }
 
     #[test]
     fn upstream_fin_before_response_head_promptly_releases_relay() {
-        abandoned_head(true, false);
+        let env = racer_io::Env::host();
+        abandoned_head(&env, true, false);
     }
 
     #[test]
     fn parent_cancel_before_response_head_promptly_releases_relay() {
-        abandoned_head(true, true);
+        let env = racer_io::Env::host();
+        abandoned_head(&env, true, true);
     }
 
-    fn abandoned_head(prompt: bool, cancel_parent: bool) {
-        let mut f = RelayFixture::new(false);
+    fn abandoned_head(env: &racer_io::Env, prompt: bool, cancel_parent: bool) {
+        let mut f = RelayFixture::new(env, false);
         let metrics = Metrics::default();
         f.server = f.server.with_metrics(metrics.clone());
         f.reactors[1].init().unwrap();
@@ -515,7 +519,7 @@ mod safety {
                 &f.scope,
             )
             .await?;
-            let mut request = request(&f.admissions[0], 11);
+            let mut request = request(env, &f.admissions[0], 11);
             let end = Instant::now()
                 + if prompt {
                     Duration::from_secs(5)
@@ -602,11 +606,13 @@ mod safety {
 
     #[test]
     fn wrong_equal_length_body_through_opaque_relay_fails_aead_then_recovers() {
-        let mut f = RelayFixture::new(false);
+        let env = racer_io::Env::host();
+        let mut f = RelayFixture::new(&env, false);
         let relay_metrics = Metrics::default();
         f.server = f.server.with_metrics(relay_metrics.clone());
         assert!(f.server.opaque_relay());
         let identities = crate::test_support::security::identities(
+            &env,
             ClusterId(CLUSTER.into()),
             &[NodeId(A.into()), NodeId(C.into())],
             || {
@@ -762,7 +768,7 @@ mod safety {
             )
             .await?;
             for (attempt, wrong) in [true, false].into_iter().enumerate() {
-                let mut request = request(&f.admissions[0], attempt as u8 + 1);
+                let mut request = request(&env, &f.admissions[0], attempt as u8 + 1);
                 request.operation = protocol::Operation::Page {
                     page: pages[0].envelope().page.clone(),
                     mode: protocol::FetchMode::CopyOnly,
@@ -913,13 +919,21 @@ fn drive<T>(
 // Wall and thread CPU include all three roles. The same signed fixture can
 // execute the materialized relay path for a local mechanism A/B.
 fn exchange(
+    env: &racer_io::Env,
     materialized: bool,
     fallback: bool,
     rounds: usize,
     fragmented: bool,
     truncated: bool,
 ) -> (Duration, Duration) {
-    RelayFixture::new(materialized).run(materialized, fallback, rounds, fragmented, truncated)
+    RelayFixture::new(env, materialized).run(
+        env,
+        materialized,
+        fallback,
+        rounds,
+        fragmented,
+        truncated,
+    )
 }
 
 struct RelayFixture {
@@ -947,7 +961,8 @@ struct RelayFixture {
 /// and nothing for any other response.
 #[test]
 fn page_bodies_count_toward_the_hot_page_shed_on_every_transport() {
-    let f = RelayFixture::new(true);
+    let env = racer_io::Env::host();
+    let f = RelayFixture::new(&env, true);
     let id = f.page.envelope().page.clone();
     let page = PeerResponse::Page {
         metadata: f.metadata.clone(),
@@ -978,11 +993,12 @@ fn send_tag_http_success_failure_drop_do_not_wait_for_crypto() {
     use crate::security::pair;
     use crate::telemetry::Pair;
     use crate::telemetry::Samples;
+    let env = racer_io::Env::host();
     for mode in ["success", "failure", "drop"] {
-        let f = RelayFixture::new(true);
+        let f = RelayFixture::new(&env, true);
         let queue = Rc::new(crate::drivers::DriverQueue::new(1024));
         let _guard = queue.enter();
-        let (_, ids) = identities();
+        let (_, ids) = identities(&env);
         let (io, _engine) = pair(
             crate::model::WorkerId(0),
             1,
@@ -1028,7 +1044,7 @@ fn send_tag_http_success_failure_drop_do_not_wait_for_crypto() {
         server_conn.set_framing(Some(0), server_conn.send_remaining(), false);
         let a = Forwarding::new(f.signers[0].clone());
         let b = Forwarding::new(f.signers[1].clone());
-        let mut local = request(&f.admissions[0], 9);
+        let mut local = request(&env, &f.admissions[0], 9);
         local.route.destination = NodeId(B.into());
         local.operation = protocol::Operation::Bootstrap {
             object: f.metadata.version.object.clone(),
@@ -1116,12 +1132,12 @@ fn send_tag_http_success_failure_drop_do_not_wait_for_crypto() {
 }
 
 impl RelayFixture {
-    fn new(materialized: bool) -> Self {
-        Self::with_pool_limit(materialized, 1)
+    fn new(env: &racer_io::Env, materialized: bool) -> Self {
+        Self::with_pool_limit(env, materialized, 1)
     }
 
-    fn with_pool_limit(materialized: bool, limit: usize) -> Self {
-        let signers = signers();
+    fn with_pool_limit(env: &racer_io::Env, materialized: bool, limit: usize) -> Self {
+        let signers = signers(env);
         let admissions: Vec<_> = (0..3)
             .map(|_| {
                 Rc::new(flow_control::Quotas::new(AdmissionPolicy::new(
@@ -1131,7 +1147,7 @@ impl RelayFixture {
             .collect();
         let reactors: Vec<_> = admissions
             .iter()
-            .map(|a| Rc::new(Reactor::new(a.clone(), &crate::test_support::env())))
+            .map(|a| Rc::new(Reactor::new(a.clone(), env)))
             .collect();
         let ios: Vec<_> = reactors
             .iter()
@@ -1192,7 +1208,10 @@ impl RelayFixture {
             Rc::new(codec(&admissions[1])),
             signers[1].clone(),
         ));
-        let paths = Rc::new(Paths::new(Rc::new(LinkHealth::default()), 4));
+        let paths = Rc::new(Paths::new(
+            Rc::new(LinkHealth::on(env.ctx.clock.clone())),
+            4,
+        ));
         let requester = Rc::new(Requester::new(
             paths.clone(),
             auth.clone(),
@@ -1284,6 +1303,7 @@ impl RelayFixture {
 
     fn run(
         self,
+        env: &racer_io::Env,
         materialized: bool,
         fallback: bool,
         rounds: usize,
@@ -1420,7 +1440,7 @@ impl RelayFixture {
                 connection::connect(&ios[0], conn, signers[0].clone(), signers[1].node(), &scope)
                     .await?;
             for i in 0..rounds {
-                let mut request = request(&admissions[0], i as u8);
+                let mut request = request(env, &admissions[0], i as u8);
                 request.operation = if i % 2 == 0 {
                     protocol::Operation::Bootstrap {
                         object: metadata.version.object.clone(),
@@ -1537,29 +1557,34 @@ fn cpu() -> Duration {
 }
 #[test]
 fn signed_full_page_bootstrap_and_page_stream_without_transit_allocation() {
+    let env = racer_io::Env::host();
     for fallback in [false, true] {
-        exchange(false, fallback, 2, true, false);
+        exchange(&env, false, fallback, 2, true, false);
     }
 }
 #[test]
 fn signed_materialized_full_page_bootstrap_and_page_keepalive() {
-    exchange(true, false, 2, true, false);
+    let env = racer_io::Env::host();
+    exchange(&env, true, false, 2, true, false);
 }
 #[test]
 fn signed_success_truncation_closes_relay_and_pooled_destination() {
-    exchange(false, false, 2, false, true);
+    let env = racer_io::Env::host();
+    exchange(&env, false, false, 2, false, true);
 }
 #[test]
 fn opaque_truncation_without_prior_success_credits_no_complete_bytes() {
+    let env = racer_io::Env::host();
     for fallback in [false, true] {
-        exchange(false, fallback, 1, false, true);
+        exchange(&env, false, fallback, 1, false, true);
     }
 }
 #[test]
 #[ignore = "local bounded before/after benchmark; run explicitly"]
 fn opaque_relay_benchmark() {
+    let env = racer_io::Env::host();
     for materialized in [true, false, false, true] {
-        let (wall, cpu) = exchange(materialized, false, 8, false, false);
+        let (wall, cpu) = exchange(&env, materialized, false, 8, false, false);
         eprintln!(
             "materialized={materialized} bytes={} wall_ms={:.3} cpu_ms={:.3}",
             8 * (16 * 1024 * 1024 + 16),
@@ -1573,6 +1598,7 @@ fn opaque_relay_benchmark() {
 fn opaque_head_rejects_binding_length_authority_and_reverse_proof_substitution() {
     use crate::peer::forwarding::ForwardedHead;
     use crate::peer::protocol;
+    let env = racer_io::Env::host();
     fn copy(head: &http1::MessageHead) -> http1::MessageHead {
         let codec = Codec::new(crate::peer::protocol::MAX_SIGNED_HEAD);
         let mut head = codec
@@ -1595,14 +1621,14 @@ fn opaque_head_rejects_binding_length_authority_and_reverse_proof_substitution()
         "hop",
         "deadline",
     ] {
-        let signers = signers();
+        let signers = signers(&env);
         let a = Forwarding::new(signers[0].clone());
         let b = Forwarding::new(signers[1].clone());
         let c = Forwarding::new(signers[2].clone());
         let admission = Rc::new(flow_control::Quotas::new(AdmissionPolicy::new(
             crate::test_support::cluster::config(false).limits,
         )));
-        let local = request(&admission, 1);
+        let local = request(&env, &admission, 1);
         let (signed, _) = a.sign_request_to(local, signers[1].node()).unwrap();
         let verified = b.verify_request(signed).unwrap();
         let binding = verified.binding().clone();
@@ -1657,15 +1683,14 @@ fn opaque_head_rejects_binding_length_authority_and_reverse_proof_substitution()
         if attack == "deadline" {
             // The binding retains its signed monotonic deadline; scope changes
             // cannot make a stale head eligible for reverse forwarding.
-            let clock = crate::rt::environment::SimulationClock::new_at(
+            let clock = racer_io::SimClock::new_at(
                 91,
                 Instant::now() + Duration::from_secs(60),
                 std::time::SystemTime::now() + Duration::from_secs(60),
             );
-            let environment = clock.environment(0);
-            let _guard = environment.enter();
+            let environment = clock.ctx(0);
             // The forwarder reads time from its own context, now the later one.
-            let b = Forwarding::new(Rc::new(signers[1].with_ctx(environment.worker_ctx())));
+            let b = Forwarding::new(Rc::new(signers[1].with_ctx(environment.clone())));
             assert!(
                 b.forward_opaque(response, 0, &binding, signers[0].node())
                     .is_err()
@@ -1690,11 +1715,12 @@ fn opaque_head_rejects_binding_length_authority_and_reverse_proof_substitution()
 #[ignore = "release-only peer sign/verify cost benchmark; run explicitly"]
 fn peer_crypto_cost_benchmark() {
     use std::hint::black_box;
+    let env = racer_io::Env::host();
     #[allow(clippy::assertions_on_constants)]
     {
         assert!(!cfg!(debug_assertions), "run with --release");
     }
-    let signers = signers();
+    let signers = signers(&env);
     let a = Forwarding::new(signers[0].clone());
     let b = Forwarding::new(signers[1].clone());
     let c = Forwarding::new(signers[2].clone());
@@ -1704,7 +1730,7 @@ fn peer_crypto_cost_benchmark() {
     const ITERATIONS: u32 = 400;
     let mut totals = [Duration::ZERO; 5];
     for _ in 0..ITERATIONS {
-        let local = request(&admission, 1);
+        let local = request(&env, &admission, 1);
         let start = Instant::now();
         let (signed, _) = a.sign_request_to(local, signers[1].node()).unwrap();
         let t1 = Instant::now();

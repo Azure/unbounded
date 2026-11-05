@@ -1537,6 +1537,7 @@ mod tests {
     }
     #[test]
     fn busy_victim_waits_and_clock_makes_progress() {
+        let env = racer_io::Env::host();
         let segments = Rc::new(segments(512, 2));
         let held = segments.append(512).unwrap();
         drop(segments.append(512).unwrap());
@@ -1544,7 +1545,7 @@ mod tests {
             Rc::new(Index::new(
                 WorkerId(0),
                 1,
-                crate::test_support::availability(),
+                crate::test_support::availability(&env),
                 racer_io::Clock::host(),
             )),
             segments.clone(),
@@ -1559,9 +1560,10 @@ mod tests {
 
     #[test]
     fn caller_selected_zero_budget_preserves_allocations_and_index() {
+        let env = racer_io::Env::host();
         let segments = Rc::new(segments(512, 2));
         drop(segments.append(512).unwrap());
-        let index = Rc::new(index(1));
+        let index = Rc::new(index(&env, 1));
         let clock = SegmentClock::with_budget(
             index,
             segments.clone(),
@@ -1578,17 +1580,18 @@ mod tests {
             page_alloc::SegmentState::Sealed
         );
     }
-    fn index(capacity: usize) -> Index {
+    fn index(env: &racer_io::Env, capacity: usize) -> Index {
         Index::new(
             WorkerId(0),
             capacity,
-            crate::test_support::availability(),
-            crate::test_support::clock(),
+            crate::test_support::availability(env),
+            env.ctx.clock.clone(),
         )
     }
     #[test]
     fn reclaim_prepares_one_scoring_pass() {
-        let index = Rc::new(index(8));
+        let env = racer_io::Env::host();
+        let index = Rc::new(index(&env, 8));
         index.set_page_capacity(4).unwrap();
         let segments = Rc::new(segments(1024, 2));
         for i in 0..2 {
@@ -1649,8 +1652,9 @@ mod tests {
     #[test]
     fn page_ticket_publishes_appended_write_and_cancellation_releases_everything() {
         use std::future::Future;
+        let env = racer_io::Env::host();
         let segments = Rc::new(segments(1024, 2));
-        let index = Rc::new(index(8));
+        let index = Rc::new(index(&env, 8));
         index.set_page_capacity(1).unwrap();
         let _clock = SegmentClock::new(index.clone(), segments.clone(), 1);
         let (page, entry) = indexed(descriptor("a", 17), 0);
@@ -1719,8 +1723,9 @@ mod tests {
     }
     #[test]
     fn hard_hold_capacity_dedup_extension_release_and_eviction() {
+        let env = racer_io::Env::host();
         let segments = Rc::new(segments(1024, 6));
-        let index = Rc::new(index(8));
+        let index = Rc::new(index(&env, 8));
         index.set_page_capacity(6).unwrap();
         let clock = SegmentClock::new(index.clone(), segments.clone(), 1);
         let (page, entry) = indexed(descriptor("held", 17), 0);
@@ -1769,8 +1774,9 @@ mod tests {
 
     #[test]
     fn hold_page_holders_share_and_release_individual_pages() {
+        let env = racer_io::Env::host();
         let segments = Rc::new(segments(1024, 6));
-        let index = Rc::new(index(8));
+        let index = Rc::new(index(&env, 8));
         index.set_page_capacity(6).unwrap();
         let _clock = SegmentClock::new(index.clone(), segments.clone(), 1);
         let (page, entry) = indexed(descriptor("held", 17), 0);
@@ -1823,12 +1829,12 @@ mod tests {
 
     #[test]
     fn stale_hold_page_release_cannot_drop_a_replacement_holder() {
-        let clock = crate::rt::environment::SimulationClock::new(29);
-        let sim_env = clock.environment(0);
-        let _environment = sim_env.enter();
-        let sim_ctx = sim_env.worker_ctx();
+        let clock = racer_io::SimClock::new(29);
+        let sim_env = clock.ctx(0);
+        let env = racer_io::Env::new(racer_io::Driver::Uring, sim_env.clone());
+        let sim_ctx = sim_env.clone();
         let segments = Rc::new(segments(1024, 6));
-        let index = Rc::new(index(8));
+        let index = Rc::new(index(&env, 8));
         index.set_page_capacity(6).unwrap();
         let _clock = SegmentClock::new(index.clone(), segments.clone(), 1);
         let (page, entry) = indexed(descriptor("held", 17), 0);
@@ -1865,8 +1871,9 @@ mod tests {
 
     #[test]
     fn hold_epoch_changes_with_every_reservation_but_not_extension() {
+        let env = racer_io::Env::host();
         let segments = Rc::new(segments(1024, 6));
-        let index = Rc::new(index(8));
+        let index = Rc::new(index(&env, 8));
         index.set_page_capacity(6).unwrap();
         let _clock = SegmentClock::new(index.clone(), segments.clone(), 1);
         let (page, entry) = indexed(descriptor("held", 17), 0);
@@ -1916,8 +1923,9 @@ mod tests {
 
     #[test]
     fn whole_hold_release_drops_unpublished_pages_and_keeps_published_counts() {
+        let env = racer_io::Env::host();
         let segments = Rc::new(segments(1024, 6));
-        let index = Rc::new(index(8));
+        let index = Rc::new(index(&env, 8));
         index.set_page_capacity(6).unwrap();
         let _clock = SegmentClock::new(index.clone(), segments.clone(), 1);
         let (page, entry) = indexed(descriptor("held", 17), 0);
@@ -1965,8 +1973,9 @@ mod tests {
 
     #[test]
     fn page_set_hold_ignores_cached_nonmember_and_charges_only_members() {
+        let env = racer_io::Env::host();
         let segments = Rc::new(segments(1024, 8));
-        let index = Rc::new(index(8));
+        let index = Rc::new(index(&env, 8));
         index.set_page_capacity(2).unwrap();
         let _clock = SegmentClock::new(index.clone(), segments.clone(), 1);
         let (cached, entry) = indexed(descriptor("primary", 2 * crate::model::PAGE_BYTES), 0);
@@ -2014,8 +2023,9 @@ mod tests {
     /// the unused reservation of the pages still held.
     #[test]
     fn released_page_with_held_write_in_flight_keeps_other_members_reserved() {
+        let env = racer_io::Env::host();
         let segments = Rc::new(segments(1024, 8));
-        let index = Rc::new(index(8));
+        let index = Rc::new(index(&env, 8));
         index.set_page_capacity(4).unwrap();
         let _clock = SegmentClock::new(index.clone(), segments.clone(), 1);
         let version = descriptor("inflight", 2 * crate::model::PAGE_BYTES).version;
@@ -2065,8 +2075,9 @@ mod tests {
 
     #[test]
     fn page_set_hold_counts_cached_members_and_unions_earlier_promises() {
+        let env = racer_io::Env::host();
         let segments = Rc::new(segments(1024, 8));
-        let index = Rc::new(index(8));
+        let index = Rc::new(index(&env, 8));
         index.set_page_capacity(6).unwrap();
         let _clock = SegmentClock::new(index.clone(), segments.clone(), 1);
         let (cached, entry) = indexed(descriptor("union", 3 * crate::model::PAGE_BYTES), 0);
@@ -2117,8 +2128,9 @@ mod tests {
 
     #[test]
     fn restored_hold_rebuilds_sorted_page_set_from_unordered_visits() {
+        let env = racer_io::Env::host();
         let segments = Rc::new(segments(1024, 64));
-        let index = Rc::new(index(64));
+        let index = Rc::new(index(&env, 64));
         let _clock = SegmentClock::new(index.clone(), segments.clone(), 1);
         let count = 40u64;
         let bytes = count * crate::model::PAGE_BYTES;
@@ -2153,8 +2165,9 @@ mod tests {
 
     #[test]
     fn restored_sparse_hold_counts_only_held_pages_at_capacity_edge() {
+        let env = racer_io::Env::host();
         let segments = Rc::new(segments(1024, 8));
-        let index = Rc::new(index(8));
+        let index = Rc::new(index(&env, 8));
         index.set_page_capacity(4).unwrap();
         let _clock = SegmentClock::new(index.clone(), segments.clone(), 1);
         let (first, _) = indexed(descriptor("sparse", 3 * crate::model::PAGE_BYTES), 0);
@@ -2196,8 +2209,9 @@ mod tests {
 
     #[test]
     fn held_snapshot_counts_only_live_publications_and_distinct_segments() {
+        let env = racer_io::Env::host();
         let segments = Rc::new(segments(1024, 8));
-        let index = Rc::new(index(8));
+        let index = Rc::new(index(&env, 8));
         let _clock = SegmentClock::new(index.clone(), segments.clone(), 1);
         let until = racer_io::Clock::host().wall_now() + std::time::Duration::from_secs(60);
         let (first, entry) = indexed(descriptor("first", 17), 0);
@@ -2266,8 +2280,9 @@ mod tests {
 
     #[test]
     fn hard_hold_rejects_already_evicting_mapping_atomically() {
+        let env = racer_io::Env::host();
         let segments = Rc::new(segments(1024, 4));
-        let index = Rc::new(index(8));
+        let index = Rc::new(index(&env, 8));
         let _clock = SegmentClock::new(index.clone(), segments.clone(), 1);
         let (page, entry) = indexed(descriptor("evicting", 17), 0);
         drop(segments.append(1024).unwrap());
@@ -2284,8 +2299,9 @@ mod tests {
 
     #[test]
     fn hard_hold_partial_failure_preserves_completed_page_and_deadline() {
+        let env = racer_io::Env::host();
         let segments = Rc::new(segments(1024, 8));
-        let index = Rc::new(index(8));
+        let index = Rc::new(index(&env, 8));
         let _clock = SegmentClock::new(index.clone(), segments.clone(), 1);
         let (page, entry) = indexed(descriptor("partial", 17), 0);
         let until = racer_io::Clock::host().wall_now() + std::time::Duration::from_secs(60);
@@ -2305,8 +2321,9 @@ mod tests {
 
     #[test]
     fn hard_hold_reserves_index_slots_before_payload_and_bounds_ttl() {
+        let env = racer_io::Env::host();
         let segments = Rc::new(segments(1024, 8));
-        let index = Rc::new(index(8));
+        let index = Rc::new(index(&env, 8));
         index.set_page_capacity(4).unwrap();
         let _clock = SegmentClock::new(index.clone(), segments, 1);
         let version = descriptor("held", 17).version;
@@ -2356,8 +2373,9 @@ mod tests {
 
     #[test]
     fn held_page_segment_is_never_reclaimed() {
+        let env = racer_io::Env::host();
         let segments = Rc::new(segments(1024, 4));
-        let index = Rc::new(index(8));
+        let index = Rc::new(index(&env, 8));
         let _bind = SegmentClock::new(index.clone(), segments.clone(), 1);
         let (held, entry) = indexed(descriptor("held", 17), 0);
         drop(segments.append(1024).unwrap());
@@ -2389,13 +2407,14 @@ mod tests {
 
     #[test]
     fn hard_hold_expiry_follows_monotonic_time_only() {
+        let env = racer_io::Env::host();
         let segments = Rc::new(segments(1024, 4));
         let virtual_clock = racer_io::ctx::VirtualClock::new();
         let clock = racer_io::Clock::from(virtual_clock.clone());
         let index = Rc::new(Index::new(
             WorkerId(0),
             8,
-            crate::test_support::availability(),
+            crate::test_support::availability(&env),
             clock.clone(),
         ));
         let _clock = SegmentClock::new(index.clone(), segments, 1);
@@ -2422,7 +2441,8 @@ mod tests {
     }
     #[test]
     fn disk_observability_index_lifecycle_and_victims() {
-        let index = Rc::new(index(4));
+        let env = racer_io::Env::host();
+        let index = Rc::new(index(&env, 4));
         index.set_page_capacity(1).unwrap();
         let retention = index.retention();
         let (page, entry) = indexed(descriptor("metrics", 17), 0);
@@ -2471,11 +2491,12 @@ mod tests {
     }
     #[test]
     fn content_type_is_immutable_including_absence() {
+        let env = racer_io::Env::host();
         let untyped = descriptor("v1", 3);
         let mut typed = untyped.clone();
         typed.content_type = Some(crate::model::ContentType::parse(b"text/plain").unwrap());
         for (first, second) in [(untyped.clone(), typed.clone()), (typed.clone(), untyped)] {
-            let index = index(8);
+            let index = index(&env, 8);
             index.publish_version(first.clone()).unwrap();
             assert_eq!(index.publish_version(second), Err(Error::CorruptRecord));
             index.publish_version(first.clone()).unwrap();
@@ -2488,11 +2509,12 @@ mod tests {
     }
     #[test]
     fn second_sight_mixed_segments_use_live_payload_value_not_padding_or_last_read() {
+        let env = racer_io::Env::host();
         let segments = Rc::new(segments(1024, 3));
         for _ in 0..3 {
             drop(segments.append(1024).unwrap());
         }
-        let index = Rc::new(index(8));
+        let index = Rc::new(index(&env, 8));
         let retention = index.retention();
         let (owned, owned_entry) = indexed(descriptor("owned", 100), 0);
         let (cold, cold_entry) = indexed(descriptor("cold", 800), 0);
@@ -2526,11 +2548,12 @@ mod tests {
     }
     #[test]
     fn second_sight_segment_equal_heat_owned_bias_and_bounded_large_segments() {
+        let env = racer_io::Env::host();
         let segments = Rc::new(segments(1024, 2));
         for _ in 0..2 {
             drop(segments.append(1024).unwrap());
         }
-        let index = Rc::new(index(1));
+        let index = Rc::new(index(&env, 1));
         let (owned, first) = indexed(descriptor("owned", 17), 0);
         let (other, second) = indexed(descriptor("other", 17), 1);
         let owner = owned.clone();
@@ -2567,8 +2590,9 @@ mod tests {
     }
     #[test]
     fn second_sight_sealed_unpublished_write_is_not_a_victim() {
+        let env = racer_io::Env::host();
         let segments = Rc::new(segments(1024, 3));
-        let index = Rc::new(index(4));
+        let index = Rc::new(index(&env, 4));
         let (published, entry) = indexed(descriptor("published", 17), 0);
         drop(segments.append(1024).unwrap());
         index.publish(published.clone(), entry).unwrap();
@@ -2626,7 +2650,8 @@ mod tests {
     }
     #[test]
     fn catalog_eviction_preserves_pages_and_conditional_removal_preserves_replacement() {
-        let index = index(1);
+        let env = racer_io::Env::host();
+        let index = index(&env, 1);
         index.set_page_capacity(1).unwrap();
         let (page, old) = indexed(descriptor("old", 17), 0);
         index.publish_version(old.metadata.clone()).unwrap();
@@ -2648,7 +2673,8 @@ mod tests {
     }
     #[test]
     fn capacity_preflight_allows_replacement_and_reopens_only_after_removal() {
-        let index = index(1);
+        let env = racer_io::Env::host();
+        let index = index(&env, 1);
         index.set_page_capacity(1).unwrap();
         let (page, entry) = indexed(descriptor("first", 17), 0);
         let (other, other_entry) = indexed(descriptor("other", 17), 1);
@@ -2675,7 +2701,8 @@ mod tests {
     }
     #[test]
     fn restore_is_atomic_and_drops_freshness() {
-        let index = index(2);
+        let env = racer_io::Env::host();
+        let index = index(&env, 2);
         let m = descriptor("v1", 17);
         let mut current = m.for_pin();
         current.expires_at = crate::model::ExpiresAt::from_unix_millis(
@@ -2741,11 +2768,12 @@ mod priority_tests {
         }
     }
 
-    fn index(pages: usize, weights: &[(&str, u16)]) -> Rc<Index> {
+    fn index(env: &racer_io::Env, pages: usize, weights: &[(&str, u16)]) -> Rc<Index> {
         let index = Rc::new(Index::new(
             WorkerId(0),
             64,
             crate::test_support::availability_for(
+                env,
                 weights.iter().map(|(name, _)| cache(name)).collect(),
             ),
             racer_io::Clock::host(),
@@ -2834,7 +2862,8 @@ mod priority_tests {
 
     #[test]
     fn accounting_tracks_publish_replace_evict_remove_and_restore() {
-        let index = index(4, &[("a", 500), ("b", 500)]);
+        let env = racer_io::Env::host();
+        let index = index(&env, 4, &[("a", 500), ("b", 500)]);
         let a0 = publish(&index, "a", "0", 0);
         publish(&index, "b", "0", 0);
         publish(&index, "b", "1", 0);
@@ -2865,7 +2894,8 @@ mod priority_tests {
 
     #[test]
     fn remove_caches_removes_only_listed_caches_in_one_call() {
-        let index = index(8, &[("a", 1), ("b", 1), ("c", 1)]);
+        let env = racer_io::Env::host();
+        let index = index(&env, 8, &[("a", 1), ("b", 1), ("c", 1)]);
         publish(&index, "a", "0", 0);
         publish(&index, "b", "0", 0);
         publish(&index, "c", "0", 0);
@@ -2888,8 +2918,9 @@ mod priority_tests {
 
     #[test]
     fn segment_reclaim_prefers_segment_dominated_by_over_share_pages() {
+        let env = racer_io::Env::host();
         let segments = segments(2);
-        let index = index(8, &[("a", 900), ("b", 100)]);
+        let index = index(&env, 8, &[("a", 900), ("b", 100)]);
         let clock = SegmentClock::new(index.clone(), segments.clone(), 1);
         drop(segments.append(4 * PAGE as usize).unwrap());
         drop(segments.append(4 * PAGE as usize).unwrap());
@@ -2925,7 +2956,8 @@ mod priority_tests {
 
     #[test]
     fn live_priority_change_flips_over_share() {
-        let index = index(4, &[("a", 900), ("b", 100)]);
+        let env = racer_io::Env::host();
+        let index = index(&env, 4, &[("a", 900), ("b", 100)]);
         publish(&index, "a", "0", 0);
         publish(&index, "b", "0", 0);
         let retention = index.retention();
@@ -2999,8 +3031,9 @@ mod priority_tests {
 
     #[test]
     fn index_full_reclaims_over_share_segment_first_and_keeps_holds() {
+        let env = racer_io::Env::host();
         // 8 index pages, 4 per segment: "a" (900) is under share, "b" over.
-        let index = index(8, &[("a", 900), ("b", 100)]);
+        let index = index(&env, 8, &[("a", 900), ("b", 100)]);
         let clock = SegmentClock::new(index.clone(), segments(8), 1);
         let segments = clock.segments.clone();
         let b = fill_segment(&index, &clock, &segments, "b", 0);
@@ -3031,8 +3064,9 @@ mod priority_tests {
 
     #[test]
     fn index_full_reclaim_work_is_bounded_with_many_resident_caches() {
+        let env = racer_io::Env::host();
         const PHANTOMS: usize = 3000;
-        let index = index(32, &[("a", 1), ("z", 1)]);
+        let index = index(&env, 32, &[("a", 1), ("z", 1)]);
         let clock = SegmentClock::new(index.clone(), segments(16), 1);
         let segments = clock.segments.clone();
         // Many resident caches without index pages, each with weight 1, so
@@ -3070,7 +3104,8 @@ mod priority_tests {
 
     #[test]
     fn index_full_reclaim_follows_live_reweight() {
-        let index = index(8, &[("a", 900), ("b", 100)]);
+        let env = racer_io::Env::host();
+        let index = index(&env, 8, &[("a", 900), ("b", 100)]);
         let clock = SegmentClock::new(index.clone(), segments(4), 1);
         let segments = clock.segments.clone();
         let a = fill_segment(&index, &clock, &segments, "a", 0);
@@ -3086,7 +3121,8 @@ mod priority_tests {
 
     #[test]
     fn priority_zero_keeps_idle_space_but_goes_first_under_pressure() {
-        let index = index(16, &[("a", 1000), ("z", 0)]);
+        let env = racer_io::Env::host();
+        let index = index(&env, 16, &[("a", 1000), ("z", 0)]);
         let clock = SegmentClock::new(index.clone(), segments(8), 1);
         let segments = clock.segments.clone();
         for round in 0..3 {
@@ -3115,8 +3151,9 @@ mod priority_tests {
 
     #[test]
     fn simulated_churn_converges_to_priority_ratio_and_follows_live_change() {
+        let env = racer_io::Env::host();
         let clock = |index: &Rc<Index>| SegmentClock::new(index.clone(), segments(32), 1);
-        let index = index(100, &[("a", 900), ("b", 100)]);
+        let index = index(&env, 100, &[("a", 900), ("b", 100)]);
         let eviction = clock(&index);
         let (a, b) = churn(&index, &eviction, 100, 0);
         assert_eq!(a + b, 100);
@@ -3128,7 +3165,7 @@ mod priority_tests {
             .update(&[definition("a", 100), definition("b", 900)]);
         let (a, b) = churn(&index, &eviction, 100, 100);
         assert!((6 * a..=14 * a).contains(&b), "{a}:{b}");
-        let even = self::index(100, &[("a", 500), ("b", 500)]);
+        let even = self::index(&env, 100, &[("a", 500), ("b", 500)]);
         let eviction = clock(&even);
         let (a, b) = churn(&even, &eviction, 100, 0);
         assert!(a.abs_diff(b) <= 8, "{a}:{b}");

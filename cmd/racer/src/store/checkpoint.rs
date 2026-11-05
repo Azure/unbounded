@@ -231,9 +231,14 @@ impl Checkpointer {
     /// One coordinator calls this after all owner-worker snapshots have succeeded.
     /// The coordinator must keep all owners frozen until this operation completes.
     #[cfg(test)]
-    pub fn publish(&self, cluster: ClusterId, shards: Vec<ShardImage>) -> Operation<'_, ()> {
+    pub fn publish(
+        &self,
+        env: &racer_io::Env,
+        cluster: ClusterId,
+        shards: Vec<ShardImage>,
+    ) -> Operation<'_, ()> {
         let directory = self.directory.clone();
-        let result = block_on_io(|reactor, ctx| async move {
+        let result = block_on_io(env, |reactor, ctx| async move {
             publish_next(&reactor, &ctx, &directory, cluster, shards).await
         });
         Box::pin(async move { result })
@@ -520,9 +525,10 @@ async fn publish_next(
 /// Run `make` on a private reactor for the current test environment's driver.
 #[cfg(test)]
 pub(crate) fn block_on_io<T: 'static, F: std::future::Future<Output = T> + 'static>(
+    env: &racer_io::Env,
     make: impl FnOnce(racer_io::Reactor, racer_io::OpCtx) -> F,
 ) -> T {
-    let env = crate::test_support::env();
+    let env = env.clone();
     let ctx = if env.driver.sim_os().is_none() && env.ctx.is_simulated() {
         racer_io::WorkerCtx::host()
     } else {
@@ -537,18 +543,22 @@ pub(crate) fn block_on_io<T: 'static, F: std::future::Future<Output = T> + 'stat
 }
 
 #[cfg(test)]
-pub(crate) fn read_candidates(directory: &Path) -> Result<Vec<(usize, CheckpointImage)>> {
-    read_candidates_with_budget(directory, MAX_CHECKPOINT_BYTES).map(Iterator::collect)
+pub(crate) fn read_candidates(
+    env: &racer_io::Env,
+    directory: &Path,
+) -> Result<Vec<(usize, CheckpointImage)>> {
+    read_candidates_with_budget(env, directory, MAX_CHECKPOINT_BYTES).map(Iterator::collect)
 }
 
 /// Decode every valid slot newest first on a private test reactor.
 #[cfg(test)]
 pub(crate) fn read_candidates_with_budget(
+    env: &racer_io::Env,
     directory: &Path,
     budget: usize,
 ) -> Result<std::vec::IntoIter<(usize, CheckpointImage)>> {
     let directory = directory.to_path_buf();
-    block_on_io(move |reactor, ctx| async move {
+    block_on_io(env, move |reactor, ctx| async move {
         let mut found = candidates(&reactor, &directory, budget, &ctx).await?;
         let mut images = Vec::new();
         while let Some(image) = next_candidate(&mut found, &reactor, &ctx).await {
@@ -1279,15 +1289,20 @@ impl<'a> Decoder<'a> {
 // filter, but do not create an application worker directory. This test-only
 // loader is not compiled into the dataplane.
 impl Recovery {
-    pub(crate) fn load(&self, alignment: Alignment) -> Operation<'_, Option<CheckpointImage>> {
-        self.load_filtered(alignment, |_, _| true)
+    pub(crate) fn load(
+        &self,
+        env: &racer_io::Env,
+        alignment: Alignment,
+    ) -> Operation<'_, Option<CheckpointImage>> {
+        self.load_filtered(env, alignment, |_, _| true)
     }
     pub(super) fn load_filtered(
         &self,
+        env: &racer_io::Env,
         alignment: Alignment,
         available: impl Fn(&CacheId, KeyId) -> bool,
     ) -> Operation<'_, Option<CheckpointImage>> {
-        let result = read_candidates(&self.directory).map(|cuts| {
+        let result = read_candidates(env, &self.directory).map(|cuts| {
             cuts.into_iter().find_map(|(_, mut image)| {
                 Recovery::filter_available(&mut image, |_| true, &available);
                 let valid = image.shards.iter().all(|s| {
@@ -1451,10 +1466,11 @@ mod budget_tests {
 
     #[test]
     fn empty_shard_exact_budget_and_unconfigured_zero_segments() {
+        let env = racer_io::Env::host();
         let index = Rc::new(Index::new(
             WorkerId(0),
             1,
-            crate::test_support::availability(),
+            crate::test_support::availability(&env),
             racer_io::Clock::host(),
         ));
         let segments = Rc::new(Segments::new(4096));

@@ -1745,7 +1745,8 @@ pub(crate) mod tests {
         use super::*;
         #[test]
         fn received_page_keeps_one_charge_and_rejects_foreign_reservations() {
-            let signers = crate::peer::tests::signers();
+            let env = racer_io::Env::host();
+            let signers = crate::peer::tests::signers(&env);
             let cache = CacheId("cccccccc-1111-4111-8111-111111111111".into());
             let mut limits = crate::test_support::cluster::config(false).limits;
             // One pooled page: a second charge would exceed the limit.
@@ -1852,7 +1853,8 @@ pub(crate) mod tests {
         }
         #[test]
         fn received_aligned_body_becomes_disk_aligned_page_and_rejects_mismatches() {
-            let signers = crate::peer::tests::signers();
+            let env = racer_io::Env::host();
+            let signers = crate::peer::tests::signers(&env);
             let cache = CacheId("cccccccc-1111-4111-8111-111111111111".into());
             let limits = crate::test_support::cluster::config(false).limits;
             let admission = Rc::new(flow_control::Quotas::new(AdmissionPolicy::new(
@@ -2088,7 +2090,8 @@ pub(crate) mod tests {
         }
         #[test]
         fn maximum_signed_heads_and_hop_count_fit_outer_signature_profile() {
-            let signers = crate::test_support::security::network(2);
+            let env = racer_io::Env::host();
+            let signers = crate::test_support::security::network(&env, 2);
             let mut head = MessageHead {
                 start: StartLine::Response { status: 200 },
                 headers: vec![
@@ -2183,8 +2186,8 @@ pub(crate) mod tests {
                 .unwrap()
                 .0
         }
-        pub(crate) fn pair() -> (Session, Session) {
-            let n = crate::test_support::security::network(3);
+        pub(crate) fn pair(env: &racer_io::Env) -> (Session, Session) {
+            let n = crate::test_support::security::network(env, 3);
             let id = random().unwrap();
             (
                 peer_wire::test_util::session(n[0].inner.clone(), &n[1].inner, id, 0),
@@ -2227,7 +2230,8 @@ pub(crate) mod tests {
         }
         #[test]
         fn historical_proof_requires_fresh_head_and_session_cannot_be_reinstalled() {
-            let (mut a, mut b) = pair();
+            let env = racer_io::Env::host();
+            let (mut a, mut b) = pair(&env);
             let mut original = frame();
             push(&mut original, "racer-receiver", &a.peer.0);
             let proof = std::sync::Arc::new(a.signatures.sign(original).unwrap());
@@ -2263,14 +2267,11 @@ pub(crate) mod tests {
         }
         #[test]
         fn parallel_connections_isolate_counters_and_wall_rollback_cannot_resurrect_frames() {
-            let clock = crate::rt::environment::SimulationClock::new_at(
-                92,
-                Instant::now(),
-                std::time::SystemTime::now(),
-            );
-            let environment = clock.environment(1);
-            let _guard = environment.enter();
-            let (mut a, mut b) = pair();
+            let clock =
+                racer_io::SimClock::new_at(92, Instant::now(), std::time::SystemTime::now());
+            let environment = clock.ctx(1);
+            let env = racer_io::Env::new(racer_io::Driver::Uring, environment.clone());
+            let (mut a, mut b) = pair(&env);
             let id = random().unwrap();
             let mut other_a =
                 peer_wire::test_util::session(a.signatures.clone(), &b.signatures, id, 0);
@@ -2282,7 +2283,7 @@ pub(crate) mod tests {
             assert_eq!(other_b.rx, 0);
             other_b.admit(other_a.sign(frame()).unwrap()).unwrap();
             clock.advance(Duration::from_secs(61));
-            clock.set_wall_time(crate::rt::environment::wall_now() - Duration::from_secs(61));
+            clock.set_wall_time(env.ctx.clock.wall_now() - Duration::from_secs(61));
             assert!(b.admit(old).is_err());
             assert_eq!(b.rx, 1);
             b.admit(a.sign(frame()).unwrap()).unwrap();
@@ -2290,15 +2291,12 @@ pub(crate) mod tests {
         }
         #[test]
         pub(crate) fn more_than_4096_frames_at_fixed_time_have_constant_session_storage() {
-            let clock = crate::rt::environment::SimulationClock::new_at(
-                71,
-                Instant::now(),
-                std::time::SystemTime::now(),
-            );
-            let environment = clock.environment(0);
-            let _guard = environment.enter();
-            let (mut a, mut b) = pair();
-            let now = crate::rt::environment::wall_now();
+            let clock =
+                racer_io::SimClock::new_at(71, Instant::now(), std::time::SystemTime::now());
+            let environment = clock.ctx(0);
+            let env = racer_io::Env::new(racer_io::Driver::Uring, environment.clone());
+            let (mut a, mut b) = pair(&env);
+            let now = env.ctx.clock.wall_now();
             let bytes = std::mem::size_of_val(&a) + std::mem::size_of_val(&b);
             for sequence in 1..=5000 {
                 let h = a.sign(frame()).unwrap();
@@ -2325,11 +2323,12 @@ pub(crate) mod tests {
         }
         #[test]
         fn loopback_mutual_authentication_pool_reuse_and_fresh_reconnect() {
-            let n = crate::test_support::security::network(2);
+            let env = racer_io::Env::host();
+            let n = crate::test_support::security::network(&env, 2);
             let admission = Rc::new(flow_control::Quotas::new(AdmissionPolicy::new(
                 crate::test_support::cluster::config(false).limits,
             )));
-            let reactor = Rc::new(Reactor::new(admission.clone(), &crate::test_support::env()));
+            let reactor = Rc::new(Reactor::new(admission.clone(), &env));
             let io = crate::http::new_io(
                 reactor.clone(),
                 Codec::new(MAX_ENVELOPE_HEAD),
@@ -2395,7 +2394,8 @@ pub(crate) mod tests {
         }
         #[test]
         pub(crate) fn signed_challenges_bind_both_identities_protocol_and_fresh_randomness() {
-            let n = crate::test_support::security::network(3);
+            let env = racer_io::Env::host();
+            let n = crate::test_support::security::network(&env, 3);
             let a = random().unwrap();
             let b = random().unwrap();
             assert_ne!(a, random().unwrap());
@@ -2444,7 +2444,8 @@ pub(crate) mod tests {
         }
         #[test]
         fn handshake_codec_bounds() {
-            let n = crate::test_support::security::network(2);
+            let env = racer_io::Env::host();
+            let n = crate::test_support::security::network(&env, 2);
             let h = session_head(
                 &n[1],
                 n[0].node(),
@@ -2475,11 +2476,12 @@ pub(crate) mod tests {
         #[test]
         fn socket_admission_rejects_replay_before_dispatch_and_closes_pool_slot() {
             use racer_io::ring::IoBuffer;
-            let n = crate::test_support::security::network(2);
+            let env = racer_io::Env::host();
+            let n = crate::test_support::security::network(&env, 2);
             let admission = Rc::new(flow_control::Quotas::new(AdmissionPolicy::new(
                 crate::test_support::cluster::config(false).limits,
             )));
-            let reactor = Rc::new(Reactor::new(admission.clone(), &crate::test_support::env()));
+            let reactor = Rc::new(Reactor::new(admission.clone(), &env));
             let io = crate::http::new_io(reactor.clone(), Codec::new(65536), admission.clone(), 0);
             let scope =
                 RequestScope::host(RequestId([2; 16]), Instant::now() + Duration::from_secs(10))
@@ -2527,7 +2529,8 @@ pub(crate) mod tests {
         #[test]
         fn handshake_reads_a_refusal_as_overloaded() {
             use std::io::Write;
-            let n = crate::test_support::security::network(2);
+            let env = racer_io::Env::host();
+            let n = crate::test_support::security::network(&env, 2);
             let overloaded = Codec::new(65536)
                 .encode_head(&peer_wire::overloaded_head())
                 .unwrap();
@@ -2538,7 +2541,7 @@ pub(crate) mod tests {
                 let admission = Rc::new(flow_control::Quotas::new(AdmissionPolicy::new(
                     crate::test_support::cluster::config(false).limits,
                 )));
-                let reactor = Rc::new(Reactor::new(admission.clone(), &crate::test_support::env()));
+                let reactor = Rc::new(Reactor::new(admission.clone(), &env));
                 let io =
                     crate::http::new_io(reactor.clone(), Codec::new(65536), admission.clone(), 0);
                 let scope = RequestScope::host(
@@ -2559,12 +2562,13 @@ pub(crate) mod tests {
         }
         #[test]
         fn handshake_cancel_expiry_and_abandonment_retain_only_fenced_admissions() {
-            let n = crate::test_support::security::network(2);
+            let env = racer_io::Env::host();
+            let n = crate::test_support::security::network(&env, 2);
             for end in ["cancel", "expiry", "drop"] {
                 let admission = Rc::new(flow_control::Quotas::new(AdmissionPolicy::new(
                     crate::test_support::cluster::config(false).limits,
                 )));
-                let reactor = Rc::new(Reactor::new(admission.clone(), &crate::test_support::env()));
+                let reactor = Rc::new(Reactor::new(admission.clone(), &env));
                 reactor.init().unwrap();
                 let io =
                     crate::http::new_io(reactor.clone(), Codec::new(65536), admission.clone(), 0);
@@ -2738,7 +2742,8 @@ pub(crate) mod tests {
         #[test]
         fn request_mac_rotates_and_rejects_missing_retired_or_mutated_tags() {
             use racer_wire::control::*;
-            let network = network(2);
+            let env = racer_io::Env::host();
+            let network = network(&env, 2);
             let make = || {
                 let mut request = head(1);
                 request
@@ -2795,7 +2800,8 @@ pub(crate) mod tests {
         }
         #[test]
         pub(crate) fn malformed_fields_unknown_algorithm_and_historical_expiry() {
-            let n = network(2);
+            let env = racer_io::Env::host();
+            let n = network(&env, 2);
             let original = n[0].sign(head(1)).unwrap();
             let mut duplicate = clone_head(&original);
             push(&mut duplicate.head, "Racer-Kind", "test");
@@ -2879,12 +2885,13 @@ pub(crate) mod tests {
 
         #[test]
         fn untimed_scope_wire_deadline_is_bounded() {
+            let env = racer_io::Env::host();
             let scope =
                 crate::runtime::RequestScope::untimed(RequestId([7; 16]), racer_io::Clock::host())
                     .unwrap();
             let before = Instant::now();
             let encoded = encode_deadline(scope.clock(), scope.deadline).unwrap();
-            let decoded = decode_deadline(&crate::test_support::clock(), encoded).unwrap();
+            let decoded = decode_deadline(&env.ctx.clock, encoded).unwrap();
             assert!(decoded.0 <= Instant::now() + MAX_WIRE_DEADLINE_HORIZON);
             assert!(decoded.0 + Duration::from_secs(1) >= before + MAX_WIRE_DEADLINE_HORIZON);
             let near = Deadline(before + Duration::from_secs(30));
@@ -2892,6 +2899,7 @@ pub(crate) mod tests {
         }
         #[test]
         fn canonical_binary_numbers_node_lists_and_deadline_round_trip() {
+            let env = racer_io::Env::host();
             assert_eq!(binary(&[0, 1, 255]), "AAH/");
             assert!(decode_binary(b"YQ").is_err());
             assert!(decode_binary(b"YR==").is_err());
@@ -2921,12 +2929,9 @@ pub(crate) mod tests {
             }
             assert!(decode_nodes(binary(&duplicate).as_bytes()).is_err());
             let deadline = Deadline(Instant::now() + Duration::from_secs(30));
-            let encoded = encode_deadline(&crate::test_support::clock(), deadline).unwrap();
-            let decoded = decode_deadline(&crate::test_support::clock(), encoded).unwrap();
-            assert_eq!(
-                encode_deadline(&crate::test_support::clock(), decoded).unwrap(),
-                encoded
-            );
+            let encoded = encode_deadline(&env.ctx.clock, deadline).unwrap();
+            let decoded = decode_deadline(&env.ctx.clock, encoded).unwrap();
+            assert_eq!(encode_deadline(&env.ctx.clock, decoded).unwrap(), encoded);
             assert!(decoded.0 <= deadline.0);
             const { assert!(MAX_SIGNED_HEAD <= MAX_HEAD) };
         }

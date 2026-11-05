@@ -43,11 +43,12 @@ fn assert_retains_nothing(f: &Fixture) {
 /// returns the same bytes, retains nothing, and asks origin every time.
 #[test]
 fn passthrough_reads_refetch_from_origin_and_retain_nothing() {
+    let env = racer_io::Env::host();
     for mode in [CacheMode::Cached, MODES[0], MODES[1]] {
         let queue = Rc::new(crate::drivers::DriverQueue::new(1024));
         let _queue = queue.enter();
-        let mut f = fixture();
-        f.set_mode(mode);
+        let mut f = fixture(&env);
+        f.set_mode(&env, mode);
         for read in 1..=3 {
             let result = acquire_plain(&mut f).unwrap();
             assert_eq!(result.plaintext.bytes(), b"abc");
@@ -74,11 +75,12 @@ fn passthrough_reads_refetch_from_origin_and_retain_nothing() {
 /// keeps neither the ciphertext nor a disk copy.
 #[test]
 fn passthrough_owner_ciphertext_fill_retains_nothing() {
+    let env = racer_io::Env::host();
     for mode in MODES {
         let queue = Rc::new(crate::drivers::DriverQueue::new(1024));
         let _queue = queue.enter();
-        let mut f = fixture();
-        f.set_mode(mode);
+        let mut f = fixture(&env);
+        f.set_mode(&env, mode);
         for read in 1..=2 {
             let copy = acquire_cipher(&mut f).unwrap();
             assert_eq!(copy.metadata.version, f.page.version);
@@ -93,11 +95,12 @@ fn passthrough_owner_ciphertext_fill_retains_nothing() {
 /// of them, and the page is gone once they finish.
 #[test]
 fn passthrough_concurrent_reads_coalesce_into_one_origin_call() {
+    let env = racer_io::Env::host();
     for mode in MODES {
         let queue = Rc::new(crate::drivers::DriverQueue::new(1024));
         let _queue = queue.enter();
-        let mut f = fixture();
-        f.set_mode(mode);
+        let mut f = fixture(&env);
+        f.set_mode(&env, mode);
         f.origin.blocked_pages.borrow_mut().insert(0);
         let mut budgets: Vec<_> = (0..3)
             .map(|_| AcquisitionBudget::new(f.scope.deadline.0, 4, 8))
@@ -155,9 +158,10 @@ fn passthrough_concurrent_reads_coalesce_into_one_origin_call() {
 /// the page: the fixture's requester panics if any peer is contacted.
 #[test]
 fn passthrough_local_route_never_asks_page_owners() {
+    let env = racer_io::Env::host();
     let queue = Rc::new(crate::drivers::DriverQueue::new(1024));
     let _queue = queue.enter();
-    let mut f = fixture();
+    let mut f = fixture(&env);
     let local = f.fill.dependencies.candidates.node.clone();
     let mut members: Vec<_> = (0..8)
         .map(|i| Member {
@@ -183,7 +187,7 @@ fn passthrough_local_route_never_asks_page_owners() {
         !ranked.ordered.contains(&local),
         "the fixture node must not own the page"
     );
-    f.set_mode(CacheMode::PassthroughLocal);
+    f.set_mode(&env, CacheMode::PassthroughLocal);
     let result = acquire_plain(&mut f).unwrap();
     assert_eq!(result.plaintext.bytes(), b"abc");
     let copy = acquire_cipher(&mut f).unwrap();
@@ -198,7 +202,8 @@ fn passthrough_local_route_never_asks_page_owners() {
 /// grant names this node, the exact object, and the exact page.
 #[test]
 fn local_origin_authority_requires_local_route() {
-    let f = fixture();
+    let env = racer_io::Env::host();
+    let f = fixture(&env);
     let policy = &f.fill.dependencies.candidates;
     for mode in [CacheMode::Cached, CacheMode::PassthroughPeers] {
         assert_eq!(
@@ -262,10 +267,11 @@ fn local_origin_authority_requires_local_route() {
 /// and switching back to cached retains pages again.
 #[test]
 fn residual_pages_are_not_served_after_switching_to_passthrough() {
+    let env = racer_io::Env::host();
     for mode in MODES {
         let queue = Rc::new(crate::drivers::DriverQueue::new(1024));
         let _queue = queue.enter();
-        let mut f = fixture();
+        let mut f = fixture(&env);
         let cached = acquire_plain(&mut f).unwrap();
         assert!(
             f.fill
@@ -276,7 +282,7 @@ fn residual_pages_are_not_served_after_switching_to_passthrough() {
                 .is_some()
         );
         assert!(f.fill.holds(&f.page));
-        f.set_mode(mode);
+        f.set_mode(&env, mode);
         assert!(f.fill.dependencies.memory.get(&f.page).unwrap().is_none());
         assert!(
             f.fill
@@ -301,7 +307,7 @@ fn residual_pages_are_not_served_after_switching_to_passthrough() {
             .writer
             .remove_cache(&f.context.object.cache)
             .unwrap();
-        f.set_mode(CacheMode::Cached);
+        f.set_mode(&env, CacheMode::Cached);
         acquire_plain(&mut f).unwrap();
         acquire_plain(&mut f).unwrap();
         assert_eq!(f.origin.calls.get(), 3, "{mode:?}");
@@ -311,9 +317,10 @@ fn residual_pages_are_not_served_after_switching_to_passthrough() {
 /// A disk copy written before a switch to passthrough is not read back.
 #[test]
 fn residual_disk_copy_is_not_served_after_switching_to_passthrough() {
+    let env = racer_io::Env::host();
     let queue = Rc::new(crate::drivers::DriverQueue::new(1024));
     let _queue = queue.enter();
-    let mut f = fixture();
+    let mut f = fixture(&env);
     let result = acquire_plain(&mut f).unwrap();
     let deps = f.fill.dependencies.clone();
     let dirty = deps
@@ -329,7 +336,7 @@ fn residual_disk_copy_is_not_served_after_switching_to_passthrough() {
     drive_disk(&f, deps.writer.progress(8, &f.scope)).unwrap();
     assert!(deps.writer.index().lookup(&f.page).unwrap().is_some());
     deps.memory.remove_cache(&f.context.object.cache).unwrap();
-    f.set_mode(CacheMode::PassthroughPeers);
+    f.set_mode(&env, CacheMode::PassthroughPeers);
     acquire_plain(&mut f).unwrap();
     assert_eq!(f.origin.calls.get(), 2);
     assert_eq!(f.fill.metrics.count(Event::DiskHit), 0);
@@ -342,18 +349,20 @@ fn passthrough_metadata_is_revalidated_on_every_read() {
     use crate::model::MetadataSelector;
     use crate::test_support::origin::AdapterOrigin;
     use crate::test_support::origin::RequestKind;
+    let env = racer_io::Env::host();
     for mode in [CacheMode::Cached, MODES[0], MODES[1]] {
         let queue = Rc::new(crate::drivers::DriverQueue::new(1024));
         let _queue = queue.enter();
-        let mut f = fixture();
-        f.set_mode(mode);
+        let mut f = fixture(&env);
+        f.set_mode(&env, mode);
         let mut metadata = f.origin.metadata.clone();
         metadata.expires_at = crate::model::ExpiresAt::test_time(
             std::time::SystemTime::now() + Duration::from_secs(3600),
         );
         let adapter = AdapterOrigin::new("fixture", metadata.clone());
-        let index = f.metadata_index(8);
-        let service = f.metadata_service_with_index(adapter_client(&f, &adapter), 1, index.clone());
+        let index = f.metadata_index(&env, 8);
+        let service =
+            f.metadata_service_with_index(adapter_client(&env, &f, &adapter), 1, index.clone());
         for read in 1..=3 {
             let resolved = drive_io(
                 service.resolve(
@@ -398,16 +407,22 @@ fn passthrough_metadata_is_revalidated_on_every_read() {
 #[test]
 fn passthrough_refuses_holds_and_prefetch_fills() {
     use crate::test_support::security::network;
+    let env = racer_io::Env::host();
     for mode in [CacheMode::Cached, MODES[0], MODES[1]] {
         let queue = Rc::new(crate::drivers::DriverQueue::new(1024));
         let _queue = queue.enter();
-        let signers = network(1);
-        let mut f = fixture_with(PAGE_BYTES + 7, None);
+        let signers = network(&env, 1);
+        let mut f = fixture_with(&env, PAGE_BYTES + 7, None);
         f.reactor.init().unwrap();
-        f.set_mode(mode);
+        f.set_mode(&env, mode);
         let membership = f.membership.clone();
-        let (_local, mut endpoint, _publication) =
-            super::hot_reads::coordinator(&f, &signers[0], &membership, NoPeer::requester());
+        let (_local, mut endpoint, _publication) = super::hot_reads::coordinator(
+            &env,
+            &f,
+            &signers[0],
+            &membership,
+            NoPeer::requester(&env),
+        );
         let directory = f.fill.dependencies.metadata_owner.clone();
         let until = racer_io::Clock::host().wall_now() + Duration::from_secs(60);
         let mut cx = Context::from_waker(futures::task::noop_waker_ref());
@@ -465,15 +480,21 @@ fn passthrough_refuses_holds_and_prefetch_fills() {
 #[test]
 fn queued_publication_is_dropped_after_switching_to_passthrough() {
     use crate::test_support::security::network;
+    let env = racer_io::Env::host();
     for mode in [CacheMode::Cached, MODES[0], MODES[1]] {
         let queue = Rc::new(crate::drivers::DriverQueue::new(1024));
         let _queue = queue.enter();
-        let signers = network(1);
-        let mut f = fixture_with(PAGE_BYTES + 7, None);
+        let signers = network(&env, 1);
+        let mut f = fixture_with(&env, PAGE_BYTES + 7, None);
         f.reactor.init().unwrap();
         let membership = f.membership.clone();
-        let (local, mut endpoint, _publication) =
-            super::hot_reads::coordinator(&f, &signers[0], &membership, NoPeer::requester());
+        let (local, mut endpoint, _publication) = super::hot_reads::coordinator(
+            &env,
+            &f,
+            &signers[0],
+            &membership,
+            NoPeer::requester(&env),
+        );
         let directory = f.fill.dependencies.metadata_owner.clone();
         let mut metadata = f.origin.metadata.immutable();
         metadata.version.etag = StrongEtag::test_value("queued-publish");
@@ -481,7 +502,7 @@ fn queued_publication_is_dropped_after_switching_to_passthrough() {
         let mut cx = Context::from_waker(futures::task::noop_waker_ref());
         // The cached fill queues its publication before the mode switch.
         let mut future = directory.queue_publication(metadata, &f.scope).unwrap();
-        f.set_mode(mode);
+        f.set_mode(&env, mode);
         let mut output = None;
         for _ in 0..4096 {
             if let Poll::Ready(result) = future.as_mut().poll(&mut cx) {
@@ -505,20 +526,26 @@ fn queued_publication_is_dropped_after_switching_to_passthrough() {
 fn delayed_retained_metadata_is_dropped_after_switching_to_passthrough() {
     use crate::model::MetadataSelector;
     use crate::test_support::security::network;
+    let env = racer_io::Env::host();
     for mode in [CacheMode::Cached, MODES[0], MODES[1]] {
         let queue = Rc::new(crate::drivers::DriverQueue::new(1024));
         let _queue = queue.enter();
-        let signers = network(1);
-        let mut f = fixture_with(PAGE_BYTES + 7, None);
+        let signers = network(&env, 1);
+        let mut f = fixture_with(&env, PAGE_BYTES + 7, None);
         f.reactor.init().unwrap();
         let membership = f.membership.clone();
         // A cached read leaves page zero and its metadata in owner memory.
         acquire_plain(&mut f).unwrap();
         let version = f.page.version.clone();
-        let index = f.metadata_index(8);
+        let index = f.metadata_index(&env, 8);
         let service = f.metadata_service_with_index(f.origin.clone(), 8, index.clone());
-        let (_local, mut endpoint, _publication) =
-            super::hot_reads::coordinator(&f, &signers[0], &membership, NoPeer::requester());
+        let (_local, mut endpoint, _publication) = super::hot_reads::coordinator(
+            &env,
+            &f,
+            &signers[0],
+            &membership,
+            NoPeer::requester(&env),
+        );
         let directory = f.fill.dependencies.metadata_owner.clone();
         let mut cx = Context::from_waker(futures::task::noop_waker_ref());
         // The lookup queues its retained-metadata request before the owner runs.
@@ -533,7 +560,7 @@ fn delayed_retained_metadata_is_dropped_after_switching_to_passthrough() {
         for _ in 0..64 {
             pump_worker(&mut endpoint, &mut f.engine, &f.crypto, &f.reactor);
         }
-        f.set_mode(mode);
+        f.set_mode(&env, mode);
         let mut output = None;
         for _ in 0..4096 {
             if let Poll::Ready(result) = lookup.as_mut().poll(&mut cx) {
@@ -545,7 +572,7 @@ fn delayed_retained_metadata_is_dropped_after_switching_to_passthrough() {
         drop(lookup);
         let found = output.expect("lookup did not complete").unwrap();
         assert_eq!(found.is_some(), !mode.passthrough(), "{mode:?}");
-        f.set_mode(CacheMode::Cached);
+        f.set_mode(&env, CacheMode::Cached);
         let published = index.version(&version).unwrap();
         assert_eq!(published.is_some(), !mode.passthrough(), "{mode:?}");
         endpoint.uninstall().unwrap();
@@ -560,19 +587,26 @@ fn passthrough_stream_keeps_its_whole_window_of_origin_reads_in_flight() {
     use super::hot_reads::{coordinator_with_window, local_membership};
     use crate::client::{ClientRequest, ReadKind};
     use crate::test_support::security::network;
+    let env = racer_io::Env::host();
     const WINDOW: usize = 4;
     for mode in MODES {
         let queue = Rc::new(crate::drivers::DriverQueue::new(1024));
         let _owner = queue.enter();
-        let signers = network(1);
-        let mut f = fixture_with(6 * PAGE_BYTES + 7, None);
+        let signers = network(&env, 1);
+        let mut f = fixture_with(&env, 6 * PAGE_BYTES + 7, None);
         f.reactor.init().unwrap();
-        f.set_mode(mode);
+        f.set_mode(&env, mode);
         // Passthrough revalidates metadata on every read.
         f.origin.serve_metadata.set(true);
         let membership = local_membership(&signers[0]);
-        let (local, mut endpoint, _publication) =
-            coordinator_with_window(&f, &signers[0], &membership, NoPeer::requester(), WINDOW);
+        let (local, mut endpoint, _publication) = coordinator_with_window(
+            &env,
+            &f,
+            &signers[0],
+            &membership,
+            NoPeer::requester(&env),
+            WINDOW,
+        );
         f.origin.blocked_pages.borrow_mut().extend(0..7);
         let scope = RequestScope::host(f.scope.request, f.scope.deadline.0).unwrap();
         let request = ClientRequest {
@@ -620,14 +654,15 @@ fn passthrough_pinned_origin_miss_keeps_transient_predecessors_retryable() {
     use crate::model::MetadataSelector;
     use crate::read::candidates::ProbeOutcome;
     use crate::test_support::origin::AdapterOrigin;
+    let env = racer_io::Env::host();
     for mode in MODES {
         let queue = Rc::new(crate::drivers::DriverQueue::new(1024));
         let _queue = queue.enter();
-        let mut f = fixture();
-        f.set_mode(mode);
+        let mut f = fixture(&env);
+        f.set_mode(&env, mode);
         let adapter = AdapterOrigin::new("fixture", f.origin.metadata.clone());
-        let index = f.metadata_index(8);
-        let service = f.metadata_service_with_index(adapter_client(&f, &adapter), 1, index);
+        let index = f.metadata_index(&env, 8);
+        let service = f.metadata_service_with_index(adapter_client(&env, &f, &adapter), 1, index);
         let selector = MetadataSelector::Pinned(f.origin.metadata.version.etag.clone());
         for (evidence, expected) in [
             (vec![], Error::VersionUnavailable),

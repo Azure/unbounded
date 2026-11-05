@@ -6,9 +6,10 @@ use racer_wire::control::CacheId;
 mod fill;
 
 /// Keep a live cache graph for mailbox admission tests without activating listeners.
-pub(super) fn admission_coordinator() -> (Rc<Coordinator>, impl Sized) {
-    let f = fill::fixture();
+pub(super) fn admission_coordinator(env: &racer_io::Env) -> (Rc<Coordinator>, impl Sized) {
+    let f = fill::fixture(env);
     let (local, endpoint, _) = f.read_graph(
+        env,
         Rc::new(f.fill.clone()),
         &f.membership,
         fill::ReadGraphSettings {
@@ -222,12 +223,16 @@ mod flight {
         /// Expiry sampling is bounded and does not confuse table and quota ownership.
         #[test]
         fn expiry_snapshot_coverage_completion_and_external_credit() {
+            let env = racer_io::Env::host();
             for count in [0, 6, 9] {
-                let flights = flights(FlightLimits {
-                    entries: 16,
-                    ..FlightLimits::default()
-                });
-                let (context, scope) = (origin(), scope());
+                let flights = flights(
+                    &env,
+                    FlightLimits {
+                        entries: 16,
+                        ..FlightLimits::default()
+                    },
+                );
+                let (context, scope) = (origin(), scope(&env));
                 let mut budgets: Vec<_> = (0..count).map(|_| budget()).collect();
                 let membership = std::sync::Arc::new(
                     crate::topology::Membership::validate(
@@ -291,18 +296,21 @@ mod flight {
         #[test]
         fn expiry_snapshot_prior_cap_can_be_free_at_expiry() {
             use std::future::Future;
-            let clock = crate::rt::environment::SimulationClock::new(742);
-            let _environment = clock.environment(0).enter();
-            let flights = flights(FlightLimits {
-                entries: 1,
-                ..FlightLimits::default()
-            });
+            let clock = racer_io::SimClock::new(742);
+            let env = racer_io::Env::new(racer_io::Driver::Uring, clock.ctx(0));
+            let flights = flights(
+                &env,
+                FlightLimits {
+                    entries: 1,
+                    ..FlightLimits::default()
+                },
+            );
             let failures = crate::telemetry::Failures::default();
             flights
                 .admission
                 .policy()
                 .set_observer(failures.observer(crate::model::WorkerId(0)));
-            let (context, scope) = (origin(), scope());
+            let (context, scope) = (origin(), scope(&env));
             let (mut first_budget, mut next_budget) = (budget(), budget());
             let first = join(&flights, &context, &scope, &mut first_budget);
             let mut page = test_page();
@@ -343,20 +351,23 @@ mod flight {
         #[test]
         fn expiry_snapshot_scope_deadline_is_excluded() {
             use std::future::Future;
-            let clock = crate::rt::environment::SimulationClock::new(743);
-            let sim_env = clock.environment(0);
-            let _environment = sim_env.enter();
-            let sim_ctx = sim_env.worker_ctx();
-            let flights = flights(FlightLimits {
-                entries: 1,
-                ..FlightLimits::default()
-            });
+            let clock = racer_io::SimClock::new(743);
+            let sim_env = clock.ctx(0);
+            let env = racer_io::Env::new(racer_io::Driver::Uring, sim_env.clone());
+            let sim_ctx = sim_env.clone();
+            let flights = flights(
+                &env,
+                FlightLimits {
+                    entries: 1,
+                    ..FlightLimits::default()
+                },
+            );
             let failures = crate::telemetry::Failures::default();
             flights
                 .admission
                 .policy()
                 .set_observer(failures.observer(crate::model::WorkerId(0)));
-            let (context, owner_scope) = (origin(), scope());
+            let (context, owner_scope) = (origin(), scope(&env));
             let short = RequestScope::on(
                 &sim_ctx.clock,
                 crate::model::RequestId([3; 16]),
@@ -393,12 +404,16 @@ mod flight {
         #[test]
         fn bounded_admission_absent_budget_precedes_fifo_with_existing_ready_control() {
             use std::future::Future;
+            let env = racer_io::Env::host();
             for partial in [false, true] {
-                let flights = flights(FlightLimits {
-                    entries: 1,
-                    ..FlightLimits::default()
-                });
-                let (context, scope) = (origin(), scope());
+                let flights = flights(
+                    &env,
+                    FlightLimits {
+                        entries: 1,
+                        ..FlightLimits::default()
+                    },
+                );
+                let (context, scope) = (origin(), scope(&env));
                 let (mut active_budget, mut queued_budget) = (budget(), budget());
                 let mut active = join(&flights, &context, &scope, &mut active_budget);
                 let membership = active.membership.clone();
@@ -499,11 +514,15 @@ mod flight {
         #[test]
         fn bounded_admission_head_cancel_wakes_queued_successor() {
             use std::future::Future;
-            let flights = flights(FlightLimits {
-                entries: 1,
-                ..FlightLimits::default()
-            });
-            let (context, scope, canceled) = (origin(), scope(), scope());
+            let env = racer_io::Env::host();
+            let flights = flights(
+                &env,
+                FlightLimits {
+                    entries: 1,
+                    ..FlightLimits::default()
+                },
+            );
+            let (context, scope, canceled) = (origin(), scope(&env), scope(&env));
             let (mut active_budget, mut head_budget, mut tail_budget) =
                 (budget(), budget(), budget());
             let active = join(&flights, &context, &scope, &mut active_budget);
@@ -553,12 +572,13 @@ mod flight {
         #[test]
         fn bounded_admission_queue_overflow_and_head_cancel() {
             use std::future::Future;
+            let env = racer_io::Env::host();
             let mut limits = crate::test_support::cluster::config(false).limits;
             limits.queue_entries = std::num::NonZeroUsize::new(1).unwrap();
             let flights = Rc::new(
                 Flights::with_limits(
                     Rc::new(flow_control::Quotas::new(AdmissionPolicy::new(limits))),
-                    crate::test_support::availability(),
+                    crate::test_support::availability(&env),
                     FlightLimits {
                         entries: 1,
                         ..FlightLimits::default()
@@ -572,7 +592,7 @@ mod flight {
                 .admission
                 .policy()
                 .set_observer(failures.observer(crate::model::WorkerId(0)));
-            let (context, scope, head_scope) = (origin(), scope(), scope());
+            let (context, scope, head_scope) = (origin(), scope(&env), scope(&env));
             let (mut active_budget, mut head_budget, mut next_budget) =
                 (budget(), budget(), budget());
             let active = join(&flights, &context, &scope, &mut active_budget);
@@ -624,11 +644,15 @@ mod flight {
         #[test]
         fn bounded_admission_fast_path_and_cancel_cleanup() {
             use std::future::Future;
-            let flights = flights(FlightLimits {
-                entries: 1,
-                ..FlightLimits::default()
-            });
-            let (context, scope, canceled) = (origin(), scope(), scope());
+            let env = racer_io::Env::host();
+            let flights = flights(
+                &env,
+                FlightLimits {
+                    entries: 1,
+                    ..FlightLimits::default()
+                },
+            );
+            let (context, scope, canceled) = (origin(), scope(&env), scope(&env));
             let (mut first_budget, mut second_budget) = (budget(), budget());
             let membership = std::sync::Arc::new(
                 crate::topology::Membership::validate(
@@ -678,11 +702,15 @@ mod flight {
         #[test]
         fn bounded_admission_drain_waits_for_ticket_retirement() {
             use std::future::Future;
-            let flights = flights(FlightLimits {
-                entries: 1,
-                ..FlightLimits::default()
-            });
-            let (context, scope) = (origin(), scope());
+            let env = racer_io::Env::host();
+            let flights = flights(
+                &env,
+                FlightLimits {
+                    entries: 1,
+                    ..FlightLimits::default()
+                },
+            );
+            let (context, scope) = (origin(), scope(&env));
             let (mut first_budget, mut next_budget) = (budget(), budget());
             let active = join(&flights, &context, &scope, &mut first_budget);
             let mut page = test_page();
@@ -713,15 +741,18 @@ mod flight {
         fn bounded_admission_original_deadline_and_allowance_are_distinct() {
             use std::future::Future;
             for original_expires in [false, true] {
-                let clock = crate::rt::environment::SimulationClock::new(741);
-                let sim_env = clock.environment(0);
-                let _environment = sim_env.enter();
-                let sim_ctx = sim_env.worker_ctx();
+                let clock = racer_io::SimClock::new(741);
+                let sim_env = clock.ctx(0);
+                let env = racer_io::Env::new(racer_io::Driver::Uring, sim_env.clone());
+                let sim_ctx = sim_env.clone();
                 let now = sim_ctx.clock.now();
-                let flights = flights(FlightLimits {
-                    entries: 1,
-                    ..FlightLimits::default()
-                });
+                let flights = flights(
+                    &env,
+                    FlightLimits {
+                        entries: 1,
+                        ..FlightLimits::default()
+                    },
+                );
                 let failures = crate::telemetry::Failures::default();
                 flights
                     .admission
@@ -815,11 +846,15 @@ mod flight {
         #[test]
         fn bounded_admission_queued_same_page_bypasses_unrelated_head() {
             use std::future::Future;
-            let flights = flights(FlightLimits {
-                entries: 1,
-                ..FlightLimits::default()
-            });
-            let (context, scope) = (origin(), scope());
+            let env = racer_io::Env::host();
+            let flights = flights(
+                &env,
+                FlightLimits {
+                    entries: 1,
+                    ..FlightLimits::default()
+                },
+            );
+            let (context, scope) = (origin(), scope(&env));
             let (mut active_budget, mut first_budget, mut other_budget, mut same_budget) =
                 (budget(), budget(), budget(), budget());
             let active = join(&flights, &context, &scope, &mut active_budget);
@@ -866,11 +901,15 @@ mod flight {
         #[test]
         fn bounded_admission_waits_for_actual_completion_and_transfers_waiter() {
             use std::future::Future;
-            let flights = flights(FlightLimits {
-                entries: 1,
-                ..FlightLimits::default()
-            });
-            let (context, scope) = (origin(), scope());
+            let env = racer_io::Env::host();
+            let flights = flights(
+                &env,
+                FlightLimits {
+                    entries: 1,
+                    ..FlightLimits::default()
+                },
+            );
+            let (context, scope) = (origin(), scope(&env));
             let (mut first_budget, mut next_budget) = (budget(), budget());
             let mut first = join(&flights, &context, &scope, &mut first_budget);
             let membership = first.membership.clone();
@@ -904,11 +943,15 @@ mod flight {
         #[test]
         fn bounded_admission_fifo_drop_and_existing_page_bypass() {
             use std::future::Future;
-            let flights = flights(FlightLimits {
-                entries: 1,
-                ..FlightLimits::default()
-            });
-            let (context, scope) = (origin(), scope());
+            let env = racer_io::Env::host();
+            let flights = flights(
+                &env,
+                FlightLimits {
+                    entries: 1,
+                    ..FlightLimits::default()
+                },
+            );
+            let (context, scope) = (origin(), scope(&env));
             let (mut active_budget, mut head_budget, mut tail_budget, mut joined_budget) =
                 (budget(), budget(), budget(), budget());
             let active = join(&flights, &context, &scope, &mut active_budget);
@@ -953,8 +996,9 @@ mod flight {
         fn detached_copy_waiters_release_notifications_without_losing_live_wake() {
             use futures::Stream;
             use futures::stream::FuturesUnordered;
-            let flights = flights(FlightLimits::default());
-            let (context, supplier, readers) = (origin(), scope(), scope());
+            let env = racer_io::Env::host();
+            let flights = flights(&env, FlightLimits::default());
+            let (context, supplier, readers) = (origin(), scope(&env), scope(&env));
             let mut budget = budget();
             let mut supplier = join(&flights, &context, &supplier, &mut budget);
             let leader = lead(&mut supplier);
@@ -1011,10 +1055,11 @@ mod flight {
 
         #[test]
         fn worker_poll_drives_owned_completion_after_waiter_disappears() {
+            let env = racer_io::Env::host();
             let queue = Rc::new(crate::drivers::DriverQueue::new(1024));
             let _owner = queue.enter();
-            let flights = flights(FlightLimits::default());
-            let (context, scope) = (origin(), scope());
+            let flights = flights(&env, FlightLimits::default());
+            let (context, scope) = (origin(), scope(&env));
             let mut a_budget = budget();
             let mut a = join(&flights, &context, &scope, &mut a_budget);
             let leader = lead(&mut a);
@@ -1044,8 +1089,9 @@ mod flight {
         #[test]
         fn deadline_sweep_wakes_waiter_without_io_and_does_not_expire_other_callers() {
             use std::sync::Arc;
-            let flights = flights(FlightLimits::default());
-            let (context, scope_a, scope_b) = (origin(), scope(), scope());
+            let env = racer_io::Env::host();
+            let flights = flights(&env, FlightLimits::default());
+            let (context, scope_a, scope_b) = (origin(), scope(&env), scope(&env));
             let (mut a_budget, mut b_budget) = (budget(), budget());
             let mut a = join(&flights, &context, &scope_a, &mut a_budget);
             let mut b = join(&flights, &context, &scope_b, &mut b_budget);
@@ -1088,8 +1134,9 @@ mod flight {
 
         #[test]
         fn rejected_credentials_retry_only_after_completion_with_independent_budget() {
-            let flights = flights(FlightLimits::default());
-            let (context, scope_a, scope_b) = (origin(), scope(), scope());
+            let env = racer_io::Env::host();
+            let flights = flights(&env, FlightLimits::default());
+            let (context, scope_a, scope_b) = (origin(), scope(&env), scope(&env));
             let (mut a_budget, mut b_budget) = (budget(), budget());
             let mut a = join(&flights, &context, &scope_a, &mut a_budget);
             let mut b = join(&flights, &context, &scope_b, &mut b_budget);
@@ -1145,8 +1192,9 @@ mod flight {
         fn drop_leader_retains_resources_until_actual_completion_without_ticket() {
             use crate::telemetry::Gauge;
             use crate::telemetry::Metrics;
-            let flights = flights(FlightLimits::default());
-            let (context, scope_a, scope_b) = (origin(), scope(), scope());
+            let env = racer_io::Env::host();
+            let flights = flights(&env, FlightLimits::default());
+            let (context, scope_a, scope_b) = (origin(), scope(&env), scope(&env));
             let (mut a_budget, mut b_budget) = (budget(), budget());
             let mut a = join(&flights, &context, &scope_a, &mut a_budget);
             let mut b = join(&flights, &context, &scope_b, &mut b_budget);
@@ -1192,8 +1240,9 @@ mod flight {
 
         #[test]
         fn cancellation_reaps_independently_and_copy_never_elects() {
-            let flights = flights(FlightLimits::default());
-            let (context, scope_a, copy_scope) = (origin(), scope(), scope());
+            let env = racer_io::Env::host();
+            let flights = flights(&env, FlightLimits::default());
+            let (context, scope_a, copy_scope) = (origin(), scope(&env), scope(&env));
             let mut a_budget = budget();
             assert!(matches!(
                 flights.join_copy(&test_page(), &copy_scope),
@@ -1227,8 +1276,9 @@ mod flight {
         /// running acquisition: `acquiring` is true only while a leader runs.
         #[test]
         fn acquiring_only_while_a_leader_runs() {
-            let flights = flights(FlightLimits::default());
-            let (context, scope_a) = (origin(), scope());
+            let env = racer_io::Env::host();
+            let flights = flights(&env, FlightLimits::default());
+            let (context, scope_a) = (origin(), scope(&env));
             let mut a_budget = budget();
             let page = test_page();
             assert!(!flights.acquiring(&page));
@@ -1246,8 +1296,9 @@ mod flight {
         /// leading a second fill or spending its budget.
         #[test]
         fn canceled_leader_hands_running_operation_to_live_waiter() {
-            let flights = flights(FlightLimits::default());
-            let (context, scope_a, scope_b) = (origin(), scope(), scope());
+            let env = racer_io::Env::host();
+            let flights = flights(&env, FlightLimits::default());
+            let (context, scope_a, scope_b) = (origin(), scope(&env), scope(&env));
             let (mut a_budget, mut b_budget) = (budget(), budget());
             let mut a = join(&flights, &context, &scope_a, &mut a_budget);
             let mut b = join(&flights, &context, &scope_b, &mut b_budget);
@@ -1280,8 +1331,10 @@ mod flight {
         /// cancellation reported by the driver retries for an eligible waiter.
         #[test]
         fn handover_ends_with_last_adopter_and_caller_scope_failure_retries() {
-            let flights = flights(FlightLimits::default());
-            let (context, scope_a, scope_b, scope_c) = (origin(), scope(), scope(), scope());
+            let env = racer_io::Env::host();
+            let flights = flights(&env, FlightLimits::default());
+            let (context, scope_a, scope_b, scope_c) =
+                (origin(), scope(&env), scope(&env), scope(&env));
             let (mut a_budget, mut b_budget, mut c_budget) = (budget(), budget(), budget());
             let mut a = join(&flights, &context, &scope_a, &mut a_budget);
             let mut b = join(&flights, &context, &scope_b, &mut b_budget);
@@ -1307,7 +1360,7 @@ mod flight {
             ));
             drop((a, b, copy, leader));
 
-            let (scope_d, scope_e) = (scope(), scope());
+            let (scope_d, scope_e) = (scope(&env), scope(&env));
             let mut d = join(&flights, &context, &scope_d, &mut c_budget);
             let mut e_budget = budget();
             let mut e = join(&flights, &context, &scope_e, &mut e_budget);
@@ -1338,6 +1391,7 @@ mod flight {
         #[test]
         fn last_adopter_gone_wakes_driver_promptly() {
             use std::sync::atomic::{AtomicUsize, Ordering};
+            let env = racer_io::Env::host();
             struct Wakes(AtomicUsize);
             impl futures::task::ArcWake for Wakes {
                 fn wake_by_ref(arc_self: &std::sync::Arc<Self>) {
@@ -1347,8 +1401,9 @@ mod flight {
             let wakes = std::sync::Arc::new(Wakes(AtomicUsize::new(0)));
             let waker = futures::task::waker(wakes.clone());
             let cx = &mut Context::from_waker(&waker);
-            let flights = flights(FlightLimits::default());
-            let (context, scope_a, scope_b, scope_c) = (origin(), scope(), scope(), scope());
+            let flights = flights(&env, FlightLimits::default());
+            let (context, scope_a, scope_b, scope_c) =
+                (origin(), scope(&env), scope(&env), scope(&env));
             let (mut a_budget, mut b_budget, mut c_budget) = (budget(), budget(), budget());
             let mut a = join(&flights, &context, &scope_a, &mut a_budget);
             let b = join(&flights, &context, &scope_b, &mut b_budget);
@@ -1378,7 +1433,7 @@ mod flight {
             operation.complete().unwrap();
             let _ = flights.fail(leader, AcquisitionFailure::Terminal(Error::Cancelled));
             assert!(!flights.acquiring(&page));
-            let drain_scope = scope();
+            let drain_scope = scope(&env);
             assert!(
                 matches!(poll(flights.drain(&drain_scope)), Poll::Ready(Ok(()))),
                 "no flight charges remain"
@@ -1389,8 +1444,9 @@ mod flight {
         /// cancellation stands even when another waiter remains.
         #[test]
         fn without_handover_canceled_leader_revokes_running_operation() {
-            let flights = flights(FlightLimits::default());
-            let (context, scope_a, scope_b) = (origin(), scope(), scope());
+            let env = racer_io::Env::host();
+            let flights = flights(&env, FlightLimits::default());
+            let (context, scope_a, scope_b) = (origin(), scope(&env), scope(&env));
             let (mut a_budget, mut b_budget) = (budget(), budget());
             let mut a = join(&flights, &context, &scope_a, &mut a_budget);
             let mut b = join(&flights, &context, &scope_b, &mut b_budget);
@@ -1405,8 +1461,9 @@ mod flight {
 
         #[test]
         fn join_preserves_occupied_flight_until_operation_drains() {
-            let flights = flights(FlightLimits::default());
-            let (context, first_scope, next_scope) = (origin(), scope(), scope());
+            let env = racer_io::Env::host();
+            let flights = flights(&env, FlightLimits::default());
+            let (context, first_scope, next_scope) = (origin(), scope(&env), scope(&env));
             let (mut first_budget, mut next_budget) = (budget(), budget());
             let mut first = join(&flights, &context, &first_scope, &mut first_budget);
             let leader = lead(&mut first);
@@ -1431,6 +1488,7 @@ mod flight {
 
         #[test]
         fn waiter_replacement_drops_waker_outside_flight_borrow() {
+            let env = racer_io::Env::host();
             thread_local! {
                 static ON_DROP: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
                     std::cell::RefCell::new(None);
@@ -1450,8 +1508,8 @@ mod flight {
                 }
             }
             for copy in [false, true] {
-                let flights = flights(FlightLimits::default());
-                let (context, first_scope, next_scope) = (origin(), scope(), scope());
+                let flights = flights(&env, FlightLimits::default());
+                let (context, first_scope, next_scope) = (origin(), scope(&env), scope(&env));
                 let (mut first_budget, mut next_budget) = (budget(), budget());
                 let mut first = join(&flights, &context, &first_scope, &mut first_budget);
                 let leader = lead(&mut first);
@@ -1496,9 +1554,10 @@ mod flight {
 
         #[test]
         fn table_and_incarnation_fences_prevent_replacement_corruption() {
-            let first = flights(FlightLimits::default());
-            let other = flights(FlightLimits::default());
-            let (context, scope) = (origin(), scope());
+            let env = racer_io::Env::host();
+            let first = flights(&env, FlightLimits::default());
+            let other = flights(&env, FlightLimits::default());
+            let (context, scope) = (origin(), scope(&env));
             let (mut a_budget, mut b_budget) = (budget(), budget());
             let mut a = join(&first, &context, &scope, &mut a_budget);
             let leader = lead(&mut a);
@@ -1526,13 +1585,17 @@ mod flight {
 
         #[test]
         fn entry_waiter_operation_and_generation_caps_are_enforced() {
-            let flights = flights(FlightLimits {
-                entries: 1,
-                waiters_per_flight: 2,
-                operations_per_flight: 1,
-                generations_per_flight: 1,
-            });
-            let (context, scope) = (origin(), scope());
+            let env = racer_io::Env::host();
+            let flights = flights(
+                &env,
+                FlightLimits {
+                    entries: 1,
+                    waiters_per_flight: 2,
+                    operations_per_flight: 1,
+                    generations_per_flight: 1,
+                },
+            );
+            let (context, scope) = (origin(), scope(&env));
             let failures = crate::telemetry::Failures::default();
             flights
                 .admission
@@ -1591,13 +1654,14 @@ mod flight {
 
         #[test]
         fn gate_join_quota_facts_and_existing_failure_are_distinct() {
-            let flights = flights(FlightLimits::default());
+            let env = racer_io::Env::host();
+            let flights = flights(&env, FlightLimits::default());
             let failures = crate::telemetry::Failures::default();
             flights
                 .admission
                 .policy()
                 .set_observer(failures.observer(crate::model::WorkerId(4)));
-            let (context, scope) = (origin(), scope());
+            let (context, scope) = (origin(), scope(&env));
             let mut first_budget = budget();
             let mut first = join(&flights, &context, &scope, &mut first_budget);
             let used = flights.admission.used(ResourceClass::Waiter);
@@ -1690,8 +1754,9 @@ mod flight {
 
         #[test]
         fn abandoned_drain_observer_and_expired_shutdown_cannot_release_work() {
-            let flights = flights(FlightLimits::default());
-            let (context, scope) = (origin(), scope());
+            let env = racer_io::Env::host();
+            let flights = flights(&env, FlightLimits::default());
+            let (context, scope) = (origin(), scope(&env));
             let mut a_budget = budget();
             let mut a = join(&flights, &context, &scope, &mut a_budget);
             let leader = lead(&mut a);
@@ -1725,8 +1790,9 @@ mod flight {
 
         #[test]
         fn dropped_completion_token_does_not_claim_completion() {
-            let flights = flights(FlightLimits::default());
-            let (context, scope) = (origin(), scope());
+            let env = racer_io::Env::host();
+            let flights = flights(&env, FlightLimits::default());
+            let (context, scope) = (origin(), scope(&env));
             let mut a_budget = budget();
             let mut a = join(&flights, &context, &scope, &mut a_budget);
             let leader = lead(&mut a);
@@ -1767,22 +1833,22 @@ mod flight {
         assert_eq!(original.remaining_links(), 0);
     }
 
-    fn flights(limits: FlightLimits) -> Rc<Flights> {
+    fn flights(env: &racer_io::Env, limits: FlightLimits) -> Rc<Flights> {
         Rc::new(
             Flights::with_limits(
                 Rc::new(flow_control::Quotas::new(AdmissionPolicy::new(
                     crate::test_support::cluster::config(false).limits,
                 ))),
-                crate::test_support::availability(),
+                crate::test_support::availability(env),
                 limits,
-                crate::test_support::clock(),
+                env.ctx.clock.clone(),
             )
             .unwrap(),
         )
     }
-    fn scope() -> RequestScope {
+    fn scope(env: &racer_io::Env) -> RequestScope {
         RequestScope::on(
-            &crate::test_support::clock(),
+            &env.ctx.clock,
             crate::model::RequestId([0; 16]),
             Instant::now() + Duration::from_secs(60),
         )
@@ -1951,8 +2017,9 @@ mod flight {
 
     #[test]
     fn validated_publication_waits_for_fences_and_shares_original_bundle() {
-        let flights = flights(FlightLimits::default());
-        let (context, scope) = (origin(), scope());
+        let env = racer_io::Env::host();
+        let flights = flights(&env, FlightLimits::default());
+        let (context, scope) = (origin(), scope(&env));
         let (mut a_budget, mut b_budget) = (budget(), budget());
         let mut a = join(&flights, &context, &scope, &mut a_budget);
         let mut b = join(&flights, &context, &scope, &mut b_budget);
@@ -2033,8 +2100,9 @@ mod flight {
 
     #[test]
     fn invalid_publication_abandons_supplier_and_forbidden_retries_independently() {
-        let flights = flights(FlightLimits::default());
-        let (context, scope) = (origin(), scope());
+        let env = racer_io::Env::host();
+        let flights = flights(&env, FlightLimits::default());
+        let (context, scope) = (origin(), scope(&env));
         let (mut a_budget, mut b_budget, mut c_budget) = (budget(), budget(), budget());
         let mut a = join(&flights, &context, &scope, &mut a_budget);
         let mut b = join(&flights, &context, &scope, &mut b_budget);
@@ -2087,8 +2155,9 @@ mod flight {
 
     #[test]
     fn forbidden_retries_but_peer_unauthorized_is_terminal() {
-        let flights = flights(FlightLimits::default());
-        let (context, scope) = (origin(), scope());
+        let env = racer_io::Env::host();
+        let flights = flights(&env, FlightLimits::default());
+        let (context, scope) = (origin(), scope(&env));
         let (mut a_budget, mut b_budget) = (budget(), budget());
         let mut a = join(&flights, &context, &scope, &mut a_budget);
         let mut b = join(&flights, &context, &scope, &mut b_budget);
@@ -2109,10 +2178,11 @@ mod flight {
 
     #[test]
     fn worker_poll_drives_parent_owned_queue_after_caller_drop() {
+        let env = racer_io::Env::host();
         let queue = Rc::new(crate::drivers::DriverQueue::new(1024));
         let _owner = queue.enter();
-        let flights = flights(FlightLimits::default());
-        let (context, scope) = (origin(), scope());
+        let flights = flights(&env, FlightLimits::default());
+        let (context, scope) = (origin(), scope(&env));
         let mut budget = budget();
         let mut a = join(&flights, &context, &scope, &mut budget);
         let leader = lead(&mut a);
@@ -2149,8 +2219,9 @@ mod flight {
 
     #[test]
     fn fences_reject_other_tables_pages_recreated_entries_and_late_retries() {
-        let flights = flights(FlightLimits::default());
-        let (context, scope_a) = (origin(), scope());
+        let env = racer_io::Env::host();
+        let flights = flights(&env, FlightLimits::default());
+        let (context, scope_a) = (origin(), scope(&env));
         let mut a_budget = budget();
         let mut a = join(&flights, &context, &scope_a, &mut a_budget);
         let leader = lead(&mut a);
@@ -2470,20 +2541,22 @@ mod timeouts {
     }
 
     impl Fixture {
-        fn bounded(mut self, request: u8, seconds: u64, links: u8) -> Self {
-            let deadline = crate::rt::environment::now() + Duration::from_secs(seconds);
-            self.scope = RequestScope::on(
-                &crate::test_support::clock(),
-                RequestId([request; 16]),
-                deadline,
-            )
-            .unwrap();
+        fn bounded(mut self, env: &racer_io::Env, request: u8, seconds: u64, links: u8) -> Self {
+            let deadline = env.ctx.now() + Duration::from_secs(seconds);
+            self.scope =
+                RequestScope::on(&env.ctx.clock, RequestId([request; 16]), deadline).unwrap();
             self.budget = AcquisitionBudget::new(deadline, 16, links);
             self
         }
-        fn new(rank: Option<usize>, stalled: usize, late_success: bool) -> Self {
-            let (_, placement, context, _, credentials) = crate::read::candidates::tests::fixture();
-            let signers = network(5);
+        fn new(
+            env: &racer_io::Env,
+            rank: Option<usize>,
+            stalled: usize,
+            late_success: bool,
+        ) -> Self {
+            let (_, placement, context, _, credentials) =
+                crate::read::candidates::tests::fixture(env);
+            let signers = network(env, 5);
             let membership = std::sync::Arc::new(
                 Membership::validate(
                     MembershipVersion(1),
@@ -2522,6 +2595,7 @@ mod timeouts {
                 local,
                 placement,
                 Requester::scripted(
+                    env.ctx.clock.clone(),
                     peers.clone(),
                     Peers::direct_hedge_available,
                     Peers::request,
@@ -2531,10 +2605,10 @@ mod timeouts {
                 Arc::new(crate::control::cell::PublicationCell::new(
                     crate::control::Snapshot::retention(2),
                 )),
-                crate::test_support::ctx(),
+                env.ctx.clone(),
             );
             let scope = RequestScope::on(
-                &crate::test_support::clock(),
+                &env.ctx.clock,
                 RequestId([3; 16]),
                 Instant::now() + Duration::from_secs(1),
             )
@@ -2564,7 +2638,7 @@ mod timeouts {
         /// attempt timeout first.
         fn resolve_page(
             &mut self,
-            clock: &crate::rt::environment::SimulationClock,
+            clock: &racer_io::SimClock,
             stall: bool,
         ) -> Result<CandidateResolution> {
             let operation = PeerOperation::Page {
@@ -2621,15 +2695,11 @@ mod timeouts {
 
     #[test]
     fn continuously_slow_candidate_reserves_fenced_fallback_and_conserves_credits() {
-        let clock = crate::rt::environment::SimulationClock::new_at(
-            94,
-            Instant::now(),
-            std::time::SystemTime::now(),
-        );
-        let sim_env = clock.environment(0);
-        let _env = sim_env.enter();
-        let sim_ctx = sim_env.worker_ctx();
-        let mut f = Fixture::new(None, 1, true).bounded(94, 30, 24);
+        let clock = racer_io::SimClock::new_at(94, Instant::now(), std::time::SystemTime::now());
+        let sim_env = clock.ctx(0);
+        let env = racer_io::Env::new(racer_io::Driver::Uring, sim_env.clone());
+        let sim_ctx = sim_env.clone();
+        let mut f = Fixture::new(&env, None, 1, true).bounded(&env, 94, 30, 24);
         let original = f.scope.deadline.0;
         f.peers.fenced.set(false);
         let operation = f.operation();
@@ -2686,13 +2756,10 @@ mod timeouts {
     #[test]
     fn slow_body_without_alternative_or_failure_route_credit_keeps_original_ceiling() {
         for (opportunities, links) in [(1, 24), (3, 4)] {
-            let clock = crate::rt::environment::SimulationClock::new_at(
-                95,
-                Instant::now(),
-                std::time::SystemTime::now(),
-            );
-            let _env = clock.environment(0).enter();
-            let mut f = Fixture::new(None, 1, false).bounded(95, 30, links);
+            let clock =
+                racer_io::SimClock::new_at(95, Instant::now(), std::time::SystemTime::now());
+            let env = racer_io::Env::new(racer_io::Driver::Uring, clock.ctx(0));
+            let mut f = Fixture::new(&env, None, 1, false).bounded(&env, 95, 30, links);
             let original = f.scope.deadline.0;
             f.peers.fenced.set(false);
             let operation = f.operation();
@@ -2744,15 +2811,12 @@ mod timeouts {
     #[test]
     fn known_healthy_body_outlives_share_with_or_without_affordable_fallback() {
         for links in [4, 24] {
-            let clock = crate::rt::environment::SimulationClock::new_at(
-                100,
-                Instant::now(),
-                std::time::SystemTime::now(),
-            );
-            let sim_env = clock.environment(0);
-            let _env = sim_env.enter();
-            let sim_ctx = sim_env.worker_ctx();
-            let mut f = Fixture::new(None, 1, false).bounded(100, 30, links);
+            let clock =
+                racer_io::SimClock::new_at(100, Instant::now(), std::time::SystemTime::now());
+            let sim_env = clock.ctx(0);
+            let env = racer_io::Env::new(racer_io::Driver::Uring, sim_env.clone());
+            let sim_ctx = sim_env.clone();
+            let mut f = Fixture::new(&env, None, 1, false).bounded(&env, 100, 30, links);
             let original = f.scope.deadline.0;
             let operation = f.operation();
             let mut request = Box::pin(f.policy.request(
@@ -2788,13 +2852,9 @@ mod timeouts {
 
     #[test]
     fn configured_total_cap_never_renews_or_accepts_late_success() {
-        let clock = crate::rt::environment::SimulationClock::new_at(
-            96,
-            Instant::now(),
-            std::time::SystemTime::now(),
-        );
-        let _env = clock.environment(0).enter();
-        let mut f = Fixture::new(None, 1, true).bounded(96, 60, 24);
+        let clock = racer_io::SimClock::new_at(96, Instant::now(), std::time::SystemTime::now());
+        let env = racer_io::Env::new(racer_io::Driver::Uring, clock.ctx(0));
+        let mut f = Fixture::new(&env, None, 1, true).bounded(&env, 96, 60, 24);
         let original = f.scope.deadline.0;
         f.policy = f.policy.with_attempt_timeout(Duration::from_secs(6));
         f.peers.fenced.set(false);
@@ -2839,9 +2899,9 @@ mod timeouts {
     #[test]
     fn candidate_final_early_credits_exhaustion_and_recovered_fallback() {
         for (credits, stalled, late, fails) in [(0, 0, false, true), (16, 1, true, false)] {
-            let clock = crate::rt::environment::SimulationClock::new(198);
-            let _env = clock.environment(0).enter();
-            let mut f = Fixture::new(None, stalled, late).bounded(198, 60, 24);
+            let clock = racer_io::SimClock::new(198);
+            let env = racer_io::Env::new(racer_io::Driver::Uring, clock.ctx(0));
+            let mut f = Fixture::new(&env, None, stalled, late).bounded(&env, 198, 60, 24);
             f.budget = AcquisitionBudget::new(f.scope.deadline.0, credits, 24);
             let failures = crate::telemetry::Failures::default();
             f.policy = f
@@ -2888,9 +2948,9 @@ mod timeouts {
 
     #[test]
     fn candidate_final_preserves_late_success_and_effective_deadline_error() {
-        let clock = crate::rt::environment::SimulationClock::new(199);
-        let _env = clock.environment(0).enter();
-        let mut f = Fixture::new(None, 3, true).bounded(199, 60, 24);
+        let clock = racer_io::SimClock::new(199);
+        let env = racer_io::Env::new(racer_io::Driver::Uring, clock.ctx(0));
+        let mut f = Fixture::new(&env, None, 3, true).bounded(&env, 199, 60, 24);
         let failures = crate::telemetry::Failures::default();
         f.policy = f
             .policy
@@ -2937,9 +2997,9 @@ mod timeouts {
     #[test]
     fn owner_page_walk_leaves_the_fetch_to_a_rank_zero_that_times_out() {
         for stalled in [1, 0] {
-            let clock = crate::rt::environment::SimulationClock::new(201);
-            let _env = clock.environment(0).enter();
-            let mut f = Fixture::new(Some(1), stalled, false).bounded(201, 60, 24);
+            let clock = racer_io::SimClock::new(201);
+            let env = racer_io::Env::new(racer_io::Driver::Uring, clock.ctx(0));
+            let mut f = Fixture::new(&env, Some(1), stalled, false).bounded(&env, 201, 60, 24);
             f.policy = f.policy.with_attempt_timeout(Duration::from_secs(1));
             if stalled == 0 {
                 // Rank 0 refuses at once: a transport failure, not a timeout.
@@ -2967,9 +3027,9 @@ mod timeouts {
     /// next timeout gives authority.
     #[test]
     fn owner_page_walk_bounds_the_wait_for_a_silent_rank_zero() {
-        let clock = crate::rt::environment::SimulationClock::new(205);
-        let _env = clock.environment(0).enter();
-        let mut f = Fixture::new(Some(1), 3, false).bounded(205, 3, 24);
+        let clock = racer_io::SimClock::new(205);
+        let env = racer_io::Env::new(racer_io::Driver::Uring, clock.ctx(0));
+        let mut f = Fixture::new(&env, Some(1), 3, false).bounded(&env, 205, 3, 24);
         f.policy = f
             .policy
             .with_attempt_timeout(Duration::from_secs(1))
@@ -2981,12 +3041,12 @@ mod timeouts {
         // t = 5..7: past the first request's 3 s deadline but within the
         // 5 s allowance: a timeout still leaves the fetch to rank 0.
         clock.advance(Duration::from_secs(3));
-        f = f.bounded(207, 60, 24);
+        f = f.bounded(&env, 207, 60, 24);
         let second = f.resolve_page(&clock, true);
         assert!(matches!(second, Err(Error::Unavailable)));
         // t = 10: rank 0 is overdue; a timeout gives authority.
         clock.advance(Duration::from_secs(3));
-        f = f.bounded(208, 60, 24);
+        f = f.bounded(&env, 208, 60, 24);
         let third = f.resolve_page(&clock, true);
         assert!(matches!(third, Ok(CandidateResolution::Origin(_))));
         let calls = f.peers.calls.borrow();
@@ -3002,9 +3062,9 @@ mod timeouts {
     /// rank 0 forgets the failure.
     #[test]
     fn owner_leaves_origin_retries_to_a_failing_rank_zero() {
-        let clock = crate::rt::environment::SimulationClock::new(209);
-        let _env = clock.environment(0).enter();
-        let mut f = Fixture::new(Some(1), 0, false).bounded(209, 60, 24);
+        let clock = racer_io::SimClock::new(209);
+        let env = racer_io::Env::new(racer_io::Driver::Uring, clock.ctx(0));
+        let mut f = Fixture::new(&env, Some(1), 0, false).bounded(&env, 209, 60, 24);
         f.policy = f
             .policy
             .with_attempt_timeout(Duration::from_secs(1))
@@ -3014,7 +3074,8 @@ mod timeouts {
         let rank0 = f.candidates.ordered[0].clone();
         let ordered = f.candidates.ordered.clone();
         let resolve_once = |f: &mut Fixture, request: u8| {
-            *f = std::mem::replace(f, Fixture::new(Some(1), 0, false)).bounded(request, 60, 24);
+            *f = std::mem::replace(f, Fixture::new(&env, Some(1), 0, false))
+                .bounded(&env, request, 60, 24);
             matches!(
                 f.resolve_page(&clock, false),
                 Ok(CandidateResolution::Origin(_))
@@ -3058,9 +3119,9 @@ mod timeouts {
     /// requester and page); an answer from it restores its place.
     #[test]
     fn reader_visits_an_owner_that_left_it_unanswered_after_the_others() {
-        let clock = crate::rt::environment::SimulationClock::new(209);
-        let _env = clock.environment(0).enter();
-        let mut f = Fixture::new(None, 1, false).bounded(209, 60, 24);
+        let clock = racer_io::SimClock::new(209);
+        let env = racer_io::Env::new(racer_io::Driver::Uring, clock.ctx(0));
+        let mut f = Fixture::new(&env, None, 1, false).bounded(&env, 209, 60, 24);
         f.policy = f
             .policy
             .with_attempt_timeout(Duration::from_secs(1))
@@ -3079,7 +3140,7 @@ mod timeouts {
         );
         // The next walk visits it last: everyone else answered.
         let before = f.peers.calls.borrow().len();
-        f = f.bounded(210, 60, 24);
+        f = f.bounded(&env, 210, 60, 24);
         let _ = f.resolve_page(&clock, false);
         let second = f.visited(before);
         assert_eq!(second.last(), Some(&hung), "{first:?} then {second:?}");
@@ -3090,7 +3151,7 @@ mod timeouts {
             racer_core::read::Answering::Answers
         );
         let before = f.peers.calls.borrow().len();
-        f = f.bounded(211, 60, 24);
+        f = f.bounded(&env, 211, 60, 24);
         let _ = f.resolve_page(&clock, false);
         assert_eq!(f.visited(before)[0], hung);
     }
@@ -3105,11 +3166,11 @@ mod timeouts {
     #[test]
     fn reader_visits_an_owner_that_shed_it_after_the_others() {
         use racer_core::read::Answering;
-        let clock = crate::rt::environment::SimulationClock::new(212);
-        let sim_env = clock.environment(0);
-        let _env = sim_env.enter();
-        let sim_ctx = sim_env.worker_ctx();
-        let mut f = Fixture::new(None, 0, false).bounded(212, 60, 24);
+        let clock = racer_io::SimClock::new(212);
+        let sim_env = clock.ctx(0);
+        let env = racer_io::Env::new(racer_io::Driver::Uring, sim_env.clone());
+        let sim_ctx = sim_env.clone();
+        let mut f = Fixture::new(&env, None, 0, false).bounded(&env, 212, 60, 24);
         f.policy = f
             .policy
             .with_attempt_timeout(Duration::from_secs(1))
@@ -3125,7 +3186,7 @@ mod timeouts {
         // It sheds this time: busy, alive, never pinged.
         f.peers.shed_pages.set(1);
         let before = f.peers.calls.borrow().len();
-        f = f.bounded(213, 60, 24);
+        f = f.bounded(&env, 213, 60, 24);
         let _ = f.resolve_page(&clock, false);
         assert_eq!(f.visited(before)[0], busy);
         assert_eq!(
@@ -3141,7 +3202,7 @@ mod timeouts {
         );
         // The next walk visits it last; it answers, which restores its place.
         let before = f.peers.calls.borrow().len();
-        f = f.bounded(214, 60, 24);
+        f = f.bounded(&env, 214, 60, 24);
         let _ = f.resolve_page(&clock, false);
         let next = f.visited(before);
         assert_ne!(next[0], busy, "{usual:?} then {next:?}");
@@ -3149,7 +3210,7 @@ mod timeouts {
         assert_eq!(f.policy.link_health().answering(&busy), Answering::Answers);
         // A shed is forgotten after the quiet time without another answer.
         f.peers.shed_pages.set(1);
-        f = f.bounded(215, 60, 24);
+        f = f.bounded(&env, 215, 60, 24);
         let _ = f.resolve_page(&clock, false);
         assert_eq!(
             f.policy.link_health().answering(&busy),
@@ -3158,16 +3219,16 @@ mod timeouts {
         clock.advance(Duration::from_secs(5));
         assert_eq!(f.policy.link_health().answering(&busy), Answering::Answers);
         let before = f.peers.calls.borrow().len();
-        f = f.bounded(216, 60, 24);
+        f = f.bounded(&env, 216, 60, 24);
         let _ = f.resolve_page(&clock, false);
         assert_eq!(f.visited(before)[0], busy);
     }
 
     #[test]
     fn candidate_final_remaining_copy_and_origin_miss_only_at_final_boundary() {
-        let clock = crate::rt::environment::SimulationClock::new(200);
-        let _env = clock.environment(0).enter();
-        let mut f = Fixture::new(Some(1), 1, true).bounded(200, 60, 24);
+        let clock = racer_io::SimClock::new(200);
+        let env = racer_io::Env::new(racer_io::Driver::Uring, clock.ctx(0));
+        let mut f = Fixture::new(&env, Some(1), 1, true).bounded(&env, 200, 60, 24);
         let failures = crate::telemetry::Failures::default();
         f.policy = f
             .policy
@@ -3238,13 +3299,9 @@ mod timeouts {
 
     #[test]
     fn retries_get_independent_local_caps_but_never_extend_overall_authority() {
-        let clock = crate::rt::environment::SimulationClock::new_at(
-            101,
-            Instant::now(),
-            std::time::SystemTime::now(),
-        );
-        let _env = clock.environment(0).enter();
-        let mut f = Fixture::new(None, 3, false).bounded(101, 15, 24);
+        let clock = racer_io::SimClock::new_at(101, Instant::now(), std::time::SystemTime::now());
+        let env = racer_io::Env::new(racer_io::Driver::Uring, clock.ctx(0));
+        let mut f = Fixture::new(&env, None, 3, false).bounded(&env, 101, 15, 24);
         let original = f.scope.deadline.0;
         f.policy = f.policy.with_attempt_timeout(Duration::from_secs(6));
         let operation = f.operation();
@@ -3293,7 +3350,8 @@ mod timeouts {
 
     #[test]
     fn subscription_stall_must_leave_time_for_fixed_page_fallback() {
-        let mut f = Fixture::new(Some(1), 1, false);
+        let env = racer_io::Env::host();
+        let mut f = Fixture::new(&env, Some(1), 1, false);
         f.peers.fenced.set(false);
         let scheduler = crate::read::range_stream::Scheduler::new(1, racer_io::WorkerCtx::host());
         let demand =
@@ -3395,7 +3453,7 @@ mod timeouts {
                     f.candidates.membership.version,
                     f.policy.node.clone(),
                     crate::peer::protocol::encode_deadline(
-                        &crate::test_support::clock(),
+                        &env.ctx.clock,
                         Deadline(call.signed_deadline),
                     )
                     .unwrap(),
@@ -3422,7 +3480,8 @@ mod timeouts {
     #[test]
     fn multi_flight_subscribe_falls_back_to_single_flight_after_refusal() {
         use crate::read::candidates::ProviderSelection;
-        let mut f = Fixture::new(Some(1), 0, false);
+        let env = racer_io::Env::host();
+        let mut f = Fixture::new(&env, Some(1), 0, false);
         f.peers.refuse_flights.set(true);
         let scheduler = crate::read::range_stream::Scheduler::new(1, racer_io::WorkerCtx::host());
         let demand =
@@ -3494,7 +3553,8 @@ mod timeouts {
     #[test]
     fn multi_flight_subscribe_falls_back_to_single_flight_after_relayed_refusal() {
         use crate::read::candidates::ProviderSelection;
-        let mut f = Fixture::new(Some(1), 0, false);
+        let env = racer_io::Env::host();
+        let mut f = Fixture::new(&env, Some(1), 0, false);
         // Every Subscribe reaches the provider through a relay that signs
         // `Unavailable` for the dropped exchange.
         f.peers.relay_unavailable.set(true);
@@ -3567,7 +3627,8 @@ mod timeouts {
 
     #[test]
     fn subscription_parent_cancellation_waits_for_fence_without_fallback() {
-        let mut f = Fixture::new(Some(1), 1, false);
+        let env = racer_io::Env::host();
+        let mut f = Fixture::new(&env, Some(1), 1, false);
         f.peers.fenced.set(false);
         let scheduler = crate::read::range_stream::Scheduler::new(1, racer_io::WorkerCtx::host());
         let demand =
@@ -3609,7 +3670,8 @@ mod timeouts {
 
     #[test]
     fn stalled_first_candidate_drains_before_healthy_fallback_without_new_credits() {
-        let mut f = Fixture::new(None, 1, true);
+        let env = racer_io::Env::host();
+        let mut f = Fixture::new(&env, None, 1, true);
         f.peers.fenced.set(false);
         let operation = f.operation();
         let mut resolve = Box::pin(f.policy.resolve_with_budget(
@@ -3658,7 +3720,8 @@ mod timeouts {
 
     #[test]
     fn stalled_predecessors_leave_local_origin_time_and_credit() {
-        let mut f = Fixture::new(Some(2), 2, false);
+        let env = racer_io::Env::host();
+        let mut f = Fixture::new(&env, Some(2), 2, false);
         let ordered = f.candidates.ordered.clone();
         let operation = f.operation();
         let mut resolve = Box::pin(f.policy.resolve_with_budget(
@@ -3700,7 +3763,8 @@ mod timeouts {
 
     #[test]
     fn remaining_copy_slices_time_for_later_healthy_copy() {
-        let mut f = Fixture::new(Some(0), 1, false);
+        let env = racer_io::Env::host();
+        let mut f = Fixture::new(&env, Some(0), 1, false);
         let operation = f.operation();
         let mut resolve = Box::pin(f.policy.remaining_copy(
             &f.candidates,
@@ -3728,7 +3792,8 @@ mod timeouts {
 
     #[test]
     fn exhausted_overall_budget_is_terminal_even_while_parent_scope_is_live() {
-        let mut f = Fixture::new(None, 3, false);
+        let env = racer_io::Env::host();
+        let mut f = Fixture::new(&env, None, 3, false);
         let overall = Instant::now() + Duration::from_millis(120);
         f.budget = AcquisitionBudget::new(overall, 16, 24);
         let operation = f.operation();
@@ -3755,7 +3820,8 @@ mod timeouts {
 
     #[test]
     fn all_stalled_candidates_stop_at_original_deadline_without_refunding_credits() {
-        let mut f = Fixture::new(None, 3, false);
+        let env = racer_io::Env::host();
+        let mut f = Fixture::new(&env, None, 3, false);
         f.scope.deadline.0 = Instant::now() + Duration::from_millis(120);
         let operation = f.operation();
         let mut resolve = Box::pin(f.policy.resolve_with_budget(
@@ -3788,7 +3854,8 @@ mod timeouts {
 
     #[test]
     fn parent_cancellation_cancels_child_but_waits_for_fence_without_fallback() {
-        let mut f = Fixture::new(None, 1, false);
+        let env = racer_io::Env::host();
+        let mut f = Fixture::new(&env, None, 1, false);
         f.peers.fenced.set(false);
         let membership = std::sync::Arc::downgrade(&f.candidates.membership);
         let operation = f.operation();
@@ -3822,7 +3889,8 @@ mod timeouts {
 
     #[test]
     fn expired_budget_cannot_mint_local_origin_authority_or_spend_credits() {
-        let mut f = Fixture::new(Some(0), 0, false);
+        let env = racer_io::Env::host();
+        let mut f = Fixture::new(&env, Some(0), 0, false);
         f.budget = AcquisitionBudget::new(Instant::now(), 16, 24);
         let operation = f.operation();
         let result = futures::executor::block_on(f.policy.resolve_with_budget(

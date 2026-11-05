@@ -316,8 +316,13 @@ impl From<Vec<CacheDefinition>> for Caches {
 
 /// Publish a single-node fixture admitting the supplied cache namespaces.
 #[cfg(test)]
-pub(crate) fn for_caches(keys: Rc<Keyring>, caches: Vec<CacheId>) -> Rc<Availability> {
+pub(crate) fn for_caches(
+    env: &racer_io::Env,
+    keys: Rc<Keyring>,
+    caches: Vec<CacheId>,
+) -> Rc<Availability> {
     for_cache_modes(
+        env,
         keys,
         caches
             .into_iter()
@@ -329,6 +334,7 @@ pub(crate) fn for_caches(keys: Rc<Keyring>, caches: Vec<CacheId>) -> Rc<Availabi
 /// Publish a single-node fixture admitting the supplied caches in their modes.
 #[cfg(test)]
 pub(crate) fn for_cache_modes(
+    env: &racer_io::Env,
     keys: Rc<Keyring>,
     caches: Vec<(CacheId, racer_wire::control::CacheMode)>,
 ) -> Rc<Availability> {
@@ -336,7 +342,7 @@ pub(crate) fn for_cache_modes(
         Arc::new(PublicationCell::new(Snapshot::retention(1))),
         keys,
     ));
-    availability.publish_modes(caches);
+    availability.publish_modes(env, caches);
     availability
 }
 
@@ -344,7 +350,11 @@ pub(crate) fn for_cache_modes(
 impl Availability {
     /// Publish the next single-node fixture with `caches` in their modes, as a
     /// controller would after a ClusterCache edit.
-    pub(crate) fn publish_modes(&self, caches: Vec<(CacheId, racer_wire::control::CacheMode)>) {
+    pub(crate) fn publish_modes(
+        &self,
+        env: &racer_io::Env,
+        caches: Vec<(CacheId, racer_wire::control::CacheMode)>,
+    ) {
         use racer_wire::control::SCHEMA_VERSION;
         let sequence = self
             .publications
@@ -354,7 +364,7 @@ impl Availability {
         PublicationTarget::new(
             self.keys.cluster().clone(),
             self.publications.clone(),
-            crate::test_support::clock(),
+            env.ctx.clock.clone(),
         )
         .apply(
             Publication {
@@ -586,16 +596,16 @@ pub(crate) mod tests {
     #[test]
     fn socket_readiness_errno_is_transient_but_file_errno_is_not() {
         use crate::control::rest::Io;
-        use crate::rt::reactor::simulation::{Fault, Simulation};
-        let sim = Simulation::new();
-        let _os = sim.enter();
+        use racer_io::sim::{Fault, SimOs};
+        let sim = SimOs::new();
+        let env = racer_io::Env::sim(&sim, racer_io::WorkerCtx::host());
         let r = Rc::new(Reactor::new(
             Rc::new(flow_control::Quotas::new(
                 crate::admission::AdmissionPolicy::new(
                     crate::test_support::cluster::config(false).limits,
                 ),
             )),
-            &crate::test_support::env(),
+            &env,
         ));
         let io = ReactorControlIo::new(r.clone());
         let scope = testing::scope();
@@ -615,19 +625,19 @@ pub(crate) mod tests {
     #[test]
     fn atomic_write_preserves_cause_and_requires_reconciliation_after_publication() {
         use crate::error::PublicationCause;
-        use crate::rt::reactor::simulation::{Fault, Simulation};
+        use racer_io::sim::{Fault, SimOs};
         use std::future::Future;
         use std::task::{Context, Poll};
         for case in ["success", "write", "rename", "cancel-rename", "sync"] {
-            let sim = Simulation::new();
-            let _os = sim.enter();
+            let sim = SimOs::new();
+            let env = racer_io::Env::sim(&sim, racer_io::WorkerCtx::host());
             let r = Reactor::new(
                 Rc::new(flow_control::Quotas::new(
                     crate::admission::AdmissionPolicy::new(
                         crate::test_support::cluster::config(false).limits,
                     ),
                 )),
-                &crate::test_support::env(),
+                &env,
             );
             let scope = testing::scope();
             sim.write_file(Path::new("/identity"), b"old").unwrap();
@@ -788,7 +798,8 @@ pub(crate) mod tests {
         }
         #[test]
         fn coherent_projection_rejects_partial_and_escaping_links() {
-            let Some(reactor) = testing::reactor() else {
+            let env = racer_io::Env::host();
+            let Some(reactor) = testing::reactor(&env) else {
                 return;
             };
             let d = testing::Directory::new();
@@ -887,12 +898,16 @@ pub(crate) mod tests {
         }
         #[test]
         fn lagging_replica_retries_preserve_state_without_enrollment() {
-            session::tests::lagging_replica();
+            let env = racer_io::Env::host();
+            session::tests::lagging_replica(&env);
         }
         #[test]
         fn changed_binding_latches_restart_across_abandoned_or_failed_persistence() {
+            let env = racer_io::Env::host();
             for abandon in [false, true] {
-                let Some(r) = testing::reactor() else { return };
+                let Some(r) = testing::reactor(&env) else {
+                    return;
+                };
                 let d = testing::Directory::new();
                 let client = client(&d, r.clone());
                 let (ca, key) = testing::ca();
@@ -972,11 +987,13 @@ pub(crate) mod tests {
         }
         #[test]
         fn status_policy_backoff_and_shutdown_are_explicit() {
-            session::tests::status_retry_shutdown();
+            let env = racer_io::Env::host();
+            session::tests::status_retry_shutdown(&env);
         }
         #[test]
         fn keyring_cursor_status_and_retry_are_independent() {
-            session::tests::independent_keyring();
+            let env = racer_io::Env::host();
+            session::tests::independent_keyring(&env);
         }
     }
 
@@ -1097,7 +1114,8 @@ pub(crate) mod tests {
         use super::*;
         #[test]
         fn preparation_reuses_same_version_without_reading_member_weights() {
-            let store = store(2);
+            let env = racer_io::Env::host();
+            let store = store(&env, 2);
             let first = store.apply(publication(1)).unwrap();
             let before = crate::topology::scored_members();
             // Cache-only: pools, and so membership, are unchanged.
@@ -1121,7 +1139,8 @@ pub(crate) mod tests {
 
         #[test]
         fn background_preparation_keeps_cpu_work_off_the_polling_thread() {
-            let store = store(2);
+            let env = racer_io::Env::host();
+            let store = store(&env, 2);
             let before = crate::topology::scored_members();
             let job = crate::control::plane::Target::<publication::PublicationCodec>::prepare(
                 &store,
@@ -1141,12 +1160,14 @@ pub(crate) mod tests {
 
         #[test]
         fn background_preparation_admission_and_canceled_scope_are_bounded() {
-            preparation_fence(false);
+            let env = racer_io::Env::host();
+            preparation_fence(&env, false);
         }
 
         #[test]
         fn canceled_background_wait_keeps_job_admission_until_completion() {
-            preparation_fence(true);
+            let env = racer_io::Env::host();
+            preparation_fence(&env, true);
         }
 
         /// Domain projection gate proving that Sync, not the adapter, owns job admission.
@@ -1218,23 +1239,23 @@ pub(crate) mod tests {
         }
 
         /// Cancel before or during a turn and fence the retained finite CPU closure.
-        fn preparation_fence(cancel_wait: bool) {
+        fn preparation_fence(env: &racer_io::Env, cancel_wait: bool) {
             use std::future::Future;
-            let clock = crate::rt::environment::SimulationClock::new(407);
-            let sim_env = clock.environment(0);
-            let _time = sim_env.enter();
-            let sim_ctx = sim_env.worker_ctx();
-            let sim = crate::rt::reactor::simulation::Simulation::new();
-            let _os = sim.enter();
+            let clock = racer_io::SimClock::new(407);
+            let sim_env = clock.ctx(0);
+            let env = racer_io::Env::new(env.driver.clone(), sim_env.clone());
+            let sim_ctx = sim_env.clone();
+            let sim = racer_io::sim::SimOs::new();
+            let env = racer_io::Env::sim(&sim, env.ctx.clone());
             let reactor = Rc::new(Reactor::new(
                 Rc::new(flow_control::Quotas::new(
                     crate::admission::AdmissionPolicy::new(
                         crate::test_support::cluster::config(false).limits,
                     ),
                 )),
-                &crate::test_support::env(),
+                &env,
             ));
-            let target = store(2);
+            let target = store(&env, 2);
             let published = target.published.clone();
             let submissions = Rc::new(Cell::new(0));
             let (release, wait) = std::sync::mpsc::channel();
@@ -1331,11 +1352,11 @@ pub(crate) mod tests {
             }
             p
         }
-        fn store(retained: usize) -> PublicationTarget {
+        fn store(env: &racer_io::Env, retained: usize) -> PublicationTarget {
             PublicationTarget::new(
                 publication(1).cluster,
                 Arc::new(PublicationCell::new(Snapshot::retention(retained))),
-                crate::test_support::clock(),
+                env.ctx.clock.clone(),
             )
         }
         fn membership(sequence: u64, version: u64) -> Publication {
@@ -1345,7 +1366,8 @@ pub(crate) mod tests {
         }
         #[test]
         fn default_two_old_generations_resolve_without_local_request_pins() {
-            let store = store(2);
+            let env = racer_io::Env::host();
+            let store = store(&env, 2);
             for version in 1..20 {
                 store.apply(membership(version, version)).unwrap();
                 for old in version.saturating_sub(2).max(1)..=version {
@@ -1373,7 +1395,8 @@ pub(crate) mod tests {
         }
         #[test]
         fn page_size_is_adopted_once_and_never_changed() {
-            let store = store(2);
+            let env = racer_io::Env::host();
+            let store = store(&env, 2);
             let mut first = publication(1);
             first.page_size = racer_wire::object::PageSize::new(64 << 10).unwrap();
             assert_eq!(store.apply(first).unwrap().page_size.get(), 64 << 10);
@@ -1387,7 +1410,8 @@ pub(crate) mod tests {
         }
         #[test]
         fn cache_only_history_uses_one_slot_and_weak_registry_stays_bounded() {
-            let store = store(0);
+            let env = racer_io::Env::host();
+            let store = store(&env, 0);
             let first = store.apply(publication(1)).unwrap();
             let mut history = vec![first.clone()];
             for sequence in 2..40 {
@@ -1431,7 +1455,8 @@ pub(crate) mod tests {
         }
         #[test]
         fn delayed_thread_lease_blocks_admission_until_release() {
-            let store = store(1);
+            let env = racer_io::Env::host();
+            let store = store(&env, 1);
             let published = store.published.clone();
             store.apply(publication(1)).unwrap();
             let (ready_tx, ready_rx) = std::sync::mpsc::channel();
@@ -1459,7 +1484,8 @@ pub(crate) mod tests {
         }
         #[test]
         fn atomic_replay_rollback_and_leased_history() {
-            let store = store(1);
+            let env = racer_io::Env::host();
+            let store = store(&env, 1);
             let first = store.apply(publication(1)).unwrap();
             assert!(Arc::ptr_eq(&first, &store.apply(publication(1)).unwrap()));
             let mut changed = publication(1);
@@ -1486,7 +1512,8 @@ pub(crate) mod tests {
         }
         #[test]
         fn site_changes_require_new_membership_and_preserve_leased_history() {
-            let store = store(3);
+            let env = racer_io::Env::host();
+            let store = store(&env, 3);
             let old = store.apply(publication(1)).unwrap();
             let mut next = publication(2);
             next.members[0].site = "site1".into();
@@ -1510,6 +1537,7 @@ pub(crate) mod tests {
         }
         #[test]
         fn staged_resources_commit_only_on_accepted_replacement() {
+            let env = racer_io::Env::host();
             struct Transition(Rc<std::cell::Cell<usize>>);
             impl CacheTransition for Transition {
                 fn commit(self: Box<Self>) {
@@ -1517,7 +1545,7 @@ pub(crate) mod tests {
                 }
             }
             let committed = Rc::new(std::cell::Cell::new(0));
-            let store = store(0);
+            let store = store(&env, 0);
             let publish = |p| store.apply_staged(p, Some(Box::new(Transition(committed.clone()))));
             let first = publish(publication(1)).unwrap();
             assert_eq!(committed.get(), 1);
@@ -1532,7 +1560,8 @@ pub(crate) mod tests {
         #[test]
         fn stale_projection_and_foreign_cluster_leave_publication_unchanged() {
             use crate::control::plane::Target;
-            let target = store(2);
+            let env = racer_io::Env::host();
+            let target = store(&env, 2);
             target.apply(publication(1)).unwrap();
             let old_job = target.prepare(Arc::new(membership(3, 2))).unwrap();
             let current = target.apply(membership(2, 2)).unwrap();
@@ -1561,7 +1590,8 @@ pub(crate) mod tests {
         /// Domain topology byte estimates and configured grace deadlines reach Published.
         #[test]
         fn domain_grace_retention_honors_bytes_time_and_external_pins() {
-            let probe = store(2).project(publication(1)).unwrap();
+            let env = racer_io::Env::host();
+            let probe = store(&env, 2).project(publication(1)).unwrap();
             let bytes = probe.membership.retained_bytes();
             assert!(bytes > 0);
             for budget in [0, bytes] {
@@ -1782,8 +1812,9 @@ pub(crate) mod tests {
         fn real_connect_readiness_blackhole_yields_to_next_address_and_cleans_fds() {
             use std::task::Context;
             use std::task::Poll;
+            let env = racer_io::Env::host();
             for mode in ["local", "cancel", "parent"] {
-                let Some(reactor) = testing::reactor() else {
+                let Some(reactor) = testing::reactor(&env) else {
                     return;
                 };
                 let d = testing::Directory::new();
@@ -1917,7 +1948,10 @@ pub(crate) mod tests {
         }
         #[test]
         fn real_ring_server_auth_and_mutual_tls() {
-            let Some(r) = testing::reactor() else { return };
+            let env = racer_io::Env::host();
+            let Some(r) = testing::reactor(&env) else {
+                return;
+            };
             let d = testing::Directory::new();
             let (ca, ca_key) = testing::ca();
             let identity = enrolled(&r, &d, &ca, &ca_key);
@@ -2008,7 +2042,10 @@ pub(crate) mod tests {
         }
         #[test]
         fn backend_disconnect_recovers_on_fresh_connection_without_circuit() {
-            let Some(r) = testing::reactor() else { return };
+            let env = racer_io::Env::host();
+            let Some(r) = testing::reactor(&env) else {
+                return;
+            };
             let d = testing::Directory::new();
             let (ca, key) = testing::ca();
             let identity = enrolled(&r, &d, &ca, &key);
@@ -2070,8 +2107,11 @@ pub(crate) mod tests {
         }
         #[test]
         fn malformed_delta_base_and_method_are_rejected_before_writing() {
-            session::tests::canonical_delta_and_get_only();
-            let Some(r) = testing::reactor() else { return };
+            let env = racer_io::Env::host();
+            session::tests::canonical_delta_and_get_only(&env);
+            let Some(r) = testing::reactor(&env) else {
+                return;
+            };
             let d = testing::Directory::new();
             let (ca, key) = testing::ca();
             let tls = server_config(&ca, &key, true);
@@ -2158,19 +2198,22 @@ pub(crate) mod tests {
         }
         #[test]
         fn not_yet_valid_identity_is_rejected_before_transport_io() {
-            let Some(r) = testing::reactor() else { return };
+            let env = racer_io::Env::host();
+            let Some(r) = testing::reactor(&env) else {
+                return;
+            };
             let d = testing::Directory::new();
             let (ca, key) = testing::ca();
             let identity = enrolled(&r, &d, &ca, &key);
             assert!(identity.valid_at(racer_io::Clock::host().wall_now()));
-            let clock = crate::rt::environment::SimulationClock::new(17);
-            let environment = clock.environment(1);
+            let clock = racer_io::SimClock::new(17);
+            let environment = clock.ctx(1);
             // Roll only the scoped wall clock back after real enrollment. The generic
             // Identity has expiry only; Racer must enforce its not-before policy itself.
             clock.set_wall_time(SystemTime::now() - Duration::from_secs(3600));
-            let _guard = environment.enter();
-            assert!(!identity.valid_at(crate::test_support::clock().wall_now()));
-            session::tests::reject_future_identity(identity);
+            let env = racer_io::Env::new(env.driver.clone(), environment.clone());
+            assert!(!identity.valid_at(env.ctx.clock.clone().wall_now()));
+            session::tests::reject_future_identity(&env, identity);
         }
     }
 
@@ -2179,7 +2222,10 @@ pub(crate) mod tests {
 
         #[test]
         fn enrollment_requires_exactly_one_identity_san() {
-            let Some(r) = testing::reactor() else { return };
+            let env = racer_io::Env::host();
+            let Some(r) = testing::reactor(&env) else {
+                return;
+            };
             let d = testing::Directory::new();
             let scope = testing::scope();
             let enrollment = Enrollment::new(
@@ -2236,7 +2282,10 @@ pub(crate) mod tests {
         fn enrollment_and_renewal_refresh_authenticated_physical_inventory() {
             use rdma_verbs::simulation::Device;
             use rdma_verbs::simulation::Simulation;
-            let Some(r) = testing::reactor() else { return };
+            let env = racer_io::Env::host();
+            let Some(r) = testing::reactor(&env) else {
+                return;
+            };
             let d = testing::Directory::new();
             let scope = testing::scope();
             let io = Rc::new(ReactorControlIo::new(r.clone()));
@@ -2299,7 +2348,10 @@ pub(crate) mod tests {
 
         #[test]
         fn renewal_tracks_short_issued_lifetime_and_preserves_default() {
-            let Some(r) = testing::reactor() else { return };
+            let env = racer_io::Env::host();
+            let Some(r) = testing::reactor(&env) else {
+                return;
+            };
             for (lifetime, due) in [(120, 80), (86400, 57600), (86700, 57600)] {
                 let d = testing::Directory::new();
                 let e = Enrollment::new(
@@ -2335,14 +2387,13 @@ pub(crate) mod tests {
                 csr.params.extended_key_usages = vec![rcgen::ExtendedKeyUsagePurpose::ClientAuth];
                 response.certificate_chain = vec![csr.signed_by(&ca, &key).unwrap().der().to_vec()];
                 let identity = testing::drive(&r, e.accept_response(response, &scope)).unwrap();
-                let clock = crate::rt::environment::SimulationClock::new_at(
+                let clock = racer_io::SimClock::new_at(
                     51,
                     std::time::Instant::now(),
                     wall + Duration::from_secs(due - 1),
                 );
-                let sim_env = clock.environment(1);
-                let _time = sim_env.enter();
-                let sim_ctx = sim_env.worker_ctx();
+                let sim_env = clock.ctx(1);
+                let sim_ctx = sim_env.clone();
                 assert!(!identity.renewal_due_at(sim_ctx.clock.clone().wall_now()));
                 clock.advance(Duration::from_secs(1));
                 assert!(identity.renewal_due_at(sim_ctx.clock.clone().wall_now()));
@@ -2355,8 +2406,11 @@ pub(crate) mod tests {
 
         #[test]
         fn authenticated_replacement_preserves_cluster_key_and_correlation_checks() {
+            let env = racer_io::Env::host();
             for expired in [false, true] {
-                let Some(r) = testing::reactor() else { return };
+                let Some(r) = testing::reactor(&env) else {
+                    return;
+                };
                 let d = testing::Directory::new();
                 let e = Enrollment::new(
                     ClusterId("11111111-1111-4111-8111-111111111111".into()),
@@ -2375,16 +2429,22 @@ pub(crate) mod tests {
                     e.accept_response(testing::issue(&request, &ca, &key, OLD_NODE), &scope),
                 )
                 .unwrap();
-                let clock = crate::rt::environment::SimulationClock::new_at(
+                let clock = racer_io::SimClock::new_at(
                     31,
                     std::time::Instant::now(),
                     SystemTime::now() + Duration::from_secs(172800),
                 );
                 // The expired case continues on a reactor built on a clock two
                 // days ahead, over the same enrollment files.
-                let _time = expired.then(|| clock.environment(1).enter());
+                let env = if expired {
+                    racer_io::Env::new(env.driver.clone(), clock.ctx(1))
+                } else {
+                    env.clone()
+                };
                 let (r, e) = if expired {
-                    let Some(r) = testing::reactor() else { return };
+                    let Some(r) = testing::reactor(&env) else {
+                        return;
+                    };
                     let e = Enrollment::new(
                         e.cluster().clone(),
                         d.0.join("token"),
@@ -2488,7 +2548,10 @@ pub(crate) mod tests {
 
         #[test]
         fn replacement_crash_at_each_completion_recovers_and_reauthenticates() {
-            let Some(r) = testing::reactor() else { return };
+            let env = racer_io::Env::host();
+            let Some(r) = testing::reactor(&env) else {
+                return;
+            };
             let (ca, key) = testing::ca();
             let mut saw_old = false;
             let mut saw_new = false;
@@ -2567,7 +2630,10 @@ pub(crate) mod tests {
 
         #[test]
         fn durable_retry_key_pairing_identity_and_rotation() {
-            let Some(r) = testing::reactor() else { return };
+            let env = racer_io::Env::host();
+            let Some(r) = testing::reactor(&env) else {
+                return;
+            };
             let scope = testing::scope();
             let directory = testing::Directory::new();
             let token = directory.0.join("token");
@@ -2664,7 +2730,10 @@ pub(crate) mod tests {
         fn durable_rail_journal_prevents_restart_renumbering_and_corruption_fails_closed() {
             use rdma_verbs::simulation::Device;
             use rdma_verbs::simulation::Simulation;
-            let Some(r) = testing::reactor() else { return };
+            let env = racer_io::Env::host();
+            let Some(r) = testing::reactor(&env) else {
+                return;
+            };
             let scope = testing::scope();
             let directory = testing::Directory::new();
             let make = || {
@@ -2714,7 +2783,10 @@ pub(crate) mod tests {
             use crate::rdma::MAX_JOURNAL_BYTES;
             use racer_wire::control::RailId;
             use racer_wire::control::RailMapping;
-            let Some(r) = testing::reactor() else { return };
+            let env = racer_io::Env::host();
+            let Some(r) = testing::reactor(&env) else {
+                return;
+            };
             let scope = testing::scope();
             let directory = testing::Directory::new();
             let inventory: Arc<crate::rdma::Inventory> = Arc::new(Default::default());
@@ -2744,7 +2816,7 @@ pub(crate) mod tests {
                     Device::new(name(2000), [3; 16]),
                 ])
                 .unwrap();
-            let _environment = sim.enter();
+            let _devices = sim.enter();
             let make = || {
                 let io = Rc::new(ReactorControlIo::new(r.clone()));
                 let e = Enrollment::new(
@@ -2776,7 +2848,10 @@ pub(crate) mod tests {
         }
         #[test]
         fn rejects_symlinked_identity_and_insecure_modes() {
-            let Some(r) = testing::reactor() else { return };
+            let env = racer_io::Env::host();
+            let Some(r) = testing::reactor(&env) else {
+                return;
+            };
             let scope = testing::scope();
             use std::os::unix::fs::PermissionsExt;
             use std::os::unix::fs::symlink;
@@ -2824,10 +2899,10 @@ pub(crate) mod tests {
         use crate::test_support::enrollment as testing;
         #[test]
         fn secure_adapters_preserve_token_symlinks_identity_rejection_and_errors() {
-            use crate::rt::reactor::simulation::Simulation;
-            let sim = Simulation::new();
-            let _environment = sim.enter();
-            let r = testing::reactor().unwrap();
+            use racer_io::sim::SimOs;
+            let sim = SimOs::new();
+            let env = racer_io::Env::sim(&sim, racer_io::WorkerCtx::host());
+            let r = testing::reactor(&env).unwrap();
             let scope = testing::scope();
             sim.write_file(Path::new("/token-data"), b"token").unwrap();
             sim.symlink(Path::new("token-data"), Path::new("/token"))
@@ -2900,7 +2975,8 @@ pub(crate) mod tests {
         #[test]
         fn enrollment_creates_private_child_beneath_kubelet_host_path() {
             use std::os::unix::fs::PermissionsExt;
-            let Some(r) = testing::reactor() else {
+            let env = racer_io::Env::host();
+            let Some(r) = testing::reactor(&env) else {
                 return;
             };
             let d = testing::Directory::new();
@@ -2964,7 +3040,8 @@ pub(crate) mod tests {
         }
         #[test]
         fn canceled_replacement_never_exposes_partial_state_and_retry_fences_late_work() {
-            let Some(r) = testing::reactor() else {
+            let env = racer_io::Env::host();
+            let Some(r) = testing::reactor(&env) else {
                 return;
             };
             let d = testing::Directory::new();
@@ -3037,7 +3114,8 @@ pub(crate) mod tests {
         }
         #[test]
         fn canceled_replacement_at_each_submission_boundary_is_complete_or_old() {
-            let Some(r) = testing::reactor() else {
+            let env = racer_io::Env::host();
+            let Some(r) = testing::reactor(&env) else {
                 return;
             };
             let d = testing::Directory::new();
@@ -3095,7 +3173,8 @@ pub(crate) mod tests {
         }
         #[test]
         fn real_ring_enrollment_durability_projection_and_abandoned_retry() {
-            let Some(r) = testing::reactor() else {
+            let env = racer_io::Env::host();
+            let Some(r) = testing::reactor(&env) else {
                 return;
             };
             let d = testing::Directory::new();

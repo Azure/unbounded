@@ -94,8 +94,8 @@ fn direct_request(suffix: &str, fields: &str) -> Vec<u8> {
 }
 
 /// A fixture whose fake origin serves `body` as version "v1".
-fn direct_fixture(body: Vec<u8>, gpu: Option<Rc<dyn GpuService>>) -> Fixture {
-    direct_fixture_with(body, |responses| match gpu {
+fn direct_fixture(env: &racer_io::Env, body: Vec<u8>, gpu: Option<Rc<dyn GpuService>>) -> Fixture {
+    direct_fixture_with(env, body, |responses| match gpu {
         Some(gpu) => responses.with_gpu(gpu),
         None => responses,
     })
@@ -103,8 +103,12 @@ fn direct_fixture(body: Vec<u8>, gpu: Option<Rc<dyn GpuService>>) -> Fixture {
 
 /// A fixture whose fake origin serves `body`, with `setup` applied to the
 /// worker's responses.
-fn direct_fixture_with(body: Vec<u8>, setup: impl FnOnce(Responses) -> Responses) -> Fixture {
-    let mut fixture = Fixture::new();
+fn direct_fixture_with(
+    env: &racer_io::Env,
+    body: Vec<u8>,
+    setup: impl FnOnce(Responses) -> Responses,
+) -> Fixture {
+    let mut fixture = Fixture::new(env);
     let delivery = Rc::new(Delivery::new(
         fixture.reactor.clone(),
         Duration::from_secs(2),
@@ -115,6 +119,7 @@ fn direct_fixture_with(body: Vec<u8>, setup: impl FnOnce(Responses) -> Responses
     ));
     fixture.listeners.responses = Rc::new(responses);
     let worker = ReadWorker::new(
+        env,
         definition(),
         ObjectMetadata {
             content_type: None,
@@ -197,7 +202,8 @@ fn settle(fixture: &Fixture) {
 
 #[test]
 fn host_read_writes_the_range_at_the_destination_offset() {
-    let fixture = direct_fixture(b"hello".to_vec(), None);
+    let env = racer_io::Env::host();
+    let fixture = direct_fixture(&env, b"hello".to_vec(), None);
     let mut memfd = Memfd::new();
     memfd.file.write_all(&[b'.'; 16]).unwrap();
     let output = exchange(
@@ -225,9 +231,10 @@ fn host_read_writes_the_range_at_the_destination_offset() {
 
 #[test]
 fn host_read_spans_pages_and_whole_objects() {
+    let env = racer_io::Env::host();
     let length = PAGE_BYTES as usize + 3;
     let body: Vec<u8> = (0..length).map(|i| (i % 251) as u8).collect();
-    let fixture = direct_fixture(body.clone(), None);
+    let fixture = direct_fixture(&env, body.clone(), None);
     let mut memfd = Memfd::new();
     let output = exchange(
         &fixture,
@@ -255,8 +262,9 @@ fn host_read_spans_pages_and_whole_objects() {
 
 #[test]
 fn host_read_descriptor_errors_are_400_and_close_descriptors() {
+    let env = racer_io::Env::host();
     let fields = "Racer-Destination-Offset: 0\r\nRacer-Destination-Length: 5\r\n";
-    let fixture = direct_fixture(b"hello".to_vec(), None);
+    let fixture = direct_fixture(&env, b"hello".to_vec(), None);
     let memfd = Memfd::new();
     let fd = memfd.file.as_raw_fd();
     let plain = request("POST", "");
@@ -298,8 +306,9 @@ fn host_read_descriptor_errors_are_400_and_close_descriptors() {
 
 #[test]
 fn host_read_rejects_non_regular_and_read_only_descriptors() {
+    let env = racer_io::Env::host();
     let fields = "Racer-Destination-Offset: 0\r\nRacer-Destination-Length: 5\r\n";
-    let fixture = direct_fixture(b"hello".to_vec(), None);
+    let fixture = direct_fixture(&env, b"hello".to_vec(), None);
     let mut fds = [0; 2];
     assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
     let mut read = unsafe { File::from_raw_fd(fds[0]) };
@@ -331,7 +340,8 @@ fn host_read_rejects_non_regular_and_read_only_descriptors() {
 
 #[test]
 fn host_read_range_and_version_errors_keep_get_statuses() {
-    let fixture = direct_fixture(b"hello".to_vec(), None);
+    let env = racer_io::Env::host();
+    let fixture = direct_fixture(&env, b"hello".to_vec(), None);
     let mut memfd = Memfd::new();
     for (fields, status) in [
         // Destination smaller than the range.
@@ -364,8 +374,9 @@ fn host_read_range_and_version_errors_keep_get_statuses() {
 
 #[test]
 fn host_read_client_disconnect_closes_descriptor_and_releases_pages() {
+    let env = racer_io::Env::host();
     let length = 2 * PAGE_BYTES as usize + 1;
-    let fixture = direct_fixture(vec![b'x'; length], None);
+    let fixture = direct_fixture(&env, vec![b'x'; length], None);
     let memfd = Memfd::new();
     let mut socket = fixture.connect();
     send_with_fds(
@@ -386,7 +397,8 @@ fn host_read_client_disconnect_closes_descriptor_and_releases_pages() {
 
 #[test]
 fn gpu_read_is_validated_then_501_without_a_backend() {
-    let fixture = direct_fixture(b"hello".to_vec(), None);
+    let env = racer_io::Env::host();
+    let fixture = direct_fixture(&env, b"hello".to_vec(), None);
     let memfd = Memfd::new();
     let fd = memfd.file.as_raw_fd();
     for (fields, fds, status) in [
@@ -506,8 +518,13 @@ impl DirectSink for FakeSink {
 
 #[test]
 fn gpu_read_delivers_pages_through_the_backend_seam() {
+    let env = racer_io::Env::host();
     let recorded = Rc::new(RefCell::new(Recorded::default()));
-    let fixture = direct_fixture(b"hello".to_vec(), Some(Rc::new(FakeGpu(recorded.clone()))));
+    let fixture = direct_fixture(
+        &env,
+        b"hello".to_vec(),
+        Some(Rc::new(FakeGpu(recorded.clone()))),
+    );
     let memfd = Memfd::new();
     let output = exchange(
         &fixture,
@@ -545,8 +562,13 @@ fn gpu_read_delivers_pages_through_the_backend_seam() {
 
 #[test]
 fn gpu_read_passes_the_client_gpu_uuid_to_the_backend() {
+    let env = racer_io::Env::host();
     let recorded = Rc::new(RefCell::new(Recorded::default()));
-    let fixture = direct_fixture(b"hello".to_vec(), Some(Rc::new(FakeGpu(recorded.clone()))));
+    let fixture = direct_fixture(
+        &env,
+        b"hello".to_vec(),
+        Some(Rc::new(FakeGpu(recorded.clone()))),
+    );
     let memfd = Memfd::new();
     let output = exchange(
         &fixture,
@@ -566,8 +588,13 @@ fn gpu_read_passes_the_client_gpu_uuid_to_the_backend() {
 
 #[test]
 fn gpu_read_rejects_a_malformed_gpu_uuid() {
+    let env = racer_io::Env::host();
     let recorded = Rc::new(RefCell::new(Recorded::default()));
-    let fixture = direct_fixture(b"hello".to_vec(), Some(Rc::new(FakeGpu(recorded.clone()))));
+    let fixture = direct_fixture(
+        &env,
+        b"hello".to_vec(),
+        Some(Rc::new(FakeGpu(recorded.clone()))),
+    );
     let memfd = Memfd::new();
     let output = exchange(
         &fixture,
@@ -593,7 +620,8 @@ mod gpu;
 /// serving the host-read and closes its carried descriptor.
 #[test]
 fn pipelined_head_then_host_read_serves_the_head_and_closes_the_descriptor() {
-    let fixture = direct_fixture(b"hello".to_vec(), None);
+    let env = racer_io::Env::host();
+    let fixture = direct_fixture(&env, b"hello".to_vec(), None);
     let mut memfd = Memfd::new();
     memfd.file.write_all(&[b'.'; 8]).unwrap();
     let mut socket = fixture.connect();

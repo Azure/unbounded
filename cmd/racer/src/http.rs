@@ -96,6 +96,7 @@ pub async fn exchange_head(
 }
 pub fn new_pipe_pool(
     admission: Rc<flow_control::Quotas<AdmissionPolicy>>,
+    #[cfg_attr(not(test), allow(unused_variables))] sim: Option<racer_io::sim::SimOs>,
 ) -> PipePool<AdmissionPolicy> {
     let waiter_limit = admission.policy().limits().queue_entries.get();
     let pool = PipePool::new(
@@ -104,10 +105,10 @@ pub fn new_pipe_pool(
         ResourceClass::RequestContext,
         waiter_limit,
     );
-    // Migration shim: test worlds are still selected thread-locally.
+    // Simulated reactors keep their pipes in the same world.
     #[cfg(test)]
-    if let Some(sim) = crate::rt::reactor::simulation::Simulation::current() {
-        return pool.simulated(sim.os().clone());
+    if let Some(sim) = sim {
+        return pool.simulated(sim);
     }
     pool
 }
@@ -676,7 +677,7 @@ impl Delivery {
         Self {
             metrics: crate::telemetry::Metrics::default(),
             #[cfg(test)]
-            pipes: Rc::new(new_pipe_pool(reactor.admission().clone())),
+            pipes: Rc::new(new_pipe_pool(reactor.admission().clone(), reactor.sim_os())),
             reactor,
             stall_timeout,
         }
@@ -860,11 +861,12 @@ pub(crate) mod tests {
     fn exchange_owners_report_only_finished_verification_and_release_on_idle() {
         use crate::telemetry::{Event, Gauge, Metrics};
         use http1::connection::State as _;
+        let env = racer_io::Env::host();
 
         for adaptive in [false, true] {
             for receive in [false, true] {
                 for finish in [false, true] {
-                    let (admission, _, _, scope) = setup();
+                    let (admission, _, _, scope) = setup(&env);
                     let metrics = Metrics::default();
                     let peers = crate::peer::AdaptivePeers::new(
                         crate::peer::Config {
@@ -954,6 +956,7 @@ pub(crate) mod tests {
     #[test]
     fn relay_owners_preserve_partial_admission_and_move_body_resources_together() {
         use http1::connection::State as _;
+        let env = racer_io::Env::host();
 
         for reserved in [false, true] {
             for context in [false, true] {
@@ -962,9 +965,9 @@ pub(crate) mod tests {
                         if piped && !staged {
                             continue;
                         }
-                        let (admission, _, _, _) = setup();
+                        let (admission, _, _, _) = setup(&env);
                         let baseline = admission.used(ResourceClass::RequestContext);
-                        let pipes = new_pipe_pool(admission.clone());
+                        let pipes = new_pipe_pool(admission.clone(), env.sim_os().cloned());
                         let mut state = State {
                             relay: RelayResources::admitted(reserved.then(|| {
                                 Rc::new(admission.reserve(None, ResourceClass::Relay, 1).unwrap())
@@ -1015,12 +1018,13 @@ pub(crate) mod tests {
     /// A submitted head owns the staged downstream body until cancellation fences.
     #[test]
     fn relay_owners_survive_head_send_abandonment_until_completion_fence() {
+        let env = racer_io::Env::host();
         for submit in [false, true] {
             for cancel in [false, true] {
-                let (admission, reactor, io, scope) = setup();
+                let (admission, reactor, io, scope) = setup(&env);
                 reactor.init().unwrap();
                 let baseline = admission.used(ResourceClass::RequestContext);
-                let pipes = new_pipe_pool(admission.clone());
+                let pipes = new_pipe_pool(admission.clone(), env.sim_os().cloned());
                 let (upstream, _reader) = UnixStream::pair().unwrap();
                 let (downstream, _writer) = UnixStream::pair().unwrap();
                 let mut destination = from_accepted(upstream.into(), &admission).unwrap();
@@ -1168,6 +1172,7 @@ pub(crate) mod tests {
             )))
         }
         fn setup(
+            env: &racer_io::Env,
             pipes: usize,
             stall: Duration,
         ) -> (
@@ -1176,8 +1181,11 @@ pub(crate) mod tests {
             Delivery,
         ) {
             let admission = admission(pipes);
-            let reactor = Rc::new(Reactor::new(admission.clone(), &crate::test_support::env()));
-            let pool = Rc::new(crate::http::new_pipe_pool(admission.clone()));
+            let reactor = Rc::new(Reactor::new(admission.clone(), env));
+            let pool = Rc::new(crate::http::new_pipe_pool(
+                admission.clone(),
+                env.sim_os().cloned(),
+            ));
             (
                 admission,
                 reactor.clone(),
@@ -1304,7 +1312,8 @@ pub(crate) mod tests {
         }
         #[test]
         fn page_send_range_is_a_stable_admitted_immutable_subrange() {
-            let (admission, _, _) = setup(1, Duration::from_secs(1));
+            let env = racer_io::Env::host();
+            let (admission, _, _) = setup(&env, 1, Duration::from_secs(1));
             let page = page(&admission, b"prefix-selected-suffix".to_vec());
             let weak = Arc::downgrade(&page.inner);
             let pointer = page.bytes()[7..].as_ptr();
@@ -1335,8 +1344,9 @@ pub(crate) mod tests {
         }
         #[test]
         fn copying_http_send_keeps_full_admission_until_failure_fence() {
+            let env = racer_io::Env::host();
             for failure in ["abandon", "cancel", "disconnect", "deadline", "drain"] {
-                let (admission, reactor, delivery) = setup(1, Duration::from_secs(2));
+                let (admission, reactor, delivery) = setup(&env, 1, Duration::from_secs(2));
                 let page = page(&admission, vec![0x5a; 512 * 1024]);
                 let weak = Arc::downgrade(&page.inner);
                 let reader = delivery.attach(page, slice(7, 500 * 1024)).unwrap();
@@ -1418,9 +1428,10 @@ pub(crate) mod tests {
         fn loopback_backpressure_thread_cpu() {
             use std::net::TcpListener;
             use std::net::TcpStream;
+            let env = racer_io::Env::host();
             const LENGTH: usize = 512 * 1024;
             const PAGES: usize = 1024;
-            let (admission, reactor, delivery) = setup(1, Duration::from_secs(5));
+            let (admission, reactor, delivery) = setup(&env, 1, Duration::from_secs(5));
             let bytes: Vec<u8> = (0..LENGTH).map(|i| (i % 251) as u8).collect();
             let page = page(&admission, bytes.clone());
             let listener = TcpListener::bind("127.0.0.1:0").unwrap();
@@ -1532,7 +1543,8 @@ pub(crate) mod tests {
         }
         #[test]
         fn independent_slices_share_page_until_last_reader_and_return_socket() {
-            let (admission, reactor, delivery) = setup(2, Duration::from_secs(1));
+            let env = racer_io::Env::host();
+            let (admission, reactor, delivery) = setup(&env, 2, Duration::from_secs(1));
             let page = page(&admission, b"0123456789".to_vec());
             let weak = Arc::downgrade(&page.inner);
             let first = delivery.attach(page.clone(), slice(1, 3)).unwrap();
@@ -1559,7 +1571,8 @@ pub(crate) mod tests {
         }
         #[test]
         fn fallback_after_partial_splice_restarts_at_accepted_cursor() {
-            let (admission, reactor, delivery) = setup(1, Duration::from_secs(1));
+            let env = racer_io::Env::host();
+            let (admission, reactor, delivery) = setup(&env, 1, Duration::from_secs(1));
             let page = page(&admission, b"0123456789".to_vec());
             let mut reader = delivery.attach(page, slice(1, 8)).unwrap();
             let (socket, mut peer) = UnixStream::pair().unwrap();
@@ -1586,7 +1599,8 @@ pub(crate) mod tests {
         fn tcp_splice_delivers_selected_slice_and_returns_connection() {
             use std::net::TcpListener;
             use std::net::TcpStream;
-            let (admission, reactor, delivery) = setup(1, Duration::from_secs(1));
+            let env = racer_io::Env::host();
+            let (admission, reactor, delivery) = setup(&env, 1, Duration::from_secs(1));
             let listener = TcpListener::bind("127.0.0.1:0").unwrap();
             let mut peer = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
             let (socket, _) = listener.accept().unwrap();
@@ -1610,7 +1624,8 @@ pub(crate) mod tests {
         }
         #[test]
         fn invalid_ranges_fail_without_sending() {
-            let (admission, _, delivery) = setup(1, Duration::from_secs(1));
+            let env = racer_io::Env::host();
+            let (admission, _, delivery) = setup(&env, 1, Duration::from_secs(1));
             let page = page(&admission, b"abc".to_vec());
             for invalid in [
                 slice(4, 0),
@@ -1630,7 +1645,8 @@ pub(crate) mod tests {
         }
         #[test]
         fn framed_delivery_and_empty_slices_work() {
-            let (admission, reactor, delivery) = setup(1, Duration::from_secs(1));
+            let env = racer_io::Env::host();
+            let (admission, reactor, delivery) = setup(&env, 1, Duration::from_secs(1));
             let page = page(&admission, b"abc".to_vec());
             let (socket, mut peer) = UnixStream::pair().unwrap();
             let reader = delivery.attach(page.clone(), slice(1, 2)).unwrap();
@@ -1656,7 +1672,8 @@ pub(crate) mod tests {
         }
         #[test]
         fn canceled_expired_and_disconnected_readers_release_resources() {
-            let (admission, reactor, delivery) = setup(1, Duration::from_secs(1));
+            let env = racer_io::Env::host();
+            let (admission, reactor, delivery) = setup(&env, 1, Duration::from_secs(1));
             for failure in [Error::Cancelled, Error::DeadlineExceeded, Error::Io] {
                 let mut scope = scope();
                 let (socket, peer) = UnixStream::pair().unwrap();
@@ -1678,7 +1695,8 @@ pub(crate) mod tests {
         }
         #[test]
         fn rejects_nonsockets_and_datagrams() {
-            let (admission, reactor, delivery) = setup(1, Duration::from_secs(1));
+            let env = racer_io::Env::host();
+            let (admission, reactor, delivery) = setup(&env, 1, Duration::from_secs(1));
             let page = page(&admission, b"abc".to_vec());
             let reader = delivery.attach(page.clone(), slice(0, 3)).unwrap();
             let file = std::fs::File::open("/dev/null").unwrap();
@@ -1705,7 +1723,8 @@ pub(crate) mod tests {
         }
         #[test]
         fn stalled_reader_times_out_without_canceling_another_reader() {
-            let (admission, reactor, delivery) = setup(2, Duration::from_millis(25));
+            let env = racer_io::Env::host();
+            let (admission, reactor, delivery) = setup(&env, 2, Duration::from_millis(25));
             let page = page(&admission, vec![0x5a; 512 * 1024]);
             let weak = Arc::downgrade(&page.inner);
             let slow = delivery.attach(page.clone(), slice(0, 512 * 1024)).unwrap();
@@ -1739,7 +1758,8 @@ pub(crate) mod tests {
         }
         #[test]
         fn http_delivery_preserves_framing_and_owned_connection() {
-            let (admission, reactor, delivery) = setup(1, Duration::from_secs(1));
+            let env = racer_io::Env::host();
+            let (admission, reactor, delivery) = setup(&env, 1, Duration::from_secs(1));
             let page = page(&admission, b"abc".to_vec());
             let (socket, mut peer) = UnixStream::pair().unwrap();
             let mut connection = crate::http::from_accepted(socket.into(), &admission).unwrap();
@@ -1769,7 +1789,8 @@ pub(crate) mod tests {
         }
         #[test]
         fn http_delivery_rejects_missing_or_insufficient_body_framing() {
-            let (admission, reactor, delivery) = setup(1, Duration::from_secs(1));
+            let env = racer_io::Env::host();
+            let (admission, reactor, delivery) = setup(&env, 1, Duration::from_secs(1));
             for (remaining, slice) in [
                 (None, slice(0, 3)),
                 (None, slice(3, 0)),
@@ -1790,7 +1811,8 @@ pub(crate) mod tests {
         }
         #[test]
         fn http_connection_and_reader_admission_survive_readiness_wait() {
-            let (admission, reactor, delivery) = setup(1, Duration::from_secs(1));
+            let env = racer_io::Env::host();
+            let (admission, reactor, delivery) = setup(&env, 1, Duration::from_secs(1));
             let (reader, connection, _peer, weak) = blocked_reader(&admission, &delivery);
             let scope = scope();
             let mut operation = delivery.finish_to(reader, connection, &scope);
@@ -1814,7 +1836,8 @@ pub(crate) mod tests {
         }
         #[test]
         fn original_deadline_caps_a_longer_stall_timeout() {
-            let (admission, reactor, delivery) = setup(1, Duration::from_secs(30));
+            let env = racer_io::Env::host();
+            let (admission, reactor, delivery) = setup(&env, 1, Duration::from_secs(30));
             let (reader, connection, _peer, _) = blocked_reader(&admission, &delivery);
             let mut scope = scope();
             scope.deadline = Deadline(Instant::now() + Duration::from_millis(25));
@@ -1827,7 +1850,8 @@ pub(crate) mod tests {
         }
         #[test]
         fn abandoned_http_send_does_not_cycle_through_reactor_owner() {
-            let (admission, reactor, delivery) = setup(1, Duration::from_secs(1));
+            let env = racer_io::Env::host();
+            let (admission, reactor, delivery) = setup(&env, 1, Duration::from_secs(1));
             let weak_reactor = Rc::downgrade(&reactor);
             let (reader, connection, _peer, weak_page) = blocked_reader(&admission, &delivery);
             let scope = scope();
@@ -1847,7 +1871,8 @@ pub(crate) mod tests {
         }
         #[test]
         fn abandoned_http_send_retains_all_leases_until_completion_fence() {
-            let (admission, reactor, delivery) = setup(1, Duration::from_secs(1));
+            let env = racer_io::Env::host();
+            let (admission, reactor, delivery) = setup(&env, 1, Duration::from_secs(1));
             let (reader, connection, _peer, weak) = blocked_reader(&admission, &delivery);
             let scope = scope();
             let mut operation = delivery.finish_to(reader, connection, &scope);
@@ -1870,8 +1895,9 @@ pub(crate) mod tests {
         }
         #[test]
         fn reactor_drain_fences_pending_http_delivery_and_releases_all_leases() {
+            let env = racer_io::Env::host();
             for abandon in [false, true] {
-                let (admission, reactor, delivery) = setup(1, Duration::from_secs(30));
+                let (admission, reactor, delivery) = setup(&env, 1, Duration::from_secs(30));
                 let (reader, connection, _peer, weak) = blocked_reader(&admission, &delivery);
                 let scope = scope();
                 let mut operation = delivery.finish_to(reader, connection, &scope);
@@ -1913,7 +1939,8 @@ pub(crate) mod tests {
         }
         #[test]
         fn http_splice_and_backpressure_send_deliver_exactly_once() {
-            let (admission, reactor, delivery) = setup(1, Duration::from_secs(2));
+            let env = racer_io::Env::host();
+            let (admission, reactor, delivery) = setup(&env, 1, Duration::from_secs(2));
             let bytes: Vec<u8> = (0..512 * 1024).map(|i| (i % 251) as u8).collect();
             let mut backing = b"prefix!".to_vec();
             backing.extend_from_slice(&bytes);
@@ -1988,7 +2015,8 @@ pub(crate) mod tests {
         }
         #[test]
         fn pending_http_send_cancellation_disconnect_and_stall_release_all_leases() {
-            let (admission, reactor, delivery) = setup(1, Duration::from_millis(25));
+            let env = racer_io::Env::host();
+            let (admission, reactor, delivery) = setup(&env, 1, Duration::from_millis(25));
             for failure in [
                 Error::Cancelled,
                 Error::Os(libc::EPIPE),
@@ -2024,7 +2052,8 @@ pub(crate) mod tests {
         }
         #[test]
         fn unpolled_http_delivery_closes_connection_and_releases_admission() {
-            let (admission, reactor, delivery) = setup(1, Duration::from_secs(1));
+            let env = racer_io::Env::host();
+            let (admission, reactor, delivery) = setup(&env, 1, Duration::from_secs(1));
             let page = page(&admission, b"abc".to_vec());
             let weak = Arc::downgrade(&page.inner);
             let reader = delivery.attach(page, slice(0, 3)).unwrap();
@@ -2052,7 +2081,8 @@ pub(crate) mod tests {
         fn tcp_http_delivery_survives_page_and_pipe_release_before_peer_reads() {
             use std::net::TcpListener;
             use std::net::TcpStream;
-            let (admission, reactor, delivery) = setup(1, Duration::from_secs(1));
+            let env = racer_io::Env::host();
+            let (admission, reactor, delivery) = setup(&env, 1, Duration::from_secs(1));
             let listener = TcpListener::bind("127.0.0.1:0").unwrap();
             let mut peer = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
             peer.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
@@ -2086,9 +2116,9 @@ pub(crate) mod tests {
 
     mod pool {
         use super::*;
-        use crate::rt::reactor::simulation::Fault;
-        use crate::rt::reactor::simulation::Simulation;
         use crate::test_support::WakeCounter;
+        use racer_io::sim::Fault;
+        use racer_io::sim::SimOs;
         use std::sync::Arc;
         use std::task::Waker;
         enum Listener {
@@ -2136,15 +2166,17 @@ pub(crate) mod tests {
                 }
             }
         }
-        fn scope() -> RequestScope {
+        fn scope(env: &racer_io::Env) -> RequestScope {
             RequestScope::on(
-                &crate::test_support::clock(),
+                &env.ctx.clock,
                 RequestId([7; 16]),
-                crate::rt::environment::now() + Duration::from_secs(5),
+                env.ctx.now() + Duration::from_secs(5),
             )
             .unwrap()
         }
-        fn setup() -> (
+        fn setup(
+            env: &racer_io::Env,
+        ) -> (
             Rc<flow_control::Quotas<AdmissionPolicy>>,
             Rc<Reactor>,
             HttpPool,
@@ -2154,7 +2186,7 @@ pub(crate) mod tests {
             // A small outbound budget keeps quota-filling tests short.
             limits.outbound_connections = std::num::NonZeroUsize::new(8).unwrap();
             let admission = Rc::new(flow_control::Quotas::new(AdmissionPolicy::new(limits)));
-            let reactor = Rc::new(Reactor::new(admission.clone(), &crate::test_support::env()));
+            let reactor = Rc::new(Reactor::new(admission.clone(), env));
             reactor.init().unwrap();
             let mut pool = new_pool(reactor.clone(), admission.clone(), 1);
             pool.config_mut().secondary_cap = 2;
@@ -2162,16 +2194,18 @@ pub(crate) mod tests {
         }
         // Hold a real checked-out connection only after a complete head/body exchange.
         fn held(
+            env: &racer_io::Env,
             pool: &HttpPool,
             reactor: &Rc<Reactor>,
             admission: &Rc<flow_control::Quotas<AdmissionPolicy>>,
             endpoint: &Endpoint,
             listener: &Listener,
         ) -> (ConnectionLease, ConnectionLease) {
-            exchanged(pool, reactor, admission, endpoint, listener, true)
+            exchanged(env, pool, reactor, admission, endpoint, listener, true)
         }
         /// Complete one real exchange through an ordinary or metadata checkout.
         fn exchanged(
+            env: &racer_io::Env,
             pool: &HttpPool,
             reactor: &Rc<Reactor>,
             admission: &Rc<flow_control::Quotas<AdmissionPolicy>>,
@@ -2179,7 +2213,7 @@ pub(crate) mod tests {
             listener: &Listener,
             metadata: bool,
         ) -> (ConnectionLease, ConnectionLease) {
-            let scope = scope();
+            let scope = scope(env);
             let io = new_io(reactor.clone(), Codec::new(4096), admission.clone(), 16);
             let client = async {
                 let connection = if metadata {
@@ -2240,7 +2274,8 @@ pub(crate) mod tests {
         }
         #[test]
         fn peer_tcp_nodelay_does_not_touch_unix_or_origin_sockets() {
-            let (admission, reactor, mut pool) = setup();
+            let env = racer_io::Env::host();
+            let (admission, reactor, mut pool) = setup(&env);
             pool.config_mut().tcp_nodelay = true;
             let (listener, endpoint) = Listener::origin();
             let Endpoint::Unix(path) = endpoint else {
@@ -2253,7 +2288,7 @@ pub(crate) mod tests {
                     cache: racer_wire::control::CacheId("nodelay-test".into()),
                 },
             ] {
-                let scope = scope();
+                let scope = scope(&env);
                 let connection = drive(&reactor, pool.checkout(&endpoint, &scope)).unwrap();
                 let accepted = listener.accept().unwrap();
                 drop(connection);
@@ -2263,14 +2298,14 @@ pub(crate) mod tests {
         }
         #[test]
         fn origin_wait_is_bounded_fifo_without_blocking_peers_or_other_caches() {
-            let clock = crate::rt::environment::SimulationClock::new(92);
-            let _environment = clock.environment(0).enter();
-            let (admission, reactor, pool) = setup();
+            let clock = racer_io::SimClock::new(92);
+            let env = racer_io::Env::new(racer_io::Driver::Uring, clock.ctx(0));
+            let (admission, reactor, pool) = setup(&env);
             let (listener, endpoint) = Listener::origin();
-            let (first, a) = held(&pool, &reactor, &admission, &endpoint, &listener);
-            let (second, b) = held(&pool, &reactor, &admission, &endpoint, &listener);
+            let (first, a) = held(&env, &pool, &reactor, &admission, &endpoint, &listener);
+            let (second, b) = held(&env, &pool, &reactor, &admission, &endpoint, &listener);
             let baseline = admission.used(ResourceClass::RequestContext);
-            let scope = scope();
+            let scope = scope(&env);
             let count = Arc::new(WakeCounter::default());
             let waker = Waker::from(count.clone());
             let mut cx = Context::from_waker(&waker);
@@ -2291,7 +2326,7 @@ pub(crate) mod tests {
             assert_eq!(reactor.in_flight(), 0);
             // A full origin queue does not gate peers or unrelated caches; peer saturation is immediate.
             for (listener, other) in [Listener::peer(), Listener::origin()] {
-                let (lease, _peer) = held(&pool, &reactor, &admission, &other, &listener);
+                let (lease, _peer) = held(&env, &pool, &reactor, &admission, &other, &listener);
                 if matches!(other, Endpoint::Peer(_)) {
                     assert!(matches!(
                         pool.checkout(&other, &scope).as_mut().poll(&mut cx),
@@ -2331,7 +2366,8 @@ pub(crate) mod tests {
         }
         #[test]
         fn origin_uid_churn_preserves_endpoint_and_connection_bounds() {
-            let (admission, reactor, mut pool) = setup();
+            let env = racer_io::Env::host();
+            let (admission, reactor, mut pool) = setup(&env);
             pool.config_mut().max_endpoints = 1;
             let (listener, endpoint) = Listener::origin();
             let Endpoint::Unix(path) = endpoint else {
@@ -2341,7 +2377,7 @@ pub(crate) mod tests {
                 cache: racer_wire::control::CacheId(format!("cache-{uid}")),
                 path: path.clone(),
             };
-            let (first, peer) = held(&pool, &reactor, &admission, &origin(0), &listener);
+            let (first, peer) = held(&env, &pool, &reactor, &admission, &origin(0), &listener);
             assert!(matches!(
                 pool.prepare_connection(&origin(1)),
                 Err(Error::Overloaded)
@@ -2349,7 +2385,8 @@ pub(crate) mod tests {
             assert_eq!(pool.snapshot().entries.len(), 1);
             drop((first, peer));
             for uid in 1..32 {
-                let (connection, peer) = held(&pool, &reactor, &admission, &origin(uid), &listener);
+                let (connection, peer) =
+                    held(&env, &pool, &reactor, &admission, &origin(uid), &listener);
                 assert_eq!(pool.snapshot().entries.len(), 1);
                 assert_eq!(admission.used(ResourceClass::OutboundConnection), 1);
                 drop((connection, peer));
@@ -2359,7 +2396,8 @@ pub(crate) mod tests {
         }
         #[test]
         fn origin_cap_is_independent_of_peer_cap_and_idle_quota_is_reclaimed() {
-            let (admission, reactor, pool) = setup();
+            let env = racer_io::Env::host();
+            let (admission, reactor, pool) = setup(&env);
             let (listener, endpoint) = Listener::origin();
             let Endpoint::Unix(path) = endpoint else {
                 unreachable!()
@@ -2368,8 +2406,8 @@ pub(crate) mod tests {
                 cache: racer_wire::control::CacheId("cache".into()),
                 path,
             };
-            let (first, a) = held(&pool, &reactor, &admission, &origin, &listener);
-            let (second, b) = held(&pool, &reactor, &admission, &origin, &listener);
+            let (first, a) = held(&env, &pool, &reactor, &admission, &origin, &listener);
+            let (second, b) = held(&env, &pool, &reactor, &admission, &origin, &listener);
             drop(second);
             let (second, address) = pool.prepare_connection(&origin).unwrap();
             assert!(
@@ -2396,7 +2434,8 @@ pub(crate) mod tests {
         }
         #[test]
         fn metadata_bypasses_queued_pages_within_existing_origin_cap() {
-            let (admission, reactor, pool) = setup();
+            let env = racer_io::Env::host();
+            let (admission, reactor, pool) = setup(&env);
             let (listener, endpoint) = Listener::origin();
             let Endpoint::Unix(path) = endpoint else {
                 unreachable!()
@@ -2405,11 +2444,11 @@ pub(crate) mod tests {
                 cache: racer_wire::control::CacheId("cache".into()),
                 path,
             };
-            let (first, a) = held(&pool, &reactor, &admission, &endpoint, &listener);
-            let (idle, b) = held(&pool, &reactor, &admission, &endpoint, &listener);
+            let (first, a) = held(&env, &pool, &reactor, &admission, &endpoint, &listener);
+            let (idle, b) = held(&env, &pool, &reactor, &admission, &endpoint, &listener);
             let baseline = admission.used(ResourceClass::RequestContext);
             drop(idle);
-            let scope = scope();
+            let scope = scope(&env);
             let mut cx = Context::from_waker(futures::task::noop_waker_ref());
             let mut page = pool.checkout_wait(&endpoint, &scope);
             assert!(page.as_mut().poll(&mut cx).is_pending());
@@ -2426,7 +2465,8 @@ pub(crate) mod tests {
         }
         #[test]
         fn metadata_keeps_shared_outbound_reserve_when_two_caches_saturate_pages() {
-            let (admission, reactor, mut pool) = setup();
+            let env = racer_io::Env::host();
+            let (admission, reactor, mut pool) = setup(&env);
             let outbound = admission.limit(ResourceClass::OutboundConnection);
             assert!(outbound >= 2, "test needs a metadata reserve");
             pool.config_mut().secondary_cap = outbound;
@@ -2453,12 +2493,12 @@ pub(crate) mod tests {
                 outbound - racer_core::admission::METADATA_OUTBOUND_RESERVE
             );
             assert!(pool.snapshot().entries[&a].0 > 0 && pool.snapshot().entries[&b].0 > 0);
-            let scope = scope();
+            let scope = scope(&env);
             let mut cx = Context::from_waker(futures::task::noop_waker_ref());
             let mut page = pool.checkout_wait(&a, &scope);
             assert!(page.as_mut().poll(&mut cx).is_pending());
             // Metadata completes a real exchange without any page releasing.
-            let (metadata, peer) = held(&pool, &reactor, &admission, &b, &listener);
+            let (metadata, peer) = held(&env, &pool, &reactor, &admission, &b, &listener);
             assert_eq!(admission.used(ResourceClass::OutboundConnection), outbound);
             assert!(page.as_mut().poll(&mut cx).is_pending());
             // A pooled metadata socket cannot be reused to bypass the ordinary cap.
@@ -2481,7 +2521,8 @@ pub(crate) mod tests {
         }
         #[test]
         fn ordinary_checkout_reuses_page_sockets_beneath_idle_metadata_socket() {
-            let (admission, reactor, mut pool) = setup();
+            let env = racer_io::Env::host();
+            let (admission, reactor, mut pool) = setup(&env);
             let outbound = admission.limit(ResourceClass::OutboundConnection);
             assert!(outbound >= 2, "test needs a metadata reserve");
             pool.config_mut().secondary_cap = outbound;
@@ -2496,9 +2537,9 @@ pub(crate) mod tests {
             let ordinary = outbound - racer_core::admission::METADATA_OUTBOUND_RESERVE;
             // Real page connections fill the ordinary quota.
             let (pages, mut peers): (Vec<_>, Vec<_>) = (0..ordinary)
-                .map(|_| exchanged(&pool, &reactor, &admission, &origin, &listener, false))
+                .map(|_| exchanged(&env, &pool, &reactor, &admission, &origin, &listener, false))
                 .unzip();
-            let (metadata, peer) = held(&pool, &reactor, &admission, &origin, &listener);
+            let (metadata, peer) = held(&env, &pool, &reactor, &admission, &origin, &listener);
             peers.push(peer);
             assert_eq!(admission.used(ResourceClass::OutboundConnection), outbound);
             // Pages return idle before the metadata socket, which lands on top.
@@ -2534,7 +2575,8 @@ pub(crate) mod tests {
         }
         #[test]
         fn ordinary_checkout_reclaims_other_cache_idle_pages_before_metadata_overload() {
-            let (admission, reactor, mut pool) = setup();
+            let env = racer_io::Env::host();
+            let (admission, reactor, mut pool) = setup(&env);
             let outbound = admission.limit(ResourceClass::OutboundConnection);
             assert!(outbound >= 2, "test needs a metadata reserve");
             pool.config_mut().secondary_cap = outbound;
@@ -2550,9 +2592,10 @@ pub(crate) mod tests {
             let ordinary = outbound - racer_core::admission::METADATA_OUTBOUND_RESERVE;
             // Cache B's pages hold every ordinary charge; cache A holds only metadata.
             let (pages, mut peers): (Vec<_>, Vec<_>) = (0..ordinary)
-                .map(|_| exchanged(&pool, &reactor, &admission, &b, &listener, false))
+                .map(|_| exchanged(&env, &pool, &reactor, &admission, &b, &listener, false))
                 .unzip();
-            let (metadata, peer) = exchanged(&pool, &reactor, &admission, &a, &listener, true);
+            let (metadata, peer) =
+                exchanged(&env, &pool, &reactor, &admission, &a, &listener, true);
             peers.push(peer);
             drop(metadata);
             assert_eq!(pool.snapshot().entries[&a].1, 1);
@@ -2577,15 +2620,17 @@ pub(crate) mod tests {
         }
         #[test]
         fn opaque_staging_and_connection_reservations_survive_reactor_abandonment() {
+            let env = racer_io::Env::host();
             let admission = Rc::new(flow_control::Quotas::new(AdmissionPolicy::new(
                 crate::test_support::cluster::config(false).limits,
             )));
-            let reactor = Rc::new(Reactor::new(admission.clone(), &crate::test_support::env()));
+            let reactor = Rc::new(Reactor::new(admission.clone(), &env));
             reactor.init().unwrap();
             let baseline = admission.used(ResourceClass::RequestContext);
             let pool = new_pool(reactor.clone(), admission.clone(), 1);
             let (listener, endpoint) = Listener::peer();
-            let (mut connection, peer) = held(&pool, &reactor, &admission, &endpoint, &listener);
+            let (mut connection, peer) =
+                held(&env, &pool, &reactor, &admission, &endpoint, &listener);
             let scope =
                 RequestScope::host(RequestId([9; 16]), Instant::now() + Duration::from_secs(5))
                     .unwrap();
@@ -2651,12 +2696,12 @@ pub(crate) mod tests {
                 (libc::EADDRNOTAVAIL, false),
                 (libc::ECONNREFUSED, true),
             ] {
-                let simulation = Simulation::new();
-                let _env = simulation.enter();
+                let simulation = SimOs::new();
+                let env = racer_io::Env::sim(&simulation, racer_io::WorkerCtx::host());
                 let admission = Rc::new(flow_control::Quotas::new(AdmissionPolicy::new(
                     crate::test_support::cluster::config(false).limits,
                 )));
-                let reactor = Rc::new(Reactor::new(admission.clone(), &crate::test_support::env()));
+                let reactor = Rc::new(Reactor::new(admission.clone(), &env));
                 let pool = new_pool(reactor.clone(), admission, 1);
                 let metrics = Metrics::default();
                 let peers = crate::peer::AdaptivePeers::new(
@@ -2761,12 +2806,12 @@ pub(crate) mod tests {
             scope: RequestScope,
         }
         impl Fixture {
-            fn new() -> Self {
+            fn new(env: &racer_io::Env) -> Self {
                 let mut limits = crate::test_support::cluster::config(false).limits;
                 limits.pipes = std::num::NonZeroUsize::new(1).unwrap();
                 limits.relay_transfers = std::num::NonZeroUsize::new(1).unwrap();
                 let admission = Rc::new(flow_control::Quotas::new(AdmissionPolicy::new(limits)));
-                let reactor = Rc::new(Reactor::new(admission.clone(), &crate::test_support::env()));
+                let reactor = Rc::new(Reactor::new(admission.clone(), env));
                 reactor.init().unwrap();
                 Self {
                     io: new_io(
@@ -2775,7 +2820,7 @@ pub(crate) mod tests {
                         admission.clone(),
                         crate::model::PAGE_BYTES + 16,
                     ),
-                    pipes: new_pipe_pool(admission.clone()),
+                    pipes: new_pipe_pool(admission.clone(), env.sim_os().cloned()),
                     admission,
                     reactor,
                     scope: RequestScope::host(
@@ -2810,7 +2855,8 @@ pub(crate) mod tests {
         }
         #[test]
         fn truncation_after_success_closes_both_without_error_suffix_or_pool_reuse() {
-            let f = Fixture::new();
+            let env = racer_io::Env::host();
+            let f = Fixture::new(&env);
             let (source, mut destination, mut writer, mut reader) = f.connections(1024);
             destination.set_framing(destination.receive_remaining(), None, false);
             destination = drive(
@@ -2849,9 +2895,10 @@ pub(crate) mod tests {
         }
         #[test]
         fn stalled_transit_retains_both_connections_pipe_and_relay_until_cancel_fence() {
+            let env = racer_io::Env::host();
             for writing in [false, true] {
                 for end in ["drop", "cancel", "deadline", "disconnect"] {
-                    let mut f = Fixture::new();
+                    let mut f = Fixture::new(&env);
                     if end == "deadline" {
                         f.scope.deadline.0 = Instant::now() + Duration::from_millis(40);
                     }
@@ -2962,7 +3009,8 @@ pub(crate) mod tests {
         }
         #[test]
         fn unsupported_splice_with_buffered_pipe_drains_suffix_and_keeps_exact_frame() {
-            let f = Fixture::new();
+            let env = racer_io::Env::host();
+            let f = Fixture::new(&env);
             let length = 1024 * 1024 + 16;
             let (source, mut destination, mut writer, mut reader) = f.connections(length);
             destination.state_mut().relay_fallback_at = Some(length / 2);
@@ -2994,7 +3042,8 @@ pub(crate) mod tests {
         #[test]
         fn tcp_backpressure_recovers_and_wakes_queued_pipe_owner_without_losing_frame() {
             use std::os::fd::AsRawFd;
-            let f = Fixture::new();
+            let env = racer_io::Env::host();
+            let f = Fixture::new(&env);
             let length = 16 * 1024 * 1024 + 16;
             let (source, destination, mut writer, mut reader) = f.connections(length);
             let size: libc::c_int = 64 * 1024;
@@ -3071,7 +3120,9 @@ pub(crate) mod tests {
         }
     }
 
-    fn setup() -> (
+    fn setup(
+        env: &racer_io::Env,
+    ) -> (
         Rc<flow_control::Quotas<AdmissionPolicy>>,
         Rc<Reactor>,
         HttpIo,
@@ -3080,7 +3131,7 @@ pub(crate) mod tests {
         let admission = Rc::new(flow_control::Quotas::new(AdmissionPolicy::new(
             crate::test_support::cluster::config(false).limits,
         )));
-        let reactor = Rc::new(Reactor::new(admission.clone(), &crate::test_support::env()));
+        let reactor = Rc::new(Reactor::new(admission.clone(), env));
         let io = new_io(
             reactor.clone(),
             Codec::new(4096),
@@ -3137,7 +3188,8 @@ pub(crate) mod tests {
     }
     #[test]
     fn small_peer_send_stages_actual_head_under_context_pressure() {
-        let (admission, reactor, _, scope) = setup();
+        let env = racer_io::Env::host();
+        let (admission, reactor, _, scope) = setup(&env);
         reactor.init().unwrap();
         let limit = crate::peer::protocol::MAX_ENVELOPE_HEAD;
         let io = new_io(reactor.clone(), Codec::new(limit), admission.clone(), 16);
@@ -3166,7 +3218,8 @@ pub(crate) mod tests {
     }
     #[test]
     fn staging_recycles_zeroed_backing_with_retained_admission() {
-        let (admission, _, io, _) = setup();
+        let env = racer_io::Env::host();
+        let (admission, _, io, _) = setup(&env);
         let baseline = admission.used(ResourceClass::RequestContext);
         let mut buffer = io.buffer(4096).unwrap();
         let pointer = buffer.bytes().unwrap().as_ptr();
@@ -3186,7 +3239,8 @@ pub(crate) mod tests {
     }
     #[test]
     fn decoded_field_storage_is_admitted_before_parser_allocations() {
-        let (admission, reactor, io, scope) = setup();
+        let env = racer_io::Env::host();
+        let (admission, reactor, io, scope) = setup(&env);
         reactor.init().unwrap();
         let baseline = admission.used(ResourceClass::RequestContext);
         let held = admission
@@ -3218,7 +3272,8 @@ pub(crate) mod tests {
     }
     #[test]
     fn client_constructor_streams_beyond_page_cap_with_bounded_staging() {
-        let (admission, reactor, _, scope) = setup();
+        let env = racer_io::Env::host();
+        let (admission, reactor, _, scope) = setup(&env);
         let io = client_io(reactor.clone(), admission.clone()).capped(4096);
         reactor.init().unwrap();
         let baseline = admission.used(ResourceClass::RequestContext);
@@ -3297,7 +3352,8 @@ pub(crate) mod tests {
     }
     #[test]
     fn client_send_limit_does_not_relax_receive_or_page_transport_limits() {
-        let (admission, reactor, _, scope) = setup();
+        let env = racer_io::Env::host();
+        let (admission, reactor, _, scope) = setup(&env);
         let page_limit = crate::model::PAGE_BYTES + 16;
         let page_io = new_io(
             reactor.clone(),
@@ -3356,7 +3412,8 @@ pub(crate) mod tests {
     }
     #[test]
     fn endpoint_caps_accept_exact_boundary_and_reject_one_extra_byte() {
-        let (admission, reactor, _, scope) = setup();
+        let env = racer_io::Env::host();
+        let (admission, reactor, _, scope) = setup(&env);
         let peer = new_io(
             reactor.clone(),
             Codec::new(crate::peer::protocol::MAX_ENVELOPE_HEAD),
@@ -3412,7 +3469,8 @@ pub(crate) mod tests {
     }
     #[test]
     fn real_socket_fragmentation_read_ahead_and_owned_ranges() {
-        let (admission, reactor, io, scope) = setup();
+        let env = racer_io::Env::host();
+        let (admission, reactor, io, scope) = setup(&env);
         reactor.init().unwrap();
         let baseline = admission.used(ResourceClass::RequestContext);
         let (socket, mut peer) = UnixStream::pair().unwrap();
@@ -3453,10 +3511,11 @@ pub(crate) mod tests {
     }
     #[test]
     fn dropped_checkout_and_destroyed_pool_release_quota_only_after_connect_fence() {
+        let env = racer_io::Env::host();
         for (cancel_before_drop, submit_before_drop) in
             [(false, false), (true, false), (true, true)]
         {
-            let (admission, reactor, _, scope) = setup();
+            let (admission, reactor, _, scope) = setup(&env);
             reactor.init().unwrap();
             let baseline = admission.used(ResourceClass::RequestContext);
             let listener = TcpListener::bind("127.0.0.1:0").unwrap();

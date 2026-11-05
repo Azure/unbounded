@@ -651,7 +651,7 @@ impl Rig {
                 owners: directory.clone(),
             },
         ));
-        let pipes = Rc::new(new_pipe_pool(admission.clone()));
+        let pipes = Rc::new(new_pipe_pool(admission.clone(), reactor.sim_os()));
         let delivery = Rc::new(Delivery::new(
             reactor.clone(),
             // This fixture polls real crypto inline rather than on its paired

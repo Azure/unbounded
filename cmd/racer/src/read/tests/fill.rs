@@ -3,9 +3,10 @@ use crate::read::dispatch::WorkerMap;
 /// Prefetched plaintext must never park behind Flight capacity.
 #[test]
 fn bounded_admission_prefetched_bootstrap_fails_without_waiting() {
+    let env = racer_io::Env::host();
     let queue = Rc::new(crate::drivers::DriverQueue::new(1024));
     let _owner = queue.enter();
-    let mut f = fixture();
+    let mut f = fixture(&env);
     let admission = f.fill.dependencies.admission.clone();
     let held = admission
         .reserve(
@@ -45,13 +46,13 @@ fn bounded_admission_prefetched_bootstrap_fails_without_waiting() {
 fn bounded_admission_two_owners_peer_failfast_and_local_finite_exit() {
     let queue = Rc::new(crate::drivers::DriverQueue::new(1024));
     let _owner = queue.enter();
-    let clock = crate::rt::environment::SimulationClock::new(751);
-    let sim_env = clock.environment(0);
-    let _environment = sim_env.enter();
-    let sim_ctx = sim_env.worker_ctx();
+    let clock = racer_io::SimClock::new(751);
+    let sim_env = clock.ctx(0);
+    let env = racer_io::Env::new(racer_io::Driver::Uring, sim_env.clone());
+    let sim_ctx = sim_env.clone();
     // Crypto captures its clock at construction; match the request clock even
     // when this test runs long after the process-wide simulation anchor.
-    let mut fixtures = [fixture(), fixture()];
+    let mut fixtures = [fixture(&env), fixture(&env)];
     for f in &mut fixtures {
         let admission = f.fill.dependencies.admission.clone();
         let held = admission
@@ -133,6 +134,7 @@ fn bounded_admission_two_owners_peer_failfast_and_local_finite_exit() {
 /// Isolate staging admission from acquisition, publication, and queued-write reclamation.
 #[test]
 fn owned_writeback_staging_reclaims_only_idle_memory_after_hard_quota_rejection() {
+    let env = racer_io::Env::host();
     let queue = Rc::new(crate::drivers::DriverQueue::new(1024));
     let _queue = queue.enter();
     for (owned, live, ciphertext) in [
@@ -141,7 +143,7 @@ fn owned_writeback_staging_reclaims_only_idle_memory_after_hard_quota_rejection(
         (false, false, true),
         (true, false, false),
     ] {
-        let f = fixture();
+        let f = fixture(&env);
         let deps = &f.fill.dependencies;
         let admission = &deps.admission;
         deps.writer
@@ -206,13 +208,14 @@ fn owned_writeback_staging_reclaims_only_idle_memory_after_hard_quota_rejection(
 
 #[test]
 fn optional_persistence_full_page_residency_above_half_budget_makes_progress() {
+    let env = racer_io::Env::host();
     let queue = Rc::new(crate::drivers::DriverQueue::new(1024));
     let _queue = queue.enter();
     let mut limits = crate::test_support::cluster::config(false).limits;
     limits.plaintext_bytes = std::num::NonZeroUsize::new(8 * PAGE_BYTES as usize).unwrap();
     limits.ciphertext_bytes =
         std::num::NonZeroUsize::new(8 * (PAGE_BYTES as usize + page_alloc::buf::GRANULE)).unwrap();
-    let mut f = fixture_with(5 * PAGE_BYTES, Some(limits));
+    let mut f = fixture_with(&env, 5 * PAGE_BYTES, Some(limits));
     f.fill
         .dependencies
         .writer
@@ -261,12 +264,13 @@ fn optional_persistence_full_page_residency_above_half_budget_makes_progress() {
 
 #[test]
 fn optional_persistence_idle_memory_reclaim_is_bounded_and_stops_at_deficit() {
+    let env = racer_io::Env::host();
     let queue = Rc::new(crate::drivers::DriverQueue::new(1024));
     let _queue = queue.enter();
     let mut limits = crate::test_support::cluster::config(false).limits;
     limits.metadata_entries = std::num::NonZeroUsize::new(1024).unwrap();
     limits.ciphertext_bytes = std::num::NonZeroUsize::new(128 * 1024 * 1024).unwrap();
-    let f = fixture_with(3, Some(limits));
+    let f = fixture_with(&env, 3, Some(limits));
     let deps = &f.fill.dependencies;
     let admission = &deps.admission;
     deps.writer.retention().set_ownership(Rc::new(|_| false));
@@ -332,9 +336,10 @@ fn optional_persistence_idle_memory_reclaim_is_bounded_and_stops_at_deficit() {
 
 #[test]
 fn optional_persistence_idle_reclaim_preserves_active_and_queued_owners() {
+    let env = racer_io::Env::host();
     let queue = Rc::new(crate::drivers::DriverQueue::new(1024));
     let _queue = queue.enter();
-    let f = fixture();
+    let f = fixture(&env);
     let deps = &f.fill.dependencies;
     let admission = &deps.admission;
     let policy = deps.writer.retention();
@@ -391,10 +396,11 @@ fn optional_persistence_idle_reclaim_preserves_active_and_queued_owners() {
 
 #[test]
 fn optional_persistence_reclaims_completed_idle_slab_before_pressure_rejection() {
+    let env = racer_io::Env::host();
     let queue = Rc::new(crate::drivers::DriverQueue::new(1024));
     let _queue = queue.enter();
     for owned in [false, true] {
-        let f = cold_disk_fixture();
+        let f = cold_disk_fixture(&env);
         let writer = &f.fill.dependencies.writer;
         let idle = writer.retained_staging_bytes();
         assert!(idle > 0);
@@ -439,9 +445,10 @@ fn optional_persistence_reclaims_completed_idle_slab_before_pressure_rejection()
 
 #[test]
 fn ready_memory_precedes_cold_ownership_refresh_and_preserves_one_interest() {
+    let env = racer_io::Env::host();
     let queue = Rc::new(crate::drivers::DriverQueue::new(1024));
     let _queue = queue.enter();
-    let mut f = fixture();
+    let mut f = fixture(&env);
     let mut budget = AcquisitionBudget::new(f.scope.deadline.0, 4, 8);
     let page = acquire(&mut f, &mut budget).unwrap();
     f.fill.dependencies.writer.discard_unsubmitted();
@@ -478,7 +485,7 @@ fn ready_memory_precedes_cold_ownership_refresh_and_preserves_one_interest() {
     deps.candidates = Rc::new(CandidatePolicy::new(
         racer_wire::control::NodeId("22222222-2222-4222-8222-000000000000".into()),
         Rc::new(Placement::new(16)),
-        NoPeer::requester(),
+        NoPeer::requester(&env),
         deps.credentials.clone(),
         published,
         racer_io::WorkerCtx::host(),
@@ -572,12 +579,13 @@ fn optional_persistence_headroom_preserves_one_page_and_half_budget() {
 
 #[test]
 fn optional_persistence_minimum_dirty_budget_is_best_effort() {
+    let env = racer_io::Env::host();
     let queue = Rc::new(crate::drivers::DriverQueue::new(1024));
     let _queue = queue.enter();
     for (bytes, succeeds) in [(18, false), (19, true)] {
         let mut limits = crate::test_support::cluster::config(false).limits;
         limits.dirty_bytes = std::num::NonZeroUsize::new(bytes).unwrap();
-        let mut f = fixture_with(3, Some(limits));
+        let mut f = fixture_with(&env, 3, Some(limits));
         f.fill
             .dependencies
             .writer
@@ -598,12 +606,13 @@ fn optional_persistence_minimum_dirty_budget_is_best_effort() {
 
 #[test]
 fn optional_persistence_owned_dirty_pressure_reclaims_only_optional_queue() {
+    let env = racer_io::Env::host();
     let queue = Rc::new(crate::drivers::DriverQueue::new(1024));
     let _queue = queue.enter();
     for queued_owned in [false, true] {
         let mut limits = crate::test_support::cluster::config(false).limits;
         limits.dirty_bytes = std::num::NonZeroUsize::new(19).unwrap();
-        let mut f = fixture_with(3, Some(limits));
+        let mut f = fixture_with(&env, 3, Some(limits));
         let policy = f.fill.dependencies.writer.retention();
         policy.set_ownership(Rc::new(|_| false));
         let mut budget = AcquisitionBudget::new(f.scope.deadline.0, 4, 8);
@@ -653,13 +662,14 @@ fn optional_persistence_owned_dirty_pressure_reclaims_only_optional_queue() {
 /// a live reweight that puts its cache under share lets it reclaim.
 #[test]
 fn optional_persistence_owned_dirty_pressure_keeps_disk_share_order() {
+    let env = racer_io::Env::host();
     let queue = Rc::new(crate::drivers::DriverQueue::new(1024));
     let _queue = queue.enter();
     let mut limits = crate::test_support::cluster::config(false).limits;
     limits.dirty_bytes = std::num::NonZeroUsize::new(19).unwrap();
     let under = CacheId(crate::test_support::security::CACHE.into());
     let over = CacheId("44444444-4444-4444-8444-444444444444".into());
-    let f = fixture_with_caches(3, Some(limits), vec![under.clone(), over.clone()]);
+    let f = fixture_with_caches(&env, 3, Some(limits), vec![under.clone(), over.clone()]);
     let deps = &f.fill.dependencies;
     let policy = deps.writer.retention();
     let page = |cache: &CacheId, etag: &str| {
@@ -719,9 +729,10 @@ fn optional_persistence_owned_dirty_pressure_keeps_disk_share_order() {
 
 #[test]
 fn optional_persistence_staging_pressure_skips_without_read_failure() {
+    let env = racer_io::Env::host();
     let queue = Rc::new(crate::drivers::DriverQueue::new(1024));
     let _queue = queue.enter();
-    let mut f = fixture();
+    let mut f = fixture(&env);
     let policy = f.fill.dependencies.writer.retention();
     policy.set_ownership(Rc::new(|_| false));
     let mut budget = AcquisitionBudget::new(f.scope.deadline.0, 4, 8);
@@ -748,9 +759,10 @@ fn optional_persistence_staging_pressure_skips_without_read_failure() {
 
 #[test]
 fn optional_persistence_owned_staging_pressure_reclaims_one_queued_optional() {
+    let env = racer_io::Env::host();
     let queue = Rc::new(crate::drivers::DriverQueue::new(1024));
     let _queue = queue.enter();
-    let mut f = fixture();
+    let mut f = fixture(&env);
     let policy = f.fill.dependencies.writer.retention();
     policy.set_ownership(Rc::new(|_| false));
     let mut budget = AcquisitionBudget::new(f.scope.deadline.0, 4, 8);
@@ -795,9 +807,10 @@ fn optional_persistence_owned_staging_pressure_reclaims_one_queued_optional() {
 /// Staging pressure must not replace an already queued owned write with another.
 #[test]
 fn optional_persistence_owned_staging_preserves_queued_owned_victim() {
+    let env = racer_io::Env::host();
     let queue = Rc::new(crate::drivers::DriverQueue::new(1024));
     let _queue = queue.enter();
-    let mut f = fixture();
+    let mut f = fixture(&env);
     let policy = f.fill.dependencies.writer.retention();
     policy.set_ownership(Rc::new(|_| true));
     let mut budget = AcquisitionBudget::new(f.scope.deadline.0, 4, 8);
@@ -859,9 +872,10 @@ fn optional_persistence_owned_staging_preserves_queued_owned_victim() {
 
 #[test]
 fn second_sight_subscription_probe_transfer_and_fanout_count_only_consumers() {
+    let env = racer_io::Env::host();
     let queue = Rc::new(crate::drivers::DriverQueue::new(1024));
     let _queue = queue.enter();
-    let mut f = fixture();
+    let mut f = fixture(&env);
     let policy = f.fill.dependencies.writer.retention();
     policy.set_ownership(Rc::new(|_| false));
     let mut budget = AcquisitionBudget::new(f.scope.deadline.0, 4, 8);
@@ -902,9 +916,10 @@ fn second_sight_subscription_probe_transfer_and_fanout_count_only_consumers() {
 
 #[test]
 fn second_sight_memory_hit_persists_original_ciphertext_and_retry_does_not() {
+    let env = racer_io::Env::host();
     let queue = Rc::new(crate::drivers::DriverQueue::new(1024));
     let _queue = queue.enter();
-    let mut f = fixture();
+    let mut f = fixture(&env);
     f.fill
         .dependencies
         .writer
@@ -951,10 +966,11 @@ fn second_sight_memory_hit_persists_original_ciphertext_and_retry_does_not() {
 
 #[test]
 fn second_sight_selected_and_optional_pressure_preserve_read_success() {
+    let env = racer_io::Env::host();
     let queue = Rc::new(crate::drivers::DriverQueue::new(1024));
     let _queue = queue.enter();
     for pressure in [false, true] {
-        let mut f = fixture();
+        let mut f = fixture(&env);
         f.fill
             .dependencies
             .writer
@@ -995,9 +1011,10 @@ fn second_sight_selected_and_optional_pressure_preserve_read_success() {
 
 #[test]
 fn second_sight_simultaneous_followers_persist_without_second_acquisition() {
+    let env = racer_io::Env::host();
     let queue = Rc::new(crate::drivers::DriverQueue::new(1024));
     let _queue = queue.enter();
-    let mut f = fixture();
+    let mut f = fixture(&env);
     f.fill
         .dependencies
         .writer
@@ -1045,10 +1062,11 @@ fn second_sight_simultaneous_followers_persist_without_second_acquisition() {
 
 #[test]
 fn second_sight_completed_flight_and_current_ownership_promote_verified_copy() {
+    let env = racer_io::Env::host();
     let queue = Rc::new(crate::drivers::DriverQueue::new(1024));
     let _queue = queue.enter();
     for owned in [false, true] {
-        let mut f = fixture();
+        let mut f = fixture(&env);
         let ownership = Rc::new(Cell::new(false));
         let current = ownership.clone();
         f.fill
@@ -1113,10 +1131,11 @@ fn second_sight_completed_flight_and_current_ownership_promote_verified_copy() {
 
 #[test]
 fn network_plaintext_rechecks_pressure_cleared_after_rejection() {
+    let env = racer_io::Env::host();
     for (shrink, exhausted) in [(true, false), (false, false), (true, true), (false, true)] {
         let mut limits = crate::test_support::cluster::config(false).limits;
         limits.plaintext_bytes = std::num::NonZeroUsize::new(858_993_459).unwrap();
-        let f = fixture_with(3, Some(limits));
+        let f = fixture_with(&env, 3, Some(limits));
         let admission = &f.fill.dependencies.admission;
         let cache = &f.context.object.cache;
         let base = admission
@@ -1184,9 +1203,10 @@ fn network_plaintext_rechecks_pressure_cleared_after_rejection() {
 
 #[test]
 fn network_plaintext_cleared_pressure_retry_is_bounded_and_reports_latest_failure() {
+    let env = racer_io::Env::host();
     let mut limits = crate::test_support::cluster::config(false).limits;
     limits.plaintext_bytes = std::num::NonZeroUsize::new(2 * PAGE_BYTES as usize).unwrap();
-    let f = fixture_with(3, Some(limits));
+    let f = fixture_with(&env, 3, Some(limits));
     let admission = &f.fill.dependencies.admission;
     let cache = &f.context.object.cache;
     let mut held = Some(
@@ -1253,11 +1273,11 @@ fn network_plaintext_cleared_pressure_retry_is_bounded_and_reports_latest_failur
 #[test]
 fn network_plaintext_cleared_pressure_retry_checks_original_scope() {
     for deadline in [false, true] {
-        let clock = crate::rt::environment::SimulationClock::new(913);
-        let sim_env = clock.environment(0);
-        let _clock = sim_env.enter();
-        let sim_ctx = sim_env.worker_ctx();
-        let f = fixture();
+        let clock = racer_io::SimClock::new(913);
+        let sim_env = clock.ctx(0);
+        let env = racer_io::Env::new(racer_io::Driver::Uring, sim_env.clone());
+        let sim_ctx = sim_env.clone();
+        let f = fixture(&env);
         let admission = &f.fill.dependencies.admission;
         let cache = &f.context.object.cache;
         let scope = RequestScope::on(
@@ -1311,9 +1331,10 @@ fn network_plaintext_cleared_pressure_retry_checks_original_scope() {
 
 #[test]
 fn network_plaintext_impossible_capacity_still_terminates_without_scanning() {
+    let env = racer_io::Env::host();
     let mut limits = crate::test_support::cluster::config(false).limits;
     limits.plaintext_bytes = std::num::NonZeroUsize::new(PAGE_BYTES as usize - 1).unwrap();
-    let f = fixture_with(3, Some(limits));
+    let f = fixture_with(&env, 3, Some(limits));
     let admission = &f.fill.dependencies.admission;
     let mut attempts = 0;
     let mut reserve = Box::pin(
@@ -1343,10 +1364,11 @@ fn network_plaintext_impossible_capacity_still_terminates_without_scanning() {
 
 #[test]
 fn idle_tiny_prefix_must_not_hide_reclaimable_full_page() {
+    let env = racer_io::Env::host();
     let mut limits = crate::test_support::cluster::config(false).limits;
     limits.plaintext_bytes = std::num::NonZeroUsize::new(858_993_459).unwrap();
     limits.metadata_entries = std::num::NonZeroUsize::new(819).unwrap();
-    let f = fixture_with(3, Some(limits));
+    let f = fixture_with(&env, 3, Some(limits));
     let admission = &f.fill.dependencies.admission;
     let cache = &f.fill.dependencies.memory;
     let mut tiny = Vec::new();
@@ -1436,13 +1458,13 @@ fn idle_tiny_prefix_must_not_hide_reclaimable_full_page() {
 fn cooperative_reclaim_bounds_busy_cycle_and_preserves_cancellation() {
     for mode in ["busy", "cancel", "deadline"] {
         let cancel = mode != "busy";
-        let clock = crate::rt::environment::SimulationClock::new(912);
-        let sim_env = clock.environment(0);
-        let _clock = sim_env.enter();
-        let sim_ctx = sim_env.worker_ctx();
+        let clock = racer_io::SimClock::new(912);
+        let sim_env = clock.ctx(0);
+        let env = racer_io::Env::new(racer_io::Driver::Uring, sim_env.clone());
+        let sim_ctx = sim_env.clone();
         let mut limits = crate::test_support::cluster::config(false).limits;
         limits.metadata_entries = std::num::NonZeroUsize::new(819).unwrap();
-        let f = fixture_with(3, Some(limits));
+        let f = fixture_with(&env, 3, Some(limits));
         let admission = &f.fill.dependencies.admission;
         let mut held = Vec::new();
         for n in 0..513 {
@@ -1511,10 +1533,12 @@ fn cooperative_reclaim_bounds_busy_cycle_and_preserves_cancellation() {
 
 #[test]
 fn cooperative_reclaim_fair_share_keeps_other_cache_and_live_ciphertext() {
+    let env = racer_io::Env::host();
     let mut limits = crate::test_support::cluster::config(false).limits;
     limits.plaintext_bytes = std::num::NonZeroUsize::new(4 * PAGE_BYTES as usize).unwrap();
     let other = CacheId("44444444-4444-4444-8444-444444444444".into());
     let f = fixture_with_caches(
+        &env,
         3,
         Some(limits),
         vec![
@@ -1550,7 +1574,8 @@ fn cooperative_reclaim_fair_share_keeps_other_cache_and_live_ciphertext() {
 /// no-op that never evicts cached ciphertext or invokes the queued-copy callback.
 #[test]
 fn cooperative_plaintext_reclaim_keeps_cached_ciphertext() {
-    let f = fixture();
+    let env = racer_io::Env::host();
+    let f = fixture(&env);
     let admission = &f.fill.dependencies.admission;
     let cache = &f.fill.dependencies.memory;
     let first = crate::memory::tests::bundle_for(admission, f.origin.metadata.immutable());
@@ -1569,7 +1594,8 @@ fn cooperative_plaintext_reclaim_keeps_cached_ciphertext() {
 
 #[test]
 fn final_fill_reclaim_success_and_ignored_writeback_are_silent() {
-    let f = fixture();
+    let env = racer_io::Env::host();
+    let f = fixture(&env);
     let admission = &f.fill.dependencies.admission;
     let failures = crate::telemetry::Failures::default();
     admission
@@ -1630,10 +1656,11 @@ fn final_fill_reclaim_success_and_ignored_writeback_are_silent() {
 
 #[test]
 fn final_fill_disk_outer_retry_emits_only_exhausted_last_rejection() {
+    let env = racer_io::Env::host();
     let queue = Rc::new(crate::drivers::DriverQueue::new(1024));
     let _owner = queue.enter();
     for recover in [true, false] {
-        let f = cold_disk_fixture();
+        let f = cold_disk_fixture(&env);
         let admission = &f.fill.dependencies.admission;
         let failures = crate::telemetry::Failures::default();
         admission
@@ -1676,9 +1703,10 @@ fn final_fill_disk_outer_retry_emits_only_exhausted_last_rejection() {
 
 #[test]
 fn final_fill_diagnostic_reports_exhaustion_not_recovered_or_optional_reserves() {
+    let env = racer_io::Env::host();
     let queue = Rc::new(crate::drivers::DriverQueue::new(1024));
     let _owner = queue.enter();
-    let mut f = fixture();
+    let mut f = fixture(&env);
     let admission = f.fill.dependencies.admission.clone();
     let failures = crate::telemetry::Failures::default();
     admission
@@ -1775,23 +1803,23 @@ mod metadata {
         use crate::test_support::origin::AdapterOrigin;
         use crate::test_support::origin::RequestKind;
         for failure in [None, Some(502)] {
-            let clock = crate::rt::environment::SimulationClock::new_at(
-                71,
-                Instant::now(),
-                std::time::SystemTime::now(),
-            );
-            let environment = clock.environment(1);
-            let _environment = environment.enter();
+            let clock =
+                racer_io::SimClock::new_at(71, Instant::now(), std::time::SystemTime::now());
+            let environment = clock.ctx(1);
+            let env = racer_io::Env::new(racer_io::Driver::Uring, environment.clone());
             let queue = Rc::new(drivers::DriverQueue::new(1024));
             let _owner = queue.enter();
-            let mut f = fixture();
+            let mut f = fixture(&env);
             let adapter = AdapterOrigin::new("fixture", f.origin.metadata.clone());
             adapter.block(RequestKind::Head);
             if let Some(status) = failure {
                 adapter.reject_next(RequestKind::Head, status);
             }
-            let service =
-                f.metadata_service_with_index(adapter_client(&f, &adapter), 1, f.metadata_index(8));
+            let service = f.metadata_service_with_index(
+                adapter_client(&env, &f, &adapter),
+                1,
+                f.metadata_index(&env, 8),
+            );
             let mut first = service.resolve(
                 MetadataSelector::Fresh,
                 f.membership.clone(),
@@ -1868,16 +1896,17 @@ mod metadata {
 
     #[test]
     fn bootstrap_rejection_re_elects_and_version_changes_never_mix_pages() {
+        let env = racer_io::Env::host();
         let queue = Rc::new(drivers::DriverQueue::new(1024));
         let _owner = queue.enter();
-        let mut f = fixture();
+        let mut f = fixture(&env);
         use crate::test_support::origin::AdapterOrigin;
         use crate::test_support::origin::RequestKind;
         let adapter = AdapterOrigin::new("fixture", f.origin.metadata.clone());
         adapter.set_body(vec![1; 3]);
         adapter.reject_next(RequestKind::InitialGet, 403);
-        let origin = adapter_client(&f, &adapter);
-        let service = f.metadata_service_with_index(origin, 8, f.metadata_index(8));
+        let origin = adapter_client(&env, &f, &adapter);
+        let service = f.metadata_service_with_index(origin, 8, f.metadata_index(&env, 8));
         let second_scope = RequestScope::host(RequestId([93; 16]), f.scope.deadline.0).unwrap();
         let second_context = OriginContext {
             object: f.context.object.clone(),
@@ -2033,6 +2062,7 @@ mod metadata {
 
     #[test]
     fn bootstrap_after_catalog_eviction_checks_cached_content_type_and_preserves_fresh_expiry() {
+        let env = racer_io::Env::host();
         let queue = Rc::new(drivers::DriverQueue::new(1024));
         let _owner = queue.enter();
         use crate::model::ContentType;
@@ -2045,7 +2075,7 @@ mod metadata {
                 (Some("text/plain"), Some("text/plain"), false),
                 (None, None, false),
             ] {
-                let mut f = fixture();
+                let mut f = fixture(&env);
                 let mut budget = AcquisitionBudget::new(f.scope.deadline.0, 8, 16);
                 let mut cached = acquire(&mut f, &mut budget).unwrap();
                 // Retain real authenticated buffers with a historical descriptor in
@@ -2058,7 +2088,7 @@ mod metadata {
                     .remove_cache(&f.context.object.cache)
                     .unwrap();
                 f.fill.dependencies.memory.publish(cached.clone()).unwrap();
-                let index = f.metadata_index(4);
+                let index = f.metadata_index(&env, 4);
                 index.publish_version(cached.metadata.immutable()).unwrap();
                 assert_eq!(index.evict_metadata(1).unwrap(), 1);
                 assert!(index.version(&f.page.version).unwrap().is_none());
@@ -2168,15 +2198,17 @@ mod metadata {
 
     #[test]
     fn blocked_metadata_leader_and_follower_notify_without_spinning() {
+        let env = racer_io::Env::host();
         let queue = Rc::new(drivers::DriverQueue::new(1024));
         let _owner = queue.enter();
         use crate::model::MetadataSelector;
         use crate::test_support::WakeCounter;
         use std::task::Waker;
         for cancel_leader in [false, true] {
-            let f = fixture();
+            let f = fixture(&env);
             let (send, receive) = futures::channel::oneshot::channel();
             let service = f.metadata_service(
+                &env,
                 Rc::new(GatedMetadataOrigin {
                     buffers: f.origin.buffers.clone(),
                     receive: RefCell::new(Some(receive)),
@@ -2262,6 +2294,7 @@ mod metadata {
 
     #[test]
     fn metadata_deadline_wakes_parked_follower_without_polling_gated_leader() {
+        let env = racer_io::Env::host();
         let queue = Rc::new(drivers::DriverQueue::new(1024));
         let _owner = queue.enter();
         use crate::model::MetadataSelector;
@@ -2271,7 +2304,7 @@ mod metadata {
         use futures::stream::FuturesUnordered;
         use std::task::Waker;
         for (budget_earlier, expire_leader) in [(false, false), (true, false), (false, true)] {
-            let f = fixture();
+            let f = fixture(&env);
             let admission = &f.fill.dependencies.admission;
             let baseline = admission.used(ResourceClass::RequestContext);
             let (send, receive) = futures::channel::oneshot::channel();
@@ -2280,7 +2313,7 @@ mod metadata {
                 receive: RefCell::new(Some(receive)),
                 calls: Cell::new(0),
             });
-            let service = f.metadata_service(origin.clone(), 1);
+            let service = f.metadata_service(&env, origin.clone(), 1);
             let due = Instant::now() + Duration::from_secs(60);
             let follower_scope = RequestScope::host(
                 RequestId([2; 16]),
@@ -2407,6 +2440,7 @@ mod pressure {
 
     #[test]
     fn sequential_full_pages_reclaim_idle_bytes_and_preserve_busy_reader_leases() {
+        let env = racer_io::Env::host();
         let queue = Rc::new(crate::drivers::DriverQueue::new(1024));
         let _owner = queue.enter();
         for (pages, ciphertext_pages, dirty_pages, hold_bundle) in
@@ -2422,7 +2456,7 @@ mod pressure {
                 std::num::NonZeroUsize::new(dirty_pages * (PAGE_BYTES as usize + 16)).unwrap();
             // Byte pressure must occur before entry-count eviction in every case.
             limits.metadata_entries = std::num::NonZeroUsize::new(128).unwrap();
-            let mut f = fixture_with(pages * PAGE_BYTES, Some(limits.clone()));
+            let mut f = fixture_with(&env, pages * PAGE_BYTES, Some(limits.clone()));
             let mut pinned = None;
             let mut bundle = None;
             for number in 0..pages {
@@ -2502,11 +2536,12 @@ mod pressure {
 
     #[test]
     fn bootstrap_admission_discards_queued_copy_before_evicting_idle_bundle() {
+        let env = racer_io::Env::host();
         let queue = Rc::new(crate::drivers::DriverQueue::new(1024));
         let _owner = queue.enter();
         let mut limits = crate::test_support::cluster::config(false).limits;
         limits.plaintext_bytes = std::num::NonZeroUsize::new(PAGE_BYTES as usize).unwrap();
-        let mut f = fixture_with(3, Some(limits));
+        let mut f = fixture_with(&env, 3, Some(limits));
         let mut budget = AcquisitionBudget::new(f.scope.deadline.0, 4, 8);
         let result = drive(
             f.fill.acquire(
@@ -2530,8 +2565,11 @@ mod pressure {
         metadata.version.etag = StrongEtag::test_value("empty");
         metadata.length = 0;
         let adapter = AdapterOrigin::new("fixture", metadata.clone());
-        let service =
-            f.metadata_service_with_index(adapter_client(&f, &adapter), 8, f.metadata_index(8));
+        let service = f.metadata_service_with_index(
+            adapter_client(&env, &f, &adapter),
+            8,
+            f.metadata_index(&env, 8),
+        );
         let mut budget = AcquisitionBudget::new(f.scope.deadline.0, 4, 8);
         let response = drive_io(
             service.bootstrap_peer(f.membership.clone(), &f.context, &f.scope, &mut budget),
@@ -2635,11 +2673,12 @@ mod pressure {
 
     #[test]
     fn reclamation_uses_second_bounded_scan_without_revoking_readers_or_spinning() {
+        let env = racer_io::Env::host();
         for class in [ResourceClass::Plaintext, ResourceClass::Ciphertext] {
             for (busy_count, idle_tail) in [(256, true), (256, false), (512, true)] {
                 let mut limits = crate::test_support::cluster::config(false).limits;
                 limits.metadata_entries = std::num::NonZeroUsize::new(1024).unwrap();
-                let f = fixture_with(3, Some(limits));
+                let f = fixture_with(&env, 3, Some(limits));
                 let cache = &f.context.object.cache;
                 let deps = &f.fill.dependencies;
                 let amount = if matches!(class, ResourceClass::Plaintext) {
@@ -2711,6 +2750,7 @@ mod pressure {
 
     #[test]
     fn fair_share_one_page_deficit_preserves_other_caches_and_remaining_working_set() {
+        let env = racer_io::Env::host();
         for class in [ResourceClass::Plaintext, ResourceClass::Ciphertext] {
             let amount = PAGE_BYTES as usize + 16;
             let mut limits = crate::test_support::cluster::config(false).limits;
@@ -2720,6 +2760,7 @@ mod pressure {
             limits.ciphertext_bytes = std::num::NonZeroUsize::new(6 * amount + slack).unwrap();
             let other_cache = CacheId("44444444-4444-4444-8444-444444444444".into());
             let f = fixture_with_caches(
+                &env,
                 3,
                 Some(limits),
                 vec![
@@ -2756,6 +2797,7 @@ mod pressure {
     /// takes over-share idle bytes first and never discards queued copies.
     #[test]
     fn optional_headroom_prefers_over_share_idle_bytes_and_keeps_queued_copies() {
+        let env = racer_io::Env::host();
         for queued in [false, true] {
             let page = PAGE_BYTES as usize + 16;
             let class = ResourceClass::Ciphertext;
@@ -2765,7 +2807,7 @@ mod pressure {
             limits.range_window_pages = std::num::NonZeroUsize::new(1).unwrap();
             let under = CacheId(crate::test_support::security::CACHE.into());
             let over = CacheId("44444444-4444-4444-8444-444444444444".into());
-            let f = fixture_with_caches(3, Some(limits), vec![under.clone(), over.clone()]);
+            let f = fixture_with_caches(&env, 3, Some(limits), vec![under.clone(), over.clone()]);
             let deps = &f.fill.dependencies;
             let admission = &deps.admission;
             let definition = |id: &CacheId, priority| racer_wire::control::CacheDefinition {
@@ -2822,7 +2864,8 @@ mod pressure {
 
     #[test]
     fn global_plaintext_deficit_counts_plaintext_not_combined_bundle_bytes() {
-        let f = fixture();
+        let env = racer_io::Env::host();
+        let f = fixture(&env);
         let cache = &f.context.object.cache;
         let first = retained_page(&f, cache, "first", ResourceClass::Plaintext, 3, false);
         let second = retained_page(&f, cache, "second", ResourceClass::Plaintext, 3, false);
@@ -2864,9 +2907,10 @@ mod pressure {
 
     #[test]
     fn dirty_only_pressure_skips_persistence_without_flushing_memory_or_queue() {
+        let env = racer_io::Env::host();
         let queue = Rc::new(crate::drivers::DriverQueue::new(1024));
         let _owner = queue.enter();
-        let mut f = fixture();
+        let mut f = fixture(&env);
         let cache = &f.context.object.cache;
         let page = retained_page(&f, cache, "queued", ResourceClass::Plaintext, 3, true);
         let deps = &f.fill.dependencies;
@@ -2901,7 +2945,8 @@ mod pressure {
 
     #[test]
     fn busy_leases_and_impossible_allocations_do_not_discard_queued_work() {
-        let f = fixture();
+        let env = racer_io::Env::host();
+        let f = fixture(&env);
         let cache = &f.context.object.cache;
         let first = retained_page(&f, cache, "first", ResourceClass::Plaintext, 3, true);
         let second = retained_page(&f, cache, "second", ResourceClass::Plaintext, 3, true);
@@ -2937,7 +2982,8 @@ mod pressure {
 
     #[test]
     fn ciphertext_staging_release_stops_before_evicting_unpinned_memory_bundle() {
-        let f = fixture();
+        let env = racer_io::Env::host();
+        let f = fixture(&env);
         let cache = &f.context.object.cache;
         let first = retained_page(&f, cache, "first", ResourceClass::Plaintext, 3, true);
         let second = retained_page(&f, cache, "second", ResourceClass::Plaintext, 3, true);
@@ -3118,29 +3164,34 @@ impl Drop for Fixture {
 }
 impl Fixture {
     /// Republish this fixture's cache in `mode`, as a ClusterCache edit would.
-    pub(super) fn set_mode(&self, mode: racer_wire::control::CacheMode) {
+    pub(super) fn set_mode(&self, env: &racer_io::Env, mode: racer_wire::control::CacheMode) {
         self.fill
             .dependencies
             .memory
             .availability()
-            .publish_modes(vec![(self.context.object.cache.clone(), mode)]);
+            .publish_modes(env, vec![(self.context.object.cache.clone(), mode)]);
     }
 
-    pub(super) fn metadata_index(&self, capacity: usize) -> Rc<Index> {
+    pub(super) fn metadata_index(&self, env: &racer_io::Env, capacity: usize) -> Rc<Index> {
         Rc::new(Index::new(
             WorkerId(0),
             capacity,
-            crate::control::for_caches(self.keys.clone(), vec![self.context.object.cache.clone()]),
-            crate::test_support::clock(),
+            crate::control::for_caches(
+                env,
+                self.keys.clone(),
+                vec![self.context.object.cache.clone()],
+            ),
+            env.ctx.clock.clone(),
         ))
     }
 
     fn metadata_service(
         &self,
+        env: &racer_io::Env,
         origin: Rc<dyn Origin>,
         capacity: usize,
     ) -> super::super::metadata::MetadataService {
-        self.metadata_service_with_index(origin, capacity, self.metadata_index(4))
+        self.metadata_service_with_index(origin, capacity, self.metadata_index(env, 4))
     }
 
     pub(super) fn metadata_service_with_index(
@@ -3168,6 +3219,7 @@ impl Fixture {
     // use different catalog, delivery, and acquisition bounds.
     pub(super) fn read_graph(
         &self,
+        env: &racer_io::Env,
         fill: Rc<Fill>,
         membership: &std::sync::Arc<crate::topology::Membership>,
         settings: ReadGraphSettings,
@@ -3196,7 +3248,7 @@ impl Fixture {
         let snapshots = Rc::new(PublicationTarget::new(
             self.keys.cluster().clone(),
             published.clone(),
-            crate::test_support::clock(),
+            env.ctx.clock.clone(),
         ));
         let (client_socket, origin_socket) =
             racer_wire::control::canonical_socket_paths(settings.name).unwrap();
@@ -3242,7 +3294,7 @@ impl Fixture {
                     WorkerId(0),
                     settings.metadata,
                     availability.clone(),
-                    crate::test_support::clock(),
+                    env.ctx.clock.clone(),
                 )),
                 owners: owners.clone(),
                 fill: fill.clone(),
@@ -3292,8 +3344,8 @@ pub(super) fn pump_worker(
     crypto.poll_budgeted(64).unwrap();
     reactor.poll_budgeted(128).unwrap();
 }
-pub(super) fn fixture() -> Fixture {
-    fixture_with(3, None)
+pub(super) fn fixture(env: &racer_io::Env) -> Fixture {
+    fixture_with(env, 3, None)
 }
 
 pub(super) fn acquire(f: &mut Fixture, budget: &mut AcquisitionBudget) -> Result<PageResult> {
@@ -3309,24 +3361,31 @@ pub(super) fn acquire(f: &mut Fixture, budget: &mut AcquisitionBudget) -> Result
         &f.crypto,
     )
 }
-pub(super) fn fixture_with(length: u64, limits: Option<crate::config::Limits>) -> Fixture {
+pub(super) fn fixture_with(
+    env: &racer_io::Env,
+    length: u64,
+    limits: Option<crate::config::Limits>,
+) -> Fixture {
     fixture_with_caches(
+        env,
         length,
         limits,
         vec![CacheId(crate::test_support::security::CACHE.into())],
     )
 }
 fn fixture_with_caches(
+    env: &racer_io::Env,
     length: u64,
     limits: Option<crate::config::Limits>,
     caches: Vec<CacheId>,
 ) -> Fixture {
-    fixture_with_flight_clock(length, limits, caches, crate::test_support::clock())
+    fixture_with_flight_clock(env, length, limits, caches, env.ctx.clock.clone())
 }
 
 /// Like [`fixture_with_caches`], with an explicit clock for the flight table's
 /// admission cutoffs.
 fn fixture_with_flight_clock(
+    env: &racer_io::Env,
     length: u64,
     limits: Option<crate::config::Limits>,
     caches: Vec<CacheId>,
@@ -3340,16 +3399,16 @@ fn fixture_with_flight_clock(
     let admission = Rc::new(flow_control::Quotas::new(AdmissionPolicy::new(
         config.limits.clone(),
     )));
-    let keys = Rc::new(crate::test_support::security::keys_for(&caches));
-    let availability = crate::control::for_caches(keys.clone(), caches);
+    let keys = Rc::new(crate::test_support::security::keys_for(env, &caches));
+    let availability = crate::control::for_caches(env, keys.clone(), caches);
     let buffers = BufferPool::new(admission.clone());
     let memory = Rc::new(MemoryCache::new(buffers.clone(), availability.clone()));
-    let reactor = Rc::new(Reactor::new(admission.clone(), &crate::test_support::env()));
+    let reactor = Rc::new(Reactor::new(admission.clone(), env));
     let index = Rc::new(Index::new(
         worker,
         16,
         availability.clone(),
-        crate::test_support::clock(),
+        env.ctx.clock.clone(),
     ));
     let segments = Rc::new(page_alloc::Segments::new(64 * 1024 * 1024));
     static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -3360,12 +3419,15 @@ fn fixture_with_flight_clock(
             std::process::id(),
             NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
         ));
-    let slabs = Rc::new(crate::test_support::simulated_slab(page_alloc::Slab::new(
-        directory.join(format!("worker-{}-slab-0.dat", worker.0)),
-        1024 * 1024 * 1024,
-        64 * 1024 * 1024,
-        crate::model::PAGE_BYTES as usize + crate::store::MAX_HEADER_BYTES + 16,
-    )));
+    let slabs = Rc::new(crate::test_support::simulated_slab(
+        page_alloc::Slab::new(
+            directory.join(format!("worker-{}-slab-0.dat", worker.0)),
+            1024 * 1024 * 1024,
+            64 * 1024 * 1024,
+            crate::model::PAGE_BYTES as usize + crate::store::MAX_HEADER_BYTES + 16,
+        ),
+        env,
+    ));
     let _ = slabs
         .open_configured(&segments)
         .expect("read fixture filesystem supports direct slab alignment");
@@ -3442,9 +3504,9 @@ fn fixture_with_flight_clock(
     let credentials = Rc::new(CredentialCrypto::new(
         keys.clone(),
         admission.clone(),
-        crate::test_support::ctx().rng,
+        env.ctx.clone().rng,
     ));
-    let peers = NoPeer::requester();
+    let peers = NoPeer::requester(env);
     let candidates = Rc::new(CandidatePolicy::new(
         node,
         Rc::new(Placement::new(16)),
@@ -3453,7 +3515,7 @@ fn fixture_with_flight_clock(
         Arc::new(crate::control::cell::PublicationCell::new(
             crate::control::Snapshot::retention(2),
         )),
-        crate::test_support::ctx(),
+        env.ctx.clone(),
     ));
     // Deliberately uninstalled catalog owner: publication must retain page-local
     // metadata and still complete when the optional catalog is unavailable.
@@ -3462,7 +3524,7 @@ fn fixture_with_flight_clock(
             Arc::new(WorkerMap::new(vec![worker]).unwrap()),
             vec![worker],
             16,
-            crate::test_support::ctx(),
+            env.ctx.clone(),
         )
         .unwrap(),
     );
@@ -3500,14 +3562,14 @@ fn fixture_with_flight_clock(
         crypto,
         engine: PageCryptoEngine::new(CryptoRuntime {
             port: engine,
-            ctx: crate::test_support::ctx(),
+            ctx: env.ctx.clone(),
         }),
         context,
         membership,
         page,
         pools: None,
         scope: RequestScope::on(
-            &crate::test_support::clock(),
+            &env.ctx.clock,
             RequestId([1; 16]),
             Instant::now() + Duration::from_secs(600),
         )
@@ -3538,6 +3600,7 @@ pub(super) fn drive<T>(
 }
 
 pub(super) fn adapter_client(
+    env: &racer_io::Env,
     f: &Fixture,
     adapter: &crate::test_support::origin::AdapterOrigin,
 ) -> Rc<crate::origin::OriginClient> {
@@ -3550,7 +3613,7 @@ pub(super) fn adapter_client(
     let snapshots = Rc::new(PublicationTarget::new(
         f.keys.cluster().clone(),
         Arc::new(PublicationCell::new(Snapshot::retention(2))),
-        crate::test_support::clock(),
+        env.ctx.clock.clone(),
     ));
     let (client_socket, origin_socket) =
         racer_wire::control::canonical_socket_paths("fixture").unwrap();
@@ -3620,18 +3683,20 @@ pub(super) fn drive_io<T>(
 
 #[test]
 fn abandoned_acquisition_does_not_cancel_shared_peer_scope() {
-    abandoned_acquisition_preserves_peer_scope(false);
+    let env = racer_io::Env::host();
+    abandoned_acquisition_preserves_peer_scope(&env, false);
 }
 
 #[test]
 fn abandoned_metadata_does_not_cancel_shared_peer_scope() {
-    abandoned_acquisition_preserves_peer_scope(true);
+    let env = racer_io::Env::host();
+    abandoned_acquisition_preserves_peer_scope(&env, true);
 }
 
-fn abandoned_acquisition_preserves_peer_scope(metadata: bool) {
+fn abandoned_acquisition_preserves_peer_scope(env: &racer_io::Env, metadata: bool) {
     use crate::model::MetadataSelector;
     {
-        let mut f = fixture();
+        let mut f = fixture(env);
         let queue = Rc::new(crate::drivers::DriverQueue::new(1024));
         let _queue = queue.enter();
         let mut cx = Context::from_waker(futures::task::noop_waker_ref());
@@ -3639,6 +3704,7 @@ fn abandoned_acquisition_preserves_peer_scope(metadata: bool) {
         if metadata {
             let (send, receive) = futures::channel::oneshot::channel();
             let service = f.metadata_service(
+                env,
                 Rc::new(metadata::GatedMetadataOrigin {
                     buffers: f.origin.buffers.clone(),
                     receive: RefCell::new(Some(receive)),
@@ -3689,7 +3755,8 @@ fn abandoned_acquisition_preserves_peer_scope(metadata: bool) {
 fn completed_fill_waits_release_shared_cancellation_capacity() {
     use futures::StreamExt;
     use futures::stream::FuturesUnordered;
-    let mut f = fixture();
+    let env = racer_io::Env::host();
+    let mut f = fixture(&env);
     let queue = Rc::new(crate::drivers::DriverQueue::new(1024));
     let _queue = queue.enter();
     // Force a terminal fill failure without any accepted I/O. Every cohort must
@@ -3745,6 +3812,7 @@ fn completed_fill_waits_release_shared_cancellation_capacity() {
 
 #[test]
 fn selected_owner_reclaims_foreign_receive_charges_across_full_pages() {
+    let env = racer_io::Env::host();
     let queue = Rc::new(crate::drivers::DriverQueue::new(1024));
     let _owner = queue.enter();
     use crate::model::PAGE_BYTES;
@@ -3753,8 +3821,8 @@ fn selected_owner_reclaims_foreign_receive_charges_across_full_pages() {
     limits.plaintext_bytes = NonZeroUsize::new(2 * PAGE_BYTES as usize).unwrap();
     limits.ciphertext_bytes =
         NonZeroUsize::new(3 * (PAGE_BYTES as usize + page_alloc::buf::GRANULE)).unwrap();
-    let mut source = fixture_with(8 * PAGE_BYTES, Some(limits.clone()));
-    let mut target = fixture_with(8 * PAGE_BYTES, Some(limits));
+    let mut source = fixture_with(&env, 8 * PAGE_BYTES, Some(limits.clone()));
+    let mut target = fixture_with(&env, 8 * PAGE_BYTES, Some(limits));
     for number in 0..8 {
         let page = PageId {
             version: source.page.version.clone(),
@@ -3852,10 +3920,11 @@ fn selected_owner_reclaims_foreign_receive_charges_across_full_pages() {
 
 #[test]
 fn ordinary_publication_rejects_foreign_worker_charges() {
+    let env = racer_io::Env::host();
     let queue = Rc::new(crate::drivers::DriverQueue::new(1024));
     let _owner = queue.enter();
-    let mut source = fixture();
-    let target = fixture();
+    let mut source = fixture(&env);
+    let target = fixture(&env);
     let mut budget = AcquisitionBudget::new(source.scope.deadline.0, 8, 16);
     let page = acquire(&mut source, &mut budget).unwrap();
     assert!(matches!(
@@ -3891,9 +3960,10 @@ fn ordinary_publication_rejects_foreign_worker_charges() {
 
 #[test]
 fn cached_corrupt_ciphertext_falls_back_without_exposing_plaintext() {
+    let env = racer_io::Env::host();
     let queue = Rc::new(crate::drivers::DriverQueue::new(1024));
     let _owner = queue.enter();
-    let mut f = fixture();
+    let mut f = fixture(&env);
     let mut budget = AcquisitionBudget::new(f.scope.deadline.0, 8, 8);
     let result = acquire(&mut f, &mut budget).unwrap();
     let mut bytes = result.ciphertext.bytes().to_vec();
@@ -3951,9 +4021,10 @@ fn cached_corrupt_ciphertext_falls_back_without_exposing_plaintext() {
 
 #[test]
 fn ciphertext_ready_promotes_once_for_concurrent_plaintext_readers() {
+    let env = racer_io::Env::host();
     let queue = Rc::new(crate::drivers::DriverQueue::new(1024));
     let _owner = queue.enter();
-    let mut f = fixture();
+    let mut f = fixture(&env);
     let metrics = Metrics::default();
     f.fill.metrics = metrics.clone();
     let mut budget = AcquisitionBudget::new(f.scope.deadline.0, 8, 8);
@@ -4040,11 +4111,12 @@ fn ciphertext_ready_promotes_once_for_concurrent_plaintext_readers() {
 
 #[test]
 fn retired_completed_flight_misses_new_callers_but_admitted_waiters_finish() {
+    let env = racer_io::Env::host();
     let queue = Rc::new(crate::drivers::DriverQueue::new(1024));
     let _owner = queue.enter();
     use crate::test_support::security::rotation_bundle;
     use racer_crypto::identity::KeyPurpose;
-    let mut f = fixture_with(3, None);
+    let mut f = fixture_with(&env, 3, None);
     let flights = f.fill.dependencies.flights.clone();
     let mut held_budget = AcquisitionBudget::new(f.scope.deadline.0, 8, 8);
     let JoinedFlight::Waiter(mut held) = flights
@@ -4169,6 +4241,7 @@ fn retired_completed_flight_misses_new_callers_but_admitted_waiters_finish() {
         use crate::client::ReadKind;
         use crate::model::ByteRange;
         let (coordinator, mut endpoint, _) = f.read_graph(
+            &env,
             Rc::new(Fill::new(f.fill.dependencies.clone())),
             &f.membership,
             ReadGraphSettings {
@@ -4300,9 +4373,10 @@ fn retired_completed_flight_misses_new_callers_but_admitted_waiters_finish() {
 
 #[test]
 fn concurrent_readers_share_origin_encryption_and_pending_original_ciphertext() {
+    let env = racer_io::Env::host();
     let queue = Rc::new(crate::drivers::DriverQueue::new(1024));
     let _owner = queue.enter();
-    let mut f = fixture();
+    let mut f = fixture(&env);
     let mut a = AcquisitionBudget::new(f.scope.deadline.0, 4, 8);
     let mut b = AcquisitionBudget::new(f.scope.deadline.0, 4, 8);
     let reads = futures::future::join(
@@ -4360,9 +4434,10 @@ fn concurrent_readers_share_origin_encryption_and_pending_original_ciphertext() 
 
 #[test]
 fn ciphertext_origin_fill_retains_verified_publication_without_a_plaintext_waiter() {
+    let env = racer_io::Env::host();
     let queue = Rc::new(crate::drivers::DriverQueue::new(1024));
     let _owner = queue.enter();
-    let mut f = fixture();
+    let mut f = fixture(&env);
     f.context.authorization =
         Some(crate::security::Authorization::from_header(b"test-supplier-credential").unwrap());
     let flights = f.fill.dependencies.flights.clone();
@@ -4469,8 +4544,8 @@ pub(super) fn drive_disk<T>(f: &Fixture, future: impl Future<Output = T>) -> T {
     }
 }
 
-fn cold_disk_fixture() -> Fixture {
-    cold_disk_fixture_from(fixture())
+fn cold_disk_fixture(env: &racer_io::Env) -> Fixture {
+    cold_disk_fixture_from(fixture(env))
 }
 
 fn cold_disk_fixture_from(mut f: Fixture) -> Fixture {
@@ -4505,8 +4580,8 @@ fn cold_disk_fixture_from(mut f: Fixture) -> Fixture {
     f
 }
 
-fn local_tail_fixture(length: u64, disk: bool) -> Fixture {
-    let mut f = fixture_with(length, None);
+fn local_tail_fixture(env: &racer_io::Env, length: u64, disk: bool) -> Fixture {
+    let mut f = fixture_with(env, length, None);
     f.page.number = PageNumber(3);
     f.reactor.init().unwrap();
     let _ = futures::executor::block_on(f.fill.dependencies.writer.open()).unwrap();
@@ -4548,12 +4623,13 @@ fn local_tail_fixture(length: u64, disk: bool) -> Fixture {
 
 #[test]
 fn cold_partial_page_admits_exact_plaintext_from_disk_and_pending() {
+    let env = racer_io::Env::host();
     let queue = Rc::new(crate::drivers::DriverQueue::new(1024));
     let _owner = queue.enter();
     for disk in [true, false] {
         // Pooled plaintext is charged at its 4 KiB-granule capacity.
         for free in [13_111_296usize, 13_111_295, PAGE_BYTES as usize] {
-            let mut f = local_tail_fixture(63_440_896, disk);
+            let mut f = local_tail_fixture(&env, 63_440_896, disk);
             let admission = f.fill.dependencies.admission.clone();
             let pressure = admission
                 .reserve(
@@ -4597,10 +4673,11 @@ fn cold_partial_page_admits_exact_plaintext_from_disk_and_pending() {
 
 #[test]
 fn cold_copy_full_page_boundary_and_canceled_disk_read_release_staging() {
+    let env = racer_io::Env::host();
     let queue = Rc::new(crate::drivers::DriverQueue::new(1024));
     let _owner = queue.enter();
     for disk in [true, false] {
-        let mut f = local_tail_fixture(4 * PAGE_BYTES, disk);
+        let mut f = local_tail_fixture(&env, 4 * PAGE_BYTES, disk);
         let admission = f.fill.dependencies.admission.clone();
         let pressure = admission
             .reserve(
@@ -4631,7 +4708,7 @@ fn cold_copy_full_page_boundary_and_canceled_disk_read_release_staging() {
         assert_eq!(f.origin.calls.get(), 0);
     }
     for pending in [false, true] {
-        let mut f = local_tail_fixture(63_440_896, true);
+        let mut f = local_tail_fixture(&env, 63_440_896, true);
         let admission = f.fill.dependencies.admission.clone();
         f.fill.dependencies.writer.slabs().reclaim_idle();
         let before = admission.used(ResourceClass::Ciphertext);
@@ -4663,11 +4740,12 @@ fn cold_copy_full_page_boundary_and_canceled_disk_read_release_staging() {
 
 #[test]
 fn copy_only_rejects_disk_payload_and_tag_corruption_before_retention() {
+    let env = racer_io::Env::host();
     let queue = Rc::new(crate::drivers::DriverQueue::new(1024));
     let _owner = queue.enter();
     for acquire in [false, true] {
         for corrupt_tag in [false, true] {
-            let mut f = cold_disk_fixture();
+            let mut f = cold_disk_fixture(&env);
             let writer = &f.fill.dependencies.writer;
             let location = writer.index().lookup(&f.page).unwrap().unwrap().location;
             let staging = writer
@@ -4789,9 +4867,10 @@ fn copy_only_rejects_disk_payload_and_tag_corruption_before_retention() {
 
 #[test]
 fn disk_tag_validation_preserves_replacement_and_intact_acquire() {
+    let env = racer_io::Env::host();
     let queue = Rc::new(crate::drivers::DriverQueue::new(1024));
     let _owner = queue.enter();
-    let mut f = cold_disk_fixture();
+    let mut f = cold_disk_fixture(&env);
     let (mut stale, token) = drive_disk(
         &f,
         f.fill.dependencies.disk.read_with_token(&f.page, &f.scope),
@@ -4882,9 +4961,10 @@ fn disk_tag_validation_preserves_replacement_and_intact_acquire() {
 
 #[test]
 fn concurrent_cold_disk_copy_only_shares_io_and_retains_original_ciphertext() {
+    let env = racer_io::Env::host();
     let queue = Rc::new(crate::drivers::DriverQueue::new(1024));
     let _owner = queue.enter();
-    let mut f = cold_disk_fixture();
+    let mut f = cold_disk_fixture(&env);
     let disk_hits = f.fill.metrics.count(Event::DiskIndexLookupHit);
     let cipher_misses = f.fill.metrics.count(Event::CiphertextLookupMiss);
     let pending_misses = f.fill.metrics.count(Event::PendingLookupMiss);
@@ -4973,9 +5053,10 @@ fn concurrent_cold_disk_copy_only_shares_io_and_retains_original_ciphertext() {
 
 #[test]
 fn detached_copy_only_keeps_disk_fence_and_independent_waiters() {
+    let env = racer_io::Env::host();
     let queue = Rc::new(crate::drivers::DriverQueue::new(1024));
     let _owner = queue.enter();
-    let mut f = cold_disk_fixture();
+    let mut f = cold_disk_fixture(&env);
     let caller = RequestScope::host(RequestId([9; 16]), f.scope.deadline.0).unwrap();
     let mut first = f.fill.copy_only(&f.page, &caller);
     let mut second = f.fill.copy_only(&f.page, &f.scope);
@@ -5012,6 +5093,7 @@ fn detached_copy_only_keeps_disk_fence_and_independent_waiters() {
 #[test]
 fn bounded_admission_private_copy_completion_wakes_queued_read() {
     use std::future::Future;
+    let env = racer_io::Env::host();
     let queue = Rc::new(crate::drivers::DriverQueue::new(1024));
     let _owner = queue.enter();
     // The queued read's admission allowance is 100ms on the flight clock.
@@ -5019,6 +5101,7 @@ fn bounded_admission_private_copy_completion_wakes_queued_read() {
     // cannot expire the allowance before the completion wake is observed.
     let frozen = racer_io::ctx::VirtualClock::new_at(Instant::now(), std::time::SystemTime::now());
     let mut f = cold_disk_fixture_from(fixture_with_flight_clock(
+        &env,
         3,
         None,
         vec![CacheId(crate::test_support::security::CACHE.into())],
@@ -5090,9 +5173,10 @@ fn bounded_admission_private_copy_completion_wakes_queued_read() {
 /// Dropping a caller cannot report a returned outcome for a parked disk driver.
 #[test]
 fn expiry_snapshot_disk_driver_stage_survives_caller_drop() {
+    let env = racer_io::Env::host();
     let queue = Rc::new(crate::drivers::DriverQueue::new(1024));
     let _owner = queue.enter();
-    let mut f = cold_disk_fixture();
+    let mut f = cold_disk_fixture(&env);
     let mut budget = AcquisitionBudget::new(f.scope.deadline.0, 4, 8);
     let mut acquire = f.fill.acquire(
         f.page.clone(),
@@ -5147,9 +5231,10 @@ fn expiry_snapshot_disk_driver_stage_survives_caller_drop() {
 /// instead of canceling; that caller completes from the same operation.
 #[test]
 fn canceled_leader_fill_driver_continues_for_remaining_caller() {
+    let env = racer_io::Env::host();
     let queue = Rc::new(crate::drivers::DriverQueue::new(1024));
     let _owner = queue.enter();
-    let mut f = cold_disk_fixture();
+    let mut f = cold_disk_fixture(&env);
     let other = RequestScope::host(f.scope.request, f.scope.deadline.0).unwrap();
     let mut a_budget = AcquisitionBudget::new(f.scope.deadline.0, 4, 8);
     let mut b_budget = AcquisitionBudget::new(other.deadline.0, 4, 8);
@@ -5190,11 +5275,12 @@ fn canceled_leader_fill_driver_continues_for_remaining_caller() {
 
 #[test]
 fn copy_only_miss_releases_shared_scope_subscriptions_across_cohorts() {
+    let env = racer_io::Env::host();
     let queue = Rc::new(crate::drivers::DriverQueue::new(1024));
     let _owner = queue.enter();
     use futures::StreamExt;
     use futures::stream::FuturesUnordered;
-    let mut f = fixture();
+    let mut f = fixture(&env);
     for _ in 0..1100 {
         let mut requests = FuturesUnordered::new();
         requests.push(f.fill.copy_only(&f.page, &f.scope));
@@ -5219,9 +5305,10 @@ fn copy_only_miss_releases_shared_scope_subscriptions_across_cohorts() {
 
 #[test]
 fn canceled_before_lookup_has_no_outcome() {
+    let env = racer_io::Env::host();
     let queue = Rc::new(crate::drivers::DriverQueue::new(1024));
     let _owner = queue.enter();
-    let f = fixture();
+    let f = fixture(&env);
     f.scope.cancel().unwrap();
     assert!(matches!(
         f.fill.cached_page(&f.page, &f.scope),
@@ -5247,9 +5334,10 @@ fn canceled_before_lookup_has_no_outcome() {
 
 #[test]
 fn lookup_plaintext_and_pending_hits_do_not_probe_disk() {
+    let env = racer_io::Env::host();
     let queue = Rc::new(crate::drivers::DriverQueue::new(1024));
     let _owner = queue.enter();
-    let mut f = fixture();
+    let mut f = fixture(&env);
     assert!(f.fill.cached_page(&f.page, &f.scope).unwrap().is_none());
     let mut budget = AcquisitionBudget::new(f.scope.deadline.0, 4, 8);
     let page = acquire(&mut f, &mut budget).unwrap();
@@ -5301,9 +5389,10 @@ fn lookup_plaintext_and_pending_hits_do_not_probe_disk() {
 
 #[test]
 fn copy_only_local_state_admission_failure_releases_all_reservations() {
+    let env = racer_io::Env::host();
     let queue = Rc::new(crate::drivers::DriverQueue::new(1024));
     let _owner = queue.enter();
-    let mut f = fixture();
+    let mut f = fixture(&env);
     let admission = &f.fill.dependencies.admission;
     let pressure = admission
         .reserve(
@@ -5340,22 +5429,24 @@ fn copy_only_local_state_admission_failure_releases_all_reservations() {
 
 #[test]
 fn copy_only_disk_read_reclaims_idle_ciphertext_without_revoking_live_copies() {
-    disk_copy_reclaims_idle_ciphertext(false);
+    let env = racer_io::Env::host();
+    disk_copy_reclaims_idle_ciphertext(&env, false);
 }
 
 #[test]
 fn peer_bootstrap_disk_copy_reclaims_idle_ciphertext_before_fresh_acquisition() {
-    disk_copy_reclaims_idle_ciphertext(true);
+    let env = racer_io::Env::host();
+    disk_copy_reclaims_idle_ciphertext(&env, true);
 }
 
-fn disk_copy_reclaims_idle_ciphertext(bootstrap: bool) {
+fn disk_copy_reclaims_idle_ciphertext(env: &racer_io::Env, bootstrap: bool) {
     let queue = Rc::new(crate::drivers::DriverQueue::new(1024));
     let _owner = queue.enter();
     let mut limits = crate::test_support::cluster::config(false).limits;
     limits.plaintext_bytes = std::num::NonZeroUsize::new(512 * 1024 * 1024).unwrap();
     limits.ciphertext_bytes = limits.plaintext_bytes;
     limits.metadata_entries = std::num::NonZeroUsize::new(64).unwrap();
-    let mut f = fixture_with(PAGE_BYTES, Some(limits));
+    let mut f = fixture_with(env, PAGE_BYTES, Some(limits));
     f.scope.deadline.0 = Instant::now() + Duration::from_secs(30);
     f.reactor.init().unwrap();
     let _ = futures::executor::block_on(f.fill.dependencies.writer.open()).unwrap();
@@ -5396,7 +5487,7 @@ fn disk_copy_reclaims_idle_ciphertext(bootstrap: bool) {
     deps.admission
         .policy()
         .set_observer(failures.observer(WorkerId(0)));
-    let index = f.metadata_index(64);
+    let index = f.metadata_index(env, 64);
     let mut fresh = metadata.clone();
     fresh.expires_at = ExpiresAt::from_unix_millis(
         std::time::SystemTime::now()
@@ -5539,9 +5630,10 @@ fn disk_copy_reclaims_idle_ciphertext(bootstrap: bool) {
 
 #[test]
 fn copy_only_miss_has_no_origin_side_effect_and_wrong_context_never_joins() {
+    let env = racer_io::Env::host();
     let queue = Rc::new(crate::drivers::DriverQueue::new(1024));
     let _owner = queue.enter();
-    let mut f = fixture();
+    let mut f = fixture(&env);
     assert!(
         drive(
             f.fill.copy_only(&f.page, &f.scope),
@@ -5568,9 +5660,10 @@ fn copy_only_miss_has_no_origin_side_effect_and_wrong_context_never_joins() {
 /// running acquisition and gets its copy.
 #[test]
 fn copy_only_without_join_misses_a_running_acquisition_and_with_join_waits() {
+    let env = racer_io::Env::host();
     let queue = Rc::new(crate::drivers::DriverQueue::new(1024));
     let _owner = queue.enter();
-    let mut f = fixture();
+    let mut f = fixture(&env);
     let mut budget = AcquisitionBudget::new(f.scope.deadline.0, 4, 8);
     let mut running = f.fill.acquire(
         f.page.clone(),
@@ -5616,9 +5709,10 @@ fn copy_only_without_join_misses_a_running_acquisition_and_with_join_waits() {
 
 #[test]
 fn rejected_origin_supplier_does_not_fail_an_independent_coalesced_reader() {
+    let env = racer_io::Env::host();
     let queue = Rc::new(crate::drivers::DriverQueue::new(1024));
     let _owner = queue.enter();
-    let mut f = fixture();
+    let mut f = fixture(&env);
     f.origin.reject_once.set(true);
     let mut a = AcquisitionBudget::new(f.scope.deadline.0, 4, 8);
     let mut b = AcquisitionBudget::new(f.scope.deadline.0, 4, 8);
@@ -5648,9 +5742,10 @@ fn rejected_origin_supplier_does_not_fail_an_independent_coalesced_reader() {
 
 #[test]
 fn canceled_supplier_retains_crypto_fence_before_replacement_origin_work() {
+    let env = racer_io::Env::host();
     let queue = Rc::new(crate::drivers::DriverQueue::new(1024));
     let _owner = queue.enter();
-    let mut f = fixture();
+    let mut f = fixture(&env);
     let mut a = AcquisitionBudget::new(f.scope.deadline.0, 4, 8);
     let second_scope = RequestScope::host(RequestId([2; 16]), f.scope.deadline.0).unwrap();
     let mut b = AcquisitionBudget::new(second_scope.deadline.0, 4, 8);
@@ -5703,8 +5798,8 @@ fn canceled_supplier_retains_crypto_fence_before_replacement_origin_work() {
 
 /// Publish a tampered copy of the on-disk page to the memory cache, optionally
 /// carrying the disk invalidation token, and attempt a plaintext local read.
-fn cached_tampered_copy_local_read(with_token: bool) -> Fixture {
-    let mut f = cold_disk_fixture();
+fn cached_tampered_copy_local_read(env: &racer_io::Env, with_token: bool) -> Fixture {
+    let mut f = cold_disk_fixture(env);
     let (disk, token) = drive_disk(
         &f,
         f.fill.dependencies.disk.read_with_token(&f.page, &f.scope),
@@ -5766,9 +5861,10 @@ fn cached_tampered_copy_local_read(with_token: bool) -> Fixture {
 
 #[test]
 fn cached_disk_copy_authentication_failure_invalidates_disk_record() {
+    let env = racer_io::Env::host();
     let queue = Rc::new(crate::drivers::DriverQueue::new(1024));
     let _owner = queue.enter();
-    let f = cached_tampered_copy_local_read(true);
+    let f = cached_tampered_copy_local_read(&env, true);
     assert!(
         f.fill
             .dependencies
@@ -5784,9 +5880,10 @@ fn cached_disk_copy_authentication_failure_invalidates_disk_record() {
 
 #[test]
 fn cached_memory_copy_authentication_failure_keeps_disk_record() {
+    let env = racer_io::Env::host();
     let queue = Rc::new(crate::drivers::DriverQueue::new(1024));
     let _owner = queue.enter();
-    let f = cached_tampered_copy_local_read(false);
+    let f = cached_tampered_copy_local_read(&env, false);
     // Without a token the cached copy is not tied to the disk record.
     assert!(
         f.fill
@@ -5802,9 +5899,10 @@ fn cached_memory_copy_authentication_failure_keeps_disk_record() {
 
 #[test]
 fn concurrent_warm_local_after_plaintext_release_shares_one_decrypt() {
+    let env = racer_io::Env::host();
     let queue = Rc::new(crate::drivers::DriverQueue::new(1024));
     let _owner = queue.enter();
-    let mut f = fixture();
+    let mut f = fixture(&env);
     let mut budget = AcquisitionBudget::new(f.scope.deadline.0, 8, 8);
     let original = acquire(&mut f, &mut budget).unwrap();
     drop(original);
@@ -5835,9 +5933,10 @@ fn concurrent_warm_local_after_plaintext_release_shares_one_decrypt() {
 
 #[test]
 fn concurrent_warm_local_without_local_copy_fails_together_without_acquisition() {
+    let env = racer_io::Env::host();
     let queue = Rc::new(crate::drivers::DriverQueue::new(1024));
     let _owner = queue.enter();
-    let mut f = fixture();
+    let mut f = fixture(&env);
     let metrics = Metrics::default();
     f.fill.metrics = metrics.clone();
     let first = f.fill.warm_local(&f.page, &f.scope);
@@ -5890,9 +5989,10 @@ fn assert_local_plaintext_idle(f: &Fixture) {
 
 #[test]
 fn range_probe_then_acquisition_share_one_retained_decrypt() {
+    let env = racer_io::Env::host();
     let queue = Rc::new(crate::drivers::DriverQueue::new(1024));
     let _owner = queue.enter();
-    let mut f = fixture();
+    let mut f = fixture(&env);
     let metrics = retained_ciphertext_only(&mut f);
     let origin_calls = f.origin.calls.get();
     let mut cx = Context::from_waker(futures::task::noop_waker_ref());
@@ -5926,9 +6026,10 @@ fn range_probe_then_acquisition_share_one_retained_decrypt() {
 
 #[test]
 fn acquisition_then_range_probe_share_one_retained_decrypt() {
+    let env = racer_io::Env::host();
     let queue = Rc::new(crate::drivers::DriverQueue::new(1024));
     let _owner = queue.enter();
-    let mut f = fixture();
+    let mut f = fixture(&env);
     let metrics = retained_ciphertext_only(&mut f);
     let origin_calls = f.origin.calls.get();
     let mut cx = Context::from_waker(futures::task::noop_waker_ref());
@@ -5972,9 +6073,10 @@ fn acquisition_then_range_probe_share_one_retained_decrypt() {
 
 #[test]
 fn range_probe_without_local_copy_does_not_block_acquisition() {
+    let env = racer_io::Env::host();
     let queue = Rc::new(crate::drivers::DriverQueue::new(1024));
     let _owner = queue.enter();
-    let mut f = fixture();
+    let mut f = fixture(&env);
     let mut cx = Context::from_waker(futures::task::noop_waker_ref());
     let mut budget = AcquisitionBudget::new(f.scope.deadline.0, 8, 8);
     let mut acquisition = f.fill.acquire(
@@ -6010,9 +6112,10 @@ fn range_probe_without_local_copy_does_not_block_acquisition() {
 
 #[test]
 fn local_plaintext_probe_job_retains_flight_charge_after_cancellation() {
+    let env = racer_io::Env::host();
     let queue = Rc::new(crate::drivers::DriverQueue::new(1024));
     let _owner = queue.enter();
-    let mut f = fixture();
+    let mut f = fixture(&env);
     let metrics = retained_ciphertext_only(&mut f);
     let admission = f.fill.dependencies.admission.clone();
     let mut cx = Context::from_waker(futures::task::noop_waker_ref());
@@ -6037,9 +6140,10 @@ fn local_plaintext_probe_job_retains_flight_charge_after_cancellation() {
 
 #[test]
 fn canceled_acquisition_led_local_plaintext_retains_flight_until_job_completes() {
+    let env = racer_io::Env::host();
     let queue = Rc::new(crate::drivers::DriverQueue::new(1024));
     let _owner = queue.enter();
-    let mut f = fixture();
+    let mut f = fixture(&env);
     let metrics = retained_ciphertext_only(&mut f);
     let admission = f.fill.dependencies.admission.clone();
     let mut cx = Context::from_waker(futures::task::noop_waker_ref());
@@ -6100,9 +6204,10 @@ fn canceled_acquisition_led_local_plaintext_retains_flight_until_job_completes()
 
 #[test]
 fn local_plaintext_probe_respects_exhausted_flight_quota() {
+    let env = racer_io::Env::host();
     let queue = Rc::new(crate::drivers::DriverQueue::new(1024));
     let _owner = queue.enter();
-    let mut f = fixture();
+    let mut f = fixture(&env);
     let metrics = retained_ciphertext_only(&mut f);
     let admission = f.fill.dependencies.admission.clone();
     let held = admission
@@ -6125,10 +6230,11 @@ fn local_plaintext_probe_respects_exhausted_flight_quota() {
 
 #[test]
 fn local_plaintext_follower_after_key_retirement_misses_but_leader_finishes() {
+    let env = racer_io::Env::host();
     let queue = Rc::new(crate::drivers::DriverQueue::new(1024));
     let _owner = queue.enter();
     use crate::test_support::security::rotation_bundle;
-    let mut f = fixture_with(3, None);
+    let mut f = fixture_with(&env, 3, None);
     let _metrics = retained_ciphertext_only(&mut f);
     let mut cx = Context::from_waker(futures::task::noop_waker_ref());
     let mut leader = Box::pin(f.fill.warm_local(&f.page, &f.scope));
@@ -6171,9 +6277,10 @@ fn expire(short: &RequestScope) {
 
 #[test]
 fn warm_reader_retries_after_joined_short_deadline_probe_expires() {
+    let env = racer_io::Env::host();
     let queue = Rc::new(crate::drivers::DriverQueue::new(1024));
     let _owner = queue.enter();
-    let mut f = fixture();
+    let mut f = fixture(&env);
     let metrics = retained_ciphertext_only(&mut f);
     let origin_calls = f.origin.calls.get();
     let short = short_scope();
@@ -6205,9 +6312,10 @@ fn warm_reader_retries_after_joined_short_deadline_probe_expires() {
 
 #[test]
 fn acquisition_retries_after_joined_short_deadline_probe_expires() {
+    let env = racer_io::Env::host();
     let queue = Rc::new(crate::drivers::DriverQueue::new(1024));
     let _owner = queue.enter();
-    let mut f = fixture();
+    let mut f = fixture(&env);
     let metrics = retained_ciphertext_only(&mut f);
     let origin_calls = f.origin.calls.get();
     let short = short_scope();
@@ -6253,9 +6361,10 @@ fn acquisition_retries_after_joined_short_deadline_probe_expires() {
 
 #[test]
 fn expired_follower_of_expired_probe_reports_its_own_deadline() {
+    let env = racer_io::Env::host();
     let queue = Rc::new(crate::drivers::DriverQueue::new(1024));
     let _owner = queue.enter();
-    let mut f = fixture();
+    let mut f = fixture(&env);
     let metrics = retained_ciphertext_only(&mut f);
     let short = short_scope();
     let follower_scope = RequestScope::host(RequestId([8; 16]), short.deadline.0).unwrap();

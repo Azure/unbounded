@@ -208,7 +208,10 @@ impl PeerServer {
         wire: Rc<super::protocol::SecurityCodec>,
         signatures: Rc<crate::peer::protocol::Signatures>,
     ) -> Self {
-        let pipes = Rc::new(crate::http::new_pipe_pool(admission.clone()));
+        let pipes = Rc::new(crate::http::new_pipe_pool(
+            admission.clone(),
+            io.reactor().sim_os(),
+        ));
         let transfers = Rc::new(super::transport::Transfers::new(
             Rc::new(crate::http::new_pool(
                 io.reactor().clone(),
@@ -1170,7 +1173,6 @@ fn peer_response(response: racer_core::route::Response) -> PeerResponse {
 mod tests {
     use super::*;
     use crate::model::RequestId;
-    use crate::rt::environment::SimulationClock;
     use crate::test_support::clock::Clock;
     use futures::channel::oneshot;
     use futures::stream::FuturesUnordered;
@@ -1241,13 +1243,14 @@ mod tests {
         use std::net::Shutdown;
         use std::net::TcpListener;
         use std::net::TcpStream;
+        let env = racer_io::Env::host();
 
         for body in [false, true] {
             for cancel_parent in [false, true] {
                 let admission = Rc::new(flow_control::Quotas::new(AdmissionPolicy::new(
                     crate::test_support::cluster::config(false).limits,
                 )));
-                let reactor = Rc::new(Reactor::new(admission.clone(), &crate::test_support::env()));
+                let reactor = Rc::new(Reactor::new(admission.clone(), &env));
                 reactor.init().unwrap();
                 let io =
                     crate::http::new_io(reactor.clone(), Codec::new(4096), admission.clone(), 4096);
@@ -1283,7 +1286,7 @@ mod tests {
                             connection = read.lease;
                             buffer = read.buffer;
                         }
-                        Ok(crate::peer::tests::signed_fixture_response())
+                        Ok(crate::peer::tests::signed_fixture_response(&env))
                     }
                     .await;
                     completed.set(true);
@@ -1351,10 +1354,11 @@ mod tests {
     fn materialized_transit_success_fences_watch_before_keepalive() {
         use crate::http::Codec;
         use crate::runtime::Reactor;
+        let env = racer_io::Env::host();
         let admission = Rc::new(flow_control::Quotas::new(AdmissionPolicy::new(
             crate::test_support::cluster::config(false).limits,
         )));
-        let reactor = Rc::new(Reactor::new(admission.clone(), &crate::test_support::env()));
+        let reactor = Rc::new(Reactor::new(admission.clone(), &env));
         reactor.init().unwrap();
         let io = crate::http::new_io(reactor.clone(), Codec::new(4096), admission.clone(), 4096);
         let parent = listener_scope();
@@ -1367,7 +1371,7 @@ mod tests {
             connection = received.connection;
             let exchange = RequestScope::host(RequestId([7; 16]), parent.deadline.0).unwrap();
             let mut pending_once = true;
-            let mut signed = Some(crate::peer::tests::signed_fixture_response());
+            let mut signed = Some(crate::peer::tests::signed_fixture_response(&env));
             let signature = signed
                 .as_ref()
                 .unwrap()
@@ -1541,13 +1545,14 @@ mod tests {
         use crate::runtime::Reactor;
         use std::net::TcpListener;
         use std::net::TcpStream;
+        let env = racer_io::Env::host();
 
         for ready in [false, true] {
             for end in ["consume", "cancel", "drop"] {
                 let admission = Rc::new(flow_control::Quotas::new(AdmissionPolicy::new(
                     crate::test_support::cluster::config(false).limits,
                 )));
-                let reactor = Reactor::new(admission.clone(), &crate::test_support::env());
+                let reactor = Reactor::new(admission.clone(), &env);
                 reactor.init().unwrap();
                 let baseline = admission.used(ResourceClass::RequestContext);
                 let scope = listener_scope();
@@ -1737,14 +1742,14 @@ mod tests {
             for end in ["expiry", "handshake-cap", "cancel", "drop", "resume"] {
                 // Only the clock is virtual: socket buffers and CQEs are real.
                 let clock =
-                    SimulationClock::new_at(83, Instant::now(), std::time::SystemTime::now());
-                let environment = clock.environment(0);
-                let _guard = environment.enter();
-                let signers = crate::test_support::security::network(2);
+                    racer_io::SimClock::new_at(83, Instant::now(), std::time::SystemTime::now());
+                let environment = clock.ctx(0);
+                let env = racer_io::Env::new(racer_io::Driver::Uring, environment.clone());
+                let signers = crate::test_support::security::network(&env, 2);
                 let mut limits = crate::test_support::cluster::config(false).limits;
                 limits.client_connections = std::num::NonZeroUsize::new(1).unwrap();
                 let admission = Rc::new(flow_control::Quotas::new(AdmissionPolicy::new(limits)));
-                let reactor = Rc::new(Reactor::new(admission.clone(), &crate::test_support::env()));
+                let reactor = Rc::new(Reactor::new(admission.clone(), &env));
                 reactor.init().unwrap();
                 let baseline = admission.used(ResourceClass::RequestContext);
                 let io = Rc::new(crate::http::new_io(
@@ -1755,6 +1760,7 @@ mod tests {
                 ));
                 let forwarding = Rc::new(Forwarding::new(signers[1].clone()));
                 let outbound = crate::peer::tests::NoOutbound::new(
+                    &env,
                     signers[1].clone(),
                     Rc::new(
                         super::super::PeerNetwork::new(
@@ -1762,13 +1768,16 @@ mod tests {
                             std::sync::Arc::new(crate::control::cell::PublicationCell::new(
                                 crate::control::Snapshot::retention(2),
                             )),
-                            crate::test_support::clock(),
+                            env.ctx.clock.clone(),
                         )
                         .unwrap(),
                     ),
                 );
                 let relay = Rc::new(Relay::new(
-                    Rc::new(Paths::new(Rc::new(LinkHealth::default()), 4)),
+                    Rc::new(Paths::new(
+                        Rc::new(LinkHealth::on(env.ctx.clock.clone())),
+                        4,
+                    )),
                     forwarding.clone(),
                     outbound.requester.clone(),
                     admission.clone(),
@@ -1778,7 +1787,7 @@ mod tests {
                             std::sync::Arc::new(crate::control::cell::PublicationCell::new(
                                 crate::control::Snapshot::retention(2),
                             )),
-                            crate::test_support::clock(),
+                            env.ctx.clock.clone(),
                         )
                         .unwrap(),
                     ),
@@ -1798,8 +1807,8 @@ mod tests {
                 .with_request_timeout(Duration::from_secs(
                     if end == "handshake-cap" { 60 } else { 4 },
                 ));
-                let scope = RequestScope::untimed(RequestId([5; 16]), crate::test_support::clock())
-                    .unwrap();
+                let scope =
+                    RequestScope::untimed(RequestId([5; 16]), env.ctx.clock.clone()).unwrap();
                 let (socket, mut peer) = UnixStream::pair().unwrap();
                 let mut writer = socket.try_clone().unwrap();
                 peer.set_nonblocking(true).unwrap();

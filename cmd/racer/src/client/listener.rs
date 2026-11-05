@@ -486,6 +486,7 @@ impl ClientListeners {
                 let temporary = format!(".racer-{:032x}", u128::from_ne_bytes(random));
                 let previous = old_by_name.get(definition.name.as_str()).cloned();
                 let next = Rc::new(bind(
+                    self.io.reactor(),
                     &self.root,
                     definition.clone(),
                     &temporary,
@@ -618,7 +619,7 @@ impl ClientListeners {
             #[cfg(not(test))]
             let simulated = false;
             #[cfg(test)]
-            let simulated = crate::rt::reactor::simulation::Simulation::current().is_some();
+            let simulated = self.io.reactor().sim_os().is_some();
             let listener = if simulated {
                 let listeners = self.listeners.borrow();
                 let key = self.sim_cursor.borrow().clone();
@@ -1395,20 +1396,18 @@ fn grant_client_search(directory: &File) -> Result<()> {
 }
 
 fn bind(
+    #[cfg_attr(not(test), allow(unused_variables))] reactor: &crate::runtime::Reactor,
     root: &Path,
     definition: CacheDefinition,
     basename: &str,
     previous: Option<&BoundListener>,
 ) -> Result<BoundListener> {
     #[cfg(test)]
-    if let Some(sim) = crate::rt::reactor::simulation::Simulation::current() {
+    if let Some(sim) = reactor.sim_os() {
         let directory = root.join(&definition.name).join("client");
-        let listener = crate::uds_endpoint::simulation::BoundSocket::bind(
-            sim.os().clone(),
-            directory.clone(),
-            basename,
-        )
-        .map_err(|_| Error::Io)?;
+        let listener =
+            crate::uds_endpoint::simulation::BoundSocket::bind(sim, directory.clone(), basename)
+                .map_err(|_| Error::Io)?;
         let bound = BoundListener {
             definition,
             listener: Listener::Sim(listener),

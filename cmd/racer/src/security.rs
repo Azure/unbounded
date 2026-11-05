@@ -1674,11 +1674,10 @@ mod tests {
     /// Publication retries reset only queue timing, not execution or ownership.
     #[test]
     fn permit_bookkeeping_preserves_missing_submission_and_retry_timing() {
-        use crate::rt::environment::{SimulationClock, now};
         use std::time::Duration;
 
-        let clock = SimulationClock::new(817);
-        let _environment = clock.environment(0).enter();
+        let clock = racer_io::SimClock::new(817);
+        let env = racer_io::Env::new(racer_io::Driver::Uring, clock.ctx(0));
         let (port, _worker) = pair(WorkerId(0), 1, NonZeroUsize::new(1).unwrap());
         let mut cx = Context::from_waker(futures::task::noop_waker_ref());
         let id = CryptoId {
@@ -1692,17 +1691,17 @@ mod tests {
         assert!(permit.send_sample.is_none());
         assert!(permit.aead_failure.is_none());
         assert_eq!(permit.measurement.execution_ns, None);
-        permit.dequeued(now());
+        permit.dequeued(env.ctx.now());
         assert_eq!(permit.measurement.queue_ns, None);
-        permit.submitted(now());
+        permit.submitted(env.ctx.now());
         clock.advance(Duration::from_nanos(11));
-        permit.submitted(now());
+        permit.submitted(env.ctx.now());
         clock.advance(Duration::from_nanos(7));
-        permit.dequeued(now());
+        permit.dequeued(env.ctx.now());
         assert_eq!(permit.measurement.queue_ns, Some(7));
-        let start = now();
+        let start = env.ctx.now();
         clock.advance(Duration::from_nanos(5));
-        permit.executed(now(), start);
+        permit.executed(env.ctx.now(), start);
         permit.rejected(IntegrityRejection::Aead);
         assert_eq!(permit.measurement.execution_ns, Some(5));
         assert!(matches!(
@@ -1801,7 +1800,8 @@ mod tests {
 
         #[test]
         fn local_context_is_independently_charged_and_keeps_exact_sensitive_fields() {
-            let keys = Rc::new(crate::test_support::security::keys());
+            let env = racer_io::Env::host();
+            let keys = Rc::new(crate::test_support::security::keys(&env));
             let admission = Rc::new(flow_control::Quotas::new(AdmissionPolicy::new(
                 crate::test_support::cluster::config(false).limits,
             )));
@@ -1857,11 +1857,12 @@ mod tests {
         }
         #[test]
         fn exact_roundtrip_nonce_freshness_admission_and_cancellation() {
+            let env = racer_io::Env::host();
             let admission = Rc::new(flow_control::Quotas::new(AdmissionPolicy::new(
                 crate::test_support::cluster::config(false).limits,
             )));
             let crypto = CredentialCrypto::new(
-                Rc::new(crate::test_support::security::keys()),
+                Rc::new(crate::test_support::security::keys(&env)),
                 admission.clone(),
                 racer_io::WorkerCtx::host().rng,
             );
@@ -1896,7 +1897,7 @@ mod tests {
             let mut limits = crate::test_support::cluster::config(false).limits;
             limits.request_context_bytes = std::num::NonZeroUsize::new(1).unwrap();
             let crypto = CredentialCrypto::new(
-                Rc::new(crate::test_support::security::keys()),
+                Rc::new(crate::test_support::security::keys(&env)),
                 Rc::new(flow_control::Quotas::new(AdmissionPolicy::new(limits))),
                 racer_io::WorkerCtx::host().rng,
             );
@@ -1907,11 +1908,12 @@ mod tests {
         }
         #[test]
         fn absent_authorization_is_charged_and_expired_context_is_rejected() {
+            let env = racer_io::Env::host();
             let admission = Rc::new(flow_control::Quotas::new(AdmissionPolicy::new(
                 crate::test_support::cluster::config(false).limits,
             )));
             let crypto = CredentialCrypto::new(
-                Rc::new(crate::test_support::security::keys()),
+                Rc::new(crate::test_support::security::keys(&env)),
                 admission.clone(),
                 racer_io::WorkerCtx::host().rng,
             );
@@ -1940,8 +1942,9 @@ mod tests {
         }
         #[test]
         fn rejects_substitution_and_distinguishes_absent_from_empty() {
+            let env = racer_io::Env::host();
             let crypto = CredentialCrypto::new(
-                Rc::new(crate::test_support::security::keys()),
+                Rc::new(crate::test_support::security::keys(&env)),
                 Rc::new(flow_control::Quotas::new(AdmissionPolicy::new(
                     crate::test_support::cluster::config(false).limits,
                 ))),
@@ -2093,11 +2096,11 @@ mod tests {
                     assert_eq!(plain.bytes()[size - 1], 7);
                 }
             }
-            fn lifecycle(size: usize, paired: bool, operation: &str) {
+            fn lifecycle(env: &racer_io::Env, size: usize, paired: bool, operation: &str) {
                 let inputs = MeasurementInputs::new(size, operation);
                 let admission = &inputs.admission;
                 let cache = &inputs.page.version.object.cache;
-                let keys = tests::keyring();
+                let keys = tests::keyring(env);
                 let iterations = 16;
                 let concurrency = if paired { 8 } else { 1 };
                 let (io, mut engine) =
@@ -2193,28 +2196,34 @@ mod tests {
 
             #[test]
             fn lifecycle_setup_preserves_success_failure_and_quota_cleanup() {
+                let env = racer_io::Env::host();
                 for paired in [false, true] {
                     for operation in ["encrypt", "decrypt", "bad_tag"] {
-                        lifecycle(4095, paired, operation);
+                        lifecycle(&env, 4095, paired, operation);
                     }
                 }
             }
 
             /// Full client submission, waiter registration, real paired execution, I/O reap,
             /// result delivery, and cleanup for both encrypt and decrypt attribution.
-            fn accounting_sample(size: usize, decrypt: bool, iterations: usize) {
+            fn accounting_sample(
+                env: &racer_io::Env,
+                size: usize,
+                decrypt: bool,
+                iterations: usize,
+            ) {
                 let operation = if decrypt { "decrypt" } else { "encrypt" };
                 let inputs = MeasurementInputs::new(size, operation);
                 let admission = &inputs.admission;
-                let keys = tests::keyring();
+                let keys = tests::keyring(env);
                 let cache = &inputs.page.version.object.cache;
                 let metrics = Metrics::default();
                 let (io, mut engine) = pair(WorkerId(0), 0, NonZeroUsize::new(8).unwrap());
                 let client = CryptoClient::new(io);
                 client.set_metrics(metrics.clone());
-                let environment = crate::rt::environment::Environment::current();
+                let thread_ctx = env.ctx.clone();
                 let thread = std::thread::spawn(move || {
-                    let _env = environment.enter();
+                    let env = racer_io::Env::new(racer_io::Driver::Uring, thread_ctx);
                     while let Some(job) =
                         futures::executor::block_on(futures::future::poll_fn(|cx| {
                             engine.poll_job(cx)
@@ -2223,18 +2232,15 @@ mod tests {
                     {
                         assert!(
                             engine
-                                .complete(PageCryptoEngine::process(
-                                    job,
-                                    &crate::test_support::ctx()
-                                ))
+                                .complete(PageCryptoEngine::process(job, &env.ctx))
                                 .is_ok()
                         );
                     }
                 });
                 let scope = RequestScope::on(
-                    &crate::test_support::clock(),
+                    &env.ctx.clock,
                     RequestId([0; 16]),
-                    crate::rt::environment::now() + Duration::from_secs(240),
+                    env.ctx.now() + Duration::from_secs(240),
                 )
                 .unwrap();
                 for batch in (0..iterations).step_by(8) {
@@ -2285,7 +2291,7 @@ mod tests {
                 ]) {
                     assert_eq!(metrics.count(event), expected);
                 }
-                if crate::rt::environment::simulation_seed().is_none() {
+                if !env.ctx.is_simulated() {
                     assert!(metrics.count(events[5]) > 0);
                     assert!(metrics.count(events[7]) > 0);
                 }
@@ -2293,39 +2299,35 @@ mod tests {
 
             #[test]
             fn attribution_preserves_client_cleanup_and_dst() {
-                use crate::rt::environment;
-                use crate::rt::environment::SimulationClock;
-                let clock = SimulationClock::new(73);
-                let env = clock.environment(0);
-                let _env = env.enter();
-                let _strict = environment::require_simulated();
+                let clock = racer_io::SimClock::new(73);
+                let env = racer_io::Env::new(racer_io::Driver::Uring, clock.ctx(0));
                 for decrypt in [false, true] {
-                    accounting_sample(63, decrypt, 16);
+                    accounting_sample(&env, 63, decrypt, 16);
                 }
             }
 
             #[test]
             fn decrypt_submission_rejection_is_not_an_executed_failure() {
-                use crate::rt::environment::{SimulationClock, now};
                 use std::time::Duration;
-                let clock = SimulationClock::new(849);
-                let sim_env = clock.environment(0);
-                let _environment = sim_env.enter();
-                let sim_ctx = sim_env.worker_ctx();
+                let clock = racer_io::SimClock::new(849);
+                let sim_env = clock.ctx(0);
+                let env = racer_io::Env::new(racer_io::Driver::Uring, sim_env.clone());
+                let sim_ctx = sim_env.clone();
                 for closed in [false, true] {
                     let admission = Rc::new(flow_control::Quotas::new(AdmissionPolicy::new(
                         crate::test_support::cluster::config(false).limits,
                     )));
-                    let keys = keyring();
+                    let keys = keyring(&env);
                     let cache = CacheId("00000000-0000-4000-8000-000000000003".into());
                     let lease = || keys.active(&cache, KeyPurpose::Page).unwrap();
                     let scope = RequestScope::on(
                         &sim_ctx.clock,
                         RequestId([7; 16]),
-                        now() + Duration::from_secs(10),
+                        env.ctx.now() + Duration::from_secs(10),
                     )
                     .unwrap();
-                    let data = measurement_input(&admission, &cache, lease(), &scope, true, false);
+                    let data =
+                        measurement_input(&env, &admission, &cache, lease(), &scope, true, false);
                     let (io, mut engine) = pair(WorkerId(0), 0, NonZeroUsize::new(1).unwrap());
                     let client = CryptoClient::new(io);
                     let metrics = Metrics::default();
@@ -2358,17 +2360,13 @@ mod tests {
 
             #[test]
             fn measurements_account_once_at_reap_even_for_cancel_and_abandon() {
-                use crate::rt::environment;
-                use crate::rt::environment::SimulationClock;
                 use std::time::Duration;
-                let clock = SimulationClock::new(42);
-                let env = clock.environment(0);
-                let _env = env.enter();
-                let _strict = environment::require_simulated();
+                let clock = racer_io::SimClock::new(42);
+                let env = racer_io::Env::new(racer_io::Driver::Uring, clock.ctx(0));
                 let admission = std::rc::Rc::new(flow_control::Quotas::new(AdmissionPolicy::new(
                     crate::test_support::cluster::config(false).limits,
                 )));
-                let keys = keyring();
+                let keys = keyring(&env);
                 for decrypt in [false, true] {
                     for mode in [
                         "success",
@@ -2410,12 +2408,12 @@ mod tests {
                             client.set_metrics(metrics.clone());
                         }
                         let failures =
-                            crate::telemetry::Failures::with_clock(crate::test_support::clock());
+                            crate::telemetry::Failures::with_clock(env.ctx.clock.clone());
                         client.set_failure_observer(failures.observer(WorkerId(0)));
                         let scope = RequestScope::on(
-                            &crate::test_support::clock(),
+                            &env.ctx.clock,
                             crate::model::RequestId([0; 16]),
-                            crate::rt::environment::now() + Duration::from_secs(10),
+                            env.ctx.now() + Duration::from_secs(10),
                         )
                         .unwrap();
                         let cache = racer_wire::control::CacheId(
@@ -2427,6 +2425,7 @@ mod tests {
                         };
                         let mut cx = Context::from_waker(futures::task::noop_waker_ref());
                         let mut data = measurement_input(
+                            &env,
                             &admission,
                             &cache,
                             lease(),
@@ -2499,10 +2498,8 @@ mod tests {
                             }
                             _ => None,
                         };
-                        let mut completion = crate::security::PageCryptoEngine::process(
-                            job,
-                            &crate::test_support::ctx(),
-                        );
+                        let mut completion =
+                            crate::security::PageCryptoEngine::process(job, &env.ctx);
                         let engine_ms = completion
                             .permit
                             .measurement
@@ -2520,7 +2517,7 @@ mod tests {
                         };
                         if decrypt {
                             let facts = completion.decrypt_failure(crate::telemetry::unix_millis(
-                                crate::test_support::clock().wall_now(),
+                                env.ctx.clock.clone().wall_now(),
                             ));
                             assert_eq!(facts.map(|f| f.error), expected_error, "{mode}");
                             if let Some(f) = facts {
@@ -2544,7 +2541,7 @@ mod tests {
                             assert!(
                                 completion
                                     .decrypt_failure(crate::telemetry::unix_millis(
-                                        crate::test_support::clock().wall_now()
+                                        env.ctx.clock.clone().wall_now()
                                     ))
                                     .is_none()
                             );
@@ -2557,11 +2554,9 @@ mod tests {
                         // The engine uses virtual time (zero cost in DST). Explicitly
                         // advance a measured interval to exercise the exact sum separately.
                         assert_eq!(completion.permit.measurement.execution_ns, Some(0));
-                        let start = crate::rt::environment::now();
+                        let start = env.ctx.now();
                         clock.advance(Duration::from_millis(2));
-                        completion
-                            .permit
-                            .executed(crate::rt::environment::now(), start);
+                        completion.permit.executed(env.ctx.now(), start);
                         let (_, mut wrong) = pair(WorkerId(1), 0, NonZeroUsize::new(1).unwrap());
                         completion = wrong.complete(completion).err().unwrap().command;
                         assert!(engine.complete(completion).is_ok());
@@ -2608,9 +2603,8 @@ mod tests {
                                 "engine_failure_observed_ms={}",
                                 engine_ms.unwrap()
                             )));
-                            let reap_ms = crate::telemetry::unix_millis(
-                                crate::test_support::clock().wall_now(),
-                            );
+                            let reap_ms =
+                                crate::telemetry::unix_millis(env.ctx.clock.clone().wall_now());
                             assert!(records.contains(&format!("reap_ms={reap_ms} ")));
                             assert!(reap_ms > engine_ms.unwrap());
                             let reason = match mode {
@@ -2683,10 +2677,11 @@ mod tests {
             #[test]
             fn stored_tag_check_accepts_sealed_pages_and_rejects_every_tamper() {
                 use crate::security::PageCryptoEngine;
+                let env = racer_io::Env::host();
                 let admission = std::rc::Rc::new(flow_control::Quotas::new(AdmissionPolicy::new(
                     crate::test_support::cluster::config(false).limits,
                 )));
-                let keys = keyring();
+                let keys = keyring(&env);
                 let cache =
                     racer_wire::control::CacheId("00000000-0000-4000-8000-000000000003".into());
                 let lease = || {
@@ -2755,10 +2750,11 @@ mod tests {
                 use crate::security::PageCryptoEngine;
                 use crate::telemetry::Pair;
                 use crate::telemetry::Samples;
+                let env = racer_io::Env::host();
                 let admission = std::rc::Rc::new(flow_control::Quotas::new(AdmissionPolicy::new(
                     crate::test_support::cluster::config(false).limits,
                 )));
-                let keys = keyring();
+                let keys = keyring(&env);
                 let cache =
                     racer_wire::control::CacheId("00000000-0000-4000-8000-000000000003".into());
                 let lease = || {
@@ -2805,7 +2801,7 @@ mod tests {
                         &filter,
                         &filter.sender,
                         &filter.receiver,
-                        crate::test_support::clock().now(),
+                        env.ctx.clock.clone().now(),
                     )
                     .unwrap();
                 ticket.finish(true);
@@ -2848,10 +2844,11 @@ mod tests {
                 use crate::security::PageCryptoEngine;
                 use crate::telemetry::Pair;
                 use crate::telemetry::Samples;
+                let env = racer_io::Env::host();
                 let admission = std::rc::Rc::new(flow_control::Quotas::new(AdmissionPolicy::new(
                     crate::test_support::cluster::config(false).limits,
                 )));
-                let keys = std::rc::Rc::new(keyring());
+                let keys = std::rc::Rc::new(keyring(&env));
                 let filter = Pair::parse(
                     "8816d91d-e896-49bf-ba8a-da97ede93818,11111111-1111-4111-8111-111111111111",
                 )
@@ -2902,7 +2899,7 @@ mod tests {
                             &filter,
                             &filter.sender,
                             &filter.receiver,
-                            crate::test_support::clock().now(),
+                            env.ctx.clock.clone().now(),
                         )
                         .unwrap();
                     ticket.finish(true);
@@ -2996,19 +2993,15 @@ mod tests {
             }
 
             fn shared_worker_queue_measurements(decrypt: bool) {
-                use crate::rt::environment;
-                use crate::rt::environment::SimulationClock;
                 use crate::security::PageCryptoEngine;
                 use std::time::Duration;
 
-                let clock = SimulationClock::new(43);
-                let env = clock.environment(0);
-                let _env = env.enter();
-                let _strict = environment::require_simulated();
+                let clock = racer_io::SimClock::new(43);
+                let env = racer_io::Env::new(racer_io::Driver::Uring, clock.ctx(0));
                 let admission = std::rc::Rc::new(flow_control::Quotas::new(AdmissionPolicy::new(
                     crate::test_support::cluster::config(false).limits,
                 )));
-                let keys = keyring();
+                let keys = keyring(&env);
                 let cache =
                     racer_wire::control::CacheId("00000000-0000-4000-8000-000000000003".into());
                 let lease = || {
@@ -3021,9 +3014,9 @@ mod tests {
                     let mut cx = Context::from_waker(futures::task::noop_waker_ref());
                     let scopes = [0, 1].map(|id| {
                         RequestScope::on(
-                            &crate::test_support::clock(),
+                            &env.ctx.clock,
                             crate::model::RequestId([id; 16]),
-                            crate::rt::environment::now() + Duration::from_secs(10),
+                            env.ctx.now() + Duration::from_secs(10),
                         )
                         .unwrap()
                     });
@@ -3052,6 +3045,7 @@ mod tests {
                     waiting.set_metrics(waiting_metrics.clone());
                     let mut future = Some(waiting.execute(
                         measurement_input(
+                            &env,
                             &admission,
                             &cache,
                             lease(),
@@ -3072,7 +3066,15 @@ mod tests {
                     assert_eq!(waiting.executor.waiter_counts(), (0, 1));
 
                     let mut other_future = other.execute(
-                        measurement_input(&admission, &cache, lease(), &scopes[0], decrypt, false),
+                        measurement_input(
+                            &env,
+                            &admission,
+                            &cache,
+                            lease(),
+                            &scopes[0],
+                            decrypt,
+                            false,
+                        ),
                         lease(),
                         &scopes[0],
                     );
@@ -3096,14 +3098,11 @@ mod tests {
                             panic!("submitted job")
                         };
                         assert_eq!(job.id().worker, worker);
-                        let mut completion =
-                            PageCryptoEngine::process(job, &crate::test_support::ctx());
+                        let mut completion = PageCryptoEngine::process(job, &env.ctx);
                         assert_eq!(completion.permit.measurement.execution_ns, Some(0));
-                        let start = crate::rt::environment::now();
+                        let start = env.ctx.now();
                         clock.advance(Duration::from_millis(service_ms));
-                        completion
-                            .permit
-                            .executed(crate::rt::environment::now(), start);
+                        completion.permit.executed(env.ctx.now(), start);
                         assert!(engine.complete(completion).is_ok());
                     }
                     // Neither the target's own 5ms execution nor this 11ms delay before
@@ -3147,15 +3146,11 @@ mod tests {
 
             #[test]
             fn duration_saturates_without_host_time_in_dst() {
-                use crate::rt::environment;
-                use crate::rt::environment::SimulationClock;
-                let clock = SimulationClock::new(19);
-                let env = clock.environment(0);
-                let _env = env.enter();
-                let _strict = environment::require_simulated();
-                let start = crate::rt::environment::now();
+                let clock = racer_io::SimClock::new(19);
+                let env = racer_io::Env::new(racer_io::Driver::Uring, clock.ctx(0));
+                let start = env.ctx.now();
                 clock.advance(std::time::Duration::from_secs(u64::MAX / 1_000_000_000 + 1));
-                assert_eq!(elapsed_ns(crate::rt::environment::now(), start), u64::MAX);
+                assert_eq!(elapsed_ns(env.ctx.now(), start), u64::MAX);
             }
 
             fn measurement_events(decrypt: bool) -> [Event; 8] {
@@ -3185,6 +3180,7 @@ mod tests {
             }
 
             fn measurement_input(
+                env: &racer_io::Env,
                 admission: &Rc<flow_control::Quotas<AdmissionPolicy>>,
                 cache: &CacheId,
                 key: KeyLease,
@@ -3207,10 +3203,8 @@ mod tests {
                     ) else {
                         panic!("setup permit")
                     };
-                    let result = PageCryptoEngine::process(
-                        permit.job(data, key, scope.clone()),
-                        &crate::test_support::ctx(),
-                    );
+                    let result =
+                        PageCryptoEngine::process(permit.job(data, key, scope.clone()), &env.ctx);
                     let CryptoOutcome::Completed(CryptoOutput::Encrypted(plain, mut ciphertext)) =
                         result.outcome
                     else {
@@ -3429,7 +3423,7 @@ mod tests {
             }
 
             impl Fixture {
-                fn new() -> Self {
+                fn new(env: &racer_io::Env) -> Self {
                     let admission = std::rc::Rc::new(flow_control::Quotas::new(
                         AdmissionPolicy::new(crate::test_support::cluster::config(false).limits),
                     ));
@@ -3439,9 +3433,9 @@ mod tests {
                         client: CryptoClient::new(io),
                         engine,
                         scope: RequestScope::on(
-                            &crate::test_support::clock(),
+                            &env.ctx.clock,
                             crate::model::RequestId([0; 16]),
-                            crate::rt::environment::now() + std::time::Duration::from_secs(5),
+                            env.ctx.now() + std::time::Duration::from_secs(5),
                         )
                         .unwrap(),
                     }
@@ -3487,13 +3481,14 @@ mod tests {
             #[test]
             fn engine_loss_reclaims_queued_owners_and_unblocks_drain() {
                 use crate::admission::ResourceClass;
+                let env = racer_io::Env::host();
                 let Fixture {
                     admission,
                     client,
                     engine,
                     scope,
-                } = Fixture::new();
-                let mut future = client.execute(input(&admission), key(), &scope);
+                } = Fixture::new(&env);
+                let mut future = client.execute(input(&admission), key(&env), &scope);
                 let mut cx = Context::from_waker(futures::task::noop_waker_ref());
                 assert!(future.as_mut().poll(&mut cx).is_pending());
                 drop(engine);
@@ -3507,13 +3502,14 @@ mod tests {
             #[test]
             fn accepted_cancellation_cannot_return_before_completion_consumption() {
                 use crate::admission::ResourceClass;
+                let env = racer_io::Env::host();
                 let Fixture {
                     admission,
                     client,
                     mut engine,
                     scope,
-                } = Fixture::new();
-                let mut future = client.execute(input(&admission), key(), &scope);
+                } = Fixture::new(&env);
+                let mut future = client.execute(input(&admission), key(&env), &scope);
                 let mut cx = Context::from_waker(futures::task::noop_waker_ref());
                 assert!(future.as_mut().poll(&mut cx).is_pending());
                 scope.cancel().unwrap();
@@ -3545,17 +3541,17 @@ mod tests {
 
             #[test]
             fn accepted_deadline_expiry_waits_for_engine_completion() {
-                let clock = crate::rt::environment::SimulationClock::new(91);
-                let sim_env = clock.environment(0);
-                let _environment = sim_env.enter();
-                let sim_ctx = sim_env.worker_ctx();
+                let clock = racer_io::SimClock::new(91);
+                let sim_env = clock.ctx(0);
+                let env = racer_io::Env::new(racer_io::Driver::Uring, sim_env.clone());
+                let sim_ctx = sim_env.clone();
                 let Fixture {
                     admission,
                     client,
                     mut engine,
                     scope,
-                } = Fixture::new();
-                let key = key();
+                } = Fixture::new(&env);
+                let key = key(&env);
                 let mut future = client.execute(input(&admission), key, &scope);
                 let mut cx = Context::from_waker(futures::task::noop_waker_ref());
                 assert!(future.as_mut().poll(&mut cx).is_pending());
@@ -3578,13 +3574,14 @@ mod tests {
             #[test]
             fn drain_scope_cancellation_wakes_even_with_unconsumed_result() {
                 use crate::model::RequestId;
+                let env = racer_io::Env::host();
                 let Fixture {
                     admission,
                     client,
                     mut engine,
                     scope,
-                } = Fixture::new();
-                let mut future = client.execute(input(&admission), key(), &scope);
+                } = Fixture::new(&env);
+                let mut future = client.execute(input(&admission), key(&env), &scope);
                 let mut cx = Context::from_waker(futures::task::noop_waker_ref());
                 assert!(future.as_mut().poll(&mut cx).is_pending());
                 let job = match engine.poll_job(&mut cx) {
@@ -3696,8 +3693,8 @@ mod tests {
                 ));
             }
 
-            pub(super) fn key() -> KeyLease {
-                keyring()
+            pub(super) fn key(env: &racer_io::Env) -> KeyLease {
+                keyring(env)
                     .active(
                         &racer_wire::control::CacheId(
                             "00000000-0000-4000-8000-000000000003".into(),
@@ -3707,7 +3704,7 @@ mod tests {
                     .unwrap()
             }
 
-            pub(super) fn keyring() -> racer_crypto::identity::Keyring {
+            pub(super) fn keyring(env: &racer_io::Env) -> racer_crypto::identity::Keyring {
                 use racer_crypto::identity::KeyEpochs;
                 use racer_crypto::identity::Keyring;
                 use racer_wire::control::CacheId;
@@ -3722,7 +3719,7 @@ mod tests {
                     ClusterId("00000000-0000-4000-8000-000000000001".into()),
                     NodeId("00000000-0000-4000-8000-000000000002".into()),
                     Arc::new(KeyEpochs::with_clock(crate::enrollment::wall_clock(
-                        &crate::test_support::clock(),
+                        &env.ctx.clock,
                     ))),
                 );
                 let cache = CacheId("00000000-0000-4000-8000-000000000003".into());
@@ -3753,6 +3750,7 @@ mod tests {
                 use std::rc::Rc;
                 use std::time::Duration;
                 use std::time::Instant;
+                let env = racer_io::Env::host();
                 let admission = Rc::new(flow_control::Quotas::new(AdmissionPolicy::new(
                     crate::test_support::cluster::config(false).limits,
                 )));
@@ -3791,7 +3789,7 @@ mod tests {
                 let scope =
                     RequestScope::host(RequestId([0; 16]), Instant::now() + Duration::from_secs(5))
                         .unwrap();
-                let mut operation = client.execute(input, key(), &scope);
+                let mut operation = client.execute(input, key(&env), &scope);
                 let mut cx = Context::from_waker(futures::task::noop_waker_ref());
                 struct Count(std::sync::atomic::AtomicUsize);
                 impl std::task::Wake for Count {
@@ -3848,6 +3846,7 @@ mod tests {
                 use crate::model::*;
                 use std::rc::Rc;
                 use std::time::Instant;
+                let env = racer_io::Env::host();
                 let admission = Rc::new(flow_control::Quotas::new(AdmissionPolicy::new(
                     crate::test_support::cluster::config(false).limits,
                 )));
@@ -3883,7 +3882,7 @@ mod tests {
                         plaintext,
                         ciphertext: crate::memory::fixture_encrypt_output(&admission, ciphertext),
                     },
-                    key(),
+                    key(&env),
                     &scope,
                 ));
                 assert!(matches!(result, Err(Error::DeadlineExceeded)));
@@ -4070,6 +4069,7 @@ mod tests {
         use crate::security::pair;
         use sha2::Digest;
         use sha2::Sha256;
+        let env = racer_io::Env::host();
 
         // SHA-256 of the complete ciphertext plus detached tag, independently
         // generated with libsodium 1.0.18. Reproduce with aead_vectors.py.
@@ -4124,7 +4124,7 @@ mod tests {
                 "bbf1eee5774267cf76c4aea9e8426da764b7799d713e848c3b9850120864728d",
             ),
         ];
-        let keys = crate::test_support::security::keys();
+        let keys = crate::test_support::security::keys(&env);
         let admission = Rc::new(flow_control::Quotas::new(AdmissionPolicy::new(
             crate::test_support::cluster::config(false).limits,
         )));
@@ -4272,7 +4272,8 @@ mod tests {
         use crate::memory::BufferPool;
         use crate::security::CryptoId;
         use crate::security::pair;
-        let keys = crate::test_support::security::keys();
+        let env = racer_io::Env::host();
+        let keys = crate::test_support::security::keys(&env);
         let admission = Rc::new(flow_control::Quotas::new(AdmissionPolicy::new(
             crate::test_support::cluster::config(false).limits,
         )));
@@ -4404,7 +4405,8 @@ mod tests {
     fn encryption_seals_into_requesting_worker_aligned_pool() {
         use crate::admission::AdmissionPolicy;
         use crate::memory::BufferPool;
-        let keys = Rc::new(crate::test_support::security::keys());
+        let env = racer_io::Env::host();
+        let keys = Rc::new(crate::test_support::security::keys(&env));
         let page = envelope().page;
         let cache = page.version.object.cache.clone();
         let alignment = crate::memory::default_disk_alignment();
@@ -4524,7 +4526,8 @@ mod tests {
         use crate::memory::BufferPool;
         use crate::security::CryptoId;
         use crate::security::pair;
-        let keys = crate::test_support::security::keys();
+        let env = racer_io::Env::host();
+        let keys = crate::test_support::security::keys(&env);
         let admission = Rc::new(flow_control::Quotas::new(AdmissionPolicy::new(
             crate::test_support::cluster::config(false).limits,
         )));
@@ -4662,6 +4665,7 @@ mod tests {
         use crate::security::pair;
         use std::sync::atomic::AtomicUsize;
         use std::sync::atomic::Ordering;
+        let env = racer_io::Env::host();
         struct WakeCount(AtomicUsize);
         impl std::task::Wake for WakeCount {
             fn wake(self: Arc<Self>) {
@@ -4671,7 +4675,7 @@ mod tests {
                 self.0.fetch_add(1, Ordering::SeqCst);
             }
         }
-        let keys = crate::test_support::security::keys();
+        let keys = crate::test_support::security::keys(&env);
         let admission = flow_control::Quotas::new(AdmissionPolicy::new(
             crate::test_support::cluster::config(false).limits,
         ));

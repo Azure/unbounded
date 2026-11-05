@@ -54,7 +54,7 @@ pub mod clock {
     use std::time::SystemTime;
     use std::time::UNIX_EPOCH;
 
-    /// Pure deadline/freshness fixture. Reactor timers use SimulationClock.
+    /// Pure deadline/freshness fixture. Reactor timers use racer_io::SimClock.
     pub struct Clock {
         now: Cell<Instant>,
         wall: Cell<SystemTime>,
@@ -222,16 +222,21 @@ pub mod origin {
 
 /// Minimal real control-plane state for storage and flight fixtures. Callers with
 /// rotating keys or publications should share their own Availability instead.
-pub fn availability() -> std::rc::Rc<crate::control::Availability> {
-    availability_for(vec![racer_wire::control::CacheId(
-        crate::test_support::security::CACHE.into(),
-    )])
+pub fn availability(env: &racer_io::Env) -> std::rc::Rc<crate::control::Availability> {
+    availability_for(
+        env,
+        vec![racer_wire::control::CacheId(
+            crate::test_support::security::CACHE.into(),
+        )],
+    )
 }
 pub fn availability_for(
+    env: &racer_io::Env,
     caches: Vec<racer_wire::control::CacheId>,
 ) -> std::rc::Rc<crate::control::Availability> {
     crate::control::for_caches(
-        std::rc::Rc::new(crate::test_support::security::keys_for(&caches)),
+        env,
+        std::rc::Rc::new(crate::test_support::security::keys_for(env, &caches)),
         caches,
     )
 }
@@ -239,8 +244,9 @@ pub fn availability_for(
 pub struct NoPeers;
 
 impl NoPeers {
-    pub fn requester() -> std::rc::Rc<crate::peer::Requester> {
+    pub fn requester(env: &racer_io::Env) -> std::rc::Rc<crate::peer::Requester> {
         crate::peer::Requester::scripted(
+            env.ctx.clock.clone(),
             std::rc::Rc::new(Self),
             Self::direct_hedge_available,
             Self::request,
@@ -367,7 +373,7 @@ pub mod cluster {
 }
 
 /// Assemble the real worker without activating I/O for wake and quota scenarios.
-pub(crate) fn wake_test_worker() -> crate::app::WorkerApplication {
+pub(crate) fn wake_test_worker(env: &racer_io::Env) -> crate::app::WorkerApplication {
     let config = cluster::config(false);
     let admission = Rc::new(flow_control::Quotas::new(AdmissionPolicy::new(
         config.limits.clone(),
@@ -375,10 +381,10 @@ pub(crate) fn wake_test_worker() -> crate::app::WorkerApplication {
     let (io, _engine) = crate::security::pair(WorkerId(0), 0, config.limits.queue_entries);
     crate::app::WorkerApplication::assemble(
         &config,
-        Arc::new(crate::app::NodeState::default()),
+        Arc::new(crate::app::NodeState::on(env.ctx.clone())),
         WorkerId(0),
         crate::worker::WorkerRuntime {
-            reactor: Rc::new(Reactor::new(admission.clone(), &crate::test_support::env())),
+            reactor: Rc::new(Reactor::new(admission.clone(), env)),
             admission,
             crypto: Rc::new(CryptoClient::new(io)),
         },
@@ -387,8 +393,8 @@ pub(crate) fn wake_test_worker() -> crate::app::WorkerApplication {
     .unwrap()
 }
 
-pub(crate) fn wake_test_coordinator() -> Rc<Coordinator> {
-    wake_test_worker().into_test_coordinator()
+pub(crate) fn wake_test_coordinator(env: &racer_io::Env) -> Rc<Coordinator> {
+    wake_test_worker(env).into_test_coordinator()
 }
 
 /// Projected-volume fixture composed from the production secure file operations.
@@ -461,7 +467,7 @@ pub(crate) mod enrollment {
         )
         .unwrap()
     }
-    pub(crate) fn reactor() -> Option<std::rc::Rc<crate::runtime::Reactor>> {
+    pub(crate) fn reactor(env: &racer_io::Env) -> Option<std::rc::Rc<crate::runtime::Reactor>> {
         match io_uring::IoUring::new(2) {
             Ok(ring) => drop(ring),
             Err(e)
@@ -480,7 +486,7 @@ pub(crate) mod enrollment {
             }
             Err(e) => panic!("io_uring setup: {e}"),
         }
-        Some(io::reactor_in(&crate::test_support::env()))
+        Some(io::reactor_in(env))
     }
 }
 
@@ -524,6 +530,7 @@ pub(crate) fn published_membership(
 
 impl ReadWorker {
     pub fn new(
+        env: &racer_io::Env,
         cache: CacheDefinition,
         metadata: ObjectMetadata,
         admission: Rc<flow_control::Quotas<AdmissionPolicy>>,
@@ -534,7 +541,7 @@ impl ReadWorker {
         // Fixture time and entropy come from the reactor that drives it.
         let reactor_ctx = reactor.ctx().clone();
         let origin = AdapterOrigin::new(&cache.name, metadata);
-        let keys = Rc::new(crate::test_support::security::keys());
+        let keys = Rc::new(crate::test_support::security::keys(env));
         let publications = Arc::new(PublicationCell::new(Snapshot::retention(2)));
         let availability = Rc::new(crate::control::Availability::new(
             publications.clone(),
@@ -584,12 +591,15 @@ impl ReadWorker {
         ));
         let segments = Rc::new(page_alloc::Segments::new(64 * 1024 * 1024));
         // Reads use an empty disk index. No slabs need to be opened or written.
-        let slabs = Rc::new(crate::test_support::simulated_slab(page_alloc::Slab::new(
-            Self::disk_root(&origin).join("slabs/worker-0-slab-0.dat"),
-            256 * 1024 * 1024,
-            64 * 1024 * 1024,
-            crate::model::PAGE_BYTES as usize + crate::store::MAX_HEADER_BYTES + 16,
-        )));
+        let slabs = Rc::new(crate::test_support::simulated_slab(
+            page_alloc::Slab::new(
+                Self::disk_root(&origin).join("slabs/worker-0-slab-0.dat"),
+                256 * 1024 * 1024,
+                64 * 1024 * 1024,
+                crate::model::PAGE_BYTES as usize + crate::store::MAX_HEADER_BYTES + 16,
+            ),
+            env,
+        ));
         let writer = Rc::new(StoreWriter::new(
             index.clone(),
             segments.clone(),
@@ -622,7 +632,7 @@ impl ReadWorker {
         let candidates = Rc::new(CandidatePolicy::new(
             keys.node().clone(),
             Rc::new(Placement::new(16)),
-            crate::test_support::NoPeers::requester(),
+            crate::test_support::NoPeers::requester(env),
             credentials.clone(),
             Arc::new(PublicationCell::new(Snapshot::retention(2))),
             reactor_ctx.clone(),
@@ -862,8 +872,8 @@ pub(crate) mod security {
         );
         (pending, chain, vec![ca.der().to_vec()])
     }
-    pub(crate) fn keys() -> Keyring {
-        keys_for(&[CacheId(CACHE.into())])
+    pub(crate) fn keys(env: &racer_io::Env) -> Keyring {
+        keys_for(env, &[CacheId(CACHE.into())])
     }
     pub(crate) fn assert_page_key(lease: &KeyLease, expected: &[u8; 32]) {
         let mut sealed = [0; 19];
@@ -874,13 +884,13 @@ pub(crate) mod security {
         racer_crypto::open(expected, &[1; 24], b"retained", &sealed, &mut opened).unwrap();
         assert_eq!(&opened, b"abc");
     }
-    pub(crate) fn keys_for(caches: &[CacheId]) -> Keyring {
+    pub(crate) fn keys_for(env: &racer_io::Env, caches: &[CacheId]) -> Keyring {
         let (_, _, roots) = issued();
         let keys = Keyring::new(
             ClusterId(CLUSTER.into()),
             NodeId(NODE.into()),
             Arc::new(KeyEpochs::with_clock(crate::enrollment::wall_clock(
-                &crate::test_support::clock(),
+                &env.ctx.clock,
             ))),
         );
         let mut initial = rotation_bundle(1, roots);
@@ -938,8 +948,9 @@ pub(crate) mod security {
     pub(crate) fn node(n: usize) -> NodeId {
         NodeId(format!("{n:08x}-1111-4111-8111-111111111111"))
     }
-    pub(crate) fn network(count: usize) -> Vec<Rc<Signatures>> {
+    pub(crate) fn network(env: &racer_io::Env, count: usize) -> Vec<Rc<Signatures>> {
         identities(
+            env,
             ClusterId(node(99).0),
             &(0..count).map(node).collect::<Vec<_>>(),
             mac_test_keys,
@@ -981,6 +992,7 @@ pub(crate) mod security {
         }
     }
     pub fn identities(
+        env: &racer_io::Env,
         cluster: ClusterId,
         nodes: &[NodeId],
         cache_keys: impl Fn() -> Vec<CacheEncryptionKey>,
@@ -997,14 +1009,14 @@ pub(crate) mod security {
                         node.clone(),
                         chain,
                         &roots,
-                        &crate::enrollment::wall_clock(&crate::test_support::clock()),
+                        &crate::enrollment::wall_clock(&env.ctx.clock),
                     )
                     .unwrap();
                 let keys = Rc::new(Keyring::new(
                     cluster.clone(),
                     node.clone(),
                     Arc::new(KeyEpochs::with_clock(crate::enrollment::wall_clock(
-                        &crate::test_support::clock(),
+                        &env.ctx.clock,
                     ))),
                 ));
                 keys.install(KeyringBundle {
@@ -1020,7 +1032,7 @@ pub(crate) mod security {
                 let signatures = Rc::new(Signatures::new(
                     keys.clone(),
                     certificates.clone(),
-                    crate::test_support::ctx(),
+                    env.ctx.clone(),
                 ));
                 Identity {
                     keys,
@@ -1051,7 +1063,8 @@ pub(crate) mod security {
         }
         #[test]
         fn request_key_purpose_separation() {
-            let keys = keys();
+            let env = racer_io::Env::host();
+            let keys = keys(&env);
             let cache = CacheId(CACHE.into());
             let mut tag = [0; 32];
             assert!(
@@ -1076,36 +1089,15 @@ pub(crate) mod security {
     }
 }
 
-/// Bind a file-mode slab to the thread's current simulation, if one is entered.
+/// Bind a file-mode slab to `env`'s simulated world, if it has one.
 pub(crate) fn simulated_slab<C: page_alloc::Charge>(
     slab: page_alloc::Slab<C>,
+    env: &racer_io::Env,
 ) -> page_alloc::Slab<C> {
-    if let Some(sim) = crate::rt::reactor::simulation::Simulation::current() {
-        slab.simulate_in(sim.os().clone());
+    if let Some(sim) = env.sim_os() {
+        slab.simulate_in(sim.clone());
     }
     slab
-}
-
-/// The selected thread environment's worker context, shared with any simulated
-/// world.
-// MIGRATION: test fixtures read the thread environment until tests pass a
-// WorkerCtx explicitly.
-pub fn ctx() -> racer_io::WorkerCtx {
-    crate::rt::environment::Environment::current().worker_ctx()
-}
-
-/// The selected thread world and environment as an explicit reactor backend.
-// MIGRATION: test fixtures read the thread environment until tests pass an
-// Env explicitly.
-pub fn env() -> racer_io::Env {
-    crate::rt::reactor::simulation::ambient_env()
-}
-
-/// MIGRATION: the clock of [`ctx`].
-pub fn clock() -> racer_io::Clock {
-    crate::rt::environment::Environment::current()
-        .worker_ctx()
-        .clock
 }
 
 /// Counts owned and borrowed wakes across threads.

@@ -1771,6 +1771,7 @@ mod tests {
         }
 
         let w = crate::rdma::links::tests::world();
+
         let (w, metrics, _) = crate::rdma::links::tests::send_in_place::metered(w);
         let links = Some(&*w.a.links);
         let count = || metrics.count(Event::RdmaFallbackOverflow);
@@ -1965,6 +1966,7 @@ mod tests {
         }
 
         fn link_setup(
+            env: &racer_io::Env,
             case: LinkSetupCase,
         ) -> (
             crate::rdma::links::tests::World,
@@ -1974,7 +1976,7 @@ mod tests {
             NodeId,
         ) {
             use crate::rdma::links::tests::world_for;
-            let signers = crate::peer::tests::signers();
+            let signers = crate::peer::tests::signers(env);
             let membership = case
                 .membership
                 .clone()
@@ -1987,10 +1989,11 @@ mod tests {
                 ],
                 false,
             );
+            let env = w.env.clone();
             let admission = Rc::new(flow_control::Quotas::new(AdmissionPolicy::new(
                 crate::test_support::cluster::config(false).limits,
             )));
-            let reactor = Rc::new(Reactor::new(admission.clone(), &crate::test_support::env()));
+            let reactor = Rc::new(Reactor::new(admission.clone(), &env));
             let initiator = transfers(signers[case.initiator].clone(), &admission, &reactor)
                 .with_links(w.a.links.clone());
             let mut server = transfers(signers[responder].clone(), &admission, &reactor);
@@ -2100,14 +2103,18 @@ mod tests {
 
         #[test]
         fn signed_link_setup_connects_both_sides() {
+            let env = racer_io::Env::host();
             for initiator in [0, 2] {
-                let (w, client, serve, local, peer) = link_setup(LinkSetupCase {
-                    initiator,
-                    responder_links: true,
-                    responder_opens: false,
-                    sites: ["site1", "site1"],
-                    membership: None,
-                });
+                let (w, client, serve, local, peer) = link_setup(
+                    &env,
+                    LinkSetupCase {
+                        initiator,
+                        responder_links: true,
+                        responder_opens: false,
+                        sites: ["site1", "site1"],
+                        membership: None,
+                    },
+                );
                 client.unwrap();
                 serve.unwrap();
                 let (_, ours) = w.a.links.ready(&peer, RailId(7)).expect("initiator ready");
@@ -2118,7 +2125,8 @@ mod tests {
 
         #[test]
         fn signed_link_setup_tie_break_rejects_the_higher_offer() {
-            let signers = crate::peer::tests::signers();
+            let env = racer_io::Env::host();
+            let signers = crate::peer::tests::signers(&env);
             // The initiator has the higher NodeId and the responder is also
             // initiating: the responder answers 409 and keeps its own offer.
             let initiator =
@@ -2129,13 +2137,16 @@ mod tests {
                 } else {
                     2
                 };
-            let (w, client, serve, local, peer) = link_setup(LinkSetupCase {
-                initiator,
-                responder_links: true,
-                responder_opens: true,
-                sites: ["site1", "site1"],
-                membership: None,
-            });
+            let (w, client, serve, local, peer) = link_setup(
+                &env,
+                LinkSetupCase {
+                    initiator,
+                    responder_links: true,
+                    responder_opens: true,
+                    sites: ["site1", "site1"],
+                    membership: None,
+                },
+            );
             assert_eq!(client, Err(Error::Unavailable));
             serve.unwrap();
             assert!(w.a.links.ready(&peer, RailId(7)).is_none());
@@ -2156,24 +2167,31 @@ mod tests {
 
         #[test]
         fn signed_link_setup_declines_without_rdma_or_across_sites() {
-            let (w, client, serve, _, peer) = link_setup(LinkSetupCase {
-                initiator: 0,
-                responder_links: false,
-                responder_opens: false,
-                sites: ["site1", "site1"],
-                membership: None,
-            });
+            let env = racer_io::Env::host();
+            let (w, client, serve, _, peer) = link_setup(
+                &env,
+                LinkSetupCase {
+                    initiator: 0,
+                    responder_links: false,
+                    responder_opens: false,
+                    sites: ["site1", "site1"],
+                    membership: None,
+                },
+            );
             assert_eq!(client, Err(Error::Unavailable));
             serve.unwrap();
             assert!(w.a.links.ready(&peer, RailId(7)).is_none());
             for sites in [["site1", "site2"], ["", ""]] {
-                let (w, client, serve, local, peer) = link_setup(LinkSetupCase {
-                    initiator: 0,
-                    responder_links: true,
-                    responder_opens: false,
-                    sites,
-                    membership: None,
-                });
+                let (w, client, serve, local, peer) = link_setup(
+                    &env,
+                    LinkSetupCase {
+                        initiator: 0,
+                        responder_links: true,
+                        responder_opens: false,
+                        sites,
+                        membership: None,
+                    },
+                );
                 assert!(client.is_err());
                 assert_eq!(serve, Err(Error::Unauthorized));
                 assert!(w.a.links.ready(&peer, RailId(7)).is_none());
@@ -2209,7 +2227,8 @@ mod tests {
 
         #[test]
         fn signed_link_setup_refuses_a_qualifying_non_rdma_edge() {
-            let signers = crate::peer::tests::signers();
+            let env = racer_io::Env::host();
+            let signers = crate::peer::tests::signers(&env);
             let (a, b) = (signers[0].node(), signers[2].node());
             let refused = (8..64)
                 .map(|fillers| budget_membership(&signers, fillers, 1))
@@ -2219,13 +2238,16 @@ mod tests {
             let admitted = budget_membership(&signers, 8, crate::topology::RDMA_PEERS);
             assert!(crate::rdma::is_rdma_edge(&admitted, a, b));
             assert_eq!(link_refusal(Some(&refused), a, b, RailId(7)), Ok(Some(403)));
-            let (w, client, serve, local, peer) = link_setup(LinkSetupCase {
-                initiator: 0,
-                responder_links: true,
-                responder_opens: false,
-                sites: ["site1", "site1"],
-                membership: Some(refused),
-            });
+            let (w, client, serve, local, peer) = link_setup(
+                &env,
+                LinkSetupCase {
+                    initiator: 0,
+                    responder_links: true,
+                    responder_opens: false,
+                    sites: ["site1", "site1"],
+                    membership: Some(refused),
+                },
+            );
             assert_eq!(client, Err(Error::Unavailable));
             serve.unwrap();
             assert!(w.a.links.ready(&peer, RailId(7)).is_none());
@@ -2234,13 +2256,16 @@ mod tests {
                 rdma_verbs::LinkState::Idle,
                 "refused offers never reach the owner"
             );
-            let (w, client, serve, local, peer) = link_setup(LinkSetupCase {
-                initiator: 0,
-                responder_links: true,
-                responder_opens: false,
-                sites: ["site1", "site1"],
-                membership: Some(admitted),
-            });
+            let (w, client, serve, local, peer) = link_setup(
+                &env,
+                LinkSetupCase {
+                    initiator: 0,
+                    responder_links: true,
+                    responder_opens: false,
+                    sites: ["site1", "site1"],
+                    membership: Some(admitted),
+                },
+            );
             client.unwrap();
             serve.unwrap();
             let (_, ours) = w.a.links.ready(&peer, RailId(7)).expect("initiator ready");
@@ -2338,10 +2363,10 @@ mod tests {
             )
         }
 
-        fn page_roundtrip(case: PageCase) -> PageOutcome {
+        fn page_roundtrip(env: &racer_io::Env, case: PageCase) -> PageOutcome {
             use crate::rdma::links::tests::link_up;
             use crate::rdma::links::tests::world_for;
-            let mut signers = crate::peer::tests::signers();
+            let mut signers = crate::peer::tests::signers(env);
             if case.reverse {
                 signers.swap(0, 2);
             }
@@ -2349,11 +2374,12 @@ mod tests {
                 [signers[0].node().clone(), signers[2].node().clone()],
                 false,
             );
-            link_up(&mut w);
+            let env = w.env.clone();
+            link_up(&env, &mut w);
             let admission = Rc::new(flow_control::Quotas::new(AdmissionPolicy::new(
                 crate::test_support::cluster::config(true).limits,
             )));
-            let reactor = Rc::new(Reactor::new(admission.clone(), &crate::test_support::env()));
+            let reactor = Rc::new(Reactor::new(admission.clone(), &env));
             let receiver =
                 transfers(signers[0].clone(), &admission, &reactor).with_links(w.a.links.clone());
             let sender =
@@ -2464,7 +2490,7 @@ mod tests {
                 let helper = crate::gpu::testing::helper(&[None]);
                 let bytes = (crate::rdma::BUFFER_LEN as u64)
                     .next_multiple_of(crate::config::GPU_STAGING_UNIT);
-                crate::rdma::links::tests::attach_landing(&mut w, &helper, bytes);
+                crate::rdma::links::tests::attach_landing(&env, &mut w, &helper, bytes);
                 assert!(w.a.links.has_landing(RailId(7), 0));
                 helper
             });
@@ -2682,13 +2708,17 @@ mod tests {
 
         #[test]
         fn simulated_link_grant_in_request_and_complete_both_directions() {
+            let env = racer_io::Env::host();
             for reverse in [false, true] {
                 for relayed in [false, true] {
-                    let outcome = page_roundtrip(PageCase {
-                        reverse,
-                        relayed,
-                        ..PageCase::default()
-                    });
+                    let outcome = page_roundtrip(
+                        &env,
+                        PageCase {
+                            reverse,
+                            relayed,
+                            ..PageCase::default()
+                        },
+                    );
                     assert_eq!(page_bytes(&outcome.result), vec![0x5a; 144]);
                     assert_eq!(outcome.sent, Ok(true));
                     assert_eq!(
@@ -2712,12 +2742,16 @@ mod tests {
         /// for exactly this page and returns it as landed, and no host buffer
         /// is used on the receiver.
         fn simulated_landing_grant_lands_the_page_in_gpu_memory() {
+            let env = racer_io::Env::host();
             for reverse in [false, true] {
-                let outcome = page_roundtrip(PageCase {
-                    reverse,
-                    landing: true,
-                    ..PageCase::default()
-                });
+                let outcome = page_roundtrip(
+                    &env,
+                    PageCase {
+                        reverse,
+                        landing: true,
+                        ..PageCase::default()
+                    },
+                );
                 assert_eq!(page_bytes(&outcome.result), vec![0x5a; 144]);
                 assert!(outcome.landed && !outcome.registered);
                 assert_eq!(outcome.sent, Ok(true));
@@ -2735,11 +2769,15 @@ mod tests {
         /// The sender may still answer a landing grant over HTTP (here its
         /// link is down): the page arrives in host memory as usual.
         fn simulated_landing_grant_falls_back_to_http() {
-            let outcome = page_roundtrip(PageCase {
-                landing: true,
-                sender_down: true,
-                ..PageCase::default()
-            });
+            let env = racer_io::Env::host();
+            let outcome = page_roundtrip(
+                &env,
+                PageCase {
+                    landing: true,
+                    sender_down: true,
+                    ..PageCase::default()
+                },
+            );
             assert_eq!(page_bytes(&outcome.result), vec![0x5a; 144]);
             assert!(!outcome.landed);
             assert_eq!(
@@ -2750,14 +2788,18 @@ mod tests {
 
         #[test]
         fn simulated_sender_rejects_cross_site_and_releases_the_grant() {
+            let env = racer_io::Env::host();
             for site in ["site2", ""] {
                 for (reverse, relayed) in [(false, false), (true, true)] {
-                    let outcome = page_roundtrip(PageCase {
-                        reverse,
-                        relayed,
-                        sender_site: Some(site),
-                        ..PageCase::default()
-                    });
+                    let outcome = page_roundtrip(
+                        &env,
+                        PageCase {
+                            reverse,
+                            relayed,
+                            sender_site: Some(site),
+                            ..PageCase::default()
+                        },
+                    );
                     assert_eq!(page_bytes(&outcome.result), vec![0x5a; 144]);
                     assert_eq!(outcome.sent, Ok(false));
                     assert!(outcome.released, "the receiver's grant is released");
@@ -2772,10 +2814,14 @@ mod tests {
 
         #[test]
         fn simulated_sender_link_down_falls_back_to_signed_http_body() {
-            let outcome = page_roundtrip(PageCase {
-                sender_down: true,
-                ..PageCase::default()
-            });
+            let env = racer_io::Env::host();
+            let outcome = page_roundtrip(
+                &env,
+                PageCase {
+                    sender_down: true,
+                    ..PageCase::default()
+                },
+            );
             assert_eq!(page_bytes(&outcome.result), vec![0x5a; 144]);
             assert_eq!(outcome.sent, Ok(true));
             assert_eq!(
@@ -2786,11 +2832,15 @@ mod tests {
 
         #[test]
         fn simulated_receiver_rejects_complete_from_cross_site_hop() {
+            let env = racer_io::Env::host();
             for site in ["site2", ""] {
-                let outcome = page_roundtrip(PageCase {
-                    receiver_site: Some(site),
-                    ..PageCase::default()
-                });
+                let outcome = page_roundtrip(
+                    &env,
+                    PageCase {
+                        receiver_site: Some(site),
+                        ..PageCase::default()
+                    },
+                );
                 assert!(matches!(outcome.result, Err(Error::Unauthorized)));
                 assert_eq!(outcome.sent, Ok(true));
                 assert_eq!(outcome.completions, 0);
@@ -2806,9 +2856,11 @@ mod tests {
             use crate::rdma::links::tests::page;
             use crate::rdma::links::tests::world_for;
             use base64::Engine;
-            let signers = crate::peer::tests::signers();
+            let env = racer_io::Env::host();
+            let signers = crate::peer::tests::signers(&env);
             let (a, b) = (signers[0].node().clone(), signers[2].node().clone());
             let mut w = world_for([a.clone(), b.clone()], false);
+            let env = w.env.clone();
             let scope =
                 RequestScope::host(RequestId([8; 16]), Instant::now() + Duration::from_secs(30))
                     .unwrap();
@@ -2820,7 +2872,7 @@ mod tests {
             );
             assert!(matches!(early, Err(Error::Unavailable)));
             assert!(native_failure(Error::Unavailable, &scope));
-            link_up(&mut w);
+            link_up(&env, &mut w);
             let binding = Binding {
                 request: [4; 32],
                 response: [5; 32],
@@ -2976,7 +3028,8 @@ mod tests {
         fn session_admitted_setup_grant_completion_still_require_exact_transfer_and_phase() {
             use crate::peer::protocol::tests::sessions::pair;
             use crate::peer::protocol::tests::sessions::signer;
-            let (mut sender, mut receiver) = pair();
+            let env = racer_io::Env::host();
+            let (mut sender, mut receiver) = pair(&env);
             let a = signer(&sender);
             let b = signer(&receiver);
             let scope = scope();
@@ -3025,7 +3078,8 @@ mod tests {
         }
         #[test]
         fn exact_signed_controls_reject_every_binding_substitution_and_unknown_field() {
-            let nodes = crate::peer::tests::signers();
+            let env = racer_io::Env::host();
+            let nodes = crate::peer::tests::signers(&env);
             let scope = scope();
             let original = binding(&scope);
             let signed = || {
@@ -3069,13 +3123,7 @@ mod tests {
                 );
             }
             let mut head = original
-                .head(
-                    &crate::test_support::clock(),
-                    Phase::Finish,
-                    &[9; 32],
-                    0,
-                    vec![],
-                )
+                .head(&env.ctx.clock, Phase::Finish, &[9; 32], 0, vec![])
                 .unwrap();
             p::push(&mut head, "racer-receiver", &nodes[1].node().0);
             p::push(&mut head, "racer-extra", 1);
@@ -3110,6 +3158,7 @@ mod tests {
         }
         #[test]
         fn control_extension_and_fallback_length_schema_is_closed() {
+            let env = racer_io::Env::host();
             let binding = binding(&scope());
             for (phase, length, extensions) in [
                 (Phase::Accept, 0, vec![]),
@@ -3130,25 +3179,13 @@ mod tests {
             ] {
                 assert!(
                     binding
-                        .head(
-                            &crate::test_support::clock(),
-                            phase,
-                            &[0; 32],
-                            length,
-                            extensions
-                        )
+                        .head(&env.ctx.clock, phase, &[0; 32], length, extensions)
                         .is_err()
                 );
             }
             assert!(
                 binding
-                    .head(
-                        &crate::test_support::clock(),
-                        Phase::Finish,
-                        &[0; 32],
-                        17,
-                        vec![]
-                    )
+                    .head(&env.ctx.clock, Phase::Finish, &[0; 32], 17, vec![])
                     .is_ok()
             );
         }

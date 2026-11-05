@@ -625,10 +625,9 @@ mod tests {
     #[test]
     fn lazy_scoring_classification_matches_telemetry_cache_disk() {
         use racer_wire::control::CacheDefinition;
-        let clock = crate::rt::environment::SimulationClock::new(52);
-        let sim_env = clock.environment(0);
-        let _environment = sim_env.enter();
-        let sim_ctx = sim_env.worker_ctx();
+        let clock = racer_io::SimClock::new(52);
+        let sim_env = clock.ctx(0);
+        let sim_ctx = sim_env.clone();
         let policy = Rc::new(Retention::new(4096, sim_ctx.clock.clone()).unwrap());
         let id = |n: &str| CacheId(n.into());
         let def = |n: &str, priority: u16| CacheDefinition {
@@ -677,10 +676,9 @@ mod tests {
     #[test]
     fn share_basis_is_incremental_across_passes_and_membership_changes() {
         use racer_wire::control::CacheDefinition;
-        let clock = crate::rt::environment::SimulationClock::new(53);
-        let sim_env = clock.environment(0);
-        let _environment = sim_env.enter();
-        let sim_ctx = sim_env.worker_ctx();
+        let clock = racer_io::SimClock::new(53);
+        let sim_env = clock.ctx(0);
+        let sim_ctx = sim_env.clone();
         let policy = Rc::new(Retention::new(4096, sim_ctx.clock.clone()).unwrap());
         let id = |n: &str| CacheId(n.into());
         let def = |n: &str, priority: u16| CacheDefinition {
@@ -773,10 +771,9 @@ mod tests {
     #[test]
     fn over_share_candidates_are_bounded_and_exact_with_many_caches() {
         use racer_wire::control::CacheDefinition;
-        let clock = crate::rt::environment::SimulationClock::new(59);
-        let sim_env = clock.environment(0);
-        let _environment = sim_env.enter();
-        let sim_ctx = sim_env.worker_ctx();
+        let clock = racer_io::SimClock::new(59);
+        let sim_env = clock.ctx(0);
+        let sim_ctx = sim_env.clone();
         let policy = Rc::new(Retention::new(4096, sim_ctx.clock.clone()).unwrap());
         let id = |n: usize| CacheId(format!("c{n:04}"));
         let def = |n: usize, priority: u16| CacheDefinition {
@@ -878,10 +875,9 @@ mod tests {
     }
     #[test]
     fn scoring_pass_pins_ownership_and_time_and_replacement_clears_factory() {
-        let clock = crate::rt::environment::SimulationClock::new(51);
-        let sim_env = clock.environment(0);
-        let _environment = sim_env.enter();
-        let sim_ctx = sim_env.worker_ctx();
+        let clock = racer_io::SimClock::new(51);
+        let sim_env = clock.ctx(0);
+        let sim_ctx = sim_env.clone();
         let policy = Retention::new(4096, sim_ctx.clock.clone()).unwrap();
         let owned = Rc::new(Cell::new(true));
         let calls = Rc::new(Cell::new(0));

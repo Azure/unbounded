@@ -574,6 +574,7 @@ pub(crate) type ScriptedLanding = Box<dyn Fn(&PeerRequest) -> Option<transport::
 impl Requester {
     #[cfg(any(test, feature = "subscription-interop"))]
     pub(crate) fn scripted<T: 'static>(
+        clock: racer_io::Clock,
         state: Rc<T>,
         available: fn(
             &T,
@@ -597,10 +598,7 @@ impl Requester {
         Rc::new(Self::Scripted {
             health: Rc::new(crate::topology::LinkHealth::new(
                 crate::topology::LINK_HEALTH_CAPACITY,
-                #[cfg(test)]
-                crate::test_support::clock(),
-                #[cfg(not(test))]
-                racer_io::Clock::host(),
+                clock,
             )),
             available: Box::new(move |m, n| available(&capability, m, n)),
             request: Box::new(move |r, m, scope, is_direct| {

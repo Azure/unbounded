@@ -1772,7 +1772,7 @@ mod tests {
         let sim = rdma_verbs::simulation::Simulation::new()
             .with_devices(vec![])
             .unwrap();
-        let _environment = sim.enter();
+        let _devices = sim.enter();
         assert!(
             !parse(&[("RACER_REGISTERED_BYTES", "1")])
                 .unwrap()

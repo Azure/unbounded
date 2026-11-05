@@ -2,8 +2,6 @@
 //! limit, and page grants without HTTP.
 
 use super::*;
-use crate::rt::environment::Environment;
-use crate::rt::environment::SimulationClock;
 use rdma_verbs::BufferState;
 use rdma_verbs::Owner;
 use rdma_verbs::simulation::Device;
@@ -21,8 +19,8 @@ pub(crate) struct Node {
 
 pub(crate) struct World {
     pub _sim: Simulation,
-    pub clock: SimulationClock,
-    pub _environment: Option<crate::rt::environment::Guard>,
+    pub clock: racer_io::SimClock,
+    pub env: racer_io::Env,
     pub a: Node,
     pub b: Node,
 }
@@ -41,26 +39,26 @@ fn mapping(n: u8) -> RailMapping {
     }
 }
 
-pub(crate) fn scope() -> RequestScope {
+pub(crate) fn scope(env: &racer_io::Env) -> RequestScope {
     RequestScope::on(
-        &crate::test_support::clock(),
+        &env.ctx.clock,
         crate::model::RequestId([1; 16]),
-        crate::rt::environment::now() + Duration::from_secs(5),
+        env.ctx.now() + Duration::from_secs(5),
     )
     .unwrap()
 }
 
-fn node(sim: &Simulation, n: u8, id: NodeId, environment: Option<&Environment>) -> Node {
+fn node(sim: &Simulation, n: u8, id: NodeId, environment: Option<&racer_io::WorkerCtx>) -> Node {
     let view = sim
         .with_devices(vec![Device::new(format!("sim{n}"), [n; 16])])
         .unwrap();
     let (mut clients, port) = rdma_verbs::node(1).unwrap();
     let owner = {
         let _scope = view.enter();
-        let ctx = environment.map_or_else(racer_io::WorkerCtx::host, Environment::worker_ctx);
+        let ctx = environment.map_or_else(racer_io::WorkerCtx::host, Clone::clone);
         Owner::new(port, ctx)
     };
-    let ctx = environment.map_or_else(crate::test_support::ctx, Environment::worker_ctx);
+    let ctx = environment.map_or_else(racer_io::WorkerCtx::host, Clone::clone);
     let limits = crate::test_support::cluster::config(true).limits;
     Node {
         links: Rc::new(Links::new(
@@ -159,11 +157,12 @@ pub(crate) fn envelope(length: u32) -> PageEnvelope {
 /// Write `page` from `b` into a buffer granted by `a` over `link_up`'s link and
 /// return the received registered page. `a` then has one buffer `Owned`.
 pub(crate) fn receive_registered(
+    env: &racer_io::Env,
     w: &mut World,
     page: &CiphertextPage,
 ) -> rdma_verbs::RegisteredPage {
     let (a, b) = (w.a.links.local().clone(), w.b.links.local().clone());
-    let scope = scope();
+    let scope = scope(env);
     let pending = drive!(w, w.a.links.grant(&b, RAIL, TransferId([9; 16]), &scope)).unwrap();
     let header = STANDARD.decode(pending.header_value()).unwrap();
     let grant = AuthenticatedGrant::decode(&header, RAIL, TransferId([9; 16])).unwrap();
@@ -182,20 +181,27 @@ pub(crate) fn world() -> World {
 /// else on the real clock (for tests over real sockets).
 pub(crate) fn world_for([id_a, id_b]: [NodeId; 2], simulated: bool) -> World {
     let sim = Simulation::new();
-    let clock = SimulationClock::new(7);
-    let environment = clock.environment(1);
+    let clock = racer_io::SimClock::new(7);
+    let environment = clock.ctx(1);
     let a = node(&sim, 1, id_a, simulated.then_some(&environment));
     let b = node(&sim, 2, id_b, simulated.then_some(&environment));
-    let guard = simulated.then(|| environment.enter());
+    let env = racer_io::Env::new(
+        racer_io::Driver::Uring,
+        if simulated {
+            environment.clone()
+        } else {
+            racer_io::WorkerCtx::host()
+        },
+    );
     let mut world = World {
         _sim: sim,
         clock,
-        _environment: guard,
+        env: env.clone(),
         a,
         b,
     };
     for n in [1, 2] {
-        let scope = scope();
+        let scope = scope(&env);
         let w = &mut world;
         let (links, admission, owner, other) = if n == 1 {
             (
@@ -232,9 +238,9 @@ pub(crate) fn world_for([id_a, id_b]: [NodeId; 2], simulated: bool) -> World {
 }
 
 /// `a` initiates, `b` accepts, `a` connects. Returns the link id.
-pub(crate) fn link_up(w: &mut World) -> u64 {
+pub(crate) fn link_up(env: &racer_io::Env, w: &mut World) -> u64 {
     let (a, b) = (w.a.links.local().clone(), w.b.links.local().clone());
-    let scope = scope();
+    let scope = scope(env);
     assert!(w.a.links.wants(&b, RAIL));
     let (epoch, ours) = drive!(w, w.a.links.open(&b, RAIL, &scope)).unwrap();
     assert!(!w.a.links.wants(&b, RAIL), "one setup per key");
@@ -317,11 +323,11 @@ fn grant_and_completion_values_round_trip_and_reject_malformed() {
 #[test]
 fn activation_without_a_buffer_settles_inactive() {
     let sim = Simulation::new();
-    let clock = SimulationClock::new(7);
-    let environment = clock.environment(1);
+    let clock = racer_io::SimClock::new(7);
+    let environment = clock.ctx(1);
     let mut n = node(&sim, 1, node_id(1), Some(&environment));
-    let _guard = environment.enter();
-    let scope = scope();
+    let env = racer_io::Env::new(racer_io::Driver::Uring, environment.clone());
+    let scope = scope(&env);
     let mut cx = Context::from_waker(futures::task::noop_waker_ref());
     let result =
         std::pin::pin!(
@@ -340,12 +346,12 @@ fn activation_without_a_buffer_settles_inactive() {
 #[test]
 fn activation_with_one_buffer_funds_one_receive_buffer() {
     let sim = Simulation::new();
-    let clock = SimulationClock::new(7);
-    let environment = clock.environment(1);
+    let clock = racer_io::SimClock::new(7);
+    let environment = clock.ctx(1);
     let mut a = node(&sim, 1, node_id(1), Some(&environment));
     let mut b = node(&sim, 2, node_id(2), Some(&environment));
-    let _guard = environment.enter();
-    let scope = scope();
+    let env = racer_io::Env::new(racer_io::Driver::Uring, environment.clone());
+    let scope = scope(&env);
     let rails = drive(
         &mut a.owner,
         &mut b.owner,
@@ -363,9 +369,10 @@ fn activation_with_one_buffer_funds_one_receive_buffer() {
 #[test]
 fn setup_page_both_directions_and_release() {
     let mut w = world();
-    let link = link_up(&mut w);
+    let env = w.env.clone();
+    let link = link_up(&env, &mut w);
     let (a, b) = (node_id(1), node_id(2));
-    let scope = scope();
+    let scope = scope(&env);
     for (forward, from, to) in [(true, &b, &a), (false, &a, &b)] {
         let (receiver, sender) = if forward {
             (&w.a.links, &w.b.links)
@@ -426,8 +433,9 @@ fn setup_page_both_directions_and_release() {
 #[test]
 fn tie_break_rate_limit_and_bad_response() {
     let mut w = world();
+    let env = w.env.clone();
     let (a, b) = (node_id(1), node_id(2));
-    let scope = scope();
+    let scope = scope(&env);
     // Both initiate at once. `a` has the lower id: it rejects `b`'s offer, and
     // `b` accepts `a`'s, replacing its own attempt.
     let (epoch_a, ours_a) = drive!(w, w.a.links.open(&b, RAIL, &scope)).unwrap();
@@ -498,8 +506,9 @@ fn tie_break_rate_limit_and_bad_response() {
 #[test]
 fn cancelled_open_clears_its_reservation() {
     let mut w = world();
+    let env = w.env.clone();
     let b = node_id(2);
-    let scope = scope();
+    let scope = scope(&env);
     {
         let mut open = std::pin::pin!(w.a.links.open(&b, RAIL, &scope));
         let mut cx = Context::from_waker(futures::task::noop_waker_ref());
@@ -519,14 +528,15 @@ fn cancelled_open_clears_its_reservation() {
         pump!(w);
     }
     assert!(w.a.links.wants(&b, RAIL));
-    drive!(w, w.a.links.open(&b, RAIL, &self::scope())).unwrap();
+    drive!(w, w.a.links.open(&b, RAIL, &self::scope(&env))).unwrap();
 }
 
 #[test]
 fn open_dropped_after_the_owner_answered_breaks_its_epoch() {
     let mut w = world();
+    let env = w.env.clone();
     let b = node_id(2);
-    let scope = scope();
+    let scope = scope(&env);
     {
         let mut open = std::pin::pin!(w.a.links.open(&b, RAIL, &scope));
         let mut cx = Context::from_waker(futures::task::noop_waker_ref());
@@ -549,14 +559,15 @@ fn open_dropped_after_the_owner_answered_breaks_its_epoch() {
         pump!(w);
     }
     assert!(w.a.links.wants(&b, RAIL));
-    drive!(w, w.a.links.open(&b, RAIL, &self::scope())).unwrap();
+    drive!(w, w.a.links.open(&b, RAIL, &self::scope(&env))).unwrap();
 }
 
 #[test]
 fn dropped_setup_attempt_abandons_its_epoch() {
     let mut w = world();
+    let env = w.env.clone();
     let b = node_id(2);
-    let scope = scope();
+    let scope = scope(&env);
     let (epoch, _) = drive!(w, w.a.links.open(&b, RAIL, &scope)).unwrap();
     drop(SetupAttempt::new(&w.a.links, &b, RAIL, epoch));
     pump!(w);
@@ -570,14 +581,15 @@ fn dropped_setup_attempt_abandons_its_epoch() {
         pump!(w);
     }
     assert!(w.a.links.wants(&b, RAIL));
-    drive!(w, w.a.links.open(&b, RAIL, &self::scope())).unwrap();
+    drive!(w, w.a.links.open(&b, RAIL, &self::scope(&env))).unwrap();
 }
 
 #[test]
 fn stale_setup_guards_leave_a_newer_attempt() {
     let mut w = world();
+    let env = w.env.clone();
     let b = node_id(2);
-    let scope = scope();
+    let scope = scope(&env);
     let (epoch, _) = drive!(w, w.a.links.open(&b, RAIL, &scope)).unwrap();
     let key = link_key(&b, RAIL);
     // A reservation token that is not the current entry.
@@ -622,8 +634,12 @@ mod zero_copy;
 mod send_failures {
     use super::*;
 
-    fn granted(w: &mut World, transfer: u8) -> (PendingReceive, AuthenticatedGrant) {
-        let scope = scope();
+    fn granted(
+        env: &racer_io::Env,
+        w: &mut World,
+        transfer: u8,
+    ) -> (PendingReceive, AuthenticatedGrant) {
+        let scope = scope(env);
         let pending = drive!(
             w,
             w.a.links
@@ -647,11 +663,12 @@ mod send_failures {
     #[test]
     fn cancelled_after_the_write_lands_keeps_the_link() {
         let mut w = world();
-        link_up(&mut w);
-        let (pending, grant) = granted(&mut w, 3);
+        let env = w.env.clone();
+        link_up(&env, &mut w);
+        let (pending, grant) = granted(&env, &mut w, 3);
         let page = page(&w.b.admission.clone(), 35, 0x5a);
         let links = w.b.links.clone();
-        let scope = scope();
+        let scope = scope(&env);
         let to = node_id(1);
         let mut send = std::pin::pin!(links.send(&to, &grant, &page, &scope));
         let mut cx = Context::from_waker(futures::task::noop_waker_ref());
@@ -672,17 +689,18 @@ mod send_failures {
         );
         assert!(w.a.links.ready(&node_id(2), RAIL).is_some());
         // The link still carries pages.
-        let (pending, grant) = granted(&mut w, 4);
+        let (pending, grant) = granted(&env, &mut w, 4);
         let second = super::page(&w.b.admission.clone(), 17, 0x6b);
-        drive!(w, links.send(&to, &grant, &second, &super::scope())).unwrap();
+        drive!(w, links.send(&to, &grant, &second, &super::scope(&env))).unwrap();
         assert_eq!(arrived(&mut w, &pending), vec![0x6b; 17]);
     }
 
     #[test]
     fn unadmitted_release_breaks_the_epoch() {
         let mut w = world();
-        link_up(&mut w);
-        let (pending, grant) = granted(&mut w, 3);
+        let env = w.env.clone();
+        link_up(&env, &mut w);
+        let (pending, grant) = granted(&env, &mut w, 3);
         let to = node_id(1);
         let (epoch, _) = w.b.links.ready(&to, RAIL).unwrap();
         let key = link_key(&to, RAIL);
@@ -724,7 +742,7 @@ pub(crate) mod send_in_place {
         let World {
             _sim,
             clock,
-            _environment,
+            env,
             a,
             b,
         } = w;
@@ -748,7 +766,7 @@ pub(crate) mod send_in_place {
             World {
                 _sim,
                 clock,
-                _environment,
+                env,
                 a,
                 b,
             },
@@ -758,17 +776,18 @@ pub(crate) mod send_in_place {
     }
 
     /// Grant on `a`, send `page` from `b`, and return what `a` received.
-    fn transfer(w: &mut World, page: &CiphertextPage) -> Vec<u8> {
-        receive_registered(w, page).bytes().to_vec()
+    fn transfer(env: &racer_io::Env, w: &mut World, page: &CiphertextPage) -> Vec<u8> {
+        receive_registered(env, w, page).bytes().to_vec()
     }
 
     #[test]
     fn send_writes_the_page_in_place_and_counts_it() {
         let mut w = world();
-        link_up(&mut w);
+        let env = w.env.clone();
+        link_up(&env, &mut w);
         let (mut w, _, mb) = metered(w);
         let page = page(&w.b.admission.clone(), 35, 0x5a);
-        let received = transfer(&mut w, &page);
+        let received = transfer(&env, &mut w, &page);
         assert_eq!(received, page.bytes());
         assert_eq!(mb.count(Event::RdmaPagesSent), 1);
         assert_eq!(mb.count(Event::RdmaSentBytes), 35);
@@ -780,8 +799,9 @@ pub(crate) mod send_in_place {
     #[test]
     fn page_dropped_by_the_caller_stays_alive_until_the_completion() {
         let mut w = world();
-        link_up(&mut w);
-        let scope = scope();
+        let env = w.env.clone();
+        link_up(&env, &mut w);
+        let scope = scope(&env);
         let pending = drive!(
             w,
             w.a.links
@@ -824,12 +844,12 @@ pub(crate) mod send_in_place {
     fn activation_without_odp_fails_and_releases_the_charge() {
         let sim = Simulation::new();
         sim.implicit_odp(false);
-        let clock = SimulationClock::new(7);
-        let environment = clock.environment(1);
+        let clock = racer_io::SimClock::new(7);
+        let environment = clock.ctx(1);
         let mut a = node(&sim, 1, node_id(1), Some(&environment));
         let mut b = node(&sim, 2, node_id(2), Some(&environment));
-        let _guard = environment.enter();
-        let scope = scope();
+        let env = racer_io::Env::new(racer_io::Driver::Uring, environment.clone());
+        let scope = scope(&env);
         let admission = a.admission.clone();
         assert_eq!(
             drive(
@@ -914,10 +934,15 @@ fn plan_landing_covers_every_gpu_and_prefers_numa() {
 }
 
 /// Register a simulated GPU's landing buffer on `a`'s rail.
-pub(crate) fn attach_landing(w: &mut World, helper: &Arc<crate::gpu::GpuHelper>, bytes: u64) {
+pub(crate) fn attach_landing(
+    env: &racer_io::Env,
+    w: &mut World,
+    helper: &Arc<crate::gpu::GpuHelper>,
+    bytes: u64,
+) {
     w.a.links.node().set_gpu_landing(helper.clone(), bytes);
     let rails = w.a.links.active();
-    let scope = scope();
+    let scope = scope(env);
     // The GPU helper answers from its own thread: poll with short sleeps.
     let mut future = std::pin::pin!(w.a.links.attach_landings(&rails, &scope));
     let mut cx = Context::from_waker(futures::task::noop_waker_ref());
@@ -940,15 +965,16 @@ fn landing_grant_receives_into_gpu_memory() {
     use std::os::unix::fs::FileExt;
     let helper = crate::gpu::testing::helper(&[None]);
     let mut w = world();
-    let link = link_up(&mut w);
+    let env = w.env.clone();
+    let link = link_up(&env, &mut w);
     // One slot only.
     let bytes = (BUFFER_LEN as u64).next_multiple_of(crate::config::GPU_STAGING_UNIT);
-    attach_landing(&mut w, &helper, bytes);
+    attach_landing(&env, &mut w, &helper, bytes);
     assert!(w.a.links.has_landing(RAIL, 0));
     assert!(!w.a.links.has_landing(RAIL, 1));
     assert!(!w.b.links.has_landing(RAIL, 0));
     let (a, b) = (node_id(1), node_id(2));
-    let scope = scope();
+    let scope = scope(&env);
     assert_eq!(
         drive!(
             w,
@@ -1035,13 +1061,14 @@ fn landing_grant_receives_into_gpu_memory() {
 fn every_gpu_lands_on_a_shared_rail() {
     let helper = crate::gpu::testing::helper(&[None, None]);
     let mut w = world();
-    link_up(&mut w);
+    let env = w.env.clone();
+    link_up(&env, &mut w);
     let bytes = (BUFFER_LEN as u64).next_multiple_of(crate::config::GPU_STAGING_UNIT);
-    attach_landing(&mut w, &helper, bytes);
+    attach_landing(&env, &mut w, &helper, bytes);
     assert!(w.a.links.has_landing(RAIL, 0));
     assert!(w.a.links.has_landing(RAIL, 1));
     let (a, b) = (node_id(1), node_id(2));
-    let scope = scope();
+    let scope = scope(&env);
     let mut held = Vec::new();
     for (ordinal, fill) in [(0, 0x10u8), (1, 0x20)] {
         let transfer = TransferId([fill; 16]);
@@ -1084,21 +1111,22 @@ fn every_gpu_lands_on_a_shared_rail() {
 fn landing_failures_leave_rails_host_only() {
     let helper = crate::gpu::testing::helper(&[None]);
     let mut w = world();
-    attach_landing(&mut w, &helper, (BUFFER_LEN as u64) / 2);
+    let env = w.env.clone();
+    attach_landing(&env, &mut w, &helper, (BUFFER_LEN as u64) / 2);
     assert!(!w.a.links.has_landing(RAIL, 0));
-    attach_landing(&mut w, &helper, 0);
+    attach_landing(&env, &mut w, &helper, 0);
     assert!(!w.a.links.has_landing(RAIL, 0));
     w._sim.fault(
         rdma_verbs::simulation::Operation::RegisterDmabuf,
         rdma_verbs::simulation::Fault::Reject,
     );
     let bytes = (BUFFER_LEN as u64).next_multiple_of(crate::config::GPU_STAGING_UNIT);
-    attach_landing(&mut w, &helper, bytes);
+    attach_landing(&env, &mut w, &helper, bytes);
     assert!(!w.a.links.has_landing(RAIL, 0));
     // No rail holds the buffer, so its GPU memory is freed again.
     assert_eq!(helper.run(crate::gpu::testing::live_staging), 0);
     // Registration works on the next try, with a new GPU buffer.
-    attach_landing(&mut w, &helper, bytes);
+    attach_landing(&env, &mut w, &helper, bytes);
     assert!(w.a.links.has_landing(RAIL, 0));
     assert_eq!(helper.run(crate::gpu::testing::live_staging), 1);
 }
@@ -1110,7 +1138,8 @@ fn landing_failures_leave_rails_host_only() {
 fn late_gpu_landing_attaches_on_active_rails_once() {
     let helper = crate::gpu::testing::helper(&[None]);
     let mut w = world();
-    link_up(&mut w);
+    let env = w.env.clone();
+    link_up(&env, &mut w);
     let node = w.a.links.node().clone();
     assert!(!node.take_landing_pending());
     node.set_gpu_landing(helper.clone(), 0);
@@ -1120,7 +1149,7 @@ fn late_gpu_landing_attaches_on_active_rails_once() {
     assert!(!w.a.links.has_landing(RAIL, 0));
     // `attach_landing` sets the landing again, then attaches like the owner
     // worker does on its next turn.
-    attach_landing(&mut w, &helper, bytes);
+    attach_landing(&env, &mut w, &helper, bytes);
     assert!(w.a.links.has_landing(RAIL, 0));
     assert!(!node.take_landing_pending(), "the attach consumed the mark");
     node.set_gpu_landing(helper, bytes);
@@ -1130,15 +1159,15 @@ fn late_gpu_landing_attaches_on_active_rails_once() {
 
 /// Crash and restart `b` under the same node id: the new owner has no links,
 /// while `a` still holds its `Ready` link to the dead queue pair (half-open).
-fn restart_b(w: &mut World) {
-    let environment = w.clock.environment(1);
+fn restart_b(env: &racer_io::Env, w: &mut World) {
+    let environment = w.clock.ctx(1);
     let fresh = node(&w._sim, 3, node_id(2), Some(&environment));
     drop(std::mem::replace(&mut w.b, fresh));
     let admission = w.b.admission.clone();
     let rails = drive!(
         w,
         w.b.links
-            .activate(vec![mapping(3)], &admission, 2 * BUFFER_LEN, &scope())
+            .activate(vec![mapping(3)], &admission, 2 * BUFFER_LEN, &scope(env))
     )
     .unwrap();
     assert_eq!(rails.len(), 1);
@@ -1151,8 +1180,9 @@ fn restart_b(w: &mut World) {
 #[test]
 fn membership_change_closes_links_to_non_edges() {
     let mut w = world();
+    let env = w.env.clone();
     let b = node_id(2);
-    link_up(&mut w);
+    link_up(&env, &mut w);
     let membership = crate::rdma::tests::rails_tests::mesh(8);
     w.a.links.retain_edges(&membership);
     pump!(w);
@@ -1161,7 +1191,7 @@ fn membership_change_closes_links_to_non_edges() {
     // No backoff: the link comes straight back, and the same membership
     // does not close it again. (Wait out the per-peer setup rate limit.)
     w.clock.advance(SETUP_INTERVAL);
-    link_up(&mut w);
+    link_up(&env, &mut w);
     w.a.links.retain_edges(&membership);
     pump!(w);
     assert!(w.a.links.ready(&b, RAIL).is_some());
@@ -1174,14 +1204,15 @@ fn membership_change_closes_links_to_non_edges() {
 #[test]
 fn half_open_link_after_peer_restart_recovers_when_the_peer_initiates() {
     let mut w = world();
+    let env = w.env.clone();
     let (a, b) = (node_id(1), node_id(2));
-    let old = link_up(&mut w);
-    restart_b(&mut w);
+    let old = link_up(&env, &mut w);
+    restart_b(&env, &mut w);
     assert_eq!(w.a.links.ready(&b, RAIL).map(|(_, id)| id), Some(old));
     assert_eq!(w.b.links.state(&a, RAIL), LinkState::Idle);
     assert!(!w.a.links.wants(&b, RAIL), "the survivor sees a ready link");
     assert!(w.b.links.wants(&a, RAIL), "the restarted peer wants a link");
-    let scope = scope();
+    let scope = scope(&env);
     let (epoch, ours) = drive!(w, w.b.links.open(&a, RAIL, &scope)).unwrap();
     assert_eq!(w.a.links.admit_setup(&b, RAIL), SetupAdmission::Accept);
     let theirs = drive!(w, w.a.links.accept(&b, RAIL, &ours, &scope)).unwrap();
@@ -1210,11 +1241,12 @@ fn half_open_link_after_peer_restart_recovers_when_the_peer_initiates() {
 #[test]
 fn half_open_link_after_peer_restart_breaks_on_first_use() {
     let mut w = world();
+    let env = w.env.clone();
     let b = node_id(2);
-    link_up(&mut w);
-    restart_b(&mut w);
+    link_up(&env, &mut w);
+    restart_b(&env, &mut w);
     assert!(w.a.links.ready(&b, RAIL).is_some());
-    let scope = scope();
+    let scope = scope(&env);
     // The grant itself may be posted before the transport reports the dead
     // peer; either way the link must not stay ready.
     let _ = drive!(w, w.a.links.grant(&b, RAIL, TransferId([6; 16]), &scope));

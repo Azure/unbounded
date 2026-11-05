@@ -519,9 +519,10 @@ mod tests {
                 Device::new("new", [2; 16]),
             ])
             .unwrap();
-        let _environment = sim.enter();
+        let _devices = sim.enter();
+        let env = racer_io::Env::host();
         let app = configured();
-        let (mut worker, engine) = worker(&app, true, true);
+        let (mut worker, engine) = worker(&env, &app, true, true);
         let mut service = test_owner(&app, engine);
         let mut cx = Context::from_waker(futures::task::noop_waker_ref());
         let mut publication = racer_wire::control::Publication {
@@ -1283,6 +1284,7 @@ mod tests {
     }
 
     fn worker(
+        env: &racer_io::Env,
         app: &Application,
         aligned: bool,
         published_rails: bool,
@@ -1296,7 +1298,7 @@ mod tests {
         )));
         let (io, engine) = security::pair(WorkerId(0), 0, app.limits.queue_entries);
         let runtime = WorkerRuntime {
-            reactor: Rc::new(Reactor::new(admission.clone(), &crate::test_support::env())),
+            reactor: Rc::new(Reactor::new(admission.clone(), env)),
             admission,
             crypto: Rc::new(CryptoClient::new(io)),
         };
@@ -1352,10 +1354,11 @@ mod tests {
         let simulated = sim
             .with_devices(vec![Device::new("test-device", [1; 16])])
             .unwrap();
-        let _environment = simulated.enter();
+        let _devices = simulated.enter();
+        let env = racer_io::Env::host();
         let mut app = configured();
         app.discovered_nics[0].device = "test-device".into();
-        let (mut worker, engine) = worker(&app, true, true);
+        let (mut worker, engine) = worker(&env, &app, true, true);
         assert_eq!(worker.native_publication().unwrap().len(), 1);
         let mut service = test_owner(&app, engine);
         let mut cx = Context::from_waker(futures::task::noop_waker_ref());
@@ -1438,6 +1441,7 @@ mod tests {
 
     #[test]
     fn local_configuration_does_not_enable_unaligned_or_unmapped_membership() {
+        let env = racer_io::Env::host();
         for (aligned, mapped, published_rails) in [
             (false, true, true),
             (true, false, true),
@@ -1447,7 +1451,7 @@ mod tests {
             if !mapped {
                 app.discovered_nics.clear();
             }
-            let (mut worker, _engine) = worker(&app, aligned, published_rails);
+            let (mut worker, _engine) = worker(&env, &app, aligned, published_rails);
             futures::executor::block_on(worker.activate_native(
                 &scope(&racer_io::Clock::host(), Duration::from_secs(1)).unwrap(),
             ))
@@ -1460,8 +1464,9 @@ mod tests {
 
     #[test]
     fn local_configuration_cannot_replace_missing_local_membership() {
+        let env = racer_io::Env::host();
         let app = configured();
-        let (mut worker, _engine) = worker(&app, true, true);
+        let (mut worker, _engine) = worker(&env, &app, true, true);
         worker
             .snapshots
             .apply(
@@ -1503,8 +1508,9 @@ mod tests {
     /// listed only after it serves.
     #[test]
     fn membership_is_usable_only_when_it_lists_the_node() {
+        let env = racer_io::Env::host();
         let app = configured();
-        let (mut worker, _engine) = worker(&app, true, true);
+        let (mut worker, _engine) = worker(&env, &app, true, true);
         let listed = worker.snapshots.current().unwrap();
         worker.snapshot_sequence = Some(listed.sequence);
         assert!(worker.membership_usable(Some(&listed)));
@@ -1543,10 +1549,11 @@ mod tests {
         let simulated = sim
             .with_devices(vec![Device::new("test-device", [1; 16])])
             .unwrap();
-        let _environment = simulated.enter();
+        let _devices = simulated.enter();
+        let env = racer_io::Env::host();
         let mut app = configured();
         app.discovered_nics[0].device = "test-device".into();
-        let (mut worker, engine) = worker(&app, true, true);
+        let (mut worker, engine) = worker(&env, &app, true, true);
         let listed = worker.snapshots.current().unwrap().membership.clone();
         worker
             .snapshots
@@ -1608,12 +1615,12 @@ mod tests {
         assert!(worker.links.as_ref().unwrap().rail_ready(RailId(7)));
     }
 
-    fn activation_falls_back() {
+    fn activation_falls_back(env: &racer_io::Env) {
         let app = configured();
         assert_eq!(app.discovered_nics[0].device, "missing");
-        let (mut worker, engine) = worker(&app, true, true);
+        let (mut worker, engine) = worker(env, &app, true, true);
         let admission = worker.runtime.admission.clone();
-        let startup = scope(&crate::test_support::clock(), Duration::from_secs(10)).unwrap();
+        let startup = scope(&env.ctx.clock, Duration::from_secs(10)).unwrap();
         let mut activation = Box::pin(worker.activate_native(&startup));
         let mut cx = Context::from_waker(futures::task::noop_waker_ref());
         assert!(
@@ -1646,7 +1653,8 @@ mod tests {
     #[cfg(not(feature = "rdma"))]
     #[test]
     fn configured_activation_without_loader_keeps_http_available() {
-        activation_falls_back();
+        let env = racer_io::Env::host();
+        activation_falls_back(&env);
     }
 
     #[cfg(feature = "rdma")]
@@ -1675,6 +1683,6 @@ mod tests {
             );
             assert_eq!(libc::dlclose(library), 0);
         }
-        activation_falls_back();
+        activation_falls_back(&racer_io::Env::host());
     }
 }

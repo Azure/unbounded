@@ -476,7 +476,6 @@ mod tests {
     use super::HashMap;
     use crate::error::Error;
     use crate::model::RequestId;
-    use crate::rt::environment::*;
     use crate::runtime::RequestScope;
     use std::time::Duration;
     mod deadline {
@@ -521,10 +520,9 @@ mod tests {
             #[test]
             fn rest_narrowing_preserves_policy_cancellation_and_parent_deadline() {
                 use crate::control::rest::Scope;
-                let clock = crate::rt::environment::SimulationClock::new(102);
-                let sim_env = clock.environment(0);
-                let _env = sim_env.enter();
-                let sim_ctx = sim_env.worker_ctx();
+                let clock = racer_io::SimClock::new(102);
+                let sim_env = clock.ctx(0);
+                let sim_ctx = sim_env.clone();
                 let start = sim_ctx.clock.now();
                 let end = start + Duration::from_secs(30);
                 let scope = RequestScope::on(&sim_ctx.clock, RequestId([102; 16]), end).unwrap();
@@ -543,10 +541,9 @@ mod tests {
 
             #[test]
             fn candidate_total_survives_body_completion_and_never_changes_authority() {
-                let clock = crate::rt::environment::SimulationClock::new(97);
-                let sim_env = clock.environment(0);
-                let _env = sim_env.enter();
-                let sim_ctx = sim_env.worker_ctx();
+                let clock = racer_io::SimClock::new(97);
+                let sim_env = clock.ctx(0);
+                let sim_ctx = sim_env.clone();
                 let start = sim_ctx.clock.now();
                 let scope = RequestScope::on(
                     &sim_ctx.clock,
@@ -591,10 +588,9 @@ mod tests {
 
             #[test]
             fn candidate_body_budget_accepts_original_ceiling_and_rejects_invalid_bounds() {
-                let clock = crate::rt::environment::SimulationClock::new(98);
-                let sim_env = clock.environment(0);
-                let _env = sim_env.enter();
-                let sim_ctx = sim_env.worker_ctx();
+                let clock = racer_io::SimClock::new(98);
+                let sim_env = clock.ctx(0);
+                let sim_ctx = sim_env.clone();
                 let start = sim_ctx.clock.now();
                 let end = start + Duration::from_secs(30);
                 let scope = RequestScope::on(&sim_ctx.clock, RequestId([98; 16]), end).unwrap();
@@ -635,10 +631,9 @@ mod tests {
 
             #[test]
             fn candidate_body_reserve_keeps_healthy_progress_and_ignores_unknown_lengths() {
-                let clock = crate::rt::environment::SimulationClock::new(91);
-                let sim_env = clock.environment(0);
-                let _env = sim_env.enter();
-                let sim_ctx = sim_env.worker_ctx();
+                let clock = racer_io::SimClock::new(91);
+                let sim_env = clock.ctx(0);
+                let sim_ctx = sim_env.clone();
                 let start = sim_ctx.clock.now();
                 let healthy = RequestScope::on(
                     &sim_ctx.clock,
@@ -697,10 +692,9 @@ mod tests {
 
             #[test]
             fn candidate_body_rate_starts_at_first_bytes_and_expiry_is_sticky() {
-                let clock = crate::rt::environment::SimulationClock::new(93);
-                let sim_env = clock.environment(0);
-                let _env = sim_env.enter();
-                let sim_ctx = sim_env.worker_ctx();
+                let clock = racer_io::SimClock::new(93);
+                let sim_env = clock.ctx(0);
+                let sim_ctx = sim_env.clone();
                 let start = sim_ctx.clock.now();
                 let scope = RequestScope::on(
                     &sim_ctx.clock,
@@ -737,10 +731,9 @@ mod tests {
 
             #[test]
             fn candidate_idle_progress_never_renews_hard_deadline_or_revives_expiry() {
-                let clock = crate::rt::environment::SimulationClock::new(39);
-                let sim_env = clock.environment(0);
-                let _env = sim_env.enter();
-                let sim_ctx = sim_env.worker_ctx();
+                let clock = racer_io::SimClock::new(39);
+                let sim_env = clock.ctx(0);
+                let sim_ctx = sim_env.clone();
                 let start = sim_ctx.clock.now();
                 let scope = RequestScope::on(
                     &sim_ctx.clock,
@@ -781,10 +774,9 @@ mod tests {
             }
             #[test]
             fn runtime_scope_retains_candidate_policy_and_shared_cancellation() {
-                let clock = crate::rt::environment::SimulationClock::new(101);
-                let sim_env = clock.environment(0);
-                let _env = sim_env.enter();
-                let sim_ctx = sim_env.worker_ctx();
+                let clock = racer_io::SimClock::new(101);
+                let sim_env = clock.ctx(0);
+                let sim_ctx = sim_env.clone();
                 let start = sim_ctx.clock.now();
                 let scope = RequestScope::on(
                     &sim_ctx.clock,
@@ -861,10 +853,10 @@ mod tests {
 
         mod tests {
             use super::*;
-            use crate::rt::reactor::simulation;
             use racer_io::ring::Descriptor;
             use racer_io::ring::IoBuffer;
             use racer_io::ring::SocketAddress;
+            use racer_io::sim as simulation;
             use std::os::unix::net::UnixStream;
             use std::task::Context;
             use std::task::Poll;
@@ -873,8 +865,9 @@ mod tests {
 
             #[test]
             fn direct_filesystem_buffers_preserve_nonempty_boundary() {
+                let env = racer_io::Env::host();
                 let admission = Rc::new(flow_control::Quotas::new(AdmissionPolicy::new(limits(4))));
-                let reactor = Reactor::new(admission.clone(), &crate::test_support::env());
+                let reactor = Reactor::new(admission.clone(), &env);
                 assert!(matches!(
                     reactor.file_buffer(0),
                     Err(Error::InvalidConfiguration)
@@ -905,6 +898,7 @@ mod tests {
                 use crate::memory::BufferPool;
                 use crate::peer::transport::WireBuffer;
                 use http1::connection::BufferRange;
+                let env = racer_io::Env::host();
                 fn check<B: IoBuffer>(buffer: B) {
                     let mut range = BufferRange::new::<Error>(buffer, 1..2).unwrap();
                     let ptr = range.bytes_mut().unwrap().as_mut_ptr();
@@ -931,7 +925,7 @@ mod tests {
                     )
                     .unwrap(),
                 );
-                let reactor = Reactor::new(admission, &crate::test_support::env());
+                let reactor = Reactor::new(admission, &env);
                 check(reactor.file_buffer(3).unwrap());
             }
 
@@ -963,7 +957,7 @@ mod tests {
                     reactor.wait(Duration::from_millis(1)).unwrap();
                 }
             }
-            pub(super) fn kernel_reactor(capacity: usize) -> Option<Reactor> {
+            pub(super) fn kernel_reactor(env: &racer_io::Env, capacity: usize) -> Option<Reactor> {
                 match io_uring::IoUring::new(2) {
                     Ok(ring) => drop(ring),
                     Err(error)
@@ -981,7 +975,7 @@ mod tests {
                     Rc::new(flow_control::Quotas::new(AdmissionPolicy::new(limits(
                         capacity,
                     )))),
-                    &crate::test_support::env(),
+                    env,
                 );
                 reactor.init().unwrap();
                 Some(reactor)
@@ -1001,11 +995,11 @@ mod tests {
             }
             #[test]
             fn file_fence_selects_only_the_matching_racer_request() {
-                let sim = simulation::Simulation::new();
-                let _environment = sim.enter();
+                let sim = simulation::SimOs::new();
+                let env = racer_io::Env::sim(&sim, racer_io::WorkerCtx::host());
                 let reactor = Reactor::new(
                     Rc::new(flow_control::Quotas::new(AdmissionPolicy::new(limits(4)))),
-                    &crate::test_support::env(),
+                    &env,
                 );
                 sim.write_file(std::path::Path::new("/one"), b"one")
                     .unwrap();
@@ -1042,11 +1036,11 @@ mod tests {
             }
             #[test]
             fn listener_retry_preserves_racer_policy_after_capacity_recovery() {
-                let sim = simulation::Simulation::new();
-                let _environment = sim.enter();
+                let sim = simulation::SimOs::new();
+                let env = racer_io::Env::sim(&sim, racer_io::WorkerCtx::host());
                 let reactor = Reactor::new(
                     Rc::new(flow_control::Quotas::new(AdmissionPolicy::new(limits(1)))),
-                    &crate::test_support::env(),
+                    &env,
                 );
                 let request = scope();
                 let (fd, _peer) = sim.socket_pair();
@@ -1068,10 +1062,10 @@ mod tests {
             }
             #[test]
             fn gate_events_use_late_observer_and_actual_readiness_rejection() {
-                let sim = simulation::Simulation::new();
-                let _environment = sim.enter();
+                let sim = simulation::SimOs::new();
+                let env = racer_io::Env::sim(&sim, racer_io::WorkerCtx::host());
                 let admission = Rc::new(flow_control::Quotas::new(AdmissionPolicy::new(limits(1))));
-                let reactor = Reactor::new(admission.clone(), &crate::test_support::env());
+                let reactor = Reactor::new(admission.clone(), &env);
                 let failures = crate::telemetry::Failures::default();
                 admission
                     .policy()
@@ -1101,7 +1095,8 @@ mod tests {
             }
             #[test]
             fn real_drain_io_preserves_control_capacity_after_admission_stop() {
-                let Some(reactor) = kernel_reactor(2) else {
+                let env = racer_io::Env::host();
+                let Some(reactor) = kernel_reactor(&env, 2) else {
                     return;
                 };
                 assert_eq!(reactor.admission.used(ResourceClass::ControlProgress), 0);
@@ -1153,7 +1148,9 @@ mod tests {
                 }
                 #[test]
                 fn provenance_capacity_and_completion_ownership() {
-                    let reactor = kernel_reactor(2).expect("real io_uring reserved submissions");
+                    let env = racer_io::Env::host();
+                    let reactor =
+                        kernel_reactor(&env, 2).expect("real io_uring reserved submissions");
                     let failures = crate::telemetry::Failures::default();
                     reactor
                         .admission
@@ -1238,7 +1235,9 @@ mod tests {
                 }
                 #[test]
                 fn attachment_cannot_overcommit_existing_ordinary_entries() {
-                    let reactor = kernel_reactor(2).expect("real io_uring reserved attachment");
+                    let env = racer_io::Env::host();
+                    let reactor =
+                        kernel_reactor(&env, 2).expect("real io_uring reserved attachment");
                     let request = scope();
                     let (socket, _peer) = UnixStream::pair().unwrap();
                     let fd = Rc::new(Descriptor::from(socket));
@@ -1267,33 +1266,32 @@ mod tests {
             use crate::admission::AdmissionPolicy;
             use crate::admission::ResourceClass;
             use crate::error::Error;
-            use crate::rt::reactor::simulation::Environment;
-            use crate::rt::reactor::simulation::Fault;
-            use crate::rt::reactor::simulation::Simulation;
-            use crate::rt::reactor::simulation::disk::DiskState;
             use crate::runtime::RequestScope;
             use racer_io::scoped::fs::prelude::*;
+            use racer_io::sim::DiskState;
+            use racer_io::sim::Fault;
+            use racer_io::sim::SimOs;
             use std::cell::Cell;
             use std::ffi::CString;
             use std::path::Path;
             use std::rc::Rc;
             use std::time::Duration;
-            fn reactor() -> Reactor {
+            fn reactor(env: &racer_io::Env) -> Reactor {
                 Reactor::new(
                     Rc::new(flow_control::Quotas::new(AdmissionPolicy::new(
                         crate::test_support::cluster::config(false).limits,
                     ))),
-                    &crate::test_support::env(),
+                    env,
                 )
             }
             #[test]
             fn simulated_pipe_splice_preserves_suffix_under_backpressure() {
-                let sim = Simulation::new();
-                let _environment = sim.enter();
+                let sim = SimOs::new();
+                let env = racer_io::Env::sim(&sim, racer_io::WorkerCtx::host());
                 let admission = Rc::new(flow_control::Quotas::new(AdmissionPolicy::new(
                     crate::test_support::cluster::config(false).limits,
                 )));
-                let pool = crate::http::new_pipe_pool(admission);
+                let pool = crate::http::new_pipe_pool(admission, env.sim_os().cloned());
                 let mut pipe = pool.acquire().unwrap();
                 let (a, b) = sim.socket_pair();
                 sim.set_stream_capacity(2).unwrap();
@@ -1332,7 +1330,7 @@ mod tests {
                         Ok(&mut self.buffer.as_mut_slice()[self.start..self.start + self.length])
                     }
                 }
-                let (sim, _environment, r, scope) = setup();
+                let (sim, _env, r, scope) = setup();
                 assert_eq!(
                     Alignment::new(0, 4096, 4096).map_err(Error::from),
                     Err(Error::DirectIoUnsupported)
@@ -1396,10 +1394,11 @@ mod tests {
                 assert_eq!(result.bytes, 4096);
                 assert_eq!(result.buffer.prefix(4096).unwrap(), &[7; 4096]);
             }
-            fn setup() -> (Simulation, Environment, Reactor, RequestScope) {
-                let sim = Simulation::new();
-                let environment = sim.enter();
-                (sim, environment, reactor(), scope())
+            fn setup() -> (SimOs, racer_io::Env, Reactor, RequestScope) {
+                let sim = SimOs::new();
+                let env = racer_io::Env::sim(&sim, racer_io::WorkerCtx::host());
+                let (reactor, scope) = (reactor(&env), scope());
+                (sim, env, reactor, scope)
             }
             struct Probe(Rc<Cell<usize>>);
             impl Drop for Probe {
@@ -1410,14 +1409,14 @@ mod tests {
             #[test]
             fn candidate_total_cancels_pending_receive_without_bytes_and_retains_both_fences() {
                 for cancel_first in [false, true] {
-                    let clock = crate::rt::environment::SimulationClock::new(99);
-                    let sim_env = clock.environment(0);
-                    let _clock = sim_env.enter();
-                    let sim_ctx = sim_env.worker_ctx();
-                    let sim = Simulation::new();
+                    let clock = racer_io::SimClock::new(99);
+                    let sim_env = clock.ctx(0);
+                    let env = racer_io::Env::new(racer_io::Driver::Uring, sim_env.clone());
+                    let sim_ctx = sim_env.clone();
+                    let sim = SimOs::new();
                     sim.set_cancel_first(cancel_first);
-                    let _environment = sim.enter();
-                    let r = reactor();
+                    let env = racer_io::Env::sim(&sim, env.ctx.clone());
+                    let r = reactor(&env);
                     r.init().unwrap();
                     let baseline = r.admission.used(ResourceClass::RequestContext);
                     let start = sim_ctx.clock.now();
@@ -1476,10 +1475,10 @@ mod tests {
                 use crate::model::StrongEtag;
                 use crate::model::VersionMetadata;
                 for cancel_first in [false, true] {
-                    let sim = Simulation::new();
+                    let sim = SimOs::new();
                     sim.set_cancel_first(cancel_first);
-                    let _environment = sim.enter();
-                    let r = reactor();
+                    let env = racer_io::Env::sim(&sim, racer_io::WorkerCtx::host());
+                    let r = reactor(&env);
                     let scope = scope();
                     let bundle = crate::memory::tests::bundle_for(
                         &r.admission,
@@ -1534,16 +1533,16 @@ mod tests {
             #[test]
             fn real_slab_open_is_sparse_exclusive_and_checks_direct_geometry() {
                 use page_alloc::Slab;
-                let sim = Simulation::new();
-                let _environment = sim.enter();
-                let r = Rc::new(reactor());
+                let sim = SimOs::new();
+                let env = racer_io::Env::sim(&sim, racer_io::WorkerCtx::host());
+                let r = Rc::new(reactor(&env));
                 let slabs = Slab::<flow_control::Charge<AdmissionPolicy>>::new(
                     "/slabs/worker-0-slab-0.dat".into(),
                     64 * 1024 * 1024,
                     32 * 1024 * 1024,
                     crate::model::PAGE_BYTES as usize + crate::store::MAX_HEADER_BYTES + 16,
                 );
-                slabs.simulate_in(sim.os().clone());
+                slabs.simulate_in(sim.clone());
                 assert!(slabs.open_now().is_ok());
                 let other = Slab::<flow_control::Charge<AdmissionPolicy>>::new(
                     "/slabs/worker-0-slab-0.dat".into(),
@@ -1551,7 +1550,7 @@ mod tests {
                     32 * 1024 * 1024,
                     crate::model::PAGE_BYTES as usize + crate::store::MAX_HEADER_BYTES + 16,
                 );
-                other.simulate_in(sim.os().clone());
+                other.simulate_in(sim.clone());
                 assert_eq!(
                     other.open_now().map_err(Error::from),
                     Err(Error::Unavailable)
@@ -1584,7 +1583,7 @@ mod tests {
             }
             #[test]
             fn projected_directory_rotation_and_private_atomic_writes_use_real_filesystem_calls() {
-                let (sim, _environment, r, scope) = setup();
+                let (sim, _env, r, scope) = setup();
                 sim.write_file(Path::new("/projected/epoch-a/bundle"), b"first")
                     .unwrap();
                 sim.symlink(Path::new("epoch-a"), Path::new("/projected/..data"))
@@ -1649,9 +1648,10 @@ mod tests {
 
     #[test]
     fn test_collection_iteration_is_fixed_and_consumes_no_nonce_entropy() {
+        let env = racer_io::Env::host();
         fn sample(seed: u64) -> (Vec<u64>, [u8; 32]) {
-            let clock = SimulationClock::new(seed);
-            let _role = clock.environment(9).enter();
+            let clock = racer_io::SimClock::new(seed);
+            let env = racer_io::Env::new(racer_io::Driver::Uring, clock.ctx(9));
             let mut map = HashMap::default();
             for id in 0..100 {
                 map.insert(id, id);
@@ -1660,55 +1660,56 @@ mod tests {
                 map.remove(&id);
             }
             let mut bytes = [0; 32];
-            fill_random(&mut bytes).unwrap();
+            env.ctx.rng.fill(&mut bytes).unwrap();
             (map.into_keys().collect(), bytes)
         }
         assert_eq!(sample(1), sample(1));
         assert_eq!(sample(1).0, sample(7).0);
-        let clock = SimulationClock::new(1);
-        let _role = clock.environment(9).enter();
+        let clock = racer_io::SimClock::new(1);
+        let env = racer_io::Env::new(env.driver.clone(), clock.ctx(9));
         let mut bytes = [0; 32];
-        fill_random(&mut bytes).unwrap();
+        env.ctx.rng.fill(&mut bytes).unwrap();
         assert_eq!(sample(1).1, bytes);
     }
 
     #[test]
     fn replay_and_nested_worlds_preserve_time_entropy_and_deadlines() {
-        let clock = SimulationClock::new(7);
-        let role = clock.environment(11);
-        let _guard = role.enter();
-        let start = now();
-        let wall = wall_now();
+        let clock = racer_io::SimClock::new(7);
+        let role = clock.ctx(11);
+        let env = racer_io::Env::new(racer_io::Driver::Uring, role.clone());
+        let start = env.ctx.now();
+        let wall = env.ctx.clock.wall_now();
         let scope = RequestScope::on(
-            &crate::test_support::clock(),
+            &env.ctx.clock,
             RequestId([1; 16]),
             start + Duration::from_secs(2),
         )
         .unwrap();
         let wire = crate::peer::protocol::encode_deadline(scope.clock(), scope.deadline).unwrap();
         let mut first = [0; 64];
-        fill_random(&mut first[..3]).unwrap();
-        fill_random(&mut first[3..]).unwrap();
+        env.ctx.rng.fill(&mut first[..3]).unwrap();
+        env.ctx.rng.fill(&mut first[3..]).unwrap();
         {
-            let replay = SimulationClock::new(7);
-            let _nested = replay.environment(11).enter();
+            let replay = racer_io::SimClock::new(7);
+            let env = racer_io::Env::new(env.driver.clone(), replay.ctx(11));
             let mut bytes = [0; 64];
-            fill_random(&mut bytes).unwrap();
+            env.ctx.rng.fill(&mut bytes[..3]).unwrap();
+            env.ctx.rng.fill(&mut bytes[3..]).unwrap();
             assert_eq!(bytes, first);
-            assert_eq!(wall_now(), wall);
+            assert_eq!(env.ctx.clock.wall_now(), wall);
             replay.advance(Duration::from_secs(500));
         }
-        assert_eq!(now(), start);
+        assert_eq!(env.ctx.now(), start);
         clock.advance(Duration::from_secs(2));
         assert_eq!(scope.check(), Err(Error::DeadlineExceeded));
         clock.set_wall_time(wall - Duration::from_secs(60));
-        assert_eq!(now(), start + Duration::from_secs(2));
+        assert_eq!(env.ctx.now(), start + Duration::from_secs(2));
         assert_eq!(
             crate::peer::protocol::encode_deadline(scope.clock(), scope.deadline).unwrap(),
             wire
         );
         assert_eq!(
-            crate::peer::protocol::decode_deadline(&crate::test_support::clock(), wire)
+            crate::peer::protocol::decode_deadline(&env.ctx.clock, wire)
                 .unwrap()
                 .0,
             scope.deadline.0
@@ -1727,27 +1728,23 @@ mod tests {
         use std::time::Duration;
 
         /// A simulated reactor on `clock`'s worker context.
-        fn sim_reactor(clock: &SimulationClock) -> racer_io::scoped::Reactor<RequestScope> {
+        fn sim_reactor(clock: &racer_io::SimClock) -> racer_io::scoped::Reactor<RequestScope> {
             racer_io::scoped::Reactor::new(
                 8,
-                &racer_io::Env::sim(
-                    &racer_io::sim::SimOs::new(),
-                    clock.environment(0).worker_ctx(),
-                ),
+                &racer_io::Env::sim(&racer_io::sim::SimOs::new(), clock.ctx(0)),
             )
         }
-        use crate::rt::environment::SimulationClock;
 
         #[test]
         fn repeated_pressure_is_rate_limited_without_self_wakes() {
-            let clock = SimulationClock::new(1);
-            let environment = clock.environment(0);
-            let _time = environment.enter();
+            let clock = racer_io::SimClock::new(1);
+            let environment = clock.ctx(0);
+            let env = racer_io::Env::new(racer_io::Driver::Uring, environment.clone());
             let r = sim_reactor(&clock);
             let scope = RequestScope::on(
-                &crate::test_support::clock(),
+                &env.ctx.clock,
                 RequestId([0; 16]),
-                crate::rt::environment::now() + Duration::from_secs(1),
+                env.ctx.now() + Duration::from_secs(1),
             )
             .unwrap();
             let calls = Cell::new(0);
@@ -1777,16 +1774,16 @@ mod tests {
         }
         #[test]
         fn backoff_preserves_shutdown_deadlines_and_fatal_errors() {
-            let clock = SimulationClock::new(2);
-            let environment = clock.environment(0);
-            let _time = environment.enter();
+            let clock = racer_io::SimClock::new(2);
+            let environment = clock.ctx(0);
+            let env = racer_io::Env::new(racer_io::Driver::Uring, environment.clone());
             let r = sim_reactor(&clock);
             let mut cx = Context::from_waker(futures::task::noop_waker_ref());
             for expected in [Error::Cancelled, Error::DeadlineExceeded] {
                 let scope = RequestScope::on(
-                    &crate::test_support::clock(),
+                    &env.ctx.clock,
                     RequestId([0; 16]),
-                    crate::rt::environment::now() + Duration::from_millis(1),
+                    env.ctx.now() + Duration::from_millis(1),
                 )
                 .unwrap();
                 let mut operation = r.retry_overloaded::<()>(&scope, || {
@@ -1801,9 +1798,9 @@ mod tests {
                 assert_eq!(operation.as_mut().poll(&mut cx), Poll::Ready(Err(expected)));
             }
             let scope = RequestScope::on(
-                &crate::test_support::clock(),
+                &env.ctx.clock,
                 RequestId([0; 16]),
-                crate::rt::environment::now() + Duration::from_secs(1),
+                env.ctx.now() + Duration::from_secs(1),
             )
             .unwrap();
             for error in [
@@ -1820,22 +1817,21 @@ mod tests {
         #[test]
         fn submitted_listener_cancellation_waits_for_cqe_fence() {
             use crate::admission::AdmissionPolicy;
-            use crate::rt::reactor::simulation::Simulation;
             use crate::runtime::Reactor;
+            use racer_io::sim::SimOs;
             use std::rc::Rc;
-            let sim = Simulation::new();
-            let _os = sim.enter();
-            let clock = SimulationClock::new(3);
-            let environment = clock.environment(0);
-            let _time = environment.enter();
+            let sim = SimOs::new();
+            let clock = racer_io::SimClock::new(3);
+            let environment = clock.ctx(0);
+            let env = racer_io::Env::sim(&sim, environment.clone());
             let admission = Rc::new(flow_control::Quotas::new(AdmissionPolicy::new(
                 crate::test_support::cluster::config(false).limits,
             )));
-            let reactor = Reactor::new(admission, &crate::test_support::env());
+            let reactor = Reactor::new(admission, &env);
             let scope = RequestScope::on(
-                &crate::test_support::clock(),
+                &env.ctx.clock,
                 RequestId([0; 16]),
-                crate::rt::environment::now() + Duration::from_secs(1),
+                env.ctx.now() + Duration::from_secs(1),
             )
             .unwrap();
             let (reader, _writer) = sim.socket_pair();

@@ -86,8 +86,8 @@ mod tests {
 
     use super::*;
     use crate::enrollment::Enrollment;
-    use crate::rt::reactor::simulation::{Fault, Simulation};
     use crate::test_support::enrollment::drive;
+    use racer_io::sim::{Fault, SimOs as Simulation};
     use std::{
         num::NonZeroU32,
         path::Path,
@@ -100,14 +100,14 @@ mod tests {
     fn journal_durability_precedes_every_crypto_prepare_and_preserves_phase() {
         for renewal in [false, true] {
             let sim = Simulation::new();
-            let _os = sim.enter();
+            let env = racer_io::Env::sim(&sim, racer_io::WorkerCtx::host());
             let reactor = Rc::new(crate::runtime::Reactor::new(
                 Rc::new(flow_control::Quotas::new(
                     crate::admission::AdmissionPolicy::new(
                         crate::test_support::cluster::config(false).limits,
                     ),
                 )),
-                &crate::test_support::env(),
+                &env,
             ));
             let io = Rc::new(ReactorControlIo::new(reactor.clone()));
             let journal =
@@ -169,14 +169,14 @@ mod tests {
     #[test]
     fn abandoned_journal_write_is_fenced_before_retry_and_crypto_submission() {
         let sim = Simulation::new();
-        let _os = sim.enter();
+        let env = racer_io::Env::sim(&sim, racer_io::WorkerCtx::host());
         let reactor = Rc::new(crate::runtime::Reactor::new(
             Rc::new(flow_control::Quotas::new(
                 crate::admission::AdmissionPolicy::new(
                     crate::test_support::cluster::config(false).limits,
                 ),
             )),
-            &crate::test_support::env(),
+            &env,
         ));
         let io = Rc::new(ReactorControlIo::new(reactor.clone()));
         let journal =

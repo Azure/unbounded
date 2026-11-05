@@ -1725,10 +1725,10 @@ pub(super) mod tests {
     }
 
     impl Fixture {
-        fn new(limits: crate::config::Limits, capacity: usize) -> Self {
+        fn new(env: &racer_io::Env, limits: crate::config::Limits, capacity: usize) -> Self {
             let admission = Rc::new(flow_control::Quotas::new(AdmissionPolicy::new(limits)));
-            let reactor = Rc::new(Reactor::new(admission.clone(), &crate::test_support::env()));
-            let pipes = Rc::new(new_pipe_pool(admission.clone()));
+            let reactor = Rc::new(Reactor::new(admission.clone(), env));
+            let pipes = Rc::new(new_pipe_pool(admission.clone(), reactor.sim_os()));
             let directory = Arc::new(
                 WorkerDirectory::new(
                     Arc::new(WorkerMap::new(vec![WorkerId(0)]).unwrap()),
@@ -1826,8 +1826,13 @@ pub(super) mod tests {
 
     #[test]
     fn sealed_reads_fill_their_whole_window_directly() {
+        let env = racer_io::Env::host();
         for (window, sealed) in [(1, 1), (2, 1), (8, 7)] {
-            let f = Fixture::new(crate::test_support::cluster::config(false).limits, window);
+            let f = Fixture::new(
+                &env,
+                crate::test_support::cluster::config(false).limits,
+                window,
+            );
             let mut metadata = metadata();
             metadata.length = 16 * PAGE_BYTES;
             let range = ByteRange::From(0).resolve(metadata.length).unwrap();
@@ -1848,8 +1853,13 @@ pub(super) mod tests {
 
     #[test]
     fn passthrough_reads_fill_their_whole_window_directly() {
+        let env = racer_io::Env::host();
         for (window, passthrough) in [(1, 1), (2, 1), (8, 7)] {
-            let f = Fixture::new(crate::test_support::cluster::config(false).limits, window);
+            let f = Fixture::new(
+                &env,
+                crate::test_support::cluster::config(false).limits,
+                window,
+            );
             let mut metadata = metadata();
             metadata.length = 16 * PAGE_BYTES;
             let range = ByteRange::From(0).resolve(metadata.length).unwrap();
@@ -1865,7 +1875,8 @@ pub(super) mod tests {
 
     #[test]
     fn sealed_pages_are_delivered_in_order_only_to_direct_readers() {
-        let f = Fixture::new(crate::test_support::cluster::config(false).limits, 2);
+        let env = racer_io::Env::host();
+        let f = Fixture::new(&env, crate::test_support::cluster::config(false).limits, 2);
         let admission = &f.admission;
         let mut metadata = metadata();
         metadata.length = 2 * PAGE_BYTES;
@@ -1930,7 +1941,8 @@ pub(super) mod tests {
 
     #[test]
     fn retained_boundary_slices_keep_full_plaintext_charged_until_exact_release() {
-        let f = Fixture::new(crate::test_support::cluster::config(false).limits, 2);
+        let env = racer_io::Env::host();
+        let f = Fixture::new(&env, crate::test_support::cluster::config(false).limits, 2);
         let admission = &f.admission;
         let mut metadata = metadata();
         metadata.length = 2 * PAGE_BYTES;
@@ -1985,10 +1997,11 @@ pub(super) mod tests {
 
     #[test]
     fn optional_remote_observation_never_blocks_ready_delivery_or_duplicates_on_repoll() {
+        let env = racer_io::Env::host();
         for repoll in [false, true] {
             let queue = Rc::new(crate::drivers::DriverQueue::new(8));
             let _queue = queue.enter();
-            let f = Fixture::new(crate::test_support::cluster::config(false).limits, 2);
+            let f = Fixture::new(&env, crate::test_support::cluster::config(false).limits, 2);
             let directory = f.streams.directory();
             assert_eq!(directory.test_observation_mailbox(), 0);
             let mut metadata = metadata();
@@ -2045,11 +2058,12 @@ pub(super) mod tests {
     #[test]
     fn later_page_pipe_wait_survives_temporary_polls_and_cleans_up() {
         use crate::test_support::WakeCounter;
+        let env = racer_io::Env::host();
         {
             for mode in ["release", "cancel", "drop"] {
                 let mut limits = crate::test_support::cluster::config(false).limits;
                 limits.pipes = std::num::NonZeroUsize::new(1).unwrap();
-                let f = Fixture::new(limits, 2);
+                let f = Fixture::new(&env, limits, 2);
                 let admission = &f.admission;
                 let pipes = &f.pipes;
                 let metadata = metadata();
@@ -2135,7 +2149,8 @@ pub(super) mod tests {
     }
     #[test]
     fn credit_starved_stream_never_holds_pipe_and_cancel_detaches_demand() {
-        let f = Fixture::new(crate::test_support::cluster::config(false).limits, 1);
+        let env = racer_io::Env::host();
+        let f = Fixture::new(&env, crate::test_support::cluster::config(false).limits, 1);
         let admission = &f.admission;
         let pipes = &f.pipes;
         let directory = &f.streams.directory;
@@ -2217,8 +2232,9 @@ pub(super) mod tests {
     fn pending_client_window_never_restarts_failed_pages_and_honors_original_deadline() {
         use std::cell::Cell;
         use std::time::Duration;
+        let env = racer_io::Env::host();
         for expire in [false, true] {
-            let f = Fixture::new(crate::test_support::cluster::config(false).limits, 2);
+            let f = Fixture::new(&env, crate::test_support::cluster::config(false).limits, 2);
             let mut metadata = metadata();
             metadata.length = 100 * PAGE_BYTES;
             let scope =
@@ -2340,7 +2356,8 @@ pub(super) mod tests {
     /// ending the read on the first transient failure.
     #[test]
     fn transient_sealed_fill_failures_are_refetched_until_retries_run_out() {
-        let f = Fixture::new(crate::test_support::cluster::config(false).limits, 2);
+        let env = racer_io::Env::host();
+        let f = Fixture::new(&env, crate::test_support::cluster::config(false).limits, 2);
         let deadline = Instant::now() + Duration::from_secs(60);
         let mut stream = stream_with_budget(&f, &metadata(), PageBudget::Client { deadline });
         let mut cx = Context::from_waker(futures::task::noop_waker_ref());
@@ -2368,7 +2385,8 @@ pub(super) mod tests {
     }
     #[test]
     fn transient_fill_failures_are_refetched_until_retries_run_out() {
-        let f = Fixture::new(crate::test_support::cluster::config(false).limits, 2);
+        let env = racer_io::Env::host();
+        let f = Fixture::new(&env, crate::test_support::cluster::config(false).limits, 2);
         let deadline = Instant::now() + Duration::from_secs(60);
         let mut stream = stream_with_budget(&f, &metadata(), PageBudget::Client { deadline });
         let mut cx = Context::from_waker(futures::task::noop_waker_ref());
@@ -2390,7 +2408,8 @@ pub(super) mod tests {
 
     #[test]
     fn non_transient_fill_failures_are_not_refetched() {
-        let f = Fixture::new(crate::test_support::cluster::config(false).limits, 2);
+        let env = racer_io::Env::host();
+        let f = Fixture::new(&env, crate::test_support::cluster::config(false).limits, 2);
         let deadline = Instant::now() + Duration::from_secs(60);
         let mut stream = stream_with_budget(&f, &metadata(), PageBudget::Client { deadline });
         let mut cx = Context::from_waker(futures::task::noop_waker_ref());
@@ -2406,13 +2425,14 @@ pub(super) mod tests {
 
     #[test]
     fn abandoning_window_drops_waiters() {
+        let env = racer_io::Env::host();
         struct Dropped(Rc<std::cell::Cell<bool>>);
         impl Drop for Dropped {
             fn drop(&mut self) {
                 self.0.set(true);
             }
         }
-        let f = Fixture::new(crate::test_support::cluster::config(false).limits, 2);
+        let f = Fixture::new(&env, crate::test_support::cluster::config(false).limits, 2);
         let deadline = Instant::now() + Duration::from_secs(60);
         let mut metadata = metadata();
         metadata.length = 3;
@@ -2431,7 +2451,8 @@ pub(super) mod tests {
     }
     #[test]
     fn later_failure_still_fills_earlier_pages_and_surfaces_in_order() {
-        let f = Fixture::new(crate::test_support::cluster::config(false).limits, 2);
+        let env = racer_io::Env::host();
+        let f = Fixture::new(&env, crate::test_support::cluster::config(false).limits, 2);
         let deadline = Instant::now() + Duration::from_secs(60);
         let mut stream = stream_with_budget(&f, &metadata(), PageBudget::Client { deadline });
         // The head probe misses only after the later page has already failed.
@@ -2485,7 +2506,8 @@ pub(super) mod tests {
     }
     #[test]
     fn memory_hits_in_window_deliver_without_fetching_earlier_pages() {
-        let f = Fixture::new(crate::test_support::cluster::config(false).limits, 2);
+        let env = racer_io::Env::host();
+        let f = Fixture::new(&env, crate::test_support::cluster::config(false).limits, 2);
         let metadata = metadata();
         let deadline = Instant::now() + Duration::from_secs(60);
         let mut stream = stream_with_budget(&f, &metadata, PageBudget::Client { deadline });
@@ -2513,7 +2535,8 @@ pub(super) mod tests {
     }
     #[test]
     fn out_of_order_direct_fill_is_buffered_and_delivered_in_order() {
-        let f = Fixture::new(crate::test_support::cluster::config(false).limits, 2);
+        let env = racer_io::Env::host();
+        let f = Fixture::new(&env, crate::test_support::cluster::config(false).limits, 2);
         let metadata = metadata();
         let scope =
             RequestScope::host(RequestId([6; 16]), Instant::now() + Duration::from_secs(60))
@@ -2548,7 +2571,8 @@ pub(super) mod tests {
     }
     #[test]
     fn selection_fanout_reaches_every_window_that_wants_the_page() {
-        let f = Fixture::new(crate::test_support::cluster::config(false).limits, 4);
+        let env = racer_io::Env::host();
+        let f = Fixture::new(&env, crate::test_support::cluster::config(false).limits, 4);
         let metadata = metadata();
         let mut streams = (0..2)
             .map(|_| {
@@ -2609,7 +2633,8 @@ pub(super) mod tests {
     }
     #[test]
     fn selection_failure_returns_pages_to_direct_fill_and_cancellation_is_fatal() {
-        let f = Fixture::new(crate::test_support::cluster::config(false).limits, 2);
+        let env = racer_io::Env::host();
+        let f = Fixture::new(&env, crate::test_support::cluster::config(false).limits, 2);
         let metadata = metadata();
         for error in [
             Error::Unavailable,
@@ -2649,7 +2674,8 @@ pub(super) mod tests {
     }
     #[test]
     fn spill_stays_off_by_default() {
-        let f = Fixture::new(crate::test_support::cluster::config(false).limits, 4);
+        let env = racer_io::Env::host();
+        let f = Fixture::new(&env, crate::test_support::cluster::config(false).limits, 4);
         let mut metadata = metadata();
         metadata.length = 4 * PAGE_BYTES;
         let mut stream = f.open(
@@ -2663,7 +2689,8 @@ pub(super) mod tests {
     }
     #[test]
     fn passthrough_stream_issues_no_selection_and_never_spills() {
-        let f = Fixture::new(crate::test_support::cluster::config(false).limits, 4);
+        let env = racer_io::Env::host();
+        let f = Fixture::new(&env, crate::test_support::cluster::config(false).limits, 4);
         f.streams
             .directory
             .configure_spill(crate::read::spill::Config {
@@ -2699,7 +2726,8 @@ pub(super) mod tests {
     }
     #[test]
     fn read_keeps_disjoint_selections_in_flight_up_to_spare_granted_flights() {
-        let f = Fixture::new(crate::test_support::cluster::config(false).limits, 10);
+        let env = racer_io::Env::host();
+        let f = Fixture::new(&env, crate::test_support::cluster::config(false).limits, 10);
         let mut metadata = metadata();
         metadata.length = 10 * PAGE_BYTES;
         let open = || {
@@ -2792,7 +2820,8 @@ pub(super) mod tests {
     }
     #[test]
     fn selection_demand_covers_only_selectable_holes_not_selected_elsewhere() {
-        let f = Fixture::new(crate::test_support::cluster::config(false).limits, 8);
+        let env = racer_io::Env::host();
+        let f = Fixture::new(&env, crate::test_support::cluster::config(false).limits, 8);
         let mut metadata = metadata();
         metadata.length = 8 * PAGE_BYTES;
         let mut stream = f.open(
@@ -2861,13 +2890,13 @@ pub(super) mod tests {
         let total = 4 * PAGE_BYTES + 17;
         let range = ByteRange::From(PAGE_BYTES).resolve(total).unwrap();
         for (capped, progressing) in [(true, false), (false, true), (false, false)] {
-            let clock = crate::rt::environment::SimulationClock::new(55);
-            let environment = clock.environment(0);
-            let _clock = environment.enter();
+            let clock = racer_io::SimClock::new(55);
+            let environment = clock.ctx(0);
+            let env = racer_io::Env::new(racer_io::Driver::Uring, environment.clone());
             let admission = Rc::new(flow_control::Quotas::new(AdmissionPolicy::new(
                 crate::test_support::cluster::config(false).limits,
             )));
-            let reactor = Rc::new(Reactor::new(admission.clone(), &crate::test_support::env()));
+            let reactor = Rc::new(Reactor::new(admission.clone(), &env));
             let io = Rc::new(crate::http::new_io(
                 reactor.clone(),
                 Codec::new(32768),
@@ -2885,6 +2914,7 @@ pub(super) mod tests {
             let (client_socket, origin_socket) =
                 racer_wire::control::canonical_socket_paths("framing").unwrap();
             let worker = crate::test_support::ReadWorker::new(
+                &env,
                 racer_wire::control::CacheDefinition {
                     id: metadata.version.object.cache.clone(),
                     name: "framing".into(),
@@ -2902,9 +2932,9 @@ pub(super) mod tests {
             );
             let _queue = worker.drivers.enter();
             let scope = RequestScope::on(
-                &crate::test_support::clock(),
+                &env.ctx.clock,
                 RequestId([7; 16]),
-                crate::rt::environment::now()
+                env.ctx.now()
                     + if progressing {
                         Duration::from_millis(30)
                     } else {
@@ -3079,7 +3109,7 @@ pub(super) mod tests {
             worker.poll(&mut cx);
             if progressing {
                 assert!(
-                    crate::rt::environment::now() > scope.deadline.0,
+                    env.ctx.now() > scope.deadline.0,
                     "stream must cross the scaled old absolute deadline"
                 );
             }
@@ -3090,10 +3120,9 @@ pub(super) mod tests {
 
     #[test]
     fn progressing_page_children_keep_deadlines_and_retry_limits_across_long_streams() {
-        let clock = crate::rt::environment::SimulationClock::new(81);
-        let sim_env = clock.environment(0);
-        let _environment = sim_env.enter();
-        let sim_ctx = sim_env.worker_ctx();
+        let clock = racer_io::SimClock::new(81);
+        let sim_env = clock.ctx(0);
+        let sim_ctx = sim_env.clone();
         let timeout = Duration::from_millis(30);
         let old_deadline = sim_ctx.clock.now() + timeout;
         let budget = PageBudget::Progressing { timeout };
@@ -3420,7 +3449,9 @@ pub(super) mod tests {
         }
         #[test]
         fn partial_final_page_uses_exact_bytes_and_completion_does_not_require_release() {
-            let f = super::Fixture::new(crate::test_support::cluster::config(false).limits, 2);
+            let env = racer_io::Env::host();
+            let f =
+                super::Fixture::new(&env, crate::test_support::cluster::config(false).limits, 2);
             let mut metadata = super::metadata();
             metadata.length = PAGE_BYTES + 5;
             let range = crate::model::ByteRange::From(PAGE_BYTES - 3)
@@ -3467,7 +3498,9 @@ pub(super) mod tests {
         }
         #[test]
         fn credit_boundaries_and_invalid_transitions_preserve_request_errors() {
-            let f = super::Fixture::new(crate::test_support::cluster::config(false).limits, 2);
+            let env = racer_io::Env::host();
+            let f =
+                super::Fixture::new(&env, crate::test_support::cluster::config(false).limits, 2);
             let mut metadata = super::metadata();
             metadata.length = PAGE_BYTES;
             let range = crate::model::ByteRange::From(0)
@@ -3508,7 +3541,9 @@ pub(super) mod tests {
         }
         #[test]
         fn small_page_credits_are_bounded_by_the_range_page_size() {
-            let f = super::Fixture::new(crate::test_support::cluster::config(false).limits, 1);
+            let env = racer_io::Env::host();
+            let f =
+                super::Fixture::new(&env, crate::test_support::cluster::config(false).limits, 1);
             let size = racer_wire::object::PageSize::new(64 << 10).unwrap();
             let metadata = super::metadata();
             let range = crate::model::ByteRange::From(0)
@@ -3528,7 +3563,9 @@ pub(super) mod tests {
         }
         #[test]
         fn invalid_credit_contracts_never_admit_demand() {
-            let f = super::Fixture::new(crate::test_support::cluster::config(false).limits, 1);
+            let env = racer_io::Env::host();
+            let f =
+                super::Fixture::new(&env, crate::test_support::cluster::config(false).limits, 1);
             let metadata = super::metadata();
             let range = crate::model::ByteRange::From(0).resolve(1).unwrap();
             for (pages, bytes) in [

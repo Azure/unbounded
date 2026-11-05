@@ -661,7 +661,9 @@ mod tests {
             RequestScope::host(RequestId([0; 16]), Instant::now() + Duration::from_secs(15))
                 .unwrap()
         }
-        fn setup() -> (
+        fn setup(
+            env: &racer_io::Env,
+        ) -> (
             Rc<flow_control::Quotas<AdmissionPolicy>>,
             Rc<Reactor>,
             Rc<DiagnosticIo>,
@@ -669,7 +671,7 @@ mod tests {
             let admission = Rc::new(flow_control::Quotas::new(AdmissionPolicy::new(
                 crate::test_support::cluster::config(false).limits,
             )));
-            let reactor = Rc::new(Reactor::new(admission.clone(), &crate::test_support::env()));
+            let reactor = Rc::new(Reactor::new(admission.clone(), env));
             let io = Rc::new(
                 DiagnosticIo::attach(reactor.clone(), admission.clone())
                     .expect("real io_uring diagnostics attachment"),
@@ -787,8 +789,8 @@ mod tests {
             }
         }
 
-        fn diagnostic_text(telemetry: &Telemetry, path: &str) -> String {
-            let (_, reactor, io) = setup();
+        fn diagnostic_text(env: &racer_io::Env, telemetry: &Telemetry, path: &str) -> String {
+            let (_, reactor, io) = setup(env);
             let listener = TcpListener::bind("127.0.0.1:0").unwrap();
             let address = listener.local_addr().unwrap();
             let scope = scope();
@@ -825,8 +827,8 @@ mod tests {
         }
 
         /// Exchange one GET without asserting the status.
-        fn diagnostic_response(telemetry: &Telemetry, path: &str) -> String {
-            let (_, reactor, io) = setup();
+        fn diagnostic_response(env: &racer_io::Env, telemetry: &Telemetry, path: &str) -> String {
+            let (_, reactor, io) = setup(env);
             let listener = TcpListener::bind("127.0.0.1:0").unwrap();
             let address = listener.local_addr().unwrap();
             let scope = scope();
@@ -858,6 +860,7 @@ mod tests {
 
         #[test]
         fn hardware_endpoint_serves_json_and_counts_requests() {
+            let env = racer_io::Env::host();
             let telemetry = Telemetry::default();
             set_hardware(&telemetry, || crate::hardware::Report {
                 errors: vec!["rdma_devices: example".into()],
@@ -865,7 +868,7 @@ mod tests {
             });
             // `Telemetry::default()` has pprof disabled; hardware still works.
             assert!(telemetry.profiling.is_none());
-            let text = diagnostic_text(&telemetry, "/debug/hardware");
+            let text = diagnostic_text(&env, &telemetry, "/debug/hardware");
             let (head, body) = text.split_once("\r\n\r\n").unwrap();
             assert!(head.contains("\r\nContent-Type: application/json\r\n"));
             assert!(!head.contains("Content-Disposition"));
@@ -882,23 +885,24 @@ mod tests {
 
         #[test]
         fn hardware_endpoint_unavailable_oversize_and_exact_path() {
+            let env = racer_io::Env::host();
             let telemetry = Telemetry::default();
-            let text = diagnostic_response(&telemetry, "/debug/hardware");
+            let text = diagnostic_response(&env, &telemetry, "/debug/hardware");
             assert_response(
                 text.as_bytes(),
                 "503 Service Unavailable",
                 Some("unavailable\n"),
             );
             assert!(hardware_counter(&telemetry));
-            let text = diagnostic_response(&telemetry, "/debug/hardware?x");
+            let text = diagnostic_response(&env, &telemetry, "/debug/hardware?x");
             assert_response(text.as_bytes(), "404 Not Found", Some("not found\n"));
-            let text = diagnostic_response(&telemetry, "/debug/hardware/");
+            let text = diagnostic_response(&env, &telemetry, "/debug/hardware/");
             assert_response(text.as_bytes(), "404 Not Found", Some("not found\n"));
             set_hardware(&telemetry, || crate::hardware::Report {
                 errors: vec!["x".repeat(crate::telemetry::HARDWARE_BODY_BYTES)],
                 ..Default::default()
             });
-            let text = diagnostic_response(&telemetry, "/debug/hardware");
+            let text = diagnostic_response(&env, &telemetry, "/debug/hardware");
             assert_response(
                 text.as_bytes(),
                 "503 Service Unavailable",
@@ -908,6 +912,7 @@ mod tests {
 
         #[test]
         fn hardware_budget_exhaustion_is_response_too_large() {
+            let env = racer_io::Env::host();
             let telemetry = Telemetry::default();
             assert!(
                 telemetry
@@ -922,7 +927,7 @@ mod tests {
                     }))
                     .is_ok()
             );
-            let text = diagnostic_response(&telemetry, "/debug/hardware");
+            let text = diagnostic_response(&env, &telemetry, "/debug/hardware");
             assert_response(
                 text.as_bytes(),
                 "503 Service Unavailable",
@@ -964,6 +969,7 @@ mod tests {
         #[test]
         fn hardware_discovery_runs_off_worker_and_is_single_flight() {
             use std::sync::mpsc;
+            let env = racer_io::Env::host();
             let telemetry = Telemetry::default();
             let (release, gate) = mpsc::channel::<()>();
             let gate = Arc::new(Mutex::new(gate));
@@ -981,7 +987,7 @@ mod tests {
                     }))
                     .is_ok()
             );
-            let (_, reactor, io) = setup();
+            let (_, reactor, io) = setup(&env);
             let listener = TcpListener::bind("127.0.0.1:0").unwrap();
             let address = listener.local_addr().unwrap();
             let scope = scope();
@@ -1063,6 +1069,7 @@ mod tests {
         #[test]
         fn hardware_charge_outlives_teardown_until_blocked_helper_finishes() {
             use std::sync::mpsc;
+            let env = racer_io::Env::host();
             let telemetry = Telemetry::default();
             let (release, gate) = mpsc::channel::<()>();
             let gate = Arc::new(Mutex::new(gate));
@@ -1080,7 +1087,7 @@ mod tests {
                     }))
                     .is_ok()
             );
-            let (admission, reactor, io) = setup();
+            let (admission, reactor, io) = setup(&env);
             let listener = TcpListener::bind("127.0.0.1:0").unwrap();
             let address = listener.local_addr().unwrap();
             let scope = scope();
@@ -1152,8 +1159,9 @@ mod tests {
 
         #[test]
         fn membership_endpoint_is_bounded_and_not_a_readiness_alias() {
+            let env = racer_io::Env::host();
             let telemetry = Telemetry::default();
-            let text = diagnostic_text(&telemetry, "/debug/membership");
+            let text = diagnostic_text(&env, &telemetry, "/debug/membership");
             assert_response(
                 text.as_bytes(),
                 "200 OK",
@@ -1172,17 +1180,18 @@ mod tests {
                     })))
                     .is_ok()
             );
-            let text = diagnostic_text(&telemetry, "/debug/membership");
+            let text = diagnostic_text(&env, &telemetry, "/debug/membership");
             assert!(text.contains("accepted_sequence=18446744073709551615 accepted_membership=7"));
             assert!(text.contains(&format!("accepted_membership_hash={}", "ab".repeat(32))));
             assert!(text.ends_with("matching_workers=2 fully_applied=1\n"));
-            assert!(!telemetry.health.ready());
+            assert!(!telemetry.health.ready(&env));
             assert!(text.len() < 1024);
         }
 
         #[test]
         fn resource_and_lifecycle_changes_are_observable_at_both_health_endpoints() {
-            let (_, reactor, io) = setup();
+            let env = racer_io::Env::host();
+            let (_, reactor, io) = setup(&env);
             let telemetry = Telemetry::default();
             let listener = TcpListener::bind("127.0.0.1:0").unwrap();
             let address = listener.local_addr().unwrap();
@@ -1216,14 +1225,16 @@ mod tests {
             };
             observe(false, true);
             assert_eq!(
-                telemetry.health.transition(crate::telemetry::State::Ready),
+                telemetry
+                    .health
+                    .transition(&env, crate::telemetry::State::Ready),
                 Err(Error::Unavailable)
             );
             let good = good_resources();
             telemetry.health.observe(good).unwrap();
             telemetry
                 .health
-                .transition(crate::telemetry::State::Ready)
+                .transition(&env, crate::telemetry::State::Ready)
                 .unwrap();
             observe(true, true);
             for bad in [
@@ -1271,22 +1282,24 @@ mod tests {
             }
             telemetry
                 .health
-                .transition(crate::telemetry::State::Draining)
+                .transition(&env, crate::telemetry::State::Draining)
                 .unwrap();
             observe(false, true);
             assert_eq!(
-                telemetry.health.transition(crate::telemetry::State::Ready),
+                telemetry
+                    .health
+                    .transition(&env, crate::telemetry::State::Ready),
                 Err(Error::Unavailable)
             );
             telemetry
                 .health
-                .transition(crate::telemetry::State::Stopped)
+                .transition(&env, crate::telemetry::State::Stopped)
                 .unwrap();
             observe(false, false);
             assert_eq!(
                 telemetry
                     .health
-                    .transition(crate::telemetry::State::Starting),
+                    .transition(&env, crate::telemetry::State::Starting),
                 Err(Error::Unavailable)
             );
             finish(server, &scope, &reactor);
@@ -1294,16 +1307,17 @@ mod tests {
 
         #[test]
         fn diagnostic_probe_and_monitors_progress_under_sustained_queue_pressure() {
+            let env = racer_io::Env::host();
             let mut limits = crate::test_support::cluster::config(false).limits;
             limits.queue_entries = std::num::NonZeroUsize::new(8).unwrap();
             let admission = Rc::new(flow_control::Quotas::new(AdmissionPolicy::new(limits)));
-            let reactor = Rc::new(Reactor::new(admission.clone(), &crate::test_support::env()));
+            let reactor = Rc::new(Reactor::new(admission.clone(), &env));
             let io = Rc::new(DiagnosticIo::attach(reactor.clone(), admission.clone()).unwrap());
             let telemetry = Telemetry::default();
             telemetry.health.observe(good_resources()).unwrap();
             telemetry
                 .health
-                .transition(crate::telemetry::State::Ready)
+                .transition(&env, crate::telemetry::State::Ready)
                 .unwrap();
             let listener = TcpListener::bind("127.0.0.1:0").unwrap();
             let address = listener.local_addr().unwrap();
@@ -1414,16 +1428,17 @@ mod tests {
 
         #[test]
         fn diagnostic_accept_recovers_after_full_entry_table() {
+            let env = racer_io::Env::host();
             let mut limits = crate::test_support::cluster::config(false).limits;
             limits.queue_entries = std::num::NonZeroUsize::new(8).unwrap();
             let admission = Rc::new(flow_control::Quotas::new(AdmissionPolicy::new(limits)));
-            let reactor = Rc::new(Reactor::new(admission.clone(), &crate::test_support::env()));
+            let reactor = Rc::new(Reactor::new(admission.clone(), &env));
             let io = Rc::new(DiagnosticIo::attach(reactor.clone(), admission.clone()).unwrap());
             let telemetry = Telemetry::default();
             telemetry.health.observe(good_resources()).unwrap();
             telemetry
                 .health
-                .transition(crate::telemetry::State::Ready)
+                .transition(&env, crate::telemetry::State::Ready)
                 .unwrap();
             let listener = TcpListener::bind("127.0.0.1:0").unwrap();
             let address = listener.local_addr().unwrap();
@@ -1467,6 +1482,7 @@ mod tests {
             use crate::telemetry::FAILURE_CAPACITY as CAPACITY;
             use crate::telemetry::Failure;
             use crate::telemetry::Stage;
+            let env = racer_io::Env::host();
             let telemetry = Telemetry::default();
             let observer = telemetry.failures.observer(WorkerId(u16::MAX));
             let scope = RequestScope::host(
@@ -1492,7 +1508,7 @@ mod tests {
                     }),
                 );
             }
-            let text = diagnostic_text(&telemetry, "/debug/failures");
+            let text = diagnostic_text(&env, &telemetry, "/debug/failures");
             assert_eq!(text.matches("stage=PeerReceiveAdmission").count(), CAPACITY);
             assert!(text.contains("sequence=2 worker=65535"));
             assert!(!text.contains("synthetic"));
@@ -1504,6 +1520,7 @@ mod tests {
             use crate::security::CryptoId;
             use crate::telemetry::AEAD_CAPACITY;
             use crate::telemetry::test_aead_failure;
+            let env = racer_io::Env::host();
             let telemetry = Telemetry::default();
             let observer = telemetry.failures.observer(WorkerId(u16::MAX));
             for _ in 0..AEAD_CAPACITY + 1 {
@@ -1516,7 +1533,7 @@ mod tests {
                     test_aead_failure(),
                 );
             }
-            let text = diagnostic_text(&telemetry, "/debug/aead");
+            let text = diagnostic_text(&env, &telemetry, "/debug/aead");
             assert_eq!(text.matches(" supplier=").count(), AEAD_CAPACITY);
             assert!(text.contains("total=65 retained=64 overwritten=1 capacity=64"));
             assert!(!text.contains("synthetic"));
@@ -1524,6 +1541,7 @@ mod tests {
 
         #[test]
         fn candidate_final_raw_endpoint_does_not_echo_request_secrets() {
+            let env = racer_io::Env::host();
             let telemetry = Telemetry::default();
             let observer = telemetry.failures.observer(crate::model::WorkerId(2));
             observer.candidate_final(CandidateFinal {
@@ -1533,7 +1551,7 @@ mod tests {
                 membership: 7,
                 trail: CandidateTrail::default(),
             });
-            let text = diagnostic_text(&telemetry, "/debug/candidate-final");
+            let text = diagnostic_text(&env, &telemetry, "/debug/candidate-final");
             assert!(
                 text.contains("coverage=candidate_operation_final"),
                 "{text}"
@@ -1549,18 +1567,20 @@ mod tests {
 
         #[test]
         fn send_tag_endpoint_is_empty_when_disabled_and_does_not_echo_headers() {
+            let env = racer_io::Env::host();
             let telemetry = Telemetry::default();
-            let text = diagnostic_text(&telemetry, "/debug/send-tag");
+            let text = diagnostic_text(&env, &telemetry, "/debug/send-tag");
             assert!(text.contains("sampled=0"));
             assert!(!text.contains("synthetic"));
-            telemetry.send_tag.fill_test_ring();
-            let text = diagnostic_text(&telemetry, "/debug/send-tag");
+            telemetry.send_tag.fill_test_ring(&env);
+            let text = diagnostic_text(&env, &telemetry, "/debug/send-tag");
             assert_eq!(text.matches("status=verified").count(), 64);
         }
 
         #[test]
         fn raw_endpoints_fragmentation_readiness_redaction_and_data_admission_stop() {
-            let (admission, reactor, io) = setup();
+            let env = racer_io::Env::host();
+            let (admission, reactor, io) = setup(&env);
             let telemetry = Telemetry::default();
             let listener = TcpListener::bind("127.0.0.1:0").unwrap();
             let address = listener.local_addr().unwrap();
@@ -1593,7 +1613,7 @@ mod tests {
             telemetry.health.observe(good_resources()).unwrap();
             telemetry
                 .health
-                .transition(crate::telemetry::State::Ready)
+                .transition(&env, crate::telemetry::State::Ready)
                 .unwrap();
             let response = exchange_raw(address, get("/readyz").as_bytes(), &mut server, &reactor);
             assert_response(&response, "200 OK", Some("ready\n"));
@@ -1648,7 +1668,8 @@ mod tests {
 
         #[test]
         fn raw_rejections_are_fixed_and_never_echo_untrusted_input() {
-            let (_, reactor, io) = setup();
+            let env = racer_io::Env::host();
+            let (_, reactor, io) = setup(&env);
             let telemetry = Telemetry::default();
             let listener = TcpListener::bind("127.0.0.1:0").unwrap();
             let address = listener.local_addr().unwrap();
@@ -1698,7 +1719,8 @@ mod tests {
 
         #[test]
         fn slow_socket_does_not_block_probes_and_abandonment_keeps_quota_until_fenced() {
-            let (admission, reactor, io) = setup();
+            let env = racer_io::Env::host();
+            let (admission, reactor, io) = setup(&env);
             let reserved_memory = admission.used(ResourceClass::RequestContext);
             let telemetry = Telemetry::default();
             let listener = TcpListener::bind("127.0.0.1:0").unwrap();
@@ -1764,8 +1786,9 @@ mod tests {
 
         #[test]
         fn fixed_parser_rejects_invalid_versions_framing_and_query_paths() {
+            let env = racer_io::Env::host();
             let telemetry = Telemetry::default();
-            let (_, reactor, io) = setup();
+            let (_, reactor, io) = setup(&env);
             let listener = TcpListener::bind("127.0.0.1:0").unwrap();
             let address = listener.local_addr().unwrap();
             let scope = scope();
@@ -1798,6 +1821,7 @@ mod tests {
         fn metrics_http_response_exports_worker_quotas_with_bounded_output() {
             use crate::model::WorkerId;
             use crate::telemetry::Metrics;
+            let env = racer_io::Env::host();
             let workers = Metrics::for_workers(64).unwrap();
             let admissions: Vec<_> = workers
                 .iter()
@@ -1901,7 +1925,7 @@ mod tests {
             for metrics in &workers {
                 metrics.observe_cache_disks(caches.clone());
             }
-            let text = diagnostic_text(&telemetry, "/metrics");
+            let text = diagnostic_text(&env, &telemetry, "/metrics");
             assert!(text.contains(&format!(
                 "racer_cache_disk_share_bytes{{cache=\"{:04}{}\"}}",
                 max_caches - 1,
@@ -1972,7 +1996,7 @@ mod tests {
                 })
                 .collect();
             workers[0].observe_cache_disks(caches);
-            let text = diagnostic_text(&telemetry, "/metrics");
+            let text = diagnostic_text(&env, &telemetry, "/metrics");
             assert!(text.len() > MAX_RESPONSE_BYTES, "{} bytes", text.len());
             assert!(text.contains(&format!(
                 "racer_cache_disk_resident_bytes{{cache=\"{:05}{}\"}}",
@@ -1993,6 +2017,7 @@ mod tests {
 
         #[test]
         fn unattached_serving_fails_closed_and_attachment_capacity_rolls_back() {
+            let env = racer_io::Env::host();
             let telemetry = Telemetry::default();
             let scope = scope();
             let mut serving = telemetry.serve("127.0.0.1:0".parse().unwrap(), &scope);
@@ -2004,7 +2029,7 @@ mod tests {
             let mut limits = crate::test_support::cluster::config(false).limits;
             limits.request_context_bytes = std::num::NonZeroUsize::new(1).unwrap();
             let admission = Rc::new(flow_control::Quotas::new(AdmissionPolicy::new(limits)));
-            let reactor = Rc::new(Reactor::new(admission.clone(), &crate::test_support::env()));
+            let reactor = Rc::new(Reactor::new(admission.clone(), &env));
             assert!(matches!(
                 telemetry.attach_io(reactor, admission.clone()),
                 Err(Error::Overloaded)
@@ -2014,7 +2039,8 @@ mod tests {
 
         #[test]
         fn raw_slow_clients_are_bounded_and_timeout_releases_capacity() {
-            let (_, reactor, io) = setup();
+            let env = racer_io::Env::host();
+            let (_, reactor, io) = setup(&env);
             let telemetry = Telemetry::default();
             let listener = TcpListener::bind("127.0.0.1:0").unwrap();
             let address = listener.local_addr().unwrap();
@@ -2056,10 +2082,11 @@ mod tests {
 
         #[test]
         fn attach_is_explicit_and_bind_failure_is_reported_on_first_poll() {
+            let env = racer_io::Env::host();
             let admission = Rc::new(flow_control::Quotas::new(AdmissionPolicy::new(
                 crate::test_support::cluster::config(false).limits,
             )));
-            let reactor = Rc::new(Reactor::new(admission.clone(), &crate::test_support::env()));
+            let reactor = Rc::new(Reactor::new(admission.clone(), &env));
             let telemetry = Telemetry::default();
             assert_eq!(admission.used(ResourceClass::ControlProgress), 0);
             telemetry
@@ -2088,11 +2115,12 @@ mod tests {
 
         #[test]
         fn profile_http_disabled_query_method_and_reserved_attachment() {
+            let env = racer_io::Env::host();
             for enabled in [false, true] {
                 let admission = Rc::new(flow_control::Quotas::new(AdmissionPolicy::new(
                     crate::test_support::cluster::config(false).limits,
                 )));
-                let reactor = Rc::new(Reactor::new(admission.clone(), &crate::test_support::env()));
+                let reactor = Rc::new(Reactor::new(admission.clone(), &env));
                 let telemetry = Telemetry {
                     profiling: enabled.then(|| crate::profiling::ProfilingController::new(true)),
                     ..Telemetry::default()

@@ -3114,6 +3114,7 @@ pub(super) mod tests {
     use racer_wire::control::CacheId;
     #[test]
     fn candidate_failure_routes_spend_initial_allowance_with_four_then_eight_link_ceiling() {
+        let env = racer_io::Env::host();
         struct Routes(RefCell<Vec<(u8, u32)>>);
         impl Routes {
             fn direct_hedge_available(
@@ -3144,12 +3145,13 @@ pub(super) mod tests {
                 Box::pin(async { Err(Error::Unavailable) })
             }
         }
-        let (membership, placement, context, scope, credentials) = fixture();
+        let (membership, placement, context, scope, credentials) = fixture(&env);
         let peers = Rc::new(Routes(RefCell::new(Vec::new())));
         let policy = CandidatePolicy::new(
             NodeId("outside".into()),
             placement,
             Requester::scripted(
+                env.ctx.clock.clone(),
                 peers.clone(),
                 Routes::direct_hedge_available,
                 Routes::request,
@@ -3235,7 +3237,9 @@ pub(super) mod tests {
             Box::pin(async move { Err(self.error) })
         }
     }
-    pub(crate) fn fixture() -> (
+    pub(crate) fn fixture(
+        env: &racer_io::Env,
+    ) -> (
         std::sync::Arc<crate::topology::Membership>,
         Rc<Placement>,
         OriginContext,
@@ -3271,7 +3275,7 @@ pub(super) mod tests {
             authorization: None,
         };
         let scope = RequestScope::on(
-            &crate::test_support::clock(),
+            &env.ctx.clock,
             RequestId([0; 16]),
             Instant::now() + std::time::Duration::from_secs(60),
         )
@@ -3283,7 +3287,7 @@ pub(super) mod tests {
             ClusterId("cluster".into()),
             NodeId("local".into()),
             std::sync::Arc::new(KeyEpochs::with_clock(crate::enrollment::wall_clock(
-                &crate::test_support::clock(),
+                &env.ctx.clock,
             ))),
         ));
         (
@@ -3291,11 +3295,7 @@ pub(super) mod tests {
             Rc::new(Placement::new(16)),
             context,
             scope,
-            Rc::new(CredentialCrypto::new(
-                keys,
-                admission,
-                crate::test_support::ctx().rng,
-            )),
+            Rc::new(CredentialCrypto::new(keys, admission, env.ctx.clone().rng)),
         )
     }
     fn spread_membership(count: usize) -> std::sync::Arc<crate::topology::Membership> {
@@ -3318,24 +3318,29 @@ pub(super) mod tests {
         )
     }
 
-    fn spread_policy(node: NodeId, selection: ReplicaSelection) -> CandidatePolicy {
+    fn spread_policy(
+        env: &racer_io::Env,
+        node: NodeId,
+        selection: ReplicaSelection,
+    ) -> CandidatePolicy {
         let peers = Rc::new(RecordedPeer {
             calls: RefCell::new(vec![]),
             error: Error::Unavailable,
         });
-        policy(node, peers).with_replica_selection(selection)
+        policy(env, node, peers).with_replica_selection(selection)
     }
 
     #[test]
     fn policy_visit_order_is_deterministic_and_neighbor_first_on_large_membership() {
+        let env = racer_io::Env::host();
         let membership = spread_membership(100);
         let placement = Placement::new(64);
         let mut neighbor_first = 0;
         let mut relayed_first_primary = 0;
         let mut relayed_first_spread = 0;
         for requester in membership.members().iter().take(20) {
-            let spread = spread_policy(requester.node.clone(), ReplicaSelection::Spread);
-            let primary = spread_policy(requester.node.clone(), ReplicaSelection::Primary);
+            let spread = spread_policy(&env, requester.node.clone(), ReplicaSelection::Spread);
+            let primary = spread_policy(&env, requester.node.clone(), ReplicaSelection::Primary);
             for page in 0..64 {
                 let candidates = placement.rank(membership.clone(), &object(), PageNumber(page));
                 if candidates.ordered.contains(&requester.node) {
@@ -3382,6 +3387,7 @@ pub(super) mod tests {
     #[test]
     fn spread_visits_an_older_later_owner_before_a_newer_owner() {
         use crate::topology::Membership;
+        let env = racer_io::Env::host();
         let all = spread_membership(12);
         let placement = Placement::new(64);
         let mut moved = 0;
@@ -3412,7 +3418,7 @@ pub(super) mod tests {
                 if candidates.ordered.contains(&requester.node) {
                     continue;
                 }
-                let spread = spread_policy(requester.node.clone(), ReplicaSelection::Spread);
+                let spread = spread_policy(&env, requester.node.clone(), ReplicaSelection::Spread);
                 let plain = spread
                     .visit_order(&ranked, &object(), PageNumber(page))
                     .ranks()
@@ -3430,7 +3436,8 @@ pub(super) mod tests {
                 } else {
                     assert_eq!(lineage, plain, "page {page}");
                 }
-                let primary = spread_policy(requester.node.clone(), ReplicaSelection::Primary);
+                let primary =
+                    spread_policy(&env, requester.node.clone(), ReplicaSelection::Primary);
                 assert_eq!(
                     primary
                         .visit_order(&candidates, &object(), PageNumber(page))
@@ -3445,13 +3452,14 @@ pub(super) mod tests {
 
     #[test]
     fn spread_splits_first_choice_evenly_across_neighbor_replicas() {
+        let env = racer_io::Env::host();
         // Four members form a complete graph, so every owner is a neighbor.
         let membership = membership();
         let placement = Placement::new(64);
         let mut counts = [0usize; 3];
         let mut total = 0;
         for requester in membership.members() {
-            let policy = spread_policy(requester.node.clone(), ReplicaSelection::Spread);
+            let policy = spread_policy(&env, requester.node.clone(), ReplicaSelection::Spread);
             for page in 0..3000 {
                 let candidates = placement.rank(membership.clone(), &object(), PageNumber(page));
                 if candidates.ordered.contains(&requester.node) {
@@ -3480,6 +3488,7 @@ pub(super) mod tests {
 
     #[test]
     fn spread_noncandidate_funds_out_of_order_owner_by_canonical_rank() {
+        let env = racer_io::Env::host();
         futures::executor::block_on(async {
             let membership = membership();
             let placement = Placement::new(8);
@@ -3496,7 +3505,7 @@ pub(super) mod tests {
                 .node
                 .clone();
             // Find a page whose spread order visits a non-primary owner first.
-            let probe = spread_policy(local.clone(), ReplicaSelection::Spread);
+            let probe = spread_policy(&env, local.clone(), ReplicaSelection::Spread);
             let (page, candidates, order) = (0..256)
                 .map(PageNumber)
                 .find_map(|page| {
@@ -3514,6 +3523,7 @@ pub(super) mod tests {
                     local.clone(),
                     Rc::new(Placement::new(8)),
                     Requester::scripted(
+                        env.ctx.clock.clone(),
                         peers.clone(),
                         FundedPeer::direct_hedge_available,
                         FundedPeer::request,
@@ -3658,6 +3668,7 @@ pub(super) mod tests {
     #[test]
     fn shed_reader_asks_the_page_helper_once_then_the_other_owners() {
         use crate::test_support::security::{network, node};
+        let env = racer_io::Env::host();
         futures::executor::block_on(async {
             // More than 64 members: several mesh columns, so readers outside
             // the owners' columns have a helper.
@@ -3682,7 +3693,7 @@ pub(super) mod tests {
             );
             let placement = Placement::new(8);
             let local = 0;
-            let probe = spread_policy(nodes[local].clone(), ReplicaSelection::Primary);
+            let probe = spread_policy(&env, nodes[local].clone(), ReplicaSelection::Primary);
             let (page, candidates, helper) = (0..256)
                 .map(PageNumber)
                 .find_map(|page| {
@@ -3698,7 +3709,7 @@ pub(super) mod tests {
             for transport in [false, true] {
                 let peers = Rc::new(ShedPeer {
                     nodes: nodes.clone(),
-                    signing: network(count)
+                    signing: network(&env, count)
                         .into_iter()
                         .map(crate::peer::forwarding::Forwarding::new)
                         .collect(),
@@ -3711,6 +3722,7 @@ pub(super) mod tests {
                     nodes[local].clone(),
                     Rc::new(Placement::new(8)),
                     Requester::scripted(
+                        env.ctx.clock.clone(),
                         peers.clone(),
                         ShedPeer::direct_hedge_available,
                         ShedPeer::request,
@@ -3828,10 +3840,11 @@ pub(super) mod tests {
 
     #[test]
     fn only_candidates_mint_authority_after_ordered_copy_probes() {
-        ordered_predecessor_probes(4);
+        let env = racer_io::Env::host();
+        ordered_predecessor_probes(&env, 4);
     }
-    fn ordered_predecessor_probes(attempts: u32) {
-        let (membership, placement, context, scope, credentials) = fixture();
+    fn ordered_predecessor_probes(env: &racer_io::Env, attempts: u32) {
+        let (membership, placement, context, scope, credentials) = fixture(env);
         let ordered = placement
             .rank(membership.clone(), &context.object, PageNumber(0))
             .ordered;
@@ -3843,6 +3856,7 @@ pub(super) mod tests {
             ordered[2].clone(),
             placement,
             Requester::scripted(
+                env.ctx.clock.clone(),
                 peer.clone(),
                 ProbePeer::direct_hedge_available,
                 ProbePeer::request,
@@ -3885,7 +3899,8 @@ pub(super) mod tests {
     }
     #[test]
     fn noncandidate_never_gets_origin_and_auth_failure_is_not_miss_evidence() {
-        let (membership, placement, context, scope, credentials) = fixture();
+        let env = racer_io::Env::host();
+        let (membership, placement, context, scope, credentials) = fixture(&env);
         let peer = Rc::new(ProbePeer {
             calls: RefCell::new(vec![]),
             error: Error::Unauthorized,
@@ -3897,6 +3912,7 @@ pub(super) mod tests {
             ordered[1].clone(),
             placement.clone(),
             Requester::scripted(
+                env.ctx.clock.clone(),
                 peer.clone(),
                 ProbePeer::direct_hedge_available,
                 ProbePeer::request,
@@ -3939,6 +3955,7 @@ pub(super) mod tests {
             NodeId("outside".into()),
             placement,
             Requester::scripted(
+                env.ctx.clock.clone(),
                 peer.clone(),
                 ProbePeer::direct_hedge_available,
                 ProbePeer::request,
@@ -3971,6 +3988,7 @@ pub(super) mod tests {
     /// the walk to the next owner instead of ending it as `Internal`.
     #[test]
     fn peer_exchange_failure_tries_next_owner() {
+        let env = racer_io::Env::host();
         for error in [
             Error::Replay,
             Error::StaleFlight,
@@ -3981,7 +3999,7 @@ pub(super) mod tests {
             Error::MissingKey,
             Error::BadGateway,
         ] {
-            let (membership, placement, context, scope, credentials) = fixture();
+            let (membership, placement, context, scope, credentials) = fixture(&env);
             let peer = Rc::new(ProbePeer {
                 calls: RefCell::new(vec![]),
                 error,
@@ -3990,6 +4008,7 @@ pub(super) mod tests {
                 NodeId("outside".into()),
                 placement,
                 Requester::scripted(
+                    env.ctx.clock.clone(),
                     peer.clone(),
                     ProbePeer::direct_hedge_available,
                     ProbePeer::request,
@@ -4021,7 +4040,7 @@ pub(super) mod tests {
             );
         }
         // The caller's own scope ending stays terminal.
-        let (membership, placement, context, scope, credentials) = fixture();
+        let (membership, placement, context, scope, credentials) = fixture(&env);
         let peer = Rc::new(ProbePeer {
             calls: RefCell::new(vec![]),
             error: Error::Cancelled,
@@ -4030,6 +4049,7 @@ pub(super) mod tests {
             NodeId("outside".into()),
             placement,
             Requester::scripted(
+                env.ctx.clock.clone(),
                 peer.clone(),
                 ProbePeer::direct_hedge_available,
                 ProbePeer::request,
@@ -4065,7 +4085,8 @@ pub(super) mod tests {
     /// not count it against the destination; a transport failure after handing it over is.
     #[test]
     fn exchange_reports_whether_the_request_was_sent() {
-        let (membership, placement, context, scope, credentials) = fixture();
+        let env = racer_io::Env::host();
+        let (membership, placement, context, scope, credentials) = fixture(&env);
         let peer = Rc::new(ProbePeer {
             calls: RefCell::new(vec![]),
             error: Error::Unavailable,
@@ -4074,6 +4095,7 @@ pub(super) mod tests {
             NodeId("outside".into()),
             placement,
             Requester::scripted(
+                env.ctx.clock.clone(),
                 peer.clone(),
                 ProbePeer::direct_hedge_available,
                 ProbePeer::request,
@@ -4259,7 +4281,7 @@ pub(super) mod tests {
             .unwrap(),
         )
     }
-    fn policy(node: NodeId, peers: Rc<RecordedPeer>) -> CandidatePolicy {
+    fn policy(env: &racer_io::Env, node: NodeId, peers: Rc<RecordedPeer>) -> CandidatePolicy {
         use racer_crypto::identity::KeyEpochs;
         use racer_crypto::identity::Keyring;
         let config = crate::test_support::cluster::config(false);
@@ -4277,6 +4299,7 @@ pub(super) mod tests {
             node,
             Rc::new(Placement::new(8)),
             Requester::scripted(
+                env.ctx.clock.clone(),
                 peers,
                 RecordedPeer::direct_hedge_available,
                 RecordedPeer::request,
@@ -4305,6 +4328,7 @@ pub(super) mod tests {
         use crate::model::{PageId, VersionMetadata, WorkerId};
         use crate::store::catalog::{Index, IndexSnapshot, IndexedPage, RecordLocation};
         use crate::topology::tests::fixtures;
+        let env = racer_io::Env::host();
         let members = fixtures::membership(1000);
         let page = PageId {
             version: ObjectVersion {
@@ -4321,11 +4345,11 @@ pub(super) mod tests {
             calls: RefCell::new(vec![]),
             error: Error::Unavailable,
         });
-        let mut policy = policy(owner.clone(), peers.clone());
+        let mut policy = policy(&env, owner.clone(), peers.clone());
         let index = Index::new(
             WorkerId(0),
             8,
-            crate::test_support::availability(),
+            crate::test_support::availability(&env),
             racer_io::Clock::host(),
         );
         index.set_page_capacity(1).unwrap();
@@ -4400,6 +4424,7 @@ pub(super) mod tests {
 
     #[test]
     fn ownership_scoped_refresh_warms_current_only_and_honors_cancellation() {
+        let env = racer_io::Env::host();
         let members = membership();
         let page = crate::model::PageId {
             version: ObjectVersion {
@@ -4416,7 +4441,7 @@ pub(super) mod tests {
             calls: RefCell::new(vec![]),
             error: Error::Unavailable,
         });
-        let mut policy = policy(owner, peers);
+        let mut policy = policy(&env, owner, peers);
         policy.published = crate::test_support::published_membership(members);
         let cancelled = scope();
         cancelled.cancel().unwrap();
@@ -4440,16 +4465,14 @@ pub(super) mod tests {
         use crate::peer::transport::Transfers;
         use crate::store::catalog::Index;
         use racer_crypto::identity::{Certificates, KeyEpochs, Keyring};
+        let env = racer_io::Env::host();
 
         for _ in 0..3 {
             let config = crate::test_support::cluster::config(false);
             let admission = Rc::new(flow_control::Quotas::new(
                 crate::admission::AdmissionPolicy::new(config.limits.clone()),
             ));
-            let reactor = Rc::new(crate::runtime::Reactor::new(
-                admission.clone(),
-                &crate::test_support::env(),
-            ));
+            let reactor = Rc::new(crate::runtime::Reactor::new(admission.clone(), &env));
             let keys = Rc::new(Keyring::new(
                 config.cluster.clone(),
                 config.node.clone(),
@@ -4534,7 +4557,7 @@ pub(super) mod tests {
             );
             let requester = Rc::new(Requester::new(
                 Rc::new(crate::topology::Paths::new(
-                    Rc::new(crate::topology::LinkHealth::default()),
+                    Rc::new(crate::topology::LinkHealth::on(env.ctx.clock.clone())),
                     1,
                 )),
                 Rc::new(Forwarding::new(signatures)),
@@ -4601,10 +4624,12 @@ pub(super) mod tests {
     }
     #[test]
     fn backup_probes_only_predecessors_in_order_before_scoped_origin_authority() {
-        ordered_predecessor_probes(3);
+        let env = racer_io::Env::host();
+        ordered_predecessor_probes(&env, 3);
     }
     #[test]
     fn noncandidate_acquires_from_candidates_and_never_mints_origin_authority() {
+        let env = racer_io::Env::host();
         futures::executor::block_on(async {
             let membership = membership();
             let candidates = Placement::new(8).rank(membership.clone(), &object(), PageNumber(0));
@@ -4619,7 +4644,7 @@ pub(super) mod tests {
                 calls: RefCell::new(vec![]),
                 error: Error::Unavailable,
             });
-            let policy = policy(local, peers.clone());
+            let policy = policy(&env, local, peers.clone());
             let context = OriginContext {
                 object: object(),
                 metadata: None,
@@ -4644,13 +4669,14 @@ pub(super) mod tests {
     }
     #[test]
     fn peer_auth_failure_is_not_predecessor_miss_evidence() {
+        let env = racer_io::Env::host();
         futures::executor::block_on(async {
             let candidates = Placement::new(8).rank(membership(), &object(), PageNumber(0));
             let peers = Rc::new(RecordedPeer {
                 calls: RefCell::new(vec![]),
                 error: Error::Unauthorized,
             });
-            let policy = policy(candidates.ordered[1].clone(), peers.clone());
+            let policy = policy(&env, candidates.ordered[1].clone(), peers.clone());
             let context = OriginContext {
                 object: object(),
                 metadata: None,
@@ -4681,13 +4707,14 @@ pub(super) mod tests {
     }
     #[test]
     fn origin_version_miss_cannot_claim_absence_when_predecessor_was_unreachable() {
+        let env = racer_io::Env::host();
         let membership = membership();
         let ranked = Placement::new(8).rank(membership.clone(), &object(), PageNumber(0));
         let peers = Rc::new(RecordedPeer {
             calls: RefCell::new(vec![]),
             error: Error::Unavailable,
         });
-        let policy = policy(ranked.ordered[1].clone(), peers);
+        let policy = policy(&env, ranked.ordered[1].clone(), peers);
         let mut authority = OriginAuthority {
             diagnostic: CandidateTrail::default(),
             membership,
@@ -4743,21 +4770,19 @@ pub(super) mod tests {
         }
         use crate::model::RequestId;
         use crate::read::tests::page;
-        use crate::rt::environment::SimulationClock;
-        use crate::rt::environment::now;
         use crate::runtime::RequestScope;
         use std::cell::Cell;
         use std::future::Future;
         use std::rc::Rc;
-        fn scope() -> RequestScope {
+        fn scope(env: &racer_io::Env) -> RequestScope {
             RequestScope::on(
-                &crate::test_support::clock(),
+                &env.ctx.clock,
                 RequestId([1; 16]),
-                now() + Duration::from_secs(10),
+                env.ctx.now() + Duration::from_secs(10),
             )
             .unwrap()
         }
-        fn controller(slots: usize, bytes: usize) -> Arc<Hedges> {
+        fn controller(env: &racer_io::Env, slots: usize, bytes: usize) -> Arc<Hedges> {
             Hedges::new(
                 HedgeConfig {
                     slots,
@@ -4765,7 +4790,7 @@ pub(super) mod tests {
                     delay: Duration::from_millis(10),
                 },
                 Metrics::default(),
-                crate::test_support::clock(),
+                env.ctx.clock.clone(),
             )
             .unwrap()
         }
@@ -4773,13 +4798,13 @@ pub(super) mod tests {
         fn malformed_speculative_http_and_wire_heads_do_not_veto_valid_primary() {
             for kind in ["invalid", "large", "wire"] {
                 for same_poll in [false, true] {
-                    let clock = SimulationClock::new(933);
-                    let _env = clock.environment(0).enter();
-                    let owner = controller(1, DUPLICATE_BYTES);
+                    let clock = racer_io::SimClock::new(933);
+                    let env = racer_io::Env::new(racer_io::Driver::Uring, clock.ctx(0));
+                    let owner = controller(&env, 1, DUPLICATE_BYTES);
                     let permit = owner.acquire().unwrap();
-                    let a = scope();
-                    let b = scope();
-                    let parent = scope();
+                    let a = scope(&env);
+                    let b = scope(&env);
+                    let parent = scope(&env);
                     let ready = Cell::new(false);
                     let malformed_ready = Cell::new(false);
                     let primary = std::future::poll_fn(|_| {
@@ -4850,11 +4875,12 @@ pub(super) mod tests {
         }
         #[test]
         fn fast_primary_never_launches_secondary_or_records_duplicate_bytes() {
-            let owner = controller(1, DUPLICATE_BYTES);
+            let env = racer_io::Env::host();
+            let owner = controller(&env, 1, DUPLICATE_BYTES);
             let permit = owner.acquire().unwrap();
-            let a = scope();
-            let b = scope();
-            let parent = scope();
+            let a = scope(&env);
+            let b = scope(&env);
+            let parent = scope(&env);
             let result = futures::executor::block_on(race(
                 async { Ok(page(1)) },
                 async {
@@ -4873,11 +4899,12 @@ pub(super) mod tests {
         }
         #[test]
         fn canceled_parent_never_polls_unlaunched_attempts() {
-            let owner = controller(1, DUPLICATE_BYTES);
+            let env = racer_io::Env::host();
+            let owner = controller(&env, 1, DUPLICATE_BYTES);
             let permit = owner.acquire().unwrap();
-            let a = scope();
-            let b = scope();
-            let parent = scope();
+            let a = scope(&env);
+            let b = scope(&env);
+            let parent = scope(&env);
             parent.cancel().unwrap();
             let never = || async {
                 panic!("canceled parent submitted work");
@@ -4891,9 +4918,9 @@ pub(super) mod tests {
         }
         #[test]
         fn worker_owned_race_keeps_permit_after_caller_detaches_until_loser_fence() {
-            let clock = SimulationClock::new(906);
-            let _env = clock.environment(0).enter();
-            let owner = controller(1, DUPLICATE_BYTES);
+            let clock = racer_io::SimClock::new(906);
+            let env = racer_io::Env::new(racer_io::Driver::Uring, clock.ctx(0));
+            let owner = controller(&env, 1, DUPLICATE_BYTES);
             let permit = owner.acquire().unwrap();
             let queue = Rc::new(crate::drivers::DriverQueue::new(1024));
             let _guard = queue.enter();
@@ -4905,9 +4932,9 @@ pub(super) mod tests {
             crate::drivers::reserve()
                 .unwrap()
                 .submit_detached(Box::pin(async move {
-                    let a = scope();
-                    let b = scope();
-                    let parent = scope();
+                    let a = scope(&env);
+                    let b = scope(&env);
+                    let parent = scope(&env);
                     let primary = std::future::poll_fn(|cx| {
                         if primary_fence.get() {
                             Poll::Ready(Err(Error::Cancelled))
@@ -4938,11 +4965,11 @@ pub(super) mod tests {
         }
         #[test]
         fn shared_slots_bytes_and_alarm_wake_are_bounded() {
-            let clock = SimulationClock::new(901);
-            let sim_env = clock.environment(0);
-            let _env = sim_env.enter();
-            let sim_ctx = sim_env.worker_ctx();
-            let owner = controller(2, DUPLICATE_BYTES);
+            let clock = racer_io::SimClock::new(901);
+            let sim_env = clock.ctx(0);
+            let env = racer_io::Env::new(racer_io::Driver::Uring, sim_env.clone());
+            let sim_ctx = sim_env.clone();
+            let owner = controller(&env, 2, DUPLICATE_BYTES);
             let permit = owner.acquire().unwrap();
             assert!(matches!(owner.clone().acquire(), Err(Error::Overloaded)));
             let wake = std::sync::Arc::new(crate::test_support::WakeCounter::default());
@@ -4969,13 +4996,13 @@ pub(super) mod tests {
         }
         #[test]
         fn validated_secondary_waits_for_primary_fence_and_keeps_slot() {
-            let clock = SimulationClock::new(902);
-            let _env = clock.environment(0).enter();
-            let owner = controller(1, DUPLICATE_BYTES);
+            let clock = racer_io::SimClock::new(902);
+            let env = racer_io::Env::new(racer_io::Driver::Uring, clock.ctx(0));
+            let owner = controller(&env, 1, DUPLICATE_BYTES);
             let permit = owner.acquire().unwrap();
-            let a = scope();
-            let b = scope();
-            let parent = scope();
+            let a = scope(&env);
+            let b = scope(&env);
+            let parent = scope(&env);
             let fence = Rc::new(Cell::new(false));
             let primary = std::future::poll_fn(|_| {
                 if fence.get() {
@@ -5009,13 +5036,13 @@ pub(super) mod tests {
         }
         #[test]
         fn invalid_fast_copy_does_not_displace_valid_slow_primary() {
-            let clock = SimulationClock::new(903);
-            let _env = clock.environment(0).enter();
-            let owner = controller(1, DUPLICATE_BYTES);
+            let clock = racer_io::SimClock::new(903);
+            let env = racer_io::Env::new(racer_io::Driver::Uring, clock.ctx(0));
+            let owner = controller(&env, 1, DUPLICATE_BYTES);
             let permit = owner.acquire().unwrap();
-            let a = scope();
-            let b = scope();
-            let parent = scope();
+            let a = scope(&env);
+            let b = scope(&env);
+            let parent = scope(&env);
             let ready = Cell::new(false);
             let primary = std::future::poll_fn(|_| {
                 if ready.get() {
@@ -5045,13 +5072,13 @@ pub(super) mod tests {
         }
         #[test]
         fn parent_cancellation_drains_both_and_never_returns_a_winner() {
-            let clock = SimulationClock::new(904);
-            let _env = clock.environment(0).enter();
-            let owner = controller(1, DUPLICATE_BYTES);
+            let clock = racer_io::SimClock::new(904);
+            let env = racer_io::Env::new(racer_io::Driver::Uring, clock.ctx(0));
+            let owner = controller(&env, 1, DUPLICATE_BYTES);
             let permit = owner.acquire().unwrap();
-            let a = scope();
-            let b = scope();
-            let parent = scope();
+            let a = scope(&env);
+            let b = scope(&env);
+            let parent = scope(&env);
             let fence = Cell::new(false);
             let child = || {
                 std::future::poll_fn(|_| {

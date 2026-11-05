@@ -678,9 +678,9 @@ fn check_pending_key(pending: &PendingIdentity, csr: &[u8]) -> Result<(), Error>
 mod tests {
     //! Real enrollment state transitions over deterministic reactor completions.
     use super::*;
-    use crate::rt::reactor::simulation::{Fault, Simulation};
     use racer_io::cancel::Cancellation;
     use racer_io::scoped::Reactor;
+    use racer_io::sim::{Fault, SimOs as Simulation};
     use std::{
         cell::Cell,
         path::Path,
@@ -937,9 +937,9 @@ mod tests {
     const NODE: &str = "22222222-2222-4222-8222-222222222222";
 
     /// Construct one namespace owner on the active simulation backend.
-    fn fixture() -> (Rc<Files>, Enrollment<Rc<Files>>, Request) {
+    fn fixture(env: &racer_io::Env) -> (Rc<Files>, Enrollment<Rc<Files>>, Request) {
         let files = Rc::new(Files {
-            reactor: Reactor::new(64, &crate::test_support::env()),
+            reactor: Reactor::new(64, env),
             next: Cell::new(0),
         });
         let enrollment = Enrollment::new(
@@ -976,6 +976,7 @@ mod tests {
 
     /// Issue a bounded client certificate for the exact CSR, with optional policy mutations.
     fn issue(
+        env: &racer_io::Env,
         request: &EnrollmentRequest,
         ca: &rcgen::Certificate,
         key: &rcgen::KeyPair,
@@ -983,7 +984,7 @@ mod tests {
     ) -> EnrollmentResponse {
         let der = rustls::pki_types::CertificateSigningRequestDer::from(request.csr_der.clone());
         let mut csr = rcgen::CertificateSigningRequestParams::from_der(&der).unwrap();
-        let now = crate::test_support::clock().wall_now();
+        let now = env.ctx.clock.clone().wall_now();
         csr.params.not_before = (now - Duration::from_secs(1)).into();
         csr.params.not_after = (now + Duration::from_secs(3600)).into();
         csr.params.subject_alt_names = vec![rcgen::SanType::URI(
@@ -1008,8 +1009,8 @@ mod tests {
     #[test]
     fn durable_enrollment_retries_rotation_and_recovery() {
         let sim = Simulation::new();
-        let _environment = sim.enter();
-        let (files, e, scope) = fixture();
+        let env = racer_io::Env::sim(&sim, racer_io::WorkerCtx::host());
+        let (files, e, scope) = fixture(&env);
         assert!(drive(&files, e.load_identity(&scope)).unwrap().is_none());
         let request = drive(
             &files,
@@ -1058,7 +1059,7 @@ mod tests {
         let pending = sim.read_file(Path::new("/private/pending.json")).unwrap();
         let identity = drive(
             &files,
-            e.accept_response(issue(&request, &ca, &key, |_| {}), &scope),
+            e.accept_response(issue(&env, &request, &ca, &key, |_| {}), &scope),
         )
         .unwrap();
         assert!(identity.valid_at(racer_io::Clock::host().wall_now()));
@@ -1098,8 +1099,8 @@ mod tests {
     #[test]
     fn late_private_key_base64_errors_preserve_identity_records() {
         let sim = Simulation::new();
-        let _environment = sim.enter();
-        let (files, e, scope) = fixture();
+        let env = racer_io::Env::sim(&sim, racer_io::WorkerCtx::host());
+        let (files, e, scope) = fixture(&env);
         let request = drive(
             &files,
             e.prepare(vec![], NonZeroU32::new(4).unwrap(), &scope),
@@ -1107,7 +1108,7 @@ mod tests {
         .unwrap();
         let (ca, key) = identity::test_util::ca();
         e.set_peer_trust_roots(vec![ca.der().to_vec()]).unwrap();
-        let response = issue(&request, &ca, &key, |_| {});
+        let response = issue(&env, &request, &ca, &key, |_| {});
         let original = sim.read_file(Path::new("/private/pending.json")).unwrap();
         let pending = decode_pending(&original).unwrap();
         let decoded = decode_private_key(&pending.private_key).unwrap();
@@ -1179,8 +1180,8 @@ mod tests {
     #[test]
     fn certificate_correlation_key_pairing_and_pending_corruption_fail_closed() {
         let sim = Simulation::new();
-        let _environment = sim.enter();
-        let (files, e, scope) = fixture();
+        let env = racer_io::Env::sim(&sim, racer_io::WorkerCtx::host());
+        let (files, e, scope) = fixture(&env);
         let request = drive(
             &files,
             e.prepare(vec![], NonZeroU32::new(4).unwrap(), &scope),
@@ -1189,7 +1190,7 @@ mod tests {
         let (ca, key) = identity::test_util::ca();
         e.set_peer_trust_roots(vec![ca.der().to_vec()]).unwrap();
         for case in ["san", "lifetime", "usage", "id", "key", "cluster", "trust"] {
-            let mut response = issue(&request, &ca, &key, |params| match case {
+            let mut response = issue(&env, &request, &ca, &key, |params| match case {
                 "san" => params
                     .subject_alt_names
                     .push(rcgen::SanType::DnsName("extra.example".try_into().unwrap())),
@@ -1212,11 +1213,12 @@ mod tests {
                 let other = e
                     .request(&e.generate().unwrap(), vec![], NonZeroU32::new(4).unwrap())
                     .unwrap();
-                response.certificate_chain = issue(&other, &ca, &key, |_| {}).certificate_chain;
+                response.certificate_chain =
+                    issue(&env, &other, &ca, &key, |_| {}).certificate_chain;
             }
             if case == "trust" {
                 let (rogue, rogue_key) = identity::test_util::ca();
-                response = issue(&request, &rogue, &rogue_key, |_| {});
+                response = issue(&env, &request, &rogue, &rogue_key, |_| {});
             }
             assert!(
                 matches!(drive(&files, e.accept_response(response, &scope)), Err(error) if error == Error::Unauthorized.into()),
@@ -1238,8 +1240,8 @@ mod tests {
     #[test]
     fn rejected_renewal_preserves_prior_identity_and_pending_request() {
         let sim = Simulation::new();
-        let _environment = sim.enter();
-        let (files, e, scope) = fixture();
+        let env = racer_io::Env::sim(&sim, racer_io::WorkerCtx::host());
+        let (files, e, scope) = fixture(&env);
         let (ca, key) = identity::test_util::ca();
         let roots = vec![ca.der().to_vec()];
         e.set_peer_trust_roots(roots.clone()).unwrap();
@@ -1250,7 +1252,7 @@ mod tests {
         .unwrap();
         let prior = drive(
             &files,
-            e.accept_response(issue(&first, &ca, &key, |_| {}), &scope),
+            e.accept_response(issue(&env, &first, &ca, &key, |_| {}), &scope),
         )
         .unwrap();
         let request = drive(
@@ -1261,7 +1263,7 @@ mod tests {
         let committed = sim.read_file(Path::new("/private/identity.json")).unwrap();
         let pending = sim.read_file(Path::new("/private/pending.json")).unwrap();
         for case in ["key-cert-sign", "ca", "missing-usage", "future", "expired"] {
-            let response = issue(&request, &ca, &key, |params| match case {
+            let response = issue(&env, &request, &ca, &key, |params| match case {
                 "key-cert-sign" => params.key_usages.push(rcgen::KeyUsagePurpose::KeyCertSign),
                 "ca" => params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained),
                 "missing-usage" => params.key_usages.clear(),
@@ -1324,7 +1326,7 @@ mod tests {
         }
         let accepted = drive(
             &files,
-            e.accept_response(issue(&request, &ca, &key, |_| {}), &scope),
+            e.accept_response(issue(&env, &request, &ca, &key, |_| {}), &scope),
         )
         .unwrap();
         assert!(
@@ -1339,8 +1341,8 @@ mod tests {
     #[test]
     fn invalid_root_snapshots_preserve_last_good_identity_and_trust() {
         let sim = Simulation::new();
-        let _environment = sim.enter();
-        let (files, e, scope) = fixture();
+        let env = racer_io::Env::sim(&sim, racer_io::WorkerCtx::host());
+        let (files, e, scope) = fixture(&env);
         let (ca, key) = identity::test_util::ca();
         let good = vec![ca.der().to_vec()];
         e.set_peer_trust_roots(good.clone()).unwrap();
@@ -1351,7 +1353,7 @@ mod tests {
         .unwrap();
         let prior = drive(
             &files,
-            e.accept_response(issue(&first, &ca, &key, |_| {}), &scope),
+            e.accept_response(issue(&env, &first, &ca, &key, |_| {}), &scope),
         )
         .unwrap();
         let request = drive(
@@ -1359,7 +1361,7 @@ mod tests {
             e.prepare(vec![], NonZeroU32::new(4).unwrap(), &scope),
         )
         .unwrap();
-        let response = issue(&request, &ca, &key, |_| {});
+        let response = issue(&env, &request, &ca, &key, |_| {});
         let committed = sim.read_file(Path::new("/private/identity.json")).unwrap();
         let pending = sim.read_file(Path::new("/private/pending.json")).unwrap();
         for case in [
@@ -1436,12 +1438,11 @@ mod tests {
     #[test]
     fn root_expiring_after_installation_blocks_persistence_and_recovery() {
         let sim = Simulation::new();
-        let _environment = sim.enter();
-        let clock = crate::rt::environment::SimulationClock::new(105);
-        let sim_env = clock.environment(0);
-        let _time = sim_env.enter();
-        let sim_ctx = sim_env.worker_ctx();
-        let (files, e, scope) = fixture();
+        let clock = racer_io::SimClock::new(105);
+        let sim_env = clock.ctx(0);
+        let env = racer_io::Env::sim(&sim, sim_env.clone());
+        let sim_ctx = sim_env.clone();
+        let (files, e, scope) = fixture(&env);
         let (ca, key) = identity::test_util::ca();
         let good = vec![ca.der().to_vec()];
         e.set_peer_trust_roots(good.clone()).unwrap();
@@ -1452,7 +1453,7 @@ mod tests {
         .unwrap();
         let prior = drive(
             &files,
-            e.accept_response(issue(&first, &ca, &key, |_| {}), &scope),
+            e.accept_response(issue(&env, &first, &ca, &key, |_| {}), &scope),
         )
         .unwrap();
         let request = drive(
@@ -1472,7 +1473,7 @@ mod tests {
             .unwrap();
         clock.advance(Duration::from_secs(120));
         assert!(
-            matches!(drive(&files, e.accept_response(issue(&request, &ca, &key, |_| {}), &scope)), Err(error) if error == Error::Unauthorized.into())
+            matches!(drive(&files, e.accept_response(issue(&env, &request, &ca, &key, |_| {}), &scope)), Err(error) if error == Error::Unauthorized.into())
         );
         assert!(drive(&files, e.load_identity(&scope)).unwrap().is_none());
         assert_eq!(
@@ -1500,8 +1501,8 @@ mod tests {
     fn persistence_faults_abandonment_and_reconciliation_preserve_errors() {
         for case in ["write", "rename", "sync", "abandon", "cancel-rename"] {
             let sim = Simulation::new();
-            let _environment = sim.enter();
-            let (files, e, scope) = fixture();
+            let env = racer_io::Env::sim(&sim, racer_io::WorkerCtx::host());
+            let (files, e, scope) = fixture(&env);
             let request = drive(
                 &files,
                 e.prepare(vec![], NonZeroU32::new(4).unwrap(), &scope),
@@ -1514,7 +1515,7 @@ mod tests {
                 "rename" => sim.inject("rename", Fault::Errno(5)).unwrap(),
                 _ => sim.inject("rename", Fault::HoldCompletion(20)).unwrap(),
             }
-            let mut accept = e.accept_response(issue(&request, &ca, &key, |_| {}), &scope);
+            let mut accept = e.accept_response(issue(&env, &request, &ca, &key, |_| {}), &scope);
             if matches!(case, "sync" | "abandon" | "cancel-rename") {
                 let mut published = false;
                 for _ in 0..100 {
@@ -1581,8 +1582,8 @@ mod tests {
     #[test]
     fn attempts_reject_overlap_and_fence_abandoned_work_before_fresh_scope() {
         let sim = Simulation::new();
-        let _environment = sim.enter();
-        let (files, e, scope) = fixture();
+        let env = racer_io::Env::sim(&sim, racer_io::WorkerCtx::host());
+        let (files, e, scope) = fixture(&env);
         sim.inject("open", Fault::Delay(10)).unwrap();
         let mut first = e.prepare(vec![], NonZeroU32::new(4).unwrap(), &scope);
         assert!(
@@ -1618,12 +1619,11 @@ mod tests {
     #[test]
     fn renewal_and_expired_recovery_follow_scoped_time() {
         let sim = Simulation::new();
-        let _environment = sim.enter();
-        let clock = crate::rt::environment::SimulationClock::new(99);
-        let sim_env = clock.environment(0);
-        let _time = sim_env.enter();
-        let sim_ctx = sim_env.worker_ctx();
-        let (files, e, scope) = fixture();
+        let clock = racer_io::SimClock::new(99);
+        let sim_env = clock.ctx(0);
+        let env = racer_io::Env::sim(&sim, sim_env.clone());
+        let sim_ctx = sim_env.clone();
+        let (files, e, scope) = fixture(&env);
         let request = drive(
             &files,
             e.prepare(vec![], NonZeroU32::new(4).unwrap(), &scope),
@@ -1633,7 +1633,7 @@ mod tests {
         e.set_peer_trust_roots(vec![ca.der().to_vec()]).unwrap();
         let identity = drive(
             &files,
-            e.accept_response(issue(&request, &ca, &key, |_| {}), &scope),
+            e.accept_response(issue(&env, &request, &ca, &key, |_| {}), &scope),
         )
         .unwrap();
         let start = UNIX_EPOCH + Duration::from_secs(identity.not_before);
@@ -1654,8 +1654,8 @@ mod tests {
     #[test]
     fn secure_helpers_reject_private_links_modes_and_oversized_reads() {
         let sim = Simulation::new();
-        let _environment = sim.enter();
-        let (files, e, scope) = fixture();
+        let env = racer_io::Env::sim(&sim, racer_io::WorkerCtx::host());
+        let (files, e, scope) = fixture(&env);
         drive(
             &files,
             e.prepare(vec![], NonZeroU32::new(4).unwrap(), &scope),

@@ -29,8 +29,8 @@ impl Resources {
 }
 impl Health {
     #[cfg(test)]
-    pub fn state(&self) -> Result<State> {
-        self.state_at(crate::test_support::clock().now())
+    pub fn state(&self, env: &racer_io::Env) -> Result<State> {
+        self.state_at(env.ctx.now())
     }
     pub fn state_at(&self, now: Instant) -> Result<State> {
         self.0
@@ -41,15 +41,15 @@ impl Health {
         self.0.observe(resources).map_err(|_| Error::Unavailable)
     }
     #[cfg(test)]
-    pub fn ready(&self) -> bool {
-        self.ready_at(crate::test_support::clock().now())
+    pub fn ready(&self, env: &racer_io::Env) -> bool {
+        self.ready_at(env.ctx.now())
     }
     pub fn ready_at(&self, now: Instant) -> bool {
         self.state_at(now).is_ok_and(|state| state == State::Ready)
     }
     #[cfg(test)]
-    pub fn live(&self) -> bool {
-        self.live_at(crate::test_support::clock().now())
+    pub fn live(&self, env: &racer_io::Env) -> bool {
+        self.live_at(env.ctx.now())
     }
     /// Starting, degraded, and draining remain live; a response establishes progress.
     pub fn live_at(&self, now: Instant) -> bool {
@@ -57,8 +57,8 @@ impl Health {
             .is_ok_and(|state| state != State::Stopped)
     }
     #[cfg(test)]
-    pub fn transition(&self, state: State) -> Result<()> {
-        self.transition_at(state, crate::test_support::clock().now())
+    pub fn transition(&self, env: &racer_io::Env, state: State) -> Result<()> {
+        self.transition_at(state, env.ctx.now())
     }
     pub fn transition_at(&self, state: State, now: Instant) -> Result<()> {
         self.0
@@ -87,6 +87,7 @@ mod tests {
         use std::time::Duration;
         #[test]
         fn lifecycle_probes_keep_resource_policy_bodies_and_irreversible_drain() {
+            let env = racer_io::Env::host();
             let telemetry = Telemetry::default();
             let now = racer_io::Clock::host().now();
             let usable = Resources {
@@ -108,11 +109,11 @@ mod tests {
             probe("/healthz", true, "ok\n", true);
             probe("/readyz", true, "not ready\n", false);
             assert_eq!(
-                telemetry.health.transition(State::Ready),
+                telemetry.health.transition(&env, State::Ready),
                 Err(Error::Unavailable)
             );
             telemetry.health.observe(usable).unwrap();
-            telemetry.health.transition(State::Ready).unwrap();
+            telemetry.health.transition(&env, State::Ready).unwrap();
             probe("/readyz", true, "ready\n", true);
             probe("/readyz", false, "not ready\n", false);
             telemetry
@@ -122,21 +123,21 @@ mod tests {
                     ..usable
                 })
                 .unwrap();
-            assert_eq!(telemetry.health.state(), Ok(State::Degraded));
+            assert_eq!(telemetry.health.state(&env), Ok(State::Degraded));
             probe("/healthz", true, "ok\n", true);
             probe("/readyz", true, "not ready\n", false);
             telemetry.health.observe(usable).unwrap();
-            assert_eq!(telemetry.health.state(), Ok(State::Ready));
-            telemetry.health.transition(State::Draining).unwrap();
+            assert_eq!(telemetry.health.state(&env), Ok(State::Ready));
+            telemetry.health.transition(&env, State::Draining).unwrap();
             assert_eq!(
-                telemetry.health.transition(State::Ready),
+                telemetry.health.transition(&env, State::Ready),
                 Err(Error::Unavailable)
             );
             probe("/healthz", true, "ok\n", true);
             probe("/readyz", true, "not ready\n", false);
-            telemetry.health.transition(State::Stopped).unwrap();
+            telemetry.health.transition(&env, State::Stopped).unwrap();
             assert_eq!(
-                telemetry.health.transition(State::Starting),
+                telemetry.health.transition(&env, State::Starting),
                 Err(Error::Unavailable)
             );
             probe("/healthz", true, "not live\n", false);
@@ -145,6 +146,7 @@ mod tests {
         }
         #[test]
         fn observation_and_credential_expiry_are_inclusive() {
+            let env = racer_io::Env::host();
             let now = racer_io::Clock::host().now();
             for (observed, boundary) in [(5, 5), (20, 10)] {
                 let health = Health::default();
@@ -159,7 +161,7 @@ mod tests {
                         observed_until: Some(now + Duration::from_secs(observed)),
                     })
                     .unwrap();
-                health.transition(State::Ready).unwrap();
+                health.transition(&env, State::Ready).unwrap();
                 assert_eq!(
                     health
                         .state_at(now + Duration::from_secs(boundary) - Duration::from_nanos(1))

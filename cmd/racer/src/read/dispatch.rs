@@ -1023,7 +1023,6 @@ impl WorkerEndpoint {
     /// without polling them; the simulated reactor still fences owned buffers.
     #[cfg(test)]
     pub(crate) fn simulation_crash(&mut self) {
-        assert!(crate::rt::reactor::simulation::Simulation::current().is_some());
         self.directory.simulation_crash();
         self.active.simulation_crash();
     }
@@ -1421,8 +1420,8 @@ mod tests {
         }
     }
     /// Deliver retained verdicts through the owner's endpoint and count them.
-    fn applied_by_owner(directory: &Arc<WorkerDirectory>) -> u64 {
-        let (owner, _fixture) = crate::read::tests::admission_coordinator();
+    fn applied_by_owner(env: &racer_io::Env, directory: &Arc<WorkerDirectory>) -> u64 {
+        let (owner, _fixture) = crate::read::tests::admission_coordinator(env);
         let before = owner
             .fill
             .metrics
@@ -1439,6 +1438,7 @@ mod tests {
     }
     #[test]
     fn failed_sealed_verdict_survives_full_driver_queue() {
+        let env = racer_io::Env::host();
         let queue = Rc::new(crate::drivers::DriverQueue::new(1));
         let _queue = queue.enter();
         let workers = vec![WorkerId(0), WorkerId(1)];
@@ -1454,18 +1454,19 @@ mod tests {
         let page = page_owned_by(&directory, WorkerId(1));
         let full = crate::drivers::reserve().unwrap();
         {
-            let (local, _fixture) = crate::read::tests::admission_coordinator();
+            let (local, _fixture) = crate::read::tests::admission_coordinator(&env);
             let _local = directory.simulation_scope(Some((WorkerId(0), local)));
             directory.report_sealed(failed_report(page.clone()), false, &scope());
             // A passing verdict is only a persistence hint and is not retained.
             directory.report_sealed(failed_report(page), true, &scope());
         }
         drop(full);
-        assert_eq!(applied_by_owner(&directory), 1);
+        assert_eq!(applied_by_owner(&env, &directory), 1);
         assert!(directory.mailboxes[1].take_failed_verdicts().is_empty());
     }
     #[test]
     fn failed_sealed_verdict_survives_full_mailbox() {
+        let env = racer_io::Env::host();
         let queue = Rc::new(crate::drivers::DriverQueue::new(64));
         let _queue = queue.enter();
         let workers = vec![WorkerId(0), WorkerId(1)];
@@ -1481,7 +1482,7 @@ mod tests {
         directory.mailboxes[1].install().unwrap();
         let page = page_owned_by(&directory, WorkerId(1));
         {
-            let (local, _fixture) = crate::read::tests::admission_coordinator();
+            let (local, _fixture) = crate::read::tests::admission_coordinator(&env);
             let _local = directory.simulation_scope(Some((WorkerId(0), local)));
             // The first verdict takes the only mailbox slot; the second is retained.
             directory.report_sealed(failed_report(page.clone()), false, &scope());
@@ -1492,7 +1493,7 @@ mod tests {
     }
     /// Run `report_sealed` for a landed page owned by worker 1 from worker 0,
     /// and return worker 0's new CorruptMiss count and worker 1's mailbox.
-    fn landed_verdict(passed: bool) -> (u64, usize) {
+    fn landed_verdict(env: &racer_io::Env, passed: bool) -> (u64, usize) {
         let queue = Rc::new(crate::drivers::DriverQueue::new(64));
         let _queue = queue.enter();
         let workers = vec![WorkerId(0), WorkerId(1)];
@@ -1507,7 +1508,7 @@ mod tests {
         );
         directory.mailboxes[1].install().unwrap();
         let page = page_owned_by(&directory, WorkerId(1));
-        let (local, _fixture) = crate::read::tests::admission_coordinator();
+        let (local, _fixture) = crate::read::tests::admission_coordinator(env);
         let before = local
             .fill
             .metrics
@@ -1529,12 +1530,14 @@ mod tests {
     /// The owner may share a landed copy with other sealed fetches, so a
     /// failed verdict goes to it rather than settling on the reporter.
     fn failed_landed_verdict_goes_to_the_owner() {
-        assert_eq!(landed_verdict(false), (0, 1));
+        let env = racer_io::Env::host();
+        assert_eq!(landed_verdict(&env, false), (0, 1));
     }
     #[test]
     /// A passed landed page leaves the owner nothing to do.
     fn passed_landed_verdict_settles_locally() {
-        assert_eq!(landed_verdict(true), (0, 0));
+        let env = racer_io::Env::host();
+        assert_eq!(landed_verdict(&env, true), (0, 0));
     }
     #[test]
     fn failed_sealed_verdicts_are_bounded() {
@@ -1715,6 +1718,7 @@ mod tests {
     #[test]
     fn expired_drain_completes_queued_selected_waiters_and_reclaims_ciphertext() {
         use crate::admission::ResourceClass;
+        let env = racer_io::Env::host();
         for cancel_caller in [false, true] {
             let directory = Arc::new(directory(1));
             let caller = scope();
@@ -1736,7 +1740,7 @@ mod tests {
             let mut endpoint = WorkerEndpoint {
                 mailbox: mailbox.clone(),
                 directory: directory.clone(),
-                local: crate::test_support::wake_test_coordinator(),
+                local: crate::test_support::wake_test_coordinator(&env),
                 active: Executor::default(),
             };
             // Model ingress on the other worker so the real selected handoff is used.
@@ -1787,12 +1791,13 @@ mod tests {
 
     #[test]
     fn expired_drain_returns_queued_budget_and_reclaims_detached_receipts() {
+        let env = racer_io::Env::host();
         for detach in [false, true] {
             let directory = Arc::new(directory(1));
             let mut endpoint = WorkerEndpoint {
                 mailbox: directory.mailboxes[0].clone(),
                 directory: directory.clone(),
-                local: crate::test_support::wake_test_coordinator(),
+                local: crate::test_support::wake_test_coordinator(&env),
                 active: Executor::default(),
             };
             let caller = scope();
@@ -1935,13 +1940,14 @@ mod tests {
 
     #[test]
     fn mailbox_and_reply_notifications_cover_both_registration_orders() {
+        let env = racer_io::Env::host();
         for submit_before_poll in [false, true] {
             for complete_before_poll in [false, true] {
                 let directory = Arc::new(directory(4));
                 let mut endpoint = WorkerEndpoint {
                     mailbox: directory.mailboxes[0].clone(),
                     directory: directory.clone(),
-                    local: crate::test_support::wake_test_coordinator(),
+                    local: crate::test_support::wake_test_coordinator(&env),
                     active: Executor::default(),
                 };
                 let count = Arc::new(crate::test_support::WakeCounter::default());
@@ -1987,10 +1993,11 @@ mod tests {
     /// A parked real acquisition cannot prevent an unrelated mailbox completion.
     #[test]
     fn bounded_admission_mailbox_keeps_other_work_progressing() {
+        let env = racer_io::Env::host();
         let queue = Rc::new(crate::drivers::DriverQueue::new(1024));
         let _owner = queue.enter();
         let directory = Arc::new(directory(4));
-        let (local, _fixture) = crate::read::tests::admission_coordinator();
+        let (local, _fixture) = crate::read::tests::admission_coordinator(&env);
         let mut endpoint = WorkerEndpoint {
             mailbox: directory.mailboxes[0].clone(),
             directory: directory.clone(),

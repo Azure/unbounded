@@ -43,8 +43,8 @@ fn real_header_end(bytes: &[u8]) -> usize {
 
 mod index_pressure {
     use super::*;
-    fn fixture(capacity: usize) -> Fixture {
-        let f = Fixture::new();
+    fn fixture(env: &racer_io::Env, capacity: usize) -> Fixture {
+        let f = Fixture::new(env);
         let _ = futures::executor::block_on(f.store.open()).unwrap();
         f.reactor
             .init()
@@ -52,12 +52,12 @@ mod index_pressure {
         f.store.writer.index().set_page_capacity(capacity).unwrap();
         f
     }
-    fn persist(f: &Fixture, number: u8) -> PageId {
+    fn persist(env: &racer_io::Env, f: &Fixture, number: u8) -> PageId {
         let copy = f.copy(number, 113);
         let id = copy.ciphertext.envelope().page.clone();
         f.enqueue(copy).unwrap();
         assert_eq!(
-            drive(&f.reactor, f.store.writer.progress(1, &scope())).unwrap(),
+            drive(&f.reactor, f.store.writer.progress(1, &scope(env))).unwrap(),
             1
         );
         assert!(f.store.writer.index().lookup(&id).unwrap().is_some());
@@ -65,15 +65,16 @@ mod index_pressure {
     }
     #[test]
     fn small_records_turn_over_sealed_open_segment_and_checkpoint_recovers_only_live_mappings() {
-        let f = fixture(2);
+        let env = racer_io::Env::host();
+        let f = fixture(&env, 2);
         let index = f.store.writer.index();
-        let first = persist(&f, 1);
-        let second = persist(&f, 2);
+        let first = persist(&env, &f, 1);
+        let second = persist(&env, &f, 2);
         let before = segment_images(&f);
         assert_eq!(before[0].2, SegmentState::Open);
         assert_eq!(f.segments.free_count(), 1);
-        let third = persist(&f, 3);
-        let fourth = persist(&f, 4);
+        let third = persist(&env, &f, 3);
+        let fourth = persist(&env, &f, 4);
         assert!(index.lookup(&first).unwrap().is_none());
         assert!(index.lookup(&second).unwrap().is_none());
         assert_eq!(index.snapshot().unwrap().entries.len(), 2);
@@ -83,17 +84,17 @@ mod index_pressure {
         assert!(after[0].1.0 > before[0].1.0, "{before:?} -> {after:?}");
         assert_eq!(f.store.writer.discarded_count(), 0);
         let image = futures::executor::block_on(f.store.checkpoint.snapshot_shard()).unwrap();
-        futures::executor::block_on(
-            f.store
-                .checkpoint
-                .publish(crate::store::checkpoint::test_cluster(), vec![image]),
-        )
+        futures::executor::block_on(f.store.checkpoint.publish(
+            &env,
+            crate::store::checkpoint::test_cluster(),
+            vec![image],
+        ))
         .unwrap();
         f.store.checkpoint.finish_snapshot();
         let loaded = futures::executor::block_on(
             f.store
                 .recovery
-                .load(f.store.writer.slabs().alignment().unwrap()),
+                .load(&env, f.store.writer.slabs().alignment().unwrap()),
         )
         .unwrap()
         .unwrap();
@@ -106,28 +107,32 @@ mod index_pressure {
         assert!(index.lookup(&first).unwrap().is_none());
         assert!(index.lookup(&second).unwrap().is_none());
         for (id, number) in [(&third, 3), (&fourth, 4)] {
-            let read = drive(&f.reactor, f.store.reader.read(id, &scope()))
+            let read = drive(&f.reactor, f.store.reader.read(id, &scope(&env)))
                 .unwrap()
                 .unwrap();
             assert_eq!(read.ciphertext.bytes(), vec![number; 129]);
         }
-        persist(&f, 5);
+        persist(&env, &f, 5);
         assert!(index.snapshot().unwrap().entries.len() <= 2);
     }
     #[test]
     fn replacement_does_not_evict_neighbors_or_let_old_tokens_remove_new_mapping() {
-        let f = fixture(2);
-        let first = persist(&f, 1);
-        let second = persist(&f, 2);
-        let (_, token) = drive(&f.reactor, f.store.reader.read_with_token(&first, &scope()))
-            .unwrap()
-            .unwrap();
+        let env = racer_io::Env::host();
+        let f = fixture(&env, 2);
+        let first = persist(&env, &f, 1);
+        let second = persist(&env, &f, 2);
+        let (_, token) = drive(
+            &f.reactor,
+            f.store.reader.read_with_token(&first, &scope(&env)),
+        )
+        .unwrap()
+        .unwrap();
         let index = f.store.writer.index();
         let neighbor = index.lookup(&second).unwrap().unwrap().location;
         let old = index.lookup(&first).unwrap().unwrap().location;
         // A healthy resident is deduplicated. Only invalidation warrants a rewrite.
         f.store.reader.invalidate(&token).unwrap();
-        persist(&f, 1);
+        persist(&env, &f, 1);
         let replacement = index.lookup(&first).unwrap().unwrap().location;
         assert_ne!(old, replacement);
         f.store.reader.invalidate(&token).unwrap();
@@ -137,22 +142,26 @@ mod index_pressure {
     }
     #[test]
     fn index_eviction_during_read_cannot_resurrect_copy_or_recycle_active_generation() {
-        let f = fixture(1);
-        let first = persist(&f, 1);
+        let env = racer_io::Env::host();
+        let f = fixture(&env, 1);
+        let first = persist(&env, &f, 1);
         let index = f.store.writer.index();
         let old = index.lookup(&first).unwrap().unwrap().location;
-        let (_, token) = drive(&f.reactor, f.store.reader.read_with_token(&first, &scope()))
-            .unwrap()
-            .unwrap();
+        let (_, token) = drive(
+            &f.reactor,
+            f.store.reader.read_with_token(&first, &scope(&env)),
+        )
+        .unwrap()
+        .unwrap();
         let held = f.store.writer.lease(&old).unwrap();
-        let request = scope();
+        let request = scope(&env);
         let mut read = f.store.reader.read(&first, &request);
         assert!(
             read.as_mut()
                 .poll(&mut Context::from_waker(futures::task::noop_waker_ref()))
                 .is_pending()
         );
-        persist(&f, 2);
+        persist(&env, &f, 2);
         assert!(drive(&f.reactor, read).unwrap().is_none());
         // The full index sealed and evicted the open segment; leases keep it
         // from recycling.
@@ -165,7 +174,7 @@ mod index_pressure {
         drop(held);
         segments.recycle(old.segment).unwrap();
         assert!(segments.lease(old.segment, old.generation).is_err());
-        persist(&f, 1);
+        persist(&env, &f, 1);
         let new = index.lookup(&first).unwrap().unwrap().location;
         assert_ne!(new.generation, old.generation);
         f.store.reader.invalidate(&token).unwrap();
@@ -173,12 +182,13 @@ mod index_pressure {
     }
     #[test]
     fn cache_removal_during_pressure_write_prevents_late_publication() {
-        let f = fixture(1);
-        let first = persist(&f, 1);
+        let env = racer_io::Env::host();
+        let f = fixture(&env, 1);
+        let first = persist(&env, &f, 1);
         let copy = f.copy(2, 113);
         let second = copy.ciphertext.envelope().page.clone();
         f.enqueue(copy).unwrap();
-        let request = scope();
+        let request = scope(&env);
         let mut write = f.store.writer.progress(1, &request);
         assert!(
             write
@@ -201,8 +211,13 @@ mod index_pressure {
     }
     #[test]
     fn partial_eviction_completes_in_flight_reads_without_resurrecting_or_reusing() {
-        let f = fixture(8);
-        let ids = [persist(&f, 1), persist(&f, 2), persist(&f, 3)];
+        let env = racer_io::Env::host();
+        let f = fixture(&env, 8);
+        let ids = [
+            persist(&env, &f, 1),
+            persist(&env, &f, 2),
+            persist(&env, &f, 3),
+        ];
         let index = f.store.writer.index();
         let location = index.lookup(&ids[0]).unwrap().unwrap().location;
         let held = f.store.writer.lease(&location).unwrap();
@@ -217,7 +232,7 @@ mod index_pressure {
                 .append(f.segments.segment_bytes() as usize)
                 .unwrap(),
         );
-        let request = scope();
+        let request = scope(&env);
         let mut reads: Vec<_> = ids
             .iter()
             .map(|id| f.store.reader.read(id, &request))
@@ -274,9 +289,9 @@ mod index_pressure {
 
 #[test]
 fn hard_hold_persist_confirms_publication_and_protects_pending() {
-    let simulation = crate::rt::reactor::simulation::Simulation::new();
-    let _environment = simulation.enter();
-    let f = Fixture::new();
+    let simulation = racer_io::sim::SimOs::new();
+    let env = racer_io::Env::sim(&simulation, racer_io::WorkerCtx::host());
+    let f = Fixture::new(&env);
     let _ = futures::executor::block_on(f.store.open()).unwrap();
     f.reactor.init().unwrap();
     let copy = f.copy(1, 113);
@@ -291,13 +306,13 @@ fn hard_hold_persist_confirms_publication_and_protects_pending() {
     assert!(index.lookup(&id).unwrap().is_none());
     drive(
         &f.reactor,
-        f.store.writer.persist_held(copy.clone(), &scope()),
+        f.store.writer.persist_held(copy.clone(), &scope(&env)),
     )
     .unwrap();
     assert!(index.lookup(&id).unwrap().is_some());
     assert_eq!(f.store.writer.pending_count(), 0);
     let first = index.lookup(&id).unwrap().unwrap().location;
-    drive(&f.reactor, f.store.writer.persist_held(copy, &scope())).unwrap();
+    drive(&f.reactor, f.store.writer.persist_held(copy, &scope(&env))).unwrap();
     assert_eq!(index.lookup(&id).unwrap().unwrap().location, first);
     index.release_hold(&id.version).unwrap();
     assert_eq!(index.hold_expiry(&id.version), Some(until));
@@ -305,10 +320,10 @@ fn hard_hold_persist_confirms_publication_and_protects_pending() {
 
 #[test]
 fn hard_hold_write_failure_is_not_success_and_unused_capacity_releases() {
-    use crate::rt::reactor::simulation::{Fault, Simulation};
-    let simulation = Simulation::new();
-    let _environment = simulation.enter();
-    let f = Fixture::new();
+    use racer_io::sim::{Fault, SimOs};
+    let simulation = SimOs::new();
+    let env = racer_io::Env::sim(&simulation, racer_io::WorkerCtx::host());
+    let f = Fixture::new(&env);
     let _ = futures::executor::block_on(f.store.open()).unwrap();
     f.reactor.init().unwrap();
     let copy = f.copy(1, 113);
@@ -317,7 +332,7 @@ fn hard_hold_write_failure_is_not_success_and_unused_capacity_releases() {
     assert_eq!(
         drive(
             &f.reactor,
-            f.store.writer.persist_held(copy.clone(), &scope())
+            f.store.writer.persist_held(copy.clone(), &scope(&env))
         ),
         Err(Error::Unavailable)
     );
@@ -330,7 +345,7 @@ fn hard_hold_write_failure_is_not_success_and_unused_capacity_releases() {
         .unwrap();
     simulation.inject("write", Fault::Errno(libc::EIO)).unwrap();
     assert_eq!(
-        drive(&f.reactor, f.store.writer.persist_held(copy, &scope())),
+        drive(&f.reactor, f.store.writer.persist_held(copy, &scope(&env))),
         Err(Error::Io)
     );
     assert!(index.lookup(&id).unwrap().is_none());
@@ -341,9 +356,9 @@ fn hard_hold_write_failure_is_not_success_and_unused_capacity_releases() {
 #[test]
 fn hard_hold_checkpoint_roundtrip_restores_only_live_disk_reservations() {
     use crate::store::checkpoint;
-    let simulation = crate::rt::reactor::simulation::Simulation::new();
-    let _environment = simulation.enter();
-    let f = Fixture::new();
+    let simulation = racer_io::sim::SimOs::new();
+    let env = racer_io::Env::sim(&simulation, racer_io::WorkerCtx::host());
+    let f = Fixture::new(&env);
     let _ = futures::executor::block_on(f.store.open()).unwrap();
     f.reactor.init().unwrap();
     let copy = f.copy(1, 113);
@@ -352,7 +367,7 @@ fn hard_hold_checkpoint_roundtrip_restores_only_live_disk_reservations() {
     let until = racer_io::Clock::host().wall_now() + Duration::from_secs(60);
     index.reserve_hold(&id.version, 1, until).unwrap();
     let before = index.hold_epoch(&id.version).unwrap();
-    drive(&f.reactor, f.store.writer.persist_held(copy, &scope())).unwrap();
+    drive(&f.reactor, f.store.writer.persist_held(copy, &scope(&env))).unwrap();
     let shard = futures::executor::block_on(f.store.checkpoint.snapshot_shard()).unwrap();
     f.store.checkpoint.finish_snapshot();
     let bytes = checkpoint::encode(&checkpoint::CheckpointImage {
@@ -409,9 +424,9 @@ fn hard_hold_checkpoint_frozen_arrival_sleeps_until_thaw_without_discard() {
             this.0.fetch_add(1, Ordering::Relaxed);
         }
     }
-    let simulation = crate::rt::reactor::simulation::Simulation::new();
-    let _environment = simulation.enter();
-    let f = Fixture::new();
+    let simulation = racer_io::sim::SimOs::new();
+    let env = racer_io::Env::sim(&simulation, racer_io::WorkerCtx::host());
+    let f = Fixture::new(&env);
     let _ = futures::executor::block_on(f.store.open()).unwrap();
     f.reactor.init().unwrap();
     let cut = futures::executor::block_on(f.store.checkpoint.snapshot_shard()).unwrap();
@@ -424,7 +439,7 @@ fn hard_hold_checkpoint_frozen_arrival_sleeps_until_thaw_without_discard() {
         .index()
         .reserve_hold(&id.version, 1, until)
         .unwrap();
-    let request = scope();
+    let request = scope(&env);
     let mut held = f.store.writer.persist_held(copy, &request);
     let wakes = std::sync::Arc::new(Wakes(std::sync::atomic::AtomicUsize::new(0)));
     let waker = futures::task::waker(wakes.clone());
@@ -437,7 +452,7 @@ fn hard_hold_checkpoint_frozen_arrival_sleeps_until_thaw_without_discard() {
     assert_eq!(f.store.writer.writes_in_flight(), 0);
     assert_eq!(f.store.writer.discarded_count(), 0);
     // Direct progress callers must also obey the pause, not just warming.
-    let background_scope = scope();
+    let background_scope = scope(&env);
     let mut background = f.store.writer.progress(1, &background_scope);
     assert!(background.as_mut().poll(&mut cx).is_pending());
     drop(background);
@@ -450,10 +465,10 @@ fn hard_hold_checkpoint_frozen_arrival_sleeps_until_thaw_without_discard() {
 
 #[test]
 fn hard_hold_checkpoint_fences_warm_owned_publication_and_restores_veto() {
-    use crate::rt::reactor::simulation::{Fault, Simulation};
-    let simulation = Simulation::new();
-    let _environment = simulation.enter();
-    let f = Fixture::new();
+    use racer_io::sim::{Fault, SimOs};
+    let simulation = SimOs::new();
+    let env = racer_io::Env::sim(&simulation, racer_io::WorkerCtx::host());
+    let f = Fixture::new(&env);
     let _ = futures::executor::block_on(f.store.open()).unwrap();
     f.reactor.init().unwrap();
     let copy = f.copy(1, 113);
@@ -462,7 +477,7 @@ fn hard_hold_checkpoint_fences_warm_owned_publication_and_restores_veto() {
     let until = racer_io::Clock::host().wall_now() + Duration::from_secs(60);
     index.reserve_hold(&id.version, 1, until).unwrap();
     simulation.inject("write", Fault::Delay(6)).unwrap();
-    let request = scope();
+    let request = scope(&env);
     let mut held = f.store.writer.persist_held(copy, &request);
     let mut cx = Context::from_waker(futures::task::noop_waker_ref());
     assert!(held.as_mut().poll(&mut cx).is_pending());
@@ -501,9 +516,9 @@ fn hard_hold_checkpoint_fences_warm_owned_publication_and_restores_veto() {
 
 #[test]
 fn hard_hold_checkpoint_abandoned_pause_reopens_writer() {
-    let simulation = crate::rt::reactor::simulation::Simulation::new();
-    let _environment = simulation.enter();
-    let f = Fixture::new();
+    let simulation = racer_io::sim::SimOs::new();
+    let env = racer_io::Env::sim(&simulation, racer_io::WorkerCtx::host());
+    let f = Fixture::new(&env);
     let _ = futures::executor::block_on(f.store.open()).unwrap();
     f.store.writer.busy.set(true);
     let busy = Busy(&f.store.writer);
@@ -523,9 +538,9 @@ fn hard_hold_checkpoint_abandoned_pause_reopens_writer() {
 
 #[test]
 fn hard_hold_checkpoint_captures_hold_added_during_index_traversal() {
-    let simulation = crate::rt::reactor::simulation::Simulation::new();
-    let _environment = simulation.enter();
-    let f = Fixture::new();
+    let simulation = racer_io::sim::SimOs::new();
+    let env = racer_io::Env::sim(&simulation, racer_io::WorkerCtx::host());
+    let f = Fixture::new(&env);
     let _ = futures::executor::block_on(f.store.open()).unwrap();
     let index = f.store.writer.index();
     index.set_page_capacity(256).unwrap();
@@ -571,16 +586,16 @@ fn hard_hold_checkpoint_captures_hold_added_during_index_traversal() {
 
 #[test]
 fn hard_hold_cancel_waits_for_stalled_background_writer_without_self_wakes() {
-    use crate::rt::reactor::simulation::{Fault, Simulation};
+    use racer_io::sim::{Fault, SimOs};
     struct Wakes(std::sync::atomic::AtomicUsize);
     impl futures::task::ArcWake for Wakes {
         fn wake_by_ref(this: &std::sync::Arc<Self>) {
             this.0.fetch_add(1, Ordering::Relaxed);
         }
     }
-    let simulation = Simulation::new();
-    let _environment = simulation.enter();
-    let f = Fixture::new();
+    let simulation = SimOs::new();
+    let env = racer_io::Env::sim(&simulation, racer_io::WorkerCtx::host());
+    let f = Fixture::new(&env);
     let _ = futures::executor::block_on(f.store.open()).unwrap();
     f.reactor.init().unwrap();
     let copy = f.copy(1, 113);
@@ -591,7 +606,7 @@ fn hard_hold_cancel_waits_for_stalled_background_writer_without_self_wakes() {
     f.enqueue(copy.clone()).unwrap();
     assert_eq!(index.release_hold(&id.version), Err(Error::Overloaded));
     simulation.inject("write", Fault::Delay(6)).unwrap();
-    let background_scope = scope();
+    let background_scope = scope(&env);
     let mut background = f.store.writer.progress(1, &background_scope);
     assert!(
         background
@@ -600,7 +615,7 @@ fn hard_hold_cancel_waits_for_stalled_background_writer_without_self_wakes() {
             .is_pending()
     );
     assert_eq!(f.store.writer.writes_in_flight(), 1);
-    let request = scope();
+    let request = scope(&env);
     let mut held = f.store.writer.persist_held(copy.clone(), &request);
     let wakes = std::sync::Arc::new(Wakes(std::sync::atomic::AtomicUsize::new(0)));
     let waker = futures::task::waker(wakes.clone());
@@ -615,10 +630,10 @@ fn hard_hold_cancel_waits_for_stalled_background_writer_without_self_wakes() {
     assert_eq!(f.store.writer.waiters.borrow().len(), 1);
 
     // Dropped followers unregister, and excess followers are bounded.
-    let follower_scope = scope();
+    let follower_scope = scope(&env);
     let mut follower = f.store.writer.persist_held(copy.clone(), &follower_scope);
     assert!(follower.as_mut().poll(&mut cx).is_pending());
-    let excess_scope = scope();
+    let excess_scope = scope(&env);
     let mut excess = f.store.writer.persist_held(copy, &excess_scope);
     assert_eq!(
         excess.as_mut().poll(&mut cx),
@@ -642,9 +657,9 @@ fn hard_hold_cancel_waits_for_stalled_background_writer_without_self_wakes() {
 
 #[test]
 fn hard_hold_cancel_removes_unsubmitted_ticket_after_background_fence() {
-    let simulation = crate::rt::reactor::simulation::Simulation::new();
-    let _environment = simulation.enter();
-    let f = Fixture::new();
+    let simulation = racer_io::sim::SimOs::new();
+    let env = racer_io::Env::sim(&simulation, racer_io::WorkerCtx::host());
+    let f = Fixture::new(&env);
     let _ = futures::executor::block_on(f.store.open()).unwrap();
     f.reactor.init().unwrap();
     let copy = f.copy(1, 113);
@@ -659,7 +674,7 @@ fn hard_hold_cancel_removes_unsubmitted_ticket_after_background_fence() {
         .unwrap();
     f.store.writer.busy.set(true);
     let busy = Busy(&f.store.writer);
-    let request = scope();
+    let request = scope(&env);
     let mut held = f.store.writer.persist_held(copy, &request);
     let mut cx = Context::from_waker(futures::task::noop_waker_ref());
     assert!(held.as_mut().poll(&mut cx).is_pending());
@@ -678,10 +693,10 @@ fn hard_hold_cancel_removes_unsubmitted_ticket_after_background_fence() {
 
 #[test]
 fn hard_hold_cancel_fences_kernel_write_after_background_future_is_dropped() {
-    use crate::rt::reactor::simulation::{Fault, Simulation};
-    let simulation = Simulation::new();
-    let _environment = simulation.enter();
-    let f = Fixture::new();
+    use racer_io::sim::{Fault, SimOs};
+    let simulation = SimOs::new();
+    let env = racer_io::Env::sim(&simulation, racer_io::WorkerCtx::host());
+    let f = Fixture::new(&env);
     let _ = futures::executor::block_on(f.store.open()).unwrap();
     f.reactor.init().unwrap();
     let copy = f.copy(1, 113);
@@ -696,11 +711,11 @@ fn hard_hold_cancel_fences_kernel_write_after_background_future_is_dropped() {
         .unwrap();
     f.enqueue(copy.clone()).unwrap();
     simulation.inject("write", Fault::Delay(6)).unwrap();
-    let background_scope = scope();
+    let background_scope = scope(&env);
     let mut background = f.store.writer.progress(1, &background_scope);
     let mut cx = Context::from_waker(futures::task::noop_waker_ref());
     assert!(background.as_mut().poll(&mut cx).is_pending());
-    let request = scope();
+    let request = scope(&env);
     let mut held = f.store.writer.persist_held(copy, &request);
     assert!(held.as_mut().poll(&mut cx).is_pending());
     request.cancel().unwrap();
@@ -727,9 +742,9 @@ fn assert_prefetch_released(f: &Fixture) {
 
 #[test]
 fn prefetch_cancel_before_submission_removes_queued_ticket() {
-    let simulation = crate::rt::reactor::simulation::Simulation::new();
-    let _environment = simulation.enter();
-    let f = Fixture::new();
+    let simulation = racer_io::sim::SimOs::new();
+    let env = racer_io::Env::sim(&simulation, racer_io::WorkerCtx::host());
+    let f = Fixture::new(&env);
     let _ = futures::executor::block_on(f.store.open()).unwrap();
     f.reactor.init().unwrap();
     let copy = f.copy(1, 113);
@@ -737,7 +752,7 @@ fn prefetch_cancel_before_submission_removes_queued_ticket() {
     // A busy background writer keeps the copy queued and unsubmitted.
     f.store.writer.busy.set(true);
     let busy = Busy(&f.store.writer);
-    let request = scope();
+    let request = scope(&env);
     let mut prefetch = f.store.writer.persist_prefetched(copy, &request);
     let mut cx = Context::from_waker(futures::task::noop_waker_ref());
     assert!(prefetch.as_mut().poll(&mut cx).is_pending());
@@ -757,16 +772,16 @@ fn prefetch_cancel_before_submission_removes_queued_ticket() {
 
 #[test]
 fn prefetch_cancel_waits_for_accepted_write() {
-    use crate::rt::reactor::simulation::{Fault, Simulation};
-    let simulation = Simulation::new();
-    let _environment = simulation.enter();
-    let f = Fixture::new();
+    use racer_io::sim::{Fault, SimOs};
+    let simulation = SimOs::new();
+    let env = racer_io::Env::sim(&simulation, racer_io::WorkerCtx::host());
+    let f = Fixture::new(&env);
     let _ = futures::executor::block_on(f.store.open()).unwrap();
     f.reactor.init().unwrap();
     let copy = f.copy(1, 113);
     let id = copy.ciphertext.envelope().page.clone();
     simulation.inject("write", Fault::Delay(6)).unwrap();
-    let request = scope();
+    let request = scope(&env);
     let mut prefetch = f.store.writer.persist_prefetched(copy, &request);
     let mut cx = Context::from_waker(futures::task::noop_waker_ref());
     assert!(prefetch.as_mut().poll(&mut cx).is_pending());
@@ -784,10 +799,10 @@ fn prefetch_cancel_waits_for_accepted_write() {
 
 #[test]
 fn prefetch_write_failure_is_not_admitted() {
-    use crate::rt::reactor::simulation::{Fault, Simulation};
-    let simulation = Simulation::new();
-    let _environment = simulation.enter();
-    let f = Fixture::new();
+    use racer_io::sim::{Fault, SimOs};
+    let simulation = SimOs::new();
+    let env = racer_io::Env::sim(&simulation, racer_io::WorkerCtx::host());
+    let f = Fixture::new(&env);
     let _ = futures::executor::block_on(f.store.open()).unwrap();
     f.reactor.init().unwrap();
     let copy = f.copy(1, 113);
@@ -797,7 +812,7 @@ fn prefetch_write_failure_is_not_admitted() {
     assert_eq!(
         drive(
             &f.reactor,
-            f.store.writer.persist_prefetched(copy, &scope())
+            f.store.writer.persist_prefetched(copy, &scope(&env))
         ),
         Err(Error::Unavailable)
     );
@@ -806,7 +821,9 @@ fn prefetch_write_failure_is_not_admitted() {
     // The failure is not sticky: a retry persists the copy.
     drive(
         &f.reactor,
-        f.store.writer.persist_prefetched(f.copy(1, 113), &scope()),
+        f.store
+            .writer
+            .persist_prefetched(f.copy(1, 113), &scope(&env)),
     )
     .unwrap();
     assert!(f.store.writer.index().lookup(&id).unwrap().is_some());
@@ -814,16 +831,16 @@ fn prefetch_write_failure_is_not_admitted() {
 
 #[test]
 fn prefetch_unheld_queued_copy_discarded_is_not_admitted() {
-    let simulation = crate::rt::reactor::simulation::Simulation::new();
-    let _environment = simulation.enter();
-    let f = Fixture::new();
+    let simulation = racer_io::sim::SimOs::new();
+    let env = racer_io::Env::sim(&simulation, racer_io::WorkerCtx::host());
+    let f = Fixture::new(&env);
     let _ = futures::executor::block_on(f.store.open()).unwrap();
     f.reactor.init().unwrap();
     let copy = f.copy(1, 113);
     let id = copy.ciphertext.envelope().page.clone();
     f.store.writer.busy.set(true);
     let busy = Busy(&f.store.writer);
-    let request = scope();
+    let request = scope(&env);
     let mut prefetch = f.store.writer.persist_prefetched(copy, &request);
     let mut cx = Context::from_waker(futures::task::noop_waker_ref());
     assert!(prefetch.as_mut().poll(&mut cx).is_pending());
@@ -841,7 +858,8 @@ fn prefetch_unheld_queued_copy_discarded_is_not_admitted() {
 
 #[test]
 fn disk_observability_publication_read_and_pending_cleanup() {
-    let f = Fixture::new();
+    let env = racer_io::Env::host();
+    let f = Fixture::new(&env);
     let _ = futures::executor::block_on(f.store.open()).unwrap();
     f.reactor.init().unwrap();
     let retention = f.store.writer.retention();
@@ -853,30 +871,33 @@ fn disk_observability_publication_read_and_pending_cleanup() {
     assert_eq!(retention.snapshot().disk[0].published_pages, 0);
     // Ownership is sampled at publication, not captured at queue insertion.
     retention.set_ownership(Rc::new(|_| true));
-    drive(&f.reactor, f.store.writer.progress(1, &scope())).unwrap();
+    drive(&f.reactor, f.store.writer.progress(1, &scope(&env))).unwrap();
     assert_eq!(retention.snapshot().pending_payload_bytes, 0);
     assert_eq!(retention.snapshot().indexed_payload_bytes, 113);
     assert_eq!(retention.snapshot().disk[1].published_pages, 1);
     assert_eq!(retention.snapshot().disk[1].published_payload_bytes, 113);
     assert_eq!(f.enqueue(f.copy(1, 113)), Ok(0));
     assert_eq!(retention.snapshot().disk[1].published_pages, 1);
-    let (_, token) = drive(&f.reactor, f.store.reader.read_with_token(&id, &scope()))
-        .unwrap()
-        .unwrap();
+    let (_, token) = drive(
+        &f.reactor,
+        f.store.reader.read_with_token(&id, &scope(&env)),
+    )
+    .unwrap()
+    .unwrap();
     retention.set_ownership(Rc::new(|_| false));
     assert!(
-        drive(&f.reactor, f.store.reader.read(&id, &scope()))
+        drive(&f.reactor, f.store.reader.read(&id, &scope(&env)))
             .unwrap()
             .is_some()
     );
     assert_eq!(retention.snapshot().disk[1].read_payload_bytes, 113);
     assert_eq!(retention.snapshot().disk[0].read_payload_bytes, 113);
-    let canceled = scope();
+    let canceled = scope(&env);
     canceled.cancel().unwrap();
     assert!(drive(&f.reactor, f.store.reader.read(&id, &canceled)).is_err());
     f.store.reader.invalidate(&token).unwrap();
     assert!(
-        drive(&f.reactor, f.store.reader.read(&id, &scope()))
+        drive(&f.reactor, f.store.reader.read(&id, &scope(&env)))
             .unwrap()
             .is_none()
     );
@@ -894,15 +915,15 @@ fn disk_observability_publication_read_and_pending_cleanup() {
 }
 #[test]
 fn disk_observability_failed_write_and_read_do_not_credit_bytes() {
-    use crate::rt::reactor::simulation::{Fault, Simulation};
-    let simulation = Simulation::new();
-    let _environment = simulation.enter();
-    let f = Fixture::new();
+    use racer_io::sim::{Fault, SimOs};
+    let simulation = SimOs::new();
+    let env = racer_io::Env::sim(&simulation, racer_io::WorkerCtx::host());
+    let f = Fixture::new(&env);
     let _ = drive(&f.reactor, f.store.open()).unwrap();
     let retention = f.store.writer.retention();
     f.enqueue(f.copy(1, 3)).unwrap();
     simulation.inject("write", Fault::Errno(libc::EIO)).unwrap();
-    drive(&f.reactor, f.store.writer.progress(1, &scope())).unwrap();
+    drive(&f.reactor, f.store.writer.progress(1, &scope(&env))).unwrap();
     assert_eq!(retention.snapshot().pending_payload_bytes, 0);
     assert_eq!(retention.snapshot().indexed_payload_bytes, 0);
     assert_eq!(retention.snapshot().disk[0].published_pages, 0);
@@ -911,11 +932,11 @@ fn disk_observability_failed_write_and_read_do_not_credit_bytes() {
     let copy = f.copy(2, 7);
     let id = copy.ciphertext.envelope().page.clone();
     f.enqueue(copy).unwrap();
-    drive(&f.reactor, f.store.writer.progress(1, &scope())).unwrap();
+    drive(&f.reactor, f.store.writer.progress(1, &scope(&env))).unwrap();
     assert_eq!(retention.snapshot().disk[0].published_payload_bytes, 7);
     simulation.inject("read", Fault::Errno(libc::EIO)).unwrap();
     assert!(
-        drive(&f.reactor, f.store.reader.read(&id, &scope()))
+        drive(&f.reactor, f.store.reader.read(&id, &scope(&env)))
             .unwrap()
             .is_none()
     );
@@ -929,9 +950,10 @@ fn disk_observability_failed_write_and_read_do_not_credit_bytes() {
 }
 #[test]
 fn second_sight_queue_owned_bias_and_pressure_discard() {
+    let env = racer_io::Env::host();
     // Pending pages carry no read heat: ownership alone orders the queue.
     {
-        let f = Fixture::new();
+        let f = Fixture::new(&env);
         let _ = futures::executor::block_on(f.store.open()).unwrap();
         f.reactor.init().expect("queue tests require io_uring");
         let owned = f.copy(1, 113);
@@ -943,12 +965,12 @@ fn second_sight_queue_owned_bias_and_pressure_discard() {
         retention.set_ownership(Rc::new(move |page| page == &classify));
         f.enqueue(other).unwrap();
         f.enqueue(owned).unwrap();
-        drive(&f.reactor, f.store.writer.progress(1, &scope())).unwrap();
+        drive(&f.reactor, f.store.writer.progress(1, &scope(&env))).unwrap();
         assert!(f.store.writer.index().lookup(&owner).unwrap().is_some());
         assert!(f.store.writer.index().lookup(&id).unwrap().is_none());
         f.store.writer.discard_unsubmitted();
     }
-    let f = Fixture::new();
+    let f = Fixture::new(&env);
     let _ = futures::executor::block_on(f.store.open()).unwrap();
     let low = f.copy(1, 113);
     let high = f.copy(2, 113);
@@ -966,7 +988,8 @@ fn second_sight_queue_owned_bias_and_pressure_discard() {
 
 #[test]
 fn second_sight_full_queue_replaces_only_lower_value_unsubmitted_work() {
-    let f = Fixture::new();
+    let env = racer_io::Env::host();
+    let f = Fixture::new(&env);
     let _ = futures::executor::block_on(f.store.open()).unwrap();
     let first = f.copy(1, 113);
     let first_id = first.ciphertext.envelope().page.clone();
@@ -994,7 +1017,8 @@ fn second_sight_full_queue_replaces_only_lower_value_unsubmitted_work() {
 /// staging reservation) leaves the victim queued.
 #[test]
 fn failed_full_queue_replacement_keeps_the_victim() {
-    let f = Fixture::new();
+    let env = racer_io::Env::host();
+    let f = Fixture::new(&env);
     let _ = futures::executor::block_on(f.store.open()).unwrap();
     let first = f.copy(1, 113);
     let first_id = first.ciphertext.envelope().page.clone();
@@ -1033,7 +1057,8 @@ fn failed_full_queue_replacement_keeps_the_victim() {
 
 #[test]
 fn second_sight_pressure_never_discards_submitted_owner() {
-    let f = Fixture::new();
+    let env = racer_io::Env::host();
+    let f = Fixture::new(&env);
     let _ = futures::executor::block_on(f.store.open()).unwrap();
     f.reactor
         .init()
@@ -1041,7 +1066,7 @@ fn second_sight_pressure_never_discards_submitted_owner() {
     let copy = f.copy(1, 113);
     let id = copy.ciphertext.envelope().page.clone();
     f.enqueue(copy).unwrap();
-    let request = scope();
+    let request = scope(&env);
     let mut progress = f.store.writer.progress(1, &request);
     assert!(
         progress
@@ -1060,7 +1085,8 @@ fn second_sight_pressure_never_discards_submitted_owner() {
 
 #[test]
 fn second_sight_reclaim_scans_only_a_fixed_queue_prefix_and_makes_progress() {
-    let f = Fixture::new();
+    let env = racer_io::Env::host();
+    let f = Fixture::new(&env);
     let _ = futures::executor::block_on(f.store.open()).unwrap();
     f.store.configure(f.admission.clone(), 128, 128).unwrap();
     for number in 0..64 {
@@ -1108,7 +1134,8 @@ fn second_sight_reclaim_scans_only_a_fixed_queue_prefix_and_makes_progress() {
 
 #[test]
 fn optional_headroom_reclaim_preserves_owned_submitted_and_index_residency() {
-    let f = Fixture::new();
+    let env = racer_io::Env::host();
+    let f = Fixture::new(&env);
     let _ = futures::executor::block_on(f.store.open()).unwrap();
     f.store.configure(f.admission.clone(), 8, 16).unwrap();
     f.reactor.init().unwrap();
@@ -1121,7 +1148,7 @@ fn optional_headroom_reclaim_preserves_owned_submitted_and_index_residency() {
     let active = f.copy(1, 3);
     let active_id = active.ciphertext.envelope().page.clone();
     f.enqueue(active).unwrap();
-    let request = scope();
+    let request = scope(&env);
     let mut progress = f.store.writer.progress(1, &request);
     assert!(
         progress
@@ -1171,7 +1198,8 @@ fn optional_headroom_reclaim_preserves_owned_submitted_and_index_residency() {
 }
 #[test]
 fn optional_headroom_reclaim_bounds_prefix_and_stops_only_after_both_deficits() {
-    let f = Fixture::new();
+    let env = racer_io::Env::host();
+    let f = Fixture::new(&env);
     let _ = futures::executor::block_on(f.store.open()).unwrap();
     f.store.configure(f.admission.clone(), 128, 128).unwrap();
     let incoming = f.copy(99, 3).ciphertext.envelope().page.clone();
@@ -1240,18 +1268,22 @@ struct Fixture {
     _directory: Directory,
 }
 impl Fixture {
-    fn new() -> Self {
-        Self::in_directory(Directory::new())
+    fn new(env: &racer_io::Env) -> Self {
+        Self::in_directory(env, Directory::new())
     }
-    fn in_directory(directory: Directory) -> Self {
-        Self::assemble(directory, crate::test_support::availability())
+    fn in_directory(env: &racer_io::Env, directory: Directory) -> Self {
+        Self::assemble(env, directory, crate::test_support::availability(env))
     }
-    fn assemble(directory: Directory, availability: Rc<crate::control::Availability>) -> Self {
+    fn assemble(
+        env: &racer_io::Env,
+        directory: Directory,
+        availability: Rc<crate::control::Availability>,
+    ) -> Self {
         let metrics = crate::telemetry::Metrics::default();
         let admission = Rc::new(flow_control::Quotas::new(AdmissionPolicy::new(
             crate::test_support::cluster::config(false).limits,
         )));
-        let reactor = Rc::new(Reactor::new(admission.clone(), &crate::test_support::env()));
+        let reactor = Rc::new(Reactor::new(admission.clone(), env));
         let pool = BufferPool::new(admission.clone());
         let index = Rc::new(catalog::Index::new(
             WorkerId(0),
@@ -1265,12 +1297,15 @@ impl Fixture {
             segments.clone(),
             1,
         ));
-        let slabs = Rc::new(crate::test_support::simulated_slab(Slab::new(
-            directory.0.join("worker-0-slab-0.dat"),
-            64 * 1024 * 1024,
-            32 * 1024 * 1024,
-            crate::model::PAGE_BYTES as usize + crate::store::MAX_HEADER_BYTES + 16,
-        )));
+        let slabs = Rc::new(crate::test_support::simulated_slab(
+            Slab::new(
+                directory.0.join("worker-0-slab-0.dat"),
+                64 * 1024 * 1024,
+                32 * 1024 * 1024,
+                crate::model::PAGE_BYTES as usize + crate::store::MAX_HEADER_BYTES + 16,
+            ),
+            env,
+        ));
         let reader = Rc::new(
             StoreReader::new(
                 index.clone(),
@@ -1405,7 +1440,7 @@ impl Fixture {
         self.store.writer.enqueue(copy, dirty)
     }
 
-    fn restart(self) -> Self {
+    fn restart(self, env: &racer_io::Env) -> Self {
         let Self {
             metrics,
             store,
@@ -1418,12 +1453,12 @@ impl Fixture {
         assert!(store.writer.is_idle());
         assert_eq!(reactor.in_flight(), 0);
         drop((store, reactor, pool, segments, admission, metrics));
-        Self::in_directory(_directory)
+        Self::in_directory(env, _directory)
     }
 }
-fn scope() -> RequestScope {
+fn scope(env: &racer_io::Env) -> RequestScope {
     RequestScope::on(
-        &crate::test_support::clock(),
+        &env.ctx.clock,
         RequestId([0; 16]),
         Instant::now() + Duration::from_secs(10),
     )
@@ -1441,17 +1476,18 @@ fn storage_requires_published_cache_and_live_keys_including_restore() {
     use crate::test_support::security::keys;
     use crate::test_support::security::rotation_bundle;
     use std::sync::Arc;
+    let env = racer_io::Env::host();
 
     for mode in ["unpublished", "absent", "keyless", "available"] {
-        let keys = Rc::new(keys());
+        let keys = Rc::new(keys(&env));
         let cache = CacheId(crate::test_support::security::CACHE.into());
         let availability = match mode {
             "unpublished" => Rc::new(Availability::new(
                 Arc::new(PublicationCell::new(Snapshot::retention(2))),
                 keys.clone(),
             )),
-            "absent" => for_caches(keys.clone(), vec![]),
-            _ => for_caches(keys.clone(), vec![cache.clone()]),
+            "absent" => for_caches(&env, keys.clone(), vec![]),
+            _ => for_caches(&env, keys.clone(), vec![cache.clone()]),
         };
         let revoke = || {
             let mut next = rotation_bundle(2, (*keys.peer_trust_roots().unwrap()).clone());
@@ -1461,7 +1497,7 @@ fn storage_requires_published_cache_and_live_keys_including_restore() {
         if mode == "keyless" {
             revoke();
         }
-        let f = Fixture::assemble(Directory::new(), availability.clone());
+        let f = Fixture::assemble(&env, Directory::new(), availability.clone());
         let memory = MemoryCache::new(f.pool.clone(), availability);
         let copy = f.copy(1, 3);
         let descriptor = copy.metadata.immutable();
@@ -1494,7 +1530,7 @@ fn storage_requires_published_cache_and_live_keys_including_restore() {
         let _ = futures::executor::block_on(f.store.open()).unwrap();
         f.reactor.init().unwrap();
         f.enqueue(copy).unwrap();
-        drive(&f.reactor, f.store.writer.progress(1, &scope())).unwrap();
+        drive(&f.reactor, f.store.writer.progress(1, &scope(&env))).unwrap();
         memory.publish(page.clone()).unwrap();
         assert!(memory.get(&id).unwrap().is_some());
         assert!(index.lookup(&id).unwrap().is_some());
@@ -1527,7 +1563,8 @@ fn drive<T>(reactor: &Reactor, future: impl Future<Output = Result<T>>) -> Resul
 }
 #[test]
 fn concurrent_writes_reserve_distinct_extents_and_capacity_before_completion() {
-    let f = Fixture::new();
+    let env = racer_io::Env::host();
+    let f = Fixture::new(&env);
     let _ = drive(&f.reactor, f.store.open()).unwrap();
     let a = f.copy(21, 4096);
     let b = f.copy(22, 4096);
@@ -1535,7 +1572,7 @@ fn concurrent_writes_reserve_distinct_extents_and_capacity_before_completion() {
     let bid = b.ciphertext.envelope().page.clone();
     f.enqueue(a).unwrap();
     f.enqueue(b).unwrap();
-    let scope = scope();
+    let scope = scope(&env);
     let mut writes = f.store.writer.progress(8, &scope);
     let mut cx = Context::from_waker(futures::task::noop_waker_ref());
     assert!(writes.as_mut().poll(&mut cx).is_pending());
@@ -1557,11 +1594,11 @@ fn concurrent_writes_reserve_distinct_extents_and_capacity_before_completion() {
 
 #[test]
 fn pipeline_out_of_order_failure_and_short_cqes_preserve_other_mapping() {
-    use crate::rt::reactor::simulation::{Fault, Simulation};
+    use racer_io::sim::{Fault, SimOs};
     for fault in [Fault::Delay(6), Fault::Errno(libc::EIO), Fault::Short(512)] {
-        let simulation = Simulation::new();
-        let _environment = simulation.enter();
-        let f = Fixture::new();
+        let simulation = SimOs::new();
+        let env = racer_io::Env::sim(&simulation, racer_io::WorkerCtx::host());
+        let f = Fixture::new(&env);
         let _ = drive(&f.reactor, f.store.open()).unwrap();
         let a = f.copy(21, 4096);
         let b = f.copy(22, 4096);
@@ -1570,7 +1607,7 @@ fn pipeline_out_of_order_failure_and_short_cqes_preserve_other_mapping() {
         f.enqueue(a).unwrap();
         f.enqueue(b).unwrap();
         simulation.inject("write", fault).unwrap();
-        let scope = scope();
+        let scope = scope(&env);
         let mut writes = f.store.writer.progress(8, &scope);
         let mut cx = Context::from_waker(std::task::Waker::noop());
         assert!(writes.as_mut().poll(&mut cx).is_pending());
@@ -1589,15 +1626,15 @@ fn pipeline_out_of_order_failure_and_short_cqes_preserve_other_mapping() {
 }
 #[test]
 fn second_sight_delayed_sealed_write_keeps_publication_authority() {
-    use crate::rt::reactor::simulation::{Fault, Simulation};
-    let simulation = Simulation::new();
-    let _environment = simulation.enter();
-    let f = Fixture::new();
+    use racer_io::sim::{Fault, SimOs};
+    let simulation = SimOs::new();
+    let env = racer_io::Env::sim(&simulation, racer_io::WorkerCtx::host());
+    let f = Fixture::new(&env);
     let _ = drive(&f.reactor, f.store.open()).unwrap();
     let first = f.copy(1, 113);
     let first_id = first.ciphertext.envelope().page.clone();
     f.enqueue(first).unwrap();
-    drive(&f.reactor, f.store.writer.progress(1, &scope())).unwrap();
+    drive(&f.reactor, f.store.writer.progress(1, &scope(&env))).unwrap();
     f.store.writer.index().touch(&first_id);
     let used = f.segments.snapshot()[0].used_bytes;
     drop(
@@ -1616,7 +1653,7 @@ fn second_sight_delayed_sealed_write_keeps_publication_authority() {
     );
     f.enqueue(delayed).unwrap();
     simulation.inject("write", Fault::Delay(6)).unwrap();
-    let request = scope();
+    let request = scope(&env);
     let mut progress = f.store.writer.progress(1, &request);
     assert!(
         progress
@@ -1636,16 +1673,16 @@ fn second_sight_delayed_sealed_write_keeps_publication_authority() {
 
 #[test]
 fn checkpoint_infeasible_budget_does_not_pause_an_inflight_writer() {
-    use crate::rt::reactor::simulation::{Fault, Simulation};
-    let simulation = Simulation::new();
-    let _environment = simulation.enter();
-    let f = Fixture::new();
+    use racer_io::sim::{Fault, SimOs};
+    let simulation = SimOs::new();
+    let env = racer_io::Env::sim(&simulation, racer_io::WorkerCtx::host());
+    let f = Fixture::new(&env);
     let _ = futures::executor::block_on(f.store.open()).unwrap();
     f.reactor.init().unwrap();
     let first = f.copy(1, 113);
     let metadata = first.metadata.immutable();
     f.enqueue(first).unwrap();
-    drive(&f.reactor, f.store.writer.progress(1, &scope())).unwrap();
+    drive(&f.reactor, f.store.writer.progress(1, &scope(&env))).unwrap();
     let index = f.store.writer.index();
     index.publish_version(metadata.clone()).unwrap();
     index
@@ -1664,7 +1701,7 @@ fn checkpoint_infeasible_budget_does_not_pause_an_inflight_writer() {
     let id = copy.ciphertext.envelope().page.clone();
     f.enqueue(copy).unwrap();
     simulation.inject("write", Fault::Delay(6)).unwrap();
-    let request = scope();
+    let request = scope(&env);
     let mut progress = f.store.writer.progress(1, &request);
     let mut cx = Context::from_waker(futures::task::noop_waker_ref());
     assert!(progress.as_mut().poll(&mut cx).is_pending());
@@ -1685,7 +1722,7 @@ fn checkpoint_infeasible_budget_does_not_pause_an_inflight_writer() {
     assert!(index.lookup(&id).unwrap().is_some());
     f.enqueue(f.copy(3, 113)).unwrap();
     assert_eq!(
-        drive(&f.reactor, f.store.writer.progress(1, &scope())),
+        drive(&f.reactor, f.store.writer.progress(1, &scope(&env))),
         Ok(1)
     );
     assert_eq!(f.store.writer.discarded_count(), 0);
@@ -1694,12 +1731,12 @@ fn checkpoint_infeasible_budget_does_not_pause_an_inflight_writer() {
 #[test]
 fn checkpoint_exact_budget_matches_full_snapshot_with_holds() {
     use super::checkpoint::{CHECKPOINT_VERSION, CheckpointImage, encode};
-    let simulation = crate::rt::reactor::simulation::Simulation::new();
-    let _environment = simulation.enter();
-    let f = Fixture::new();
+    let simulation = racer_io::sim::SimOs::new();
+    let env = racer_io::Env::sim(&simulation, racer_io::WorkerCtx::host());
+    let f = Fixture::new(&env);
     let _ = futures::executor::block_on(f.store.open()).unwrap();
     f.enqueue(f.copy(1, 113)).unwrap();
-    drive(&f.reactor, f.store.writer.progress(1, &scope())).unwrap();
+    drive(&f.reactor, f.store.writer.progress(1, &scope(&env))).unwrap();
     let index = f.store.writer.index();
     let metadata = index.snapshot().unwrap().entries[0].1.metadata.clone();
     index.publish_version(metadata.clone()).unwrap();
@@ -1753,10 +1790,11 @@ fn checkpoint_exact_budget_matches_full_snapshot_with_holds() {
 
 #[test]
 fn incremental_checkpoint_budget_thaws_and_async_publication_roundtrips() {
-    let f = Fixture::new();
+    let env = racer_io::Env::host();
+    let f = Fixture::new(&env);
     let _ = drive(&f.reactor, f.store.open()).unwrap();
     f.enqueue(f.copy(1, 4096)).unwrap();
-    drive(&f.reactor, f.store.writer.progress(8, &scope())).unwrap();
+    drive(&f.reactor, f.store.writer.progress(8, &scope(&env))).unwrap();
     assert!(matches!(
         drive(&f.reactor, f.store.checkpoint.snapshot_incremental(1)),
         Err(Error::Overloaded)
@@ -1774,7 +1812,7 @@ fn incremental_checkpoint_budget_thaws_and_async_publication_roundtrips() {
             crate::store::checkpoint::test_cluster(),
             vec![shard],
             f.reactor.clone(),
-            scope(),
+            scope(&env),
             7,
             1,
             1024 * 1024,
@@ -1800,10 +1838,11 @@ fn incremental_checkpoint_budget_thaws_and_async_publication_roundtrips() {
 
 #[test]
 fn checkpoint_preflights_segment_metadata_and_page_clones() {
-    let f = Fixture::new();
+    let env = racer_io::Env::host();
+    let f = Fixture::new(&env);
     let _ = drive(&f.reactor, f.store.open()).unwrap();
     f.enqueue(f.copy(1, 4096)).unwrap();
-    drive(&f.reactor, f.store.writer.progress(8, &scope())).unwrap();
+    drive(&f.reactor, f.store.writer.progress(8, &scope(&env))).unwrap();
     let index = f.store.writer.index();
     let metadata = index.snapshot().unwrap().entries[0].1.metadata.clone();
     index.publish_version(metadata.clone()).unwrap();
@@ -1848,10 +1887,10 @@ fn checkpoint_preflights_segment_metadata_and_page_clones() {
 
 #[test]
 fn checkpoint_directory_startup_is_bounded_and_simulation_compatible() {
-    use crate::rt::reactor::simulation::Simulation;
-    let sim = Simulation::new();
-    let _os = sim.enter();
-    let f = Fixture::new();
+    use racer_io::sim::SimOs;
+    let sim = SimOs::new();
+    let env = racer_io::Env::sim(&sim, racer_io::WorkerCtx::host());
+    let f = Fixture::new(&env);
     let directory = PathBuf::from("/checkpoint-new/nested");
     let checkpoint = super::checkpoint::Checkpointer::new(
         directory.clone(),
@@ -1861,13 +1900,13 @@ fn checkpoint_directory_startup_is_bounded_and_simulation_compatible() {
     assert!(sim.metadata(&directory).is_err());
     drive(
         &f.reactor,
-        Box::pin(checkpoint.prepare_directory(&f.reactor, &scope())),
+        Box::pin(checkpoint.prepare_directory(&f.reactor, &scope(&env))),
     )
     .unwrap();
     assert!(sim.metadata(&directory).is_ok());
     drive(
         &f.reactor,
-        Box::pin(checkpoint.prepare_directory(&f.reactor, &scope())),
+        Box::pin(checkpoint.prepare_directory(&f.reactor, &scope(&env))),
     )
     .unwrap();
     let bad = super::checkpoint::Checkpointer::new(
@@ -1878,11 +1917,11 @@ fn checkpoint_directory_startup_is_bounded_and_simulation_compatible() {
     assert!(
         drive(
             &f.reactor,
-            Box::pin(bad.prepare_directory(&f.reactor, &scope()))
+            Box::pin(bad.prepare_directory(&f.reactor, &scope(&env)))
         )
         .is_err()
     );
-    let canceled = scope();
+    let canceled = scope(&env);
     canceled.cancel().unwrap();
     assert_eq!(
         drive(
@@ -1895,7 +1934,8 @@ fn checkpoint_directory_startup_is_bounded_and_simulation_compatible() {
 
 #[test]
 fn record_round_trip_preserves_ciphertext_zeroes_padding_and_rejects_torn_header() {
-    let f = Fixture::new();
+    let env = racer_io::Env::host();
+    let f = Fixture::new(&env);
     let a = Alignment::new(512, 512, 512).unwrap();
     for length in [3, crate::model::PAGE_BYTES as usize] {
         let page = f.copy(9, length);
@@ -1932,7 +1972,8 @@ fn record_round_trip_preserves_ciphertext_zeroes_padding_and_rejects_torn_header
 }
 #[test]
 fn dirty_queue_is_bounded_and_cache_removal_discards_without_io() {
-    let f = Fixture::new();
+    let env = racer_io::Env::host();
+    let f = Fixture::new(&env);
     let _ = futures::executor::block_on(f.store.open()).unwrap();
     let first = f.copy(1, 3);
     let id = first.ciphertext.envelope().page.clone();
@@ -1956,7 +1997,8 @@ fn dirty_queue_is_bounded_and_cache_removal_discards_without_io() {
 
 #[test]
 fn allocator_integration_rejects_foreign_and_mismatched_writer_charges() {
-    let f = Fixture::new();
+    let env = racer_io::Env::host();
+    let f = Fixture::new(&env);
     let _ = futures::executor::block_on(f.store.open()).unwrap();
     let foreign =
         flow_control::Quotas::new(AdmissionPolicy::new(f.admission.policy().limits().clone()));
@@ -2017,7 +2059,8 @@ fn allocator_integration_rejects_foreign_and_mismatched_writer_charges() {
 
 #[test]
 fn allocator_integration_validates_reader_charges_before_submission() {
-    let f = Fixture::new();
+    let env = racer_io::Env::host();
+    let f = Fixture::new(&env);
     let _ = futures::executor::block_on(f.store.open()).unwrap();
     let page = f.copy(1, 64);
     let id = page.ciphertext.envelope().page.clone();
@@ -2054,7 +2097,7 @@ fn allocator_integration_validates_reader_charges_before_submission() {
         .unwrap();
     drop(lease);
     for variant in 0..4 {
-        let request = scope();
+        let request = scope(&env);
         let result = futures::executor::block_on(f.store.reader.read_with_token_reclaim(
             &id,
             &request,
@@ -2085,7 +2128,8 @@ fn allocator_integration_validates_reader_charges_before_submission() {
 
 #[test]
 fn allocator_integration_reclaims_idle_charge_before_writer_admission_retry() {
-    let f = Fixture::new();
+    let env = racer_io::Env::host();
+    let f = Fixture::new(&env);
     let _ = futures::executor::block_on(f.store.open()).unwrap();
     let page = f.copy(1, 64);
     let cache = &page.metadata.version.object.cache;
@@ -2125,7 +2169,8 @@ fn segment_images(f: &Fixture) -> Vec<(SegmentId, Generation, SegmentState, u64)
 
 #[test]
 fn store_open_rejects_preconfigured_mismatched_geometry() {
-    let f = Fixture::new();
+    let env = racer_io::Env::host();
+    let f = Fixture::new(&env);
     let alignment = f.store.writer.slabs().open_now().unwrap();
     f.segments
         .configure(32 * 1024 * 1024, 1, alignment)
@@ -2139,7 +2184,8 @@ fn store_open_rejects_preconfigured_mismatched_geometry() {
 
 #[test]
 fn index_capacity_rejection_preserves_segments_and_releases_all_charges_without_io() {
-    let mut f = Fixture::new();
+    let env = racer_io::Env::host();
+    let mut f = Fixture::new(&env);
     let alignment = futures::executor::block_on(f.store.open()).unwrap();
     // A writer without a configured clock must still reject safely, before I/O.
     f.store.writer = Rc::new(StoreWriter::new(
@@ -2148,7 +2194,7 @@ fn index_capacity_rejection_preserves_segments_and_releases_all_charges_without_
         f.store.writer.slabs().clone(),
         f.admission.clone(),
         f.reactor.clone(),
-        crate::test_support::availability(),
+        crate::test_support::availability(&env),
     ));
     let index = f.store.writer.index();
     index.set_page_capacity(1).unwrap();
@@ -2185,7 +2231,7 @@ fn index_capacity_rejection_preserves_segments_and_releases_all_charges_without_
         .unwrap();
     drop((retained, append));
     let before = segment_images(&f);
-    let request = scope();
+    let request = scope(&env);
     let mut progress = f.store.writer.progress(2, &request);
     let mut cx = Context::from_waker(futures::task::noop_waker_ref());
     assert_eq!(progress.as_mut().poll(&mut cx), Poll::Ready(Ok(2)));
@@ -2223,7 +2269,8 @@ fn index_capacity_rejection_preserves_segments_and_releases_all_charges_without_
 
 #[test]
 fn real_writer_rechecks_index_capacity_and_replaces_same_page_when_full() {
-    let f = Fixture::new();
+    let env = racer_io::Env::host();
+    let f = Fixture::new(&env);
     let _ = futures::executor::block_on(f.store.open()).unwrap();
     f.reactor.init().expect("storage test requires io_uring");
     let index = f.store.writer.index();
@@ -2239,7 +2286,7 @@ fn real_writer_rechecks_index_capacity_and_replaces_same_page_when_full() {
         2
     );
     assert_eq!(f.metrics.count(crate::telemetry::Event::DiskPublication), 0);
-    let request = scope();
+    let request = scope(&env);
     let mut progress = f.store.writer.progress(1, &request);
     let mut cx = Context::from_waker(futures::task::noop_waker_ref());
     assert!(progress.as_mut().poll(&mut cx).is_pending());
@@ -2336,11 +2383,12 @@ fn real_writer_rechecks_index_capacity_and_replaces_same_page_when_full() {
 
 #[test]
 fn persistence_pressure_and_restart_preserve_only_live_pages() {
+    let env = racer_io::Env::host();
     for (capacity, length) in [(1, 3), (2, 4096), (4, 65536)] {
-        let f = Fixture::new();
+        let f = Fixture::new(&env);
         f.store.writer.index().set_page_capacity(capacity).unwrap();
         let _ = drive(&f.reactor, f.store.open()).unwrap();
-        let request = scope();
+        let request = scope(&env);
         let mut expected = Vec::new();
         for number in 1..=6 {
             let page = f.copy(number, length);
@@ -2370,14 +2418,14 @@ fn persistence_pressure_and_restart_preserve_only_live_pages() {
             &f.reactor,
             f.store
                 .checkpoint
-                .publish(crate::store::checkpoint::test_cluster(), vec![image]),
+                .publish(&env, crate::store::checkpoint::test_cluster(), vec![image]),
         )
         .unwrap();
         f.store.checkpoint.finish_snapshot();
         assert_eq!(f.admission.used(ResourceClass::DirtyCiphertext), 0);
 
         // Drop every old component, then reopen the same actual slab/checkpoint files.
-        let f = f.restart();
+        let f = f.restart(&env);
         // Ring teardown may release the kernel's final file reference after the
         // userspace owners drop. Bound the wait for the exclusive slab lock;
         // an actual leaked owner must still fail the restart scenario.
@@ -2391,7 +2439,7 @@ fn persistence_pressure_and_restart_preserve_only_live_pages() {
                 result => panic!("slab did not reopen after owner teardown: {result:?}"),
             }
         };
-        let image = drive(&f.reactor, f.store.recovery.load(alignment))
+        let image = drive(&f.reactor, f.store.recovery.load(&env, alignment))
             .unwrap()
             .unwrap();
         drive(
@@ -2414,7 +2462,8 @@ fn persistence_pressure_and_restart_preserve_only_live_pages() {
 
 #[test]
 fn real_direct_slab_roundtrip_checkpoint_and_corruption_miss() {
-    let f = Fixture::new();
+    let env = racer_io::Env::host();
+    let f = Fixture::new(&env);
     let alignment = futures::executor::block_on(f.store.open())
         .expect("test filesystem must support O_DIRECT and STATX_DIOALIGN");
     f.reactor.init().expect("storage test requires io_uring");
@@ -2422,7 +2471,7 @@ fn real_direct_slab_roundtrip_checkpoint_and_corruption_miss() {
     let id = page.ciphertext.envelope().page.clone();
     f.enqueue(page.clone()).unwrap();
     assert!(f.store.writer.index().lookup(&id).unwrap().is_none());
-    let request = scope();
+    let request = scope(&env);
     assert_eq!(
         drive(&f.reactor, f.store.writer.progress(1, &request)).unwrap(),
         1
@@ -2433,14 +2482,14 @@ fn real_direct_slab_roundtrip_checkpoint_and_corruption_miss() {
     assert_eq!(read.ciphertext.bytes(), page.ciphertext.bytes());
     assert_eq!(read.ciphertext.envelope(), page.ciphertext.envelope());
     let image = futures::executor::block_on(f.store.checkpoint.snapshot_shard()).unwrap();
-    futures::executor::block_on(
-        f.store
-            .checkpoint
-            .publish(crate::store::checkpoint::test_cluster(), vec![image]),
-    )
+    futures::executor::block_on(f.store.checkpoint.publish(
+        &env,
+        crate::store::checkpoint::test_cluster(),
+        vec![image],
+    ))
     .unwrap();
     f.store.checkpoint.finish_snapshot();
-    let loaded = futures::executor::block_on(f.store.recovery.load(alignment))
+    let loaded = futures::executor::block_on(f.store.recovery.load(&env, alignment))
         .unwrap()
         .unwrap();
     futures::executor::block_on(
@@ -2500,12 +2549,13 @@ fn real_direct_slab_roundtrip_checkpoint_and_corruption_miss() {
 
 #[test]
 fn other_format_version_and_unknown_cipher_records_are_cache_misses() {
-    let f = Fixture::new();
+    let env = racer_io::Env::host();
+    let f = Fixture::new(&env);
     let _ = futures::executor::block_on(f.store.open()).unwrap();
     f.reactor.init().unwrap();
     let page = f.copy(3, 23);
     let id = page.ciphertext.envelope().page.clone();
-    let request = scope();
+    let request = scope(&env);
     for other_version in [true, false] {
         f.enqueue(page.clone()).unwrap();
         drive(&f.reactor, f.store.writer.progress(1, &request)).unwrap();
@@ -2577,12 +2627,13 @@ fn other_format_version_and_unknown_cipher_records_are_cache_misses() {
 
 #[test]
 fn stored_payload_and_tag_corruption_reach_the_reader_for_tag_check() {
-    let f = Fixture::new();
+    let env = racer_io::Env::host();
+    let f = Fixture::new(&env);
     let _ = futures::executor::block_on(f.store.open()).unwrap();
     f.reactor.init().unwrap();
     let page = f.copy(3, 23);
     let id = page.ciphertext.envelope().page.clone();
-    let request = scope();
+    let request = scope(&env);
     for corrupt_tag in [false, true] {
         f.enqueue(page.clone()).unwrap();
         drive(&f.reactor, f.store.writer.progress(1, &request)).unwrap();
@@ -2649,13 +2700,14 @@ fn stored_payload_and_tag_corruption_reach_the_reader_for_tag_check() {
 
 #[test]
 fn abandoned_write_retains_kernel_lease_and_cannot_publish() {
-    let f = Fixture::new();
+    let env = racer_io::Env::host();
+    let f = Fixture::new(&env);
     let _ = futures::executor::block_on(f.store.open()).unwrap();
     f.reactor.init().unwrap();
     let page = f.copy(1, 64);
     let id = page.ciphertext.envelope().page.clone();
     f.enqueue(page).unwrap();
-    let request = scope();
+    let request = scope(&env);
     let mut operation = f.store.writer.progress(1, &request);
     let waker = futures::task::noop_waker();
     let mut cx = Context::from_waker(&waker);
@@ -2686,13 +2738,14 @@ fn abandoned_write_retains_kernel_lease_and_cannot_publish() {
 
 #[test]
 fn cache_removal_during_write_fences_late_publication() {
-    let f = Fixture::new();
+    let env = racer_io::Env::host();
+    let f = Fixture::new(&env);
     let _ = futures::executor::block_on(f.store.open()).unwrap();
     f.reactor.init().unwrap();
     let page = f.copy(1, 64);
     let id = page.ciphertext.envelope().page.clone();
     f.enqueue(page).unwrap();
-    let request = scope();
+    let request = scope(&env);
     let mut operation = f.store.writer.progress(1, &request);
     let waker = futures::task::noop_waker();
     let mut cx = Context::from_waker(&waker);
@@ -2733,11 +2786,12 @@ fn sustained_rotation_reclaims_history_and_fences_held_pages_and_write_completio
     use crate::test_support::security::rotation_bundle;
     use racer_crypto::identity::KeyPurpose;
     use std::sync::Arc;
-    let keys = Rc::new(keys());
+    let env = racer_io::Env::host();
+    let keys = Rc::new(keys(&env));
     let roots = (*keys.peer_trust_roots().unwrap()).clone();
     let cache = CacheId(crate::test_support::security::CACHE.into());
-    let availability = for_caches(keys.clone(), vec![cache.clone()]);
-    let f = Fixture::assemble(Directory::new(), availability.clone());
+    let availability = for_caches(&env, keys.clone(), vec![cache.clone()]);
+    let f = Fixture::assemble(&env, Directory::new(), availability.clone());
     let memory = MemoryCache::new(f.pool.clone(), availability);
     let _ = futures::executor::block_on(f.store.open()).unwrap();
     f.reactor.init().unwrap();
@@ -2844,10 +2898,11 @@ fn sustained_rotation_reclaims_history_and_fences_held_pages_and_write_completio
 
 #[test]
 fn truncated_payload_is_a_miss_and_write_failure_releases_dirty_accounting() {
-    let f = Fixture::new();
+    let env = racer_io::Env::host();
+    let f = Fixture::new(&env);
     let _ = futures::executor::block_on(f.store.open()).unwrap();
     f.reactor.init().unwrap();
-    let request = scope();
+    let request = scope(&env);
     let page = f.copy(7, 64);
     let id = page.ciphertext.envelope().page.clone();
     f.enqueue(page).unwrap();
@@ -2876,7 +2931,8 @@ fn truncated_payload_is_a_miss_and_write_failure_releases_dirty_accounting() {
 
 #[test]
 fn stopped_admission_drains_two_accepted_copies_with_no_spare_ciphertext_quota() {
-    let f = Fixture::new();
+    let env = racer_io::Env::host();
+    let f = Fixture::new(&env);
     let _ = futures::executor::block_on(f.store.open()).unwrap();
     f.reactor.init().unwrap();
     let first = f.copy(1, 64);
@@ -2904,7 +2960,7 @@ fn stopped_admission_drains_two_accepted_copies_with_no_spare_ciphertext_quota()
             .reserve(None, ResourceClass::Ciphertext, 512)
             .is_err()
     );
-    let request = scope();
+    let request = scope(&env);
     drive(&f.reactor, f.store.writer.drain(&request)).unwrap();
     assert!(f.store.writer.index().lookup(&first_id).unwrap().is_some());
     assert!(f.store.writer.index().lookup(&second_id).unwrap().is_some());
@@ -2918,7 +2974,8 @@ fn stopped_admission_drains_two_accepted_copies_with_no_spare_ciphertext_quota()
 
 #[test]
 fn staging_pressure_rejects_before_queue_acceptance_and_preserves_accepted_work() {
-    let f = Fixture::new();
+    let env = racer_io::Env::host();
+    let f = Fixture::new(&env);
     let _ = futures::executor::block_on(f.store.open()).unwrap();
     f.reactor.init().unwrap();
     let first = f.copy(1, 64);
@@ -2936,7 +2993,7 @@ fn staging_pressure_rejects_before_queue_acceptance_and_preserves_accepted_work(
     assert!(matches!(f.enqueue(second), Err(Error::Overloaded)));
     assert_eq!(f.store.writer.pending_count(), 1);
     f.admission.stop();
-    drive(&f.reactor, f.store.writer.drain(&scope())).unwrap();
+    drive(&f.reactor, f.store.writer.drain(&scope(&env))).unwrap();
     assert!(f.store.writer.is_idle());
     assert_eq!(f.admission.used(ResourceClass::DirtyCiphertext), 0);
     drop(pressure);
@@ -2945,13 +3002,14 @@ fn staging_pressure_rejects_before_queue_acceptance_and_preserves_accepted_work(
 
 #[test]
 fn shutdown_deadline_discards_second_copy_and_fences_submitted_first_copy() {
-    let f = Fixture::new();
+    let env = racer_io::Env::host();
+    let f = Fixture::new(&env);
     let _ = futures::executor::block_on(f.store.open()).unwrap();
     f.reactor.init().unwrap();
     f.enqueue(f.copy(1, 64)).unwrap();
     f.enqueue(f.copy(2, 64)).unwrap();
     f.admission.stop();
-    let request = scope();
+    let request = scope(&env);
     let mut write = f.store.writer.progress(1, &request);
     let mut cx = Context::from_waker(futures::task::noop_waker_ref());
     assert!(write.as_mut().poll(&mut cx).is_pending());
@@ -2989,14 +3047,15 @@ fn shutdown_deadline_discards_second_copy_and_fences_submitted_first_copy() {
 
 #[test]
 fn incremental_ciphertext_reclamation_preserves_submitted_fence_and_remaining_queue() {
-    let f = Fixture::new();
+    let env = racer_io::Env::host();
+    let f = Fixture::new(&env);
     f.store.configure(f.admission.clone(), 3, 16).unwrap();
     let _ = futures::executor::block_on(f.store.open()).unwrap();
     f.reactor.init().unwrap();
     f.enqueue(f.copy(1, 64)).unwrap();
     f.enqueue(f.copy(2, 64)).unwrap();
     f.enqueue(f.copy(3, 64)).unwrap();
-    let request = scope();
+    let request = scope(&env);
     let mut write = f.store.writer.progress(1, &request);
     let mut cx = Context::from_waker(futures::task::noop_waker_ref());
     assert!(write.as_mut().poll(&mut cx).is_pending());
@@ -3025,13 +3084,14 @@ fn incremental_ciphertext_reclamation_preserves_submitted_fence_and_remaining_qu
 
 #[test]
 fn disk_read_reclaims_exact_staging_and_decode_charges_without_flushing_queue() {
-    let f = Fixture::new();
+    let env = racer_io::Env::host();
+    let f = Fixture::new(&env);
     let _ = futures::executor::block_on(f.store.open()).unwrap();
     f.reactor.init().unwrap();
     let copy = f.copy(1, 64);
     let id = copy.ciphertext.envelope().page.clone();
     f.enqueue(copy).unwrap();
-    let request = scope();
+    let request = scope(&env);
     drive(&f.reactor, f.store.writer.progress(1, &request)).unwrap();
     let disk_bytes = f
         .store
@@ -3105,7 +3165,8 @@ fn disk_read_reclaims_exact_staging_and_decode_charges_without_flushing_queue() 
 
 #[test]
 fn unreclaimable_segment_pressure_discards_copies_without_fatal_progress_error() {
-    let f = Fixture::new();
+    let env = racer_io::Env::host();
+    let f = Fixture::new(&env);
     let _ = futures::executor::block_on(f.store.open()).unwrap();
     f.reactor.init().unwrap();
     f.enqueue(f.copy(1, 64)).unwrap();
@@ -3115,7 +3176,7 @@ fn unreclaimable_segment_pressure_discards_copies_without_fatal_progress_error()
     let second = segments.append(32 * 1024 * 1024).unwrap();
     f.admission.stop();
     assert_eq!(
-        drive(&f.reactor, f.store.writer.progress(2, &scope())).unwrap(),
+        drive(&f.reactor, f.store.writer.progress(2, &scope(&env))).unwrap(),
         2
     );
     assert_eq!(f.store.writer.discarded_count(), 2);
@@ -3130,7 +3191,8 @@ fn unreclaimable_segment_pressure_discards_copies_without_fatal_progress_error()
 
 #[test]
 fn actual_enospc_completion_discards_both_writes_and_drains() {
-    let f = Fixture::new();
+    let env = racer_io::Env::host();
+    let f = Fixture::new(&env);
     let _ = futures::executor::block_on(f.store.open()).unwrap();
     f.reactor.init().unwrap();
     f.enqueue(f.copy(1, 64)).unwrap();
@@ -3148,7 +3210,7 @@ fn actual_enospc_completion_discards_both_writes_and_drains() {
         )
         .unwrap();
     f.admission.stop();
-    drive(&f.reactor, f.store.writer.drain(&scope())).unwrap();
+    drive(&f.reactor, f.store.writer.drain(&scope(&env))).unwrap();
     assert_eq!(f.store.writer.discarded_count(), 2);
     assert!(f.store.writer.is_idle());
     assert!(
@@ -3167,7 +3229,8 @@ fn actual_enospc_completion_discards_both_writes_and_drains() {
 
 #[test]
 fn fill_accepted_before_stop_can_transfer_dirty_ownership_during_drain() {
-    let f = Fixture::new();
+    let env = racer_io::Env::host();
+    let f = Fixture::new(&env);
     let _ = futures::executor::block_on(f.store.open()).unwrap();
     f.reactor.init().unwrap();
     let page = f.copy(1, 64);
@@ -3182,7 +3245,7 @@ fn fill_accepted_before_stop_can_transfer_dirty_ownership_during_drain() {
         .unwrap();
     f.admission.stop();
     f.store.writer.enqueue(page, dirty).unwrap();
-    drive(&f.reactor, f.store.writer.drain(&scope())).unwrap();
+    drive(&f.reactor, f.store.writer.drain(&scope(&env))).unwrap();
     assert!(f.store.writer.index().lookup(&id).unwrap().is_some());
     assert!(f.store.writer.is_idle());
 }
@@ -3190,15 +3253,17 @@ fn fill_accepted_before_stop_can_transfer_dirty_ownership_during_drain() {
 #[test]
 fn registered_fill_accepted_before_stop_persists_during_drain() {
     use crate::rdma::links::tests::{link_up, receive_registered, world};
-    let f = Fixture::new();
+    let env = racer_io::Env::host();
+    let f = Fixture::new(&env);
     let _ = futures::executor::block_on(f.store.open()).unwrap();
     f.reactor.init().unwrap();
     let mut page = f.copy(1, 64);
     let id = page.ciphertext.envelope().page.clone();
     let cache = page.metadata.version.object.cache.clone();
     let mut w = world();
-    link_up(&mut w);
-    let received = receive_registered(&mut w, &page.ciphertext);
+    let env = w.env.clone();
+    link_up(&env, &mut w);
+    let received = receive_registered(&env, &mut w, &page.ciphertext);
     let length = received.len();
     let reservation = f
         .admission
@@ -3214,7 +3279,7 @@ fn registered_fill_accepted_before_stop_persists_during_drain() {
         .unwrap();
     f.admission.stop();
     f.store.writer.enqueue(page, dirty).unwrap();
-    drive(&f.reactor, f.store.writer.drain(&scope())).unwrap();
+    drive(&f.reactor, f.store.writer.drain(&scope(&env))).unwrap();
     assert!(f.store.writer.index().lookup(&id).unwrap().is_some());
     assert!(f.store.writer.is_idle());
 }
@@ -3222,15 +3287,17 @@ fn registered_fill_accepted_before_stop_persists_during_drain() {
 #[test]
 fn registered_persistence_reclaims_cached_pages_through_callback() {
     use crate::rdma::links::tests::{link_up, receive_registered, world};
-    let f = Fixture::new();
+    let env = racer_io::Env::host();
+    let f = Fixture::new(&env);
     let _ = futures::executor::block_on(f.store.open()).unwrap();
     f.reactor.init().unwrap();
     let mut page = f.copy(1, 64);
     let id = page.ciphertext.envelope().page.clone();
     let cache = page.metadata.version.object.cache.clone();
     let mut w = world();
-    link_up(&mut w);
-    let received = receive_registered(&mut w, &page.ciphertext);
+    let env = w.env.clone();
+    link_up(&env, &mut w);
+    let received = receive_registered(&env, &mut w, &page.ciphertext);
     let length = received.len();
     let reservation = f
         .admission
@@ -3281,7 +3348,7 @@ fn registered_persistence_reclaims_cached_pages_through_callback() {
     // Both the registered copy-out and disk staging use the callback.
     assert_eq!(calls.get(), 2);
     assert!(cached.borrow().is_empty());
-    drive(&f.reactor, f.store.writer.drain(&scope())).unwrap();
+    drive(&f.reactor, f.store.writer.drain(&scope(&env))).unwrap();
     assert!(f.store.writer.index().lookup(&id).unwrap().is_some());
     assert!(f.store.writer.is_idle());
 }
@@ -3292,15 +3359,17 @@ fn registered_persistence_reclaims_cached_pages_through_callback() {
 #[test]
 fn registered_page_copied_out_for_disk_is_device_aligned() {
     use crate::rdma::links::tests::{link_up, receive_registered, world};
-    let f = Fixture::new();
+    let env = racer_io::Env::host();
+    let f = Fixture::new(&env);
     let _ = futures::executor::block_on(f.store.open()).unwrap();
     f.reactor.init().unwrap();
     let mut page = f.copy(1, 64);
     let id = page.ciphertext.envelope().page.clone();
     let cache = page.metadata.version.object.cache.clone();
     let mut w = world();
-    link_up(&mut w);
-    let received = receive_registered(&mut w, &page.ciphertext);
+    let env = w.env.clone();
+    link_up(&env, &mut w);
+    let received = receive_registered(&env, &mut w, &page.ciphertext);
     let length = received.len();
     let reservation = f
         .admission
@@ -3333,22 +3402,24 @@ fn registered_page_copied_out_for_disk_is_device_aligned() {
     // Zero-copy staging: only the header block.
     assert_eq!(reserved[1], staging_bytes(&queued, alignment).unwrap());
     assert!(zero_copy_body(&queued, alignment).unwrap().is_some());
-    drive(&f.reactor, f.store.writer.drain(&scope())).unwrap();
+    drive(&f.reactor, f.store.writer.drain(&scope(&env))).unwrap();
     assert!(f.store.writer.index().lookup(&id).unwrap().is_some());
 }
 
 #[test]
 fn registered_page_cached_then_persisted_is_copied_out_once() {
     use crate::rdma::links::tests::{link_up, receive_registered, world};
-    let f = Fixture::new();
+    let env = racer_io::Env::host();
+    let f = Fixture::new(&env);
     let _ = futures::executor::block_on(f.store.open()).unwrap();
     f.reactor.init().unwrap();
     let mut page = f.copy(1, 64);
     let id = page.ciphertext.envelope().page.clone();
     let cache = page.metadata.version.object.cache.clone();
     let mut w = world();
-    link_up(&mut w);
-    let received = receive_registered(&mut w, &page.ciphertext);
+    let env = w.env.clone();
+    link_up(&env, &mut w);
+    let received = receive_registered(&env, &mut w, &page.ciphertext);
     let length = received.len();
     let reservation = f
         .admission
@@ -3387,7 +3458,7 @@ fn registered_page_cached_then_persisted_is_copied_out_once() {
         before + 1,
         "one copy-out for cache and disk queue"
     );
-    drive(&f.reactor, f.store.writer.drain(&scope())).unwrap();
+    drive(&f.reactor, f.store.writer.drain(&scope(&env))).unwrap();
     assert!(f.store.writer.index().lookup(&id).unwrap().is_some());
     drop((cached, again));
     crate::rdma::links::tests::pump(&mut w.a.owner, &mut w.b.owner);
@@ -4179,15 +4250,16 @@ mod checkpoint {
         use crate::runtime::RequestScope;
         use std::time::Duration;
         use std::time::Instant;
+        let env = racer_io::Env::host();
         let directory = Directory::new();
-        let (index, segments) = state(8);
+        let (index, segments) = state(&env, 8);
         let checkpoint = Checkpointer::new(directory.0.clone(), index, segments);
         checkpoint.configure_geometry(geometry()).unwrap();
         let reactor = Rc::new(Reactor::new(
             Rc::new(flow_control::Quotas::new(AdmissionPolicy::new(
                 crate::test_support::cluster::config(false).limits,
             ))),
-            &crate::test_support::env(),
+            &env,
         ));
         let scope = RequestScope::host(
             crate::model::RequestId([202; 16]),
@@ -4203,7 +4275,7 @@ mod checkpoint {
                 checkpoint
                     .publish_async(
                         crate::store::checkpoint::test_cluster(),
-                        vec![shard()],
+                        vec![shard(&env)],
                         reactor.clone(),
                         scope,
                         3,
@@ -4229,14 +4301,15 @@ mod checkpoint {
         use std::task::Poll;
         use std::time::Duration;
         use std::time::Instant;
+        let env = racer_io::Env::host();
         let directory = Directory::new();
-        let (index, segments) = state(8);
+        let (index, segments) = state(&env, 8);
         let checkpoint = Checkpointer::new(directory.0.clone(), index, segments);
         let reactor = Rc::new(Reactor::new(
             Rc::new(flow_control::Quotas::new(AdmissionPolicy::new(
                 crate::test_support::cluster::config(false).limits,
             ))),
-            &crate::test_support::env(),
+            &env,
         ));
         reactor.init().unwrap();
         let scope = || {
@@ -4266,7 +4339,7 @@ mod checkpoint {
         let mut abandoned = checkpoint
             .publish_async(
                 crate::store::checkpoint::test_cluster(),
-                vec![shard()],
+                vec![shard(&env)],
                 reactor.clone(),
                 scope(),
                 3,
@@ -4320,6 +4393,7 @@ mod checkpoint {
 
     #[test]
     fn checkpoint_geometry_keeps_item_limit_alignment_errors_and_live_dimensions() {
+        let env = racer_io::Env::host();
         let valid = geometry();
         let excessive = CheckpointGeometry {
             slab_bytes: SEGMENT_BYTES * 1_000_001,
@@ -4359,7 +4433,7 @@ mod checkpoint {
         ] {
             assert_eq!(invalid.validate(), Err(Error::CorruptRecord));
         }
-        let (_, segments) = state(8);
+        let (_, segments) = state(&env, 8);
         assert_eq!(valid.validate_live(&segments), Ok(()));
         assert_eq!(
             CheckpointGeometry {
@@ -4393,12 +4467,12 @@ mod checkpoint {
         }
     }
 
-    fn state(capacity: usize) -> (Rc<Index>, Rc<Segments>) {
+    fn state(env: &racer_io::Env, capacity: usize) -> (Rc<Index>, Rc<Segments>) {
         let g = geometry();
         let index = Rc::new(Index::new(
             WorkerId(0),
             capacity,
-            crate::test_support::availability(),
+            crate::test_support::availability(env),
             racer_io::Clock::host(),
         ));
         let segments = Rc::new(Segments::new(g.segment_bytes));
@@ -4412,8 +4486,8 @@ mod checkpoint {
         (index, segments)
     }
 
-    fn shard() -> ShardImage {
-        let (index, segments) = state(8);
+    fn shard(env: &racer_io::Env) -> ShardImage {
+        let (index, segments) = state(env, 8);
         let metadata = descriptor("v1", 17);
         let page = PageId {
             version: metadata.version.clone(),
@@ -4451,13 +4525,13 @@ mod checkpoint {
         }
     }
 
-    fn image(sequence: u64) -> CheckpointImage {
+    fn image(env: &racer_io::Env, sequence: u64) -> CheckpointImage {
         CheckpointImage {
             version: CHECKPOINT_VERSION,
             page_size: racer_wire::object::PageSize::DEFAULT,
             cluster: crate::store::checkpoint::test_cluster(),
             sequence,
-            shards: vec![shard()],
+            shards: vec![shard(env)],
         }
     }
 
@@ -4469,7 +4543,8 @@ mod checkpoint {
 
     #[test]
     fn recovery_budget_accounts_for_decoded_strings_vectors_and_validation_before_decode() {
-        let bytes = encode(&image(1)).unwrap();
+        let env = racer_io::Env::host();
+        let bytes = encode(&image(&env, 1)).unwrap();
         let required = recovery_memory(&bytes, usize::MAX).unwrap();
         assert!(required > bytes.len());
         assert!(matches!(
@@ -4498,9 +4573,10 @@ mod checkpoint {
     #[test]
     fn recovery_downsize_falls_back_or_starts_cold_without_retaining_two_images() {
         use crate::store::checkpoint::read_candidates_with_budget;
+        let env = racer_io::Env::host();
         let directory = Directory::new();
-        let older = encode(&image(1)).unwrap();
-        let mut newer = image(2);
+        let older = encode(&image(&env, 1)).unwrap();
+        let mut newer = image(&env, 2);
         for n in 0..20 {
             newer.shards[0]
                 .index
@@ -4514,7 +4590,7 @@ mod checkpoint {
         // Both encoded files fit; only the older decoded image fits.
         assert!(newer.len() < budget);
         assert_eq!(
-            read_candidates_with_budget(&directory.0, budget)
+            read_candidates_with_budget(&env, &directory.0, budget)
                 .unwrap()
                 .next()
                 .unwrap()
@@ -4524,14 +4600,14 @@ mod checkpoint {
         );
         for tiny in [0, 1, older.len(), budget - 1] {
             assert!(
-                read_candidates_with_budget(&directory.0, tiny)
+                read_candidates_with_budget(&env, &directory.0, tiny)
                     .unwrap()
                     .next()
                     .is_none()
             );
         }
         assert_eq!(
-            read_candidates_with_budget(&directory.0, MAX_CHECKPOINT_BYTES)
+            read_candidates_with_budget(&env, &directory.0, MAX_CHECKPOINT_BYTES)
                 .unwrap()
                 .next()
                 .unwrap()
@@ -4557,7 +4633,8 @@ mod checkpoint {
 
     #[test]
     fn cluster_round_trips_and_binds_the_digest() {
-        let original = image(3);
+        let env = racer_io::Env::host();
+        let original = image(&env, 3);
         let bytes = encode(&original).unwrap();
         assert_eq!(CHECKPOINT_VERSION, 4);
         assert_eq!(&bytes[32..68], original.cluster.0.as_bytes());
@@ -4572,6 +4649,7 @@ mod checkpoint {
 
     #[test]
     fn invalid_cluster_is_rejected_on_encode_and_decode() {
+        let env = racer_io::Env::host();
         for bad in [
             "",
             "not-a-uuid",
@@ -4580,13 +4658,13 @@ mod checkpoint {
             "AAAAAAAA-1111-4111-8111-111111111111",
             "11111111x1111-4111-8111-111111111111",
         ] {
-            let mut cut = image(1);
+            let mut cut = image(&env, 1);
             cut.cluster = racer_wire::control::ClusterId(bad.into());
             assert!(encode(&cut).is_err(), "{bad}");
         }
         // Same-length invalid bytes with a valid digest still fail to decode.
         use sha2::Digest;
-        let bytes = encode(&image(1)).unwrap();
+        let bytes = encode(&image(&env, 1)).unwrap();
         let mut body = bytes[..bytes.len() - 32].to_vec();
         body[32..68].copy_from_slice(b"AAAAAAAA-1111-4111-8111-111111111111");
         let digest = sha2::Sha256::digest(&body);
@@ -4602,22 +4680,27 @@ mod checkpoint {
     #[test]
     fn legacy_v1_checkpoint_is_a_disposable_cold_start() {
         use crate::store::checkpoint::read_candidates_with_budget;
+        let env = racer_io::Env::host();
         let directory = Directory::new();
-        let v1 = legacy_v1(&encode(&image(7)).unwrap());
+        let v1 = legacy_v1(&encode(&image(&env, 7)).unwrap());
         assert!(decode(&v1).is_err());
         assert!(recovery_memory(&v1, usize::MAX).is_err());
         // Only v1 on disk: no candidate and no error, so recovery starts cold.
         fs::write(directory.0.join("checkpoint.0"), &v1).unwrap();
         assert!(
-            read_candidates_with_budget(&directory.0, MAX_CHECKPOINT_BYTES)
+            read_candidates_with_budget(&env, &directory.0, MAX_CHECKPOINT_BYTES)
                 .unwrap()
                 .next()
                 .is_none()
         );
         // A v2 slot next to a newer v1 slot is still used. The v1 file is left
         // in place and is replaced by the next publication.
-        fs::write(directory.0.join("checkpoint.1"), encode(&image(2)).unwrap()).unwrap();
-        let found: Vec<_> = read_candidates_with_budget(&directory.0, MAX_CHECKPOINT_BYTES)
+        fs::write(
+            directory.0.join("checkpoint.1"),
+            encode(&image(&env, 2)).unwrap(),
+        )
+        .unwrap();
+        let found: Vec<_> = read_candidates_with_budget(&env, &directory.0, MAX_CHECKPOINT_BYTES)
             .unwrap()
             .map(|(_, image)| image.sequence)
             .collect();
@@ -4629,8 +4712,13 @@ mod checkpoint {
     fn unreadable_slot_is_disposable_but_storage_directory_failure_is_fatal() {
         use crate::store::checkpoint::read_candidates_with_budget;
         use std::os::fd::AsRawFd;
+        let env = racer_io::Env::host();
         let directory = Directory::new();
-        fs::write(directory.0.join("checkpoint.1"), encode(&image(1)).unwrap()).unwrap();
+        fs::write(
+            directory.0.join("checkpoint.1"),
+            encode(&image(&env, 1)).unwrap(),
+        )
+        .unwrap();
         // Opening a Unix socket as a file fails even when tests run as root.
         let dir = fs::File::open(&directory.0).unwrap();
         let _socket = std::os::unix::net::UnixListener::bind(format!(
@@ -4639,7 +4727,7 @@ mod checkpoint {
         ))
         .unwrap();
         assert_eq!(
-            read_candidates_with_budget(&directory.0, MAX_CHECKPOINT_BYTES)
+            read_candidates_with_budget(&env, &directory.0, MAX_CHECKPOINT_BYTES)
                 .unwrap()
                 .next()
                 .unwrap()
@@ -4648,16 +4736,21 @@ mod checkpoint {
             1
         );
         assert!(matches!(
-            read_candidates_with_budget(&directory.0.join("checkpoint.1"), MAX_CHECKPOINT_BYTES),
+            read_candidates_with_budget(
+                &env,
+                &directory.0.join("checkpoint.1"),
+                MAX_CHECKPOINT_BYTES
+            ),
             Err(Error::Io)
         ));
     }
 
     #[test]
     fn binary_round_trip_retains_locations_keys_metadata_and_is_send() {
+        let env = racer_io::Env::host();
         fn assert_send<T: Send>() {}
         assert_send::<ShardImage>();
-        let encoded = checkpoint_format::encode(&image(7)).unwrap();
+        let encoded = checkpoint_format::encode(&image(&env, 7)).unwrap();
         let decoded = checkpoint_format::decode(&encoded).unwrap();
         assert_eq!(decoded.sequence, 7);
         assert_eq!(&encoded[..8], b"RACERCP\0");
@@ -4683,12 +4776,13 @@ mod checkpoint {
 
     #[test]
     fn layout_digest_round_trips_and_rejects_changed_mapping_before_recovery() {
-        let mut cut = image(7);
+        let env = racer_io::Env::host();
+        let mut cut = image(&env, 7);
         cut.shards[0].geometry.layout_digest = [17; 32];
         let encoded = checkpoint_format::encode(&cut).unwrap();
         let mut decoded = checkpoint_format::decode(&encoded).unwrap();
         assert_eq!(decoded.shards[0].geometry.layout_digest, [17; 32]);
-        let (index, segments) = state(8);
+        let (index, segments) = state(&env, 8);
         let recovery = Recovery::new(PathBuf::new(), index.clone(), segments.clone());
         recovery.configure_geometry(geometry()).unwrap();
         assert_eq!(
@@ -4706,7 +4800,8 @@ mod checkpoint {
 
     #[test]
     fn current_metadata_checkpoints_round_trip_without_data_loss() {
-        let encoded = checkpoint_format::encode(&image(9)).unwrap();
+        let env = racer_io::Env::host();
+        let encoded = checkpoint_format::encode(&image(&env, 9)).unwrap();
         let mut recovered = checkpoint_format::decode(&encoded).unwrap();
         assert_eq!(recovered.version, CHECKPOINT_VERSION);
         assert!(
@@ -4743,7 +4838,8 @@ mod checkpoint {
 
     #[test]
     fn empty_cut_has_stable_current_binary_vector() {
-        let (index, segments) = state(8);
+        let env = racer_io::Env::host();
+        let (index, segments) = state(&env, 8);
         let image = CheckpointImage {
             version: CHECKPOINT_VERSION,
             page_size: racer_wire::object::PageSize::DEFAULT,
@@ -4771,7 +4867,8 @@ mod checkpoint {
 
     #[test]
     fn populated_cut_has_stable_current_binary_vector() {
-        let bytes = checkpoint_format::encode(&image(7)).unwrap();
+        let env = racer_io::Env::host();
+        let bytes = checkpoint_format::encode(&image(&env, 7)).unwrap();
         // image(7) layout: header 32 + cluster UUID 36 + shard count 4 + worker 2 + geometry 80
         // + segment count 4 + two segments 50 + page count 4 + descriptor 92
         // (36-byte cache, 32-byte key, 4-byte quoted ETag, length 8, three
@@ -4799,12 +4896,13 @@ mod checkpoint {
 
     #[test]
     fn other_checkpoint_versions_are_rejected_and_recover_as_cold_cache() {
+        let env = racer_io::Env::host();
         let directory = Directory::new();
         for version in [0, CHECKPOINT_VERSION + 1, u32::MAX] {
-            let mut cut = image(9);
+            let mut cut = image(&env, 9);
             cut.version = version;
             assert!(checkpoint_format::encode(&cut).is_err());
-            let mut bytes = checkpoint_format::encode(&image(9)).unwrap();
+            let mut bytes = checkpoint_format::encode(&image(&env, 9)).unwrap();
             bytes[8..12].copy_from_slice(&version.to_le_bytes());
             let end = bytes.len() - 32;
             let digest = Sha256::digest(&bytes[..end]);
@@ -4812,11 +4910,11 @@ mod checkpoint {
             assert!(checkpoint_format::decode(&bytes).is_err());
             assert!(sequence_hint(&bytes).is_err());
             fs::write(directory.0.join("checkpoint.0"), bytes).unwrap();
-            let (index, segments) = state(8);
+            let (index, segments) = state(&env, 8);
             let recovery = Recovery::new(directory.0.clone(), index.clone(), segments);
             recovery.configure_geometry(geometry()).unwrap();
             assert!(
-                block_on(recovery.load(geometry().alignment().unwrap()))
+                block_on(recovery.load(&env, geometry().alignment().unwrap()))
                     .unwrap()
                     .is_none()
             );
@@ -4827,7 +4925,8 @@ mod checkpoint {
 
     #[test]
     fn metadata_order_does_not_affect_encoding_and_cross_shard_conflicts_fail() {
-        let mut image = image(1);
+        let env = racer_io::Env::host();
+        let mut image = image(&env, 1);
         image.shards[0]
             .index
             .metadata
@@ -4835,7 +4934,7 @@ mod checkpoint {
         let first = checkpoint_format::encode(&image).unwrap();
         image.shards[0].index.metadata.reverse();
         assert_eq!(checkpoint_format::encode(&image).unwrap(), first);
-        let mut other = shard();
+        let mut other = shard(&env);
         other.worker = WorkerId(1);
         other.index.entries.clear();
         other.index.metadata = vec![descriptor("v1", 18)];
@@ -4845,24 +4944,25 @@ mod checkpoint {
 
     #[test]
     fn newer_incompatible_geometry_or_catalog_falls_back_and_keys_filter_on_load() {
+        let env = racer_io::Env::host();
         let directory = Directory::new();
         fs::write(
             directory.0.join("checkpoint.0"),
-            checkpoint_format::encode(&image(1)).unwrap(),
+            checkpoint_format::encode(&image(&env, 1)).unwrap(),
         )
         .unwrap();
-        let mut newer = image(2);
+        let mut newer = image(&env, 2);
         newer.shards[0].geometry.memory_alignment = 8192;
         fs::write(
             directory.0.join("checkpoint.1"),
             checkpoint_format::encode(&newer).unwrap(),
         )
         .unwrap();
-        let (index, segments) = state(1);
+        let (index, segments) = state(&env, 1);
         let recovery = Recovery::new(directory.0.clone(), index, segments);
         recovery.configure_geometry(geometry()).unwrap();
         let recovered =
-            block_on(recovery.load_filtered(geometry().alignment().unwrap(), |_, _| false))
+            block_on(recovery.load_filtered(&env, geometry().alignment().unwrap(), |_, _| false))
                 .unwrap()
                 .unwrap();
         assert_eq!(recovered.sequence, 1);
@@ -4876,7 +4976,7 @@ mod checkpoint {
         )
         .unwrap();
         assert_eq!(
-            block_on(recovery.load(geometry().alignment().unwrap()))
+            block_on(recovery.load(&env, geometry().alignment().unwrap()))
                 .unwrap()
                 .unwrap()
                 .sequence,
@@ -4887,12 +4987,13 @@ mod checkpoint {
     #[test]
     fn oversized_sparse_files_and_symlinks_are_rejected_without_payload_reads() {
         use std::os::unix::fs::symlink;
+        let env = racer_io::Env::host();
         let directory = Directory::new();
         let file = fs::File::create(directory.0.join("checkpoint.0")).unwrap();
         file.set_len(MAX_CHECKPOINT_BYTES as u64 + 1).unwrap();
         fs::write(
             directory.0.join("payload"),
-            checkpoint_format::encode(&image(3)).unwrap(),
+            checkpoint_format::encode(&image(&env, 3)).unwrap(),
         )
         .unwrap();
         symlink(
@@ -4900,10 +5001,10 @@ mod checkpoint {
             directory.0.join("checkpoint.1"),
         )
         .unwrap();
-        let (index, segments) = state(8);
+        let (index, segments) = state(&env, 8);
         let recovery = Recovery::new(directory.0.clone(), index, segments);
         assert!(
-            block_on(recovery.load(geometry().alignment().unwrap()))
+            block_on(recovery.load(&env, geometry().alignment().unwrap()))
                 .unwrap()
                 .is_none()
         );
@@ -4911,7 +5012,8 @@ mod checkpoint {
 
     #[test]
     fn malformed_hash_version_length_counts_and_trailing_bytes_are_rejected() {
-        let encoded = checkpoint_format::encode(&image(1)).unwrap();
+        let env = racer_io::Env::host();
+        let encoded = checkpoint_format::encode(&image(&env, 1)).unwrap();
         for cut in [0, 7, 31, encoded.len() - 1] {
             assert!(checkpoint_format::decode(&encoded[..cut]).is_err());
         }
@@ -4935,25 +5037,27 @@ mod checkpoint {
 
     #[test]
     fn invalid_generation_bounds_duplicates_and_descriptor_conflicts_are_rejected() {
-        let mut bad = image(1);
+        let env = racer_io::Env::host();
+        let mut bad = image(&env, 1);
         bad.shards[0].index.entries[0].1.location.generation.0 += 1;
         assert!(checkpoint_format::encode(&bad).is_err());
-        let mut bad = image(1);
+        let mut bad = image(&env, 1);
         bad.shards[0].index.entries[0].1.location.extent =
             Extent::new(SEGMENT_BYTES, 4096).unwrap();
         assert!(checkpoint_format::encode(&bad).is_err());
-        let mut bad = image(1);
+        let mut bad = image(&env, 1);
         let duplicate = bad.shards[0].index.entries[0].clone();
         bad.shards[0].index.entries.push(duplicate);
         assert!(checkpoint_format::encode(&bad).is_err());
-        let mut bad = image(1);
+        let mut bad = image(&env, 1);
         bad.shards[0].index.metadata.push(descriptor("v1", 18));
         assert!(checkpoint_format::encode(&bad).is_err());
     }
 
     #[test]
     fn overlapping_mappings_are_rejected() {
-        let mut bad = image(1);
+        let env = racer_io::Env::host();
+        let mut bad = image(&env, 1);
         let mut overlapping = bad.shards[0].index.entries[0].clone();
         overlapping.0.version.object.key = CacheKey([8; 32]);
         overlapping.1.metadata.version = overlapping.0.version.clone();
@@ -4963,22 +5067,31 @@ mod checkpoint {
 
     #[test]
     fn alternating_publication_falls_back_to_valid_older_cut_and_ignores_temp_and_payload() {
+        let env = racer_io::Env::host();
         let directory = Directory::new();
-        let (index, segments) = state(8);
+        let (index, segments) = state(&env, 8);
         let checkpointer = Checkpointer::new(directory.0.clone(), index.clone(), segments.clone());
         let recovery = Recovery::new(directory.0.clone(), index, segments);
         recovery.configure_geometry(geometry()).unwrap();
         assert!(
-            block_on(recovery.load(geometry().alignment().unwrap()))
+            block_on(recovery.load(&env, geometry().alignment().unwrap()))
                 .unwrap()
                 .is_none()
         );
-        block_on(checkpointer.publish(crate::store::checkpoint::test_cluster(), vec![shard()]))
-            .unwrap();
-        block_on(checkpointer.publish(crate::store::checkpoint::test_cluster(), vec![shard()]))
-            .unwrap();
+        block_on(checkpointer.publish(
+            &env,
+            crate::store::checkpoint::test_cluster(),
+            vec![shard(&env)],
+        ))
+        .unwrap();
+        block_on(checkpointer.publish(
+            &env,
+            crate::store::checkpoint::test_cluster(),
+            vec![shard(&env)],
+        ))
+        .unwrap();
         let load = || {
-            block_on(recovery.load(geometry().alignment().unwrap()))
+            block_on(recovery.load(&env, geometry().alignment().unwrap()))
                 .unwrap()
                 .unwrap()
         };
@@ -4986,13 +5099,17 @@ mod checkpoint {
         fs::write(directory.0.join("checkpoint.1"), b"torn").unwrap();
         fs::write(
             directory.0.join(".checkpoint.tmp"),
-            checkpoint_format::encode(&image(99)).unwrap(),
+            checkpoint_format::encode(&image(&env, 99)).unwrap(),
         )
         .unwrap();
         fs::write(directory.0.join("slab.0"), b"payload must not be scanned").unwrap();
         assert_eq!(load().sequence, 1);
-        block_on(checkpointer.publish(crate::store::checkpoint::test_cluster(), vec![shard()]))
-            .unwrap();
+        block_on(checkpointer.publish(
+            &env,
+            crate::store::checkpoint::test_cluster(),
+            vec![shard(&env)],
+        ))
+        .unwrap();
         assert_eq!(load().sequence, 2);
         assert_eq!(
             fs::read(directory.0.join("slab.0")).unwrap(),
@@ -5001,7 +5118,7 @@ mod checkpoint {
         fs::write(directory.0.join("checkpoint.0"), b"bad").unwrap();
         fs::write(directory.0.join("checkpoint.1"), b"bad").unwrap();
         assert!(
-            block_on(recovery.load(geometry().alignment().unwrap()))
+            block_on(recovery.load(&env, geometry().alignment().unwrap()))
                 .unwrap()
                 .is_none()
         );
@@ -5009,8 +5126,9 @@ mod checkpoint {
 
     #[test]
     fn recovery_validates_before_mutation_seals_segments_and_filters_missing_keys() {
+        let env = racer_io::Env::host();
         let directory = Directory::new();
-        let (index, segments) = state(8);
+        let (index, segments) = state(&env, 8);
         let keep = descriptor("keep", 0);
         index
             .publish_current(crate::model::ObjectMetadata {
@@ -5026,7 +5144,7 @@ mod checkpoint {
         let recovery = Recovery::new(directory.0.clone(), index.clone(), segments.clone());
         recovery.configure_geometry(geometry()).unwrap();
         let before = segments.snapshot();
-        let mut bad = shard();
+        let mut bad = shard(&env);
         bad.index.entries[0].1.location.generation.0 += 1;
         assert!(block_on(recovery.install_shard(Some(bad))).is_err());
         assert!(
@@ -5036,7 +5154,7 @@ mod checkpoint {
                 .is_some()
         );
         assert_eq!(segments.snapshot()[0].used_bytes, before[0].used_bytes);
-        let mut recovered = image(1);
+        let mut recovered = image(&env, 1);
         let page = recovered.shards[0].index.entries[0].0.clone();
         Recovery::filter_available(&mut recovered, |_| true, |_, _| false);
         block_on(recovery.install_shard(recovered.shards.pop())).unwrap();
@@ -5054,7 +5172,7 @@ mod checkpoint {
                 .all(|segment| !matches!(segment.state, SegmentState::Open))
         );
         assert!(index.current(&page.version.object).unwrap().is_none());
-        block_on(recovery.install_shard(Some(shard()))).unwrap();
+        block_on(recovery.install_shard(Some(shard(&env)))).unwrap();
         assert!(index.lookup(&page).unwrap().is_some());
         block_on(recovery.install_shard(None)).unwrap();
         assert!(index.lookup(&page).unwrap().is_none());
@@ -5068,12 +5186,13 @@ mod checkpoint {
 
     #[test]
     fn catalog_capacity_failure_preserves_all_live_state() {
+        let env = racer_io::Env::host();
         let directory = Directory::new();
-        let (index, segments) = state(1);
+        let (index, segments) = state(&env, 1);
         index.publish_version(descriptor("keep", 0)).unwrap();
         let recovery = Recovery::new(directory.0.clone(), index.clone(), segments.clone());
         recovery.configure_geometry(geometry()).unwrap();
-        let mut recovered = shard();
+        let mut recovered = shard(&env);
         recovered.index.metadata = vec![descriptor("one", 0), descriptor("two", 0)];
         assert!(block_on(recovery.install_shard(Some(recovered))).is_err());
         assert!(
@@ -5092,8 +5211,9 @@ mod checkpoint {
 
     #[test]
     fn snapshot_freeze_requires_explicit_owner_release() {
+        let env = racer_io::Env::host();
         let directory = Directory::new();
-        let (index, segments) = state(8);
+        let (index, segments) = state(&env, 8);
         let checkpointer =
             Checkpointer::new(directory.0.join("not-created"), index, segments.clone());
         assert!(!directory.0.join("not-created").exists());
@@ -5110,8 +5230,9 @@ mod checkpoint {
 
     #[test]
     fn frozen_recovery_rejects_before_mutating_index_and_retries_after_release() {
+        let env = racer_io::Env::host();
         let directory = Directory::new();
-        let (index, segments) = state(8);
+        let (index, segments) = state(&env, 8);
         index.publish_version(descriptor("keep", 0)).unwrap();
         let recovery = Recovery::new(directory.0.clone(), index.clone(), segments.clone());
         recovery.configure_geometry(geometry()).unwrap();
@@ -5119,7 +5240,7 @@ mod checkpoint {
         checkpointer.configure_geometry(geometry()).unwrap();
         block_on(checkpointer.snapshot_shard()).unwrap();
         assert_eq!(
-            block_on(recovery.install_shard(Some(shard()))),
+            block_on(recovery.install_shard(Some(shard(&env)))),
             Err(Error::Overloaded)
         );
         assert!(
@@ -5135,7 +5256,7 @@ mod checkpoint {
                 .all(|segment| segment.used_bytes == 0)
         );
         checkpointer.finish_snapshot();
-        block_on(recovery.install_shard(Some(shard()))).unwrap();
+        block_on(recovery.install_shard(Some(shard(&env)))).unwrap();
         assert!(
             index
                 .version(&descriptor("keep", 0).version)
@@ -5146,12 +5267,13 @@ mod checkpoint {
 
     #[test]
     fn checkpoint_alignment_errors_are_corruption_and_live_mismatch_is_configuration() {
+        let env = racer_io::Env::host();
         for alignment in [0, 3, u64::MAX] {
             let mut bad = geometry();
             bad.memory_alignment = alignment;
             assert_eq!(bad.validate(), Err(Error::CorruptRecord));
         }
-        let (index, segments) = state(8);
+        let (index, segments) = state(&env, 8);
         let checkpointer = Checkpointer::new(PathBuf::new(), index, segments);
         let mut mismatch = geometry();
         mismatch.memory_alignment *= 2;
@@ -5163,7 +5285,8 @@ mod checkpoint {
 
     #[test]
     fn dropping_checkpointer_releases_successful_freeze() {
-        let (index, segments) = state(8);
+        let env = racer_io::Env::host();
+        let (index, segments) = state(&env, 8);
         let checkpointer = Checkpointer::new(PathBuf::new(), index, segments.clone());
         checkpointer.configure_geometry(geometry()).unwrap();
         block_on(checkpointer.snapshot_shard()).unwrap();
@@ -5174,7 +5297,8 @@ mod checkpoint {
 
     #[test]
     fn dropping_incremental_snapshot_future_releases_in_progress_freeze() {
-        let (index, segments) = state(256);
+        let env = racer_io::Env::host();
+        let (index, segments) = state(&env, 256);
         let metadata = descriptor("many-pages", 128 * crate::model::PAGE_BYTES);
         for number in 0..128 {
             let (lease, extent) = segments.append(4096).unwrap();
@@ -5213,26 +5337,35 @@ mod checkpoint {
 
     #[test]
     fn failed_snapshot_releases_owner_and_failed_publication_preserves_prior_cut() {
+        let env = racer_io::Env::host();
         let directory = Directory::new();
-        let (index, segments) = state(8);
+        let (index, segments) = state(&env, 8);
         let checkpointer = Checkpointer::new(directory.0.clone(), index.clone(), segments.clone());
         checkpointer.configure_geometry(geometry()).unwrap();
-        let invalid = shard().index.entries.pop().unwrap();
+        let invalid = shard(&env).index.entries.pop().unwrap();
         index.publish(invalid.0, invalid.1).unwrap();
         // The index references a generation without an allocated record in this table.
         assert!(block_on(checkpointer.snapshot_shard()).is_err());
         assert!(segments.append(4096).is_ok());
 
-        block_on(checkpointer.publish(crate::store::checkpoint::test_cluster(), vec![shard()]))
-            .unwrap();
+        block_on(checkpointer.publish(
+            &env,
+            crate::store::checkpoint::test_cluster(),
+            vec![shard(&env)],
+        ))
+        .unwrap();
         // Force rename to fail while leaving the previously published slot readable.
         fs::create_dir(directory.0.join("checkpoint.1")).unwrap();
         assert!(
-            block_on(checkpointer.publish(crate::store::checkpoint::test_cluster(), vec![shard()]))
-                .is_err()
+            block_on(checkpointer.publish(
+                &env,
+                crate::store::checkpoint::test_cluster(),
+                vec![shard(&env)]
+            ))
+            .is_err()
         );
         let recovery = Recovery::new(directory.0.clone(), index, segments);
-        let recovered = block_on(recovery.load(geometry().alignment().unwrap()))
+        let recovered = block_on(recovery.load(&env, geometry().alignment().unwrap()))
             .unwrap()
             .unwrap();
         assert_eq!(recovered.sequence, 1);
@@ -5247,13 +5380,14 @@ mod checkpoint {
 
     #[test]
     fn outstanding_lease_and_wrong_worker_cannot_partially_install() {
+        let env = racer_io::Env::host();
         let directory = Directory::new();
-        let (index, segments) = state(8);
+        let (index, segments) = state(&env, 8);
         index.publish_version(descriptor("keep", 0)).unwrap();
         let recovery = Recovery::new(directory.0.clone(), index.clone(), segments.clone());
         recovery.configure_geometry(geometry()).unwrap();
         let lease = segments.append(4096).unwrap();
-        assert!(block_on(recovery.install_shard(Some(shard()))).is_err());
+        assert!(block_on(recovery.install_shard(Some(shard(&env)))).is_err());
         assert!(
             index
                 .version(&descriptor("keep", 0).version)
@@ -5261,7 +5395,7 @@ mod checkpoint {
                 .is_some()
         );
         drop(lease);
-        let mut wrong = shard();
+        let mut wrong = shard(&env);
         wrong.worker = WorkerId(1);
         assert!(block_on(recovery.install_shard(Some(wrong))).is_err());
         assert!(
@@ -5282,7 +5416,8 @@ fn enqueue_staging(f: &Fixture, page: CiphertextCopy) -> usize {
 
 #[test]
 fn zero_copy_persist_stages_only_header_and_round_trips() {
-    let f = Fixture::new();
+    let env = racer_io::Env::host();
+    let f = Fixture::new(&env);
     let _ = futures::executor::block_on(f.store.open()).unwrap();
     f.reactor.init().unwrap();
     let alignment = f.store.writer.slabs().alignment().unwrap();
@@ -5295,7 +5430,7 @@ fn zero_copy_persist_stages_only_header_and_round_trips() {
         let id = page.ciphertext.envelope().page.clone();
         let before = page.ciphertext.disk_body(alignment).unwrap().to_vec();
         assert_eq!(enqueue_staging(&f, page.clone()), header);
-        let request = scope();
+        let request = scope(&env);
         assert_eq!(
             drive(&f.reactor, f.store.writer.progress(1, &request)).unwrap(),
             1
@@ -5320,7 +5455,8 @@ fn zero_copy_persist_stages_only_header_and_round_trips() {
 
 #[test]
 fn unaligned_page_persists_through_copy_fallback_with_full_staging() {
-    let f = Fixture::new();
+    let env = racer_io::Env::host();
+    let f = Fixture::new(&env);
     let _ = futures::executor::block_on(f.store.open()).unwrap();
     f.reactor.init().unwrap();
     let alignment = f.store.writer.slabs().alignment().unwrap();
@@ -5330,7 +5466,7 @@ fn unaligned_page_persists_through_copy_fallback_with_full_staging() {
     assert_eq!(staging_bytes(&page, alignment).unwrap(), full);
     let id = page.ciphertext.envelope().page.clone();
     assert_eq!(enqueue_staging(&f, page.clone()), full);
-    let request = scope();
+    let request = scope(&env);
     assert_eq!(
         drive(&f.reactor, f.store.writer.progress(1, &request)).unwrap(),
         1
@@ -5349,7 +5485,8 @@ fn unaligned_page_persists_through_copy_fallback_with_full_staging() {
 
 #[test]
 fn zero_copy_body_serves_a_shorter_record_body_and_rejects_misfits() {
-    let f = Fixture::new();
+    let env = racer_io::Env::host();
+    let f = Fixture::new(&env);
     let page = f.aligned_copy(4, 100);
     let pool = f.pool.alignment();
     let body = page.ciphertext.disk_body(pool).unwrap();
@@ -5368,11 +5505,11 @@ fn zero_copy_body_serves_a_shorter_record_body_and_rejects_misfits() {
 
 #[test]
 fn zero_copy_write_failure_releases_charges_and_does_not_publish() {
-    use crate::rt::reactor::simulation::{Fault, Simulation};
+    use racer_io::sim::{Fault, SimOs};
     for fault in [Fault::Errno(libc::EIO), Fault::Short(512)] {
-        let simulation = Simulation::new();
-        let _environment = simulation.enter();
-        let f = Fixture::new();
+        let simulation = SimOs::new();
+        let env = racer_io::Env::sim(&simulation, racer_io::WorkerCtx::host());
+        let f = Fixture::new(&env);
         let _ = drive(&f.reactor, f.store.open()).unwrap();
         let alignment = f.store.writer.slabs().alignment().unwrap();
         let page = f.aligned_copy(5, 4096);
@@ -5381,7 +5518,7 @@ fn zero_copy_write_failure_releases_charges_and_does_not_publish() {
         let page_charge = f.admission.used(ResourceClass::Ciphertext);
         f.enqueue(page.clone()).unwrap();
         simulation.inject("writev", fault).unwrap();
-        let request = scope();
+        let request = scope(&env);
         // Progress may absorb the device error; it must not publish.
         let _ = drive(&f.reactor, f.store.writer.progress(1, &request));
         assert!(f.store.writer.is_idle());
@@ -5399,12 +5536,13 @@ const OTHER_CACHE: &str = "44444444-4444-4444-8444-444444444444";
 
 /// Fixture cache at priority 1 next to `OTHER_CACHE` at 1000, with one
 /// indexed page so the fixture cache is over its share.
-fn over_share_fixture() -> (Fixture, CacheId, CacheId) {
+fn over_share_fixture(env: &racer_io::Env) -> (Fixture, CacheId, CacheId) {
     let over = CacheId(crate::test_support::security::CACHE.into());
     let under = CacheId(OTHER_CACHE.into());
     let f = Fixture::assemble(
+        env,
         Directory::new(),
-        crate::test_support::availability_for(vec![over.clone(), under.clone()]),
+        crate::test_support::availability_for(env, vec![over.clone(), under.clone()]),
     );
     let _ = futures::executor::block_on(f.store.open()).unwrap();
     let definition = |id: &CacheId, priority| racer_wire::control::CacheDefinition {
@@ -5451,7 +5589,8 @@ fn over_share_fixture() -> (Fixture, CacheId, CacheId) {
 
 #[test]
 fn full_queue_never_lets_over_share_page_displace_under_share_page() {
-    let (f, over, under) = over_share_fixture();
+    let env = racer_io::Env::host();
+    let (f, over, under) = over_share_fixture(&env);
     let hot = f.copy_in(over.clone(), 1, 113);
     let hot_id = hot.ciphertext.envelope().page.clone();
     let kept = f.copy_in(under.clone(), 2, 113);
@@ -5474,7 +5613,8 @@ fn full_queue_never_lets_over_share_page_displace_under_share_page() {
 
 #[test]
 fn write_order_and_ciphertext_reclaim_put_under_share_first() {
-    let (f, over, under) = over_share_fixture();
+    let env = racer_io::Env::host();
+    let (f, over, under) = over_share_fixture(&env);
     f.reactor.init().expect("queue tests require io_uring");
     let first = f.copy_in(over, 1, 113);
     let first_id = first.ciphertext.envelope().page.clone();
@@ -5486,13 +5626,14 @@ fn write_order_and_ciphertext_reclaim_put_under_share_first() {
     assert!(f.store.writer.reclaim_ciphertext(None, 1) > 0);
     assert!(f.store.writer.copy_only(&first_id).unwrap().is_none());
     assert!(f.store.writer.copy_only(&second_id).unwrap().is_some());
-    drive(&f.reactor, f.store.writer.progress(1, &scope())).unwrap();
+    drive(&f.reactor, f.store.writer.progress(1, &scope(&env))).unwrap();
     assert!(f.store.writer.index().lookup(&second_id).unwrap().is_some());
 }
 
 #[test]
 fn optional_admission_pressure_requires_over_share_and_reserved_free_segments() {
-    let (f, over, under) = over_share_fixture();
+    let env = racer_io::Env::host();
+    let (f, over, under) = over_share_fixture(&env);
     let writer = &f.store.writer;
     assert!(f.segments.free_count() > 1);
     assert!(!writer.over_share_under_pressure(&over));
@@ -5588,7 +5729,8 @@ fn cache_disk_samples_scale_to_large_catalogs() {
 /// classification is current, so a live reweight changes eligibility.
 #[test]
 fn owned_reclaim_never_lets_unheld_over_share_page_take_under_share_write() {
-    let (f, over, under) = over_share_fixture();
+    let env = racer_io::Env::host();
+    let (f, over, under) = over_share_fixture(&env);
     let writer = &f.store.writer;
     let incoming = f
         .copy_in(over.clone(), 9, 113)
@@ -5677,10 +5819,10 @@ fn owned_reclaim_never_lets_unheld_over_share_page_take_under_share_write() {
 #[test]
 fn passthrough_cache_never_enqueues_or_publishes_to_disk() {
     use racer_wire::control::CacheMode;
-    let simulation = crate::rt::reactor::simulation::Simulation::new();
-    let _environment = simulation.enter();
-    let availability = crate::test_support::availability();
-    let f = Fixture::assemble(Directory::new(), availability.clone());
+    let simulation = racer_io::sim::SimOs::new();
+    let env = racer_io::Env::sim(&simulation, racer_io::WorkerCtx::host());
+    let availability = crate::test_support::availability(&env);
+    let f = Fixture::assemble(&env, Directory::new(), availability.clone());
     let _ = futures::executor::block_on(f.store.open()).unwrap();
     f.reactor.init().unwrap();
     let index = f.store.writer.index().clone();
@@ -5688,15 +5830,15 @@ fn passthrough_cache_never_enqueues_or_publishes_to_disk() {
         let copy = f.copy(1, 113);
         let id = copy.ciphertext.envelope().page.clone();
         let cache = id.version.object.cache.clone();
-        availability.publish_modes(vec![(cache.clone(), CacheMode::Cached)]);
+        availability.publish_modes(&env, vec![(cache.clone(), CacheMode::Cached)]);
         f.store.writer.remove_cache(&cache).unwrap();
         // Queued while cached, then the mode switches before the write
         // publishes. The index publication must refuse it.
         f.enqueue(copy.clone()).unwrap();
         assert_eq!(f.store.writer.pending_count(), 1);
-        availability.publish_modes(vec![(cache.clone(), mode)]);
+        availability.publish_modes(&env, vec![(cache.clone(), mode)]);
         assert!(f.store.writer.copy_only(&id).unwrap().is_none(), "{mode:?}");
-        drive(&f.reactor, f.store.writer.progress(8, &scope())).unwrap();
+        drive(&f.reactor, f.store.writer.progress(8, &scope(&env))).unwrap();
         assert!(index.lookup(&id).unwrap().is_none(), "{mode:?}");
         // After the purge, a resumed fill cannot enqueue at all.
         f.store.writer.remove_cache(&cache).unwrap();
@@ -5707,17 +5849,18 @@ fn passthrough_cache_never_enqueues_or_publishes_to_disk() {
 }
 #[test]
 fn warm_disk_reads_reuse_pooled_buffers_charged_to_pool_class() {
-    let f = Fixture::new();
+    let env = racer_io::Env::host();
+    let f = Fixture::new(&env);
     let _ = futures::executor::block_on(f.store.open()).unwrap();
     f.reactor.init().unwrap();
     let copy = f.copy(1, 113);
     let id = copy.ciphertext.envelope().page.clone();
     f.enqueue(copy).unwrap();
-    drive(&f.reactor, f.store.writer.progress(1, &scope())).unwrap();
+    drive(&f.reactor, f.store.writer.progress(1, &scope(&env))).unwrap();
     // The written copy's pooled buffer is idle now; start from an empty pool.
     f.store.reader.buffers.shed_disk_buffers();
     let read = || {
-        drive(&f.reactor, f.store.reader.read(&id, &scope()))
+        drive(&f.reactor, f.store.reader.read(&id, &scope(&env)))
             .unwrap()
             .unwrap()
     };
@@ -5743,17 +5886,18 @@ fn warm_disk_reads_reuse_pooled_buffers_charged_to_pool_class() {
 }
 #[test]
 fn drain_sleeps_while_progress_is_busy_and_wakes_when_it_ends() {
+    let env = racer_io::Env::host();
     struct Wakes(std::sync::atomic::AtomicUsize);
     impl futures::task::ArcWake for Wakes {
         fn wake_by_ref(this: &std::sync::Arc<Self>) {
             this.0.fetch_add(1, Ordering::Relaxed);
         }
     }
-    let f = Fixture::new();
+    let f = Fixture::new(&env);
     let _ = futures::executor::block_on(f.store.open()).unwrap();
     f.reactor.init().unwrap();
     f.enqueue(f.copy(1, 64)).unwrap();
-    let request = scope();
+    let request = scope(&env);
     let mut write = f.store.writer.progress(1, &request);
     let mut idle = Context::from_waker(futures::task::noop_waker_ref());
     assert!(write.as_mut().poll(&mut idle).is_pending());
@@ -5774,7 +5918,8 @@ fn drain_sleeps_while_progress_is_busy_and_wakes_when_it_ends() {
 
 #[test]
 fn pending_metadata_follows_queue_membership_per_version() {
-    let f = Fixture::new();
+    let env = racer_io::Env::host();
+    let f = Fixture::new(&env);
     let _ = futures::executor::block_on(f.store.open()).unwrap();
     f.reactor.init().unwrap();
     let first = f.copy(1, 64);
@@ -5799,11 +5944,12 @@ fn retention_sweep_drops_pages_whose_key_left_the_keyring() {
     use crate::memory::tests::bundle_for;
     use crate::test_support::security::keys;
     use crate::test_support::security::rotation_bundle;
+    let env = racer_io::Env::host();
 
-    let keys = Rc::new(keys());
+    let keys = Rc::new(keys(&env));
     let cache = CacheId(crate::test_support::security::CACHE.into());
-    let availability = for_caches(keys.clone(), vec![cache]);
-    let f = Fixture::assemble(Directory::new(), availability.clone());
+    let availability = for_caches(&env, keys.clone(), vec![cache]);
+    let f = Fixture::assemble(&env, Directory::new(), availability.clone());
     let memory = MemoryCache::new(f.pool.clone(), availability);
     let _ = futures::executor::block_on(f.store.open()).unwrap();
     f.reactor.init().unwrap();
@@ -5812,7 +5958,7 @@ fn retention_sweep_drops_pages_whose_key_left_the_keyring() {
         let copy = f.copy(number, 3);
         let page = bundle_for(&f.admission, copy.metadata.immutable());
         f.enqueue(copy).unwrap();
-        drive(&f.reactor, f.store.writer.progress(1, &scope())).unwrap();
+        drive(&f.reactor, f.store.writer.progress(1, &scope(&env))).unwrap();
         memory.publish(page).unwrap();
     }
     // The first pass after startup finds every key still installed.

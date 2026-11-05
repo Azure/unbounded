@@ -38,8 +38,6 @@ pub mod rdma;
 pub mod read;
 pub mod remote;
 pub mod retention;
-#[cfg(test)]
-pub(crate) mod rt;
 pub mod runtime;
 pub mod security;
 pub mod store;

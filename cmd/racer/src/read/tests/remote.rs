@@ -57,8 +57,8 @@ const CACHE: &str = "33333333-3333-4333-8333-333333333333";
 fn node(n: usize) -> NodeId {
     NodeId(format!("22222222-2222-4222-8222-{n:012}"))
 }
-fn identities(nodes: &[NodeId]) -> Vec<Identity> {
-    crate::test_support::security::identities(ClusterId(CLUSTER.into()), nodes, || {
+fn identities(env: &racer_io::Env, nodes: &[NodeId]) -> Vec<Identity> {
+    crate::test_support::security::identities(env, ClusterId(CLUSTER.into()), nodes, || {
         let mut keys = crate::test_support::security::mac_test_key(CACHE);
         keys.push(racer_wire::control::CacheEncryptionKey::new(
             racer_wire::control::CacheKeyRef {
@@ -131,28 +131,31 @@ impl LocalPageService for CandidateService {
 
 #[test]
 fn remote_candidate_uses_actual_requester_signatures_and_inherited_credits() {
-    remote_candidate(None, false);
-    remote_candidate(None, true);
+    let env = racer_io::Env::host();
+    remote_candidate(&env, None, false);
+    remote_candidate(&env, None, true);
 }
 
 #[test]
 fn remote_origin_absence_preserves_fresh_404_pinned_412_and_later_cached_version() {
+    let env = racer_io::Env::host();
     for case in [
         Absence::Fresh,
         Absence::Subscription,
         Absence::Pinned,
         Absence::CachedPin,
     ] {
-        remote_candidate(Some(case), false);
+        remote_candidate(&env, Some(case), false);
     }
 }
 
 #[test]
 fn coordinator_copy_miss_is_not_origin_absence_and_pinned_missing_is_412() {
+    let env = racer_io::Env::host();
     let queue = Rc::new(crate::drivers::DriverQueue::new(1024));
     let _owner = queue.enter();
     use crate::test_support::NoPeers;
-    let ids = identities(&[node(0), node(1)]);
+    let ids = identities(&env, &[node(0), node(1)]);
     let membership = Arc::new(
         Membership::validate(
             MembershipVersion(1),
@@ -170,14 +173,15 @@ fn coordinator_copy_miss_is_not_origin_absence_and_pinned_missing_is_412() {
         crate::test_support::cluster::config(false).limits,
     )));
     let calls = missing_adapter();
-    let reactor = Rc::new(Reactor::new(admission.clone(), &crate::test_support::env()));
+    let reactor = Rc::new(Reactor::new(admission.clone(), &env));
     let (coordinator, _endpoint) = metadata_coordinator_with_newer_publication(
+        &env,
         &node(1),
         &membership,
         ids[1].keys.clone(),
         admission.clone(),
         reactor.clone(),
-        NoPeers::requester(),
+        NoPeers::requester(&env),
         calls.clone(),
         true,
     );
@@ -271,16 +275,22 @@ enum Absence {
     CachedPin,
 }
 
-fn remote_candidate(absence: Option<Absence>, forbidden: bool) {
-    remote_candidate_with_churn(absence, forbidden, false);
+fn remote_candidate(env: &racer_io::Env, absence: Option<Absence>, forbidden: bool) {
+    remote_candidate_with_churn(env, absence, forbidden, false);
 }
 
 #[test]
 fn live_read_routes_after_cache_only_publication_and_membership_update() {
-    remote_candidate_with_churn(None, false, true);
+    let env = racer_io::Env::host();
+    remote_candidate_with_churn(&env, None, false, true);
 }
 
-fn remote_candidate_with_churn(absence: Option<Absence>, forbidden: bool, churn: bool) {
+fn remote_candidate_with_churn(
+    env: &racer_io::Env,
+    absence: Option<Absence>,
+    forbidden: bool,
+    churn: bool,
+) {
     let queue = Rc::new(crate::drivers::DriverQueue::new(1024));
     let _owner = queue.enter();
     use crate::control::Snapshot;
@@ -347,13 +357,13 @@ fn remote_candidate_with_churn(absence: Option<Absence>, forbidden: bool, churn:
         .clone();
     let mut nodes = vec![source.clone(), destination.clone()];
     nodes.extend(ranked.ordered.iter().skip(1).cloned());
-    let identities = identities(&nodes);
+    let identities = identities(env, &nodes);
     let a = &identities[0];
     let b = &identities[1];
     let admission = Rc::new(flow_control::Quotas::new(AdmissionPolicy::new(
         crate::test_support::cluster::config(false).limits,
     )));
-    let reactor = Rc::new(Reactor::new(admission.clone(), &crate::test_support::env()));
+    let reactor = Rc::new(Reactor::new(admission.clone(), env));
     let io = Rc::new(crate::http::new_io(
         reactor.clone(),
         Codec::new(protocol::MAX_ENVELOPE_HEAD),
@@ -384,10 +394,13 @@ fn remote_candidate_with_churn(absence: Option<Absence>, forbidden: bool, churn:
         )
         .unwrap(),
     );
-    let paths = Rc::new(Paths::new(Rc::new(LinkHealth::default()), 8));
+    let paths = Rc::new(Paths::new(
+        Rc::new(LinkHealth::on(env.ctx.clock.clone())),
+        8,
+    ));
     let auth = Rc::new(Forwarding::new(b.signatures.clone()));
     let outbound =
-        crate::peer::tests::NoOutbound::new(b.signatures.clone(), destination_network.clone());
+        crate::peer::tests::NoOutbound::new(env, b.signatures.clone(), destination_network.clone());
     let relay = Rc::new(Relay::new(
         paths.clone(),
         auth.clone(),
@@ -429,12 +442,14 @@ fn remote_candidate_with_churn(absence: Option<Absence>, forbidden: bool, churn:
                 metadata: matches!(case, Absence::CachedPin).then(|| metadata.clone()),
             });
             metadata_coordinator(
+                env,
                 &destination,
                 &membership,
                 b.keys.clone(),
                 admission.clone(),
                 reactor.clone(),
                 crate::peer::Requester::scripted(
+                    env.ctx.clock.clone(),
                     copies,
                     CachedCopies::direct_hedge_available,
                     CachedCopies::request,
@@ -473,6 +488,7 @@ fn remote_candidate_with_churn(absence: Option<Absence>, forbidden: bool, churn:
     ));
     let requester: Rc<crate::peer::Requester> = if matches!(absence, Some(Absence::Pinned)) {
         crate::peer::Requester::scripted(
+            env.ctx.clock.clone(),
             Rc::new(PinnedFallback {
                 requester,
                 destination,
@@ -498,6 +514,7 @@ fn remote_candidate_with_churn(absence: Option<Absence>, forbidden: bool, churn:
     let ingress_calls = missing_adapter();
     let ingress = matches!(absence, Some(Absence::Fresh | Absence::Subscription)).then(|| {
         metadata_coordinator(
+            env,
             &source,
             &membership,
             a.keys.clone(),
@@ -884,7 +901,9 @@ impl CachedCopies {
 
 // Production read graph and origin client; only the adapter boundary and later
 // candidate caches are doubles. Metadata-only requests need no slab I/O or crypto.
+#[allow(clippy::too_many_arguments)] // The fixture forwards the test's distinct doubles.
 fn metadata_coordinator(
+    env: &racer_io::Env,
     node: &NodeId,
     membership: &Arc<Membership>,
     keys: Rc<Keyring>,
@@ -894,13 +913,14 @@ fn metadata_coordinator(
     adapter: Rc<AdapterOrigin>,
 ) -> (Rc<super::Coordinator>, super::dispatch::WorkerEndpoint) {
     metadata_coordinator_with_newer_publication(
-        node, membership, keys, admission, reactor, peers, adapter, false,
+        env, node, membership, keys, admission, reactor, peers, adapter, false,
     )
 }
 
 /// Build a metadata fixture with an optional newer accepted publication.
 #[allow(clippy::too_many_arguments)] // Keep independently varied fixture inputs visible at call sites.
 fn metadata_coordinator_with_newer_publication(
+    env: &racer_io::Env,
     node: &NodeId,
     membership: &Arc<Membership>,
     keys: Rc<Keyring>,
@@ -973,12 +993,15 @@ fn metadata_coordinator_with_newer_publication(
         racer_io::Clock::host(),
     ));
     let segments = Rc::new(page_alloc::Segments::new(64 * 1024 * 1024));
-    let slabs = Rc::new(crate::test_support::simulated_slab(page_alloc::Slab::new(
-        "unused/absence-slabs/worker-0-slab-0.dat".into(),
-        1024 * 1024 * 1024,
-        64 * 1024 * 1024,
-        crate::model::PAGE_BYTES as usize + crate::store::MAX_HEADER_BYTES + 16,
-    )));
+    let slabs = Rc::new(crate::test_support::simulated_slab(
+        page_alloc::Slab::new(
+            "unused/absence-slabs/worker-0-slab-0.dat".into(),
+            1024 * 1024 * 1024,
+            64 * 1024 * 1024,
+            crate::model::PAGE_BYTES as usize + crate::store::MAX_HEADER_BYTES + 16,
+        ),
+        env,
+    ));
     // Building the eviction clock binds hold accounting to the segments.
     let _ = crate::store::catalog::SegmentClock::new(index.clone(), segments.clone(), 1);
     let disk = Rc::new(StoreReader::new(

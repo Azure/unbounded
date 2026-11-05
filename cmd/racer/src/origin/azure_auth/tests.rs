@@ -38,8 +38,12 @@ fn status(code: u16) -> Vec<u8> {
     format!("HTTP/1.1 {code} X\r\nContent-Length: 2\r\n\r\n{{}}").into_bytes()
 }
 
-fn source(cache: AzureTokenCache, resolver: MapResolver) -> Option<AzureTokenSource> {
-    let reactor = reactor()?;
+fn source(
+    env: &racer_io::Env,
+    cache: AzureTokenCache,
+    resolver: MapResolver,
+) -> Option<AzureTokenSource> {
+    let reactor = reactor(env)?;
     Some(AzureTokenSource::with_resolver(
         Arc::new(cache),
         reactor,
@@ -185,6 +189,7 @@ fn form_encoding_and_configuration_validation() {
 
 #[test]
 fn managed_identity_caches_refreshes_and_invalidates() {
+    let env = racer_io::Env::host();
     let requests = Arc::new(StdMutex::new(Vec::<String>::new()));
     let seen = requests.clone();
     let (address, accepted, server) = serve(None, 4, move |head, _| {
@@ -203,7 +208,7 @@ fn managed_identity_caches_refreshes_and_invalidates() {
         imds_endpoints(address.port()),
     )
     .unwrap();
-    let Some(source) = source(cache, MapResolver::new(Vec::new())) else {
+    let Some(source) = source(&env, cache, MapResolver::new(Vec::new())) else {
         return;
     };
     assert_eq!(&*bearer(&source).unwrap(), "token-1");
@@ -242,6 +247,7 @@ fn managed_identity_caches_refreshes_and_invalidates() {
 
 #[test]
 fn managed_identity_failures_and_stale_fallback() {
+    let env = racer_io::Env::host();
     let responses = Arc::new(StdMutex::new(vec![status(500), status(400), status(404)]));
     let queue = responses.clone();
     let (address, _, server) = serve(None, 3, move |_, _| queue.lock().unwrap().remove(0));
@@ -250,7 +256,7 @@ fn managed_identity_failures_and_stale_fallback() {
         imds_endpoints(address.port()),
     )
     .unwrap();
-    let Some(source) = source(cache, MapResolver::new(Vec::new())) else {
+    let Some(source) = source(&env, cache, MapResolver::new(Vec::new())) else {
         return;
     };
     // A token due for refresh but unexpired survives a failed refresh.
@@ -268,6 +274,7 @@ fn managed_identity_failures_and_stale_fallback() {
 
 #[test]
 fn workload_identity_exchanges_federated_token_with_discovered_tenant() {
+    let env = racer_io::Env::host();
     let identity = test_identity(&["login.example"]);
     let directory = Directory::new();
     let token_file = directory.0.join("token");
@@ -295,7 +302,7 @@ fn workload_identity_exchanges_federated_token_with_discovered_tenant() {
         },
     )
     .unwrap();
-    let Some(source) = source(cache, MapResolver::new(vec![address])) else {
+    let Some(source) = source(&env, cache, MapResolver::new(vec![address])) else {
         return;
     };
     assert_eq!(bearer(&source).err(), Some(AuthError::TenantUnknown));
@@ -326,7 +333,7 @@ fn workload_identity_exchanges_federated_token_with_discovered_tenant() {
     }
 }
 
-fn stalled_source() -> Option<AzureTokenSource> {
+fn stalled_source(env: &racer_io::Env) -> Option<AzureTokenSource> {
     let cache = AzureTokenCache::new(
         AzureCredential::ManagedIdentity { client_id: None },
         // Port 9 is never contacted: every case below waits on the lock or
@@ -334,7 +341,7 @@ fn stalled_source() -> Option<AzureTokenSource> {
         imds_endpoints(9),
     )
     .unwrap();
-    source(cache, MapResolver::new(Vec::new()))
+    source(env, cache, MapResolver::new(Vec::new()))
 }
 
 fn bearer_in(source: &AzureTokenSource, scope: &RequestScope) -> Result<Arc<str>, AuthError> {
@@ -347,7 +354,8 @@ fn bearer_in(source: &AzureTokenSource, scope: &RequestScope) -> Result<Arc<str>
 
 #[test]
 fn refresh_lock_wait_observes_waiter_deadline() {
-    let Some(source) = stalled_source() else {
+    let env = racer_io::Env::host();
+    let Some(source) = stalled_source(&env) else {
         return;
     };
     // A stalled fetch leads the node-wide refresh.
@@ -375,7 +383,8 @@ fn refresh_lock_wait_observes_waiter_deadline() {
 
 #[test]
 fn refresh_lock_wait_observes_waiter_cancellation() {
-    let Some(source) = stalled_source() else {
+    let env = racer_io::Env::host();
+    let Some(source) = stalled_source(&env) else {
         return;
     };
     let fetch = source.cache.begin().ok().unwrap();
@@ -426,7 +435,8 @@ fn concurrent_workers_share_one_refresh() {
             let cache = cache.clone();
             let barrier = barrier.clone();
             std::thread::spawn(move || {
-                let reactor = reactor();
+                let env = racer_io::Env::host();
+                let reactor = reactor(&env);
                 barrier.wait();
                 let reactor = reactor?;
                 let source = AzureTokenSource::with_resolver(

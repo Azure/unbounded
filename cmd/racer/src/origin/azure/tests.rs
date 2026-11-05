@@ -887,7 +887,12 @@ mod router {
         h.snapshots.current().unwrap().unwrap().caches[0].id.clone()
     }
 
-    fn authority(h: &Harness, object: &ObjectId, page: u64) -> OriginAuthority {
+    fn authority(
+        env: &racer_io::Env,
+        h: &Harness,
+        object: &ObjectId,
+        page: u64,
+    ) -> OriginAuthority {
         let node = NodeId("node".into());
         let membership = Arc::new(
             Membership::validate(
@@ -916,7 +921,7 @@ mod router {
         CandidatePolicy::new(
             node,
             Rc::new(Placement::new(2)),
-            crate::test_support::NoPeers::requester(),
+            crate::test_support::NoPeers::requester(env),
             credentials,
             h.snapshots.clone(),
             racer_io::WorkerCtx::host(),
@@ -988,10 +993,11 @@ mod router {
 
     #[test]
     fn native_caches_use_azure_and_others_use_the_adapter() {
+        let env = racer_io::Env::host();
         let h = harness();
         let cache = publish(&h, true);
         let context = in_cache(&cache);
-        let authority = authority(&h, &context.object, 0);
+        let authority = authority(&env, &h, &context.object, 0);
         let reserve = || {
             h.admission
                 .reserve(Some(&cache), ResourceClass::Plaintext, PAGE_BYTES as usize)
@@ -1029,10 +1035,11 @@ mod router {
 
     #[test]
     fn caches_without_an_origin_use_the_adapter() {
+        let env = racer_io::Env::host();
         let h = harness();
         let cache = publish(&h, false);
         let context = in_cache(&cache);
-        let authority = authority(&h, &context.object, 0);
+        let authority = authority(&env, &h, &context.object, 0);
         let (router, adapter, fake) = router(h, true);
         let _ = block_on(router.metadata(&authority, &context, MetadataSelector::Fresh, &scope()));
         assert_eq!(adapter.0.get(), 1);
@@ -1041,10 +1048,11 @@ mod router {
 
     #[test]
     fn without_azure_every_cache_uses_the_adapter() {
+        let env = racer_io::Env::host();
         let h = harness();
         let cache = publish(&h, true);
         let context = in_cache(&cache);
-        let authority = authority(&h, &context.object, 0);
+        let authority = authority(&env, &h, &context.object, 0);
         let (router, adapter, fake) = router(h, false);
         let _ = block_on(router.metadata(&authority, &context, MetadataSelector::Fresh, &scope()));
         assert_eq!(adapter.0.get(), 1);

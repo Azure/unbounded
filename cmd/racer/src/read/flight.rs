@@ -1740,10 +1740,9 @@ mod admission_wake_tests {
     /// Serial completion, error, abandonment, and old cells cannot invent an outcome.
     #[test]
     fn expiry_snapshot_call_guards_and_generation_cells() {
-        let clock = crate::rt::environment::SimulationClock::new(920);
-        let sim_env = clock.environment(0);
-        let _environment = sim_env.enter();
-        let sim_ctx = sim_env.worker_ctx();
+        let clock = racer_io::SimClock::new(920);
+        let sim_env = clock.ctx(0);
+        let sim_ctx = sim_env.clone();
         let make = || {
             DriverDiagnostic(
                 Rc::new(std::cell::Cell::new(DriverObservation {
@@ -1790,6 +1789,7 @@ mod admission_wake_tests {
     /// A successor can install its notification synchronously during ticket removal.
     #[test]
     fn bounded_admission_reentrant_successor_registration_survives_head_drop() {
+        let env = racer_io::Env::host();
         thread_local! {
             static CALLBACK: RefCell<Option<Box<dyn FnOnce()>>> = RefCell::new(None);
         }
@@ -1810,7 +1810,7 @@ mod admission_wake_tests {
         )));
         let flights = Rc::new(Flights::new(
             admission.clone(),
-            crate::test_support::availability(),
+            crate::test_support::availability(&env),
             racer_io::Clock::host(),
         ));
         let page = crate::memory::tests::bundle_for(

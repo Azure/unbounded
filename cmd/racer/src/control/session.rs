@@ -1087,10 +1087,7 @@ pub(super) mod tests {
     }
 
     /// Explicit simulated clock progression with a host watchdog and CPU yield.
-    fn drive<T>(
-        clock: &crate::rt::environment::SimulationClock,
-        operation: impl Future<Output = T>,
-    ) -> T {
+    fn drive<T>(clock: &racer_io::SimClock, operation: impl Future<Output = T>) -> T {
         let mut operation = std::pin::pin!(operation);
         let until = Instant::now() + Duration::from_secs(5);
         loop {
@@ -1107,7 +1104,7 @@ pub(super) mod tests {
     }
 
     /// Application error/scoping adapter, without any external sockets.
-    fn host() -> Rc<ReactorControlIo> {
+    fn host(env: &racer_io::Env) -> Rc<ReactorControlIo> {
         Rc::new(ReactorControlIo::new(Rc::new(
             crate::runtime::Reactor::new(
                 Rc::new(flow_control::Quotas::new(
@@ -1115,17 +1112,17 @@ pub(super) mod tests {
                         crate::test_support::cluster::config(false).limits,
                     ),
                 )),
-                &crate::test_support::env(),
+                env,
             ),
         )))
     }
 
     /// Long enough for several independent generic retry turns.
-    fn scope() -> RequestScope {
+    fn scope(env: &racer_io::Env) -> RequestScope {
         RequestScope::on(
-            &crate::test_support::clock(),
+            &env.ctx.clock,
             crate::model::RequestId([8; 16]),
-            crate::rt::environment::now() + Duration::from_secs(300),
+            env.ctx.now() + Duration::from_secs(300),
         )
         .unwrap()
     }
@@ -1142,7 +1139,7 @@ pub(super) mod tests {
     }
 
     /// Session fixture intentionally has no token and no attached transport until requested.
-    fn session() -> Session {
+    fn session(env: &racer_io::Env) -> Session {
         let p = document(1);
         let keys = Rc::new(Keyring::new(
             p.cluster.clone(),
@@ -1159,12 +1156,12 @@ pub(super) mod tests {
                 p.cluster.clone(),
                 "missing-token".into(),
                 "missing-identity".into(),
-                host(),
+                host(env),
             )),
             RailJournal::new(
                 Arc::new(Default::default()),
                 "missing-identity".into(),
-                host(),
+                host(env),
             ),
             std::num::NonZeroU32::new(4).unwrap(),
             keys.clone(),
@@ -1174,19 +1171,19 @@ pub(super) mod tests {
                 Arc::new(crate::control::cell::PublicationCell::new(
                     super::super::Snapshot::retention(0),
                 )),
-                crate::test_support::clock(),
+                env.ctx.clock.clone(),
             )),
         )
     }
 
     /// Preserve the former lagging-replica scenario through real generic scheduling.
-    pub(crate) fn lagging_replica() {
-        let clock = crate::rt::environment::SimulationClock::new(731);
-        let sim_env = clock.environment(0);
-        let _time = sim_env.enter();
-        let sim_ctx = sim_env.worker_ctx();
+    pub(crate) fn lagging_replica(env: &racer_io::Env) {
+        let clock = racer_io::SimClock::new(731);
+        let sim_env = clock.ctx(0);
+        let env = racer_io::Env::new(env.driver.clone(), sim_env.clone());
+        let sim_ctx = sim_env.clone();
         for pending in [false, true] {
-            let session = session();
+            let session = session(&env);
             let first = document(10);
             let accepted = session.snapshots.apply(first.clone()).unwrap();
             let mut next = document(11);
@@ -1213,7 +1210,7 @@ pub(super) mod tests {
             });
             let requests = Rc::new(RefCell::new(Vec::new()));
             let mut sync = Sync::new(
-                host(),
+                host(&env),
                 Feed::new(
                     ObservedPublication {
                         received: session.received.clone(),
@@ -1235,7 +1232,7 @@ pub(super) mod tests {
             )
             .unwrap();
             sync.seed(Arc::new(first)).unwrap();
-            let scope = scope();
+            let scope = scope(&env);
             if pending {
                 drive(&clock, sync.turn(&scope)).unwrap();
             }
@@ -1273,7 +1270,7 @@ pub(super) mod tests {
     }
 
     /// Structured failures feed generic Retry-After, while stop fences both drivers.
-    pub(crate) fn status_retry_shutdown() {
+    pub(crate) fn status_retry_shutdown(env: &racer_io::Env) {
         for (status, code, expected) in [
             (413, "too_large", Error::InvalidRequest),
             (503, "forbidden", Error::InvalidRequest),
@@ -1289,11 +1286,11 @@ pub(super) mod tests {
                 Err(expected)
             );
         }
-        let clock = crate::rt::environment::SimulationClock::new(732);
-        let _time = clock.environment(0).enter();
-        let session = session();
-        session.attach_io(host()).unwrap();
-        let scope = scope();
+        let clock = racer_io::SimClock::new(732);
+        let env = racer_io::Env::new(env.driver.clone(), clock.ctx(0));
+        let session = session(&env);
+        session.attach_io(host(&env)).unwrap();
+        let scope = scope(&env);
         drive(&clock, session.shutdown(&scope)).unwrap();
         assert_eq!(
             drive(&clock, session.progress(&scope)),
@@ -1316,12 +1313,12 @@ pub(super) mod tests {
     }
 
     /// Key feed validates 204 and tracks its cursor independently of publication/issuance.
-    pub(crate) fn independent_keyring() {
-        let clock = crate::rt::environment::SimulationClock::new(733);
-        let _time = clock.environment(0).enter();
-        let session = session();
-        session.attach_io(host()).unwrap();
-        let scope = scope();
+    pub(crate) fn independent_keyring(env: &racer_io::Env) {
+        let clock = racer_io::SimClock::new(733);
+        let env = racer_io::Env::new(env.driver.clone(), clock.ctx(0));
+        let session = session(&env);
+        session.attach_io(host(&env)).unwrap();
+        let scope = scope(&env);
         let key_owner = Turn::take(&session.keyrings).unwrap();
         assert_eq!(
             drive(&clock, session.keyring_progress(&scope)),
@@ -1377,9 +1374,9 @@ pub(super) mod tests {
     }
 
     /// No string method or externally supplied delta digest exists in the feed API.
-    pub(crate) fn canonical_delta_and_get_only() {
-        let clock = crate::rt::environment::SimulationClock::new(734);
-        let _time = clock.environment(0).enter();
+    pub(crate) fn canonical_delta_and_get_only(env: &racer_io::Env) {
+        let clock = racer_io::SimClock::new(734);
+        let env = racer_io::Env::new(env.driver.clone(), clock.ctx(0));
         let feed = Feed::new(
             PublicationCodec,
             wire::SNAPSHOT_PATH.into(),
@@ -1400,7 +1397,11 @@ pub(super) mod tests {
             }])),
             requests: requests.clone(),
         };
-        drive(&clock, feed.fetch::<ReactorControlIo, _>(&source, &scope())).unwrap();
+        drive(
+            &clock,
+            feed.fetch::<ReactorControlIo, _>(&source, &scope(&env)),
+        )
+        .unwrap();
         assert_eq!(
             requests.borrow()[0],
             (format!("{}?after=1", wire::SNAPSHOT_PATH), Some(digest))
@@ -1408,8 +1409,8 @@ pub(super) mod tests {
     }
 
     /// Not-before policy is enforced before the generic transport receives an identity.
-    pub(crate) fn reject_future_identity(identity: LocalSigningIdentity) {
-        let session = session();
+    pub(crate) fn reject_future_identity(env: &racer_io::Env, identity: LocalSigningIdentity) {
+        let session = session(env);
         *session.auth.identity.borrow_mut() = Some(identity);
         let credentials = FeedCredentials {
             auth: session.auth.clone(),
@@ -1422,9 +1423,9 @@ pub(super) mod tests {
     /// Pending documents, not lossy reconstructed snapshots, form the next delta base.
     #[test]
     fn pending_publication_delta_uses_exact_received_document() {
-        let clock = crate::rt::environment::SimulationClock::new(735);
-        let _time = clock.environment(0).enter();
-        let session = session();
+        let clock = racer_io::SimClock::new(735);
+        let env = racer_io::Env::new(racer_io::Driver::Uring, clock.ctx(0));
+        let session = session(&env);
         let first = document(10);
         let held = session.snapshots.apply(first.clone()).unwrap();
         let mut pending = document(11);
@@ -1459,7 +1460,7 @@ pub(super) mod tests {
             requests: requests.clone(),
         };
         let mut sync = Sync::new(
-            host(),
+            host(&env),
             Feed::new(
                 ObservedPublication {
                     received: session.received.clone(),
@@ -1478,7 +1479,7 @@ pub(super) mod tests {
         )
         .unwrap();
         sync.seed(Arc::new(first)).unwrap();
-        let scope = scope();
+        let scope = scope(&env);
         drive(&clock, sync.turn(&scope)).unwrap();
         drive(&clock, sync.turn(&scope)).unwrap();
         assert_eq!(sync.status().accepted, Some(10));
@@ -1503,7 +1504,8 @@ pub(super) mod tests {
     /// Managed reports carry configured shares and are sent only when rails change.
     #[test]
     fn managed_report_forwards_distinct_rails_only() {
-        let session = session();
+        let env = racer_io::Env::host();
+        let session = session(&env);
         session.mark_serving();
         session.report_rails(&[]);
         let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
@@ -1529,7 +1531,8 @@ pub(super) mod tests {
     /// open; then only the newest rails, once.
     #[test]
     fn managed_report_waits_until_serving() {
-        let session = session();
+        let env = racer_io::Env::host();
+        let session = session(&env);
         let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
         let sink = seen.clone();
         session.set_report(Arc::new(move |shares, rails| {
@@ -1558,7 +1561,8 @@ pub(super) mod tests {
     /// nothing to report yet; enrollment persists rails first).
     #[test]
     fn serving_without_rails_reports_nothing() {
-        let session = session();
+        let env = racer_io::Env::host();
+        let session = session(&env);
         let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
         let sink = seen.clone();
         session.set_report(Arc::new(move |shares, rails| {

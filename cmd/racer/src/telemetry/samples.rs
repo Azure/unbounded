@@ -64,12 +64,12 @@ pub(crate) struct Work {
 }
 impl Samples {
     #[cfg(test)]
-    pub(crate) fn fill_test_ring(&self) {
+    pub(crate) fn fill_test_ring(&self, env: &racer_io::Env) {
         let pair = Pair::parse(
             "8816d91d-e896-49bf-ba8a-da97ede93818,11111111-1111-4111-8111-111111111111",
         )
         .unwrap();
-        let now = crate::test_support::clock().now();
+        let now = env.ctx.clock.clone().now();
         for i in 0..SEND_TAG_CAPACITY {
             let (ticket, mut work) = self
                 .begin_at(&pair, &pair.sender, &pair.receiver, || {
@@ -235,9 +235,8 @@ mod tests {
         }
         #[test]
         fn send_tag_pair_and_shared_owner_bounds() {
-            let clock = environment::SimulationClock::new(72);
-            let _env = clock.environment(0).enter();
-            let _strict = environment::require_simulated();
+            let clock = racer_io::SimClock::new(72);
+            let env = racer_io::Env::new(racer_io::Driver::Uring, clock.ctx(0));
             for value in [
                 "",
                 "x,y",
@@ -250,33 +249,19 @@ mod tests {
             let samples = Samples::default();
             assert!(
                 samples
-                    .begin(
-                        &p,
-                        &p.receiver,
-                        &p.sender,
-                        crate::test_support::clock().now()
-                    )
+                    .begin(&p, &p.receiver, &p.sender, env.ctx.clock.clone().now())
                     .is_none()
             );
             let (ticket, work) = samples
-                .begin(
-                    &p,
-                    &p.sender,
-                    &p.receiver,
-                    crate::test_support::clock().now(),
-                )
+                .begin(&p, &p.sender, &p.receiver, env.ctx.clock.clone().now())
                 .unwrap();
             drop(ticket);
             let other = samples.clone();
             let p2 = p.clone();
+            let thread_clock = env.ctx.clock.clone();
             assert!(
                 std::thread::spawn(move || other
-                    .begin(
-                        &p2,
-                        &p2.sender,
-                        &p2.receiver,
-                        crate::test_support::clock().now()
-                    )
+                    .begin(&p2, &p2.sender, &p2.receiver, thread_clock.now())
                     .is_none())
                 .join()
                 .unwrap()
@@ -286,12 +271,7 @@ mod tests {
             assert!(!samples.0.counts().busy);
             assert!(
                 samples
-                    .begin(
-                        &p,
-                        &p.sender,
-                        &p.receiver,
-                        crate::test_support::clock().now()
-                    )
+                    .begin(&p, &p.sender, &p.receiver, env.ctx.clock.clone().now())
                     .is_none(),
                 "burst is one"
             );
@@ -301,40 +281,24 @@ mod tests {
             clock.advance(Duration::from_secs(120));
             assert!(
                 samples
-                    .begin(
-                        &p,
-                        &p.sender,
-                        &p.receiver,
-                        crate::test_support::clock().now()
-                    )
+                    .begin(&p, &p.sender, &p.receiver, env.ctx.clock.clone().now())
                     .is_none()
             );
         }
         #[test]
         fn send_tag_ineligible_pairs_do_not_start_the_sampling_window() {
-            let clock = environment::SimulationClock::new(76);
-            let _env = clock.environment(0).enter();
-            let _strict = environment::require_simulated();
+            let clock = racer_io::SimClock::new(76);
+            let env = racer_io::Env::new(racer_io::Driver::Uring, clock.ctx(0));
             let p = pair();
             let samples = Samples::default();
             assert!(
                 samples
-                    .begin(
-                        &p,
-                        &p.receiver,
-                        &p.sender,
-                        crate::test_support::clock().now()
-                    )
+                    .begin(&p, &p.receiver, &p.sender, env.ctx.clock.clone().now())
                     .is_none()
             );
             clock.advance(Duration::from_secs(120));
             let (ticket, work) = samples
-                .begin(
-                    &p,
-                    &p.sender,
-                    &p.receiver,
-                    crate::test_support::clock().now(),
-                )
+                .begin(&p, &p.sender, &p.receiver, env.ctx.clock.clone().now())
                 .unwrap();
             assert_eq!(ticket.0.sequence, 1);
             assert_eq!(samples.0.counts().eligible, 1);
@@ -347,40 +311,24 @@ mod tests {
         }
         #[test]
         fn send_tag_interval_accepts_exactly_500ms() {
-            let clock = environment::SimulationClock::new(73);
-            let _env = clock.environment(0).enter();
-            let _strict = environment::require_simulated();
+            let clock = racer_io::SimClock::new(73);
+            let env = racer_io::Env::new(racer_io::Driver::Uring, clock.ctx(0));
             let p = pair();
             let samples = Samples::default();
             let (ticket, work) = samples
-                .begin(
-                    &p,
-                    &p.sender,
-                    &p.receiver,
-                    crate::test_support::clock().now(),
-                )
+                .begin(&p, &p.sender, &p.receiver, env.ctx.clock.clone().now())
                 .unwrap();
             drop(work);
             drop(ticket);
             clock.advance(Duration::from_millis(500) - Duration::from_nanos(1));
             assert!(
                 samples
-                    .begin(
-                        &p,
-                        &p.sender,
-                        &p.receiver,
-                        crate::test_support::clock().now()
-                    )
+                    .begin(&p, &p.sender, &p.receiver, env.ctx.clock.clone().now())
                     .is_none()
             );
             clock.advance(Duration::from_nanos(1));
             let (ticket, work) = samples
-                .begin(
-                    &p,
-                    &p.sender,
-                    &p.receiver,
-                    crate::test_support::clock().now(),
-                )
+                .begin(&p, &p.sender, &p.receiver, env.ctx.clock.clone().now())
                 .unwrap();
             assert_eq!(ticket.0.sequence, 2);
             drop(work);
@@ -392,18 +340,12 @@ mod tests {
 
         #[test]
         fn send_tag_ticket_and_snapshot_survive_retention_overwrite() {
-            let clock = environment::SimulationClock::new(74);
-            let _env = clock.environment(0).enter();
-            let _strict = environment::require_simulated();
+            let clock = racer_io::SimClock::new(74);
+            let env = racer_io::Env::new(racer_io::Driver::Uring, clock.ctx(0));
             let p = pair();
             let samples = Samples::default();
             let (ticket, work) = samples
-                .begin(
-                    &p,
-                    &p.sender,
-                    &p.receiver,
-                    crate::test_support::clock().now(),
-                )
+                .begin(&p, &p.sender, &p.receiver, env.ctx.clock.clone().now())
                 .unwrap();
             let weak = Arc::downgrade(&ticket.0);
             work.finish(None);
@@ -412,12 +354,7 @@ mod tests {
             for _ in 0..SEND_TAG_CAPACITY {
                 clock.advance(Duration::from_millis(500));
                 let (next, work) = samples
-                    .begin(
-                        &p,
-                        &p.sender,
-                        &p.receiver,
-                        crate::test_support::clock().now(),
-                    )
+                    .begin(&p, &p.sender, &p.receiver, env.ctx.clock.clone().now())
                     .unwrap();
                 next.finish(true);
                 work.finish(None);
@@ -449,19 +386,13 @@ mod tests {
 
         #[test]
         fn send_tag_ring_is_bounded_and_preserves_send_outcomes() {
-            let clock = environment::SimulationClock::new(75);
-            let _env = clock.environment(0).enter();
-            let _strict = environment::require_simulated();
+            let clock = racer_io::SimClock::new(75);
+            let env = racer_io::Env::new(racer_io::Driver::Uring, clock.ctx(0));
             let p = pair();
             let samples = Samples::default();
             for i in 0..240 {
                 let (ticket, mut work) = samples
-                    .begin(
-                        &p,
-                        &p.sender,
-                        &p.receiver,
-                        crate::test_support::clock().now(),
-                    )
+                    .begin(&p, &p.sender, &p.receiver, env.ctx.clock.clone().now())
                     .unwrap();
                 ticket.finish(i % 2 == 0);
                 work.facts = Some(crate::telemetry::test_aead_failure());
@@ -472,12 +403,7 @@ mod tests {
             }
             assert!(
                 samples
-                    .begin(
-                        &p,
-                        &p.sender,
-                        &p.receiver,
-                        crate::test_support::clock().now()
-                    )
+                    .begin(&p, &p.sender, &p.receiver, env.ctx.clock.clone().now())
                     .is_none()
             );
             let mut text = String::new();

@@ -14,10 +14,10 @@ const CIPHER: usize = crate::model::PAGE_BYTES as usize + 16;
 
 /// A fixture whose dirty ciphertext limit is `dirty` bytes, with `held`
 /// bytes of it already reserved, and ownership fixed to `owned`.
-fn persisting(owned: bool, dirty: usize) -> Fixture {
+fn persisting(env: &racer_io::Env, owned: bool, dirty: usize) -> Fixture {
     let mut limits = crate::test_support::cluster::config(false).limits;
     limits.dirty_bytes = std::num::NonZeroUsize::new(dirty).unwrap();
-    let f = fixture_with(3, Some(limits));
+    let f = fixture_with(env, 3, Some(limits));
     f.fill
         .dependencies
         .writer
@@ -33,6 +33,7 @@ fn persisting(owned: bool, dirty: usize) -> Fixture {
 /// a failed one as `disk_write_rejected`).
 #[test]
 fn fill_persistence_matches_core_policy() {
+    let env = racer_io::Env::host();
     let mut cases = std::collections::BTreeSet::new();
     for (owned, seen) in [(true, false), (false, false), (false, true)] {
         for (limit, held) in [
@@ -45,7 +46,7 @@ fn fill_persistence_matches_core_policy() {
         ] {
             let queue = Rc::new(crate::drivers::DriverQueue::new(1024));
             let _queue = queue.enter();
-            let f = persisting(owned, limit);
+            let f = persisting(&env, owned, limit);
             let deps = &f.fill.dependencies;
             let admission = &deps.admission;
             let page = crate::memory::tests::bundle_for(admission, f.origin.metadata.immutable());
@@ -95,10 +96,11 @@ fn fill_persistence_matches_core_policy() {
 /// ciphertext is exhausted; persistence is skipped exactly when it is.
 #[test]
 fn dirty_pressure_skips_persistence_while_bootstrap_read_succeeds() {
+    let env = racer_io::Env::host();
     for full in [false, true] {
         let queue = Rc::new(crate::drivers::DriverQueue::new(1024));
         let _queue = queue.enter();
-        let mut f = persisting(true, CIPHER);
+        let mut f = persisting(&env, true, CIPHER);
         let cache = f.context.object.cache.clone();
         let admission = f.fill.dependencies.admission.clone();
         let held = full.then(|| {

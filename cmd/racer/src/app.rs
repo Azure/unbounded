@@ -202,17 +202,19 @@ pub struct NodeState {
 
 impl Default for NodeState {
     fn default() -> Self {
-        // Production replaces the default node before running workers; tests
-        // share the selected world's clock.
-        #[cfg(test)]
-        let ctx = crate::test_support::ctx();
-        #[cfg(not(test))]
+        // Production replaces the default node before running workers.
         let ctx = racer_io::WorkerCtx::host();
         Self::new(vec![WorkerId(0), WorkerId(1)], 16, ctx).expect("valid default worker map")
     }
 }
 
 impl NodeState {
+    /// The default two-worker node on a test role's time and entropy.
+    #[cfg(test)]
+    pub(crate) fn on(ctx: racer_io::WorkerCtx) -> Self {
+        Self::new(vec![WorkerId(0), WorkerId(1)], 16, ctx).expect("valid default worker map")
+    }
+
     /// Allocate shared state with default peer admission for the registered workers.
     fn new(workers: Vec<WorkerId>, capacity: usize, ctx: racer_io::WorkerCtx) -> Result<Self> {
         Self::with_peer_admission(workers, capacity, Default::default(), ctx)
@@ -1397,7 +1399,7 @@ impl WorkerApplication {
             runtime.crypto.clone(),
             buffers.clone(),
         ));
-        let pipes = Rc::new(new_pipe_pool(admission.clone()));
+        let pipes = Rc::new(new_pipe_pool(admission.clone(), reactor.sim_os()));
         let delivery = Rc::new(
             Delivery::new(reactor.clone(), config.reader_stall_timeout)
                 .with_metrics(metrics.clone()),

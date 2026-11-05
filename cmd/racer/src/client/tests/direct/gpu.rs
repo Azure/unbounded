@@ -70,8 +70,8 @@ fn assert_released(helper: &GpuHelper) {
     assert_eq!(helper.leaked(), 0);
 }
 
-fn gpu_fixture(body: Vec<u8>, helper: &Arc<GpuHelper>) -> Fixture {
-    direct_fixture(body, Some(Rc::new(GpuClient::new(helper.clone()))))
+fn gpu_fixture(env: &racer_io::Env, body: Vec<u8>, helper: &Arc<GpuHelper>) -> Fixture {
+    direct_fixture(env, body, Some(Rc::new(GpuClient::new(helper.clone()))))
 }
 
 fn fields(range: &str, offset: u64, length: u64, size: u64) -> String {
@@ -83,9 +83,10 @@ fn fields(range: &str, offset: u64, length: u64, size: u64) -> String {
 
 #[test]
 fn gpu_read_writes_the_range_at_the_destination_offset() {
+    let env = racer_io::Env::host();
     let helper = start(GpuMode::Required, 2).unwrap();
     assert_eq!(helper.devices().len(), 2);
-    let fixture = gpu_fixture(b"hello".to_vec(), &helper);
+    let fixture = gpu_fixture(&env, b"hello".to_vec(), &helper);
     // The allocation is on the second GPU, so the helper must find it.
     let allocation = allocate(&helper, 1, GRANULE);
     let output = exchange(
@@ -117,9 +118,9 @@ fn uuid_field(index: u8) -> String {
 
 /// Serve a five-byte `gpu-read` into an allocation on GPU `ordinal` of four,
 /// sending `extra` fields. Returns the status line and the import attempts.
-fn read_on_four_gpus(ordinal: i32, extra: &str) -> (String, usize, Vec<u8>) {
+fn read_on_four_gpus(env: &racer_io::Env, ordinal: i32, extra: &str) -> (String, usize, Vec<u8>) {
     let helper = start(GpuMode::Required, 4).unwrap();
-    let fixture = gpu_fixture(b"hello".to_vec(), &helper);
+    let fixture = gpu_fixture(env, b"hello".to_vec(), &helper);
     let allocation = allocate(&helper, ordinal, GRANULE);
     let from = trace_len(&helper);
     let output = exchange(
@@ -138,9 +139,10 @@ fn read_on_four_gpus(ordinal: i32, extra: &str) -> (String, usize, Vec<u8>) {
 
 #[test]
 fn gpu_read_uuid_selects_a_nonzero_ordinal_first() {
+    let env = racer_io::Env::host();
     // The client's container sees this GPU as device 0; the dataplane sees it
     // as device 3. The UUID is the same in both.
-    let (status, imports, written) = read_on_four_gpus(3, &uuid_field(3));
+    let (status, imports, written) = read_on_four_gpus(&env, 3, &uuid_field(3));
     assert!(status.starts_with("http/1.1 200"), "{status}");
     assert_eq!(imports, 1, "only the named GPU is tried");
     assert_eq!(written, b"hello");
@@ -148,7 +150,8 @@ fn gpu_read_uuid_selects_a_nonzero_ordinal_first() {
 
 #[test]
 fn gpu_read_without_uuid_tries_each_gpu() {
-    let (status, imports, written) = read_on_four_gpus(3, "");
+    let env = racer_io::Env::host();
+    let (status, imports, written) = read_on_four_gpus(&env, 3, "");
     assert!(status.starts_with("http/1.1 200"), "{status}");
     assert_eq!(imports, 4);
     assert_eq!(written, b"hello");
@@ -156,7 +159,8 @@ fn gpu_read_without_uuid_tries_each_gpu() {
 
 #[test]
 fn gpu_read_unknown_uuid_is_501_so_the_client_uses_the_host() {
-    let (status, imports, written) = read_on_four_gpus(3, &uuid_field(9));
+    let env = racer_io::Env::host();
+    let (status, imports, written) = read_on_four_gpus(&env, 3, &uuid_field(9));
     assert!(status.starts_with("http/1.1 501"), "{status}");
     assert_eq!(imports, 0, "nothing is imported");
     assert_eq!(written, [0; 5]);
@@ -164,7 +168,8 @@ fn gpu_read_unknown_uuid_is_501_so_the_client_uses_the_host() {
 
 #[test]
 fn gpu_read_wrong_uuid_still_finds_the_owning_gpu() {
-    let (status, imports, written) = read_on_four_gpus(2, &uuid_field(1));
+    let env = racer_io::Env::host();
+    let (status, imports, written) = read_on_four_gpus(&env, 2, &uuid_field(1));
     assert!(status.starts_with("http/1.1 200"), "{status}");
     // GPU 1 first, then 0, then 2.
     assert_eq!(imports, 3);
@@ -173,10 +178,11 @@ fn gpu_read_wrong_uuid_still_finds_the_owning_gpu() {
 
 #[test]
 fn gpu_read_spans_pages() {
+    let env = racer_io::Env::host();
     let length = 2 * PAGE_BYTES as usize + 7;
     let body: Vec<u8> = (0..length).map(|i| (i % 251) as u8).collect();
     let helper = start(GpuMode::Auto, 1).unwrap();
-    let fixture = gpu_fixture(body.clone(), &helper);
+    let fixture = gpu_fixture(&env, body.clone(), &helper);
     let size = (length as u64 + 10).next_multiple_of(GRANULE);
     let allocation = allocate(&helper, 0, size);
     let output = exchange(
@@ -202,8 +208,9 @@ fn gpu_read_spans_pages() {
 
 #[test]
 fn gpu_read_errors_before_the_head_release_everything() {
+    let env = racer_io::Env::host();
     let helper = start(GpuMode::Required, 1).unwrap();
-    let fixture = gpu_fixture(b"hello".to_vec(), &helper);
+    let fixture = gpu_fixture(&env, b"hello".to_vec(), &helper);
     let allocation = allocate(&helper, 0, GRANULE);
     // On a GPU the dataplane did not discover.
     let foreign = allocate(&helper, 3, GRANULE);
@@ -263,9 +270,10 @@ fn gpu_read_errors_before_the_head_release_everything() {
 
 #[test]
 fn gpu_read_driver_fault_fails_the_read_and_releases_the_import() {
+    let env = racer_io::Env::host();
     let length = 2 * PAGE_BYTES as usize;
     let helper = start(GpuMode::Required, 1).unwrap();
-    let fixture = gpu_fixture(vec![b'x'; length], &helper);
+    let fixture = gpu_fixture(&env, vec![b'x'; length], &helper);
     let size = (length as u64).next_multiple_of(GRANULE);
     let allocation = allocate(&helper, 0, size);
     helper.run(|| sim().fault(Operation::CopyH2d, -5));
@@ -287,9 +295,10 @@ fn gpu_read_driver_fault_fails_the_read_and_releases_the_import() {
 
 #[test]
 fn gpu_read_client_disconnect_releases_the_import() {
+    let env = racer_io::Env::host();
     let length = 3 * PAGE_BYTES as usize + 1;
     let helper = start(GpuMode::Required, 1).unwrap();
-    let fixture = gpu_fixture(vec![b'x'; length], &helper);
+    let fixture = gpu_fixture(&env, vec![b'x'; length], &helper);
     let size = (length as u64).next_multiple_of(GRANULE);
     let allocation = allocate(&helper, 0, size);
     let mut socket = fixture.connect();
@@ -480,9 +489,10 @@ fn default_slots() -> usize {
 /// decrypted again, on the GPU, from the cached ciphertext.
 #[test]
 fn gpu_read_memory_ciphertext_hit_decrypts_on_the_gpu() {
+    let env = racer_io::Env::host();
     let helper = start(GpuMode::Required, 1).unwrap();
     let data = body(5000);
-    let fixture = gpu_fixture(data.clone(), &helper);
+    let fixture = gpu_fixture(&env, data.clone(), &helper);
     worker(&fixture).retain(true);
     let _ = gpu_read(&fixture, &helper, None, 5000);
     assert!(
@@ -520,9 +530,10 @@ fn gpu_read_memory_ciphertext_hit_decrypts_on_the_gpu() {
 /// not read the disk copy.
 #[test]
 fn gpu_read_prefers_memory_ciphertext_over_cufile() {
+    let env = racer_io::Env::host();
     let helper = start(GpuMode::Required, 1).unwrap();
     let data = body(5000);
-    let fixture = gpu_fixture(data.clone(), &helper);
+    let fixture = gpu_fixture(&env, data.clone(), &helper);
     arrange(&fixture, &helper, 1, 5000, true, true);
     assert!(worker(&fixture).disk_location(&page_id(0)).is_some());
     let mark = trace_len(&helper);
@@ -539,9 +550,10 @@ fn gpu_read_prefers_memory_ciphertext_over_cufile() {
 
 #[test]
 fn gpu_read_retained_ciphertext_decrypts_part_of_a_page_on_the_gpu() {
+    let env = racer_io::Env::host();
     let helper = start(GpuMode::Required, 1).unwrap();
     let data = body(5000);
-    let fixture = gpu_fixture(data.clone(), &helper);
+    let fixture = gpu_fixture(&env, data.clone(), &helper);
     arrange(&fixture, &helper, 1, 5000, true, false);
     let mark = trace_len(&helper);
     let (head, frames, allocation, size) = gpu_read(&fixture, &helper, Some((100, 199)), 100);
@@ -560,10 +572,11 @@ fn gpu_read_retained_ciphertext_decrypts_part_of_a_page_on_the_gpu() {
 
 #[test]
 fn gpu_read_disk_pages_go_through_cufile_and_gpu_decrypt() {
+    let env = racer_io::Env::host();
     let length = 2 * PAGE_BYTES as usize + 4099;
     let helper = start(GpuMode::Required, 1).unwrap();
     let data = body(length);
-    let fixture = gpu_fixture(data.clone(), &helper);
+    let fixture = gpu_fixture(&env, data.clone(), &helper);
     arrange(&fixture, &helper, 3, length as u64, false, true);
     let mark = trace_len(&helper);
     let (head, frames, allocation, _) = gpu_read(&fixture, &helper, None, length as u64);
@@ -589,10 +602,11 @@ fn gpu_read_disk_pages_go_through_cufile_and_gpu_decrypt() {
 /// read each disk page once with cuFile. The second GPU copies the staged
 /// ciphertext from the first and decrypts it itself.
 fn concurrent_gpu_reads_on_peer_gpus_share_cufile_reads() {
+    let env = racer_io::Env::host();
     let length = 2 * PAGE_BYTES as usize + 4099;
     let helper = start(GpuMode::Required, 2).unwrap();
     let data = body(length);
-    let fixture = gpu_fixture(data.clone(), &helper);
+    let fixture = gpu_fixture(&env, data.clone(), &helper);
     arrange(&fixture, &helper, 3, length as u64, false, true);
     let reads = worker(&fixture).metric(Event::GpuDirectDiskRead);
     let mark = trace_len(&helper);
@@ -631,9 +645,10 @@ fn concurrent_gpu_reads_on_peer_gpus_share_cufile_reads() {
 #[test]
 fn gpu_read_tampered_disk_ciphertext_fails_and_drops_the_record() {
     use std::os::unix::fs::FileExt;
+    let env = racer_io::Env::host();
     let helper = start(GpuMode::Required, 1).unwrap();
     let data = body(5000);
-    let fixture = gpu_fixture(data, &helper);
+    let fixture = gpu_fixture(&env, data, &helper);
     arrange(&fixture, &helper, 1, 5000, false, true);
     let location = worker(&fixture).disk_location(&page_id(0)).unwrap();
     let slab = std::fs::OpenOptions::new()
@@ -702,9 +717,10 @@ fn tamper_retained(fixture: &Fixture, in_tag: bool) {
 
 #[test]
 fn gpu_read_body_and_tag_tampering_fail_without_writing() {
+    let env = racer_io::Env::host();
     for in_tag in [false, true] {
         let helper = start(GpuMode::Required, 1).unwrap();
-        let fixture = gpu_fixture(body(5000), &helper);
+        let fixture = gpu_fixture(&env, body(5000), &helper);
         arrange(&fixture, &helper, 1, 5000, true, false);
         tamper_retained(&fixture, in_tag);
         let mark = trace_len(&helper);
@@ -734,11 +750,12 @@ fn gpu_read_body_and_tag_tampering_fail_without_writing() {
 
 #[test]
 fn gpu_read_without_free_staging_reads_disk_through_host_memory() {
+    let env = racer_io::Env::host();
     // Room for the two scratch slots only.
     let staging = (2 * crate::gpu::SLOT_BYTES).next_multiple_of(crate::config::GPU_STAGING_UNIT);
     let helper = start_with(staging, |_| {});
     let data = body(5000);
-    let fixture = gpu_fixture(data.clone(), &helper);
+    let fixture = gpu_fixture(&env, data.clone(), &helper);
     arrange(&fixture, &helper, 1, 5000, false, true);
     let mark = trace_len(&helper);
     let (head, frames, allocation, _) = gpu_read(&fixture, &helper, None, 5000);
@@ -754,9 +771,10 @@ fn gpu_read_without_free_staging_reads_disk_through_host_memory() {
 
 #[test]
 fn gpu_read_falls_back_to_host_ciphertext_when_cufile_fails() {
+    let env = racer_io::Env::host();
     let helper = start(GpuMode::Required, 1).unwrap();
     let data = body(5000);
-    let fixture = gpu_fixture(data.clone(), &helper);
+    let fixture = gpu_fixture(&env, data.clone(), &helper);
     arrange(&fixture, &helper, 1, 5000, false, true);
     helper.run(|| sim().fault(Operation::FileRead, -5));
     let mark = trace_len(&helper);
@@ -776,12 +794,13 @@ fn gpu_read_falls_back_to_host_ciphertext_when_cufile_fails() {
 
 #[test]
 fn gpu_read_without_decrypt_kernels_decrypts_on_the_cpu() {
+    let env = racer_io::Env::host();
     let helper = start_with(crate::config::DEFAULT_GPU_STAGING_BYTES, |simulation| {
         simulation.disable_kernels()
     });
     assert!(!helper.decrypts(0));
     let data = body(5000);
-    let fixture = gpu_fixture(data.clone(), &helper);
+    let fixture = gpu_fixture(&env, data.clone(), &helper);
     arrange(&fixture, &helper, 1, 5000, false, true);
     let mark = trace_len(&helper);
     let plaintext = counter(&helper.counters().plaintext);
@@ -822,9 +841,13 @@ fn slot(
     crate::app::gpu_slot(&config, true, telemetry, links, loader)
 }
 
-fn lazy_fixture(body: Vec<u8>, slot: &Arc<crate::gpu_slot::GpuSlot>) -> Fixture {
+fn lazy_fixture(
+    env: &racer_io::Env,
+    body: Vec<u8>,
+    slot: &Arc<crate::gpu_slot::GpuSlot>,
+) -> Fixture {
     let slot = slot.clone();
-    direct_fixture_with(body, move |responses| responses.with_lazy_gpu(slot))
+    direct_fixture_with(env, body, move |responses| responses.with_lazy_gpu(slot))
 }
 
 fn render(telemetry: &crate::gpu_telemetry::GpuTelemetry) -> String {
@@ -841,6 +864,7 @@ fn calls_now(calls: &std::sync::atomic::AtomicUsize) -> usize {
 /// `auto` touches no GPU at startup, for host reads, or for metrics. The
 /// first `gpu-read` starts the helper once, and later reads reuse it.
 fn auto_starts_the_gpu_on_the_first_gpu_read_only() {
+    let env = racer_io::Env::host();
     let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let telemetry = Arc::new(crate::gpu_telemetry::GpuTelemetry::default());
     let links = Arc::new(crate::rdma::LinkNode::default());
@@ -854,7 +878,7 @@ fn auto_starts_the_gpu_on_the_first_gpu_read_only() {
     telemetry.attach_slot(slot.clone());
     assert!(slot.standby());
     assert!(slot.get().is_none());
-    let fixture = lazy_fixture(b"hello".to_vec(), &slot);
+    let fixture = lazy_fixture(&env, b"hello".to_vec(), &slot);
     // A host read, and a metrics scrape, never start it.
     let memfd = Memfd::new();
     let output = exchange(
@@ -921,6 +945,7 @@ fn auto_starts_the_gpu_on_the_first_gpu_read_only() {
 #[test]
 /// Concurrent first `gpu-read` requests share one start.
 fn concurrent_first_gpu_reads_start_the_gpu_once() {
+    let env = racer_io::Env::host();
     let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let slot = slot(
         GpuMode::Auto,
@@ -929,7 +954,7 @@ fn concurrent_first_gpu_reads_start_the_gpu_once() {
         None,
     )
     .unwrap();
-    let fixture = lazy_fixture(b"hello".to_vec(), &slot);
+    let fixture = lazy_fixture(&env, b"hello".to_vec(), &slot);
     let memfd = Memfd::new();
     let request = direct_request("gpu-read", &fields("", 0, 5, GRANULE));
     let mut sockets: Vec<_> = (0..4)
@@ -955,6 +980,7 @@ fn concurrent_first_gpu_reads_start_the_gpu_once() {
 /// A failed start or a node with no usable GPU leaves `gpu-read` off (501)
 /// for good, so clients use host reads, and it is never retried.
 fn auto_start_failure_is_501_and_not_retried() {
+    let env = racer_io::Env::host();
     let failing = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let counted = failing.clone();
     let failed: crate::gpu::Loader = Box::new(move || {
@@ -973,7 +999,7 @@ fn auto_start_failure_is_501_and_not_retried() {
         )
         .unwrap();
         telemetry.attach_slot(slot.clone());
-        let fixture = lazy_fixture(b"hello".to_vec(), &slot);
+        let fixture = lazy_fixture(&env, b"hello".to_vec(), &slot);
         let memfd = Memfd::new();
         for _ in 0..3 {
             let output = exchange(
@@ -1088,6 +1114,7 @@ fn gated_loader(
 /// stops waiting and releases its connection; the shared start keeps going
 /// and a later `gpu-read` uses the helper it started.
 fn stalled_gpu_start_honors_request_expiry_and_cancellation() {
+    let env = racer_io::Env::host();
     for mode in ["expire", "cancel"] {
         let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let (open, gate) = std::sync::mpsc::channel();
@@ -1098,7 +1125,7 @@ fn stalled_gpu_start_honors_request_expiry_and_cancellation() {
             None,
         )
         .unwrap();
-        let mut fixture = lazy_fixture(b"hello".to_vec(), &slot);
+        let mut fixture = lazy_fixture(&env, b"hello".to_vec(), &slot);
         let timeout = Duration::from_millis(200);
         if mode == "expire" {
             fixture.listeners = fixture.listeners.with_request_timeout(timeout);

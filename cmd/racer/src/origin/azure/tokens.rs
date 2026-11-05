@@ -285,6 +285,7 @@ mod tests {
 
     #[test]
     fn rejected_tokens_refresh_at_most_once_per_window_per_credential() {
+        let env = racer_io::Env::host();
         // IMDS names each token after the requesting client and request count.
         let count = Arc::new(Mutex::new(0usize));
         let seen = count.clone();
@@ -305,7 +306,7 @@ mod tests {
             )
             .into_bytes()
         });
-        let Some(reactor) = reactor() else {
+        let Some(reactor) = reactor(&env) else {
             let _ = std::net::TcpStream::connect(address);
             return;
         };
@@ -353,6 +354,7 @@ mod tests {
 
     #[test]
     fn stale_rejections_keep_newer_tokens_across_workers() {
+        let env = racer_io::Env::host();
         let count = Arc::new(Mutex::new(0usize));
         let seen = count.clone();
         let (address, accepted, server) = serve(None, 4, move |_, _| {
@@ -367,7 +369,7 @@ mod tests {
             )
             .into_bytes()
         });
-        let Some(reactor) = reactor() else {
+        let Some(reactor) = reactor(&env) else {
             let _ = std::net::TcpStream::connect(address);
             return;
         };
@@ -451,7 +453,8 @@ mod tests {
 
     #[test]
     fn sources_and_caches_for_unpublished_credentials_are_dropped() {
-        let Some(reactor) = reactor() else { return };
+        let env = racer_io::Env::host();
+        let Some(reactor) = reactor(&env) else { return };
         let caches = Arc::new(AzureTokenCaches::new(AuthEndpoints {
             imds: RemoteEndpoint::http("127.0.0.1", 9).unwrap(),
             authority: "https://login.microsoftonline.com/".into(),

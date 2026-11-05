@@ -7,13 +7,12 @@ use crate::app::*;
 use crate::lifecycle::Service;
 use crate::model::PAGE_BYTES;
 use crate::model::*;
-use crate::rt::environment::SimulationClock;
-use crate::rt::reactor::simulation::Fault;
-use crate::rt::reactor::simulation::Simulation;
 use racer_crypto::identity::PendingIdentity;
 use racer_crypto::identity::SigningIdentity;
 use racer_io::ring::Descriptor;
 use racer_io::ring::SocketAddress;
+use racer_io::sim::Fault;
+use racer_io::sim::SimOs;
 use racer_wire::control as wire;
 use racer_wire::control::CacheDefinition;
 use racer_wire::control::CacheId;
@@ -32,36 +31,25 @@ const MAX_TURNS: usize = 100_000;
 // dataplane ignores it.
 const SUBSCRIPTION_FIELDS: &str = "Content-Length: 0\r\nRacer-Page-Credits: 64\r\nRacer-Byte-Credits: 1073741824\r\nRacer-Ordered: 1\r\n";
 
-/// The application owns this deterministic replay domain, not the generic runtime.
-trait RacerEntropy {
-    fn racer_environment(&self, stream: u64) -> crate::rt::environment::Environment;
-}
-impl RacerEntropy for SimulationClock {
-    fn racer_environment(&self, stream: u64) -> crate::rt::environment::Environment {
-        self.environment_with_entropy_domain(stream, &b"racer.dst.entropy.v1\0"[..])
-    }
-}
-
+/// Seeded role entropy replays for the same reads and stays separate between
+/// role streams.
 #[test]
 fn racer_entropy_replay_bytes_are_stable() {
-    let clock = SimulationClock::new(7);
-    let role = clock.racer_environment(11);
+    let clock = racer_io::SimClock::new(7);
+    let role = clock.ctx(11);
     let mut bytes = [0; 32];
     for chunk in bytes.chunks_mut(3) {
-        let _role = role.clone().enter();
-        crate::rt::environment::fill_random(chunk).unwrap();
+        role.rng.fill(chunk).unwrap();
     }
-    assert_eq!(
-        bytes,
-        [
-            3, 158, 83, 113, 252, 214, 143, 64, 34, 247, 154, 192, 42, 95, 161, 48, 152, 147, 76,
-            64, 247, 88, 244, 158, 105, 39, 35, 80, 39, 109, 231, 156,
-        ]
-    );
-    let _default = clock.environment(11).enter();
-    let mut neutral = [0; 32];
-    crate::rt::environment::fill_random(&mut neutral).unwrap();
-    assert_ne!(bytes, neutral);
+    let replay_role = clock.ctx(11);
+    let mut replay = [0; 32];
+    for chunk in replay.chunks_mut(3) {
+        replay_role.rng.fill(chunk).unwrap();
+    }
+    assert_eq!(bytes, replay);
+    let mut neighbor = [0; 32];
+    clock.ctx(12).rng.fill(&mut neighbor).unwrap();
+    assert_ne!(bytes, neighbor);
 }
 
 mod faults {
@@ -206,7 +194,7 @@ mod faults {
             response
         }
 
-        pub(super) fn peer_security(&mut self) {
+        pub(super) fn peer_security(&mut self, env: &racer_io::Env) {
             use crate::http::Codec;
             use crate::peer::protocol as p;
             use crate::peer::protocol::encode_envelope;
@@ -219,8 +207,7 @@ mod faults {
                 self.nodes[sender].config.cluster.clone(),
                 keys.clone(),
             ));
-            let signatures =
-                Signatures::new(keys, certificates.clone(), crate::test_support::ctx());
+            let signatures = Signatures::new(keys, certificates.clone(), env.ctx.clone());
             let peer = self.nodes[receiver].config.node.clone();
             let mut head = MessageHead {
                 start: StartLine::Request {
@@ -301,7 +288,7 @@ mod faults {
         }
 
         pub(super) fn disk_corruption(&mut self) {
-            use crate::rt::reactor::simulation::disk::DiskState;
+            use racer_io::sim::DiskState;
             self.settle();
             let entries: Vec<_> = self
                 .nodes
@@ -464,7 +451,7 @@ mod faults {
             self.catalog.borrow_mut().current.insert(2, version);
         }
 
-        pub(super) fn peer_outage(&mut self) {
+        pub(super) fn peer_outage(&mut self, env: &racer_io::Env) {
             let index = self.rng.pick(self.nodes.len());
             let address = self.nodes[index].config.peer_listen;
             let listener_scope = self.nodes[index].workers[0]
@@ -486,11 +473,8 @@ mod faults {
             self.traffic(2, true);
             let node = &mut self.nodes[index];
             let peers = node.workers[0].app.peers.clone();
-            let listener_scope = scope(
-                &crate::test_support::clock(),
-                Duration::from_secs(365 * 24 * 3600),
-            )
-            .unwrap();
+            let listener_scope =
+                scope(&env.ctx.clock, Duration::from_secs(365 * 24 * 3600)).unwrap();
             let peer_scope = listener_scope.clone();
             node.workers[0].app.listener_scope = Some(listener_scope);
             node.workers[0].app.peer_task =
@@ -556,7 +540,7 @@ mod faults {
             self.coverage.action("partition-heal");
         }
 
-        pub(super) fn crash_inflight(&mut self) {
+        pub(super) fn crash_inflight(&mut self, env: &racer_io::Env) {
             let node = self.rng.pick(self.nodes.len());
             self.update(1);
             let mut client = self.request_on(1, false, false, node);
@@ -576,13 +560,13 @@ mod faults {
                 }
             }
             assert!(admitted, "crash must interrupt accepted work");
-            let id = self.retire(node, true);
+            let id = self.retire(env, node, true);
             self.exchange(client, true);
-            self.add(Some(id));
+            self.add(env, Some(id));
             self.coverage.action("inflight-crash");
         }
 
-        pub(super) fn crash_pending_write(&mut self) {
+        pub(super) fn crash_pending_write(&mut self, env: &racer_io::Env) {
             self.update(7);
             self.sim.inject("writev", Fault::Delay(64)).unwrap();
             *self.coverage.injected.entry("writev".into()).or_default() += 1;
@@ -606,11 +590,11 @@ mod faults {
                 }
             }
             let victim = victim.expect("generated write never reached OS submission");
-            let id = self.retire(victim, true);
+            let id = self.retire(env, victim, true);
             if !completed {
                 self.exchange(client, true);
             }
-            self.add(Some(id));
+            self.add(env, Some(id));
             self.coverage.action("pending-write-crash");
         }
 
@@ -637,7 +621,7 @@ mod faults {
             self.coverage.action("key-retirement");
         }
 
-        pub(super) fn cache_recreate(&mut self) {
+        pub(super) fn cache_recreate(&mut self, env: &racer_io::Env) {
             self.generation += 1;
             let members = self.members();
             let mut staged = Vec::new();
@@ -706,7 +690,7 @@ mod faults {
                     &mut **crypto,
                     app.clients.reconcile(
                         &definitions,
-                        &scope(&crate::test_support::clock(), Duration::from_secs(30)).unwrap(),
+                        &scope(&env.ctx.clock, Duration::from_secs(30)).unwrap(),
                     ),
                 )
                 .unwrap();
@@ -714,7 +698,7 @@ mod faults {
             self.coverage.action("cache-retire-recreate");
         }
 
-        pub(super) fn native_fault(&mut self) {
+        pub(super) fn native_fault(&mut self, env: &racer_io::Env) {
             use rdma_verbs::simulation::Fault as NativeFault;
             use rdma_verbs::simulation::Operation as NativeOperation;
             if self.native_rules.is_empty() {
@@ -736,7 +720,7 @@ mod faults {
             let (operation, fault) = self.native_rules.swap_remove(index);
             // Even a one-node generated topology needs a real peer payload path.
             if self.nodes.len() == 1 {
-                self.add(None);
+                self.add(env, None);
             }
             self.settle();
             self.clock.advance(Duration::from_secs(26));
@@ -767,7 +751,7 @@ mod faults {
             let warm = self.request_on(5, true, false, source);
             self.exchange(warm, false);
             // Pages use HTTP until the persistent link is ready.
-            self.connect_links(receiver, source);
+            self.connect_links(env, receiver, source);
             self.fabric.fault(operation, fault);
             self.coverage.action("native-fault");
             let client = self.request_on(5, true, false, receiver);
@@ -812,14 +796,12 @@ mod scenarios {
         use flow_control::subscriptions::Interval;
         use racer_core::subscriptions::Demand;
 
-        let sim = Simulation::new();
-        let _os = sim.enter();
-        let clock = SimulationClock::new(73);
-        let _time = clock.racer_environment(0).enter();
-        let _strict = crate::rt::environment::require_simulated();
+        let sim = SimOs::new();
+        let clock = racer_io::SimClock::new(73);
+        let env = racer_io::Env::sim(&sim, clock.ctx(0));
         let mut harness = Harness::new(73, sim, clock, false);
-        harness.add(None);
-        harness.add(None);
+        harness.add(&env, None);
+        harness.add(&env, None);
         let target = harness
             .nodes
             .iter()
@@ -848,14 +830,14 @@ mod scenarios {
                 sender.config.cluster.clone(),
                 keys.clone(),
             )),
-            crate::test_support::ctx(),
+            env.ctx.clone(),
         )));
         let credentials = CredentialCrypto::new(
             keys,
             sender.workers[0].runtime.admission.clone(),
-            crate::test_support::ctx().rng,
+            env.ctx.clone().rng,
         );
-        let scope = scope(&crate::test_support::clock(), Duration::from_secs(5)).unwrap();
+        let scope = scope(&env.ctx.clock, Duration::from_secs(5)).unwrap();
         let object = ObjectId {
             cache: harness.definition(0).id,
             key: CacheKey([0; 32]),
@@ -967,15 +949,12 @@ mod scenarios {
         use futures::Stream;
         use futures::stream::FuturesUnordered;
 
-        let sim = Simulation::new();
-        let _os = sim.enter();
-        let clock = SimulationClock::new(73);
-        let environment = clock.racer_environment(0);
-        let _time = environment.enter();
-        let _strict = crate::rt::environment::require_simulated();
+        let sim = SimOs::new();
+        let clock = racer_io::SimClock::new(73);
+        let env = racer_io::Env::sim(&sim, clock.ctx(0));
         let mut harness = Harness::new(73, sim, clock, false);
-        harness.add(None);
-        harness.add(None);
+        harness.add(&env, None);
+        harness.add(&env, None);
         let target = harness
             .nodes
             .iter()
@@ -1002,20 +981,20 @@ mod scenarios {
                 harness.nodes[source].config.cluster.clone(),
                 sender.keys.clone(),
             )),
-            crate::test_support::ctx(),
+            env.ctx.clone(),
         ));
         let forwarding = Forwarding::new(signatures);
         let credentials = CredentialCrypto::new(
             sender.keys.clone(),
             sender.runtime.admission.clone(),
-            crate::test_support::ctx().rng,
+            env.ctx.clone().rng,
         );
         let previous = harness.nodes[source].config.node.clone();
         for round in 0u64..1100 {
             let scope = RequestScope::on(
-                &crate::test_support::clock(),
+                &env.ctx.clock,
                 RequestId([1; 16]),
-                crate::rt::environment::now() + Duration::from_secs(5),
+                env.ctx.now() + Duration::from_secs(5),
             )
             .unwrap();
             let mut attempt = [0; 16];
@@ -1096,19 +1075,15 @@ mod scenarios {
 
     #[test]
     fn listeners_survive_repeated_reactor_queue_pressure() {
-        let sim = Simulation::new();
-        let _os = sim.enter();
-        let clock = SimulationClock::new(73);
-        let environment = clock.racer_environment(0);
-        let _time = environment.enter();
-        let _strict = crate::rt::environment::require_simulated();
+        let sim = SimOs::new();
+        let clock = racer_io::SimClock::new(73);
+        let env = racer_io::Env::sim(&sim, clock.ctx(0));
         let mut harness = Harness::new(73, sim.clone(), clock.clone(), false);
-        harness.add(None);
+        harness.add(&env, None);
         // The DST harness bypasses control enrollment and already attaches diagnostic
         // resources; install the same service task as start_diagnostics.
         let app = &mut harness.nodes[0].workers[0].app;
-        let diagnostic_scope =
-            scope(&crate::test_support::clock(), Duration::from_secs(30)).unwrap();
+        let diagnostic_scope = scope(&env.ctx.clock, Duration::from_secs(30)).unwrap();
         app.diagnostic_scope = Some(diagnostic_scope.clone());
         let telemetry = app.telemetry.clone();
         let listen = app.diagnostics_address;
@@ -1129,8 +1104,7 @@ mod scenarios {
                 .unwrap();
             reactor.poll_budgeted(128).unwrap();
             reactor.poll_budgeted(128).unwrap();
-            let pressure_scope =
-                scope(&crate::test_support::clock(), Duration::from_secs(30)).unwrap();
+            let pressure_scope = scope(&env.ctx.clock, Duration::from_secs(30)).unwrap();
             let (reader, _writer) = sim.socket_pair();
             let reader = Rc::new(reader);
             let mut pressure = Vec::new();
@@ -1221,12 +1195,9 @@ mod scenarios {
     const READERS: usize = 40;
 
     fn healthy_relayed_page_reads_with_mode(opaque: bool) {
-        let sim = Simulation::new();
-        let _os = sim.enter();
-        let clock = SimulationClock::new(71);
-        let environment = clock.racer_environment(0);
-        let _time = environment.enter();
-        let _strict = crate::rt::environment::require_simulated();
+        let sim = SimOs::new();
+        let clock = racer_io::SimClock::new(71);
+        let env = &racer_io::Env::sim(&sim, clock.ctx(0));
         let mut harness = Harness::new(71, sim, clock, false);
         harness.opaque_relay = opaque;
         // Match the deployed 64 MiB per-worker payload budgets. A five-page layer
@@ -1234,7 +1205,7 @@ mod scenarios {
         harness.payload_regression = true;
         harness.update(1);
         for _ in 0..RELAY_NODES {
-            harness.add(None);
+            harness.add(env, None);
         }
         for node in &harness.nodes {
             for worker in &node.workers {
@@ -1270,12 +1241,9 @@ mod scenarios {
     }
 
     fn concurrent_relayed_layers_with_mode(opaque: bool) {
-        let sim = Simulation::new();
-        let _os = sim.enter();
-        let clock = SimulationClock::new(73);
-        let environment = clock.racer_environment(0);
-        let _time = environment.enter();
-        let _strict = crate::rt::environment::require_simulated();
+        let sim = SimOs::new();
+        let clock = racer_io::SimClock::new(73);
+        let env = &racer_io::Env::sim(&sim, clock.ctx(0));
         let mut harness = Harness::new(73, sim, clock, false);
         harness.concurrent_layers = true;
         harness.opaque_relay = opaque;
@@ -1283,7 +1251,7 @@ mod scenarios {
             harness.update(object);
         }
         for _ in 0..RELAY_NODES {
-            harness.add(None);
+            harness.add(env, None);
         }
         // Exercise success, then controlled receive pressure after success headers,
         // then recovery on the same graphs, identities, disk, and connections.
@@ -1491,7 +1459,7 @@ mod traffic {
             self.trace.record(format!("action:{name}"));
             *self.actions.entry(name).or_default() += 1;
         }
-        pub(super) fn collect(&mut self, sim: &Simulation) {
+        pub(super) fn collect(&mut self, sim: &SimOs) {
             for event in sim.take_trace() {
                 self.trace.record(format!(
                     "os:{}:{}:{}",
@@ -1578,13 +1546,13 @@ mod traffic {
         }
     }
     impl Harness {
-        pub(super) fn generated(&mut self, steps: usize) {
+        pub(super) fn generated(&mut self, env: &racer_io::Env, steps: usize) {
             for object in 0..8 {
                 self.update(object);
             }
             let initial = 2 + self.rng.pick(MAX_NODES - 1);
             for _ in 0..initial {
-                self.add(None);
+                self.add(env, None);
             }
             let mut actions = Vec::new();
             for step in 0..steps {
@@ -1603,18 +1571,18 @@ mod traffic {
                     self.seed,
                     self.nodes.len()
                 );
-                self.run_action(action);
+                self.run_action(env, action);
                 self.coverage.trace.checkpoint();
             }
             self.verify_recovery();
-            self.teardown_generated();
+            self.teardown_generated(env);
         }
-        fn run_action(&mut self, action: Action) {
+        fn run_action(&mut self, env: &racer_io::Env, action: Action) {
             match action {
-                Action::AddNode if self.nodes.len() < MAX_NODES => self.add(None),
+                Action::AddNode if self.nodes.len() < MAX_NODES => self.add(env, None),
                 Action::RemoveNode if self.nodes.len() > 1 => {
                     let index = self.rng.pick(self.nodes.len());
-                    self.remove(index);
+                    self.remove(env, index);
                 }
                 Action::Update => {
                     let object = self.rng.pick(8);
@@ -1630,8 +1598,8 @@ mod traffic {
                 }
                 Action::Restart => {
                     let index = self.rng.pick(self.nodes.len());
-                    let id = self.remove(index);
-                    self.add(Some(id));
+                    let id = self.remove(env, index);
+                    self.add(env, Some(id));
                 }
                 Action::ShortIo => {
                     let operation = if self.rng.pick(2) == 0 {
@@ -1696,8 +1664,8 @@ mod traffic {
                     self.settle();
                     self.coverage.action("client-cancel");
                 }
-                Action::PeerOutage => self.peer_outage(),
-                Action::InflightCrash => self.crash_inflight(),
+                Action::PeerOutage => self.peer_outage(env),
+                Action::InflightCrash => self.crash_inflight(env),
                 Action::OldPin => {
                     let object = 2 + self.rng.pick(6);
                     let node = self.rng.pick(self.nodes.len());
@@ -1720,7 +1688,7 @@ mod traffic {
                     let mut client = self.request(1, false, false);
                     self.tick();
                     let complete = client.poll();
-                    self.add(None);
+                    self.add(env, None);
                     if complete {
                         self.check(&client, false);
                         client.fd.take();
@@ -1732,7 +1700,7 @@ mod traffic {
                 }
                 Action::Partition if self.nodes.len() > 1 => self.partition_traffic(),
                 Action::WallJump => {
-                    let wall = crate::rt::environment::wall_now();
+                    let wall = env.ctx.clock.wall_now();
                     let amount = Duration::from_secs(1 + self.rng.pick(120) as u64);
                     self.clock.set_wall_time(if self.rng.pick(2) == 0 {
                         wall + amount
@@ -1742,20 +1710,19 @@ mod traffic {
                     self.traffic(1, true);
                     // Recover past replay admission's wall high-water mark.
                     self.clock.advance(Duration::from_secs(121));
-                    let (anchor, wall_anchor) = crate::rt::environment::clock_anchor();
-                    self.clock.set_wall_time(
-                        wall_anchor + crate::rt::environment::now().duration_since(anchor),
-                    );
+                    let (anchor, wall_anchor) = env.ctx.clock.anchor();
+                    self.clock
+                        .set_wall_time(wall_anchor + env.ctx.now().duration_since(anchor));
                     self.coverage.action("wall-jump");
                 }
                 Action::OriginFault => self.origin_fault(),
                 Action::MalformedClient => self.malformed_client(),
                 Action::KeyRetirement => self.key_retirement(),
-                Action::CacheRecreate => self.cache_recreate(),
-                Action::NativeFault if self.native => self.native_fault(),
-                Action::PeerSecurity if self.nodes.len() > 1 => self.peer_security(),
+                Action::CacheRecreate => self.cache_recreate(env),
+                Action::NativeFault if self.native => self.native_fault(env),
+                Action::PeerSecurity if self.nodes.len() > 1 => self.peer_security(env),
                 Action::DiskCorruption => self.disk_corruption(),
-                Action::PendingWriteCrash => self.crash_pending_write(),
+                Action::PendingWriteCrash => self.crash_pending_write(env),
                 // Do not resample gated actions: preserve weights and random draws.
                 Action::Traffic
                 | Action::AddNode
@@ -1793,9 +1760,9 @@ mod traffic {
                 );
             }
         }
-        fn teardown_generated(&mut self) {
+        fn teardown_generated(&mut self, env: &racer_io::Env) {
             while !self.nodes.is_empty() {
-                self.remove(0);
+                self.remove(env, 0);
             }
             self.coverage.collect(&self.sim);
             self.coverage.collect_native(&self.fabric);
@@ -2009,7 +1976,7 @@ impl PartialEq for ReplayTrace {
 }
 impl Eq for ReplayTrace {}
 
-fn handle(fd: &Descriptor) -> crate::rt::reactor::simulation::Handle {
+fn handle(fd: &Descriptor) -> racer_io::sim::Handle {
     fd.as_sim().expect("DST escaped into host I/O")
 }
 fn would_block(error: &std::io::Error) -> bool {
@@ -2049,7 +2016,7 @@ struct Adapter {
     connections: Vec<OriginConnection>,
 }
 impl Adapter {
-    fn new(sim: &Simulation, id: usize) -> Self {
+    fn new(sim: &SimOs, id: usize) -> Self {
         let path = cache(id).origin_socket;
         sim.create_dir_all(path.parent().unwrap()).unwrap();
         let _ = sim.unlink(&path);
@@ -2308,7 +2275,7 @@ struct Harness {
 
     seed: u64,
     rng: Random,
-    sim: Simulation,
+    sim: SimOs,
     nodes: Vec<Node>,
     next_node: usize,
     generation: u64,
@@ -2318,7 +2285,7 @@ struct Harness {
     coverage: Coverage,
     ca: rcgen::Certificate,
     ca_key: rcgen::KeyPair,
-    clock: SimulationClock,
+    clock: racer_io::SimClock,
     fabric: rdma_verbs::simulation::Simulation,
     native: bool,
     key_epoch: u8,
@@ -2334,7 +2301,7 @@ struct Harness {
     concurrent_layers: bool,
 }
 impl Harness {
-    fn new(seed: u64, sim: Simulation, clock: SimulationClock, native: bool) -> Self {
+    fn new(seed: u64, sim: SimOs, clock: racer_io::SimClock, native: bool) -> Self {
         let key = racer_crypto::SigningKey::from_seed(&[91; 32])
             .to_pkcs8_der()
             .unwrap();
@@ -2417,17 +2384,15 @@ impl Harness {
             config.node.clone(),
         )
     }
-    fn add(&mut self, restart: Option<usize>) {
+    fn add(&mut self, env: &racer_io::Env, restart: Option<usize>) {
         let id = restart.unwrap_or_else(|| {
             let id = self.next_node;
             self.next_node += 1;
             id
         });
         // Restart is a new process incarnation, not a rewind of nonce entropy.
-        let role = self
-            .clock
-            .racer_environment(1 + id as u64 + (self.generation << 32));
-        let _role = role.enter();
+        let role = self.clock.ctx(1 + id as u64 + (self.generation << 32));
+        let env = racer_io::Env::new(env.driver.clone(), role.clone());
         let device = format!("dst-rnic-{id}");
         let gid = [1 + (id % 254) as u8; 16];
         let fabric = self
@@ -2474,7 +2439,7 @@ impl Harness {
             self.generation
         ));
         let worker_ids: Vec<_> = (0..worker_count).map(|i| WorkerId(i as u16)).collect();
-        let mut state = NodeState::new(worker_ids.clone(), 64, crate::test_support::ctx()).unwrap();
+        let mut state = NodeState::new(worker_ids.clone(), 64, env.ctx.clone()).unwrap();
         // Retention belongs to the shared publication authority, not worker handles.
         state.publications = Arc::new(crate::control::cell::PublicationCell::new(
             crate::control::Snapshot::retention(config.limits.retained_snapshots.get()),
@@ -2497,7 +2462,7 @@ impl Harness {
             Vec::new()
         };
         let (mut app, runtime, engine) =
-            crate::app::tests::local_worker_with_fabric(&config, &node, 0, discovered_nics);
+            crate::app::tests::local_worker_with_fabric(&env, &config, &node, 0, discovered_nics);
         let crypto = stepped_crypto(&node, engine);
         app.keys
             .install(self.bundle(&config, u64::from(self.key_epoch) + 1))
@@ -2518,18 +2483,19 @@ impl Harness {
         publication.members = self.members().into_iter().map(Into::into).collect();
         publication.members.push(member(&config).into());
         app.snapshots.apply(publication).unwrap();
-        let startup = scope(&crate::test_support::clock(), Duration::from_secs(30)).unwrap();
+        let startup = scope(&env.ctx.clock, Duration::from_secs(30)).unwrap();
         let mut workers = vec![LocalWorker {
             app,
             runtime,
             crypto,
         }];
         for worker in 1..worker_count {
-            let role = self.clock.racer_environment(
-                1 + id as u64 + (self.generation << 32) + ((worker as u64) << 48),
-            );
-            let _role = role.enter();
+            let role = self
+                .clock
+                .ctx(1 + id as u64 + (self.generation << 32) + ((worker as u64) << 48));
+            let env = racer_io::Env::new(env.driver.clone(), role.clone());
             let (app, runtime, engine) = crate::app::tests::local_worker_with_fabric(
+                &env,
                 &config,
                 &node,
                 worker as u16,
@@ -2557,7 +2523,7 @@ impl Harness {
         if worker_count > 1 {
             self.coverage.action("multi-worker");
         }
-        self.start_node_listeners(id, &config, &mut workers[0], &startup);
+        self.start_node_listeners(&env, id, &config, &mut workers[0], &startup);
         let adapter = Adapter::new(&self.sim, id);
         self.nodes.push(Node {
             id,
@@ -2597,6 +2563,7 @@ impl Harness {
 
     fn start_node_listeners(
         &self,
+        env: &racer_io::Env,
         id: usize,
         config: &Config,
         worker: &mut LocalWorker,
@@ -2615,11 +2582,7 @@ impl Harness {
         .unwrap();
         let peers = app.peers.clone();
         let address = config.peer_listen;
-        let listener_scope = scope(
-            &crate::test_support::clock(),
-            Duration::from_secs(365 * 24 * 3600),
-        )
-        .unwrap();
+        let listener_scope = scope(&env.ctx.clock, Duration::from_secs(365 * 24 * 3600)).unwrap();
         let peer_scope = listener_scope.clone();
         app.listener_scope = Some(listener_scope);
         app.peer_task = Some(Box::pin(
@@ -2732,15 +2695,15 @@ impl Harness {
             "descriptor bound"
         );
     }
-    fn remove(&mut self, index: usize) -> usize {
-        self.retire(index, false)
+    fn remove(&mut self, env: &racer_io::Env, index: usize) -> usize {
+        self.retire(env, index, false)
     }
-    fn retire(&mut self, index: usize, crash: bool) -> usize {
+    fn retire(&mut self, env: &racer_io::Env, index: usize, crash: bool) -> usize {
         let mut node = self.nodes.remove(index);
         self.coverage
             .trace
             .record(format!("retire:{}:{crash}", node.id));
-        let shutdown = scope(&crate::test_support::clock(), Duration::from_secs(30)).unwrap();
+        let shutdown = scope(&env.ctx.clock, Duration::from_secs(30)).unwrap();
         if crash {
             self.sim
                 .disk()
@@ -2852,7 +2815,7 @@ impl Harness {
     /// Set up the persistent link from node `a` to node `b` and wait until
     /// both ends are ready, waiting out any backoff. If `a` is ready but `b`
     /// is not (`b` restarted under `a`'s link), `b` initiates instead.
-    fn connect_links(&mut self, a: usize, b: usize) {
+    fn connect_links(&mut self, env: &racer_io::Env, a: usize, b: usize) {
         let rail = racer_wire::control::RailId(0);
         for _ in 0..64 {
             let (local, peer) = (
@@ -2868,8 +2831,7 @@ impl Harness {
             for state in [links.state(&peer, rail), remote.state(&local, rail)] {
                 if let rdma_verbs::LinkState::Backoff(until) = state {
                     self.clock.advance(
-                        until.saturating_duration_since(crate::rt::environment::now())
-                            + Duration::from_millis(1),
+                        until.saturating_duration_since(env.ctx.now()) + Duration::from_millis(1),
                     );
                 }
             }
@@ -3191,18 +3153,16 @@ fn dst_generated_traffic_churn_oracle() {
 
 #[test]
 fn default_grace_staggered_nodes_and_periodic_checkpoint_traffic() {
-    let sim = Simulation::new();
-    let _os = sim.enter();
-    let clock = SimulationClock::new(505);
-    let environment = clock.racer_environment(0);
-    let _time = environment.enter();
+    let sim = SimOs::new();
+    let clock = racer_io::SimClock::new(505);
+    let env = racer_io::Env::sim(&sim, clock.ctx(0));
     let mut harness = Harness::new(505, sim, clock, false);
     harness.retained_snapshots = 2;
     for object in 0..8 {
         harness.update(object);
     }
     for _ in 0..4 {
-        harness.add(None);
+        harness.add(&env, None);
     }
     // Retention is fixed when the node-wide authority is constructed. The shared
     // policy already retains the delayed topology; never replace a worker's view.
@@ -3230,7 +3190,7 @@ fn default_grace_staggered_nodes_and_periodic_checkpoint_traffic() {
                 .app
                 .node
                 .publications
-                .resolve(old.0, crate::rt::environment::now())
+                .resolve(old.0, env.ctx.now())
                 .unwrap()
                 .is_some()
         );
@@ -3265,18 +3225,15 @@ fn dst_generated_native_traffic_churn_oracle() {
 #[test]
 fn dst_origin_recovery_completes_before_concurrent_healthy_reads() {
     for native in [false, true] {
-        let sim = Simulation::new();
-        let _os = sim.enter();
-        let clock = SimulationClock::new(106);
-        let environment = clock.racer_environment(0);
-        let _time = environment.enter();
-        let _strict = crate::rt::environment::require_simulated();
+        let sim = SimOs::new();
+        let clock = racer_io::SimClock::new(106);
+        let env = racer_io::Env::sim(&sim, clock.ctx(0));
         let mut harness = Harness::new(106, sim, clock, native);
         for object in 0..8 {
             harness.update(object);
         }
         for _ in 0..3 {
-            harness.add(None);
+            harness.add(&env, None);
         }
         for fault in [
             OriginFault::DuplicateLength,
@@ -3298,7 +3255,7 @@ fn dst_origin_recovery_completes_before_concurrent_healthy_reads() {
         }
         assert_eq!(harness.coverage.actions["origin-recovered"], 5);
         while !harness.nodes.is_empty() {
-            harness.remove(0);
+            harness.remove(&env, 0);
         }
         assert_eq!(harness.sim.live_handles(), 0);
         assert_eq!(harness.fabric.live_resources(), 0);
@@ -3308,18 +3265,15 @@ fn dst_origin_recovery_completes_before_concurrent_healthy_reads() {
 #[test]
 fn dst_native_faults_reach_warmed_peers_in_small_topologies() {
     for nodes in [1, 2, 3] {
-        let sim = Simulation::new();
-        let _os = sim.enter();
-        let clock = SimulationClock::new(118);
-        let environment = clock.racer_environment(0);
-        let _time = environment.enter();
-        let _strict = crate::rt::environment::require_simulated();
+        let sim = SimOs::new();
+        let clock = racer_io::SimClock::new(118);
+        let env = racer_io::Env::sim(&sim, clock.ctx(0));
         let mut harness = Harness::new(118, sim, clock, true);
         for _ in 0..nodes {
-            harness.add(None);
+            harness.add(&env, None);
         }
         for _ in 0..9 {
-            harness.native_fault();
+            harness.native_fault(&env);
             assert_eq!(harness.fabric.pending_faults(), 0);
         }
         // One complete rule bag covers Bind/WriteImm/Invalidate x all three faults.
@@ -3328,7 +3282,7 @@ fn dst_native_faults_reach_warmed_peers_in_small_topologies() {
         assert!(harness.coverage.native_faults.values().all(|&n| n == 1));
         assert!(harness.coverage.native_writes > 0);
         while !harness.nodes.is_empty() {
-            harness.remove(0);
+            harness.remove(&env, 0);
         }
         assert_eq!(harness.sim.live_handles(), 0);
         assert_eq!(harness.fabric.live_resources(), 0);
@@ -3338,15 +3292,12 @@ fn dst_native_faults_reach_warmed_peers_in_small_topologies() {
 #[test]
 fn dst_refused_peer_connect_preserves_candidate_fallback() {
     for native in [false, true] {
-        let sim = Simulation::new();
-        let _os = sim.enter();
-        let clock = SimulationClock::new(119);
-        let environment = clock.racer_environment(0);
-        let _time = environment.enter();
-        let _strict = crate::rt::environment::require_simulated();
+        let sim = SimOs::new();
+        let clock = racer_io::SimClock::new(119);
+        let env = racer_io::Env::sim(&sim, clock.ctx(0));
         let mut harness = Harness::new(119, sim, clock, native);
         for _ in 0..4 {
-            harness.add(None);
+            harness.add(&env, None);
         }
         harness.update(2);
         let ranked = harness.ranked_nodes(&harness.object_id(2));
@@ -3364,7 +3315,7 @@ fn dst_refused_peer_connect_preserves_candidate_fallback() {
         assert_eq!(harness.coverage.failures, 0);
         assert!(harness.coverage.relay_turns > 0);
         while !harness.nodes.is_empty() {
-            harness.remove(0);
+            harness.remove(&env, 0);
         }
         assert_eq!(harness.sim.live_handles(), 0);
         assert_eq!(harness.fabric.live_resources(), 0);
@@ -3385,15 +3336,12 @@ fn dst_shutdown_checkpoint_uses_async_io_and_releases_all_shards() {
         "cancel",
         "cancel-write",
     ] {
-        let sim = Simulation::new();
-        let _os = sim.enter();
-        let clock = SimulationClock::new(120);
-        let environment = clock.racer_environment(0);
-        let _time = environment.enter();
-        let _strict = crate::rt::environment::require_simulated();
+        let sim = SimOs::new();
+        let clock = racer_io::SimClock::new(120);
+        let env = racer_io::Env::sim(&sim, clock.ctx(0));
         let mut harness = Harness::new(120, sim, clock, false);
         harness.rng = Random((0..100).find(|seed| Random(*seed).pick(2) == 1).unwrap());
-        harness.add(None);
+        harness.add(&env, None);
         assert_eq!(harness.nodes[0].workers.len(), 2);
         harness.settle();
         if case == "periodic" {
@@ -3404,7 +3352,7 @@ fn dst_shutdown_checkpoint_uses_async_io_and_releases_all_shards() {
         }
         let node = &mut harness.nodes[0];
         let state = node.workers[0].app.node.clone();
-        let before = read_candidates(&node.config.slab_directory).unwrap();
+        let before = read_candidates(&env, &node.config.slab_directory).unwrap();
         let sequence = before.first().map_or(0, |(_, image)| image.sequence);
         assert_eq!(sequence > 0, case == "periodic");
         if case == "overflow" {
@@ -3439,7 +3387,7 @@ fn dst_shutdown_checkpoint_uses_async_io_and_releases_all_shards() {
                 assert!(!index.snapshot_metadata().is_empty());
             }
         }
-        let deadline = scope(&crate::test_support::clock(), Duration::from_secs(30)).unwrap();
+        let deadline = scope(&env.ctx.clock, Duration::from_secs(30)).unwrap();
         if case == "cancel" {
             deadline.cancel().unwrap();
         }
@@ -3513,7 +3461,7 @@ fn dst_shutdown_checkpoint_uses_async_io_and_releases_all_shards() {
             results.iter().all(|result| *result == expected),
             "{case}: {results:?}"
         );
-        let after = read_candidates(&node.config.slab_directory).unwrap();
+        let after = read_candidates(&env, &node.config.slab_directory).unwrap();
         if expected.is_ok() {
             assert!(delayed);
             assert_eq!(after[0].1.sequence, sequence + 1);
@@ -3546,7 +3494,7 @@ fn dst_shutdown_checkpoint_uses_async_io_and_releases_all_shards() {
         }
         // The test directly exercised the final cut. Process-loss cleanup avoids
         // asking a failed shutdown cut to run again, while fencing all I/O owners.
-        harness.retire(0, true);
+        harness.retire(&env, 0, true);
         assert_eq!(harness.sim.live_handles(), 0);
     }
 }
@@ -3700,19 +3648,17 @@ fn dst_coverage_policy_and_aggregation() {
 }
 
 fn replay(seed: u64, steps: usize, native: bool) -> Coverage {
-    let sim = Simulation::new();
-    let _os = sim.enter();
-    let clock = SimulationClock::new(seed);
-    let environment = clock.racer_environment(0);
-    let _time = environment.enter();
-    let _strict = crate::rt::environment::require_simulated();
+    let sim = SimOs::new();
+    let clock = racer_io::SimClock::new(seed);
+    let env = racer_io::Env::sim(&sim, clock.ctx(0));
     let mut harness = Harness::new(seed, sim, clock, native);
     harness
         .coverage
         .trace
         .record(format!("run:{seed}:{steps}:{native}"));
-    let result =
-        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| harness.generated(steps)));
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        harness.generated(&env, steps)
+    }));
     if let Err(error) = result {
         harness.coverage.collect(&harness.sim);
         harness.coverage.collect_native(&harness.fabric);

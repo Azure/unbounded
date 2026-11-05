@@ -917,8 +917,9 @@ mod tests {
     }
     #[test]
     fn layout_digest_rejects_mismatched_cuts_and_one_mismatched_worker() {
-        let node = NodeState::default();
-        let keys = crate::test_support::security::keys();
+        let env = racer_io::Env::host();
+        let node = NodeState::on(env.ctx.clone());
+        let keys = crate::test_support::security::keys(&env);
         let ids = [WorkerId(0), WorkerId(1)];
         let layouts = super::super::devices::recovery_layout_fixture();
         let guarded = [layouts[0].layout_digest, layouts[1].layout_digest];
@@ -991,7 +992,7 @@ mod tests {
                 let index = Rc::new(crate::store::catalog::Index::new(
                     shard.worker,
                     4,
-                    crate::test_support::availability(),
+                    crate::test_support::availability(&env),
                     racer_io::Clock::host(),
                 ));
                 let segments = Rc::new(Segments::new(shard.geometry.segment_bytes));
@@ -1081,8 +1082,9 @@ mod tests {
     /// checkpoints and starts cold instead of failing node recovery.
     #[test]
     fn changed_slab_size_or_worker_count_skips_stale_checkpoint() {
-        let node = NodeState::default();
-        let keys = crate::test_support::security::keys();
+        let env = racer_io::Env::host();
+        let node = NodeState::on(env.ctx.clone());
+        let keys = crate::test_support::security::keys(&env);
         let live = |ids: &[WorkerId], g: CheckpointGeometry| -> HashMap<_, _> {
             ids.iter().map(|id| (*id, g)).collect()
         };
@@ -1136,8 +1138,9 @@ mod tests {
 
     #[test]
     fn newest_complete_cut_wins_and_partial_duplicate_or_foreign_workers_fall_back() {
-        let node = NodeState::default();
-        let keys = crate::test_support::security::keys();
+        let env = racer_io::Env::host();
+        let node = NodeState::on(env.ctx.clone());
+        let keys = crate::test_support::security::keys(&env);
         let geometry = [(WorkerId(0), geometry()), (WorkerId(1), geometry())]
             .into_iter()
             .collect();
@@ -1217,8 +1220,9 @@ mod tests {
         use crate::store::catalog::IndexedPage;
         use crate::store::catalog::RecordLocation;
         use crate::store::checkpoint;
+        let env = racer_io::Env::host();
         let node = NodeState::new(vec![WorkerId(0)], 16, racer_io::WorkerCtx::host()).unwrap();
-        let keys = crate::test_support::security::keys();
+        let keys = crate::test_support::security::keys(&env);
         let caches = caches();
         let cache = caches[0].id.clone();
         let g = geometry();
@@ -1331,7 +1335,7 @@ mod tests {
         let index = Rc::new(Index::new(
             WorkerId(0),
             16,
-            crate::test_support::availability(),
+            crate::test_support::availability(&env),
             racer_io::Clock::host(),
         ));
         let segments = Rc::new(Segments::new(g.segment_bytes));
@@ -1361,8 +1365,9 @@ mod tests {
         use crate::store::catalog::IndexedPage;
         use crate::store::catalog::RecordLocation;
         use crate::store::checkpoint;
+        let env = racer_io::Env::host();
         let node = NodeState::new(vec![WorkerId(0)], 16, racer_io::WorkerCtx::host()).unwrap();
-        let keys = crate::test_support::security::keys();
+        let keys = crate::test_support::security::keys(&env);
         let caches = caches();
         let g = geometry();
         let geometry = [(WorkerId(0), g)].into_iter().collect();
@@ -1450,8 +1455,9 @@ mod tests {
         use crate::model::ObjectVersion;
         use crate::model::StrongEtag;
         use crate::model::VersionMetadata;
-        let node = NodeState::default();
-        let keys = crate::test_support::security::keys();
+        let env = racer_io::Env::host();
+        let node = NodeState::on(env.ctx.clone());
+        let keys = crate::test_support::security::keys(&env);
         let geometry = [(WorkerId(0), geometry()), (WorkerId(1), geometry())]
             .into_iter()
             .collect();
@@ -1497,6 +1503,7 @@ mod tests {
         use crate::app::tests::ControlFixture;
         use crate::app::tests::local_worker;
         use crate::app::tests::publication;
+        let env = racer_io::Env::host();
         for budget in [1, 64 * 1024 * 1024] {
             let mut fixture = ControlFixture::new();
             let mut config = fixture.config.take().unwrap();
@@ -1504,7 +1511,7 @@ mod tests {
             let node = Arc::new(
                 NodeState::new(vec![WorkerId(0)], 16, racer_io::WorkerCtx::host()).unwrap(),
             );
-            let (app, _runtime, _crypto) = local_worker(&config, &node, 0);
+            let (app, _runtime, _crypto) = local_worker(&env, &config, &node, 0);
             app.snapshots
                 .apply(publication(&config, 1, vec![]))
                 .unwrap();
@@ -1560,8 +1567,9 @@ mod tests {
 
     #[test]
     fn distinct_live_catalog_and_page_capacities_select_an_installable_cut() {
+        let env = racer_io::Env::host();
         let node = NodeState::new(vec![WorkerId(0)], 16, racer_io::WorkerCtx::host()).unwrap();
-        let keys = crate::test_support::security::keys();
+        let keys = crate::test_support::security::keys(&env);
         let geometry = [(WorkerId(0), geometry())].into_iter().collect();
         let candidate = |sequence, count| {
             let mut cut = image(sequence, &[WorkerId(0)]);
@@ -1599,7 +1607,7 @@ mod tests {
         let live = Index::new(
             WorkerId(0),
             1,
-            crate::test_support::availability(),
+            crate::test_support::availability(&env),
             racer_io::Clock::host(),
         );
         live.set_page_capacity(16).unwrap();

@@ -1097,7 +1097,7 @@ mod tests {
             }),
         }
     }
-    fn request(id: u8) -> PeerRequest {
+    fn request(env: &racer_io::Env, id: u8) -> PeerRequest {
         let n = std::num::NonZeroUsize::new(1024 * 1024).unwrap();
         let admission = flow_control::Quotas::new(AdmissionPolicy::new(Limits {
             plaintext_bytes: n,
@@ -1128,7 +1128,7 @@ mod tests {
             key: CacheKey([7; 32]),
         };
         let scope = RequestScope::on(
-            &crate::test_support::clock(),
+            &env.ctx.clock,
             RequestId([id; 16]),
             Instant::now() + Duration::from_secs(30),
         )
@@ -1212,17 +1212,16 @@ mod tests {
             )
         }
 
-        fn complete(client: &CryptoClient, port: &mut CryptoPort) {
+        fn complete(env: &racer_io::Env, client: &CryptoClient, port: &mut CryptoPort) {
             let mut cx = Context::from_waker(std::task::Waker::noop());
             let Poll::Ready(Ok(Some(job))) = port.poll_job(&mut cx) else {
                 panic!("expected queued verification");
             };
             let caller = std::thread::current().id();
-            let environment = crate::rt::environment::Environment::current();
+            let ctx = env.ctx.clone();
             let completion = std::thread::spawn(move || {
-                let _guard = environment.enter();
                 assert_ne!(caller, std::thread::current().id());
-                PageCryptoEngine::process(job, &environment.worker_ctx())
+                PageCryptoEngine::process(job, &ctx)
             })
             .join()
             .unwrap();
@@ -1231,6 +1230,7 @@ mod tests {
         }
 
         fn run<T>(
+            env: &racer_io::Env,
             future: impl Future<Output = Result<T>>,
             client: &CryptoClient,
             port: &mut CryptoPort,
@@ -1239,7 +1239,7 @@ mod tests {
             let mut cx = Context::from_waker(std::task::Waker::noop());
             assert!(future.as_mut().poll(&mut cx).is_pending());
             assert_eq!(client.outstanding(), 1);
-            complete(client, port);
+            complete(env, client, port);
             let Poll::Ready(result) = future.as_mut().poll(&mut cx) else {
                 panic!("completion must wake verification");
             };
@@ -1247,8 +1247,8 @@ mod tests {
             result
         }
 
-        fn copy_request(signed: &SignedRequest) -> SignedRequest {
-            let mut logical = request(71);
+        fn copy_request(env: &racer_io::Env, signed: &SignedRequest) -> SignedRequest {
+            let mut logical = request(env, 71);
             logical.route = signed.request.route.clone();
             SignedRequest {
                 authentication: ForwardedHead {
@@ -1271,9 +1271,10 @@ mod tests {
 
         #[test]
         fn offloaded_maximum_chain_round_trip_and_each_bad_hop() {
-            let signatures = network(9);
+            let env = racer_io::Env::host();
+            let signatures = network(&env, 9);
             let forwarding: Vec<_> = signatures.iter().cloned().map(Forwarding::new).collect();
-            let mut logical = request(71);
+            let mut logical = request(&env, 71);
             logical.route.destination = node(8);
             logical.route.remaining_links = 8;
             let scope = logical.origin.scope().clone();
@@ -1291,7 +1292,7 @@ mod tests {
             assert_eq!(signed.authentication.hops.len(), 7);
             let (destination, client, mut port) = pair(signatures[8].clone());
             for index in 0..8 {
-                let mut bad = copy_request(&signed);
+                let mut bad = copy_request(&env, &signed);
                 if index == 0 {
                     let mut original = clone_head(&bad.authentication.original);
                     corrupt(&mut original);
@@ -1300,12 +1301,13 @@ mod tests {
                     corrupt(&mut bad.authentication.hops[index - 1]);
                 }
                 let expected = destination
-                    .verify_request(copy_request(&bad))
+                    .verify_request(copy_request(&env, &bad))
                     .err()
                     .unwrap();
                 assert_eq!(expected, Error::Unauthorized);
                 assert_eq!(
                     run(
+                        &env,
                         destination.verify_request_async(bad, &scope),
                         &client,
                         &mut port
@@ -1314,7 +1316,7 @@ mod tests {
                     Some(expected)
                 );
             }
-            let mut excessive = copy_request(&signed);
+            let mut excessive = copy_request(&env, &signed);
             excessive
                 .authentication
                 .hops
@@ -1324,6 +1326,7 @@ mod tests {
             excessive.authentication.original = Arc::new(invalid);
             assert_eq!(
                 run(
+                    &env,
                     destination.verify_request_async(excessive, &scope),
                     &client,
                     &mut port
@@ -1332,6 +1335,7 @@ mod tests {
                 Some(Error::HopBudgetExhausted)
             );
             let admitted = run(
+                &env,
                 destination.verify_request_async(signed, &scope),
                 &client,
                 &mut port,
@@ -1362,6 +1366,7 @@ mod tests {
                     .unwrap();
                 assert_eq!(
                     run(
+                        &env,
                         sender.verify_response_async(bad, &outstanding, &scope),
                         &client,
                         &mut port
@@ -1371,6 +1376,7 @@ mod tests {
                 );
             }
             let opaque = run(
+                &env,
                 sender.verify_opaque_async(
                     copy_response(&response).authentication,
                     0,
@@ -1384,6 +1390,7 @@ mod tests {
             assert_eq!(opaque.authentication().hops.len(), 7);
             assert_eq!(
                 run(
+                    &env,
                     sender.verify_opaque_async(
                         copy_response(&response).authentication,
                         1,
@@ -1397,6 +1404,7 @@ mod tests {
                 Some(Error::InvalidRequest)
             );
             let verified = run(
+                &env,
                 sender.verify_response_async(response, &outstanding, &scope),
                 &client,
                 &mut port,
@@ -1408,12 +1416,13 @@ mod tests {
 
         #[test]
         fn offloaded_strict_signature_rejections_match_inline() {
-            let signatures = network(3);
+            let env = racer_io::Env::host();
+            let signatures = network(&env, 3);
             let sender = Forwarding::new(signatures[0].clone());
             let (receiver, client, mut port) = pair(signatures[2].clone());
-            let scope = request(71).origin.scope().clone();
+            let scope = request(&env, 71).origin.scope().clone();
             for fault in 0..3 {
-                let (mut signed, _) = sender.sign_request(request(71)).unwrap();
+                let (mut signed, _) = sender.sign_request(request(&env, 71)).unwrap();
                 let mut original = clone_head(&signed.authentication.original);
                 match fault {
                     0 => {
@@ -1435,11 +1444,12 @@ mod tests {
                     format!("racer=:{}:", protocol::binary(&original.signature)).into_bytes();
                 signed.authentication.original = Arc::new(original);
                 assert_eq!(
-                    receiver.verify_request(copy_request(&signed)).err(),
+                    receiver.verify_request(copy_request(&env, &signed)).err(),
                     Some(Error::Unauthorized)
                 );
                 assert_eq!(
                     run(
+                        &env,
                         receiver.verify_request_async(signed, &scope),
                         &client,
                         &mut port
@@ -1452,15 +1462,16 @@ mod tests {
 
         #[test]
         fn offloaded_cancellation_capacity_deadline_and_abandoned_fences() {
-            let signatures = network(3);
+            let env = racer_io::Env::host();
+            let signatures = network(&env, 3);
             let sender = Forwarding::new(signatures[0].clone());
             let (receiver, client, mut port) = pair(signatures[2].clone());
-            let scope = request(72).origin.scope().clone();
-            let make = || sender.sign_request(request(72)).unwrap().0;
+            let scope = request(&env, 72).origin.scope().clone();
+            let make = || sender.sign_request(request(&env, 72)).unwrap().0;
             let mut first = Box::pin(receiver.verify_request_async(make(), &scope));
             let mut cx = Context::from_waker(std::task::Waker::noop());
             assert!(first.as_mut().poll(&mut cx).is_pending());
-            let waiting_scope = request(73).origin.scope().clone();
+            let waiting_scope = request(&env, 73).origin.scope().clone();
             let mut waiting = Box::pin(receiver.verify_request_async(make(), &waiting_scope));
             assert!(waiting.as_mut().poll(&mut cx).is_pending());
             let mut overflow = Box::pin(receiver.verify_request_async(make(), &scope));
@@ -1476,7 +1487,7 @@ mod tests {
             scope.cancellation.cancel().unwrap();
             assert!(first.as_mut().poll(&mut cx).is_pending());
             assert_eq!(client.outstanding(), 1);
-            complete(&client, &mut port);
+            complete(&env, &client, &mut port);
             assert!(matches!(
                 first.as_mut().poll(&mut cx),
                 Poll::Ready(Err(Error::Cancelled))
@@ -1488,10 +1499,10 @@ mod tests {
                 Poll::Ready(Err(Error::Cancelled))
             ));
             assert_eq!(client.outstanding(), 0);
-            let clock = crate::rt::environment::SimulationClock::new(929);
-            let sim_env = clock.environment(0);
-            let _guard = sim_env.enter();
-            let sim_ctx = sim_env.worker_ctx();
+            let clock = racer_io::SimClock::new(929);
+            let sim_env = clock.ctx(0);
+            let env = racer_io::Env::new(env.driver.clone(), sim_env.clone());
+            let sim_ctx = sim_env.clone();
             let scope = RequestScope::on(
                 &sim_ctx.clock,
                 RequestId([74; 16]),
@@ -1501,7 +1512,7 @@ mod tests {
             let mut expired = Box::pin(receiver.verify_request_async(make(), &scope));
             assert!(expired.as_mut().poll(&mut cx).is_pending());
             clock.advance(Duration::from_secs(2));
-            complete(&client, &mut port);
+            complete(&env, &client, &mut port);
             assert!(matches!(
                 expired.as_mut().poll(&mut cx),
                 Poll::Ready(Err(Error::DeadlineExceeded))
@@ -1516,11 +1527,11 @@ mod tests {
             assert!(abandoned.as_mut().poll(&mut cx).is_pending());
             drop(abandoned);
             assert_eq!(client.outstanding(), 1);
-            complete(&client, &mut port);
+            complete(&env, &client, &mut port);
             assert_eq!(client.outstanding(), 0);
             let mut late_cancel = Box::pin(receiver.verify_request_async(make(), &scope));
             assert!(late_cancel.as_mut().poll(&mut cx).is_pending());
-            complete(&client, &mut port);
+            complete(&env, &client, &mut port);
             scope.cancellation.cancel().unwrap();
             assert!(matches!(
                 late_cancel.as_mut().poll(&mut cx),
@@ -1545,17 +1556,20 @@ mod tests {
         fn offloaded_verification_observes_rotation_after_submission() {
             use crate::test_support::security::{ca, identities, mac_test_keys};
             use racer_wire::control::{BundleGeneration, ClusterId, KeyringBundle};
+            let env = racer_io::Env::host();
             for retire_roots in [false, true] {
                 let identities = identities(
+                    &env,
                     ClusterId(node(99).0),
                     &[node(0), node(1), node(2)],
                     mac_test_keys,
                 );
                 let sender = Forwarding::new(identities[0].signatures.clone());
                 let (receiver, client, mut port) = pair(identities[2].signatures.clone());
-                let scope = request(76).origin.scope().clone();
-                let make = || sender.sign_request(request(76)).unwrap().0;
+                let scope = request(&env, 76).origin.scope().clone();
+                let make = || sender.sign_request(request(&env, 76)).unwrap().0;
                 run(
+                    &env,
                     receiver.verify_request_async(make(), &scope),
                     &client,
                     &mut port,
@@ -1583,7 +1597,7 @@ mod tests {
                         },
                     })
                     .unwrap();
-                complete(&client, &mut port);
+                complete(&env, &client, &mut port);
                 let expected = if retire_roots {
                     Error::Unauthorized
                 } else {
@@ -1598,18 +1612,14 @@ mod tests {
     }
     #[test]
     fn retained_request_survives_fresh_window_but_not_deadline_or_forgery() {
-        let clock = crate::rt::environment::SimulationClock::new_at(
-            931,
-            Instant::now(),
-            std::time::SystemTime::now(),
-        );
-        let environment = clock.environment(0);
-        let _guard = environment.enter();
-        let signatures = network(3);
+        let clock = racer_io::SimClock::new_at(931, Instant::now(), std::time::SystemTime::now());
+        let environment = clock.ctx(0);
+        let env = racer_io::Env::new(racer_io::Driver::Uring, environment.clone());
+        let signatures = network(&env, 3);
         let sender = Forwarding::new(signatures[0].clone());
         let receiver = Forwarding::new(signatures[2].clone());
-        let mut logical = request(44);
-        logical.route.deadline.0 = crate::rt::environment::now() + Duration::from_secs(120);
+        let mut logical = request(&env, 44);
+        logical.route.deadline.0 = env.ctx.now() + Duration::from_secs(120);
         let (signed, binding) = sender.sign_request(logical).unwrap();
         let admitted = receiver.verify_request(signed).unwrap();
         clock.advance(Duration::from_secs(61));
@@ -1644,7 +1654,7 @@ mod tests {
                 .verify_response(copy_response(&response), &forged_mac)
                 .is_err()
         );
-        let wall = crate::rt::environment::wall_now();
+        let wall = env.ctx.clock.wall_now();
         clock.set_wall_time(wall - Duration::from_secs(67));
         assert!(matches!(
             signatures[2].verify_retained_request(admitted.binding()),
@@ -1677,13 +1687,14 @@ mod tests {
         use crate::memory::tests::bundle_for;
         use crate::model::ExpiresAt;
         use crate::model::ObjectMetadata;
-        let mut request = request(90);
+        let env = racer_io::Env::host();
+        let mut request = request(&env, 90);
         request.operation = Operation::Bootstrap {
             object: request.origin.object.clone(),
             mode: FetchMode::Acquire,
         };
         request.route.remaining_attempts = 2;
-        let head = protocol::request_head(&crate::test_support::clock(), &request).unwrap();
+        let head = protocol::request_head(&env.ctx.clock, &request).unwrap();
         let mut metadata = ObjectMetadata {
             content_type: None,
             version: ObjectVersion {
@@ -1762,7 +1773,7 @@ mod tests {
         assert!(
             response_matches(
                 &response,
-                &protocol::request_head(&crate::test_support::clock(), &request).unwrap(),
+                &protocol::request_head(&env.ctx.clock, &request).unwrap(),
                 &racer_io::Clock::host()
             )
             .is_err()
@@ -1782,14 +1793,15 @@ mod tests {
 
     #[test]
     fn every_signed_request_field_must_agree_with_the_logical_request() {
-        let signatures = network(3);
+        let env = racer_io::Env::host();
+        let signatures = network(&env, 3);
         let receiver = Forwarding::new(signatures[1].clone());
-        let fields = protocol::request_head(&crate::test_support::clock(), &request(1))
+        let fields = protocol::request_head(&env.ctx.clock, &request(&env, 1))
             .unwrap()
             .headers;
         for field in fields {
-            let logical = request(1);
-            let mut head = protocol::request_head(&crate::test_support::clock(), &logical).unwrap();
+            let logical = request(&env, 1);
+            let mut head = protocol::request_head(&env.ctx.clock, &logical).unwrap();
             head.headers
                 .iter_mut()
                 .find(|h| h.name == field.name)
@@ -1818,10 +1830,11 @@ mod tests {
     }
     #[test]
     fn route_membership_and_identifier_sizes_are_validated_before_admission() {
-        let signatures = network(3);
+        let env = racer_io::Env::host();
+        let signatures = network(&env, 3);
         let sender = Forwarding::new(signatures[0].clone());
         let receiver = Forwarding::new(signatures[1].clone());
-        let mut zero = request(1);
+        let mut zero = request(&env, 1);
         zero.route.membership.0 = 0;
         assert!(sender.sign_request_to(zero, &node(1)).is_err());
         for (name, value) in [
@@ -1829,8 +1842,8 @@ mod tests {
             ("racer-route-request", protocol::binary(&[1; 15])),
             ("racer-route-attempt", protocol::binary(&[2; 17])),
         ] {
-            let logical = request(1);
-            let mut head = protocol::request_head(&crate::test_support::clock(), &logical).unwrap();
+            let logical = request(&env, 1);
+            let mut head = protocol::request_head(&env.ctx.clock, &logical).unwrap();
             head.headers
                 .iter_mut()
                 .find(|h| h.name == name)
@@ -1854,13 +1867,14 @@ mod tests {
     }
     #[test]
     fn every_negative_outcome_is_signed_and_bound_to_the_exact_attempt() {
-        let signatures = network(3);
+        let env = racer_io::Env::host();
+        let signatures = network(&env, 3);
         let sender = Forwarding::new(signatures[0].clone());
         let receiver = Forwarding::new(signatures[2].clone());
-        let (signed, binding) = sender.sign_request(request(1)).unwrap();
+        let (signed, binding) = sender.sign_request(request(&env, 1)).unwrap();
         // A distinct attempt has a distinct signed binding. Session ordering
         // distinguishes repeated transport sends of an identical historical proof.
-        let (_, other) = sender.sign_request(request(2)).unwrap();
+        let (_, other) = sender.sign_request(request(&env, 2)).unwrap();
         let admitted = receiver.verify_request(signed).unwrap();
         for outcome in [
             PeerResponse::Miss,
@@ -1892,13 +1906,14 @@ mod tests {
     }
     #[test]
     fn signed_attempt_ceiling_survives_decode_and_rejects_tamper_and_hop_refills() {
-        let signatures = network(4);
+        let env = racer_io::Env::host();
+        let signatures = network(&env, 4);
         let f: Vec<_> = signatures
             .iter()
             .map(|s| Forwarding::new(s.clone()))
             .collect();
         let acquire = |id| {
-            let mut logical = request(id);
+            let mut logical = request(&env, id);
             if let Operation::Metadata { mode, .. } = &mut logical.operation {
                 *mode = FetchMode::Acquire;
             }
@@ -1907,8 +1922,7 @@ mod tests {
             logical
         };
         for value in ["4294967296", "-1", "01", "+1"] {
-            let mut head =
-                protocol::request_head(&crate::test_support::clock(), &acquire(9)).unwrap();
+            let mut head = protocol::request_head(&env.ctx.clock, &acquire(9)).unwrap();
             head.headers
                 .iter_mut()
                 .find(|h| h.name == "racer-route-attempts")
@@ -1989,7 +2003,7 @@ mod tests {
         .unwrap();
         let mut refill = final_request.request.route.clone();
         refill.remaining_attempts = 5;
-        protocol::route_headers(&crate::test_support::clock(), &mut forged, &refill).unwrap();
+        protocol::route_headers(&env.ctx.clock, &mut forged, &refill).unwrap();
         push(&mut forged, "racer-receiver", &node(3).0);
         let bad_hop = signatures[2].sign(forged).unwrap();
         let genuine_hop = std::mem::replace(&mut final_request.authentication.hops[1], bad_hop);
@@ -2013,14 +2027,13 @@ mod tests {
         let verified = f[3].verify_request(decoded).unwrap();
         assert_eq!(verified.request().route.remaining_attempts, 2);
 
-        let mut copy = request(12);
+        let mut copy = request(&env, 12);
         copy.route.remaining_attempts = 1;
         assert!(f[0].sign_request_to(copy, &node(1)).is_err());
         // A forged but correctly signed CopyOnly original cannot hide credits by
         // lowering them to zero in the effective route at a subsequent relay.
-        let mut copy = request(12);
-        let mut original_head =
-            protocol::request_head(&crate::test_support::clock(), &copy).unwrap();
+        let mut copy = request(&env, 12);
+        let mut original_head = protocol::request_head(&env.ctx.clock, &copy).unwrap();
         original_head
             .headers
             .iter_mut()
@@ -2032,7 +2045,7 @@ mod tests {
         copy.route.visited.push(node(1));
         copy.route.remaining_links -= 1;
         let mut hop = hop_head("request-hop", &original, &original).unwrap();
-        protocol::route_headers(&crate::test_support::clock(), &mut hop, &copy.route).unwrap();
+        protocol::route_headers(&env.ctx.clock, &mut hop, &copy.route).unwrap();
         push(&mut hop, "racer-receiver", &node(2).0);
         let hop = signatures[1].sign(hop).unwrap();
         assert!(
@@ -2056,10 +2069,11 @@ mod tests {
 
     #[test]
     fn origin_forbidden_is_signed_403_and_cannot_substitute_rejected_401() {
-        let signatures = network(3);
+        let env = racer_io::Env::host();
+        let signatures = network(&env, 3);
         let sender = Forwarding::new(signatures[0].clone());
         let receiver = Forwarding::new(signatures[2].clone());
-        let (signed, binding) = sender.sign_request(request(14)).unwrap();
+        let (signed, binding) = sender.sign_request(request(&env, 14)).unwrap();
         let admitted = receiver.verify_request(signed).unwrap();
         for (outcome, status, substitute) in [
             (
@@ -2102,8 +2116,12 @@ mod tests {
             sender.verify_response(reply, &binding).unwrap();
         }
     }
-    fn prefetch_request(id: u8, action: crate::peer::protocol::PrefetchAction) -> PeerRequest {
-        let mut request = request(id);
+    fn prefetch_request(
+        env: &racer_io::Env,
+        id: u8,
+        action: crate::peer::protocol::PrefetchAction,
+    ) -> PeerRequest {
+        let mut request = request(env, id);
         request.operation = Operation::Prefetch {
             version: ObjectVersion {
                 object: request.origin.object.clone(),
@@ -2133,9 +2151,11 @@ mod tests {
     #[test]
     fn maximum_request_proof_and_nine_proof_envelope_fit_their_limits() {
         use crate::peer::protocol::{MAX_ENVELOPE_HEAD, MAX_SIGNED_HEAD, encode_envelope};
-        let signatures = network(2);
+        let env = racer_io::Env::host();
+        let signatures = network(&env, 2);
         let forwarding = Forwarding::new(signatures[0].clone());
         let mut request = prefetch_request(
+            &env,
             31,
             crate::peer::protocol::PrefetchAction::Fill {
                 page_size: crate::model::PageSize::DEFAULT,
@@ -2198,7 +2218,8 @@ mod tests {
         use crate::peer::protocol::decode_envelope;
         use crate::peer::protocol::encode_envelope;
         use racer_core::prefetch::{FailCode, PageResult};
-        let signatures = network(2);
+        let env = racer_io::Env::host();
+        let signatures = network(&env, 2);
         let f: Vec<_> = signatures
             .iter()
             .map(|s| Forwarding::new(s.clone()))
@@ -2244,7 +2265,7 @@ mod tests {
             ),
         ] {
             let (signed, binding) = f[0]
-                .sign_request_to(prefetch_request(id, action.clone()), &node(1))
+                .sign_request_to(prefetch_request(&env, id, action.clone()), &node(1))
                 .unwrap();
             let scope = signed.request.origin.scope().clone();
             let (auth, _) = decode_envelope(
@@ -2287,7 +2308,7 @@ mod tests {
             f[0].verify_response(response, &binding).unwrap();
         }
         // Prefetch results are not valid answers to a data request.
-        let (signed, binding) = f[0].sign_request_to(request(25), &node(1)).unwrap();
+        let (signed, binding) = f[0].sign_request_to(request(&env, 25), &node(1)).unwrap();
         let admitted = f[1].verify_request(signed).unwrap();
         assert!(
             f[1].sign_response(
@@ -2303,6 +2324,7 @@ mod tests {
         use crate::peer::protocol::PrefetchAction;
         use crate::peer::protocol::SecurityCodec;
         use crate::peer::protocol::request_head;
+        let env = racer_io::Env::host();
         let fill = |pages: Vec<u64>, length| PrefetchAction::Fill {
             page_size: crate::model::PageSize::DEFAULT,
             pages,
@@ -2321,22 +2343,18 @@ mod tests {
             PrefetchAction::Probe { pages: vec![4, 4] },
         ] {
             assert!(
-                request_head(
-                    &crate::test_support::clock(),
-                    &prefetch_request(31, action.clone())
-                )
-                .is_err(),
+                request_head(&env.ctx.clock, &prefetch_request(&env, 31, action.clone())).is_err(),
                 "{action:?}"
             );
         }
         assert!(
             request_head(
-                &crate::test_support::clock(),
-                &prefetch_request(31, fill((0..256).collect(), 256 * PAGE_BYTES))
+                &env.ctx.clock,
+                &prefetch_request(&env, 31, fill((0..256).collect(), 256 * PAGE_BYTES))
             )
             .is_ok()
         );
-        let signatures = network(2);
+        let signatures = network(&env, 2);
         let sender = Forwarding::new(signatures[0].clone());
         let admission = Rc::new(flow_control::Quotas::new(AdmissionPolicy::new(
             crate::test_support::cluster::config(false).limits,
@@ -2344,7 +2362,10 @@ mod tests {
         let codec =
             SecurityCodec::new(admission.clone(), crate::memory::BufferPool::new(admission));
         let (signed, _) = sender
-            .sign_request_to(prefetch_request(32, prefetch_fill(vec![1, 4])), &node(1))
+            .sign_request_to(
+                prefetch_request(&env, 32, prefetch_fill(vec![1, 4])),
+                &node(1),
+            )
             .unwrap();
         let scope = signed.request.origin.scope().clone();
         let decode = |change: &dyn Fn(&mut Vec<http1::Header>)| {
@@ -2420,14 +2441,15 @@ mod tests {
             content_type: None,
             priority: racer_core::prefetch::Priority::Normal,
         };
-        let clock = crate::test_support::clock();
-        assert!(request_head(&clock, &prefetch_request(31, fill(vec![3]))).is_err());
-        let head = request_head(&clock, &prefetch_request(31, fill(vec![0, 2]))).unwrap();
+        let env = racer_io::Env::host();
+        let clock = env.ctx.clock.clone();
+        assert!(request_head(&clock, &prefetch_request(&env, 31, fill(vec![3]))).is_err());
+        let head = request_head(&clock, &prefetch_request(&env, 31, fill(vec![0, 2]))).unwrap();
         assert_eq!(
             head.unique("racer-page-size").unwrap(),
             Some(b"65536".as_slice())
         );
-        let signatures = network(2);
+        let signatures = network(&env, 2);
         let sender = Forwarding::new(signatures[0].clone());
         let admission = Rc::new(flow_control::Quotas::new(AdmissionPolicy::new(
             crate::test_support::cluster::config(false).limits,
@@ -2435,7 +2457,7 @@ mod tests {
         let codec =
             SecurityCodec::new(admission.clone(), crate::memory::BufferPool::new(admission));
         let (signed, _) = sender
-            .sign_request_to(prefetch_request(32, fill(vec![0, 2])), &node(1))
+            .sign_request_to(prefetch_request(&env, 32, fill(vec![0, 2])), &node(1))
             .unwrap();
         let scope = signed.request.origin.scope().clone();
         let decoded = codec
@@ -2457,12 +2479,13 @@ mod tests {
     }
     #[test]
     fn signed_round_trip_reverse_path_response_substitution_and_replay() {
-        let signatures = network(3);
+        let env = racer_io::Env::host();
+        let signatures = network(&env, 3);
         let f: Vec<_> = signatures
             .iter()
             .map(|s| Forwarding::new(s.clone()))
             .collect();
-        let (outbound, binding) = f[0].sign_request_to(request(1), &node(1)).unwrap();
+        let (outbound, binding) = f[0].sign_request_to(request(&env, 1), &node(1)).unwrap();
         let admitted = f[1].verify_request(outbound).unwrap();
         let reverse = admitted.binding().clone();
         let route = budget(&admitted);
@@ -2474,7 +2497,7 @@ mod tests {
         let mut substituted = copy_response(&response);
         substituted.response = PeerResponse::Overloaded;
         assert!(f[1].verify_response(substituted, &reverse).is_err());
-        let (_, other) = f[0].sign_request_to(request(9), &node(1)).unwrap();
+        let (_, other) = f[0].sign_request_to(request(&env, 9), &node(1)).unwrap();
         assert!(
             f[1].verify_response(copy_response(&response), &other)
                 .is_err()
@@ -2516,10 +2539,11 @@ mod tests {
     }
     #[test]
     fn page_descriptor_fields_and_successful_response_are_bound_exactly() {
-        let signatures = network(3);
+        let env = racer_io::Env::host();
+        let signatures = network(&env, 3);
         let a = Forwarding::new(signatures[0].clone());
         let b = Forwarding::new(signatures[2].clone());
-        let mut request = request(3);
+        let mut request = request(&env, 3);
         let page = PageId {
             version: ObjectVersion {
                 object: request.origin.object.clone(),
@@ -2614,7 +2638,7 @@ mod tests {
         );
 
         let relay = Forwarding::new(signatures[1].clone());
-        let mut local = self::request(4);
+        let mut local = self::request(&env, 4);
         local.operation = Operation::Page {
             page: ciphertext.envelope().page.clone(),
             mode: FetchMode::Acquire,
@@ -2650,9 +2674,10 @@ mod tests {
     }
     #[test]
     fn validly_signed_page_must_match_the_requested_version_and_page() {
-        let signatures = network(3);
+        let env = racer_io::Env::host();
+        let signatures = network(&env, 3);
         let sender = Forwarding::new(signatures[0].clone());
-        let mut local = request(1);
+        let mut local = request(&env, 1);
         let requested = PageId {
             version: ObjectVersion {
                 object: local.origin.object.clone(),
@@ -2713,13 +2738,14 @@ mod tests {
     }
     #[test]
     fn exact_request_agreement_credentials_mode_identity_and_route() {
-        let signatures = network(3);
+        let env = racer_io::Env::host();
+        let signatures = network(&env, 3);
         let f: Vec<_> = signatures
             .iter()
             .map(|s| Forwarding::new(s.clone()))
             .collect();
         for change in 0..10 {
-            let (mut signed, _) = f[0].sign_request_to(request(1), &node(1)).unwrap();
+            let (mut signed, _) = f[0].sign_request_to(request(&env, 1), &node(1)).unwrap();
             match change {
                 0 => {
                     if let Operation::Metadata { mode, .. } = &mut signed.request.operation {
@@ -2774,13 +2800,14 @@ mod tests {
     }
     #[test]
     fn route_budget_extensions_loops_and_hop_chain_substitution_fail() {
-        let signatures = network(3);
+        let env = racer_io::Env::host();
+        let signatures = network(&env, 3);
         let f: Vec<_> = signatures
             .iter()
             .map(|s| Forwarding::new(s.clone()))
             .collect();
         for change in 0..5 {
-            let (signed, _) = f[0].sign_request_to(request(1), &node(1)).unwrap();
+            let (signed, _) = f[0].sign_request_to(request(&env, 1), &node(1)).unwrap();
             let admitted = f[1].verify_request(signed).unwrap();
             let mut route = budget(&admitted);
             match change {
@@ -2792,13 +2819,13 @@ mod tests {
             }
             assert!(f[1].append_request(admitted, &node(2), route).is_err());
         }
-        let (first, _) = f[0].sign_request_to(request(1), &node(1)).unwrap();
-        let (second, _) = f[0].sign_request_to(request(2), &node(1)).unwrap();
+        let (first, _) = f[0].sign_request_to(request(&env, 1), &node(1)).unwrap();
+        let (second, _) = f[0].sign_request_to(request(&env, 2), &node(1)).unwrap();
         let admitted = f[1].verify_request(first).unwrap();
         let route = budget(&admitted);
         let mut forwarded = f[1].append_request(admitted, &node(2), route).unwrap();
         for h in &forwarded.authentication.hops[0].head.headers {
-            let mut logical = request(1);
+            let mut logical = request(&env, 1);
             logical.route = RouteBudget {
                 membership: forwarded.request.route.membership,
                 request: forwarded.request.route.request,
@@ -2832,7 +2859,7 @@ mod tests {
         }
         forwarded.authentication.original = second.authentication.original;
         assert!(f[2].verify_request(forwarded).is_err());
-        let mut exhausted = request(1);
+        let mut exhausted = request(&env, 1);
         exhausted.route.remaining_links = 1;
         let (signed, _) = f[0].sign_request_to(exhausted, &node(1)).unwrap();
         let admitted = f[1].verify_request(signed).unwrap();
@@ -2843,12 +2870,13 @@ mod tests {
     fn successful_metadata_must_match_original_object_pin_and_operation() {
         use crate::model::ExpiresAt;
         use crate::model::ObjectMetadata;
-        let signatures = network(3);
+        let env = racer_io::Env::host();
+        let signatures = network(&env, 3);
         let f: Vec<_> = signatures
             .iter()
             .map(|s| Forwarding::new(s.clone()))
             .collect();
-        let (signed, _) = f[0].sign_request(request(1)).unwrap();
+        let (signed, _) = f[0].sign_request(request(&env, 1)).unwrap();
         let admitted = f[2].verify_request(signed).unwrap();
         let good = ObjectMetadata {
             content_type: Some(crate::model::ContentType::parse(b"text/plain").unwrap()),
@@ -2861,7 +2889,7 @@ mod tests {
         };
         f[2].sign_response(admitted.binding(), PeerResponse::Metadata(good.clone()))
             .unwrap();
-        let (signed, binding) = f[0].sign_request(request(2)).unwrap();
+        let (signed, binding) = f[0].sign_request(request(&env, 2)).unwrap();
         let admitted_typed = f[2].verify_request(signed).unwrap();
         let mut signed = f[2]
             .sign_response(
@@ -2905,10 +2933,13 @@ mod tests {
     fn relay_cannot_assert_success_but_can_return_request_bound_errors() {
         use crate::model::ExpiresAt;
         use crate::model::ObjectMetadata;
-        let signatures = network(3);
+        let env = racer_io::Env::host();
+        let signatures = network(&env, 3);
         let requester = Forwarding::new(signatures[0].clone());
         let relay = Forwarding::new(signatures[1].clone());
-        let (signed, binding) = requester.sign_request_to(request(1), &node(1)).unwrap();
+        let (signed, binding) = requester
+            .sign_request_to(request(&env, 1), &node(1))
+            .unwrap();
         let admitted = relay.verify_request(signed).unwrap();
         let metadata = ObjectMetadata {
             content_type: None,
@@ -2948,11 +2979,12 @@ mod tests {
     }
     #[test]
     fn deadline_roundtrip_and_verified_mailbox_ownership() {
+        let env = racer_io::Env::host();
         let deadline = racer_io::deadline::Deadline(Instant::now() + Duration::from_secs(20));
-        let value = protocol::encode_deadline(&crate::test_support::clock(), deadline).unwrap();
-        let decoded = protocol::decode_deadline(&crate::test_support::clock(), value).unwrap();
+        let value = protocol::encode_deadline(&env.ctx.clock, deadline).unwrap();
+        let decoded = protocol::decode_deadline(&env.ctx.clock, value).unwrap();
         assert_eq!(
-            protocol::encode_deadline(&crate::test_support::clock(), decoded).unwrap(),
+            protocol::encode_deadline(&env.ctx.clock, decoded).unwrap(),
             value
         );
         assert!(decoded.0 <= deadline.0);

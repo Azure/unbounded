@@ -121,19 +121,20 @@ mod tests {
     use super::*;
     use std::{pin::Pin, task::Context};
 
-    fn scope() -> RequestScope {
+    fn scope(env: &racer_io::Env) -> RequestScope {
         RequestScope::on(
-            &crate::test_support::clock(),
+            &env.ctx.clock,
             crate::model::RequestId([7; 16]),
-            crate::rt::environment::now() + Duration::from_secs(30),
+            env.ctx.now() + Duration::from_secs(30),
         )
         .unwrap()
     }
 
     #[test]
     fn immediate_results_never_arm_an_alarm() {
+        let env = racer_io::Env::host();
         let retry = NativeRetry::unattached();
-        let scope = scope();
+        let scope = scope(&env);
         for result in [Ok(7), Err(Error::Overloaded), Err(Error::Io)] {
             let mut operation = Box::pin(retry.wait(&scope, std::future::ready(result)));
             assert_eq!(
@@ -148,9 +149,10 @@ mod tests {
 
     #[test]
     fn elapsed_alarm_yields_once_then_arms_without_failing_request() {
+        let env = racer_io::Env::host();
         let retry = NativeRetry::unattached();
         retry.immediate.set(true);
-        let scope = scope();
+        let scope = scope(&env);
         let wakes = std::sync::Arc::new(crate::test_support::WakeCounter::default());
         let waker = std::task::Waker::from(wakes.clone());
         let mut cx = Context::from_waker(&waker);
@@ -165,8 +167,9 @@ mod tests {
 
     #[test]
     fn unrelated_polls_retain_one_alarm_and_completion_detaches_it() {
+        let env = racer_io::Env::host();
         let retry = NativeRetry::unattached();
-        let scope = scope();
+        let scope = scope(&env);
         let ready = Cell::new(false);
         let mut operation = Box::pin(retry.wait(
             &scope,
@@ -190,9 +193,10 @@ mod tests {
 
     #[test]
     fn cancellation_and_alarm_failure_do_not_leave_pending_without_wakes() {
+        let env = racer_io::Env::host();
         for cancel in [false, true] {
             let retry = NativeRetry::unattached();
-            let scope = scope();
+            let scope = scope(&env);
             let mut operation = Box::pin(retry.wait(&scope, std::future::pending::<Result<()>>()));
             let mut cx = Context::from_waker(std::task::Waker::noop());
             assert!(operation.as_mut().poll(&mut cx).is_pending());
@@ -215,10 +219,10 @@ mod tests {
     #[test]
     fn alarm_wakes_child_to_observe_deadline_without_native_wake() {
         use futures::{Stream, stream::FuturesUnordered};
-        let clock = crate::rt::environment::SimulationClock::new(989);
-        let _environment = clock.environment(0).enter();
+        let clock = racer_io::SimClock::new(989);
+        let env = racer_io::Env::new(racer_io::Driver::Uring, clock.ctx(0));
         let retry = NativeRetry::unattached();
-        let scope = scope();
+        let scope = scope(&env);
         let mut active = FuturesUnordered::new();
         active.push(retry.wait(&scope, std::future::pending::<Result<()>>()));
         let mut cx = Context::from_waker(std::task::Waker::noop());
@@ -236,10 +240,11 @@ mod tests {
     /// An op the owner completes on its own thread wakes the waiting task
     /// directly: no alarm fires, and the only alarm armed is the deadline.
     fn owner_thread_completion_wakes_waiter_without_alarm() {
+        let env = racer_io::Env::host();
         let (mut clients, port) = rdma_verbs::node(1).unwrap();
         let client = clients.remove(0);
         let retry = NativeRetry::unattached();
-        let scope = scope();
+        let scope = scope(&env);
         let wakes = std::sync::Arc::new(crate::test_support::WakeCounter::default());
         let waker = std::task::Waker::from(wakes.clone());
         let mut cx = Context::from_waker(&waker);
@@ -277,22 +282,20 @@ mod tests {
     #[test]
     fn kernel_alarm_wakes_child_and_releases_timer_after_completion() {
         use futures::{Stream, stream::FuturesUnordered};
+        let env = racer_io::Env::host();
         let admission = Rc::new(flow_control::Quotas::new(AdmissionPolicy::new(
             crate::test_support::cluster::config(true).limits,
         )));
-        let reactor = Rc::new(crate::runtime::Reactor::new(
-            admission,
-            &crate::test_support::env(),
-        ));
+        let reactor = Rc::new(crate::runtime::Reactor::new(admission, &env));
         reactor
             .init()
             .expect("real io_uring required for kernel alarm validation");
         let retry = NativeRetry::new(reactor.clone());
         // The alarm is the scope deadline: a short scope makes it fire.
         let short = RequestScope::on(
-            &crate::test_support::clock(),
+            &env.ctx.clock,
             crate::model::RequestId([7; 16]),
-            crate::rt::environment::now() + Duration::from_millis(20),
+            env.ctx.now() + Duration::from_millis(20),
         )
         .unwrap();
         let polls = Cell::new(0);
@@ -323,7 +326,7 @@ mod tests {
             std::thread::sleep(Duration::from_millis(1));
         }
         assert_eq!(polls.get(), 1, "the deadline fails the wait, no retry poll");
-        let scope = scope();
+        let scope = scope(&env);
         while reactor.in_flight() != 0 {
             assert!(std::time::Instant::now() < end, "timer fence did not drain");
             reactor.poll_budgeted(16).unwrap();

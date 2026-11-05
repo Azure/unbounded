@@ -268,12 +268,13 @@ impl Drop for Permit {
 mod tests {
     use super::*;
 
-    fn now() -> Instant {
-        crate::test_support::clock().now()
+    fn now(env: &racer_io::Env) -> Instant {
+        env.ctx.clock.clone().now()
     }
 
     #[test]
     fn worker_handles_share_fifo_but_not_counter_shards() {
+        let env = racer_io::Env::host();
         let metrics = Metrics::for_workers(2).unwrap();
         let first = Gate::with_metrics(
             Config {
@@ -290,7 +291,7 @@ mod tests {
         ));
         let scope = RequestScope::host(
             crate::model::RequestId([1; 16]),
-            now() + Duration::from_secs(10),
+            now(&env) + Duration::from_secs(10),
         )
         .unwrap();
         let permit = futures::executor::block_on(second.acquire(&admission, &scope))
@@ -323,10 +324,10 @@ mod tests {
     #[test]
     fn receive_alarm_wakes_without_completion_and_preserves_scope() {
         use std::future::Future;
-        let clock = crate::rt::environment::SimulationClock::new(909);
-        let sim_env = clock.environment(0);
-        let _env = sim_env.enter();
-        let sim_ctx = sim_env.worker_ctx();
+        let clock = racer_io::SimClock::new(909);
+        let sim_env = clock.ctx(0);
+        let env = racer_io::Env::new(racer_io::Driver::Uring, sim_env.clone());
+        let sim_ctx = sim_env.clone();
         let admission = Quotas::new(AdmissionPolicy::new(
             crate::test_support::cluster::config(false).limits,
         ));
@@ -344,7 +345,7 @@ mod tests {
             let parent = RequestScope::on(
                 &sim_ctx.clock,
                 RequestId([4; 16]),
-                now() + Duration::from_secs(10),
+                now(&env) + Duration::from_secs(10),
             )
             .unwrap();
             let original = parent.deadline;
@@ -363,7 +364,7 @@ mod tests {
             }
             if cause == "total" {
                 scope
-                    .set_candidate_total(now() + Duration::from_millis(10))
+                    .set_candidate_total(now(&env) + Duration::from_millis(10))
                     .unwrap();
             }
             let mut pending = Box::pin(gate.acquire(&admission, &scope));
@@ -413,6 +414,7 @@ mod tests {
     #[test]
     fn receive_permit_is_not_retained_by_idle_http_state() {
         use http1::connection::State as _;
+        let env = racer_io::Env::host();
         let admission = Quotas::new(AdmissionPolicy::new(
             crate::test_support::cluster::config(false).limits,
         ));
@@ -421,7 +423,8 @@ mod tests {
             ..Config::default()
         })
         .unwrap();
-        let scope = RequestScope::host(RequestId([5; 16]), now() + Duration::from_secs(5)).unwrap();
+        let scope =
+            RequestScope::host(RequestId([5; 16]), now(&env) + Duration::from_secs(5)).unwrap();
         let mut ticket = gate.enter(&admission, &scope).unwrap().unwrap();
         let mut cx = Context::from_waker(futures::task::noop_waker_ref());
         let Poll::Ready(Ok(permit)) = ticket.poll(&scope, &mut cx) else {
@@ -441,6 +444,7 @@ mod tests {
     }
     #[test]
     fn receive_fifo_is_shared_bounded_and_completion_owned() {
+        let env = racer_io::Env::host();
         assert_eq!(std::mem::align_of::<Gate>(), 64);
         let admission = Quotas::new(AdmissionPolicy::new(
             crate::test_support::cluster::config(false).limits,
@@ -451,7 +455,8 @@ mod tests {
             ..Config::default()
         })
         .unwrap();
-        let scope = RequestScope::host(RequestId([1; 16]), now() + Duration::from_secs(5)).unwrap();
+        let scope =
+            RequestScope::host(RequestId([1; 16]), now(&env) + Duration::from_secs(5)).unwrap();
         let wake = Arc::new(Wake(AtomicUsize::new(0)));
         let waker = Waker::from(wake.clone());
         let mut cx = Context::from_waker(&waker);
@@ -484,10 +489,12 @@ mod tests {
     }
     #[test]
     fn receive_disabled_cancel_and_expired_ticket_do_not_grant() {
+        let env = racer_io::Env::host();
         let admission = Quotas::new(AdmissionPolicy::new(
             crate::test_support::cluster::config(false).limits,
         ));
-        let scope = RequestScope::host(RequestId([2; 16]), now() + Duration::from_secs(5)).unwrap();
+        let scope =
+            RequestScope::host(RequestId([2; 16]), now(&env) + Duration::from_secs(5)).unwrap();
         assert!(
             Gate::new(Config::default())
                 .unwrap()
@@ -503,7 +510,7 @@ mod tests {
         .unwrap();
         let mut ticket = gate.enter(&admission, &scope).unwrap().unwrap();
         assert!(ticket.deadline() <= scope.deadline.0);
-        ticket.deadline = now();
+        ticket.deadline = now(&env);
         let mut cx = Context::from_waker(futures::task::noop_waker_ref());
         assert!(matches!(
             ticket.poll(&scope, &mut cx),
@@ -522,6 +529,7 @@ mod tests {
 
     #[test]
     fn receive_queue_pressure_and_middle_removal_preserve_fifo() {
+        let env = racer_io::Env::host();
         let admission = Quotas::new(AdmissionPolicy::new(
             crate::test_support::cluster::config(false).limits,
         ));
@@ -531,7 +539,8 @@ mod tests {
             ..Config::default()
         })
         .unwrap();
-        let scope = RequestScope::host(RequestId([3; 16]), now() + Duration::from_secs(5)).unwrap();
+        let scope =
+            RequestScope::host(RequestId([3; 16]), now(&env) + Duration::from_secs(5)).unwrap();
         let held = admission
             .reserve(
                 None,

@@ -56,14 +56,15 @@ fn get(id: &str) -> PrefetchRequest<'static> {
 #[test]
 #[allow(clippy::disallowed_methods)] // Real disk writes need wall time.
 fn put_fills_every_page_through_the_owner_and_reports_success() {
+    let env = racer_io::Env::host();
     let queue = Rc::new(crate::drivers::DriverQueue::new(1024));
     let _queue = queue.enter();
-    let signers = network(1);
-    let mut f = fixture_with(2 * PAGE_BYTES + 7, None);
+    let signers = network(&env, 1);
+    let mut f = fixture_with(&env, 2 * PAGE_BYTES + 7, None);
     f.reactor.init().unwrap();
     let membership = local_membership(&signers[0]);
     let (local, mut endpoint, _publication) =
-        coordinator(&f, &signers[0], &membership, NoPeer::requester());
+        coordinator(&env, &f, &signers[0], &membership, NoPeer::requester(&env));
     let body = put_body(&f);
     let put = |id: &str| PrefetchRequest::Put {
         id: id.into(),
@@ -179,16 +180,17 @@ fn put_fills_every_page_through_the_owner_and_reports_success() {
 
 #[test]
 fn put_to_a_passthrough_cache_is_409_passthrough() {
+    let env = racer_io::Env::host();
     for mode in [CacheMode::PassthroughPeers, CacheMode::PassthroughLocal] {
         let queue = Rc::new(crate::drivers::DriverQueue::new(1024));
         let _queue = queue.enter();
-        let signers = network(1);
-        let mut f = fixture_with(PAGE_BYTES + 7, None);
+        let signers = network(&env, 1);
+        let mut f = fixture_with(&env, PAGE_BYTES + 7, None);
         f.reactor.init().unwrap();
-        f.set_mode(mode);
+        f.set_mode(&env, mode);
         let membership = local_membership(&signers[0]);
         let (local, mut endpoint, _publication) =
-            coordinator(&f, &signers[0], &membership, NoPeer::requester());
+            coordinator(&env, &f, &signers[0], &membership, NoPeer::requester(&env));
         let body = put_body(&f);
         let response = run(
             &mut f,
@@ -209,14 +211,15 @@ fn put_to_a_passthrough_cache_is_409_passthrough() {
 
 #[test]
 fn bad_bodies_and_draining_nodes_get_json_errors() {
+    let env = racer_io::Env::host();
     let queue = Rc::new(crate::drivers::DriverQueue::new(1024));
     let _queue = queue.enter();
-    let signers = network(1);
-    let mut f = fixture_with(PAGE_BYTES + 7, None);
+    let signers = network(&env, 1);
+    let mut f = fixture_with(&env, PAGE_BYTES + 7, None);
     f.reactor.init().unwrap();
     let membership = local_membership(&signers[0]);
     let (local, mut endpoint, _publication) =
-        coordinator(&f, &signers[0], &membership, NoPeer::requester());
+        coordinator(&env, &f, &signers[0], &membership, NoPeer::requester(&env));
     let response = run(
         &mut f,
         &mut endpoint,
@@ -286,16 +289,17 @@ fn pooled_membership(
 /// node out of the cache's pool.
 #[test]
 fn a_node_that_left_the_cache_pool_refuses_retained_membership_requests() {
+    let env = racer_io::Env::host();
     let queue = Rc::new(crate::drivers::DriverQueue::new(1024));
     let _queue = queue.enter();
-    let signers = network(2);
-    let mut f = fixture_with(PAGE_BYTES + 7, None);
+    let signers = network(&env, 2);
+    let mut f = fixture_with(&env, PAGE_BYTES + 7, None);
     f.reactor.init().unwrap();
     let retained = pooled_membership(&mut f, &signers, &[0]);
     let current = pooled_membership(&mut f, &signers, &[1]);
     assert!(retained.serves(&f.context.object.cache, signers[0].node()));
     let (local, mut endpoint, _publication) =
-        coordinator(&f, &signers[0], &current, NoPeer::requester());
+        coordinator(&env, &f, &signers[0], &current, NoPeer::requester(&env));
     let context = crate::security::OriginContext {
         object: f.context.object.clone(),
         metadata: None,
@@ -329,14 +333,15 @@ fn a_node_that_left_the_cache_pool_refuses_retained_membership_requests() {
 /// than the cluster's, before probing or filling anything.
 #[test]
 fn owner_refuses_a_fill_cut_at_another_page_size() {
+    let env = racer_io::Env::host();
     let queue = Rc::new(crate::drivers::DriverQueue::new(1024));
     let _queue = queue.enter();
-    let signers = network(2);
-    let mut f = fixture_with(PAGE_BYTES + 7, None);
+    let signers = network(&env, 2);
+    let mut f = fixture_with(&env, PAGE_BYTES + 7, None);
     f.reactor.init().unwrap();
     let membership = pooled_membership(&mut f, &signers, &[0]);
     let (local, mut endpoint, _publication) =
-        coordinator(&f, &signers[0], &membership, NoPeer::requester());
+        coordinator(&env, &f, &signers[0], &membership, NoPeer::requester(&env));
     assert_eq!(local.page_size(), Ok(crate::model::PageSize::DEFAULT));
     let context = crate::security::OriginContext {
         object: f.context.object.clone(),
@@ -366,14 +371,15 @@ fn owner_refuses_a_fill_cut_at_another_page_size() {
 #[test]
 #[allow(clippy::disallowed_methods)] // Real disk writes need wall time.
 fn put_ranks_owners_only_within_the_cache_pool() {
+    let env = racer_io::Env::host();
     let queue = Rc::new(crate::drivers::DriverQueue::new(1024));
     let _queue = queue.enter();
-    let signers = network(2);
-    let mut f = fixture_with(4 * PAGE_BYTES + 7, None);
+    let signers = network(&env, 2);
+    let mut f = fixture_with(&env, 4 * PAGE_BYTES + 7, None);
     f.reactor.init().unwrap();
     let membership = pooled_membership(&mut f, &signers, &[0]);
     let (local, mut endpoint, _publication) =
-        coordinator(&f, &signers[0], &membership, NoPeer::requester());
+        coordinator(&env, &f, &signers[0], &membership, NoPeer::requester(&env));
     let body = put_body(&f);
     let put = PrefetchRequest::Put {
         id: "t".into(),
@@ -400,14 +406,15 @@ fn put_ranks_owners_only_within_the_cache_pool() {
 /// for peers: a peer that ranked it as owner used a stale membership.
 #[test]
 fn a_node_outside_the_cache_pool_refuses_tickets_and_fills() {
+    let env = racer_io::Env::host();
     let queue = Rc::new(crate::drivers::DriverQueue::new(1024));
     let _queue = queue.enter();
-    let signers = network(2);
-    let mut f = fixture_with(PAGE_BYTES + 7, None);
+    let signers = network(&env, 2);
+    let mut f = fixture_with(&env, PAGE_BYTES + 7, None);
     f.reactor.init().unwrap();
     let membership = pooled_membership(&mut f, &signers, &[1]);
     let (local, mut endpoint, _publication) =
-        coordinator(&f, &signers[0], &membership, NoPeer::requester());
+        coordinator(&env, &f, &signers[0], &membership, NoPeer::requester(&env));
     let body = put_body(&f);
     let put = PrefetchRequest::Put {
         id: "t".into(),

@@ -12,8 +12,6 @@ use crate::telemetry::primitives::Ring;
 use crate::telemetry::primitives::SampleLimits;
 use crate::telemetry::primitives::SharedRing;
 
-#[cfg(test)]
-use crate::rt::environment;
 use crate::telemetry::primitives::server;
 use crate::telemetry::primitives::server::Handler;
 use crate::telemetry::primitives::server::Response;
