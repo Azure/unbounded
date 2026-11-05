@@ -96,7 +96,7 @@ func TestMachineStatusIsolationChangeSchema(t *testing.T) {
 func TestMachineIsolationEnums(t *testing.T) {
 	t.Parallel()
 
-	want := []string{"", "nspawn", "none"}
+	want := []string{"", "nspawn", "none", "container"}
 
 	if got := enumValues(t, machineSchema(t).Properties["spec"].Properties["isolation"]); !slices.Equal(got, want) {
 		t.Errorf("spec.isolation enum = %v, want %v", got, want)

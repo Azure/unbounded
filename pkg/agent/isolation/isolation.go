@@ -52,10 +52,10 @@ func ParseMode(s string) (Mode, error) {
 	switch m := Mode(s); m {
 	case "":
 		return DefaultMode, nil
-	case ModeNSpawn, ModeNone:
+	case ModeNSpawn, ModeNone, ModeContainer:
 		return m, nil
 	default:
-		return "", fmt.Errorf("unsupported isolation mode %q (supported: %s, %s)", s, ModeNSpawn, ModeNone)
+		return "", fmt.Errorf("unsupported isolation mode %q (supported: %s, %s, %s)", s, ModeNSpawn, ModeNone, ModeContainer)
 	}
 }
 

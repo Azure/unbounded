@@ -209,6 +209,10 @@ type MachineReconciler struct {
 	ClusterInfo                 *ClusterInfo
 	MaxConcurrentReconciles     int
 	ProvisioningTimeoutDuration time.Duration
+	// ExperimentalContainerIsolation enables the experimental container
+	// isolation mode: Machines may declare it, and every agent configuration
+	// machina provisions opts in to it.
+	ExperimentalContainerIsolation bool
 }
 
 // +kubebuilder:rbac:groups=unbounded-cloud.io,resources=machines,verbs=get;list;watch;create;update;patch;delete
@@ -234,7 +238,7 @@ func (r *MachineReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 
 	// Maintain the isolation drift condition for every Machine, including
 	// agent-registered ones without SSH config.
-	changed, recheck := syncIsolationConditions(&machine, time.Now())
+	changed, recheck := syncIsolationConditions(&machine, time.Now(), r.ExperimentalContainerIsolation)
 	if changed {
 		if err := r.Status().Update(ctx, &machine); err != nil {
 			if errors.IsConflict(err) {
@@ -354,6 +358,11 @@ func (r *MachineReconciler) reconcileProvisioning(ctx context.Context, machine *
 
 		return r.updateStatus(ctx, machine, unboundedv1alpha3.MachinePhaseFailed,
 			fmt.Sprintf("Provisioning timed out after %s", r.provisioningTimeout()))
+	}
+
+	// An experimental mode is provisioned only when machina enables it.
+	if err := checkIsolationEnabled(machine.Spec.Isolation, r.ExperimentalContainerIsolation); err != nil {
+		return r.updateStatus(ctx, machine, unboundedv1alpha3.MachinePhaseFailed, err.Error())
 	}
 
 	// Build SSH config from the Machine's spec.
@@ -615,6 +624,8 @@ func (r *MachineReconciler) provisionMachine(
 		},
 		ProviderLabels: providerLabels,
 		BootstrapToken: bootstrapToken,
+
+		ExperimentalContainerIsolation: r.ExperimentalContainerIsolation,
 	})
 
 	configJSON, err := json.Marshal(agentConfig)

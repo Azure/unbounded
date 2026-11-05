@@ -59,10 +59,15 @@ type AgentConfig struct {
 	// When empty the agent uses the built-in default image.
 	OCIImage string `json:"OCIImage,omitempty"`
 
-	// Isolation selects where the node stack runs: nspawn or none. Empty
-	// means nspawn, which is also what every config written before this field
-	// existed means. Only the modes this agent can operate are accepted.
+	// Isolation selects where the node stack runs: nspawn, none or container.
+	// Empty means nspawn, which is also what every config written before this
+	// field existed means. Only the modes this agent can operate are accepted,
+	// and container only with Experimental.ContainerIsolation.
 	Isolation string `json:"Isolation,omitempty"`
+
+	// Experimental opts the host in to experimental agent features. Nil
+	// enables none of them.
+	Experimental *ExperimentalConfig `json:"Experimental,omitempty"`
 
 	// NvidiaToolkit overrides where the NVIDIA Container Toolkit tools are on
 	// the host. It applies to Isolation none only, the one mode that runs them
@@ -301,6 +306,11 @@ func (a *AgentConfig) DeepCopy() *AgentConfig {
 		out.NvidiaToolkit = &toolkit
 	}
 
+	if a.Experimental != nil {
+		experimental := *a.Experimental
+		out.Experimental = &experimental
+	}
+
 	return &out
 }
 
@@ -342,6 +352,10 @@ func (a *AgentConfig) Validate() error {
 
 	if _, err := isolation.ParseMode(a.Isolation); err != nil {
 		errs = append(errs, fmt.Errorf("invalid Isolation: %w", err))
+	}
+
+	if err := a.validateExperimental(); err != nil {
+		errs = append(errs, err)
 	}
 
 	if err := a.validateNvidiaToolkit(); err != nil {
