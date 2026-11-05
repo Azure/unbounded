@@ -217,15 +217,42 @@ Model failures within 2x of racer-sim's and the same order of magnitude.
 | 50,000 | 24,742 failed (3.1%), 47 origin, 15,254 pings, p50 1.48 s | 757 failed, 16 origin, 27 pings, p50 1.73 s | 143,726 failed (18%; 1,541,629 relay sheds, 0 search sheds), 17 origin, 39 pings, p50 1.79 s / p99 2.91 s, 89,544 B/node, 221 s (measured before routed pings) |
 
 10,000 is within tolerance. 50,000 is not: without relay quotas the Model failed 33x fewer
-reads than racer-sim, with them 5.8x more. The hypothesis that racer-sim's extra failures
-came from relay quotas holds in direction (the quota is what fails reads at 50,000), but the
-Model overshoots. Search slots are not the cause: no Model search found its worker's 8 slots
-busy, because searches cost little CPU and one shared cache serves most of them. Open
-leads, not yet verified: racer-sim's queued searches (514,580) delay requests and spread
-relay load in time, where the Model's instant searches send them in one burst; the Model's
-shared route cache gives every node the same routes, so hot relays concentrate (production
-and racer-sim cache per node); the Model's relays hold their transfer while an `Acquire`
-destination fetches. Next step: per-node route caches at 50,000 and a relay hold breakdown.
+reads than racer-sim, with them 5.8x more. racer-sim's own report for the same run
+(`rejections.relay`) shows 76,062 relay rejections against the Model's 1,541,629, so the gap
+is relay load, not the quota itself. Leads checked:
+
+- Shared route cache (refuted). A cache entry's routes depend only on its `PathKey`
+  (`topology/src/paths.rs:165-180`: membership, ends, links, visited, blocked; the seed only
+  picks among cached alternatives, `select_route`), so the node that searched does not change
+  which relays carry a request. Per-node caches of production's 128 entries
+  (`src/worker.rs:262` `cached_paths`) over a shared search memo gave 130 failures at 10,000
+  (against 134), 0 search sheds, and 18 KB more per node, so the Model keeps one cache.
+- Search latency (refuted for now). No Model search found its worker's 8 slots busy at 10,000
+  or 50,000, shared cache or not. racer-sim's 514,580 queued searches come from its 64-entry
+  queue, which production does not have (see Route search slots).
+- Relay hold (matches production). Production keeps the `Relay` reservation on the connection
+  from before `forward_inner` until the downstream answer has been written
+  (`src/peer/server.rs:540-560` reserves and awaits `forward_inner`; `:778` clears
+  `relay.reservation` after the relayed body is written), so a relay holds its transfer while
+  an `Acquire` destination fetches, as the Model does. racer-sim releases at the same point
+  (`sim/src/node/world.rs` `send_reply`, `held`).
+- Relay hold breakdown (`MODEL_DIAG=1`, `relay_hold:<end>:<ms>` and `relay_shed:<kind>:hop<n>`
+  in `attempt_errors`). At 50,000 every shed is at the first relay (`hop1`) of a probe, never a
+  ping. Holds of answered requests: 128-511 ms for 562,000 of 1,108,000, mostly an owner's
+  reply waiting on its crypto helper (owner sheds are decided at once, `served:owner*:Overloaded:0ms`,
+  but reach the reader 250-750 ms later). At 10,000 most holds are 8-127 ms.
+- Crypto helpers (open, the strongest lead). Production pairs each worker with its own crypto
+  helper (`src/worker.rs:124-130` `WorkerPair { io, crypto }`); the Model and racer-sim have one
+  per node (`src/resources.rs` `Fabric::crypto`). racer-sim also does not wait for request
+  verification (`sim/src/node/world.rs` `hop` charges `verify_ns` and goes on), where the Model
+  and production do (`src/peer/forwarding.rs:368` `verify_request_async`). One helper per
+  worker, the connection's worker as `probe % workers` (an inference about production's
+  listener), measured: 50,000 failed 58,358 (7.3%, 1,031,764 relay sheds, p50 0.90 s), 2.4x
+  racer-sim; but 10,000 failed 806 (4.5x racer-sim; 15,979 relay sheds, p50 268 ms) and 400 and
+  2,000 were unchanged. Not committed: it moves 10,000 out of tolerance. At 10,000 the extra
+  failures are walks `OOver HUnav OFail OFail`: owner 0 sheds, the helper's flight fails at
+  once because the helper is itself a reader whose own walk failed, and the reader's link
+  budget is spent before owners 1 and 2 (`HopBudgetExhausted`, not sent).
 
 Pings: the Model now routes pings like racer-sim and production, but sends few (0 at
 10,000, 39 at 50,000) against racer-sim's 3,986 and 15,254: pings start only from silence

@@ -531,8 +531,8 @@ struct Model<'s> {
     ticking: bool,
     /// Whether an [`Ev::Publish`] is scheduled.
     publishing: bool,
-    /// `Relay` transfers held by each request's relays, as `(node, worker)`.
-    relay_charges: BTreeMap<u64, Vec<(u32, u8)>>,
+    /// `Relay` transfers held by each request's relays, as `(node, worker, reserved at)`.
+    relay_charges: BTreeMap<u64, Vec<(u32, u8, Nanos)>>,
     /// `Relay` transfers in use per `(node, worker)`.
     relays_active: BTreeMap<(u32, u8), usize>,
     /// When each running route search of a `(node, worker)` finishes.
@@ -557,9 +557,13 @@ struct Model<'s> {
     /// Partitioned node pairs, smaller id first.
     partitions: BTreeSet<(u32, u32)>,
     /// Route searches: the real `topology::Paths` over exhaustive mesh searches, one cache
-    /// shared by every node. racer-sim keeps one per node over a shared memo; per-node caches
-    /// gave the same 10,000-node cold start (78 against 79 failures) at 40% more memory.
-    /// Searches run synchronously, so the search queue never fills.
+    /// shared by every node. Production keeps one per worker (`src/app.rs` `Paths::with_limits`)
+    /// and racer-sim one per node, but a cache entry's routes depend only on its key, not on the
+    /// node that searched (`topology/src/paths.rs` `PathKey` leaves out the seed, which only
+    /// picks among the cached alternatives), so sharing changes search counts and CPU, not
+    /// which relays carry requests. Per-node caches of production's 128 entries left the 10,000
+    /// node cold start unchanged (130 against 134 failures, 0 search sheds) at 18 KB more per
+    /// node. Searches run synchronously, so the search queue never fills.
     paths: Paths<Exhaustive>,
 }
 
@@ -1721,13 +1725,19 @@ impl<'s> Model<'s> {
                 let active = self.relays_active.entry((at, worker)).or_default();
                 if *active >= relay_transfers() {
                     self.report.counters.relay_sheds += 1;
+                    if self.diag {
+                        let m = &self.msgs[&mid];
+                        let kind = if m.ping.is_some() { "ping" } else { "probe" };
+                        let key = format!("relay_shed:{kind}:hop{}", m.path.len());
+                        *self.report.attempt_errors.entry(key).or_default() += 1;
+                    }
                     return self.fail_hop(mid, at, Fault::Overloaded);
                 }
                 *active += 1;
                 self.relay_charges
                     .entry(mid)
                     .or_default()
-                    .push((at, worker));
+                    .push((at, worker, now));
                 self.report.counters.relays += 1;
                 self.forward(mid, at, Some(plan));
             }
@@ -1736,13 +1746,31 @@ impl<'s> Model<'s> {
 
     /// Drop `mid` without an answer: its relays see the exchange end.
     fn drop_msg(&mut self, mid: u64) {
-        self.msgs.remove(&mid);
         self.release_relays(mid);
+        self.msgs.remove(&mid);
     }
 
     /// The relays of `mid` release their `Relay` transfers.
     fn release_relays(&mut self, mid: u64) {
-        for key in self.relay_charges.remove(&mid).unwrap_or_default() {
+        let now = self.now();
+        let kind = if self.diag {
+            match self.msgs.get(&mid) {
+                Some(m) if m.ping.is_some() => "ping",
+                Some(_) => "unanswered",
+                None => "answered",
+            }
+        } else {
+            ""
+        };
+        for (node, worker, start) in self.relay_charges.remove(&mid).unwrap_or_default() {
+            if self.diag {
+                // Log2 buckets of the hold in ms.
+                let ms = (now - start) / MILLIS;
+                let bucket = if ms == 0 { 0 } else { 1u64 << ms.ilog2() };
+                let key = format!("relay_hold:{kind}:{bucket}ms");
+                *self.report.attempt_errors.entry(key).or_default() += 1;
+            }
+            let key = (node, worker);
             let active = self.relays_active.get_mut(&key).expect("a charged relay");
             *active -= 1;
             if *active == 0 {
