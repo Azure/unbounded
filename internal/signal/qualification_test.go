@@ -787,6 +787,7 @@ func TestQualificationEvidenceRetriesTransientNodeRead(t *testing.T) {
 	}
 	start := metav1.NewTime(time.Now().UTC().Add(-time.Minute))
 	finish := metav1.NewTime(time.Now().UTC())
+	fingerprint := signalv1.NodeFingerprint{NodeUID: node.UID, BootID: "boot-a"}
 	reconciler := &RunReconciler{
 		APIReader: failingNodeReader{
 			err: apierrors.NewServiceUnavailable("temporary API failure"),
@@ -802,6 +803,21 @@ func TestQualificationEvidenceRetriesTransientNodeRead(t *testing.T) {
 			Phase:      signalv1.CheckPhaseSucceeded,
 			StartedAt:  &start,
 			FinishedAt: &finish,
+			BackendEvidence: signalv1.BackendEvidenceStatus{
+				Complete: true,
+				Content: qualificationBackendEvidence(
+					t,
+					run,
+					0,
+					start.Time,
+					finish.Time,
+					nil,
+					[]signalv1.NodeFingerprint{fingerprint},
+					[]signalv1.NodeFingerprint{fingerprint},
+					[]signalv1.QualificationVerdict{signalv1.QualificationVerdictPass},
+					false,
+				),
+			},
 		}},
 		"Pass",
 		"",

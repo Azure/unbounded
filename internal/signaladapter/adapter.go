@@ -366,13 +366,16 @@ func ValidateConfig(config Config) ([]signalv1.Participant, []corev1.Toleration,
 	if (config.PlanDigest == "") != (config.AdapterImage == "") {
 		return nil, nil, nil, errors.New("plan digest and adapter image must either both be present or both be absent")
 	}
+
 	if config.PlanDigest != "" {
 		if !signalv1.IsSHA256Digest(config.PlanDigest) {
 			return nil, nil, nil, errors.New("plan digest must be an algorithm-qualified SHA-256 digest")
 		}
+
 		if !runnerImagePattern.MatchString(config.AdapterImage) {
 			return nil, nil, nil, errors.New("adapter image must be an immutable sha256 digest reference")
 		}
+
 		if config.RunName == "" || config.CheckID == "" || config.CheckOrder < 0 {
 			return nil, nil, nil, errors.New("qualification evidence requires run and check identity")
 		}

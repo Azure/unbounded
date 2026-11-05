@@ -23,6 +23,7 @@ func TestApplyQualificationEvidenceAttributesPodParticipants(t *testing.T) {
 	started := time.Date(2026, 1, 2, 3, 4, 5, 0, time.UTC)
 	evidence := qualificationEvidenceSkeleton(2)
 	addHealthyMPIWorkers(&evidence)
+
 	results := []Result{
 		qualificationResult(0, "Pass", "participant-zero", started),
 		qualificationResult(1, "Fail", "participant-one", started),
@@ -39,6 +40,7 @@ func TestApplyQualificationEvidenceAttributesPodParticipants(t *testing.T) {
 	if evidence.GroupResult != nil {
 		t.Fatal("Pod evidence unexpectedly contains a group verdict")
 	}
+
 	if evidence.Participants[0].Verdict.Verdict != "Pass" ||
 		evidence.Participants[1].Verdict.Verdict != "Fail" ||
 		evidence.Participants[0].Verdict.Attribution != "participant" {
@@ -75,6 +77,7 @@ func TestApplyQualificationEvidenceSeparatesMPIGroupAndParticipantObservation(t 
 		evidence.GroupResult.Attribution != "group" {
 		t.Fatalf("MPI group result = %#v", evidence.GroupResult)
 	}
+
 	for index := range evidence.Participants {
 		if evidence.Participants[index].Verdict.Attribution != "group-with-participant-observation" {
 			t.Fatalf("participant %d attribution = %#v", index, evidence.Participants[index].Verdict)
@@ -89,12 +92,14 @@ func TestApplyQualificationEvidenceSeparatesMPIGroupAndParticipantObservation(t 
 		qualificationFingerprints("boot-a", "boot-a"),
 		qualificationFingerprints("boot-a", "boot-a"),
 	)
+
 	if evidence.Participants[1].Verdict.Verdict != "Inconclusive" {
 		t.Fatalf("incomplete MPI participant verdict = %#v", evidence.Participants[1].Verdict)
 	}
 
 	evidence = qualificationEvidenceSkeleton(2)
 	addHealthyMPIWorkers(&evidence)
+
 	results[0].Measurements = `{"qualification":{"participants":[{"participantIndex":0,"visibleDevices":["gpu-a"],"coveredDevices":["gpu-a"]}]}}`
 	results[1].Measurements = results[0].Measurements
 	applyQualificationEvidence(
@@ -104,6 +109,7 @@ func TestApplyQualificationEvidenceSeparatesMPIGroupAndParticipantObservation(t 
 		qualificationFingerprints("boot-a", "boot-a"),
 		qualificationFingerprints("boot-a", "boot-a"),
 	)
+
 	if evidence.Participants[1].Verdict.Reason != "PerDeviceCoverageNotProven" {
 		t.Fatalf("missing MPI participant evidence = %#v", evidence.Participants[1].Verdict)
 	}
@@ -138,11 +144,13 @@ func TestApplyQualificationEvidenceEnforcesContinuity(t *testing.T) {
 		qualificationFingerprints("boot-a"),
 		qualificationFingerprints("boot-a"),
 	)
+
 	participant := evidence.Participants[0]
 	if participant.Verdict.Verdict != "Pass" || !participant.PerDeviceCoverage ||
 		participant.MaxObservedGap == nil || participant.MaxObservedGap.Duration > maxGap.Duration {
 		t.Fatalf("complete continuity evidence = %#v", participant)
 	}
+
 	if participant.Start.DriverVersion != "1.2.3" ||
 		participant.Start.GPUInventoryDigest == "" ||
 		participant.Start.GPUInventoryDigest != participant.End.GPUInventoryDigest {
@@ -190,6 +198,7 @@ func TestApplyQualificationEvidenceEnforcesContinuity(t *testing.T) {
 			testResult.SampleTimes = append([]time.Time(nil), result.SampleTimes...)
 			ends := qualificationFingerprints("boot-a")
 			testCase.mutate(&testResult, ends)
+
 			testEvidence := qualificationEvidenceSkeleton(1)
 
 			applyQualificationEvidence(
@@ -231,13 +240,16 @@ func TestBackendEvidenceBindingAndCompatibility(t *testing.T) {
 		qualificationFingerprints("boot-a"),
 		qualificationFingerprints("boot-a"),
 	)
+
 	content, err := json.Marshal(evidence)
 	if err != nil {
 		t.Fatal(err)
 	}
+
 	if err := ValidateBackendEvidence(string(content)); err != nil {
 		t.Fatalf("ValidateBackendEvidence() error = %v", err)
 	}
+
 	if err := ValidateBackendEvidenceBinding(
 		string(content),
 		config.RunUID,
@@ -247,6 +259,7 @@ func TestBackendEvidenceBindingAndCompatibility(t *testing.T) {
 	); err != nil {
 		t.Fatalf("ValidateBackendEvidenceBinding() error = %v", err)
 	}
+
 	if err := ValidateBackendEvidenceBinding(
 		string(content),
 		"other-run",
@@ -268,6 +281,7 @@ func TestBackendEvidenceBindingAndCompatibility(t *testing.T) {
 		qualificationFingerprints("boot-a"),
 		qualificationFingerprints("boot-a"),
 	)
+
 	if legacyEvidence.Participants[0].Verdict.Reason != "QualificationIdentityUnavailable" {
 		t.Fatalf("legacy evidence verdict = %#v", legacyEvidence.Participants[0].Verdict)
 	}
@@ -298,6 +312,7 @@ func TestBackendEvidenceRemainsBounded(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+
 	if complete || len(content) > MaxBackendEvidenceBytes {
 		t.Fatalf("bounded evidence complete=%t bytes=%d", complete, len(content))
 	}
@@ -318,6 +333,7 @@ func qualificationConfig(backend signalv1.ExecutionBackend) Config {
 
 func qualificationEvidenceSkeleton(participantCount int) BackendEvidence {
 	started := time.Date(2026, 1, 2, 3, 4, 5, 0, time.UTC)
+
 	participants := make([]ParticipantBackendEvidence, participantCount)
 	for index := range participants {
 		participants[index] = ParticipantBackendEvidence{

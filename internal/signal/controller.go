@@ -366,17 +366,21 @@ func validateAdapterBackendEvidence(content string) error {
 	if evidence.Identity.RunUID == "" || evidence.Identity.CheckID == "" || evidence.Identity.CheckOrder < 0 {
 		return errors.New("backend evidence identity is incomplete")
 	}
+
 	if evidence.Identity.PlanDigest != "" && !signalv1.IsSHA256Digest(evidence.Identity.PlanDigest) {
 		return errors.New("backend evidence plan digest is invalid")
 	}
+
 	if !signalv1.IsDigestPinnedImage(evidence.Provenance.RunnerImage) ||
 		(evidence.Provenance.AdapterImage != "" &&
 			!signalv1.IsDigestPinnedImage(evidence.Provenance.AdapterImage)) {
 		return errors.New("backend evidence provenance is invalid")
 	}
+
 	if evidence.Identity.PlanDigest != "" && evidence.Provenance.AdapterImage == "" {
 		return errors.New("backend evidence with a plan digest requires adapter provenance")
 	}
+
 	if evidence.Timing.StartedAt.IsZero() || evidence.Timing.FinishedAt.IsZero() ||
 		evidence.Timing.FinishedAt.Before(&evidence.Timing.StartedAt) ||
 		evidence.Timing.SampleCount < 1 {
@@ -396,18 +400,22 @@ func validateAdapterBackendEvidence(content string) error {
 			participant.Start.NodeUID != participant.End.NodeUID {
 			return fmt.Errorf("backend evidence participant %d node identity is invalid", participant.ParticipantIndex)
 		}
+
 		if err := validateAdapterVerdictEvidence(participant.Verdict); err != nil {
 			return fmt.Errorf("backend evidence participant %d verdict: %w", participant.ParticipantIndex, err)
 		}
+
 		if len(participant.VisibleDevices) > maxAdapterEvidenceDevices ||
 			len(participant.CoveredDevices) > maxAdapterEvidenceDevices {
 			return fmt.Errorf("backend evidence participant %d device evidence exceeds bounds", participant.ParticipantIndex)
 		}
 	}
+
 	if evidence.GroupResult != nil {
 		if err := validateAdapterVerdictEvidence(*evidence.GroupResult); err != nil {
 			return fmt.Errorf("backend evidence group verdict: %w", err)
 		}
+
 		if evidence.GroupResult.Attribution != "group" {
 			return errors.New("backend evidence group verdict attribution is invalid")
 		}
@@ -420,11 +428,13 @@ func validateAdapterVerdictEvidence(verdict adapterVerdictEvidence) error {
 	if verdict.ExecutionState == "" || verdict.Reason == "" {
 		return errors.New("execution state and reason are required")
 	}
+
 	switch verdict.Verdict {
 	case "Pass", "Fail", "Inconclusive":
 	default:
 		return errors.New("verdict is invalid")
 	}
+
 	switch verdict.Attribution {
 	case "participant", "group", "group-with-participant-observation":
 	default:
@@ -4247,6 +4257,7 @@ func (r *RunReconciler) qualificationEvidenceIdentity(
 				fmt.Sprintf("QualificationEvidenceMalformed: check %s evidence cannot be decoded", run.Spec.Checks[index].ID),
 				nil
 		}
+
 		if !evidence.Complete || len(evidence.Participants) != len(participants) {
 			verdict = "Inconclusive"
 			reason = fmt.Sprintf("QualificationEvidenceIncomplete: check %s participant evidence is incomplete", run.Spec.Checks[index].ID)
@@ -4266,6 +4277,7 @@ func (r *RunReconciler) qualificationEvidenceIdentity(
 			if index == 0 {
 				identity.Start = observed.Start
 			}
+
 			identity.End = observed.End
 			identity.Verdict = combineQualificationVerdicts(
 				identity.Verdict,
@@ -4277,6 +4289,7 @@ func (r *RunReconciler) qualificationEvidenceIdentity(
 				observed.Start.BootID != observed.End.BootID {
 				sameBoot = false
 			}
+
 			perDeviceCoverage = perDeviceCoverage && observed.PerDeviceCoverage
 		}
 
@@ -4297,12 +4310,14 @@ func (r *RunReconciler) qualificationEvidenceIdentity(
 				verdict = "Inconclusive"
 				reason = fmt.Sprintf("ContinuityNotProven: check %s lacks same-boot evidence", check.ID)
 			}
+
 			if verdict == "Pass" && check.Continuity.MaxSampleGap != nil &&
 				(evidence.Timing.MaxObservedGap == nil ||
 					evidence.Timing.MaxObservedGap.Duration > check.Continuity.MaxSampleGap.Duration) {
 				verdict = "Inconclusive"
 				reason = fmt.Sprintf("ContinuityNotProven: check %s exceeds its sample-gap requirement", check.ID)
 			}
+
 			if verdict == "Pass" && check.Continuity.RequirePerDeviceCoverage && !perDeviceCoverage {
 				verdict = "Inconclusive"
 				reason = fmt.Sprintf("ContinuityNotProven: check %s lacks per-device coverage evidence", check.ID)
@@ -4323,6 +4338,7 @@ func (r *RunReconciler) qualificationEvidenceIdentity(
 	if err != nil {
 		return nil, "Inconclusive", "ParticipantIdentityMissing: " + err.Error(), nil
 	}
+
 	for index := range participants {
 		if !sameBaseFingerprint(participants[index].Start, admissionStarts[index]) {
 			return nil,
@@ -4337,8 +4353,17 @@ func (r *RunReconciler) qualificationEvidenceIdentity(
 			client.ObjectKey{Name: run.Spec.Participants[index].NodeName},
 			&node,
 		); err != nil {
+			if !apierrors.IsNotFound(err) {
+				return nil, verdict, reason, fmt.Errorf(
+					"read participant %s end fingerprint: %w",
+					run.Spec.Participants[index].NodeName,
+					err,
+				)
+			}
+
 			return nil, "Inconclusive", "ParticipantIdentityMissing: end fingerprint unavailable", nil
 		}
+
 		if !sameBaseFingerprint(participants[index].End, nodeFingerprint(&node)) {
 			return nil,
 				"Inconclusive",
@@ -4539,6 +4564,7 @@ func combineQualificationVerdicts(
 	if current == signalv1.QualificationVerdictFail || observed == signalv1.QualificationVerdictFail {
 		return signalv1.QualificationVerdictFail
 	}
+
 	if current == signalv1.QualificationVerdictInconclusive ||
 		observed == signalv1.QualificationVerdictInconclusive {
 		return signalv1.QualificationVerdictInconclusive
@@ -4727,9 +4753,11 @@ func groupedBackendEvidenceComplete(
 		evidence.Identity.PlanDigest != run.Spec.PlanDigest {
 		return false, errors.New("backend-evidence identity does not match the immutable Run check")
 	}
+
 	if evidence.Provenance.RunnerImage != check.RunnerImage {
 		return false, errors.New("backend-evidence runner image differs from the immutable check")
 	}
+
 	if run.Spec.PlanProvenance != nil &&
 		evidence.Provenance.AdapterImage != run.Spec.PlanProvenance.AdapterImage {
 		return false, errors.New("backend-evidence adapter image differs from the immutable plan")
@@ -4753,6 +4781,7 @@ func groupedBackendEvidenceComplete(
 	if err != nil {
 		return false, err
 	}
+
 	switch backend {
 	case signalv1.ExecutionBackendPod:
 		if evidence.GroupResult != nil {
@@ -4781,10 +4810,12 @@ func groupedBackendEvidenceComplete(
 		}
 
 		seen[participant.ParticipantIndex] = true
+
 		expectedAttribution := "participant"
 		if backend == signalv1.ExecutionBackendMPIJob {
 			expectedAttribution = "group-with-participant-observation"
 		}
+
 		if participant.Verdict.Attribution != expectedAttribution {
 			return false, fmt.Errorf(
 				"backend-evidence participant %d verdict attribution is invalid for %s",
@@ -4792,6 +4823,7 @@ func groupedBackendEvidenceComplete(
 				backend,
 			)
 		}
+
 		expectedParticipant := participants[participant.ParticipantIndex]
 		if participant.Start.NodeUID != expectedParticipant.NodeUID ||
 			participant.End.NodeUID != expectedParticipant.NodeUID {
@@ -4870,6 +4902,7 @@ func groupedBackendEvidenceComplete(
 							participant.ParticipantIndex,
 						)
 					}
+
 					workerHealthy = pod.Phase == corev1.PodSucceeded && len(pod.Containers) > 0
 					for _, container := range pod.Containers {
 						workerHealthy = workerHealthy &&
@@ -4897,6 +4930,7 @@ func groupedBackendEvidenceComplete(
 
 		if backend == signalv1.ExecutionBackendMPIJob {
 			complete = complete && workerPods == 1
+
 			if participant.Verdict.Verdict == "Pass" && !workerHealthy {
 				return false, fmt.Errorf(
 					"backend-evidence participant %d pass verdict lacks healthy worker evidence",

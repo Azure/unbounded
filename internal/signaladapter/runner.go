@@ -129,12 +129,15 @@ func (r *Runner) PersistResult(
 	if err := runtime.DefaultUnstructuredConverter.FromUnstructured(runObject.Object, &run); err != nil {
 		return fmt.Errorf("decode CertificationRun before result publication: %w", err)
 	}
+
 	if run.UID != request.RunUID {
 		return errors.New("CertificationRun UID changed before result publication")
 	}
+
 	if request.CheckIndex < 0 || request.CheckIndex >= len(run.Spec.Checks) {
 		return errors.New("CertificationRun check changed before result publication")
 	}
+
 	if err := ValidateBackendEvidenceBinding(
 		output.BackendEvidence,
 		request.RunUID,
@@ -377,6 +380,7 @@ func (r *Runner) backendFailureOutput(
 	defer cancelCapture()
 
 	now := r.now()
+
 	results := make([]Result, len(participants))
 	for index := range results {
 		results[index] = Result{
@@ -609,6 +613,7 @@ func (r *Runner) waitForResult(ctx context.Context, config Config, backend creat
 	participantIndex := int(backend.participantIndexes[0])
 	startedAt := r.now()
 	sampleTimes := make([]time.Time, 0)
+
 	result = Result{
 		ParticipantIndex: participantIndex,
 		ExecutionState:   "Error",

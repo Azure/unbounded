@@ -86,7 +86,9 @@ func TestPersistResultCreatesControllerContractConfigMap(t *testing.T) {
 	workflow.SetNamespace(request.Namespace)
 	workflow.SetName(request.WorkflowName)
 	workflow.SetUID(types.UID("workflow-uid"))
+
 	run := certificationRun()
+
 	runContent, err := runtime.DefaultUnstructuredConverter.ToUnstructured(run)
 	if err != nil {
 		t.Fatal(err)
@@ -267,6 +269,7 @@ func validBackendEvidence(
 			Pods: []PodEvidence{},
 		}},
 	}
+
 	content, err := json.Marshal(evidence)
 	if err != nil {
 		t.Fatal(err)
