@@ -141,8 +141,9 @@ fn scenario_report() {
     let scenario = scenarios::find(&name).expect("known scenario");
     let (outcome, r) = model::run(&scenario, Choices::seeded(seed));
     println!(
-        "failure {:?} counters {} attempt_errors {}",
+        "failure {:?} max_per_page {} counters {} attempt_errors {}",
         outcome.failure.as_ref().map(|f| &f.name),
+        r["origin_per_page"]["max_requests_per_page"],
         r["metrics"]["counters"],
         r["metrics"]["attempt_errors"]
     );
