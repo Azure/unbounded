@@ -927,3 +927,21 @@ fn partitioned_seat_stops_serving_within_freshness() {
     assert!(w.run_until(Duration::from_secs(90), |w| w.endpoints(primary) == 1));
     assert!(w.ready(primary));
 }
+
+/// The same seed replays the same election: the same winner at the same
+/// virtual time after the same API requests.
+#[test]
+fn same_seed_replays_the_same_election() {
+    let run = |seed_value| {
+        let mut w = World::with(3, seed_value, |_| {});
+        for i in 1..=3 {
+            w.start(i);
+        }
+        assert!(w.run_until(Duration::from_secs(120), |w| w.has_record()));
+        let (at, winner, _) = w.terms[0].clone();
+        (at, winner, w.api.requests())
+    };
+    for seed_value in [5, 6] {
+        assert_eq!(run(seed_value), run(seed_value), "seed {seed_value}");
+    }
+}
