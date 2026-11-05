@@ -15,6 +15,7 @@ import (
 	"sync"
 	"time"
 
+	"golang.org/x/sync/singleflight"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	apimeta "k8s.io/apimachinery/pkg/api/meta"
@@ -84,7 +85,15 @@ type Reconciler struct {
 	PowerActionTimeout    time.Duration
 	MediaInstallTimeout   time.Duration
 	MediaBootTimeout      time.Duration
-	Now                   func() metav1.Time
+	// ReconcileLookupTimeout bounds how long one reconcile waits for the
+	// registry when resolving the HTTP boot URL or preparing boot media.
+	// The lookup keeps running after it expires and the target waits for
+	// a later reconcile. Zero uses DefaultReconcileLookupTimeout.
+	ReconcileLookupTimeout time.Duration
+	Now                    func() metav1.Time
+
+	// lookups deduplicates detached registry lookups across reconciles.
+	lookups singleflight.Group
 }
 
 // +kubebuilder:rbac:groups=unbounded-cloud.io,resources=machineoperations,verbs=get;list;watch;delete;update;patch
@@ -773,7 +782,13 @@ func (r *Reconciler) httpBootConfig(ctx context.Context, machine *v1alpha3.Machi
 		return "", redfish.StaticIPv4Config{}, fmt.Errorf("HTTP boot URL resolver is not configured")
 	}
 
-	bootURL, err := r.HTTPBootURL(ctx, machine)
+	key := "http-boot-url/" + machine.Name + "/" + string(machine.UID) + "/" + machine.ResourceVersion
+
+	machine = machine.DeepCopy()
+
+	bootURL, err := boundedLookup(ctx, &r.lookups, key, r.reconcileLookupTimeout(), func(ctx context.Context) (string, error) {
+		return r.HTTPBootURL(ctx, machine)
+	})
 	if err != nil {
 		return "", redfish.StaticIPv4Config{}, err
 	}

@@ -454,7 +454,15 @@ func (r *Reconciler) advanceVirtualMedia(ctx context.Context, op *v1alpha3.Machi
 	next := b.Phase
 	switch b.Phase {
 	case "Preparing":
-		source, err = r.BootMedia.Prepare(ctx, machine, op, b.ID)
+		// Building the ISO pulls EFI files from the registry. The build
+		// keeps running detached when the wait expires; a later reconcile
+		// joins it or finds the finished ISO on disk.
+		// The build may outlive this reconcile, so it gets its own copies.
+		buildMachine, buildOp := machine.DeepCopy(), op.DeepCopy()
+
+		source, err = boundedLookup(ctx, &r.lookups, "boot-media/"+b.ID, r.reconcileLookupTimeout(), func(ctx context.Context) (bootmedia.Source, error) {
+			return r.BootMedia.Prepare(ctx, buildMachine, buildOp, b.ID)
+		})
 		if err == nil {
 			if source.Name == "" || source.Server == "" {
 				err = fmt.Errorf("virtual media provider returned an empty source")
