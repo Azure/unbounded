@@ -369,7 +369,7 @@ pub enum Outcome {
     /// transient evidence, not a route failure.
     StaleDestination,
     /// The destination itself (not a relay) answered `Overloaded`. Like
-    /// `Probe(Overloaded)` without a route failure; asks a reader's helper.
+    /// `Probe(Overloaded)` without a route failure; both ask a reader's helper.
     Shed,
     /// The destination itself answered `FlightFull`: like [`Outcome::Shed`], but it proved it is
     /// fetching the page. An owner's probe of rank 0 then withholds origin authority, so ranks 1
@@ -951,7 +951,18 @@ impl CandidateWalk {
             };
         }
         self.index += 1;
-        if self.helper == Helper::Armed && matches!(outcome, Outcome::Shed | Outcome::Fetching) {
+        // A busy owner, or a busy hop before it (a relay's `Overloaded`, or a holder that shed the
+        // request before verifying it, `route::unverified_failure`), sends a reader to its
+        // helper. Either way the helper is the way around the hot owner.
+        if self.helper == Helper::Armed
+            && matches!(
+                outcome,
+                Outcome::Shed
+                    | Outcome::Fetching
+                    | Outcome::Probe(ProbeOutcome::Overloaded)
+                    | Outcome::Transport(ProbeOutcome::Overloaded)
+            )
+        {
             self.helper = Helper::Due;
         }
         match outcome {

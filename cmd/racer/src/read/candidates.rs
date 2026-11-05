@@ -3658,7 +3658,9 @@ pub(super) mod tests {
     /// A non-owner whose owner itself sheds it (a signed `Overloaded` from the destination) asks
     /// its mesh helper (the delegate in the owner's column) once, with an Acquire funded from what is left (too little for
     /// the helper to ask another helper), then the remaining owners. A transport `Overloaded` (no
-    /// signed answer, as from a congested route) does not.
+    /// signed answer, as from a congested route or a holder that shed the request before
+    /// verifying it, `racer_core::route::unverified_failure`) does the same: the helper is the
+    /// way around a busy hop as well as a busy owner.
     #[test]
     fn shed_reader_asks_the_page_helper_once_then_the_other_owners() {
         use crate::test_support::security::{network, node};
@@ -3761,10 +3763,6 @@ pub(super) mod tests {
                 );
                 let calls = peers.calls.borrow();
                 let visited: Vec<_> = calls.iter().map(|(to, ..)| to.clone()).collect();
-                if transport {
-                    assert!(!visited.contains(&helper), "{visited:?}");
-                    continue;
-                }
                 assert_eq!(
                     visited[..2],
                     [candidates.ordered[0].clone(), helper.clone()]

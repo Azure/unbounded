@@ -276,9 +276,10 @@ fn walks() {
         ("helper, few links", helper(canonical), budget(8, 4), nothing, &[SHED, SHED, SHED, COPY], "0A3S:8/4/4 3A3Fh:4/8/8 => Copy 8/4/4"),
         ("helper, helper links", helper(canonical), budget(8, HELPER_LINKS), nothing, &[SHED, SHED, SHED, COPY], "0A3S:8/8/4 3A3Fh:4/8/8 => Copy 8/8/4"),
         ("helper miss", helper(canonical), budget(32, 64), nothing, &[SHED], "0A3S:32/64/4 3A3Fh:4/8/8 1A2S:32/64/4 2A1S:32/64/4 => Exhausted { funding: false } 32/64/4"),
-        // Only a destination's own shed asks the helper.
-        ("relay overload, no helper", helper(canonical), budget(32, 64), nothing, &[OVL], "0A3S:32/64/4 1A2S:32/64/8 2A1S:32/64/8 => Exhausted { funding: false } 32/64/8"),
-        ("transport overload, no helper", helper(canonical), budget(32, 64), nothing, &[T_OVL], "0A3S:32/64/4 1A2S:32/64/8 2A1S:32/64/8 => Exhausted { funding: false } 32/64/8"),
+        // A destination's own shed, a relay's `Overloaded` and an unsigned overload (a holder
+        // that shed the request before verifying it) ask the helper; unreachable does not.
+        ("relay overload, helper", helper(canonical), budget(32, 64), nothing, &[OVL], "0A3S:32/64/4 3A3Fh:4/8/8 1A2S:32/64/8 2A1S:32/64/8 => Exhausted { funding: false } 32/64/8"),
+        ("transport overload, helper", helper(canonical), budget(32, 64), nothing, &[T_OVL], "0A3S:32/64/4 3A3Fh:4/8/8 1A2S:32/64/8 2A1S:32/64/8 => Exhausted { funding: false } 32/64/8"),
         ("unreachable, no helper", helper(canonical), budget(32, 64), nothing, &[T_UNR], "0A3S:32/64/4 1A2S:32/64/8 2A1S:32/64/8 => Exhausted { funding: false } 32/64/8"),
         ("miss, no helper", helper(canonical), budget(32, 64), nothing, &[MISS], "0A3S:32/64/4 1A2S:32/64/4 2A1S:32/64/4 => Exhausted { funding: false } 32/64/4"),
         // Without overflow the helper changes nothing (same trace with and without).
@@ -1626,6 +1627,40 @@ fn rank0_route_overloads_advance_the_watch_to_origin() {
         origin_at.is_some_and(|s| s > 0),
         "origin never used: {origin_at:?}"
     );
+}
+
+/// An unsigned `Overloaded` (a relay's, or a holder's that shed the request before verifying
+/// it) asks the overflow helper next, as a signed shed does: the owner is behind a busy hop, and
+/// the helper is the way around it. A signed `Unavailable` does not.
+#[test]
+fn an_unsigned_overload_asks_the_helper_next() {
+    use crate::read::{PAGE_ATTEMPTS, PAGE_LINKS};
+    for (first, helper) in [
+        (SHED, true),
+        (OVL, true),
+        (T_OVL, true),
+        (UNR, false),
+        (MISS, false),
+    ] {
+        let mut walk = CandidateWalk::new(WalkConfig {
+            helper: true,
+            ..reader(3)
+        });
+        let mut b = budget(PAGE_ATTEMPTS, PAGE_LINKS);
+        let mut probed = Vec::new();
+        while let Ok(Step::Probe(probe)) = walk.next(&mut b) {
+            let deadline = b.deadline();
+            let request = walk.request_budget(&mut b);
+            plan(request, deadline, &probe).unwrap();
+            probed.push(probe.canonical);
+            let outcome = if probe.canonical == 0 { first } else { MISS };
+            if walk.complete(&mut b, outcome).unwrap().is_some() || probed.len() == 2 {
+                break;
+            }
+        }
+        assert_eq!(probed[0], 0, "{first:?}");
+        assert_eq!(probed.get(1) == Some(&3), helper, "{first:?} {probed:?}");
+    }
 }
 
 /// A page read whose rank 0 sheds it asks its overflow helper on the helper's own grant: a helper
