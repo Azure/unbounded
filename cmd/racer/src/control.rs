@@ -2266,8 +2266,8 @@ pub(crate) mod tests {
 
         #[test]
         fn authenticated_replacement_preserves_cluster_key_and_correlation_checks() {
-            let Some(r) = testing::reactor() else { return };
             for expired in [false, true] {
+                let Some(r) = testing::reactor() else { return };
                 let d = testing::Directory::new();
                 let e = Enrollment::new(
                     ClusterId("11111111-1111-4111-8111-111111111111".into()),
@@ -2291,10 +2291,22 @@ pub(crate) mod tests {
                     std::time::Instant::now(),
                     SystemTime::now() + Duration::from_secs(172800),
                 );
+                // The expired case continues on a reactor built on a clock two
+                // days ahead, over the same enrollment files.
                 let _time = expired.then(|| clock.environment(1).enter());
-                if expired {
-                    r.override_ctx_for_test(clock.environment(1).worker_ctx());
-                }
+                let (r, e) = if expired {
+                    let Some(r) = testing::reactor() else { return };
+                    let e = Enrollment::new(
+                        e.cluster().clone(),
+                        d.0.join("token"),
+                        d.0.join("identity"),
+                        Rc::new(ReactorControlIo::new(r.clone())),
+                    );
+                    e.set_peer_trust_roots(vec![ca.der().to_vec()]).unwrap();
+                    (r, e)
+                } else {
+                    (r, e)
+                };
                 if expired {
                     assert!(
                         testing::drive(&r, e.load_identity(&scope))
