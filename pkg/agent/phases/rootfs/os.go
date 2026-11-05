@@ -41,6 +41,11 @@ var archSources = map[string][]byte{
 	"arm64": sourcesArm64,
 }
 
+// KubernetesModulesConfig returns the modules-load.d content that lists the
+// kernel modules the node needs. A host-native backend installs it on the host,
+// where the nspawn machine would have loaded the same modules at boot.
+func KubernetesModulesConfig() []byte { return append([]byte(nil), kubernetesModulesConfig...) }
+
 // osConfigFile describes a configuration file to write into the machine rootfs.
 type osConfigFile struct {
 	// path is relative to the machine directory root.
