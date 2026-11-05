@@ -7,10 +7,10 @@ use std::num::{NonZeroU32, NonZeroUsize};
 use std::rc::Rc;
 use std::time::{Duration, Instant};
 
+use crate::alloc_model::{Heat, PhantomEntries, SecondSight, SegmentClock};
 use flow_control::coalesce::flight::state::Published;
 use flow_control::{Charge, Circuits, Policy, Quotas, Rejection};
-use page_alloc::retention::{Heat, SecondSight};
-use page_alloc::{Alignment, PhantomEntries, SegmentClock, Segments};
+use page_alloc::{Alignment, Segments};
 use racer_control_wire::{CacheId, NodeId};
 
 /// Link failure records per node, matching the dataplane's

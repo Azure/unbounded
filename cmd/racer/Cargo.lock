@@ -1027,9 +1027,11 @@ dependencies = [
  "racer-cluster-control",
  "racer-control-wire",
  "racer-core",
+ "racer-io",
  "racer-object-wire",
  "serde_json",
  "topology",
+ "uring-runtime",
 ]
 
 [[package]]

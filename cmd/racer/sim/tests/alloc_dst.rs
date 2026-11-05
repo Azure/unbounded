@@ -12,9 +12,10 @@
 //! A failure prints the case, step, and operation.
 
 use page_alloc::{
-    AlignedBuffer, Alignment, Charge, Error, Extent, FreezeGuard, Generation, SegmentClock,
-    SegmentEntries, SegmentId, SegmentLease, SegmentSnapshot, SegmentState, Segments, Slab,
+    AlignedBuffer, Alignment, Charge, Error, Extent, FreezeGuard, Generation, SegmentId,
+    SegmentLease, SegmentSnapshot, SegmentState, Segments, Slab,
 };
+use racer_sim::alloc_model::{SegmentClock, SegmentEntries};
 use std::{
     cell::{Cell, RefCell},
     collections::{BTreeMap, VecDeque},

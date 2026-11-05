@@ -931,22 +931,20 @@ fn io_uring_roundtrip_and_completion_fence() {
     assert!(buffer.as_slice().iter().all(|byte| *byte == 73));
     drop(buffer);
     assert_eq!(reactor.in_flight(), 0);
-    /// A completed roundtrip has no caller mappings left to remove.
-    struct EmptyEntries;
-
-    impl page_alloc::SegmentEntries for EmptyEntries {
-        /// The smoke workflow publishes no index entries.
-        fn remove_bounded(&self, _: SegmentId, _: usize) -> usize {
-            0
-        }
-
-        /// Both slots are logically unmapped.
-        fn is_empty(&self, _: SegmentId) -> bool {
-            true
-        }
-    }
-    let clock = page_alloc::SegmentClock::new(std::rc::Rc::new(segments));
-    clock.reclaim_scored(&EmptyEntries, 2, 4, 0, |_| 0).unwrap();
+    // A completed roundtrip has no index entries left to remove.
+    let segments = std::rc::Rc::new(segments);
+    let mut index = page_alloc::disk_index::DiskIndex::new(1, 1, segments.count()).unwrap();
+    index
+        .reclaim(
+            &segments,
+            page_alloc::disk_index::ReclaimBudget {
+                free_reserve: 2,
+                max_visits: 4,
+                max_entries: 0,
+            },
+            |_, _| panic!("no entries"),
+        )
+        .unwrap();
 }
 
 /// Keep both halves aligned even when offset and length units differ.
@@ -1240,41 +1238,35 @@ fn partial_table_reclamation_changes_authority_without_erasing_storage() {
     );
     assert_eq!(segments.free_count(), 1);
 
-    /// One caller mapping whose removal is observable independently of disk bytes.
-    struct Entries {
-        populated: Cell<bool>,
-
-        removals: Cell<usize>,
-    }
-
-    impl page_alloc::SegmentEntries for Entries {
-        /// Forget the mapping only for its actual segment and a positive budget.
-        fn remove_bounded(&self, segment: SegmentId, budget: usize) -> usize {
-            if segment == SegmentId(0) && budget != 0 && self.populated.replace(false) {
-                self.removals.set(self.removals.get() + 1);
-                1
-            } else {
-                0
-            }
-        }
-
-        /// Report current caller ownership rather than allocator occupancy.
-        fn is_empty(&self, segment: SegmentId) -> bool {
-            segment != SegmentId(0) || !self.populated.get()
-        }
-    }
-    let entries = Entries {
-        populated: Cell::new(true),
-        removals: Cell::new(0),
-    };
-    let clock = page_alloc::SegmentClock::new(segments.clone());
+    // One index entry whose removal is observable independently of disk bytes.
+    use page_alloc::disk_index::{CacheIdx, DiskIndex, PageSlot, ReclaimBudget};
+    let mut index = DiskIndex::new(1, 1, segments.count()).unwrap();
+    let cache = index.add_cache(CacheIdx(0)).unwrap();
+    index
+        .place(
+            PageSlot(0),
+            cache,
+            SegmentId(0),
+            original_generation,
+            extent,
+        )
+        .unwrap();
     let held = segments.lease(SegmentId(0), original_generation).unwrap();
+    let mut removals = 0;
     assert_eq!(
-        clock.reclaim_scored(&entries, 2, 4, 1, |_| 0),
+        index.reclaim(
+            &segments,
+            ReclaimBudget {
+                free_reserve: 2,
+                max_visits: 4,
+                max_entries: 1,
+            },
+            |_, _| removals += 1,
+        ),
         Err(Error::Busy)
     );
-    assert_eq!(entries.removals.get(), 1);
-    assert!(!entries.populated.get());
+    assert_eq!(removals, 1);
+    assert!(index.get(PageSlot(0)).is_none());
     assert_eq!(segments.state(SegmentId(0)), Ok(SegmentState::Evicting));
     assert!(matches!(
         segments.lease(SegmentId(0), original_generation),
@@ -1295,9 +1287,19 @@ fn partial_table_reclamation_changes_authority_without_erasing_storage() {
     .unwrap();
     assert!(buffer.as_slice().iter().all(|byte| *byte == 91));
     drop(buffer);
-    clock.reclaim_scored(&entries, 2, 4, 0, |_| 0).unwrap();
+    index
+        .reclaim(
+            &segments,
+            ReclaimBudget {
+                free_reserve: 2,
+                max_visits: 4,
+                max_entries: 0,
+            },
+            |_, _| removals += 1,
+        )
+        .unwrap();
     assert_eq!(segments.free_count(), 2);
-    assert_eq!(entries.removals.get(), 1);
+    assert_eq!(removals, 1);
     assert_eq!(segments.snapshot()[0].generation, Generation(2));
 
     // Reuse grants new generation authority, but does not mutate the stored bytes.
@@ -1333,7 +1335,7 @@ fn partial_table_reclamation_changes_authority_without_erasing_storage() {
     assert_eq!(image[1].state, SegmentState::Free);
     assert_eq!(image[1].used_bytes, 0);
     assert_eq!(image[1].generation, Generation(1));
-    assert_eq!(entries.removals.get(), 1);
+    assert_eq!(removals, 1);
     assert_eq!(segments.free_count(), 1);
 }
 

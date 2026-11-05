@@ -18,6 +18,8 @@
 //! - [`node`]: real node logic (placement, routes, walk, flights, fill,
 //!   serve, caches, admission) driven by events; every scenario runs it.
 
+#[doc(hidden)]
+pub mod alloc_model;
 pub mod combined;
 pub mod config;
 pub mod control;
@@ -37,8 +39,8 @@ pub mod node {
     //!   workers with `WorkerMap::select`;
     //! - one phantom `Paths` route cache (shared route memo), link circuits
     //!   (`flow_control::Circuits`, the state behind `LinkHealth`), a phantom disk
-    //!   (`Segments` + `SegmentClock` + `PhantomEntries`) and retention history
-    //!   (`SecondSight`, `Heat`).
+    //!   (`Segments` plus the simulator's own `SegmentClock` and `PhantomEntries`
+    //!   in `alloc_model`) and retention history (`SecondSight`, `Heat`).
     //!
     //! [`world::NodeWorld`] drives these with events: read arrival, peer request
     //! hops (`decide_hop` at every hop), replies, origin completions, membership

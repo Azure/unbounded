@@ -1,9 +1,8 @@
 //! Segment reverse mappings and stable publication order, independent of page schema.
 
-use crate::SegmentId;
+use page_alloc::SegmentId;
 use std::collections::{BTreeMap, HashMap, hash_map::RandomState};
 use std::hash::{BuildHasher, Hash};
-use std::ops::Bound::{Excluded, Unbounded};
 
 /// Exact page mappings with a monotonic checkpoint order and per-segment
 /// reverse maps for segment reclaim.
@@ -48,26 +47,6 @@ impl<K: Eq + Hash + Clone, V, H: BuildHasher> PageIndex<K, V, H> {
         self.pages.get(key)
     }
 
-    /// Check identity membership without changing order.
-    pub fn contains_key(&self, key: &K) -> bool {
-        self.pages.contains_key(key)
-    }
-
-    /// Visit mappings using the caller-selected hash state.
-    pub fn iter(&self) -> impl Iterator<Item = (&K, &V)> {
-        self.pages.iter()
-    }
-
-    /// Visit identities without cloning entries.
-    pub fn keys(&self) -> impl Iterator<Item = &K> {
-        self.pages.keys()
-    }
-
-    /// Check age exhaustion before the caller changes residency or other metadata.
-    pub fn can_publish(&self) -> bool {
-        self.next_age < u64::MAX
-    }
-
     /// Publish a mapping with a fresh age, or return it untouched on
     /// exhaustion.
     pub fn insert(&mut self, key: K, value: V, segment: SegmentId) -> Result<Option<V>, (K, V)> {
@@ -97,14 +76,6 @@ impl<K: Eq + Hash + Clone, V, H: BuildHasher> PageIndex<K, V, H> {
             self.reverse.remove(&segment);
         }
         Some(old)
-    }
-
-    /// Resume a monotonic checkpoint scan.
-    pub fn after(&self, after: u64, limit: usize) -> impl Iterator<Item = (u64, &K, &V)> {
-        self.order
-            .range((Excluded(after), Unbounded))
-            .take(limit)
-            .map(|(age, key)| (*age, key, &self.pages[key]))
     }
 
     /// Visit only a bounded prefix of one segment's mappings.
@@ -145,14 +116,13 @@ mod tests {
     use super::*;
 
     #[test]
-    fn replacement_reverse_maps_and_monotonic_scans() {
+    fn replacement_keeps_reverse_maps() {
         let mut index = PageIndex::<u64, u64>::default();
         for key in 0..65 {
             index.insert(key, key, SegmentId(0)).unwrap();
         }
-        let cursor = index.after(0, 1).next().unwrap().0;
         index.remove(&0);
-        assert_eq!(index.after(cursor, 100).count(), 64);
+        assert_eq!(index.len(), 64);
         assert_eq!(index.insert(1, 99, SegmentId(1)).unwrap(), Some(1));
         assert_eq!(index.segment(SegmentId(1), 1).next(), Some((&1, &99)));
         index.remove(&1);
@@ -165,7 +135,6 @@ mod tests {
         let mut index = PageIndex::<u64, u64>::default();
         index.insert(1, 2, SegmentId(0)).unwrap();
         index.next_age = u64::MAX;
-        assert!(!index.can_publish());
         assert_eq!(index.insert(1, 3, SegmentId(1)), Err((1, 3)));
         assert_eq!(index.get(&1), Some(&2));
         assert!(index.segment_empty(SegmentId(1)));

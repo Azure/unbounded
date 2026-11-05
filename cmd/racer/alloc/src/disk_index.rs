@@ -41,8 +41,8 @@
 //! | queue replacement in `store.rs` (drops the victim first) | [`DiskIndex::reserve_replacing`] (validates, then removes) |
 //! | `holds.rs` `Holds`, `HoldEpoch`, `PageHolders`, wall-or-monotonic `live()` | [`HoldId`] holds, [`DiskIndex::expire_holds`] on [`Monotonic`] only |
 //! | `Holds::unused` O(holds), `segment_held` O(holds x locations) | [`DiskIndex::holds_unused`], [`DiskIndex::can_evict`] O(1) |
-//! | `SegmentClock::{reclaim, reclaim_index, reclaim_scored, mark_read}`, `SegmentEntries` | [`DiskIndex::reclaim`] with [`DiskIndex::touch`] heat |
-//! | `retention::Heat` keyed per page, separate capacity | per-segment heat derived from the index |
+//! | `SegmentClock::{reclaim, reclaim_index, reclaim_scored, mark_read}`, `SegmentEntries` (removed; the simulator keeps a copy) | [`DiskIndex::reclaim`] with [`DiskIndex::touch`] heat |
+//! | `retention::Heat` keyed per page, separate capacity (removed; the simulator keeps a copy) | per-segment heat derived from the index |
 //! | per-cache byte maps in `catalog.rs`/`retention.rs`, `remove_cache(s)` | [`DiskIndex::cache_bytes`], [`DiskIndex::remove_cache`] |
 //! | `Arc::strong_count` busy checks (`store.rs`) | `writes` counters and segment leases |
 //!

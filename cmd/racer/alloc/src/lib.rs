@@ -114,8 +114,9 @@
 //! never partially publish.
 //! Raw file opening, table configuration, and manual eviction are test-support
 //! escape hatches. Production startup binds with [`Slab::open_configured`], and
-//! [`SegmentClock`] owns the ordering of mapping removal before physical reuse.
-//! The table, slab, and clock are cache-line aligned to isolate worker-local state;
+//! [`disk_index::DiskIndex::reclaim_scored`] owns the ordering of mapping removal
+//! before physical reuse.
+//! The table and slab are cache-line aligned to isolate worker-local state;
 //! their Rc ownership prevents moving authority to a different worker thread.
 //!
 //! For a checkpoint, stop mutation admission, retain a freeze guard, drive writes
@@ -125,12 +126,12 @@
 //! must validate identity, lengths, integrity, and versions. Invalid, stale, torn,
 //! or missing cache records must become misses and be refetched.
 //!
-//! [`SegmentClock`] shares a cursor across bounded sweeps.
+//! The disk index keeps one clock hand across bounded sweeps.
 //! Physical reclamation selects only Sealed/Evicting slots and recycles empty slots
 //! after leases drain. Scored reclamation visits at most
 //! min(slot count, max_visits, 64) slots, including skipped slots, then ranks
 //! eligible candidates. For a nonzero reserve,
-//! [`SegmentClock::reclaim_scored`] can succeed once the reserve (capped at the
+//! [`disk_index::DiskIndex::reclaim_scored`] can succeed once the reserve (capped at the
 //! slot count) is met, even with pending evictions. Success is not a drain guarantee.
 //! Busy means the bounded sweep could not meet the reserve, or table mutation was
 //! blocked. Use [`Segments::free_count`] to check capacity and retry bounded
@@ -162,10 +163,8 @@
 pub mod buf;
 mod demand;
 pub mod disk_index;
-pub mod index;
 pub mod intern;
 pub mod pending;
-pub mod retention;
 mod segments;
 mod sync;
 
@@ -176,10 +175,8 @@ pub use demand::{
     DEFAULT_WINDOW, PoolDemand, PoolStats,
 };
 use racer_io::ring::IoBuffer;
-pub use segments::PhantomEntries;
 pub use segments::{
-    FreezeGuard, Generation, SegmentClock, SegmentEntries, SegmentId, SegmentLease,
-    SegmentSnapshot, SegmentState, Segments,
+    FreezeGuard, Generation, SegmentId, SegmentLease, SegmentSnapshot, SegmentState, Segments,
 };
 pub use slab::{DevicePlacement, Slab};
 use std::{

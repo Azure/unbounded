@@ -1,7 +1,8 @@
 //! Measures per-node heap cost of phantom placement, replayed routes, and
 //! payload-free disk entries, for simulator memory planning.
 
-use page_alloc::{PhantomEntries, SegmentId};
+use page_alloc::SegmentId;
+use racer_sim::alloc_model::PhantomEntries;
 use racer_sim::phantom::{Phantom, SharedRoutes};
 use std::{
     alloc::{GlobalAlloc, Layout, System},
