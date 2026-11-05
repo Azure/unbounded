@@ -354,13 +354,17 @@ impl Server {
                     }
                 }
                 if accepting.is_none() && self.resources.active.get() < MAX_CONNECTIONS {
-                    accepting = Some(uring_runtime::drivers::retry_listener(scope, || {
-                        reactor.accept_reserved(
-                            listener.clone(),
-                            Some(self.resources.submissions.clone()),
-                            scope,
-                        )
-                    }));
+                    accepting = Some(uring_runtime::drivers::retry_listener(
+                        scope,
+                        reactor.ctx().clock.clone(),
+                        || {
+                            reactor.accept_reserved(
+                                listener.clone(),
+                                Some(self.resources.submissions.clone()),
+                                scope,
+                            )
+                        },
+                    ));
                 }
                 if let Some(accept) = &mut accepting {
                     match accept.as_mut().poll(cx) {

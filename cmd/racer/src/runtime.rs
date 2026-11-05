@@ -1088,9 +1088,11 @@ mod tests {
                 assert!(poll(&mut busy).is_pending());
                 let address = SocketAddress::Unix("/retry-listener".into());
                 let listener = Rc::new(sim.listen(address.clone()).unwrap());
-                let mut accept = uring_runtime::drivers::retry_listener(&request, || {
-                    reactor.accept(listener.clone(), &request)
-                });
+                let mut accept = uring_runtime::drivers::retry_listener(
+                    &request,
+                    request.clock().clone(),
+                    || reactor.accept(listener.clone(), &request),
+                );
                 assert!(poll(&mut accept).is_pending());
                 assert_eq!(reactor.in_flight(), 1);
                 drop(busy);
@@ -1769,7 +1771,7 @@ mod tests {
             let wakes = Arc::new(WakeCounter::default());
             let waker = Waker::from(wakes.clone());
             let mut cx = Context::from_waker(&waker);
-            let mut operation = retry(&scope, || {
+            let mut operation = retry(&scope, scope.clock().clone(), || {
                 calls.set(calls.get() + 1);
                 Box::pin(std::future::ready(if calls.get() <= 4 {
                     Err(Error::Overloaded)
@@ -1802,7 +1804,7 @@ mod tests {
                     uring_runtime::environment::now() + Duration::from_millis(1),
                 )
                 .unwrap();
-                let mut operation = retry::<_, ()>(&scope, || {
+                let mut operation = retry::<_, ()>(&scope, scope.clock().clone(), || {
                     Box::pin(std::future::ready(Err(Error::Overloaded)))
                 });
                 assert!(operation.as_mut().poll(&mut cx).is_pending());
@@ -1824,8 +1826,9 @@ mod tests {
                 Error::InvalidConfiguration,
                 Error::Internal,
             ] {
-                let mut operation =
-                    retry::<_, ()>(&scope, || Box::pin(std::future::ready(Err(error))));
+                let mut operation = retry::<_, ()>(&scope, scope.clock().clone(), || {
+                    Box::pin(std::future::ready(Err(error)))
+                });
                 assert_eq!(operation.as_mut().poll(&mut cx), Poll::Ready(Err(error)));
             }
         }
@@ -1851,7 +1854,7 @@ mod tests {
             .unwrap();
             let (reader, _writer) = sim.socket_pair();
             let reader = Rc::new(reader);
-            let mut operation = retry(&scope, || {
+            let mut operation = retry(&scope, scope.clock().clone(), || {
                 reactor.readiness(reader.clone(), libc::POLLIN as u32, &scope)
             });
             let mut cx = Context::from_waker(futures::task::noop_waker_ref());

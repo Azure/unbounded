@@ -255,7 +255,7 @@ impl PeerServer {
             loop {
                 scope.check()?;
                 if let AcceptMode::Distributed(ingress) = &self.accept {
-                    uring_runtime::drivers::retry_listener(scope, || {
+                    uring_runtime::drivers::retry_listener(scope, scope.clock().clone(), || {
                         reactor.readiness_with_lease(fd.clone(), libc::POLLIN as u32, (), scope)
                     })
                     .await?;
@@ -297,7 +297,7 @@ impl PeerServer {
                     continue;
                 }
                 let accepted = next_accepted(
-                    uring_runtime::drivers::retry_listener(scope, || {
+                    uring_runtime::drivers::retry_listener(scope, scope.clock().clone(), || {
                         reactor.accept(fd.clone(), scope)
                     }),
                     &mut active,

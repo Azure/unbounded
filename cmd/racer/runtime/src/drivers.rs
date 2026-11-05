@@ -5,9 +5,7 @@
 //! original owner across nested scopes. No executor or application policy is hidden
 //! here. For example, a local proxy can drive detached cache writes alongside I/O.
 
-use crate::{
-    Error, Operation, Result, Scope, environment, group::FailureReporter, reactor::ReactorWake,
-};
+use crate::{Error, Operation, Result, Scope, group::FailureReporter, reactor::ReactorWake};
 use std::{
     cell::{Cell, RefCell},
     collections::VecDeque,
@@ -531,12 +529,13 @@ impl Default for RetryOptions {
 /// Submitted operations retain their original completion fence on cancellation.
 pub fn retry_listener<'a, S: Scope, T: 'a>(
     scope: &'a S,
+    clock: racer_io::Clock,
     submit: impl FnMut() -> Operation<'a, T, S::Error> + 'a,
 ) -> Operation<'a, T, S::Error>
 where
     S::Error: PartialEq,
 {
-    retry_listener_with(scope, RetryOptions::default(), submit)
+    retry_listener_with(scope, clock, RetryOptions::default(), submit)
 }
 
 thread_local! {
@@ -588,6 +587,7 @@ pub fn next_alarm() -> Option<std::time::Instant> {
 /// Retry overload using caller-selected limits without allocating a backend timer.
 fn retry_listener_with<'a, S: Scope, T: 'a>(
     scope: &'a S,
+    clock: racer_io::Clock,
     options: RetryOptions,
     mut submit: impl FnMut() -> Operation<'a, T, S::Error> + 'a,
 ) -> Operation<'a, T, S::Error>
@@ -601,14 +601,14 @@ where
         let cancellation = scope.cancellation().map(|c| c.subscribe()).transpose()?;
         let mut operation = None;
         let mut retries = 0usize;
-        let mut retry_at = environment::now();
+        let mut retry_at = clock.now();
         std::future::poll_fn(|cx| {
             if operation.is_none() {
                 scope.check()?;
                 if let Some(cancellation) = &cancellation {
                     cancellation.register(cx.waker());
                 }
-                if environment::now() < retry_at {
+                if clock.now() < retry_at {
                     alarm(retry_at, cx.waker());
                     return Poll::Pending;
                 }
@@ -621,7 +621,8 @@ where
                         return Poll::Ready(Err(error));
                     }
                     retries = retries.checked_add(1).ok_or(Error::Overloaded)?;
-                    retry_at = environment::now()
+                    retry_at = clock
+                        .now()
                         .checked_add(options.interval)
                         .ok_or(Error::InvalidInput)?;
                     alarm(retry_at, cx.waker());
@@ -1585,12 +1586,13 @@ mod retry_tests {
     /// Retry bounds and invalid intervals fail without unbounded or immediate resubmission.
     #[test]
     fn configured_retry_limit_interval_zero_and_overflow() {
-        let clock = environment::SimulationClock::new(4);
+        let clock = crate::environment::SimulationClock::new(4);
         let _role = clock.environment(0).enter();
         let scope = TestScope::default();
         let attempts = Cell::new(0);
         let mut future = retry_listener_with(
             &scope,
+            clock.environment(0).worker_ctx().clock,
             RetryOptions {
                 interval: Duration::from_millis(3),
                 max_retries: Some(1),
@@ -1617,6 +1619,7 @@ mod retry_tests {
         ] {
             let mut future = retry_listener_with(
                 &scope,
+                clock.environment(0).worker_ctx().clock,
                 RetryOptions {
                     interval,
                     max_retries: None,
@@ -1630,7 +1633,7 @@ mod retry_tests {
     /// Default retry timing requires owner polling and rechecks policy before resubmission.
     #[test]
     fn retries_only_after_ten_ms_without_self_wakes_and_checks_scope() {
-        let clock = environment::SimulationClock::new(45);
+        let clock = crate::environment::SimulationClock::new(45);
         let _environment = clock.environment(0).enter();
         for cancel in [false, true] {
             let scope = TestScope::default();
@@ -1638,17 +1641,18 @@ mod retry_tests {
             let wake = Arc::new(WakeCounter::default());
             let waker = Waker::from(wake.clone());
             let mut cx = Context::from_waker(&waker);
-            let mut future = retry_listener(&scope, || {
-                let attempt = attempts.get();
-                attempts.set(attempt + 1);
-                Box::pin(async move {
-                    if attempt == 0 {
-                        Err(Error::Overloaded)
-                    } else {
-                        Ok(7)
-                    }
-                })
-            });
+            let mut future =
+                retry_listener(&scope, clock.environment(0).worker_ctx().clock, || {
+                    let attempt = attempts.get();
+                    attempts.set(attempt + 1);
+                    Box::pin(async move {
+                        if attempt == 0 {
+                            Err(Error::Overloaded)
+                        } else {
+                            Ok(7)
+                        }
+                    })
+                });
             assert!(future.as_mut().poll(&mut cx).is_pending());
             clock.advance(Duration::from_millis(9));
             assert!(future.as_mut().poll(&mut cx).is_pending());
@@ -1672,7 +1676,7 @@ mod retry_tests {
         let scope = TestScope::default();
         let completed = Cell::new(false);
         let attempts = Cell::new(0);
-        let mut future = retry_listener(&scope, || {
+        let mut future = retry_listener(&scope, racer_io::Clock::host(), || {
             attempts.set(attempts.get() + 1);
             Box::pin(std::future::poll_fn(|_| {
                 if completed.get() {
