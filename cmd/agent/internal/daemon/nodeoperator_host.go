@@ -22,6 +22,13 @@ type hostOperator struct{}
 
 var _ hostOperations = hostOperator{}
 
+// FindActiveMachine returns the running node, from its applied config, for
+// tools outside the daemon (exec, logs) that operate it the way the daemon
+// does.
+func FindActiveMachine(log *slog.Logger) (*ActiveMachine, error) {
+	return hostOperator{}.FindActiveMachine(log)
+}
+
 func (hostOperator) FindActiveMachine(log *slog.Logger) (*ActiveMachine, error) {
 	return findActiveMachineIn(log, goalstates.AppliedConfigPath)
 }
