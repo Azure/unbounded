@@ -523,6 +523,9 @@ struct Msg {
     relays: Vec<SimCharge>,
     /// When the first relay took its `Relay` transfer.
     relayed_at: Option<Nanos>,
+    /// The current holder verified the request (production `verify_request_async` before
+    /// dispatch or relay, `peer/server.rs`).
+    verified: bool,
     /// A pinned single-link hedge exchange.
     direct: bool,
     /// An orphan notice's copy offer: answered `Miss` without a body.
@@ -1639,9 +1642,12 @@ impl NodeWorld {
                 }
                 match result {
                     Ok(got) => {
+                        // The page's worker opens it (an inference about production's lanes).
+                        let worker = (r.page % u64::from(self.fabric.workers)) as u8;
                         let open = self.fabric.crypto(
                             now,
                             r.node,
+                            worker,
                             self.fabric.costs.aead(self.config.page_bytes),
                         );
                         let latency = open - r.start;
@@ -3084,6 +3090,7 @@ impl NodeWorld {
             abandon: self.nanos(plan.attempt_end).max(now + 1),
             relays: Vec::new(),
             relayed_at: None,
+            verified: false,
             direct,
             offer: false,
             ping: false,
@@ -3120,6 +3127,13 @@ impl NodeWorld {
 
     /// Route `msg` one hop from `holder`. `plan` is the relay plan at a relay; `None` at the
     /// requester.
+    /// The worker (and crypto helper) holding `mid`'s connection (the Model's `conn_worker`).
+    fn conn_worker(&self, mid: u64) -> u8 {
+        self.msgs
+            .get(&mid)
+            .map_or(0, |m| (m.probe % u64::from(self.fabric.workers)) as u8)
+    }
+
     fn forward(&mut self, mid: u64, holder: u32, plan: Option<RelayPlan>) {
         let m = self.msgs.get(&mid).expect("message");
         let instant = self.instant(self.now());
@@ -3314,6 +3328,7 @@ impl NodeWorld {
             abandon: timeout,
             relays: Vec::new(),
             relayed_at: None,
+            verified: false,
             direct: false,
             offer,
             ping: !offer,
@@ -3470,11 +3485,15 @@ impl NodeWorld {
                     .at(abandon.max(now + 1), Event::LastHop { msg: mid });
             }
             let costs = self.fabric.costs;
-            let signed = self.fabric.crypto(now, holder, costs.sign_ns);
+            let conn = self.conn_worker(mid);
+            let signed = self.fabric.crypto(now, holder, conn, costs.sign_ns);
             let arrive = self.fabric.message(signed, holder, next);
             self.metrics.incr("peer_messages");
             // The receiver verifies when the message arrives (in `hop`), so no future slot is
             // reserved on its crypto helper.
+            if let Some(m) = self.msgs.get_mut(&mid) {
+                m.verified = false;
+            }
             self.engine.at(arrive, Event::Hop { msg: mid });
         } else {
             self.metrics.incr("link_failures");
@@ -3595,10 +3614,24 @@ impl NodeWorld {
             // The requester gave up: production relays and the destination see the upstream
             // connection close and drop the exchange.
             self.metrics.incr("requests_abandoned");
+            if m.verified {
+                self.metrics.incr("requests_abandoned_verifying");
+            }
             self.msgs.remove(&mid);
             return;
         }
-        self.fabric.crypto(now, at, self.fabric.costs.verify_ns);
+        if !m.verified {
+            // Production verifies on the crypto helper and dispatches or relays only after.
+            let conn = (m.probe % u64::from(self.fabric.workers)) as u8;
+            let ready = self
+                .fabric
+                .crypto(now, at, conn, self.fabric.costs.verify_ns);
+            self.msgs.get_mut(&mid).expect("message").verified = true;
+            if ready > now {
+                self.engine.at(ready, Event::Hop { msg: mid });
+                return;
+            }
+        }
         self.adopt(at);
         let m = self.msgs.get(&mid).expect("message");
         let known = self.versions.known(at, m.version, now);
@@ -4055,13 +4088,14 @@ impl NodeWorld {
             return;
         }
         let costs = self.fabric.costs;
+        let conn = (m.probe % u64::from(self.fabric.workers)) as u8;
         let links = (route.len() - 1) as u64;
         if let Some(p) = self.probes.get_mut(&m.probe) {
             p.hops = route.len() - 1;
         }
         let arrive = if reply == Reply::Response(ResponseKind::Page) {
             let bytes = self.config.page_bytes;
-            let sealed = self.fabric.crypto(ready, from, costs.sign_ns);
+            let sealed = self.fabric.crypto(ready, from, conn, costs.sign_ns);
             // The body streams only while the requester still waits; relays hold their `Relay`
             // reservation until the body has passed (production keeps it on the connection while
             // streaming, `peer/server.rs` `relay.reservation`).
@@ -4095,7 +4129,7 @@ impl NodeWorld {
                 self.metrics
                     .observe("relay_hold_answer_ns", ready.saturating_sub(start));
             }
-            let mut t = self.fabric.crypto(ready, from, costs.sign_ns);
+            let mut t = self.fabric.crypto(ready, from, conn, costs.sign_ns);
             for hop in route.windows(2) {
                 t = self.fabric.message(t, hop[0], hop[1]);
             }
@@ -4138,7 +4172,7 @@ impl NodeWorld {
         };
         let now = self.now();
         self.fabric
-            .crypto(now, fill.node, self.fabric.costs.verify_ns);
+            .crypto(now, fill.node, fill.worker, self.fabric.costs.verify_ns);
         let (node, page) = (fill.node, fill.page);
         let relayed = match probe.granted {
             Some(i) => fill.batch.get(i).is_some_and(|b| b.relayed),

@@ -566,6 +566,23 @@ fn relays_hold_their_reservation_only_while_the_body_streams() {
     assert_eq!(counter(&report, "reads_failed"), 0, "{report}");
 }
 
+/// Production verifies a request on the crypto helper before it serves or relays it
+/// (`peer/server.rs` `verify_request_async`): a request whose requester gave up while it waited
+/// for verification is dropped, not served.
+#[test]
+fn holders_wait_for_request_verification() {
+    let mut config = quiet(16);
+    config.duration_ns = 10 * SECONDS;
+    // Slower than the requester's attempt timeout.
+    config.costs.verify_ns = 3 * SECONDS;
+    config.storms = vec![Storm::new(0, 0, 16, 10 * MILLIS)];
+    let report = run(config, 8);
+    assert!(
+        counter(&report, "requests_abandoned_verifying") > 0,
+        "{report}"
+    );
+}
+
 /// Where the hung peers sit: how many members, and which of them hang.
 #[derive(Clone, Copy)]
 struct HangLayout {

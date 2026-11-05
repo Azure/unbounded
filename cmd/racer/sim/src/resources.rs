@@ -95,6 +95,8 @@ pub struct Fabric {
     pub disk_write_free: Vec<Nanos>,
     /// `nodes * workers` entries.
     pub cpu_free: Vec<Nanos>,
+    /// `nodes * workers` entries: production pairs each worker with its own crypto helper
+    /// (`src/worker.rs` `WorkerPair { io, crypto }`).
     pub crypto_free: Vec<Nanos>,
     pub workers: u8,
     pub nic_bps: u64,
@@ -126,7 +128,7 @@ impl Fabric {
             disk_read_free: vec![0; n],
             disk_write_free: vec![0; n],
             cpu_free: vec![0; n * workers as usize],
-            crypto_free: vec![0; n],
+            crypto_free: vec![0; n * workers as usize],
             workers,
             nic_bps: config.nic_bps,
             chunk_bytes: config.chunk_bytes.max(1),
@@ -225,10 +227,11 @@ impl Fabric {
         reserve(&mut self.cpu_free[i], now, service).1
     }
 
-    /// Run `ns` on the node's crypto helper.
-    pub fn crypto(&mut self, now: Nanos, node: u32, ns: Nanos) -> Nanos {
+    /// Run `ns` on the crypto helper of one worker of `node`.
+    pub fn crypto(&mut self, now: Nanos, node: u32, worker: u8, ns: Nanos) -> Nanos {
+        let i = node as usize * self.workers as usize + (worker % self.workers) as usize;
         let service = self.scale(node, ns);
-        reserve(&mut self.crypto_free[node as usize], now, service).1
+        reserve(&mut self.crypto_free[i], now, service).1
     }
 
     /// Forget queued work on a crashed node.
@@ -239,12 +242,14 @@ impl Fabric {
             &mut self.rx_free[i],
             &mut self.disk_read_free[i],
             &mut self.disk_write_free[i],
-            &mut self.crypto_free[i],
         ] {
             *v = now;
         }
         let w = self.workers as usize;
         for v in &mut self.cpu_free[i * w..(i + 1) * w] {
+            *v = now;
+        }
+        for v in &mut self.crypto_free[i * w..(i + 1) * w] {
             *v = now;
         }
     }
@@ -749,7 +754,11 @@ mod tests {
         f.reset_node(0, 1000);
         assert_eq!(f.cpu(0, 0, 0, 100), 1100);
         assert!(f.disk_read(0, 1, 4096) > f.disk_latency);
-        assert!(f.crypto(0, 1, 10) == 40);
+        assert!(f.crypto(0, 1, 0, 10) == 40);
+        // Each worker has its own crypto helper (both reset to 1000 above).
+        assert_eq!(f.crypto(0, 0, 0, 100), 1100);
+        assert_eq!(f.crypto(0, 0, 1, 100), 1100);
+        assert_eq!(f.crypto(0, 0, 0, 100), 1200);
     }
 
     /// A slow sender takes longer, but holds the receiver's NIC only for the receiver's own service
