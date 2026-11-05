@@ -65,10 +65,10 @@ type MachineOperationList struct {
 type OperationKind string
 
 const (
-	// OperationNodeReboot restarts the nspawn-backed node in place without
-	// reprovisioning the rootfs. Services are stopped, the nspawn container
-	// is restarted, and services are brought back up. Handled by the
-	// in-VM agent.
+	// OperationNodeReboot restarts the node stack in place without
+	// reprovisioning. Services are stopped, the node stack (nspawn machine,
+	// container or host units, depending on the isolation mode) is
+	// restarted, and services are brought back up. Handled by the agent.
 	OperationNodeReboot OperationKind = "NodeReboot"
 
 	// OperationAgentUpgrade upgrades the host-side unbounded-agent binary.
