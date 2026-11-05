@@ -406,6 +406,43 @@ func TestNodeCertificationContract(t *testing.T) {
 		t.Fatalf("planDigests maxItems = %v, want %d", maxItems, MaxContributingRuns)
 	}
 
+	latestNonPass, found := status.Properties["latestNonPass"]
+	if !found {
+		t.Fatal("NodeCertification status has no latestNonPass watermark")
+	}
+
+	for _, property := range []string{"name", "uid", "finishedAt", "classification", "evidenceDigest"} {
+		if !contains(latestNonPass.Required, property) {
+			t.Fatalf("latestNonPass does not require %s", property)
+		}
+	}
+
+	if maxLength := latestNonPass.Properties["name"].MaxLength; maxLength == nil || *maxLength != 253 {
+		t.Fatalf("latestNonPass name maxLength = %v, want 253", maxLength)
+	}
+
+	if latestNonPass.Properties["evidenceDigest"].Pattern != SHA256DigestPattern {
+		t.Fatalf(
+			"latestNonPass evidenceDigest pattern = %q, want %q",
+			latestNonPass.Properties["evidenceDigest"].Pattern,
+			SHA256DigestPattern,
+		)
+	}
+
+	classification := latestNonPass.Properties["classification"]
+	for _, want := range []string{`"Failed"`, `"Inconclusive"`, `"Canceled"`} {
+		if !containsJSONEnum(classification.Enum, want) {
+			t.Fatalf("latestNonPass classification enum = %s, missing %s", classification.Enum, want)
+		}
+	}
+
+	if !hasValidationRule(
+		&status,
+		"!has(oldSelf.latestNonPass) || (has(self.latestNonPass) && (self.latestNonPass.finishedAt > oldSelf.latestNonPass.finishedAt || (self.latestNonPass.finishedAt == oldSelf.latestNonPass.finishedAt && (self.latestNonPass.uid > oldSelf.latestNonPass.uid || (self.latestNonPass.uid == oldSelf.latestNonPass.uid && self.latestNonPass == oldSelf.latestNonPass)))))",
+	) {
+		t.Fatal("latestNonPass does not have monotonic finishedAt and UID validation")
+	}
+
 	if NodeCertificationConditionGateProjected != "GateProjected" {
 		t.Fatalf("gate condition = %q, want GateProjected", NodeCertificationConditionGateProjected)
 	}
@@ -429,6 +466,31 @@ func TestNodeCertificationContract(t *testing.T) {
 		if !containsJSONEnum(phase.Enum, want) {
 			t.Fatalf("phase enum = %s, missing %s", phase.Enum, want)
 		}
+	}
+}
+
+func TestNodeCertificationBackwardDecode(t *testing.T) {
+	t.Parallel()
+
+	content := []byte(`{
+		"apiVersion":"signal.unbounded-cloud.io/v1alpha1",
+		"kind":"NodeCertification",
+		"metadata":{"name":"existing","namespace":"default"},
+		"spec":{
+			"policy":{"name":"policy","uid":"policy-uid","generation":1},
+			"nodeName":"node-1",
+			"nodeUID":"node-uid"
+		},
+		"status":{"phase":"Qualified","observedGeneration":1}
+	}`)
+
+	ledger := &NodeCertification{}
+	if err := json.Unmarshal(content, ledger); err != nil {
+		t.Fatalf("decode existing NodeCertification without watermark: %v", err)
+	}
+
+	if ledger.Status.LatestNonPass != nil {
+		t.Fatal("existing NodeCertification unexpectedly acquired latestNonPass")
 	}
 }
 
