@@ -248,8 +248,14 @@ impl Transfers {
                 .checked_sub(i + 1)
                 .filter(|i| *i > 0)
                 .ok_or(Error::Unauthorized)?;
-            let verified = self.signatures.verify_historical(signed)?;
-            if verified.node() != &path[index]
+            // Outgoing responses were signed here or verified once by the exchange
+            // that returned them; only unverified ingress needs signature checks.
+            let signer = if sending {
+                crate::peer::protocol::node_field(&signed.head, "racer-signer")?
+            } else {
+                self.signatures.verify_historical(signed)?.node().clone()
+            };
+            if signer != path[index]
                 || crate::peer::protocol::receiver(&signed.head)? != path[index - 1]
             {
                 return Err(Error::Unauthorized);
@@ -1056,16 +1062,21 @@ pub struct LandedResponse {
 
 /// Internal transport result: native delivery stays materialized; HTTP relay
 /// delivery owns an unfinished connection and its exact opaque body framing.
+///
+/// The type parameters carry the proof state: the transport returns signed,
+/// unverified owners, and the requester converts them exactly once into
+/// [`VerifiedExchange`] so no later stage verifies the same envelope again.
 #[allow(clippy::large_enum_variant)] // Keep completed delivery inline without another allocation.
-pub enum RelayResponse {
-    Complete(SignedResponse),
+pub enum RelayResponse<C = SignedResponse, A = crate::peer::forwarding::ForwardedHead> {
+    Complete(C),
 
     /// A page in a GPU landing buffer. Only a requester that asked for
     /// landing gets this, and only that requester's sealed read uses it.
+    /// The transport verifies it against the request binding before returning.
     Landed(Box<LandedResponse>),
 
     Http {
-        authentication: crate::peer::forwarding::ForwardedHead,
+        authentication: A,
 
         connection: Box<crate::http::ConnectionLease>,
 
@@ -1076,6 +1087,12 @@ pub enum RelayResponse {
         overflow: Option<Rc<crate::rdma::Links>>,
     },
 }
+
+/// An exchange whose response proofs were verified once against the request binding.
+pub type VerifiedExchange = RelayResponse<
+    crate::peer::forwarding::VerifiedResponse,
+    crate::peer::forwarding::VerifiedOpaque,
+>;
 
 /// Whether the hop from `local` to `peer` carries `operation` over HTTP only
 /// because the edge is an overflow edge (see [`crate::rdma::is_overflow`]).

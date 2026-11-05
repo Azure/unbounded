@@ -536,11 +536,18 @@ fn relay_dispatch_preserves_reverse_path_and_fails_closed_on_link_loss() {
             }
             Ok::<_, Error>(())
         };
+        crate::peer::forwarding::ENVELOPE_VERIFICATIONS.with(|count| count.set(0));
         let (result, served) = crate::http::tests::drive(&socket.reactor, async {
             futures::join!(relay.forward(ingress, membership, &scope), destination)
         });
         served.unwrap();
         assert_eq!(requester.outbound_requests(), 1);
+        // The relay verifies the downstream response once, inside its exchange,
+        // and appends its reverse hop without verifying it again.
+        assert_eq!(
+            crate::peer::forwarding::ENVELOPE_VERIFICATIONS.with(std::cell::Cell::get),
+            usize::from(!fail)
+        );
         if fail {
             assert!(matches!(result, Err(Error::Io)));
         } else {

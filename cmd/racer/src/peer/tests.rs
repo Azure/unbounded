@@ -1654,7 +1654,7 @@ mod requester_safety {
                 requester
                     .request_direct(request, membership, &scope)
                     .await
-                    .map(|r| RelayResponse::Complete(r.into_signed()))
+                    .map(RelayResponse::Complete)
             } else if opaque {
                 requester
                     .exchange_inner(
@@ -1671,6 +1671,7 @@ mod requester_safety {
                     .map(RelayResponse::Complete)
             }
         };
+        crate::peer::forwarding::ENVELOPE_VERIFICATIONS.with(|count| count.set(0));
         let mut work = Box::pin(async { futures::join!(client, server) });
         let mut cx = Context::from_waker(futures::task::noop_waker_ref());
         let (result, served) = loop {
@@ -1686,6 +1687,13 @@ mod requester_safety {
         };
         served.unwrap();
         drop(work);
+        // Each direct, materialized, and opaque response is verified exactly once,
+        // including the tampered response, which still fails.
+        assert_eq!(
+            crate::peer::forwarding::ENVELOPE_VERIFICATIONS.with(std::cell::Cell::get),
+            1,
+            "{case} response verifications"
+        );
         if case == "corrupt" {
             assert!(result.is_err());
         } else {
@@ -1711,7 +1719,7 @@ mod requester_safety {
                     drop(connection);
                 }
                 RelayResponse::Complete(response) => assert_eq!(
-                    matches!(response.response, PeerResponse::Overloaded),
+                    matches!(response.response(), PeerResponse::Overloaded),
                     case == "overloaded"
                 ),
                 RelayResponse::Landed(_) => panic!("nothing asked for landing"),

@@ -293,6 +293,31 @@ impl VerifiedResponse {
         self.signed
     }
 }
+
+/// An opaque response head verified once against its request binding. Only
+/// [`Forwarding::verify_opaque_async`] constructs it, so relays append their
+/// reverse hop without verifying the same proofs again.
+pub struct VerifiedOpaque(ForwardedHead);
+
+impl VerifiedOpaque {
+    /// Borrow the verified original and reverse hops.
+    pub fn authentication(&self) -> &ForwardedHead {
+        &self.0
+    }
+
+    /// Release the verified proofs for re-encoding toward the requester.
+    pub fn into_authentication(self) -> ForwardedHead {
+        self.0
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Envelope verifications run on this thread, for verify-once regression tests.
+    pub(crate) static ENVELOPE_VERIFICATIONS: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(0) };
+}
+
 impl Forwarding {
     /// Retain the locally emitted route for verification at the transport boundary.
     /// Response verification still authenticates the original signature and path.
@@ -341,6 +366,8 @@ impl Forwarding {
         input: EnvelopeInput,
         scope: &crate::runtime::RequestScope,
     ) -> Result<EnvelopeOutput> {
+        #[cfg(test)]
+        ENVELOPE_VERIFICATIONS.with(|count| count.set(count.get() + 1));
         let (keys, certificates) = self.signatures.for_offload();
         let job = Box::new(EnvelopeJob {
             keys,
@@ -399,26 +426,23 @@ impl Forwarding {
         length: usize,
         request: &RequestBinding,
         scope: &crate::runtime::RequestScope,
-    ) -> Result<ForwardedHead> {
+    ) -> Result<VerifiedOpaque> {
         match self
             .verify_envelope(EnvelopeInput::Opaque(auth, length, request.clone()), scope)
             .await?
         {
-            EnvelopeOutput::Opaque(auth) => Ok(auth),
+            EnvelopeOutput::Opaque(auth) => Ok(VerifiedOpaque(auth)),
             _ => Err(Error::Internal),
         }
     }
-    pub(crate) async fn forward_opaque_async(
+    /// Append this relay's reverse hop to an opaque head verified by its exchange.
+    pub(crate) fn forward_opaque_verified(
         &self,
-        auth: ForwardedHead,
-        length: usize,
+        auth: VerifiedOpaque,
         request: &RequestBinding,
         previous: &NodeId,
-        scope: &crate::runtime::RequestScope,
     ) -> Result<ForwardedHead> {
-        let mut auth = self
-            .verify_opaque_async(auth, length, request, scope)
-            .await?;
+        let mut auth = auth.0;
         self.append_response_head(&mut auth, request, previous)?;
         Ok(auth)
     }
@@ -1354,7 +1378,7 @@ mod tests {
                 &mut port,
             )
             .unwrap();
-            assert_eq!(opaque.hops.len(), 7);
+            assert_eq!(opaque.authentication().hops.len(), 7);
             assert_eq!(
                 run(
                     sender.verify_opaque_async(

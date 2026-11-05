@@ -462,28 +462,22 @@ impl Relay {
             let outbound = self
                 .forwarding
                 .append_request(request, next, outbound_budget)?;
-            let response = if relay.is_some() {
-                self.transport
-                    .exchange_inner(outbound, membership, Some(reservation), &scope)
-                    .await?
-            } else {
-                transport::RelayResponse::Complete(
-                    self.transport
-                        .exchange(outbound, membership, &scope)
-                        .await?,
+            let response = self
+                .transport
+                .exchange_inner(
+                    outbound,
+                    membership,
+                    relay.is_some().then(|| reservation.clone()),
+                    &scope,
                 )
-            };
+                .await?;
             scope.check()?;
+            // The exchange verified every proof against `binding`; only append.
             match response {
-                transport::RelayResponse::Complete(response) => {
-                    let response = self
-                        .forwarding
-                        .verify_response_async(response, &binding, &scope)
-                        .await?;
-                    self.forwarding
-                        .append_response(response, &previous)
-                        .map(transport::RelayResponse::Complete)
-                }
+                transport::RelayResponse::Complete(response) => self
+                    .forwarding
+                    .append_response(response, &previous)
+                    .map(transport::RelayResponse::Complete),
                 // A relay never asks for landing.
                 transport::RelayResponse::Landed(_) => Err(Error::Internal),
                 transport::RelayResponse::Http {
@@ -492,10 +486,11 @@ impl Relay {
                     length,
                     overflow,
                 } => {
-                    let authentication = self
-                        .forwarding
-                        .forward_opaque_async(authentication, length, &binding, &previous, &scope)
-                        .await?;
+                    let authentication = self.forwarding.forward_opaque_verified(
+                        authentication,
+                        &binding,
+                        &previous,
+                    )?;
                     Ok(transport::RelayResponse::Http {
                         authentication,
                         connection,
@@ -758,7 +753,7 @@ impl Requester {
 ///     let reply = relay.forward(admitted, membership.clone(), scope).await?;
 ///     let _retained_chain = reply.authentication;
 ///     // Both network boundaries preserve envelopes in each direction.
-///     let _exchange: SignedResponse = transport.exchange(outbound, membership, scope).await?;
+///     let _exchange: VerifiedResponse = transport.exchange(outbound, membership, scope).await?;
 ///     let _dispatch: SignedResponse = server.dispatch(inbound, scope).await?;
 ///     Ok(())
 /// }
@@ -790,7 +785,7 @@ impl Requester {
             if !self.direct_hedge_available(&membership, &next) {
                 return Err(Error::Overloaded);
             }
-            let (signed, binding) = forwarding.sign_request_to(request, &next)?;
+            let (signed, _binding) = forwarding.sign_request_to(request, &next)?;
             let mut timing = PageTiming::new(metrics, scope.clock().clone());
             let response = self
                 .exchange_inner_mode(
@@ -807,9 +802,7 @@ impl Requester {
                 return Err(Error::Internal);
             };
             scope.check()?;
-            let response = forwarding
-                .verify_response_async(response, &binding, &scope)
-                .await?;
+            // Verified once by `exchange_inner_mode` against the binding from signing.
             timing.success(&response);
             Ok(response)
         })
@@ -930,7 +923,7 @@ impl Requester {
                     .await,
             )?;
             let next = route.nodes.get(1).ok_or(Error::Unavailable)?;
-            let (signed, binding) = forwarding.sign_request_to(request, next)?;
+            let (signed, _binding) = forwarding.sign_request_to(request, next)?;
             let mut timing = PageTiming::new(metrics, scope.clock().clone());
             let response = self
                 .exchange_inner_mode(
@@ -943,9 +936,9 @@ impl Requester {
                     landing,
                 )
                 .await?;
+            // Verified once by `exchange_inner_mode` against `binding`.
             let response = match response {
                 transport::RelayResponse::Complete(response) => response,
-                // Verified by exchange_inner_mode against `binding`.
                 transport::RelayResponse::Landed(landed) => {
                     scope.check()?;
                     return Ok(Delivered::Landed(landed));
@@ -953,13 +946,6 @@ impl Requester {
                 transport::RelayResponse::Http { .. } => return Err(Error::Internal),
             };
             scope.check()?;
-            let response = observer.result(
-                Stage::PeerVerify,
-                &scope,
-                forwarding
-                    .verify_response_async(response, &binding, &scope)
-                    .await,
-            )?;
             timing.success(&response);
             Ok(Delivered::Response(response))
         })
@@ -982,7 +968,7 @@ impl Requester {
         request: SignedRequest,
         membership: std::sync::Arc<crate::topology::Membership>,
         scope: &'a RequestScope,
-    ) -> Operation<'a, SignedResponse> {
+    ) -> Operation<'a, VerifiedResponse> {
         Box::pin(async move {
             match self
                 .exchange_inner(request, membership, None, scope)
@@ -1009,7 +995,7 @@ impl Requester {
         membership: std::sync::Arc<crate::topology::Membership>,
         relay: Option<Rc<flow_control::Charge<AdmissionPolicy>>>,
         scope: &'a RequestScope,
-    ) -> Operation<'a, transport::RelayResponse> {
+    ) -> Operation<'a, transport::VerifiedExchange> {
         self.exchange_inner_mode(request, membership, relay, scope, false, None, None)
     }
     #[allow(clippy::too_many_arguments)] // Keep transport, routing, and landing inputs explicit.
@@ -1022,7 +1008,7 @@ impl Requester {
         direct_http: bool,
         timing: Option<&'a mut PageTiming<'_>>,
         landing: Option<i32>,
-    ) -> Operation<'a, transport::RelayResponse> {
+    ) -> Operation<'a, transport::VerifiedExchange> {
         let (network, paths, health, forwarding, transfers) = match self {
             Self::Network {
                 network,
@@ -1112,13 +1098,22 @@ impl Requester {
             // Receiving a signed envelope is not proof. Recover only after the
             // complete reverse chain and original request binding are verified.
             let response = match response {
-                Ok(response) => self.verify_exchange(response, &binding, &scope).await,
+                Ok(response) => {
+                    let verified = self.verify_exchange(response, &binding, &scope).await;
+                    match self {
+                        Self::Network { observer, .. } => {
+                            observer.result(Stage::PeerVerify, &scope, verified)
+                        }
+                        #[cfg(any(test, feature = "subscription-interop"))]
+                        Self::Scripted { .. } => verified,
+                    }
+                }
                 Err(error) => Err(error),
             };
             use racer_core::route;
             let exchange = match &response {
                 Ok(transport::RelayResponse::Complete(response)) => route::Exchange::Complete {
-                    overloaded: matches!(response.response, protocol::PeerResponse::Overloaded),
+                    overloaded: matches!(response.response(), protocol::PeerResponse::Overloaded),
                 },
                 // A landed page was verified by the transport, like a complete response.
                 Ok(transport::RelayResponse::Landed(_)) => {
@@ -1166,7 +1161,7 @@ impl Requester {
         response: transport::RelayResponse,
         binding: &crate::peer::forwarding::RequestBinding,
         scope: &RequestScope,
-    ) -> Result<transport::RelayResponse> {
+    ) -> Result<transport::VerifiedExchange> {
         let forwarding = match self {
             Self::Network { forwarding, .. } => forwarding,
             #[cfg(any(test, feature = "subscription-interop"))]
@@ -1178,7 +1173,7 @@ impl Requester {
             transport::RelayResponse::Complete(response) => forwarding
                 .verify_response_async(response, binding, scope)
                 .await
-                .map(|verified| transport::RelayResponse::Complete(verified.into_signed())),
+                .map(transport::RelayResponse::Complete),
             transport::RelayResponse::Landed(landed) => {
                 forwarding.verify_landed(
                     &landed.authentication,
@@ -1200,8 +1195,10 @@ impl Requester {
                 // All Racer outcomes use HTTP 200. Inspect the authenticated
                 // outcome, exactly as the materialized path does, not HTTP status.
                 connection.state_mut().exchange.verified_response(
-                    crate::peer::protocol::field(&authentication.original.head, "racer-outcome")?
-                        != "overloaded",
+                    crate::peer::protocol::field(
+                        &authentication.authentication().original.head,
+                        "racer-outcome",
+                    )? != "overloaded",
                 );
                 Ok(transport::RelayResponse::Http {
                     authentication,
