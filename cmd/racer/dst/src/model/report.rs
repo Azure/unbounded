@@ -39,6 +39,18 @@ pub struct Counters {
     pub no_helper: u64,
     /// Pages published to disk.
     pub disk_writes: u64,
+    /// Pages evicted from a full node store.
+    pub evictions: u64,
+    /// Peer pages served by a node that does not own the page (an overflow helper).
+    pub helper_copies: u64,
+    /// Injected origin precondition failures (412).
+    pub origin_412: u64,
+    /// Injected origin forbidden answers (403).
+    pub origin_403: u64,
+    /// Injected origin server errors (5xx).
+    pub origin_5xx: u64,
+    /// Most pages any node stores at the end of the run.
+    pub stored_pages_max: u64,
 }
 
 /// What a run observed.
@@ -52,6 +64,8 @@ pub struct Report {
     pub errors: BTreeMap<String, u64>,
     /// Origin requests by page.
     pub origin_per_page: BTreeMap<Page, u64>,
+    /// Core effect and serve outcome variants seen, by [`super::effect_name`].
+    pub coverage: BTreeMap<&'static str, u64>,
     /// Hard failures (invariant violations), first few kept.
     pub violations: Vec<String>,
     /// Hard failure count.
@@ -112,6 +126,12 @@ impl Report {
                     "helper_probes": c.helpers,
                     "no_helper": c.no_helper,
                     "disk_writes": c.disk_writes,
+                    "evictions": c.evictions,
+                    "helper_copies": c.helper_copies,
+                    "origin_412": c.origin_412,
+                    "origin_403": c.origin_403,
+                    "origin_5xx": c.origin_5xx,
+                    "stored_pages_max": c.stored_pages_max,
                 },
                 "histograms": {
                     "read_latency_ns": {
@@ -129,6 +149,7 @@ impl Report {
                 "max_requests_per_page": max_per_page,
                 "mean_requests_per_page": if pages == 0 { 0.0 } else { c.origin_requests as f64 / pages as f64 },
             },
+            "coverage": self.coverage,
             "invariants": {
                 "hard_failures": self.hard_failures,
                 "violations": self.violations,

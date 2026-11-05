@@ -133,6 +133,10 @@ pub struct ModelSpec {
     pub storms: Vec<Storm>,
     /// Client read deadline.
     pub read_timeout: Nanos,
+    /// Pages each node keeps; the least recently used page is evicted past it. 0 is unbounded.
+    pub stored_pages: usize,
+    /// Injected origin error rates.
+    pub origin_errors: OriginErrors,
     /// Report checks, by name.
     pub checks: Vec<(String, ReportCheck)>,
 }
@@ -144,6 +148,8 @@ impl std::fmt::Debug for ModelSpec {
             .field("pages_per_object", &self.pages_per_object)
             .field("page_bytes", &self.page_bytes)
             .field("storms", &self.storms)
+            .field("stored_pages", &self.stored_pages)
+            .field("origin_errors", &self.origin_errors)
             .finish()
     }
 }
@@ -157,6 +163,8 @@ impl Default for ModelSpec {
             page_bytes: 1 << 20,
             storms: Vec::new(),
             read_timeout: 10_000 * MILLIS,
+            stored_pages: 0,
+            origin_errors: OriginErrors::default(),
             checks: Vec::new(),
         }
     }
@@ -220,7 +228,64 @@ struct Asker {
 
 struct Node {
     cores: Vec<WorkerCore<ModelTypes>>,
-    stored: BTreeSet<Page>,
+    stored: Store,
+}
+
+/// A node's published pages, bounded by least-recently-used eviction (racer-sim keeps a
+/// bounded page set too; the real disk index arrives in a later phase).
+#[derive(Default)]
+struct Store {
+    /// 0 is unbounded.
+    capacity: usize,
+    clock: u64,
+    used: BTreeMap<Page, u64>,
+    order: BTreeMap<u64, Page>,
+}
+
+impl Store {
+    fn new(capacity: usize) -> Self {
+        Self {
+            capacity,
+            ..Self::default()
+        }
+    }
+
+    fn contains(&self, page: &Page) -> bool {
+        self.used.contains_key(page)
+    }
+
+    /// Mark `page` used; `false` when it is not stored.
+    fn touch(&mut self, page: Page) -> bool {
+        let Some(at) = self.used.get_mut(&page) else {
+            return false;
+        };
+        self.order.remove(at);
+        self.clock += 1;
+        *at = self.clock;
+        self.order.insert(self.clock, page);
+        true
+    }
+
+    /// Store `page`; returns how many pages were evicted to make room.
+    fn insert(&mut self, page: Page) -> u64 {
+        if self.touch(page) {
+            return 0;
+        }
+        self.clock += 1;
+        self.used.insert(page, self.clock);
+        self.order.insert(self.clock, page);
+        let mut evicted = 0;
+        while self.capacity != 0 && self.used.len() > self.capacity {
+            let (_, old) = self.order.pop_first().expect("non-empty");
+            self.used.remove(&old);
+            evicted += 1;
+        }
+        evicted
+    }
+
+    fn len(&self) -> usize {
+        self.used.len()
+    }
 }
 
 /// A running Model world.
@@ -282,7 +347,7 @@ impl<'s> Model<'s> {
                 cores: (0..workers)
                     .map(|worker| core(node, worker, workers, &members, &placement, base))
                     .collect(),
-                stored: BTreeSet::new(),
+                stored: Store::new(spec.stored_pages),
             })
             .collect();
         Self {
@@ -355,7 +420,7 @@ impl<'s> Model<'s> {
         match event {
             Ev::Read { node, page } => {
                 self.trace.record(now, TAG_EVENT, 1, u64::from(node));
-                if self.nodes[node as usize].stored.contains(&page) {
+                if self.nodes[node as usize].stored.touch(page) {
                     self.report.counters.local_hits += 1;
                     self.report.counters.reads_completed += 1;
                     self.report.latency(0);
@@ -479,6 +544,11 @@ impl<'s> Model<'s> {
             column_mate: false,
         };
         let served = core.serve(&page, request, &view, at);
+        *self
+            .report
+            .coverage
+            .entry(served_name(&served))
+            .or_default() += 1;
         let decision = match served {
             Served::Defer(_) => {
                 self.report.counters.deferrals += 1;
@@ -492,7 +562,10 @@ impl<'s> Model<'s> {
                 self.reply(&asker, to, ResponseKind::Overloaded)
             }
             Decision::Reject(_) | Decision::Miss => self.reply(&asker, to, ResponseKind::Miss),
-            _ if stored => self.send_page(asker, to, page),
+            _ if stored => {
+                self.nodes[to as usize].stored.touch(page);
+                self.send_page(asker, to, page)
+            }
             Decision::CopyOnly { .. } => self.reply(&asker, to, ResponseKind::Miss),
             Decision::Acquire => {
                 let budget = AcquisitionBudgetSpec {
@@ -527,6 +600,9 @@ impl<'s> Model<'s> {
             .transfer(now, &[to, asker.from], self.spec.page_bytes);
         self.report.counters.peer_bytes += self.spec.page_bytes;
         self.report.counters.peer_pages += 1;
+        if !owners(&self.placement, &self.members, page).contains(&to) {
+            self.report.counters.helper_copies += 1;
+        }
         self.engine.at(end, Ev::BodyEnd { body: key });
         self.engine.at(
             end,
@@ -567,6 +643,11 @@ impl<'s> Model<'s> {
     /// world, never a choice of where to go next.
     fn dispatch(&mut self, node: u32, worker: u32, effects: Vec<Effect<ModelTypes>>) {
         for effect in effects {
+            *self
+                .report
+                .coverage
+                .entry(effect_name(&effect))
+                .or_default() += 1;
             if let Some(id) = effect.id()
                 && !self.answered.insert((node, worker, id))
             {
@@ -698,13 +779,27 @@ impl<'s> Model<'s> {
                         now,
                         page.object,
                         self.spec.page_bytes,
-                        OriginErrors::default(),
+                        self.spec.origin_errors,
                     );
-                    let result = if outcome == OriginOutcome::Ok {
-                        self.report.counters.origin_bytes += self.spec.page_bytes;
-                        Ok(())
-                    } else {
-                        Err(Error::Unavailable)
+                    // racer-sim's mapping (`sim/src/node/world.rs`, origin completion).
+                    let c = &mut self.report.counters;
+                    let result = match outcome {
+                        OriginOutcome::Ok => {
+                            c.origin_bytes += self.spec.page_bytes;
+                            Ok(())
+                        }
+                        OriginOutcome::PreconditionFailed => {
+                            c.origin_412 += 1;
+                            Err(Error::VersionUnavailable)
+                        }
+                        OriginOutcome::Forbidden => {
+                            c.origin_403 += 1;
+                            Err(Error::OriginForbidden)
+                        }
+                        OriginOutcome::ServerError => {
+                            c.origin_5xx += 1;
+                            Err(Error::Unavailable)
+                        }
                     };
                     self.engine
                         .at(at, input(read, Input::Origin { id, result }));
@@ -712,7 +807,8 @@ impl<'s> Model<'s> {
                 Acq::Publish { id, .. } => {
                     self.report.counters.disk_writes += 1;
                     let at = self.fabric.disk_write(now, node, self.spec.page_bytes);
-                    self.nodes[node as usize].stored.insert(page);
+                    let evicted = self.nodes[node as usize].stored.insert(page);
+                    self.report.counters.evictions += evicted;
                     self.engine
                         .at(at, input(read, Input::Published { id, result: Ok(()) }));
                 }
@@ -788,6 +884,9 @@ impl<'s> Model<'s> {
             self.violation(format!("{} of {} reads ended", ended, self.expected_reads));
         }
         for (n, node) in self.nodes.iter().enumerate() {
+            let stored = node.stored.len() as u64;
+            let max = &mut self.report.counters.stored_pages_max;
+            *max = (*max).max(stored);
             for (w, core) in node.cores.iter().enumerate() {
                 if core.flights() + core.requests() + core.reads() != 0 {
                     let message = format!(
@@ -809,6 +908,63 @@ impl<'s> Model<'s> {
         if !self.bodies.is_empty() {
             self.violation(format!("{} bodies never ended", self.bodies.len()));
         }
+    }
+}
+
+/// The coverage name of an effect: the variant path, exhaustively, so a new core variant fails
+/// to compile here until the coverage-parity list (`coverage::EFFECTS`) names it.
+pub fn effect_name(effect: &Effect<ModelTypes>) -> &'static str {
+    use acquisition::Io as Acq;
+    use racer_core::read::window::{Effect as Win, Next};
+    match effect {
+        Effect::Acquisition { effect, .. } => match effect {
+            Acq::Rank { .. } => "Acquisition::Rank",
+            Acq::Hints { .. } => "Acquisition::Hints",
+            Acq::Hedge { .. } => "Acquisition::Hedge",
+            Acq::Refresh { .. } => "Acquisition::Refresh",
+            Acq::Send { .. } => "Acquisition::Send",
+            Acq::Validate { .. } => "Acquisition::Validate",
+            Acq::Batch { .. } => "Acquisition::Batch",
+            Acq::Sleep { .. } => "Acquisition::Sleep",
+            Acq::Origin { .. } => "Acquisition::Origin",
+            Acq::Publish { .. } => "Acquisition::Publish",
+        },
+        Effect::Window { effect, .. } => match effect {
+            Win::Probe { .. } => "Window::Probe",
+            Win::Fetch { .. } => "Window::Fetch",
+            Win::Select { .. } => "Window::Select",
+            Win::Hold { .. } => "Window::Hold",
+            Win::SpillFill { .. } => "Window::SpillFill",
+            Win::Release(_) => "Window::Release",
+            Win::Discard(_) => "Window::Discard",
+        },
+        Effect::Deliver { next, .. } => match next {
+            Next::End => "Deliver::End",
+            Next::Wait => "Deliver::Wait",
+            Next::Page { .. } => "Deliver::Page",
+            Next::Fail(_) => "Deliver::Fail",
+        },
+        Effect::Worker { msg, .. } => match msg {
+            WorkerMsg::Fetch { .. } => "Worker::Fetch",
+            WorkerMsg::Fetched { .. } => "Worker::Fetched",
+        },
+        Effect::Completed { result: Ok(()), .. } => "Completed::Ok",
+        Effect::Completed { result: Err(_), .. } => "Completed::Err",
+        Effect::Metadata { .. } => "Metadata",
+        Effect::MetadataReady { result: Ok(_), .. } => "MetadataReady::Ok",
+        Effect::MetadataReady { result: Err(_), .. } => "MetadataReady::Err",
+    }
+}
+
+/// The coverage name of a serve-side outcome.
+fn served_name(served: &Served) -> &'static str {
+    match served {
+        Served::Defer(_) => "Served::Defer",
+        Served::Decided(Decision::Reject(_)) => "Served::Reject",
+        Served::Decided(Decision::Miss) => "Served::Miss",
+        Served::Decided(Decision::Shed) => "Served::Shed",
+        Served::Decided(Decision::CopyOnly { .. }) => "Served::CopyOnly",
+        Served::Decided(Decision::Acquire) => "Served::Acquire",
     }
 }
 
@@ -937,4 +1093,35 @@ pub fn run(scenario: &Scenario, choices: Choices) -> (Outcome, Value) {
         },
         report,
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn page(number: u32) -> Page {
+        Page { object: 0, number }
+    }
+
+    #[test]
+    fn store_evicts_the_least_recently_used_page() {
+        let mut store = Store::new(2);
+        assert_eq!(store.insert(page(1)), 0);
+        assert_eq!(store.insert(page(2)), 0);
+        assert!(store.touch(page(1)));
+        assert_eq!(store.insert(page(3)), 1);
+        assert!(store.contains(&page(1)) && store.contains(&page(3)));
+        assert!(!store.contains(&page(2)) && !store.touch(page(2)));
+        assert_eq!(store.insert(page(3)), 0, "a re-publish refreshes");
+        assert_eq!(store.len(), 2);
+    }
+
+    #[test]
+    fn an_unbounded_store_never_evicts() {
+        let mut store = Store::new(0);
+        for n in 0..100 {
+            assert_eq!(store.insert(page(n)), 0);
+        }
+        assert_eq!(store.len(), 100);
+    }
 }
