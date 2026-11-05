@@ -4261,8 +4261,13 @@ fn assembled_peer_io_carries_maximum_client_context_over_eight_signed_links() {
             )
         })
         .unwrap();
+        let (auth, length) = decode_envelope(
+            received.value,
+            false,
+            crate::peer::protocol::chains(&received.connection).unwrap(),
+        )
+        .unwrap();
         sockets.push((sent.connection, received.connection));
-        let (auth, length) = decode_envelope(received.value, false).unwrap();
         assert_eq!(length, 0);
         assert_eq!(auth.hops.len(), index - 1);
         let decoded = codec.request(auth, &scope).unwrap();
@@ -4325,7 +4330,12 @@ fn assembled_peer_io_carries_maximum_client_context_over_eight_signed_links() {
             )
         })
         .unwrap();
-        let (auth, _) = decode_envelope(received.value, true).unwrap();
+        let (auth, _) = decode_envelope(
+            received.value,
+            true,
+            crate::peer::protocol::chains(&received.connection).unwrap(),
+        )
+        .unwrap();
         let verified = forwarding[index - 1]
             .verify_response(
                 codec.response(auth, vec![], &scope).unwrap(),

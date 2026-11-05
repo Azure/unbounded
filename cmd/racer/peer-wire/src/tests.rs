@@ -277,7 +277,7 @@ fn object_context_signature_base_vector_and_proof_preserve_opaque_bytes() {
 
     push(&mut head, "racer-timestamp", "1700000000123");
     push(&mut head, "racer-signer", node(0).0);
-    let params = "(\"@method\" \"@request-target\" \"authorization\" \"content-length\" \"host\" \"racer-metadata\" \"racer-signer\" \"racer-timestamp\");created=1700000000;keyid=\"00000000-1111-4111-8111-111111111111\";alg=\"ed25519\";tag=\"racer-peer-v1\"";
+    let params = "(\"@method\" \"@request-target\" \"authorization\" \"content-length\" \"host\" \"racer-metadata\" \"racer-signer\" \"racer-timestamp\");created=1700000000;keyid=\"00000000-1111-4111-8111-111111111111\";alg=\"ed25519\";tag=\"racer-peer-v2\"";
     push(&mut head, "signature-input", format!("racer={params}"));
     let mut expected = b"\"@method\": GET\n\"@request-target\": /v1/objects/abababababababababababababababababababababababababababababababab\n\"authorization\": Bearer \xff\n\"content-length\": 0\n\"host\": racer\n\"racer-metadata\": a,\\b\x80\n\"racer-signer\": 00000000-1111-4111-8111-111111111111\n\"racer-timestamp\": 1700000000123\n\"@signature-params\": ".to_vec();
     expected.extend_from_slice(params.as_bytes());
@@ -289,7 +289,12 @@ fn object_context_signature_base_vector_and_proof_preserve_opaque_bytes() {
     let signed = n[0].sign(head).unwrap();
     let digest = signed_digest(&signed).unwrap();
     let encoded = encode_signed(&signed).unwrap();
-    let decoded = decode_signed(&encoded).unwrap();
+    let mut decoded = decode_signed(&encoded).unwrap();
+    assert!(
+        n[1].verify_proof(decode_signed(&encoded).unwrap()).is_err(),
+        "unresolved chain"
+    );
+    resolve(&mut decoded, &test_util::AnyChain).unwrap();
     assert_eq!(signed_digest(&decoded).unwrap(), digest);
     let verified = n[1].verify_proof(decoded).unwrap();
     assert_eq!(
@@ -302,6 +307,7 @@ fn object_context_signature_base_vector_and_proof_preserve_opaque_bytes() {
     );
     for name in ["racer-metadata", "authorization"] {
         let mut tampered = decode_signed(&encoded).unwrap();
+        resolve(&mut tampered, &test_util::AnyChain).unwrap();
         let value = &mut tampered
             .head
             .headers
@@ -328,14 +334,14 @@ fn rfc9421_exact_request_and_response_signature_base_vectors() {
     push(&mut request, "racer-timestamp", "1700000000123");
     push(&mut request, "racer-signer", node(0).0);
     push(&mut request, "content-length", "0");
-    let params = "(\"@method\" \"@request-target\" \"content-length\" \"host\" \"racer-signer\" \"racer-timestamp\");created=1700000000;keyid=\"00000000-1111-4111-8111-111111111111\";alg=\"ed25519\";tag=\"racer-peer-v1\"";
+    let params = "(\"@method\" \"@request-target\" \"content-length\" \"host\" \"racer-signer\" \"racer-timestamp\");created=1700000000;keyid=\"00000000-1111-4111-8111-111111111111\";alg=\"ed25519\";tag=\"racer-peer-v2\"";
     push(&mut request, "signature-input", format!("racer={params}"));
     assert_eq!(signature_base(&request).unwrap(), format!("\"@method\": POST\n\"@request-target\": /racer/peer/v1?attempt=1\n\"content-length\": 0\n\"host\": \n\"racer-signer\": 00000000-1111-4111-8111-111111111111\n\"racer-timestamp\": 1700000000123\n\"@signature-params\": {params}").as_bytes());
     request.start = StartLine::Response { status: 200 };
     request
         .headers
         .retain(|h| h.name != "signature-input" && h.name != "host");
-    let params = "(\"@status\" \"content-length\" \"racer-signer\" \"racer-timestamp\");created=1700000000;keyid=\"00000000-1111-4111-8111-111111111111\";alg=\"ed25519\";tag=\"racer-peer-v1\"";
+    let params = "(\"@status\" \"content-length\" \"racer-signer\" \"racer-timestamp\");created=1700000000;keyid=\"00000000-1111-4111-8111-111111111111\";alg=\"ed25519\";tag=\"racer-peer-v2\"";
     push(&mut request, "signature-input", format!("racer={params}"));
     assert_eq!(signature_base(&request).unwrap(), format!("\"@status\": 200\n\"content-length\": 0\n\"racer-signer\": 00000000-1111-4111-8111-111111111111\n\"racer-timestamp\": 1700000000123\n\"@signature-params\": {params}").as_bytes());
 }
@@ -344,12 +350,16 @@ fn rfc9421_exact_request_and_response_signature_base_vectors() {
 fn ed25519_rfc9421_base_tamper_replay_and_receiver_challenge() {
     let n = network(3, &racer_io::WorkerCtx::host());
     let original = n[0].sign(head()).unwrap();
-    let clone = || decode_signed(&encode_signed(&original).unwrap()).unwrap();
+    let clone = || {
+        let mut copy = decode_signed(&encode_signed(&original).unwrap()).unwrap();
+        resolve(&mut copy, &test_util::AnyChain).unwrap();
+        copy
+    };
     let base = String::from_utf8(signature_base(&original.head).unwrap()).unwrap();
     assert!(base.starts_with(
         "\"@method\": POST\n\"@request-target\": /racer/peer/v1\n\"content-length\": 0\n"
     ));
-    assert!(base.ends_with(";alg=\"ed25519\";tag=\"racer-peer-v1\""));
+    assert!(base.ends_with(";alg=\"ed25519\";tag=\"racer-peer-v2\""));
     for h in &original.head.headers {
         let mut tamper = clone();
         tamper
@@ -422,8 +432,12 @@ fn envelope_limits_and_canonical_fields_preserve_exact_bytes() {
         hops: vec![],
     };
     for length in [0, MAX_BODY] {
-        let (decoded, actual) =
-            decode_envelope(encode_envelope(&auth, true, length).unwrap(), true).unwrap();
+        let (decoded, actual) = decode_envelope(
+            encode_envelope(&auth, true, length).unwrap(),
+            true,
+            &test_util::AnyChain,
+        )
+        .unwrap();
         assert_eq!(actual, length);
         assert_eq!(encode_signed(&decoded.original).unwrap(), encoded);
     }
@@ -431,17 +445,17 @@ fn envelope_limits_and_canonical_fields_preserve_exact_bytes() {
     assert!(encode_envelope(&auth, false, 1).is_err());
     for (name, value) in [
         ("content-length", "00"),
-        ("racer-peer-version", "2"),
+        ("racer-peer-version", "1"),
         ("racer-hop-1", "AAAA"),
     ] {
         let mut bad = encode_envelope(&auth, false, 0).unwrap();
         bad.headers.retain(|h| h.name != name);
         push(&mut bad, name, value);
-        assert!(decode_envelope(bad, false).is_err());
+        assert!(decode_envelope(bad, false, &test_util::AnyChain).is_err());
     }
     let mut duplicate = encode_envelope(&auth, false, 0).unwrap();
     push(&mut duplicate, "Content-Length", 0);
-    assert!(decode_envelope(duplicate, false).is_err());
+    assert!(decode_envelope(duplicate, false, &test_util::AnyChain).is_err());
     let mut trailing = STANDARD.decode(&encoded).unwrap();
     trailing.extend_from_slice(b"extra");
     assert!(decode_signed(STANDARD.encode(trailing).as_bytes()).is_err());
@@ -599,7 +613,7 @@ fn request_builders_supply_host_for_strict_http_codec() {
     };
     let envelope = encode_envelope(&auth, false, 0).unwrap();
     assert_eq!(envelope.unique("host").unwrap(), Some(b"".as_slice()));
-    decode_envelope(envelope, false).unwrap();
+    decode_envelope(envelope, false, &test_util::AnyChain).unwrap();
     let binding = Binding {
         request: [1; 32],
         response: [2; 32],
@@ -874,5 +888,5 @@ fn overloaded_head_is_exact_and_bodiless() {
     });
     assert!(!is_overloaded(&extra));
     // A signed envelope is never mistaken for it, and it never decodes as one.
-    assert!(decode_envelope(overloaded_head(), true).is_err());
+    assert!(decode_envelope(overloaded_head(), true, &test_util::AnyChain).is_err());
 }

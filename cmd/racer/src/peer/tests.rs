@@ -238,7 +238,11 @@ mod body_progress {
                     crate::peer::protocol::accept(&io, conn, signers[2].clone(), &server_scope)
                         .await?;
                 let received = io.receive_head(conn, &server_scope).await?;
-                let (head, _) = decode_envelope(received.value, false)?;
+                let (head, _) = decode_envelope(
+                    received.value,
+                    false,
+                    crate::peer::protocol::chains(&received.connection)?,
+                )?;
                 let remote_auth = Forwarding::new(signers[2].clone());
                 let req =
                     remote_auth.verify_request(codec(&admission).request(head, &server_scope)?)?;
@@ -905,7 +909,12 @@ mod destination_disconnect {
                     assert_eq!(reactor.in_flight(), 0, "success must fence the FIN watch");
                     let received =
                         drive(&reactor, io.receive_head(client.connection, &parent)).unwrap();
-                    let (head, length) = decode_envelope(received.value, true).unwrap();
+                    let (head, length) = decode_envelope(
+                        received.value,
+                        true,
+                        crate::peer::protocol::chains(&received.connection).unwrap(),
+                    )
+                    .unwrap();
                     assert_eq!(length, result.ciphertext.bytes().len());
                     let mut connection = received.connection;
                     let mut bytes = Vec::new();
@@ -1218,7 +1227,11 @@ mod encrypted_http {
                     }
                 };
                 let received = ios[1].receive_head(conn, &scope).await?;
-                let (head, _) = decode_envelope(received.value, false)?;
+                let (head, _) = decode_envelope(
+                    received.value,
+                    false,
+                    crate::peer::protocol::chains(&received.connection)?,
+                )?;
                 let request = auth.verify_request(codec(&admissions[1]).request(head, &scope)?)?;
                 let index = usize::from(attempt == 2 || attempt == 4);
                 let ciphertext = &pages[index];
@@ -1622,7 +1635,11 @@ mod requester_safety {
             let conn = crate::http::from_accepted(fd, &admission)?;
             let conn = connection::accept(&io, conn, signers[2].clone(), &scope).await?;
             let received = io.receive_head(conn, &scope).await?;
-            let (head, length) = decode_envelope(received.value, false)?;
+            let (head, length) = decode_envelope(
+                received.value,
+                false,
+                crate::peer::protocol::chains(&received.connection)?,
+            )?;
             assert_eq!(length, 0);
             let auth = Forwarding::new(signers[2].clone());
             let request = auth.verify_request(codec.request(head, &scope)?)?;
@@ -1935,6 +1952,7 @@ mod subscriptions {
             let (first, _) = decode_envelope(
                 encode_envelope(&first.authentication, false, 0).unwrap(),
                 false,
+                &peer_wire::test_util::AnyChain,
             )
             .unwrap();
             let mut first =
@@ -1976,6 +1994,7 @@ mod subscriptions {
             let (encoded, length) = decode_envelope(
                 encode_envelope(&second.authentication, true, body.len()).unwrap(),
                 true,
+                &peer_wire::test_util::AnyChain,
             )
             .unwrap();
             assert_eq!(length, 19);
@@ -2143,6 +2162,7 @@ mod subscriptions {
         let (wire, _) = decode_envelope(
             encode_envelope(&signed.authentication, false, 0).unwrap(),
             false,
+            &peer_wire::test_util::AnyChain,
         )
         .unwrap();
         let mut work = server.dispatch(codec(&admission).request(wire, &scope).unwrap(), &scope);
@@ -2212,6 +2232,7 @@ mod subscriptions {
         let (wire, _) = decode_envelope(
             encode_envelope(&signed.authentication, false, 0).unwrap(),
             false,
+            &peer_wire::test_util::AnyChain,
         )
         .unwrap();
         let mut work = server.dispatch(
@@ -2996,7 +3017,11 @@ mod timing {
             let auth = Forwarding::new(signers[2].clone());
             for attempt in 0..3 {
                 let received = io.receive_head(connection, &scope).await?;
-                let (head, _) = decode_envelope(received.value, false)?;
+                let (head, _) = decode_envelope(
+                    received.value,
+                    false,
+                    crate::peer::protocol::chains(&received.connection)?,
+                )?;
                 let request = auth.verify_request(codec(&admission).request(head, &scope)?)?;
                 let mut response = auth.sign_response(
                     request.binding(),

@@ -573,6 +573,7 @@ pub(crate) mod tests {
             let replay = SignedHead {
                 head: verified.signed.head,
                 signature: verified.signed.signature,
+                chain: verified.signed.chain,
             };
             signatures.verify_proof(replay).unwrap();
             let mut tampered = signatures.sign(head()).unwrap();

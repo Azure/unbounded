@@ -910,9 +910,23 @@ pub fn encode_envelope(
 ) -> Result<MessageHead> {
     peer_wire::encode_envelope(authentication, response, body_length).map_err(Into::into)
 }
-/// Decode framing only; proof verification and socket replay admission are separate.
-pub fn decode_envelope(head: MessageHead, response: bool) -> Result<(ForwardedHead, usize)> {
-    peer_wire::decode_envelope(head, response).map_err(Into::into)
+/// Decode framing and resolve each proof's chain from the carrying session, which
+/// admitted the head; proof verification is separate.
+pub fn decode_envelope(
+    head: MessageHead,
+    response: bool,
+    chains: &dyn peer_wire::Chains,
+) -> Result<(ForwardedHead, usize)> {
+    peer_wire::decode_envelope(head, response, chains).map_err(Into::into)
+}
+/// The session of a connection that delivered a head, which resolves its chains.
+/// Every production peer exchange runs on a session; a missing one is a fault.
+pub(crate) fn chains(connection: &crate::http::ConnectionLease) -> Result<&Session> {
+    connection
+        .state()
+        .session
+        .as_ref()
+        .ok_or(Error::Unauthorized)
 }
 pub(crate) fn encode_signed(head: &SignedHead) -> Result<Vec<u8>> {
     peer_wire::encode_signed(head).map_err(Into::into)
@@ -1968,17 +1982,27 @@ pub(crate) mod tests {
 
     mod envelope_tests {
         use super::*;
+        fn fixture_chain() -> Arc<peer_wire::Chain> {
+            peer_wire::Chain::decode(&[0, 0, 0, 1, 0]).unwrap()
+        }
         fn envelope() -> ForwardedHead {
             ForwardedHead {
                 original: Arc::new(SignedHead {
                     head: MessageHead {
                         start: StartLine::Response { status: 404 },
-                        headers: vec![Header {
-                            name: "racer-opaque".into(),
-                            value: b"AAEC/w==".to_vec(),
-                        }],
+                        headers: vec![
+                            Header {
+                                name: "racer-opaque".into(),
+                                value: b"AAEC/w==".to_vec(),
+                            },
+                            Header {
+                                name: "racer-certificate".into(),
+                                value: binary(fixture_chain().fingerprint()).into_bytes(),
+                            },
+                        ],
                     },
                     signature: vec![7; 64],
+                    chain: None,
                 }),
                 hops: vec![],
             }
@@ -1986,31 +2010,35 @@ pub(crate) mod tests {
         #[test]
         fn envelope_preserves_signature_and_opaque_headers() {
             let original = envelope();
-            let (decoded, length) =
-                decode_envelope(encode_envelope(&original, true, 27).unwrap(), true).unwrap();
+            let (decoded, length) = decode_envelope(
+                encode_envelope(&original, true, 27).unwrap(),
+                true,
+                &peer_wire::test_util::AnyChain,
+            )
+            .unwrap();
             assert_eq!(length, 27);
             assert_eq!(decoded.original.signature, original.original.signature);
             assert_eq!(decoded.original.head.headers[0].value, b"AAEC/w==");
         }
         #[test]
         fn rejects_versions_duplicates_holes_and_request_bodies() {
-            for version in ["0", "2", "3", "10"] {
+            for version in ["0", "1", "3", "10"] {
                 let mut head = encode_envelope(&envelope(), false, 0).unwrap();
                 head.headers[0].value = version.as_bytes().to_vec();
-                assert!(decode_envelope(head, false).is_err());
+                assert!(decode_envelope(head, false, &peer_wire::test_util::AnyChain).is_err());
             }
             let mut head = encode_envelope(&envelope(), false, 0).unwrap();
             head.headers.push(Header {
                 name: "Content-Length".into(),
                 value: b"0".to_vec(),
             });
-            assert!(decode_envelope(head, false).is_err());
+            assert!(decode_envelope(head, false, &peer_wire::test_util::AnyChain).is_err());
             let mut head = encode_envelope(&envelope(), false, 0).unwrap();
             head.headers.push(Header {
                 name: "racer-hop-1".into(),
                 value: encode_signed(&envelope().original).unwrap(),
             });
-            assert!(decode_envelope(head, false).is_err());
+            assert!(decode_envelope(head, false, &peer_wire::test_util::AnyChain).is_err());
             assert!(encode_envelope(&envelope(), false, 1).is_err());
             assert!(encode_envelope(&envelope(), true, usize::MAX).is_err());
         }
@@ -2124,8 +2152,8 @@ pub(crate) mod tests {
             let n = crate::test_support::security::network(3);
             let id = random().unwrap();
             (
-                peer_wire::test_util::session(n[0].inner.clone(), n[1].node().clone(), id, 0),
-                peer_wire::test_util::session(n[1].inner.clone(), n[0].node().clone(), id, 1),
+                peer_wire::test_util::session(n[0].inner.clone(), &n[1].inner, id, 0),
+                peer_wire::test_util::session(n[1].inner.clone(), &n[0].inner, id, 1),
             )
         }
         pub(crate) fn signer(session: &Session) -> Rc<Signatures> {
@@ -2177,7 +2205,8 @@ pub(crate) mod tests {
                 let wire = a.sign(encode_envelope(&auth, false, 0).unwrap()).unwrap();
                 let copy = clone_head(&wire);
                 let decoded = b.admit(wire).unwrap();
-                let (retained, _) = decode_envelope(decoded, false).unwrap();
+                let (retained, _) =
+                    decode_envelope(decoded, false, &peer_wire::test_util::AnyChain).unwrap();
                 assert_eq!(retained.original.signature, proof.signature);
                 assert_eq!(b.rx, sequence);
                 if let Some(old) = previous {
@@ -2209,9 +2238,9 @@ pub(crate) mod tests {
             let (mut a, mut b) = pair();
             let id = random().unwrap();
             let mut other_a =
-                peer_wire::test_util::session(a.signatures.clone(), a.peer.clone(), id, 0);
+                peer_wire::test_util::session(a.signatures.clone(), &b.signatures, id, 0);
             let mut other_b =
-                peer_wire::test_util::session(b.signatures.clone(), b.peer.clone(), id, 1);
+                peer_wire::test_util::session(b.signatures.clone(), &a.signatures, id, 1);
             let old = a.sign(frame()).unwrap();
             b.admit(clone_head(&old)).unwrap();
             assert!(other_b.admit(clone_head(&old)).is_err());
@@ -2827,7 +2856,7 @@ pub(crate) mod tests {
             let decoded = decode_deadline(encoded).unwrap();
             assert_eq!(encode_deadline(decoded).unwrap(), encoded);
             assert!(decoded.0 <= deadline.0);
-            assert_eq!(MAX_HEAD, MAX_SIGNED_HEAD);
+            const { assert!(MAX_SIGNED_HEAD <= MAX_HEAD) };
         }
     }
 

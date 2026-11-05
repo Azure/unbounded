@@ -22,6 +22,7 @@ fn signed_opaque_relay_roundtrip_and_exact_attempt_binding() {
     let (envelope, _) = decode_envelope(
         encode_envelope(&signed.authentication, false, 0).unwrap(),
         false,
+        &peer_wire::test_util::AnyChain,
     )
     .unwrap();
     let verified = auth[1]
@@ -52,6 +53,7 @@ fn signed_opaque_relay_roundtrip_and_exact_attempt_binding() {
     let (envelope, _) = decode_envelope(
         encode_envelope(&forwarded.authentication, false, 0).unwrap(),
         false,
+        &peer_wire::test_util::AnyChain,
     )
     .unwrap();
     let admitted = auth[2]
@@ -69,6 +71,7 @@ fn signed_opaque_relay_roundtrip_and_exact_attempt_binding() {
     let (envelope, _) = decode_envelope(
         encode_envelope(&reply.authentication, true, 0).unwrap(),
         true,
+        &peer_wire::test_util::AnyChain,
     )
     .unwrap();
     let decoded = codec.response(envelope, vec![], &scope).unwrap();
@@ -202,7 +205,8 @@ fn not_found_is_authenticated_through_relay_and_restricted_to_fresh_acquire() {
             envelope.start,
             StartLine::Response { status: 200 }
         ));
-        let (envelope, length) = decode_envelope(envelope, true).unwrap();
+        let (envelope, length) =
+            decode_envelope(envelope, true, &peer_wire::test_util::AnyChain).unwrap();
         assert_eq!(length, 0);
         let decoded = codec.response(envelope, vec![], &scope).unwrap();
         let (_, other) = auth[0]
@@ -287,6 +291,7 @@ fn changed_operation_credentials_replay_and_deadlines_fail() {
     let (envelope, _) = decode_envelope(
         encode_envelope(&signed.authentication, false, 0).unwrap(),
         false,
+        &peer_wire::test_util::AnyChain,
     )
     .unwrap();
     receiver.verify_request(signed).unwrap();
@@ -503,7 +508,11 @@ fn relay_dispatch_preserves_reverse_path_and_fails_closed_on_link_loss() {
                 crate::peer::protocol::accept(&socket.io, connection, signers[2].clone(), &scope)
                     .await?;
             let received = socket.io.receive_head(connection, &scope).await?;
-            let (envelope, length) = decode_envelope(received.value, false)?;
+            let (envelope, length) = decode_envelope(
+                received.value,
+                false,
+                crate::peer::protocol::chains(&received.connection)?,
+            )?;
             assert_eq!(length, 0);
             let auth = Forwarding::new(signers[2].clone());
             let admitted = auth.verify_request(socket.codec.request(envelope, &scope)?)?;
@@ -708,6 +717,7 @@ fn equal_cost_signed_receiver_survives_wire_recompute_and_cache_eviction() {
         let (envelope, _) = decode_envelope(
             encode_envelope(&signed.authentication, false, 0).unwrap(),
             false,
+            &peer_wire::test_util::AnyChain,
         )
         .unwrap();
         let decoded = codec(&admission).request(envelope, &scope).unwrap();
@@ -1448,7 +1458,7 @@ fn real_http_ciphertext_fragmentation_pool_reuse_and_truncation() {
         for attempt in 0..3 {
             let mut received = io.receive_head(conn, &scope).await?;
             assert!(
-                transport::detach(&mut received.value)?.is_none(),
+                transport::detach(&mut received.value, &peer_wire::test_util::AnyChain)?.is_none(),
                 "no native control without capability"
             );
             conn = received.connection;
@@ -1855,7 +1865,8 @@ mod established_sessions {
                             | "racer-profile"
                             | "racer-cluster"
                             | "racer-signer"
-                            | "racer-certificates"
+                            | "racer-certificate"
+                            | "racer-chains"
                             | "racer-timestamp"
                     )
                 });

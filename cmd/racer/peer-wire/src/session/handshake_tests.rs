@@ -420,7 +420,7 @@ fn connect_rejects_signed_bad_challenge_and_ready_without_pooling() {
                 let (client, server) = h.pair(sim);
                 let (result, ()) = h.drive(join(h.connect(client, &h.scope), async {
                     let hello = h.io.receive_head(server, &h.scope).await.unwrap();
-                    let (_, a, zero) = verify_session(
+                    let (_, a, zero, _) = verify_session(
                         &h.identities[1],
                         &hello.value,
                         Some(h.identities[0].node()),
@@ -452,7 +452,7 @@ fn connect_rejects_signed_bad_challenge_and_ready_without_pooling() {
                     if phase == "ready" {
                         server.next_round().unwrap();
                         let finish = h.io.receive_head(server, &h.scope).await.unwrap();
-                        let (_, echoed, remote) = verify_session(
+                        let (_, echoed, remote, _) = verify_session(
                             &h.identities[1],
                             &finish.value,
                             Some(h.identities[0].node()),
@@ -522,7 +522,7 @@ fn accept_rejects_signed_bad_hello_and_finish_without_installing_session() {
                             .connection;
                     if phase == "finish" {
                         let challenge = h.io.receive_head(client, &h.scope).await.unwrap();
-                        let (_, echoed, b) = verify_session(
+                        let (_, echoed, b, _) = verify_session(
                             &h.identities[0],
                             &challenge.value,
                             Some(h.identities[1].node()),
@@ -586,7 +586,7 @@ fn cancellation_and_deadlines_abort_each_handshake_wait_and_release_slots() {
                                 return hello.connection;
                             }
                             clock.advance(Duration::from_secs(1));
-                            let (_, a, _) = verify_session(
+                            let (_, a, _, _) = verify_session(
                                 &h.identities[1],
                                 &hello.value,
                                 None,

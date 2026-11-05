@@ -3052,6 +3052,7 @@ mod landing {
                             headers: vec![],
                         },
                         signature: vec![],
+                        chain: None,
                     }),
                     hops: vec![],
                 },

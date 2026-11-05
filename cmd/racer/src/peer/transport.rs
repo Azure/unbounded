@@ -157,12 +157,20 @@ fn attach(head: &mut MessageHead, signed: &SignedHead) -> Result<()> {
     });
     Ok(())
 }
-pub(super) fn detach(head: &mut MessageHead) -> Result<Option<SignedHead>> {
+/// Remove the control proof and resolve its chain from the carrying session.
+pub(super) fn detach(
+    head: &mut MessageHead,
+    chains: &dyn peer_wire::Chains,
+) -> Result<Option<SignedHead>> {
     let value = head.unique(HEADER)?.map(|v| v.to_vec());
     head.headers
         .retain(|h| !h.name.eq_ignore_ascii_case(HEADER));
     value
-        .map(|v| super::protocol::decode_signed(&v))
+        .map(|v| {
+            let mut signed = super::protocol::decode_signed(&v)?;
+            peer_wire::resolve(&mut signed, chains)?;
+            Ok(signed)
+        })
         .transpose()
 }
 fn frame(signed: SignedHead) -> Result<MessageHead> {
@@ -176,8 +184,12 @@ fn frame(signed: SignedHead) -> Result<MessageHead> {
         0,
     )
 }
-fn unframe(head: MessageHead, response: bool) -> Result<SignedHead> {
-    let (auth, len) = decode_envelope(head, response)?;
+fn unframe(
+    head: MessageHead,
+    response: bool,
+    chains: &dyn peer_wire::Chains,
+) -> Result<SignedHead> {
+    let (auth, len) = decode_envelope(head, response, chains)?;
     if len != 0 || !auth.hops.is_empty() {
         return Err(Error::InvalidRequest);
     }
@@ -813,7 +825,11 @@ pub(crate) async fn link_exchange(
         let (verified, _) = peer_wire::link::RdmaLink::verify(
             signatures.wire(),
             Some(peer),
-            unframe(received.value, true)?,
+            unframe(
+                received.value,
+                true,
+                crate::peer::protocol::chains(&connection)?,
+            )?,
             true,
         )?;
         let (signed, verified_peer) = verified.into_parts();
@@ -1382,7 +1398,10 @@ impl Transfers {
                 // a requester's walk asks its helper.
                 return Err(Error::Overloaded);
             }
-            let control = detach(&mut received.value)?;
+            let control = detach(
+                &mut received.value,
+                crate::peer::protocol::chains(&received.connection)?,
+            )?;
             let relay_context = if relay.is_some() {
                 let size = received.value.headers.iter().try_fold(0usize, |n, h| {
                     n.checked_add(h.value.len() + h.name.len())
@@ -1396,7 +1415,11 @@ impl Transfers {
             } else {
                 None
             };
-            let (authentication, length) = decode_envelope(received.value, true)?;
+            let (authentication, length) = decode_envelope(
+                received.value,
+                true,
+                crate::peer::protocol::chains(&received.connection)?,
+            )?;
             if let Some(control) = control {
                 let (binding, accept, peer, pending) = native.ok_or(Error::Unauthorized)?;
                 let arriving = scope.clock().now();
@@ -2013,7 +2036,11 @@ mod tests {
                 let serve = async {
                     let b = p::accept(&server.io, b, signers[responder].clone(), &scope).await?;
                     let received = server.io.receive_head(b, &scope).await?;
-                    let (auth, length) = decode_envelope(received.value, false)?;
+                    let (auth, length) = decode_envelope(
+                        received.value,
+                        false,
+                        crate::peer::protocol::chains(&received.connection)?,
+                    )?;
                     assert_eq!(length, 0);
                     server
                         .serve_link(
@@ -2487,8 +2514,15 @@ mod tests {
                     attach(&mut initial, &p::decode_signed(&accept_wire)?)?;
                     let sent = receiver.io.send_head(a, initial, &scope).await?;
                     let mut received = receiver.io.receive_head(sent.connection, &scope).await?;
-                    let control = detach(&mut received.value)?;
-                    let (auth, length) = decode_envelope(received.value, true)?;
+                    let control = detach(
+                        &mut received.value,
+                        crate::peer::protocol::chains(&received.connection)?,
+                    )?;
+                    let (auth, length) = decode_envelope(
+                        received.value,
+                        true,
+                        crate::peer::protocol::chains(&received.connection)?,
+                    )?;
                     let Some(control) = control else {
                         // Plain HTTP: the sender released the grant.
                         let arrival = std::future::poll_fn(|cx| pending.poll_arrival(cx)).await;
@@ -2521,7 +2555,11 @@ mod tests {
                 let send = async {
                     let b = p::accept(&sender.io, b, signers[2].clone(), &scope).await?;
                     let mut received = sender.io.receive_head(b, &scope).await?;
-                    let control = detach(&mut received.value)?.ok_or(Error::Unauthorized)?;
+                    let control = detach(
+                        &mut received.value,
+                        crate::peer::protocol::chains(&received.connection)?,
+                    )?
+                    .ok_or(Error::Unauthorized)?;
                     let (verified, _) = binding.verify(
                         &signers[2],
                         signers[0].node(),
@@ -2921,7 +2959,9 @@ mod tests {
             }
         }
         fn copy(control: &SignedHead) -> SignedHead {
-            p::decode_signed(&p::encode_signed(control).unwrap()).unwrap()
+            let mut copy = p::decode_signed(&p::encode_signed(control).unwrap()).unwrap();
+            peer_wire::resolve(&mut copy, &peer_wire::test_util::AnyChain).unwrap();
+            copy
         }
         #[test]
         fn session_admitted_setup_grant_completion_still_require_exact_transfer_and_phase() {
@@ -2943,7 +2983,8 @@ mod tests {
                     .unwrap();
                 let signed = sender.sign(frame(control).unwrap()).unwrap();
                 let admitted = receiver.admit(signed).unwrap();
-                let control = unframe(admitted, phase.response()).unwrap();
+                let control =
+                    unframe(admitted, phase.response(), &peer_wire::test_util::AnyChain).unwrap();
                 let mut wrong = original.clone();
                 wrong.transfer.0[0] ^= 1;
                 assert!(

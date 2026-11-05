@@ -1961,6 +1961,7 @@ mod tests {
         let (auth, _) = decode_envelope(
             encode_envelope(&forwarded.authentication, false, 0).unwrap(),
             false,
+            &peer_wire::test_util::AnyChain,
         )
         .unwrap();
         let decoded = codec.request(auth, &scope).unwrap();
@@ -2176,6 +2177,7 @@ mod tests {
             let (auth, _) = decode_envelope(
                 encode_envelope(&signed.authentication, false, 0).unwrap(),
                 false,
+                &peer_wire::test_util::AnyChain,
             )
             .unwrap();
             let decoded = codec.request(auth, &scope).unwrap();

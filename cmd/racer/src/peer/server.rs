@@ -466,8 +466,15 @@ impl PeerServer {
                     .ok_or(Error::InvalidRequest)?
                     .max(1),
             )?;
-            let native_control = super::transport::detach(&mut received.value)?;
-            let (authentication, length) = decode_envelope(received.value, false)?;
+            let native_control = super::transport::detach(
+                &mut received.value,
+                crate::peer::protocol::chains(&received.connection)?,
+            )?;
+            let (authentication, length) = decode_envelope(
+                received.value,
+                false,
+                crate::peer::protocol::chains(&received.connection)?,
+            )?;
             if length != 0 {
                 return Err(Error::InvalidRequest);
             }

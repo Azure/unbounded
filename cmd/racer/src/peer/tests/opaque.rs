@@ -178,7 +178,11 @@ mod materialized_pairing {
             let mut previous = None;
             loop {
                 let received = ios[2].receive_head(conn, &scope).await?;
-                let (head, length) = decode_envelope(received.value, false)?;
+                let (head, length) = decode_envelope(
+                    received.value,
+                    false,
+                    crate::peer::protocol::chains(&received.connection)?,
+                )?;
                 assert_eq!(length, 0);
                 let request = auth.verify_request(codec(&admissions[2]).request(head, &scope)?)?;
                 let protocol::Operation::Page { page, .. } = &request.request().operation else {
@@ -312,7 +316,11 @@ mod materialized_pairing {
                         &scope,
                     )
                     .await?;
-                let (head, length) = decode_envelope(received.value, true)?;
+                let (head, length) = decode_envelope(
+                    received.value,
+                    true,
+                    crate::peer::protocol::chains(&received.connection)?,
+                )?;
                 assert_eq!(head.hops.len(), 1);
                 assert_eq!(length, pages[number].bytes().len());
                 conn = received.connection;
@@ -445,7 +453,11 @@ mod safety {
             let conn = crate::http::from_accepted(fd, &f.admissions[2])?;
             let conn = connection::accept(&f.ios[2], conn, f.signers[2].clone(), &f.scope).await?;
             let received = f.ios[2].receive_head(conn, &f.scope).await?;
-            let (head, length) = decode_envelope(received.value, false)?;
+            let (head, length) = decode_envelope(
+                received.value,
+                false,
+                crate::peer::protocol::chains(&received.connection)?,
+            )?;
             assert_eq!(length, 0);
             let request = Forwarding::new(f.signers[2].clone())
                 .verify_request(codec(&f.admissions[2]).request(head, &f.scope)?)?;
@@ -689,7 +701,11 @@ mod safety {
                 connection::accept(&f.ios[2], conn, f.signers[2].clone(), &f.scope).await?;
             for wrong in [true, false] {
                 let received = f.ios[2].receive_head(conn, &f.scope).await?;
-                let (head, _) = decode_envelope(received.value, false)?;
+                let (head, _) = decode_envelope(
+                    received.value,
+                    false,
+                    crate::peer::protocol::chains(&received.connection)?,
+                )?;
                 let auth = Forwarding::new(f.signers[2].clone());
                 let request =
                     auth.verify_request(codec(&f.admissions[2]).request(head, &f.scope)?)?;
@@ -753,7 +769,11 @@ mod safety {
                         &f.scope,
                     )
                     .await?;
-                let (head, size) = decode_envelope(received.value, true)?;
+                let (head, size) = decode_envelope(
+                    received.value,
+                    true,
+                    crate::peer::protocol::chains(&received.connection)?,
+                )?;
                 assert_eq!(head.hops.len(), 1);
                 assert_eq!(size, length + 16);
                 conn = received.connection;
@@ -1290,7 +1310,11 @@ impl RelayFixture {
             let mut conn = connection::accept(&ios[2], conn, signers[2].clone(), &scope).await?;
             for i in 0..rounds {
                 let received = ios[2].receive_head(conn, &scope).await?;
-                let (head, length) = decode_envelope(received.value, false)?;
+                let (head, length) = decode_envelope(
+                    received.value,
+                    false,
+                    crate::peer::protocol::chains(&received.connection)?,
+                )?;
                 assert_eq!(length, 0);
                 let request = codec(&admissions[2]).request(head, &scope)?;
                 let auth = Forwarding::new(signers[2].clone());
@@ -1409,7 +1433,11 @@ impl RelayFixture {
                         &scope,
                     )
                     .await?;
-                let (head, length) = decode_envelope(received.value, true)?;
+                let (head, length) = decode_envelope(
+                    received.value,
+                    true,
+                    crate::peer::protocol::chains(&received.connection)?,
+                )?;
                 assert_eq!(head.hops.len(), 1);
                 assert_eq!(length, body.len());
                 conn = received.connection;

@@ -977,6 +977,7 @@ pub(crate) mod security {
         SignedHead {
             head: codec.decode_head(&encoded).unwrap().unwrap().0,
             signature: head.signature.clone(),
+            chain: head.chain.clone(),
         }
     }
     pub fn identities(

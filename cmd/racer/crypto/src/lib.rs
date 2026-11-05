@@ -1046,11 +1046,12 @@ pub mod identity {
         }
     }
 
-    /// One exact chain validated against a specific immutable root snapshot.
+    /// One chain, keyed by its collision-resistant fingerprint, validated against
+    /// a specific immutable root snapshot.
     struct CachedPeer {
         roots: Arc<Vec<Vec<u8>>>,
 
-        chain: Vec<Vec<u8>>,
+        fingerprint: [u8; 32],
 
         node: NodeId,
 
@@ -1059,6 +1060,17 @@ pub mod identity {
         until: u64,
 
         checked: u64,
+    }
+
+    /// Length-prefixed digest of an exact chain for the validation cache.
+    fn chain_fingerprint(chain: &[Vec<u8>]) -> [u8; 32] {
+        let mut hash = Sha256::new();
+        hash.update(b"racer-crypto/certificate-chain\0");
+        for cert in chain {
+            hash.update((cert.len() as u64).to_be_bytes());
+            hash.update(cert);
+        }
+        hash.finalize().into()
     }
 
     impl VerifiedPeer {
@@ -1087,8 +1099,15 @@ pub mod identity {
             }
         }
 
-        /// Reuse exact-chain validation only while roots and time remain valid.
-        fn key(&self, chain: &[Vec<u8>], expected: &NodeId) -> Result<VerifyingKey> {
+        /// Reuse chain validation only while roots and time remain valid. The
+        /// fingerprint must be a collision-resistant digest the caller computed
+        /// from `chain` itself, never a value read from the wire.
+        fn key(
+            &self,
+            fingerprint: &[u8; 32],
+            chain: &[Vec<u8>],
+            expected: &NodeId,
+        ) -> Result<VerifyingKey> {
             let roots = self.keys.peer_trust_roots()?;
             let clock = self.keys.epochs.clock();
             let now = clock.unix_time().as_secs();
@@ -1098,20 +1117,20 @@ pub mod identity {
             });
             if let Some(entry) = cache
                 .iter()
-                .find(|entry| &entry.node == expected && entry.chain == chain)
+                .find(|entry| &entry.node == expected && &entry.fingerprint == fingerprint)
             {
                 return Ok(entry.key);
             }
             drop(cache);
             let verified = verify_chain(clock, &roots, chain, &self.cluster, expected)?;
             let mut cache = self.cache.lock().map_err(|_| Error::Unavailable)?;
-            // At most 64 exact, wire-bounded chains (4 MiB of chain bytes).
+            // At most 64 validated chain fingerprints.
             if cache.len() == 64 {
                 cache.pop_front();
             }
             cache.push_back(CachedPeer {
                 roots,
-                chain: chain.to_vec(),
+                fingerprint: *fingerprint,
                 node: expected.clone(),
                 key: verified.key,
                 until: verified.expires,
@@ -1126,7 +1145,7 @@ pub mod identity {
             if &self.cluster != self.keys.cluster() {
                 return Err(Error::Unauthorized);
             }
-            self.key(chain, expected)?;
+            self.key(&chain_fingerprint(chain), chain, expected)?;
             Ok(VerifiedPeer {
                 node: expected.clone(),
             })
@@ -1140,10 +1159,29 @@ pub mod identity {
             message: &[u8],
             signature: &[u8],
         ) -> Result<VerifiedPeer> {
+            self.verify_signed_fingerprint(
+                &chain_fingerprint(chain),
+                chain,
+                expected,
+                message,
+                signature,
+            )
+        }
+
+        /// Like [`Self::verify_signed`], reusing validation by a fingerprint that the
+        /// caller computed from `chain` with a collision-resistant digest.
+        pub fn verify_signed_fingerprint(
+            &self,
+            fingerprint: &[u8; 32],
+            chain: &[Vec<u8>],
+            expected: &NodeId,
+            message: &[u8],
+            signature: &[u8],
+        ) -> Result<VerifiedPeer> {
             if &self.cluster != self.keys.cluster() {
                 return Err(Error::Unauthorized);
             }
-            let key = self.key(chain, expected)?;
+            let key = self.key(fingerprint, chain, expected)?;
             key.verify_strict(message, signature)
                 .map_err(|_| Error::Unauthorized)?;
             Ok(VerifiedPeer {
