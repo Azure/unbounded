@@ -768,42 +768,6 @@ mod tests {
     use super::*;
     use futures::{channel::oneshot, task::noop_waker};
 
-    /// A polling panic returns admission before the task destructor submits a child.
-    #[test]
-    fn panic_releases_capacity_before_task_drop_and_queue_remains_usable() {
-        /// Panics while polling, then reenters its queue during destruction.
-        struct Panics;
-
-        impl Future for Panics {
-            /// This task has no application result.
-            type Output = ();
-
-            /// Inject a panic after the queue has transferred execution ownership.
-            fn poll(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<()> {
-                panic!("injected poll panic");
-            }
-        }
-
-        impl Drop for Panics {
-            /// Verify admission is available before submitting replacement work.
-            fn drop(&mut self) {
-                assert_eq!(pending(), 0);
-                reserve().unwrap().submit(Box::pin(async {}));
-            }
-        }
-        let queue = Rc::new(DriverQueue::new(1));
-        let _owner = queue.enter();
-        reserve().unwrap().submit_detached(Panics);
-        let mut cx = Context::from_waker(Waker::noop());
-        assert!(
-            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| queue.poll(&mut cx, 1)))
-                .is_err()
-        );
-        assert_eq!(pending(), 1);
-        queue.poll(&mut cx, 1);
-        assert_eq!(pending(), 0);
-    }
-
     /// Nested polling cannot steal the outer owner's notifications for ready backlog.
     #[test]
     fn budget_backlog_wakes_outer_owner_and_nested_poll_cannot_replace_it() {
@@ -856,42 +820,6 @@ mod tests {
         queue.poll(&mut Context::from_waker(&Waker::from(Arc::new(OnDrop))), 0);
         queue.poll(&mut Context::from_waker(Waker::noop()), 1);
         assert_eq!(pending(), 0);
-    }
-
-    /// A completed future's panicking destructor cannot retain queue admission.
-    #[test]
-    fn panicking_completed_task_destructor_does_not_leak_capacity() {
-        /// Completes normally, then panics while releasing its owned resources.
-        struct PanicsOnDrop;
-
-        impl Future for PanicsOnDrop {
-            /// Completion carries no application value.
-            type Output = ();
-
-            /// Finish immediately so destruction happens through the completion path.
-            fn poll(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<()> {
-                Poll::Ready(())
-            }
-        }
-
-        impl Drop for PanicsOnDrop {
-            /// Check released admission before injecting the destructor panic.
-            fn drop(&mut self) {
-                assert_eq!(pending(), 0);
-                panic!("injected destructor panic");
-            }
-        }
-        let queue = Rc::new(DriverQueue::new(1));
-        let _owner = queue.enter();
-        reserve().unwrap().submit_detached(PanicsOnDrop);
-        assert!(
-            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                queue.poll(&mut Context::from_waker(Waker::noop()), 1);
-            }))
-            .is_err()
-        );
-        assert_eq!(pending(), 0);
-        assert!(reserve().is_ok());
     }
 
     /// Detached results do not destroy their future before queue capacity is returned.
@@ -1515,20 +1443,14 @@ mod scheduler_tests {
         );
     }
 
-    /// Busy guards reject reentry and release exclusion during normal and panic paths.
+    /// Busy guards reject reentry and release exclusion on drop.
     #[test]
-    fn busy_excludes_reentry_and_releases_on_drop_and_unwind() {
+    fn busy_excludes_reentry_and_releases_on_drop() {
         let flag = Cell::new(false);
         let guard = Busy::try_enter(&flag).unwrap();
         assert!(matches!(Busy::try_enter(&flag), Err(Error::Overloaded)));
         assert!(flag.get());
         drop(guard);
-        assert!(!flag.get());
-        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            let _guard = Busy::try_enter(&flag).unwrap();
-            panic!("unwind");
-        }));
-        assert!(result.is_err());
         assert!(!flag.get());
         drop(Busy::try_enter(&flag).unwrap());
     }

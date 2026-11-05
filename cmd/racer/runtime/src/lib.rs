@@ -1223,63 +1223,6 @@ pub mod mailbox {
             assert!(mailbox.submit(2, String::new(), &scope, None).is_ok());
         }
 
-        /// Caller callbacks run outside queue locks and poisoned state remains disposable.
-        #[test]
-        fn queued_callbacks_reenter_and_panics_do_not_poison_disposal() {
-            let (mailbox, scope) = setup();
-            let receipt = mailbox.submit(1, String::new(), &scope, None).unwrap();
-            assert_eq!(mailbox.queued_min(|_| mailbox.outstanding()), Some(1));
-            assert!(
-                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    mailbox.queued_min::<usize>(|_| panic!("callback"));
-                }))
-                .is_err()
-            );
-            // Deliberately poison the internal mutex to exercise Drop recovery too.
-            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                let _guard = mailbox.state.lock().unwrap();
-                panic!("poison");
-            }));
-            drop(mailbox.take_queued());
-            drop(receipt);
-            assert_eq!(mailbox.outstanding(), 0);
-        }
-
-        /// Panicking caller policy clones cannot reserve admission or poison the queue.
-        #[test]
-        fn panicking_scope_clone_never_reserves_or_locks() {
-            /// Injects failure while copying caller-owned admission policy.
-            struct Panics;
-
-            impl Clone for Panics {
-                /// Fail before the mailbox can lock or reserve capacity.
-                fn clone(&self) -> Self {
-                    panic!("clone");
-                }
-            }
-
-            impl Scope for Panics {
-                /// The fixture uses portable runtime failures.
-                type Error = Error;
-
-                /// Admit work so submission reaches the deliberately panicking clone.
-                fn check(&self) -> Result<()> {
-                    Ok(())
-                }
-            }
-            let mailbox = Arc::new(Mailbox::<(), (), (), Panics>::new(1).unwrap());
-            mailbox.install().unwrap();
-            assert!(
-                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    let _ = mailbox.submit(1, (), &Panics, None);
-                }))
-                .is_err()
-            );
-            assert_eq!(mailbox.outstanding(), 0);
-            assert!(!mailbox.has_queued());
-            mailbox.uninstall().unwrap();
-        }
-
         /// Accepted commands retain credit without creating a cycle back to the mailbox.
         #[test]
         fn queued_owners_do_not_keep_mailbox_alive() {

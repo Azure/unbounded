@@ -743,75 +743,6 @@ mod tests {
         }
     }
 
-    /// Nested panicking cleanup leaves the authoritative head ready to resume.
-    #[test]
-    fn reentrant_cleanup_after_wrap_and_panic_resumes_from_authoritative_head() {
-        use std::rc::Weak;
-
-        /// Payload that checks publication ordering and injects nested cleanup failure.
-        struct Item {
-            id: usize,
-
-            sender: Weak<Sender<Item>>,
-
-            drops: Rc<RefCell<Vec<usize>>>,
-        }
-
-        impl Drop for Item {
-            /// Record removal before reentering cleanup or raising the injected panic.
-            fn drop(&mut self) {
-                self.drops.borrow_mut().push(self.id);
-                let sender = self.sender.upgrade().unwrap();
-                if sender.shared.receiver_closed.load(Ordering::Acquire) {
-                    assert_eq!(
-                        sender.cached_head.get(),
-                        sender.shared.head.0.load(Ordering::Relaxed),
-                        "cleanup publishes its cache before invoking a destructor"
-                    );
-                }
-                if self.id == 3 {
-                    // The nested cleanup removes 4 before its destructor panics.
-                    // The outer cleanup must never put either 3 or 4 back.
-                    self.sender.upgrade().unwrap().discard_closed();
-                } else if self.id == 4 {
-                    panic!("nested destructor failure");
-                }
-            }
-        }
-        let drops = Rc::new(RefCell::new(Vec::new()));
-        let (sender, mut receiver) = bounded(3).unwrap();
-        let sender = Rc::new(sender);
-        for id in 0..6 {
-            assert!(
-                sender
-                    .try_send(Item {
-                        id,
-                        sender: Rc::downgrade(&sender),
-                        drops: drops.clone(),
-                    })
-                    .is_ok()
-            );
-            if id < 3 {
-                drop(receiver.receive().unwrap());
-            }
-        }
-        drop(receiver);
-        assert!(
-            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| { sender.discard_closed() }))
-                .is_err()
-        );
-        assert_eq!(*drops.borrow(), [0, 1, 2, 3, 4]);
-        assert_eq!(
-            sender.cached_head.get(),
-            sender.shared.head.0.load(Ordering::Relaxed),
-            "unwind must not restore an outer cleanup's stale cache"
-        );
-        assert!(sender.discard_closed());
-        assert!(sender.discard_closed());
-        drop(sender);
-        assert_eq!(*drops.borrow(), [0, 1, 2, 3, 4, 5]);
-    }
-
     /// Zero-sized payloads retain distinct ownership despite sharing storage addresses.
     #[test]
     fn zero_sized_values_still_have_exactly_once_destructors() {
@@ -1234,37 +1165,5 @@ mod tests {
         assert!(receiver.poll_receive(&mut cx).is_pending());
         sender.close();
         assert_eq!(counter.count(), 3);
-    }
-
-    /// Unwinding an orphan destructor cannot leave its slot initialized twice.
-    #[test]
-    fn orphan_cleanup_advances_before_panicking_destructor() {
-        use std::sync::atomic::AtomicUsize;
-
-        /// Payload that panics on its first destruction attempt.
-        struct Panics(Arc<AtomicUsize>);
-
-        impl Drop for Panics {
-            /// Count destruction and inject a failure on the first call.
-            fn drop(&mut self) {
-                if self.0.fetch_add(1, Ordering::Relaxed) == 0 {
-                    panic!("injected destructor failure");
-                }
-            }
-        }
-        let count = Arc::new(AtomicUsize::new(0));
-        let (sender, receiver) = bounded(1).unwrap();
-        assert!(sender.try_send(Panics(count.clone())).is_ok());
-        drop(receiver);
-        assert!(
-            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| sender.discard_closed()))
-                .is_err()
-        );
-        drop(sender);
-        assert_eq!(
-            count.load(Ordering::Relaxed),
-            1,
-            "orphan cannot be dropped twice"
-        );
     }
 }

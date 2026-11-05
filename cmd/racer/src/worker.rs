@@ -415,17 +415,13 @@ impl WorkerGroup {
         factory: &dyn FaultRecipe,
         mut allocate: impl FnMut(WorkerId, u64, NonZeroUsize) -> Result<(IoCryptoPort, CryptoPort)>,
     ) -> Result<Resources> {
-        // Allocate every endpoint before spawning even the coordinator. Panics
-        // in caller policy and fallible queue allocation have identical rollback.
-        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            Resources::with_allocator(
-                factory.limits(),
-                self.plan.pairs.iter().map(|pair| pair.worker).collect(),
-                self.generation,
-                &mut allocate,
-            )
-        }))
-        .unwrap_or(Err(Error::Io))
+        // Allocate every endpoint before spawning even the coordinator.
+        Resources::with_allocator(
+            factory.limits(),
+            self.plan.pairs.iter().map(|pair| pair.worker).collect(),
+            self.generation,
+            &mut allocate,
+        )
     }
 
     #[cfg(test)]
@@ -640,7 +636,7 @@ impl Resources {
         Ok(())
     }
     /// Construct on the owning I/O thread. Retain resources even when graph
-    /// construction fails or panics so group teardown closes and fences them.
+    /// construction fails so group teardown closes and fences them.
     pub fn build_lane(
         &self,
         lane: usize,
@@ -663,17 +659,14 @@ impl Resources {
             admission,
             crypto: Rc::new(CryptoClient::new(port)),
         };
-        let built = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            build(
-                self.workers[lane],
-                WorkerRuntime {
-                    reactor: runtime.reactor.clone(),
-                    admission: runtime.admission.clone(),
-                    crypto: runtime.crypto.clone(),
-                },
-            )
-        }))
-        .unwrap_or(Err(Error::Io));
+        let built = build(
+            self.workers[lane],
+            WorkerRuntime {
+                reactor: runtime.reactor.clone(),
+                admission: runtime.admission.clone(),
+                crypto: runtime.crypto.clone(),
+            },
+        );
         Ok(Box::new(IoService {
             runtime,
             built,
@@ -2729,70 +2722,6 @@ mod tests {
             );
             io.close_submissions().unwrap();
             assert_eq!(count.count(), 1);
-        }
-
-        #[test]
-        fn coordinator_panic_reports_failure_and_joins_without_waiting_for_startup_deadline() {
-            let (mut group, factory) = fixture(3);
-            let scope = lifecycle_scope().unwrap();
-            assert_eq!(
-                group.start_with_allocator(Arc::new(factory), &scope, |_, _, _| {
-                    panic!("injected allocation panic")
-                }),
-                Err(Error::Io)
-            );
-            assert_eq!(group.runtime.stats().coordinators, 0);
-            assert_eq!(group.runtime.stats().done, 0);
-            let factory = fixture(3).1;
-            let mut borrowed = WorkerGroup::new(colocated_plan(2, 1));
-            let before = current_cpus().unwrap();
-            assert_eq!(
-                borrowed.run_with_allocator(&factory, &scope, false, |_, _, _| {
-                    panic!("injected borrowed allocation panic")
-                }),
-                Err(Error::Io)
-            );
-            assert_eq!(borrowed.runtime.stats().done, 0);
-            assert_eq!(current_cpus().unwrap(), before);
-        }
-
-        #[test]
-        fn limits_panic_starts_no_owned_or_borrowed_threads() {
-            struct PanicLimits;
-            impl FaultRecipe for PanicLimits {
-                fn limits(&self) -> Limits {
-                    panic!("injected limits panic")
-                }
-                fn build(
-                    &self,
-                    _: WorkerId,
-                    _: WorkerRuntime,
-                ) -> Result<Box<dyn Service<RequestScope>>> {
-                    panic!("must not build")
-                }
-                fn build_crypto(
-                    &self,
-                    _: WorkerId,
-                    _: CryptoRuntime,
-                ) -> Result<Box<dyn Service<RequestScope>>> {
-                    panic!("must not build")
-                }
-            }
-            let before = current_cpus().unwrap();
-            let scope = lifecycle_scope().unwrap();
-            let mut group = WorkerGroup::new(colocated_plan(3, 1));
-            assert_eq!(
-                group.start_recipe(Arc::new(PanicLimits), &scope),
-                Err(Error::Io)
-            );
-            assert_eq!(group.runtime.stats().done, 0);
-            assert_eq!(group.runtime.stats().coordinators, 0);
-            assert_eq!(
-                group.run_recipe_with_scope(&PanicLimits, &scope),
-                Err(Error::Io)
-            );
-            assert_eq!(group.runtime.stats().done, 0);
-            assert_eq!(current_cpus().unwrap(), before);
         }
 
         #[test]

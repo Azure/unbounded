@@ -182,7 +182,7 @@ impl ProfilingController {
             .name("racer-profiler".into())
             .stack_size(2 * 1024 * 1024)
             .spawn(move || {
-                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let result = {
                     #[cfg(all(
                         target_os = "linux",
                         any(target_arch = "x86_64", target_arch = "aarch64")
@@ -197,8 +197,7 @@ impl ProfilingController {
                     {
                         Err(ProfileError::Unsupported)
                     }
-                }))
-                .unwrap_or(Err(ProfileError::Io));
+                };
                 *helper.result.lock().unwrap_or_else(|e| e.into_inner()) = Some(result);
                 let one = 1u64;
                 // SAFETY: the descriptor and eight-byte value remain live during write.

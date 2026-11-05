@@ -277,7 +277,7 @@ impl HardwareState {
     fn run(&self, job: HardwareJob, limit: usize) {
         use std::os::fd::AsRawFd;
         use std::sync::atomic::Ordering;
-        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let result = (|| {
             let walk =
                 crate::hardware::Walk::new(self.cancelled.clone(), crate::hardware::WORKING_BYTES);
             let report = match job(&walk) {
@@ -299,8 +299,7 @@ impl HardwareState {
                 }
                 Err(Encode::Failed) => Err(server::BinaryError::Unavailable("unavailable")),
             }
-        }))
-        .unwrap_or(Err(server::BinaryError::Unavailable("unavailable")));
+        })();
         if self.cancelled.load(Ordering::Acquire) {
             return;
         }
@@ -960,20 +959,6 @@ mod tests {
                 crate::hardware::Abort::Cancelled
             );
             assert!(session.result().is_none(), "cancelled result is discarded");
-        }
-
-        #[test]
-        fn hardware_helper_panic_is_unavailable_and_releases_slot() {
-            let telemetry = Telemetry::default();
-            set_hardware(&telemetry, || panic!("synthetic discovery failure"));
-            for _ in 0..2 {
-                let text = diagnostic_response(&telemetry, "/debug/hardware");
-                assert_response(
-                    text.as_bytes(),
-                    "503 Service Unavailable",
-                    Some("unavailable\n"),
-                );
-            }
         }
 
         #[test]
