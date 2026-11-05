@@ -2690,7 +2690,7 @@ impl Fill {
         source: DecryptSource,
     ) -> Result<PageResult> {
         // These source counters include structural CorruptRecord rejections in
-        // this helper. They are independent of the exact CRC/AEAD engine counters,
+        // this helper. They are independent of the exact AEAD engine counters,
         // which are reaped even if a waiting fill has been abandoned.
         let result = async {
             validate_copy(&copy, page)?;
