@@ -3313,6 +3313,17 @@ fn fixture_with_caches(
     limits: Option<crate::config::Limits>,
     caches: Vec<CacheId>,
 ) -> Fixture {
+    fixture_with_flight_clock(length, limits, caches, crate::test_support::clock())
+}
+
+/// Like [`fixture_with_caches`], with an explicit clock for the flight table's
+/// admission cutoffs.
+fn fixture_with_flight_clock(
+    length: u64,
+    limits: Option<crate::config::Limits>,
+    caches: Vec<CacheId>,
+    flight_clock: racer_io::Clock,
+) -> Fixture {
     let mut config = crate::test_support::cluster::config(false);
     if let Some(limits) = limits {
         config.limits = limits;
@@ -3447,11 +3458,7 @@ fn fixture_with_caches(
         )
         .unwrap(),
     );
-    let flights = Rc::new(Flights::new(
-        admission.clone(),
-        availability,
-        crate::test_support::clock(),
-    ));
+    let flights = Rc::new(Flights::new(admission.clone(), availability, flight_clock));
     let fill = Fill::new(FillDependencies {
         memory,
         buffers,
@@ -4454,7 +4461,10 @@ pub(super) fn drive_disk<T>(f: &Fixture, future: impl Future<Output = T>) -> T {
 }
 
 fn cold_disk_fixture() -> Fixture {
-    let mut f = fixture();
+    cold_disk_fixture_from(fixture())
+}
+
+fn cold_disk_fixture_from(mut f: Fixture) -> Fixture {
     f.scope.deadline.0 = Instant::now() + Duration::from_secs(30);
     f.reactor.init().unwrap();
     let _ = futures::executor::block_on(f.fill.dependencies.writer.open()).unwrap();
@@ -4995,7 +5005,16 @@ fn bounded_admission_private_copy_completion_wakes_queued_read() {
     use std::future::Future;
     let queue = Rc::new(crate::rt::drivers::DriverQueue::new(1024));
     let _owner = queue.enter();
-    let mut f = cold_disk_fixture();
+    // The queued read's admission allowance is 100ms on the flight clock.
+    // Freeze that clock so slow disk and crypto completions under host load
+    // cannot expire the allowance before the completion wake is observed.
+    let frozen = racer_io::ctx::VirtualClock::new_at(Instant::now(), std::time::SystemTime::now());
+    let mut f = cold_disk_fixture_from(fixture_with_flight_clock(
+        3,
+        None,
+        vec![CacheId(crate::test_support::security::CACHE.into())],
+        frozen.into(),
+    ));
     let admission = &f.fill.dependencies.admission;
     let flights = &f.fill.dependencies.flights;
     let mut copy = f.fill.copy_only(&f.page, &f.scope);
