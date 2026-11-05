@@ -9,7 +9,8 @@ driver's userspace libraries into the node stack, generates a CDI
 specification, and configures containerd so that GPU workloads can be scheduled on the node.
 Most of this page describes the default `nspawn`
 [isolation mode]({{< relref "reference/agent/isolation" >}}); see
-[GPU support by isolation mode](#gpu-support-by-isolation-mode) for `none`.
+[GPU support by isolation mode](#gpu-support-by-isolation-mode) for `none` and
+`container`.
 
 ## Prerequisites
 
@@ -40,6 +41,7 @@ requests once, and each mode applies them its own way.
 |---|---|
 | [`nspawn`]({{< relref "reference/agent/nspawn" >}}) | Device and library bind-mounts plus `DeviceAllow=` entries in the nspawn config. The rest of this page describes this mode. |
 | [`none`]({{< relref "reference/agent/isolation-none" >}}) | Native. The node stack runs on the host and sees the driver, libraries, and `/dev/nvidia*` directly, so there is nothing to bind-mount and no `/run/host-nvidia` indirection. The NVIDIA Container Toolkit comes from the host. See [Toolkit and CDI in `none` mode](#toolkit-and-cdi-in-none-mode). |
+| [`container`]({{< relref "reference/agent/isolation-container" >}}) | The same grants become OCI mounts, devices, and cgroup device rules for the container, and the node-lifecycle hooks do what the `nspawn` lifecycle hooks do: pre-start refreshes the grants from the host, and post-start, once systemd in the container is up, links the libraries, builds the driver root, generates the CDI spec, and restarts containerd and kubelet around it. It uses the same `agent-*-nvidia` rootfs images as `nspawn`, and so the toolkit paths inside the image; `NvidiaToolkit` is rejected in this mode. Experimental: not run on a GPU host or on Azure Container Linux. |
 
 The Fabric Manager and persistence mode prerequisites are host requirements in
 every mode.
