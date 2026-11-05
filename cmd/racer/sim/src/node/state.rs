@@ -974,7 +974,8 @@ mod tests {
         assert!(reserve(&quotas, ResourceClass::Relay, 17).is_err());
         assert_eq!(ResourceClass::Relay.name(), "relay");
         // Production rules: unconfigured classes keep production defaults.
-        assert_eq!(quotas.limit(ResourceClass::IngressConnection), 45);
+        assert_eq!(quotas.limit(ResourceClass::IngressConnection), 61);
+        assert_eq!(quotas.limit(ResourceClass::PeerIngressConnection), 2048);
         assert_eq!(quotas.policy().max_keys(), 4096);
         assert_eq!(
             quotas.policy().floor(ResourceClass::Ciphertext),

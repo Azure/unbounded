@@ -498,6 +498,8 @@ fn interop_limits() -> Limits {
         queue_entries: count,
         connections_per_neighbor: count,
         client_connections: count,
+        peer_connections: count,
+        outbound_connections: count,
         pipes: count,
         range_window_pages: count,
         header_bytes: NonZeroUsize::new(16 * 1024).unwrap(),

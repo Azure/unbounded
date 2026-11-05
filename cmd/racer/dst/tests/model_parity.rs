@@ -133,13 +133,20 @@ fn model_memory_per_node() {
         if let Ok(r) = std::env::var("MODEL_RELAY_TRANSFERS") {
             spec.relay_transfers = r.parse().unwrap();
         }
-        // `MODEL_CONNECTIONS`: `production` models production's peer connection slots,
-        // `evict` and `refuse` (or both) add the proposed fixes; unset leaves them off.
+        // `MODEL_CONNECTIONS`: `off` holds no connection slots; `legacy` is the listener
+        // before peer ingress was sized apart and refused when full (45 slots per worker, accept
+        // queue); `evict` adds idle eviction to production. Unset is production.
         if let Ok(mode) = std::env::var("MODEL_CONNECTIONS") {
             let mut config = model::ConnectionConfig::production(spec.workers);
             config.evict_idle = mode.contains("evict");
-            config.refuse_when_full = mode.contains("refuse");
-            spec.connections = Some(config);
+            if mode.contains("legacy") {
+                config = model::ConnectionConfig::legacy(spec.workers);
+            }
+            spec.connections = if mode == "off" {
+                model::PeerConnections::Off
+            } else {
+                model::PeerConnections::Custom(config)
+            };
         }
     }
     // `MODEL_SEED`: the cold start's seed, 8 by default.
@@ -239,37 +246,48 @@ fn membership_churn_refreshes_falls_back_and_waits() {
     }
 }
 
-/// Production peer connection slots on the 400-node cold start (`racer_core::connections`):
-/// after the burst, hot nodes' ingress slots stay held by idle connections their peers keep
-/// pooled (30 s on both sides), so later connections wait in the accept queue. Evicting the
-/// longest-idle inbound connection when the listener is full (the proposed fix, not
-/// production) cuts the waits that outlive their attempt and never fails more reads. See `dst/MODEL.md`, "Peer connection slots".
+/// Peer connection slots on the 400-node cold start (`racer_core::connections`). With the
+/// legacy limits (`ConnectionConfig::legacy`: 45 ingress slots per worker, a full listener
+/// leaves connections in its accept queue) hot nodes' ingress slots stay held by idle
+/// connections their peers keep pooled (30 s on both sides), so later connections wait in the
+/// accept queue; evicting the longest-idle inbound connection cuts the waits that outlive their
+/// attempt and never fails more reads. Production (2,048 peer slots per worker, refusal when full)
+/// never queues. See `dst/MODEL.md`, "Peer connection slots".
 #[test]
 fn idle_connections_pin_ingress_slots() {
-    let counters = |evict: bool| {
+    let counters = |connections: fn(u32) -> model::ConnectionConfig, evict: bool| {
         let mut scenario = scenarios::cold_start(400);
         let spec = std::rc::Rc::get_mut(scenario.model.as_mut().unwrap()).unwrap();
-        let mut config = model::ConnectionConfig::production(spec.workers);
+        let mut config = connections(spec.workers);
         config.evict_idle = evict;
-        spec.connections = Some(config);
+        spec.connections = model::PeerConnections::Custom(config);
         let (_, report) = model::run(&scenario, Choices::seeded(8));
         report["metrics"]["counters"].clone()
     };
     let count = |c: &serde_json::Value, k: &str| c[k].as_u64().unwrap();
-    let production = counters(false);
-    let evicting = counters(true);
-    assert!(count(&production, "conn_queued") > 0, "{production}");
-    assert!(count(&production, "conn_reused") > 0, "{production}");
-    assert_eq!(count(&production, "conn_idle_evicted"), 0, "{production}");
+    let legacy = counters(model::ConnectionConfig::legacy, false);
+    let evicting = counters(model::ConnectionConfig::legacy, true);
+    let production = counters(model::ConnectionConfig::production, false);
+    assert!(count(&legacy, "conn_queued") > 0, "{legacy}");
+    assert!(count(&legacy, "conn_reused") > 0, "{legacy}");
+    assert_eq!(count(&legacy, "conn_idle_evicted"), 0, "{legacy}");
     assert!(count(&evicting, "conn_idle_evicted") > 0, "{evicting}");
     // Waits that outlive the requester's attempt, and the reads they fail.
     assert!(
-        count(&evicting, "conn_queue_abandoned") * 2 < count(&production, "conn_queue_abandoned"),
-        "{production} {evicting}"
+        count(&evicting, "conn_queue_abandoned") * 2 < count(&legacy, "conn_queue_abandoned"),
+        "{legacy} {evicting}"
     );
     assert!(
-        count(&evicting, "reads_failed") <= count(&production, "reads_failed"),
-        "{production} {evicting}"
+        count(&evicting, "reads_failed") <= count(&legacy, "reads_failed"),
+        "{legacy} {evicting}"
+    );
+    for key in ["conn_queued", "conn_dropped", "conn_idle_evicted"] {
+        assert_eq!(count(&production, key), 0, "{key}: {production}");
+    }
+    assert!(count(&production, "conn_reused") > 0, "{production}");
+    assert!(
+        count(&production, "reads_failed") <= count(&legacy, "reads_failed"),
+        "{legacy} {production}"
     );
 }
 

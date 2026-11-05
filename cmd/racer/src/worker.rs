@@ -251,6 +251,8 @@ trait FaultRecipe: Sync {
             queue_entries: n(64),
             connections_per_neighbor: n(2),
             client_connections: n(128),
+            peer_connections: n(128),
+            outbound_connections: n(128),
             pipes: n(16),
             range_window_pages: n(2),
             header_bytes: n(32768),

@@ -74,6 +74,8 @@ pub struct ScaledLimits {
     pub flights: bool,
     pub queue_entries: bool,
     pub client_connections: bool,
+    pub peer_connections: bool,
+    pub outbound_connections: bool,
     pub pipes: bool,
     pub placement_cache_bytes: bool,
     pub cached_paths: bool,
@@ -288,8 +290,8 @@ impl Config {
 
         // Each shared budget comes from its node-wide name or, by default,
         // from its per-worker name, which is scaled later.
-        let mut scaled = [false; 14];
-        let mut shared = [NonZeroUsize::MIN; 14];
+        let mut scaled = [false; 16];
+        let mut shared = [NonZeroUsize::MIN; 16];
         for (index, (node, worker)) in table::SHARED_BUDGETS.iter().enumerate() {
             match (v.is_set(node), v.is_set(worker)) {
                 (true, true) => {
@@ -314,6 +316,8 @@ impl Config {
             flights,
             queue_entries,
             client_connections,
+            peer_connections,
+            outbound_connections,
             pipes,
             placement_cache_bytes,
             cached_paths,
@@ -332,6 +336,8 @@ impl Config {
             queue_entries,
             connections_per_neighbor: nonzero("RACER_NEIGHBOR_CONNECTIONS_PER_WORKER")?,
             client_connections,
+            peer_connections,
+            outbound_connections,
             pipes,
             range_window_pages: nonzero("RACER_RANGE_WINDOW_PAGES")?,
             header_bytes: nonzero("RACER_HEADER_BYTES")?,
@@ -352,6 +358,8 @@ impl Config {
             flights,
             queue_entries,
             client_connections,
+            peer_connections,
+            outbound_connections,
             pipes,
             placement_cache_bytes,
             cached_paths,
@@ -368,6 +376,8 @@ impl Config {
             flights,
             queue_entries,
             client_connections,
+            peer_connections,
+            outbound_connections,
             pipes,
             placement_cache_bytes,
             cached_paths,
@@ -554,6 +564,11 @@ impl Config {
         scale(&mut limits.flights, scaled.flights)?;
         scale(&mut limits.queue_entries, scaled.queue_entries)?;
         scale(&mut limits.client_connections, scaled.client_connections)?;
+        scale(&mut limits.peer_connections, scaled.peer_connections)?;
+        scale(
+            &mut limits.outbound_connections,
+            scaled.outbound_connections,
+        )?;
         scale(&mut limits.pipes, scaled.pipes)?;
         scale(
             &mut limits.placement_cache_bytes,
@@ -764,10 +779,10 @@ impl Config {
                 "RDMA needs registered memory for at least one page plus 16 bytes",
             );
         }
-        if limits.connections_per_neighbor > limits.client_connections {
+        if limits.connections_per_neighbor > limits.outbound_connections {
             return rule(
-                "RACER_NEIGHBOR_CONNECTIONS_PER_WORKER, RACER_CLIENT_CONNECTIONS",
-                "neighbor connections must not exceed client connections",
+                "RACER_NEIGHBOR_CONNECTIONS_PER_WORKER, RACER_OUTBOUND_CONNECTIONS",
+                "neighbor connections must not exceed outbound connections",
             );
         }
         if limits
@@ -1335,6 +1350,8 @@ mod tests {
                 flights: true,
                 queue_entries: true,
                 client_connections: true,
+                peer_connections: true,
+                outbound_connections: true,
                 pipes: true,
                 placement_cache_bytes: true,
                 cached_paths: true,
@@ -2265,7 +2282,7 @@ mod tests {
             config.origin_connections_per_cache.get(),
             DEFAULT_ORIGIN_CONNECTIONS_PER_CACHE
         );
-        assert_eq!(config.limits.connections_per_neighbor.get(), 2);
+        assert_eq!(config.limits.connections_per_neighbor.get(), 8);
         config.validate().unwrap();
         crate::app::Application::assemble(config).unwrap();
         assert!(parse(&[("RACER_ENABLE_RDMA", "true"), ("RACER_MAX_THREADS", "7")]).is_ok());
@@ -2273,7 +2290,7 @@ mod tests {
 
     type LimitField = (&'static str, fn(&Limits) -> NonZeroUsize);
 
-    const SCALED_FIELDS: [LimitField; 14] = [
+    const SCALED_FIELDS: [LimitField; 16] = [
         ("RACER_PLAINTEXT_BYTES", |l| l.plaintext_bytes),
         ("RACER_CIPHERTEXT_BYTES", |l| l.ciphertext_bytes),
         ("RACER_DIRTY_BYTES", |l| l.dirty_bytes),
@@ -2282,6 +2299,8 @@ mod tests {
         ("RACER_FLIGHTS", |l| l.flights),
         ("RACER_QUEUE_ENTRIES", |l| l.queue_entries),
         ("RACER_CLIENT_CONNECTIONS", |l| l.client_connections),
+        ("RACER_PEER_CONNECTIONS", |l| l.peer_connections),
+        ("RACER_OUTBOUND_CONNECTIONS", |l| l.outbound_connections),
         ("RACER_PIPES", |l| l.pipes),
         ("RACER_PLACEMENT_CACHE_BYTES", |l| l.placement_cache_bytes),
         ("RACER_CACHED_PATHS", |l| l.cached_paths),
@@ -2362,6 +2381,10 @@ mod tests {
                 "RACER_FLIGHTS" => config.scaled_limits.flights = true,
                 "RACER_QUEUE_ENTRIES" => config.scaled_limits.queue_entries = true,
                 "RACER_CLIENT_CONNECTIONS" => config.scaled_limits.client_connections = true,
+                "RACER_PEER_CONNECTIONS" => config.scaled_limits.peer_connections = true,
+                "RACER_OUTBOUND_CONNECTIONS" => {
+                    config.scaled_limits.outbound_connections = true;
+                }
                 "RACER_PIPES" => config.scaled_limits.pipes = true,
                 "RACER_PLACEMENT_CACHE_BYTES" => config.scaled_limits.placement_cache_bytes = true,
                 "RACER_CACHED_PATHS" => config.scaled_limits.cached_paths = true,
@@ -2967,9 +2990,30 @@ mod tests {
             ("RACER_RANGE_WINDOW_PAGES", "16"),
             ("RACER_PLAINTEXT_BYTES", "18446744073709551615"),
             ("RACER_NEIGHBOR_CONNECTIONS_PER_WORKER", "129"),
+            ("RACER_NEIGHBOR_CONNECTIONS_PER_WORKER", "65"),
+            ("RACER_PEER_CONNECTIONS_PER_WORKER", "0"),
+            ("RACER_PEER_CONNECTIONS", "65537"),
+            ("RACER_OUTBOUND_CONNECTIONS_PER_WORKER", "0"),
         ] {
             assert!(parse(&[(name, value)]).is_err(), "{name}={value}");
         }
+        // Neighbor connections are bounded by outbound connections, not client connections.
+        assert!(parse(&[("RACER_NEIGHBOR_CONNECTIONS_PER_WORKER", "64")]).is_ok());
+        let wide = parse(&[
+            ("RACER_NEIGHBOR_CONNECTIONS_PER_WORKER", "65"),
+            ("RACER_OUTBOUND_CONNECTIONS_PER_WORKER", "128"),
+            ("RACER_CLIENT_CONNECTIONS_PER_WORKER", "8"),
+        ])
+        .unwrap();
+        assert_eq!(wide.limits.outbound_connections.get(), 128);
+        assert_eq!(wide.limits.peer_connections.get(), 2048);
+        assert!(
+            parse(&[
+                ("RACER_NEIGHBOR_CONNECTIONS_PER_WORKER", "9"),
+                ("RACER_OUTBOUND_CONNECTIONS_PER_WORKER", "8"),
+            ])
+            .is_err()
+        );
         assert!(
             parse(&[
                 ("RACER_FLIGHTS", "65536"),

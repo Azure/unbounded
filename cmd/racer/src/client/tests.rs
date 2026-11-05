@@ -943,6 +943,8 @@ fn limits() -> Limits {
         queue_entries: n,
         connections_per_neighbor: n,
         client_connections: n,
+        peer_connections: n,
+        outbound_connections: n,
         pipes: n,
         range_window_pages: n,
         header_bytes: NonZeroUsize::new(32768).unwrap(),

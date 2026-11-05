@@ -2497,6 +2497,42 @@ pub(crate) mod tests {
             drop(a);
             assert_eq!(admission.used(ResourceClass::Connection), 0);
         }
+        /// A listener with no peer ingress slot answers the overload head in place of the
+        /// challenge (`PeerServer::refuse`): the sender's handshake fails `Overloaded` at once
+        /// and the connection is not pooled. Any other unsigned answer fails otherwise.
+        #[test]
+        fn handshake_reads_a_refusal_as_overloaded() {
+            use std::io::Write;
+            let n = crate::test_support::security::network(2);
+            let overloaded = Codec::new(65536)
+                .encode_head(&peer_wire::overloaded_head())
+                .unwrap();
+            let mut other = peer_wire::overloaded_head();
+            other.headers[0].value = b"1".to_vec();
+            let other = Codec::new(65536).encode_head(&other).unwrap();
+            for (answer, refused) in [(overloaded, true), (other, false)] {
+                let admission = Rc::new(flow_control::Quotas::new(AdmissionPolicy::new(
+                    crate::test_support::cluster::config(false).limits,
+                )));
+                let reactor = Rc::new(Reactor::new(admission.clone(), &crate::test_support::env()));
+                let io =
+                    crate::http::new_io(reactor.clone(), Codec::new(65536), admission.clone(), 0);
+                let scope = RequestScope::host(
+                    RequestId([4; 16]),
+                    Instant::now() + Duration::from_secs(10),
+                )
+                .unwrap();
+                let (a, mut b) = std::os::unix::net::UnixStream::pair().unwrap();
+                b.write_all(&answer).unwrap();
+                let a = crate::http::from_accepted(a.into(), &admission).unwrap();
+                let result = drive(&reactor, connect(&io, a, n[0].clone(), n[1].node(), &scope));
+                let error = result.err().unwrap();
+                assert_eq!(error == Error::Overloaded, refused, "{error:?}");
+                drive(&reactor, reactor.drain()).unwrap();
+                assert_eq!(admission.used(ResourceClass::Connection), 0);
+                drop(b);
+            }
+        }
         #[test]
         fn handshake_cancel_expiry_and_abandonment_retain_only_fenced_admissions() {
             let n = crate::test_support::security::network(2);

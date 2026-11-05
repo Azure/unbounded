@@ -283,6 +283,13 @@ where
             &scope,
         )
         .await?;
+    // A listener with no peer ingress slot answers the overload head instead of a challenge
+    // and closes the connection: fail `Overloaded` so the sender asks elsewhere.
+    if crate::is_overloaded(&response.value) {
+        let mut connection = response.connection;
+        connection.poison();
+        return Err(Error::Runtime(racer_io::Error::Overloaded).into());
+    }
     let (_, echoed, b, _) =
         verify_session(&signatures, &response.value, Some(peer), "challenge", true)?;
     drop(response.value);

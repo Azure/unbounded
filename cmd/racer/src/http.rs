@@ -1152,6 +1152,8 @@ pub(crate) mod tests {
                     queue_entries: small,
                     connections_per_neighbor: small,
                     client_connections: small,
+                    peer_connections: small,
+                    outbound_connections: small,
                     pipes: std::num::NonZeroUsize::new(pipes).unwrap(),
                     range_window_pages: small,
                     header_bytes: small,
@@ -2149,6 +2151,8 @@ pub(crate) mod tests {
         ) {
             let mut limits = crate::test_support::cluster::config(false).limits;
             limits.queue_entries = std::num::NonZeroUsize::new(2).unwrap();
+            // A small outbound budget keeps quota-filling tests short.
+            limits.outbound_connections = std::num::NonZeroUsize::new(8).unwrap();
             let admission = Rc::new(flow_control::Quotas::new(AdmissionPolicy::new(limits)));
             let reactor = Rc::new(Reactor::new(admission.clone(), &crate::test_support::env()));
             reactor.init().unwrap();

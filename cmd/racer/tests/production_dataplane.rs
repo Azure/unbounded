@@ -148,6 +148,8 @@ fn limits(pages: usize) -> Limits {
         queue_entries: n,
         connections_per_neighbor: nz(8),
         client_connections: n,
+        peer_connections: n,
+        outbound_connections: n,
         pipes: nz(8),
         range_window_pages: nz(2),
         header_bytes: nz(32768),

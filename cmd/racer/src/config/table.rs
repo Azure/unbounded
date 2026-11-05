@@ -93,7 +93,7 @@ macro_rules! shared_budget {
 }
 
 /// Shared budgets as (node-wide name, per-worker name) pairs, in [`LIMITS`] order.
-pub(super) const SHARED_BUDGETS: [(&str, &str); 14] = [
+pub(super) const SHARED_BUDGETS: [(&str, &str); 16] = [
     ("RACER_PLAINTEXT_BYTES", "RACER_PLAINTEXT_BYTES_PER_WORKER"),
     (
         "RACER_CIPHERTEXT_BYTES",
@@ -114,6 +114,14 @@ pub(super) const SHARED_BUDGETS: [(&str, &str); 14] = [
         "RACER_CLIENT_CONNECTIONS",
         "RACER_CLIENT_CONNECTIONS_PER_WORKER",
     ),
+    (
+        "RACER_PEER_CONNECTIONS",
+        "RACER_PEER_CONNECTIONS_PER_WORKER",
+    ),
+    (
+        "RACER_OUTBOUND_CONNECTIONS",
+        "RACER_OUTBOUND_CONNECTIONS_PER_WORKER",
+    ),
     ("RACER_PIPES", "RACER_PIPES_PER_WORKER"),
     (
         "RACER_PLACEMENT_CACHE_BYTES",
@@ -131,7 +139,7 @@ pub(super) const SHARED_BUDGETS: [(&str, &str); 14] = [
     ("RACER_RELAY_TRANSFERS", "RACER_RELAY_TRANSFERS_PER_WORKER"),
 ];
 
-const LIMITS: [[Var; 2]; 14] = [
+const LIMITS: [[Var; 2]; 16] = [
     shared_budget!(
         "RACER_PLAINTEXT_BYTES",
         "RACER_PLAINTEXT_BYTES_PER_WORKER",
@@ -186,7 +194,21 @@ const LIMITS: [[Var; 2]; 14] = [
         "RACER_CLIENT_CONNECTIONS_PER_WORKER",
         uint(1, 65_536, COUNT),
         "64",
-        "Connection admission. A quarter of each worker's share (less one slot, at least one) bounds its outbound peer and origin connections, so raise it when many concurrent page reads to different peers are refused as `Overloaded`."
+        "Client and control connections. A quarter of each worker's share, at most three, is kept for control connections; the rest accept client connections. Peer and outbound connections have their own limits."
+    ),
+    shared_budget!(
+        "RACER_PEER_CONNECTIONS",
+        "RACER_PEER_CONNECTIONS_PER_WORKER",
+        uint(1, 65_536, COUNT),
+        "2048",
+        "Inbound peer connections. A peer connection runs one exchange at a time and stays open between them; when every worker's share is in use the listener answers new connections with the unsigned overload head and closes them, so the sender asks elsewhere. Each connection is a file descriptor."
+    ),
+    shared_budget!(
+        "RACER_OUTBOUND_CONNECTIONS",
+        "RACER_OUTBOUND_CONNECTIONS_PER_WORKER",
+        uint(1, 65_536, COUNT),
+        "64",
+        "Outbound peer and origin connections, busy or idle. One slot per worker is kept for origin metadata when the share is at least two. Raise it when many concurrent page reads to different peers are refused as `Overloaded`."
     ),
     shared_budget!(
         "RACER_PIPES",
@@ -232,10 +254,10 @@ const LIMITS: [[Var; 2]; 14] = [
     ),
 ];
 
-const fn flatten_limits() -> [Var; 28] {
-    let mut out = [LIMITS[0][0]; 28];
+const fn flatten_limits() -> [Var; 32] {
+    let mut out = [LIMITS[0][0]; 32];
     let mut i = 0;
-    while i < 14 {
+    while i < 16 {
         out[2 * i] = LIMITS[i][0];
         out[2 * i + 1] = LIMITS[i][1];
         i += 1;
@@ -243,7 +265,7 @@ const fn flatten_limits() -> [Var; 28] {
     out
 }
 
-const SHARED: [Var; 28] = flatten_limits();
+const SHARED: [Var; 32] = flatten_limits();
 
 const BASE: &[Var] = &[
     // Control and identity.
@@ -486,8 +508,8 @@ const BASE: &[Var] = &[
         "RACER_NEIGHBOR_CONNECTIONS_PER_WORKER",
         Group::Limits,
         uint(1, 1024, COUNT),
-        Value("2"),
-        "Connections each I/O worker keeps to one neighbor; at most the worker's client connections.",
+        Value("8"),
+        "Busy connections each I/O worker keeps to one neighbor; at most the worker's outbound connections.",
     )),
     var(
         "RACER_RANGE_WINDOW_PAGES",
@@ -906,22 +928,22 @@ const BASE: &[Var] = &[
     },
 ];
 
-const fn concat_table() -> [Var; BASE.len() + 28] {
-    let mut out = [BASE[0]; BASE.len() + 28];
+const fn concat_table() -> [Var; BASE.len() + SHARED.len()] {
+    let mut out = [BASE[0]; BASE.len() + SHARED.len()];
     let mut i = 0;
     while i < BASE.len() {
         out[i] = BASE[i];
         i += 1;
     }
     let mut j = 0;
-    while j < 28 {
+    while j < SHARED.len() {
         out[BASE.len() + j] = SHARED[j];
         j += 1;
     }
     out
 }
 
-const ALL: [Var; BASE.len() + 28] = concat_table();
+const ALL: [Var; BASE.len() + SHARED.len()] = concat_table();
 
 /// Every accepted variable.
 pub static TABLE: &[Var] = &ALL;

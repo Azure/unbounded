@@ -75,6 +75,8 @@ pub struct PeerServer {
     /// Hot-page shedding over the page response bodies this server is
     /// writing ([`ServeDecision`]).
     serve: Rc<std::cell::RefCell<ServeDecision<crate::model::PageId>>>,
+    /// The encoded unsigned overload head a full listener answers with ([`Self::refuse`]).
+    refusal: Rc<[u8]>,
 }
 
 /// Bodies of one page an owner writes before it may shed readers of that page:
@@ -120,6 +122,20 @@ impl PeerServer {
             fd.enable_tcp_nodelay(true).map_err(|_| Error::Io)?;
         }
         Ok(fd)
+    }
+    /// Answer a connection the listener has no peer ingress slot for with the unsigned overload
+    /// head (`peer_wire::overloaded_head`), then close it. The sender reads it in place of the
+    /// handshake's first answer and fails `Overloaded` at once (`peer_wire::connect`), so it asks
+    /// elsewhere. The head is written without waiting; a full send buffer (it never is on a new
+    /// socket) only closes the connection, which the sender sees as a failed handshake.
+    pub(crate) fn refuse(&self, accepted: &racer_io::ring::Descriptor) {
+        self.metrics.record(crate::telemetry::Event::Overload, 1);
+        let _ = accepted.try_send(&self.refusal);
+        // Reading what the sender already wrote keeps the close a FIN rather than a reset that
+        // could discard the head before the sender reads it.
+        let mut discard = [0u8; 512];
+        let _ = accepted.try_recv(&mut discard);
+        let _ = accepted.shutdown(libc::SHUT_WR);
     }
     pub(crate) fn with_metrics(mut self, metrics: crate::telemetry::Metrics) -> Self {
         self.metrics = metrics;
@@ -263,19 +279,27 @@ impl PeerServer {
                             reactor.readiness_with_lease(fd.clone(), libc::POLLIN as u32, (), scope)
                         })
                         .await?;
-                    let cancellation = scope.cancellation.subscribe()?;
-                    let offer = std::future::poll_fn(|cx| {
-                        cancellation.register(cx.waker());
-                        if let Err(error) = scope.check() {
-                            return std::task::Poll::Ready(Err(error));
+                    scope.check()?;
+                    // With every worker's peer ingress in use, accept the connection only to
+                    // refuse it, rather than leave it in the kernel accept queue until the
+                    // sender's attempt times out (`refuse`).
+                    let offer = match ingress.reserve(futures::task::noop_waker_ref()) {
+                        Ok(offer) => offer,
+                        Err(Error::Overloaded) => {
+                            match fd.try_accept() {
+                                Ok(accepted) => self.refuse(&accepted),
+                                Err(error)
+                                    if matches!(
+                                        error.kind(),
+                                        std::io::ErrorKind::WouldBlock
+                                            | std::io::ErrorKind::Interrupted
+                                    ) => {}
+                                Err(_) => return Err(Error::Io),
+                            }
+                            continue;
                         }
-                        match ingress.reserve(cx.waker()) {
-                            Ok(offer) => std::task::Poll::Ready(Ok(offer)),
-                            Err(Error::Overloaded) => std::task::Poll::Pending,
-                            Err(error) => std::task::Poll::Ready(Err(error)),
-                        }
-                    })
-                    .await?;
+                        Err(error) => return Err(error),
+                    };
                     let accepted = match fd.try_accept() {
                         Ok(fd) => fd,
                         Err(error)
@@ -362,6 +386,10 @@ impl PeerServer {
             serve: Rc::new(std::cell::RefCell::new(ServeDecision::new(
                 crate::model::PAGE_BYTES,
             ))),
+            refusal: crate::http::Codec::new(peer_wire::MAX_ENVELOPE_HEAD)
+                .encode_head(&peer_wire::overloaded_head())
+                .expect("the overload head encodes")
+                .into(),
         }
     }
 
@@ -1809,7 +1837,7 @@ mod tests {
                 assert_eq!(admission.used(ResourceClass::ControlProgress), 1);
                 assert!(admission.used(ResourceClass::RequestContext) > baseline);
                 assert!(matches!(
-                    admission.reserve(None, ResourceClass::Connection, 1),
+                    admission.reserve(None, ResourceClass::IngressConnection, 1),
                     Err(flow_control::Error::Overloaded)
                 ));
 

@@ -269,11 +269,9 @@ pub struct ModelSpec {
     /// zero is unbounded.
     pub crypto_queue: usize,
     /// Peer connection slots (`racer_core::connections`): per-worker outbound pools, per-node
-    /// ingress with its accept queue, and idle reuse. `None` (the default, so existing scenarios
-    /// keep their transport) connects every link at once and holds nothing;
-    /// [`ConnectionConfig::production`] is production's semantics, which fail several of the
-    /// scenarios (see `dst/MODEL.md`, "Peer connection slots").
-    pub connections: Option<ConnectionConfig>,
+    /// ingress, and idle reuse. Production's by default (see `dst/MODEL.md`, "Peer connection
+    /// slots").
+    pub connections: PeerConnections,
     /// Waiters per flight; production's default unless a scenario overrides it (racer-sim
     /// `NodeConfig::waiters_per_flight`).
     pub waiters_per_flight: usize,
@@ -302,6 +300,17 @@ impl std::fmt::Debug for ModelSpec {
     }
 }
 
+/// Which peer connection slots a Model run holds.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PeerConnections {
+    /// Every link connects at once and holds nothing.
+    Off,
+    /// [`ConnectionConfig::production`] for the spec's workers.
+    Production,
+    /// Explicit limits.
+    Custom(ConnectionConfig),
+}
+
 impl Default for ModelSpec {
     /// racer-sim's `Config::default` node shape: 2 workers, 16 pages of 1 MiB, 10 s reads.
     fn default() -> Self {
@@ -322,7 +331,7 @@ impl Default for ModelSpec {
             membership_lag: membership::LAG,
             relay_transfers: relay_transfers(),
             crypto_queue: crypto_queue(),
-            connections: None,
+            connections: PeerConnections::Production,
             waiters_per_flight: flight_limits().waiters_per_flight,
             checks: Vec::new(),
             control: None,
@@ -826,10 +835,10 @@ impl<'s> Model<'s> {
             partitions: BTreeSet::new(),
             pings: BTreeMap::new(),
             paths: Paths::with_limits(ROUTE_CACHE_ENTRIES, ROUTE_CACHE_ENTRIES * 256, 8),
-            conns: Connections::new(
-                spec.connections
-                    .unwrap_or_else(|| ConnectionConfig::production(workers)),
-            ),
+            conns: Connections::new(match spec.connections {
+                PeerConnections::Custom(config) => config,
+                _ => ConnectionConfig::production(workers),
+            }),
             msg_conns: BTreeMap::new(),
             queued: BTreeMap::new(),
             answered_msgs: BTreeSet::new(),
@@ -2390,7 +2399,7 @@ impl<'s> Model<'s> {
         };
         let cut = self.cut(holder, next);
         // The sender's pool hands out a connection before any I/O (`racer_core::connections`).
-        let acquired = (!cut && self.spec.connections.is_some())
+        let acquired = (!cut && self.spec.connections != PeerConnections::Off)
             .then(|| self.conns.acquire(now, holder, conn, next));
         match acquired {
             // A refusal is the receiver's unsigned overload head, read as `Overloaded` too.

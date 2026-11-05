@@ -123,6 +123,8 @@ fn reactor() -> Option<Rc<Reactor>> {
             queue_entries: NonZeroUsize::new(32).unwrap(),
             connections_per_neighbor: n,
             client_connections: n,
+            peer_connections: n,
+            outbound_connections: n,
             pipes: n,
             range_window_pages: n,
             header_bytes: NonZeroUsize::new(64 * 1024).unwrap(),

@@ -24,13 +24,16 @@ pub enum ResourceClass {
     /// Outbound sockets other than origin metadata, kept below the outbound
     /// limit so metadata lookups never queue behind page bodies.
     OrdinaryOutboundConnection,
+    /// Inbound peer sockets, sized apart from client sockets: a peer connection runs one
+    /// exchange at a time and holds little memory while idle.
+    PeerIngressConnection,
     /// Idle bytes held by worker buffer pools for reuse. Bounded by the
     /// ciphertext budget and released by memory pressure.
     Pool,
 }
 
 impl ResourceClass {
-    pub const ALL: [Self; 16] = [
+    pub const ALL: [Self; 17] = [
         Self::Plaintext,
         Self::Ciphertext,
         Self::DirtyCiphertext,
@@ -46,6 +49,7 @@ impl ResourceClass {
         Self::OutboundConnection,
         Self::ControlConnection,
         Self::OrdinaryOutboundConnection,
+        Self::PeerIngressConnection,
         Self::Pool,
     ];
 
@@ -67,13 +71,14 @@ impl ResourceClass {
             Self::OutboundConnection => "outbound_connection",
             Self::ControlConnection => "control_connection",
             Self::OrdinaryOutboundConnection => "ordinary_outbound_connection",
+            Self::PeerIngressConnection => "peer_ingress_connection",
             Self::Pool => "pool",
         }
     }
 }
 
 impl crate::flow::Class for ResourceClass {
-    const COUNT: usize = 16;
+    const COUNT: usize = 17;
     fn index(self) -> usize {
         self as usize
     }
@@ -91,6 +96,17 @@ pub const METADATA_OUTBOUND_RESERVE: usize = 1;
 
 const MIB: usize = 1024 * 1024;
 
+/// Default inbound peer connections per worker. A cold start where every node reads one object
+/// at once concentrates thousands of connections on each page's owners and relays; with 45
+/// slots per worker (the old share of `client_connections`) a 50,000-node cold start failed 74%
+/// of reads in both simulators (`dst/MODEL.md`, "Peer connection slots").
+pub const PEER_CONNECTIONS: usize = 2048;
+/// Default outbound peer and origin connections per worker, one slot of which is kept for origin
+/// metadata (`METADATA_OUTBOUND_RESERVE`).
+pub const OUTBOUND_CONNECTIONS: usize = 64;
+/// Default busy connections per worker to one next hop.
+pub const PEER_CONNECTIONS_PER_NEIGHBOR: usize = 8;
+
 /// Independent bounded-resource dimensions. Validation precedes resource creation.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Limits {
@@ -103,7 +119,12 @@ pub struct Limits {
     pub waiters_per_flight: NonZeroUsize,
     pub queue_entries: NonZeroUsize,
     pub connections_per_neighbor: NonZeroUsize,
+    /// Client sockets and control connections.
     pub client_connections: NonZeroUsize,
+    /// Inbound peer sockets (`ResourceClass::PeerIngressConnection`).
+    pub peer_connections: NonZeroUsize,
+    /// Outbound peer and origin sockets (`ResourceClass::OutboundConnection`).
+    pub outbound_connections: NonZeroUsize,
     pub pipes: NonZeroUsize,
     pub range_window_pages: NonZeroUsize,
     pub header_bytes: NonZeroUsize,
@@ -136,8 +157,10 @@ impl Default for Limits {
             flights: nz(64),
             waiters_per_flight: nz(64),
             queue_entries: nz(256),
-            connections_per_neighbor: nz(2),
+            connections_per_neighbor: nz(PEER_CONNECTIONS_PER_NEIGHBOR),
             client_connections: nz(64),
+            peer_connections: nz(PEER_CONNECTIONS),
+            outbound_connections: nz(OUTBOUND_CONNECTIONS),
             pipes: nz(16),
             range_window_pages: nz(2),
             header_bytes: nz(32 * 1024),
@@ -159,8 +182,10 @@ impl Limits {
     /// (`src/peer/server.rs` `serve_connection`).
     ///
     /// Each connection runs one exchange at a time, so a worker's peer exchanges hold at most
-    /// `IngressConnection + OutboundConnection` crypto jobs (`Rules::peer_crypto_jobs`); every
-    /// byte a queued verification pins is charged to `RequestContext`.
+    /// `PeerIngressConnection + OutboundConnection` crypto jobs (`Rules::peer_crypto_jobs`). With
+    /// the default limits that is more than this queue holds: past it a verification is shed
+    /// with the unsigned overload head rather than waiting. Every byte a queued verification
+    /// pins is charged to `RequestContext`.
     pub fn crypto_submissions(&self) -> usize {
         self.queue_entries.get().saturating_mul(2)
     }
@@ -208,7 +233,7 @@ impl Rules {
     /// outbound connection, since a connection runs one exchange at a time
     /// (`src/peer/server.rs` `listen`).
     pub fn peer_crypto_jobs(&self) -> usize {
-        self.limit(ResourceClass::IngressConnection)
+        self.limit(ResourceClass::PeerIngressConnection)
             .saturating_add(self.limit(ResourceClass::OutboundConnection))
     }
 
@@ -225,18 +250,25 @@ impl Rules {
                 .flights
                 .get()
                 .saturating_mul(limits.waiters_per_flight.get()),
-            ResourceClass::Connection => limits.client_connections.get(),
+            // Every socket: client and control, inbound peer, and outbound. Each kind is bounded
+            // by its own class; this total never binds first.
+            ResourceClass::Connection => limits
+                .client_connections
+                .get()
+                .saturating_add(limits.peer_connections.get())
+                .saturating_add(limits.outbound_connections.get()),
             // Snapshot, renewal, and keyring delivery make independent progress.
             ResourceClass::ControlConnection => (limits.client_connections.get() / 4).min(3),
-            ResourceClass::OutboundConnection => limits.client_connections.get() / 4,
+            ResourceClass::OutboundConnection => limits.outbound_connections.get(),
             ResourceClass::OrdinaryOutboundConnection => {
                 let outbound = self.limit(ResourceClass::OutboundConnection);
                 outbound - usize::from(outbound >= 2) * METADATA_OUTBOUND_RESERVE
             }
-            ResourceClass::IngressConnection => limits.client_connections.get().saturating_sub(
-                self.limit(ResourceClass::ControlConnection)
-                    + self.limit(ResourceClass::OutboundConnection),
-            ),
+            ResourceClass::IngressConnection => limits
+                .client_connections
+                .get()
+                .saturating_sub(self.limit(ResourceClass::ControlConnection)),
+            ResourceClass::PeerIngressConnection => limits.peer_connections.get(),
             ResourceClass::Pipe => limits.pipes.get(),
             ResourceClass::ControlProgress => limits.queue_entries.get(),
             ResourceClass::Relay => limits.relay_transfers.get(),
@@ -286,7 +318,9 @@ impl Rules {
     pub fn wakes(class: ResourceClass) -> bool {
         matches!(
             class,
-            ResourceClass::Connection | ResourceClass::IngressConnection
+            ResourceClass::Connection
+                | ResourceClass::IngressConnection
+                | ResourceClass::PeerIngressConnection
         )
     }
 
@@ -333,42 +367,59 @@ mod tests {
         let mut limits = Limits::default();
         let rules = |limits: &Limits| Rules::new(limits.clone(), Floors::for_page(16 * MIB, 0));
         let r = rules(&limits);
+        assert_eq!(r.limit(ResourceClass::Connection), 64 + 2048 + 64);
         assert_eq!(r.limit(ResourceClass::ControlConnection), 3);
-        assert_eq!(r.limit(ResourceClass::OutboundConnection), 16);
-        assert_eq!(r.limit(ResourceClass::OrdinaryOutboundConnection), 15);
-        assert_eq!(r.limit(ResourceClass::IngressConnection), 45);
+        assert_eq!(r.limit(ResourceClass::IngressConnection), 61);
+        assert_eq!(r.limit(ResourceClass::OutboundConnection), 64);
+        assert_eq!(r.limit(ResourceClass::OrdinaryOutboundConnection), 63);
+        assert_eq!(r.limit(ResourceClass::PeerIngressConnection), 2048);
+        assert_eq!(limits.connections_per_neighbor.get(), 8);
         assert_eq!(r.limit(ResourceClass::Waiter), 4096);
         limits.client_connections = nz(4);
         let r = rules(&limits);
-        assert_eq!(r.limit(ResourceClass::OutboundConnection), 1);
-        assert_eq!(r.limit(ResourceClass::OrdinaryOutboundConnection), 1);
         assert_eq!(r.limit(ResourceClass::ControlConnection), 1);
-        assert_eq!(r.limit(ResourceClass::IngressConnection), 2);
+        assert_eq!(r.limit(ResourceClass::IngressConnection), 3);
+        // Peer and outbound sockets do not depend on `client_connections`.
+        assert_eq!(r.limit(ResourceClass::OutboundConnection), 64);
+        assert_eq!(r.limit(ResourceClass::PeerIngressConnection), 2048);
         limits.client_connections = nz(1);
+        limits.outbound_connections = nz(1);
+        limits.peer_connections = nz(1);
         let r = rules(&limits);
-        assert_eq!(r.limit(ResourceClass::OrdinaryOutboundConnection), 0);
+        assert_eq!(r.limit(ResourceClass::ControlConnection), 0);
         assert_eq!(r.limit(ResourceClass::IngressConnection), 1);
+        // A single outbound slot keeps no metadata reserve.
+        assert_eq!(r.limit(ResourceClass::OrdinaryOutboundConnection), 1);
+        assert_eq!(r.limit(ResourceClass::PeerIngressConnection), 1);
+        limits.outbound_connections = nz(2);
+        assert_eq!(
+            rules(&limits).limit(ResourceClass::OrdinaryOutboundConnection),
+            1
+        );
         limits.flights = nz(usize::MAX);
         assert_eq!(rules(&limits).limit(ResourceClass::Waiter), usize::MAX);
+        assert!(Rules::wakes(ResourceClass::PeerIngressConnection));
     }
 
     #[test]
-    fn crypto_queue_holds_every_peer_exchange_of_a_worker() {
+    fn peer_crypto_jobs_count_peer_ingress_and_outbound_connections() {
         let limits = Limits::default();
         assert_eq!(limits.crypto_submissions(), 512);
         let rules = Rules::new(limits.clone(), Floors::for_page(16 * MIB, 0));
-        // 45 inbound and 16 outbound connections: the default queue never sheds a
-        // verification before connection admission stops accepting work.
-        assert_eq!(rules.peer_crypto_jobs(), 61);
-        assert!(rules.peer_crypto_jobs() <= limits.crypto_submissions());
-        // Connection admission scales with `client_connections`, the queue with
-        // `queue_entries`; at the minimum the queue is still two submissions.
+        // 2,048 inbound and 64 outbound connections: more exchanges than the default queue
+        // holds, so a burst sheds verifications with the unsigned overload head (the server
+        // answers it at once) instead of leaving connections unaccepted.
+        assert_eq!(rules.peer_crypto_jobs(), 2048 + 64);
+        assert!(rules.peer_crypto_jobs() > limits.crypto_submissions());
+        // Peer connections scale with `peer_connections` and `outbound_connections`, the queue
+        // with `queue_entries`; at the minimum the queue is still two submissions.
         let mut small = limits.clone();
         small.queue_entries = nz(1);
-        small.client_connections = nz(1);
+        small.peer_connections = nz(1);
+        small.outbound_connections = nz(1);
         assert_eq!(small.crypto_submissions(), 2);
         let rules = Rules::new(small.clone(), Floors::for_page(16 * MIB, 0));
-        assert!(rules.peer_crypto_jobs() <= small.crypto_submissions());
+        assert_eq!(rules.peer_crypto_jobs(), 2);
         let mut huge = limits;
         huge.queue_entries = nz(usize::MAX);
         assert_eq!(huge.crypto_submissions(), usize::MAX);

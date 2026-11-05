@@ -4928,6 +4928,8 @@ pub(crate) mod tests {
                 queue_entries: small,
                 connections_per_neighbor: small,
                 client_connections: small,
+                peer_connections: small,
+                outbound_connections: small,
                 pipes: std::num::NonZeroUsize::new(pipes).unwrap(),
                 range_window_pages: small,
                 header_bytes: small,

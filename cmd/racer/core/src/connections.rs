@@ -5,18 +5,22 @@
 //!
 //! - Outbound. Each I/O worker has its own HTTP pool. A pool keeps at most `per_endpoint`
 //!   connections busy per next hop (`src/http.rs` `Endpoint::capacity`, `PoolConfig::per_endpoint`
-//!   from `connections_per_neighbor`) and reuses an idle one first, newest first
+//!   from `connections_per_neighbor`, 8) and reuses an idle one first, newest first
 //!   (`http/src/connection.rs` `acquire`). Every connection, busy or idle, holds one
-//!   `OrdinaryOutboundConnection` slot (`src/admission.rs` `reserve_connection`). When none is free
+//!   `OrdinaryOutboundConnection` slot (63 of `outbound_connections`, `src/admission.rs`
+//!   `reserve_connection`). When none is free
 //!   the pool closes all of its idle connections and tries once more; past that the exchange fails
 //!   `Overloaded` at once, before any I/O (`http/src/connection.rs`, `clear_idle` then
 //!   `reserve()?`). Over the per-endpoint cap it also fails `Overloaded` at once.
-//! - Ingress. The peer listener reserves an `IngressConnection` slot on any worker that has one
-//!   before it calls `accept` (`src/peer/server.rs` `listen`, `AcceptMode::Distributed`, through
-//!   `flow_core::admission::Handoff::reserve`). With every worker full it stops accepting, so new
-//!   connections wait in the kernel accept queue in arrival order and are accepted as slots free.
-//!   The queue is the listener's backlog (`std::net::TcpListener::bind`, 128); past it Linux drops
-//!   the handshake and the sender hears nothing until its attempt gives up.
+//! - Ingress. The peer listener reserves a `PeerIngressConnection` slot (`peer_connections`,
+//!   2,048 per worker) on any worker that has one before it calls `accept` (`src/peer/server.rs`
+//!   `listen`, `AcceptMode::Distributed`, through `flow_core::admission::Handoff::reserve`). With
+//!   every worker full it accepts the connection only to write the unsigned overload head and
+//!   close it, so the sender's handshake fails `Overloaded` at once (`Config::refuse_when_full`).
+//!   The queue and backlog below model the listener before that change (`refuse_when_full`
+//!   off): connections wait in the kernel accept queue in arrival order and are accepted as
+//!   slots free; past the backlog (`std::net::TcpListener::bind`, 128) Linux drops the handshake
+//!   and the sender hears nothing until its attempt gives up.
 //! - A connection runs one exchange at a time and holds its ingress slot while idle too: the
 //!   server waits up to `request_timeout` (30 s) for the next head (`src/peer/server.rs`
 //!   `serve_connection`, `header_scope`), and the sender keeps it in its pool for the pool's idle
@@ -63,9 +67,9 @@ pub struct Config {
     /// new one, rather than leaving the new one in the accept queue. The proposed fix for idle
     /// connections pinning ingress slots (see `dst/MODEL.md`, "Peer connection slots").
     pub evict_idle: bool,
-    /// Not production: a full listener with nothing to evict accepts the connection only to
-    /// answer the unsigned overload head at once, rather than leaving it in the accept queue,
-    /// so the sender goes elsewhere (proposed fix, see `dst/MODEL.md`).
+    /// A full listener with nothing to evict accepts the connection only to answer the unsigned
+    /// overload head at once, rather than leaving it in the accept queue, so the sender goes
+    /// elsewhere (production: `src/peer/server.rs` `listen`, `refuse`).
     pub refuse_when_full: bool,
 }
 
@@ -75,19 +79,34 @@ impl Config {
         Self::from_limits(&Limits::default(), workers)
     }
 
+    /// The limits before peer ingress was sized apart from client connections, for comparison
+    /// (`dst/MODEL.md`, "Peer connection slots"): 45 ingress slots per worker (64 client
+    /// connections less 3 control and 16 outbound), 15 ordinary outbound, 2 busy per next hop,
+    /// and a full listener that leaves new connections in its accept queue.
+    pub fn legacy(workers: u32) -> Self {
+        let workers = workers.max(1) as usize;
+        Self {
+            ingress: 45 * workers,
+            outbound: 15,
+            per_endpoint: 2,
+            refuse_when_full: false,
+            ..Self::production(1)
+        }
+    }
+
     pub fn from_limits(limits: &Limits, workers: u32) -> Self {
         let rules = Rules::new(limits.clone(), Floors::for_page(4096, 0));
         let workers = workers.max(1) as usize;
         Self {
             ingress: rules
-                .limit(ResourceClass::IngressConnection)
+                .limit(ResourceClass::PeerIngressConnection)
                 .saturating_mul(workers),
             outbound: rules.limit(ResourceClass::OrdinaryOutboundConnection),
             per_endpoint: limits.connections_per_neighbor.get(),
             backlog: LISTEN_BACKLOG,
             idle_timeout: IDLE_TIMEOUT_NS,
             evict_idle: false,
-            refuse_when_full: false,
+            refuse_when_full: true,
         }
     }
 }
@@ -110,7 +129,7 @@ pub enum Acquire {
     /// No outbound slot or per-endpoint capacity: fails `Overloaded` before any I/O.
     Overloaded,
     /// The receiver's listener is full and answers the unsigned overload head at once
-    /// (`Config::refuse_when_full`, not production).
+    /// (`Config::refuse_when_full`).
     Refused,
 }
 
@@ -497,14 +516,23 @@ mod tests {
     #[test]
     fn production_defaults_follow_the_admission_rules() {
         let config = Config::production(4);
-        // 64 connections per worker less 3 control and 16 outbound, on 4 workers.
-        assert_eq!(config.ingress, 45 * 4);
-        // 16 outbound less the metadata reserve.
-        assert_eq!(config.outbound, 15);
-        assert_eq!(config.per_endpoint, 2);
+        // 2,048 peer connections per worker, on 4 workers.
+        assert_eq!(config.ingress, 2048 * 4);
+        // 64 outbound less the metadata reserve.
+        assert_eq!(config.outbound, 63);
+        assert_eq!(config.per_endpoint, 8);
         assert_eq!(config.backlog, 128);
         assert_eq!(config.idle_timeout, 30_000_000_000);
-        assert_eq!(Config::production(0).ingress, 45);
+        assert!(config.refuse_when_full);
+        assert!(!config.evict_idle);
+        assert_eq!(Config::production(0).ingress, 2048);
+        let legacy = Config::legacy(2);
+        assert_eq!(
+            (legacy.ingress, legacy.outbound, legacy.per_endpoint),
+            (90, 15, 2)
+        );
+        assert!(!legacy.refuse_when_full);
+        assert_eq!(legacy.backlog, 128);
     }
 
     #[test]

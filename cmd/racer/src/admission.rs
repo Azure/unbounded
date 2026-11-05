@@ -435,6 +435,9 @@ pub fn reserve_connection(
     if matches!(role, ResourceClass::IngressConnection) {
         return reserve_ingress(&admission.shared());
     }
+    if matches!(role, ResourceClass::PeerIngressConnection) {
+        return reserve_peer_ingress(&admission.shared());
+    }
     if !matches!(
         role,
         ResourceClass::OutboundConnection | ResourceClass::ControlConnection
@@ -489,10 +492,27 @@ pub fn reserve_fill(
 pub fn reserve_ingress(admission: &SharedQuotas<AdmissionPolicy>) -> Result<ConnectionReservation> {
     reserve_ingress_charges(admission).map_err(Into::into)
 }
+/// Admit an inbound peer socket against `PeerIngressConnection` and the total.
+pub fn reserve_peer_ingress(
+    admission: &SharedQuotas<AdmissionPolicy>,
+) -> Result<ConnectionReservation> {
+    reserve_peer_ingress_charges(admission).map_err(Into::into)
+}
 fn reserve_ingress_charges(
     admission: &SharedQuotas<AdmissionPolicy>,
 ) -> flow_control::Result<ConnectionReservation> {
     let role = admission.reserve(ResourceClass::IngressConnection, 1)?;
+    let total = admission.reserve(ResourceClass::Connection, 1)?;
+    Ok(ConnectionReservation {
+        _total: total,
+        _role: role,
+        ordinary: None,
+    })
+}
+fn reserve_peer_ingress_charges(
+    admission: &SharedQuotas<AdmissionPolicy>,
+) -> flow_control::Result<ConnectionReservation> {
+    let role = admission.reserve(ResourceClass::PeerIngressConnection, 1)?;
     let total = admission.reserve(ResourceClass::Connection, 1)?;
     Ok(ConnectionReservation {
         _total: total,
@@ -512,29 +532,59 @@ pub(crate) struct Accepted {
     pub reservation: ConnectionReservation,
     pub kind: Kind,
 }
-struct IngressAdmission(SharedQuotas<AdmissionPolicy>);
+struct IngressAdmission {
+    quotas: SharedQuotas<AdmissionPolicy>,
+    peer: bool,
+}
 impl flow_control::HandoffAdmission for IngressAdmission {
     type Reservation = ConnectionReservation;
     fn register(&self, waker: &Waker) {
-        self.0.register(waker);
+        self.quotas.register(waker);
     }
     fn reserve(&self) -> flow_control::Result<ConnectionReservation> {
-        reserve_ingress_charges(&self.0)
+        if self.peer {
+            reserve_peer_ingress_charges(&self.quotas)
+        } else {
+            reserve_ingress_charges(&self.quotas)
+        }
     }
 }
-pub(crate) struct Ingress(Arc<flow_control::Handoff<WorkerId, IngressAdmission, (OwnedFd, Kind)>>);
+/// Hands accepted sockets to the worker that reserved their slot. Client sockets reserve
+/// `IngressConnection`, peer sockets `PeerIngressConnection`; both also hold the `Connection`
+/// total.
+pub(crate) struct Ingress {
+    handoff: Arc<flow_control::Handoff<WorkerId, IngressAdmission, (OwnedFd, Kind)>>,
+    peer: bool,
+}
 pub(crate) struct Offer(flow_control::Offer<WorkerId, IngressAdmission, (OwnedFd, Kind)>);
 impl Ingress {
+    /// A handoff for client sockets.
     pub fn new(workers: &[WorkerId]) -> Self {
-        Self(Arc::new(flow_control::Handoff::new(workers)))
+        Self {
+            handoff: Arc::new(flow_control::Handoff::new(workers)),
+            peer: false,
+        }
+    }
+    /// A handoff for inbound peer sockets.
+    pub fn for_peers(workers: &[WorkerId]) -> Self {
+        Self {
+            peer: true,
+            ..Self::new(workers)
+        }
     }
     pub fn install(&self, worker: WorkerId, admission: &Quotas<AdmissionPolicy>) -> Result<()> {
-        self.0
-            .install(&worker, IngressAdmission(admission.shared()))
+        self.handoff
+            .install(
+                &worker,
+                IngressAdmission {
+                    quotas: admission.shared(),
+                    peer: self.peer,
+                },
+            )
             .map_err(Into::into)
     }
     pub fn reserve(self: &Arc<Self>, waker: &Waker) -> Result<Offer> {
-        self.0.reserve(waker).map(Offer).map_err(Into::into)
+        self.handoff.reserve(waker).map(Offer).map_err(Into::into)
     }
     pub fn pop_batch<const N: usize>(
         &self,
@@ -542,7 +592,7 @@ impl Ingress {
         waker: &Waker,
         budget: usize,
     ) -> Result<[Option<Accepted>; N]> {
-        self.0
+        self.handoff
             .pop_batch(&worker, waker, budget)
             .map(|items| {
                 items.map(|item| {
@@ -559,7 +609,7 @@ impl Ingress {
             .map_err(Into::into)
     }
     pub fn close(&self, worker: WorkerId) {
-        self.0.close(&worker);
+        self.handoff.close(&worker);
     }
 }
 impl Offer {
@@ -824,9 +874,9 @@ mod tests {
 
     #[test]
     fn ordinary_outbound_leaves_metadata_reserve_and_reclassification_enforces_it() {
-        for (connections, ordinary, total) in [(64, 15, 16), (8, 1, 2), (4, 1, 1)] {
+        for (ordinary, total) in [(63, 64), (15, 16), (1, 2), (1, 1)] {
             let mut limits = crate::test_support::cluster::config(false).limits;
-            limits.client_connections = std::num::NonZeroUsize::new(connections).unwrap();
+            limits.outbound_connections = std::num::NonZeroUsize::new(total).unwrap();
             let admission = Quotas::new(AdmissionPolicy::new(limits));
             assert_eq!(admission.limit(ResourceClass::OutboundConnection), total);
             assert_eq!(
@@ -882,11 +932,16 @@ mod tests {
             3,
             "snapshot, enrollment, and key delivery slots"
         );
+        // Peer ingress has its own slots, also outside client admission.
+        let peers: Vec<_> = (0..admission.limit(ResourceClass::PeerIngressConnection))
+            .map(|_| reserve_connection(&admission, ResourceClass::PeerIngressConnection).unwrap())
+            .collect();
+        assert!(reserve_connection(&admission, ResourceClass::PeerIngressConnection).is_err());
         assert_eq!(
             admission.used(ResourceClass::Connection),
             admission.limit(ResourceClass::Connection)
         );
-        drop((ingress, outbound, control));
+        drop((ingress, outbound, control, peers));
         assert_eq!(admission.used(ResourceClass::Connection), 0);
     }
 
@@ -1085,18 +1140,25 @@ mod rules_equivalence_tests {
                 .flights
                 .get()
                 .saturating_mul(limits.waiters_per_flight.get()),
-            ResourceClass::Connection => limits.client_connections.get(),
+            ResourceClass::Connection => limits
+                .client_connections
+                .get()
+                .saturating_add(limits.peer_connections.get())
+                .saturating_add(limits.outbound_connections.get()),
             ResourceClass::ControlConnection => (limits.client_connections.get() / 4).min(3),
-            ResourceClass::OutboundConnection => limits.client_connections.get() / 4,
+            // Peer and outbound sockets have their own limits since peer ingress was sized
+            // apart from client connections (`dst/MODEL.md`, "Peer connection slots").
+            ResourceClass::OutboundConnection => limits.outbound_connections.get(),
             ResourceClass::OrdinaryOutboundConnection => {
                 let outbound = legacy_limit(limits, ResourceClass::OutboundConnection);
                 outbound
                     - usize::from(outbound >= 2) * racer_core::admission::METADATA_OUTBOUND_RESERVE
             }
-            ResourceClass::IngressConnection => limits.client_connections.get().saturating_sub(
-                legacy_limit(limits, ResourceClass::ControlConnection)
-                    + legacy_limit(limits, ResourceClass::OutboundConnection),
-            ),
+            ResourceClass::IngressConnection => limits
+                .client_connections
+                .get()
+                .saturating_sub(legacy_limit(limits, ResourceClass::ControlConnection)),
+            ResourceClass::PeerIngressConnection => limits.peer_connections.get(),
             ResourceClass::Pipe => limits.pipes.get(),
             ResourceClass::ControlProgress => limits.queue_entries.get(),
             ResourceClass::Relay => limits.relay_transfers.get(),
@@ -1159,7 +1221,9 @@ mod rules_equivalence_tests {
                 AdmissionPolicy::wakes(class),
                 matches!(
                     class,
-                    ResourceClass::Connection | ResourceClass::IngressConnection
+                    ResourceClass::Connection
+                        | ResourceClass::IngressConnection
+                        | ResourceClass::PeerIngressConnection
                 )
             );
             assert_eq!(
@@ -1187,8 +1251,11 @@ mod rules_equivalence_tests {
         check(scaled.limits);
         let one = NonZeroUsize::MIN;
         for connections in [1, 2, 3, 4, 7, 8, 11, 12, 13, 16, 65_536] {
+            let connections = NonZeroUsize::new(connections).unwrap();
             check(Limits {
-                client_connections: NonZeroUsize::new(connections).unwrap(),
+                client_connections: connections,
+                peer_connections: connections,
+                outbound_connections: connections,
                 ..Limits::default()
             });
         }

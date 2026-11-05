@@ -159,6 +159,9 @@ pub struct NodeState {
 
     ingress: Arc<crate::admission::Ingress>,
 
+    /// Inbound peer sockets, admitted against `PeerIngressConnection`.
+    peer_ingress: Arc<crate::admission::Ingress>,
+
     metrics: Vec<(WorkerId, crate::telemetry::Metrics)>,
 
     failures: crate::telemetry::Failures,
@@ -239,6 +242,7 @@ impl NodeState {
             profiling: Default::default(),
             hedges: std::sync::OnceLock::new(),
             ingress: Arc::new(crate::admission::Ingress::new(&workers)),
+            peer_ingress: Arc::new(crate::admission::Ingress::for_peers(&workers)),
             subscriptions: Arc::new(crate::peer::subscriptions::Subscriptions::new(
                 Default::default(),
             )?),
@@ -1300,6 +1304,7 @@ impl WorkerApplication {
             .set_observer(node.failures.observer(worker));
         metrics.observe_admission(worker, admission.shared())?;
         node.ingress.install(worker, &admission)?;
+        node.peer_ingress.install(worker, &admission)?;
         let reactor = runtime.reactor.clone();
         let limits = admission.policy().limits();
         let snapshots = Rc::new(PublicationTarget::new(
@@ -1588,7 +1593,7 @@ impl WorkerApplication {
             crate::peer::server::Settings {
                 tcp_nodelay: config.peer_tcp_nodelay,
                 accept: if distributed {
-                    crate::peer::server::AcceptMode::Distributed(node.ingress.clone())
+                    crate::peer::server::AcceptMode::Distributed(node.peer_ingress.clone())
                 } else {
                     crate::peer::server::AcceptMode::Local
                 },
@@ -2298,13 +2303,15 @@ impl WorkerApplication {
     /// Admit a bounded batch of handed-off connections and poll active peer work.
     fn poll_ingress(&mut self, cx: &mut Context<'_>, budget: usize) -> Result<()> {
         if !self.stopping {
-            for accepted in self
+            let clients = self
                 .node
                 .ingress
-                .pop_batch::<64>(self.worker, cx.waker(), budget)?
-                .into_iter()
-                .flatten()
-            {
+                .pop_batch::<64>(self.worker, cx.waker(), budget)?;
+            let peers = self
+                .node
+                .peer_ingress
+                .pop_batch::<64>(self.worker, cx.waker(), budget)?;
+            for accepted in clients.into_iter().chain(peers).flatten() {
                 let connection =
                     crate::http::from_reserved(accepted.fd.into(), accepted.reservation);
                 // Isolated retirement failures must not terminate listener service.
@@ -2639,6 +2646,7 @@ impl crate::lifecycle::Service<RequestScope> for WorkerApplication {
             profiling.stop();
         }
         self.node.ingress.close(self.worker);
+        self.node.peer_ingress.close(self.worker);
         if let Some(scope) = &self.task_scope {
             scope.cancel()?;
         }
@@ -3351,6 +3359,8 @@ fn partition_limits_with_cause(
         ("flights", &mut limits.flights),
         ("queue_entries", &mut limits.queue_entries),
         ("client_connections", &mut limits.client_connections),
+        ("peer_connections", &mut limits.peer_connections),
+        ("outbound_connections", &mut limits.outbound_connections),
         ("pipes", &mut limits.pipes),
         ("placement_cache_bytes", &mut limits.placement_cache_bytes),
         ("cached_paths", &mut limits.cached_paths),
@@ -3397,8 +3407,8 @@ fn partition_limits_with_cause(
             limits.queue_entries.get() < crate::telemetry::CONTROL_SLOTS + 2,
         ),
         (
-            "client_connections",
-            limits.client_connections < limits.connections_per_neighbor,
+            "outbound_connections",
+            limits.outbound_connections < limits.connections_per_neighbor,
         ),
     ] {
         if insufficient {
@@ -3729,9 +3739,10 @@ mod lifecycle_policy_tests {
                     "RACER_DIRTY_BYTES" => Some("1073741824".into()),
                     // Each worker funds the 1 MiB diagnostic response buffers.
                     "RACER_REQUEST_CONTEXT_BYTES" => Some("536870912".into()),
-                    "RACER_QUEUE_ENTRIES" | "RACER_CLIENT_CONNECTIONS" | "RACER_PIPES" => {
-                        Some("1024".into())
-                    }
+                    "RACER_QUEUE_ENTRIES"
+                    | "RACER_CLIENT_CONNECTIONS"
+                    | "RACER_OUTBOUND_CONNECTIONS"
+                    | "RACER_PIPES" => Some("1024".into()),
                     "RACER_RELAY_TRANSFERS" => Some("64".into()),
                     _ => None,
                 })

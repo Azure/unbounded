@@ -1434,24 +1434,37 @@ fn readers_handle_owners_that_are_behind() {
     }
 }
 
-/// Production peer connection slots (`racer_core::connections`) on the 400-node cold start:
-/// connections queue at hot nodes' full listeners, partly behind idle connections peers keep
-/// pooled for 30 s. Evicting the longest-idle inbound connection (the proposed fix, not
-/// production) cuts the queued waits that outlive their attempt. Mirrors the Model's
-/// `idle_connections_pin_ingress_slots` (`dst/MODEL.md`, "Peer connection slots").
+/// Peer connection slots (`racer_core::connections`) on the 400-node cold start. With the legacy
+/// limits (`Config::legacy`) connections queue at hot nodes' full listeners, partly behind idle
+/// connections peers keep pooled for 30 s; evicting the longest-idle inbound connection cuts the
+/// queued waits that outlive their attempt. Production (2,048 peer slots per worker, refusal
+/// when full) never queues. Mirrors the Model's `idle_connections_pin_ingress_slots`
+/// (`dst/MODEL.md`, "Peer connection slots").
 #[test]
 fn idle_connections_pin_ingress_slots() {
-    let report = |evict: bool| {
+    let report = |legacy: bool, evict: bool| {
         let mut config = quiet(400);
         config.duration_ns = 30 * SECONDS;
         config.storms = vec![Storm::new(0, 0, 400, 10 * MILLIS)];
-        config.node.connections = true;
+        assert!(config.node.connections, "production default");
+        config.node.conn_legacy = legacy;
         config.node.conn_evict_idle = evict;
         run(config, 8)
     };
     let conn = |r: &Value, k: &str| r["connections"][k].as_u64().unwrap();
-    let production = report(false);
-    let evicting = report(true);
+    let production = report(true, false);
+    let evicting = report(true, true);
+    let current = report(false, false);
+    for key in ["queued", "dropped", "idle_evicted"] {
+        assert_eq!(conn(&current, key), 0, "{key}: {}", current["connections"]);
+    }
+    assert!(conn(&current, "reused") > 0, "{}", current["connections"]);
+    assert!(
+        counter(&current, "reads_failed") < counter(&production, "reads_failed"),
+        "{} {}",
+        counter(&current, "reads_failed"),
+        counter(&production, "reads_failed")
+    );
     assert!(
         conn(&production, "queued") > 0,
         "{}",

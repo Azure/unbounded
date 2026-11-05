@@ -797,6 +797,7 @@ fn worker_sizing_reports_specific_resource_floor() {
         "request_context_bytes",
         "queue_entries",
         "client_connections",
+        "outbound_connections",
         "registered_bytes",
         "pipes",
         "placement_cache_bytes",
@@ -809,6 +810,7 @@ fn worker_sizing_reports_specific_resource_floor() {
             "request_context_bytes" => &mut limits.request_context_bytes,
             "queue_entries" => &mut limits.queue_entries,
             "client_connections" => &mut limits.client_connections,
+            "outbound_connections" => &mut limits.outbound_connections,
             "registered_bytes" => &mut limits.registered_bytes,
             "placement_cache_bytes" => &mut limits.placement_cache_bytes,
             _ => &mut limits.pipes,
@@ -816,9 +818,15 @@ fn worker_sizing_reports_specific_resource_floor() {
         *value = NonZeroUsize::new(1).unwrap();
         let workers = if dimension == "pipes" { 2 } else { 1 };
         let rdma = dimension == "registered_bytes";
+        // One client connection leaves no control slot.
+        let cause = if dimension == "client_connections" {
+            "control_connections"
+        } else {
+            dimension
+        };
         assert_eq!(
             partition_limits_with_cause(&limits, workers, rdma).err(),
-            Some((dimension, Error::InvalidConfiguration)),
+            Some((cause, Error::InvalidConfiguration)),
             "{dimension}"
         );
         if rdma {
@@ -3804,7 +3812,7 @@ fn peer_tcp_nodelay_assembled_outbound_and_distributed_accept() {
             runtime.reactor.poll_budgeted(64).unwrap();
             if inbound.is_none() {
                 inbound = node
-                    .ingress
+                    .peer_ingress
                     .pop_batch::<1>(WorkerId(0), cx.waker(), 1)
                     .unwrap()[0]
                     .take();
@@ -3837,6 +3845,116 @@ fn peer_tcp_nodelay_assembled_outbound_and_distributed_accept() {
                 .used(crate::admission::ResourceClass::Connection),
             0
         );
+        assert_eq!(
+            runtime
+                .admission
+                .used(crate::admission::ResourceClass::PeerIngressConnection),
+            0
+        );
+    }
+}
+
+/// Peer ingress is sized by `peer_connections`, apart from client connections. With every slot
+/// in use the listener accepts a new connection only to answer the unsigned overload head and
+/// close it, rather than leave it in the kernel accept queue; once a slot frees it accepts again.
+#[test]
+fn a_full_peer_listener_refuses_with_the_overload_head() {
+    use crate::admission::ResourceClass;
+    use std::io::Read;
+    let mut config = crate::test_support::cluster::config(false);
+    config.limits.peer_connections = NonZeroUsize::new(1).unwrap();
+    let node = Arc::new(NodeState::default());
+    let (app, runtime, _) = local_worker(&config, &node, 0);
+    assert_eq!(
+        runtime
+            .admission
+            .limit(ResourceClass::PeerIngressConnection),
+        1
+    );
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    drop(listener);
+    let scope = scope(&racer_io::Clock::host(), Duration::from_secs(5)).unwrap();
+    let mut serving = app.peers.listen(address, &scope);
+    let mut cx = Context::from_waker(futures::task::noop_waker_ref());
+    assert!(serving.as_mut().poll(&mut cx).is_pending());
+    let mut pump = |until: Instant, done: &mut dyn FnMut() -> bool| {
+        while !done() {
+            assert!(serving.as_mut().poll(&mut cx).is_pending());
+            runtime.reactor.poll_budgeted(64).unwrap();
+            assert!(Instant::now() < until, "peer listener stalled");
+            runtime.reactor.wait(Duration::from_millis(1)).unwrap();
+        }
+    };
+    let pop = |node: &NodeState| {
+        node.peer_ingress
+            .pop_batch::<1>(WorkerId(0), futures::task::noop_waker_ref(), 1)
+            .unwrap()[0]
+            .take()
+    };
+    // The first connection takes the only slot and is handed off.
+    let _first = std::net::TcpStream::connect(address).unwrap();
+    let mut held = None;
+    pump(Instant::now() + Duration::from_secs(3), &mut || {
+        held = held.take().or_else(|| pop(&node));
+        held.is_some()
+    });
+    assert_eq!(
+        runtime.admission.used(ResourceClass::PeerIngressConnection),
+        1
+    );
+    // The socket total counts it; client ingress does not.
+    assert_eq!(runtime.admission.used(ResourceClass::Connection), 1);
+    assert_eq!(runtime.admission.used(ResourceClass::IngressConnection), 0);
+    // The second is refused: it reads the overload head, then end of stream.
+    let mut second = std::net::TcpStream::connect(address).unwrap();
+    second.set_nonblocking(true).unwrap();
+    let mut answer = Vec::new();
+    pump(Instant::now() + Duration::from_secs(3), &mut || {
+        let mut buffer = [0u8; 256];
+        match second.read(&mut buffer) {
+            Ok(0) => true,
+            Ok(n) => {
+                answer.extend_from_slice(&buffer[..n]);
+                false
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => false,
+            Err(error) => panic!("{error}"),
+        }
+    });
+    let head = crate::http::Codec::new(65536)
+        .decode_head(&answer)
+        .unwrap()
+        .unwrap()
+        .0;
+    assert!(peer_wire::is_overloaded(&head));
+    assert!(pop(&node).is_none());
+    assert_eq!(
+        runtime.admission.used(ResourceClass::PeerIngressConnection),
+        1
+    );
+    // A freed slot accepts the next connection.
+    drop(held);
+    assert_eq!(
+        runtime.admission.used(ResourceClass::PeerIngressConnection),
+        0
+    );
+    let _third = std::net::TcpStream::connect(address).unwrap();
+    let mut accepted = None;
+    pump(Instant::now() + Duration::from_secs(3), &mut || {
+        accepted = accepted.take().or_else(|| pop(&node));
+        accepted.is_some()
+    });
+    drop(accepted);
+    scope.cancel().unwrap();
+    let until = Instant::now() + Duration::from_secs(3);
+    loop {
+        runtime.reactor.poll_budgeted(64).unwrap();
+        if let Poll::Ready(result) = serving.as_mut().poll(&mut cx) {
+            assert_eq!(result, Err(Error::Cancelled));
+            break;
+        }
+        assert!(Instant::now() < until, "peer cancellation stalled");
     }
 }
 
@@ -4098,7 +4216,7 @@ fn distributed_peer_listener_recovers_from_queue_pressure() {
         assert!(serving.as_mut().poll(&mut cx).is_pending());
         runtime.reactor.poll_budgeted(64).unwrap();
         if let Some(accepted) = node
-            .ingress
+            .peer_ingress
             .pop_batch::<1>(WorkerId(0), cx.waker(), 1)
             .unwrap()[0]
             .take()
