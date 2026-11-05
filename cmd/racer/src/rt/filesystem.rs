@@ -1477,7 +1477,7 @@ mod memory_tests {
 
 #[cfg(test)]
 mod kernel_tests {
-    //! Private Linux flag validation; host behavior lives in tests/runtime.rs.
+    //! Private Linux flag validation; host behavior lives in rt/integration_tests.rs.
     use super::*;
 
     /// Keep secure flags and Linux pathname bounds independent of service limits.

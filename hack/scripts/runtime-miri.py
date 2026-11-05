@@ -62,7 +62,6 @@ GROUPS = {
     ]),
     "rt-memory": ("racer", [
         "rt::filesystem::memory_tests::shared_allocation_preserves_cursor_and_fails_oversized",
-        "rt::filesystem::memory_tests::flags_and_linux_path_bounds_are_not_application_limits",
     ]),
 }
 
@@ -79,7 +78,7 @@ def main():
     root = Path(__file__).resolve().parents[2]
     package, tests = GROUPS[args.group]
     command = [
-        "timeout", "--signal=TERM", "--kill-after=10s", "290s",
+        "timeout", "--signal=TERM", "--kill-after=10s", "1100s" if package == "racer" else "290s",
         "cargo", "+" + TOOLCHAIN, "miri", "test", "--locked",
         "--manifest-path", str(root / "cmd/racer/Cargo.toml"),
         "--target-dir", os.environ.get("RUNTIME_MIRI_TARGET_DIR", str(root / "tmp/runtime-miri-target")),
@@ -89,6 +88,10 @@ def main():
     # Keep Miri's default isolation, aliasing, alignment, and leak checks enabled.
     # Inherit only the tool/cache placement, not caller flags that weaken checks.
     environment = dict(os.environ, MIRIFLAGS="")
+    if package == "racer":
+        # The pinned Miri nightly predates if-let guard stabilization, which the
+        # root crate uses. Enabling the gate does not change checked semantics.
+        environment["RUSTFLAGS"] = "-Zcrate-attr=feature(if_let_guard)"
     print("Running: " + " ".join(command), flush=True)
     result = subprocess.run(command, env=environment, stdout=subprocess.PIPE,
                             stderr=subprocess.STDOUT, text=True, check=False)

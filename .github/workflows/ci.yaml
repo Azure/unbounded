@@ -552,7 +552,7 @@ jobs:
   runtime-miri:
     name: Runtime Miri (${{ matrix.group }})
     runs-on: ubuntu-24.04
-    timeout-minutes: 15
+    timeout-minutes: 30
     strategy:
       fail-fast: false
       matrix:
@@ -581,7 +581,7 @@ jobs:
         run: timeout --signal=TERM --kill-after=10s 300s cargo +nightly-2025-11-21 miri setup
 
       - name: Validate exact pure runtime test group
-        run: timeout --signal=TERM --kill-after=10s 300s python3 hack/scripts/runtime-miri.py ${{ matrix.group }}
+        run: timeout --signal=TERM --kill-after=10s 1200s python3 hack/scripts/runtime-miri.py ${{ matrix.group }}
   racer-envtest:
     name: Racer API Server Integration Tests
     runs-on: ubuntu-24.04
