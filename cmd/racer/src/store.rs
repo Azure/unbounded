@@ -213,7 +213,7 @@ impl StoreReader {
                 }
             };
             let length = entry.location.extent.length();
-            let amount = staging_capacity(length)?;
+            let amount = staging_capacity(length)?.max(self.buffers.disk_capacity(length)?);
             let mut reserved = reserve(amount);
             if matches!(reserved, Err(Error::Overloaded)) {
                 self.slabs.reclaim_idle();
@@ -226,10 +226,10 @@ impl StoreReader {
             {
                 return Err(Error::InvalidConfiguration);
             }
-            let buffer = self.slabs.allocate(length, reservation)?;
+            let buffer = self.buffers.disk_buffer(length, reservation)?;
             let buffer = match self
                 .slabs
-                .read(&self.reactor, entry.location.extent, buffer, lease, scope)
+                .read_buf(&self.reactor, entry.location.extent, buffer, lease, scope)
                 .await
             {
                 Ok(b) => b,
@@ -245,7 +245,7 @@ impl StoreReader {
             // A record with this magic but a different format version (for
             // example, written by a newer release) is a cold cache miss, not
             // evidence of damaged storage. Never parse its remaining fields.
-            let bytes = buffer.bytes()?;
+            let bytes: &[u8] = &buffer;
             if bytes.get(..8) == Some(MAGIC)
                 && bytes
                     .get(8..12)
@@ -254,7 +254,7 @@ impl StoreReader {
                 self.invalidate(&token)?;
                 return Ok(None);
             }
-            let decoded = match parse(&buffer, entry.location.extent) {
+            let decoded = match parse_bytes(&buffer, entry.location.extent) {
                 Ok(d) => d,
                 Err(_) => {
                     self.corrupt_miss();

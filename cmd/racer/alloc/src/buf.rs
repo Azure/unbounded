@@ -669,6 +669,15 @@ impl<C: Charge> Buf<C> {
     }
 
     /// Rebind to a new charge that covers the capacity, returning the old one.
+    pub fn replace_charge(&mut self, charge: C) -> std::result::Result<C, C> {
+        if !charge.covers(self.capacity()) {
+            return Err(charge);
+        }
+        Ok(std::mem::replace(&mut self.charge, charge))
+    }
+
+    /// Move the buffer to a new charge of another type, which must cover the
+    /// full capacity. On refusal both are handed back unchanged.
     pub fn rebind<D: Charge>(mut self, charge: D) -> std::result::Result<(Buf<D>, C), (Self, D)> {
         if !charge.covers(self.capacity()) {
             return Err((self, charge));

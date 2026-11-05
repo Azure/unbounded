@@ -1101,6 +1101,7 @@ mod rules_equivalence_tests {
             ResourceClass::Pipe => limits.pipes.get(),
             ResourceClass::ControlProgress => limits.queue_entries.get(),
             ResourceClass::Relay => limits.relay_transfers.get(),
+            ResourceClass::Pool => limits.ciphertext_bytes.get(),
         }
     }
 

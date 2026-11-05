@@ -24,10 +24,13 @@ pub enum ResourceClass {
     /// Outbound sockets other than origin metadata, kept below the outbound
     /// limit so metadata lookups never queue behind page bodies.
     OrdinaryOutboundConnection,
+    /// Idle bytes held by worker buffer pools for reuse. Bounded by the
+    /// ciphertext budget and released by memory pressure.
+    Pool,
 }
 
 impl ResourceClass {
-    pub const ALL: [Self; 15] = [
+    pub const ALL: [Self; 16] = [
         Self::Plaintext,
         Self::Ciphertext,
         Self::DirtyCiphertext,
@@ -43,6 +46,7 @@ impl ResourceClass {
         Self::OutboundConnection,
         Self::ControlConnection,
         Self::OrdinaryOutboundConnection,
+        Self::Pool,
     ];
 
     /// Stable snake_case name for reports.
@@ -63,12 +67,13 @@ impl ResourceClass {
             Self::OutboundConnection => "outbound_connection",
             Self::ControlConnection => "control_connection",
             Self::OrdinaryOutboundConnection => "ordinary_outbound_connection",
+            Self::Pool => "pool",
         }
     }
 }
 
 impl crate::flow::Class for ResourceClass {
-    const COUNT: usize = 15;
+    const COUNT: usize = 16;
     fn index(self) -> usize {
         self as usize
     }
@@ -213,6 +218,7 @@ impl Rules {
             ResourceClass::Pipe => limits.pipes.get(),
             ResourceClass::ControlProgress => limits.queue_entries.get(),
             ResourceClass::Relay => limits.relay_transfers.get(),
+            ResourceClass::Pool => limits.ciphertext_bytes.get(),
         }
     }
 
@@ -275,6 +281,19 @@ impl Rules {
 mod tests {
     use super::*;
     use crate::flow::Class;
+
+    #[test]
+    fn idle_pool_bytes_are_bounded_by_the_ciphertext_budget() {
+        let rules = Rules::new(Limits::default(), Floors::for_page(4096, 4096));
+        assert_eq!(
+            rules.limit(ResourceClass::Pool),
+            rules.limit(ResourceClass::Ciphertext)
+        );
+        assert!(!Rules::weighted(ResourceClass::Pool));
+        assert!(!Rules::covers(ResourceClass::Pool));
+        assert!(!Rules::wakes(ResourceClass::Pool));
+        assert_eq!(ResourceClass::Pool.name(), "pool");
+    }
 
     #[test]
     fn indices_follow_all_and_names_are_unique() {

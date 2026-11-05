@@ -683,6 +683,45 @@ impl<C: Charge> Slab<C> {
         })
     }
 
+    /// Read exactly one checked extent into a pooled [`crate::buf::Buf`].
+    ///
+    /// Ownership rules match [`Self::read`]: the buffer and lease stay with the
+    /// kernel until completion, and the bytes prove nothing until the caller
+    /// validates them. The buffer's length must equal the extent length and its
+    /// first byte must meet the slab's memory alignment. Unlike [`Self::read`],
+    /// dropping the returned buffer returns its storage to the owning pool.
+    pub fn read_buf<'a, D: Charge, S: Scope, B: Budget>(
+        &'a self,
+        reactor: &'a Reactor<S, B>,
+        extent: Extent,
+        buffer: crate::buf::Buf<D>,
+        lease: SegmentLease,
+        scope: &'a S,
+    ) -> Operation<'a, crate::buf::Buf<D>, S::Error>
+    where
+        S::Error: From<Error>,
+    {
+        Box::pin(async move {
+            let (file, extent) = self.locate_checked(extent, &lease, |alignment, extent| {
+                if !(buffer.as_ptr() as usize).is_multiple_of(alignment.memory())
+                    || !extent.offset().is_multiple_of(alignment.offset())
+                    || !extent.length().is_multiple_of(alignment.length())
+                    || buffer.len() != extent.length()
+                {
+                    return Err(Error::InvalidConfiguration);
+                }
+                Ok(())
+            })?;
+            let completion = reactor
+                .read_at(file, extent.offset(), buffer, lease, scope)
+                .await?;
+            if completion.bytes != extent.length() {
+                return Err(Error::Io.into());
+            }
+            Ok(completion.buffer)
+        })
+    }
+
     /// Write exactly one checked extent with completion-owned accounting and lease.
     /// Failed writes do not roll back the space reserved by append.
     /// Any lease permits writes within its captured prefix, including a lease from

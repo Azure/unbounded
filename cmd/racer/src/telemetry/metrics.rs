@@ -79,7 +79,7 @@ impl From<&crate::pressure::MemorySample> for ProcessMemory {
 }
 
 /// Snake-case `class` label values for every admission class, in index order.
-const ADMISSION_CLASSES: [(crate::admission::ResourceClass, &str); 15] = {
+const ADMISSION_CLASSES: [(crate::admission::ResourceClass, &str); 16] = {
     use crate::admission::ResourceClass as C;
     [
         (C::Plaintext, "plaintext"),
@@ -100,6 +100,7 @@ const ADMISSION_CLASSES: [(crate::admission::ResourceClass, &str); 15] = {
             C::OrdinaryOutboundConnection,
             "ordinary_outbound_connection",
         ),
+        (C::Pool, "pool"),
     ]
 };
 

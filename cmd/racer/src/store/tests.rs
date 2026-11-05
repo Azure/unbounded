@@ -5770,3 +5770,37 @@ fn passthrough_cache_never_enqueues_or_publishes_to_disk() {
         assert!(index.lookup(&id).unwrap().is_none(), "{mode:?}");
     }
 }
+#[test]
+fn warm_disk_reads_reuse_pooled_buffers_charged_to_pool_class() {
+    let f = Fixture::new();
+    let _ = futures::executor::block_on(f.store.open()).unwrap();
+    f.reactor.init().unwrap();
+    let copy = f.copy(1, 113);
+    let id = copy.ciphertext.envelope().page.clone();
+    f.enqueue(copy).unwrap();
+    drive(&f.reactor, f.store.writer.progress(1, &scope())).unwrap();
+    let read = || {
+        drive(&f.reactor, f.store.reader.read(&id, &scope()))
+            .unwrap()
+            .unwrap()
+    };
+    let first = read();
+    let pointer = first.ciphertext.bytes().as_ptr();
+    assert_eq!(f.admission.used(ResourceClass::Pool), 0);
+    drop(first);
+    // The released read buffer is idle in the pool, charged to the Pool class
+    // instead of the reader's Ciphertext reservation.
+    let idle = f.store.reader.buffers.disk_idle_bytes();
+    assert!(idle > 0);
+    assert_eq!(f.admission.used(ResourceClass::Pool), idle);
+    let second = read();
+    assert_eq!(second.ciphertext.bytes().as_ptr(), pointer);
+    assert_eq!(f.admission.used(ResourceClass::Pool), 0);
+    drop(second);
+    // Memory pressure discards idle storage and releases its charge.
+    assert_eq!(f.store.reader.buffers.shed_disk_buffers(), idle);
+    assert_eq!(f.admission.used(ResourceClass::Pool), 0);
+    // A shed buffer stays mapped (cold) and is reused by the next read.
+    let third = read();
+    assert_eq!(third.ciphertext.bytes(), read().ciphertext.bytes());
+}

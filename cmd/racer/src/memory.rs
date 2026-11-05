@@ -189,6 +189,10 @@ impl Drop for AlignedBody {
 pub struct BufferPool {
     admission: Rc<flow_control::Quotas<AdmissionPolicy>>,
     aligned: page_alloc::WorkerBufferPool<PoolCharge>,
+    /// Disk read buffers. Idle storage is charged to [`ResourceClass::Pool`]
+    /// and returns here from any thread, so a warm disk hit reuses a mapping
+    /// instead of mapping and unmapping a fresh one.
+    disk: Rc<std::cell::RefCell<page_alloc::buf::Pool>>,
 }
 /// Mutable staging buffer, not proof of authentication and not client-deliverable.
 /// Fixed-size owned backing stays at the same address when this owner moves.
@@ -250,10 +254,14 @@ pub(crate) struct CiphertextBytes {
     pub storage: CiphertextStorage,
 }
 
+/// Pooled disk read storage charged to the reading cache's Ciphertext class.
+pub(crate) type DiskBuffer = page_alloc::buf::Buf<flow_control::Charge<AdmissionPolicy>>;
+
 pub(crate) enum CiphertextStorage {
     Owned(flow_control::ChargedBytes<AdmissionPolicy>),
+    /// A disk record read into a pooled buffer; `range` is its ciphertext.
     Slab {
-        buffer: page_alloc::FrozenBuffer<flow_control::Charge<AdmissionPolicy>>,
+        buffer: DiskBuffer,
         range: std::ops::Range<usize>,
     },
     /// Ciphertext produced directly into direct-I/O aligned storage.
@@ -346,9 +354,18 @@ impl BufferPool {
     ) -> Self {
         let budget = aligned_capacity(alignment, PAGE_BYTES as usize + 16)
             .map_or(0, |page| page.saturating_mul(ALIGNED_POOL_IDLE_PAGES));
+        let disk = page_alloc::buf::Pool::new(
+            page_alloc::buf::PoolConfig {
+                alignment: alignment.memory(),
+                max_idle_per_class: ALIGNED_POOL_IDLE_PAGES,
+            },
+            flow_control::QuotaPoolAccount::new(admission.shared(), ResourceClass::Pool),
+        )
+        .expect("disk alignment is a valid pool alignment");
         Self {
             admission,
             aligned: page_alloc::WorkerBufferPool::with_budget(alignment, budget),
+            disk: Rc::new(std::cell::RefCell::new(disk)),
         }
     }
     /// Direct-I/O alignment of aligned ciphertext buffers from this worker.
@@ -374,12 +391,45 @@ impl BufferPool {
     /// while memory is constrained.
     pub(crate) fn constrain_idle_buffers(&self, constrained: bool) {
         self.aligned.set_constrained(constrained);
+        if constrained {
+            self.shed_disk_buffers();
+        }
+    }
+    /// Discard idle disk read storage (`MADV_DONTNEED`) and release its
+    /// [`ResourceClass::Pool`] charge. Returns the bytes released.
+    pub(crate) fn shed_disk_buffers(&self) -> usize {
+        self.disk
+            .try_borrow_mut()
+            .map_or(0, |mut pool| pool.shed(usize::MAX))
+    }
+    /// Idle bytes held by the disk read pool.
+    #[cfg(test)]
+    pub(crate) fn disk_idle_bytes(&self) -> usize {
+        self.disk.borrow().idle_bytes()
+    }
+    /// Check out a pooled disk read buffer of exactly `length` bytes. The
+    /// reservation must be a Ciphertext charge from this worker's admission
+    /// covering the pooled capacity; contents are unspecified until the read.
+    pub(crate) fn disk_buffer(
+        &self,
+        length: usize,
+        reservation: flow_control::Charge<AdmissionPolicy>,
+    ) -> Result<DiskBuffer> {
+        if !self.admission.owns(&reservation) {
+            return Err(Error::InvalidConfiguration);
+        }
+        Ok(self.disk.borrow_mut().take(length, reservation, false)?)
+    }
+    /// Capacity a pooled disk read of `length` bytes is charged for.
+    pub(crate) fn disk_capacity(&self, length: usize) -> Result<usize> {
+        Ok(self.disk.borrow().capacity_for(length)?)
     }
     /// Release idle recycled storage: the flow-control recycler and this
     /// worker's aligned pool, dropping the admission charges both retain.
     pub(crate) fn reclaim_idle_buffers(&self) {
         self.admission.reclaim_buffers();
         self.aligned.clear();
+        self.shed_disk_buffers();
     }
     /// Admission a pooled aligned buffer of `length` bytes must be charged for.
     pub(crate) fn aligned_capacity(&self, length: usize) -> Result<usize> {
@@ -611,17 +661,15 @@ impl BufferPool {
     }
     pub(crate) fn slab_ciphertext(
         &self,
-        buffer: page_alloc::AlignedBuffer<flow_control::Charge<AdmissionPolicy>>,
+        buffer: DiskBuffer,
         envelope: PageEnvelope,
         range: std::ops::Range<usize>,
     ) -> Result<CiphertextPage> {
         envelope.validate()?;
-        if buffer.as_slice().get(range.clone()).is_none()
-            || range.len() != envelope.ciphertext_length as usize
+        if buffer.get(range.clone()).is_none() || range.len() != envelope.ciphertext_length as usize
         {
             return Err(Error::CorruptRecord);
         }
-        let buffer = buffer.freeze()?;
         self.validate_reservation(
             buffer.charge(),
             ResourceClass::Ciphertext,
@@ -775,7 +823,11 @@ impl CiphertextPage {
         {
             match &mut inner.storage {
                 CiphertextStorage::Owned(storage) => storage.reservation = reservation,
-                CiphertextStorage::Slab { buffer, .. } => buffer.rebind(reservation)?,
+                CiphertextStorage::Slab { buffer, .. } => {
+                    buffer
+                        .replace_charge(reservation)
+                        .map_err(|_| Error::from(page_alloc::Error::InvalidConfiguration))?;
+                }
                 CiphertextStorage::Aligned { buffer, .. } => buffer.rebind(reservation)?,
                 CiphertextStorage::Registered { .. } => unreachable!(),
             }
@@ -858,7 +910,7 @@ impl CiphertextPage {
     pub fn bytes(&self) -> &[u8] {
         match &self.inner.storage {
             CiphertextStorage::Owned(storage) => &storage.bytes,
-            CiphertextStorage::Slab { buffer, range } => &buffer.as_slice()[range.clone()],
+            CiphertextStorage::Slab { buffer, range } => &buffer[range.clone()],
             CiphertextStorage::Aligned { buffer, length } => &buffer.as_slice()[..*length],
             CiphertextStorage::Registered { page, .. } => page.bytes(),
         }
@@ -3771,17 +3823,17 @@ pub(crate) mod tests {
             let envelope = fixture.ciphertext.envelope().clone();
             let cache = envelope.page.version.object.cache.clone();
             drop(fixture);
-            let mut buffer = page_alloc::Alignment::new(4096, 4096, 4096)
-                .unwrap()
-                .allocate(
-                    4096,
-                    source
-                        .reserve(Some(&cache), ResourceClass::Ciphertext, 4096)
-                        .unwrap(),
-                )
-                .unwrap();
-            buffer.as_mut_slice()[137..156].fill(7);
-            let pointer = buffer.as_slice()[137..].as_ptr();
+            let mut buffer = page_alloc::buf::Buf::unpooled(
+                4096,
+                4096,
+                source
+                    .reserve(Some(&cache), ResourceClass::Ciphertext, 4096)
+                    .unwrap(),
+                false,
+            )
+            .unwrap();
+            buffer[137..156].fill(7);
+            let pointer = buffer[137..].as_ptr();
             let page = BufferPool::new(source.clone())
                 .slab_ciphertext(buffer, envelope, 137..156)
                 .unwrap();
@@ -3829,15 +3881,15 @@ pub(crate) mod tests {
             4090..4109,
             std::ops::Range { start: 20, end: 1 },
         ] {
-            let buffer = page_alloc::Alignment::new(4096, 4096, 4096)
-                .unwrap()
-                .allocate(
-                    4096,
-                    source
-                        .reserve(Some(&cache), ResourceClass::Ciphertext, 4096)
-                        .unwrap(),
-                )
-                .unwrap();
+            let buffer = page_alloc::buf::Buf::unpooled(
+                4096,
+                4096,
+                source
+                    .reserve(Some(&cache), ResourceClass::Ciphertext, 4096)
+                    .unwrap(),
+                false,
+            )
+            .unwrap();
             assert!(matches!(
                 BufferPool::new(source.clone()).slab_ciphertext(buffer, envelope.clone(), range),
                 Err(Error::CorruptRecord)
@@ -3845,9 +3897,12 @@ pub(crate) mod tests {
             assert_eq!(source.used(ResourceClass::Ciphertext), 0);
         }
         for class in [ResourceClass::Ciphertext, ResourceClass::Plaintext] {
-            let buffer = page_alloc::Alignment::new(4096, 4096, 4096)
-                .unwrap()
-                .allocate(4096, source.reserve(Some(&cache), class, 4096).unwrap());
+            let buffer = page_alloc::buf::Buf::unpooled(
+                4096,
+                4096,
+                source.reserve(Some(&cache), class, 4096).unwrap(),
+                false,
+            );
             if matches!(class, ResourceClass::Plaintext) {
                 assert!(matches!(
                     buffer,
@@ -3865,15 +3920,15 @@ pub(crate) mod tests {
             ));
             assert_eq!(source.used(class), 0);
         }
-        let buffer = page_alloc::Alignment::new(4096, 4096, 4096)
-            .unwrap()
-            .allocate(
-                4096,
-                source
-                    .reserve(Some(&cache), ResourceClass::Ciphertext, 4096)
-                    .unwrap(),
-            )
-            .unwrap();
+        let buffer = page_alloc::buf::Buf::unpooled(
+            4096,
+            4096,
+            source
+                .reserve(Some(&cache), ResourceClass::Ciphertext, 4096)
+                .unwrap(),
+            false,
+        )
+        .unwrap();
         let page = BufferPool::new(source.clone())
             .slab_ciphertext(buffer, envelope, 4077..4096)
             .unwrap();
