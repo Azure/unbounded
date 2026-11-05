@@ -306,6 +306,28 @@ func TestGeneratedCRDSetContainsAllCertificationResources(t *testing.T) {
 			crd.Spec.Versions[0].Schema.OpenAPIV3Schema == nil {
 			t.Fatalf("%s is not a structural v1 CRD: %#v", name, crd.Spec)
 		}
+
+		switch name {
+		case "signal.unbounded-cloud.io_certificationruns.yaml",
+			"signal.unbounded-cloud.io_certificationsuites.yaml":
+			assertContainsAll(
+				t,
+				string(content),
+				name,
+				"minDuration",
+				"continuity",
+				"maxSampleGap must not exceed backendActiveDeadline",
+				"maxSampleGap must not exceed minDuration",
+			)
+		case "signal.unbounded-cloud.io_nodecertifications.yaml":
+			assertContainsAll(
+				t,
+				string(content),
+				name,
+				"latestNonPass",
+				"latestNonPass must advance by finishedAt and UID",
+			)
+		}
 	}
 }
 
@@ -396,4 +418,14 @@ func assertRule(
 	}
 
 	t.Fatalf("%s/%s in namespace %q not found", kind, name, namespace)
+}
+
+func assertContainsAll(t *testing.T, content, name string, values ...string) {
+	t.Helper()
+
+	for _, value := range values {
+		if !strings.Contains(content, value) {
+			t.Fatalf("%s does not contain %q", name, value)
+		}
+	}
 }

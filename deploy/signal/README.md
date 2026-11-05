@@ -119,8 +119,18 @@ Each check contains:
 | `scriptKey` | Key in the Suite's `spec.scriptBundle.name`; admission snapshots the verified bytes and records their SHA-256 digest |
 | `backend` | `Pod` or `MPIJob` |
 | `backendActiveDeadline` | Backend execution deadline |
+| `minDuration` | Optional minimum uninterrupted observed duration required for a passing check |
+| `continuity` | Optional maximum sample gap, same-boot, and per-device coverage requirements |
 | `gpuCount` | GPU request; must be positive for MPIJob |
 | `workloadPolicy` | Narrow container resources and host access policy |
+
+When `minDuration` is set, backend success before that observed duration does
+not prove the check. `continuity.maxSampleGap` must not exceed either the
+backend deadline or `minDuration`. `requireSameBootID` rejects evidence that
+spans a participant reboot, and `requirePerDeviceCoverage` requires evidence
+for every device in the starting inventory. These requirements are verified
+from evidence; the controller does not infer continuity from elapsed wall-clock
+time alone.
 
 Workload policy is intentionally constrained:
 
@@ -221,6 +231,7 @@ The Run spec snapshots:
 - ordered participants with Node name and Node UID;
 - the immutable script bundle name, UID, and aggregate digest;
 - the resolved executable plan snapshot;
+- each check's minimum-duration and continuity requirements;
 - monotonic `cancel` and `release` actions.
 
 The controller derives the Workflow deadline from the immutable backend
@@ -266,7 +277,10 @@ separation between credited Runs. The Policy also defines:
 The ledger records contributing terminal Runs, accepted plan digests,
 qualification phase, expiry, fingerprint, and evidence identity. Expired,
 revoked, replaced-identity, or policy-mismatched ledgers do not qualify a Node.
-No ledger individually owns the shared gate label.
+For Reset and Revoke semantics, it also records a monotonic watermark for the
+latest terminal non-passing Run. That watermark survives Run and evidence
+deletion so older passing Runs cannot silently regain credit. No ledger
+individually owns the shared gate label.
 
 When one or more active Policies request `ProtectedLabel`, the shared label is
 present only when **every** such Policy has a current, qualified, unexpired
@@ -363,6 +377,9 @@ Evidence manifest v2 stores bounded, chunked evidence and includes:
 - the immutable check snapshots and script contents;
 - aggregate execution state, verdict, reason, phase, and timestamps;
 - each positional check's verdict and timing;
+- minimum-duration and continuity summaries, including observed duration,
+  sample count, maximum observed gap, same-boot status, and per-device
+  coverage;
 - typed Pod or MPIJob evidence, including Pods, containers, states, bounded
   logs, and capture errors;
 - backend identities and participant positions;
@@ -438,7 +455,9 @@ Use a guarded two-stage upgrade:
 7. Create or migrate Policies only after terminal evidence compatibility is
    understood. Existing Runs remain readable, but only evidence satisfying the
    current Policy and evidence-v2 identity requirements receives qualification
-   credit.
+   credit. Existing ledgers without a latest non-pass watermark remain
+   readable; future Reset or Revoke evaluations persist the monotonic
+   watermark.
 8. Enable protected projection only in a separate reviewed rollout after the
    operator guard prerequisites are positively verified.
 
