@@ -495,9 +495,9 @@ pub fn hung_peers() -> Scenario {
 /// probes of rank 0 time out or are shed by a relay leave the fetch to rank 0: no page is asked
 /// of origin twice, and pings find rank 0 busy, not hung.
 ///
-/// Not in [`catalog`] yet: the Model fails `origin-once-per-page` (see `dst/MODEL.md`, "Slow
-/// origin"). Run it with `MODEL_SCENARIO=model-slow-origin MODEL_SEED=3` and the
-/// `scenario_report` test after adding it to the catalog.
+/// Owners above rank 0 that probe it copy-only wait on its running fill (production
+/// `Fill::copy_only_joining`) rather than fetching the page themselves (see `dst/MODEL.md`, "Slow
+/// origin").
 pub fn slow_origin() -> Scenario {
     const NODES: u32 = 300;
     let spec = ModelSpec {
@@ -1015,6 +1015,7 @@ pub fn catalog() -> Vec<Scenario> {
         faults(),
         partition_heals(),
         hung_peers(),
+        slow_origin(),
         node_faults(),
         membership_churn(),
         authority_election(),

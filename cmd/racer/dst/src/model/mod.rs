@@ -714,6 +714,10 @@ struct Model<'s> {
     ranges: BTreeMap<(u32, u32, WindowId), RangeState>,
     /// Serving reads by `(node, worker, request)`.
     serving: BTreeMap<(u32, u32, RequestId), Asker>,
+    /// The admitted body request of each serving read (production `dispatch_verified` holds a
+    /// `Streaming` from the hot-page check until the response is ready), counted toward the
+    /// page's hot-page fan-in while it waits.
+    admitted: BTreeMap<(u32, u32, RequestId), racer_core::read::serve::Body<Page>>,
     /// Sent probes not yet answered or timed out, by `(node, worker, effect)`.
     probes: BTreeMap<(u32, u32, EffectId), Sent>,
     /// Answered effect ids by `(node, worker)`.
@@ -906,6 +910,7 @@ impl<'s> Model<'s> {
             refreshing: BTreeMap::new(),
             ranges: BTreeMap::new(),
             serving: BTreeMap::new(),
+            admitted: BTreeMap::new(),
             probes: BTreeMap::new(),
             answered: BTreeSet::new(),
             bodies: BTreeMap::new(),
@@ -1984,7 +1989,23 @@ impl<'s> Model<'s> {
                 self.nodes[to as usize].stored.touch(page);
                 self.send_page(asker, to, page)
             }
-            Decision::CopyOnly { .. } => self.reply(&asker, to, ResponseKind::Miss),
+            // Production `Fill::copy_only_joining` (`src/read/fill.rs`, `join` from
+            // `copy_join_allowed`, `src/read.rs`): with no copy, a joinable copy-only probe waits on
+            // the running flight within the serve scope and answers with its fill.
+            Decision::CopyOnly { join: true } => {
+                let deadline = self.instant((now + SERVE_TIMEOUT).min(route.deadline));
+                let mut out = Vec::new();
+                let core = &mut self.nodes[to as usize].cores[worker as usize];
+                match core.copy_page(page, deadline, at, &mut out) {
+                    Some(request) => {
+                        self.report.counters.copy_joins += 1;
+                        self.serve_admitted(to, worker, request, page, asker);
+                        self.dispatch(to, worker, out);
+                    }
+                    None => self.reply(&asker, to, ResponseKind::Miss),
+                }
+            }
+            Decision::CopyOnly { join: false } => self.reply(&asker, to, ResponseKind::Miss),
             Decision::Acquire => {
                 // Production `inherited_budget` (`src/read.rs`; racer-sim `serve`): the serving
                 // read spends the probe's credits within its own serve scope and the route's
@@ -2022,10 +2043,27 @@ impl<'s> Model<'s> {
                 }
                 let core = &mut self.nodes[to as usize].cores[worker as usize];
                 let request = core.read_page(page, budget, at, &mut out);
-                self.serving.insert((to, worker, request), asker);
+                self.serve_admitted(to, worker, request, page, asker);
                 self.dispatch(to, worker, out);
             }
         }
+    }
+
+    /// Record serving read `request` for `asker`, counting its body from admission.
+    fn serve_admitted(
+        &mut self,
+        to: u32,
+        worker: u32,
+        request: RequestId,
+        page: Page,
+        asker: Asker,
+    ) {
+        let key = (to, worker, request);
+        self.serving.insert(key, asker);
+        let body = self.nodes[to as usize].cores[worker as usize]
+            .serve
+            .begin_body(page);
+        self.admitted.insert(key, body);
     }
 
     /// `to` streams its copy of `page` to the asker; the reply lands when the body does.
@@ -3368,6 +3406,11 @@ impl<'s> Model<'s> {
         result: Result<(), Error>,
     ) {
         let now = self.now();
+        if let Some(body) = self.admitted.remove(&(node, worker, request)) {
+            self.nodes[node as usize].cores[worker as usize]
+                .serve
+                .end_body(body);
+        }
         if let Some(asker) = self.serving.remove(&(node, worker, request)) {
             if self.diag {
                 let owners = self.latest_owners(page);

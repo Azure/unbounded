@@ -19,6 +19,8 @@ pub struct Counters {
     pub local_hits: u64,
     /// Reads that joined a running local acquisition.
     pub flight_joins: u64,
+    /// Copy-only peer probes that waited on a running flight (production `Flights::join_copy`).
+    pub copy_joins: u64,
     /// Origin page requests.
     pub origin_requests: u64,
     /// Origin bytes delivered.
@@ -231,6 +233,7 @@ impl Report {
                     "reads_failed": c.reads_failed,
                     "local_hits": c.local_hits,
                     "flight_joins": c.flight_joins,
+                    "copy_joins": c.copy_joins,
                     "origin_requests": c.origin_requests,
                     "origin_bytes": c.origin_bytes,
                     "peer_probes": c.peer_probes,

@@ -35,11 +35,11 @@ fn hot_page_storm_fans_out_through_helpers() {
     assert_hot_page_fanin_bounded(&report);
 }
 
-/// racer-sim `assert_bounded_hot_page_storm` bounds peak fan-in for the hot page by the exempt cap
-/// plus the other owners. The Model exceeds it: an owner that does not hold the page yet admits
-/// requesters into its flight (the serve rule counts streaming bodies, not flight waiters) and
-/// streams to all of them when the fill lands (`dst/MODEL.md`, racer-sim inventory). The bound
-/// is printed, not asserted.
+/// racer-sim `assert_bounded_hot_page_storm`: peak fan-in for the hot page is at most the exempt
+/// cap plus the other owners (`designs/racer-mesh-v2.md`, Hot keys). It holds because an owner
+/// counts an admitted body request from admission, including while it waits on the fill
+/// (production `PeerServer::dispatch_verified`, Model `serve_admitted`), not only once its body
+/// is written.
 fn assert_hot_page_fanin_bounded(report: &serde_json::Value) {
     use racer_core::read::budget::{hot_page_bodies, hot_page_exempt_bodies};
     let page_bytes = report["page_bytes"].as_u64().unwrap();
@@ -47,7 +47,10 @@ fn assert_hot_page_fanin_bounded(report: &serde_json::Value) {
     let bound = cap + topology::REPLICAS as u64 - 1;
     let fanin = counter(report, "page_peak_fanin");
     assert!(fanin > 0, "no page bodies");
-    println!("page_peak_fanin {fanin}, racer-sim bound {bound}");
+    assert!(
+        fanin <= bound,
+        "page_peak_fanin {fanin} past the bound {bound}"
+    );
 }
 
 /// racer-sim `mesh_hot_page_storm_stays_bounded_on_a_large_pool` (seed 4): the hot page storm on
@@ -59,6 +62,19 @@ fn assert_hot_page_fanin_bounded(report: &serde_json::Value) {
 fn mesh_hot_page_storm_stays_bounded_on_a_large_pool() {
     let report = run(scenarios::hot_page_storm(2048), 4);
     assert_hot_page_fanin_bounded(&report);
+}
+
+/// racer-sim `owners_above_rank_zero_do_not_overlap_a_slow_origin_fetch` and
+/// `relay_shed_rank0_probes_do_not_overlap_a_slow_origin_fetch` (seed 3): under a slow origin,
+/// owners above rank 0 join rank 0's fill through their copy-only probes, so every page is asked
+/// of origin once.
+#[test]
+fn owners_above_rank_zero_do_not_overlap_a_slow_origin_fetch() {
+    for seed in [1, 3, 5] {
+        let report = run(scenarios::slow_origin(), seed);
+        assert_eq!(counter(&report, "origin_requests"), 64, "seed {seed}");
+        assert!(counter(&report, "copy_joins") > 0, "seed {seed}");
+    }
 }
 
 #[test]
@@ -242,7 +258,10 @@ fn parity_summary() {
 fn scenario_report() {
     let name = std::env::var("MODEL_SCENARIO").unwrap_or_else(|_| "model-cold-start-400".into());
     let seed = std::env::var("MODEL_SEED").map_or(1, |s| s.parse().unwrap());
-    let scenario = scenarios::find(&name).expect("known scenario");
+    let scenario = match name.strip_prefix("model-hot-page-storm-") {
+        Some(nodes) => scenarios::hot_page_storm(nodes.parse().unwrap()),
+        None => scenarios::find(&name).expect("known scenario"),
+    };
     let (outcome, r) = model::run(&scenario, Choices::seeded(seed));
     println!(
         "failure {:?} max_per_page {} counters {} attempt_errors {}",

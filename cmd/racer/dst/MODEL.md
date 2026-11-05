@@ -56,8 +56,15 @@ such as which node holds which page.
 - Acquisition walks: ranking, peer probes, validation, origin fetches and publication
   run in the core's `PageAcquisition`.
 - Serve side: `WorkerCore::serve` (dispatch table, hot-page shedding over live body
-  counters, copy-only answers, successor deferral). A body counts as streaming from
-  its first byte until its last byte lands.
+  counters, copy-only answers, successor deferral). A body counts toward the page's hot-page
+  fan-in from admission (an `Acquire` or a joining copy-only request, `serve_admitted`, as
+  production `PeerServer::dispatch_verified`) until its last byte lands, including while it
+  waits on the page's fill.
+- Copy-only joins: a copy-only probe that `copy_join_allowed` lets join (a reader, or an owner
+  ranked after this node) waits on the running flight within the serve scope and answers with
+  its fill (production `Fill::copy_only_joining`, `src/read/fill.rs:1985-2001`; core
+  `WorkerCore::copy_page` over `FlightTable::join_copy`), or `FlightFull` past the waiter cap.
+  Before, the Model answered every copy-only probe without a stored copy `Miss` (`copy_joins`).
 - Visit order: a non-owner's Rank is answered with production `visit_order` (`Spread` over
   `replica_score`, mesh neighbors first) and `demote_unanswered` over a node-wide
   `liveness::Silence`, fed by the core's `Effect::Silence` (production `CandidatePolicy::apply`
@@ -269,6 +276,7 @@ Every racer-sim number below is from the racer-sim release binary at this commit
 | `model-origin-forbidden` | `origin_forbidden_reelects_a_waiter` (11) | 403s fail reads with `OriginForbidden`, the rest complete |
 | `model-partition-heals` | `reads_recover_after_partition_heals` (6) | at least one storm's reads complete (Model: also every read ends, links crossed the cut) |
 | `model-hung-peers` | `hung_relays_are_routed_around`, `hung_peers_are_found_and_recovered_peers_are_used_again` (`GRID`, silence on; 5) | requests are lost to hung peers and found by silence; racer-sim's bounds are at most 2 failures in the first storm and 1 in the second, the Model checks at most 3 in total (its peers hang until 40 s rather than for good, so the run drains) |
+| `model-slow-origin` | `relay_shed_rank0_probes_do_not_overlap_a_slow_origin_fetch`, `owners_above_rank_zero_do_not_overlap_a_slow_origin_fetch` (3) | every read ends, origin once per page, silence pings run |
 
 | Scenario | Metric | racer-sim | Model |
 |---|---|---|---|
@@ -301,6 +309,11 @@ Every racer-sim number below is from the racer-sim release binary at this commit
 | | link failures | not recorded | 191 |
 | hung peers, 200 nodes (`GRID`) | failed | at most 3 (racer-sim's bounds) | 0 of 12800 |
 | | requests lost to hangs / silence timeouts / pings | not recorded | 691 / 505 / 1452 (seed 1) |
+
+The Model rows above predate copy-only joins and the hot-page admission count (see Scale,
+Slow origin and Hot-page fan-in); after them the hot-page storm sheds 409 and serves 323 helper
+copies (seed 5), and cold start 2000 fails 0 reads with 16 origin requests (seed 8). Other rows
+were not re-measured.
 
 Tolerances. The Model passes every racer-sim check above, with these documented
 differences:
@@ -634,17 +647,46 @@ Cold start 400 origin requests (36 against 30, before `FlightFull`). Ranks 1 and
 origin after rank 0 answered their delegated `Acquire` with its flight's waiter cap, a signed
 `Overloaded` the walk took as a shed. Fixed by `FlightFull` (above).
 
-Slow origin (accepted gap with an open lead, `scenarios::slow_origin`, not in the catalog). racer-sim's
+Slow origin (fixed: a Model bug, `model-slow-origin`, in the catalog). racer-sim's
 `relay_shed_rank0_probes_do_not_overlap_a_slow_origin_fetch` (seed 3) asserts one origin
-request per page. The Model (seed 3) asks origin 144 times for 64 pages (max 3 per page) and
-fails 141 of 3,072 reads. `MODEL_DIAG=1`: rank 0 fetches all 64 pages; ranks 1 and 2 fetch 80
-times after rank 0 answered their probe `Miss` (`origin:rankSome(1):OMiss`). Those probes are
-copy-only (`owner_probe:copy_onlytrue:attempts0`, 101 of 262 owner-to-owner probes): the owner
-serving a reader's request did not have the attempts to delegate (`walk.rs:657-661` needs
-`left + 2`), so it probed rank 0 copy-only (`walk.rs:674-677`), got a miss while rank 0 was still
-fetching, and ended `End::Origin`. Open question for the next session: whether racer-sim funds
-owner serving reads differently (reader `owner_funding`, retries' budgets) or this is a Model
-divergence; compare the inherited `route.attempts` at owners with racer-sim's `serve`.
+request per page. The Model asked origin 144 times for 64 pages (max 3 per page) and failed 141
+of 3,072 reads: ranks 1 and 2 probed rank 0 copy-only (an owner whose inherited budget lacks the
+`left + 2` attempts to delegate, `core/src/read/walk.rs:657-661`, probes rank 0 copy-only,
+`walk.rs:674-677`), got `Miss` while rank 0 was fetching, and went to origin. Production funds
+those owners the same way: both inherit the probe's `route.attempts` through
+`budget::inherited_budget` (`src/read.rs:93-107`, `:735`; Model `serve`), so production sends
+the same copy-only probes. But production rank 0 does not answer them `Miss`: `copy_join_allowed`
+lets a later owner join (`core/src/read/serve.rs:153-156`, `src/read.rs:253-270`, `:705-710`),
+and `Fill::copy_only_joining` waits on the running flight (`src/read/fill.rs:1985-2001`). The
+Model answered every `CopyOnly` decision without a stored copy `Miss`
+(`dst/src/model/mod.rs` `serve`, before this change). Now it joins through
+`WorkerCore::copy_page`. Seed 3: 64 origin requests (1 per page), 0 failed reads; seeds 1 and 5
+also 64. With the hot-page admission count (see Hot-page fan-in) seed 3 fails 16 of 3,072 reads
+(seed 1: 0, seed 5: 4), all ending, which the scenario allows.
+
+Hot-page fan-in (fixed in production and the Model). The hot-page storm peaked at 63 bodies of
+one page at an owner (bound: exempt cap plus the other owners, 36,
+`designs/racer-mesh-v2.md` Hot keys). Production had the same burst: `dispatch_verified` checks
+`shed_hot_page` at admission (`src/peer/server.rs` `dispatch_verified`), but the counter it reads
+counted a body only from its head (`page_streaming`, `send_http_response_inner`, `send_native`),
+so every request admitted while the page was cold waited on the fill uncounted and streamed when
+it landed. The design states the bound for any column size, so this was a production weakness,
+not intent. Production now holds a `Streaming` count for an admitted body request from the shed
+check until its response is ready (`protocol_socket.rs` `hot_page_shedding` checks the count seen
+while serving), and the Model counts from admission (`serve_admitted`). Peak fan-in, failed reads:
+
+| Scenario (seed) | Before | After |
+|---|---|---|
+| hot-page storm 512 (5) | 63, 0 | 35, 0 |
+| hot-page storm 512 (1) | not run | 35, 0 |
+| hot-page storm 2048 (4) | 63, 0 | 34, 0 |
+| hot-page storm 2048 (2) | not run | 34, 0 |
+| cold start 400 (8) | not run | 36, 0 (16 origin) |
+| cold start 2000 (8) | not run | 68, 0 (16 origin) |
+
+`assert_hot_page_fanin_bounded` now asserts the bound. It is not a bound for every page: a node
+writing many pages at once sheds only while one page is at least half its bodies
+(`budget::shed_hot_page`), so cold start 2000 peaks at 68.
 
 Earlier leads:
 
@@ -1013,9 +1055,9 @@ with the production test that covers it.
 | `overloaded_hot_page_owners_do_not_stream_to_abandoned_requesters` | accepted gap | needs racer-sim `late_page_replies`; the Model drops an abandoned exchange before its first chunk (`replies_abandoned`, `Model::send_page`) |
 | `hot_page_readers_fan_out_through_helpers` | ported | `model-hot-page-storm-512` (with the core's helper rule; racer-sim's `mesh_helpers` off variant is not run) |
 | `mesh_hot_page_readers_fan_out_through_column_helpers` | ported | `model-hot-page-storm-512` |
-| `mesh_hot_page_storm_stays_bounded_on_a_large_pool` | ported | `model_parity.rs` (same name, ignored: release). Fan-in bound printed, not asserted: the Model peaks at 63 bodies (bound 36) when an owner streams to its flight waiters as the fill lands |
-| `owners_above_rank_zero_do_not_overlap_a_slow_origin_fetch` | accepted gap (open lead) | `scenarios::slow_origin` asks origin up to 3 times per page: owners above rank 0 without the attempts to delegate probe rank 0 copy-only (`core/src/read/walk.rs:661-678`), miss while rank 0 fetches, and fetch; `expired_leaders_hand_their_fill_to_later_waiters` shows the same `concurrent` repeats. The walk is production code, so whether production overlaps too depends on the budget owners inherit (see Scale, Slow origin) |
-| `relay_shed_rank0_probes_do_not_overlap_a_slow_origin_fetch` | accepted gap (open lead) | as above |
+| `mesh_hot_page_storm_stays_bounded_on_a_large_pool` | ported | `model_parity.rs` (same name, ignored: release). Fan-in bound asserted (34 against 36; see Scale, Hot-page fan-in) |
+| `owners_above_rank_zero_do_not_overlap_a_slow_origin_fetch` | ported | `model-slow-origin` (`origin-once-per-page`) and `model_parity.rs` (same name, seeds 1, 3, 5); copy-only probes join rank 0's fill (see Scale, Slow origin) |
+| `relay_shed_rank0_probes_do_not_overlap_a_slow_origin_fetch` | ported | as above |
 | `relays_hold_their_reservation_only_while_the_body_streams` | equivalent | relay holds are modeled (`release_relays_at`); production `src/peer/server.rs:540-560`, `:778` |
 | `holders_wait_for_request_verification` | equivalent | `model/mod.rs` `a_request_waiting_for_verification_leaves_its_worker_free`; no `requests_abandoned_verifying` counter |
 | `hung_peers_are_found_and_recovered_peers_are_used_again` | ported | `model-hung-peers` |
