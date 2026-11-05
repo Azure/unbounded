@@ -172,9 +172,11 @@ impl PeerOriginContext {
     }
 }
 
-pub(crate) fn fresh_nonce() -> Result<Nonce> {
+/// A fresh AEAD nonce from `rng`, which must be cryptographically secure
+/// outside simulation ([`racer_io::Rng::os`] in production).
+pub(crate) fn fresh_nonce(rng: &racer_io::Rng) -> Result<Nonce> {
     let mut nonce = [0u8; 24];
-    uring_runtime::environment::fill_random(&mut nonce).map_err(|_| Error::Unavailable)?;
+    rng.fill(&mut nonce).map_err(|_| Error::Unavailable)?;
     Ok(Nonce(nonce))
 }
 pub(crate) fn field(out: &mut Vec<u8>, value: &[u8]) -> Result<()> {
@@ -430,7 +432,7 @@ impl PageCrypto {
 /// The vetted AEAD adapter processes owned jobs in bounded quanta, checks the
 /// original deadline/cancellation, and returns every accepted job as a completion.
 pub struct PageCryptoEngine {
-    environment: uring_runtime::environment::Environment,
+    ctx: racer_io::WorkerCtx,
 
     runtime: CryptoRuntime,
 
@@ -439,15 +441,19 @@ pub struct PageCryptoEngine {
 impl PageCryptoEngine {
     pub fn new(runtime: CryptoRuntime) -> Self {
         Self {
-            environment: uring_runtime::environment::Environment::current(),
+            ctx: runtime.ctx.clone(),
             runtime,
             executor: offload::Worker::default(),
         }
     }
+    /// The crypto thread's clock and entropy.
+    pub fn ctx(&self) -> &racer_io::WorkerCtx {
+        &self.ctx
+    }
     /// All fallible work borrows input. Ownership transfers only after the final
     /// cancellation check, so failures retain the exact input and quota owners.
-    pub fn process(job: CryptoJob) -> CryptoCompletion {
-        let measurement_start = uring_runtime::environment::now();
+    pub fn process(job: CryptoJob, ctx: &racer_io::WorkerCtx) -> CryptoCompletion {
+        let measurement_start = ctx.clock.now();
         let CryptoJob {
             mut permit,
             input,
@@ -457,7 +463,7 @@ impl PageCryptoEngine {
         let input = match input {
             CryptoInput::VerifyEnvelope(job) => {
                 let outcome = job.verify(&scope);
-                permit.executed(measurement_start);
+                permit.executed(ctx.clock.now(), measurement_start);
                 return CryptoCompletion {
                     permit,
                     outcome,
@@ -472,6 +478,7 @@ impl PageCryptoEngine {
             key.as_ref().expect("page job key"),
             &scope,
             &mut permit,
+            &ctx.rng,
         );
         if let Some(sample) = &mut permit.send_sample
             && let CryptoInput::Checksum { ciphertext } = &input
@@ -491,7 +498,7 @@ impl PageCryptoEngine {
             }
             Ok((envelope, bytes)) => Self::complete(input, envelope, bytes),
         };
-        permit.executed(measurement_start);
+        permit.executed(ctx.clock.now(), measurement_start);
         CryptoCompletion {
             permit,
             outcome,
@@ -565,6 +572,7 @@ impl PageCryptoEngine {
         key: &racer_crypto::identity::KeyLease,
         scope: &RequestScope,
         permit: &mut CryptoPermit,
+        rng: &racer_io::Rng,
     ) -> Result<(PageEnvelope, Zeroizing<Vec<u8>>)> {
         scope.check().inspect_err(|error| {
             permit.measurement.scope_failure = crate::telemetry::DecryptScopeFailure::Entry(*error);
@@ -604,7 +612,7 @@ impl PageCryptoEngine {
                     cipher: crate::model::PageCipher::Xaes256Gcm,
                     page: page.clone(),
                     key_id: key.id(),
-                    nonce: fresh_nonce()?,
+                    nonce: fresh_nonce(rng)?,
                     plaintext_length: length,
                     ciphertext_length: length.checked_add(16).ok_or(Error::InvalidRequest)?,
                 };
@@ -780,11 +788,11 @@ impl PageCryptoEngine {
         }
     }
     fn drive(&mut self, cx: &mut Context<'_>, budget: usize) -> Result<()> {
-        let _environment = self.environment.enter();
+        let ctx = &self.ctx;
         self.executor
             .poll(&mut self.runtime.port.queue, cx, budget, |mut job| {
-                job.permit.dequeued();
-                Self::process(job)
+                job.permit.dequeued(ctx.clock.now());
+                Self::process(job, ctx)
             })
             .map_err(Into::into)
     }
@@ -794,7 +802,7 @@ impl uring_runtime::group::Service<RequestScope> for PageCryptoEngine {
         self.runtime.port.register_driver(waker);
     }
     fn start<'a>(&'a mut self, scope: &'a RequestScope) -> Operation<'a, ()> {
-        Box::pin(self.environment.scope(async move { scope.check() }))
+        Box::pin(async move { scope.check() })
     }
     fn poll_budgeted(&mut self, cx: &mut Context<'_>, work_budget: usize) -> Result<()> {
         // A helper error ends the worker group; name it before the process exits.
@@ -904,6 +912,8 @@ fn credential_bounds(
 pub struct CredentialCrypto {
     keys: Rc<Keyring>,
     admission: Rc<flow_control::Quotas<AdmissionPolicy>>,
+    /// Credential nonces: [`racer_io::Rng::os`] outside simulation.
+    rng: racer_io::Rng,
 }
 impl CredentialCrypto {
     /// Independently charged zeroizing context. Warm admission may transfer this
@@ -936,8 +946,16 @@ impl CredentialCrypto {
             _reservation: reservation,
         })
     }
-    pub fn new(keys: Rc<Keyring>, admission: Rc<flow_control::Quotas<AdmissionPolicy>>) -> Self {
-        Self { keys, admission }
+    pub fn new(
+        keys: Rc<Keyring>,
+        admission: Rc<flow_control::Quotas<AdmissionPolicy>>,
+        rng: racer_io::Rng,
+    ) -> Self {
+        Self {
+            keys,
+            admission,
+            rng,
+        }
     }
     /// Borrow only for this bounded synchronous call; never retain, clone, enqueue,
     /// or cache the raw context. Each retry/fanout uses a new attempt ID and calls
@@ -991,7 +1009,7 @@ impl CredentialCrypto {
             let key = self
                 .keys
                 .active(&context.object.cache, KeyPurpose::OriginCredentials)?;
-            let nonce = fresh_nonce()?;
+            let nonce = fresh_nonce(&self.rng)?;
             let aad = credential_aad(key.id(), &context.object, scope.request, attempt, metadata)?;
             let mut bytes = Zeroizing::new(vec![0; raw.len() + TAG_LEN]);
             key.seal_credentials(&context.object.cache, &nonce.0, &aad, raw, &mut bytes)
@@ -1237,9 +1255,8 @@ pub(crate) enum IntegrityRejection {
     Crc,
     Aead,
 }
-fn elapsed_ns(start: std::time::Instant) -> u64 {
-    uring_runtime::environment::now()
-        .saturating_duration_since(start)
+fn elapsed_ns(now: std::time::Instant, start: std::time::Instant) -> u64 {
+    now.saturating_duration_since(start)
         .as_nanos()
         .min(u128::from(u64::MAX)) as u64
 }
@@ -1258,18 +1275,21 @@ impl CryptoPermit {
     }
 
     /// Start queue timing at each publication attempt, including a retry.
-    fn submitted(&mut self) {
-        self.measurement.submitted = Some(uring_runtime::environment::now());
+    fn submitted(&mut self, now: std::time::Instant) {
+        self.measurement.submitted = Some(now);
     }
 
     /// Stop queue timing when the worker takes ownership, before execution.
-    fn dequeued(&mut self) {
-        self.measurement.queue_ns = self.measurement.submitted.map(elapsed_ns);
+    fn dequeued(&mut self, now: std::time::Instant) {
+        self.measurement.queue_ns = self
+            .measurement
+            .submitted
+            .map(|start| elapsed_ns(now, start));
     }
 
     /// Record elapsed execution even for failed or canceled accepted jobs.
-    pub(crate) fn executed(&mut self, start: std::time::Instant) {
-        self.measurement.execution_ns = Some(elapsed_ns(start));
+    pub(crate) fn executed(&mut self, now: std::time::Instant, start: std::time::Instant) {
+        self.measurement.execution_ns = Some(elapsed_ns(now, start));
     }
 
     /// Retain the exact integrity check that rejected this job.
@@ -1449,6 +1469,8 @@ pub struct CryptoPort {
 pub struct CryptoRuntime {
     /// Unique offload worker endpoint, transferred before local construction.
     pub port: CryptoPort,
+    /// The crypto thread's clock and entropy.
+    pub ctx: racer_io::WorkerCtx,
 }
 /// Allocate fixed-capacity handoffs without starting either service.
 pub fn pair(
@@ -1493,7 +1515,7 @@ impl IoCryptoPort {
         // Capture at publication attempt, not reservation. Retry overwrites it.
         self.queue
             .try_submit(job, |job| {
-                job.permit.submitted();
+                job.permit.submitted(job.scope.clock().now());
             })
             .map_err(Into::into)
     }
@@ -1517,7 +1539,7 @@ impl CryptoPort {
         let result = self.queue.poll_job(cx).map_err(Into::into);
         match result {
             Poll::Ready(Ok(Some(mut job))) => {
-                job.permit.dequeued();
+                job.permit.dequeued(job.scope.clock().now());
                 Poll::Ready(Ok(Some(job)))
             }
             other => other,
@@ -1623,7 +1645,7 @@ impl CryptoClient {
                         }
                     },
                     |job| {
-                        job.permit.submitted();
+                        job.permit.submitted(job.scope.clock().now());
                     },
                 )
                 .await?;
@@ -1706,17 +1728,17 @@ mod tests {
         assert!(permit.send_sample.is_none());
         assert!(permit.aead_failure.is_none());
         assert_eq!(permit.measurement.execution_ns, None);
-        permit.dequeued();
+        permit.dequeued(now());
         assert_eq!(permit.measurement.queue_ns, None);
-        permit.submitted();
+        permit.submitted(now());
         clock.advance(Duration::from_nanos(11));
-        permit.submitted();
+        permit.submitted(now());
         clock.advance(Duration::from_nanos(7));
-        permit.dequeued();
+        permit.dequeued(now());
         assert_eq!(permit.measurement.queue_ns, Some(7));
         let start = now();
         clock.advance(Duration::from_nanos(5));
-        permit.executed(start);
+        permit.executed(now(), start);
         permit.rejected(IntegrityRejection::Aead);
         assert_eq!(permit.measurement.execution_ns, Some(5));
         assert!(matches!(
@@ -1819,7 +1841,8 @@ mod tests {
             let admission = Rc::new(flow_control::Quotas::new(AdmissionPolicy::new(
                 crate::test_support::cluster::config(false).limits,
             )));
-            let crypto = CredentialCrypto::new(keys, admission.clone());
+            let crypto =
+                CredentialCrypto::new(keys, admission.clone(), crate::test_support::ctx().rng);
             let scope = RequestScope::new(
                 RequestId([4; 16]),
                 std::time::Instant::now() + std::time::Duration::from_secs(5),
@@ -1876,6 +1899,7 @@ mod tests {
             let crypto = CredentialCrypto::new(
                 Rc::new(crate::test_support::security::keys()),
                 admission.clone(),
+                crate::test_support::ctx().rng,
             );
             let original = origin();
             let scope = scope();
@@ -1910,6 +1934,7 @@ mod tests {
             let crypto = CredentialCrypto::new(
                 Rc::new(crate::test_support::security::keys()),
                 Rc::new(flow_control::Quotas::new(AdmissionPolicy::new(limits))),
+                crate::test_support::ctx().rng,
             );
             assert!(matches!(
                 crypto.seal(&original, attempt, &self::scope()),
@@ -1924,6 +1949,7 @@ mod tests {
             let crypto = CredentialCrypto::new(
                 Rc::new(crate::test_support::security::keys()),
                 admission.clone(),
+                crate::test_support::ctx().rng,
             );
             let mut original = origin();
             original.authorization = None;
@@ -1955,6 +1981,7 @@ mod tests {
                 Rc::new(flow_control::Quotas::new(AdmissionPolicy::new(
                     crate::test_support::cluster::config(false).limits,
                 ))),
+                crate::test_support::ctx().rng,
             );
             let original = origin();
             let scope = scope();
@@ -2118,7 +2145,14 @@ mod tests {
                             }))
                             .unwrap();
                             let Some(job) = job else { break };
-                            assert!(engine.complete(PageCryptoEngine::process(job)).is_ok());
+                            assert!(
+                                engine
+                                    .complete(PageCryptoEngine::process(
+                                        job,
+                                        &crate::test_support::ctx()
+                                    ))
+                                    .is_ok()
+                            );
                         }
                     }))
                 } else {
@@ -2153,7 +2187,7 @@ mod tests {
                     if paired {
                         assert!(io.try_submit(job).is_ok());
                     } else {
-                        let result = PageCryptoEngine::process(job);
+                        let result = PageCryptoEngine::process(job, &crate::test_support::ctx());
                         validate(&result, size);
                         failures +=
                             usize::from(matches!(result.outcome, CryptoOutcome::Failed { .. }));
@@ -2223,7 +2257,14 @@ mod tests {
                         }))
                         .unwrap()
                     {
-                        assert!(engine.complete(PageCryptoEngine::process(job)).is_ok());
+                        assert!(
+                            engine
+                                .complete(PageCryptoEngine::process(
+                                    job,
+                                    &crate::test_support::ctx()
+                                ))
+                                .is_ok()
+                        );
                     }
                 });
                 let scope = RequestScope::new(
@@ -2485,7 +2526,10 @@ mod tests {
                             }
                             _ => None,
                         };
-                        let mut completion = crate::security::PageCryptoEngine::process(job);
+                        let mut completion = crate::security::PageCryptoEngine::process(
+                            job,
+                            &crate::test_support::ctx(),
+                        );
                         let engine_ms = completion
                             .permit
                             .measurement
@@ -2534,7 +2578,7 @@ mod tests {
                         assert_eq!(completion.permit.measurement.execution_ns, Some(0));
                         let start = environment::now();
                         clock.advance(Duration::from_millis(2));
-                        completion.permit.executed(start);
+                        completion.permit.executed(environment::now(), start);
                         let (_, mut wrong) = pair(WorkerId(1), 0, NonZeroUsize::new(1).unwrap());
                         completion = wrong.complete(completion).err().unwrap().command;
                         assert!(engine.complete(completion).is_ok());
@@ -2693,11 +2737,10 @@ mod tests {
                 ) else {
                     panic!("permit")
                 };
-                let completion = PageCryptoEngine::process(permit.job(
-                    input(&admission),
-                    lease(),
-                    scope.clone(),
-                ));
+                let completion = PageCryptoEngine::process(
+                    permit.job(input(&admission), lease(), scope.clone()),
+                    &crate::test_support::ctx(),
+                );
                 let CryptoOutcome::Completed(CryptoOutput::Encrypted(plain, mut ciphertext)) =
                     completion.outcome
                 else {
@@ -2731,7 +2774,7 @@ mod tests {
                 let Poll::Ready(Ok(Some(job))) = engine.poll_job(&mut cx) else {
                     panic!("job")
                 };
-                let completion = PageCryptoEngine::process(job);
+                let completion = PageCryptoEngine::process(job, &crate::test_support::ctx());
                 assert_eq!(retained.cached_checksum(), Some(expected));
                 assert!(engine.complete(completion).is_ok());
                 let mut text = String::new();
@@ -2853,7 +2896,8 @@ mod tests {
                             let Poll::Ready(Ok(Some(job))) = engine.poll_job(&mut cx) else {
                                 panic!("job")
                             };
-                            let completion = PageCryptoEngine::process(job);
+                            let completion =
+                                PageCryptoEngine::process(job, &crate::test_support::ctx());
                             assert!(engine.complete(completion).is_ok());
                             client.poll_budgeted(1).unwrap();
                             assert!(future.as_mut().poll(&mut cx).is_ready());
@@ -2991,11 +3035,12 @@ mod tests {
                             panic!("submitted job")
                         };
                         assert_eq!(job.id().worker, worker);
-                        let mut completion = PageCryptoEngine::process(job);
+                        let mut completion =
+                            PageCryptoEngine::process(job, &crate::test_support::ctx());
                         assert_eq!(completion.permit.measurement.execution_ns, Some(0));
                         let start = environment::now();
                         clock.advance(Duration::from_millis(service_ms));
-                        completion.permit.executed(start);
+                        completion.permit.executed(environment::now(), start);
                         assert!(engine.complete(completion).is_ok());
                     }
                     // Neither the target's own 5ms execution nor this 11ms delay before
@@ -3047,7 +3092,7 @@ mod tests {
                 let _strict = environment::require_simulated();
                 let start = environment::now();
                 clock.advance(std::time::Duration::from_secs(u64::MAX / 1_000_000_000 + 1));
-                assert_eq!(elapsed_ns(start), u64::MAX);
+                assert_eq!(elapsed_ns(environment::now(), start), u64::MAX);
             }
 
             fn measurement_events(decrypt: bool) -> [Event; 8] {
@@ -3099,7 +3144,10 @@ mod tests {
                     ) else {
                         panic!("setup permit")
                     };
-                    let result = PageCryptoEngine::process(permit.job(data, key, scope.clone()));
+                    let result = PageCryptoEngine::process(
+                        permit.job(data, key, scope.clone()),
+                        &crate::test_support::ctx(),
+                    );
                     let CryptoOutcome::Completed(CryptoOutput::Encrypted(plain, mut ciphertext)) =
                         result.outcome
                     else {
@@ -3403,7 +3451,8 @@ mod tests {
                     Poll::Ready(Ok(Some(job))) => job,
                     _ => panic!("job"),
                 };
-                let completion = crate::security::PageCryptoEngine::process(job);
+                let completion =
+                    crate::security::PageCryptoEngine::process(job, &crate::test_support::ctx());
                 assert!(engine.complete(completion).is_ok());
                 assert!(
                     future.as_mut().poll(&mut cx).is_pending(),
@@ -3438,7 +3487,8 @@ mod tests {
                     Poll::Ready(Ok(Some(job))) => job,
                     _ => panic!("job"),
                 };
-                let completion = crate::security::PageCryptoEngine::process(job);
+                let completion =
+                    crate::security::PageCryptoEngine::process(job, &crate::test_support::ctx());
                 assert!(engine.complete(completion).is_ok());
                 client.poll_budgeted(1).unwrap();
                 assert!(matches!(
@@ -4065,6 +4115,7 @@ mod tests {
                     )
                     .unwrap(),
                 ),
+                &crate::test_support::ctx(),
             );
             let CryptoOutcome::Completed(CryptoOutput::Decrypted(clear, original)) =
                 &completion.outcome
@@ -4117,8 +4168,9 @@ mod tests {
     #[test]
     fn random_nonces_do_not_repeat() {
         let mut seen = std::collections::HashSet::new();
+        let rng = racer_io::Rng::os();
         for _ in 0..1024 {
-            assert!(seen.insert(fresh_nonce().unwrap().0));
+            assert!(seen.insert(fresh_nonce(&rng).unwrap().0));
         }
     }
     #[test]
@@ -4135,7 +4187,10 @@ mod tests {
         let descriptor = envelope();
         let cache = &descriptor.page.version.object.cache;
         let (io, port) = pair(WorkerId(0), 1, std::num::NonZeroUsize::new(1).unwrap());
-        let mut engine = PageCryptoEngine::new(CryptoRuntime { port });
+        let mut engine = PageCryptoEngine::new(CryptoRuntime {
+            port,
+            ctx: crate::test_support::ctx(),
+        });
         let mut cx = Context::from_waker(futures::task::noop_waker_ref());
         for sequence in 1..=6 {
             let canceled = sequence == 2;
@@ -4269,7 +4324,10 @@ mod tests {
                 .with_buffers(pool.clone());
             holders.push((admission, pool, crypto));
             // One crypto thread (this one) drives both workers' queues.
-            engines.push(PageCryptoEngine::new(CryptoRuntime { port }));
+            engines.push(PageCryptoEngine::new(CryptoRuntime {
+                port,
+                ctx: crate::test_support::ctx(),
+            }));
         }
         let scope = RequestScope::new(
             RequestId([1; 16]),
@@ -4375,7 +4433,10 @@ mod tests {
         let page = envelope().page;
         let cache = &page.version.object.cache;
         let (io, port) = pair(WorkerId(0), 1, std::num::NonZeroUsize::new(1).unwrap());
-        let mut engine = PageCryptoEngine::new(CryptoRuntime { port });
+        let mut engine = PageCryptoEngine::new(CryptoRuntime {
+            port,
+            ctx: crate::test_support::ctx(),
+        });
         let mut cx = Context::from_waker(futures::task::noop_waker_ref());
         let mut nonces = std::collections::HashSet::new();
         for sequence in 1..=5 {
@@ -4528,7 +4589,10 @@ mod tests {
         let wake = Arc::new(WakeCount(AtomicUsize::new(0)));
         let waker = std::task::Waker::from(wake.clone());
         let mut cx = Context::from_waker(&waker);
-        let mut engine = PageCryptoEngine::new(CryptoRuntime { port });
+        let mut engine = PageCryptoEngine::new(CryptoRuntime {
+            port,
+            ctx: crate::test_support::ctx(),
+        });
         engine.register_driver(&waker);
         // Budget polling's noop task waker must not replace the runtime driver.
         engine

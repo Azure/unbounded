@@ -93,15 +93,12 @@ impl NativeNode {
         engine: PageCryptoEngine,
     ) -> Result<Box<dyn uring_runtime::group::Service<RequestScope>>> {
         let mut owner = self.owner.lock().map_err(|_| Error::Unavailable)?;
+        let ctx = engine.ctx().clone();
         Ok(match owner.take_if(|(hosted, _)| *hosted == worker) {
             // Build the owner here, on the native thread that polls it.
             Some((_, port)) => Box::new(WithOwner::with_host(
                 engine,
-                rdma_verbs::Owner::new(
-                    port,
-                    // MIGRATION: the thread environment until workers receive a WorkerCtx.
-                    uring_runtime::environment::Environment::current().worker_ctx(),
-                ),
+                rdma_verbs::Owner::new(port, ctx),
             )),
             None => Box::new(engine),
         })
@@ -1191,7 +1188,13 @@ mod tests {
                 .with_default_pool(),
             )
             .unwrap();
-        (worker, CryptoRuntime { port: engine })
+        (
+            worker,
+            CryptoRuntime {
+                port: engine,
+                ctx: crate::test_support::ctx(),
+            },
+        )
     }
 
     #[test]

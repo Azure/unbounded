@@ -565,7 +565,11 @@ impl Rig {
             transfers,
             network,
         ));
-        let credentials = Rc::new(CredentialCrypto::new(keys.clone(), admission.clone()));
+        let credentials = Rc::new(CredentialCrypto::new(
+            keys.clone(),
+            admission.clone(),
+            racer_io::Rng::os(),
+        ));
         let candidates = Rc::new(CandidatePolicy::new(
             NodeId(NODE.into()),
             Rc::new(Placement::new(64)),
@@ -597,6 +601,7 @@ impl Rig {
                     Rc::new(CryptoClient::new(port)),
                     Some(RefCell::new(PageCryptoEngine::new(CryptoRuntime {
                         port: engine,
+                        ctx: racer_io::WorkerCtx::host(),
                     }))),
                 )
             }
@@ -978,7 +983,7 @@ impl Bootstrap {
                 racer_io::WorkerCtx::host(),
             ))),
             receiver,
-            credentials: CredentialCrypto::new(sender, admission),
+            credentials: CredentialCrypto::new(sender, admission, racer_io::Rng::os()),
             coordinator,
             membership,
         }

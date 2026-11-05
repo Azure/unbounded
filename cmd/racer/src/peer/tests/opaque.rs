@@ -629,7 +629,10 @@ mod safety {
             clients.push(client);
             engines
                 .borrow_mut()
-                .push(PageCryptoEngine::new(CryptoRuntime { port }));
+                .push(PageCryptoEngine::new(CryptoRuntime {
+                    port,
+                    ctx: crate::test_support::ctx(),
+                }));
         }
         let poll_crypto = || {
             for engine in engines.borrow_mut().iter_mut() {

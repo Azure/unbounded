@@ -609,7 +609,11 @@ impl ReadWorker {
         crypto.set_metrics(metrics.clone());
         let worker_admission = admission.clone();
         let worker_reactor = reactor.clone();
-        let credentials = Rc::new(CredentialCrypto::new(keys.clone(), admission.clone()));
+        let credentials = Rc::new(CredentialCrypto::new(
+            keys.clone(),
+            admission.clone(),
+            crate::test_support::ctx().rng,
+        ));
         let candidates = Rc::new(CandidatePolicy::new(
             keys.node().clone(),
             Rc::new(Placement::new(16)),
@@ -674,7 +678,10 @@ impl ReadWorker {
             origin,
             drivers: Rc::new(DriverQueue::new(1024)),
             endpoint: RefCell::new(endpoint),
-            engine: RefCell::new(PageCryptoEngine::new(CryptoRuntime { port: engine })),
+            engine: RefCell::new(PageCryptoEngine::new(CryptoRuntime {
+                port: engine,
+                ctx: crate::test_support::ctx(),
+            })),
             crypto,
             writer,
             memory,

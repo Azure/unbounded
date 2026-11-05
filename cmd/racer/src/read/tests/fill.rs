@@ -3446,7 +3446,11 @@ fn fixture_with_caches(
     });
     let (port, engine) = security::pair(worker, 0, config.limits.queue_entries);
     let crypto = Rc::new(CryptoClient::new(port));
-    let credentials = Rc::new(CredentialCrypto::new(keys.clone(), admission.clone()));
+    let credentials = Rc::new(CredentialCrypto::new(
+        keys.clone(),
+        admission.clone(),
+        crate::test_support::ctx().rng,
+    ));
     let peers = NoPeer::requester();
     let candidates = Rc::new(CandidatePolicy::new(
         node,
@@ -3501,7 +3505,10 @@ fn fixture_with_caches(
         fill,
         origin,
         crypto,
-        engine: PageCryptoEngine::new(CryptoRuntime { port: engine }),
+        engine: PageCryptoEngine::new(CryptoRuntime {
+            port: engine,
+            ctx: crate::test_support::ctx(),
+        }),
         context,
         membership,
         page,

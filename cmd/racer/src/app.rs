@@ -1235,7 +1235,11 @@ impl WorkerApplication {
             signatures.clone(),
             runtime.crypto.clone(),
         ));
-        let credentials = Rc::new(CredentialCrypto::new(keys.clone(), admission.clone()));
+        let credentials = Rc::new(CredentialCrypto::new(
+            keys.clone(),
+            admission.clone(),
+            reactor.ctx().rng.clone(),
+        ));
         let is_sampler = worker == node.control_worker;
         let node_pressure = node.pressure.clone();
         let control = if worker == node.control_worker {

@@ -1118,7 +1118,10 @@ mod encrypted_http {
             }
             cryptos.push(PageCrypto::new(identity.keys.clone(), client.clone()));
             clients.push(client);
-            engines.push(PageCryptoEngine::new(CryptoRuntime { port }));
+            engines.push(PageCryptoEngine::new(CryptoRuntime {
+                port,
+                ctx: crate::test_support::ctx(),
+            }));
         }
         let ios: Vec<_> = admissions
             .iter()

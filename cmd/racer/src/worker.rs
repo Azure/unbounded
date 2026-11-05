@@ -694,7 +694,13 @@ impl Resources {
             .1
             .take()
             .ok_or(Error::Io)?;
-        build(self.workers[lane], CryptoRuntime { port })
+        build(
+            self.workers[lane],
+            CryptoRuntime {
+                port,
+                ctx: crate::runtime::ambient_ctx(),
+            },
+        )
     }
 }
 #[cfg(test)]
@@ -1759,16 +1765,13 @@ mod tests {
                     return Err(Error::Unauthorized);
                 }
                 let page = PageCryptoEngine::new(runtime);
+                let ctx = page.ctx().clone();
                 let engine: Box<dyn Service<RequestScope>> = if self.native {
                     let (mut clients, port) = rdma_verbs::node(1)?;
                     self.observed.native.lock().unwrap().push(clients.remove(0));
                     Box::new(rdma_verbs::WithNative::with_host(
                         page,
-                        rdma_verbs::Owner::new(
-                            port,
-                            // MIGRATION: the thread environment until workers receive a WorkerCtx.
-                            uring_runtime::environment::Environment::current().worker_ctx(),
-                        ),
+                        rdma_verbs::Owner::new(port, ctx),
                     ))
                 } else {
                     Box::new(page)

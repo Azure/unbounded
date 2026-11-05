@@ -904,6 +904,7 @@ mod router {
                 )),
             )),
             h.admission.clone(),
+            crate::test_support::ctx().rng,
         ));
         CandidatePolicy::new(
             node,

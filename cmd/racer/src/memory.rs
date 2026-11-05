@@ -1984,7 +1984,10 @@ pub(crate) mod tests {
                 Rc::new(crate::test_support::security::keys()),
                 client.clone(),
             );
-            let mut engine = PageCryptoEngine::new(CryptoRuntime { port: engine_port });
+            let mut engine = PageCryptoEngine::new(CryptoRuntime {
+                port: engine_port,
+                ctx: crate::test_support::ctx(),
+            });
             let scope = scope();
             let mut work = crypto.encrypt(
                 page_id(&descriptor(&cache, "v1", 3)),

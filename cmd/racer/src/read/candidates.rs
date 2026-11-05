@@ -3294,7 +3294,11 @@ pub(super) mod tests {
             Rc::new(Placement::new(16)),
             context,
             scope,
-            Rc::new(CredentialCrypto::new(keys, admission)),
+            Rc::new(CredentialCrypto::new(
+                keys,
+                admission,
+                crate::test_support::ctx().rng,
+            )),
         )
     }
     fn spread_membership(count: usize) -> std::sync::Arc<crate::topology::Membership> {
@@ -4283,7 +4287,11 @@ pub(super) mod tests {
                 RecordedPeer::request,
                 RecordedPeer::request_direct,
             ),
-            Rc::new(CredentialCrypto::new(keys, admission)),
+            Rc::new(CredentialCrypto::new(
+                keys,
+                admission,
+                crate::test_support::ctx().rng,
+            )),
             Arc::new(controlplane::Published::new(
                 crate::control::Snapshot::retention(2),
             )),
@@ -4545,7 +4553,11 @@ pub(super) mod tests {
                 config.node,
                 Rc::new(Placement::new(1)),
                 requester,
-                Rc::new(CredentialCrypto::new(keys, admission)),
+                Rc::new(CredentialCrypto::new(
+                    keys,
+                    admission,
+                    crate::test_support::ctx().rng,
+                )),
                 published,
                 crate::test_support::ctx(),
             ));

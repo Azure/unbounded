@@ -362,7 +362,7 @@ fn failed_crypto_output_is_scrubbed(config: &Config) {
         FREED.store(false, Ordering::SeqCst);
         ZEROED.store(false, Ordering::SeqCst);
         NEXT_SIZE.store(if encrypt { length + 16 } else { length }, Ordering::SeqCst);
-        let completion = PageCryptoEngine::process(job);
+        let completion = PageCryptoEngine::process(job, &racer_io::WorkerCtx::host());
         assert_eq!(
             NEXT_SIZE.load(Ordering::SeqCst),
             0,

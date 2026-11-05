@@ -106,6 +106,7 @@ fn credentials(
             ))),
         )),
         admission,
+        crate::test_support::ctx().rng,
     ))
 }
 fn client() -> (

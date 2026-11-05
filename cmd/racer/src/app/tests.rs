@@ -669,7 +669,10 @@ pub(super) fn local_worker_with_fabric(
     (
         app,
         runtime,
-        PageCryptoEngine::new(CryptoRuntime { port: engine }),
+        PageCryptoEngine::new(CryptoRuntime {
+            port: engine,
+            ctx: crate::test_support::ctx(),
+        }),
     )
 }
 
@@ -1478,7 +1481,13 @@ fn composes_http_and_optional_rdma_without_operational_side_effects() {
         let application =
             Application::assemble(crate::test_support::cluster::config(enable_rdma)).unwrap();
         let _engine = application
-            .build_crypto(WorkerId(0), CryptoRuntime { port: engine })
+            .build_crypto(
+                WorkerId(0),
+                CryptoRuntime {
+                    port: engine,
+                    ctx: crate::test_support::ctx(),
+                },
+            )
             .unwrap();
         let state = NodeState {
             publications: Arc::new(Published::new(Snapshot::retention(
@@ -1522,6 +1531,7 @@ fn composes_http_and_optional_rdma_without_operational_side_effects() {
                 WorkerId(1),
                 CryptoRuntime {
                     port: second_engine,
+                    ctx: crate::test_support::ctx(),
                 },
             )
             .unwrap();
@@ -4164,6 +4174,7 @@ fn assembled_peer_io_carries_maximum_client_context_over_eight_signed_links() {
     let crypto = CredentialCrypto::new(
         Rc::new(crate::test_support::security::keys()),
         admission.clone(),
+        crate::test_support::ctx().rng,
     );
     let scope = scope(&crate::test_support::clock(), Duration::from_secs(30)).unwrap();
     let cache = CacheId(crate::test_support::security::CACHE.into());

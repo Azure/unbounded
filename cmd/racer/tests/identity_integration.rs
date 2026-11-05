@@ -245,7 +245,10 @@ fn active_crypto_operation_completes_after_rotation_with_its_original_key_lease(
     let pool = BufferPool::new(admission.clone());
     let (io, engine) = security::pair(WorkerId(0), 0, std::num::NonZeroUsize::new(8).unwrap());
     let client = CryptoClient::new(io);
-    let mut engine = PageCryptoEngine::new(CryptoRuntime { port: engine });
+    let mut engine = PageCryptoEngine::new(CryptoRuntime {
+        port: engine,
+        ctx: racer_io::WorkerCtx::host(),
+    });
     let mut plaintext = pool
         .plaintext(
             admission

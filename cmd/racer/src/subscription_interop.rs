@@ -311,8 +311,15 @@ impl SubscriptionFixture {
         ));
         let (port, engine) = security::pair(WorkerId(0), 0, limits.queue_entries);
         let crypto = Rc::new(security::CryptoClient::new(port));
-        let engine = PageCryptoEngine::new(CryptoRuntime { port: engine });
-        let credentials = Rc::new(CredentialCrypto::new(keys.clone(), admission.clone()));
+        let engine = PageCryptoEngine::new(CryptoRuntime {
+            port: engine,
+            ctx: reactor.ctx().clone(),
+        });
+        let credentials = Rc::new(CredentialCrypto::new(
+            keys.clone(),
+            admission.clone(),
+            reactor.ctx().rng.clone(),
+        ));
         let peers = peer::Requester::scripted(
             Rc::new(NoPeer),
             NoPeer::direct_hedge_available,

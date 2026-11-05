@@ -850,7 +850,11 @@ mod scenarios {
             )),
             crate::test_support::ctx(),
         )));
-        let credentials = CredentialCrypto::new(keys, sender.workers[0].runtime.admission.clone());
+        let credentials = CredentialCrypto::new(
+            keys,
+            sender.workers[0].runtime.admission.clone(),
+            crate::test_support::ctx().rng,
+        );
         let scope = scope(&crate::test_support::clock(), Duration::from_secs(5)).unwrap();
         let object = ObjectId {
             cache: harness.definition(0).id,
@@ -1001,8 +1005,11 @@ mod scenarios {
             crate::test_support::ctx(),
         ));
         let forwarding = Forwarding::new(signatures);
-        let credentials =
-            CredentialCrypto::new(sender.keys.clone(), sender.runtime.admission.clone());
+        let credentials = CredentialCrypto::new(
+            sender.keys.clone(),
+            sender.runtime.admission.clone(),
+            crate::test_support::ctx().rng,
+        );
         let previous = harness.nodes[source].config.node.clone();
         for round in 0u64..1100 {
             let scope = RequestScope::new(

@@ -222,9 +222,13 @@ fn coordinator_copy_miss_is_not_origin_absence_and_pinned_missing_is_412() {
                     FetchMode::CopyOnly
                 },
             },
-            origin: CredentialCrypto::new(ids[0].keys.clone(), admission.clone())
-                .seal(&context, attempt, &scope)
-                .unwrap(),
+            origin: CredentialCrypto::new(
+                ids[0].keys.clone(),
+                admission.clone(),
+                crate::test_support::ctx().rng,
+            )
+            .seal(&context, attempt, &scope)
+            .unwrap(),
             route: crate::topology::RouteBudget {
                 membership: membership.version,
                 request: scope.request,
@@ -508,7 +512,11 @@ fn remote_candidate_with_churn(absence: Option<Absence>, forbidden: bool, churn:
         source,
         placement,
         requester,
-        Rc::new(CredentialCrypto::new(a.keys.clone(), admission.clone())),
+        Rc::new(CredentialCrypto::new(
+            a.keys.clone(),
+            admission.clone(),
+            crate::test_support::ctx().rng,
+        )),
         Arc::new(controlplane::Published::new(
             crate::control::Snapshot::retention(2),
         )),
@@ -990,7 +998,11 @@ fn metadata_coordinator_with_newer_publication(
         reactor.clone(),
         availability.clone(),
     ));
-    let credentials = Rc::new(CredentialCrypto::new(keys.clone(), admission.clone()));
+    let credentials = Rc::new(CredentialCrypto::new(
+        keys.clone(),
+        admission.clone(),
+        crate::test_support::ctx().rng,
+    ));
     let candidates = Rc::new(CandidatePolicy::new(
         node.clone(),
         Rc::new(Placement::new(16)),

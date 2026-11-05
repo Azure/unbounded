@@ -1191,7 +1191,7 @@ mod tests {
             let completion = std::thread::spawn(move || {
                 let _guard = environment.enter();
                 assert_ne!(caller, std::thread::current().id());
-                PageCryptoEngine::process(job)
+                PageCryptoEngine::process(job, &environment.worker_ctx())
             })
             .join()
             .unwrap();
