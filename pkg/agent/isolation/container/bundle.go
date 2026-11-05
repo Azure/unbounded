@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"path/filepath"
+	"slices"
 	"strings"
 
 	"github.com/Azure/unbounded/pkg/agent/isolation"
@@ -33,16 +34,46 @@ type SameMount struct {
 	Shared bool // rshared propagation
 }
 
-// SamePathMounts are the paths shared with the host. PROVISIONAL: whether
-// rshared propagation works through the Azure Container Linux root mount is
-// unverified.
+// SamePathMounts are the paths shared with the host.
+//
+// Pod volume mounts that the kubelet and CSI drivers make under
+// /var/lib/kubelet must be visible on the host, so that bind is rshared and the
+// container's root propagation is rshared too: mounts made in the container
+// propagate back through the host's /var/lib/kubelet, which the agent makes a
+// shared mount of its own before the container starts (see RenderUnit). The bpffs at /sys/fs/bpf is not shared:
+// each slot gets its own (BPFFSPath), as each nspawn machine does.
+//
+// PROVISIONAL: that propagation through the Azure Container Linux root mount
+// behaves as on other distributions is unverified.
 var SamePathMounts = []SameMount{
 	{Path: "/run/containerd"},
 	{Path: "/etc/containerd/certs.d"},
-	{Path: "/var/lib/kubelet", Shared: true},
+	{Path: KubeletDir, Shared: true},
 	{Path: "/opt/cni"},
-	{Path: "/sys/fs/bpf"},
 }
+
+// The container sees the host's /sys and /proc/sys read-only, except
+// /proc/sys/net: it shares the host network namespace, and CNI plugins and
+// kube-proxy set network sysctls, as in the nspawn machine
+// (SYSTEMD_NSPAWN_API_VFS_WRITABLE=network). runc mounts readonlyPaths after
+// the mounts, so every /proc/sys subtree but net is listed; runc skips one the
+// kernel does not have.
+var procSysReadOnly = []string{
+	"/proc/sys/abi", "/proc/sys/crypto", "/proc/sys/debug", "/proc/sys/dev",
+	"/proc/sys/fs", "/proc/sys/kernel", "/proc/sys/user", "/proc/sys/vm",
+}
+
+// defaultReadonlyPaths and defaultMaskedPaths are the paths runtimes protect
+// in every container by default: kernel interfaces a container has no use for
+// that would let it change or read host-wide state.
+var (
+	defaultReadonlyPaths = []string{"/proc/bus", "/proc/fs", "/proc/irq", "/proc/sysrq-trigger"}
+	defaultMaskedPaths   = []string{
+		"/proc/acpi", "/proc/asound", "/proc/interrupts", "/proc/kcore", "/proc/keys",
+		"/proc/latency_stats", "/proc/sched_debug", "/proc/scsi", "/proc/timer_list",
+		"/proc/timer_stats", "/sys/devices/virtual/powercap", "/sys/firmware",
+	}
+)
 
 // ExtraBind is a host path bound into the container at a different path than
 // the same-path contract covers, such as the staged offline image archives.
@@ -60,6 +91,8 @@ const (
 	ImageArchiveDir = "/var/lib/unbounded/container-images"
 	// ImageArchiveHostDir is the host symlink to the current staging directory.
 	ImageArchiveHostDir = ImageArchiveDir + "/current"
+	// KubeletDir is the kubelet's state directory, shared with the host.
+	KubeletDir = "/var/lib/kubelet"
 	// KernelModulesDir is the host's kernel modules directory, bound read-only
 	// as the nspawn machine does so modprobe inside the node sees the host
 	// kernel's modules. PROVISIONAL: Azure Container Linux may keep modules
@@ -78,6 +111,8 @@ type DeviceInfo struct {
 // BundleInput is everything config.json depends on, so generation is a pure
 // function.
 type BundleInput struct {
+	// Slot selects the slot's bpffs and cgroup.
+	Slot      string
 	RootfsDir string
 	SELinux   SELinuxMode
 	Grants    []isolation.Grant
@@ -169,6 +204,7 @@ type mount struct {
 }
 
 type linux struct {
+	CgroupsPath       string      `json:"cgroupsPath"`
 	Namespaces        []namespace `json:"namespaces"`
 	Devices           []device    `json:"devices,omitempty"`
 	Resources         resources   `json:"resources"`
@@ -227,6 +263,10 @@ var allCaps = []string{
 // RenderConfig returns the OCI runtime config.json for the input. The output
 // is deterministic.
 func RenderConfig(in BundleInput) ([]byte, error) {
+	if err := ValidSlot(in.Slot); err != nil {
+		return nil, err
+	}
+
 	if !filepath.IsAbs(in.RootfsDir) {
 		return nil, fmt.Errorf("rootfs dir %q must be absolute", in.RootfsDir)
 	}
@@ -240,7 +280,7 @@ func RenderConfig(in BundleInput) ([]byte, error) {
 	// privileged systemd-in-OCI setups; not exercised on Azure Container Linux.
 	mounts := []mount{
 		{Destination: "/proc", Type: "proc", Source: "proc", Options: []string{"nosuid", "noexec", "nodev"}},
-		{Destination: "/sys", Type: "sysfs", Source: "sysfs", Options: []string{"nosuid", "noexec", "nodev", "rw"}},
+		{Destination: "/sys", Type: "sysfs", Source: "sysfs", Options: []string{"nosuid", "noexec", "nodev", "ro"}},
 		{Destination: "/sys/fs/cgroup", Type: "cgroup", Source: "cgroup", Options: []string{"nosuid", "noexec", "nodev", "rw"}},
 		{Destination: "/dev", Type: "tmpfs", Source: "tmpfs", Options: []string{"nosuid", "strictatime", "mode=755", "size=65536k"}},
 		{Destination: "/dev/pts", Type: "devpts", Source: "devpts", Options: []string{"nosuid", "noexec", "newinstance", "ptmxmode=0666", "mode=0620", "gid=5"}},
@@ -265,6 +305,10 @@ func RenderConfig(in BundleInput) ([]byte, error) {
 		mounts = append(mounts, mount{Destination: s.Path, Type: "bind", Source: s.Path, Options: opts})
 		taken[s.Path] = true
 	}
+
+	// The slot's own bpffs, which the unit mounts on the host before start.
+	mounts = append(mounts, mount{Destination: "/sys/fs/bpf", Type: "bind", Source: BPFFSPath(in.Slot), Options: []string{"rbind", "rw"}})
+	taken["/sys/fs/bpf"] = true
 
 	for _, e := range in.ExtraBinds {
 		if !filepath.IsAbs(e.Source) || !filepath.IsAbs(e.Target) {
@@ -345,6 +389,23 @@ func RenderConfig(in BundleInput) ([]byte, error) {
 			if g.Kind == isolation.GrantLibraryPath {
 				libPaths = append(libPaths, target)
 			}
+
+			// A device directory such as /dev/infiniband is bound whole, so
+			// nodes the host creates in it later appear in the container. Its
+			// DeviceAllow entries need no rule to be usable: the container runs
+			// with every device allowed. As for a device grant, a node that
+			// exists now still gets an explicit rule so it survives a tightened
+			// baseline. A device class, or a node not there yet, has no major
+			// and minor to write a rule for, as for a device class grant.
+			for _, allow := range g.DeviceAllow {
+				info, ok := in.Devices[allow]
+				if !ok {
+					continue
+				}
+
+				major, minor := info.Major, info.Minor
+				rules = append(rules, deviceRule{Allow: true, Type: info.Type, Major: &major, Minor: &minor, Access: "rwm"})
+			}
 		case isolation.GrantDevice:
 			info, ok := in.Devices[g.Source]
 			if !ok {
@@ -389,12 +450,15 @@ func RenderConfig(in BundleInput) ([]byte, error) {
 		Linux: linux{
 			// Host network namespace (no network entry) and host UTS so the
 			// hostname is the node name. PID 1 needs its own PID namespace.
+			// Inside the supervising unit's cgroup, so the unit's stop ends
+			// the container with it.
+			CgroupsPath:       CgroupPath(in.Slot),
 			Namespaces:        []namespace{{Type: "pid"}, {Type: "mount"}, {Type: "ipc"}, {Type: "cgroup"}},
 			Devices:           devices,
 			Resources:         resources{Devices: rules},
-			RootfsPropagation: "rslave",
-			MaskedPaths:       []string{},
-			ReadonlyPaths:     []string{},
+			RootfsPropagation: "rshared",
+			MaskedPaths:       slices.Clone(defaultMaskedPaths),
+			ReadonlyPaths:     append(slices.Clone(defaultReadonlyPaths), procSysReadOnly...),
 		},
 	}
 

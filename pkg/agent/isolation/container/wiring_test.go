@@ -16,6 +16,7 @@ import (
 	"github.com/Azure/unbounded/pkg/agent/goalstates"
 	"github.com/Azure/unbounded/pkg/agent/isolation"
 	"github.com/Azure/unbounded/pkg/agent/isolation/isolationtest"
+	"github.com/Azure/unbounded/pkg/agent/nodelifecycle"
 )
 
 func nodeSpec(slot string) isolation.NodeSpec {
@@ -28,6 +29,7 @@ func TestHostPathConstantsMatchGoalStates(t *testing.T) {
 }
 
 func TestSlotNamesMatchGoalStates(t *testing.T) {
+	require.Equal(t, goalstates.BPFFSMountPath("kube2"), BPFFSPath("kube2"), "the same per-slot bpffs as nspawn, so reset removes either")
 	require.Equal(t, goalstates.NSpawnMachineKube1, slotKube1)
 	require.Equal(t, goalstates.NSpawnMachineKube2, slotKube2)
 }
@@ -99,7 +101,7 @@ func TestExtraBindsAreRenderedOnlyWhenTheSourceExists(t *testing.T) {
 
 func TestConfigExtraBindsGoldenAndValidation(t *testing.T) {
 	got, err := RenderConfig(BundleInput{
-		RootfsDir: "/var/lib/unbounded/containers/kube1", SELinux: SELinuxEnforcing,
+		Slot: "kube1", RootfsDir: "/var/lib/unbounded/containers/kube1", SELinux: SELinuxEnforcing,
 		ExtraBinds: []ExtraBind{
 			{Source: ImageArchiveHostDir, Target: ImageArchiveDir, ReadOnly: true},
 			{Source: KernelModulesDir, Target: KernelModulesDir, ReadOnly: true},
@@ -108,13 +110,13 @@ func TestConfigExtraBindsGoldenAndValidation(t *testing.T) {
 	require.NoError(t, err)
 	isolationtest.Golden(t, "config-extra-binds.json", got)
 
-	_, err = RenderConfig(BundleInput{RootfsDir: "/r", ExtraBinds: []ExtraBind{{Source: "rel", Target: "/x"}}})
+	_, err = RenderConfig(BundleInput{Slot: "kube1", RootfsDir: "/r", ExtraBinds: []ExtraBind{{Source: "rel", Target: "/x"}}})
 	require.ErrorContains(t, err, "absolute")
 
-	_, err = RenderConfig(BundleInput{RootfsDir: "/r", ExtraBinds: []ExtraBind{{Source: "/a", Target: "/var/lib/kubelet"}}})
+	_, err = RenderConfig(BundleInput{Slot: "kube1", RootfsDir: "/r", ExtraBinds: []ExtraBind{{Source: "/a", Target: "/var/lib/kubelet"}}})
 	require.ErrorContains(t, err, "conflicts")
 
-	_, err = RenderConfig(BundleInput{RootfsDir: "/r", ExtraBinds: []ExtraBind{{Source: "/a", Target: "/x"}, {Source: "/b", Target: "/x"}}})
+	_, err = RenderConfig(BundleInput{Slot: "kube1", RootfsDir: "/r", ExtraBinds: []ExtraBind{{Source: "/a", Target: "/x"}, {Source: "/b", Target: "/x"}}})
 	require.ErrorContains(t, err, "conflicts")
 }
 
@@ -197,14 +199,14 @@ func TestPreflightToleratesAMissingRuntimeOnlyWhenProvisioned(t *testing.T) {
 
 func TestDeviceClassGrantNeedsNoRule(t *testing.T) {
 	got, err := RenderConfig(BundleInput{
-		RootfsDir: "/r",
-		Grants:    []isolation.Grant{{Kind: isolation.GrantDevice, Purpose: isolation.PurposeHostDevice, DeviceClass: "char-input"}},
+		Slot: "kube1", RootfsDir: "/r",
+		Grants: []isolation.Grant{{Kind: isolation.GrantDevice, Purpose: isolation.PurposeHostDevice, DeviceClass: "char-input"}},
 	})
 	require.NoError(t, err)
 	require.NotContains(t, string(got), "char-input")
 
 	// A device grant with neither a node nor a class is still an error.
-	_, err = RenderConfig(BundleInput{RootfsDir: "/r", Grants: []isolation.Grant{{Kind: isolation.GrantDevice}}})
+	_, err = RenderConfig(BundleInput{Slot: "kube1", RootfsDir: "/r", Grants: []isolation.Grant{{Kind: isolation.GrantDevice}}})
 	require.ErrorContains(t, err, "absolute path")
 }
 
@@ -478,19 +480,46 @@ func TestDestroyRemovesTheRootfsWhenTheContainerIsGoneAfterAFailedStop(t *testin
 	}
 }
 
-// Restart=always with RestartSec=1 trips systemd's default start limit after
-// five fast failures, leaving the unit failed and the node down. A missing
-// runtime must also not make systemd skip the unit and report success.
-func TestUnitHasNoStartLimitAndNoRuntimeCondition(t *testing.T) {
+// Restart=always keeps the node coming back, but a start that can never
+// succeed (a GPU hook that keeps failing) must not loop forever: the unit has
+// a start limit, in the [Unit] section, and its start timeout covers the
+// post-start hook's waits. A missing runtime must also not make systemd skip
+// the unit and report success.
+func TestUnitStartLimitTimeoutAndNoRuntimeCondition(t *testing.T) {
 	unit := string(RenderUnit(UnitSpec{Slot: "kube1", RuntimePath: rt, BundleDir: "/b"}))
 
-	require.Contains(t, unit, "StartLimitIntervalSec=0\n")
 	require.NotContains(t, unit, "ConditionPathExists")
 
 	unitSection, serviceSection, found := strings.Cut(unit, "[Service]")
 	require.True(t, found)
-	require.Contains(t, unitSection, "StartLimitIntervalSec=0", "it is a [Unit] setting")
+	require.Contains(t, unitSection, "StartLimitIntervalSec=3600\n", "it is a [Unit] setting")
+	require.Contains(t, unitSection, "StartLimitBurst=10\n")
 	require.NotContains(t, serviceSection, "StartLimitIntervalSec")
+
+	require.Greater(t, StartTimeout, nodelifecycle.PostStartBudget, "the start timeout leaves room after the post-start waits")
+	require.Contains(t, serviceSection, "TimeoutStartSec=360\n")
+}
+
+// The two slots' units conflict, and the container's cgroup is inside the
+// unit's, with runc in its own subgroup.
+func TestUnitConflictsWithTheOtherSlotAndDelegatesItsCgroup(t *testing.T) {
+	for slot, other := range map[string]string{"kube1": "kube2", "kube2": "kube1"} {
+		unit := string(RenderUnit(UnitSpec{Slot: slot, RuntimePath: rt, BundleDir: "/b"}))
+
+		require.Contains(t, unit, "Conflicts="+UnitName(other)+"\n")
+		require.Contains(t, unit, "Slice=system.slice\n")
+		require.Contains(t, unit, "Delegate=yes\nDelegateSubgroup=supervisor\n")
+		require.Contains(t, unit, "ExecStartPre=/usr/bin/mkdir -p /run/bpffs/"+slot+"\n")
+		require.Contains(t, unit, "mount -t bpf bpf /run/bpffs/"+slot)
+		require.Equal(t, "/system.slice/"+UnitName(slot)+"/payload", CgroupPath(slot))
+
+		// The host's kubelet directory is a shared mount before runc starts,
+		// and that runs before the container, at every start.
+		share := strings.Index(unit, "ExecStartPre=/usr/bin/mount --make-rshared /var/lib/kubelet\n")
+		require.Positive(t, share)
+		require.Contains(t, unit, "mountpoint -q /var/lib/kubelet || /usr/bin/mount --bind /var/lib/kubelet /var/lib/kubelet")
+		require.Less(t, share, strings.Index(unit, "ExecStart="))
+	}
 }
 
 func TestStartFailsClearlyWhenTheRuntimeIsMissing(t *testing.T) {

@@ -36,8 +36,8 @@ func mountOptions(t *testing.T, config []byte) map[string][]string {
 
 func hardeningInput() BundleInput {
 	return BundleInput{
-		RootfsDir: "/var/lib/unbounded/containers/kube1",
-		SELinux:   SELinuxPermissive,
+		Slot: "kube1", RootfsDir: "/var/lib/unbounded/containers/kube1",
+		SELinux: SELinuxPermissive,
 		ExtraBinds: []ExtraBind{
 			{Source: "/lib/modules", Target: "/lib/modules", ReadOnly: true},
 			{Source: "/srv/rw", Target: "/srv/rw"},
@@ -77,21 +77,21 @@ func TestReadOnlyBindsStayRoWithoutRuntimeSupport(t *testing.T) {
 }
 
 func TestTargetsAreCleanedBeforeTheConflictCheck(t *testing.T) {
-	in := BundleInput{RootfsDir: "/r", SELinux: SELinuxPermissive, ExtraBinds: []ExtraBind{
+	in := BundleInput{Slot: "kube1", RootfsDir: "/r", SELinux: SELinuxPermissive, ExtraBinds: []ExtraBind{
 		{Source: "/x", Target: "/run/containerd/../containerd"},
 	}}
 
 	_, err := RenderConfig(in)
 	require.ErrorContains(t, err, "conflicts")
 
-	in = BundleInput{RootfsDir: "/r", SELinux: SELinuxPermissive, Grants: []isolation.Grant{
+	in = BundleInput{Slot: "kube1", RootfsDir: "/r", SELinux: SELinuxPermissive, Grants: []isolation.Grant{
 		{Kind: isolation.GrantMount, Source: "/data", Target: "/etc/containerd/certs.d/"},
 	}}
 
 	_, err = RenderConfig(in)
 	require.ErrorContains(t, err, "conflicts")
 
-	in = BundleInput{RootfsDir: "/r", SELinux: SELinuxPermissive, Grants: []isolation.Grant{
+	in = BundleInput{Slot: "kube1", RootfsDir: "/r", SELinux: SELinuxPermissive, Grants: []isolation.Grant{
 		{Kind: isolation.GrantMount, Source: "/data//models/", Target: "/mnt/./models/"},
 	}}
 
@@ -105,19 +105,19 @@ func TestTargetsAreCleanedBeforeTheConflictCheck(t *testing.T) {
 
 func TestTargetsUnderProcAndSysAreRefused(t *testing.T) {
 	for _, target := range []string{"/proc", "/proc/sys", "/sys", "/sys/kernel/security", "/proc/../proc/sys", "/sys/fs/cgroup/x"} {
-		_, err := RenderConfig(BundleInput{RootfsDir: "/r", SELinux: SELinuxPermissive, ExtraBinds: []ExtraBind{{Source: "/x", Target: target}}})
+		_, err := RenderConfig(BundleInput{Slot: "kube1", RootfsDir: "/r", SELinux: SELinuxPermissive, ExtraBinds: []ExtraBind{{Source: "/x", Target: target}}})
 		require.ErrorContains(t, err, "/proc or /sys", "extra bind "+target)
 
-		_, err = RenderConfig(BundleInput{RootfsDir: "/r", SELinux: SELinuxPermissive, Grants: []isolation.Grant{{Kind: isolation.GrantMount, Source: "/x", Target: target}}})
+		_, err = RenderConfig(BundleInput{Slot: "kube1", RootfsDir: "/r", SELinux: SELinuxPermissive, Grants: []isolation.Grant{{Kind: isolation.GrantMount, Source: "/x", Target: target}}})
 		require.ErrorContains(t, err, "/proc or /sys", "grant "+target)
 	}
 
 	// Only the subtrees; a sibling that shares the prefix text is fine.
-	_, err := RenderConfig(BundleInput{RootfsDir: "/r", SELinux: SELinuxPermissive, ExtraBinds: []ExtraBind{{Source: "/x", Target: "/procfs-data"}, {Source: "/y", Target: "/system"}}})
+	_, err := RenderConfig(BundleInput{Slot: "kube1", RootfsDir: "/r", SELinux: SELinuxPermissive, ExtraBinds: []ExtraBind{{Source: "/x", Target: "/procfs-data"}, {Source: "/y", Target: "/system"}}})
 	require.NoError(t, err)
 
 	// The fixed same-path mount of /sys/fs/bpf is not user input.
-	cfg, err := RenderConfig(BundleInput{RootfsDir: "/r", SELinux: SELinuxPermissive})
+	cfg, err := RenderConfig(BundleInput{Slot: "kube1", RootfsDir: "/r", SELinux: SELinuxPermissive})
 	require.NoError(t, err)
 	require.Contains(t, mountOptions(t, cfg), "/sys/fs/bpf")
 }

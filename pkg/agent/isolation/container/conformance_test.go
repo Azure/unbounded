@@ -13,6 +13,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/require"
 
@@ -58,7 +59,7 @@ func (f *fakeRuntime) run(_ context.Context, _ *slog.Logger, name string, args .
 		}
 
 		return "", nil
-	case "delete":
+	case "delete", "kill":
 		return "", nil
 	}
 
@@ -104,6 +105,8 @@ func TestConformance(t *testing.T) {
 			Run:           f.run,
 			SourceRoot:    filepath.Join(dir, "host"),
 			MountInfoPath: filepath.Join(dir, "mountinfo"),
+			GoneTimeout:   20 * time.Millisecond,
+			PollInterval:  time.Millisecond,
 			Host:          &HostFS{SELinuxEnforce: filepath.Join(dir, "absent")},
 			Stream: func(context.Context, string, ...string) (io.ReadCloser, error) {
 				return io.NopCloser(strings.NewReader("log line\n")), nil

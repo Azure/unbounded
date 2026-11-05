@@ -37,7 +37,7 @@ var nvidiaDevices = map[string]DeviceInfo{
 
 func TestConfigNvidiaGolden(t *testing.T) {
 	got, err := RenderConfig(BundleInput{
-		RootfsDir: "/var/lib/unbounded/containers/kube1", SELinux: SELinuxEnforcing,
+		Slot: "kube1", RootfsDir: "/var/lib/unbounded/containers/kube1", SELinux: SELinuxEnforcing,
 		Grants: nvidiaGrants, Devices: nvidiaDevices,
 	})
 	require.NoError(t, err)
@@ -45,7 +45,7 @@ func TestConfigNvidiaGolden(t *testing.T) {
 }
 
 func TestConfigNvidiaGrantsBecomeDevicesRulesAndReadOnlyMounts(t *testing.T) {
-	b, err := RenderConfig(BundleInput{RootfsDir: "/r", Grants: nvidiaGrants, Devices: nvidiaDevices})
+	b, err := RenderConfig(BundleInput{Slot: "kube1", RootfsDir: "/r", Grants: nvidiaGrants, Devices: nvidiaDevices})
 	require.NoError(t, err)
 
 	var cfg struct {
@@ -149,7 +149,7 @@ func TestPrepareWithNoGrantsHasNoGPUWiring(t *testing.T) {
 	}
 
 	// Identical to the bundle rendered for no grants at all.
-	want, err := RenderConfig(BundleInput{RootfsDir: b.Layout.RootfsDir("kube1"), SELinux: SELinuxEnforcing, ExtraBinds: nil, Devices: map[string]DeviceInfo{}})
+	want, err := RenderConfig(BundleInput{Slot: "kube1", RootfsDir: b.Layout.RootfsDir("kube1"), SELinux: SELinuxEnforcing, ExtraBinds: nil, Devices: map[string]DeviceInfo{}})
 	require.NoError(t, err)
 	require.Equal(t, string(want), string(data))
 }

@@ -32,6 +32,19 @@ type Controller interface {
 	Restart(ctx context.Context, slot string) error
 }
 
+// The default bounds of PostStart. The supervising unit's start timeout is
+// derived from PostStartBudget, so they are one constant, not two numbers that
+// have to be kept equal.
+const (
+	// DefaultReadyTimeout bounds PostStart's wait for the stack to be running.
+	DefaultReadyTimeout = 2 * time.Minute
+	// DefaultAfterStartTimeout bounds AfterStart on its own, apart from the
+	// readiness wait, so it is not limited to what remained of it.
+	DefaultAfterStartTimeout = 3 * time.Minute
+	// PostStartBudget is the longest PostStart takes with the defaults.
+	PostStartBudget = DefaultReadyTimeout + DefaultAfterStartTimeout
+)
+
 // Lifecycle implements the three phases.
 type Lifecycle struct {
 	Log        *slog.Logger
@@ -42,8 +55,14 @@ type Lifecycle struct {
 	// running, with the slot. The container mode uses it to wire GPUs, which
 	// needs the stack up. Its failure fails PostStart.
 	AfterStart func(ctx context.Context, slot string) error
-	// ReadyTimeout bounds PostStart's wait for the stack to be running.
+	// ReadyTimeout bounds PostStart's wait for the stack to be running. Zero
+	// is DefaultReadyTimeout.
 	ReadyTimeout time.Duration
+	// AfterStartTimeout bounds AfterStart. Zero is DefaultAfterStartTimeout.
+	AfterStartTimeout time.Duration
+	// Peer, when set, returns the slot whose node stack must not run at the
+	// same time as slot's. PreStart refuses while it runs.
+	Peer func(slot string) string
 	// PollInterval is the wait between readiness checks.
 	PollInterval time.Duration
 }
@@ -60,11 +79,28 @@ func (l *Lifecycle) validate() error {
 	return nil
 }
 
-// PreStart refreshes host-side configuration before the supervising unit
-// starts, then reloads systemd so changed units take effect.
+// PreStart refuses to start a slot while its peer slot's node stack is still
+// alive, so a failed stop can never leave two node stacks on one host. It then
+// refreshes host-side configuration and reloads systemd so changed units take
+// effect.
 func (l *Lifecycle) PreStart(ctx context.Context, slot string) error {
 	if err := l.validate(); err != nil {
 		return err
+	}
+
+	if l.Peer != nil {
+		peer := l.Peer(slot)
+
+		running, detail, err := l.Controller.Running(ctx, peer)
+		if err != nil {
+			return fmt.Errorf("refusing to start %s: cannot tell whether %s is still running: %w", slot, peer, err)
+		}
+
+		if running {
+			return fmt.Errorf("refusing to start %s while %s is still running", slot, peer)
+		}
+
+		l.Log.Debug("peer slot is not running", "slot", slot, "peer", peer, "detail", detail)
 	}
 
 	if err := l.Controller.Regenerate(ctx, slot); err != nil {
@@ -90,7 +126,7 @@ func (l *Lifecycle) PostStart(ctx context.Context, slot string) error {
 
 	timeout := l.ReadyTimeout
 	if timeout <= 0 {
-		timeout = 2 * time.Minute
+		timeout = DefaultReadyTimeout
 	}
 
 	interval := l.PollInterval
@@ -128,18 +164,17 @@ func (l *Lifecycle) PostStart(ctx context.Context, slot string) error {
 	}
 }
 
-// afterStartTimeout bounds AfterStart on its own, apart from the readiness
-// wait: the hook is then not limited to what remained of ReadyTimeout. Three
-// minutes fits the supervising unit's start timeout after a readiness wait of
-// up to two. It is a variable so a test can shorten it.
-var afterStartTimeout = 3 * time.Minute
-
 func (l *Lifecycle) afterStart(ctx context.Context, slot string) error {
 	if l.AfterStart == nil {
 		return nil
 	}
 
-	ctx, cancel := context.WithTimeout(ctx, afterStartTimeout)
+	timeout := l.AfterStartTimeout
+	if timeout <= 0 {
+		timeout = DefaultAfterStartTimeout
+	}
+
+	ctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 
 	if err := l.AfterStart(ctx, slot); err != nil {

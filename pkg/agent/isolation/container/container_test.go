@@ -14,6 +14,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/require"
 
@@ -32,10 +33,10 @@ var testDevices = map[string]DeviceInfo{"/dev/nvidia0": {Type: "c", Major: 195, 
 
 func TestConfigGolden(t *testing.T) {
 	for name, in := range map[string]BundleInput{
-		"config-enforcing.json":  {RootfsDir: "/var/lib/unbounded/containers/kube1", SELinux: SELinuxEnforcing},
-		"config-permissive.json": {RootfsDir: "/var/lib/unbounded/containers/kube1", SELinux: SELinuxPermissive},
+		"config-enforcing.json":  {Slot: "kube1", RootfsDir: "/var/lib/unbounded/containers/kube1", SELinux: SELinuxEnforcing},
+		"config-permissive.json": {Slot: "kube1", RootfsDir: "/var/lib/unbounded/containers/kube1", SELinux: SELinuxPermissive},
 		"config-grants.json": {
-			RootfsDir: "/var/lib/unbounded/containers/kube2", SELinux: SELinuxEnforcing,
+			Slot: "kube2", RootfsDir: "/var/lib/unbounded/containers/kube2", SELinux: SELinuxEnforcing,
 			Grants: testGrants, Devices: testDevices,
 		},
 	} {
@@ -60,7 +61,7 @@ func TestUnitGolden(t *testing.T) {
 
 func TestConfigSELinuxLabel(t *testing.T) {
 	label := func(m SELinuxMode) string {
-		b, err := RenderConfig(BundleInput{RootfsDir: "/r", SELinux: m})
+		b, err := RenderConfig(BundleInput{Slot: "kube1", RootfsDir: "/r", SELinux: m})
 		require.NoError(t, err)
 
 		var s spec
@@ -76,7 +77,7 @@ func TestConfigSELinuxLabel(t *testing.T) {
 }
 
 func TestConfigSamePathContract(t *testing.T) {
-	b, err := RenderConfig(BundleInput{RootfsDir: "/r"})
+	b, err := RenderConfig(BundleInput{Slot: "kube1", RootfsDir: "/r"})
 	require.NoError(t, err)
 
 	var s spec
@@ -87,23 +88,80 @@ func TestConfigSamePathContract(t *testing.T) {
 		byDest[m.Destination] = m
 	}
 
-	for _, p := range []string{"/run/containerd", "/etc/containerd/certs.d", "/var/lib/kubelet", "/opt/cni", "/sys/fs/bpf"} {
+	for _, p := range []string{"/run/containerd", "/etc/containerd/certs.d", "/var/lib/kubelet", "/opt/cni"} {
 		m, ok := byDest[p]
 		require.True(t, ok, p)
 		require.Equal(t, p, m.Source, "same path on both sides")
 		require.Contains(t, m.Options, "rbind")
 	}
 
+	// Pod mounts made in the container must reach the host.
 	require.Contains(t, byDest["/var/lib/kubelet"].Options, "rshared")
 	require.NotContains(t, byDest["/run/containerd"].Options, "rshared")
+	require.Equal(t, "rshared", s.Linux.RootfsPropagation)
+
+	// Each slot has its own bpffs, as each nspawn machine does.
+	require.Equal(t, "/run/bpffs/kube1", byDest["/sys/fs/bpf"].Source)
+
+	// The container runs inside its unit's cgroup.
+	require.Equal(t, "/system.slice/unbounded-node-kube1.service/payload", s.Linux.CgroupsPath)
 
 	for _, ns := range s.Linux.Namespaces {
 		require.NotEqual(t, "network", ns.Type, "host network namespace")
 	}
 }
 
+// The host's /sys and /proc/sys are read-only in the container except
+// /proc/sys/net, which the shared network namespace's CNI needs, and the
+// default kernel interfaces are masked.
+func TestConfigProtectsKernelInterfaces(t *testing.T) {
+	b, err := RenderConfig(BundleInput{Slot: "kube2", RootfsDir: "/r"})
+	require.NoError(t, err)
+
+	var s spec
+	require.NoError(t, json.Unmarshal(b, &s))
+
+	for _, m := range s.Mounts {
+		switch m.Destination {
+		case "/sys":
+			require.Contains(t, m.Options, "ro")
+			require.NotContains(t, m.Options, "rw")
+		case "/sys/fs/cgroup":
+			require.Contains(t, m.Options, "rw", "systemd and the kubelet manage cgroups")
+		}
+	}
+
+	for _, p := range []string{"/proc/sys/kernel", "/proc/sys/vm", "/proc/sys/fs", "/proc/sysrq-trigger"} {
+		require.Contains(t, s.Linux.ReadonlyPaths, p)
+	}
+
+	for _, p := range s.Linux.ReadonlyPaths {
+		require.NotEqual(t, "/proc/sys", p, "that would make /proc/sys/net read-only too")
+		require.False(t, strings.HasPrefix(p, "/proc/sys/net"), p)
+	}
+
+	for _, p := range []string{"/proc/kcore", "/proc/keys", "/sys/firmware"} {
+		require.Contains(t, s.Linux.MaskedPaths, p)
+	}
+
+	require.Equal(t, "/run/bpffs/kube2", func() string {
+		for _, m := range s.Mounts {
+			if m.Destination == "/sys/fs/bpf" {
+				return m.Source
+			}
+		}
+
+		return ""
+	}())
+}
+
+func TestConfigRefusesAnInvalidSlot(t *testing.T) {
+	_, err := RenderConfig(BundleInput{RootfsDir: "/r"})
+	require.ErrorContains(t, err, "invalid container slot")
+}
+
 func TestConfigGrantsBecomeMountsDevicesRules(t *testing.T) {
-	b, err := RenderConfig(BundleInput{RootfsDir: "/r", Grants: testGrants, Devices: testDevices})
+	b, err := RenderConfig(BundleInput{Slot: "kube1", RootfsDir: "/r", Grants: testGrants, Devices: testDevices})
 	require.NoError(t, err)
 
 	var s spec
@@ -136,18 +194,106 @@ func TestConfigGrantsBecomeMountsDevicesRules(t *testing.T) {
 	require.True(t, found, "cgroup device rule for the granted device")
 }
 
+// A device directory is bound whole and writable, so device nodes the host
+// creates in it later appear in the container, and the allow-all baseline makes
+// them usable. A node it allows that exists at render time also gets an explicit
+// rule, as a device grant does; a device class gets none, as a class grant
+// does not.
+func TestConfigDeviceDirectoryIsBoundWhole(t *testing.T) {
+	t.Parallel()
+
+	rdmaCM := DeviceInfo{Type: "c", Major: 10, Minor: 58, Mode: 0o666}
+	b, err := RenderConfig(BundleInput{
+		Slot:      "kube1",
+		RootfsDir: "/r",
+		Grants: []isolation.Grant{{
+			Kind:        isolation.GrantMount,
+			Purpose:     isolation.PurposeHostMount,
+			Source:      "/dev/infiniband",
+			Target:      "/dev/infiniband",
+			DeviceAllow: []string{"char-infiniband_verbs", "/dev/infiniband/rdma_cm", "/dev/infiniband/uverbs9"},
+		}},
+		Devices: map[string]DeviceInfo{"/dev/infiniband/rdma_cm": rdmaCM},
+	})
+	require.NoError(t, err)
+
+	var s spec
+	require.NoError(t, json.Unmarshal(b, &s))
+
+	var bound *mount
+
+	for i := range s.Mounts {
+		if s.Mounts[i].Destination == "/dev/infiniband" {
+			bound = &s.Mounts[i]
+		}
+	}
+
+	require.NotNil(t, bound, "the device directory is bound")
+	require.Equal(t, "/dev/infiniband", bound.Source)
+	require.Equal(t, []string{"rbind", "rw"}, bound.Options)
+
+	// No device node is created for the directory or its contents: the bind
+	// exposes them.
+	require.Len(t, s.Linux.Devices, len(baselineDevices))
+
+	require.Equal(t, deviceRule{Allow: true, Access: "rwm"}, s.Linux.Resources.Devices[0], "every device is allowed")
+
+	explicit := s.Linux.Resources.Devices[1+len(baselineDevices):]
+	require.Len(t, explicit, 1, "only the node that exists gets its own rule")
+	require.Equal(t, "c", explicit[0].Type)
+	require.EqualValues(t, 10, *explicit[0].Major)
+	require.EqualValues(t, 58, *explicit[0].Minor)
+}
+
+// RenderBundle describes the device paths a device directory allows that exist
+// on the host, and skips the ones that do not yet.
+func TestRenderBundleDescribesDeviceDirectoryNodes(t *testing.T) {
+	b, _, _ := newBackend(t)
+	b.StatDevice = func(p string) (DeviceInfo, error) {
+		if p == "/dev/infiniband/rdma_cm" {
+			return DeviceInfo{Type: "c", Major: 10, Minor: 58, Mode: 0o666}, nil
+		}
+
+		return DeviceInfo{}, os.ErrNotExist
+	}
+
+	require.NoError(t, b.RenderBundle("kube1", []isolation.Grant{{
+		Kind:        isolation.GrantMount,
+		Purpose:     isolation.PurposeHostMount,
+		Source:      "/dev/infiniband",
+		Target:      "/dev/infiniband",
+		DeviceAllow: []string{"char-infiniband_verbs", "/dev/infiniband/rdma_cm", "/dev/infiniband/uverbs0"},
+	}}))
+
+	data, err := os.ReadFile(b.Layout.ConfigPath("kube1"))
+	require.NoError(t, err)
+
+	var s spec
+	require.NoError(t, json.Unmarshal(data, &s))
+
+	var minors []int64
+
+	for _, r := range s.Linux.Resources.Devices {
+		if r.Major != nil && *r.Major == 10 {
+			minors = append(minors, *r.Minor)
+		}
+	}
+
+	require.Equal(t, []int64{58}, minors)
+}
+
 func TestConfigRejectsBadGrants(t *testing.T) {
 	for name, tt := range map[string]struct {
 		in   BundleInput
 		want string
 	}{
-		"relative rootfs":        {BundleInput{RootfsDir: "r"}, "absolute"},
-		"relative source":        {BundleInput{RootfsDir: "/r", Grants: []isolation.Grant{{Kind: isolation.GrantMount, Source: "x"}}}, "absolute"},
-		"empty source":           {BundleInput{RootfsDir: "/r", Grants: []isolation.Grant{{Kind: isolation.GrantMount}}}, "absolute"},
-		"relative target":        {BundleInput{RootfsDir: "/r", Grants: []isolation.Grant{{Kind: isolation.GrantMount, Source: "/x", Target: "y"}}}, "absolute"},
-		"conflict with baseline": {BundleInput{RootfsDir: "/r", Grants: []isolation.Grant{{Kind: isolation.GrantMount, Source: "/x", Target: "/var/lib/kubelet"}}}, "conflicts"},
-		"unknown kind":           {BundleInput{RootfsDir: "/r", Grants: []isolation.Grant{{Kind: "bogus", Source: "/x"}}}, "unsupported"},
-		"device without info":    {BundleInput{RootfsDir: "/r", Grants: []isolation.Grant{{Kind: isolation.GrantDevice, Source: "/dev/x"}}}, "no device information"},
+		"relative rootfs":        {BundleInput{Slot: "kube1", RootfsDir: "r"}, "absolute"},
+		"relative source":        {BundleInput{Slot: "kube1", RootfsDir: "/r", Grants: []isolation.Grant{{Kind: isolation.GrantMount, Source: "x"}}}, "absolute"},
+		"empty source":           {BundleInput{Slot: "kube1", RootfsDir: "/r", Grants: []isolation.Grant{{Kind: isolation.GrantMount}}}, "absolute"},
+		"relative target":        {BundleInput{Slot: "kube1", RootfsDir: "/r", Grants: []isolation.Grant{{Kind: isolation.GrantMount, Source: "/x", Target: "y"}}}, "absolute"},
+		"conflict with baseline": {BundleInput{Slot: "kube1", RootfsDir: "/r", Grants: []isolation.Grant{{Kind: isolation.GrantMount, Source: "/x", Target: "/var/lib/kubelet"}}}, "conflicts"},
+		"unknown kind":           {BundleInput{Slot: "kube1", RootfsDir: "/r", Grants: []isolation.Grant{{Kind: "bogus", Source: "/x"}}}, "unsupported"},
+		"device without info":    {BundleInput{Slot: "kube1", RootfsDir: "/r", Grants: []isolation.Grant{{Kind: isolation.GrantDevice, Source: "/dev/x"}}}, "no device information"},
 	} {
 		t.Run(name, func(t *testing.T) {
 			_, err := RenderConfig(tt.in)
@@ -157,7 +303,7 @@ func TestConfigRejectsBadGrants(t *testing.T) {
 }
 
 func TestConfigDeterministic(t *testing.T) {
-	in := BundleInput{RootfsDir: "/r", Grants: testGrants, Devices: testDevices, SELinux: SELinuxEnforcing}
+	in := BundleInput{Slot: "kube1", RootfsDir: "/r", Grants: testGrants, Devices: testDevices, SELinux: SELinuxEnforcing}
 	a, err := RenderConfig(in)
 	require.NoError(t, err)
 
@@ -197,6 +343,11 @@ func (s *stub) run(_ context.Context, _ *slog.Logger, name string, args ...strin
 		}
 	}
 
+	// A runtime with no answer configured knows no container.
+	if strings.HasPrefix(line, rt+" state") {
+		return "", errors.New("container does not exist")
+	}
+
 	return "", nil
 }
 
@@ -217,6 +368,8 @@ func newBackend(t *testing.T) (*Backend, *stub, string) {
 		Run:           st.run,
 		SourceRoot:    filepath.Join(dir, "host"),
 		MountInfoPath: filepath.Join(dir, "mountinfo"),
+		GoneTimeout:   20 * time.Millisecond,
+		PollInterval:  time.Millisecond,
 		Host: &HostFS{
 			CgroupControllers: filepath.Join(dir, "cgroup.controllers"),
 			SELinuxEnforce:    filepath.Join(dir, "enforce"),
@@ -371,14 +524,134 @@ func TestStartStopRestartCommands(t *testing.T) {
 
 	u := UnitName("kube1")
 	require.Equal(t, []string{
+		"systemctl reset-failed " + u,
 		"systemctl enable --now " + u,
+		"systemctl reset-failed " + u,
 		"systemctl enable --now " + u,
 		"systemctl restart " + u,
 		"systemctl stop " + u,
+		rt + " state unbounded-kube1",
 		rt + " delete --force unbounded-kube1",
 		"systemctl stop " + u,
+		rt + " state unbounded-kube1",
 		rt + " delete --force unbounded-kube1",
 	}, st.calls)
+}
+
+// Only one slot comes back at boot: starting a slot disables the other one,
+// and stopping a slot disables it.
+func TestStartDisablesTheOtherSlotAndStopDisablesItself(t *testing.T) {
+	b, st, _ := newBackend(t)
+	ctx := context.Background()
+
+	for _, slot := range []string{"kube1", "kube2"} {
+		_, err := b.Prepare(ctx, isolation.NodeSpec{Slot: slot})
+		require.NoError(t, err)
+	}
+
+	st.reset()
+	require.NoError(t, b.Start(ctx, isolation.SlotName("kube2")))
+	require.Equal(t, []string{
+		"systemctl disable " + UnitName("kube1"),
+		"systemctl reset-failed " + UnitName("kube2"),
+		"systemctl enable --now " + UnitName("kube2"),
+	}, st.calls)
+
+	st.reset()
+	require.NoError(t, b.Stop(ctx, isolation.SlotName("kube2")))
+	require.Contains(t, st.calls, "systemctl disable "+UnitName("kube2"))
+
+	// The other slot's unit cannot be disabled: this one is not started.
+	st.reset()
+	st.fail["systemctl disable"] = errors.New("read-only /etc")
+
+	require.ErrorContains(t, b.Start(ctx, isolation.SlotName("kube1")), "disable "+UnitName("kube2"))
+	require.NotContains(t, st.calls, "systemctl enable --now "+UnitName("kube1"))
+}
+
+// Stop returns only once the runtime reports the container gone. One that
+// outlives the unit is killed; one that survives that is an error.
+func TestStopVerifiesTheContainerIsGone(t *testing.T) {
+	ctx := context.Background()
+	r := isolation.SlotName("kube1")
+
+	b, st, _ := newBackend(t)
+	st.out[rt+" state"] = `{"status":"running"}`
+
+	err := b.Stop(ctx, r)
+	require.ErrorContains(t, err, "still alive after stopping, killing and deleting it")
+	require.Contains(t, st.calls, rt+" kill --all unbounded-kube1 KILL")
+
+	// A container the kill ends is gone, and the stop succeeds.
+	b, st, _ = newBackend(t)
+	killed := false
+	b.Run = func(ctx context.Context, log *slog.Logger, name string, args ...string) (string, error) {
+		if name == rt && args[0] == "kill" {
+			killed = true
+		}
+
+		if name == rt && args[0] == "state" && !killed {
+			return `{"status":"running"}`, nil
+		}
+
+		return st.run(ctx, log, name, args...)
+	}
+
+	require.NoError(t, b.Stop(ctx, r))
+	require.True(t, killed)
+
+	// A stopped container is gone too.
+	b, st, _ = newBackend(t)
+	st.out[rt+" state"] = `{"status":"stopped"}`
+
+	require.NoError(t, b.Stop(ctx, r))
+	require.NotContains(t, st.calls, rt+" kill --all unbounded-kube1 KILL")
+}
+
+// Destroy never trusts a stop that reported success: while the runtime has a
+// live container nothing is removed.
+func TestDestroyKeepsEverythingWhileTheContainerLives(t *testing.T) {
+	ctx := context.Background()
+	b, st, _ := newBackend(t)
+
+	_, err := b.Prepare(ctx, isolation.NodeSpec{Slot: "kube1"})
+	require.NoError(t, err)
+
+	st.out[rt+" state"] = `{"status":"running"}`
+
+	err = b.Destroy(ctx, isolation.SlotName("kube1"))
+	require.ErrorContains(t, err, "still alive")
+	require.DirExists(t, b.Layout.RootfsDir("kube1"))
+	require.FileExists(t, filepath.Join(b.SystemdDir, UnitName("kube1")))
+	require.DirExists(t, b.Layout.BundleDir("kube1"))
+}
+
+// The slot's private bpffs is unmounted and removed with the slot.
+func TestDestroyRemovesTheSlotsBPFFS(t *testing.T) {
+	ctx := context.Background()
+	b, st, _ := newBackend(t)
+
+	_, err := b.Prepare(ctx, isolation.NodeSpec{Slot: "kube2"})
+	require.NoError(t, err)
+
+	bpffs := filepath.Join(b.SourceRoot, BPFFSPath("kube2"))
+	require.NoError(t, os.MkdirAll(bpffs, 0o755))
+	require.NoError(t, os.WriteFile(b.MountInfoPath, []byte("40 30 0:40 / "+bpffs+" rw - bpf bpf rw\n"), 0o644))
+
+	require.NoError(t, b.Destroy(ctx, isolation.SlotName("kube2")))
+	require.Contains(t, st.calls, "umount "+bpffs)
+	require.NoDirExists(t, bpffs)
+
+	// An unmount failure is reported and the mount point kept.
+	b, st, _ = newBackend(t)
+	bpffs = filepath.Join(b.SourceRoot, BPFFSPath("kube1"))
+	require.NoError(t, os.MkdirAll(bpffs, 0o755))
+	require.NoError(t, os.WriteFile(b.MountInfoPath, []byte("40 30 0:40 / "+bpffs+" rw - bpf bpf rw\n"), 0o644))
+
+	st.fail["umount"] = errors.New("busy")
+
+	require.ErrorContains(t, b.Destroy(ctx, isolation.SlotName("kube1")), "unmount bpffs")
+	require.DirExists(t, bpffs)
 }
 
 func TestFailureRecovery(t *testing.T) {
@@ -619,7 +892,7 @@ func TestNewDefault(t *testing.T) {
 func TestConfigAlwaysCreatesDevKmsg(t *testing.T) {
 	t.Parallel()
 
-	b, err := RenderConfig(BundleInput{RootfsDir: "/var/lib/unbounded/containers/kube1", SELinux: SELinuxPermissive})
+	b, err := RenderConfig(BundleInput{Slot: "kube1", RootfsDir: "/var/lib/unbounded/containers/kube1", SELinux: SELinuxPermissive})
 	require.NoError(t, err)
 
 	var cfg struct {
@@ -658,4 +931,23 @@ func TestConfigAlwaysCreatesDevKmsg(t *testing.T) {
 	}
 
 	require.True(t, ruled, "an explicit cgroup rule for /dev/kmsg")
+}
+
+// udev belongs to the host; the container's copy is masked in its rootfs, and
+// preparing again keeps it masked.
+func TestPrepareMasksUdevInTheRootfs(t *testing.T) {
+	b, _, _ := newBackend(t)
+
+	for range 2 {
+		_, err := b.Prepare(context.Background(), isolation.NodeSpec{Slot: "kube1"})
+		require.NoError(t, err)
+	}
+
+	for _, unit := range MaskedUnits {
+		target, err := os.Readlink(filepath.Join(b.Layout.RootfsDir("kube1"), "etc/systemd/system", unit))
+		require.NoError(t, err, unit)
+		require.Equal(t, os.DevNull, target, unit)
+	}
+
+	require.Contains(t, MaskedUnits, "systemd-udevd.service")
 }
