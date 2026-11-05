@@ -153,7 +153,10 @@ Custom Go controllers register the operations they support with
 callback or long-running begin and poll callbacks, plus optional replay,
 replacement bootstrap, and cleanup behavior. The controller is installed with
 `pkg/machineops/controller.AddToManager`; provider code does not reconcile
-`MachineOperation` status directly. Long-running begin callbacks must be
+`MachineOperation` status directly. A provider that declares capacity with
+`WithCapacity` installs the MachineClass controller with
+`pkg/machineops/controller.AddCapacityToManager`, described in
+[MachineClass](#machineclass). Long-running begin callbacks must be
 idempotent for `OperationRequest.OperationUID` because the controller may call
 them again until their operation handle has been persisted. `OperationRequest`
 contains the exact external machine resource UID and generation, resolved host
@@ -579,6 +582,162 @@ responses (option 67) for `spec.host.netboot.bootProtocol: PXE`.
 The `httpBootPath` field specifies the file path, relative to metalman's HTTP
 artifact server, used for `spec.host.netboot.bootProtocol: HTTP`. If `httpBootPath` is
 omitted, metalman falls back to `dhcpBootImageName` for the UEFI HTTP boot URL.
+
+## MachineClass
+
+| Property | Value |
+|----------|-------|
+| Kind | `MachineClass` |
+| Plural | `machineclasses` |
+| Short name | `mcls` |
+| Scope | Cluster |
+| Status subresource | Yes |
+
+A `MachineClass` is a provider-neutral template that capacity consumers
+request `MachineAllocation`s from. The provider interprets its provider
+configuration and publishes the capacity offerings it can launch.
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| `spec.siteRef.name` | string | Yes | The `Site` that allocated machines join. Immutable. |
+| `spec.provider` | string | Yes | The registered provider that interprets the class. Immutable. |
+| `spec.providerConfigRef` | TypedObjectReference | Yes | Provider configuration. Only a core-group `ConfigMap` with a `namespace` is accepted. |
+| `spec.configurationRef.name` | string | Yes | The `MachineConfiguration` name. |
+| `spec.configurationRef.version` | int32 | Yes | The pinned `MachineConfigurationVersion` number. |
+| `spec.bootstrap.filesRef` | NamespacedObjectReference | No | A `ConfigMap` of bootstrap files. Its `run` key is the script that runs as root before the agent installer. |
+| `spec.bootstrap.agentArtifact.url` | string | No | Agent tarball location, an `https` or `file:///` URL. |
+| `spec.bootstrap.agentArtifact.sha256` | string | No | Lowercase hex SHA-256 of the agent tarball. Required with `url`. |
+
+```yaml
+apiVersion: unbounded-cloud.io/v1alpha3
+kind: MachineClass
+metadata:
+  name: remote-spot
+spec:
+  siteRef:
+    name: remote
+  provider: ExampleCloud
+  providerConfigRef:
+    kind: ConfigMap
+    namespace: unbounded-capacity
+    name: remote-spot
+  configurationRef:
+    name: workers
+    version: 3
+```
+
+### MachineClass controller
+
+The MachineClass controller resolves each class it serves and publishes the
+result in the class status. It serves a class only when the class's
+`spec.provider` is a registration that declares capacity and, when the
+controller is scoped to a Site, the class's `spec.siteRef.name` is that Site.
+It reads its inputs in this order and stops at the first failure:
+
+1. The `Site` must exist and must not be deleting.
+2. The provider-config `ConfigMap` must be in the configured provider-config
+   namespace, must set `immutable: true`, and must not have `binaryData`.
+3. The bootstrap files `ConfigMap`, when `spec.bootstrap.filesRef` is set,
+   follows the same rules and must have a non-blank `run` key.
+4. The `MachineConfigurationVersion` named `<name>-v<version>` must exist, and
+   its `spec.version` and `unbounded-cloud.io/machine-configuration` label must
+   match the reference.
+5. Exactly one `MachineOperationCredential` must match the class's Site and
+   provider. Its Secret, if any, must be in the configured credential Secret
+   namespace.
+
+The controller then calls the provider's `ResolveClass` with the class name and
+UID, the Site name, a copy of the provider-config data, and the credential.
+Every offering must have a unique non-empty `name`, an `instanceType`, a valid
+`capacityType` and `availability`, a `validUntil`, and, when a `price` is set, a
+valid currency and hourly price. The controller publishes the offerings sorted
+by name.
+
+Two `CapacityOptions` intervals control when a class is resolved again:
+
+| Option | Default | Description |
+|--------|---------|-------------|
+| `ClassRefreshInterval` | 5m | How long to wait after a successful resolve when no offering expires sooner, and after an input failure. Must be at least the effective `MinRequeueInterval`. |
+| `MinRequeueInterval` | 10s | The shortest wait after a successful resolve. Must be at least 1s and at most the effective `ClassRefreshInterval`. |
+
+After a successful resolve the controller waits until the earliest unexpired
+`validUntil` or for `ClassRefreshInterval`, whichever is sooner, but never less
+than `MinRequeueInterval`. `OfferingsCurrent` can therefore stay `True` for up
+to `MinRequeueInterval` after the earliest `validUntil`. A transient provider
+error is retried with backoff. The controller also resolves a class again when
+its spec changes or when a referenced `Site`, `ConfigMap`,
+`MachineConfigurationVersion`, or `MachineOperationCredential` changes. Secrets
+are not watched; a Secret change is picked up at the next refresh.
+
+### MachineClass status
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `observedGeneration` | int64 | The class generation of the last successful resolve. |
+| `resolvedRevision` | string | Identifies the launch inputs of the last successful resolve. |
+| `providerConfig` | ObjectContentSnapshot | Namespace, name, UID, and SHA-256 of the provider-config data. |
+| `bootstrapFiles` | ObjectContentSnapshot | Namespace, name, UID, and SHA-256 of the bootstrap files data. Absent without `filesRef`. |
+| `configuration` | ConfigurationContentSnapshot | Configuration name, version, version object name, UID, and SHA-256 of the template. |
+| `site` | UIDReference | Name and UID of the Site. |
+| `credential` | UIDReference | Name and UID of the matched `MachineOperationCredential`. |
+| `offerings` | []MachineClassOffering | The provider's offerings, sorted by name. |
+| `conditions` | []Condition | `Ready` and `OfferingsCurrent`. |
+
+`resolvedRevision` is the SHA-256 of the provider, the `site` and `credential`
+references, the `providerConfig`, `bootstrapFiles`, and `configuration`
+snapshots, and `spec.bootstrap.agentArtifact`. It excludes the offerings, all
+timestamps, the conditions, the class generation, name, and UID, and Secret
+content, so refreshed offerings keep the same revision. Only a successful
+resolve changes `observedGeneration`, `resolvedRevision`, the snapshots, the
+references, and the offerings, and it changes them together. A failure keeps
+the last published values and reports itself in the conditions, whose
+`observedGeneration` is the generation that was read.
+
+| Condition | Status | Reason | Meaning |
+|-----------|--------|--------|---------|
+| `Ready` | `True` | `Resolved` | The inputs resolved and the provider accepted them. |
+| `Ready` | `False` | `SiteNotFound`, `SiteDeleting` | The Site is missing or being deleted. |
+| `Ready` | `False` | `ProviderConfigInvalid`, `ProviderConfigForbidden`, `ProviderConfigNotFound`, `ProviderConfigNotImmutable` | The provider-config reference is not a namespaced core `ConfigMap`, or the `ConfigMap` is outside the allowed namespace, missing, not immutable, or has `binaryData`. |
+| `Ready` | `False` | `BootstrapFilesForbidden`, `BootstrapFilesNotFound`, `BootstrapFilesNotImmutable`, `BootstrapFilesInvalid` | The bootstrap files `ConfigMap` is outside the allowed namespace, missing, not immutable, has `binaryData`, or has no `run` key. |
+| `Ready` | `False` | `ConfigurationInvalid`, `ConfigurationNotFound`, `ConfigurationMismatch` | The configuration version is unset, missing, or does not match the reference. |
+| `Ready` | `False` | `AuthNotFound`, `AuthAmbiguous`, `AuthInvalid`, `AuthSecretForbidden`, `AuthSecretNotFound` | No single usable credential matches the class's Site and provider. |
+| `Ready` | `False` | `ProviderConfigRejected` | The provider returned a `PermanentError`. The message carries its text. |
+| `Ready` | `False` | `ResolveFailed`, `OfferingsInvalid` | A transient provider error or invalid offerings. When `Ready` was `True` and neither the inputs nor the generation changed since the last successful resolve, `Ready` stays `True` instead. |
+| `OfferingsCurrent` | `True` | `OfferingsAvailable` | At least one offering is `Available` and its `validUntil` has not passed. |
+| `OfferingsCurrent` | `False` | `NoOfferingsAvailable` | The class resolved, but no offering is `Available` and unexpired. |
+| `OfferingsCurrent` | `False` | `ClassNotReady` | `Ready` is `False` because of an input failure or `ProviderConfigRejected`. |
+| `OfferingsCurrent` | `False` | `ResolveFailed`, `OfferingsInvalid` | The last resolve failed transiently or returned invalid offerings. |
+
+### Installing the MachineClass controller
+
+A custom provider controller registers capacity with `WithCapacity` and
+installs the MachineClass controller with
+`pkg/machineops/controller.AddCapacityToManager`:
+
+```go
+err := controller.AddCapacityToManager(mgr, providers, controller.CapacityOptions{
+	ProviderName:              "ExampleCloud",
+	SiteName:                  "remote",
+	CredentialSecretNamespace: "unbounded-system",
+	ProviderConfigNamespace:   "unbounded-capacity",
+})
+```
+
+The controller runs only while the manager holds its leader-election lease, so
+enable leader election with a lease ID unique to the provider and Site scope.
+Two deployments must not serve overlapping scopes, such as an unscoped
+deployment next to one scoped to a Site.
+
+`deploy/machine-ops/04-machineclass-rbac.yaml.tmpl` defines three ClusterRoles
+and no bindings. Bind them to the controller's ServiceAccount:
+
+| ClusterRole | Grants | Bind with |
+|-------------|--------|-----------|
+| `unbounded-machineclass-controller` | `machineclasses` read, `machineclasses/status` update, and `sites`, `machineconfigurationversions`, `machineoperationcredentials` read | A ClusterRoleBinding. |
+| `unbounded-machineclass-controller-provider-config` | `configmaps` `get`, `list`, `watch` | A RoleBinding in the provider-config namespace only. |
+| `unbounded-machineclass-controller-credentials` | `secrets` `get` | A RoleBinding in the credential Secret namespace only. |
+
+The controller's manager also needs its own leader-election Lease permissions.
 
 ---
 
