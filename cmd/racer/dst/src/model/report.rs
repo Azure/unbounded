@@ -70,6 +70,17 @@ pub struct Counters {
     pub replies_abandoned: u64,
     /// Probe answers that arrived after their attempt timed out.
     pub late_answers: u64,
+    /// Requests a relay forwarded (racer-sim `relays`).
+    pub relays: u64,
+    /// Relay failures answered by the relay, or dropped (racer-sim `relay_failures_dropped`).
+    pub relay_failures: u64,
+    /// Route searches that found no route (racer-sim `route_unreachable`).
+    pub route_unreachable: u64,
+    /// Last links unanswered when the requester gave up (racer-sim `silence_timeouts`).
+    pub silence_timeouts: u64,
+    /// Requests dropped at a relay or destination after the requester gave up (racer-sim
+    /// `requests_abandoned`).
+    pub requests_abandoned: u64,
     /// Most pages any node stores at the end of the run.
     pub stored_pages_max: u64,
 }
@@ -165,6 +176,11 @@ impl Report {
                     "silence_pings": c.silence_pings,
                     "flights_reelected": c.flights_reelected,
                     "late_answers": c.late_answers,
+                    "relays": c.relays,
+                    "relay_failures": c.relay_failures,
+                    "route_unreachable": c.route_unreachable,
+                    "silence_timeouts": c.silence_timeouts,
+                    "requests_abandoned": c.requests_abandoned,
                     "replies_abandoned": c.replies_abandoned,
                 },
                 "histograms": {

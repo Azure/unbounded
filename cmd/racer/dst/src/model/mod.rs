@@ -21,6 +21,7 @@ use std::{
 
 use racer_control_wire::{CacheId, NodeId};
 use racer_core::{
+    liveness::{Detours, LINK_TIMEOUTS},
     liveness::{MAX_PINGS_IN_FLIGHT, SILENCE_CAPACITY, Silence},
     prefetch::OwnerBudget,
     read::{
@@ -44,11 +45,14 @@ use racer_core::{
             WorkerCore, WorkerMsg,
         },
     },
-    route::MAX_LINKS,
+    route::{
+        Fault, Hop, MAX_LINKS, RelayFailure, RelayPlan, Response, RouteFault, decide_hop,
+        relay_failure, search_budget,
+    },
 };
 use racer_object_wire::model::{CacheKey, ObjectId, PageNumber};
 use serde_json::Value;
-use topology::{Member, Placement, REPLICAS};
+use topology::{Exhaustive, Member, PathQuery, Paths, Placement, REPLICAS};
 
 pub use report::{Counters, Report};
 
@@ -250,25 +254,12 @@ enum Ev {
         read: ReadId,
         input: Input,
     },
-    /// A probe from `(from, worker, read, id)` arrives at `to`.
-    Probe {
-        from: u32,
-        worker: u32,
-        read: ReadId,
-        id: EffectId,
-        to: u32,
-        page: Page,
-        copy_only: bool,
-        /// The attempt's signed overall deadline (`AttemptPlan::overall`).
-        deadline: Nanos,
-        /// Remote acquisition credits and route links the probe carries.
-        attempts: u32,
-        links: u8,
-        /// When the requester abandons the exchange.
-        abandon: Nanos,
-        /// The destination verified the request and its worker took it: serve now.
-        verified: bool,
-    },
+    /// Peer request `msg` (a key of `Model::msgs`) reaches its next holder (`verified` once the
+    /// holder checked its signature and, at the destination, its worker took it).
+    Hop { msg: u64, verified: bool },
+    /// The requester of `msg` gave up: a last link still unanswered is a timeout for its
+    /// sender (racer-sim `Event::LastHop`).
+    LastHop { msg: u64 },
     /// A silence ping from `from` reaches `to` (`verified` once `to` checked its signature).
     Ping {
         from: u32,
@@ -353,6 +344,22 @@ struct Route {
     links: u8,
 }
 
+/// A peer request on its route (racer-sim `Msg`; production `peer/forwarding.rs`).
+struct Msg {
+    from: u32,
+    worker: u32,
+    read: ReadId,
+    id: EffectId,
+    dest: u32,
+    page: Page,
+    route: Route,
+    /// Wire form: the requester and every relay so far.
+    path: Vec<u32>,
+    /// The node the request travels to.
+    at: u32,
+    abandon: Nanos,
+}
+
 /// Who waits for a serving read's completion.
 struct Asker {
     from: u32,
@@ -363,6 +370,12 @@ struct Asker {
     at: Nanos,
     /// When the requester abandons the exchange (its `AttemptPlan::attempt_end`).
     abandon: Nanos,
+    /// The request's wire route (requester first); replies travel it in reverse.
+    path: Vec<u32>,
+    /// The request's destination: an answer from any other node is a relay's.
+    dest: u32,
+    /// The request's key in `Model::msgs` (and `Model::last_hops`).
+    msg: u64,
 }
 
 struct Node {
@@ -373,6 +386,9 @@ struct Node {
     silence: Silence<u32, Page>,
     /// Silence pings in flight (production `CandidatePolicy::pings`).
     pings: usize,
+    /// Production `LinkHealth` detours (racer-sim `NodeState::detours`): first hops a route
+    /// skips after timeouts.
+    detours: Detours<u32>,
 }
 
 /// A node's published pages, bounded by least-recently-used eviction (racer-sim keeps a
@@ -469,6 +485,17 @@ struct Model<'s> {
     diag: bool,
     /// `MODEL_DIAG`: each acquisition's probe outcomes (`O`wner or `H`elper, answer kind).
     walks: BTreeMap<(u32, u32, ReadId), String>,
+    /// Peer requests on their routes.
+    msgs: BTreeMap<u64, Msg>,
+    next_msg: u64,
+    /// Last links awaiting their destination's answer: sender, destination, page, send time
+    /// (racer-sim `last_hops`).
+    last_hops: BTreeMap<u64, (u32, u32, Page, Nanos)>,
+    /// Route searches: the real `topology::Paths` over exhaustive mesh searches, one cache
+    /// shared by every node. racer-sim keeps one per node over a shared memo; per-node caches
+    /// gave the same 10,000-node cold start (78 against 79 failures) at 40% more memory.
+    /// Searches run synchronously, so the search queue never fills.
+    paths: Paths<Exhaustive>,
 }
 
 const TAG_EVENT: u64 = 1;
@@ -482,6 +509,8 @@ pub const NO_ATTEMPT_CAP: Nanos = Nanos::MAX;
 const SERVE_TIMEOUT: Nanos = 5 * SECONDS;
 /// Client attempts per read, as in racer-sim.
 const MAX_ATTEMPTS: u8 = 4;
+/// Entries of the shared route cache.
+const ROUTE_CACHE_ENTRIES: usize = 1 << 16;
 
 /// The owners of `page` under `members` (member positions are node ids).
 fn owners(placement: &Placement<Phantom>, members: &Members, page: Page) -> Vec<u32> {
@@ -522,6 +551,7 @@ impl<'s> Model<'s> {
                     Duration::from_nanos(ATTEMPT_TIMEOUT),
                 ),
                 pings: 0,
+                detours: Detours::new(SILENCE_CAPACITY),
             })
             .collect();
         Self {
@@ -549,6 +579,10 @@ impl<'s> Model<'s> {
             timeouts_queued: 0,
             diag: std::env::var_os("MODEL_DIAG").is_some(),
             walks: BTreeMap::new(),
+            msgs: BTreeMap::new(),
+            next_msg: 0,
+            last_hops: BTreeMap::new(),
+            paths: Paths::with_limits(ROUTE_CACHE_ENTRIES, ROUTE_CACHE_ENTRIES * 256, 8),
         }
     }
 
@@ -749,65 +783,21 @@ impl<'s> Model<'s> {
                 self.dispatch(node, worker, out);
                 self.pump_all(node, worker);
             }
-            Ev::Probe {
-                from,
-                worker,
-                read,
-                id,
-                to,
-                page,
-                copy_only,
-                deadline,
-                attempts,
-                links,
-                abandon,
-                verified,
-            } => {
-                if !verified {
-                    // Production verifies every request's signature on the crypto helper
-                    // (`peer/server.rs` `verify_request_async`) before the worker dispatches it
-                    // (racer-sim `want`, `request_ns` on the worker FIFO).
-                    let costs = self.fabric.costs;
-                    let (verify, request) = (costs.crypto_verify_ns, costs.cpu_request_ns);
-                    let checked = self.fabric.crypto(now, to, verify);
-                    let w = owner_worker(page, self.spec.workers.max(1)) as u8;
-                    let at = self.fabric.cpu(checked, to, w, request);
-                    let probe = Ev::Probe {
-                        from,
-                        worker,
-                        read,
-                        id,
-                        to,
+            Ev::Hop { msg, verified } => self.hop(msg, verified),
+            Ev::LastHop { msg } => {
+                if let Some((sender, dest, page, sent)) = self.last_hops.remove(&msg) {
+                    self.report.counters.silence_timeouts += 1;
+                    let (sent, at) = (self.instant(sent), self.instant(now));
+                    if self.nodes[sender as usize].silence.timed_out(
+                        dest,
                         page,
-                        copy_only,
-                        deadline,
-                        attempts,
-                        links,
-                        abandon,
-                        verified: true,
-                    };
-                    self.engine.at(at, probe);
-                    return;
+                        sent,
+                        at,
+                        LINK_TIMEOUTS,
+                    ) {
+                        self.poll_pings(sender);
+                    }
                 }
-                self.trace.record(now, TAG_EVENT, 3, u64::from(to));
-                self.serve(
-                    Asker {
-                        from,
-                        worker,
-                        read,
-                        id,
-                        at: now,
-                        abandon,
-                    },
-                    to,
-                    page,
-                    Route {
-                        copy_only,
-                        deadline,
-                        attempts,
-                        links,
-                    },
-                );
             }
             Ev::Ping {
                 from,
@@ -1247,7 +1237,7 @@ impl<'s> Model<'s> {
                     self.instant(route.deadline),
                     route.attempts,
                     route.links,
-                    1,
+                    asker.path.len(),
                 );
                 let budget = match inherited {
                     Ok(budget) => AcquisitionBudgetSpec::from(&budget),
@@ -1302,13 +1292,13 @@ impl<'s> Model<'s> {
         self.bodies.insert(key, (to, worker, body));
         // Production drops an exchange its requester abandoned: no chunk starts at or after the
         // requester's attempt bound (racer-sim `transfer_until`, `replies_abandoned`).
+        self.answering(&asker, to, now);
         let sealed = self.sign(to);
-        let Some(end) = self.fabric.transfer_until(
-            sealed,
-            &[to, asker.from],
-            self.spec.page_bytes,
-            asker.abandon,
-        ) else {
+        let route = Self::back(&asker, to);
+        let Some(end) =
+            self.fabric
+                .transfer_until(sealed, &route, self.spec.page_bytes, asker.abandon)
+        else {
             self.report.counters.replies_abandoned += 1;
             self.engine
                 .at(asker.abandon.max(now), Ev::BodyEnd { body: key });
@@ -1329,6 +1319,7 @@ impl<'s> Model<'s> {
         }
         self.report.counters.peer_bytes += self.spec.page_bytes;
         self.report.counters.peer_pages += 1;
+        self.report.counters.peer_bytes += self.spec.page_bytes * (route.len() as u64 - 2);
         if !owners(&self.placement, &self.members, page).contains(&to) {
             self.report.counters.helper_copies += 1;
         }
@@ -1349,6 +1340,251 @@ impl<'s> Model<'s> {
                 },
             },
         );
+    }
+
+    /// `msg` reached its holder (racer-sim `hop`; production `peer/server.rs` verifies, then
+    /// `decide_hop` serves or relays).
+    fn hop(&mut self, mid: u64, verified: bool) {
+        let now = self.now();
+        let Some(m) = self.msgs.get(&mid) else {
+            return;
+        };
+        let at = m.at;
+        if now >= m.abandon {
+            // The requester gave up: relays and the destination see the upstream connection
+            // close and drop the exchange.
+            self.report.counters.requests_abandoned += 1;
+            self.msgs.remove(&mid);
+            return;
+        }
+        if !verified {
+            // Production verifies every request's signature on the crypto helper
+            // (`peer/server.rs` `verify_request_async`) before it dispatches or relays it; the
+            // destination's worker then takes it (racer-sim `want`, `request_ns`).
+            let costs = self.fabric.costs;
+            let mut ready = self.fabric.crypto(now, at, costs.crypto_verify_ns);
+            if at == m.dest {
+                let w = owner_worker(m.page, self.spec.workers.max(1)) as u8;
+                ready = self.fabric.cpu(ready, at, w, costs.cpu_request_ns);
+            }
+            self.engine.at(
+                ready,
+                Ev::Hop {
+                    msg: mid,
+                    verified: true,
+                },
+            );
+            return;
+        }
+        self.trace.record(now, TAG_EVENT, 3, u64::from(at));
+        match decide_hop(&at, &m.path, &m.dest, m.route.links, true) {
+            Hop::StaleMembership => self.violation(format!("node {at} lacks the one membership")),
+            Hop::Serve => {
+                let m = self.msgs.remove(&mid).expect("message");
+                let (page, route) = (m.page, m.route);
+                let asker = Asker {
+                    from: m.from,
+                    worker: m.worker,
+                    read: m.read,
+                    id: m.id,
+                    at: now,
+                    abandon: m.abandon,
+                    path: m.path,
+                    dest: m.dest,
+                    msg: mid,
+                };
+                self.serve(asker, at, page, route);
+            }
+            Hop::Relay(plan) => {
+                if plan.outbound == Err(RouteFault::Invalid) {
+                    self.msgs.remove(&mid);
+                    return self.violation(format!("relay {at} received a route revisiting it"));
+                }
+                self.report.counters.relays += 1;
+                self.forward(mid, at, Some(plan));
+            }
+        }
+    }
+
+    /// Route `msg` one link from `holder` (racer-sim `forward`; production `Paths::shortest`
+    /// with `LinkHealth` blocks and `Paths::detour`). `plan` is the relay plan at a relay.
+    fn forward(&mut self, mid: u64, holder: u32, plan: Option<RelayPlan>) {
+        let now = self.now();
+        let at = self.instant(now);
+        let m = &self.msgs[&mid];
+        let dest = m.dest;
+        if self.nodes[holder as usize].silence.silent(&dest, at) {
+            // The destination is a silent next hop of this node.
+            return self.fail_hop(mid, holder, Fault::Unavailable);
+        }
+        let search = match plan {
+            None => search_budget(&m.path, m.route.links, &holder),
+            Some(plan) => plan.search,
+        };
+        let Ok((keep, links)) = search else {
+            return self.fail_hop(mid, holder, Fault::HopBudgetExhausted);
+        };
+        let visited: Vec<usize> = m.path[..keep].iter().map(|n| *n as usize).collect();
+        let node = &self.nodes[holder as usize];
+        let mut blocked: Vec<usize> = node
+            .silence
+            .silent_peers(at)
+            .map(|p| *p as usize)
+            .filter(|p| self.members.is_neighbor(holder as usize, *p))
+            .collect();
+        blocked.sort_unstable();
+        let level = node.detours.level(&dest, at);
+        blocked.extend(self.members.detour(holder as usize, dest as usize, level));
+        let seed = mid.to_be_bytes();
+        let query = PathQuery {
+            from: holder as usize,
+            to: dest as usize,
+            links,
+            visited: &visited,
+            blocked: &blocked,
+            seed: &seed,
+        };
+        let (route, polls) = self.route(query);
+        // racer-sim `spawn`: a cache hit answers on the first poll, each further poll expands
+        // up to 32 nodes, on one worker's CPU.
+        let costs = self.fabric.costs;
+        let worker = (mid % u64::from(self.spec.workers.max(1))) as u8;
+        let cost = polls.saturating_sub(1) * 32 * costs.cpu_path_expand_ns_per_node;
+        let ready = self.fabric.cpu(now, holder, worker, cost);
+        let route = match route {
+            Ok(route) => route,
+            Err(topology::Error::Overloaded) => {
+                return self.fail_hop(mid, holder, Fault::Overloaded);
+            }
+            Err(_) => {
+                self.report.counters.route_unreachable += 1;
+                return self.fail_hop(mid, holder, Fault::Unavailable);
+            }
+        };
+        self.link(mid, holder, plan, route[1] as u32, ready);
+    }
+
+    /// Run one route search to completion; returns the route and the polls it took.
+    fn route(&self, query: PathQuery<'_>) -> (Result<Vec<usize>, topology::Error>, u64) {
+        let mut future = std::pin::pin!(self.paths.route(&*self.members, query));
+        let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+        let mut polls = 0;
+        loop {
+            polls += 1;
+            if let std::task::Poll::Ready(route) = future.as_mut().poll(&mut cx) {
+                return (route, polls);
+            }
+            // Searches run one at a time, so a search never waits on another.
+            assert!(polls < 1_000, "a route search did not finish");
+        }
+    }
+
+    /// Send `msg` from `holder` over its link to `next` once `ready` (racer-sim `link`).
+    fn link(&mut self, mid: u64, holder: u32, plan: Option<RelayPlan>, next: u32, ready: Nanos) {
+        let now = self.now();
+        let m = self.msgs.get_mut(&mid).expect("message");
+        if let Some(plan) = plan {
+            let Ok(outbound) = plan.outbound else {
+                return self.fail_hop(mid, holder, Fault::HopBudgetExhausted);
+            };
+            m.path.push(holder);
+            m.route.links = outbound;
+        }
+        m.at = next;
+        if next == m.dest {
+            // The last link: this sender learns whether the destination answers.
+            self.last_hops.insert(mid, (holder, next, m.page, now));
+            let abandon = m.abandon.max(now + 1);
+            self.engine.at(abandon, Ev::LastHop { msg: mid });
+        }
+        let signed = self
+            .fabric
+            .crypto(ready, holder, self.fabric.costs.crypto_sign_ns);
+        let arrive = self.fabric.message(signed, holder, next);
+        self.engine.at(
+            arrive,
+            Ev::Hop {
+                msg: mid,
+                verified: false,
+            },
+        );
+    }
+
+    /// Forwarding `msg` from `holder` failed with `fault` (racer-sim `fail_hop`; production
+    /// `relay_failure`).
+    fn fail_hop(&mut self, mid: u64, holder: u32, fault: Fault) {
+        let Some(m) = self.msgs.remove(&mid) else {
+            return;
+        };
+        let asker = Asker {
+            from: m.from,
+            worker: m.worker,
+            read: m.read,
+            id: m.id,
+            at: self.now(),
+            abandon: m.abandon,
+            path: m.path,
+            dest: m.dest,
+            msg: mid,
+        };
+        if holder == asker.from && asker.path.len() == 1 {
+            // The requester's own send failed: a transport error.
+            let failed = Input::Replied {
+                id: asker.id,
+                reply: Reply::Failed {
+                    error: Error::Unavailable,
+                    sent: true,
+                    scope_live: true,
+                },
+                answer: None,
+            };
+            let input = Ev::Input {
+                node: asker.from,
+                worker: asker.worker,
+                read: asker.read,
+                input: failed,
+            };
+            return self.engine.at(self.now(), input);
+        }
+        self.report.counters.relay_failures += 1;
+        match relay_failure(fault, false) {
+            RelayFailure::Respond(r) => self.reply(&asker, holder, response_kind(r)),
+            RelayFailure::RespondIfLive(r) if self.now() < m.route.deadline => {
+                self.reply(&asker, holder, response_kind(r));
+            }
+            RelayFailure::RespondIfLive(_) => {}
+            RelayFailure::Propagate => self.fail_probe(&asker, holder),
+        }
+    }
+
+    /// The route back from `from` to `asker`: `from`, then the request's path reversed.
+    fn back(asker: &Asker, from: u32) -> Vec<u32> {
+        let mut route = Vec::with_capacity(asker.path.len() + 1);
+        route.push(from);
+        route.extend(asker.path.iter().rev().copied());
+        route
+    }
+
+    /// `from` answers `asker`, ready at `ready`: an answer from the destination before the
+    /// requester gave up clears its last link (racer-sim `send_reply`). Returns whether the
+    /// answer is the destination's own (signed by it).
+    fn answering(&mut self, asker: &Asker, from: u32, ready: Nanos) -> bool {
+        let own = from == asker.dest;
+        if own
+            && ready < asker.abandon
+            && let Some((sender, dest, ..)) = self.last_hops.remove(&asker.msg)
+        {
+            let at = self.instant(self.now());
+            self.nodes[sender as usize].silence.answered(&dest, at);
+        }
+        own
+    }
+
+    /// A message from `asker`'s replier back over `route`, leaving at `ready`.
+    fn message_back(&self, ready: Nanos, route: &[u32]) -> Nanos {
+        route
+            .windows(2)
+            .fold(ready, |t, hop| self.fabric.message(t, hop[0], hop[1]))
     }
 
     /// `node` signs a peer response on its crypto helper (production `sign_response` in
@@ -1432,7 +1668,9 @@ impl<'s> Model<'s> {
 
     /// The serving read on `to` failed without a peer response: a transport failure.
     fn fail_probe(&mut self, asker: &Asker, to: u32) {
-        let at = self.fabric.message(self.now(), to, asker.from);
+        let now = self.now();
+        self.answering(asker, to, now);
+        let at = self.message_back(now, &Self::back(asker, to));
         self.engine.at(
             at,
             Ev::Input {
@@ -1453,8 +1691,9 @@ impl<'s> Model<'s> {
     }
 
     fn reply(&mut self, asker: &Asker, to: u32, kind: ResponseKind) {
-        let signed = self.sign(to);
-        let at = self.fabric.message(signed, to, asker.from);
+        let own = self.answering(asker, to, self.now());
+        let ready = self.sign(to);
+        let at = self.message_back(ready, &Self::back(asker, to));
         self.engine.at(
             at,
             Ev::Input {
@@ -1463,7 +1702,8 @@ impl<'s> Model<'s> {
                 read: asker.read,
                 input: Input::Replied {
                     id: asker.id,
-                    reply: Reply::Answer { kind, signed: true },
+                    // A relay's answer is not the destination's signed answer.
+                    reply: Reply::Answer { kind, signed: own },
                     answer: None,
                 },
             },
@@ -1616,27 +1856,27 @@ impl<'s> Model<'s> {
                             id,
                         },
                     );
-                    // The requester signs each request on its crypto helper (production
-                    // `peer::protocol`; racer-sim `fail_hop`/`hop`).
-                    let signed = self.fabric.crypto(now, node, costs.crypto_sign_ns);
-                    let at = self.fabric.message(signed, node, to);
-                    self.engine.at(
-                        at,
-                        Ev::Probe {
-                            from: node,
-                            worker,
-                            read,
-                            id,
-                            to,
-                            page,
-                            copy_only: probe.mode == racer_core::read::walk::Mode::CopyOnly,
+                    self.next_msg += 1;
+                    let mid = self.next_msg;
+                    let msg = Msg {
+                        from: node,
+                        worker,
+                        read,
+                        id,
+                        dest: to,
+                        page,
+                        route: Route {
+                            copy_only,
                             deadline,
                             attempts: plan.remote_attempts,
                             links: plan.links,
-                            abandon: timeout,
-                            verified: false,
                         },
-                    );
+                        path: vec![node],
+                        at: node,
+                        abandon: timeout,
+                    };
+                    self.msgs.insert(mid, msg);
+                    self.forward(mid, node, None);
                 }
                 Acq::Validate { id, .. } => {
                     let at = self
@@ -1753,6 +1993,10 @@ impl<'s> Model<'s> {
                     SilenceNote::Shed => silence.shed(dest, page, at),
                     SilenceNote::Answered => silence.answered(&dest, at),
                     SilenceNote::TimedOut { needed } => {
+                        // Production `LinkHealth::silence_timed_out`: later routes to `dest`
+                        // skip the relay that may have eaten this exchange.
+                        self.nodes[node as usize].detours.timed_out(dest, sent, at);
+                        let silence = &mut self.nodes[node as usize].silence;
                         if silence.timed_out(dest, page, sent, at, needed) {
                             self.poll_pings(node);
                         }
@@ -1876,6 +2120,9 @@ impl<'s> Model<'s> {
                     .entry(format!("walk:{walk}"))
                     .or_default() += 1;
             }
+        }
+        if !self.msgs.is_empty() {
+            self.violation(format!("{} peer requests never ended", self.msgs.len()));
         }
         let ended = self.report.counters.reads_completed + self.report.counters.reads_failed;
         if ended != self.expected_reads {
@@ -2114,6 +2361,19 @@ pub fn run(scenario: &Scenario, choices: Choices) -> (Outcome, Value) {
         },
         report,
     )
+}
+
+/// The response kind a relay signs for `r` (racer-sim `response_kind`).
+fn response_kind(r: Response) -> ResponseKind {
+    match r {
+        Response::Overloaded => ResponseKind::Overloaded,
+        Response::Unavailable => ResponseKind::Unavailable,
+        Response::NotFound => ResponseKind::NotFound,
+        Response::VersionUnavailable => ResponseKind::VersionUnavailable,
+        Response::OriginRejected => ResponseKind::OriginRejected,
+        Response::OriginForbidden => ResponseKind::OriginForbidden,
+        Response::StaleMembership => ResponseKind::StaleMembership,
+    }
 }
 
 #[cfg(test)]

@@ -36,7 +36,20 @@ fn hot_page_storm_fans_out_through_helpers() {
 
 #[test]
 fn cold_start_400() {
-    run(scenarios::cold_start(400), 8);
+    let report = run(scenarios::cold_start(400), 8);
+    let counters = &report["metrics"]["counters"];
+    // Probes cross the mesh: most owners are not neighbors, so requests are relayed, and every
+    // relayed page crosses more than one link.
+    let relays = counters["relays"].as_u64().unwrap();
+    assert!(relays > 0, "{counters}");
+    let (bytes, pages) = (
+        counters["peer_bytes"].as_u64().unwrap(),
+        counters["peer_pages"].as_u64().unwrap(),
+    );
+    assert!(
+        bytes > pages * model::ModelSpec::default().page_bytes,
+        "{counters}"
+    );
 }
 
 /// Full-size cold start; a few seconds in release builds (`cargo test --release`).

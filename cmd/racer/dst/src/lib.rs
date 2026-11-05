@@ -77,6 +77,7 @@
 //! `tests/no_random_state.rs`); use `BTreeMap` or a fixed-seed hasher. No host
 //! clock or OS entropy on behavior paths: use the node's `WorkerCtx`.
 #![deny(missing_docs)]
+#![recursion_limit = "256"]
 
 pub mod choices;
 pub mod costs;
