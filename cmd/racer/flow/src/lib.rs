@@ -31,9 +31,11 @@ pub use racer_flow_core::{Class, Error, Result, coalesce, fifo, progress, subscr
 
 /// Charged kernel pipes and worker-local reuse.
 mod pipe;
+mod pool_account;
 
 pub use page_alloc::{PoolDemand, PoolStats};
 pub use pipe::{MAX_PIPE_BYTES, PipeLease, PipePool, splice_unsupported};
+pub use pool_account::QuotaPoolAccount;
 pub use racer_flow_core::admission::{
     Adaptive, Admitted, Circuits, Config as AdaptiveConfig, Event as AdaptiveEvent, Handoff,
     HandoffAdmission, HedgePermit, Hedges, Observer as AdaptiveObserver, Offer,
