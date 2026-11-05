@@ -148,3 +148,16 @@ func TestUnmountBelowByPrefixReportsAnUnreadableMountTable(t *testing.T) {
 	_, err := UnmountBelowByPrefix(t.Context(), nil, nil, t.TempDir(), KubeletDir)
 	require.Error(t, err)
 }
+
+// The real mount table missing is an error, not "no mounts": a removal that
+// trusted it could delete through a mount it never saw.
+func TestOpenMountTableFailsClosedWithoutTheRealTable(t *testing.T) {
+	t.Parallel()
+
+	_, err := openMountTable(filepath.Join(t.TempDir(), "absent"), false)
+	require.ErrorContains(t, err, "read the mount table")
+
+	f, err := openMountTable(filepath.Join(t.TempDir(), "absent"), true)
+	require.NoError(t, err)
+	require.Nil(t, f)
+}

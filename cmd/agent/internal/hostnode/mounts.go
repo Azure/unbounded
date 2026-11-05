@@ -53,16 +53,13 @@ func UnmountBelowByPrefix(ctx context.Context, log *slog.Logger, run none.Runner
 func unmountBelow(ctx context.Context, log *slog.Logger, run none.Runner, mountInfo string, prefixes ...string) (map[string]error, error) {
 	log = Logger(log)
 
-	if mountInfo == "" {
-		mountInfo = "/proc/self/mountinfo"
+	override := mountInfo != ""
+	if !override {
+		mountInfo = defaultMountInfo
 	}
 
-	f, err := os.Open(mountInfo)
-	if errors.Is(err, os.ErrNotExist) {
-		return nil, nil
-	}
-
-	if err != nil {
+	f, err := openMountTable(mountInfo, override)
+	if err != nil || f == nil {
 		return nil, err
 	}
 
@@ -108,6 +105,27 @@ func unmountBelow(ctx context.Context, log *slog.Logger, run none.Runner, mountI
 	}
 
 	return failed, nil
+}
+
+// defaultMountInfo is the mount table of the agent's mount namespace.
+const defaultMountInfo = "/proc/self/mountinfo"
+
+// openMountTable opens the mount table at path. The real mount table always
+// exists: without it nothing says which mounts are below a directory, and
+// removing the directory could delete through one, so its absence is an error.
+// A path a caller supplied (a test's) that does not exist means "no mounts",
+// which is a nil file and no error.
+func openMountTable(path string, override bool) (*os.File, error) {
+	f, err := os.Open(path)
+	if errors.Is(err, os.ErrNotExist) && override {
+		return nil, nil
+	}
+
+	if err != nil {
+		return nil, fmt.Errorf("read the mount table: %w", err)
+	}
+
+	return f, nil
 }
 
 // unescapeMount decodes the octal escapes mountinfo uses for spaces and tabs.
