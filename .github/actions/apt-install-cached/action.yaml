@@ -1,0 +1,85 @@
+name: Install apt packages with a download cache
+description: >-
+  Install apt packages, reusing .deb files from the GitHub Actions cache.
+  Package indexes are always refreshed so installs stay current; only the
+  downloaded archives are cached. The cache is saved only from push events, so
+  pull requests restore entries written by their base branch without adding
+  their own.
+inputs:
+  packages:
+    description: Space-separated list of packages to install.
+    required: true
+  cache-name:
+    description: Short name that identifies this package set in the cache key.
+    required: true
+  install-recommends:
+    description: Whether to install recommended packages.
+    required: false
+    default: "false"
+  timeout-seconds:
+    description: Timeout for each apt-get invocation.
+    required: false
+    default: "600"
+runs:
+  using: composite
+  steps:
+    - name: Compute apt cache key
+      id: key
+      shell: bash
+      env:
+        PACKAGES: ${{ inputs.packages }}
+      run: |
+        set -euo pipefail
+        # Sort the package list so the key does not depend on argument order.
+        hash="$(tr -s '[:space:]' '\n' <<<"$PACKAGES" | sed '/^$/d' | sort -u | sha256sum | cut -c1-16)"
+        echo "hash=${hash}" >> "$GITHUB_OUTPUT"
+        # ImageOS and ImageVersion are set on GitHub-hosted runners. The image
+        # version changes when the runner image is updated, which keeps the
+        # cached archives close to what the mirrors currently serve.
+        echo "image=${ImageOS:-unknown}" >> "$GITHUB_OUTPUT"
+        echo "image-version=${ImageVersion:-unknown}" >> "$GITHUB_OUTPUT"
+        echo "dir=${RUNNER_TEMP}/apt-archives" >> "$GITHUB_OUTPUT"
+
+    - name: Restore apt archives
+      id: restore
+      uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+      with:
+        path: ${{ steps.key.outputs.dir }}
+        key: apt-${{ inputs.cache-name }}-${{ runner.os }}-${{ runner.arch }}-${{ steps.key.outputs.image }}-${{ steps.key.outputs.hash }}-${{ steps.key.outputs.image-version }}
+        restore-keys: |
+          apt-${{ inputs.cache-name }}-${{ runner.os }}-${{ runner.arch }}-${{ steps.key.outputs.image }}-${{ steps.key.outputs.hash }}-
+
+    - name: Install packages
+      shell: bash
+      env:
+        PACKAGES: ${{ inputs.packages }}
+        ARCHIVES: ${{ steps.key.outputs.dir }}
+        INSTALL_RECOMMENDS: ${{ inputs.install-recommends }}
+        TIMEOUT_SECONDS: ${{ inputs.timeout-seconds }}
+      run: |
+        set -euo pipefail
+        mkdir -p "$ARCHIVES/partial"
+        recommends=--no-install-recommends
+        if [ "$INSTALL_RECOMMENDS" = "true" ]; then
+          recommends=--install-recommends
+        fi
+        read -ra packages <<<"$PACKAGES"
+        timeout --signal=TERM --kill-after=10s "${TIMEOUT_SECONDS}s" sudo apt-get update
+        timeout --signal=TERM --kill-after=10s "${TIMEOUT_SECONDS}s" sudo apt-get install -y "$recommends" \
+          -o Dir::Cache::Archives="$ARCHIVES" \
+          -o APT::Keep-Downloaded-Packages=true \
+          "${packages[@]}"
+        # Drop archives that the mirrors no longer serve so a restored cache
+        # does not grow with every package update.
+        sudo apt-get autoclean -o Dir::Cache::Archives="$ARCHIVES"
+        # apt writes the archives as root; hand them back to the runner user so
+        # the cache can be saved, and drop apt's lock and partial downloads.
+        sudo rm -rf "$ARCHIVES/partial" "$ARCHIVES/lock"
+        sudo chown -R "$(id -u):$(id -g)" "$ARCHIVES"
+
+    - name: Save apt archives
+      if: github.event_name == 'push' && steps.restore.outputs.cache-hit != 'true'
+      uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+      with:
+        path: ${{ steps.key.outputs.dir }}
+        key: ${{ steps.restore.outputs.cache-primary-key }}

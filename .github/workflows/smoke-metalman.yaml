@@ -18,6 +18,7 @@ on:
       - hack/smoke-metalman-http.py
       - hack/smoke-metalman.py
       - .github/workflows/smoke-metalman.yaml
+      - .github/actions/apt-install-cached/**
   push:
     # release-* included so a cherry-pick onto a release branch gets the same
     # post-merge validation as main. The pull_request trigger above is
@@ -36,9 +37,14 @@ on:
       - hack/smoke-metalman-http.py
       - hack/smoke-metalman.py
       - .github/workflows/smoke-metalman.yaml
+      - .github/actions/apt-install-cached/**
   schedule:
     - cron: "0 7 * * *"
   workflow_dispatch:
+
+concurrency:
+  group: smoke-metalman-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 permissions:
   contents: read
@@ -74,22 +80,22 @@ jobs:
         with:
           go-version-file: go.mod
 
-      - name: Cache apt packages
-        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
-        with:
-          path: /var/cache/apt/archives
-          key: apt-smoke-noble-${{ hashFiles('.github/workflows/smoke-metalman.yaml') }}
-          restore-keys: apt-smoke-noble-
-
       - name: Install system dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends \
-            dnsmasq qemu-kvm libvirt-daemon-system libvirt-clients virtinst \
-            ovmf qemu-utils swtpm swtpm-tools \
+        uses: ./.github/actions/apt-install-cached
+        with:
+          cache-name: smoke-metalman-pxe
+          packages: >-
+            dnsmasq qemu-kvm libvirt-daemon-system libvirt-clients virtinst
+            ovmf qemu-utils swtpm swtpm-tools
             python3-yaml cpio iptables
-          sudo systemctl start libvirtd
 
+      - name: Start libvirtd
+        run: sudo systemctl start libvirtd
+
+      # Both jobs build the same three images from the same inputs, so they
+      # share cache scopes. Only this job writes them, and only on push, so
+      # pull requests restore the base branch layers without exporting their
+      # own.
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
         with:
@@ -103,7 +109,7 @@ jobs:
           load: true
           tags: localhost:5555/unbounded/host-ubuntu2404:smoke
           cache-from: type=gha,scope=host-ubuntu2404
-          cache-to: type=gha,mode=max,scope=host-ubuntu2404
+          cache-to: ${{ github.event_name == 'push' && 'type=gha,mode=max,scope=host-ubuntu2404' || '' }}
           provenance: false
 
       - name: Build netboot image
@@ -114,7 +120,7 @@ jobs:
           load: true
           tags: localhost:5555/unbounded/netboot:smoke
           cache-from: type=gha,scope=netboot
-          cache-to: type=gha,mode=max,scope=netboot
+          cache-to: ${{ github.event_name == 'push' && 'type=gha,mode=max,scope=netboot' || '' }}
           provenance: false
 
       - name: Build agent-ubuntu2404 image
@@ -125,7 +131,7 @@ jobs:
           load: true
           tags: localhost:5555/unbounded/agent-ubuntu2404:smoke
           cache-from: type=gha,scope=agent-ubuntu2404
-          cache-to: type=gha,mode=max,scope=agent-ubuntu2404
+          cache-to: ${{ github.event_name == 'push' && 'type=gha,mode=max,scope=agent-ubuntu2404' || '' }}
           provenance: false
 
       - name: Create kind cluster
@@ -170,21 +176,17 @@ jobs:
         with:
           go-version-file: go.mod
 
-      - name: Cache apt packages
-        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
-        with:
-          path: /var/cache/apt/archives
-          key: apt-smoke-http-noble-${{ hashFiles('.github/workflows/smoke-metalman.yaml') }}
-          restore-keys: apt-smoke-http-noble-
-
       - name: Install system dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends \
-            qemu-kvm libvirt-daemon-system libvirt-clients ovmf qemu-utils \
-            swtpm swtpm-tools python3-yaml cpio iptables tcpdump dnsmasq \
+        uses: ./.github/actions/apt-install-cached
+        with:
+          cache-name: smoke-metalman-http
+          packages: >-
+            qemu-kvm libvirt-daemon-system libvirt-clients ovmf qemu-utils
+            swtpm swtpm-tools python3-yaml cpio iptables tcpdump dnsmasq
             dosfstools mtools curl
-          sudo systemctl start libvirtd
+
+      - name: Start libvirtd
+        run: sudo systemctl start libvirtd
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
@@ -199,7 +201,6 @@ jobs:
           load: true
           tags: localhost:5556/unbounded/host-ubuntu2404:http-smoke
           cache-from: type=gha,scope=host-ubuntu2404
-          cache-to: type=gha,mode=max,scope=host-ubuntu2404
           provenance: false
 
       - name: Build netboot image
@@ -210,7 +211,6 @@ jobs:
           load: true
           tags: localhost:5556/unbounded/netboot:http-smoke
           cache-from: type=gha,scope=netboot
-          cache-to: type=gha,mode=max,scope=netboot
           provenance: false
 
       - name: Build agent image
@@ -221,7 +221,6 @@ jobs:
           load: true
           tags: localhost:5556/unbounded/agent-ubuntu2404:http-smoke
           cache-from: type=gha,scope=agent-ubuntu2404
-          cache-to: type=gha,mode=max,scope=agent-ubuntu2404
           provenance: false
 
       - name: Create kind cluster

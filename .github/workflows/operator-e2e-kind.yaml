@@ -16,6 +16,7 @@ on:
       - go.mod
       - go.sum
       - .github/workflows/operator-e2e-kind.yaml
+      - .github/actions/setup-go-cached/**
   push:
     # release-* included so a cherry-pick onto a release branch gets the same
     # post-merge validation as main. The pull_request trigger above is
@@ -32,6 +33,7 @@ on:
       - go.mod
       - go.sum
       - .github/workflows/operator-e2e-kind.yaml
+      - .github/actions/setup-go-cached/**
   workflow_dispatch:
 
 concurrency:
@@ -55,10 +57,16 @@ jobs:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
+      # setup-go's built-in cache shares one key across every workflow and
+      # saves from pull requests too. Use a build cache scoped to this suite
+      # instead, saved only from push runs.
+      # Only GOCACHE is cached. Modules download quickly from the proxy, and
+      # leaving them out keeps the entry small.
       - name: Set up Go
-        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        uses: ./.github/actions/setup-go-cached
         with:
-          go-version-file: go.mod
+          profile: e2e-operator
+          restore-mod-cache: "false"
 
       - name: Install kind
         run: |
@@ -81,3 +89,11 @@ jobs:
 
       - name: Run operator reaper e2e
         run: go test -tags=e2e -count=1 -timeout=900s -v ./e2e/operator/...
+
+      # Runs only when the steps above succeed; the action saves only on push.
+      - name: Save Go build cache
+        uses: ./.github/actions/setup-go-cached
+        with:
+          phase: save
+          profile: e2e-operator
+          save-build-cache: "true"

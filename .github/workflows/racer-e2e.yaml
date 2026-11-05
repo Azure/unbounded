@@ -29,6 +29,7 @@ on:
       - go.sum
       - Makefile
       - .github/workflows/racer-e2e.yaml
+      - .github/actions/setup-go-cached/**
   push:
     # release-* included so a cherry-pick onto a release branch gets the same
     # post-merge validation as main. The pull_request trigger above is
@@ -57,6 +58,7 @@ on:
       - go.sum
       - Makefile
       - .github/workflows/racer-e2e.yaml
+      - .github/actions/setup-go-cached/**
   schedule:
     - cron: "17 9 * * *"
   workflow_dispatch:
@@ -81,14 +83,31 @@ jobs:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
+      # setup-go's built-in cache shares one key across every workflow and
+      # saves from pull requests too. Use a build cache scoped to this suite
+      # instead, saved only from push runs so pull requests restore the base
+      # branch entry without adding their own.
+      # Only GOCACHE is cached. Modules download quickly from the proxy, and
+      # leaving them out keeps the entry small.
       - name: Set up Go
-        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        uses: ./.github/actions/setup-go-cached
         with:
-          go-version-file: go.mod
-          cache-dependency-path: go.sum
+          profile: e2e-racer
+          restore-mod-cache: "false"
 
+      # The release binary avoids compiling kind on every run.
       - name: Install kind
-        run: go install sigs.k8s.io/kind@v0.30.0
+        env:
+          KIND_VERSION: v0.30.0
+          KIND_SHA256: 517ab7fc89ddeed5fa65abf71530d90648d9638ef0c4cde22c2c11f8097b8889
+        run: |
+          set -euo pipefail
+          curl -fsSL --retry 3 -o "${RUNNER_TEMP}/kind" \
+            "https://github.com/kubernetes-sigs/kind/releases/download/${KIND_VERSION}/kind-linux-amd64"
+          echo "${KIND_SHA256}  ${RUNNER_TEMP}/kind" | sha256sum --check -
+          sudo install -m 0755 "${RUNNER_TEMP}/kind" /usr/local/bin/kind
+          rm -f "${RUNNER_TEMP}/kind"
+          kind version
 
       # The suite skips when prerequisites are absent. Verify them first so CI
       # cannot report success without creating a cluster.
@@ -100,11 +119,50 @@ jobs:
           done
           "$CONTAINER_ENGINE" info >/dev/null
 
+      # The Rust dataplane is the slowest image in the suite. Build it here
+      # with a layer cache, tagged exactly as the harness's image-racer-local
+      # target tags it, and let the harness push it to its local registry.
+      # The builder is not made the default so the harness's own docker build
+      # calls keep loading into the local image store.
+      - name: Set up Docker Buildx
+        id: buildx
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+        with:
+          use: false
+
+      # mode=max keeps the builder stage, which holds the cargo build and
+      # the CUDA and rdma-core setup. The entry is about 1 GB, most of it the
+      # rust base image layers. Only push runs write it.
+      - name: Build racer image
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          builder: ${{ steps.buildx.outputs.name }}
+          context: .
+          file: images/racer/Containerfile
+          load: true
+          provenance: false
+          tags: |
+            racer:e2e
+            localhost:5001/unbounded/racer:e2e
+          cache-from: type=gha,scope=racer-e2e-racer-amd64
+          cache-to: ${{ github.event_name == 'push' && 'type=gha,mode=max,scope=racer-e2e-racer-amd64' || '' }}
+
       # CI=1 makes missing Azure blob egress fail instead of skipping.
+      # RACER_E2E_SKIP_DATAPLANE_BUILD reuses the racer image built above; the
+      # harness still builds the Go images and pushes all of them.
       - name: Run Racer e2e
         env:
           CI: "1"
+          RACER_E2E_SKIP_DATAPLANE_BUILD: "1"
         run: make e2e-racer
+
+      # Runs only when the steps above succeed; the action saves only on push.
+      - name: Save Go build cache
+        uses: ./.github/actions/setup-go-cached
+        with:
+          phase: save
+          profile: e2e-racer
+          save-build-cache: "true"
 
       - name: Upload Racer e2e logs
         if: always()
