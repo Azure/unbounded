@@ -957,6 +957,82 @@ func TestMachineClassReconcilerStaleReadConflicts(t *testing.T) {
 	require.Equal(t, int64(2), apimeta.FindStatusCondition(after.Status.Conditions, unboundedv1alpha3.MachineClassConditionReady).ObservedGeneration)
 }
 
+func TestMachineClassReconcilerReturnsReadErrors(t *testing.T) {
+	t.Parallel()
+
+	unavailable := apierrors.NewServiceUnavailable("API server unavailable")
+
+	tests := []struct {
+		name  string
+		fails func(object runtime.Object, key client.ObjectKey) bool
+	}{
+		{name: "site get", fails: func(object runtime.Object, _ client.ObjectKey) bool {
+			_, ok := object.(*unboundedv1alpha3.Site)
+			return ok
+		}},
+		{name: "provider config get", fails: func(object runtime.Object, key client.ObjectKey) bool {
+			_, ok := object.(*corev1.ConfigMap)
+			return ok && key.Name == "provider-config"
+		}},
+		{name: "bootstrap files get", fails: func(object runtime.Object, key client.ObjectKey) bool {
+			_, ok := object.(*corev1.ConfigMap)
+			return ok && key.Name == "bootstrap-files"
+		}},
+		{name: "configuration version get", fails: func(object runtime.Object, _ client.ObjectKey) bool {
+			_, ok := object.(*unboundedv1alpha3.MachineConfigurationVersion)
+			return ok
+		}},
+		{name: "credential list", fails: func(object runtime.Object, _ client.ObjectKey) bool {
+			_, ok := object.(*unboundedv1alpha3.MachineOperationCredentialList)
+			return ok
+		}},
+		{name: "secret get", fails: func(object runtime.Object, _ client.ObjectKey) bool {
+			_, ok := object.(*corev1.Secret)
+			return ok
+		}},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			h := newClassHarness(t, newClassFixture())
+			h.resolver.setOfferings(classTestOffering("spot-a", unboundedv1alpha3.OfferingAvailable, time.Hour))
+
+			_, err := h.reconcile()
+			require.NoError(t, err)
+
+			before := h.class().Status
+			updates := h.statusUpdateCount()
+			calls := len(h.resolver.requestsSnapshot())
+
+			failed := false
+
+			h.failReads(func(object runtime.Object, key client.ObjectKey) error {
+				if !tt.fails(object, key) {
+					return nil
+				}
+
+				failed = true
+
+				return unavailable
+			})
+
+			result, err := h.reconcile()
+			require.Error(t, err)
+			require.True(t, apierrors.IsServiceUnavailable(err), "expected the read error, got %v", err)
+			require.Equal(t, ctrl.Result{}, result)
+			require.True(t, failed, "the injected read was never made")
+
+			h.failReads(nil)
+
+			require.Equal(t, updates, h.statusUpdateCount())
+			require.Len(t, h.resolver.requestsSnapshot(), calls)
+			require.Equal(t, before, h.class().Status)
+		})
+	}
+}
+
 func TestMachineClassReconcilerSkipsUnchangedStatus(t *testing.T) {
 	t.Parallel()
 
@@ -1198,6 +1274,9 @@ type classHarness struct {
 	configMapGets []client.ObjectKey
 	secretGets    int
 	staleClass    *unboundedv1alpha3.MachineClass
+	// readError, when set, returns the error a read of object fails with,
+	// or nil to let the read through.
+	readError func(object runtime.Object, key client.ObjectKey) error
 }
 
 func newClassHarness(t *testing.T, fixture *classFixture) *classHarness {
@@ -1221,6 +1300,10 @@ func newClassHarness(t *testing.T, fixture *classFixture) *classHarness {
 				}
 				h.mu.Unlock()
 
+				if err := h.injectedReadError(obj, key); err != nil {
+					return err
+				}
+
 				if isClass && stale != nil {
 					stale.DeepCopyInto(class)
 					return nil
@@ -1232,6 +1315,10 @@ func newClassHarness(t *testing.T, fixture *classFixture) *classHarness {
 				h.mu.Lock()
 				h.mainReads = append(h.mainReads, readKind(list))
 				h.mu.Unlock()
+
+				if err := h.injectedReadError(list, client.ObjectKey{}); err != nil {
+					return err
+				}
 
 				return c.List(ctx, list, opts...)
 			},
@@ -1265,6 +1352,10 @@ func newClassHarness(t *testing.T, fixture *classFixture) *classHarness {
 				h.configMapGets = append(h.configMapGets, key)
 				h.mu.Unlock()
 
+				if err := h.injectedReadError(obj, key); err != nil {
+					return err
+				}
+
 				return c.Get(ctx, key, obj, opts...)
 			},
 		}).
@@ -1284,6 +1375,10 @@ func newClassHarness(t *testing.T, fixture *classFixture) *classHarness {
 				h.secretGets++
 				h.mu.Unlock()
 
+				if err := h.injectedReadError(obj, key); err != nil {
+					return err
+				}
+
 				return c.Get(ctx, key, obj, opts...)
 			},
 		}).
@@ -1300,6 +1395,25 @@ func newClassHarness(t *testing.T, fixture *classFixture) *classHarness {
 	}
 
 	return h
+}
+
+func (h *classHarness) injectedReadError(object runtime.Object, key client.ObjectKey) error {
+	h.mu.Lock()
+	readError := h.readError
+	h.mu.Unlock()
+
+	if readError == nil {
+		return nil
+	}
+
+	return readError(object, key)
+}
+
+func (h *classHarness) failReads(readError func(object runtime.Object, key client.ObjectKey) error) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+
+	h.readError = readError
 }
 
 func readKind(object runtime.Object) string {
