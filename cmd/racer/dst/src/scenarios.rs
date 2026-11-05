@@ -1,6 +1,7 @@
 //! Built-in scenarios run by `make racer-dst` and the CI seed set.
 use crate::{
     Scenario,
+    authority::{self, ApiFaults},
     engine::{MILLIS, Nanos, SECONDS},
     fixture::lane_pair,
     invariants::{Class, all_roles_settled},
@@ -597,6 +598,88 @@ pub fn membership_churn() -> Scenario {
         .end(20 * SECONDS)
 }
 
+/// Three authorities and the fake API elect one primary and keep it, with
+/// no faults.
+pub fn authority_election() -> Scenario {
+    authority::scenario(
+        "authority-election",
+        3,
+        FaultMix::default(),
+        ApiFaults::default(),
+        180 * SECONDS,
+    )
+}
+
+/// Partitions between authorities and the API server or each other.
+pub fn authority_partitions() -> Scenario {
+    authority::scenario(
+        "authority-partitions",
+        3,
+        FaultMix {
+            max_faults: 4,
+            partition: 1,
+            max_downtime: 90 * SECONDS,
+            ..FaultMix::default()
+        },
+        ApiFaults::default(),
+        420 * SECONDS,
+    )
+}
+
+/// Authorities crash and restart with the same Pod identity.
+pub fn authority_crash_restart() -> Scenario {
+    authority::scenario(
+        "authority-crash-restart",
+        3,
+        FaultMix {
+            max_faults: 4,
+            crash_restart: 1,
+            max_downtime: 60 * SECONDS,
+            ..FaultMix::default()
+        },
+        ApiFaults::default(),
+        420 * SECONDS,
+    )
+}
+
+/// Authority clocks run up to 10% fast or slow, with partitions.
+pub fn authority_clock_skew() -> Scenario {
+    authority::scenario(
+        "authority-clock-skew",
+        3,
+        FaultMix {
+            max_faults: 5,
+            clock_rate: 2,
+            partition: 1,
+            max_downtime: 90 * SECONDS,
+            max_rate_ppm: 100_000,
+            ..FaultMix::default()
+        },
+        ApiFaults::default(),
+        420 * SECONDS,
+    )
+}
+
+/// Spurious write conflicts and dropped watches from the API server, with
+/// crashes.
+pub fn authority_api_faults() -> Scenario {
+    authority::scenario(
+        "authority-api-faults",
+        3,
+        FaultMix {
+            max_faults: 2,
+            crash_restart: 1,
+            max_downtime: 30 * SECONDS,
+            ..FaultMix::default()
+        },
+        ApiFaults {
+            conflict_ppm: 2_000,
+            watch_drop_ppm: 500,
+        },
+        300 * SECONDS,
+    )
+}
+
 /// Every built-in scenario.
 pub fn catalog() -> Vec<Scenario> {
     vec![
@@ -612,6 +695,11 @@ pub fn catalog() -> Vec<Scenario> {
         hung_peers(),
         node_faults(),
         membership_churn(),
+        authority_election(),
+        authority_partitions(),
+        authority_crash_restart(),
+        authority_clock_skew(),
+        authority_api_faults(),
         Scenario::new("lane-pair")
             .roles(|env| lane_pair(env, 8))
             .with(all_roles_settled())

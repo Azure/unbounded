@@ -10,6 +10,7 @@
 //!
 //! | Module | Role |
 //! |---|---|
+//! | [`authority`] | Full fidelity control plane: real `racer-cluster-control` authorities and the fake API |
 //! | [`choices`] | The choice stream: seeded PRNG (CI), fuzzer bytes, record/replay, shrinking, seed files |
 //! | [`engine`] | Virtual time ([`engine::Nanos`]), event queue with deterministic ties, [`engine::TraceHash`] |
 //! | [`costs`] | The checked-in `costs.toml` cost table and its parser |
@@ -79,6 +80,7 @@
 #![deny(missing_docs)]
 #![recursion_limit = "256"]
 
+pub mod authority;
 pub mod choices;
 pub mod costs;
 pub mod determinism;

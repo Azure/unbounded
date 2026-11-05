@@ -434,10 +434,11 @@ impl<'s> World<'s> {
             let os = shared.clone().unwrap_or_else(new_os);
             let slow = Rc::new(Cell::new(1u8));
             let (costs, factor) = (scenario.costs, slow.clone());
+            let by_size = scenario.charge_bytes;
             os.set_op_cost(move |op| {
                 Duration::from_nanos(
                     costs
-                        .op(op.kind, op.bytes)
+                        .op(op.kind, if by_size { op.bytes } else { 0 })
                         .saturating_mul(u64::from(factor.get())),
                 )
             });
@@ -478,7 +479,12 @@ impl<'s> World<'s> {
             self.fail(
                 Class::Safety,
                 "node-start",
-                format!("node {node} incarnation {}: {e:?}", env.incarnation),
+                match self.report.take() {
+                    Some(why) => {
+                        format!("node {node} incarnation {}: {e:?}: {why}", env.incarnation)
+                    }
+                    None => format!("node {node} incarnation {}: {e:?}", env.incarnation),
+                },
             )
         })?;
         let n = &mut self.nodes[node];

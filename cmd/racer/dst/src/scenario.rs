@@ -97,6 +97,11 @@ pub struct Scenario {
     /// order and cancel order from [`Choices`] (on by default). Off keeps
     /// FIFO order.
     pub seeded_os: bool,
+    /// Whether node OS operations are charged by size as well as kind (on
+    /// by default). Off charges every operation as if it moved no bytes,
+    /// for roles whose message sizes carry host entropy (TLS handshakes
+    /// with randomized signatures) so sizes must not move time.
+    pub charge_bytes: bool,
     /// The Model fidelity workload ([`Fidelity::Model`] only).
     pub model: Option<Rc<ModelSpec>>,
     /// One simulated OS (network and disk) shared by every node, with each
@@ -139,6 +144,7 @@ impl Scenario {
             max_steps: 1_000_000,
             busy_limit: 100_000,
             seeded_os: true,
+            charge_bytes: true,
             model: None,
             network: None,
         }
@@ -243,6 +249,12 @@ impl Scenario {
         endpoint: impl Fn(u32) -> racer_io::ring::SocketAddress + 'static,
     ) -> Self {
         self.network = Some(Rc::new(endpoint));
+        self
+    }
+
+    /// Charge node OS operations by size ([`Scenario::charge_bytes`]).
+    pub fn charge_bytes(mut self, by_size: bool) -> Self {
+        self.charge_bytes = by_size;
         self
     }
 

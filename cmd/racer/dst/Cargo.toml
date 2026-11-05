@@ -11,6 +11,7 @@ name = "racer-dst"
 path = "src/main.rs"
 
 [dependencies]
+racer-cluster-control = { path = "../cluster-control" }
 racer-io = { path = "../io" }
 racer-core = { path = "../core" }
 racer-control-wire = { path = "../control-wire" }
