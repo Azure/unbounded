@@ -63,6 +63,10 @@ pub struct Config {
     /// new one, rather than leaving the new one in the accept queue. The proposed fix for idle
     /// connections pinning ingress slots (see `dst/MODEL.md`, "Peer connection slots").
     pub evict_idle: bool,
+    /// Not production: a full listener with nothing to evict accepts the connection only to
+    /// answer the unsigned overload head at once, rather than leaving it in the accept queue,
+    /// so the sender goes elsewhere (proposed fix, see `dst/MODEL.md`).
+    pub refuse_when_full: bool,
 }
 
 impl Config {
@@ -83,6 +87,7 @@ impl Config {
             backlog: LISTEN_BACKLOG,
             idle_timeout: IDLE_TIMEOUT_NS,
             evict_idle: false,
+            refuse_when_full: false,
         }
     }
 }
@@ -104,6 +109,9 @@ pub enum Acquire {
     Dropped(ConnId),
     /// No outbound slot or per-endpoint capacity: fails `Overloaded` before any I/O.
     Overloaded,
+    /// The receiver's listener is full and answers the unsigned overload head at once
+    /// (`Config::refuse_when_full`, not production).
+    Refused,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -160,6 +168,8 @@ pub struct Stats {
     pub idle_expired: u64,
     /// Idle inbound connections a full listener closed (`Config::evict_idle`).
     pub idle_evicted: u64,
+    /// Connections a full listener refused (`Config::refuse_when_full`).
+    pub refused: u64,
     pub most_queued: usize,
 }
 
@@ -258,6 +268,15 @@ impl Connections {
             conn.state = State::Busy;
             self.stats.reused += 1;
             return Acquire::Reused(id);
+        }
+        let full =
+            |l: &Listener| l.held >= config.ingress && (!config.evict_idle || l.idle.is_empty());
+        if config.refuse_when_full && self.listeners.get(&to).is_some_and(full) {
+            self.stats.refused += 1;
+            if endpoint.busy == 0 && endpoint.idle.is_empty() {
+                pool.endpoints.remove(&to);
+            }
+            return Acquire::Refused;
         }
         if pool.open >= config.outbound {
             let idle: Vec<ConnId> = pool
@@ -419,7 +438,22 @@ mod tests {
             backlog: 1,
             idle_timeout: 100,
             evict_idle: false,
+            refuse_when_full: false,
         }
+    }
+
+    #[test]
+    fn a_full_listener_can_refuse_instead_of_queueing() {
+        let mut c = Connections::new(Config {
+            refuse_when_full: true,
+            ..small()
+        });
+        c.acquire(0, 1, 0, 9);
+        c.acquire(0, 2, 0, 9);
+        assert_eq!(c.acquire(0, 3, 0, 9), Acquire::Refused);
+        assert_eq!(c.stats().refused, 1);
+        assert_eq!(c.open(), 2);
+        assert_eq!(c.ingress(9), (2, 0));
     }
 
     #[test]
