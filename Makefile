@@ -373,8 +373,8 @@ help: ## Show this help
 	@echo "  racer-generate                   Generate Racer deepcopy and CRD artifacts"
 	@echo "  racer-loadgen | racer-loadgen-build  Build loadgen (with/without focused tests)"
 	@echo "  racer-loadgen-test                Race-test racer-loadgen"
-	@echo "  racer-object | racer-object-build  Build racer-object (with/without focused tests)"
-	@echo "  racer-object-test                 Race-test racer-object"
+	@echo "  racer-object | racer-object-build  Build the Rust racer-object sidecar (with/without tests)"
+	@echo "  racer-object-test                 Check formatting, lint, and test the racer-object crate"
 	@echo "  image-racer-local       Build the racer container image"
 	@echo "  image-racer-loadgen-local         Build the loadgen container image"
 	@echo "  image-racer-object-local          Build the racer-object container image"
@@ -665,18 +665,24 @@ image-racer-loadgen-local: ## Build the loadgen container image locally (single-
 	$(call trivy-maybe,$(RACER_LOADGEN_IMAGE))
 
 RACER_OBJECT_BIN=bin/racer-object
-RACER_OBJECT_CMD=./cmd/racer-object
+RACER_OBJECT_MANIFEST=cmd/racer-object/Cargo.toml
+RACER_OBJECT_CARGO_TARGET_DIR ?= $(CURDIR)/bin/racer-object-cargo
 RACER_OBJECT_IMAGE ?= $(CONTAINER_REGISTRY)/racer-object:$(VERSION_TAG)
 
 .PHONY: racer-object racer-object-build racer-object-test image-racer-object-local
-racer-object: racer-object-test racer-object-build ## Test and build racer-object
+racer-object: racer-object-test racer-object-build ## Test and build the Rust racer-object sidecar
 
-racer-object-build: ## Build racer-object without lint/test
+racer-object-build: ## Build the Rust racer-object sidecar (release) into bin/racer-object without tests
 	@mkdir -p bin
-	timeout --signal=TERM --kill-after=10s 300s $(GOBUILD) -trimpath -ldflags '$(STAMP_LDFLAGS)' -o $(RACER_OBJECT_BIN) $(RACER_OBJECT_CMD)
+	CARGO_TARGET_DIR="$(RACER_OBJECT_CARGO_TARGET_DIR)" \
+		RACER_OBJECT_VERSION="$(VERSION)" RACER_OBJECT_GIT_COMMIT="$(GIT_COMMIT)" RACER_OBJECT_BUILD_TIME="$(BUILD_TIME)" \
+		timeout --signal=TERM --kill-after=10s 600s cargo build --locked --release --manifest-path $(RACER_OBJECT_MANIFEST)
+	install -m 0755 "$(RACER_OBJECT_CARGO_TARGET_DIR)/release/racer-object" $(RACER_OBJECT_BIN)
 
-racer-object-test: ## Race-test racer-object
-	timeout --signal=TERM --kill-after=10s 300s $(GOTEST) -timeout=5m -race $(RACER_OBJECT_CMD)/...
+racer-object-test: ## Check formatting, run Clippy, and test the racer-object crate
+	timeout --signal=TERM --kill-after=10s 300s cargo fmt --manifest-path $(RACER_OBJECT_MANIFEST) --all --check
+	CARGO_TARGET_DIR="$(RACER_OBJECT_CARGO_TARGET_DIR)" timeout --signal=TERM --kill-after=10s 600s cargo clippy --locked --manifest-path $(RACER_OBJECT_MANIFEST) --all-targets -- -D warnings
+	CARGO_TARGET_DIR="$(RACER_OBJECT_CARGO_TARGET_DIR)" timeout --signal=TERM --kill-after=10s 600s cargo test --locked --manifest-path $(RACER_OBJECT_MANIFEST)
 
 image-racer-object-local: ## Build the racer-object container image locally (single-arch)
 	$(CONTAINER_ENGINE) build \

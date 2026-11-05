@@ -1,47 +1,34 @@
 # Copyright (c) Microsoft Corporation.
 # SPDX-License-Identifier: Apache-2.0
 
+ARG RUST_IMAGE=docker.io/library/rust:1.96.0-bookworm
+ARG RUNTIME_IMAGE=ubuntu:noble
+
 # Build stage
-# Pin the builder to BUILDPLATFORM so the Go toolchain runs natively on the
-# host even when targeting a foreign TARGETPLATFORM.
-FROM --platform=$BUILDPLATFORM docker.io/library/golang:1.27.3-trixie AS builder
+# Build on the target platform (no --platform=$BUILDPLATFORM): Cargo then
+# compiles natively for the image architecture without a cross toolchain.
+FROM ${RUST_IMAGE} AS builder
+# Frame pointers keep perf and other stack samplers usable in production.
+ENV RUSTFLAGS="-C force-frame-pointers=yes"
+WORKDIR /src/cmd/racer-object
 
-RUN apt-get update && apt-get install -y \
-    build-essential \
-    make \
-    gcc \
-    git \
-    ca-certificates \
-    && apt-get clean
+# Copy only the standalone crate so unrelated repository changes do not
+# invalidate the build cache.
+COPY cmd/racer-object/Cargo.toml cmd/racer-object/Cargo.lock cmd/racer-object/build.rs ./
+COPY cmd/racer-object/src ./src
 
-ENV CGO_ENABLED=0
-ENV GOPATH=/go
-ENV GOTOOLCHAIN=auto
-ENV PATH=$PATH:/go/bin
-
-WORKDIR /src
-
-# Cache mount IDs match images/net/Containerfile so builds that share a
-# BuildKit instance (such as the CI build-images job) reuse each other's
-# module and build caches.
-COPY go.mod go.sum ./
-RUN --mount=type=cache,target=/go/pkg/mod go mod download
-
-COPY ../../ .
-
-ARG TARGETOS
-ARG TARGETARCH
-
+# Version metadata reported by --version, read by src/cli.rs at compile time.
 ARG VERSION=dev
-ARG GIT_COMMIT=
-ARG BUILD_TIME=
-RUN --mount=type=cache,target=/go/pkg/mod \
-    --mount=type=cache,target=/root/.cache/go-build,id=go-build-${TARGETARCH} \
-    GOOS=${TARGETOS} GOARCH=${TARGETARCH} \
-    make racer-object-build VERSION=${VERSION} ${GIT_COMMIT:+GIT_COMMIT=${GIT_COMMIT}} ${BUILD_TIME:+BUILD_TIME=${BUILD_TIME}}
+ARG GIT_COMMIT=unknown
+ARG BUILD_TIME=unknown
+RUN RACER_OBJECT_VERSION="${VERSION}" \
+    RACER_OBJECT_GIT_COMMIT="${GIT_COMMIT}" \
+    RACER_OBJECT_BUILD_TIME="${BUILD_TIME}" \
+    cargo build --locked --release && \
+    install -D -m 0755 target/release/racer-object /out/racer-object
 
 # Runtime stage
-FROM ubuntu:noble
+FROM ${RUNTIME_IMAGE}
 
 RUN apt-get update && apt-get upgrade -y && apt-get install -y --no-install-recommends \
     ca-certificates \
@@ -49,7 +36,7 @@ RUN apt-get update && apt-get upgrade -y && apt-get install -y --no-install-reco
 
 RUN mkdir -p /unbounded/bin
 
-COPY --from=builder /src/bin/racer-object /unbounded/bin/racer-object
+COPY --from=builder /out/racer-object /unbounded/bin/racer-object
 COPY LICENSE NOTICE /unbounded/licenses/
 
 ENV PATH="/unbounded/bin:${PATH}"

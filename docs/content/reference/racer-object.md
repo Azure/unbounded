@@ -45,9 +45,14 @@ Usage: `racer-object sidecar [flags]`.
 | `--api` | `s3` | Client-facing API: `s3` or `azure`. |
 | `--listen` | `127.0.0.1:8080` | Loopback IP literal and port. Non-loopback addresses are rejected. |
 | `--request-timeout` | `5m` | Request timeout. |
-| `--max-connections` | `128` | Client connections accepted at once, and concurrent reads from Racer. 1 to 65536. |
-| `--debug-listen` | empty | Optional pprof and `/healthz` address. Unauthenticated and unencrypted. Restrict access. |
+| `--max-connections` | `128` | Client connections accepted at once, and concurrent reads from Racer, across all workers. 1 to 65536. |
+| `--workers` | usable CPUs, at most `4` | Serving threads, each with its own event loop. 1 to 256. The default counts CPUs allowed by the cgroup quota and CPU affinity. Use `1` for the lowest footprint. |
+| `--debug-listen` | empty | Optional `/healthz` address. Unauthenticated and unencrypted. Restrict access. |
 | `--version` | | Print version and exit. |
+
+To profile the sidecar, use
+`perf` or another sampling profiler on the node. The binary is built with frame
+pointers, so `perf record -g -p <pid>` gives usable call stacks.
 
 Earlier releases also had an `origin` command. The Racer dataplane now reads
 Azure Blob itself, so it was removed. racer-object no longer reads S3 or any
@@ -415,5 +420,11 @@ that only reports that the diagnostic listener is up.
 make racer-object-test
 ```
 
-These cover sidecar behavior through the Go SDK test bridge. The bridge does not cache data. They do not establish live multi-node
-behavior, admission compatibility, or compatibility with every S3 or Azure SDK. Validate those in your own environment.
+This checks formatting, runs Clippy, and runs the Rust unit and integration
+tests for the sidecar. Unit tests cover the request rules, the Racer client
+socket protocol, and response building. Integration tests serve requests over
+TCP with no Racer listening, so they cover only requests that never reach
+Racer, connection handling, and the unavailable case. Reads through a real
+Racer are covered by the kind-based suite in `e2e/racer`. None of these
+establish live multi-node behavior, admission compatibility, or compatibility
+with every S3 or Azure SDK. Validate those in your own environment.
