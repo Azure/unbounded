@@ -16,6 +16,7 @@ import (
 	"path"
 	"strconv"
 	"strings"
+	"time"
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -42,7 +43,16 @@ type HTTPServer struct {
 	FileResolver
 	StatusRecorder StatusRecorder
 	Media          *MediaProvider
+	// LookupTimeout bounds machine lookup and file resolution for one
+	// request, up to the point where the response starts. Streaming the
+	// body is not bounded by it. Zero means defaultHTTPLookupTimeout.
+	LookupTimeout time.Duration
 }
+
+// defaultHTTPLookupTimeout bounds registry resolution before response
+// headers are sent, so a stalled registry cannot hold a request open for
+// as long as the client waits.
+const defaultHTTPLookupTimeout = 3 * time.Minute
 
 type StatusRecorder interface {
 	RecordBootLoaderDownloaded(ctx context.Context, machineName, filename string) error
@@ -142,6 +152,15 @@ func (h *HTTPServer) handleFile(w http.ResponseWriter, r *http.Request) {
 
 	ip := clientIP(r)
 	log := slog.With("proto", "http", "path", path, "ip", ip)
+
+	// lookupCtx stays valid while the body streams. The timer cancels it only
+	// if resolution has not finished in time, mirroring the TFTP server.
+	lookupCtx, cancelLookup := context.WithCancel(r.Context())
+	defer cancelLookup()
+
+	lookupTimer := time.AfterFunc(orDefault(h.LookupTimeout, defaultHTTPLookupTimeout), cancelLookup)
+	defer lookupTimer.Stop()
+
 	// The running installer keeps its original lease even if the Machine is
 	// edited. Resolve its artifacts from the operation snapshot, never live input.
 	if h.Media != nil {
@@ -153,7 +172,7 @@ func (h *HTTPServer) handleFile(w http.ResponseWriter, r *http.Request) {
 				return
 			}
 
-			o, claimed, err := h.Media.artifactOwner(r.Context(), remote)
+			o, claimed, err := h.Media.artifactOwner(lookupCtx, remote)
 			if claimed {
 				if err != nil || strings.HasSuffix(path, "grub.cfg") {
 					log.Warn("rejected boot media artifact request", "err", err)
@@ -169,7 +188,7 @@ func (h *HTTPServer) handleFile(w http.ResponseWriter, r *http.Request) {
 					src = mediaDiskSource(o.status().Netboot)
 				}
 
-				resolved, err := h.Media.Resolver.ResolveFileByPathForIP(r.Context(), path, o.machine, src, remote)
+				resolved, err := h.Media.Resolver.ResolveFileByPathForIP(lookupCtx, path, o.machine, src, remote)
 				if err != nil {
 					log.Warn("boot media artifact unavailable", "ref", src.Ref, "err", err)
 
@@ -182,6 +201,14 @@ func (h *HTTPServer) handleFile(w http.ResponseWriter, r *http.Request) {
 					return
 				}
 				defer resolved.Close() //nolint:errcheck // read-only
+
+				if !lookupTimer.Stop() {
+					log.Warn("boot media artifact lookup timed out", "ref", src.Ref)
+					w.Header().Set("Retry-After", "5")
+					http.Error(w, "media artifact unavailable", http.StatusServiceUnavailable)
+
+					return
+				}
 
 				log.Info("serving boot media artifact", "ref", src.Ref, "range", r.Header.Get("Range"))
 
@@ -211,7 +238,7 @@ func (h *HTTPServer) handleFile(w http.ResponseWriter, r *http.Request) {
 			ip = owner.status().Netboot.DHCPLeases[0].IPv4
 		}
 	default:
-		node, err = h.LookupNodeByIP(r.Context(), ip)
+		node, err = h.LookupNodeByIP(lookupCtx, ip)
 	}
 
 	if err != nil {
@@ -261,14 +288,16 @@ func (h *HTTPServer) handleFile(w http.ResponseWriter, r *http.Request) {
 		pinned *imagepull.Image
 	)
 
-	if netSrc := h.NetbootImageSource(node); node.Spec.Netboot().TargetBootProtocol() == v1alpha3.PXEBootProtocolHTTP && h.Puller != nil && netSrc.Ref != "" {
+	// user-data comes from a ConfigMap or a built-in default and is never a
+	// boot loader, so it must not wait on or fail with the registry.
+	if netSrc := h.NetbootImageSource(node); path != userDataPath && node.Spec.Netboot().TargetBootProtocol() == v1alpha3.PXEBootProtocolHTTP && h.Puller != nil && netSrc.Ref != "" {
 		// Classify with the netboot image, which holds the metadata, rather
 		// than the per-path source. For disk.img.gz the source is the OS
 		// image, and searching it for metadata.yaml would index its large
 		// layers under the metadata fetch timeout.
-		netImg, err := h.resolveImage(r.Context(), netSrc)
+		netImg, err := h.resolveImage(lookupCtx, netSrc)
 		if err == nil {
-			isBootLoader, err = h.isHTTPBootLoaderDownload(r.Context(), netImg, path)
+			isBootLoader, err = h.isHTTPBootLoaderDownload(lookupCtx, netImg, path)
 		}
 
 		if path != "disk.img.gz" {
@@ -288,7 +317,7 @@ func (h *HTTPServer) handleFile(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if isBootLoader {
-		installRequested, err := h.installRequested(r.Context(), node)
+		installRequested, err := h.installRequested(lookupCtx, node)
 		if err != nil {
 			log.Warn("checking active install operation", "node", node.Name, "err", err)
 			http.Error(w, "checking active install operation", http.StatusServiceUnavailable)
@@ -304,7 +333,7 @@ func (h *HTTPServer) handleFile(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	resolved, err := h.resolveFile(r.Context(), path, node, src, pinned, ip)
+	resolved, err := h.resolveFile(lookupCtx, path, node, src, pinned, ip)
 	if err != nil {
 		if errors.Is(err, ErrImageUnavailable) {
 			log.Info("image unavailable", "node", node.Name, "ref", src.Ref, "err", err)
@@ -326,6 +355,14 @@ func (h *HTTPServer) handleFile(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer resolved.Close() //nolint:errcheck // read-only
+
+	if !lookupTimer.Stop() {
+		log.Warn("file lookup timed out", "node", node.Name, "ref", src.Ref)
+		w.Header().Set("Retry-After", "5")
+		http.Error(w, "file not yet available, retry later", http.StatusServiceUnavailable)
+
+		return
+	}
 
 	if resolved.File != nil {
 		log.Info("serving image file", "node", node.Name, "size", resolved.File.Size(), "range", r.Header.Get("Range"))

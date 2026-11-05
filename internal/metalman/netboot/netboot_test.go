@@ -4,6 +4,7 @@
 package netboot
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -4247,4 +4248,144 @@ func TestPinnedImageMetadataIsKeyedByDigest(t *testing.T) {
 	meta, err = direct.PinnedImageMetadata(t.Context(), imgB)
 	require.NoError(t, err)
 	require.Equal(t, "b.efi", meta.HTTPBootPath)
+}
+
+// TestUserDataServedWhenRegistryUnreachable checks that user-data, which
+// comes from a ConfigMap or a default, is served over HTTP and TFTP while
+// the registry cannot be reached.
+func TestUserDataServedWhenRegistryUnreachable(t *testing.T) {
+	for _, proto := range []string{v1alpha3.PXEBootProtocolHTTP, v1alpha3.PXEBootProtocolPXE} {
+		t.Run(proto, func(t *testing.T) {
+			node := &v1alpha3.Machine{
+				ObjectMeta: metav1.ObjectMeta{Name: "node-ud-offline"},
+				Spec: v1alpha3.MachineSpec{PXE: &v1alpha3.PXESpec{
+					Image:        "ghcr.io/test/image:v1",
+					BootProtocol: proto,
+					DHCPLeases:   []v1alpha3.DHCPLease{{MAC: "aa:bb:cc:dd:ee:51", IPv4: "10.0.9.11", SubnetMask: "255.255.255.0"}},
+				}},
+			}
+			fc := fake.NewClientBuilder().WithScheme(newScheme(t)).WithObjects(node).
+				WithIndex(&v1alpha3.Machine{}, indexing.IndexNodeByIP, indexing.IndexNodeByIPFunc).Build()
+			resolver := FileResolver{
+				Puller:            unreachablePuller(t),
+				Reader:            fc,
+				Cluster:           &StaticClusterInfo{},
+				DefaultNetbootRef: "ghcr.io/test/image:v1",
+			}
+
+			// HTTP.
+			srv := &HTTPServer{FileResolver: resolver}
+			mux := http.NewServeMux()
+			mux.HandleFunc("GET /", srv.handleFile)
+
+			ts := newTestPeerServer(mux)
+			defer ts.Close()
+
+			req, _ := http.NewRequest("GET", ts.URL+"/cloud-init/user-data", nil)
+			req.Header.Set(testPeerHeader, "10.0.9.11")
+
+			resp, err := http.DefaultClient.Do(req)
+			if err != nil {
+				t.Fatalf("GET user-data: %v", err)
+			}
+
+			body, _ := io.ReadAll(resp.Body)
+			resp.Body.Close()
+
+			if resp.StatusCode != http.StatusOK || string(body) != defaultUserData {
+				t.Fatalf("HTTP user-data: got %d %q, want 200 %q", resp.StatusCode, body, defaultUserData)
+			}
+
+			// An image file still fails with the registry down.
+			req, _ = http.NewRequest("GET", ts.URL+"/vmlinuz", nil)
+			req.Header.Set(testPeerHeader, "10.0.9.11")
+
+			resp, err = http.DefaultClient.Do(req)
+			if err != nil {
+				t.Fatalf("GET vmlinuz: %v", err)
+			}
+
+			resp.Body.Close()
+
+			if resp.StatusCode != http.StatusServiceUnavailable {
+				t.Fatalf("HTTP vmlinuz: got %d, want 503", resp.StatusCode)
+			}
+
+			// TFTP.
+			tsrv := &TFTPServer{FileResolver: resolver}
+
+			var buf bytes.Buffer
+			if err := tsrv.readHandler(userDataPath, &tftpReaderFrom{readerFrom: readerFrom{&buf}, ip: "10.0.9.11"}); err != nil {
+				t.Fatalf("TFTP user-data: %v", err)
+			}
+
+			if buf.String() != defaultUserData {
+				t.Fatalf("TFTP user-data: got %q", buf.String())
+			}
+		})
+	}
+}
+
+// TestHTTPServerBoundsStalledRegistry checks that an image file request
+// returns 503 within LookupTimeout when the registry accepts connections but
+// never responds, instead of waiting for as long as the client does.
+func TestHTTPServerBoundsStalledRegistry(t *testing.T) {
+	release := make(chan struct{})
+	stalled := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		select {
+		case <-release:
+		case <-r.Context().Done():
+		}
+	}))
+
+	defer stalled.Close()
+	defer close(release)
+
+	node := &v1alpha3.Machine{
+		ObjectMeta: metav1.ObjectMeta{Name: "node-stalled"},
+		Spec: v1alpha3.MachineSpec{PXE: &v1alpha3.PXESpec{
+			Image:      "ghcr.io/test/image:v1",
+			DHCPLeases: []v1alpha3.DHCPLease{{MAC: "aa:bb:cc:dd:ee:52", IPv4: "10.0.9.12", SubnetMask: "255.255.255.0"}},
+		}},
+	}
+	fc := fake.NewClientBuilder().WithScheme(newScheme(t)).WithObjects(node).
+		WithIndex(&v1alpha3.Machine{}, indexing.IndexNodeByIP, indexing.IndexNodeByIPFunc).Build()
+	host := strings.TrimPrefix(stalled.URL, "http://")
+	srv := &HTTPServer{
+		FileResolver: FileResolver{
+			Puller:            &imagepull.Puller{HTTPClient: &http.Client{Transport: &redirectTransport{host: host}}},
+			Reader:            fc,
+			Cluster:           &StaticClusterInfo{},
+			DefaultNetbootRef: "ghcr.io/test/image:v1",
+		},
+		LookupTimeout: 200 * time.Millisecond,
+	}
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /", srv.handleFile)
+
+	ts := newTestPeerServer(mux)
+	defer ts.Close()
+
+	req, _ := http.NewRequest("GET", ts.URL+"/vmlinuz", nil)
+	req.Header.Set(testPeerHeader, "10.0.9.12")
+
+	client := &http.Client{Timeout: 30 * time.Second}
+
+	start := time.Now()
+
+	resp, err := client.Do(req)
+	if err != nil {
+		t.Fatalf("GET vmlinuz: %v", err)
+	}
+
+	resp.Body.Close()
+
+	if resp.StatusCode != http.StatusServiceUnavailable {
+		t.Fatalf("got %d, want 503", resp.StatusCode)
+	}
+
+	if elapsed := time.Since(start); elapsed > 10*time.Second {
+		t.Fatalf("request took %s, want it bounded by LookupTimeout", elapsed)
+	}
 }
