@@ -2308,6 +2308,8 @@ impl WorkerApplication {
 
     /// Drive queued writes unless a periodic checkpoint is waiting for its cut.
     fn poll_writer(&mut self, cx: &mut Context<'_>) -> Result<()> {
+        // `Error::FlightFull` is not listed: it comes only from peer responses,
+        // which the store writer never issues.
         if let Some(result) = poll_task(&mut self.writer_task, cx)
             && !matches!(
                 result,
