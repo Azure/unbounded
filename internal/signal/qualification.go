@@ -218,6 +218,14 @@ func (r *QualificationReconciler) reconcileNodeLedger(
 		}
 	}
 
+	if policy.Generation > ledger.Spec.Policy.Generation {
+		before := ledger.DeepCopy()
+		ledger.Spec.Policy.Generation = policy.Generation
+		if err := r.Patch(ctx, &ledger, client.MergeFrom(before)); err != nil {
+			return err
+		}
+	}
+
 	status, err := r.evaluateLedger(ctx, policy, node, &ledger)
 	if err != nil {
 		return err
@@ -778,51 +786,39 @@ func (r *QualificationReconciler) reconcileQualificationLabel(
 	ctx context.Context,
 	node *corev1.Node,
 ) error {
-	shouldProject := false
+	var policies signalv1.CertificationPolicyList
+	if err := r.APIReader.List(ctx, &policies); err != nil {
+		return err
+	}
 
-	if r.GateProtected {
-		var ledgers signalv1.NodeCertificationList
-		if err := r.List(
-			ctx,
-			&ledgers,
-			client.InNamespace(r.Namespace),
-			client.MatchingLabels{qualificationNodeUIDLabel: string(node.UID)},
-		); err != nil {
-			return err
-		}
+	var ledgers signalv1.NodeCertificationList
+	if err := r.List(
+		ctx,
+		&ledgers,
+		client.InNamespace(r.Namespace),
+		client.MatchingLabels{qualificationNodeUIDLabel: string(node.UID)},
+	); err != nil {
+		return err
+	}
 
-		for index := range ledgers.Items {
-			ledger := &ledgers.Items[index]
-			if ledger.DeletionTimestamp.IsZero() &&
-				ledger.Spec.NodeUID == node.UID &&
-				ledger.Status.Phase == signalv1.NodeCertificationPhaseQualified &&
-				ledger.Status.ExpiresAt != nil &&
-				r.now().Before(ledger.Status.ExpiresAt.Time) {
-				var policy signalv1.CertificationPolicy
-				if err := r.APIReader.Get(ctx, client.ObjectKey{Name: ledger.Spec.Policy.Name}, &policy); err != nil {
-					continue
-				}
-
-				digest, err := policyDigest(policy.Spec)
-				if err != nil {
-					return err
-				}
-
-				if policy.DeletionTimestamp.IsZero() &&
-					policy.UID == ledger.Spec.Policy.UID &&
-					policy.Generation == ledger.Status.ObservedGeneration &&
-					ledger.Status.PolicyDigest == digest &&
-					ledger.Status.Fingerprint != nil &&
-					ledger.Status.Fingerprint.NodeUID == node.UID &&
-					policy.Spec.GateProjection.Mode == signalv1.GateProjectionProtectedLabel {
-					shouldProject = true
-					break
-				}
-			}
+	protected := make([]signalv1.CertificationPolicy, 0)
+	for index := range policies.Items {
+		policy := &policies.Items[index]
+		if policy.DeletionTimestamp.IsZero() &&
+			policy.Spec.GateProjection.Mode == signalv1.GateProjectionProtectedLabel {
+			protected = append(protected, *policy)
 		}
 	}
 
-	return retry.RetryOnConflict(retry.DefaultRetry, func() error {
+	shouldProject := r.GateProtected && len(protected) > 0
+	for index := range protected {
+		if !r.policyHasQualifiedLedger(node, &protected[index], ledgers.Items) {
+			shouldProject = false
+			break
+		}
+	}
+
+	if err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
 		var current corev1.Node
 		if err := r.Get(ctx, client.ObjectKey{Name: node.Name}, &current); err != nil {
 			return client.IgnoreNotFound(err)
@@ -848,7 +844,86 @@ func (r *QualificationReconciler) reconcileQualificationLabel(
 		}
 
 		return r.Patch(ctx, &current, client.MergeFromWithOptions(before, client.MergeFromWithOptimisticLock{}))
-	})
+	}); err != nil {
+		return err
+	}
+
+	return r.projectGateConditions(ctx, protected, ledgers.Items, shouldProject)
+}
+
+func (r *QualificationReconciler) policyHasQualifiedLedger(
+	node *corev1.Node,
+	policy *signalv1.CertificationPolicy,
+	ledgers []signalv1.NodeCertification,
+) bool {
+	digest, err := policyDigest(policy.Spec)
+	if err != nil {
+		return false
+	}
+
+	for index := range ledgers {
+		ledger := &ledgers[index]
+		if ledger.DeletionTimestamp.IsZero() &&
+			ledger.Spec.NodeUID == node.UID &&
+			ledger.Spec.Policy.UID == policy.UID &&
+			ledger.Spec.Policy.Generation == policy.Generation &&
+			ledger.Status.ObservedGeneration == policy.Generation &&
+			ledger.Status.PolicyDigest == digest &&
+			ledger.Status.Phase == signalv1.NodeCertificationPhaseQualified &&
+			ledger.Status.ExpiresAt != nil &&
+			r.now().Before(ledger.Status.ExpiresAt.Time) &&
+			ledger.Status.Fingerprint != nil &&
+			ledger.Status.Fingerprint.NodeUID == node.UID {
+			return true
+		}
+	}
+
+	return false
+}
+
+func (r *QualificationReconciler) projectGateConditions(
+	ctx context.Context,
+	policies []signalv1.CertificationPolicy,
+	ledgers []signalv1.NodeCertification,
+	projected bool,
+) error {
+	policyUIDs := make(map[types.UID]struct{}, len(policies))
+	for index := range policies {
+		policyUIDs[policies[index].UID] = struct{}{}
+	}
+
+	for index := range ledgers {
+		ledger := &ledgers[index]
+		if _, exists := policyUIDs[ledger.Spec.Policy.UID]; !exists {
+			continue
+		}
+
+		status := metav1.ConditionFalse
+		reason := "PoliciesNotQualified"
+		message := "The shared protected label is not backed by every ProtectedLabel Policy"
+		if !r.GateProtected {
+			reason = signalv1.NodeCertificationReasonProtectionUnverified
+			message = "Node authorizer and NodeRestriction protection are not explicitly verified"
+		} else if projected {
+			status = metav1.ConditionTrue
+			reason = "Projected"
+			message = "The shared protected label is projected"
+		}
+
+		before := ledger.DeepCopy()
+		apimeta.SetStatusCondition(&ledger.Status.Conditions, metav1.Condition{
+			Type:               signalv1.NodeCertificationConditionGateProjected,
+			Status:             status,
+			ObservedGeneration: ledger.Status.ObservedGeneration,
+			Reason:             reason,
+			Message:            message,
+		})
+		if err := r.Status().Patch(ctx, ledger, client.MergeFrom(before)); err != nil {
+			return err
+		}
+	}
+
+	return nil
 }
 
 func (r *QualificationReconciler) now() time.Time {
@@ -940,8 +1015,8 @@ func uniqueRecords(records []qualificationRecord) []qualificationRecord {
 
 func recordReferences(records []qualificationRecord) []signalv1.ContributingRunReference {
 	records = uniqueRecords(records)
-	if len(records) > 64 {
-		records = records[len(records)-64:]
+	if len(records) > signalv1.MaxContributingRuns {
+		records = records[len(records)-signalv1.MaxContributingRuns:]
 	}
 
 	result := make([]signalv1.ContributingRunReference, len(records))
@@ -962,8 +1037,8 @@ func recordPlanDigests(records []qualificationRecord) []string {
 
 	sort.Strings(values)
 
-	if len(values) > 32 {
-		values = values[len(values)-32:]
+	if len(values) > signalv1.MaxContributingRuns {
+		values = values[len(values)-signalv1.MaxContributingRuns:]
 	}
 
 	return values

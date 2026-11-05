@@ -5,11 +5,14 @@ package signal
 
 import (
 	"context"
+	"fmt"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
+	apimeta "k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
@@ -406,26 +409,14 @@ func TestProtectedQualificationLabelGateAndMultiplePolicies(t *testing.T) {
 	ledgerA := qualificationLedger(policyA, node)
 	ledgerA.Status.Phase = signalv1.NodeCertificationPhaseRevoked
 	ledgerB := qualificationLedger(policyB, node)
-	ledgerB.Status.Phase = signalv1.NodeCertificationPhaseQualified
-	ledgerB.Status.ObservedGeneration = policyB.Generation
-	digest, err := policyDigest(policyB.Spec)
-	if err != nil {
-		t.Fatal(err)
-	}
-	ledgerB.Status.PolicyDigest = digest
-	fingerprint := nodeFingerprint(node)
-	ledgerB.Status.Fingerprint = &fingerprint
-	expires := metav1.NewTime(now.Add(time.Hour))
-	ledgerB.Status.ExpiresAt = &expires
+	setQualifiedLedger(t, ledgerB, policyB, node, now.Add(time.Hour))
 
 	scheme := qualificationScheme(t)
-	kube := fake.NewClientBuilder().WithScheme(scheme).WithObjects(
-		node,
-		policyA,
-		policyB,
-		ledgerA,
-		ledgerB,
-	).Build()
+	kube := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithStatusSubresource(&signalv1.NodeCertification{}).
+		WithObjects(node, policyA, policyB, ledgerA, ledgerB).
+		Build()
 	reconciler := &QualificationReconciler{
 		Client:        kube,
 		APIReader:     kube,
@@ -443,8 +434,31 @@ func TestProtectedQualificationLabelGateAndMultiplePolicies(t *testing.T) {
 		t.Fatal(err)
 	}
 
+	if _, exists := current.Labels[signalv1.NodeQualificationLabel]; exists {
+		t.Fatalf("one unqualified ProtectedLabel Policy did not remove the shared label: %#v", current.Labels)
+	}
+
+	var currentLedgerA signalv1.NodeCertification
+	if err := kube.Get(
+		context.Background(),
+		types.NamespacedName{Namespace: ledgerA.Namespace, Name: ledgerA.Name},
+		&currentLedgerA,
+	); err != nil {
+		t.Fatal(err)
+	}
+	setQualifiedLedger(t, &currentLedgerA, policyA, node, now.Add(time.Hour))
+	if err := kube.Status().Update(context.Background(), &currentLedgerA); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := reconciler.reconcileQualificationLabel(context.Background(), &current); err != nil {
+		t.Fatalf("reconcileQualificationLabel(all policies qualified) error = %v", err)
+	}
+	if err := kube.Get(context.Background(), types.NamespacedName{Name: node.Name}, &current); err != nil {
+		t.Fatal(err)
+	}
 	if current.Labels[signalv1.NodeQualificationLabel] != signalv1.NodeQualificationValue {
-		t.Fatalf("one revoked policy removed another policy's backing label: %#v", current.Labels)
+		t.Fatalf("all qualified ProtectedLabel Policies did not project the shared label: %#v", current.Labels)
 	}
 
 	if err := kube.Delete(context.Background(), ledgerB); err != nil {
@@ -485,8 +499,95 @@ func TestProtectedQualificationLabelGateAndMultiplePolicies(t *testing.T) {
 		t.Fatalf("disabled protection gate retained %q", signalv1.NodeQualificationLabel)
 	}
 
+	if err := kube.Get(
+		context.Background(),
+		types.NamespacedName{Namespace: ledgerA.Namespace, Name: ledgerA.Name},
+		&currentLedgerA,
+	); err != nil {
+		t.Fatal(err)
+	}
+	gateCondition := apimeta.FindStatusCondition(
+		currentLedgerA.Status.Conditions,
+		signalv1.NodeCertificationConditionGateProjected,
+	)
+	if gateCondition == nil ||
+		gateCondition.Status != metav1.ConditionFalse ||
+		gateCondition.Reason != signalv1.NodeCertificationReasonProtectionUnverified {
+		t.Fatalf("disabled gate condition = %#v", gateCondition)
+	}
+
 	if signalv1.NodeQualificationLabel != "node-restriction.kubernetes.io/project-signal-qualified" {
 		t.Fatalf("qualification label key = %q", signalv1.NodeQualificationLabel)
+	}
+}
+
+func TestNodeCertificationPolicyGenerationAdvancesMonotonically(t *testing.T) {
+	t.Parallel()
+
+	node := qualificationNode("node", "node-uid", "boot-a")
+	policy := qualificationPolicy("policy", "policy-uid", signalv1.NonPassBehaviorIgnore)
+	policy.Generation = 2
+	ledger := qualificationLedger(policy, node)
+	ledger.Spec.Policy.Generation = 1
+
+	scheme := qualificationScheme(t)
+	kube := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithStatusSubresource(&signalv1.NodeCertification{}).
+		WithObjects(node, policy, ledger).
+		Build()
+	reconciler := &QualificationReconciler{
+		Client:    kube,
+		APIReader: kube,
+		Evidence:  missingEvidenceStore{},
+		Namespace: "signal-system",
+	}
+
+	if err := reconciler.reconcileNodeLedger(context.Background(), policy, node); err != nil {
+		t.Fatalf("reconcileNodeLedger() error = %v", err)
+	}
+
+	var current signalv1.NodeCertification
+	if err := kube.Get(
+		context.Background(),
+		types.NamespacedName{Namespace: ledger.Namespace, Name: ledger.Name},
+		&current,
+	); err != nil {
+		t.Fatal(err)
+	}
+	if current.Spec.Policy.Generation != policy.Generation ||
+		current.Status.ObservedGeneration != policy.Generation {
+		t.Fatalf(
+			"policy generation = spec %d, observed %d, want %d",
+			current.Spec.Policy.Generation,
+			current.Status.ObservedGeneration,
+			policy.Generation,
+		)
+	}
+}
+
+func TestQualificationCreditsAndPlanDigestsBoundedAt64(t *testing.T) {
+	t.Parallel()
+
+	records := make([]qualificationRecord, signalv1.MaxContributingRuns+1)
+	for index := range records {
+		records[index] = qualificationRecord{
+			Reference: signalv1.ContributingRunReference{
+				Name: "run-" + strconv.Itoa(index),
+				UID:  types.UID("run-" + strconv.Itoa(index)),
+			},
+			Identity: signalv1.QualificationEvidenceIdentity{
+				PlanDigest: "sha256:" + fmt.Sprintf("%064x", index),
+			},
+			FinishedAt: time.Unix(int64(index), 0),
+		}
+	}
+
+	if got := len(recordReferences(records)); got != signalv1.MaxContributingRuns {
+		t.Fatalf("contributing references = %d, want %d", got, signalv1.MaxContributingRuns)
+	}
+	if got := len(recordPlanDigests(records)); got != signalv1.MaxContributingRuns {
+		t.Fatalf("plan digests = %d, want %d", got, signalv1.MaxContributingRuns)
 	}
 }
 
@@ -603,6 +704,29 @@ func qualificationLedger(
 			NodeUID:  node.UID,
 		},
 	}
+}
+
+func setQualifiedLedger(
+	t *testing.T,
+	ledger *signalv1.NodeCertification,
+	policy *signalv1.CertificationPolicy,
+	node *corev1.Node,
+	expiresAt time.Time,
+) {
+	t.Helper()
+
+	digest, err := policyDigest(policy.Spec)
+	if err != nil {
+		t.Fatal(err)
+	}
+	fingerprint := nodeFingerprint(node)
+	expires := metav1.NewTime(expiresAt)
+	ledger.Spec.Policy.Generation = policy.Generation
+	ledger.Status.Phase = signalv1.NodeCertificationPhaseQualified
+	ledger.Status.ObservedGeneration = policy.Generation
+	ledger.Status.PolicyDigest = digest
+	ledger.Status.Fingerprint = &fingerprint
+	ledger.Status.ExpiresAt = &expires
 }
 
 func qualificationRun(
