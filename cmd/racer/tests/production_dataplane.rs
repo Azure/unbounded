@@ -1497,8 +1497,10 @@ fn request(method: &str, fields: &str) -> String {
 }
 
 fn subscription_request(fields: &str) -> String {
+    // One page of credit at the published page size.
+    let credits = FIXTURE_PAGE_SIZE.get().get();
     format!(
-        "POST /v1/objects/{} HTTP/1.1\r\nHost: racer\r\nContent-Length: 0\r\nAuthorization: fixture-credential\r\nRacer-Metadata: fixture-metadata\r\nRacer-Page-Credits: 1\r\nRacer-Byte-Credits: {P}\r\n{fields}\r\n",
+        "POST /v1/objects/{} HTTP/1.1\r\nHost: racer\r\nContent-Length: 0\r\nAuthorization: fixture-credential\r\nRacer-Metadata: fixture-metadata\r\nRacer-Page-Credits: 1\r\nRacer-Byte-Credits: {credits}\r\n{fields}\r\n",
         "ab".repeat(32)
     )
 }

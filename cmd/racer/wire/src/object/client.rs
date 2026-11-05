@@ -2,7 +2,7 @@
 
 use crate::http::{Header, MessageHead, StartLine, is_token, trim_ows};
 use crate::object::model::{
-    ByteRange, CacheKey, MAX_FIELD_BYTES, MAX_WIRE_INTEGER, ObjectMetadata, PAGE_BYTES,
+    ByteRange, CacheKey, MAX_FIELD_BYTES, MAX_WIRE_INTEGER, ObjectMetadata, PAGE_BYTES, PageSize,
     ResolvedRange, StrongEtag, parse_decimal,
 };
 use crate::object::{Error, Result};
@@ -265,7 +265,12 @@ impl RequestParser {
                 // Direct reads are paced by the dataplane and ignore credits.
                 "racer-page-credits" | "racer-byte-credits" if direct.is_some() => {}
                 "racer-page-credits" => page_credits = decimal(value, 1, 64)? as usize,
-                "racer-byte-credits" => byte_credits = decimal(value, PAGE_BYTES, 64 * PAGE_BYTES)?,
+                // The parser does not know the cluster page size: accept credits
+                // down to the smallest page any cluster may publish. The stream
+                // then requires at least one page of the cluster's size.
+                "racer-byte-credits" => {
+                    byte_credits = decimal(value, PageSize::TEST_MIN.get(), 64 * PAGE_BYTES)?
+                }
                 "racer-destination-offset" if direct.is_some() => {
                     once(&mut destination_offset, parse_decimal(value)?)?;
                 }

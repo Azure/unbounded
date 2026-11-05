@@ -4003,7 +4003,12 @@ mod parser_tests {
             assert!(parse(head("POST", &[(name, b"2"), (name, b"2")])).is_err());
         }
         for pages in [1, 64] {
-            for bytes in [PAGE_BYTES, 64 * PAGE_BYTES] {
+            for bytes in [
+                racer_wire::object::PageSize::TEST_MIN.get(),
+                racer_wire::object::PageSize::MIN.get(),
+                PAGE_BYTES,
+                64 * PAGE_BYTES,
+            ] {
                 for ordered in ["0", "1", "2", "01"] {
                     let parsed = parse(head(
                         "POST",
@@ -4022,7 +4027,12 @@ mod parser_tests {
         }
         for (name, value) in [
             ("Racer-Page-Credits", "65".into()),
-            ("Racer-Byte-Credits", (PAGE_BYTES - 1).to_string()),
+            // Below the smallest publishable page; a cluster's own page size
+            // is enforced when the stream installs credits.
+            (
+                "Racer-Byte-Credits",
+                (racer_wire::object::PageSize::TEST_MIN.get() - 1).to_string(),
+            ),
             ("Racer-Byte-Credits", (64 * PAGE_BYTES + 1).to_string()),
         ] {
             assert!(parse(head("POST", &[(name, value.as_bytes())])).is_err());
