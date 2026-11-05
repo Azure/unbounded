@@ -4,9 +4,9 @@ use ::telemetry::metrics;
 // Fixed metric names; only installed runtime worker IDs are exposed as labels.
 //
 // Integrity diagnostics are two independent axes, not a reason/source matrix:
-// - `racer_crypto_decrypt_{crc,aead}_rejected_total` counts the exact failed
-//   check once at completion reap, including abandoned jobs. Structural errors,
-//   missing keys, and cancellation are not classified as CRC or AEAD failures.
+// - `racer_crypto_decrypt_aead_rejected_total` counts the exact failed check
+//   once at completion reap, including abandoned jobs. Structural errors,
+//   missing keys, and cancellation are not classified as AEAD failures.
 // - `racer_fill_decrypt_{disk,retained,peer}_corrupt_total` counts CorruptRecord
 //   results observed by the fill decrypt helper (including its structural checks).
 //   Retained includes memory, flights, and pending writes, even for copies first
@@ -301,7 +301,6 @@ metrics! { Event, EVENTS, EVENT_COUNT;
             Self::PeerPageBodyCount => "racer_peer_page_body_nanoseconds_count",
             Self::PeerPageBodyNs => "racer_peer_page_body_nanoseconds_sum",
             Self::PeerPageCensored => "racer_peer_page_censored_total",
-            Self::CryptoDecryptCrcRejected => "racer_crypto_decrypt_crc_rejected_total",
             Self::CryptoDecryptAeadRejected => "racer_crypto_decrypt_aead_rejected_total",
             Self::FillDecryptDiskCorrupt => "racer_fill_decrypt_disk_corrupt_total",
             Self::FillDecryptRetainedCorrupt => "racer_fill_decrypt_retained_corrupt_total",
@@ -315,7 +314,6 @@ metrics! { Event, EVENTS, EVENT_COUNT;
             Self::CryptoDecryptFailureInvalidConfiguration => "racer_crypto_decrypt_failure_invalid_configuration_total",
             Self::CryptoDecryptFailureInvalidRequest => "racer_crypto_decrypt_failure_invalid_request_total",
             Self::CryptoDecryptFailureOverloaded => "racer_crypto_decrypt_failure_overloaded_total",
-            Self::CryptoDecryptFailureCorruptCrc => "racer_crypto_decrypt_failure_corrupt_crc_total",
             Self::CryptoDecryptFailureCorruptAead => "racer_crypto_decrypt_failure_corrupt_aead_total",
             Self::CryptoDecryptFailureCorruptUnclassified => "racer_crypto_decrypt_failure_corrupt_unclassified_total",
             Self::CryptoDecryptFailureOther => "racer_crypto_decrypt_failure_other_total",
@@ -365,8 +363,8 @@ metrics! { Event, EVENTS, EVENT_COUNT;
             Self::FillOriginNs => "racer_fill_origin_nanoseconds_sum",
             Self::FillEncryptCount => "racer_fill_encrypt_nanoseconds_count",
             Self::FillEncryptNs => "racer_fill_encrypt_nanoseconds_sum",
-            Self::FillChecksumCount => "racer_fill_checksum_nanoseconds_count",
-            Self::FillChecksumNs => "racer_fill_checksum_nanoseconds_sum",
+            Self::FillTagCheckCount => "racer_fill_tag_check_nanoseconds_count",
+            Self::FillTagCheckNs => "racer_fill_tag_check_nanoseconds_sum",
             Self::DiagnosticHardware => "racer_diagnostic_hardware_total",
             Self::GpuDirectDiskRead => "racer_gpu_direct_disk_reads_total",
             Self::GpuDirectDiskReadBytes => "racer_gpu_direct_disk_read_bytes_total",
@@ -1392,7 +1390,6 @@ mod tests {
         fn integrity_diagnostics_have_fixed_names_and_wrapping_sharded_counts() {
             let workers = Metrics::for_workers(2).unwrap();
             let events = [
-                Event::CryptoDecryptCrcRejected,
                 Event::CryptoDecryptAeadRejected,
                 Event::FillDecryptDiskCorrupt,
                 Event::FillDecryptRetainedCorrupt,

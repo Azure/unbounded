@@ -142,7 +142,7 @@ pub struct NodeState {
     /// the report's own copy is still charged against the walk budget.
     hardware: Arc<crate::hardware::Context>,
 
-    send_crc: crate::telemetry::Samples,
+    send_tag: crate::telemetry::Samples,
 
     profiling: std::sync::OnceLock<Arc<crate::profiling::ProfilingController>>,
 
@@ -232,7 +232,7 @@ impl NodeState {
             peer_receive: Default::default(),
             inventory: Arc::new(crate::rdma::Inventory::default()),
             hardware: Default::default(),
-            send_crc: Default::default(),
+            send_tag: Default::default(),
             profiling: Default::default(),
             hedges: std::sync::OnceLock::new(),
             ingress: Arc::new(crate::admission::Ingress::new(&workers)),
@@ -1503,9 +1503,9 @@ impl WorkerApplication {
             },
         )
         .with_metrics(metrics.clone());
-        let peers = Rc::new(peers.with_send_crc(
-            config.send_crc_pair.clone(),
-            node.send_crc.clone(),
+        let peers = Rc::new(peers.with_send_tag(
+            config.send_tag_pair.clone(),
+            node.send_tag.clone(),
             crypto,
         ));
         let clients = Self::assemble_clients(
@@ -1519,7 +1519,7 @@ impl WorkerApplication {
         );
 
         let mut telemetry = Telemetry::default();
-        telemetry.send_crc = node.send_crc.clone();
+        telemetry.send_tag = node.send_tag.clone();
         telemetry.failures = node.failures.clone();
         telemetry.metrics = metrics;
         telemetry.health = node.observations.health.clone();

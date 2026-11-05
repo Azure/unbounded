@@ -1,6 +1,7 @@
 //! Worker-local encrypted slab storage. No HTTP, plaintext, or origin credentials.
-//! Versioned little-endian records protect framing with header SHA-256. The stored
-//! CRC is checked before AEAD at the fill boundary; padding is never returned.
+//! Versioned little-endian records protect framing with header SHA-256. Ciphertext
+//! integrity is checked with its AEAD tag at the fill boundary; padding is never
+//! returned.
 use self::catalog::Index;
 use self::catalog::IndexedPage;
 use self::catalog::RecordLocation;
@@ -281,7 +282,6 @@ impl StoreReader {
                 decoded.header.envelope,
                 decoded.ciphertext,
             )?;
-            ciphertext.expected_checksum(decoded.checksum)?;
             self.clock.mark_read(entry.location.segment)?;
             self.index
                 .retention()
@@ -1562,7 +1562,7 @@ impl Drop for DirtyCleanup<'_> {
 // Page record format version, stored after the magic. Readers treat any other
 // version as a cold miss.
 //
-// Version 2 layout:
+// Version 3 layout:
 // - `[0, real)`: header fields followed by a SHA-256 digest of the preceding
 //   header bytes. `real` is at most `MAX_RAW_HEADER_BYTES`.
 // - `[real, header_len)`: zero padding. `header_len` (stored at bytes 12..16)
@@ -1571,7 +1571,7 @@ impl Drop for DirtyCleanup<'_> {
 // - `[header_len, header_len + ciphertext_length)`: ciphertext, so it starts at
 //   a disk-aligned offset and can be written from its own aligned buffer.
 // - The remainder up to the record extent is zero padding.
-pub const FORMAT_VERSION: u32 = 2;
+pub const FORMAT_VERSION: u32 = 3;
 pub const MAX_ID_BYTES: usize = 4096;
 pub const MAX_ETAG_BYTES: usize = 8192;
 /// Upper bound on the unpadded header, including its digest.
@@ -1660,7 +1660,6 @@ pub struct EncodedRecord {
 pub struct DecodedRecord {
     pub header: RecordHeader,
     pub ciphertext: std::ops::Range<usize>,
-    pub checksum: u64,
 }
 impl DecodedRecord {
     /// Ciphertext byte range relative to the record start, if the record's
@@ -1799,7 +1798,7 @@ fn raw_layout(page: &CiphertextCopy, generation: Generation) -> Result<usize> {
         return Err(Error::CorruptRecord);
     }
     let header_bytes = HEADER_PREFIX_BYTES
-        .checked_add(12)
+        .checked_add(4)
         .ok_or(Error::CorruptRecord)?
         .checked_add(cache.len())
         .and_then(|len| len.checked_add(etag.len()))
@@ -1877,7 +1876,6 @@ fn header_bytes(page: &CiphertextCopy, generation: Generation, layout: &RecordLa
     out.extend_from_slice(&(etag.len() as u32).to_le_bytes());
     out.extend_from_slice(cache);
     out.extend_from_slice(etag);
-    out.extend_from_slice(&page.ciphertext.checksum().to_le_bytes());
     out.extend_from_slice(
         &(page
             .metadata
@@ -1981,7 +1979,7 @@ pub fn parse_bytes(bytes: &[u8], extent: Extent) -> Result<DecodedRecord> {
 /// without touching the ciphertext. The prefix must cover the whole header
 /// block; reading min(MAX_HEADER_BYTES, extent length) bytes always does. This
 /// lets a direct-to-GPU reader validate framing through host memory and then
-/// transfer only `DecodedRecord::ciphertext`. The ciphertext checksum is not
+/// transfer only `DecodedRecord::ciphertext`. The ciphertext AEAD tag is not
 /// verified here.
 pub fn parse_prefix(prefix: &[u8], extent: Extent) -> Result<DecodedRecord> {
     if prefix.len() > extent.length() {
@@ -2037,7 +2035,6 @@ fn parse_header(bytes: &[u8], extent: Extent) -> Result<DecodedRecord> {
             .to_owned(),
     );
     let etag = StrongEtag::parse(r.take(etag_len)?).map_err(|_| Error::CorruptRecord)?;
-    let checksum = r.u64()?;
     let content_type_length = r.u32()? as usize;
     let content_type = if content_type_length == 0 {
         None
@@ -2085,7 +2082,6 @@ fn parse_header(bytes: &[u8], extent: Extent) -> Result<DecodedRecord> {
             extent,
         },
         ciphertext: header_len..logical_bytes,
-        checksum,
     })
 }
 /// Length of the variable header fields after the 16-byte fixed prefix and
@@ -2103,7 +2099,6 @@ fn header_fields_len(r: &mut Decoder<'_>) -> Result<usize> {
     }
     r.take(cache_len)?;
     r.take(etag_len)?;
-    r.take(8)?;
     let content_type_len = r.u32()? as usize;
     if content_type_len > MAX_RAW_HEADER_BYTES {
         return Err(Error::CorruptRecord);

@@ -642,7 +642,6 @@ mod destination_disconnect {
             ciphertext: CiphertextPage {
                 provenance: None,
                 inner: Arc::new(CiphertextBytes {
-                    checksum: std::sync::OnceLock::new(),
                     envelope: PageEnvelope {
                         cipher: crate::model::PageCipher::Xaes256Gcm,
                         page: page.clone(),
@@ -1349,8 +1348,6 @@ mod encrypted_http {
                     );
                 }
                 reused = Some(pointer);
-                // A receiver-computed CRC succeeds even for the wrong valid body.
-                assert_eq!(ciphertext.verify_checksum(), Ok(()));
                 let successes = metrics.count(Event::CryptoDecryptSuccess);
                 let clear = cryptos[0]
                     .decrypt(
@@ -1371,7 +1368,6 @@ mod encrypted_http {
                         "mismatch cannot produce publishable plaintext"
                     );
                     assert_eq!(metrics.count(Event::CryptoDecryptAeadRejected), 1);
-                    assert_eq!(metrics.count(Event::CryptoDecryptCrcRejected), 0);
                 } else {
                     let clear = clear?;
                     assert_eq!(clear.page(), &page.envelope().page);
@@ -1396,7 +1392,6 @@ mod encrypted_http {
         );
         assert_eq!(metrics.count(Event::CryptoDecryptSuccess), 3);
         assert_eq!(metrics.count(Event::CryptoDecryptAeadRejected), 1);
-        assert_eq!(metrics.count(Event::CryptoDecryptCrcRejected), 0);
         assert!(clients.iter().all(|client| client.outstanding() == 0));
         drive(reactor.drain(), &reactor, &mut engines, &clients).unwrap();
         assert_eq!(reactor.in_flight(), 0);

@@ -478,7 +478,7 @@ each worker and are never divided.
 | Variable | Default | Scope | Accepted | Description |
 | --- | --- | --- | --- | --- |
 | `RACER_PPROF_ENABLED` | `false` | Node | `true`, `false` | Serve CPU profiles on the diagnostics listener. |
-| `RACER_SEND_CRC_PAIR` | Unset: off | Node | text | `sender,receiver` node UUIDs whose peer sends are checksummed for diagnosis. |
+| `RACER_SEND_TAG_PAIR` | Unset: off | Node | text | `sender,receiver` node UUIDs whose peer sends get a sampled AEAD tag check for diagnosis. |
 
 #### Cluster control (managed mode)
 

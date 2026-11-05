@@ -183,29 +183,113 @@ pub(crate) fn field(out: &mut Vec<u8>, value: &[u8]) -> Result<()> {
     out.extend_from_slice(value);
     Ok(())
 }
+/// Page AAD as borrowed parts plus small stack scalars, so tag checks can
+/// stream it into GHASH without building a per-page buffer.
+///
 /// Layout: domain, cipher:u32 BE, cache(length:u32 BE, bytes), exact object key,
 /// quoted ETag(length:u32 BE, bytes), page:u64 BE, key ID, nonce, lengths:u32 BE.
+pub(crate) struct PageAad<'a> {
+    envelope: &'a PageEnvelope,
+    cipher: [u8; 4],
+    cache_length: [u8; 4],
+    etag_length: [u8; 4],
+    number: [u8; 8],
+    plaintext_length: [u8; 4],
+    ciphertext_length: [u8; 4],
+}
+impl<'a> PageAad<'a> {
+    const DOMAIN: &'static [u8] = b"racer/page/aead/v1\0";
+
+    pub(crate) fn new(envelope: &'a PageEnvelope) -> Result<Self> {
+        envelope.validate()?;
+        let cache = envelope.page.version.object.cache.0.as_bytes();
+        let etag = envelope.page.version.etag.as_bytes();
+        if !racer_crypto::identity::canonical_uuid(&envelope.page.version.object.cache.0)
+            || etag.len() > crate::model::MAX_FIELD_BYTES
+        {
+            return Err(Error::CorruptRecord);
+        }
+        let length = |value: &[u8]| {
+            u32::try_from(value.len())
+                .map(u32::to_be_bytes)
+                .map_err(|_| Error::InvalidRequest)
+        };
+        Ok(Self {
+            envelope,
+            cipher: (envelope.cipher as u32).to_be_bytes(),
+            cache_length: length(cache)?,
+            etag_length: length(etag)?,
+            number: envelope.page.number.0.to_be_bytes(),
+            plaintext_length: envelope.plaintext_length.to_be_bytes(),
+            ciphertext_length: envelope.ciphertext_length.to_be_bytes(),
+        })
+    }
+
+    /// The AAD is the concatenation of these parts.
+    pub(crate) fn parts(&self) -> [&[u8]; 12] {
+        let envelope = self.envelope;
+        [
+            Self::DOMAIN,
+            &self.cipher,
+            &self.cache_length,
+            envelope.page.version.object.cache.0.as_bytes(),
+            &envelope.page.version.object.key.0,
+            &self.etag_length,
+            envelope.page.version.etag.as_bytes(),
+            &self.number,
+            &envelope.key_id.0,
+            &envelope.nonce.0,
+            &self.plaintext_length,
+            &self.ciphertext_length,
+        ]
+    }
+}
+/// The canonical page AAD bytes; see [`PageAad`] for the layout.
 pub fn page_aad(envelope: &PageEnvelope) -> Result<Vec<u8>> {
-    envelope.validate()?;
-    if !racer_crypto::identity::canonical_uuid(&envelope.page.version.object.cache.0)
-        || envelope.page.version.etag.as_bytes().len() > crate::model::MAX_FIELD_BYTES
+    Ok(PageAad::new(envelope)?.parts().concat())
+}
+/// The stored AEAD tag: the last [`TAG_LEN`] ciphertext bytes, or zeros when
+/// the ciphertext is shorter than a tag. Reads only the tag bytes.
+fn stored_tag(ciphertext: &[u8]) -> [u8; TAG_LEN] {
+    ciphertext
+        .len()
+        .checked_sub(TAG_LEN)
+        .and_then(|start| ciphertext[start..].try_into().ok())
+        .unwrap_or([0; TAG_LEN])
+}
+/// Verify a page's stored AEAD tag against its envelope without decrypting.
+/// Length mismatches and tag mismatches are `CorruptRecord`; a key that does
+/// not match the envelope is `MissingKey`.
+fn verify_stored_tag(
+    key: &racer_crypto::identity::KeyLease,
+    ciphertext: &CiphertextPage,
+) -> Result<()> {
+    let envelope = ciphertext.envelope();
+    let length = envelope.plaintext_length as usize;
+    let bytes = ciphertext.bytes();
+    if bytes.len() != envelope.ciphertext_length as usize
+        || length.checked_add(TAG_LEN) != Some(bytes.len())
     {
         return Err(Error::CorruptRecord);
     }
-    let mut out = b"racer/page/aead/v1\0".to_vec();
-    out.extend_from_slice(&(envelope.cipher as u32).to_be_bytes());
-    field(&mut out, envelope.page.version.object.cache.0.as_bytes())?;
-    out.extend_from_slice(&envelope.page.version.object.key.0);
-    field(&mut out, envelope.page.version.etag.as_bytes())?;
-    out.extend_from_slice(&envelope.page.number.0.to_be_bytes());
-    out.extend_from_slice(&envelope.key_id.0);
-    out.extend_from_slice(&envelope.nonce.0);
-    out.extend_from_slice(&envelope.plaintext_length.to_be_bytes());
-    out.extend_from_slice(&envelope.ciphertext_length.to_be_bytes());
-    Ok(out)
+    let cache = &envelope.page.version.object.cache;
+    if key.cache() != cache || key.id() != envelope.key_id {
+        return Err(Error::MissingKey);
+    }
+    let aad = PageAad::new(envelope)?;
+    let (body, tag) = bytes.split_at(length);
+    key.verify_page_tag(
+        cache,
+        envelope.key_id,
+        &envelope.nonce.0,
+        &aad.parts(),
+        body,
+        tag,
+    )
+    .map_err(|_| Error::CorruptRecord)
 }
-/// Called only on crypto for exact AEAD rejects or opt-in send samples. Reuses
-/// the CRC already initialized by verify_checksum; never scans payload bytes.
+/// Called only on crypto for exact AEAD rejects or opt-in send samples. Reads
+/// only the stored tag; never scans payload bytes.
 pub(crate) fn capture_aead_failure(
     ciphertext: &CiphertextPage,
     aad: &[u8],
@@ -237,7 +321,7 @@ pub(crate) fn capture_aead_failure(
         plaintext: envelope.plaintext_length,
         ciphertext: envelope.ciphertext_length,
         aad: Sha256::digest(aad).into(),
-        crc: ciphertext.cached_checksum(),
+        tag: stored_tag(ciphertext.bytes()),
     }
 }
 
@@ -268,16 +352,16 @@ impl PageCrypto {
         let _ = self
             .client
             .execute_sample(
-                CryptoInput::Checksum { ciphertext },
+                CryptoInput::VerifyTag { ciphertext },
                 key,
                 scope,
                 Some(sample),
             )
             .await;
     }
-    /// Verify persisted ciphertext integrity on the bounded crypto worker queue.
-    /// This does not authenticate a peer copy or produce publishable plaintext.
-    pub fn verify_checksum<'a>(
+    /// Verify ciphertext integrity with its AEAD tag, without decrypting, on
+    /// the bounded crypto worker queue. Produces no plaintext.
+    pub fn verify_tag<'a>(
         &'a self,
         ciphertext: CiphertextPage,
         scope: &'a RequestScope,
@@ -291,10 +375,10 @@ impl PageCrypto {
             )?;
             match self
                 .client
-                .execute(CryptoInput::Checksum { ciphertext }, key, scope)
+                .execute(CryptoInput::VerifyTag { ciphertext }, key, scope)
                 .await?
             {
-                CryptoOutput::Checksummed(_) => Ok(()),
+                CryptoOutput::TagVerified(_) => Ok(()),
                 _ => Err(Error::CorruptRecord),
             }
         })
@@ -373,7 +457,7 @@ impl PageCrypto {
             {
                 CryptoOutput::Decrypted(page, _original_ciphertext) => Ok(page),
                 CryptoOutput::Encrypted(..)
-                | CryptoOutput::Checksummed(_)
+                | CryptoOutput::TagVerified(_)
                 | CryptoOutput::EnvelopeVerified(_) => Err(Error::CorruptRecord),
             }
         })
@@ -420,7 +504,7 @@ impl PageCrypto {
             {
                 CryptoOutput::Encrypted(plaintext, ciphertext) => Ok((plaintext, ciphertext)),
                 CryptoOutput::Decrypted(..)
-                | CryptoOutput::Checksummed(_)
+                | CryptoOutput::TagVerified(_)
                 | CryptoOutput::EnvelopeVerified(_) => Err(Error::CorruptRecord),
             }
         })
@@ -480,7 +564,7 @@ impl PageCryptoEngine {
             ctx,
         );
         if let Some(sample) = &mut permit.send_sample
-            && let CryptoInput::Checksum { ciphertext } = &input
+            && let CryptoInput::VerifyTag { ciphertext } = &input
             && let Ok(aad) = page_aad(ciphertext.envelope())
         {
             sample.facts = Some(capture_aead_failure(
@@ -510,72 +594,6 @@ impl PageCryptoEngine {
         }
     }
 
-    /// Decrypt with one read of the ciphertext for both its CRC and the AEAD
-    /// copy, when every check that the unfused path runs after the CRC would
-    /// pass. Returns `None` without side effects otherwise, so the caller's
-    /// unfused path reports exactly the error it always has.
-    ///
-    /// The unfused path scans the ciphertext for its CRC, then copies it into
-    /// plaintext storage for in-place AEAD: two reads of a page that, after an
-    /// RDMA receive, is no longer in cache. Here each chunk is checksummed
-    /// right after it is copied, while it is still cache resident.
-    fn open_fused(
-        key: &racer_crypto::identity::KeyLease,
-        ciphertext: &CiphertextPage,
-        plaintext: &flow_control::Charge<AdmissionPolicy>,
-        permit: &mut CryptoPermit,
-        scope: &RequestScope,
-        clock: &racer_io::Clock,
-    ) -> Result<Option<Zeroizing<Vec<u8>>>> {
-        let envelope = ciphertext.envelope();
-        let length = envelope.plaintext_length as usize;
-        if key.cache() != &envelope.page.version.object.cache
-            || key.id() != envelope.key_id
-            || ciphertext.bytes().len() != envelope.ciphertext_length as usize
-            || length.checked_add(TAG_LEN) != Some(ciphertext.bytes().len())
-            || plaintext
-                .validate(ResourceClass::Plaintext, length)
-                .is_err()
-            || plaintext.key() != Some(&envelope.page.version.object.cache)
-        {
-            return Ok(None);
-        }
-        let Ok(aad) = page_aad(envelope) else {
-            return Ok(None);
-        };
-        let Ok(storage) = plaintext.buffer(length) else {
-            return Ok(None);
-        };
-        let mut bytes = Zeroizing::new(storage);
-        let (_, tag) = ciphertext.bytes().split_at(length);
-        let checksum = racer_crypto::copy_prefix_crc64(ciphertext.bytes(), &mut bytes)
-            .map_err(|_| Error::CorruptRecord)?;
-        ciphertext
-            .verify_computed_checksum(checksum)
-            .inspect_err(|_| {
-                permit.rejected(IntegrityRejection::Crc);
-            })?;
-        key.open_page_in_place(
-            &envelope.page.version.object.cache,
-            envelope.key_id,
-            &envelope.nonce.0,
-            &aad,
-            &mut bytes,
-            tag,
-        )
-        .map_err(|_| {
-            permit.rejected(IntegrityRejection::Aead);
-            permit.aead_failure = Some(capture_aead_failure(
-                ciphertext,
-                &aad,
-                scope.request,
-                crate::telemetry::unix_millis(clock.wall_now()),
-            ));
-            Error::CorruptRecord
-        })?;
-        Ok(Some(bytes))
-    }
-
     /// Borrow every quota owner until crypto and the final cancellation check succeed.
     fn prepare(
         input: &mut CryptoInput,
@@ -587,21 +605,15 @@ impl PageCryptoEngine {
         scope.check().inspect_err(|error| {
             permit.measurement.scope_failure = crate::telemetry::DecryptScopeFailure::Entry(*error);
         })?;
-        if let CryptoInput::Checksum { ciphertext } = input {
-            if let Some(sample) = &mut permit.send_sample {
-                sample.cached = ciphertext.cached_checksum().is_some();
-                if sample.cached {
-                    return Ok((ciphertext.envelope().clone(), Zeroizing::new(Vec::new())));
-                }
-            }
-            ciphertext.verify_checksum()?;
+        if let CryptoInput::VerifyTag { ciphertext } = input {
+            verify_stored_tag(key, ciphertext)?;
             scope.check()?;
             return Ok((ciphertext.envelope().clone(), Zeroizing::new(Vec::new())));
         }
         key.require_purpose(KeyPurpose::Page)?;
         let (envelope, mut bytes) = match input {
             CryptoInput::VerifyEnvelope(_) => unreachable!("envelope handled above"),
-            CryptoInput::Checksum { .. } => unreachable!("checksum handled above"),
+            CryptoInput::VerifyTag { .. } => unreachable!("tag check handled above"),
             CryptoInput::Encrypt {
                 page,
                 plaintext,
@@ -676,14 +688,7 @@ impl PageCryptoEngine {
                 plaintext,
             } => {
                 let envelope = ciphertext.envelope();
-                if let Some(bytes) =
-                    Self::open_fused(key, ciphertext, plaintext, permit, scope, &ctx.clock)?
                 {
-                    (envelope.clone(), bytes)
-                } else {
-                    ciphertext.verify_checksum().inspect_err(|_| {
-                        permit.rejected(IntegrityRejection::Crc);
-                    })?;
                     if key.cache() != &envelope.page.version.object.cache
                         || key.id() != envelope.key_id
                     {
@@ -740,8 +745,8 @@ impl PageCryptoEngine {
     ) -> CryptoOutcome {
         match input {
             CryptoInput::VerifyEnvelope(_) => unreachable!("envelope handled above"),
-            CryptoInput::Checksum { ciphertext } => {
-                CryptoOutcome::Completed(CryptoOutput::Checksummed(ciphertext))
+            CryptoInput::VerifyTag { ciphertext } => {
+                CryptoOutcome::Completed(CryptoOutput::TagVerified(ciphertext))
             }
             CryptoInput::Encrypt {
                 page,
@@ -766,7 +771,6 @@ impl PageCryptoEngine {
                         CiphertextPage {
                             provenance: None,
                             inner: Arc::new(CiphertextBytes {
-                                checksum: std::sync::OnceLock::from(racer_crypto::crc64(&bytes)),
                                 envelope,
                                 storage: flow_control::ChargedBytes {
                                     bytes: std::mem::take(&mut *bytes),
@@ -777,8 +781,7 @@ impl PageCryptoEngine {
                         }
                     }
                     EncryptOutput::Aligned(buffer) => {
-                        let checksum = racer_crypto::crc64(buffer.as_slice());
-                        CiphertextPage::from_aligned(*buffer, envelope, Some(checksum))
+                        CiphertextPage::from_aligned(*buffer, envelope)
                     }
                 };
                 CryptoOutcome::Completed(CryptoOutput::Encrypted(plain, encrypted))
@@ -1192,8 +1195,8 @@ impl PartialOrd for CryptoId {
 pub enum CryptoInput {
     /// Authenticate owned headers and hops without touching page body bytes.
     VerifyEnvelope(Box<crate::peer::forwarding::EnvelopeJob>),
-    /// Check a stored CRC without allocating plaintext or running AEAD.
-    Checksum { ciphertext: CiphertextPage },
+    /// Check the stored AEAD tag without allocating plaintext or decrypting.
+    VerifyTag { ciphertext: CiphertextPage },
     Decrypt {
         ciphertext: CiphertextPage,
         plaintext: flow_control::Charge<AdmissionPolicy>,
@@ -1219,7 +1222,7 @@ impl From<flow_control::Charge<AdmissionPolicy>> for EncryptOutput {
 }
 pub enum CryptoOutput {
     EnvelopeVerified(Box<crate::peer::forwarding::EnvelopeOutput>),
-    Checksummed(CiphertextPage),
+    TagVerified(CiphertextPage),
     /// Retain original ciphertext through completion too; I/O decides whether to
     /// retain it for peer copies/persistence after consuming the completion.
     Decrypted(VerifiedPage, CiphertextPage),
@@ -1243,7 +1246,7 @@ pub struct CryptoPermit {
 /// Per-job timing and integrity observations, published only at I/O completion.
 #[derive(Default)]
 struct Measurement {
-    checksum_only: bool,
+    verify_only: bool,
 
     decrypt: bool,
 
@@ -1268,7 +1271,6 @@ struct DecryptFailureMeta {
 /// Exact failed integrity check, not a diagnosis of where bytes became invalid.
 #[derive(Clone, Copy)]
 pub(crate) enum IntegrityRejection {
-    Crc,
     Aead,
 }
 fn elapsed_ns(now: std::time::Instant, start: std::time::Instant) -> u64 {
@@ -1319,7 +1321,7 @@ impl CryptoCompletion {
     fn record(&self, metrics: &crate::telemetry::Metrics) {
         use crate::telemetry::Event::*;
         let m = &self.permit.measurement;
-        if m.checksum_only {
+        if m.verify_only {
             return;
         }
         let Some(execution) = m.execution_ns else {
@@ -1373,7 +1375,6 @@ impl CryptoCompletion {
         if let Some(rejection) = m.rejection {
             metrics.record(
                 match rejection {
-                    IntegrityRejection::Crc => CryptoDecryptCrcRejected,
                     IntegrityRejection::Aead => CryptoDecryptAeadRejected,
                 },
                 1,
@@ -1391,9 +1392,9 @@ pub struct CryptoJob {
 impl CryptoPermit {
     pub fn job(mut self, input: CryptoInput, key: KeyLease, scope: RequestScope) -> CryptoJob {
         use racer_io::ring::IoBuffer;
-        self.measurement.checksum_only = matches!(
+        self.measurement.verify_only = matches!(
             input,
-            CryptoInput::Checksum { .. } | CryptoInput::VerifyEnvelope(_)
+            CryptoInput::VerifyTag { .. } | CryptoInput::VerifyEnvelope(_)
         );
         self.measurement.decrypt = matches!(input, CryptoInput::Decrypt { .. });
         self.measurement.bytes = match &input {
@@ -1401,7 +1402,7 @@ impl CryptoPermit {
             CryptoInput::Encrypt { plaintext, .. } => {
                 plaintext.bytes().map_or(0, |b| b.len() as u64)
             }
-            CryptoInput::Decrypt { ciphertext, .. } | CryptoInput::Checksum { ciphertext } => {
+            CryptoInput::Decrypt { ciphertext, .. } | CryptoInput::VerifyTag { ciphertext } => {
                 u64::from(ciphertext.envelope().plaintext_length)
             }
         };
@@ -1439,7 +1440,7 @@ pub struct CryptoCompletion {
 impl CryptoCompletion {
     fn decrypt_failure(&self, reap_ms: u64) -> Option<crate::telemetry::DecryptFailure> {
         let m = &self.permit.measurement;
-        if !m.decrypt || m.checksum_only || m.execution_ns.is_none() {
+        if !m.decrypt || m.verify_only || m.execution_ns.is_none() {
             return None;
         }
         let CryptoOutcome::Failed { input, error } = &self.outcome else {
@@ -1651,7 +1652,7 @@ impl CryptoClient {
                         if let Some(key) = key {
                             permit.job(input, key, scope.clone())
                         } else {
-                            permit.measurement.checksum_only = true;
+                            permit.measurement.verify_only = true;
                             CryptoJob {
                                 input,
                                 key: None,
@@ -2140,7 +2141,7 @@ mod tests {
                     let (CryptoOutput::Encrypted(plain, ciphertext)
                     | CryptoOutput::Decrypted(plain, ciphertext)) = output
                     else {
-                        panic!("AEAD measurement received checksum-only output");
+                        panic!("AEAD measurement received verify-only output");
                     };
                     assert_eq!(plain.bytes().len(), size);
                     assert_eq!(ciphertext.bytes().len(), size + 16);
@@ -2307,7 +2308,7 @@ mod tests {
                         let (CryptoOutput::Encrypted(plain, cipher)
                         | CryptoOutput::Decrypted(plain, cipher)) = &output
                         else {
-                            panic!("AEAD measurement received checksum-only output");
+                            panic!("AEAD measurement received verify-only output");
                         };
                         assert_eq!(plain.bytes().len(), size);
                         assert_eq!((plain.bytes()[0], plain.bytes()[size - 1]), (7, 7));
@@ -2434,7 +2435,6 @@ mod tests {
                         "aead",
                         "malformed",
                         "short_body",
-                        "abandon_crc",
                         "abandon_aead",
                         "deadline",
                         "missing_key",
@@ -2449,7 +2449,6 @@ mod tests {
                                 "aead"
                                     | "malformed"
                                     | "short_body"
-                                    | "abandon_crc"
                                     | "abandon_aead"
                                     | "deadline"
                                     | "missing_key"
@@ -2493,7 +2492,6 @@ mod tests {
                                 mode,
                                 "failure"
                                     | "aead"
-                                    | "abandon_crc"
                                     | "abandon_aead"
                                     | "failure_late_cancel"
                                     | "no_metrics"
@@ -2513,11 +2511,6 @@ mod tests {
                                     .reserve(Some(&cache), ResourceClass::Ciphertext, 1)
                                     .unwrap();
                             }
-                            if matches!(mode, "aead" | "abandon_aead") {
-                                // Peer bytes without a persisted CRC must still fail AEAD.
-                                Arc::get_mut(&mut ciphertext.inner).unwrap().checksum =
-                                    std::sync::OnceLock::new();
-                            }
                             if mode == "malformed" {
                                 Arc::get_mut(&mut ciphertext.inner)
                                     .unwrap()
@@ -2528,7 +2521,6 @@ mod tests {
                                 // A valid descriptor with a mismatched body is malformed,
                                 // not an authentication rejection from the primitive.
                                 let inner = Arc::get_mut(&mut ciphertext.inner).unwrap();
-                                inner.checksum = std::sync::OnceLock::new();
                                 inner.bytes.pop();
                             }
                         }
@@ -2620,12 +2612,11 @@ mod tests {
                         assert!(engine.complete(completion).is_ok());
                         let events = measurement_events(decrypt);
                         assert_eq!(metrics.count(events[0]), 0);
-                        assert_eq!(metrics.count(CryptoDecryptCrcRejected), 0);
                         assert_eq!(metrics.count(CryptoDecryptAeadRejected), 0);
                         let mut before_reap = String::new();
                         failures.write_decrypt(&mut before_reap).unwrap();
                         assert!(before_reap.contains("total=0 retained=0"));
-                        if matches!(mode, "abandon" | "abandon_crc" | "abandon_aead") {
+                        if matches!(mode, "abandon" | "abandon_aead") {
                             drop(future);
                         } else {
                             client.poll_budgeted(1).unwrap();
@@ -2673,8 +2664,7 @@ mod tests {
                                 "missing_key" => "missing_key",
                                 "invalid_configuration" => "invalid_configuration",
                                 "malformed" | "short_body" => "corrupt_unclassified",
-                                "aead" | "abandon_aead" => "corrupt_aead",
-                                _ => "corrupt_crc",
+                                _ => "corrupt_aead",
                             };
                             assert!(
                                 records.contains(&format!("reason={reason} ")),
@@ -2709,25 +2699,19 @@ mod tests {
                             assert_eq!(metrics.count(event), expected, "{mode} {event:?}");
                         }
                         assert_eq!(client.outstanding(), 0);
-                        assert_eq!(
-                            metrics.count(CryptoDecryptCrcRejected),
-                            u64::from(
-                                decrypt
-                                    && matches!(
-                                        mode,
-                                        "failure" | "abandon_crc" | "failure_late_cancel"
-                                    )
-                            ),
-                            "{mode}"
-                        );
+                        // Every corrupt decrypt input is an AEAD rejection.
+                        let rejected = decrypt
+                            && matches!(
+                                mode,
+                                "aead" | "abandon_aead" | "failure" | "failure_late_cancel"
+                            );
                         assert_eq!(
                             metrics.count(CryptoDecryptAeadRejected),
-                            u64::from(matches!(mode, "aead" | "abandon_aead")),
+                            u64::from(rejected),
                             "{mode}"
                         );
                         let mut records = String::new();
                         failures.write_aead(&mut records).unwrap();
-                        let rejected = matches!(mode, "aead" | "abandon_aead");
                         assert_eq!(records.lines().count(), 1 + usize::from(rejected), "{mode}");
                         assert!(records.starts_with(if rejected {
                             "total=1 retained=1"
@@ -2735,14 +2719,84 @@ mod tests {
                             "total=0 retained=0"
                         }));
                         if rejected {
-                            assert!(!records.contains("crc=none"));
+                            assert!(records.contains(" tag="));
                         }
                     }
                 }
             }
 
             #[test]
-            fn send_crc_computes_fresh_body_and_holds_owner_through_abandoned_reap() {
+            fn stored_tag_check_accepts_sealed_pages_and_rejects_every_tamper() {
+                use crate::security::PageCryptoEngine;
+                let admission = std::rc::Rc::new(flow_control::Quotas::new(AdmissionPolicy::new(
+                    crate::test_support::cluster::config(false).limits,
+                )));
+                let keys = keyring();
+                let cache =
+                    racer_control_wire::CacheId("00000000-0000-4000-8000-000000000003".into());
+                let lease = || {
+                    keys.active(&cache, racer_crypto::identity::KeyPurpose::Page)
+                        .unwrap()
+                };
+                let scope = RequestScope::host(
+                    crate::model::RequestId([7; 16]),
+                    racer_io::Clock::host().now() + Duration::from_secs(10),
+                )
+                .unwrap();
+                let sealed = || {
+                    let mut cx = Context::from_waker(futures::task::noop_waker_ref());
+                    let (setup, _engine) = pair(WorkerId(0), 0, NonZeroUsize::new(1).unwrap());
+                    let Poll::Ready(Ok(permit)) = setup.poll_reserve(
+                        &mut cx,
+                        CryptoId {
+                            worker: WorkerId(0),
+                            generation: 0,
+                            sequence: 1,
+                        },
+                    ) else {
+                        panic!("permit")
+                    };
+                    let completion = PageCryptoEngine::process(
+                        permit.job(input(&admission), lease(), scope.clone()),
+                        &racer_io::WorkerCtx::host(),
+                    );
+                    let CryptoOutcome::Completed(CryptoOutput::Encrypted(_, ciphertext)) =
+                        completion.outcome
+                    else {
+                        panic!("encrypted")
+                    };
+                    ciphertext
+                };
+                let verify =
+                    |page: &CiphertextPage| super::super::verify_stored_tag(&lease(), page);
+                assert_eq!(verify(&sealed()), Ok(()));
+                for (case, expected) in [
+                    ("body", Error::CorruptRecord),
+                    ("tag", Error::CorruptRecord),
+                    ("nonce", Error::CorruptRecord),
+                    ("page", Error::CorruptRecord),
+                    ("short", Error::CorruptRecord),
+                    ("key", Error::MissingKey),
+                ] {
+                    let mut page = sealed();
+                    let inner = Arc::get_mut(&mut page.inner).unwrap();
+                    let last = inner.bytes.len() - 1;
+                    match case {
+                        "body" => inner.bytes[0] ^= 1,
+                        "tag" => inner.bytes[last] ^= 1,
+                        "nonce" => inner.envelope.nonce.0[0] ^= 1,
+                        "page" => inner.envelope.page.number.0 += 1,
+                        "short" => {
+                            inner.bytes.pop();
+                        }
+                        _ => inner.envelope.key_id = KeyId([99; 16]),
+                    }
+                    assert_eq!(verify(&page), Err(expected), "{case}");
+                }
+            }
+
+            #[test]
+            fn send_tag_verifies_body_and_holds_owner_through_abandoned_reap() {
                 use crate::security::PageCryptoEngine;
                 use crate::telemetry::Pair;
                 use crate::telemetry::Samples;
@@ -2777,14 +2831,14 @@ mod tests {
                     permit.job(input(&admission), lease(), scope.clone()),
                     &racer_io::WorkerCtx::host(),
                 );
-                let CryptoOutcome::Completed(CryptoOutput::Encrypted(plain, mut ciphertext)) =
+                let CryptoOutcome::Completed(CryptoOutput::Encrypted(plain, ciphertext)) =
                     completion.outcome
                 else {
                     panic!("encrypted")
                 };
                 drop(plain);
-                Arc::get_mut(&mut ciphertext.inner).unwrap().checksum = std::sync::OnceLock::new();
-                let expected = racer_crypto::crc64(ciphertext.bytes());
+                let stored = &ciphertext.bytes()[ciphertext.bytes().len() - TAG_LEN..];
+                let expected: String = stored.iter().map(|b| format!("{b:02x}")).collect();
                 let retained = ciphertext.clone();
                 let samples = Samples::default();
                 let filter = Pair::parse(
@@ -2804,19 +2858,19 @@ mod tests {
                 let (io, mut engine) = pair(WorkerId(0), 1, NonZeroUsize::new(1).unwrap());
                 let client = CryptoClient::new(io);
                 let mut future = client.execute_sample(
-                    CryptoInput::Checksum { ciphertext },
+                    CryptoInput::VerifyTag { ciphertext },
                     lease(),
                     &scope,
                     Some(sample),
                 );
                 assert!(future.as_mut().poll(&mut cx).is_pending());
-                assert_eq!(retained.cached_checksum(), None);
                 drop(future);
                 let Poll::Ready(Ok(Some(job))) = engine.poll_job(&mut cx) else {
                     panic!("job")
                 };
                 let completion = PageCryptoEngine::process(job, &racer_io::WorkerCtx::host());
-                assert_eq!(retained.cached_checksum(), Some(expected));
+                // The abandoned job's ciphertext owner lives until completion is reaped.
+                assert_eq!(Arc::strong_count(&retained.inner), 2);
                 assert!(engine.complete(completion).is_ok());
                 let mut text = String::new();
                 samples.write(&mut text).unwrap();
@@ -2827,14 +2881,14 @@ mod tests {
                 text.clear();
                 samples.write(&mut text).unwrap();
                 assert!(text.contains("busy=0"));
-                assert!(text.contains("send=completed status=computed"));
-                assert!(text.contains(&format!("crc={expected:016x}")));
+                assert!(text.contains("send=completed status=verified"));
+                assert!(text.contains(&format!(" tag={expected}")));
                 assert_eq!(text.lines().count(), 2);
                 assert_eq!(client.outstanding(), 0);
             }
 
             #[test]
-            fn send_crc_cached_cancel_missing_key_and_capacity_are_diagnostic_only() {
+            fn send_tag_mismatch_cancel_missing_key_and_capacity_are_diagnostic_only() {
                 use crate::security::PageCrypto;
                 use crate::security::PageCryptoEngine;
                 use crate::telemetry::Pair;
@@ -2847,7 +2901,7 @@ mod tests {
                     "8816d91d-e896-49bf-ba8a-da97ede93818,11111111-1111-4111-8111-111111111111",
                 )
                 .unwrap();
-                for mode in ["cached", "cancel", "missing", "capacity"] {
+                for mode in ["mismatch", "cancel", "missing", "capacity"] {
                     let mut page = crate::memory::tests::bundle_for(
                         &admission,
                         crate::model::VersionMetadata {
@@ -2859,7 +2913,7 @@ mod tests {
                                     ),
                                     key: crate::model::CacheKey([3; 32]),
                                 },
-                                etag: crate::model::StrongEtag::test_value("send-crc"),
+                                etag: crate::model::StrongEtag::test_value("send-tag"),
                             },
                             length: 3,
                         },
@@ -2868,8 +2922,9 @@ mod tests {
                     let inner = Arc::get_mut(&mut page.inner).unwrap();
                     inner.envelope.page.version.object.cache =
                         racer_control_wire::CacheId("00000000-0000-4000-8000-000000000003".into());
-                    if mode == "cached" {
-                        inner.checksum.set(42).unwrap();
+                    if mode == "mismatch" {
+                        // Flip a body byte so the stored tag no longer matches.
+                        inner.bytes[0] ^= 1;
                     }
                     if mode == "missing" {
                         // The fixture keyring installs [1;16], also the bundle's default.
@@ -2921,7 +2976,7 @@ mod tests {
                             None
                         };
                         let mut future = client.execute_sample(
-                            CryptoInput::Checksum { ciphertext: page },
+                            CryptoInput::VerifyTag { ciphertext: page },
                             lease,
                             &scope,
                             Some(sample),
@@ -2955,15 +3010,15 @@ mod tests {
                     assert!(text.contains("busy=0"), "{mode}: {text}");
                     assert!(text.contains("send=completed"));
                     assert!(
-                        text.contains(if mode == "cached" {
-                            "status=cached"
+                        text.contains(if mode == "mismatch" {
+                            "status=mismatch"
                         } else {
                             "status=unavailable"
                         }),
                         "{mode}: {text}"
                     );
-                    if mode == "cached" {
-                        assert!(text.contains("crc=000000000000002a"));
+                    if mode == "mismatch" {
+                        assert!(text.contains(" tag="));
                     }
                     if mode == "missing" {
                         assert!(text.contains("MissingKey"));
@@ -3342,7 +3397,7 @@ mod tests {
                                 .into(),
                         }
                     } else {
-                        // Fresh received allocation/checksum state, as on disk/peer ingress.
+                        // Fresh received allocation state, as on disk/peer ingress.
                         let bytes = encrypted;
                         let ciphertext = pool
                             .ciphertext(
@@ -4438,10 +4493,6 @@ mod tests {
             let length = 5000 + index;
             assert_eq!(clear.bytes().len(), length);
             assert_eq!(cipher.bytes().len(), length + 16);
-            assert_eq!(
-                cipher.cached_checksum(),
-                Some(racer_crypto::crc64(cipher.bytes()))
-            );
             let body = cipher
                 .disk_body(alignment)
                 .expect("disk-aligned ciphertext");
@@ -4681,7 +4732,6 @@ mod tests {
             let cipher = CiphertextPage {
                 provenance: None,
                 inner: Arc::new(CiphertextBytes {
-                    checksum: std::sync::OnceLock::new(),
                     envelope: descriptor.clone(),
                     storage: flow_control::ChargedBytes {
                         bytes,

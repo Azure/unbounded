@@ -1344,8 +1344,7 @@ impl SecurityCodec {
                         {
                             return Err(Error::InvalidRequest);
                         }
-                        self.buffers
-                            .aligned_ciphertext_page(buffer, envelope, None)?
+                        self.buffers.aligned_ciphertext_page(buffer, envelope)?
                     }
                 };
                 if outcome == "selected" {

@@ -1247,7 +1247,6 @@ fn known_copy_admission_validates_before_reclaim_and_preserves_failures() {
         if case == "corrupt" {
             let inner = Arc::get_mut(&mut copy.ciphertext.inner).unwrap();
             inner.bytes[0] ^= 1;
-            inner.checksum.take();
         }
         let free = if case == "short" { 2 } else { 3 };
         let pressure = admission

@@ -143,8 +143,8 @@ pub(crate) enum DriverStage {
     DiskReadCall,
     /// Serial decrypt call, including admission and completion delivery.
     DecryptCall,
-    /// Serial checksum call, including admission and completion delivery.
-    ChecksumCall,
+    /// Serial tag check call, including admission and completion delivery.
+    TagCheckCall,
     /// Composite candidate work, including concurrent hedges and nested validation.
     CandidateCompositeCall,
     /// Plaintext reservation and bounded reclamation.

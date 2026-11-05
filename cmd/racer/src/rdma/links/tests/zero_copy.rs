@@ -57,7 +57,6 @@ fn registered_ciphertext_reads_in_place_and_drop_frees_buffer() {
     let (mut w, admission, page) = setup();
     let ciphertext = registered(&mut w, &admission, &page.ciphertext);
     assert_eq!(ciphertext.bytes(), page.ciphertext.bytes());
-    assert_eq!(ciphertext.checksum(), page.ciphertext.checksum());
     assert_eq!(owned(&w), Some(1));
     let before = admission.used(ResourceClass::Ciphertext);
     // A clone on another thread keeps the buffer; dropping it there frees it.
@@ -240,8 +239,6 @@ fn detach_registered_copies_once_into_the_pool_and_shares_with_the_cache() {
     let cache = MemoryCache::new(pool.clone(), crate::test_support::availability());
     let baseline = admission.used(ResourceClass::Ciphertext);
     let ciphertext = registered(&mut w, &admission, &page.ciphertext);
-    let checksum = page.ciphertext.checksum();
-    ciphertext.expected_checksum(checksum).unwrap();
     let pointer = ciphertext.bytes().as_ptr();
     let before = crate::memory::registered_copy_outs();
     let charge = aligned_charge(&pool, &admission, &ciphertext);
@@ -250,7 +247,11 @@ fn detach_registered_copies_once_into_the_pool_and_shares_with_the_cache() {
     assert!(!detached.is_registered());
     assert_ne!(detached.bytes().as_ptr(), pointer);
     assert_eq!(detached.bytes(), page.ciphertext.bytes());
-    assert_eq!(detached.cached_checksum(), Some(checksum), "checksum kept");
+    assert_eq!(
+        detached.envelope(),
+        page.ciphertext.envelope(),
+        "envelope kept"
+    );
     assert!(detached.is_disk_aligned(crate::memory::default_disk_alignment()));
     // The registered buffer was released by the copy-out.
     pump!(w);

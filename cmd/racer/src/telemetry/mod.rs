@@ -111,7 +111,7 @@ pub struct Telemetry {
     pub(crate) hardware: OnceCell<Rc<dyn Fn() -> HardwareJob>>,
     /// The current hardware helper, alive until both its thread and response finish.
     hardware_active: std::cell::RefCell<std::sync::Weak<HardwareState>>,
-    pub send_crc: crate::telemetry::Samples,
+    pub send_tag: crate::telemetry::Samples,
     pub failures: crate::telemetry::Failures,
     pub metrics: crate::telemetry::Metrics,
     pub health: crate::telemetry::Health,

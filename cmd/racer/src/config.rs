@@ -106,7 +106,7 @@ impl Default for OriginSettings {
 pub struct Config {
     pub spill: crate::read::spill::Config,
     pub prefetch: crate::prefetch::Config,
-    pub send_crc_pair: Option<crate::telemetry::Pair>,
+    pub send_tag_pair: Option<crate::telemetry::Pair>,
     pub page_hedge: crate::read::candidates::HedgeConfig,
     /// Order in which a non-owner requester visits a page's ranked owners.
     pub replica_selection: crate::read::candidates::ReplicaSelection,
@@ -402,12 +402,12 @@ impl Config {
                 origin_bytes_per_sec: u("RACER_PREFETCH_ORIGIN_BYTES_PER_SEC"),
                 max_attempts: u("RACER_PREFETCH_MAX_ATTEMPTS"),
             },
-            send_crc_pair: v
-                .text("RACER_SEND_CRC_PAIR")
+            send_tag_pair: v
+                .text("RACER_SEND_TAG_PAIR")
                 .map(|value| {
                     crate::telemetry::Pair::parse(value).map_err(|_| {
                         ConfigError::value(
-                            "RACER_SEND_CRC_PAIR",
+                            "RACER_SEND_TAG_PAIR",
                             value,
                             "must be two different canonical node UUIDs, sender,receiver",
                         )
@@ -2073,13 +2073,13 @@ mod tests {
     }
 
     #[test]
-    fn send_crc_pair_is_opt_in_and_validated() {
-        assert!(parse(&[]).unwrap().send_crc_pair.is_none());
+    fn send_tag_pair_is_opt_in_and_validated() {
+        assert!(parse(&[]).unwrap().send_tag_pair.is_none());
         let valid = "8816d91d-e896-49bf-ba8a-da97ede93818,11111111-1111-4111-8111-111111111111";
         assert!(
-            parse(&[("RACER_SEND_CRC_PAIR", valid)])
+            parse(&[("RACER_SEND_TAG_PAIR", valid)])
                 .unwrap()
-                .send_crc_pair
+                .send_tag_pair
                 .is_some()
         );
         for invalid in [
@@ -2088,7 +2088,7 @@ mod tests {
             "a,b,c",
             "8816d91d-e896-49bf-ba8a-da97ede93818,8816d91d-e896-49bf-ba8a-da97ede93818",
         ] {
-            assert!(parse(&[("RACER_SEND_CRC_PAIR", invalid)]).is_err());
+            assert!(parse(&[("RACER_SEND_TAG_PAIR", invalid)]).is_err());
         }
     }
 

@@ -768,11 +768,11 @@ const BASE: &[Var] = &[
         "Serve CPU profiles on the diagnostics listener.",
     ),
     var(
-        "RACER_SEND_CRC_PAIR",
+        "RACER_SEND_TAG_PAIR",
         Group::Diagnostics,
         text(TextKind::Other),
         Unset("off"),
-        "`sender,receiver` node UUIDs whose peer sends are checksummed for diagnosis.",
+        "`sender,receiver` node UUIDs whose peer sends get a sampled AEAD tag check for diagnosis.",
     ),
     // Cluster control. Managed deployments set these from the Pod spec.
     control(var(

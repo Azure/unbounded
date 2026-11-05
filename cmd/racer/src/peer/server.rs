@@ -52,7 +52,7 @@ pub(crate) struct Settings {
 pub struct PeerServer {
     tcp_nodelay: bool,
     metrics: crate::telemetry::Metrics,
-    send_crc: Option<(
+    send_tag: Option<(
         crate::telemetry::Pair,
         crate::telemetry::Samples,
         Rc<crate::security::PageCrypto>,
@@ -128,13 +128,13 @@ impl PeerServer {
         self.metrics = metrics;
         self
     }
-    pub(crate) fn with_send_crc(
+    pub(crate) fn with_send_tag(
         mut self,
         pair: Option<crate::telemetry::Pair>,
         samples: crate::telemetry::Samples,
         crypto: Rc<crate::security::PageCrypto>,
     ) -> Self {
-        self.send_crc = pair.map(|pair| (pair, samples, crypto));
+        self.send_tag = pair.map(|pair| (pair, samples, crypto));
         self
     }
     fn begin_send_sample(
@@ -143,7 +143,7 @@ impl PeerServer {
         response: &SignedResponse,
         scope: &RequestScope,
     ) -> Option<crate::telemetry::Ticket> {
-        let (pair, samples, crypto) = self.send_crc.as_ref()?;
+        let (pair, samples, crypto) = self.send_tag.as_ref()?;
         let ciphertext = match &response.response {
             PeerResponse::Page { ciphertext, .. }
             | PeerResponse::Selected { ciphertext, .. }
@@ -346,7 +346,7 @@ impl PeerServer {
             subscriptions,
             metrics: crate::telemetry::Metrics::default(),
             tcp_nodelay: settings.tcp_nodelay,
-            send_crc: None,
+            send_tag: None,
             placement: crate::topology::Placement::new(64),
             opaque_relay: settings.opaque_relay,
             pipes,

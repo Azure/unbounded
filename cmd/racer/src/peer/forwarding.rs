@@ -1059,7 +1059,6 @@ mod tests {
         crate::memory::CiphertextPage {
             provenance: None,
             inner: Arc::new(crate::memory::CiphertextBytes {
-                checksum: std::sync::OnceLock::new(),
                 envelope,
                 storage: flow_control::ChargedBytes {
                     bytes: vec![0; length],

@@ -791,7 +791,6 @@ mod safety {
                         "no publishable plaintext"
                     );
                     assert_eq!(metrics.count(Event::CryptoDecryptAeadRejected), 1);
-                    assert_eq!(metrics.count(Event::CryptoDecryptCrcRejected), 0);
                 } else {
                     let clear = clear?;
                     assert!(clear.bytes().iter().all(|b| *b == 31));
@@ -944,7 +943,7 @@ fn page_bodies_count_toward_the_hot_page_shed_on_every_transport() {
 }
 
 #[test]
-fn send_crc_http_success_failure_drop_do_not_wait_for_crypto() {
+fn send_tag_http_success_failure_drop_do_not_wait_for_crypto() {
     use crate::security::CryptoClient;
     use crate::security::PageCrypto;
     use crate::security::pair;
@@ -965,7 +964,7 @@ fn send_crc_http_success_failure_drop_do_not_wait_for_crypto() {
             Rc::new(CryptoClient::new(io)),
         ));
         let samples = Samples::default();
-        let server = f.server.with_send_crc(
+        let server = f.server.with_send_tag(
             Some(Pair {
                 sender: NodeId(B.into()),
                 receiver: NodeId(A.into()),

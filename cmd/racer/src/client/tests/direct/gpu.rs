@@ -656,20 +656,16 @@ fn gpu_read_tampered_disk_ciphertext_fails_and_drops_the_record() {
     assert_idle(&fixture, &helper, default_slots());
 }
 
-/// Replace the retained ciphertext of page 0 with tampered bytes, keeping
-/// the original CRC (`keep_crc`) or the CRC of the tampered bytes.
-fn tamper_retained(fixture: &Fixture, keep_crc: bool) {
+/// Replace the retained ciphertext of page 0 with tampered bytes, flipping a
+/// bit in the stored tag (`in_tag`) or in the ciphertext body.
+fn tamper_retained(fixture: &Fixture, in_tag: bool) {
     use crate::memory::CiphertextBytes;
     use crate::memory::CiphertextPage;
     let memory = worker(fixture).memory();
     let copy = memory.unverified(&page_id(0)).unwrap().unwrap().copy;
     let mut bytes = copy.ciphertext.bytes().to_vec();
-    bytes[3] ^= 0x40;
-    let crc = if keep_crc {
-        copy.ciphertext.checksum()
-    } else {
-        racer_crypto::crc64(&bytes)
-    };
+    let index = if in_tag { bytes.len() - 1 } else { 3 };
+    bytes[index] ^= 0x40;
     let reservation = fixture
         .listeners
         .admission
@@ -682,7 +678,6 @@ fn tamper_retained(fixture: &Fixture, keep_crc: bool) {
     let tampered = CiphertextPage {
         provenance: None,
         inner: Arc::new(CiphertextBytes {
-            checksum: std::sync::OnceLock::from(crc),
             envelope: copy.ciphertext.envelope().clone(),
             storage: flow_control::ChargedBytes { bytes, reservation }.into(),
         }),
@@ -700,12 +695,12 @@ fn tamper_retained(fixture: &Fixture, keep_crc: bool) {
 }
 
 #[test]
-fn gpu_read_crc_and_tag_mismatches_fail_without_writing() {
-    for keep_crc in [true, false] {
+fn gpu_read_body_and_tag_tampering_fail_without_writing() {
+    for in_tag in [false, true] {
         let helper = start(GpuMode::Required, 1).unwrap();
         let fixture = gpu_fixture(body(5000), &helper);
         arrange(&fixture, &helper, 1, 5000, true, false);
-        tamper_retained(&fixture, keep_crc);
+        tamper_retained(&fixture, in_tag);
         let mark = trace_len(&helper);
         let (head, frames, allocation, size) = gpu_read(&fixture, &helper, Some((0, 9)), 10);
         assert!(head.starts_with("http/1.1 200"), "{head}");

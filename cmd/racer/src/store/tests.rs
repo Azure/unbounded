@@ -35,7 +35,7 @@ use std::task::Poll;
 use std::time::Duration;
 use std::time::Instant;
 
-/// End of the real (unpadded) v2 header, including its digest.
+/// End of the real (unpadded) current header, including its digest.
 fn real_header_end(bytes: &[u8]) -> usize {
     16 + super::header_fields_len(&mut super::Decoder(&bytes[16..])).unwrap()
         + super::HEADER_DIGEST_BYTES
@@ -1495,10 +1495,7 @@ impl Fixture {
             .aligned_ciphertext(reservation, length + 16)
             .unwrap();
         buffer.as_mut_slice().fill(number);
-        let ciphertext = self
-            .pool
-            .aligned_ciphertext_page(buffer, envelope, None)
-            .unwrap();
+        let ciphertext = self.pool.aligned_ciphertext_page(buffer, envelope).unwrap();
         CiphertextCopy {
             metadata: owned.metadata,
             ciphertext,
@@ -2661,7 +2658,7 @@ fn other_format_version_and_unknown_cipher_records_are_cache_misses() {
 }
 
 #[test]
-fn stored_payload_and_tag_corruption_fail_mandatory_checksum() {
+fn stored_payload_and_tag_corruption_reach_the_reader_for_tag_check() {
     let f = Fixture::new();
     let _ = futures::executor::block_on(f.store.open()).unwrap();
     f.reactor.init().unwrap();
@@ -2701,7 +2698,6 @@ fn stored_payload_and_tag_corruption_fail_mandatory_checksum() {
         .unwrap();
         let parsed = super::parse(&stored, location.extent).unwrap();
         assert_eq!(parsed.header.format_version, super::FORMAT_VERSION);
-        assert_eq!(parsed.checksum, page.ciphertext.checksum());
         let offset = if corrupt_tag {
             parsed.ciphertext.end - 1
         } else {
@@ -2720,10 +2716,13 @@ fn stored_payload_and_tag_corruption_fail_mandatory_checksum() {
         let (read, token) = drive(&f.reactor, f.store.reader.read_with_token(&id, &request))
             .unwrap()
             .unwrap();
-        // The I/O worker carries the stored expectation; crypto-worker validation
-        // rejects corruption before AEAD can publish plaintext.
-        assert_eq!(read.ciphertext.checksum(), page.ciphertext.checksum());
-        assert_eq!(read.ciphertext.verify_checksum(), Err(Error::CorruptRecord));
+        // The store returns the corrupt bytes unchanged; the crypto worker's
+        // tag check at the fill boundary rejects them before AEAD can publish
+        // plaintext.
+        let index = offset - parsed.ciphertext.start;
+        let mut expected = page.ciphertext.bytes().to_vec();
+        expected[index] ^= 1;
+        assert_eq!(read.ciphertext.bytes(), &expected[..]);
         f.store.reader.invalidate(&token).unwrap();
         assert!(f.store.writer.index().lookup(&id).unwrap().is_none());
     }
@@ -3519,7 +3518,6 @@ mod records {
             ciphertext: CiphertextPage {
                 provenance: None,
                 inner: Arc::new(CiphertextBytes {
-                    checksum: std::sync::OnceLock::new(),
                     envelope: PageEnvelope {
                         cipher: crate::model::PageCipher::Xaes256Gcm,
                         page: PageId {
@@ -3566,38 +3564,38 @@ mod records {
             .collect()
     }
 
-    // Little-endian v2 record header for `page(3, 0, "cache", "v1")` at
+    // Little-endian v3 record header for `page(3, 0, "cache", "v1")` at
     // generation 7, including the header digest. The header is zero padded to
     // 512 bytes, the ciphertext follows at offset 512, and bytes past the
     // ciphertext are zero padding.
     const GOLDEN_HEADER: &str = concat!(
-        "5243525041474531020000000002000007000000000000000300000000000000",
+        "5243525041474531030000000002000007000000000000000300000000000000",
         "0000000000000000030000001300000001010101010101010101010101010101",
         "0202020202020202020202020202020202020202020202020303030303030303",
         "0303030303030303030303030303030303030303030303030500000004000000",
-        "6361636865227631227853ecbd5e15ca0c0000000001000000f2ba12dc70a195",
-        "6526e93ce78625d77fac702d18ab8439512812f098a7e14afa",
+        "6361636865227631220000000001000000efd2fa324e302a5dcfbbd673b1bf42",
+        "a3409a8a1263ed59340f6b05e5cb2104c4",
     );
     const GOLDEN_CIPHERTEXT: &str = "02020202020202020202020202020202020202";
 
     #[test]
     fn current_wire_bytes_and_reused_padding_across_page_and_alignment_boundaries() {
         let admission = admission();
-        // Normal header is 185 bytes, plus a 16-byte tag. Straddle both units.
+        // Normal header is 177 bytes, plus a 16-byte tag. Straddle both units.
         for (length, number, maximum, geometry, offset) in [
             (1, 0, false, (512, 512, 512), 0),
-            (310, 0, false, (512, 512, 512), 512),
-            (311, 0, false, (512, 512, 512), 1024),
-            (312, 0, false, (512, 512, 512), 512),
-            (314, 0, false, (512, 512, 512), 512),
-            (315, 0, false, (512, 512, 512), 1024),
-            (316, 0, false, (512, 512, 512), 512),
-            (3894, 0, false, (4096, 4096, 4096), 4096),
-            (3895, 0, false, (4096, 4096, 4096), 8192),
-            (3896, 0, false, (4096, 4096, 4096), 4096),
-            (3898, 0, false, (4096, 4096, 4096), 4096),
-            (3899, 0, false, (4096, 4096, 4096), 8192),
-            (3900, 0, false, (4096, 4096, 4096), 4096),
+            (318, 0, false, (512, 512, 512), 512),
+            (319, 0, false, (512, 512, 512), 1024),
+            (320, 0, false, (512, 512, 512), 512),
+            (322, 0, false, (512, 512, 512), 512),
+            (323, 0, false, (512, 512, 512), 1024),
+            (324, 0, false, (512, 512, 512), 512),
+            (3902, 0, false, (4096, 4096, 4096), 4096),
+            (3903, 0, false, (4096, 4096, 4096), 8192),
+            (3904, 0, false, (4096, 4096, 4096), 4096),
+            (3906, 0, false, (4096, 4096, 4096), 4096),
+            (3907, 0, false, (4096, 4096, 4096), 8192),
+            (3908, 0, false, (4096, 4096, 4096), 4096),
             (PAGE_BYTES as usize, 0, false, (4096, 512, 4096), 512),
             (PAGE_BYTES as usize, 1, true, (512, 4096, 512), 4096),
             (3, 2, true, (4096, 512, 4096), 1536),
@@ -3618,7 +3616,7 @@ mod records {
             let logical = logical_length(&page).unwrap();
             assert_eq!(
                 logical,
-                128 + 16 + cache.len() + etag.len() + 2 + 32 + length + 16
+                128 + 8 + cache.len() + etag.len() + 2 + 32 + length + 16
             );
             let record = record_length(&page, alignment).unwrap();
             let extent = alignment.extent(offset, record).unwrap();
@@ -3646,7 +3644,6 @@ mod records {
             // Reuse an actual record, shortening ciphertext into the old payload
             // when possible. This catches stale bytes at the new padding boundary.
             let inner = Arc::get_mut(&mut page.ciphertext.inner).unwrap();
-            inner.checksum.take();
             if length > 1 {
                 inner.envelope.plaintext_length -= 1;
                 inner.envelope.ciphertext_length -= 1;
@@ -3774,7 +3771,7 @@ mod records {
             UNIX_EPOCH + std::time::Duration::from_millis(1),
         ] {
             page.metadata.expires_at = ExpiresAt::from_system_time(expiry).unwrap();
-            assert_eq!(logical_length(&page), Ok(204));
+            assert_eq!(logical_length(&page), Ok(196));
             let encoded = encode(
                 &page,
                 Generation(7),
@@ -3788,12 +3785,6 @@ mod records {
                     .header
                     .metadata,
                 page.metadata.immutable()
-            );
-            assert_eq!(
-                parse(&encoded.buffer, encoded.header.extent)
-                    .unwrap()
-                    .checksum,
-                page.ciphertext.checksum()
             );
             assert_eq!(
                 encode_at(
@@ -3949,7 +3940,6 @@ mod records {
         assert!(bytes[512 + ciphertext.len()..].iter().all(|&b| b == 0));
         let parsed = parse_bytes(bytes, Extent::new(0, 1024).unwrap()).unwrap();
         assert_eq!(parsed.header.format_version, FORMAT_VERSION);
-        assert_eq!(parsed.checksum, page.ciphertext.checksum());
     }
 
     #[test]
@@ -3968,7 +3958,6 @@ mod records {
         let parsed = parse(&encoded.buffer, encoded.header.extent).unwrap();
         assert_eq!(parsed.header.format_version, FORMAT_VERSION);
         assert_eq!(parsed.header.metadata, page.metadata.immutable());
-        assert_eq!(parsed.checksum, page.ciphertext.checksum());
 
         let mut corrupted = encoded.buffer.bytes().unwrap().to_vec();
         let start = corrupted
@@ -3997,11 +3986,9 @@ mod records {
         let original = encoded.buffer.bytes().unwrap();
         assert_eq!(&original[8..12], &FORMAT_VERSION.to_le_bytes());
         let header_len = real_header_end(original);
-        let crc_offset = 128 + "cache".len() + "\"v1\"".len();
-        assert_eq!(
-            &original[crc_offset..crc_offset + 8],
-            &page.ciphertext.checksum().to_le_bytes()
-        );
+        // The content type length follows the cache and ETag bytes.
+        let field_offset = 128 + "cache".len() + "\"v1\"".len();
+        assert_eq!(&original[field_offset..field_offset + 4], &[0; 4]);
         for version in [0, FORMAT_VERSION, FORMAT_VERSION + 1, u32::MAX] {
             let mut bytes = original.to_vec();
             bytes[8..12].copy_from_slice(&version.to_le_bytes());
@@ -4009,7 +3996,7 @@ mod records {
             bytes[header_len - 32..header_len].copy_from_slice(&digest);
             let parsed = parse_bytes(&bytes, encoded.header.extent);
             if version == FORMAT_VERSION {
-                assert_eq!(parsed.unwrap().checksum, page.ciphertext.checksum());
+                assert_eq!(parsed.unwrap().header.envelope, *page.ciphertext.envelope());
             } else {
                 assert!(
                     matches!(parsed, Err(Error::CorruptRecord)),
@@ -4018,30 +4005,30 @@ mod records {
             }
         }
 
-        // A current-version header cannot omit the mandatory checksum even if
+        // A current-version header cannot omit a mandatory field even if
         // the framing hash and lengths have been recomputed by the producer.
-        let mut missing_crc = original.to_vec();
-        missing_crc.drain(crc_offset..crc_offset + 8);
-        missing_crc.splice(header_len - 8..header_len - 8, [0; 8]);
-        let shorter_header = header_len - 8;
-        let digest = Sha256::digest(&missing_crc[..shorter_header - 32]);
-        missing_crc[shorter_header - 32..shorter_header].copy_from_slice(&digest);
+        let mut missing_field = original.to_vec();
+        missing_field.drain(field_offset..field_offset + 4);
+        missing_field.splice(header_len - 4..header_len - 4, [0; 4]);
+        let shorter_header = header_len - 4;
+        let digest = Sha256::digest(&missing_field[..shorter_header - 32]);
+        missing_field[shorter_header - 32..shorter_header].copy_from_slice(&digest);
         assert!(matches!(
-            parse_bytes(&missing_crc, encoded.header.extent),
+            parse_bytes(&missing_field, encoded.header.extent),
             Err(Error::CorruptRecord)
         ));
 
-        let mut damaged_crc = original.to_vec();
-        damaged_crc[crc_offset] ^= 1;
+        let mut damaged_field = original.to_vec();
+        damaged_field[field_offset] ^= 1;
         assert!(matches!(
-            parse_bytes(&damaged_crc, encoded.header.extent),
+            parse_bytes(&damaged_field, encoded.header.extent),
             Err(Error::CorruptRecord)
         ));
     }
 
     /// Encode `page(3, 0, "cache", etag)` with a 512-byte record unit, the
     /// densest layout readers accept.
-    fn encoded_v2(
+    fn encoded_current(
         admission: &flow_control::Quotas<AdmissionPolicy>,
         etag: &str,
     ) -> (Vec<u8>, Extent) {
@@ -4062,13 +4049,13 @@ mod records {
     }
 
     #[test]
-    fn v2_ciphertext_starts_at_aligned_header_block_across_boundaries() {
+    fn ciphertext_starts_at_aligned_header_block_across_boundaries() {
         let admission = admission();
-        // The real header is 183 bytes plus the ETag length for "cache" IDs.
+        // The real header is 175 bytes plus the ETag length for "cache" IDs.
         for unit in [512, 4096] {
             let alignment = Alignment::new(unit, unit as u64, unit).unwrap();
             for real in [512 - 1, 512, 512 + 1, 4096 - 1, 4096, 4096 + 1] {
-                let etag = "x".repeat(real - 183);
+                let etag = "x".repeat(real - 175);
                 for content_type in [None, Some("text/plain")] {
                     let mut page = page(&admission, 3, 0, "cache", &etag);
                     page.metadata.content_type = content_type
@@ -4113,9 +4100,9 @@ mod records {
     }
 
     #[test]
-    fn v2_rejects_nonzero_padding_and_bad_header_lengths() {
+    fn current_rejects_nonzero_padding_and_bad_header_lengths() {
         let admission = admission();
-        let (original, extent) = encoded_v2(&admission, "v1");
+        let (original, extent) = encoded_current(&admission, "v1");
         let real = real_header_end(&original);
         assert!(parse_bytes(&original, extent).is_ok());
 
@@ -4160,7 +4147,7 @@ mod records {
     #[test]
     fn v1_layout_record_is_rejected() {
         let admission = admission();
-        let (original, extent) = encoded_v2(&admission, "v1");
+        let (original, extent) = encoded_current(&admission, "v1");
         let real = real_header_end(&original);
         // Rebuild the v1 layout: unpadded header, ciphertext right after it.
         let mut bytes = vec![0; extent.length()];
@@ -4215,7 +4202,7 @@ mod records {
         }
         // Records written with a 512-byte header block still parse, but must
         // be read through host memory.
-        let (bytes, extent) = encoded_v2(&admission, "v1");
+        let (bytes, extent) = encoded_current(&admission, "v1");
         let old = parse_bytes(&bytes, extent).unwrap();
         assert_eq!(old.ciphertext, 512..512 + 19);
         assert_eq!(old.direct_range(), None);

@@ -32,7 +32,8 @@ pub(crate) struct AeadFailure {
     pub plaintext: u32,
     pub ciphertext: u32,
     pub aad: [u8; 32],
-    pub crc: Option<u64>,
+    /// The stored AEAD tag (last 16 ciphertext bytes); fingerprints the copy.
+    pub tag: [u8; 16],
 }
 impl AeadFailure {
     pub(crate) fn write_fields(&self, out: &mut impl std::fmt::Write) -> std::fmt::Result {
@@ -60,10 +61,8 @@ impl AeadFailure {
         hex(out, &self.nonce)?;
         write!(out, " lengths={}/{} aad=", self.plaintext, self.ciphertext)?;
         hex(out, &self.aad)?;
-        match self.crc {
-            Some(crc) => write!(out, " crc={crc:016x}"),
-            None => write!(out, " crc=none"),
-        }
+        write!(out, " tag=")?;
+        hex(out, &self.tag)
     }
 }
 
@@ -87,21 +86,19 @@ pub(crate) enum DecryptReason {
     InvalidConfiguration,
     InvalidRequest,
     Overloaded,
-    CorruptCrc,
     CorruptAead,
     CorruptUnclassified,
     Other,
 }
 impl DecryptReason {
     #[cfg(test)]
-    pub(crate) const ALL: [Self; 10] = [
+    pub(crate) const ALL: [Self; 9] = [
         Self::Cancelled,
         Self::DeadlineExceeded,
         Self::MissingKey,
         Self::InvalidConfiguration,
         Self::InvalidRequest,
         Self::Overloaded,
-        Self::CorruptCrc,
         Self::CorruptAead,
         Self::CorruptUnclassified,
         Self::Other,
@@ -119,7 +116,6 @@ impl DecryptReason {
             Error::InvalidRequest => Self::InvalidRequest,
             Error::Overloaded => Self::Overloaded,
             Error::CorruptRecord => match rejection {
-                Some(IntegrityRejection::Crc) => Self::CorruptCrc,
                 Some(IntegrityRejection::Aead) => Self::CorruptAead,
                 None => Self::CorruptUnclassified,
             },
@@ -134,7 +130,6 @@ impl DecryptReason {
             Self::InvalidConfiguration => Event::CryptoDecryptFailureInvalidConfiguration,
             Self::InvalidRequest => Event::CryptoDecryptFailureInvalidRequest,
             Self::Overloaded => Event::CryptoDecryptFailureOverloaded,
-            Self::CorruptCrc => Event::CryptoDecryptFailureCorruptCrc,
             Self::CorruptAead => Event::CryptoDecryptFailureCorruptAead,
             Self::CorruptUnclassified => Event::CryptoDecryptFailureCorruptUnclassified,
             Self::Other => Event::CryptoDecryptFailureOther,
@@ -148,7 +143,6 @@ impl DecryptReason {
             Self::InvalidConfiguration => "invalid_configuration",
             Self::InvalidRequest => "invalid_request",
             Self::Overloaded => "overloaded",
-            Self::CorruptCrc => "corrupt_crc",
             Self::CorruptAead => "corrupt_aead",
             Self::CorruptUnclassified => "corrupt_unclassified",
             Self::Other => "other",
@@ -1478,7 +1472,7 @@ pub(crate) fn test_aead_failure() -> AeadFailure {
         plaintext: u32::MAX,
         ciphertext: u32::MAX,
         aad: [255; 32],
-        crc: Some(u64::MAX),
+        tag: [255; 16],
     }
 }
 
@@ -1491,7 +1485,7 @@ mod tests {
 
         #[test]
         fn decrypt_failure_classification_is_fixed_and_preserves_unknown_causes() {
-            use crate::security::IntegrityRejection::{Aead, Crc};
+            use crate::security::IntegrityRejection::Aead;
             // Classification only: this does not exercise the allocator failure path.
             let cases = [
                 (Error::Cancelled, None, "cancelled"),
@@ -1500,7 +1494,6 @@ mod tests {
                 (Error::InvalidConfiguration, None, "invalid_configuration"),
                 (Error::InvalidRequest, None, "invalid_request"),
                 (Error::Overloaded, None, "overloaded"),
-                (Error::CorruptRecord, Some(Crc), "corrupt_crc"),
                 (Error::CorruptRecord, Some(Aead), "corrupt_aead"),
                 (Error::CorruptRecord, None, "corrupt_unclassified"),
                 (Error::Os(-123), None, "other"),
@@ -1645,7 +1638,6 @@ mod tests {
             };
             let mut aead = test_aead_failure();
             aead.peer = None;
-            aead.crc = None;
             observer.record_aead(id, aead);
             struct Unlocked<'a> {
                 failures: &'a Failures,
@@ -1673,12 +1665,13 @@ mod tests {
             assert_eq!(
                 out.text,
                 format!(
-                    "total=1 retained=1 overwritten=0 capacity=64\nseq=1 w=3 crypto=4:5 ms=18446744073709551615 request={} acquisition=none attempt=none supplier=none remote=none page={} number=18446744073709551615 key={} nonce={} lengths=4294967295/4294967295 aad={} crc=none\n",
+                    "total=1 retained=1 overwritten=0 capacity=64\nseq=1 w=3 crypto=4:5 ms=18446744073709551615 request={} acquisition=none attempt=none supplier=none remote=none page={} number=18446744073709551615 key={} nonce={} lengths=4294967295/4294967295 aad={} tag={}\n",
                     "ff".repeat(16),
                     "ff".repeat(32),
                     "ff".repeat(16),
                     "ff".repeat(24),
                     "ff".repeat(32),
+                    "ff".repeat(16),
                 )
             );
         }

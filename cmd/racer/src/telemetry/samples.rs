@@ -1,7 +1,7 @@
 use super::*;
 
-pub const SEND_CRC_CAPACITY: usize = 64;
-const SEND_CRC_LIMITS: SampleLimits = SampleLimits {
+pub const SEND_TAG_CAPACITY: usize = 64;
+const SEND_TAG_LIMITS: SampleLimits = SampleLimits {
     total: 240,
     duration: Duration::from_secs(120),
     interval: Duration::from_millis(500),
@@ -33,12 +33,12 @@ impl Pair {
 }
 /// Racer's selected sender/receiver sampling policy and diagnostic records.
 #[derive(Clone)]
-pub struct Samples(::telemetry::Sampler<Sample, SEND_CRC_CAPACITY>);
+pub struct Samples(::telemetry::Sampler<Sample, SEND_TAG_CAPACITY>);
 
 impl Default for Samples {
     /// Apply Racer's fixed send-checksum sample limits.
     fn default() -> Self {
-        Self(::telemetry::Sampler::new(SEND_CRC_LIMITS))
+        Self(::telemetry::Sampler::new(SEND_TAG_LIMITS))
     }
 }
 struct Sample {
@@ -58,11 +58,9 @@ pub(crate) struct Ticket(Arc<Sample>);
 pub(crate) struct Work {
     sample: Arc<Sample>,
 
-    _lease: ::telemetry::SampleLease<Sample, SEND_CRC_CAPACITY>,
+    _lease: ::telemetry::SampleLease<Sample, SEND_TAG_CAPACITY>,
 
     pub facts: Option<AeadFailure>,
-
-    pub cached: bool,
 }
 impl Samples {
     #[cfg(test)]
@@ -72,10 +70,10 @@ impl Samples {
         )
         .unwrap();
         let now = environment::now();
-        for i in 0..SEND_CRC_CAPACITY {
+        for i in 0..SEND_TAG_CAPACITY {
             let (ticket, mut work) = self
                 .begin_at(&pair, &pair.sender, &pair.receiver, || {
-                    now + SEND_CRC_LIMITS.interval * i as u32
+                    now + SEND_TAG_LIMITS.interval * i as u32
                 })
                 .unwrap();
             work.facts = Some(crate::telemetry::test_aead_failure());
@@ -126,7 +124,6 @@ impl Samples {
                 sample,
                 _lease: lease,
                 facts: None,
-                cached: false,
             },
         ))
     }
@@ -140,10 +137,10 @@ impl Samples {
         } = counts;
         writeln!(
             out,
-            "eligible={eligible} sampled={sampled} skipped={skipped} busy={} retained={} overwritten={} capacity={SEND_CRC_CAPACITY}",
+            "eligible={eligible} sampled={sampled} skipped={skipped} busy={} retained={} overwritten={} capacity={SEND_TAG_CAPACITY}",
             u8::from(busy),
-            sampled.min(SEND_CRC_CAPACITY as u64),
-            sampled.saturating_sub(SEND_CRC_CAPACITY as u64)
+            sampled.min(SEND_TAG_CAPACITY as u64),
+            sampled.saturating_sub(SEND_TAG_CAPACITY as u64)
         )?;
         for (_, sample) in entries.iter_refs() {
             let data = sample.data.lock().unwrap_or_else(|e| e.into_inner());
@@ -198,12 +195,10 @@ impl Work {
         let mut data = self.sample.data.lock().unwrap_or_else(|e| e.into_inner());
         data.facts = self.facts;
         data.error = error;
-        data.status = if error.is_some() {
-            "unavailable"
-        } else if self.cached {
-            "cached"
-        } else {
-            "computed"
+        data.status = match error {
+            None => "verified",
+            Some(Error::CorruptRecord) => "mismatch",
+            Some(_) => "unavailable",
         };
     }
 }
@@ -221,8 +216,8 @@ impl Drop for Work {
 // Bounded internal failures, exported separately from low-cardinality metrics.
 // Only typed errors, correlation IDs, and numeric progress/resource facts enter
 // this ring. Object keys, ETags, headers, credentials, and payloads never enter it.
-// A separate 64-entry AEAD ring survives transient admission floods. Its CRC is
-// a receiver-side fingerprint, not proof of equality with sender bytes. Page/AAD
+// A separate 64-entry AEAD ring survives transient admission floods. Its stored
+// tag is a receiver-side fingerprint, not proof of equality with sender bytes. Page/AAD
 // hashes are pseudonyms (known inputs can be guessed), never authentication.
 // Supplier is the original response signer; remote is the last reverse signer,
 // not a TCP address. Acquisition IDs can differ from the decrypt request after
@@ -232,14 +227,14 @@ impl Drop for Work {
 mod tests {
     use super::*;
 
-    pub(crate) mod send_crc_tests {
+    pub(crate) mod send_tag_tests {
         use super::*;
         fn pair() -> Pair {
             Pair::parse("8816d91d-e896-49bf-ba8a-da97ede93818,11111111-1111-4111-8111-111111111111")
                 .unwrap()
         }
         #[test]
-        fn send_crc_pair_and_shared_owner_bounds() {
+        fn send_tag_pair_and_shared_owner_bounds() {
             let clock = environment::SimulationClock::new(72);
             let _env = clock.environment(0).enter();
             let _strict = environment::require_simulated();
@@ -316,7 +311,7 @@ mod tests {
             );
         }
         #[test]
-        fn send_crc_ineligible_pairs_do_not_start_the_sampling_window() {
+        fn send_tag_ineligible_pairs_do_not_start_the_sampling_window() {
             let clock = environment::SimulationClock::new(76);
             let _env = clock.environment(0).enter();
             let _strict = environment::require_simulated();
@@ -351,7 +346,7 @@ mod tests {
             assert!(text.contains("status=unavailable error=Some(Io)"));
         }
         #[test]
-        fn send_crc_interval_accepts_exactly_500ms() {
+        fn send_tag_interval_accepts_exactly_500ms() {
             let clock = environment::SimulationClock::new(73);
             let _env = clock.environment(0).enter();
             let _strict = environment::require_simulated();
@@ -396,7 +391,7 @@ mod tests {
         }
 
         #[test]
-        fn send_crc_ticket_and_snapshot_survive_retention_overwrite() {
+        fn send_tag_ticket_and_snapshot_survive_retention_overwrite() {
             let clock = environment::SimulationClock::new(74);
             let _env = clock.environment(0).enter();
             let _strict = environment::require_simulated();
@@ -414,7 +409,7 @@ mod tests {
             work.finish(None);
             drop(work);
             let snapshot = samples.0.snapshot().0;
-            for _ in 0..SEND_CRC_CAPACITY {
+            for _ in 0..SEND_TAG_CAPACITY {
                 clock.advance(Duration::from_millis(500));
                 let (next, work) = samples
                     .begin(
@@ -432,7 +427,7 @@ mod tests {
             assert!(before.starts_with(
                 "eligible=65 sampled=65 skipped=0 busy=0 retained=64 overwritten=1 capacity=64\nseq=2 "
             ));
-            assert_eq!(before.lines().count(), SEND_CRC_CAPACITY + 1);
+            assert_eq!(before.lines().count(), SEND_TAG_CAPACITY + 1);
             ticket.finish(false);
             let mut after = String::new();
             samples.write(&mut after).unwrap();
@@ -453,7 +448,7 @@ mod tests {
         }
 
         #[test]
-        fn send_crc_ring_is_bounded_and_preserves_send_outcomes() {
+        fn send_tag_ring_is_bounded_and_preserves_send_outcomes() {
             let clock = environment::SimulationClock::new(75);
             let _env = clock.environment(0).enter();
             let _strict = environment::require_simulated();
@@ -487,7 +482,7 @@ mod tests {
             );
             let mut text = String::new();
             samples.write(&mut text).unwrap();
-            assert_eq!(text.lines().count(), SEND_CRC_CAPACITY + 1);
+            assert_eq!(text.lines().count(), SEND_TAG_CAPACITY + 1);
             assert!(text.contains("overwritten=176 capacity=64\nseq=177 "));
             assert!(text.contains("send=completed"));
             assert!(text.contains("send=failed"));

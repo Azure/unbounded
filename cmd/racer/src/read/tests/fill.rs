@@ -4804,7 +4804,7 @@ fn copy_only_rejects_disk_payload_and_tag_corruption_before_retention() {
 }
 
 #[test]
-fn disk_crc_validation_preserves_replacement_and_intact_acquire() {
+fn disk_tag_validation_preserves_replacement_and_intact_acquire() {
     let queue = Rc::new(uring_runtime::drivers::DriverQueue::new(1024));
     let _owner = queue.enter();
     let mut f = cold_disk_fixture();
@@ -4821,10 +4821,13 @@ fn disk_crc_validation_preserves_replacement_and_intact_acquire() {
     .unwrap()
     .unwrap();
     // Hold an old read across a same-page replacement publication.
-    // Corrupt the expected checksum without exposing mutable frozen slab bytes.
-    let checksum = stale.ciphertext.checksum();
-    Arc::get_mut(&mut stale.ciphertext.inner).unwrap().checksum =
-        std::sync::OnceLock::from(checksum ^ 1);
+    // Change the nonce, and so the AAD, so the stored tag no longer verifies,
+    // without exposing mutable frozen slab bytes.
+    Arc::get_mut(&mut stale.ciphertext.inner)
+        .unwrap()
+        .envelope
+        .nonce
+        .0[0] ^= 1;
     let writer = &f.fill.dependencies.writer;
     let old = writer.index().lookup(&f.page).unwrap().unwrap().location;
     // Enqueue now deduplicates resident pages. Model the invalidation that
@@ -4870,7 +4873,17 @@ fn disk_crc_validation_preserves_replacement_and_intact_acquire() {
         &f.crypto,
     )
     .unwrap();
-    assert_eq!(intact.ciphertext.verify_checksum(), Ok(()));
+    assert_eq!(
+        drive(
+            f.fill
+                .dependencies
+                .crypto
+                .verify_tag(intact.ciphertext.clone(), &f.scope),
+            &mut f.engine,
+            &f.crypto
+        ),
+        Ok(())
+    );
     assert_eq!(f.fill.metrics.count(Event::PageDecrypt), 0);
     assert_eq!(f.origin.calls.get(), 0);
     assert!(

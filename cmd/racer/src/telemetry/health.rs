@@ -74,9 +74,9 @@ impl Health {
     }
 }
 
-// Opt-in HTTP send fingerprints, never authentication or payload scans on I/O.
+// Opt-in HTTP send tag checks, run on crypto, never payload scans on I/O.
 // Shared limits: one active owner, two samples/second, 240 total, 120 seconds.
-// Cached CRCs are reused. Pending/unavailable samples do not prove agreement.
+// Pending/unavailable samples do not prove agreement.
 
 #[cfg(test)]
 mod tests {

@@ -141,7 +141,7 @@ fn stage_events(stage: DriverStage) -> Option<(Event, Event)> {
         DriverStage::DiskReadCall => Some((Event::FillDiskReadCount, Event::FillDiskReadNs)),
         DriverStage::OriginCall => Some((Event::FillOriginCount, Event::FillOriginNs)),
         DriverStage::EncryptCall => Some((Event::FillEncryptCount, Event::FillEncryptNs)),
-        DriverStage::ChecksumCall => Some((Event::FillChecksumCount, Event::FillChecksumNs)),
+        DriverStage::TagCheckCall => Some((Event::FillTagCheckCount, Event::FillTagCheckNs)),
         DriverStage::Starting
         | DriverStage::BetweenCalls
         | DriverStage::CandidateCompositeCall
@@ -2137,7 +2137,7 @@ impl Fill {
             if !want_plaintext && let Some(token) = &token {
                 match self
                     .call(
-                        DriverStage::ChecksumCall,
+                        DriverStage::TagCheckCall,
                         self.validate_disk_copy(&copy, page, token, scope),
                     )
                     .await
@@ -2238,7 +2238,7 @@ impl Fill {
             Ok(()) => {
                 self.dependencies
                     .crypto
-                    .verify_checksum(copy.ciphertext.clone(), scope)
+                    .verify_tag(copy.ciphertext.clone(), scope)
                     .await
             }
             Err(error) => Err(error),

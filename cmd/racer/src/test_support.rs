@@ -287,7 +287,7 @@ pub mod cluster {
         Config {
             spill: Default::default(),
             prefetch: Default::default(),
-            send_crc_pair: None,
+            send_tag_pair: None,
             page_hedge: Default::default(),
             replica_selection: Default::default(),
             peer_admission: Default::default(),

@@ -484,7 +484,7 @@ pub(super) fn get(
         "/debug/failures"
         | "/debug/aead"
         | "/debug/decrypt-failures"
-        | "/debug/send-crc"
+        | "/debug/send-tag"
         | "/debug/terminal"
         | "/debug/gate-events"
         | "/debug/flight-expiry"
@@ -501,8 +501,8 @@ pub(super) fn get(
             Some(state) => state.write(&mut output)?,
             None => output.write_str("unavailable fully_applied=0\n")?,
         }
-    } else if path == "/debug/send-crc" {
-        telemetry.send_crc.write(&mut output)?;
+    } else if path == "/debug/send-tag" {
+        telemetry.send_tag.write(&mut output)?;
     } else if path == "/debug/aead" {
         telemetry.failures.write_aead(&mut output)?;
     } else if path == "/debug/decrypt-failures" {
@@ -1561,14 +1561,14 @@ mod tests {
         }
 
         #[test]
-        fn send_crc_endpoint_is_empty_when_disabled_and_does_not_echo_headers() {
+        fn send_tag_endpoint_is_empty_when_disabled_and_does_not_echo_headers() {
             let telemetry = Telemetry::default();
-            let text = diagnostic_text(&telemetry, "/debug/send-crc");
+            let text = diagnostic_text(&telemetry, "/debug/send-tag");
             assert!(text.contains("sampled=0"));
             assert!(!text.contains("synthetic"));
-            telemetry.send_crc.fill_test_ring();
-            let text = diagnostic_text(&telemetry, "/debug/send-crc");
-            assert_eq!(text.matches("status=computed").count(), 64);
+            telemetry.send_tag.fill_test_ring();
+            let text = diagnostic_text(&telemetry, "/debug/send-tag");
+            assert_eq!(text.matches("status=verified").count(), 64);
         }
 
         #[test]

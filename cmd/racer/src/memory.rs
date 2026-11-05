@@ -243,10 +243,8 @@ pub struct CiphertextPage {
     pub(crate) inner: Arc<CiphertextBytes>,
     pub(crate) provenance: Option<crate::telemetry::PeerProvenance>,
 }
-/// Ciphertext metadata and checksum cache remain separate from allocation ownership.
+/// Ciphertext metadata remains separate from allocation ownership.
 pub(crate) struct CiphertextBytes {
-    pub checksum: std::sync::OnceLock<u64>,
-
     pub envelope: PageEnvelope,
 
     pub storage: CiphertextStorage,
@@ -486,7 +484,6 @@ impl BufferPool {
         Ok(CiphertextPage {
             provenance: None,
             inner: Arc::new(CiphertextBytes {
-                checksum: std::sync::OnceLock::new(),
                 envelope,
                 storage: flow_control::ChargedBytes { bytes, reservation }.into(),
             }),
@@ -513,7 +510,6 @@ impl BufferPool {
         Ok(CiphertextPage {
             provenance: None,
             inner: Arc::new(CiphertextBytes {
-                checksum: std::sync::OnceLock::new(),
                 envelope,
                 storage: CiphertextStorage::Registered {
                     page,
@@ -599,7 +595,7 @@ impl BufferPool {
         page.rehome(reservation)
     }
     /// Copy `page`'s bytes into a pooled aligned page, preserving its envelope,
-    /// known checksum, and provenance.
+    /// and provenance.
     fn copy_aligned(
         &self,
         page: &CiphertextPage,
@@ -608,8 +604,7 @@ impl BufferPool {
         let length = page.bytes().len();
         let mut buffer = self.aligned_ciphertext(reservation, length)?;
         buffer.as_mut_slice().copy_from_slice(page.bytes());
-        let mut copy =
-            self.aligned_ciphertext_page(buffer, page.envelope().clone(), page.cached_checksum())?;
+        let mut copy = self.aligned_ciphertext_page(buffer, page.envelope().clone())?;
         copy.provenance = page.provenance;
         page.record_copy_out(&copy);
         Ok(copy)
@@ -638,7 +633,6 @@ impl BufferPool {
         Ok(CiphertextPage {
             provenance: None,
             inner: Arc::new(CiphertextBytes {
-                checksum: std::sync::OnceLock::new(),
                 envelope,
                 storage: CiphertextStorage::Slab { buffer, range },
             }),
@@ -650,13 +644,11 @@ impl BufferPool {
     /// Mirrors [`Self::ciphertext`]: the length must equal the envelope's
     /// ciphertext length, and the buffer's charge must be a Ciphertext
     /// reservation from this admission for the page's cache covering the full
-    /// capacity. Freezing zero-fills the pad. A known `checksum` is cached
-    /// eagerly; it must be the CRC-64 of the ciphertext bytes.
+    /// capacity. Freezing zero-fills the pad.
     pub(crate) fn aligned_ciphertext_page(
         &self,
         buffer: CiphertextBuffer,
         envelope: PageEnvelope,
-        checksum: Option<u64>,
     ) -> Result<CiphertextPage> {
         envelope.validate()?;
         let length = buffer.len();
@@ -669,7 +661,7 @@ impl BufferPool {
             buffer.capacity(),
             Some(&envelope.page.version.object.cache),
         )?;
-        Ok(CiphertextPage::from_aligned(buffer, envelope, checksum))
+        Ok(CiphertextPage::from_aligned(buffer, envelope))
     }
     fn entry_limit(&self) -> usize {
         self.admission.policy().limits().metadata_entries.get()
@@ -801,7 +793,6 @@ impl CiphertextPage {
             buffer.as_mut_slice()[..length].copy_from_slice(self.bytes());
             Self {
                 inner: Arc::new(CiphertextBytes {
-                    checksum: self.inner.checksum.clone(),
                     envelope: self.envelope().clone(),
                     storage: CiphertextStorage::Aligned {
                         buffer: AlignedBody(buffer.freeze()?),
@@ -815,7 +806,6 @@ impl CiphertextPage {
             bytes.copy_from_slice(self.bytes());
             Self {
                 inner: Arc::new(CiphertextBytes {
-                    checksum: self.inner.checksum.clone(),
                     envelope: self.envelope().clone(),
                     storage: flow_control::ChargedBytes { bytes, reservation }.into(),
                 }),
@@ -848,18 +838,12 @@ impl CiphertextPage {
         }
     }
     /// Freeze aligned output into a page. Callers have validated the length
-    /// against `envelope` and the buffer's Ciphertext charge; a `checksum`
-    /// must be the CRC-64 of the ciphertext.
-    pub(crate) fn from_aligned(
-        buffer: CiphertextBuffer,
-        envelope: PageEnvelope,
-        checksum: Option<u64>,
-    ) -> Self {
+    /// against `envelope` and the buffer's Ciphertext charge.
+    pub(crate) fn from_aligned(buffer: CiphertextBuffer, envelope: PageEnvelope) -> Self {
         let length = buffer.len();
         Self {
             provenance: None,
             inner: Arc::new(CiphertextBytes {
-                checksum: checksum.map_or_else(std::sync::OnceLock::new, Into::into),
                 envelope,
                 storage: CiphertextStorage::Aligned {
                     buffer: buffer.freeze(),
@@ -867,39 +851,6 @@ impl CiphertextPage {
                 },
             }),
         }
-    }
-    pub fn checksum(&self) -> u64 {
-        *self
-            .inner
-            .checksum
-            .get_or_init(|| racer_crypto::crc64(self.bytes()))
-    }
-    /// Never initializes a checksum or scans bytes on the I/O thread.
-    pub(crate) fn cached_checksum(&self) -> Option<u64> {
-        self.inner.checksum.get().copied()
-    }
-    pub(crate) fn verify_checksum(&self) -> Result<()> {
-        self.verify_computed_checksum(racer_crypto::crc64(self.bytes()))
-    }
-    /// Verify a checksum the caller computed over exactly [`Self::bytes`],
-    /// with the same effect as [`Self::verify_checksum`].
-    pub(crate) fn verify_computed_checksum(&self, actual: u64) -> Result<()> {
-        if self
-            .inner
-            .checksum
-            .get()
-            .is_some_and(|expected| *expected != actual)
-        {
-            return Err(Error::CorruptRecord);
-        }
-        let _ = self.inner.checksum.set(actual);
-        Ok(())
-    }
-    pub(crate) fn expected_checksum(&self, checksum: u64) -> Result<()> {
-        self.inner
-            .checksum
-            .set(checksum)
-            .map_err(|_| Error::CorruptRecord)
     }
     pub fn envelope(&self) -> &PageEnvelope {
         &self.inner.envelope
@@ -3812,7 +3763,7 @@ pub(crate) mod tests {
         }
     }
     #[test]
-    fn slab_ciphertext_keeps_pointer_capacity_checksum_and_rehomes() {
+    fn slab_ciphertext_keeps_pointer_capacity_and_rehomes() {
         for shared in [false, true] {
             let source = admission(8);
             let target = admission(8);
@@ -3838,10 +3789,6 @@ pub(crate) mod tests {
             assert_eq!(page.bytes(), &[7; 19]);
             assert_eq!(page.inner.capacity(), 4096);
             assert_eq!(source.used(ResourceClass::Ciphertext), 4096);
-            page.expected_checksum(racer_crypto::crc64(&[7; 19]))
-                .unwrap();
-            assert_eq!(page.verify_checksum(), Ok(()));
-            let checksum = page.checksum();
             let retained = shared.then(|| page.clone());
             let moved = page
                 .rehome(
@@ -3851,8 +3798,6 @@ pub(crate) mod tests {
                 )
                 .unwrap();
             assert_eq!(moved.bytes().as_ptr() == pointer, !shared);
-            assert_eq!(moved.checksum(), checksum);
-            assert_eq!(moved.verify_checksum(), Ok(()));
             assert!(target.owns(moved.inner.reservation()));
             assert_eq!(
                 source.used(ResourceClass::Ciphertext),
@@ -3860,7 +3805,6 @@ pub(crate) mod tests {
             );
             std::thread::spawn(move || {
                 assert_eq!(moved.bytes(), &[7; 19]);
-                assert_eq!(moved.verify_checksum(), Ok(()));
                 drop(moved);
             })
             .join()
@@ -3872,7 +3816,7 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn slab_ciphertext_rejects_bad_ranges_authority_and_checksum() {
+    fn slab_ciphertext_rejects_bad_ranges_and_authority() {
         let source = admission(8);
         let other = admission(8);
         let fixture = bundle(&source, "slab");
@@ -3933,9 +3877,6 @@ pub(crate) mod tests {
         let page = BufferPool::new(source.clone())
             .slab_ciphertext(buffer, envelope, 4077..4096)
             .unwrap();
-        page.expected_checksum(racer_crypto::crc64(page.bytes()) ^ 1)
-            .unwrap();
-        assert_eq!(page.verify_checksum(), Err(Error::CorruptRecord));
         assert!(matches!(
             page.rehome(
                 other
@@ -3961,8 +3902,8 @@ pub(crate) mod tests {
                 remote: [b'b'; 36],
             };
             page.ciphertext.provenance = Some(provenance);
-            let checksum = page.ciphertext.checksum();
             let pointer = page.ciphertext.bytes().as_ptr();
+            let original = page.ciphertext.bytes().to_vec();
             let retained = shared.then(|| page.ciphertext.clone());
             let reservation = target
                 .reserve(
@@ -3973,7 +3914,7 @@ pub(crate) mod tests {
                 .unwrap();
             let moved = page.ciphertext.rehome(reservation).unwrap();
             assert_eq!(moved.bytes().as_ptr() == pointer, !shared);
-            assert_eq!(moved.checksum(), checksum);
+            assert_eq!(moved.bytes(), &original[..]);
             assert_eq!(moved.provenance, Some(provenance));
             if let Some(retained) = &retained {
                 assert_eq!(retained.provenance, Some(provenance));
@@ -4021,7 +3962,7 @@ pub(crate) mod tests {
         );
         // Length and cache mismatches are rejected and storage returns idle.
         assert!(matches!(
-            pool.aligned_ciphertext_page(fill(length - 1), envelope.clone(), None),
+            pool.aligned_ciphertext_page(fill(length - 1), envelope.clone()),
             Err(Error::CorruptRecord)
         ));
         let wrong = CacheId("wrong".into());
@@ -4030,7 +3971,7 @@ pub(crate) mod tests {
             .unwrap();
         buffer.as_mut_slice().fill(1);
         assert!(matches!(
-            pool.aligned_ciphertext_page(buffer, envelope.clone(), None),
+            pool.aligned_ciphertext_page(buffer, envelope.clone()),
             Err(Error::InvalidConfiguration)
         ));
         assert_eq!(pool.aligned_stats().idle_buffers, 1);
@@ -4044,10 +3985,9 @@ pub(crate) mod tests {
             .as_mut_slice()
             .copy_from_slice(base.ciphertext.bytes());
         let page = pool
-            .aligned_ciphertext_page(buffer, envelope.clone(), Some(7))
+            .aligned_ciphertext_page(buffer, envelope.clone())
             .unwrap();
         assert_eq!(page.bytes(), base.ciphertext.bytes());
-        assert_eq!(page.cached_checksum(), Some(7));
         let body = page.disk_body(alignment).unwrap();
         assert_eq!(body.as_ptr(), page.bytes().as_ptr());
         assert_eq!(body.len(), 4096);
@@ -4178,7 +4118,7 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn aead_fingerprints_reuse_crc_and_separate_body_from_identity() {
+    fn aead_fingerprints_record_stored_tag_and_separate_body_from_identity() {
         use crate::model::RequestId;
         use crate::security::capture_aead_failure;
         let admission = admission(8);
@@ -4191,14 +4131,7 @@ pub(crate) mod tests {
             aad.extend_from_slice(p.envelope().page.version.etag.as_bytes());
             capture_aead_failure(p, &aad, request, 0)
         };
-        assert_eq!(page.ciphertext.cached_checksum(), None);
-        assert_eq!(capture(&page.ciphertext).crc, None);
         assert_eq!(capture(&page.ciphertext).peer, None);
-        assert_eq!(
-            page.ciphertext.cached_checksum(),
-            None,
-            "capture must not hash payload"
-        );
         let provenance = crate::telemetry::PeerProvenance {
             request: RequestId([3; 16]),
             attempt: crate::model::AttemptId([4; 16]),
@@ -4206,8 +4139,6 @@ pub(crate) mod tests {
             remote: [b'b'; 36],
         };
         page.ciphertext.provenance = Some(provenance);
-        page.ciphertext.verify_checksum().unwrap();
-        assert_eq!(page.ciphertext.verify_checksum(), Ok(()));
         let first = capture(&page.ciphertext);
         let repeat = capture(&page.ciphertext);
         // Frozen SHA-256 vectors include the domain, u64 field lengths, exact
@@ -4232,23 +4163,24 @@ pub(crate) mod tests {
         assert_eq!(first.key, page.ciphertext.envelope().key_id.0);
         assert_eq!(first.nonce, [2; 24]);
         assert_eq!((first.plaintext, first.ciphertext), (3, 19));
-        assert_eq!(
-            first.crc,
-            Some(racer_crypto::crc64(page.ciphertext.bytes()))
-        );
+        let stored_tag = |p: &CiphertextPage| {
+            let bytes = p.bytes();
+            <[u8; 16]>::try_from(&bytes[bytes.len() - 16..]).unwrap()
+        };
+        assert_eq!(first.tag, stored_tag(&page.ciphertext));
         assert_eq!(first.page, repeat.page);
         assert_eq!(first.aad, repeat.aad);
-        assert_eq!(first.crc, repeat.crc);
+        assert_eq!(first.tag, repeat.tag);
         let inner = Arc::get_mut(&mut page.ciphertext.inner).unwrap();
+        // A body change before the tag leaves the stored tag fingerprint alone.
         inner.bytes[0] ^= 1;
         assert!(page.validate_metadata().is_ok());
-        assert_eq!(page.ciphertext.verify_checksum(), Err(Error::CorruptRecord));
-        assert_eq!(capture(&page.ciphertext).crc, first.crc);
-        assert_eq!(page.ciphertext.cached_checksum(), first.crc);
-        Arc::get_mut(&mut page.ciphertext.inner).unwrap().checksum = std::sync::OnceLock::new();
-        page.ciphertext.verify_checksum().unwrap();
+        assert_eq!(capture(&page.ciphertext).tag, first.tag);
+        let inner = Arc::get_mut(&mut page.ciphertext.inner).unwrap();
+        let last = inner.bytes.len() - 1;
+        inner.bytes[last] ^= 1;
         let changed = capture(&page.ciphertext);
-        assert_ne!(first.crc, changed.crc);
+        assert_ne!(first.tag, changed.tag);
         assert_eq!(first.page, changed.page);
         assert_eq!(first.aad, changed.aad);
         Arc::get_mut(&mut page.ciphertext.inner)
@@ -4257,7 +4189,7 @@ pub(crate) mod tests {
             .nonce
             .0[0] ^= 1;
         let changed_aad = capture(&page.ciphertext);
-        assert_eq!(changed.crc, changed_aad.crc);
+        assert_eq!(changed.tag, changed_aad.tag);
         assert_eq!(changed.page, changed_aad.page);
         assert_ne!(changed.aad, changed_aad.aad);
         let failures = crate::telemetry::Failures::default();

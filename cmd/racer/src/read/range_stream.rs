@@ -1772,7 +1772,6 @@ pub(super) mod tests {
             ciphertext: CiphertextPage {
                 provenance: None,
                 inner: Arc::new(CiphertextBytes {
-                    checksum: Default::default(),
                     envelope: PageEnvelope {
                         cipher: crate::model::PageCipher::Xaes256Gcm,
                         page,
