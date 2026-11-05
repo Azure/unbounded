@@ -151,7 +151,11 @@ impl SealedPage {
         self.envelope.validate()?;
         if self.page() != page
             || self.metadata.version != page.version
-            || self.metadata.immutable().page_length(page)? != self.envelope.plaintext_length
+            || self
+                .metadata
+                .immutable()
+                .page_length_in(page, self.envelope.page_size)?
+                != self.envelope.plaintext_length
             || self.aad.len() > racer_gpu::MAX_AAD
         {
             return Err(Error::CorruptRecord);

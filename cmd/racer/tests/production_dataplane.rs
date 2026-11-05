@@ -230,6 +230,8 @@ struct OriginState {
     benchmark_keys: bool,
     version: u8,
     length: u64,
+    /// Page size the fixture publication announced when the adapter started.
+    page: u64,
     zero_ttl: bool,
     expires_at: Option<u128>,
     online: bool,
@@ -249,6 +251,7 @@ impl Adapter {
             benchmark_keys: false,
             version: 1,
             length,
+            page: FIXTURE_PAGE_SIZE.get().get(),
             zero_ttl,
             expires_at: None,
             online: true,
@@ -344,7 +347,7 @@ fn adapter_connection(
             f.get("racer-metadata").map(String::as_str),
             Some("fixture-metadata")
         );
-        let (version, length, zero_ttl, expires_at, online) = {
+        let (version, length, page, zero_ttl, expires_at, online) = {
             let mut state = state.lock().unwrap();
             state.calls.push(OriginRequest {
                 method: method.into(),
@@ -354,6 +357,7 @@ fn adapter_connection(
             (
                 state.version,
                 state.length,
+                state.page,
                 state.zero_ttl,
                 state.expires_at,
                 state.online,
@@ -394,8 +398,8 @@ fn adapter_connection(
         let (first, last) = range.split_once('-').unwrap();
         let first: u64 = first.parse().unwrap();
         let last: u64 = last.parse::<u64>().unwrap().min(length - 1);
-        assert_eq!(first % P, 0);
-        assert_eq!(last, (first + P - 1).min(length - 1));
+        assert_eq!(first % page, 0);
+        assert_eq!(last, (first + page - 1).min(length - 1));
         if write!(stream, "HTTP/1.1 206 Partial Content\r\nContent-Length: {}\r\nContent-Type: application/octet-stream\r\nContent-Range: bytes {first}-{last}/{length}\r\nETag: {tag}\r\nRacer-Expires-At: {expiry}\r\n\r\n", last - first + 1).is_err() { return; }
         let mut chunk = [0; 65536];
         let mut offset = first;
@@ -795,9 +799,10 @@ impl Rig {
     fn subscribe(&self, fields: &str) -> Reply {
         let (local, mut remote) = UnixStream::pair().unwrap();
         let request = subscription_request(fields);
+        let page = FIXTURE_PAGE_SIZE.get().get();
         let reader = thread::spawn(move || {
             remote.write_all(request.as_bytes()).unwrap();
-            receive_subscription(remote)
+            receive_subscription(remote, page)
         });
         let result = self.drive(self.serve(local, &scope()));
         let reply = reader.join();
@@ -883,6 +888,12 @@ fn open_fixture_storage(
     (index, disk, writer)
 }
 
+std::thread_local! {
+    /// Page size the fixture publication announces; tests run one per thread.
+    static FIXTURE_PAGE_SIZE: std::cell::Cell<racer_wire::object::PageSize> =
+        const { std::cell::Cell::new(racer_wire::object::PageSize::DEFAULT) };
+}
+
 fn fixture_publication() -> Publication {
     let (client_socket, origin_socket) = canonical_socket_paths("production-fixture").unwrap();
     Publication {
@@ -907,7 +918,7 @@ fn fixture_publication() -> Publication {
             mode: racer_wire::control::CacheMode::Cached,
             origin: None,
         }],
-        page_size: racer_wire::object::PageSize::DEFAULT,
+        page_size: FIXTURE_PAGE_SIZE.get(),
     }
     .with_default_pool()
 }
@@ -1493,7 +1504,7 @@ fn subscription_request(fields: &str) -> String {
 }
 
 /// Collect a subscription using one-page credits, returning at completion without waiting for EOF.
-fn receive_subscription(mut stream: UnixStream) -> Reply {
+fn receive_subscription(mut stream: UnixStream, page: u64) -> Reply {
     stream.set_read_timeout(Some(TIMEOUT)).unwrap();
     stream.set_write_timeout(Some(TIMEOUT)).unwrap();
     let head = read_head(&mut stream).expect("subscription response head");
@@ -1526,8 +1537,8 @@ fn receive_subscription(mut stream: UnixStream) -> Reply {
             1 => {
                 assert_eq!(offset, start + body.len() as u64);
                 assert!(offset < end);
-                assert_eq!(number, offset / P);
-                assert_eq!(u64::from(length), (end - offset).min(P - offset % P));
+                assert_eq!(number, offset / page);
+                assert_eq!(u64::from(length), (end - offset).min(page - offset % page));
                 assert!(length > 0);
                 let previous = body.len();
                 body.resize(previous + length as usize, 0);
@@ -1620,6 +1631,52 @@ fn subscription_credits_persist_three_pages_and_serve_partial_disk_range_offline
     assert_eq!(rig.admission.used(ResourceClass::Waiter), 0);
     rig.memory.evict_idle(usize::MAX).unwrap();
     assert_eq!(rig.admission.used(ResourceClass::Plaintext), 0);
+}
+
+#[test]
+#[ignore = "D13 in progress: the first 64 KiB subscription fails with BadGateway after HEAD, before any origin GET"]
+fn small_published_pages_fill_persist_and_serve_cross_page_ranges() {
+    // D13: the cluster publishes 64 KiB pages; origin fetches, records, and
+    // range slicing all follow it instead of the 16 MiB default.
+    let size = racer_wire::object::PageSize::new(64 << 10).unwrap();
+    FIXTURE_PAGE_SIZE.set(size);
+    let p = size.get();
+    let length = 2 * p + 113;
+    let rig = Rig::with_dirty_pages(length, false, 4, 3);
+    check_subscription(&rig.subscribe(""), 1, 0, length, length);
+    let calls = rig.adapter.calls();
+    assert_eq!(calls.len(), 4);
+    for (number, call) in calls[1..].iter().enumerate() {
+        let expected = format!(
+            "bytes={}-{}",
+            number as u64 * p,
+            (number as u64 + 1) * p - 1
+        );
+        assert_eq!(call.range.as_deref(), Some(expected.as_str()));
+    }
+    rig.flush();
+    assert_eq!(rig.writer.index().snapshot().unwrap().entries.len(), 3);
+    rig.adapter.offline();
+    assert!(rig.memory.evict_idle(usize::MAX).unwrap() > 0);
+    // A range crossing both page boundaries, served from small disk records.
+    let start = p - 7;
+    let end = 2 * p + 13;
+    check_subscription(
+        &rig.subscribe(&format!(
+            "If-Match: \"v1\"\r\nRange: bytes={start}-{}\r\n",
+            end - 1
+        )),
+        1,
+        start,
+        end,
+        length,
+    );
+    assert_eq!(
+        rig.adapter.calls().len(),
+        4,
+        "disk hit contacted disabled origin"
+    );
+    rig.drive(rig.reactor.drain()).unwrap();
 }
 
 #[test]
@@ -1960,7 +2017,7 @@ fn cancel_backpressured_reader_preserves_fast_reader_and_releases_leases() {
     let fast_done = Arc::new(AtomicBool::new(false));
     let done = fast_done.clone();
     let fast_reader = thread::spawn(move || {
-        let reply = receive_subscription(fast_remote);
+        let reply = receive_subscription(fast_remote, P);
         done.store(true, Ordering::Release);
         reply
     });
