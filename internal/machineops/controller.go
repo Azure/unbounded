@@ -128,10 +128,6 @@ func (r *MachineOperationReconciler) Reconcile(ctx context.Context, req ctrl.Req
 		return ctrl.Result{}, nil
 	}
 
-	if reason, message := allocationMachineRejection(op.Spec.OperationKind, &machine); reason != "" {
-		return r.failOperation(ctx, &op, reason, message)
-	}
-
 	providerMatch := r.providerFor(host.provider, op.Spec.OperationKind)
 	if !providerMatch.supported() {
 		if providerMatch.provider != nil && isHostOperation(op.Spec.OperationKind) {
@@ -144,6 +140,10 @@ func (r *MachineOperationReconciler) Reconcile(ctx context.Context, req ctrl.Req
 			"machine", machine.Name)
 
 		return ctrl.Result{}, nil
+	}
+
+	if reason, message := allocationMachineRejection(op.Spec.OperationKind, &machine); reason != "" {
+		return r.failOperation(ctx, &op, reason, message)
 	}
 
 	if err := validateProviderReference(&machine, providerMatch.provider); err != nil {

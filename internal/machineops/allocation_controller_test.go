@@ -278,7 +278,64 @@ func TestMachineAllocationSnapshotOutcomes(t *testing.T) {
 		planned bool
 		// err is the error the reconcile returns instead of writing status.
 		err string
+		// message is part of the failure message.
+		message string
 	}{
+		{
+			name: "class name longer than a label value, class not Ready",
+			mutate: func(t *testing.T, h *allocationHarness) {
+				longName := strings.Repeat("a", 60) + ".example.x"
+				class := newAllocationFixture(t).class
+				class.Name = longName
+				class.UID = "long-class-uid"
+				class.ResourceVersion = ""
+				class.Status = unboundedv1alpha3.MachineClassStatus{}
+				require.NoError(t, h.store.Create(context.Background(), class))
+				h.updateAllocationSpec(t, func(spec *unboundedv1alpha3.MachineAllocationSpec) {
+					spec.ClassRef = unboundedv1alpha3.UIDReference{Name: longName, UID: "long-class-uid"}
+				})
+			},
+			failure: unboundedv1alpha3.FailureInvalidRequest,
+			message: "spec.classRef.name",
+		},
+		{
+			name: "consumer UID that is not a label value",
+			mutate: func(t *testing.T, h *allocationHarness) {
+				// The consumer kind is not watched, so the UID that matches no
+				// consumer does not retire the allocation.
+				h.reconciler.ConsumerKinds = nil
+				h.updateAllocationSpec(t, func(spec *unboundedv1alpha3.MachineAllocationSpec) { spec.ConsumerRef.UID = "not a uid!" })
+			},
+			failure: unboundedv1alpha3.FailureInvalidRequest,
+			message: "spec.consumerRef.uid",
+		},
+		{
+			name: "Site name longer than a label value",
+			mutate: func(t *testing.T, h *allocationHarness) {
+				longSite := strings.Repeat("s", 70)
+				site := newClassTestSite("site-long-uid")
+				site.Name = longSite
+				require.NoError(t, h.store.Create(context.Background(), site))
+				h.updateClass(t, func(class *unboundedv1alpha3.MachineClass) {
+					class.Status.Site = &unboundedv1alpha3.UIDReference{Name: longSite, UID: "site-long-uid"}
+				})
+			},
+			failure: unboundedv1alpha3.FailureInvalidRequest,
+			message: "status.site.name",
+			planned: false,
+		},
+		{
+			name: "offering label value that reaches the node labels",
+			mutate: func(t *testing.T, h *allocationHarness) {
+				h.updateClass(t, func(class *unboundedv1alpha3.MachineClass) {
+					for i := range class.Status.Offerings {
+						class.Status.Offerings[i].Zone = "bad value!"
+					}
+				})
+			},
+			failure: unboundedv1alpha3.FailureInvalidRequest,
+			message: "node label topology.kubernetes.io/zone",
+		},
 		{
 			name: "class missing",
 			mutate: func(t *testing.T, h *allocationHarness) {
@@ -465,6 +522,7 @@ func TestMachineAllocationSnapshotOutcomes(t *testing.T) {
 			if tt.failure != "" {
 				require.Equal(t, tt.failure, allocation.Status.FailureReason)
 				require.NotEmpty(t, allocation.Status.FailureMessage)
+				require.Contains(t, allocation.Status.FailureMessage, tt.message)
 				requireAllocationCondition(t, allocation, unboundedv1alpha3.MachineAllocationConditionAllocated, metav1.ConditionFalse, string(tt.failure))
 
 				// A failure is terminal: nothing is written again and the
@@ -788,6 +846,25 @@ func TestMachineAllocationInputProtection(t *testing.T) {
 		require.Equal(t, unboundedv1alpha3.FailureInvalidRequest, h.allocation().Status.FailureReason)
 	})
 
+	t.Run("a ConfigMap the cache shows but the API server deleted fails the allocation", func(t *testing.T) {
+		t.Parallel()
+
+		h := newAllocationHarness(t, newAllocationFixture(t))
+		h.reconcile() // snapshot
+		h.reconcile() // finalizer
+		h.failPatchNotFound("ConfigMap", "bootstrap-files")
+		h.resetCalls()
+		h.settle()
+
+		allocation := h.allocation()
+		require.Equal(t, unboundedv1alpha3.FailureInvalidRequest, allocation.Status.FailureReason)
+		require.Contains(t, allocation.Status.FailureMessage, "bootstrap-files")
+		require.Nil(t, h.operation(allocTestNames.allocateOperation))
+		require.Nil(t, h.secret(allocTestNames.tokenSecret))
+		require.Nil(t, h.machine())
+		require.Empty(t, h.creates())
+	})
+
 	t.Run("a deleting ConfigMap fails the allocation", func(t *testing.T) {
 		t.Parallel()
 
@@ -1040,8 +1117,19 @@ func TestMachineAllocationReleaseFlow(t *testing.T) {
 	require.Equal(t, &unboundedv1alpha3.UIDReference{Name: release.Name, UID: release.UID}, allocation.Status.Operations.Release)
 	requireAllocationCondition(t, allocation, unboundedv1alpha3.MachineAllocationConditionReleased, metav1.ConditionFalse, allocationReasonReleasing)
 
-	// HostRelease completes: the finalizers go in order, then Released.
+	// HostRelease completes: Released=True is committed alone, then the
+	// finalizers go, the allocation's last.
 	h.completeOperation(allocTestNames.releaseOperation, unboundedv1alpha3.OperationPhaseComplete, "Succeeded", nil)
+	h.resetCalls()
+	h.reconcile()
+
+	require.Equal(t, []string{"status MachineAllocation alloc-1"}, h.writes(), "the commit is the only write of its reconcile")
+
+	allocation = h.allocation()
+	requireAllocationCondition(t, allocation, unboundedv1alpha3.MachineAllocationConditionReleased, metav1.ConditionTrue, allocationReasonReleased)
+	require.Contains(t, allocation.Finalizers, unboundedv1alpha3.MachineAllocationFinalizer)
+	require.Contains(t, h.operation(allocTestNames.allocateOperation).Finalizers, unboundedv1alpha3.MachineAllocationFinalizer)
+
 	h.resetCalls()
 	h.reconcile()
 
@@ -1049,9 +1137,12 @@ func TestMachineAllocationReleaseFlow(t *testing.T) {
 		"patch MachineOperation " + allocTestNames.allocateOperation,
 		"patch MachineOperation " + allocTestNames.releaseOperation,
 		"patch Machine " + allocTestNames.machine,
-		"status MachineAllocation alloc-1",
 		"patch MachineAllocation alloc-1",
 	}, h.writes())
+
+	for _, read := range h.reads() {
+		require.NotRegexp(t, `(Secret|Node|Namespace) `, read, "the cleanup reads no consumer, Node or Secret")
+	}
 
 	allocation = h.allocation()
 	requireAllocationCondition(t, allocation, unboundedv1alpha3.MachineAllocationConditionReleased, metav1.ConditionTrue, allocationReasonReleased)
@@ -1075,7 +1166,8 @@ func TestMachineAllocationReleaseHolds(t *testing.T) {
 
 		h.settle()
 		h.setOperationHandle(allocTestNames.allocateOperation)
-		h.completeOperation(allocTestNames.allocateOperation, unboundedv1alpha3.OperationPhaseComplete, "Succeeded", nil)
+		h.completeOperation(allocTestNames.allocateOperation, unboundedv1alpha3.OperationPhaseComplete, "Succeeded",
+			&unboundedv1alpha3.MachineOperationAllocationResult{OwnedResources: []unboundedv1alpha3.ProviderOwnedResource{{ID: "vm", NativeID: "vm-1"}}})
 		h.settle()
 		h.setLifecycle(unboundedv1alpha3.MachineAllocationReleased)
 	}
@@ -1085,7 +1177,29 @@ func TestMachineAllocationReleaseHolds(t *testing.T) {
 		setup         func(*testing.T, *allocationHarness)
 		reason        string
 		releaseCreate bool
+		failure       unboundedv1alpha3.MachineAllocationFailureReason
 	}{
+		{
+			name: "ownership unknown reported by the engine",
+			setup: func(t *testing.T, h *allocationHarness) {
+				h.settle()
+				h.completeOperation(allocTestNames.allocateOperation, unboundedv1alpha3.OperationPhaseFailed, allocationReasonOwnershipUnknown, nil)
+				h.setLifecycle(unboundedv1alpha3.MachineAllocationReleased)
+			},
+			reason:  allocationReasonOwnershipUnknown,
+			failure: unboundedv1alpha3.FailureProviderFailed,
+		},
+		{
+			name: "ownership unknown from a handle without a result",
+			setup: func(t *testing.T, h *allocationHarness) {
+				h.settle()
+				h.setOperationHandle(allocTestNames.allocateOperation)
+				h.completeOperation(allocTestNames.allocateOperation, unboundedv1alpha3.OperationPhaseFailed, "SkuNotAvailable", nil)
+				h.setLifecycle(unboundedv1alpha3.MachineAllocationReleased)
+			},
+			reason:  allocationReasonOwnershipUnknown,
+			failure: unboundedv1alpha3.FailureProviderFailed,
+		},
 		{
 			name: "allocate operation missing",
 			setup: func(t *testing.T, h *allocationHarness) {
@@ -1161,9 +1275,15 @@ func TestMachineAllocationReleaseHolds(t *testing.T) {
 			require.NoError(t, err)
 			require.Equal(t, ctrl.Result{}, result, "a hold never requeues on a timer")
 			h.settle()
+			h.settle()
 
 			allocation := h.allocation()
 			requireAllocationCondition(t, allocation, unboundedv1alpha3.MachineAllocationConditionReleased, metav1.ConditionFalse, tt.reason)
+
+			if tt.failure != "" {
+				require.Equal(t, tt.failure, allocation.Status.FailureReason)
+			}
+
 			require.Contains(t, allocation.Finalizers, unboundedv1alpha3.MachineAllocationFinalizer)
 
 			if machine := h.machine(); machine != nil {
@@ -1179,6 +1299,161 @@ func TestMachineAllocationReleaseHolds(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestMachineAllocationReleaseAfterFirstBeginRefusal(t *testing.T) {
+	t.Parallel()
+
+	// A first Begin PermanentError created nothing: no handle and no result,
+	// and the reason is the provider's. Release runs with empty ownership.
+	h := newAllocationHarness(t, newAllocationFixture(t))
+	h.settle()
+	h.completeOperation(allocTestNames.allocateOperation, unboundedv1alpha3.OperationPhaseFailed, "QuotaExceeded", nil)
+	h.setLifecycle(unboundedv1alpha3.MachineAllocationReleased)
+	h.settle()
+
+	allocation := h.allocation()
+	require.Equal(t, unboundedv1alpha3.FailureQuotaExceeded, allocation.Status.FailureReason)
+	requireAllocationCondition(t, allocation, unboundedv1alpha3.MachineAllocationConditionReleased, metav1.ConditionFalse, allocationReasonReleasing)
+
+	release := h.operation(allocTestNames.releaseOperation)
+	require.NotNil(t, release)
+	require.Empty(t, allocation.Status.OwnedResources)
+
+	h.completeOperation(allocTestNames.releaseOperation, unboundedv1alpha3.OperationPhaseComplete, "Succeeded", nil)
+	h.settle()
+
+	allocation = h.allocation()
+	requireAllocationCondition(t, allocation, unboundedv1alpha3.MachineAllocationConditionReleased, metav1.ConditionTrue, allocationReasonReleased)
+	require.Empty(t, allocation.Finalizers)
+}
+
+func TestMachineAllocationFinishCrashWhileDeleting(t *testing.T) {
+	t.Parallel()
+
+	// released leaves HostRelease Complete with the allocation, both ops and
+	// the Machine deleting and still held by the controller's finalizer, and
+	// both input ConfigMaps still protected.
+	released := func(t *testing.T) *allocationHarness {
+		t.Helper()
+
+		h := newAllocationHarness(t, newAllocationFixture(t))
+		h.settle()
+		h.setOperationHandle(allocTestNames.allocateOperation)
+		h.completeOperation(allocTestNames.allocateOperation, unboundedv1alpha3.OperationPhaseComplete, "Succeeded",
+			&unboundedv1alpha3.MachineOperationAllocationResult{OwnedResources: []unboundedv1alpha3.ProviderOwnedResource{{ID: "vm", NativeID: "vm-1"}}})
+		h.settle()
+		h.setLifecycle(unboundedv1alpha3.MachineAllocationReleased)
+		h.settle()
+		h.completeOperation(allocTestNames.releaseOperation, unboundedv1alpha3.OperationPhaseComplete, "Succeeded", nil)
+
+		for _, name := range []string{"provider-config", "bootstrap-files"} {
+			configMap := h.configMap(name)
+			configMap.Finalizers = append(configMap.Finalizers, allocTestNames.inputFinalizer)
+			require.NoError(t, h.configMaps.Update(context.Background(), configMap))
+		}
+
+		ctx := context.Background()
+		require.NoError(t, h.store.Delete(ctx, h.operation(allocTestNames.allocateOperation)))
+		require.NoError(t, h.store.Delete(ctx, h.operation(allocTestNames.releaseOperation)))
+		require.NoError(t, h.store.Delete(ctx, h.machine()))
+		require.NoError(t, h.store.Delete(ctx, h.allocation()))
+		h.resetCalls()
+
+		return h
+	}
+
+	requireFinished := func(t *testing.T, h *allocationHarness) {
+		t.Helper()
+
+		committed := 0
+
+		for _, write := range h.statusWrites() {
+			require.NotContains(t, write, "failure="+string(unboundedv1alpha3.FailureProviderConflict))
+			require.NotContains(t, write, allocationReasonAllocateOperationMissing)
+			require.NotContains(t, write, allocationReasonReleaseOperationMissing)
+
+			if strings.Contains(write, "Released=True/Released") {
+				committed++
+			} else {
+				require.Zero(t, committed, "a status write after the commit replaced Released=True: %s", write)
+			}
+		}
+
+		require.Equal(t, 1, committed, "Released=True is written once")
+		require.Nil(t, h.allocation(), "the allocation is deleted with its last finalizer")
+		require.Nil(t, h.operation(allocTestNames.allocateOperation))
+		require.Nil(t, h.operation(allocTestNames.releaseOperation))
+		require.Nil(t, h.machine())
+
+		for _, name := range []string{"provider-config", "bootstrap-files"} {
+			require.NotContains(t, h.configMap(name).Finalizers, allocTestNames.inputFinalizer)
+		}
+	}
+
+	// An uninterrupted finish names the writes a crash can follow.
+	reference := released(t)
+	reference.settle()
+	requireFinished(t, reference)
+
+	// The input finalizers go first, because the recorded HostAllocate is
+	// terminal. The commit is then written alone in the next reconcile.
+	finishWrites := reference.writes()
+	require.Equal(t, []string{
+		"patch ConfigMap provider-config",
+		"patch ConfigMap bootstrap-files",
+		"status MachineAllocation alloc-1",
+		"patch MachineOperation " + allocTestNames.allocateOperation,
+		"patch MachineOperation " + allocTestNames.releaseOperation,
+		"patch Machine " + allocTestNames.machine,
+		"patch MachineAllocation alloc-1",
+	}, finishWrites)
+
+	for stop := 1; stop <= len(finishWrites); stop++ {
+		t.Run("crash after "+finishWrites[stop-1], func(t *testing.T) {
+			t.Parallel()
+
+			h := released(t)
+			h.crashAfterWrites(stop)
+			_, _ = h.reconcileResult()
+			_, _ = h.reconcileResult()
+			h.crashAfterWrites(0)
+			h.restart()
+
+			for range 10 {
+				if h.allocation() == nil {
+					break
+				}
+
+				_, err := h.reconcileResult()
+				require.NoError(t, err)
+			}
+
+			requireFinished(t, h)
+		})
+	}
+
+	t.Run("the commit write conflicts once", func(t *testing.T) {
+		t.Parallel()
+
+		h := released(t)
+		h.conflictNextStatusWrite()
+
+		var err error
+
+		for range 3 {
+			if _, err = h.reconcileResult(); err != nil {
+				break
+			}
+		}
+
+		require.True(t, apierrors.IsConflict(errors.Unwrap(err)) || apierrors.IsConflict(err), "commit error %v", err)
+		require.Empty(t, h.statusWrites(), "the commit is the first status write")
+
+		h.restart()
+		h.settle()
+		requireFinished(t, h)
+	})
 }
 
 func TestMachineAllocationReleaseWithoutLaunch(t *testing.T) {
@@ -1226,6 +1501,10 @@ func TestMachineAllocationReleaseWithoutLaunch(t *testing.T) {
 			require.NotContains(t, h.writes(), "create MachineOperation "+allocTestNames.releaseOperation)
 
 			if tt.fences {
+				for _, name := range []string{"provider-config", "bootstrap-files"} {
+					require.NotContains(t, h.configMap(name).Finalizers, allocTestNames.inputFinalizer, "the cleanup removes the input finalizer")
+				}
+
 				require.True(t, h.machine().Spec.Fenced)
 				require.Nil(t, h.secret(allocTestNames.tokenSecret))
 				require.Empty(t, h.machine().Finalizers)
@@ -1494,6 +1773,7 @@ func TestAllocationFailureReason(t *testing.T) {
 		"InsufficientCapacity":  unboundedv1alpha3.FailureInsufficientCapacity,
 		"AuthSecretNotFound":    unboundedv1alpha3.FailureAuthFailed,
 		"AuthorityReplaced":     unboundedv1alpha3.FailureAuthFailed,
+		"OwnershipUnknown":      unboundedv1alpha3.FailureProviderFailed,
 		"AllocationFenced":      unboundedv1alpha3.FailureInvalidRequest,
 		"OperationNotRecorded":  unboundedv1alpha3.FailureInvalidRequest,
 		"AllocationUnavailable": unboundedv1alpha3.FailureInvalidRequest,
@@ -1778,6 +2058,11 @@ type allocationHarness struct {
 	writesSeen      int
 	failCreateKind  string
 	failStatus      bool
+	// patchNotFound names objects, as "Kind/name", whose patch returns
+	// NotFound although the reader still shows them.
+	patchNotFound map[string]bool
+	// conflictStatus makes the next status write return a conflict.
+	conflictStatus bool
 }
 
 var errAllocationTestCrash = errors.New("controller crashed")
@@ -1880,6 +2165,15 @@ func (h *allocationHarness) refusal(call allocationCall) error {
 		return errors.New("status writes are failing")
 	}
 
+	if call.verb == "status" && h.conflictStatus {
+		h.conflictStatus = false
+		return apierrors.NewConflict(schema.GroupResource{Resource: "machineallocations"}, call.name, errors.New("the object has been modified"))
+	}
+
+	if call.verb == "patch" && h.patchNotFound[call.kind+"/"+call.name] {
+		return apierrors.NewNotFound(schema.GroupResource{Resource: call.kind}, call.name)
+	}
+
 	return nil
 }
 
@@ -1965,7 +2259,7 @@ func (h *allocationHarness) cacheFuncs() interceptor.Funcs {
 			return h.storeFor(obj, c).Delete(ctx, obj, opts...)
 		},
 		SubResourceUpdate: func(ctx context.Context, c client.Client, subResourceName string, obj client.Object, opts ...client.SubResourceUpdateOption) error {
-			if err := h.record(allocationCall{verb: "status", kind: allocationTestKind(obj), name: obj.GetName()}); err != nil {
+			if err := h.record(allocationCall{verb: "status", kind: allocationTestKind(obj), name: obj.GetName(), body: statusSummary(obj)}); err != nil {
 				return err
 			}
 
@@ -2033,6 +2327,22 @@ func (r *allocationLiveReader) Get(ctx context.Context, key client.ObjectKey, ob
 func (r *allocationLiveReader) List(ctx context.Context, list client.ObjectList, opts ...client.ListOption) error {
 	_ = r.h.record(allocationCall{reader: "live", verb: "list", kind: fmt.Sprintf("%T", list)})
 	return r.h.store.List(ctx, list, opts...)
+}
+
+// statusSummary is the failure reason and the conditions of an allocation
+// status write, for example "failure= Released=True/Released".
+func statusSummary(obj client.Object) string {
+	allocation, ok := obj.(*unboundedv1alpha3.MachineAllocation)
+	if !ok {
+		return ""
+	}
+
+	summary := "failure=" + string(allocation.Status.FailureReason)
+	for _, condition := range allocation.Status.Conditions {
+		summary += " " + condition.Type + "=" + string(condition.Status) + "/" + condition.Reason
+	}
+
+	return summary
 }
 
 func allocationTestKind(obj runtime.Object) string {
@@ -2184,6 +2494,38 @@ func (h *allocationHarness) failCreates(kind string) {
 	defer h.mu.Unlock()
 
 	h.failCreateKind = kind
+}
+
+func (h *allocationHarness) failPatchNotFound(kind, name string) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+
+	if h.patchNotFound == nil {
+		h.patchNotFound = map[string]bool{}
+	}
+
+	h.patchNotFound[kind+"/"+name] = true
+}
+
+func (h *allocationHarness) conflictNextStatusWrite() {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+
+	h.conflictStatus = true
+}
+
+// statusWrites returns the summary of every status write that reached the
+// store.
+func (h *allocationHarness) statusWrites() []string {
+	var writes []string
+
+	for _, call := range h.callsSnapshot() {
+		if call.verb == "status" && !call.refused {
+			writes = append(writes, call.body)
+		}
+	}
+
+	return writes
 }
 
 func (h *allocationHarness) failStatusWrites(fail bool) {
@@ -2555,6 +2897,13 @@ func (f *fakeCapacityProvider) pollRelease(_ context.Context, request OperationR
 	f.releasePolls = append(f.releasePolls, request)
 
 	return f.pollResult, f.pollErr
+}
+
+func (f *fakeCapacityProvider) setBeginErr(err error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	f.beginErr = err
 }
 
 func (f *fakeCapacityProvider) setPoll(result publicmachineops.PollResult, err error) {

@@ -15,6 +15,7 @@ import (
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	apimeta "k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/util/validation"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
@@ -71,6 +72,16 @@ func (r *MachineAllocationReconciler) reconcileSnapshot(
 	allocation := s.allocation
 	classRef := allocation.Spec.ClassRef
 
+	// The allocation's machine-class and consumer-uid labels carry these
+	// values as written, so they are checked before anything else.
+	if message := invalidLabelValues(map[string]string{
+		"spec.classRef.name":   classRef.Name,
+		"spec.consumerRef.uid": string(allocation.Spec.ConsumerRef.UID),
+	}); message != "" {
+		r.fail(s, unboundedv1alpha3.FailureInvalidRequest, message)
+		return r.finishWrite(ctx, s)
+	}
+
 	var class unboundedv1alpha3.MachineClass
 	if err := r.Get(ctx, client.ObjectKey{Name: classRef.Name}, &class); err != nil {
 		if !apierrors.IsNotFound(err) {
@@ -118,6 +129,12 @@ func (r *MachineAllocationReconciler) reconcileSnapshot(
 	selected, failure := selectOffering(class.Status.Offerings, allocation.Spec.Resources, allocation.Spec.Requirements, r.now())
 	if failure != nil {
 		r.fail(s, failure.reason, failure.message)
+		return r.finishWrite(ctx, s)
+	}
+
+	labels := allocationLabels(&inputs.template, allocation.Spec.NodeTemplate, selected.labels)
+	if message := invalidMachineLabels(class.Status.Site.Name, kubeletNodeLabels(labels)); message != "" {
+		r.fail(s, unboundedv1alpha3.FailureInvalidRequest, message)
 		return r.finishWrite(ctx, s)
 	}
 
@@ -173,11 +190,48 @@ func (r *MachineAllocationReconciler) reconcileSnapshot(
 	s.status.Image = plan.HostImage
 	s.status.Capacity = selected.offering.Capacity.DeepCopy()
 	s.status.Allocatable = capacityAfterOverhead(&selected.offering)
-	s.status.Labels = allocationLabels(&inputs.template, allocation.Spec.NodeTemplate, selected.labels)
+	s.status.Labels = labels
 	r.setCondition(s, unboundedv1alpha3.MachineAllocationConditionAllocated, metav1.ConditionFalse, allocationReasonLaunching,
 		fmt.Sprintf("offering %s planned as %s", selected.offering.Name, plan.ProviderID))
 
 	return r.finishWrite(ctx, s)
+}
+
+// invalidLabelValues returns a message naming each field whose value is not
+// a valid label value, or "" when all are valid.
+func invalidLabelValues(fields map[string]string) string {
+	var problems []string
+
+	for _, field := range slices.Sorted(maps.Keys(fields)) {
+		if errs := validation.IsValidLabelValue(fields[field]); len(errs) > 0 {
+			problems = append(problems, fmt.Sprintf("%s %q is not a valid label value: %s", field, fields[field], strings.Join(errs, "; ")))
+		}
+	}
+
+	return strings.Join(problems, "; ")
+}
+
+// invalidMachineLabels returns a message naming the Site label value or the
+// node label of the allocation's Machine that is not valid, or "" when all
+// are valid.
+func invalidMachineLabels(siteName string, nodeLabels map[string]string) string {
+	fields := map[string]string{"MachineClass status.site.name": siteName}
+
+	var problems []string
+
+	for _, key := range slices.Sorted(maps.Keys(nodeLabels)) {
+		if errs := validation.IsQualifiedName(key); len(errs) > 0 {
+			problems = append(problems, fmt.Sprintf("node label key %q is not a valid label key: %s", key, strings.Join(errs, "; ")))
+		}
+
+		fields["node label "+key] = nodeLabels[key]
+	}
+
+	if message := invalidLabelValues(fields); message != "" {
+		problems = append(problems, message)
+	}
+
+	return strings.Join(problems, "; ")
 }
 
 // machineClassReady reports whether the class resolved its current
@@ -299,7 +353,7 @@ func (r *MachineAllocationReconciler) addAllocationFinalizer(ctx context.Context
 		unboundedv1alpha3.LabelMachineClass:  allocation.Spec.ClassRef.Name,
 	}
 
-	return r.patchMetadata(ctx, allocation, func(updated client.Object) bool {
+	return r.patchMetadata(ctx, s, allocation, func(updated client.Object) bool {
 		current := updated.GetLabels()
 		if current == nil {
 			current = map[string]string{}
@@ -417,9 +471,18 @@ func (r *MachineAllocationReconciler) protectInputs(ctx context.Context, s *allo
 			return false, nil
 		}
 
-		if err := r.patchMetadata(ctx, &configMap, func(updated client.Object) bool {
+		err = r.patchMetadata(ctx, s, &configMap, func(updated client.Object) bool {
 			return controllerutil.AddFinalizer(updated, s.names.inputFinalizer)
-		}); err != nil {
+		})
+		if apierrors.IsNotFound(err) {
+			// The cache can still show a ConfigMap the API server deleted.
+			r.fail(s, unboundedv1alpha3.FailureInvalidRequest,
+				fmt.Sprintf("input ConfigMap %s/%s is missing, being deleted or replaced", frozen.Namespace, frozen.Name))
+
+			return false, nil
+		}
+
+		if err != nil {
 			return false, err
 		}
 	}
@@ -440,7 +503,7 @@ func (r *MachineAllocationReconciler) unprotectInputs(ctx context.Context, s *al
 			return fmt.Errorf("get ConfigMap %s/%s: %w", frozen.Namespace, frozen.Name, err)
 		}
 
-		if err := r.removeFinalizer(ctx, &configMap, s.names.inputFinalizer); err != nil {
+		if err := r.removeFinalizer(ctx, s, &configMap, s.names.inputFinalizer); err != nil {
 			return err
 		}
 	}

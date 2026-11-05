@@ -227,8 +227,17 @@ func TestAllocationOperationUncertainBeginHolds(t *testing.T) {
 		name   string
 		mutate func(*testing.T, *engineHarness)
 		reason string
+		// transient reaches the InProgress state through a transient Begin
+		// error instead of a crash.
+		transient bool
 	}{
 		{name: "fenced", mutate: func(t *testing.T, e *engineHarness) { e.fenceMachine(t) }, reason: allocationReasonBeginOutcomeUnknown},
+		{
+			name:      "fenced after a transient Begin error",
+			mutate:    func(t *testing.T, e *engineHarness) { e.fenceMachine(t) },
+			reason:    allocationReasonBeginOutcomeUnknown,
+			transient: true,
+		},
 		{
 			name: "token missing",
 			mutate: func(t *testing.T, e *engineHarness) {
@@ -253,7 +262,21 @@ func TestAllocationOperationUncertainBeginHolds(t *testing.T) {
 			t.Parallel()
 
 			e := newEngineHarness(t, nil)
-			e.markInProgressWithoutHandle(t)
+
+			if tt.transient {
+				e.provider.setBeginErr(errors.New("request timed out"))
+				e.reconcile(allocTestNames.allocateOperation)
+				e.provider.setBeginErr(nil)
+				e.provider.reset()
+
+				op := e.operation(allocTestNames.allocateOperation)
+				require.Equal(t, unboundedv1alpha3.OperationPhaseInProgress, op.Status.Targets[0].Phase)
+				require.Equal(t, int32(1), op.Status.Targets[0].Attempts)
+				require.Nil(t, op.Status.Targets[0].ProviderOperation)
+			} else {
+				e.markInProgressWithoutHandle(t)
+			}
+
 			tt.mutate(t, e)
 
 			result := e.reconcile(allocTestNames.allocateOperation)
@@ -421,6 +444,96 @@ func TestAllocationOperationAppliesResult(t *testing.T) {
 	}
 }
 
+func TestAllocationOperationAppliesResultWithoutOwnership(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name string
+		poll publicmachineops.PollResult
+		err  error
+	}{
+		{name: "succeeded without a report", poll: publicmachineops.PollResult{State: publicmachineops.ProviderOperationStateSucceeded}},
+		{name: "failed without a report", poll: publicmachineops.PollResult{State: publicmachineops.ProviderOperationStateFailed, Reason: "SkuNotAvailable"}},
+		{name: "canceled without a report", poll: publicmachineops.PollResult{State: publicmachineops.ProviderOperationStateCanceled}},
+		{name: "poll PermanentError", err: &publicmachineops.PermanentError{Reason: "HandleExpired", Err: errors.New("operation handle is gone")}},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			e := newEngineHarness(t, nil)
+			e.reconcile(allocTestNames.allocateOperation)
+			e.provider.setPoll(tt.poll, tt.err)
+			e.recordStatusUpdates(true)
+
+			e.reconcile(allocTestNames.allocateOperation)
+
+			updates := e.statusUpdates()
+			first := slices.IndexFunc(updates, func(op *unboundedv1alpha3.MachineOperation) bool {
+				return len(op.Status.Targets) == 1 && op.Status.Targets[0].Phase == unboundedv1alpha3.OperationPhaseFailed
+			})
+			require.GreaterOrEqual(t, first, 0)
+
+			completed := apimeta.FindStatusCondition(updates[first].Status.Conditions, OperationConditionCompleted)
+			require.NotNil(t, completed, "the update that fails the target sets Completed")
+			require.Equal(t, metav1.ConditionFalse, completed.Status)
+			require.Equal(t, allocationReasonOwnershipUnknown, completed.Reason)
+
+			op := e.operation(allocTestNames.allocateOperation)
+			e.requireCompleted(t, op.Name, unboundedv1alpha3.OperationPhaseFailed, allocationReasonOwnershipUnknown)
+			require.Nil(t, op.Status.Allocation)
+		})
+	}
+}
+
+func TestAllocationOperationBeginPermanentError(t *testing.T) {
+	t.Parallel()
+
+	refusal := &publicmachineops.PermanentError{Reason: "QuotaExceeded", Err: errors.New("quota exhausted")}
+
+	tests := []struct {
+		name    string
+		prepare func(*testing.T, *engineHarness)
+		reason  string
+	}{
+		{name: "first Begin", reason: "QuotaExceeded"},
+		{
+			name: "after a transient Begin error",
+			prepare: func(_ *testing.T, e *engineHarness) {
+				e.provider.setBeginErr(errors.New("request timed out"))
+				e.reconcile(allocTestNames.allocateOperation)
+			},
+			reason: allocationReasonOwnershipUnknown,
+		},
+		{
+			name:    "after a crash left the target InProgress",
+			prepare: func(t *testing.T, e *engineHarness) { e.markInProgressWithoutHandle(t) },
+			reason:  allocationReasonOwnershipUnknown,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			e := newEngineHarness(t, nil)
+			if tt.prepare != nil {
+				tt.prepare(t, e)
+			}
+
+			e.provider.setBeginErr(refusal)
+			e.reconcile(allocTestNames.allocateOperation)
+
+			e.requireCompleted(t, allocTestNames.allocateOperation, unboundedv1alpha3.OperationPhaseFailed, tt.reason)
+
+			op := e.operation(allocTestNames.allocateOperation)
+			require.Equal(t, unboundedv1alpha3.OperationPhaseFailed, op.Status.Targets[0].Phase)
+			require.Nil(t, op.Status.Allocation)
+		})
+	}
+}
+
 func TestReleaseOperationWaitsAndRequests(t *testing.T) {
 	t.Parallel()
 
@@ -460,6 +573,19 @@ func TestReleaseOperationWaitsAndRequests(t *testing.T) {
 			mutate: func(t *testing.T, e *engineHarness) {
 				op := e.operation(allocTestNames.allocateOperation)
 				op.Status.Phase = unboundedv1alpha3.OperationPhaseInProgress
+				require.NoError(t, e.raw.Status().Update(context.Background(), op))
+			},
+		},
+		{
+			name: "recorded HostAllocate ownership unknown",
+			mutate: func(t *testing.T, e *engineHarness) {
+				op := e.operation(allocTestNames.allocateOperation)
+				op.Status.Phase = unboundedv1alpha3.OperationPhaseFailed
+				op.Status.Allocation = nil
+				op.Status.Conditions = []metav1.Condition{{
+					Type: OperationConditionCompleted, Status: metav1.ConditionFalse, Reason: allocationReasonOwnershipUnknown,
+					LastTransitionTime: metav1.NewTime(allocTestNow),
+				}}
 				require.NoError(t, e.raw.Status().Update(context.Background(), op))
 			},
 		},
@@ -1020,14 +1146,23 @@ func TestAllocationOperationFinishesTerminalTarget(t *testing.T) {
 	t.Parallel()
 
 	for _, tt := range []struct {
-		target unboundedv1alpha3.OperationPhase
-		phase  unboundedv1alpha3.OperationPhase
-		reason string
+		name      string
+		target    unboundedv1alpha3.OperationPhase
+		completed string
+		phase     unboundedv1alpha3.OperationPhase
+		reason    string
 	}{
-		{target: unboundedv1alpha3.OperationPhaseComplete, phase: unboundedv1alpha3.OperationPhaseComplete, reason: "Succeeded"},
-		{target: unboundedv1alpha3.OperationPhaseFailed, phase: unboundedv1alpha3.OperationPhaseFailed, reason: "TargetFailed"},
+		{name: "Complete", target: unboundedv1alpha3.OperationPhaseComplete, phase: unboundedv1alpha3.OperationPhaseComplete, reason: "Succeeded"},
+		{name: "Failed", target: unboundedv1alpha3.OperationPhaseFailed, phase: unboundedv1alpha3.OperationPhaseFailed, reason: "TargetFailed"},
+		{
+			name:      "Failed with the reason on the Completed condition",
+			target:    unboundedv1alpha3.OperationPhaseFailed,
+			completed: allocationReasonOwnershipUnknown,
+			phase:     unboundedv1alpha3.OperationPhaseFailed,
+			reason:    allocationReasonOwnershipUnknown,
+		},
 	} {
-		t.Run(string(tt.target), func(t *testing.T) {
+		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
 
 			e := newEngineHarness(t, nil)
@@ -1036,6 +1171,14 @@ func TestAllocationOperationFinishesTerminalTarget(t *testing.T) {
 			op := e.operation(allocTestNames.allocateOperation)
 			op.Status.Targets[0].Phase = tt.target
 			op.Status.Targets[0].Message = "finished before the operation recorded it"
+
+			if tt.completed != "" {
+				op.Status.Conditions = []metav1.Condition{{
+					Type: OperationConditionCompleted, Status: metav1.ConditionFalse, Reason: tt.completed,
+					LastTransitionTime: metav1.NewTime(allocTestNow),
+				}}
+			}
+
 			require.NoError(t, e.raw.Status().Update(context.Background(), op))
 
 			e.reconcile(allocTestNames.allocateOperation)
