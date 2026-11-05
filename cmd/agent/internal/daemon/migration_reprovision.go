@@ -15,8 +15,11 @@ import (
 	"strings"
 	"time"
 
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/rest"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 
+	v1alpha3 "github.com/Azure/unbounded/api/machina/v1alpha3"
 	"github.com/Azure/unbounded/cmd/agent/internal/hostnode"
 	"github.com/Azure/unbounded/internal/fsutil"
 	"github.com/Azure/unbounded/internal/provision"
@@ -458,3 +461,42 @@ func (e *migrationEnv) appliedInMode(log *slog.Logger, mode isolation.Mode) bool
 
 // reprovisionSlots are the slots a bootstrap can record a node in.
 var reprovisionSlots = []string{"kube1", "kube2"}
+
+// ReprovisionGaveUpStatus is what a handoff that gave up reports in the Machine
+// status.
+func ReprovisionGaveUpStatus(j migrate.Journal) *v1alpha3.IsolationChangeStatus {
+	return &v1alpha3.IsolationChangeStatus{
+		TargetMode:         v1alpha3.IsolationMode(j.To),
+		Strategy:           v1alpha3.IsolationChangeReprovision,
+		Phase:              v1alpha3.IsolationChangeFailed,
+		Message:            j.Message,
+		LastTransitionTime: metav1.Now(),
+	}
+}
+
+// ReportReprovisionGaveUp reports a handoff that gave up in the Machine status,
+// with the bootstrap token of the staged configuration cfg. The host is reset
+// and has no daemon to report it, and the staged configuration, which holds
+// the token, is about to be removed. A configuration without a token (an
+// attested host) cannot report: the change is then reported by the first
+// daemon that starts on the host, or shows as stale in machina.
+func ReportReprovisionGaveUp(ctx context.Context, cfg *provision.AgentConfig, j migrate.Journal) error {
+	if strings.TrimSpace(cfg.Kubelet.Auth.BootstrapToken) == "" {
+		return errors.New("the staged configuration has no bootstrap token to report with")
+	}
+
+	restCfg, err := buildBootstrapRESTConfig(cfg)
+	if err != nil {
+		return err
+	}
+
+	c, err := client.New(restCfg, client.Options{Scheme: newScheme()})
+	if err != nil {
+		return err
+	}
+
+	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
+
+	return patchIsolationStatus(ctx, c, cfg.MachineName, isolationStatus{Change: ReprovisionGaveUpStatus(j)})
+}
