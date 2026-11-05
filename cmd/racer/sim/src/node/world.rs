@@ -3624,7 +3624,11 @@ impl NodeWorld {
                         m.relays.push(charge);
                         self.forward(mid, at, Some(plan));
                     }
-                    Err(_) => self.fail_hop(mid, at, Fault::Overloaded),
+                    Err(_) => {
+                        // No `Relay` transfer free (the Model's `relay_sheds`).
+                        self.metrics.incr("relay_sheds");
+                        self.fail_hop(mid, at, Fault::Overloaded)
+                    }
                 }
             }
         }
