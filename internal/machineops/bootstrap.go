@@ -124,6 +124,16 @@ func (r *MachineOperationReconciler) buildReplaceAgentConfig(ctx context.Context
 		return provision.UnboundedAgentConfig{}, err
 	}
 
+	return buildAgentConfig(machine, clusterInfo, bootstrapToken, r.ExperimentalContainerIsolation), nil
+}
+
+// buildAgentConfig builds the agent config that a host launched or replaced
+// for machine starts with, joining with bootstrapToken. The config opts in to
+// the experimental container isolation mode when experimentalContainerIsolation
+// is set.
+func buildAgentConfig(machine *unboundedv1alpha3.Machine, clusterInfo *ClusterInfo, bootstrapToken string,
+	experimentalContainerIsolation bool,
+) provision.UnboundedAgentConfig {
 	return provision.BuildAgentConfig(provision.BuildAgentConfigParams{
 		Machine: machine,
 		Cluster: provision.ClusterEndpoint{
@@ -136,8 +146,8 @@ func (r *MachineOperationReconciler) buildReplaceAgentConfig(ctx context.Context
 		BootstrapToken: bootstrapToken,
 		NodeName:       machine.Name,
 
-		ExperimentalContainerIsolation: r.ExperimentalContainerIsolation,
-	}), nil
+		ExperimentalContainerIsolation: experimentalContainerIsolation,
+	})
 }
 
 func (r *MachineOperationReconciler) clusterInfo(ctx context.Context) (*ClusterInfo, error) {
