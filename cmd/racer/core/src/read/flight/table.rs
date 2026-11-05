@@ -135,6 +135,17 @@ impl<C, P, O, R, T, W: WaiterPolicy, X, Q> FlightEntry<C, P, O, R, T, W, X, Q> {
         self.incarnation
     }
 
+    /// Raw state, for tests that forge waiter deadlines. Bypasses every table invariant.
+    #[doc(hidden)]
+    pub fn state_mut(&mut self) -> &mut State<C, P, O, W, T> {
+        &mut self.state
+    }
+
+    /// The reusable partial result, which a leader may discard.
+    pub fn partial_mut(&mut self) -> &mut Option<P> {
+        &mut self.state.partial
+    }
+
     /// Retained operations, including those completing.
     pub fn operations(&self) -> usize {
         self.operations.len()
@@ -522,6 +533,19 @@ impl<
             wakes,
             park,
         ))
+    }
+
+    /// Store waiter `id`'s wake target without refreshing. `false` when `id` is not attached.
+    pub fn park(&mut self, key: &K, id: u64, park: impl FnOnce(&mut Option<T>)) -> bool {
+        let Some(waiter) = self
+            .entries
+            .get_mut(key)
+            .and_then(|e| e.state.waiters.get_mut(&id))
+        else {
+            return false;
+        };
+        park(&mut waiter.waker);
+        true
     }
 
     /// Poll copy waiter `id` of the refreshed entry `key`. `None` after `park`.

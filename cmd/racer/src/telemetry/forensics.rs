@@ -238,8 +238,13 @@ pub enum ClientBoundary {
 pub(crate) enum JoinGate {
     EntryCap,
     WaiterCap,
+    // Kept so the forensic counter layout (`counter_rows=58`) stays stable; the shared flight
+    // table allocates ids and inserts infallibly, so these are no longer produced.
+    #[allow(dead_code)]
     WaiterId,
+    #[allow(dead_code)]
     Identity,
+    #[allow(dead_code)]
     Insert,
     ExistingFailed,
     Unclassified,

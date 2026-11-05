@@ -237,7 +237,7 @@ mod flight {
                 );
                 let mut waiters = Vec::new();
                 for (number, budget) in budgets.iter_mut().enumerate() {
-                    let mut page = fence().page;
+                    let mut page = test_page();
                     page.number = PageNumber(number as u64);
                     let JoinedFlight::Waiter(waiter) = flights
                         .join(page, membership.clone(), &context, &scope, budget)
@@ -247,7 +247,7 @@ mod flight {
                     };
                     waiters.push(waiter);
                 }
-                let held = flights.reserve_copy_flight(&fence().page, &scope).unwrap();
+                let held = flights.reserve_copy_flight(&test_page(), &scope).unwrap();
                 let now = racer_io::Clock::host().now();
                 let facts = flights.expiry_snapshot_without_ticket(now);
                 assert_eq!(facts.total, count);
@@ -273,7 +273,7 @@ mod flight {
                     assert_eq!(entry.stage, Some(DriverStage::CandidateCompositeCall));
                     operation.complete().unwrap();
                     flights
-                        .publish(leader, result(&flights, fence().page))
+                        .publish(leader, result(&flights, test_page()))
                         .unwrap();
                     let entry = flights.expiry_snapshot_without_ticket(now).entries[0].unwrap();
                     assert_eq!(entry.lifecycle, FlightState::Complete);
@@ -304,7 +304,7 @@ mod flight {
             let (context, scope) = (origin(), scope());
             let (mut first_budget, mut next_budget) = (budget(), budget());
             let first = join(&flights, &context, &scope, &mut first_budget);
-            let mut page = fence().page;
+            let mut page = test_page();
             page.number = PageNumber(1);
             let mut waiting = Box::pin(flights.join_wait(
                 page,
@@ -364,7 +364,7 @@ mod flight {
             .unwrap();
             let (mut active_budget, mut next_budget) = (budget(), budget());
             let active = join(&flights, &context, &owner_scope, &mut active_budget);
-            let mut page = fence().page;
+            let mut page = test_page();
             page.number = PageNumber(1);
             let mut waiting = Box::pin(flights.join_wait(
                 page,
@@ -401,7 +401,7 @@ mod flight {
                 let (mut active_budget, mut queued_budget) = (budget(), budget());
                 let mut active = join(&flights, &context, &scope, &mut active_budget);
                 let membership = active.membership.clone();
-                let mut absent = fence().page;
+                let mut absent = test_page();
                 absent.number = PageNumber(1);
                 let mut queued = Box::pin(flights.join_wait(
                     absent.clone(),
@@ -450,7 +450,7 @@ mod flight {
                     Err(Error::Overloaded)
                 ));
                 let leader = lead(&mut active);
-                let page = result(&flights, fence().page);
+                let page = result(&flights, test_page());
                 if partial {
                     flights
                         .publish_acquired(
@@ -465,7 +465,7 @@ mod flight {
                         .unwrap();
                     assert!(matches!(
                         flights.join_for(
-                            fence().page,
+                            test_page(),
                             membership,
                             &context,
                             &scope,
@@ -478,7 +478,7 @@ mod flight {
                     flights.publish(leader, page).unwrap();
                     assert!(matches!(
                         flights.join_for(
-                            fence().page,
+                            test_page(),
                             membership,
                             &context,
                             &scope,
@@ -507,7 +507,7 @@ mod flight {
                 (budget(), budget(), budget());
             let active = join(&flights, &context, &scope, &mut active_budget);
             let membership = active.membership.clone();
-            let mut page = fence().page;
+            let mut page = test_page();
             page.number = PageNumber(1);
             let mut head = Box::pin(flights.join_wait(
                 page.clone(),
@@ -576,7 +576,7 @@ mod flight {
                 (budget(), budget(), budget());
             let active = join(&flights, &context, &scope, &mut active_budget);
             let membership = active.membership.clone();
-            let mut page = fence().page;
+            let mut page = test_page();
             page.number = PageNumber(1);
             let mut head = Box::pin(flights.join_wait(
                 page.clone(),
@@ -637,7 +637,7 @@ mod flight {
                 .unwrap(),
             );
             let mut first = Box::pin(flights.join_wait(
-                fence().page,
+                test_page(),
                 membership.clone(),
                 &context,
                 &scope,
@@ -648,7 +648,7 @@ mod flight {
                 panic!("immediate admission");
             };
             assert_eq!(flights.admission_state(), (0, 0, false));
-            let mut page = fence().page;
+            let mut page = test_page();
             page.number = PageNumber(1);
             let mut waiting = Box::pin(flights.join_wait(
                 page.clone(),
@@ -684,7 +684,7 @@ mod flight {
             let (context, scope) = (origin(), scope());
             let (mut first_budget, mut next_budget) = (budget(), budget());
             let active = join(&flights, &context, &scope, &mut first_budget);
-            let mut page = fence().page;
+            let mut page = test_page();
             page.number = PageNumber(1);
             let mut waiting = Box::pin(flights.join_wait(
                 page,
@@ -742,7 +742,7 @@ mod flight {
                         Duration::from_secs(30)
                     };
                 let mut budget = AcquisitionBudget::new(original, 3, 8);
-                let mut page = fence().page;
+                let mut page = test_page();
                 page.number = PageNumber(1);
                 let mut waiting = Box::pin(flights.join_wait(
                     page,
@@ -823,7 +823,7 @@ mod flight {
                 (budget(), budget(), budget(), budget());
             let active = join(&flights, &context, &scope, &mut active_budget);
             let membership = active.membership.clone();
-            let mut page = fence().page;
+            let mut page = test_page();
             page.number = PageNumber(1);
             let mut other_page = page.clone();
             other_page.number = PageNumber(2);
@@ -875,7 +875,7 @@ mod flight {
             let membership = first.membership.clone();
             let leader = lead(&mut first);
             let operation = flights.retain_operation(&leader, metric_lease()).unwrap();
-            let mut page = fence().page;
+            let mut page = test_page();
             page.number = PageNumber(1);
             let count = std::sync::Arc::new(crate::test_support::WakeCounter::default());
             let waker = Waker::from(count.clone());
@@ -912,7 +912,7 @@ mod flight {
                 (budget(), budget(), budget(), budget());
             let active = join(&flights, &context, &scope, &mut active_budget);
             let membership = active.membership.clone();
-            let mut page = fence().page;
+            let mut page = test_page();
             page.number = PageNumber(1);
             let mut head = Box::pin(flights.join_wait(
                 page.clone(),
@@ -959,7 +959,7 @@ mod flight {
             let leader = lead(&mut supplier);
             let operation = flights.retain_operation(&leader, metric_lease()).unwrap();
             for _ in 0..1100 {
-                let mut copy = match flights.join_copy(&fence().page, &readers).unwrap() {
+                let mut copy = match flights.join_copy(&test_page(), &readers).unwrap() {
                     JoinedCopy::Waiter(waiter) => waiter,
                     _ => panic!("expected live flight"),
                 };
@@ -973,11 +973,11 @@ mod flight {
                 drop(tasks);
                 drop(copy);
             }
-            let mut first = match flights.join_copy(&fence().page, &readers).unwrap() {
+            let mut first = match flights.join_copy(&test_page(), &readers).unwrap() {
                 JoinedCopy::Waiter(waiter) => waiter,
                 _ => panic!("expected live flight"),
             };
-            let mut second = match flights.join_copy(&fence().page, &readers).unwrap() {
+            let mut second = match flights.join_copy(&test_page(), &readers).unwrap() {
                 JoinedCopy::Waiter(waiter) => waiter,
                 _ => panic!("expected live flight"),
             };
@@ -1062,15 +1062,16 @@ mod flight {
             flights
                 .table
                 .borrow_mut()
-                .get_mut(&fence().page)
+                .entry_mut(&test_page())
                 .unwrap()
+                .state_mut()
                 .waiters
                 .get_mut(&b.registration.id)
                 .unwrap()
                 .budget_deadline = Instant::now();
             {
                 let mut table = flights.table.borrow_mut();
-                let entry = table.get_mut(&fence().page).unwrap();
+                let entry = table.entry_mut(&test_page()).unwrap().state_mut();
                 entry
                     .deadlines
                     .retain(|(_, id), _| *id != b.registration.id);
@@ -1092,7 +1093,7 @@ mod flight {
             let mut a = join(&flights, &context, &scope_a, &mut a_budget);
             let mut b = join(&flights, &context, &scope_b, &mut b_budget);
             let leader = lead(&mut a);
-            let old_fence = leader.fence.clone();
+            let old_ticket = leader.ticket;
             a.acquisition(&leader)
                 .unwrap()
                 .budget
@@ -1100,7 +1101,7 @@ mod flight {
                 .unwrap();
             assert!(poll(b.wait()).is_pending());
             let operation = flights.retain_operation(&leader, metric_lease()).unwrap();
-            let id = operation.id;
+            let id = operation.operation;
             assert_eq!(
                 flights.fail(leader, AcquisitionFailure::OriginRejected),
                 Ok(FlightState::Draining)
@@ -1110,19 +1111,19 @@ mod flight {
             assert!(operation.cancellation_requested());
             operation.complete().unwrap();
             let retry = lead(&mut b);
-            assert!(retry.fence.generation > old_fence.generation);
+            assert!(retry.ticket.generation > old_ticket.generation);
             assert_eq!(
                 b.acquisition(&retry).unwrap().budget.remaining_attempts(),
                 3
             );
             assert_eq!(
-                flights.complete_operation(&old_fence, id),
+                flights.complete_operation(&test_page(), id),
                 Err(Error::StaleFlight)
             );
             let stale = FlightLeader {
                 flights: flights.clone(),
-                fence: old_fence,
-                caller: a.registration.id,
+                page: test_page(),
+                ticket: old_ticket,
                 active: true,
             };
             assert_eq!(
@@ -1163,8 +1164,9 @@ mod flight {
                 flights
                     .table
                     .borrow()
-                    .get(&fence().page)
+                    .entry(&test_page())
                     .unwrap()
+                    .state()
                     .phase
                     .state(),
                 FlightState::Draining
@@ -1193,13 +1195,13 @@ mod flight {
             let (context, scope_a, copy_scope) = (origin(), scope(), scope());
             let mut a_budget = budget();
             assert!(matches!(
-                flights.join_copy(&fence().page, &copy_scope),
+                flights.join_copy(&test_page(), &copy_scope),
                 Ok(JoinedCopy::Miss)
             ));
             let mut a = join(&flights, &context, &scope_a, &mut a_budget);
             let leader = lead(&mut a);
             let operation = flights.retain_operation(&leader, metric_lease()).unwrap();
-            let mut copy = match flights.join_copy(&fence().page, &copy_scope).unwrap() {
+            let mut copy = match flights.join_copy(&test_page(), &copy_scope).unwrap() {
                 JoinedCopy::Waiter(waiter) => waiter,
                 _ => panic!("expected copy waiter"),
             };
@@ -1227,12 +1229,12 @@ mod flight {
             let flights = flights(FlightLimits::default());
             let (context, scope_a) = (origin(), scope());
             let mut a_budget = budget();
-            let page = fence().page;
+            let page = test_page();
             assert!(!flights.acquiring(&page));
             let mut a = join(&flights, &context, &scope_a, &mut a_budget);
             let leader = lead(&mut a);
             assert!(flights.acquiring(&page));
-            let result = result(&flights, fence().page);
+            let result = result(&flights, test_page());
             assert_eq!(flights.publish(leader, result), Ok(FlightState::Complete));
             assert!(!flights.acquiring(&page));
         }
@@ -1262,7 +1264,7 @@ mod flight {
             drop(a);
             assert!(poll(b.wait()).is_pending(), "no second election");
             operation.complete().unwrap();
-            let page = result(&flights, fence().page);
+            let page = result(&flights, test_page());
             assert_eq!(flights.publish(leader, page), Ok(FlightState::Complete));
             assert!(matches!(
                 poll(b.wait()),
@@ -1283,7 +1285,7 @@ mod flight {
             let mut a = join(&flights, &context, &scope_a, &mut a_budget);
             let mut b = join(&flights, &context, &scope_b, &mut b_budget);
             let leader = lead(&mut a);
-            let mut copy = match flights.join_copy(&fence().page, &scope_c).unwrap() {
+            let mut copy = match flights.join_copy(&test_page(), &scope_c).unwrap() {
                 JoinedCopy::Waiter(waiter) => waiter,
                 _ => panic!("expected copy waiter"),
             };
@@ -1351,7 +1353,7 @@ mod flight {
             let b = join(&flights, &context, &scope_b, &mut b_budget);
             let mut c = join(&flights, &context, &scope_c, &mut c_budget);
             let leader = lead(&mut a);
-            let page = fence().page;
+            let page = test_page();
             let mut operation = flights.retain_operation(&leader, metric_lease()).unwrap();
             flights.allow_handover(&leader).unwrap();
             assert!(!operation.poll_cancellation(cx));
@@ -1397,7 +1399,7 @@ mod flight {
             assert!(operation.cancellation_requested());
             assert!(poll(b.wait()).is_pending());
             operation.complete().unwrap();
-            assert!(lead(&mut b).fence.generation > leader.fence.generation);
+            assert!(lead(&mut b).ticket.generation > leader.ticket.generation);
         }
 
         #[test]
@@ -1407,7 +1409,7 @@ mod flight {
             let (mut first_budget, mut next_budget) = (budget(), budget());
             let mut first = join(&flights, &context, &first_scope, &mut first_budget);
             let leader = lead(&mut first);
-            let incarnation = leader.fence.incarnation;
+            let incarnation = leader.ticket.incarnation;
             let operation = flights.retain_operation(&leader, metric_lease()).unwrap();
             drop(leader);
             drop(first);
@@ -1418,7 +1420,7 @@ mod flight {
             operation.complete().unwrap();
             assert_eq!(flights.admission.used(ResourceClass::ControlProgress), 0);
             let replacement = lead(&mut next);
-            assert_eq!(replacement.fence.incarnation, incarnation);
+            assert_eq!(replacement.ticket.incarnation, incarnation);
             drop(replacement);
             drop(next);
             assert!(flights.table.borrow().is_empty());
@@ -1454,7 +1456,7 @@ mod flight {
                 let leader = lead(&mut first);
                 let mut next = join(&flights, &context, &next_scope, &mut next_budget);
                 let JoinedCopy::Waiter(mut copy_waiter) =
-                    flights.join_copy(&fence().page, &next_scope).unwrap()
+                    flights.join_copy(&test_page(), &next_scope).unwrap()
                 else {
                     panic!("expected copy waiter");
                 };
@@ -1499,8 +1501,7 @@ mod flight {
             let (mut a_budget, mut b_budget) = (budget(), budget());
             let mut a = join(&first, &context, &scope, &mut a_budget);
             let leader = lead(&mut a);
-            let old = leader.fence.clone();
-            let caller = leader.caller;
+            let old = leader.ticket;
             assert_eq!(
                 other.fail(leader, AcquisitionFailure::OriginRejected),
                 Err(Error::StaleFlight)
@@ -1508,11 +1509,11 @@ mod flight {
             a.detach().unwrap();
             let mut b = join(&first, &context, &scope, &mut b_budget);
             let leader = lead(&mut b);
-            assert_ne!(old.incarnation, leader.fence.incarnation);
+            assert_ne!(old.incarnation, leader.ticket.incarnation);
             let stale = FlightLeader {
                 flights: first.clone(),
-                fence: old,
-                caller,
+                page: test_page(),
+                ticket: old,
                 active: true,
             };
             assert_eq!(
@@ -1541,10 +1542,10 @@ mod flight {
             let mut b = join(&flights, &context, &scope, &mut b_budget);
             // A full flight proves the fetch; a full table below does not.
             assert!(matches!(
-                flights.join_copy(&fence().page, &scope),
+                flights.join_copy(&test_page(), &scope),
                 Err(Error::FlightFull)
             ));
-            let mut another_page = fence().page;
+            let mut another_page = test_page();
             another_page.number = PageNumber(1);
             assert!(matches!(
                 flights.join(
@@ -1608,13 +1609,13 @@ mod flight {
                 )
                 .unwrap();
             assert!(matches!(
-                flights.join_copy(&fence().page, &scope),
+                flights.join_copy(&test_page(), &scope),
                 Err(Error::Overloaded)
             ));
             let mut extra_budget = budget();
             assert!(matches!(
                 flights.join(
-                    fence().page,
+                    test_page(),
                     first.membership.clone(),
                     &context,
                     &scope,
@@ -1632,7 +1633,7 @@ mod flight {
                         - flights.admission.used(ResourceClass::Flight),
                 )
                 .unwrap();
-            let mut other = fence().page;
+            let mut other = test_page();
             other.number = PageNumber(1);
             assert!(matches!(
                 flights.join(
@@ -1652,7 +1653,7 @@ mod flight {
             let mut second_budget = budget();
             assert!(matches!(
                 flights.join(
-                    fence().page,
+                    test_page(),
                     first.membership.clone(),
                     &context,
                     &scope,
@@ -1697,7 +1698,13 @@ mod flight {
             drop(leader);
             assert!(operation.cancellation_requested());
             assert!(matches!(
-                flights.table.borrow().get(&fence().page).unwrap().phase,
+                flights
+                    .table
+                    .borrow()
+                    .entry(&test_page())
+                    .unwrap()
+                    .state()
+                    .phase,
                 Phase::Draining(_)
             ));
             let expired =
@@ -1708,7 +1715,7 @@ mod flight {
             ));
             assert_eq!(flights.table.borrow().len(), 1);
             assert!(matches!(
-                flights.join_copy(&fence().page, &scope),
+                flights.join_copy(&test_page(), &scope),
                 Err(Error::Cancelled)
             ));
             operation.complete().unwrap();
@@ -1723,14 +1730,14 @@ mod flight {
             let mut a = join(&flights, &context, &scope, &mut a_budget);
             let leader = lead(&mut a);
             let operation = flights.retain_operation(&leader, metric_lease()).unwrap();
-            let (fence, id) = (operation.fence.clone(), operation.id);
+            let (page, id) = (operation.page.clone(), operation.operation);
             drop(operation);
             drop(leader);
             drop(a);
             flights.poll_budgeted(100).unwrap();
             assert_eq!(flights.table.borrow().len(), 1);
             // Simulate the worker reaping the actual completion, not request drop.
-            flights.complete_operation(&fence, id).unwrap();
+            flights.complete_operation(&page, id).unwrap();
             assert!(flights.table.borrow().is_empty());
         }
     }
@@ -1781,7 +1788,7 @@ mod flight {
     }
     fn origin() -> OriginContext {
         OriginContext {
-            object: fence().page.version.object,
+            object: test_page().version.object,
             metadata: None,
             authorization: None,
         }
@@ -1800,7 +1807,7 @@ mod flight {
                 .unwrap(),
         );
         match flights
-            .join(fence().page, membership, context, scope, budget)
+            .join(test_page(), membership, context, scope, budget)
             .unwrap()
         {
             JoinedFlight::Waiter(waiter) => waiter,
@@ -1943,13 +1950,13 @@ mod flight {
         let (mut a_budget, mut b_budget) = (budget(), budget());
         let mut a = join(&flights, &context, &scope, &mut a_budget);
         let mut b = join(&flights, &context, &scope, &mut b_budget);
-        let mut copy = match flights.join_copy(&fence().page, &scope).unwrap() {
+        let mut copy = match flights.join_copy(&test_page(), &scope).unwrap() {
             JoinedCopy::Waiter(waiter) => waiter,
             _ => panic!("expected copy"),
         };
         let leader = lead(&mut a);
         let operation = flights.retain_operation(&leader, metric_lease()).unwrap();
-        let page = result(&flights, fence().page);
+        let page = result(&flights, test_page());
         assert_eq!(
             flights.publish(leader, page.clone()),
             Ok(FlightState::Draining)
@@ -1993,12 +2000,12 @@ mod flight {
             &page.ciphertext.inner
         ));
         assert!(matches!(
-            flights.join_copy(&fence().page, &scope),
+            flights.join_copy(&test_page(), &scope),
             Ok(JoinedCopy::Complete(_))
         ));
         assert!(matches!(
             flights.join(
-                fence().page,
+                test_page(),
                 a.membership.clone(),
                 &context,
                 &scope,
@@ -2011,7 +2018,7 @@ mod flight {
         drop(copy);
         assert!(flights.table.borrow().is_empty());
         assert!(matches!(
-            flights.join_copy(&fence().page, &scope),
+            flights.join_copy(&test_page(), &scope),
             Ok(JoinedCopy::Miss)
         ));
         // Readers own their bundles independently of the flight entry.
@@ -2027,13 +2034,13 @@ mod flight {
         let mut b = join(&flights, &context, &scope, &mut b_budget);
         let mut c = join(&flights, &context, &scope, &mut c_budget);
         let leader = lead(&mut a);
-        let generation = leader.fence.generation;
-        let mut bad = result(&flights, fence().page);
+        let generation = leader.ticket.generation;
+        let mut bad = result(&flights, test_page());
         bad.metadata.length = 4;
         assert_eq!(flights.publish(leader, bad), Err(Error::CorruptRecord));
         failed(&mut a, Error::Cancelled);
         let retry = lead(&mut b);
-        assert!(retry.fence.generation > generation);
+        assert!(retry.ticket.generation > generation);
         assert_eq!(
             flights.fail(retry, AcquisitionFailure::OriginForbidden),
             Ok(FlightState::RetryPending)
@@ -2121,47 +2128,57 @@ mod flight {
         assert_eq!(uring_runtime::drivers::pending(), 0);
     }
 
-    fn fence() -> Fence {
-        Fence {
-            page: PageId {
-                version: ObjectVersion {
-                    object: ObjectId {
-                        cache: CacheId(crate::test_support::security::CACHE.into()),
-                        key: CacheKey([0; 32]),
-                    },
-                    etag: StrongEtag::test_value("v1"),
+    fn test_page() -> PageId {
+        PageId {
+            version: ObjectVersion {
+                object: ObjectId {
+                    cache: CacheId(crate::test_support::security::CACHE.into()),
+                    key: CacheKey([0; 32]),
                 },
-                number: PageNumber(0),
+                etag: StrongEtag::test_value("v1"),
             },
-            identity: flow_control::coalesce::flight::Identity {
-                owner: Rc::new(()),
-                incarnation: 1,
-                generation: 1,
-            },
+            number: PageNumber(0),
         }
     }
 
     #[test]
     fn fences_reject_other_tables_pages_recreated_entries_and_late_retries() {
-        let current = fence();
-        assert_eq!(current.validate(&current.clone()), Ok(()));
-        let mut stale = current.clone();
-        stale.owner = Rc::new(());
-        assert_eq!(stale.validate(&current), Err(Error::StaleFlight));
-        let mut stale = current.clone();
-        stale.page.number = PageNumber(1);
-        assert_eq!(stale.validate(&current), Err(Error::StaleFlight));
-        let mut stale = current.clone();
-        stale.incarnation += 1;
-        assert_eq!(stale.validate(&current), Err(Error::StaleFlight));
-        let mut stale = current.clone();
-        stale.generation += 1;
-        assert_eq!(stale.validate(&current), Err(Error::StaleFlight));
+        let flights = flights(FlightLimits::default());
+        let (context, scope_a) = (origin(), scope());
+        let mut a_budget = budget();
+        let mut a = join(&flights, &context, &scope_a, &mut a_budget);
+        let leader = lead(&mut a);
+        let forged = |edit: &dyn Fn(&mut FlightLeader)| {
+            let mut stale = FlightLeader {
+                flights: flights.clone(),
+                page: leader.page.clone(),
+                ticket: leader.ticket,
+                active: true,
+            };
+            edit(&mut stale);
+            stale
+        };
+        let stale: [&dyn Fn(&mut FlightLeader); 4] = [
+            &|l| l.ticket.fence.0 += 1,
+            &|l| l.page.number = PageNumber(1),
+            &|l| l.ticket.incarnation += 1,
+            &|l| l.ticket.generation += 1,
+        ];
+        for edit in stale {
+            assert_eq!(
+                flights.fail(forged(edit), AcquisitionFailure::Terminal(Error::Io)),
+                Err(Error::StaleFlight)
+            );
+        }
+        assert!(a.acquisition(&leader).is_ok());
+        flights
+            .fail(leader, AcquisitionFailure::Terminal(Error::Io))
+            .unwrap();
     }
 
     #[test]
     fn request_context_must_match_both_cache_and_key_before_join() {
-        let page = fence().page;
+        let page = test_page();
         let mut context = OriginContext {
             object: page.version.object.clone(),
             metadata: None,
