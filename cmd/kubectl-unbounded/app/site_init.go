@@ -61,7 +61,6 @@ type siteInitHandler struct {
 	// Defaults to true.
 	manageCniPlugin bool
 
-	enableMachina  bool
 	enableMetalman bool
 
 	// kubeCli is the kubernetes client interface.
@@ -315,7 +314,6 @@ func (h *siteInitHandler) clusterSiteConfig() unboundedSiteConfig {
 		NodeCIDRs:            []string{h.clusterNodeCIDR},
 		PodCIDRs:             []string{h.clusterPodCIDR},
 		ManageCniPlugin:      h.manageCniPlugin,
-		EnableMachina:        h.enableMachina,
 		EnableTokenRefresher: false,
 		Manifests: []string{
 			"gatewaypool.yaml",
@@ -395,7 +393,6 @@ type unboundedSiteConfig struct {
 	NodeCIDRs            []string
 	PodCIDRs             []string
 	Manifests            []string
-	EnableMachina        bool
 	EnableMetalman       bool
 	EnableTokenRefresher bool
 	// ManageCniPlugin controls whether unbounded-net manages the CNI plugin.
@@ -484,7 +481,6 @@ func siteInitCommand() *cobra.Command {
 	cmd.Flags().StringVar(&handler.nodeCIDR, "node-cidr", "", "The node CIDR")
 	cmd.Flags().StringVar(&handler.podCIDR, "pod-cidr", "", "The pod CIDR")
 	cmd.Flags().BoolVar(&handler.manageCniPlugin, "manage-cni-plugin", true, "Whether unbounded-net manages the CNI plugin; set to false when the cluster already has a CNI (e.g. Cilium, Calico)")
-	cmd.Flags().BoolVar(&handler.enableMachina, "enable-machina", true, "Enable machina for the Site")
 	cmd.Flags().BoolVar(&handler.enableMetalman, "enable-metalman", false, "Enable metalman for the Site")
 
 	if err := cmd.MarkFlagRequired("name"); err != nil {

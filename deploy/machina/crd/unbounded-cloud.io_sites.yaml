@@ -25,10 +25,6 @@ spec:
     - jsonPath: .spec.podCidrAssignments
       name: Pod CIDR Assignments
       type: string
-    - jsonPath: .spec.components.machina.enabled
-      name: Machina
-      priority: 1
-      type: boolean
     - jsonPath: .spec.components.metalman.enabled
       name: Metalman
       priority: 1
@@ -101,8 +97,9 @@ spec:
                         type: boolean
                     type: object
                   machina:
-                    description: Machina configures the machina controller for this
-                      site.
+                    description: |-
+                      Machina is a deprecated compatibility setting and is ignored.
+                      Machina is required and cannot be disabled.
                     properties:
                       enabled:
                         description: Enabled controls whether the component is reconciled.

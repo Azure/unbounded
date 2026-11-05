@@ -86,7 +86,8 @@ A **Site** represents a remote location where machines will run. The `site init`
 command requires the operator to already be installed (it errors otherwise). It
 creates site resources, records the requested components in
 `Site.spec.components`, and generates a bootstrap token. The operator deploys
-unbounded-net, machina, and optional components from the Site specs.
+unbounded-net and machina as required cluster singletons whenever a Site exists,
+plus optional components from the Site specs.
 
 ```bash
 kubectl unbounded site init \
@@ -112,7 +113,6 @@ kubectl unbounded site init \
 |------|-------------|
 | `--kubeconfig` | Path to kubeconfig file |
 | `--manage-cni-plugin` | Set to `false` when the cluster already has a CNI (default: `true`) |
-| `--enable-machina` | Enable machina on the cluster Site (default: `true`) |
 | `--enable-metalman` | Enable the metalman component in the Site spec |
 
 </details>
