@@ -2296,20 +2296,26 @@ pub(crate) mod tests {
                             .is_none()
                     );
                 }
+                // Certificates must be valid at the worker clock that verifies them, which
+                // runs two days ahead of host time in the expired case.
+                let issued_at = r.ctx().clock.wall_now() - Duration::from_secs(1);
+                let issue = |request: &_, ca: &_, key: &_, node: &str| {
+                    testing::issue_at(request, ca, key, node, issued_at)
+                };
                 let old = std::fs::read(d.0.join("identity/identity.json")).unwrap();
                 let request =
                     testing::drive(&r, e.prepare(vec![], NonZeroU32::new(4).unwrap(), &scope))
                         .unwrap();
-                let response = testing::issue(&request, &ca, &key, NEW_NODE);
+                let response = issue(&request, &ca, &key, NEW_NODE);
                 let mut wrong_san = response.clone();
                 wrong_san.node = NodeId(OLD_NODE.into());
                 let mut wrong_id = response.clone();
                 wrong_id.enrollment = EnrollmentId(OLD_NODE.into());
                 let mut foreign_request = request.clone();
                 foreign_request.cluster = ClusterId("44444444-4444-4444-8444-444444444444".into());
-                let foreign = testing::issue(&foreign_request, &ca, &key, NEW_NODE);
+                let foreign = issue(&foreign_request, &ca, &key, NEW_NODE);
                 let (rogue_ca, rogue_key) = testing::ca();
-                let rogue = testing::issue(&request, &rogue_ca, &rogue_key, NEW_NODE);
+                let rogue = issue(&request, &rogue_ca, &rogue_key, NEW_NODE);
                 let other = Enrollment::new(
                     e.cluster().clone(),
                     d.0.join("token"),
@@ -2322,7 +2328,7 @@ pub(crate) mod tests {
                 )
                 .unwrap();
                 other_request.enrollment = request.enrollment.clone();
-                let wrong_key = testing::issue(&other_request, &ca, &key, NEW_NODE);
+                let wrong_key = issue(&other_request, &ca, &key, NEW_NODE);
                 for bad in [wrong_san, wrong_id, foreign, rogue, wrong_key] {
                     assert!(matches!(
                         testing::drive(&r, e.accept_response(bad, &scope)),
