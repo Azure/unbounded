@@ -9,6 +9,7 @@ use crate::http::new_pipe_pool;
 use crate::model::ExpiresAt;
 use crate::model::ObjectMetadata;
 use crate::model::ObjectVersion;
+use crate::model::PAGE_BYTES;
 use crate::model::StrongEtag;
 use crate::read::ReadResponse;
 use crate::runtime::Cancellation;

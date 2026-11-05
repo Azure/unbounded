@@ -535,16 +535,10 @@ pub fn request_head(clock: &racer_io::Clock, request: &PeerRequest) -> Result<Me
         Operation::Page { page, mode } => {
             push(&mut head, "racer-operation", "page");
             version_fields(&mut head, &page.version)?;
+            // The page number is the whole request: the provider cuts it at the
+            // published page size, so no byte range (which would need that size
+            // here) travels with it. Decoders never read one.
             push(&mut head, "racer-page", page.number.0);
-            let start = page
-                .number
-                .0
-                .checked_mul(PAGE_BYTES)
-                .ok_or(Error::InvalidRange)?;
-            let end = start
-                .checked_add(PAGE_BYTES - 1)
-                .ok_or(Error::InvalidRange)?;
-            push(&mut head, "range", format!("bytes={start}-{end}"));
             (&page.version.object, mode)
         }
         Operation::Metadata {
