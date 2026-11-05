@@ -744,9 +744,15 @@ Site, the allocation's Site is that Site. An allocation with neither a class nor
 a snapshot is served by every allocation controller and fails with
 `InvalidRequest`. It launches a host in this order:
 
-1. Once the class is `Ready` for its current generation and its live inputs
-   still match the class status, the controller selects an offering, calls the
-   provider's `PlanAllocation`, and writes `status.snapshot`,
+1. It checks that `spec.classRef.name` and `spec.consumerRef.uid`, which become
+   the `unbounded-cloud.io/machine-class` and `unbounded-cloud.io/consumer-uid`
+   label values as written, are valid label values (at most 63 characters).
+   Otherwise the allocation fails with `InvalidRequest` and gets no snapshot.
+   Once the class is `Ready` for its current generation and its live inputs
+   still match the class status, the controller selects an offering. It also
+   checks that the class's Site name and the node labels the Machine will
+   register with are valid labels, and fails with `InvalidRequest` otherwise.
+   It then calls the provider's `PlanAllocation`, and writes `status.snapshot`,
    `status.providerID` (`unbounded:///machineallocations/<uid>`), the planned
    instance type, zone, capacity type, image, capacity, allocatable, and labels
    in one status write.
@@ -813,10 +819,13 @@ When release is authorized, the controller waits for the recorded
 `HostAllocate` to finish, creates the `HostRelease` operation, records it in
 `status.operations.release`, and waits for it. The `HostRelease` acts only on
 the resources in `status.ownedResources` and those the `HostAllocate`
-reported. When it completes, the controller removes its finalizers from the
-operations, the Machine, and the input `ConfigMap`s, sets `Released`, and
-removes its own finalizer. An allocation with no recorded `HostAllocate`
-finishes without a `HostRelease`. The controller does not delete the Machine
+reported. When the `HostAllocate` may have created a host but reported no owned
+resources, the controller holds with `OwnershipUnknown` instead of releasing.
+When the `HostRelease` completes, the controller first sets `Released=True` in a
+status write of its own. That is the commit point: from then on it only removes
+its finalizers, from the operations, the Machine, and the input `ConfigMap`s,
+and its own finalizer last, and it never looks at the operations again. An
+allocation with no recorded `HostAllocate` finishes without a `HostRelease`. The controller does not delete the Machine
 or the Node; deleting the allocation garbage-collects the Machine and the
 operations it owns.
 
@@ -835,6 +844,7 @@ operations it owns.
 | `Released` | `False` | `AwaitingAllocateOperation` | Waiting for the recorded `HostAllocate` to finish. |
 | `Released` | `False` | `Releasing` | Waiting for the `HostRelease`. |
 | `Released` | `False` | `ReleaseFailed` | Hold: the `HostRelease` failed. |
+| `Released` | `False` | `OwnershipUnknown` | Hold: the `HostAllocate` failed with `OwnershipUnknown`, or has a provider handle and no reported result, so a host may exist that release would not know about. The failure is `ProviderFailed`. |
 | `Released` | `False` | `AllocateOperationMissing`, `ReleaseOperationMissing` | Hold: a recorded operation is gone or was replaced. `AllocateOperationMissing` also sets the `ProviderConflict` failure. |
 | `Released` | `False` | `MachineMissing` | Hold: the Machine is gone before its host was released. |
 | `Released` | `False` | `BeginOutcomeUnknown` | Hold: the `HostAllocate` may have begun and cannot be begun again. |
@@ -865,12 +875,18 @@ providerID match the snapshot. An unrecorded operation under the deterministic
 name waits for the record. Any other failed check fails the operation, or,
 once `Begin` may have run, holds it with the reason in the target message and
 the `Completed` condition, such as `BeginOutcomeUnknown` or
-`AuthorityReplaced`. The user data is `cloud-init` that writes the bootstrap
+`AuthorityReplaced`. A provider must report its owned resources in
+`OperationResult.Allocation` on every terminal `HostAllocate` Poll result,
+including failures, and its `Begin` may return a `PermanentError` only when it
+created nothing. A terminal result without a report, a Poll `PermanentError`,
+or a `Begin` `PermanentError` after `Begin` may already have run fails the
+operation with `OwnershipUnknown`. The user data is `cloud-init` that writes the bootstrap
 files to `/var/lib/unbounded/bootstrap`, runs its `run` file, and then installs
 the agent, verifying `spec.bootstrap.agentArtifact.sha256` when the class sets
 an artifact. The agent's kubelet registers with `status.providerID`. A
 `HostRelease` begins only once `spec.lifecycle` is `Released`, the Machine is
-fenced or being deleted, and the recorded `HostAllocate` has finished.
+fenced or being deleted, and the recorded `HostAllocate` has finished with
+known ownership.
 
 On a Machine bound to an allocation, `HostReplace`, `HostPowerOn`, and
 `HostPowerOff` fail with `UnsupportedOperation`, and every host operation on a
