@@ -8,7 +8,10 @@
 //! node holds which page). It never decides where to probe, when to fetch from origin or
 //! whom to shed; the cores do. See `dst/MODEL.md` for what is and is not modeled yet.
 
+pub mod control;
 pub mod coverage;
+#[allow(missing_docs)]
+pub mod ctl_report;
 pub mod membership;
 pub mod phantom;
 mod report;

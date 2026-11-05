@@ -138,8 +138,8 @@ pub enum Poll {
 /// has nothing to serve). One poll per node: a second answers 429. On `Ok`
 /// the poll stays in `set` until the caller removes it; on `Err` it is not
 /// held.
-pub fn start_poll<K: Eq + std::hash::Hash + Clone>(
-    set: &mut HashSet<K>,
+pub fn start_poll<K: Eq + std::hash::Hash + Clone, S: std::hash::BuildHasher>(
+    set: &mut HashSet<K, S>,
     node: &K,
     after: Option<u64>,
     current: Option<u64>,
