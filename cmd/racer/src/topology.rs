@@ -52,17 +52,20 @@ pub struct LinkHealth {
     /// Destinations whose routes skip relays that left an exchange
     /// unanswered (`racer_core::liveness::Detours`).
     detours: std::cell::RefCell<racer_core::liveness::Detours<NodeId>>,
+    /// Worker time for circuit, silence, and detour state.
+    clock: racer_io::Clock,
 }
 pub type LinkProbe<'a> = flow_control::Probe<'a, NodeId>;
+#[cfg(test)]
 impl Default for LinkHealth {
-    /// Construct independent worker-local circuit state for all possible neighbors.
+    /// Construct independent worker-local circuit state on the selected clock.
     fn default() -> Self {
-        Self::new(LINK_HEALTH_CAPACITY)
+        Self::new(LINK_HEALTH_CAPACITY, crate::test_support::clock())
     }
 }
 impl LinkHealth {
     pub fn acquire(&self, node: &NodeId) -> Result<LinkProbe<'_>> {
-        self.acquire_at(node, uring_runtime::environment::now())
+        self.acquire_at(node, self.clock.now())
     }
     pub fn acquire_at(&self, node: &NodeId, now: Instant) -> Result<LinkProbe<'_>> {
         self.inner.acquire(node, now).map_err(Into::into)
@@ -83,8 +86,9 @@ impl LinkHealth {
         }
         result
     }
-    pub fn new(capacity: usize) -> Self {
+    pub fn new(capacity: usize, clock: racer_io::Clock) -> Self {
         Self {
+            clock,
             inner: flow_control::Circuits::new(capacity, Duration::from_secs(1)),
             silence: std::cell::RefCell::new(Silence::new(
                 racer_core::liveness::SILENCE_CAPACITY,
@@ -122,7 +126,7 @@ impl LinkHealth {
         sent: Instant,
         needed: u32,
     ) -> bool {
-        let now = uring_runtime::environment::now();
+        let now = self.clock.now();
         self.detours.borrow_mut().timed_out(peer.clone(), sent, now);
         self.silence
             .borrow_mut()
@@ -134,16 +138,14 @@ impl LinkHealth {
     }
     /// `peer` answered an exchange: it is not hung.
     pub fn silence_answered(&self, peer: &NodeId) {
-        self.silence
-            .borrow_mut()
-            .answered(peer, uring_runtime::environment::now());
+        self.silence.borrow_mut().answered(peer, self.clock.now());
     }
     /// `peer` itself shed an exchange for `page` (an `Overloaded` it
     /// signed): it is alive and busy; see `Silence::shed`.
     pub fn silence_shed(&self, peer: &NodeId, page: crate::model::PageId) {
         self.silence
             .borrow_mut()
-            .shed(peer.clone(), page, uring_runtime::environment::now());
+            .shed(peer.clone(), page, self.clock.now());
     }
     /// At most `max` pings due now, each marked outstanding
     /// (`Silence::due_pings`).
@@ -159,7 +161,7 @@ impl LinkHealth {
     /// visit order).
     pub fn answering(&self, peer: &NodeId) -> racer_core::read::Answering {
         use racer_core::read::Answering;
-        let now = uring_runtime::environment::now();
+        let now = self.clock.now();
         let silence = self.silence.borrow();
         if silence.silent(peer, now) {
             Answering::Silent
@@ -171,12 +173,10 @@ impl LinkHealth {
     }
     /// Whether `peer` is silent: requests for it fail at once.
     pub fn silent(&self, peer: &NodeId) -> bool {
-        self.silence
-            .borrow()
-            .silent(peer, uring_runtime::environment::now())
+        self.silence.borrow().silent(peer, self.clock.now())
     }
     pub fn observe(&self, neighbor: &NodeId, outcome: LinkOutcome) -> Result<()> {
-        self.observe_at(neighbor, outcome, uring_runtime::environment::now())
+        self.observe_at(neighbor, outcome, self.clock.now())
     }
     pub fn observe_at(&self, neighbor: &NodeId, outcome: LinkOutcome, now: Instant) -> Result<()> {
         if matches!(outcome, LinkOutcome::Success) {
@@ -189,14 +189,14 @@ impl LinkHealth {
     }
     /// Routing hint only; actual sends acquire an exclusive half-open probe.
     pub fn available(&self, neighbor: &NodeId) -> Result<bool> {
-        self.available_at(neighbor, uring_runtime::environment::now())
+        self.available_at(neighbor, self.clock.now())
     }
     pub fn available_at(&self, neighbor: &NodeId, now: Instant) -> Result<bool> {
         // A silent neighbor is routed around.
         Ok(self.inner.available(neighbor, now) && !self.silence.borrow().silent(neighbor, now))
     }
     pub fn try_acquire(&self, neighbor: &NodeId) -> Result<bool> {
-        self.try_acquire_at(neighbor, uring_runtime::environment::now())
+        self.try_acquire_at(neighbor, self.clock.now())
     }
     pub fn try_acquire_at(&self, neighbor: &NodeId, now: Instant) -> Result<bool> {
         Ok(self.inner.try_acquire(neighbor, now))
@@ -1034,7 +1034,7 @@ impl Paths {
     ) -> Operation<'a, Route> {
         Box::pin(async move {
             scope.check()?;
-            budget.validate_at(from, uring_runtime::environment::now())?;
+            budget.validate_at(from, self.health.clock.now())?;
             if membership.version != budget.membership {
                 return Err(Error::IncompatibleMembership);
             }
@@ -1055,7 +1055,7 @@ impl Paths {
             // primary relay that may have eaten the exchanges it follows up.
             let mut level = self
                 .health
-                .detour_level(&budget.destination, uring_runtime::environment::now());
+                .detour_level(&budget.destination, self.health.clock.now());
             if ping {
                 level = level.max(1);
             }
@@ -1077,7 +1077,7 @@ impl Paths {
                 std::future::poll_fn(|cx| {
                     if let Err(error) = scope
                         .check()
-                        .and_then(|()| budget.validate_at(from, uring_runtime::environment::now()))
+                        .and_then(|()| budget.validate_at(from, self.health.clock.now()))
                     {
                         return Poll::Ready(Err(error));
                     }
@@ -1089,7 +1089,7 @@ impl Paths {
                 .await
             };
             scope.check()?;
-            budget.validate_at(from, uring_runtime::environment::now())?;
+            budget.validate_at(from, self.health.clock.now())?;
             // Health/admission may change while yielded. Retry under the same budget.
             if self.blocked(&membership, source, exempt)? != blocked {
                 return Err(Error::Unavailable);
@@ -1108,7 +1108,7 @@ impl Paths {
         source: usize,
         exempt: Option<&NodeId>,
     ) -> Result<Vec<usize>> {
-        let now = uring_runtime::environment::now();
+        let now = self.health.clock.now();
         let positions = membership.inner.neighbors(source);
         let neighbors: Vec<_> = positions
             .iter()
@@ -1249,7 +1249,7 @@ pub(crate) mod tests {
         use crate::topology::tests::fixtures::object;
         #[test]
         fn owned_half_open_probe_remains_exclusive_until_completion_or_drop() {
-            let health = LinkHealth::new(1);
+            let health = LinkHealth::new(1, crate::test_support::clock());
             let node = NodeId("peer".into());
             health
                 .observe_at(
@@ -1279,7 +1279,7 @@ pub(crate) mod tests {
         }
         #[test]
         fn endpoint_application_errors_do_not_open_circuits_and_probes_are_bounded() {
-            let health = LinkHealth::new(2);
+            let health = LinkHealth::new(2, crate::test_support::clock());
             let endpoint = NodeId("origin".into());
             for error in [
                 Error::Unauthorized,
@@ -1311,8 +1311,8 @@ pub(crate) mod tests {
         }
         #[test]
         fn circuit_backoff_probes_success_and_isolation() {
-            let first = LinkHealth::new(2);
-            let second = LinkHealth::new(2);
+            let first = LinkHealth::new(2, crate::test_support::clock());
+            let second = LinkHealth::new(2, crate::test_support::clock());
             let node = NodeId("a".into());
             let now = Instant::now();
             assert!(first.try_acquire_at(&node, now).unwrap());
@@ -1349,7 +1349,7 @@ pub(crate) mod tests {
         }
         #[test]
         fn capacity_and_placement_are_independent() {
-            let health = LinkHealth::new(1);
+            let health = LinkHealth::new(1, crate::test_support::clock());
             let members = membership(3);
             let placement = Placement::new(1);
             let before = placement

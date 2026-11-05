@@ -3655,7 +3655,7 @@ mod explicit_clock {
 
     #[test]
     fn link_health_acquires_at_the_supplied_time() {
-        let health = LinkHealth::new(1);
+        let health = LinkHealth::new(1, crate::test_support::clock());
         let node = NodeId("b".into());
         let start = Instant::now();
         health

@@ -110,7 +110,7 @@ impl OriginClient {
             return Err(Error::InvalidConfiguration);
         }
         Ok(Self {
-            health: crate::topology::LinkHealth::new(64),
+            health: crate::topology::LinkHealth::new(64, io.reactor().ctx().clock.clone()),
             snapshots,
             pool,
             io,

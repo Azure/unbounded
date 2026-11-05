@@ -582,7 +582,13 @@ impl Requester {
     ) -> Rc<Self> {
         let capability = state.clone();
         Rc::new(Self::Scripted {
-            health: Rc::new(crate::topology::LinkHealth::default()),
+            health: Rc::new(crate::topology::LinkHealth::new(
+                crate::topology::LINK_HEALTH_CAPACITY,
+                #[cfg(test)]
+                crate::test_support::clock(),
+                #[cfg(not(test))]
+                racer_io::Clock::host(),
+            )),
             available: Box::new(move |m, n| available(&capability, m, n)),
             request: Box::new(move |r, m, scope, is_direct| {
                 let state = state.clone();

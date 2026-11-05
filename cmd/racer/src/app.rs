@@ -1304,8 +1304,11 @@ impl WorkerApplication {
                 // Silence: the rank 0 watch's
                 // allowance, and one peer attempt per ping.
                 Rc::new(
-                    LinkHealth::default()
-                        .with_silence(config.request_timeout / 2, config.peer_attempt_timeout),
+                    LinkHealth::new(
+                        crate::topology::LINK_HEALTH_CAPACITY,
+                        runtime.reactor.ctx().clock.clone(),
+                    )
+                    .with_silence(config.request_timeout / 2, config.peer_attempt_timeout),
                 ),
                 limits.cached_paths.get(),
                 limits.path_cache_bytes.get(),

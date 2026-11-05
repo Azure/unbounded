@@ -790,7 +790,7 @@ fn refused_socket_opens_only_immediate_link_and_selects_bounded_alternate() {
         )
         .unwrap(),
     );
-    let health = Rc::new(LinkHealth::new(36));
+    let health = Rc::new(LinkHealth::new(36, crate::test_support::clock()));
     let paths = Rc::new(Paths::new(health.clone(), 4));
     let requester = Requester::new(
         paths.clone(),
