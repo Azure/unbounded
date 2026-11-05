@@ -1,0 +1,30 @@
+# Only an identity granted the allocate verb on machines may create a Machine
+# with spec.allocationRef, which binds it to a MachineAllocation. Without this
+# policy any identity that may create Machines, such as the agent daemon group,
+# could create one bound to an allocation. spec.allocationRef cannot be added
+# after create, so updates need no rule.
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicy
+metadata:
+  name: unbounded-machine-allocationref
+spec:
+  failurePolicy: Fail
+  matchConstraints:
+    resourceRules:
+      - apiGroups: ["unbounded-cloud.io"]
+        apiVersions: ["*"]
+        operations: ["CREATE"]
+        resources: ["machines"]
+  validations:
+    - expression: "!has(object.spec) || !has(object.spec.allocationRef) || authorizer.group('unbounded-cloud.io').resource('machines').check('allocate').allowed()"
+      message: "only an identity granted the allocate verb on machines may set spec.allocationRef"
+      reason: Forbidden
+
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicyBinding
+metadata:
+  name: unbounded-machine-allocationref
+spec:
+  policyName: unbounded-machine-allocationref
+  validationActions: ["Deny"]

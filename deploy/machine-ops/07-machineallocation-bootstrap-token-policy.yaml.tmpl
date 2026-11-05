@@ -1,0 +1,48 @@
+# Limits the kube-system Secret writes of the MachineAllocation controller to
+# its own bootstrap tokens. RBAC cannot limit create or delete by name or
+# label, so the controller's kube-system Role grants them on every Secret.
+#
+# The policy applies to an identity allowed the allocate verb on machines,
+# which identifies the allocation controller, and that is not allowed "*" on
+# machines. RBAC matches a requested "*" only against a rule whose verbs
+# contain "*", so cluster-admin and system:masters, which keep their existing
+# token tooling, skip the policy while the controller's explicit verbs do not.
+# Never grant the allocation controller "*" on machines.
+#
+# Only kube-system Secrets match: the API server sets
+# kubernetes.io/metadata.name on every namespace to its name. Reads never
+# reach admission, and no allocation role grants update or patch on Secrets.
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicy
+metadata:
+  name: unbounded-machineallocation-bootstrap-tokens
+spec:
+  failurePolicy: Fail
+  matchConstraints:
+    resourceRules:
+      - apiGroups: [""]
+        apiVersions: ["v1"]
+        operations: ["CREATE", "DELETE"]
+        resources: ["secrets"]
+    namespaceSelector:
+      matchLabels:
+        kubernetes.io/metadata.name: kube-system
+  matchConditions:
+    - name: allocation-controller
+      expression: "authorizer.group('unbounded-cloud.io').resource('machines').check('allocate').allowed() && !authorizer.group('unbounded-cloud.io').resource('machines').check('*').allowed()"
+  validations:
+    - expression: "request.operation != 'CREATE' || (has(object.type) && object.type == 'bootstrap.kubernetes.io/token' && has(object.metadata.labels) && 'unbounded-cloud.io/allocation-uid' in object.metadata.labels && object.metadata.labels['unbounded-cloud.io/allocation-uid'] != '')"
+      message: "an identity granted the allocate verb on machines may create and delete only bootstrap token Secrets labeled unbounded-cloud.io/allocation-uid in kube-system"
+      reason: Forbidden
+    - expression: "request.operation != 'DELETE' || (has(oldObject.type) && oldObject.type == 'bootstrap.kubernetes.io/token' && has(oldObject.metadata.labels) && 'unbounded-cloud.io/allocation-uid' in oldObject.metadata.labels && oldObject.metadata.labels['unbounded-cloud.io/allocation-uid'] != '')"
+      message: "an identity granted the allocate verb on machines may create and delete only bootstrap token Secrets labeled unbounded-cloud.io/allocation-uid in kube-system"
+      reason: Forbidden
+
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicyBinding
+metadata:
+  name: unbounded-machineallocation-bootstrap-tokens
+spec:
+  policyName: unbounded-machineallocation-bootstrap-tokens
+  validationActions: ["Deny"]
