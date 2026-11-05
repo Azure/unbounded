@@ -115,16 +115,17 @@ func (o *runOptions) validate() error {
 
 // Run is the main daemon entry point. It discovers the active node, builds a
 // Kubernetes client, registers the Machine CR if needed, and blocks until the
-// context is canceled. modes is the operator of every isolation mode this agent
-// can operate, from the agent's mode composition table.
-func Run(ctx context.Context, log *slog.Logger, modes ModeOperators) error {
+// context is canceled. modes is the operator, and backends the backend, of
+// every isolation mode this agent can operate, from the agent's mode
+// composition table.
+func Run(ctx context.Context, log *slog.Logger, modes ModeOperators, backends ModeBackends) error {
 	// After an AgentUpgrade from a release that predates the host root, this is
 	// the first time the new agent runs on the host.
 	if err := MigrateHostRoot(log); err != nil {
 		return err
 	}
 
-	return run(ctx, log, runOptions{NodeOperator: newDispatchOperator(hostOperator{}, modes)})
+	return run(ctx, log, runOptions{NodeOperator: newDispatchOperator(newHostOperator(backends), modes)})
 }
 
 // run is the inner loop. Tests can override external dependencies through opts.
