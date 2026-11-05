@@ -266,6 +266,8 @@ enum Ev {
         links: u8,
         /// When the requester abandons the exchange.
         abandon: Nanos,
+        /// The destination verified the request and its worker took it: serve now.
+        verified: bool,
     },
     /// Probe `id` of `(node, worker, read)` reached its attempt bound
     /// (`AttemptPlan::attempt_end`) unanswered.
@@ -696,6 +698,12 @@ impl<'s> Model<'s> {
                         self.report.counters.late_answers += 1;
                         return;
                     };
+                    if let Reply::Answer { .. } = reply {
+                        // The requester verifies the signed response on its crypto helper; like
+                        // racer-sim (`reply`), the walk does not wait for the slot.
+                        let verify = self.fabric.costs.crypto_verify_ns;
+                        self.fabric.crypto(now, node, verify);
+                    }
                     if self.diag {
                         let owners = owners(&self.placement, &self.members, page);
                         let role = |n: u32| match owners.iter().position(|o| *o == n) {
@@ -735,7 +743,34 @@ impl<'s> Model<'s> {
                 attempts,
                 links,
                 abandon,
+                verified,
             } => {
+                if !verified {
+                    // Production verifies every request's signature on the crypto helper
+                    // (`peer/server.rs` `verify_request_async`) before the worker dispatches it
+                    // (racer-sim `want`, `request_ns` on the worker FIFO).
+                    let costs = self.fabric.costs;
+                    let (verify, request) = (costs.crypto_verify_ns, costs.cpu_request_ns);
+                    let checked = self.fabric.crypto(now, to, verify);
+                    let w = owner_worker(page, self.spec.workers.max(1)) as u8;
+                    let at = self.fabric.cpu(checked, to, w, request);
+                    let probe = Ev::Probe {
+                        from,
+                        worker,
+                        read,
+                        id,
+                        to,
+                        page,
+                        copy_only,
+                        deadline,
+                        attempts,
+                        links,
+                        abandon,
+                        verified: true,
+                    };
+                    self.engine.at(at, probe);
+                    return;
+                }
                 self.trace.record(now, TAG_EVENT, 3, u64::from(to));
                 self.serve(
                     Asker {
@@ -1241,10 +1276,13 @@ impl<'s> Model<'s> {
         self.bodies.insert(key, (to, worker, body));
         // Production drops an exchange its requester abandoned: no chunk starts at or after the
         // requester's attempt bound (racer-sim `transfer_until`, `replies_abandoned`).
-        let Some(end) =
-            self.fabric
-                .transfer_until(now, &[to, asker.from], self.spec.page_bytes, asker.abandon)
-        else {
+        let sealed = self.sign(to);
+        let Some(end) = self.fabric.transfer_until(
+            sealed,
+            &[to, asker.from],
+            self.spec.page_bytes,
+            asker.abandon,
+        ) else {
             self.report.counters.replies_abandoned += 1;
             self.engine
                 .at(asker.abandon.max(now), Ev::BodyEnd { body: key });
@@ -1287,6 +1325,14 @@ impl<'s> Model<'s> {
         );
     }
 
+    /// `node` signs a peer response on its crypto helper (production `sign_response` in
+    /// `peer/server.rs`; racer-sim `send_reply`); returns when the signature is ready.
+    fn sign(&mut self, node: u32) -> Nanos {
+        let now = self.now();
+        self.fabric
+            .crypto(now, node, self.fabric.costs.crypto_sign_ns)
+    }
+
     /// The serving read on `to` failed without a peer response: a transport failure.
     fn fail_probe(&mut self, asker: &Asker, to: u32) {
         let at = self.fabric.message(self.now(), to, asker.from);
@@ -1310,7 +1356,8 @@ impl<'s> Model<'s> {
     }
 
     fn reply(&mut self, asker: &Asker, to: u32, kind: ResponseKind) {
-        let at = self.fabric.message(self.now(), to, asker.from);
+        let signed = self.sign(to);
+        let at = self.fabric.message(signed, to, asker.from);
         self.engine.at(
             at,
             Ev::Input {
@@ -1472,7 +1519,10 @@ impl<'s> Model<'s> {
                             id,
                         },
                     );
-                    let at = self.fabric.message(now, node, to) + costs.cpu_request_ns;
+                    // The requester signs each request on its crypto helper (production
+                    // `peer::protocol`; racer-sim `fail_hop`/`hop`).
+                    let signed = self.fabric.crypto(now, node, costs.crypto_sign_ns);
+                    let at = self.fabric.message(signed, node, to);
                     self.engine.at(
                         at,
                         Ev::Probe {
@@ -1487,6 +1537,7 @@ impl<'s> Model<'s> {
                             attempts: plan.remote_attempts,
                             links: plan.links,
                             abandon: timeout,
+                            verified: false,
                         },
                     );
                 }
