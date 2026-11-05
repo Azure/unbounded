@@ -220,6 +220,7 @@ func (r *QualificationReconciler) reconcileNodeLedger(
 
 	if policy.Generation > ledger.Spec.Policy.Generation {
 		before := ledger.DeepCopy()
+
 		ledger.Spec.Policy.Generation = policy.Generation
 		if err := r.Patch(ctx, &ledger, client.MergeFrom(before)); err != nil {
 			return err
@@ -250,6 +251,7 @@ func (r *QualificationReconciler) evaluateLedger(
 	if err != nil {
 		return status, err
 	}
+
 	status.PolicyDigest = digest
 
 	if node.UID != ledger.Spec.NodeUID {
@@ -802,6 +804,7 @@ func (r *QualificationReconciler) reconcileQualificationLabel(
 	}
 
 	protected := make([]signalv1.CertificationPolicy, 0)
+
 	for index := range policies.Items {
 		policy := &policies.Items[index]
 		if policy.DeletionTimestamp.IsZero() &&
@@ -901,6 +904,7 @@ func (r *QualificationReconciler) projectGateConditions(
 		status := metav1.ConditionFalse
 		reason := "PoliciesNotQualified"
 		message := "The shared protected label is not backed by every ProtectedLabel Policy"
+
 		if !r.GateProtected {
 			reason = signalv1.NodeCertificationReasonProtectionUnverified
 			message = "Node authorizer and NodeRestriction protection are not explicitly verified"
@@ -918,6 +922,7 @@ func (r *QualificationReconciler) projectGateConditions(
 			Reason:             reason,
 			Message:            message,
 		})
+
 		if err := r.Status().Patch(ctx, ledger, client.MergeFrom(before)); err != nil {
 			return err
 		}

@@ -446,7 +446,9 @@ func TestProtectedQualificationLabelGateAndMultiplePolicies(t *testing.T) {
 	); err != nil {
 		t.Fatal(err)
 	}
+
 	setQualifiedLedger(t, &currentLedgerA, policyA, node, now.Add(time.Hour))
+
 	if err := kube.Status().Update(context.Background(), &currentLedgerA); err != nil {
 		t.Fatal(err)
 	}
@@ -454,9 +456,11 @@ func TestProtectedQualificationLabelGateAndMultiplePolicies(t *testing.T) {
 	if err := reconciler.reconcileQualificationLabel(context.Background(), &current); err != nil {
 		t.Fatalf("reconcileQualificationLabel(all policies qualified) error = %v", err)
 	}
+
 	if err := kube.Get(context.Background(), types.NamespacedName{Name: node.Name}, &current); err != nil {
 		t.Fatal(err)
 	}
+
 	if current.Labels[signalv1.NodeQualificationLabel] != signalv1.NodeQualificationValue {
 		t.Fatalf("all qualified ProtectedLabel Policies did not project the shared label: %#v", current.Labels)
 	}
@@ -506,6 +510,7 @@ func TestProtectedQualificationLabelGateAndMultiplePolicies(t *testing.T) {
 	); err != nil {
 		t.Fatal(err)
 	}
+
 	gateCondition := apimeta.FindStatusCondition(
 		currentLedgerA.Status.Conditions,
 		signalv1.NodeCertificationConditionGateProjected,
@@ -555,6 +560,7 @@ func TestNodeCertificationPolicyGenerationAdvancesMonotonically(t *testing.T) {
 	); err != nil {
 		t.Fatal(err)
 	}
+
 	if current.Spec.Policy.Generation != policy.Generation ||
 		current.Status.ObservedGeneration != policy.Generation {
 		t.Fatalf(
@@ -586,6 +592,7 @@ func TestQualificationCreditsAndPlanDigestsBoundedAt64(t *testing.T) {
 	if got := len(recordReferences(records)); got != signalv1.MaxContributingRuns {
 		t.Fatalf("contributing references = %d, want %d", got, signalv1.MaxContributingRuns)
 	}
+
 	if got := len(recordPlanDigests(records)); got != signalv1.MaxContributingRuns {
 		t.Fatalf("plan digests = %d, want %d", got, signalv1.MaxContributingRuns)
 	}
@@ -719,6 +726,7 @@ func setQualifiedLedger(
 	if err != nil {
 		t.Fatal(err)
 	}
+
 	fingerprint := nodeFingerprint(node)
 	expires := metav1.NewTime(expiresAt)
 	ledger.Spec.Policy.Generation = policy.Generation
