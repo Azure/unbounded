@@ -486,7 +486,11 @@ mod faults {
             self.traffic(2, true);
             let node = &mut self.nodes[index];
             let peers = node.workers[0].app.peers.clone();
-            let listener_scope = scope(Duration::from_secs(365 * 24 * 3600)).unwrap();
+            let listener_scope = scope(
+                &crate::test_support::clock(),
+                Duration::from_secs(365 * 24 * 3600),
+            )
+            .unwrap();
             let peer_scope = listener_scope.clone();
             node.workers[0].app.listener_scope = Some(listener_scope);
             node.workers[0].app.peer_task =
@@ -700,8 +704,10 @@ mod faults {
                 drive_local(
                     runtime,
                     &mut **crypto,
-                    app.clients
-                        .reconcile(&definitions, &scope(Duration::from_secs(30)).unwrap()),
+                    app.clients.reconcile(
+                        &definitions,
+                        &scope(&crate::test_support::clock(), Duration::from_secs(30)).unwrap(),
+                    ),
                 )
                 .unwrap();
             }
@@ -845,7 +851,7 @@ mod scenarios {
             crate::test_support::ctx(),
         )));
         let credentials = CredentialCrypto::new(keys, sender.workers[0].runtime.admission.clone());
-        let scope = scope(Duration::from_secs(5)).unwrap();
+        let scope = scope(&crate::test_support::clock(), Duration::from_secs(5)).unwrap();
         let object = ObjectId {
             cache: harness.definition(0).id,
             key: CacheKey([0; 32]),
@@ -1093,7 +1099,8 @@ mod scenarios {
         // The DST harness bypasses control enrollment and already attaches diagnostic
         // resources; install the same service task as start_diagnostics.
         let app = &mut harness.nodes[0].workers[0].app;
-        let diagnostic_scope = scope(Duration::from_secs(30)).unwrap();
+        let diagnostic_scope =
+            scope(&crate::test_support::clock(), Duration::from_secs(30)).unwrap();
         app.diagnostic_scope = Some(diagnostic_scope.clone());
         let telemetry = app.telemetry.clone();
         let listen = app.diagnostics_address;
@@ -1114,7 +1121,8 @@ mod scenarios {
                 .unwrap();
             reactor.poll_budgeted(128).unwrap();
             reactor.poll_budgeted(128).unwrap();
-            let pressure_scope = scope(Duration::from_secs(30)).unwrap();
+            let pressure_scope =
+                scope(&crate::test_support::clock(), Duration::from_secs(30)).unwrap();
             let (reader, _writer) = sim.socket_pair();
             let reader = Rc::new(reader);
             let mut pressure = Vec::new();
@@ -2464,7 +2472,7 @@ impl Harness {
         publication.members = self.members().into_iter().map(Into::into).collect();
         publication.members.push(member(&config).into());
         app.snapshots.apply(publication).unwrap();
-        let startup = scope(Duration::from_secs(30)).unwrap();
+        let startup = scope(&crate::test_support::clock(), Duration::from_secs(30)).unwrap();
         let mut workers = vec![LocalWorker {
             app,
             runtime,
@@ -2561,7 +2569,11 @@ impl Harness {
         .unwrap();
         let peers = app.peers.clone();
         let address = config.peer_listen;
-        let listener_scope = scope(Duration::from_secs(365 * 24 * 3600)).unwrap();
+        let listener_scope = scope(
+            &crate::test_support::clock(),
+            Duration::from_secs(365 * 24 * 3600),
+        )
+        .unwrap();
         let peer_scope = listener_scope.clone();
         app.listener_scope = Some(listener_scope);
         app.peer_task = Some(Box::pin(
@@ -2682,7 +2694,7 @@ impl Harness {
         self.coverage
             .trace
             .record(format!("retire:{}:{crash}", node.id));
-        let shutdown = scope(Duration::from_secs(30)).unwrap();
+        let shutdown = scope(&crate::test_support::clock(), Duration::from_secs(30)).unwrap();
         if crash {
             self.sim
                 .disk()
@@ -3381,7 +3393,7 @@ fn dst_shutdown_checkpoint_uses_async_io_and_releases_all_shards() {
                 assert!(!index.snapshot_metadata().is_empty());
             }
         }
-        let deadline = scope(Duration::from_secs(30)).unwrap();
+        let deadline = scope(&crate::test_support::clock(), Duration::from_secs(30)).unwrap();
         if case == "cancel" {
             deadline.cancel().unwrap();
         }

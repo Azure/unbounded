@@ -133,7 +133,7 @@ impl WorkerApplication {
             self.actual_rails.clear();
             self.discovered_nics = snapshot.nics;
             self.inventory_generation = snapshot.generation;
-            self.native_retry = uring_runtime::environment::now();
+            self.native_retry = self.ctx().now();
         }
         Ok(())
     }
@@ -167,7 +167,7 @@ impl WorkerApplication {
             && let Poll::Ready(result) = task.as_mut().poll(cx)
         {
             self.native_task = None;
-            self.native_retry = uring_runtime::environment::now() + Duration::from_secs(1);
+            self.native_retry = self.ctx().now() + Duration::from_secs(1);
             match &result {
                 Err(error) => {
                     links.close();
@@ -197,7 +197,7 @@ impl WorkerApplication {
             && links.node().take_landing_pending()
         {
             let rails = self.actual_rails.clone();
-            let turn = scope(Duration::from_secs(5))?;
+            let turn = scope(&self.ctx().clock, Duration::from_secs(5))?;
             self.native_task = Some(Box::pin(async move {
                 links.attach_landings(&rails, &turn).await;
                 Ok(rails)
@@ -208,7 +208,7 @@ impl WorkerApplication {
         if !self.native_owner()
             || self.native_task.is_some()
             || !self.actual_rails.is_empty()
-            || uring_runtime::environment::now() < self.native_retry
+            || self.ctx().now() < self.native_retry
         {
             return Ok(());
         }
@@ -223,7 +223,7 @@ impl WorkerApplication {
         }
         let admission = self.runtime.admission.clone();
         let registered = admission.limit(crate::admission::ResourceClass::Registered);
-        let turn = scope(activation_turn(registered))?;
+        let turn = scope(&self.ctx().clock, activation_turn(registered))?;
         self.native_task = Some(Box::pin(async move {
             links
                 .activate(publication, &admission, registered, &turn)
@@ -1091,7 +1091,7 @@ mod tests {
         let held = admission
             .reserve(None, ResourceClass::Registered, 1)
             .unwrap();
-        let startup = scope(Duration::from_secs(10)).unwrap();
+        let startup = scope(&crate::test_support::clock(), Duration::from_secs(10)).unwrap();
         let publication = vec![racer_control_wire::RailMapping {
             device: "missing".into(),
             port: 1,
@@ -1261,7 +1261,9 @@ mod tests {
             )
             .unwrap();
         worker
-            .refresh_snapshot(&scope(Duration::from_secs(1)).unwrap())
+            .refresh_snapshot(
+                &scope(&crate::test_support::clock(), Duration::from_secs(1)).unwrap(),
+            )
             .unwrap();
         assert!(worker.actual_rails.is_empty());
         assert!(!worker.links.as_ref().unwrap().rail_ready(RailId(7)));
@@ -1297,9 +1299,9 @@ mod tests {
                 app.discovered_nics.clear();
             }
             let (mut worker, _engine) = worker(&app, aligned, published_rails);
-            futures::executor::block_on(
-                worker.activate_native(&scope(Duration::from_secs(1)).unwrap()),
-            )
+            futures::executor::block_on(worker.activate_native(
+                &scope(&crate::test_support::clock(), Duration::from_secs(1)).unwrap(),
+            ))
             .unwrap();
             assert!(worker.actual_rails.is_empty());
             assert!(!worker.links.as_ref().unwrap().rail_ready(RailId(7)));
@@ -1329,9 +1331,9 @@ mod tests {
         // Not a member yet (a new node joins only once it serves): startup continues without native rails, and local
         // configuration does not stand in for the missing membership.
         assert_eq!(
-            futures::executor::block_on(
-                worker.activate_native(&scope(Duration::from_secs(1)).unwrap())
-            ),
+            futures::executor::block_on(worker.activate_native(
+                &scope(&crate::test_support::clock(), Duration::from_secs(1)).unwrap()
+            )),
             Ok(())
         );
         assert_eq!(
@@ -1411,9 +1413,9 @@ mod tests {
             )
             .unwrap();
         assert_eq!(
-            futures::executor::block_on(
-                worker.activate_native(&scope(Duration::from_secs(1)).unwrap())
-            ),
+            futures::executor::block_on(worker.activate_native(
+                &scope(&crate::test_support::clock(), Duration::from_secs(1)).unwrap()
+            )),
             Ok(())
         );
         let mut service = app.build_crypto(WorkerId(0), engine).unwrap();
@@ -1458,7 +1460,7 @@ mod tests {
         assert_eq!(app.discovered_nics[0].device, "missing");
         let (mut worker, engine) = worker(&app, true, true);
         let admission = worker.runtime.admission.clone();
-        let startup = scope(Duration::from_secs(10)).unwrap();
+        let startup = scope(&crate::test_support::clock(), Duration::from_secs(10)).unwrap();
         let mut activation = Box::pin(worker.activate_native(&startup));
         let mut cx = Context::from_waker(futures::task::noop_waker_ref());
         assert!(

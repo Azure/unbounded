@@ -273,7 +273,7 @@ impl WorkerApplication {
         if !self.started {
             return Ok(());
         }
-        let now = uring_runtime::environment::now();
+        let now = self.ctx().now();
         if let Some(task) = self.checkpoint_task.as_mut()
             && let Poll::Ready(result) = task.as_mut().poll(cx)
         {
@@ -365,7 +365,7 @@ impl WorkerApplication {
                 self.keys.cluster().clone(),
                 shards,
                 self.runtime.reactor.clone(),
-                scope(self.timeout)?,
+                scope(&self.ctx().clock, self.timeout)?,
                 publication.sequence,
                 publication.slot,
                 self.checkpoint_budget,
@@ -1425,9 +1425,10 @@ mod tests {
             })
             .unwrap();
             std::fs::write(config.slab_directory.join("checkpoint.0"), bytes).unwrap();
-            futures::executor::block_on(
-                app.recover_node(geometry, &scope(Duration::from_secs(5)).unwrap()),
-            )
+            futures::executor::block_on(app.recover_node(
+                geometry,
+                &scope(&crate::test_support::clock(), Duration::from_secs(5)).unwrap(),
+            ))
             .unwrap();
             let cut = node.recovery.lock().unwrap();
             assert!(cut.selected && cut.installed.contains(&WorkerId(0)));

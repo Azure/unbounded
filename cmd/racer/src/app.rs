@@ -512,7 +512,7 @@ impl Application {
             // embedded control alive and retry bounded attempts until stopped.
             let enrolled = retry_enrollment(
                 || {
-                    let attempt = scope(MANAGED_ENROLLMENT_ATTEMPT)?;
+                    let attempt = scope(&self.node.clock, MANAGED_ENROLLMENT_ATTEMPT)?;
                     bootstrap(&self.config, &self.node, &self.limits, &attempt)
                 },
                 || STOP_REQUESTED.load(Ordering::Relaxed),
@@ -525,7 +525,7 @@ impl Application {
                 Err(error) => return Err(error),
             }
         } else {
-            let scope = scope(self.config.request_timeout)?;
+            let scope = scope(&self.node.clock, self.config.request_timeout)?;
             bootstrap(&self.config, &self.node, &self.limits, &scope)?
         };
         let selector = self
@@ -591,7 +591,7 @@ const CONTROL_TURN: Duration = Duration::from_secs(racer_control_wire::POLL_WAIT
 ///
 /// The turn owns its own cancellation so its expiry never cancels startup.
 fn control_turn(startup: &RequestScope, limit: Duration) -> Result<RequestScope> {
-    let mut turn = scope(limit)?;
+    let mut turn = scope(startup.clock(), limit)?;
     if startup.deadline.0 < turn.deadline.0 {
         turn.deadline = startup.deadline;
     }
@@ -645,10 +645,8 @@ fn retry_enrollment<T>(
 }
 
 /// Create a bounded scope for application-owned lifecycle operations.
-fn scope(timeout: Duration) -> Result<RequestScope> {
-    // MIGRATION: lifecycle scopes move onto the role's WorkerCtx.
-    let clock = crate::runtime::ambient_ctx().clock;
-    RequestScope::with_clock(RequestId([0; 16]), clock.now() + timeout, clock)
+fn scope(clock: &racer_io::Clock, timeout: Duration) -> Result<RequestScope> {
+    RequestScope::with_clock(RequestId([0; 16]), clock.now() + timeout, clock.clone())
 }
 
 /// Retry enrollment under the original startup scope and the session's backoff.
@@ -668,7 +666,7 @@ async fn start_control(
                     .sleep(
                         control
                             .next_attempt()
-                            .unwrap_or_else(uring_runtime::environment::now),
+                            .unwrap_or_else(|| reactor.ctx().now()),
                         startup,
                     )
                     .await?;
@@ -782,7 +780,7 @@ fn bootstrap(
     };
     drop(operation);
     // Fence CPU preparation before draining the reactor, on success and failure.
-    let shutdown_scope = scope(config.shutdown_timeout)?;
+    let shutdown_scope = scope(&reactor.ctx().clock, config.shutdown_timeout)?;
     let mut shutdown = control.shutdown(&shutdown_scope);
     let shutdown_result = loop {
         if let Poll::Ready(result) = shutdown.as_mut().poll(&mut cx) {
@@ -1166,6 +1164,11 @@ mod ownership_maintenance_tests {
 }
 
 impl WorkerApplication {
+    /// This worker's time and entropy.
+    fn ctx(&self) -> &racer_io::WorkerCtx {
+        self.runtime.reactor.ctx()
+    }
+
     /// All constructors below only connect dependencies. Runtime commands route
     /// listener work to page/metadata owners before any acquisition is dispatched.
     pub fn assemble(
@@ -1176,6 +1179,7 @@ impl WorkerApplication {
         discovered_nics: Vec<racer_control_wire::RailMapping>,
     ) -> Result<Self> {
         let environment = uring_runtime::environment::Environment::current();
+        let started = runtime.reactor.ctx().now();
         let metrics = node
             .metrics
             .iter()
@@ -1544,7 +1548,7 @@ impl WorkerApplication {
             actual_rails: Vec::new(),
             inventory_generation: 0,
             native_task: None,
-            native_retry: uring_runtime::environment::now(),
+            native_retry: started,
             rdma_report: config
                 .managed_control
                 .as_ref()
@@ -1566,10 +1570,8 @@ impl WorkerApplication {
             checkpoint_budget: config.checkpoint_bytes.get(),
             placement,
             candidates,
-            ownership_maintenance: OwnershipMaintenance {
-                next: uring_runtime::environment::now(),
-            },
-            placement_retry: uring_runtime::environment::now(),
+            ownership_maintenance: OwnershipMaintenance { next: started },
+            placement_retry: started,
             placement_warning: None,
             diagnostic_task: None,
             diagnostic_scope: None,
@@ -1592,7 +1594,7 @@ impl WorkerApplication {
             cache_prepare_task: None,
             cache_preparing_generation: 0,
             control_scope: None,
-            next_health: uring_runtime::environment::now(),
+            next_health: started,
             pressure: WorkerPressure::new(config.memory_pressure, &node_pressure, is_sampler),
         })
     }
@@ -1979,7 +1981,7 @@ impl WorkerApplication {
         let worker = self.worker;
         let budget = work_budget.min(64);
         stage_result(worker, "native", self.poll_native(cx))?;
-        let now = uring_runtime::environment::now();
+        let now = self.ctx().now();
         if !self.stopping
             && now >= self.placement_retry
             && let Ok(snapshot) = self.snapshots.current()
@@ -2004,8 +2006,7 @@ impl WorkerApplication {
             gate.poll_deadlines(budget);
         }
         // Expire metadata before advancing peer/listener tasks.
-        self.metadata
-            .poll_deadlines(uring_runtime::environment::now(), budget);
+        self.metadata.poll_deadlines(self.ctx().now(), budget);
         if !self.stopping {
             let prepared = self.poll_cache_preparation(cx);
             stage_result(worker, "cache-preparation", prepared)?;
@@ -2014,10 +2015,11 @@ impl WorkerApplication {
         stage_result(worker, "writer", self.poll_writer(cx))?;
         if !self.stopping {
             stage_result(worker, "control", self.poll_control(cx))?;
-            let refreshed = scope(self.timeout).and_then(|turn| self.refresh_snapshot(&turn));
+            let refreshed = scope(&self.ctx().clock, self.timeout)
+                .and_then(|turn| self.refresh_snapshot(&turn));
             stage_result(worker, "snapshot-refresh", refreshed)?;
         }
-        let now = uring_runtime::environment::now();
+        let now = self.ctx().now();
         if now >= self.next_health {
             self.observe_memory(now);
             self.reclaim_cache_under_pressure();
@@ -2305,7 +2307,7 @@ impl WorkerApplication {
             && self.store.writer.pending_count() != 0
         {
             let writer = self.store.writer.clone();
-            let write_scope = scope(self.timeout)?;
+            let write_scope = scope(&self.ctx().clock, self.timeout)?;
             self.writer_task = Some(Box::pin(async move {
                 writer.progress(8, &write_scope).await.map(|_| ())
             }));
@@ -2327,7 +2329,10 @@ impl WorkerApplication {
             && let Some(control) = &self.control
         {
             let control = control.clone();
-            let turn = scope(racer_control_wire::POLL_WAIT + Duration::from_secs(10))?;
+            let turn = scope(
+                &self.ctx().clock,
+                racer_control_wire::POLL_WAIT + Duration::from_secs(10),
+            )?;
             self.control_scope = Some(turn.clone());
             self.control_task = Some(Box::pin(async move { control.progress(&turn).await }));
         }
@@ -2345,7 +2350,7 @@ impl WorkerApplication {
             && let Some(control) = &self.control
         {
             let control = control.clone();
-            let turn = scope(Duration::from_secs(80))?;
+            let turn = scope(&self.ctx().clock, Duration::from_secs(80))?;
             self.keyring_scope = Some(turn.clone());
             self.keyring_task = Some(Box::pin(
                 async move { control.keyring_progress(&turn).await },
@@ -2388,10 +2393,7 @@ impl WorkerApplication {
                 // Notification can precede thread exit. Recheck the join fence
                 // with a bounded kernel timer, not a blocking join or self-wake.
                 timer
-                    .sleep(
-                        uring_runtime::environment::now() + Duration::from_millis(10),
-                        deadline,
-                    )
+                    .sleep(self.ctx().now() + Duration::from_millis(10), deadline)
                     .await?;
             }
         }
@@ -2487,25 +2489,23 @@ impl uring_runtime::group::Factory<RequestScope> for Application {
     }
 
     fn teardown_scope(&self, startup: &RequestScope) -> RequestScope {
-        scope(Duration::from_secs(30)).unwrap_or_else(|_| startup.clone())
+        scope(startup.clock(), Duration::from_secs(30)).unwrap_or_else(|_| startup.clone())
     }
 }
 
 impl uring_runtime::group::Service<RequestScope> for WorkerApplication {
     fn wait_timeout(&self, maximum: Duration) -> Duration {
         let _environment = self.environment.enter();
-        let maximum = self.ownership_maintenance.wait_timeout(
-            uring_runtime::environment::now(),
-            self.stopping,
-            maximum,
-        );
+        let maximum =
+            self.ownership_maintenance
+                .wait_timeout(self.ctx().now(), self.stopping, maximum);
         self.metadata
             .next_deadline()
             .into_iter()
             .chain(self.flights.next_deadline())
             .min()
             .map_or(maximum, |deadline| {
-                maximum.min(deadline.saturating_duration_since(uring_runtime::environment::now()))
+                maximum.min(deadline.saturating_duration_since(self.ctx().now()))
             })
     }
 
@@ -2564,14 +2564,14 @@ impl uring_runtime::group::Service<RequestScope> for WorkerApplication {
         let drivers = self.drivers.clone();
         Box::pin(environment.scope(drivers.scope(async move {
             self.stop_admission()?;
-            let deadline = scope(self.shutdown_timeout)?;
+            let deadline = scope(&self.ctx().clock, self.shutdown_timeout)?;
             self.stop_profiling(&deadline).await?;
             if let Some(control) = &self.control {
                 control.shutdown(&deadline).await?;
             }
             let clients = self.clients.clone();
             let flights = self.flights.clone();
-            let fence_scope = scope(Duration::from_secs(365 * 24 * 3600))?;
+            let fence_scope = scope(&self.ctx().clock, Duration::from_secs(365 * 24 * 3600))?;
             let mut client_drain = clients.drain(&deadline);
             let mut flight_drain = flights.drain(&fence_scope);
             let mut clients_done = false;
@@ -2830,7 +2830,7 @@ impl WorkerApplication {
             if self.cache_prepare_task.is_none() {
                 let clients = self.clients.clone();
                 let prepared = self.prepared_listeners.clone();
-                let startup = scope(self.timeout)?;
+                let startup = scope(&self.ctx().clock, self.timeout)?;
                 // Bind only the caches whose pool has this node.
                 let served = self
                     .served_caches
@@ -2873,7 +2873,13 @@ impl Observations {
     /// Record fixture readiness without an accepted publication cursor.
     #[cfg(test)]
     fn record(&self, worker: WorkerId, resources: Resources, count: usize) -> Result<()> {
-        self.record_snapshot(worker, resources, count, None)
+        self.record_snapshot(
+            worker,
+            resources,
+            count,
+            None,
+            crate::test_support::clock().now(),
+        )
     }
 
     /// Combine fresh worker observations into node-wide readiness.
@@ -2883,10 +2889,11 @@ impl Observations {
         resources: Resources,
         count: usize,
         sequence: Option<racer_control_wire::PublicationSequence>,
+        now: std::time::Instant,
     ) -> Result<()> {
         let mut workers = self.workers.lock().map_err(|_| Error::Unavailable)?;
         workers.insert(worker, (resources, sequence));
-        let now = uring_runtime::environment::now();
+
         let complete = workers.len() == count;
         let all = |test: fn(&Resources) -> bool| {
             complete
@@ -2924,9 +2931,10 @@ impl Observations {
         &self,
         diagnostic: &mut crate::telemetry::MembershipDiagnostic,
         count: usize,
+        now: std::time::Instant,
     ) -> Result<()> {
         let workers = self.workers.lock().map_err(|_| Error::Unavailable)?;
-        let now = uring_runtime::environment::now();
+
         diagnostic.expected_workers = count;
         diagnostic.matching_workers = workers
             .values()
@@ -2948,12 +2956,13 @@ impl WorkerApplication {
         }
         let control = self.control.as_ref().unwrap().clone();
         let node = self.node.clone();
+        let clock = self.ctx().clock.clone();
         self.telemetry
             .membership
             .set(Rc::new(move || {
                 let mut diagnostic = control.membership_diagnostic()?;
                 node.observations
-                    .membership_workers(&mut diagnostic, node.count)?;
+                    .membership_workers(&mut diagnostic, node.count, clock.now())?;
                 Ok(diagnostic)
             }))
             .map_err(|_| Error::InvalidConfiguration)?;
@@ -2982,7 +2991,7 @@ impl WorkerApplication {
             .map_err(|_| Error::InvalidConfiguration)?;
         self.telemetry
             .attach_io(self.runtime.reactor.clone(), self.runtime.admission.clone())?;
-        let diagnostic_scope = scope(Duration::from_secs(365 * 24 * 3600))?;
+        let diagnostic_scope = scope(&self.ctx().clock, Duration::from_secs(365 * 24 * 3600))?;
         let task_scope = diagnostic_scope.clone();
         let telemetry = self.telemetry.clone();
         let address = self.diagnostics_address;
@@ -3008,7 +3017,7 @@ impl WorkerApplication {
         self.telemetry
             .metrics
             .observe_retention(self.store.writer.retention().snapshot());
-        let now = uring_runtime::environment::now();
+        let now = self.ctx().now();
         if self.control.is_some() {
             self.telemetry.metrics.set_gauge(
                 crate::telemetry::Gauge::KeyringGeneration,
@@ -3023,7 +3032,7 @@ impl WorkerApplication {
                     .set_gauge(crate::telemetry::Gauge::IdentityExpiresAtSeconds, expiry);
             }
             let remaining = (UNIX_EPOCH + Duration::from_secs(expiry))
-                .duration_since(uring_runtime::environment::wall_now())
+                .duration_since(self.ctx().clock.wall_now())
                 .ok()?;
             now.checked_add(remaining)
         });
@@ -3043,6 +3052,7 @@ impl WorkerApplication {
             },
             node.count,
             self.snapshot_sequence,
+            now,
         )
     }
 
@@ -3156,7 +3166,7 @@ impl WorkerApplication {
                         let io = ReactorControlIo::new(self.runtime.reactor.clone());
                         ReactorControlIo::sleep(
                             &io,
-                            uring_runtime::environment::now() + Duration::from_millis(100),
+                            self.ctx().now() + Duration::from_millis(100),
                             startup,
                         )
                         .await?;
@@ -3192,9 +3202,12 @@ impl WorkerApplication {
     /// Start diagnostics and bind the control worker's peer listener before readiness.
     async fn start_listeners(&mut self) -> Result<()> {
         std::future::poll_fn(|cx| Poll::Ready(self.start_diagnostics(cx))).await?;
-        self.task_scope = Some(scope(Duration::from_secs(365 * 24 * 3600))?);
+        self.task_scope = Some(scope(
+            &self.ctx().clock,
+            Duration::from_secs(365 * 24 * 3600),
+        )?);
         if self.control.is_some() {
-            let listener_scope = scope(Duration::from_secs(365 * 24 * 3600))?;
+            let listener_scope = scope(&self.ctx().clock, Duration::from_secs(365 * 24 * 3600))?;
             let peers = self.peers.clone();
             let peer_scope = listener_scope.clone();
             let address = self.peer_address;
@@ -3415,7 +3428,7 @@ mod lifecycle_policy_tests {
             || {
                 attempts.set(attempts.get() + 1);
                 // Each attempt runs under its own deadline that expires first.
-                let attempt = scope(Duration::from_millis(1))?;
+                let attempt = scope(&crate::test_support::clock(), Duration::from_millis(1))?;
                 std::thread::sleep(Duration::from_millis(2));
                 if attempts.get() < 4 {
                     attempt.check()?;
@@ -3448,7 +3461,7 @@ mod lifecycle_policy_tests {
 
     #[test]
     fn control_turns_are_bounded_and_never_outlive_startup() {
-        let long = scope(MANAGED_STARTUP).unwrap();
+        let long = scope(&crate::test_support::clock(), MANAGED_STARTUP).unwrap();
         let turn = control_turn(&long, CONTROL_TURN).unwrap();
         let now = uring_runtime::environment::now();
         assert!(turn.deadline.0 <= now + CONTROL_TURN);
@@ -3456,7 +3469,7 @@ mod lifecycle_policy_tests {
         // Expiry of a turn must not cancel startup.
         let _ = turn.cancel();
         assert_eq!(long.check(), Ok(()));
-        let short = scope(Duration::from_millis(5)).unwrap();
+        let short = scope(&crate::test_support::clock(), Duration::from_millis(5)).unwrap();
         let turn = control_turn(&short, CONTROL_TURN).unwrap();
         assert_eq!(turn.deadline.0, short.deadline.0);
         // Managed startup outlives the fixed lifecycle policy.
