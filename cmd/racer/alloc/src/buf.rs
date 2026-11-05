@@ -27,7 +27,10 @@
 //! Disk reads should land in pooled buffers taken from the worker's pool so a
 //! hit reuses storage instead of mapping and unmapping a fresh page.
 //!
-//! # Replaces (wiring map)
+//! # Replaced types
+//!
+//! Every type in the left column except `AlignedBuffer` and the slab pool,
+//! which still back disk write staging, has been removed.
 //!
 //! | Old | New |
 //! |---|---|

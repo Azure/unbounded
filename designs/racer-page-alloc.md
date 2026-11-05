@@ -41,13 +41,11 @@ Disk allocation and I/O authority is worker-local. `Segments`, `Slab`,
 worker-local state and cannot move to another worker. See `alloc/src/segments.rs`,
 `alloc/src/slab.rs`, and `alloc/src/lib.rs`.
 
-`WorkerBufferPool` is a separate, mutex-protected pool. Its `DetachedBuffer`
-can move to a crypto thread for filling. Freezing produces a `FrozenBuffer`
-with immutable bytes; it can be shared across threads when its charge allows
-it. Dropping either buffer returns storage to its original pool, if that pool
-still exists. Freezing an `AlignedBuffer` instead detaches it from the
-worker-local slab pool and rejects retained `Rc` guards. This does not transfer
-disk allocation or I/O authority.
+`buf::Pool` (`alloc/src/buf.rs`) is owned by one worker, but its `Buf`
+buffers are `Send` and may be filled or dropped on any thread, such as a crypto
+thread. A dropped `Buf` returns to its pool through a lock-free per-class
+return stack that only the owner drains. `Arc<Buf<C>>` is the shared immutable
+form. This does not transfer disk allocation or I/O authority.
 
 ## Buffers
 
@@ -82,25 +80,18 @@ when allocations missed and returns were refused for depth, the target grows by
 half the misses (at least 1); entries that stayed unused for the whole window
 are halved, oldest first; after 10 miss-free windows the target drops by 1.
 `Slab::constrain_idle` refuses returns and trims to the minimum depth, which
-defaults to zero. The flow
-recycler (`Quotas::maintain_buffers` in `flow/src/lib.rs`) uses the same
-controller and also retains at most half of each class limit. Workers drive
-both from `poll_services`. Idle slab buffers keep their admission charges.
+defaults to zero. Workers drive it from `poll_services`. Idle slab buffers keep
+their admission charges.
 
 ### Cross-thread buffer pool
 
-`WorkerBufferPool` groups storage into 64 KiB capacity classes. It keeps at
-most eight idle buffers per class and a caller-set byte budget, 128 MiB by
-default. It reuses the most recently returned buffer in a matching class.
-This pool does not use `PoolDemand`; `clear` frees its idle storage. Wiping
-and charge destructors run outside the mutex.
-
-Racer uses this pool for aligned ciphertext. Its `PoolCharge` releases live
-ciphertext admission before parking idle storage, so Racer sets a separate
-idle budget of four maximum-page capacity classes (`src/memory.rs`). A new
-checkout must bring a charge covering the full capacity. Encryption and HTTP
-receive can fill this storage, and a frozen page can be sent or written to
-disk without another body allocation.
+`buf::Pool` groups storage into capacity classes and serves aligned
+ciphertext, pooled plaintext, copied ciphertext, and peer receives. Idle bytes
+are charged to a dedicated admission class through `PoolAccount`
+(`flow_control::QuotaPoolAccount`), so admission sees them; a failed idle
+charge frees the storage instead. `Pool::shed` releases idle storage under
+memory pressure. A checkout must bring a charge covering the full capacity,
+and the charge rides in the `Buf`.
 
 ### Wiping and padding
 
@@ -110,11 +101,11 @@ pooling or freeing it. Clean allocations skip the wipe. See
 `Allocation::wipe` and the buffer `Drop` implementations in `alloc/src/lib.rs`.
 
 The worker-local slab pool also clears non-secret storage before reuse, using
-`MADV_DONTNEED` for mappings when possible and zero filling otherwise. The
-cross-thread pool deliberately does not clear non-secret storage. Its producers
-must overwrite every requested byte. `DetachedBuffer::freeze` clears only the
-padding up to the direct-I/O length unit. This rule allows ciphertext reuse
-without weakening plaintext wiping.
+`MADV_DONTNEED` for mappings when possible and zero filling otherwise. `buf::Pool`
+deliberately does not clear non-secret storage. Its producers must overwrite
+every requested byte. Storage taken with the `wipe` flag is erased before it
+is pooled or freed. This rule allows ciphertext reuse without weakening
+plaintext wiping.
 
 ## Segments
 
