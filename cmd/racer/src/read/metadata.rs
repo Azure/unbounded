@@ -120,11 +120,9 @@ impl RefreshTable {
     /// registrations, including readers of completed cohorts, are live.
     fn new(capacity: usize, at: Instant) -> Self {
         Self {
-            inner: RefCell::new(Cohorts::with_limits(
-                capacity,
-                at,
-                RefreshHashState::default(),
-            )),
+            inner: RefCell::new(
+                Cohorts::with_limits(capacity, at, RefreshHashState::default()).retain_retired(),
+            ),
             at,
         }
     }
@@ -133,13 +131,26 @@ impl RefreshTable {
         self.at + Duration::from_secs(1)
     }
 
-    fn join(self: &Rc<Self>, key: RefreshKey) -> Result<Registration> {
+    /// Run `f` on the cohorts, then drop retired wake targets and wake others
+    /// only after releasing the borrow: wakers may reenter the table.
+    fn update<T>(&self, f: impl FnOnce(&mut Cohorts, &mut Vec<WakeTarget>) -> T) -> T {
         let mut wakes = Vec::new();
+        let (value, retired) = {
+            let mut cohorts = self.inner.borrow_mut();
+            let value = f(&mut cohorts, &mut wakes);
+            (value, cohorts.take_retired())
+        };
+        drop(retired);
+        for wake in wakes {
+            wake.wake();
+        }
+        value
+    }
+
+    fn join(self: &Rc<Self>, key: RefreshKey) -> Result<Registration> {
+        let (at, deadline) = (self.at, self.deadline());
         let joined =
-            self.inner
-                .borrow_mut()
-                .join(&key, self.at, self.deadline(), 1, |_| Ok(()), &mut wakes);
-        wake_all(wakes);
+            self.update(|cohorts, wakes| cohorts.join(&key, at, deadline, 1, |_| Ok(()), wakes));
         let member = joined.map_err(|error| match error {
             racer_core::read::Error::FlightFull | racer_core::read::Error::Overloaded => {
                 Error::Overloaded
@@ -166,12 +177,6 @@ impl RefreshTable {
     #[cfg(test)]
     fn active_count(&self) -> usize {
         self.inner.borrow().open()
-    }
-}
-
-fn wake_all(wakes: Vec<WakeTarget>) {
-    for wake in wakes {
-        wake.wake();
     }
 }
 
@@ -202,16 +207,12 @@ impl Registration {
     /// Register the latest wake target and elect at most once per waiter.
     fn event(&self, waker: &Waker) -> Poll<RefreshEvent<Result<RefreshOutput>>> {
         let owner = &self.owner;
-        let mut wakes = Vec::new();
-        let step = owner.table.inner.borrow_mut().poll(
-            &owner.key,
-            owner.member,
-            owner.table.at,
-            1,
-            WakeTarget(waker.clone()),
-            &mut wakes,
-        );
-        wake_all(wakes);
+        // Clone outside the table borrow: a waker's clone may reenter the table.
+        let target = WakeTarget(waker.clone());
+        let at = owner.table.at;
+        let step = owner
+            .table
+            .update(|cohorts, wakes| cohorts.poll(&owner.key, owner.member, at, 1, target, wakes));
         match step {
             Ok(Step::Pending) => Poll::Pending,
             Ok(Step::Lead(started)) => {
@@ -234,14 +235,10 @@ impl Registration {
         };
         let error =
             racer_core::read::Error::try_from(error).unwrap_or(racer_core::read::Error::Cancelled);
-        let mut wakes = Vec::new();
         // A stale leader has nothing to release.
         let _ = owner
             .table
-            .inner
-            .borrow_mut()
-            .retry(&owner.key, started, error, &mut wakes);
-        wake_all(wakes);
+            .update(|cohorts, wakes| cohorts.retry(&owner.key, started, error, wakes));
     }
 
     /// Broadcast the leader's result and close admission before waking readers.
@@ -251,26 +248,19 @@ impl Registration {
         let Some(started) = owner.started.take() else {
             return;
         };
-        let mut wakes = Vec::new();
         // A stale leader cannot publish.
         let _ = owner
             .table
-            .inner
-            .borrow_mut()
-            .finish(&owner.key, started, result, &mut wakes);
-        wake_all(wakes);
+            .update(|cohorts, wakes| cohorts.finish(&owner.key, started, result, wakes));
     }
 }
 
 impl Drop for RegistrationOwner {
     /// Detach once, then wake followers outside the table borrow.
     fn drop(&mut self) {
-        let mut wakes = Vec::new();
-        self.table
-            .inner
-            .borrow_mut()
-            .detach(&self.key, self.member, &mut wakes);
-        wake_all(wakes);
+        self.table.update(|cohorts, wakes| {
+            cohorts.detach(&self.key, self.member, wakes);
+        });
     }
 }
 
@@ -1373,6 +1363,88 @@ pub(crate) mod tests {
             next.begin_attempt(now, deadline),
             Err(racer_core::read::Error::Unavailable)
         );
+    }
+
+    thread_local! {
+        static ON_HOOK_CLONE: RefCell<Option<Box<dyn FnOnce()>>> = RefCell::new(None);
+        static ON_HOOK_DROP: RefCell<Option<Box<dyn FnOnce()>>> = RefCell::new(None);
+    }
+
+    /// A waker whose next clone or drop runs a one-shot hook on this thread.
+    fn hook_waker() -> Waker {
+        fn raw() -> std::task::RawWaker {
+            unsafe fn clone(_: *const ()) -> std::task::RawWaker {
+                if let Some(hook) = ON_HOOK_CLONE.with(|slot| slot.borrow_mut().take()) {
+                    hook();
+                }
+                raw()
+            }
+            unsafe fn drop(_: *const ()) {
+                if let Some(hook) = ON_HOOK_DROP.with(|slot| slot.borrow_mut().take()) {
+                    hook();
+                }
+            }
+            unsafe fn wake(_: *const ()) {}
+            static VTABLE: std::task::RawWakerVTable =
+                std::task::RawWakerVTable::new(clone, wake, wake, drop);
+            std::task::RawWaker::new(std::ptr::null(), &VTABLE)
+        }
+        // SAFETY: The vtable never dereferences its data pointer.
+        unsafe { Waker::from_raw(raw()) }
+    }
+
+    /// Waker clone, replacement, and detach callbacks may reenter the cohorts.
+    #[test]
+    fn cohort_wakers_may_reenter_the_table() {
+        let table = Rc::new(RefreshTable::new(1, Instant::now()));
+        let leader = table.join(key()).unwrap();
+        let follower = table.join(key()).unwrap();
+        assert!(matches!(
+            leader.event(&noop_waker()),
+            Poll::Ready(RefreshEvent::Lead)
+        ));
+        let nested = table.clone();
+        let admitted = Rc::new(RefCell::new(Vec::new()));
+        let sink = admitted.clone();
+        ON_HOOK_CLONE.with(|slot| {
+            *slot.borrow_mut() = Some(Box::new(move || {
+                sink.borrow_mut().push(nested.join(key()).unwrap());
+            }))
+        });
+        let waker = hook_waker();
+        assert!(follower.event(&waker).is_pending());
+        assert_eq!(admitted.borrow().len(), 1);
+
+        // Replacing the parked waker drops it after the table borrow ends.
+        let nested = table.clone();
+        let sink = admitted.clone();
+        ON_HOOK_DROP.with(|slot| {
+            *slot.borrow_mut() = Some(Box::new(move || {
+                sink.borrow_mut().push(nested.join(key()).unwrap());
+            }))
+        });
+        assert!(follower.event(&noop_waker()).is_pending());
+        assert_eq!(admitted.borrow().len(), 2);
+
+        // Detaching drops the parked waker after the table borrow ends too.
+        let parked = hook_waker();
+        assert!(follower.event(&parked).is_pending());
+        drop(parked);
+        let nested = table.clone();
+        let sink = admitted.clone();
+        ON_HOOK_DROP.with(|slot| {
+            *slot.borrow_mut() = Some(Box::new(move || {
+                sink.borrow_mut().push(nested.join(key()).unwrap());
+            }))
+        });
+        drop(follower);
+        assert_eq!(admitted.borrow().len(), 3);
+        drop(waker);
+        leader.finish(Ok(output()));
+        drop(leader);
+        admitted.borrow_mut().clear();
+        assert_eq!(table.registration_count(), 0);
+        assert_eq!(table.active_count(), 0);
     }
 
     #[test]

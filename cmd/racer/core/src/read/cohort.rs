@@ -136,6 +136,17 @@ where
         }
     }
 
+    /// See [`FlightTable::retain_retired`].
+    pub fn retain_retired(mut self) -> Self {
+        self.table = self.table.retain_retired();
+        self
+    }
+
+    /// See [`FlightTable::take_retired`].
+    pub fn take_retired(&mut self) -> Vec<T> {
+        self.table.take_retired()
+    }
+
     pub fn table(&self) -> &FlightTable<Key<Obj>, M, M, M, R, S, T> {
         &self.table
     }
@@ -624,5 +635,27 @@ mod tests {
             Err(Error::Overloaded)
         );
         assert!(c.join(&k, at, deadline, 1, |_| Ok(()), &mut wakes).is_ok());
+    }
+
+    #[test]
+    fn retained_targets_are_handed_back() {
+        let at = Instant::now();
+        let deadline = at + Duration::from_secs(10);
+        let mut c: Cohorts =
+            MetadataCohort::with_limits(1, at, RandomState::new()).retain_retired();
+        let mut wakes = Vec::new();
+        let k = key(RefreshPurpose::Current);
+        let a = c.join(&k, at, deadline, 1, |_| Ok(()), &mut wakes).unwrap();
+        let b = c.join(&k, at, deadline, 1, |_| Ok(()), &mut wakes).unwrap();
+        assert!(matches!(
+            c.poll(&k, a, at, 1, 10, &mut wakes),
+            Ok(Step::Lead(_))
+        ));
+        assert_eq!(c.poll(&k, b, at, 1, 11, &mut wakes), Ok(Step::Pending));
+        assert_eq!(c.poll(&k, b, at, 1, 12, &mut wakes), Ok(Step::Pending));
+        assert_eq!(c.take_retired(), vec![11]);
+        c.detach(&k, b, &mut wakes);
+        assert_eq!(c.take_retired(), vec![12]);
+        assert!(c.take_retired().is_empty());
     }
 }

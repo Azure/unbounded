@@ -114,6 +114,8 @@ pub struct FlightTable<K, C, P, O, R, S = RandomState, T = Token> {
     next_incarnation: u64,
     next_operation: u64,
     capacity: VecDeque<T>,
+    /// Wake targets replaced or detached since the last [`Self::take_retired`], when retained.
+    retired: Option<Vec<T>>,
 }
 
 impl<K: Eq + Hash + Clone, C: Clone, P: Clone, O, R, S: BuildHasher, T: Clone + PartialEq>
@@ -146,7 +148,24 @@ impl<K: Eq + Hash + Clone, C: Clone, P: Clone, O, R, S: BuildHasher, T: Clone + 
             next_incarnation: 0,
             next_operation: 0,
             capacity: VecDeque::new(),
+            retired: None,
         }
+    }
+
+    /// Hand replaced and detached wake targets to [`Self::take_retired`] instead of dropping them
+    /// inside the table, so a driver whose targets run code on drop (a `Waker`) can drop them after
+    /// releasing its borrow of the table.
+    pub fn retain_retired(mut self) -> Self {
+        self.retired = Some(Vec::new());
+        self
+    }
+
+    /// Wake targets retired since the last call; empty unless [`Self::retain_retired`].
+    pub fn take_retired(&mut self) -> Vec<T> {
+        self.retired
+            .as_mut()
+            .map(std::mem::take)
+            .unwrap_or_default()
     }
 
     pub fn fence(&self) -> Fence {
@@ -344,7 +363,12 @@ impl<K: Eq + Hash + Clone, C: Clone, P: Clone, O, R, S: BuildHasher, T: Clone + 
         }
         let idle = entry.idle();
         refresh(&mut entry.state, idle, || now, split, wakes);
-        let park = |slot: &mut Option<T>| *slot = Some(token);
+        let retired = &mut self.retired;
+        let park = |slot: &mut Option<T>| {
+            if let (Some(old), Some(retired)) = (slot.replace(token), retired) {
+                retired.push(old);
+            }
+        };
         if copy {
             return Ok(match copy_wait(&mut entry.state, id, park) {
                 None => Wait::Pending,
@@ -531,6 +555,10 @@ impl<K: Eq + Hash + Clone, C: Clone, P: Clone, O, R, S: BuildHasher, T: Clone + 
         let Some(entry) = self.entries.get_mut(key) else {
             return;
         };
+        if let (Some(retired), Some(waiter)) = (&mut self.retired, entry.state.waiters.get_mut(&id))
+        {
+            retired.extend(waiter.waker.take());
+        }
         entry.state.detach(id);
         self.refreshed(key, wakes);
         self.remove_quiescent(key, wakes);
@@ -752,7 +780,7 @@ mod tests {
         assert!(f.t.wait_entry(101));
     }
 
-    /// Metadata cohort (`coalesce::Table`): keyed by object, the first caller leads, every waiter
+    /// Metadata-cohort-shaped use (see `read::cohort` for the real one): keyed by object, the first caller leads, every waiter
     /// observes the one published metadata, and a failed leader fails the cohort.
     #[test]
     fn metadata_cohort_instance() {
