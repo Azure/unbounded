@@ -5804,3 +5804,54 @@ fn warm_disk_reads_reuse_pooled_buffers_charged_to_pool_class() {
     let third = read();
     assert_eq!(third.ciphertext.bytes(), read().ciphertext.bytes());
 }
+#[test]
+fn drain_sleeps_while_progress_is_busy_and_wakes_when_it_ends() {
+    struct Wakes(std::sync::atomic::AtomicUsize);
+    impl futures::task::ArcWake for Wakes {
+        fn wake_by_ref(this: &std::sync::Arc<Self>) {
+            this.0.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+    let f = Fixture::new();
+    let _ = futures::executor::block_on(f.store.open()).unwrap();
+    f.reactor.init().unwrap();
+    f.enqueue(f.copy(1, 64)).unwrap();
+    let request = scope();
+    let mut write = f.store.writer.progress(1, &request);
+    let mut idle = Context::from_waker(futures::task::noop_waker_ref());
+    assert!(write.as_mut().poll(&mut idle).is_pending());
+    let wakes = std::sync::Arc::new(Wakes(Default::default()));
+    let waker = futures::task::waker(wakes.clone());
+    let mut cx = Context::from_waker(&waker);
+    let mut drain = f.store.writer.drain(&request);
+    for _ in 0..3 {
+        assert!(drain.as_mut().poll(&mut cx).is_pending());
+    }
+    // Pending without a self-wake: the old loop woke itself on every poll.
+    assert_eq!(wakes.0.load(Ordering::Relaxed), 0);
+    drive(&f.reactor, write).unwrap();
+    assert!(wakes.0.load(Ordering::Relaxed) >= 1);
+    drive(&f.reactor, drain).unwrap();
+    assert!(f.store.writer.is_idle());
+}
+
+#[test]
+fn pending_metadata_follows_queue_membership_per_version() {
+    let f = Fixture::new();
+    let _ = futures::executor::block_on(f.store.open()).unwrap();
+    f.reactor.init().unwrap();
+    let first = f.copy(1, 64);
+    let version = first.metadata.version.clone();
+    let expected = first.metadata.immutable();
+    assert!(f.store.writer.metadata(&version).unwrap().is_none());
+    f.enqueue(first).unwrap();
+    assert_eq!(f.store.writer.metadata(&version).unwrap(), Some(expected));
+    let entry = f.store.writer.pending.borrow().versions[&version].pages;
+    assert_eq!(entry, 1);
+    assert_eq!(f.store.writer.discard_unsubmitted(), 1);
+    assert!(f.store.writer.metadata(&version).unwrap().is_none());
+    assert!(f.store.writer.pending.borrow().versions.is_empty());
+    f.enqueue(f.copy(2, 64)).unwrap();
+    f.store.writer.remove_cache(&version.object.cache).unwrap();
+    assert!(f.store.writer.pending.borrow().versions.is_empty());
+}

@@ -479,6 +479,90 @@ fn queued_position(queue: &VecDeque<PageId>, page: &PageId) -> Option<usize> {
         .position(|queued| queued == page)
 }
 
+/// Pending versions summarized for [`StoreWriter::metadata`], so a lookup
+/// costs O(1) unless one version's queued pages use different keys.
+struct PendingVersion {
+    pages: usize,
+    metadata: VersionMetadata,
+    /// The key of every queued page, or `None` once two keys were seen.
+    key: Option<racer_control_wire::KeyId>,
+}
+
+/// Queued dirty copies keyed by page, with a per-version summary kept in step
+/// on every insert and removal.
+#[derive(Default)]
+struct PendingWrites {
+    pages: HashMap<PageId, Dirty>,
+    versions: HashMap<ObjectVersion, PendingVersion>,
+}
+
+impl std::ops::Deref for PendingWrites {
+    type Target = HashMap<PageId, Dirty>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.pages
+    }
+}
+
+impl PendingWrites {
+    fn get_mut(&mut self, page: &PageId) -> Option<&mut Dirty> {
+        self.pages.get_mut(page)
+    }
+
+    fn insert(&mut self, page: PageId, dirty: Dirty) {
+        let key = dirty.page.ciphertext.envelope().key_id;
+        match self.versions.get_mut(&page.version) {
+            Some(version) => {
+                version.pages += 1;
+                version.key = version.key.filter(|known| *known == key);
+            }
+            None => {
+                self.versions.insert(
+                    page.version.clone(),
+                    PendingVersion {
+                        pages: 1,
+                        metadata: dirty.page.metadata.immutable(),
+                        key: Some(key),
+                    },
+                );
+            }
+        }
+        if let Some(old) = self.pages.insert(page, dirty) {
+            self.forget(&old);
+        }
+    }
+
+    fn forget(&mut self, dirty: &Dirty) {
+        let version = &dirty.page.ciphertext.envelope().page.version;
+        if let Some(entry) = self.versions.get_mut(version) {
+            entry.pages -= 1;
+            if entry.pages == 0 {
+                self.versions.remove(version);
+            }
+        }
+    }
+
+    fn remove(&mut self, page: &PageId) -> Option<Dirty> {
+        let dirty = self.pages.remove(page)?;
+        self.forget(&dirty);
+        Some(dirty)
+    }
+
+    fn retain(&mut self, mut keep: impl FnMut(&PageId, &mut Dirty) -> bool) {
+        let versions = &mut self.versions;
+        self.pages.retain(|page, dirty| {
+            let kept = keep(page, dirty);
+            if !kept && let Some(entry) = versions.get_mut(&page.version) {
+                entry.pages -= 1;
+                if entry.pages == 0 {
+                    versions.remove(&page.version);
+                }
+            }
+            kept
+        });
+    }
+}
+
 /// Bounded dirty copies persist asynchronously, with publication after full I/O.
 pub struct StoreWriter {
     metrics: crate::telemetry::Metrics,
@@ -489,7 +573,7 @@ pub struct StoreWriter {
     admission: Rc<flow_control::Quotas<AdmissionPolicy>>,
     reactor: Rc<Reactor>,
     clock: RefCell<Option<Rc<SegmentClock>>>,
-    pending: RefCell<HashMap<PageId, Dirty>>,
+    pending: RefCell<PendingWrites>,
     queue: RefCell<VecDeque<PageId>>,
     next: Cell<u64>,
     capacity: Cell<usize>,
@@ -534,7 +618,7 @@ impl StoreWriter {
             admission,
             reactor,
             clock: RefCell::new(None),
-            pending: RefCell::new(HashMap::default()),
+            pending: RefCell::default(),
             queue: RefCell::new(VecDeque::new()),
             next: Cell::new(1),
             capacity: Cell::new(64),
@@ -781,15 +865,20 @@ impl StoreWriter {
         })
     }
 
+    /// Drop a still-queued write by ticket. The queue is searched only when
+    /// the ticket is still pending, so a completed or superseded write costs
+    /// one map lookup.
     fn remove_queued_ticket(&self, page: &PageId, ticket: u64) {
-        let position = self.queue.borrow().iter().position(|queued| queued == page);
         if self
             .pending
             .borrow()
             .get(page)
-            .is_some_and(|dirty| dirty.ticket == ticket)
-            && let Some(position) = position
+            .is_none_or(|dirty| dirty.ticket != ticket)
         {
+            return;
+        }
+        let position = self.queue.borrow().iter().position(|queued| queued == page);
+        if let Some(position) = position {
             self.queue.borrow_mut().remove(position);
             self.pending.borrow_mut().remove(page);
             self.note_discard(1);
@@ -987,13 +1076,24 @@ impl StoreWriter {
             .filter(|d| self.allowed(&d.page))
             .map(|d| d.page.clone()))
     }
+    /// Metadata of a version with a queued page this node may still serve.
+    /// O(1) unless the version's queued pages use different keys.
     pub fn metadata(&self, version: &ObjectVersion) -> Result<Option<VersionMetadata>> {
-        Ok(self
-            .pending
-            .borrow()
-            .iter()
-            .find(|(p, d)| &p.version == version && self.allowed(&d.page))
-            .map(|(_, d)| d.page.metadata.immutable()))
+        let pending = self.pending.borrow();
+        let Some(entry) = pending.versions.get(version) else {
+            return Ok(None);
+        };
+        let cache = &version.object.cache;
+        let allowed = match entry.key {
+            Some(key) => {
+                self.availability.page(cache, key) && !self.availability.passthrough(cache)
+            }
+            None => pending
+                .pages
+                .iter()
+                .any(|(p, d)| &p.version == version && self.allowed(&d.page)),
+        };
+        Ok(allowed.then(|| entry.metadata.clone()))
     }
     pub fn pending_count(&self) -> usize {
         self.pending.borrow().len()
@@ -1381,7 +1481,11 @@ impl StoreWriter {
             if scope.check().is_err() {
                 self.cancel_pending_writes()?;
             }
-            // An application-held progress future must be polled alongside drain.
+            // An application-held progress future must be polled alongside
+            // drain. Sleep until it finishes (Busy wakes writer waiters) or the
+            // scope is canceled, instead of polling in a self-wake loop.
+            let waiter = WriterWaiter::with_limit(self, usize::MAX)?;
+            let cancellation = scope.cancellation.subscribe()?;
             std::future::poll_fn(|cx| {
                 if scope.check().is_err()
                     && let Err(error) = self.cancel_pending_writes()
@@ -1389,13 +1493,14 @@ impl StoreWriter {
                     return std::task::Poll::Ready(Err(error));
                 }
                 if !self.busy.get() {
-                    std::task::Poll::Ready(Ok(()))
-                } else {
-                    cx.waker().wake_by_ref();
-                    std::task::Poll::Pending
+                    return std::task::Poll::Ready(Ok(()));
                 }
+                cancellation.register(cx.waker());
+                waiter.register(cx.waker());
+                std::task::Poll::Pending
             })
             .await?;
+            drop((cancellation, waiter));
             while self.pending_count() != 0 {
                 scope.check()?;
                 self.progress(8, scope).await?;
@@ -1511,6 +1616,18 @@ impl<'a> WriterWaiter<'a> {
             .set(id.checked_add(1).ok_or(Error::Unavailable)?);
         waiters.insert(id, None);
         Ok(Self { writer, id })
+    }
+
+    /// Wake `waker` at the next writer state change.
+    fn register(&self, waker: &std::task::Waker) {
+        let old = self
+            .writer
+            .waiters
+            .borrow_mut()
+            .get_mut(&self.id)
+            .expect("registered writer waiter")
+            .replace(waker.clone());
+        drop(old);
     }
 
     async fn ready(&self, checkpoint: bool) {
