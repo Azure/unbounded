@@ -926,18 +926,16 @@ impl SecurityCodec {
 
 /// A received response body and the admission that charged its staging.
 pub(crate) enum ResponseBody {
-    /// Vector staging. Without a reservation, the decoder charges the page.
-    Owned {
-        bytes: Vec<u8>,
-        reservation: Option<flow_control::Charge<AdmissionPolicy>>,
-    },
+    /// No body.
+    Empty,
     /// Aligned staging from the receiving worker's pool, already charged.
+    /// An unkeyed charge is swapped for one keyed to the page's cache.
     Aligned(crate::memory::CiphertextBuffer),
 }
 impl ResponseBody {
     fn len(&self) -> usize {
         match self {
-            Self::Owned { bytes, .. } => bytes.len(),
+            Self::Empty => 0,
             Self::Aligned(buffer) => buffer.len(),
         }
     }
@@ -1278,24 +1276,33 @@ impl SecurityCodec {
         body: Vec<u8>,
         scope: &RequestScope,
     ) -> Result<SignedResponse> {
-        self.response_reserved(authentication, body, None, scope)
+        let body = if body.is_empty() {
+            ResponseBody::Empty
+        } else {
+            // Unkeyed staging; the decoder recharges it to the page's cache.
+            let reservation = self.admission.reserve(
+                None,
+                ResourceClass::Ciphertext,
+                self.buffers.aligned_capacity(body.len())?,
+            )?;
+            let mut buffer = self.buffers.aligned_ciphertext(reservation, body.len())?;
+            buffer.as_mut_slice().copy_from_slice(&body);
+            ResponseBody::Aligned(buffer)
+        };
+        self.response_body(authentication, body, scope)
     }
-    /// Transfer the completed receive allocation's charge into the decoded page.
-    pub fn response_reserved(
+    /// Decode `body` staged under a caller's keyed Ciphertext `reservation`.
+    #[cfg(test)]
+    pub(crate) fn response_reserved(
         &self,
         authentication: ForwardedHead,
         body: Vec<u8>,
-        reservation: Option<flow_control::Charge<AdmissionPolicy>>,
+        reservation: flow_control::Charge<AdmissionPolicy>,
         scope: &RequestScope,
     ) -> Result<SignedResponse> {
-        self.response_body(
-            authentication,
-            ResponseBody::Owned {
-                bytes: body,
-                reservation,
-            },
-            scope,
-        )
+        let mut buffer = self.buffers.encryption_output(reservation, body.len())?;
+        buffer.as_mut_slice().copy_from_slice(&body);
+        self.response_body(authentication, ResponseBody::Aligned(buffer), scope)
     }
     /// Decode a response, keeping an aligned body in place as the page.
     pub(crate) fn response_body(
@@ -1316,29 +1323,21 @@ impl SecurityCodec {
                     return Err(Error::InvalidRequest);
                 }
                 let ciphertext = match body {
-                    ResponseBody::Owned {
-                        bytes: body,
-                        reservation,
-                    } => {
-                        let reservation = match reservation {
-                            Some(reservation) => {
-                                reservation.validate(ResourceClass::Ciphertext, body.capacity())?;
-                                if !self.admission.owns(&reservation)
-                                    || reservation.key() != Some(&metadata.version.object.cache)
-                                {
-                                    return Err(Error::InvalidRequest);
-                                }
-                                reservation
-                            }
-                            None => self.admission.reserve(
+                    ResponseBody::Empty => return Err(Error::InvalidRequest),
+                    ResponseBody::Aligned(mut buffer) => {
+                        if buffer.charge().key().is_none() && self.admission.owns(buffer.charge()) {
+                            let keyed = self.admission.reserve(
                                 Some(&metadata.version.object.cache),
                                 ResourceClass::Ciphertext,
-                                body.capacity(),
-                            )?,
-                        };
-                        self.buffers.ciphertext(reservation, envelope, body)?
-                    }
-                    ResponseBody::Aligned(buffer) => {
+                                buffer.capacity(),
+                            )?;
+                            // The unkeyed staging charge is released here.
+                            drop(
+                                buffer
+                                    .replace_charge(keyed)
+                                    .map_err(|_| Error::InvalidConfiguration)?,
+                            );
+                        }
                         let reservation = buffer.charge();
                         reservation.validate(ResourceClass::Ciphertext, buffer.capacity())?;
                         if !self.admission.owns(reservation)
@@ -1768,7 +1767,7 @@ pub(crate) mod tests {
                     original: authentication.original.clone(),
                     hops: vec![],
                 };
-                let result = codec.response_reserved(auth, vec![9; 19], Some(reservation), &scope);
+                let result = codec.response_reserved(auth, vec![9; 19], reservation, &scope);
                 if case == 0 {
                     let result = result.unwrap();
                     assert_eq!(

@@ -72,6 +72,14 @@ impl CiphertextBuffer {
     pub fn as_mut_slice(&mut self) -> &mut [u8] {
         &mut self.buffer
     }
+    /// Swap the reservation for `charge`, which must cover the capacity.
+    /// Returns the replaced charge, or `charge` back when it does not cover.
+    pub(crate) fn replace_charge(
+        &mut self,
+        charge: CiphertextCharge,
+    ) -> std::result::Result<CiphertextCharge, CiphertextCharge> {
+        self.buffer.replace_charge(charge)
+    }
     /// Zero the pad and freeze without copying. The returned buffer's length
     /// is the padded length; the second value is the ciphertext length.
     fn freeze(self) -> (DiskBuffer, usize) {

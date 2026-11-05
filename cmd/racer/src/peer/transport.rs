@@ -556,7 +556,7 @@ impl Transfers {
                 )?;
                 WireBuffer::aligned(buffers, reservation, length)?
             }
-            _ => WireBuffer::new(admission, length)?,
+            _ => WireBuffer::unkeyed(codec.buffers(), admission, length)?,
         };
         let read = self.io.read_body_exact(connection, buffer, scope).await?;
         Ok((read.lease, read.buffer))
@@ -719,13 +719,8 @@ impl Transfers {
             .read_ciphertext(connection, cache.as_ref(), length, scope)
             .await?;
         let (_, codec) = &self.wire;
-        let response = match buffer.into_body() {
-            // Unkeyed staging is recharged to the page's cache by the decoder.
-            super::protocol::ResponseBody::Owned { bytes, .. } => {
-                codec.response(authentication, bytes, scope)?
-            }
-            body => codec.response_body(authentication, body, scope)?,
-        };
+        // Unkeyed staging is recharged to the page's cache by the decoder.
+        let response = codec.response_body(authentication, buffer.into_body(), scope)?;
         validate_body_length(&response.response, length)?;
         connection.finish_exchange()?;
         Ok(response)
@@ -958,13 +953,12 @@ impl Transfers {
 }
 
 /// Stable, quota-owned transport staging. Never contains plaintext page data.
-/// Construction normalizes capacity before pointer extraction; Vec backing then
-/// stays fixed while ownership moves through reactor completion closures.
 ///
-/// Page bodies use [`WireBuffer::Aligned`] storage from the receiving worker's
-/// pool so the decoded page can be persisted without a copy.
+/// Bodies land in aligned storage from the receiving worker's pool so the
+/// decoded page can be persisted without a copy.
 pub(crate) enum WireBuffer {
-    Owned(flow_control::ChargedBuffer<AdmissionPolicy>),
+    /// A zero-length body.
+    Empty,
     Aligned(crate::memory::CiphertextBuffer),
 }
 impl WireBuffer {
@@ -982,70 +976,47 @@ impl WireBuffer {
             .aligned_ciphertext(reservation, length)
             .map(Self::Aligned)
     }
-    pub(crate) fn new(
+    /// Staging for a body whose cache is not known yet, charged unkeyed to
+    /// `admission`, which must own `buffers`. The decoder swaps the charge
+    /// for one keyed to the page's cache without copying.
+    pub(crate) fn unkeyed(
+        buffers: &crate::memory::BufferPool,
         admission: &flow_control::Quotas<AdmissionPolicy>,
         length: usize,
     ) -> Result<Self> {
+        if length == 0 {
+            return Ok(Self::Empty);
+        }
         if length > crate::model::PAGE_BYTES as usize + 16 {
             return Err(Error::InvalidRequest);
         }
-        let reservation = admission.reserve(None, ResourceClass::Ciphertext, length)?;
-        Ok(Self::Owned(flow_control::ChargedBuffer::unpooled(
-            reservation,
-            length,
-        )?))
-    }
-    #[cfg(test)]
-    pub(crate) fn reserved(
-        reservation: flow_control::Charge<AdmissionPolicy>,
-        length: usize,
-    ) -> Result<Self> {
-        reservation.validate(ResourceClass::Ciphertext, length)?;
-        if length > crate::model::PAGE_BYTES as usize + 16 {
-            return Err(Error::InvalidRequest);
-        }
-        Ok(Self::Owned(flow_control::ChargedBuffer::unpooled(
-            reservation,
-            length,
-        )?))
+        let reservation = admission.reserve(
+            None,
+            ResourceClass::Ciphertext,
+            buffers.aligned_capacity(length)?,
+        )?;
+        Self::aligned(buffers, reservation, length)
     }
     /// Hand the completed receive to the response decoder with its charge.
     pub(crate) fn into_body(self) -> super::protocol::ResponseBody {
         match self {
-            Self::Owned(buffer) => {
-                let (bytes, reservation) = buffer.into_parts();
-                super::protocol::ResponseBody::Owned {
-                    bytes: bytes.into_vec(),
-                    reservation: Some(reservation),
-                }
-            }
+            Self::Empty => super::protocol::ResponseBody::Empty,
             Self::Aligned(buffer) => super::protocol::ResponseBody::Aligned(buffer),
         }
     }
-    /// Split vector staging; aligned staging has no `Vec` form.
-    #[cfg(test)]
-    pub(crate) fn into_parts(self) -> (Vec<u8>, flow_control::Charge<AdmissionPolicy>) {
-        match self {
-            Self::Owned(buffer) => {
-                let (bytes, reservation) = buffer.into_parts();
-                (bytes.into_vec(), reservation)
-            }
-            Self::Aligned(_) => panic!("aligned wire buffer"),
-        }
-    }
 }
-// SAFETY: both variants own stable, exclusive backing and their complete
-// reservation until dropped.
+// SAFETY: the aligned variant owns stable, exclusive backing and its complete
+// reservation until dropped; the empty variant exposes no memory.
 unsafe impl IoBuffer for WireBuffer {
     fn bytes(&self) -> racer_io::Result<&[u8]> {
         match self {
-            Self::Owned(buffer) => Ok(buffer.bytes()),
+            Self::Empty => Ok(&[]),
             Self::Aligned(buffer) => buffer.bytes(),
         }
     }
     fn bytes_mut(&mut self) -> racer_io::Result<&mut [u8]> {
         match self {
-            Self::Owned(buffer) => Ok(buffer.bytes_mut()),
+            Self::Empty => Ok(&mut []),
             Self::Aligned(buffer) => buffer.bytes_mut(),
         }
     }
@@ -1488,10 +1459,7 @@ impl Transfers {
         let (admission, codec) = &self.wire;
         let observer = admission.policy().observer();
         let body = if length == 0 {
-            super::protocol::ResponseBody::Owned {
-                bytes: Vec::new(),
-                reservation: None,
-            }
+            super::protocol::ResponseBody::Empty
         } else {
             let cache = &request.request.origin.object.cache;
             let buffers = codec.buffers();
@@ -2873,161 +2841,48 @@ mod tests {
             assert_eq!(admission.used(ResourceClass::Ciphertext), 0);
         }
     }
+    /// Unkeyed receives land in the worker's pool, charged to the whole
+    /// pooled size class, and later receives reuse the idle buffer.
     #[test]
-    fn wire_checkout_reuses_zeroed_payload_without_moving_or_releasing_its_charge() {
-        use racer_control_wire::CacheId;
-        let admission = flow_control::Quotas::new(AdmissionPolicy::new(
+    fn wire_unkeyed_receive_uses_pooled_storage_and_validates_bounds() {
+        let admission = Rc::new(flow_control::Quotas::new(AdmissionPolicy::new(
             crate::test_support::cluster::config(false).limits,
-        ));
-        let first = CacheId("first".into());
-        let second = CacheId("second".into());
+        )));
+        let buffers = crate::memory::BufferPool::new(admission.clone());
         let length = 1 << 20;
-        for reserved in [false, true] {
-            let mut old = admission
-                .reserve(Some(&first), ResourceClass::Plaintext, length)
-                .unwrap();
-            let mut bytes = old.buffer(length).unwrap();
-            bytes.fill(0xa7);
-            bytes.truncate(1);
-            let pointer = bytes.as_ptr();
-            old.recycle(bytes);
-            drop(old);
-            let mut buffer = if reserved {
-                WireBuffer::reserved(
-                    admission
-                        .reserve(Some(&second), ResourceClass::Ciphertext, length)
-                        .unwrap(),
-                    length,
-                )
-            } else {
-                WireBuffer::new(&admission, length)
-            }
-            .unwrap();
-            assert_eq!(buffer.bytes().unwrap().as_ptr(), pointer);
-            assert_eq!(buffer.bytes().unwrap().len(), length);
-            assert!(buffer.bytes().unwrap().iter().all(|byte| *byte == 0));
-            assert_eq!(admission.used(ResourceClass::Plaintext), 0);
-            assert_eq!(admission.used(ResourceClass::Ciphertext), length);
-            assert_eq!(admission.retained_buffer_bytes(), 0);
-            buffer.bytes_mut().unwrap()[..3].copy_from_slice(b"abc");
-            let (bytes, mut reservation) = buffer.into_parts();
-            assert_eq!(bytes.as_ptr(), pointer);
-            assert_eq!(&bytes[..3], b"abc");
-            assert_eq!(reservation.key(), reserved.then_some(&second));
-            assert_eq!(reservation.amount(), length);
-            assert_eq!(admission.used(ResourceClass::Ciphertext), length);
-            reservation.recycle(bytes);
-            drop(reservation);
-            admission.reclaim_buffers();
-            assert_eq!(admission.used(ResourceClass::Ciphertext), 0);
-        }
-    }
-    #[test]
-    fn wire_checkout_validates_bounds_class_and_admission_before_reuse() {
-        let admission = flow_control::Quotas::new(AdmissionPolicy::new(
-            crate::test_support::cluster::config(false).limits,
-        ));
-        let length = 1 << 20;
-        let mut old = admission
-            .reserve(None, ResourceClass::Ciphertext, length)
-            .unwrap();
-        old.recycle(old.buffer(length).unwrap());
-        drop(old);
-        for (class, amount, requested) in [
-            (ResourceClass::Plaintext, length, length),
-            (ResourceClass::Ciphertext, length - 1, length),
-            (ResourceClass::Ciphertext, (16 << 20) + 17, (16 << 20) + 17),
-        ] {
-            let reservation = admission.reserve(None, class, amount).unwrap();
-            assert!(WireBuffer::reserved(reservation, requested).is_err());
-            assert_eq!(admission.retained_buffer_bytes(), length);
-            assert_eq!(admission.used(ResourceClass::Ciphertext), length);
-            assert_eq!(admission.used(ResourceClass::Plaintext), 0);
-        }
+        let capacity = buffers.aligned_capacity(length).unwrap();
+        let mut first = WireBuffer::unkeyed(&buffers, &admission, length).unwrap();
+        assert_eq!(first.bytes().unwrap().len(), length);
+        assert_eq!(admission.used(ResourceClass::Ciphertext), capacity);
+        first.bytes_mut().unwrap()[..3].copy_from_slice(b"abc");
+        let pointer = first.bytes().unwrap().as_ptr();
+        drop(first);
+        assert_eq!(admission.used(ResourceClass::Ciphertext), 0);
+        let second = WireBuffer::unkeyed(&buffers, &admission, length).unwrap();
+        assert_eq!(second.bytes().unwrap().as_ptr(), pointer, "pool reuse");
+        let crate::peer::protocol::ResponseBody::Aligned(body) = second.into_body() else {
+            panic!("aligned body");
+        };
+        assert_eq!(body.charge().key(), None);
+        assert_eq!(body.charge().amount(), capacity);
+        drop(body);
+        let empty = WireBuffer::unkeyed(&buffers, &admission, 0).unwrap();
+        assert!(empty.bytes().unwrap().is_empty());
         assert!(matches!(
-            WireBuffer::new(&admission, (16 << 20) + 17),
+            empty.into_body(),
+            crate::peer::protocol::ResponseBody::Empty
+        ));
+        assert!(matches!(
+            WireBuffer::unkeyed(&buffers, &admission, (16 << 20) + 17),
             Err(Error::InvalidRequest)
         ));
-        assert!(matches!(
-            WireBuffer::new(&admission, 0),
-            Err(Error::InvalidConfiguration)
-        ));
-        // A pool miss still exposes only initialized bytes.
-        let fresh = WireBuffer::new(&admission, 3).unwrap();
-        assert_eq!(fresh.bytes().unwrap(), &[0; 3]);
-        drop(fresh);
+        buffers.reclaim_idle_buffers();
         admission.stop();
         assert!(matches!(
-            WireBuffer::new(&admission, length),
+            WireBuffer::unkeyed(&buffers, &admission, length),
             Err(Error::Unavailable)
         ));
         assert_eq!(admission.used(ResourceClass::Ciphertext), 0);
-    }
-    /// Pre-reserved staging retains surplus credit and permits an empty view.
-    #[test]
-    fn wire_reserved_surplus_empty_and_abandoned_backing_keep_accounting() {
-        let admission = flow_control::Quotas::new(AdmissionPolicy::new(
-            crate::test_support::cluster::config(false).limits,
-        ));
-        for length in [0, 3, 1 << 20] {
-            let amount = 2 << 20;
-            let buffer = WireBuffer::reserved(
-                admission
-                    .reserve(None, ResourceClass::Ciphertext, amount)
-                    .unwrap(),
-                length,
-            )
-            .unwrap();
-            assert_eq!(buffer.bytes().unwrap().len(), length);
-            assert_eq!(admission.used(ResourceClass::Ciphertext), amount);
-            drop(buffer);
-            assert_eq!(admission.used(ResourceClass::Ciphertext), 0);
-            assert_eq!(admission.retained_buffer_bytes(), 0);
-        }
-    }
-    #[test]
-    #[ignore = "opt-in same-workload wire buffer checkout benchmark"]
-    fn wire_checkout_benchmark() {
-        use std::hint::black_box;
-        use std::time::Instant;
-        const ITERATIONS: usize = 128;
-        for length in [1 << 20, 16 << 20, (16 << 20) + 16] {
-            for reserved in [false, true] {
-                let admission = flow_control::Quotas::new(AdmissionPolicy::new(
-                    crate::test_support::cluster::config(false).limits,
-                ));
-                for sample in 0..6 {
-                    let start = Instant::now();
-                    for _ in 0..ITERATIONS {
-                        let mut buffer = if reserved {
-                            WireBuffer::reserved(
-                                admission
-                                    .reserve(None, ResourceClass::Ciphertext, length)
-                                    .unwrap(),
-                                length,
-                            )
-                        } else {
-                            WireBuffer::new(&admission, length)
-                        }
-                        .unwrap();
-                        buffer.bytes_mut().unwrap().fill(black_box(0xa7));
-                        black_box(buffer.bytes().unwrap());
-                        let (bytes, mut reservation) = buffer.into_parts();
-                        reservation.recycle(bytes);
-                        drop(reservation);
-                    }
-                    let elapsed = start.elapsed();
-                    if sample != 0 {
-                        println!(
-                            "wire_checkout length={length} reserved={reserved} sample={sample} iterations={ITERATIONS} ns_per_op={:.0}",
-                            elapsed.as_nanos() as f64 / ITERATIONS as f64,
-                        );
-                    }
-                }
-                admission.reclaim_buffers();
-                assert_eq!(admission.used(ResourceClass::Ciphertext), 0);
-            }
-        }
     }
     mod native_control_tests {
         use super::*;

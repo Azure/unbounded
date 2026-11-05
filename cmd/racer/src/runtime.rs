@@ -888,8 +888,8 @@ mod tests {
                 }
                 let admission = Rc::new(flow_control::Quotas::new(AdmissionPolicy::new(limits(4))));
                 check(OwnedBuffer::new(&crate::http::HttpContext(admission.clone()), 3).unwrap());
-                check(WireBuffer::new(&admission, 3).unwrap());
                 let pool = BufferPool::new(admission.clone());
+                check(WireBuffer::unkeyed(&pool, &admission, 3).unwrap());
                 check(
                     pool.plaintext(
                         admission
