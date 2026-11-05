@@ -170,13 +170,9 @@ func resolveMachine(
 		containerdVersion = ContainerdVersion
 	}
 
-	runcVersion := cfg.CRI.Runc.Version
-	if runcVersion == "" {
-		runcVersion = defaultRunCVersion(kernel)
-		if runcVersion != RunCVersion {
-			log.Warn("host kernel release is not supported by runc "+RunCVersion+"; using an older runc",
-				"kernel", kernel, "runc", runcVersion)
-		}
+	runcVersion, err := resolveRunCVersion(log, kernel, cfg.CRI.Runc.Version, downloads)
+	if err != nil {
+		return nil, err
 	}
 
 	cniVersion := cfg.CNI.PluginVersion

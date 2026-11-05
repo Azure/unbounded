@@ -4,6 +4,8 @@
 package goalstates
 
 import (
+	"fmt"
+	"log/slog"
 	"strconv"
 	"strings"
 )
@@ -23,6 +25,65 @@ func defaultRunCVersion(kernelRelease string) string {
 	}
 
 	return RunCLibpathrsFallbackVersion
+}
+
+// resolveRunCVersion returns the runc version for the goal state. A configured
+// version is an explicit pin and is returned unchanged. Otherwise it picks
+// defaultRunCVersion for the kernel. When a download override sets a runc
+// version, for example from an offline artifact manifest, that version is the
+// one installed. It returns an error when the version would link libpathrs on
+// a kernel that libpathrs cannot parse. It does not swap in the fallback
+// version, because the override source may not contain it.
+func resolveRunCVersion(log *slog.Logger, kernelRelease, configured string, downloads *DownloadOverrides) (string, error) {
+	if configured != "" {
+		return configured, nil
+	}
+
+	version := defaultRunCVersion(kernelRelease)
+
+	if downloads != nil && downloads.Runc != nil && downloads.Runc.Version != "" {
+		effective := downloads.Runc.Version
+		if !libpathrsParsesKernelRelease(kernelRelease) && runcLinksLibpathrs(effective) {
+			return "", fmt.Errorf("host kernel release %q is not supported by runc %s from the download override; "+
+				"provide runc %s or set CRI.Runc.Version", kernelRelease, effective, RunCLibpathrsFallbackVersion)
+		}
+
+		return version, nil
+	}
+
+	if version != RunCVersion {
+		log.Warn("host kernel release is not supported by runc "+RunCVersion+"; using an older runc",
+			"kernel", kernelRelease, "runc", version)
+	}
+
+	return version, nil
+}
+
+// runcLinksLibpathrs reports whether the runc version links libpathrs, which
+// runc does from 1.5 on. A version it cannot parse is treated as linking
+// libpathrs.
+func runcLinksLibpathrs(version string) bool {
+	parts := strings.SplitN(strings.TrimPrefix(version, "v"), ".", 3)
+	if len(parts) < 2 {
+		return true
+	}
+
+	major, err := strconv.ParseUint(parts[0], 10, 64)
+	if err != nil {
+		return true
+	}
+
+	minorDigits := parts[1]
+	if end := strings.IndexFunc(minorDigits, func(r rune) bool { return r < '0' || r > '9' }); end >= 0 {
+		minorDigits = minorDigits[:end]
+	}
+
+	minor, err := strconv.ParseUint(minorDigits, 10, 64)
+	if err != nil {
+		return true
+	}
+
+	return major > 1 || (major == 1 && minor >= 5)
 }
 
 // libpathrsParsesKernelRelease reports whether libpathrs can parse the kernel
