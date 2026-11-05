@@ -39,6 +39,7 @@ func Run() {
 		newCmdExec(cmdCtx),
 		newCmdLogs(cmdCtx),
 		newCmdSupportsIsolation(),
+		newCmdIsolationReprovision(cmdCtx),
 	)
 
 	if err := root.Execute(); err != nil {
