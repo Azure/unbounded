@@ -125,7 +125,7 @@ func AddCapacityToManager(mgr ctrl.Manager, providers []*machineops.Provider, op
 		return fmt.Errorf("setup MachineClass controller: %w", err)
 	}
 
-	if !options.EnableAllocationController {
+	if !slices.Contains(capacityControllers(options), machineAllocationControllerName) {
 		return nil
 	}
 
