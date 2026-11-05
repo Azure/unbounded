@@ -197,6 +197,8 @@ type indexCache struct {
 	ll    *list.List
 	items map[digest.Digest]*list.Element
 	sf    singleflight.Group
+	// buildTimeout bounds one detached index build. Zero means no bound.
+	buildTimeout time.Duration
 }
 
 type indexItem struct {
@@ -204,8 +206,8 @@ type indexItem struct {
 	idx *layerIndex
 }
 
-func newIndexCache(maxItems int) *indexCache {
-	return &indexCache{max: maxItems, ll: list.New(), items: map[digest.Digest]*list.Element{}}
+func newIndexCache(maxItems int, buildTimeout time.Duration) *indexCache {
+	return &indexCache{max: maxItems, buildTimeout: buildTimeout, ll: list.New(), items: map[digest.Digest]*list.Element{}}
 }
 
 func (c *indexCache) get(d digest.Digest) (*layerIndex, bool) {
@@ -250,57 +252,52 @@ func (c *indexCache) len() int {
 // load returns the index for d, building it with build at most once at a
 // time per digest.
 //
-// The build runs with the context of the caller that started it (the
-// leader). Every caller, leader or waiter, stops waiting as soon as its own
-// ctx is done and returns ctx's error; the build keeps running in the
-// singleflight goroutine and its result is still cached and delivered to the
-// remaining waiters, so no goroutine is leaked. If a waiter receives a
-// cancellation error from a build it did not run (the leader's context was
-// canceled), and its own ctx is still live, it retries and becomes the new
-// leader. A caller whose own build failed returns that error unchanged.
+// The build runs detached from the context of the caller that started it:
+// it keeps the caller's values but not its cancellation or deadline, and is
+// bounded by c.buildTimeout instead (none when zero). Every caller stops
+// waiting as soon as its own ctx is done and returns ctx's error, but the
+// build keeps running and its result is cached, so a caller with a short
+// deadline (a DHCP or metadata lookup) does not throw away a partly
+// downloaded layer; a later caller joins the running build or finds the
+// stored index. A failed build is not cached and its error is returned to
+// every caller still waiting on it.
 func (c *indexCache) load(ctx context.Context, d digest.Digest, build func(context.Context) (*layerIndex, error)) (*layerIndex, error) {
-	for {
+	if idx, ok := c.get(d); ok {
+		return idx, nil
+	}
+
+	bctx := withWaiter(context.WithoutCancel(ctx), ctx)
+
+	ch := c.sf.DoChan(string(d), func() (any, error) {
 		if idx, ok := c.get(d); ok {
 			return idx, nil
 		}
 
-		// ran is written by the singleflight goroutine before the result
-		// is sent on ch, so reading it after receiving is race free.
-		ran := false
-		ch := c.sf.DoChan(string(d), func() (any, error) {
-			ran = true
+		buildCtx, cancel := bctx, context.CancelFunc(func() {})
+		if c.buildTimeout > 0 {
+			buildCtx, cancel = context.WithTimeout(bctx, c.buildTimeout)
+		}
+		defer cancel()
 
-			if idx, ok := c.get(d); ok {
-				return idx, nil
-			}
-
-			idx, err := build(ctx)
-			if err != nil {
-				return nil, err
-			}
-
-			c.add(d, idx)
-
-			return idx, nil
-		})
-
-		var res singleflight.Result
-
-		select {
-		case <-ctx.Done():
-			return nil, ctx.Err()
-		case res = <-ch:
+		idx, err := build(buildCtx)
+		if err != nil {
+			return nil, err
 		}
 
-		if res.Err == nil {
-			return res.Val.(*layerIndex), nil //nolint:errcheck,forcetypeassert // only *layerIndex is returned
+		c.add(d, idx)
+
+		return idx, nil
+	})
+
+	select {
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	case res := <-ch:
+		if res.Err != nil {
+			return nil, res.Err
 		}
 
-		if !ran && ctx.Err() == nil && (errors.Is(res.Err, context.Canceled) || errors.Is(res.Err, context.DeadlineExceeded)) {
-			continue
-		}
-
-		return nil, res.Err
+		return res.Val.(*layerIndex), nil //nolint:errcheck,forcetypeassert // only *layerIndex is returned
 	}
 }
 

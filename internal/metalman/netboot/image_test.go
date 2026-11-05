@@ -13,6 +13,7 @@ import (
 	"net/http/httptest"
 	"net/url"
 	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -750,4 +751,46 @@ func TestMetadataMemoRechecksCacheInsideFlight(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, "fetched.efi", meta.HTTPBootPath)
 	require.EqualValues(t, 1, calls.Load())
+}
+
+// A metadata lookup whose fetch budget expires while the layer index is
+// still downloading does not discard that download: a later lookup gets the
+// metadata from the same build without fetching the layer again.
+func TestMetadataTimeoutKeepsIndexBuild(t *testing.T) {
+	var blobGets atomic.Int32
+
+	images := newTestImages(t, imagepulltest.WithMiddleware(func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if strings.Contains(r.URL.Path, "/blobs/") && r.Method == http.MethodGet {
+				blobGets.Add(1)
+
+				select {
+				case <-time.After(200 * time.Millisecond):
+				case <-r.Context().Done():
+					return
+				}
+			}
+
+			next.ServeHTTP(w, r)
+		})
+	}))
+	ref := images.Push(t, "ghcr.io/test/netboot:v1", map[string][]byte{"metadata.yaml": []byte("dhcpBootImageName: shimx64.efi\n")})
+
+	resolver := &FileResolver{Puller: images.Puller, Metadata: &MetadataMemo{FetchTimeout: 50 * time.Millisecond, ErrorTTL: -1}}
+
+	_, err := resolver.ImageMetadata(t.Context(), ImageSource{Ref: ref})
+	require.Error(t, err, "first lookup should time out while the layer downloads")
+
+	// A later lookup, with enough budget to read the file itself, shares
+	// the Puller and so the build the timed-out lookup started.
+	resolver.Metadata = &MetadataMemo{FetchTimeout: 5 * time.Second}
+
+	meta, err := resolver.ImageMetadata(t.Context(), ImageSource{Ref: ref})
+	require.NoError(t, err)
+	require.Equal(t, "shimx64.efi", meta.DHCPBootImageName)
+
+	// One full read builds the index; reading metadata.yaml reads the layer
+	// up to that file. Without the detached build, the timed-out attempt
+	// would add another full read.
+	require.LessOrEqual(t, blobGets.Load(), int32(2), "layer downloaded again after timeout")
 }

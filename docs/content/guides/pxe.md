@@ -100,7 +100,9 @@ with `Retry-After`, and Machine operations wait.
 
 Metalman keeps two small things in memory: the parsed `metadata.yaml`, and an index of file names and SHA-256 digests for recently
 read layers. The first request that touches a layer downloads it once in full
-to build the index. After that, metalman answers requests for missing files
+to build the index. That download continues for up to 30 minutes even if the
+request that started it times out, so a later request picks it up instead of
+starting over. After that, metalman answers requests for missing files
 without downloading any layer, skips layers that do not contain the requested
 file, and checks that a file read from start to end matches its indexed digest.
 If a download fails or the digest does not match after the response has

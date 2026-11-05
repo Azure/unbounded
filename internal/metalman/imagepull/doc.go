@@ -23,9 +23,11 @@
 // is only kept when the whole layer was read and its digest verified.
 // Indexes are keyed by layer digest, shared by all Images from one Puller,
 // and kept in a bounded LRU (Puller.MaxIndexedLayers). Concurrent requests
-// for the same layer share a single build. Each caller stops waiting for a
-// shared build when its own context is done, and a waiter whose context is
-// still live retries if the build was canceled by its starter's context.
+// for the same layer share a single build. The build runs detached from the
+// callers' contexts, bounded by Puller.IndexBuildTimeout: each caller stops
+// waiting when its own context is done, but the build continues and its
+// index is cached, so a later caller joins it or finds it stored instead of
+// downloading the layer again.
 //
 // The first use of a layer therefore costs one full layer download, and each
 // file read costs another download of the layer up to the end of the file.

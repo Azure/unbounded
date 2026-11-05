@@ -49,7 +49,11 @@ type MetadataMemo struct {
 	// FetchTimeout bounds one shared metadata fetch. Zero or less means
 	// DefaultMetadataFetchTimeout. An imagepull.Puller with a mirror caps
 	// each mirror attempt at half of the remaining budget, so a stalled
-	// mirror still leaves time for the upstream registry.
+	// mirror still leaves time for the upstream registry. It only bounds
+	// the wait: an imagepull layer index build that the fetch started
+	// keeps running after it expires (up to Puller.IndexBuildTimeout), so
+	// a later fetch on a slow link joins that build instead of starting
+	// the layer download over.
 	FetchTimeout time.Duration
 	// Now returns the current time. Nil means time.Now.
 	Now func() time.Time

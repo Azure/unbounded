@@ -5,9 +5,11 @@ package imagepull_test
 
 import (
 	"bytes"
+	"context"
 	"errors"
 	"io"
 	"net/http"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -435,5 +437,83 @@ func TestBufferBudgetReleasedOnClose(t *testing.T) {
 
 	if used, _ := imagepull.BufferStats(p); used != 0 {
 		t.Fatalf("buffered after Close = %d, want 0", used)
+	}
+}
+
+// slowBlobs delays every blob request by delay.
+func slowBlobs(delay time.Duration) ipt.Option {
+	return ipt.WithMiddleware(func(h http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if strings.Contains(r.URL.Path, "/blobs/") {
+				select {
+				case <-time.After(delay):
+				case <-r.Context().Done():
+					return
+				}
+			}
+
+			h.ServeHTTP(w, r)
+		})
+	})
+}
+
+func slowImage(t *testing.T, reg *ipt.Registry) string {
+	t.Helper()
+
+	ref, _ := reg.Push(t, "img", "v1", ipt.ImageSpec{Layers: []ipt.Layer{{
+		Entries:     []ipt.Entry{ipt.File("metadata.yaml", []byte("x")), ipt.File("disk/big", randomBytes(16*1024, 7))},
+		Compression: ipt.Uncompressed,
+	}}})
+
+	return ref
+}
+
+// A caller whose deadline expires during an index build does not discard
+// the build: a later caller gets the index from the same download.
+func TestIndexBuildSurvivesCallerDeadline(t *testing.T) {
+	// Count the requests of an uninterrupted build for comparison.
+	fresh := ipt.NewRegistry(t)
+	freshRef := slowImage(t, fresh)
+	freshImg := resolve(t, &imagepull.Puller{ChunkSize: 1024, Concurrency: 1}, imagepull.Source{Ref: freshRef})
+
+	if _, err := freshImg.Open(t.Context(), "missing"); !errors.Is(err, imagepull.ErrNotFound) {
+		t.Fatalf("err = %v, want ErrNotFound", err)
+	}
+
+	want := fresh.Count(ipt.KindBlob)
+
+	reg := ipt.NewRegistry(t, slowBlobs(100*time.Millisecond))
+	ref := slowImage(t, reg)
+	img := resolve(t, &imagepull.Puller{ChunkSize: 1024, Concurrency: 1}, imagepull.Source{Ref: ref})
+
+	ctx, cancel := context.WithTimeout(t.Context(), 30*time.Millisecond)
+	defer cancel()
+
+	if _, err := img.Open(ctx, "missing"); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("short caller err = %v, want deadline exceeded", err)
+	}
+
+	if _, err := img.Open(t.Context(), "missing"); !errors.Is(err, imagepull.ErrNotFound) {
+		t.Fatalf("later caller err = %v, want ErrNotFound", err)
+	}
+
+	if got := reg.Count(ipt.KindBlob); got != want {
+		t.Fatalf("blob requests = %d, want %d (one build)", got, want)
+	}
+}
+
+func TestIndexBuildTimeoutBoundsBuild(t *testing.T) {
+	reg := ipt.NewRegistry(t, slowBlobs(time.Second))
+	ref := slowImage(t, reg)
+	img := resolve(t, &imagepull.Puller{ChunkSize: 1024, Concurrency: 1, IndexBuildTimeout: 50 * time.Millisecond}, imagepull.Source{Ref: ref})
+
+	begin := time.Now()
+
+	if _, err := img.Open(t.Context(), "missing"); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("err = %v, want deadline exceeded", err)
+	}
+
+	if d := time.Since(begin); d > 900*time.Millisecond {
+		t.Fatalf("build ran %v, want bounded by IndexBuildTimeout", d)
 	}
 }

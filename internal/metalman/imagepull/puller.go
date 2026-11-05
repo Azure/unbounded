@@ -67,6 +67,9 @@ const (
 	// corrupted is read from the upstream registry only, across Images
 	// resolved by the same Puller.
 	DefaultMirrorQuarantine = 10 * time.Minute
+	// DefaultIndexBuildTimeout is the default bound on one layer index
+	// build, which downloads and reads a whole layer.
+	DefaultIndexBuildTimeout = 30 * time.Minute
 
 	// userAgent identifies requests made by this package.
 	userAgent = "unbounded-metalman-imagepull"
@@ -141,6 +144,17 @@ type Puller struct {
 	// content) kept in memory, keyed by layer digest. Zero or less means
 	// DefaultMaxIndexedLayers.
 	MaxIndexedLayers int
+	// IndexBuildTimeout bounds one layer index build. A build is shared by
+	// all callers that need the layer and runs detached from their
+	// contexts: a caller whose context ends stops waiting, but the build
+	// continues and its index is cached for later callers, so short
+	// caller deadlines on a slow link do not discard a partly downloaded
+	// layer. While the caller that started the build is waiting, mirror
+	// timeouts inside the build are capped against its deadline, so a
+	// stalled mirror still fails over to the upstream registry in time;
+	// afterwards they are capped against this bound. Zero means
+	// DefaultIndexBuildTimeout; negative disables the bound.
+	IndexBuildTimeout time.Duration
 	// HTTPClient is the base HTTP client. Nil means a plain client for blob
 	// requests (chunk requests are retried by this package), a retrying
 	// client for upstream manifest requests, and a non-retrying client for
@@ -202,7 +216,7 @@ func (p *Puller) state() *pullerState {
 			maxLayers = DefaultMaxIndexedLayers
 		}
 
-		p.st = &pullerState{indexes: newIndexCache(maxLayers), budget: newBudget(maxBytes)}
+		p.st = &pullerState{indexes: newIndexCache(maxLayers, durationOr(p.IndexBuildTimeout, DefaultIndexBuildTimeout)), budget: newBudget(maxBytes)}
 
 		if ttl := durationOr(p.MirrorQuarantine, DefaultMirrorQuarantine); ttl > 0 {
 			p.st.quarantine = newQuarantine(ttl, maxQuarantined)
@@ -476,13 +490,34 @@ func (t *timeoutTransport) RoundTrip(req *http.Request) (*http.Response, error) 
 // headers or stall mid-body under ctx: half the time left before its
 // deadline, so the upstream registry always keeps the other half. ok is
 // false when ctx has no deadline.
+//
+// A detached index build carries the context of the caller that started it
+// (see withWaiter). While that caller is still waiting, its deadline also
+// counts, so a stalled mirror fails over to the upstream registry within
+// the caller's budget rather than the much longer build bound.
 func mirrorBudget(ctx context.Context) (limit time.Duration, ok bool) {
 	deadline, ok := ctx.Deadline()
+
+	if w, isCtx := ctx.Value(waiterKey{}).(context.Context); isCtx && w.Err() == nil {
+		if wd, wok := w.Deadline(); wok && (!ok || wd.Before(deadline)) {
+			deadline, ok = wd, true
+		}
+	}
+
 	if !ok {
 		return 0, false
 	}
 
 	return max(time.Until(deadline)/2, time.Millisecond), true
+}
+
+// waiterKey is the context key for the context of the caller waiting on a
+// detached operation.
+type waiterKey struct{}
+
+// withWaiter records waiter as the caller waiting on detached context ctx.
+func withWaiter(ctx, waiter context.Context) context.Context {
+	return context.WithValue(ctx, waiterKey{}, waiter)
 }
 
 // capDuration returns d bounded by limit. A non-positive d (no bound) is

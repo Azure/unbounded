@@ -1521,7 +1521,11 @@ func TestMediaPrepareFetchTimeoutDoesNotBlockOtherMedia(t *testing.T) {
 			next.ServeHTTP(w, r)
 		})
 	})
-	p, m, op, _ := mediaFixtureImages(t, "amd64", nil, nil, stall)
+	p, m, op, images := mediaFixtureImages(t, "amd64", nil, nil, stall)
+
+	// Layer index builds outlive the caller's context; bound them so the
+	// stalled build ends before the registry shuts down.
+	images.Puller.IndexBuildTimeout = time.Second
 
 	var calls []string
 
