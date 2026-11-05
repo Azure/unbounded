@@ -18,7 +18,6 @@ use crate::model::CacheKey;
 use crate::model::MAX_FIELD_BYTES;
 use crate::model::ObjectId;
 use crate::model::ObjectMetadata;
-use crate::model::PAGE_BYTES;
 use crate::model::PageNumber;
 use crate::model::ResolvedRange;
 use crate::read::ReadPayload;
@@ -557,7 +556,7 @@ impl Responses {
                     let offset = slice
                         .page
                         .0
-                        .checked_mul(PAGE_BYTES)
+                        .checked_mul(range.page_size().get())
                         .and_then(|n| n.checked_add(u64::from(slice.offset)))
                         .ok_or(Error::BadGateway)?;
                     // Acquisition owns no delivery pipe and continues even while
@@ -768,7 +767,7 @@ impl Responses {
                 let offset = slice
                     .page
                     .0
-                    .checked_mul(PAGE_BYTES)
+                    .checked_mul(range.page_size().get())
                     .and_then(|n| n.checked_add(u64::from(slice.offset)))
                     .ok_or(Error::BadGateway)?;
                 // The parser and validate bound offset + range length.
@@ -964,7 +963,7 @@ impl Responses {
         }
         match kind {
             ReadKind::Subscription { range, .. } => {
-                let expected = expected_subscription_range(*range, response.metadata.length)?;
+                let expected = expected_subscription_range(*range, response)?;
                 if response.payload.range() != expected {
                     return Err(Error::BadGateway);
                 }
@@ -977,7 +976,7 @@ impl Responses {
             | ReadKind::GpuRead {
                 range, destination, ..
             } => {
-                let expected = expected_subscription_range(*range, response.metadata.length)?;
+                let expected = expected_subscription_range(*range, response)?;
                 if response.payload.range() != expected {
                     return Err(Error::BadGateway);
                 }
@@ -1049,16 +1048,23 @@ impl Responses {
 }
 
 /// Resolve the request's expected body shape, treating invalid successes as 502.
+/// The range a response must carry for `range`, resolved at the page size the response's
+/// stream was cut at (the published cluster page size), so only the bytes are compared.
 fn expected_subscription_range(
     range: Option<ByteRange>,
-    length: u64,
+    response: &ReadResponse,
 ) -> Result<Option<ResolvedRange>> {
+    let length = response.metadata.length;
     if length == 0 && range.is_none() {
         return Ok(None);
     }
+    let page = response
+        .payload
+        .range()
+        .map_or(crate::model::PageSize::DEFAULT, |r| r.page_size());
     range
         .unwrap_or(ByteRange::From(0))
-        .resolve(length)
+        .resolve_paged(length, page)
         .map(Some)
         .map_err(|_| Error::BadGateway)
 }

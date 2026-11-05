@@ -1462,7 +1462,7 @@ impl StoreWriter {
             index_ticket.publish(
                 id.clone(),
                 IndexedPage {
-                    page_size: racer_wire::object::PageSize::DEFAULT,
+                    page_size: page.ciphertext.envelope().page_size,
                     location,
                     metadata: page.metadata.immutable(),
                     key_id: page.ciphertext.envelope().key_id,

@@ -1634,7 +1634,6 @@ fn subscription_credits_persist_three_pages_and_serve_partial_disk_range_offline
 }
 
 #[test]
-#[ignore = "D13 in progress: the first 64 KiB subscription fails with BadGateway after HEAD, before any origin GET"]
 fn small_published_pages_fill_persist_and_serve_cross_page_ranges() {
     // D13: the cluster publishes 64 KiB pages; origin fetches, records, and
     // range slicing all follow it instead of the 16 MiB default.
