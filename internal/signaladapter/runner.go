@@ -44,6 +44,7 @@ type Runner struct {
 	Kubernetes             kubernetes.Interface
 	PollInterval           time.Duration
 	CaptureWait            time.Duration
+	Now                    func() time.Time
 	ReadPodLog             func(context.Context, string, string, string, bool) (string, error)
 	PersistBackendEvidence func(string) error
 }
@@ -67,6 +68,7 @@ const (
 	resultRunUIDAnnotation     = "signal.unbounded-cloud.io/check-result-run-uid"
 	resultCheckIDAnnotation    = "signal.unbounded-cloud.io/check-result-check-id"
 	resultCheckOrderAnnotation = "signal.unbounded-cloud.io/check-result-check-order"
+	resultPlanDigestAnnotation = "signal.unbounded-cloud.io/check-result-plan-digest"
 	runLabel                   = "signal.unbounded-cloud.io/run"
 )
 
@@ -117,6 +119,32 @@ func (r *Runner) PersistResult(
 		return err
 	}
 
+	runObject, err := r.Dynamic.Resource(certificationRunGVR).Namespace(request.Namespace).
+		Get(ctx, request.RunName, metav1.GetOptions{})
+	if err != nil {
+		return fmt.Errorf("re-read CertificationRun before result publication: %w", err)
+	}
+
+	var run signalv1.CertificationRun
+	if err := runtime.DefaultUnstructuredConverter.FromUnstructured(runObject.Object, &run); err != nil {
+		return fmt.Errorf("decode CertificationRun before result publication: %w", err)
+	}
+	if run.UID != request.RunUID {
+		return errors.New("CertificationRun UID changed before result publication")
+	}
+	if request.CheckIndex < 0 || request.CheckIndex >= len(run.Spec.Checks) {
+		return errors.New("CertificationRun check changed before result publication")
+	}
+	if err := ValidateBackendEvidenceBinding(
+		output.BackendEvidence,
+		request.RunUID,
+		check.ID,
+		check.Order,
+		run.Spec.PlanDigest,
+	); err != nil {
+		return err
+	}
+
 	content, err := json.Marshal(output)
 	if err != nil {
 		return fmt.Errorf("encode adapter result: %w", err)
@@ -143,6 +171,7 @@ func (r *Runner) PersistResult(
 				resultRunUIDAnnotation:     string(request.RunUID),
 				resultCheckIDAnnotation:    string(check.ID),
 				resultCheckOrderAnnotation: strconv.FormatInt(int64(check.Order), 10),
+				resultPlanDigestAnnotation: run.Spec.PlanDigest,
 			},
 			OwnerReferences: []metav1.OwnerReference{{
 				APIVersion: workflow.GetAPIVersion(),
@@ -175,6 +204,8 @@ func (r *Runner) Execute(ctx context.Context, config Config) (AggregateOutput, e
 	if err != nil {
 		return AggregateOutput{}, err
 	}
+
+	startFingerprints := r.captureParticipantFingerprints(ctx, participants)
 
 	workflow, err := r.Dynamic.Resource(workflowGVR).Namespace(config.Namespace).
 		Get(ctx, config.WorkflowName, metav1.GetOptions{})
@@ -293,6 +324,7 @@ func (r *Runner) Execute(ctx context.Context, config Config) (AggregateOutput, e
 	waitGroup.Wait()
 
 	results := expandResults(resourceResults, created)
+	endFingerprints := r.captureParticipantFingerprints(context.WithoutCancel(ctx), participants)
 
 	output, err := Aggregate(len(participants), references, results)
 	if err != nil {
@@ -309,6 +341,9 @@ func (r *Runner) Execute(ctx context.Context, config Config) (AggregateOutput, e
 		config,
 		participants,
 		created,
+		results,
+		startFingerprints,
+		endFingerprints,
 	)
 	if err != nil {
 		return finishBackendFailure(fmt.Errorf("capture backend evidence: %w", err))
@@ -341,11 +376,28 @@ func (r *Runner) backendFailureOutput(
 	captureContext, cancelCapture := context.WithTimeout(context.Background(), r.captureWait())
 	defer cancelCapture()
 
+	now := r.now()
+	results := make([]Result, len(participants))
+	for index := range results {
+		results[index] = Result{
+			ParticipantIndex: index,
+			ExecutionState:   "Error",
+			Verdict:          "Inconclusive",
+			Reason:           "BackendSetupFailed",
+			StartedAt:        now,
+			FinishedAt:       now,
+			SampleTimes:      []time.Time{now},
+		}
+	}
+
 	evidence, _, err := r.captureBackendEvidence(
 		captureContext,
 		config,
 		participants,
 		created,
+		results,
+		r.captureParticipantFingerprints(captureContext, participants),
+		r.captureParticipantFingerprints(captureContext, participants),
 	)
 	if err != nil {
 		return AggregateOutput{}, fmt.Errorf("capture partial backend evidence: %w", err)
@@ -357,16 +409,6 @@ func (r *Runner) backendFailureOutput(
 	}
 
 	reason := boundedRedactedText(cause.Error(), maxEvidenceTextBytes)
-
-	results := make([]Result, len(participants))
-	for index := range results {
-		results[index] = Result{
-			ParticipantIndex: index,
-			ExecutionState:   "Error",
-			Verdict:          "Inconclusive",
-			Reason:           "BackendSetupFailed",
-		}
-	}
 
 	measurements, err := json.Marshal(map[string]any{
 		"participantCount": len(participants),
@@ -563,14 +605,21 @@ func (r *Runner) mpiWorkerPods(ctx context.Context, backend createdResource) ([]
 	return workers, nil
 }
 
-func (r *Runner) waitForResult(ctx context.Context, config Config, backend createdResource) Result {
+func (r *Runner) waitForResult(ctx context.Context, config Config, backend createdResource) (result Result) {
 	participantIndex := int(backend.participantIndexes[0])
-	result := Result{
+	startedAt := r.now()
+	sampleTimes := make([]time.Time, 0)
+	result = Result{
 		ParticipantIndex: participantIndex,
 		ExecutionState:   "Error",
 		Verdict:          "Inconclusive",
 		Reason:           "BackendExecutionFailed",
 	}
+	defer func() {
+		result.StartedAt = startedAt
+		result.FinishedAt = r.now()
+		result.SampleTimes = sampleTimes
+	}()
 
 	ticker := time.NewTicker(r.pollInterval())
 	defer ticker.Stop()
@@ -578,6 +627,8 @@ func (r *Runner) waitForResult(ctx context.Context, config Config, backend creat
 	var capturedResult *Result
 
 	for {
+		sampleTimes = append(sampleTimes, r.now())
+
 		object, err := r.Dynamic.Resource(backend.gvr).Namespace(config.Namespace).
 			Get(ctx, backend.resource.GetName(), metav1.GetOptions{})
 		if err != nil {
@@ -637,6 +688,41 @@ func (r *Runner) waitForResult(ctx context.Context, config Config, backend creat
 		case <-ticker.C:
 		}
 	}
+}
+
+func (r *Runner) captureParticipantFingerprints(
+	ctx context.Context,
+	participants []signalv1.Participant,
+) []signalv1.NodeFingerprint {
+	fingerprints := make([]signalv1.NodeFingerprint, len(participants))
+	for index := range participants {
+		fingerprints[index].NodeUID = participants[index].NodeUID
+
+		node, err := r.Kubernetes.CoreV1().Nodes().
+			Get(ctx, participants[index].NodeName, metav1.GetOptions{})
+		if err != nil || node.UID != participants[index].NodeUID {
+			continue
+		}
+
+		fingerprints[index] = signalv1.NodeFingerprint{
+			NodeUID:        node.UID,
+			BootID:         node.Status.NodeInfo.BootID,
+			KernelVersion:  node.Status.NodeInfo.KernelVersion,
+			OSImage:        node.Status.NodeInfo.OSImage,
+			KubeletVersion: node.Status.NodeInfo.KubeletVersion,
+			SystemUUID:     node.Status.NodeInfo.SystemUUID,
+		}
+	}
+
+	return fingerprints
+}
+
+func (r *Runner) now() time.Time {
+	if r.Now != nil {
+		return r.Now().UTC()
+	}
+
+	return time.Now().UTC()
 }
 
 func backendCompletionFromLogs(

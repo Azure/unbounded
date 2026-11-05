@@ -5,13 +5,17 @@ package signaladapter
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"regexp"
 	"slices"
+	"sort"
 	"strings"
+	"time"
 
 	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
@@ -23,9 +27,12 @@ import (
 )
 
 const (
-	backendEvidenceVersion = "v1"
+	backendEvidenceVersion = "v2"
 	maxEvidenceLogBytes    = 512
 	maxEvidenceTextBytes   = 512
+	maxEvidenceSamples     = 64
+	maxEvidenceDevices     = 64
+	maxEvidenceDeviceBytes = 128
 	resultsStatusPrefix    = "PROJECT_SIGNAL_RESULTS_V1 "
 )
 
@@ -42,17 +49,55 @@ var (
 
 type BackendEvidence struct {
 	Version      string                       `json:"version"`
+	Identity     EvidenceIdentity             `json:"identity"`
+	Timing       CheckTimingEvidence          `json:"timing"`
+	Provenance   ExecutionProvenanceEvidence  `json:"provenance"`
+	GroupResult  *VerdictEvidence             `json:"groupResult,omitempty"`
 	Complete     bool                         `json:"complete"`
 	Participants []ParticipantBackendEvidence `json:"participants"`
 	CaptureError string                       `json:"captureError,omitempty"`
 }
 
+type EvidenceIdentity struct {
+	RunUID     types.UID        `json:"runUID"`
+	CheckID    signalv1.CheckID `json:"checkID"`
+	CheckOrder int32            `json:"checkOrder"`
+	PlanDigest string           `json:"planDigest,omitempty"`
+}
+
+type CheckTimingEvidence struct {
+	StartedAt        metav1.Time      `json:"startedAt"`
+	FinishedAt       metav1.Time      `json:"finishedAt"`
+	ObservedDuration metav1.Duration  `json:"observedDuration"`
+	MaxObservedGap   *metav1.Duration `json:"maxObservedGap,omitempty"`
+	SampleCount      int              `json:"sampleCount"`
+}
+
+type ExecutionProvenanceEvidence struct {
+	AdapterImage string `json:"adapterImage,omitempty"`
+	RunnerImage  string `json:"runnerImage"`
+}
+
+type VerdictEvidence struct {
+	ExecutionState string `json:"executionState"`
+	Verdict        string `json:"verdict"`
+	Reason         string `json:"reason"`
+	Attribution    string `json:"attribution"`
+}
+
 type ParticipantBackendEvidence struct {
-	ParticipantIndex int                   `json:"participantIndex"`
-	Resource         BackendObjectEvidence `json:"resource"`
-	LauncherJob      *JobEvidence          `json:"launcherJob,omitempty"`
-	Pods             []PodEvidence         `json:"pods"`
-	CaptureError     string                `json:"captureError,omitempty"`
+	ParticipantIndex  int                      `json:"participantIndex"`
+	Verdict           VerdictEvidence          `json:"verdict"`
+	Start             signalv1.NodeFingerprint `json:"start"`
+	End               signalv1.NodeFingerprint `json:"end"`
+	MaxObservedGap    *metav1.Duration         `json:"maxObservedGap,omitempty"`
+	VisibleDevices    []string                 `json:"visibleDevices,omitempty"`
+	CoveredDevices    []string                 `json:"coveredDevices,omitempty"`
+	PerDeviceCoverage bool                     `json:"perDeviceCoverage,omitempty"`
+	Resource          BackendObjectEvidence    `json:"resource"`
+	LauncherJob       *JobEvidence             `json:"launcherJob,omitempty"`
+	Pods              []PodEvidence            `json:"pods"`
+	CaptureError      string                   `json:"captureError,omitempty"`
 }
 
 type BackendObjectEvidence struct {
@@ -164,9 +209,22 @@ func (r *Runner) captureBackendEvidence(
 	config Config,
 	participants []signalv1.Participant,
 	backends []createdResource,
+	results []Result,
+	starts []signalv1.NodeFingerprint,
+	ends []signalv1.NodeFingerprint,
 ) (string, bool, error) {
 	evidence := BackendEvidence{
-		Version:      backendEvidenceVersion,
+		Version: backendEvidenceVersion,
+		Identity: EvidenceIdentity{
+			RunUID:     config.RunUID,
+			CheckID:    config.CheckID,
+			CheckOrder: config.CheckOrder,
+			PlanDigest: config.PlanDigest,
+		},
+		Provenance: ExecutionProvenanceEvidence{
+			AdapterImage: config.AdapterImage,
+			RunnerImage:  config.RunnerImage,
+		},
 		Complete:     true,
 		Participants: make([]ParticipantBackendEvidence, 0, len(participants)),
 	}
@@ -205,12 +263,338 @@ func (r *Runner) captureBackendEvidence(
 		return left.ParticipantIndex - right.ParticipantIndex
 	})
 
+	applyQualificationEvidence(&evidence, config, results, starts, ends)
+
 	content, complete, err := marshalBackendEvidence(evidence, MaxBackendEvidenceBytes)
 	if err != nil {
 		return "", false, err
 	}
 
 	return string(content), complete, nil
+}
+
+type qualificationMeasurement struct {
+	DriverVersion  string                                `json:"driverVersion,omitempty"`
+	VisibleDevices []string                              `json:"visibleDevices,omitempty"`
+	CoveredDevices []string                              `json:"coveredDevices,omitempty"`
+	Participants   []participantQualificationMeasurement `json:"participants,omitempty"`
+}
+
+type participantQualificationMeasurement struct {
+	ParticipantIndex int      `json:"participantIndex"`
+	DriverVersion    string   `json:"driverVersion,omitempty"`
+	VisibleDevices   []string `json:"visibleDevices,omitempty"`
+	CoveredDevices   []string `json:"coveredDevices,omitempty"`
+}
+
+func applyQualificationEvidence(
+	evidence *BackendEvidence,
+	config Config,
+	results []Result,
+	starts []signalv1.NodeFingerprint,
+	ends []signalv1.NodeFingerprint,
+) {
+	resultByParticipant := make(map[int]Result, len(results))
+	for index := range results {
+		resultByParticipant[results[index].ParticipantIndex] = results[index]
+	}
+
+	var earliest time.Time
+	var latest time.Time
+	var largestGap time.Duration
+	totalSamples := 0
+
+	for index := range evidence.Participants {
+		participant := &evidence.Participants[index]
+		result, found := resultByParticipant[participant.ParticipantIndex]
+		if !found {
+			participant.Verdict = inconclusiveVerdict("ParticipantResultMissing", qualificationAttribution(config))
+			evidence.Complete = false
+
+			continue
+		}
+
+		if participant.ParticipantIndex >= 0 && participant.ParticipantIndex < len(starts) {
+			participant.Start = starts[participant.ParticipantIndex]
+		}
+		if participant.ParticipantIndex >= 0 && participant.ParticipantIndex < len(ends) {
+			participant.End = ends[participant.ParticipantIndex]
+		}
+
+		if earliest.IsZero() || (!result.StartedAt.IsZero() && result.StartedAt.Before(earliest)) {
+			earliest = result.StartedAt
+		}
+		if result.FinishedAt.After(latest) {
+			latest = result.FinishedAt
+		}
+
+		samples := boundedSampleTimes(result)
+		totalSamples += len(samples)
+		gap := maximumSampleGap(samples)
+		if gap > largestGap {
+			largestGap = gap
+		}
+		if len(samples) > 1 {
+			value := metav1.Duration{Duration: gap}
+			participant.MaxObservedGap = &value
+		}
+
+		participant.Verdict = VerdictEvidence{
+			ExecutionState: result.ExecutionState,
+			Verdict:        result.Verdict,
+			Reason:         result.Reason,
+			Attribution:    qualificationAttribution(config),
+		}
+
+		measurements, measurementErr := decodeQualificationMeasurements(
+			result.Measurements,
+			participant.ParticipantIndex,
+			config.BackendKind,
+		)
+		if measurementErr == nil && measurements != nil {
+			participant.VisibleDevices = measurements.VisibleDevices
+			participant.CoveredDevices = measurements.CoveredDevices
+			if measurements.DriverVersion != "" {
+				participant.Start.DriverVersion = measurements.DriverVersion
+				participant.End.DriverVersion = measurements.DriverVersion
+			}
+			if len(measurements.VisibleDevices) > 0 {
+				digest := deviceInventoryDigest(measurements.VisibleDevices)
+				participant.Start.GPUInventoryDigest = digest
+				participant.End.GPUInventoryDigest = digest
+			}
+			participant.PerDeviceCoverage = sameStringSet(
+				measurements.VisibleDevices,
+				measurements.CoveredDevices,
+			)
+		}
+
+		enforceQualificationRequirements(participant, config, result, measurementErr)
+	}
+
+	if config.BackendKind == string(signalv1.ExecutionBackendMPIJob) && len(results) > 0 {
+		evidence.GroupResult = &VerdictEvidence{
+			ExecutionState: results[0].ExecutionState,
+			Verdict:        results[0].Verdict,
+			Reason:         results[0].Reason,
+			Attribution:    "group",
+		}
+	}
+
+	if !earliest.IsZero() && !latest.IsZero() && !latest.Before(earliest) {
+		evidence.Timing = CheckTimingEvidence{
+			StartedAt:        metav1.NewTime(earliest),
+			FinishedAt:       metav1.NewTime(latest),
+			ObservedDuration: metav1.Duration{Duration: latest.Sub(earliest)},
+			SampleCount:      totalSamples,
+		}
+		if totalSamples > len(evidence.Participants) {
+			value := metav1.Duration{Duration: largestGap}
+			evidence.Timing.MaxObservedGap = &value
+		}
+	}
+}
+
+func qualificationAttribution(config Config) string {
+	if config.BackendKind == string(signalv1.ExecutionBackendMPIJob) {
+		return "group-with-participant-observation"
+	}
+
+	return "participant"
+}
+
+func enforceQualificationRequirements(
+	participant *ParticipantBackendEvidence,
+	config Config,
+	result Result,
+	measurementErr error,
+) {
+	if config.PlanDigest == "" || config.AdapterImage == "" {
+		participant.Verdict = inconclusiveVerdict("QualificationIdentityUnavailable", participant.Verdict.Attribution)
+
+		return
+	}
+
+	if participant.CaptureError != "" || participant.Start.NodeUID == "" || participant.End.NodeUID == "" {
+		participant.Verdict = inconclusiveVerdict("ParticipantEvidenceIncomplete", participant.Verdict.Attribution)
+
+		return
+	}
+
+	if config.MinDuration != nil && result.FinishedAt.Sub(result.StartedAt) < config.MinDuration.Duration {
+		participant.Verdict = inconclusiveVerdict("MinimumDurationNotMet", participant.Verdict.Attribution)
+
+		return
+	}
+
+	if config.Continuity == nil {
+		return
+	}
+
+	if config.Continuity.RequireSameBootID &&
+		(participant.Start.BootID == "" || participant.End.BootID == "" ||
+			participant.Start.BootID != participant.End.BootID) {
+		participant.Verdict = inconclusiveVerdict("SameBootNotProven", participant.Verdict.Attribution)
+
+		return
+	}
+
+	if config.Continuity.MaxSampleGap != nil {
+		if participant.MaxObservedGap == nil ||
+			participant.MaxObservedGap.Duration > config.Continuity.MaxSampleGap.Duration {
+			participant.Verdict = inconclusiveVerdict("SampleContinuityNotProven", participant.Verdict.Attribution)
+
+			return
+		}
+	}
+
+	if config.Continuity.RequirePerDeviceCoverage {
+		if measurementErr != nil || len(participant.VisibleDevices) == 0 || !participant.PerDeviceCoverage {
+			participant.Verdict = inconclusiveVerdict("PerDeviceCoverageNotProven", participant.Verdict.Attribution)
+		}
+	}
+}
+
+func inconclusiveVerdict(reason, attribution string) VerdictEvidence {
+	return VerdictEvidence{
+		ExecutionState: "Succeeded",
+		Verdict:        "Inconclusive",
+		Reason:         reason,
+		Attribution:    attribution,
+	}
+}
+
+func boundedSampleTimes(result Result) []time.Time {
+	samples := make([]time.Time, 0, len(result.SampleTimes)+2)
+	if !result.StartedAt.IsZero() {
+		samples = append(samples, result.StartedAt)
+	}
+	samples = append(samples, result.SampleTimes...)
+	if !result.FinishedAt.IsZero() {
+		samples = append(samples, result.FinishedAt)
+	}
+	sort.Slice(samples, func(left, right int) bool {
+		return samples[left].Before(samples[right])
+	})
+	samples = slices.Compact(samples)
+	if len(samples) > maxEvidenceSamples {
+		step := float64(len(samples)-1) / float64(maxEvidenceSamples-1)
+		bounded := make([]time.Time, 0, maxEvidenceSamples)
+		for index := 0; index < maxEvidenceSamples; index++ {
+			bounded = append(bounded, samples[int(float64(index)*step)])
+		}
+		samples = bounded
+	}
+
+	return samples
+}
+
+func maximumSampleGap(samples []time.Time) time.Duration {
+	var maximum time.Duration
+	for index := 1; index < len(samples); index++ {
+		if gap := samples[index].Sub(samples[index-1]); gap > maximum {
+			maximum = gap
+		}
+	}
+
+	return maximum
+}
+
+func decodeQualificationMeasurements(
+	content string,
+	participantIndex int,
+	backendKind string,
+) (*qualificationMeasurement, error) {
+	if strings.TrimSpace(content) == "" {
+		return nil, nil
+	}
+
+	var envelope map[string]json.RawMessage
+	if err := json.Unmarshal([]byte(content), &envelope); err != nil {
+		return nil, fmt.Errorf("decode qualification measurements: %w", err)
+	}
+	raw, exists := envelope["qualification"]
+	if !exists {
+		return nil, nil
+	}
+
+	var measurement qualificationMeasurement
+	decoder := json.NewDecoder(strings.NewReader(string(raw)))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&measurement); err != nil {
+		return nil, fmt.Errorf("decode qualification measurements: %w", err)
+	}
+	if err := decoder.Decode(&struct{}{}); !errors.Is(err, io.EOF) {
+		return nil, errors.New("qualification measurements contain trailing JSON values")
+	}
+
+	if backendKind == string(signalv1.ExecutionBackendMPIJob) {
+		var selected *participantQualificationMeasurement
+		seen := map[int]struct{}{}
+		for index := range measurement.Participants {
+			participant := &measurement.Participants[index]
+			if participant.ParticipantIndex < 0 || participant.ParticipantIndex >= MaxParticipants {
+				return nil, errors.New("qualification participant index is invalid")
+			}
+			if _, duplicate := seen[participant.ParticipantIndex]; duplicate {
+				return nil, errors.New("qualification measurements repeat a participant index")
+			}
+			seen[participant.ParticipantIndex] = struct{}{}
+			if participant.ParticipantIndex == participantIndex {
+				selected = participant
+			}
+		}
+		if selected == nil {
+			return nil, errors.New("qualification measurements do not identify the MPI participant")
+		}
+		returnMeasurement := &qualificationMeasurement{
+			DriverVersion:  selected.DriverVersion,
+			VisibleDevices: selected.VisibleDevices,
+			CoveredDevices: selected.CoveredDevices,
+		}
+		measurement = *returnMeasurement
+	} else if len(measurement.Participants) != 0 {
+		return nil, errors.New("Pod qualification measurements must not contain participant groups")
+	}
+
+	for name, devices := range map[string][]string{
+		"visibleDevices": measurement.VisibleDevices,
+		"coveredDevices": measurement.CoveredDevices,
+	} {
+		if len(devices) > maxEvidenceDevices {
+			return nil, fmt.Errorf("%s exceeds %d entries", name, maxEvidenceDevices)
+		}
+		for _, device := range devices {
+			if device == "" || len(device) > maxEvidenceDeviceBytes {
+				return nil, fmt.Errorf("%s contains an invalid device identity", name)
+			}
+		}
+	}
+	if len(measurement.DriverVersion) > 128 {
+		return nil, errors.New("driverVersion exceeds 128 bytes")
+	}
+
+	measurement.VisibleDevices = normalizedStringSet(measurement.VisibleDevices)
+	measurement.CoveredDevices = normalizedStringSet(measurement.CoveredDevices)
+
+	return &measurement, nil
+}
+
+func normalizedStringSet(values []string) []string {
+	normalized := slices.Clone(values)
+	sort.Strings(normalized)
+
+	return slices.Compact(normalized)
+}
+
+func sameStringSet(left, right []string) bool {
+	return slices.Equal(normalizedStringSet(left), normalizedStringSet(right))
+}
+
+func deviceInventoryDigest(devices []string) string {
+	sum := sha256.Sum256([]byte(strings.Join(normalizedStringSet(devices), "\x00")))
+
+	return "sha256:" + hex.EncodeToString(sum[:])
 }
 
 func marshalBackendEvidence(evidence BackendEvidence, limit int) ([]byte, bool, error) {
@@ -220,6 +604,14 @@ func marshalBackendEvidence(evidence BackendEvidence, limit int) ([]byte, bool, 
 
 	if limit < 1 || limit > MaxBackendEvidenceBytes {
 		return nil, false, fmt.Errorf("backend evidence limit must be between 1 and %d bytes", MaxBackendEvidenceBytes)
+	}
+
+	evidence.CaptureError = boundedRedactedText(evidence.CaptureError, maxEvidenceTextBytes)
+	for index := range evidence.Participants {
+		evidence.Participants[index].CaptureError = boundedRedactedText(
+			evidence.Participants[index].CaptureError,
+			maxEvidenceTextBytes,
+		)
 	}
 
 	content, err := json.Marshal(evidence)
@@ -979,11 +1371,110 @@ func ValidateBackendEvidence(content string) error {
 		return fmt.Errorf("backend evidence version %q is invalid", evidence.Version)
 	}
 
+	if evidence.Identity.RunUID == "" || evidence.Identity.CheckID == "" || evidence.Identity.CheckOrder < 0 {
+		return errors.New("backend evidence identity is incomplete")
+	}
+	if evidence.Identity.PlanDigest != "" && !signalv1.IsSHA256Digest(evidence.Identity.PlanDigest) {
+		return errors.New("backend evidence plan digest is invalid")
+	}
+	if evidence.Provenance.RunnerImage == "" ||
+		!runnerImagePattern.MatchString(evidence.Provenance.RunnerImage) {
+		return errors.New("backend evidence runner image is not digest pinned")
+	}
+	if evidence.Provenance.AdapterImage != "" &&
+		!runnerImagePattern.MatchString(evidence.Provenance.AdapterImage) {
+		return errors.New("backend evidence adapter image is not digest pinned")
+	}
+	if evidence.Identity.PlanDigest != "" && evidence.Provenance.AdapterImage == "" {
+		return errors.New("backend evidence with a plan digest requires adapter provenance")
+	}
+	if evidence.Timing.StartedAt.IsZero() || evidence.Timing.FinishedAt.IsZero() ||
+		evidence.Timing.FinishedAt.Before(&evidence.Timing.StartedAt) {
+		return errors.New("backend evidence timing is incomplete")
+	}
+	if evidence.Timing.SampleCount < 1 || evidence.Timing.SampleCount > MaxParticipants*(maxEvidenceSamples+2) {
+		return errors.New("backend evidence sample count is invalid")
+	}
+
 	if len(evidence.Participants) < 1 || len(evidence.Participants) > MaxParticipants {
 		return fmt.Errorf(
 			"backend evidence must contain between 1 and %d participants",
 			MaxParticipants,
 		)
+	}
+
+	seen := make(map[int]struct{}, len(evidence.Participants))
+	for index := range evidence.Participants {
+		participant := &evidence.Participants[index]
+		if participant.ParticipantIndex < 0 || participant.ParticipantIndex >= MaxParticipants {
+			return fmt.Errorf("backend evidence participant %d is out of range", participant.ParticipantIndex)
+		}
+		if _, exists := seen[participant.ParticipantIndex]; exists {
+			return fmt.Errorf("backend evidence repeats participant %d", participant.ParticipantIndex)
+		}
+		seen[participant.ParticipantIndex] = struct{}{}
+		if participant.Start.NodeUID == "" || participant.End.NodeUID == "" ||
+			participant.Start.NodeUID != participant.End.NodeUID {
+			return fmt.Errorf("backend evidence participant %d has invalid node identity", participant.ParticipantIndex)
+		}
+		if err := validateVerdictEvidence(participant.Verdict); err != nil {
+			return fmt.Errorf("backend evidence participant %d verdict: %w", participant.ParticipantIndex, err)
+		}
+		if len(participant.VisibleDevices) > maxEvidenceDevices ||
+			len(participant.CoveredDevices) > maxEvidenceDevices {
+			return fmt.Errorf("backend evidence participant %d device evidence exceeds bounds", participant.ParticipantIndex)
+		}
+	}
+	if evidence.GroupResult != nil {
+		if err := validateVerdictEvidence(*evidence.GroupResult); err != nil {
+			return fmt.Errorf("backend evidence group verdict: %w", err)
+		}
+		if evidence.GroupResult.Attribution != "group" {
+			return errors.New("backend evidence group verdict attribution is invalid")
+		}
+	}
+
+	return nil
+}
+
+func ValidateBackendEvidenceBinding(
+	content string,
+	runUID types.UID,
+	checkID signalv1.CheckID,
+	checkOrder int32,
+	planDigest string,
+) error {
+	var evidence BackendEvidence
+	if err := json.Unmarshal([]byte(content), &evidence); err != nil {
+		return fmt.Errorf("decode backend evidence binding: %w", err)
+	}
+
+	if evidence.Identity.RunUID != runUID ||
+		evidence.Identity.CheckID != checkID ||
+		evidence.Identity.CheckOrder != checkOrder ||
+		evidence.Identity.PlanDigest != planDigest {
+		return errors.New("backend evidence identity does not match the immutable Run check")
+	}
+
+	return nil
+}
+
+func validateVerdictEvidence(verdict VerdictEvidence) error {
+	if verdict.ExecutionState == "" || verdict.Reason == "" {
+		return errors.New("execution state and reason are required")
+	}
+	if len(verdict.Reason) > MaxReasonBytes {
+		return fmt.Errorf("reason exceeds %d bytes", MaxReasonBytes)
+	}
+	switch verdict.Verdict {
+	case "Pass", "Fail", "Inconclusive":
+	default:
+		return errors.New("verdict is invalid")
+	}
+	switch verdict.Attribution {
+	case "participant", "group", "group-with-participant-observation":
+	default:
+		return errors.New("attribution is invalid")
 	}
 
 	return nil

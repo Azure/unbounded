@@ -25,6 +25,76 @@ import (
 	signalv1 "github.com/Azure/unbounded/api/signal/v1alpha1"
 )
 
+func qualificationBackendEvidence(
+	t *testing.T,
+	run *signalv1.CertificationRun,
+	checkIndex int,
+	startedAt time.Time,
+	finishedAt time.Time,
+	maxGap *metav1.Duration,
+	starts []signalv1.NodeFingerprint,
+	ends []signalv1.NodeFingerprint,
+	verdicts []signalv1.QualificationVerdict,
+	perDeviceCoverage bool,
+) string {
+	t.Helper()
+
+	participants := make([]adapterParticipantBackendEvidence, len(starts))
+	for index := range starts {
+		participants[index] = adapterParticipantBackendEvidence{
+			ParticipantIndex: index,
+			Verdict: adapterVerdictEvidence{
+				ExecutionState: "Succeeded",
+				Verdict:        string(verdicts[index]),
+				Reason:         "Observed",
+				Attribution:    "participant",
+			},
+			Start:             starts[index],
+			End:               ends[index],
+			MaxObservedGap:    maxGap,
+			PerDeviceCoverage: perDeviceCoverage,
+			Resource: adapterBackendObjectEvidence{
+				APIVersion: "v1",
+				Kind:       "Pod",
+				Namespace:  run.Namespace,
+				Name:       fmt.Sprintf("backend-%d", index),
+				UID:        types.UID(fmt.Sprintf("backend-uid-%d", index)),
+			},
+			Pods: []adapterPodEvidence{},
+		}
+	}
+
+	evidence := adapterBackendEvidence{
+		Version: adapterBackendEvidenceVersion,
+		Identity: adapterEvidenceIdentity{
+			RunUID:     run.UID,
+			CheckID:    run.Spec.Checks[checkIndex].ID,
+			CheckOrder: int32(checkIndex),
+			PlanDigest: run.Spec.PlanDigest,
+		},
+		Timing: adapterCheckTimingEvidence{
+			StartedAt:        metav1.NewTime(startedAt),
+			FinishedAt:       metav1.NewTime(finishedAt),
+			ObservedDuration: metav1.Duration{Duration: finishedAt.Sub(startedAt)},
+			MaxObservedGap:   maxGap,
+			SampleCount:      2,
+		},
+		Provenance: adapterExecutionProvenanceEvidence{
+			AdapterImage: run.Spec.PlanProvenance.AdapterImage,
+			RunnerImage:  run.Spec.Checks[checkIndex].RunnerImage,
+		},
+		Complete:     true,
+		Participants: participants,
+	}
+
+	content, err := json.Marshal(evidence)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	return string(content)
+}
+
 func TestQualificationEvidenceRejectsEarlySuccessAndUnsupportedContinuity(t *testing.T) {
 	t.Parallel()
 
@@ -51,11 +121,24 @@ func TestQualificationEvidenceRejectsEarlySuccessAndUnsupportedContinuity(t *tes
 	}
 
 	statuses := []signalv1.CheckStatus{{
-		ID:         signalv1.CheckID("R01"),
-		Order:      0,
-		Phase:      signalv1.CheckPhaseSucceeded,
-		StartedAt:  &start,
-		FinishedAt: &finish,
+		ID:    signalv1.CheckID("R01"),
+		Order: 0,
+		Phase: signalv1.CheckPhaseSucceeded,
+		BackendEvidence: signalv1.BackendEvidenceStatus{
+			Complete: true,
+			Content: qualificationBackendEvidence(
+				t,
+				run,
+				0,
+				start.Time,
+				finish.Time,
+				nil,
+				[]signalv1.NodeFingerprint{{NodeUID: node.UID, BootID: "boot-a"}},
+				[]signalv1.NodeFingerprint{{NodeUID: node.UID, BootID: "boot-a"}},
+				[]signalv1.QualificationVerdict{signalv1.QualificationVerdictPass},
+				false,
+			),
+		},
 	}}
 
 	identity, verdict, reason, err := reconciler.qualificationEvidenceIdentity(
@@ -79,6 +162,18 @@ func TestQualificationEvidenceRejectsEarlySuccessAndUnsupportedContinuity(t *tes
 		MaxSampleGap: &metav1.Duration{Duration: 10 * time.Second},
 	}
 	refreshPlanDigest(run)
+	statuses[0].BackendEvidence.Content = qualificationBackendEvidence(
+		t,
+		run,
+		0,
+		start.Time,
+		finish.Time,
+		nil,
+		[]signalv1.NodeFingerprint{{NodeUID: node.UID, BootID: "boot-a"}},
+		[]signalv1.NodeFingerprint{{NodeUID: node.UID, BootID: "boot-a"}},
+		[]signalv1.QualificationVerdict{signalv1.QualificationVerdictPass},
+		false,
+	)
 
 	_, verdict, reason, err = reconciler.qualificationEvidenceIdentity(
 		context.Background(),
@@ -91,7 +186,7 @@ func TestQualificationEvidenceRejectsEarlySuccessAndUnsupportedContinuity(t *tes
 		t.Fatalf("qualificationEvidenceIdentity() continuity error = %v", err)
 	}
 
-	if verdict != "Inconclusive" || !strings.Contains(reason, "sample-gap evidence") {
+	if verdict != "Inconclusive" || !strings.Contains(reason, "sample-gap requirement") {
 		t.Fatalf("unsupported continuity verdict = %q, reason %q", verdict, reason)
 	}
 }
@@ -125,10 +220,23 @@ func TestQualificationEvidenceRejectsSameBootViolation(t *testing.T) {
 		context.Background(),
 		run,
 		[]signalv1.CheckStatus{{
-			ID:         signalv1.CheckID("R01"),
-			Phase:      signalv1.CheckPhaseSucceeded,
-			StartedAt:  &start,
-			FinishedAt: &finish,
+			ID:    signalv1.CheckID("R01"),
+			Phase: signalv1.CheckPhaseSucceeded,
+			BackendEvidence: signalv1.BackendEvidenceStatus{
+				Complete: true,
+				Content: qualificationBackendEvidence(
+					t,
+					run,
+					0,
+					start.Time,
+					finish.Time,
+					nil,
+					[]signalv1.NodeFingerprint{{NodeUID: node.UID, BootID: "boot-a"}},
+					[]signalv1.NodeFingerprint{{NodeUID: node.UID, BootID: "boot-b"}},
+					[]signalv1.QualificationVerdict{signalv1.QualificationVerdictPass},
+					false,
+				),
+			},
 		}},
 		"Pass",
 		"",
@@ -179,10 +287,32 @@ func TestQualificationEvidenceDoesNotInferMultiParticipantVerdicts(t *testing.T)
 		context.Background(),
 		run,
 		[]signalv1.CheckStatus{{
-			ID:         signalv1.CheckID("R01"),
-			Phase:      signalv1.CheckPhaseSucceeded,
-			StartedAt:  &start,
-			FinishedAt: &finish,
+			ID:    signalv1.CheckID("R01"),
+			Phase: signalv1.CheckPhaseSucceeded,
+			BackendEvidence: signalv1.BackendEvidenceStatus{
+				Complete: true,
+				Content: qualificationBackendEvidence(
+					t,
+					run,
+					0,
+					start.Time,
+					finish.Time,
+					nil,
+					[]signalv1.NodeFingerprint{
+						{NodeUID: requester.UID, BootID: "boot-a"},
+						{NodeUID: helper.UID, BootID: "boot-a"},
+					},
+					[]signalv1.NodeFingerprint{
+						{NodeUID: requester.UID, BootID: "boot-a"},
+						{NodeUID: helper.UID, BootID: "boot-a"},
+					},
+					[]signalv1.QualificationVerdict{
+						signalv1.QualificationVerdictPass,
+						signalv1.QualificationVerdictInconclusive,
+					},
+					false,
+				),
+			},
 		}},
 		"Pass",
 		"",
@@ -191,8 +321,10 @@ func TestQualificationEvidenceDoesNotInferMultiParticipantVerdicts(t *testing.T)
 		t.Fatalf("qualificationEvidenceIdentity() error = %v", err)
 	}
 
-	if identity != nil || verdict != "Pass" {
-		t.Fatalf("multi-participant aggregate verdict produced qualification identity %#v, verdict %q", identity, verdict)
+	if identity == nil || verdict != "Pass" || len(identity.Participants) != 2 ||
+		identity.Participants[0].Verdict != signalv1.QualificationVerdictPass ||
+		identity.Participants[1].Verdict != signalv1.QualificationVerdictInconclusive {
+		t.Fatalf("multi-participant evidence identity = %#v, verdict %q", identity, verdict)
 	}
 }
 

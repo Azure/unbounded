@@ -14,6 +14,7 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"time"
 
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -45,8 +46,13 @@ var runnerImagePattern = regexp.MustCompile(`^[^@\s]+@sha256:[0-9a-f]{64}$`)
 type Config struct {
 	Namespace              string
 	WorkflowName           string
+	RunName                string
 	ExecutionName          string
 	RunUID                 types.UID
+	CheckID                signalv1.CheckID
+	CheckOrder             int32
+	PlanDigest             string
+	AdapterImage           string
 	ParticipantsJSON       string
 	ParticipantCount       int
 	ScriptConfigMap        string
@@ -55,6 +61,8 @@ type Config struct {
 	RunnerImage            string
 	BackendKind            string
 	BackendDeadlineSeconds int64
+	MinDuration            *metav1.Duration
+	Continuity             *signalv1.ContinuityPolicy
 	WorkloadPolicyJSON     string
 	GPUResourceCount       string
 }
@@ -146,11 +154,21 @@ func ResolveConfig(request Request, run *signalv1.CertificationRun) (Config, sig
 		return Config{}, signalv1.CertificationCheckSnapshot{}, fmt.Errorf("encode workload policy: %w", err)
 	}
 
+	var adapterImage string
+	if run.Spec.PlanProvenance != nil {
+		adapterImage = run.Spec.PlanProvenance.AdapterImage
+	}
+
 	return Config{
 		Namespace:              request.Namespace,
 		WorkflowName:           request.WorkflowName,
+		RunName:                request.RunName,
 		ExecutionName:          request.ExecutionName,
 		RunUID:                 request.RunUID,
+		CheckID:                check.ID,
+		CheckOrder:             check.Order,
+		PlanDigest:             run.Spec.PlanDigest,
+		AdapterImage:           adapterImage,
 		ParticipantsJSON:       string(participantsJSON),
 		ParticipantCount:       len(participants),
 		ScriptConfigMap:        run.Spec.ScriptBundle.Name,
@@ -159,9 +177,31 @@ func ResolveConfig(request Request, run *signalv1.CertificationRun) (Config, sig
 		RunnerImage:            check.RunnerImage,
 		BackendKind:            string(check.Backend),
 		BackendDeadlineSeconds: int64(check.BackendActiveDeadline.Seconds()),
+		MinDuration:            copyDuration(check.MinDuration),
+		Continuity:             copyContinuity(check.Continuity),
 		WorkloadPolicyJSON:     string(workloadPolicyJSON),
 		GPUResourceCount:       strconv.FormatInt(int64(check.GPUCount), 10),
 	}, check, nil
+}
+
+func copyDuration(value *metav1.Duration) *metav1.Duration {
+	if value == nil {
+		return nil
+	}
+
+	copied := *value
+
+	return &copied
+}
+
+func copyContinuity(value *signalv1.ContinuityPolicy) *signalv1.ContinuityPolicy {
+	if value == nil {
+		return nil
+	}
+
+	copied := value.DeepCopy()
+
+	return copied
 }
 
 type Result struct {
@@ -172,6 +212,9 @@ type Result struct {
 	Measurements     string             `json:"measurements"`
 	ResultLog        *ResultLogMetadata `json:"resultLog,omitempty"`
 	ExitCode         int                `json:"-"`
+	StartedAt        time.Time          `json:"-"`
+	FinishedAt       time.Time          `json:"-"`
+	SampleTimes      []time.Time        `json:"-"`
 }
 
 type ResultLogSourceMetadata struct {
@@ -318,6 +361,21 @@ func ValidateConfig(config Config) ([]signalv1.Participant, []corev1.Toleration,
 		return nil, nil, nil, errors.New(
 			"script-digest must be an algorithm-qualified SHA-256 digest (sha256:<64 lowercase hexadecimal characters>)",
 		)
+	}
+
+	if (config.PlanDigest == "") != (config.AdapterImage == "") {
+		return nil, nil, nil, errors.New("plan digest and adapter image must either both be present or both be absent")
+	}
+	if config.PlanDigest != "" {
+		if !signalv1.IsSHA256Digest(config.PlanDigest) {
+			return nil, nil, nil, errors.New("plan digest must be an algorithm-qualified SHA-256 digest")
+		}
+		if !runnerImagePattern.MatchString(config.AdapterImage) {
+			return nil, nil, nil, errors.New("adapter image must be an immutable sha256 digest reference")
+		}
+		if config.RunName == "" || config.CheckID == "" || config.CheckOrder < 0 {
+			return nil, nil, nil, errors.New("qualification evidence requires run and check identity")
+		}
 	}
 
 	if config.BackendDeadlineSeconds <= 0 {

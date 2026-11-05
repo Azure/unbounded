@@ -67,6 +67,7 @@ const (
 	stageResultPhaseOrder      = "signal.unbounded-cloud.io/stage-result-phase-order"
 	stageResultStageOrder      = "signal.unbounded-cloud.io/stage-result-stage-order"
 	stageResultRunnerImages    = "signal.unbounded-cloud.io/stage-result-runner-images"
+	checkResultPlanDigest      = "signal.unbounded-cloud.io/check-result-plan-digest"
 	runAdmissionReady          = "ready"
 	runAdmissionPending        = "pending"
 	profileSuiteNameField      = "spec.suite.name"
@@ -77,7 +78,8 @@ const (
 	maxAdapterBackendOutputBytes   = 8 * 1024
 	maxAdapterBackendEvidenceBytes = 24 * 1024
 	maxAdapterEvidenceTextBytes    = 512
-	adapterBackendEvidenceVersion  = "v1"
+	maxAdapterEvidenceDevices      = 64
+	adapterBackendEvidenceVersion  = "v2"
 	maxAdapterCheckResultFields    = maxAdapterReasonBytes +
 		maxAdapterMeasurementsBytes +
 		maxAdapterBackendOutputBytes +
@@ -111,17 +113,55 @@ var workflowGVK = schema.GroupVersionKind{
 
 type adapterBackendEvidence struct {
 	Version      string                              `json:"version"`
+	Identity     adapterEvidenceIdentity             `json:"identity"`
+	Timing       adapterCheckTimingEvidence          `json:"timing"`
+	Provenance   adapterExecutionProvenanceEvidence  `json:"provenance"`
+	GroupResult  *adapterVerdictEvidence             `json:"groupResult,omitempty"`
 	Complete     bool                                `json:"complete"`
 	Participants []adapterParticipantBackendEvidence `json:"participants"`
 	CaptureError string                              `json:"captureError,omitempty"`
 }
 
+type adapterEvidenceIdentity struct {
+	RunUID     types.UID        `json:"runUID"`
+	CheckID    signalv1.CheckID `json:"checkID"`
+	CheckOrder int32            `json:"checkOrder"`
+	PlanDigest string           `json:"planDigest,omitempty"`
+}
+
+type adapterCheckTimingEvidence struct {
+	StartedAt        metav1.Time      `json:"startedAt"`
+	FinishedAt       metav1.Time      `json:"finishedAt"`
+	ObservedDuration metav1.Duration  `json:"observedDuration"`
+	MaxObservedGap   *metav1.Duration `json:"maxObservedGap,omitempty"`
+	SampleCount      int              `json:"sampleCount"`
+}
+
+type adapterExecutionProvenanceEvidence struct {
+	AdapterImage string `json:"adapterImage,omitempty"`
+	RunnerImage  string `json:"runnerImage"`
+}
+
+type adapterVerdictEvidence struct {
+	ExecutionState string `json:"executionState"`
+	Verdict        string `json:"verdict"`
+	Reason         string `json:"reason"`
+	Attribution    string `json:"attribution"`
+}
+
 type adapterParticipantBackendEvidence struct {
-	ParticipantIndex int                          `json:"participantIndex"`
-	Resource         adapterBackendObjectEvidence `json:"resource"`
-	LauncherJob      *adapterJobEvidence          `json:"launcherJob,omitempty"`
-	Pods             []adapterPodEvidence         `json:"pods"`
-	CaptureError     string                       `json:"captureError,omitempty"`
+	ParticipantIndex  int                          `json:"participantIndex"`
+	Verdict           adapterVerdictEvidence       `json:"verdict"`
+	Start             signalv1.NodeFingerprint     `json:"start"`
+	End               signalv1.NodeFingerprint     `json:"end"`
+	MaxObservedGap    *metav1.Duration             `json:"maxObservedGap,omitempty"`
+	VisibleDevices    []string                     `json:"visibleDevices,omitempty"`
+	CoveredDevices    []string                     `json:"coveredDevices,omitempty"`
+	PerDeviceCoverage bool                         `json:"perDeviceCoverage,omitempty"`
+	Resource          adapterBackendObjectEvidence `json:"resource"`
+	LauncherJob       *adapterJobEvidence          `json:"launcherJob,omitempty"`
+	Pods              []adapterPodEvidence         `json:"pods"`
+	CaptureError      string                       `json:"captureError,omitempty"`
 }
 
 type adapterBackendObjectEvidence struct {
@@ -323,11 +363,72 @@ func validateAdapterBackendEvidence(content string) error {
 		return fmt.Errorf("backend evidence version %q is invalid", evidence.Version)
 	}
 
+	if evidence.Identity.RunUID == "" || evidence.Identity.CheckID == "" || evidence.Identity.CheckOrder < 0 {
+		return errors.New("backend evidence identity is incomplete")
+	}
+	if evidence.Identity.PlanDigest != "" && !signalv1.IsSHA256Digest(evidence.Identity.PlanDigest) {
+		return errors.New("backend evidence plan digest is invalid")
+	}
+	if !signalv1.IsDigestPinnedImage(evidence.Provenance.RunnerImage) ||
+		(evidence.Provenance.AdapterImage != "" &&
+			!signalv1.IsDigestPinnedImage(evidence.Provenance.AdapterImage)) {
+		return errors.New("backend evidence provenance is invalid")
+	}
+	if evidence.Identity.PlanDigest != "" && evidence.Provenance.AdapterImage == "" {
+		return errors.New("backend evidence with a plan digest requires adapter provenance")
+	}
+	if evidence.Timing.StartedAt.IsZero() || evidence.Timing.FinishedAt.IsZero() ||
+		evidence.Timing.FinishedAt.Before(&evidence.Timing.StartedAt) ||
+		evidence.Timing.SampleCount < 1 {
+		return errors.New("backend evidence timing is invalid")
+	}
+
 	if len(evidence.Participants) < 1 || len(evidence.Participants) > maxAdapterParticipants {
 		return fmt.Errorf(
 			"backend evidence must contain between 1 and %d participants",
 			maxAdapterParticipants,
 		)
+	}
+
+	for index := range evidence.Participants {
+		participant := &evidence.Participants[index]
+		if participant.Start.NodeUID == "" || participant.End.NodeUID == "" ||
+			participant.Start.NodeUID != participant.End.NodeUID {
+			return fmt.Errorf("backend evidence participant %d node identity is invalid", participant.ParticipantIndex)
+		}
+		if err := validateAdapterVerdictEvidence(participant.Verdict); err != nil {
+			return fmt.Errorf("backend evidence participant %d verdict: %w", participant.ParticipantIndex, err)
+		}
+		if len(participant.VisibleDevices) > maxAdapterEvidenceDevices ||
+			len(participant.CoveredDevices) > maxAdapterEvidenceDevices {
+			return fmt.Errorf("backend evidence participant %d device evidence exceeds bounds", participant.ParticipantIndex)
+		}
+	}
+	if evidence.GroupResult != nil {
+		if err := validateAdapterVerdictEvidence(*evidence.GroupResult); err != nil {
+			return fmt.Errorf("backend evidence group verdict: %w", err)
+		}
+		if evidence.GroupResult.Attribution != "group" {
+			return errors.New("backend evidence group verdict attribution is invalid")
+		}
+	}
+
+	return nil
+}
+
+func validateAdapterVerdictEvidence(verdict adapterVerdictEvidence) error {
+	if verdict.ExecutionState == "" || verdict.Reason == "" {
+		return errors.New("execution state and reason are required")
+	}
+	switch verdict.Verdict {
+	case "Pass", "Fail", "Inconclusive":
+	default:
+		return errors.New("verdict is invalid")
+	}
+	switch verdict.Attribution {
+	case "participant", "group", "group-with-participant-observation":
+	default:
+		return errors.New("attribution is invalid")
 	}
 
 	return nil
@@ -3669,6 +3770,8 @@ func (r *RunReconciler) terminalCheckStatuses(
 
 		normalizedEvidence, complete, evidenceErr := groupedBackendEvidenceForParticipants(
 			outputs.BackendEvidence,
+			run,
+			check,
 			run.Spec.Participants,
 			outputs.BackendResources,
 			check.Backend,
@@ -3778,7 +3881,8 @@ func (r *RunReconciler) readCheckResult(
 	if result.Labels[SnapshotRunLabel] != run.Name ||
 		result.Annotations[checkResultRunUID] != string(run.UID) ||
 		result.Annotations[checkResultCheckID] != string(check.ID) ||
-		result.Annotations[checkResultCheckOrder] != strconv.FormatInt(int64(check.Order), 10) {
+		result.Annotations[checkResultCheckOrder] != strconv.FormatInt(int64(check.Order), 10) ||
+		result.Annotations[checkResultPlanDigest] != run.Spec.PlanDigest {
 		return adapterCheckResult{}, errors.New("check result ConfigMap identity does not match the run")
 	}
 
@@ -4112,38 +4216,8 @@ func (r *RunReconciler) qualificationEvidenceIdentity(
 		return nil, "Inconclusive", "ExecutionPlanIdentityInvalid: immutable plan provenance is invalid", nil
 	}
 
-	starts, err := decodeStartFingerprints(run)
-	if err != nil {
-		return nil, "Inconclusive", "ParticipantIdentityMissing: " + err.Error(), nil
-	}
-
-	ends := make([]signalv1.NodeFingerprint, len(run.Spec.Participants))
-
 	participants := make([]signalv1.ParticipantEvidenceIdentity, len(run.Spec.Participants))
 	for index := range run.Spec.Participants {
-		var node corev1.Node
-		if err := r.APIReader.Get(
-			ctx,
-			client.ObjectKey{Name: run.Spec.Participants[index].NodeName},
-			&node,
-		); err != nil {
-			if apierrors.IsNotFound(err) {
-				return nil, "Inconclusive", "ParticipantIdentityMissing: end fingerprint unavailable", nil
-			}
-
-			return nil, verdict, reason, fmt.Errorf(
-				"read participant %s end fingerprint: %w",
-				run.Spec.Participants[index].NodeName,
-				err,
-			)
-		}
-
-		if node.UID != run.Spec.Participants[index].NodeUID {
-			return nil, "Inconclusive", "ParticipantIdentityChanged: node UID changed during execution", nil
-		}
-
-		ends[index] = nodeBaseFingerprint(&node)
-
 		role := signalv1.ParticipantRoleParticipant
 		if index == 0 {
 			role = signalv1.ParticipantRoleRequester
@@ -4152,53 +4226,84 @@ func (r *RunReconciler) qualificationEvidenceIdentity(
 		participants[index] = signalv1.ParticipantEvidenceIdentity{
 			Index:   int32(index),
 			Role:    role,
-			Verdict: qualificationVerdict(verdict),
-			Start:   starts[index],
-			End:     ends[index],
+			Verdict: signalv1.QualificationVerdictPass,
 		}
 	}
 
 	summaries := make([]signalv1.CheckContinuitySummary, len(statuses))
 	for index := range statuses {
 		status := &statuses[index]
-		if status.StartedAt == nil || status.FinishedAt == nil || status.FinishedAt.Before(status.StartedAt) {
+		if status.BackendEvidence.Content == "" {
 			return nil,
 				"Inconclusive",
-				fmt.Sprintf("CheckTimingMissing: check %s has no trustworthy execution interval", run.Spec.Checks[index].ID),
+				fmt.Sprintf("QualificationEvidenceMissing: check %s has no adapter evidence", run.Spec.Checks[index].ID),
 				nil
 		}
 
-		duration := status.FinishedAt.Sub(status.StartedAt.Time)
-		sameBoot := true
+		var evidence adapterBackendEvidence
+		if err := json.Unmarshal([]byte(status.BackendEvidence.Content), &evidence); err != nil {
+			return nil,
+				"Inconclusive",
+				fmt.Sprintf("QualificationEvidenceMalformed: check %s evidence cannot be decoded", run.Spec.Checks[index].ID),
+				nil
+		}
+		if !evidence.Complete || len(evidence.Participants) != len(participants) {
+			verdict = "Inconclusive"
+			reason = fmt.Sprintf("QualificationEvidenceIncomplete: check %s participant evidence is incomplete", run.Spec.Checks[index].ID)
+		}
 
-		for participantIndex := range starts {
-			if starts[participantIndex].BootID == "" ||
-				ends[participantIndex].BootID == "" ||
-				starts[participantIndex].BootID != ends[participantIndex].BootID {
-				sameBoot = false
-				break
+		duration := evidence.Timing.FinishedAt.Sub(evidence.Timing.StartedAt.Time)
+		sameBoot := true
+		perDeviceCoverage := true
+
+		for participantIndex := range evidence.Participants {
+			observed := &evidence.Participants[participantIndex]
+			if observed.ParticipantIndex < 0 || observed.ParticipantIndex >= len(participants) {
+				return nil, "Inconclusive", "QualificationEvidenceMalformed: participant index is invalid", nil
 			}
+
+			identity := &participants[observed.ParticipantIndex]
+			if index == 0 {
+				identity.Start = observed.Start
+			}
+			identity.End = observed.End
+			identity.Verdict = combineQualificationVerdicts(
+				identity.Verdict,
+				qualificationVerdict(observed.Verdict.Verdict),
+			)
+
+			if observed.Start.BootID == "" ||
+				observed.End.BootID == "" ||
+				observed.Start.BootID != observed.End.BootID {
+				sameBoot = false
+			}
+			perDeviceCoverage = perDeviceCoverage && observed.PerDeviceCoverage
 		}
 
 		summaries[index] = signalv1.CheckContinuitySummary{
-			Order:            int32(index),
-			StartedAt:        *status.StartedAt,
-			FinishedAt:       *status.FinishedAt,
-			ObservedDuration: metav1.Duration{Duration: duration},
-			Completed:        status.Phase == signalv1.CheckPhaseSucceeded,
-			SameBootID:       sameBoot,
+			Order:             int32(index),
+			StartedAt:         evidence.Timing.StartedAt,
+			FinishedAt:        evidence.Timing.FinishedAt,
+			ObservedDuration:  metav1.Duration{Duration: duration},
+			MaxSampleGap:      evidence.Timing.MaxObservedGap,
+			Completed:         status.Phase == signalv1.CheckPhaseSucceeded,
+			SameBootID:        sameBoot,
+			PerDeviceCoverage: perDeviceCoverage,
 		}
 
 		check := &run.Spec.Checks[index]
 		if verdict == "Pass" && check.Continuity != nil {
-			switch {
-			case check.Continuity.RequireSameBootID && !sameBoot:
+			if check.Continuity.RequireSameBootID && !sameBoot {
 				verdict = "Inconclusive"
 				reason = fmt.Sprintf("ContinuityNotProven: check %s lacks same-boot evidence", check.ID)
-			case check.Continuity.MaxSampleGap != nil:
+			}
+			if verdict == "Pass" && check.Continuity.MaxSampleGap != nil &&
+				(evidence.Timing.MaxObservedGap == nil ||
+					evidence.Timing.MaxObservedGap.Duration > check.Continuity.MaxSampleGap.Duration) {
 				verdict = "Inconclusive"
-				reason = fmt.Sprintf("ContinuityNotProven: check %s lacks sample-gap evidence", check.ID)
-			case check.Continuity.RequirePerDeviceCoverage:
+				reason = fmt.Sprintf("ContinuityNotProven: check %s exceeds its sample-gap requirement", check.ID)
+			}
+			if verdict == "Pass" && check.Continuity.RequirePerDeviceCoverage && !perDeviceCoverage {
 				verdict = "Inconclusive"
 				reason = fmt.Sprintf("ContinuityNotProven: check %s lacks per-device coverage evidence", check.ID)
 			}
@@ -4211,6 +4316,34 @@ func (r *RunReconciler) qualificationEvidenceIdentity(
 					"LegacyDurationSemanticsUnsupported: legacy backend lifetime cannot prove sustained execution",
 					nil
 			}
+		}
+	}
+
+	admissionStarts, err := decodeStartFingerprints(run)
+	if err != nil {
+		return nil, "Inconclusive", "ParticipantIdentityMissing: " + err.Error(), nil
+	}
+	for index := range participants {
+		if !sameBaseFingerprint(participants[index].Start, admissionStarts[index]) {
+			return nil,
+				"Inconclusive",
+				fmt.Sprintf("ParticipantIdentityChanged: participant %d start fingerprint differs from admission", index),
+				nil
+		}
+
+		var node corev1.Node
+		if err := r.APIReader.Get(
+			ctx,
+			client.ObjectKey{Name: run.Spec.Participants[index].NodeName},
+			&node,
+		); err != nil {
+			return nil, "Inconclusive", "ParticipantIdentityMissing: end fingerprint unavailable", nil
+		}
+		if !sameBaseFingerprint(participants[index].End, nodeFingerprint(&node)) {
+			return nil,
+				"Inconclusive",
+				fmt.Sprintf("ParticipantIdentityChanged: participant %d end fingerprint is no longer current", index),
+				nil
 		}
 	}
 
@@ -4229,12 +4362,13 @@ func (r *RunReconciler) qualificationEvidenceIdentity(
 
 	sort.Strings(runnerImages)
 
-	for index := range participants {
-		participants[index].Verdict = qualificationVerdict(verdict)
-	}
-
-	if len(participants) > 1 {
-		return nil, verdict, reason, nil
+	if verdict != "Pass" {
+		for index := range participants {
+			participants[index].Verdict = combineQualificationVerdicts(
+				participants[index].Verdict,
+				qualificationVerdict(verdict),
+			)
+		}
 	}
 
 	return &signalv1.QualificationEvidenceIdentity{
@@ -4398,6 +4532,31 @@ func qualificationVerdict(verdict string) signalv1.QualificationVerdict {
 	}
 }
 
+func combineQualificationVerdicts(
+	current signalv1.QualificationVerdict,
+	observed signalv1.QualificationVerdict,
+) signalv1.QualificationVerdict {
+	if current == signalv1.QualificationVerdictFail || observed == signalv1.QualificationVerdictFail {
+		return signalv1.QualificationVerdictFail
+	}
+	if current == signalv1.QualificationVerdictInconclusive ||
+		observed == signalv1.QualificationVerdictInconclusive {
+		return signalv1.QualificationVerdictInconclusive
+	}
+
+	return signalv1.QualificationVerdictPass
+}
+
+func sameBaseFingerprint(left, right signalv1.NodeFingerprint) bool {
+	return left.NodeUID != "" &&
+		left.NodeUID == right.NodeUID &&
+		(left.BootID == "" || left.BootID == right.BootID) &&
+		(left.KernelVersion == "" || left.KernelVersion == right.KernelVersion) &&
+		(left.OSImage == "" || left.OSImage == right.OSImage) &&
+		(left.KubeletVersion == "" || left.KubeletVersion == right.KubeletVersion) &&
+		(left.SystemUUID == "" || left.SystemUUID == right.SystemUUID)
+}
+
 func nodeFingerprint(node *corev1.Node) signalv1.NodeFingerprint {
 	fingerprint := nodeBaseFingerprint(node)
 	fingerprint.DriverVersion = node.Annotations[DriverVersionAnnotation]
@@ -4542,6 +4701,8 @@ func backendResourceReferencesForParticipants(
 
 func groupedBackendEvidenceComplete(
 	content string,
+	run *signalv1.CertificationRun,
+	check *signalv1.CertificationCheckSnapshot,
 	participants []signalv1.Participant,
 	references []signalv1.BackendResourceReference,
 	backend signalv1.ExecutionBackend,
@@ -4557,6 +4718,21 @@ func groupedBackendEvidenceComplete(
 	var evidence adapterBackendEvidence
 	if err := json.Unmarshal([]byte(content), &evidence); err != nil {
 		return false, err
+	}
+
+	if run == nil || check == nil ||
+		evidence.Identity.RunUID != run.UID ||
+		evidence.Identity.CheckID != check.ID ||
+		evidence.Identity.CheckOrder != check.Order ||
+		evidence.Identity.PlanDigest != run.Spec.PlanDigest {
+		return false, errors.New("backend-evidence identity does not match the immutable Run check")
+	}
+	if evidence.Provenance.RunnerImage != check.RunnerImage {
+		return false, errors.New("backend-evidence runner image differs from the immutable check")
+	}
+	if run.Spec.PlanProvenance != nil &&
+		evidence.Provenance.AdapterImage != run.Spec.PlanProvenance.AdapterImage {
+		return false, errors.New("backend-evidence adapter image differs from the immutable plan")
 	}
 
 	if len(evidence.Participants) > participantCount || (!allowPartial && len(evidence.Participants) != participantCount) {
@@ -4577,6 +4753,16 @@ func groupedBackendEvidenceComplete(
 	if err != nil {
 		return false, err
 	}
+	switch backend {
+	case signalv1.ExecutionBackendPod:
+		if evidence.GroupResult != nil {
+			return false, errors.New("backend-evidence Pod result must not contain a group verdict")
+		}
+	case signalv1.ExecutionBackendMPIJob:
+		if evidence.GroupResult == nil {
+			return false, errors.New("backend-evidence MPI result requires a group verdict")
+		}
+	}
 
 	for index := range evidence.Participants {
 		participant := &evidence.Participants[index]
@@ -4595,6 +4781,25 @@ func groupedBackendEvidenceComplete(
 		}
 
 		seen[participant.ParticipantIndex] = true
+		expectedAttribution := "participant"
+		if backend == signalv1.ExecutionBackendMPIJob {
+			expectedAttribution = "group-with-participant-observation"
+		}
+		if participant.Verdict.Attribution != expectedAttribution {
+			return false, fmt.Errorf(
+				"backend-evidence participant %d verdict attribution is invalid for %s",
+				participant.ParticipantIndex,
+				backend,
+			)
+		}
+		expectedParticipant := participants[participant.ParticipantIndex]
+		if participant.Start.NodeUID != expectedParticipant.NodeUID ||
+			participant.End.NodeUID != expectedParticipant.NodeUID {
+			return false, fmt.Errorf(
+				"backend-evidence participant %d fingerprint differs from the immutable participant",
+				participant.ParticipantIndex,
+			)
+		}
 
 		if participant.Resource.APIVersion == "" ||
 			participant.Resource.Kind == "" ||
@@ -4724,6 +4929,8 @@ func backendIdentity(backend signalv1.ExecutionBackend) (string, string, error) 
 
 func groupedBackendEvidenceForParticipants(
 	content string,
+	run *signalv1.CertificationRun,
+	check *signalv1.CertificationCheckSnapshot,
 	participants []signalv1.Participant,
 	resources string,
 	backend signalv1.ExecutionBackend,
@@ -4739,6 +4946,8 @@ func groupedBackendEvidenceForParticipants(
 
 	complete, err := groupedBackendEvidenceComplete(
 		content,
+		run,
+		check,
 		participants,
 		references,
 		backend,

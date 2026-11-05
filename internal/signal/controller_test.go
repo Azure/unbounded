@@ -1568,6 +1568,7 @@ func TestReadCheckResultEnforcesBoundedImmutableIdentity(t *testing.T) {
 				checkResultRunUID:     string(run.UID),
 				checkResultCheckID:    string(check.ID),
 				checkResultCheckOrder: strconv.FormatInt(int64(check.Order), 10),
+				checkResultPlanDigest: run.Spec.PlanDigest,
 			},
 			OwnerReferences: []metav1.OwnerReference{
 				*metav1.NewControllerRef(workflow, workflowGVK),
@@ -1607,6 +1608,15 @@ func TestReadCheckResultEnforcesBoundedImmutableIdentity(t *testing.T) {
 
 	if _, err := digestReconciler.readCheckResult(context.Background(), workflow, run, check); err == nil {
 		t.Fatal("readCheckResult() accepted a mismatched digest")
+	}
+
+	wrongPlan := result.DeepCopy()
+	wrongPlan.Annotations[checkResultPlanDigest] = "sha256:" + strings.Repeat("f", 64)
+	planClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(wrongPlan).Build()
+	planReconciler := &RunReconciler{Client: planClient, APIReader: planClient}
+
+	if _, err := planReconciler.readCheckResult(context.Background(), workflow, run, check); err == nil {
+		t.Fatal("readCheckResult() accepted a mismatched plan digest")
 	}
 
 	maximum := adapterCheckResult{

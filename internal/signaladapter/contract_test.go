@@ -86,21 +86,32 @@ func TestPersistResultCreatesControllerContractConfigMap(t *testing.T) {
 	workflow.SetNamespace(request.Namespace)
 	workflow.SetName(request.WorkflowName)
 	workflow.SetUID(types.UID("workflow-uid"))
+	run := certificationRun()
+	runContent, err := runtime.DefaultUnstructuredConverter.ToUnstructured(run)
+	if err != nil {
+		t.Fatal(err)
+	}
 
 	kubernetesClient := kubernetesfake.NewSimpleClientset()
 	runner := Runner{
-		Dynamic:    dynamicfake.NewSimpleDynamicClient(runtime.NewScheme(), workflow),
+		Dynamic: dynamicfake.NewSimpleDynamicClient(
+			runtime.NewScheme(),
+			workflow,
+			&unstructured.Unstructured{Object: runContent},
+		),
 		Kubernetes: kubernetesClient,
 	}
+	check := *run.Spec.Checks[1].DeepCopy()
+	check.ID = "R02"
+	check.Order = 1
 	output := AggregateOutput{
 		ExecutionState:  "Succeeded",
 		Verdict:         "Pass",
 		Reason:          "AllParticipantsPassed",
 		Measurements:    "{}",
 		BackendJSON:     "[]",
-		BackendEvidence: `{"version":"v1","participants":[{}]}`,
+		BackendEvidence: validBackendEvidence(t, run, check),
 	}
-	check := signalv1.CertificationCheckSnapshot{ID: "R02", Order: 1}
 
 	if err := runner.PersistResult(t.Context(), request, check, output); err != nil {
 		t.Fatal(err)
@@ -155,6 +166,7 @@ func TestPersistResultCreatesControllerContractConfigMap(t *testing.T) {
 		result.Annotations[resultRunUIDAnnotation] != string(request.RunUID) ||
 		result.Annotations[resultCheckIDAnnotation] != string(check.ID) ||
 		result.Annotations[resultCheckOrderAnnotation] != "1" ||
+		result.Annotations[resultPlanDigestAnnotation] != run.Spec.PlanDigest ||
 		result.Labels[runLabel] != request.RunName {
 		t.Fatalf("unexpected result identity metadata: labels=%v annotations=%v", result.Labels, result.Annotations)
 	}
@@ -181,6 +193,11 @@ func certificationRun() *signalv1.CertificationRun {
 				UID:    types.UID("script-uid"),
 				Digest: "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
 			},
+			PlanDigest: "sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+			PlanProvenance: &signalv1.ExecutionPlanProvenance{
+				AdapterImage:           "example.invalid/adapter@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+				WorkflowTemplateDigest: "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+			},
 			Checks: []signalv1.CertificationCheckSnapshot{{
 				Script: signalv1.ScriptSnapshot{
 					Key:    "00-r01",
@@ -200,4 +217,60 @@ func certificationRun() *signalv1.CertificationRun {
 			}},
 		},
 	}
+}
+
+func validBackendEvidence(
+	t *testing.T,
+	run *signalv1.CertificationRun,
+	check signalv1.CertificationCheckSnapshot,
+) string {
+	t.Helper()
+
+	started := time.Date(2026, 1, 2, 3, 4, 5, 0, time.UTC)
+	finished := started.Add(time.Minute)
+	evidence := BackendEvidence{
+		Version: backendEvidenceVersion,
+		Identity: EvidenceIdentity{
+			RunUID:     run.UID,
+			CheckID:    check.ID,
+			CheckOrder: check.Order,
+			PlanDigest: run.Spec.PlanDigest,
+		},
+		Timing: CheckTimingEvidence{
+			StartedAt:        metav1.NewTime(started),
+			FinishedAt:       metav1.NewTime(finished),
+			ObservedDuration: metav1.Duration{Duration: time.Minute},
+			SampleCount:      2,
+		},
+		Provenance: ExecutionProvenanceEvidence{
+			AdapterImage: run.Spec.PlanProvenance.AdapterImage,
+			RunnerImage:  check.RunnerImage,
+		},
+		Complete: true,
+		Participants: []ParticipantBackendEvidence{{
+			ParticipantIndex: 0,
+			Verdict: VerdictEvidence{
+				ExecutionState: "Succeeded",
+				Verdict:        "Pass",
+				Reason:         "Passed",
+				Attribution:    "participant",
+			},
+			Start: signalv1.NodeFingerprint{NodeUID: run.Spec.Participants[0].NodeUID, BootID: "boot-a"},
+			End:   signalv1.NodeFingerprint{NodeUID: run.Spec.Participants[0].NodeUID, BootID: "boot-a"},
+			Resource: BackendObjectEvidence{
+				APIVersion: "v1",
+				Kind:       "Pod",
+				Namespace:  run.Namespace,
+				Name:       "backend",
+				UID:        "backend-uid",
+			},
+			Pods: []PodEvidence{},
+		}},
+	}
+	content, err := json.Marshal(evidence)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	return string(content)
 }
