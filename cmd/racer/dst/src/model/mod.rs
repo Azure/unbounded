@@ -694,6 +694,26 @@ const CONNECT_TIMEOUT: Nanos = 100 * MILLIS;
 /// Route searches per worker at once (production `RACER_ACTIVE_PATH_SEARCHES_PER_WORKER`
 /// default, `src/worker.rs`; racer-sim `NodeConfig::active_searches`).
 const ACTIVE_SEARCHES: usize = 8;
+/// Route searches per worker that may wait for a slot (production `topology::DEFAULT_SEARCH_QUEUE`,
+/// `src/app.rs`; racer-sim `NodeConfig::search_queue`).
+const SEARCH_QUEUE: usize = topology::DEFAULT_SEARCH_QUEUE;
+
+/// When a new route search starts given the end times of a worker's searches still running or
+/// waiting (`ends`, all after `now`): at once with a free slot, else in arrival order when the
+/// [`ACTIVE_SEARCHES`]th-latest of them ends, or `None` (`Overloaded`) with [`SEARCH_QUEUE`]
+/// already waiting. Every search's end is known when it starts, so FIFO admission over
+/// [`ACTIVE_SEARCHES`] slots starts the next one exactly then.
+fn search_start(ends: &[Nanos], now: Nanos) -> Option<Nanos> {
+    if ends.len() < ACTIVE_SEARCHES {
+        return Some(now);
+    }
+    if ends.len() >= ACTIVE_SEARCHES + SEARCH_QUEUE {
+        return None;
+    }
+    let mut sorted = ends.to_vec();
+    sorted.sort_unstable();
+    Some(sorted[ends.len() - ACTIVE_SEARCHES])
+}
 /// Entries of the shared route cache.
 const ROUTE_CACHE_ENTRIES: usize = 1 << 16;
 
@@ -2284,22 +2304,27 @@ impl<'s> Model<'s> {
             seed: &seed,
         };
         let worker = (mid % u64::from(self.spec.workers.max(1))) as u8;
-        // Production (`src/app.rs` `Paths::with_limits`) runs at most
-        // `RACER_ACTIVE_PATH_SEARCHES_PER_WORKER` (8) searches per worker and queues none: a
-        // search past them fails `Overloaded` (`topology::Paths::route` with no queue). A slot
-        // is held until the search's CPU work is done.
-        let running = {
+        // Production (`src/app.rs` `Paths::with_limits(..).with_queue(DEFAULT_SEARCH_QUEUE)`)
+        // runs at most `RACER_ACTIVE_PATH_SEARCHES_PER_WORKER` (8) searches per worker and lets
+        // `topology::DEFAULT_SEARCH_QUEUE` (64) more wait in arrival order; past those a search
+        // fails `Overloaded`. A slot is held until the search's CPU work is done.
+        let start = {
             let ends = self.searches.entry((holder, worker)).or_default();
             ends.retain(|end| *end > now);
-            ends.len()
+            search_start(ends, now)
         };
-        let (route, polls) = self.route(&members, query, || running < ACTIVE_SEARCHES);
+        let (route, polls) = self.route(&members, query, || start.is_some());
 
         // racer-sim `spawn`: a cache hit answers on the first poll, each further poll expands
-        // up to 32 nodes, on one worker's CPU.
+        // up to 32 nodes, on one worker's CPU. A queued search starts when a slot frees.
         let costs = self.fabric.costs;
         let cost = polls.saturating_sub(1) * 32 * costs.cpu_path_expand_ns_per_node;
-        let ready = self.fabric.cpu(now, holder, worker, cost);
+        let ready = if polls > 1 {
+            let start = start.unwrap_or(now);
+            self.fabric.cpu_from(now, start, holder, worker, cost)
+        } else {
+            self.fabric.cpu(now, holder, worker, cost)
+        };
         if polls > 1 && route != Err(topology::Error::Overloaded) {
             self.searches
                 .entry((holder, worker))
@@ -3585,6 +3610,25 @@ mod tests {
         model.hop(mid, false);
         let worker = owner_worker(page(1), spec.workers.max(1)) as u8;
         assert_eq!(model.fabric.cpu(0, 1, worker, 1), 1);
+    }
+
+    #[test]
+    fn route_searches_queue_in_arrival_order_then_shed() {
+        assert_eq!(search_start(&[], 5), Some(5));
+        let running: Vec<Nanos> = (1..=ACTIVE_SEARCHES as Nanos).map(|i| 100 * i).collect();
+        assert_eq!(search_start(&running[1..], 5), Some(5));
+        // Every slot busy: the next search starts when the first one ends.
+        assert_eq!(search_start(&running, 5), Some(100));
+        // One waiting (ending at 150): the next one takes the second slot to free.
+        let mut waiting = running.clone();
+        waiting.push(150);
+        assert_eq!(search_start(&waiting, 5), Some(150));
+        // A full queue sheds.
+        let full: Vec<Nanos> = (0..(ACTIVE_SEARCHES + SEARCH_QUEUE) as Nanos)
+            .map(|i| 10 + i)
+            .collect();
+        assert_eq!(search_start(&full, 5), None);
+        assert!(search_start(&full[1..], 5).is_some());
     }
 
     #[test]

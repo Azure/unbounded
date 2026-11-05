@@ -989,8 +989,8 @@ fn retention_observes_client_reads_including_memory_hits() {
 
 /// Rankings and route searches yield between CPU slices and hold their placement pin or search slot
 /// meanwhile, so production's concurrency limits reject concurrent work with `Overloaded` without a
-/// search queue (the default). With a queue, searches beyond the slot limit wait and are woken when
-/// a slot frees, so far fewer are rejected, and none at the default limits.
+/// search queue. With a queue (production's default), searches beyond the slot limit wait and are
+/// woken when a slot frees, so far fewer are rejected, and none at the default limits.
 #[test]
 fn yielding_searches_hit_production_concurrency_limits() {
     let mut config = quiet3(600);
@@ -998,12 +998,13 @@ fn yielding_searches_hit_production_concurrency_limits() {
     config.node.placement_entries = 2;
     config.node.active_searches = 1;
     config.storms = vec![Storm::new(0, 2, 600, MILLIS)];
-    let mut rejecting = config.clone();
     assert_eq!(
-        rejecting.node.search_queue, 0,
-        "production default has no queue"
+        config.node.search_queue,
+        topology::DEFAULT_SEARCH_QUEUE as u32,
+        "production queues searches"
     );
-    config.node.search_queue = topology::DEFAULT_SEARCH_QUEUE as u32;
+    let mut rejecting = config.clone();
+    rejecting.node.search_queue = 0;
     let (_, before) = run_world(rejecting.clone(), 3);
     assert!(counter(&before, "ranking_overloaded") > 0, "{before}");
     let rejected = counter(&before, "route_search_overloaded");

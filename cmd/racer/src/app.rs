@@ -1429,6 +1429,9 @@ impl WorkerApplication {
                 limits.path_cache_bytes.get(),
                 limits.active_path_searches.get(),
             )
+            // A cold start bursts past the search slots; a short queue keeps those reads from
+            // failing `Overloaded` (dst/MODEL.md, "Peer connection slots").
+            .with_queue(::topology::DEFAULT_SEARCH_QUEUE)
             .with_peer_admission(node.peer_admission.for_worker(&metrics)),
         );
         let placement = Rc::new(Placement::with_memory_budget(

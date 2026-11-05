@@ -993,6 +993,13 @@ impl Paths {
             inner: ::topology::Paths::with_limits(cache_entries, cache_bytes, active_searches),
         }
     }
+    /// Let up to `limit` searches wait for a slot instead of failing `Overloaded`
+    /// (`topology::Paths::with_queue`).
+    #[must_use]
+    pub fn with_queue(mut self, limit: usize) -> Self {
+        self.inner = self.inner.with_queue(limit);
+        self
+    }
     #[cfg(test)]
     pub fn shortest(
         &self,
@@ -2319,6 +2326,39 @@ pub(crate) mod tests {
                 placement_error(::topology::Error::SamplingExhausted),
                 Error::Internal
             );
+        }
+        /// The dataplane's `Paths` (`src/app.rs`) queues searches past its slots: with one slot
+        /// and a queue of one, a second search waits and a third fails `Overloaded`.
+        #[test]
+        fn with_queue_lets_searches_wait_up_to_the_queue_limit() {
+            let members = membership(100_000);
+            let source = &members.members()[0].node;
+            let paths = Paths::with_limits(Rc::new(LinkHealth::default()), 0, 1, 1).with_queue(1);
+            let mut cx = std::task::Context::from_waker(futures::task::noop_waker_ref());
+            let budgets: Vec<_> = (0..3)
+                .map(|i| budget(&members, 80_003 + i, NORMAL_LINKS))
+                .collect();
+            let scopes: Vec<_> = budgets
+                .iter()
+                .map(|b| RequestScope::host(b.request, b.deadline.0).unwrap())
+                .collect();
+            let mut first = paths.shortest_async(members.clone(), source, &budgets[0], &scopes[0]);
+            assert!(first.as_mut().poll(&mut cx).is_pending());
+            let mut second = paths.shortest_async(members.clone(), source, &budgets[1], &scopes[1]);
+            assert!(second.as_mut().poll(&mut cx).is_pending());
+            assert_eq!(
+                paths
+                    .shortest(members.clone(), source, &budgets[2])
+                    .unwrap_err(),
+                Error::Overloaded
+            );
+            drop(first);
+            let route = loop {
+                if let std::task::Poll::Ready(route) = second.as_mut().poll(&mut cx) {
+                    break route;
+                }
+            };
+            assert!(route.is_ok());
         }
         /// Production `Paths::new` queues searches beyond its 8
         /// slots instead of failing them with `Overloaded`; a queued search runs

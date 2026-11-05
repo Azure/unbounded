@@ -295,8 +295,8 @@ impl Default for NodeConfig {
             path_entries: 128,
             path_bytes: 256 << 10,
             active_searches: 8,
-            // Production builds `Paths` without a queue (`src/app.rs` `with_limits`).
-            search_queue: 0,
+            // Production queues searches past its slots (`src/app.rs` `with_queue`).
+            search_queue: topology::DEFAULT_SEARCH_QUEUE as u32,
             flights: 64,
             waiters_per_flight: 64,
             relay_transfers: 16,
