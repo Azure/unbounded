@@ -16,7 +16,7 @@ use std::{
 
 pub mod server;
 
-pub use metrics::{Lease, Metric, Metrics};
+pub use metrics::{Lease, LocalLease, Metric, Metrics};
 
 /// Fixed writer shards for caller-defined diagnostic snapshots.
 /// Each read clones one shard under its lock; aggregation never holds a writer lock.
@@ -360,7 +360,17 @@ pub mod metrics {
 
     /// Clones retain their writer shard; reads aggregate all retained shards.
     /// Counter blocks isolate shards without padding every event. Each shared
-    /// gauge occupies its own cache line.
+    /// gauge occupies its own cache line; per-shard gauge contributions use
+    /// counter-style blocks so leases on different shards never share a line.
+    ///
+    /// Counters wrap on overflow, both per shard and when summed at scrape.
+    /// Prometheus treats a decrease as a counter reset, so wrapping is the
+    /// documented semantics rather than saturation.
+    ///
+    /// Updates use atomic `fetch_add` rather than a single-writer load and
+    /// store: clones retain their shard and may be moved to helper threads,
+    /// and [`Metrics::add_on`] writes an arbitrary shard, so a shard is not
+    /// guaranteed to have exactly one writer thread.
     #[derive(Clone)]
     pub struct Metrics<C: Metric, G: Metric> {
         registry: Arc<Registry>,
@@ -427,11 +437,56 @@ pub mod metrics {
         }
     }
 
+    /// A single gauge unit on one writer shard, released on drop. The holder
+    /// can also record counters on the same shard through one shared pointer,
+    /// so a per-request owner needs no other registry handle.
+    #[must_use = "dropping the lease immediately releases its gauge unit"]
+    pub struct LocalLease<C: Metric> {
+        registry: Arc<Registry>,
+
+        shard: usize,
+
+        index: usize,
+
+        kinds: PhantomData<fn() -> C>,
+    }
+
+    impl<C: Metric> LocalLease<C> {
+        /// Add to a counter on this lease's writer shard with wrapping arithmetic.
+        pub fn add(&self, metric: C, amount: u64) {
+            self.registry
+                .counter(self.shard, metric.index())
+                .fetch_add(amount, Ordering::Relaxed);
+        }
+    }
+
+    impl<C: Metric> Drop for LocalLease<C> {
+        /// Release this acquisition from its shard's contribution.
+        fn drop(&mut self) {
+            self.registry
+                .local_gauge(self.shard, self.index)
+                .fetch_sub(1, Ordering::Relaxed);
+        }
+    }
+
+    impl Registry {
+        /// Locate a counter inside its writer's cache-line blocks.
+        fn counter(&self, shard: usize, index: usize) -> &AtomicU64 {
+            &self.counters[shard * self.stride + index / 8].0[index % 8]
+        }
+
+        /// Locate one shard's contribution to a gauge.
+        fn local_gauge(&self, shard: usize, index: usize) -> &AtomicU64 {
+            &self.local_gauges[shard * self.gauge_stride + index / 8].0[index % 8]
+        }
+    }
+
     impl<C: Metric, G: Metric> Metrics<C, G> {
         /// Allocate a fixed registry. Panics if `n` is zero or capacity overflows.
         pub fn shards(n: usize) -> Vec<Self> {
             assert!(n >= 1, "at least one metrics shard is required");
             let stride = C::ALL.len().div_ceil(8);
+            let gauge_stride = G::ALL.len().div_ceil(8);
             let registry = Arc::new(Registry {
                 counters: (0..stride.checked_mul(n).expect("metrics capacity overflow"))
                     .map(|_| CounterBlock::default())
@@ -439,6 +494,12 @@ pub mod metrics {
                 stride,
                 shards: n,
                 gauges: (0..G::ALL.len()).map(|_| Gauge::default()).collect(),
+                local_gauges: (0..gauge_stride
+                    .checked_mul(n)
+                    .expect("metrics capacity overflow"))
+                    .map(|_| CounterBlock::default())
+                    .collect(),
+                gauge_stride,
             });
             (0..n)
                 .map(|shard| Self {
@@ -449,7 +510,7 @@ pub mod metrics {
                 .collect()
         }
 
-        /// Add with wrapping atomic arithmetic; scrape sums saturate across shards.
+        /// Add with wrapping atomic arithmetic; scrape sums also wrap.
         pub fn add(&self, metric: C, amount: u64) {
             self.add_on(self.shard, metric, amount);
         }
@@ -461,10 +522,11 @@ pub mod metrics {
                 .fetch_add(amount, Ordering::Relaxed);
         }
 
-        /// Sum all writer shards, saturating on overflow.
+        /// Sum all writer shards with wrapping arithmetic, so a wrapped shard
+        /// reads as one counter reset instead of a stuck maximum.
         pub fn count(&self, metric: C) -> u64 {
             (0..self.registry.shards).fold(0u64, |total, shard| {
-                total.saturating_add(self.count_on(shard, metric))
+                total.wrapping_add(self.count_on(shard, metric))
             })
         }
 
@@ -474,11 +536,47 @@ pub mod metrics {
             self.counter(shard, metric).load(Ordering::Relaxed)
         }
 
-        /// Observe a shared gauge with a relaxed load.
+        /// Observe a gauge with relaxed loads: the shared value plus every
+        /// shard's [`Metrics::lease_local`] contribution, with wrapping sums.
         pub fn gauge(&self, metric: G) -> u64 {
-            self.registry.gauges[metric.index()]
-                .0
-                .load(Ordering::Relaxed)
+            let index = metric.index();
+            (0..self.registry.shards).fold(
+                self.registry.gauges[index].0.load(Ordering::Relaxed),
+                |total, shard| {
+                    total.wrapping_add(
+                        self.registry
+                            .local_gauge(shard, index)
+                            .load(Ordering::Relaxed),
+                    )
+                },
+            )
+        }
+
+        /// Replace this shard's contribution to a gauge. Do not use while its
+        /// local leases are outstanding; intended for fixtures and resets.
+        pub fn set_local(&self, metric: G, value: u64) {
+            self.registry
+                .local_gauge(self.shard, metric.index())
+                .store(value, Ordering::Relaxed);
+        }
+
+        /// Increment this shard's contribution to a gauge unless full. Unlike
+        /// [`Metrics::lease`], concurrent workers touch separate cache lines.
+        /// Do not mix with [`Metrics::set`] on the same gauge.
+        pub fn lease_local(&self, metric: G) -> Option<LocalLease<C>> {
+            let index = metric.index();
+            self.registry
+                .local_gauge(self.shard, index)
+                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |old| {
+                    old.checked_add(1)
+                })
+                .ok()?;
+            Some(LocalLease {
+                registry: self.registry.clone(),
+                shard: self.shard,
+                index,
+                kinds: PhantomData,
+            })
         }
 
         /// Replace a shared gauge; do not replace values with outstanding leases.
@@ -525,8 +623,7 @@ pub mod metrics {
 
         /// Locate a counter inside its writer's cache-line blocks.
         fn counter(&self, shard: usize, metric: C) -> &AtomicU64 {
-            let index = metric.index();
-            &self.registry.counters[shard * self.registry.stride + index / 8].0[index % 8]
+            self.registry.counter(shard, metric.index())
         }
     }
 
@@ -630,6 +727,10 @@ pub mod metrics {
         shards: usize,
 
         gauges: Box<[Gauge]>,
+
+        local_gauges: Box<[CounterBlock]>,
+
+        gauge_stride: usize,
     }
 
     /// Metric layout, arithmetic, lifetime, and streaming contracts.
@@ -804,13 +905,13 @@ pub mod metrics {
             assert_eq!(workers[0].count(Event::I), 6);
         }
 
-        /// Distinguish saturating sums, wrapping updates, and checked leases.
+        /// Distinguish wrapping sums, wrapping updates, and checked leases.
         #[test]
         fn saturation_and_gauge_wrapping_and_lease_lifetime() {
             let workers = TestMetrics::shards(2);
             workers[0].add(Event::A, u64::MAX - 1);
             workers[1].add(Event::A, 2);
-            assert_eq!(workers[0].count(Event::A), u64::MAX);
+            assert_eq!(workers[0].count(Event::A), 0);
             workers[0].add(Event::A, 9);
             assert_eq!(workers[0].counter(0, Event::A).load(Ordering::Relaxed), 7);
             workers[0].set(Level::Active, u64::MAX - 1);
@@ -825,6 +926,38 @@ pub mod metrics {
             drop(workers);
             drop(lease);
             assert_eq!(registry.gauges[0].0.load(Ordering::Relaxed), 1);
+        }
+
+        /// Local leases count on their own shard, sum on read, record counters
+        /// on that shard, and release from any thread.
+        #[test]
+        fn local_leases_are_sharded_and_summed() {
+            let workers = TestMetrics::shards(3);
+            workers[0].set(Level::Other, 4);
+            let first = workers[1].lease_local(Level::Active).unwrap();
+            let second = workers[2].lease_local(Level::Active).unwrap();
+            let third = workers[2].lease_local(Level::Active).unwrap();
+            assert_eq!(workers[0].gauge(Level::Active), 3);
+            assert_eq!(workers[0].gauge(Level::Other), 4);
+            let registry = &workers[0].registry;
+            assert_eq!(registry.local_gauge(2, 0).load(Ordering::Relaxed), 2);
+            assert_eq!(registry.gauges[0].0.load(Ordering::Relaxed), 0);
+            second.add(Event::B, 5);
+            assert_eq!(workers[0].count_on(2, Event::B), 5);
+            assert_eq!(workers[0].count_on(1, Event::B), 0);
+            std::thread::spawn(move || drop(second)).join().unwrap();
+            drop(workers);
+            drop(third);
+            let reader = TestMetrics {
+                registry: first.registry.clone(),
+                shard: 0,
+                kinds: PhantomData,
+            };
+            assert_eq!(reader.gauge(Level::Active), 1);
+            drop(first);
+            assert_eq!(reader.gauge(Level::Active), 0);
+            reader.set_local(Level::Active, u64::MAX);
+            assert!(reader.lease_local(Level::Active).is_none());
         }
 
         /// Shared-shard writers may race scrapes without losing updates or leases.

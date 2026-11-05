@@ -432,9 +432,10 @@ impl Drop for OpaqueRelayBody<'_> {
     }
 }
 /// One complete client head through final delivery, including cancellation/drop.
+/// Holds one worker-local lease, which is also its counter handle, so opening
+/// a request clones a single pointer and touches only this worker's lines.
 pub(crate) struct RequestMetrics {
-    _active: ::telemetry::Lease,
-    metrics: Metrics,
+    active: ::telemetry::LocalLease<Event>,
     succeeded: bool,
     overloaded: bool,
     /// The first reported failure, which names why the request ended.
@@ -446,7 +447,7 @@ impl RequestMetrics {
     }
     pub(crate) fn fail(&mut self, error: crate::error::Error) {
         if error == crate::error::Error::Overloaded && !self.overloaded {
-            self.metrics.record(Event::Overload, 1);
+            self.active.add(Event::Overload, 1);
             self.overloaded = true;
         }
         self.failure.get_or_insert(error);
@@ -455,8 +456,8 @@ impl RequestMetrics {
 impl Drop for RequestMetrics {
     fn drop(&mut self) {
         if !self.succeeded {
-            self.metrics.record(Event::RequestError, 1);
-            self.metrics.record(request_error_reason(self.failure), 1);
+            self.active.add(Event::RequestError, 1);
+            self.active.add(request_error_reason(self.failure), 1);
             log_request_failure(self.failure);
         }
     }
@@ -786,17 +787,19 @@ impl Metrics {
     }
 
     pub(crate) fn request(&self) -> Result<RequestMetrics> {
-        let active = self.lease(Gauge::ActiveRequests)?;
-        self.record(Event::Request, 1);
+        let active = self
+            .core
+            .lease_local(Gauge::ActiveRequests)
+            .ok_or(crate::error::Error::Overloaded)?;
+        active.add(Event::Request, 1);
         Ok(RequestMetrics {
-            _active: active,
-            metrics: self.clone(),
+            active,
             succeeded: false,
             overloaded: false,
             failure: None,
         })
     }
-    /// Saturate instead of wrapping a long-lived Prometheus counter.
+    /// Add with wrapping arithmetic; Prometheus reads a wrap as a counter reset.
     pub fn record(&self, event: Event, amount: u64) {
         self.core.add(event, amount);
     }
@@ -1224,7 +1227,7 @@ mod tests {
         #[test]
         fn request_lease_overflow_preserves_counters_and_error() {
             let metrics = Metrics::default();
-            metrics.set_gauge(Gauge::ActiveRequests, u64::MAX);
+            metrics.core.set_local(Gauge::ActiveRequests, u64::MAX);
             assert!(matches!(
                 metrics.request(),
                 Err(crate::error::Error::Overloaded)
@@ -1677,7 +1680,7 @@ mod tests {
             assert_eq!(metrics.gauge(Gauge::ActiveRequests), 0);
         }
         #[test]
-        fn fixed_series_saturate_and_leases_return_to_baseline() {
+        fn fixed_series_wrap_and_leases_return_to_baseline() {
             let metrics = Metrics::default();
             for event in EVENTS {
                 metrics.record(event, u64::MAX);
@@ -1784,12 +1787,12 @@ mod tests {
         }
 
         #[test]
-        fn aggregate_events_saturate_without_wrapping() {
+        fn aggregate_events_wrap_like_a_counter_reset() {
             let workers = Metrics::for_workers(2).unwrap();
             for event in EVENTS {
                 workers[0].record(event, u64::MAX - 1);
                 workers[1].record(event, 2);
-                assert_eq!(workers[0].count(event), u64::MAX);
+                assert_eq!(workers[0].count(event), 0);
                 workers[1].record(event, u64::MAX);
                 assert_eq!(workers[1].count(event), u64::MAX);
             }
