@@ -894,8 +894,8 @@ mod tests {
         }
 
         /// Share parent cancellation with the fresh attempt scope.
-        fn cancellation(&self) -> Option<&Cancellation> {
-            Some(&self.cancellation)
+        fn cancel_token(&self) -> Option<&racer_io::CancelToken> {
+            Some(self.cancellation.token())
         }
     }
 

@@ -402,7 +402,7 @@ impl WorkerApplication {
             .insert(self.worker, geometry);
         std::future::poll_fn(|cx| {
             startup.check()?;
-            if STOP_REQUESTED.load(Ordering::Relaxed) {
+            if super::stop_requested() {
                 return Poll::Ready(Err(Error::Cancelled));
             }
             let cut = node.recovery.lock().map_err(|_| Error::Unavailable)?;

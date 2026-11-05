@@ -459,7 +459,7 @@ pub async fn poll_scoped<S: Scope, T, E: Into<S::Error>>(
     scope: &S,
     mut poll: impl FnMut(&mut Context<'_>) -> Poll<Result<T, E>>,
 ) -> Result<T, S::Error> {
-    let cancellation = scope.cancellation().map(|c| c.subscribe()).transpose()?;
+    let cancellation = scope.cancel_wait();
     std::future::poll_fn(|cx| {
         if let Some(cancellation) = &cancellation {
             cancellation.register(cx.waker());
@@ -569,7 +569,7 @@ where
         if options.interval.is_zero() {
             return Err(Error::InvalidConfiguration.into());
         }
-        let cancellation = scope.cancellation().map(|c| c.subscribe()).transpose()?;
+        let cancellation = scope.cancel_wait();
         let mut operation = None;
         let mut retries = 0usize;
         let mut retry_at = clock.now();
@@ -623,7 +623,7 @@ pub async fn race<S: HedgeScope, T>(
     parent.check()?;
     let mut primary = std::pin::pin!(primary);
     let mut secondary = std::pin::pin!(secondary);
-    let mut registration = parent.cancellation().map(|c| c.subscribe()).transpose()?;
+    let mut registration = parent.cancel_wait();
     let mut primary_state = Child::new(primary_scope);
     let mut secondary_state = Child::new(secondary_scope);
     let mut launched = false;
@@ -1332,8 +1332,8 @@ mod scheduler_tests {
         }
 
         /// Supply notification only for fixtures that enable cancellation.
-        fn cancellation(&self) -> Option<&Cancellation> {
-            self.cancellation.as_ref()
+        fn cancel_token(&self) -> Option<&racer_io::CancelToken> {
+            self.cancellation.as_ref().map(|c| c.token())
         }
     }
 
@@ -1399,9 +1399,9 @@ mod scheduler_tests {
         assert_eq!(Arc::strong_count(&count), 2);
     }
 
-    /// Ready results pass through and failed subscription prevents polling application work.
+    /// Ready results and errors pass through a cancelable scope.
     #[test]
-    fn scoped_poll_preserves_ready_results_and_subscription_failure() {
+    fn scoped_poll_preserves_ready_results() {
         let cancellation = Cancellation::new().unwrap();
         let scope = TestScope {
             cancellation: Some(cancellation.clone()),
@@ -1416,15 +1416,6 @@ mod scheduler_tests {
                 Error::Io
             )))),
             Err(Error::Io)
-        );
-        let _registrations: Vec<_> = (0..1024)
-            .map(|_| cancellation.subscribe().unwrap())
-            .collect();
-        assert_eq!(
-            futures::executor::block_on(poll_scoped(&scope, |_| -> Poll<Result<()>> {
-                panic!("subscription must fail first")
-            })),
-            Err(Error::Overloaded)
         );
     }
 
@@ -1632,8 +1623,8 @@ mod hedge_tests {
         }
 
         /// Supply cancellation wakeups while the parent still owns admission.
-        fn cancellation(&self) -> Option<&Cancellation> {
-            Some(&self.0)
+        fn cancel_token(&self) -> Option<&racer_io::CancelToken> {
+            Some(self.0.token())
         }
     }
 
@@ -1722,8 +1713,8 @@ mod hedge_tests {
             }
 
             /// Share the underlying scope's cancellation subscription source.
-            fn cancellation(&self) -> Option<&Cancellation> {
-                self.inner.cancellation()
+            fn cancel_token(&self) -> Option<&racer_io::CancelToken> {
+                self.inner.cancel_token()
             }
         }
 

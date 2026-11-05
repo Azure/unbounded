@@ -98,7 +98,6 @@ use std::num::NonZeroUsize;
 use std::rc::Rc;
 use std::sync::Arc;
 use std::sync::Mutex;
-use std::sync::atomic::AtomicBool;
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering;
 use std::task::Context;
@@ -519,7 +518,7 @@ impl Application {
                     let attempt = scope(&self.node.clock, MANAGED_ENROLLMENT_ATTEMPT)?;
                     bootstrap(&self.config, &self.node, &self.limits, &attempt)
                 },
-                || STOP_REQUESTED.load(Ordering::Relaxed),
+                stop_requested,
                 MANAGED_ENROLLMENT_PACE,
             );
             match enrolled {
@@ -563,15 +562,16 @@ impl Application {
             .node = identity;
         self.prepare_workers()?;
         let mut workers = WorkerGroup::new(plan, self.ctx.clone());
+        // A stop signal is a clean stop, not an error; failures recorded
+        // before or after it still fail the run.
+        workers.observe_stop_signal();
         let result = if self.config.managed() {
             workers.run_with_startup(&self, None)
         } else {
             workers.run(&self)
         };
-        match result {
-            Err(error) if signal_stop(error, signals.requested()) => Ok(()),
-            result => result,
-        }
+        drop(signals);
+        result
     }
 }
 
@@ -794,7 +794,7 @@ fn drive_bootstrap<T>(
     let waker = uring_runtime::drivers::thread_waker(Some(reactor.waker()?));
     let mut cx = Context::from_waker(&waker);
     loop {
-        if stoppable && STOP_REQUESTED.load(Ordering::Relaxed) {
+        if stoppable && stop_requested() {
             return Err(Error::Cancelled);
         }
         if let Some(scope) = scope {
@@ -825,17 +825,17 @@ const BOOTSTRAP_MAX_PARK: Duration = Duration::from_secs(3600);
 /// observed promptly even while the operation waits on a long control turn.
 /// Dropping the operation leaves reactor and CQE fencing to normal teardown.
 async fn stoppable<T>(operation: impl std::future::Future<Output = Result<T>>) -> Result<T> {
-    stoppable_by(&STOP_REQUESTED, operation).await
+    stoppable_by(stop_requested, operation).await
 }
 
 /// [`stoppable`] with an explicit stop flag.
 async fn stoppable_by<T>(
-    stop: &AtomicBool,
+    stop: impl Fn() -> bool,
     operation: impl std::future::Future<Output = Result<T>>,
 ) -> Result<T> {
     let mut operation = std::pin::pin!(operation);
     std::future::poll_fn(|cx| {
-        if stop.load(Ordering::Relaxed) {
+        if stop() {
             return Poll::Ready(Err(Error::Cancelled));
         }
         operation.as_mut().poll(cx)
@@ -843,12 +843,14 @@ async fn stoppable_by<T>(
     .await
 }
 
-static STOP_REQUESTED: AtomicBool = AtomicBool::new(false);
+/// Whether a process stop was requested since the stop handlers were installed.
+fn stop_requested() -> bool {
+    racer_io::signal::stop_raised()
+}
 
 /// Record a process stop request and wake parked lanes, using only a
 /// signal-safe atomic store and an eventfd write.
 extern "C" fn request_stop(_: libc::c_int) {
-    STOP_REQUESTED.store(true, Ordering::Relaxed);
     racer_io::signal::raise_stop();
 }
 
@@ -881,7 +883,6 @@ impl StopSignals {
         let mut installed = INSTALLED.lock().map_err(|_| Error::Internal)?;
         if installed.guards == 0 {
             racer_io::signal::stop_fd()?;
-            STOP_REQUESTED.store(false, Ordering::Relaxed);
             racer_io::signal::reset_stop();
             let mut previous = Vec::new();
             for signal in [libc::SIGINT, libc::SIGTERM] {
@@ -906,7 +907,7 @@ impl StopSignals {
 
     /// Check whether a handled process signal requested shutdown.
     pub fn requested(&self) -> bool {
-        STOP_REQUESTED.load(Ordering::Relaxed)
+        stop_requested()
     }
 }
 
@@ -2628,9 +2629,6 @@ impl crate::lifecycle::Service<RequestScope> for WorkerApplication {
         if !self.started {
             return Err(Error::Unavailable);
         }
-        if STOP_REQUESTED.load(Ordering::Relaxed) {
-            return Err(Error::Cancelled);
-        }
         self.poll_services(cx, work_budget)
     }
 
@@ -3296,7 +3294,7 @@ impl WorkerApplication {
         std::future::poll_fn(|cx| {
             startup.check()?;
             self.poll_cache_preparation(cx)?;
-            if STOP_REQUESTED.load(Ordering::Relaxed) {
+            if stop_requested() {
                 return Poll::Ready(Err(Error::Cancelled));
             }
             if node.prepared.load(Ordering::Acquire) == node.count
@@ -3587,10 +3585,14 @@ mod lifecycle_policy_tests {
 
     #[test]
     fn stoppable_startup_ends_promptly_and_passes_results() {
+        use std::sync::atomic::AtomicBool;
         let stop = AtomicBool::new(false);
         let waker = futures::task::noop_waker();
         let mut cx = Context::from_waker(&waker);
-        let mut pending = Box::pin(stoppable_by(&stop, std::future::pending::<Result<()>>()));
+        let mut pending = Box::pin(stoppable_by(
+            || stop.load(Ordering::Relaxed),
+            std::future::pending::<Result<()>>(),
+        ));
         assert!(pending.as_mut().poll(&mut cx).is_pending());
         stop.store(true, Ordering::Relaxed);
         assert_eq!(
@@ -3598,7 +3600,7 @@ mod lifecycle_policy_tests {
             Poll::Ready(Err(Error::Cancelled))
         );
         let clear = AtomicBool::new(false);
-        let mut done = Box::pin(stoppable_by(&clear, async {
+        let mut done = Box::pin(stoppable_by(|| clear.load(Ordering::Relaxed), async {
             Err::<(), _>(Error::Unauthorized)
         }));
         assert_eq!(

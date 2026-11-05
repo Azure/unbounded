@@ -225,6 +225,8 @@ pub struct Group<S: Scope + Send> {
     control: Arc<Control<S::Error>>,
 
     coordinator: Option<JoinHandle<()>>,
+
+    observe_signal: bool,
 }
 
 impl<S: Scope + Send> Group<S> {
@@ -234,6 +236,7 @@ impl<S: Scope + Send> Group<S> {
             plan,
             control: Arc::new(Control::new(0, 0, false)),
             coordinator: None,
+            observe_signal: false,
         }
     }
 
@@ -295,6 +298,9 @@ impl<S: Scope + Send> Group<S> {
         self.control
             .check_scope
             .store(check_scope, Ordering::Relaxed);
+        self.control
+            .observe_signal
+            .store(self.observe_signal, Ordering::Relaxed);
         let mut state = self.control.lock();
         state.check_scope = check_scope;
         state.helper_ready.fill(true);
@@ -343,6 +349,23 @@ impl<S: Scope + Send> Group<S> {
             let _ = self.join();
         }
         result
+    }
+
+    /// Observe the process stop signal ([`racer_io::signal::stop_raised`]) on
+    /// every lane turn of later runs, stopping with [`StopReason::Signal`].
+    pub fn observe_stop_signal(&mut self) {
+        self.observe_signal = true;
+        self.control.observe_signal.store(true, Ordering::Relaxed);
+    }
+
+    /// Request a clean stop: drain and shut down without recording an error.
+    pub fn request_stop(&self, reason: StopReason) {
+        self.control.request_stop(reason);
+    }
+
+    /// Why the group stopped, if it stopped without (or before) failing.
+    pub fn stop_reason(&self) -> Option<StopReason> {
+        self.control.stop_reason()
     }
 
     /// Run on the caller's thread without making the startup scope a run deadline.
@@ -407,6 +430,18 @@ impl<S: Scope + Send> Drop for Group<S> {
     }
 }
 
+/// Why a group stopped without failing. A stop is not an error: a group that
+/// only stopped returns `Ok`, and any real failure recorded before or after
+/// the stop is still reported.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StopReason {
+    /// A process stop signal (see [`racer_io::signal::raise_stop`]).
+    Signal,
+    /// A service, caller, or startup scope requested the stop
+    /// (surfaced by the service as `Error::Cancelled`).
+    Requested,
+}
+
 /// Monotonic lifecycle requests shared by all execution threads.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 enum Phase {
@@ -423,6 +458,8 @@ struct State<E> {
 
     error: Option<E>,
 
+    stop: Option<StopReason>,
+
     helper_ready: Vec<bool>,
 
     closed: Vec<bool>,
@@ -432,6 +469,15 @@ struct State<E> {
     auto_shutdown: bool,
 
     check_scope: bool,
+}
+
+impl<E: Copy + From<Error>> State<E> {
+    /// The error that interrupts a barrier wait: the first failure, or
+    /// `Cancelled` once a stop was requested.
+    fn interrupted(&self) -> Option<E> {
+        self.error
+            .or_else(|| self.stop.map(|_| E::from(Error::Cancelled)))
+    }
 }
 
 /// Shared lifecycle coordination, independent of service-owned resources.
@@ -450,6 +496,9 @@ struct Control<E> {
     /// Set once any lane closed its helper submissions.
     closing: AtomicBool,
 
+    /// Whether lane turns observe the process stop signal.
+    observe_signal: AtomicBool,
+
     /// Wakes of every parked lane and helper, fired on each phase change.
     wakers: Mutex<Vec<Waker>>,
 }
@@ -465,6 +514,7 @@ impl<E: Copy + PartialEq + From<Error>> Control<E> {
                     ..Stats::default()
                 },
                 error: None,
+                stop: None,
                 helper_ready: vec![false; lanes],
                 closed: vec![false; lanes],
                 fenced: vec![false; lanes],
@@ -475,6 +525,7 @@ impl<E: Copy + PartialEq + From<Error>> Control<E> {
             stopping: AtomicBool::new(false),
             check_scope: AtomicBool::new(false),
             closing: AtomicBool::new(false),
+            observe_signal: AtomicBool::new(false),
             wakers: Mutex::new(Vec::new()),
         }
     }
@@ -505,9 +556,24 @@ impl<E: Copy + PartialEq + From<Error>> Control<E> {
         self.state.lock().unwrap_or_else(|e| e.into_inner())
     }
 
-    /// Return the first recorded error, if any.
+    /// Return the first recorded error, if any. A stop alone is `Ok`.
     fn result(&self) -> Result<(), E> {
         self.lock().error.map_or(Ok(()), Err)
+    }
+
+    /// The first recorded stop request, if any.
+    fn stop_reason(&self) -> Option<StopReason> {
+        self.lock().stop
+    }
+
+    /// Record a stop request (the first reason is kept) and begin draining.
+    fn request_stop(&self, reason: StopReason) {
+        let mut state = self.lock();
+        state.stop.get_or_insert(reason);
+        state.phase = state.phase.max(Phase::Drain);
+        self.stopping.store(true, Ordering::Release);
+        drop(state);
+        self.notify();
     }
 
     /// Advance the lifecycle request without allowing it to move backward.
@@ -522,19 +588,16 @@ impl<E: Copy + PartialEq + From<Error>> Control<E> {
 
     /// Retain the first error and notify all threads to begin draining.
     ///
-    /// A requested stop surfaces as `Error::Cancelled`. It yields to the first
-    /// real failure recorded after it, so drain, checkpoint, or fence errors
-    /// during a signaled stop are reported instead of a clean exit.
+    /// `Error::Cancelled` is a stop request, not a failure: it is recorded as
+    /// [`StopReason::Requested`], so drain, checkpoint, or fence errors during
+    /// a stop are still reported instead of a clean exit.
     fn fail(&self, error: E) {
-        let mut state = self.lock();
-        let cancelled = E::from(Error::Cancelled);
-        match state.error {
-            None => state.error = Some(error),
-            Some(first) if first == cancelled && error != cancelled => {
-                state.error = Some(error);
-            }
-            Some(_) => {}
+        if error == E::from(Error::Cancelled) {
+            self.request_stop(StopReason::Requested);
+            return;
         }
+        let mut state = self.lock();
+        state.error.get_or_insert(error);
         state.phase = state.phase.max(Phase::Drain);
         self.stopping.store(true, Ordering::Release);
         drop(state);
@@ -565,13 +628,13 @@ impl<E: Copy + PartialEq + From<Error>> Control<E> {
     where
         E: From<Error> + Send + 'static,
     {
-        let registration = scope.cancellation().map(|c| c.subscribe()).transpose()?;
+        let registration = scope.cancel_wait();
         if let Some(registration) = &registration {
             registration.register(&Waker::from(Arc::new(ConditionWake(self.clone()))));
         }
         let mut state = self.lock();
         loop {
-            if let Some(error) = state.error {
+            if let Some(error) = state.interrupted() {
                 return Err(error);
             }
             if done(&state) {
@@ -583,7 +646,7 @@ impl<E: Copy + PartialEq + From<Error>> Control<E> {
             scope.check()?;
             let recheck = scope.recheck_within();
             state = self.lock();
-            if state.error.is_some() || done(&state) {
+            if state.interrupted().is_some() || done(&state) {
                 continue;
             }
             state = match recheck {
@@ -606,7 +669,18 @@ impl<E: Copy + PartialEq + From<Error>> Control<E> {
         if self.check_scope.load(Ordering::Relaxed) {
             record(self, scope.check());
         }
+        self.poll_signal();
         self.stopping.load(Ordering::Acquire)
+    }
+
+    /// Turn an observed process stop signal into a [`StopReason::Signal`] stop.
+    fn poll_signal(&self) {
+        if self.observe_signal.load(Ordering::Relaxed)
+            && !self.stopping.load(Ordering::Relaxed)
+            && racer_io::signal::stop_raised()
+        {
+            self.request_stop(StopReason::Signal);
+        }
     }
 }
 
@@ -1061,11 +1135,7 @@ async fn drive<S: Scope>(
     startup: bool,
     turn: &Turn<S::Error>,
 ) -> Result<(), S::Error> {
-    let registration = if startup {
-        scope.cancellation().map(|c| c.subscribe()).transpose()?
-    } else {
-        None
-    };
+    let registration = if startup { scope.cancel_wait() } else { None };
     let mut registered = false;
     std::future::poll_fn(|cx| {
         if let Some(registration) = &registration
@@ -1082,6 +1152,7 @@ async fn drive<S: Scope>(
         }
         if startup {
             scope.check()?;
+            control.poll_signal();
             if control.lock().phase != Phase::Running {
                 return Poll::Ready(Err(Error::Cancelled.into()));
             }
@@ -1134,7 +1205,7 @@ async fn drained<E: Copy + PartialEq + From<Error>>(control: &Control<E>) {
     }
     std::future::poll_fn(|_| {
         let state = control.lock();
-        if state.phase == Phase::Shutdown || state.auto_shutdown || state.error.is_some() {
+        if state.phase == Phase::Shutdown || state.auto_shutdown || state.interrupted().is_some() {
             Poll::Ready(())
         } else {
             Poll::Pending
@@ -1200,7 +1271,7 @@ async fn lane_lifecycle<'a, S: Scope>(
         control.changed.notify_all();
         let check_scope = control.check_scope.load(Ordering::Relaxed);
         let registration = if check_scope {
-            subscribe_cancellation(&startup, control)
+            startup.cancel_wait()
         } else {
             None
         };
@@ -1280,7 +1351,7 @@ fn helper_thread<S: Scope>(
             }
         }
     }
-    let registration = subscribe_cancellation(&startup, control);
+    let registration = startup.cancel_wait();
     if let Some(registration) = &registration {
         registration.register(&waker);
     }
@@ -1427,25 +1498,6 @@ fn helper_service<'a, S: Scope>(
         }
         result
     }))
-}
-
-/// Subscribe to caller cancellation, recording a subscription failure.
-fn subscribe_cancellation<S: Scope>(
-    scope: &S,
-    control: &Control<S::Error>,
-) -> Option<uring_runtime::environment::CancellationRegistration> {
-    match scope
-        .cancellation()
-        .map(|c| c.subscribe())
-        .transpose()
-        .map_err(S::Error::from)
-    {
-        Ok(registration) => registration,
-        Err(error) => {
-            control.fail(error);
-            None
-        }
-    }
 }
 
 /// Abort immediately if a fence future fails or panics while being polled.

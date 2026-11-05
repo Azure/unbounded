@@ -50,7 +50,7 @@ where
         submitted: impl FnOnce(&mut J),
     ) -> crate::Result<C, S::Error> {
         scope.check()?;
-        let cancellation = scope.cancellation().map(|c| c.subscribe()).transpose()?;
+        let cancellation = scope.cancel_wait();
         let capacity_waiter =
             std::future::poll_fn(|cx| Poll::Ready(self.pending.enter(scope.clone(), cx))).await?;
         let id = identify(capacity_waiter.sequence());
@@ -128,7 +128,7 @@ where
         scope: &S,
         mut observe: impl FnMut(&C),
     ) -> crate::Result<(), S::Error> {
-        let cancellation = scope.cancellation().map(|c| c.subscribe()).transpose()?;
+        let cancellation = scope.cancel_wait();
         /// Clear stale driver wake registrations even when the drain future is dropped.
         struct Guard<'a, S>(&'a RefCell<Option<(S, Waker)>>);
         impl<S> Drop for Guard<'_, S> {
@@ -1052,8 +1052,8 @@ mod tests {
         }
 
         /// Register wakes for cancellation independently of completion delivery.
-        fn cancellation(&self) -> Option<&crate::environment::Cancellation> {
-            Some(&self.0)
+        fn cancel_token(&self) -> Option<&racer_io::CancelToken> {
+            Some(self.0.token())
         }
     }
 

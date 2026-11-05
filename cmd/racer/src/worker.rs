@@ -230,6 +230,7 @@ pub struct WorkerGroup {
     runtime: Group<RequestScope>,
     generation: u64,
     ctx: racer_io::WorkerCtx,
+    observe_signal: bool,
 }
 
 #[cfg(test)]
@@ -281,7 +282,16 @@ impl WorkerGroup {
             plan,
             generation: 0,
             ctx,
+            observe_signal: false,
         }
+    }
+    /// Stop cleanly (not as an error) when the process stop signal is raised.
+    pub fn observe_stop_signal(&mut self) {
+        self.observe_signal = true;
+    }
+    /// Why the last run stopped without failing, if it did.
+    pub fn stop_reason(&self) -> Option<crate::lifecycle::StopReason> {
+        self.runtime.stop_reason()
     }
     /// Driver-controlled adapter over the same scoped execution used by `run`.
     /// The coordinator becomes the first I/O worker, not an extra helper thread.
@@ -403,6 +413,9 @@ impl WorkerGroup {
             }
         }
         self.runtime = Group::new(runtime_plan(&self.plan));
+        if self.observe_signal {
+            self.runtime.observe_stop_signal();
+        }
         self.runtime.validate(caller_is_worker)?;
         self.generation = self
             .generation
@@ -2670,23 +2683,6 @@ mod tests {
         }
 
         #[test]
-        fn cancellation_subscription_failure_tears_down_built_services() {
-            let (mut group, factory) = fixture(3);
-            let events = factory.events.clone();
-            let scope = lifecycle_scope(&crate::test_support::clock()).unwrap();
-            let _registrations = (0..1024)
-                .map(|_| scope.cancellation.subscribe().unwrap())
-                .collect::<Vec<_>>();
-            assert_eq!(
-                group.start_recipe(Arc::new(factory), &scope),
-                Err(Error::Overloaded)
-            );
-            assert_eq!(group.runtime.stats().coordinators, 0);
-            assert_eq!(group.runtime.stats().done, 2);
-            assert!(events.lock().unwrap().contains(&"crypto-shutdown"));
-        }
-
-        #[test]
         fn startup_failure_rolls_back_and_owned_start_counts_caller() {
             let scope = lifecycle_scope(&crate::test_support::clock()).unwrap();
             let (mut group, factory) = fixture(2);
@@ -2720,7 +2716,12 @@ mod tests {
             factory.stop_on_poll = true;
             let before = current_cpus().unwrap();
             let mut group = WorkerGroup::new(plan, crate::test_support::ctx());
-            assert_eq!(group.run_recipe(&factory), Err(Error::Cancelled));
+            // A requested stop is a clean exit with a recorded reason.
+            assert_eq!(group.run_recipe(&factory), Ok(()));
+            assert_eq!(
+                group.stop_reason(),
+                Some(crate::lifecycle::StopReason::Requested)
+            );
             assert_eq!(current_cpus().unwrap(), before);
             assert_eq!(group.runtime.stats().done, 2);
             assert!(factory.events.lock().unwrap().contains(&"crypto-shutdown"));
@@ -2731,7 +2732,7 @@ mod tests {
             assert!(crate::worker::LIFECYCLE_TIMEOUT == Duration::from_secs(30));
             for (budget, expected) in [
                 (Duration::from_millis(50), Err(Error::DeadlineExceeded)),
-                (Duration::from_secs(3600), Err(Error::Cancelled)),
+                (Duration::from_secs(3600), Ok(())),
             ] {
                 let (group, mut factory) = fixture(2);
                 let plan = AffinityPlan {

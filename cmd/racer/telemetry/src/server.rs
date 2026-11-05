@@ -331,7 +331,7 @@ impl Server {
             let mut accepting = None;
             let mut connections: Vec<Operation<'_, (), S::Error>> =
                 Vec::with_capacity(MAX_CONNECTIONS);
-            let cancellation = scope.cancellation().map(|c| c.subscribe()).transpose()?;
+            let cancellation = scope.cancel_wait();
             std::future::poll_fn(|cx| {
                 if let Some(cancellation) = &cancellation {
                     cancellation.register(cx.waker());
@@ -1892,8 +1892,8 @@ mod tests {
         }
 
         /// Share the caller's cancellation source with reactor operations.
-        fn cancellation(&self) -> Option<&uring_runtime::environment::Cancellation> {
-            Some(&self.cancellation)
+        fn cancel_token(&self) -> Option<&racer_io::CancelToken> {
+            Some(self.cancellation.token())
         }
     }
 

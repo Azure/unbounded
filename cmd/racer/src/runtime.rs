@@ -317,8 +317,8 @@ impl uring_runtime::Scope for RequestScope {
         RequestScope::check(self)
     }
 
-    fn cancellation(&self) -> Option<&uring_runtime::environment::Cancellation> {
-        Some(&self.cancellation.inner)
+    fn cancel_token(&self) -> Option<&racer_io::CancelToken> {
+        Some(self.cancellation.inner.token())
     }
 
     fn recheck_within(&self) -> Option<std::time::Duration> {
@@ -827,10 +827,7 @@ mod tests {
                     Err(Error::DeadlineExceeded)
                 );
                 let count = Arc::new(Count(AtomicUsize::new(0)));
-                let registration = uring_runtime::Scope::cancellation(&clone)
-                    .unwrap()
-                    .subscribe()
-                    .unwrap();
+                let registration = uring_runtime::Scope::cancel_wait(&clone).unwrap();
                 registration.register(&Waker::from(count.clone()));
                 scope.cancel().unwrap();
                 assert_eq!(uring_runtime::Scope::check(&clone), Err(Error::Cancelled));

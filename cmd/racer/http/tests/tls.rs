@@ -104,8 +104,8 @@ impl Scope for RequestScope {
         Ok(())
     }
 
-    fn cancellation(&self) -> Option<&Cancellation> {
-        Some(&self.cancellation)
+    fn cancel_token(&self) -> Option<&racer_io::CancelToken> {
+        Some(self.cancellation.token())
     }
 }
 fn scope() -> RequestScope {

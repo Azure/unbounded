@@ -43,8 +43,6 @@ pub mod test_util {
     }
 }
 
-use std::{future::Future, pin::Pin};
-
 // MIGRATION: shared with `racer-io` until uring-runtime is deleted.
 /// Portable runtime failures, shared with `racer-io` during the migration.
 pub use racer_io::Error;
@@ -53,45 +51,9 @@ pub use racer_io::Error;
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
 /// Worker-local future; no hidden executor and no Send requirement.
-pub type Operation<'a, T, E = Error> = Pin<Box<dyn Future<Output = Result<T, E>> + 'a>>;
+pub use racer_io::scope::Operation;
 
-/// Caller-owned operation deadline and cancellation policy.
-pub trait Scope: Clone + 'static {
-    /// Caller-owned failures that can represent runtime failures. Equality
-    /// lets lifecycle code tell a requested stop (`Error::Cancelled`) from a
-    /// real failure.
-    type Error: Copy + Send + 'static + From<Error> + PartialEq;
-
-    /// Check admission, cancellation, and deadline policy before starting work.
-    fn check(&self) -> Result<(), Self::Error>;
-
-    /// Supply cancellation wakeups, or leave wake scheduling entirely to the owner.
-    fn cancellation(&self) -> Option<&environment::Cancellation> {
-        None
-    }
-
-    /// Longest a checked steady-state run may park before rechecking this
-    /// scope; its cancellation wakes the run sooner. `None` means only
-    /// cancellation can fail the scope. The default polls every millisecond.
-    fn recheck_within(&self) -> Option<std::time::Duration> {
-        Some(std::time::Duration::from_millis(1))
-    }
-
-    /// Whether [`Self::check`] can fail for in-flight operations without the
-    /// [`Self::op_ctx`] cancel token or deadline firing. The reactor then
-    /// rescans such operations on a short interval while it is parked.
-    fn polled_checks(&self) -> bool {
-        true
-    }
-
-    /// The reactor operation context: cancellation token and deadline.
-    fn op_ctx(&self) -> racer_io::OpCtx {
-        match self.cancellation() {
-            Some(cancellation) => racer_io::OpCtx::with_cancel(cancellation.token()),
-            None => racer_io::OpCtx::none(),
-        }
-    }
-}
+pub use racer_io::scope::{CancelWait, Scope};
 
 /// Accounting hook. Charges stay alive until their resources are fenced.
 pub trait Budget: 'static {
@@ -116,7 +78,7 @@ impl Budget for () {
 pub mod mailbox {
     /// Explicit local execution of accepted mailbox commands.
     pub mod executor;
-    use crate::{Error, Result, Scope, environment::CancellationRegistration};
+    use crate::{CancelWait, Error, Result, Scope};
     use futures::task::AtomicWaker;
     use std::{
         collections::VecDeque,
@@ -177,7 +139,7 @@ pub mod mailbox {
 
         scope: S,
 
-        cancellation: Option<CancellationRegistration>,
+        cancellation: Option<CancelWait>,
 
         permit: Arc<Permit>,
 
@@ -264,11 +226,7 @@ pub mod mailbox {
             budget: Option<B>,
         ) -> Result<Receipt<W, V, B, S>, S::Error> {
             scope.check()?;
-            let cancellation = scope
-                .cancellation()
-                .map(|c| c.subscribe())
-                .transpose()
-                .map_err(S::Error::from)?;
+            let cancellation = scope.cancel_wait();
             // Clone all caller policy before reserving credit or taking a lock.
             let command_scope = scope.clone();
             let receipt_scope = scope.clone();
@@ -638,8 +596,8 @@ pub mod mailbox {
             }
 
             /// Supply the shared cancellation source for receipt wake registration.
-            fn cancellation(&self) -> Option<&Cancellation> {
-                Some(&self.0)
+            fn cancel_token(&self) -> Option<&racer_io::CancelToken> {
+                Some(self.0.token())
             }
         }
 

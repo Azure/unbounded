@@ -41,6 +41,7 @@ use std::io::Write;
 use std::num::NonZeroUsize;
 use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
+use std::sync::atomic::AtomicBool;
 use std::thread;
 use std::time::Instant;
 

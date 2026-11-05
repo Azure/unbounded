@@ -196,9 +196,20 @@ pub(crate) fn existing_stop_fd() -> Option<RawFd> {
     (fd >= 0).then_some(fd)
 }
 
-/// Make the stop eventfd readable. Async-signal-safe: one atomic load and
-/// one `write(2)`; does nothing before [`stop_fd`].
+/// Set by [`raise_stop`], cleared by [`reset_stop`].
+static STOP_RAISED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Whether a stop was raised since the last [`reset_stop`]. One relaxed load,
+/// cheap enough to check on every lane turn.
+pub fn stop_raised() -> bool {
+    STOP_RAISED.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Record a stop request and make the stop eventfd readable.
+/// Async-signal-safe: one atomic store, one atomic load, and one `write(2)`;
+/// the eventfd write does nothing before [`stop_fd`].
 pub fn raise_stop() {
+    STOP_RAISED.store(true, std::sync::atomic::Ordering::Relaxed);
     if let Some(fd) = existing_stop_fd() {
         let value = 1u64;
         // SAFETY: the descriptor is never closed; the value is a live u64.
@@ -208,6 +219,7 @@ pub fn raise_stop() {
 
 /// Consume a raised stop so later reactors do not wake for it.
 pub fn reset_stop() {
+    STOP_RAISED.store(false, std::sync::atomic::Ordering::Relaxed);
     if let Some(fd) = existing_stop_fd() {
         let mut value = 0u64;
         // SAFETY: nonblocking read into a local u64.
@@ -243,6 +255,8 @@ mod stop_tests {
             .unwrap();
         assert!(started.elapsed() < std::time::Duration::from_secs(5));
         raiser.join().unwrap();
+        assert!(stop_raised());
         reset_stop();
+        assert!(!stop_raised());
     }
 }

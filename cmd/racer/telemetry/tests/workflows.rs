@@ -152,8 +152,8 @@ impl Scope for RequestScope {
     }
 
     /// Share cancellation with pending reactor operations.
-    fn cancellation(&self) -> Option<&Cancellation> {
-        Some(&self.cancellation)
+    fn cancel_token(&self) -> Option<&racer_io::CancelToken> {
+        Some(self.cancellation.token())
     }
 }
 

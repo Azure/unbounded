@@ -141,16 +141,18 @@ fn service_owner_requires_both_fences_and_explicit_release() {
     }
 }
 
-/// A requested stop (`Cancelled`) yields to the first real failure after
-/// it, so post-stop drain or checkpoint errors are not reported as a clean
-/// stop. Real failures are never replaced.
+/// A requested stop (`Cancelled`) is not a failure: it records a stop reason
+/// and leaves the result clean, while real failures before or after it are
+/// reported and the first one is kept.
 #[test]
-fn stop_yields_to_later_failures_but_failures_are_kept() {
+fn stop_is_not_an_error_but_later_failures_are_kept() {
     let control = Control::<Error>::new(1, 0, false);
     control.fail(Error::Cancelled);
-    assert_eq!(control.result(), Err(Error::Cancelled));
-    control.fail(Error::Cancelled);
-    assert_eq!(control.result(), Err(Error::Cancelled));
+    assert_eq!(control.result(), Ok(()));
+    assert_eq!(control.stop_reason(), Some(StopReason::Requested));
+    assert_eq!(control.lock().interrupted(), Some(Error::Cancelled));
+    control.request_stop(StopReason::Signal);
+    assert_eq!(control.stop_reason(), Some(StopReason::Requested));
     control.fail(Error::Io);
     assert_eq!(control.result(), Err(Error::Io));
     control.fail(Error::DeadlineExceeded);
@@ -161,6 +163,7 @@ fn stop_yields_to_later_failures_but_failures_are_kept() {
     control.fail(Error::DeadlineExceeded);
     control.fail(Error::Cancelled);
     assert_eq!(control.result(), Err(Error::DeadlineExceeded));
+    assert_eq!(control.stop_reason(), Some(StopReason::Requested));
 }
 
 /// Failed fences and incomplete ownership stages abort before service destruction.
@@ -513,17 +516,18 @@ fn recipe(plan: &Plan) -> Recipe {
     }
 }
 
-/// A stop requested while running is a clean `Cancelled`, but a drain
-/// failure after that stop is reported instead of being swallowed.
+/// A stop requested while running is a clean exit, but a drain failure
+/// after that stop is reported instead of being swallowed.
 #[test]
 fn drain_failure_after_stop_is_reported() {
-    for (drain_error, expected) in [(None, Error::Cancelled), (Some(Error::Io), Error::Io)] {
+    for (drain_error, expected) in [(None, Ok(())), (Some(Error::Io), Err(Error::Io))] {
         let plan = plan(1);
         let mut factory = recipe(&plan);
         factory.drain_error = drain_error;
         factory.stop.store(true, Ordering::SeqCst);
         let mut group = Group::new(plan);
-        assert_eq!(group.run(&factory, &TestScope), Err(expected));
+        assert_eq!(group.run(&factory, &TestScope), expected);
+        assert_eq!(group.stop_reason(), Some(StopReason::Requested));
         assert!(factory.events.lock().unwrap().contains(&"drain"));
     }
 }

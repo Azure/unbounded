@@ -234,8 +234,8 @@ mod disconnect_scopes {
             }
         }
 
-        fn cancellation(&self) -> Option<&Cancellation> {
-            Some(&self.0)
+        fn cancel_token(&self) -> Option<&racer_io::CancelToken> {
+            Some(self.0.token())
         }
     }
 

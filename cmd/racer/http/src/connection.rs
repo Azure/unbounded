@@ -67,7 +67,7 @@ pub async fn disconnect_fenced<C: Context, T>(
     cancel_watch: impl Fn(&C::Scope),
     work: impl std::future::Future<Output = Result<C, T>>,
 ) -> Result<C, T> {
-    let parent_wake = parent.cancellation().map(|c| c.subscribe()).transpose()?;
+    let parent_wake = parent.cancel_wait();
     let watch_scope = watch_scope()?;
     let socket = connection.socket();
     let events = (libc::POLLRDHUP | libc::POLLHUP | libc::POLLERR) as u32;
@@ -1547,7 +1547,7 @@ impl<C: Context> HttpPool<C> {
         Box::pin(async move {
             scope.check()?;
             let mut waiting: Option<Waiting<C>> = None;
-            let cancellation = scope.cancellation().map(|c| c.subscribe()).transpose()?;
+            let cancellation = scope.cancel_wait();
             let (connection, address) = poll_fn(|cx| {
                 if let Some(c) = &cancellation {
                     c.register(cx.waker());

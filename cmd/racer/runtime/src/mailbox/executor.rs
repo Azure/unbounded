@@ -1,9 +1,7 @@
 //! Explicit mailbox execution. Cancellation requests never release accepted work.
 
 use super::{Command, Completion, Mailbox, Reply};
-use crate::{
-    Error, Operation, Result, Scope, drivers::Runnable, environment::CancellationRegistration,
-};
+use crate::{CancelWait, Error, Operation, Result, Scope, drivers::Runnable};
 use std::{
     collections::VecDeque,
     rc::Rc,
@@ -45,7 +43,7 @@ pub struct Executor<V, B, S: ExecutionScope> {
 
 /// One accepted command's execution and independent cancellation registration.
 struct Active<V, B, S: ExecutionScope> {
-    cancellation: Result<Option<CancellationRegistration>>,
+    cancellation: Result<Option<CancelWait>>,
 
     runnable: Arc<Runnable>,
 
@@ -92,7 +90,7 @@ impl<V: 'static, B: 'static, S: ExecutionScope> Executor<V, B, S> {
                 let active_scope = scope.clone();
                 let handler = handler.clone();
                 self.active.push_back(Active {
-                    cancellation: caller.cancellation().map(|c| c.subscribe()).transpose(),
+                    cancellation: Ok(caller.cancel_wait()),
                     runnable: Runnable::new(),
                     scope: active_scope,
                     caller,
@@ -240,8 +238,8 @@ mod tests {
         }
 
         /// Supply the operation-owned wake subscription source.
-        fn cancellation(&self) -> Option<&Cancellation> {
-            Some(&self.0)
+        fn cancel_token(&self) -> Option<&racer_io::CancelToken> {
+            Some(self.0.token())
         }
     }
     impl ExecutionScope for TestScope {
@@ -387,7 +385,7 @@ mod tests {
         let active_scope = scope();
         let (finish, fence) = futures::channel::oneshot::channel::<()>();
         executor.active.push_back(Active {
-            cancellation: caller.cancellation().map(|c| c.subscribe()).transpose(),
+            cancellation: Ok(caller.cancel_wait()),
             runnable: Runnable::new(),
             scope: active_scope.clone(),
             caller,
@@ -451,7 +449,7 @@ mod tests {
             let order = order.clone();
             let caller = scope();
             executor.active.push_back(Active {
-                cancellation: caller.cancellation().map(|c| c.subscribe()).transpose(),
+                cancellation: Ok(caller.cancel_wait()),
                 runnable: Runnable::new(),
                 scope: scope(),
                 caller,
