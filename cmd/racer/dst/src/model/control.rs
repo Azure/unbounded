@@ -1,5 +1,5 @@
 #![allow(missing_docs)]
-//! Control plane simulation: the real `racer_cluster_control` steps (seat
+//! Control plane simulation: the real `racer_authority` steps (seat
 //! lottery and renewal, primary contention, primary passes, seat followers)
 //! for every Pod, plus a client per Pod that enrolls and long-polls through
 //! the real seat admission and authorization steps, all on one [`Engine`].
@@ -16,7 +16,7 @@ use std::{
     time::{Duration, Instant, SystemTime},
 };
 
-use racer_cluster_control::{
+use racer_authority::{
     PrimaryView, SeatPolicy, annotations, limits,
     rules::{
         admission::{Admit, Body, Poll, WriteQueue, body_for, start_poll},
@@ -751,7 +751,7 @@ impl ControlSim {
                 uid: uuid(0, 0xd5),
                 service_account: "racer".into(),
             },
-            policy: Policy::from(racer_cluster_control::Rotation::default()),
+            policy: Policy::from(racer_authority::Rotation::default()),
             cluster: "c1c1c1c1-0000-4000-8000-000000000001".into(),
             membership_changed: None,
             wake_pending: false,
@@ -2015,7 +2015,7 @@ impl ControlSim {
 
     /// Start one primary pass. A `periodic` pass schedules the next one.
     /// The pass runs as production's `primary.rs` `reconcile` loop
-    /// (cluster-control/src/primary.rs:545-723): the real [`Shell`] decides
+    /// (authority/src/primary.rs:545-723): the real [`Shell`] decides
     /// every step, and its state read and PUT each take an API round trip, so
     /// another term can write in between (a CAS conflict re-reads and
     /// re-plans) and the Lease can go stale before the PUT (`recheck`).
@@ -2374,7 +2374,7 @@ impl ControlSim {
             {
                 // The copy keeps the publication and its delta from the
                 // seat's previous image (`seat.rs` `fetch_image`,
-                // cluster-control/src/seat.rs:824), so a seat that becomes
+                // authority/src/seat.rs:824), so a seat that becomes
                 // primary plans deltas from it.
                 p.follower_image = Some(i.clone());
             }
@@ -2885,7 +2885,7 @@ mod tests {
     #[test]
     fn follower_installs_and_serves() {
         let record = |sequence: u64| StateRecord {
-            version: racer_cluster_control::rules::state::VERSION,
+            version: racer_authority::rules::state::VERSION,
             cluster: "c".into(),
             sequence,
             membership_version: sequence,

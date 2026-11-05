@@ -20,7 +20,7 @@ const MANAGED_DIRECTORY: &str = "managed";
 /// Sentinel recording the one cluster UID this node identity may join.
 const CLUSTER_SENTINEL: &str = "cluster";
 
-/// Embedded cluster-control service as seen by dataplane startup.
+/// Embedded authority service as seen by dataplane startup.
 pub trait ClusterControl: Send + Sync + 'static {
     /// Wait up to `timeout` for durable cluster state; return cluster and device selector.
     fn bootstrap(&self, timeout: Duration) -> std::result::Result<Bootstrapped, BootstrapError>;

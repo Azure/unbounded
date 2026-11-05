@@ -2,7 +2,7 @@
 
 Full fidelity runs real application code on the simulated driver
 (`Driver::Sim`) inside one racer-dst `World`, stepped on one thread. This
-page covers the control plane: real `racer_cluster_control::Authority`
+page covers the control plane: real `racer_authority::Authority`
 instances against the in-memory Kubernetes API that the crate's own
 simulated tests use. The code is `src/authority.rs`; scenarios are in
 `src/scenarios.rs` (`authority-*`) and run from `seeds/ci.txt` by
@@ -95,5 +95,5 @@ record) or a new `HashMap` iteration on a behavior path.
 - `authority-crash-restart` seed 1: a dropped `Authority` leaked every task,
   listener and connection (futures held the runtime `Rc` across awaits, a
   cycle), so a restarted Pod failed to bind its addresses. Fixed in
-  `cluster-control/src/rt.rs`; regression test
+  `authority/src/rt.rs`; regression test
   `dropped_authority_restarts_with_the_same_identity`.

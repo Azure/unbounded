@@ -1,6 +1,6 @@
 //! Process entry point. Configuration and application lifecycle own all resources.
 //!
-//! In managed deployments the embedded cluster-control service starts first, on
+//! In managed deployments the embedded authority service starts first, on
 //! its own bounded thread, and the dataplane waits for its bootstrap before any
 //! worker is assembled. Standalone fixtures set a static endpoint instead.
 
@@ -25,7 +25,7 @@ fn main() -> std::process::ExitCode {
 }
 
 /// Cluster-control handle adapted to the dataplane startup contract.
-struct Embedded(racer_cluster_control::Handle);
+struct Embedded(racer_authority::Handle);
 
 impl ClusterControl for Embedded {
     fn bootstrap(&self, timeout: Duration) -> Result<Bootstrapped, BootstrapError> {
@@ -34,8 +34,8 @@ impl ClusterControl for Embedded {
                 cluster: bootstrap.cluster,
                 block_devices: bootstrap.block_devices,
             }),
-            Err(racer_cluster_control::Error::Unavailable) => Err(BootstrapError::Retry),
-            Err(racer_cluster_control::Error::Timeout) => Err(BootstrapError::Pending),
+            Err(racer_authority::Error::Unavailable) => Err(BootstrapError::Retry),
+            Err(racer_authority::Error::Timeout) => Err(BootstrapError::Pending),
             Err(error) => {
                 eprintln!("racer: stage=cluster-bootstrap control error={error}");
                 Err(BootstrapError::Fatal)
@@ -64,15 +64,15 @@ fn run() -> std::result::Result<(), (&'static str, Error)> {
     // Held across cluster bootstrap and the application so SIGTERM/SIGINT stop a
     // managed bootstrap wait; the application shares, never resets, this state.
     let signals = StopSignals::install().map_err(|error| ("signals", error))?;
-    let control = config.cluster_control.take();
+    let control = config.authority.take();
     // Retained until the application stops; dropping it stops control boundedly.
     // The concrete handle is kept beside the trait object for fatal diagnostics.
     let control = match (control, config.managed()) {
         (None, false) => None,
         (Some(control), true) => {
-            let handle = racer_cluster_control::start(control).map_err(|error| {
-                eprintln!("racer: stage=cluster-control-start error={error}");
-                ("cluster-control-start", Error::Unavailable)
+            let handle = racer_authority::start(control).map_err(|error| {
+                eprintln!("racer: stage=authority-start error={error}");
+                ("authority-start", Error::Unavailable)
             })?;
             let concrete = Arc::new(Embedded(handle));
             let embedded: Arc<dyn ClusterControl> = concrete.clone();

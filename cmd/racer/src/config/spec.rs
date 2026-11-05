@@ -99,7 +99,7 @@ pub enum Owner {
     /// The dataplane process.
     Dataplane,
     /// Embedded cluster control, in managed deployments.
-    ClusterControl,
+    Authority,
     /// The operator. The dataplane accepts and ignores it, because the
     /// operator's settings ConfigMap reaches the Pod environment whole.
     Operator,
@@ -464,7 +464,7 @@ pub fn markdown(table: &[Var]) -> String {
         for var in table.iter().filter(|var| var.group == group) {
             let scope = match (var.owner, var.scope) {
                 (Owner::Operator, _) => "Operator",
-                (Owner::ClusterControl, _) => "Node",
+                (Owner::Authority, _) => "Node",
                 (_, Scope::Node) => "Node",
                 (_, Scope::PerWorker) => "Per I/O worker",
             };
@@ -503,7 +503,7 @@ pub fn json(table: &[Var], empty_unset: &dyn Fn(&str) -> bool) -> String {
     for (index, var) in table.iter().enumerate() {
         let owner = match var.owner {
             Owner::Dataplane => "dataplane",
-            Owner::ClusterControl => "cluster-control",
+            Owner::Authority => "authority",
             Owner::Operator => "operator",
         };
         let scope = match var.scope {

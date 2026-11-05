@@ -1,4 +1,4 @@
-//! Full fidelity control plane: real `racer-cluster-control` authorities
+//! Full fidelity control plane: real `racer-authority` authorities
 //! against the in-memory Kubernetes API, as roles of one world.
 //!
 //! Node 0 runs the fake API server ([`KubeRole`]); node `i` (1-based) runs
@@ -26,7 +26,7 @@ use std::{
     rc::Rc,
 };
 
-use racer_cluster_control::{
+use racer_authority::{
     Authority, Next, Role,
     rules::state::Term,
     simulation::{self, Committed, FakeKube, KubeView},

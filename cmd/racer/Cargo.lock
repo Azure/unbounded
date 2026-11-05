@@ -869,7 +869,7 @@ dependencies = [
  "page-alloc",
  "peer-wire",
  "prost",
- "racer-cluster-control",
+ "racer-authority",
  "racer-control-wire",
  "racer-core",
  "racer-crypto",
@@ -892,7 +892,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "racer-cluster-control"
+name = "racer-authority"
 version = "0.1.0"
 dependencies = [
  "base64",
@@ -969,7 +969,7 @@ dependencies = [
 name = "racer-dst"
 version = "0.1.0"
 dependencies = [
- "racer-cluster-control",
+ "racer-authority",
  "racer-control-wire",
  "racer-core",
  "racer-io",

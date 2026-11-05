@@ -91,7 +91,7 @@ pub struct ControlEndpoint {
 /// Called from the control reactor; implementations must only enqueue work.
 pub type Report = Arc<dyn Fn(u32, Vec<wire::RailMapping>) + Send + Sync>;
 
-/// Managed-mode bindings from the embedded cluster-control service.
+/// Managed-mode bindings from the embedded authority service.
 #[derive(Clone)]
 pub struct Managed {
     /// Elected endpoints refreshed by discovery; read on every connection checkout.

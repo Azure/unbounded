@@ -63,7 +63,7 @@ const fn per_worker(mut v: Var) -> Var {
 }
 
 const fn control(mut v: Var) -> Var {
-    v.owner = Owner::ClusterControl;
+    v.owner = Owner::Authority;
     v
 }
 
@@ -872,7 +872,7 @@ const BASE: &[Var] = &[
         Group::Kubernetes,
         uint(1, racer_control_wire::MAX_RETAINED_PAGE_KEYS as u64, COUNT),
         Value("7"),
-        "Readable page keys per cache: the active key plus older decrypt keys. Read by the cluster-control authority.",
+        "Readable page keys per cache: the active key plus older decrypt keys. Read by the authority.",
     )),
     control(var(
         "RACER_KUBE_API_CA",

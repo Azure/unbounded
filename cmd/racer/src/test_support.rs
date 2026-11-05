@@ -361,7 +361,7 @@ pub mod cluster {
             },
             scaled_limits: Default::default(),
             origin: Default::default(),
-            cluster_control: None,
+            authority: None,
         }
     }
 }

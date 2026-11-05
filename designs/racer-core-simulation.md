@@ -69,11 +69,11 @@ Depends only on `topology`, `racer-object-wire`, `racer-control-wire`, `flow-con
   `MAX_OFFERS_IN_FLIGHT` in `racer_core::liveness`).
 - The wire hop limit comes from core: `peer-wire/src/lib.rs:505` sets
   `MAX_HOPS = racer_core::route::MAX_LINKS`.
-- `racer-cluster-control` exposes pure rule functions in `cluster-control/src/rules/` (seat
+- `racer-authority` exposes pure rule functions in `authority/src/rules/` (seat
   lottery and renewal, primary contention and plan pass, seat admission, authorization). Wall
   time and entropy are inputs: `now_micro` takes a
-  `SystemTime` (`cluster-control/src/rules/election.rs:126`) and `new_key` takes an `Entropy`
-  (`cluster-control/src/rules/keyring.rs:370`).
+  `SystemTime` (`authority/src/rules/election.rs:126`) and `new_key` takes an `Entropy`
+  (`authority/src/rules/keyring.rs:370`).
 
 ## racer-dst
 
@@ -86,8 +86,8 @@ model (`dst/costs.toml`) and one invariant set serve two fidelities (`dst/src/li
 | `choices` | The choice stream: seeded PRNG, fuzzer bytes, record and replay, shrinking, seed files |
 | `costs`, `resources` | The cost table and FIFO servers for NIC, disk, CPU, crypto, origin and the site RTT matrix |
 | `world`, `fixture` | Full fidelity: nodes, roles, the one-thread scheduler and faults over simulated `racer-io` |
-| `authority` | Full fidelity control plane: real `racer-cluster-control` authorities against the fake API |
-| `model` | Model fidelity: a byte-free interpreter over real `WorkerCore`s, `topology::Placement` with `Phantom` rankings, the control plane (`model/control.rs`, driving `cluster-control` rules) and combined runs |
+| `authority` | Full fidelity control plane: real `racer-authority` authorities against the fake API |
+| `model` | Model fidelity: a byte-free interpreter over real `WorkerCore`s, `topology::Placement` with `Phantom` rankings, the control plane (`model/control.rs`, driving `authority` rules) and combined runs |
 | `invariants`, `determinism` | Invariant registration, double-run trace comparison and failure shrinking |
 | `scenario`, `scenarios`, `cli` | Scenario builder, the catalog run by `make racer-dst`, and the one-scenario command line |
 
@@ -178,7 +178,7 @@ comments refer to them by name.
 A new member is added to the membership only after it reports that it serves peer links
 (`src/control/session.rs` `mark_serving`). Before that, a listed member would refuse every link
 and reads toward it would fail. Joins are batched by a hold that grows with membership size
-(`join_hold_secs` in `cluster-control/src/rules/primary.rs`), so clients stay within one version
+(`join_hold_secs` in `authority/src/rules/primary.rs`), so clients stay within one version
 during large enrollments instead of falling back to full images.
 
 ### Hot page fanout

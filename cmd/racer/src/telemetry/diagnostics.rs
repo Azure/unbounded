@@ -1789,7 +1789,7 @@ mod tests {
         /// Largest catalog the control plane can key: one retained page key
         /// per cache gives the most caches that fit a key bundle.
         fn max_metric_caches() -> usize {
-            racer_cluster_control::rules::keyring::catalog_capacity(1)
+            racer_authority::rules::keyring::catalog_capacity(1)
         }
 
         #[test]

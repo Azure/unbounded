@@ -180,7 +180,7 @@ func TestEnvtestRacerAdmissionAndRBAC(t *testing.T) {
 			p.OwnerReferences = []metav1.OwnerReference{{APIVersion: "v1", Kind: "ConfigMap", Name: "x", UID: "x"}}
 		}))
 		// The policy's limit, which a Rust test ties to MAX_REPORT_BYTES in
-		// cmd/racer/cluster-control/src/limits.rs.
+		// cmd/racer/authority/src/limits.rs.
 		policy, err := fs.ReadFile(manifests.Manifests, "policies.yaml")
 		require.NoError(t, err)
 

@@ -203,7 +203,7 @@ pub struct Config {
     pub origin: OriginSettings,
     /// Embedded cluster control settings, present when `RACER_NAMESPACE`
     /// selects managed mode. `main` takes them to start control.
-    pub cluster_control: Option<racer_cluster_control::Config>,
+    pub authority: Option<racer_authority::Config>,
 }
 
 impl Config {
@@ -523,9 +523,9 @@ impl Config {
                     .map(|_| path("RACER_AZURE_FEDERATED_TOKEN_FILE"))
                     .transpose()?,
             },
-            cluster_control: None,
+            authority: None,
         };
-        config.cluster_control = cluster_control(&v, &config)?;
+        config.authority = authority(&v, &config)?;
         config.validate()?;
         Ok(config)
     }
@@ -810,7 +810,7 @@ impl Config {
         self.control_endpoint.is_none()
     }
 
-    /// Withhold one thread from an explicit cap for the cluster-control thread.
+    /// Withhold one thread from an explicit cap for the authority thread.
     ///
     /// The control thread is unpinned and mostly blocked on network I/O. With
     /// no explicit cap, worker sizing is already bounded by eligible CPUs, so
@@ -909,7 +909,7 @@ pub fn environment() -> std::result::Result<BTreeMap<String, String>, ConfigErro
 pub fn empty_is_unset(name: &str) -> bool {
     TABLE.iter().any(|var| {
         var.name == name
-            && (var.owner == spec::Owner::ClusterControl
+            && (var.owner == spec::Owner::Authority
                 || matches!(
                     name,
                     "RACER_ORIGIN_TRUST_BUNDLE"
@@ -929,11 +929,11 @@ fn too_large(v: &Values, name: &str) -> ConfigError {
 
 /// Build embedded cluster control's configuration when `RACER_NAMESPACE`
 /// selects managed mode.
-fn cluster_control(
+fn authority(
     v: &Values,
     config: &Config,
-) -> std::result::Result<Option<racer_cluster_control::Config>, ConfigError> {
-    use racer_cluster_control::SeatPolicy;
+) -> std::result::Result<Option<racer_authority::Config>, ConfigError> {
+    use racer_authority::SeatPolicy;
     let Some(namespace) = v.text("RACER_NAMESPACE") else {
         return Ok(None);
     };
@@ -999,7 +999,7 @@ fn cluster_control(
         "auto" => SeatPolicy::Auto,
         value => match spec::unsigned(value) {
             Some(n)
-                if (1..=racer_cluster_control::annotations::MAX_SEATS as u64).contains(&n)
+                if (1..=racer_authority::annotations::MAX_SEATS as u64).contains(&n)
                     && value == n.to_string() =>
             {
                 SeatPolicy::Fixed(n as usize)
@@ -1041,7 +1041,7 @@ fn cluster_control(
     } else {
         format!("{host}:{port}")
     };
-    let control = racer_cluster_control::Config {
+    let control = racer_authority::Config {
         namespace,
         pod_name,
         pod_uid,
@@ -1066,7 +1066,7 @@ fn cluster_control(
         )?,
         // Members reach this node's peer listener; publish its port.
         peer_port: config.peer_listen.port(),
-        rotation: racer_cluster_control::Rotation {
+        rotation: racer_authority::Rotation {
             retained_page_keys: v.unsigned("RACER_RETAINED_PAGE_KEYS").expect("defaulted") as usize,
             ..Default::default()
         },
@@ -1959,7 +1959,7 @@ mod tests {
     }
 
     #[test]
-    fn managed_mode_reserves_one_thread_for_cluster_control() {
+    fn managed_mode_reserves_one_thread_for_authority() {
         let mut unlimited = parse_managed(&[]).unwrap();
         unlimited.reserve_control_thread().unwrap();
         assert_eq!(unlimited.max_threads, DEFAULT_MAX_THREADS);
@@ -3100,7 +3100,7 @@ mod tests {
         assert!(config.validate().is_err());
     }
 
-    // Embedded cluster control settings (ported from cluster-control's own
+    // Embedded cluster control settings (ported from the authority crate's own
     // environment parser, which this table replaced).
 
     fn managed_env(extra: &[(&str, &str)]) -> Parsed {
@@ -3118,21 +3118,21 @@ mod tests {
         Config::from_map(&values)
     }
 
-    fn control(extra: &[(&str, &str)]) -> racer_cluster_control::Config {
-        managed_env(extra).unwrap().cluster_control.unwrap()
+    fn control(extra: &[(&str, &str)]) -> racer_authority::Config {
+        managed_env(extra).unwrap().authority.unwrap()
     }
 
     #[test]
-    fn cluster_control_is_absent_without_a_namespace() {
-        assert!(parse_managed(&[]).unwrap().cluster_control.is_none());
-        assert!(parse(&[]).unwrap().cluster_control.is_none());
+    fn authority_is_absent_without_a_namespace() {
+        assert!(parse_managed(&[]).unwrap().authority.is_none());
+        assert!(parse(&[]).unwrap().authority.is_none());
     }
 
     #[test]
-    fn cluster_control_defaults() {
+    fn authority_defaults() {
         let config = managed_env(&[]).unwrap();
-        let c = config.cluster_control.as_ref().unwrap();
-        assert_eq!(c.seats, racer_cluster_control::SeatPolicy::Auto);
+        let c = config.authority.as_ref().unwrap();
+        assert_eq!(c.seats, racer_authority::SeatPolicy::Auto);
         assert_eq!(c.control_listen.port(), 8443);
         assert_eq!(c.webhook_listen.port(), 9443);
         assert_eq!(c.api_server, "10.96.0.1:443");
@@ -3155,13 +3155,13 @@ mod tests {
     }
 
     #[test]
-    fn cluster_control_retained_page_keys() {
+    fn authority_retained_page_keys() {
         let c = control(&[]);
         assert_eq!(
             c.rotation.retained_page_keys,
-            racer_cluster_control::rules::keyring::DEFAULT_RETAINED_PAGE_KEYS
+            racer_authority::rules::keyring::DEFAULT_RETAINED_PAGE_KEYS
         );
-        assert_eq!(c.rotation, racer_cluster_control::Rotation::default());
+        assert_eq!(c.rotation, racer_authority::Rotation::default());
         for (value, want) in [("1", 1), ("16", 16)] {
             let c = control(&[("RACER_RETAINED_PAGE_KEYS", value)]);
             assert_eq!(c.rotation.retained_page_keys, want);
@@ -3178,12 +3178,12 @@ mod tests {
     }
 
     #[test]
-    fn cluster_control_seats_and_ipv6_api() {
+    fn authority_seats_and_ipv6_api() {
         let c = control(&[
             ("RACER_CONTROL_SEATS", "5"),
             ("KUBERNETES_SERVICE_HOST", "fd00::1"),
         ]);
-        assert_eq!(c.seats, racer_cluster_control::SeatPolicy::Fixed(5));
+        assert_eq!(c.seats, racer_authority::SeatPolicy::Fixed(5));
         assert_eq!(c.api_server, "[fd00::1]:443");
         for bad in ["0", "17", "05", "x"] {
             assert_eq!(
@@ -3197,7 +3197,7 @@ mod tests {
     }
 
     #[test]
-    fn cluster_control_listeners_accept_both_pod_ip_families() {
+    fn authority_listeners_accept_both_pod_ip_families() {
         for ip in ["10.244.2.3", "fd00:10:244::3"] {
             let control_listen = format!("[{ip}]:8443");
             let webhook = format!("[{ip}]:9443");
@@ -3213,7 +3213,7 @@ mod tests {
     }
 
     #[test]
-    fn cluster_control_webhook_also_serves_the_other_pod_ip_family() {
+    fn authority_webhook_also_serves_the_other_pod_ip_family() {
         let webhook = "[10.0.0.5]:9443";
         let c = |ips: &str, listen: &str| {
             managed_env(&[("RACER_POD_IPS", ips), ("RACER_WEBHOOK_LISTEN", listen)])
@@ -3221,7 +3221,7 @@ mod tests {
         let alt = |ips, listen| {
             c(ips, listen)
                 .unwrap()
-                .cluster_control
+                .authority
                 .unwrap()
                 .webhook_alternate
         };
@@ -3250,7 +3250,7 @@ mod tests {
     }
 
     #[test]
-    fn cluster_control_listener_address_validation() {
+    fn authority_listener_address_validation() {
         for address in ["127.0.0.1:0", "[127.0.0.1]:0", "[::1]:0", ":0"] {
             let c = control(&[("RACER_CONTROL_LISTEN", address)]);
             assert_eq!(c.control_listen.port(), 0);
@@ -3277,7 +3277,7 @@ mod tests {
     }
 
     #[test]
-    fn cluster_control_missing_identity_fails_by_name() {
+    fn authority_missing_identity_fails_by_name() {
         let mut values = map(&[
             ("RACER_NAMESPACE", "racer-system"),
             ("RACER_POD_NAME", "racer-abc"),

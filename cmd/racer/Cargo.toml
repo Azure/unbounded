@@ -1,5 +1,5 @@
 [workspace]
-members = [".", "io", "alloc", "crypto", "verbs", "gpu", "http", "topology", "telemetry", "flow", "flow-core", "control-wire", "controlplane", "uds-endpoint", "wire-codec", "peer-wire", "object-wire", "cluster-control", "core", "dst"]
+members = [".", "io", "alloc", "crypto", "verbs", "gpu", "http", "topology", "telemetry", "flow", "flow-core", "control-wire", "controlplane", "uds-endpoint", "wire-codec", "peer-wire", "object-wire", "authority", "core", "dst"]
 resolver = "3"
 
 [package]
@@ -32,7 +32,7 @@ racer-core = { path = "core" }
 uds-endpoint = { path = "uds-endpoint" }
 wire-codec = { path = "wire-codec", features = ["rest"] }
 racer-control-wire = { path = "control-wire" }
-racer-cluster-control = { path = "cluster-control" }
+racer-authority = { path = "authority" }
 flow-control = { path = "flow" }
 topology = { path = "topology" }
 telemetry = { path = "telemetry" }

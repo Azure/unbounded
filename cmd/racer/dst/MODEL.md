@@ -762,7 +762,7 @@ runs the contention cold start (every node reads one 16-page object).
 ## Control plane
 
 `model/control.rs` is racer-sim's `ControlSim` (`sim/src/control.rs`) moved onto the dst
-engine, with the primary pass replaced: every decision is a real `racer-cluster-control`
+engine, with the primary pass replaced: every decision is a real `racer-authority`
 rule. Each Pod runs the seat lottery and renewal (`rules::seat::{Lottery, SeatRenew}`),
 primary contention (`rules::primary::Contend`, `rules::election`), and a seat follower that
 installs records through `rules::seat::{admit, superseded, need_image}`. Each Pod's client
@@ -770,7 +770,7 @@ enrolls and long-polls through seat admission (`rules::admission::{start_poll, W
 body_for}`) and bearer authorization (`rules::authz::{AuthCache, ApiBudget}`); all
 authorization API calls share one Kubernetes API token bucket. The primary pass is
 `rules::primary::plan_pass` and `discovery`, driven by the real `rules::shell::Shell` as
-`primary.rs` `reconcile` drives it (cluster-control/src/primary.rs:545-723):
+`primary.rs` `reconcile` drives it (authority/src/primary.rs:545-723):
 
 - `Shell::begin` asks for a state read. The read takes one API round trip
   (`api_latency_ns`); the shell checks it against the process high water (rollback or wipe
@@ -785,7 +785,7 @@ authorization API calls share one Kubernetes API token bucket. The primary pass 
 - `Settle` installs the record into the primary's own follower (fails closed on rollback),
   installs the plan's image, and publishes discovery on the primary Lease.
 - An `Abort` with `StateError::fails_closed` ends the term and drops the served state
-  (`seat::fail_closed`, cluster-control/src/seat.rs:695), as `lead` does
+  (`seat::fail_closed`, authority/src/seat.rs:695), as `lead` does
   (primary.rs:195-208). The primary Lease renewal feeds `Shell::renewed`, and
   `ctl_single_primary` counts Pods whose shell is `fresh`.
 
@@ -948,7 +948,7 @@ racer-sim is deleted. These racer-sim behaviors have no Model counterpart; each 
 behavior covered by production tests instead:
 
 - No Full counterpart with enrolling clients against real authorities (the control plans run
-  in the Model against the real `cluster-control` rules; `authority-*` run real authorities).
+  in the Model against the real `authority` rules; `authority-*` run real authorities).
 - Features the Model answers as not started (see the racer-sim inventory below for each test).
   Adding them needs new Model machinery (hint and offer messages with their own queues, a memory
   tier beside the store, quota classes), not dispatch of existing effects.

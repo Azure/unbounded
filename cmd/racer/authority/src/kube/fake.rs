@@ -322,7 +322,7 @@ static DIRS: AtomicUsize = AtomicUsize::new(0);
 pub fn scratch() -> std::path::PathBuf {
     let n = DIRS.fetch_add(1, SeqCst);
     let dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("../../../tmp/racer-cluster-control-tests")
+        .join("../../../tmp/racer-authority-tests")
         .join(format!("{}-{n}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     dir
