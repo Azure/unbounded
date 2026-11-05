@@ -12,10 +12,11 @@
 // sees (/etc/containerd, /var/lib/kubelet, /opt/cni, /run/containerd), so
 // unbounded-net-node, gantry and their charts do not change per mode.
 //
-// Slot. A none node has no blue/green slot. The slot recorded in applied-config
-// (the file name <slot>-applied-config.json) is always kube1, so discovery,
-// the uninstall script and the appliedconfig reader work unchanged. The NodeRoot
-// slot is the version directory name, which is what Upgrade flips.
+// Slot. A none node has no blue/green slot. Its applied config is recorded for
+// the slot kube1, under the none mode's own name (none-kube1-applied-config.json,
+// see goalstates.AppliedConfigName), which agents that predate the mode never
+// read. The NodeRoot slot is the version directory name, which is what Upgrade
+// flips.
 package noneops
 
 import (
