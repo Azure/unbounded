@@ -65,11 +65,11 @@ pub struct FillDependencies {
     /// Page workers keep their own page-attached descriptor even if that catalog evicts it.
     pub metadata_owner: Arc<super::dispatch::WorkerDirectory>,
 }
-type LocalCopies = flow_control::coalesce::shared::Table<PageId, Result<Option<UnverifiedPage>>>;
+type LocalCopies = super::shared::Table<PageId, Result<Option<UnverifiedPage>>>;
 /// Local plaintext recovery keyed by page: one decrypt of a retained or local
 /// copy is shared by every concurrent warm reader and by elected acquisitions
 /// that find the page cached. Local-only readers never start acquisition.
-type LocalPlaintext = flow_control::coalesce::shared::Table<PageId, Result<Option<PageResult>>>;
+type LocalPlaintext = super::shared::Table<PageId, Result<Option<PageResult>>>;
 /// Source key of each running local plaintext job, once its copy is chosen.
 /// New followers are admitted only while that key remains available.
 type LocalPlaintextKeys = std::cell::RefCell<

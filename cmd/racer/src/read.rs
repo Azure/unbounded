@@ -39,6 +39,7 @@ pub(crate) mod gpu_copies;
 pub mod metadata;
 pub mod range_stream;
 pub mod sealed;
+pub(crate) mod shared;
 pub mod spill;
 
 /// Metadata and its optional stream, with no independent range to disagree with it.
