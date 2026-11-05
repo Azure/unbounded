@@ -297,6 +297,21 @@ impl From<racer_io::Error> for Error {
     }
 }
 
+impl From<racer_io::fs::ReplacementError> for Error {
+    fn from(error: racer_io::fs::ReplacementError) -> Self {
+        use racer_io::fs::ReplacementError;
+        match error {
+            ReplacementError::BeforeRename(cause) => cause.into(),
+            ReplacementError::RenameUncertain(cause) => {
+                Self::RenameUncertain(Error::from(cause).into())
+            }
+            ReplacementError::Published(cause) => {
+                Self::PublishedNotDurable(Error::from(cause).into())
+            }
+        }
+    }
+}
+
 impl From<crate::rt::filesystem::operations::ReplacementError<Error>> for Error {
     fn from(error: crate::rt::filesystem::operations::ReplacementError<Error>) -> Self {
         use crate::rt::filesystem::operations::ReplacementError;

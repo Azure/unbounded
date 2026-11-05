@@ -4279,12 +4279,16 @@ mod checkpoint {
         }
         assert!(reactor.in_flight() > 0);
         drop(abandoned);
+        // The publication runs on the kernel reactor as one composite
+        // operation; its abandoned submissions stay owned until reaped.
         let fence_reactor = reactor.clone();
-        drive(Box::pin(async move {
-            fence_reactor
-                .file_fence(crate::model::RequestId([201; 16]))
-                .await
-        }))
+        drive(Box::pin(std::future::poll_fn(move |_| {
+            if fence_reactor.in_flight() == 0 {
+                Poll::Ready(Ok(()))
+            } else {
+                Poll::Pending
+            }
+        })))
         .unwrap();
         assert_eq!(reactor.in_flight(), 0);
         for slot in ["checkpoint.0", "checkpoint.1"] {
@@ -4481,7 +4485,7 @@ mod checkpoint {
 
     #[test]
     fn recovery_downsize_falls_back_or_starts_cold_without_retaining_two_images() {
-        use crate::store::checkpoint::candidates;
+        use crate::store::checkpoint::read_candidates_with_budget;
         let directory = Directory::new();
         let older = encode(&image(1)).unwrap();
         let mut newer = image(2);
@@ -4498,7 +4502,7 @@ mod checkpoint {
         // Both encoded files fit; only the older decoded image fits.
         assert!(newer.len() < budget);
         assert_eq!(
-            candidates(&directory.0, budget)
+            read_candidates_with_budget(&directory.0, budget)
                 .unwrap()
                 .next()
                 .unwrap()
@@ -4507,10 +4511,15 @@ mod checkpoint {
             1
         );
         for tiny in [0, 1, older.len(), budget - 1] {
-            assert!(candidates(&directory.0, tiny).unwrap().next().is_none());
+            assert!(
+                read_candidates_with_budget(&directory.0, tiny)
+                    .unwrap()
+                    .next()
+                    .is_none()
+            );
         }
         assert_eq!(
-            candidates(&directory.0, MAX_CHECKPOINT_BYTES)
+            read_candidates_with_budget(&directory.0, MAX_CHECKPOINT_BYTES)
                 .unwrap()
                 .next()
                 .unwrap()
@@ -4580,7 +4589,7 @@ mod checkpoint {
 
     #[test]
     fn legacy_v1_checkpoint_is_a_disposable_cold_start() {
-        use crate::store::checkpoint::candidates;
+        use crate::store::checkpoint::read_candidates_with_budget;
         let directory = Directory::new();
         let v1 = legacy_v1(&encode(&image(7)).unwrap());
         assert!(decode(&v1).is_err());
@@ -4588,7 +4597,7 @@ mod checkpoint {
         // Only v1 on disk: no candidate and no error, so recovery starts cold.
         fs::write(directory.0.join("checkpoint.0"), &v1).unwrap();
         assert!(
-            candidates(&directory.0, MAX_CHECKPOINT_BYTES)
+            read_candidates_with_budget(&directory.0, MAX_CHECKPOINT_BYTES)
                 .unwrap()
                 .next()
                 .is_none()
@@ -4596,7 +4605,7 @@ mod checkpoint {
         // A v2 slot next to a newer v1 slot is still used. The v1 file is left
         // in place and is replaced by the next publication.
         fs::write(directory.0.join("checkpoint.1"), encode(&image(2)).unwrap()).unwrap();
-        let found: Vec<_> = candidates(&directory.0, MAX_CHECKPOINT_BYTES)
+        let found: Vec<_> = read_candidates_with_budget(&directory.0, MAX_CHECKPOINT_BYTES)
             .unwrap()
             .map(|(_, image)| image.sequence)
             .collect();
@@ -4606,7 +4615,7 @@ mod checkpoint {
 
     #[test]
     fn unreadable_slot_is_disposable_but_storage_directory_failure_is_fatal() {
-        use crate::store::checkpoint::candidates;
+        use crate::store::checkpoint::read_candidates_with_budget;
         use std::os::fd::AsRawFd;
         let directory = Directory::new();
         fs::write(directory.0.join("checkpoint.1"), encode(&image(1)).unwrap()).unwrap();
@@ -4618,7 +4627,7 @@ mod checkpoint {
         ))
         .unwrap();
         assert_eq!(
-            candidates(&directory.0, MAX_CHECKPOINT_BYTES)
+            read_candidates_with_budget(&directory.0, MAX_CHECKPOINT_BYTES)
                 .unwrap()
                 .next()
                 .unwrap()
@@ -4627,7 +4636,7 @@ mod checkpoint {
             1
         );
         assert!(matches!(
-            candidates(&directory.0.join("checkpoint.1"), MAX_CHECKPOINT_BYTES),
+            read_candidates_with_budget(&directory.0.join("checkpoint.1"), MAX_CHECKPOINT_BYTES),
             Err(Error::Io)
         ));
     }

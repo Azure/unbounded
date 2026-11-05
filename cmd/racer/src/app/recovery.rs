@@ -418,45 +418,10 @@ impl WorkerApplication {
         })
         .await?;
         if self.worker == node.control_worker {
-            let candidates =
-                crate::store::checkpoint::candidates(&self.slab_directory, self.checkpoint_budget);
+            let scanned = self.scan_checkpoints(startup).await;
             let mut cut = node.recovery.lock().map_err(|_| Error::Unavailable)?;
-            match candidates {
-                Ok(candidates) => {
-                    let mut newest = None;
-                    let images = candidates
-                        .map(|(slot, image)| {
-                            newest.get_or_insert((slot, image.sequence));
-                            image
-                        })
-                        .filter(|image| {
-                            node.devices.as_ref().is_none_or(|plan| {
-                                image.shards.iter().all(|shard| {
-                                    plan.workers.get(shard.worker.0 as usize).is_some_and(
-                                        |worker| {
-                                            shard
-                                                .index
-                                                .validate_capacity(
-                                                    worker.page_entries,
-                                                    self.store.writer.index().metadata_capacity(),
-                                                )
-                                                .is_ok()
-                                        },
-                                    )
-                                })
-                            })
-                        });
-                    let selected = select(
-                        images,
-                        &cut.geometry,
-                        &node.workers,
-                        (
-                            self.store.writer.index().page_capacity(),
-                            self.store.writer.index().metadata_capacity(),
-                        ),
-                        &self.keys,
-                        &self.snapshots.current()?.caches,
-                    );
+            match scanned {
+                Ok((newest, selected)) => {
                     if let Some((slot, sequence)) = newest {
                         let mut periodic = node
                             .periodic_checkpoint
@@ -517,6 +482,89 @@ impl WorkerApplication {
         })
         .await?;
         Ok(())
+    }
+}
+
+impl WorkerApplication {
+    /// Scan checkpoint slots newest first on the worker reactor, keeping at
+    /// most one decoded image while validating it. Returns the newest decoded
+    /// slot and sequence, and the first compatible image.
+    async fn scan_checkpoints(
+        &self,
+        startup: &RequestScope,
+    ) -> Result<(Option<(usize, u64)>, Option<CheckpointImage>)> {
+        let node = &self.node;
+        let geometry = node
+            .recovery
+            .lock()
+            .map_err(|_| Error::Unavailable)?
+            .geometry
+            .clone();
+        let snapshot = self.snapshots.current()?;
+        let capacity = (
+            self.store.writer.index().page_capacity(),
+            self.store.writer.index().metadata_capacity(),
+        );
+        let directory = &self.slab_directory;
+        let budget = self.checkpoint_budget;
+        let (geometry, snapshot) = (&geometry, &snapshot);
+        self.runtime
+            .reactor
+            .run(
+                startup,
+                None,
+                racer_io::scoped::SubmissionKind::OtherIo,
+                move |io, ctx| {
+                    let (io, ctx) = (io.clone(), ctx.clone());
+                    Box::pin(async move {
+                        let scan = async {
+                            let mut found =
+                                crate::store::checkpoint::candidates(&io, directory, budget, &ctx)
+                                    .await?;
+                            let mut newest = None;
+                            while let Some((slot, image)) =
+                                crate::store::checkpoint::next_candidate(&mut found, &io, &ctx)
+                                    .await
+                            {
+                                newest.get_or_insert((slot, image.sequence));
+                                let fits = node.devices.as_ref().is_none_or(|plan| {
+                                    image.shards.iter().all(|shard| {
+                                        plan.workers.get(shard.worker.0 as usize).is_some_and(
+                                            |worker| {
+                                                shard
+                                                    .index
+                                                    .validate_capacity(
+                                                        worker.page_entries,
+                                                        capacity.1,
+                                                    )
+                                                    .is_ok()
+                                            },
+                                        )
+                                    })
+                                });
+                                if !fits {
+                                    continue;
+                                }
+                                let selected = select(
+                                    std::iter::once(image),
+                                    geometry,
+                                    &node.workers,
+                                    capacity,
+                                    &self.keys,
+                                    &snapshot.caches,
+                                );
+                                if selected.is_some() {
+                                    return Ok((newest, selected));
+                                }
+                            }
+                            Ok((newest, None))
+                        };
+                        Ok(scan.await)
+                    }) as racer_io::Operation<'_, Result<_>>
+                },
+                |_| None,
+            )
+            .await?
     }
 }
 
@@ -1426,11 +1474,24 @@ mod tests {
             })
             .unwrap();
             std::fs::write(config.slab_directory.join("checkpoint.0"), bytes).unwrap();
-            futures::executor::block_on(app.recover_node(
-                geometry,
-                &scope(&racer_io::Clock::host(), Duration::from_secs(5)).unwrap(),
-            ))
-            .unwrap();
+            let startup = scope(&racer_io::Clock::host(), Duration::from_secs(5)).unwrap();
+            let mut recovering = std::pin::pin!(app.recover_node(geometry, &startup));
+            let until = std::time::Instant::now() + Duration::from_secs(10);
+            loop {
+                app.runtime.reactor.poll_budgeted(64).unwrap();
+                if let Poll::Ready(result) = recovering
+                    .as_mut()
+                    .poll(&mut Context::from_waker(futures::task::noop_waker_ref()))
+                {
+                    result.unwrap();
+                    break;
+                }
+                assert!(
+                    std::time::Instant::now() < until,
+                    "recovery made no progress"
+                );
+                app.runtime.reactor.wait(Duration::from_millis(1)).unwrap();
+            }
             let cut = node.recovery.lock().unwrap();
             assert!(cut.selected && cut.installed.contains(&WorkerId(0)));
             assert!(cut.failure.is_none());

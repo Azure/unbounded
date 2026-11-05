@@ -43,12 +43,17 @@ use std::path::PathBuf;
 use std::rc::Rc;
 
 pub(crate) const CHECKPOINT_NAMES: [&str; 2] = ["checkpoint.0", "checkpoint.1"];
-const SLOTS: crate::rt::filesystem::checkpoint::Slots<HEADER_BYTES> =
-    crate::rt::filesystem::checkpoint::Slots {
-        names: CHECKPOINT_NAMES,
-        minimum_bytes: HEADER_BYTES + CLUSTER_BYTES + 4 + DIGEST_BYTES,
-        maximum_bytes: MAX_CHECKPOINT_BYTES,
-    };
+const SLOTS: racer_io::fs::checkpoint::Slots<HEADER_BYTES> = racer_io::fs::checkpoint::Slots {
+    names: CHECKPOINT_NAMES,
+    minimum_bytes: HEADER_BYTES + CLUSTER_BYTES + 4 + DIGEST_BYTES,
+    maximum_bytes: MAX_CHECKPOINT_BYTES,
+};
+
+/// Publication scratch bound per write submission.
+/// One publication's outcome inside its reactor operation.
+type Published = std::result::Result<(), racer_io::fs::ReplacementError>;
+
+const PUBLISH_CHUNK: std::num::NonZeroUsize = std::num::NonZeroUsize::new(16384).unwrap();
 
 pub struct Checkpointer {
     layout_digest: [u8; 32],
@@ -225,22 +230,13 @@ impl Checkpointer {
 
     /// One coordinator calls this after all owner-worker snapshots have succeeded.
     /// The coordinator must keep all owners frozen until this operation completes.
+    #[cfg(test)]
     pub fn publish(&self, cluster: ClusterId, shards: Vec<ShardImage>) -> Operation<'_, ()> {
-        Box::pin(async move {
-            let newest = candidates(&self.directory, MAX_CHECKPOINT_BYTES)?
-                .next()
-                .map(|(slot, image)| (slot, image.sequence));
-            // Replace the slot opposite the newest valid image, including after a
-            // torn newer publication. The surviving valid generation stays intact.
-            let (slot, sequence) = SLOTS.next_publication(newest).ok_or(Error::Unavailable)?;
-            let bytes = encode(&CheckpointImage {
-                version: CHECKPOINT_VERSION,
-                cluster,
-                sequence,
-                shards,
-            })?;
-            publish_bytes(&self.directory, slot, &bytes)
-        })
+        let directory = self.directory.clone();
+        let result = block_on_io(|reactor, ctx| async move {
+            publish_next(&reactor, &ctx, &directory, cluster, shards).await
+        });
+        Box::pin(async move { result })
     }
 
     /// Periodic disposable hints. The coordinator serializes generations and
@@ -273,16 +269,22 @@ impl Checkpointer {
             if bytes.len() > budget / 2 {
                 return Err(Error::Overloaded);
             }
-            SLOTS
-                .publish_async(
-                    &reactor,
-                    &directory,
-                    slot,
-                    &bytes,
-                    std::num::NonZeroUsize::new(16384).unwrap(),
+            reactor
+                .run(
                     &scope,
+                    None,
+                    racer_io::scoped::SubmissionKind::OtherIo,
+                    move |io, ctx| {
+                        let (io, ctx) = (io.clone(), ctx.clone());
+                        Box::pin(async move {
+                            Ok(SLOTS
+                                .publish(&io, &directory, slot, &bytes, PUBLISH_CHUNK, &ctx)
+                                .await)
+                        }) as racer_io::Operation<'static, _>
+                    },
+                    |_: &racer_io::Operation<'static, Published>| None,
                 )
-                .await
+                .await?
                 .map_err(Into::into)
         }))
     }
@@ -342,10 +344,6 @@ fn snapshot_image_bytes(shards: &[ShardImage]) -> Result<usize> {
         }
     }
     Ok(total)
-}
-
-fn publish_bytes(directory: &Path, slot: usize, bytes: &[u8]) -> Result<()> {
-    SLOTS.publish(directory, slot, bytes).map_err(|_| Error::Io)
 }
 
 /// Newest-valid checkpoint selection with empty-cache fallback and no payload scan.
@@ -442,26 +440,120 @@ impl Recovery {
 /// Callers must discard a rejected image before advancing. An inaccessible storage
 /// directory is fatal; individual checkpoint files are disposable hints. Slab
 /// opening/validation remains independently fatal during Store::open.
-pub(crate) fn candidates(directory: &Path, budget: usize) -> Result<Candidates> {
-    SLOTS
+pub(crate) async fn candidates(
+    reactor: &racer_io::Reactor,
+    directory: &Path,
+    budget: usize,
+    ctx: &racer_io::OpCtx,
+) -> Result<Candidates> {
+    let mut found = SLOTS
         .candidates(
+            reactor,
             directory,
             budget,
-            |header| sequence_hint(header).map_err(std::io::Error::other),
-            |bytes, budget| decode_with_budget(bytes, budget).map_err(std::io::Error::other),
+            |header| sequence_hint(header).map_err(|_| racer_io::Error::InvalidInput),
+            |bytes, budget| {
+                decode_with_budget(bytes, budget).map_err(|_| racer_io::Error::InvalidInput)
+            },
+            ctx,
         )
+        .await
         .map_err(|e| {
             eprintln!("racer: checkpoint storage directory unavailable: {e}");
             Error::Io
-        })
+        })?;
+    report_skipped(&mut found);
+    Ok(found)
 }
 
-pub(crate) type Candidates =
-    crate::rt::filesystem::checkpoint::Candidates<CheckpointImage, HEADER_BYTES>;
+/// Decode the newest remaining image, reporting slots skipped on the way.
+pub(crate) async fn next_candidate(
+    found: &mut Candidates,
+    reactor: &racer_io::Reactor,
+    ctx: &racer_io::OpCtx,
+) -> Option<(usize, CheckpointImage)> {
+    let next = found.next(reactor, ctx).await;
+    report_skipped(found);
+    next
+}
+
+fn report_skipped(found: &mut Candidates) {
+    for (slot, error) in found.skipped.drain(..) {
+        eprintln!("racer: skipping checkpoint slot {slot}: {error}");
+    }
+}
+
+pub(crate) type Candidates = racer_io::fs::checkpoint::Candidates<CheckpointImage, HEADER_BYTES>;
+
+/// Publish `shards` as the successor of the newest valid image, into the
+/// opposite slot.
+#[cfg(test)]
+async fn publish_next(
+    reactor: &racer_io::Reactor,
+    ctx: &racer_io::OpCtx,
+    directory: &Path,
+    cluster: ClusterId,
+    shards: Vec<ShardImage>,
+) -> Result<()> {
+    let mut found = candidates(reactor, directory, MAX_CHECKPOINT_BYTES, ctx).await?;
+    let newest = next_candidate(&mut found, reactor, ctx)
+        .await
+        .map(|(slot, image)| (slot, image.sequence));
+    drop(found);
+    // Replace the slot opposite the newest valid image, including after a
+    // torn newer publication. The surviving valid generation stays intact.
+    let (slot, sequence) = SLOTS.next_publication(newest).ok_or(Error::Unavailable)?;
+    let bytes = encode(&CheckpointImage {
+        version: CHECKPOINT_VERSION,
+        cluster,
+        sequence,
+        shards,
+    })?;
+    SLOTS
+        .publish(reactor, directory, slot, &bytes, PUBLISH_CHUNK, ctx)
+        .await
+        .map_err(|_| Error::Io)
+}
+
+/// Run `make` on a private reactor for the current test environment's driver.
+#[cfg(test)]
+pub(crate) fn block_on_io<T: 'static, F: std::future::Future<Output = T> + 'static>(
+    make: impl FnOnce(racer_io::Reactor, racer_io::OpCtx) -> F,
+) -> T {
+    let env = crate::test_support::env();
+    let ctx = if env.driver.sim_os().is_none() && env.ctx.is_simulated() {
+        racer_io::WorkerCtx::host()
+    } else {
+        env.ctx.clone()
+    };
+    let reactor =
+        racer_io::Reactor::new(env.driver.clone(), racer_io::ring::Config::new(64), ctx).unwrap();
+    let executor = racer_io::exec::LocalExecutor::new(Some(reactor.wake_handle()));
+    executor
+        .block_on(&reactor, make(reactor.clone(), racer_io::OpCtx::none()))
+        .unwrap()
+}
 
 #[cfg(test)]
 pub(crate) fn read_candidates(directory: &Path) -> Result<Vec<(usize, CheckpointImage)>> {
-    Ok(candidates(directory, MAX_CHECKPOINT_BYTES)?.collect())
+    read_candidates_with_budget(directory, MAX_CHECKPOINT_BYTES).map(Iterator::collect)
+}
+
+/// Decode every valid slot newest first on a private test reactor.
+#[cfg(test)]
+pub(crate) fn read_candidates_with_budget(
+    directory: &Path,
+    budget: usize,
+) -> Result<std::vec::IntoIter<(usize, CheckpointImage)>> {
+    let directory = directory.to_path_buf();
+    block_on_io(move |reactor, ctx| async move {
+        let mut found = candidates(&reactor, &directory, budget, &ctx).await?;
+        let mut images = Vec::new();
+        while let Some(image) = next_candidate(&mut found, &reactor, &ctx).await {
+            images.push(image);
+        }
+        Ok(images.into_iter())
+    })
 }
 
 // Bounded, versioned binary checkpoints. SHA-256 covers the header and body.
@@ -1164,8 +1256,8 @@ impl Recovery {
         alignment: Alignment,
         available: impl Fn(&CacheId, KeyId) -> bool,
     ) -> Operation<'_, Option<CheckpointImage>> {
-        let result = candidates(&self.directory, MAX_CHECKPOINT_BYTES).map(|mut cuts| {
-            cuts.find_map(|(_, mut image)| {
+        let result = read_candidates(&self.directory).map(|cuts| {
+            cuts.into_iter().find_map(|(_, mut image)| {
                 Recovery::filter_available(&mut image, |_| true, &available);
                 let valid = image.shards.iter().all(|s| {
                     s.geometry.matches_alignment(alignment)

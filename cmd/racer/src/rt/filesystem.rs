@@ -27,7 +27,6 @@ use std::{
 };
 use zeroize::Zeroize;
 
-pub mod checkpoint;
 pub mod operations;
 
 #[cfg(test)]
