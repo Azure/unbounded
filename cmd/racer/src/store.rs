@@ -511,10 +511,7 @@ impl StoreWriter {
         &self,
         retention: &'a crate::retention::Retention,
     ) -> crate::retention::Scoring<'a> {
-        retention.scoring_at(
-            uring_runtime::environment::now(),
-            self.index.disk_capacity(),
-        )
+        retention.scoring_at(self.index.clock().now(), self.index.disk_capacity())
     }
     /// Install before read engines capture the shared policy.
     pub fn set_retention(&self, retention: Rc<crate::retention::Retention>) {

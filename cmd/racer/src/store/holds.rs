@@ -161,9 +161,8 @@ impl Hold {
             .collect()
     }
 
-    pub fn live(&self) -> bool {
-        uring_runtime::environment::wall_now() < self.until
-            || uring_runtime::environment::now() < self.monotonic
+    pub fn live(&self, clock: &racer_io::Clock) -> bool {
+        clock.wall_now() < self.until || clock.now() < self.monotonic
     }
 
     pub fn unused(&self) -> usize {
@@ -180,11 +179,14 @@ pub(super) struct Holds {
     pub percent: usize,
     /// Last epoch handed to a newly created entry.
     pub last_epoch: u64,
+    /// Worker time for hold expiry.
+    pub clock: racer_io::Clock,
 }
 
-impl Default for Holds {
-    fn default() -> Self {
+impl Holds {
+    pub fn new(clock: racer_io::Clock) -> Self {
         Self {
+            clock,
             entries: HashMap::default(),
             segments: None,
             free_reserve: 1,
@@ -202,8 +204,9 @@ impl Holds {
     }
 
     pub fn expire(&mut self) {
-        self.entries
-            .retain(|_, hold| hold.live() || !hold.inflight.is_empty() || hold.active.get() != 0);
+        self.entries.retain(|_, hold| {
+            hold.live(&self.clock) || !hold.inflight.is_empty() || hold.active.get() != 0
+        });
     }
 
     pub fn unused(&self) -> usize {
@@ -212,7 +215,7 @@ impl Holds {
 
     pub fn segment_held(&self, segment: SegmentId) -> bool {
         self.entries.values().any(|hold| {
-            hold.live()
+            hold.live(&self.clock)
                 && hold
                     .locations
                     .values()
@@ -220,14 +223,15 @@ impl Holds {
         })
     }
 
-    pub fn deadline(until: SystemTime) -> Result<Instant> {
+    pub fn deadline(until: SystemTime, clock: &racer_io::Clock) -> Result<Instant> {
         let ttl = until
-            .duration_since(uring_runtime::environment::wall_now())
+            .duration_since(clock.wall_now())
             .map_err(|_| Error::InvalidConfiguration)?;
         if ttl.is_zero() || ttl > MAX_HOLD_TTL {
             return Err(Error::InvalidConfiguration);
         }
-        uring_runtime::environment::now()
+        clock
+            .now()
             .checked_add(ttl)
             .ok_or(Error::InvalidConfiguration)
     }

@@ -250,7 +250,7 @@ impl Index {
         until: std::time::SystemTime,
         add_holders: bool,
     ) -> Result<super::holds::HoldEpoch> {
-        let monotonic = super::holds::Holds::deadline(until)?;
+        let monotonic = super::holds::Holds::deadline(until, &self.clock)?;
         if !self.available(&version.object.cache) {
             return Err(Error::MissingKey);
         }
@@ -345,7 +345,7 @@ impl Index {
             .borrow()
             .entries
             .get(version)
-            .filter(|hold| hold.live())
+            .filter(|hold| hold.live(&self.clock))
             .map(|hold| hold.until)
     }
 
@@ -356,7 +356,11 @@ impl Index {
         let state = self.state.borrow();
         let mut snapshot = HeldSnapshot::default();
         let mut segments = HashSet::default();
-        for (version, hold) in holds.entries.iter().filter(|(_, hold)| hold.live()) {
+        for (version, hold) in holds
+            .entries
+            .iter()
+            .filter(|(_, hold)| hold.live(&self.clock))
+        {
             let mut page = PageId {
                 version: version.clone(),
                 number: crate::model::PageNumber(0),
@@ -388,7 +392,7 @@ impl Index {
             .borrow()
             .entries
             .get(version)
-            .filter(|hold| hold.live())
+            .filter(|hold| hold.live(&self.clock))
             .map(|hold| hold.pages.clone())
             .ok_or(Error::Unavailable)?;
         // Extension renews the deadline only; it adds no holders.
@@ -484,7 +488,7 @@ impl Index {
             .borrow()
             .entries
             .get(&page.version)
-            .filter(|hold| hold.live())
+            .filter(|hold| hold.live(&self.clock))
             .and_then(|hold| hold.holders.get(&page.number).map(|holder| holder.count))
             .unwrap_or(0)
     }
@@ -495,7 +499,7 @@ impl Index {
             .borrow()
             .entries
             .get(&page.version)
-            .is_some_and(|hold| hold.live() && hold.pages.contains(page.number))
+            .is_some_and(|hold| hold.live(&self.clock) && hold.pages.contains(page.number))
     }
 
     pub(super) fn protect_hold(&self, version: &ObjectVersion) -> Result<super::holds::HoldGuard> {
@@ -503,7 +507,7 @@ impl Index {
         let hold = holds
             .entries
             .get(version)
-            .filter(|hold| hold.live())
+            .filter(|hold| hold.live(&self.clock))
             .ok_or(Error::Unavailable)?;
         hold.active
             .set(hold.active.get().checked_add(1).ok_or(Error::Overloaded)?);
@@ -516,7 +520,7 @@ impl Index {
             .borrow()
             .entries
             .get(&page.version)
-            .filter(|hold| hold.live() && hold.locations.contains_key(&page.number))
+            .filter(|hold| hold.live(&self.clock) && hold.locations.contains_key(&page.number))
             .map(|hold| hold.until)
     }
 
@@ -532,7 +536,7 @@ impl Index {
             .entries
             .get(&page.version)
             .is_some_and(|hold| {
-                hold.live()
+                hold.live(&self.clock)
                     && hold.unused() != 0
                     && hold.pages.contains(page.number)
                     && !hold.locations.contains_key(&page.number)
@@ -545,7 +549,7 @@ impl Index {
         if let Some(hold) = holds
             .entries
             .get_mut(&page.version)
-            .filter(|hold| hold.live() && hold.pages.contains(page.number))
+            .filter(|hold| hold.live(&self.clock) && hold.pages.contains(page.number))
         {
             if !hold.locations.contains_key(&page.number) && hold.unused() == 0 {
                 return Err(Error::Overloaded);
@@ -566,7 +570,7 @@ impl Index {
         remaining: &mut usize,
     ) -> Result<()> {
         let holds = self.holds.borrow();
-        for hold in holds.entries.values().filter(|hold| hold.live()) {
+        for hold in holds.entries.values().filter(|hold| hold.live(&self.clock)) {
             for location in hold.locations.values() {
                 *remaining = remaining
                     .checked_sub(super::checkpoint::RETAINED_RECORD_BYTES)
@@ -653,7 +657,7 @@ impl Index {
         for segment in segments {
             for (offset, until) in &segment.retained_records {
                 if *until > now {
-                    super::holds::Holds::deadline(*until)?;
+                    super::holds::Holds::deadline(*until, &self.clock)?;
                     offsets.insert(*offset);
                 }
             }
@@ -698,8 +702,12 @@ impl Index {
                 counts: RefCell::new(HashMap::default()),
             }),
             active_writes: Rc::new(RefCell::new(HashMap::default())),
-            holds: RefCell::new(super::holds::Holds::default()),
+            holds: RefCell::new(super::holds::Holds::new(clock.clone())),
         }
+    }
+    /// Worker time for this index's freshness and expiry decisions.
+    pub fn clock(&self) -> &racer_io::Clock {
+        &self.clock
     }
     fn available(&self, cache: &racer_control_wire::CacheId) -> bool {
         self.availability.metadata(cache)
@@ -1058,7 +1066,7 @@ impl Index {
             *remaining = remaining.checked_sub(bytes).ok_or(Error::Overloaded)?;
         }
         let holds = self.holds.borrow();
-        for hold in holds.entries.values().filter(|hold| hold.live()) {
+        for hold in holds.entries.values().filter(|hold| hold.live(&self.clock)) {
             let bytes = hold
                 .locations
                 .len()
@@ -2026,7 +2034,10 @@ mod tests {
             let mut holds = index.holds.borrow_mut();
             let hold = holds.entries.get_mut(&first.version).unwrap();
             hold.until = std::time::UNIX_EPOCH;
-            assert!(hold.live(), "monotonic deadline still protects pages");
+            assert!(
+                hold.live(&index.clock),
+                "monotonic deadline still protects pages"
+            );
         }
         assert_eq!(index.held_snapshot().pages, 1);
         index
