@@ -905,7 +905,30 @@ impl Owner {
         }
 
         self.publish(now);
+        #[cfg(any(test, feature = "simulation"))]
+        self.check_wake();
         Ok(())
+    }
+
+    /// Simulation-only invariant: an owner with work left must have armed a
+    /// wake for it. Links, dying links, an undrained shutdown, and a pending
+    /// backoff expiry need [`Self::next_wake`]; registrations in flight are
+    /// woken by their helper (or held by the simulation). A violation means
+    /// a parked owner would sleep forever: a missing timer.
+    #[cfg(any(test, feature = "simulation"))]
+    fn check_wake(&self) {
+        if self.simulation.is_none() {
+            return;
+        }
+        let pending = !self.links.is_empty()
+            || !self.dying.is_empty()
+            || (self.closing && !self.leaked && !self.drained())
+            || self.expiry.is_some();
+        let external = self.activating.is_some() || !self.attaching.is_empty();
+        assert!(
+            !missing_wake(pending, self.next_wake(), external),
+            "rdma owner has pending work and no armed wake source"
+        );
     }
 
     fn handle(&mut self, command: Command, now: Instant) {
@@ -1773,6 +1796,13 @@ impl Drop for Owner {
     }
 }
 
+/// True when an owner with `pending` work has neither a timer (`wake`) nor
+/// an `external` wake source for it.
+#[cfg(any(test, feature = "simulation"))]
+fn missing_wake(pending: bool, wake: Option<Instant>, external: bool) -> bool {
+    pending && wake.is_none() && !external
+}
+
 /// Fail `command`'s op with `error`.
 fn fail(command: Command, error: Error) {
     match command {
@@ -1825,6 +1855,17 @@ mod tests {
                 "{d:?}"
             );
         }
+    }
+
+    #[test]
+    /// The wake check flags only pending work with no timer and no external
+    /// wake.
+    fn missing_wake_needs_pending_work_and_no_source() {
+        let now = Instant::now();
+        assert!(missing_wake(true, None, false));
+        assert!(!missing_wake(true, Some(now), false));
+        assert!(!missing_wake(true, None, true));
+        assert!(!missing_wake(false, None, false));
     }
 
     #[test]
