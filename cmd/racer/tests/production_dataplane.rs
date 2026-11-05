@@ -854,7 +854,6 @@ fn open_fixture_storage(
     ));
     let eviction = Rc::new(SegmentClock::new(index.clone(), segments.clone(), 1));
     let disk = Rc::new(StoreReader::new(
-        eviction.clone(),
         index.clone(),
         segments.clone(),
         slabs.clone(),

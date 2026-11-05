@@ -1803,7 +1803,6 @@ impl WorkerApplication {
         }
         let reader = Rc::new(
             StoreReader::new(
-                eviction.clone(),
                 index.clone(),
                 segments.clone(),
                 slabs.clone(),

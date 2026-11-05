@@ -224,7 +224,6 @@ impl SubscriptionFixture {
         use store::StoreReader;
         use store::StoreWriter;
         use store::catalog::Index;
-        use store::catalog::SegmentClock;
 
         let mut limits = interop_limits();
         // Independent of the 512 MiB logical object: at most four plaintext pages.
@@ -304,8 +303,9 @@ impl SubscriptionFixture {
             reactor.clone(),
             availability.clone(),
         ));
+        // Building the eviction clock binds hold accounting to the segments.
+        let _ = crate::store::catalog::SegmentClock::new(index.clone(), segments.clone(), 1);
         let disk = Rc::new(StoreReader::new(
-            Rc::new(SegmentClock::new(index.clone(), segments.clone(), 1)),
             index.clone(),
             segments,
             slabs,

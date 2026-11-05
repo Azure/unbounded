@@ -924,7 +924,6 @@ fn metadata_coordinator_with_newer_publication(
     use crate::store::StoreReader;
     use crate::store::StoreWriter;
     use crate::store::catalog::Index;
-    use crate::store::catalog::SegmentClock;
     use controlplane::Published;
     use racer_control_wire::Publication;
     let published = Arc::new(Published::new(Snapshot::retention(4)));
@@ -983,8 +982,9 @@ fn metadata_coordinator_with_newer_publication(
         64 * 1024 * 1024,
         crate::model::PAGE_BYTES as usize + crate::store::MAX_HEADER_BYTES + 16,
     )));
+    // Building the eviction clock binds hold accounting to the segments.
+    let _ = crate::store::catalog::SegmentClock::new(index.clone(), segments.clone(), 1);
     let disk = Rc::new(StoreReader::new(
-        Rc::new(SegmentClock::new(index.clone(), segments.clone(), 1)),
         index.clone(),
         segments.clone(),
         slabs.clone(),

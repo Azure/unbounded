@@ -3015,7 +3015,6 @@ pub(super) use racer_control_wire::CacheId;
 
 pub(super) use crate::security::PageCryptoEngine;
 pub(super) use crate::store::catalog::Index;
-pub(super) use crate::store::catalog::SegmentClock;
 pub(super) use crate::topology::Member;
 pub(super) use crate::topology::Membership;
 pub(super) use crate::topology::Placement;
@@ -3388,11 +3387,11 @@ fn fixture_with_caches(
     let _ = slabs
         .open_configured(&segments)
         .expect("read fixture filesystem supports direct slab alignment");
-    let clock = Rc::new(SegmentClock::new(index.clone(), segments.clone(), 1));
     let metrics = Metrics::default();
+    // Building the eviction clock binds hold accounting to the segments.
+    let _ = crate::store::catalog::SegmentClock::new(index.clone(), segments.clone(), 1);
     let disk = Rc::new(
         StoreReader::new(
-            clock,
             index.clone(),
             segments.clone(),
             slabs.clone(),

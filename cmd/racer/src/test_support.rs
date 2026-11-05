@@ -600,7 +600,6 @@ impl ReadWorker {
         ));
         let clock = Rc::new(SegmentClock::new(index.clone(), segments.clone(), 1));
         let disk = Rc::new(StoreReader::new(
-            clock.clone(),
             index.clone(),
             segments,
             slabs,

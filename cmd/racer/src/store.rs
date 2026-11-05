@@ -88,7 +88,6 @@ impl Store {
 /// AEAD validation remains owned by fill.
 pub struct StoreReader {
     metrics: crate::telemetry::Metrics,
-    clock: Rc<catalog::SegmentClock>,
     index: Rc<Index>,
     segments: Rc<Segments>,
     slabs: Rc<Slab<flow_control::Charge<AdmissionPolicy>>>,
@@ -124,7 +123,6 @@ impl StoreReader {
         self.index.version(version)
     }
     pub fn new(
-        clock: Rc<catalog::SegmentClock>,
         index: Rc<Index>,
         segments: Rc<Segments>,
         slabs: Rc<Slab<flow_control::Charge<AdmissionPolicy>>>,
@@ -134,7 +132,6 @@ impl StoreReader {
     ) -> Self {
         Self {
             metrics: crate::telemetry::Metrics::default(),
-            clock,
             index,
             segments,
             slabs,
@@ -282,7 +279,6 @@ impl StoreReader {
                 decoded.header.envelope,
                 decoded.ciphertext,
             )?;
-            self.clock.mark_read(entry.location.segment)?;
             self.index
                 .retention()
                 .disk_read(page, u64::from(entry.metadata.page_length(page)?));
@@ -410,7 +406,6 @@ impl StoreReader {
             } else {
                 ciphertext.length
             };
-            self.clock.mark_read(location.segment)?;
             self.index
                 .retention()
                 .disk_read(page, u64::from(entry.metadata.page_length(page)?));

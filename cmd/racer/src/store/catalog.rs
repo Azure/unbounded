@@ -1405,22 +1405,6 @@ impl SegmentClock {
             clock: page_alloc::SegmentClock::new(segments),
         }
     }
-    pub fn mark_read(&self, segment: SegmentId) -> Result<()> {
-        self.clock.mark_read(segment).map_err(Into::into)
-    }
-    /// Make index room independently of slab space, with at most two rotations.
-    /// Use the same segment-level second chance as payload reclamation, but only
-    /// forget mappings: even an open segment can lose its index entries safely.
-    /// Its bytes and generation stay intact until normal lease-fenced recycling.
-    pub fn reclaim_index_for(&self, page: &PageId) -> Result<()> {
-        self.clock
-            .reclaim_index(
-                &*self.index,
-                self.budget.segment_visits.min(self.budget.mapping_removals),
-                || self.index.preflight_capacity(page).is_ok(),
-            )
-            .map_err(Into::into)
-    }
     /// Rank at most 64 slots before eviction. Busy segments remain Evicting until
     /// a later poll; ownership and heat cannot prevent eventual reclamation.
     pub fn reclaim_now(&self) -> Result<()> {
@@ -1474,7 +1458,6 @@ mod tests {
             segments.clone(),
             2,
         );
-        clock.mark_read(SegmentId(1)).unwrap();
         assert_eq!(clock.reclaim_now(), Err(Error::Overloaded));
         assert_eq!(segments.free_count(), 1);
         drop(held);
@@ -2400,11 +2383,6 @@ mod tests {
                     let page = &pages[usize::try_from(draw()).unwrap() % pages.len()];
                     index.retention().touch(page);
                 }
-                if draw() % 2 == 0 {
-                    let segment = SegmentId(draw() % count as u64);
-                    real.mark_read(segment).unwrap();
-                    phantom_clock.mark_read(segment).unwrap();
-                }
                 let reserve = 1 + usize::try_from(draw() % 3).unwrap();
                 let retention = index.retention();
                 let scoring = retention.scoring_at(now, index.disk_capacity());
@@ -2489,7 +2467,6 @@ mod tests {
         assert_eq!(index.segment_score(SegmentId(1)), 300);
         assert_eq!(index.segment_score(SegmentId(2)), 10);
         let clock = SegmentClock::new(index.clone(), segments.clone(), 1);
-        clock.mark_read(SegmentId(2)).unwrap();
         clock.reclaim_now().unwrap();
         assert!(index.lookup(&small).unwrap().is_none());
         assert!(index.lookup(&owned).unwrap().is_some());

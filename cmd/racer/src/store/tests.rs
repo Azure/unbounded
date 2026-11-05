@@ -205,63 +205,6 @@ mod index_pressure {
         assert_eq!(f.admission.used(ResourceClass::Ciphertext), 0);
         assert!(f.enqueue(f.copy(3, 113)).is_ok());
     }
-    fn publish(f: &Fixture, index: &catalog::Index, segments: &Segments, number: u8) -> PageId {
-        let copy = f.copy(number, 113);
-        let id = copy.ciphertext.envelope().page.clone();
-        let append = segments.append(512).unwrap();
-        index
-            .publish(
-                id.clone(),
-                catalog::IndexedPage {
-                    location: catalog::RecordLocation {
-                        segment: append.0.id(),
-                        generation: append.0.generation(),
-                        extent: append.1,
-                    },
-                    metadata: copy.metadata.immutable(),
-                    key_id: copy.ciphertext.envelope().key_id,
-                },
-            )
-            .unwrap();
-        id
-    }
-    #[test]
-    fn index_clock_gives_recent_segments_a_second_chance_and_handles_no_victim() {
-        let f = Fixture::new();
-        let index = Rc::new(catalog::Index::new(
-            WorkerId(0),
-            2,
-            crate::test_support::availability(),
-            racer_io::Clock::host(),
-        ));
-        index.set_page_capacity(2).unwrap();
-        let segments = Rc::new(Segments::new(512));
-        segments
-            .configure(1536, 3, Alignment::new(512, 512, 512).unwrap())
-            .unwrap();
-        let clock = catalog::SegmentClock::new(index.clone(), segments.clone(), 1);
-        let ids = [
-            publish(&f, &index, &segments, 1),
-            publish(&f, &index, &segments, 2),
-        ];
-        let incoming = f.copy(3, 113).ciphertext.envelope().page.clone();
-        clock.mark_read(SegmentId(0)).unwrap();
-        clock.reclaim_index_for(&incoming).unwrap();
-        assert!(index.lookup(&ids[0]).unwrap().is_some());
-        assert!(index.lookup(&ids[1]).unwrap().is_none());
-        assert_eq!(segments.free_count(), 1);
-        index.set_page_capacity(1).unwrap();
-        clock.mark_read(SegmentId(0)).unwrap();
-        clock.reclaim_index_for(&incoming).unwrap();
-        assert!(index.lookup(&ids[0]).unwrap().is_none());
-        let empty = Rc::new(Segments::new(512));
-        publish(&f, &index, &segments, 1);
-        assert_eq!(
-            catalog::SegmentClock::new(index, empty, 1).reclaim_index_for(&incoming),
-            Err(Error::Overloaded)
-        );
-    }
-
     #[test]
     fn partial_eviction_completes_in_flight_reads_without_resurrecting_or_reusing() {
         let f = fixture(8);
@@ -1378,7 +1321,6 @@ impl Fixture {
         )));
         let reader = Rc::new(
             StoreReader::new(
-                eviction.clone(),
                 index.clone(),
                 segments.clone(),
                 slabs.clone(),
