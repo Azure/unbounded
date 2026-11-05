@@ -138,9 +138,34 @@ func TestTakeThatCrashedLeavesNothingToRestore(t *testing.T) {
 	require.ErrorIs(t, Restore(snap, root), ErrNoSnapshot)
 }
 
-func TestTakeReplacesAnEarlierSnapshot(t *testing.T) {
+// A complete snapshot is the record of a configuration that an interrupted
+// upgrade may still need to put back, so Take never overwrites it.
+func TestTakeRefusesToReplaceACompleteSnapshot(t *testing.T) {
+	root, snap := newTree(t)
+	before := read(t, root, "etc/containerd/config.toml")
+	require.NoError(t, Take(snap, root, treePaths))
+
+	write(t, root, "etc/containerd/config.toml", "version = 9\n", 0o644)
+	require.ErrorIs(t, Take(snap, root, treePaths), ErrSnapshotExists)
+
+	require.NoError(t, Restore(snap, root))
+	assert.Equal(t, before, read(t, root, "etc/containerd/config.toml"), "the first snapshot is intact")
+
+	// Once it is discarded a new one can be taken.
+	require.NoError(t, Discard(snap))
+	write(t, root, "etc/containerd/config.toml", "version = 9\n", 0o644)
+	require.NoError(t, Take(snap, root, treePaths))
+	write(t, root, "etc/containerd/config.toml", "garbage", 0o644)
+	require.NoError(t, Restore(snap, root))
+	assert.Equal(t, "version = 9\n", read(t, root, "etc/containerd/config.toml"))
+}
+
+// An incomplete snapshot (a Take that crashed before the manifest) is not a
+// record of anything and is replaced.
+func TestTakeReplacesAnIncompleteSnapshot(t *testing.T) {
 	root, snap := newTree(t)
 	require.NoError(t, Take(snap, root, treePaths))
+	require.NoError(t, os.Remove(filepath.Join(snap, manifestName)))
 
 	write(t, root, "etc/containerd/config.toml", "version = 9\n", 0o644)
 	require.NoError(t, Take(snap, root, treePaths))

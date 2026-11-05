@@ -25,6 +25,8 @@ import (
 	"syscall"
 
 	"github.com/google/renameio/v2"
+
+	"github.com/Azure/unbounded/internal/fsutil"
 )
 
 // ErrNoSnapshot is returned by Restore when dir holds no complete snapshot.
@@ -63,13 +65,26 @@ type manifest struct {
 	Entries []entry  `json:"entries"`
 }
 
+// ErrSnapshotExists is returned by Take when dir already holds a complete
+// snapshot. That snapshot is the only record of a configuration a crash may
+// have interrupted the restore of, so it is never overwritten: the caller
+// restores or discards it first.
+var ErrSnapshotExists = errors.New("a configuration snapshot already exists")
+
 // Take records the state of paths, which are absolute in-node paths, below
-// root (empty means the real filesystem root) into dir, replacing any snapshot
-// already there. A directory is recorded with everything below it; symbolic
+// root (empty means the real filesystem root) into dir. A complete snapshot
+// already in dir is refused with ErrSnapshotExists; an incomplete one, which a
+// crash during an earlier Take leaves, is replaced. The snapshot is durable
+// once Take returns: every saved file and the manifest are synced, the
+// manifest last, so a manifest on disk always names files that are there. A directory is recorded with everything below it; symbolic
 // links are recorded, not followed. A path that does not exist is recorded as
 // absent. Sockets, devices and other special files are an error, since they
 // cannot be put back.
 func Take(dir, root string, paths []string) (err error) {
+	if Exists(dir) {
+		return fmt.Errorf("%w in %s", ErrSnapshotExists, dir)
+	}
+
 	if err := os.RemoveAll(dir); err != nil {
 		return fmt.Errorf("clear snapshot directory: %w", err)
 	}
@@ -109,7 +124,11 @@ func Take(dir, root string, paths []string) (err error) {
 		return fmt.Errorf("marshal snapshot manifest: %w", err)
 	}
 
-	if err := renameio.WriteFile(filepath.Join(dir, manifestName), data, 0o600, renameio.WithTempDir(dir)); err != nil {
+	if err := fsutil.SyncDir(filepath.Join(dir, blobDir)); err != nil {
+		return fmt.Errorf("sync snapshot files: %w", err)
+	}
+
+	if err := fsutil.WriteFileDurable(filepath.Join(dir, manifestName), data, 0o600); err != nil {
 		return fmt.Errorf("write snapshot manifest: %w", err)
 	}
 
@@ -177,7 +196,7 @@ func recordOne(m *manifest, dir, p, host string, info fs.FileInfo) error {
 		e.Kind = File
 		e.Blob = fmt.Sprintf("%06d", len(m.Entries))
 
-		if err := os.WriteFile(filepath.Join(dir, blobDir, e.Blob), data, 0o600); err != nil {
+		if err := writeSynced(filepath.Join(dir, blobDir, e.Blob), data); err != nil {
 			return fmt.Errorf("save %s: %w", host, err)
 		}
 	default:
@@ -187,6 +206,23 @@ func recordOne(m *manifest, dir, p, host string, info fs.FileInfo) error {
 	m.Entries = append(m.Entries, e)
 
 	return nil
+}
+
+// writeSynced writes a new snapshot file and syncs its contents. The directory
+// entry is synced once for all files before the manifest is written.
+func writeSynced(path string, data []byte) error {
+	f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
+	if err != nil {
+		return err
+	}
+
+	if _, err := f.Write(data); err != nil {
+		_ = f.Close() //nolint:errcheck // the write error is the one to report
+
+		return err
+	}
+
+	return errors.Join(f.Sync(), f.Close())
 }
 
 // Exists reports whether dir holds a complete snapshot.

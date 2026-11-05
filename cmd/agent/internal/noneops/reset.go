@@ -186,8 +186,10 @@ func (t *Teardown) Destroy() phases.Task {
 }
 
 // dataDirs are node state with no meaning once the node is gone. In the nspawn
-// mode they live in the machine rootfs and disappear with it.
-var dataDirs = []string{"/var/lib/kubelet", "/var/lib/containerd", goalstates.CNIConfigDir, goalstates.CNIBinDir}
+// mode they live in the machine rootfs and disappear with it. The CNI plugin
+// directory is not one: the backend removes the links it made there and leaves
+// the plugins other components installed.
+var dataDirs = []string{"/var/lib/kubelet", "/var/lib/containerd", goalstates.CNIConfigDir}
 
 // unmountedDataDirs are the data directories pods can leave mounts below.
 var unmountedDataDirs = []string{hostnode.KubeletDir, "/var/lib/containerd"}

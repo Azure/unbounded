@@ -231,6 +231,17 @@ func (s *Snapshot) Restore() error {
 	return nil
 }
 
+// RestoreSnapshot restores a snapshot saved in dir by an earlier process, such
+// as one a crash interrupted, and reloads systemd for the real root.
+func RestoreSnapshot(log *slog.Logger, dir, hostRoot string) error {
+	s := &Snapshot{log: log, dir: dir, hostRoot: hostRoot}
+	if hostRoot == "" {
+		s.reload = func() error { return reloadSystemd(log) }
+	}
+
+	return s.Restore()
+}
+
 // Restored reports whether Restore has succeeded.
 func (s *Snapshot) Restored() bool { return s.restored }
 
