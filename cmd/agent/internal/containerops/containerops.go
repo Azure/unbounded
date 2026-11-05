@@ -42,6 +42,7 @@ import (
 
 	"github.com/Azure/unbounded/cmd/agent/internal/hostnode"
 	"github.com/Azure/unbounded/pkg/agent/config"
+	"github.com/Azure/unbounded/pkg/agent/confsnap"
 	"github.com/Azure/unbounded/pkg/agent/goalstates"
 	"github.com/Azure/unbounded/pkg/agent/isolation"
 	"github.com/Azure/unbounded/pkg/agent/isolation/container"
@@ -98,6 +99,9 @@ type Overrides struct {
 
 	// PollInterval is the wait between readiness polls. Zero means one second.
 	PollInterval time.Duration
+	// GoneTimeout bounds the wait for a stopped container to be gone; see
+	// container.Backend.GoneTimeout. PollInterval is its poll interval too.
+	GoneTimeout time.Duration
 	// ReadyTimeout bounds the wait for systemd in the container. Zero means two
 	// minutes.
 	ReadyTimeout time.Duration
@@ -158,6 +162,8 @@ func New(p Params) *Node {
 		Run:           p.Run,
 		SourceRoot:    p.HostRoot,
 		MountInfoPath: p.MountInfoPath,
+		GoneTimeout:   p.GoneTimeout,
+		PollInterval:  p.PollInterval,
 	}}
 }
 
@@ -527,15 +533,16 @@ func (n *Node) cleanupNetwork(ctx context.Context) error {
 }
 
 // resetSharedKubeletState prepares the shared kubelet directory for a new slot.
-// Pod volume mounts propagate from the stopped container to the host under
-// /var/lib/kubelet and outlive it, so they are unmounted, and the previous
-// kubelet identity is removed when the node authenticates with a bootstrap
-// token, so the new slot bootstraps fresh credentials as a new nspawn machine
-// does. Direct kubeconfig and exec credential modes are rewritten by Configure.
-// PROVISIONAL: propagation of pod mounts to the host (rshared through the host
-// root mount) is the design's assumption.
+// Pod volume mounts made in the stopped container propagated to the host under
+// /var/lib/kubelet (the unit makes it a shared mount and the container binds it
+// rshared) and outlive it, so they are unmounted. Only mounts strictly below
+// the directory go: its own mount is the shared bind the next slot's mounts
+// propagate through, or a dedicated disk. The previous kubelet identity is
+// removed when the node authenticates with a bootstrap token, so the new slot
+// bootstraps fresh credentials as a new nspawn machine does. Direct kubeconfig
+// and exec credential modes are rewritten by Configure.
 func (n *Node) resetSharedKubeletState(ctx context.Context) error {
-	if err := hostnode.UnmountBelow(ctx, n.p.Log, n.p.Run, n.p.MountInfoPath, hostnode.KubeletDir); err != nil {
+	if err := hostnode.UnmountStrictlyBelow(ctx, n.p.Log, n.p.Run, n.p.MountInfoPath, hostnode.KubeletDir); err != nil {
 		return err
 	}
 
@@ -566,7 +573,9 @@ func (n *Node) Upgrade(ctx context.Context, old *Node) (err error) {
 		}
 	}
 
-	snapshot, err := hostnode.TakeSnapshot(n.p.Log, n.configSnapshotDir(), n.p.HostRoot)
+	// Preparing the new slot writes the host's CNI plugins, which the old slot
+	// sees at the same path, so those are saved too.
+	snapshot, err := hostnode.TakeSnapshotOf(n.p.Log, n.configSnapshotDir(), n.p.HostRoot, confsnap.PathsFor(isolation.ModeContainer))
 	if err != nil {
 		return err
 	}
@@ -667,17 +676,21 @@ func (n *Node) restoreShared() error {
 	return nil
 }
 
-// rollback removes the new slot and starts the old one again.
+// rollback removes the new slot and starts the old one again. The old slot is
+// started only once the new one is destroyed, which Backend.Destroy reports
+// only when the runtime has confirmed its container gone: two node stacks must
+// never run at once over the host paths both slots share. When the new slot
+// cannot be removed the old one is left stopped and the error says so.
 func (n *Node) rollback(ctx context.Context, old *Node, cause error) error {
 	ctx = context.WithoutCancel(ctx)
 
 	n.p.Log.Error("upgrade failed, restoring the previous slot", "failed_slot", n.slot, "restore_slot", old.slot, "error", cause)
 
-	var errs []error
-
 	if err := n.Destroy(ctx); err != nil {
-		errs = append(errs, fmt.Errorf("remove slot %s: %w", n.slot, err))
+		return errors.Join(cause, fmt.Errorf("remove slot %s: %w; previous slot %s is left stopped and the node needs attention", n.slot, err, old.slot))
 	}
+
+	var errs []error
 
 	if err := n.cleanupNetwork(ctx); err != nil {
 		errs = append(errs, fmt.Errorf("clean up network: %w", err))

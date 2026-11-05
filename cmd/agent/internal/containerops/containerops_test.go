@@ -205,7 +205,7 @@ func (f *fixture) node(slot string, dns bool) *Node {
 		Log:       quiet(),
 		Slot:      slot,
 		GoalState: f.goalState(slot, dns),
-		Overrides: Overrides{Layout: container.Layout{Base: filepath.Join(f.dir, "containers")}, SystemdDir: filepath.Join(f.dir, "systemd"), RuntimePath: testRuntime, HelperPath: "/usr/local/bin/unbounded-agent", Run: f.h.run, MountInfoPath: f.mountInfo(), Host: &container.HostFS{SELinuxEnforce: filepath.Join(f.dir, "absent")}, PollInterval: time.Millisecond, ReadyTimeout: 50 * time.Millisecond, Unpack: func(_ context.Context, dir string) error {
+		Overrides: Overrides{Layout: container.Layout{Base: filepath.Join(f.dir, "containers")}, SystemdDir: filepath.Join(f.dir, "systemd"), RuntimePath: testRuntime, HelperPath: "/usr/local/bin/unbounded-agent", Run: f.h.run, MountInfoPath: f.mountInfo(), Host: &container.HostFS{SELinuxEnforce: filepath.Join(f.dir, "absent")}, PollInterval: time.Millisecond, GoneTimeout: 20 * time.Millisecond, ReadyTimeout: 50 * time.Millisecond, Unpack: func(_ context.Context, dir string) error {
 			if err := c.inc(&c.unpack, &c.unpackErr); err != nil {
 				return err
 			}
@@ -652,15 +652,25 @@ func upgradeFixture(t *testing.T) (f *fixture, oldNode, newNode *Node) {
 	return f, oldNode, f.node("kube2", true)
 }
 
+func TestKubeletDirMatchesTheBackend(t *testing.T) {
+	require.Equal(t, hostnode.KubeletDir, container.KubeletDir)
+}
+
 func TestUpgradeMovesToTheAlternateSlot(t *testing.T) {
 	f, oldNode, newNode := upgradeFixture(t)
 
 	// A pod volume mounted under the shared kubelet directory by the old node.
-	require.NoError(t, os.WriteFile(f.mountInfo(), []byte("100 1 0:50 / /var/lib/kubelet/pods/x/volumes/v rw - tmpfs tmpfs rw\n"), 0o644))
+	// The kubelet directory's own shared mount stays: the new slot's pod
+	// mounts propagate through it.
+	require.NoError(t, os.WriteFile(f.mountInfo(), []byte(
+		"99 1 0:49 / /var/lib/kubelet rw shared:7 - ext4 /dev/sdb rw\n"+
+			"100 1 0:50 / /var/lib/kubelet/pods/x/volumes/v rw - tmpfs tmpfs rw\n"), 0o644))
 
 	require.NoError(t, newNode.Upgrade(t.Context(), oldNode))
 
 	calls := f.h.snapshot()
+	require.NotContains(t, calls, "umount -l /var/lib/kubelet", "the kubelet directory itself is never unmounted")
+
 	requireOrder(t, calls,
 		// The old slot is stopped gracefully only after the new one is built.
 		"systemctl stop "+container.UnitName("kube1"),
@@ -756,6 +766,26 @@ func TestUpgradeRollsBack(t *testing.T) {
 			}
 		})
 	}
+}
+
+// The old slot is started again only once the new one is confirmed gone: a
+// new container that survives its stop and kill leaves the old one stopped,
+// so two node stacks never run over the shared host paths.
+func TestUpgradeDoesNotResumeTheOldSlotWhileTheNewOneLives(t *testing.T) {
+	f, oldNode, newNode := upgradeFixture(t)
+	f.h.failOne["unbounded-kube2 systemctl enable --now kubelet.service"] = errors.New("kubelet failed")
+	f.h.failAll["systemctl stop "+container.UnitName("kube2")] = errors.New("stop timed out")
+	f.h.failAll["systemctl disable "+container.UnitName("kube2")] = errors.New("busy")
+
+	err := newNode.Upgrade(t.Context(), oldNode)
+	require.ErrorContains(t, err, "kubelet failed")
+	require.ErrorContains(t, err, "still alive")
+	require.ErrorContains(t, err, "previous slot kube1 is left stopped")
+	require.NotContains(t, err.Error(), "restored")
+
+	require.False(t, f.h.active[container.UnitName("kube1")], "the old slot is not started beside the live new one")
+	require.Equal(t, -1, index(f.h.snapshot(), "systemctl enable --now "+container.UnitName("kube1"), 0))
+	require.DirExists(t, f.rootfs("kube2"), "the live slot's files are kept")
 }
 
 func TestUpgradeReportsAFailedRestore(t *testing.T) {

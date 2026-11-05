@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/require"
 
@@ -138,6 +139,32 @@ func TestTeardownDestroyKeepsTheLayoutWhenASlotCannotBeRemoved(t *testing.T) {
 	require.DirExists(t, td.Layout.RootfsDir("kube1"), "the data below the mount is untouched")
 	require.FileExists(t, runtime, "the layout and runtime stay so the next reset can finish")
 	require.NoDirExists(t, td.Layout.RootfsDir("kube2"), "the other slot is still removed")
+
+	// While a slot remains, the data both slots share stays too.
+	require.FileExists(t, f.hostPath("/var/lib/kubelet/config.yaml"))
+	require.FileExists(t, f.hostPath("/opt/cni/bin/bridge"))
+	require.FileExists(t, f.hostPath("/var/lib/unbounded/container-images/a.tar"))
+}
+
+// A slot whose container survives the stop keeps everything, and the pod
+// mounts below /var/lib/kubelet are not unmounted under it.
+func TestTeardownDestroyKeepsSharedDataWhileAContainerLives(t *testing.T) {
+	f, td, _ := teardownFixture(t)
+	td.GoneTimeout = 10 * time.Millisecond
+	td.PollInterval = time.Millisecond
+
+	require.NoError(t, os.WriteFile(f.mountInfo(), []byte("100 1 0:50 / /var/lib/kubelet/pods/x/volumes/v rw - tmpfs tmpfs rw\n"), 0o644))
+	f.h.failAll["systemctl stop "+container.UnitName("kube1")] = errors.New("stop timed out")
+	f.h.failAll["systemctl disable "+container.UnitName("kube1")] = errors.New("busy")
+
+	err := td.Destroy().Do(t.Context())
+	require.ErrorContains(t, err, "destroy kube1")
+	require.ErrorContains(t, err, "still alive")
+
+	require.NotContains(t, f.h.snapshot(), "umount -l /var/lib/kubelet/pods/x/volumes/v", "nothing is unmounted under a live container")
+	require.FileExists(t, f.hostPath("/var/lib/kubelet/config.yaml"))
+	require.FileExists(t, f.hostPath("/opt/cni/bin/bridge"))
+	require.DirExists(t, td.Layout.RootfsDir("kube1"))
 }
 
 func TestTeardownRemoveConfigLeavesOtherFiles(t *testing.T) {
