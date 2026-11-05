@@ -513,6 +513,7 @@ fn ready_memory_precedes_cold_ownership_refresh_and_preserves_one_interest() {
         NoPeer::requester(),
         deps.credentials.clone(),
         published,
+        crate::test_support::ctx(),
     ));
     f.fill = Fill::new(deps);
     let before = f
@@ -3455,6 +3456,7 @@ fn fixture_with_caches(
         Arc::new(controlplane::Published::new(
             crate::control::Snapshot::retention(2),
         )),
+        crate::test_support::ctx(),
     ));
     // Deliberately uninstalled catalog owner: publication must retain page-local
     // metadata and still complete when the optional catalog is unavailable.

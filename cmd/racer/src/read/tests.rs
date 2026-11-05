@@ -2514,6 +2514,7 @@ mod timeouts {
                 Arc::new(controlplane::Published::new(
                     crate::control::Snapshot::retention(2),
                 )),
+                crate::test_support::ctx(),
             );
             let scope =
                 RequestScope::new(RequestId([3; 16]), Instant::now() + Duration::from_secs(1))

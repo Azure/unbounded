@@ -504,6 +504,7 @@ fn remote_candidate_with_churn(absence: Option<Absence>, forbidden: bool, churn:
         Arc::new(controlplane::Published::new(
             crate::control::Snapshot::retention(2),
         )),
+        crate::test_support::ctx(),
     );
     let context = OriginContext {
         object: object.clone(),
@@ -990,6 +991,7 @@ fn metadata_coordinator_with_newer_publication(
         Arc::new(controlplane::Published::new(
             crate::control::Snapshot::retention(2),
         )),
+        crate::test_support::ctx(),
     ));
     let origin = adapter.client(
         snapshots.clone(),

@@ -189,6 +189,9 @@ pub struct NodeState {
 
     /// Native Azure origin limits, token caches, and TLS trust roots.
     azure: crate::origin::azure::AzureNode,
+
+    /// Node-wide monotonic and wall time.
+    clock: racer_io::Clock,
 }
 
 impl Default for NodeState {
@@ -248,6 +251,7 @@ impl NodeState {
             recovery: Mutex::new(recovery::RecoveryCut::default()),
             observations: Observations::default(),
             native: native::NativeNode::default(),
+            clock: clock.clone(),
             azure: crate::origin::azure::AzureNode::new(&Default::default()),
             pressure: Default::default(),
         })
@@ -1187,8 +1191,12 @@ impl WorkerApplication {
         let hedges = node
             .hedges
             .get_or_init(|| {
-                crate::read::candidates::Hedges::new(config.page_hedge, node.metrics[0].1.clone())
-                    .expect("validated hedge config")
+                crate::read::candidates::Hedges::new(
+                    config.page_hedge,
+                    node.metrics[0].1.clone(),
+                    node.clock.clone(),
+                )
+                .expect("validated hedge config")
             })
             .for_worker(metrics.clone());
         admission
@@ -1368,6 +1376,7 @@ impl WorkerApplication {
                 requester.clone(),
                 credentials.clone(),
                 node.publications.clone(),
+                reactor.ctx().clone(),
             )
             .with_hedges(hedges)
             .with_reactor(reactor.clone())

@@ -288,6 +288,7 @@ fn install_peers(f: &mut Fixture, rank: Option<usize>) -> (Rc<ScriptedPeers>, Ve
         Arc::new(controlplane::Published::new(
             crate::control::Snapshot::retention(2),
         )),
+        crate::test_support::ctx(),
     ));
     f.fill = Fill::new(dependencies);
     f.fill
@@ -657,6 +658,7 @@ fn serial_zero_grant_copy_failures_and_positive_grant_acquire() {
                     Arc::new(controlplane::Published::new(
                         crate::control::Snapshot::retention(2),
                     )),
+                    crate::test_support::ctx(),
                 )
                 .with_observer(failures.observer(WorkerId(0))),
             );
@@ -1068,6 +1070,7 @@ fn hedge_suppresses_without_independent_route_credits_or_local_memory() {
                 bytes: crate::read::candidates::DUPLICATE_BYTES,
             },
             metrics.clone(),
+            crate::test_support::clock(),
         )
         .unwrap();
         let _slot = (reason == "slots").then(|| hedges.acquire().unwrap());
@@ -1081,6 +1084,7 @@ fn hedge_suppresses_without_independent_route_credits_or_local_memory() {
                 Arc::new(controlplane::Published::new(
                     crate::control::Snapshot::retention(2),
                 )),
+                crate::test_support::ctx(),
             )
             .with_hedges(hedges),
         );
@@ -1416,6 +1420,7 @@ fn enable_hedge(f: &mut Fixture, peers: &Rc<ScriptedPeers>) -> crate::telemetry:
             bytes: crate::read::candidates::DUPLICATE_BYTES,
         },
         metrics.clone(),
+        crate::test_support::clock(),
     )
     .unwrap();
     let mut deps = f.fill.dependencies.clone();
@@ -1428,6 +1433,7 @@ fn enable_hedge(f: &mut Fixture, peers: &Rc<ScriptedPeers>) -> crate::telemetry:
             Arc::new(controlplane::Published::new(
                 crate::control::Snapshot::retention(2),
             )),
+            crate::test_support::ctx(),
         )
         .with_hedges(hedges),
     );
@@ -1514,6 +1520,7 @@ fn hedge_stale_membership_refreshes_once_without_fresh_credits() {
                     peers.requester(),
                     deps.credentials.clone(),
                     crate::test_support::published_membership(latest.clone()),
+                    crate::test_support::ctx(),
                 )
                 .with_hedges(deps.candidates.hedge_owner().unwrap().clone()),
             );
@@ -1764,6 +1771,7 @@ fn hedge_cold_backup_coordinators_probe_predecessors_then_reach_origin_with_orig
                 Arc::new(controlplane::Published::new(
                     crate::control::Snapshot::retention(2),
                 )),
+                crate::test_support::ctx(),
             );
             if i == source {
                 policy = policy.with_hedges(
@@ -1774,6 +1782,7 @@ fn hedge_cold_backup_coordinators_probe_predecessors_then_reach_origin_with_orig
                             bytes: crate::read::candidates::DUPLICATE_BYTES,
                         },
                         hedge_metrics.clone(),
+                        crate::test_support::clock(),
                     )
                     .unwrap(),
                 );
@@ -2664,6 +2673,7 @@ fn replica_selection_orders_first_acquire_and_non_primary_owner_fills() {
                 Arc::new(controlplane::Published::new(
                     crate::control::Snapshot::retention(2),
                 )),
+                crate::test_support::ctx(),
             )
             .with_replica_selection(selection);
             if i == source {
@@ -3063,6 +3073,7 @@ mod landing {
             Arc::new(controlplane::Published::new(
                 crate::control::Snapshot::retention(2),
             )),
+            crate::test_support::ctx(),
         ));
         f.fill = Fill::new(dependencies);
         own(&f, false);
@@ -3812,6 +3823,7 @@ fn install_versions(
         peers.requester(),
         deps.credentials.clone(),
         published,
+        crate::test_support::ctx(),
     );
     policy.instant_stale_wait.set(wait);
     deps.candidates = Rc::new(policy);
@@ -3828,6 +3840,7 @@ fn publish_same_membership(f: &mut Fixture, peers: &Rc<ScriptedPeers>) {
         peers.requester(),
         deps.credentials.clone(),
         crate::test_support::published_membership(f.membership.clone()),
+        crate::test_support::ctx(),
     ));
     f.fill = Fill::new(deps);
 }
@@ -5434,6 +5447,7 @@ fn refreshed_owner_order_keys_orphan_notice_and_failure_hold() {
             peers.requester(),
             deps.credentials.clone(),
             crate::test_support::published_membership(latest.clone()),
+            crate::test_support::ctx(),
         ));
         f.fill = Fill::new(deps);
         own(&f, true);
@@ -5515,6 +5529,7 @@ fn passthrough_peers_coalesces_reads_from_distinct_nodes_on_the_owner() {
             Arc::new(controlplane::Published::new(
                 crate::control::Snapshot::retention(2),
             )),
+            crate::test_support::ctx(),
         );
         let mut deps = f.fill.dependencies.clone();
         deps.candidates = Rc::new(policy);

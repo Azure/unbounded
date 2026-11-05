@@ -324,6 +324,7 @@ impl SubscriptionFixture {
             peers.clone(),
             credentials.clone(),
             Arc::new(Published::new(Snapshot::retention(2))),
+            racer_io::WorkerCtx::host(),
         ));
         let origin = Rc::new(GeneratedOrigin(buffers.clone()));
         let memory = Rc::new(MemoryCache::new(buffers.clone(), availability.clone()));

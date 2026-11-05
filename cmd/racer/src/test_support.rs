@@ -615,6 +615,7 @@ impl ReadWorker {
             crate::test_support::NoPeers::requester(),
             credentials.clone(),
             Arc::new(Published::new(Snapshot::retention(2))),
+            crate::test_support::ctx(),
         ));
         let client = origin.client(
             snapshots.clone(),
@@ -1063,9 +1064,15 @@ pub(crate) fn simulated_slab<C: page_alloc::Charge>(
     slab
 }
 
-/// The selected thread environment's clock, shared with any simulated world.
+/// The selected thread environment's worker context, shared with any simulated
+/// world.
 // MIGRATION: test fixtures read the thread environment until tests pass a
 // WorkerCtx explicitly.
+pub fn ctx() -> racer_io::WorkerCtx {
+    uring_runtime::environment::Environment::current().worker_ctx()
+}
+
+/// MIGRATION: the clock of [`ctx`].
 pub fn clock() -> racer_io::Clock {
     uring_runtime::environment::Environment::current()
         .worker_ctx()

@@ -911,6 +911,7 @@ mod router {
             crate::test_support::NoPeers::requester(),
             credentials,
             h.snapshots.clone(),
+            crate::test_support::ctx(),
         )
         .local_authority(
             membership,

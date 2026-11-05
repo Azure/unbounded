@@ -311,6 +311,7 @@ fn real_uds_root_remapping_keeps_public_authority_and_http_validation() {
         NoPeers::requester(),
         credentials(admission.clone()),
         Arc::new(Published::new(Snapshot::retention(2))),
+        crate::test_support::ctx(),
     );
     let scope = scope();
     let CandidateResolution::Origin(authority) = block_on(policy.resolve(
@@ -985,6 +986,7 @@ fn public_operations_reject_wrong_authority_before_io() {
         NoPeers::requester(),
         credentials(client().1),
         Arc::new(Published::new(Snapshot::retention(2))),
+        crate::test_support::ctx(),
     );
     let context = context();
     let scope = scope();

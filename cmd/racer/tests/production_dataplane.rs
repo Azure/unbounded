@@ -560,6 +560,7 @@ impl Rig {
             peers.clone(),
             credentials.clone(),
             published.clone(),
+            racer_io::WorkerCtx::host(),
         ));
         let origin = Rc::new(
             OriginClient::new(

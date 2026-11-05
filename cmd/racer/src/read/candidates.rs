@@ -158,6 +158,8 @@ fn positions(candidates: &Candidates) -> List<u32, MAX_HANDOFF> {
 }
 
 pub struct CandidatePolicy {
+    /// Time and entropy for this worker's candidate walks.
+    ctx: racer_io::WorkerCtx,
     hedge: Option<Arc<Hedges>>,
     replica_selection: ReplicaSelection,
     attempt_timeout: std::time::Duration,
@@ -593,7 +595,7 @@ impl CandidatePolicy {
                 if requested.is_some() && !matches!(error, Error::Overloaded) {
                     self.single_flight
                         .borrow_mut()
-                        .insert(destination.clone(), uring_runtime::environment::now());
+                        .insert(destination.clone(), self.ctx.now());
                     return Ok(ProviderSelection::Refused {
                         provider: destination.clone(),
                     });
@@ -634,7 +636,7 @@ impl CandidatePolicy {
             {
                 self.single_flight
                     .borrow_mut()
-                    .insert(destination.clone(), uring_runtime::environment::now());
+                    .insert(destination.clone(), self.ctx.now());
                 Ok(ProviderSelection::Refused {
                     provider: destination.clone(),
                 })
@@ -650,7 +652,7 @@ impl CandidatePolicy {
             || self
                 .single_flight
                 .borrow_mut()
-                .contains(provider, uring_runtime::environment::now())
+                .contains(provider, self.ctx.now())
         {
             return None;
         }
@@ -663,8 +665,10 @@ impl CandidatePolicy {
         peers: Rc<Requester>,
         credentials: Rc<CredentialCrypto>,
         published: Arc<controlplane::Published<crate::control::Snapshot>>,
+        ctx: racer_io::WorkerCtx,
     ) -> Self {
         Self {
+            ctx,
             hedge: None,
             // Low-level construction keeps canonical order; the service reads
             // its selection from configuration (default `Spread`).
@@ -719,9 +723,7 @@ impl CandidatePolicy {
             .member(destination)
             .map(|m| m.site.clone())
             .unwrap_or_default();
-        self.notices
-            .borrow_mut()
-            .observe(site, cut, uring_runtime::environment::now());
+        self.notices.borrow_mut().observe(site, cut, self.ctx.now());
     }
 
     /// Whether this policy can wait for a destination that is behind.
@@ -1095,7 +1097,7 @@ impl CandidatePolicy {
             answer: None,
             dest: None,
             acquire: false,
-            sent: uring_runtime::environment::now(),
+            sent: self.ctx.now(),
             error: None,
             phase: Phase::Walk,
             authority: None,
@@ -1120,7 +1122,7 @@ impl CandidatePolicy {
         copy: &mut Option<T>,
     ) -> Result<Action> {
         let (object, page) = operation_identity(operation);
-        let now = uring_runtime::environment::now;
+        let now = || self.ctx.now();
         let mut next = a.fill.on(event, budget, now());
         loop {
             let (action, evidence) = next;
@@ -1340,7 +1342,7 @@ impl CandidatePolicy {
                 // Ranking failures are not errors; the walk just goes without.
                 let version = version.expect("a previous version");
                 let current = a.current.as_ref().expect("ranked");
-                let now = uring_runtime::environment::now();
+                let now = self.ctx.now();
                 let previous = self
                     .published
                     .resolve(version, now)
@@ -1489,7 +1491,7 @@ impl CandidatePolicy {
         };
         let remaining = a.phase == Phase::Remaining;
         a.acquire = probe.mode == WalkMode::Acquire;
-        a.sent = uring_runtime::environment::now();
+        a.sent = self.ctx.now();
         let mut exchanged = Exchanged::default();
         let response = self
             .request_traced(
@@ -1581,7 +1583,7 @@ impl CandidatePolicy {
                 Rank0Note::TimedOut => watch.timed_out(
                     id.clone(),
                     destination.clone(),
-                    uring_runtime::environment::now(),
+                    self.ctx.now(),
                     budget.deadline().min(scope.deadline.0),
                 ),
                 Rank0Note::Failed => watch.answered_failure(id, destination),
@@ -1739,7 +1741,7 @@ impl CandidatePolicy {
             })
             .collect();
         let node = |p: &u32| &membership.members()[*p as usize].node;
-        let sent = uring_runtime::environment::now();
+        let sent = self.ctx.now();
         let responses = futures::future::join_all(targets.iter().zip(grants.iter_mut()).map(
             |(target, (grant, exchanged))| {
                 self.request_traced(
@@ -2104,7 +2106,7 @@ impl CandidatePolicy {
             // racer-core reserves the complete route and remote credits before
             // sending and derives the share, local cap, and body budget. Lost
             // responses cannot refund forwarded links; no retry gets fresh credits.
-            let now = uring_runtime::environment::now();
+            let now = self.ctx.now();
             let plan = racer_core::read::walk::plan_attempt(
                 budget,
                 racer_core::read::walk::AttemptInputs {
@@ -2144,7 +2146,10 @@ impl CandidatePolicy {
             attempt_scope.body_deadlines = Some((overall, plan.share));
             attempt_scope.set_candidate_body_budget(plan.observation, plan.complete_by)?;
             let mut bytes = [0; 16];
-            uring_runtime::environment::fill_random(&mut bytes).map_err(|_| Error::Unavailable)?;
+            self.ctx
+                .rng
+                .fill(&mut bytes)
+                .map_err(|_| Error::Unavailable)?;
             let attempt = AttemptId(bytes);
             facts.attempt = Some(attempt);
             let credentials = &self.credentials;
@@ -2318,7 +2323,7 @@ impl CandidatePolicy {
         if !should_notice(Some(rank)) || owners.get(rank) != Some(&self.node) {
             return false;
         }
-        let now = uring_runtime::environment::now();
+        let now = self.ctx.now();
         let mut noted = false;
         // Rank 0 and, for a holder at rank 2, rank 1 unless it answered this owner's walk.
         for index in notice_indexes(Some(rank), evidence) {
@@ -2362,11 +2367,9 @@ impl CandidatePolicy {
         let Some(rank0) = owners.first() else {
             return;
         };
-        self.rank0_watch.borrow_mut().failed(
-            page.clone(),
-            rank0.clone(),
-            uring_runtime::environment::now(),
-        );
+        self.rank0_watch
+            .borrow_mut()
+            .failed(page.clone(), rank0.clone(), self.ctx.now());
     }
 
     /// Send due copy offers, at most [`MAX_OFFERS_IN_FLIGHT`] at a time, each on its own detached
@@ -2420,7 +2423,7 @@ impl CandidatePolicy {
                 let _flight = flight;
                 metrics.record(Event::OrphanOfferSent, 1);
                 let end = policy.offer(&due).await.unwrap_or(OfferEnd::Cut);
-                let now = uring_runtime::environment::now();
+                let now = policy.ctx.now();
                 match end {
                     OfferEnd::Dropped => {}
                     OfferEnd::Delivered => metrics.record(Event::OrphanOfferDelivered, 1),
@@ -2466,7 +2469,7 @@ impl CandidatePolicy {
                 let _flight = flight;
                 metrics.record(Event::SilencePingSent, 1);
                 let answered = policy.ping(&peer, &page).await;
-                let now = uring_runtime::environment::now();
+                let now = policy.ctx.now();
                 if health.ping_outcome(&peer, answered, now) {
                     metrics.record(Event::SilencePeerSilent, 1);
                 }
@@ -2479,8 +2482,7 @@ impl CandidatePolicy {
     /// classify the result (`racer_core::liveness::ping_verdict`).
     async fn ping(&self, peer: &NodeId, page: &crate::model::PageId) -> Option<bool> {
         use racer_core::read::hints::NOTICE_LINKS;
-        // MIGRATION: the hint owner receives a WorkerCtx in a later step.
-        let ctx = crate::runtime::ambient_ctx();
+        let ctx = self.ctx.clone();
         let deadline = ctx.now() + self.attempt_timeout;
         let mut id = [0; 16];
         ctx.rng.fill(&mut id).ok()?;
@@ -2533,8 +2535,7 @@ impl CandidatePolicy {
     ) -> Result<OfferEnd> {
         use racer_core::read::hints::{NOTICE_LINKS, notice_target};
         let (page, index) = (&due.key.0, due.key.1);
-        // MIGRATION: the hint owner receives a WorkerCtx in a later step.
-        let ctx = crate::runtime::ambient_ctx();
+        let ctx = self.ctx.clone();
         let deadline = ctx.now() + self.attempt_timeout;
         let mut id = [0; 16];
         ctx.rng.fill(&mut id).map_err(|_| Error::Unavailable)?;
@@ -2707,7 +2708,7 @@ fn candidate_final_validation_tail_preserves_identity_and_omissions() {
 
 fn check_budget(scope: &RequestScope, budget: &AcquisitionBudget) -> Result<()> {
     scope.check()?;
-    if uring_runtime::environment::now() >= budget.deadline() {
+    if scope.clock().now() >= budget.deadline() {
         Err(Error::DeadlineExceeded)
     } else {
         Ok(())
@@ -2971,6 +2972,7 @@ pub(crate) struct Hedges {
     config: HedgeConfig,
     capacity: Arc<flow_control::Hedges>,
     metrics: Metrics,
+    clock: racer_io::Clock,
 }
 pub(crate) struct Permit {
     owner: Arc<Hedges>,
@@ -2982,13 +2984,19 @@ impl Hedges {
             config: self.config,
             capacity: self.capacity.clone(),
             metrics,
+            clock: self.clock.clone(),
         })
     }
-    pub(crate) fn new(config: HedgeConfig, metrics: Metrics) -> Result<Arc<Self>> {
+    pub(crate) fn new(
+        config: HedgeConfig,
+        metrics: Metrics,
+        clock: racer_io::Clock,
+    ) -> Result<Arc<Self>> {
         config.validate()?;
         Ok(Arc::new(Self {
             config,
             metrics,
+            clock,
             capacity: flow_control::Hedges::new(config.slots, config.bytes),
         }))
     }
@@ -2999,22 +3007,21 @@ impl Hedges {
         self.metrics.record(Event::PageHedgeSuppressed, 1);
     }
     pub(crate) fn acquire(self: &Arc<Self>) -> Result<Permit> {
-        let capacity = self.capacity.acquire(
-            DUPLICATE_BYTES,
-            uring_runtime::environment::now() + self.config.delay,
-        )?;
+        let capacity = self
+            .capacity
+            .acquire(DUPLICATE_BYTES, self.clock.now() + self.config.delay)?;
         Ok(Permit {
             owner: self.clone(),
             capacity,
         })
     }
     pub(crate) fn poll(&self) {
-        self.capacity.poll(uring_runtime::environment::now());
+        self.capacity.poll(self.clock.now());
     }
 }
 impl Permit {
     pub(crate) fn delay(&self, cx: &mut Context<'_>) -> Poll<()> {
-        self.capacity.delay(uring_runtime::environment::now(), cx)
+        self.capacity.delay(self.owner.clock.now(), cx)
     }
     pub(crate) fn started(&self) {
         self.owner.metrics.record(Event::PageHedgeStarted, 1);
@@ -3151,6 +3158,7 @@ pub(super) mod tests {
             Arc::new(controlplane::Published::new(
                 crate::control::Snapshot::retention(2),
             )),
+            crate::test_support::ctx(),
         );
         let mut budget = AcquisitionBudget::new(scope.deadline.0, 16, 24);
         let result = futures::executor::block_on(policy.resolve_with_budget(
@@ -3507,6 +3515,7 @@ pub(super) mod tests {
                     ),
                     probe.credentials.clone(),
                     probe.published.clone(),
+                    crate::test_support::ctx(),
                 )
                 .with_replica_selection(selection);
                 let context = OriginContext {
@@ -3701,6 +3710,7 @@ pub(super) mod tests {
                     ),
                     probe.credentials.clone(),
                     probe.published.clone(),
+                    crate::test_support::ctx(),
                 );
                 let context = OriginContext {
                     object: object(),
@@ -3838,6 +3848,7 @@ pub(super) mod tests {
             Arc::new(controlplane::Published::new(
                 crate::control::Snapshot::retention(2),
             )),
+            crate::test_support::ctx(),
         );
         let candidates = policy.candidates(membership, &context.object, PageNumber(0));
         let mut budget = AcquisitionBudget::new(scope.deadline.0, attempts, 8);
@@ -3891,6 +3902,7 @@ pub(super) mod tests {
             Arc::new(controlplane::Published::new(
                 crate::control::Snapshot::retention(2),
             )),
+            crate::test_support::ctx(),
         );
         let mut budget = AcquisitionBudget::new(scope.deadline.0, 4, 8);
         let result = futures::executor::block_on(policy.resolve_with_budget(
@@ -3932,6 +3944,7 @@ pub(super) mod tests {
             Arc::new(controlplane::Published::new(
                 crate::control::Snapshot::retention(2),
             )),
+            crate::test_support::ctx(),
         );
         let mut budget = AcquisitionBudget::new(scope.deadline.0, 16, 24);
         let result = futures::executor::block_on(policy.resolve_with_budget(
@@ -3982,6 +3995,7 @@ pub(super) mod tests {
                 Arc::new(controlplane::Published::new(
                     crate::control::Snapshot::retention(2),
                 )),
+                crate::test_support::ctx(),
             );
             let mut budget = AcquisitionBudget::new(scope.deadline.0, 16, 24);
             let result = futures::executor::block_on(policy.resolve_with_budget(
@@ -4021,6 +4035,7 @@ pub(super) mod tests {
             Arc::new(controlplane::Published::new(
                 crate::control::Snapshot::retention(2),
             )),
+            crate::test_support::ctx(),
         );
         let mut budget = AcquisitionBudget::new(scope.deadline.0, 16, 24);
         let result = futures::executor::block_on(policy.resolve_with_budget(
@@ -4064,6 +4079,7 @@ pub(super) mod tests {
             Arc::new(controlplane::Published::new(
                 crate::control::Snapshot::retention(2),
             )),
+            crate::test_support::ctx(),
         );
         let destination = membership.members()[0].node.clone();
         let operation = PeerOperation::Metadata {
@@ -4266,6 +4282,7 @@ pub(super) mod tests {
             Arc::new(controlplane::Published::new(
                 crate::control::Snapshot::retention(2),
             )),
+            crate::test_support::ctx(),
         )
     }
     fn scope() -> RequestScope {
@@ -4519,6 +4536,7 @@ pub(super) mod tests {
                 requester,
                 Rc::new(CredentialCrypto::new(keys, admission)),
                 published,
+                crate::test_support::ctx(),
             ));
             let weak_policy = Rc::downgrade(&policy);
             let callback = policy.ownership_callback();
@@ -4679,6 +4697,7 @@ pub(super) mod tests {
                     delay: Duration::from_millis(1),
                 },
                 metrics[0].clone(),
+                crate::test_support::clock(),
             )
             .unwrap();
             let second = first.for_worker(metrics[1].clone());
@@ -4719,6 +4738,7 @@ pub(super) mod tests {
                     delay: Duration::from_millis(10),
                 },
                 Metrics::default(),
+                crate::test_support::clock(),
             )
             .unwrap()
         }
@@ -4907,9 +4927,13 @@ pub(super) mod tests {
             drop(permit);
             assert!(owner.acquire().is_ok());
             assert!(
-                !Hedges::new(HedgeConfig::default(), Metrics::default())
-                    .unwrap()
-                    .enabled()
+                !Hedges::new(
+                    HedgeConfig::default(),
+                    Metrics::default(),
+                    crate::test_support::clock()
+                )
+                .unwrap()
+                .enabled()
             );
         }
         #[test]

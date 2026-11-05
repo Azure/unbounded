@@ -739,6 +739,7 @@ pub(super) fn coordinator_with_window(
         peers.clone(),
         deps.credentials.clone(),
         Arc::new(controlplane::Published::new(Snapshot::retention(2))),
+        crate::test_support::ctx(),
     ));
     f.read_graph(
         Rc::new(Fill::new(deps)),
