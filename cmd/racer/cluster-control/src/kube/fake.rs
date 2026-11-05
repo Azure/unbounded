@@ -1,4 +1,5 @@
-//! In-memory Kubernetes API server for tests.
+//! In-memory Kubernetes API server for tests and the simulation harness
+//! ([`crate::simulation`]).
 //!
 //! It serves a plain-value [`Store`] (GET, list, PUT with resourceVersion
 //! CAS, POST, merge and JSON PATCH, watch with compaction (410 Gone), field
@@ -34,6 +35,8 @@ struct Inner {
     put_delay: RefCell<Option<Arc<AtomicU64>>>,
     get_delay: RefCell<Option<Arc<AtomicU64>>>,
     token: RefCell<String>,
+    /// Bumped by [`FakeApi::drop_watches`]; open watches end when it moves.
+    watch_epoch: std::cell::Cell<u64>,
 }
 
 impl FakeApi {
@@ -45,6 +48,7 @@ impl FakeApi {
             put_delay: RefCell::new(None),
             get_delay: RefCell::new(None),
             token: RefCell::new(TOKEN.into()),
+            watch_epoch: std::cell::Cell::new(0),
         }))
     }
 
@@ -110,6 +114,19 @@ impl FakeApi {
         self.0.store.borrow_mut().fail_next(statuses);
     }
 
+    /// Fail the next write (PUT, POST, PATCH or DELETE) with `status`,
+    /// leaving reads alone. A 409 here is a spurious resourceVersion conflict.
+    pub fn fail_next_write(&self, status: u16) {
+        self.0.store.borrow_mut().write_faults.push_back(status);
+    }
+
+    /// End every open watch stream cleanly, as an API server restart or a
+    /// load balancer idle cut would. Clients must re-list or resume.
+    pub fn drop_watches(&self) {
+        self.0.watch_epoch.set(self.0.watch_epoch.get() + 1);
+        self.0.changed.notify();
+    }
+
     /// Requests seen, as (method, target).
     pub fn requests(&self) -> Vec<(String, String)> {
         self.0.requests.borrow().clone()
@@ -147,8 +164,13 @@ impl FakeApi {
             out
         };
         let mut seen = from;
+        let epoch = self.0.watch_epoch.get();
         loop {
             let generation = self.0.changed.generation();
+            if self.0.watch_epoch.get() != epoch {
+                let _ = conn.tls.write_all(b"0\r\n\r\n").await;
+                return;
+            }
             let events = self
                 .0
                 .store
@@ -184,6 +206,7 @@ impl FakeApi {
 /// Bearer token the fake API accepts until [`FakeApi::set_token`].
 pub const TOKEN: &str = "api-token";
 
+#[cfg(test)]
 /// Serve the fake API on loopback and return client settings for it.
 pub fn serve(api: FakeApi, dir: &std::path::Path) -> KubeConfig {
     serve_at(api, dir, "127.0.0.1:0".parse().unwrap())
@@ -291,8 +314,10 @@ pub fn serve_at(api: FakeApi, dir: &std::path::Path, address: std::net::SocketAd
     }
 }
 
+#[cfg(test)]
 static DIRS: AtomicUsize = AtomicUsize::new(0);
 
+#[cfg(test)]
 /// Project-local scratch directory for one test.
 pub fn scratch() -> std::path::PathBuf {
     let n = DIRS.fetch_add(1, SeqCst);
@@ -303,6 +328,7 @@ pub fn scratch() -> std::path::PathBuf {
     dir
 }
 
+#[cfg(test)]
 /// Run a test body with a fake API and a connected client.
 pub fn run<F, Fut>(body: F)
 where
@@ -361,6 +387,7 @@ pub struct Store {
     compacted: u64,
     uids: u64,
     faults: VecDeque<u16>,
+    write_faults: VecDeque<u16>,
     post_hook: Option<Hook>,
 }
 
@@ -373,6 +400,7 @@ impl Store {
             compacted: 0,
             uids: 1,
             faults: VecDeque::new(),
+            write_faults: VecDeque::new(),
             post_hook: None,
         }
     }
@@ -463,6 +491,11 @@ impl Store {
     /// Serve one request. `target` is a path with an optional query.
     pub fn handle(&mut self, method: &str, target: &str, body: &[u8]) -> (u16, Value) {
         if let Some(s) = self.faults.pop_front() {
+            return (s, json!({"kind":"Status","code":s}));
+        }
+        if method != "GET"
+            && let Some(s) = self.write_faults.pop_front()
+        {
             return (s, json!({"kind":"Status","code":s}));
         }
         let (path, query) = match target.split_once('?') {
@@ -645,6 +678,7 @@ pub fn json_patch(target: &mut Value, ops: &Value) -> Result<(), u16> {
     Ok(())
 }
 
+#[cfg(test)]
 mod store_tests {
     use super::*;
 
@@ -676,6 +710,19 @@ mod store_tests {
         assert_eq!(s.handle("PUT", &format!("{LEASES}/x"), b"{}").0, 404);
         assert_eq!(s.handle("GET", &format!("{LEASES}/x"), b"").0, 404);
         assert_eq!(s.handle("GET", "/x/y", b"{").0, 400);
+    }
+
+    #[test]
+    fn write_faults_skip_reads_and_apply_once() {
+        let mut s = Store::new();
+        let path = format!("{LEASES}/a");
+        let created = s.put_object(&path, lease("a"));
+        s.write_faults.push_back(409);
+        assert_eq!(s.handle("GET", &path, b"").0, 200);
+        let body = serde_json::to_vec(&created).unwrap();
+        assert_eq!(s.handle("PUT", &path, &body).0, 409);
+        // The fault did not change the object, so the same write now lands.
+        assert_eq!(s.handle("PUT", &path, &body).0, 200);
     }
 
     #[test]

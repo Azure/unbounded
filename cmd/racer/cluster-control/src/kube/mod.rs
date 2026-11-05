@@ -650,7 +650,8 @@ pub mod paths {
     }
 }
 
-#[cfg(test)]
+// Outside tests only the simulation support uses part of it.
+#[cfg_attr(not(test), allow(dead_code, unused_imports))]
 pub(crate) mod fake;
 
 #[cfg(test)]

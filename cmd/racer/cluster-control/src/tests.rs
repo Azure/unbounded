@@ -14,11 +14,8 @@ use crate::{
     rt::{self, Executor, Tcp},
     tls::TlsStream,
 };
-use base64::{
-    Engine,
-    engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD},
-};
-use serde_json::{Value, json};
+use base64::{Engine, engine::general_purpose::STANDARD};
+
 use std::{
     path::PathBuf,
     sync::{
@@ -28,94 +25,16 @@ use std::{
     time::{Duration, Instant},
 };
 
-const NS: &str = "racer-system";
-const SECRET_UID: &str = "c1c1c1c1-0000-4000-8000-000000000001";
-const DS_UID: &str = "d5d5d5d5-0000-4000-8000-000000000001";
-const SA_UID: &str = "5a5a5a5a-0000-4000-8000-000000000001";
+use crate::simulation::{NS, SECRET_UID, node_uid, pod_uid, seed};
 
-fn node_uid(i: usize) -> String {
-    format!("0000000{i}-0000-4000-8000-0000000000aa")
-}
-
-fn pod_uid(i: usize) -> String {
-    format!("0000000{i}-0000-4000-8000-0000000000bb")
-}
-
-/// Unsigned test JWT naming a Pod.
+/// Unsigned test JWT naming a Pod, valid for an hour of host time.
 fn token(pod: usize) -> String {
     let exp = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
         .as_secs()
         + 3600;
-    format!(
-        "e30.{}.sig",
-        URL_SAFE_NO_PAD.encode(json!({"exp": exp, "pod": pod}).to_string())
-    )
-}
-
-fn seed(api: &fake::FakeApi, pods: usize) {
-    let mut secret = json!({"apiVersion":"v1","kind":"Secret","type":"Opaque","metadata":{"name":"racer-state","namespace":NS,"uid":SECRET_UID}});
-    secret["data"] = json!({});
-    api.put_object(
-        &format!("/api/v1/namespaces/{NS}/secrets/racer-state"),
-        secret,
-    );
-    for name in (0..16)
-        .map(annotations::seat_lease)
-        .chain([annotations::PRIMARY_LEASE.to_owned()])
-    {
-        api.put_object(
-            &format!("/apis/coordination.k8s.io/v1/namespaces/{NS}/leases/{name}"),
-            json!({"metadata":{"name":name,"namespace":NS},"spec":{}}),
-        );
-    }
-    api.put_object(
-        &format!("/apis/apps/v1/namespaces/{NS}/daemonsets/racer"),
-        json!({"metadata":{"name":"racer","uid":DS_UID,"annotations":{crate::control::STATE_UID:SECRET_UID}}}),
-    );
-    api.put_object(
-        &format!("/api/v1/namespaces/{NS}/serviceaccounts/racer"),
-        json!({"metadata":{"name":"racer","uid":SA_UID,"annotations":{crate::control::STATE_UID:SECRET_UID}}}),
-    );
-    for i in 1..=pods {
-        api.put_object(
-            &format!("/api/v1/nodes/n{i}"),
-            json!({"metadata":{"name":format!("n{i}"),"uid":node_uid(i),"annotations":{annotations::BLOCK_DEVICES:"nvme-.*"}}}),
-        );
-        api.put_object(
-            &format!("/api/v1/namespaces/{NS}/pods/p{i}"),
-            json!({
-                "metadata":{"name":format!("p{i}"),"namespace":NS,"uid":pod_uid(i),"creationTimestamp":"2026-01-01T00:00:00Z",
-                    // Serving dataplanes have reported.
-                    "annotations":{annotations::REPORT:"{\"shares\":1,\"rdma_nics\":[]}"},
-                    "ownerReferences":[{"apiVersion":"apps/v1","kind":"DaemonSet","name":"racer","uid":DS_UID,"controller":true}]},
-                "spec":{"nodeName":format!("n{i}"),"serviceAccountName":"racer"},
-                "status":{"podIP":format!("127.0.0.{}", i + 1),"phase":"Running"}
-            }),
-        );
-    }
-    api.on_post(|path, body| {
-        if path != crate::kube::paths::TOKEN_REVIEWS {
-            return None;
-        }
-        let token = body["spec"]["token"].as_str().unwrap_or_default();
-        let payload = token.split('.').nth(1).and_then(|p| URL_SAFE_NO_PAD.decode(p).ok());
-        let Some(claims) = payload.and_then(|p| serde_json::from_slice::<Value>(&p).ok()) else {
-            return Some((201, json!({"status":{"authenticated":false}})));
-        };
-        let i = claims["pod"].as_u64().unwrap_or(0) as usize;
-        Some((201, json!({"status":{
-            "authenticated": true,
-            "audiences": ["racer-control"],
-            "user": {"username": format!("system:serviceaccount:{NS}:racer"), "uid": SA_UID, "extra": {
-                "authentication.kubernetes.io/pod-name": [format!("p{i}")],
-                "authentication.kubernetes.io/pod-uid": [pod_uid(i)],
-                "authentication.kubernetes.io/node-name": [format!("n{i}")],
-                "authentication.kubernetes.io/node-uid": [node_uid(i)],
-            }}
-        }})))
-    });
+    crate::simulation::token(pod, exp)
 }
 
 /// Run the fake API on its own thread.

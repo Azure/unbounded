@@ -945,3 +945,26 @@ fn same_seed_replays_the_same_election() {
         assert_eq!(run(seed_value), run(seed_value), "seed {seed_value}");
     }
 }
+
+/// The API server ends every watch stream (a restart or an idle cut). The
+/// primary watches again: a later Pod change still reaches a publication
+/// well before any periodic resync.
+#[test]
+fn dropped_watches_are_resumed() {
+    let mut w = World::new(1);
+    ready_single(&mut w);
+    assert!(w.run_until(
+        Duration::from_secs(30),
+        |w| w.authority(1).diagnostics().sequence >= 1
+    ));
+    w.run_for(Duration::from_secs(5));
+    let before = w.authority(1).diagnostics().sequence;
+    w.api.drop_watches();
+    w.run_for(Duration::from_secs(1));
+    w.authority_mut(1).report(9, vec![]).unwrap();
+    assert!(w.run_until(Duration::from_secs(20), |w| {
+        w.authority(1).diagnostics().sequence > before
+    }));
+    assert!(w.ready(1));
+    assert!(matches!(w.role(1), Role::Primary(0)));
+}

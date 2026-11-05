@@ -54,6 +54,7 @@ pub mod rules;
 mod seat;
 mod server;
 mod shared;
+pub mod simulation;
 mod sync;
 #[cfg(test)]
 mod tests;

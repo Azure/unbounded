@@ -306,7 +306,6 @@ impl rustls::time_provider::TimeProvider for WallTime {
 }
 
 /// The simulated OS of the current runtime, if it is simulated.
-#[cfg(test)]
 pub fn sim_os() -> Option<racer_io::sim::SimOs> {
     try_current().and_then(|c| c.reactor.sim_os())
 }
