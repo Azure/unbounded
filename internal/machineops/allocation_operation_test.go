@@ -1015,3 +1015,32 @@ func (e *engineHarness) markInProgressWithoutHandle(t *testing.T) {
 	}}
 	require.NoError(t, e.raw.Status().Update(context.Background(), op))
 }
+
+func TestAllocationOperationFinishesTerminalTarget(t *testing.T) {
+	t.Parallel()
+
+	for _, tt := range []struct {
+		target unboundedv1alpha3.OperationPhase
+		phase  unboundedv1alpha3.OperationPhase
+		reason string
+	}{
+		{target: unboundedv1alpha3.OperationPhaseComplete, phase: unboundedv1alpha3.OperationPhaseComplete, reason: "Succeeded"},
+		{target: unboundedv1alpha3.OperationPhaseFailed, phase: unboundedv1alpha3.OperationPhaseFailed, reason: "TargetFailed"},
+	} {
+		t.Run(string(tt.target), func(t *testing.T) {
+			t.Parallel()
+
+			e := newEngineHarness(t, nil)
+			e.markInProgressWithoutHandle(t)
+
+			op := e.operation(allocTestNames.allocateOperation)
+			op.Status.Targets[0].Phase = tt.target
+			op.Status.Targets[0].Message = "finished before the operation recorded it"
+			require.NoError(t, e.raw.Status().Update(context.Background(), op))
+
+			e.reconcile(allocTestNames.allocateOperation)
+			e.requireNoProviderCalls(t)
+			e.requireCompleted(t, allocTestNames.allocateOperation, tt.phase, tt.reason)
+		})
+	}
+}
