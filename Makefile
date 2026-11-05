@@ -368,7 +368,7 @@ help: ## Show this help
 	@echo "  racer-test                       Test the Rust Racer workspace and Go Racer API and wire contracts"
 	@echo "  racer-fmt                        Format the Rust Racer workspace"
 	@echo "  racer-lint                       Check Rust formatting, workspace Clippy, and Racer purity"
-	@echo "  racer-purity-graph               Report pure Racer crates that depend on IO crates (STRICT=1 fails)"
+	@echo "  racer-purity-graph               Fail when a pure Racer crate depends on an IO crate"
 	@echo "  racer-gpu-test                   Build the CUDA shim with kernels and run GPU hardware tests"
 	@echo "  racer-fuzz                       Run each Racer libFuzzer target briefly (FUZZ_SECONDS, default 30)"
 	@echo "  racer-dst                        Run the Racer DST seed set twice each (DST_SEEDS, DST_STEPS, DST_FILTER)"
@@ -588,8 +588,8 @@ RACER_RUST_TOOLCHAIN ?= 1.96.0
 racer-fmt: ## Format the Rust Racer workspace
 	timeout --signal=TERM --kill-after=10s 300s cargo +$(RACER_RUST_TOOLCHAIN) fmt --manifest-path cmd/racer/Cargo.toml --all
 
-racer-purity-graph: ## Report pure Racer crates that depend on IO crates (STRICT=1 fails)
-	timeout --signal=TERM --kill-after=10s 300s python3 hack/scripts/racer-purity-graph.py --manifest-path cmd/racer/Cargo.toml $(if $(STRICT),--strict)
+racer-purity-graph: ## Fail when a pure Racer crate depends on an IO crate
+	timeout --signal=TERM --kill-after=10s 300s python3 hack/scripts/racer-purity-graph.py --manifest-path cmd/racer/Cargo.toml --strict
 
 racer-lint: racer-purity-graph ## Check Rust formatting, workspace Clippy, and Racer purity
 	timeout --signal=TERM --kill-after=10s 300s cargo +$(RACER_RUST_TOOLCHAIN) fmt --manifest-path cmd/racer/Cargo.toml --all --check

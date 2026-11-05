@@ -213,8 +213,8 @@ jobs:
           timeout --signal=TERM --kill-after=10s 1200s cargo +1.96.0 clippy --locked --manifest-path cmd/racer/Cargo.toml --workspace --all-targets -- -D warnings
           timeout --signal=TERM --kill-after=10s 1200s cargo +1.96.0 clippy --locked --manifest-path cmd/racer/Cargo.toml --workspace --all-targets --all-features -- -D warnings
 
-      - name: Report Racer dependency purity
-        run: timeout --signal=TERM --kill-after=10s 300s python3 hack/scripts/racer-purity-graph.py --manifest-path cmd/racer/Cargo.toml
+      - name: Enforce Racer dependency purity
+        run: timeout --signal=TERM --kill-after=10s 300s python3 hack/scripts/racer-purity-graph.py --manifest-path cmd/racer/Cargo.toml --strict
 
       # Allocator simulation is explicit test support (Slab::simulate_in), not a
       # cargo feature. Clippy also type-checks every allocator target.

@@ -11,7 +11,9 @@ import json
 import subprocess
 import sys
 
-PURE = ["racer-core", "racer-flow-core", "topology", "racer-wire", "racer-authority"]
+# racer-authority is not listed: it owns the control-plane server and its IO
+# (racer-io, http1). Its rules module is kept pure by authority/tests/purity.rs.
+PURE = ["racer-core", "racer-flow-core", "topology", "racer-wire"]
 IO = ["racer-io", "http1", "page-alloc", "flow-control", "rdma-verbs", "racer-gpu", "io-uring"]
 
 
