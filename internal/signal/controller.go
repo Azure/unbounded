@@ -611,6 +611,7 @@ func (r *AdmissionReconciler) admitNode(ctx context.Context, node *corev1.Node, 
 	if err != nil {
 		return fmt.Errorf("build immutable CertificationRun execution plan: %w", err)
 	}
+
 	if _, err := buildWorkflow(run); err != nil {
 		deleteErr := r.Delete(context.WithoutCancel(ctx), snapshot)
 
@@ -1883,6 +1884,7 @@ func (r *RunReconciler) finishGrouped(
 	if err != nil {
 		return ctrl.Result{}, err
 	}
+
 	verdict = enforcedVerdict
 	reason = enforcedReason
 
@@ -2743,6 +2745,7 @@ func (r *RunReconciler) qualificationEvidenceIdentity(
 	}
 
 	ends := make([]signalv1.NodeFingerprint, len(run.Spec.Participants))
+
 	participants := make([]signalv1.ParticipantEvidenceIdentity, len(run.Spec.Participants))
 	for index := range run.Spec.Participants {
 		var node corev1.Node
@@ -2759,6 +2762,7 @@ func (r *RunReconciler) qualificationEvidenceIdentity(
 		}
 
 		ends[index] = nodeFingerprint(&node)
+
 		role := signalv1.ParticipantRoleParticipant
 		if index == 0 {
 			role = signalv1.ParticipantRoleRequester
@@ -2785,6 +2789,7 @@ func (r *RunReconciler) qualificationEvidenceIdentity(
 
 		duration := status.FinishedAt.Sub(status.StartedAt.Time)
 		sameBoot := true
+
 		for participantIndex := range starts {
 			if starts[participantIndex].BootID == "" ||
 				ends[participantIndex].BootID == "" ||
@@ -2831,6 +2836,7 @@ func (r *RunReconciler) qualificationEvidenceIdentity(
 
 	runnerImages := make([]string, 0, len(run.Spec.Checks))
 	seenImages := map[string]struct{}{}
+
 	for index := range run.Spec.Checks {
 		image := run.Spec.Checks[index].RunnerImage
 		if _, exists := seenImages[image]; exists {
@@ -2840,6 +2846,7 @@ func (r *RunReconciler) qualificationEvidenceIdentity(
 		seenImages[image] = struct{}{}
 		runnerImages = append(runnerImages, image)
 	}
+
 	sort.Strings(runnerImages)
 
 	for index := range participants {

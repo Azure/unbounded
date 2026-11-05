@@ -111,6 +111,7 @@ func (r *QualificationReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 
 	if !slices.Contains(policy.Finalizers, qualificationPolicyFinalizer) {
 		before := policy.DeepCopy()
+
 		policy.Finalizers = append(policy.Finalizers, qualificationPolicyFinalizer)
 		if err := r.Patch(ctx, &policy, client.MergeFrom(before)); err != nil {
 			return ctrl.Result{}, err
@@ -167,6 +168,7 @@ func (r *QualificationReconciler) finalizePolicy(
 
 	if slices.Contains(policy.Finalizers, qualificationPolicyFinalizer) {
 		before := policy.DeepCopy()
+
 		policy.Finalizers = slices.DeleteFunc(policy.Finalizers, func(value string) bool {
 			return value == qualificationPolicyFinalizer
 		})
@@ -235,7 +237,12 @@ func (r *QualificationReconciler) evaluateLedger(
 ) (signalv1.NodeCertificationStatus, error) {
 	status := ledger.Status
 	status.ObservedGeneration = policy.Generation
-	status.PolicyDigest = policyDigest(policy.Spec)
+
+	digest, err := policyDigest(policy.Spec)
+	if err != nil {
+		return status, err
+	}
+	status.PolicyDigest = digest
 
 	if node.UID != ledger.Spec.NodeUID {
 		status.Phase = signalv1.NodeCertificationPhaseNodeGone
@@ -275,8 +282,10 @@ func (r *QualificationReconciler) evaluateLedger(
 	}
 
 	contributions := make([]qualificationRecord, 0)
+
 	for requirementIndex := range policy.Spec.Requirements {
 		requirement := &policy.Spec.Requirements[requirementIndex]
+
 		accepted, err := r.acceptedRecords(ctx, requirement, node.UID, records)
 		if err != nil {
 			return status, err
@@ -287,6 +296,7 @@ func (r *QualificationReconciler) evaluateLedger(
 			if len(contributions) == 0 {
 				status.Phase = signalv1.NodeCertificationPhasePending
 			}
+
 			status.Reason = fmt.Sprintf("Requirement %s is not yet satisfied", requirement.Name)
 			status.ContributingRuns = recordReferences(contributions)
 			status.PlanDigests = recordPlanDigests(contributions)
@@ -300,6 +310,7 @@ func (r *QualificationReconciler) evaluateLedger(
 	}
 
 	contributions = uniqueRecords(contributions)
+
 	fingerprint, ok := qualificationFingerprint(policy.Spec.InvalidationFingerprintFields, node, contributions)
 	if !ok {
 		status.Phase = signalv1.NodeCertificationPhaseQualifying
@@ -340,11 +351,13 @@ func (r *QualificationReconciler) evaluateLedger(
 	conditionStatus := metav1.ConditionFalse
 	conditionReason := "Current"
 	conditionMessage := "Qualification is outside its renewal window"
+
 	if renewalDue {
 		conditionStatus = metav1.ConditionTrue
 		conditionReason = "RenewalWindow"
 		conditionMessage = "Qualification is inside its renewal window"
 	}
+
 	apimeta.SetStatusCondition(&status.Conditions, metav1.Condition{
 		Type:               "RenewalDue",
 		Status:             conditionStatus,
@@ -369,6 +382,7 @@ func (r *QualificationReconciler) qualificationRecords(
 		if err != nil {
 			return nil, err
 		}
+
 		if !found || !recordIncludesNode(record, nodeUID) {
 			continue
 		}
@@ -388,6 +402,7 @@ func (r *QualificationReconciler) qualificationRecords(
 			run.Spec.PlanDigest == "" || run.Spec.PlanProvenance == nil {
 			continue
 		}
+
 		canonical, err := signalv1.DeriveExecutionPlanDigest(
 			int32(len(run.Spec.Participants)),
 			run.Spec.ScriptBundle.Digest,
@@ -399,6 +414,7 @@ func (r *QualificationReconciler) qualificationRecords(
 			!qualificationIdentityProvenanceValid(run.Status.Evidence.Identity) {
 			continue
 		}
+
 		if _, exists := seen[run.UID]; exists {
 			continue
 		}
@@ -438,6 +454,7 @@ func (r *QualificationReconciler) recordFromEvidence(
 	if err != nil || !found {
 		return qualificationRecord{}, false, err
 	}
+
 	if digest != reference.EvidenceDigest {
 		return qualificationRecord{}, false, nil
 	}
@@ -457,14 +474,17 @@ func (r *QualificationReconciler) recordFromEvidence(
 	if err := json.Unmarshal(data, &document); err != nil {
 		return qualificationRecord{}, false, err
 	}
+
 	if document.RunID != string(reference.UID) || document.QualificationIdentity == nil ||
 		document.QualificationIdentity.PlanDigest != reference.PlanDigest {
 		return qualificationRecord{}, false, nil
 	}
+
 	provenance := signalv1.ExecutionPlanProvenance{
 		AdapterImage:           document.QualificationIdentity.Provenance.AdapterImage,
 		WorkflowTemplateDigest: document.QualificationIdentity.Provenance.WorkflowTemplateDigest,
 	}
+
 	canonical, err := signalv1.DeriveExecutionPlanDigest(
 		int32(len(document.Participants)),
 		document.ScriptBundle.Digest,
@@ -480,6 +500,7 @@ func (r *QualificationReconciler) recordFromEvidence(
 	if err != nil {
 		return qualificationRecord{}, false, err
 	}
+
 	startedAt, err := time.Parse(time.RFC3339Nano, document.StartedAt)
 	if err != nil {
 		return qualificationRecord{}, false, err
@@ -521,27 +542,33 @@ func (r *QualificationReconciler) acceptedRecords(
 	records []qualificationRecord,
 ) ([]qualificationRecord, error) {
 	var currentProfile signalv1.CertificationProfile
+
 	var currentSuite signalv1.CertificationSuite
+
 	if requirement.AcceptedPlans.Mode == signalv1.AcceptedPlanModeCurrent {
 		if err := r.APIReader.Get(ctx, client.ObjectKey{Name: requirement.Profile.Name}, &currentProfile); err != nil {
 			return nil, client.IgnoreNotFound(err)
 		}
+
 		if err := r.APIReader.Get(ctx, client.ObjectKey{Name: currentProfile.Spec.Suite.Name}, &currentSuite); err != nil {
 			return nil, client.IgnoreNotFound(err)
 		}
 	}
 
 	accepted := make([]qualificationRecord, 0)
+
 	for index := range records {
 		record := records[index]
 		if record.Profile.Name != requirement.Profile.Name ||
 			(requirement.Profile.UID != "" && record.Profile.UID != requirement.Profile.UID) {
 			continue
 		}
+
 		if requirement.AcceptedPlans.Mode == signalv1.AcceptedPlanModeListed &&
 			!slices.Contains(requirement.AcceptedPlans.Digests, record.Identity.PlanDigest) {
 			continue
 		}
+
 		if requirement.AcceptedPlans.Mode == signalv1.AcceptedPlanModeCurrent &&
 			(record.Profile.UID != currentProfile.UID ||
 				record.Profile.Generation != currentProfile.Generation ||
@@ -596,12 +623,14 @@ func requirementSatisfied(
 
 	if requirement.Variation.MinRunSeparation != nil {
 		separated := 0
+
 		var previous time.Time
 		for index := range records {
 			if !previous.IsZero() &&
 				records[index].StartedAt.Sub(previous) < requirement.Variation.MinRunSeparation.Duration {
 				continue
 			}
+
 			previous = records[index].StartedAt
 			separated++
 		}
@@ -636,6 +665,7 @@ func qualificationFingerprint(
 	}
 
 	latest := records[len(records)-1]
+
 	participant, found := recordParticipant(latest, node.UID)
 	if !found {
 		return nil, false
@@ -719,6 +749,7 @@ func (r *QualificationReconciler) markGoneLedgers(
 
 		before := ledger.DeepCopy()
 		ledger.Status.Phase = signalv1.NodeCertificationPhaseNodeGone
+
 		ledger.Status.Reason = "The pinned Node UID no longer exists"
 		if err := r.Status().Patch(ctx, ledger, client.MergeFrom(before)); err != nil {
 			return err
@@ -748,6 +779,7 @@ func (r *QualificationReconciler) reconcileQualificationLabel(
 	node *corev1.Node,
 ) error {
 	shouldProject := false
+
 	if r.GateProtected {
 		var ledgers signalv1.NodeCertificationList
 		if err := r.List(
@@ -770,10 +802,16 @@ func (r *QualificationReconciler) reconcileQualificationLabel(
 				if err := r.APIReader.Get(ctx, client.ObjectKey{Name: ledger.Spec.Policy.Name}, &policy); err != nil {
 					continue
 				}
+
+				digest, err := policyDigest(policy.Spec)
+				if err != nil {
+					return err
+				}
+
 				if policy.DeletionTimestamp.IsZero() &&
 					policy.UID == ledger.Spec.Policy.UID &&
 					policy.Generation == ledger.Status.ObservedGeneration &&
-					ledger.Status.PolicyDigest == policyDigest(policy.Spec) &&
+					ledger.Status.PolicyDigest == digest &&
 					ledger.Status.Fingerprint != nil &&
 					ledger.Status.Fingerprint.NodeUID == node.UID &&
 					policy.Spec.GateProjection.Mode == signalv1.GateProjectionProtectedLabel {
@@ -789,6 +827,7 @@ func (r *QualificationReconciler) reconcileQualificationLabel(
 		if err := r.Get(ctx, client.ObjectKey{Name: node.Name}, &current); err != nil {
 			return client.IgnoreNotFound(err)
 		}
+
 		if current.UID != node.UID {
 			return nil
 		}
@@ -797,9 +836,11 @@ func (r *QualificationReconciler) reconcileQualificationLabel(
 		if current.Labels == nil {
 			current.Labels = map[string]string{}
 		}
+
 		if current.Labels[EligibilityLabel] == "production" {
 			delete(current.Labels, EligibilityLabel)
 		}
+
 		if shouldProject {
 			current.Labels[signalv1.NodeQualificationLabel] = signalv1.NodeQualificationValue
 		} else {
@@ -824,10 +865,13 @@ func nodeCertificationName(policyUID, nodeUID types.UID) string {
 	return "nodecert-" + hex.EncodeToString(sum[:16])
 }
 
-func policyDigest(spec signalv1.CertificationPolicySpec) string {
-	data, _ := json.Marshal(spec)
+func policyDigest(spec signalv1.CertificationPolicySpec) (string, error) {
+	data, err := json.Marshal(spec)
+	if err != nil {
+		return "", fmt.Errorf("marshal CertificationPolicy spec: %w", err)
+	}
 
-	return digestBytes(data)
+	return digestBytes(data), nil
 }
 
 func recordIncludesNode(record qualificationRecord, nodeUID types.UID) bool {
@@ -863,6 +907,7 @@ func identityFinishedAt(identity *signalv1.QualificationEvidenceIdentity) time.T
 
 func identityStartedAt(identity *signalv1.QualificationEvidenceIdentity) time.Time {
 	var started time.Time
+
 	for index := range identity.Checks {
 		value := identity.Checks[index].StartedAt.Time
 		if started.IsZero() || value.Before(started) {
@@ -875,11 +920,13 @@ func identityStartedAt(identity *signalv1.QualificationEvidenceIdentity) time.Ti
 
 func uniqueRecords(records []qualificationRecord) []qualificationRecord {
 	seen := map[types.UID]struct{}{}
+
 	result := make([]qualificationRecord, 0, len(records))
 	for index := range records {
 		if _, exists := seen[records[index].Reference.UID]; exists {
 			continue
 		}
+
 		seen[records[index].Reference.UID] = struct{}{}
 		result = append(result, records[index])
 	}
@@ -912,7 +959,9 @@ func recordPlanDigests(records []qualificationRecord) []string {
 			values = append(values, records[index].Identity.PlanDigest)
 		}
 	}
+
 	sort.Strings(values)
+
 	if len(values) > 32 {
 		values = values[len(values)-32:]
 	}

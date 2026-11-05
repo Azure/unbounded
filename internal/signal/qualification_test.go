@@ -61,6 +61,7 @@ func TestQualificationEvidenceRejectsEarlySuccessAndUnsupportedContinuity(t *tes
 	if err != nil {
 		t.Fatalf("qualificationEvidenceIdentity() error = %v", err)
 	}
+
 	if identity == nil || verdict != "Inconclusive" ||
 		!strings.Contains(reason, "MinimumDurationNotMet") {
 		t.Fatalf("early success = identity %#v, verdict %q, reason %q", identity, verdict, reason)
@@ -71,6 +72,7 @@ func TestQualificationEvidenceRejectsEarlySuccessAndUnsupportedContinuity(t *tes
 		MaxSampleGap: &metav1.Duration{Duration: 10 * time.Second},
 	}
 	refreshPlanDigest(run)
+
 	_, verdict, reason, err = reconciler.qualificationEvidenceIdentity(
 		context.Background(),
 		run,
@@ -81,6 +83,7 @@ func TestQualificationEvidenceRejectsEarlySuccessAndUnsupportedContinuity(t *tes
 	if err != nil {
 		t.Fatalf("qualificationEvidenceIdentity() continuity error = %v", err)
 	}
+
 	if verdict != "Inconclusive" || !strings.Contains(reason, "sample-gap evidence") {
 		t.Fatalf("unsupported continuity verdict = %q, reason %q", verdict, reason)
 	}
@@ -126,6 +129,7 @@ func TestQualificationEvidenceRejectsSameBootViolation(t *testing.T) {
 	if err != nil {
 		t.Fatalf("qualificationEvidenceIdentity() error = %v", err)
 	}
+
 	if verdict != "Inconclusive" || !strings.Contains(reason, "same-boot evidence") {
 		t.Fatalf("same-boot violation verdict = %q, reason %q", verdict, reason)
 	}
@@ -163,6 +167,7 @@ func TestQualificationEvidenceDoesNotInferMultiParticipantVerdicts(t *testing.T)
 
 	start := metav1.NewTime(finishedAt.Add(-time.Minute))
 	finish := metav1.NewTime(finishedAt)
+
 	identity, verdict, _, err := reconciler.qualificationEvidenceIdentity(
 		context.Background(),
 		run,
@@ -178,6 +183,7 @@ func TestQualificationEvidenceDoesNotInferMultiParticipantVerdicts(t *testing.T)
 	if err != nil {
 		t.Fatalf("qualificationEvidenceIdentity() error = %v", err)
 	}
+
 	if identity != nil || verdict != "Pass" {
 		t.Fatalf("multi-participant aggregate verdict produced qualification identity %#v, verdict %q", identity, verdict)
 	}
@@ -207,6 +213,7 @@ func TestEvaluateLedgerQualificationAndMigrationRules(t *testing.T) {
 	if err != nil {
 		t.Fatalf("evaluateLedger() error = %v", err)
 	}
+
 	if status.Phase != signalv1.NodeCertificationPhaseQualified ||
 		len(status.ContributingRuns) != 1 ||
 		status.PolicyDigest == "" {
@@ -227,6 +234,7 @@ func TestEvaluateLedgerQualificationAndMigrationRules(t *testing.T) {
 	if err != nil {
 		t.Fatalf("evaluateLedger(old Run) error = %v", err)
 	}
+
 	if status.Phase == signalv1.NodeCertificationPhaseQualified {
 		t.Fatalf("old Run without plan identity received qualification credit: %#v", status)
 	}
@@ -257,6 +265,7 @@ func TestEvaluateLedgerRevocationExpiryAndFingerprintInvalidation(t *testing.T) 
 	if err != nil {
 		t.Fatalf("evaluateLedger(revoke) error = %v", err)
 	}
+
 	if status.Phase != signalv1.NodeCertificationPhaseRevoked {
 		t.Fatalf("phase = %s, want Revoked", status.Phase)
 	}
@@ -271,6 +280,7 @@ func TestEvaluateLedgerRevocationExpiryAndFingerprintInvalidation(t *testing.T) 
 	if err != nil {
 		t.Fatalf("evaluateLedger(expiry) error = %v", err)
 	}
+
 	if status.Phase != signalv1.NodeCertificationPhaseExpired {
 		t.Fatalf("phase = %s, want Expired", status.Phase)
 	}
@@ -289,6 +299,7 @@ func TestEvaluateLedgerRevocationExpiryAndFingerprintInvalidation(t *testing.T) 
 	if err != nil {
 		t.Fatalf("evaluateLedger(fingerprint) error = %v", err)
 	}
+
 	if status.Phase == signalv1.NodeCertificationPhaseQualified {
 		t.Fatalf("changed fingerprint retained qualification: %#v", status)
 	}
@@ -323,6 +334,7 @@ func TestEvaluateLedgerAccumulatesSeparatedRunsAndResetsAfterNonPass(t *testing.
 	if err != nil {
 		t.Fatalf("evaluateLedger(accumulate) error = %v", err)
 	}
+
 	if status.Phase != signalv1.NodeCertificationPhaseQualified ||
 		len(status.ContributingRuns) != 2 {
 		t.Fatalf("accumulated status = %#v", status)
@@ -346,6 +358,7 @@ func TestEvaluateLedgerAccumulatesSeparatedRunsAndResetsAfterNonPass(t *testing.
 	if err != nil {
 		t.Fatalf("evaluateLedger(reset) error = %v", err)
 	}
+
 	if status.Phase == signalv1.NodeCertificationPhaseQualified {
 		t.Fatalf("pre-failure Runs retained credit after Reset: %#v", status)
 	}
@@ -376,6 +389,7 @@ func TestEvaluateLedgerAcceptedPlanAndHelperCredit(t *testing.T) {
 	if err != nil {
 		t.Fatalf("evaluateLedger() error = %v", err)
 	}
+
 	if status.Phase == signalv1.NodeCertificationPhaseQualified {
 		t.Fatalf("helper or unlisted plan received requester credit: %#v", status)
 	}
@@ -394,7 +408,11 @@ func TestProtectedQualificationLabelGateAndMultiplePolicies(t *testing.T) {
 	ledgerB := qualificationLedger(policyB, node)
 	ledgerB.Status.Phase = signalv1.NodeCertificationPhaseQualified
 	ledgerB.Status.ObservedGeneration = policyB.Generation
-	ledgerB.Status.PolicyDigest = policyDigest(policyB.Spec)
+	digest, err := policyDigest(policyB.Spec)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ledgerB.Status.PolicyDigest = digest
 	fingerprint := nodeFingerprint(node)
 	ledgerB.Status.Fingerprint = &fingerprint
 	expires := metav1.NewTime(now.Add(time.Hour))
@@ -419,10 +437,12 @@ func TestProtectedQualificationLabelGateAndMultiplePolicies(t *testing.T) {
 	if err := reconciler.reconcileQualificationLabel(context.Background(), node); err != nil {
 		t.Fatalf("reconcileQualificationLabel() error = %v", err)
 	}
+
 	var current corev1.Node
 	if err := kube.Get(context.Background(), types.NamespacedName{Name: node.Name}, &current); err != nil {
 		t.Fatal(err)
 	}
+
 	if current.Labels[signalv1.NodeQualificationLabel] != signalv1.NodeQualificationValue {
 		t.Fatalf("one revoked policy removed another policy's backing label: %#v", current.Labels)
 	}
@@ -430,12 +450,15 @@ func TestProtectedQualificationLabelGateAndMultiplePolicies(t *testing.T) {
 	if err := kube.Delete(context.Background(), ledgerB); err != nil {
 		t.Fatal(err)
 	}
+
 	if err := reconciler.reconcileQualificationLabel(context.Background(), &current); err != nil {
 		t.Fatalf("reconcileQualificationLabel(deleted ledger) error = %v", err)
 	}
+
 	if err := kube.Get(context.Background(), types.NamespacedName{Name: node.Name}, &current); err != nil {
 		t.Fatal(err)
 	}
+
 	if _, exists := current.Labels[signalv1.NodeQualificationLabel]; exists {
 		t.Fatalf("deleted ledger left an unbacked qualification label")
 	}
@@ -443,20 +466,25 @@ func TestProtectedQualificationLabelGateAndMultiplePolicies(t *testing.T) {
 	if current.Labels == nil {
 		current.Labels = map[string]string{}
 	}
+
 	current.Labels[signalv1.NodeQualificationLabel] = signalv1.NodeQualificationValue
 	if err := kube.Update(context.Background(), &current); err != nil {
 		t.Fatal(err)
 	}
+
 	reconciler.GateProtected = false
 	if err := reconciler.reconcileQualificationLabel(context.Background(), &current); err != nil {
 		t.Fatalf("reconcileQualificationLabel(disabled) error = %v", err)
 	}
+
 	if err := kube.Get(context.Background(), types.NamespacedName{Name: node.Name}, &current); err != nil {
 		t.Fatal(err)
 	}
+
 	if _, exists := current.Labels[signalv1.NodeQualificationLabel]; exists {
 		t.Fatalf("disabled protection gate retained %q", signalv1.NodeQualificationLabel)
 	}
+
 	if signalv1.NodeQualificationLabel != "node-restriction.kubernetes.io/project-signal-qualified" {
 		t.Fatalf("qualification label key = %q", signalv1.NodeQualificationLabel)
 	}
@@ -481,6 +509,7 @@ func TestRunProjectionDoesNotGrantProductionEligibility(t *testing.T) {
 	if err := kube.Get(context.Background(), types.NamespacedName{Name: node.Name}, &current); err != nil {
 		t.Fatal(err)
 	}
+
 	if _, exists := current.Labels[EligibilityLabel]; exists {
 		t.Fatalf("terminal Run retained direct eligibility projection: %#v", current.Labels)
 	}
@@ -503,6 +532,7 @@ func qualificationScheme(t *testing.T) *runtime.Scheme {
 	if err := corev1.AddToScheme(scheme); err != nil {
 		t.Fatal(err)
 	}
+
 	if err := signalv1.AddToScheme(scheme); err != nil {
 		t.Fatal(err)
 	}
@@ -654,6 +684,7 @@ func qualificationRun(
 	if err != nil {
 		panic(err)
 	}
+
 	run.Spec.PlanDigest = planDigest
 	run.Status.Evidence.Identity.PlanDigest = planDigest
 
@@ -674,6 +705,7 @@ func refreshPlanDigest(run *signalv1.CertificationRun) {
 	if err != nil {
 		panic(err)
 	}
+
 	run.Spec.PlanDigest = planDigest
 	run.Status.Evidence.Identity.PlanDigest = planDigest
 }

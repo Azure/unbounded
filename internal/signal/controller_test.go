@@ -328,6 +328,7 @@ func TestSuiteSnapshotAndRunPinning(t *testing.T) {
 
 	node := &corev1.Node{ObjectMeta: metav1.ObjectMeta{Name: "node"}}
 	participants := []signalv1.Participant{{NodeName: node.Name, NodeUID: types.UID("node-uid")}}
+
 	run, err := newCertificationRun(
 		"run",
 		reconciler.Namespace,
@@ -359,6 +360,7 @@ func TestSuiteSnapshotAndRunPinning(t *testing.T) {
 		run.Spec.Checks[1].Script.Digest != digestString(scripts["second.sh"]) {
 		t.Fatalf("Run did not retain resolved script/check snapshots: %#v", run.Spec)
 	}
+
 	if run.Spec.PlanDigest == "" || run.Spec.PlanProvenance == nil {
 		t.Fatalf("Run omitted immutable execution plan identity: %#v", run.Spec)
 	}
