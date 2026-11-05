@@ -100,3 +100,103 @@ fn failover_repeats_are_skips_or_their_orphans() {
         assert_eq!(n(&repeats["held"]["missed"]), 0, "{o}");
     }
 }
+
+/// racer-sim `churn_grows_the_data_plane`. The Model has no `membership_adoptions` counter;
+/// a node adopts exactly what its client applied (`dst/MODEL.md`, Combined scenarios).
+#[test]
+fn churn_grows_the_data_plane() {
+    let r = quick("full-churn", 320, 400, 1, 0.1);
+    assert_clean(&r);
+    assert!(
+        counter(&r, "membership_publications") >= 4,
+        "{}",
+        r["metrics"]["counters"]
+    );
+    assert!(ctl_counter(&r, "ctl_pods_removed") > 0);
+    assert!(counter(&r, "reads_completed") >= 1);
+}
+
+/// racer-sim `lagging_clients_skew_the_data_plane`.
+#[test]
+fn lagging_clients_skew_the_data_plane() {
+    let r = quick("full-lagging", 300, 600, 1, 0.2);
+    assert_clean(&r);
+    assert!(ctl_counter(&r, "ctl_unreachable") > 0);
+    assert!(counter(&r, "reads_completed") >= 1);
+    let incompatible = r["metrics"]["errors"]["IncompatibleMembership"]
+        .as_u64()
+        .unwrap_or(0);
+    assert!(
+        counter(&r, "stale_membership_replies") + incompatible > 0,
+        "{}",
+        r["metrics"]["counters"]
+    );
+}
+
+/// racer-sim `data_faults_join_the_control_plans`: the combined plans carry data-plane faults
+/// by default and `"combined_faults"` turns them off. racer-sim's explicit `faults` list has no
+/// Model counterpart (scenario faults are set in code).
+#[test]
+fn data_faults_join_the_control_plans() {
+    use racer_dst::scenarios::{DataFaults, combined_with};
+    let faults = DataFaults::default();
+    let failover = combined_with("full-failover", 200, 0.2, Some(300), &faults);
+    let spec = failover.model.as_ref().unwrap();
+    assert_eq!(spec.site_cuts.len(), 1);
+    assert_eq!(spec.origin_bursts.len(), 2);
+    // Every 100th node of 1,000 is slowed 8x, and later restored.
+    let lagging = combined_with("full-lagging", 1000, 0.2, Some(300), &faults);
+    assert_eq!(lagging.faults.len(), 20);
+    let mut off = faults;
+    off.apply_json(&serde_json::json!({"enabled": false}))
+        .unwrap();
+    let quiet = combined_with("full-failover", 200, 0.2, Some(300), &off);
+    let spec = quiet.model.as_ref().unwrap();
+    assert!(spec.site_cuts.is_empty() && spec.origin_bursts.is_empty());
+    assert!(
+        off.apply_json(&serde_json::json!({"slow_factor": 0}))
+            .is_err()
+    );
+    assert!(
+        DataFaults::default()
+            .apply_json(&serde_json::json!({"nope": 1}))
+            .is_err()
+    );
+
+    let r_cut = quick("full-failover", 200, 300, 1, 0.2);
+    assert_clean(&r_cut);
+    assert!(counter(&r_cut, "origin_5xx") >= 1);
+    assert!(counter(&r_cut, "link_failures") >= 1);
+    let (outcome, r) = model::run(&quiet, Choices::seeded(1));
+    assert_eq!(outcome.failure, None);
+    assert_eq!(counter(&r, "origin_5xx"), 0);
+    // Links to crashed Pods still fail; the site cut's do not.
+    let (cut, quiet) = (
+        counter(&r_cut, "link_failures"),
+        counter(&r, "link_failures"),
+    );
+    assert!(
+        quiet < cut,
+        "{quiet} link failures without the cut, {cut} with it"
+    );
+}
+
+/// racer-sim `replays_exactly`.
+#[test]
+fn replays_exactly() {
+    let run = |name: &str, seed: u64| {
+        let scenario = scenarios::combined(name, 80, 0.1, Some(120));
+        model::run(&scenario, Choices::seeded(seed))
+    };
+    for name in [
+        "full-cold-start",
+        "full-failover",
+        "full-churn",
+        "full-lagging",
+    ] {
+        let ((a, ra), (b, rb)) = (run(name, 3), run(name, 3));
+        assert_eq!(a.trace, b.trace, "{name}");
+        assert_eq!(ra["metrics"], rb["metrics"], "{name}");
+    }
+    assert_ne!(run("full-churn", 3).0.trace, run("full-churn", 4).0.trace);
+}
