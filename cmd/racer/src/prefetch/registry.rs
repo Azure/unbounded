@@ -202,6 +202,8 @@ pub enum PutCheck {
 /// Ticket and unit state for one node.
 pub struct Registry {
     config: Config,
+    /// Wall time for ticket timestamps.
+    clock: racer_io::Clock,
     tickets: BTreeMap<TicketKey, Ticket>,
     units: HashMap<UnitKey, Unit>,
     rotation: [VecDeque<TicketKey>; 3],
@@ -213,16 +215,18 @@ pub struct Registry {
 }
 
 /// Wall-clock milliseconds for status timestamps.
-pub fn wall_ms() -> u64 {
-    uring_runtime::environment::wall_now()
+pub fn wall_ms(clock: &racer_io::Clock) -> u64 {
+    clock
+        .wall_now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |d| d.as_millis().min(u128::from(u64::MAX)) as u64)
 }
 
 impl Registry {
-    pub fn new(config: Config, seed: u64) -> Self {
+    pub fn new(config: Config, seed: u64, clock: racer_io::Clock) -> Self {
         Self {
             config,
+            clock,
             tickets: BTreeMap::new(),
             units: HashMap::new(),
             rotation: Default::default(),
@@ -342,7 +346,7 @@ impl Registry {
                 }
                 if !ticket.released {
                     ticket.expires_at = now + Duration::from_secs(ticket.ttl_seconds);
-                    ticket.expires_at_ms = wall_ms() + ticket.ttl_seconds * 1000;
+                    ticket.expires_at_ms = wall_ms(&self.clock) + ticket.ttl_seconds * 1000;
                 }
                 return Ok(PutCheck::Replay(Box::new(
                     self.status(cache, id, None, None)?,
@@ -402,7 +406,7 @@ impl Registry {
         }
         let key = (cache.clone(), id.to_owned());
         self.check_limits(&key)?;
-        let wall = wall_ms();
+        let wall = wall_ms(&self.clock);
         let created = !self.tickets.contains_key(&key);
         if let Some(old) = self.tickets.get(&key) {
             let priority = old.priority;
@@ -1020,7 +1024,7 @@ impl Registry {
         let record = !ticket.finished_recorded;
         ticket.canceled = Some(reason);
         ticket.finished_recorded = true;
-        ticket.updated_at_ms = wall_ms();
+        ticket.updated_at_ms = wall_ms(&self.clock);
         let priority = ticket.priority;
         if record {
             self.finished.push((priority, Outcome::Canceled));

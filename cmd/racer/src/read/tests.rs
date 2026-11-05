@@ -3269,7 +3269,7 @@ mod timeouts {
     fn subscription_stall_must_leave_time_for_fixed_page_fallback() {
         let mut f = Fixture::new(Some(1), 1, false);
         f.peers.fenced.set(false);
-        let scheduler = crate::read::range_stream::Scheduler::new(1);
+        let scheduler = crate::read::range_stream::Scheduler::new(1, crate::test_support::ctx());
         let demand =
             racer_core::subscriptions::Demand::new(vec![flow_control::subscriptions::Interval {
                 start: 0,
@@ -3394,7 +3394,7 @@ mod timeouts {
         use crate::read::candidates::ProviderSelection;
         let mut f = Fixture::new(Some(1), 0, false);
         f.peers.refuse_flights.set(true);
-        let scheduler = crate::read::range_stream::Scheduler::new(1);
+        let scheduler = crate::read::range_stream::Scheduler::new(1, crate::test_support::ctx());
         let demand =
             racer_core::subscriptions::Demand::new(vec![flow_control::subscriptions::Interval {
                 start: 0,
@@ -3468,7 +3468,7 @@ mod timeouts {
         // Every Subscribe reaches the provider through a relay that signs
         // `Unavailable` for the dropped exchange.
         f.peers.relay_unavailable.set(true);
-        let scheduler = crate::read::range_stream::Scheduler::new(1);
+        let scheduler = crate::read::range_stream::Scheduler::new(1, crate::test_support::ctx());
         let demand =
             racer_core::subscriptions::Demand::new(vec![flow_control::subscriptions::Interval {
                 start: 0,
@@ -3539,7 +3539,7 @@ mod timeouts {
     fn subscription_parent_cancellation_waits_for_fence_without_fallback() {
         let mut f = Fixture::new(Some(1), 1, false);
         f.peers.fenced.set(false);
-        let scheduler = crate::read::range_stream::Scheduler::new(1);
+        let scheduler = crate::read::range_stream::Scheduler::new(1, crate::test_support::ctx());
         let demand =
             racer_core::subscriptions::Demand::new(vec![flow_control::subscriptions::Interval {
                 start: 0,

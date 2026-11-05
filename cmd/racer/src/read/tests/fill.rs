@@ -3465,6 +3465,7 @@ fn fixture_with_caches(
             Arc::new(WorkerMap::new(vec![worker]).unwrap()),
             vec![worker],
             16,
+            crate::test_support::ctx(),
         )
         .unwrap(),
     );

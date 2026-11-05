@@ -274,6 +274,7 @@ impl SubscriptionFixture {
                 Arc::new(WorkerMap::new(vec![WorkerId(0)]).unwrap()),
                 vec![WorkerId(0)],
                 16,
+                racer_io::WorkerCtx::host(),
             )
             .unwrap(),
         );

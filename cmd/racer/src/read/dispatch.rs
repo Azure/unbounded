@@ -106,6 +106,8 @@ pub struct WorkerDirectory {
     spill: std::sync::Mutex<super::spill::Config>,
     pub(crate) subscriptions: Arc<super::range_stream::Scheduler>,
     map: Arc<WorkerMap>,
+    /// Node-wide time and entropy.
+    ctx: racer_io::WorkerCtx,
     mailboxes: Vec<Arc<Mailbox>>,
     sequence: AtomicU64,
 }
@@ -360,7 +362,12 @@ impl WorkerDirectory {
         });
         SimulationLocal { key, previous }
     }
-    pub fn new(map: Arc<WorkerMap>, workers: Vec<WorkerId>, capacity: usize) -> Result<Self> {
+    pub fn new(
+        map: Arc<WorkerMap>,
+        workers: Vec<WorkerId>,
+        capacity: usize,
+        ctx: racer_io::WorkerCtx,
+    ) -> Result<Self> {
         if workers.is_empty()
             || capacity == 0
             || workers
@@ -371,12 +378,14 @@ impl WorkerDirectory {
             return Err(Error::InvalidConfiguration);
         }
         Ok(Self {
-            prefetch: Arc::new(crate::prefetch::service::Prefetch::new()),
+            prefetch: Arc::new(crate::prefetch::service::Prefetch::new(ctx.clone())),
             spill: std::sync::Mutex::new(super::spill::Config::default()),
             subscriptions: super::range_stream::Scheduler::new(
                 capacity.saturating_mul(workers.len()),
+                ctx.clone(),
             ),
             map,
+            ctx,
             mailboxes: workers
                 .into_iter()
                 .map(|worker| {
@@ -543,8 +552,7 @@ impl WorkerDirectory {
             let Ok(permit) = uring_runtime::drivers::reserve() else {
                 continue;
             };
-            // MIGRATION: the directory receives a WorkerCtx in a later step.
-            let clock = crate::runtime::ambient_ctx().clock;
+            let clock = self.ctx.clock.clone();
             let Ok(scope) = RequestScope::with_clock(
                 request,
                 clock.now() + std::time::Duration::from_secs(30),
@@ -1444,6 +1452,7 @@ mod tests {
                 Arc::new(WorkerMap::new(workers.clone()).unwrap()),
                 workers,
                 4,
+                crate::test_support::ctx(),
             )
             .unwrap(),
         );
@@ -1470,6 +1479,7 @@ mod tests {
                 Arc::new(WorkerMap::new(workers.clone()).unwrap()),
                 workers,
                 1,
+                crate::test_support::ctx(),
             )
             .unwrap(),
         );
@@ -1496,6 +1506,7 @@ mod tests {
                 Arc::new(WorkerMap::new(workers.clone()).unwrap()),
                 workers,
                 4,
+                crate::test_support::ctx(),
             )
             .unwrap(),
         );
@@ -1639,6 +1650,7 @@ mod tests {
             Arc::new(WorkerMap::new(workers.clone()).unwrap()),
             workers,
             capacity,
+            crate::test_support::ctx(),
         )
         .unwrap();
         for mailbox in &directory.mailboxes {

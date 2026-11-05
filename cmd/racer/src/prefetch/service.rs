@@ -116,29 +116,17 @@ pub struct Prefetch {
     waiters: Mutex<Waiters>,
     next_wake: Mutex<Option<Instant>>,
     metrics: OnceLock<Arc<PrefetchMetrics>>,
-}
-
-impl Default for Prefetch {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-fn seed() -> u64 {
-    let mut bytes = [0; 8];
-    let _ = uring_runtime::environment::fill_random(&mut bytes);
-    u64::from_le_bytes(bytes)
-}
-
-fn now() -> Instant {
-    uring_runtime::environment::now()
+    /// Node-wide time and entropy.
+    ctx: racer_io::WorkerCtx,
 }
 
 impl Prefetch {
-    pub fn new() -> Self {
+    pub fn new(ctx: racer_io::WorkerCtx) -> Self {
         let config = Config::default();
+        // A failed draw keeps a fixed scheduler seed; it only orders ties.
+        let seed = ctx.rng.next_u64().unwrap_or_default();
         Self {
-            registry: Mutex::new(Registry::new(config, seed())),
+            registry: Mutex::new(Registry::new(config, seed, ctx.clock.clone())),
             owner: Mutex::new(OwnerBudget::new(
                 config.concurrent_fills as usize,
                 config.origin_bytes_per_sec,
@@ -151,10 +139,27 @@ impl Prefetch {
             waiters: Mutex::new(Waiters::default()),
             next_wake: Mutex::new(None),
             metrics: OnceLock::new(),
+            ctx,
         }
     }
 
     /// Apply `RACER_PREFETCH_*` settings.
+    fn now(&self) -> Instant {
+        self.ctx.now()
+    }
+
+    /// A random request identifier; a failed draw yields the zero identifier.
+    fn request_id(&self) -> RequestId {
+        let mut bytes = [0; 16];
+        let _ = self.ctx.rng.fill(&mut bytes);
+        RequestId(bytes)
+    }
+
+    /// A fresh scope on this node's clock.
+    fn scope(&self, deadline: Instant) -> Result<RequestScope> {
+        RequestScope::with_clock(self.request_id(), deadline, self.ctx.clock.clone())
+    }
+
     pub fn configure(&self, config: Config) -> Result<()> {
         config.validate()?;
         self.registry.lock().unwrap().configure(config);
@@ -233,7 +238,7 @@ impl Prefetch {
     /// Called from every worker's poll: expire tickets and wake the pump and
     /// waiters when a deadline passed.
     pub fn tick(&self) {
-        let now = now();
+        let now = self.now();
         let due = self
             .next_wake
             .try_lock()
@@ -264,7 +269,7 @@ impl Prefetch {
             return;
         }
         let mut registry = self.registry.lock().unwrap();
-        registry.cancel_caches(caches, Reason::Passthrough, now());
+        registry.cancel_caches(caches, Reason::Passthrough, self.now());
         self.changed(&mut registry);
         drop(registry);
         self.wake_waiters();
@@ -273,7 +278,7 @@ impl Prefetch {
     /// Cancel tickets of caches that are no longer published.
     pub fn retain_caches(&self, keep: impl Fn(&CacheId) -> bool) {
         let mut registry = self.registry.lock().unwrap();
-        registry.retain_caches(keep, now());
+        registry.retain_caches(keep, self.now());
         self.changed(&mut registry);
         drop(registry);
         self.wake_waiters();
@@ -297,7 +302,7 @@ impl Prefetch {
             self.promoted
                 .lock()
                 .unwrap()
-                .insert(page.clone(), (priority, now()));
+                .insert(page.clone(), (priority, self.now()));
         }
         promoted
     }
@@ -309,7 +314,7 @@ impl Prefetch {
         bytes: u64,
         priority: Priority,
     ) -> std::result::Result<OwnerFill<'_>, PageResult> {
-        let now = now();
+        let now = self.now();
         let mut owner = self.owner.lock().unwrap();
         let expired = owner.expire(now);
         let admitted = owner.admit(page.clone(), bytes, now);
@@ -361,7 +366,7 @@ impl Prefetch {
         if let Some((priority, at)) = self.promoted.lock().unwrap().remove(page)
             && let Some(metrics) = self.metrics()
         {
-            metrics.demand_wait(priority, now().saturating_duration_since(at));
+            metrics.demand_wait(priority, self.now().saturating_duration_since(at));
         }
     }
 
@@ -484,12 +489,6 @@ fn origin_context(object: &ObjectId, context: &UnitContext) -> Result<OriginCont
             .map(|a| Authorization::from_header(a))
             .transpose()?,
     })
-}
-
-fn request_id() -> RequestId {
-    let mut bytes = [0; 16];
-    let _ = uring_runtime::environment::fill_random(&mut bytes);
-    RequestId(bytes)
 }
 
 fn page_length(length: u64, page: u64) -> u64 {
@@ -625,11 +624,8 @@ async fn dispatch(
             .map(|&page| (unit(page), outcome, None))
             .collect::<Vec<_>>()
     };
-    let Ok(scope) = RequestScope::with_clock(
-        request_id(),
-        now() + DISPATCH_TIMEOUT,
-        crate::runtime::ambient_ctx().clock,
-    ) else {
+    let prefetch = &local.prefetch_directory().prefetch;
+    let Ok(scope) = prefetch.scope(prefetch.now() + DISPATCH_TIMEOUT) else {
         return all(UnitOutcome::Retry(RetryKind::Unavailable, None));
     };
     let membership = match local.cache_membership(&version.object.cache) {
@@ -740,7 +736,7 @@ async fn run_pump(prefetch: Arc<Prefetch>, local: Rc<Coordinator>) {
     let max_pages = (prefetch.config().concurrent_fills as usize)
         .clamp(1, racer_core::prefetch::MAX_OPERATION_PAGES);
     loop {
-        let now = now();
+        let now = prefetch.now();
         let draining = prefetch.draining();
         if let Some(membership) = local.current_membership() {
             if membership_version.is_some_and(|v| v != membership.version) {
@@ -781,7 +777,7 @@ async fn run_pump(prefetch: Arc<Prefetch>, local: Rc<Coordinator>) {
         })
         .await;
         if let Some(results) = next {
-            let now = uring_runtime::environment::now();
+            let now = prefetch.now();
             let membership = local.current_membership();
             prefetch.with_registry(|registry| {
                 let mut completed = Vec::with_capacity(results.len());
@@ -828,11 +824,8 @@ async fn resolve(
             })
         })
         .collect();
-    let scope = RequestScope::with_clock(
-        request_id(),
-        now() + RESOLVE_TIMEOUT,
-        crate::runtime::ambient_ctx().clock,
-    );
+    let prefetch = &local.prefetch_directory().prefetch;
+    let scope = prefetch.scope(prefetch.now() + RESOLVE_TIMEOUT);
     let mut resolved: Vec<Option<Resolution>> = vec![None; distinct.len()];
     if let Ok(scope) = &scope {
         let mut work = futures::stream::iter(distinct.iter().enumerate().map(
@@ -912,9 +905,7 @@ async fn coverage(
     units: Vec<UnitKey>,
     deadline: Instant,
 ) -> u64 {
-    let Ok(scope) =
-        RequestScope::with_clock(request_id(), deadline, crate::runtime::ambient_ctx().clock)
-    else {
+    let Ok(scope) = local.prefetch_directory().prefetch.scope(deadline) else {
         return 0;
     };
     let me = local.local_node();
@@ -1033,7 +1024,7 @@ async fn handle_inner(
             Ok(json(200, &api::List { prefetches }))
         }
         PrefetchRequest::Delete { id } => {
-            let status = prefetch.with_registry(|r| r.delete(cache, &id, now()))?;
+            let status = prefetch.with_registry(|r| r.delete(cache, &id, prefetch.now()))?;
             prefetch.kick();
             prefetch.wake_waiters();
             Ok(json(200, &status))
@@ -1054,15 +1045,16 @@ async fn handle_inner(
             let config = prefetch.config();
             let spec = api::parse_spec(body, authorization.is_some(), &config)?;
             let authorization = authorization.map(|a| Arc::new(Zeroizing::new(a.to_vec())));
-            if let PutCheck::Replay(status) =
-                prefetch.with_registry(|r| r.check_put(cache, &id, &spec, &authorization, now()))?
+            if let PutCheck::Replay(status) = prefetch
+                .with_registry(|r| r.check_put(cache, &id, &spec, &authorization, prefetch.now()))?
             {
                 return Ok(json(200, &*status));
             }
             let resolved = resolve(local, cache, &membership, &spec, authorization.as_ref()).await;
             scope.check().map_err(|_| unavailable("request expired"))?;
-            let (status, body) = prefetch
-                .with_registry(|r| r.apply_put(cache, &id, spec, resolved, authorization, now()))?;
+            let (status, body) = prefetch.with_registry(|r| {
+                r.apply_put(cache, &id, spec, resolved, authorization, prefetch.now())
+            })?;
             if let Ok(local) = directory.local_coordinator() {
                 prefetch.ensure_pump(local);
             }
@@ -1083,7 +1075,7 @@ async fn get(
     // Validate the id and cursor before waiting.
     prefetch.with_registry(|r| r.status(cache, id, query.refs, query.cursor.as_deref()))?;
     if let Some(wait) = query.wait.filter(|w| !w.is_zero()) {
-        let until = now() + wait;
+        let until = prefetch.now() + wait;
         prefetch.wake_at(until);
         let cancellation = scope.cancellation.subscribe().ok();
         let waiter = prefetch.waiter();
@@ -1098,7 +1090,7 @@ async fn get(
                 .unwrap()
                 .settled(cache, id)
                 .unwrap_or(true);
-            if settled || now() >= until || scope.check().is_err() || prefetch.draining() {
+            if settled || prefetch.now() >= until || scope.check().is_err() || prefetch.draining() {
                 Poll::Ready(())
             } else {
                 Poll::Pending
@@ -1112,14 +1104,14 @@ async fn get(
         let units = prefetch.with_registry(|r| r.desired(cache, id))?;
         // Bound probing by the client request deadline so a slow or
         // unresponsive owner cannot consume the budget needed to answer.
-        let deadline = coverage_deadline(now(), scope.deadline.0);
+        let deadline = coverage_deadline(prefetch.now(), scope.deadline.0);
         let resident = match (local.cache_membership(cache), deadline) {
             (Ok(membership), Some(deadline)) => coverage(local, &membership, units, deadline).await,
             _ => 0,
         };
         status.coverage = Some(Coverage {
             resident_bytes: resident,
-            observed_at_ms: super::registry::wall_ms(),
+            observed_at_ms: super::registry::wall_ms(&prefetch.ctx.clock),
         });
     }
     Ok(json(200, &status))

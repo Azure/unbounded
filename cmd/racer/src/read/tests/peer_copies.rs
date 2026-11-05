@@ -865,7 +865,8 @@ fn invalid_signed_selection_falls_back_without_resetting_acquisition_budget() {
                 flow_control::subscriptions::Interval { start: 0, end: 1 },
             ])
             .unwrap();
-            let scheduler = crate::read::range_stream::Scheduler::new(1);
+            let scheduler =
+                crate::read::range_stream::Scheduler::new(1, crate::test_support::ctx());
             let selection = crate::read::range_stream::Selection::for_test(
                 &scheduler,
                 f.page.version.clone(),
@@ -927,7 +928,7 @@ fn open_subscription_selects_no_peers_after_switching_to_passthrough_local() {
         }])
         .unwrap();
     // The subscription and its selection exist before the switch.
-    let scheduler = crate::read::range_stream::Scheduler::new(1);
+    let scheduler = crate::read::range_stream::Scheduler::new(1, crate::test_support::ctx());
     let selection =
         crate::read::range_stream::Selection::for_test(&scheduler, f.page.version.clone(), demand);
     f.set_mode(racer_control_wire::CacheMode::PassthroughLocal);

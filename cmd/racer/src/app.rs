@@ -199,17 +199,17 @@ impl Default for NodeState {
         // Production replaces the default node before running workers; tests
         // share the selected world's clock.
         #[cfg(test)]
-        let clock = crate::test_support::clock();
+        let ctx = crate::test_support::ctx();
         #[cfg(not(test))]
-        let clock = racer_io::Clock::host();
-        Self::new(vec![WorkerId(0), WorkerId(1)], 16, clock).expect("valid default worker map")
+        let ctx = racer_io::WorkerCtx::host();
+        Self::new(vec![WorkerId(0), WorkerId(1)], 16, ctx).expect("valid default worker map")
     }
 }
 
 impl NodeState {
     /// Allocate shared state with default peer admission for the registered workers.
-    fn new(workers: Vec<WorkerId>, capacity: usize, clock: racer_io::Clock) -> Result<Self> {
-        Self::with_peer_admission(workers, capacity, Default::default(), clock)
+    fn new(workers: Vec<WorkerId>, capacity: usize, ctx: racer_io::WorkerCtx) -> Result<Self> {
+        Self::with_peer_admission(workers, capacity, Default::default(), ctx)
     }
 
     /// Allocate node-wide authorities and partitioned metrics for the worker set.
@@ -217,8 +217,9 @@ impl NodeState {
         workers: Vec<WorkerId>,
         capacity: usize,
         peer_config: crate::peer::Config,
-        clock: racer_io::Clock,
+        ctx: racer_io::WorkerCtx,
     ) -> Result<Self> {
+        let clock = ctx.clock.clone();
         let count = workers.len();
         let map = Arc::new(WorkerMap::new(workers.clone())?);
         let metrics = crate::telemetry::Metrics::for_workers(count)?;
@@ -243,7 +244,7 @@ impl NodeState {
             keys: Arc::new(KeyEpochs::with_clock(crate::enrollment::wall_clock(&clock))),
             control_worker: WorkerId(0),
             cache_rollout: controlplane::Rollout::new(workers.iter().copied()),
-            workers: Arc::new(WorkerDirectory::new(map, workers, capacity)?),
+            workers: Arc::new(WorkerDirectory::new(map, workers, capacity, ctx)?),
             count,
             prepared: AtomicUsize::new(0),
             checkpoint: Mutex::new(CheckpointCut::default()),
@@ -477,7 +478,7 @@ impl Application {
             plan.pairs.iter().map(|p| p.worker).collect(),
             self.limits.queue_entries.get(),
             self.config.peer_admission,
-            racer_io::Clock::host(),
+            racer_io::WorkerCtx::host(),
         )?;
         node.azure = crate::origin::azure::AzureNode::new(&self.config.origin);
         self.node = Arc::new(node);

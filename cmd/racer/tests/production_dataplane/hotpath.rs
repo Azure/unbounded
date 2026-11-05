@@ -508,7 +508,9 @@ fn shared_directory_routes_cold_and_offline_reads_to_both_owners() {
         resources: Resources::new(budgets(), ids.clone(), 1).unwrap(),
         root: scratch.path.clone(),
         commands: Mutex::new(receivers),
-        directory: Arc::new(WorkerDirectory::new(map, ids, 256).unwrap()),
+        directory: Arc::new(
+            WorkerDirectory::new(map, ids, 256, racer_io::WorkerCtx::host()).unwrap(),
+        ),
         slab_bytes: 256 * MIB,
     });
     let mut group = WorkerGroup::new(plan);
@@ -598,7 +600,9 @@ fn warm_page_allocations() {
         resources: Resources::new(budgets(), ids.clone(), 1).unwrap(),
         root: scratch.path.clone(),
         commands: Mutex::new(BTreeMap::from([(0, receive)])),
-        directory: Arc::new(WorkerDirectory::new(map, ids, 256).unwrap()),
+        directory: Arc::new(
+            WorkerDirectory::new(map, ids, 256, racer_io::WorkerCtx::host()).unwrap(),
+        ),
         slab_bytes: 256 * MIB,
     });
     let mut group = WorkerGroup::new(plan);
@@ -668,7 +672,8 @@ fn run_case(root: &std::path::Path, default: &AffinityPlan, mode: &str, concurre
     let ids: Vec<_> = default.pairs.iter().map(|pair| pair.worker).collect();
     let map = Arc::new(WorkerMap::new(ids.clone()).unwrap());
     let keys = balanced_keys(&map, workers, REQUESTS + workers);
-    let directory = Arc::new(WorkerDirectory::new(map, ids.clone(), 256).unwrap());
+    let directory =
+        Arc::new(WorkerDirectory::new(map, ids.clone(), 256, racer_io::WorkerCtx::host()).unwrap());
     let mut receivers = BTreeMap::new();
     let commands: Vec<_> = ids
         .iter()

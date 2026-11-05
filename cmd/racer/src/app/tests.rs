@@ -371,7 +371,7 @@ impl ControlFixture {
             NodeState::new(
                 (0..workers).map(WorkerId).collect(),
                 64,
-                crate::test_support::clock(),
+                crate::test_support::ctx(),
             )
             .unwrap(),
         );
@@ -2588,8 +2588,7 @@ fn removal_publication_finishes_locally_after_controller_disappears() {
     };
     *fixture.publication.lock().unwrap() =
         Some(publication(&config, 1, vec![definition(), keep.clone()]));
-    let node =
-        Arc::new(NodeState::new(vec![WorkerId(0)], 64, crate::test_support::clock()).unwrap());
+    let node = Arc::new(NodeState::new(vec![WorkerId(0)], 64, crate::test_support::ctx()).unwrap());
     config.node = bootstrap(
         &config,
         &node,
@@ -2778,7 +2777,7 @@ fn startup_retries_tls_internal_error_before_enrollment_and_worker_snapshot() {
 fn startup_tls_authentication_alert_remains_terminal() {
     let mut fixture = ControlFixture::new();
     let config = fixture.config.take().unwrap();
-    let node = NodeState::new(vec![WorkerId(0)], 64, crate::test_support::clock()).unwrap();
+    let node = NodeState::new(vec![WorkerId(0)], 64, crate::test_support::ctx()).unwrap();
     fixture.handshake_alerts.lock().unwrap().push_back(42);
     assert_eq!(
         bootstrap(
@@ -2799,7 +2798,7 @@ fn startup_tls_authentication_alert_remains_terminal() {
 fn startup_tls_internal_error_respects_deadline() {
     let mut fixture = ControlFixture::new();
     let config = fixture.config.take().unwrap();
-    let node = NodeState::new(vec![WorkerId(0)], 64, crate::test_support::clock()).unwrap();
+    let node = NodeState::new(vec![WorkerId(0)], 64, crate::test_support::ctx()).unwrap();
     fixture.handshake_alerts.lock().unwrap().extend([80; 16]);
     assert_eq!(
         bootstrap(
@@ -2821,7 +2820,7 @@ fn startup_reauthenticates_retained_identity_and_fails_closed() {
     let mut fixture = ControlFixture::new();
     let config = fixture.config.take().unwrap();
     let start = || {
-        let node = NodeState::new(vec![WorkerId(0)], 64, crate::test_support::clock()).unwrap();
+        let node = NodeState::new(vec![WorkerId(0)], 64, crate::test_support::ctx()).unwrap();
         bootstrap(
             &config,
             &node,
@@ -2919,7 +2918,7 @@ fn node_replacement_drains_all_workers_and_restart_converges() {
         fixture.poll_status.store(200, Ordering::Release);
         fixture.certificate_age.store(1, Ordering::Release);
         let fresh =
-            Arc::new(NodeState::new(vec![WorkerId(0)], 64, crate::test_support::clock()).unwrap());
+            Arc::new(NodeState::new(vec![WorkerId(0)], 64, crate::test_support::ctx()).unwrap());
         drop(group);
         let app = Arc::try_unwrap(app).ok().unwrap();
         let mut config = Arc::try_unwrap(app.config).ok().unwrap();
@@ -3244,8 +3243,7 @@ fn blocked_publication_is_superseded_while_projection_rotates() {
 fn network_keyring_bootstrap_rotation_recovery_and_failure_retention() {
     let mut fixture = ControlFixture::new();
     let mut config = fixture.config.take().unwrap();
-    let node =
-        Arc::new(NodeState::new(vec![WorkerId(0)], 64, crate::test_support::clock()).unwrap());
+    let node = Arc::new(NodeState::new(vec![WorkerId(0)], 64, crate::test_support::ctx()).unwrap());
     {
         let mut bundle = fixture.bundle.lock().unwrap();
         *bundle =
@@ -3443,8 +3441,7 @@ fn network_keyring_bootstrap_rotation_recovery_and_failure_retention() {
 fn real_control_bootstrap_recovery_publication_readiness_and_shutdown() {
     let mut fixture = ControlFixture::new();
     let mut config = fixture.config.take().unwrap();
-    let node =
-        Arc::new(NodeState::new(vec![WorkerId(0)], 64, crate::test_support::clock()).unwrap());
+    let node = Arc::new(NodeState::new(vec![WorkerId(0)], 64, crate::test_support::ctx()).unwrap());
     let startup = scope(Duration::from_secs(15)).unwrap();
     config.node = bootstrap(&config, &node, &config.limits, &startup)
         .unwrap()
@@ -3863,7 +3860,7 @@ fn worker_requesters_share_configured_admission_and_production_metrics() {
             vec![WorkerId(0), WorkerId(1)],
             16,
             config.peer_admission,
-            crate::test_support::clock(),
+            crate::test_support::ctx(),
         )
         .unwrap(),
     );
@@ -3931,7 +3928,7 @@ fn receive_gate_two_workers_share_capacity_and_wake_expiry_without_cqe() {
         NodeState::new(
             vec![WorkerId(0), WorkerId(1)],
             16,
-            crate::test_support::clock(),
+            crate::test_support::ctx(),
         )
         .unwrap(),
     );
@@ -4073,7 +4070,7 @@ fn assembly_uses_node_metrics_for_sparse_worker_ids() {
         NodeState::new(
             vec![WorkerId(9), WorkerId(2)],
             16,
-            crate::test_support::clock(),
+            crate::test_support::ctx(),
         )
         .unwrap(),
     );

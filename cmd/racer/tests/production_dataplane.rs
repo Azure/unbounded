@@ -472,6 +472,7 @@ impl Rig {
                         Arc::new(WorkerMap::new(vec![WorkerId(0)]).unwrap()),
                         vec![WorkerId(0)],
                         64,
+                        racer_io::WorkerCtx::host(),
                     )
                     .unwrap(),
                 ),

@@ -1004,6 +1004,7 @@ fn metadata_coordinator_with_newer_publication(
             Arc::new(WorkerMap::new(vec![WorkerId(0)]).unwrap()),
             vec![WorkerId(0)],
             16,
+            crate::test_support::ctx(),
         )
         .unwrap(),
     );

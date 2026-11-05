@@ -100,6 +100,8 @@ struct State {
 /// Node-wide registry of open read windows and peer subscription contracts.
 pub(crate) struct Scheduler {
     capacity: usize,
+    /// Contract expiry and identifiers.
+    ctx: racer_io::WorkerCtx,
     state: Mutex<State>,
 }
 
@@ -123,7 +125,7 @@ impl Scheduler {
         let version = selection.version.clone();
         let demand = selection.demand.clone();
         let mut state = self.state.lock().unwrap();
-        let now = uring_runtime::environment::now();
+        let now = self.ctx.now();
         // Expired contracts are dropped only once idle, so a late drop never
         // releases a flight of the contract that replaced it.
         state
@@ -135,7 +137,7 @@ impl Scheduler {
                 return Err(Error::Overloaded);
             }
             let mut id = [0; 16];
-            uring_runtime::environment::fill_random(&mut id).map_err(|_| Error::Unavailable)?;
+            self.ctx.rng.fill(&mut id).map_err(|_| Error::Unavailable)?;
             state.contracts.insert(
                 key.clone(),
                 Contract {
@@ -229,7 +231,7 @@ impl Scheduler {
 
     /// Unused granted flights across the live contracts of `version`.
     fn spare(&self, version: &ObjectVersion) -> usize {
-        let now = uring_runtime::environment::now();
+        let now = self.ctx.now();
         self.state
             .lock()
             .unwrap()
@@ -242,9 +244,10 @@ impl Scheduler {
             .sum()
     }
 
-    pub(crate) fn new(capacity: usize) -> Arc<Self> {
+    pub(crate) fn new(capacity: usize, ctx: racer_io::WorkerCtx) -> Arc<Self> {
         Arc::new(Self {
             capacity,
+            ctx,
             state: Mutex::new(State {
                 contracts: BTreeMap::new(),
                 sequence: 0,
@@ -441,20 +444,18 @@ enum RangeBudget {
 #[cfg(test)]
 pub(crate) fn client_page_budget_for_test(deadline: Instant) -> AcquisitionBudget {
     RangeBudget::ClientPages { deadline }
-        .next_page(false)
+        .next_page(false, crate::test_support::clock().now())
         .unwrap()
         .unwrap()
 }
 impl RangeBudget {
-    fn next_page(&mut self, _pending: bool) -> Result<Option<AcquisitionBudget>> {
+    fn next_page(&mut self, _pending: bool, now: Instant) -> Result<Option<AcquisitionBudget>> {
         match self {
-            Self::ProgressingPages { timeout } => Ok(Some(AcquisitionBudget::new(
-                uring_runtime::environment::now() + *timeout,
-                8,
-                16,
-            ))),
+            Self::ProgressingPages { timeout } => {
+                Ok(Some(AcquisitionBudget::new(now + *timeout, 8, 16)))
+            }
             Self::ClientPages { deadline } => {
-                if uring_runtime::environment::now() >= *deadline {
+                if now >= *deadline {
                     return Err(Error::DeadlineExceeded);
                 }
                 Ok(Some(AcquisitionBudget::new(*deadline, 8, 16)))
@@ -1101,7 +1102,10 @@ impl RangeStream {
 
     /// Returns false when the range budget admits no more work for now.
     fn start_fetch(&mut self, index: usize, scope: &RequestScope) -> Result<bool> {
-        let Some(child) = self.budget.next_page(self.pending())? else {
+        let Some(child) = self
+            .budget
+            .next_page(self.pending(), self.scope.clock().now())?
+        else {
             return Ok(false);
         };
         let mut child_scope = scope.clone();
@@ -1181,7 +1185,10 @@ impl RangeStream {
         let Some((demand, pages)) = self.plan_selection()? else {
             return Ok(false);
         };
-        let Some(child) = self.budget.next_page(self.pending())? else {
+        let Some(child) = self
+            .budget
+            .next_page(self.pending(), self.scope.clock().now())?
+        else {
             return Ok(false);
         };
         let selection = Selection {
@@ -1422,9 +1429,11 @@ impl RangeStream {
         let remaining = scope
             .deadline
             .0
-            .saturating_duration_since(uring_runtime::environment::now());
-        let Some(until) =
-            uring_runtime::environment::wall_now().checked_add(SPILL_HOLD.min(remaining))
+            .saturating_duration_since(scope.clock().now());
+        let Some(until) = scope
+            .clock()
+            .wall_now()
+            .checked_add(SPILL_HOLD.min(remaining))
         else {
             return false;
         };
@@ -1471,7 +1480,7 @@ impl RangeStream {
     fn operation_scope(&self) -> RequestScope {
         let mut scope = self.scope.clone();
         if let RangeBudget::ProgressingPages { timeout } = self.budget {
-            scope.deadline.0 = uring_runtime::environment::now() + timeout;
+            scope.deadline.0 = scope.clock().now() + timeout;
         }
         scope
     }
@@ -1686,6 +1695,7 @@ pub(super) mod tests {
                     Arc::new(WorkerMap::new(vec![WorkerId(0)]).unwrap()),
                     vec![WorkerId(0)],
                     capacity,
+                    crate::test_support::ctx(),
                 )
                 .unwrap(),
             );
@@ -2126,7 +2136,10 @@ pub(super) mod tests {
         // acquisition credits to its destination. Neither spend can accumulate
         // into a range-length limit, and unused credits cannot grow later pages.
         for _ in 0..100 {
-            let mut page = budget.next_page(false).unwrap().unwrap();
+            let mut page = budget
+                .next_page(false, crate::test_support::clock().now())
+                .unwrap()
+                .unwrap();
             assert_eq!(page.remaining_attempts(), 8);
             assert_eq!(page.remaining_links(), 16);
             assert_eq!(page.begin_attempt(Instant::now(), deadline), Ok(deadline));
@@ -2141,7 +2154,10 @@ pub(super) mod tests {
             );
             budget.complete(page).unwrap();
         }
-        let mut page = budget.next_page(false).unwrap().unwrap();
+        let mut page = budget
+            .next_page(false, crate::test_support::clock().now())
+            .unwrap()
+            .unwrap();
         for _ in 0..8 {
             page.begin_attempt(Instant::now(), deadline).unwrap();
         }
@@ -2162,7 +2178,7 @@ pub(super) mod tests {
             deadline: Instant::now(),
         };
         assert!(matches!(
-            expired.next_page(false),
+            expired.next_page(false, crate::test_support::clock().now()),
             Err(Error::DeadlineExceeded)
         ));
     }
@@ -2170,13 +2186,24 @@ pub(super) mod tests {
     fn explicit_aggregate_range_budget_never_refills_spent_pages() {
         let deadline = Instant::now() + std::time::Duration::from_secs(60);
         let mut budget = RangeBudget::Shared(AcquisitionBudget::new(deadline, 2, 4));
-        let mut page = budget.next_page(false).unwrap().unwrap();
-        assert!(budget.next_page(true).unwrap().is_none());
+        let mut page = budget
+            .next_page(false, crate::test_support::clock().now())
+            .unwrap()
+            .unwrap();
+        assert!(
+            budget
+                .next_page(true, crate::test_support::clock().now())
+                .unwrap()
+                .is_none()
+        );
         page.begin_attempt(Instant::now(), deadline).unwrap();
         page.begin_attempt(Instant::now(), deadline).unwrap();
         page.charge_links(4).unwrap();
         budget.complete(page).unwrap();
-        let mut next = budget.next_page(false).unwrap().unwrap();
+        let mut next = budget
+            .next_page(false, crate::test_support::clock().now())
+            .unwrap()
+            .unwrap();
         assert_eq!(next.deadline(), deadline);
         assert_eq!(
             next.begin_attempt(Instant::now(), deadline),
@@ -2209,7 +2236,11 @@ pub(super) mod tests {
             // Script both admitted acquisitions, avoiding full-page allocation.
             // A full pending window must prevent admission of page two onward.
             for number in 0..2 {
-                let mut budget = stream.budget.next_page(number != 0).unwrap().unwrap();
+                let mut budget = stream
+                    .budget
+                    .next_page(number != 0, crate::test_support::clock().now())
+                    .unwrap()
+                    .unwrap();
                 let attempts = attempts.clone();
                 let gate = gate.clone();
                 stream.inject(Slot::Fetching(Box::pin(async move {
@@ -2492,7 +2523,11 @@ pub(super) mod tests {
             opened.await;
             Ok(None)
         })));
-        let budget = stream.budget.next_page(false).unwrap().unwrap();
+        let budget = stream
+            .budget
+            .next_page(false, crate::test_support::clock().now())
+            .unwrap()
+            .unwrap();
         stream.inject(Slot::Fetching(Box::pin(async move {
             Ok((Err(Error::VersionUnavailable), budget))
         })));
@@ -2540,7 +2575,11 @@ pub(super) mod tests {
         let gate = Rc::new(std::cell::Cell::new(false));
         let opened = gated(gate.clone());
         let head = page_result(&f.admission, &metadata, 0);
-        let budget = stream.budget.next_page(false).unwrap().unwrap();
+        let budget = stream
+            .budget
+            .next_page(false, crate::test_support::clock().now())
+            .unwrap()
+            .unwrap();
         stream.inject(Slot::Fetching(Box::pin(async move {
             opened.await;
             Ok((Ok(head), budget))
@@ -2576,8 +2615,16 @@ pub(super) mod tests {
         let opened = gated(gate.clone());
         let head = page_result(&f.admission, &metadata, 0);
         let later = page_result(&f.admission, &metadata, 1);
-        let first = stream.budget.next_page(false).unwrap().unwrap();
-        let second = stream.budget.next_page(true).unwrap().unwrap();
+        let first = stream
+            .budget
+            .next_page(false, crate::test_support::clock().now())
+            .unwrap()
+            .unwrap();
+        let second = stream
+            .budget
+            .next_page(true, crate::test_support::clock().now())
+            .unwrap()
+            .unwrap();
         stream.inject(Slot::Fetching(Box::pin(async move {
             opened.await;
             Ok((Ok(head), first))
@@ -2677,7 +2724,11 @@ pub(super) mod tests {
             stream.configure_subscription(2, 2 * PAGE_BYTES).unwrap();
             stream.inject(Slot::Ready(Ok(page_result(&f.admission, &metadata, 0))));
             stream.inject(Slot::Selecting);
-            let budget = stream.budget.next_page(false).unwrap().unwrap();
+            let budget = stream
+                .budget
+                .next_page(false, crate::test_support::clock().now())
+                .unwrap()
+                .unwrap();
             stream.selections.push(Pending {
                 operation: Box::pin(async move { Ok((Err(error), budget)) }),
                 pages: BTreeSet::from([1]),
@@ -3188,7 +3239,10 @@ pub(super) mod tests {
         let old_deadline = uring_runtime::environment::now() + timeout;
         let mut budget = RangeBudget::ProgressingPages { timeout };
         for _ in 0..12 {
-            let mut page = budget.next_page(false).unwrap().unwrap();
+            let mut page = budget
+                .next_page(false, crate::test_support::clock().now())
+                .unwrap()
+                .unwrap();
             let deadline = page.deadline();
             assert_eq!(deadline, uring_runtime::environment::now() + timeout);
             for _ in 0..8 {
@@ -3204,7 +3258,10 @@ pub(super) mod tests {
             budget.complete(page).unwrap();
         }
         assert!(uring_runtime::environment::now() > old_deadline);
-        let mut stalled = budget.next_page(false).unwrap().unwrap();
+        let mut stalled = budget
+            .next_page(false, crate::test_support::clock().now())
+            .unwrap()
+            .unwrap();
         clock.advance(timeout);
         assert_eq!(
             stalled.begin_attempt(uring_runtime::environment::now(), stalled.deadline()),
@@ -3285,7 +3342,7 @@ pub(super) mod tests {
         }
         #[test]
         fn contracts_never_refill_and_start_with_one_selection_per_provider() {
-            let scheduler = Scheduler::new(4);
+            let scheduler = Scheduler::new(4, crate::test_support::ctx());
             let deadline = uring_runtime::environment::now() + std::time::Duration::from_secs(30);
             let (first, one) = issue(&scheduler, 0, "provider", Some(4), deadline);
             let (one, _) = one.unwrap();
@@ -3325,7 +3382,7 @@ pub(super) mod tests {
         }
         #[test]
         fn contract_serves_up_to_granted_flights_and_refusal_resets_to_one() {
-            let scheduler = Scheduler::new(4);
+            let scheduler = Scheduler::new(4, crate::test_support::ctx());
             let deadline = uring_runtime::environment::now() + std::time::Duration::from_secs(30);
             let provider = NodeId("provider".into());
             let (first, result) = issue(&scheduler, 0, "provider", Some(3), deadline);
@@ -3368,7 +3425,7 @@ pub(super) mod tests {
         }
         #[test]
         fn expired_contract_drains_before_a_fresh_one_replaces_it() {
-            let scheduler = Scheduler::new(4);
+            let scheduler = Scheduler::new(4, crate::test_support::ctx());
             let deadline = uring_runtime::environment::now() + std::time::Duration::from_millis(20);
             let (first, result) = issue(&scheduler, 0, "provider", Some(2), deadline);
             let (old, _) = result.unwrap();
@@ -3414,7 +3471,7 @@ pub(super) mod tests {
         }
         #[test]
         fn scheduler_windows_are_bounded_and_drop_frees_capacity() {
-            let scheduler = Scheduler::new(2);
+            let scheduler = Scheduler::new(2, crate::test_support::ctx());
             let first = scheduler.open(version()).unwrap();
             let second = scheduler.open(version()).unwrap();
             assert!(matches!(scheduler.open(version()), Err(Error::Overloaded)));
@@ -3425,7 +3482,7 @@ pub(super) mod tests {
         }
         #[test]
         fn offer_fans_out_to_every_window_that_wants_the_page() {
-            let scheduler = Scheduler::new(4);
+            let scheduler = Scheduler::new(4, crate::test_support::ctx());
             let first = scheduler.open(version()).unwrap();
             let second = scheduler.open(version()).unwrap();
             let slow = scheduler.open(version()).unwrap();
@@ -3448,7 +3505,7 @@ pub(super) mod tests {
         }
         #[test]
         fn offers_outside_wanted_pages_are_dropped_and_inbox_stays_bounded() {
-            let scheduler = Scheduler::new(1);
+            let scheduler = Scheduler::new(1, crate::test_support::ctx());
             let reader = scheduler.open(version()).unwrap();
             want(&reader, &[0, 1]);
             let selection = Selection::for_test(&scheduler, version(), demand(0, 1_000_000));
@@ -3467,7 +3524,7 @@ pub(super) mod tests {
         }
         #[test]
         fn dropped_window_is_removed_from_fanout_and_busy_elsewhere() {
-            let scheduler = Scheduler::new(2);
+            let scheduler = Scheduler::new(2, crate::test_support::ctx());
             let supplier = scheduler.open(version()).unwrap();
             let reader = scheduler.open(version()).unwrap();
             supplier.sync(
