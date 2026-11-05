@@ -529,16 +529,7 @@ impl AzureTokenSource {
     /// its leader's scope and still fills the cache.
     async fn wait(&self, seen: u64, scope: &RequestScope) -> Result<(), AuthError> {
         use futures::future::{Either, select};
-        use uring_runtime::reactor::timer::SleepMode;
-        #[cfg(test)]
-        let mode = if uring_runtime::environment::simulation_seed().is_some() {
-            SleepMode::ClockPoll
-        } else {
-            SleepMode::Kernel
-        };
-        #[cfg(not(test))]
-        let mode = SleepMode::Kernel;
-        let expiry = self.reactor.sleep_until(scope.deadline.0, mode, scope);
+        let expiry = self.reactor.sleep_until(scope.deadline.0, scope);
         let wait = FlightWait {
             cache: &self.cache,
             seen,

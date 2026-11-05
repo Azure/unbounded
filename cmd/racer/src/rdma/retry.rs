@@ -46,13 +46,7 @@ impl NativeRetry {
             }
             let until = (scope.clock().now() + Duration::from_millis(1)).min(scope.deadline.0);
             if let Some(reactor) = &self.reactor {
-                reactor
-                    .sleep_until(
-                        until,
-                        uring_runtime::reactor::timer::SleepMode::Kernel,
-                        scope,
-                    )
-                    .await
+                reactor.sleep_until(until, scope).await
             } else {
                 #[cfg(test)]
                 {

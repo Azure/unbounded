@@ -29,34 +29,15 @@ pub(crate) type HashSet<K> = std::collections::HashSet<K>;
 pub(crate) type HashMap<K, V> = std::collections::HashMap<K, V, HashState>;
 #[cfg(test)]
 pub(crate) type HashSet<K> = std::collections::HashSet<K, HashState>;
+/// Test hasher with a fixed seed so simulated runs iterate maps identically.
 #[cfg(test)]
-#[derive(Clone, Debug)]
-pub(crate) enum HashState {
-    Real(std::collections::hash_map::RandomState),
-    Simulated(u64),
-}
-#[cfg(test)]
-impl Default for HashState {
-    fn default() -> Self {
-        match uring_runtime::environment::simulation_seed() {
-            Some(seed) => Self::Simulated(seed),
-            None => Self::Real(std::collections::hash_map::RandomState::new()),
-        }
-    }
-}
+#[derive(Clone, Debug, Default)]
+pub(crate) struct HashState;
 #[cfg(test)]
 impl std::hash::BuildHasher for HashState {
     type Hasher = std::collections::hash_map::DefaultHasher;
     fn build_hasher(&self) -> Self::Hasher {
-        use std::hash::Hasher;
-        match self {
-            Self::Real(state) => state.build_hasher(),
-            Self::Simulated(seed) => {
-                let mut hasher = Self::Hasher::new();
-                hasher.write_u64(*seed);
-                hasher
-            }
-        }
+        Self::Hasher::new()
     }
 }
 
@@ -505,7 +486,6 @@ impl Reactor {
 #[cfg(test)]
 mod tests {
     use super::HashMap;
-    use super::HashState;
     use crate::error::Error;
     use crate::model::RequestId;
     use crate::runtime::RequestScope;
@@ -1677,7 +1657,7 @@ mod tests {
     }
 
     #[test]
-    fn simulation_replays_collection_iteration_without_consuming_nonce_entropy() {
+    fn test_collection_iteration_is_fixed_and_consumes_no_nonce_entropy() {
         fn sample(seed: u64) -> (Vec<u64>, [u8; 32]) {
             let clock = SimulationClock::new(seed);
             let _role = clock.environment(9).enter();
@@ -1693,14 +1673,12 @@ mod tests {
             (map.into_keys().collect(), bytes)
         }
         assert_eq!(sample(1), sample(1));
-        assert_ne!(sample(1).0, sample(7).0);
+        assert_eq!(sample(1).0, sample(7).0);
         let clock = SimulationClock::new(1);
         let _role = clock.environment(9).enter();
         let mut bytes = [0; 32];
         fill_random(&mut bytes).unwrap();
         assert_eq!(sample(1).1, bytes);
-        let _real = uring_runtime::environment::Environment::default().enter();
-        assert!(matches!(HashState::default(), HashState::Real(_)));
     }
 
     #[test]

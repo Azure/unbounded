@@ -1092,58 +1092,36 @@ pub mod timer {
     //! Timers sharing the reactor's completion fences.
     use super::*;
 
-    /// Choose kernel-owned waiting or cooperative observation of a simulated clock.
-    #[derive(Clone, Copy, Debug)]
-    pub enum SleepMode {
-        /// Wait on the reactor's timer heap.
-        Kernel,
-        /// Poll the scoped clock cooperatively. The owner advances that clock.
-        #[cfg(feature = "simulation")]
-        ClockPoll,
-    }
-
     impl<S: Scope, B: Budget> Reactor<S, B> {
-        /// Sleep until `until` under the caller's scope. Kernel mode rejects
-        /// simulated clocks; ClockPoll requires one and wakes its executor.
+        /// Sleep until `until` under the caller's scope. On a simulated
+        /// worker clock the sleep polls that clock cooperatively (its owner
+        /// advances it); otherwise it waits on the reactor's timer heap.
         pub fn sleep_until<'a>(
             &'a self,
             until: Instant,
-            mode: SleepMode,
             scope: &'a S,
         ) -> Operation<'a, (), S::Error> {
             Box::pin(async move {
                 scope.check()?;
-                #[cfg(feature = "simulation")]
-                match mode {
-                    SleepMode::Kernel
-                        if crate::environment::simulation_seed().is_some()
-                            || self.simulation.is_some() =>
-                    {
-                        return Err(Error::InvalidConfiguration.into());
-                    }
-                    SleepMode::ClockPoll if crate::environment::simulation_seed().is_none() => {
-                        return Err(Error::InvalidConfiguration.into());
-                    }
-                    _ => (),
-                }
-                if until <= crate::environment::now() {
+                let clock = self.ctx().clock.clone();
+                if until <= clock.now() {
                     return Ok(());
                 }
-                match mode {
-                    #[cfg(feature = "simulation")]
-                    SleepMode::ClockPoll => {
-                        return std::future::poll_fn(|cx| {
-                            scope.check()?;
-                            if crate::environment::now() >= until {
-                                Poll::Ready(Ok(()))
-                            } else {
-                                cx.waker().wake_by_ref();
-                                Poll::Pending
-                            }
-                        })
-                        .await;
-                    }
-                    SleepMode::Kernel => (),
+                if clock.is_virtual() {
+                    return std::future::poll_fn(|cx| {
+                        scope.check()?;
+                        if clock.now() >= until {
+                            Poll::Ready(Ok(()))
+                        } else {
+                            cx.waker().wake_by_ref();
+                            Poll::Pending
+                        }
+                    })
+                    .await;
+                }
+                #[cfg(feature = "simulation")]
+                if self.simulation.is_some() {
+                    return Err(Error::InvalidConfiguration.into());
                 }
                 let io = self.io()?;
                 let ctx = scope.op_ctx();

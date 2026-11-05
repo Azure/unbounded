@@ -774,7 +774,6 @@ impl CandidatePolicy {
     /// Sleep until `until` under the request's scope. `false` without a
     /// timer.
     async fn stale_sleep(&self, until: std::time::Instant, scope: &RequestScope) -> Result<bool> {
-        use uring_runtime::reactor::timer::SleepMode;
         #[cfg(test)]
         if self.instant_stale_wait.get() {
             return Ok(true);
@@ -782,15 +781,7 @@ impl CandidatePolicy {
         let Some(reactor) = &self.reactor else {
             return Ok(false);
         };
-        #[cfg(test)]
-        let mode = if uring_runtime::environment::simulation_seed().is_some() {
-            SleepMode::ClockPoll
-        } else {
-            SleepMode::Kernel
-        };
-        #[cfg(not(test))]
-        let mode = SleepMode::Kernel;
-        reactor.sleep_until(until, mode, scope).await?;
+        reactor.sleep_until(until, scope).await?;
         Ok(true)
     }
 

@@ -539,18 +539,7 @@ impl ReactorControlIo {
 
     /// Wait until an absolute deadline under the caller's cancellation scope.
     pub fn sleep<'a>(&'a self, until: Instant, scope: &'a RequestScope) -> Operation<'a, ()> {
-        Box::pin(async move {
-            use uring_runtime::reactor::timer::SleepMode;
-            #[cfg(test)]
-            let mode = if uring_runtime::environment::simulation_seed().is_some() {
-                SleepMode::ClockPoll
-            } else {
-                SleepMode::Kernel
-            };
-            #[cfg(not(test))]
-            let mode = SleepMode::Kernel;
-            self.reactor.sleep_until(until, mode, scope).await
-        })
+        Box::pin(async move { self.reactor.sleep_until(until, scope).await })
     }
 }
 
