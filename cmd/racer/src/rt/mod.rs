@@ -40,8 +40,7 @@ pub mod test_util {
     }
 }
 
-// MIGRATION: shared with `racer-io` until uring-runtime is deleted.
-/// Portable runtime failures, shared with `racer-io` during the migration.
+/// Portable runtime failures from `racer-io`.
 pub use racer_io::Error;
 
 /// A runtime result, optionally using an application-owned error type.
@@ -51,25 +50,6 @@ pub type Result<T, E = Error> = std::result::Result<T, E>;
 pub use racer_io::scope::Operation;
 
 pub use racer_io::scope::{CancelWait, Scope};
-
-/// Accounting hook. Charges stay alive until their resources are fenced.
-pub trait Budget: 'static {
-    /// An owned accounting guard retained until the charged resource is fenced.
-    type Charge: 'static;
-
-    /// Reserve accounting capacity for bytes without choosing application policy.
-    fn charge(&self, bytes: usize) -> Result<Self::Charge>;
-}
-
-impl Budget for () {
-    /// No accounting guard is needed when the caller disables charging.
-    type Charge = ();
-
-    /// Accept every charge without retaining application capacity.
-    fn charge(&self, _bytes: usize) -> Result<()> {
-        Ok(())
-    }
-}
 
 /// Bounded owned handoffs. Cancellation is notification, never a completion fence.
 pub mod mailbox {
