@@ -765,14 +765,7 @@ pub mod identity {
     struct BundleDelivery {
         keys: Rc<Keyring>,
 
-        accepted: Option<AcceptedBundle>,
-    }
-
-    /// Accepted canonical content used to reject conflicting delivery cursors.
-    struct AcceptedBundle {
-        generation: BundleGeneration,
-
-        hash: [u8; 32],
+        accepted: Option<BundleGeneration>,
     }
 
     impl BundleInstaller {
@@ -788,11 +781,7 @@ pub mod identity {
 
         /// Return the last successfully accepted bundle generation.
         pub fn generation(&self) -> Option<BundleGeneration> {
-            self.state
-                .borrow()
-                .accepted
-                .as_ref()
-                .map(|accepted| accepted.generation)
+            self.state.borrow().accepted
         }
 
         /// Replace the keyring and reset delivery tracking for its new owner.
@@ -812,22 +801,15 @@ pub mod identity {
             bundle
                 .cache_keys
                 .sort_by(|a, b| reference_order(&a.key).cmp(&reference_order(&b.key)));
-            let encoded = Zeroizing::new(
-                racer_control_wire::encode_bundle(&bundle).map_err(BundleError::Wire)?,
-            );
-            let hash: [u8; 32] = Sha256::digest(&*encoded).into();
-            let mut state = self.state.borrow_mut();
-            if let Some(old) = state.accepted.as_ref()
-                && (bundle.generation < old.generation
-                    || bundle.generation == old.generation && hash != old.hash)
-            {
-                return Err(BundleError::Replay);
+            if bundle.cache_keys.len() > MAX_BUNDLE_KEYS {
+                return Err(BundleError::Identity(Error::InvalidConfiguration));
             }
-            // Even exact cached delivery must consult current shared epochs.
-            // Another keyring view may have advanced or retired this generation.
+            let mut state = self.state.borrow_mut();
+            // Replay is judged once, against the shared published epoch, by
+            // `accept_bundle`; exact redelivery is acknowledged without change.
             let roots = bundle.peer_trust_roots.clone();
-            let generation = state.keys.install(bundle).map_err(BundleError::Identity)?;
-            state.accepted = Some(AcceptedBundle { generation, hash });
+            let generation = state.keys.install_checked(&bundle.into())?;
+            state.accepted = Some(generation);
             Ok((generation, roots))
         }
     }
@@ -1649,11 +1631,27 @@ pub mod identity {
             self.install_inner(&bundle.into())
         }
 
-        /// Prepare outside the lock, then validate the transition and publish once.
+        /// Install, reporting replay as a configuration error.
         fn install_inner(&self, bundle: &KeyringBundle) -> Result<BundleGeneration> {
+            self.install_checked(bundle).map_err(|error| match error {
+                BundleError::Identity(error) => error,
+                BundleError::Replay | BundleError::Wire(_) => Error::InvalidConfiguration,
+            })
+        }
+
+        /// Prepare outside the lock, then validate the transition and publish once.
+        fn install_checked(
+            &self,
+            bundle: &KeyringBundle,
+        ) -> std::result::Result<BundleGeneration, BundleError> {
             let validated =
-                ValidatedBundle::prepare(self.epochs.clock(), bundle, &self.cluster, &self.node)?;
-            let mut state = self.epochs.state.lock().map_err(|_| Error::Unavailable)?;
+                ValidatedBundle::prepare(self.epochs.clock(), bundle, &self.cluster, &self.node)
+                    .map_err(BundleError::Identity)?;
+            let mut state = self
+                .epochs
+                .state
+                .lock()
+                .map_err(|_| BundleError::Identity(Error::Unavailable))?;
             let published = validated.transition(state.published.as_deref())?;
             let retired = published.map(|published| {
                 state.index = Some(Arc::new(KeyIndex::new(&published)));
@@ -1664,7 +1662,7 @@ pub mod identity {
             drop(state);
             drop(retired);
             // Drop this view's copy of the old index now rather than on next use.
-            self.reload()?;
+            self.reload().map_err(BundleError::Identity)?;
             Ok(bundle.generation)
         }
     }
@@ -1749,22 +1747,66 @@ pub mod identity {
 
         /// Check the current epoch and construct a replacement without mutating it.
         /// Exact replay returns no replacement, preserving all shared owner identities.
-        fn transition(self, current: Option<&PublishedBundle>) -> Result<Option<PublishedBundle>> {
+        fn transition(
+            self,
+            current: Option<&PublishedBundle>,
+        ) -> std::result::Result<Option<PublishedBundle>, BundleError> {
             let Self {
                 bundle,
                 fingerprint,
             } = self;
+            if accept_bundle(current, bundle, &fingerprint)? == Accepted::Exact {
+                return Ok(None);
+            }
+            self::transition_entries(bundle, fingerprint, current).map_err(BundleError::Identity)
+        }
+    }
+
+    /// How a delivered bundle relates to the published one.
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    enum Accepted {
+        /// The exact published bundle was delivered again.
+        Exact,
+
+        /// A newer generation (or the first one).
+        Newer,
+    }
+
+    /// The single replay and monotonicity check for keyring bundles: a
+    /// different cluster is invalid; an older generation, or the same
+    /// generation with different content, is a replay.
+    fn accept_bundle(
+        current: Option<&PublishedBundle>,
+        bundle: &KeyringBundle,
+        fingerprint: &[u8; 32],
+    ) -> std::result::Result<Accepted, BundleError> {
+        let Some(current) = current else {
+            return Ok(Accepted::Newer);
+        };
+        if current.cluster != bundle.cluster {
+            return Err(BundleError::Identity(Error::InvalidConfiguration));
+        }
+        if bundle.generation < current.generation
+            || bundle.generation == current.generation && current.fingerprint != *fingerprint
+        {
+            return Err(BundleError::Replay);
+        }
+        Ok(if bundle.generation == current.generation {
+            Accepted::Exact
+        } else {
+            Accepted::Newer
+        })
+    }
+
+    /// Build a replacement table for a newer generation without mutating the
+    /// current one.
+    fn transition_entries(
+        bundle: &KeyringBundle,
+        fingerprint: [u8; 32],
+        current: Option<&PublishedBundle>,
+    ) -> Result<Option<PublishedBundle>> {
+        {
             if let Some(current) = current {
-                if current.cluster != bundle.cluster || bundle.generation < current.generation {
-                    return Err(Error::InvalidConfiguration);
-                }
-                if current.generation == bundle.generation {
-                    return if current.fingerprint == fingerprint {
-                        Ok(None)
-                    } else {
-                        Err(Error::InvalidConfiguration)
-                    };
-                }
                 let by_reference: HashMap<_, &Arc<Entry>> = current
                     .entries
                     .iter()
@@ -2212,10 +2254,8 @@ pub mod identity {
             newer.peer_trust_roots = vec![new_ca.der().to_vec()];
             other.install(newer.clone()).unwrap();
             assert_eq!(keys.generation().unwrap(), Some(3));
-            assert_eq!(
-                installer.install(old),
-                Err(BundleError::Identity(Error::InvalidConfiguration))
-            );
+            // Rollback below the shared epoch is a replay.
+            assert_eq!(installer.install(old), Err(BundleError::Replay));
             assert_eq!(*keys.peer_trust_roots().unwrap(), newer.peer_trust_roots);
             assert_eq!(installer.generation(), Some(BundleGeneration(2)));
             assert_eq!(
@@ -2270,9 +2310,10 @@ pub mod identity {
             );
             bundle.generation = BundleGeneration(3);
             bundle.peer_trust_roots = vec![vec![0; 128]];
+            // Malformed roots fail trust validation (no wire re-encoding).
             assert_eq!(
                 installer.install(bundle.clone()),
-                Err(BundleError::Wire(racer_control_wire::Error::InvalidRequest))
+                Err(BundleError::Identity(Error::Unauthorized))
             );
             let (_, chain) = issue(
                 &first,
