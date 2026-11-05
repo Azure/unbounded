@@ -11,6 +11,7 @@ import (
 	"github.com/Azure/unbounded/cmd/agent/internal/nspawnops"
 	"github.com/Azure/unbounded/internal/provision"
 	"github.com/Azure/unbounded/pkg/agent/isolation"
+	"github.com/Azure/unbounded/pkg/agent/isolation/none"
 )
 
 // agentMode is everything the agent needs to operate one isolation mode: its
@@ -50,6 +51,17 @@ func agentModes() agentModeTable {
 				return daemon.NewNSpawnOperator(newBackend)
 			},
 			newPlan: func() stagePlan { return nspawnPlan{} },
+		},
+		isolation.ModeNone: {
+			// Status, Exec and Logs need no goal state; the operator builds the
+			// fully wired node for everything else.
+			newBackend: func(log *slog.Logger, _ *provision.AgentConfig) isolation.Backend {
+				return none.NewDefault(log)
+			},
+			newOperator: func(daemon.BackendFactory) daemon.ModeOperator {
+				return daemon.NoneOperator{}
+			},
+			newPlan: func() stagePlan { return &nonePlan{} },
 		},
 	}
 }

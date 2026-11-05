@@ -281,6 +281,15 @@ func TestBootstrapIdentity_DefaultModeKeepsTheFingerprint(t *testing.T) {
 	explicit, err := bootstrapIdentity(cfg)
 	require.NoError(t, err)
 	require.Equal(t, unset, explicit)
+
+	// Another mode is another installation: a host installed in nspawn refuses
+	// a start in none until it is reset, instead of building a second node
+	// stack beside the first.
+	cfg.Isolation = "none"
+	other, err := bootstrapIdentity(cfg)
+	require.NoError(t, err)
+	require.NotEqual(t, unset.ConfigFingerprint, other.ConfigFingerprint)
+	require.Equal(t, unset.MachineName, other.MachineName)
 }
 
 func TestConfiguredMode(t *testing.T) {
