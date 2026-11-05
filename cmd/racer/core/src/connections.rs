@@ -59,6 +59,10 @@ pub struct Config {
     pub backlog: usize,
     /// How long an idle connection stays open, in nanoseconds.
     pub idle_timeout: u64,
+    /// Not production: a full listener closes its longest-idle inbound connection to accept a
+    /// new one, rather than leaving the new one in the accept queue. The proposed fix for idle
+    /// connections pinning ingress slots (see `dst/MODEL.md`, "Peer connection slots").
+    pub evict_idle: bool,
 }
 
 impl Config {
@@ -78,6 +82,7 @@ impl Config {
             per_endpoint: limits.connections_per_neighbor.get(),
             backlog: LISTEN_BACKLOG,
             idle_timeout: IDLE_TIMEOUT_NS,
+            evict_idle: false,
         }
     }
 }
@@ -138,6 +143,8 @@ struct Pool {
 struct Listener {
     held: usize,
     queue: VecDeque<ConnId>,
+    /// Idle inbound connections by when they went idle (`Config::evict_idle` only).
+    idle: BTreeMap<(u64, ConnId), ()>,
 }
 
 /// Counters for reports.
@@ -151,6 +158,8 @@ pub struct Stats {
     pub overloaded_pool: u64,
     pub idle_cleared: u64,
     pub idle_expired: u64,
+    /// Idle inbound connections a full listener closed (`Config::evict_idle`).
+    pub idle_evicted: u64,
     pub most_queued: usize,
 }
 
@@ -193,6 +202,14 @@ impl Connections {
         self.conns.len()
     }
 
+    /// Connections running an exchange now.
+    pub fn busy(&self) -> usize {
+        self.conns
+            .values()
+            .filter(|c| c.state == State::Busy)
+            .count()
+    }
+
     /// Ingress slots `node` holds and connections waiting in its accept queue.
     pub fn ingress(&self, node: u32) -> (usize, usize) {
         self.listeners
@@ -230,7 +247,15 @@ impl Connections {
         }
         if let Some(id) = endpoint.idle.pop() {
             endpoint.busy += 1;
-            self.conns.get_mut(&id).expect("idle connection").state = State::Busy;
+            let conn = self.conns.get_mut(&id).expect("idle connection");
+            if let (State::Idle { until }, true) = (conn.state, config.evict_idle)
+                && let Some(listener) = self.listeners.get_mut(&to)
+            {
+                listener
+                    .idle
+                    .remove(&(until.saturating_sub(config.idle_timeout), id));
+            }
+            conn.state = State::Busy;
             self.stats.reused += 1;
             return Acquire::Reused(id);
         }
@@ -262,6 +287,16 @@ impl Connections {
         pool.endpoints.entry(to).or_default().busy += 1;
         let id = self.next;
         self.next += 1;
+        if config.evict_idle
+            && self
+                .listeners
+                .get(&to)
+                .is_some_and(|l| l.held >= config.ingress)
+            && let Some(&(_, oldest)) = self.listeners.get(&to).and_then(|l| l.idle.keys().next())
+        {
+            self.stats.idle_evicted += 1;
+            self.close(oldest);
+        }
         let listener = self.listeners.entry(to).or_default();
         let (ingress, acquired) = if listener.held < config.ingress {
             listener.held += 1;
@@ -311,6 +346,14 @@ impl Connections {
         endpoint.busy -= 1;
         endpoint.idle.push(id);
         self.expiries.push(Reverse((until, id)));
+        if self.config.evict_idle {
+            let to = conn.to;
+            self.listeners
+                .get_mut(&to)
+                .expect("an accepted connection's listener")
+                .idle
+                .insert((now, id), ());
+        }
     }
 
     /// Close `id` (a failed or abandoned exchange, or an idle timeout), releasing its slots.
@@ -333,6 +376,11 @@ impl Connections {
             self.pools.remove(&key);
         }
         let listener = self.listeners.get_mut(&conn.to).expect("listener");
+        if let State::Idle { until } = conn.state {
+            listener
+                .idle
+                .remove(&(until.saturating_sub(self.config.idle_timeout), id));
+        }
         match conn.ingress {
             Ingress::Held => {
                 listener.held -= 1;
@@ -348,7 +396,7 @@ impl Connections {
             Ingress::Queued => listener.queue.retain(|i| *i != id),
             Ingress::Dropped => {}
         }
-        if listener.held == 0 && listener.queue.is_empty() {
+        if listener.held == 0 && listener.queue.is_empty() && listener.idle.is_empty() {
             self.listeners.remove(&conn.to);
         }
     }
@@ -370,7 +418,46 @@ mod tests {
             per_endpoint: 2,
             backlog: 1,
             idle_timeout: 100,
+            evict_idle: false,
         }
+    }
+
+    #[test]
+    fn a_full_listener_can_evict_its_longest_idle_connection() {
+        let mut c = Connections::new(Config {
+            evict_idle: true,
+            ..small()
+        });
+        let Acquire::Accepted(a) = c.acquire(0, 1, 0, 9) else {
+            panic!()
+        };
+        let Acquire::Accepted(b) = c.acquire(0, 2, 0, 9) else {
+            panic!()
+        };
+        c.finish(5, b);
+        c.finish(10, a);
+        // Full: the connection idle since 5 closes for the newcomer.
+        assert!(matches!(c.acquire(20, 3, 0, 9), Acquire::Accepted(_)));
+        assert_eq!(c.stats().idle_evicted, 1);
+        assert_eq!(c.ingress(9), (2, 0));
+        // Its owner reconnects: `a` is the only idle one left and goes next.
+        assert!(matches!(c.acquire(20, 2, 0, 9), Acquire::Accepted(_)));
+        assert_eq!(c.open(), 2);
+        // Busy connections are never evicted.
+        assert!(matches!(c.acquire(20, 4, 0, 9), Acquire::Queued(_)));
+        // A reused connection is busy again and not evictable.
+        let mut c = Connections::new(Config {
+            evict_idle: true,
+            ..small()
+        });
+        let Acquire::Accepted(a) = c.acquire(0, 1, 0, 9) else {
+            panic!()
+        };
+        c.acquire(0, 2, 0, 9);
+        c.finish(1, a);
+        assert_eq!(c.acquire(2, 1, 0, 9), Acquire::Reused(a));
+        assert!(matches!(c.acquire(3, 3, 0, 9), Acquire::Queued(_)));
+        assert_eq!(c.stats().idle_evicted, 0);
     }
 
     #[test]
