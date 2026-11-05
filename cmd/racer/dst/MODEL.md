@@ -815,6 +815,14 @@ scenarios at racer-sim defaults (seed 1, and seed 2 where noted):
 | lagging 200 | enrolled, unreachable polls (seed 1, 2) | 198, 190, 104 | 198, 142, 184 |
 | | client lag p99 ms | 77,309 | 77,309 |
 
+| enrollment-storm 10,000 | all enrolled at, enroll p50/p99 s | 44.4, 14.0 / 30.1 | 32.4, 15.0 / 30.1 |
+| | API requests, 429s, replies | 30,449, 371, 41,571 | 30,374, 286, 41,481 |
+| failover 10,000 | failover p50/max s | 27.9 / 27.9 | 28.6 / 33.5 |
+| | API requests, 429s, replies | 30,433, 326, 62,390 | 30,458, 348, 62,370 |
+| ctl-churn 10,000 | enrolled, membership version, replies | 9,500, 21, 116,007 | 9,500, 21, 116,102 |
+| lagging 10,000 | unreachable polls, client lag p99/max s | 8,136, 8.6 / 79.0 | 7,644, 8.6 / 79.0 |
+| | wall (release), peak RSS | 22.1 s, 163 MB | 11.7 s, 172 MB |
+
 Every control run has zero hard failures in both. Combined scenarios at racer-sim's test
 sizes (seed 1):
 
@@ -834,15 +842,19 @@ sizes (seed 1):
 
 Membership skew at the end, enrolled counts and membership versions match exactly in every
 combined run. Reads completed are 3-12% lower in the Model because its read load stops
-before the end (see above). Within tolerance except `full-failover` read failures (91 against
-10, all `Unavailable`): racer-sim attributes all ten to members whose clients are not ready
-(`reads_failed_while_members_unready`); the Model's come from the same window (members listed
-while their restarted clients hold no snapshot) and, by inference (not yet traced), from the site cut, which the
-Model enforces on every link between the two sites. Open; see Gaps.
+before the end (see above). Within tolerance except `full-failover` read failures (91 against 10, all `Unavailable`).
+Ablation (`CTL_NO_CUT=1`, `CTL_NO_BURSTS=1` on `combined_report`): without the site cut the
+Model fails 5 reads, without the origin bursts 90, so the excess comes from the cut between
+sites 0 and 1. Both harnesses fail a hop that crosses the cut (racer-sim
+`sim/src/node/world.rs:3464-3472`, Model `Model::cut`); racer-sim also opens link circuits
+after failures (`world.rs:3458-3462`), which the Model does not model (see Not modeled yet).
+That circuits steer racer-sim's later requests around the cut is an inference, not traced.
+Open; see Gaps.
 
 ### Gaps blocking racer-sim deletion
 
-- `full-failover` read failures differ by 9x at 200 nodes (above).
+- `full-failover` read failures differ by 9x at 200 nodes, from the site cut (above); needs
+  link circuits in the Model or a traced explanation.
 - No Full counterpart with enrolling clients against real authorities.
 - The Model has no racer-sim node report fields (`peer_requests_*`, `fills_failed`,
   `origin_repeats_*` classification used by racer-sim's `failover_repeats_are_skips_or_their_orphans`),

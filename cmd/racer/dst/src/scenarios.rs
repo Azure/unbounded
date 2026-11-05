@@ -877,11 +877,13 @@ pub fn combined(name: &str, nodes: u32, rate: f64, secs: Option<u64>) -> Scenari
                 .then_some(())
                 .ok_or(format!("counters {}", r["metrics"]["counters"]))
         });
+    // A 50,000-node run takes on the order of 10^9 read-path events.
     let mut scenario = Scenario::new(format!("model-{name}-{nodes}"))
         .nodes(nodes)
         .sites(4)
         .model(spec)
-        .end(d);
+        .end(d)
+        .max_steps(u64::MAX);
     for (at, fault) in slow {
         scenario = scenario.fault(at, fault);
     }
@@ -891,10 +893,12 @@ pub fn combined(name: &str, nodes: u32, rate: f64, secs: Option<u64>) -> Scenari
 /// Every built-in scenario.
 pub fn catalog() -> Vec<Scenario> {
     vec![
+        // Smaller than racer-sim's test sizes so the debug CI run stays fast; the parity table
+        // in `dst/MODEL.md` runs racer-sim's sizes through `tests/control.rs`.
         combined("full-cold-start", 200, 0.05, Some(120)),
-        combined("full-failover", 200, 0.2, Some(300)),
-        combined("full-churn", 320, 0.1, Some(400)),
-        combined("full-lagging", 300, 0.2, Some(600)),
+        combined("full-failover", 120, 0.05, Some(300)),
+        combined("full-churn", 160, 0.02, Some(400)),
+        combined("full-lagging", 150, 0.05, Some(300)),
         control("enrollment-storm", 200),
         control("failover", 200),
         control("ctl-churn", 320),

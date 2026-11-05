@@ -55,7 +55,17 @@ fn combined_report() {
     let seed = var("CTL_SEED").map_or(1, |s| s.parse().unwrap());
     let rate = var("CTL_RATE").map_or(0.05, |s| s.parse().unwrap());
     let secs = var("CTL_SECS").map(|s| s.parse().unwrap());
-    let scenario = scenarios::combined(&name, nodes, rate, secs);
+    let mut scenario = scenarios::combined(&name, nodes, rate, secs);
+    // `CTL_NO_CUT`, `CTL_NO_BURSTS`: drop the site cut or origin bursts (diagnostics).
+    if let Some(spec) = scenario.model.as_mut() {
+        let spec = std::rc::Rc::get_mut(spec).unwrap();
+        if var("CTL_NO_CUT").is_some() {
+            spec.site_cuts.clear();
+        }
+        if var("CTL_NO_BURSTS").is_some() {
+            spec.origin_bursts.clear();
+        }
+    }
     let started = std::time::Instant::now();
     let (outcome, report) = model::run(&scenario, Choices::seeded(seed));
     let text = serde_json::to_string_pretty(&report).unwrap();
