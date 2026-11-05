@@ -12,6 +12,7 @@ zeroize = "1"
 racer-io = { path = "../io" }
 
 [dev-dependencies]
+racer-io = { path = "../io" }
 
 [target.'cfg(loom)'.dev-dependencies]
 loom = "0.7"

@@ -18,7 +18,10 @@ use page_alloc::{
 use racer_io::scoped::Reactor;
 use racer_io::sim::{Fault, SimOs};
 use racer_io::{Operation, Scope};
-use racer_sim::alloc_model::{SegmentClock, SegmentEntries};
+#[path = "support/clock.rs"]
+mod clock;
+
+use clock::{SegmentClock, SegmentEntries};
 use std::{
     cell::{Cell, RefCell},
     collections::{BTreeMap, VecDeque},
