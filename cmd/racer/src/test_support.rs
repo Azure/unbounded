@@ -1000,7 +1000,11 @@ pub(crate) mod security {
                 .unwrap();
                 keys.install_signing_identity(Arc::new(identity)).unwrap();
                 let certificates = Rc::new(Certificates::new(cluster.clone(), keys.clone()));
-                let signatures = Rc::new(Signatures::new(keys.clone(), certificates.clone()));
+                let signatures = Rc::new(Signatures::new(
+                    keys.clone(),
+                    certificates.clone(),
+                    crate::test_support::ctx(),
+                ));
                 Identity {
                     keys,
                     certificates,

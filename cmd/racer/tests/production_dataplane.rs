@@ -537,7 +537,11 @@ impl Rig {
             .unwrap(),
         );
         let certificates = Rc::new(Certificates::new(ClusterId(CLUSTER.into()), keys.clone()));
-        let signatures = Rc::new(Signatures::new(keys.clone(), certificates));
+        let signatures = Rc::new(Signatures::new(
+            keys.clone(),
+            certificates,
+            racer_io::WorkerCtx::host(),
+        ));
         let forwarding = Rc::new(Forwarding::new(signatures.clone()));
         let transfers = Rc::new(Transfers::new(
             http.clone(),
@@ -968,7 +972,11 @@ impl Bootstrap {
     ) -> Self {
         let certificates = Rc::new(Certificates::new(ClusterId(CLUSTER.into()), sender.clone()));
         Self {
-            sender: Forwarding::new(Rc::new(Signatures::new(sender.clone(), certificates))),
+            sender: Forwarding::new(Rc::new(Signatures::new(
+                sender.clone(),
+                certificates,
+                racer_io::WorkerCtx::host(),
+            ))),
             receiver,
             credentials: CredentialCrypto::new(sender, admission),
             coordinator,

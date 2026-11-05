@@ -88,6 +88,7 @@ pub enum EnvelopeOutput {
 pub struct EnvelopeJob {
     keys: racer_crypto::identity::Keyring,
     certificates: racer_crypto::identity::CertificateVerifier,
+    ctx: racer_io::WorkerCtx,
     input: EnvelopeInput,
 }
 
@@ -99,10 +100,11 @@ impl EnvelopeJob {
         let Self {
             keys,
             certificates,
+            ctx,
             input,
         } = self;
         let certificates = Rc::new(certificates.into_local());
-        let verifier = Forwarding::new(Rc::new(Signatures::new(Rc::new(keys), certificates)));
+        let verifier = Forwarding::new(Rc::new(Signatures::new(Rc::new(keys), certificates, ctx)));
         let proof = scope
             .check()
             .and_then(|()| match &input {
@@ -145,6 +147,7 @@ impl EnvelopeJob {
                     input: crate::security::CryptoInput::VerifyEnvelope(Box::new(Self {
                         keys,
                         certificates,
+                        ctx: verifier.signatures.ctx().clone(),
                         input,
                     })),
                     error,
@@ -173,8 +176,8 @@ pub struct RequestBinding {
     deadline: u64,
 }
 impl RequestBinding {
-    pub(crate) fn retained_proof(&self) -> Result<&SignedHead> {
-        check_request_deadline(self)?;
+    pub(crate) fn retained_proof(&self, clock: &racer_io::Clock) -> Result<&SignedHead> {
+        check_request_deadline(self, clock)?;
         if field(&self.original.head, "racer-kind")? != "request"
             || self.deadline > number(&self.original.head, "racer-route-deadline")?
         {
@@ -342,6 +345,7 @@ impl Forwarding {
         let job = Box::new(EnvelopeJob {
             keys,
             certificates,
+            ctx: self.signatures.ctx().clone(),
             input,
         });
         let output = if let Some(crypto) = &self.crypto {
@@ -432,7 +436,7 @@ impl Forwarding {
         next: &NodeId,
     ) -> Result<(SignedRequest, RequestBinding)> {
         let route = RouteState::from_budget(&request.route)?;
-        if route.deadline <= protocol::millis(uring_runtime::environment::wall_now())? {
+        if route.deadline <= protocol::millis(self.signatures.ctx().clock.wall_now())? {
             return Err(Error::DeadlineExceeded);
         }
         if route.visited != [self.signatures.node().clone()]
@@ -511,7 +515,7 @@ impl Forwarding {
         {
             return Err(Error::Unauthorized);
         }
-        if route.deadline <= protocol::millis(uring_runtime::environment::wall_now())? {
+        if route.deadline <= protocol::millis(self.signatures.ctx().clock.wall_now())? {
             return Err(Error::DeadlineExceeded);
         }
         if receiver(&previous.head)? != *self.signatures.node() {
@@ -533,7 +537,7 @@ impl Forwarding {
         request: &RequestBinding,
         response: PeerResponse,
     ) -> Result<SignedResponse> {
-        check_request_deadline(request)?;
+        check_request_deadline(request, &self.signatures.ctx().clock)?;
         // A retained subscription must not outlive retired request keys/trust.
         self.signatures.verify_retained_request(request)?;
         if request.path.last() != Some(self.signatures.node()) || request.path.len() < 2 {
@@ -542,7 +546,7 @@ impl Forwarding {
         let mut head =
             protocol::response_head(&response, &signed_digest(&request.original)?, &request.path)?;
         check_grant_deadline(&head, request)?;
-        response_matches(&head, &request.original.head)?;
+        response_matches(&head, &request.original.head, &self.signatures.ctx().clock)?;
         response_authority(&head, &request.original.head, self.signatures.node())?;
         push(
             &mut head,
@@ -678,7 +682,7 @@ impl Forwarding {
         expected: &MessageHead,
         request: &RequestBinding,
     ) -> Result<(VerifiedPeer, Vec<VerifiedPeer>)> {
-        check_request_deadline(request)?;
+        check_request_deadline(request, &self.signatures.ctx().clock)?;
         self.signatures.verify_retained_request(request)?;
         check_grant_deadline(&auth.original.head, request)?;
         if auth.hops.len() >= protocol::MAX_HOPS {
@@ -701,7 +705,11 @@ impl Forwarding {
         {
             return Err(Error::Unauthorized);
         }
-        response_matches(&auth.original.head, &request.original.head)?;
+        response_matches(
+            &auth.original.head,
+            &request.original.head,
+            &self.signatures.ctx().clock,
+        )?;
         response_authority(&auth.original.head, &request.original.head, origin.node())?;
         if receiver(&auth.original.head)? != path[path.len() - 2] {
             return Err(Error::Unauthorized);
@@ -764,13 +772,13 @@ impl Forwarding {
         next_hop: &NodeId,
         budget: RouteBudget,
     ) -> Result<SignedRequest> {
-        check_request_deadline(&request.binding)?;
+        check_request_deadline(&request.binding, &self.signatures.ctx().clock)?;
         if request.binding.path.last() != Some(self.signatures.node()) {
             return Err(Error::Unauthorized);
         }
         let old = RouteState::from_budget(&request.signed.request.route)?;
         let next = RouteState::from_budget(&budget)?;
-        if next.deadline <= protocol::millis(uring_runtime::environment::wall_now())? {
+        if next.deadline <= protocol::millis(self.signatures.ctx().clock.wall_now())? {
             return Err(Error::DeadlineExceeded);
         }
         old.transition(&next, self.signatures.node())?;
@@ -806,7 +814,7 @@ impl Forwarding {
         binding: &RequestBinding,
         previous_hop: &NodeId,
     ) -> Result<()> {
-        check_request_deadline(binding)?;
+        check_request_deadline(binding, &self.signatures.ctx().clock)?;
         let path =
             protocol::decode_nodes(field(&auth.original.head, "racer-response-path")?.as_bytes())?;
         let index = path
@@ -881,7 +889,11 @@ fn response_hop_head(
         .map_err(Into::into)
 }
 use racer_core::route;
-fn response_matches(response: &MessageHead, request: &MessageHead) -> Result<()> {
+fn response_matches(
+    response: &MessageHead,
+    request: &MessageHead,
+    clock: &racer_io::Clock,
+) -> Result<()> {
     let outcome = field(response, "racer-outcome")?;
     if outcome == "selected" {
         if field(request, "racer-operation")? != "subscribe" {
@@ -914,7 +926,7 @@ fn response_matches(response: &MessageHead, request: &MessageHead) -> Result<()>
                 {
                     u64::MAX
                 } else {
-                    protocol::millis(uring_runtime::environment::wall_now())?
+                    protocol::millis(clock.wall_now())?
                 },
             )
             || !route::page_budget_ok(
@@ -1008,8 +1020,8 @@ fn response_authority(
     }
     Ok(())
 }
-fn check_request_deadline(request: &RequestBinding) -> Result<()> {
-    if request.deadline <= protocol::millis(uring_runtime::environment::wall_now())? {
+fn check_request_deadline(request: &RequestBinding, clock: &racer_io::Clock) -> Result<()> {
+    if request.deadline <= protocol::millis(clock.wall_now())? {
         return Err(Error::DeadlineExceeded);
     }
     Ok(())
@@ -1654,7 +1666,10 @@ mod tests {
             &[node(0), node(2)],
         )
         .unwrap();
-        assert_eq!(response_matches(&empty, &head), Ok(()));
+        assert_eq!(
+            response_matches(&empty, &head, &crate::test_support::clock()),
+            Ok(())
+        );
         assert_eq!(
             response_authority(&empty, &head, &node(1)),
             Err(Error::Unauthorized)
@@ -1674,7 +1689,10 @@ mod tests {
             &[node(0), node(2)],
         )
         .unwrap();
-        assert_eq!(response_matches(&response, &head), Ok(()));
+        assert_eq!(
+            response_matches(&response, &head, &crate::test_support::clock()),
+            Ok(())
+        );
         for name in [
             "racer-page",
             "racer-page-present",
@@ -1695,14 +1713,24 @@ mod tests {
                 .find(|h| h.name == name)
                 .unwrap()
                 .value = b"9".to_vec();
-            assert!(response_matches(&bad, &head).is_err(), "{name}");
+            assert!(
+                response_matches(&bad, &head, &crate::test_support::clock()).is_err(),
+                "{name}"
+            );
         }
         request.operation = Operation::Metadata {
             object: request.origin.object.clone(),
             selector: MetadataSelector::Fresh,
             mode: FetchMode::Acquire,
         };
-        assert!(response_matches(&response, &protocol::request_head(&request).unwrap()).is_err());
+        assert!(
+            response_matches(
+                &response,
+                &protocol::request_head(&request).unwrap(),
+                &crate::test_support::clock()
+            )
+            .is_err()
+        );
         assert!(
             protocol::response_head(
                 &PeerResponse::Bootstrap {

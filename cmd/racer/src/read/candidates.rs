@@ -4503,6 +4503,7 @@ pub(super) mod tests {
             let signatures = Rc::new(Signatures::new(
                 keys.clone(),
                 Rc::new(Certificates::new(config.cluster, keys.clone())),
+                crate::test_support::ctx(),
             ));
             // Real network requester/transport plus the same strong reclamation
             // captures as production. No I/O or slab file is opened in this test.

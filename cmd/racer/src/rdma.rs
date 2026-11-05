@@ -523,7 +523,7 @@ pub(crate) mod tests {
             .unwrap();
             keys.install_signing_identity(Arc::new(identity)).unwrap();
             let certificates = Rc::new(Certificates::new(cluster, keys.clone()));
-            let signatures = Signatures::new(keys, certificates);
+            let signatures = Signatures::new(keys, certificates, crate::test_support::ctx());
             let setup = link_setup::Setup::new(RailId(9), [1; 32], 8, 2)
                 .unwrap()
                 .encode();

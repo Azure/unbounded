@@ -91,7 +91,11 @@ impl Signatures {
         peer_wire::test_util::sign_fields(&self.inner, head).map_err(Into::into)
     }
 
-    pub fn new(keys: Rc<Keyring>, certificates: Rc<Certificates>) -> Self {
+    pub fn new(
+        keys: Rc<Keyring>,
+        certificates: Rc<Certificates>,
+        ctx: racer_io::WorkerCtx,
+    ) -> Self {
         Self {
             keys: keys.clone(),
             certificates: certificates.clone(),
@@ -99,13 +103,21 @@ impl Signatures {
                 keys,
                 certificates,
                 Rc::new(RequestMac),
-                // MIGRATION: the thread environment until workers receive a WorkerCtx.
-                uring_runtime::environment::Environment::current().worker_ctx(),
+                ctx,
             )),
         }
     }
     pub fn node(&self) -> &NodeId {
         self.inner.node()
+    }
+    /// The same identity on another worker context.
+    #[cfg(test)]
+    pub(crate) fn with_ctx(&self, ctx: racer_io::WorkerCtx) -> Self {
+        Self::new(self.keys.clone(), self.certificates.clone(), ctx)
+    }
+    /// The worker's time and entropy.
+    pub fn ctx(&self) -> &racer_io::WorkerCtx {
+        self.inner.ctx()
     }
     pub(crate) fn for_offload(&self) -> (Keyring, racer_crypto::identity::CertificateVerifier) {
         ((*self.keys).clone(), self.certificates.for_offload())
@@ -131,7 +143,7 @@ impl Signatures {
         &self,
         binding: &super::forwarding::RequestBinding,
     ) -> Result<VerifiedPeer> {
-        let signed = binding.retained_proof()?;
+        let signed = binding.retained_proof(&self.ctx().clock)?;
         self.inner
             .verify_retained_request(signed, number(&signed.head, "racer-route-deadline")?)
             .map_err(Into::into)

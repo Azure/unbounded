@@ -48,7 +48,6 @@ use racer_io::ring::IoBuffer;
 use std::rc::Rc;
 use std::sync::Arc;
 use std::time::Duration;
-use uring_runtime::environment::now;
 
 const HEADER: &str = "racer-payload-control";
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -90,9 +89,10 @@ impl Binding {
         membership: u64,
         scope: &RequestScope,
         rail: RailId,
+        rng: &racer_io::Rng,
     ) -> Result<Self> {
         let mut transfer = [0; 16];
-        uring_runtime::environment::fill_random(&mut transfer).map_err(|_| Error::Unavailable)?;
+        rng.fill(&mut transfer).map_err(|_| Error::Unavailable)?;
         Ok(Self {
             request: envelope_digest(auth)?,
             response: [0; 32],
@@ -201,7 +201,7 @@ fn native_scope(scope: &RequestScope) -> RequestScope {
     bounded.deadline.0 = bounded
         .deadline
         .0
-        .min(uring_runtime::environment::now() + Duration::from_secs(5));
+        .min(scope.clock().now() + Duration::from_secs(5));
     bounded
 }
 fn native_failure(error: Error, scope: &RequestScope) -> bool {
@@ -290,7 +290,7 @@ impl Transfers {
         let Some(links) = &self.links else {
             return Ok((connection, false));
         };
-        let serving = now();
+        let serving = scope.clock().now();
         let peer = accept.peer.node();
         let (PeerResponse::Page { ciphertext, .. } | PeerResponse::Selected { ciphertext, .. }) =
             &response.response
@@ -333,7 +333,7 @@ impl Transfers {
         binding.response = envelope_digest(&response.authentication)?;
         let previous = signed_digest(&accept.signed)?;
         // `Links::send` writes the page in place, or stages a copy without ODP.
-        let sending = now();
+        let sending = scope.clock().now();
         let sent = links
             .send(peer, &grant, ciphertext, &native_scope(scope))
             .await;
@@ -449,6 +449,7 @@ impl Transfers {
             request.request.route.membership.0,
             scope,
             rail,
+            &self.io.reactor().ctx().rng,
         )?;
         let landed = match landing {
             Some(ordinal)
@@ -1335,7 +1336,7 @@ impl Transfers {
                 timing.end(1);
             }
             // Native response verification requires an authenticated membership lease.
-            let granting = now();
+            let granting = scope.clock().now();
             let native = if membership.is_some() {
                 self.accept_native(&request, plan, landing, scope).await?
             } else {
@@ -1370,7 +1371,7 @@ impl Transfers {
             if let Some(timing) = timing.as_deref_mut() {
                 timing.begin();
             }
-            let heading = now();
+            let heading = scope.clock().now();
             let sent = observer.result(
                 Stage::PeerHead,
                 scope,
@@ -1404,7 +1405,7 @@ impl Transfers {
             let (authentication, length) = decode_envelope(received.value, true)?;
             if let Some(control) = control {
                 let (binding, accept, peer, pending) = native.ok_or(Error::Unauthorized)?;
-                let arriving = now();
+                let arriving = scope.clock().now();
                 let received = self
                     .receive_native(
                         received.connection,
@@ -1532,7 +1533,7 @@ impl Transfers {
                             reads,
                             first: first.map(timestamp).unwrap_or_default(),
                             last: last.map(timestamp).unwrap_or_default(),
-                            now: timestamp(uring_runtime::environment::now()),
+                            now: timestamp(scope.clock().now()),
                             original: scope
                                 .body_deadlines
                                 .map(|d| timestamp(d.0))
@@ -1565,7 +1566,7 @@ impl Transfers {
                     return Err(Error::Io);
                 }
                 offset += completion.bytes;
-                let now = uring_runtime::environment::now();
+                let now = scope.clock().now();
                 first.get_or_insert(now);
                 last = Some(now);
                 reads = reads.saturating_add(1);
@@ -1644,7 +1645,7 @@ pub(crate) async fn relay_body(
                 tick.deadline.0 = tick
                     .deadline
                     .0
-                    .min(uring_runtime::environment::now() + Duration::from_millis(10));
+                    .min(scope.clock().now() + Duration::from_millis(10));
                 tick
             },
             |error| error == Error::DeadlineExceeded,

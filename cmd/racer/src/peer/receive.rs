@@ -11,7 +11,6 @@ use flow_control::{Charge, Quotas};
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
-use uring_runtime::environment::now;
 
 #[derive(Clone, Copy, Debug)]
 pub struct Config {
@@ -102,7 +101,7 @@ impl Gate {
         if self.config.active == 0 {
             return Ok(None);
         }
-        let deadline = scope.deadline.0.min(now() + self.config.wait);
+        let deadline = scope.deadline.0.min(scope.clock().now() + self.config.wait);
         let mut state = self.state.lock().map_err(|_| Error::Unavailable)?;
         if state.queued() >= self.config.queued {
             self.metrics.record(Event::PeerReceiveFull, 1);
@@ -120,7 +119,7 @@ impl Gate {
             id,
             deadline,
             charge: Some(charge),
-            started: now(),
+            started: scope.clock().now(),
             terminal: false,
         }))
     }
@@ -151,7 +150,7 @@ impl Gate {
         let wakes = {
             let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
             state.poll_deadlines(budget, |scope, deadline| {
-                now() >= deadline || scope.check().is_err()
+                scope.clock().now() >= deadline || scope.check().is_err()
             })
         };
         for wake in wakes {
@@ -173,7 +172,7 @@ impl Ticket {
         cx: &mut Context<'_>,
     ) -> Poll<Result<Arc<Permit>>> {
         if let Err(error) = scope.check().and_then(|()| {
-            if now() >= self.deadline {
+            if scope.clock().now() >= self.deadline {
                 Err(Error::DeadlineExceeded)
             } else {
                 Ok(())
@@ -203,7 +202,9 @@ impl Ticket {
             self.gate.metrics.record(Event::PeerReceiveAdmitted, 1);
             self.gate.metrics.record(
                 Event::PeerReceiveWaitNs,
-                now()
+                scope
+                    .clock()
+                    .now()
                     .saturating_duration_since(self.started)
                     .as_nanos()
                     .min(u64::MAX as u128) as u64,
@@ -266,6 +267,11 @@ impl Drop for Permit {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn now() -> Instant {
+        crate::test_support::clock().now()
+    }
+
     #[test]
     fn worker_handles_share_fifo_but_not_counter_shards() {
         let metrics = Metrics::for_workers(2).unwrap();

@@ -1622,6 +1622,8 @@ fn opaque_head_rejects_binding_length_authority_and_reverse_proof_substitution()
             );
             let environment = clock.environment(0);
             let _guard = environment.enter();
+            // The forwarder reads time from its own context, now the later one.
+            let b = Forwarding::new(Rc::new(signers[1].with_ctx(environment.worker_ctx())));
             assert!(
                 b.forward_opaque(response, 0, &binding, signers[0].node())
                     .is_err()

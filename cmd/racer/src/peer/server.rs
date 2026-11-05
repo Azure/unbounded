@@ -457,11 +457,7 @@ impl PeerServer {
             // One fixed budget for handshake reads, verification, signing, writes,
             // and the incoming application head. Partial progress never renews it.
             // Only application dispatch/response I/O use the signed deadline below.
-            let header_scope = header_scope(
-                scope,
-                self.request_timeout,
-                uring_runtime::environment::now(),
-            )?;
+            let header_scope = header_scope(scope, self.request_timeout, scope.clock().now())?;
             let connection = self
                 .authenticate_connection(connection, &header_scope)
                 .await?;
@@ -941,7 +937,7 @@ impl PeerServer {
                     membership.version,
                     request.origin().node().clone(),
                     encode_deadline(scope.deadline)?,
-                    millis(uring_runtime::environment::wall_now())?,
+                    millis(scope.clock().wall_now())?,
                 )?
             } else {
                 self.subscriptions
@@ -981,7 +977,7 @@ impl PeerServer {
                                     metadata,
                                     ciphertext,
                                 },
-                                millis(uring_runtime::environment::wall_now())?,
+                                millis(scope.clock().wall_now())?,
                             )?;
                         }
                         Ok(other) => {
@@ -1003,7 +999,7 @@ impl PeerServer {
                     if let Err(error) = scope.check() {
                         return std::task::Poll::Ready(Err(error));
                     }
-                    let now = match millis(uring_runtime::environment::wall_now()) {
+                    let now = match millis(scope.clock().wall_now()) {
                         Ok(now) => now,
                         Err(error) => return std::task::Poll::Ready(Err(error)),
                     };

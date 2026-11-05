@@ -219,7 +219,8 @@ mod faults {
                 self.nodes[sender].config.cluster.clone(),
                 keys.clone(),
             ));
-            let signatures = Signatures::new(keys, certificates.clone());
+            let signatures =
+                Signatures::new(keys, certificates.clone(), crate::test_support::ctx());
             let peer = self.nodes[receiver].config.node.clone();
             let mut head = MessageHead {
                 start: StartLine::Request {
@@ -841,6 +842,7 @@ mod scenarios {
                 sender.config.cluster.clone(),
                 keys.clone(),
             )),
+            crate::test_support::ctx(),
         )));
         let credentials = CredentialCrypto::new(keys, sender.workers[0].runtime.admission.clone());
         let scope = scope(Duration::from_secs(5)).unwrap();
@@ -990,6 +992,7 @@ mod scenarios {
                 harness.nodes[source].config.cluster.clone(),
                 sender.keys.clone(),
             )),
+            crate::test_support::ctx(),
         ));
         let forwarding = Forwarding::new(signatures);
         let credentials =

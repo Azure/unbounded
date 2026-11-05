@@ -1222,7 +1222,11 @@ impl WorkerApplication {
             node.publications.clone(),
             keys.clone(),
         ));
-        let signatures = Rc::new(Signatures::new(keys.clone(), certificates.clone()));
+        let signatures = Rc::new(Signatures::new(
+            keys.clone(),
+            certificates.clone(),
+            reactor.ctx().clone(),
+        ));
         let forwarding = Rc::new(Forwarding::with_crypto(
             signatures.clone(),
             runtime.crypto.clone(),
