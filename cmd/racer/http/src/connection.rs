@@ -304,6 +304,9 @@ pub struct ConnectionLease<C: Context> {
 
     reusable: bool,
 
+    /// Checked out from the idle pool rather than freshly connected.
+    reused: bool,
+
     read_ahead: Option<(OwnedBuffer<C>, Range<usize>)>,
 
     /// Descriptors from the receive that produced `read_ahead`. They belong to
@@ -613,7 +616,30 @@ impl<C: Context> HttpIo<C> {
     ) -> Operation<'a, C, HeadCompletion<C, MessageHead>> {
         Box::pin(async move {
             let completed = self
-                .receive_head_outcome(connection, scope, header_limit, false, None)
+                .receive_head_outcome(connection, scope, header_limit, false, None, None)
+                .await?;
+            Ok(HeadCompletion {
+                connection: completed.connection,
+                value: completed.value?,
+                _decoded: completed._decoded,
+            })
+        })
+    }
+
+    /// [`Self::receive_head_limited`] that also reports, on failure, whether
+    /// any response byte had arrived. `started` is set once a byte is seen,
+    /// so a caller can tell a peer that closed an idle socket (nothing
+    /// received) from one that failed mid-head.
+    pub fn receive_head_observed<'a>(
+        &'a self,
+        connection: ConnectionLease<C>,
+        scope: &'a C::Scope,
+        header_limit: usize,
+        started: &'a std::cell::Cell<bool>,
+    ) -> Operation<'a, C, HeadCompletion<C, MessageHead>> {
+        Box::pin(async move {
+            let completed = self
+                .receive_head_outcome(connection, scope, header_limit, false, None, Some(started))
                 .await?;
             Ok(HeadCompletion {
                 connection: completed.connection,
@@ -632,7 +658,7 @@ impl<C: Context> HttpIo<C> {
         scope: &'a C::Scope,
         header_limit: usize,
     ) -> Operation<'a, C, HeadCompletion<C, Result<C, MessageHead>>> {
-        self.receive_head_outcome(connection, scope, header_limit, true, None)
+        self.receive_head_outcome(connection, scope, header_limit, true, None, None)
     }
 
     /// Like [`Self::receive_request_head_limited`], but read with `recvmsg` and
@@ -648,7 +674,14 @@ impl<C: Context> HttpIo<C> {
         Box::pin(async move {
             let sink = Rc::new(RefCell::new(ReceivedDescriptors::default()));
             let completed = self
-                .receive_head_outcome(connection, scope, header_limit, true, Some(sink.clone()))
+                .receive_head_outcome(
+                    connection,
+                    scope,
+                    header_limit,
+                    true,
+                    Some(sink.clone()),
+                    None,
+                )
                 .await?;
             let descriptors = std::mem::take(&mut *sink.borrow_mut());
             Ok(HeadCompletion {
@@ -669,6 +702,7 @@ impl<C: Context> HttpIo<C> {
         header_limit: usize,
         request_only: bool,
         ancillary: Option<Rc<RefCell<ReceivedDescriptors>>>,
+        started: Option<&'a std::cell::Cell<bool>>,
     ) -> Operation<'a, C, HeadCompletion<C, Result<C, MessageHead>>> {
         Box::pin(async move {
             scope.check()?;
@@ -703,6 +737,11 @@ impl<C: Context> HttpIo<C> {
                 buffer.bytes[..used].copy_from_slice(&ahead.bytes[range]);
             }
             loop {
+                if used > 0
+                    && let Some(started) = started
+                {
+                    started.set(true);
+                }
                 let (complete, malformed) = scan.advance(&buffer.bytes[..used]);
                 let decoded_charge = if complete {
                     Some(
@@ -1193,6 +1232,7 @@ impl<C: Context> ConnectionLease<C> {
             reservation: Some(Rc::new(slot)),
             pool,
             reusable: false,
+            reused: false,
             read_ahead: None,
             ahead_descriptors: ReceivedDescriptors::default(),
             rx_remaining: None,
@@ -1202,6 +1242,13 @@ impl<C: Context> ConnectionLease<C> {
             kernel_tls: None,
             relay: None,
         }
+    }
+
+    /// Whether this lease came from the idle pool. The peer may have closed
+    /// such a socket while it was idle, so a request that fails on it before
+    /// any response byte arrives was likely never processed.
+    pub fn reused(&self) -> bool {
+        self.reused
     }
 
     /// Whether this connection's record layer is kernel TLS.
@@ -1733,6 +1780,7 @@ impl<C: Context> HttpPool<C> {
                 ConnectionLease::new(idle.fd, idle.reservation, idle.state, slot.0.take());
             lease.kernel_tls = idle.kernel_tls;
             lease.relay = idle.relay;
+            lease.reused = true;
             return Ok((lease, None));
         }
         if let Some(e) = rejected {
@@ -1913,6 +1961,19 @@ impl<C: Context> HttpPool<C> {
                 std::mem::take(&mut e.idle)
             })
         };
+        drop(garbage);
+    }
+
+    /// Close the idle connections of `endpoint`, for example after one was
+    /// found closed by its peer, so the next checkout connects afresh. Active
+    /// leases and other endpoints are unaffected.
+    pub fn discard_idle(&self, endpoint: &C::Endpoint) {
+        let garbage = self
+            .state
+            .borrow_mut()
+            .entries
+            .get_mut(endpoint)
+            .map(|entry| std::mem::take(&mut entry.idle));
         drop(garbage);
     }
 

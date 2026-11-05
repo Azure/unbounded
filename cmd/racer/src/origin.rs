@@ -130,13 +130,12 @@ impl OriginClient {
         scope.check()?;
         self.validate_reservation(&reservation, context)?;
         let mut head = request(context, "GET")?;
-        head.headers.push(Header::new("Range", b"bytes=0-16777215"));
-        let connection = self
-            .pool
-            .checkout_wait(endpoint, scope)
-            .await
-            .map_err(response_error)?;
-        let mut response = self.exchange_head(connection, head, scope).await?;
+        // The first page, as the page fetch below would request it.
+        head.headers.push(Header::new(
+            "Range",
+            format!("bytes=0-{}", PAGE_BYTES - 1).as_bytes(),
+        ));
+        let mut response = self.exchange_head(endpoint, false, head, scope).await?;
         let (metadata, length) = validate_bootstrap(&response.value, &context.object)?;
         if length == 0 {
             scope.check()?;
@@ -196,12 +195,7 @@ impl OriginClient {
         }
         // HEAD has no plaintext reservation and uses metadata connection admission.
         // Where the endpoint cap permits, GETs leave a slot available for HEAD.
-        let connection = self
-            .pool
-            .checkout_metadata(endpoint, scope)
-            .await
-            .map_err(response_error)?;
-        let mut response = self.exchange_head(connection, head, scope).await?;
+        let mut response = self.exchange_head(endpoint, true, head, scope).await?;
         // A pinned 404 is a broken origin contract, not permission to refresh.
         validate_response(
             &response.value,
@@ -253,12 +247,7 @@ impl OriginClient {
         head.headers
             .push(Header::new("If-Match", page.version.etag.as_bytes()));
         self.validate_reservation(&reservation, context)?;
-        let connection = self
-            .pool
-            .checkout_wait(endpoint, scope)
-            .await
-            .map_err(response_error)?;
-        let response = self.exchange_head(connection, head, scope).await?;
+        let response = self.exchange_head(endpoint, false, head, scope).await?;
         let (_, length) = validate_page_head(&response.value, page)?;
         let buffer = self.buffers.plaintext(reservation, length as usize)?;
         let mut body = self.read_page(response.connection, buffer, scope).await?;
@@ -286,22 +275,39 @@ impl OriginClient {
         Ok(())
     }
 
-    /// Exchange bounded heads after the caller selects metadata or body admission.
+    /// Check out a connection under metadata or body admission and exchange
+    /// bounded heads. A request that fails on a reused idle connection before
+    /// any response byte retries once after dropping the endpoint's idle
+    /// connections, so it runs on a fresh one: the adapter most likely closed
+    /// the idle socket and never saw the request.
     async fn exchange_head(
         &self,
-        connection: ConnectionLease,
+        endpoint: &Endpoint,
+        metadata: bool,
         head: MessageHead,
         scope: &RequestScope,
-    ) -> Result<http1::connection::HeadCompletion<crate::http::HttpContext, MessageHead>> {
-        let sent = self
-            .io
-            .send_head(connection, head, scope)
-            .await
+    ) -> Result<crate::http::HeadExchange> {
+        let mut retry = Some(crate::http::copy_head(&head));
+        let mut head = head;
+        loop {
+            let connection = if metadata {
+                self.pool.checkout_metadata(endpoint, scope).await
+            } else {
+                self.pool.checkout_wait(endpoint, scope).await
+            }
             .map_err(response_error)?;
-        self.io
-            .receive_head_limited(sent.connection, scope, 32 * 1024)
-            .await
-            .map_err(response_error)
+            match crate::http::exchange_head(&self.io, connection, head, scope, 32 * 1024).await {
+                Ok(response) => return Ok(response),
+                Err(failure) if failure.stale && scope.check().is_ok() => {
+                    let Some(again) = retry.take() else {
+                        return Err(response_error(failure.error));
+                    };
+                    self.pool.discard_idle(endpoint);
+                    head = again;
+                }
+                Err(failure) => return Err(response_error(failure.error)),
+            }
+        }
     }
 
     async fn read_page(

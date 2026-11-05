@@ -787,3 +787,42 @@ fn admission_wait_does_not_spend_an_address_attempt() {
     drop(transport);
     server.join().unwrap();
 }
+
+/// Storage closes a pooled connection after the next request arrives but
+/// before answering, as when its idle timeout races the request. The request
+/// retries once on a fresh connection.
+#[test]
+fn reused_connection_closed_before_response_retries_on_fresh_connection() {
+    use std::io::{Read as _, Write as _};
+    let Some(reactor) = reactor() else { return };
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    let blobs = Arc::new(Mutex::new(Blobs {
+        etag: "\"v1\"".into(),
+    }));
+    let server = std::thread::spawn(move || {
+        let (mut first, _) = listener.accept().unwrap();
+        let (head, _) = crate::remote::tests::read_request(&mut first).unwrap();
+        first.write_all(&azure(&head, &blobs)).unwrap();
+        // The next request arrives and the socket closes unanswered.
+        crate::remote::tests::read_request(&mut first).unwrap();
+        drop(first);
+        let (mut second, _) = listener.accept().unwrap();
+        let (head, _) = crate::remote::tests::read_request(&mut second).unwrap();
+        second.write_all(&azure(&head, &blobs)).unwrap();
+        let _ = second.read_to_end(&mut Vec::new());
+    });
+    let url = format!("http://127.0.0.1:{}/account/models", address.port());
+    let f = fixture(
+        reactor,
+        &url,
+        AzureCredential::Anonymous,
+        MapResolver::new(vec![]),
+        TrustRoots::at("/nonexistent/racer-bundle.pem".into()),
+        AnonymousOnly,
+    );
+    assert_eq!(f.metadata("small").unwrap().metadata.length, 5);
+    assert_eq!(f.metadata("small").unwrap().metadata.length, 5);
+    drop(f);
+    server.join().unwrap();
+}

@@ -14,7 +14,7 @@
 use super::{AzureExchange, AzureTransport};
 use crate::admission::AdmissionPolicy;
 use crate::error::{Error, Operation, Result};
-use crate::http::{ConnectionLease, Endpoint, HttpIo, HttpPool};
+use crate::http::{ConnectionLease, Endpoint, HttpIo, HttpPool, exchange_head};
 use crate::memory::PlaintextBuffer;
 use crate::model::parse_decimal;
 use crate::remote::{RemoteEndpoint, Resolver};
@@ -173,6 +173,44 @@ impl PoolTransport {
         self.endpoints.borrow().len()
     }
 
+    /// Check out a connection, failing over across resolved addresses.
+    async fn checkout(
+        &self,
+        remote: &RemoteEndpoint,
+        sequence: &RemoteEndpoint,
+        endpoint: &Endpoint,
+        is_head: bool,
+        scope: &RequestScope,
+    ) -> Result<ConnectionLease> {
+        let attempts = remote.address_count().max(1);
+        loop {
+            let before = sequence.addresses_taken();
+            let attempt_scope = attempt_scope(scope, attempts.saturating_sub(before));
+            let checkout = if is_head {
+                self.pool.checkout_metadata(endpoint, &attempt_scope).await
+            } else {
+                self.pool.checkout_wait(endpoint, &attempt_scope).await
+            };
+            let taken = sequence.addresses_taken();
+            match checkout {
+                Ok(lease) => return Ok(lease),
+                // An admission wait that hit the narrowed deadline took no
+                // address; wait again under a fresh share of the request.
+                Err(Error::DeadlineExceeded) if taken == before && scope.check().is_ok() => {}
+                // A narrowed attempt's deadline is a stalled connect;
+                // the request scope check rules out the request's own.
+                Err(Error::Io | Error::Os(_) | Error::Unavailable | Error::DeadlineExceeded)
+                    if taken > before && taken < attempts && scope.check().is_ok() => {}
+                Err(error) => {
+                    if matches!(error, Error::Io | Error::Os(_) | Error::Unavailable) {
+                        remote.expire_addresses();
+                    }
+                    return Err(error);
+                }
+            }
+        }
+    }
+
     fn endpoint(&self, url: &AzureContainerUrl) -> Result<Endpoint> {
         let key = Self::key(url);
         if let Some(endpoint) = self.endpoints.borrow().get(&key) {
@@ -240,39 +278,28 @@ impl AzureTransport for PoolTransport {
             // address. Only checkout is narrowed: a reused idle connection
             // returns at once, and the send and response read below use the
             // full request scope.
-            let attempts = remote.address_count().max(1);
-            let lease = loop {
-                let before = sequence.addresses_taken();
-                let attempt_scope = attempt_scope(scope, attempts.saturating_sub(before));
-                let checkout = if is_head {
-                    self.pool.checkout_metadata(&endpoint, &attempt_scope).await
-                } else {
-                    self.pool.checkout_wait(&endpoint, &attempt_scope).await
-                };
-                let taken = sequence.addresses_taken();
-                match checkout {
-                    Ok(lease) => break lease,
-                    // An admission wait that hit the narrowed deadline took no
-                    // address; wait again under a fresh share of the request.
-                    Err(Error::DeadlineExceeded) if taken == before && scope.check().is_ok() => {}
-                    // A narrowed attempt's deadline is a stalled connect;
-                    // the request scope check rules out the request's own.
-                    Err(
-                        Error::Io | Error::Os(_) | Error::Unavailable | Error::DeadlineExceeded,
-                    ) if taken > before && taken < attempts && scope.check().is_ok() => {}
-                    Err(error) => {
-                        if matches!(error, Error::Io | Error::Os(_) | Error::Unavailable) {
-                            remote.expire_addresses();
-                        }
-                        return Err(error);
+            // A GET or HEAD that fails on a reused idle connection before any
+            // response byte retries once after dropping the endpoint's idle
+            // connections, so it runs on a fresh one: the peer most likely
+            // closed the idle socket and never saw the request.
+            let mut retry = Some(crate::http::copy_head(&head));
+            let mut head = head;
+            let response = loop {
+                let lease = self
+                    .checkout(&remote, &sequence, &endpoint, is_head, scope)
+                    .await?;
+                match exchange_head(&self.io, lease, head, scope, MAX_RESPONSE_HEAD).await {
+                    Ok(response) => break response,
+                    Err(failure) if failure.stale && scope.check().is_ok() => {
+                        let Some(again) = retry.take() else {
+                            return Err(failure.error);
+                        };
+                        self.pool.discard_idle(&endpoint);
+                        head = again;
                     }
+                    Err(failure) => return Err(failure.error),
                 }
             };
-            let sent = self.io.send_head(lease, head, scope).await?;
-            let response = self
-                .io
-                .receive_head_limited(sent.connection, scope, MAX_RESPONSE_HEAD)
-                .await?;
             Ok(PoolExchange {
                 head: response.value,
                 lease: response.connection,

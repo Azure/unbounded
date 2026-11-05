@@ -1658,3 +1658,72 @@ mod protocol_tests {
         }
     }
 }
+
+const HEAD_OK: &[u8] = b"HTTP/1.1 200 OK\r\nContent-Length: 3\r\nRacer-Content-Type: text/plain\r\nETag: \"v\"\r\nRacer-Expires-At: 1234\r\n\r\n";
+
+/// The adapter closes a pooled connection after reading the next request
+/// but before answering it, as when its idle timeout races the request. The
+/// request retries once on a fresh connection.
+#[test]
+fn real_uds_reused_connection_closed_before_response_retries_on_fresh_connection() {
+    let (_path, listener, endpoint) = listen();
+    let server = thread::spawn(move || {
+        let mut first = accept(&listener);
+        check_request(&receive(&mut first), "HEAD", None, None, false);
+        first.write_all(HEAD_OK).unwrap();
+        // The second request arrives on the idle connection, which closes
+        // without a response byte.
+        check_request(&receive(&mut first), "HEAD", None, None, false);
+        drop(first);
+        let mut second = accept(&listener);
+        check_request(&receive(&mut second), "HEAD", None, None, false);
+        second.write_all(HEAD_OK).unwrap();
+        // Hold the connection until the client is done with it.
+        let _ = second.read_to_end(&mut Vec::new());
+    });
+    let (client, _admission, reactor) = client();
+    let mut context = context();
+    context.authorization = None;
+    context.metadata = None;
+    let scope = scope();
+    for _ in 0..2 {
+        let head = drive(
+            &reactor,
+            client.metadata_at(&endpoint, &context, MetadataSelector::Fresh, &scope),
+        )
+        .unwrap();
+        assert_eq!(head.metadata.length, 3);
+    }
+    client.pool.close();
+    server.join().unwrap();
+}
+
+/// A failure on a freshly connected socket is not retried: it cannot be a
+/// stale pooled connection.
+#[test]
+fn real_uds_fresh_connection_closed_before_response_is_not_retried() {
+    let (_path, listener, endpoint) = listen();
+    let server = thread::spawn(move || {
+        let mut first = accept(&listener);
+        check_request(&receive(&mut first), "HEAD", None, None, false);
+        drop(first);
+        listener.set_nonblocking(true).unwrap();
+        thread::sleep(Duration::from_millis(200));
+        assert!(listener.accept().is_err(), "no retry connection");
+    });
+    let (client, _admission, reactor) = client();
+    let mut context = context();
+    context.authorization = None;
+    context.metadata = None;
+    let scope = scope();
+    assert_eq!(
+        drive(
+            &reactor,
+            client.metadata_at(&endpoint, &context, MetadataSelector::Fresh, &scope),
+        )
+        .map(|_| ()),
+        Err(Error::BadGateway)
+    );
+    server.join().unwrap();
+    client.pool.close();
+}

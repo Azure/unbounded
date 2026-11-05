@@ -25,6 +25,75 @@ use uring_runtime::reactor::SocketAddress;
 use uring_runtime::reactor::descriptor::Descriptor;
 
 pub const MAX_HEAD_BYTES: usize = 32 * 1024;
+
+/// Response head of one request exchange and the connection that carried it.
+pub type HeadExchange = http1::connection::HeadCompletion<HttpContext, MessageHead>;
+
+/// A failed [`exchange_head`] and whether the request may be retried once on
+/// a fresh connection.
+pub struct ExchangeFailure {
+    pub error: Error,
+    /// The connection came from the idle pool, the request is a GET or HEAD,
+    /// and it failed with a closed-socket error before any response byte: the
+    /// peer most likely closed the idle socket and never saw the request.
+    pub stale: bool,
+}
+
+/// A field-by-field copy of `head`, kept to resend a request. Each copy
+/// clears its own field values when dropped.
+pub fn copy_head(head: &MessageHead) -> MessageHead {
+    MessageHead {
+        start: match &head.start {
+            http1::StartLine::Request { method, target } => http1::StartLine::Request {
+                method: method.clone(),
+                target: target.clone(),
+            },
+            http1::StartLine::Response { status } => http1::StartLine::Response { status: *status },
+        },
+        headers: head
+            .headers
+            .iter()
+            .map(|header| http1::Header::new(&header.name, &header.value))
+            .collect(),
+    }
+}
+
+/// Send `head` on `connection` and receive a response head of at most
+/// `limit` bytes, reporting whether a failure looks like a stale pooled
+/// connection (see [`ExchangeFailure::stale`]).
+pub async fn exchange_head(
+    io: &HttpIo,
+    connection: ConnectionLease,
+    head: MessageHead,
+    scope: &RequestScope,
+    limit: usize,
+) -> std::result::Result<HeadExchange, ExchangeFailure> {
+    let idempotent = matches!(
+        &head.start,
+        http1::StartLine::Request { method, .. } if method == "GET" || method == "HEAD"
+    );
+    let retryable = idempotent && connection.reused();
+    let closed = |error: &Error| {
+        matches!(
+            error,
+            Error::Io | Error::Os(libc::ECONNRESET | libc::EPIPE | libc::ECONNABORTED)
+        )
+    };
+    let sent = io
+        .send_head(connection, head, scope)
+        .await
+        .map_err(|error| ExchangeFailure {
+            stale: retryable && closed(&error),
+            error,
+        })?;
+    let started = std::cell::Cell::new(false);
+    io.receive_head_observed(sent.connection, scope, limit, &started)
+        .await
+        .map_err(|error| ExchangeFailure {
+            stale: retryable && !started.get() && closed(&error),
+            error,
+        })
+}
 pub fn new_pipe_pool(
     admission: Rc<flow_control::Quotas<AdmissionPolicy>>,
 ) -> PipePool<AdmissionPolicy> {
