@@ -762,50 +762,58 @@ fn bootstrap(
         control.bind_keyring(keys)?;
         Ok((identity.node().clone(), control.block_devices()))
     });
-    let waker = futures::task::noop_waker();
-    let mut cx = Context::from_waker(&waker);
-    let result = loop {
-        if STOP_REQUESTED.load(Ordering::Relaxed) {
-            break Err(Error::Cancelled);
-        }
-        if let Err(error) = startup
-            .check()
-            .and_then(|()| reactor.poll_budgeted(64).map(|_| ()))
-        {
-            break Err(error);
-        }
-        if let Poll::Ready(result) = operation.as_mut().poll(&mut cx) {
-            break result;
-        }
-        if let Err(error) = reactor.wait(Duration::from_millis(1)) {
-            break Err(error);
-        }
-    };
+    let result = drive_bootstrap(&reactor, Some(startup), true, operation.as_mut());
     drop(operation);
     // Fence CPU preparation before draining the reactor, on success and failure.
     let shutdown_scope = scope(&reactor.ctx().clock, config.shutdown_timeout)?;
     let mut shutdown = control.shutdown(&shutdown_scope);
-    let shutdown_result = loop {
-        if let Poll::Ready(result) = shutdown.as_mut().poll(&mut cx) {
-            break result;
-        }
-        reactor.poll_budgeted(64)?;
-        reactor.wait(Duration::from_millis(1))?;
-    };
+    let shutdown_result = drive_bootstrap(&reactor, None, false, shutdown.as_mut());
     drop(shutdown);
     // Dropped TLS waits can still own CQEs. Cancellation is not their fence.
     let _ = startup.cancel();
     let mut drain = reactor.drain();
-    loop {
-        reactor.poll_budgeted(64)?;
-        if let Poll::Ready(fenced) = drain.as_mut().poll(&mut cx) {
-            fenced?;
-            break;
-        }
-        reactor.wait(Duration::from_millis(1))?;
-    }
+    drive_bootstrap(&reactor, None, false, drain.as_mut())?;
     result.and_then(|identity| shutdown_result.map(|()| identity))
 }
+
+/// Drive one bootstrap `operation` on `reactor` until it completes, parking on
+/// the reactor's wake sources (completions, its wake handle, the process stop
+/// eventfd, ring deadlines, and this thread's alarms) and on `scope`'s
+/// deadline. With `stoppable`, a process stop ends it with `Cancelled`; a
+/// failed `scope` check or reactor turn ends it with that error.
+fn drive_bootstrap<T>(
+    reactor: &Reactor,
+    scope: Option<&RequestScope>,
+    stoppable: bool,
+    mut operation: std::pin::Pin<&mut (dyn std::future::Future<Output = Result<T>> + '_)>,
+) -> Result<T> {
+    let waker = uring_runtime::drivers::thread_waker(Some(reactor.waker()?));
+    let mut cx = Context::from_waker(&waker);
+    loop {
+        if stoppable && STOP_REQUESTED.load(Ordering::Relaxed) {
+            return Err(Error::Cancelled);
+        }
+        if let Some(scope) = scope {
+            scope.check()?;
+        }
+        reactor.poll_budgeted(64)?;
+        uring_runtime::drivers::fire_alarms(reactor.ctx().clock.now());
+        if let Poll::Ready(result) = operation.as_mut().poll(&mut cx) {
+            return result;
+        }
+        let mut wait = uring_runtime::drivers::next_alarm().map_or(BOOTSTRAP_MAX_PARK, |at| {
+            at.saturating_duration_since(reactor.ctx().clock.now())
+        });
+        if let Some(recheck) = scope.and_then(uring_runtime::Scope::recheck_within) {
+            wait = wait.min(recheck);
+        }
+        reactor.wait(wait.min(BOOTSTRAP_MAX_PARK))?;
+    }
+}
+
+/// Longest bootstrap park; it bounds only the arithmetic, since every
+/// bootstrap wait ends on a wake source or deadline first.
+const BOOTSTRAP_MAX_PARK: Duration = Duration::from_secs(3600);
 
 /// End `operation` with `Cancelled` as soon as a process stop is requested.
 ///
