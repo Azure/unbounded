@@ -610,12 +610,25 @@ where
             scope.check()?;
             self.state
                 .advance(&self.feed, &self.target, self.host.as_ref(), self.schedule)?;
-            let now = self.host.ctx().clock.now();
-            let tick = self
-                .host
-                .sleep(now.checked_add(self.schedule.tick).unwrap_or(now), &scope);
-            match futures::future::select(network.as_mut(), tick).await {
-                futures::future::Either::Left((result, _)) => match result {
+            // Local work polls its CPU job on the tick timer. With none pending,
+            // only the network can make progress, so park on it alone.
+            let result = if self.state.has_local_work() {
+                let now = self.host.ctx().clock.now();
+                let tick = self
+                    .host
+                    .sleep(now.checked_add(self.schedule.tick).unwrap_or(now), &scope);
+                match futures::future::select(network.as_mut(), tick).await {
+                    futures::future::Either::Left((result, _)) => result,
+                    futures::future::Either::Right((result, _)) => {
+                        result?;
+                        continue;
+                    }
+                }
+            } else {
+                network.as_mut().await
+            };
+            {
+                match result {
                     Ok(document) => {
                         self.state.failures = 0;
                         self.state.next_fetch = self.host.ctx().clock.now() + self.schedule.tick;
@@ -662,8 +675,7 @@ where
                         }
                         return Err(failure.error);
                     }
-                },
-                futures::future::Either::Right((result, _)) => result?,
+                }
             }
         }
     }
@@ -683,10 +695,7 @@ where
             scope.check()?;
             self.state
                 .advance(&self.feed, &self.target, self.host.as_ref(), self.schedule)?;
-            if self.state.job.is_none()
-                && self.state.prepared.is_none()
-                && self.state.queued.is_none()
-            {
+            if !self.state.has_local_work() {
                 return Ok(());
             }
             let now = self.host.ctx().clock.now();
@@ -728,6 +737,11 @@ where
 }
 
 impl<C: Codec, T: Target<C>> Progress<C, T> {
+    /// Whether a received document still awaits preparation, its CPU job, or install.
+    fn has_local_work(&self) -> bool {
+        self.queued.is_some() || self.job.is_some() || self.prepared.is_some()
+    }
+
     /// Enforce both transport backoff and the independent candidate retry floor.
     fn fetch_at(&self) -> Instant {
         self.rejected.as_ref().map_or(self.next_fetch, |rejected| {
