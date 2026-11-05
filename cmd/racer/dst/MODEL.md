@@ -125,6 +125,18 @@ such as which node holds which page.
   `ModelSpec::crypto_queue`, both `Limits::crypto_submissions`, `core/src/admission.rs`) through the same table (`verify_sheds`,
   racer-sim `verify_sheds_dest`/`verify_sheds_relay`). The shed is not silence: the last-hop
   record is dropped. Before this, both fidelities queued verifications without bound.
+- Link circuits (production `LinkHealth`, `src/topology.rs:45-58`, one per worker: each worker's
+  `Paths` gets its own `LinkHealth::new`, `src/app.rs:1422-1431`). Before a send the sender
+  acquires the next hop's circuit (`src/peer.rs:1074` `health.acquire(&next)?`); an open one fails
+  the send `Unavailable` at once (`flow-core/src/admission.rs` `Circuits::acquire`). A socket
+  failure records `LinkOutcome::Refused` (`route::exchange_evidence`, `src/peer.rs:1130-1133`),
+  which backs the circuit off for `route::link_backoff` (100 ms doubling to 20 s, plus jitter).
+  Route searches skip neighbors whose circuit is open (`Paths::blocked`, `src/topology.rs:1116-1145`).
+  Model: `Model::link` (acquire, success on connect), `Ev::LinkDown` (failure after the connect
+  timeout), `forward` (blocked neighbors), keyed by `(node, worker)` with the requester's read
+  worker or the relay's connection worker (`link_worker`). Differences: success is recorded on
+  connect, not when the exchange completes; the backoff jitter is a mix of the peer id, not
+  SHA-256 of its name (as racer-sim). `ModelSpec::circuits` turns them off for ablation.
 - Pings: a silence ping is a peer request routed over the mesh (production
   `CandidatePolicy::ping` through `request_traced`, `src/read/candidates.rs:2488-2531`;
   racer-sim `launch_control`) on `NOTICE_LINKS` links with no remote attempts; the
@@ -228,9 +240,8 @@ How the combination was chosen (racer-sim, 50,000 nodes, seed 8, failed reads):
   deferral (`Served::Defer`) never happens.
 - Membership changes come from scenario churn, or in combined scenarios from the control
   plane (see Control plane below). A node that left keeps serving peers and relaying.
-- Link circuits (`Circuits`). Route searches run synchronously against one shared `Paths`
-  cache (production keeps one per worker), so the Model has more cache hits and fewer
-  searches needing a slot.
+- Route searches run synchronously against one shared `Paths` cache (production keeps one per
+  worker), so the Model has more cache hits and fewer searches needing a slot.
 - A crash keeps the node's cores and stored pages (production keeps the disk; racer-sim
   drops memory state and in-flight reads). A crashed node's own client reads keep running;
   only its peer server and its replies are gone. Clock faults (`ClockSkew`, `ClockRate`,
@@ -655,11 +666,7 @@ Flight failure semantics (checked, no change): when a leader's walk fails, produ
 fails every waiter with the leader's error unless it is an origin rejection or a
 handed-over deadline/cancellation, which re-elect (`core/src/read/flight.rs` `fail`).
 
-Not ported yet: `slow_disk_sheds_persistence...` (persistence shedding),
-`relays_hold_their_reservation_only_while_the_body_streams` and `relay_shed_rank0_probes...`
-(the quota now exists; the scenarios are not ported), the full-mesh and watch-off variants
-of the hung-peer test, quota tests in `contention_scenarios.rs`, `sim/tests/mesh_scenarios.rs`
-(topology-only mesh metrics) and `sim/tests/phantom_memory.rs` (racer-sim memory accounting).
+What is and is not ported from racer-sim is listed under racer-sim inventory at the end.
 
 ## Model-only scenarios
 
@@ -833,7 +840,7 @@ sizes (seed 1):
 | full-cold-start 200, 120 s, 0.05/s | reads completed / failed | 4823 / 0 | 4450 / 0 |
 | | skipped not enrolled / not member | 35 / 113 | 34 / 104 |
 | | origin requests, origin/page | 1123, 1 | 918, 2 |
-| full-failover 200, 300 s, 0.2/s | reads completed / failed | 17123 / 10 | 15043 / 91 |
+| full-failover 200, 300 s, 0.2/s | reads completed / failed | 17123 / 10 | 15112 / 22 (91 before link circuits) |
 | | skipped not enrolled / not member | 226 / 474 | 236 / 487 |
 | | origin requests, origin/page | 9149, 6 | 7923, 7 |
 | full-churn 320, 400 s, 0.1/s | reads completed / failed | 13969 / 0 | 12802 / 2 |
@@ -853,7 +860,7 @@ sizes (seed 1):
 | | read latency p50/p99/max ms | 46 / 151 / 4,045 | 48 / 127 / 3,729 |
 | | enrolled, membership version, skew | 50,000, 6, all current | 50,000, 6, all current |
 | | wall (release), peak RSS (per node) | 1,867 s, 5.06 GB (101 KB) | 1,632 s, 3.10 GB (62 KB) |
-| full-failover 10,000, 900 s, 0.02/s | reads completed / failed | 268,752 / 187 | 258,424 / 1,462 |
+| full-failover 10,000, 900 s, 0.02/s | reads completed / failed | 268,752 / 187 | 258,424 / 1,462 (before link circuits) |
 | | origin requests, origin/page | 44,199, 6 | 44,715, 8 |
 | | read latency p50/p99/max ms | 42 / 218 / 3,551 | 47 / 157 / 3,473 |
 | | wall (release), peak RSS | 316 s, 1.15 GB | 268 s, 0.64 GB |
@@ -864,22 +871,223 @@ accounts for its higher skipped counts is an inference (racer-sim not traced). T
 
 Membership skew at the end, enrolled counts and membership versions match exactly in every
 combined run. Reads completed are 3-12% lower in the Model because its read load stops
-before the end (see above). Within tolerance except `full-failover` read failures (91 against 10, all `Unavailable`).
-Ablation (`CTL_NO_CUT=1`, `CTL_NO_BURSTS=1` on `combined_report`): without the site cut the
-Model fails 5 reads, without the origin bursts 90, so the excess comes from the cut between
-sites 0 and 1. Both harnesses fail a hop that crosses the cut (racer-sim
-`sim/src/node/world.rs:3464-3472`, Model `Model::cut`); racer-sim also opens link circuits
-after failures (`world.rs:3458-3462`), which the Model does not model (see Not modeled yet).
-That circuits steer racer-sim's later requests around the cut is an inference, not traced.
-Open; see Gaps.
+before the end (see above).
+
+`full-failover` read failures (closed by link circuits). Ablation (`CTL_NO_CUT=1`,
+`CTL_NO_BURSTS=1` on `combined_report`): without the site cut the Model failed 5 reads,
+without the origin bursts 90, so the excess came from the cut between sites 0 and 1. Both
+harnesses fail a hop that crosses the cut (racer-sim `sim/src/node/world.rs` `link`, Model
+`Model::cut`). racer-sim also opened link circuits after failures (`world.rs` `link`,
+`n.links.acquire` and `n.links.failure`) and its route searches skip neighbors whose circuit is
+open (`world.rs` `blocked`), as production does (see Link circuits in Modeled). The Model now does
+the same: later routes leave the cut neighbor and relay through sites 2 and 3, so link
+failures fall and reads stop failing (`link_circuit_open` stays 0: the searches route around,
+no send meets an open circuit). Test: `site_cut_opens_link_circuits_and_routes_around`.
+
+| full-failover, seed | racer-sim failed (link failures) | Model before | Model, circuits per worker (production) | Model, circuits per node (racer-sim) |
+|---|---|---|---|---|
+| 200 nodes, 300 s, 0.2/s, seed 1 | 10 (1,434) | 91 (1,181) | 22 (785) | 14 (719) |
+| 200 nodes, 300 s, 0.2/s, seed 8 | 12 (1,293) | 86 (1,180) | 13 (761) | 8 (696) |
+| 10,000 nodes, 900 s, 0.02/s, seed 8 | 194 (16,468) | 1,398 (16,797) | 270 (10,937) | not run |
+
+The test-profile binaries produced these (racer-sim `--config '{"request_rate": ...}'`, Model
+`combined_report`). racer-sim keeps one `Circuits` per node (`sim/src/node/state.rs:153-154`
+`links`); production keeps one per worker (`src/topology.rs:45` "Worker-local link circuits",
+built per worker in `src/app.rs:1422-1431`), so a production worker learns a dead link only from
+its own sends. The per-node column is an ablation (every send keyed to worker 0): it fails 36%
+to 38% fewer reads, so racer-sim is optimistic here and the per-worker Model is the production
+reference. The rest of the gap at seed 1 (22 against 10) is not traced.
 
 ### Gaps blocking racer-sim deletion
 
-- `full-failover` read failures differ by 9x at 200 nodes and 8x at 10,000, from the site
-  cut (above); needs link circuits in the Model or a traced explanation.
 - No Full counterpart with enrolling clients against real authorities.
-- The Model has no racer-sim node report fields (`peer_requests_*`, `fills_failed`,
-  `origin_repeats_*` classification used by racer-sim's `failover_repeats_are_skips_or_their_orphans`),
-  so those racer-sim combined tests have no Model counterpart.
-- `--config` overrides (`"control"`, `"combined_faults"`) are not parsed; scenarios take
-  `ControlSpec::overrides` and spec fields instead.
+- racer-sim tests of features the Model answers as not started (successor hints, orphan
+  offers, lineage targets, hedges, persistence shedding, quotas, memory tiers); see the
+  racer-sim inventory below.
+
+Closed: `full-failover` read failures (link circuits, above); racer-sim's node report fields
+(Origin repeats and node report fields, below); `--config` (Command line, below).
+
+## Origin repeats and node report fields
+
+`src/model/repeats.rs` is racer-sim's `classify_repeat` (`sim/src/node/world.rs`) over Model
+acquisitions. Every origin request of a page fetched before is classified against the page's
+previous request: rank 0 moved (`after_owner_move`), it failed (`after_failure`), it is still in
+flight (`concurrent`), its holder lost the copy (`copy_lost`, holder down or page evicted), or the
+holder still holds it (`copy_held`, by cause: `raced`, `unreachable`, `busy`, `unfunded`,
+`missed`, `unasked`). An owner above rank 0 records why its last probe of rank 0 did not serve
+(`skips`: `partition`, `down`, `route`, `circuit`, `timeout`, `failed`, `relay`, `busy`,
+`copy_only`, `unfunded`), and a held repeat behind such a skip is its orphan. The report carries
+racer-sim's `origin_per_page` fields (`requests`, `repeats`, `skips`,
+`max_requests_per_page_excluding_failure_retries`, `max_failure_retries_per_page`) and the
+`origin_repeats_*` and `origin_skips_*` counters, plus `peer_requests_acquire`,
+`peer_requests_copy_only`, `fills` and `fills_failed` (`WorkerCore::observed`, counted when an
+acquisition ends in `core/src/read/worker.rs` `finish`).
+
+Differences: the Model never cancels an origin request, so it has no `origin_canceled`; it has no
+member that does not serve yet (`not_serving`); a probe's transport cause is noted on the
+requester's walk (`Model::note_cut`) for cut, down, circuit and route failures, and anything else
+unanswered is `timeout`. racer-sim makes an unexplained held repeat a hard invariant
+(`origin_repeat_explained`); the Model counts it (`repeats.unexplained`) and the ported tests
+assert zero, because `model-range-readers` refetches pages a node already holds through its
+range windows (an open lead: the window fill path does not consult the node store the way a page
+read does, `Model::client_read`).
+
+`full-failover`, 200 nodes, 300 s, 0.2/s, seed 1:
+
+| Field | racer-sim | Model |
+|---|---|---|
+| requests / pages | 9,150 / 7,673 | 7,961 / 6,985 |
+| after_failure / after_owner_move / concurrent | 767 / 39 / 0 | 762 / 86 / 0 |
+| copy_lost / copy_held | 634 / 37 | 6 / 122 |
+| skips failed / copy_only / relay / partition / down | 370 / 353 / 77 / 71 / 31 | 369 / 302 / 75 / 65 / 19 |
+| orphans (sum) / unexplained | 20 / 0 | 105 / 0 |
+| peer_requests_acquire / copy_only | 24,701 / 24,582 | 21,151 / 881 |
+| fills_failed | 1,111 | 1,003 |
+
+Skips agree within 15% in every class. `copy_lost` against `copy_held` differs because racer-sim
+drops a crashed node's memory pages and bounds its memory, while a Model node keeps its store
+through a crash (Not modeled yet), so the Model finds more held copies and charges them to their
+skips as orphans. racer-sim's copy-only probes include hedges, lineage and successor probes and
+orphan offers, none of which the Model sends.
+
+## Command line
+
+With arguments the `racer-dst` binary runs one scenario and writes its JSON report, with
+racer-sim's command line (`src/cli.rs`): `--scenario`, `--nodes`, `--seed`, `--duration`,
+`--config FILE.json`, `--out PATH`; `make racer-dst-report ARGS='...'` runs it in release
+like `make racer-sim`. Scenarios are racer-sim's control plans, its `full-*` combined scenarios
+(default 16 nodes and 0.02 reads per node per second, as racer-sim), and every catalog scenario
+by name. `--config` takes racer-sim's keys that have a Model counterpart: `nodes`, `sites`,
+`workers`, `duration_ns`, `request_rate`, `objects`, `zipf_s`, `range_fraction`,
+`range_pages`, `page_bytes`, `pages_per_object`, `origin_errors`, `control` (racer-sim's control
+`Settings` overrides), `combined_faults` (racer-sim `DataFaults`: `enabled`, `slow_permille`,
+`slow_factor`, `p5xx`, `p412`, `burst_ns`, `partition`) and `node` (`crypto_queue`,
+`relay_transfers`, `waiters_per_flight`, `connections`, `circuits`). Any other key is an error,
+not ignored. The report is the Model's, with racer-sim's top-level `scenario`, `seed`,
+`duration_ns`, `trace_hash` and `wall_ms`, plus `dst_scenario` and `failure`; the process exits 1
+when the run fails a check or invariant (after writing the report) and 2 on a usage error
+(racer-sim exits 0 and leaves hard failures to the report). Nothing in the repository runs
+racer-sim besides `make racer-sim`; `designs/racer-core-simulation.md` describes it.
+
+## racer-sim inventory
+
+Every racer-sim test and scenario, with its Model counterpart. "Ported" runs racer-sim's
+checks against the Model; "equivalent" covers the same contract another way.
+
+`sim/tests/contention_scenarios.rs`:
+
+| racer-sim test | Status | racer-dst counterpart or reason |
+|---|---|---|
+| `cold_nodes_contend_for_one_global_origin` | not ported | origin bandwidth timing bound; `resources.rs` `origin_cap_and_errors` tests the shared origin server |
+| `warm_peer_fanout_is_limited_by_source_node_network` | not ported | NIC timing bound; `resources.rs` FIFO server tests |
+| `workers_share_node_network_bandwidth` | not ported | NIC is per node in `resources.rs` (`Fabric`) as in racer-sim; no scenario test |
+| `concurrent_cold_readers_join_flights` | ported | `model-concurrent-cold-readers` |
+| `slow_disk_sheds_persistence_without_losing_reader_progress` | not ported | persistence shedding not modeled |
+| `reads_recover_after_partition_heals` | ported | `model-partition-heals` |
+| `cold_start_completes_with_bounded_origin_traffic` | ported | `model-cold-start-400` |
+| `two_thousand_nodes_cold_start` | ported | `model-cold-start-2000` |
+| `verification_sheds_send_readers_to_helpers` | equivalent | `tests/model.rs` `verification_sheds_end_every_read` |
+| `seed_matrix_replays_identical_reports` | equivalent | `make racer-dst` runs every seed entry twice; `model-node-faults`, `model-faults` |
+| `overloaded_hot_page_owners_do_not_stream_to_abandoned_requesters` | not ported | needs racer-sim's `late_page_replies`; the Model has `replies_abandoned` only |
+| `hot_page_readers_fan_out_through_helpers` | ported | `model-hot-page-storm-512` (with the core's helper rule; racer-sim's `mesh_helpers` off variant is not run) |
+| `mesh_hot_page_readers_fan_out_through_column_helpers` | ported | `model-hot-page-storm-512` |
+| `mesh_hot_page_storm_stays_bounded_on_a_large_pool` | not ported | portable (2,048-node storm); not run for CI time |
+| `owners_above_rank_zero_do_not_overlap_a_slow_origin_fetch` | not ported | `scenarios::slow_origin` in progress (see Scale, Slow origin) |
+| `relay_shed_rank0_probes_do_not_overlap_a_slow_origin_fetch` | not ported | as above |
+| `relays_hold_their_reservation_only_while_the_body_streams` | not ported | relay holds are modeled (`release_relays_at`); no scenario test |
+| `holders_wait_for_request_verification` | equivalent | `model/mod.rs` `a_request_waiting_for_verification_leaves_its_worker_free`; no `requests_abandoned_verifying` counter |
+| `hung_peers_are_found_and_recovered_peers_are_used_again` | ported | `model-hung-peers` |
+| `hung_relays_are_routed_around` | ported | `model-hung-peers` (full-mesh and watch-off variants not ported) |
+| `readers_do_not_return_first_to_an_owner_that_shed_them` | not ported | needs racer-sim's `shed_repeats` and `silence_marks` counters |
+| `single_reader_then_storm_reuses_copies` | ported | `model_parity.rs` (same name) |
+| `cold_storm_bounds_origin_per_page` | ported | `model_parity.rs` (same name) |
+| `origin_errors_follow_the_fill_plan` | ported | `model_parity.rs` (same name; no `remaining_walks` counter) |
+| `origin_forbidden_reelects_a_waiter` | ported | `model-origin-forbidden`, `origin_forbidden_fails_only_the_leader` |
+| `tight_quotas_reject_by_class` | not ported | admission quotas not modeled |
+| `same_seed_replays_and_seeds_differ` | equivalent | `tests/model.rs` `model_runs_are_deterministic_and_seed_dependent` |
+| `memory_accounting_is_per_component` | not ported | racer-sim's own memory accounting; Model memory is `model_memory_per_node` |
+| `retention_observes_client_reads_including_memory_hits` | not ported | memory tiers and retention not modeled |
+| `yielding_searches_hit_production_concurrency_limits` | equivalent | `model/mod.rs` `route_searches_queue_in_arrival_order_then_shed`, `a_first_ranking_scores_every_member_and_a_cached_one_polls_once` |
+| `hedging_beats_a_slow_primary` | not ported | hedges not modeled |
+| `duplicate_memory_publish_does_not_touch` | not ported | memory tiers not modeled (`store_evicts_the_least_recently_used_page` covers the Model store) |
+| `joined_owners_copy_from_previous_owners` | equivalent | `model-membership-churn` (`Previous`, `Batch` under the previous membership) |
+| `joined_owners_never_refetch` | not ported | strict form; not checked against the Model |
+| `expired_fills_cancel_their_origin_request` | not ported | the Model never cancels origin requests |
+| `expired_leaders_hand_their_fill_to_later_waiters` | not ported | portable (flight handover runs in the core); needs a slow-origin scenario |
+| `churn_adoption_staleness_and_repeats` | equivalent | `membership_churn_refreshes_falls_back_and_waits` |
+| `readers_handle_owners_that_are_behind` | not ported | racer-sim `config.node` stale-handling switches; the core has no such switches |
+| `idle_connections_pin_ingress_slots` | ported | `model_parity.rs` (same name) |
+| `full_outbound_pools_refuse_links` | not ported | portable (connection slots are modeled); no scenario test |
+
+`sim/src/combined.rs`:
+
+| racer-sim test | Status | racer-dst counterpart or reason |
+|---|---|---|
+| `cold_start_window_fits_owner_egress` | equivalent | the window is computed inline in `scenarios::combined_with` |
+| `cold_start_reads_after_enrollment` | ported | `tests/combined.rs` |
+| `failover_crashes_data_nodes_too` | ported | `tests/combined.rs` (no `restarts` counter) |
+| `failover_repeats_are_skips_or_their_orphans` | ported | `tests/combined.rs` |
+| `failover_readers_are_deferred_to_orphan_holders` | not ported | successor hints not modeled |
+| `failover_owners_copy_orphans_from_successors` | not ported | successor targets not modeled |
+| `failover_holders_offer_orphans_to_rank_zero` | not ported | orphan offers not modeled |
+| `owners_leave_origin_retries_to_a_failing_rank_zero` | not ported | needs `rank0_failure_hold` on and off; the core has no switch |
+| `failover_drops_the_dead_member` | not ported | needs a `dead_member_links` age histogram |
+| `lineage_targets_find_copies_of_pages_that_moved` | not ported | lineage targets not modeled |
+| `demoted_targets_and_lineage_grants_find_more_moved_copies` | not ported | as above |
+| `parallel_deep_lineage_probes_find_more_copies_without_more_latency` | not ported | as above |
+| `cold_start_members_serve_before_they_are_routable` | not ported | needs `report_at_start` and unready-member link counters |
+| `churn_grows_the_data_plane` | ported | `tests/combined.rs` (no `membership_adoptions`) |
+| `lagging_clients_skew_the_data_plane` | ported | `tests/combined.rs` |
+| `data_faults_join_the_control_plans` | ported | `tests/combined.rs` (no explicit `faults` list) |
+| `replays_exactly` | ported | `tests/combined.rs` |
+| `crashed_pod_is_down_and_comes_back` | not ported | racer-sim's internal `Combined` API; Model crashes follow the control faults |
+
+`sim/src/control.rs`: all 21 tests run unchanged in `model/control.rs` (same names).
+
+`sim/src/lib.rs`: `parses_options_and_durations` and `config_file_and_flag_precedence` are
+`cli.rs` `parses_options_and_durations` and `config_overrides_reach_the_scenario`;
+`control_scenarios_run_from_the_cli` is `tests/control.rs` `control_plans_run_clean_at_40_pods`;
+`replay_is_deterministic` is `model_runs_are_deterministic_and_seed_dependent`;
+`smoke_scenarios_hold_invariants` and `empty_substrate_50k_rss` are not ported (racer-sim's
+Poisson node scenarios, below).
+
+`sim/tests/mesh_scenarios.rs` (10, topology-only mesh metrics) and `sim/tests/phantom_memory.rs`
+(2): not ported; they test `topology` and racer-sim's `Phantom` memory, not the read path. The
+Model's copy of `Phantom` has its own tests (`model/phantom.rs`, including
+`phantom_entries_are_small_and_share_one_memo`). Moving the mesh tests to the `topology` crate is
+the way to keep them when racer-sim goes.
+
+`sim/tests/alloc_dst.rs` (10) and `sim/src/alloc_model/*` (23): racer-sim's page allocator model,
+unrelated to the read path; not ported. They should move with the allocator model (or to the
+`alloc` crate) before racer-sim is deleted.
+
+Component unit tests of racer-sim's own substrate (`engine.rs` 4, `report.rs` 4, `resources.rs`
+15, `config.rs` 5, `workload.rs` 5, `faults.rs` 3, `phantom.rs` 5, `mesh.rs` 4, `node/state.rs` 4,
+`node/world.rs` 2): equivalent where the Model has a copy (`engine.rs`, `resources.rs`,
+`model/ctl_report.rs`, `model/phantom.rs`, `model/membership.rs` `publish_adopt_and_resolve`,
+`external_versions_follow_applied_clients`); the rest test racer-sim code that goes with it.
+`node/world.rs` `owner_without_a_cached_ranking_sheds_a_hot_page` and
+`mesh_owner_exempts_its_column` test serve decisions that live in the core
+(`WorkerCore::serve`) and are exercised by `model-hot-page-storm-512`.
+
+racer-sim CLI scenarios (`sim/src/lib.rs` `USAGE`):
+
+| racer-sim scenario | racer-dst |
+|---|---|
+| `enrollment-storm`, `failover`, `ctl-churn`, `lagging` | same names on the command line; `model-ctl-*` in the catalog |
+| `full-cold-start`, `full-failover`, `full-churn`, `full-lagging` | same names on the command line; `model-full-*` in the catalog |
+| `storm` | `model-cold-start-*`, `model-hot-page-storm-512`, `model-concurrent-cold-readers` |
+| `churn` | `model-membership-churn` |
+| `faults` | `model-faults`, `model-node-faults`, `model-partition-heals` |
+| `empty` | not ported (substrate memory only) |
+| `smoke`, `caches-only`, `zipf` | not ported: racer-sim's Poisson load on its own node model; the combined scenarios carry the same Zipf load (`Workload`) with the control plane |
+| `mesh`, `mesh-selector` | not ported (topology-only; see above) |
+
+Portable but not yet ported: `mesh_hot_page_storm_stays_bounded_on_a_large_pool` (a
+2,048-node `hot_page_storm`), `full_outbound_pools_refuse_links` (a burst with connection slots
+on, checking `conn_overloaded_*`), `expired_leaders_hand_their_fill_to_later_waiters` and the two
+slow-origin tests (after `scenarios::slow_origin` passes), `failover_drops_the_dead_member`
+(after a dead-member link counter), and the three resource timing tests (bounds need
+recalibrating to `costs.toml`).
+
