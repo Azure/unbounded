@@ -83,7 +83,7 @@ pub fn apply_primary(
     endpoints: &DiscoveredEndpoints,
     changed: &RefCell<(String, Option<Instant>)>,
 ) {
-    let now = Instant::now();
+    let now = crate::rt::now();
     {
         let mut c = changed.borrow_mut();
         if c.0 != obs.resource_version {
@@ -373,7 +373,7 @@ pub async fn lottery(shared: Rc<Shared>, primary_changed: Rc<RefCell<(String, Op
                 pod_uid: &shared.config.pod_uid,
                 initial_seats: initial_seats(&shared),
             },
-            Instant::now(),
+            crate::rt::now(),
             &mut **shared.rng.borrow_mut(),
         );
         let index = match plan {
@@ -398,7 +398,7 @@ pub async fn lottery(shared: Rc<Shared>, primary_changed: Rc<RefCell<(String, Op
         if !lottery.observe(
             index,
             &obs,
-            Instant::now(),
+            crate::rt::now(),
             &shared.config.node_name,
             &shared.identity,
         ) {
@@ -412,7 +412,7 @@ pub async fn lottery(shared: Rc<Shared>, primary_changed: Rc<RefCell<(String, Op
             &shared.config.pod_name,
             &election::now_micro(SystemTime::now()),
         );
-        let started = Instant::now();
+        let started = crate::rt::now();
         let body = lease::with(&object, &spec, &my_seat_annotations(&shared, &seat));
         match lease::put(&shared.lease_api, &ns, &body).await {
             Ok(v) => {
@@ -504,14 +504,14 @@ fn ready_changed(shared: &Shared, seat: &Seat, object: &serde_json::Value) -> bo
 /// Renew the seat Lease until it is lost, shrunk away, or the runtime stops.
 pub async fn seat_task(shared: Rc<Shared>, seat: Rc<Seat>, mut object: serde_json::Value) {
     let ns = shared.config.namespace.clone();
-    let mut schedule = SeatRenew::new(Instant::now());
+    let mut schedule = SeatRenew::new(crate::rt::now());
     loop {
         let generation = shared.changed.generation();
         let _ = rt::deadline(schedule.next, shared.changed.changed(generation)).await;
         if !seat_still_mine(&shared, &seat) {
             return;
         }
-        let now = Instant::now();
+        let now = crate::rt::now();
         let view = shared.primary.borrow().clone();
         let inputs = rules::RenewInputs::from_view(
             &view,
@@ -546,7 +546,7 @@ pub async fn seat_task(shared: Rc<Shared>, seat: Rc<Seat>, mut object: serde_jso
         let obs = lease::observe(&object);
         let spec = election::renew(&obs.spec, &election::now_micro(SystemTime::now()));
         let body = lease::with(&object, &spec, &my_seat_annotations(&shared, &seat));
-        let started = Instant::now();
+        let started = crate::rt::now();
         schedule.put_started(started);
         match rt::timeout(
             limits::LEASE_RENEW,
@@ -573,7 +573,7 @@ pub async fn seat_task(shared: Rc<Shared>, seat: Rc<Seat>, mut object: serde_jso
                         },
                     )
                 });
-                match schedule.conflict(same, Instant::now()) {
+                match schedule.conflict(same, crate::rt::now()) {
                     rules::Conflict::Retry => {
                         if let Ok(v) = read {
                             object = v;
@@ -586,9 +586,9 @@ pub async fn seat_task(shared: Rc<Shared>, seat: Rc<Seat>, mut object: serde_jso
                     rules::Conflict::Later => {}
                 }
             }
-            _ => schedule.put_failed(Instant::now()),
+            _ => schedule.put_failed(crate::rt::now()),
         }
-        if !seat.lease.get().fresh(Instant::now()) {
+        if !seat.lease.get().fresh(crate::rt::now()) {
             shared.lose_seat();
             return;
         }
@@ -598,7 +598,7 @@ pub async fn seat_task(shared: Rc<Shared>, seat: Rc<Seat>, mut object: serde_jso
 /// Read the state Secret, keep serving state, and copy images from the primary.
 pub async fn follower(shared: Rc<Shared>, seat: Rc<Seat>) {
     while seat_still_mine(&shared, &seat) && !shared.stopping.get() {
-        let started = Instant::now();
+        let started = crate::rt::now();
         // Taken before the read: a primary Lease change (a commit publishes
         // its sequence there) that arrives while the read is in flight may
         // not be in what it returned, so it wakes the next read (Known
@@ -756,8 +756,12 @@ async fn fetch_image(shared: &Shared) -> Result<(), Error> {
         .ok_or(Error::Unavailable)?
         .parse()
         .map_err(|_| Error::Unavailable)?;
-    let token =
-        std::fs::read_to_string(&shared.config.control_token).map_err(|_| Error::Unavailable)?;
+    let token = zeroize::Zeroizing::new(
+        rt::read_file(&shared.config.control_token, limits::MAX_TOKEN_BYTES * 2)
+            .await
+            .map_err(|_| Error::Unavailable)?,
+    );
+    let token = std::str::from_utf8(&token).map_err(|_| Error::Unavailable)?;
     let token = zeroize::Zeroizing::new(token.trim().to_owned());
     let tls = server::pinned_client(&cert)?;
     let body = rt::timeout(Duration::from_secs(60), async {
@@ -957,7 +961,7 @@ mod tests {
             (1, observed_seat(1, "my-node")),
         ]);
         let mut observer = Observer::default();
-        let start = Instant::now();
+        let start = crate::rt::now();
         for observation in seen.values() {
             observer.observe(observation, start);
         }
@@ -976,7 +980,7 @@ mod tests {
             (1, observed_seat(1, "my-node")),
         ]);
         let mut observer = Observer::default();
-        let start = Instant::now();
+        let start = crate::rt::now();
         for observation in seen.values() {
             observer.observe(observation, start);
         }
@@ -1029,7 +1033,7 @@ mod tests {
             holder: Some("p/0000000000000000".into()),
             ..Default::default()
         };
-        let t = Instant::now();
+        let t = crate::rt::now();
         assert!(v.live(Some(t), t));
         assert!(!v.live(Some(t), t + limits::LEASE_DURATION));
         assert!(!v.live(None, t));
@@ -1065,17 +1069,17 @@ mod tests {
     fn rollback_refused_after_fail_closed() {
         crate::kube::fake::run(|_api, kube| async move {
             let shared = crate::shared::tests::shared(kube);
-            install_record(&shared, record(5), Instant::now()).unwrap();
+            install_record(&shared, record(5), crate::rt::now()).unwrap();
             assert_eq!(shared.serving.borrow().record.as_ref().unwrap().sequence, 5);
             fail_closed(&shared);
             // An older record must not be accepted just because the current
             // one was cleared.
             assert_eq!(
-                install_record(&shared, record(4), Instant::now()),
+                install_record(&shared, record(4), crate::rt::now()),
                 Err(state::StateError::Rollback)
             );
             assert!(shared.serving.borrow().record.is_none());
-            install_record(&shared, record(6), Instant::now()).unwrap();
+            install_record(&shared, record(6), crate::rt::now()).unwrap();
             assert_eq!(shared.serving.borrow().record.as_ref().unwrap().sequence, 6);
         });
     }
@@ -1095,14 +1099,14 @@ mod tests {
                         annotations::STATE_KEY: STANDARD.encode(state::encode(&r).unwrap())}}),
             );
             shared.is_primary.set(true);
-            follow_once(&shared, Instant::now()).await.unwrap();
+            follow_once(&shared, crate::rt::now()).await.unwrap();
             assert_eq!(shared.serving.borrow().record.as_ref().unwrap().sequence, 3);
             // Markers and data removed on the same Secret: not a fresh install.
             api.put_object(
                 &path,
                 serde_json::json!({"metadata": {"name": "racer-state", "uid": uid}}),
             );
-            assert!(follow_once(&shared, Instant::now()).await.is_err());
+            assert!(follow_once(&shared, crate::rt::now()).await.is_err());
             assert!(shared.serving.borrow().record.is_none());
         });
     }
@@ -1145,12 +1149,12 @@ mod tests {
             };
             shared.is_primary.set(true);
             put(&record(5));
-            follow_once(&shared, Instant::now()).await.unwrap();
+            follow_once(&shared, crate::rt::now()).await.unwrap();
             put(&record(4));
-            assert!(follow_once(&shared, Instant::now()).await.is_err());
+            assert!(follow_once(&shared, crate::rt::now()).await.is_err());
             assert!(shared.serving.borrow().record.is_none());
             assert!(
-                follow_once(&shared, Instant::now()).await.is_err(),
+                follow_once(&shared, crate::rt::now()).await.is_err(),
                 "stays closed"
             );
         });
@@ -1176,15 +1180,15 @@ mod tests {
             };
             shared.is_primary.set(true);
             put(&record(4));
-            follow_once(&shared, Instant::now()).await.unwrap();
+            follow_once(&shared, crate::rt::now()).await.unwrap();
             let delay = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(300));
             api.delay_gets(delay);
-            let read = follow_once(&shared, Instant::now());
+            let read = follow_once(&shared, crate::rt::now());
             let commit = async {
                 rt::sleep(Duration::from_millis(100)).await;
                 // `primary.rs` `reconcile`: write, then install.
                 put(&record(5));
-                install_record(&shared, record(5), Instant::now()).unwrap();
+                install_record(&shared, record(5), crate::rt::now()).unwrap();
             };
             let (read, ()) = futures::future::join(read, commit).await;
             assert!(read.is_ok(), "{read:?}");
@@ -1194,7 +1198,7 @@ mod tests {
             // A rollback read after the commit is still refused.
             api.delay_gets(std::sync::Arc::new(0.into()));
             put(&record(4));
-            assert!(follow_once(&shared, Instant::now()).await.is_err());
+            assert!(follow_once(&shared, crate::rt::now()).await.is_err());
             assert!(shared.serving.borrow().record.is_none());
         });
     }
@@ -1224,7 +1228,7 @@ mod tests {
             api.delay_gets(delay.clone());
             let seat = Rc::new(new_seat(&shared, 0).unwrap());
             *shared.seat.borrow_mut() = Some(seat.clone());
-            let started = Instant::now();
+            let started = crate::rt::now();
             rt::spawn(follower(shared.clone(), seat)).unwrap();
             // The first read is in flight and answers sequence 4.
             rt::sleep(Duration::from_millis(100)).await;

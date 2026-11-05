@@ -72,7 +72,7 @@ impl Budget {
 
     /// Deadline for writing `len` bytes starting now.
     fn write_deadline(&self, len: usize) -> Instant {
-        Instant::now()
+        crate::rt::now()
             + self.io
             + Duration::from_millis((len as u64).saturating_mul(1000) / self.write_rate.max(1))
     }
@@ -189,7 +189,7 @@ struct Reply<'a> {
 
 /// Local deadline of a credential expiring at `expires` (Unix seconds).
 fn caller_deadline(expires: u64) -> Instant {
-    Instant::now() + Duration::from_secs(expires.saturating_sub(unix_now()))
+    crate::rt::now() + Duration::from_secs(expires.saturating_sub(unix_now()))
 }
 
 /// Write fence: the seat authority deadline, clamped to the caller's.
@@ -285,7 +285,7 @@ pub(crate) async fn write_fenced(
         };
         let at = if authorized {
             match authority() {
-                Some(a) if a > Instant::now() => deadline.min(a),
+                Some(a) if a > crate::rt::now() => deadline.min(a),
                 _ => return false,
             }
         } else {
@@ -615,7 +615,7 @@ impl Server {
             if let Some(v) = ready() {
                 return Some(v);
             }
-            if Instant::now() >= deadline || self.shared.stopping.get() {
+            if crate::rt::now() >= deadline || self.shared.stopping.get() {
                 return None;
             }
             let generation = self.shared.changed.generation();
@@ -636,8 +636,8 @@ impl Server {
             .authority()
             .deadline()
             .ok_or(ProtocolFailure::Unavailable)?;
-        Ok((Instant::now() + wire::POLL_WAIT)
-            .min(Instant::now() + Duration::from_secs(expires - now))
+        Ok((crate::rt::now() + wire::POLL_WAIT)
+            .min(crate::rt::now() + Duration::from_secs(expires - now))
             .min(authority))
     }
 
@@ -713,7 +713,7 @@ impl Server {
         if bearer && !chain.is_empty() {
             return Err(ProtocolFailure::Unauthenticated);
         }
-        let authorized_at = Instant::now();
+        let authorized_at = crate::rt::now();
         let (node, expires) = if bearer {
             let c = self.authorize_bearer(head).await?;
             (c.node.uid, c.expires)
@@ -1036,7 +1036,7 @@ async fn webhook_connection(
             }
         };
         let authorized = bytes.starts_with(b"HTTP/1.1 200");
-        let deadline = Instant::now() + io;
+        let deadline = crate::rt::now() + io;
         if !write_fenced(&mut conn.tls, &bytes, &[], deadline, authorized, authority).await {
             return;
         }
@@ -1155,7 +1155,8 @@ pub async fn webhook_reply(shared: &Shared, body: &[u8]) -> Vec<u8> {
         Ok(r) => r,
         Err(_) => return http::response_head(400, &[], 0, false),
     };
-    let (caches, node) = review_lookups(&shared.api, &review, Instant::now() + LOOKUP_BUDGET).await;
+    let (caches, node) =
+        review_lookups(&shared.api, &review, crate::rt::now() + LOOKUP_BUDGET).await;
     let out = review.respond(
         image,
         &crate::webhook::Lookups {
@@ -1454,7 +1455,7 @@ mod tests {
             let got = cache_lookups(
                 &kube,
                 names(&["pooled", "plain", "absent"]),
-                Instant::now() + Duration::from_secs(2),
+                crate::rt::now() + Duration::from_secs(2),
             )
             .await;
             assert_eq!(got["pooled"], CacheLookup::Found(Some(sel)));
@@ -1466,7 +1467,7 @@ mod tests {
             let got = cache_lookups(
                 &kube,
                 names(&["plain"]),
-                Instant::now() + Duration::from_secs(2),
+                crate::rt::now() + Duration::from_secs(2),
             )
             .await;
             assert_eq!(got["plain"], CacheLookup::Unavailable);
@@ -1477,7 +1478,7 @@ mod tests {
             let got = cache_lookups(
                 &kube,
                 names(&["plain"]),
-                Instant::now() + Duration::from_millis(100),
+                crate::rt::now() + Duration::from_millis(100),
             )
             .await;
             assert_eq!(got["plain"], CacheLookup::Unavailable);
@@ -1531,7 +1532,7 @@ mod tests {
             api.delay_gets(delay.clone());
 
             // Three 400 ms GETs fit a 700 ms budget only if they overlap.
-            let started = Instant::now();
+            let started = crate::rt::now();
             let (caches, node) =
                 review_lookups(&kube, &review, started + Duration::from_millis(700)).await;
             assert!(started.elapsed() < Duration::from_millis(700));
@@ -1542,7 +1543,7 @@ mod tests {
 
             // Past the shared deadline every lookup is Unavailable, which
             // admission answers with a retryable 503.
-            let started = Instant::now();
+            let started = crate::rt::now();
             let (caches, node) =
                 review_lookups(&kube, &review, started + Duration::from_millis(100)).await;
             assert!(started.elapsed() < Duration::from_millis(300));
@@ -1571,7 +1572,7 @@ mod tests {
                 &crate::kube::paths::node("n1"),
                 serde_json::json!({"metadata": {"name": "n1", "labels": {"pool": "gpu"}}}),
             );
-            let t = Instant::now() + Duration::from_secs(2);
+            let t = crate::rt::now() + Duration::from_secs(2);
             assert_eq!(
                 node_lookup(&kube, "n1", t).await,
                 NodeLookup::Found([("pool".to_owned(), "gpu".to_owned())].into())
@@ -1582,7 +1583,7 @@ mod tests {
             let delay = Arc::new(std::sync::atomic::AtomicU64::new(1000));
             api.delay_gets(delay.clone());
             assert_eq!(
-                node_lookup(&kube, "n1", Instant::now() + Duration::from_millis(100)).await,
+                node_lookup(&kube, "n1", crate::rt::now() + Duration::from_millis(100)).await,
                 NodeLookup::Unavailable
             );
             delay.store(0, std::sync::atomic::Ordering::SeqCst);
@@ -1598,7 +1599,7 @@ mod tests {
             rt::spawn(Server::with_budget(shared.clone(), budget()).run(listener)).unwrap();
 
             // Idle: no request byte at all.
-            let started = Instant::now();
+            let started = crate::rt::now();
             let mut idle = connect(address, &pin).await.unwrap();
             assert!(closed_without_reply(&mut idle).await);
             assert!(started.elapsed() < Duration::from_secs(2));
@@ -1710,15 +1711,15 @@ mod tests {
                 let (tcp, _) = listener.accept().await.unwrap();
                 let mut tls = TlsStream::server(tcp, server).await.unwrap();
                 let body = vec![7u8; body];
-                let started = Instant::now();
+                let started = crate::rt::now();
                 let revoke = revoke_after.map(|d| started + d);
                 let caller = caller_after.map(|d| started + d);
                 // The same composition the server uses: seat authority
                 // (renewed, so always 60s ahead) clamped to the caller.
                 let ok = write_fenced(&mut tls, b"HEAD", &body, started + deadline, true, || {
                     let seat = match revoke {
-                        Some(r) if Instant::now() >= r => None,
-                        _ => Some(Instant::now() + Duration::from_secs(60)),
+                        Some(r) if crate::rt::now() >= r => None,
+                        _ => Some(crate::rt::now() + Duration::from_secs(60)),
                     };
                     fence(seat, caller)
                 })
@@ -1800,17 +1801,17 @@ mod tests {
 
     #[test]
     fn fence_never_extends_either_deadline() {
-        let now = Instant::now();
+        let now = crate::rt::now();
         let (a, b) = (now + Duration::from_secs(1), now + Duration::from_secs(2));
         assert_eq!(fence(Some(a), Some(b)), Some(a));
         assert_eq!(fence(Some(b), Some(a)), Some(a));
         assert_eq!(fence(Some(b), None), Some(b));
         assert_eq!(fence(None, Some(a)), None);
         assert_eq!(fence(None, None), None);
-        assert!(caller_deadline(unix_now()) <= Instant::now());
-        assert!(caller_deadline(0) <= Instant::now());
+        assert!(caller_deadline(unix_now()) <= crate::rt::now());
+        assert!(caller_deadline(0) <= crate::rt::now());
         let later = caller_deadline(unix_now() + 100);
-        assert!(later > Instant::now() + Duration::from_secs(98));
+        assert!(later > crate::rt::now() + Duration::from_secs(98));
     }
 
     #[test]
@@ -2234,13 +2235,13 @@ mod tests {
             // Enrollment and other non-poll replies still fail fast.
             assert_eq!(server.write_slot().err(), Some(ProtocolFailure::Overloaded));
             // A poll whose deadline (plus grace) passes while queued: 429.
-            let past = Instant::now() - limits::WRITE_QUEUE_GRACE;
+            let past = crate::rt::now() - limits::WRITE_QUEUE_GRACE;
             assert_eq!(
                 server.queued_write_slot(past, expires).await.err(),
                 Some(ProtocolFailure::Overloaded)
             );
             // An expired credential bounds the wait too.
-            let now = Instant::now();
+            let now = crate::rt::now();
             assert_eq!(
                 server.queued_write_slot(now, unix_now()).await.err(),
                 Some(ProtocolFailure::Overloaded)
@@ -2250,7 +2251,7 @@ mod tests {
             let result = Rc::new(RefCell::new(None));
             let (s, r) = (server.clone(), result.clone());
             rt::spawn(async move {
-                let out = s.queued_write_slot(Instant::now(), expires).await;
+                let out = s.queued_write_slot(crate::rt::now(), expires).await;
                 *r.borrow_mut() = Some(out.err());
             })
             .unwrap();

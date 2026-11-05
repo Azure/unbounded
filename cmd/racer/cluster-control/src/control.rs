@@ -229,13 +229,13 @@ fn run(
             if !shared.stopping.get() {
                 shared.stopping.set(true);
                 shared.changed.notify();
-                stop_at = Some(Instant::now() + Duration::from_secs(5));
+                stop_at = Some(rt::now() + Duration::from_secs(5));
             }
             // Give seat tasks a bounded chance to release Leases.
             return shared.seat.borrow().is_none()
                 && !shared.is_primary.get()
                 && shared.releasing.get() == 0
-                || stop_at.is_some_and(|t| Instant::now() >= t);
+                || stop_at.is_some_and(|t| rt::now() >= t);
         }
         false
     });

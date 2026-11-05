@@ -63,13 +63,13 @@ pub async fn contend(shared: Rc<Shared>, seat: Rc<Seat>) {
     while seat_mine(&shared, &seat) && !shared.stopping.get() {
         if let Ok(object) = lease::get(&shared.lease_api, &ns, annotations::PRIMARY_LEASE).await {
             let obs = lease::observe(&object);
-            if contend.observe(&obs, Instant::now(), seat_mine(&shared, &seat)) {
+            if contend.observe(&obs, crate::rt::now(), seat_mine(&shared, &seat)) {
                 let spec = election::claim(
                     &obs.spec,
                     &shared.config.pod_name,
                     &election::now_micro(SystemTime::now()),
                 );
-                let started = Instant::now();
+                let started = crate::rt::now();
                 let body = lease::with(
                     &object,
                     &spec,
@@ -184,7 +184,7 @@ async fn lead(shared: &Rc<Shared>, seat: &Rc<Seat>, object: Value, started: Inst
     for kind in [Kind::Nodes, Kind::Pods, Kind::Caches] {
         let _ = rt::spawn(watch(t.clone(), kind));
     }
-    let mut next = Instant::now();
+    let mut next = crate::rt::now();
     while t.alive.get() && seat_mine(shared, seat) && !shared.stopping.get() {
         let generation = t.changed.generation();
         let _ = rt::deadline(next, wake(shared, seat, &t.changed, generation)).await;
@@ -209,7 +209,7 @@ async fn lead(shared: &Rc<Shared>, seat: &Rc<Seat>, object: Value, started: Inst
             t.alive.set(false);
             break;
         }
-        next = Instant::now() + limits::LEASE_RENEW;
+        next = crate::rt::now() + limits::LEASE_RENEW;
     }
     t.alive.set(false);
     shared.is_primary.set(false);
@@ -252,7 +252,7 @@ async fn wake(shared: &Shared, seat: &Rc<Seat>, changed: &Signal, generation: u6
 async fn renew(t: Rc<Term_>) {
     let ns = t.shared.config.namespace.clone();
     while t.alive.get() {
-        let started = Instant::now();
+        let started = crate::rt::now();
         // Taken before reading `extra`: a change from here on renews again.
         let publish = t.publish.generation();
         let object = t.object.borrow().clone();
@@ -295,7 +295,7 @@ async fn renew(t: Rc<Term_>) {
             }
             _ => {}
         }
-        if !t.shell.borrow().lease().fresh(Instant::now()) || !seat_mine(&t.shared, &t.seat) {
+        if !t.shell.borrow().lease().fresh(crate::rt::now()) || !seat_mine(&t.shared, &t.seat) {
             t.alive.set(false);
             t.changed.notify();
             return;
@@ -494,14 +494,14 @@ async fn read_seats(t: &Term_) -> SeatSnapshot {
             continue;
         };
         let o = lease::observe(&v);
-        t.seat_observer.borrow_mut().observe(&o, Instant::now());
+        t.seat_observer.borrow_mut().observe(&o, crate::rt::now());
         holders.insert(i, (o, v));
     }
     SeatSnapshot { holders }
 }
 
 fn live_seats(t: &Term_, s: &SeatSnapshot) -> BTreeMap<usize, LeaseObservation> {
-    let now = Instant::now();
+    let now = crate::rt::now();
     let cluster = t.shared.cluster.borrow().clone();
     s.holders
         .iter()
@@ -570,7 +570,7 @@ async fn reconcile(t: &Rc<Term_>) -> Result<(), StateError> {
     loop {
         effect = match effect {
             Effect::ReadState => {
-                let started = Instant::now();
+                let started = crate::rt::now();
                 let read = read_state(shared).await;
                 let (object, current) = match read {
                     Ok((object, current)) => (object, Ok(current)),
@@ -634,7 +634,7 @@ async fn reconcile(t: &Rc<Term_>) -> Result<(), StateError> {
                 } = plan;
                 planned = Some((image, desired, eligible));
                 t.shell.borrow_mut().on(Event::Planned {
-                    now: Instant::now(),
+                    now: crate::rt::now(),
                     next: changed.then_some(next),
                 })
             }
@@ -653,7 +653,7 @@ async fn reconcile(t: &Rc<Term_>) -> Result<(), StateError> {
                 }
                 body["metadata"]["annotations"][annotations::INITIALIZED] = cluster.clone().into();
                 body["metadata"]["annotations"][annotations::CLUSTER_ID] = cluster.clone().into();
-                let started = Instant::now();
+                let started = crate::rt::now();
                 // Recheck right before the write.
                 t.shell.borrow().recheck(started)?;
                 let result = match shared
@@ -719,7 +719,7 @@ async fn update_discovery(
 ) {
     let shared = &t.shared;
     let sequence = shared.serving.borrow().record.as_ref().map(|r| r.sequence);
-    let previous = ready_floor(t.ready_floor.get(), sequence, Instant::now());
+    let previous = ready_floor(t.ready_floor.get(), sequence, crate::rt::now());
     let d = discovery(live, desired, eligible, sequence, previous);
     {
         let mut extra = t.extra.borrow_mut();
@@ -731,12 +731,12 @@ async fn update_discovery(
         }
     }
     let webhooks = d.webhooks;
-    let fresh = || t.alive.get() && t.shell.borrow().fresh(Instant::now());
+    let fresh = || t.alive.get() && t.shell.borrow().fresh(crate::rt::now());
     let _ = reconcile_webhook(
         shared,
         &webhooks,
         &t.webhook_retired,
-        Instant::now(),
+        crate::rt::now(),
         &fresh,
     )
     .await;
@@ -921,7 +921,7 @@ mod tests {
     #[test]
     fn ready_floor_grace() {
         use super::ready_floor;
-        let now = std::time::Instant::now();
+        let now = crate::rt::now();
         let later = now + std::time::Duration::from_secs(5);
         assert_eq!(ready_floor(Some((7, 6, later)), Some(7), now), Some(6));
         assert_eq!(ready_floor(Some((7, 6, now)), Some(7), later), None);
@@ -948,7 +948,7 @@ mod tests {
             let a = seat(1, "10.0.0.1");
             let v6 = seat(3, "fd00::1");
             let retired = RetiredTrust::default();
-            let t0 = Instant::now();
+            let t0 = crate::rt::now();
             let yes = || true;
             reconcile_webhook(&shared, &[a.clone(), v6], &retired, t0, &yes)
                 .await
@@ -1037,7 +1037,7 @@ mod tests {
                 &shared,
                 std::slice::from_ref(&seat),
                 &RetiredTrust::default(),
-                Instant::now(),
+                crate::rt::now(),
                 &yes,
             )
             .await
@@ -1079,7 +1079,7 @@ mod tests {
                 &shared,
                 &[seat],
                 &RetiredTrust::default(),
-                Instant::now(),
+                crate::rt::now(),
                 &fresh,
             )
             .await
@@ -1121,7 +1121,7 @@ mod tests {
                 &shared,
                 &seats,
                 &RetiredTrust::default(),
-                Instant::now(),
+                crate::rt::now(),
                 &|| true,
             )
             .await

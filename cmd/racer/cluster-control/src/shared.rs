@@ -139,7 +139,7 @@ impl Shared {
     }
 
     pub fn has_authority(&self) -> bool {
-        !self.stopping.get() && self.authority().fresh(Instant::now())
+        !self.stopping.get() && self.authority().fresh(crate::rt::now())
     }
 
     /// Ready to serve: authority, an image matching the committed record, a

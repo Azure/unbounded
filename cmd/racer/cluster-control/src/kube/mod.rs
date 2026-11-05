@@ -95,6 +95,9 @@ const LIST_PAGE: usize = 500;
 pub const MAX_LIST_ITEMS: usize = 400_000;
 const CREDENTIAL_TTL: Duration = Duration::from_secs(60);
 
+/// Largest API CA bundle read.
+const MAX_CA_BYTES: usize = 1024 * 1024;
+
 /// Build a client TLS config that trusts only `ca_pem`.
 pub fn tls_config(ca_pem: &[u8]) -> Result<Arc<rustls::ClientConfig>, KubeError> {
     let mut roots = rustls::RootCertStore::empty();
@@ -144,16 +147,19 @@ impl Kube {
     }
 
     /// Reread the token and CA when stale. A changed CA drops idle connections.
-    fn credentials(
+    /// Files are read on the reactor; no borrow is held across the reads.
+    async fn credentials(
         &self,
     ) -> Result<(zeroize::Zeroizing<String>, Arc<rustls::ClientConfig>), KubeError> {
-        let mut slot = self.credentials.borrow_mut();
-        if slot
-            .as_ref()
-            .is_none_or(|c| c.read_at.elapsed() >= CREDENTIAL_TTL)
-        {
-            let token =
-                std::fs::read_to_string(&self.config.token).map_err(|_| KubeError::Unauthorized)?;
+        let stale = self.credentials.borrow().as_ref().is_none_or(|c| {
+            crate::rt::now().saturating_duration_since(c.read_at) >= CREDENTIAL_TTL
+        });
+        if stale {
+            let token = rt::read_file(&self.config.token, limits::MAX_TOKEN_BYTES * 2)
+                .await
+                .map_err(|_| KubeError::Unauthorized)?;
+            let token = zeroize::Zeroizing::new(token);
+            let token = std::str::from_utf8(&token).map_err(|_| KubeError::Unauthorized)?;
             let token = zeroize::Zeroizing::new(token.trim().to_owned());
             if token.is_empty()
                 || token.len() > limits::MAX_TOKEN_BYTES
@@ -161,7 +167,10 @@ impl Kube {
             {
                 return Err(KubeError::Unauthorized);
             }
-            let ca = std::fs::read(&self.config.ca).map_err(|_| KubeError::Unavailable)?;
+            let ca = rt::read_file(&self.config.ca, MAX_CA_BYTES)
+                .await
+                .map_err(|_| KubeError::Unavailable)?;
+            let mut slot = self.credentials.borrow_mut();
             let tls = match slot.as_ref() {
                 Some(old) if old.ca == ca => old.tls.clone(),
                 _ => {
@@ -173,9 +182,10 @@ impl Kube {
                 token,
                 ca,
                 tls,
-                read_at: Instant::now(),
+                read_at: crate::rt::now(),
             });
         }
+        let slot = self.credentials.borrow();
         let c = slot.as_ref().expect("set above");
         Ok((c.token.clone(), c.tls.clone()))
     }
@@ -216,7 +226,7 @@ impl Kube {
         body: &[u8],
         limit: usize,
     ) -> Result<(u16, Vec<u8>), KubeError> {
-        let (token, tls) = self.credentials()?;
+        let (token, tls) = self.credentials().await?;
         let bearer = format!("Bearer {}", token.as_str());
         let mut headers = vec![
             ("Authorization", bearer.as_str()),
@@ -270,7 +280,7 @@ impl Kube {
                     if head.status == 401 {
                         // Force a token reread on the next call.
                         if let Some(c) = self.credentials.borrow_mut().as_mut() {
-                            c.read_at = Instant::now() - CREDENTIAL_TTL;
+                            c.read_at = crate::rt::now() - CREDENTIAL_TTL;
                         }
                     }
                     return Ok((head.status, body));
@@ -381,7 +391,7 @@ impl Kube {
         query: &str,
         resource_version: &str,
     ) -> Result<Watch, KubeError> {
-        let (token, tls) = self.credentials()?;
+        let (token, tls) = self.credentials().await?;
         let mut target = format!(
             "{path}?watch=1&allowWatchBookmarks=true&timeoutSeconds={}&resourceVersion={}",
             limits::WATCH_TIMEOUT.as_secs(),
@@ -421,7 +431,7 @@ impl Kube {
                 body,
                 pending: Vec::new(),
                 done: false,
-                deadline: Instant::now() + limits::WATCH_TIMEOUT + Duration::from_secs(30),
+                deadline: crate::rt::now() + limits::WATCH_TIMEOUT + Duration::from_secs(30),
             })
         })
         .await

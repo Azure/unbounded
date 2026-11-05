@@ -19,7 +19,7 @@ use crate::{
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use racer_control_wire::{ProtocolFailure, TOKEN_AUDIENCE};
 use serde_json::{Value, json};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 /// An authorized dataplane caller.
 #[derive(Clone, Debug)]
@@ -71,7 +71,7 @@ fn api_failure(shared: &Shared, e: KubeError) -> ProtocolFailure {
     match e {
         KubeError::NotFound => ProtocolFailure::Forbidden,
         KubeError::Throttled => {
-            shared.auth_budget.borrow_mut().throttled(Instant::now());
+            shared.auth_budget.borrow_mut().throttled(crate::rt::now());
             ProtocolFailure::Overloaded
         }
         _ => ProtocolFailure::Unavailable,
@@ -155,7 +155,7 @@ async fn reviewed(
     expires: u64,
     now: u64,
 ) -> Result<User, ProtocolFailure> {
-    if let Some(u) = shared.authz.borrow_mut().review(key, Instant::now()) {
+    if let Some(u) = shared.authz.borrow_mut().review(key, crate::rt::now()) {
         return Ok(u);
     }
     let u = review(shared, token).await?;
@@ -163,14 +163,14 @@ async fn reviewed(
         *key,
         u.clone(),
         Duration::from_secs(expires.saturating_sub(now)),
-        Instant::now(),
+        crate::rt::now(),
     );
     Ok(u)
 }
 
 /// DaemonSet and ServiceAccount UIDs, cached for [`authz::BINDINGS_TTL`].
 async fn bindings(shared: &Shared) -> Result<Bindings, ProtocolFailure> {
-    if let Some(b) = shared.authz.borrow_mut().bindings(Instant::now()) {
+    if let Some(b) = shared.authz.borrow_mut().bindings(crate::rt::now()) {
         return Ok(b);
     }
     let ns = &shared.config.namespace;
@@ -196,7 +196,7 @@ async fn bindings(shared: &Shared) -> Result<Bindings, ProtocolFailure> {
     shared
         .authz
         .borrow_mut()
-        .put_bindings(b.clone(), Instant::now());
+        .put_bindings(b.clone(), crate::rt::now());
     Ok(b)
 }
 
@@ -213,14 +213,14 @@ pub async fn authorize(
     let token = bearer(header)?;
     let expires = token_expiry(token, now)?;
     let key = authz::token_key(token);
-    if let Some(c) = shared.authz.borrow_mut().caller(&key, Instant::now()) {
+    if let Some(c) = shared.authz.borrow_mut().caller(&key, crate::rt::now()) {
         return Ok(c);
     }
-    let calls = shared.authz.borrow().calls(&key, Instant::now());
+    let calls = shared.authz.borrow().calls(&key, crate::rt::now());
     let wait = shared
         .auth_budget
         .borrow_mut()
-        .reserve(calls, Instant::now(), limits::AUTH_BUDGET_WAIT)
+        .reserve(calls, crate::rt::now(), limits::AUTH_BUDGET_WAIT)
         .ok_or(ProtocolFailure::Overloaded)?;
     if !wait.is_zero() {
         crate::rt::sleep(wait).await;
@@ -273,7 +273,7 @@ pub async fn authorize(
         key,
         caller.clone(),
         Duration::from_secs(expires.saturating_sub(now)),
-        Instant::now(),
+        crate::rt::now(),
     );
     Ok(caller)
 }

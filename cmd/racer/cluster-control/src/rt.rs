@@ -288,6 +288,19 @@ pub async fn timeout<T>(
     deadline(now() + duration, future).await
 }
 
+/// Read a small file (such as a projected token or CA bundle) on the
+/// reactor, so the control thread never blocks on the filesystem.
+/// Ordinary symlinks are followed; files over `limit` bytes fail.
+pub async fn read_file(path: &std::path::Path, limit: usize) -> io::Result<Vec<u8>> {
+    let c = current();
+    let bytes = c
+        .reactor
+        .read_path(path, limit, &OpCtx::none())
+        .await
+        .map_err(to_io)?;
+    Ok(bytes.to_vec())
+}
+
 /// Size of one socket receive.
 const RECV_BYTES: usize = 16 * 1024;
 
