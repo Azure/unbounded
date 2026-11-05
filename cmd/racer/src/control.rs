@@ -149,6 +149,10 @@ pub struct Snapshot {
     /// reads them through `membership`.
     pub pools: Vec<racer_wire::control::Pool>,
 
+    /// Cluster-wide page size (D13), fixed for the life of the process: a publication that
+    /// changes it is rejected.
+    pub page_size: racer_wire::object::PageSize,
+
     content_hash: [u8; 32],
 
     membership_hash: [u8; 32],
@@ -164,6 +168,7 @@ impl Snapshot {
             membership,
             caches: Arc::default(),
             pools: Vec::new(),
+            page_size: racer_wire::object::PageSize::DEFAULT,
             content_hash: [0; 32],
             membership_hash: [0; 32],
         }
@@ -383,6 +388,7 @@ impl Availability {
                         }
                     })
                     .collect(),
+                page_size: racer_wire::object::PageSize::DEFAULT,
             }
             .with_default_pool(),
         )
@@ -1364,6 +1370,20 @@ pub(crate) mod tests {
                     );
                 }
             }
+        }
+        #[test]
+        fn page_size_is_adopted_once_and_never_changed() {
+            let store = store(2);
+            let mut first = publication(1);
+            first.page_size = racer_wire::object::PageSize::new(64 << 10).unwrap();
+            assert_eq!(store.apply(first).unwrap().page_size.get(), 64 << 10);
+            assert!(matches!(
+                store.apply(publication(2)),
+                Err(Error::InvalidConfiguration)
+            ));
+            let mut same = publication(3);
+            same.page_size = racer_wire::object::PageSize::new(64 << 10).unwrap();
+            assert_eq!(store.apply(same).unwrap().page_size.get(), 64 << 10);
         }
         #[test]
         fn cache_only_history_uses_one_slot_and_weak_registry_stays_bounded() {

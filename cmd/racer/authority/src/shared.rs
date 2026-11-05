@@ -240,6 +240,7 @@ pub(crate) mod tests {
             daemonset: "racer".into(),
             service_account: "racer".into(),
             peer_port: 8082,
+            page_size: racer_wire::object::PageSize::DEFAULT,
             rotation: Default::default(),
         };
         Rc::new(Shared {

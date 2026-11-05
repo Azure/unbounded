@@ -26,6 +26,7 @@ pub fn parse_nics(value: &Value) -> Result<Vec<RailMapping>, wire::Error> {
         }],
         "caches": [],
         "pools": [],
+        "page_bytes": racer_wire::object::PageSize::DEFAULT.get(),
     });
     let bytes = serde_json::to_vec(&doc).map_err(|_| wire::Error::InvalidRequest)?;
     let mut p = wire::decode_publication(&bytes)?;
@@ -53,6 +54,7 @@ pub fn encode_nics(nics: &[RailMapping]) -> Result<Value, wire::Error> {
             site: String::new(),
         }],
         caches: vec![],
+        page_size: racer_wire::object::PageSize::DEFAULT,
         pools: vec![],
     };
     let bytes = wire::encode_publication(&p)?;

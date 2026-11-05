@@ -563,6 +563,7 @@ impl ReadWorker {
                         site: String::new(),
                     }],
                     caches: vec![cache.clone()],
+                    page_size: racer_wire::object::PageSize::DEFAULT,
                 }
                 .with_default_pool(),
             )

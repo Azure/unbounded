@@ -97,6 +97,7 @@ pub fn pod_config(os: &SimOs, i: usize, token_exp: u64) -> std::io::Result<Confi
         daemonset: "racer".into(),
         service_account: "racer".into(),
         peer_port: 8082,
+        page_size: racer_wire::object::PageSize::DEFAULT,
         rotation: Rotation::default(),
     })
 }

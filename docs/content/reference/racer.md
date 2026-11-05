@@ -508,6 +508,7 @@ each worker and are never divided.
 | `RACER_WEBHOOK_LISTEN` | `:9443` | Node | `ip:port` | Object sidecar admission webhook listener. `:port` binds every IPv4 address. |
 | `RACER_OBJECT_IMAGE` | Unset: webhook serving off | Node | image reference | Image injected as the object sidecar. |
 | `RACER_RETAINED_PAGE_KEYS` | `7` | Node | 1..16 | Readable page keys per cache: the active key plus older decrypt keys. Read by the authority. |
+| `RACER_PAGE_BYTES` | `16777216` (16 MiB) | Node | 65,536..16,777,216 bytes | Cluster-wide logical page size, a power of two. Read by the authority and published to every node. |
 | `RACER_KUBE_API_CA` | `/var/run/secrets/kubernetes.io/serviceaccount/ca.crt` | Node | absolute path | Kubernetes API CA bundle. |
 | `RACER_KUBE_API_TOKEN` | `/var/run/secrets/kubernetes.io/serviceaccount/token` | Node | absolute path | Default-audience token, used only for the Kubernetes API. |
 | `RACER_DAEMONSET` | `racer` | Node | DNS label | Dataplane DaemonSet name. |

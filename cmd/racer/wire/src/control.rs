@@ -170,6 +170,9 @@ pub struct Publication {
 
     /// Node pools of the catalog's caches. Each cache is in exactly one pool.
     pub pools: Vec<Pool>,
+
+    /// Cluster-wide logical page size every node adopts (D13).
+    pub page_size: crate::object::PageSize,
 }
 
 impl Publication {
@@ -1520,6 +1523,8 @@ mod codec {
         caches: Vec<Cache>,
 
         pools: Vec<PoolDto>,
+
+        page_bytes: u64,
     }
 
     /// Pool JSON record. `members` is absent, never null, for the default pool.
@@ -1638,6 +1643,8 @@ mod codec {
             .collect::<Result<Vec<_>>>()?;
         validate_definitions(&caches)?;
         caches.sort_by(|a, b| a.id.cmp(&b.id));
+        let page_size =
+            crate::object::PageSize::new(p.page_bytes).map_err(|_| Error::InvalidRequest)?;
         let mut pools = pools_from_dto(p.pools);
         validate_pools(&pools, members.len(), &caches)?;
         for pool in &mut pools {
@@ -1651,6 +1658,7 @@ mod codec {
             members,
             caches,
             pools,
+            page_size,
         })
     }
 
@@ -1701,6 +1709,7 @@ mod codec {
             members,
             caches,
             pools: pools_to_dto(&p.pools),
+            page_bytes: p.page_size.get(),
         })
     }
 
@@ -1745,6 +1754,8 @@ mod codec {
             caches: &'a [Cache],
 
             pools: &'a [PoolDto],
+
+            page_bytes: u64,
         }
 
         /// Canonical membership bytes exclude cursors and cache definitions, but
@@ -1767,6 +1778,7 @@ mod codec {
                     members: &d.members,
                     caches: &d.caches,
                     pools: &d.pools,
+                    page_bytes: d.page_bytes,
                 },
                 MAX_PUBLICATION_BYTES,
             )?,
@@ -1808,6 +1820,8 @@ mod codec {
 
         /// Complete pool list of the target; member indexes refer to its members.
         pools: Vec<PoolDto>,
+
+        page_bytes: u64,
     }
 
     /// Hash the canonical publication content using lowercase SHA-256 hexadecimal.
@@ -1854,6 +1868,7 @@ mod codec {
         original.members = members.into_values().collect();
         original.caches = d.caches;
         original.pools = d.pools;
+        original.page_bytes = d.page_bytes;
         original.sequence = d.sequence;
         original.membership_version = d.membership_version;
         encode(&original, MAX_PUBLICATION_BYTES)?;
@@ -2285,7 +2300,7 @@ mod codec {
                 "base_hash":content_hash(&base).unwrap(),"sequence":next.sequence.0.to_string(),
                 "membership_version":next.membership_version.0.to_string(),"content_hash":content_hash(&next).unwrap(),
                 "upsert_members":dto.members,"remove_members":[removed],"caches":dto.caches,
-                "pools":dto.pools
+                "pools":dto.pools,"page_bytes":dto.page_bytes
             });
             let bytes = serde_json::to_vec(&delta).unwrap();
             assert_eq!(
@@ -3043,6 +3058,19 @@ mod codec {
             let mut no_pools: Value = serde_json::from_str(&raw).unwrap();
             no_pools.as_object_mut().unwrap().remove("pools");
             assert!(decode_publication(&serde_json::to_vec(&no_pools).unwrap()).is_err());
+            // D13: the page size is required, validated, and part of the content hash.
+            let mut paged: Value = serde_json::from_str(&raw).unwrap();
+            paged.as_object_mut().unwrap().remove("page_bytes");
+            assert!(decode_publication(&serde_json::to_vec(&paged).unwrap()).is_err());
+            for bad in [0u64, 4096, 98304, 32 << 20] {
+                paged["page_bytes"] = bad.into();
+                assert!(decode_publication(&serde_json::to_vec(&paged).unwrap()).is_err());
+            }
+            paged["page_bytes"] = (64u64 << 10).into();
+            let small = decode_publication(&serde_json::to_vec(&paged).unwrap()).unwrap();
+            assert_eq!(small.page_size.get(), 64 << 10);
+            let full = decode_publication(raw.as_bytes()).unwrap();
+            assert_ne!(content_hash(&small).unwrap(), content_hash(&full).unwrap());
         }
 
         /// The default pool helper covers every cache with the top priority.
@@ -3105,7 +3133,7 @@ mod codec {
                 "delta_version":2,"cluster":base.cluster.0,"base_sequence":base.sequence.0.to_string(),
                 "base_hash":content_hash(&base).unwrap(),"sequence":next.sequence.0.to_string(),
                 "membership_version":next.membership_version.0.to_string(),"content_hash":content_hash(&next).unwrap(),
-                "upsert_members":[],"remove_members":[],"caches":d.caches,"pools":d.pools
+                "upsert_members":[],"remove_members":[],"caches":d.caches,"pools":d.pools,"page_bytes":d.page_bytes
             });
             let applied = apply_delta(&base, &serde_json::to_vec(&delta).unwrap()).unwrap();
             assert_eq!(applied.pools, next.pools);
@@ -3392,7 +3420,7 @@ mod codec {
         /// The Go delta fixture applies exactly once and binds changed member content.
         #[test]
         fn go_delta_vector_applies_exactly_and_rejects_tampering() {
-            let base = decode_publication(br#"{"schema_version":2,"cluster":"11111111-1111-4111-8111-111111111111","sequence":"1","membership_version":"1","members":[{"node":"22222222-2222-4222-8222-222222222222","shares":4,"peer_endpoint":"127.0.0.1:7443","rdma_nics":[],"site":""},{"node":"33333333-3333-4333-8333-333333333333","shares":4,"peer_endpoint":"127.0.0.2:7443","rdma_nics":[],"site":""}],"caches":[],"pools":[]}"#).unwrap();
+            let base = decode_publication(br#"{"schema_version":2,"cluster":"11111111-1111-4111-8111-111111111111","sequence":"1","membership_version":"1","members":[{"node":"22222222-2222-4222-8222-222222222222","shares":4,"peer_endpoint":"127.0.0.1:7443","rdma_nics":[],"site":""},{"node":"33333333-3333-4333-8333-333333333333","shares":4,"peer_endpoint":"127.0.0.2:7443","rdma_nics":[],"site":""}],"caches":[],"pools":[],"page_bytes":16777216}"#).unwrap();
             let delta = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/testdata/delta.json"));
             let next = apply_delta(&base, delta.as_bytes()).unwrap();
             assert_eq!(next.sequence.0, 2);
@@ -3401,7 +3429,7 @@ mod codec {
             assert_eq!(next.members[1].shares.get(), 7);
             assert_eq!(
                 format!("{:x}", Sha256::digest(canonical_content(&next).unwrap().0)),
-                "6c712b7c02dffe1e6f64d0794a8ccb23699b7d375bc212f748620b2fc464d7c9"
+                "11c9293a9cd1abf98844df94a5bc8f194a5358d6fbb08a5583ee32f32c7f4992"
             );
             assert!(apply_delta(&next, delta.as_bytes()).is_err());
             assert!(

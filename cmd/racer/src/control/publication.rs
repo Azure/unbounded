@@ -225,6 +225,11 @@ fn project(
         return Err(Error::Unauthorized);
     }
     let publication = wire::validate_publication(document)?;
+    // Stored pages and in-flight reads are split by the adopted page size; a node never
+    // switches it under them.
+    if current.is_some_and(|old| old.page_size != publication.page_size) {
+        return Err(Error::InvalidConfiguration);
+    }
     let (content, membership) = wire::canonical_content(&publication)?;
     let content_hash: [u8; 32] = Sha256::digest(content).into();
     let membership_hash: [u8; 32] = Sha256::digest(membership).into();
@@ -251,6 +256,7 @@ fn project(
         membership,
         caches: Arc::new(publication.caches.into()),
         pools: publication.pools,
+        page_size: publication.page_size,
         content_hash,
         membership_hash,
     }))

@@ -2776,6 +2776,7 @@ fn production_snapshot_replacement_rejects_old_backlog_uid_with_503() {
             site: String::new(),
         }],
         caches: vec![definition()],
+        page_size: racer_wire::object::PageSize::DEFAULT,
     }
     .with_default_pool();
     snapshots.apply(publication.clone()).unwrap();

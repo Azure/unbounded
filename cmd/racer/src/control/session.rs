@@ -1440,7 +1440,7 @@ pub(super) mod tests {
             "sequence": "12", "membership_version": next.membership_version.0.to_string(),
             "content_hash": wire::content_hash(&next).unwrap(),
             "upsert_members": [], "remove_members": [], "caches": [],
-            "pools": []
+            "pools": [], "page_bytes": 16777216
         });
         let requests = Rc::new(RefCell::new(vec![]));
         let source = Script {

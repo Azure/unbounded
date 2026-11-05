@@ -544,6 +544,7 @@ mod tests {
                 site: "site1".into(),
             }],
             caches: vec![],
+            page_size: racer_wire::object::PageSize::DEFAULT,
         }
         .with_default_pool();
         worker.snapshots.apply(publication.clone()).unwrap();
@@ -1329,6 +1330,7 @@ mod tests {
                         site: "site1".into(),
                     }],
                     caches: vec![],
+                    page_size: racer_wire::object::PageSize::DEFAULT,
                 }
                 .with_default_pool(),
             )
@@ -1404,6 +1406,7 @@ mod tests {
                         site: "site1".into(),
                     }],
                     caches: vec![],
+                    page_size: racer_wire::object::PageSize::DEFAULT,
                 }
                 .with_default_pool(),
             )
@@ -1470,6 +1473,7 @@ mod tests {
                     membership_version: MembershipVersion(2),
                     members: vec![],
                     caches: vec![],
+                    page_size: racer_wire::object::PageSize::DEFAULT,
                 }
                 .with_default_pool(),
             )
@@ -1516,6 +1520,7 @@ mod tests {
                     membership_version: MembershipVersion(2),
                     members: vec![],
                     caches: vec![],
+                    page_size: racer_wire::object::PageSize::DEFAULT,
                 }
                 .with_default_pool(),
             )
@@ -1554,6 +1559,7 @@ mod tests {
                     membership_version: MembershipVersion(2),
                     members: vec![],
                     caches: vec![],
+                    page_size: racer_wire::object::PageSize::DEFAULT,
                 }
                 .with_default_pool(),
             )
@@ -1587,6 +1593,7 @@ mod tests {
                         site: member.site.clone(),
                     }],
                     caches: vec![],
+                    page_size: racer_wire::object::PageSize::DEFAULT,
                 }
                 .with_default_pool(),
             )

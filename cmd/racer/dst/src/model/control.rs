@@ -2156,6 +2156,7 @@ impl ControlSim {
                 writer: shell.writer(),
                 wall_unix: self.wall_secs(),
                 membership_changed_unix: self.membership_changed,
+                page_size: racer_wire::object::PageSize::DEFAULT,
             },
             &mut self.rng,
         );

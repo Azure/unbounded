@@ -169,9 +169,13 @@ impl OriginClient {
         })
     }
 
-    /// The published cluster page size.
+    /// The published cluster page size; the default before any publication (callers that pass
+    /// an explicit endpoint may run without one).
     fn page_size(&self) -> Result<PageSize> {
-        Ok(PageSize::DEFAULT)
+        Ok(self
+            .snapshots
+            .current()?
+            .map_or(PageSize::DEFAULT, |snapshot| snapshot.page_size))
     }
 
     fn endpoint(&self, context: &OriginContext) -> Result<Endpoint> {

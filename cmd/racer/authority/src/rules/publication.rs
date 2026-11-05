@@ -10,6 +10,7 @@ use racer_wire::control::{
     self as wire, CacheDefinition, ClusterId, Member, MembershipVersion, Publication,
     PublicationSequence,
 };
+use racer_wire::object::PageSize;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::{collections::BTreeMap, sync::Arc};
@@ -50,6 +51,7 @@ pub fn prepare(
     members: impl IntoIterator<Item = Member>,
     caches: Vec<CacheDefinition>,
     pools: &[PoolPlan],
+    page_size: racer_wire::object::PageSize,
 ) -> Result<Prepared, wire::Error> {
     let mut p = Publication {
         schema_version: wire::SCHEMA_VERSION,
@@ -59,6 +61,7 @@ pub fn prepare(
         members: members.into_iter().collect(),
         caches,
         pools: Vec::new(),
+        page_size,
     };
     p.members.sort_by(|a, b| a.node.cmp(&b.node));
     let nodes: Vec<&str> = p.members.iter().map(|m| m.node.0.as_str()).collect();
@@ -128,6 +131,7 @@ pub fn encode_delta(base: &Publication, next: &Publication) -> Result<Vec<u8>, w
         "remove_members": remove,
         "caches": caches,
         "pools": pools,
+        "page_bytes": next.page_size.get(),
     });
     let b = serde_json::to_vec(&d).map_err(|_| wire::Error::InvalidRequest)?;
     if b.len() > MAX_DELTA_BYTES {
@@ -237,7 +241,7 @@ mod tests {
         caches: Vec<CacheDefinition>,
     ) -> Result<Prepared, wire::Error> {
         let plans = pools::plan(&caches, &Default::default(), []);
-        prepare(prev, cluster, members, caches, &plans)
+        prepare(prev, cluster, members, caches, &plans, PageSize::DEFAULT)
     }
 
     fn cache() -> CacheDefinition {
@@ -417,7 +421,15 @@ mod tests {
     fn pools_resolve_to_member_indexes_and_bump_membership() {
         let plans = gpu_pool();
         let members = || [member(3, 4), member(1, 4), member(2, 4)];
-        let p1 = prepare(&Record::default(), C, members(), vec![cache()], &plans).unwrap();
+        let p1 = prepare(
+            &Record::default(),
+            C,
+            members(),
+            vec![cache()],
+            &plans,
+            PageSize::DEFAULT,
+        )
+        .unwrap();
         assert_eq!(p1.publication.pools.len(), 1);
         assert_eq!(p1.publication.pools[0].members, Some(vec![1, 2]));
         assert_eq!(p1.publication.pools[0].rank, (1 << 32) | 500);
@@ -428,6 +440,7 @@ mod tests {
             [member(2, 4), member(3, 4), member(1, 4)],
             vec![cache()],
             &plans,
+            PageSize::DEFAULT,
         )
         .unwrap();
         assert_eq!(again.encoded, p1.encoded);
@@ -439,7 +452,15 @@ mod tests {
             .as_mut()
             .unwrap()
             .remove(&member(3, 4).node.0);
-        let p2 = prepare(&p1.record, C, members(), vec![cache()], &moved).unwrap();
+        let p2 = prepare(
+            &p1.record,
+            C,
+            members(),
+            vec![cache()],
+            &moved,
+            PageSize::DEFAULT,
+        )
+        .unwrap();
         assert_eq!(p2.publication.pools[0].members, Some(vec![1]));
         assert_eq!(p2.record.sequence, p1.record.sequence + 1);
         assert_eq!(
@@ -454,7 +475,15 @@ mod tests {
             p2.record.membership_version + 1
         );
         // Pools naming non-members leave them out.
-        let p4 = prepare(&p3.record, C, [member(1, 4)], vec![cache()], &plans).unwrap();
+        let p4 = prepare(
+            &p3.record,
+            C,
+            [member(1, 4)],
+            vec![cache()],
+            &plans,
+            PageSize::DEFAULT,
+        )
+        .unwrap();
         assert_eq!(p4.publication.pools[0].members, Some(vec![]));
         // Deltas carry pools.
         let i3 = Image::new(
@@ -467,6 +496,16 @@ mod tests {
         let applied = wire::apply_delta(&p3.publication, &d).unwrap();
         assert_eq!(wire::encode_publication(&applied).unwrap(), p4.encoded);
         // Uncovered caches are rejected.
-        assert!(prepare(&Record::default(), C, members(), vec![cache()], &[]).is_err());
+        assert!(
+            prepare(
+                &Record::default(),
+                C,
+                members(),
+                vec![cache()],
+                &[],
+                PageSize::DEFAULT
+            )
+            .is_err()
+        );
     }
 }

@@ -324,6 +324,7 @@ fn remote_candidate_with_churn(absence: Option<Absence>, forbidden: bool, churn:
                 site: String::new(),
             })
             .collect(),
+        page_size: racer_wire::object::PageSize::DEFAULT,
     }
     .with_default_pool();
     let first = source_store.apply(publication.clone()).unwrap();
@@ -952,6 +953,7 @@ fn metadata_coordinator_with_newer_publication(
             mode: racer_wire::control::CacheMode::Cached,
             origin: None,
         }],
+        page_size: racer_wire::object::PageSize::DEFAULT,
     }
     .with_default_pool();
     snapshots.apply(publication.clone()).unwrap();

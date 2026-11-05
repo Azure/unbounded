@@ -270,6 +270,7 @@ impl SubscriptionFixture {
                 }],
                 caches: vec![cache.clone()],
                 pools: racer_wire::control::default_pools(std::slice::from_ref(&cache)),
+                page_size: racer_wire::object::PageSize::DEFAULT,
             })
             .unwrap();
         let directory = Arc::new(

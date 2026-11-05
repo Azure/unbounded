@@ -57,6 +57,7 @@ pub struct PassInputs<'a> {
     pub pod_uid: &'a str,
     pub seats: SeatPolicy,
     pub peer_port: u16,
+    pub page_size: racer_wire::object::PageSize,
     pub policy: &'a Policy,
     pub inventory: &'a Inventory,
     /// Nodes, Pods, and ClusterCaches were all synced when the pass began
@@ -246,6 +247,7 @@ pub fn plan_pass(i: &PassInputs<'_>, rng: &mut dyn Entropy) -> Result<PassPlan, 
                 m.members.values().cloned(),
                 catalog.clone(),
                 &plans,
+                i.page_size,
             )
             .map_err(|_| StateError::TooLarge)?;
             // Held joiners count: seats must not shrink while they wait.
@@ -495,6 +497,7 @@ mod tests {
                 pod_uid: "pod-uid",
                 seats: SeatPolicy::Auto,
                 peer_port: 8082,
+                page_size: racer_wire::object::PageSize::DEFAULT,
                 policy: &policy,
                 inventory: inv,
                 synced: inv.synced(),

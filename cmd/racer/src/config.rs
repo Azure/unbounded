@@ -1070,6 +1070,10 @@ fn authority(
             retained_page_keys: v.unsigned("RACER_RETAINED_PAGE_KEYS").expect("defaulted") as usize,
             ..Default::default()
         },
+        page_size: racer_wire::object::PageSize::new(
+            v.unsigned("RACER_PAGE_BYTES").expect("defaulted"),
+        )
+        .map_err(|_| ConfigError::new("RACER_PAGE_BYTES", "must be a power of two"))?,
     };
     control.validate().map_err(|error| {
         ConfigError::new(
@@ -3171,6 +3175,25 @@ mod tests {
                     .unwrap()
                     .name,
                 "RACER_RETAINED_PAGE_KEYS"
+            );
+        }
+    }
+
+    #[test]
+    fn authority_page_bytes() {
+        assert_eq!(
+            control(&[]).page_size,
+            racer_wire::object::PageSize::DEFAULT
+        );
+        let c = control(&[("RACER_PAGE_BYTES", "65536")]);
+        assert_eq!(c.page_size.get(), 65536);
+        for bad in ["4096", "98304", "33554432", "x"] {
+            assert_eq!(
+                managed_env(&[("RACER_PAGE_BYTES", bad)])
+                    .err()
+                    .unwrap()
+                    .name,
+                "RACER_PAGE_BYTES"
             );
         }
     }

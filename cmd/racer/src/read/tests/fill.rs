@@ -460,6 +460,7 @@ fn ready_memory_precedes_cold_ownership_refresh_and_preserves_one_interest() {
         membership_version: racer_wire::control::MembershipVersion(1),
         members: vec![],
         caches: vec![],
+        page_size: racer_wire::object::PageSize::DEFAULT,
     }
     .with_default_pool();
     publication.members = (0..1000)
@@ -3214,6 +3215,7 @@ impl Fixture {
                 mode: racer_wire::control::CacheMode::Cached,
                 origin: None,
             }],
+            page_size: racer_wire::object::PageSize::DEFAULT,
         };
         let publication = match &self.pools {
             Some(pools) => Publication {
@@ -3570,6 +3572,7 @@ pub(super) fn adapter_client(
                     mode: racer_wire::control::CacheMode::Cached,
                     origin: None,
                 }],
+                page_size: racer_wire::object::PageSize::DEFAULT,
             }
             .with_default_pool(),
         )

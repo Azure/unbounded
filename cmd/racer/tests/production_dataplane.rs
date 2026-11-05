@@ -907,6 +907,7 @@ fn fixture_publication() -> Publication {
             mode: racer_wire::control::CacheMode::Cached,
             origin: None,
         }],
+        page_size: racer_wire::object::PageSize::DEFAULT,
     }
     .with_default_pool()
 }

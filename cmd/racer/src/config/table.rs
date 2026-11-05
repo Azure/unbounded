@@ -875,6 +875,13 @@ const BASE: &[Var] = &[
         "Readable page keys per cache: the active key plus older decrypt keys. Read by the authority.",
     )),
     control(var(
+        "RACER_PAGE_BYTES",
+        Group::Kubernetes,
+        uint(64 * 1024, 16 * 1024 * 1024, BYTES),
+        Value("16777216"),
+        "Cluster-wide logical page size, a power of two. Read by the authority and published to every node.",
+    )),
+    control(var(
         "RACER_KUBE_API_CA",
         Group::Kubernetes,
         text(TextKind::Path),

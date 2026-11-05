@@ -631,6 +631,7 @@ async fn reconcile(t: &Rc<Term_>) -> Result<(), StateError> {
                             pod_uid: &shared.config.pod_uid,
                             seats: shared.config.seats,
                             peer_port: shared.config.peer_port,
+                            page_size: shared.config.page_size,
                             policy: &policy,
                             inventory: &inventory,
                             synced: ready,
