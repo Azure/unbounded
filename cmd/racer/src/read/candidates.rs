@@ -737,6 +737,11 @@ impl CandidatePolicy {
 
     /// Let readers wait for a destination that is behind this node's membership instead of skipping
     /// it.
+    /// This worker's time and entropy.
+    pub(crate) fn ctx(&self) -> &racer_io::WorkerCtx {
+        &self.ctx
+    }
+
     pub(crate) fn with_reactor(mut self, reactor: Rc<crate::runtime::Reactor>) -> Self {
         self.reactor = Some(reactor);
         self

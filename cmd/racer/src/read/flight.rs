@@ -641,6 +641,11 @@ impl CopyWaiter<'_> {
 }
 
 impl Flights {
+    /// The flights' clock.
+    pub(crate) fn clock(&self) -> &racer_io::Clock {
+        &self.clock
+    }
+
     /// Attach a fresh generation without refreshing state or touching wake ownership.
     pub(super) fn driver_diagnostic(&self, leader: &FlightLeader) -> Option<DriverDiagnostic> {
         let diagnostic = DriverDiagnostic(

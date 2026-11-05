@@ -184,7 +184,7 @@ impl Coordinator {
             .note(
                 page.clone(),
                 requester.clone(),
-                uring_runtime::environment::now(),
+                self.fill.dependencies.candidates.ctx().now(),
             );
         self.fill
             .metrics
@@ -214,7 +214,11 @@ impl Coordinator {
             .candidates
             .successors
             .borrow()
-            .peek_for(page, requester, uring_runtime::environment::now());
+            .peek_for(
+                page,
+                requester,
+                self.fill.dependencies.candidates.ctx().now(),
+            );
         if hints.is_empty() {
             return false;
         }
@@ -235,7 +239,7 @@ impl Coordinator {
                 requester.clone(),
                 &to,
                 MAX_DEFERRALS,
-                uring_runtime::environment::now(),
+                self.fill.dependencies.candidates.ctx().now(),
             );
         self.fill
             .metrics
@@ -306,7 +310,7 @@ impl Coordinator {
                     requester.clone(),
                     holds,
                     acquiring,
-                    uring_runtime::environment::now(),
+                    self.fill.dependencies.candidates.ctx().now(),
                 )
         {
             self.fill

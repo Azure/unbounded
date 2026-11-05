@@ -411,7 +411,7 @@ impl Fill {
             .diagnostic
             .as_ref()
             .map(|diagnostic| diagnostic.call(stage));
-        let start = uring_runtime::environment::now();
+        let start = self.dependencies.flights.clock().now();
         let result = work.await;
         if let Some((count, sum)) = stage_events(stage) {
             self.metrics.record_duration(count, sum, start);
@@ -426,7 +426,7 @@ impl Fill {
         sum: Event,
         work: impl std::future::Future<Output = T>,
     ) -> T {
-        let start = uring_runtime::environment::now();
+        let start = self.dependencies.flights.clock().now();
         let result = work.await;
         self.metrics.record_duration(count, sum, start);
         result
@@ -1651,7 +1651,7 @@ impl Fill {
         // budget; the extra time is within the adopting waiter's own deadline and budget.
         let handover = !self.fence_acquisition;
         let ceiling = racer_core::read::flight::handover_ceiling(
-            uring_runtime::environment::now(),
+            caller_scope.clock().now(),
             caller_scope.deadline.0,
             handover,
         );
@@ -1670,7 +1670,7 @@ impl Fill {
         let diagnostic_lifetime = DriverDiagnostic::lifetime(fill.diagnostic.clone());
         let flights = self.dependencies.flights.clone();
         let (send, mut receive) = futures::channel::oneshot::channel();
-        let submitted = uring_runtime::environment::now();
+        let submitted = self.dependencies.flights.clock().now();
         driver_permit.submit_detached(Box::pin(async move {
             fill.metrics.record_duration(
                 Event::FillDriverStartCount,
@@ -2342,7 +2342,7 @@ impl Fill {
                     first,
                     second,
                 } => {
-                    let hedge_start = uring_runtime::environment::now();
+                    let hedge_start = self.dependencies.flights.clock().now();
                     let (result, end) = self
                         .timed(
                             Event::FillHedgeCount,
@@ -2406,7 +2406,7 @@ impl Fill {
                 Action::Origin { rank } => {
                     let authority = policy.authority(&mut acquisition, rank, &operation);
                     authority.validate(&context.object, page.number)?;
-                    budget.begin_attempt(uring_runtime::environment::now(), scope.deadline.0)?;
+                    budget.begin_attempt(scope.clock().now(), scope.deadline.0)?;
                     scope.check()?;
                     // Peer reception owns its ciphertext allocation. Reserve encryption
                     // output only when this candidate actually needs an origin fill.
@@ -2532,7 +2532,7 @@ impl Fill {
                 self.reserve_bootstrap(&context.object.cache)
             })?
         };
-        budget.begin_attempt(uring_runtime::environment::now(), scope.deadline.0)?;
+        budget.begin_attempt(scope.clock().now(), scope.deadline.0)?;
         scope.check()?;
         let ciphertext =
             self.observe_reservation(scope, page, FillAdmissionSite::OriginCiphertext, || {

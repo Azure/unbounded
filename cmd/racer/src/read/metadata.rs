@@ -315,11 +315,11 @@ impl MetadataService {
 
     /// Invalidate current observations when the clock's freshness is uncertain.
     fn observe_clock(&self) -> Result<SystemTime> {
-        let now = uring_runtime::environment::wall_now();
+        let now = self.candidates.ctx().clock.wall_now();
         if self
             .clock
             .borrow_mut()
-            .observe(now, uring_runtime::environment::now())
+            .observe(now, self.candidates.ctx().now())
         {
             self.storage.index.invalidate_freshness()?;
         }
@@ -373,7 +373,10 @@ impl MetadataService {
                     }
                     let driver_permit = uring_runtime::drivers::reserve().map_err(Error::from)?;
                     let mut nonce = [0; 16];
-                    uring_runtime::environment::fill_random(&mut nonce)
+                    self.candidates
+                        .ctx()
+                        .rng
+                        .fill(&mut nonce)
                         .map_err(|_| Error::Unavailable)?;
                     let attempt = crate::model::AttemptId(nonce);
                     let sealed = self.credentials.seal(context, attempt, scope)?;
@@ -577,7 +580,7 @@ impl MetadataService {
     ) -> std::result::Result<RefreshOutput, RefreshFailure> {
         authority.validate(&context.object, PageNumber(0))?;
         budget
-            .begin_attempt(uring_runtime::environment::now(), scope.deadline.0)
+            .begin_attempt(scope.clock().now(), scope.deadline.0)
             .map_err(Error::from)?;
         let selector = purpose.selector();
         let acquisition = match purpose {
