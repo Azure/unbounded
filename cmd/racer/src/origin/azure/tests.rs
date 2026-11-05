@@ -900,7 +900,7 @@ mod router {
                 ClusterId("cluster".into()),
                 node.clone(),
                 Arc::new(racer_crypto::identity::KeyEpochs::with_clock(
-                    crate::enrollment::migration_wall_clock(),
+                    crate::enrollment::wall_clock(&crate::test_support::clock()),
                 )),
             )),
             h.admission.clone(),

@@ -367,7 +367,14 @@ impl ControlFixture {
         timeout: Duration,
     ) -> (Config, Arc<NodeState>) {
         let mut config = self.config.take().unwrap();
-        let node = Arc::new(NodeState::new((0..workers).map(WorkerId).collect(), 64).unwrap());
+        let node = Arc::new(
+            NodeState::new(
+                (0..workers).map(WorkerId).collect(),
+                64,
+                crate::test_support::clock(),
+            )
+            .unwrap(),
+        );
         config.node = bootstrap(&config, &node, &config.limits, &scope(timeout).unwrap())
             .unwrap()
             .0;
@@ -2098,8 +2105,18 @@ fn cache_removal_installs_while_renewal_and_next_publication_poll_are_held() {
     .unwrap();
     worker.control_task.take();
     let control = worker.control.clone().unwrap();
-    assert!(control.identity().unwrap().renewal_due());
-    assert!(control.identity().unwrap().valid_now());
+    assert!(
+        control
+            .identity()
+            .unwrap()
+            .renewal_due_at(crate::test_support::clock().wall_now())
+    );
+    assert!(
+        control
+            .identity()
+            .unwrap()
+            .valid_at(crate::test_support::clock().wall_now())
+    );
     let accepted = fixture.enrollments.load(Ordering::Acquire);
     let baseline_polls = fixture.long_polls.load(Ordering::Acquire);
     fixture.hold_renewal.store(true, Ordering::Release);
@@ -2193,8 +2210,18 @@ fn cache_removal_during_retry_after(delay_renewal_entry: bool) {
     .unwrap();
     worker.control_task.take();
     let control = worker.control.clone().unwrap();
-    assert!(control.identity().unwrap().renewal_due());
-    assert!(control.identity().unwrap().valid_now());
+    assert!(
+        control
+            .identity()
+            .unwrap()
+            .renewal_due_at(crate::test_support::clock().wall_now())
+    );
+    assert!(
+        control
+            .identity()
+            .unwrap()
+            .valid_at(crate::test_support::clock().wall_now())
+    );
     let accepted = fixture.enrollments.load(Ordering::Acquire);
     fixture.hold_renewal.store(true, Ordering::Release);
     fixture
@@ -2300,7 +2327,9 @@ fn same_node_renewal_backs_off_expires_closed_and_recovers() {
         let completed = done.clone();
         let control = worker.control.clone().unwrap();
         if let Some(clock) = clock
-            && control.identity().is_some_and(|i| i.valid_now())
+            && control
+                .identity()
+                .is_some_and(|i| i.valid_at(crate::test_support::clock().wall_now()))
             && let Some(next) = control.next_attempt()
         {
             clock.advance(next.saturating_duration_since(now()));
@@ -2352,7 +2381,10 @@ fn same_node_renewal_backs_off_expires_closed_and_recovers() {
     turn(&mut worker, &runtime, &mut engine, None);
     let control = worker.control.clone().unwrap();
     let old = control.identity().unwrap();
-    assert!(old.renewal_due() && old.valid_now());
+    assert!(
+        old.renewal_due_at(crate::test_support::clock().wall_now())
+            && old.valid_at(crate::test_support::clock().wall_now())
+    );
     let old_signing = worker.keys.signing_identity().unwrap();
     let committed = std::fs::read(config.identity_directory.join("identity.json")).unwrap();
     let baseline = fixture.bootstrap_requests.lock().unwrap().len();
@@ -2381,7 +2413,7 @@ fn same_node_renewal_backs_off_expires_closed_and_recovers() {
     for _ in 0..16 {
         turn(&mut worker, &runtime, &mut engine, Some(&clock));
         assert!(node.observations.health.ready());
-        assert!(old.valid_now());
+        assert!(old.valid_at(crate::test_support::clock().wall_now()));
         assert!(Arc::ptr_eq(
             &old_signing,
             &worker.keys.signing_identity().unwrap()
@@ -2439,7 +2471,7 @@ fn same_node_renewal_backs_off_expires_closed_and_recovers() {
     worker.observe_health().unwrap();
     assert!(node.observations.health.ready());
     clock.advance(Duration::from_millis(1));
-    assert!(!old.valid_now());
+    assert!(!old.valid_at(crate::test_support::clock().wall_now()));
     assert!(!node.observations.health.ready());
     worker.observe_health().unwrap();
     assert_eq!(node.observations.health.state(), Ok(State::Degraded));
@@ -2484,7 +2516,10 @@ fn same_node_renewal_backs_off_expires_closed_and_recovers() {
     turn(&mut worker, &runtime, &mut engine, Some(&clock));
     let fresh = control.identity().unwrap();
     assert_eq!(fresh.node(), old.node());
-    assert!(fresh.valid_now() && !fresh.renewal_due());
+    assert!(
+        fresh.valid_at(crate::test_support::clock().wall_now())
+            && !fresh.renewal_due_at(crate::test_support::clock().wall_now())
+    );
     assert_ne!(fresh.certificate_chain(), old.certificate_chain());
     assert_ne!(fresh.private_key_der(), old.private_key_der());
     assert_eq!(
@@ -2553,7 +2588,8 @@ fn removal_publication_finishes_locally_after_controller_disappears() {
     };
     *fixture.publication.lock().unwrap() =
         Some(publication(&config, 1, vec![definition(), keep.clone()]));
-    let node = Arc::new(NodeState::new(vec![WorkerId(0)], 64).unwrap());
+    let node =
+        Arc::new(NodeState::new(vec![WorkerId(0)], 64, crate::test_support::clock()).unwrap());
     config.node = bootstrap(
         &config,
         &node,
@@ -2742,7 +2778,7 @@ fn startup_retries_tls_internal_error_before_enrollment_and_worker_snapshot() {
 fn startup_tls_authentication_alert_remains_terminal() {
     let mut fixture = ControlFixture::new();
     let config = fixture.config.take().unwrap();
-    let node = NodeState::new(vec![WorkerId(0)], 64).unwrap();
+    let node = NodeState::new(vec![WorkerId(0)], 64, crate::test_support::clock()).unwrap();
     fixture.handshake_alerts.lock().unwrap().push_back(42);
     assert_eq!(
         bootstrap(
@@ -2763,7 +2799,7 @@ fn startup_tls_authentication_alert_remains_terminal() {
 fn startup_tls_internal_error_respects_deadline() {
     let mut fixture = ControlFixture::new();
     let config = fixture.config.take().unwrap();
-    let node = NodeState::new(vec![WorkerId(0)], 64).unwrap();
+    let node = NodeState::new(vec![WorkerId(0)], 64, crate::test_support::clock()).unwrap();
     fixture.handshake_alerts.lock().unwrap().extend([80; 16]);
     assert_eq!(
         bootstrap(
@@ -2785,7 +2821,7 @@ fn startup_reauthenticates_retained_identity_and_fails_closed() {
     let mut fixture = ControlFixture::new();
     let config = fixture.config.take().unwrap();
     let start = || {
-        let node = NodeState::new(vec![WorkerId(0)], 64).unwrap();
+        let node = NodeState::new(vec![WorkerId(0)], 64, crate::test_support::clock()).unwrap();
         bootstrap(
             &config,
             &node,
@@ -2882,7 +2918,8 @@ fn node_replacement_drains_all_workers_and_restart_converges() {
         assert_eq!(images[0].1.shards.len(), 2);
         fixture.poll_status.store(200, Ordering::Release);
         fixture.certificate_age.store(1, Ordering::Release);
-        let fresh = Arc::new(NodeState::new(vec![WorkerId(0)], 64).unwrap());
+        let fresh =
+            Arc::new(NodeState::new(vec![WorkerId(0)], 64, crate::test_support::clock()).unwrap());
         drop(group);
         let app = Arc::try_unwrap(app).ok().unwrap();
         let mut config = Arc::try_unwrap(app.config).ok().unwrap();
@@ -3207,7 +3244,8 @@ fn blocked_publication_is_superseded_while_projection_rotates() {
 fn network_keyring_bootstrap_rotation_recovery_and_failure_retention() {
     let mut fixture = ControlFixture::new();
     let mut config = fixture.config.take().unwrap();
-    let node = Arc::new(NodeState::new(vec![WorkerId(0)], 64).unwrap());
+    let node =
+        Arc::new(NodeState::new(vec![WorkerId(0)], 64, crate::test_support::clock()).unwrap());
     {
         let mut bundle = fixture.bundle.lock().unwrap();
         *bundle =
@@ -3405,7 +3443,8 @@ fn network_keyring_bootstrap_rotation_recovery_and_failure_retention() {
 fn real_control_bootstrap_recovery_publication_readiness_and_shutdown() {
     let mut fixture = ControlFixture::new();
     let mut config = fixture.config.take().unwrap();
-    let node = Arc::new(NodeState::new(vec![WorkerId(0)], 64).unwrap());
+    let node =
+        Arc::new(NodeState::new(vec![WorkerId(0)], 64, crate::test_support::clock()).unwrap());
     let startup = scope(Duration::from_secs(15)).unwrap();
     config.node = bootstrap(&config, &node, &config.limits, &startup)
         .unwrap()
@@ -3820,8 +3859,13 @@ fn worker_requesters_share_configured_admission_and_production_metrics() {
         ..Default::default()
     };
     let node = Arc::new(
-        NodeState::with_peer_admission(vec![WorkerId(0), WorkerId(1)], 16, config.peer_admission)
-            .unwrap(),
+        NodeState::with_peer_admission(
+            vec![WorkerId(0), WorkerId(1)],
+            16,
+            config.peer_admission,
+            crate::test_support::clock(),
+        )
+        .unwrap(),
     );
     let (first, _, _) = local_worker(&config, &node, 0);
     let (second, _, _) = local_worker(&config, &node, 1);
@@ -3883,7 +3927,14 @@ fn receive_gate_two_workers_share_capacity_and_wake_expiry_without_cqe() {
     let mut config = crate::test_support::cluster::config(false);
     config.peer_receive.active = 1;
     config.peer_receive.wait = Duration::from_millis(10);
-    let node = Arc::new(NodeState::new(vec![WorkerId(0), WorkerId(1)], 16).unwrap());
+    let node = Arc::new(
+        NodeState::new(
+            vec![WorkerId(0), WorkerId(1)],
+            16,
+            crate::test_support::clock(),
+        )
+        .unwrap(),
+    );
     let (mut first, _, _) = local_worker(&config, &node, 0);
     let (second, _, _) = local_worker(&config, &node, 1);
     let gate = node.peer_receive.get().unwrap().clone();
@@ -4018,7 +4069,14 @@ fn assembly_uses_node_metrics_for_sparse_worker_ids() {
     use crate::telemetry::Event;
     use crate::telemetry::Gauge;
     let config = crate::test_support::cluster::config(false);
-    let node = Arc::new(NodeState::new(vec![WorkerId(9), WorkerId(2)], 16).unwrap());
+    let node = Arc::new(
+        NodeState::new(
+            vec![WorkerId(9), WorkerId(2)],
+            16,
+            crate::test_support::clock(),
+        )
+        .unwrap(),
+    );
     let (first, _, _) = local_worker(&config, &node, 9);
     let (second, _, _) = local_worker(&config, &node, 2);
     first.telemetry.metrics.record(Event::MemoryHit, 2);

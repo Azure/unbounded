@@ -1111,7 +1111,7 @@ fn enrolled_identity(
         .unwrap();
     assert_eq!(identity.cluster().0, CLUSTER);
     assert_eq!(identity.node().0, NODE);
-    assert!(identity.valid_now());
+    assert!(identity.valid_at(std::time::SystemTime::now()));
     identity
 }
 

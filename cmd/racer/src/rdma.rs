@@ -503,15 +503,15 @@ pub(crate) mod tests {
                     node.clone(),
                     chain,
                     &roots,
-                    &crate::enrollment::migration_wall_clock(),
+                    &crate::enrollment::wall_clock(&crate::test_support::clock()),
                 )
                 .unwrap();
             let keys = Rc::new(Keyring::new(
                 cluster.clone(),
                 node.clone(),
-                Arc::new(KeyEpochs::with_clock(
-                    crate::enrollment::migration_wall_clock(),
-                )),
+                Arc::new(KeyEpochs::with_clock(crate::enrollment::wall_clock(
+                    &crate::test_support::clock(),
+                ))),
             ));
             keys.install(KeyringBundle {
                 schema_version: racer_control_wire::KEYRING_SCHEMA_VERSION,

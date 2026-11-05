@@ -31,11 +31,10 @@ use uring_runtime::{
 };
 use zeroize::{Zeroize, Zeroizing};
 
-/// MIGRATION: bridges the ambient `uring_runtime` wall clock (virtual under
-/// simulation) into racer-crypto's injected clock. Replace with the node's
-/// `racer_io::WorkerCtx` clock when the root crate moves to racer-io.
-pub fn migration_wall_clock() -> identity::WallClock {
-    identity::WallClock::new(uring_runtime::environment::wall_now)
+/// racer-crypto's injected wall clock reading the given worker clock.
+pub fn wall_clock(clock: &racer_io::Clock) -> identity::WallClock {
+    let clock = clock.clone();
+    identity::WallClock::new(move || clock.wall_now())
 }
 
 /// Enrollment validation failures, separate from caller-owned filesystem errors.
@@ -193,6 +192,16 @@ impl<H: Host> Enrollment<H> {
         }
     }
 
+    /// Wall time from the owning worker's reactor.
+    pub fn wall_clock(&self) -> identity::WallClock {
+        wall_clock(&self.host.reactor().ctx().clock)
+    }
+
+    /// Current wall time from the owning worker's reactor.
+    pub fn wall_now(&self) -> SystemTime {
+        self.host.reactor().ctx().clock.wall_now()
+    }
+
     /// Return the configured cluster binding.
     pub fn cluster(&self) -> &ClusterId {
         &self.cluster
@@ -200,7 +209,7 @@ impl<H: Host> Enrollment<H> {
 
     /// Validate all roots before atomically replacing the enrollment trust snapshot.
     pub fn set_peer_trust_roots(&self, roots: Vec<Vec<u8>>) -> Result<(), Error> {
-        identity::root_store(&migration_wall_clock(), &roots).map_err(|_| Error::Unauthorized)?;
+        identity::root_store(&self.wall_clock(), &roots).map_err(|_| Error::Unauthorized)?;
         *self.roots.borrow_mut() = roots;
         Ok(())
     }
@@ -222,7 +231,12 @@ impl<H: Host> Enrollment<H> {
         params.distinguished_name = rcgen::DistinguishedName::new();
         let csr = params.serialize_request(&signing).map_err(|_| Error::Io)?;
         let mut id = [0; 16];
-        uring_runtime::environment::fill_random(&mut id).map_err(|_| Error::Io)?;
+        self.host
+            .reactor()
+            .ctx()
+            .rng
+            .fill(&mut id)
+            .map_err(|_| Error::Io)?;
         id[6] = (id[6] & 0x0f) | 0x40;
         id[8] = (id[8] & 0x3f) | 0x80;
         let h = format!("{:032x}", u128::from_be_bytes(id));
@@ -298,7 +312,7 @@ impl<H: Host> Enrollment<H> {
             return Err(Error::Unauthorized);
         }
         let public = identity::verify_chain(
-            &migration_wall_clock(),
+            &self.wall_clock(),
             &self.roots.borrow(),
             &r.certificate_chain,
             &self.cluster,
@@ -536,6 +550,7 @@ impl LocalSigningIdentity {
     pub fn signing_identity(
         &self,
         roots: &[Vec<u8>],
+        clock: &identity::WallClock,
     ) -> identity::Result<Arc<identity::SigningIdentity>> {
         identity::SigningIdentity::from_pkcs8(
             self.cluster.clone(),
@@ -543,7 +558,7 @@ impl LocalSigningIdentity {
             &self.private_material,
             self.certificate_chain.clone(),
             roots,
-            &migration_wall_clock(),
+            clock,
         )
         .map(Arc::new)
     }
@@ -553,19 +568,17 @@ impl LocalSigningIdentity {
         UNIX_EPOCH + Duration::from_secs(self.not_after)
     }
 
-    /// Check both ends of the leaf's lifetime against the scoped wall clock.
-    pub fn valid_now(&self) -> bool {
-        let now = uring_runtime::environment::wall_now();
+    /// Check both ends of the leaf's lifetime against wall time `now`.
+    pub fn valid_at(&self, now: SystemTime) -> bool {
         now >= UNIX_EPOCH + Duration::from_secs(self.not_before) && now < self.expires_at()
     }
 
     /// Renew after two thirds of the issued lifetime, capped by wire policy.
-    pub fn renewal_due(&self) -> bool {
+    pub fn renewal_due_at(&self, now: SystemTime) -> bool {
         let lifetime = Duration::from_secs(self.not_after - self.not_before);
-        uring_runtime::environment::wall_now()
-            >= UNIX_EPOCH
-                + Duration::from_secs(self.not_before)
-                + (lifetime * 2 / 3).min(wire::RENEW_AFTER)
+        now >= UNIX_EPOCH
+            + Duration::from_secs(self.not_before)
+            + (lifetime * 2 / 3).min(wire::RENEW_AFTER)
     }
 }
 
@@ -977,7 +990,7 @@ mod tests {
     ) -> EnrollmentResponse {
         let der = rustls::pki_types::CertificateSigningRequestDer::from(request.csr_der.clone());
         let mut csr = rcgen::CertificateSigningRequestParams::from_der(&der).unwrap();
-        let now = uring_runtime::environment::wall_now();
+        let now = crate::test_support::clock().wall_now();
         csr.params.not_before = (now - Duration::from_secs(1)).into();
         csr.params.not_after = (now + Duration::from_secs(3600)).into();
         csr.params.subject_alt_names = vec![rcgen::SanType::URI(
@@ -1055,10 +1068,17 @@ mod tests {
             e.accept_response(issue(&request, &ca, &key, |_| {}), &scope),
         )
         .unwrap();
-        assert!(identity.valid_now());
-        assert!(!identity.renewal_due());
+        assert!(identity.valid_at(crate::test_support::clock().wall_now()));
+        assert!(!identity.renewal_due_at(crate::test_support::clock().wall_now()));
         assert!(!identity.private_key_der().is_empty());
-        assert!(identity.signing_identity(&[ca.der().to_vec()]).is_ok());
+        assert!(
+            identity
+                .signing_identity(
+                    &[ca.der().to_vec()],
+                    &wall_clock(&crate::test_support::clock())
+                )
+                .is_ok()
+        );
         sim.disk().crash().unwrap();
         assert_eq!(
             drive(&files, e.load_identity(&scope))
@@ -1184,8 +1204,9 @@ mod tests {
                     .subject_alt_names
                     .push(rcgen::SanType::DnsName("extra.example".try_into().unwrap())),
                 "lifetime" => {
-                    params.not_after =
-                        (uring_runtime::environment::wall_now() + Duration::from_secs(90000)).into()
+                    params.not_after = (crate::test_support::clock().wall_now()
+                        + Duration::from_secs(90000))
+                    .into()
                 }
                 "usage" => {
                     params.extended_key_usages = vec![rcgen::ExtendedKeyUsagePurpose::ServerAuth]
@@ -1257,13 +1278,13 @@ mod tests {
                 "missing-usage" => params.key_usages.clear(),
                 "future" => {
                     params.not_before =
-                        (uring_runtime::environment::wall_now() + Duration::from_secs(600)).into()
+                        (crate::test_support::clock().wall_now() + Duration::from_secs(600)).into()
                 }
                 "expired" => {
                     params.not_before =
-                        (uring_runtime::environment::wall_now() - Duration::from_secs(600)).into();
+                        (crate::test_support::clock().wall_now() - Duration::from_secs(600)).into();
                     params.not_after =
-                        (uring_runtime::environment::wall_now() - Duration::from_secs(300)).into();
+                        (crate::test_support::clock().wall_now() - Duration::from_secs(300)).into();
                 }
                 _ => unreachable!(),
             });
@@ -1285,7 +1306,7 @@ mod tests {
             assert_eq!(recovered.certificate_chain(), prior.certificate_chain());
             assert!(
                 recovered
-                    .signing_identity(&roots)
+                    .signing_identity(&roots, &wall_clock(&crate::test_support::clock()))
                     .unwrap()
                     .sign(b"still usable")
                     .is_ok()
@@ -1317,7 +1338,11 @@ mod tests {
             e.accept_response(issue(&request, &ca, &key, |_| {}), &scope),
         )
         .unwrap();
-        assert!(accepted.signing_identity(&roots).is_ok());
+        assert!(
+            accepted
+                .signing_identity(&roots, &wall_clock(&crate::test_support::clock()))
+                .is_ok()
+        );
         assert!(sim.metadata(Path::new("/private/pending.json")).is_err());
     }
 
@@ -1357,7 +1382,7 @@ mod tests {
             "too-many",
             "oversized",
         ] {
-            let now = uring_runtime::environment::wall_now();
+            let now = crate::test_support::clock().wall_now();
             let mut params = rcgen::CertificateParams::new(Vec::<String>::new()).unwrap();
             params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
             params.not_before = (now - Duration::from_secs(600)).into();
@@ -1410,7 +1435,7 @@ mod tests {
             assert_eq!(recovered.certificate_chain(), prior.certificate_chain());
             assert!(
                 recovered
-                    .signing_identity(&good)
+                    .signing_identity(&good, &wall_clock(&crate::test_support::clock()))
                     .unwrap()
                     .sign(b"still usable")
                     .is_ok()
@@ -1448,7 +1473,7 @@ mod tests {
         let pending = sim.read_file(Path::new("/private/pending.json")).unwrap();
         let mut params = rcgen::CertificateParams::new(Vec::<String>::new()).unwrap();
         params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
-        let now = uring_runtime::environment::wall_now();
+        let now = crate::test_support::clock().wall_now();
         params.not_before = (now - Duration::from_secs(60)).into();
         params.not_after = (now + Duration::from_secs(60)).into();
         let short = params.self_signed(&key).unwrap();
@@ -1472,7 +1497,7 @@ mod tests {
         assert_eq!(recovered.certificate_chain(), prior.certificate_chain());
         assert!(
             recovered
-                .signing_identity(&good)
+                .signing_identity(&good, &wall_clock(&crate::test_support::clock()))
                 .unwrap()
                 .sign(b"still usable")
                 .is_ok()
@@ -1621,15 +1646,15 @@ mod tests {
         let start = UNIX_EPOCH + Duration::from_secs(identity.not_before);
         let lifetime = identity.not_after - identity.not_before;
         clock.set_wall_time(start + Duration::from_secs(lifetime * 2 / 3 - 1));
-        assert!(!identity.renewal_due());
+        assert!(!identity.renewal_due_at(crate::test_support::clock().wall_now()));
         clock.set_wall_time(start + Duration::from_secs(lifetime * 2 / 3 + 1));
-        assert!(identity.renewal_due());
-        assert!(identity.valid_now());
+        assert!(identity.renewal_due_at(crate::test_support::clock().wall_now()));
+        assert!(identity.valid_at(crate::test_support::clock().wall_now()));
         clock.set_wall_time(identity.expires_at() + Duration::from_secs(1));
-        assert!(!identity.valid_now());
+        assert!(!identity.valid_at(crate::test_support::clock().wall_now()));
         assert!(drive(&files, e.load_identity(&scope)).unwrap().is_none());
         clock.set_wall_time(start - Duration::from_secs(1));
-        assert!(!identity.valid_now());
+        assert!(!identity.valid_at(crate::test_support::clock().wall_now()));
     }
 
     /// Shared secure helpers keep symlink policy, permissions and size errors intact.

@@ -649,9 +649,9 @@ pub(crate) mod tests {
             let keys = Rc::new(Keyring::new(
                 publication.cluster,
                 publication.members[0].node.clone(),
-                Arc::new(KeyEpochs::with_clock(
-                    crate::enrollment::migration_wall_clock(),
-                )),
+                Arc::new(KeyEpochs::with_clock(crate::enrollment::wall_clock(
+                    &crate::test_support::clock(),
+                ))),
             ));
             let installer = BundleInstaller::new(keys.clone());
             let (ca, _) = testing::ca();
@@ -773,9 +773,9 @@ pub(crate) mod tests {
             let keys = Rc::new(Keyring::new(
                 cluster.clone(),
                 NodeId("22222222-2222-4222-8222-222222222222".into()),
-                Arc::new(KeyEpochs::with_clock(
-                    crate::enrollment::migration_wall_clock(),
-                )),
+                Arc::new(KeyEpochs::with_clock(crate::enrollment::wall_clock(
+                    &crate::test_support::clock(),
+                ))),
             ));
             Session::new(
                 ControlEndpoint {
@@ -2046,14 +2046,14 @@ pub(crate) mod tests {
             let d = testing::Directory::new();
             let (ca, key) = testing::ca();
             let identity = enrolled(&r, &d, &ca, &key);
-            assert!(identity.valid_now());
+            assert!(identity.valid_at(crate::test_support::clock().wall_now()));
             let clock = uring_runtime::environment::SimulationClock::new(17);
             let environment = clock.environment(1);
             // Roll only the scoped wall clock back after real enrollment. The generic
             // Identity has expiry only; Racer must enforce its not-before policy itself.
             clock.set_wall_time(SystemTime::now() - Duration::from_secs(3600));
             let _guard = environment.enter();
-            assert!(!identity.valid_now());
+            assert!(!identity.valid_at(crate::test_support::clock().wall_now()));
             session::tests::reject_future_identity(identity);
         }
     }
@@ -2225,13 +2225,13 @@ pub(crate) mod tests {
                     wall + Duration::from_secs(due - 1),
                 );
                 let _time = clock.environment(1).enter();
-                assert!(!identity.renewal_due());
+                assert!(!identity.renewal_due_at(crate::test_support::clock().wall_now()));
                 clock.advance(Duration::from_secs(1));
-                assert!(identity.renewal_due());
-                assert!(identity.valid_now());
+                assert!(identity.renewal_due_at(crate::test_support::clock().wall_now()));
+                assert!(identity.valid_at(crate::test_support::clock().wall_now()));
                 clock.advance(Duration::from_secs(lifetime - due));
-                assert!(!identity.valid_now());
-                assert!(identity.renewal_due());
+                assert!(!identity.valid_at(crate::test_support::clock().wall_now()));
+                assert!(identity.renewal_due_at(crate::test_support::clock().wall_now()));
             }
         }
 
@@ -2263,6 +2263,9 @@ pub(crate) mod tests {
                     SystemTime::now() + Duration::from_secs(172800),
                 );
                 let _time = expired.then(|| clock.environment(1).enter());
+                if expired {
+                    r.override_ctx_for_test(clock.environment(1).worker_ctx());
+                }
                 if expired {
                     assert!(
                         testing::drive(&r, e.load_identity(&scope))
@@ -2488,8 +2491,8 @@ pub(crate) mod tests {
             assert!(testing::drive(&r, again.accept_response(wrong, &scope)).is_err());
             assert!(directory.0.join("identity/pending.json").exists());
             let identity = testing::drive(&r, again.accept_response(response, &scope)).unwrap();
-            assert!(identity.valid_now());
-            assert!(!identity.renewal_due());
+            assert!(identity.valid_at(crate::test_support::clock().wall_now()));
+            assert!(!identity.renewal_due_at(crate::test_support::clock().wall_now()));
             assert_eq!(
                 testing::drive(&r, again.load_identity(&scope))
                     .unwrap()

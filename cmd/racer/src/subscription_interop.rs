@@ -237,7 +237,7 @@ impl SubscriptionFixture {
         let reactor = Rc::new(Reactor::new(admission.clone()));
         reactor.init().unwrap();
         let buffers = BufferPool::new(admission.clone());
-        let keys = Rc::new(interop_keys());
+        let keys = Rc::new(interop_keys(&reactor.ctx().clock));
         let published = Arc::new(Published::new(Snapshot::retention(2)));
         let availability = Rc::new(control::Availability::new(published.clone(), keys.clone()));
         let snapshots = Rc::new(PublicationTarget::new(keys.cluster().clone(), published));
@@ -492,14 +492,12 @@ fn interop_limits() -> Limits {
     }
 }
 
-fn interop_keys() -> racer_crypto::identity::Keyring {
+fn interop_keys(clock: &racer_io::Clock) -> racer_crypto::identity::Keyring {
     let cluster = ClusterId("11111111-1111-4111-8111-111111111111".into());
     let keys = Keyring::new(
         cluster.clone(),
         NodeId("22222222-2222-4222-8222-222222222222".into()),
-        Arc::new(KeyEpochs::with_clock(
-            crate::enrollment::migration_wall_clock(),
-        )),
+        Arc::new(KeyEpochs::with_clock(crate::enrollment::wall_clock(clock))),
     );
     let mut ca = rcgen::CertificateParams::new(vec![]).unwrap();
     ca.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);

@@ -3268,9 +3268,9 @@ pub(super) mod tests {
         let keys = Rc::new(Keyring::new(
             ClusterId("cluster".into()),
             NodeId("local".into()),
-            std::sync::Arc::new(KeyEpochs::with_clock(
-                crate::enrollment::migration_wall_clock(),
-            )),
+            std::sync::Arc::new(KeyEpochs::with_clock(crate::enrollment::wall_clock(
+                &crate::test_support::clock(),
+            ))),
         ));
         (
             membership,
@@ -4245,9 +4245,9 @@ pub(super) mod tests {
         let keys = Rc::new(Keyring::new(
             config.cluster,
             node.clone(),
-            std::sync::Arc::new(KeyEpochs::with_clock(
-                crate::enrollment::migration_wall_clock(),
-            )),
+            std::sync::Arc::new(KeyEpochs::with_clock(crate::enrollment::wall_clock(
+                &crate::test_support::clock(),
+            ))),
         ));
         CandidatePolicy::new(
             node,
@@ -4420,9 +4420,9 @@ pub(super) mod tests {
             let keys = Rc::new(Keyring::new(
                 config.cluster.clone(),
                 config.node.clone(),
-                Arc::new(KeyEpochs::with_clock(
-                    crate::enrollment::migration_wall_clock(),
-                )),
+                Arc::new(KeyEpochs::with_clock(crate::enrollment::wall_clock(
+                    &crate::test_support::clock(),
+                ))),
             ));
             let published = crate::test_support::published_membership(Arc::new(
                 crate::topology::Membership::validate(

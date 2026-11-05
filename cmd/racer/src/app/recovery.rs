@@ -1130,7 +1130,7 @@ mod tests {
         use crate::store::catalog::IndexedPage;
         use crate::store::catalog::RecordLocation;
         use crate::store::checkpoint;
-        let node = NodeState::new(vec![WorkerId(0)], 16).unwrap();
+        let node = NodeState::new(vec![WorkerId(0)], 16, crate::test_support::clock()).unwrap();
         let keys = crate::test_support::security::keys();
         let caches = caches();
         let cache = caches[0].id.clone();
@@ -1269,7 +1269,7 @@ mod tests {
         use crate::store::catalog::IndexedPage;
         use crate::store::catalog::RecordLocation;
         use crate::store::checkpoint;
-        let node = NodeState::new(vec![WorkerId(0)], 16).unwrap();
+        let node = NodeState::new(vec![WorkerId(0)], 16, crate::test_support::clock()).unwrap();
         let keys = crate::test_support::security::keys();
         let caches = caches();
         let g = geometry();
@@ -1406,7 +1406,9 @@ mod tests {
             let mut fixture = ControlFixture::new();
             let mut config = fixture.config.take().unwrap();
             config.checkpoint_bytes = std::num::NonZeroUsize::new(budget).unwrap();
-            let node = Arc::new(NodeState::new(vec![WorkerId(0)], 16).unwrap());
+            let node = Arc::new(
+                NodeState::new(vec![WorkerId(0)], 16, crate::test_support::clock()).unwrap(),
+            );
             let (app, _runtime, _crypto) = local_worker(&config, &node, 0);
             app.snapshots
                 .apply(publication(&config, 1, vec![]))
@@ -1448,7 +1450,7 @@ mod tests {
 
     #[test]
     fn distinct_live_catalog_and_page_capacities_select_an_installable_cut() {
-        let node = NodeState::new(vec![WorkerId(0)], 16).unwrap();
+        let node = NodeState::new(vec![WorkerId(0)], 16, crate::test_support::clock()).unwrap();
         let keys = crate::test_support::security::keys();
         let geometry = [(WorkerId(0), geometry())].into_iter().collect();
         let candidate = |sequence, count| {

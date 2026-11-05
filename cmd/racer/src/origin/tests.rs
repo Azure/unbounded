@@ -101,9 +101,9 @@ fn credentials(
         Rc::new(Keyring::new(
             ClusterId("cluster".into()),
             racer_control_wire::NodeId("local".into()),
-            Arc::new(KeyEpochs::with_clock(
-                crate::enrollment::migration_wall_clock(),
-            )),
+            Arc::new(KeyEpochs::with_clock(crate::enrollment::wall_clock(
+                &crate::test_support::clock(),
+            ))),
         )),
         admission,
     ))

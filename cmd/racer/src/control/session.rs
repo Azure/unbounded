@@ -219,7 +219,7 @@ impl Credentials<ReactorControlIo> for FeedCredentials {
             .identity
             .borrow()
             .clone()
-            .filter(|i| i.valid_now())
+            .filter(|i| i.valid_at(self.auth.enrollment.wall_now()))
             .map(IdentityLease))
     }
 
@@ -700,7 +700,10 @@ impl Session {
         if let Some(bundle) = self.auth.startup_bundle.borrow().as_ref() {
             self.auth.secrets.install(bundle.clone())?;
         }
-        keys.install_signing_identity(identity.signing_identity(&keys.peer_trust_roots()?)?)?;
+        keys.install_signing_identity(identity.signing_identity(
+            &keys.peer_trust_roots()?,
+            &self.auth.enrollment.wall_clock(),
+        )?)?;
         self.auth.startup_bundle.borrow_mut().take();
         Ok(())
     }
@@ -725,9 +728,15 @@ impl Session {
             let _busy = super::enter(&self.busy)?;
             // Without usable identity, do not start an identity-only fetch that
             // could race renewal and advance its own authentication retry clock.
-            if self.identity().is_none_or(|identity| !identity.valid_now()) {
+            if self
+                .identity()
+                .is_none_or(|identity| !identity.valid_at(self.auth.enrollment.wall_now()))
+            {
                 self.renew_if_due(scope).await?;
-                if self.identity().is_none_or(|identity| !identity.valid_now()) {
+                if self
+                    .identity()
+                    .is_none_or(|identity| !identity.valid_at(self.auth.enrollment.wall_now()))
+                {
                     return Err(Error::Unavailable);
                 }
             }
@@ -846,7 +855,10 @@ impl Session {
 
     /// Renewal failures never reset either feed or discard a still-valid identity.
     async fn renew_if_due(&self, scope: &RequestScope) -> Result<()> {
-        if (self.auth.binding_check.get() || self.identity().is_none_or(|i| i.renewal_due()))
+        if (self.auth.binding_check.get()
+            || self
+                .identity()
+                .is_none_or(|i| i.renewal_due_at(self.auth.enrollment.wall_now())))
             && self
                 .renewal_next
                 .get()
@@ -877,7 +889,10 @@ impl Session {
                         return Err(error);
                     }
                     self.renewal_next.set(Some(self.issuance_backoff()?));
-                    if self.identity().is_none_or(|i| !i.valid_now()) {
+                    if self
+                        .identity()
+                        .is_none_or(|i| !i.valid_at(self.auth.enrollment.wall_now()))
+                    {
                         return Err(if error == Error::Unauthorized {
                             Error::Unavailable
                         } else {
@@ -908,7 +923,10 @@ impl Session {
         }
         let identity = accepted?;
         let keys = self.auth.keys.borrow();
-        keys.install_signing_identity(identity.signing_identity(&keys.peer_trust_roots()?)?)?;
+        keys.install_signing_identity(identity.signing_identity(
+            &keys.peer_trust_roots()?,
+            &self.auth.enrollment.wall_clock(),
+        )?)?;
         *self.auth.identity.borrow_mut() = Some(identity);
         Ok(())
     }
