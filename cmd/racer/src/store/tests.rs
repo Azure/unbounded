@@ -925,8 +925,9 @@ fn disk_observability_failed_write_and_read_do_not_credit_bytes() {
     );
 }
 #[test]
-fn second_sight_queue_owned_bias_hot_nonowned_and_pressure_discard() {
-    for hot_nonowned in [false, true] {
+fn second_sight_queue_owned_bias_and_pressure_discard() {
+    // Pending pages carry no read heat: ownership alone orders the queue.
+    {
         let f = Fixture::new();
         let _ = futures::executor::block_on(f.store.open()).unwrap();
         f.reactor.init().expect("queue tests require io_uring");
@@ -939,20 +940,9 @@ fn second_sight_queue_owned_bias_hot_nonowned_and_pressure_discard() {
         retention.set_ownership(Rc::new(move |page| page == &classify));
         f.enqueue(other).unwrap();
         f.enqueue(owned).unwrap();
-        if hot_nonowned {
-            for _ in 0..3 {
-                retention.touch(&id);
-            }
-        }
         drive(&f.reactor, f.store.writer.progress(1, &scope())).unwrap();
-        assert_eq!(
-            f.store.writer.index().lookup(&owner).unwrap().is_some(),
-            !hot_nonowned
-        );
-        assert_eq!(
-            f.store.writer.index().lookup(&id).unwrap().is_some(),
-            hot_nonowned
-        );
+        assert!(f.store.writer.index().lookup(&owner).unwrap().is_some());
+        assert!(f.store.writer.index().lookup(&id).unwrap().is_none());
         f.store.writer.discard_unsubmitted();
     }
     let f = Fixture::new();
@@ -1113,29 +1103,6 @@ fn second_sight_reclaim_scans_only_a_fixed_queue_prefix_and_makes_progress() {
     assert_eq!(f.store.writer.discarded_count(), 65);
 }
 
-#[test]
-fn second_sight_pending_residency_transfers_to_index_and_releases_on_cancel_or_drop() {
-    let f = Fixture::new();
-    let _ = futures::executor::block_on(f.store.open()).unwrap();
-    f.reactor.init().expect("residency tests require io_uring");
-    let retention = f.store.writer.retention();
-    let copy = f.copy(1, 3);
-    let id = copy.ciphertext.envelope().page.clone();
-    f.enqueue(copy).unwrap();
-    assert_eq!(retention.snapshot().heat_entries, 1);
-    retention.touch(&id);
-    drive(&f.reactor, f.store.writer.progress(1, &scope())).unwrap();
-    assert_eq!(retention.snapshot().heat_entries, 1);
-    assert_eq!(retention.score(&id), 1);
-    f.enqueue(f.copy(1, 3)).unwrap();
-    assert_eq!(retention.snapshot().heat_entries, 1);
-    f.enqueue(f.copy(2, 3)).unwrap();
-    assert_eq!(retention.snapshot().heat_entries, 2);
-    f.store.writer.cancel_pending_writes().unwrap();
-    assert_eq!(retention.snapshot().heat_entries, 1);
-    drop(f);
-    assert_eq!(retention.snapshot().heat_entries, 0);
-}
 #[test]
 fn optional_headroom_reclaim_preserves_owned_submitted_and_index_residency() {
     let f = Fixture::new();
@@ -1627,7 +1594,7 @@ fn second_sight_delayed_sealed_write_keeps_publication_authority() {
     let first_id = first.ciphertext.envelope().page.clone();
     f.enqueue(first).unwrap();
     drive(&f.reactor, f.store.writer.progress(1, &scope())).unwrap();
-    f.store.writer.retention().touch(&first_id);
+    f.store.writer.index().touch(&first_id);
     let used = f.segments.snapshot()[0].used_bytes;
     drop(
         f.segments
@@ -5455,16 +5422,12 @@ fn over_share_fixture() -> (Fixture, CacheId, CacheId) {
 #[test]
 fn full_queue_never_lets_over_share_page_displace_under_share_page() {
     let (f, over, under) = over_share_fixture();
-    let retention = f.store.writer.retention();
     let hot = f.copy_in(over.clone(), 1, 113);
     let hot_id = hot.ciphertext.envelope().page.clone();
     let kept = f.copy_in(under.clone(), 2, 113);
     let kept_id = kept.ciphertext.envelope().page.clone();
     f.enqueue(kept).unwrap();
     f.enqueue(hot).unwrap();
-    for _ in 0..3 {
-        retention.touch(&hot_id);
-    }
     // An over-share page cannot displace anything at equal or higher rank.
     assert_eq!(
         f.enqueue(f.copy_in(over.clone(), 3, 113)),
@@ -5483,17 +5446,13 @@ fn full_queue_never_lets_over_share_page_displace_under_share_page() {
 fn write_order_and_ciphertext_reclaim_put_under_share_first() {
     let (f, over, under) = over_share_fixture();
     f.reactor.init().expect("queue tests require io_uring");
-    let retention = f.store.writer.retention();
     let first = f.copy_in(over, 1, 113);
     let first_id = first.ciphertext.envelope().page.clone();
     let second = f.copy_in(under, 2, 113);
     let second_id = second.ciphertext.envelope().page.clone();
     f.enqueue(first).unwrap();
     f.enqueue(second).unwrap();
-    for _ in 0..3 {
-        retention.touch(&first_id);
-    }
-    // Reclaim releases the over-share copy first despite its heat.
+    // Reclaim releases the over-share copy first.
     assert!(f.store.writer.reclaim_ciphertext(None, 1) > 0);
     assert!(f.store.writer.copy_only(&first_id).unwrap().is_none());
     assert!(f.store.writer.copy_only(&second_id).unwrap().is_some());

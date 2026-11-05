@@ -589,6 +589,15 @@ impl Pages {
             .map_or(0, |inner| inner.disk.borrow().holds_unused())
     }
 
+    /// Record a read of `page`, heating its segment.
+    pub fn touch(&self, page: &PageId) {
+        if let Some(inner) = self.inner.as_ref()
+            && let Some(slot) = inner.slots.get(page)
+        {
+            inner.disk.borrow_mut().touch(slot);
+        }
+    }
+
     /// Whether `page` is stored or being written.
     pub fn occupied(&self, page: &PageId) -> bool {
         self.inner.as_ref().is_some_and(|inner| {
@@ -691,7 +700,7 @@ impl Pages {
         budget: page_alloc::disk_index::ReclaimBudget,
         scan: usize,
         unseen: u64,
-        mut value: impl FnMut(&PageId, &VersionMetadata) -> u64,
+        mut value: impl FnMut(&PageId, &VersionMetadata, u32) -> u64,
         mut evicted: impl FnMut(&PageId, &VersionMetadata),
     ) -> Result<()> {
         self.inner_mut()?;
@@ -709,14 +718,14 @@ impl Pages {
         let result = disk.reclaim_scored(
             segments,
             budget,
-            |disk, segment, _heat| {
+            |disk, segment, heat| {
                 let count = disk.segment_usage(segment).0 as usize;
                 let known =
                     disk.segment_entries(segment)
                         .take(scan)
                         .fold(0u64, |sum, (slot, _)| {
                             let page = slots.key(slot).expect("interned page");
-                            sum.saturating_add(value(page, &versions[&page.version].0))
+                            sum.saturating_add(value(page, &versions[&page.version].0, heat))
                         });
                 known.saturating_add((count.saturating_sub(scan) as u64).saturating_mul(unseen))
             },
@@ -765,19 +774,20 @@ impl Pages {
         segment: SegmentId,
         budget: usize,
         unseen_value: u64,
-        mut score: impl FnMut(&PageId, &VersionMetadata) -> u64,
+        mut score: impl FnMut(&PageId, &VersionMetadata, u32) -> u64,
     ) -> u64 {
         let Some(inner) = self.inner.as_ref() else {
             return 0;
         };
         let disk = inner.disk.borrow();
+        let heat = disk.segment_heat(segment);
         let count = disk.segment_usage(segment).0 as usize;
         let known = disk
             .segment_entries(segment)
             .take(budget)
             .fold(0u64, |sum, (slot, _)| {
                 let page = inner.slots.key(slot).expect("interned page");
-                sum.saturating_add(score(page, &self.versions[&page.version].0))
+                sum.saturating_add(score(page, &self.versions[&page.version].0, heat))
             });
         known.saturating_add((count.saturating_sub(budget) as u64).saturating_mul(unseen_value))
     }

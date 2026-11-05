@@ -178,14 +178,13 @@ fn write_disk_label(out: &mut impl Write, disk: &str) -> std::fmt::Result {
     }
     Ok(())
 }
-pub(super) const RETENTION_METRICS: [(&str, &str); 10] = [
+pub(super) const RETENTION_METRICS: [(&str, &str); 9] = [
     ("racer_retention_observations_total", "counter"),
     ("racer_retention_qualified_total", "counter"),
     ("racer_retention_persistence_attempts_total", "counter"),
     ("racer_retention_persistence_accepted_total", "counter"),
     ("racer_retention_filter_set_bits", "gauge"),
     ("racer_retention_filter_bits", "gauge"),
-    ("racer_retention_heat_entries", "gauge"),
     ("racer_disk_pending_payload_bytes", "gauge"),
     ("racer_disk_indexed_payload_bytes", "gauge"),
     ("racer_retention_share_rejected_total", "counter"),
@@ -638,7 +637,6 @@ impl Metrics {
                 snapshot.persistence_accepted,
                 snapshot.filter_set_bits as u64,
                 snapshot.filter_bits as u64,
-                snapshot.heat_entries as u64,
                 snapshot.pending_payload_bytes,
                 snapshot.indexed_payload_bytes,
                 snapshot.share_rejected,
@@ -1222,7 +1220,6 @@ mod retention_metric_tests {
             persistence_accepted: 2,
             filter_set_bits: 7,
             filter_bits: 256,
-            heat_entries: 1,
             ..Default::default()
         });
         workers[1].observe_retention(crate::retention::Snapshot {
@@ -1243,7 +1240,6 @@ mod retention_metric_tests {
             "racer_retention_persistence_accepted_total 2\n",
             "racer_retention_filter_set_bits 9\n",
             "racer_retention_filter_bits 512\n",
-            "racer_retention_heat_entries 1\n",
         ] {
             assert!(output.contains(sample), "{sample}");
         }
@@ -1253,7 +1249,7 @@ mod retention_metric_tests {
                 .any(|line| line.starts_with("racer_retention_") && line.contains('{'))
         );
         assert!(output.contains("# TYPE racer_retention_observations_total counter\n"));
-        assert!(output.contains("# TYPE racer_retention_heat_entries gauge\n"));
+        assert!(output.contains("# TYPE racer_retention_filter_bits gauge\n"));
     }
 
     #[test]

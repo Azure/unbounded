@@ -280,6 +280,7 @@ impl StoreReader {
                 decoded.header.envelope,
                 decoded.ciphertext,
             )?;
+            self.index.touch(page);
             self.index
                 .retention()
                 .disk_read(page, u64::from(entry.metadata.page_length(page)?));
@@ -407,6 +408,7 @@ impl StoreReader {
             } else {
                 ciphertext.length
             };
+            self.index.touch(page);
             self.index
                 .retention()
                 .disk_read(page, u64::from(entry.metadata.page_length(page)?));
@@ -439,7 +441,6 @@ pub(crate) struct DirectRecord {
 
 struct Dirty {
     hold: Option<holds::HoldGuard>,
-    _resident: catalog::Resident,
 
     _payload: crate::retention::Payload,
 
@@ -1040,7 +1041,6 @@ impl StoreWriter {
             } else {
                 None
             },
-            _resident: self.index.track(&id)?,
             _payload: self.retention().payload(
                 u64::from(page.ciphertext.envelope().plaintext_length),
                 false,

@@ -50,7 +50,8 @@ pub struct Index {
 
     reserved: Cell<usize>,
 
-    residency: Rc<Residency>,
+    /// Worker retention policy; startup wiring replaces it once.
+    retention: RefCell<Rc<Retention>>,
 
     holds: RefCell<super::holds::Holds>,
 
@@ -90,7 +91,8 @@ struct State {
 
     current: HashMap<ObjectId, CurrentVersion>,
 
-    residents: HashMap<PageId, Resident>,
+    /// Indexed payload charge of each stored page.
+    residents: HashMap<PageId, crate::retention::Payload>,
 }
 impl State {
     fn new(slots: u32) -> Self {
@@ -100,28 +102,6 @@ impl State {
             order: VecDeque::new(),
             current: HashMap::default(),
             residents: HashMap::default(),
-        }
-    }
-}
-/// One worker's exact union of pending and indexed pages. Guards release heat
-/// only when the final storage owner disappears, including cancellation/drop.
-struct Residency {
-    retention: RefCell<Rc<Retention>>,
-    counts: RefCell<HashMap<PageId, usize>>,
-}
-pub(super) struct Resident {
-    residency: Rc<Residency>,
-    page: PageId,
-    payload: Option<crate::retention::Payload>,
-}
-impl Drop for Resident {
-    fn drop(&mut self) {
-        let mut counts = self.residency.counts.borrow_mut();
-        let count = counts.get_mut(&self.page).expect("tracked storage owner");
-        *count -= 1;
-        if *count == 0 {
-            counts.remove(&self.page);
-            self.residency.retention.borrow().forget(&self.page);
         }
     }
 }
@@ -218,10 +198,10 @@ impl IndexSnapshot {
 }
 /// Per-byte segment value of one page; see
 /// [`racer_core::cache::class_score`].
-fn page_value(scoring: &crate::retention::Scoring<'_>, page: &PageId) -> u8 {
+fn page_value(scoring: &crate::retention::Scoring<'_>, page: &PageId, heat: u32) -> u8 {
     let any = scoring.any_over_share();
     racer_core::cache::class_score(
-        scoring.score(page),
+        scoring.score(page, heat),
         any,
         any && scoring.over_share(&page.version.object.cache),
     )
@@ -816,13 +796,10 @@ impl Index {
             )),
             availability,
             reserved: Cell::new(0),
-            residency: Rc::new(Residency {
-                retention: RefCell::new(Rc::new(
-                    Retention::new(256 * 1024, 65536 + 64, clock.clone())
-                        .expect("valid bounded retention"),
-                )),
-                counts: RefCell::new(HashMap::default()),
-            }),
+            retention: RefCell::new(Rc::new(
+                Retention::new(256 * 1024, 65536 + 64, clock.clone())
+                    .expect("valid bounded retention"),
+            )),
             holds: RefCell::new(super::holds::Holds::new(&clock)),
             key_sweep: Cell::default(),
         }
@@ -895,28 +872,20 @@ impl Index {
         }
     }
     pub fn retention(&self) -> Rc<Retention> {
-        self.residency.retention.borrow().clone()
+        self.retention.borrow().clone()
     }
     pub fn set_retention(&self, retention: Rc<Retention>) {
         // Startup wiring only: replacing a live policy would invalidate read-side
-        // clones and require a capacity-sized heat migration in a request turn.
+        // clones and strand the payload charges of stored pages.
         assert!(
-            self.residency.counts.borrow().is_empty(),
-            "install retention before residency"
+            self.state.borrow().residents.is_empty(),
+            "install retention before publishing pages"
         );
-        *self.residency.retention.borrow_mut() = retention;
+        *self.retention.borrow_mut() = retention;
     }
-    pub(super) fn track(&self, page: &PageId) -> Result<Resident> {
-        let mut counts = self.residency.counts.borrow_mut();
-        if !self.retention().track(page) {
-            return Err(Error::Overloaded);
-        }
-        *counts.entry(page.clone()).or_default() += 1;
-        Ok(Resident {
-            residency: self.residency.clone(),
-            page: page.clone(),
-            payload: None,
-        })
+    /// Record a disk read of `page`, raising its segment's retention heat.
+    pub fn touch(&self, page: &PageId) {
+        self.state.borrow_mut().pages.touch(page);
     }
     /// Reserve one potential new mapping for `page`. A full index returns
     /// `Overloaded`; the caller frees entries with
@@ -985,12 +954,9 @@ impl Index {
         {
             return Err(Error::Overloaded);
         }
-        // Acquire first: replacement retains its existing heat without a gap.
-        let mut resident = self.track(&page)?;
-        resident.payload = Some(
-            self.retention()
-                .indexed_payload(&page.version.object.cache, payload_bytes),
-        );
+        let payload = self
+            .retention()
+            .indexed_payload(&page.version.object.cache, payload_bytes);
         let inserted = match reservation.take() {
             Some(reservation) => state.pages.publish(reservation, &page, entry),
             None => state.pages.insert(page.clone(), entry).map(|()| true),
@@ -998,7 +964,7 @@ impl Index {
         if inserted != Ok(true) {
             return inserted.map(drop);
         }
-        state.residents.insert(resident.page.clone(), resident);
+        state.residents.insert(page, payload);
         Ok(())
     }
     /// Look in both the standalone catalog and retained page entries for this exact
@@ -1241,13 +1207,13 @@ impl Index {
     /// Validate identity/length agreement and catalog bounds; clear all freshness.
     pub fn restore(&self, snapshot: IndexSnapshot) -> Result<()> {
         self.validate_snapshot(&snapshot)?;
-        let mut replacement = Index::new(
+        let replacement = Index::new(
             self.worker,
             self.metadata_capacity,
             self.availability.clone(),
             self.clock.clone(),
         );
-        replacement.residency = self.residency.clone();
+        *replacement.retention.borrow_mut() = self.retention();
         replacement.set_page_capacity(self.page_capacity.get())?;
         for (p, e) in snapshot.entries {
             replacement.publish(p, e)?;
@@ -1332,11 +1298,11 @@ impl Index {
             segment,
             racer_core::cache::SCAN_BUDGET,
             racer_core::cache::unseen_value_for(crate::model::PAGE_BYTES, scoring.any_over_share()),
-            |page, metadata| {
+            |page, metadata, heat| {
                 racer_core::cache::page_value(
                     metadata.page_length(page).ok(),
                     crate::model::PAGE_BYTES as u32,
-                    page_value(scoring, page),
+                    page_value(scoring, page, heat),
                 )
             },
         )
@@ -1522,11 +1488,11 @@ impl SegmentClock {
             },
             racer_core::cache::SCAN_BUDGET,
             unseen,
-            |page, metadata| {
+            |page, metadata, heat| {
                 racer_core::cache::page_value(
                     metadata.page_length(page).ok(),
                     crate::model::PAGE_BYTES as u32,
-                    page_value(&scoring, page),
+                    page_value(&scoring, page, heat),
                 )
             },
             |page, metadata| {
@@ -2507,119 +2473,6 @@ mod tests {
             assert_eq!(index.publish_version(conflict), Err(Error::CorruptRecord));
         }
     }
-    /// The simulator's payload-free `PhantomEntries` makes the same CLOCK
-    /// eviction decisions as the catalog index when given the same scores.
-    #[test]
-    fn phantom_segment_entries_match_catalog_reclamation() {
-        use racer_core::cache::{SCAN_BUDGET, page_value, unseen_value};
-        for seed in 1..=4u64 {
-            let mut state = seed.wrapping_mul(0x9e37_79b9_7f4a_7c15);
-            let mut draw = move || {
-                state ^= state << 13;
-                state ^= state >> 7;
-                state ^= state << 17;
-                state
-            };
-            let count = 12;
-            let real_segments = Rc::new(segments(1024, count));
-            let phantom_segments = Rc::new(segments(1024, count));
-            let index = Rc::new(index(4096));
-            index.set_page_capacity(4096).unwrap();
-            let owned = Rc::new(RefCell::new(std::collections::HashSet::new()));
-            let classify = owned.clone();
-            index
-                .retention()
-                .set_ownership(Rc::new(move |page| classify.borrow().contains(page)));
-            let phantom_clock = page_alloc::SegmentClock::new(phantom_segments.clone());
-            let phantom = page_alloc::PhantomEntries::<PageId>::default();
-            let now = racer_io::Clock::host().now();
-            let mut pages = Vec::new();
-            let mut next = 0;
-            let mut total_evicted = 0;
-            for round in 0..60 {
-                // Fill every free slot on both tables in the same order.
-                while real_segments.free_count() > 0 {
-                    let (_, a) = real_segments.append(1024).unwrap();
-                    let (_, b) = phantom_segments.append(1024).unwrap();
-                    assert_eq!(a, b);
-                    let segment = a.offset() / 1024;
-                    for _ in 0..1 + draw() % 4 {
-                        next += 1;
-                        let length = 1 + draw() % 900;
-                        let (page, mut entry) =
-                            indexed(descriptor(&format!("p{next}"), length), segment);
-                        entry.location.extent = a;
-                        if draw() % 3 == 0 {
-                            owned.borrow_mut().insert(page.clone());
-                        }
-                        index.publish(page.clone(), entry).unwrap();
-                        phantom
-                            .publish(
-                                page.clone(),
-                                u32::try_from(length).unwrap(),
-                                SegmentId(segment),
-                            )
-                            .unwrap();
-                        pages.push(page);
-                    }
-                }
-                for _ in 0..draw() % 4 {
-                    let page = &pages[usize::try_from(draw()).unwrap() % pages.len()];
-                    index.retention().touch(page);
-                }
-                let reserve = 1 + usize::try_from(draw() % 3).unwrap();
-                let retention = index.retention();
-                let scoring = retention.scoring_at(now, index.disk_capacity());
-                let expected = SegmentClock::new(index.clone(), real_segments.clone(), reserve)
-                    .reclaim_at(now);
-                let actual = phantom_clock.reclaim_scored(
-                    &phantom,
-                    reserve,
-                    FOREGROUND_RECLAIM_BUDGET.segment_visits,
-                    FOREGROUND_RECLAIM_BUDGET.mapping_removals,
-                    |segment| {
-                        phantom.segment_score(
-                            segment,
-                            SCAN_BUDGET,
-                            unseen_value(crate::model::PAGE_BYTES),
-                            |page, bytes| {
-                                page_value(
-                                    Some(bytes),
-                                    crate::model::PAGE_BYTES as u32,
-                                    scoring.score(page),
-                                )
-                            },
-                        )
-                    },
-                );
-                assert_eq!(
-                    expected,
-                    actual.map_err(Error::from),
-                    "seed {seed} round {round}"
-                );
-                let evicted = phantom.take_evicted();
-                total_evicted += evicted.len();
-                for (page, _) in evicted {
-                    owned.borrow_mut().remove(&page);
-                }
-                for id in 0..count as u64 {
-                    assert_eq!(
-                        real_segments.state(SegmentId(id)).unwrap(),
-                        phantom_segments.state(SegmentId(id)).unwrap(),
-                        "seed {seed} round {round} segment {id}"
-                    );
-                }
-                for page in &pages {
-                    assert_eq!(
-                        index.lookup(page).unwrap().is_some(),
-                        phantom.get(page).is_some(),
-                        "seed {seed} round {round}"
-                    );
-                }
-            }
-            assert!(total_evicted > 100, "{total_evicted}");
-        }
-    }
     #[test]
     fn second_sight_mixed_segments_use_live_payload_value_not_padding_or_last_read() {
         let segments = Rc::new(segments(1024, 3));
@@ -2644,7 +2497,7 @@ mod tests {
             index.publish(page, entry).unwrap();
         }
         for _ in 0..3 {
-            retention.touch(&hot);
+            index.touch(&hot);
         }
         assert_eq!(index.segment_score(SegmentId(0)), 100);
         assert_eq!(index.segment_score(SegmentId(1)), 300);
@@ -2700,72 +2553,13 @@ mod tests {
         assert!(index.snapshot().unwrap().entries.is_empty());
     }
     #[test]
-    fn second_sight_residency_replacement_restore_purge_and_drop_are_balanced() {
-        let index = index(4);
-        let retention = index.retention();
-        let (page, entry) = indexed(descriptor("resident", 17), 0);
-        let pending = index.track(&page).unwrap();
-        retention.touch(&page);
-        index.publish(page.clone(), entry.clone()).unwrap();
-        assert_eq!(retention.snapshot().heat_entries, 1);
-        assert_eq!(retention.score(&page), 1);
-        let (_, replacement) = indexed(entry.metadata.clone(), 1);
-        index.publish(page.clone(), replacement.clone()).unwrap();
-        assert_eq!(retention.score(&page), 1);
-        index.remove_if_matches(&page, &entry.location);
-        assert_eq!(retention.snapshot().heat_entries, 1);
-        let snapshot = index.snapshot().unwrap();
-        index.restore(snapshot).unwrap();
-        assert_eq!(retention.score(&page), 1);
-        index.remove_cache(&page.version.object.cache);
-        assert_eq!(
-            retention.snapshot().heat_entries,
-            1,
-            "pending still owns heat"
-        );
-        drop(pending);
-        assert_eq!(retention.snapshot().heat_entries, 0);
-        index.publish(page.clone(), entry).unwrap();
-        assert_eq!(retention.score(&page), 0);
-        drop(index);
-        assert_eq!(retention.snapshot().heat_entries, 0);
-    }
-    #[test]
-    fn second_sight_heat_capacity_and_failed_restore_leave_existing_residency_intact() {
-        let index = index(4);
-        let retention = Rc::new(Retention::new(4096, 1, racer_io::Clock::host()).unwrap());
-        index.set_retention(retention.clone());
-        let (page, entry) = indexed(descriptor("resident", 17), 0);
-        index.publish(page.clone(), entry.clone()).unwrap();
-        retention.touch(&page);
-        let (other, other_entry) = indexed(descriptor("other", 17), 1);
-        assert!(matches!(index.track(&other), Err(Error::Overloaded)));
-        assert_eq!(
-            index.publish(other.clone(), other_entry.clone()),
-            Err(Error::Overloaded)
-        );
-        assert_eq!(
-            index.restore(IndexSnapshot {
-                entries: vec![(other, other_entry)],
-                metadata: vec![]
-            }),
-            Err(Error::Overloaded)
-        );
-        assert!(index.lookup(&page).unwrap().is_some());
-        assert_eq!(retention.snapshot().heat_entries, 1);
-        assert_eq!(retention.snapshot().indexed_payload_bytes, 17);
-        assert_eq!(retention.score(&page), 1);
-        drop(index);
-        assert_eq!(retention.snapshot().heat_entries, 0);
-    }
-    #[test]
     fn second_sight_sealed_unpublished_write_is_not_a_victim() {
         let segments = Rc::new(segments(1024, 3));
         let index = Rc::new(index(4));
         let (published, entry) = indexed(descriptor("published", 17), 0);
         drop(segments.append(1024).unwrap());
         index.publish(published.clone(), entry).unwrap();
-        index.retention().touch(&published);
+        index.touch(&published);
         let (page, entry) = indexed(descriptor("completed", 17), 1);
         let (other, _) = indexed(descriptor("other", 17), 2);
         let mut ticket = index.reserve_page_for(&page).unwrap();
@@ -3093,7 +2887,7 @@ mod priority_tests {
             .collect();
         for page in &b {
             for _ in 0..8 {
-                index.retention().touch(page);
+                index.touch(page);
             }
         }
         let retention = index.retention();
@@ -3200,7 +2994,7 @@ mod priority_tests {
         // Make the over-share cache hotter: heat alone would evict "a".
         for page in &b {
             for _ in 0..8 {
-                index.retention().touch(page);
+                index.touch(page);
             }
         }
         assert!(matches!(
@@ -3291,7 +3085,7 @@ mod priority_tests {
         );
         for page in fill_segment(&index, &clock, &segments, "a", 0) {
             for _ in 0..8 {
-                index.retention().touch(&page);
+                index.touch(&page);
             }
         }
         for round in 1..4 {

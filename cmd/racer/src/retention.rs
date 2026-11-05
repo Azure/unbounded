@@ -4,7 +4,7 @@ use crate::error::{Error, Result};
 use crate::model::PageId;
 use crate::priority::{ShareBasis, Unpublished, Weights};
 use crate::runtime::HashMap;
-use page_alloc::retention::{Heat, SecondSight};
+use page_alloc::retention::SecondSight;
 use racer_control_wire::CacheId;
 use std::cell::{Cell, OnceCell, RefCell};
 use std::rc::Rc;
@@ -44,7 +44,6 @@ pub struct Snapshot {
     pub share_rejected: u64,
     pub filter_set_bits: usize,
     pub filter_bits: usize,
-    pub heat_entries: usize,
     pub pending_payload_bytes: u64,
     pub indexed_payload_bytes: u64,
     /// Event-time cache-only ownership, never insertion-class resident gauges.
@@ -89,6 +88,9 @@ impl Drop for Payload {
     }
 }
 pub(crate) type Ownership = Rc<dyn Fn(&PageId) -> bool>;
+/// Highest read heat that raises a retention score; matches the former
+/// per-page heat ceiling.
+pub(crate) const MAX_HEAT: u8 = 3;
 pub(crate) type OwnershipPass = Rc<dyn Fn() -> Ownership>;
 
 /// One eviction or ordering pass. Ownership and time are pinned when the pass
@@ -99,16 +101,23 @@ pub(crate) type OwnershipPass = Rc<dyn Fn() -> Ownership>;
 pub(crate) struct Scoring<'a> {
     retention: &'a Retention,
     ownership: Ownership,
-    now: Instant,
     capacity: u64,
     basis: OnceCell<ShareBasis>,
     classified: RefCell<HashMap<CacheId, bool>>,
     any_over_share: OnceCell<bool>,
 }
 impl Scoring<'_> {
-    pub(crate) fn score(&self, page: &PageId) -> u8 {
-        self.retention
-            .score_owned_at(page, self.now, (self.ownership)(page))
+    /// Combined rank of a pending (not yet stored) page: under-share pages
+    /// outrank every over-share page; ownership orders pages within one
+    /// class. Pending pages carry no read heat. Higher is kept longer.
+    pub(crate) fn rank(&self, page: &PageId) -> u64 {
+        let under = !self.over_share(&page.version.object.cache);
+        (u64::from(under) << 8) | u64::from(self.score(page, 0))
+    }
+    /// Retention score of `page` stored in a segment with read `heat`.
+    pub(crate) fn score(&self, page: &PageId, heat: u32) -> u8 {
+        let heat = u8::try_from(heat).unwrap_or(MAX_HEAT).min(MAX_HEAT);
+        racer_core::read::retention_score(heat, (self.ownership)(page), self.retention.enabled)
     }
     /// Whether the cache's indexed payload exceeded its fair share of this
     /// worker's disk capacity when the pass started.
@@ -146,12 +155,6 @@ impl Scoring<'_> {
         *self
             .any_over_share
             .get_or_init(|| !self.over_share_candidates(2).is_empty())
-    }
-    /// Combined victim rank: under-share pages outrank every over-share page;
-    /// the retention score orders pages within one class. Higher is kept longer.
-    pub(crate) fn rank(&self, page: &PageId) -> u64 {
-        let under = !self.over_share(&page.version.object.cache);
-        (u64::from(under) << 8) | u64::from(self.score(page))
     }
 }
 /// One cache's indexed payload and fair share on this worker.
@@ -263,27 +266,25 @@ struct PressureOrder {
 }
 struct State {
     history: SecondSight,
-
-    heat: Heat<PageId>,
 }
 impl Retention {
+    /// `heat_entries` is unused: read heat lives on the disk index per segment.
     pub fn new(history_bytes: usize, heat_entries: usize, clock: racer_io::Clock) -> Result<Self> {
         Self::configured(history_bytes, heat_entries, PERIOD, true, clock)
     }
     /// History rotation starts at the clock's current time.
     pub fn configured(
         history_bytes: usize,
-        heat_entries: usize,
+        _heat_entries: usize,
         period: Duration,
         enabled: bool,
         clock: racer_io::Clock,
     ) -> Result<Self> {
         let history = SecondSight::new(history_bytes, period, clock.now())
             .ok_or(Error::InvalidConfiguration)?;
-        let heat = Heat::new(heat_entries).ok_or(Error::InvalidConfiguration)?;
         Ok(Self {
             clock,
-            state: RefCell::new(State { history, heat }),
+            state: RefCell::new(State { history }),
             ownership: RefCell::new(Rc::new(|_| false)),
             ownership_pass: RefCell::new(None),
             counters: Counters::default(),
@@ -317,7 +318,8 @@ impl Retention {
         self.weights.borrow().clone()
     }
     /// `capacity` is this worker's usable payload capacity in bytes.
-    pub(crate) fn scoring_at(&self, now: Instant, capacity: u64) -> Scoring<'_> {
+    /// `_now` is kept for callers; heat lives on the disk index per segment.
+    pub(crate) fn scoring_at(&self, _now: Instant, capacity: u64) -> Scoring<'_> {
         let ownership = match self.ownership_pass.borrow().as_ref() {
             Some(prepare) => prepare(),
             None => self.ownership.borrow().clone(),
@@ -325,7 +327,6 @@ impl Retention {
         Scoring {
             retention: self,
             ownership,
-            now,
             capacity,
             basis: OnceCell::new(),
             classified: RefCell::default(),
@@ -510,9 +511,6 @@ impl Retention {
         let owned = self.is_owned(page);
         let mut state = self.state.borrow_mut();
         let seen = self.enabled && state.history.observe(page, now);
-        if self.enabled {
-            state.heat.touch(page, now);
-        }
         // Disabled second-sight admits only owned pages.
         let observation = Observation {
             eligible: racer_core::read::retention_eligible(owned, self.enabled, seen),
@@ -526,38 +524,6 @@ impl Retention {
     }
     pub fn eligible(&self, observation: Observation) -> bool {
         observation.eligible()
-    }
-    /// Storage installs/removes heat with resident index mappings. Admission never
-    /// replaces another resident's exact heat just because hashes collide.
-    pub fn track(&self, page: &PageId) -> bool {
-        self.track_at(page, self.clock.now())
-    }
-    /// [`Retention::track`] at an explicit instant.
-    pub fn track_at(&self, page: &PageId, now: Instant) -> bool {
-        self.state.borrow_mut().heat.track(page, now)
-    }
-    pub fn forget(&self, page: &PageId) {
-        self.state.borrow_mut().heat.forget(page);
-    }
-    pub fn touch(&self, page: &PageId) {
-        self.touch_at(page, self.clock.now());
-    }
-    /// [`Retention::touch`] at an explicit instant.
-    pub fn touch_at(&self, page: &PageId, now: Instant) {
-        self.state.borrow_mut().heat.touch(page, now);
-    }
-    pub fn score(&self, page: &PageId) -> u8 {
-        self.score_at(page, self.clock.now())
-    }
-    /// [`Retention::score`] at an explicit instant.
-    pub fn score_at(&self, page: &PageId, now: Instant) -> u8 {
-        let owned = self.is_owned(page);
-        self.score_owned_at(page, now, owned)
-    }
-    fn score_owned_at(&self, page: &PageId, now: Instant, owned: bool) -> u8 {
-        let mut state = self.state.borrow_mut();
-        let heat = state.heat.score(page, now);
-        racer_core::read::retention_score(heat, owned, self.enabled)
     }
     pub fn persistence_attempt(&self, accepted: bool) {
         self.counters.attempts.fetch_add(1, Ordering::Relaxed);
@@ -649,7 +615,6 @@ impl Retention {
             disk: self.disk.get(),
             filter_set_bits: set_bits,
             filter_bits: bits,
-            heat_entries: state.heat.len(),
         }
     }
 }
@@ -930,30 +895,30 @@ mod tests {
                 Rc::new(move |_| owned)
             }
         }));
-        policy.track(&page(0));
-        policy.touch(&page(0));
         let now = sim_ctx.clock.now();
         let scoring = policy.scoring_at(now, u64::MAX);
         owned.set(false);
         for _ in 0..256 {
-            assert_eq!(scoring.score(&page(0)), 2);
-            assert_eq!(scoring.score(&page(1)), 1);
+            assert_eq!(scoring.score(&page(0), 1), 2);
+            assert_eq!(scoring.score(&page(1), 0), 1);
         }
         assert_eq!(calls.get(), 1);
+        // Segment heat saturates at the per-page maximum.
+        assert_eq!(scoring.score(&page(0), u32::MAX), MAX_HEAT + 1);
         assert_eq!(
             policy
                 .scoring_at(now + Duration::from_secs(60), u64::MAX)
-                .score(&page(0)),
+                .score(&page(0), 0),
             0
         );
         assert_eq!(calls.get(), 2);
         policy.set_ownership(Rc::new(|_| true));
-        assert_eq!(policy.scoring_at(now, u64::MAX).score(&page(1)), 1);
+        assert_eq!(policy.scoring_at(now, u64::MAX).score(&page(1), 0), 1);
         assert_eq!(calls.get(), 2);
         let disabled =
             Retention::configured(4096, 1, PERIOD, false, sim_ctx.clock.clone()).unwrap();
         disabled.set_ownership(Rc::new(|_| true));
-        assert_eq!(disabled.scoring_at(now, u64::MAX).score(&page(0)), 0);
+        assert_eq!(disabled.scoring_at(now, u64::MAX).score(&page(0), 3), 0);
     }
     fn page(number: u64) -> PageId {
         PageId {
@@ -997,7 +962,6 @@ mod tests {
             assert_eq!(snapshot.disk[0].segment_evicted_pages, 1);
             assert_eq!(snapshot.disk[0].segment_evicted_payload_bytes, 3);
             assert_eq!(snapshot.observations, 0);
-            assert_eq!(snapshot.heat_entries, 0);
         }
         assert_eq!(calls.get(), before);
         drop(pending);
@@ -1049,29 +1013,6 @@ mod tests {
         }
     }
     #[test]
-    fn ownership_is_current_and_heat_saturates_then_decays() {
-        let policy = Retention::new(4096, 2, racer_io::Clock::host()).unwrap();
-        assert!(policy.track(&page(0)));
-        assert!(policy.track(&page(1)));
-        assert!(!policy.track(&page(2)));
-        for _ in 0..8 {
-            policy.touch(&page(0));
-        }
-        assert_eq!(policy.score(&page(0)), 3);
-        assert_eq!(policy.score(&page(1)), 0);
-        let now = racer_io::Clock::host().now();
-        assert_eq!(policy.score_at(&page(0), now + Duration::from_secs(60)), 2);
-        let owned = Rc::new(Cell::new(true));
-        let value = owned.clone();
-        policy.set_ownership(Rc::new(move |_| value.get()));
-        assert_eq!(policy.score_at(&page(0), now + Duration::from_secs(180)), 1);
-        owned.set(false);
-        assert_eq!(policy.score_at(&page(0), now + Duration::from_secs(180)), 0);
-        policy.forget(&page(0));
-        assert!(policy.track(&page(2)));
-        assert_eq!(policy.snapshot().heat_entries, 2);
-    }
-    #[test]
     fn disabled_is_owned_only_and_metrics_count_once() {
         let policy =
             Retention::configured(4096, 1, PERIOD, false, racer_io::Clock::host()).unwrap();
@@ -1103,17 +1044,10 @@ mod tests {
         b.version.etag = crate::model::StrongEtag::test_value("v2");
         assert!(!policy.observe(&a, &Interest::default()).eligible());
         assert!(!policy.observe(&b, &Interest::default()).eligible());
-        assert!(policy.track(&a));
-        assert!(policy.track(&b));
-        policy.touch(&a);
-        assert_eq!(policy.score(&a), 1);
-        assert_eq!(policy.score(&b), 0);
         for n in 0..10000 {
             policy.observe(&page(n), &Interest::default());
         }
-        assert_eq!(policy.snapshot().heat_entries, 2);
         assert_eq!(policy.snapshot().filter_bits, 4096 * 8);
         assert!(Retention::new(31, 1, racer_io::Clock::host()).is_err());
-        assert!(Retention::new(4096, 0, racer_io::Clock::host()).is_err());
     }
 }

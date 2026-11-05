@@ -1178,6 +1178,13 @@ impl DiskIndex {
         })
     }
 
+    /// Read heat of `segment` (see [`Self::touch`]).
+    pub fn segment_heat(&self, segment: SegmentId) -> u32 {
+        self.segments
+            .get(segment.0 as usize)
+            .map_or(0, |meta| meta.heat)
+    }
+
     /// Stored records and bytes in `segment`.
     pub fn segment_usage(&self, segment: SegmentId) -> (u32, u64) {
         self.segments
@@ -1676,6 +1683,10 @@ mod tests {
         write(&mut index, &segments, 0, cache, 512).unwrap();
         let segment = index.get(PageSlot(0)).unwrap().location.segment();
         assert!(!index.is_unused_held(PageSlot(0)) && index.segment_held(segment));
+        assert_eq!(index.segment_heat(segment), 0);
+        index.touch(PageSlot(0));
+        index.touch(PageSlot(0));
+        assert_eq!(index.segment_heat(segment), 2);
         let second = index
             .hold(&[PageSlot(3)], Monotonic(20), Monotonic(0))
             .unwrap();

@@ -1830,7 +1830,6 @@ mod tests {
                         share_rejected: u64::MAX,
                         filter_set_bits: usize::MAX,
                         filter_bits: usize::MAX,
-                        heat_entries: usize::MAX,
                         pending_payload_bytes: u64::MAX,
                         indexed_payload_bytes: u64::MAX,
                         disk: [crate::retention::DiskClassSnapshot {
