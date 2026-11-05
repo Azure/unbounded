@@ -1,7 +1,13 @@
-//! Retained one-shot alarms for native waits, using the serving worker's reactor.
+//! Deadline alarms for native waits, using the serving worker's reactor.
+//!
+//! Owner ops wake their waiting task themselves, across threads, when the
+//! owner completes them, so a wait needs no periodic retry. The only alarm
+//! is the scope deadline: a stalled op must still fail at that deadline.
 
 use super::*;
-use std::{future::Future, time::Duration};
+use std::future::Future;
+#[cfg(test)]
+use std::time::Duration;
 
 /// Timer backend shared by native handles, never by individual pending alarms.
 pub(super) struct NativeRetry {
@@ -37,14 +43,14 @@ impl NativeRetry {
         })
     }
 
-    /// One millisecond bounds retries without spinning on a held mailbox.
+    /// Fire at the scope deadline.
     fn alarm<'a>(&'a self, scope: &'a RequestScope) -> Operation<'a, ()> {
         Box::pin(async move {
             #[cfg(test)]
             if self.immediate.replace(false) {
                 return Ok(());
             }
-            let until = (scope.clock().now() + Duration::from_millis(1)).min(scope.deadline.0);
+            let until = scope.deadline.0;
             if let Some(reactor) = &self.reactor {
                 reactor.sleep_until(until, scope).await
             } else {
@@ -60,7 +66,8 @@ impl NativeRetry {
         })
     }
 
-    /// Keep one alarm across unrelated wakes; native success never allocates one.
+    /// Keep one deadline alarm across unrelated wakes; native success never
+    /// allocates one.
     pub(super) async fn wait<T, E: Into<Error>>(
         &self,
         scope: &RequestScope,
@@ -226,6 +233,48 @@ mod tests {
     }
 
     #[test]
+    /// An op the owner completes on its own thread wakes the waiting task
+    /// directly: no alarm fires, and the only alarm armed is the deadline.
+    fn owner_thread_completion_wakes_waiter_without_alarm() {
+        let (mut clients, port) = rdma_verbs::node(1).unwrap();
+        let client = clients.remove(0);
+        let retry = NativeRetry::unattached();
+        let scope = scope();
+        let wakes = std::sync::Arc::new(crate::test_support::WakeCounter::default());
+        let waker = std::task::Waker::from(wakes.clone());
+        let mut cx = Context::from_waker(&waker);
+        let op = client.open(rdma_verbs::LinkKey {
+            peer: [3; 32],
+            rail: 0,
+        });
+        let mut waiting = Box::pin(retry.wait(&scope, poll_fn(|cx| op.poll(cx))));
+        // Poll before the owner exists, so only its completion can wake us.
+        assert!(waiting.as_mut().poll(&mut cx).is_pending());
+        assert_eq!(retry.alarms.borrow().len(), 1);
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let owner = std::thread::spawn(move || {
+            let owner = rdma_verbs::Owner::new(port, racer_io::WorkerCtx::host());
+            let (mut role, stop) = rdma_verbs::OwnerRole::new(owner).unwrap();
+            sender.send(stop).unwrap();
+            racer_io::exec::run(&mut role).unwrap();
+        });
+        let stop = receiver.recv().unwrap();
+        let end = std::time::Instant::now() + Duration::from_secs(5);
+        while wakes.count() == 0 {
+            assert!(std::time::Instant::now() < end, "owner completion lost");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        // Not activated: the owner answers with an error, which still wakes.
+        assert!(matches!(
+            waiting.as_mut().poll(&mut cx),
+            Poll::Ready(Err(_))
+        ));
+        assert!(retry.alarms.borrow()[0].is_canceled());
+        stop.stop();
+        owner.join().unwrap();
+    }
+
+    #[test]
     fn kernel_alarm_wakes_child_and_releases_timer_after_completion() {
         use futures::{Stream, stream::FuturesUnordered};
         let admission = Rc::new(flow_control::Quotas::new(AdmissionPolicy::new(
@@ -239,18 +288,20 @@ mod tests {
             .init()
             .expect("real io_uring required for kernel alarm validation");
         let retry = NativeRetry::new(reactor.clone());
-        let scope = scope();
+        // The alarm is the scope deadline: a short scope makes it fire.
+        let short = RequestScope::on(
+            &crate::test_support::clock(),
+            crate::model::RequestId([7; 16]),
+            crate::rt::environment::now() + Duration::from_millis(20),
+        )
+        .unwrap();
         let polls = Cell::new(0);
         let mut active = FuturesUnordered::new();
         active.push(retry.wait(
-            &scope,
+            &short,
             poll_fn(|_| {
                 polls.set(polls.get() + 1);
-                if polls.get() == 1 {
-                    Poll::Pending
-                } else {
-                    Poll::Ready(Ok::<_, Error>(()))
-                }
+                Poll::<Result<()>>::Pending
             }),
         ));
         let mut cx = Context::from_waker(std::task::Waker::noop());
@@ -266,12 +317,13 @@ mod tests {
             );
             reactor.poll_budgeted(16).unwrap();
             if let Poll::Ready(Some(result)) = Pin::new(&mut active).poll_next(&mut cx) {
-                result.unwrap();
+                assert_eq!(result, Err(Error::DeadlineExceeded));
                 break;
             }
             std::thread::sleep(Duration::from_millis(1));
         }
-        assert_eq!(polls.get(), 2);
+        assert_eq!(polls.get(), 1, "the deadline fails the wait, no retry poll");
+        let scope = scope();
         while reactor.in_flight() != 0 {
             assert!(std::time::Instant::now() < end, "timer fence did not drain");
             reactor.poll_budgeted(16).unwrap();
