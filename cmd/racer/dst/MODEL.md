@@ -84,8 +84,11 @@ such as which node holds which page.
 - Relay transfers: a relay reserves one `ResourceClass::Relay` transfer on its worker before
   it forwards (production `src/peer/server.rs:540`, limit `relay_transfers` 16 per worker,
   `src/worker.rs:265`, `core/src/admission.rs:145`); none free fails the hop `Overloaded`
-  (`relay_sheds`). The reservation is held until the answer leaves, or for a page until the
-  body has passed (racer-sim `send_reply`, `held`). The run fails if any is still held.
+  (`relay_sheds`). The reservation is held until the answer has been written back upstream
+  (production `send_http_response` clears `relay.reservation`), or for a page until the body
+  has passed (racer-sim `send_reply`, `held`; Model `reply`, `release_relays_at`). Both
+  fidelities used to release a non-page answer's relays when the destination decided it. The
+  run fails if any is still held.
 - Route search slots: production builds its `Paths` with `with_limits(.., active_path_searches)`
   (`src/app.rs:1320-1333`, `RACER_ACTIVE_PATH_SEARCHES_PER_WORKER` default 8,
   `src/worker.rs:261`) and no wait queue, so a search past 8 running on the worker fails
@@ -98,6 +101,20 @@ such as which node holds which page.
   connection's worker and dispatches or relays only after (production `src/peer/server.rs:515-518`,
   `:792`; `src/worker.rs` `WorkerPair`). racer-sim does the same since this commit (`hop`,
   `Msg::verified`, per-worker `crypto_free`); before, it charged one helper per node and went on.
+- Crypto queue bound: a worker's crypto client admits `queue_entries` port slots plus as many
+  waiters (`src/security.rs` `CryptoClient::new`, `runtime/src/offload.rs`
+  `AdmissionQueue::enter`), `queue_entries` 256 per worker (`core/src/admission.rs:138`,
+  per worker after `Config::scale_limits`), so 512 jobs. A request verification past it fails
+  `Overloaded` before any key work. Production used to return that error from
+  `serve_connection`, which closes the connection (the previous holder read `Io`: a relay
+  signed `Unavailable`, a requester counted a transport failure). It now answers the unsigned
+  overload head (`peer_wire::overloaded_head`, `racer_core::route::unverified_failure`), which
+  the previous holder reads as `Overloaded` (`src/peer/transport.rs`). Both fidelities count
+  every crypto job a worker's helper holds (`Fabric::crypto_outstanding`) and shed a
+  verification at `crypto_queue` (racer-sim `NodeConfig::crypto_queue` 512, Model
+  `ModelSpec::crypto_queue` from `Limits::default`) through the same table (`verify_sheds`,
+  racer-sim `verify_sheds_dest`/`verify_sheds_relay`). The shed is not silence: the last-hop
+  record is dropped. Before this, both fidelities queued verifications without bound.
 - Pings: a silence ping is a peer request routed over the mesh (production
   `CandidatePolicy::ping` through `request_traced`, `src/read/candidates.rs:2488-2531`;
   racer-sim `launch_control`) on `NOTICE_LINKS` links with no remote attempts; the
@@ -318,16 +335,67 @@ from production in two ways, and the Model was the faithful side in both:
   helper per worker, as production and the Model, 56,073.
 
 Relay sheds stay at the first relay in both: hot owners' verification queues hold every relay
-toward them, and 16 `Relay` transfers per worker (`src/worker.rs:265`) run out. Both
-fidelities release a relay when the destination decides its answer, before the answer is signed
-and carried back (Model `reply`, racer-sim `send_reply`); production holds it until the answer
-is written (`server.rs:778`), so both under-state holds slightly.
+toward them, and 16 `Relay` transfers per worker (`src/worker.rs:265`) run out. That queue was
+unbounded in both fidelities, which production's is not (see Crypto queue bound in Modeled).
 
-Open question (production). With these costs (`verify_ns` 40 us, `sign_ns` 20 us, 2 workers)
-a 50,000-node cold start fails 4.6% (Model) to 7.0% (racer-sim) of reads, all from relay sheds
-behind hot owners' verification queues. Remedies (more `Relay` transfers, shedding before
-verification, or bounding a relay's hold) live in `src/peer/server.rs` and `src/worker.rs`,
-outside racer-core; not attempted here.
+Crypto queue bound (production-faithful, adopted). Every number in the tables above queued
+request verifications without bound. Production sheds a verification past 512 crypto jobs per
+worker, and it used to answer that shed by closing the connection. Seed 8, cold start, failed
+reads / origin requests (most per page), relay sheds, verification sheds, latency p50 / p99:
+
+| Nodes | Fidelity | Before: bound, connection closed | After: bound, unsigned overload head, helper |
+|---|---|---|---|
+| 2,000 | racer-sim | 3 / 16 (1), 2,723, 0, 150 ms / 2.15 s | 0 / 16 (1), 2,601, 0, 134 ms / 2.15 s |
+| 2,000 | Model | 2 / 17, 2,550, 0, 167 ms / 2.15 s | 2 / 16, 2,510, 0, 171 ms / 2.16 s |
+| 10,000 | racer-sim | 470 / 31 (3), 59,045, 76,145, 251 ms / 2.15 s | 465 / 16 (1), 31,569, 54,297, 301 ms / 2.15 s |
+| 10,000 | Model | 224 / 33, 37,479, 94,068, 257 ms / 2.20 s | 177 / 16, 20,813, 64,567, 315 ms / 2.22 s |
+| 50,000 | racer-sim | 631,635 (79%) / 46 (3), 1,420,841, 3,737,271, 301 ms / 603 ms | 47,915 (6.0%) / 16 (1), 235,532, 1,073,883, 603 ms / 2.42 s |
+| 50,000 | Model | 648,773 (81%) / 44, 1,546,084, 4,424,300, 354 ms / 639 ms | 18,615 (2.3%) / 16, 222,487, 962,087, 712 ms / 2.53 s |
+
+Both columns hold relays until the answer is written back. "Before" is production before this
+change: a 50,000-node cold start collapses, because a closed connection reads as a dead link
+(signed `Unavailable` from a relay, a transport failure at a requester), owners above rank 0
+reach origin, and readers retry the same hot owners. "After" is the fix:
+
+- The holder answers a verification shed with the unsigned overload head
+  (`src/peer/server.rs` `serve_connection`, `racer_core::route::unverified_failure`). It costs
+  no key work and carries nothing from the request; it says only that the holder is busy, which
+  closing the connection says as well. Every other verification failure still closes.
+- The sender reads it as `Overloaded` (`src/peer/transport.rs`): a relay signs its own
+  `Overloaded` (`route::relay_failure`), a requester sees a transport `Overloaded`.
+- A reader's walk asks its overflow helper after any `Overloaded`, signed or not
+  (`core/src/read/walk.rs` `complete`), not only after the destination's signed shed: the helper
+  is the way around a busy hop as well as a busy owner. A forged unsigned overload can only send
+  a reader to its helper, which dropping the connection could force as well.
+
+Other candidates at 50,000 unless noted (seed 8, all with the bound 512, the unsigned head, the
+helper change and relays held to the written answer unless noted):
+
+| Candidate | Model failed reads | racer-sim failed reads |
+|---|---|---|
+| Unsigned head without the helper change (relays released early) | 716,558 | 714,562 (bound 128) |
+| Shed a relay before verifying when its `Relay` quota is full (unbounded queue, no helper change, relays released early) | not run | 208 at 10,000 (204 without) |
+| Owner sheds a hot page before verifying, unsigned (relays released early) | 18,831 (22,978 without), 11,257 unbounded (1,722 without) | not run |
+| `Relay` transfers 32 per worker | 27,681 | 42,617 |
+| Crypto bound 1,024 (relays released early) | 17,748 | not run |
+| Crypto bound 2,048 | 6,212 (0.78%), p50 805 ms / p99 2.59 s | 18,120 (2.3%), p50 671 ms / p99 2.42 s |
+| Unbounded verification queue (relays released early) | 1,722 | not run |
+
+Pre-verification relay admission does not help: relay verifications wait about 40 us (racer-sim
+`verify_wait_relay_ns` p90 at 10,000) against owners' tens of ms (`verify_wait_dest_ns`).
+Shedding hot pages before verifying loses the signed shed's evidence and does worse. More relay
+transfers move the queue to the owners. A deeper crypto queue is the remaining lever: at 2,048
+jobs per worker the Model passes the 1% check and racer-sim fails 2.3%.
+
+Open question (production). With the fix a 50,000-node cold start still fails 2.3% (Model) to
+6.0% (racer-sim) of reads, and the cold start's 1% check fails in both. The crypto capacity is
+`queue_entries` (`src/worker.rs:618` passes it to `security::try_pair`), which also sizes flight
+operation queues (`src/read/flight.rs:675`), `ControlProgress`, the store queue and peer
+admission (`src/app.rs:480`); raising it, or giving the crypto pair its own limit, changes those
+too or touches `src/worker.rs` beyond one line, so it is not done here. Operators can raise it
+with `RACER_QUEUE_ENTRIES`. racer-sim fails 2.6x the Model at 50,000 with the fix (outside the
+2x tolerance); relay holds to the written answer moved racer-sim from 25,207 to 47,915 and the
+Model from 22,978 to 18,615, so the gap is in how long relays hold, not verification.
 
 Earlier leads, kept for the record: read attempts failed at similar rates but the Model's
 failures clustered (four attempts within a second); per-node route caches, the destination not
