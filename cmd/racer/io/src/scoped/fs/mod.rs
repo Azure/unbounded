@@ -492,27 +492,7 @@ pub mod secure {
         path::{Component, Path},
     };
 
-    /// Required metadata was unavailable, or the caller's access policy failed.
-    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-    pub enum AccessError {
-        /// The stat result omitted a field needed for an access decision.
-        MissingMetadata,
-        /// A present field did not satisfy the requested access policy.
-        PermissionDenied,
-    }
-
-    /// Caller-selected ownership, permission, and hard-link constraints.
-    #[derive(Clone, Copy, Debug)]
-    pub struct AccessRequirements {
-        /// Required numeric owner ID.
-        pub owner: u32,
-
-        /// Any of these mode bits causes an access failure.
-        pub forbidden_mode: u16,
-
-        /// Optional exact link count; the metadata field is always required.
-        pub links: Option<u32>,
-    }
+    pub use crate::fs::{AccessError, AccessRequirements, check_access};
 
     /// Reject resolution that escapes the supplied directory descriptor.
     pub const BENEATH: u64 = 0x08;
@@ -790,25 +770,6 @@ pub mod secure {
     pub fn component(name: &OsStr, limit: usize) -> Result<CString> {
         validate_component(name, limit)?;
         path_name(name, limit)
-    }
-
-    /// Check metadata completeness, owner, forbidden mode bits and optional links.
-    /// The link field must be present even when no exact link count is requested.
-    pub fn check_access(
-        stat: &libc::statx,
-        required: AccessRequirements,
-    ) -> Result<(), AccessError> {
-        let mask = libc::STATX_MODE | libc::STATX_UID | libc::STATX_NLINK;
-        if stat.stx_mask & mask != mask {
-            return Err(AccessError::MissingMetadata);
-        }
-        if stat.stx_mode & required.forbidden_mode != 0
-            || stat.stx_uid != required.owner
-            || required.links.is_some_and(|links| stat.stx_nlink != links)
-        {
-            return Err(AccessError::PermissionDenied);
-        }
-        Ok(())
     }
 
     /// Validate type and size before reading. A bounded read is still necessary
