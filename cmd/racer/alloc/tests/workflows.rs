@@ -946,7 +946,7 @@ fn io_uring_roundtrip_and_completion_fence() {
         }
     }
     let clock = page_alloc::SegmentClock::new(std::rc::Rc::new(segments));
-    clock.reclaim(&EmptyEntries, 2, 4, 0).unwrap();
+    clock.reclaim_scored(&EmptyEntries, 2, 4, 0, |_| 0).unwrap();
 }
 
 /// Keep both halves aligned even when offset and length units differ.
@@ -1269,7 +1269,10 @@ fn partial_table_reclamation_changes_authority_without_erasing_storage() {
     };
     let clock = page_alloc::SegmentClock::new(segments.clone());
     let held = segments.lease(SegmentId(0), original_generation).unwrap();
-    assert_eq!(clock.reclaim(&entries, 2, 4, 1), Err(Error::Busy));
+    assert_eq!(
+        clock.reclaim_scored(&entries, 2, 4, 1, |_| 0),
+        Err(Error::Busy)
+    );
     assert_eq!(entries.removals.get(), 1);
     assert!(!entries.populated.get());
     assert_eq!(segments.state(SegmentId(0)), Ok(SegmentState::Evicting));
@@ -1292,7 +1295,7 @@ fn partial_table_reclamation_changes_authority_without_erasing_storage() {
     .unwrap();
     assert!(buffer.as_slice().iter().all(|byte| *byte == 91));
     drop(buffer);
-    clock.reclaim(&entries, 2, 4, 0).unwrap();
+    clock.reclaim_scored(&entries, 2, 4, 0, |_| 0).unwrap();
     assert_eq!(segments.free_count(), 2);
     assert_eq!(entries.removals.get(), 1);
     assert_eq!(segments.snapshot()[0].generation, Generation(2));

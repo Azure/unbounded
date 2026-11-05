@@ -302,11 +302,6 @@ enum Op {
         entries: u8,
         salt: u8,
     },
-    ReclaimIndex {
-        visits: u8,
-        keep: u8,
-    },
-    MarkRead(u8),
     Evict(u8),
     Recycle(u8),
     Buffer(u8),
@@ -465,13 +460,6 @@ struct Index {
     unpublished: RefCell<[usize; SLOTS]>,
 
     removed: Cell<usize>,
-}
-
-impl Index {
-    /// Total mappings across all segments.
-    fn total(&self) -> usize {
-        self.map.borrow().values().map(VecDeque::len).sum()
-    }
 }
 
 impl SegmentEntries for Index {
@@ -891,12 +879,10 @@ impl GeometryModel {
                 bad: false,
                 target: 0,
             };
-            assert_eq!(clock.reclaim(&index, 1, 255, 1), Err(Error::Unavailable));
             assert_eq!(
                 clock.reclaim_scored(&index, 1, 255, 1, |_| 0),
                 Err(Error::Unavailable)
             );
-            assert_eq!(clock.reclaim_index(&index, 255, || false), Err(Error::Busy));
             assert!(self.segments.snapshot().is_empty());
             c.empty_clock += 1;
             return;
@@ -907,9 +893,8 @@ impl GeometryModel {
             0..=2 => {
                 // An index error preserves generation and occupancy, not lifecycle:
                 // physical reclamation already entered eviction before the callback.
-                let target = if action == 0 {
-                    target
-                } else {
+                // All three actions run the scored clock; they share one target rule.
+                let target = {
                     let Some(target) = self
                         .expected
                         .iter()
@@ -930,18 +915,12 @@ impl GeometryModel {
                     bad: true,
                     target,
                 };
-                let result = match action {
-                    0 => clock.reclaim_index(&index, 255, || false),
-                    1 => clock.reclaim(&index, slots, 255, 1),
-                    _ => clock.reclaim_scored(&index, slots, 255, 1, |_| 0),
-                };
-                if action == 2 && target >= 64 {
+                let result = clock.reclaim_scored(&index, slots, 255, 1, |_| 0);
+                if target >= 64 {
                     assert_eq!(result, Err(Error::Busy));
                 } else {
                     assert_eq!(result, Err(Error::InvalidConfiguration));
-                    if action != 0 {
-                        self.expected[target].state = SegmentState::Evicting;
-                    }
+                    self.expected[target].state = SegmentState::Evicting;
                     c.overreport[action as usize] += 1;
                 }
             }
@@ -1520,11 +1499,6 @@ impl<'t, 'w> Phase<'t, 'w> {
                 entries,
                 salt,
             } => self.reclaim(*reserve, *visits, *entries, Some(*salt)),
-            Op::ReclaimIndex { visits, keep } => self.reclaim_index(*visits, *keep),
-            Op::MarkRead(slot) => {
-                let id = SegmentId(u64::from(*slot) % SLOTS as u64);
-                assert_eq!(self.t.clock.mark_read(id), Ok(()));
-            }
             Op::Evict(slot) => self.evict(*slot as usize % SLOTS),
             Op::Recycle(slot) => self.recycle(*slot as usize % SLOTS),
             Op::Buffer(pages) => {
@@ -2043,19 +2017,13 @@ impl<'t, 'w> Phase<'t, 'w> {
         let pre = self.snap();
         let unpublished = *self.w.index.unpublished.borrow();
         let removed = self.w.index.removed.get();
-        let result = match salt {
-            None => self
-                .t
-                .clock
-                .reclaim(&self.w.index, reserve, visits, entries),
-            Some(salt) => {
-                self.t
-                    .clock
-                    .reclaim_scored(&self.w.index, reserve, visits, entries, |id| {
-                        (id.0 + 1).wrapping_mul(u64::from(salt)) % 5
-                    })
-            }
-        };
+        let salt = u64::from(salt.unwrap_or(0));
+        let result = self
+            .t
+            .clock
+            .reclaim_scored(&self.w.index, reserve, visits, entries, |id| {
+                (id.0 + 1).wrapping_mul(salt) % 5
+            });
         let post = self.snap();
         let removed = self.w.index.removed.get() - removed;
         assert!(removed <= entries, "removed {removed} > {entries}");
@@ -2117,22 +2085,6 @@ impl<'t, 'w> Phase<'t, 'w> {
         assert!(self.w.index.is_empty(b.id), "recycled with live mappings");
         assert!(!self.held(seg), "recycled under a held lease");
         self.w.coverage.recycles += 1;
-    }
-
-    /// Drop index mappings without touching the table.
-    fn reclaim_index(&mut self, visits: u8, keep: u8) {
-        let (visits, keep) = (usize::from(visits) % (2 * SLOTS + 2), usize::from(keep) % 4);
-        let pre = self.snap();
-        let removed = self.w.index.removed.get();
-        let index = &self.w.index;
-        let result = self
-            .t
-            .clock
-            .reclaim_index(index, visits, || index.total() <= keep);
-        let removed = self.w.index.removed.get() - removed;
-        assert_eq!(self.snap(), pre);
-        assert!(removed <= visits.min(2 * SLOTS));
-        assert_eq!(result.is_ok(), self.w.index.total() <= keep, "{result:?}");
     }
 
     /// Enter eviction directly.
@@ -2445,15 +2397,11 @@ fn generate(seed: u64, steps: usize) -> (bool, Vec<Op>) {
                 visits: rng.byte(8),
                 entries: rng.byte(6),
             },
-            53..=56 => Op::Scored {
+            53..=59 => Op::Scored {
                 reserve: rng.byte(4),
                 visits: rng.byte(8),
                 entries: rng.byte(6),
                 salt: rng.byte(256),
-            },
-            57..=59 => Op::ReclaimIndex {
-                visits: rng.byte(8),
-                keep: rng.byte(4),
             },
             60..=62 => Op::Evict(rng.byte(SLOTS as u64)),
             63..=65 => Op::Recycle(rng.byte(SLOTS as u64)),
@@ -2473,8 +2421,7 @@ fn generate(seed: u64, steps: usize) -> (bool, Vec<Op>) {
             83 => Op::Poll(rng.byte(8)),
             84..=86 => Op::Abandon(rng.byte(8)),
             87..=88 => Op::Freeze,
-            89..=91 => Op::Thaw,
-            92..=93 => Op::MarkRead(rng.byte(SLOTS as u64)),
+            89..=93 => Op::Thaw,
             94 => Op::Buffer(rng.byte(2)),
             95 => Op::DropBuffer(rng.byte(4)),
             96 => Op::ReclaimIdle,

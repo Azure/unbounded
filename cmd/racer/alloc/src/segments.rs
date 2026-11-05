@@ -277,7 +277,7 @@ impl Segments {
         self.table.clone()
     }
 
-    /// Recovery revision used to invalidate eviction cursor and recent-read state.
+    /// Recovery revision used to invalidate the eviction cursor.
     pub(crate) fn restore_epoch(&self) -> u64 {
         self.restore_epoch.get()
     }
@@ -851,14 +851,12 @@ impl<K: Eq + std::hash::Hash + Clone, H: std::hash::BuildHasher + Default> Segme
     }
 }
 
-/// One worker-local cursor and recent-read set for index and physical reclamation.
+/// One worker-local cursor for scored physical reclamation.
 #[repr(align(64))]
 pub struct SegmentClock {
     segments: Rc<Segments>,
 
     hand: Cell<usize>,
-
-    recent: RefCell<HashSet<SegmentId>>,
 
     restore_epoch: Cell<u64>,
 }
@@ -870,22 +868,8 @@ impl SegmentClock {
         Self {
             segments,
             hand: Cell::new(0),
-            recent: RefCell::new(HashSet::new()),
             restore_epoch: Cell::new(epoch),
         }
-    }
-
-    /// Give live segments a second chance; ignore completions arriving after eviction.
-    pub fn mark_read(&self, segment: SegmentId) -> Result<()> {
-        self.sync_restore();
-        if !matches!(
-            self.segments.state(segment)?,
-            SegmentState::Open | SegmentState::Sealed
-        ) {
-            return Ok(());
-        }
-        self.recent.borrow_mut().insert(segment);
-        Ok(())
     }
 
     /// Clear transient eviction history after successful table recovery.
@@ -893,7 +877,6 @@ impl SegmentClock {
         let epoch = self.segments.restore_epoch();
         if self.restore_epoch.replace(epoch) != epoch {
             self.hand.set(0);
-            self.recent.borrow_mut().clear();
         }
     }
 
@@ -902,38 +885,6 @@ impl SegmentClock {
         let hand = self.hand.get() % count;
         self.hand.set((hand + 1) % count);
         SegmentId(hand as u64)
-    }
-
-    /// Forget one mapping per candidate until admission succeeds, without changing
-    /// bytes or generations. At most two rotations, further capped by max_visits.
-    /// Freeze does not block caller-owned index mutation.
-    pub fn reclaim_index(
-        &self,
-        entries: &impl SegmentEntries,
-        max_visits: usize,
-        mut ready: impl FnMut() -> bool,
-    ) -> Result<()> {
-        self.sync_restore();
-        if ready() {
-            return Ok(());
-        }
-        let count = self.segments.count();
-        for _ in 0..count.saturating_mul(2).min(max_visits) {
-            let id = self.next(count);
-            if self.recent.borrow_mut().remove(&id) {
-                continue;
-            }
-            if !entries.can_reclaim(id) {
-                continue;
-            }
-            if entries.remove_bounded(id, 1) > 1 {
-                return Err(Error::InvalidConfiguration);
-            }
-            if ready() {
-                return Ok(());
-            }
-        }
-        Err(Error::Busy)
     }
 
     /// Visit at most min(slot count, max_visits, 64) slots, then rank eligible
@@ -1008,7 +959,6 @@ impl SegmentClock {
                 continue;
             }
             self.segments.begin_eviction(id)?;
-            self.recent.borrow_mut().remove(&id);
             if entries_left != 0 && !entries.is_empty(id) {
                 let removed = entries.remove_bounded(id, entries_left);
                 if removed > entries_left {
@@ -1025,74 +975,6 @@ impl SegmentClock {
             }
         }
         if self.segments.free_count() >= target {
-            Ok(())
-        } else {
-            Err(Error::Busy)
-        }
-    }
-
-    /// Reclaim a reserve with bounded visits and mapping removals, without compaction.
-    /// Busy leases keep segments Evicting until a later sweep. A zero reserve is a
-    /// no-op; a zero mapping budget can recycle empty but not populated segments.
-    /// For a nonzero reserve, success requires the reserve (capped at the slot
-    /// count), but does not guarantee that pending evictions have drained. Busy
-    /// means the bounded sweep could not meet the reserve or mutation was blocked.
-    /// Use [`Segments::free_count`] to check capacity and retry when more is needed.
-    pub fn reclaim(
-        &self,
-        entries: &impl SegmentEntries,
-        free_reserve: usize,
-        max_visits: usize,
-        max_entries: usize,
-    ) -> Result<()> {
-        self.sync_restore();
-        if free_reserve == 0 {
-            return Ok(());
-        }
-        let count = self.segments.count();
-        if count == 0 {
-            return Err(Error::Unavailable);
-        }
-        let target = free_reserve.min(count);
-        let mut free = self.segments.free_count();
-        let mut entries_left = max_entries;
-        for _ in 0..count.saturating_mul(2).min(max_visits) {
-            if free >= target {
-                return Ok(());
-            }
-            let id = self.next(count);
-            let state = self.segments.state(id)?;
-            if !matches!(state, SegmentState::Sealed | SegmentState::Evicting) {
-                continue;
-            }
-            if !entries.can_reclaim(id) || (state == SegmentState::Sealed && !entries.can_evict(id))
-            {
-                continue;
-            }
-            if self.recent.borrow_mut().remove(&id) {
-                continue;
-            }
-            if entries_left == 0 && !entries.is_empty(id) {
-                continue;
-            }
-            self.segments.begin_eviction(id)?;
-            if entries_left != 0 && !entries.is_empty(id) {
-                let removed = entries.remove_bounded(id, entries_left);
-                if removed > entries_left {
-                    return Err(Error::InvalidConfiguration);
-                }
-                entries_left -= removed;
-            }
-            if !entries.is_empty(id) {
-                continue;
-            }
-            match self.segments.recycle_evicted(id) {
-                Ok(()) => free += 1,
-                Err(Error::Busy) => {}
-                Err(e) => return Err(e),
-            }
-        }
-        if free >= target {
             Ok(())
         } else {
             Err(Error::Busy)
@@ -1553,6 +1435,17 @@ mod clock_tests {
         }
     }
 
+    /// Unscored reclamation through the scored clock.
+    fn reclaim(
+        clock: &SegmentClock,
+        entries: &impl SegmentEntries,
+        reserve: usize,
+        visits: usize,
+        budget: usize,
+    ) -> Result<()> {
+        clock.reclaim_scored(entries, reserve, visits, budget, |_| 0)
+    }
+
     /// Create a shared table with enough slots for a bounded clock scenario.
     fn segments(count: usize) -> Rc<Segments> {
         let segments = Rc::new(Segments::new(1024));
@@ -1571,22 +1464,21 @@ mod clock_tests {
     fn empty_and_zero_budget_sweeps_do_not_call_entries() {
         let clock = SegmentClock::new(Rc::new(Segments::new(1024)));
         let entries = Entries::new(vec![]);
-        assert_eq!(clock.reclaim_index(&entries, 64, || true), Ok(()));
         assert_eq!(
-            clock.reclaim_index(&entries, 64, || false),
-            Err(Error::Busy)
+            reclaim(&clock, &entries, 1, 64, 256),
+            Err(Error::Unavailable)
         );
-        assert_eq!(clock.reclaim(&entries, 1, 64, 256), Err(Error::Unavailable));
-        assert_eq!(clock.mark_read(SegmentId(0)), Err(Error::Corrupt));
         assert!(entries.calls.borrow().is_empty());
-        let clock = SegmentClock::new(segments(1));
+        let segments = segments(1);
+        drop(segments.append(1024).unwrap());
+        let clock = SegmentClock::new(segments);
         let entries = Entries::new(vec![1]);
-        assert_eq!(clock.reclaim_index(&entries, 0, || false), Err(Error::Busy));
+        assert_eq!(reclaim(&clock, &entries, 1, 0, 256), Err(Error::Busy));
         assert!(entries.calls.borrow().is_empty());
     }
 
     #[test]
-    fn hard_veto_applies_to_already_evicting_and_index_only_sweeps() {
+    fn hard_veto_applies_to_already_evicting_segments() {
         let segments = segments(2);
         drop(segments.append(1024).unwrap());
         segments.begin_evict(SegmentId(0)).unwrap();
@@ -1598,61 +1490,13 @@ mod clock_tests {
             clock.reclaim_scored(&entries, 2, 64, 256, |_| 0),
             Err(Error::Busy)
         );
-        assert_eq!(clock.reclaim(&entries, 2, 64, 256), Err(Error::Busy));
-        assert_eq!(
-            clock.reclaim_index(&entries, 64, || false),
-            Err(Error::Busy)
-        );
+        assert_eq!(reclaim(&clock, &entries, 2, 64, 256), Err(Error::Busy));
         assert!(entries.calls.borrow().is_empty());
         assert_eq!(segments.state(SegmentId(0)), Ok(SegmentState::Evicting));
         entries.evictable.set(true);
         entries.hard_veto.set(false);
         clock.reclaim_scored(&entries, 2, 64, 256, |_| 0).unwrap();
         assert_eq!(segments.free_count(), 2);
-    }
-
-    /// Index admission can forget open mappings without reclaiming their storage.
-    #[test]
-    fn index_second_chance_removes_open_mappings_without_recycling() {
-        let segments = segments(2);
-        drop(segments.append(512).unwrap());
-        let clock = SegmentClock::new(segments.clone());
-        let entries = Entries::new(vec![1, 1]);
-        clock.mark_read(SegmentId(0)).unwrap();
-        clock
-            .reclaim_index(&entries, 64, || entries.counts.borrow()[1] == 0)
-            .unwrap();
-        assert_eq!(*entries.counts.borrow(), [1, 0]);
-        clock.mark_read(SegmentId(0)).unwrap();
-        clock
-            .reclaim_index(&entries, 64, || entries.counts.borrow()[0] == 0)
-            .unwrap();
-        assert_eq!(segments.state(SegmentId(0)), Ok(SegmentState::Open));
-        assert!(segments.lease(SegmentId(0), Generation(1)).is_ok());
-        assert_eq!(segments.free_count(), 1);
-    }
-
-    /// Calls resume the prior cursor but never exceed visits or two rotations.
-    #[test]
-    fn sweep_budget_persists_cursor_and_limits_to_two_rotations() {
-        let clock = SegmentClock::new(segments(40));
-        let entries = Entries::new(vec![10; 40]);
-        assert_eq!(
-            clock.reclaim_index(&entries, 64, || false),
-            Err(Error::Busy)
-        );
-        assert_eq!(entries.calls.borrow().len(), 64);
-        assert_eq!(entries.calls.borrow()[63], (SegmentId(23), 1));
-        entries.calls.borrow_mut().clear();
-        assert_eq!(clock.reclaim_index(&entries, 1, || false), Err(Error::Busy));
-        assert_eq!(*entries.calls.borrow(), [(SegmentId(24), 1)]);
-        let clock = SegmentClock::new(segments(2));
-        let entries = Entries::new(vec![10; 2]);
-        assert_eq!(
-            clock.reclaim_index(&entries, 64, || false),
-            Err(Error::Busy)
-        );
-        assert_eq!(entries.calls.borrow().len(), 4);
     }
 
     /// Mapping budget exhaustion leaves partial eviction for the next bounded call.
@@ -1663,12 +1507,12 @@ mod clock_tests {
         drop(segments.append(1024).unwrap());
         let clock = SegmentClock::new(segments.clone());
         let entries = Entries::new(vec![257, 0]);
-        assert_eq!(clock.reclaim(&entries, 2, 64, 256), Err(Error::Busy));
+        assert_eq!(reclaim(&clock, &entries, 2, 64, 256), Err(Error::Busy));
         assert_eq!(*entries.counts.borrow(), [1, 0]);
         assert_eq!(*entries.calls.borrow(), [(SegmentId(0), 256)]);
         assert_eq!(segments.state(SegmentId(0)), Ok(SegmentState::Evicting));
         assert_eq!(segments.free_count(), 1);
-        clock.reclaim(&entries, 2, 64, 256).unwrap();
+        reclaim(&clock, &entries, 2, 64, 256).unwrap();
         assert_eq!(segments.free_count(), 2);
         assert_eq!(*entries.counts.borrow(), [0, 0]);
     }
@@ -1685,20 +1529,20 @@ mod clock_tests {
             let before = segments.snapshot();
             assert_eq!(before[0].state, SegmentState::Sealed);
 
-            assert_eq!(clock.reclaim(&entries, 1, 2, 1), Err(Error::Busy));
+            assert_eq!(reclaim(&clock, &entries, 1, 2, 1), Err(Error::Busy));
             assert_eq!(segments.snapshot(), before);
             assert_eq!(*entries.counts.borrow(), [mapping_count]);
             assert!(entries.calls.borrow().is_empty());
             assert_eq!(segments.free_count(), 0);
 
             entries.evictable.set(true);
-            assert_eq!(clock.reclaim(&entries, 1, 1, 1), Err(Error::Busy));
+            assert_eq!(reclaim(&clock, &entries, 1, 1, 1), Err(Error::Busy));
             assert_eq!(segments.state(SegmentId(0)), Ok(SegmentState::Evicting));
             assert_eq!(*entries.counts.borrow(), [mapping_count.saturating_sub(1)]);
 
             // Once eviction starts, a later veto must not block remaining mappings.
             entries.evictable.set(false);
-            assert_eq!(clock.reclaim(&entries, 1, 1, 1), Err(Error::Busy));
+            assert_eq!(reclaim(&clock, &entries, 1, 1, 1), Err(Error::Busy));
             assert_eq!(*entries.counts.borrow(), [0]);
             assert_eq!(entries.calls.borrow().len(), mapping_count);
             assert_eq!(segments.state(SegmentId(0)), Ok(SegmentState::Evicting));
@@ -1707,7 +1551,7 @@ mod clock_tests {
 
             // The live lease, not the veto, remains the physical reuse fence.
             drop(held);
-            clock.reclaim(&entries, 1, 1, 0).unwrap();
+            reclaim(&clock, &entries, 1, 1, 0).unwrap();
             assert_eq!(segments.state(SegmentId(0)), Ok(SegmentState::Free));
             assert_eq!(segments.free_count(), 1);
             assert_eq!(segments.snapshot()[0].generation, Generation(2));
@@ -1723,36 +1567,16 @@ mod clock_tests {
         let clock = SegmentClock::new(segments.clone());
         let entries = Entries::new(vec![1, 1]);
         let frozen = segments.freeze().unwrap();
-        assert_eq!(clock.reclaim(&entries, 2, 64, 256), Err(Error::Busy));
+        assert_eq!(reclaim(&clock, &entries, 2, 64, 256), Err(Error::Busy));
         assert!(entries.calls.borrow().is_empty());
         drop(frozen);
-        clock.mark_read(SegmentId(1)).unwrap();
-        assert_eq!(clock.reclaim(&entries, 2, 64, 256), Err(Error::Busy));
+        assert_eq!(reclaim(&clock, &entries, 2, 64, 256), Err(Error::Busy));
         assert_eq!(segments.state(SegmentId(0)), Ok(SegmentState::Evicting));
         assert_eq!(segments.free_count(), 1);
-        assert_eq!(clock.mark_read(SegmentId(0)), Ok(()));
-        assert_eq!(clock.mark_read(SegmentId(1)), Ok(()));
-        assert!(clock.recent.borrow().is_empty());
         drop(held);
-        clock.reclaim(&entries, 2, 64, 256).unwrap();
+        reclaim(&clock, &entries, 2, 64, 256).unwrap();
         assert_eq!(segments.free_count(), 2);
         assert!(segments.lease(SegmentId(0), Generation(1)).is_err());
-    }
-
-    /// Skipping an open segment does not consume its future second chance.
-    #[test]
-    fn physical_sweep_preserves_recent_bit_on_ineligible_open_segment() {
-        let segments = segments(1);
-        drop(segments.append(512).unwrap());
-        let clock = SegmentClock::new(segments.clone());
-        let entries = Entries::new(vec![1]);
-        clock.mark_read(SegmentId(0)).unwrap();
-        assert_eq!(clock.reclaim(&entries, 1, 64, 256), Err(Error::Busy));
-        drop(segments.append(512).unwrap());
-        assert_eq!(clock.reclaim(&entries, 1, 1, 256), Err(Error::Busy));
-        assert!(entries.calls.borrow().is_empty());
-        clock.reclaim(&entries, 1, 1, 256).unwrap();
-        assert_eq!(*entries.calls.borrow(), [(SegmentId(0), 256)]);
     }
 
     /// A no-space rollover creates a reclaimable tail without reserving bytes.
@@ -1772,11 +1596,11 @@ mod clock_tests {
             let clock = SegmentClock::new(segments.clone());
             let entries = Entries::new(vec![0]);
             if retain_lease {
-                assert_eq!(clock.reclaim(&entries, 1, 2, 0), Err(Error::Busy));
+                assert_eq!(reclaim(&clock, &entries, 1, 2, 0), Err(Error::Busy));
                 assert_eq!(segments.state(SegmentId(0)), Ok(SegmentState::Evicting));
                 drop(held.take());
             }
-            clock.reclaim(&entries, 1, 2, 0).unwrap();
+            reclaim(&clock, &entries, 1, 2, 0).unwrap();
             assert!(entries.calls.borrow().is_empty());
             let (lease, extent) = segments.append(1024).unwrap();
             assert_eq!(lease.id(), SegmentId(0));
@@ -1794,12 +1618,12 @@ mod clock_tests {
         drop(segments.append(1024).unwrap());
         let clock = SegmentClock::new(segments.clone());
         let entries = Entries::new(vec![1, 0]);
-        clock.reclaim(&entries, 1, 2, 0).unwrap();
+        reclaim(&clock, &entries, 1, 2, 0).unwrap();
         assert_eq!(segments.state(SegmentId(0)), Ok(SegmentState::Sealed));
         assert_eq!(segments.state(SegmentId(1)), Ok(SegmentState::Free));
         assert_eq!(*entries.counts.borrow(), [1, 0]);
         assert!(entries.calls.borrow().is_empty());
-        assert_eq!(clock.reclaim(&entries, 2, 64, 0), Err(Error::Busy));
+        assert_eq!(reclaim(&clock, &entries, 2, 64, 0), Err(Error::Busy));
         assert_eq!(segments.state(SegmentId(0)), Ok(SegmentState::Sealed));
     }
 
@@ -1808,18 +1632,16 @@ mod clock_tests {
     fn zero_reserve_has_no_side_effects_even_when_unconfigured() {
         let unconfigured = SegmentClock::new(Rc::new(Segments::new(1024)));
         assert_eq!(
-            unconfigured.reclaim(&Entries::new(vec![]), 0, 64, 256),
+            reclaim(&unconfigured, &Entries::new(vec![]), 0, 64, 256),
             Ok(())
         );
         let segments = segments(1);
         drop(segments.append(1024).unwrap());
         let clock = SegmentClock::new(segments.clone());
         let entries = Entries::new(vec![1]);
-        clock.mark_read(SegmentId(0)).unwrap();
-        assert_eq!(clock.reclaim(&entries, 0, 64, 256), Ok(()));
+        assert_eq!(reclaim(&clock, &entries, 0, 64, 256), Ok(()));
         assert_eq!(segments.state(SegmentId(0)), Ok(SegmentState::Sealed));
         assert!(entries.calls.borrow().is_empty());
-        assert!(clock.recent.borrow().contains(&SegmentId(0)));
     }
 
     /// Scoring completes before mutation; mapping budgets, freeze, leases and
@@ -1914,19 +1736,14 @@ mod clock_tests {
     /// Meeting a smaller reserve does not promise to drain a leased pending victim.
     #[test]
     fn reserve_success_does_not_require_pending_evictions_to_drain() {
-        for scored in [false, true] {
+        {
             let segments = segments(3);
             let held = segments.append(1024).unwrap().0;
             drop(segments.append(1024).unwrap());
             let clock = SegmentClock::new(segments.clone());
             let entries = Entries::new(vec![1, 1, 0]);
-            let reclaim = |reserve, visits| {
-                if scored {
-                    clock.reclaim_scored(&entries, reserve, visits, 3, |_| 0)
-                } else {
-                    clock.reclaim(&entries, reserve, visits, 3)
-                }
-            };
+            let reclaim =
+                |reserve, visits| clock.reclaim_scored(&entries, reserve, visits, 3, |_| 0);
             assert_eq!(reclaim(3, 1), Err(Error::Busy));
             assert_eq!(segments.free_count(), 1);
             assert_eq!(segments.evicting.get(), 1);
@@ -1962,40 +1779,28 @@ mod clock_tests {
         drop(segments.append(1024).unwrap());
         let clock = SegmentClock::new(segments.clone());
         assert_eq!(
-            clock.reclaim_index(&InvalidEntries, 1, || false),
-            Err(Error::InvalidConfiguration)
-        );
-        assert_eq!(
-            clock.reclaim(&InvalidEntries, 1, 1, 1),
+            reclaim(&clock, &InvalidEntries, 1, 1, 1),
             Err(Error::InvalidConfiguration)
         );
         assert_eq!(segments.state(SegmentId(0)), Ok(SegmentState::Evicting));
         assert_eq!(segments.free_count(), 0);
     }
 
-    /// Every clock operation observes the restore epoch before using old history.
+    /// Every clock operation observes the restore epoch before using the old cursor.
     #[test]
-    fn restore_resets_cursor_and_recent_reads_before_any_clock_operation() {
+    fn restore_resets_cursor_before_any_clock_operation() {
         let segments = segments(2);
         drop(segments.append(1024).unwrap());
         drop(segments.append(1024).unwrap());
         let clock = SegmentClock::new(segments.clone());
         let entries = Entries::new(vec![10, 10]);
-        assert_eq!(clock.reclaim_index(&entries, 1, || false), Err(Error::Busy));
-        clock.mark_read(SegmentId(0)).unwrap();
+        assert_eq!(reclaim(&clock, &entries, 2, 1, 1), Err(Error::Busy));
         assert_eq!(clock.hand.get(), 1);
+        assert_eq!(*entries.calls.borrow(), [(SegmentId(0), 1)]);
         segments.restore(segments.snapshot()).unwrap();
         entries.calls.borrow_mut().clear();
-        assert_eq!(clock.reclaim_index(&entries, 1, || false), Err(Error::Busy));
+        assert_eq!(reclaim(&clock, &entries, 2, 1, 1), Err(Error::Busy));
         assert_eq!(*entries.calls.borrow(), [(SegmentId(0), 1)]);
-        clock.mark_read(SegmentId(1)).unwrap();
-        segments.restore(segments.snapshot()).unwrap();
-        clock.mark_read(SegmentId(0)).unwrap();
-        assert_eq!(clock.hand.get(), 0);
-        assert_eq!(*clock.recent.borrow(), HashSet::from([SegmentId(0)]));
-        segments.restore(segments.snapshot()).unwrap();
-        clock.reclaim(&entries, 0, 0, 0).unwrap();
-        assert!(clock.recent.borrow().is_empty());
     }
 }
 

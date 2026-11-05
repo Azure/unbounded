@@ -110,7 +110,7 @@
 //! exists at a time. Restore requires both thawing and draining all leases,
 //! including reads and abandoned I/O. It validates the whole ordered image before
 //! publication, seals an open tail, rebuilds free slots, and advances an epoch
-//! that clears the eviction cursor and recent-read state. Invalid or busy restores
+//! that clears the eviction cursor. Invalid or busy restores
 //! never partially publish.
 //! Raw file opening, table configuration, and manual eviction are test-support
 //! escape hatches. Production startup binds with [`Slab::open_configured`], and
@@ -125,13 +125,11 @@
 //! must validate identity, lengths, integrity, and versions. Invalid, stale, torn,
 //! or missing cache records must become misses and be refetched.
 //!
-//! [`SegmentClock`] shares a cursor and second-chance set across bounded sweeps.
-//! Index reclamation forgets mappings without touching bytes or generations.
+//! [`SegmentClock`] shares a cursor across bounded sweeps.
 //! Physical reclamation selects only Sealed/Evicting slots and recycles empty slots
-//! after leases drain. Index and unscored sweeps visit at most two rotations,
-//! further capped by the caller. Scored reclamation visits at most
+//! after leases drain. Scored reclamation visits at most
 //! min(slot count, max_visits, 64) slots, including skipped slots, then ranks
-//! eligible candidates. For a nonzero reserve, [`SegmentClock::reclaim`] and
+//! eligible candidates. For a nonzero reserve,
 //! [`SegmentClock::reclaim_scored`] can succeed once the reserve (capped at the
 //! slot count) is met, even with pending evictions. Success is not a drain guarantee.
 //! Busy means the bounded sweep could not meet the reserve, or table mutation was
