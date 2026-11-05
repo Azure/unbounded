@@ -294,9 +294,13 @@ func TestConfiguredMode(t *testing.T) {
 		require.Equal(t, isolation.ModeNSpawn, mode, value)
 	}
 
+	mode, err = configuredMode(&provision.UnboundedAgentConfig{AgentConfig: provision.AgentConfig{Isolation: "none"}})
+	require.NoError(t, err)
+	require.Equal(t, isolation.ModeNone, mode)
+
 	// A mode this agent has no table entry for is refused, and so is the
 	// bootstrap plan for it.
-	for _, value := range []string{"none", "container", "microvm"} {
+	for _, value := range []string{"container", "microvm"} {
 		cfg := &provision.UnboundedAgentConfig{AgentConfig: provision.AgentConfig{Isolation: value}}
 
 		_, err = configuredMode(cfg)
