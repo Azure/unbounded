@@ -84,7 +84,8 @@ type runOptions struct {
 	// NewClient constructs controller-runtime clients. Defaults to client.NewWithWatch.
 	NewClient kubeClientFunc
 
-	// NodeOperator performs host-local nspawn operations. Defaults to nspawnNodeOperator.
+	// NodeOperator performs host-local node operations. Run sets it to the
+	// dispatcher over the mode operators it is given; it is required.
 	NodeOperator nodeOperator
 }
 
@@ -98,7 +99,7 @@ func (o *runOptions) validate() error {
 	}
 
 	if o.NodeOperator == nil {
-		o.NodeOperator = nspawnNodeOperator{}
+		return errors.New("run options need a node operator")
 	}
 
 	if o.installation == nil {
@@ -112,17 +113,18 @@ func (o *runOptions) validate() error {
 	return nil
 }
 
-// Run is the main daemon entry point. It discovers the active nspawn
-// machine, builds a Kubernetes client, registers the Machine CR if needed,
-// and blocks until the context is canceled.
-func Run(ctx context.Context, log *slog.Logger) error {
+// Run is the main daemon entry point. It discovers the active node, builds a
+// Kubernetes client, registers the Machine CR if needed, and blocks until the
+// context is canceled. modes is the operator of every isolation mode this agent
+// can operate, from the agent's mode composition table.
+func Run(ctx context.Context, log *slog.Logger, modes ModeOperators) error {
 	// After an AgentUpgrade from a release that predates the host root, this is
 	// the first time the new agent runs on the host.
 	if err := MigrateHostRoot(log); err != nil {
 		return err
 	}
 
-	return run(ctx, log, runOptions{})
+	return run(ctx, log, runOptions{NodeOperator: newDispatchOperator(hostOperator{}, modes)})
 }
 
 // run is the inner loop. Tests can override external dependencies through opts.
