@@ -26,9 +26,11 @@
 //!
 //! # Threads
 //!
-//! [`start`] spawns exactly one thread, see [`CONTROL_THREADS`]. It runs a
-//! small single-threaded executor over `poll(2)`. There is no Tokio and no
-//! thread pool. Connection and task counts are fixed by [`limits`].
+//! [`start`] spawns exactly one thread, see [`CONTROL_THREADS`]. It runs one
+//! [`Authority`]: a single-threaded executor over a `racer-io` reactor
+//! (`io_uring`). There is no Tokio and no thread pool. Connection and task
+//! counts are fixed by [`limits`]. A simulation builds an [`Authority`] on
+//! the simulated driver instead and steps it with [`Authority::turn`].
 //!
 //! # Discovery annotations
 //!
