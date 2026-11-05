@@ -2448,6 +2448,7 @@ mod tests {
             factory: TestFactory,
             local: Rc<()>,
             driver: Option<Waker>,
+            reporter: Option<FailureReporter<Error>>,
         }
         struct TestCrypto {
             factory: TestFactory,
@@ -2476,6 +2477,7 @@ mod tests {
                     factory: self.clone(),
                     local: Rc::new(()),
                     driver: None,
+                    reporter: None,
                 }))
             }
             fn build_crypto(
@@ -2498,6 +2500,9 @@ mod tests {
             }
         }
         impl Service<RequestScope> for TestIo {
+            fn set_failure_reporter(&mut self, reporter: FailureReporter<Error>) {
+                self.reporter = Some(reporter);
+            }
             fn start<'a>(&'a mut self, _: &'a RequestScope) -> Operation<'a, ()> {
                 let ready = Instant::now() + self.factory.start_delay;
                 Box::pin(std::future::poll_fn(move |cx| {
@@ -2519,6 +2524,7 @@ mod tests {
                 assert!(budget <= WORK_BUDGET);
                 assert_eq!(Rc::strong_count(&self.local), 1);
                 if self.factory.stop_on_poll {
+                    self.reporter.as_ref().unwrap().request_stop();
                     Err(Error::Cancelled)
                 } else {
                     Ok(())

@@ -183,7 +183,7 @@ impl<E> Park<E> for ThreadPark {
     }
 }
 
-/// Error-only group capability: cannot advance phases or authorize resource release.
+/// Failure and stop capability: cannot advance phases or authorize resource release.
 #[derive(Clone)]
 pub struct FailureReporter<E: Copy> {
     control: Arc<Control<E>>,
@@ -193,6 +193,12 @@ impl<E: Copy + PartialEq + From<Error>> FailureReporter<E> {
     /// Record the first failure and request that every lane stop admission.
     pub fn report(&self, error: E) {
         self.control.fail(error);
+    }
+
+    /// Request a clean stop ([`StopReason::Requested`]). A service then
+    /// returning `Error::Cancelled` stops the group without failing it.
+    pub fn request_stop(&self) {
+        self.control.request_stop(StopReason::Requested);
     }
 }
 
@@ -588,15 +594,24 @@ impl<E: Copy + PartialEq + From<Error>> Control<E> {
 
     /// Retain the first error and notify all threads to begin draining.
     ///
-    /// `Error::Cancelled` is a stop request, not a failure: it is recorded as
-    /// [`StopReason::Requested`], so drain, checkpoint, or fence errors during
-    /// a stop are still reported instead of a clean exit.
+    /// `Error::Cancelled` is the echo of a stop, not a failure, but only when
+    /// a real stop exists: one already recorded in the group or the raised
+    /// process stop signal (recorded as [`StopReason::Signal`]). A stray
+    /// `Cancelled` with no stop behind it is a failure, so the process exits
+    /// nonzero instead of reporting a clean stop. Drain, checkpoint, or fence
+    /// errors during a stop are still reported.
     fn fail(&self, error: E) {
-        if error == E::from(Error::Cancelled) {
-            self.request_stop(StopReason::Requested);
-            return;
-        }
         let mut state = self.lock();
+        if error == E::from(Error::Cancelled) {
+            if state.stop.is_some() {
+                return;
+            }
+            if racer_io::signal::stop_raised() {
+                drop(state);
+                self.request_stop(StopReason::Signal);
+                return;
+            }
+        }
         state.error.get_or_insert(error);
         state.phase = state.phase.max(Phase::Drain);
         self.stopping.store(true, Ordering::Release);

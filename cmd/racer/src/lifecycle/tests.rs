@@ -99,6 +99,7 @@ fn service_owner_requires_both_fences_and_explicit_release() {
             owner: Rc::new(thread::current().id()),
             stop: Arc::default(),
             drain_error: None,
+            reporter: None,
         }));
         let control = Control::new(1, usize::from(helper), true);
         let waker = racer_io::exec::thread_waker();
@@ -141,12 +142,13 @@ fn service_owner_requires_both_fences_and_explicit_release() {
     }
 }
 
-/// A requested stop (`Cancelled`) is not a failure: it records a stop reason
-/// and leaves the result clean, while real failures before or after it are
-/// reported and the first one is kept.
+/// A requested stop is not a failure: it records a stop reason and leaves the
+/// result clean, the `Cancelled` echo of that stop is absorbed, and real
+/// failures before or after it are reported and the first one is kept.
 #[test]
 fn stop_is_not_an_error_but_later_failures_are_kept() {
     let control = Control::<Error>::new(1, 0, false);
+    control.request_stop(StopReason::Requested);
     control.fail(Error::Cancelled);
     assert_eq!(control.result(), Ok(()));
     assert_eq!(control.stop_reason(), Some(StopReason::Requested));
@@ -161,9 +163,22 @@ fn stop_is_not_an_error_but_later_failures_are_kept() {
 
     let control = Control::<Error>::new(1, 0, false);
     control.fail(Error::DeadlineExceeded);
+    control.request_stop(StopReason::Requested);
     control.fail(Error::Cancelled);
     assert_eq!(control.result(), Err(Error::DeadlineExceeded));
     assert_eq!(control.stop_reason(), Some(StopReason::Requested));
+}
+
+/// A `Cancelled` with no stop behind it (none recorded, no stop signal) is a
+/// failure, not a clean stop, so the process exits nonzero.
+#[test]
+fn cancelled_without_a_stop_is_a_failure() {
+    assert!(!racer_io::signal::stop_raised());
+    let control = Control::<Error>::new(1, 0, false);
+    control.fail(Error::Cancelled);
+    assert_eq!(control.result(), Err(Error::Cancelled));
+    assert_eq!(control.stop_reason(), None);
+    assert_eq!(control.lock().interrupted(), Some(Error::Cancelled));
 }
 
 /// Failed fences and incomplete ownership stages abort before service destruction.
@@ -419,6 +434,8 @@ struct Local {
     stop: Arc<AtomicBool>,
 
     drain_error: Option<Error>,
+
+    reporter: Option<FailureReporter<Error>>,
 }
 
 impl Factory<TestScope> for Recipe {
@@ -433,6 +450,7 @@ impl Factory<TestScope> for Recipe {
             owner: Rc::new(thread::current().id()),
             stop: self.stop.clone(),
             drain_error: self.drain_error,
+            reporter: None,
         }))
     }
 
@@ -451,6 +469,11 @@ impl Drop for Local {
 }
 
 impl Service<TestScope> for Local {
+    /// Keep the capability used to request an explicit stop.
+    fn set_failure_reporter(&mut self, reporter: FailureReporter<Error>) {
+        self.reporter = Some(reporter);
+    }
+
     /// Record startup when its future is driven.
     fn start<'a>(&'a mut self, _: &'a TestScope) -> Operation<'a, ()> {
         Box::pin(async {
@@ -463,6 +486,7 @@ impl Service<TestScope> for Local {
     fn poll_budgeted(&mut self, _: &mut Context<'_>, budget: usize) -> Result<()> {
         assert_eq!(budget, 64);
         if self.stop.load(Ordering::SeqCst) {
+            self.reporter.as_ref().unwrap().request_stop();
             Err(Error::Cancelled)
         } else {
             Ok(())
