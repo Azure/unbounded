@@ -152,8 +152,16 @@ bootstrap token, and removes its staged files; the next agent to run on the
 host reports it too. A change still `InProgress` after two hours shows as
 `ChangeStale`.
 
-A failed change is not retried on its own: the node keeps the mode it had and
-the next repave tries again. Removing the annotation after the change stops
+A change that fails before the reset is not retried on its own: the node keeps
+the mode it had and the next repave tries again.
+
+The target's artifacts are downloaded by the bootstrap, after the reset, not
+before it. The check in step 2 confirms the configuration resolves, but not
+that its download sources are reachable. If they stay unreachable until the
+service gives up, the host is left reset with no node stack: fix the download
+sources (`spec.agent.downloads` or the offline bundle) and bootstrap the host
+again. Check that the target mode's download sources work before you start a
+reprovision. Removing the annotation after the change stops
 later changes from resetting the host.
 
 ## Drift
