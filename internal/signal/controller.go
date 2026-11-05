@@ -488,6 +488,10 @@ func (r *AdmissionReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&corev1.Node{}, builder.WithPredicates(predicate.LabelChangedPredicate{})).
 		Watches(
+			&signalv1.CertificationProfile{},
+			handler.EnqueueRequestsFromMapFunc(r.requestsForProfile),
+		).
+		Watches(
 			&signalv1.CertificationSuite{},
 			handler.EnqueueRequestsFromMapFunc(r.requestsForSuite),
 		).
@@ -506,6 +510,34 @@ func profileSuiteIndex(object client.Object) []string {
 	}
 
 	return []string{profile.Spec.Suite.Name}
+}
+
+func (r *AdmissionReconciler) requestsForProfile(
+	ctx context.Context,
+	object client.Object,
+) []ctrl.Request {
+	profile, ok := object.(*signalv1.CertificationProfile)
+	if !ok {
+		return nil
+	}
+
+	var nodes corev1.NodeList
+	if err := r.List(ctx, &nodes); err != nil {
+		log.FromContext(ctx).Error(err, "failed to list Nodes requesting Profile", "profile", profile.Name)
+
+		return nil
+	}
+
+	requests := make([]ctrl.Request, 0)
+
+	for index := range nodes.Items {
+		node := &nodes.Items[index]
+		if node.Labels[RequestLabel] == profile.Name {
+			requests = append(requests, ctrl.Request{NamespacedName: client.ObjectKey{Name: node.Name}})
+		}
+	}
+
+	return requests
 }
 
 func (r *AdmissionReconciler) requestsForSuite(ctx context.Context, object client.Object) []ctrl.Request {

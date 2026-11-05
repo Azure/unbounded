@@ -101,6 +101,10 @@ SIGNAL_ADAPTER_IMAGE ?= example.invalid/project-signal-adapter@sha256:0000000000
 SIGNAL_ADAPTER_BUILD_IMAGE ?= example.invalid/project-signal-adapter:replace-me
 SIGNAL_CERTIFICATION_RUNNER_IMAGE ?= example.invalid/project-signal-runner@sha256:0000000000000000000000000000000000000000000000000000000000000000
 SIGNAL_NAMESPACE ?= project-signal
+SIGNAL_SCRIPT_NAMESPACE ?= $(SIGNAL_NAMESPACE)
+SIGNAL_QUALIFICATION_GATE_PROTECTED ?= false
+SIGNAL_QUALIFICATION_GATE_GUARD ?=
+SIGNAL_WORKFLOW_TEMPLATE_DIGEST ?=
 SIGNAL_MANIFEST_TEMPLATES_DIR := deploy/signal
 SIGNAL_MANIFEST_RENDERED_DIR := deploy/signal/rendered
 
@@ -1237,18 +1241,67 @@ machine-ops-manifests: ## Render machine-ops-controller manifests into deploy/ma
 	@echo "Rendered machine-ops manifests into $(MACHINE_OPS_MANIFEST_RENDERED_DIR) (image: $(MACHINE_OPS_CONTROLLER_IMAGE))"
 
 signal-manifests: ## Render Project Signal manifests into deploy/signal/rendered
-	@mkdir -p $(SIGNAL_MANIFEST_RENDERED_DIR)/crd
-	@find $(SIGNAL_MANIFEST_RENDERED_DIR) -mindepth 1 -not -name .gitignore -delete
+	@set -eu; \
+	case "$(SIGNAL_QUALIFICATION_GATE_PROTECTED)" in \
+		true|false) ;; \
+		*) echo "SIGNAL_QUALIFICATION_GATE_PROTECTED must be true or false" >&2; exit 1 ;; \
+	esac; \
+	if [ "$(SIGNAL_QUALIFICATION_GATE_PROTECTED)" = true ] && \
+		[ "$(SIGNAL_QUALIFICATION_GATE_GUARD)" != node-authorizer-node-restriction-rbac-verified ]; then \
+		echo "enabling the protected qualification gate requires SIGNAL_QUALIFICATION_GATE_GUARD=node-authorizer-node-restriction-rbac-verified" >&2; \
+		exit 1; \
+	fi; \
+	mkdir -p tmp; \
+	temp_dir="$$(mktemp -d tmp/signal-manifests.XXXXXX)"; \
+	trap 'rm -rf "$$temp_dir"' EXIT; \
+	$(GOCMD) run ./hack/cmd/render-manifests \
+		--templates-dir $(SIGNAL_MANIFEST_TEMPLATES_DIR) \
+		--output-dir "$$temp_dir" \
+		--set Namespace=$(SIGNAL_NAMESPACE) \
+		--set ScriptNamespace=$(SIGNAL_SCRIPT_NAMESPACE) \
+		--set ControllerImage=$(SIGNAL_CONTROLLER_IMAGE) \
+		--set AdapterImage=$(SIGNAL_ADAPTER_IMAGE) \
+		--set RunnerImage=$(SIGNAL_CERTIFICATION_RUNNER_IMAGE) \
+		--set WorkflowTemplateDigest=sha256:0000000000000000000000000000000000000000000000000000000000000000 \
+		--set QualificationGateProtected=$(SIGNAL_QUALIFICATION_GATE_PROTECTED) \
+		--set QualificationGateGuard=$(SIGNAL_QUALIFICATION_GATE_GUARD); \
+	workflow_template="$$temp_dir/04-adapter-workflowtemplate.yaml"; \
+	if command -v sha256sum >/dev/null 2>&1; then \
+		workflow_hash="$$(sha256sum "$$workflow_template" | awk '{print $$1}')"; \
+	elif command -v shasum >/dev/null 2>&1; then \
+		workflow_hash="$$(shasum -a 256 "$$workflow_template" | awk '{print $$1}')"; \
+	elif command -v openssl >/dev/null 2>&1; then \
+		workflow_hash="$$(openssl dgst -sha256 "$$workflow_template" | awk '{print $$NF}')"; \
+	else \
+		echo "sha256sum, shasum, or openssl is required to digest the WorkflowTemplate" >&2; \
+		exit 1; \
+	fi; \
+	workflow_digest="sha256:$$workflow_hash"; \
+	if ! printf '%s\n' "$$workflow_digest" | grep -Eq '^sha256:[0-9a-f]{64}$$'; then \
+		echo "computed WorkflowTemplate digest is invalid: $$workflow_digest" >&2; \
+		exit 1; \
+	fi; \
+	if [ -n "$(SIGNAL_WORKFLOW_TEMPLATE_DIGEST)" ] && \
+		[ "$(SIGNAL_WORKFLOW_TEMPLATE_DIGEST)" != "$$workflow_digest" ]; then \
+		echo "WorkflowTemplate digest mismatch: expected $(SIGNAL_WORKFLOW_TEMPLATE_DIGEST), rendered $$workflow_digest" >&2; \
+		exit 1; \
+	fi; \
+	mkdir -p $(SIGNAL_MANIFEST_RENDERED_DIR)/crd; \
+	find $(SIGNAL_MANIFEST_RENDERED_DIR) -mindepth 1 -not -name .gitignore -delete; \
 	$(GOCMD) run ./hack/cmd/render-manifests \
 		--templates-dir $(SIGNAL_MANIFEST_TEMPLATES_DIR) \
 		--output-dir $(SIGNAL_MANIFEST_RENDERED_DIR) \
 		--set Namespace=$(SIGNAL_NAMESPACE) \
+		--set ScriptNamespace=$(SIGNAL_SCRIPT_NAMESPACE) \
 		--set ControllerImage=$(SIGNAL_CONTROLLER_IMAGE) \
 		--set AdapterImage=$(SIGNAL_ADAPTER_IMAGE) \
-		--set RunnerImage=$(SIGNAL_CERTIFICATION_RUNNER_IMAGE)
-	@mkdir -p $(SIGNAL_MANIFEST_RENDERED_DIR)/crd
-	@cp $(SIGNAL_MANIFEST_TEMPLATES_DIR)/crd/*.yaml $(SIGNAL_MANIFEST_RENDERED_DIR)/crd/
-	@echo "Rendered Project Signal manifests into $(SIGNAL_MANIFEST_RENDERED_DIR) (image: $(SIGNAL_CONTROLLER_IMAGE))"
+		--set RunnerImage=$(SIGNAL_CERTIFICATION_RUNNER_IMAGE) \
+		--set WorkflowTemplateDigest="$$workflow_digest" \
+		--set QualificationGateProtected=$(SIGNAL_QUALIFICATION_GATE_PROTECTED) \
+		--set QualificationGateGuard=$(SIGNAL_QUALIFICATION_GATE_GUARD); \
+	mkdir -p $(SIGNAL_MANIFEST_RENDERED_DIR)/crd; \
+	cp $(SIGNAL_MANIFEST_TEMPLATES_DIR)/crd/*.yaml $(SIGNAL_MANIFEST_RENDERED_DIR)/crd/; \
+	echo "Rendered Project Signal manifests into $(SIGNAL_MANIFEST_RENDERED_DIR) (controller: $(SIGNAL_CONTROLLER_IMAGE), workflow: $$workflow_digest)"
 
 playpen-manifests: ## Render playpen operator and runner manifests into deploy/playpen/rendered
 	@mkdir -p $(PLAYPEN_MANIFEST_RENDERED_DIR)

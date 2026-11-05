@@ -1419,6 +1419,44 @@ func TestSuiteWatchRequestsProfileNodes(t *testing.T) {
 	}
 }
 
+func TestProfileWatchRequestsProfileNodes(t *testing.T) {
+	t.Parallel()
+
+	scheme := runtime.NewScheme()
+	if err := corev1.AddToScheme(scheme); err != nil {
+		t.Fatalf("add core scheme: %v", err)
+	}
+
+	if err := signalv1.AddToScheme(scheme); err != nil {
+		t.Fatalf("add signal scheme: %v", err)
+	}
+
+	profile := &signalv1.CertificationProfile{ObjectMeta: metav1.ObjectMeta{Name: "profile-a"}}
+	node := &corev1.Node{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:   "node-a",
+			Labels: map[string]string{RequestLabel: profile.Name},
+		},
+	}
+	otherNode := &corev1.Node{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:   "node-b",
+			Labels: map[string]string{RequestLabel: "profile-b"},
+		},
+	}
+
+	kube := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(node, otherNode).
+		Build()
+	reconciler := &AdmissionReconciler{Client: kube}
+
+	requests := reconciler.requestsForProfile(context.Background(), profile)
+	if len(requests) != 1 || requests[0].Name != node.Name {
+		t.Fatalf("requestsForProfile() = %#v, want Node %s", requests, node.Name)
+	}
+}
+
 func TestSuiteSnapshotAndRunPinning(t *testing.T) {
 	t.Parallel()
 

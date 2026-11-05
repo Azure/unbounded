@@ -2,11 +2,33 @@
 {{- if not (regexMatch "^[^@[:space:]]+@sha256:[0-9a-f]{64}$" $controllerImage) }}
 {{- fail "ControllerImage must be an immutable sha256 digest reference" }}
 {{- end }}
+{{- $adapterImage := default "example.invalid/project-signal-adapter@sha256:0000000000000000000000000000000000000000000000000000000000000000" .AdapterImage }}
+{{- if not (regexMatch "^[^@[:space:]]+@sha256:[0-9a-f]{64}$" $adapterImage) }}
+{{- fail "AdapterImage must be an immutable sha256 digest reference" }}
+{{- end }}
+{{- $runnerImage := default "example.invalid/project-signal-runner@sha256:0000000000000000000000000000000000000000000000000000000000000000" .RunnerImage }}
+{{- if not (regexMatch "^[^@[:space:]]+@sha256:[0-9a-f]{64}$" $runnerImage) }}
+{{- fail "RunnerImage must be an immutable sha256 digest reference" }}
+{{- end }}
+{{- $workflowTemplateDigest := .WorkflowTemplateDigest }}
+{{- if not (regexMatch "^sha256:[0-9a-f]{64}$" $workflowTemplateDigest) }}
+{{- fail "WorkflowTemplateDigest must be an algorithm-qualified sha256 digest" }}
+{{- end }}
+{{- $qualificationGateProtected := default "false" .QualificationGateProtected }}
+{{- if not (regexMatch "^(true|false)$" $qualificationGateProtected) }}
+{{- fail "QualificationGateProtected must be true or false" }}
+{{- end }}
+{{- if and (eq $qualificationGateProtected "true") (ne .QualificationGateGuard "node-authorizer-node-restriction-rbac-verified") }}
+{{- fail "QualificationGateProtected requires an explicit Node authorizer, NodeRestriction, and restrictive Node-patch RBAC guard" }}
+{{- end }}
 apiVersion: apps/v1
 kind: Deployment
 metadata:
   name: project-signal-controller
   namespace: {{ default "project-signal" .Namespace }}
+  annotations:
+    signal.unbounded-cloud.io/qualification-gate-protected: {{ $qualificationGateProtected | quote }}
+    signal.unbounded-cloud.io/qualification-gate-guard: {{ ternary "operator-verified" "disabled" (eq $qualificationGateProtected "true") | quote }}
   labels:
     app.kubernetes.io/name: project-signal-controller
     app.kubernetes.io/part-of: project-signal
@@ -37,7 +59,11 @@ spec:
           args:
             - --namespace={{ default "project-signal" .Namespace }}
             - --script-namespace={{ default (default "project-signal" .Namespace) .ScriptNamespace }}
-            - --runner-image={{ default "example.invalid/project-signal-runner@sha256:0000000000000000000000000000000000000000000000000000000000000000" .RunnerImage }}
+            - --runner-image={{ $runnerImage }}
+            - --controller-image={{ $controllerImage }}
+            - --adapter-image={{ $adapterImage }}
+            - --workflow-template-digest={{ $workflowTemplateDigest }}
+            - --qualification-gate-protected={{ $qualificationGateProtected }}
             - --leader-elect=true
             - --max-concurrent-runs=4
             - --metrics-bind-address=:8080
