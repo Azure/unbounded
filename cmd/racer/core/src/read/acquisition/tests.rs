@@ -423,8 +423,56 @@ fn origin_without_budget_fails_before_fetching() {
         rank0: Rank0State::Unknown,
     });
     assert_eq!(kinds(&effects), ["Done"]);
-    assert!(h.done().result.is_err());
+    // The authority ranking itself refuses a read past its deadline.
+    assert_eq!(h.done().result, Err(Error::DeadlineExceeded));
+    assert_eq!(h.done().phase, Phase::Walk);
+}
+
+#[test]
+fn origin_without_attempts_fails_before_fetching() {
+    let mut h = Harness::with(false, Features::PRODUCTION, 0, 16);
+    owner_to_hints(&mut h, 0);
+    let id = h.id();
+    let effects = h.act(Input::Hints {
+        id,
+        hints: vec![],
+        rank0: Rank0State::Unknown,
+    });
+    assert_eq!(kinds(&effects), ["Done"]);
+    assert_eq!(h.done().result, Err(Error::Unavailable));
     assert_eq!(h.done().phase, Phase::Origin);
+}
+
+#[test]
+fn a_walk_only_origin_leaves_the_attempt_to_its_caller() {
+    let mut h = Harness::with(false, Features::PRODUCTION, 0, 16);
+    h.acq = PageAcquisition::new(
+        FillConfig {
+            operation: OperationKind::Page,
+            hedge: false,
+            walk_only: true,
+            scope: h.now + Duration::from_secs(60),
+            features: Features::PRODUCTION,
+        },
+        "initial",
+        h.now,
+    );
+    owner_to_hints(&mut h, 0);
+    let id = h.id();
+    let effects = h.act(Input::Hints {
+        id,
+        hints: vec![],
+        rank0: Rank0State::Unknown,
+    });
+    assert_eq!(kinds(&effects), ["Origin"]);
+    assert_eq!(h.budget.remaining_attempts(), 0);
+}
+
+#[test]
+fn done_carries_the_final_notes() {
+    let mut h = Harness::new(false);
+    exhaust(&mut h);
+    assert_ne!(h.done().notes & Notes::EXHAUSTED, 0);
 }
 
 #[test]

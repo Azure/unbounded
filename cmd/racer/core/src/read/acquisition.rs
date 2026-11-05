@@ -248,6 +248,8 @@ pub struct Done {
     /// The last walk could not fund a probe.
     pub funding: bool,
     pub remaining: Option<RemainingEnd>,
+    /// The final step's evidence notes ([`Notes`]).
+    pub notes: u16,
 }
 
 /// One completion or external event.
@@ -390,6 +392,7 @@ pub struct PageAcquisition<R, M, A> {
     authority: Option<Authority>,
     /// The interpreter holds an acquired page.
     copy: bool,
+    walk_only: bool,
     pending: Option<(EffectId, Pending)>,
     started: bool,
     done: Option<Done>,
@@ -413,6 +416,7 @@ impl<R: Clone, M, A> PageAcquisition<R, M, A> {
             phase: Phase::Walk,
             authority: None,
             copy: false,
+            walk_only: config.walk_only,
             pending: None,
             started: false,
             done: None,
@@ -648,6 +652,10 @@ impl<R: Clone, M, A> PageAcquisition<R, M, A> {
                         out.push(Effect::Rank { id, ranking, basis });
                         return;
                     }
+                    // The authority ranking needs no IO, but not past the read's deadline.
+                    Ok(None) if now >= budget.deadline() => {
+                        Event::Ranked(Err(Error::DeadlineExceeded))
+                    }
                     Ok(None) => Event::Ranked(Ok(self.authority_ranking())),
                     Err(error) => Event::Ranked(Err(error)),
                 },
@@ -733,7 +741,11 @@ impl<R: Clone, M, A> PageAcquisition<R, M, A> {
                     };
                     self.phase = Phase::Origin;
                     self.authority = Some(authority);
-                    if let Err(error) = budget.begin_attempt(now, self.scope) {
+                    // A walk-only acquisition hands the authority to its caller, who funds the
+                    // origin attempt.
+                    if !self.walk_only
+                        && let Err(error) = budget.begin_attempt(now, self.scope)
+                    {
                         self.finish(Err(error), evidence, budget, now, out);
                         return;
                     }
@@ -840,6 +852,7 @@ impl<R: Clone, M, A> PageAcquisition<R, M, A> {
             exhausted,
             funding: self.fill.funding,
             remaining: self.fill.remaining_end,
+            notes: evidence.notes,
         };
         self.pending = None;
         self.done = Some(done);
