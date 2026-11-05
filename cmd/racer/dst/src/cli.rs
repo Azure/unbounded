@@ -26,12 +26,30 @@ pub const USAGE: &str = "usage: racer-dst [--scenario NAME] [--nodes N] [--seed 
 [--duration D] [--config FILE.json] [--out PATH]\n\
 scenarios: enrollment-storm, failover, ctl-churn, lagging,\n\
            full-cold-start, full-failover, full-churn, full-lagging,\n\
+           racer-sim's storm, churn, faults, smoke, caches-only, zipf and empty,\n\
            or any racer-dst catalog scenario name\n\
 durations: integer with ns, us, ms or s suffix (plain numbers are seconds)\n\
 without arguments racer-dst runs its seed set (DST_SEEDS, DST_STEPS, DST_FILTER)";
 
 /// racer-sim control plans.
 pub const CONTROL: &[&str] = &["enrollment-storm", "failover", "ctl-churn", "lagging"];
+
+/// racer-sim's other scenario names and the racer-dst scenario each runs (`dst/MODEL.md`,
+/// Command line). `storm` is [`scenarios::cold_start`] at `--nodes`; racer-sim's Poisson node
+/// scenarios (`smoke`, `caches-only`, `zipf`) run the combined Zipf load, and `empty` runs it
+/// with no reads.
+pub const SIM_ALIASES: &[(&str, &str)] = &[
+    ("storm", "storm"),
+    ("churn", "model-membership-churn"),
+    ("faults", "model-faults"),
+    ("smoke", "full-cold-start"),
+    ("caches-only", "full-cold-start"),
+    ("zipf", "full-cold-start"),
+    ("empty", "full-cold-start"),
+];
+
+/// racer-sim's topology-only scenarios, now `topology/tests/mesh_scenarios.rs`.
+pub const MESH: &[&str] = &["mesh", "mesh-selector"];
 
 /// racer-sim combined scenarios.
 pub const COMBINED: &[&str] = &[
@@ -156,7 +174,15 @@ impl Options {
                 _ => return Err(format!("unknown argument {arg:?}")),
             }
         }
+        if MESH.contains(&options.scenario.as_str()) {
+            return Err(format!(
+                "scenario {:?} measures topology only; run `cargo test -p topology --test \
+                 mesh_scenarios`",
+                options.scenario
+            ));
+        }
         let known = CONTROL.contains(&options.scenario.as_str())
+            || SIM_ALIASES.iter().any(|(n, _)| *n == options.scenario)
             || COMBINED.contains(&options.scenario.as_str())
             || scenarios::find(&options.scenario).is_some();
         if !known {
@@ -295,11 +321,24 @@ impl Config {
 
 /// Build the scenario `options` names with `config` applied.
 fn build(options: &Options, config: &Config) -> Result<Scenario, String> {
-    let name = options.scenario.as_str();
+    let sim_name = options.scenario.as_str();
+    let name = SIM_ALIASES
+        .iter()
+        .find(|(n, _)| *n == sim_name)
+        .map_or(sim_name, |(_, to)| to);
     let nodes = options.nodes.or(config.nodes);
     let duration = options.duration.or(config.duration);
-    let rate = config.request_rate;
-    let mut scenario = if COMBINED.contains(&name) {
+    let rate = match sim_name {
+        "empty" => Some(config.request_rate.unwrap_or(0.0)),
+        _ => config.request_rate,
+    };
+    let mut scenario = if name == "storm" {
+        let mut scenario = scenarios::cold_start(nodes.unwrap_or(16));
+        if let Some(d) = duration {
+            scenario = scenario.end(d);
+        }
+        scenario
+    } else if COMBINED.contains(&name) {
         // racer-sim `data_defaults`: 0.02 reads per node per second; its `Config::default`
         // has 16 nodes.
         let secs = duration.map(|d| d.div_ceil(SECONDS));
@@ -515,5 +554,33 @@ mod tests {
             ..o
         };
         assert!(run(&missing).is_err());
+    }
+
+    /// Every racer-sim `--scenario` name (`sim/src/lib.rs` `USAGE`) runs and reports under its
+    /// own name, except the topology-only mesh scenarios, which point at the topology tests.
+    #[test]
+    fn every_racer_sim_scenario_name_runs() {
+        let names = CONTROL
+            .iter()
+            .chain(COMBINED)
+            .chain(SIM_ALIASES.iter().map(|(n, _)| n));
+        for name in names {
+            let catalog = matches!(*name, "churn" | "faults");
+            let o = Options {
+                scenario: (*name).into(),
+                nodes: (!catalog).then_some(8),
+                duration: Some(20 * SECONDS),
+                ..Options::default()
+            };
+            let parsed = Options::parse(&args(&["--scenario", name])).unwrap();
+            assert_eq!(parsed.scenario, *name);
+            let (r, _) = run(&o).unwrap_or_else(|e| panic!("{name}: {e}"));
+            assert_eq!(r["scenario"], *name);
+            assert!(r["dst_scenario"].is_string(), "{name}");
+        }
+        for name in MESH {
+            let error = Options::parse(&args(&["--scenario", name])).unwrap_err();
+            assert!(error.contains("mesh_scenarios"), "{error}");
+        }
     }
 }
