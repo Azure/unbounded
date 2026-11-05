@@ -31,7 +31,7 @@ This document describes the custom resource definitions shipped with machina: **
 
 | Property | Type | Required | Description |
 |----------|------|----------|-------------|
-| `spec.isolation` | string | No | Where the node stack (containerd, kubelet, CNI, CoreDNS) runs on the host. Empty or `nspawn`, the only mode in this release. Empty declares nothing: a node keeps the mode it runs, and a new node uses `nspawn`. Passed to the agent config as `Isolation`. The agent never writes this field on an existing Machine; it sets it only when it creates the Machine at self-registration. |
+| `spec.isolation` | string | No | Where the node stack (containerd, kubelet, CNI, CoreDNS) runs on the host. `nspawn` or `none`. Empty declares nothing: a node keeps the mode it runs, and a new node uses `nspawn`. Passed to the agent config as `Isolation`. The agent never writes this field on an existing Machine; it sets it only when it creates the Machine at self-registration. |
 
 A change takes effect at the node's next repave. A change that needs a
 reprovision also needs the annotation `unbounded-cloud.io/allow-reprovision:
