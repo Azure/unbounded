@@ -732,6 +732,7 @@ mod destination_disconnect {
             let flights = Rc::new(Flights::new(
                 admission.clone(),
                 crate::test_support::availability_for(vec![CacheId(CACHE.into())]),
+                crate::test_support::clock(),
             ));
             let service = Rc::new(PendingPage {
                 flights: flights.clone(),

@@ -53,6 +53,9 @@ pub struct Flights {
     admission_deadlines: Rc<uring_runtime::environment::Registry>,
 
     capacity_wake: CapacityWake,
+
+    /// Flight ages, budget gates, and driver diagnostics.
+    clock: racer_io::Clock,
 }
 
 /// The current FIFO head alone owns this notification.
@@ -115,6 +118,9 @@ pub(super) type Table = coalesce::flight::Table<PageId, Entry, FlightHashState>;
 pub(super) struct Entry {
     created: Instant,
 
+    /// The owning flights' clock.
+    clock: racer_io::Clock,
+
     diagnostic: Option<DriverDiagnostic>,
 
     fence: Fence,
@@ -155,7 +161,7 @@ pub(crate) enum DriverStage {
 
 /// One generation's scalar observation, allocated once at driver handoff.
 #[derive(Clone)]
-pub(super) struct DriverDiagnostic(Rc<std::cell::Cell<DriverObservation>>);
+pub(super) struct DriverDiagnostic(Rc<std::cell::Cell<DriverObservation>>, racer_io::Clock);
 
 /// Facts observed by this driver only, never inferred from lifecycle state.
 #[derive(Clone, Copy)]
@@ -204,7 +210,7 @@ impl DriverDiagnostic {
     pub(super) fn set(&self, stage: DriverStage) {
         let mut state = self.0.get();
         state.stage = stage;
-        state.since = uring_runtime::environment::now();
+        state.since = self.1.now();
         self.0.set(state);
     }
 
@@ -220,9 +226,7 @@ impl DriverDiagnostic {
     /// Latch the first observed request to cancel this driver's owned scope.
     pub(super) fn cancellation_seen(&self) {
         let mut state = self.0.get();
-        state
-            .cancel_seen
-            .get_or_insert_with(uring_runtime::environment::now);
+        state.cancel_seen.get_or_insert_with(|| self.1.now());
         self.0.set(state);
     }
 
@@ -253,8 +257,7 @@ impl coalesce::flight::state::WaiterPolicy for WaiterRecord {
     type Error = Error;
     fn check(&self) -> Option<Error> {
         self.scope.check().err().or_else(|| {
-            (uring_runtime::environment::now() >= self.budget_deadline)
-                .then_some(Error::DeadlineExceeded)
+            (self.scope.clock().now() >= self.budget_deadline).then_some(Error::DeadlineExceeded)
         })
     }
     fn deadline(&self) -> Instant {
@@ -541,7 +544,7 @@ impl AcquisitionWaiter<'_> {
                     self.budget.deadline(),
                     self.budget.remaining_attempts(),
                     idle,
-                    uring_runtime::environment::now,
+                    || flights.clock.now(),
                     split_result,
                     wakes,
                     |slot| {
@@ -640,12 +643,15 @@ impl CopyWaiter<'_> {
 impl Flights {
     /// Attach a fresh generation without refreshing state or touching wake ownership.
     pub(super) fn driver_diagnostic(&self, leader: &FlightLeader) -> Option<DriverDiagnostic> {
-        let diagnostic = DriverDiagnostic(Rc::new(std::cell::Cell::new(DriverObservation {
-            stage: DriverStage::Starting,
-            since: uring_runtime::environment::now(),
-            cancel_seen: None,
-            abandoned: false,
-        })));
+        let diagnostic = DriverDiagnostic(
+            Rc::new(std::cell::Cell::new(DriverObservation {
+                stage: DriverStage::Starting,
+                since: self.clock.now(),
+                cancel_seen: None,
+                abandoned: false,
+            })),
+            self.clock.clone(),
+        );
         let mut table = self.table.borrow_mut();
         let entry = table.get_mut(&leader.fence.page)?;
         validate_leader(entry, leader).ok()?;
@@ -656,6 +662,7 @@ impl Flights {
     pub fn new(
         admission: Rc<flow_control::Quotas<AdmissionPolicy>>,
         availability: Rc<crate::control::Availability>,
+        clock: racer_io::Clock,
     ) -> Self {
         let limits = FlightLimits {
             entries: admission.policy().limits().flights.get(),
@@ -674,6 +681,7 @@ impl Flights {
             ),
             admission_deadlines: Rc::default(),
             capacity_wake: Rc::default(),
+            clock,
         }
     }
 
@@ -681,6 +689,7 @@ impl Flights {
         admission: Rc<flow_control::Quotas<AdmissionPolicy>>,
         availability: Rc<crate::control::Availability>,
         limits: FlightLimits,
+        clock: racer_io::Clock,
     ) -> Result<Self> {
         if limits.entries == 0
             || limits.waiters_per_flight == 0
@@ -700,6 +709,7 @@ impl Flights {
             ),
             admission_deadlines: Rc::default(),
             capacity_wake: Rc::default(),
+            clock,
         })
     }
 
@@ -786,7 +796,7 @@ impl Flights {
             return Err(Error::Cancelled);
         }
         if !self.table.borrow().contains_key(&page) {
-            if uring_runtime::environment::now() >= budget.deadline() {
+            if self.clock.now() >= budget.deadline() {
                 return Err(Error::DeadlineExceeded);
             }
             if budget.remaining_attempts() == 0 {
@@ -859,7 +869,7 @@ impl Flights {
                 }
             }
             flight::join_budget_gate(
-                uring_runtime::environment::now(),
+                self.clock.now(),
                 budget.deadline(),
                 budget.remaining_attempts(),
                 table.get(&page).is_some_and(|e| e.partial.is_some()),
@@ -908,7 +918,8 @@ impl Flights {
                 if let Err(owned) = table.insert(
                     page.clone(),
                     Entry {
-                        created: uring_runtime::environment::now(),
+                        created: self.clock.now(),
+                        clock: self.clock.clone(),
                         diagnostic: None,
                         fence: Fence {
                             page: page.clone(),
@@ -991,7 +1002,7 @@ impl Flights {
             return Err(Error::Cancelled);
         }
         self.admit_join(&page, None)?;
-        if uring_runtime::environment::now() >= budget.deadline() {
+        if self.clock.now() >= budget.deadline() {
             return Err(Error::DeadlineExceeded);
         }
         if budget.remaining_attempts() == 0 {
@@ -1006,7 +1017,7 @@ impl Flights {
         {
             return self.join(page, membership, context, scope, budget);
         }
-        let cutoff = uring_runtime::environment::now() + std::time::Duration::from_millis(100);
+        let cutoff = self.clock.now() + std::time::Duration::from_millis(100);
         let deadline = cutoff.min(scope.deadline.0).min(budget.deadline());
         let (reservation, detail) = crate::admission::capture_rejection(&self.admission, || {
             self.admission
@@ -1044,7 +1055,7 @@ impl Flights {
                 };
                 return Poll::Ready(Err(error));
             }
-            let now = uring_runtime::environment::now();
+            let now = self.clock.now();
             if now >= budget.deadline() {
                 reason = crate::telemetry::WaitGate::BudgetDeadline;
                 return Poll::Ready(Err(Error::DeadlineExceeded));
@@ -1480,8 +1491,7 @@ impl Flights {
     /// worker must also poll at request deadlines to expire parked waiters.
     pub fn poll_with_context(&self, cx: &mut Context<'_>, work_budget: usize) -> Result<()> {
         uring_runtime::drivers::poll(cx, work_budget);
-        self.admission_deadlines
-            .poll(uring_runtime::environment::now(), work_budget);
+        self.admission_deadlines.poll(self.clock.now(), work_budget);
         self.sweep_budgeted(work_budget)
     }
 
@@ -1676,11 +1686,12 @@ fn revoke(entry: &mut Entry, error: Error, wakes: &mut Vec<Waker>) {
     settle(entry, wakes);
 }
 fn refresh(entry: &mut Entry, wakes: &mut Vec<Waker>) {
+    let clock = &entry.clock;
     entry.state.refresh(
         entry.operations.is_empty(),
         Error::Unavailable,
         Error::Cancelled,
-        uring_runtime::environment::now,
+        || clock.now(),
         split_result,
         wakes,
     );
@@ -1789,12 +1800,15 @@ mod admission_wake_tests {
         let clock = uring_runtime::environment::SimulationClock::new(920);
         let _environment = clock.environment(0).enter();
         let make = || {
-            DriverDiagnostic(Rc::new(std::cell::Cell::new(DriverObservation {
-                stage: DriverStage::Starting,
-                since: uring_runtime::environment::now(),
-                cancel_seen: None,
-                abandoned: false,
-            })))
+            DriverDiagnostic(
+                Rc::new(std::cell::Cell::new(DriverObservation {
+                    stage: DriverStage::Starting,
+                    since: uring_runtime::environment::now(),
+                    cancel_seen: None,
+                    abandoned: false,
+                })),
+                crate::test_support::clock(),
+            )
         };
         let old = make();
         for success in [false, true] {
@@ -1852,6 +1866,7 @@ mod admission_wake_tests {
         let flights = Rc::new(Flights::new(
             admission.clone(),
             crate::test_support::availability(),
+            crate::test_support::clock(),
         ));
         let page = crate::memory::tests::bundle_for(
             &admission,

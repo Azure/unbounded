@@ -569,6 +569,7 @@ mod flight {
                         entries: 1,
                         ..FlightLimits::default()
                     },
+                    crate::test_support::clock(),
                 )
                 .unwrap(),
             );
@@ -1769,6 +1770,7 @@ mod flight {
                 ))),
                 crate::test_support::availability(),
                 limits,
+                crate::test_support::clock(),
             )
             .unwrap(),
         )

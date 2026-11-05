@@ -1017,6 +1017,7 @@ fn metadata_coordinator_with_newer_publication(
             flights: Rc::new(crate::read::flight::Flights::new(
                 admission.clone(),
                 availability.clone(),
+                crate::test_support::clock(),
             )),
             crypto: Rc::new(PageCrypto::new(keys, Rc::new(CryptoClient::new(port)))),
             credentials: credentials.clone(),

@@ -1416,7 +1416,11 @@ impl WorkerApplication {
             adapter,
             Some(azure),
         ));
-        let flights = Rc::new(Flights::new(admission.clone(), availability.clone()));
+        let flights = Rc::new(Flights::new(
+            admission.clone(),
+            availability.clone(),
+            reactor.ctx().clock.clone(),
+        ));
         let (coordinator, metadata) = Self::assemble_reads(
             config,
             &node,

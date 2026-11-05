@@ -3466,7 +3466,11 @@ fn fixture_with_caches(
         )
         .unwrap(),
     );
-    let flights = Rc::new(Flights::new(admission.clone(), availability));
+    let flights = Rc::new(Flights::new(
+        admission.clone(),
+        availability,
+        crate::test_support::clock(),
+    ));
     let fill = Fill::new(FillDependencies {
         memory,
         buffers,

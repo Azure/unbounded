@@ -334,7 +334,11 @@ impl SubscriptionFixture {
             writer: writer.clone(),
             origin: origin.clone(),
             candidates: candidates.clone(),
-            flights: Rc::new(Flights::new(admission.clone(), availability.clone())),
+            flights: Rc::new(Flights::new(
+                admission.clone(),
+                availability.clone(),
+                racer_io::Clock::host(),
+            )),
             crypto: Rc::new(PageCrypto::new(keys, crypto.clone())),
             credentials: credentials.clone(),
             admission: admission.clone(),

@@ -592,7 +592,11 @@ impl Rig {
             published.clone(),
             keys.clone(),
         ));
-        let flights = Rc::new(Flights::new(admission.clone(), availability.clone()));
+        let flights = Rc::new(Flights::new(
+            admission.clone(),
+            availability.clone(),
+            racer_io::Clock::host(),
+        ));
         let fill = Rc::new(Fill::new(FillDependencies {
             memory: memory.clone(),
             buffers,

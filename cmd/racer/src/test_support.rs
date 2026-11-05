@@ -631,7 +631,11 @@ impl ReadWorker {
                 writer: writer.clone(),
                 origin: client.clone(),
                 candidates: candidates.clone(),
-                flights: Rc::new(Flights::new(admission.clone(), availability.clone())),
+                flights: Rc::new(Flights::new(
+                    admission.clone(),
+                    availability.clone(),
+                    crate::test_support::clock(),
+                )),
                 crypto: Rc::new(PageCrypto::new(keys, crypto.clone())),
                 credentials: credentials.clone(),
                 admission,
