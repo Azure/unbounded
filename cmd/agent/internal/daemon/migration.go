@@ -86,11 +86,14 @@ func (e *migrationEnv) resolveJournal(ctx context.Context, log *slog.Logger, j m
 }
 
 // preflightMigrationTarget checks the target mode's host requirements without
-// changing anything, before the first mutation.
-func preflightMigrationTarget(ctx context.Context, log *slog.Logger, mode isolation.Mode) error {
+// changing anything, before the first mutation. A reprovision bootstraps the
+// target, which installs what the mode needs, so the checks' warnings about
+// tools the bootstrap installs do not stop it; an in-place change installs
+// nothing, so they do.
+func preflightMigrationTarget(ctx context.Context, log *slog.Logger, mode isolation.Mode, strategy migrate.Strategy) error {
 	switch mode {
 	case isolation.ModeNSpawn:
-		return runMigrationPreflight(ctx, mode, []preflight.Checker{host.CheckNSpawnRuntime(log)})
+		return runMigrationPreflight(ctx, mode, strategy == migrate.InPlace, []preflight.Checker{host.CheckNSpawnRuntime(log)})
 	case isolation.ModeNone:
 		// The none backend's ownership check refuses a host that runs a kubelet
 		// or containerd it does not own, and the node being migrated is one, so
@@ -110,13 +113,11 @@ func preflightMigrationTarget(ctx context.Context, log *slog.Logger, mode isolat
 
 // runMigrationPreflight runs the target mode's checks and returns what stops
 // the migration. Bootstrap installs a missing nspawn tool, so the nspawn
-// runtime check only warns about one there. A migration installs nothing
-// before the target starts, so for nspawn a warning is a failure: failing here
-// leaves the node running, while finding the tool missing at start would stop
-// the source first and then roll back.
-func runMigrationPreflight(ctx context.Context, mode isolation.Mode, checks []preflight.Checker) error {
-	failOnWarnings := mode == isolation.ModeNSpawn
-
+// runtime check only warns about one there. An in-place migration installs
+// nothing before the target starts, so failOnWarnings makes a warning a
+// failure: failing here leaves the node running, while finding the tool
+// missing at start would stop the source first and then roll back.
+func runMigrationPreflight(ctx context.Context, mode isolation.Mode, failOnWarnings bool, checks []preflight.Checker) error {
 	report := preflight.Run(ctx, checks, preflight.Options{})
 	if !report.HasErrors() && (!failOnWarnings || !report.HasWarnings()) {
 		return nil

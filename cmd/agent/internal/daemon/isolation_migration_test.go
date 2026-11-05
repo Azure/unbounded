@@ -162,7 +162,7 @@ func newMigHarness(t *testing.T, from isolation.Mode) *migHarness {
 			h.events = append(h.events, "kubelet-on-host "+slot)
 			return h.failAt["kubelet-on-host"]
 		},
-		Preflight: func(_ context.Context, _ *slog.Logger, mode isolation.Mode) error {
+		Preflight: func(_ context.Context, _ *slog.Logger, mode isolation.Mode, _ migrate.Strategy) error {
 			h.events = append(h.events, "preflight "+string(mode))
 			return h.failAt["preflight"]
 		},

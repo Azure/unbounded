@@ -88,7 +88,7 @@ func (e *migrationEnv) newInPlaceMigration(
 		// The target backend's own host requirements, checked before anything
 		// is changed.
 		Preflight: func(ctx context.Context, _ isolation.Backend) error {
-			return e.preflight(ctx, log, j.To)
+			return e.preflight(ctx, log, j.To, migrate.InPlace)
 		},
 		// The target's artifacts for the same configuration a repave would use.
 		Download: func(ctx context.Context) error { return e.stageArchives(ctx, log, archives) },

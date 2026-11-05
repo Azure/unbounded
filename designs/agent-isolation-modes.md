@@ -623,9 +623,10 @@ pair with `container`.
   the reset, so an expired token is caught when the API server can be reached.
   When it cannot be reached the change goes ahead and the handoff's bounded
   retry reports a real failure. An invalid token cannot be renewed from the
-  agent: the operator must renew it or bootstrap with attestation. A change to
-  nspawn is refused up front when the host lacks the nspawn runtime, because a
-  change installs nothing.
+  agent: the operator must renew it or bootstrap with attestation. An in-place
+  change to nspawn is refused up front when the host lacks the nspawn runtime,
+  because it installs nothing; a reprovision to nspawn bootstraps, which
+  installs it, so a missing tool is only a warning there.
 - *Gaps.* The handoff does not fetch the target's artifacts before the reset:
   `--check` resolves the goal state (which verifies an offline bundle), but an
   unreachable download source is found only by the bootstrap after the reset,
