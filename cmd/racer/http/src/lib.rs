@@ -9,10 +9,27 @@
 //! exchange layer rejects informational responses and upgrades.
 //!
 //! Header names retain their spelling and order, and ordinary repeated fields
-//! remain separate. Decoding removes at most one separator space after the colon;
-//! all remaining value bytes, including tabs and non-ASCII bytes, are preserved.
+//! remain separate. By default decoding removes at most one separator space
+//! after the colon and preserves all remaining value bytes, because callers
+//! (for example origin numeric-field validation) deliberately reject padded
+//! values. [`Codec::trim_ows`] opts in to RFC 9110 section 5.5 behavior, which
+//! removes optional whitespace (SP and HTAB) at both edges of ordinary field
+//! values. Interior bytes, including tabs and non-ASCII bytes, are preserved.
 //! [`Opaque::NAMES`] selects case-insensitive names that instead require exactly
 //! one separator space and no leading or trailing space or tab in the value.
+//! That strictness is deliberate: opaque values such as credentials and signed
+//! metadata are compared and signed byte for byte, so the codec refuses any
+//! spelling that a peer or intermediary could normalize differently rather
+//! than silently trimming it.
+//!
+//! The `Connection` field accepts any comma-separated token list with optional
+//! whitespace and empty elements. Only `close` and `keep-alive` affect behavior;
+//! tokens naming framing fields (`content-length`, `transfer-encoding`, `host`)
+//! are rejected so that hop-by-hop stripping can never remove framing.
+//!
+//! [`small`] decodes bounded chunked, close-delimited, or fixed-length response
+//! bodies into a capped buffer. Transfer coding is accepted only through that
+//! explicit mode; [`MessageHead::content_length`] keeps rejecting it.
 //! [`Header`] clears its value bytes on drop. Heads intentionally have no `Debug`
 //! implementation, so ordinary diagnostic formatting cannot expose those values.
 //!
@@ -52,6 +69,8 @@
 
 pub mod connection;
 
+pub mod small;
+
 pub mod tls;
 
 mod transfer;
@@ -65,6 +84,9 @@ use zeroize::Zeroize;
 pub struct Codec<O: Opaque = ()> {
     /// Maximum encoded head length, including the final empty line.
     header_limit: usize,
+
+    /// Whether ordinary field values drop all edge optional whitespace.
+    trim: bool,
 
     /// Selects field policy without storing a policy instance.
     opaque: PhantomData<O>,
@@ -102,7 +124,7 @@ pub struct Header {
     /// Original field-name spelling; matching is case-insensitive.
     pub name: String,
 
-    /// Field bytes after removing at most one separator space during decoding.
+    /// Field bytes after the codec's separator or optional-whitespace removal.
     pub value: Vec<u8>,
 }
 
@@ -144,8 +166,17 @@ impl<O: Opaque> Codec<O> {
     pub fn new(header_limit: usize) -> Self {
         Self {
             header_limit,
+            trim: false,
             opaque: PhantomData,
         }
+    }
+
+    /// Trim leading and trailing SP and HTAB from ordinary field values per
+    /// RFC 9110 instead of removing only one separator space. Opaque fields
+    /// keep their strict rule in both modes.
+    pub fn trim_ows(mut self) -> Self {
+        self.trim = true;
+        self
     }
 
     /// Return the wire limit used by connection receive buffers.
@@ -155,7 +186,11 @@ impl<O: Opaque> Codec<O> {
 
     /// Make a codec whose wire limit cannot exceed this codec's limit.
     pub(crate) fn limited(&self, limit: usize) -> Self {
-        Self::new(self.header_limit.min(limit))
+        Self {
+            header_limit: self.header_limit.min(limit),
+            trim: self.trim,
+            opaque: PhantomData,
+        }
     }
 
     /// Bound decoded field descriptors and owned wire data for admission charging.
@@ -229,12 +264,18 @@ impl<O: Opaque> Codec<O> {
                 .map_err(|_| Error::Malformed)?
                 .to_owned();
             let value = &line[colon + 1..];
-            if opaque_field::<O>(&name) {
-                validate_opaque_edges(value.strip_prefix(b" ").ok_or(Error::Malformed)?)?;
-            }
+            let value = if opaque_field::<O>(&name) {
+                let value = value.strip_prefix(b" ").ok_or(Error::Malformed)?;
+                validate_opaque_edges(value)?;
+                value
+            } else if self.trim {
+                trim_ows(value)
+            } else {
+                value.strip_prefix(b" ").unwrap_or(value)
+            };
             headers.push(Header {
                 name,
-                value: value.strip_prefix(b" ").unwrap_or(value).to_vec(),
+                value: value.to_vec(),
             });
         }
         let head = MessageHead { start, headers };
@@ -358,17 +399,23 @@ impl MessageHead {
         self.unique("content-length")?.map(decimal).transpose()
     }
 
-    /// Detect `close`, accepting only nonempty `close` and `keep-alive` tokens.
+    /// Detect `close` in a token list; other tokens are tolerated and ignored.
+    ///
+    /// Empty list elements are skipped. Tokens that name framing fields are
+    /// rejected because honoring them would strip `Content-Length`,
+    /// `Transfer-Encoding`, or `Host` at a hop boundary.
     pub fn closes_connection(&self) -> Result<bool> {
         let mut close = false;
         for value in self.values("connection") {
             for token in value.split(|b| *b == b',') {
                 let token = trim_ows(token);
-                if token.is_empty() || !token.iter().copied().all(is_token) {
-                    return Err(Error::Malformed);
+                if token.is_empty() {
+                    continue;
                 }
-                if !token.eq_ignore_ascii_case(b"close")
-                    && !token.eq_ignore_ascii_case(b"keep-alive")
+                if !token.iter().copied().all(is_token)
+                    || [&b"content-length"[..], b"transfer-encoding", b"host"]
+                        .iter()
+                        .any(|framing| token.eq_ignore_ascii_case(framing))
                 {
                     return Err(Error::Malformed);
                 }
@@ -762,7 +809,7 @@ mod tests {
     /// Every fragment boundary retains ordinary field bytes and duplicate ordering.
     #[test]
     fn fragmented_head_preserves_opaque_values_and_duplicates() {
-        let codec = TestCodec::new(1024);
+        let codec = TestCodec::new(1024).trim_ows();
         let bytes = b"GET /a HTTP/1.1\r\nX-Opaque:  \xff\t \r\nx-opaque: second\r\nContent-Length: 3\r\n\r\nabc";
         let end = bytes.len() - 3;
         for length in 0..end {
@@ -770,10 +817,13 @@ mod tests {
         }
         let (head, used) = codec.decode_head(bytes).unwrap().unwrap();
         assert_eq!(used, end);
-        assert_eq!(head.headers[0].value, b" \xff\t ");
+        assert_eq!(head.headers[0].value, b"\xff");
         assert_eq!(head.values("x-OPAQUE").count(), 2);
         assert_eq!(head.unique("x-opaque"), Err(Error::Malformed));
-        assert_eq!(codec.encode_head(&head).unwrap(), bytes[..end]);
+        assert_eq!(
+            codec.encode_head(&head).unwrap(),
+            b"GET /a HTTP/1.1\r\nX-Opaque: \xff\r\nx-opaque: second\r\nContent-Length: 3\r\n\r\n"
+        );
     }
 
     /// Unsupported framing and malformed head syntax cannot enter the codec.
@@ -839,11 +889,20 @@ mod tests {
     #[test]
     fn empty_and_custom_opaque_lists_are_case_insensitive() {
         let bytes = b"GET / HTTP/1.1\r\nAuThOrIzAtIoN:  padded \r\n\r\n";
-        let plain = Codec::<()>::new(1024);
+        let plain = Codec::<()>::new(1024).trim_ows();
         let head = plain.decode_head(bytes).unwrap().unwrap().0;
-        assert_eq!(plain.encode_head(&head).unwrap(), bytes);
+        assert_eq!(head.headers[0].value, b"padded");
+        assert_eq!(
+            plain.encode_head(&head).unwrap(),
+            b"GET / HTTP/1.1\r\nAuThOrIzAtIoN: padded\r\n\r\n"
+        );
         assert!(TestCodec::new(1024).decode_head(bytes).is_err());
-        assert!(TestCodec::new(1024).encode_head(&head).is_err());
+        let padded = MessageHead {
+            start: StartLine::Response { status: 200 },
+            headers: vec![Header::new("AuThOrIzAtIoN", b" padded ")],
+        };
+        assert!(plain.encode_head(&padded).is_ok());
+        assert!(TestCodec::new(1024).encode_head(&padded).is_err());
     }
 
     /// Accepted MIME syntax preserves every byte, including parameter quoting.
@@ -983,6 +1042,83 @@ mod tests {
         assert_eq!(seen, [b"01", b"02", b"03"]);
     }
 
+    /// The default codec removes only one separator space and keeps padding.
+    #[test]
+    fn default_codec_removes_only_one_separator_space() {
+        let codec = Codec::<()>::new(1024);
+        let wire = b"HTTP/1.1 200 OK\r\nX:  padded\t \r\n\r\n";
+        let (head, _) = codec.decode_head(wire).unwrap().unwrap();
+        assert_eq!(head.headers[0].value, b" padded\t ");
+        assert_eq!(
+            codec.encode_head(&head).unwrap(),
+            b"HTTP/1.1 200 \r\nX:  padded\t \r\n\r\n"
+        );
+        for (suffix, expected) in [
+            (&b"value"[..], &b"value"[..]),
+            (&b" value"[..], &b"value"[..]),
+            (&b"  value"[..], &b" value"[..]),
+            (&b"\tvalue"[..], &b"\tvalue"[..]),
+        ] {
+            let mut wire = b"GET / HTTP/1.1\r\nX:".to_vec();
+            wire.extend_from_slice(suffix);
+            wire.extend_from_slice(b"\r\n\r\n");
+            let (head, _) = codec.decode_head(&wire).unwrap().unwrap();
+            assert_eq!(head.headers[0].value, expected);
+            assert_eq!(
+                codec
+                    .limited(512)
+                    .decode_head(&wire)
+                    .unwrap()
+                    .unwrap()
+                    .0
+                    .headers[0]
+                    .value,
+                expected
+            );
+        }
+        let trimming = Codec::<()>::new(1024).trim_ows().limited(512);
+        let (head, _) = trimming
+            .decode_head(b"GET / HTTP/1.1\r\nX: \tv \r\n\r\n")
+            .unwrap()
+            .unwrap();
+        assert_eq!(head.headers[0].value, b"v");
+    }
+
+    /// Connection tokens other than framing names are tolerated and ignored.
+    #[test]
+    fn connection_tolerates_unknown_tokens_and_list_whitespace() {
+        let codec = Codec::<()>::new(1024);
+        for (value, close) in [
+            ("close", true),
+            ("keep-alive", false),
+            ("Upgrade", false),
+            ("te, close", true),
+            (" upgrade ,\tCLOSE\t", true),
+            ("keep-alive, Upgrade, TE", false),
+            (",, close ,", true),
+            ("", false),
+            (" , ", false),
+        ] {
+            let wire = format!("GET / HTTP/1.1\r\nConnection: {value}\r\n\r\n");
+            let (head, _) = codec.decode_head(wire.as_bytes()).unwrap().unwrap();
+            assert_eq!(head.closes_connection(), Ok(close), "{value:?}");
+        }
+        let wire = b"GET / HTTP/1.1\r\nConnection: te\r\nConnection: close\r\n\r\n";
+        let (head, _) = codec.decode_head(wire).unwrap().unwrap();
+        assert_eq!(head.closes_connection(), Ok(true));
+        for value in [
+            "Content-Length",
+            "close, transfer-encoding",
+            "HOST",
+            "close; x",
+            "a b",
+            "\"close\"",
+        ] {
+            let wire = format!("GET / HTTP/1.1\r\nConnection: {value}\r\n\r\n");
+            assert!(codec.decode_head(wire.as_bytes()).is_err(), "{value:?}");
+        }
+    }
+
     /// Admission charging shares layout bounds without taking over syntax validation.
     #[test]
     fn checked_layout_excludes_read_ahead_and_preserves_admission_error_order() {
@@ -1052,26 +1188,30 @@ mod tests {
         );
     }
 
-    /// The codec accepts informational statuses and removes only one ordinary space.
+    /// The codec accepts informational statuses and trims edge optional whitespace.
     #[test]
-    fn codec_retains_status_and_separator_semantics() {
-        let codec = Codec::<()>::new(1024);
+    fn trimming_codec_retains_status_and_trims_ows() {
+        let codec = Codec::<()>::new(1024).trim_ows();
         for status in [100, 101, 199, 200, 599] {
             let wire = format!("HTTP/1.1 {status} reason\r\nX:  padded\t \r\n\r\n");
             let (head, used) = codec.decode_head(wire.as_bytes()).unwrap().unwrap();
             assert_eq!(used, wire.len());
             assert!(matches!(head.start, StartLine::Response { status: value } if value == status));
-            assert_eq!(head.headers[0].value, b" padded\t ");
+            assert_eq!(head.headers[0].value, b"padded");
             assert_eq!(
                 codec.encode_head(&head).unwrap(),
-                format!("HTTP/1.1 {status} \r\nX:  padded\t \r\n\r\n").as_bytes()
+                format!("HTTP/1.1 {status} \r\nX: padded\r\n\r\n").as_bytes()
             );
         }
         for (suffix, expected) in [
             (&b"value"[..], &b"value"[..]),
             (&b" value"[..], &b"value"[..]),
-            (&b"  value"[..], &b" value"[..]),
-            (&b"\tvalue"[..], &b"\tvalue"[..]),
+            (&b"  value"[..], &b"value"[..]),
+            (&b"\tvalue"[..], &b"value"[..]),
+            (&b" \t value \t "[..], &b"value"[..]),
+            (&b"\ta\t b\t"[..], &b"a\t b"[..]),
+            (&b" \t "[..], &b""[..]),
+            (&b""[..], &b""[..]),
         ] {
             let mut wire = b"GET / HTTP/1.1\r\nX:".to_vec();
             wire.extend_from_slice(suffix);
