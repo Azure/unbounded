@@ -552,6 +552,7 @@ impl WorkerApplication {
                                     capacity,
                                     &self.keys,
                                     &snapshot.caches,
+                                    snapshot.page_size,
                                 );
                                 if selected.is_some() {
                                     return Ok((newest, selected));
@@ -576,11 +577,18 @@ fn select(
     (page_capacity, metadata_capacity): (usize, usize),
     keys: &Keyring,
     caches: &[racer_wire::control::CacheDefinition],
+    page_size: racer_wire::object::PageSize,
 ) -> Option<CheckpointImage> {
     // The disk scanner supplies newest-first images, never retaining a second
     // decoded candidate while validating the first.
     candidates.into_iter().find_map(|image| {
         let sequence = image.sequence;
+        // A cut taken under another published page size cuts every page at
+        // the wrong offsets: start cold rather than serve it (D13).
+        if image.page_size != page_size {
+            eprintln!("racer: skipping checkpoint sequence {sequence} cut at another page size");
+            return None;
+        }
         let selected = validate_candidate(
             image,
             geometry,
@@ -878,6 +886,7 @@ mod tests {
     fn image(sequence: u64, ids: &[WorkerId]) -> CheckpointImage {
         CheckpointImage {
             version: CHECKPOINT_VERSION,
+            page_size: racer_wire::object::PageSize::DEFAULT,
             cluster: crate::store::checkpoint::test_cluster(),
             sequence,
             shards: ids
@@ -944,7 +953,15 @@ mod tests {
                 .collect()
         };
         let choose = |cuts, geometry: &HashMap<WorkerId, CheckpointGeometry>| {
-            select(cuts, geometry, &node.workers, (4, 4), &keys, &caches())
+            select(
+                cuts,
+                geometry,
+                &node.workers,
+                (4, 4),
+                &keys,
+                &caches(),
+                racer_wire::object::PageSize::DEFAULT,
+            )
         };
         let g = live(guarded);
         assert!(choose(vec![candidate(2, mismatched), candidate(1, mismatched)], &g).is_none());
@@ -955,6 +972,15 @@ mod tests {
         mixed.shards[1].geometry.layout_digest = mismatched[1];
         assert_eq!(
             choose(vec![mixed, candidate(2, guarded)], &g)
+                .unwrap()
+                .sequence,
+            2
+        );
+        // A cut taken under another published page size starts cold (D13).
+        let mut resized = candidate(4, guarded);
+        resized.page_size = racer_wire::object::PageSize::new(64 << 10).unwrap();
+        assert_eq!(
+            choose(vec![resized, candidate(2, guarded)], &g)
                 .unwrap()
                 .sequence,
             2
@@ -1001,6 +1027,7 @@ mod tests {
                             number: crate::model::PageNumber(0),
                         },
                         crate::store::catalog::IndexedPage {
+                            page_size: racer_wire::object::PageSize::DEFAULT,
                             location: crate::store::catalog::RecordLocation {
                                 segment: allocated.id,
                                 generation: allocated.generation,
@@ -1060,7 +1087,15 @@ mod tests {
             ids.iter().map(|id| (*id, g)).collect()
         };
         let choose = |cuts: Vec<CheckpointImage>, g: &HashMap<WorkerId, CheckpointGeometry>| {
-            select(cuts, g, &node.workers, (4, 4), &keys, &caches())
+            select(
+                cuts,
+                g,
+                &node.workers,
+                (4, 4),
+                &keys,
+                &caches(),
+                racer_wire::object::PageSize::DEFAULT,
+            )
         };
         let three = [WorkerId(0), WorkerId(1), WorkerId(2)];
         let five = [
@@ -1119,7 +1154,8 @@ mod tests {
                 &node.workers,
                 (4, 4),
                 &keys,
-                &caches()
+                &caches(),
+                racer_wire::object::PageSize::DEFAULT
             )
             .unwrap()
             .sequence,
@@ -1153,7 +1189,8 @@ mod tests {
                 &node.workers,
                 (4, 4),
                 &keys,
-                &caches()
+                &caches(),
+                racer_wire::object::PageSize::DEFAULT
             )
             .unwrap()
             .sequence,
@@ -1166,7 +1203,8 @@ mod tests {
                 &node.workers,
                 (4, 4),
                 &keys,
-                &caches()
+                &caches(),
+                racer_wire::object::PageSize::DEFAULT
             )
             .is_none()
         );
@@ -1213,6 +1251,7 @@ mod tests {
         old.shards[0].index.entries.push((
             page.clone(),
             IndexedPage {
+                page_size: racer_wire::object::PageSize::DEFAULT,
                 location: RecordLocation {
                     segment: append.0.id(),
                     generation: append.0.generation(),
@@ -1238,6 +1277,7 @@ mod tests {
             (16, 16),
             &keys,
             &[],
+            racer_wire::object::PageSize::DEFAULT,
         )
         .unwrap();
         assert!(removed.shards[0].index.entries.is_empty());
@@ -1249,6 +1289,7 @@ mod tests {
             (16, 16),
             &keys,
             &caches,
+            racer_wire::object::PageSize::DEFAULT,
         )
         .unwrap();
         assert_eq!(retained.shards[0].index.entries.len(), 1);
@@ -1262,6 +1303,7 @@ mod tests {
             (16, 16),
             &keys,
             &caches,
+            racer_wire::object::PageSize::DEFAULT,
         )
         .unwrap();
         assert!(filtered.shards[0].index.entries.is_empty());
@@ -1281,6 +1323,7 @@ mod tests {
             (16, 16),
             &keys,
             &caches,
+            racer_wire::object::PageSize::DEFAULT,
         )
         .unwrap();
         assert!(keyless.shards[0].index.entries.is_empty());
@@ -1355,6 +1398,7 @@ mod tests {
                 number: PageNumber(0),
             },
             IndexedPage {
+                page_size: racer_wire::object::PageSize::DEFAULT,
                 location: RecordLocation {
                     segment: append.0.id(),
                     generation: append.0.generation(),
@@ -1381,6 +1425,7 @@ mod tests {
                 (16, 16),
                 &keys,
                 &caches,
+                racer_wire::object::PageSize::DEFAULT,
             )
         };
 
@@ -1438,7 +1483,8 @@ mod tests {
                 &node.workers,
                 (4, 4),
                 &keys,
-                &caches()
+                &caches(),
+                racer_wire::object::PageSize::DEFAULT
             )
             .unwrap()
             .sequence,
@@ -1468,6 +1514,7 @@ mod tests {
             app.store.checkpoint.finish_snapshot();
             let bytes = crate::store::checkpoint::encode(&CheckpointImage {
                 version: CHECKPOINT_VERSION,
+                page_size: racer_wire::object::PageSize::DEFAULT,
                 cluster: config.cluster.clone(),
                 sequence: 9,
                 shards: vec![shard],
@@ -1545,6 +1592,7 @@ mod tests {
             (16, 1),
             &keys,
             &caches(),
+            racer_wire::object::PageSize::DEFAULT,
         )
         .unwrap();
         assert_eq!(chosen.sequence, 1);
@@ -1566,7 +1614,8 @@ mod tests {
                 &node.workers,
                 (1, 2),
                 &keys,
-                &caches()
+                &caches(),
+                racer_wire::object::PageSize::DEFAULT
             )
             .unwrap()
             .sequence,
@@ -1579,7 +1628,8 @@ mod tests {
                 &node.workers,
                 (16, 0),
                 &keys,
-                &caches()
+                &caches(),
+                racer_wire::object::PageSize::DEFAULT
             )
             .is_none()
         );
@@ -1590,7 +1640,8 @@ mod tests {
                 &node.workers,
                 (16, 0),
                 &keys,
-                &caches()
+                &caches(),
+                racer_wire::object::PageSize::DEFAULT
             )
             .is_some()
         );

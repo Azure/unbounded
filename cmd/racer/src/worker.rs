@@ -1840,6 +1840,7 @@ mod tests {
             fn input(&self) -> CryptoInput {
                 let cache = CacheId(crate::test_support::security::CACHE.into());
                 CryptoInput::Encrypt {
+                    page_size: racer_wire::object::PageSize::DEFAULT,
                     page: PageId {
                         version: ObjectVersion {
                             object: ObjectId {

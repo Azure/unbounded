@@ -827,6 +827,7 @@ mod tests {
                     )
                     .unwrap(),
                 PageEnvelope {
+                    page_size: racer_wire::object::PageSize::DEFAULT,
                     cipher: crate::model::PageCipher::Xaes256Gcm,
                     page: page.clone(),
                     key_id: racer_wire::control::KeyId([1; 16]),
@@ -926,6 +927,7 @@ mod tests {
             )
             .unwrap();
         let envelope = PageEnvelope {
+            page_size: racer_wire::object::PageSize::DEFAULT,
             cipher: crate::model::PageCipher::Xaes256Gcm,
             page: page.clone(),
             key_id: racer_wire::control::KeyId([1; 16]),

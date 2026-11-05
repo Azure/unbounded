@@ -137,6 +137,7 @@ pub(crate) fn envelope(length: u32) -> PageEnvelope {
     use crate::model::*;
     let cache = racer_wire::control::CacheId("cccccccc-1111-4111-8111-111111111111".into());
     PageEnvelope {
+        page_size: racer_wire::object::PageSize::DEFAULT,
         cipher: PageCipher::Xaes256Gcm,
         page: PageId {
             version: ObjectVersion {

@@ -134,6 +134,7 @@ mod materialized_pairing {
                             )
                             .unwrap(),
                         PageEnvelope {
+                            page_size: racer_wire::object::PageSize::DEFAULT,
                             cipher: crate::model::PageCipher::Xaes256Gcm,
                             page: PageId {
                                 version: metadata.version.clone(),
@@ -683,7 +684,13 @@ mod safety {
                 .unwrap();
             let (verified, encrypted) = drive(
                 &f.reactors,
-                cryptos[1].encrypt(page, plain, output, &f.scope),
+                cryptos[1].encrypt(
+                    page,
+                    racer_wire::object::PageSize::DEFAULT,
+                    plain,
+                    output,
+                    &f.scope,
+                ),
                 poll_crypto,
             )
             .unwrap();
@@ -1233,6 +1240,7 @@ impl RelayFixture {
             ),
         };
         let envelope = PageEnvelope {
+            page_size: racer_wire::object::PageSize::DEFAULT,
             cipher: crate::model::PageCipher::Xaes256Gcm,
             page: PageId {
                 version: metadata.version.clone(),

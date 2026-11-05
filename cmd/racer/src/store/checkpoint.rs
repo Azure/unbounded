@@ -261,6 +261,7 @@ impl Checkpointer {
         Ok(Box::pin(async move {
             let bytes = encode_incremental(&CheckpointImage {
                 version: CHECKPOINT_VERSION,
+                page_size: shards_page_size(&shards)?,
                 cluster,
                 sequence,
                 shards,
@@ -505,6 +506,7 @@ async fn publish_next(
     let (slot, sequence) = SLOTS.next_publication(newest).ok_or(Error::Unavailable)?;
     let bytes = encode(&CheckpointImage {
         version: CHECKPOINT_VERSION,
+        page_size: shards_page_size(&shards)?,
         cluster,
         sequence,
         shards,
@@ -574,7 +576,7 @@ pub(crate) fn read_candidates_with_budget(
 // restarts at 1, so they can repeat across clusters. Recovery skips a cut
 // from another cluster. Checkpoints with any other version or cluster are
 // discarded as disposable cache hints.
-pub const CHECKPOINT_VERSION: u32 = 3;
+pub const CHECKPOINT_VERSION: u32 = 4;
 const CLUSTER_BYTES: usize = 36;
 pub const FILE_LAYOUT_DIGEST: [u8; 32] = *b"racer-file-layout-v1\0\0\0\0\0\0\0\0\0\0\0\0";
 pub const MAX_CHECKPOINT_BYTES: usize = 64 * 1024 * 1024;
@@ -779,6 +781,9 @@ impl ShardImage {
 
 pub struct CheckpointImage {
     pub version: u32,
+    /// Page size every entry was cut at (D13). Recovery under another
+    /// published page size discards the image and starts cold.
+    pub page_size: racer_wire::object::PageSize,
     /// Cluster UID that owns the keys named by page entries.
     pub cluster: ClusterId,
     pub sequence: u64,
@@ -806,7 +811,8 @@ pub async fn encode_incremental(image: &CheckpointImage) -> Result<Vec<u8>> {
     let mut out = Encoder(Vec::new());
     out.bytes(MAGIC)?;
     out.u32(image.version)?;
-    out.u32(0)?; // Reserved flags.
+    // Every page size is at most 16 MiB, so it fits a u32.
+    out.u32(image.page_size.get() as u32)?;
     out.u64(image.sequence)?;
     out.u64(0)?; // Total encoded length, filled before hashing.
     out.bytes(image.cluster.0.as_bytes())?;
@@ -926,9 +932,11 @@ pub fn decode_with_budget(bytes: &[u8], budget: usize) -> Result<CheckpointImage
         return Err(Error::CorruptRecord);
     }
     let version = input.u32()?;
-    if version != CHECKPOINT_VERSION || input.u32()? != 0 {
+    if version != CHECKPOINT_VERSION {
         return Err(Error::CorruptRecord);
     }
+    let page_size = racer_wire::object::PageSize::from_wire(u64::from(input.u32()?))
+        .map_err(|_| Error::CorruptRecord)?;
     let sequence = input.u64()?;
     if input.u64()? != bytes.len() as u64 {
         return Err(Error::CorruptRecord);
@@ -985,6 +993,7 @@ pub fn decode_with_budget(bytes: &[u8], budget: usize) -> Result<CheckpointImage
             entries.push((
                 page,
                 IndexedPage {
+                    page_size,
                     metadata,
                     key_id,
                     location: RecordLocation {
@@ -1020,6 +1029,7 @@ pub fn decode_with_budget(bytes: &[u8], budget: usize) -> Result<CheckpointImage
     }
     let image = CheckpointImage {
         version,
+        page_size,
         cluster,
         sequence,
         shards,
@@ -1121,12 +1131,33 @@ fn version_key(version: &ObjectVersion) -> (&str, &[u8; 32], &[u8]) {
         version.etag.as_bytes(),
     )
 }
+/// The one page size shared by every entry of `shards`; the default when
+/// there are no entries. Mixed sizes are a corrupt cut.
+pub fn shards_page_size(shards: &[ShardImage]) -> Result<racer_wire::object::PageSize> {
+    let mut sizes = shards
+        .iter()
+        .flat_map(|shard| shard.index.entries.iter().map(|(_, entry)| entry.page_size));
+    let first = sizes.next().unwrap_or_default();
+    if sizes.all(|size| size == first) {
+        Ok(first)
+    } else {
+        Err(Error::CorruptRecord)
+    }
+}
+
 fn validate_image(image: &CheckpointImage) -> Result<()> {
     if image.version != CHECKPOINT_VERSION
         || image.cluster.0.len() != CLUSTER_BYTES
         || !racer_crypto::identity::canonical_uuid(&image.cluster.0)
         || image.shards.is_empty()
         || image.shards.len() > MAX_SHARDS
+        || image.shards.iter().any(|shard| {
+            shard
+                .index
+                .entries
+                .iter()
+                .any(|(_, entry)| entry.page_size != image.page_size)
+        })
     {
         return Err(Error::CorruptRecord);
     }
@@ -1360,6 +1391,7 @@ mod budget_tests {
                             number: PageNumber(0),
                         },
                         IndexedPage {
+                            page_size: racer_wire::object::PageSize::DEFAULT,
                             metadata: descriptor,
                             key_id: crate::model::key_id_from_generation(1, 1).unwrap(),
                             location: RecordLocation {
@@ -1377,6 +1409,7 @@ mod budget_tests {
                 let segments = segments.snapshot();
                 let image = CheckpointImage {
                     version: CHECKPOINT_VERSION,
+                    page_size: racer_wire::object::PageSize::DEFAULT,
                     cluster: crate::store::checkpoint::test_cluster(),
                     sequence: 1,
                     shards: vec![ShardImage {

@@ -69,6 +69,7 @@ pub(crate) fn page(byte: u8) -> crate::memory::PageResult {
             inner: Arc::new(CiphertextBytes {
                 pins: Default::default(),
                 envelope: PageEnvelope {
+                    page_size: racer_wire::object::PageSize::DEFAULT,
                     cipher: crate::model::PageCipher::Xaes256Gcm,
                     page,
                     key_id: key_id_from_generation(1, 1).unwrap(),
@@ -1930,6 +1931,7 @@ mod flight {
                 inner: Arc::new(CiphertextBytes {
                     pins: Default::default(),
                     envelope: PageEnvelope {
+                        page_size: racer_wire::object::PageSize::DEFAULT,
                         cipher: crate::model::PageCipher::Xaes256Gcm,
                         page,
                         key_id: crate::model::key_id_from_generation(1, 1).unwrap(),

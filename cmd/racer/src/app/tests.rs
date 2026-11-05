@@ -748,6 +748,7 @@ pub(super) fn page(app: &WorkerApplication) -> crate::memory::PageResult {
                 .reserve(Some(cache), ResourceClass::Ciphertext, 19)
                 .unwrap(),
             PageEnvelope {
+                page_size: racer_wire::object::PageSize::DEFAULT,
                 cipher: crate::model::PageCipher::Xaes256Gcm,
                 page: id,
                 key_id: app
@@ -3600,6 +3601,7 @@ fn real_control_bootstrap_recovery_publication_readiness_and_shutdown() {
     let accepted_scope = scope(&racer_io::Clock::host(), Duration::from_secs(10)).unwrap();
     let mut accepted = runtime.crypto.execute(
         crate::security::CryptoInput::Encrypt {
+            page_size: racer_wire::object::PageSize::DEFAULT,
             page,
             plaintext,
             ciphertext: crate::memory::fixture_encrypt_output(&runtime.admission, ciphertext),

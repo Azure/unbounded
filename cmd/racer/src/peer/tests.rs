@@ -275,6 +275,7 @@ mod body_progress {
                         bytes.len(),
                     )?,
                     PageEnvelope {
+                        page_size: racer_wire::object::PageSize::DEFAULT,
                         cipher: crate::model::PageCipher::Xaes256Gcm,
                         page: page.clone(),
                         key_id: KeyId([1; 16]),
@@ -643,6 +644,7 @@ mod destination_disconnect {
                 inner: Arc::new(CiphertextBytes {
                     pins: Default::default(),
                     envelope: PageEnvelope {
+                        page_size: racer_wire::object::PageSize::DEFAULT,
                         cipher: crate::model::PageCipher::Xaes256Gcm,
                         page: page.clone(),
                         key_id: KeyId([1; 16]),
@@ -1190,7 +1192,13 @@ mod encrypted_http {
                 .reserve(Some(cache), ResourceClass::Ciphertext, length + 16)
                 .unwrap();
             let (verified, ciphertext) = drive(
-                cryptos[1].encrypt(page, plaintext, output, &scope),
+                cryptos[1].encrypt(
+                    page,
+                    racer_wire::object::PageSize::DEFAULT,
+                    plaintext,
+                    output,
+                    &scope,
+                ),
                 &reactor,
                 &mut engines,
                 &clients,
@@ -1818,6 +1826,7 @@ mod subscriptions {
                     )
                     .unwrap(),
                 PageEnvelope {
+                    page_size: racer_wire::object::PageSize::DEFAULT,
                     cipher: crate::model::PageCipher::Xaes256Gcm,
                     page: page.clone(),
                     key_id: KeyId([1; 16]),
@@ -2714,6 +2723,7 @@ mod timing {
                         )
                         .unwrap(),
                     crate::model::PageEnvelope {
+                        page_size: racer_wire::object::PageSize::DEFAULT,
                         cipher: crate::model::PageCipher::Xaes256Gcm,
                         page: page.clone(),
                         key_id: KeyId([1; 16]),

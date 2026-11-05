@@ -278,6 +278,7 @@ fn active_crypto_operation_completes_after_rotation_with_its_original_key_lease(
     .unwrap();
     let mut operation = client.execute(
         CryptoInput::Encrypt {
+            page_size: racer_wire::object::PageSize::DEFAULT,
             page,
             plaintext,
             ciphertext: Box::new(

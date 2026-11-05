@@ -2486,6 +2486,7 @@ mod tests {
         };
         let ciphertext = wire_ciphertext(
             PageEnvelope {
+                page_size: racer_wire::object::PageSize::DEFAULT,
                 cipher: crate::model::PageCipher::Xaes256Gcm,
                 page,
                 key_id: KeyId([6; 16]),
@@ -2624,6 +2625,7 @@ mod tests {
             };
             let ciphertext = wire_ciphertext(
                 PageEnvelope {
+                    page_size: racer_wire::object::PageSize::DEFAULT,
                     cipher: crate::model::PageCipher::Xaes256Gcm,
                     page,
                     key_id: KeyId([3; 16]),

@@ -1163,10 +1163,13 @@ fn encrypted_copy(f: &mut Fixture) -> CiphertextCopy {
     let mut plaintext = f.fill.dependencies.buffers.plaintext(plaintext, 3).unwrap();
     plaintext.bytes_mut().unwrap().copy_from_slice(b"abc");
     let (_, ciphertext) = drive(
-        f.fill
-            .dependencies
-            .crypto
-            .encrypt(f.page.clone(), plaintext, ciphertext, &f.scope),
+        f.fill.dependencies.crypto.encrypt(
+            f.page.clone(),
+            racer_wire::object::PageSize::DEFAULT,
+            plaintext,
+            ciphertext,
+            &f.scope,
+        ),
         &mut f.engine,
         &f.crypto,
     )
@@ -1382,10 +1385,13 @@ fn known_copy_full_page_still_requires_full_plaintext_admission() {
         )
         .unwrap();
     let (_, ciphertext) = drive(
-        f.fill
-            .dependencies
-            .crypto
-            .encrypt(f.page.clone(), plaintext, ciphertext, &f.scope),
+        f.fill.dependencies.crypto.encrypt(
+            f.page.clone(),
+            racer_wire::object::PageSize::DEFAULT,
+            plaintext,
+            ciphertext,
+            &f.scope,
+        ),
         &mut f.engine,
         &f.crypto,
     )
@@ -1923,10 +1929,13 @@ fn hedge_full_page_exact_plaintext_quotas_suppress_before_spending_serial_credit
             .plaintext(plaintext, PAGE_BYTES as usize)
             .unwrap();
         let (plain, ciphertext) = drive(
-            f.fill
-                .dependencies
-                .crypto
-                .encrypt(f.page.clone(), plaintext, ciphertext, &f.scope),
+            f.fill.dependencies.crypto.encrypt(
+                f.page.clone(),
+                racer_wire::object::PageSize::DEFAULT,
+                plaintext,
+                ciphertext,
+                &f.scope,
+            ),
             &mut f.engine,
             &f.crypto,
         )
@@ -1999,10 +2008,13 @@ fn hedge_authenticated_metadata_conflict_cannot_win_over_retained_descriptor() {
             .plaintext(plaintext, PAGE_BYTES as usize)
             .unwrap();
         let (plain, ciphertext) = drive(
-            f.fill
-                .dependencies
-                .crypto
-                .encrypt(f.page.clone(), plaintext, ciphertext, &f.scope),
+            f.fill.dependencies.crypto.encrypt(
+                f.page.clone(),
+                racer_wire::object::PageSize::DEFAULT,
+                plaintext,
+                ciphertext,
+                &f.scope,
+            ),
             &mut f.engine,
             &f.crypto,
         )

@@ -333,6 +333,7 @@ impl PrefetchAction {
 /// Every filled page must exist in a nonempty object.
 fn prefetch_fill_in_range(pages: &[u64], length: u64) -> bool {
     pages.last().is_some_and(|last| {
+        // Prefetch still cuts at the default page size (D13 remaining work).
         last.checked_mul(PAGE_BYTES)
             .is_some_and(|start| start < length)
     })
@@ -846,6 +847,7 @@ fn page_fields(
     push(head, "racer-page", e.page.number.0);
     push_binary(head, "racer-page-key", &e.key_id.0);
     push(head, "racer-page-cipher", e.cipher as u32);
+    push(head, "racer-page-size", e.page_size.get());
     push_binary(head, "racer-page-nonce", &e.nonce.0);
     push(head, "racer-plaintext-length", e.plaintext_length);
     push(head, "racer-ciphertext-length", e.ciphertext_length);
@@ -853,7 +855,7 @@ fn page_fields(
         .page
         .number
         .0
-        .checked_mul(PAGE_BYTES)
+        .checked_mul(e.page_size.get())
         .ok_or(Error::InvalidRange)?;
     let end = start
         .checked_add(u64::from(e.plaintext_length))
@@ -1083,6 +1085,8 @@ pub(crate) fn page_descriptor(head: &MessageHead) -> Result<(ObjectMetadata, Pag
             u32::try_from(number(head, "racer-page-cipher")?).map_err(|_| Error::InvalidRequest)?,
         )
         .map_err(|_| Error::InvalidRequest)?,
+        page_size: racer_wire::object::PageSize::from_wire(number(head, "racer-page-size")?)
+            .map_err(|_| Error::InvalidRequest)?,
         page: PageId {
             version: metadata.version.clone(),
             number: PageNumber(number(head, "racer-page")?),
@@ -1447,6 +1451,7 @@ pub(crate) mod tests {
             expires_at: ExpiresAt::from_system_time(UNIX_EPOCH).unwrap(),
         };
         let envelope = PageEnvelope {
+            page_size: racer_wire::object::PageSize::DEFAULT,
             cipher: crate::model::PageCipher::Xaes256Gcm,
             page: PageId {
                 version,
@@ -1501,6 +1506,7 @@ pub(crate) mod tests {
             expires_at: ExpiresAt::from_system_time(UNIX_EPOCH).unwrap(),
         };
         let envelope = PageEnvelope {
+            page_size: racer_wire::object::PageSize::DEFAULT,
             cipher: crate::model::PageCipher::Xaes256Gcm,
             page: PageId {
                 version: metadata.version.clone(),
@@ -1556,6 +1562,7 @@ pub(crate) mod tests {
             ("racer-page", "0"),
             ("racer-page-key", "AAAAAAAAAAAAAAAAAAAAAA=="),
             ("racer-page-cipher", "1"),
+            ("racer-page-size", "16777216"),
             ("racer-page-nonce", "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"),
             ("racer-plaintext-length", "3"),
             ("racer-ciphertext-length", "19"),
@@ -1758,6 +1765,7 @@ pub(crate) mod tests {
                         .reserve(Some(&cache), ResourceClass::Ciphertext, 19)
                         .unwrap(),
                     PageEnvelope {
+                        page_size: racer_wire::object::PageSize::DEFAULT,
                         cipher: crate::model::PageCipher::Xaes256Gcm,
                         page: PageId {
                             version: metadata.version.clone(),
@@ -1862,6 +1870,7 @@ pub(crate) mod tests {
                         .reserve(Some(&cache), ResourceClass::Ciphertext, 19)
                         .unwrap(),
                     PageEnvelope {
+                        page_size: racer_wire::object::PageSize::DEFAULT,
                         cipher: crate::model::PageCipher::Xaes256Gcm,
                         page: PageId {
                             version: metadata.version.clone(),

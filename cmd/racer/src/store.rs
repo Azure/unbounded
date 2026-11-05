@@ -281,9 +281,10 @@ impl StoreReader {
                 decoded.ciphertext,
             )?;
             self.index.touch(page);
-            self.index
-                .retention()
-                .disk_read(page, u64::from(entry.metadata.page_length(page)?));
+            self.index.retention().disk_read(
+                page,
+                u64::from(entry.metadata.page_length_in(page, entry.page_size)?),
+            );
             Ok(Some((
                 CiphertextCopy {
                     metadata: entry.metadata.for_pin(),
@@ -409,9 +410,10 @@ impl StoreReader {
                 ciphertext.length
             };
             self.index.touch(page);
-            self.index
-                .retention()
-                .disk_read(page, u64::from(entry.metadata.page_length(page)?));
+            self.index.retention().disk_read(
+                page,
+                u64::from(entry.metadata.page_length_in(page, entry.page_size)?),
+            );
             Ok(Some(DirectRecord {
                 token,
                 metadata: entry.metadata.for_pin(),
@@ -1460,6 +1462,7 @@ impl StoreWriter {
             index_ticket.publish(
                 id.clone(),
                 IndexedPage {
+                    page_size: racer_wire::object::PageSize::DEFAULT,
                     location,
                     metadata: page.metadata.immutable(),
                     key_id: page.ciphertext.envelope().key_id,
@@ -1678,7 +1681,9 @@ impl Drop for DirtyCleanup<'_> {
 // Page record format version, stored after the magic. Readers treat any other
 // version as a cold miss.
 //
-// Version 3 layout:
+// Version 4 layout (version 3 plus the page size after the cipher, so a store
+// reopened under another published page size sees its pages as cut at the old
+// size):
 // - `[0, real)`: header fields followed by a SHA-256 digest of the preceding
 //   header bytes. `real` is at most `MAX_RAW_HEADER_BYTES`.
 // - `[real, header_len)`: zero padding. `header_len` (stored at bytes 12..16)
@@ -1687,7 +1692,7 @@ impl Drop for DirtyCleanup<'_> {
 // - `[header_len, header_len + ciphertext_length)`: ciphertext, so it starts at
 //   a disk-aligned offset and can be written from its own aligned buffer.
 // - The remainder up to the record extent is zero padding.
-pub const FORMAT_VERSION: u32 = 3;
+pub const FORMAT_VERSION: u32 = 4;
 pub const MAX_ID_BYTES: usize = 4096;
 pub const MAX_ETAG_BYTES: usize = 8192;
 /// Upper bound on the unpadded header, including its digest.
@@ -1913,8 +1918,9 @@ fn raw_layout(page: &CiphertextCopy, generation: Generation) -> Result<usize> {
     {
         return Err(Error::CorruptRecord);
     }
+    // Cipher and page size trail the variable-length fields.
     let header_bytes = HEADER_PREFIX_BYTES
-        .checked_add(4)
+        .checked_add(4 + 4)
         .ok_or(Error::CorruptRecord)?
         .checked_add(cache.len())
         .and_then(|len| len.checked_add(etag.len()))
@@ -2004,6 +2010,8 @@ fn header_bytes(page: &CiphertextCopy, generation: Generation, layout: &RecordLa
         out.extend_from_slice(content_type.as_bytes());
     }
     out.extend_from_slice(&(envelope.cipher as u32).to_le_bytes());
+    // Every page size is at most 16 MiB, so it fits a u32.
+    out.extend_from_slice(&(envelope.page_size.get() as u32).to_le_bytes());
     debug_assert_eq!(out.len() + HEADER_DIGEST_BYTES, layout.header_bytes);
     let digest = Sha256::digest(&out);
     out.extend_from_slice(&digest);
@@ -2161,6 +2169,8 @@ fn parse_header(bytes: &[u8], extent: Extent) -> Result<DecodedRecord> {
         )
     };
     let cipher = crate::model::PageCipher::try_from(r.u32()?)?;
+    let page_size = racer_wire::object::PageSize::from_wire(u64::from(r.u32()?))
+        .map_err(|_| Error::CorruptRecord)?;
     if !r.0.is_empty() || generation.0 == 0 {
         return Err(Error::CorruptRecord);
     }
@@ -2175,6 +2185,7 @@ fn parse_header(bytes: &[u8], extent: Extent) -> Result<DecodedRecord> {
     };
     let envelope = PageEnvelope {
         cipher,
+        page_size,
         page: PageId { version, number },
         key_id,
         nonce,
@@ -2220,7 +2231,7 @@ fn header_fields_len(r: &mut Decoder<'_>) -> Result<usize> {
         return Err(Error::CorruptRecord);
     }
     r.take(content_type_len)?;
-    r.take(4)?;
+    r.take(4 + 4)?;
     Ok(start - r.0.len())
 }
 pub fn decode(

@@ -1362,6 +1362,7 @@ fn real_http_ciphertext_fragmentation_pool_reuse_and_truncation() {
     };
     let body = vec![0x9a; 8192 + 16];
     let envelope = PageEnvelope {
+        page_size: racer_wire::object::PageSize::DEFAULT,
         cipher: crate::model::PageCipher::Xaes256Gcm,
         page: PageId {
             version: version.clone(),

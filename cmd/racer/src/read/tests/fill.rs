@@ -17,6 +17,7 @@ fn bounded_admission_prefetched_bootstrap_fails_without_waiting() {
     let plain = f.fill.reserve_bootstrap(&f.context.object.cache).unwrap();
     let plaintext = f.fill.dependencies.buffers.plaintext(plain, 3).unwrap();
     let origin = OriginPage {
+        page_size: racer_wire::object::PageSize::DEFAULT,
         metadata: f.origin.metadata.clone(),
         plaintext,
     };
@@ -1388,6 +1389,7 @@ fn idle_tiny_prefix_must_not_hide_reclaimable_full_page() {
                     )
                     .unwrap(),
                 crate::model::PageEnvelope {
+                    page_size: racer_wire::object::PageSize::DEFAULT,
                     cipher: crate::model::PageCipher::Xaes256Gcm,
                     page: id.clone(),
                     key_id: crate::model::key_id_from_generation(1, 1).unwrap(),
@@ -1998,6 +2000,7 @@ mod metadata {
                     let mut plaintext = self.buffers.plaintext(reservation, bytes.len())?;
                     plaintext.bytes_mut()?.copy_from_slice(&bytes);
                     reply.page_zero = Some(OriginPage {
+                        page_size: racer_wire::object::PageSize::DEFAULT,
                         metadata: page.metadata,
                         plaintext,
                     });
@@ -2080,6 +2083,7 @@ mod metadata {
                     let mut plaintext = f.origin.buffers.plaintext(reservation, 3).unwrap();
                     plaintext.bytes_mut().unwrap().copy_from_slice(b"abc");
                     Some(OriginPage {
+                        page_size: racer_wire::object::PageSize::DEFAULT,
                         metadata: fresh.clone(),
                         plaintext,
                     })
@@ -2583,6 +2587,7 @@ mod pressure {
                         .reserve(Some(cache), ResourceClass::Ciphertext, 19)
                         .unwrap(),
                     crate::model::PageEnvelope {
+                        page_size: racer_wire::object::PageSize::DEFAULT,
                         cipher: crate::model::PageCipher::Xaes256Gcm,
                         page: id,
                         key_id: crate::model::key_id_from_generation(1, 1).unwrap(),
@@ -3082,6 +3087,7 @@ impl Origin for TestOrigin {
                 plaintext.bytes_mut()?.fill(page.number.0 as u8);
             }
             Ok(OriginPage {
+                page_size: racer_wire::object::PageSize::DEFAULT,
                 metadata: self.metadata.clone(),
                 plaintext,
             })

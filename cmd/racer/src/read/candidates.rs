@@ -4334,6 +4334,7 @@ pub(super) mod tests {
                 entries: vec![(
                     page.clone(),
                     IndexedPage {
+                        page_size: racer_wire::object::PageSize::DEFAULT,
                         location: RecordLocation {
                             segment: page_alloc::SegmentId(0),
                             generation: page_alloc::Generation(1),

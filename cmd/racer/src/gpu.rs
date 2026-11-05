@@ -3134,6 +3134,7 @@ mod tests {
     ) -> (Vec<u8>, impl FnOnce(SealedSource) -> Box<SealedPage>) {
         let metadata = metadata(plaintext.len() as u64);
         let envelope = PageEnvelope {
+            page_size: racer_wire::object::PageSize::DEFAULT,
             cipher: PageCipher::Xaes256Gcm,
             page: PageId {
                 version: metadata.version.clone(),

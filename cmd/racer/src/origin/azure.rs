@@ -358,6 +358,16 @@ impl<T: AzureTransport, K: AzureTokenSource> AzureOrigin<T, K> {
         Ok((snapshot, index))
     }
 
+    /// The published cluster page size; the default before any publication.
+    fn page_size(&self) -> Result<racer_wire::object::PageSize> {
+        Ok(self
+            .snapshots
+            .current()?
+            .map_or(racer_wire::object::PageSize::DEFAULT, |snapshot| {
+                snapshot.page_size
+            }))
+    }
+
     /// Check the supplied full-page plaintext charge without taking ownership.
     fn validate_reservation(
         &self,
@@ -481,10 +491,12 @@ impl<T: AzureTransport, K: AzureTokenSource> AzureOrigin<T, K> {
         scope: &RequestScope,
     ) -> Result<MetadataReply> {
         self.validate_reservation(&reservation, &context.object)?;
+        let page_size = self.page_size()?;
+        let size = page_size.get();
         let begun = self.begin(definition, context, scope).await?;
         let range = ByteRange {
             first: 0,
-            last: PAGE_BYTES - 1,
+            last: size - 1,
         };
         let exchange = self
             .send(definition, &begun, AzureMethod::Get, Some(range), None)
@@ -496,7 +508,7 @@ impl<T: AzureTransport, K: AzureTokenSource> AzureOrigin<T, K> {
                 let (first, last, total) = content_range(head)?;
                 if first != 0
                     || blob.content_length != last + 1
-                    || blob.content_length != total.min(PAGE_BYTES)
+                    || blob.content_length != total.min(size)
                 {
                     return Err(Error::BadGateway);
                 }
@@ -505,9 +517,7 @@ impl<T: AzureTransport, K: AzureTokenSource> AzureOrigin<T, K> {
             // Defensive: a service that ignores the range must still fit page 0.
             200 => {
                 let blob = response::blob(head, &begun.object)?;
-                if response::field(head, "Content-Range")?.is_some()
-                    || blob.content_length > PAGE_BYTES
-                {
+                if response::field(head, "Content-Range")?.is_some() || blob.content_length > size {
                     return Err(Error::BadGateway);
                 }
                 let total = blob.content_length;
@@ -550,6 +560,7 @@ impl<T: AzureTransport, K: AzureTokenSource> AzureOrigin<T, K> {
             page_zero: Some(OriginPage {
                 metadata: metadata.clone(),
                 plaintext,
+                page_size,
             }),
             metadata,
         })
@@ -618,13 +629,11 @@ impl<T: AzureTransport, K: AzureTokenSource> AzureOrigin<T, K> {
         if page.version.object != context.object {
             return Err(Error::Unauthorized);
         }
-        let first = page
-            .number
-            .0
-            .checked_mul(PAGE_BYTES)
-            .ok_or(Error::InvalidRange)?;
+        let page_size = self.page_size()?;
+        let size = page_size.get();
+        let first = page.number.0.checked_mul(size).ok_or(Error::InvalidRange)?;
         let last = first
-            .checked_add(PAGE_BYTES - 1)
+            .checked_add(size - 1)
             .filter(|last| *last <= i64::MAX as u64)
             .ok_or(Error::InvalidRange)?;
         self.validate_reservation(&reservation, &context.object)?;
@@ -652,7 +661,7 @@ impl<T: AzureTransport, K: AzureTokenSource> AzureOrigin<T, K> {
         let (got_first, got_last, total) = content_range(head)?;
         if got_first != first
             || blob.content_length != got_last - got_first + 1
-            || blob.content_length != (total - first).min(PAGE_BYTES)
+            || blob.content_length != (total - first).min(size)
         {
             return Err(Error::BadGateway);
         }
@@ -670,6 +679,7 @@ impl<T: AzureTransport, K: AzureTokenSource> AzureOrigin<T, K> {
         Ok(OriginPage {
             metadata,
             plaintext,
+            page_size,
         })
     }
 }

@@ -2370,6 +2370,7 @@ mod tests {
                 etag: StrongEtag::parse(b"\"provider\"").unwrap(),
             };
             let envelope = PageEnvelope {
+                page_size: racer_wire::object::PageSize::DEFAULT,
                 cipher: crate::model::PageCipher::Xaes256Gcm,
                 page: PageId {
                     version: version.clone(),

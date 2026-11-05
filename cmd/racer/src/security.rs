@@ -460,6 +460,7 @@ impl PageCrypto {
     pub fn encrypt<'a>(
         &'a self,
         page: PageId,
+        page_size: racer_wire::object::PageSize,
         plaintext: PlaintextBuffer,
         ciphertext: flow_control::Charge<AdmissionPolicy>,
         scope: &'a RequestScope,
@@ -482,6 +483,7 @@ impl PageCrypto {
                 .execute(
                     CryptoInput::Encrypt {
                         page,
+                        page_size,
                         plaintext,
                         ciphertext,
                     },
@@ -604,6 +606,7 @@ impl PageCryptoEngine {
             CryptoInput::VerifyTag { .. } => unreachable!("tag check handled above"),
             CryptoInput::Encrypt {
                 page,
+                page_size,
                 plaintext,
                 ciphertext,
             } => {
@@ -620,6 +623,7 @@ impl PageCryptoEngine {
                 let length = u32::try_from(raw.len()).map_err(|_| Error::InvalidRequest)?;
                 let envelope = PageEnvelope {
                     cipher: crate::model::PageCipher::Xaes256Gcm,
+                    page_size: *page_size,
                     page: page.clone(),
                     key_id: key.id(),
                     nonce: fresh_nonce(&ctx.rng)?,
@@ -718,6 +722,7 @@ impl PageCryptoEngine {
                 page,
                 plaintext,
                 ciphertext,
+                ..
             } => {
                 let plain = VerifiedPage {
                     inner: Arc::new(VerifiedBytes {
@@ -1141,6 +1146,8 @@ pub enum CryptoInput {
     },
     Encrypt {
         page: PageId,
+        /// Cluster page size the plaintext was cut at (D13).
+        page_size: racer_wire::object::PageSize,
         plaintext: PlaintextBuffer,
         /// Aligned AEAD output checked out of the requesting worker's pool,
         /// already charged; the page is held as disk-aligned ciphertext.
@@ -2055,6 +2062,7 @@ mod tests {
             }
             fn envelope(size: usize) -> PageEnvelope {
                 PageEnvelope {
+                    page_size: racer_wire::object::PageSize::DEFAULT,
                     cipher: crate::model::PageCipher::Xaes256Gcm,
                     page: page(),
                     key_id: crate::model::key_id_from_generation(1, 1).unwrap(),
@@ -3334,6 +3342,7 @@ mod tests {
                             .unwrap();
                         plain.bytes_mut().unwrap().copy_from_slice(source);
                         CryptoInput::Encrypt {
+                            page_size: racer_wire::object::PageSize::DEFAULT,
                             page: page.clone(),
                             plaintext: plain,
                             ciphertext: crate::memory::fixture_encrypt_output(
@@ -3439,6 +3448,7 @@ mod tests {
                 use crate::model::*;
                 let cache = CacheId("00000000-0000-4000-8000-000000000003".into());
                 CryptoInput::Encrypt {
+                    page_size: racer_wire::object::PageSize::DEFAULT,
                     page: PageId {
                         version: ObjectVersion {
                             object: ObjectId {
@@ -3749,6 +3759,7 @@ mod tests {
                     )
                     .unwrap();
                 let input = CryptoInput::Encrypt {
+                    page_size: racer_wire::object::PageSize::DEFAULT,
                     page: PageId {
                         version: ObjectVersion {
                             object: ObjectId {
@@ -3859,6 +3870,7 @@ mod tests {
                 let scope = RequestScope::host(RequestId([0; 16]), Instant::now()).unwrap();
                 let result = futures::executor::block_on(client.execute(
                     CryptoInput::Encrypt {
+                        page_size: racer_wire::object::PageSize::DEFAULT,
                         page,
                         plaintext,
                         ciphertext: crate::memory::fixture_encrypt_output(&admission, ciphertext),
@@ -3933,6 +3945,7 @@ mod tests {
     }
     fn envelope() -> PageEnvelope {
         PageEnvelope {
+            page_size: racer_wire::object::PageSize::DEFAULT,
             cipher: crate::model::PageCipher::Xaes256Gcm,
             page: PageId {
                 version: ObjectVersion {
@@ -4427,7 +4440,13 @@ mod tests {
             let reservation = admission
                 .reserve(Some(&cache), ResourceClass::Ciphertext, length + 16)
                 .unwrap();
-            let mut future = crypto.encrypt(page.clone(), plaintext, reservation, &scope);
+            let mut future = crypto.encrypt(
+                page.clone(),
+                racer_wire::object::PageSize::DEFAULT,
+                plaintext,
+                reservation,
+                &scope,
+            );
             assert!(future.as_mut().poll(&mut cx).is_pending());
             futures.push(future);
         }
@@ -4554,6 +4573,7 @@ mod tests {
             assert!(
                 io.try_submit(permit.job(
                     CryptoInput::Encrypt {
+                        page_size: racer_wire::object::PageSize::DEFAULT,
                         page: page.clone(),
                         plaintext,
                         ciphertext: crate::memory::fixture_encrypt_output(&admission, ciphertext)

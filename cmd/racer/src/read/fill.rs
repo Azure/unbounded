@@ -1853,7 +1853,10 @@ impl Fill {
         use crate::admission::ResourceClass;
         use crate::model::PAGE_BYTES;
         if origin.plaintext.bytes()?.len()
-            != origin.metadata.immutable().page_length(page)? as usize
+            != origin
+                .metadata
+                .immutable()
+                .page_length_in(page, origin.page_size)? as usize
         {
             return Err(Error::CorruptRecord);
         }
@@ -1893,9 +1896,13 @@ impl Fill {
         let (plaintext, ciphertext) = self
             .call(
                 DriverStage::EncryptCall,
-                self.dependencies
-                    .crypto
-                    .encrypt(page.clone(), origin.plaintext, ciphertext, scope),
+                self.dependencies.crypto.encrypt(
+                    page.clone(),
+                    origin.page_size,
+                    origin.plaintext,
+                    ciphertext,
+                    scope,
+                ),
             )
             .await?;
         let result = PageResult {
@@ -2620,16 +2627,23 @@ impl Fill {
         if origin.metadata.version != page.version {
             return Err(Error::CorruptRecord);
         }
-        let expected = origin.metadata.immutable().page_length(page)?;
+        let expected = origin
+            .metadata
+            .immutable()
+            .page_length_in(page, origin.page_size)?;
         if origin.plaintext.bytes()?.len() != expected as usize {
             return Err(Error::CorruptRecord);
         }
         let (plaintext, ciphertext) = self
             .call(
                 DriverStage::EncryptCall,
-                self.dependencies
-                    .crypto
-                    .encrypt(page.clone(), origin.plaintext, ciphertext, scope),
+                self.dependencies.crypto.encrypt(
+                    page.clone(),
+                    origin.page_size,
+                    origin.plaintext,
+                    ciphertext,
+                    scope,
+                ),
             )
             .await?;
         Ok(PageResult {

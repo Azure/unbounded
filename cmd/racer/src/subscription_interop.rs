@@ -134,6 +134,7 @@ impl origin::Origin for GeneratedOrigin {
                 *byte = ((offset + i as u64) % 251) as u8;
             }
             Ok(origin::OriginPage {
+                page_size: racer_wire::object::PageSize::DEFAULT,
                 metadata,
                 plaintext,
             })

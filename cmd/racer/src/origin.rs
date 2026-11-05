@@ -164,6 +164,7 @@ impl OriginClient {
             page_zero: Some(OriginPage {
                 metadata: metadata.clone(),
                 plaintext: body.buffer,
+                page_size: size,
             }),
             metadata,
         })
@@ -269,6 +270,7 @@ impl OriginClient {
         Ok(OriginPage {
             metadata,
             plaintext: body.buffer,
+            page_size: size,
         })
     }
 
@@ -472,6 +474,8 @@ pub fn validate_metadata(head: &MessageHead, object: &ObjectId) -> Result<Object
 pub struct OriginPage {
     pub metadata: ObjectMetadata,
     pub plaintext: PlaintextBuffer,
+    /// Page size the plaintext was cut at (D13).
+    pub page_size: PageSize,
 }
 /// Require exact If-Match, Content-Range, whole-page length, and final-page bounds.
 /// Reject multipart, short/overlong bodies, and unexpected versions.

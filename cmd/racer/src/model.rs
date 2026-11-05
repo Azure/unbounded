@@ -40,6 +40,9 @@ impl TryFrom<u32> for PageCipher {
 pub struct PageEnvelope {
     pub cipher: PageCipher,
 
+    /// Cluster page size the page was cut at (D13); bounds `plaintext_length`.
+    pub page_size: PageSize,
+
     pub page: PageId,
 
     pub key_id: KeyId,
@@ -56,7 +59,7 @@ impl PageEnvelope {
     /// Check structural bounds, not identity, final-page length, or authentication.
     pub fn validate(&self) -> Result<()> {
         if self.plaintext_length == 0
-            || u64::from(self.plaintext_length) > PAGE_BYTES
+            || u64::from(self.plaintext_length) > self.page_size.get()
             || self.plaintext_length.checked_add(AEAD_TAG_BYTES) != Some(self.ciphertext_length)
         {
             return Err(Error::CorruptRecord);
@@ -77,6 +80,10 @@ impl PageDescriptor for PageEnvelope {
 
     fn plaintext_length(&self) -> u32 {
         self.plaintext_length
+    }
+
+    fn page_size(&self) -> PageSize {
+        self.page_size
     }
 }
 
@@ -108,9 +115,44 @@ mod tests {
     }
 
     #[test]
+    fn page_bounds_follow_the_declared_page_size() {
+        let small = PageSize::new(64 << 10).unwrap();
+        let descriptor = descriptor("v1", 3 * small.get() + 5);
+        let mut envelope = PageEnvelope {
+            page_size: small,
+            cipher: PageCipher::Xaes256Gcm,
+            page: PageId {
+                version: descriptor.version.clone(),
+                number: PageNumber(3),
+            },
+            key_id: KeyId([0; 16]),
+            nonce: Nonce([0; 24]),
+            plaintext_length: 5,
+            ciphertext_length: 21,
+        };
+        let corrupt = Err(racer_wire::object::Error::CorruptRecord);
+        assert_eq!(descriptor.validate_page(&envelope), Ok(()));
+        assert_eq!(descriptor.validate_page_in(&envelope, small), Ok(()));
+        // The cluster's size is another: the page was cut at other offsets.
+        assert_eq!(
+            descriptor.validate_page_in(&envelope, PageSize::DEFAULT),
+            corrupt
+        );
+        envelope.page.number = PageNumber(1);
+        envelope.plaintext_length = small.get() as u32;
+        envelope.ciphertext_length = envelope.plaintext_length + 16;
+        assert_eq!(descriptor.validate_page(&envelope), Ok(()));
+        // A small page never carries more than its declared size.
+        envelope.plaintext_length += 1;
+        envelope.ciphertext_length += 1;
+        assert_eq!(envelope.validate(), Err(Error::CorruptRecord));
+    }
+
+    #[test]
     fn page_bounds_use_total_version_length_and_reject_empty_overflow_and_mismatch() {
         let descriptor = descriptor("v1", PAGE_BYTES + 3);
         let mut envelope = PageEnvelope {
+            page_size: racer_wire::object::PageSize::DEFAULT,
             cipher: PageCipher::Xaes256Gcm,
             page: PageId {
                 version: descriptor.version.clone(),
@@ -146,6 +188,7 @@ mod tests {
     #[test]
     fn envelope_enforces_nonempty_bounded_plaintext_and_exact_tag_length() {
         let mut envelope = PageEnvelope {
+            page_size: racer_wire::object::PageSize::DEFAULT,
             cipher: PageCipher::Xaes256Gcm,
             page: PageId {
                 version: ObjectVersion {

@@ -119,6 +119,7 @@ fn dirty_pressure_skips_persistence_while_bootstrap_read_succeeds() {
         let result = drive(
             f.fill.publish_bootstrap_with_context(
                 OriginPage {
+                    page_size: racer_wire::object::PageSize::DEFAULT,
                     metadata: f.origin.metadata.clone(),
                     plaintext,
                 },

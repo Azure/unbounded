@@ -357,6 +357,7 @@ fn hard_hold_checkpoint_roundtrip_restores_only_live_disk_reservations() {
     f.store.checkpoint.finish_snapshot();
     let bytes = checkpoint::encode(&checkpoint::CheckpointImage {
         version: checkpoint::CHECKPOINT_VERSION,
+        page_size: racer_wire::object::PageSize::DEFAULT,
         cluster: crate::store::checkpoint::test_cluster(),
         sequence: 1,
         shards: vec![shard],
@@ -476,6 +477,7 @@ fn hard_hold_checkpoint_fences_warm_owned_publication_and_restores_veto() {
     f.store.checkpoint.finish_snapshot();
     let encoded = crate::store::checkpoint::encode(&crate::store::checkpoint::CheckpointImage {
         version: crate::store::checkpoint::CHECKPOINT_VERSION,
+        page_size: racer_wire::object::PageSize::DEFAULT,
         cluster: crate::store::checkpoint::test_cluster(),
         sequence: 1,
         shards: vec![shard],
@@ -536,6 +538,7 @@ fn hard_hold_checkpoint_captures_hold_added_during_index_traversal() {
             .publish(
                 id.clone(),
                 catalog::IndexedPage {
+                    page_size: racer_wire::object::PageSize::DEFAULT,
                     location: catalog::RecordLocation {
                         segment: lease.id(),
                         generation: lease.generation(),
@@ -1339,6 +1342,7 @@ impl Fixture {
             etag: StrongEtag::parse(b"\"v1\"").unwrap(),
         };
         let envelope = PageEnvelope {
+            page_size: racer_wire::object::PageSize::DEFAULT,
             cipher: crate::model::PageCipher::Xaes256Gcm,
             page: PageId {
                 version: version.clone(),
@@ -1725,6 +1729,7 @@ fn checkpoint_exact_budget_matches_full_snapshot_with_holds() {
     let bytes = |shard| {
         encode(&CheckpointImage {
             version: CHECKPOINT_VERSION,
+            page_size: racer_wire::object::PageSize::DEFAULT,
             cluster: crate::store::checkpoint::test_cluster(),
             sequence: 1,
             shards: vec![shard],
@@ -2036,6 +2041,7 @@ fn allocator_integration_validates_reader_charges_before_submission() {
         .publish(
             id.clone(),
             catalog::IndexedPage {
+                page_size: racer_wire::object::PageSize::DEFAULT,
                 location: catalog::RecordLocation {
                     segment: lease.id(),
                     generation: lease.generation(),
@@ -2170,6 +2176,7 @@ fn index_capacity_rejection_preserves_segments_and_releases_all_charges_without_
         .publish(
             retained_id.clone(),
             catalog::IndexedPage {
+                page_size: racer_wire::object::PageSize::DEFAULT,
                 location: location.clone(),
                 metadata: retained.metadata.immutable(),
                 key_id: retained.ciphertext.envelope().key_id,
@@ -3434,6 +3441,7 @@ mod records {
                 inner: Arc::new(CiphertextBytes {
                     pins: Default::default(),
                     envelope: PageEnvelope {
+                        page_size: racer_wire::object::PageSize::DEFAULT,
                         cipher: crate::model::PageCipher::Xaes256Gcm,
                         page: PageId {
                             version: metadata.version.clone(),
@@ -3477,17 +3485,17 @@ mod records {
             .collect()
     }
 
-    // Little-endian v3 record header for `page(3, 0, "cache", "v1")` at
+    // Little-endian v4 record header for `page(3, 0, "cache", "v1")` at
     // generation 7, including the header digest. The header is zero padded to
     // 512 bytes, the ciphertext follows at offset 512, and bytes past the
     // ciphertext are zero padding.
     const GOLDEN_HEADER: &str = concat!(
-        "5243525041474531030000000002000007000000000000000300000000000000",
+        "5243525041474531040000000002000007000000000000000300000000000000",
         "0000000000000000030000001300000001010101010101010101010101010101",
         "0202020202020202020202020202020202020202020202020303030303030303",
         "0303030303030303030303030303030303030303030303030500000004000000",
-        "6361636865227631220000000001000000efd2fa324e302a5dcfbbd673b1bf42",
-        "a3409a8a1263ed59340f6b05e5cb2104c4",
+        "636163686522763122000000000100000000000001ed0efaa82e84e8ef91b1a1",
+        "8d5b9717a65080f3e32c858a18f5cc6c37a393992f",
     );
     const GOLDEN_CIPHERTEXT: &str = "02020202020202020202020202020202020202";
 
@@ -3529,7 +3537,7 @@ mod records {
             let logical = logical_length(&page).unwrap();
             assert_eq!(
                 logical,
-                128 + 8 + cache.len() + etag.len() + 2 + 32 + length + 16
+                128 + 12 + cache.len() + etag.len() + 2 + 32 + length + 16
             );
             let record = record_length(&page, alignment).unwrap();
             let extent = alignment.extent(offset, record).unwrap();
@@ -3687,7 +3695,7 @@ mod records {
             UNIX_EPOCH + std::time::Duration::from_millis(1),
         ] {
             page.metadata.expires_at = ExpiresAt::from_system_time(expiry).unwrap();
-            assert_eq!(logical_length(&page), Ok(196));
+            assert_eq!(logical_length(&page), Ok(200));
             let encoded = encode(
                 &page,
                 Generation(7),
@@ -3967,11 +3975,11 @@ mod records {
     #[test]
     fn ciphertext_starts_at_aligned_header_block_across_boundaries() {
         let admission = admission();
-        // The real header is 175 bytes plus the ETag length for "cache" IDs.
+        // The real header is 179 bytes plus the ETag length for "cache" IDs.
         for unit in [512, 4096] {
             let alignment = Alignment::new(unit, unit as u64, unit).unwrap();
             for real in [512 - 1, 512, 512 + 1, 4096 - 1, 4096, 4096 + 1] {
-                let etag = "x".repeat(real - 175);
+                let etag = "x".repeat(real - 179);
                 for content_type in [None, Some("text/plain")] {
                     let mut page = page(&admission, 3, 0, "cache", &etag);
                     page.metadata.content_type = content_type
@@ -4421,6 +4429,7 @@ mod checkpoint {
             .publish(
                 page,
                 IndexedPage {
+                    page_size: racer_wire::object::PageSize::DEFAULT,
                     location: RecordLocation {
                         segment: allocation.id,
                         generation: allocation.generation,
@@ -4445,6 +4454,7 @@ mod checkpoint {
     fn image(sequence: u64) -> CheckpointImage {
         CheckpointImage {
             version: CHECKPOINT_VERSION,
+            page_size: racer_wire::object::PageSize::DEFAULT,
             cluster: crate::store::checkpoint::test_cluster(),
             sequence,
             shards: vec![shard()],
@@ -4549,7 +4559,7 @@ mod checkpoint {
     fn cluster_round_trips_and_binds_the_digest() {
         let original = image(3);
         let bytes = encode(&original).unwrap();
-        assert_eq!(CHECKPOINT_VERSION, 3);
+        assert_eq!(CHECKPOINT_VERSION, 4);
         assert_eq!(&bytes[32..68], original.cluster.0.as_bytes());
         let decoded = decode(&bytes).unwrap();
         assert_eq!(decoded.cluster, original.cluster);
@@ -4736,6 +4746,7 @@ mod checkpoint {
         let (index, segments) = state(8);
         let image = CheckpointImage {
             version: CHECKPOINT_VERSION,
+            page_size: racer_wire::object::PageSize::DEFAULT,
             cluster: crate::store::checkpoint::test_cluster(),
             sequence: 1,
             shards: vec![ShardImage {
@@ -4754,7 +4765,7 @@ mod checkpoint {
             .collect();
         assert_eq!(
             digest,
-            "97f3dc695de6f0100f14f371fcf48fdf99b60469171e1e8e802e888d618e384d"
+            "bbf59ea8dd0c1f31c0790d92da22835a5d1ab13391ea37c16c8a5dbc824376bf"
         );
     }
 
@@ -4775,7 +4786,7 @@ mod checkpoint {
             .collect();
         assert_eq!(
             digest,
-            "188367304f9eee50bf312335bc838c5277b171ac387e50c28f3d3f5bc02d4220"
+            "23b6ac07a293ccf5f5ea277ec59980d3fc5a82b66a68b0a2190100ec07e51caa"
         );
         let decoded = checkpoint_format::decode(&bytes).unwrap();
         assert_eq!(decoded.shards[0].index.entries.len(), 1);
@@ -5174,6 +5185,7 @@ mod checkpoint {
                         number: PageNumber(number),
                     },
                     IndexedPage {
+                        page_size: racer_wire::object::PageSize::DEFAULT,
                         metadata: metadata.clone(),
                         key_id: crate::model::key_id_from_generation(1, 1).unwrap(),
                         location: RecordLocation {
@@ -5416,6 +5428,7 @@ fn over_share_fixture() -> (Fixture, CacheId, CacheId) {
         .publish(
             resident.ciphertext.envelope().page.clone(),
             catalog::IndexedPage {
+                page_size: racer_wire::object::PageSize::DEFAULT,
                 metadata: crate::model::VersionMetadata {
                     content_type: None,
                     version: resident.metadata.version.clone(),

@@ -185,6 +185,12 @@ impl PageSize {
         }
     }
 
+    /// Decode a page size carried by a peer message or a stored record. Accepts every size
+    /// any constructor accepts; whether it is the cluster's size is the reader's check.
+    pub fn from_wire(bytes: u64) -> Result<Self> {
+        Self::checked(bytes, Self::TEST_MIN)
+    }
+
     pub const fn get(self) -> u64 {
         self.0
     }
@@ -542,14 +548,20 @@ impl VersionMetadata {
     }
 
     /// Structural consistency only, not authentication of origin/peer/disk input.
+    ///
+    /// Checks the page against the page size the envelope itself declares; callers that
+    /// know the cluster page size use [`Self::validate_page_in`] to also reject a page cut
+    /// at another size.
     pub fn validate_page(&self, envelope: &impl PageDescriptor) -> Result<()> {
-        self.validate_page_in(envelope, PageSize::DEFAULT)
+        self.validate_page_in(envelope, envelope.page_size())
     }
 
-    /// [`Self::validate_page`] for pages of `size`.
+    /// [`Self::validate_page`] that also requires the envelope to declare `size`.
     pub fn validate_page_in(&self, envelope: &impl PageDescriptor, size: PageSize) -> Result<()> {
         envelope.validate_structure()?;
-        if self.page_length_in(envelope.page(), size)? != envelope.plaintext_length() {
+        if envelope.page_size() != size
+            || self.page_length_in(envelope.page(), size)? != envelope.plaintext_length()
+        {
             return Err(Error::CorruptRecord);
         }
         Ok(())
@@ -616,6 +628,9 @@ pub trait PageDescriptor {
 
     /// Return the decoded page length, excluding transport or encryption overhead.
     fn plaintext_length(&self) -> u32;
+
+    /// Return the page size the page was cut at (D13).
+    fn page_size(&self) -> PageSize;
 }
 
 #[cfg(test)]

@@ -91,6 +91,7 @@ fn final_payload_owner_scrubs_full_allocation_on_reclaim_and_rejection() {
                     .ciphertext(
                         reservation,
                         PageEnvelope {
+                            page_size: racer_wire::object::PageSize::DEFAULT,
                             cipher: racer::model::PageCipher::Xaes256Gcm,
                             page: PageId {
                                 version: ObjectVersion {
@@ -213,6 +214,7 @@ fn failed_crypto_output_is_scrubbed(config: &Config) {
         let pool = BufferPool::new(admission.clone());
         let key = keys.active(&cache, KeyPurpose::Page).unwrap();
         let mut descriptor = PageEnvelope {
+            page_size: racer_wire::object::PageSize::DEFAULT,
             cipher: racer::model::PageCipher::Xaes256Gcm,
             page: PageId {
                 version: ObjectVersion {
@@ -248,6 +250,7 @@ fn failed_crypto_output_is_scrubbed(config: &Config) {
             plaintext.bytes_mut().unwrap().fill(0xa7);
             watch(plaintext.bytes().unwrap().as_ptr());
             CryptoInput::Encrypt {
+                page_size: racer_wire::object::PageSize::DEFAULT,
                 page: descriptor.page,
                 plaintext,
                 ciphertext: Box::new(

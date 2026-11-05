@@ -543,6 +543,7 @@ mod tests {
                     expires_at: ExpiresAt::from_system_time(std::time::UNIX_EPOCH).unwrap(),
                 },
                 envelope: PageEnvelope {
+                    page_size: racer_wire::object::PageSize::DEFAULT,
                     cipher: PageCipher::Xaes256Gcm,
                     page: page(0),
                     key_id: racer_wire::control::KeyId([0; 16]),

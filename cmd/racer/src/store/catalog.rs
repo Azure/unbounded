@@ -158,6 +158,8 @@ impl PageTicket {
 #[derive(Clone, Debug)]
 pub struct IndexedPage {
     pub location: RecordLocation,
+    /// Page size the stored record was cut at (D13).
+    pub page_size: racer_wire::object::PageSize,
     pub metadata: VersionMetadata,
     pub key_id: KeyId,
 }
@@ -187,7 +189,7 @@ impl IndexSnapshot {
             lengths.insert(&metadata.version, metadata);
         }
         for (page, entry) in &self.entries {
-            entry.metadata.page_length(page)?;
+            entry.metadata.page_length_in(page, entry.page_size)?;
         }
         Ok(())
     }
@@ -436,7 +438,7 @@ impl Index {
                 let Some(entry) = state.pages.get(&page) else {
                     continue;
                 };
-                let Ok(bytes) = entry.metadata.page_length(&page) else {
+                let Ok(bytes) = entry.metadata.page_length_in(&page, entry.page_size) else {
                     continue;
                 };
                 snapshot.pages = snapshot.pages.saturating_add(1);
@@ -817,7 +819,8 @@ impl Index {
     /// one bounds how much payload the worker can keep resident. Segment space
     /// is ignored until segments are bound.
     pub fn disk_capacity(&self) -> u64 {
-        let pages = (self.page_capacity.get() as u64).saturating_mul(crate::model::PAGE_BYTES);
+        let size = self.state.borrow().pages.page_size().get();
+        let pages = (self.page_capacity.get() as u64).saturating_mul(size);
         self.holds
             .borrow()
             .segments
@@ -949,7 +952,7 @@ impl Index {
             return Ok(());
         }
         Self::validate_descriptor(&entry.metadata)?;
-        let payload_bytes = u64::from(entry.metadata.page_length(&page)?);
+        let payload_bytes = u64::from(entry.metadata.page_length_in(&page, entry.page_size)?);
         let mut state = self.state.borrow_mut();
         Self::check_length(&state, &entry.metadata)?;
         if !state.pages.contains_key(&page)
@@ -1303,14 +1306,15 @@ impl Index {
         scoring: &crate::retention::Scoring<'_>,
     ) -> u64 {
         let state = self.state.borrow();
+        let size = state.pages.page_size();
         state.pages.segment_score(
             segment,
             racer_core::cache::SCAN_BUDGET,
-            racer_core::cache::unseen_value_for(crate::model::PAGE_BYTES, scoring.any_over_share()),
+            racer_core::cache::unseen_value_for(size.get(), scoring.any_over_share()),
             |page, metadata, heat| {
                 racer_core::cache::page_value(
-                    metadata.page_length(page).ok(),
-                    crate::model::PAGE_BYTES as u32,
+                    metadata.page_length_in(page, size).ok(),
+                    size.get() as u32,
                     page_value(scoring, page, heat),
                 )
             },
@@ -1417,15 +1421,13 @@ impl Index {
         let entries = self.segment_entries_bounded(segment, budget);
         let removed = entries.len();
         for (page, location) in entries {
-            let bytes = self
-                .state
-                .borrow()
-                .pages
-                .get(&page)
-                .expect("indexed page")
+            let state = self.state.borrow();
+            let view = state.pages.get(&page).expect("indexed page");
+            let bytes = view
                 .metadata
-                .page_length(&page)
+                .page_length_in(&page, view.page_size)
                 .expect("validated indexed page");
+            drop(state);
             self.retention().evicted(&page, u64::from(bytes));
             self.remove_if_matches(&page, &location);
         }
@@ -1483,8 +1485,8 @@ impl SegmentClock {
     fn reclaim_to(&self, now: std::time::Instant, free_reserve: usize) -> Result<()> {
         let retention = self.index.retention();
         let scoring = retention.scoring_at(now, self.index.disk_capacity());
-        let unseen =
-            racer_core::cache::unseen_value_for(crate::model::PAGE_BYTES, scoring.any_over_share());
+        let size = self.index.state.borrow().pages.page_size();
+        let unseen = racer_core::cache::unseen_value_for(size.get(), scoring.any_over_share());
         let mut evicted = Vec::new();
         let result = self.index.state.borrow_mut().pages.reclaim(
             &self.segments,
@@ -1497,13 +1499,16 @@ impl SegmentClock {
             unseen,
             |page, metadata, heat| {
                 racer_core::cache::page_value(
-                    metadata.page_length(page).ok(),
-                    crate::model::PAGE_BYTES as u32,
+                    metadata.page_length_in(page, size).ok(),
+                    size.get() as u32,
                     page_value(&scoring, page, heat),
                 )
             },
             |page, metadata| {
-                evicted.push((page.clone(), metadata.page_length(page).unwrap_or(0)));
+                evicted.push((
+                    page.clone(),
+                    metadata.page_length_in(page, size).unwrap_or(0),
+                ));
             },
         );
         for (page, bytes) in evicted {
@@ -1626,6 +1631,7 @@ mod tests {
                 number: crate::model::PageNumber(0),
             },
             IndexedPage {
+                page_size: racer_wire::object::PageSize::DEFAULT,
                 metadata,
                 key_id: crate::model::key_id_from_generation(1, 1).unwrap(),
                 location: RecordLocation {
@@ -1680,6 +1686,7 @@ mod tests {
             ticket.publish(
                 page.clone(),
                 IndexedPage {
+                    page_size: racer_wire::object::PageSize::DEFAULT,
                     location: wrong,
                     ..entry.clone()
                 }
@@ -1700,6 +1707,7 @@ mod tests {
             .publish(
                 page.clone(),
                 IndexedPage {
+                    page_size: racer_wire::object::PageSize::DEFAULT,
                     location: location.clone(),
                     ..entry
                 },
@@ -2773,6 +2781,7 @@ mod priority_tests {
                 number: crate::model::PageNumber(0),
             },
             IndexedPage {
+                page_size: racer_wire::object::PageSize::DEFAULT,
                 metadata,
                 key_id: crate::model::key_id_from_generation(1, 1).unwrap(),
                 location: RecordLocation {

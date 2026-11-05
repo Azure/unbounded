@@ -2135,6 +2135,7 @@ pub(crate) mod tests {
                 .ciphertext(
                     reserved.ciphertext,
                     PageEnvelope {
+                        page_size: racer_wire::object::PageSize::DEFAULT,
                         cipher: crate::model::PageCipher::Xaes256Gcm,
                         page: id,
                         key_id: crate::model::key_id_from_generation(1, 1).unwrap(),
@@ -2297,6 +2298,7 @@ pub(crate) mod tests {
             let scope = scope();
             let mut work = crypto.encrypt(
                 page_id(&descriptor(&cache, "v1", 3)),
+                racer_wire::object::PageSize::DEFAULT,
                 plaintext,
                 reserved.ciphertext,
                 &scope,
@@ -2437,6 +2439,7 @@ pub(crate) mod tests {
                             .ciphertext(
                                 cipher_charge,
                                 PageEnvelope {
+                                    page_size: racer_wire::object::PageSize::DEFAULT,
                                     cipher: crate::model::PageCipher::Xaes256Gcm,
                                     page,
                                     key_id: crate::model::key_id_from_generation(1, 1).unwrap(),
@@ -4193,6 +4196,7 @@ pub(crate) mod tests {
             .aligned_ciphertext_page(
                 buffer,
                 PageEnvelope {
+                    page_size: racer_wire::object::PageSize::DEFAULT,
                     cipher: crate::model::PageCipher::Xaes256Gcm,
                     page,
                     key_id: crate::model::key_id_from_generation(1, 1).unwrap(),

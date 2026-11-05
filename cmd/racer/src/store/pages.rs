@@ -62,6 +62,7 @@ impl Walk {
 #[derive(Clone)]
 pub(super) struct PageView<'a> {
     pub page: &'a PageId,
+    pub page_size: racer_wire::object::PageSize,
     pub location: RecordLocation,
     pub metadata: &'a VersionMetadata,
     pub key_id: KeyId,
@@ -70,6 +71,7 @@ impl PageView<'_> {
     /// Clone the stored entry without its page identity.
     pub fn into_entry(self) -> IndexedPage {
         IndexedPage {
+            page_size: self.page_size,
             location: self.location,
             metadata: self.metadata.clone(),
             key_id: self.key_id,
@@ -97,6 +99,9 @@ pub(super) struct Pages {
     slots: u32,
     /// Stored pages (in-flight reservations excluded).
     stored: usize,
+    /// Page size of every stored record (D13). Fixed by the first stored page
+    /// while the table is empty; a record cut at another size is refused.
+    page_size: racer_wire::object::PageSize,
     versions: HashMap<ObjectVersion, (VersionMetadata, usize)>,
     /// Hold identities a rebuilt disk index must stay above.
     hold_floor: HoldId,
@@ -165,10 +170,22 @@ impl Pages {
             inner: None,
             slots,
             stored: 0,
+            page_size: racer_wire::object::PageSize::DEFAULT,
             versions: HashMap::default(),
             hold_floor: HoldId::default(),
             hash_key: KeyedState::default(),
         }
+    }
+
+    /// Whether a record cut at `size` may join the table: every stored page
+    /// shares one page size, adopted while the table is empty.
+    fn accepts(&self, size: racer_wire::object::PageSize) -> bool {
+        self.stored == 0 || self.page_size == size
+    }
+
+    /// Page size of the stored records.
+    pub fn page_size(&self) -> racer_wire::object::PageSize {
+        self.page_size
     }
 
     /// Stored pages, excluding in-flight reservations.
@@ -249,6 +266,7 @@ impl Pages {
                 (
                     page.clone(),
                     IndexedPage {
+                        page_size: self.page_size,
                         location: location(&view),
                         metadata: self.versions[&page.version].0.clone(),
                         key_id: inner.keys[slot.0 as usize],
@@ -280,6 +298,7 @@ impl Pages {
         let page = inner.slots.key(slot).expect("interned page");
         PageView {
             page,
+            page_size: self.page_size,
             location: location(view),
             metadata: &self.versions[&page.version].0,
             key_id: inner.keys[slot.0 as usize],
@@ -372,10 +391,15 @@ impl Pages {
         entry: IndexedPage,
     ) -> Result<bool> {
         let IndexedPage {
+            page_size,
             location,
             metadata,
             key_id,
         } = entry;
+        if !self.accepts(page_size) {
+            self.release(reservation);
+            return Err(Error::InvalidRequest);
+        }
         let same = self
             .inner
             .as_ref()
@@ -406,6 +430,7 @@ impl Pages {
             }
         };
         inner.keys[slot.0 as usize] = key_id;
+        self.page_size = page_size;
         if replaced.is_none() {
             self.stored += 1;
             self.versions
@@ -421,10 +446,14 @@ impl Pages {
     /// when the slot arena or the cache table is full; nothing changes on error.
     pub fn insert(&mut self, page: PageId, entry: IndexedPage) -> Result<()> {
         let IndexedPage {
+            page_size,
             location,
             metadata,
             key_id,
         } = entry;
+        if !self.accepts(page_size) {
+            return Err(Error::InvalidRequest);
+        }
         let (slot, cache) = self.intern(&page)?;
         let inner = self.inner.as_mut().expect("initialized page table");
         let placed = inner.disk.borrow_mut().place(
@@ -442,6 +471,7 @@ impl Pages {
             }
         };
         inner.keys[slot.0 as usize] = key_id;
+        self.page_size = page_size;
         if replaced.is_none() {
             self.stored += 1;
             self.versions
@@ -885,6 +915,7 @@ mod tests {
 
     fn entry(page: &PageId, segment: u64) -> IndexedPage {
         IndexedPage {
+            page_size: racer_wire::object::PageSize::DEFAULT,
             location: RecordLocation {
                 segment: SegmentId(segment),
                 generation: Generation(1),
@@ -897,6 +928,33 @@ mod tests {
             },
             key_id: KeyId([7; 16]),
         }
+    }
+
+    #[test]
+    fn stored_pages_share_one_page_size_adopted_while_empty() {
+        let small = racer_wire::object::PageSize::new(64 << 10).unwrap();
+        let mut pages = Pages::new(4);
+        let (a0, a1) = (page("c", "a", 0), page("c", "a", 1));
+        let resized = |page: &PageId, segment| IndexedPage {
+            page_size: small,
+            ..entry(page, segment)
+        };
+        pages.insert(a0.clone(), resized(&a0, 0)).unwrap();
+        assert_eq!(pages.page_size(), small);
+        assert_eq!(pages.get(&a0).unwrap().into_entry().page_size, small);
+        // A record cut at another size never joins the table.
+        assert_eq!(
+            pages.insert(a1.clone(), entry(&a1, 1)),
+            Err(Error::InvalidRequest)
+        );
+        assert!(pages.get(&a1).is_none());
+        pages.insert(a1.clone(), resized(&a1, 1)).unwrap();
+        assert!(pages.remove(&a0, None));
+        assert!(pages.remove(&a1, None));
+        // Empty again, the table adopts the next size.
+        pages.insert(a0.clone(), entry(&a0, 2)).unwrap();
+        assert_eq!(pages.page_size(), racer_wire::object::PageSize::DEFAULT);
+        pages.check();
     }
 
     #[test]
