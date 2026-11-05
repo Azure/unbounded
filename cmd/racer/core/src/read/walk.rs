@@ -3,9 +3,7 @@
 
 pub use crate::liveness::Rank0State;
 use crate::read::budget::{AcquisitionBudget, MAX_ROUTE_LINKS};
-use crate::read::budget::{
-    HELPER_ATTEMPTS, HELPER_FLOOR_ATTEMPTS, HELPER_FLOOR_LINKS, HELPER_LINKS, HELPER_MIN_ATTEMPTS,
-};
+use crate::read::budget::{HELPER_ATTEMPTS, HELPER_LINKS, HELPER_MIN_ATTEMPTS};
 use crate::read::{
     Error, OperationKind, ProbeOutcome, ResponseKind, Result, Source, VisitOrder, classify,
     origin_miss_error, unusable_copy,
@@ -100,6 +98,13 @@ const REPLICAS_BELOW: usize = MAX_HANDOFF - 1;
 /// The fresh grant a granted probe spends.
 pub fn granted_budget(deadline: Instant) -> AcquisitionBudget {
     AcquisitionBudget::new(deadline, SUCCESSOR_GRANT_ATTEMPTS, SUCCESSOR_GRANT_LINKS)
+}
+
+/// The overflow helper's own grant: one detour per walk ([`HELPER_ATTEMPTS`] is below
+/// [`HELPER_MIN_ATTEMPTS`], so a helper never asks another), funded apart from the walk so it
+/// cannot spend the links and attempts the remaining owners need.
+pub fn helper_grant(deadline: Instant) -> AcquisitionBudget {
+    AcquisitionBudget::new(deadline, HELPER_ATTEMPTS, HELPER_LINKS)
 }
 
 /// Fewest attempts a non-owner funds an out-of-order Acquire to `canonical`
@@ -516,11 +521,10 @@ impl CandidateWalk {
         }
     }
 
-    /// Ask the page's helper, funded from what is left.
-    fn helper_probe(&mut self, budget: &mut AcquisitionBudget) -> Result<Step> {
-        let attempts = budget.remaining_attempts().min(HELPER_ATTEMPTS);
-        let links = budget.remaining_links().min(HELPER_LINKS);
-        let mut child = budget.partition(attempts, links)?;
+    /// Ask the page's helper on its own grant ([`helper_grant`]), never the walk's credits, so a
+    /// helper that fails at once still leaves every remaining owner funded.
+    fn helper_probe(&mut self, budget: &AcquisitionBudget) -> Step {
+        let mut child = helper_grant(budget.deadline());
         // Forward every funded link: fewer cannot reach rank 0 through a relay.
         child.note_route_failure();
         self.pending = Some(Pending {
@@ -532,14 +536,14 @@ impl CandidateWalk {
             previous: false,
             granted: false,
         });
-        Ok(Step::Probe(Probe {
+        Step::Probe(Probe {
             index: self.index,
             canonical: self.config.owners,
             mode: Mode::Acquire,
             remaining_opportunities: (self.count.saturating_sub(self.index) + 1) as u32,
             route: RouteMode::FundedRoute,
             previous: false,
-        }))
+        })
     }
 
     /// Minimum credits the funded visits after `index` need.
@@ -578,11 +582,7 @@ impl CandidateWalk {
         }
         if self.helper == Helper::Due {
             self.helper = Helper::Used;
-            if budget.remaining_attempts() >= HELPER_FLOOR_ATTEMPTS
-                && budget.remaining_links() >= HELPER_FLOOR_LINKS
-            {
-                return self.helper_probe(budget);
-            }
+            return Ok(self.helper_probe(budget));
         }
         let rank = self.config.rank;
         let continuation = self.config.continuation;
@@ -895,8 +895,10 @@ impl CandidateWalk {
         outcome: Outcome,
     ) -> Result<Option<End>> {
         let pending = self.pending.take().expect("no pending probe");
+        // A successor's or the helper's grant is dropped: the walk's budget never grows.
         if let Some(bounded) = pending.bounded
             && !pending.granted
+            && !pending.helper
         {
             budget.reunite(bounded)?;
         }

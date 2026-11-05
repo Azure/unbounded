@@ -5,9 +5,7 @@
 // The attribute below also marks this file as test-only for tests/purity.rs.
 #[cfg(test)]
 use super::*;
-use crate::read::budget::{
-    HELPER_ATTEMPTS, HELPER_FLOOR_LINKS, HELPER_LINKS, HELPER_MIN_ATTEMPTS, inherited_budget,
-};
+use crate::read::budget::{HELPER_ATTEMPTS, HELPER_LINKS, HELPER_MIN_ATTEMPTS, inherited_budget};
 use crate::read::{Answering, ReplicaSelection, demote_unanswered, visit_order};
 use std::fmt::Write;
 
@@ -273,10 +271,10 @@ fn walks() {
         ("previous behind", with(owner(2), &|c| c.previous = 0b11), budget(8, 32), nothing, &[BEHIND, MISS], "0A3Fp:2/4/4 1C2Sp:8/32/4 => Origin { rank: 2, evidence: [Unreachable, CopyMiss] } 8/32/4"),
         // An owner that sheds the reader sends it to its helper once, funded from what is left,
         // with the helper's full funded envelope; a helper miss falls back to the other owners.
-        ("helper copy", helper(canonical), budget(8, 16), nothing, &[SHED, SHED, SHED, COPY], "0A3S:8/16/4 3A3Fh:4/8/8 => Copy 8/16/8"),
-        ("helper, floor links", helper(canonical), budget(8, HELPER_FLOOR_LINKS), nothing, &[SHED, SHED, SHED, COPY], "0A3S:8/4/4 3A3Fh:4/4/4 => Copy 8/4/4"),
-        ("helper, helper links", helper(canonical), budget(8, HELPER_LINKS), nothing, &[SHED, SHED, SHED, COPY], "0A3S:8/8/4 3A3Fh:4/8/8 => Copy 8/8/8"),
-        ("helper miss", helper(canonical), budget(32, 64), nothing, &[SHED], "0A3S:32/64/4 3A3Fh:4/8/8 1A2S:32/64/8 2A1S:32/64/8 => Exhausted { funding: false } 32/64/8"),
+        ("helper copy", helper(canonical), budget(8, 16), nothing, &[SHED, SHED, SHED, COPY], "0A3S:8/16/4 3A3Fh:4/8/8 => Copy 8/16/4"),
+        ("helper, few links", helper(canonical), budget(8, 4), nothing, &[SHED, SHED, SHED, COPY], "0A3S:8/4/4 3A3Fh:4/8/8 => Copy 8/4/4"),
+        ("helper, helper links", helper(canonical), budget(8, HELPER_LINKS), nothing, &[SHED, SHED, SHED, COPY], "0A3S:8/8/4 3A3Fh:4/8/8 => Copy 8/8/4"),
+        ("helper miss", helper(canonical), budget(32, 64), nothing, &[SHED], "0A3S:32/64/4 3A3Fh:4/8/8 1A2S:32/64/4 2A1S:32/64/4 => Exhausted { funding: false } 32/64/4"),
         // Only a destination's own shed asks the helper.
         ("relay overload, no helper", helper(canonical), budget(32, 64), nothing, &[OVL], "0A3S:32/64/4 1A2S:32/64/8 2A1S:32/64/8 => Exhausted { funding: false } 32/64/8"),
         ("transport overload, no helper", helper(canonical), budget(32, 64), nothing, &[T_OVL], "0A3S:32/64/4 1A2S:32/64/8 2A1S:32/64/8 => Exhausted { funding: false } 32/64/8"),
@@ -289,10 +287,11 @@ fn walks() {
         ("first 1", first(1), budget(8, 16), nothing, &[MISS], "1A3F:4/8/8 0A2S:8/16/8 2A1S:8/16/8 => Exhausted { funding: false } 8/16/8"),
         ("first 2, helper", helper(first(2).order), budget(8, 16), nothing, &[MISS], "2A3F:5/8/8 0A2S:8/16/8 1A1S:8/16/8 => Exhausted { funding: false } 8/16/8"),
         ("first 2", first(2), budget(8, 16), nothing, &[MISS], "2A3F:5/8/8 0A2S:8/16/8 1A1S:8/16/8 => Exhausted { funding: false } 8/16/8"),
-        // A helper never chains; owners never use helpers; too little left skips it.
+        // A helper never chains; owners never use helpers; a walk starting below
+        // `HELPER_MIN_ATTEMPTS` never asks one, and one that does spends the helper's own grant.
         ("helper budget", helper(canonical), budget(HELPER_ATTEMPTS, 8), nothing, &[SHED], "0A3S:4/8/4 1A2S:4/8/4 2A1S:4/8/4 => Exhausted { funding: false } 4/8/4"),
         ("owner ignores helper", with(owner(2), &|c| c.helper = true), budget(8, 16), nothing, &[SHED], "0A3F:2/4/4 1C2S:8/16/4 => Origin { rank: 2, evidence: [Overloaded, Overloaded] } 8/16/4"),
-        ("helper unaffordable", helper(first(2).order), budget(HELPER_MIN_ATTEMPTS + 1, 16), Spend::Transfer, &[SHED], "2A3F:5/8/8 0C2S:1/8/8 1A1S:0/0/0 => Exhausted { funding: false } 0/0/0"),
+        ("helper on its own grant", helper(first(2).order), budget(HELPER_MIN_ATTEMPTS + 1, 16), Spend::Transfer, &[SHED], "2A3F:5/8/8 3A3Fh:4/8/8 0C2S:1/8/8 1A1S:0/0/0 => Exhausted { funding: false } 0/0/0"),
         // A small budget visits rank 0 first instead of failing to fund rank 2.
         ("small budget", first(2), budget(HELPER_ATTEMPTS - 1, 7), nothing, &[COPY, MISS], "0A3S:3/7/4 => Copy 3/7/4"),
         // A hedge reports only `Overloaded`, never a destination shed.
@@ -1618,4 +1617,48 @@ fn rank0_route_overloads_advance_the_watch_to_origin() {
         origin_at.is_some_and(|s| s > 0),
         "origin never used: {origin_at:?}"
     );
+}
+
+/// A page read whose rank 0 sheds it asks its overflow helper on the helper's own grant: a helper
+/// failing at once (often a reader failing the same way) still leaves every remaining owner
+/// probed, never ending `HopBudgetExhausted` or `Unavailable` before them.
+#[test]
+fn a_failed_helper_detour_leaves_every_remaining_owner_funded() {
+    use crate::read::{PAGE_ATTEMPTS, PAGE_LINKS};
+    for helper_outcome in [FAILED, UNR, T_UNR, OVL, T_OVL, TIMEOUT, MISS, SHED] {
+        let mut walk = CandidateWalk::new(WalkConfig {
+            helper: true,
+            ..reader(3)
+        });
+        let mut b = budget(PAGE_ATTEMPTS, PAGE_LINKS);
+        let mut probed = Vec::new();
+        let end = loop {
+            let probe = match walk.next(&mut b) {
+                Ok(Step::Probe(probe)) => probe,
+                Ok(Step::End(end)) => break Ok(end),
+                Ok(Step::Granted(_)) => panic!("no granted probes"),
+                Err(e) => break Err(e),
+            };
+            let deadline = b.deadline();
+            let request = walk.request_budget(&mut b);
+            if let Err(e) = plan(request, deadline, &probe) {
+                break Err(e);
+            }
+            probed.push(probe.canonical);
+            let outcome = match probe.canonical {
+                0 => SHED,
+                3 => helper_outcome,
+                _ => MISS,
+            };
+            if let Some(end) = walk.complete(&mut b, outcome).unwrap() {
+                break Ok(end);
+            }
+        };
+        assert_eq!(probed, [0, 3, 1, 2], "{helper_outcome:?} {end:?}");
+        assert_eq!(
+            end,
+            Ok(End::Exhausted { funding: false }),
+            "{helper_outcome:?}"
+        );
+    }
 }

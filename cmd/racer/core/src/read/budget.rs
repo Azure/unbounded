@@ -402,23 +402,16 @@ mod budget_tests {
 // readers ([`shed_hot_page`]), except its column mates in the page's pool and the other owners; a
 // shed non-owner asks its mesh helper ([`mesh_helper`], [`crate::read::walk::WalkConfig::helper`]):
 // the middle node of its primary path to the owner, a column mate of the owner. [`fanout_helper`]
-// and [`is_helper`] are the v1 hashed helpers, kept for comparison. A helper probe carries at most
-// [`HELPER_ATTEMPTS`] and only walks starting with [`HELPER_MIN_ATTEMPTS`] may ask one, so requests
+// and [`is_helper`] are the v1 hashed helpers, kept for comparison. A helper probe spends its own grant
+// of [`HELPER_ATTEMPTS`], never the walk's, and only walks starting with [`HELPER_MIN_ATTEMPTS`] may ask one, so requests
 // never chain. Helpers are non-owners, so they never reach origin.
 
-/// Most attempts a requester funds a helper probe with: the exchange plus
-/// the helper's own walk of the owners.
+/// Attempts of a helper probe's own grant (`walk::helper_grant`): the exchange plus the helper's
+/// own walk of the owners.
 pub const HELPER_ATTEMPTS: u32 = 4;
 
-/// Most links a helper probe is funded with (a full failure-routing envelope).
+/// Links of a helper probe's own grant (a full failure-routing envelope).
 pub const HELPER_LINKS: u8 = 8;
-
-/// Fewest attempts left for a helper probe: the exchange, and at the helper
-/// one exchange with rank 0 plus the credit rank 0 needs for origin.
-pub const HELPER_FLOOR_ATTEMPTS: u32 = 3;
-
-/// Fewest links left for a helper probe: a route to the helper and a route from it to an owner.
-pub const HELPER_FLOOR_LINKS: u8 = 4;
 
 /// A walk may ask a helper only if it starts with at least this many attempts. Larger than
 /// [`HELPER_ATTEMPTS`], so a helper never asks another helper.
@@ -428,7 +421,6 @@ pub const HELPER_MIN_ATTEMPTS: u32 = HELPER_ATTEMPTS + 1;
 pub const MAX_HELPERS: usize = 256;
 
 const _: () = assert!(HELPER_MIN_ATTEMPTS > HELPER_ATTEMPTS);
-const _: () = assert!(HELPER_FLOOR_ATTEMPTS <= HELPER_ATTEMPTS);
 
 /// Helpers per page for a membership of `members`: the integer square root, at most
 /// [`MAX_HELPERS`]. With `n` readers, owners and each helper then send about `sqrt(n)` copies.
