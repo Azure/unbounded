@@ -10,7 +10,7 @@ use crate::read::{Error, FailureKind, Result};
 use std::time::Instant;
 
 mod table;
-pub use table::{Fence, FlightTable, Joined, Operation, Ticket};
+pub use table::{Fence, FlightEntry, FlightTable, Joined, Operation, Removed, Ticket, Waiter};
 
 /// Opaque wake target chosen by the driver (for example, a simulated task id).
 pub type Token = u64;
