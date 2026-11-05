@@ -4189,7 +4189,7 @@ pub(crate) mod tests {
             // Production passes the already validated canonical page_aad bytes.
             let mut aad = p.envelope().nonce.0.to_vec();
             aad.extend_from_slice(p.envelope().page.version.etag.as_bytes());
-            capture_aead_failure(p, &aad, request)
+            capture_aead_failure(p, &aad, request, 0)
         };
         assert_eq!(page.ciphertext.cached_checksum(), None);
         assert_eq!(capture(&page.ciphertext).crc, None);

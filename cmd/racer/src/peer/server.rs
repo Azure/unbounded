@@ -155,7 +155,8 @@ impl PeerServer {
         };
         ciphertext.provenance?;
         let receiver = connection.state().session.as_ref()?.peer();
-        let (ticket, sample) = samples.begin(pair, self.signatures.node(), receiver)?;
+        let (ticket, sample) =
+            samples.begin(pair, self.signatures.node(), receiver, scope.clock().now())?;
         let permit = match uring_runtime::drivers::reserve().map_err(Error::from) {
             Ok(p) => p,
             Err(error) => {

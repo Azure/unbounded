@@ -30,6 +30,7 @@ use std::sync::OnceLock;
 use std::task::Poll;
 use std::time::Duration;
 use std::time::Instant;
+#[cfg(test)]
 use uring_runtime::environment;
 use uring_runtime::environment::Deadline;
 use uring_runtime::reactor::descriptor::Descriptor;
@@ -610,14 +611,15 @@ fn get(
     admission_usable: bool,
     mut output: &mut dyn Write,
 ) -> std::result::Result<Response, std::fmt::Error> {
-    let ready = admission_usable && telemetry.health.ready();
+    let now = telemetry.failures.now();
+    let ready = admission_usable && telemetry.health.ready_at(now);
     const LIVE_PROBE: ::telemetry::health::Probe =
         ::telemetry::health::Probe::new("ok\n", "not live\n");
     const READY_PROBE: ::telemetry::health::Probe =
         ::telemetry::health::Probe::new("ready\n", "not ready\n");
     let (response, body, event) = match path {
         "/healthz" => {
-            let (response, body) = LIVE_PROBE.response(telemetry.health.live());
+            let (response, body) = LIVE_PROBE.response(telemetry.health.live_at(now));
             (response, body, Event::DiagnosticHealth)
         }
         "/readyz" => {
@@ -644,7 +646,7 @@ fn get(
             output,
             "# TYPE racer_ready gauge\nracer_ready {}\n# TYPE racer_live gauge\nracer_live {}",
             u8::from(ready),
-            u8::from(telemetry.health.live())
+            u8::from(telemetry.health.live_at(now))
         )?;
     } else if path == "/debug/membership" {
         match telemetry.membership.get().and_then(|read| read().ok()) {
@@ -1138,8 +1140,9 @@ impl Resources {
     }
 }
 impl Health {
+    #[cfg(test)]
     pub fn state(&self) -> Result<State> {
-        self.state_at(uring_runtime::environment::now())
+        self.state_at(crate::test_support::clock().now())
     }
     pub fn state_at(&self, now: Instant) -> Result<State> {
         self.0
@@ -1149,18 +1152,29 @@ impl Health {
     pub fn observe(&self, resources: Resources) -> Result<()> {
         self.0.observe(resources).map_err(|_| Error::Unavailable)
     }
+    #[cfg(test)]
     pub fn ready(&self) -> bool {
-        self.state().is_ok_and(|state| state == State::Ready)
+        self.ready_at(crate::test_support::clock().now())
+    }
+    pub fn ready_at(&self, now: Instant) -> bool {
+        self.state_at(now).is_ok_and(|state| state == State::Ready)
+    }
+    #[cfg(test)]
+    pub fn live(&self) -> bool {
+        self.live_at(crate::test_support::clock().now())
     }
     /// Starting, degraded, and draining remain live; a response establishes progress.
-    pub fn live(&self) -> bool {
-        self.state().is_ok_and(|state| state != State::Stopped)
+    pub fn live_at(&self, now: Instant) -> bool {
+        self.state_at(now)
+            .is_ok_and(|state| state != State::Stopped)
     }
+    #[cfg(test)]
     pub fn transition(&self, state: State) -> Result<()> {
+        self.transition_at(state, crate::test_support::clock().now())
+    }
+    pub fn transition_at(&self, state: State, now: Instant) -> Result<()> {
         self.0
-            .transition(state, |resources| {
-                resources.usable_at(uring_runtime::environment::now())
-            })
+            .transition(state, |resources| resources.usable_at(now))
             .map_err(|_| Error::Unavailable)
     }
     /// Store an observation and settle Ready or Degraded atomically. Usability
@@ -1268,8 +1282,9 @@ impl Samples {
         pair: &Pair,
         sender: &NodeId,
         receiver: &NodeId,
+        now: Instant,
     ) -> Option<(Ticket, Work)> {
-        self.begin_at(pair, sender, receiver, environment::now)
+        self.begin_at(pair, sender, receiver, || now)
     }
     fn begin_at(
         &self,
@@ -1782,11 +1797,8 @@ pub struct Failure {
 impl Failure {
     pub fn new(stage: Stage, error: Error) -> Self {
         Self {
-            unix_millis: uring_runtime::environment::wall_now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_millis()
-                .min(u64::MAX as u128) as u64,
+            // Stamped by `Observer::record` from the node clock.
+            unix_millis: 0,
             stage,
             error,
             request: None,
@@ -1806,6 +1818,10 @@ impl Failure {
         self.detail = detail;
         self
     }
+    pub(crate) fn at(mut self, unix_millis: u64) -> Self {
+        self.unix_millis = unix_millis;
+        self
+    }
 }
 
 #[derive(Clone, Default)]
@@ -1818,7 +1834,24 @@ pub struct Failures(
     std::sync::Arc<GateEvents>,
     SharedRing<(WorkerId, RequestId, u64, FlightExpiry), 16>,
     SharedRing<DecryptFailure, DECRYPT_FAILURE_CAPACITY>,
+    FailureClock,
 );
+
+/// Wall clock that stamps failures when they are recorded.
+#[derive(Clone)]
+pub(crate) struct FailureClock(std::sync::Arc<racer_io::Clock>);
+impl Default for FailureClock {
+    fn default() -> Self {
+        Self(std::sync::Arc::new(racer_io::Clock::host()))
+    }
+}
+
+pub(crate) fn unix_millis(at: std::time::SystemTime) -> u64 {
+    at.duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+        .min(u64::MAX as u128) as u64
+}
 
 /// One sampled entry, with no object identity or owned resources.
 #[derive(Clone, Copy, Debug)]
@@ -1984,6 +2017,19 @@ struct ProtectedFailure {
 #[derive(Clone, Default)]
 pub struct Observer(Option<(Failures, WorkerId)>);
 impl Failures {
+    /// Failures stamped from `clock` instead of the host wall clock.
+    pub fn with_clock(clock: racer_io::Clock) -> Self {
+        Self {
+            8: FailureClock(std::sync::Arc::new(clock)),
+            ..Self::default()
+        }
+    }
+    pub(crate) fn unix_millis(&self) -> u64 {
+        unix_millis(self.8.0.wall_now())
+    }
+    pub(crate) fn now(&self) -> Instant {
+        self.8.0.now()
+    }
     /// Write the independent bounded expiry ring without changing gate counters.
     pub(crate) fn write_flight_expiry(&self, out: &mut impl std::fmt::Write) -> std::fmt::Result {
         let snapshot = self.6.snapshot();
@@ -2398,6 +2444,10 @@ impl Failures {
     }
 }
 impl Observer {
+    /// The recording clock's wall time, or `None` when detached.
+    pub(crate) fn unix_millis(&self) -> Option<u64> {
+        self.0.as_ref().map(|(failures, _)| failures.unix_millis())
+    }
     /// Publish already frozen facts after all worker-local borrows have ended.
     pub(crate) fn flight_expiry(&self, scope: &RequestScope, page: u64, facts: FlightExpiry) {
         if let Some((failures, worker)) = &self.0 {
@@ -2419,13 +2469,17 @@ impl Observer {
                     _ => Error::Overloaded,
                 },
             )
-            .request(scope),
+            .request(scope)
+            .at(failures.unix_millis()),
             page,
             facts,
         });
     }
-    pub(crate) fn candidate_final(&self, record: CandidateFinal) {
+    pub(crate) fn candidate_final(&self, mut record: CandidateFinal) {
         if let Some((failures, worker)) = &self.0 {
+            if record.failure.unix_millis == 0 {
+                record.failure.unix_millis = failures.unix_millis();
+            }
             failures.4.push((*worker, record));
         }
     }
@@ -2440,10 +2494,13 @@ impl Observer {
             failures.7.push(failure);
         }
     }
-    pub fn record(&self, failure: Failure) {
+    pub fn record(&self, mut failure: Failure) {
         let Some((failures, worker)) = &self.0 else {
             return;
         };
+        if failure.unix_millis == 0 {
+            failure.unix_millis = failures.unix_millis();
+        }
         failures.0.push((*worker, failure));
         if matches!(
             failure.stage,
@@ -2471,7 +2528,8 @@ impl Observer {
             worker: *worker,
             failure: Failure::new(Stage::Admission, Error::Overloaded)
                 .request(scope)
-                .detail(detail.unwrap_or_default()),
+                .detail(detail.unwrap_or_default())
+                .at(failures.unix_millis()),
             site: Some(site),
             page,
         });
@@ -5352,28 +5410,67 @@ pub(crate) mod tests {
             }
             let p = pair();
             let samples = Samples::default();
-            assert!(samples.begin(&p, &p.receiver, &p.sender).is_none());
-            let (ticket, work) = samples.begin(&p, &p.sender, &p.receiver).unwrap();
+            assert!(
+                samples
+                    .begin(
+                        &p,
+                        &p.receiver,
+                        &p.sender,
+                        crate::test_support::clock().now()
+                    )
+                    .is_none()
+            );
+            let (ticket, work) = samples
+                .begin(
+                    &p,
+                    &p.sender,
+                    &p.receiver,
+                    crate::test_support::clock().now(),
+                )
+                .unwrap();
             drop(ticket);
             let other = samples.clone();
             let p2 = p.clone();
             assert!(
-                std::thread::spawn(move || other.begin(&p2, &p2.sender, &p2.receiver).is_none())
-                    .join()
-                    .unwrap()
+                std::thread::spawn(move || other
+                    .begin(
+                        &p2,
+                        &p2.sender,
+                        &p2.receiver,
+                        crate::test_support::clock().now()
+                    )
+                    .is_none())
+                .join()
+                .unwrap()
             );
             assert!(samples.0.counts().busy);
             drop(work);
             assert!(!samples.0.counts().busy);
             assert!(
-                samples.begin(&p, &p.sender, &p.receiver).is_none(),
+                samples
+                    .begin(
+                        &p,
+                        &p.sender,
+                        &p.receiver,
+                        crate::test_support::clock().now()
+                    )
+                    .is_none(),
                 "burst is one"
             );
             let mut text = String::new();
             samples.write(&mut text).unwrap();
             assert!(text.contains("send=abandoned status=unavailable"));
             clock.advance(Duration::from_secs(120));
-            assert!(samples.begin(&p, &p.sender, &p.receiver).is_none());
+            assert!(
+                samples
+                    .begin(
+                        &p,
+                        &p.sender,
+                        &p.receiver,
+                        crate::test_support::clock().now()
+                    )
+                    .is_none()
+            );
         }
         #[test]
         fn send_crc_ineligible_pairs_do_not_start_the_sampling_window() {
@@ -5382,9 +5479,25 @@ pub(crate) mod tests {
             let _strict = environment::require_simulated();
             let p = pair();
             let samples = Samples::default();
-            assert!(samples.begin(&p, &p.receiver, &p.sender).is_none());
+            assert!(
+                samples
+                    .begin(
+                        &p,
+                        &p.receiver,
+                        &p.sender,
+                        crate::test_support::clock().now()
+                    )
+                    .is_none()
+            );
             clock.advance(Duration::from_secs(120));
-            let (ticket, work) = samples.begin(&p, &p.sender, &p.receiver).unwrap();
+            let (ticket, work) = samples
+                .begin(
+                    &p,
+                    &p.sender,
+                    &p.receiver,
+                    crate::test_support::clock().now(),
+                )
+                .unwrap();
             assert_eq!(ticket.0.sequence, 1);
             assert_eq!(samples.0.counts().eligible, 1);
             work.finish(Some(Error::Io));
@@ -5401,13 +5514,36 @@ pub(crate) mod tests {
             let _strict = environment::require_simulated();
             let p = pair();
             let samples = Samples::default();
-            let (ticket, work) = samples.begin(&p, &p.sender, &p.receiver).unwrap();
+            let (ticket, work) = samples
+                .begin(
+                    &p,
+                    &p.sender,
+                    &p.receiver,
+                    crate::test_support::clock().now(),
+                )
+                .unwrap();
             drop(work);
             drop(ticket);
             clock.advance(Duration::from_millis(500) - Duration::from_nanos(1));
-            assert!(samples.begin(&p, &p.sender, &p.receiver).is_none());
+            assert!(
+                samples
+                    .begin(
+                        &p,
+                        &p.sender,
+                        &p.receiver,
+                        crate::test_support::clock().now()
+                    )
+                    .is_none()
+            );
             clock.advance(Duration::from_nanos(1));
-            let (ticket, work) = samples.begin(&p, &p.sender, &p.receiver).unwrap();
+            let (ticket, work) = samples
+                .begin(
+                    &p,
+                    &p.sender,
+                    &p.receiver,
+                    crate::test_support::clock().now(),
+                )
+                .unwrap();
             assert_eq!(ticket.0.sequence, 2);
             drop(work);
             drop(ticket);
@@ -5423,14 +5559,28 @@ pub(crate) mod tests {
             let _strict = environment::require_simulated();
             let p = pair();
             let samples = Samples::default();
-            let (ticket, work) = samples.begin(&p, &p.sender, &p.receiver).unwrap();
+            let (ticket, work) = samples
+                .begin(
+                    &p,
+                    &p.sender,
+                    &p.receiver,
+                    crate::test_support::clock().now(),
+                )
+                .unwrap();
             let weak = Arc::downgrade(&ticket.0);
             work.finish(None);
             drop(work);
             let snapshot = samples.0.snapshot().0;
             for _ in 0..SEND_CRC_CAPACITY {
                 clock.advance(Duration::from_millis(500));
-                let (next, work) = samples.begin(&p, &p.sender, &p.receiver).unwrap();
+                let (next, work) = samples
+                    .begin(
+                        &p,
+                        &p.sender,
+                        &p.receiver,
+                        crate::test_support::clock().now(),
+                    )
+                    .unwrap();
                 next.finish(true);
                 work.finish(None);
             }
@@ -5467,7 +5617,14 @@ pub(crate) mod tests {
             let p = pair();
             let samples = Samples::default();
             for i in 0..240 {
-                let (ticket, mut work) = samples.begin(&p, &p.sender, &p.receiver).unwrap();
+                let (ticket, mut work) = samples
+                    .begin(
+                        &p,
+                        &p.sender,
+                        &p.receiver,
+                        crate::test_support::clock().now(),
+                    )
+                    .unwrap();
                 ticket.finish(i % 2 == 0);
                 work.facts = Some(crate::telemetry::test_aead_failure());
                 work.finish(None);
@@ -5475,7 +5632,16 @@ pub(crate) mod tests {
                 drop(ticket);
                 clock.advance(Duration::from_millis(500));
             }
-            assert!(samples.begin(&p, &p.sender, &p.receiver).is_none());
+            assert!(
+                samples
+                    .begin(
+                        &p,
+                        &p.sender,
+                        &p.receiver,
+                        crate::test_support::clock().now()
+                    )
+                    .is_none()
+            );
             let mut text = String::new();
             samples.write(&mut text).unwrap();
             assert_eq!(text.lines().count(), SEND_CRC_CAPACITY + 1);

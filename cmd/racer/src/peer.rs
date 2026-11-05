@@ -521,6 +521,13 @@ pub(crate) enum Delivered {
 /// Concrete candidate requester. Scripted outcomes exist only in unit tests and
 /// the subscription interoperability fixture, so cancellation and an adversarial
 /// late-success completion fence remain distinct.
+#[cfg_attr(
+    any(test, feature = "subscription-interop"),
+    allow(
+        clippy::large_enum_variant,
+        reason = "Only the test-only Scripted variant is small; production has one variant"
+    )
+)]
 pub enum Requester {
     Network {
         #[cfg(test)]

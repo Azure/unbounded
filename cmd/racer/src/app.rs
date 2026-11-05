@@ -241,7 +241,7 @@ impl NodeState {
             )?),
             publications: Arc::new(Published::new(Snapshot::retention(2))),
             metrics: workers.iter().copied().zip(metrics).collect(),
-            failures: crate::telemetry::Failures::default(),
+            failures: crate::telemetry::Failures::with_clock(clock.clone()),
             keys: Arc::new(KeyEpochs::with_clock(crate::enrollment::wall_clock(&clock))),
             control_worker: WorkerId(0),
             cache_rollout: controlplane::Rollout::new(workers.iter().copied()),
@@ -2390,7 +2390,7 @@ impl WorkerApplication {
             self.started = false;
             self.telemetry
                 .health
-                .transition(crate::telemetry::State::Stopped)?;
+                .transition_at(crate::telemetry::State::Stopped, self.node.clock.now())?;
             Ok(())
         })))
     }
@@ -2548,10 +2548,11 @@ impl uring_runtime::group::Service<RequestScope> for WorkerApplication {
         }
         self.cache_prepare_task.take();
         self.prepared_listeners.borrow_mut().take();
-        if self.telemetry.health.state()? != crate::telemetry::State::Stopped {
+        let now = self.node.clock.now();
+        if self.telemetry.health.state_at(now)? != crate::telemetry::State::Stopped {
             self.telemetry
                 .health
-                .transition(crate::telemetry::State::Draining)?;
+                .transition_at(crate::telemetry::State::Draining, now)?;
         }
         self.clients.stop_admission();
         if let Some(endpoint) = &self.endpoint {

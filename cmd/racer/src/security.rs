@@ -21,8 +21,6 @@ use crate::model::RequestId;
 use crate::model::WorkerId;
 use crate::runtime::RequestScope;
 use crate::telemetry::AeadFailure;
-use crate::telemetry::Failure;
-use crate::telemetry::Stage;
 use racer_control_wire::KeyId;
 use racer_crypto::TAG_LEN;
 use racer_crypto::identity::KeyLease;
@@ -212,6 +210,7 @@ pub(crate) fn capture_aead_failure(
     ciphertext: &CiphertextPage,
     aad: &[u8],
     request: RequestId,
+    unix_millis: u64,
 ) -> AeadFailure {
     use sha2::Digest;
     use sha2::Sha256;
@@ -228,7 +227,7 @@ pub(crate) fn capture_aead_failure(
         hash.update(field);
     }
     AeadFailure {
-        unix_millis: Failure::new(Stage::PeerDecode, Error::CorruptRecord).unix_millis,
+        unix_millis,
         request,
         peer: ciphertext.provenance,
         page: hash.finalize().into(),
@@ -478,20 +477,25 @@ impl PageCryptoEngine {
             key.as_ref().expect("page job key"),
             &scope,
             &mut permit,
-            &ctx.rng,
+            ctx,
         );
         if let Some(sample) = &mut permit.send_sample
             && let CryptoInput::Checksum { ciphertext } = &input
             && let Ok(aad) = page_aad(ciphertext.envelope())
         {
-            sample.facts = Some(capture_aead_failure(ciphertext, &aad, scope.request));
+            sample.facts = Some(capture_aead_failure(
+                ciphertext,
+                &aad,
+                scope.request,
+                crate::telemetry::unix_millis(ctx.clock.wall_now()),
+            ));
         }
         let outcome = match prepared {
             Err(error) => {
                 if permit.measurement.decrypt {
                     permit.measurement.failure = Some(DecryptFailureMeta {
                         request: scope.request,
-                        engine_ms: Failure::new(Stage::PeerDecode, error).unix_millis,
+                        engine_ms: crate::telemetry::unix_millis(ctx.clock.wall_now()),
                     });
                 }
                 CryptoOutcome::Failed { input, error }
@@ -521,6 +525,7 @@ impl PageCryptoEngine {
         plaintext: &flow_control::Charge<AdmissionPolicy>,
         permit: &mut CryptoPermit,
         scope: &RequestScope,
+        clock: &racer_io::Clock,
     ) -> Result<Option<Zeroizing<Vec<u8>>>> {
         let envelope = ciphertext.envelope();
         let length = envelope.plaintext_length as usize;
@@ -560,7 +565,12 @@ impl PageCryptoEngine {
         )
         .map_err(|_| {
             permit.rejected(IntegrityRejection::Aead);
-            permit.aead_failure = Some(capture_aead_failure(ciphertext, &aad, scope.request));
+            permit.aead_failure = Some(capture_aead_failure(
+                ciphertext,
+                &aad,
+                scope.request,
+                crate::telemetry::unix_millis(clock.wall_now()),
+            ));
             Error::CorruptRecord
         })?;
         Ok(Some(bytes))
@@ -572,7 +582,7 @@ impl PageCryptoEngine {
         key: &racer_crypto::identity::KeyLease,
         scope: &RequestScope,
         permit: &mut CryptoPermit,
-        rng: &racer_io::Rng,
+        ctx: &racer_io::WorkerCtx,
     ) -> Result<(PageEnvelope, Zeroizing<Vec<u8>>)> {
         scope.check().inspect_err(|error| {
             permit.measurement.scope_failure = crate::telemetry::DecryptScopeFailure::Entry(*error);
@@ -612,7 +622,7 @@ impl PageCryptoEngine {
                     cipher: crate::model::PageCipher::Xaes256Gcm,
                     page: page.clone(),
                     key_id: key.id(),
-                    nonce: fresh_nonce(rng)?,
+                    nonce: fresh_nonce(&ctx.rng)?,
                     plaintext_length: length,
                     ciphertext_length: length.checked_add(16).ok_or(Error::InvalidRequest)?,
                 };
@@ -666,7 +676,9 @@ impl PageCryptoEngine {
                 plaintext,
             } => {
                 let envelope = ciphertext.envelope();
-                if let Some(bytes) = Self::open_fused(key, ciphertext, plaintext, permit, scope)? {
+                if let Some(bytes) =
+                    Self::open_fused(key, ciphertext, plaintext, permit, scope, &ctx.clock)?
+                {
                     (envelope.clone(), bytes)
                 } else {
                     ciphertext.verify_checksum().inspect_err(|_| {
@@ -702,8 +714,12 @@ impl PageCryptoEngine {
                     )
                     .map_err(|_| {
                         permit.rejected(IntegrityRejection::Aead);
-                        permit.aead_failure =
-                            Some(capture_aead_failure(ciphertext, &aad, scope.request));
+                        permit.aead_failure = Some(capture_aead_failure(
+                            ciphertext,
+                            &aad,
+                            scope.request,
+                            crate::telemetry::unix_millis(ctx.clock.wall_now()),
+                        ));
                         Error::CorruptRecord
                     })?;
                     (envelope.clone(), bytes)
@@ -1421,7 +1437,7 @@ pub struct CryptoCompletion {
     pub(crate) _key: Option<KeyLease>,
 }
 impl CryptoCompletion {
-    fn decrypt_failure(&self) -> Option<crate::telemetry::DecryptFailure> {
+    fn decrypt_failure(&self, reap_ms: u64) -> Option<crate::telemetry::DecryptFailure> {
         let m = &self.permit.measurement;
         if !m.decrypt || m.checksum_only || m.execution_ns.is_none() {
             return None;
@@ -1441,7 +1457,7 @@ impl CryptoCompletion {
                 _ => None,
             },
             engine_ms: m.failure.as_ref().map(|f| f.engine_ms),
-            reap_ms: Failure::new(Stage::PeerDecode, *error).unix_millis,
+            reap_ms,
             scope_failure: m.scope_failure,
             queue_ns: m.queue_ns,
             execution_ns: m.execution_ns,
@@ -1667,9 +1683,13 @@ impl CryptoClient {
         if let Some(metrics) = self.metrics.borrow().as_ref() {
             completion.record(metrics);
         }
-        if let Some(failure) = completion.decrypt_failure() {
-            self.observer.borrow().record_decrypt(failure);
+        let observer = self.observer.borrow();
+        if let Some(reap_ms) = observer.unix_millis()
+            && let Some(failure) = completion.decrypt_failure(reap_ms)
+        {
+            observer.record_decrypt(failure);
         }
+        drop(observer);
         let id = completion.id();
         if let Some(sample) = &completion.permit.send_sample {
             sample.finish(match &completion.outcome {
@@ -2442,7 +2462,8 @@ mod tests {
                         if mode != "no_metrics" {
                             client.set_metrics(metrics.clone());
                         }
-                        let failures = crate::telemetry::Failures::default();
+                        let failures =
+                            crate::telemetry::Failures::with_clock(crate::test_support::clock());
                         client.set_failure_observer(failures.observer(WorkerId(0)));
                         let scope = RequestScope::new(
                             crate::model::RequestId([0; 16]),
@@ -2546,7 +2567,9 @@ mod tests {
                             _ => Some(Error::CorruptRecord),
                         };
                         if decrypt {
-                            let facts = completion.decrypt_failure();
+                            let facts = completion.decrypt_failure(crate::telemetry::unix_millis(
+                                crate::test_support::clock().wall_now(),
+                            ));
                             assert_eq!(facts.map(|f| f.error), expected_error, "{mode}");
                             if let Some(f) = facts {
                                 assert_eq!(f.request, Some(scope.request));
@@ -2566,7 +2589,13 @@ mod tests {
                                 );
                             }
                             let execution = completion.permit.measurement.execution_ns.take();
-                            assert!(completion.decrypt_failure().is_none());
+                            assert!(
+                                completion
+                                    .decrypt_failure(crate::telemetry::unix_millis(
+                                        crate::test_support::clock().wall_now()
+                                    ))
+                                    .is_none()
+                            );
                             completion.permit.measurement.execution_ns = execution;
                         }
                         if matches!(mode, "late_cancel" | "failure_late_cancel") {
@@ -2626,8 +2655,9 @@ mod tests {
                                 "engine_failure_observed_ms={}",
                                 engine_ms.unwrap()
                             )));
-                            let reap_ms = Failure::new(Stage::PeerDecode, expected_error.unwrap())
-                                .unix_millis;
+                            let reap_ms = crate::telemetry::unix_millis(
+                                crate::test_support::clock().wall_now(),
+                            );
                             assert!(records.contains(&format!("reap_ms={reap_ms} ")));
                             assert!(reap_ms > engine_ms.unwrap());
                             let reason = match mode {
@@ -2756,7 +2786,12 @@ mod tests {
                 )
                 .unwrap();
                 let (ticket, sample) = samples
-                    .begin(&filter, &filter.sender, &filter.receiver)
+                    .begin(
+                        &filter,
+                        &filter.sender,
+                        &filter.receiver,
+                        crate::test_support::clock().now(),
+                    )
                     .unwrap();
                 ticket.finish(true);
                 drop(ticket);
@@ -2847,7 +2882,12 @@ mod tests {
                     let client = std::rc::Rc::new(CryptoClient::new(io));
                     let samples = Samples::default();
                     let (ticket, sample) = samples
-                        .begin(&filter, &filter.sender, &filter.receiver)
+                        .begin(
+                            &filter,
+                            &filter.sender,
+                            &filter.receiver,
+                            crate::test_support::clock().now(),
+                        )
                         .unwrap();
                     ticket.finish(true);
                     let mut cx = Context::from_waker(futures::task::noop_waker_ref());
