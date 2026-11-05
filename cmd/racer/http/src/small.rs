@@ -230,6 +230,13 @@ impl Decoder {
         self.body
     }
 
+    /// Take the decoded body bytes so far, leaving the decoder running. The
+    /// body cap applies to bytes not yet taken, so a caller streaming an
+    /// unbounded body (for example a watch) bounds each undrained window.
+    pub fn take_body(&mut self) -> Vec<u8> {
+        std::mem::take(&mut self.body)
+    }
+
     /// Whether the framing already completed without needing end of stream.
     pub fn is_done(&self) -> bool {
         matches!(
@@ -502,6 +509,25 @@ mod tests {
         }
         decoder.finish()?;
         Ok((decoder.into_body(), used))
+    }
+
+    /// Taking the body streams an unbounded chunked body in capped windows.
+    #[test]
+    fn take_body_streams_in_capped_windows() {
+        let mut decoder = Decoder::new(Framing::Chunked, LIMITS).unwrap();
+        let mut seen = Vec::new();
+        for _ in 0..4 {
+            assert_eq!(decoder.feed(b"c\r\nabcdefghijkl\r\n"), Ok(Status::Need));
+            seen.extend(decoder.take_body());
+            assert!(decoder.body().is_empty());
+        }
+        assert_eq!(seen.len(), 48);
+        assert_eq!(decoder.feed(b"0\r\n\r\n"), Ok(Status::Done(5)));
+        assert!(decoder.take_body().is_empty());
+        // An undrained window still hits the cap.
+        let mut decoder = Decoder::new(Framing::Chunked, LIMITS).unwrap();
+        assert_eq!(decoder.feed(b"c\r\nabcdefghijkl\r\n"), Ok(Status::Need));
+        assert_eq!(decoder.feed(b"c\r\n"), Err(Error::TooLarge));
     }
 
     /// Valid chunked bodies decode identically at every split and stop at the end.

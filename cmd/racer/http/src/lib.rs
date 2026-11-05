@@ -88,6 +88,10 @@ pub struct Codec<O: Opaque = ()> {
     /// Whether ordinary field values drop all edge optional whitespace.
     trim: bool,
 
+    /// Whether heads may carry `Transfer-Encoding` (see
+    /// [`Codec::transfer_coding`]).
+    coding: bool,
+
     /// Selects field policy without storing a policy instance.
     opaque: PhantomData<O>,
 }
@@ -167,6 +171,7 @@ impl<O: Opaque> Codec<O> {
         Self {
             header_limit,
             trim: false,
+            coding: false,
             opaque: PhantomData,
         }
     }
@@ -176,6 +181,15 @@ impl<O: Opaque> Codec<O> {
     /// keep their strict rule in both modes.
     pub fn trim_ows(mut self) -> Self {
         self.trim = true;
+        self
+    }
+
+    /// Accept `Transfer-Encoding` fields in decoded and encoded heads, for
+    /// callers that select body framing themselves with
+    /// [`small::Framing::from_response`]. `Content-Length` is still parsed
+    /// strictly. Off by default: fixed-length paths reject transfer coding.
+    pub fn transfer_coding(mut self) -> Self {
+        self.coding = true;
         self
     }
 
@@ -189,6 +203,7 @@ impl<O: Opaque> Codec<O> {
         Self {
             header_limit: self.header_limit.min(limit),
             trim: self.trim,
+            coding: self.coding,
             opaque: PhantomData,
         }
     }
@@ -356,7 +371,11 @@ impl<O: Opaque> Codec<O> {
                 validate_opaque_edges(&h.value)?;
             }
         }
-        head.content_length()?;
+        if self.coding {
+            head.unique("content-length")?.map(decimal).transpose()?;
+        } else {
+            head.content_length()?;
+        }
         head.closes_connection()?;
         head.unique("host")?;
         Ok(())
@@ -755,6 +774,28 @@ mod tests {
 
     /// A codec using the test opaque policy.
     type TestCodec = Codec<Fields>;
+
+    /// Transfer coding is rejected unless opted in; Content-Length stays strict.
+    #[test]
+    fn transfer_coding_is_an_explicit_opt_in() {
+        let wire = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n";
+        assert_eq!(
+            Codec::<()>::new(1024).decode_head(wire).err(),
+            Some(Error::Malformed)
+        );
+        let codec = Codec::<()>::new(1024).transfer_coding();
+        let (head, used) = codec.decode_head(wire).unwrap().unwrap();
+        assert_eq!(used, wire.len());
+        assert_eq!(
+            small::Framing::from_response(&head),
+            Ok(small::Framing::Chunked)
+        );
+        assert!(codec.encode_head(&head).is_ok());
+        let bad = b"HTTP/1.1 200 OK\r\nContent-Length: +1\r\n\r\n";
+        assert_eq!(codec.decode_head(bad).err(), Some(Error::Malformed));
+        let twice = b"HTTP/1.1 200 OK\r\nContent-Length: 1\r\nContent-Length: 1\r\n\r\n";
+        assert_eq!(codec.decode_head(twice).err(), Some(Error::Malformed));
+    }
 
     /// Construction copies bytes, while encoding still rejects invalid field syntax.
     #[test]
