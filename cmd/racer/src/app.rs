@@ -517,7 +517,7 @@ impl Application {
             let enrolled = retry_enrollment(
                 || {
                     let attempt = scope(&self.node.clock, MANAGED_ENROLLMENT_ATTEMPT)?;
-                    bootstrap(&self.config, &self.node, &self.limits, &attempt)
+                    bootstrap(&self.config, &self.node, &self.limits, &attempt, &self.ctx)
                 },
                 stop_requested,
                 MANAGED_ENROLLMENT_PACE,
@@ -530,7 +530,7 @@ impl Application {
             }
         } else {
             let scope = scope(&self.node.clock, self.config.request_timeout)?;
-            bootstrap(&self.config, &self.node, &self.limits, &scope)?
+            bootstrap(&self.config, &self.node, &self.limits, &scope, &self.ctx)?
         };
         let selector = self
             .config
@@ -736,11 +736,15 @@ fn bootstrap(
     node: &NodeState,
     limits: &Limits,
     startup: &RequestScope,
+    ctx: &racer_io::WorkerCtx,
 ) -> Result<(NodeId, Option<String>)> {
     let admission = Rc::new(flow_control::Quotas::new(AdmissionPolicy::new(
         limits.clone(),
     )));
-    let reactor = Rc::new(Reactor::new(admission));
+    let reactor = Rc::new(Reactor::new(
+        admission,
+        &racer_io::Env::new(racer_io::Driver::Uring, ctx.clone()),
+    ));
     let unresolved = Rc::new(Keyring::new(
         config.cluster.clone(),
         NodeId(String::new()),
@@ -959,8 +963,6 @@ pub struct WorkerApplication {
     next_health: std::time::Instant,
 
     pressure: WorkerPressure,
-
-    environment: uring_runtime::environment::Environment,
 
     drivers: Rc<uring_runtime::drivers::DriverQueue>,
 
@@ -1268,7 +1270,6 @@ impl WorkerApplication {
         runtime: WorkerRuntime,
         discovered_nics: Vec<racer_control_wire::RailMapping>,
     ) -> Result<Self> {
-        let environment = runtime.reactor.environment().clone();
         let started = runtime.reactor.ctx().now();
         let metrics = node
             .metrics
@@ -1570,7 +1571,7 @@ impl WorkerApplication {
         #[cfg(not(test))]
         let distributed = true;
         #[cfg(test)]
-        let distributed = uring_runtime::reactor::simulation::Simulation::current().is_none();
+        let distributed = runtime.reactor.sim_os().is_none();
         let peers = PeerServer::new(
             io.clone(),
             forwarding,
@@ -1628,7 +1629,6 @@ impl WorkerApplication {
             #[cfg(test)]
             peer_requester: requester,
             http,
-            environment,
             drivers,
             worker,
             runtime,
@@ -1890,8 +1890,8 @@ impl WorkerApplication {
             .reset_mismatched_size()
         });
         #[cfg(test)]
-        if let Some(sim) = uring_runtime::reactor::simulation::Simulation::current() {
-            slabs.simulate_in(sim.os().clone());
+        if let Some(sim) = runtime.reactor.sim_os() {
+            slabs.simulate_in(sim);
         }
         let reader = Rc::new(
             StoreReader::new(
@@ -2070,7 +2070,6 @@ impl WorkerApplication {
     /// Any error here ends the worker group and the process, so each stage names
     /// itself in the log before the error propagates.
     fn poll_services(&mut self, cx: &mut Context<'_>, work_budget: usize) -> Result<()> {
-        let _environment = self.environment.enter();
         let _queue = self.drivers.enter();
         if work_budget == 0 {
             return Ok(());
@@ -2471,9 +2470,8 @@ impl WorkerApplication {
 
     /// Fence control preparation and release this worker's remaining service owners.
     pub fn shutdown<'a>(&'a mut self, shutdown_scope: &'a RequestScope) -> Operation<'a, ()> {
-        let environment = self.environment.clone();
         let drivers = self.drivers.clone();
-        Box::pin(environment.scope(drivers.scope(async move {
+        Box::pin(drivers.scope(async move {
             self.stop_profiling(shutdown_scope).await?;
             self.control_task.take();
             self.keyring_task.take();
@@ -2490,7 +2488,7 @@ impl WorkerApplication {
                 .health
                 .transition_at(crate::telemetry::State::Stopped, self.node.clock.now())?;
             Ok(())
-        })))
+        }))
     }
 
     async fn stop_profiling(&self, deadline: &RequestScope) -> Result<()> {
@@ -2603,7 +2601,6 @@ impl crate::lifecycle::Factory<RequestScope> for Application {
 
 impl crate::lifecycle::Service<RequestScope> for WorkerApplication {
     fn wait_timeout(&self, maximum: Duration) -> Duration {
-        let _environment = self.environment.enter();
         let maximum =
             self.ownership_maintenance
                 .wait_timeout(self.ctx().now(), self.stopping, maximum);
@@ -2634,7 +2631,6 @@ impl crate::lifecycle::Service<RequestScope> for WorkerApplication {
     }
 
     fn stop_admission(&mut self) -> Result<()> {
-        let _environment = self.environment.enter();
         let _queue = self.drivers.enter();
         self.stopping = true;
         if let Some(profiling) = self.node.profiling.get() {
@@ -2671,9 +2667,8 @@ impl crate::lifecycle::Service<RequestScope> for WorkerApplication {
     }
 
     fn drain<'a>(&'a mut self, _scope: &'a RequestScope) -> Operation<'a, ()> {
-        let environment = self.environment.clone();
         let drivers = self.drivers.clone();
-        Box::pin(environment.scope(drivers.scope(async move {
+        Box::pin(drivers.scope(async move {
             self.stop_admission()?;
             let deadline = scope(&self.ctx().clock, self.shutdown_timeout)?;
             self.stop_profiling(&deadline).await?;
@@ -2765,7 +2760,7 @@ impl crate::lifecycle::Service<RequestScope> for WorkerApplication {
                 self.checkpoint(&deadline).await?;
             }
             Ok(())
-        })))
+        }))
     }
 
     fn shutdown<'a>(&'a mut self, scope: &'a RequestScope) -> Operation<'a, ()> {
@@ -3180,9 +3175,8 @@ impl WorkerApplication {
 
     /// Recover storage and accept initial control state before opening listeners.
     pub fn start<'a>(&'a mut self, startup: &'a RequestScope) -> Operation<'a, ()> {
-        let environment = self.environment.clone();
         let drivers = self.drivers.clone();
-        Box::pin(environment.scope(drivers.scope(stoppable(async move {
+        Box::pin(drivers.scope(stoppable(async move {
             startup.check()?;
             if self.started || self.stopping {
                 return Err(Error::InvalidConfiguration);
@@ -3216,7 +3210,7 @@ impl WorkerApplication {
             self.started = true;
             self.observe_health()?;
             Ok(())
-        }))))
+        })))
     }
 
     /// Open storage and publish the effective disk capacity metrics.

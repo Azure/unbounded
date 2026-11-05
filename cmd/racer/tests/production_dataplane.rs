@@ -490,7 +490,7 @@ impl Rig {
             Some(runtime) => (runtime.admission.clone(), runtime.reactor.clone()),
             None => {
                 let admission = Rc::new(flow_control::Quotas::new(AdmissionPolicy::new(budget)));
-                let reactor = Rc::new(Reactor::new(admission.clone()));
+                let reactor = Rc::new(Reactor::new(admission.clone(), &racer_io::Env::host()));
                 (admission, reactor)
             }
         };

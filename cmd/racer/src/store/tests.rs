@@ -1248,7 +1248,7 @@ impl Fixture {
         let admission = Rc::new(flow_control::Quotas::new(AdmissionPolicy::new(
             crate::test_support::cluster::config(false).limits,
         )));
-        let reactor = Rc::new(Reactor::new(admission.clone()));
+        let reactor = Rc::new(Reactor::new(admission.clone(), &crate::test_support::env()));
         let pool = BufferPool::new(admission.clone());
         let index = Rc::new(catalog::Index::new(
             WorkerId(0),
@@ -4173,9 +4173,12 @@ mod checkpoint {
         let (index, segments) = state(8);
         let checkpoint = Checkpointer::new(directory.0.clone(), index, segments);
         checkpoint.configure_geometry(geometry()).unwrap();
-        let reactor = Rc::new(Reactor::new(Rc::new(flow_control::Quotas::new(
-            AdmissionPolicy::new(crate::test_support::cluster::config(false).limits),
-        ))));
+        let reactor = Rc::new(Reactor::new(
+            Rc::new(flow_control::Quotas::new(AdmissionPolicy::new(
+                crate::test_support::cluster::config(false).limits,
+            ))),
+            &crate::test_support::env(),
+        ));
         let scope = RequestScope::host(
             crate::model::RequestId([202; 16]),
             Instant::now() + Duration::from_secs(10),
@@ -4219,9 +4222,12 @@ mod checkpoint {
         let directory = Directory::new();
         let (index, segments) = state(8);
         let checkpoint = Checkpointer::new(directory.0.clone(), index, segments);
-        let reactor = Rc::new(Reactor::new(Rc::new(flow_control::Quotas::new(
-            AdmissionPolicy::new(crate::test_support::cluster::config(false).limits),
-        ))));
+        let reactor = Rc::new(Reactor::new(
+            Rc::new(flow_control::Quotas::new(AdmissionPolicy::new(
+                crate::test_support::cluster::config(false).limits,
+            ))),
+            &crate::test_support::env(),
+        ));
         reactor.init().unwrap();
         let scope = || {
             RequestScope::host(

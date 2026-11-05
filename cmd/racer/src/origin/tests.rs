@@ -139,7 +139,7 @@ fn client() -> (
         relay_transfers: n,
     };
     let admission = Rc::new(flow_control::Quotas::new(AdmissionPolicy::new(limits)));
-    let reactor = Rc::new(Reactor::new(admission.clone()));
+    let reactor = Rc::new(Reactor::new(admission.clone(), &crate::test_support::env()));
     let pool = Rc::new(crate::http::new_pool(reactor.clone(), admission.clone(), 2));
     let io = Rc::new(crate::http::new_io(
         reactor.clone(),

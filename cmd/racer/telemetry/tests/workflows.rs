@@ -256,7 +256,7 @@ fn exchange_request(
 /// Output failure must close only that connection without sending private partial text.
 #[test]
 fn failed_and_oversized_handler_output_closes_only_that_connection() {
-    let reactor = Reactor::<RequestScope, ()>::new(8, ());
+    let reactor = Reactor::<RequestScope, ()>::new(8, (), &racer_io::Env::host());
     let submissions = reactor
         .reserve_submissions(server::CONTROL_SLOTS, ())
         .unwrap();
@@ -315,7 +315,7 @@ fn failed_and_oversized_handler_output_closes_only_that_connection() {
 /// terminator is rejected, and both exchanges release their connection lease.
 #[test]
 fn exact_request_limit_distinguishes_complete_and_unterminated_headers() {
-    let reactor = Reactor::<RequestScope, ()>::new(8, ());
+    let reactor = Reactor::<RequestScope, ()>::new(8, (), &racer_io::Env::host());
     let submissions = reactor
         .reserve_submissions(server::CONTROL_SLOTS, ())
         .unwrap();

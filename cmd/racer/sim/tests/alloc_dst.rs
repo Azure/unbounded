@@ -535,7 +535,7 @@ impl Table {
             slab,
             clock: SegmentClock::new(segments.clone()),
             segments,
-            reactor: Reactor::new(32, ()),
+            reactor: Reactor::new(32, (), &uring_runtime::reactor::simulation::ambient_env()),
         }
     }
 }

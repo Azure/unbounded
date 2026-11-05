@@ -3325,7 +3325,7 @@ fn fixture_with_caches(
     let availability = crate::control::for_caches(keys.clone(), caches);
     let buffers = BufferPool::new(admission.clone());
     let memory = Rc::new(MemoryCache::new(buffers.clone(), availability.clone()));
-    let reactor = Rc::new(Reactor::new(admission.clone()));
+    let reactor = Rc::new(Reactor::new(admission.clone(), &crate::test_support::env()));
     let index = Rc::new(Index::new(
         worker,
         16,

@@ -142,11 +142,58 @@ impl OpCtx {
 }
 
 /// Backend selected at construction.
+#[derive(Clone, Debug)]
 pub enum Driver {
     /// The Linux kernel through io_uring.
     Uring,
     /// A deterministic simulated operating system.
     Sim(crate::sim::SimOs),
+}
+
+impl Driver {
+    /// The simulated OS this driver selects, or `None` for the kernel.
+    pub fn sim_os(&self) -> Option<&crate::sim::SimOs> {
+        match self {
+            Self::Uring => None,
+            Self::Sim(os) => Some(os),
+        }
+    }
+}
+
+/// The backend and worker context one worker role runs against, passed
+/// explicitly to every owner that builds a reactor or a descriptor.
+#[derive(Clone, Debug)]
+pub struct Env {
+    /// Kernel or simulated operating system.
+    pub driver: Driver,
+
+    /// Time and entropy.
+    pub ctx: WorkerCtx,
+}
+
+impl Env {
+    /// Production: the kernel with host time and entropy.
+    pub fn host() -> Self {
+        Self {
+            driver: Driver::Uring,
+            ctx: WorkerCtx::host(),
+        }
+    }
+
+    /// A role with an explicit backend and context.
+    pub fn new(driver: Driver, ctx: WorkerCtx) -> Self {
+        Self { driver, ctx }
+    }
+
+    /// A role on the simulated OS `os` with context `ctx`.
+    pub fn sim(os: &crate::sim::SimOs, ctx: WorkerCtx) -> Self {
+        Self::new(Driver::Sim(os.clone()), ctx)
+    }
+
+    /// The simulated OS, or `None` for the kernel.
+    pub fn sim_os(&self) -> Option<&crate::sim::SimOs> {
+        self.driver.sim_os()
+    }
 }
 
 /// Ring sizing.

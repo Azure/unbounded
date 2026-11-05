@@ -157,8 +157,8 @@ struct Harness {
 }
 
 impl Harness {
-    fn new() -> Self {
-        let reactor = Rc::new(TestReactor(Reactor::new(32, ())));
+    fn new(env: &racer_io::Env) -> Self {
+        let reactor = Rc::new(TestReactor(Reactor::new(32, (), env)));
         let hooks = Rc::new(Hooks::default());
         let identities = crate::tests::network(3, reactor.0.ctx());
         Self {
@@ -284,10 +284,11 @@ async fn join<A: Future, B: Future>(a: A, b: B) -> (A::Output, B::Output) {
 
 fn simulation(test: impl FnOnce(&Harness, &Simulation, &SimulationClock)) {
     let clock = SimulationClock::new_at(899, Instant::now(), SystemTime::now());
-    let _clock = clock.environment(0).enter();
+    let environment = clock.environment(0);
+    let _clock = environment.enter();
     let sim = Simulation::new();
     let _sim = sim.enter();
-    let h = Harness::new();
+    let h = Harness::new(&racer_io::Env::sim(&sim, environment.worker_ctx()));
     test(&h, &sim, &clock);
     h.pool.close();
     h.drive(h.reactor.drain()).unwrap();

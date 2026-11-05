@@ -694,7 +694,10 @@ impl Resources {
             self.limits.clone(),
         )));
         let runtime = WorkerRuntime {
-            reactor: Rc::new(Reactor::new(admission.clone())),
+            reactor: Rc::new(Reactor::new(
+                admission.clone(),
+                &racer_io::Env::new(racer_io::Driver::Uring, self.ctx.clone()),
+            )),
             admission,
             crypto: Rc::new(CryptoClient::new(port)),
         };
@@ -1031,7 +1034,7 @@ mod tests {
         let observed = Rc::new(Cell::new(0));
         let mut service = IoService {
             runtime: WorkerRuntime {
-                reactor: Rc::new(Reactor::new(admission.clone())),
+                reactor: Rc::new(Reactor::new(admission.clone(), &crate::test_support::env())),
                 admission,
                 crypto: Rc::new(CryptoClient::new(port)),
             },

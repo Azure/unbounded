@@ -2294,7 +2294,7 @@ pub(crate) mod tests {
             let admission = Rc::new(flow_control::Quotas::new(AdmissionPolicy::new(
                 crate::test_support::cluster::config(false).limits,
             )));
-            let reactor = Rc::new(Reactor::new(admission.clone()));
+            let reactor = Rc::new(Reactor::new(admission.clone(), &crate::test_support::env()));
             let io = crate::http::new_io(
                 reactor.clone(),
                 Codec::new(MAX_ENVELOPE_HEAD),
@@ -2446,7 +2446,7 @@ pub(crate) mod tests {
             let admission = Rc::new(flow_control::Quotas::new(AdmissionPolicy::new(
                 crate::test_support::cluster::config(false).limits,
             )));
-            let reactor = Rc::new(Reactor::new(admission.clone()));
+            let reactor = Rc::new(Reactor::new(admission.clone(), &crate::test_support::env()));
             let io = crate::http::new_io(reactor.clone(), Codec::new(65536), admission.clone(), 0);
             let scope =
                 RequestScope::host(RequestId([2; 16]), Instant::now() + Duration::from_secs(10))
@@ -2495,7 +2495,7 @@ pub(crate) mod tests {
                 let admission = Rc::new(flow_control::Quotas::new(AdmissionPolicy::new(
                     crate::test_support::cluster::config(false).limits,
                 )));
-                let reactor = Rc::new(Reactor::new(admission.clone()));
+                let reactor = Rc::new(Reactor::new(admission.clone(), &crate::test_support::env()));
                 reactor.init().unwrap();
                 let io =
                     crate::http::new_io(reactor.clone(), Codec::new(65536), admission.clone(), 0);

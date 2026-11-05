@@ -1124,7 +1124,7 @@ impl RelayFixture {
             .collect();
         let reactors: Vec<_> = admissions
             .iter()
-            .map(|a| Rc::new(Reactor::new(a.clone())))
+            .map(|a| Rc::new(Reactor::new(a.clone(), &crate::test_support::env())))
             .collect();
         let ios: Vec<_> = reactors
             .iter()

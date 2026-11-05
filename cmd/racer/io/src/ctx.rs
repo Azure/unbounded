@@ -316,6 +316,85 @@ impl VirtualClock {
     }
 }
 
+/// Test support: one simulated world's virtual clock and the seed its role
+/// contexts draw entropy from. Give each role a stable, unique stream.
+#[derive(Clone, Debug)]
+pub struct SimClock {
+    seed: u64,
+
+    clock: VirtualClock,
+}
+
+impl SimClock {
+    /// A world on [`VirtualClock::new`]'s fixed anchors.
+    pub fn new(seed: u64) -> Self {
+        Self {
+            seed,
+            clock: VirtualClock::new(),
+        }
+    }
+
+    /// A world with explicit monotonic and wall-clock anchors.
+    pub fn new_at(seed: u64, monotonic: Instant, wall: SystemTime) -> Self {
+        Self {
+            seed,
+            clock: VirtualClock::new_at(monotonic, wall),
+        }
+    }
+
+    /// The world's seed.
+    pub fn seed(&self) -> u64 {
+        self.seed
+    }
+
+    /// A role context on this world's clock with entropy stream `stream`.
+    /// Calling again with the same stream replays its bytes.
+    pub fn ctx(&self, stream: u64) -> WorkerCtx {
+        WorkerCtx::simulated(&self.clock, self.seed, stream)
+    }
+
+    /// The world's virtual clock.
+    pub fn virtual_clock(&self) -> &VirtualClock {
+        &self.clock
+    }
+
+    /// Advance time, panicking if the monotonic instant would overflow.
+    pub fn advance(&self, duration: Duration) {
+        self.checked_advance(duration).expect("clock overflow");
+    }
+
+    /// Advance time, or leave it unchanged when the monotonic instant would overflow.
+    pub fn checked_advance(&self, duration: Duration) -> Result<()> {
+        self.clock
+            .now()
+            .checked_add(duration)
+            .ok_or(Error::InvalidInput)?;
+        self.clock.advance(duration)
+    }
+
+    /// Correct wall time without changing elapsed time or the stable anchor.
+    pub fn set_wall_time(&self, wall: SystemTime) {
+        self.clock
+            .set_wall_time(wall)
+            .expect("simulated wall time is after the Unix epoch");
+    }
+
+    /// Total monotonic time advanced since the world was created.
+    pub fn elapsed(&self) -> Duration {
+        self.clock.elapsed()
+    }
+
+    /// Current monotonic time.
+    pub fn now(&self) -> Instant {
+        self.clock.now()
+    }
+
+    /// Current wall time.
+    pub fn wall_now(&self) -> SystemTime {
+        self.clock.wall_now()
+    }
+}
+
 impl Default for VirtualClock {
     /// Same as [`VirtualClock::new`].
     fn default() -> Self {

@@ -4445,7 +4445,10 @@ pub(super) mod tests {
             let admission = Rc::new(flow_control::Quotas::new(
                 crate::admission::AdmissionPolicy::new(config.limits.clone()),
             ));
-            let reactor = Rc::new(crate::runtime::Reactor::new(admission.clone()));
+            let reactor = Rc::new(crate::runtime::Reactor::new(
+                admission.clone(),
+                &crate::test_support::env(),
+            ));
             let keys = Rc::new(Keyring::new(
                 config.cluster.clone(),
                 config.node.clone(),

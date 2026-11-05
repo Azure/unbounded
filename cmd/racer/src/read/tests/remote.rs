@@ -170,7 +170,7 @@ fn coordinator_copy_miss_is_not_origin_absence_and_pinned_missing_is_412() {
         crate::test_support::cluster::config(false).limits,
     )));
     let calls = missing_adapter();
-    let reactor = Rc::new(Reactor::new(admission.clone()));
+    let reactor = Rc::new(Reactor::new(admission.clone(), &crate::test_support::env()));
     let (coordinator, _endpoint) = metadata_coordinator_with_newer_publication(
         &node(1),
         &membership,
@@ -352,7 +352,7 @@ fn remote_candidate_with_churn(absence: Option<Absence>, forbidden: bool, churn:
     let admission = Rc::new(flow_control::Quotas::new(AdmissionPolicy::new(
         crate::test_support::cluster::config(false).limits,
     )));
-    let reactor = Rc::new(Reactor::new(admission.clone()));
+    let reactor = Rc::new(Reactor::new(admission.clone(), &crate::test_support::env()));
     let io = Rc::new(crate::http::new_io(
         reactor.clone(),
         Codec::new(protocol::MAX_ENVELOPE_HEAD),

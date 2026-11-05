@@ -951,7 +951,7 @@ pub mod secure {
             }
 
             let host = Rc::new(Hosting {
-                reactor: Reactor::new(4, ()),
+                reactor: Reactor::new(4, (), &crate::reactor::simulation::ambient_env()),
                 next: Cell::new(0),
                 fences: RefCell::default(),
                 ready: Cell::new(false),

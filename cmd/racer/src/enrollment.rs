@@ -946,7 +946,7 @@ mod tests {
     /// Construct one namespace owner on the active simulation backend.
     fn fixture() -> (Rc<Files>, Enrollment<Rc<Files>>, Request) {
         let files = Rc::new(Files {
-            reactor: Reactor::new(64, ()),
+            reactor: Reactor::new(64, (), &crate::test_support::env()),
             next: Cell::new(0),
         });
         let enrollment = Enrollment::new(

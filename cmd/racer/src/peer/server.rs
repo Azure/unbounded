@@ -247,7 +247,10 @@ impl PeerServer {
             use futures::stream::FuturesUnordered;
             scope.check()?;
             let reactor = self.io.reactor();
-            let fd = Rc::new(uring_runtime::reactor::descriptor::tcp_listener(address)?);
+            let fd = Rc::new(uring_runtime::reactor::descriptor::tcp_listener(
+                reactor.sim_os().as_ref(),
+                address,
+            )?);
             let mut active = FuturesUnordered::new();
             let maximum = self
                 .admission
@@ -1195,7 +1198,7 @@ mod tests {
                 let admission = Rc::new(flow_control::Quotas::new(AdmissionPolicy::new(
                     crate::test_support::cluster::config(false).limits,
                 )));
-                let reactor = Rc::new(Reactor::new(admission.clone()));
+                let reactor = Rc::new(Reactor::new(admission.clone(), &crate::test_support::env()));
                 reactor.init().unwrap();
                 let io =
                     crate::http::new_io(reactor.clone(), Codec::new(4096), admission.clone(), 4096);
@@ -1302,7 +1305,7 @@ mod tests {
         let admission = Rc::new(flow_control::Quotas::new(AdmissionPolicy::new(
             crate::test_support::cluster::config(false).limits,
         )));
-        let reactor = Rc::new(Reactor::new(admission.clone()));
+        let reactor = Rc::new(Reactor::new(admission.clone(), &crate::test_support::env()));
         reactor.init().unwrap();
         let io = crate::http::new_io(reactor.clone(), Codec::new(4096), admission.clone(), 4096);
         let parent = listener_scope();
@@ -1495,7 +1498,7 @@ mod tests {
                 let admission = Rc::new(flow_control::Quotas::new(AdmissionPolicy::new(
                     crate::test_support::cluster::config(false).limits,
                 )));
-                let reactor = Reactor::new(admission.clone());
+                let reactor = Reactor::new(admission.clone(), &crate::test_support::env());
                 reactor.init().unwrap();
                 let baseline = admission.used(ResourceClass::RequestContext);
                 let scope = listener_scope();
@@ -1695,7 +1698,7 @@ mod tests {
                 let mut limits = crate::test_support::cluster::config(false).limits;
                 limits.client_connections = std::num::NonZeroUsize::new(1).unwrap();
                 let admission = Rc::new(flow_control::Quotas::new(AdmissionPolicy::new(limits)));
-                let reactor = Rc::new(Reactor::new(admission.clone()));
+                let reactor = Rc::new(Reactor::new(admission.clone(), &crate::test_support::env()));
                 reactor.init().unwrap();
                 let baseline = admission.used(ResourceClass::RequestContext);
                 let io = Rc::new(crate::http::new_io(

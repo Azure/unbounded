@@ -1151,7 +1151,7 @@ mod tests {
         )));
         let (io, engine) = security::pair(WorkerId(0), 0, app.limits.queue_entries);
         let runtime = WorkerRuntime {
-            reactor: Rc::new(Reactor::new(admission.clone())),
+            reactor: Rc::new(Reactor::new(admission.clone(), &crate::test_support::env())),
             admission,
             crypto: Rc::new(CryptoClient::new(io)),
         };

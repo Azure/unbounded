@@ -83,7 +83,7 @@ impl Rig {
             metadata_entries: n,
             relay_transfers: n,
         })));
-        let reactor = Rc::new(Reactor::new(admission.clone()));
+        let reactor = Rc::new(Reactor::new(admission.clone(), &racer_io::Env::host()));
         let io = Rc::new(racer::http::new_io(
             reactor.clone(),
             Codec::new(LIMIT),

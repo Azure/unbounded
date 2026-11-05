@@ -44,15 +44,8 @@ pub use racer_io::ring::{
 pub struct Reactor<S: Scope, B: Budget> {
     rejection_observer: Option<Box<RejectionObserver<S>>>,
 
-    environment: super::environment::Environment,
-
-    /// Worker clock and entropy for code driven by this reactor.
-    // MIGRATION: bridged from the construction-time thread environment until
-    // workers receive a WorkerCtx explicitly.
-    ctx: racer_io::WorkerCtx,
-
-    #[cfg(feature = "simulation")]
-    simulation: Option<simulation::Simulation>,
+    /// Backend and worker context for code driven by this reactor.
+    env: racer_io::Env,
 
     budget: B,
 
@@ -211,34 +204,24 @@ struct Admission<S> {
 impl<S: Scope, Q: Budget> Reactor<S, Q> {
     /// Worker clock and entropy for code driven by this reactor.
     pub fn ctx(&self) -> &racer_io::WorkerCtx {
-        &self.ctx
+        &self.env.ctx
+    }
+
+    /// The backend and worker context this reactor was built with.
+    pub fn env(&self) -> &racer_io::Env {
+        &self.env
     }
 
     /// The simulated OS this reactor drives, or `None` on the kernel.
     pub fn sim_os(&self) -> Option<racer_io::sim::SimOs> {
-        #[cfg(feature = "simulation")]
-        {
-            self.simulation.as_ref().map(|sim| sim.os().clone())
-        }
-        #[cfg(not(feature = "simulation"))]
-        None
-    }
-
-    /// The environment captured when this reactor was constructed. Owners
-    /// built on the reactor's thread reuse it instead of reading the ambient one.
-    pub fn environment(&self) -> &super::environment::Environment {
-        &self.environment
+        self.env.sim_os().cloned()
     }
 
     /// Create an uninitialized reactor; resources are acquired by [`Self::init`].
-    pub fn new(queue_entries: usize, budget: Q) -> Self {
-        let environment = super::environment::Environment::current();
+    pub fn new(queue_entries: usize, budget: Q, env: &racer_io::Env) -> Self {
         Self {
             rejection_observer: None,
-            ctx: environment.worker_ctx(),
-            environment,
-            #[cfg(feature = "simulation")]
-            simulation: simulation::Simulation::current(),
+            env: env.clone(),
             budget,
             queue_entries,
             io: OnceCell::new(),
@@ -299,13 +282,7 @@ impl<S: Scope, Q: Budget> Reactor<S, Q> {
             return Ok(io);
         }
         let ctx = self.ctx().clone();
-        #[cfg(feature = "simulation")]
-        let driver = match &self.simulation {
-            Some(sim) => Driver::Sim(sim.os().clone()),
-            None => Driver::Uring,
-        };
-        #[cfg(not(feature = "simulation"))]
-        let driver = Driver::Uring;
+        let driver = self.env.driver.clone();
         let ctx = if matches!(driver, Driver::Uring) && ctx.is_simulated() {
             self.foreign_clock.set(true);
             racer_io::WorkerCtx::host()
@@ -860,7 +837,6 @@ impl<S: Scope, Q: Budget> Reactor<S, Q> {
     /// in-flight scopes, canceling operations whose scope failed. Returns the
     /// completions consumed.
     pub fn poll_budgeted(&self, budget: usize) -> Result<usize> {
-        let _environment = self.environment.enter();
         if budget == 0 {
             return Ok(0);
         }
@@ -928,7 +904,6 @@ impl<S: Scope, Q: Budget> Reactor<S, Q> {
             return Ok(());
         };
         if !duration.is_zero() {
-            let _environment = self.environment.enter();
             self.scan(io, usize::MAX);
         }
         if duration.is_zero() || io.is_sim() {
@@ -1119,8 +1094,7 @@ pub mod timer {
                     })
                     .await;
                 }
-                #[cfg(feature = "simulation")]
-                if self.simulation.is_some() {
+                if self.env.sim_os().is_some() {
                     return Err(Error::InvalidConfiguration.into());
                 }
                 let io = self.io()?;
@@ -1153,15 +1127,15 @@ pub mod timer {
 }
 
 pub mod descriptor {
-    //! Owned descriptors are shared with `racer-io`. These constructors consult
-    //! the thread-selected simulation (a migration shim; delete with this crate).
+    //! Owned descriptors are shared with `racer-io`. These constructors use the
+    //! explicitly selected simulated OS, or the kernel.
     use crate::{Error, Result};
     pub use racer_io::ring::Descriptor;
+    use racer_io::sim::SimOs;
 
-    /// Bind a nonblocking TCP listener in the currently selected environment.
-    pub fn tcp_listener(address: std::net::SocketAddr) -> Result<Descriptor> {
-        #[cfg(feature = "simulation")]
-        if let Some(sim) = super::simulation::Simulation::current() {
+    /// Bind a nonblocking TCP listener on `sim`, or on the kernel when `None`.
+    pub fn tcp_listener(sim: Option<&SimOs>, address: std::net::SocketAddr) -> Result<Descriptor> {
+        if let Some(sim) = sim {
             return sim
                 .listen(super::SocketAddress::Inet(address))
                 .map_err(|_| Error::Io);
@@ -1169,10 +1143,9 @@ pub mod descriptor {
         Descriptor::tcp_listener(address).map_err(|_| Error::Io)
     }
 
-    /// Create a nonblocking, close-on-exec stream socket in the selected environment.
-    pub fn socket(domain: i32) -> Result<Descriptor> {
-        #[cfg(feature = "simulation")]
-        if let Some(sim) = super::simulation::Simulation::current() {
+    /// Create a nonblocking, close-on-exec stream socket on `sim` or the kernel.
+    pub fn socket(sim: Option<&SimOs>, domain: i32) -> Result<Descriptor> {
+        if let Some(sim) = sim {
             return sim.socket(domain).map_err(|_| Error::Io);
         }
         Descriptor::socket(domain).map_err(|_| Error::Io)

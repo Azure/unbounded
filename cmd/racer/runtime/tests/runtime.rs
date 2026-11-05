@@ -208,7 +208,11 @@ mod filesystem {
         }
         let used = Rc::new(Cell::new(0));
         let reactor = Reactor {
-            core: Core::new(capacity, CountingBudget(used.clone())),
+            core: Core::new(
+                capacity,
+                CountingBudget(used.clone()),
+                &uring_runtime::reactor::simulation::ambient_env(),
+            ),
             used,
         };
         reactor.init().unwrap();
@@ -285,7 +289,7 @@ mod filesystem {
         let root = Directory::new();
         let path = root.0.join("private");
         let request = SecureScope(scope());
-        let host = Core::new(16, ());
+        let host = Core::new(16, (), &uring_runtime::reactor::simulation::ambient_env());
         let host_dir =
             drive_secure(&host, secure::directory(&host, &path, true, true, &request)).unwrap();
         drive_secure(
@@ -295,7 +299,7 @@ mod filesystem {
         .unwrap();
         let sim = Simulation::new();
         let environment = sim.enter();
-        let simulated = Core::new(16, ());
+        let simulated = Core::new(16, (), &uring_runtime::reactor::simulation::ambient_env());
         let sim_dir = drive_secure(
             &simulated,
             secure::directory(&simulated, &path, true, true, &request),
@@ -383,7 +387,7 @@ mod filesystem {
             let root = Directory::new();
             let path = root.0.join("private");
             let request = SecureScope(scope());
-            let r = Core::new(16, ());
+            let r = Core::new(16, (), &uring_runtime::reactor::simulation::ambient_env());
             r.init().unwrap();
             let dir = drive_secure(&r, secure::directory(&r, &path, true, true, &request)).unwrap();
             drive_secure(
@@ -544,7 +548,11 @@ mod filesystem {
         let _simulation = sim.enter();
         let used = Rc::new(Cell::new(0));
         let simulated = Reactor {
-            core: Core::new(16, CountingBudget(used.clone())),
+            core: Core::new(
+                16,
+                CountingBudget(used.clone()),
+                &uring_runtime::reactor::simulation::ambient_env(),
+            ),
             used,
         };
         simulated.init().unwrap();
@@ -1014,8 +1022,8 @@ mod reserved_capacity {
     fn reserved_capacity_is_reactor_local_and_failed_replies_release_it_only_on_consumption() {
         let simulation = Simulation::new();
         let _os = simulation.enter();
-        let owner = Reactor::new(1, ());
-        let foreign = Reactor::new(1, ());
+        let owner = Reactor::new(1, (), &uring_runtime::reactor::simulation::ambient_env());
+        let foreign = Reactor::new(1, (), &uring_runtime::reactor::simulation::ambient_env());
         let scope = OpenScope;
         let charge = Rc::new(());
         let retained_charge = Rc::downgrade(&charge);
@@ -1104,7 +1112,7 @@ mod reserved_capacity {
         use uring_runtime::reactor::{SocketAddress, simulation::Fault};
         let simulation = Simulation::new();
         let _os = simulation.enter();
-        let reactor = Reactor::new(1, ());
+        let reactor = Reactor::new(1, (), &uring_runtime::reactor::simulation::ambient_env());
         let capacity = reactor.reserve_submissions(1, ()).unwrap();
         let scope = OpenScope;
         let (socket, peer) = simulation.socket_pair();
@@ -1171,7 +1179,7 @@ mod reserved_capacity {
         }
         let simulation = Simulation::new();
         let _os = simulation.enter();
-        let reactor = Reactor::new(1, ());
+        let reactor = Reactor::new(1, (), &uring_runtime::reactor::simulation::ambient_env());
         let capacity = reactor.reserve_submissions(1, ()).unwrap();
         let scope = OpenScope;
         let (socket, peer) = simulation.socket_pair();
@@ -1191,7 +1199,7 @@ mod reserved_capacity {
         use uring_runtime::reactor::{SocketAddress, simulation::Fault};
         let simulation = Simulation::new();
         let _os = simulation.enter();
-        let reactor = Reactor::new(3, ());
+        let reactor = Reactor::new(3, (), &uring_runtime::reactor::simulation::ambient_env());
         let scope = OpenScope;
         let charge = Rc::new(());
         let weak = Rc::downgrade(&charge);
@@ -1296,7 +1304,7 @@ mod reserved_capacity {
         }
         let simulation = Simulation::new();
         let _os = simulation.enter();
-        let reactor = Reactor::new(2, ());
+        let reactor = Reactor::new(2, (), &uring_runtime::reactor::simulation::ambient_env());
         let scope = OpenScope;
         let charge = Rc::new(());
         let charge_weak = Rc::downgrade(&charge);

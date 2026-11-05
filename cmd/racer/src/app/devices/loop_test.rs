@@ -261,7 +261,7 @@ fn disposable_loop_devices_read_only_bind_restart() {
     let admission = Rc::new(flow_control::Quotas::new(
         crate::admission::AdmissionPolicy::new(config.limits.clone()),
     ));
-    let reactor = crate::runtime::Reactor::new(admission);
+    let reactor = crate::runtime::Reactor::new(admission, &crate::test_support::env());
     let scope = crate::runtime::RequestScope::on(
         &crate::test_support::clock(),
         crate::model::RequestId([99; 16]),

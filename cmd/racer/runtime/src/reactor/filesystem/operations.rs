@@ -1060,7 +1060,7 @@ mod tests {
         let _environment = sim.enter();
         sim.write_file(Path::new("/data"), b"abc").unwrap();
         let fd = Rc::new(sim.open(None, Path::new("/data"), libc::O_RDONLY).unwrap());
-        let r = crate::reactor::Reactor::new(8, Reject);
+        let r = crate::reactor::Reactor::new(8, Reject, &crate::reactor::simulation::ambient_env());
         let request = scope();
         let mut future = r.file_read_bounded(fd, 3, NonZeroUsize::new(2).unwrap(), &request);
         assert!(matches!(

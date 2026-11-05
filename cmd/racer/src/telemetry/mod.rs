@@ -194,7 +194,10 @@ impl Telemetry {
     ) -> Operation<'a, ()> {
         Box::pin(async move {
             scope.check()?;
-            let listener = uring_runtime::reactor::descriptor::tcp_listener(address)?;
+            let listener = uring_runtime::reactor::descriptor::tcp_listener(
+                io.reactor.sim_os().as_ref(),
+                address,
+            )?;
             serve(self, listener, io, scope).await
         })
     }

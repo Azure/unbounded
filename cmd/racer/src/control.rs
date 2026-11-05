@@ -582,11 +582,14 @@ pub(crate) mod tests {
         use wire_codec::rest::Io;
         let sim = Simulation::new();
         let _os = sim.enter();
-        let r = Rc::new(Reactor::new(Rc::new(flow_control::Quotas::new(
-            crate::admission::AdmissionPolicy::new(
-                crate::test_support::cluster::config(false).limits,
-            ),
-        ))));
+        let r = Rc::new(Reactor::new(
+            Rc::new(flow_control::Quotas::new(
+                crate::admission::AdmissionPolicy::new(
+                    crate::test_support::cluster::config(false).limits,
+                ),
+            )),
+            &crate::test_support::env(),
+        ));
         let io = ReactorControlIo::new(r.clone());
         let scope = testing::scope();
         let (socket, _peer) = sim.socket_pair();
@@ -611,11 +614,14 @@ pub(crate) mod tests {
         for case in ["success", "write", "rename", "cancel-rename", "sync"] {
             let sim = Simulation::new();
             let _os = sim.enter();
-            let r = Reactor::new(Rc::new(flow_control::Quotas::new(
-                crate::admission::AdmissionPolicy::new(
-                    crate::test_support::cluster::config(false).limits,
-                ),
-            )));
+            let r = Reactor::new(
+                Rc::new(flow_control::Quotas::new(
+                    crate::admission::AdmissionPolicy::new(
+                        crate::test_support::cluster::config(false).limits,
+                    ),
+                )),
+                &crate::test_support::env(),
+            );
             let scope = testing::scope();
             sim.write_file(Path::new("/identity"), b"old").unwrap();
             sim.disk().sync_all().unwrap();
@@ -1212,11 +1218,14 @@ pub(crate) mod tests {
             let sim_ctx = sim_env.worker_ctx();
             let sim = uring_runtime::reactor::simulation::Simulation::new();
             let _os = sim.enter();
-            let reactor = Rc::new(Reactor::new(Rc::new(flow_control::Quotas::new(
-                crate::admission::AdmissionPolicy::new(
-                    crate::test_support::cluster::config(false).limits,
-                ),
-            ))));
+            let reactor = Rc::new(Reactor::new(
+                Rc::new(flow_control::Quotas::new(
+                    crate::admission::AdmissionPolicy::new(
+                        crate::test_support::cluster::config(false).limits,
+                    ),
+                )),
+                &crate::test_support::env(),
+            ));
             let target = store(2);
             let published = target.published.clone();
             let submissions = Rc::new(Cell::new(0));

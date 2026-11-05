@@ -101,11 +101,14 @@ mod tests {
         for renewal in [false, true] {
             let sim = Simulation::new();
             let _os = sim.enter();
-            let reactor = Rc::new(crate::runtime::Reactor::new(Rc::new(
-                flow_control::Quotas::new(crate::admission::AdmissionPolicy::new(
-                    crate::test_support::cluster::config(false).limits,
+            let reactor = Rc::new(crate::runtime::Reactor::new(
+                Rc::new(flow_control::Quotas::new(
+                    crate::admission::AdmissionPolicy::new(
+                        crate::test_support::cluster::config(false).limits,
+                    ),
                 )),
-            )));
+                &crate::test_support::env(),
+            ));
             let io = Rc::new(ReactorControlIo::new(reactor.clone()));
             let journal =
                 RailJournal::new(Arc::new(Default::default()), "/identity".into(), io.clone());
@@ -167,11 +170,14 @@ mod tests {
     fn abandoned_journal_write_is_fenced_before_retry_and_crypto_submission() {
         let sim = Simulation::new();
         let _os = sim.enter();
-        let reactor = Rc::new(crate::runtime::Reactor::new(Rc::new(
-            flow_control::Quotas::new(crate::admission::AdmissionPolicy::new(
-                crate::test_support::cluster::config(false).limits,
+        let reactor = Rc::new(crate::runtime::Reactor::new(
+            Rc::new(flow_control::Quotas::new(
+                crate::admission::AdmissionPolicy::new(
+                    crate::test_support::cluster::config(false).limits,
+                ),
             )),
-        )));
+            &crate::test_support::env(),
+        ));
         let io = Rc::new(ReactorControlIo::new(reactor.clone()));
         let journal =
             RailJournal::new(Arc::new(Default::default()), "/identity".into(), io.clone());

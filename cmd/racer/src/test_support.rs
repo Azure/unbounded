@@ -377,7 +377,7 @@ pub(crate) fn wake_test_worker() -> crate::app::WorkerApplication {
         Arc::new(crate::app::NodeState::default()),
         WorkerId(0),
         crate::worker::WorkerRuntime {
-            reactor: Rc::new(Reactor::new(admission.clone())),
+            reactor: Rc::new(Reactor::new(admission.clone(), &crate::test_support::env())),
             admission,
             crypto: Rc::new(CryptoClient::new(io)),
         },
@@ -1092,6 +1092,13 @@ pub(crate) fn simulated_slab<C: page_alloc::Charge>(
 // WorkerCtx explicitly.
 pub fn ctx() -> racer_io::WorkerCtx {
     uring_runtime::environment::Environment::current().worker_ctx()
+}
+
+/// The selected thread world and environment as an explicit reactor backend.
+// MIGRATION: test fixtures read the thread environment until tests pass an
+// Env explicitly.
+pub fn env() -> racer_io::Env {
+    uring_runtime::reactor::simulation::ambient_env()
 }
 
 /// MIGRATION: the clock of [`ctx`].

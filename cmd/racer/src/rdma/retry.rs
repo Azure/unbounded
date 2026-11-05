@@ -231,7 +231,10 @@ mod tests {
         let admission = Rc::new(flow_control::Quotas::new(AdmissionPolicy::new(
             crate::test_support::cluster::config(true).limits,
         )));
-        let reactor = Rc::new(crate::runtime::Reactor::new(admission));
+        let reactor = Rc::new(crate::runtime::Reactor::new(
+            admission,
+            &crate::test_support::env(),
+        ));
         reactor
             .init()
             .expect("real io_uring required for kernel alarm validation");

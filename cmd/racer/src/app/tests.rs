@@ -381,6 +381,7 @@ impl ControlFixture {
             &node,
             &config.limits,
             &scope(&racer_io::Clock::host(), timeout).unwrap(),
+            &crate::test_support::ctx(),
         )
         .unwrap()
         .0;
@@ -656,7 +657,7 @@ pub(super) fn local_worker_with_fabric(
     )));
     let (io, engine) = crate::security::pair(worker, 0, config.limits.queue_entries);
     let runtime = WorkerRuntime {
-        reactor: Rc::new(Reactor::new(admission.clone())),
+        reactor: Rc::new(Reactor::new(admission.clone(), &crate::test_support::env())),
         admission,
         crypto: Rc::new(crate::security::CryptoClient::new(io)),
     };
@@ -1021,7 +1022,7 @@ fn worker_sizing_funds_diagnostics_and_ordinary_progress() {
         let admission = Rc::new(flow_control::Quotas::new(AdmissionPolicy::new(
             result.unwrap(),
         )));
-        let reactor = Rc::new(Reactor::new(admission.clone()));
+        let reactor = Rc::new(Reactor::new(admission.clone(), &crate::test_support::env()));
         reactor.init().unwrap();
         let baseline = admission.used(ResourceClass::RequestContext);
         let diagnostics =
@@ -1372,11 +1373,8 @@ fn metadata_wait_uses_worker_clock_and_keeps_due_backlog_runnable() {
         worker
     };
     let maximum = Duration::from_millis(1);
-    let now = {
-        let _environment = worker.environment.enter();
-        worker.environment.worker_ctx().clock.now()
-    };
-    // Require the hook to enter the worker environment, not sample host time.
+    let now = worker.ctx().clock.now();
+    // Require the hook to use the worker's context, not sample host time.
     let _required = uring_runtime::environment::require_simulated();
     assert_eq!(worker.wait_timeout(maximum), maximum);
     let probes: Vec<_> = (0..65)
@@ -1470,7 +1468,7 @@ fn composes_http_and_optional_rdma_without_operational_side_effects() {
         let (io, engine) = security::pair(WorkerId(0), 0, config.limits.queue_entries);
         let crypto = Rc::new(CryptoClient::new(io));
         let runtime = WorkerRuntime {
-            reactor: Rc::new(Reactor::new(admission.clone())),
+            reactor: Rc::new(Reactor::new(admission.clone(), &crate::test_support::env())),
             admission,
             crypto: crypto.clone(),
         };
@@ -1518,7 +1516,10 @@ fn composes_http_and_optional_rdma_without_operational_side_effects() {
         let (second_io, second_engine) =
             security::pair(WorkerId(1), 0, config.limits.queue_entries);
         let second_runtime = WorkerRuntime {
-            reactor: Rc::new(Reactor::new(second_admission.clone())),
+            reactor: Rc::new(Reactor::new(
+                second_admission.clone(),
+                &crate::test_support::env(),
+            )),
             admission: second_admission,
             crypto: Rc::new(CryptoClient::new(second_io)),
         };
@@ -2611,6 +2612,7 @@ fn removal_publication_finishes_locally_after_controller_disappears() {
         &node,
         &config.limits,
         &scope(&racer_io::Clock::host(), Duration::from_secs(15)).unwrap(),
+        &crate::test_support::ctx(),
     )
     .unwrap()
     .0;
@@ -2801,7 +2803,8 @@ fn startup_tls_authentication_alert_remains_terminal() {
             &config,
             &node,
             &config.limits,
-            &scope(&racer_io::Clock::host(), Duration::from_secs(5)).unwrap()
+            &scope(&racer_io::Clock::host(), Duration::from_secs(5)).unwrap(),
+            &crate::test_support::ctx()
         ),
         Err(Error::Unauthorized)
     );
@@ -2822,7 +2825,8 @@ fn startup_tls_internal_error_respects_deadline() {
             &config,
             &node,
             &config.limits,
-            &scope(&racer_io::Clock::host(), Duration::from_millis(500)).unwrap()
+            &scope(&racer_io::Clock::host(), Duration::from_millis(500)).unwrap(),
+            &crate::test_support::ctx()
         ),
         Err(Error::DeadlineExceeded)
     );
@@ -2843,6 +2847,7 @@ fn startup_reauthenticates_retained_identity_and_fails_closed() {
             &node,
             &config.limits,
             &scope(&racer_io::Clock::host(), Duration::from_secs(5)).unwrap(),
+            &crate::test_support::ctx(),
         )
     };
     let (old, selector) = start().unwrap();
@@ -2951,6 +2956,7 @@ fn node_replacement_drains_all_workers_and_restart_converges() {
             &fresh,
             &config.limits,
             &scope(&racer_io::Clock::host(), Duration::from_secs(15)).unwrap(),
+            &crate::test_support::ctx(),
         )
         .unwrap()
         .0;
@@ -3298,6 +3304,7 @@ fn network_keyring_bootstrap_rotation_recovery_and_failure_retention() {
         &node,
         &config.limits,
         &scope(&racer_io::Clock::host(), Duration::from_secs(15)).unwrap(),
+        &crate::test_support::ctx(),
     )
     .unwrap()
     .0;
@@ -3493,9 +3500,15 @@ fn real_control_bootstrap_recovery_publication_readiness_and_shutdown() {
     let node =
         Arc::new(NodeState::new(vec![WorkerId(0)], 64, racer_io::WorkerCtx::host()).unwrap());
     let startup = scope(&racer_io::Clock::host(), Duration::from_secs(15)).unwrap();
-    config.node = bootstrap(&config, &node, &config.limits, &startup)
-        .unwrap()
-        .0;
+    config.node = bootstrap(
+        &config,
+        &node,
+        &config.limits,
+        &startup,
+        &crate::test_support::ctx(),
+    )
+    .unwrap()
+    .0;
     assert_eq!(fixture.enrollments.load(Ordering::Acquire), 1);
     let (mut worker, runtime, mut engine) = local_worker(&config, &node, 0);
     let startup = scope(&racer_io::Clock::host(), Duration::from_secs(15)).unwrap();

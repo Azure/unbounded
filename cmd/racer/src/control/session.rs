@@ -1108,11 +1108,14 @@ pub(super) mod tests {
     /// Application error/scoping adapter, without any external sockets.
     fn host() -> Rc<ReactorControlIo> {
         Rc::new(ReactorControlIo::new(Rc::new(
-            crate::runtime::Reactor::new(Rc::new(flow_control::Quotas::new(
-                crate::admission::AdmissionPolicy::new(
-                    crate::test_support::cluster::config(false).limits,
-                ),
-            ))),
+            crate::runtime::Reactor::new(
+                Rc::new(flow_control::Quotas::new(
+                    crate::admission::AdmissionPolicy::new(
+                        crate::test_support::cluster::config(false).limits,
+                    ),
+                )),
+                &crate::test_support::env(),
+            ),
         )))
     }
 

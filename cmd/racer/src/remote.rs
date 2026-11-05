@@ -389,6 +389,7 @@ pub async fn exchange_small(
     let address = endpoint.address()?;
     let lease = Rc::new(reactor.reserve_connection(ResourceClass::ControlConnection)?);
     let fd = Rc::new(uring_runtime::reactor::descriptor::socket(
+        reactor.sim_os().as_ref(),
         if address.is_ipv4() {
             libc::AF_INET
         } else {

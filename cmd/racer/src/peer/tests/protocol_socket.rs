@@ -397,7 +397,7 @@ fn server_authenticates_before_copy_only_service_and_signs_failures() {
         admission.clone(),
         network.clone(),
     ));
-    let reactor = Rc::new(Reactor::new(admission.clone()));
+    let reactor = Rc::new(Reactor::new(admission.clone(), &crate::test_support::env()));
     let io = Rc::new(crate::http::new_io(
         reactor,
         Codec::new(65536),
@@ -776,7 +776,7 @@ fn refused_socket_opens_only_immediate_link_and_selects_bounded_alternate() {
     let admission = Rc::new(flow_control::Quotas::new(AdmissionPolicy::new(
         crate::test_support::cluster::config(false).limits,
     )));
-    let reactor = Rc::new(Reactor::new(admission.clone()));
+    let reactor = Rc::new(Reactor::new(admission.clone(), &crate::test_support::env()));
     let io = Rc::new(crate::http::new_io(
         reactor.clone(),
         Codec::new(protocol::MAX_ENVELOPE_HEAD),
@@ -1166,7 +1166,7 @@ fn incoming_header_timeout_closes_silent_partial_and_idle_keepalive_peers() {
         let admission = Rc::new(flow_control::Quotas::new(AdmissionPolicy::new(
             crate::test_support::cluster::config(false).limits,
         )));
-        let reactor = Rc::new(Reactor::new(admission.clone()));
+        let reactor = Rc::new(Reactor::new(admission.clone(), &crate::test_support::env()));
         reactor.init().unwrap();
         let baseline = admission.used(ResourceClass::RequestContext);
         let io = Rc::new(crate::http::new_io(
@@ -1346,7 +1346,7 @@ fn real_http_ciphertext_fragmentation_pool_reuse_and_truncation() {
     let admission = Rc::new(flow_control::Quotas::new(AdmissionPolicy::new(
         crate::test_support::cluster::config(false).limits,
     )));
-    let reactor = Rc::new(Reactor::new(admission.clone()));
+    let reactor = Rc::new(Reactor::new(admission.clone(), &crate::test_support::env()));
     let io = Rc::new(crate::http::new_io(
         reactor.clone(),
         Codec::new(64 * 1024),
@@ -1654,7 +1654,7 @@ mod established_sessions {
             let admission = Rc::new(flow_control::Quotas::new(AdmissionPolicy::new(
                 crate::test_support::cluster::config(false).limits,
             )));
-            let reactor = Rc::new(Reactor::new(admission.clone()));
+            let reactor = Rc::new(Reactor::new(admission.clone(), &crate::test_support::env()));
             reactor.init().unwrap();
             let io = Rc::new(crate::http::new_io(
                 reactor.clone(),
@@ -2095,7 +2095,7 @@ fn hot_page_shedding(mate: bool) {
         network.clone(),
     ));
     let io = Rc::new(crate::http::new_io(
-        Rc::new(Reactor::new(admission.clone())),
+        Rc::new(Reactor::new(admission.clone(), &crate::test_support::env())),
         Codec::new(65536),
         admission.clone(),
         16777232,

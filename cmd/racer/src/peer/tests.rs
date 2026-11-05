@@ -118,7 +118,7 @@ mod body_progress {
             admission
                 .policy()
                 .set_observer(telemetry.failures.observer(WorkerId(2)));
-            let reactor = Rc::new(Reactor::new(admission.clone()));
+            let reactor = Rc::new(Reactor::new(admission.clone(), &crate::test_support::env()));
             let io = Rc::new(crate::http::new_io(
                 reactor.clone(),
                 Codec::new(protocol::MAX_ENVELOPE_HEAD),
@@ -679,7 +679,7 @@ mod destination_disconnect {
             let admission = Rc::new(flow_control::Quotas::new(AdmissionPolicy::new(
                 crate::test_support::cluster::config(false).limits,
             )));
-            let reactor = Rc::new(Reactor::new(admission.clone()));
+            let reactor = Rc::new(Reactor::new(admission.clone(), &crate::test_support::env()));
             reactor.init().unwrap();
             let io = Rc::new(crate::http::new_io(
                 reactor.clone(),
@@ -1099,7 +1099,10 @@ mod encrypted_http {
                 )))
             })
             .collect();
-        let reactor = Rc::new(Reactor::new(admissions[0].clone()));
+        let reactor = Rc::new(Reactor::new(
+            admissions[0].clone(),
+            &crate::test_support::env(),
+        ));
         let mut engines = Vec::new();
         let mut clients = Vec::new();
         let mut cryptos = Vec::new();
@@ -1482,7 +1485,7 @@ mod requester_safety {
         let admission = Rc::new(flow_control::Quotas::new(AdmissionPolicy::new(
             crate::test_support::cluster::config(false).limits,
         )));
-        let reactor = Rc::new(Reactor::new(admission.clone()));
+        let reactor = Rc::new(Reactor::new(admission.clone(), &crate::test_support::env()));
         let io = Rc::new(crate::http::new_io(
             reactor.clone(),
             Codec::new(crate::peer::protocol::MAX_ENVELOPE_HEAD),
@@ -1932,7 +1935,7 @@ mod subscriptions {
             });
             let server = server::PeerServer::for_test(
                 Rc::new(crate::http::new_io(
-                    Rc::new(Reactor::new(admission.clone())),
+                    Rc::new(Reactor::new(admission.clone(), &crate::test_support::env())),
                     Codec::new(protocol::MAX_ENVELOPE_HEAD),
                     admission.clone(),
                     crate::model::PAGE_BYTES + 16,
@@ -2123,7 +2126,7 @@ mod subscriptions {
         ));
         let server = server::PeerServer::for_test(
             Rc::new(crate::http::new_io(
-                Rc::new(Reactor::new(admission.clone())),
+                Rc::new(Reactor::new(admission.clone(), &crate::test_support::env())),
                 Codec::new(protocol::MAX_ENVELOPE_HEAD),
                 admission.clone(),
                 crate::model::PAGE_BYTES + 16,
@@ -3340,7 +3343,10 @@ impl SocketFixture {
         let admission = Rc::new(flow_control::Quotas::new(AdmissionPolicy::new(
             crate::test_support::cluster::config(false).limits,
         )));
-        let reactor = Rc::new(crate::runtime::Reactor::new(admission.clone()));
+        let reactor = Rc::new(crate::runtime::Reactor::new(
+            admission.clone(),
+            &crate::test_support::env(),
+        ));
         let io = Rc::new(crate::http::new_io(
             reactor.clone(),
             crate::http::Codec::new(protocol::MAX_ENVELOPE_HEAD),

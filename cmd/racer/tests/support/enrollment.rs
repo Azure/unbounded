@@ -25,8 +25,8 @@ pub fn default_config(cluster: &str) -> dataplane::config::Config {
 
 pub fn reactor() -> Rc<Reactor> {
     let n = NonZeroUsize::new(1024 * 1024).unwrap();
-    let reactor = Rc::new(Reactor::new(Rc::new(flow_control::Quotas::new(
-        AdmissionPolicy::new(Limits {
+    let reactor = Rc::new(Reactor::new(
+        Rc::new(flow_control::Quotas::new(AdmissionPolicy::new(Limits {
             plaintext_bytes: n,
             ciphertext_bytes: n,
             dirty_bytes: n,
@@ -47,8 +47,9 @@ pub fn reactor() -> Rc<Reactor> {
             retained_snapshots: n,
             metadata_entries: n,
             relay_transfers: n,
-        }),
-    ))));
+        }))),
+        &uring_runtime::reactor::simulation::ambient_env(),
+    ));
     reactor.init().unwrap();
     reactor
 }

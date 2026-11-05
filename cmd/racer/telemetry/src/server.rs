@@ -1030,7 +1030,8 @@ mod tests {
         let sim_env = clock.environment(0);
         let _clock = sim_env.enter();
         let sim_ctx = sim_env.worker_ctx();
-        let reactor = Reactor::<TestScope, ()>::new(12, ());
+        let env = racer_io::Env::new(racer_io::Driver::Uring, sim_ctx.clone());
+        let reactor = Reactor::<TestScope, ()>::new(12, (), &env);
         let owner = setup(
             reactor
                 .reserve_submissions(
@@ -1201,11 +1202,10 @@ mod tests {
     #[test]
     fn binary_small_window_abandonment_retains_output_and_session_until_fence() {
         use std::task::{Context, Waker};
-        use uring_runtime::reactor::simulation::Simulation;
-        let sim = Simulation::new();
+        let sim = racer_io::sim::SimOs::new();
         sim.set_stream_capacity(32).unwrap();
-        let _sim = sim.enter();
-        let reactor = Reactor::<TestScope, ()>::new(12, ());
+        let env = racer_io::Env::sim(&sim, racer_io::WorkerCtx::host());
+        let reactor = Reactor::<TestScope, ()>::new(12, (), &env);
         let submissions = reactor
             .reserve_submissions(CONTROL_SLOTS + BINARY_CONTROL_SLOTS, ())
             .unwrap();
@@ -1328,7 +1328,8 @@ mod tests {
             let sim_env = clock.environment(0);
             let _clock = sim_env.enter();
             let sim_ctx = sim_env.worker_ctx();
-            let reactor = Reactor::<TestScope, ()>::new(12, ());
+            let env = racer_io::Env::new(racer_io::Driver::Uring, sim_ctx.clone());
+            let reactor = Reactor::<TestScope, ()>::new(12, (), &env);
             let submissions = reactor
                 .reserve_submissions(CONTROL_SLOTS + BINARY_CONTROL_SLOTS, ())
                 .unwrap();
@@ -1837,7 +1838,7 @@ mod tests {
     /// Exercise partial progress and invalid completion sizes against the same range.
     #[test]
     fn completion_progress_preserves_bounds_on_failure() {
-        let reactor = Reactor::<TestScope, ()>::new(8, ());
+        let reactor = Reactor::<TestScope, ()>::new(8, (), &racer_io::Env::host());
         let submissions = reactor.reserve_submissions(CONTROL_SLOTS, ()).unwrap();
         let owner = Server::new(submissions, ());
         let mut buffer = owner.buffer(&Routes::default()).unwrap();
@@ -1972,7 +1973,7 @@ mod tests {
     #[test]
     fn exchange_deadline_overflow_returns_invalid_input_without_io() {
         use std::task::{Context, Waker};
-        use uring_runtime::{environment::SimulationClock, reactor::simulation::Simulation};
+        use uring_runtime::environment::SimulationClock;
 
         let limit = near_instant_limit();
         let now = limit - Duration::from_secs(1);
@@ -1981,9 +1982,9 @@ mod tests {
         let sim_env = clock.environment(0);
         let _clock = sim_env.enter();
         let sim_ctx = sim_env.worker_ctx();
-        let simulation = Simulation::new();
-        let _simulation = simulation.enter();
-        let reactor = Reactor::<TestScope, ()>::new(8, ());
+        let simulation = racer_io::sim::SimOs::new();
+        let env = racer_io::Env::sim(&simulation, sim_ctx.clone());
+        let reactor = Reactor::<TestScope, ()>::new(8, (), &env);
         let submissions = reactor.reserve_submissions(CONTROL_SLOTS, ()).unwrap();
         let owner = Server::new(submissions, ());
         let connections = Rc::new(Cell::new(0));
@@ -2022,7 +2023,7 @@ mod tests {
     #[test]
     fn exchange_deadline_preserves_timeout_and_parent_limit() {
         use std::task::{Context, Waker};
-        use uring_runtime::{environment::SimulationClock, reactor::simulation::Simulation};
+        use uring_runtime::environment::SimulationClock;
 
         for (now, parent_timeout, timeout) in [
             (Instant::now(), Duration::from_secs(10), CONNECTION_TIMEOUT),
@@ -2041,9 +2042,9 @@ mod tests {
             let sim_env = clock.environment(0);
             let _clock = sim_env.enter();
             let sim_ctx = sim_env.worker_ctx();
-            let simulation = Simulation::new();
-            let _simulation = simulation.enter();
-            let reactor = Reactor::<TestScope, ()>::new(8, ());
+            let simulation = racer_io::sim::SimOs::new();
+            let env = racer_io::Env::sim(&simulation, sim_ctx.clone());
+            let reactor = Reactor::<TestScope, ()>::new(8, (), &env);
             let submissions = reactor.reserve_submissions(CONTROL_SLOTS, ()).unwrap();
             let owner = Server::new(submissions, ());
             let handler = Routes::default();
@@ -2082,19 +2083,16 @@ mod tests {
     #[test]
     fn serve_classifies_exchange_deadline_without_stopping_listener() {
         use std::task::{Context, Waker};
-        use uring_runtime::{
-            environment::SimulationClock,
-            reactor::{SocketAddress, simulation::Simulation},
-        };
+        use uring_runtime::{environment::SimulationClock, reactor::SocketAddress};
 
         let now = Instant::now();
         let clock = SimulationClock::new_at(1, now, std::time::SystemTime::UNIX_EPOCH);
         let sim_env = clock.environment(0);
         let _clock = sim_env.enter();
         let sim_ctx = sim_env.worker_ctx();
-        let simulation = Simulation::new();
-        let _simulation = simulation.enter();
-        let reactor = Reactor::<TestScope, ()>::new(8, ());
+        let simulation = racer_io::sim::SimOs::new();
+        let env = racer_io::Env::sim(&simulation, sim_ctx.clone());
+        let reactor = Reactor::<TestScope, ()>::new(8, (), &env);
         let memory = Rc::new(Cell::new(0));
         let control = Rc::new(Cell::new(0));
         let connections = Rc::new(Cell::new(0));
@@ -2198,7 +2196,7 @@ mod tests {
             net::{TcpListener, TcpStream},
             task::{Context, Waker},
         };
-        let reactor = Reactor::<TestScope, ()>::new(8, ());
+        let reactor = Reactor::<TestScope, ()>::new(8, (), &racer_io::Env::host());
         let memory = Rc::new(Cell::new(0));
         let control = Rc::new(Cell::new(0));
         let connections = Rc::new(Cell::new(0));
@@ -2294,7 +2292,7 @@ mod tests {
             net::{TcpListener, TcpStream},
             task::{Context, Waker},
         };
-        let reactor = Reactor::<TestScope, ()>::new(8, ());
+        let reactor = Reactor::<TestScope, ()>::new(8, (), &racer_io::Env::host());
         let memory = Rc::new(Cell::new(0));
         let control = Rc::new(Cell::new(0));
         let connections = Rc::new(Cell::new(0));

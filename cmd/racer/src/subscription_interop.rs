@@ -233,7 +233,7 @@ impl SubscriptionFixture {
         let admission = Rc::new(flow_control::Quotas::new(AdmissionPolicy::new(
             limits.clone(),
         )));
-        let reactor = Rc::new(Reactor::new(admission.clone()));
+        let reactor = Rc::new(Reactor::new(admission.clone(), &racer_io::Env::host()));
         reactor.init().unwrap();
         let buffers = BufferPool::new(admission.clone());
         let keys = Rc::new(interop_keys(&reactor.ctx().clock));

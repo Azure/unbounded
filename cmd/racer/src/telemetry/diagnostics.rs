@@ -12,7 +12,7 @@ impl server::Scope for RequestScope {
 /// One attachment serves at most one listener. Resource reservations outlive
 /// abandoned connection futures because the reactor retains their buffers.
 pub struct DiagnosticIo {
-    reactor: Rc<Reactor>,
+    pub(crate) reactor: Rc<Reactor>,
     admission: Rc<flow_control::Quotas<AdmissionPolicy>>,
     /// `/debug/hardware` working set, helper stack, and result (`HARDWARE_BYTES` of
     /// `RESERVED_BYTES`). Each helper and its session share this charge, so it is
@@ -669,7 +669,7 @@ mod tests {
             let admission = Rc::new(flow_control::Quotas::new(AdmissionPolicy::new(
                 crate::test_support::cluster::config(false).limits,
             )));
-            let reactor = Rc::new(Reactor::new(admission.clone()));
+            let reactor = Rc::new(Reactor::new(admission.clone(), &crate::test_support::env()));
             let io = Rc::new(
                 DiagnosticIo::attach(reactor.clone(), admission.clone())
                     .expect("real io_uring diagnostics attachment"),
@@ -1295,7 +1295,7 @@ mod tests {
             let mut limits = crate::test_support::cluster::config(false).limits;
             limits.queue_entries = std::num::NonZeroUsize::new(8).unwrap();
             let admission = Rc::new(flow_control::Quotas::new(AdmissionPolicy::new(limits)));
-            let reactor = Rc::new(Reactor::new(admission.clone()));
+            let reactor = Rc::new(Reactor::new(admission.clone(), &crate::test_support::env()));
             let io = Rc::new(DiagnosticIo::attach(reactor.clone(), admission.clone()).unwrap());
             let telemetry = Telemetry::default();
             telemetry.health.observe(good_resources()).unwrap();
@@ -1415,7 +1415,7 @@ mod tests {
             let mut limits = crate::test_support::cluster::config(false).limits;
             limits.queue_entries = std::num::NonZeroUsize::new(8).unwrap();
             let admission = Rc::new(flow_control::Quotas::new(AdmissionPolicy::new(limits)));
-            let reactor = Rc::new(Reactor::new(admission.clone()));
+            let reactor = Rc::new(Reactor::new(admission.clone(), &crate::test_support::env()));
             let io = Rc::new(DiagnosticIo::attach(reactor.clone(), admission.clone()).unwrap());
             let telemetry = Telemetry::default();
             telemetry.health.observe(good_resources()).unwrap();
@@ -2002,7 +2002,7 @@ mod tests {
             let mut limits = crate::test_support::cluster::config(false).limits;
             limits.request_context_bytes = std::num::NonZeroUsize::new(1).unwrap();
             let admission = Rc::new(flow_control::Quotas::new(AdmissionPolicy::new(limits)));
-            let reactor = Rc::new(Reactor::new(admission.clone()));
+            let reactor = Rc::new(Reactor::new(admission.clone(), &crate::test_support::env()));
             assert!(matches!(
                 telemetry.attach_io(reactor, admission.clone()),
                 Err(Error::Overloaded)
@@ -2057,7 +2057,7 @@ mod tests {
             let admission = Rc::new(flow_control::Quotas::new(AdmissionPolicy::new(
                 crate::test_support::cluster::config(false).limits,
             )));
-            let reactor = Rc::new(Reactor::new(admission.clone()));
+            let reactor = Rc::new(Reactor::new(admission.clone(), &crate::test_support::env()));
             let telemetry = Telemetry::default();
             assert_eq!(admission.used(ResourceClass::ControlProgress), 0);
             telemetry
@@ -2090,7 +2090,7 @@ mod tests {
                 let admission = Rc::new(flow_control::Quotas::new(AdmissionPolicy::new(
                     crate::test_support::cluster::config(false).limits,
                 )));
-                let reactor = Rc::new(Reactor::new(admission.clone()));
+                let reactor = Rc::new(Reactor::new(admission.clone(), &crate::test_support::env()));
                 let telemetry = Telemetry {
                     profiling: enabled.then(|| crate::profiling::ProfilingController::new(true)),
                     ..Telemetry::default()

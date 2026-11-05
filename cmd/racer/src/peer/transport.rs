@@ -1982,7 +1982,7 @@ mod tests {
             let admission = Rc::new(flow_control::Quotas::new(AdmissionPolicy::new(
                 crate::test_support::cluster::config(false).limits,
             )));
-            let reactor = Rc::new(Reactor::new(admission.clone()));
+            let reactor = Rc::new(Reactor::new(admission.clone(), &crate::test_support::env()));
             let initiator = transfers(signers[case.initiator].clone(), &admission, &reactor)
                 .with_links(w.a.links.clone());
             let mut server = transfers(signers[responder].clone(), &admission, &reactor);
@@ -2345,7 +2345,7 @@ mod tests {
             let admission = Rc::new(flow_control::Quotas::new(AdmissionPolicy::new(
                 crate::test_support::cluster::config(true).limits,
             )));
-            let reactor = Rc::new(Reactor::new(admission.clone()));
+            let reactor = Rc::new(Reactor::new(admission.clone(), &crate::test_support::env()));
             let receiver =
                 transfers(signers[0].clone(), &admission, &reactor).with_links(w.a.links.clone());
             let sender =

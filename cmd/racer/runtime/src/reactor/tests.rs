@@ -104,6 +104,7 @@ pub(super) mod fixtures {
                 core: super::super::Reactor::new(
                     admission.limits.queue_entries.get(),
                     CountingBudget(admission.clone()),
+                    &crate::reactor::simulation::ambient_env(),
                 ),
                 admission,
             }
@@ -313,9 +314,14 @@ mod adapter {
         let _environment = sim.enter();
         let rejections = Rc::new(RefCell::new(Vec::new()));
         let seen = rejections.clone();
-        let r = super::super::Reactor::<RequestScope, ()>::new(2, ()).with_rejection_observer(
-            move |_, facts: SubmissionRejection| seen.borrow_mut().push(facts.reason),
-        );
+        let r = super::super::Reactor::<RequestScope, ()>::new(
+            2,
+            (),
+            &crate::reactor::simulation::ambient_env(),
+        )
+        .with_rejection_observer(move |_, facts: SubmissionRejection| {
+            seen.borrow_mut().push(facts.reason)
+        });
         let capacity = r.reserve_submissions(1, ()).unwrap();
         assert_eq!(capacity.capacity(), 1);
         assert!(r.reserve_submissions(1, ()).is_err());

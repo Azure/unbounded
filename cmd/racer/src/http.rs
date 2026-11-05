@@ -1175,7 +1175,7 @@ pub(crate) mod tests {
             Delivery,
         ) {
             let admission = admission(pipes);
-            let reactor = Rc::new(Reactor::new(admission.clone()));
+            let reactor = Rc::new(Reactor::new(admission.clone(), &crate::test_support::env()));
             let pool = Rc::new(crate::http::new_pipe_pool(admission.clone()));
             (
                 admission,
@@ -2151,7 +2151,7 @@ pub(crate) mod tests {
             let mut limits = crate::test_support::cluster::config(false).limits;
             limits.queue_entries = std::num::NonZeroUsize::new(2).unwrap();
             let admission = Rc::new(flow_control::Quotas::new(AdmissionPolicy::new(limits)));
-            let reactor = Rc::new(Reactor::new(admission.clone()));
+            let reactor = Rc::new(Reactor::new(admission.clone(), &crate::test_support::env()));
             reactor.init().unwrap();
             let mut pool = new_pool(reactor.clone(), admission.clone(), 1);
             pool.config_mut().secondary_cap = 2;
@@ -2577,7 +2577,7 @@ pub(crate) mod tests {
             let admission = Rc::new(flow_control::Quotas::new(AdmissionPolicy::new(
                 crate::test_support::cluster::config(false).limits,
             )));
-            let reactor = Rc::new(Reactor::new(admission.clone()));
+            let reactor = Rc::new(Reactor::new(admission.clone(), &crate::test_support::env()));
             reactor.init().unwrap();
             let baseline = admission.used(ResourceClass::RequestContext);
             let pool = new_pool(reactor.clone(), admission.clone(), 1);
@@ -2653,7 +2653,7 @@ pub(crate) mod tests {
                 let admission = Rc::new(flow_control::Quotas::new(AdmissionPolicy::new(
                     crate::test_support::cluster::config(false).limits,
                 )));
-                let reactor = Rc::new(Reactor::new(admission.clone()));
+                let reactor = Rc::new(Reactor::new(admission.clone(), &crate::test_support::env()));
                 let pool = new_pool(reactor.clone(), admission, 1);
                 let metrics = Metrics::default();
                 let peers = crate::peer::AdaptivePeers::new(
@@ -2763,7 +2763,7 @@ pub(crate) mod tests {
                 limits.pipes = std::num::NonZeroUsize::new(1).unwrap();
                 limits.relay_transfers = std::num::NonZeroUsize::new(1).unwrap();
                 let admission = Rc::new(flow_control::Quotas::new(AdmissionPolicy::new(limits)));
-                let reactor = Rc::new(Reactor::new(admission.clone()));
+                let reactor = Rc::new(Reactor::new(admission.clone(), &crate::test_support::env()));
                 reactor.init().unwrap();
                 Self {
                     io: new_io(
@@ -3077,7 +3077,7 @@ pub(crate) mod tests {
         let admission = Rc::new(flow_control::Quotas::new(AdmissionPolicy::new(
             crate::test_support::cluster::config(false).limits,
         )));
-        let reactor = Rc::new(Reactor::new(admission.clone()));
+        let reactor = Rc::new(Reactor::new(admission.clone(), &crate::test_support::env()));
         let io = new_io(
             reactor.clone(),
             Codec::new(4096),

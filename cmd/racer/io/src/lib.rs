@@ -20,7 +20,7 @@ pub mod sim;
 pub mod xthread;
 
 pub use cancel::{CancelToken, Deadline};
-pub use ctx::{Clock, Rng, WorkerCtx};
+pub use ctx::{Clock, Rng, SimClock, WorkerCtx};
 pub use error::{Error, Result};
-pub use ring::{Driver, IoClass, OpCtx, Reactor};
+pub use ring::{Driver, Env, IoClass, OpCtx, Reactor};
 pub use scope::{CancelWait, Operation, Scope};

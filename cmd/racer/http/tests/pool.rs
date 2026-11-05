@@ -199,7 +199,7 @@ fn new_io(reactor: Rc<Reactor>, admission: Rc<Quotas<Limits>>) -> Io {
 /// Initialize the explicitly polled reactor before recording accounting baselines.
 fn setup() -> (Rc<Quotas<Limits>>, Rc<Reactor>, Pool) {
     let admission = Rc::new(Quotas::new(Limits));
-    let reactor = Rc::new(Reactor::new(32, ()));
+    let reactor = Rc::new(Reactor::new(32, (), &racer_io::Env::host()));
     reactor.init().unwrap();
     let pool = new_pool(reactor.clone(), admission.clone());
     (admission, reactor, pool)

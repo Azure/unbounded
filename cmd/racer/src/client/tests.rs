@@ -824,7 +824,7 @@ fn simulated_listener_preparation_rollback_and_real_http_exchange() {
     let sim = Simulation::new();
     let _environment = sim.enter();
     let admission = Rc::new(flow_control::Quotas::new(AdmissionPolicy::new(limits())));
-    let reactor = Rc::new(Reactor::new(admission.clone()));
+    let reactor = Rc::new(Reactor::new(admission.clone(), &crate::test_support::env()));
     let io = Rc::new(crate::http::new_io(
         reactor.clone(),
         Codec::new(32768),
@@ -1012,7 +1012,7 @@ impl Fixture {
     fn with_limits(limits: Limits) -> Self {
         let root = Root::new();
         let admission = Rc::new(flow_control::Quotas::new(AdmissionPolicy::new(limits)));
-        let reactor = Rc::new(Reactor::new(admission.clone()));
+        let reactor = Rc::new(Reactor::new(admission.clone(), &crate::test_support::env()));
         // Production client-socket framing, so route body caps are exercised.
         let io = Rc::new(crate::http::client_io(reactor.clone(), admission.clone()));
         let delivery = Rc::new(Delivery::new(reactor.clone(), Duration::from_secs(2)));
@@ -3595,7 +3595,10 @@ mod response {
         let admission = Rc::new(flow_control::Quotas::new(AdmissionPolicy::new(
             crate::test_support::cluster::config(false).limits,
         )));
-        let delivery = Delivery::new(Rc::new(Reactor::new(admission)), Duration::from_secs(2));
+        let delivery = Delivery::new(
+            Rc::new(Reactor::new(admission, &crate::test_support::env())),
+            Duration::from_secs(2),
+        );
         let slice = PageSlice {
             page: PageNumber(0),
             offset: 0,
@@ -3658,7 +3661,7 @@ mod response {
         let admission = Rc::new(flow_control::Quotas::new(
             crate::admission::AdmissionPolicy::new(limits),
         ));
-        let reactor = crate::runtime::Reactor::new(admission);
+        let reactor = crate::runtime::Reactor::new(admission, &crate::test_support::env());
         let scope = scope();
         let (fd, _peer) = sim.socket_pair();
         let fd = Rc::new(fd);
@@ -3692,9 +3695,12 @@ mod response {
         let _environment = sim.enter();
         let mut limits = crate::test_support::cluster::config(false).limits;
         limits.queue_entries = std::num::NonZeroUsize::new(1).unwrap();
-        let reactor = crate::runtime::Reactor::new(Rc::new(flow_control::Quotas::new(
-            crate::admission::AdmissionPolicy::new(limits),
-        )));
+        let reactor = crate::runtime::Reactor::new(
+            Rc::new(flow_control::Quotas::new(
+                crate::admission::AdmissionPolicy::new(limits),
+            )),
+            &crate::test_support::env(),
+        );
         let scope = scope();
         let (fd, _peer) = sim.socket_pair();
         let fd = Rc::new(fd);

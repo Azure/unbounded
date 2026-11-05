@@ -537,7 +537,7 @@ pub mod delivery {
 
         #[test]
         fn direct_delivery_large_chunks_preserve_bytes_without_pipe_calls() {
-            let reactor = Rc::new(Reactor::new(16, ()));
+            let reactor = Rc::new(Reactor::new(16, (), &racer_io::Env::host()));
             let (connection, mut peer, _) = connection();
             let bytes = Rc::new(vec![91; 16 * 1024 * 1024]);
             let expected = bytes.len();
@@ -571,7 +571,7 @@ pub mod delivery {
         #[test]
         fn direct_delivery_empty_and_rejected_scope_never_touch_pipe() {
             for empty in [false, true] {
-                let reactor = Rc::new(Reactor::new(16, ()));
+                let reactor = Rc::new(Reactor::new(16, (), &racer_io::Env::host()));
                 let (connection, _peer, slot) = connection();
                 let observer = Observe::default();
                 observer.scope_error.set(true);
@@ -595,7 +595,7 @@ pub mod delivery {
 
         #[test]
         fn direct_abandonment_retains_view_and_connection_until_fence() {
-            let reactor = Rc::new(Reactor::new(16, ()));
+            let reactor = Rc::new(Reactor::new(16, (), &racer_io::Env::host()));
             reactor.init().unwrap();
             let (connection, _peer, slot) = connection();
             while connection.socket().try_send(&[0; 8192]).is_ok() {}
@@ -708,7 +708,7 @@ pub mod delivery {
         /// Fallback must reconstruct the unaccepted body rather than replay staging.
         #[test]
         fn partial_pipe_fallback_resumes_at_accepted_not_staged_cursor() {
-            let reactor = Rc::new(Reactor::new(16, ()));
+            let reactor = Rc::new(Reactor::new(16, (), &racer_io::Env::host()));
             let (connection, mut peer, _) = connection();
             let observer = Observe::default();
             let owner = Reader {
@@ -743,7 +743,7 @@ pub mod delivery {
         /// An interrupted drain yields without submission or resetting the stall clock.
         #[test]
         fn drain_interruption_yields_then_owned_send_observes_in_order() {
-            let reactor = Rc::new(Reactor::new(16, ()));
+            let reactor = Rc::new(Reactor::new(16, (), &racer_io::Env::host()));
             let (connection, mut peer, _) = connection();
             let observer = Observe::default();
             let owner = Reader {
@@ -788,7 +788,7 @@ pub mod delivery {
         #[test]
         fn short_drain_scope_rejection_and_completion_rejection_do_not_advance() {
             for failure in ["drain", "scope", "completion"] {
-                let reactor = Rc::new(Reactor::new(16, ()));
+                let reactor = Rc::new(Reactor::new(16, (), &racer_io::Env::host()));
                 let (connection, _peer, weak) = connection();
                 let observer = Observe::default();
                 observer.scope_error.set(failure == "scope");
@@ -826,7 +826,7 @@ pub mod delivery {
         /// Interrupted staging yields, while an exhausted reader does not consult policy.
         #[test]
         fn interrupted_write_yields_and_empty_delivery_does_not_consult_scope() {
-            let reactor = Rc::new(Reactor::new(16, ()));
+            let reactor = Rc::new(Reactor::new(16, (), &racer_io::Env::host()));
             let (connection, _peer, _) = connection();
             let observer = Observe::default();
             let owner = Reader {
@@ -862,7 +862,7 @@ pub mod delivery {
         #[test]
         fn abandoned_owned_send_keeps_backing_and_connection_until_fence() {
             use std::os::fd::AsRawFd;
-            let reactor = Rc::new(Reactor::new(16, ()));
+            let reactor = Rc::new(Reactor::new(16, (), &racer_io::Env::host()));
             reactor.init().unwrap();
             let (connection, _peer, slot) = connection();
             let size: libc::c_int = 4096;
@@ -916,7 +916,7 @@ pub mod delivery {
         /// Writable short sends yield at the call budget without submitting readiness.
         #[test]
         fn writable_pipe_yields_at_call_budget_and_retains_accepted_cursor() {
-            let reactor = Rc::new(Reactor::new(16, ()));
+            let reactor = Rc::new(Reactor::new(16, (), &racer_io::Env::host()));
             let (connection, mut peer, _) = connection();
             let observer = Observe::default();
             let owner = Reader {
@@ -1436,7 +1436,7 @@ pub mod relay {
             fn new() -> Self {
                 let hooks = Rc::new(Hooks::default());
                 let io = HttpIo::new(
-                    Rc::new(Rc::new(Reactor::new(16, ()))),
+                    Rc::new(Rc::new(Reactor::new(16, (), &racer_io::Env::host()))),
                     Codec::new(128),
                     hooks.clone(),
                     64,

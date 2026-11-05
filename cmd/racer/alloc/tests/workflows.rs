@@ -2,6 +2,7 @@
 
 use page_alloc::{Alignment, DevicePlacement, Error, Generation, SegmentId, Segments, Slab};
 use page_alloc::{Charge, SegmentState};
+use racer_io::sim::Fault;
 use std::{cell::Cell, path::Path, rc::Rc};
 use std::{
     fs::File,
@@ -12,7 +13,6 @@ use std::{
     sync::Arc,
     task::{Context, Poll, Waker},
 };
-use uring_runtime::reactor::simulation::{Fault, Simulation};
 use uring_runtime::{Operation, Scope, reactor::Reactor};
 
 /// Distinguishes allocator validation errors from runtime completion failures.
@@ -106,10 +106,10 @@ impl Drop for CountingCharge {
 /// Restored records remain readable and the sealed recovery tail is not overwritten.
 #[test]
 fn reopen_snapshot_reads_old_record_and_appends_without_overwriting_it() {
-    let simulation = Simulation::new();
-    let _environment = simulation.enter();
-    let reactor = Reactor::<TestScope, ()>::new(16, ());
-    let make_slab = || slab_new::<()>("/alloc-workflows/restart".into(), 16384, 8192, 1024);
+    let simulation = racer_io::sim::SimOs::new();
+    let env = racer_io::Env::sim(&simulation, racer_io::WorkerCtx::host());
+    let reactor = Reactor::<TestScope, ()>::new(16, (), &env);
+    let make_slab = || slab_new::<()>(&env, "/alloc-workflows/restart".into(), 16384, 8192, 1024);
     let slab = make_slab();
     let segments = Segments::new(slab.segment_bytes());
     let alignment = slab.open_configured(&segments).unwrap();
@@ -232,9 +232,9 @@ fn reopen_snapshot_reads_old_record_and_appends_without_overwriting_it() {
 /// Public pooling enforces admission, zeroization, exact-size reuse, and bounded retention.
 #[test]
 fn buffer_pool_keeps_only_zeroed_accounted_storage_and_rejects_undercharging() {
-    let simulation = Simulation::new();
-    let _environment = simulation.enter();
-    let slab = slab_new("/alloc-workflows/pool".into(), 8192, 4096, 1024);
+    let simulation = racer_io::sim::SimOs::new();
+    let env = racer_io::Env::sim(&simulation, racer_io::WorkerCtx::host());
+    let slab = slab_new(&env, "/alloc-workflows/pool".into(), 8192, 4096, 1024);
     let segments = Segments::new(slab.segment_bytes());
     let alignment = slab.open_configured(&segments).unwrap();
     let size = alignment.extent(0, 31).unwrap().length();
@@ -309,9 +309,9 @@ fn buffer_pool_keeps_only_zeroed_accounted_storage_and_rejects_undercharging() {
 /// first, releases its accounting, and holds a constrained pool empty.
 #[test]
 fn idle_pool_adapts_to_demand_and_constraint() {
-    let simulation = Simulation::new();
-    let _environment = simulation.enter();
-    let slab = slab_new("/alloc-workflows/demand".into(), 8192, 4096, 1024);
+    let simulation = racer_io::sim::SimOs::new();
+    let env = racer_io::Env::sim(&simulation, racer_io::WorkerCtx::host());
+    let slab = slab_new(&env, "/alloc-workflows/demand".into(), 8192, 4096, 1024);
     let segments = Segments::new(slab.segment_bytes());
     let alignment = slab.open_configured(&segments).unwrap();
     let size = alignment.extent(0, 31).unwrap().length();
@@ -363,10 +363,10 @@ fn idle_pool_adapts_to_demand_and_constraint() {
 /// Bound submissions reject foreign identity and bytes beyond the captured prefix.
 #[test]
 fn bound_io_rejects_foreign_tables_and_ranges_appended_after_lease_acquisition() {
-    let simulation = Simulation::new();
-    let _environment = simulation.enter();
-    let reactor = Reactor::<TestScope, ()>::new(16, ());
-    let slab = slab_new::<()>("/alloc-workflows/bound".into(), 16384, 8192, 512);
+    let simulation = racer_io::sim::SimOs::new();
+    let env = racer_io::Env::sim(&simulation, racer_io::WorkerCtx::host());
+    let reactor = Reactor::<TestScope, ()>::new(16, (), &env);
+    let slab = slab_new::<()>(&env, "/alloc-workflows/bound".into(), 16384, 8192, 512);
     let segments = Segments::new(slab.segment_bytes());
     let alignment = slab.open_configured(&segments).unwrap();
     let other = Segments::from_geometry(segments.geometry().unwrap()).unwrap();
@@ -459,11 +459,11 @@ fn bound_io_rejects_foreign_tables_and_ranges_appended_after_lease_acquisition()
 #[test]
 fn restore_waits_for_freeze_guard_and_abandoned_write_completion_independently() {
     for cancel_first in [false, true] {
-        let simulation = Simulation::new();
+        let simulation = racer_io::sim::SimOs::new();
         simulation.set_cancel_first(cancel_first);
-        let _environment = simulation.enter();
-        let reactor = Reactor::<TestScope, ()>::new(16, ());
-        let slab = slab_new::<()>("/alloc-workflows/freeze".into(), 8192, 4096, 512);
+        let env = racer_io::Env::sim(&simulation, racer_io::WorkerCtx::host());
+        let reactor = Reactor::<TestScope, ()>::new(16, (), &env);
+        let slab = slab_new::<()>(&env, "/alloc-workflows/freeze".into(), 8192, 4096, 512);
         let segments = Segments::new(slab.segment_bytes());
         let alignment = slab.open_configured(&segments).unwrap();
         let size = alignment.extent(0, 31).unwrap().length();
@@ -505,8 +505,8 @@ fn restore_waits_for_freeze_guard_and_abandoned_write_completion_independently()
 }
 
 /// Build and bind a deterministic simulated slab with two segments.
-fn setup<C: Charge>() -> (Slab<C>, Segments) {
-    let slab = slab_new(PathBuf::from("/virtual/slab.dat"), 8192, 4096, 512);
+fn setup<C: Charge>(env: &racer_io::Env) -> (Slab<C>, Segments) {
+    let slab = slab_new(env, PathBuf::from("/virtual/slab.dat"), 8192, 4096, 512);
     let segments = Segments::new(4096);
     let _ = slab.open_configured(&segments).unwrap();
     (slab, segments)
@@ -515,10 +515,10 @@ fn setup<C: Charge>() -> (Slab<C>, Segments) {
 /// Public reads and writes preserve payloads and reject short or failed completions.
 #[test]
 fn roundtrip_short_io_and_runtime_errors() {
-    let sim = Simulation::new();
-    let _environment = sim.enter();
-    let (slab, segments) = setup::<()>();
-    let reactor = Reactor::<TestScope, ()>::new(16, ());
+    let sim = racer_io::sim::SimOs::new();
+    let env = racer_io::Env::sim(&sim, racer_io::WorkerCtx::host());
+    let (slab, segments) = setup::<()>(&env);
+    let reactor = Reactor::<TestScope, ()>::new(16, (), &env);
     let (lease, extent) = segments.append(4096).unwrap();
     let mut buffer = slab.allocate(extent.length(), ()).unwrap();
     buffer.as_mut_slice().fill(42);
@@ -580,11 +580,11 @@ fn roundtrip_short_io_and_runtime_errors() {
 #[test]
 fn abandoned_write_retains_lease_charges_and_counter_until_completion() {
     for cancel_first in [false, true] {
-        let sim = Simulation::new();
+        let sim = racer_io::sim::SimOs::new();
         sim.set_cancel_first(cancel_first);
-        let _environment = sim.enter();
-        let (slab, segments) = setup::<CountingCharge>();
-        let reactor = Reactor::<TestScope, ()>::new(16, ());
+        let env = racer_io::Env::sim(&sim, racer_io::WorkerCtx::host());
+        let (slab, segments) = setup::<CountingCharge>(&env);
+        let reactor = Reactor::<TestScope, ()>::new(16, (), &env);
         let used = Rc::new(Cell::new(0));
         let (lease, extent) = segments.append(4096).unwrap();
         let mut buffer = slab
@@ -629,10 +629,10 @@ fn abandoned_write_retains_lease_charges_and_counter_until_completion() {
 /// An unpolled write owns no runtime work, but an abandoned accepted read still does.
 #[test]
 fn abandoned_read_and_unpolled_write_release_at_the_correct_fence() {
-    let sim = Simulation::new();
-    let _environment = sim.enter();
-    let (slab, segments) = setup::<()>();
-    let reactor = Reactor::<TestScope, ()>::new(16, ());
+    let sim = racer_io::sim::SimOs::new();
+    let env = racer_io::Env::sim(&sim, racer_io::WorkerCtx::host());
+    let (slab, segments) = setup::<()>(&env);
+    let reactor = Reactor::<TestScope, ()>::new(16, (), &env);
     let (lease, extent) = segments.append(4096).unwrap();
     let op = slab.write(
         &reactor,
@@ -685,16 +685,16 @@ fn abandoned_read_and_unpolled_write_release_at_the_correct_fence() {
 /// Simulation preserves file locks, size validation, and synchronous error categories.
 #[test]
 fn simulation_open_lock_size_and_faults() {
-    let sim = Simulation::new();
-    let _environment = sim.enter();
-    let (slab, _) = setup::<()>();
-    let conflicting = slab_new::<()>(PathBuf::from("/virtual/slab.dat"), 8192, 4096, 512);
+    let sim = racer_io::sim::SimOs::new();
+    let env = racer_io::Env::sim(&sim, racer_io::WorkerCtx::host());
+    let (slab, _) = setup::<()>(&env);
+    let conflicting = slab_new::<()>(&env, PathBuf::from("/virtual/slab.dat"), 8192, 4096, 512);
     assert_eq!(conflicting.open_now(), Err(Error::Unavailable));
     assert_eq!(slab.open_now(), slab.alignment());
     drop(slab);
     let _ = conflicting.open_now().unwrap();
     drop(conflicting);
-    let wrong_size = slab_new::<()>(PathBuf::from("/virtual/slab.dat"), 16384, 4096, 512);
+    let wrong_size = slab_new::<()>(&env, PathBuf::from("/virtual/slab.dat"), 16384, 4096, 512);
     assert_eq!(wrong_size.open_now(), Err(Error::InvalidConfiguration));
     sim.inject("open", Fault::Errno(libc::EOPNOTSUPP)).unwrap();
     assert_eq!(wrong_size.open_now(), Err(Error::Unsupported));
@@ -711,8 +711,8 @@ fn simulation_open_lock_size_and_faults() {
 /// Fault hooks cannot swap descriptors while a write completion owns the old file.
 #[test]
 fn replacement_hooks_are_fallible_and_refuse_live_writes() {
-    let sim = Simulation::new();
-    let _environment = sim.enter();
+    let sim = racer_io::sim::SimOs::new();
+    let env = racer_io::Env::sim(&sim, racer_io::WorkerCtx::host());
     let replacement = || {
         sim.open(
             None,
@@ -721,13 +721,13 @@ fn replacement_hooks_are_fallible_and_refuse_live_writes() {
         )
         .unwrap()
     };
-    let unopened = slab_new::<()>(PathBuf::from("/unopened"), 8192, 4096, 512);
+    let unopened = slab_new::<()>(&env, PathBuf::from("/unopened"), 8192, 4096, 512);
     assert_eq!(
         unopened.replace_descriptor_for_test(replacement()),
         Err(Error::Unavailable)
     );
-    let (slab, segments) = setup::<()>();
-    let reactor = Reactor::<TestScope, ()>::new(16, ());
+    let (slab, segments) = setup::<()>(&env);
+    let reactor = Reactor::<TestScope, ()>::new(16, (), &env);
     let (lease, extent) = segments.append(4096).unwrap();
     sim.inject("write", Fault::HoldCompletion(8)).unwrap();
     let mut write = slab.write(
@@ -895,6 +895,7 @@ fn io_uring_roundtrip_and_completion_fence() {
     };
     let (_, segment_bytes) = device_placement_sizes(alignment);
     let slab = slab_new::<()>(
+        &racer_io::Env::host(),
         directory.0.join("uring.dat"),
         2 * segment_bytes,
         segment_bytes,
@@ -902,7 +903,7 @@ fn io_uring_roundtrip_and_completion_fence() {
     );
     let segments = Segments::new(segment_bytes);
     assert_eq!(slab.open_configured(&segments), Ok(alignment));
-    let reactor = Reactor::<TestScope, ()>::new(16, ());
+    let reactor = Reactor::<TestScope, ()>::new(16, (), &racer_io::Env::host());
     reactor.init().unwrap();
     let (lease, extent) = segments.append(segment_bytes as usize).unwrap();
     let mut buffer = slab.allocate(extent.length(), ()).unwrap();
@@ -1068,7 +1069,7 @@ fn device_placements_route_real_io_and_reject_short_reads() {
     assert_eq!(slab.alignment(), Err(Error::Unavailable));
     let segments = Segments::new(segment_bytes);
     assert_eq!(slab.open_configured(&segments), Ok(alignment));
-    let reactor = Reactor::<TestScope, ()>::new(16, ());
+    let reactor = Reactor::<TestScope, ()>::new(16, (), &racer_io::Env::host());
     reactor.init().unwrap();
     for id in 0..3 {
         for half in 0..2 {
@@ -1154,6 +1155,7 @@ fn unbound_and_failed_binding_reject_reads_and_writes_before_reactor_admission()
     let failures = ["unbound", "wrong-geometry", "frozen-table"].as_slice();
     for &failure in failures {
         let slab = slab_new::<()>(
+            &racer_io::Env::host(),
             directory.0.join(failure),
             2 * segment_bytes,
             segment_bytes,
@@ -1180,7 +1182,7 @@ fn unbound_and_failed_binding_reject_reads_and_writes_before_reactor_admission()
         let correct = Segments::from_geometry(slab.geometry().unwrap()).unwrap();
         let (lease, extent) = correct.append(segment_bytes as usize).unwrap();
         let buffer = slab.allocate(extent.length(), ()).unwrap();
-        let reactor = Reactor::<TestScope, ()>::new(16, ());
+        let reactor = Reactor::<TestScope, ()>::new(16, (), &racer_io::Env::host());
         let mut read = slab.read(&reactor, extent, buffer, lease, &TestScope);
         assert!(matches!(
             poll(&mut read),
@@ -1211,10 +1213,10 @@ fn unbound_and_failed_binding_reject_reads_and_writes_before_reactor_admission()
 /// Partial tables preserve file geometry, lease-fenced reuse, and unchanged disk bytes.
 #[test]
 fn partial_table_reclamation_changes_authority_without_erasing_storage() {
-    let simulation = Simulation::new();
-    let _environment = simulation.enter();
-    let reactor = Reactor::<TestScope, ()>::new(16, ());
-    let slab = slab_new::<()>("/alloc-workflows/partial".into(), 16384, 4096, 512);
+    let simulation = racer_io::sim::SimOs::new();
+    let env = racer_io::Env::sim(&simulation, racer_io::WorkerCtx::host());
+    let reactor = Reactor::<TestScope, ()>::new(16, (), &env);
+    let slab = slab_new::<()>(&env, "/alloc-workflows/partial".into(), 16384, 4096, 512);
     let alignment = slab.open_now().unwrap();
     let physical = slab.geometry().unwrap();
     let partial = page_alloc::SegmentGeometry::new(16384, 4096, 2, alignment).unwrap();
@@ -1353,14 +1355,20 @@ unsafe impl racer_io::ring::SharedWriteBuffer for SharedBody {
 /// Vectored writes land header then body, validate layout, and fail closed.
 #[test]
 fn vectored_write_roundtrip_validation_and_faults() {
-    let sim = Simulation::new();
-    let _environment = sim.enter();
-    let slab = slab_new::<()>(PathBuf::from("/virtual/vectored.dat"), 65536, 32768, 16384);
+    let sim = racer_io::sim::SimOs::new();
+    let env = racer_io::Env::sim(&sim, racer_io::WorkerCtx::host());
+    let slab = slab_new::<()>(
+        &env,
+        PathBuf::from("/virtual/vectored.dat"),
+        65536,
+        32768,
+        16384,
+    );
     let segments = Segments::new(32768);
     let unit = slab.open_configured(&segments).unwrap().length();
     assert!(unit * 2 <= 16384);
     let total = 2 * unit;
-    let reactor = Reactor::<TestScope, ()>::new(16, ());
+    let reactor = Reactor::<TestScope, ()>::new(16, (), &env);
     let (lease, extent) = segments.append(total).unwrap();
     let lease_again = || segments.lease(SegmentId(0), Generation(1)).unwrap();
     let header = |len: usize| {
@@ -1485,16 +1493,17 @@ fn vectored_write_roundtrip_validation_and_faults() {
     assert_eq!(Rc::strong_count(&page), 1);
 }
 
-/// Construct a file-mode slab in the thread's current simulation, if any.
+/// Construct a file-mode slab in `env`'s simulated OS, if any.
 fn slab_new<C: page_alloc::Charge>(
+    env: &racer_io::Env,
     path: std::path::PathBuf,
     capacity_bytes: u64,
     segment_bytes: u64,
     max_record_bytes: usize,
 ) -> Slab<C> {
     let slab = Slab::new(path, capacity_bytes, segment_bytes, max_record_bytes);
-    if let Some(sim) = uring_runtime::reactor::simulation::Simulation::current() {
-        slab.simulate_in(sim.os().clone());
+    if let Some(sim) = env.sim_os() {
+        slab.simulate_in(sim.clone());
     }
     slab
 }

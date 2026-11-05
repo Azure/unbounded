@@ -410,12 +410,14 @@ impl Reactor {
     pub(crate) fn admission(&self) -> &Rc<flow_control::Quotas<AdmissionPolicy>> {
         &self.admission
     }
-    pub fn new(admission: Rc<flow_control::Quotas<AdmissionPolicy>>) -> Self {
+    /// Build a worker reactor on `env`'s backend and context.
+    pub fn new(admission: Rc<flow_control::Quotas<AdmissionPolicy>>, env: &racer_io::Env) -> Self {
         let diagnostics = admission.clone();
         Self {
             core: uring_runtime::reactor::Reactor::new(
                 admission.policy().limits().queue_entries.get(),
                 AdmissionBudget(admission.clone()),
+                env,
             )
             .with_rejection_observer(move |scope, facts| {
                 diagnostics.policy().observer().gate_rejection(
@@ -886,7 +888,7 @@ mod tests {
             #[test]
             fn direct_filesystem_buffers_preserve_nonempty_boundary_and_charge() {
                 let admission = Rc::new(flow_control::Quotas::new(AdmissionPolicy::new(limits(4))));
-                let reactor = Reactor::new(admission.clone());
+                let reactor = Reactor::new(admission.clone(), &crate::test_support::env());
                 assert!(matches!(
                     reactor.file_buffer(0),
                     Err(Error::InvalidConfiguration)
@@ -945,7 +947,7 @@ mod tests {
                     )
                     .unwrap(),
                 );
-                let reactor = Reactor::new(admission);
+                let reactor = Reactor::new(admission, &crate::test_support::env());
                 check(reactor.file_buffer(3).unwrap());
             }
 
@@ -991,9 +993,12 @@ mod tests {
                     }
                     Err(error) => panic!("unexpected io_uring setup failure: {error}"),
                 }
-                let reactor = Reactor::new(Rc::new(flow_control::Quotas::new(
-                    AdmissionPolicy::new(limits(capacity)),
-                )));
+                let reactor = Reactor::new(
+                    Rc::new(flow_control::Quotas::new(AdmissionPolicy::new(limits(
+                        capacity,
+                    )))),
+                    &crate::test_support::env(),
+                );
                 reactor.init().unwrap();
                 Some(reactor)
             }
@@ -1014,9 +1019,10 @@ mod tests {
             fn file_fence_selects_only_the_matching_racer_request() {
                 let sim = simulation::Simulation::new();
                 let _environment = sim.enter();
-                let reactor = Reactor::new(Rc::new(flow_control::Quotas::new(
-                    AdmissionPolicy::new(limits(4)),
-                )));
+                let reactor = Reactor::new(
+                    Rc::new(flow_control::Quotas::new(AdmissionPolicy::new(limits(4)))),
+                    &crate::test_support::env(),
+                );
                 sim.write_file(std::path::Path::new("/one"), b"one")
                     .unwrap();
                 sim.write_file(std::path::Path::new("/two"), b"two")
@@ -1054,9 +1060,10 @@ mod tests {
             fn listener_retry_preserves_racer_policy_after_capacity_recovery() {
                 let sim = simulation::Simulation::new();
                 let _environment = sim.enter();
-                let reactor = Reactor::new(Rc::new(flow_control::Quotas::new(
-                    AdmissionPolicy::new(limits(1)),
-                )));
+                let reactor = Reactor::new(
+                    Rc::new(flow_control::Quotas::new(AdmissionPolicy::new(limits(1)))),
+                    &crate::test_support::env(),
+                );
                 let request = scope();
                 let (fd, _peer) = sim.socket_pair();
                 let mut busy = reactor.readiness(Rc::new(fd), libc::POLLIN as u32, &request);
@@ -1083,7 +1090,7 @@ mod tests {
                 let sim = simulation::Simulation::new();
                 let _environment = sim.enter();
                 let admission = Rc::new(flow_control::Quotas::new(AdmissionPolicy::new(limits(1))));
-                let reactor = Reactor::new(admission.clone());
+                let reactor = Reactor::new(admission.clone(), &crate::test_support::env());
                 let failures = crate::telemetry::Failures::default();
                 admission
                     .policy()
@@ -1290,9 +1297,12 @@ mod tests {
             use uring_runtime::reactor::simulation::Simulation;
             use uring_runtime::reactor::simulation::disk::DiskState;
             fn reactor() -> Reactor {
-                Reactor::new(Rc::new(flow_control::Quotas::new(AdmissionPolicy::new(
-                    crate::test_support::cluster::config(false).limits,
-                ))))
+                Reactor::new(
+                    Rc::new(flow_control::Quotas::new(AdmissionPolicy::new(
+                        crate::test_support::cluster::config(false).limits,
+                    ))),
+                    &crate::test_support::env(),
+                )
             }
             #[test]
             fn simulated_pipe_splice_preserves_suffix_under_backpressure() {
@@ -1827,7 +1837,7 @@ mod tests {
             let admission = Rc::new(flow_control::Quotas::new(AdmissionPolicy::new(
                 crate::test_support::cluster::config(false).limits,
             )));
-            let reactor = Reactor::new(admission);
+            let reactor = Reactor::new(admission, &crate::test_support::env());
             let scope = RequestScope::on(
                 &crate::test_support::clock(),
                 RequestId([0; 16]),

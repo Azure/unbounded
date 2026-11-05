@@ -1802,7 +1802,10 @@ impl<C: Context> HttpPool<C> {
             result => result?,
         };
         let address = endpoint.address()?;
-        let fd = uring_runtime::reactor::descriptor::socket(socket_domain(&address))?;
+        let fd = uring_runtime::reactor::descriptor::socket(
+            self.reactor.sim_os().as_ref(),
+            socket_domain(&address),
+        )?;
         if matches!(address, SocketAddress::Inet(_)) {
             fd.enable_tcp_nodelay(self.config.tcp_nodelay)
                 .map_err(|_| racer_io::Error::Io)?;
@@ -1849,7 +1852,10 @@ impl<C: Context> HttpPool<C> {
                     // switched to the `tls` ULP. Close it and redo TCP and the
                     // handshake on a fresh socket under the same scope.
                     scope.check()?;
-                    let fd = uring_runtime::reactor::descriptor::socket(socket_domain(&address))?;
+                    let fd = uring_runtime::reactor::descriptor::socket(
+                        self.reactor.sim_os().as_ref(),
+                        socket_domain(&address),
+                    )?;
                     if matches!(address, SocketAddress::Inet(_)) {
                         fd.enable_tcp_nodelay(self.config.tcp_nodelay)
                             .map_err(|_| racer_io::Error::Io)?;
@@ -2588,7 +2594,7 @@ mod tests {
 
     /// Create the caller-owned reactor wrapper used by test contexts.
     fn reactor() -> Rc<TestReactor> {
-        Rc::new(TestReactor(Reactor::new(16, ())))
+        Rc::new(TestReactor(Reactor::new(16, (), &racer_io::Env::host())))
     }
 
     /// Build a response with one explicit content length.

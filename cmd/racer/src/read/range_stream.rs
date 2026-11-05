@@ -1723,7 +1723,7 @@ pub(super) mod tests {
     impl Fixture {
         fn new(limits: crate::config::Limits, capacity: usize) -> Self {
             let admission = Rc::new(flow_control::Quotas::new(AdmissionPolicy::new(limits)));
-            let reactor = Rc::new(Reactor::new(admission.clone()));
+            let reactor = Rc::new(Reactor::new(admission.clone(), &crate::test_support::env()));
             let pipes = Rc::new(new_pipe_pool(admission.clone()));
             let directory = Arc::new(
                 WorkerDirectory::new(
@@ -2862,7 +2862,7 @@ pub(super) mod tests {
             let admission = Rc::new(flow_control::Quotas::new(AdmissionPolicy::new(
                 crate::test_support::cluster::config(false).limits,
             )));
-            let reactor = Rc::new(Reactor::new(admission.clone()));
+            let reactor = Rc::new(Reactor::new(admission.clone(), &crate::test_support::env()));
             let io = Rc::new(crate::http::new_io(
                 reactor.clone(),
                 Codec::new(32768),

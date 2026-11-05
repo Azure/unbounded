@@ -195,7 +195,7 @@ fn fixture() -> Fixture {
 }
 fn fixture_with(context: usize) -> Fixture {
     let admission = std::rc::Rc::new(Quotas::new(Limits(context)));
-    let reactor = std::rc::Rc::new(Reactor::new(64, ()));
+    let reactor = std::rc::Rc::new(Reactor::new(64, (), &racer_io::Env::host()));
     reactor.init().unwrap();
     let pool = Pool::new(
         std::rc::Rc::new(reactor.clone()),

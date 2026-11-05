@@ -111,8 +111,8 @@ fn reactor() -> Option<Rc<Reactor>> {
     crate::test_support::enrollment::reactor()?;
     let n = NonZeroUsize::new(1024).unwrap();
     let bytes = NonZeroUsize::new(4 * PAGE_BYTES as usize).unwrap();
-    let reactor = Rc::new(Reactor::new(Rc::new(flow_control::Quotas::new(
-        AdmissionPolicy::new(Limits {
+    let reactor = Rc::new(Reactor::new(
+        Rc::new(flow_control::Quotas::new(AdmissionPolicy::new(Limits {
             plaintext_bytes: bytes,
             ciphertext_bytes: bytes,
             dirty_bytes: bytes,
@@ -133,8 +133,9 @@ fn reactor() -> Option<Rc<Reactor>> {
             retained_snapshots: n,
             metadata_entries: n,
             relay_transfers: n,
-        }),
-    ))));
+        }))),
+        &crate::test_support::env(),
+    ));
     reactor.init().unwrap();
     Some(reactor)
 }

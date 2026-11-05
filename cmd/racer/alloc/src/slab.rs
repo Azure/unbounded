@@ -1667,7 +1667,7 @@ mod tests {
     /// Device submissions keep completion error handling and release their fences.
     #[test]
     fn device_io_faults_release_completion_resources() {
-        use uring_runtime::reactor::simulation::{Fault, Simulation};
+        use racer_io::sim::Fault;
 
         #[derive(Clone, Copy, Debug, PartialEq)]
         enum TestError {
@@ -1704,8 +1704,8 @@ mod tests {
         let _ = slab.open_configured(&segments).unwrap();
         let (lease, extent) = segments.append(4096).unwrap();
         drop(lease);
-        let sim = Simulation::new();
-        let _environment = sim.enter();
+        let sim = racer_io::sim::SimOs::new();
+        let env = racer_io::Env::sim(&sim, racer_io::WorkerCtx::host());
         let descriptor = sim
             .open(
                 None,
@@ -1720,7 +1720,7 @@ mod tests {
         };
         placements[0].file = Rc::new(descriptor);
         drop(opened);
-        let reactor = Reactor::<TestScope, ()>::new(16, ());
+        let reactor = Reactor::<TestScope, ()>::new(16, (), &env);
         for write in [false, true] {
             for (fault, expected) in [
                 (Fault::Short(512), TestError::Alloc(Error::Io)),

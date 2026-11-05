@@ -104,7 +104,7 @@ impl Context for Caller {
 /// Build a small reactor and explicit head and body limits.
 fn io() -> HttpIo<Caller> {
     HttpIo::new(
-        Rc::new(Rc::new(Reactor::new(16, ()))),
+        Rc::new(Rc::new(Reactor::new(16, (), &racer_io::Env::host()))),
         Codec::new(256),
         Rc::new(Caller),
         16,
@@ -279,7 +279,7 @@ mod disconnect_scopes {
     fn success_and_parent_cancel_fence_watch_and_keep_parent_independent() {
         for cancel in [false, true] {
             let io = HttpIo::new(
-                Rc::new(Rc::new(Reactor::new(16, ()))),
+                Rc::new(Rc::new(Reactor::new(16, (), &racer_io::Env::host()))),
                 Codec::new(256),
                 Rc::new(ScopedCaller),
                 16,
@@ -346,7 +346,7 @@ mod disconnect_scopes {
     #[test]
     fn failed_watch_scope_preserves_error_without_polling_work() {
         let io = HttpIo::new(
-            Rc::new(Rc::new(Reactor::new(16, ()))),
+            Rc::new(Rc::new(Reactor::new(16, (), &racer_io::Env::host()))),
             Codec::new(256),
             Rc::new(ScopedCaller),
             16,
@@ -439,7 +439,7 @@ fn head_has_no_body_even_with_large_representation_length() {
 fn real_partial_sends_preserve_owned_subrange() {
     use std::{io::Read, os::fd::AsRawFd};
     let io = HttpIo::new(
-        Rc::new(Rc::new(Reactor::new(16, ()))),
+        Rc::new(Rc::new(Reactor::new(16, (), &racer_io::Env::host()))),
         Codec::new(256),
         Rc::new(Caller),
         2 * 1024 * 1024,
