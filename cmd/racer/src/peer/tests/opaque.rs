@@ -1675,8 +1675,8 @@ fn opaque_head_rejects_binding_length_authority_and_reverse_proof_substitution()
     }
 }
 
-/// Per-operation cost of the peer request crypto path, the source of the racer-sim and racer-dst
-/// `sign_ns` / `verify_ns` constants. Run with
+/// Per-operation cost of the peer request crypto path, the source of racer-dst's `[crypto]`
+/// `sign_ns` / `verify_ns` constants (`dst/costs.toml`). Run with
 /// `cargo test --release -p racer --lib peer_crypto_cost_benchmark -- --ignored --nocapture`.
 #[test]
 #[ignore = "release-only peer sign/verify cost benchmark; run explicitly"]
