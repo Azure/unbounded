@@ -139,3 +139,18 @@ func TestBuildAgentConfig_Downloads(t *testing.T) {
 		require.Nil(t, cfg.Downloads, "empty download source should yield nil Downloads")
 	})
 }
+
+func TestAgentArtifactInstallEnv(t *testing.T) {
+	t.Parallel()
+
+	require.Nil(t, AgentArtifactInstallEnv(nil))
+
+	got := AgentArtifactInstallEnv(&v1alpha3.AgentArtifact{
+		URL:    "https://artifacts.example.com/agent's.tar.gz",
+		SHA256: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+	})
+	require.Equal(t, []string{
+		`AGENT_URL='https://artifacts.example.com/agent'\''s.tar.gz'`,
+		"AGENT_SHA256='aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'",
+	}, got)
+}
