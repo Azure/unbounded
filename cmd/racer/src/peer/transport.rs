@@ -1815,15 +1815,15 @@ mod tests {
     }
     #[test]
     fn adaptive_socket_attribution_ignores_local_pressure_and_expired_scope() {
-        let scope = RequestScope::new(
+        let scope = RequestScope::host(
             crate::model::RequestId([91; 16]),
-            uring_runtime::environment::now() + std::time::Duration::from_secs(10),
+            racer_io::Clock::host().now() + std::time::Duration::from_secs(10),
         )
         .unwrap();
         let owner = crate::peer::AdaptivePeers::new(
             Default::default(),
             Default::default(),
-            crate::test_support::clock(),
+            racer_io::Clock::host(),
         )
         .unwrap();
         let node = racer_control_wire::NodeId("peer".into());
@@ -1976,7 +1976,7 @@ mod tests {
                 server = server.with_links(w.b.links.clone());
             }
             let scope =
-                RequestScope::new(RequestId([5; 16]), Instant::now() + Duration::from_secs(10))
+                RequestScope::host(RequestId([5; 16]), Instant::now() + Duration::from_secs(10))
                     .unwrap();
             let (peer, local) = (
                 signers[responder].node().clone(),
@@ -2225,7 +2225,7 @@ mod tests {
         #[test]
         fn native_subdeadline_preserves_parent_deadline_and_cancellation() {
             let scope =
-                RequestScope::new(RequestId([1; 16]), Instant::now() + Duration::from_secs(30))
+                RequestScope::host(RequestId([1; 16]), Instant::now() + Duration::from_secs(30))
                     .unwrap();
             let native = native_scope(&scope);
             assert!(native.deadline.0 <= scope.deadline.0);
@@ -2333,7 +2333,7 @@ mod tests {
             let sender =
                 transfers(signers[2].clone(), &admission, &reactor).with_links(w.b.links.clone());
             let scope =
-                RequestScope::new(RequestId([7; 16]), Instant::now() + Duration::from_secs(30))
+                RequestScope::host(RequestId([7; 16]), Instant::now() + Duration::from_secs(30))
                     .unwrap();
             let cache = CacheId("cccccccc-1111-4111-8111-111111111111".into());
             let version = ObjectVersion {
@@ -2772,7 +2772,7 @@ mod tests {
             let (a, b) = (signers[0].node().clone(), signers[2].node().clone());
             let mut w = world_for([a.clone(), b.clone()], false);
             let scope =
-                RequestScope::new(RequestId([8; 16]), Instant::now() + Duration::from_secs(30))
+                RequestScope::host(RequestId([8; 16]), Instant::now() + Duration::from_secs(30))
                     .unwrap();
             // Before setup, the receiver cannot grant and the page uses HTTP.
             let early = drive(
@@ -3026,7 +3026,7 @@ mod tests {
     mod native_control_tests {
         use super::*;
         fn scope() -> RequestScope {
-            RequestScope::new(
+            RequestScope::host(
                 crate::model::RequestId([4; 16]),
                 std::time::Instant::now() + Duration::from_secs(30),
             )

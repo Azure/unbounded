@@ -180,7 +180,7 @@ mod body_progress {
             // alive until the outer watchdog so crossing that deadline between
             // client and server polls cannot fail an otherwise valid assertion.
             let server_scope =
-                RequestScope::new(scope.request, start + Duration::from_secs(5)).unwrap();
+                RequestScope::host(scope.request, start + Duration::from_secs(5)).unwrap();
             Self {
                 idle,
                 telemetry,
@@ -225,7 +225,7 @@ mod body_progress {
                 binding,
             } = self;
             let mut timing =
-                super::super::PageTiming::new(&telemetry.metrics, crate::test_support::clock());
+                super::super::PageTiming::new(&telemetry.metrics, racer_io::Clock::host());
             let address = listener.local_addr().unwrap();
             let fixture_end = start + Duration::from_secs(5);
             let sent = Cell::new(0usize);
@@ -717,7 +717,7 @@ mod destination_disconnect {
                 PeerNetwork::new(
                     NodeId(C.into()),
                     crate::test_support::published_membership(membership.clone()),
-                    crate::test_support::clock(),
+                    racer_io::Clock::host(),
                 )
                 .unwrap(),
             );
@@ -734,7 +734,7 @@ mod destination_disconnect {
             let flights = Rc::new(Flights::new(
                 admission.clone(),
                 crate::test_support::availability_for(vec![CacheId(CACHE.into())]),
-                crate::test_support::clock(),
+                racer_io::Clock::host(),
             ));
             let service = Rc::new(PendingPage {
                 flights: flights.clone(),
@@ -759,7 +759,7 @@ mod destination_disconnect {
                 signers[2].clone(),
             );
             let parent =
-                RequestScope::new(RequestId([9; 16]), Instant::now() + Duration::from_secs(60))
+                RequestScope::host(RequestId([9; 16]), Instant::now() + Duration::from_secs(60))
                     .unwrap();
             Self {
                 outbound,
@@ -790,7 +790,7 @@ mod destination_disconnect {
                 server,
                 parent,
             } = self;
-            let independent = RequestScope::new(RequestId([8; 16]), parent.deadline.0).unwrap();
+            let independent = RequestScope::host(RequestId([8; 16]), parent.deadline.0).unwrap();
             let origin = OriginContext {
                 object: page.version.object.clone(),
                 metadata: None,
@@ -1120,7 +1120,7 @@ mod encrypted_http {
             clients.push(client);
             engines.push(PageCryptoEngine::new(CryptoRuntime {
                 port,
-                ctx: crate::test_support::ctx(),
+                ctx: racer_io::WorkerCtx::host(),
             }));
         }
         let ios: Vec<_> = admissions
@@ -1146,8 +1146,9 @@ mod encrypted_http {
             Rc::new(codec(&admissions[0])),
             identities[0].signatures.clone(),
         );
-        let scope = RequestScope::new(RequestId([8; 16]), Instant::now() + Duration::from_secs(20))
-            .unwrap();
+        let scope =
+            RequestScope::host(RequestId([8; 16]), Instant::now() + Duration::from_secs(20))
+                .unwrap();
         let length = 1 << 20; // Enter the production recycled-payload pool.
         let mut pages: Vec<CiphertextPage> = Vec::new();
         let mut expected = Vec::new();
@@ -1201,7 +1202,7 @@ mod encrypted_http {
         let listener = Rc::new(uring_runtime::reactor::descriptor::Descriptor::from(
             listener,
         ));
-        let canceled = RequestScope::new(RequestId([9; 16]), scope.deadline.0).unwrap();
+        let canceled = RequestScope::host(RequestId([9; 16]), scope.deadline.0).unwrap();
         let accepts = Cell::new(0);
         let prefix_sent = Cell::new(false);
         let server = async {
@@ -1468,7 +1469,7 @@ mod requester_safety {
             crate::peer::PeerNetwork::new(
                 local.clone(),
                 crate::test_support::published_membership(members.clone()),
-                crate::test_support::clock(),
+                racer_io::Clock::host(),
             )
             .unwrap(),
         );
@@ -1491,7 +1492,7 @@ mod requester_safety {
         let adaptive = AdaptivePeers::new(
             Default::default(),
             Metrics::default(),
-            crate::test_support::clock(),
+            racer_io::Clock::host(),
         )
         .unwrap();
         let signers = crate::peer::tests::signers();
@@ -1561,7 +1562,7 @@ mod requester_safety {
                 ..Default::default()
             },
             metrics.clone(),
-            crate::test_support::clock(),
+            racer_io::Clock::host(),
         )
         .unwrap();
         let node = signers[2].node().clone();
@@ -1583,13 +1584,13 @@ mod requester_safety {
                 crate::peer::PeerNetwork::new(
                     signers[0].node().clone(),
                     crate::test_support::published_membership(membership.clone()),
-                    crate::test_support::clock(),
+                    racer_io::Clock::host(),
                 )
                 .unwrap(),
             ),
         );
         let mut request = crate::peer::tests::request(&admission, 91);
-        let scope = RequestScope::new(
+        let scope = RequestScope::host(
             request.route.request,
             Instant::now() + Duration::from_secs(3),
         )
@@ -1897,7 +1898,7 @@ mod subscriptions {
                 PeerNetwork::new(
                     NodeId(C.into()),
                     crate::test_support::published_membership(membership),
-                    crate::test_support::clock(),
+                    racer_io::Clock::host(),
                 )
                 .unwrap(),
             );
@@ -2093,7 +2094,7 @@ mod subscriptions {
             PeerNetwork::new(
                 NodeId(C.into()),
                 crate::test_support::published_membership(membership),
-                crate::test_support::clock(),
+                racer_io::Clock::host(),
             )
             .unwrap(),
         );
@@ -2120,7 +2121,7 @@ mod subscriptions {
             signers[2].clone(),
         );
         let mut request = subscribe(&admission, A, 70, 0, FetchMode::Acquire);
-        let scope = RequestScope::new(
+        let scope = RequestScope::host(
             RequestId([70; 16]),
             Instant::now() + Duration::from_secs(240),
         )
@@ -2200,7 +2201,7 @@ mod subscriptions {
         // deadline, then traverse every ineligible interval. Every poll is measured,
         // including rank completion and transition to the next endpoint.
         let mut request = subscribe(&admission, A, 72, 0, FetchMode::Acquire);
-        let resume_scope = RequestScope::new(scope.request, scope.deadline.0).unwrap();
+        let resume_scope = RequestScope::host(scope.request, scope.deadline.0).unwrap();
         request.origin.scope = resume_scope.clone();
         request.origin.request = resume_scope.request;
         request.route.request = resume_scope.request;
@@ -2542,7 +2543,7 @@ mod subscriptions {
                 PeerNetwork::new(
                     NodeId(node.into()),
                     crate::test_support::published_membership(membership.clone()),
-                    crate::test_support::clock(),
+                    racer_io::Clock::host(),
                 )
                 .unwrap(),
             )
@@ -2725,8 +2726,10 @@ mod timing {
         let local = page_request(&admission, 1);
         let metrics = Metrics::default();
         let clock = SimulationClock::new_at(7, Instant::now(), std::time::SystemTime::now());
-        let _environment = clock.environment(1).enter();
-        let mut timing = PageTiming::new(&metrics, crate::test_support::clock());
+        let sim_env = clock.environment(1);
+        let _environment = sim_env.enter();
+        let sim_ctx = sim_env.worker_ctx();
+        let mut timing = PageTiming::new(&metrics, sim_ctx.clock.clone());
         timing.enable(&local, TransportPlan::Http, false);
         for stage in 0..4 {
             if stage > 0 {
@@ -2783,7 +2786,7 @@ mod timing {
             } else {
                 TransportPlan::Http
             };
-            let mut timing = PageTiming::new(&metrics, crate::test_support::clock());
+            let mut timing = PageTiming::new(&metrics, racer_io::Clock::host());
             timing.enable(&local, plan, case == "opaque");
             for stage in 0..4 {
                 timing.begin();
@@ -2808,9 +2811,11 @@ mod timing {
         let metrics = Metrics::default();
         let local = page_request(&admission, 1);
         let clock = SimulationClock::new_at(8, Instant::now(), std::time::SystemTime::now());
-        let _environment = clock.environment(1).enter();
+        let sim_env = clock.environment(1);
+        let _environment = sim_env.enter();
+        let sim_ctx = sim_env.worker_ctx();
         let mut work = Box::pin(async {
-            let mut timing = PageTiming::new(&metrics, crate::test_support::clock());
+            let mut timing = PageTiming::new(&metrics, sim_ctx.clock.clone());
             timing.enable(&local, TransportPlan::Http, false);
             clock.advance(Duration::from_nanos(17));
             timing.end(0);
@@ -2841,7 +2846,7 @@ mod timing {
         let metrics = Metrics::default();
         for (attempt, case) in ["invalid", "miss", "drop"].into_iter().enumerate() {
             let local = page_request(&admission, attempt as u8);
-            let mut timing = PageTiming::new(&metrics, crate::test_support::clock());
+            let mut timing = PageTiming::new(&metrics, racer_io::Clock::host());
             timing.enable(&local, TransportPlan::Http, false);
             for stage in 0..4 {
                 timing.begin();
@@ -2932,7 +2937,7 @@ mod timing {
                     crate::peer::AdaptivePeers::new(
                         Default::default(),
                         metrics.clone(),
-                        crate::test_support::clock(),
+                        racer_io::Clock::host(),
                     )
                     .unwrap(),
                 ),
@@ -2943,14 +2948,14 @@ mod timing {
                 PeerNetwork::new(
                     NodeId(A.into()),
                     crate::test_support::published_membership(members.clone()),
-                    crate::test_support::clock(),
+                    racer_io::Clock::host(),
                 )
                 .unwrap(),
             ),
         )
         .with_metrics(metrics.clone());
-        let scope =
-            RequestScope::new(RequestId([1; 16]), Instant::now() + Duration::from_secs(5)).unwrap();
+        let scope = RequestScope::host(RequestId([1; 16]), Instant::now() + Duration::from_secs(5))
+            .unwrap();
         let client = async {
             for attempt in 0..3 {
                 let response = if attempt == 1 {
@@ -3133,7 +3138,9 @@ pub(super) fn codec(admission: &Rc<flow_control::Quotas<AdmissionPolicy>>) -> Se
 fn receive_gate_operation_bypass_and_chained_small_caps_expire_and_recover() {
     use crate::telemetry::{Gauge, Metrics};
     let clock = uring_runtime::environment::SimulationClock::new(920);
-    let _env = clock.environment(0).enter();
+    let sim_env = clock.environment(0);
+    let _env = sim_env.enter();
+    let sim_ctx = sim_env.worker_ctx();
     let fixtures = [SocketFixture::new(1), SocketFixture::new(1)];
     let metrics = [Metrics::default(), Metrics::default()];
     let gates: Vec<_> = metrics
@@ -3161,9 +3168,10 @@ fn receive_gate_operation_bypass_and_chained_small_caps_expire_and_recover() {
                 .with_receive_gate(g.clone())
         })
         .collect();
-    let scope = RequestScope::new(
+    let scope = RequestScope::on(
+        &sim_ctx.clock,
         RequestId([20; 16]),
-        uring_runtime::environment::now() + Duration::from_secs(1),
+        sim_ctx.clock.now() + Duration::from_secs(1),
     )
     .unwrap();
     let mut requests: Vec<_> = fixtures.iter().map(|f| request(&f.admission, 20)).collect();
@@ -3405,8 +3413,10 @@ fn page_timing_duration_conversion_saturates_and_reversed_clock_is_zero() {
     use uring_runtime::environment::SimulationClock;
     let metrics = Metrics::default();
     let clock = SimulationClock::new(9);
-    let _environment = clock.environment(1).enter();
-    let mut timing = PageTiming::new(&metrics, crate::test_support::clock());
+    let sim_env = clock.environment(1);
+    let _environment = sim_env.enter();
+    let sim_ctx = sim_env.worker_ctx();
+    let mut timing = PageTiming::new(&metrics, sim_ctx.clock.clone());
     timing.active = true;
     timing.begin();
     clock.advance(Duration::from_secs(u64::MAX / 1_000_000_000 + 1));
@@ -3424,7 +3434,9 @@ mod adaptive {
     #[test]
     fn hedges_require_spare_capacity_and_no_local_or_peer_pressure() {
         let clock = uring_runtime::environment::SimulationClock::new(905);
-        let _env = clock.environment(0).enter();
+        let sim_env = clock.environment(0);
+        let _env = sim_env.enter();
+        let sim_ctx = sim_env.worker_ctx();
         let owner = AdaptivePeers::new(
             Config {
                 total: 4,
@@ -3432,7 +3444,7 @@ mod adaptive {
                 ..Default::default()
             },
             Metrics::default(),
-            crate::test_support::clock(),
+            sim_ctx.clock.clone(),
         )
         .unwrap();
         let node = NodeId("a".into());
@@ -3449,7 +3461,7 @@ mod adaptive {
                 ..Default::default()
             },
             Metrics::default(),
-            crate::test_support::clock(),
+            sim_ctx.clock.clone(),
         )
         .unwrap();
         let permit = owner.acquire(&node).unwrap();
@@ -3459,7 +3471,9 @@ mod adaptive {
     #[test]
     fn churn_cannot_evict_neutral_probe_backoff_with_old_update_time() {
         let clock = uring_runtime::environment::SimulationClock::new(783);
-        let _env = clock.environment(0).enter();
+        let sim_env = clock.environment(0);
+        let _env = sim_env.enter();
+        let sim_ctx = sim_env.worker_ctx();
         let owner = AdaptivePeers::new(
             Config {
                 total: 2 * CAPACITY,
@@ -3467,7 +3481,7 @@ mod adaptive {
                 ..Default::default()
             },
             Metrics::default(),
-            crate::test_support::clock(),
+            sim_ctx.clock.clone(),
         )
         .unwrap();
         let node = NodeId("000-circuit".into());
@@ -3504,7 +3518,7 @@ mod adaptive {
                 ..Default::default()
             },
             metrics.clone(),
-            crate::test_support::clock(),
+            racer_io::Clock::host(),
         )
         .unwrap();
         let worker = owner.clone();
@@ -3531,7 +3545,9 @@ mod adaptive {
     #[test]
     fn recovery_requires_exclusive_verified_probe_and_old_success_cannot_clear_failure() {
         let clock = uring_runtime::environment::SimulationClock::new(779);
-        let _env = clock.environment(0).enter();
+        let sim_env = clock.environment(0);
+        let _env = sim_env.enter();
+        let sim_ctx = sim_env.worker_ctx();
         let owner = AdaptivePeers::new(
             Config {
                 total: 4,
@@ -3539,7 +3555,7 @@ mod adaptive {
                 ..Default::default()
             },
             Metrics::default(),
-            crate::test_support::clock(),
+            sim_ctx.clock.clone(),
         )
         .unwrap();
         let node = NodeId("a".into());
@@ -3568,7 +3584,9 @@ mod adaptive {
     #[test]
     fn state_capacity_never_evicts_live_permits_and_ages_retired_entries() {
         let clock = uring_runtime::environment::SimulationClock::new(780);
-        let _env = clock.environment(0).enter();
+        let sim_env = clock.environment(0);
+        let _env = sim_env.enter();
+        let sim_ctx = sim_env.worker_ctx();
         let owner = AdaptivePeers::new(
             Config {
                 total: 2 * CAPACITY,
@@ -3576,7 +3594,7 @@ mod adaptive {
                 ..Default::default()
             },
             Metrics::default(),
-            crate::test_support::clock(),
+            sim_ctx.clock.clone(),
         )
         .unwrap();
         let permits: Vec<_> = (0..CAPACITY)
@@ -3609,7 +3627,9 @@ mod adaptive {
     #[test]
     fn local_pressure_shrinks_node_limit_without_revoking_work_or_blame() {
         let clock = uring_runtime::environment::SimulationClock::new(781);
-        let _env = clock.environment(0).enter();
+        let sim_env = clock.environment(0);
+        let _env = sim_env.enter();
+        let sim_ctx = sim_env.worker_ctx();
         let metrics = Metrics::default();
         let owner = AdaptivePeers::new(
             Config {
@@ -3618,7 +3638,7 @@ mod adaptive {
                 ..Default::default()
             },
             metrics.clone(),
-            crate::test_support::clock(),
+            sim_ctx.clock.clone(),
         )
         .unwrap();
         let node = NodeId("a".into());
@@ -3685,7 +3705,7 @@ mod explicit_clock {
 
     #[test]
     fn link_health_acquires_at_the_supplied_time() {
-        let health = LinkHealth::new(1, crate::test_support::clock());
+        let health = LinkHealth::new(1, racer_io::Clock::host());
         let node = NodeId("b".into());
         let start = Instant::now();
         health

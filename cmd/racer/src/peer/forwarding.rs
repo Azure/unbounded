@@ -1458,10 +1458,13 @@ mod tests {
             ));
             assert_eq!(client.outstanding(), 0);
             let clock = uring_runtime::environment::SimulationClock::new(929);
-            let _guard = clock.environment(0).enter();
-            let scope = RequestScope::new(
+            let sim_env = clock.environment(0);
+            let _guard = sim_env.enter();
+            let sim_ctx = sim_env.worker_ctx();
+            let scope = RequestScope::on(
+                &sim_ctx.clock,
                 RequestId([74; 16]),
-                uring_runtime::environment::now() + Duration::from_secs(1),
+                sim_ctx.clock.now() + Duration::from_secs(1),
             )
             .unwrap();
             let mut expired = Box::pin(receiver.verify_request_async(make(), &scope));
@@ -1472,9 +1475,10 @@ mod tests {
                 expired.as_mut().poll(&mut cx),
                 Poll::Ready(Err(Error::DeadlineExceeded))
             ));
-            let scope = RequestScope::new(
+            let scope = RequestScope::on(
+                &sim_ctx.clock,
                 RequestId([75; 16]),
-                uring_runtime::environment::now() + Duration::from_secs(30),
+                sim_ctx.clock.now() + Duration::from_secs(30),
             )
             .unwrap();
             let mut abandoned = Box::pin(receiver.verify_request_async(make(), &scope));
@@ -1492,9 +1496,10 @@ mod tests {
                 Poll::Ready(Err(Error::Cancelled))
             ));
             assert_eq!(client.outstanding(), 0);
-            let scope = RequestScope::new(
+            let scope = RequestScope::on(
+                &sim_ctx.clock,
                 RequestId([77; 16]),
-                uring_runtime::environment::now() + Duration::from_secs(30),
+                sim_ctx.clock.now() + Duration::from_secs(30),
             )
             .unwrap();
             client.close_submissions().unwrap();
@@ -1667,7 +1672,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            response_matches(&empty, &head, &crate::test_support::clock()),
+            response_matches(&empty, &head, &racer_io::Clock::host()),
             Ok(())
         );
         assert_eq!(
@@ -1690,7 +1695,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            response_matches(&response, &head, &crate::test_support::clock()),
+            response_matches(&response, &head, &racer_io::Clock::host()),
             Ok(())
         );
         for name in [
@@ -1714,7 +1719,7 @@ mod tests {
                 .unwrap()
                 .value = b"9".to_vec();
             assert!(
-                response_matches(&bad, &head, &crate::test_support::clock()).is_err(),
+                response_matches(&bad, &head, &racer_io::Clock::host()).is_err(),
                 "{name}"
             );
         }
@@ -1727,7 +1732,7 @@ mod tests {
             response_matches(
                 &response,
                 &protocol::request_head(&request).unwrap(),
-                &crate::test_support::clock()
+                &racer_io::Clock::host()
             )
             .is_err()
         );

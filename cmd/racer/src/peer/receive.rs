@@ -288,7 +288,7 @@ mod tests {
         let admission = Quotas::new(AdmissionPolicy::new(
             crate::test_support::cluster::config(false).limits,
         ));
-        let scope = RequestScope::new(
+        let scope = RequestScope::host(
             crate::model::RequestId([1; 16]),
             now() + Duration::from_secs(10),
         )
@@ -324,7 +324,9 @@ mod tests {
     fn receive_alarm_wakes_without_completion_and_preserves_scope() {
         use std::future::Future;
         let clock = uring_runtime::environment::SimulationClock::new(909);
-        let _env = clock.environment(0).enter();
+        let sim_env = clock.environment(0);
+        let _env = sim_env.enter();
+        let sim_ctx = sim_env.worker_ctx();
         let admission = Quotas::new(AdmissionPolicy::new(
             crate::test_support::cluster::config(false).limits,
         ));
@@ -339,8 +341,12 @@ mod tests {
                 metrics.clone(),
             )
             .unwrap();
-            let parent =
-                RequestScope::new(RequestId([4; 16]), now() + Duration::from_secs(10)).unwrap();
+            let parent = RequestScope::on(
+                &sim_ctx.clock,
+                RequestId([4; 16]),
+                now() + Duration::from_secs(10),
+            )
+            .unwrap();
             let original = parent.deadline;
             let wake = Arc::new(Wake(AtomicUsize::new(0)));
             let waker = Waker::from(wake.clone());
@@ -350,7 +356,8 @@ mod tests {
                 panic!("grant");
             };
             drop(held);
-            let scope = RequestScope::new(parent.request, parent.deadline.0).unwrap();
+            let scope =
+                RequestScope::on(&sim_ctx.clock, parent.request, parent.deadline.0).unwrap();
             if cause == "idle" {
                 scope.set_candidate_idle(Duration::from_millis(10)).unwrap();
             }
@@ -414,7 +421,7 @@ mod tests {
             ..Config::default()
         })
         .unwrap();
-        let scope = RequestScope::new(RequestId([5; 16]), now() + Duration::from_secs(5)).unwrap();
+        let scope = RequestScope::host(RequestId([5; 16]), now() + Duration::from_secs(5)).unwrap();
         let mut ticket = gate.enter(&admission, &scope).unwrap().unwrap();
         let mut cx = Context::from_waker(futures::task::noop_waker_ref());
         let Poll::Ready(Ok(permit)) = ticket.poll(&scope, &mut cx) else {
@@ -444,7 +451,7 @@ mod tests {
             ..Config::default()
         })
         .unwrap();
-        let scope = RequestScope::new(RequestId([1; 16]), now() + Duration::from_secs(5)).unwrap();
+        let scope = RequestScope::host(RequestId([1; 16]), now() + Duration::from_secs(5)).unwrap();
         let wake = Arc::new(Wake(AtomicUsize::new(0)));
         let waker = Waker::from(wake.clone());
         let mut cx = Context::from_waker(&waker);
@@ -480,7 +487,7 @@ mod tests {
         let admission = Quotas::new(AdmissionPolicy::new(
             crate::test_support::cluster::config(false).limits,
         ));
-        let scope = RequestScope::new(RequestId([2; 16]), now() + Duration::from_secs(5)).unwrap();
+        let scope = RequestScope::host(RequestId([2; 16]), now() + Duration::from_secs(5)).unwrap();
         assert!(
             Gate::new(Config::default())
                 .unwrap()
@@ -524,7 +531,7 @@ mod tests {
             ..Config::default()
         })
         .unwrap();
-        let scope = RequestScope::new(RequestId([3; 16]), now() + Duration::from_secs(5)).unwrap();
+        let scope = RequestScope::host(RequestId([3; 16]), now() + Duration::from_secs(5)).unwrap();
         let held = admission
             .reserve(
                 None,

@@ -1739,9 +1739,9 @@ pub(crate) mod tests {
                 hops: vec![],
             };
             drop(response);
-            let scope = RequestScope::new(
+            let scope = RequestScope::host(
                 RequestId([1; 16]),
-                uring_runtime::environment::now() + Duration::from_secs(30),
+                racer_io::Clock::host().now() + Duration::from_secs(30),
             )
             .unwrap();
             for case in 0..5 {
@@ -1837,9 +1837,9 @@ pub(crate) mod tests {
             push(&mut head, "racer-receiver", &signers[0].node().0);
             let original = std::sync::Arc::new(signers[2].sign(head).unwrap());
             drop(response);
-            let scope = RequestScope::new(
+            let scope = RequestScope::host(
                 RequestId([1; 16]),
-                uring_runtime::environment::now() + Duration::from_secs(30),
+                racer_io::Clock::host().now() + Duration::from_secs(30),
             )
             .unwrap();
             let alignment = crate::memory::default_disk_alignment();
@@ -2259,7 +2259,7 @@ pub(crate) mod tests {
                 listener,
             ));
             let scope =
-                RequestScope::new(RequestId([1; 16]), Instant::now() + Duration::from_secs(30))
+                RequestScope::host(RequestId([1; 16]), Instant::now() + Duration::from_secs(30))
                     .unwrap();
             let mut previous_id = None;
             for _ in 0..2 {
@@ -2400,7 +2400,7 @@ pub(crate) mod tests {
             let reactor = Rc::new(Reactor::new(admission.clone()));
             let io = crate::http::new_io(reactor.clone(), Codec::new(65536), admission.clone(), 0);
             let scope =
-                RequestScope::new(RequestId([2; 16]), Instant::now() + Duration::from_secs(10))
+                RequestScope::host(RequestId([2; 16]), Instant::now() + Duration::from_secs(10))
                     .unwrap();
             let (a, b) = std::os::unix::net::UnixStream::pair().unwrap();
             let a = crate::http::from_accepted(a.into(), &admission).unwrap();
@@ -2450,7 +2450,7 @@ pub(crate) mod tests {
                 reactor.init().unwrap();
                 let io =
                     crate::http::new_io(reactor.clone(), Codec::new(65536), admission.clone(), 0);
-                let scope = RequestScope::new(
+                let scope = RequestScope::host(
                     RequestId([3; 16]),
                     Instant::now()
                         + if end == "expiry" {

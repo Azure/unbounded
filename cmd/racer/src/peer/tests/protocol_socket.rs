@@ -379,7 +379,7 @@ fn server_authenticates_before_copy_only_service_and_signs_failures() {
         PeerNetwork::new(
             NodeId(C.into()),
             crate::test_support::published_membership(membership),
-            crate::test_support::clock(),
+            racer_io::Clock::host(),
         )
         .unwrap(),
     );
@@ -466,7 +466,7 @@ fn relay_dispatch_preserves_reverse_path_and_fails_closed_on_link_loss() {
             PeerNetwork::new(
                 NodeId(B.into()),
                 crate::test_support::published_membership(membership.clone()),
-                crate::test_support::clock(),
+                racer_io::Clock::host(),
             )
             .unwrap(),
         );
@@ -593,7 +593,7 @@ fn relay_fails_a_request_for_a_silent_destination_at_once() {
         PeerNetwork::new(
             NodeId(B.into()),
             crate::test_support::published_membership(membership.clone()),
-            crate::test_support::clock(),
+            racer_io::Clock::host(),
         )
         .unwrap(),
     );
@@ -612,7 +612,7 @@ fn relay_fails_a_request_for_a_silent_destination_at_once() {
         },
         number: crate::model::PageNumber(0),
     };
-    let now = uring_runtime::environment::now();
+    let now = racer_io::Clock::host().now();
     assert!(health.silence_timed_out(&destination, page, now, 1));
     assert_eq!(health.due_pings(now, 1).len(), 1);
     assert!(health.ping_outcome(&destination, Some(false), now));
@@ -793,7 +793,7 @@ fn refused_socket_opens_only_immediate_link_and_selects_bounded_alternate() {
         )
         .unwrap(),
     );
-    let health = Rc::new(LinkHealth::new(36, crate::test_support::clock()));
+    let health = Rc::new(LinkHealth::new(36, racer_io::Clock::host()));
     let paths = Rc::new(Paths::new(health.clone(), 4));
     let requester = Requester::new(
         paths.clone(),
@@ -803,7 +803,7 @@ fn refused_socket_opens_only_immediate_link_and_selects_bounded_alternate() {
             PeerNetwork::new(
                 NodeId(A.into()),
                 crate::test_support::published_membership(members.clone()),
-                crate::test_support::clock(),
+                racer_io::Clock::host(),
             )
             .unwrap(),
         ),
@@ -976,7 +976,7 @@ fn signed_tcp_case(case: &str) {
         PeerNetwork::new(
             NodeId(A.into()),
             crate::test_support::published_membership(membership.clone()),
-            crate::test_support::clock(),
+            racer_io::Clock::host(),
         )
         .unwrap(),
     );
@@ -984,7 +984,7 @@ fn signed_tcp_case(case: &str) {
         PeerNetwork::new(
             NodeId(C.into()),
             crate::test_support::published_membership(membership.clone()),
-            crate::test_support::clock(),
+            racer_io::Clock::host(),
         )
         .unwrap(),
     );
@@ -993,7 +993,7 @@ fn signed_tcp_case(case: &str) {
     let adaptive = crate::peer::AdaptivePeers::new(
         Default::default(),
         metrics.clone(),
-        crate::test_support::clock(),
+        racer_io::Clock::host(),
     )
     .unwrap();
     let paths =
@@ -1059,7 +1059,7 @@ fn signed_tcp_case(case: &str) {
         );
         return;
     }
-    let listener_scope = RequestScope::new(
+    let listener_scope = RequestScope::host(
         RequestId([0; 16]),
         scope.deadline.0 + Duration::from_secs(60),
     )
@@ -1168,7 +1168,7 @@ fn incoming_header_timeout_closes_silent_partial_and_idle_keepalive_peers() {
                     Arc::new(controlplane::Published::new(
                         crate::control::Snapshot::retention(2),
                     )),
-                    crate::test_support::clock(),
+                    racer_io::Clock::host(),
                 )
                 .unwrap(),
             ),
@@ -1184,7 +1184,7 @@ fn incoming_header_timeout_closes_silent_partial_and_idle_keepalive_peers() {
                     Arc::new(controlplane::Published::new(
                         crate::control::Snapshot::retention(2),
                     )),
-                    crate::test_support::clock(),
+                    racer_io::Clock::host(),
                 )
                 .unwrap(),
             ),
@@ -1205,7 +1205,7 @@ fn incoming_header_timeout_closes_silent_partial_and_idle_keepalive_peers() {
         } else {
             Duration::from_millis(30)
         });
-        let scope = RequestScope::new(
+        let scope = RequestScope::host(
             RequestId([7; 16]),
             Instant::now()
                 + if case == "listener" {
@@ -1425,7 +1425,7 @@ fn real_http_ciphertext_fragmentation_pool_reuse_and_truncation() {
         nodes: vec![NodeId(A.into()), NodeId(C.into())],
     };
     let scope =
-        RequestScope::new(RequestId([7; 16]), Instant::now() + Duration::from_secs(30)).unwrap();
+        RequestScope::host(RequestId([7; 16]), Instant::now() + Duration::from_secs(30)).unwrap();
     let server = async {
         use racer_io::ring::IoBuffer;
         let fd = reactor
@@ -1554,7 +1554,7 @@ fn outbound_lease_routes_without_registry_and_rejects_non_neighbors() {
         Arc::new(controlplane::Published::new(
             crate::control::Snapshot::retention(2),
         )),
-        crate::test_support::clock(),
+        racer_io::Clock::host(),
     )
     .unwrap();
     assert!(matches!(
@@ -1667,7 +1667,7 @@ mod established_sessions {
                 PeerNetwork::new(
                     NodeId(C.into()),
                     crate::test_support::published_membership(membership),
-                    crate::test_support::clock(),
+                    racer_io::Clock::host(),
                 )
                 .unwrap(),
             );
@@ -1696,7 +1696,7 @@ mod established_sessions {
                 server,
                 signers,
                 calls,
-                scope: RequestScope::new(
+                scope: RequestScope::host(
                     RequestId([7; 16]),
                     Instant::now() + Duration::from_secs(30),
                 )
@@ -1860,7 +1860,7 @@ mod established_sessions {
             0
         );
         drop(socket);
-        let scope = RequestScope::new(f.scope.request, f.scope.deadline.0).unwrap();
+        let scope = RequestScope::host(f.scope.request, f.scope.deadline.0).unwrap();
         let mut sending = f.io.send_head(a, f.frame(true), &scope);
         let mut cx = Context::from_waker(futures::task::noop_waker_ref());
         assert!(sending.as_mut().poll(&mut cx).is_pending());
@@ -2012,7 +2012,7 @@ fn hot_page_shedding(mate: bool) {
         PeerNetwork::new(
             NodeId(C.into()),
             crate::test_support::published_membership(membership.clone()),
-            crate::test_support::clock(),
+            racer_io::Clock::host(),
         )
         .unwrap(),
     );

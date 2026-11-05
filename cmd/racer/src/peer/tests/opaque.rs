@@ -436,7 +436,7 @@ mod safety {
         let finished = Cell::new(false);
         let deadline = Cell::new(None);
         let abandoned = Cell::new(None);
-        let relay_scope = RequestScope::new(f.scope.request, f.scope.deadline.0).unwrap();
+        let relay_scope = RequestScope::host(f.scope.request, f.scope.deadline.0).unwrap();
         let shutdown = f.requester_socket.try_clone().unwrap();
         let destination = async {
             let fd = f.reactors[2]
@@ -631,7 +631,7 @@ mod safety {
                 .borrow_mut()
                 .push(PageCryptoEngine::new(CryptoRuntime {
                     port,
-                    ctx: crate::test_support::ctx(),
+                    ctx: racer_io::WorkerCtx::host(),
                 }));
         }
         let poll_crypto = || {
@@ -1146,7 +1146,7 @@ impl RelayFixture {
             PeerNetwork::new(
                 NodeId(B.into()),
                 crate::test_support::published_membership(membership),
-                crate::test_support::clock(),
+                racer_io::Clock::host(),
             )
             .unwrap(),
         );
@@ -1188,8 +1188,9 @@ impl RelayFixture {
         )
         .with_transfers(transfers)
         .with_opaque_relay(!materialized);
-        let scope = RequestScope::new(RequestId([1; 16]), Instant::now() + Duration::from_secs(25))
-            .unwrap();
+        let scope =
+            RequestScope::host(RequestId([1; 16]), Instant::now() + Duration::from_secs(25))
+                .unwrap();
         let plaintext: Vec<_> = (0..crate::model::PAGE_BYTES as usize)
             .map(|i| (i % 251) as u8)
             .collect();

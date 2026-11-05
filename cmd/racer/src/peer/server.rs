@@ -1152,7 +1152,7 @@ mod tests {
         future.poll(&mut Context::from_waker(futures::task::noop_waker_ref()))
     }
     fn listener_scope() -> RequestScope {
-        RequestScope::new(RequestId([6; 16]), Instant::now() + Duration::from_secs(60)).unwrap()
+        RequestScope::host(RequestId([6; 16]), Instant::now() + Duration::from_secs(60)).unwrap()
     }
     fn assert_counts(counts: &AcceptCounts, dropped: usize, consumed: usize) {
         assert_eq!(counts.created.get(), 1);
@@ -1179,7 +1179,7 @@ mod tests {
                 let io =
                     crate::http::new_io(reactor.clone(), Codec::new(4096), admission.clone(), 4096);
                 let parent = listener_scope();
-                let exchange = RequestScope::new(
+                let exchange = RequestScope::host(
                     RequestId([7; 16]),
                     parent.deadline.0 - Duration::from_secs(10),
                 )
@@ -1292,7 +1292,7 @@ mod tests {
                 .unwrap();
             let received = drive(&reactor, io.receive_head(connection, &parent)).unwrap();
             connection = received.connection;
-            let exchange = RequestScope::new(RequestId([7; 16]), parent.deadline.0).unwrap();
+            let exchange = RequestScope::host(RequestId([7; 16]), parent.deadline.0).unwrap();
             let mut pending_once = true;
             let mut signed = Some(crate::peer::tests::signed_fixture_response());
             let signature = signed
@@ -1557,7 +1557,7 @@ mod tests {
         let clock = Clock::default();
         let timeout = Duration::from_secs(10);
         let listener =
-            RequestScope::new(RequestId([9; 16]), clock.now() + Duration::from_secs(60)).unwrap();
+            RequestScope::host(RequestId([9; 16]), clock.now() + Duration::from_secs(60)).unwrap();
         let first = header_scope(&listener, timeout, clock.now()).unwrap();
         assert_eq!(first.request, listener.request);
         assert_eq!(first.deadline.0, clock.now() + timeout);
@@ -1579,7 +1579,7 @@ mod tests {
     fn header_budget_never_extends_listener_deadline_and_rejects_overflow() {
         let clock = Clock::default();
         let listener =
-            RequestScope::new(RequestId([8; 16]), clock.now() + Duration::from_secs(1)).unwrap();
+            RequestScope::host(RequestId([8; 16]), clock.now() + Duration::from_secs(1)).unwrap();
         let header = header_scope(&listener, Duration::from_secs(30), clock.now()).unwrap();
         assert_eq!(header.deadline.0, listener.deadline.0);
         clock.advance(Duration::from_secs(1)).unwrap();
