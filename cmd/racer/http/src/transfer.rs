@@ -129,7 +129,7 @@ pub mod delivery {
         O: DirectOwner<C>,
         H: Observer<C>,
     {
-        let mut stalled_at = uring_runtime::environment::now();
+        let mut stalled_at = reactor.ctx().clock.now();
         let mut budget = 0;
         let mut calls = 0;
         while !owner.bytes().is_empty() {
@@ -165,7 +165,7 @@ pub mod delivery {
             observer.direct_bytes(sent);
             owner.advance(sent);
             observer.delivered_bytes(sent);
-            stalled_at = uring_runtime::environment::now();
+            stalled_at = reactor.ctx().clock.now();
             budget += sent;
             calls += 1;
             if (budget >= TURN_BYTES || calls >= TURN_CALLS) && !owner.bytes().is_empty() {
@@ -194,7 +194,7 @@ pub mod delivery {
         O: Owner<C>,
         H: Observer<C>,
     {
-        let mut stalled_at = uring_runtime::environment::now();
+        let mut stalled_at = reactor.ctx().clock.now();
         let mut copying = false;
         let mut budget = 0;
         let mut calls = 0;
@@ -275,7 +275,7 @@ pub mod delivery {
             }
             owner.advance(sent);
             observer.delivered_bytes(sent);
-            stalled_at = uring_runtime::environment::now();
+            stalled_at = reactor.ctx().clock.now();
             budget += sent;
             calls += 1;
             if (budget >= TURN_BYTES || calls >= TURN_CALLS) && owner.remaining() != 0 {

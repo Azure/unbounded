@@ -1382,6 +1382,7 @@ impl<C: Context> Drop for ConnectionLease<C> {
         let Some(state) = target.state.upgrade() else {
             return;
         };
+        let now = state.borrow().clock.now();
         let candidate = if self.reusable && Rc::strong_count(&self.fd) == 1 {
             self.reservation
                 .take()
@@ -1390,7 +1391,7 @@ impl<C: Context> Drop for ConnectionLease<C> {
                     state: policy.expect("live state"),
                     fd: self.fd.clone(),
                     reservation,
-                    since: uring_runtime::environment::now(),
+                    since: now,
                     kernel_tls: self.kernel_tls.take(),
                     relay: self.relay.take(),
                 })
@@ -1422,19 +1423,22 @@ impl<C: Context> Drop for ConnectionLease<C> {
 impl<C: Context> HttpPool<C> {
     /// Create an empty pool without spawning maintenance tasks.
     pub fn new(reactor: Rc<C::Reactor>, context: Rc<C>, config: PoolConfig) -> Self {
+        let clock = reactor.ctx().clock.clone();
+        let now = clock.now();
         Self {
             reactor,
             context,
             config,
             state: Rc::new(RefCell::new(PoolState {
+                clock,
                 entries: BTreeMap::new(),
                 expiry_cursor: None,
-                next_expiry: uring_runtime::environment::now(),
+                next_expiry: now,
                 next_generation: 0,
                 closed: false,
                 waiting: VecDeque::new(),
                 poll_cursor: 0,
-                next_waiter_poll: uring_runtime::environment::now(),
+                next_waiter_poll: now,
             })),
         }
     }
@@ -1573,7 +1577,7 @@ impl<C: Context> HttpPool<C> {
     pub fn poll_waiters(&self, budget: usize) {
         self.expire_idle_budgeted(budget);
         let mut state = self.state.borrow_mut();
-        let now = uring_runtime::environment::now();
+        let now = state.clock.now();
         if budget == 0 || state.waiting.is_empty() || now < state.next_waiter_poll {
             return;
         }
@@ -1646,7 +1650,7 @@ impl<C: Context> HttpPool<C> {
                 .entries
                 .get_mut(endpoint)
                 .ok_or(racer_io::Error::Unavailable)?;
-            let now = uring_runtime::environment::now();
+            let now = self.reactor.ctx().clock.now();
             entry.expire_idle(now, self.config.idle_timeout, &mut garbage);
             if entry.active >= endpoint.capacity(&self.config) {
                 return Err(racer_io::Error::Overloaded.into());
@@ -1865,7 +1869,7 @@ impl<C: Context> HttpPool<C> {
     /// Scan at most `budget` endpoints, dropping expired owners outside pool borrows.
     fn expire_idle_budgeted(&self, budget: usize) {
         use std::ops::Bound::{Excluded, Unbounded};
-        let now = uring_runtime::environment::now();
+        let now = self.reactor.ctx().clock.now();
         let mut garbage = Vec::new();
         {
             let mut state = self.state.borrow_mut();
@@ -1935,7 +1939,7 @@ impl<C: Context> HttpPool<C> {
     /// Force an unthrottled full endpoint expiry pass for caller tests.
     #[cfg(feature = "test-util")]
     pub fn expire_idle(&self) {
-        self.state.borrow_mut().next_expiry = uring_runtime::environment::now();
+        self.state.borrow_mut().next_expiry = self.reactor.ctx().clock.now();
         self.expire_idle_budgeted(usize::MAX);
     }
 
@@ -2012,6 +2016,9 @@ impl<C: Context> Entry<C> {
 
 /// Shared endpoint table, maintenance cursors, and bounded waiting queue.
 struct PoolState<C: Context> {
+    /// Clock of the pool's reactor, also read when leases return idle owners.
+    clock: racer_io::Clock,
+
     entries: BTreeMap<C::Endpoint, Entry<C>>,
 
     expiry_cursor: Option<C::Endpoint>,

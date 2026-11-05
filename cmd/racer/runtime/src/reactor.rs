@@ -69,6 +69,14 @@ pub struct Reactor<S: Scope, B: Budget> {
 
     environment: super::environment::Environment,
 
+    /// Worker clock and entropy for code driven by this reactor.
+    // MIGRATION: bridged from the construction-time thread environment until
+    // workers receive a WorkerCtx explicitly.
+    ctx: racer_io::WorkerCtx,
+
+    /// Test support: a context selected after construction.
+    ctx_override: std::cell::OnceCell<racer_io::WorkerCtx>,
+
     budget: B,
 
     queue_entries: usize,
@@ -989,11 +997,28 @@ impl<B: 'static, L: 'static> InFlight<B, L> {
 }
 
 impl<S: Scope, Q: Budget> Reactor<S, Q> {
+    /// Worker clock and entropy for code driven by this reactor.
+    pub fn ctx(&self) -> &racer_io::WorkerCtx {
+        self.ctx_override.get().unwrap_or(&self.ctx)
+    }
+
+    /// Test support: replace the construction-time context once, for tests
+    /// that switch a running worker from host time to a simulated clock.
+    #[doc(hidden)]
+    pub fn override_ctx_for_test(&self, ctx: racer_io::WorkerCtx) {
+        assert!(
+            self.ctx_override.set(ctx).is_ok(),
+            "context already overridden"
+        );
+    }
+
     /// Create an uninitialized reactor; kernel resources are acquired by [`Self::init`].
     pub fn new(queue_entries: usize, budget: Q) -> Self {
         Self {
             rejection_observer: None,
             environment: super::environment::Environment::current(),
+            ctx: super::environment::Environment::current().worker_ctx(),
+            ctx_override: std::cell::OnceCell::new(),
             budget,
             queue_entries,
             ordinary: Rc::new(Cell::new(0)),

@@ -28,7 +28,7 @@ use std::{
     time::{Duration, Instant},
 };
 use uring_runtime::{
-    Budget, Operation, environment,
+    Budget, Operation,
     reactor::{Reactor, SUBMISSION_BYTES, SubmissionCapacity, descriptor::Descriptor},
 };
 use zeroize::{Zeroize, Zeroizing};
@@ -375,7 +375,10 @@ impl Server {
         parent: &'a S,
     ) -> Operation<'a, (), S::Error> {
         Box::pin(async move {
-            let deadline = environment::now()
+            let deadline = reactor
+                .ctx()
+                .clock
+                .now()
                 .checked_add(CONNECTION_TIMEOUT)
                 .ok_or(Error::InvalidInput)?;
             let scope = parent.with_deadline(deadline);
@@ -488,7 +491,10 @@ impl Server {
                         let _cancel = CancelBinary(guard.clone());
                         buffer.binary = Some(guard.clone());
                         scope = parent.with_deadline(
-                            environment::now()
+                            reactor
+                                .ctx()
+                                .clock
+                                .now()
                                 .checked_add(response.duration + extension)
                                 .ok_or(Error::InvalidInput)?,
                         );
@@ -793,6 +799,7 @@ mod tests {
     use super::*;
     use std::cell::RefCell;
     use std::os::fd::OwnedFd;
+    use uring_runtime::environment;
 
     struct Producer {
         fd: OwnedFd,
