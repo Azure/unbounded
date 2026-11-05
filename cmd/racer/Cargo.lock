@@ -1045,7 +1045,6 @@ dependencies = [
  "futures",
  "libc",
  "racer-io",
- "serde_json",
 ]
 
 [[package]]

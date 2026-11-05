@@ -1081,7 +1081,7 @@ pub(crate) type RegisterWake = Arc<dyn Fn() + Send + Sync>;
 /// helper thread while the owner keeps serving. Only that one call leaves
 /// the owner thread; the result becomes a [`NativeRegion`] on the owner in
 /// [`Self::finish`]. Under the simulation the call runs inline (the
-/// simulation is single-threaded) and [`crate::Simulation::hold_registrations`]
+/// simulation is single-threaded) and `Simulation::hold_registrations`
 /// keeps it pending.
 ///
 /// Dropped unfinished, it frees a finished registration, but leaks the

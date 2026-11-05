@@ -6,7 +6,8 @@
 //! [`node`] returns one [`Client`] per I/O worker and one [`OwnerPort`].
 //! Build the [`Owner`] from the port on the native thread and run it with
 //! [`crate::OwnerRole`] (or poll it with [`Owner::poll_budgeted`]). Every
-//! libibverbs call runs on that thread.
+//! libibverbs call runs on that thread, except pool registrations, which run
+//! on short-lived helper threads (`ffi::Registering`).
 //! Clients queue commands and get results through [`Op`]s.
 
 use std::{

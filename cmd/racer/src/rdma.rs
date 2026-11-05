@@ -19,17 +19,19 @@ use racer_control_wire::MembershipVersion;
 use racer_control_wire::NodeId;
 use racer_control_wire::RailId;
 use racer_control_wire::RailMapping;
+#[cfg(test)]
 use rdma_verbs::PortInfo;
-use rdma_verbs::discovery::Binding;
 use sha2::Digest;
 use sha2::Sha256;
 use std::cell::Cell;
 use std::cell::RefCell;
 use std::future::poll_fn;
+#[cfg(test)]
 use std::path::Path;
 use std::rc::Rc;
 use std::task::Poll;
 
+mod discovery;
 pub(crate) mod link_setup;
 pub(crate) mod links;
 mod retry;
@@ -103,145 +105,13 @@ fn validate_native_page_size(page_size: libc::c_long) -> Result<()> {
         Err(Error::Unavailable)
     }
 }
-/// Match authenticated physical bindings against live eligible verbs ports.
-pub fn match_publication(
-    publication: &[RailMapping],
-    discovered: &[PortInfo],
-) -> Result<Vec<(RailMapping, usize)>> {
-    Ok(rdma_verbs::discovery::match_ports(
-        &publication.iter().map(binding).collect::<Vec<_>>(),
-        discovered,
-    )?
-    .into_iter()
-    .map(|(port, index)| (mapping(port), index))
-    .collect())
-}
-
-// Pre-enrollment inventory and deterministic per-worker physical NIC selection.
-
-/// Shared durable-journal bound for admission, restoration, and enrollment I/O.
-pub use rdma_verbs::discovery::MAX_JOURNAL_BYTES;
-
-/// One process-wide inventory, shared by enrollment and every worker. Withdrawn
-/// ports keep their rail reservation: neither outages nor GID changes renumber
-/// surviving ports. Enrollment persists reservations across process restarts.
-#[derive(Default)]
-pub struct Inventory(rdma_verbs::discovery::Inventory);
-
-/// Local discovery snapshot translated into Racer publication types.
-#[derive(Clone, Default)]
-pub struct Snapshot {
-    pub generation: u64,
-
-    pub nics: Vec<RailMapping>,
-}
-
-impl Inventory {
-    pub fn generation(&self) -> u64 {
-        self.0.generation()
-    }
-    /// Read the shared physical inventory using Racer's publication types.
-    pub fn snapshot(&self) -> Result<Snapshot> {
-        Ok(snapshot(self.0.snapshot()?))
-    }
-
-    /// Optional transport discovery failures withdraw RDMA, not HTTP service.
-    pub fn refresh(&self) -> Result<Snapshot> {
-        self.update(inventory())
-    }
-
-    /// Publish discovered ports while preserving their durable physical labels.
-    pub fn update(&self, nics: Vec<RailMapping>) -> Result<Snapshot> {
-        Ok(snapshot(self.0.update(nics.iter().map(binding).collect())?))
-    }
-
-    /// Keep the existing enrollment journal representation unchanged.
-    pub fn reservations(&self) -> Result<Vec<u8>> {
-        self.0.reservations().map_err(Into::into)
-    }
-
-    /// Restore before issuance, never discard a corrupt journal and renumber.
-    pub fn restore(&self, bytes: &[u8]) -> Result<()> {
-        self.0.restore(bytes).map_err(|error| match error {
-            rdma_verbs::Error::InvalidRequest => Error::CorruptRecord,
-            other => other.into(),
-        })
-    }
-}
-
-/// Erase application rail identity before passing physical bindings to verbs.
-fn binding(nic: &RailMapping) -> Binding {
-    Binding {
-        rail: nic.rail.0,
-        device: nic.device.clone(),
-        port: nic.port,
-        gid: nic.gid,
-        numa_node: nic.numa_node,
-    }
-}
-
-/// Restore application identity after physical discovery, without authorizing it.
-fn mapping(nic: Binding) -> RailMapping {
-    RailMapping {
-        rail: RailId(nic.rail),
-        device: nic.device,
-        port: nic.port,
-        gid: nic.gid,
-        numa_node: nic.numa_node,
-    }
-}
-
-/// Convert the physical snapshot at the application boundary.
-fn snapshot(snapshot: rdma_verbs::discovery::Snapshot) -> Snapshot {
-    Snapshot {
-        generation: snapshot.generation,
-        nics: snapshot.nics.into_iter().map(mapping).collect(),
-    }
-}
-
-/// Discovery failures are optional-transport failures, never HTTP startup failures.
-pub fn inventory() -> Vec<RailMapping> {
-    inventory_at(
-        rdma_verbs::inventory().unwrap_or_default(),
-        Path::new("/sys/class/infiniband"),
-    )
-}
-
-fn inventory_at(ports: Vec<PortInfo>, root: &Path) -> Vec<RailMapping> {
-    rdma_verbs::discovery::inventory_at(ports, root)
-        .into_iter()
-        .take(64)
-        .enumerate()
-        .map(|(i, p)| RailMapping {
-            device: p.device,
-            port: p.port,
-            rail: RailId(i as u16),
-            gid: Some(p.gid),
-            numa_node: p.numa_node,
-        })
-        .collect()
-}
-
-/// Select at most one device per rail. Explicit NUMA overrides detected locality;
-/// prefer local, then unknown, then remote, spreading equal candidates by worker.
-pub fn select_worker(
-    published: &[RailMapping],
-    discovered: &[RailMapping],
-    worker: usize,
-    numa: Option<usize>,
-    capacity: usize,
-) -> Vec<RailMapping> {
-    rdma_verbs::discovery::select_worker(
-        &published.iter().map(binding).collect::<Vec<_>>(),
-        &discovered.iter().map(binding).collect::<Vec<_>>(),
-        worker,
-        numa,
-        capacity,
-    )
-    .into_iter()
-    .map(mapping)
-    .collect()
-}
+// Pre-enrollment inventory, the durable rail journal, and per-worker NUMA
+// selection live in `discovery`; `rdma_verbs` only enumerates ports.
+#[cfg(test)]
+use discovery::inventory_at;
+pub use discovery::{
+    Inventory, MAX_JOURNAL_BYTES, Snapshot, inventory, match_publication, select_worker,
+};
 
 // RDMA requires compatible authenticated mappings; discovery can only veto.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

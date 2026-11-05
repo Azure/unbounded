@@ -24,6 +24,9 @@ The main source files are:
 - `src/app/native.rs`: node ownership, activation, and rail publication.
 - `src/rdma/links.rs`: worker-facing link and page operations.
 - `src/rdma/link_setup.rs`: setup encoding, binding, link id, and tie-break.
+- `src/rdma/setup.rs`: the per-key setup state machine (`SetupTable`).
+- `src/rdma/discovery.rs`: rail journal, publication matching, and NUMA-aware
+  selection over `RailMapping` (`rdma_verbs` only enumerates ports).
 - `peer-wire/src/link.rs`: signed link request and response.
 - `src/peer/transport.rs`: background setup and per-page transport.
 - `src/memory.rs`, `src/read/fill.rs`, and `src/store.rs`: page retention.
@@ -37,7 +40,9 @@ NUMA node. The thread counts against `max_threads`. It runs
 `rdma_verbs::OwnerRole`, which parks on an eventfd (commands, closes, returned
 buffers, stop) and on `Owner::poll_fds` (completion and connection manager
 channels) with a timeout from `Owner::next_wake`; an idle owner has no periodic
-tick. The verbs adapter spawns no threads: in registration mode the RDMA
+tick. Page and device pool registrations run on short-lived helper threads
+so the owner keeps serving. Otherwise the verbs adapter spawns no threads: in
+registration mode the RDMA
 connection manager is an event-driven state machine the owner advances on each
 poll. The owner thread starts before the worker group and stops after it
 joins; stopping waits until every page buffer has returned, printing a
@@ -45,9 +50,12 @@ diagnostic every `DRAIN_REPORT`, and never frees early. Only this owner posts
 verbs operations.
 
 Each worker has a `Links` facade and a bounded command queue. Results return
-through one-shot `Op` cells. The owner publishes link snapshots; a worker that
-cannot read a snapshot treats the link as unavailable for that request.
-`LinkNode` holds the shared rail publication and setup reservations.
+through one-shot `Op` cells. The owner publishes link snapshots by swapping
+an `Arc` with a generation counter; a worker read never reports `Idle`
+because of a concurrent publish, though it may lag the owner. A sender
+releases a peer's grant by link id, which the owner resolves, so a lagging
+snapshot never skips a `Release`. `LinkNode` holds the shared rail
+publication and the setup state machine.
 
 Activation selects rails once for the node, using the owner's NUMA location.
 The registered-memory budget is split across the funded devices and rounded
@@ -111,10 +119,17 @@ setup uses byte ordering of NodeIds: the lower NodeId's offer wins. The other
 offer gets `409`. Setup is limited to one accepted attempt per peer and rail
 per second; excess attempts get `429`. Unavailable native service gets `503`.
 
-Per-key reservation guards prevent two workers from opening the same link.
-Dropping an open or setup attempt clears only its own reservation and breaks
-only its own epoch, including when the owner completed an open that the
-caller never read. An old guard cannot remove a newer setup attempt.
+One `SetupTable` per node holds each key's setup state: idle, `Opening`
+(a token names the attempt while the owner opens the link), or `Exchanging`
+(the owner's epoch, during the signed HTTP exchange). Only an idle key may
+begin, so two workers never open the same link. The responder's admission
+applies the tie-break against an attempt of ours, then the rate limit, and
+an accepted offer supersedes our attempt. Every transition names its token
+or epoch, so dropping an open or setup attempt clears only its own state and
+breaks only its own epoch, including when the owner completed an open that
+the caller never read. An old guard cannot remove a newer attempt. The
+responder accepts through the owner, which creates the QP for the link id
+before the HTTP reply goes out.
 
 ## Peer wire v2: certificate chains per session
 

@@ -65,7 +65,8 @@ Registration mode needs no ODP. Its logic lives in `src/registration.rs`:
 Each registration-mode device has a nonblocking connection manager event
 channel and a listener on its IPv4 address (port `RACER_RDMA_CM_PORT`, else
 18515). The endpoint's `qpn` is a random 24-bit token that names the QP in the
-setup exchange and the connection request. The adapter spawns no threads;
+setup exchange and the connection request. The adapter spawns no threads
+for connection management;
 `NativeDevice::progress` reads events without blocking, and the owner calls it
 on every poll (a QP still connecting also calls it from its own progress).
 
@@ -103,7 +104,7 @@ without waiting on the fds still works.
 | `src/link.rs` | Per-QP grants, writes, credits, timers, and completion handling |
 | `src/pool.rs` | Registered receive buffers and ownership states |
 | `src/channel.rs` | Bounded worker command queues and one-shot results |
-| `src/discovery.rs` | Stable port identities, port journal, and NUMA-aware worker selection |
+| `src/discovery.rs` | Raw port enumeration helpers: device name checks and sysfs PCI and NUMA normalization. Rail labels, the journal, and selection are Racer policy in `src/rdma/discovery.rs` |
 | `src/control.rs` | Fixed-size in-band control codec |
 | `src/ffi.rs` | Native resource ownership, mode choice, the work request ledger, bounds checks, and completion validation |
 | `src/registration.rs` | Registration mode: per-grant and per-write registrations, connection manager state machine |
@@ -118,6 +119,25 @@ without waiting on the fds still works.
 `Owner::new` runs on the native thread and captures its environment.
 `OwnerRole::new` wraps it as a `racer_io::exec::Role` for a dedicated thread;
 `OwnerStop::stop` closes it, and the role finishes once the owner drained.
+
+Activation and `attach_device` pin and register large buffers, which can
+block for a long time. The owner runs only that native call (`ibv_reg_mr` of
+a page pool, `ibv_reg_dmabuf_mr` of a device pool) on a short-lived helper
+thread (`Registering` in `src/ffi.rs`) and keeps serving commands and
+completions; the helper wakes the owner when done, and the op resolves then.
+Shutdown waits for registrations in flight. If the owner is dropped while a
+helper runs, the device, dma-buf owner, and charge leak (the charge is
+quarantined), so nothing the helper may still use is freed. The simulation
+runs registrations inline, and `Simulation::hold_registrations` keeps them
+pending.
+
+`Client::link` reads the owner's published link table. The owner builds a
+new table and swaps an `Arc` under a mutex held only for the swap, bumping a
+generation counter; a worker reuses its cached table while the generation is
+unchanged. A read never reports `Idle` because of a concurrent publish, and a
+publish never fails, so the owner needs no retry timer for it.
+`Client::release_link` names the link by handshake id so the owner, not a
+possibly stale snapshot, resolves it.
 Clients are `Send`; they contain shared handles, not native resources.
 
 Each worker has a FIFO command queue with capacity 64. The owner drains them
@@ -196,8 +216,9 @@ A rail can also hold one device pool: caller memory that the NIC reaches
 through a Linux dma-buf, such as GPU memory. The caller passes an owner that
 implements `DmabufMemory` (descriptor, offset, length, and the NIC address of
 the first byte) to `Client::attach_device`, once per rail per round, after
-activation, in window mode only. The owner thread registers it with `ibv_reg_dmabuf_mr`
-(`LOCAL_WRITE | MW_BIND`) and splits it into buffers of the node's buffer
+activation, in window mode only. A short-lived helper thread registers it with
+`ibv_reg_dmabuf_mr` (`LOCAL_WRITE | MW_BIND`) while the owner keeps serving;
+the owner then splits it into buffers of the node's buffer
 length. The crate does not depend on any GPU library.
 
 `Client::grant_device` grants a device buffer. It uses the same states, the

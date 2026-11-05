@@ -1,12 +1,15 @@
 //! Persistent RDMA links for a two-thread runtime: an I/O thread and a
 //! native thread.
 //!
-//! All RDMA (libibverbs) calls run on the native thread. The I/O thread never
-//! touches RDMA. It talks to the native thread through bounded command queues.
+//! All RDMA (libibverbs) calls run on the native thread, except pool memory
+//! registration (see below). The I/O thread never touches RDMA. It talks to
+//! the native thread through bounded command queues.
 //!
-//! This crate spawns no threads and runs no executor, and neither does its C
-//! adapter: the RDMA connection manager is an event-driven state machine the
-//! owner advances when polled. Time and randomness come from the explicit
+//! This crate runs no executor. Its only threads are short-lived helpers
+//! that pin and register page and device pools (`ibv_reg_mr`,
+//! `ibv_reg_dmabuf_mr`) so the owner keeps serving meanwhile; the RDMA
+//! connection manager is an event-driven state machine the owner advances
+//! when polled. Time and randomness come from the explicit
 //! `racer_io::WorkerCtx` passed to `Owner::new`.
 //!
 //! # Basics
@@ -105,7 +108,8 @@ pub mod discovery;
 /// List RDMA ports on this host. Opens and closes devices on this thread.
 ///
 /// Returns [`Error::Unavailable`] with no RDMA backend. Use
-/// [`discovery::inventory_at`] to fill in NUMA info.
+/// [`discovery::inventory_at`] to fill in NUMA info. Rail labels and port
+/// selection are the caller's policy.
 pub fn inventory() -> Result<Vec<PortInfo>> {
     Ok(ffi::discover()?
         .iter()
