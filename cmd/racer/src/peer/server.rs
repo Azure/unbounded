@@ -512,10 +512,34 @@ impl PeerServer {
                     .admit_native(&request, control, &request_scope)?,
                 _ => None,
             };
-            let request = self
+            let request = match self
                 .forwarding
                 .verify_request_async(request, &request_scope)
-                .await?;
+                .await
+            {
+                Ok(request) => request,
+                // Shed before verification (for example, the crypto queue is full): answer the
+                // unsigned overload head, which costs no key work and carries nothing from the
+                // request, so the sender asks elsewhere instead of reading a dead link.
+                Err(error)
+                    if admitted.is_none()
+                        && racer_core::route::unverified_failure(error.fault())
+                            == racer_core::route::UnverifiedFailure::Overloaded =>
+                {
+                    let mut connection = self
+                        .io
+                        .send_head(
+                            received.connection,
+                            peer_wire::overloaded_head(),
+                            &request_scope,
+                        )
+                        .await?
+                        .connection;
+                    connection.finish_exchange()?;
+                    return Ok(connection);
+                }
+                Err(error) => return Err(error),
+            };
             let membership = self
                 .relay
                 .network

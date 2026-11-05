@@ -1631,6 +1631,9 @@ mod established_sessions {
     }
     impl Fixture {
         fn new() -> Self {
+            Self::with_forwarding(|signers| Forwarding::new(signers[2].clone()))
+        }
+        fn with_forwarding(forwarding: impl FnOnce(&[Rc<Signatures>]) -> Forwarding) -> Self {
             let admission = Rc::new(flow_control::Quotas::new(AdmissionPolicy::new(
                 crate::test_support::cluster::config(false).limits,
             )));
@@ -1643,7 +1646,7 @@ mod established_sessions {
                 crate::model::PAGE_BYTES + 16,
             ));
             let signers = signers();
-            let forwarding = Rc::new(Forwarding::new(signers[2].clone()));
+            let forwarding = Rc::new(forwarding(&signers));
             let calls = Rc::new(Cell::new(0));
             let service = Rc::new(CountedService(calls.clone()));
             let membership = Arc::new(
@@ -1759,6 +1762,54 @@ mod established_sessions {
             })
             .unwrap()
         }
+    }
+
+    #[test]
+    fn crypto_queue_full_answers_unsigned_overload_before_verification() {
+        use std::num::NonZeroUsize;
+        let (crypto_io, _port) =
+            crate::security::pair(crate::model::WorkerId(0), 1, NonZeroUsize::new(1).unwrap());
+        let client = Rc::new(crate::security::CryptoClient::new(crypto_io));
+        let f = Fixture::with_forwarding(|signers| {
+            Forwarding::with_crypto(signers[2].clone(), client.clone())
+        });
+        // Fill the one port slot and the one admission waiter; nothing completes them.
+        let forwarding = Forwarding::with_crypto(f.signers[2].clone(), client.clone());
+        let signed = |n| {
+            Forwarding::new(f.signers[0].clone())
+                .sign_request(request(&f.admission, n))
+                .unwrap()
+                .0
+        };
+        let mut cx = Context::from_waker(futures::task::noop_waker_ref());
+        let mut held = Vec::new();
+        for n in 2..4 {
+            let mut verify = Box::pin(forwarding.verify_request_async(signed(n), &f.scope));
+            assert!(verify.as_mut().poll(&mut cx).is_pending());
+            held.push(verify);
+        }
+        let (a, b) = f.sockets();
+        let (response, served) = f.drive(async {
+            let client = async {
+                let a = connection::connect(
+                    &f.io,
+                    a,
+                    f.signers[0].clone(),
+                    f.signers[2].node(),
+                    &f.scope,
+                )
+                .await?;
+                f.io.exchange_head(a, f.frame(false), &f.scope).await
+            };
+            futures::join!(client, f.server.serve_connection(b, &f.scope))
+        });
+        let response = response.unwrap();
+        // The answer is the bare unsigned overload head: no envelope, no body.
+        assert!(peer_wire::is_overloaded(&response.value));
+        assert_eq!(response.connection.remaining_body(), Some(0));
+        assert!(served.is_ok(), "{:?}", served.err());
+        assert_eq!(f.calls.get(), 0, "an unverified request reached service");
+        drop(held);
     }
 
     #[test]

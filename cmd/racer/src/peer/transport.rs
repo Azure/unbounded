@@ -1388,6 +1388,12 @@ impl Transfers {
             if native.is_some() {
                 self.record_rdma_stage(Event::RdmaHeadCount, Event::RdmaHeadNs, heading);
             }
+            if peer_wire::is_overloaded(&received.value) {
+                // The next holder shed the request before verifying it
+                // (`racer_core::route::unverified_failure`): a relay signs its own `Overloaded`,
+                // a requester's walk asks its helper.
+                return Err(Error::Overloaded);
+            }
             let control = detach(&mut received.value)?;
             let relay_context = if relay.is_some() {
                 let size = received.value.headers.iter().try_fold(0usize, |n, h| {
