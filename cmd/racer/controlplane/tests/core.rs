@@ -358,14 +358,23 @@ struct Scope {
     canceled: Rc<Cell<bool>>,
 
     deadline: Instant,
+
+    /// Time source for deadline checks.
+    clock: racer_io::Clock,
 }
 
 impl Scope {
-    /// Start an uncanceled fixture scope with a five-second deadline.
+    /// Start an uncanceled host-clock scope with a five-second deadline.
     fn new() -> Self {
+        Self::on(racer_io::Clock::host())
+    }
+
+    /// Start an uncanceled scope on `clock` with a five-second deadline.
+    fn on(clock: racer_io::Clock) -> Self {
         Self {
             canceled: Rc::new(Cell::new(false)),
-            deadline: uring_runtime::environment::now() + Duration::from_secs(5),
+            deadline: clock.now() + Duration::from_secs(5),
+            clock,
         }
     }
 }
@@ -376,7 +385,7 @@ impl uring_runtime::Scope for Scope {
     fn check(&self) -> Result<(), Failure> {
         if self.canceled.get() {
             Err(racer_io::Error::Cancelled.into())
-        } else if uring_runtime::environment::now() >= self.deadline {
+        } else if self.clock.now() >= self.deadline {
             Err(racer_io::Error::DeadlineExceeded.into())
         } else {
             Ok(())
@@ -393,6 +402,7 @@ impl rest::Scope for Scope {
         Self {
             canceled: self.canceled.clone(),
             deadline: self.deadline.min(until),
+            clock: self.clock.clone(),
         }
     }
 }
@@ -1435,7 +1445,7 @@ impl Host for ClockHost {
             if let Err(error) = scope.check() {
                 return std::task::Poll::Ready(Err(error));
             }
-            if uring_runtime::environment::now() >= until {
+            if self.0.clock.now() >= until {
                 std::task::Poll::Ready(Ok(()))
             } else {
                 std::task::Poll::Pending
@@ -1475,16 +1485,17 @@ fn candidate_rejection_backoff_survives_successful_receipts_and_newer_recovers()
         future::Future as _,
         task::{Context, Poll},
     };
-    use uring_runtime::environment::{SimulationClock, now};
+    use uring_runtime::environment::SimulationClock;
     for phase in 0..3 {
         let clock = SimulationClock::new(42);
-        let _environment = clock.environment(0).enter();
+        let sim_env = clock.environment(0);
+        let _environment = sim_env.enter();
+        let sim_ctx = sim_env.worker_ctx();
+        let now = || sim_ctx.clock.now();
         let target = Installer::new();
         let script = Script::new([]);
         let mut sync = Sync::new(
-            Rc::new(ClockHost(
-                uring_runtime::environment::Environment::current().worker_ctx(),
-            )),
+            Rc::new(ClockHost(sim_ctx.clone())),
             Feed::new(Numbers, "/watch".into(), 16).unwrap(),
             script.clone(),
             target.clone(),
@@ -1499,7 +1510,7 @@ fn candidate_rejection_backoff_survives_successful_receipts_and_newer_recovers()
         sync.seed(Arc::new(1)).unwrap();
         let scope = Scope {
             deadline: now() + Duration::from_secs(100),
-            ..Scope::new()
+            ..Scope::on(sim_ctx.clock.clone())
         };
         let mut cx = Context::from_waker(futures::task::noop_waker_ref());
         for attempt in 0..6 {

@@ -149,8 +149,11 @@ fn world() -> World {
     }
 }
 
-fn now() -> Instant {
-    uring_runtime::environment::now()
+impl World {
+    /// The world's simulated monotonic time.
+    fn now(&self) -> Instant {
+        self.clock.virtual_clock().now()
+    }
 }
 
 fn ready<T>(op: &Op<T>) -> rdma_verbs::Result<T> {
@@ -244,7 +247,7 @@ fn pages_flow_both_ways_over_one_link() {
         let mut w = world();
         let (ea, eb) = link_up(&mut w);
         for round in 0..10u8 {
-            let deadline = now() + 5 * SECOND;
+            let deadline = w.now() + 5 * SECOND;
             let worker = usize::from(round % 2);
             let into_a = w.a.clients[worker].grant(TO_B, ea, [round; 16], 100, deadline);
             let into_b = w.b.clients[worker].grant(TO_A, eb, [round; 16], 200, deadline);
@@ -271,7 +274,7 @@ fn pages_flow_both_ways_over_one_link() {
         // A static source is written in place too, and no write takes a pool
         // buffer: page buffers only receive.
         static ZERO: &[u8] = b"zero";
-        let deadline = now() + 5 * SECOND;
+        let deadline = w.now() + 5 * SECOND;
         let granted = w.b.clients[0].grant(TO_A, eb, [9; 16], 4, deadline);
         let granted = wait(&mut w, &granted).unwrap();
         let source = Source::new(Arc::new(ZERO));
@@ -329,13 +332,13 @@ fn release_and_wrong_tag_fall_back_without_break() {
     profiles(|| {
         let mut w = world();
         let (ea, eb) = link_up(&mut w);
-        let deadline = now() + 5 * SECOND;
+        let deadline = w.now() + 5 * SECOND;
         let granted = w.a.clients[0].grant(TO_B, ea, [1; 16], 10, deadline);
         let granted = wait(&mut w, &granted).unwrap();
         let released = w.b.clients[0].release(TO_A, eb, granted.tag);
         assert_eq!(wait(&mut w, &released), Ok(()));
         assert!(matches!(ready(&granted.arrival), Ok(Arrival::Released)));
-        let wrong = w.b.clients[0].write(TO_A, eb, 999, bytes(vec![1]), now() + SECOND);
+        let wrong = w.b.clients[0].write(TO_A, eb, 999, bytes(vec![1]), w.now() + SECOND);
         pump(&mut w);
         assert!(pending(&wrong));
         w.clock.advance(SECOND);
@@ -362,7 +365,7 @@ fn fabric_faults_break_without_producing_pages() {
         ] {
             let mut w = world();
             let (ea, eb) = link_up(&mut w);
-            let deadline = now() + 5 * SECOND;
+            let deadline = w.now() + 5 * SECOND;
             let granted = w.a.clients[0].grant(TO_B, ea, [1; 16], 10, deadline);
             let granted = wait(&mut w, &granted).unwrap();
             // Only node b posts writes with immediate.
@@ -406,7 +409,7 @@ fn abort_and_backoff() {
     profiles(|| {
         let mut w = world();
         let (ea, _) = link_up(&mut w);
-        let granted = w.a.clients[0].grant(TO_B, ea, [1; 16], 10, now() + 5 * SECOND);
+        let granted = w.a.clients[0].grant(TO_B, ea, [1; 16], 10, w.now() + 5 * SECOND);
         let granted = wait(&mut w, &granted).unwrap();
         w.a.clients[1].break_link(TO_B, ea);
         pump(&mut w);
@@ -414,7 +417,7 @@ fn abort_and_backoff() {
         let LinkState::Backoff(first) = w.a.clients[0].link(TO_B) else {
             panic!("not backing off");
         };
-        let delay = first - now();
+        let delay = first - w.now();
         assert!(
             delay >= BACKOFF_MIN * 8 / 10 && delay <= BACKOFF_MIN * 12 / 10,
             "{delay:?}"
@@ -431,7 +434,7 @@ fn abort_and_backoff() {
         let LinkState::Backoff(second) = w.a.clients[0].link(TO_B) else {
             panic!("not backing off");
         };
-        let delay = second - now();
+        let delay = second - w.now();
         assert!(
             delay >= BACKOFF_MIN * 16 / 10 && delay <= BACKOFF_MIN * 24 / 10,
             "{delay:?}"
@@ -483,7 +486,7 @@ fn setup_rules() {
         });
         assert_eq!(wait(&mut w, &third).err(), Some(Error::Overloaded));
         // b's peer restarted: a new offer replaces the ready link.
-        let granted = w.b.clients[0].grant(TO_A, eb, [1; 16], 10, now() + 5 * SECOND);
+        let granted = w.b.clients[0].grant(TO_A, eb, [1; 16], 10, w.now() + 5 * SECOND);
         let granted = wait(&mut w, &granted).unwrap();
         let offer = Setup {
             endpoint: setup.endpoint,
@@ -632,7 +635,7 @@ fn shutdown_waits_for_pages_and_destroys() {
     profiles(|| {
         let mut w = world();
         let (ea, eb) = link_up(&mut w);
-        let deadline = now() + 5 * SECOND;
+        let deadline = w.now() + 5 * SECOND;
         let granted = w.a.clients[0].grant(TO_B, ea, [1; 16], 10, deadline);
         let granted = wait(&mut w, &granted).unwrap();
         let written = w.b.clients[0].write(TO_A, eb, granted.tag, bytes(vec![3; 10]), deadline);
@@ -693,7 +696,7 @@ fn owner_drop() {
     profiles(|| {
         let mut w = world();
         let (ea, eb) = link_up(&mut w);
-        let deadline = now() + 5 * SECOND;
+        let deadline = w.now() + 5 * SECOND;
         let granted = w.a.clients[0].grant(TO_B, ea, [1; 16], 10, deadline);
         let granted = wait(&mut w, &granted).unwrap();
         let written = w.b.clients[0].write(TO_A, eb, granted.tag, bytes(vec![4; 10]), deadline);
@@ -730,7 +733,7 @@ fn worker_drop() {
     profiles(|| {
         let mut w = world();
         let (ea, eb) = link_up(&mut w);
-        let deadline = now() + 5 * SECOND;
+        let deadline = w.now() + 5 * SECOND;
         let granted = w.a.clients[1].grant(TO_B, ea, [1; 16], 10, deadline);
         drop(w.a.clients.pop());
         let granted = wait(&mut w, &granted).unwrap();
@@ -775,7 +778,7 @@ fn with_native_drives_inner_work_holding_buffers() {
         for fence in [false, true] {
             let mut w = world();
             let (ea, eb) = link_up(&mut w);
-            let deadline = now() + 5 * SECOND;
+            let deadline = w.now() + 5 * SECOND;
             let granted = w.a.clients[0].grant(TO_B, ea, [1; 16], 4, deadline);
             let granted = wait(&mut w, &granted).unwrap();
             let written = w.b.clients[0].write(TO_A, eb, granted.tag, bytes(vec![2; 4]), deadline);
@@ -973,7 +976,7 @@ fn device_grants_land_in_dmabuf_memory() {
             Some(2)
         );
         assert_eq!(w.b.clients[0].device_buffers(7, 0, BufferState::Free), None);
-        let deadline = now() + 5 * SECOND;
+        let deadline = w.now() + 5 * SECOND;
         let mut held = Vec::new();
         for round in 0..2u8 {
             let granted = w.a.clients[0].grant_device(TO_B, ea, 0, [round; 16], 100, deadline);
@@ -1051,7 +1054,7 @@ fn device_pools_on_one_rail_are_independent() {
         assert_eq!(wait(&mut w, &attached), Ok(1));
         let attached = w.a.clients[0].attach_device(7, 1, second.clone());
         assert_eq!(wait(&mut w, &attached), Ok(1));
-        let deadline = now() + 5 * SECOND;
+        let deadline = w.now() + 5 * SECOND;
         let mut held = Vec::new();
         for (id, memory, fill) in [(0u32, &first, 0x11u8), (1, &second, 0x22)] {
             let granted = w.a.clients[0].grant_device(TO_B, ea, id, [fill; 16], 50, deadline);
@@ -1101,7 +1104,7 @@ fn device_attach_rules_and_registration_faults() {
     window_only(|| {
         let mut w = world();
         let (ea, _) = link_up(&mut w);
-        let deadline = now() + 5 * SECOND;
+        let deadline = w.now() + 5 * SECOND;
         let missing = w.a.clients[0].grant_device(TO_B, ea, 0, [1; 16], 10, deadline);
         assert_eq!(wait(&mut w, &missing).err(), Some(Error::Unavailable));
         let memory = device_memory();
@@ -1146,7 +1149,7 @@ fn device_grant_break_fences_before_reuse() {
         let (ea, eb) = link_up(&mut w);
         let attached = w.a.clients[0].attach_device(7, 0, device_memory());
         assert_eq!(wait(&mut w, &attached), Ok(2));
-        let deadline = now() + 5 * SECOND;
+        let deadline = w.now() + 5 * SECOND;
         let granted = w.a.clients[0].grant_device(TO_B, ea, 0, [1; 16], 10, deadline);
         let granted = wait(&mut w, &granted).unwrap();
         assert_eq!(
