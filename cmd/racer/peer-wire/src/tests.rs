@@ -506,7 +506,7 @@ fn control_chain_rejects_phase_previous_identity_and_extension_substitution() {
         membership: 1,
         deadline: encode_deadline(
             &racer_io::Clock::host(),
-            Deadline(racer_io::Clock::host().now() + Duration::from_secs(30)),
+            racer_io::Clock::host().now() + Duration::from_secs(30),
         )
         .unwrap(),
         rail: racer_control_wire::RailId(1),

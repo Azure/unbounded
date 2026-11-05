@@ -402,7 +402,7 @@ pub fn millis(time: SystemTime) -> Result<u64> {
 /// an untimed scope's placeholder deadline (about a century out) must never
 /// grant a peer unbounded authority.
 pub fn encode_deadline(clock: &racer_io::Clock, deadline: Deadline) -> Result<u64> {
-    peer_wire::encode_deadline(clock, clamp_wire_deadline(deadline, clock.now()))
+    peer_wire::encode_deadline(clock, clamp_wire_deadline(deadline, clock.now()).0)
         .map_err(Into::into)
 }
 /// Longest deadline horizon ever placed on the wire.
@@ -414,7 +414,9 @@ fn clamp_wire_deadline(deadline: Deadline, now: Instant) -> Deadline {
     }
 }
 pub fn decode_deadline(clock: &racer_io::Clock, value: u64) -> Result<Deadline> {
-    peer_wire::decode_deadline(clock, value).map_err(Into::into)
+    peer_wire::decode_deadline(clock, value)
+        .map(Deadline)
+        .map_err(Into::into)
 }
 /// Canonical node-list encoding: concatenated u32 big-endian length + UTF-8 ID,
 /// then padded base64. Empty lists encode as an empty header value.

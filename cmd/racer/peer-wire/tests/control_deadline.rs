@@ -14,7 +14,6 @@ use std::{
     sync::Arc,
     time::{Duration, Instant, UNIX_EPOCH},
 };
-use uring_runtime::environment::Deadline;
 
 struct NoMac;
 
@@ -181,7 +180,7 @@ fn future_deadline_signs_and_verifies() {
     let binding = binding(
         encode_deadline(
             &racer_io::Clock::host(),
-            Deadline(racer_io::Clock::host().now() + Duration::from_secs(30)),
+            racer_io::Clock::host().now() + Duration::from_secs(30),
         )
         .unwrap(),
     );

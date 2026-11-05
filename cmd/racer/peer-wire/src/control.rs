@@ -149,8 +149,7 @@ impl Binding {
         previous: &[u8; 32],
         length: usize,
     ) -> Result<(VerifiedHead, Phase)> {
-        if decode_deadline(&signatures.ctx().clock, self.deadline)?.0
-            <= signatures.ctx().clock.now()
+        if decode_deadline(&signatures.ctx().clock, self.deadline)? <= signatures.ctx().clock.now()
         {
             return Err(Error::DeadlineExceeded);
         }

@@ -1,5 +1,6 @@
 use super::*;
 use http1::connection::{HttpPool, PoolConfig, State};
+use racer_io::cancel::Cancellation;
 use std::{
     cell::Cell,
     future::{Future, poll_fn},
@@ -7,7 +8,7 @@ use std::{
     time::Instant,
 };
 use uring_runtime::{
-    environment::{Cancellation, SimulationClock, now},
+    environment::{SimulationClock, now},
     reactor::{Reactor, SocketAddress, simulation::Simulation},
 };
 

@@ -4,6 +4,10 @@ use http1::connection::{self, Context as HttpContext, Endpoint as EndpointPolicy
 use http1::{Codec, Header, MessageHead, StartLine};
 use racer_io::Scope;
 use racer_io::ring::IoBuffer;
+use racer_io::{
+    cancel::Cancellation,
+    ring::{Descriptor, SocketAddress},
+};
 use std::{
     future::Future,
     io::{Read, Write},
@@ -17,10 +21,7 @@ use std::{
     task::{Context, Poll, Wake, Waker},
     time::{Duration, Instant},
 };
-use uring_runtime::{
-    environment::{Cancellation, now},
-    reactor::{SocketAddress, descriptor::Descriptor},
-};
+use uring_runtime::environment::now;
 
 /// Keep protocol failures distinct from runtime and quota admission failures.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

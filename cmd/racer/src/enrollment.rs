@@ -677,6 +677,7 @@ fn check_pending_key(pending: &PendingIdentity, csr: &[u8]) -> Result<(), Error>
 mod tests {
     //! Real enrollment state transitions over deterministic reactor completions.
     use super::*;
+    use racer_io::cancel::Cancellation;
     use std::{
         cell::Cell,
         path::Path,
@@ -684,12 +685,9 @@ mod tests {
         task::{Context, Poll},
         time::Instant,
     };
-    use uring_runtime::{
-        environment::Cancellation,
-        reactor::{
-            Reactor,
-            simulation::{Fault, Simulation},
-        },
+    use uring_runtime::reactor::{
+        Reactor,
+        simulation::{Fault, Simulation},
     };
 
     std::thread_local! {

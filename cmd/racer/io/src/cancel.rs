@@ -9,7 +9,7 @@ use std::{
     pin::Pin,
     sync::{
         Arc, Mutex, Weak,
-        atomic::{AtomicU8, Ordering},
+        atomic::{AtomicU8, AtomicUsize, Ordering},
     },
     task::{Context, Poll, Waker},
     time::{Duration, Instant},
@@ -350,6 +350,107 @@ impl From<Instant> for Deadline {
     }
 }
 
+/// Shared cancellation state with a caller-bounded set of operation wakeups.
+#[derive(Clone)]
+pub struct Cancellation {
+    state: Arc<CancellationState>,
+}
+
+/// Operation-owned cancellation wake registration. Drop removes its live entry;
+/// independent operations may safely register the same executor waker.
+pub struct CancellationRegistration {
+    cancellation: Cancellation,
+
+    key: Mutex<Option<WaitKey>>,
+}
+
+/// Cancellation state shared by handles and their operation registrations.
+struct CancellationState {
+    token: CancelToken,
+
+    registration_limit: usize,
+
+    live: AtomicUsize,
+}
+
+impl Cancellation {
+    /// Construct with a 1024-live-registration limit. Construction cannot fail;
+    /// the Result contract is retained for existing callers.
+    pub fn new() -> crate::Result<Self> {
+        Ok(Self::with_registration_limit(1024))
+    }
+
+    /// Choose a subscription bound; zero still permits canceling and querying.
+    fn with_registration_limit(registration_limit: usize) -> Self {
+        Self {
+            state: Arc::new(CancellationState {
+                token: CancelToken::new(),
+                registration_limit,
+                live: AtomicUsize::new(0),
+            }),
+        }
+    }
+
+    /// The reactor cancellation token that this cancellation drives.
+    pub fn token(&self) -> &CancelToken {
+        &self.state.token
+    }
+
+    /// Whether any owner has requested cancellation.
+    pub fn is_cancelled(&self) -> bool {
+        self.state.token.is_cancelled()
+    }
+
+    /// Subscribe for one operation's lifetime, even when operations share a waker.
+    /// Dropping the subscription reclaims its capacity and wake.
+    pub fn subscribe(&self) -> crate::Result<CancellationRegistration> {
+        self.state
+            .live
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |live| {
+                (live < self.state.registration_limit).then_some(live + 1)
+            })
+            .map_err(|_| Error::Overloaded)?;
+        Ok(CancellationRegistration {
+            cancellation: self.clone(),
+            key: Mutex::new(None),
+        })
+    }
+
+    /// Mark cancellation and wake live subscribers.
+    pub fn cancel(&self) -> crate::Result<()> {
+        self.state.token.cancel();
+        Ok(())
+    }
+}
+
+impl CancellationRegistration {
+    /// Replace the waiting task and close the race with concurrent cancellation.
+    pub fn register(&self, waker: &Waker) {
+        let mut key = self.key.lock().unwrap_or_else(|poison| poison.into_inner());
+        if self
+            .cancellation
+            .state
+            .token
+            .register(&mut key, waker)
+            .is_some()
+        {
+            waker.wake_by_ref();
+        }
+    }
+}
+
+impl Drop for CancellationRegistration {
+    /// Remove this subscription without removing other operations' wakes.
+    fn drop(&mut self) {
+        let key = self
+            .key
+            .get_mut()
+            .unwrap_or_else(|poison| poison.into_inner());
+        self.cancellation.state.token.deregister(key);
+        self.cancellation.state.live.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -437,5 +538,124 @@ mod tests {
             Err(Error::DeadlineExceeded)
         );
         assert_eq!(soon.remaining(now), Some(Duration::from_millis(1)));
+    }
+
+    /// Counts wakes, for cancellation registration tests.
+    #[derive(Default)]
+    struct WakeCount(AtomicUsize);
+
+    impl WakeCount {
+        fn count(&self) -> usize {
+            self.0.load(Ordering::SeqCst)
+        }
+    }
+
+    impl std::task::Wake for WakeCount {
+        fn wake(self: Arc<Self>) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    /// Cancellation and registration races preserve notifications and capacity.
+    #[test]
+    fn caller_selected_registration_bound_and_concurrent_cancel() {
+        let disabled = Cancellation::with_registration_limit(0);
+        assert!(matches!(disabled.subscribe(), Err(Error::Overloaded)));
+        disabled.cancel().unwrap();
+        assert!(disabled.is_cancelled());
+        for _ in 0..64 {
+            let cancellation = Cancellation::with_registration_limit(1);
+            let registration = cancellation.subscribe().unwrap();
+            assert!(matches!(cancellation.subscribe(), Err(Error::Overloaded)));
+            let count = Arc::new(WakeCount::default());
+            let waker = Waker::from(count.clone());
+            std::thread::scope(|threads| {
+                threads.spawn(|| cancellation.cancel().unwrap());
+                threads.spawn(|| registration.register(&waker));
+            });
+            assert!(count.count() >= 1);
+            drop(registration);
+            assert!(cancellation.subscribe().is_ok());
+        }
+    }
+
+    /// Each subscription owns its capacity even when tasks use the same waker.
+    #[test]
+    fn operation_registrations_reclaim_capacity_and_do_not_remove_shared_wakes() {
+        let cancellation = Cancellation::new().unwrap();
+        let count = Arc::new(WakeCount::default());
+        let waker = Waker::from(count.clone());
+        for _ in 0..2048 {
+            let registration = cancellation.subscribe().unwrap();
+            registration.register(&waker);
+        }
+        assert_eq!(cancellation.state.live.load(Ordering::Acquire), 0);
+        assert_eq!(cancellation.token().waiters(), 0);
+        let first = cancellation.subscribe().unwrap();
+        let second = cancellation.subscribe().unwrap();
+        first.register(&waker);
+        second.register(&waker);
+        drop(first);
+        cancellation.cancel().unwrap();
+        assert_eq!(count.count(), 1);
+    }
+
+    /// Subscription drop releases executor ownership before the shared scope ends.
+    #[test]
+    fn dropping_subscription_releases_executor_resources_before_scope_ends() {
+        let cancellation = Cancellation::new().unwrap();
+        let executor = Arc::new(WakeCount::default());
+        let weak = Arc::downgrade(&executor);
+        let registration = cancellation.subscribe().unwrap();
+        registration.register(&Waker::from(executor));
+        assert!(weak.upgrade().is_some());
+        drop(registration);
+        assert!(weak.upgrade().is_none());
+        assert!(!cancellation.is_cancelled());
+
+        // A worker that subscribes after cancellation must still be notified.
+        cancellation.cancel().unwrap();
+        let executor = Arc::new(WakeCount::default());
+        let registration = cancellation.subscribe().unwrap();
+        registration.register(&Waker::from(executor.clone()));
+        assert_eq!(executor.count(), 1);
+    }
+
+    /// Dropping one live registration immediately admits its replacement.
+    #[test]
+    fn cancellation_drives_the_reactor_token_and_its_waiters() {
+        let cancellation = Cancellation::new().unwrap();
+        let token = cancellation.token().clone();
+        let registration = cancellation.subscribe().unwrap();
+        let woke = Arc::new(AtomicUsize::new(0));
+        struct Count(Arc<AtomicUsize>);
+        impl std::task::Wake for Count {
+            fn wake(self: Arc<Self>) {
+                self.0.fetch_add(1, Ordering::AcqRel);
+            }
+        }
+        let waker = Waker::from(Arc::new(Count(woke.clone())));
+        registration.register(&waker);
+        assert_eq!(token.waiters(), 1);
+        assert_eq!(token.check(), Ok(()));
+        cancellation.cancel().unwrap();
+        assert_eq!(woke.load(Ordering::Acquire), 1);
+        assert_eq!(token.check(), Err(Error::Cancelled));
+        // Registering after cancellation wakes immediately.
+        registration.register(&waker);
+        assert_eq!(woke.load(Ordering::Acquire), 2);
+        drop(registration);
+        assert_eq!(token.waiters(), 0);
+    }
+
+    #[test]
+    fn live_registration_limit_is_reclaimed_after_drop() {
+        let cancellation = Cancellation::new().unwrap();
+        let mut registrations: Vec<_> = (0..1024)
+            .map(|_| cancellation.subscribe().unwrap())
+            .collect();
+        assert!(matches!(cancellation.subscribe(), Err(Error::Overloaded)));
+        registrations.pop();
+        assert!(cancellation.subscribe().is_ok());
     }
 }

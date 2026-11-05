@@ -1039,7 +1039,7 @@ mod tests {
         let scope = TestScope {
             clock: sim_ctx.clock.clone(),
             deadline: sim_ctx.clock.now() + Duration::from_secs(100),
-            cancellation: uring_runtime::environment::Cancellation::new().unwrap(),
+            cancellation: racer_io::cancel::Cancellation::new().unwrap(),
         };
         let mut cx = Context::from_waker(Waker::noop());
         // Hold prepaid slots as the accept, other connections, or a profile would.
@@ -1209,7 +1209,7 @@ mod tests {
         let scope = TestScope {
             clock: racer_io::Clock::host(),
             deadline: racer_io::Clock::host().now() + Duration::from_secs(100),
-            cancellation: uring_runtime::environment::Cancellation::new().unwrap(),
+            cancellation: racer_io::cancel::Cancellation::new().unwrap(),
         };
         let (fd, peer) = sim.socket_pair();
         let (completion, signal) = sim.socket_pair();
@@ -1331,7 +1331,7 @@ mod tests {
             let scope = TestScope {
                 clock: sim_ctx.clock.clone(),
                 deadline: now + Duration::from_secs(if outcome == "parent" { 4 } else { 100 }),
-                cancellation: uring_runtime::environment::Cancellation::new().unwrap(),
+                cancellation: racer_io::cancel::Cancellation::new().unwrap(),
             };
             let (completion, mut signal) = UnixStream::pair().unwrap();
             completion.set_nonblocking(true).unwrap();
@@ -1868,7 +1868,7 @@ mod tests {
         /// Time source for deadline checks.
         clock: racer_io::Clock,
 
-        cancellation: uring_runtime::environment::Cancellation,
+        cancellation: racer_io::cancel::Cancellation,
     }
 
     impl racer_io::Scope for TestScope {
@@ -1986,7 +1986,7 @@ mod tests {
         let scope = TestScope {
             clock: sim_ctx.clock.clone(),
             deadline: limit,
-            cancellation: uring_runtime::environment::Cancellation::new().unwrap(),
+            cancellation: racer_io::cancel::Cancellation::new().unwrap(),
         };
         assert_eq!(racer_io::Scope::check(&scope), Ok(()));
         let (fd, peer) = simulation.socket_pair();
@@ -2038,7 +2038,7 @@ mod tests {
             let scope = TestScope {
                 clock: sim_ctx.clock.clone(),
                 deadline: now.checked_add(parent_timeout).unwrap(),
-                cancellation: uring_runtime::environment::Cancellation::new().unwrap(),
+                cancellation: racer_io::cancel::Cancellation::new().unwrap(),
             };
             let (fd, _peer) = simulation.socket_pair();
             let buffer = owner.buffer(&handler).unwrap();
@@ -2093,7 +2093,7 @@ mod tests {
         let scope = TestScope {
             clock: sim_ctx.clock.clone(),
             deadline: now + Duration::from_secs(10),
-            cancellation: uring_runtime::environment::Cancellation::new().unwrap(),
+            cancellation: racer_io::cancel::Cancellation::new().unwrap(),
         };
         let address = SocketAddress::Inet("127.0.0.1:18080".parse().unwrap());
         let listener = simulation.listen(address.clone()).unwrap();
@@ -2197,7 +2197,7 @@ mod tests {
         let scope = TestScope {
             clock: racer_io::Clock::host(),
             deadline: racer_io::Clock::host().now() + Duration::from_secs(10),
-            cancellation: uring_runtime::environment::Cancellation::new().unwrap(),
+            cancellation: racer_io::cancel::Cancellation::new().unwrap(),
         };
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let address = listener.local_addr().unwrap();
@@ -2293,7 +2293,7 @@ mod tests {
         let scope = TestScope {
             clock: racer_io::Clock::host(),
             deadline: racer_io::Clock::host().now() + Duration::from_secs(10),
-            cancellation: uring_runtime::environment::Cancellation::new().unwrap(),
+            cancellation: racer_io::cancel::Cancellation::new().unwrap(),
         };
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let address = listener.local_addr().unwrap();

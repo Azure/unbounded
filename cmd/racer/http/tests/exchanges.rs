@@ -214,8 +214,8 @@ fn disconnect_waits_for_work_cleanup_before_returning_failure() {
 /// Independent caller scopes exercise cancellation and watch fencing without Racer.
 mod disconnect_scopes {
     use super::*;
+    use racer_io::cancel::Cancellation;
     use std::cell::Cell;
-    use uring_runtime::environment::Cancellation;
 
     /// A cancellable caller scope, independent of wall time.
     #[derive(Clone)]

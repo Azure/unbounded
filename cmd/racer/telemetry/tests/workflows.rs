@@ -1,6 +1,7 @@
 //! End-to-end diagnostic ownership, formatting failure, and request-boundary workflows.
 
 use racer_io::Error;
+use racer_io::cancel::Cancellation;
 use racer_io::{Operation, Scope};
 use std::{
     cell::RefCell,
@@ -14,7 +15,7 @@ use telemetry::{
     Lease, Metrics, Ring,
     server::{self, Event, Handler, Response, Server},
 };
-use uring_runtime::{environment::Cancellation, reactor::Reactor};
+use uring_runtime::reactor::Reactor;
 
 telemetry::metrics! { Counter, COUNTERS, COUNTER_COUNT;
     Self::Completed => "completed_total",
