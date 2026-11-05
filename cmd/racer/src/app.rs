@@ -1095,27 +1095,65 @@ pub struct WorkerApplication {
 
 /// Ownership is optional eviction guidance. Even Progress may mean the ranking
 /// cache is pinned, so do not self-wake continuously or retry within one turn.
+///
+/// After two consecutive idle passes under the same membership the retry backs
+/// off to [`OWNERSHIP_SETTLED_RETRY`]; a membership change runs the next turn
+/// at once and resets the backoff.
 struct OwnershipMaintenance {
     next: std::time::Instant,
+
+    /// Membership identity observed at the last idle pass, if any.
+    settled: Option<usize>,
 }
 
+/// Retry after an idle pass while membership is unchanged or unknown.
+const OWNERSHIP_IDLE_RETRY: Duration = Duration::from_millis(100);
+
+/// Retry after repeated idle passes under one membership. Recovered and newly
+/// appended residents are still revisited, only less often.
+const OWNERSHIP_SETTLED_RETRY: Duration = Duration::from_secs(1);
+
 impl OwnershipMaintenance {
+    /// Maintenance starting at `next` with no settled membership.
+    fn new(next: std::time::Instant) -> Self {
+        Self {
+            next,
+            settled: None,
+        }
+    }
+
     /// Advance eviction guidance at most once per scheduled maintenance turn.
+    /// `membership` identifies the current published membership, if any.
     fn poll(
         &mut self,
         now: std::time::Instant,
         stopping: bool,
+        membership: Option<usize>,
         refresh: impl FnOnce() -> Result<crate::topology::Maintenance>,
     ) {
-        if stopping || now < self.next {
+        if stopping {
+            return;
+        }
+        let changed = self.settled.is_some() && membership != self.settled;
+        if changed {
+            self.settled = None;
+        } else if now < self.next {
             return;
         }
         let delay = match refresh() {
             Ok(crate::topology::Maintenance::Progress) => Duration::from_millis(1),
             // Missing publications and unavailable capacity must not fail reads
             // or permanently prevent a later pass over idle/recovered residents.
-            Ok(crate::topology::Maintenance::Idle | crate::topology::Maintenance::Blocked)
-            | Err(_) => Duration::from_millis(100),
+            Ok(crate::topology::Maintenance::Idle | crate::topology::Maintenance::Blocked) => {
+                let settled = membership.is_some() && self.settled == membership;
+                self.settled = membership;
+                if settled {
+                    OWNERSHIP_SETTLED_RETRY
+                } else {
+                    OWNERSHIP_IDLE_RETRY
+                }
+            }
+            Err(_) => OWNERSHIP_IDLE_RETRY,
         };
         self.next = now + delay;
     }
@@ -1138,9 +1176,35 @@ mod ownership_maintenance_tests {
     use crate::topology::Maintenance;
 
     #[test]
+    fn ownership_maintenance_backs_off_when_settled_and_resumes_on_membership_change() {
+        let start = std::time::Instant::now();
+        let mut maintenance = OwnershipMaintenance::new(start);
+        let idle = || Ok(Maintenance::Idle);
+        maintenance.poll(start, false, Some(1), idle);
+        assert_eq!(maintenance.next, start + OWNERSHIP_IDLE_RETRY);
+        let now = maintenance.next;
+        maintenance.poll(now, false, Some(1), idle);
+        assert_eq!(maintenance.next, now + OWNERSHIP_SETTLED_RETRY);
+        // Unchanged membership waits for the settled retry.
+        maintenance.poll(now, false, Some(1), || panic!("settled refresh"));
+        // A membership change refreshes at once and restarts the backoff.
+        let calls = std::cell::Cell::new(0);
+        maintenance.poll(now, false, Some(2), || {
+            calls.set(calls.get() + 1);
+            Ok(Maintenance::Idle)
+        });
+        assert_eq!(calls.get(), 1);
+        assert_eq!(maintenance.next, now + OWNERSHIP_IDLE_RETRY);
+        // Errors keep the short retry.
+        let now = maintenance.next;
+        maintenance.poll(now, false, Some(2), || Err(Error::Unavailable));
+        assert_eq!(maintenance.next, now + OWNERSHIP_IDLE_RETRY);
+    }
+
+    #[test]
     fn ownership_maintenance_bounds_progress_and_retries_idle_and_errors() {
         let start = std::time::Instant::now();
-        let mut maintenance = OwnershipMaintenance { next: start };
+        let mut maintenance = OwnershipMaintenance::new(start);
         let calls = std::cell::Cell::new(0);
         for status in [
             Ok(Maintenance::Progress),
@@ -1150,7 +1214,7 @@ mod ownership_maintenance_tests {
             Err(Error::Overloaded),
         ] {
             let now = maintenance.next;
-            maintenance.poll(now, false, || {
+            maintenance.poll(now, false, None, || {
                 calls.set(calls.get() + 1);
                 status
             });
@@ -1164,13 +1228,18 @@ mod ownership_maintenance_tests {
                 maintenance.wait_timeout(now, false, Duration::from_secs(1)),
                 expected
             );
-            maintenance.poll(now, false, || panic!("same-turn refresh"));
-            maintenance.poll(maintenance.next - Duration::from_nanos(1), false, || {
-                panic!("early refresh")
-            });
+            maintenance.poll(now, false, None, || panic!("same-turn refresh"));
+            maintenance.poll(
+                maintenance.next - Duration::from_nanos(1),
+                false,
+                None,
+                || panic!("early refresh"),
+            );
         }
         assert_eq!(calls.get(), 5);
-        maintenance.poll(maintenance.next, true, || panic!("refresh during shutdown"));
+        maintenance.poll(maintenance.next, true, None, || {
+            panic!("refresh during shutdown")
+        });
         assert_eq!(
             maintenance.wait_timeout(maintenance.next, true, Duration::from_secs(1)),
             Duration::from_secs(1)
@@ -1597,7 +1666,7 @@ impl WorkerApplication {
             checkpoint_budget: config.checkpoint_bytes.get(),
             placement,
             candidates,
-            ownership_maintenance: OwnershipMaintenance { next: started },
+            ownership_maintenance: OwnershipMaintenance::new(started),
             placement_retry: started,
             placement_warning: None,
             diagnostic_task: None,
@@ -2022,9 +2091,15 @@ impl WorkerApplication {
         }
         // Independent of placement.maintain being Idle: recovered residents and
         // changed membership need periodic refresh even without foreground reads.
-        self.ownership_maintenance.poll(now, self.stopping, || {
-            self.candidates.refresh_ownership(self.store.writer.index())
-        });
+        let membership = self
+            .snapshots
+            .current()
+            .ok()
+            .map(|snapshot| std::sync::Arc::as_ptr(&snapshot.membership) as usize);
+        self.ownership_maintenance
+            .poll(now, self.stopping, membership, || {
+                self.candidates.refresh_ownership(self.store.writer.index())
+            });
         if !self.stopping {
             self.coordinator.poll_offers(now);
         }

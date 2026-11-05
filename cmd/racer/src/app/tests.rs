@@ -1365,7 +1365,7 @@ fn metadata_wait_uses_worker_clock_and_keeps_due_backlog_runnable() {
         // deadlines. Construct every worker timer in the same simulated clock.
         worker
             .ownership_maintenance
-            .poll(sim_ctx.clock.now(), false, || {
+            .poll(sim_ctx.clock.now(), false, None, || {
                 Ok(crate::topology::Maintenance::Idle)
             });
         worker
