@@ -510,6 +510,12 @@ impl Store {
 /// A running Model world.
 struct Model<'s> {
     spec: &'s ModelSpec,
+    /// Placement rankings each worker has completed: membership version and page. Production
+    /// keeps a `Placement` cache per worker (`src/app.rs` `Placement::with_memory_budget`), and
+    /// its first ranking of a key scores every member, 256 per poll
+    /// (`topology/src/placement.rs` `rank_async`, `WORK_QUANTUM`); later rankings of the key
+    /// are cache hits.
+    ranked: BTreeSet<(u32, u32, u64, Page)>,
     engine: Engine<Ev>,
     trace: TraceHash,
     choices: Choices,
@@ -667,6 +673,7 @@ impl<'s> Model<'s> {
             timeouts_queued: 0,
             diag: std::env::var_os("MODEL_DIAG").is_some(),
             walks: BTreeMap::new(),
+            ranked: BTreeSet::new(),
             msgs: BTreeMap::new(),
             next_msg: 0,
             last_hops: BTreeMap::new(),
@@ -1384,6 +1391,28 @@ impl<'s> Model<'s> {
     }
 
     /// Rank `page` for `node` (production `CandidatePolicy::rank_for`, racer-sim `rank_for`).
+    /// Polls of `node`'s ranking of `page` on `worker` (racer-sim `spawn`: one
+    /// `ranking_chunk_ns` each). A worker's first ranking of a page under a membership scores
+    /// every member, `WORK_QUANTUM` (256) per poll; later ones answer from its placement cache
+    /// in one poll.
+    fn ranking_chunks(
+        &mut self,
+        node: u32,
+        worker: u32,
+        page: Page,
+        basis: &RankBasis<Ranking, u64>,
+    ) -> u64 {
+        let number = match basis {
+            RankBasis::Verify(ranking) => ranking.0,
+            RankBasis::Latest(number) | RankBasis::Fallback(number) => *number,
+            RankBasis::Previous { version } => *version,
+        };
+        let Some(members) = self.versions.borrow().get(number).map(|v| v.count() as u64) else {
+            return 1;
+        };
+        ranking_polls(self.ranked.insert((node, worker, number, page)), members)
+    }
+
     fn rank(
         &self,
         node: u32,
@@ -2309,9 +2338,13 @@ impl<'s> Model<'s> {
         match effect {
             Effect::Acquisition { read, page, effect } => match effect {
                 Acq::Rank { id, basis, .. } => {
-                    let at = self
-                        .fabric
-                        .cpu(now, node, worker as u8, costs.cpu_ranking_chunk_ns);
+                    let chunks = self.ranking_chunks(node, worker, page, &basis);
+                    let at = self.fabric.cpu(
+                        now,
+                        node,
+                        worker as u8,
+                        chunks * costs.cpu_ranking_chunk_ns,
+                    );
                     let result = self.rank(node, page, basis);
                     self.engine
                         .at(at, input(read, Input::Ranked { id, result }));
@@ -3003,6 +3036,17 @@ fn fault_code(fault: crate::world::Fault) -> u64 {
     }
 }
 
+/// Polls of one ranking over `members` (production `topology/src/placement.rs` `rank_async`):
+/// a first ranking scores `WORK_QUANTUM` (256) members per poll; a cached one takes one poll.
+fn ranking_polls(first: bool, members: u64) -> u64 {
+    const WORK_QUANTUM: u64 = 256;
+    if first {
+        members.div_ceil(WORK_QUANTUM).max(1)
+    } else {
+        1
+    }
+}
+
 /// The response kind a relay signs for `r` (racer-sim `response_kind`).
 fn response_kind(r: Response) -> ResponseKind {
     match r {
@@ -3019,6 +3063,15 @@ fn response_kind(r: Response) -> ResponseKind {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_first_ranking_scores_every_member_and_a_cached_one_polls_once() {
+        assert_eq!(ranking_polls(true, 0), 1);
+        assert_eq!(ranking_polls(true, 256), 1);
+        assert_eq!(ranking_polls(true, 257), 2);
+        assert_eq!(ranking_polls(true, 50_000), 196);
+        assert_eq!(ranking_polls(false, 50_000), 1);
+    }
 
     fn page(number: u32) -> Page {
         Page { object: 0, number }
