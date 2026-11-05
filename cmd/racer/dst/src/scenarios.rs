@@ -440,9 +440,15 @@ pub fn hung_peers() -> Scenario {
                 .then_some(())
                 .ok_or("no request reached a hung peer".into())
         })
+        // At most 0.5% of the 12,800 reads. The bound was 3 while the Model charged request
+        // signing to the crypto helper. Production signs on the I/O worker (`src/peer.rs`
+        // `sign_request_to`); charged there, each worker's 32-page burst holds its 8 route search
+        // slots longer (production `Paths::with_limits` has no queue, `src/app.rs`), and 8 to 30
+        // reads over seeds 1 to 8 fail on search sheds (`search_sheds`; see `dst/MODEL.md`,
+        // "Signing placement").
         .check("few-reads-fail", |r| {
             let failed = counter(r, "reads_failed");
-            (failed <= 3)
+            (failed <= 64)
                 .then_some(())
                 .ok_or(format!("{failed} reads failed: {}", r["metrics"]["errors"]))
         });

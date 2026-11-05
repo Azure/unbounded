@@ -21,7 +21,9 @@ use std::{
 };
 
 use racer_control_wire::{CacheId, NodeId};
+pub use racer_core::connections::Config as ConnectionConfig;
 use racer_core::{
+    connections::{Acquire, ConnId, Connections},
     liveness::{Detours, LINK_TIMEOUTS},
     liveness::{MAX_PINGS_IN_FLIGHT, SILENCE_CAPACITY, Silence},
     prefetch::OwnerBudget,
@@ -215,6 +217,12 @@ pub struct ModelSpec {
     /// and the server answers the unsigned overload head (racer-sim `NodeConfig::crypto_queue`);
     /// zero is unbounded.
     pub crypto_queue: usize,
+    /// Peer connection slots (`racer_core::connections`): per-worker outbound pools, per-node
+    /// ingress with its accept queue, and idle reuse. `None` (the default, so existing scenarios
+    /// keep their transport) connects every link at once and holds nothing;
+    /// [`ConnectionConfig::production`] is production's semantics, which fail several of the
+    /// scenarios (see `dst/MODEL.md`, "Peer connection slots").
+    pub connections: Option<ConnectionConfig>,
     /// Waiters per flight; production's default unless a scenario overrides it (racer-sim
     /// `NodeConfig::waiters_per_flight`).
     pub waiters_per_flight: usize,
@@ -255,6 +263,7 @@ impl Default for ModelSpec {
             membership_lag: membership::LAG,
             relay_transfers: relay_transfers(),
             crypto_queue: crypto_queue(),
+            connections: None,
             waiters_per_flight: flight_limits().waiters_per_flight,
             checks: Vec::new(),
         }
@@ -294,9 +303,14 @@ enum Ev {
     /// Peer request `msg` (a key of `Model::msgs`) reaches its next holder (`verified` once the
     /// holder checked its signature and, at the destination, its worker took it).
     Hop { msg: u64, verified: bool },
+    /// The destination verified request `msg`; its worker takes it next.
+    Verified { msg: u64 },
     /// The requester of `msg` gave up: a last link still unanswered is a timeout for its
     /// sender (racer-sim `Event::LastHop`).
     LastHop { msg: u64 },
+    /// The requester of `msg` gave up: it closes its connection and the relays see theirs close
+    /// (`Model::conns`).
+    Abandon { msg: u64 },
     /// Silence ping `ping` (a key of `Model::pings`) ended: [`liveness::ping_verdict`] of its
     /// answer. A ping ends once; later ends are dropped.
     PingEnd { ping: u64, answered: Option<bool> },
@@ -584,6 +598,14 @@ struct Model<'s> {
     /// node cold start unchanged (130 against 134 failures, 0 search sheds) at 18 KB more per
     /// node. Searches run synchronously, so the search queue never fills.
     paths: Paths<Exhaustive>,
+    /// Peer connection slots of every node (`racer_core::connections`).
+    conns: Connections,
+    /// The connections each request holds, one per link in route order.
+    msg_conns: BTreeMap<u64, Vec<ConnId>>,
+    /// Requests whose next hop waits in an accept queue: the request and when it arrives.
+    queued: BTreeMap<ConnId, (u64, Nanos)>,
+    /// Requests whose answer is on its way back, so their connections go idle, not closed.
+    answered_msgs: BTreeSet<u64>,
 }
 
 const TAG_EVENT: u64 = 1;
@@ -685,6 +707,13 @@ impl<'s> Model<'s> {
             partitions: BTreeSet::new(),
             pings: BTreeMap::new(),
             paths: Paths::with_limits(ROUTE_CACHE_ENTRIES, ROUTE_CACHE_ENTRIES * 256, 8),
+            conns: Connections::new(
+                spec.connections
+                    .unwrap_or_else(|| ConnectionConfig::production(workers)),
+            ),
+            msg_conns: BTreeMap::new(),
+            queued: BTreeMap::new(),
+            answered_msgs: BTreeSet::new(),
         }
     }
 
@@ -835,12 +864,16 @@ impl<'s> Model<'s> {
                 break;
             }
             self.step(event);
+            self.admit_queued();
         }
     }
 
     fn step(&mut self, event: Ev) {
         let now = self.now();
         self.versions.borrow_mut().now = now;
+        // Idle connections that timed out free their ingress slots first.
+        self.conns.advance(now);
+        self.admit_queued();
         match event {
             Ev::Membership { node, live } => {
                 if self.versions.borrow_mut().set(node, live) {
@@ -1026,6 +1059,32 @@ impl<'s> Model<'s> {
                 self.pump_all(node, worker);
             }
             Ev::Hop { msg, verified } => self.hop(msg, verified),
+            Ev::Verified { msg } => {
+                if let Some(m) = self.msgs.get(&msg) {
+                    let w = owner_worker(m.page, self.spec.workers.max(1)) as u8;
+                    let ready = self
+                        .fabric
+                        .cpu(now, m.at, w, self.fabric.costs.cpu_request_ns);
+                    let hop = Ev::Hop {
+                        msg,
+                        verified: true,
+                    };
+                    self.engine.at(ready, hop);
+                }
+            }
+            Ev::Abandon { msg } => {
+                self.timeouts_queued -= 1;
+                let waiting = self
+                    .msg_conns
+                    .get(&msg)
+                    .is_some_and(|ids| ids.iter().any(|id| self.queued.contains_key(id)));
+                self.close_conns(msg);
+                if waiting {
+                    // Never accepted: no holder will see it again.
+                    self.report.counters.requests_abandoned += 1;
+                    self.drop_msg(msg);
+                }
+            }
             Ev::LastHop { msg } => {
                 self.timeouts_queued -= 1;
                 if let Some((sender, dest, page, sent)) = self.last_hops.remove(&msg) {
@@ -1669,6 +1728,9 @@ impl<'s> Model<'s> {
         let end = self
             .fabric
             .transfer_until(sealed, &route, self.spec.page_bytes, asker.abandon);
+        if end.is_some() {
+            self.answered_msgs.insert(asker.msg);
+        }
         self.release_relays_at(asker.msg, end.unwrap_or(asker.abandon));
         let Some(end) = end else {
             self.report.counters.replies_abandoned += 1;
@@ -1735,7 +1797,7 @@ impl<'s> Model<'s> {
         if self.hung(at) {
             // Accepted, never answered or forwarded; the requester's attempt times out.
             self.report.counters.messages_lost += 1;
-            self.drop_msg(mid);
+            self.lose_msg(mid);
             return;
         }
         if now >= m.abandon {
@@ -1758,6 +1820,12 @@ impl<'s> Model<'s> {
             if bound != 0 && self.fabric.crypto_outstanding(now, at, conn) >= bound {
                 // The crypto submission fails `Overloaded` before any key work (racer-sim `hop`).
                 self.report.counters.verify_sheds += 1;
+                // The unsigned overload head ends the last link's exchange cleanly
+                // (`peer/server.rs` `serve_connection` returns the connection for reuse).
+                if let Some(id) = self.msg_conns.get_mut(&mid).and_then(Vec::pop) {
+                    self.queued.remove(&id);
+                    self.conns.finish(now, id);
+                }
                 // The last link's sender sees the connection fail or an unsigned overload at
                 // once: not silence.
                 self.last_hops.remove(&mid);
@@ -1774,20 +1842,21 @@ impl<'s> Model<'s> {
                 };
                 return self.fail_hop(mid, previous, fault);
             }
-            let mut ready = self
+            let ready = self
                 .fabric
                 .crypto(now, at, conn, costs.verify(m.path.len()));
-            if at == m.dest {
-                let w = owner_worker(m.page, self.spec.workers.max(1)) as u8;
-                ready = self.fabric.cpu(ready, at, w, costs.cpu_request_ns);
-            }
-            self.engine.at(
-                ready,
+            // The destination's worker takes the request once it is verified, not before: a
+            // reservation at a future start would hold the worker idle until then (`reserve` is
+            // one FIFO server), delaying everything it signs or searches meanwhile.
+            let next = if at == m.dest {
+                Ev::Verified { msg: mid }
+            } else {
                 Ev::Hop {
                     msg: mid,
                     verified: true,
-                },
-            );
+                }
+            };
+            self.engine.at(ready, next);
             return;
         }
         self.trace.record(now, TAG_EVENT, 3, u64::from(at));
@@ -1847,6 +1916,50 @@ impl<'s> Model<'s> {
         self.msgs.remove(&mid);
     }
 
+    /// Drop `mid` as [`Self::drop_msg`], but its connections stay open until the requester
+    /// gives up ([`Ev::Abandon`]): nobody answers or closes them before.
+    fn lose_msg(&mut self, mid: u64) {
+        let held = self.msg_conns.remove(&mid);
+        self.drop_msg(mid);
+        if let Some(held) = held {
+            self.msg_conns.insert(mid, held);
+        }
+    }
+
+    /// Close every connection `mid` holds (a failed or abandoned exchange is never reused,
+    /// `src/peer/transport.rs`).
+    fn close_conns(&mut self, mid: u64) {
+        for id in self.msg_conns.remove(&mid).unwrap_or_default() {
+            if self.queued.remove(&id).is_some() {
+                self.report.counters.conn_queue_abandoned += 1;
+            }
+            self.conns.close(id);
+        }
+    }
+
+    /// `mid` was answered: its connections go idle for reuse.
+    fn finish_conns(&mut self, mid: u64) {
+        let now = self.now();
+        for id in self.msg_conns.remove(&mid).unwrap_or_default() {
+            self.queued.remove(&id);
+            self.conns.finish(now, id);
+        }
+    }
+
+    /// Start the hops whose connections an ingress slot just accepted.
+    fn admit_queued(&mut self) {
+        let now = self.now();
+        for id in self.conns.take_admitted() {
+            if let Some((mid, arrive)) = self.queued.remove(&id) {
+                let hop = Ev::Hop {
+                    msg: mid,
+                    verified: false,
+                };
+                self.engine.at(arrive.max(now), hop);
+            }
+        }
+    }
+
     /// The relays of `mid` release their `Relay` transfers.
     fn release_relays(&mut self, mid: u64) {
         self.release_relays_after(mid, false);
@@ -1865,6 +1978,13 @@ impl<'s> Model<'s> {
         } else {
             ""
         };
+        // Production keeps each connection until the answer is written upstream; an exchange
+        // that ends without one closes its connections.
+        if self.answered_msgs.remove(&mid) {
+            self.finish_conns(mid);
+        } else {
+            self.close_conns(mid);
+        }
         for (node, worker, start) in self.relay_charges.remove(&mid).unwrap_or_default() {
             if self.diag {
                 // Log2 buckets of the hold in ms.
@@ -1887,8 +2007,10 @@ impl<'s> Model<'s> {
     fn release_relays_at(&mut self, mid: u64, at: Nanos) {
         if at <= self.now() {
             self.release_relays_after(mid, true);
-        } else if self.relay_charges.contains_key(&mid) {
+        } else if self.relay_charges.contains_key(&mid) || self.msg_conns.contains_key(&mid) {
             self.engine.at(at, Ev::Release { msg: mid });
+        } else {
+            self.answered_msgs.remove(&mid);
         }
     }
 
@@ -1987,6 +2109,7 @@ impl<'s> Model<'s> {
             ends.len()
         };
         let (route, polls) = self.route(&members, query, || running < ACTIVE_SEARCHES);
+
         // racer-sim `spawn`: a cache hit answers on the first poll, each further poll expands
         // up to 32 nodes, on one worker's CPU.
         let costs = self.fabric.costs;
@@ -1998,7 +2121,9 @@ impl<'s> Model<'s> {
                 .or_default()
                 .push(ready);
         }
-        if polls > 1 && route == Err(topology::Error::Overloaded) {
+        // A search shed on its first poll counts too: the route was not cached and every slot
+        // was busy (it was left out before, hiding most sheds).
+        if route == Err(topology::Error::Overloaded) {
             self.report.counters.search_sheds += 1;
         }
         let route = match route {
@@ -2045,16 +2170,43 @@ impl<'s> Model<'s> {
     /// Send `msg` from `holder` over its link to `next` once `ready` (racer-sim `link`).
     fn link(&mut self, mid: u64, holder: u32, plan: Option<RelayPlan>, next: u32, ready: Nanos) {
         let now = self.now();
+        if plan.is_some_and(|plan| plan.outbound.is_err()) {
+            return self.fail_hop(mid, holder, Fault::HopBudgetExhausted);
+        }
+        let conn = if holder == self.msgs[&mid].from {
+            self.msgs[&mid].worker as u8
+        } else {
+            self.conn_worker(mid)
+        };
+        let cut = self.cut(holder, next);
+        // The sender's pool hands out a connection before any I/O (`racer_core::connections`).
+        let acquired = (!cut && self.spec.connections.is_some())
+            .then(|| self.conns.acquire(now, holder, conn, next));
+        match acquired {
+            Some(Acquire::Overloaded) => return self.fail_hop(mid, holder, Fault::Overloaded),
+            Some(
+                Acquire::Reused(id)
+                | Acquire::Accepted(id)
+                | Acquire::Queued(id)
+                | Acquire::Dropped(id),
+            ) => {
+                let held = self.msg_conns.entry(mid).or_default();
+                if held.is_empty() {
+                    let abandon = self.msgs[&mid].abandon.max(now + 1);
+                    self.timeouts_queued += 1;
+                    self.engine.at(abandon, Ev::Abandon { msg: mid });
+                }
+                held.push(id);
+            }
+            None => {}
+        }
         let m = self.msgs.get_mut(&mid).expect("message");
         if let Some(plan) = plan {
-            let Ok(outbound) = plan.outbound else {
-                return self.fail_hop(mid, holder, Fault::HopBudgetExhausted);
-            };
             m.path.push(holder);
-            m.route.links = outbound;
+            m.route.links = plan.outbound.expect("checked above");
         }
         m.at = next;
-        if self.cut(holder, next) {
+        if cut {
             self.report.counters.link_failures += 1;
             let failed = Ev::LinkDown { msg: mid, holder };
             return self.engine.at(now + CONNECT_TIMEOUT, failed);
@@ -2067,26 +2219,32 @@ impl<'s> Model<'s> {
             self.timeouts_queued += 1;
             self.engine.at(abandon, Ev::LastHop { msg: mid });
         }
-        let conn = if holder == self.msgs[&mid].from {
-            self.msgs[&mid].worker as u8
-        } else {
-            self.conn_worker(mid)
-        };
-        // Charged on the crypto helper, though production signs inline on the I/O worker
-        // (`src/peer.rs` `sign_request_to`, `append_request`); see `dst/MODEL.md`, "Signing
-        // placement".
+        // Production signs inline on the I/O worker (`src/peer.rs` `sign_request_to`,
+        // `append_request`); only verification goes to the crypto helper.
         let proofs = self.msgs[&mid].path.len();
-        let signed =
-            self.fabric
-                .crypto(ready, holder, conn, self.fabric.costs.sign_request(proofs));
+        let cost = self.fabric.costs.sign_request(proofs);
+        let signed = self.fabric.cpu_from(now, ready, holder, conn, cost);
         let arrive = self.fabric.message(signed, holder, next);
-        self.engine.at(
-            arrive,
-            Ev::Hop {
-                msg: mid,
-                verified: false,
-            },
-        );
+        match acquired {
+            Some(Acquire::Queued(id)) => {
+                // Production stops accepting with every ingress slot held; the connection waits
+                // in the kernel accept queue (`peer/server.rs` `listen`).
+                self.queued.insert(id, (mid, arrive));
+            }
+            Some(Acquire::Dropped(_)) => {
+                // A full accept queue drops the handshake: the sender hears nothing and its
+                // attempt times out.
+                self.report.counters.messages_lost += 1;
+                self.lose_msg(mid);
+            }
+            _ => self.engine.at(
+                arrive,
+                Ev::Hop {
+                    msg: mid,
+                    verified: false,
+                },
+            ),
+        }
     }
 
     /// Forwarding `msg` from `holder` failed with `fault` (racer-sim `fail_hop`; production
@@ -2192,15 +2350,14 @@ impl<'s> Model<'s> {
             .fold(ready, |t, hop| self.fabric.message(t, hop[0], hop[1]))
     }
 
-    /// `node` signs a peer response on the crypto helper paired with the worker holding `mid`'s
-    /// connection (racer-sim `send_reply`); returns when the signature is ready. Production
-    /// signs inline on the I/O worker (`Forwarding::sign_response` from `peer/server.rs`); see
-    /// `dst/MODEL.md`, "Signing placement".
+    /// `node` signs a peer response on the I/O worker holding `mid`'s connection, inline as
+    /// production does (`Forwarding::sign_response` from `peer/server.rs`; racer-sim
+    /// `send_reply`); returns when the signature is ready.
     fn sign(&mut self, node: u32, mid: u64) -> Nanos {
         let now = self.now();
         let conn = self.conn_worker(mid);
         self.fabric
-            .crypto(now, node, conn, self.fabric.costs.crypto_sign_response_ns)
+            .cpu(now, node, conn, self.fabric.costs.crypto_sign_response_ns)
     }
 
     /// The worker of a node that holds request `mid`'s connection, as the Model spreads peer
@@ -2323,6 +2480,7 @@ impl<'s> Model<'s> {
         }
         let ready = self.sign(to, asker.msg);
         let at = self.message_back(ready, &route);
+        self.answered_msgs.insert(asker.msg);
         // Production keeps each relay's `Relay` reservation until it has written the answer
         // upstream (`peer/server.rs` `send_http_response` clears `relay.reservation`).
         self.release_relays_at(asker.msg, at);
@@ -2794,6 +2952,13 @@ impl<'s> Model<'s> {
                     .or_default() += 1;
             }
         }
+        // A request still in an accept queue when the run ends is in flight, not lost: its
+        // requester's attempt bound lies past the end.
+        let waiting: BTreeSet<u64> = self.queued.values().map(|(mid, _)| *mid).collect();
+        for mid in &waiting {
+            self.msgs.remove(mid);
+            self.relay_charges.remove(mid);
+        }
         if !self.msgs.is_empty() {
             self.violation(format!("{} peer requests never ended", self.msgs.len()));
         }
@@ -2801,6 +2966,18 @@ impl<'s> Model<'s> {
             let held = self.relay_charges.len();
             self.violation(format!("{held} requests still hold relay transfers"));
         }
+        let stats = self.conns.stats();
+        let c = &mut self.report.counters;
+        c.conn_reused = stats.reused;
+        c.conn_accepted = stats.accepted;
+        c.conn_queued = stats.queued;
+        c.conn_dropped = stats.dropped;
+        c.conn_overloaded_endpoint = stats.overloaded_endpoint;
+        c.conn_overloaded_pool = stats.overloaded_pool;
+        c.conn_idle_cleared = stats.idle_cleared;
+        c.conn_idle_expired = stats.idle_expired;
+        c.conn_most_queued = stats.most_queued as u64;
+        c.conn_idle_evicted = stats.idle_evicted;
         let c = &self.report.counters;
         let ended = c.reads_completed + c.reads_failed + c.reads_skipped_not_member;
         if ended != self.expected_reads {
@@ -3157,6 +3334,46 @@ mod tests {
         let at = model.instant(model.now());
         assert!(!model.nodes[0].silence.unanswered(&5, at));
         assert!(!model.nodes[0].silence.silent(&5, at));
+    }
+
+    /// A request waiting for verification must not hold its destination worker's CPU: the
+    /// worker stays free for other work (signing, searches) until the verification ends.
+    #[test]
+    fn a_request_waiting_for_verification_leaves_its_worker_free() {
+        let scenario = crate::scenarios::cold_start(16);
+        let spec = scenario.model.as_deref().expect("model spec");
+        let mut model = Model::new(&scenario, spec, Choices::seeded(1));
+        let version = model.versions.borrow().adopted(0).number;
+        let mid = 7;
+        model.msgs.insert(
+            mid,
+            Msg {
+                from: 0,
+                worker: 0,
+                read: ReadId(0),
+                id: EffectId::default(),
+                dest: 1,
+                page: page(1),
+                route: Route {
+                    version,
+                    copy_only: false,
+                    deadline: 10 * SECONDS,
+                    attempts: 1,
+                    links: 4,
+                    charged: 4,
+                },
+                path: vec![0],
+                at: 1,
+                abandon: 10 * SECONDS,
+                ping: None,
+            },
+        );
+        let conn = model.conn_worker(mid);
+        // A deep crypto queue: the verification ends 10 ms from now.
+        model.fabric.crypto(0, 1, conn, 10 * MILLIS);
+        model.hop(mid, false);
+        let worker = owner_worker(page(1), spec.workers.max(1)) as u8;
+        assert_eq!(model.fabric.cpu(0, 1, worker, 1), 1);
     }
 
     #[test]

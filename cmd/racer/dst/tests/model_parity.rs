@@ -133,6 +133,13 @@ fn model_memory_per_node() {
         if let Ok(r) = std::env::var("MODEL_RELAY_TRANSFERS") {
             spec.relay_transfers = r.parse().unwrap();
         }
+        // `MODEL_CONNECTIONS`: `production` models production's peer connection slots,
+        // `evict` adds the proposed eviction of idle inbound connections; unset leaves them off.
+        if let Ok(mode) = std::env::var("MODEL_CONNECTIONS") {
+            let mut config = model::ConnectionConfig::production(spec.workers);
+            config.evict_idle = mode == "evict";
+            spec.connections = Some(config);
+        }
     }
     // `MODEL_SEED`: the cold start's seed, 8 by default.
     let seed = std::env::var("MODEL_SEED").map_or(8, |s| s.parse().unwrap());
@@ -229,4 +236,38 @@ fn membership_churn_refreshes_falls_back_and_waits() {
             "{name}: {coverage}"
         );
     }
+}
+
+/// Production peer connection slots on the 400-node cold start (`racer_core::connections`):
+/// after the burst, hot nodes' ingress slots stay held by idle connections their peers keep
+/// pooled (30 s on both sides), so later connections wait in the accept queue. Evicting the
+/// longest-idle inbound connection when the listener is full (the proposed fix, not
+/// production) cuts the waits that outlive their attempt and the reads they fail. See `dst/MODEL.md`, "Peer connection slots".
+#[test]
+fn idle_connections_pin_ingress_slots() {
+    let counters = |evict: bool| {
+        let mut scenario = scenarios::cold_start(400);
+        let spec = std::rc::Rc::get_mut(scenario.model.as_mut().unwrap()).unwrap();
+        let mut config = model::ConnectionConfig::production(spec.workers);
+        config.evict_idle = evict;
+        spec.connections = Some(config);
+        let (_, report) = model::run(&scenario, Choices::seeded(8));
+        report["metrics"]["counters"].clone()
+    };
+    let count = |c: &serde_json::Value, k: &str| c[k].as_u64().unwrap();
+    let production = counters(false);
+    let evicting = counters(true);
+    assert!(count(&production, "conn_queued") > 0, "{production}");
+    assert!(count(&production, "conn_reused") > 0, "{production}");
+    assert_eq!(count(&production, "conn_idle_evicted"), 0, "{production}");
+    assert!(count(&evicting, "conn_idle_evicted") > 0, "{evicting}");
+    // Waits that outlive the requester's attempt, and the reads they fail.
+    assert!(
+        count(&evicting, "conn_queue_abandoned") * 2 < count(&production, "conn_queue_abandoned"),
+        "{production} {evicting}"
+    );
+    assert!(
+        count(&evicting, "reads_failed") < count(&production, "reads_failed"),
+        "{production} {evicting}"
+    );
 }

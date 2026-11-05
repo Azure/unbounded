@@ -96,6 +96,28 @@ pub struct Counters {
     pub relay_sheds: u64,
     /// Requests whose verification found the crypto queue full (racer-sim `verify_sheds`).
     pub verify_sheds: u64,
+    /// Links that reused an idle connection (`racer_core::connections::Stats`).
+    pub conn_reused: u64,
+    /// Links whose new connection was accepted at once.
+    pub conn_accepted: u64,
+    /// Links whose new connection waited in the receiver's accept queue.
+    pub conn_queued: u64,
+    /// Links whose new connection a full accept queue dropped.
+    pub conn_dropped: u64,
+    /// Links refused `Overloaded` by the per-endpoint cap.
+    pub conn_overloaded_endpoint: u64,
+    /// Links refused `Overloaded` by a full outbound pool.
+    pub conn_overloaded_pool: u64,
+    /// Idle connections a full outbound pool closed.
+    pub conn_idle_cleared: u64,
+    /// Idle connections that timed out.
+    pub conn_idle_expired: u64,
+    /// The longest accept queue.
+    pub conn_most_queued: u64,
+    /// Idle inbound connections a full listener closed (not production).
+    pub conn_idle_evicted: u64,
+    /// Requests whose accept-queue wait outlived their requester's attempt.
+    pub conn_queue_abandoned: u64,
     /// Route searches refused with every search slot busy (racer-sim `route_search_overloaded`).
     pub search_sheds: u64,
     /// Membership changes (racer-sim `membership_changes`).
@@ -207,6 +229,17 @@ impl Report {
                     "relays": c.relays,
                     "relay_sheds": c.relay_sheds,
                     "verify_sheds": c.verify_sheds,
+                    "conn_reused": c.conn_reused,
+                    "conn_accepted": c.conn_accepted,
+                    "conn_queued": c.conn_queued,
+                    "conn_dropped": c.conn_dropped,
+                    "conn_overloaded_endpoint": c.conn_overloaded_endpoint,
+                    "conn_overloaded_pool": c.conn_overloaded_pool,
+                    "conn_idle_cleared": c.conn_idle_cleared,
+                    "conn_idle_expired": c.conn_idle_expired,
+                    "conn_most_queued": c.conn_most_queued,
+                    "conn_idle_evicted": c.conn_idle_evicted,
+                    "conn_queue_abandoned": c.conn_queue_abandoned,
                     "search_sheds": c.search_sheds,
                     "membership_changes": c.membership_changes,
                     "membership_publications": c.membership_publications,
