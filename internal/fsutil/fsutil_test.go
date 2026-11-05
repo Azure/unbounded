@@ -9,8 +9,10 @@ import (
 	"path/filepath"
 	"slices"
 	"strings"
+	"sync"
 	"testing"
 
+	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
 	"github.com/Azure/unbounded/internal/fsutil"
@@ -165,4 +167,77 @@ func TestWriteFileAtomicFailureLeavesNoTemporaryFile(t *testing.T) {
 
 	require.Error(t, fsutil.WriteFileAtomic(path, []byte("x"), 0o644))
 	require.NoFileExists(t, path+".tmp")
+	requireOnlyEntries(t, filepath.Dir(path), "dest")
+}
+
+// The temporary file is unique per write, so a stale fixed-name temporary
+// file left by an earlier crash neither blocks a write nor is renamed into
+// place, and only the destination remains afterwards.
+func TestWriteFileAtomicIgnoresAStaleTemporaryFile(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	path := filepath.Join(dir, "file")
+	require.NoError(t, os.WriteFile(path+".tmp", []byte("stale"), 0o600))
+
+	require.NoError(t, fsutil.WriteFileAtomic(path, []byte("fresh"), 0o640))
+
+	got, err := os.ReadFile(path)
+	require.NoError(t, err)
+	require.Equal(t, "fresh", string(got))
+
+	info, err := os.Stat(path)
+	require.NoError(t, err)
+	require.Equal(t, os.FileMode(0o640), info.Mode().Perm())
+	requireOnlyEntries(t, dir, "file", "file.tmp")
+}
+
+func TestWriteFileAtomicConcurrentWritersLeaveOneWholeFile(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	path := filepath.Join(dir, "file")
+	contents := []string{"aaaaaaaa", "bbbbbbbb", "cccccccc", "dddddddd"}
+
+	var wg sync.WaitGroup
+
+	for _, c := range contents {
+		wg.Add(1)
+
+		go func() {
+			defer wg.Done()
+
+			assert.NoError(t, fsutil.WriteFileAtomic(path, []byte(c), 0o644))
+		}()
+	}
+
+	wg.Wait()
+
+	got, err := os.ReadFile(path)
+	require.NoError(t, err)
+	require.Contains(t, contents, string(got))
+	requireOnlyEntries(t, dir, "file")
+}
+
+func TestWriteFileAtomicReportsAnUncreatableParent(t *testing.T) {
+	t.Parallel()
+
+	blocker := filepath.Join(t.TempDir(), "blocker")
+	require.NoError(t, os.WriteFile(blocker, nil, 0o644))
+
+	require.Error(t, fsutil.WriteFileAtomic(filepath.Join(blocker, "sub", "file"), []byte("x"), 0o644))
+}
+
+func requireOnlyEntries(t *testing.T, dir string, want ...string) {
+	t.Helper()
+
+	entries, err := os.ReadDir(dir)
+	require.NoError(t, err)
+
+	var names []string
+	for _, e := range entries {
+		names = append(names, e.Name())
+	}
+
+	require.ElementsMatch(t, want, names)
 }
