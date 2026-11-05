@@ -1,7 +1,7 @@
 //! Explicit mailbox execution. Cancellation requests never release accepted work.
 
 use super::{Command, Completion, Mailbox, Reply};
-use crate::{CancelWait, Error, Operation, Result, Scope, drivers::Runnable};
+use crate::rt::{CancelWait, Error, Operation, Result, Scope, drivers::Runnable};
 use std::{
     collections::VecDeque,
     rc::Rc,
@@ -198,9 +198,9 @@ impl<V: 'static, B: 'static, S: ExecutionScope> Executor<V, B, S> {
     }
 
     /// Drop accepted tasks only after the simulated operating system's crash cut.
-    #[cfg(feature = "simulation")]
+    #[cfg(test)]
     pub fn simulation_crash(&mut self) {
-        assert!(crate::reactor::simulation::Simulation::current().is_some());
+        assert!(crate::rt::reactor::simulation::Simulation::current().is_some());
         self.active.clear();
     }
 }
@@ -218,7 +218,7 @@ impl<V, B, S: ExecutionScope> Drop for Executor<V, B, S> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{environment::Cancellation, test_util::WakeCounter};
+    use crate::rt::{environment::Cancellation, test_util::WakeCounter};
     use std::{cell::RefCell, task::Waker};
 
     /// Cancellation-only execution policy with independent accepted scopes.

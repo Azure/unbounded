@@ -1,14 +1,14 @@
 //! Caller error conversion may inspect and close the mailbox that rejected work.
 
+use racer::rt::{
+    Error, Result, Scope,
+    mailbox::{Command, Mailbox},
+};
 use std::{
     alloc::{GlobalAlloc, Layout, System},
     cell::{Cell, RefCell},
     sync::{Arc, mpsc},
     time::Duration,
-};
-use uring_runtime::{
-    Error, Result, Scope,
-    mailbox::{Command, Mailbox},
 };
 
 /// Scope with no allocation or policy failures before mailbox admission.

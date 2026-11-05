@@ -1,5 +1,5 @@
 [workspace]
-members = [".", "runtime", "io", "alloc", "crypto", "verbs", "gpu", "http", "topology", "telemetry", "flow", "flow-core", "control-wire", "controlplane", "uds-endpoint", "wire-codec", "peer-wire", "object-wire", "cluster-control", "core", "sim", "dst"]
+members = [".", "io", "alloc", "crypto", "verbs", "gpu", "http", "topology", "telemetry", "flow", "flow-core", "control-wire", "controlplane", "uds-endpoint", "wire-codec", "peer-wire", "object-wire", "cluster-control", "core", "sim", "dst"]
 resolver = "3"
 
 [package]
@@ -41,7 +41,6 @@ racer-crypto = { path = "crypto" }
 rdma-verbs = { path = "verbs" }
 racer-gpu = { path = "gpu" }
 page-alloc = { path = "alloc" }
-uring-runtime = { path = "runtime" }
 racer-io = { path = "io" }
 base64 = "0.22"
 futures = "0.3"
@@ -67,12 +66,11 @@ uds-endpoint = { path = "uds-endpoint", features = ["test-util"] }
 rdma-verbs = { path = "verbs", features = ["simulation"] }
 racer-gpu = { path = "gpu", features = ["simulation"] }
 http1 = { path = "http", features = ["test-util"] }
-uring-runtime = { path = "runtime", features = ["simulation", "test-util"] }
 
 # Keep source locations and inline frames for Parca.
 #
 # The hot path crosses crate boundaries on every operation (racer ->
-# uring-runtime -> flow-control -> page-alloc -> http1), so cross-crate inlining
+# racer-io -> flow-control -> page-alloc -> http1), so cross-crate inlining
 # is load bearing.
 #
 # A panic in a release build aborts the process: a panicking worker, reactor

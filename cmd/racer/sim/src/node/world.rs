@@ -2833,7 +2833,7 @@ impl NodeWorld {
         }
     }
 
-    /// One hedge contender finished (production `record_result` in `uring_runtime::drivers::race`).
+    /// One hedge contender finished (production `record_result` in `racer::rt::drivers::race`).
     fn hedge_result(&mut self, id: u64, primary: bool, result: Result<(), Error>) {
         let Some(fill) = self.fills.get_mut(&id) else {
             return;

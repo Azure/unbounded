@@ -72,7 +72,7 @@ impl Simulation {
 // MIGRATION: lets callers that still select a world by thread build reactors
 // explicitly; delete with the thread-local selection.
 pub fn ambient_env() -> racer_io::Env {
-    let ctx = crate::environment::Environment::current().worker_ctx();
+    let ctx = crate::rt::environment::Environment::current().worker_ctx();
     match Simulation::current() {
         Some(sim) => racer_io::Env::sim(sim.os(), ctx),
         None => racer_io::Env::new(racer_io::Driver::Uring, ctx),

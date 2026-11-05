@@ -105,7 +105,7 @@ use std::task::Poll;
 use std::time::Duration;
 use std::time::UNIX_EPOCH;
 
-use uring_runtime::drivers::poll_task;
+use crate::rt::drivers::poll_task;
 
 mod devices;
 mod native;
@@ -800,7 +800,7 @@ fn drive_bootstrap<T>(
     stoppable: bool,
     mut operation: std::pin::Pin<&mut (dyn std::future::Future<Output = Result<T>> + '_)>,
 ) -> Result<T> {
-    let waker = uring_runtime::drivers::thread_waker(Some(reactor.waker()?));
+    let waker = crate::rt::drivers::thread_waker(Some(reactor.waker()?));
     let mut cx = Context::from_waker(&waker);
     loop {
         if stoppable && stop_requested() {
@@ -967,7 +967,7 @@ pub struct WorkerApplication {
 
     pressure: WorkerPressure,
 
-    drivers: Rc<uring_runtime::drivers::DriverQueue>,
+    drivers: Rc<crate::rt::drivers::DriverQueue>,
 
     http: Rc<HttpPool>,
 
@@ -1284,7 +1284,7 @@ impl WorkerApplication {
         runtime
             .crypto
             .set_failure_observer(node.failures.observer(worker));
-        let drivers = Rc::new(uring_runtime::drivers::DriverQueue::new(1024));
+        let drivers = Rc::new(crate::rt::drivers::DriverQueue::new(1024));
         let _queue = drivers.enter();
         let admission = runtime.admission.clone();
         config.page_hedge.validate()?;

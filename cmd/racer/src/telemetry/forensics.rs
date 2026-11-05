@@ -363,7 +363,7 @@ pub struct BodyProgress {
 }
 
 pub(crate) fn timestamp(clock: &racer_io::Clock, at: std::time::Instant) -> u64 {
-    crate::peer::protocol::encode_deadline(clock, uring_runtime::environment::Deadline(at))
+    crate::peer::protocol::encode_deadline(clock, crate::rt::environment::Deadline(at))
         .unwrap_or_default()
 }
 
@@ -472,7 +472,7 @@ pub(crate) struct FlightExpiry {
 
     pub overshoot_us: u64,
 
-    pub queue: uring_runtime::offload::AdmissionSnapshot,
+    pub queue: crate::rt::offload::AdmissionSnapshot,
 
     pub caller_head: Option<bool>,
 
@@ -1155,7 +1155,7 @@ mod gate_event_tests {
         let facts = FlightExpiry {
             observed_unix_ms: u64::MAX,
             overshoot_us: u64::MAX,
-            queue: uring_runtime::offload::AdmissionSnapshot {
+            queue: crate::rt::offload::AdmissionSnapshot {
                 queued: usize::MAX,
                 capacity: usize::MAX,
                 head: Some(u64::MAX),

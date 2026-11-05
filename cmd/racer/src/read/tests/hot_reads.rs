@@ -30,12 +30,12 @@ mod duplex_release {
 
     #[test]
     fn duplex_exact_release_before_final_send_cqe_is_provisional() {
-        use uring_runtime::reactor::simulation::Fault;
-        use uring_runtime::reactor::simulation::Simulation;
+        use crate::rt::reactor::simulation::Fault;
+        use crate::rt::reactor::simulation::Simulation;
         for mode in ["valid", "duplicate", "malformed", "short", "drop"] {
             let sim = Simulation::new();
             let _sim = sim.enter();
-            let queue = Rc::new(uring_runtime::drivers::DriverQueue::new(1024));
+            let queue = Rc::new(crate::rt::drivers::DriverQueue::new(1024));
             let _owner = queue.enter();
             let signers = network(1);
             let mut f = fixture();
@@ -81,7 +81,7 @@ mod duplex_release {
             let mut bytes = Vec::new();
             let mut pump = |endpoint: &mut crate::read::dispatch::WorkerEndpoint| {
                 endpoint.poll(&mut cx, 64).unwrap();
-                uring_runtime::drivers::poll(&mut cx, 64);
+                crate::rt::drivers::poll(&mut cx, 64);
                 crate::lifecycle::Service::poll_budgeted(
                     &mut f.engine,
                     &mut std::task::Context::from_waker(futures::task::noop_waker_ref()),
@@ -214,9 +214,9 @@ mod duplex_release {
     }
 
     fn run(mode: &str) {
-        let queue = Rc::new(uring_runtime::drivers::DriverQueue::new(1024));
+        let queue = Rc::new(crate::rt::drivers::DriverQueue::new(1024));
         let _owner = queue.enter();
-        let clock = uring_runtime::environment::SimulationClock::new(311);
+        let clock = crate::rt::environment::SimulationClock::new(311);
         let environment = clock.environment(0);
         let _clock = environment.enter();
         let signers = network(1);
@@ -228,7 +228,7 @@ mod duplex_release {
         let scope = RequestScope::on(
             &crate::test_support::clock(),
             f.scope.request,
-            uring_runtime::environment::now() + Duration::from_secs(60),
+            crate::rt::environment::now() + Duration::from_secs(60),
         )
         .unwrap();
         let request = ClientRequest {
@@ -765,7 +765,7 @@ pub(super) fn coordinator_with_window(
 
 #[test]
 fn concurrent_reads_share_page_work_and_bound_fetch_by_credit() {
-    let queue = Rc::new(uring_runtime::drivers::DriverQueue::new(1024));
+    let queue = Rc::new(crate::rt::drivers::DriverQueue::new(1024));
     let _owner = queue.enter();
     let signers = network(1);
     let mut f = fixture_with(3 * PAGE_BYTES + 7, None);
@@ -885,7 +885,7 @@ fn concurrent_reads_share_page_work_and_bound_fetch_by_credit() {
 
 #[test]
 fn fetch_window_is_not_an_unreleased_credit_ceiling() {
-    let queue = Rc::new(uring_runtime::drivers::DriverQueue::new(1024));
+    let queue = Rc::new(crate::rt::drivers::DriverQueue::new(1024));
     let _owner = queue.enter();
     // Full-page batch, then a one-byte boundary with byte credit just below
     // and exactly at the threshold for two additional full pages.
@@ -996,7 +996,7 @@ fn fetch_window_is_not_an_unreleased_credit_ceiling() {
 fn zero_priority_read_beside_active_cache_progresses_while_first_page_is_held() {
     use crate::admission::ResourceClass;
     use flow_control::Policy;
-    let queue = Rc::new(uring_runtime::drivers::DriverQueue::new(1024));
+    let queue = Rc::new(crate::rt::drivers::DriverQueue::new(1024));
     let _owner = queue.enter();
     let signers = network(1);
     // Production sizes stream and admission windows from the same setting.
@@ -1108,7 +1108,7 @@ fn zero_priority_read_beside_active_cache_progresses_while_first_page_is_held() 
 
 #[test]
 fn later_page_completes_before_head_and_cancellation_keeps_completion_fence() {
-    let queue = Rc::new(uring_runtime::drivers::DriverQueue::new(1024));
+    let queue = Rc::new(crate::rt::drivers::DriverQueue::new(1024));
     let _owner = queue.enter();
     for mode in ["success", "cancel", "drop", "failure"] {
         let signers = network(1);
@@ -1142,7 +1142,7 @@ fn later_page_completes_before_head_and_cancellation_keeps_completion_fence() {
         let mut pump = |endpoint: &mut crate::read::dispatch::WorkerEndpoint| {
             let mut cx = Context::from_waker(futures::task::noop_waker_ref());
             endpoint.poll(&mut cx, 64).unwrap();
-            uring_runtime::drivers::poll(&mut cx, 64);
+            crate::rt::drivers::poll(&mut cx, 64);
             crate::lifecycle::Service::poll_budgeted(
                 &mut f.engine,
                 &mut std::task::Context::from_waker(futures::task::noop_waker_ref()),
@@ -1337,7 +1337,7 @@ fn production_range_windows(old_provider: bool) -> Vec<Rc<LinkStats>> {
             })
         })
         .collect();
-    let queue = Rc::new(uring_runtime::drivers::DriverQueue::new(1024));
+    let queue = Rc::new(crate::rt::drivers::DriverQueue::new(1024));
     let _owner = queue.enter();
     let signers = network(3);
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
@@ -1526,7 +1526,7 @@ fn production_range_windows(old_provider: bool) -> Vec<Rc<LinkStats>> {
                 )
                 .unwrap();
         }
-        uring_runtime::drivers::poll(
+        crate::rt::drivers::poll(
             &mut Context::from_waker(futures::task::noop_waker_ref()),
             64,
         );
@@ -1658,7 +1658,7 @@ fn production_range_windows(old_provider: bool) -> Vec<Rc<LinkStats>> {
 }
 #[test]
 fn origin_fill_preserves_ciphertext_for_memory_and_pending_candidate_copy() {
-    let queue = Rc::new(uring_runtime::drivers::DriverQueue::new(1024));
+    let queue = Rc::new(crate::rt::drivers::DriverQueue::new(1024));
     let _owner = queue.enter();
     let mut f = fixture();
     let mut budget = AcquisitionBudget::new(f.scope.deadline.0, 8, 8);
@@ -1753,7 +1753,7 @@ fn fill_and_release(f: &mut Fixture) -> CiphertextPage {
 
 #[test]
 fn memory_cache_retains_only_ciphertext_after_delivery() {
-    let queue = Rc::new(uring_runtime::drivers::DriverQueue::new(1024));
+    let queue = Rc::new(crate::rt::drivers::DriverQueue::new(1024));
     let _owner = queue.enter();
     let mut f = fixture();
     let ciphertext = fill_and_release(&mut f);
@@ -1767,7 +1767,7 @@ fn memory_cache_retains_only_ciphertext_after_delivery() {
 
 #[test]
 fn cached_ciphertext_hit_decrypts_without_refetching() {
-    let queue = Rc::new(uring_runtime::drivers::DriverQueue::new(1024));
+    let queue = Rc::new(crate::rt::drivers::DriverQueue::new(1024));
     let _owner = queue.enter();
     let mut f = fixture();
     let ciphertext = fill_and_release(&mut f);
@@ -1796,7 +1796,7 @@ fn cached_ciphertext_hit_decrypts_without_refetching() {
 
 #[test]
 fn concurrent_cached_ciphertext_hits_coalesce_into_one_decrypt() {
-    let queue = Rc::new(uring_runtime::drivers::DriverQueue::new(1024));
+    let queue = Rc::new(crate::rt::drivers::DriverQueue::new(1024));
     let _owner = queue.enter();
     let mut f = fixture();
     fill_and_release(&mut f);
@@ -1811,7 +1811,7 @@ fn concurrent_cached_ciphertext_hits_coalesce_into_one_decrypt() {
 
 #[test]
 fn live_plaintext_is_reused_without_another_decrypt() {
-    let queue = Rc::new(uring_runtime::drivers::DriverQueue::new(1024));
+    let queue = Rc::new(crate::rt::drivers::DriverQueue::new(1024));
     let _owner = queue.enter();
     let mut f = fixture();
     let mut budget = AcquisitionBudget::new(f.scope.deadline.0, 8, 8);
@@ -1834,7 +1834,7 @@ fn live_plaintext_is_reused_without_another_decrypt() {
 
 #[test]
 fn peers_receive_cached_ciphertext_without_plaintext() {
-    let queue = Rc::new(uring_runtime::drivers::DriverQueue::new(1024));
+    let queue = Rc::new(crate::rt::drivers::DriverQueue::new(1024));
     let _owner = queue.enter();
     let mut f = fixture();
     let ciphertext = fill_and_release(&mut f);
@@ -1949,7 +1949,7 @@ fn read_range(
             continue;
         }
         endpoint.poll(&mut cx, 64).unwrap();
-        uring_runtime::drivers::poll(&mut cx, 64);
+        crate::rt::drivers::poll(&mut cx, 64);
         crate::lifecycle::Service::poll_budgeted(&mut f.engine, &mut cx, 64).unwrap();
         f.crypto.poll_budgeted(64).unwrap();
         f.reactor.poll_budgeted(128).unwrap();
@@ -1958,7 +1958,7 @@ fn read_range(
     drop(stream);
     for _ in 0..32 {
         endpoint.poll(&mut cx, 64).unwrap();
-        uring_runtime::drivers::poll(&mut cx, 64);
+        crate::rt::drivers::poll(&mut cx, 64);
     }
     delivered
 }
@@ -1967,7 +1967,7 @@ fn read_range(
 fn warm_range_reread_decrypts_cached_ciphertext_without_any_transfer() {
     const PAGES: u64 = 6;
     const WINDOW: usize = 4;
-    let queue = Rc::new(uring_runtime::drivers::DriverQueue::new(1024));
+    let queue = Rc::new(crate::rt::drivers::DriverQueue::new(1024));
     let _owner = queue.enter();
     let signers = network(2);
     let mut f = roomy_fixture(PAGES);
@@ -2009,7 +2009,7 @@ fn warm_range_reread_decrypts_cached_ciphertext_without_any_transfer() {
 fn warm_range_reread_transfers_only_uncached_pages() {
     const PAGES: u64 = 6;
     const WINDOW: usize = 4;
-    let queue = Rc::new(uring_runtime::drivers::DriverQueue::new(1024));
+    let queue = Rc::new(crate::rt::drivers::DriverQueue::new(1024));
     let _owner = queue.enter();
     let signers = network(1);
     let mut f = roomy_fixture(PAGES);

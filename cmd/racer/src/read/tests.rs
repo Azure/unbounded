@@ -83,7 +83,7 @@ pub(crate) fn page(byte: u8) -> crate::memory::PageResult {
 }
 #[test]
 fn racer_capacity_and_reservation_errors_are_preserved() {
-    use uring_runtime::drivers::*;
+    use crate::rt::drivers::*;
     assert!(matches!(
         reserve().map_err(Error::from),
         Err(Error::InvalidConfiguration)
@@ -101,7 +101,7 @@ fn racer_capacity_and_reservation_errors_are_preserved() {
 }
 #[test]
 fn detached_operation_errors_release_capacity() {
-    use uring_runtime::drivers::*;
+    use crate::rt::drivers::*;
     let queue = Rc::new(DriverQueue::new(1024));
     let _owner = queue.enter();
     reserve()
@@ -290,7 +290,7 @@ mod flight {
         #[test]
         fn expiry_snapshot_prior_cap_can_be_free_at_expiry() {
             use std::future::Future;
-            let clock = uring_runtime::environment::SimulationClock::new(742);
+            let clock = crate::rt::environment::SimulationClock::new(742);
             let _environment = clock.environment(0).enter();
             let flights = flights(FlightLimits {
                 entries: 1,
@@ -342,7 +342,7 @@ mod flight {
         #[test]
         fn expiry_snapshot_scope_deadline_is_excluded() {
             use std::future::Future;
-            let clock = uring_runtime::environment::SimulationClock::new(743);
+            let clock = crate::rt::environment::SimulationClock::new(743);
             let sim_env = clock.environment(0);
             let _environment = sim_env.enter();
             let sim_ctx = sim_env.worker_ctx();
@@ -712,7 +712,7 @@ mod flight {
         fn bounded_admission_original_deadline_and_allowance_are_distinct() {
             use std::future::Future;
             for original_expires in [false, true] {
-                let clock = uring_runtime::environment::SimulationClock::new(741);
+                let clock = crate::rt::environment::SimulationClock::new(741);
                 let sim_env = clock.environment(0);
                 let _environment = sim_env.enter();
                 let sim_ctx = sim_env.worker_ctx();
@@ -1010,7 +1010,7 @@ mod flight {
 
         #[test]
         fn worker_poll_drives_owned_completion_after_waiter_disappears() {
-            let queue = Rc::new(uring_runtime::drivers::DriverQueue::new(1024));
+            let queue = Rc::new(crate::rt::drivers::DriverQueue::new(1024));
             let _owner = queue.enter();
             let flights = flights(FlightLimits::default());
             let (context, scope) = (origin(), scope());
@@ -1020,7 +1020,7 @@ mod flight {
             let operation = flights.retain_operation(&leader, metric_lease()).unwrap();
             let (send, receive) = futures::channel::oneshot::channel::<()>();
             let worker = flights.clone();
-            uring_runtime::drivers::reserve()
+            crate::rt::drivers::reserve()
                 .unwrap()
                 .submit_detached(Box::pin(async move {
                     receive.await.map_err(|_| Error::Io)?;
@@ -1037,7 +1037,7 @@ mod flight {
             send.send(()).unwrap();
             flights.poll_budgeted(1).unwrap();
             assert!(flights.table.borrow().is_empty());
-            assert_eq!(uring_runtime::drivers::pending(), 0);
+            assert_eq!(crate::rt::drivers::pending(), 0);
         }
 
         #[test]
@@ -2104,7 +2104,7 @@ mod flight {
 
     #[test]
     fn worker_poll_drives_parent_owned_queue_after_caller_drop() {
-        let queue = Rc::new(uring_runtime::drivers::DriverQueue::new(1024));
+        let queue = Rc::new(crate::rt::drivers::DriverQueue::new(1024));
         let _owner = queue.enter();
         let flights = flights(FlightLimits::default());
         let (context, scope) = (origin(), scope());
@@ -2113,7 +2113,7 @@ mod flight {
         let leader = lead(&mut a);
         let operation = flights.retain_operation(&leader, metric_lease()).unwrap();
         let (send, recv) = futures::channel::oneshot::channel::<()>();
-        uring_runtime::drivers::reserve()
+        crate::rt::drivers::reserve()
             .unwrap()
             .submit_detached(Box::pin(async move {
                 recv.await.map_err(|_| Error::Io)?;
@@ -2126,7 +2126,7 @@ mod flight {
         assert_eq!(flights.table.borrow().len(), 1);
         send.send(()).unwrap();
         assert!(matches!(poll(flights.drain(&scope)), Poll::Ready(Ok(()))));
-        assert_eq!(uring_runtime::drivers::pending(), 0);
+        assert_eq!(crate::rt::drivers::pending(), 0);
     }
 
     fn test_page() -> PageId {
@@ -2269,6 +2269,7 @@ mod timeouts {
     use crate::peer::protocol::Signatures;
     use crate::read::candidates::*;
     use crate::read::flight::AcquisitionBudget;
+    use crate::rt::environment::Deadline;
     use crate::runtime::RequestScope;
     use crate::security::OriginContext;
     use crate::test_support::security::network;
@@ -2288,7 +2289,6 @@ mod timeouts {
     use std::task::Poll;
     use std::time::Duration;
     use std::time::Instant;
-    use uring_runtime::environment::Deadline;
 
     struct Call {
         scope: RequestScope,
@@ -2466,7 +2466,7 @@ mod timeouts {
 
     impl Fixture {
         fn bounded(mut self, request: u8, seconds: u64, links: u8) -> Self {
-            let deadline = uring_runtime::environment::now() + Duration::from_secs(seconds);
+            let deadline = crate::rt::environment::now() + Duration::from_secs(seconds);
             self.scope = RequestScope::on(
                 &crate::test_support::clock(),
                 RequestId([request; 16]),
@@ -2559,7 +2559,7 @@ mod timeouts {
         /// attempt timeout first.
         fn resolve_page(
             &mut self,
-            clock: &uring_runtime::environment::SimulationClock,
+            clock: &crate::rt::environment::SimulationClock,
             stall: bool,
         ) -> Result<CandidateResolution> {
             let operation = PeerOperation::Page {
@@ -2616,7 +2616,7 @@ mod timeouts {
 
     #[test]
     fn continuously_slow_candidate_reserves_fenced_fallback_and_conserves_credits() {
-        let clock = uring_runtime::environment::SimulationClock::new_at(
+        let clock = crate::rt::environment::SimulationClock::new_at(
             94,
             Instant::now(),
             std::time::SystemTime::now(),
@@ -2681,7 +2681,7 @@ mod timeouts {
     #[test]
     fn slow_body_without_alternative_or_failure_route_credit_keeps_original_ceiling() {
         for (opportunities, links) in [(1, 24), (3, 4)] {
-            let clock = uring_runtime::environment::SimulationClock::new_at(
+            let clock = crate::rt::environment::SimulationClock::new_at(
                 95,
                 Instant::now(),
                 std::time::SystemTime::now(),
@@ -2739,7 +2739,7 @@ mod timeouts {
     #[test]
     fn known_healthy_body_outlives_share_with_or_without_affordable_fallback() {
         for links in [4, 24] {
-            let clock = uring_runtime::environment::SimulationClock::new_at(
+            let clock = crate::rt::environment::SimulationClock::new_at(
                 100,
                 Instant::now(),
                 std::time::SystemTime::now(),
@@ -2783,7 +2783,7 @@ mod timeouts {
 
     #[test]
     fn configured_total_cap_never_renews_or_accepts_late_success() {
-        let clock = uring_runtime::environment::SimulationClock::new_at(
+        let clock = crate::rt::environment::SimulationClock::new_at(
             96,
             Instant::now(),
             std::time::SystemTime::now(),
@@ -2834,7 +2834,7 @@ mod timeouts {
     #[test]
     fn candidate_final_early_credits_exhaustion_and_recovered_fallback() {
         for (credits, stalled, late, fails) in [(0, 0, false, true), (16, 1, true, false)] {
-            let clock = uring_runtime::environment::SimulationClock::new(198);
+            let clock = crate::rt::environment::SimulationClock::new(198);
             let _env = clock.environment(0).enter();
             let mut f = Fixture::new(None, stalled, late).bounded(198, 60, 24);
             f.budget = AcquisitionBudget::new(f.scope.deadline.0, credits, 24);
@@ -2883,7 +2883,7 @@ mod timeouts {
 
     #[test]
     fn candidate_final_preserves_late_success_and_effective_deadline_error() {
-        let clock = uring_runtime::environment::SimulationClock::new(199);
+        let clock = crate::rt::environment::SimulationClock::new(199);
         let _env = clock.environment(0).enter();
         let mut f = Fixture::new(None, 3, true).bounded(199, 60, 24);
         let failures = crate::telemetry::Failures::default();
@@ -2932,7 +2932,7 @@ mod timeouts {
     #[test]
     fn owner_page_walk_leaves_the_fetch_to_a_rank_zero_that_times_out() {
         for stalled in [1, 0] {
-            let clock = uring_runtime::environment::SimulationClock::new(201);
+            let clock = crate::rt::environment::SimulationClock::new(201);
             let _env = clock.environment(0).enter();
             let mut f = Fixture::new(Some(1), stalled, false).bounded(201, 60, 24);
             f.policy = f.policy.with_attempt_timeout(Duration::from_secs(1));
@@ -2962,7 +2962,7 @@ mod timeouts {
     /// next timeout gives authority.
     #[test]
     fn owner_page_walk_bounds_the_wait_for_a_silent_rank_zero() {
-        let clock = uring_runtime::environment::SimulationClock::new(205);
+        let clock = crate::rt::environment::SimulationClock::new(205);
         let _env = clock.environment(0).enter();
         let mut f = Fixture::new(Some(1), 3, false).bounded(205, 3, 24);
         f.policy = f
@@ -2997,7 +2997,7 @@ mod timeouts {
     /// rank 0 forgets the failure.
     #[test]
     fn owner_leaves_origin_retries_to_a_failing_rank_zero() {
-        let clock = uring_runtime::environment::SimulationClock::new(209);
+        let clock = crate::rt::environment::SimulationClock::new(209);
         let _env = clock.environment(0).enter();
         let mut f = Fixture::new(Some(1), 0, false).bounded(209, 60, 24);
         f.policy = f
@@ -3053,7 +3053,7 @@ mod timeouts {
     /// requester and page); an answer from it restores its place.
     #[test]
     fn reader_visits_an_owner_that_left_it_unanswered_after_the_others() {
-        let clock = uring_runtime::environment::SimulationClock::new(209);
+        let clock = crate::rt::environment::SimulationClock::new(209);
         let _env = clock.environment(0).enter();
         let mut f = Fixture::new(None, 1, false).bounded(209, 60, 24);
         f.policy = f
@@ -3100,7 +3100,7 @@ mod timeouts {
     #[test]
     fn reader_visits_an_owner_that_shed_it_after_the_others() {
         use racer_core::read::Answering;
-        let clock = uring_runtime::environment::SimulationClock::new(212);
+        let clock = crate::rt::environment::SimulationClock::new(212);
         let sim_env = clock.environment(0);
         let _env = sim_env.enter();
         let sim_ctx = sim_env.worker_ctx();
@@ -3160,7 +3160,7 @@ mod timeouts {
 
     #[test]
     fn candidate_final_remaining_copy_and_origin_miss_only_at_final_boundary() {
-        let clock = uring_runtime::environment::SimulationClock::new(200);
+        let clock = crate::rt::environment::SimulationClock::new(200);
         let _env = clock.environment(0).enter();
         let mut f = Fixture::new(Some(1), 1, true).bounded(200, 60, 24);
         let failures = crate::telemetry::Failures::default();
@@ -3233,7 +3233,7 @@ mod timeouts {
 
     #[test]
     fn retries_get_independent_local_caps_but_never_extend_overall_authority() {
-        let clock = uring_runtime::environment::SimulationClock::new_at(
+        let clock = crate::rt::environment::SimulationClock::new_at(
             101,
             Instant::now(),
             std::time::SystemTime::now(),

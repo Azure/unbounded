@@ -41,6 +41,7 @@ use crate::model::{
     PageNumber, StrongEtag,
 };
 use crate::read::candidates::OriginAuthority;
+use crate::rt::environment::Deadline;
 use crate::runtime::RequestScope;
 use crate::security::OriginContext;
 use http1::MessageHead;
@@ -51,7 +52,6 @@ use std::rc::Rc;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 use std::time::{SystemTime, UNIX_EPOCH};
-use uring_runtime::environment::Deadline;
 use zeroize::Zeroizing;
 
 /// An OAuth access token for `https://storage.azure.com/`. Zeroized on drop

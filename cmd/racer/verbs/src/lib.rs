@@ -6,8 +6,8 @@
 //!
 //! This crate spawns no threads and runs no executor, and neither does its C
 //! adapter: the RDMA connection manager is an event-driven state machine the
-//! owner advances when polled. Time and randomness come from the current
-//! `uring-runtime` environment.
+//! owner advances when polled. Time and randomness come from the explicit
+//! `racer_io::WorkerCtx` passed to `Owner::new`.
 //!
 //! # Basics
 //!

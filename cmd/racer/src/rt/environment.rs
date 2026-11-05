@@ -3,7 +3,7 @@
 //! Production uses the host clock and getrandom. Deterministic environments
 //! require the simulation feature. Deadline registries are explicitly driven by
 //! their owner; neither registering a deadline nor reading a clock starts a timer.
-use crate::{Error, Result};
+use crate::rt::{Error, Result};
 use std::{
     cell::{Cell, RefCell},
     collections::BTreeMap,
@@ -19,7 +19,7 @@ use std::{
 /// Time and entropy selection retained by a worker role across individual polls.
 #[derive(Clone, Debug, Default)]
 pub struct Environment {
-    #[cfg(feature = "simulation")]
+    #[cfg(test)]
     simulated: Option<Simulated>,
 }
 
@@ -52,7 +52,7 @@ pub struct Observer {
     epoch: u64,
 }
 
-#[cfg(feature = "simulation")]
+#[cfg(test)]
 thread_local! {
     static REQUIRE_SIMULATED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     static CURRENT: std::cell::RefCell<Environment> = const {
@@ -61,7 +61,7 @@ thread_local! {
 }
 
 /// Fail closed if a simulated role accidentally selects real clock/entropy.
-#[cfg(feature = "simulation")]
+#[cfg(test)]
 pub fn require_simulated() -> SimulationRequired {
     SimulationRequired(
         REQUIRE_SIMULATED.with(|required| required.replace(true)),
@@ -69,11 +69,11 @@ pub fn require_simulated() -> SimulationRequired {
     )
 }
 
-#[cfg(feature = "simulation")]
+#[cfg(test)]
 /// Restores the thread's previous host-access requirement when dropped.
 pub struct SimulationRequired(bool, PhantomData<Rc<()>>);
 
-#[cfg(feature = "simulation")]
+#[cfg(test)]
 impl Drop for SimulationRequired {
     /// Restore the strictness selected before this thread entered the guard.
     fn drop(&mut self) {
@@ -84,7 +84,7 @@ impl Drop for SimulationRequired {
 /// A guard belongs to the thread that entered it. Never hold it across an await;
 /// use `Environment::scope` to enter only while polling or dropping a future.
 pub struct Guard {
-    #[cfg(feature = "simulation")]
+    #[cfg(test)]
     previous: Environment,
 
     _local: PhantomData<Rc<()>>,
@@ -95,7 +95,7 @@ impl Environment {
     // MIGRATION: bridges thread-local environments to WorkerCtx until every
     // role receives its context explicitly.
     pub fn worker_ctx(&self) -> racer_io::WorkerCtx {
-        #[cfg(feature = "simulation")]
+        #[cfg(test)]
         if let Some(sim) = &self.simulated {
             return sim.ctx.clone();
         }
@@ -104,16 +104,16 @@ impl Environment {
 
     /// Capture this thread's selected environment, or the host environment.
     pub fn current() -> Self {
-        #[cfg(feature = "simulation")]
+        #[cfg(test)]
         return CURRENT.with(|current| current.borrow().clone());
-        #[cfg(not(feature = "simulation"))]
+        #[cfg(not(test))]
         Self::default()
     }
 
     /// Select this environment until the returned thread-local guard is dropped.
     pub fn enter(&self) -> Guard {
         Guard {
-            #[cfg(feature = "simulation")]
+            #[cfg(test)]
             previous: CURRENT.with(|current| current.replace(self.clone())),
             _local: PhantomData,
         }
@@ -131,7 +131,7 @@ impl Environment {
 impl Drop for Guard {
     /// Restore this thread's previous environment, including during unwinding.
     fn drop(&mut self) {
-        #[cfg(feature = "simulation")]
+        #[cfg(test)]
         CURRENT.with(|current| current.replace(std::mem::take(&mut self.previous)));
     }
 }
@@ -167,7 +167,7 @@ impl<F> Drop for Scoped<F> {
     }
 }
 
-#[cfg(feature = "simulation")]
+#[cfg(test)]
 /// Return the active simulated world's seed, or None for a host environment.
 pub fn simulation_seed() -> Option<u64> {
     Environment::current().simulated.map(|sim| sim.clock.seed)
@@ -175,7 +175,7 @@ pub fn simulation_seed() -> Option<u64> {
 
 /// Read monotonic time from the selected environment.
 pub fn now() -> Instant {
-    #[cfg(feature = "simulation")]
+    #[cfg(test)]
     if let Some(sim) = selected_simulation() {
         return sim.clock.clock.now();
     }
@@ -184,7 +184,7 @@ pub fn now() -> Instant {
 
 /// Read wall time, including simulated wall-clock corrections.
 pub fn wall_now() -> SystemTime {
-    #[cfg(feature = "simulation")]
+    #[cfg(test)]
     if let Some(sim) = selected_simulation() {
         return sim.clock.clock.wall_now();
     }
@@ -194,7 +194,7 @@ pub fn wall_now() -> SystemTime {
 /// Stable mapping anchor, unaffected by later wall-clock corrections. All roles
 /// of a simulated world use the same anchor, including after nested world scopes.
 pub fn clock_anchor() -> (Instant, SystemTime) {
-    #[cfg(feature = "simulation")]
+    #[cfg(test)]
     if let Some(sim) = selected_simulation() {
         return racer_io::Clock::from(sim.clock.clock.clone()).anchor();
     }
@@ -205,14 +205,14 @@ pub fn clock_anchor() -> (Instant, SystemTime) {
 
 /// Fill bytes from the host entropy source or the selected replayable role stream.
 pub fn fill_random(bytes: &mut [u8]) -> Result<(), getrandom::Error> {
-    #[cfg(feature = "simulation")]
+    #[cfg(test)]
     if let Some(sim) = selected_simulation() {
         return sim.entropy.lock().unwrap().fill(bytes);
     }
     getrandom::getrandom(bytes)
 }
 
-#[cfg(feature = "simulation")]
+#[cfg(test)]
 #[derive(Clone, Debug)]
 /// A world's clock and a role's shared entropy cursor.
 struct Simulated {
@@ -224,7 +224,7 @@ struct Simulated {
     ctx: racer_io::WorkerCtx,
 }
 
-#[cfg(feature = "simulation")]
+#[cfg(test)]
 #[derive(Debug)]
 /// A domain-separated, counter-based entropy stream with a partial-block cursor.
 struct Entropy {
@@ -241,7 +241,7 @@ struct Entropy {
     offset: usize,
 }
 
-#[cfg(feature = "simulation")]
+#[cfg(test)]
 impl Entropy {
     /// Copy whole available chunks while retaining the cursor across role clones.
     fn fill(&mut self, mut bytes: &mut [u8]) -> Result<(), getrandom::Error> {
@@ -273,7 +273,7 @@ impl Entropy {
 
 /// One clock per simulated world. Give each node/worker/role a stable, unique
 /// stream ID and retain its Environment; cloning a role shares its entropy cursor.
-#[cfg(feature = "simulation")]
+#[cfg(test)]
 #[derive(Clone, Debug)]
 pub struct SimulationClock {
     seed: u64,
@@ -283,7 +283,7 @@ pub struct SimulationClock {
     clock: racer_io::ctx::VirtualClock,
 }
 
-#[cfg(feature = "simulation")]
+#[cfg(test)]
 impl SimulationClock {
     /// Create a world with the process monotonic origin and a fixed wall epoch.
     pub fn new(seed: u64) -> Self {
@@ -345,12 +345,12 @@ impl SimulationClock {
     }
 
     /// Advance atomically or leave both clocks unchanged on overflow.
-    pub fn checked_advance(&self, duration: std::time::Duration) -> crate::Result<()> {
+    pub fn checked_advance(&self, duration: std::time::Duration) -> crate::rt::Result<()> {
         // Keep the old contract: the monotonic instant itself must not overflow.
         self.clock
             .now()
             .checked_add(duration)
-            .ok_or(crate::Error::InvalidInput)?;
+            .ok_or(crate::rt::Error::InvalidInput)?;
         self.clock.advance(duration)
     }
 
@@ -417,7 +417,7 @@ impl Deadline {
 
 impl Registry {
     /// Start at a chosen identifier to exercise exhaustion without many entries.
-    #[cfg(any(test, feature = "test-util"))]
+    #[cfg(test)]
     pub fn with_next_id(next: u64) -> Self {
         Self {
             next: Cell::new(next),
@@ -543,7 +543,7 @@ impl Observer {
 }
 
 /// Select the simulated role, rejecting host fallback inside a strict scope.
-#[cfg(feature = "simulation")]
+#[cfg(test)]
 fn selected_simulation() -> Option<Simulated> {
     let simulated = Environment::current().simulated;
     if simulated.is_none() {
@@ -564,7 +564,7 @@ pub fn unix_millis(time: SystemTime) -> Result<u64> {
 }
 
 /// Deterministic clock, entropy, and nested environment ownership regressions.
-#[cfg(all(test, feature = "simulation"))]
+#[cfg(test)]
 mod tests {
     use super::*;
     use std::time::Duration;
@@ -577,7 +577,7 @@ mod tests {
         let before = (now(), wall_now(), clock.elapsed());
         assert_eq!(
             clock.checked_advance(Duration::MAX),
-            Err(crate::Error::InvalidInput)
+            Err(crate::rt::Error::InvalidInput)
         );
         assert_eq!((now(), wall_now(), clock.elapsed()), before);
         assert!(std::panic::catch_unwind(|| clock.advance(Duration::MAX)).is_err());
@@ -843,15 +843,15 @@ mod deadline_tests {
     }
 
     /// Wall corrections never renew an existing monotonic deadline.
-    #[cfg(feature = "simulation")]
+    #[cfg(test)]
     #[test]
     fn deadline_mapping_is_stable_across_simulated_time_and_wall_jumps() {
-        let clock = crate::environment::SimulationClock::new(17);
+        let clock = crate::rt::environment::SimulationClock::new(17);
         let _environment = clock.environment(0).enter();
-        let deadline = Deadline(crate::environment::now() + Duration::from_secs(30));
+        let deadline = Deadline(crate::rt::environment::now() + Duration::from_secs(30));
         let encoded = deadline.to_unix_millis().unwrap();
         clock.advance(Duration::from_secs(60));
-        clock.set_wall_time(crate::environment::wall_now() + Duration::from_secs(100));
+        clock.set_wall_time(crate::rt::environment::wall_now() + Duration::from_secs(100));
         assert_eq!(deadline.to_unix_millis(), Ok(encoded));
         assert_eq!(
             Deadline::from_unix_millis(encoded)
@@ -926,13 +926,16 @@ mod registry_tests {
         assert_eq!(table.poll(now, 1), 1);
         assert_eq!(
             first.check(Waker::noop()),
-            Err(crate::Error::DeadlineExceeded)
+            Err(crate::rt::Error::DeadlineExceeded)
         );
         assert_eq!(second.check(Waker::noop()), Ok(()));
         drop(second);
         assert!(table.is_empty());
         let table = Rc::new(Registry::with_next_id(u64::MAX));
-        assert!(matches!(table.register(now), Err(crate::Error::Overloaded)));
+        assert!(matches!(
+            table.register(now),
+            Err(crate::rt::Error::Overloaded)
+        ));
         assert!(table.is_empty());
     }
 
@@ -973,7 +976,7 @@ mod registry_tests {
     /// Only the latest waiter wakes, and removing its registration releases ownership.
     #[test]
     fn latest_waker_is_notified_once_and_drop_releases_it() {
-        use crate::test_util::WakeCounter;
+        use crate::rt::test_util::WakeCounter;
         use std::sync::Arc;
         let table = Rc::new(Registry::default());
         let now = Instant::now();

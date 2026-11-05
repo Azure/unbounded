@@ -1,8 +1,8 @@
 //! Filesystem SQEs use the parent reactor's original/cancel completion fences.
 //! Every pointer backing, descriptor, and quota lives in the submission closure.
-#[cfg(feature = "simulation")]
-use crate::reactor::simulation;
-use crate::{Error, Operation, Result, Scope};
+#[cfg(test)]
+use crate::rt::reactor::simulation;
+use crate::rt::{Error, Operation, Result, Scope};
 use racer_io::{
     ring::{IoBuffer, IoId},
     scoped::{Reactor, SubmissionKind, descriptor::Descriptor},
@@ -30,7 +30,7 @@ use zeroize::Zeroize;
 pub mod checkpoint;
 pub mod operations;
 
-#[cfg(all(test, feature = "simulation"))]
+#[cfg(test)]
 mod fixtures;
 
 pub use operations::ReplaceFiles;
@@ -77,7 +77,7 @@ impl AsRef<[u8]> for ReadBuffer {
 // SAFETY: private non-resizing Vec retains allocation and quota through completion.
 unsafe impl IoBuffer for Buffer {
     /// Borrow the unconsumed region while retaining its stable allocation.
-    fn bytes(&self) -> crate::Result<&[u8]> {
+    fn bytes(&self) -> crate::rt::Result<&[u8]> {
         Ok(&self.data[self.start..self.end])
     }
 
@@ -601,9 +601,9 @@ pub mod secure {
             &self,
             host: &H,
             parent: &S,
-        ) -> Result<(crate::drivers::Busy<'_>, S), S::Error> {
+        ) -> Result<(crate::rt::drivers::Busy<'_>, S), S::Error> {
             parent.check()?;
-            let guard = crate::drivers::Busy::try_enter(&self.busy)?;
+            let guard = crate::rt::drivers::Busy::try_enter(&self.busy)?;
             let previous = self.previous.borrow().clone();
             if let Some(previous) = previous {
                 host.fence(&previous).await?;
@@ -634,7 +634,7 @@ pub mod secure {
         stat: &libc::statx,
         regular: bool,
     ) -> Result<(), AccessError> {
-        #[cfg(feature = "simulation")]
+        #[cfg(test)]
         if fd.as_sim().is_some() {
             return check_access(
                 stat,
@@ -645,7 +645,7 @@ pub mod secure {
                 },
             );
         }
-        #[cfg(not(feature = "simulation"))]
+        #[cfg(not(test))]
         let _ = fd;
         check_private(stat, regular)
     }
@@ -1069,7 +1069,7 @@ pub mod secure {
             }
 
             let host = Rc::new(Hosting {
-                reactor: Reactor::new(4, &crate::reactor::simulation::ambient_env()),
+                reactor: Reactor::new(4, &crate::rt::reactor::simulation::ambient_env()),
                 next: Cell::new(0),
                 fences: RefCell::default(),
                 ready: Cell::new(false),
@@ -1223,15 +1223,15 @@ pub mod secure {
     }
 }
 
-#[cfg(all(test, feature = "simulation"))]
+#[cfg(test)]
 mod secure_tests {
     //! Simulated namespace fault sequences complement host integration coverage.
     use super::*;
-    use crate::filesystem::{
+    use crate::rt::filesystem::{
         fixtures::{Admission, Limits, Reactor, scope},
         test_support::{drive, poll},
     };
-    use crate::reactor::simulation::{Fault, Simulation};
+    use crate::rt::reactor::simulation::{Fault, Simulation};
     use std::{num::NonZeroUsize, path::Path};
 
     /// Construct the counting reactor used to observe simulated namespace fences.
@@ -1423,11 +1423,11 @@ mod secure_tests {
     }
 }
 
-#[cfg(all(test, feature = "simulation"))]
+#[cfg(test)]
 mod test_support {
     //! Bounded explicit driving for filesystem operations with arbitrary errors.
     use super::*;
-    use crate::filesystem::fixtures::Reactor;
+    use crate::rt::filesystem::fixtures::Reactor;
     use std::time::Instant;
 
     /// Poll one reply without implicitly advancing the backend.

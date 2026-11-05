@@ -18,6 +18,7 @@ use crate::model::PageEnvelope;
 use crate::model::PageId;
 use crate::model::RequestId;
 use crate::model::WorkerId;
+use crate::rt::offload;
 use crate::runtime::RequestScope;
 use crate::telemetry::AeadFailure;
 use racer_control_wire::KeyId;
@@ -37,7 +38,6 @@ use std::sync::atomic::Ordering;
 use std::task::Context;
 use std::task::Poll;
 use std::task::Waker;
-use uring_runtime::offload;
 use zeroize::Zeroizing;
 
 impl From<racer_crypto::identity::Error> for crate::error::Error {
@@ -1068,8 +1068,8 @@ pub struct CryptoSendFailure<T> {
     pub command: T,
     pub error: Error,
 }
-impl<T> From<uring_runtime::channel::SendFailure<T>> for CryptoSendFailure<T> {
-    fn from(failure: uring_runtime::channel::SendFailure<T>) -> Self {
+impl<T> From<racer_io::xthread::spsc::SendFailure<T>> for CryptoSendFailure<T> {
+    fn from(failure: racer_io::xthread::spsc::SendFailure<T>) -> Self {
         Self {
             command: failure.command,
             error: failure.error.into(),
@@ -1658,8 +1658,8 @@ mod tests {
     /// Publication retries reset only queue timing, not execution or ownership.
     #[test]
     fn permit_bookkeeping_preserves_missing_submission_and_retry_timing() {
+        use crate::rt::environment::{SimulationClock, now};
         use std::time::Duration;
-        use uring_runtime::environment::{SimulationClock, now};
 
         let clock = SimulationClock::new(817);
         let _environment = clock.environment(0).enter();
@@ -2195,7 +2195,7 @@ mod tests {
                 let (io, mut engine) = pair(WorkerId(0), 0, NonZeroUsize::new(8).unwrap());
                 let client = CryptoClient::new(io);
                 client.set_metrics(metrics.clone());
-                let environment = uring_runtime::environment::Environment::current();
+                let environment = crate::rt::environment::Environment::current();
                 let thread = std::thread::spawn(move || {
                     let _env = environment.enter();
                     while let Some(job) =
@@ -2217,7 +2217,7 @@ mod tests {
                 let scope = RequestScope::on(
                     &crate::test_support::clock(),
                     RequestId([0; 16]),
-                    uring_runtime::environment::now() + Duration::from_secs(240),
+                    crate::rt::environment::now() + Duration::from_secs(240),
                 )
                 .unwrap();
                 for batch in (0..iterations).step_by(8) {
@@ -2268,7 +2268,7 @@ mod tests {
                 ]) {
                     assert_eq!(metrics.count(event), expected);
                 }
-                if uring_runtime::environment::simulation_seed().is_none() {
+                if crate::rt::environment::simulation_seed().is_none() {
                     assert!(metrics.count(events[5]) > 0);
                     assert!(metrics.count(events[7]) > 0);
                 }
@@ -2276,8 +2276,8 @@ mod tests {
 
             #[test]
             fn attribution_preserves_client_cleanup_and_dst() {
-                use uring_runtime::environment;
-                use uring_runtime::environment::SimulationClock;
+                use crate::rt::environment;
+                use crate::rt::environment::SimulationClock;
                 let clock = SimulationClock::new(73);
                 let env = clock.environment(0);
                 let _env = env.enter();
@@ -2289,8 +2289,8 @@ mod tests {
 
             #[test]
             fn decrypt_submission_rejection_is_not_an_executed_failure() {
+                use crate::rt::environment::{SimulationClock, now};
                 use std::time::Duration;
-                use uring_runtime::environment::{SimulationClock, now};
                 let clock = SimulationClock::new(849);
                 let sim_env = clock.environment(0);
                 let _environment = sim_env.enter();
@@ -2341,9 +2341,9 @@ mod tests {
 
             #[test]
             fn measurements_account_once_at_reap_even_for_cancel_and_abandon() {
+                use crate::rt::environment;
+                use crate::rt::environment::SimulationClock;
                 use std::time::Duration;
-                use uring_runtime::environment;
-                use uring_runtime::environment::SimulationClock;
                 let clock = SimulationClock::new(42);
                 let env = clock.environment(0);
                 let _env = env.enter();
@@ -2398,7 +2398,7 @@ mod tests {
                         let scope = RequestScope::on(
                             &crate::test_support::clock(),
                             crate::model::RequestId([0; 16]),
-                            uring_runtime::environment::now() + Duration::from_secs(10),
+                            crate::rt::environment::now() + Duration::from_secs(10),
                         )
                         .unwrap();
                         let cache = racer_control_wire::CacheId(
@@ -2540,11 +2540,11 @@ mod tests {
                         // The engine uses virtual time (zero cost in DST). Explicitly
                         // advance a measured interval to exercise the exact sum separately.
                         assert_eq!(completion.permit.measurement.execution_ns, Some(0));
-                        let start = uring_runtime::environment::now();
+                        let start = crate::rt::environment::now();
                         clock.advance(Duration::from_millis(2));
                         completion
                             .permit
-                            .executed(uring_runtime::environment::now(), start);
+                            .executed(crate::rt::environment::now(), start);
                         let (_, mut wrong) = pair(WorkerId(1), 0, NonZeroUsize::new(1).unwrap());
                         completion = wrong.complete(completion).err().unwrap().command;
                         assert!(engine.complete(completion).is_ok());
@@ -2979,10 +2979,10 @@ mod tests {
             }
 
             fn shared_worker_queue_measurements(decrypt: bool) {
+                use crate::rt::environment;
+                use crate::rt::environment::SimulationClock;
                 use crate::security::PageCryptoEngine;
                 use std::time::Duration;
-                use uring_runtime::environment;
-                use uring_runtime::environment::SimulationClock;
 
                 let clock = SimulationClock::new(43);
                 let env = clock.environment(0);
@@ -3006,7 +3006,7 @@ mod tests {
                         RequestScope::on(
                             &crate::test_support::clock(),
                             crate::model::RequestId([id; 16]),
-                            uring_runtime::environment::now() + Duration::from_secs(10),
+                            crate::rt::environment::now() + Duration::from_secs(10),
                         )
                         .unwrap()
                     });
@@ -3082,11 +3082,11 @@ mod tests {
                         let mut completion =
                             PageCryptoEngine::process(job, &crate::test_support::ctx());
                         assert_eq!(completion.permit.measurement.execution_ns, Some(0));
-                        let start = uring_runtime::environment::now();
+                        let start = crate::rt::environment::now();
                         clock.advance(Duration::from_millis(service_ms));
                         completion
                             .permit
-                            .executed(uring_runtime::environment::now(), start);
+                            .executed(crate::rt::environment::now(), start);
                         assert!(engine.complete(completion).is_ok());
                     }
                     // Neither the target's own 5ms execution nor this 11ms delay before
@@ -3130,18 +3130,15 @@ mod tests {
 
             #[test]
             fn duration_saturates_without_host_time_in_dst() {
-                use uring_runtime::environment;
-                use uring_runtime::environment::SimulationClock;
+                use crate::rt::environment;
+                use crate::rt::environment::SimulationClock;
                 let clock = SimulationClock::new(19);
                 let env = clock.environment(0);
                 let _env = env.enter();
                 let _strict = environment::require_simulated();
-                let start = uring_runtime::environment::now();
+                let start = crate::rt::environment::now();
                 clock.advance(std::time::Duration::from_secs(u64::MAX / 1_000_000_000 + 1));
-                assert_eq!(
-                    elapsed_ns(uring_runtime::environment::now(), start),
-                    u64::MAX
-                );
+                assert_eq!(elapsed_ns(crate::rt::environment::now(), start), u64::MAX);
             }
 
             fn measurement_events(decrypt: bool) -> [Event; 8] {
@@ -3375,9 +3372,9 @@ mod tests {
             #[cfg(test)]
             mod tests {
                 use racer_io::Error;
+                use racer_io::xthread::spsc::*;
                 use std::task::Context;
                 use std::task::Poll;
-                use uring_runtime::channel::*;
 
                 #[test]
                 fn adapter_maps_errors_without_losing_command_ownership() {
@@ -3426,7 +3423,7 @@ mod tests {
                         scope: RequestScope::on(
                             &crate::test_support::clock(),
                             crate::model::RequestId([0; 16]),
-                            uring_runtime::environment::now() + std::time::Duration::from_secs(5),
+                            crate::rt::environment::now() + std::time::Duration::from_secs(5),
                         )
                         .unwrap(),
                     }
@@ -3529,7 +3526,7 @@ mod tests {
 
             #[test]
             fn accepted_deadline_expiry_waits_for_engine_completion() {
-                let clock = uring_runtime::environment::SimulationClock::new(91);
+                let clock = crate::rt::environment::SimulationClock::new(91);
                 let sim_env = clock.environment(0);
                 let _environment = sim_env.enter();
                 let sim_ctx = sim_env.worker_ctx();

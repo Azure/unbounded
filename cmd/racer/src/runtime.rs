@@ -8,6 +8,9 @@ use crate::error::Error;
 use crate::error::Operation;
 use crate::error::Result;
 use crate::model::RequestId;
+use crate::rt::environment::Deadline;
+use crate::rt::filesystem::Buffer;
+use crate::rt::filesystem::prelude::*;
 use racer_io::scoped::ReactorWake;
 use racer_io::scoped::SUBMISSION_BYTES;
 use racer_io::scoped::SubmissionCapacity;
@@ -17,9 +20,6 @@ use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::OnceLock;
 use std::time::Instant;
-use uring_runtime::environment::Deadline;
-use uring_runtime::filesystem::Buffer;
-use uring_runtime::filesystem::prelude::*;
 
 // Seeded hashing only in simulated worlds; production retains std hashing.
 #[cfg(not(test))]
@@ -476,9 +476,9 @@ mod tests {
     use super::HashMap;
     use crate::error::Error;
     use crate::model::RequestId;
+    use crate::rt::environment::*;
     use crate::runtime::RequestScope;
     use std::time::Duration;
-    use uring_runtime::environment::*;
     mod deadline {
         //! Request scope and cancellation regression tests.
         use crate::runtime::*;
@@ -521,7 +521,7 @@ mod tests {
             #[test]
             fn rest_narrowing_preserves_policy_cancellation_and_parent_deadline() {
                 use wire_codec::rest::Scope;
-                let clock = uring_runtime::environment::SimulationClock::new(102);
+                let clock = crate::rt::environment::SimulationClock::new(102);
                 let sim_env = clock.environment(0);
                 let _env = sim_env.enter();
                 let sim_ctx = sim_env.worker_ctx();
@@ -543,7 +543,7 @@ mod tests {
 
             #[test]
             fn candidate_total_survives_body_completion_and_never_changes_authority() {
-                let clock = uring_runtime::environment::SimulationClock::new(97);
+                let clock = crate::rt::environment::SimulationClock::new(97);
                 let sim_env = clock.environment(0);
                 let _env = sim_env.enter();
                 let sim_ctx = sim_env.worker_ctx();
@@ -591,7 +591,7 @@ mod tests {
 
             #[test]
             fn candidate_body_budget_accepts_original_ceiling_and_rejects_invalid_bounds() {
-                let clock = uring_runtime::environment::SimulationClock::new(98);
+                let clock = crate::rt::environment::SimulationClock::new(98);
                 let sim_env = clock.environment(0);
                 let _env = sim_env.enter();
                 let sim_ctx = sim_env.worker_ctx();
@@ -635,7 +635,7 @@ mod tests {
 
             #[test]
             fn candidate_body_reserve_keeps_healthy_progress_and_ignores_unknown_lengths() {
-                let clock = uring_runtime::environment::SimulationClock::new(91);
+                let clock = crate::rt::environment::SimulationClock::new(91);
                 let sim_env = clock.environment(0);
                 let _env = sim_env.enter();
                 let sim_ctx = sim_env.worker_ctx();
@@ -697,7 +697,7 @@ mod tests {
 
             #[test]
             fn candidate_body_rate_starts_at_first_bytes_and_expiry_is_sticky() {
-                let clock = uring_runtime::environment::SimulationClock::new(93);
+                let clock = crate::rt::environment::SimulationClock::new(93);
                 let sim_env = clock.environment(0);
                 let _env = sim_env.enter();
                 let sim_ctx = sim_env.worker_ctx();
@@ -737,7 +737,7 @@ mod tests {
 
             #[test]
             fn candidate_idle_progress_never_renews_hard_deadline_or_revives_expiry() {
-                let clock = uring_runtime::environment::SimulationClock::new(39);
+                let clock = crate::rt::environment::SimulationClock::new(39);
                 let sim_env = clock.environment(0);
                 let _env = sim_env.enter();
                 let sim_ctx = sim_env.worker_ctx();
@@ -781,7 +781,7 @@ mod tests {
             }
             #[test]
             fn runtime_scope_retains_candidate_policy_and_shared_cancellation() {
-                let clock = uring_runtime::environment::SimulationClock::new(101);
+                let clock = crate::rt::environment::SimulationClock::new(101);
                 let sim_env = clock.environment(0);
                 let _env = sim_env.enter();
                 let sim_ctx = sim_env.worker_ctx();
@@ -861,6 +861,7 @@ mod tests {
 
         mod tests {
             use super::*;
+            use crate::rt::reactor::simulation;
             use racer_io::ring::Descriptor;
             use racer_io::ring::IoBuffer;
             use racer_io::ring::SocketAddress;
@@ -869,7 +870,6 @@ mod tests {
             use std::task::Poll;
             use std::time::Duration;
             use std::time::Instant;
-            use uring_runtime::reactor::simulation;
 
             #[test]
             fn direct_filesystem_buffers_preserve_nonempty_boundary() {
@@ -884,8 +884,7 @@ mod tests {
                     Err(Error::InvalidConfiguration)
                 ));
                 assert_eq!(admission.used(ResourceClass::RequestContext), 0);
-                let mut buffer: uring_runtime::filesystem::Buffer =
-                    reactor.file_bytes(b"abc").unwrap();
+                let mut buffer: crate::rt::filesystem::Buffer = reactor.file_bytes(b"abc").unwrap();
                 assert_eq!(buffer.prefix(3).unwrap(), b"abc");
                 assert!(buffer.prefix(4).is_err());
                 assert!(buffer.advance(4).is_err());
@@ -1268,17 +1267,17 @@ mod tests {
             use crate::admission::AdmissionPolicy;
             use crate::admission::ResourceClass;
             use crate::error::Error;
+            use crate::rt::filesystem::prelude::*;
+            use crate::rt::reactor::simulation::Environment;
+            use crate::rt::reactor::simulation::Fault;
+            use crate::rt::reactor::simulation::Simulation;
+            use crate::rt::reactor::simulation::disk::DiskState;
             use crate::runtime::RequestScope;
             use std::cell::Cell;
             use std::ffi::CString;
             use std::path::Path;
             use std::rc::Rc;
             use std::time::Duration;
-            use uring_runtime::filesystem::prelude::*;
-            use uring_runtime::reactor::simulation::Environment;
-            use uring_runtime::reactor::simulation::Fault;
-            use uring_runtime::reactor::simulation::Simulation;
-            use uring_runtime::reactor::simulation::disk::DiskState;
             fn reactor() -> Reactor {
                 Reactor::new(
                     Rc::new(flow_control::Quotas::new(AdmissionPolicy::new(
@@ -1411,7 +1410,7 @@ mod tests {
             #[test]
             fn candidate_total_cancels_pending_receive_without_bytes_and_retains_both_fences() {
                 for cancel_first in [false, true] {
-                    let clock = uring_runtime::environment::SimulationClock::new(99);
+                    let clock = crate::rt::environment::SimulationClock::new(99);
                     let sim_env = clock.environment(0);
                     let _clock = sim_env.enter();
                     let sim_ctx = sim_env.worker_ctx();
@@ -1604,7 +1603,7 @@ mod tests {
                 assert_eq!(&*bytes, b"first");
                 let private = drive(
                     &r,
-                    Box::pin(uring_runtime::filesystem::secure::directory(
+                    Box::pin(crate::rt::filesystem::secure::directory(
                         &r,
                         Path::new("/private"),
                         true,
@@ -1617,7 +1616,7 @@ mod tests {
                 drive(
                     &r,
                     Box::pin(async {
-                        uring_runtime::filesystem::secure::atomic_write(
+                        crate::rt::filesystem::secure::atomic_write(
                             &r, &private, "identity", b"secret", &scope,
                         )
                         .await
@@ -1737,7 +1736,7 @@ mod tests {
                 ),
             )
         }
-        use uring_runtime::environment::SimulationClock;
+        use crate::rt::environment::SimulationClock;
 
         #[test]
         fn repeated_pressure_is_rate_limited_without_self_wakes() {
@@ -1748,7 +1747,7 @@ mod tests {
             let scope = RequestScope::on(
                 &crate::test_support::clock(),
                 RequestId([0; 16]),
-                uring_runtime::environment::now() + Duration::from_secs(1),
+                crate::rt::environment::now() + Duration::from_secs(1),
             )
             .unwrap();
             let calls = Cell::new(0);
@@ -1787,7 +1786,7 @@ mod tests {
                 let scope = RequestScope::on(
                     &crate::test_support::clock(),
                     RequestId([0; 16]),
-                    uring_runtime::environment::now() + Duration::from_millis(1),
+                    crate::rt::environment::now() + Duration::from_millis(1),
                 )
                 .unwrap();
                 let mut operation = r.retry_overloaded::<()>(&scope, || {
@@ -1804,7 +1803,7 @@ mod tests {
             let scope = RequestScope::on(
                 &crate::test_support::clock(),
                 RequestId([0; 16]),
-                uring_runtime::environment::now() + Duration::from_secs(1),
+                crate::rt::environment::now() + Duration::from_secs(1),
             )
             .unwrap();
             for error in [
@@ -1821,9 +1820,9 @@ mod tests {
         #[test]
         fn submitted_listener_cancellation_waits_for_cqe_fence() {
             use crate::admission::AdmissionPolicy;
+            use crate::rt::reactor::simulation::Simulation;
             use crate::runtime::Reactor;
             use std::rc::Rc;
-            use uring_runtime::reactor::simulation::Simulation;
             let sim = Simulation::new();
             let _os = sim.enter();
             let clock = SimulationClock::new(3);
@@ -1836,7 +1835,7 @@ mod tests {
             let scope = RequestScope::on(
                 &crate::test_support::clock(),
                 RequestId([0; 16]),
-                uring_runtime::environment::now() + Duration::from_secs(1),
+                crate::rt::environment::now() + Duration::from_secs(1),
             )
             .unwrap();
             let (reader, _writer) = sim.socket_pair();

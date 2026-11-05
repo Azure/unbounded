@@ -35,7 +35,7 @@ Depends only on `topology`, `racer-object-wire`, `racer-control-wire`, `flow-con
   monotonic `Instant` plus `wall_ms`) and randomness as an explicit RNG (`time::SplitMix64`).
 - `core/clippy.toml` disallows `Instant::now`, `SystemTime::now`, and `thread::spawn`.
 - `core/tests/purity.rs` scans non-test code in `core/src/**/*.rs` and fails on `Instant::now`,
-  `SystemTime::now`, `uring_runtime`, `environment::now`, `getrandom`, and `thread::spawn`.
+  `SystemTime::now`, `racer_io`, `environment::now`, `getrandom`, and `thread::spawn`.
 
 ### Modules
 

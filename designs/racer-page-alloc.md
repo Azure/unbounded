@@ -8,7 +8,7 @@
 1. Memory buffers aligned for direct I/O, with caller-selected wiping rules.
 2. A table of fixed-size segments in a sparse cache file or caller-opened files
    or devices, with leases that stop reuse while I/O still points at a segment.
-3. Async read and write of that storage through the `uring-runtime` reactor.
+3. Async read and write of that storage through the `racer-io` reactor.
 
 The crate stores bytes and payload-agnostic index state. It does not know
 record headers, encryption, checksums, or object versions. Pages are known only
@@ -241,8 +241,8 @@ and it does not flush to disk.
 
 ## Simulation
 
-For file-backed slabs, the `simulation` feature routes open, lock, stat, and sizing to the
-`uring-runtime` simulated filesystem. Buffers, leases, and segment rules do not
+For file-backed slabs, `Slab::simulate_in` routes open, lock, stat, and sizing to the
+`racer-io` simulated filesystem (`SimOs`). Buffers, leases, and segment rules do not
 change, so the same workflow tests run in both modes.
 
 ## Testing
@@ -266,4 +266,4 @@ change, so the same workflow tests run in both modes.
   commands, so feature unification cannot hide one from the other. The
   production run sets `PAGE_ALLOC_REQUIRE_REAL_IO=1`, so a host without
   io_uring or direct I/O fails instead of skipping. Miri runs only on
-  `uring-runtime`, not on this crate.
+  the worker-runtime allowlist in `hack/scripts/runtime-miri.py`, not on this crate.

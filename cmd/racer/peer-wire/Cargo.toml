@@ -14,7 +14,6 @@ http1 = { path = "../http" }
 racer-crypto = { path = "../crypto" }
 racer-control-wire = { path = "../control-wire" }
 racer-core = { path = "../core" }
-uring-runtime = { path = "../runtime" }
 racer-io = { path = "../io" }
 base64 = "0.22"
 sha2 = "0.10"
@@ -22,4 +21,3 @@ sha2 = "0.10"
 [dev-dependencies]
 racer-object-wire = { path = "../object-wire" }
 racer-crypto = { path = "../crypto", features = ["test-util"] }
-uring-runtime = { path = "../runtime", features = ["simulation", "test-util"] }

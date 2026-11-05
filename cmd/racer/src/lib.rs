@@ -32,6 +32,8 @@ pub mod rdma;
 pub mod read;
 pub mod remote;
 pub mod retention;
+#[doc(hidden)]
+pub mod rt;
 pub mod runtime;
 pub mod security;
 pub mod store;

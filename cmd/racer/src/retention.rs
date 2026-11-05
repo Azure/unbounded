@@ -625,7 +625,7 @@ mod tests {
     #[test]
     fn lazy_scoring_classification_matches_telemetry_cache_disk() {
         use racer_control_wire::CacheDefinition;
-        let clock = uring_runtime::environment::SimulationClock::new(52);
+        let clock = crate::rt::environment::SimulationClock::new(52);
         let sim_env = clock.environment(0);
         let _environment = sim_env.enter();
         let sim_ctx = sim_env.worker_ctx();
@@ -677,7 +677,7 @@ mod tests {
     #[test]
     fn share_basis_is_incremental_across_passes_and_membership_changes() {
         use racer_control_wire::CacheDefinition;
-        let clock = uring_runtime::environment::SimulationClock::new(53);
+        let clock = crate::rt::environment::SimulationClock::new(53);
         let sim_env = clock.environment(0);
         let _environment = sim_env.enter();
         let sim_ctx = sim_env.worker_ctx();
@@ -773,7 +773,7 @@ mod tests {
     #[test]
     fn over_share_candidates_are_bounded_and_exact_with_many_caches() {
         use racer_control_wire::CacheDefinition;
-        let clock = uring_runtime::environment::SimulationClock::new(59);
+        let clock = crate::rt::environment::SimulationClock::new(59);
         let sim_env = clock.environment(0);
         let _environment = sim_env.enter();
         let sim_ctx = sim_env.worker_ctx();
@@ -878,7 +878,7 @@ mod tests {
     }
     #[test]
     fn scoring_pass_pins_ownership_and_time_and_replacement_clears_factory() {
-        let clock = uring_runtime::environment::SimulationClock::new(51);
+        let clock = crate::rt::environment::SimulationClock::new(51);
         let sim_env = clock.environment(0);
         let _environment = sim_env.enter();
         let sim_ctx = sim_env.worker_ctx();

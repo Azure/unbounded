@@ -1087,7 +1087,7 @@ pub(super) mod tests {
 
     /// Explicit simulated clock progression with a host watchdog and CPU yield.
     fn drive<T>(
-        clock: &uring_runtime::environment::SimulationClock,
+        clock: &crate::rt::environment::SimulationClock,
         operation: impl Future<Output = T>,
     ) -> T {
         let mut operation = std::pin::pin!(operation);
@@ -1124,7 +1124,7 @@ pub(super) mod tests {
         RequestScope::on(
             &crate::test_support::clock(),
             crate::model::RequestId([8; 16]),
-            uring_runtime::environment::now() + Duration::from_secs(300),
+            crate::rt::environment::now() + Duration::from_secs(300),
         )
         .unwrap()
     }
@@ -1180,7 +1180,7 @@ pub(super) mod tests {
 
     /// Preserve the former lagging-replica scenario through real generic scheduling.
     pub(crate) fn lagging_replica() {
-        let clock = uring_runtime::environment::SimulationClock::new(731);
+        let clock = crate::rt::environment::SimulationClock::new(731);
         let sim_env = clock.environment(0);
         let _time = sim_env.enter();
         let sim_ctx = sim_env.worker_ctx();
@@ -1288,7 +1288,7 @@ pub(super) mod tests {
                 Err(expected)
             );
         }
-        let clock = uring_runtime::environment::SimulationClock::new(732);
+        let clock = crate::rt::environment::SimulationClock::new(732);
         let _time = clock.environment(0).enter();
         let session = session();
         session.attach_io(host()).unwrap();
@@ -1316,7 +1316,7 @@ pub(super) mod tests {
 
     /// Key feed validates 204 and tracks its cursor independently of publication/issuance.
     pub(crate) fn independent_keyring() {
-        let clock = uring_runtime::environment::SimulationClock::new(733);
+        let clock = crate::rt::environment::SimulationClock::new(733);
         let _time = clock.environment(0).enter();
         let session = session();
         session.attach_io(host()).unwrap();
@@ -1377,7 +1377,7 @@ pub(super) mod tests {
 
     /// No string method or externally supplied delta digest exists in the feed API.
     pub(crate) fn canonical_delta_and_get_only() {
-        let clock = uring_runtime::environment::SimulationClock::new(734);
+        let clock = crate::rt::environment::SimulationClock::new(734);
         let _time = clock.environment(0).enter();
         let feed = Feed::new(
             PublicationCodec,
@@ -1421,7 +1421,7 @@ pub(super) mod tests {
     /// Pending documents, not lossy reconstructed snapshots, form the next delta base.
     #[test]
     fn pending_publication_delta_uses_exact_received_document() {
-        let clock = uring_runtime::environment::SimulationClock::new(735);
+        let clock = crate::rt::environment::SimulationClock::new(735);
         let _time = clock.environment(0).enter();
         let session = session();
         let first = document(10);

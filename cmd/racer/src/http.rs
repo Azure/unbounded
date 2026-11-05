@@ -106,7 +106,7 @@ pub fn new_pipe_pool(
     );
     // Migration shim: test worlds are still selected thread-locally.
     #[cfg(test)]
-    if let Some(sim) = uring_runtime::reactor::simulation::Simulation::current() {
+    if let Some(sim) = crate::rt::reactor::simulation::Simulation::current() {
         return pool.simulated(sim.os().clone());
     }
     pool
@@ -1126,6 +1126,7 @@ pub(crate) mod tests {
         use crate::model::PageNumber;
         use crate::model::RequestId;
         use crate::model::StrongEtag;
+        use crate::rt::environment::Deadline;
         use crate::runtime::Cancellation;
         use crate::runtime::Reactor;
         use racer_control_wire::CacheId;
@@ -1136,7 +1137,6 @@ pub(crate) mod tests {
         use std::task::Context;
         use std::task::Poll;
         use std::time::Instant;
-        use uring_runtime::environment::Deadline;
         fn admission(pipes: usize) -> Rc<flow_control::Quotas<AdmissionPolicy>> {
             let small = std::num::NonZeroUsize::new(8).unwrap();
             let bytes = std::num::NonZeroUsize::new(32 * 1024 * 1024).unwrap();
@@ -2086,11 +2086,11 @@ pub(crate) mod tests {
 
     mod pool {
         use super::*;
+        use crate::rt::reactor::simulation::Fault;
+        use crate::rt::reactor::simulation::Simulation;
         use crate::test_support::WakeCounter;
         use std::sync::Arc;
         use std::task::Waker;
-        use uring_runtime::reactor::simulation::Fault;
-        use uring_runtime::reactor::simulation::Simulation;
         enum Listener {
             Tcp(std::net::TcpListener),
             Unix(std::os::unix::net::UnixListener, PathBuf),
@@ -2140,7 +2140,7 @@ pub(crate) mod tests {
             RequestScope::on(
                 &crate::test_support::clock(),
                 RequestId([7; 16]),
-                uring_runtime::environment::now() + Duration::from_secs(5),
+                crate::rt::environment::now() + Duration::from_secs(5),
             )
             .unwrap()
         }
@@ -2263,7 +2263,7 @@ pub(crate) mod tests {
         }
         #[test]
         fn origin_wait_is_bounded_fifo_without_blocking_peers_or_other_caches() {
-            let clock = uring_runtime::environment::SimulationClock::new(92);
+            let clock = crate::rt::environment::SimulationClock::new(92);
             let _environment = clock.environment(0).enter();
             let (admission, reactor, pool) = setup();
             let (listener, endpoint) = Listener::origin();

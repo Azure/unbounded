@@ -973,7 +973,7 @@ fn send_tag_http_success_failure_drop_do_not_wait_for_crypto() {
     use crate::telemetry::Samples;
     for mode in ["success", "failure", "drop"] {
         let f = RelayFixture::new(true);
-        let queue = Rc::new(uring_runtime::drivers::DriverQueue::new(1024));
+        let queue = Rc::new(crate::rt::drivers::DriverQueue::new(1024));
         let _guard = queue.enter();
         let (_, ids) = identities();
         let (io, _engine) = pair(
@@ -1649,7 +1649,7 @@ fn opaque_head_rejects_binding_length_authority_and_reverse_proof_substitution()
         if attack == "deadline" {
             // The binding retains its signed monotonic deadline; scope changes
             // cannot make a stale head eligible for reverse forwarding.
-            let clock = uring_runtime::environment::SimulationClock::new_at(
+            let clock = crate::rt::environment::SimulationClock::new_at(
                 91,
                 Instant::now() + Duration::from_secs(60),
                 std::time::SystemTime::now() + Duration::from_secs(60),

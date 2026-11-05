@@ -950,7 +950,7 @@ fn worker_sizing_reduces_at_or_above_half() {
 #[test]
 fn worker_sizing_funds_diagnostics_and_ordinary_progress() {
     use crate::affinity::CpuLocation;
-    use uring_runtime::reactor::simulation::Simulation;
+    use crate::rt::reactor::simulation::Simulation;
     let mut config = Config::from_lookup(|name| {
         Ok(match name {
             "RACER_CLUSTER_ID" => Some("00000000-0000-4000-8000-000000000001".into()),
@@ -1258,7 +1258,7 @@ fn assembled_worker_exports_live_quota_gauges() {
 
 #[test]
 fn disk_usage_worker_samples_recovery_and_reset() {
-    let simulation = uring_runtime::reactor::simulation::Simulation::new();
+    let simulation = crate::rt::reactor::simulation::Simulation::new();
     let _environment = simulation.enter();
     let worker = wake_test_worker();
     let geometry = futures::executor::block_on(worker.prepare_storage()).unwrap();
@@ -1364,7 +1364,7 @@ fn placement_maintenance_retries_pressure_without_spinning_or_log_floods() {
 
 #[test]
 fn metadata_wait_uses_worker_clock_and_keeps_due_backlog_runnable() {
-    use uring_runtime::environment::SimulationClock;
+    use crate::rt::environment::SimulationClock;
     let clock = SimulationClock::new(913);
     let worker = {
         let sim_env = clock.environment(0);
@@ -1383,7 +1383,7 @@ fn metadata_wait_uses_worker_clock_and_keeps_due_backlog_runnable() {
     let maximum = Duration::from_millis(1);
     let now = worker.ctx().clock.now();
     // Require the hook to use the worker's context, not sample host time.
-    let _required = uring_runtime::environment::require_simulated();
+    let _required = crate::rt::environment::require_simulated();
     assert_eq!(worker.wait_timeout(maximum), maximum);
     let probes: Vec<_> = (0..65)
         .map(|_| crate::read::metadata::tests::deadline_probe(&worker.metadata, now + maximum * 2))
@@ -1923,7 +1923,7 @@ fn two_worker_removal_preserves_late_driver_and_blocks_late_memory_and_disk_fill
     let memory = second.memory.clone();
     let late = late1.clone();
     let owner = second.drivers.enter();
-    uring_runtime::drivers::reserve()
+    crate::rt::drivers::reserve()
         .unwrap()
         .submit_detached(Box::pin(async move {
             receive.await.map_err(|_| Error::Cancelled)?;
@@ -2334,10 +2334,10 @@ fn cache_removal_during_retry_after(delay_renewal_entry: bool) {
 
 #[test]
 fn same_node_renewal_backs_off_expires_closed_and_recovers() {
+    use crate::rt::environment::SimulationClock;
+    use crate::rt::environment::now;
+    use crate::rt::environment::wall_now;
     use crate::telemetry::State;
-    use uring_runtime::environment::SimulationClock;
-    use uring_runtime::environment::now;
-    use uring_runtime::environment::wall_now;
 
     // Complete each real control turn through the application's error handling.
     // Leave the next turn unsubmitted so the test controls all retry boundaries.
@@ -3190,7 +3190,7 @@ fn drive_advancing<T>(
     runtime: &WorkerRuntime,
     engine: &mut dyn crate::lifecycle::Service<RequestScope>,
     future: Operation<'_, T>,
-    clock: Option<&uring_runtime::environment::SimulationClock>,
+    clock: Option<&crate::rt::environment::SimulationClock>,
 ) -> Result<T> {
     let mut future = future;
     let until = Instant::now() + Duration::from_secs(15);
@@ -3991,7 +3991,7 @@ fn assembly_applies_configured_client_request_timeout() {
     use crate::admission::ResourceClass;
     use std::sync::atomic::AtomicBool;
     for timeout in [Duration::from_millis(250), Duration::from_secs(45)] {
-        let clock = uring_runtime::environment::SimulationClock::new(908);
+        let clock = crate::rt::environment::SimulationClock::new(908);
         let _environment = clock.environment(0).enter();
         let mut config = crate::test_support::cluster::config(false);
         config.request_timeout = timeout;
@@ -4100,7 +4100,7 @@ fn disabled_rdma_turn_does_not_refresh_inventory() {
 fn receive_gate_two_workers_share_capacity_and_wake_expiry_without_cqe() {
     use futures::Stream;
     use futures::stream::FuturesUnordered;
-    let clock = uring_runtime::environment::SimulationClock::new(919);
+    let clock = crate::rt::environment::SimulationClock::new(919);
     let sim_env = clock.environment(0);
     let _env = sim_env.enter();
     let sim_ctx = sim_env.worker_ctx();
@@ -4156,7 +4156,7 @@ fn receive_gate_two_workers_share_capacity_and_wake_expiry_without_cqe() {
 
 #[test]
 fn workers_share_configured_page_hedge_slots_and_bytes() {
-    let clock = uring_runtime::environment::SimulationClock::new(907);
+    let clock = crate::rt::environment::SimulationClock::new(907);
     let _environment = clock.environment(0).enter();
     let mut config = crate::test_support::cluster::config(false);
     config.page_hedge.slots = 1;

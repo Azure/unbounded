@@ -5,6 +5,7 @@ use crate::model::AttemptId;
 use crate::model::ObjectId;
 use crate::model::PageNumber;
 use crate::model::RequestId;
+use crate::rt::environment::Deadline;
 use crate::runtime::RequestScope;
 #[cfg(test)]
 use racer_control_wire::CacheId;
@@ -22,7 +23,6 @@ use std::sync::Arc;
 use std::task::Poll;
 use std::time::Duration;
 use std::time::Instant;
-use uring_runtime::environment::Deadline;
 
 pub use ::topology::RDMA_PEERS;
 pub use ::topology::{Maintenance, SLOT_COUNT};
@@ -1163,7 +1163,7 @@ pub(crate) mod tests {
     /// silent: unavailable for routing until it answers anything.
     #[test]
     fn a_silent_peer_is_routed_around_until_it_answers() {
-        let clock = uring_runtime::environment::SimulationClock::new(1);
+        let clock = crate::rt::environment::SimulationClock::new(1);
         let sim_env = clock.environment(0);
         let _env = sim_env.enter();
         let sim_ctx = sim_env.worker_ctx();
@@ -2642,7 +2642,7 @@ pub(crate) mod tests {
             use crate::peer::AdaptivePeers;
             use crate::peer::Config;
             use crate::peer::Outcome;
-            let clock = uring_runtime::environment::SimulationClock::new(110);
+            let clock = crate::rt::environment::SimulationClock::new(110);
             let sim_env = clock.environment(0);
             let _env = sim_env.enter();
             let sim_ctx = sim_env.worker_ctx();
@@ -2680,7 +2680,7 @@ pub(crate) mod tests {
 
         #[test]
         fn yielded_and_cached_searches_enforce_scope_budget_and_membership() {
-            let clock = uring_runtime::environment::SimulationClock::new(109);
+            let clock = crate::rt::environment::SimulationClock::new(109);
             let sim_env = clock.environment(0);
             let _env = sim_env.enter();
             let sim_ctx = sim_env.worker_ctx();

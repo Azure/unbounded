@@ -43,7 +43,7 @@ fn fill_persistence_matches_core_policy() {
             (CIPHER, CIPHER),
             (CIPHER, CIPHER - 8),
         ] {
-            let queue = Rc::new(uring_runtime::drivers::DriverQueue::new(1024));
+            let queue = Rc::new(crate::rt::drivers::DriverQueue::new(1024));
             let _queue = queue.enter();
             let f = persisting(owned, limit);
             let deps = &f.fill.dependencies;
@@ -96,7 +96,7 @@ fn fill_persistence_matches_core_policy() {
 #[test]
 fn dirty_pressure_skips_persistence_while_bootstrap_read_succeeds() {
     for full in [false, true] {
-        let queue = Rc::new(uring_runtime::drivers::DriverQueue::new(1024));
+        let queue = Rc::new(crate::rt::drivers::DriverQueue::new(1024));
         let _queue = queue.enter();
         let mut f = persisting(true, CIPHER);
         let cache = f.context.object.cache.clone();

@@ -50,7 +50,7 @@ pub fn reactor() -> Rc<Reactor> {
             metadata_entries: n,
             relay_transfers: n,
         }))),
-        &uring_runtime::reactor::simulation::ambient_env(),
+        &racer_io::Env::new(racer_io::Driver::Uring, racer_io::WorkerCtx::host()),
     ));
     reactor.init().unwrap();
     reactor

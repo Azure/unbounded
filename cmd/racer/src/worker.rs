@@ -479,7 +479,7 @@ impl Drop for WorkerGroup {
 
 fn driver_waker(runtime: Option<&WorkerRuntime>) -> Result<Waker> {
     let reactor = runtime.map(|runtime| runtime.reactor.waker()).transpose()?;
-    Ok(uring_runtime::drivers::thread_waker(reactor))
+    Ok(crate::rt::drivers::thread_waker(reactor))
 }
 
 /// Independently drive resource completions while a service future borrows its
@@ -2168,7 +2168,7 @@ mod tests {
             // Leave startup enough room under concurrent builds: this scenario checks
             // deadline-driven teardown after all eight jobs, not startup latency.
             scope.deadline =
-                uring_runtime::environment::Deadline(Instant::now() + Duration::from_secs(1));
+                crate::rt::environment::Deadline(Instant::now() + Duration::from_secs(1));
             assert_eq!(
                 group.run_recipe_with_scope(&factory, &scope),
                 Err(Error::DeadlineExceeded)
@@ -2199,7 +2199,7 @@ mod tests {
                     let mut group = WorkerGroup::new(plan, crate::test_support::ctx());
                     let mut scope = scope();
                     if failure == Failure::PendingStart {
-                        scope.deadline = uring_runtime::environment::Deadline(
+                        scope.deadline = crate::rt::environment::Deadline(
                             Instant::now() + Duration::from_millis(30),
                         );
                     }
@@ -2302,7 +2302,7 @@ mod tests {
             let mut group = WorkerGroup::new(plan, crate::test_support::ctx());
             let mut scope = scope();
             scope.deadline =
-                uring_runtime::environment::Deadline(Instant::now() + Duration::from_millis(100));
+                crate::rt::environment::Deadline(Instant::now() + Duration::from_millis(100));
             assert_eq!(
                 group.start_recipe(Arc::new(factory), &scope),
                 Err(Error::DeadlineExceeded)
@@ -2765,7 +2765,7 @@ mod tests {
             );
             let mut scope = lifecycle_scope(&crate::test_support::clock()).unwrap();
             scope.deadline =
-                uring_runtime::environment::Deadline(Instant::now() + Duration::from_millis(50));
+                crate::rt::environment::Deadline(Instant::now() + Duration::from_millis(50));
             assert_eq!(
                 scoped.run_recipe_with_scope(&factory, &scope),
                 Err(Error::DeadlineExceeded)
@@ -2775,7 +2775,7 @@ mod tests {
 
         #[test]
         fn engine_driver_wake_survives_noop_operation_poll() {
-            use uring_runtime::test_util::WakeCounter;
+            use crate::rt::test_util::WakeCounter;
             let (_, factory) = fixture(3);
             let (io, port) = security::pair(WorkerId(0), 1, NonZeroUsize::new(1).unwrap());
             let mut engine = TestCrypto {

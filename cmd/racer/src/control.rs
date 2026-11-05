@@ -3,6 +3,14 @@
 use crate::error::Error;
 use crate::error::Operation;
 use crate::error::Result;
+use crate::rt::drivers::Busy;
+#[cfg(test)]
+use crate::rt::filesystem::prelude::*;
+use crate::rt::filesystem::secure;
+#[cfg(test)]
+use crate::rt::filesystem::secure::{
+    BENEATH, NO_MAGICLINKS, atomic_write, directory, read_at, read_path,
+};
 #[cfg(test)]
 use crate::runtime::Reactor;
 use crate::runtime::RequestScope;
@@ -49,14 +57,6 @@ use std::time::Duration;
 use std::time::Instant;
 #[cfg(test)]
 use std::time::SystemTime;
-use uring_runtime::drivers::Busy;
-#[cfg(test)]
-use uring_runtime::filesystem::prelude::*;
-use uring_runtime::filesystem::secure;
-#[cfg(test)]
-use uring_runtime::filesystem::secure::{
-    BENEATH, NO_MAGICLINKS, atomic_write, directory, read_at, read_path,
-};
 use wire_codec::rest;
 #[cfg(test)]
 use wire_codec::rest::Response;
@@ -452,7 +452,7 @@ impl rest::Io for ReactorControlIo {
         self.reactor.sim_os()
     }
 
-    type FileBytes = uring_runtime::filesystem::ReadBuffer;
+    type FileBytes = crate::rt::filesystem::ReadBuffer;
 
     type Error = Error;
 
@@ -578,7 +578,7 @@ pub(crate) mod tests {
 
     #[test]
     fn socket_readiness_errno_is_transient_but_file_errno_is_not() {
-        use uring_runtime::reactor::simulation::{Fault, Simulation};
+        use crate::rt::reactor::simulation::{Fault, Simulation};
         use wire_codec::rest::Io;
         let sim = Simulation::new();
         let _os = sim.enter();
@@ -608,9 +608,9 @@ pub(crate) mod tests {
     #[test]
     fn atomic_write_preserves_cause_and_requires_reconciliation_after_publication() {
         use crate::error::PublicationCause;
+        use crate::rt::reactor::simulation::{Fault, Simulation};
         use std::future::Future;
         use std::task::{Context, Poll};
-        use uring_runtime::reactor::simulation::{Fault, Simulation};
         for case in ["success", "write", "rename", "cancel-rename", "sync"] {
             let sim = Simulation::new();
             let _os = sim.enter();
@@ -1191,7 +1191,7 @@ pub(crate) mod tests {
             {
                 Box::pin(async move {
                     if self.0.replace(true) {
-                        uring_runtime::drivers::poll_scoped(scope, |_| {
+                        crate::rt::drivers::poll_scoped(scope, |_| {
                             std::task::Poll::<Result<Response>>::Pending
                         })
                         .await
@@ -1212,11 +1212,11 @@ pub(crate) mod tests {
         /// Cancel before or during a turn and fence the retained finite CPU closure.
         fn preparation_fence(cancel_wait: bool) {
             use std::future::Future;
-            let clock = uring_runtime::environment::SimulationClock::new(407);
+            let clock = crate::rt::environment::SimulationClock::new(407);
             let sim_env = clock.environment(0);
             let _time = sim_env.enter();
             let sim_ctx = sim_env.worker_ctx();
-            let sim = uring_runtime::reactor::simulation::Simulation::new();
+            let sim = crate::rt::reactor::simulation::Simulation::new();
             let _os = sim.enter();
             let reactor = Rc::new(Reactor::new(
                 Rc::new(flow_control::Quotas::new(
@@ -2141,7 +2141,7 @@ pub(crate) mod tests {
             let (ca, key) = testing::ca();
             let identity = enrolled(&r, &d, &ca, &key);
             assert!(identity.valid_at(racer_io::Clock::host().wall_now()));
-            let clock = uring_runtime::environment::SimulationClock::new(17);
+            let clock = crate::rt::environment::SimulationClock::new(17);
             let environment = clock.environment(1);
             // Roll only the scoped wall clock back after real enrollment. The generic
             // Identity has expiry only; Racer must enforce its not-before policy itself.
@@ -2313,7 +2313,7 @@ pub(crate) mod tests {
                 csr.params.extended_key_usages = vec![rcgen::ExtendedKeyUsagePurpose::ClientAuth];
                 response.certificate_chain = vec![csr.signed_by(&ca, &key).unwrap().der().to_vec()];
                 let identity = testing::drive(&r, e.accept_response(response, &scope)).unwrap();
-                let clock = uring_runtime::environment::SimulationClock::new_at(
+                let clock = crate::rt::environment::SimulationClock::new_at(
                     51,
                     std::time::Instant::now(),
                     wall + Duration::from_secs(due - 1),
@@ -2353,7 +2353,7 @@ pub(crate) mod tests {
                     e.accept_response(testing::issue(&request, &ca, &key, OLD_NODE), &scope),
                 )
                 .unwrap();
-                let clock = uring_runtime::environment::SimulationClock::new_at(
+                let clock = crate::rt::environment::SimulationClock::new_at(
                     31,
                     std::time::Instant::now(),
                     SystemTime::now() + Duration::from_secs(172800),
@@ -2802,7 +2802,7 @@ pub(crate) mod tests {
         use crate::test_support::enrollment as testing;
         #[test]
         fn secure_adapters_preserve_token_symlinks_identity_rejection_and_errors() {
-            use uring_runtime::reactor::simulation::Simulation;
+            use crate::rt::reactor::simulation::Simulation;
             let sim = Simulation::new();
             let _environment = sim.enter();
             let r = testing::reactor().unwrap();

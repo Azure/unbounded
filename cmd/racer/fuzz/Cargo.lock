@@ -206,7 +206,6 @@ version = "0.1.0"
 dependencies = [
  "futures",
  "racer-io",
- "uring-runtime",
  "wire-codec",
 ]
 
@@ -539,7 +538,6 @@ dependencies = [
  "libc",
  "racer-io",
  "rustls",
- "uring-runtime",
  "zeroize",
 ]
 
@@ -703,7 +701,6 @@ version = "0.1.0"
 dependencies = [
  "libc",
  "racer-io",
- "uring-runtime",
  "zeroize",
 ]
 
@@ -718,7 +715,6 @@ dependencies = [
  "racer-crypto",
  "racer-io",
  "sha2",
- "uring-runtime",
 ]
 
 [[package]]
@@ -856,7 +852,6 @@ dependencies = [
  "telemetry",
  "topology",
  "uds-endpoint",
- "uring-runtime",
  "wire-codec",
  "x509-parser",
  "zeroize",
@@ -869,10 +864,11 @@ dependencies = [
  "base64",
  "futures",
  "getrandom 0.2.17",
- "httparse",
+ "http1",
  "libc",
  "racer-control-wire",
  "racer-core",
+ "racer-io",
  "rcgen",
  "regex",
  "rustls",
@@ -1011,7 +1007,6 @@ dependencies = [
  "libc",
  "racer-io",
  "serde_json",
- "uring-runtime",
 ]
 
 [[package]]
@@ -1254,7 +1249,6 @@ version = "0.1.0"
 dependencies = [
  "httparse",
  "racer-io",
- "uring-runtime",
  "zeroize",
 ]
 
@@ -1352,18 +1346,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8ecb6da28b8a351d773b68d5825ac39017e680750f980f3a1a85cd8dd28a47c1"
 
 [[package]]
-name = "uring-runtime"
-version = "0.1.0"
-dependencies = [
- "futures",
- "getrandom 0.2.17",
- "io-uring",
- "libc",
- "racer-io",
- "zeroize",
-]
-
-[[package]]
 name = "version_check"
 version = "0.9.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1458,7 +1440,6 @@ dependencies = [
  "rustls",
  "rustls-pemfile",
  "sha2",
- "uring-runtime",
  "zeroize",
 ]
 

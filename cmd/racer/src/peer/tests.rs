@@ -17,6 +17,8 @@ use crate::peer::protocol::SecurityCodec;
 use crate::peer::protocol::Signatures;
 use crate::peer::protocol::decode_envelope;
 use crate::peer::protocol::encode_envelope;
+use crate::rt::environment::Deadline;
+use crate::rt::environment::SimulationClock;
 use crate::runtime::RequestScope;
 use crate::security::EncryptedAuthorization;
 use crate::security::PeerOriginContext;
@@ -31,8 +33,6 @@ use std::rc::Rc;
 use std::sync::Arc;
 use std::time::Duration;
 use std::time::Instant;
-use uring_runtime::environment::Deadline;
-use uring_runtime::environment::SimulationClock;
 
 mod body_progress {
     use super::*;
@@ -2700,7 +2700,7 @@ mod timing {
                 version: page.version.clone(),
                 length: 3,
                 expires_at: crate::model::ExpiresAt::test_time(
-                    uring_runtime::environment::wall_now() + Duration::from_secs(60),
+                    crate::rt::environment::wall_now() + Duration::from_secs(60),
                 ),
             },
             // Intentionally not AEAD-valid: forwarding verification does not decrypt.
@@ -3156,7 +3156,7 @@ pub(super) fn codec(admission: &Rc<flow_control::Quotas<AdmissionPolicy>>) -> Se
 #[test]
 fn receive_gate_operation_bypass_and_chained_small_caps_expire_and_recover() {
     use crate::telemetry::{Gauge, Metrics};
-    let clock = uring_runtime::environment::SimulationClock::new(920);
+    let clock = crate::rt::environment::SimulationClock::new(920);
     let sim_env = clock.environment(0);
     let _env = sim_env.enter();
     let sim_ctx = sim_env.worker_ctx();
@@ -3431,8 +3431,8 @@ fn page_timing_duration_conversion_saturates_and_reversed_clock_is_zero() {
     use crate::peer::Metrics;
     use crate::peer::PageTiming;
 
+    use crate::rt::environment::SimulationClock;
     use std::time::Duration;
-    use uring_runtime::environment::SimulationClock;
     let metrics = Metrics::default();
     let clock = SimulationClock::new(9);
     let sim_env = clock.environment(1);
@@ -3455,7 +3455,7 @@ mod adaptive {
     use crate::peer::*;
     #[test]
     fn hedges_require_spare_capacity_and_no_local_or_peer_pressure() {
-        let clock = uring_runtime::environment::SimulationClock::new(905);
+        let clock = crate::rt::environment::SimulationClock::new(905);
         let sim_env = clock.environment(0);
         let _env = sim_env.enter();
         let sim_ctx = sim_env.worker_ctx();
@@ -3492,7 +3492,7 @@ mod adaptive {
     }
     #[test]
     fn churn_cannot_evict_neutral_probe_backoff_with_old_update_time() {
-        let clock = uring_runtime::environment::SimulationClock::new(783);
+        let clock = crate::rt::environment::SimulationClock::new(783);
         let sim_env = clock.environment(0);
         let _env = sim_env.enter();
         let sim_ctx = sim_env.worker_ctx();
@@ -3566,7 +3566,7 @@ mod adaptive {
     }
     #[test]
     fn recovery_requires_exclusive_verified_probe_and_old_success_cannot_clear_failure() {
-        let clock = uring_runtime::environment::SimulationClock::new(779);
+        let clock = crate::rt::environment::SimulationClock::new(779);
         let sim_env = clock.environment(0);
         let _env = sim_env.enter();
         let sim_ctx = sim_env.worker_ctx();
@@ -3605,7 +3605,7 @@ mod adaptive {
     }
     #[test]
     fn state_capacity_never_evicts_live_permits_and_ages_retired_entries() {
-        let clock = uring_runtime::environment::SimulationClock::new(780);
+        let clock = crate::rt::environment::SimulationClock::new(780);
         let sim_env = clock.environment(0);
         let _env = sim_env.enter();
         let sim_ctx = sim_env.worker_ctx();
@@ -3648,7 +3648,7 @@ mod adaptive {
     }
     #[test]
     fn local_pressure_shrinks_node_limit_without_revoking_work_or_blame() {
-        let clock = uring_runtime::environment::SimulationClock::new(781);
+        let clock = crate::rt::environment::SimulationClock::new(781);
         let sim_env = clock.environment(0);
         let _env = sim_env.enter();
         let sim_ctx = sim_env.worker_ctx();

@@ -7,6 +7,9 @@ use crate::app::*;
 use crate::lifecycle::Service;
 use crate::model::PAGE_BYTES;
 use crate::model::*;
+use crate::rt::environment::SimulationClock;
+use crate::rt::reactor::simulation::Fault;
+use crate::rt::reactor::simulation::Simulation;
 use racer_control_wire as wire;
 use racer_control_wire::CacheDefinition;
 use racer_control_wire::CacheId;
@@ -21,9 +24,6 @@ use std::cell::RefCell;
 use std::collections::BTreeMap;
 use std::collections::VecDeque;
 use std::num::NonZeroUsize;
-use uring_runtime::environment::SimulationClock;
-use uring_runtime::reactor::simulation::Fault;
-use uring_runtime::reactor::simulation::Simulation;
 
 const MAX_NODES: usize = 32;
 const MAX_TURNS: usize = 100_000;
@@ -34,10 +34,10 @@ const SUBSCRIPTION_FIELDS: &str = "Content-Length: 0\r\nRacer-Page-Credits: 64\r
 
 /// The application owns this deterministic replay domain, not the generic runtime.
 trait RacerEntropy {
-    fn racer_environment(&self, stream: u64) -> uring_runtime::environment::Environment;
+    fn racer_environment(&self, stream: u64) -> crate::rt::environment::Environment;
 }
 impl RacerEntropy for SimulationClock {
-    fn racer_environment(&self, stream: u64) -> uring_runtime::environment::Environment {
+    fn racer_environment(&self, stream: u64) -> crate::rt::environment::Environment {
         self.environment_with_entropy_domain(stream, &b"racer.dst.entropy.v1\0"[..])
     }
 }
@@ -49,7 +49,7 @@ fn racer_entropy_replay_bytes_are_stable() {
     let mut bytes = [0; 32];
     for chunk in bytes.chunks_mut(3) {
         let _role = role.clone().enter();
-        uring_runtime::environment::fill_random(chunk).unwrap();
+        crate::rt::environment::fill_random(chunk).unwrap();
     }
     assert_eq!(
         bytes,
@@ -60,7 +60,7 @@ fn racer_entropy_replay_bytes_are_stable() {
     );
     let _default = clock.environment(11).enter();
     let mut neutral = [0; 32];
-    uring_runtime::environment::fill_random(&mut neutral).unwrap();
+    crate::rt::environment::fill_random(&mut neutral).unwrap();
     assert_ne!(bytes, neutral);
 }
 
@@ -301,7 +301,7 @@ mod faults {
         }
 
         pub(super) fn disk_corruption(&mut self) {
-            use uring_runtime::reactor::simulation::disk::DiskState;
+            use crate::rt::reactor::simulation::disk::DiskState;
             self.settle();
             let entries: Vec<_> = self
                 .nodes
@@ -816,7 +816,7 @@ mod scenarios {
         let _os = sim.enter();
         let clock = SimulationClock::new(73);
         let _time = clock.racer_environment(0).enter();
-        let _strict = uring_runtime::environment::require_simulated();
+        let _strict = crate::rt::environment::require_simulated();
         let mut harness = Harness::new(73, sim, clock, false);
         harness.add(None);
         harness.add(None);
@@ -972,7 +972,7 @@ mod scenarios {
         let clock = SimulationClock::new(73);
         let environment = clock.racer_environment(0);
         let _time = environment.enter();
-        let _strict = uring_runtime::environment::require_simulated();
+        let _strict = crate::rt::environment::require_simulated();
         let mut harness = Harness::new(73, sim, clock, false);
         harness.add(None);
         harness.add(None);
@@ -1015,7 +1015,7 @@ mod scenarios {
             let scope = RequestScope::on(
                 &crate::test_support::clock(),
                 RequestId([1; 16]),
-                uring_runtime::environment::now() + Duration::from_secs(5),
+                crate::rt::environment::now() + Duration::from_secs(5),
             )
             .unwrap();
             let mut attempt = [0; 16];
@@ -1101,7 +1101,7 @@ mod scenarios {
         let clock = SimulationClock::new(73);
         let environment = clock.racer_environment(0);
         let _time = environment.enter();
-        let _strict = uring_runtime::environment::require_simulated();
+        let _strict = crate::rt::environment::require_simulated();
         let mut harness = Harness::new(73, sim.clone(), clock.clone(), false);
         harness.add(None);
         // The DST harness bypasses control enrollment and already attaches diagnostic
@@ -1226,7 +1226,7 @@ mod scenarios {
         let clock = SimulationClock::new(71);
         let environment = clock.racer_environment(0);
         let _time = environment.enter();
-        let _strict = uring_runtime::environment::require_simulated();
+        let _strict = crate::rt::environment::require_simulated();
         let mut harness = Harness::new(71, sim, clock, false);
         harness.opaque_relay = opaque;
         // Match the deployed 64 MiB per-worker payload budgets. A five-page layer
@@ -1275,7 +1275,7 @@ mod scenarios {
         let clock = SimulationClock::new(73);
         let environment = clock.racer_environment(0);
         let _time = environment.enter();
-        let _strict = uring_runtime::environment::require_simulated();
+        let _strict = crate::rt::environment::require_simulated();
         let mut harness = Harness::new(73, sim, clock, false);
         harness.concurrent_layers = true;
         harness.opaque_relay = opaque;
@@ -1732,7 +1732,7 @@ mod traffic {
                 }
                 Action::Partition if self.nodes.len() > 1 => self.partition_traffic(),
                 Action::WallJump => {
-                    let wall = uring_runtime::environment::wall_now();
+                    let wall = crate::rt::environment::wall_now();
                     let amount = Duration::from_secs(1 + self.rng.pick(120) as u64);
                     self.clock.set_wall_time(if self.rng.pick(2) == 0 {
                         wall + amount
@@ -1742,9 +1742,9 @@ mod traffic {
                     self.traffic(1, true);
                     // Recover past replay admission's wall high-water mark.
                     self.clock.advance(Duration::from_secs(121));
-                    let (anchor, wall_anchor) = uring_runtime::environment::clock_anchor();
+                    let (anchor, wall_anchor) = crate::rt::environment::clock_anchor();
                     self.clock.set_wall_time(
-                        wall_anchor + uring_runtime::environment::now().duration_since(anchor),
+                        wall_anchor + crate::rt::environment::now().duration_since(anchor),
                     );
                     self.coverage.action("wall-jump");
                 }
@@ -2009,7 +2009,7 @@ impl PartialEq for ReplayTrace {
 }
 impl Eq for ReplayTrace {}
 
-fn handle(fd: &Descriptor) -> uring_runtime::reactor::simulation::Handle {
+fn handle(fd: &Descriptor) -> crate::rt::reactor::simulation::Handle {
     fd.as_sim().expect("DST escaped into host I/O")
 }
 fn would_block(error: &std::io::Error) -> bool {
@@ -2829,7 +2829,7 @@ impl Harness {
             for state in [links.state(&peer, rail), remote.state(&local, rail)] {
                 if let rdma_verbs::LinkState::Backoff(until) = state {
                     self.clock.advance(
-                        until.saturating_duration_since(uring_runtime::environment::now())
+                        until.saturating_duration_since(crate::rt::environment::now())
                             + Duration::from_millis(1),
                     );
                 }
@@ -3191,7 +3191,7 @@ fn default_grace_staggered_nodes_and_periodic_checkpoint_traffic() {
                 .app
                 .node
                 .publications
-                .resolve(old.0, uring_runtime::environment::now())
+                .resolve(old.0, crate::rt::environment::now())
                 .unwrap()
                 .is_some()
         );
@@ -3231,7 +3231,7 @@ fn dst_origin_recovery_completes_before_concurrent_healthy_reads() {
         let clock = SimulationClock::new(106);
         let environment = clock.racer_environment(0);
         let _time = environment.enter();
-        let _strict = uring_runtime::environment::require_simulated();
+        let _strict = crate::rt::environment::require_simulated();
         let mut harness = Harness::new(106, sim, clock, native);
         for object in 0..8 {
             harness.update(object);
@@ -3274,7 +3274,7 @@ fn dst_native_faults_reach_warmed_peers_in_small_topologies() {
         let clock = SimulationClock::new(118);
         let environment = clock.racer_environment(0);
         let _time = environment.enter();
-        let _strict = uring_runtime::environment::require_simulated();
+        let _strict = crate::rt::environment::require_simulated();
         let mut harness = Harness::new(118, sim, clock, true);
         for _ in 0..nodes {
             harness.add(None);
@@ -3304,7 +3304,7 @@ fn dst_refused_peer_connect_preserves_candidate_fallback() {
         let clock = SimulationClock::new(119);
         let environment = clock.racer_environment(0);
         let _time = environment.enter();
-        let _strict = uring_runtime::environment::require_simulated();
+        let _strict = crate::rt::environment::require_simulated();
         let mut harness = Harness::new(119, sim, clock, native);
         for _ in 0..4 {
             harness.add(None);
@@ -3351,7 +3351,7 @@ fn dst_shutdown_checkpoint_uses_async_io_and_releases_all_shards() {
         let clock = SimulationClock::new(120);
         let environment = clock.racer_environment(0);
         let _time = environment.enter();
-        let _strict = uring_runtime::environment::require_simulated();
+        let _strict = crate::rt::environment::require_simulated();
         let mut harness = Harness::new(120, sim, clock, false);
         harness.rng = Random((0..100).find(|seed| Random(*seed).pick(2) == 1).unwrap());
         harness.add(None);
@@ -3666,7 +3666,7 @@ fn replay(seed: u64, steps: usize, native: bool) -> Coverage {
     let clock = SimulationClock::new(seed);
     let environment = clock.racer_environment(0);
     let _time = environment.enter();
-    let _strict = uring_runtime::environment::require_simulated();
+    let _strict = crate::rt::environment::require_simulated();
     let mut harness = Harness::new(seed, sim, clock, native);
     harness
         .coverage

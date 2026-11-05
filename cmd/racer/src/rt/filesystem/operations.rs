@@ -394,14 +394,14 @@ mod publication {
     pub(super) struct Directory {
         fd: Descriptor,
 
-        #[cfg(feature = "simulation")]
+        #[cfg(test)]
         simulated: Option<(simulation::Simulation, PathBuf)>,
     }
 
     impl Directory {
         /// Walk and pin private directories without traversing parent symlinks.
         pub(super) fn open(path: &Path) -> io::Result<Self> {
-            #[cfg(feature = "simulation")]
+            #[cfg(test)]
             if let Some(sim) = simulation::Simulation::current() {
                 let mut current = PathBuf::from(if path.is_absolute() { "/" } else { "." });
                 let mut fd = sim.open(
@@ -453,7 +453,7 @@ mod publication {
             }
             Ok(Self {
                 fd,
-                #[cfg(feature = "simulation")]
+                #[cfg(test)]
                 simulated: None,
             })
         }
@@ -462,7 +462,7 @@ mod publication {
         pub(super) fn create(&self, name: &CString) -> io::Result<Descriptor> {
             let flags =
                 libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_CLOEXEC | libc::O_NOFOLLOW;
-            #[cfg(feature = "simulation")]
+            #[cfg(test)]
             if let Some((sim, _)) = &self.simulated {
                 return sim.open(
                     Some(&self.fd),
@@ -475,7 +475,7 @@ mod publication {
 
         /// Publish a stage without an implicit durability fence.
         pub(super) fn rename(&self, from: &CString, to: &CString) -> io::Result<()> {
-            #[cfg(feature = "simulation")]
+            #[cfg(test)]
             if let Some((sim, directory)) = &self.simulated {
                 return sim.rename(
                     &directory.join(OsStr::from_bytes(from.as_bytes())),
@@ -496,7 +496,7 @@ mod publication {
 
         /// Remove a failed stage without changing the destination.
         pub(super) fn unlink(&self, name: &CString) -> io::Result<()> {
-            #[cfg(feature = "simulation")]
+            #[cfg(test)]
             if let Some((sim, directory)) = &self.simulated {
                 return sim.unlink(&directory.join(OsStr::from_bytes(name.as_bytes())));
             }
@@ -561,7 +561,7 @@ mod publication {
 
     /// Perform one positioned write and return short progress or the original error.
     pub(super) fn write(fd: &Descriptor, offset: usize, bytes: &[u8]) -> io::Result<usize> {
-        #[cfg(feature = "simulation")]
+        #[cfg(test)]
         if let Some(handle) = fd.as_sim() {
             return handle.file_write(offset as u64, bytes);
         }
@@ -576,11 +576,11 @@ mod publication {
     }
 }
 
-#[cfg(all(test, feature = "simulation"))]
+#[cfg(test)]
 mod chunked_tests {
     //! Reused scratch and publication faults exercised through simulated completions.
     use super::*;
-    use crate::reactor::{
+    use crate::rt::reactor::{
         filesystem::fixtures::{Admission, Limits, Reactor, scope},
         filesystem::{
             operations::publish_new,
@@ -793,11 +793,11 @@ mod chunked_tests {
     }
 }
 
-#[cfg(all(test, feature = "simulation"))]
+#[cfg(test)]
 mod tests {
     //! Bounded output ownership and staged publication phase regressions.
     use super::*;
-    use crate::reactor::{
+    use crate::rt::reactor::{
         filesystem::fixtures::{Admission, Limits, Reactor, scope},
         filesystem::test_support::{drive, poll},
         simulation::{Fault, Simulation},

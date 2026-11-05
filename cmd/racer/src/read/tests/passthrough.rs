@@ -44,7 +44,7 @@ fn assert_retains_nothing(f: &Fixture) {
 #[test]
 fn passthrough_reads_refetch_from_origin_and_retain_nothing() {
     for mode in [CacheMode::Cached, MODES[0], MODES[1]] {
-        let queue = Rc::new(uring_runtime::drivers::DriverQueue::new(1024));
+        let queue = Rc::new(crate::rt::drivers::DriverQueue::new(1024));
         let _queue = queue.enter();
         let mut f = fixture();
         f.set_mode(mode);
@@ -75,7 +75,7 @@ fn passthrough_reads_refetch_from_origin_and_retain_nothing() {
 #[test]
 fn passthrough_owner_ciphertext_fill_retains_nothing() {
     for mode in MODES {
-        let queue = Rc::new(uring_runtime::drivers::DriverQueue::new(1024));
+        let queue = Rc::new(crate::rt::drivers::DriverQueue::new(1024));
         let _queue = queue.enter();
         let mut f = fixture();
         f.set_mode(mode);
@@ -94,7 +94,7 @@ fn passthrough_owner_ciphertext_fill_retains_nothing() {
 #[test]
 fn passthrough_concurrent_reads_coalesce_into_one_origin_call() {
     for mode in MODES {
-        let queue = Rc::new(uring_runtime::drivers::DriverQueue::new(1024));
+        let queue = Rc::new(crate::rt::drivers::DriverQueue::new(1024));
         let _queue = queue.enter();
         let mut f = fixture();
         f.set_mode(mode);
@@ -131,7 +131,7 @@ fn passthrough_concurrent_reads_coalesce_into_one_origin_call() {
             assert!(first.as_mut().poll(&mut cx).is_pending());
             assert!(second.as_mut().poll(&mut cx).is_pending());
             assert!(third.as_mut().poll(&mut cx).is_pending());
-            uring_runtime::drivers::poll(&mut cx, 64);
+            crate::rt::drivers::poll(&mut cx, 64);
         }
         assert_eq!(f.origin.calls.get(), 1, "{mode:?}");
         f.origin.blocked_pages.borrow_mut().clear();
@@ -155,7 +155,7 @@ fn passthrough_concurrent_reads_coalesce_into_one_origin_call() {
 /// the page: the fixture's requester panics if any peer is contacted.
 #[test]
 fn passthrough_local_route_never_asks_page_owners() {
-    let queue = Rc::new(uring_runtime::drivers::DriverQueue::new(1024));
+    let queue = Rc::new(crate::rt::drivers::DriverQueue::new(1024));
     let _queue = queue.enter();
     let mut f = fixture();
     let local = f.fill.dependencies.candidates.node.clone();
@@ -263,7 +263,7 @@ fn local_origin_authority_requires_local_route() {
 #[test]
 fn residual_pages_are_not_served_after_switching_to_passthrough() {
     for mode in MODES {
-        let queue = Rc::new(uring_runtime::drivers::DriverQueue::new(1024));
+        let queue = Rc::new(crate::rt::drivers::DriverQueue::new(1024));
         let _queue = queue.enter();
         let mut f = fixture();
         let cached = acquire_plain(&mut f).unwrap();
@@ -311,7 +311,7 @@ fn residual_pages_are_not_served_after_switching_to_passthrough() {
 /// A disk copy written before a switch to passthrough is not read back.
 #[test]
 fn residual_disk_copy_is_not_served_after_switching_to_passthrough() {
-    let queue = Rc::new(uring_runtime::drivers::DriverQueue::new(1024));
+    let queue = Rc::new(crate::rt::drivers::DriverQueue::new(1024));
     let _queue = queue.enter();
     let mut f = fixture();
     let result = acquire_plain(&mut f).unwrap();
@@ -343,7 +343,7 @@ fn passthrough_metadata_is_revalidated_on_every_read() {
     use crate::test_support::origin::AdapterOrigin;
     use crate::test_support::origin::RequestKind;
     for mode in [CacheMode::Cached, MODES[0], MODES[1]] {
-        let queue = Rc::new(uring_runtime::drivers::DriverQueue::new(1024));
+        let queue = Rc::new(crate::rt::drivers::DriverQueue::new(1024));
         let _queue = queue.enter();
         let mut f = fixture();
         f.set_mode(mode);
@@ -399,7 +399,7 @@ fn passthrough_metadata_is_revalidated_on_every_read() {
 fn passthrough_refuses_holds_and_prefetch_fills() {
     use crate::test_support::security::network;
     for mode in [CacheMode::Cached, MODES[0], MODES[1]] {
-        let queue = Rc::new(uring_runtime::drivers::DriverQueue::new(1024));
+        let queue = Rc::new(crate::rt::drivers::DriverQueue::new(1024));
         let _queue = queue.enter();
         let signers = network(1);
         let mut f = fixture_with(PAGE_BYTES + 7, None);
@@ -466,7 +466,7 @@ fn passthrough_refuses_holds_and_prefetch_fills() {
 fn queued_publication_is_dropped_after_switching_to_passthrough() {
     use crate::test_support::security::network;
     for mode in [CacheMode::Cached, MODES[0], MODES[1]] {
-        let queue = Rc::new(uring_runtime::drivers::DriverQueue::new(1024));
+        let queue = Rc::new(crate::rt::drivers::DriverQueue::new(1024));
         let _queue = queue.enter();
         let signers = network(1);
         let mut f = fixture_with(PAGE_BYTES + 7, None);
@@ -506,7 +506,7 @@ fn delayed_retained_metadata_is_dropped_after_switching_to_passthrough() {
     use crate::model::MetadataSelector;
     use crate::test_support::security::network;
     for mode in [CacheMode::Cached, MODES[0], MODES[1]] {
-        let queue = Rc::new(uring_runtime::drivers::DriverQueue::new(1024));
+        let queue = Rc::new(crate::rt::drivers::DriverQueue::new(1024));
         let _queue = queue.enter();
         let signers = network(1);
         let mut f = fixture_with(PAGE_BYTES + 7, None);
@@ -562,7 +562,7 @@ fn passthrough_stream_keeps_its_whole_window_of_origin_reads_in_flight() {
     use crate::test_support::security::network;
     const WINDOW: usize = 4;
     for mode in MODES {
-        let queue = Rc::new(uring_runtime::drivers::DriverQueue::new(1024));
+        let queue = Rc::new(crate::rt::drivers::DriverQueue::new(1024));
         let _owner = queue.enter();
         let signers = network(1);
         let mut f = fixture_with(6 * PAGE_BYTES + 7, None);
@@ -621,7 +621,7 @@ fn passthrough_pinned_origin_miss_keeps_transient_predecessors_retryable() {
     use crate::read::candidates::ProbeOutcome;
     use crate::test_support::origin::AdapterOrigin;
     for mode in MODES {
-        let queue = Rc::new(uring_runtime::drivers::DriverQueue::new(1024));
+        let queue = Rc::new(crate::rt::drivers::DriverQueue::new(1024));
         let _queue = queue.enter();
         let mut f = fixture();
         f.set_mode(mode);

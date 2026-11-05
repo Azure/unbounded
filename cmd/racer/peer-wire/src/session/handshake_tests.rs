@@ -2,28 +2,27 @@ use super::*;
 use http1::connection::{HttpPool, PoolConfig, State};
 use racer_io::cancel::Cancellation;
 use racer_io::scoped::{Reactor, SocketAddress};
+use racer_io::{Clock, ctx::SimClock, sim::SimOs};
 use std::{
     cell::Cell,
     future::{Future, poll_fn},
     task::{Poll, Waker},
     time::Instant,
 };
-use uring_runtime::{
-    environment::{SimulationClock, now},
-    reactor::simulation::Simulation,
-};
 
 #[derive(Clone)]
 struct TestScope {
     cancellation: Cancellation,
     deadline: Instant,
+    clock: Clock,
 }
 
 impl TestScope {
-    fn new(duration: Duration) -> Self {
+    fn new(clock: &Clock, duration: Duration) -> Self {
         Self {
             cancellation: Cancellation::new().unwrap(),
-            deadline: now() + duration,
+            deadline: clock.now() + duration,
+            clock: clock.clone(),
         }
     }
 }
@@ -35,7 +34,7 @@ impl Scope for TestScope {
         if self.cancellation.is_cancelled() {
             return Err(racer_io::Error::Cancelled.into());
         }
-        if now() >= self.deadline {
+        if self.clock.now() >= self.deadline {
             return Err(Error::DeadlineExceeded);
         }
         Ok(())
@@ -141,7 +140,10 @@ impl Context for Hooks {
         parent.check()?;
         Ok(TestScope {
             cancellation: parent.cancellation.clone(),
-            deadline: parent.deadline.min(now() + Duration::from_secs(5)),
+            deadline: parent
+                .deadline
+                .min(parent.clock.now() + Duration::from_secs(5)),
+            clock: parent.clock.clone(),
         })
     }
 }
@@ -162,12 +164,13 @@ impl Harness {
         let reactor = Rc::new(TestReactor(Reactor::new(32, env)));
         let hooks = Rc::new(Hooks::default());
         let identities = crate::tests::network(3, reactor.0.ctx());
+        let scope = TestScope::new(&reactor.0.ctx().clock, Duration::from_secs(30));
         Self {
             io: HttpIo::new(reactor.clone(), Codec::new(MAX_HEAD), hooks.clone(), 0, 0),
             pool: HttpPool::new(reactor.clone(), hooks.clone(), PoolConfig::default()),
             reactor,
             hooks,
-            scope: TestScope::new(Duration::from_secs(30)),
+            scope,
             identities,
         }
     }
@@ -184,7 +187,7 @@ impl Harness {
         panic!("simulation exceeded bounded polling budget");
     }
 
-    fn pair(&self, sim: &Simulation) -> (Lease, Lease) {
+    fn pair(&self, sim: &SimOs) -> (Lease, Lease) {
         use http1::connection::{Context as _, Endpoint as _};
         let listener = sim.listen(Endpoint.address().unwrap()).unwrap();
         let mut client = self
@@ -283,13 +286,10 @@ async fn join<A: Future, B: Future>(a: A, b: B) -> (A::Output, B::Output) {
     .await
 }
 
-fn simulation(test: impl FnOnce(&Harness, &Simulation, &SimulationClock)) {
-    let clock = SimulationClock::new_at(899, Instant::now(), SystemTime::now());
-    let environment = clock.environment(0);
-    let _clock = environment.enter();
-    let sim = Simulation::new();
-    let _sim = sim.enter();
-    let h = Harness::new(&racer_io::Env::sim(&sim, environment.worker_ctx()));
+fn simulation(test: impl FnOnce(&Harness, &SimOs, &SimClock)) {
+    let clock = SimClock::new_at(899, Instant::now(), SystemTime::now());
+    let sim = SimOs::new();
+    let h = Harness::new(&racer_io::Env::sim(&sim, clock.ctx(0)));
     test(&h, &sim, &clock);
     h.pool.close();
     h.drive(h.reactor.drain()).unwrap();
@@ -563,11 +563,10 @@ fn cancellation_and_deadlines_abort_each_handshake_wait_and_release_slots() {
             for stop in ["cancel", "parent-deadline", "handshake-deadline"] {
                 simulation(|h, sim, clock| {
                     let (client, server) = h.pair(sim);
-                    let scope = TestScope::new(Duration::from_secs(if stop == "parent-deadline" {
-                        2
-                    } else {
-                        30
-                    }));
+                    let scope = TestScope::new(
+                        &h.scope.clock,
+                        Duration::from_secs(if stop == "parent-deadline" { 2 } else { 30 }),
+                    );
                     let (target, peer) = if outbound {
                         (client, server)
                     } else {
@@ -690,11 +689,14 @@ fn pooled_sessions_reject_wrong_peer_expiry_and_canceled_parent_without_io() {
                 assert!(socket.ptr_eq(&Rc::downgrade(&client.socket())));
                 let (mut client, server) = h.application_round(client, server);
                 assert!(client.is_reusable());
-                let mut scope = TestScope::new(Duration::from_secs(30));
+                let mut scope = TestScope::new(&h.scope.clock, Duration::from_secs(30));
                 match fault {
-                    "expired" => client.state_mut().session.as_mut().unwrap().state.expires = now(),
+                    "expired" => {
+                        client.state_mut().session.as_mut().unwrap().state.expires =
+                            h.scope.clock.now()
+                    }
                     "cancel" => scope.cancellation.cancel().unwrap(),
-                    "deadline" => scope.deadline = now(),
+                    "deadline" => scope.deadline = h.scope.clock.now(),
                     _ => (),
                 }
                 let trace = sim.trace();

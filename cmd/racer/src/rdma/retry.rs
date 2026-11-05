@@ -118,7 +118,7 @@ mod tests {
         RequestScope::on(
             &crate::test_support::clock(),
             crate::model::RequestId([7; 16]),
-            uring_runtime::environment::now() + Duration::from_secs(30),
+            crate::rt::environment::now() + Duration::from_secs(30),
         )
         .unwrap()
     }
@@ -208,7 +208,7 @@ mod tests {
     #[test]
     fn alarm_wakes_child_to_observe_deadline_without_native_wake() {
         use futures::{Stream, stream::FuturesUnordered};
-        let clock = uring_runtime::environment::SimulationClock::new(989);
+        let clock = crate::rt::environment::SimulationClock::new(989);
         let _environment = clock.environment(0).enter();
         let retry = NativeRetry::unattached();
         let scope = scope();

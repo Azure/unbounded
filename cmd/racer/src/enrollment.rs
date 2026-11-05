@@ -8,6 +8,11 @@
 //! returning an identity. Cancellation and abandoned writes are fenced through
 //! the caller's host; transport retries and inventory remain application policy.
 
+use crate::rt::filesystem::prelude::*;
+use crate::rt::filesystem::{
+    operations::ReplacementError,
+    secure::{self, Attempts, Host},
+};
 use base64::{Engine, engine::general_purpose::STANDARD};
 use racer_control_wire::{
     self as wire, ClusterId, EnrollmentId, EnrollmentRequest, EnrollmentResponse, NodeId,
@@ -22,11 +27,6 @@ use std::{
     path::PathBuf,
     sync::Arc,
     time::{Duration, SystemTime, UNIX_EPOCH},
-};
-use uring_runtime::filesystem::prelude::*;
-use uring_runtime::filesystem::{
-    operations::ReplacementError,
-    secure::{self, Attempts, Host},
 };
 use zeroize::{Zeroize, Zeroizing};
 
@@ -678,6 +678,7 @@ fn check_pending_key(pending: &PendingIdentity, csr: &[u8]) -> Result<(), Error>
 mod tests {
     //! Real enrollment state transitions over deterministic reactor completions.
     use super::*;
+    use crate::rt::reactor::simulation::{Fault, Simulation};
     use racer_io::cancel::Cancellation;
     use racer_io::scoped::Reactor;
     use std::{
@@ -687,7 +688,6 @@ mod tests {
         task::{Context, Poll},
         time::Instant,
     };
-    use uring_runtime::reactor::simulation::{Fault, Simulation};
 
     std::thread_local! {
         /// Observe secret-field destruction without reading deallocated memory.
@@ -1437,7 +1437,7 @@ mod tests {
     fn root_expiring_after_installation_blocks_persistence_and_recovery() {
         let sim = Simulation::new();
         let _environment = sim.enter();
-        let clock = uring_runtime::environment::SimulationClock::new(105);
+        let clock = crate::rt::environment::SimulationClock::new(105);
         let sim_env = clock.environment(0);
         let _time = sim_env.enter();
         let sim_ctx = sim_env.worker_ctx();
@@ -1619,7 +1619,7 @@ mod tests {
     fn renewal_and_expired_recovery_follow_scoped_time() {
         let sim = Simulation::new();
         let _environment = sim.enter();
-        let clock = uring_runtime::environment::SimulationClock::new(99);
+        let clock = crate::rt::environment::SimulationClock::new(99);
         let sim_env = clock.environment(0);
         let _time = sim_env.enter();
         let sim_ctx = sim_env.worker_ctx();

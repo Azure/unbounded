@@ -170,7 +170,7 @@ impl PeerServer {
         let receiver = connection.state().session.as_ref()?.peer();
         let (ticket, sample) =
             samples.begin(pair, self.signatures.node(), receiver, scope.clock().now())?;
-        let permit = match uring_runtime::drivers::reserve().map_err(Error::from) {
+        let permit = match crate::rt::drivers::reserve().map_err(Error::from) {
             Ok(p) => p,
             Err(error) => {
                 sample.finish(Some(error));
@@ -1148,6 +1148,7 @@ fn peer_response(response: racer_core::route::Response) -> PeerResponse {
 mod tests {
     use super::*;
     use crate::model::RequestId;
+    use crate::rt::environment::SimulationClock;
     use crate::test_support::clock::Clock;
     use futures::channel::oneshot;
     use futures::stream::FuturesUnordered;
@@ -1159,7 +1160,6 @@ mod tests {
     use std::pin::Pin;
     use std::task::Context;
     use std::task::Poll;
-    use uring_runtime::environment::SimulationClock;
 
     #[derive(Default)]
     struct AcceptCounts {

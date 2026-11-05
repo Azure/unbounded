@@ -1815,7 +1815,7 @@ mod tests {
 
     #[test]
     fn stale_hold_page_release_cannot_drop_a_replacement_holder() {
-        let clock = uring_runtime::environment::SimulationClock::new(29);
+        let clock = crate::rt::environment::SimulationClock::new(29);
         let sim_env = clock.environment(0);
         let _environment = sim_env.enter();
         let sim_ctx = sim_env.worker_ctx();

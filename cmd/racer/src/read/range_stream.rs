@@ -1389,7 +1389,7 @@ impl RangeStream {
                 continue;
             };
             // A pending hold may still be applied; its completion fence says so.
-            let Ok(permit) = uring_runtime::drivers::reserve() else {
+            let Ok(permit) = crate::rt::drivers::reserve() else {
                 continue;
             };
             let directory = self.directory.clone();
@@ -1981,7 +1981,7 @@ pub(super) mod tests {
     #[test]
     fn optional_remote_observation_never_blocks_ready_delivery_or_duplicates_on_repoll() {
         for repoll in [false, true] {
-            let queue = Rc::new(uring_runtime::drivers::DriverQueue::new(8));
+            let queue = Rc::new(crate::rt::drivers::DriverQueue::new(8));
             let _queue = queue.enter();
             let f = Fixture::new(crate::test_support::cluster::config(false).limits, 2);
             let directory = f.streams.directory();
@@ -2856,7 +2856,7 @@ pub(super) mod tests {
         let total = 4 * PAGE_BYTES + 17;
         let range = ByteRange::From(PAGE_BYTES).resolve(total).unwrap();
         for (capped, progressing) in [(true, false), (false, true), (false, false)] {
-            let clock = uring_runtime::environment::SimulationClock::new(55);
+            let clock = crate::rt::environment::SimulationClock::new(55);
             let environment = clock.environment(0);
             let _clock = environment.enter();
             let admission = Rc::new(flow_control::Quotas::new(AdmissionPolicy::new(
@@ -2899,7 +2899,7 @@ pub(super) mod tests {
             let scope = RequestScope::on(
                 &crate::test_support::clock(),
                 RequestId([7; 16]),
-                uring_runtime::environment::now()
+                crate::rt::environment::now()
                     + if progressing {
                         Duration::from_millis(30)
                     } else {
@@ -3074,7 +3074,7 @@ pub(super) mod tests {
             worker.poll(&mut cx);
             if progressing {
                 assert!(
-                    uring_runtime::environment::now() > scope.deadline.0,
+                    crate::rt::environment::now() > scope.deadline.0,
                     "stream must cross the scaled old absolute deadline"
                 );
             }
@@ -3085,7 +3085,7 @@ pub(super) mod tests {
 
     #[test]
     fn progressing_page_children_keep_deadlines_and_retry_limits_across_long_streams() {
-        let clock = uring_runtime::environment::SimulationClock::new(81);
+        let clock = crate::rt::environment::SimulationClock::new(81);
         let sim_env = clock.environment(0);
         let _environment = sim_env.enter();
         let sim_ctx = sim_env.worker_ctx();

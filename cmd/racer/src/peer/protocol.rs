@@ -19,6 +19,7 @@ use crate::model::ObjectMetadata;
 use crate::model::PageEnvelope;
 use crate::model::*;
 use crate::peer::forwarding::ForwardedHead;
+use crate::rt::environment::Deadline;
 use crate::runtime::RequestScope;
 use crate::security::EncryptedAuthorization;
 use crate::security::OpaqueMetadata;
@@ -47,7 +48,6 @@ use std::time::Instant;
 use std::time::SystemTime;
 #[cfg(test)]
 use std::time::UNIX_EPOCH;
-use uring_runtime::environment::Deadline;
 
 pub enum FetchMode {
     CopyOnly,
@@ -2239,7 +2239,7 @@ pub(crate) mod tests {
         }
         #[test]
         fn parallel_connections_isolate_counters_and_wall_rollback_cannot_resurrect_frames() {
-            let clock = uring_runtime::environment::SimulationClock::new_at(
+            let clock = crate::rt::environment::SimulationClock::new_at(
                 92,
                 Instant::now(),
                 std::time::SystemTime::now(),
@@ -2258,7 +2258,7 @@ pub(crate) mod tests {
             assert_eq!(other_b.rx, 0);
             other_b.admit(other_a.sign(frame()).unwrap()).unwrap();
             clock.advance(Duration::from_secs(61));
-            clock.set_wall_time(uring_runtime::environment::wall_now() - Duration::from_secs(61));
+            clock.set_wall_time(crate::rt::environment::wall_now() - Duration::from_secs(61));
             assert!(b.admit(old).is_err());
             assert_eq!(b.rx, 1);
             b.admit(a.sign(frame()).unwrap()).unwrap();
@@ -2266,7 +2266,7 @@ pub(crate) mod tests {
         }
         #[test]
         pub(crate) fn more_than_4096_frames_at_fixed_time_have_constant_session_storage() {
-            let clock = uring_runtime::environment::SimulationClock::new_at(
+            let clock = crate::rt::environment::SimulationClock::new_at(
                 71,
                 Instant::now(),
                 std::time::SystemTime::now(),
@@ -2274,7 +2274,7 @@ pub(crate) mod tests {
             let environment = clock.environment(0);
             let _guard = environment.enter();
             let (mut a, mut b) = pair();
-            let now = uring_runtime::environment::wall_now();
+            let now = crate::rt::environment::wall_now();
             let bytes = std::mem::size_of_val(&a) + std::mem::size_of_val(&b);
             for sequence in 1..=5000 {
                 let h = a.sign(frame()).unwrap();

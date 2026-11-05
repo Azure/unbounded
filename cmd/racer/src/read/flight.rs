@@ -49,9 +49,9 @@ pub struct Flights {
 
     pub(super) table: RefCell<Table>,
 
-    waiting: uring_runtime::offload::AdmissionQueue<PageId>,
+    waiting: crate::rt::offload::AdmissionQueue<PageId>,
 
-    admission_deadlines: Rc<uring_runtime::environment::Registry>,
+    admission_deadlines: Rc<crate::rt::environment::Registry>,
 
     capacity_wake: CapacityWake,
 
@@ -64,7 +64,7 @@ type CapacityWake = Rc<RefCell<Option<(u64, Waker)>>>;
 
 /// Retire only this ticket's wake before its queue guard can wake a successor.
 struct AdmissionTicket<'a> {
-    ticket: Option<uring_runtime::offload::CapacityWaiter<'a, PageId>>,
+    ticket: Option<crate::rt::offload::CapacityWaiter<'a, PageId>>,
 
     wake: CapacityWake,
 
@@ -328,7 +328,7 @@ pub struct FlightOperation {
     pub(super) operation: flight::Operation,
     /// Wake at the deadline of the waiter the operation currently serves, so
     /// a handed-over operation observes the end of its last adopter.
-    alarm: Option<(Instant, uring_runtime::environment::Registration)>,
+    alarm: Option<(Instant, crate::rt::environment::Registration)>,
 }
 impl FlightOperation {
     pub fn complete(self) -> Result<()> {
@@ -690,7 +690,7 @@ impl Flights {
                 clock.now(),
                 FlightHashState::default(),
             )),
-            waiting: uring_runtime::offload::AdmissionQueue::new(
+            waiting: crate::rt::offload::AdmissionQueue::new(
                 admission.policy().limits().queue_entries,
             ),
             admission_deadlines: Rc::default(),
@@ -723,7 +723,7 @@ impl Flights {
                 clock.now(),
                 FlightHashState::default(),
             )),
-            waiting: uring_runtime::offload::AdmissionQueue::new(
+            waiting: crate::rt::offload::AdmissionQueue::new(
                 admission.policy().limits().queue_entries,
             ),
             admission_deadlines: Rc::default(),
@@ -1490,7 +1490,7 @@ impl Flights {
     /// Reactor-facing variant registers its real waker with owned drivers. The
     /// worker must also poll at request deadlines to expire parked waiters.
     pub fn poll_with_context(&self, cx: &mut Context<'_>, work_budget: usize) -> Result<()> {
-        uring_runtime::drivers::poll(cx, work_budget);
+        crate::rt::drivers::poll(cx, work_budget);
         self.admission_deadlines.poll(self.clock.now(), work_budget);
         self.sweep_budgeted(work_budget)
     }
@@ -1528,9 +1528,7 @@ impl Flights {
                 self.poll_with_context(cx, self.limits.entries)?;
                 let waker = WakeTarget(cx.waker().clone());
                 let mut table = self.table.borrow_mut();
-                if table.is_empty()
-                    && self.waiting.is_empty()
-                    && uring_runtime::drivers::pending() == 0
+                if table.is_empty() && self.waiting.is_empty() && crate::rt::drivers::pending() == 0
                 {
                     return Poll::Ready(Ok(()));
                 }
@@ -1737,7 +1735,7 @@ mod admission_wake_tests {
     /// Serial completion, error, abandonment, and old cells cannot invent an outcome.
     #[test]
     fn expiry_snapshot_call_guards_and_generation_cells() {
-        let clock = uring_runtime::environment::SimulationClock::new(920);
+        let clock = crate::rt::environment::SimulationClock::new(920);
         let sim_env = clock.environment(0);
         let _environment = sim_env.enter();
         let sim_ctx = sim_env.worker_ctx();

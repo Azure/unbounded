@@ -156,7 +156,7 @@ impl BoundListener {
 }
 
 pub(super) struct Active {
-    pub(super) runnable: Arc<uring_runtime::drivers::Runnable>,
+    pub(super) runnable: Arc<crate::rt::drivers::Runnable>,
     pub(super) deadline: Rc<Cell<std::time::Instant>>,
     pub(super) expired: Option<std::time::Instant>,
     pub(super) cache: CacheId,
@@ -303,7 +303,7 @@ impl ClientListeners {
             .await
         });
         self.active.borrow_mut().push_back(Active {
-            runnable: uring_runtime::drivers::Runnable::new(),
+            runnable: crate::rt::drivers::Runnable::new(),
             deadline,
             expired: None,
             cache,
@@ -618,7 +618,7 @@ impl ClientListeners {
             #[cfg(not(test))]
             let simulated = false;
             #[cfg(test)]
-            let simulated = uring_runtime::reactor::simulation::Simulation::current().is_some();
+            let simulated = crate::rt::reactor::simulation::Simulation::current().is_some();
             let listener = if simulated {
                 let listeners = self.listeners.borrow();
                 let key = self.sim_cursor.borrow().clone();
@@ -1401,7 +1401,7 @@ fn bind(
     previous: Option<&BoundListener>,
 ) -> Result<BoundListener> {
     #[cfg(test)]
-    if let Some(sim) = uring_runtime::reactor::simulation::Simulation::current() {
+    if let Some(sim) = crate::rt::reactor::simulation::Simulation::current() {
         let directory = root.join(&definition.name).join("client");
         let listener = uds_endpoint::simulation::BoundSocket::bind(
             sim.os().clone(),

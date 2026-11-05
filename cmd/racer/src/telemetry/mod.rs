@@ -12,6 +12,9 @@ use ::telemetry::Ring;
 use ::telemetry::SampleLimits;
 use ::telemetry::SharedRing;
 
+#[cfg(test)]
+use crate::rt::environment;
+use crate::rt::environment::Deadline;
 use ::telemetry::server;
 use ::telemetry::server::Handler;
 use ::telemetry::server::Response;
@@ -31,9 +34,6 @@ use std::sync::OnceLock;
 use std::task::Poll;
 use std::time::Duration;
 use std::time::Instant;
-#[cfg(test)]
-use uring_runtime::environment;
-use uring_runtime::environment::Deadline;
 
 mod diagnostics;
 mod forensics;

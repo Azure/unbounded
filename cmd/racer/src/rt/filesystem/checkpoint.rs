@@ -6,8 +6,8 @@
 
 use super::Files;
 use super::operations::{Durability, ReplaceFiles, Replacement, ReplacementError};
-use crate::reactor::Reactor;
-use crate::{Error, Scope};
+use crate::rt::reactor::Reactor;
+use crate::rt::{Error, Scope};
 use std::fs::OpenOptions;
 use std::io::{self, Read};
 use std::os::unix::fs::OpenOptionsExt;
@@ -120,8 +120,8 @@ impl<const HEADER: usize> Slots<HEADER> {
             .get(slot)
             .ok_or_else(|| io::Error::other("invalid checkpoint slot"))?;
         let candidates = (0..128).map(|_| {
-            #[cfg(feature = "simulation")]
-            if let Some(sim) = crate::reactor::simulation::Simulation::current() {
+            #[cfg(test)]
+            if let Some(sim) = crate::rt::reactor::simulation::Simulation::current() {
                 return directory.join(format!(".checkpoint.{}.tmp", sim.next_sequence()));
             }
             let sequence = TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed);
@@ -257,8 +257,8 @@ impl<T, const HEADER: usize> Iterator for Candidates<T, HEADER> {
 /// Real or simulated file with a bounded sequential cursor.
 enum CandidateFile {
     Real(std::fs::File),
-    #[cfg(feature = "simulation")]
-    Sim(crate::reactor::descriptor::Descriptor, u64),
+    #[cfg(test)]
+    Sim(crate::rt::reactor::descriptor::Descriptor, u64),
 }
 
 impl CandidateFile {
@@ -266,8 +266,8 @@ impl CandidateFile {
     fn open(path: &Path, directory: bool) -> io::Result<Self> {
         let flags =
             libc::O_NOFOLLOW | libc::O_NONBLOCK | if directory { libc::O_DIRECTORY } else { 0 };
-        #[cfg(feature = "simulation")]
-        if let Some(sim) = crate::reactor::simulation::Simulation::current() {
+        #[cfg(test)]
+        if let Some(sim) = crate::rt::reactor::simulation::Simulation::current() {
             let file = sim.open(None, path, libc::O_RDONLY | flags)?;
             return Ok(Self::Sim(file, 0));
         }
@@ -285,7 +285,7 @@ impl CandidateFile {
                 let m = file.metadata()?;
                 (m.is_file(), m.len())
             }
-            #[cfg(feature = "simulation")]
+            #[cfg(test)]
             Self::Sim(file, _) => {
                 let m = file.as_sim().expect("simulated file").stat()?;
                 (
@@ -306,7 +306,7 @@ impl Read for CandidateFile {
     fn read(&mut self, bytes: &mut [u8]) -> io::Result<usize> {
         match self {
             Self::Real(file) => file.read(bytes),
-            #[cfg(feature = "simulation")]
+            #[cfg(test)]
             Self::Sim(file, offset) => {
                 let n = file
                     .as_sim()
@@ -319,10 +319,10 @@ impl Read for CandidateFile {
     }
 }
 
-#[cfg(all(test, feature = "simulation"))]
+#[cfg(test)]
 mod tests {
     use super::*;
-    use crate::reactor::simulation::{Fault, Simulation};
+    use crate::rt::reactor::simulation::{Fault, Simulation};
 
     const SLOTS: Slots<8> = Slots {
         names: ["a", "b"],

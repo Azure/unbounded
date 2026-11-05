@@ -1,13 +1,13 @@
 //! Durable physical-port reservations supplied to crypto enrollment by the dataplane.
 
 use super::ReactorControlIo;
+use crate::rt::filesystem::secure::{self, Attempts, Host};
 use crate::{
     error::{Error, Operation},
     runtime::RequestScope,
 };
 use racer_control_wire::RailMapping;
 use std::{cell::Cell, path::PathBuf, rc::Rc, sync::Arc};
-use uring_runtime::filesystem::secure::{self, Attempts, Host};
 
 /// Own one journal namespace and fence abandoned writes before reusing its stage name.
 pub struct RailJournal {
@@ -86,6 +86,7 @@ mod tests {
 
     use super::*;
     use crate::enrollment::Enrollment;
+    use crate::rt::reactor::simulation::{Fault, Simulation};
     use crate::test_support::enrollment::drive;
     use std::{
         num::NonZeroU32,
@@ -93,7 +94,6 @@ mod tests {
         task::{Context, Poll},
         time::Duration,
     };
-    use uring_runtime::reactor::simulation::{Fault, Simulation};
 
     /// Failed durability never reaches crypto preparation, including a renewal CSR.
     #[test]

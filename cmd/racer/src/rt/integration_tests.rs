@@ -4,6 +4,17 @@
 #[cfg(target_os = "linux")]
 mod filesystem {
     //! Host filesystem publication, ownership, permissions, and cancellation fences.
+    use crate::rt::{
+        Error, Operation, Result, Scope,
+        reactor::{
+            IoBuffer, Reactor as Core,
+            filesystem::{
+                operations::{Durability, Replacement, ReplacementError, publish_new},
+                prelude::*,
+                secure,
+            },
+        },
+    };
     use std::{
         cell::Cell,
         ffi::CString,
@@ -21,17 +32,6 @@ mod filesystem {
         sync::atomic::{AtomicUsize, Ordering},
         task::{Context, Poll},
         time::{Duration, Instant},
-    };
-    use uring_runtime::{
-        Error, Operation, Result, Scope,
-        reactor::{
-            IoBuffer, Reactor as Core,
-            filesystem::{
-                operations::{Durability, Replacement, ReplacementError, publish_new},
-                prelude::*,
-                secure,
-            },
-        },
     };
 
     /// Caller-selected Linux pathname ceiling; not a private implementation import.
@@ -175,7 +175,7 @@ mod filesystem {
             Err(error) => panic!("unexpected io_uring setup failure: {error}"),
         }
         let reactor = Reactor {
-            core: Core::new(capacity, &uring_runtime::reactor::simulation::ambient_env()),
+            core: Core::new(capacity, &crate::rt::reactor::simulation::ambient_env()),
         };
         reactor.init().unwrap();
         Some(reactor)
@@ -240,10 +240,10 @@ mod filesystem {
     }
 
     /// Private helpers follow retained descriptors across ambient simulation changes.
-    #[cfg(feature = "simulation")]
+    #[cfg(test)]
     #[test]
     fn secure_helpers_use_retained_backend_owner_after_environment_switch() {
-        use uring_runtime::reactor::simulation::Simulation;
+        use crate::rt::reactor::simulation::Simulation;
 
         let Some(_kernel) = kernel_reactor(4) else {
             return;
@@ -251,7 +251,7 @@ mod filesystem {
         let root = Directory::new();
         let path = root.0.join("private");
         let request = SecureScope(scope());
-        let host = Core::new(16, &uring_runtime::reactor::simulation::ambient_env());
+        let host = Core::new(16, &crate::rt::reactor::simulation::ambient_env());
         let host_dir =
             drive_secure(&host, secure::directory(&host, &path, true, true, &request)).unwrap();
         drive_secure(
@@ -261,7 +261,7 @@ mod filesystem {
         .unwrap();
         let sim = Simulation::new();
         let environment = sim.enter();
-        let simulated = Core::new(16, &uring_runtime::reactor::simulation::ambient_env());
+        let simulated = Core::new(16, &crate::rt::reactor::simulation::ambient_env());
         let sim_dir = drive_secure(
             &simulated,
             secure::directory(&simulated, &path, true, true, &request),
@@ -339,17 +339,17 @@ mod filesystem {
             return;
         };
         for simulated in [false, true] {
-            if simulated && !cfg!(feature = "simulation") {
+            if simulated && !cfg!(test) {
                 continue;
             }
-            #[cfg(feature = "simulation")]
-            let sim = uring_runtime::reactor::simulation::Simulation::new();
-            #[cfg(feature = "simulation")]
+            #[cfg(test)]
+            let sim = crate::rt::reactor::simulation::Simulation::new();
+            #[cfg(test)]
             let _environment = simulated.then(|| sim.enter());
             let root = Directory::new();
             let path = root.0.join("private");
             let request = SecureScope(scope());
-            let r = Core::new(16, &uring_runtime::reactor::simulation::ambient_env());
+            let r = Core::new(16, &crate::rt::reactor::simulation::ambient_env());
             r.init().unwrap();
             let dir = drive_secure(&r, secure::directory(&r, &path, true, true, &request)).unwrap();
             drive_secure(
@@ -388,7 +388,7 @@ mod filesystem {
                     Error::InvalidInput
                 )))
             ));
-            #[cfg(feature = "simulation")]
+            #[cfg(test)]
             if simulated {
                 sim.symlink(Path::new("value"), &path.join("link")).unwrap();
                 sim.chmod(&path.join("value"), 0o644).unwrap();
@@ -410,11 +410,11 @@ mod filesystem {
                     .as_ref(),
                 b"secret"
             );
-            #[cfg(feature = "simulation")]
+            #[cfg(test)]
             if simulated {
                 sim.inject(
                     "rename",
-                    uring_runtime::reactor::simulation::Fault::Errno(libc::EIO),
+                    crate::rt::reactor::simulation::Fault::Errno(libc::EIO),
                 )
                 .unwrap();
                 assert!(matches!(
@@ -446,10 +446,10 @@ mod filesystem {
     }
 
     /// Compare failed creation and anonymous-file semantics without namespace changes.
-    #[cfg(feature = "simulation")]
+    #[cfg(test)]
     #[test]
     fn creation_flags_preserve_namespace_and_tmpfile_is_explicitly_unsupported() {
-        use uring_runtime::reactor::simulation::Simulation;
+        use crate::rt::reactor::simulation::Simulation;
         let Some(host) = kernel_reactor(16) else {
             return;
         };
@@ -509,7 +509,7 @@ mod filesystem {
         let file_before = sim.metadata(&existing).unwrap();
         let _simulation = sim.enter();
         let simulated = Reactor {
-            core: Core::new(16, &uring_runtime::reactor::simulation::ambient_env()),
+            core: Core::new(16, &crate::rt::reactor::simulation::ambient_env()),
         };
         simulated.init().unwrap();
         for path in [&missing, &existing, &root.0] {
@@ -745,7 +745,7 @@ mod filesystem {
             let result = std::process::Command::new(std::env::current_exe().unwrap())
                 .args([
                     "--exact",
-                    "filesystem::host_publication_honors_umask_in_isolated_process",
+                    "rt::integration_tests::filesystem::host_publication_honors_umask_in_isolated_process",
                     "--nocapture",
                 ])
                 .env(CHILD, &acknowledgment)
@@ -917,16 +917,16 @@ mod filesystem {
     }
 }
 
-#[cfg(feature = "simulation")]
+#[cfg(test)]
 mod reserved_capacity {
     //! Prepaid capacity and unread reply ownership through public operations.
+    use crate::rt::{
+        Error, Operation, Result, Scope,
+        reactor::{Reactor, filesystem::prelude::*, simulation::Simulation},
+    };
     use std::{
         rc::Rc,
         task::{Context, Poll},
-    };
-    use uring_runtime::{
-        Error, Operation, Result, Scope,
-        reactor::{Reactor, filesystem::prelude::*, simulation::Simulation},
     };
 
     /// Keep cancellation and deadlines out of admission-only scenarios.
@@ -966,8 +966,8 @@ mod reserved_capacity {
     fn reserved_capacity_is_reactor_local_and_failed_replies_release_it_only_on_consumption() {
         let simulation = Simulation::new();
         let _os = simulation.enter();
-        let owner = Reactor::new(1, &uring_runtime::reactor::simulation::ambient_env());
-        let foreign = Reactor::new(1, &uring_runtime::reactor::simulation::ambient_env());
+        let owner = Reactor::new(1, &crate::rt::reactor::simulation::ambient_env());
+        let foreign = Reactor::new(1, &crate::rt::reactor::simulation::ambient_env());
         let scope = OpenScope;
         let charge = Rc::new(());
         let retained_charge = Rc::downgrade(&charge);
@@ -989,7 +989,7 @@ mod reserved_capacity {
         simulation
             .inject(
                 "send",
-                uring_runtime::reactor::simulation::Fault::Errno(libc::EPIPE),
+                crate::rt::reactor::simulation::Fault::Errno(libc::EPIPE),
             )
             .unwrap();
         let mut failed = owner.send_reserved(
@@ -1053,10 +1053,10 @@ mod reserved_capacity {
     /// Verify completed receives and accepts hold reserved slots until replies are read.
     #[test]
     fn reserved_receive_and_accept_keep_slots_until_reply_consumption() {
-        use uring_runtime::reactor::{SocketAddress, simulation::Fault};
+        use crate::rt::reactor::{SocketAddress, simulation::Fault};
         let simulation = Simulation::new();
         let _os = simulation.enter();
-        let reactor = Reactor::new(1, &uring_runtime::reactor::simulation::ambient_env());
+        let reactor = Reactor::new(1, &crate::rt::reactor::simulation::ambient_env());
         let capacity = reactor.reserve_submissions(1, ()).unwrap();
         let scope = OpenScope;
         let (socket, peer) = simulation.socket_pair();
@@ -1104,7 +1104,7 @@ mod reserved_capacity {
     /// Verify simulated sends use shared buffer access without requesting mutable access.
     #[test]
     fn simulated_writes_use_immutable_accessor_like_production() {
-        use uring_runtime::reactor::IoBuffer;
+        use crate::rt::reactor::IoBuffer;
 
         /// Stable send storage that rejects all mutable access.
         struct ReadOnly(Vec<u8>);
@@ -1112,18 +1112,18 @@ mod reserved_capacity {
         // SAFETY: private stable Vec; mutation accessor fails without exposing aliases.
         unsafe impl IoBuffer for ReadOnly {
             /// Borrow the initialized bytes for sending.
-            fn bytes(&self) -> uring_runtime::Result<&[u8]> {
+            fn bytes(&self) -> crate::rt::Result<&[u8]> {
                 Ok(&self.0)
             }
 
             /// Reject mutable access so the test detects an incorrect send accessor.
-            fn bytes_mut(&mut self) -> uring_runtime::Result<&mut [u8]> {
+            fn bytes_mut(&mut self) -> crate::rt::Result<&mut [u8]> {
                 Err(Error::InvalidInput)
             }
         }
         let simulation = Simulation::new();
         let _os = simulation.enter();
-        let reactor = Reactor::new(1, &uring_runtime::reactor::simulation::ambient_env());
+        let reactor = Reactor::new(1, &crate::rt::reactor::simulation::ambient_env());
         let capacity = reactor.reserve_submissions(1, ()).unwrap();
         let scope = OpenScope;
         let (socket, peer) = simulation.socket_pair();
@@ -1140,10 +1140,10 @@ mod reserved_capacity {
     /// Verify reserved failures and unread accepts neither block ordinary sends nor leak handles.
     #[test]
     fn reserved_failures_and_unread_accepts_do_not_block_other_operations_or_leak_handles() {
-        use uring_runtime::reactor::{SocketAddress, simulation::Fault};
+        use crate::rt::reactor::{SocketAddress, simulation::Fault};
         let simulation = Simulation::new();
         let _os = simulation.enter();
-        let reactor = Reactor::new(3, &uring_runtime::reactor::simulation::ambient_env());
+        let reactor = Reactor::new(3, &crate::rt::reactor::simulation::ambient_env());
         let scope = OpenScope;
         let charge = Rc::new(());
         let weak = Rc::downgrade(&charge);
@@ -1221,8 +1221,8 @@ mod reserved_capacity {
     /// Verify rejected submissions release their reserved slot and owned buffer exactly once.
     #[test]
     fn reserved_sq_rejection_releases_exact_partition_and_buffer_owner() {
+        use crate::rt::reactor::IoBuffer;
         use std::cell::Cell;
-        use uring_runtime::reactor::IoBuffer;
 
         /// Count releases of stable submission storage independently of the reactor.
         struct Owned(Vec<u8>, Rc<Cell<usize>>);
@@ -1230,12 +1230,12 @@ mod reserved_capacity {
         // SAFETY: private non-resizing Vec retains initialized backing across moves.
         unsafe impl IoBuffer for Owned {
             /// Borrow the initialized bytes without transferring ownership.
-            fn bytes(&self) -> uring_runtime::Result<&[u8]> {
+            fn bytes(&self) -> crate::rt::Result<&[u8]> {
                 Ok(&self.0)
             }
 
             /// Borrow the initialized bytes for an operation that needs mutable storage.
-            fn bytes_mut(&mut self) -> uring_runtime::Result<&mut [u8]> {
+            fn bytes_mut(&mut self) -> crate::rt::Result<&mut [u8]> {
                 Ok(&mut self.0)
             }
         }
@@ -1248,7 +1248,7 @@ mod reserved_capacity {
         }
         let simulation = Simulation::new();
         let _os = simulation.enter();
-        let reactor = Reactor::new(2, &uring_runtime::reactor::simulation::ambient_env());
+        let reactor = Reactor::new(2, &crate::rt::reactor::simulation::ambient_env());
         let scope = OpenScope;
         let charge = Rc::new(());
         let charge_weak = Rc::downgrade(&charge);

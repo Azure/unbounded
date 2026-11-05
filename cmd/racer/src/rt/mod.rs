@@ -1,12 +1,7 @@
-//! Explicitly driven worker-local I/O and pinned thread groups.
-//!
-//! Scheduling and resource policy belong to the caller. Simulation is opt-in.
-//! Generic mechanisms accept caller-owned scope, budget, result, and scheduling
-//! hooks. Request models, admission classes, retry policy, entropy domain choices,
-//! and service-graph ownership belong in application adapters, not this crate.
-#![deny(unsafe_op_in_unsafe_fn)]
-
-pub mod channel;
+//! Worker-local scheduling, ambient environment, offload, and filesystem
+//! helpers formerly in the `uring-runtime` crate. Relocated here so the crate
+//! can be deleted; I/O itself lives in `racer-io`. Simulation helpers exist
+//! only in test builds.
 
 pub mod drivers;
 
@@ -18,7 +13,7 @@ pub mod offload;
 
 pub mod reactor;
 
-#[cfg(any(test, feature = "test-util"))]
+#[cfg(test)]
 /// Optional shared wake instrumentation for tests, disabled in production builds.
 pub mod test_util {
     use std::sync::{
@@ -80,7 +75,7 @@ impl Budget for () {
 pub mod mailbox {
     /// Explicit local execution of accepted mailbox commands.
     pub mod executor;
-    use crate::{CancelWait, Error, Result, Scope};
+    use crate::rt::{CancelWait, Error, Result, Scope};
     use futures::task::AtomicWaker;
     use std::{
         collections::VecDeque,
@@ -548,7 +543,7 @@ pub mod mailbox {
     #[cfg(test)]
     mod tests {
         use super::*;
-        use crate::{environment::Cancellation, test_util::WakeCounter};
+        use crate::rt::{environment::Cancellation, test_util::WakeCounter};
         use std::sync::atomic::AtomicUsize;
 
         /// Producer loss is terminal even when a surviving reply receives a late result.
@@ -1314,3 +1309,6 @@ mod tests {
         }
     }
 }
+
+#[cfg(test)]
+mod integration_tests;

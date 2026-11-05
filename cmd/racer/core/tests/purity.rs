@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 const FORBIDDEN: &[&str] = &[
     "Instant::now",
     "SystemTime::now",
-    "uring_runtime",
+    "racer_io",
     "environment::now",
     "getrandom",
     "thread::spawn",

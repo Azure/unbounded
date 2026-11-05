@@ -397,7 +397,7 @@ impl Prefetch {
             self.kick();
             return;
         }
-        let Ok(permit) = uring_runtime::drivers::reserve() else {
+        let Ok(permit) = crate::rt::drivers::reserve() else {
             return;
         };
         pump.running = true;

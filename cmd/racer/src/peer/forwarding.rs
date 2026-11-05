@@ -1218,7 +1218,7 @@ mod tests {
                 panic!("expected queued verification");
             };
             let caller = std::thread::current().id();
-            let environment = uring_runtime::environment::Environment::current();
+            let environment = crate::rt::environment::Environment::current();
             let completion = std::thread::spawn(move || {
                 let _guard = environment.enter();
                 assert_ne!(caller, std::thread::current().id());
@@ -1488,7 +1488,7 @@ mod tests {
                 Poll::Ready(Err(Error::Cancelled))
             ));
             assert_eq!(client.outstanding(), 0);
-            let clock = uring_runtime::environment::SimulationClock::new(929);
+            let clock = crate::rt::environment::SimulationClock::new(929);
             let sim_env = clock.environment(0);
             let _guard = sim_env.enter();
             let sim_ctx = sim_env.worker_ctx();
@@ -1598,7 +1598,7 @@ mod tests {
     }
     #[test]
     fn retained_request_survives_fresh_window_but_not_deadline_or_forgery() {
-        let clock = uring_runtime::environment::SimulationClock::new_at(
+        let clock = crate::rt::environment::SimulationClock::new_at(
             931,
             Instant::now(),
             std::time::SystemTime::now(),
@@ -1609,7 +1609,7 @@ mod tests {
         let sender = Forwarding::new(signatures[0].clone());
         let receiver = Forwarding::new(signatures[2].clone());
         let mut logical = request(44);
-        logical.route.deadline.0 = uring_runtime::environment::now() + Duration::from_secs(120);
+        logical.route.deadline.0 = crate::rt::environment::now() + Duration::from_secs(120);
         let (signed, binding) = sender.sign_request(logical).unwrap();
         let admitted = receiver.verify_request(signed).unwrap();
         clock.advance(Duration::from_secs(61));
@@ -1644,7 +1644,7 @@ mod tests {
                 .verify_response(copy_response(&response), &forged_mac)
                 .is_err()
         );
-        let wall = uring_runtime::environment::wall_now();
+        let wall = crate::rt::environment::wall_now();
         clock.set_wall_time(wall - Duration::from_secs(67));
         assert!(matches!(
             signatures[2].verify_retained_request(admitted.binding()),
@@ -2891,8 +2891,7 @@ mod tests {
     }
     #[test]
     fn deadline_roundtrip_and_verified_mailbox_ownership() {
-        let deadline =
-            uring_runtime::environment::Deadline(Instant::now() + Duration::from_secs(20));
+        let deadline = crate::rt::environment::Deadline(Instant::now() + Duration::from_secs(20));
         let value = protocol::encode_deadline(&crate::test_support::clock(), deadline).unwrap();
         let decoded = protocol::decode_deadline(&crate::test_support::clock(), value).unwrap();
         assert_eq!(

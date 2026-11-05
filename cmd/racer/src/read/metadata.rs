@@ -266,13 +266,13 @@ impl Drop for RegistrationOwner {
 
 #[derive(Default)]
 struct IngressDeadlines {
-    inner: Rc<uring_runtime::environment::Registry>,
+    inner: Rc<crate::rt::environment::Registry>,
 }
 /// One entry per admitted resolve, shared across its follower and leader waits.
 /// The refresh registration quota bounds these entries. Drivers never own this
 /// guard: ingress expiry must not release their acquisition or completion fences.
 struct IngressDeadline {
-    inner: uring_runtime::environment::Registration,
+    inner: crate::rt::environment::Registration,
 }
 impl IngressDeadlines {
     fn register(self: &Rc<Self>, deadline: Instant) -> Result<IngressDeadline> {
@@ -300,7 +300,7 @@ impl IngressDeadline {
 
 #[derive(Default)]
 struct Clock {
-    inner: uring_runtime::environment::Observer,
+    inner: crate::rt::environment::Observer,
 }
 impl Clock {
     fn observe(&mut self, wall: SystemTime, monotonic: Instant) -> bool {
@@ -487,7 +487,7 @@ impl MetadataService {
             let deadline = self.deadlines.register(scope.deadline.0)?;
             let cancellation = scope.cancellation.subscribe()?;
             let event = poll_fn(|cx| {
-                uring_runtime::drivers::poll(cx, 64);
+                crate::rt::drivers::poll(cx, 64);
                 cancellation.register(cx.waker());
                 if let Err(error) = deadline.check(scope, cx.waker()) {
                     return Poll::Ready(Err(error));
@@ -506,7 +506,7 @@ impl MetadataService {
                     if budget.remaining_attempts() == 0 {
                         return Err(Error::Unavailable);
                     }
-                    let driver_permit = uring_runtime::drivers::reserve().map_err(Error::from)?;
+                    let driver_permit = crate::rt::drivers::reserve().map_err(Error::from)?;
                     let mut nonce = [0; 16];
                     self.candidates
                         .ctx()
@@ -576,7 +576,7 @@ impl MetadataService {
                     let (result, remaining) = poll_fn(|cx| {
                         cancellation.register(cx.waker());
                         deadline.check(scope, cx.waker())?;
-                        uring_runtime::drivers::poll(cx, 64);
+                        crate::rt::drivers::poll(cx, 64);
                         match Pin::new(&mut receive).poll(cx) {
                             Poll::Ready(Ok(value)) => Poll::Ready(Ok(value)),
                             Poll::Ready(Err(_)) => Poll::Ready(Err(Error::Unavailable)),
@@ -1226,7 +1226,7 @@ pub(crate) mod tests {
         assert_eq!(refreshes.active_count(), 0);
         assert_eq!(refreshes.registration_count(), 0);
         let table = Rc::new(IngressDeadlines {
-            inner: Rc::new(uring_runtime::environment::Registry::with_next_id(u64::MAX)),
+            inner: Rc::new(crate::rt::environment::Registry::with_next_id(u64::MAX)),
         });
         assert!(matches!(table.register(due), Err(Error::Overloaded)));
         assert!(table.inner.is_empty());
@@ -1275,7 +1275,7 @@ pub(crate) mod tests {
 
     #[test]
     fn worker_driver_retains_leadership_after_request_drop_until_completion() {
-        let queue = Rc::new(uring_runtime::drivers::DriverQueue::new(1024));
+        let queue = Rc::new(crate::rt::drivers::DriverQueue::new(1024));
         let _owner = queue.enter();
         let table = Rc::new(RefreshTable::new(1, Instant::now()));
         let request = table.join(key()).unwrap();
@@ -1287,7 +1287,7 @@ pub(crate) mod tests {
         ));
         let driver = request.clone();
         let (complete, fence) = futures::channel::oneshot::channel::<()>();
-        uring_runtime::drivers::reserve()
+        crate::rt::drivers::reserve()
             .unwrap()
             .submit_detached(Box::pin(async move {
                 fence.await.map_err(|_| Error::Io)?;
@@ -1295,12 +1295,12 @@ pub(crate) mod tests {
                 Ok::<_, Error>(())
             }));
         let mut cx = std::task::Context::from_waker(&waker);
-        uring_runtime::drivers::poll(&mut cx, 64);
+        crate::rt::drivers::poll(&mut cx, 64);
         drop(request);
         assert!(follower.event(&waker).is_pending());
         assert_eq!(table.registration_count(), 2);
         complete.send(()).unwrap();
-        uring_runtime::drivers::poll(&mut cx, 64);
+        crate::rt::drivers::poll(&mut cx, 64);
         assert_eq!(table.registration_count(), 1);
         assert!(matches!(
             follower.event(&waker),

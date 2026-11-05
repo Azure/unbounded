@@ -20,6 +20,8 @@ use crate::read::flight::Flights;
 use crate::read::metadata::MetadataDependencies;
 use crate::read::metadata::MetadataService;
 use crate::read::range_stream::RangeStreams;
+use crate::rt::drivers::DriverQueue;
+use crate::rt::filesystem::prelude::*;
 use crate::runtime::Reactor;
 use crate::security::CredentialCrypto;
 use crate::security::CryptoClient;
@@ -41,18 +43,16 @@ use std::num::NonZeroU32;
 use std::rc::Rc;
 use std::sync::Arc;
 use std::task::Context;
-use uring_runtime::drivers::DriverQueue;
-use uring_runtime::filesystem::prelude::*;
 
 pub mod clock {
     use crate::error::Error;
     use crate::error::Result;
+    use crate::rt::environment::Deadline;
     use std::cell::Cell;
     use std::time::Duration;
     use std::time::Instant;
     use std::time::SystemTime;
     use std::time::UNIX_EPOCH;
-    use uring_runtime::environment::Deadline;
 
     /// Pure deadline/freshness fixture. Reactor timers use SimulationClock.
     pub struct Clock {
@@ -366,7 +366,7 @@ pub mod cluster {
     }
 }
 
-pub use uring_runtime::test_util::WakeCounter;
+pub use crate::rt::test_util::WakeCounter;
 
 /// Assemble the real worker without activating I/O for wake and quota scenarios.
 pub(crate) fn wake_test_worker() -> crate::app::WorkerApplication {
@@ -400,10 +400,10 @@ pub(crate) async fn projected_file(
     file: &str,
     limit: usize,
     scope: &crate::runtime::RequestScope,
-) -> crate::error::Result<uring_runtime::filesystem::ReadBuffer> {
-    use uring_runtime::filesystem::secure::{BENEATH, NO_MAGICLINKS};
+) -> crate::error::Result<crate::rt::filesystem::ReadBuffer> {
+    use crate::rt::filesystem::secure::{BENEATH, NO_MAGICLINKS};
 
-    let dir = uring_runtime::filesystem::secure::directory(r, path, false, false, scope).await?;
+    let dir = crate::rt::filesystem::secure::directory(r, path, false, false, scope).await?;
     // One openat2 resolves ..data and pins the target directory across rotation.
     // BENEATH rejects absolute/escaping links; NO_MAGICLINKS rejects proc escapes.
     let generation = r
@@ -415,7 +415,7 @@ pub(crate) async fn projected_file(
             scope,
         )
         .await?;
-    uring_runtime::filesystem::secure::read_at(r, &generation, file, limit, false, scope).await
+    crate::rt::filesystem::secure::read_at(r, &generation, file, limit, false, scope).await
 }
 
 /// Enrollment I/O and certificate fixtures shared by control and application tests.
@@ -1081,7 +1081,7 @@ pub(crate) mod security {
 pub(crate) fn simulated_slab<C: page_alloc::Charge>(
     slab: page_alloc::Slab<C>,
 ) -> page_alloc::Slab<C> {
-    if let Some(sim) = uring_runtime::reactor::simulation::Simulation::current() {
+    if let Some(sim) = crate::rt::reactor::simulation::Simulation::current() {
         slab.simulate_in(sim.os().clone());
     }
     slab
@@ -1092,19 +1092,19 @@ pub(crate) fn simulated_slab<C: page_alloc::Charge>(
 // MIGRATION: test fixtures read the thread environment until tests pass a
 // WorkerCtx explicitly.
 pub fn ctx() -> racer_io::WorkerCtx {
-    uring_runtime::environment::Environment::current().worker_ctx()
+    crate::rt::environment::Environment::current().worker_ctx()
 }
 
 /// The selected thread world and environment as an explicit reactor backend.
 // MIGRATION: test fixtures read the thread environment until tests pass an
 // Env explicitly.
 pub fn env() -> racer_io::Env {
-    uring_runtime::reactor::simulation::ambient_env()
+    crate::rt::reactor::simulation::ambient_env()
 }
 
 /// MIGRATION: the clock of [`ctx`].
 pub fn clock() -> racer_io::Clock {
-    uring_runtime::environment::Environment::current()
+    crate::rt::environment::Environment::current()
         .worker_ctx()
         .clock
 }

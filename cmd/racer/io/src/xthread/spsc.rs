@@ -296,7 +296,7 @@ impl<T> Receiver<T> {
 
     /// Receive for a local facade that cannot expose an exclusive endpoint borrow.
     /// Non-Sync access and publication before callbacks keep reentry ownership-safe.
-    pub(crate) fn receive_shared(&self) -> Result<Option<T>> {
+    pub fn receive_shared(&self) -> Result<Option<T>> {
         let head = self.shared.head.0.load(Ordering::Relaxed);
         let capacity = self.shared.slots.len();
         let mut tail = self.cached_tail.get();
@@ -329,7 +329,7 @@ impl<T> Receiver<T> {
     }
 
     /// Poll for a local facade obeying the same single-waiter contract as the endpoint.
-    pub(crate) fn poll_receive_shared(&self, cx: &mut Context<'_>) -> Poll<Result<Option<T>>> {
+    pub fn poll_receive_shared(&self, cx: &mut Context<'_>) -> Poll<Result<Option<T>>> {
         // Internal shared callers must obey the same single-waiter contract.
         self.shared.readable.register(cx.waker());
         match self.receive_shared() {

@@ -16,6 +16,7 @@ use page_alloc::{
     SegmentLease, SegmentSnapshot, SegmentState, Segments, Slab,
 };
 use racer_io::scoped::Reactor;
+use racer_io::sim::{Fault, SimOs};
 use racer_io::{Operation, Scope};
 use racer_sim::alloc_model::{SegmentClock, SegmentEntries};
 use std::{
@@ -28,7 +29,6 @@ use std::{
     },
     task::{Context, Poll, Wake, Waker},
 };
-use uring_runtime::reactor::simulation::{Fault, Simulation};
 
 const PAGE: u64 = 4096;
 const SEGMENT: u64 = 2 * PAGE;
@@ -521,8 +521,8 @@ struct Table {
 
 impl Table {
     /// Open the slab and an unconfigured table, checking simulated alignment.
-    fn open() -> Self {
-        let slab = slab_new(PATH.into(), CAPACITY, SEGMENT, SEGMENT as usize);
+    fn open(sim: &SimOs) -> Self {
+        let slab = slab_new(sim, PATH.into(), CAPACITY, SEGMENT, SEGMENT as usize);
         let segments = Rc::new(Segments::new(SEGMENT));
         let alignment = slab.open_configured(&segments).unwrap();
         assert_eq!(alignment.length() as u64, PAGE);
@@ -531,7 +531,7 @@ impl Table {
             slab,
             clock: SegmentClock::new(segments.clone()),
             segments,
-            reactor: Reactor::new(32, &uring_runtime::reactor::simulation::ambient_env()),
+            reactor: Reactor::new(32, &racer_io::Env::sim(sim, racer_io::WorkerCtx::host())),
         }
     }
 }
@@ -1014,7 +1014,7 @@ impl GeometryModel {
 struct Phase<'t, 'w> {
     fences: Vec<Fence<'t>>,
     retired_wakers: Vec<(Arc<WakeCount>, usize)>,
-    sim: &'w Simulation,
+    sim: &'w SimOs,
 
     t: &'t Table,
 
@@ -1221,6 +1221,7 @@ impl<'t, 'w> Phase<'t, 'w> {
                 assert!(other.snapshot().is_empty());
                 assert!(!other.is_configured());
                 let huge = slab_new::<Counted>(
+                    self.sim,
                     "/dst/huge".into(),
                     SEGMENT * (page_alloc::MAX_SEGMENTS + 1),
                     SEGMENT,
@@ -1232,8 +1233,13 @@ impl<'t, 'w> Phase<'t, 'w> {
                 );
             }
             6 => {
-                let slab =
-                    slab_new::<Counted>("/dst/config".into(), CAPACITY, SEGMENT, PAGE as usize);
+                let slab = slab_new::<Counted>(
+                    self.sim,
+                    "/dst/config".into(),
+                    CAPACITY,
+                    SEGMENT,
+                    PAGE as usize,
+                );
                 let _ = slab.open_now().unwrap();
                 let wrong = Segments::new(PAGE);
                 assert_eq!(
@@ -1260,11 +1266,17 @@ impl<'t, 'w> Phase<'t, 'w> {
             }
             7 => {
                 {
-                    let slab =
-                        slab_new::<Counted>("/dst/size".into(), CAPACITY, SEGMENT, PAGE as usize);
+                    let slab = slab_new::<Counted>(
+                        self.sim,
+                        "/dst/size".into(),
+                        CAPACITY,
+                        SEGMENT,
+                        PAGE as usize,
+                    );
                     let _ = slab.open_now().unwrap();
                 }
                 let slab = slab_new::<Counted>(
+                    self.sim,
                     "/dst/size".into(),
                     CAPACITY + SEGMENT,
                     SEGMENT,
@@ -1277,6 +1289,7 @@ impl<'t, 'w> Phase<'t, 'w> {
                     remaining: Cell::new(usize::MAX),
                 };
                 let slab = slab_new::<RebindCharge>(
+                    self.sim,
                     "/dst/rebind-pool".into(),
                     CAPACITY,
                     SEGMENT,
@@ -1328,7 +1341,7 @@ impl<'t, 'w> Phase<'t, 'w> {
     }
 
     /// Start a phase with no caller-owned resources.
-    fn new(sim: &'w Simulation, t: &'t Table, w: &'w mut World) -> Self {
+    fn new(sim: &'w SimOs, t: &'t Table, w: &'w mut World) -> Self {
         Self {
             fences: Vec::new(),
             retired_wakers: Vec::new(),
@@ -2249,8 +2262,7 @@ fn libc_eio() -> i32 {
 /// Run one case through the shared runner and return its coverage.
 fn run(case: &str, cancel_first: bool, ops: &[Op]) -> Coverage {
     let _context = Context_;
-    let sim = Simulation::new();
-    let _environment = sim.enter();
+    let sim = SimOs::new();
     sim.set_cancel_first(cancel_first);
     let mut world = World {
         geometry: None,
@@ -2267,7 +2279,7 @@ fn run(case: &str, cancel_first: bool, ops: &[Op]) -> Coverage {
     let mut start = 0;
     let mut recovered = None;
     loop {
-        let table = Table::open();
+        let table = Table::open(&sim);
         let mut phase = Phase::new(&sim, &table, &mut world);
         if let Some(image) = recovered.take() {
             context(format!("{case} recovery before step {start}"));
@@ -3007,16 +3019,15 @@ fn restore_cross_product() {
     assert!(c.reissues > 0, "{c:?}");
 }
 
-/// Construct a file-mode slab in the thread's current simulation, if any.
+/// Construct a file-mode slab in the given simulated world.
 fn slab_new<C: page_alloc::Charge>(
+    sim: &SimOs,
     path: std::path::PathBuf,
     capacity_bytes: u64,
     segment_bytes: u64,
     max_record_bytes: usize,
 ) -> Slab<C> {
     let slab = Slab::new(path, capacity_bytes, segment_bytes, max_record_bytes);
-    if let Some(sim) = uring_runtime::reactor::simulation::Simulation::current() {
-        slab.simulate_in(sim.os().clone());
-    }
+    slab.simulate_in(sim.clone());
     slab
 }

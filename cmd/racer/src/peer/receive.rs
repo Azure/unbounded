@@ -323,7 +323,7 @@ mod tests {
     #[test]
     fn receive_alarm_wakes_without_completion_and_preserves_scope() {
         use std::future::Future;
-        let clock = uring_runtime::environment::SimulationClock::new(909);
+        let clock = crate::rt::environment::SimulationClock::new(909);
         let sim_env = clock.environment(0);
         let _env = sim_env.enter();
         let sim_ctx = sim_env.worker_ctx();

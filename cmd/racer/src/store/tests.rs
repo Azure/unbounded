@@ -274,7 +274,7 @@ mod index_pressure {
 
 #[test]
 fn hard_hold_persist_confirms_publication_and_protects_pending() {
-    let simulation = uring_runtime::reactor::simulation::Simulation::new();
+    let simulation = crate::rt::reactor::simulation::Simulation::new();
     let _environment = simulation.enter();
     let f = Fixture::new();
     let _ = futures::executor::block_on(f.store.open()).unwrap();
@@ -305,7 +305,7 @@ fn hard_hold_persist_confirms_publication_and_protects_pending() {
 
 #[test]
 fn hard_hold_write_failure_is_not_success_and_unused_capacity_releases() {
-    use uring_runtime::reactor::simulation::{Fault, Simulation};
+    use crate::rt::reactor::simulation::{Fault, Simulation};
     let simulation = Simulation::new();
     let _environment = simulation.enter();
     let f = Fixture::new();
@@ -341,7 +341,7 @@ fn hard_hold_write_failure_is_not_success_and_unused_capacity_releases() {
 #[test]
 fn hard_hold_checkpoint_roundtrip_restores_only_live_disk_reservations() {
     use crate::store::checkpoint;
-    let simulation = uring_runtime::reactor::simulation::Simulation::new();
+    let simulation = crate::rt::reactor::simulation::Simulation::new();
     let _environment = simulation.enter();
     let f = Fixture::new();
     let _ = futures::executor::block_on(f.store.open()).unwrap();
@@ -408,7 +408,7 @@ fn hard_hold_checkpoint_frozen_arrival_sleeps_until_thaw_without_discard() {
             this.0.fetch_add(1, Ordering::Relaxed);
         }
     }
-    let simulation = uring_runtime::reactor::simulation::Simulation::new();
+    let simulation = crate::rt::reactor::simulation::Simulation::new();
     let _environment = simulation.enter();
     let f = Fixture::new();
     let _ = futures::executor::block_on(f.store.open()).unwrap();
@@ -449,7 +449,7 @@ fn hard_hold_checkpoint_frozen_arrival_sleeps_until_thaw_without_discard() {
 
 #[test]
 fn hard_hold_checkpoint_fences_warm_owned_publication_and_restores_veto() {
-    use uring_runtime::reactor::simulation::{Fault, Simulation};
+    use crate::rt::reactor::simulation::{Fault, Simulation};
     let simulation = Simulation::new();
     let _environment = simulation.enter();
     let f = Fixture::new();
@@ -499,7 +499,7 @@ fn hard_hold_checkpoint_fences_warm_owned_publication_and_restores_veto() {
 
 #[test]
 fn hard_hold_checkpoint_abandoned_pause_reopens_writer() {
-    let simulation = uring_runtime::reactor::simulation::Simulation::new();
+    let simulation = crate::rt::reactor::simulation::Simulation::new();
     let _environment = simulation.enter();
     let f = Fixture::new();
     let _ = futures::executor::block_on(f.store.open()).unwrap();
@@ -521,7 +521,7 @@ fn hard_hold_checkpoint_abandoned_pause_reopens_writer() {
 
 #[test]
 fn hard_hold_checkpoint_captures_hold_added_during_index_traversal() {
-    let simulation = uring_runtime::reactor::simulation::Simulation::new();
+    let simulation = crate::rt::reactor::simulation::Simulation::new();
     let _environment = simulation.enter();
     let f = Fixture::new();
     let _ = futures::executor::block_on(f.store.open()).unwrap();
@@ -568,7 +568,7 @@ fn hard_hold_checkpoint_captures_hold_added_during_index_traversal() {
 
 #[test]
 fn hard_hold_cancel_waits_for_stalled_background_writer_without_self_wakes() {
-    use uring_runtime::reactor::simulation::{Fault, Simulation};
+    use crate::rt::reactor::simulation::{Fault, Simulation};
     struct Wakes(std::sync::atomic::AtomicUsize);
     impl futures::task::ArcWake for Wakes {
         fn wake_by_ref(this: &std::sync::Arc<Self>) {
@@ -639,7 +639,7 @@ fn hard_hold_cancel_waits_for_stalled_background_writer_without_self_wakes() {
 
 #[test]
 fn hard_hold_cancel_removes_unsubmitted_ticket_after_background_fence() {
-    let simulation = uring_runtime::reactor::simulation::Simulation::new();
+    let simulation = crate::rt::reactor::simulation::Simulation::new();
     let _environment = simulation.enter();
     let f = Fixture::new();
     let _ = futures::executor::block_on(f.store.open()).unwrap();
@@ -675,7 +675,7 @@ fn hard_hold_cancel_removes_unsubmitted_ticket_after_background_fence() {
 
 #[test]
 fn hard_hold_cancel_fences_kernel_write_after_background_future_is_dropped() {
-    use uring_runtime::reactor::simulation::{Fault, Simulation};
+    use crate::rt::reactor::simulation::{Fault, Simulation};
     let simulation = Simulation::new();
     let _environment = simulation.enter();
     let f = Fixture::new();
@@ -724,7 +724,7 @@ fn assert_prefetch_released(f: &Fixture) {
 
 #[test]
 fn prefetch_cancel_before_submission_removes_queued_ticket() {
-    let simulation = uring_runtime::reactor::simulation::Simulation::new();
+    let simulation = crate::rt::reactor::simulation::Simulation::new();
     let _environment = simulation.enter();
     let f = Fixture::new();
     let _ = futures::executor::block_on(f.store.open()).unwrap();
@@ -754,7 +754,7 @@ fn prefetch_cancel_before_submission_removes_queued_ticket() {
 
 #[test]
 fn prefetch_cancel_waits_for_accepted_write() {
-    use uring_runtime::reactor::simulation::{Fault, Simulation};
+    use crate::rt::reactor::simulation::{Fault, Simulation};
     let simulation = Simulation::new();
     let _environment = simulation.enter();
     let f = Fixture::new();
@@ -781,7 +781,7 @@ fn prefetch_cancel_waits_for_accepted_write() {
 
 #[test]
 fn prefetch_write_failure_is_not_admitted() {
-    use uring_runtime::reactor::simulation::{Fault, Simulation};
+    use crate::rt::reactor::simulation::{Fault, Simulation};
     let simulation = Simulation::new();
     let _environment = simulation.enter();
     let f = Fixture::new();
@@ -811,7 +811,7 @@ fn prefetch_write_failure_is_not_admitted() {
 
 #[test]
 fn prefetch_unheld_queued_copy_discarded_is_not_admitted() {
-    let simulation = uring_runtime::reactor::simulation::Simulation::new();
+    let simulation = crate::rt::reactor::simulation::Simulation::new();
     let _environment = simulation.enter();
     let f = Fixture::new();
     let _ = futures::executor::block_on(f.store.open()).unwrap();
@@ -891,7 +891,7 @@ fn disk_observability_publication_read_and_pending_cleanup() {
 }
 #[test]
 fn disk_observability_failed_write_and_read_do_not_credit_bytes() {
-    use uring_runtime::reactor::simulation::{Fault, Simulation};
+    use crate::rt::reactor::simulation::{Fault, Simulation};
     let simulation = Simulation::new();
     let _environment = simulation.enter();
     let f = Fixture::new();
@@ -1553,7 +1553,7 @@ fn concurrent_writes_reserve_distinct_extents_and_capacity_before_completion() {
 
 #[test]
 fn pipeline_out_of_order_failure_and_short_cqes_preserve_other_mapping() {
-    use uring_runtime::reactor::simulation::{Fault, Simulation};
+    use crate::rt::reactor::simulation::{Fault, Simulation};
     for fault in [Fault::Delay(6), Fault::Errno(libc::EIO), Fault::Short(512)] {
         let simulation = Simulation::new();
         let _environment = simulation.enter();
@@ -1585,7 +1585,7 @@ fn pipeline_out_of_order_failure_and_short_cqes_preserve_other_mapping() {
 }
 #[test]
 fn second_sight_delayed_sealed_write_keeps_publication_authority() {
-    use uring_runtime::reactor::simulation::{Fault, Simulation};
+    use crate::rt::reactor::simulation::{Fault, Simulation};
     let simulation = Simulation::new();
     let _environment = simulation.enter();
     let f = Fixture::new();
@@ -1632,7 +1632,7 @@ fn second_sight_delayed_sealed_write_keeps_publication_authority() {
 
 #[test]
 fn checkpoint_infeasible_budget_does_not_pause_an_inflight_writer() {
-    use uring_runtime::reactor::simulation::{Fault, Simulation};
+    use crate::rt::reactor::simulation::{Fault, Simulation};
     let simulation = Simulation::new();
     let _environment = simulation.enter();
     let f = Fixture::new();
@@ -1690,7 +1690,7 @@ fn checkpoint_infeasible_budget_does_not_pause_an_inflight_writer() {
 #[test]
 fn checkpoint_exact_budget_matches_full_snapshot_with_holds() {
     use super::checkpoint::{CHECKPOINT_VERSION, CheckpointImage, encode};
-    let simulation = uring_runtime::reactor::simulation::Simulation::new();
+    let simulation = crate::rt::reactor::simulation::Simulation::new();
     let _environment = simulation.enter();
     let f = Fixture::new();
     let _ = futures::executor::block_on(f.store.open()).unwrap();
@@ -1843,7 +1843,7 @@ fn checkpoint_preflights_segment_metadata_and_page_clones() {
 
 #[test]
 fn checkpoint_directory_startup_is_bounded_and_simulation_compatible() {
-    use uring_runtime::reactor::simulation::Simulation;
+    use crate::rt::reactor::simulation::Simulation;
     let sim = Simulation::new();
     let _os = sim.enter();
     let f = Fixture::new();
@@ -5345,7 +5345,7 @@ fn zero_copy_body_serves_a_shorter_record_body_and_rejects_misfits() {
 
 #[test]
 fn zero_copy_write_failure_releases_charges_and_does_not_publish() {
-    use uring_runtime::reactor::simulation::{Fault, Simulation};
+    use crate::rt::reactor::simulation::{Fault, Simulation};
     for fault in [Fault::Errno(libc::EIO), Fault::Short(512)] {
         let simulation = Simulation::new();
         let _environment = simulation.enter();
@@ -5653,7 +5653,7 @@ fn owned_reclaim_never_lets_unheld_over_share_page_take_under_share_write() {
 #[test]
 fn passthrough_cache_never_enqueues_or_publishes_to_disk() {
     use racer_control_wire::CacheMode;
-    let simulation = uring_runtime::reactor::simulation::Simulation::new();
+    let simulation = crate::rt::reactor::simulation::Simulation::new();
     let _environment = simulation.enter();
     let availability = crate::test_support::availability();
     let f = Fixture::assemble(Directory::new(), availability.clone());

@@ -1,5 +1,5 @@
 //! A scoped reactor on the thread-selected backend for filesystem tests.
-use crate::{
+use crate::rt::{
     Error, Operation, Result, Scope,
     environment::{Cancellation, Deadline},
 };
@@ -35,7 +35,7 @@ impl Reactor {
         Self {
             core: racer_io::scoped::Reactor::new(
                 admission.limits.queue_entries.get(),
-                &crate::reactor::simulation::ambient_env(),
+                &crate::rt::reactor::simulation::ambient_env(),
             ),
         }
     }
@@ -71,7 +71,7 @@ impl Scope for RequestScope {
     fn check(&self) -> Result<()> {
         if self.cancellation.is_cancelled() {
             Err(Error::Cancelled)
-        } else if crate::environment::now() >= self.deadline.0 {
+        } else if crate::rt::environment::now() >= self.deadline.0 {
             Err(Error::DeadlineExceeded)
         } else {
             Ok(())
