@@ -1,0 +1,438 @@
+# Copyright (c) Microsoft Corporation.
+# SPDX-License-Identifier: Apache-2.0
+---
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  annotations:
+    controller-gen.kubebuilder.io/version: v0.20.1
+  name: certificationprofiles.signal.unbounded-cloud.io
+spec:
+  group: signal.unbounded-cloud.io
+  names:
+    kind: CertificationProfile
+    listKind: CertificationProfileList
+    plural: certificationprofiles
+    shortNames:
+    - certprofile
+    singular: certificationprofile
+  scope: Cluster
+  versions:
+  - additionalPrinterColumns:
+    - jsonPath: .spec.suite.name
+      name: Suite
+      type: string
+    - jsonPath: .spec.participants.count
+      name: Participants
+      type: integer
+    name: v1alpha1
+    schema:
+      openAPIV3Schema:
+        properties:
+          apiVersion:
+            description: |-
+              APIVersion defines the versioned schema of this representation of an object.
+              Servers should convert recognized schemas to the latest internal value, and
+              may reject unrecognized values.
+              More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#resources
+            type: string
+          kind:
+            description: |-
+              Kind is a string value representing the REST resource this object represents.
+              Servers may infer this from the endpoint the client submits requests to.
+              Cannot be updated.
+              In CamelCase.
+              More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#types-kinds
+            type: string
+          metadata:
+            type: object
+          spec:
+            properties:
+              environment:
+                properties:
+                  modelCaches:
+                    items:
+                      properties:
+                        name:
+                          maxLength: 63
+                          minLength: 1
+                          type: string
+                        reference:
+                          maxLength: 253
+                          minLength: 1
+                          type: string
+                      required:
+                      - name
+                      - reference
+                      type: object
+                    maxItems: 16
+                    type: array
+                    x-kubernetes-list-map-keys:
+                    - name
+                    x-kubernetes-list-type: map
+                  namespace:
+                    description: Namespace is the approved execution namespace.
+                    maxLength: 63
+                    minLength: 1
+                    type: string
+                  networks:
+                    items:
+                      properties:
+                        attachmentDefinition:
+                          maxLength: 253
+                          type: string
+                        interfaceClass:
+                          maxLength: 128
+                          minLength: 1
+                          type: string
+                        name:
+                          maxLength: 63
+                          minLength: 1
+                          type: string
+                      required:
+                      - interfaceClass
+                      - name
+                      type: object
+                    maxItems: 16
+                    type: array
+                    x-kubernetes-list-map-keys:
+                    - name
+                    x-kubernetes-list-type: map
+                  objectStores:
+                    items:
+                      properties:
+                        name:
+                          maxLength: 63
+                          minLength: 1
+                          type: string
+                        reference:
+                          maxLength: 253
+                          minLength: 1
+                          type: string
+                      required:
+                      - name
+                      - reference
+                      type: object
+                    maxItems: 16
+                    type: array
+                    x-kubernetes-list-map-keys:
+                    - name
+                    x-kubernetes-list-type: map
+                  resolvers:
+                    items:
+                      properties:
+                        name:
+                          maxLength: 63
+                          minLength: 1
+                          type: string
+                        reference:
+                          maxLength: 253
+                          minLength: 1
+                          type: string
+                      required:
+                      - name
+                      - reference
+                      type: object
+                    maxItems: 16
+                    type: array
+                    x-kubernetes-list-map-keys:
+                    - name
+                    x-kubernetes-list-type: map
+                  resources:
+                    description: ResourceRequirements describes the compute resource
+                      requirements.
+                    properties:
+                      claims:
+                        description: |-
+                          Claims lists the names of resources, defined in spec.resourceClaims,
+                          that are used by this container.
+
+                          This field depends on the
+                          DynamicResourceAllocation feature gate.
+
+                          This field is immutable. It can only be set for containers.
+                        items:
+                          description: ResourceClaim references one entry in PodSpec.ResourceClaims.
+                          properties:
+                            name:
+                              description: |-
+                                Name must match the name of one entry in pod.spec.resourceClaims of
+                                the Pod where this field is used. It makes that resource available
+                                inside a container.
+                              type: string
+                            request:
+                              description: |-
+                                Request is the name chosen for a request in the referenced claim.
+                                If empty, everything from the claim is made available, otherwise
+                                only the result of this request.
+                              type: string
+                          required:
+                          - name
+                          type: object
+                        type: array
+                        x-kubernetes-list-map-keys:
+                        - name
+                        x-kubernetes-list-type: map
+                      limits:
+                        additionalProperties:
+                          anyOf:
+                          - type: integer
+                          - type: string
+                          pattern: ^(\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))(([KMGTPE]i)|[numkMGTPE]|([eE](\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))))?$
+                          x-kubernetes-int-or-string: true
+                        description: |-
+                          Limits describes the maximum amount of compute resources allowed.
+                          More info: https://kubernetes.io/docs/concepts/configuration/manage-resources-containers/
+                        type: object
+                      requests:
+                        additionalProperties:
+                          anyOf:
+                          - type: integer
+                          - type: string
+                          pattern: ^(\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))(([KMGTPE]i)|[numkMGTPE]|([eE](\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))))?$
+                          x-kubernetes-int-or-string: true
+                        description: |-
+                          Requests describes the minimum amount of compute resources required.
+                          If Requests is omitted for a container, it defaults to Limits if that is explicitly specified,
+                          otherwise to an implementation-defined value. Requests cannot exceed Limits.
+                          More info: https://kubernetes.io/docs/concepts/configuration/manage-resources-containers/
+                        type: object
+                    type: object
+                  runtimeClassName:
+                    maxLength: 253
+                    type: string
+                  secretRefs:
+                    description: |-
+                      SecretRefs contain names only. Secret values must never enter Profile,
+                      Run, plan digest, or evidence objects.
+                    items:
+                      description: |-
+                        LocalObjectReference contains enough information to let you locate the
+                        referenced object inside the same namespace.
+                      properties:
+                        name:
+                          default: ""
+                          description: |-
+                            Name of the referent.
+                            This field is effectively required, but due to backwards compatibility is
+                            allowed to be empty. Instances of this type with an empty value here are
+                            almost certainly wrong.
+                            More info: https://kubernetes.io/docs/concepts/overview/working-with-objects/names/#names
+                          type: string
+                      type: object
+                      x-kubernetes-map-type: atomic
+                    maxItems: 32
+                    type: array
+                    x-kubernetes-list-map-keys:
+                    - name
+                    x-kubernetes-list-type: map
+                  storage:
+                    items:
+                      properties:
+                        accessModes:
+                          items:
+                            type: string
+                          maxItems: 4
+                          type: array
+                          x-kubernetes-list-type: set
+                        capacity:
+                          description: Capacity uses Kubernetes quantity syntax.
+                          maxLength: 64
+                          minLength: 1
+                          type: string
+                        disposable:
+                          type: boolean
+                        mountPath:
+                          maxLength: 1024
+                          minLength: 1
+                          type: string
+                        name:
+                          maxLength: 63
+                          minLength: 1
+                          type: string
+                        storageClassName:
+                          maxLength: 253
+                          minLength: 1
+                          type: string
+                      required:
+                      - capacity
+                      - mountPath
+                      - name
+                      - storageClassName
+                      type: object
+                    maxItems: 16
+                    type: array
+                    x-kubernetes-list-map-keys:
+                    - name
+                    x-kubernetes-list-type: map
+                required:
+                - namespace
+                type: object
+                x-kubernetes-validations:
+                - message: environment resource limits must not exceed 16 entries
+                  rule: '!has(self.resources) || !has(self.resources.limits) || size(self.resources.limits)
+                    <= 16'
+                - message: environment resource requests must not exceed 16 entries
+                  rule: '!has(self.resources) || !has(self.resources.requests) ||
+                    size(self.resources.requests) <= 16'
+                - message: environment resource claims must not exceed 16 entries
+                  rule: '!has(self.resources) || !has(self.resources.claims) || size(self.resources.claims)
+                    <= 16'
+              participantRoles:
+                items:
+                  properties:
+                    count:
+                      format: int32
+                      maximum: 8
+                      minimum: 1
+                      type: integer
+                    role:
+                      maxLength: 63
+                      minLength: 1
+                      type: string
+                    selector:
+                      description: Selector narrows the Profile participant selector
+                        for this role.
+                      properties:
+                        matchExpressions:
+                          description: matchExpressions is a list of label selector
+                            requirements. The requirements are ANDed.
+                          items:
+                            description: |-
+                              A label selector requirement is a selector that contains values, a key, and an operator that
+                              relates the key and values.
+                            properties:
+                              key:
+                                description: key is the label key that the selector
+                                  applies to.
+                                type: string
+                              operator:
+                                description: |-
+                                  operator represents a key's relationship to a set of values.
+                                  Valid operators are In, NotIn, Exists and DoesNotExist.
+                                type: string
+                              values:
+                                description: |-
+                                  values is an array of string values. If the operator is In or NotIn,
+                                  the values array must be non-empty. If the operator is Exists or DoesNotExist,
+                                  the values array must be empty. This array is replaced during a strategic
+                                  merge patch.
+                                items:
+                                  type: string
+                                type: array
+                                x-kubernetes-list-type: atomic
+                            required:
+                            - key
+                            - operator
+                            type: object
+                          type: array
+                          x-kubernetes-list-type: atomic
+                        matchLabels:
+                          additionalProperties:
+                            type: string
+                          description: |-
+                            matchLabels is a map of {key,value} pairs. A single {key,value} in the matchLabels
+                            map is equivalent to an element of matchExpressions, whose key field is "key", the
+                            operator is "In", and the values array contains only "value". The requirements are ANDed.
+                          type: object
+                      type: object
+                      x-kubernetes-map-type: atomic
+                  required:
+                  - count
+                  - role
+                  type: object
+                maxItems: 16
+                type: array
+                x-kubernetes-list-map-keys:
+                - role
+                x-kubernetes-list-type: map
+              participants:
+                properties:
+                  count:
+                    format: int32
+                    maximum: 8
+                    minimum: 1
+                    type: integer
+                  selector:
+                    description: |-
+                      A label selector is a label query over a set of resources. The result of matchLabels and
+                      matchExpressions are ANDed. An empty label selector matches all objects. A null
+                      label selector matches no objects.
+                    properties:
+                      matchExpressions:
+                        description: matchExpressions is a list of label selector
+                          requirements. The requirements are ANDed.
+                        items:
+                          description: |-
+                            A label selector requirement is a selector that contains values, a key, and an operator that
+                            relates the key and values.
+                          properties:
+                            key:
+                              description: key is the label key that the selector
+                                applies to.
+                              type: string
+                            operator:
+                              description: |-
+                                operator represents a key's relationship to a set of values.
+                                Valid operators are In, NotIn, Exists and DoesNotExist.
+                              type: string
+                            values:
+                              description: |-
+                                values is an array of string values. If the operator is In or NotIn,
+                                the values array must be non-empty. If the operator is Exists or DoesNotExist,
+                                the values array must be empty. This array is replaced during a strategic
+                                merge patch.
+                              items:
+                                type: string
+                              type: array
+                              x-kubernetes-list-type: atomic
+                          required:
+                          - key
+                          - operator
+                          type: object
+                        type: array
+                        x-kubernetes-list-type: atomic
+                      matchLabels:
+                        additionalProperties:
+                          type: string
+                        description: |-
+                          matchLabels is a map of {key,value} pairs. A single {key,value} in the matchLabels
+                          map is equivalent to an element of matchExpressions, whose key field is "key", the
+                          operator is "In", and the values array contains only "value". The requirements are ANDed.
+                        type: object
+                    type: object
+                    x-kubernetes-map-type: atomic
+                required:
+                - count
+                - selector
+                type: object
+                x-kubernetes-validations:
+                - message: selector must contain at least one matchLabels or matchExpressions
+                    term
+                  rule: (has(self.selector.matchLabels) && size(self.selector.matchLabels)
+                    > 0) || (has(self.selector.matchExpressions) && size(self.selector.matchExpressions)
+                    > 0)
+              suite:
+                properties:
+                  name:
+                    maxLength: 253
+                    minLength: 1
+                    pattern: ^[a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*$
+                    type: string
+                required:
+                - name
+                type: object
+            required:
+            - participants
+            - suite
+            type: object
+            x-kubernetes-validations:
+            - message: participant role counts must equal participants.count
+              rule: '!has(self.participantRoles) || size(self.participantRoles) ==
+                0 || self.participantRoles.map(x, x.count).sum() == self.participants.count'
+        required:
+        - spec
+        type: object
+    served: true
+    storage: true
+    subresources: {}
