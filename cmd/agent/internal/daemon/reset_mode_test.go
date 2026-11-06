@@ -134,7 +134,7 @@ func TestResetRunsTheContainerTeardownOnlyWhereAContainerNodeLeftTraces(t *testi
 		"remove-daemon-unit", "stop-machine", "stop-container-node", "remove-wireguard-keys",
 		"remove-nspawn-config", "remove-container-config",
 		"remove-machine", "remove-container-node", "remove-bpffs-mount",
-		"cleanup-routes", "remove-first-boot-unit", "remove-agent-artifacts", "reload-systemd",
+		"cleanup-routes", "remove-nftables-flush", "remove-first-boot-unit", "remove-agent-artifacts", "reload-systemd",
 	} {
 		idx := strings.Index(name, step)
 		require.GreaterOrEqual(t, idx, 0, "%s missing from %s", step, name)
@@ -144,6 +144,19 @@ func TestResetRunsTheContainerTeardownOnlyWhereAContainerNodeLeftTraces(t *testi
 	}
 
 	assert.NotContains(t, name, "none-node")
+}
+
+// The container bootstrap installs the nftables flush unit wanted by
+// multi-user.target, so a reset of a container host must remove it, or the
+// reset host keeps flushing its own firewall at every boot. Its removal runs
+// once, after the container teardown and before systemd is reloaded.
+func TestResetOfAContainerHostRemovesTheNFTablesFlush(t *testing.T) {
+	h, _ := stubResetHostWith(false, true)
+	name := resetResourcesOn(discardLogger(), h).Name()
+
+	require.Equal(t, 1, strings.Count(name, "remove-nftables-flush"), name)
+	assert.Less(t, strings.Index(name, "remove-container-node"), strings.Index(name, "remove-nftables-flush"))
+	assert.Less(t, strings.Index(name, "remove-nftables-flush"), strings.Index(name, "reload-systemd"))
 }
 
 // A host with traces of both (for example a change between them that was
