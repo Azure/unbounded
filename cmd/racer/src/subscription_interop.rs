@@ -276,7 +276,7 @@ impl SubscriptionFixture {
                 page_size: racer_wire::object::PageSize::DEFAULT,
             })
             .unwrap();
-        let directory = Arc::new(
+        let directory = std::rc::Rc::new(
             WorkerDirectory::new(
                 Arc::new(WorkerMap::new(vec![WorkerId(0)]).unwrap()),
                 vec![WorkerId(0)],

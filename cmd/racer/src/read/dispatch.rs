@@ -227,7 +227,7 @@ impl mailbox::executor::ExecutionScope for RequestScope {
 /// Worker-owned command driver. Poll it even after ingress requests disconnect.
 /// Active futures are retained until completion; cancel is never a completion fence.
 pub struct WorkerEndpoint {
-    directory: Arc<WorkerDirectory>,
+    directory: std::rc::Rc<WorkerDirectory>,
 
     mailbox: Arc<Mailbox>,
 
@@ -362,7 +362,7 @@ impl WorkerDirectory {
     /// Production gets this isolation from its owning OS thread.
     #[cfg(test)]
     pub(crate) fn simulation_scope(
-        self: &Arc<Self>,
+        self: &Rc<Self>,
         local: Option<(WorkerId, Rc<Coordinator>)>,
     ) -> SimulationLocal {
         let previous = self
@@ -389,7 +389,7 @@ impl WorkerDirectory {
     }
 
     pub fn install(
-        self: &Arc<Self>,
+        self: &Rc<Self>,
         worker: WorkerId,
         local: Rc<Coordinator>,
     ) -> Result<WorkerEndpoint> {
@@ -948,7 +948,7 @@ impl WorkerDirectory {
 
 #[cfg(test)]
 pub(crate) struct SimulationLocal {
-    directory: Arc<WorkerDirectory>,
+    directory: std::rc::Rc<WorkerDirectory>,
     previous: Option<(WorkerId, std::rc::Weak<Coordinator>)>,
 }
 #[cfg(test)]
@@ -1371,7 +1371,7 @@ impl NodeDirectory {
 }
 
 // PeerServer owns local services through Rc; retain this worker's directory view.
-impl LocalPageService for Arc<WorkerDirectory> {
+impl LocalPageService for std::rc::Rc<WorkerDirectory> {
     fn serve_peer<'a>(
         &'a self,
         request: VerifiedRequest,
@@ -1447,7 +1447,7 @@ mod tests {
         }
     }
     /// Deliver retained verdicts through the owner's endpoint and count them.
-    fn applied_by_owner(env: &racer_io::Env, directory: &Arc<WorkerDirectory>) -> u64 {
+    fn applied_by_owner(env: &racer_io::Env, directory: &std::rc::Rc<WorkerDirectory>) -> u64 {
         let (owner, _fixture) = crate::read::tests::admission_coordinator(env);
         let before = owner
             .fill
@@ -1468,7 +1468,7 @@ mod tests {
         let env = racer_io::Env::host();
         let queue = Rc::new(crate::drivers::DriverQueue::new(1));
         let workers = vec![WorkerId(0), WorkerId(1)];
-        let directory = Arc::new(
+        let directory = std::rc::Rc::new(
             WorkerDirectory::new(
                 Arc::new(WorkerMap::new(workers.clone()).unwrap()),
                 workers,
@@ -1495,7 +1495,7 @@ mod tests {
         let env = racer_io::Env::host();
         let queue = Rc::new(crate::drivers::DriverQueue::new(64));
         let workers = vec![WorkerId(0), WorkerId(1)];
-        let directory = Arc::new(
+        let directory = std::rc::Rc::new(
             WorkerDirectory::new(
                 Arc::new(WorkerMap::new(workers.clone()).unwrap()),
                 workers,
@@ -1521,7 +1521,7 @@ mod tests {
     fn landed_verdict(env: &racer_io::Env, passed: bool) -> (u64, usize) {
         let queue = Rc::new(crate::drivers::DriverQueue::new(64));
         let workers = vec![WorkerId(0), WorkerId(1)];
-        let directory = Arc::new(
+        let directory = std::rc::Rc::new(
             WorkerDirectory::new(
                 Arc::new(WorkerMap::new(workers.clone()).unwrap()),
                 workers,
@@ -1744,7 +1744,7 @@ mod tests {
         use crate::admission::ResourceClass;
         let env = racer_io::Env::host();
         for cancel_caller in [false, true] {
-            let directory = Arc::new(directory(1));
+            let directory = Rc::new(directory(1));
             let caller = scope();
             let admission = Rc::new(flow_control::Quotas::new(
                 crate::admission::AdmissionPolicy::new(
@@ -1817,7 +1817,7 @@ mod tests {
     fn expired_drain_returns_queued_budget_and_reclaims_detached_receipts() {
         let env = racer_io::Env::host();
         for detach in [false, true] {
-            let directory = Arc::new(directory(1));
+            let directory = Rc::new(directory(1));
             let mut endpoint = WorkerEndpoint {
                 mailbox: directory.mailboxes[0].clone(),
                 directory: directory.clone(),
@@ -1967,7 +1967,7 @@ mod tests {
         let env = racer_io::Env::host();
         for submit_before_poll in [false, true] {
             for complete_before_poll in [false, true] {
-                let directory = Arc::new(directory(4));
+                let directory = Rc::new(directory(4));
                 let mut endpoint = WorkerEndpoint {
                     mailbox: directory.mailboxes[0].clone(),
                     directory: directory.clone(),
@@ -2018,7 +2018,7 @@ mod tests {
     #[test]
     fn bounded_admission_mailbox_keeps_other_work_progressing() {
         let env = racer_io::Env::host();
-        let directory = Arc::new(directory(4));
+        let directory = Rc::new(directory(4));
         let (local, _fixture) = crate::read::tests::admission_coordinator(&env);
         let mut endpoint = WorkerEndpoint {
             mailbox: directory.mailboxes[0].clone(),

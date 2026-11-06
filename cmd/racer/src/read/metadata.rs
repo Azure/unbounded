@@ -34,7 +34,6 @@ use std::future::Future;
 use std::future::poll_fn;
 use std::pin::Pin;
 use std::rc::Rc;
-use std::sync::Arc;
 use std::task::Poll;
 use std::task::Waker;
 use std::time::Duration;
@@ -340,7 +339,7 @@ pub struct MetadataDependencies {
 
     pub fill: Rc<super::fill::Fill>,
 
-    pub owners: Arc<super::dispatch::WorkerDirectory>,
+    pub owners: std::rc::Rc<super::dispatch::WorkerDirectory>,
 }
 
 /// Coordinate metadata observations on the page-zero worker.
@@ -1006,6 +1005,7 @@ pub(crate) mod tests {
     use futures::task::noop_waker;
     use racer_core::read::{MAX_REFRESH_ATTEMPTS, MAX_WAITERS};
     use racer_wire::control::CacheId;
+    use std::sync::Arc;
     use std::time::UNIX_EPOCH;
 
     fn metadata(etag: &str, length: u64) -> ObjectMetadata {

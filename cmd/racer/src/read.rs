@@ -457,7 +457,7 @@ impl Coordinator {
     }
 
     /// The node's worker directory, which owns the prefetch registry.
-    pub(crate) fn prefetch_directory(&self) -> &std::sync::Arc<dispatch::WorkerDirectory> {
+    pub(crate) fn prefetch_directory(&self) -> &std::rc::Rc<dispatch::WorkerDirectory> {
         self.streams.directory()
     }
 

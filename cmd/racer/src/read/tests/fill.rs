@@ -3490,7 +3490,7 @@ fn fixture_with_flight_clock(
     ));
     // Deliberately uninstalled catalog owner: publication must retain page-local
     // metadata and still complete when the optional catalog is unavailable.
-    let metadata_owner = Arc::new(
+    let metadata_owner = std::rc::Rc::new(
         WorkerDirectory::new(
             Arc::new(WorkerMap::new(vec![worker]).unwrap()),
             vec![worker],

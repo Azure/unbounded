@@ -110,7 +110,7 @@ struct Factory {
     resources: Resources,
     root: PathBuf,
     commands: Mutex<BTreeMap<u16, mpsc::Receiver<Command>>>,
-    directory: Arc<WorkerDirectory>,
+    directory: Arc<racer::read::dispatch::NodeDirectory>,
     slab_bytes: u64,
 }
 fn budgets() -> Limits {
@@ -138,7 +138,7 @@ impl Factory {
                 scratch: Scratch::under(&self.root),
                 runtime,
                 worker,
-                directory: self.directory.clone(),
+                directory: Rc::new(self.directory.view()),
                 slab_bytes: self.slab_bytes,
             }),
         ));
@@ -511,7 +511,8 @@ fn shared_directory_routes_cold_and_offline_reads_to_both_owners() {
         root: scratch.path.clone(),
         commands: Mutex::new(receivers),
         directory: Arc::new(
-            WorkerDirectory::new(map, ids, 256, racer_io::WorkerCtx::host()).unwrap(),
+            racer::read::dispatch::NodeDirectory::new(map, ids, 256, racer_io::WorkerCtx::host())
+                .unwrap(),
         ),
         slab_bytes: 256 * MIB,
     });
@@ -612,7 +613,8 @@ fn warm_page_allocations() {
         root: scratch.path.clone(),
         commands: Mutex::new(BTreeMap::from([(0, receive)])),
         directory: Arc::new(
-            WorkerDirectory::new(map, ids, 256, racer_io::WorkerCtx::host()).unwrap(),
+            racer::read::dispatch::NodeDirectory::new(map, ids, 256, racer_io::WorkerCtx::host())
+                .unwrap(),
         ),
         slab_bytes: 256 * MIB,
     });
@@ -683,8 +685,15 @@ fn run_case(root: &std::path::Path, default: &AffinityPlan, mode: &str, concurre
     let ids: Vec<_> = default.pairs.iter().map(|pair| pair.worker).collect();
     let map = Arc::new(WorkerMap::new(ids.clone()).unwrap());
     let keys = balanced_keys(&map, workers, REQUESTS + workers);
-    let directory =
-        Arc::new(WorkerDirectory::new(map, ids.clone(), 256, racer_io::WorkerCtx::host()).unwrap());
+    let directory = Arc::new(
+        racer::read::dispatch::NodeDirectory::new(
+            map,
+            ids.clone(),
+            256,
+            racer_io::WorkerCtx::host(),
+        )
+        .unwrap(),
+    );
     let mut receivers = BTreeMap::new();
     let commands: Vec<_> = ids
         .iter()

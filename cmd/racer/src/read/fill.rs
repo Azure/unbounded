@@ -63,7 +63,7 @@ pub struct FillDependencies {
     pub admission: Rc<flow_control::Quotas<AdmissionPolicy>>,
     /// Publish immutable descriptors to the page-zero owner over bounded commands.
     /// Page workers keep their own page-attached descriptor even if that catalog evicts it.
-    pub metadata_owner: Arc<super::dispatch::WorkerDirectory>,
+    pub metadata_owner: std::rc::Rc<super::dispatch::WorkerDirectory>,
 }
 type LocalCopies = super::shared::Table<PageId, Result<Option<UnverifiedPage>>>;
 /// Local plaintext recovery keyed by page: one decrypt of a retained or local

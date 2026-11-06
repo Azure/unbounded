@@ -1039,7 +1039,7 @@ fn metadata_coordinator_with_newer_publication(
         reactor.clone(),
         buffers.clone(),
     );
-    let owners = Arc::new(
+    let owners = std::rc::Rc::new(
         super::dispatch::WorkerDirectory::new(
             Arc::new(WorkerMap::new(vec![WorkerId(0)]).unwrap()),
             vec![WorkerId(0)],

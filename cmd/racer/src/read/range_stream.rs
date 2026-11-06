@@ -514,7 +514,7 @@ enum Held {
 
 /// Open pinned streams on the ingress reactor using the shared worker directory.
 pub struct RangeStreams {
-    directory: Arc<WorkerDirectory>,
+    directory: std::rc::Rc<WorkerDirectory>,
 
     delivery: Rc<Delivery>,
 
@@ -555,7 +555,7 @@ pub struct RangeStream {
 
     scope: RequestScope,
 
-    directory: Arc<WorkerDirectory>,
+    directory: std::rc::Rc<WorkerDirectory>,
 
     delivery: Rc<Delivery>,
 
@@ -611,7 +611,7 @@ pub struct RangeStream {
 impl RangeStreams {
     /// Bind stream creation to this worker's delivery resources and read window.
     pub fn new(
-        directory: Arc<WorkerDirectory>,
+        directory: std::rc::Rc<WorkerDirectory>,
         delivery: Rc<Delivery>,
         window_pages: usize,
         drivers: Rc<crate::drivers::DriverQueue>,
@@ -630,7 +630,7 @@ impl RangeStreams {
     }
 
     /// Share the same metadata and page owners used by newly opened streams.
-    pub(crate) fn directory(&self) -> &Arc<WorkerDirectory> {
+    pub(crate) fn directory(&self) -> &std::rc::Rc<WorkerDirectory> {
         &self.directory
     }
 
@@ -1745,7 +1745,7 @@ pub(super) mod tests {
             let admission = Rc::new(flow_control::Quotas::new(AdmissionPolicy::new(limits)));
             let reactor = Rc::new(Reactor::new(admission.clone(), env));
             let pipes = Rc::new(new_pipe_pool(admission.clone(), reactor.sim_os()));
-            let directory = Arc::new(
+            let directory = std::rc::Rc::new(
                 WorkerDirectory::new(
                     Arc::new(WorkerMap::new(vec![WorkerId(0)]).unwrap()),
                     vec![WorkerId(0)],

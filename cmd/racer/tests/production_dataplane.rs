@@ -438,7 +438,7 @@ struct RigWorker {
     scratch: Scratch,
     runtime: racer::worker::WorkerRuntime,
     worker: WorkerId,
-    directory: Arc<WorkerDirectory>,
+    directory: std::rc::Rc<WorkerDirectory>,
     slab_bytes: u64,
 }
 impl Rig {
@@ -472,7 +472,7 @@ impl Rig {
                 Scratch::new(),
                 None,
                 WorkerId(0),
-                Arc::new(
+                std::rc::Rc::new(
                     WorkerDirectory::new(
                         Arc::new(WorkerMap::new(vec![WorkerId(0)]).unwrap()),
                         vec![WorkerId(0)],

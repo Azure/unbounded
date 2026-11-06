@@ -1036,7 +1036,7 @@ pub struct WorkerApplication {
 
     telemetry: Rc<Telemetry>,
 
-    directory: Arc<WorkerDirectory>,
+    directory: std::rc::Rc<WorkerDirectory>,
 
     node: Arc<NodeState>,
 
@@ -1357,7 +1357,7 @@ impl WorkerApplication {
         let is_sampler = worker == node.control_worker;
         // This worker's own view of the node directory; it binds this worker's
         // coordinator when the endpoint installs.
-        let directory = Arc::new(node.workers.view());
+        let directory = std::rc::Rc::new(node.workers.view());
         let node_pressure = node.pressure.clone();
         let control = if worker == node.control_worker {
             Some(Self::assemble_control(
