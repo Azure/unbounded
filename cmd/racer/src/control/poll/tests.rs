@@ -1000,3 +1000,82 @@ fn jitter_is_bounded_inclusive_and_not_constant() {
         jitter_sample(Duration::from_secs(1), u32::MAX)
     );
 }
+
+/// A delta reply against `base` that produces `next`, upserting every member.
+fn delta(base: &wire::Publication, next: &wire::Publication) -> Reply {
+    let mut body: serde_json::Value =
+        serde_json::from_slice(&wire::encode_publication(next).unwrap()).unwrap();
+    let object = body.as_object_mut().unwrap();
+    object.remove("schema_version");
+    let members = object.remove("members").unwrap();
+    object.insert("upsert_members".into(), members);
+    object.insert("remove_members".into(), serde_json::json!([]));
+    object.insert("delta_version".into(), wire::DELTA_VERSION.into());
+    object.insert("base_sequence".into(), base.sequence.0.to_string().into());
+    object.insert("base_hash".into(), wire::content_hash(base).unwrap().into());
+    object.insert(
+        "content_hash".into(),
+        wire::content_hash(next).unwrap().into(),
+    );
+    Reply::Response(200, serde_json::to_vec(&body).unwrap())
+}
+
+/// Deltas apply in one request against the cached base digest, a delta
+/// that does not match the base falls back to one cursor-free full fetch,
+/// and every request carries the digest of the current base.
+#[test]
+fn deltas_apply_against_cached_digest_and_fall_back_to_full() {
+    sim(5, |clock, env| {
+        let io = host(env);
+        let (one, two, three) = (publication(1, 0), publication(2, 1), publication(3, 2));
+        let script = Script::new(
+            &io,
+            [
+                published(1, 0),
+                delta(&one, &two),
+                // Bound to the wrong base: refused, then a full image is fetched.
+                delta(&one, &three),
+                published(3, 2),
+            ],
+        );
+        let feed = poll(&io, Doc::Publication, &script, &Installer::new());
+        let scope = scope(env);
+        for expected in [1, 2, 3] {
+            let document = drive(clock, feed.fetch(&scope)).unwrap().unwrap();
+            assert_eq!(document.version(), expected);
+            assert_eq!(
+                document.digest().unwrap(),
+                wire::content_hash(&publication(expected, expected - 1)).unwrap()
+            );
+        }
+        let requests = script.requests.borrow();
+        let path = wire::SNAPSHOT_PATH;
+        assert_eq!(
+            *requests,
+            [
+                (path.to_owned(), None),
+                (
+                    format!("{path}?after=1"),
+                    Some(wire::content_hash(&one).unwrap())
+                ),
+                (
+                    format!("{path}?after=2"),
+                    Some(wire::content_hash(&two).unwrap())
+                ),
+                (path.to_owned(), None),
+            ]
+        );
+        drop(requests);
+        // A restored base replaces the cached digest.
+        feed.restore(Some(Document::Publication(Arc::new(one.clone()))));
+        script.push(delta(&one, &two));
+        assert_eq!(
+            drive(clock, feed.fetch(&scope)).unwrap().unwrap().version(),
+            2
+        );
+        assert_eq!(
+            script.requests.borrow()[4].1.as_deref(),
+            Some(wire::content_hash(&one).unwrap().as_str())
+        );
+    });
+}

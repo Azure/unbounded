@@ -87,13 +87,29 @@ impl Doc {
         })
     }
 
-    /// Apply and validate a delta against the exact retained base.
-    fn delta(self, base: &Document, bytes: &[u8]) -> Result<Document> {
-        match (self, base) {
-            (Self::Publication, Document::Publication(base)) => Ok(Document::Publication(
-                Arc::new(wire::apply_delta(base, bytes)?),
-            )),
-            _ => Err(Error::InvalidRequest),
+    /// Decode a response once, as a delta against `base` (the retained base
+    /// and its [`Document::digest`]) when the body is a delta and this document
+    /// supports deltas, otherwise as a full document. Returns the validated
+    /// document with its digest.
+    fn decode_response(
+        self,
+        bytes: &[u8],
+        base: Option<(&Document, &str)>,
+    ) -> Result<(Document, String)> {
+        match self {
+            Self::Publication => {
+                let base = base.and_then(|(document, digest)| match document {
+                    Document::Publication(base) => Some((base.as_ref(), digest)),
+                    Document::Keyring(_) => None,
+                });
+                let (document, digest) = wire::decode_publication_response(bytes, base)?;
+                Ok((Document::Publication(Arc::new(document)), digest))
+            }
+            Self::Keyring => {
+                let document = self.decode(bytes)?;
+                let digest = document.digest()?;
+                Ok((document, digest))
+            }
         }
     }
 }
@@ -334,8 +350,9 @@ pub struct Poll {
 
     schedule: Schedule,
 
-    /// Latest complete decoded document, including unaccepted state.
-    last: RefCell<Option<Document>>,
+    /// Latest complete decoded document, including unaccepted state, with its
+    /// digest once computed, so each poll does not rehash the delta base.
+    last: RefCell<Option<(Document, Option<String>)>>,
 
     state: RefCell<Progress>,
 
@@ -449,12 +466,29 @@ impl Poll {
 
     /// Lease the latest decoded document, which is not necessarily accepted.
     pub fn last(&self) -> Option<Document> {
-        self.last.borrow().clone()
+        self.last
+            .borrow()
+            .as_ref()
+            .map(|(document, _)| document.clone())
     }
 
     /// Restore a known delta base, for example an accepted startup document.
     pub fn restore(&self, document: Option<Document>) {
-        *self.last.borrow_mut() = document;
+        *self.last.borrow_mut() = document.map(|document| (document, None));
+    }
+
+    /// The retained base with its digest, computing and caching the digest on
+    /// first use. The cache is replaced together with the document.
+    fn base(&self) -> Result<Option<(Document, String)>> {
+        let mut last = self.last.borrow_mut();
+        let Some((document, digest)) = last.as_mut() else {
+            return Ok(None);
+        };
+        let digest = match digest {
+            Some(digest) => digest.clone(),
+            None => digest.insert(document.digest()?).clone(),
+        };
+        Ok(Some((document.clone(), digest)))
     }
 
     /// Seed a document already installed by startup, before any work is submitted.
@@ -512,18 +546,15 @@ impl Poll {
         scope: &RequestScope,
     ) -> std::result::Result<Option<Document>, FetchError> {
         scope.check()?;
-        let base = self.last();
+        let base = self.base()?;
         let route = self.doc.path();
         let limit = self.doc.limit();
         let path = base.as_ref().map_or_else(
             || route.to_owned(),
-            |d| format!("{route}?after={}", d.version()),
+            |(d, _)| format!("{route}?after={}", d.version()),
         );
-        let digest = base.as_ref().map(Document::digest).transpose()?;
-        let response = self
-            .fetch
-            .get(&path, digest.as_deref(), limit, scope)
-            .await?;
+        let digest = base.as_ref().map(|(_, digest)| digest.as_str());
+        let response = self.fetch.get(&path, digest, limit, scope).await?;
         scope.check()?;
         if response.status == 204 {
             if base.is_none() || !response.body.is_empty() {
@@ -532,34 +563,30 @@ impl Poll {
             return Ok(None);
         }
         check_response(&response, limit)?;
-        let decoded = self
-            .doc
-            .decode(&response.body)
-            .or_else(|full_error| match &base {
-                Some(base) if self.doc.deltas() => self.doc.delta(base, &response.body),
-                _ => Err(full_error),
-            });
-        let document = match decoded {
-            Ok(document) => document,
+        let delta_base = base
+            .as_ref()
+            .filter(|_| self.doc.deltas())
+            .map(|(document, digest)| (document, digest.as_str()));
+        let decoded = self.doc.decode_response(&response.body, delta_base);
+        // Even a new version must have a usable digest before becoming a base.
+        // Otherwise one invalid candidate poisons every subsequent request.
+        let (document, document_digest) = match decoded {
+            Ok(decoded) => decoded,
             Err(_) => {
                 let response = self.fetch.get(route, None, limit, scope).await?;
                 check_response(&response, limit)?;
-                self.doc.decode(&response.body)?
+                self.doc.decode_response(&response.body, None)?
             }
         };
         scope.check()?;
-        // Even a new version must have a usable digest before becoming a base.
-        // Otherwise one invalid candidate poisons every subsequent request.
-        let document_digest = document.digest()?;
         self.install.received(&document);
-        if let Some(base) = &base
+        if let Some((base, _)) = &base
             && (document.version() < base.version()
-                || document.version() == base.version()
-                    && Some(document_digest.as_str()) != digest.as_deref())
+                || document.version() == base.version() && Some(document_digest.as_str()) != digest)
         {
             return Err(Error::Replay.into());
         }
-        self.restore(Some(document.clone()));
+        *self.last.borrow_mut() = Some((document.clone(), Some(document_digest)));
         Ok(Some(document))
     }
 
