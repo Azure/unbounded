@@ -34,6 +34,12 @@ type isolationStatus struct {
 // fields land together or not at all, so status.isolation never trails a
 // Succeeded change.
 //
+// A Change replaces status.isolationChange as a whole: every optional field it
+// leaves empty is sent as null, so a merge patch removes the value an earlier
+// attempt wrote instead of keeping it. Without that, the reason of a refused
+// change would outlive a later attempt that failed, and machina would report
+// the failure as a refusal.
+//
 // The message is truncated to what the API accepts.
 func patchIsolationStatus(ctx context.Context, c client.Client, machineName string, s isolationStatus) error {
 	fields := map[string]any{}
@@ -43,8 +49,11 @@ func patchIsolationStatus(ctx context.Context, c client.Client, machineName stri
 	}
 
 	if s.Change != nil {
-		change := *s.Change
-		change.Message = machineops.TruncateUTF8Bytes(change.Message, v1alpha3.IsolationChangeMessageMaxLength)
+		change, err := isolationChangePatch(*s.Change)
+		if err != nil {
+			return err
+		}
+
 		fields["isolationChange"] = change
 	}
 
@@ -65,6 +74,37 @@ func patchIsolationStatus(ctx context.Context, c client.Client, machineName stri
 	}
 
 	return nil
+}
+
+// isolationChangeOptionalFields are the JSON names of the optional fields of
+// IsolationChangeStatus. Each one is sent as null when empty, so a write
+// replaces the whole object. A test fails if a field is added to the type and
+// not here.
+var isolationChangeOptionalFields = []string{"strategy", "reason", "message", "lastTransitionTime"}
+
+// isolationChangePatch encodes change as the merge patch value of
+// status.isolationChange, with its message truncated and every empty optional
+// field set to null.
+func isolationChangePatch(change v1alpha3.IsolationChangeStatus) (map[string]any, error) {
+	change.Message = machineops.TruncateUTF8Bytes(change.Message, v1alpha3.IsolationChangeMessageMaxLength)
+
+	data, err := json.Marshal(change)
+	if err != nil {
+		return nil, fmt.Errorf("encode isolation change: %w", err)
+	}
+
+	value := map[string]any{}
+	if err := json.Unmarshal(data, &value); err != nil {
+		return nil, fmt.Errorf("decode isolation change: %w", err)
+	}
+
+	for _, name := range isolationChangeOptionalFields {
+		if _, ok := value[name]; !ok {
+			value[name] = nil
+		}
+	}
+
+	return value, nil
 }
 
 // reportMachineObservations reports everything the agent observes about its
