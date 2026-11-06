@@ -422,13 +422,13 @@ async fn watch(t: Rc<Term_>, kind: Kind) {
                 rt::sleep(RESYNC).await;
                 continue;
             }
-            Err(_) => {
+            Err(e) => {
+                eprintln!("racer: list {path} failed: {e:?}; retrying in {backoff}s");
                 rt::sleep(Duration::from_secs(backoff)).await;
                 backoff = (backoff * 2).min(30);
                 continue;
             }
         };
-        backoff = 1;
         {
             let mut inv = t.inventory.borrow_mut();
             match kind {
@@ -448,8 +448,16 @@ async fn watch(t: Rc<Term_>, kind: Kind) {
         drop(items);
         t.changed.notify();
         loop {
-            let Ok(mut w) = t.shared.api.watch(&path, "", &rv).await else {
-                break;
+            let mut w = match t.shared.api.watch(&path, "", &rv).await {
+                Ok(w) => w,
+                Err(e) => {
+                    // Back off before relisting so a watch that keeps
+                    // failing does not spin list requests.
+                    eprintln!("racer: watch {path} failed: {e:?}; relisting in {backoff}s");
+                    rt::sleep(Duration::from_secs(backoff)).await;
+                    backoff = (backoff * 2).min(30);
+                    break;
+                }
             };
             let mut relist = false;
             loop {
@@ -458,6 +466,7 @@ async fn watch(t: Rc<Term_>, kind: Kind) {
                 }
                 match w.next().await {
                     Ok(Some(e)) => {
+                        backoff = 1;
                         rv = str_at(&e.object, &["metadata", "resourceVersion"]).to_owned();
                         if e.kind != "BOOKMARK" {
                             apply(&mut t.inventory.borrow_mut(), kind, &e.kind, &e.object);
@@ -465,7 +474,8 @@ async fn watch(t: Rc<Term_>, kind: Kind) {
                         }
                     }
                     Ok(None) => break,
-                    Err(_) => {
+                    Err(e) => {
+                        eprintln!("racer: watch {path} ended: {e:?}; relisting");
                         relist = true;
                         break;
                     }
@@ -581,7 +591,10 @@ async fn reconcile(t: &Rc<Term_>) -> Result<(), StateError> {
                 str_at(v, &["metadata", "uid"]).into()
             }
             Ok(_) | Err(KubeError::NotFound) => String::new(),
-            Err(_) => return Ok(()),
+            Err(e) => {
+                eprintln!("racer: reconcile skipped: get DaemonSet failed: {e:?}");
+                return Ok(());
+            }
         },
         service_account: shared.config.service_account.clone(),
     };
