@@ -5559,6 +5559,10 @@ def start_machina_controller() -> None:
         "make", "machina-manifests",
         f"MACHINA_IMAGE={MACHINA_E2E_IMAGE}",
         f"MACHINA_API_SERVER_ENDPOINT={api_server}",
+        # machina's own experimental gate is covered by its unit tests. The
+        # suites test the agent's gate, so machina must not mask the agent's
+        # reports with ExperimentalModeDisabled when a suite declares container.
+        "MACHINA_EXPERIMENTAL_CONTAINER_ISOLATION=true",
     ], cwd=str(REPO_ROOT))
 
     rendered = REPO_ROOT / "deploy" / "machina" / "rendered"
