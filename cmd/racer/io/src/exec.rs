@@ -15,6 +15,7 @@ use crate::{
 };
 use std::{
     cell::{Cell, RefCell},
+    collections::VecDeque,
     future::Future,
     pin::Pin,
     rc::Rc,
@@ -69,7 +70,9 @@ fn thread_token() -> u64 {
 
 /// Ready queue shared with wakers.
 struct Shared {
-    queue: Mutex<Vec<u64>>,
+    /// FIFO so that a budgeted [`LocalExecutor::run_ready`] takes from the
+    /// front in O(taken) rather than shifting the remainder.
+    queue: Mutex<VecDeque<u64>>,
 
     owner: u64,
 
@@ -100,7 +103,7 @@ impl Wake for TaskWaker {
             .queue
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .push(self.id);
+            .push_back(self.id);
         if thread_token() != self.shared.owner
             && let Some(notify) = &self.shared.notify
         {
@@ -137,7 +140,7 @@ impl LocalExecutor {
     pub fn new(wake: Option<Arc<WakeHandle>>) -> Self {
         Self {
             shared: Arc::new(Shared {
-                queue: Mutex::new(Vec::new()),
+                queue: Mutex::new(VecDeque::new()),
                 owner: thread_token(),
                 notify: wake,
             }),
@@ -203,7 +206,7 @@ impl LocalExecutor {
             .queue
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .push(id);
+            .push_back(id);
     }
 
     /// Live tasks.
@@ -568,6 +571,22 @@ mod tests {
         assert_eq!(counter.get(), 1);
         assert!(executor.is_empty());
         assert_eq!(executor.run_ready(16), 0);
+    }
+
+    #[test]
+    fn budgeted_run_ready_polls_in_fifo_order() {
+        let executor = LocalExecutor::new(None);
+        let order = Rc::new(RefCell::new(Vec::new()));
+        for index in 0..5 {
+            let order = order.clone();
+            executor.spawn_detached(async move { order.borrow_mut().push(index) });
+        }
+        assert_eq!(executor.run_ready(2), 2);
+        assert_eq!(*order.borrow(), [0, 1]);
+        assert_eq!(executor.run_ready(2), 2);
+        assert_eq!(executor.run_ready(16), 1);
+        assert_eq!(*order.borrow(), [0, 1, 2, 3, 4]);
+        assert!(!executor.has_ready());
     }
 
     #[test]
