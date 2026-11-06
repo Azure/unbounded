@@ -525,11 +525,11 @@ notices:
       - Copyright 2016 The filepathx Authors
     license:
       - name: BSD 3-Clause License
-        link: https://github.com/klauspost/compress/blob/v1.20.1/LICENSE
+        link: https://github.com/klauspost/compress/blob/v1.20.2/LICENSE
       - name: Apache License, Version 2.0
-        link: https://github.com/klauspost/compress/blob/v1.20.1/LICENSE
+        link: https://github.com/klauspost/compress/blob/v1.20.2/LICENSE
       - name: MIT License
-        link: https://github.com/klauspost/compress/blob/v1.20.1/LICENSE
+        link: https://github.com/klauspost/compress/blob/v1.20.2/LICENSE
   - dependency: github.com/lib/pq
     ecosystem: go
     copyright:
@@ -749,6 +749,13 @@ notices:
     license:
       - name: BSD 3-Clause License
         link: https://go.googlesource.com/mod
+  - dependency: golang.org/x/net
+    ecosystem: go
+    copyright:
+      - Copyright 2009 The Go Authors.
+    license:
+      - name: BSD 3-Clause License
+        link: https://go.googlesource.com/net
   - dependency: golang.org/x/sync
     ecosystem: go
     copyright:
