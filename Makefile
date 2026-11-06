@@ -1123,6 +1123,7 @@ MACHINA_MANIFEST_TEMPLATES_DIR := deploy/machina
 MACHINA_MANIFEST_RENDERED_DIR  := deploy/machina/rendered
 MACHINE_OPS_NAMESPACE ?= $(UNBOUNDED_NAMESPACE)
 MACHINE_OPS_API_SERVER_ENDPOINT ?=
+MACHINE_OPS_EXPERIMENTAL_CONTAINER_ISOLATION ?= false
 MACHINE_OPS_MANIFEST_TEMPLATES_DIR := deploy/machine-ops
 MACHINE_OPS_MANIFEST_RENDERED_DIR  := deploy/machine-ops/rendered
 PLAYPEN_NAMESPACE ?= playpen
@@ -1186,7 +1187,8 @@ machine-ops-manifests: ## Render machine-ops-controller manifests into deploy/ma
 		--set ControllerImage=$(MACHINE_OPS_CONTROLLER_IMAGE) \
 		--set Provider=$(MACHINE_OPS_PROVIDER) \
 		--set Site=$(MACHINE_OPS_SITE) \
-		--set APIServerEndpoint=$(MACHINE_OPS_API_SERVER_ENDPOINT)
+		--set APIServerEndpoint=$(MACHINE_OPS_API_SERVER_ENDPOINT) \
+		--set ExperimentalContainerIsolation=$(MACHINE_OPS_EXPERIMENTAL_CONTAINER_ISOLATION)
 	@echo "Rendered machine-ops manifests into $(MACHINE_OPS_MANIFEST_RENDERED_DIR) (image: $(MACHINE_OPS_CONTROLLER_IMAGE))"
 
 playpen-manifests: ## Render playpen operator and runner manifests into deploy/playpen/rendered
