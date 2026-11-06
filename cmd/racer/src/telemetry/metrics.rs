@@ -423,6 +423,31 @@ metrics! { Event, EVENTS, EVENT_COUNT;
             Self::DirtyDiscardCanceled => "racer_dirty_discard_reasons_total" { "reason=\"canceled\"" },
             Self::DirtyDiscardRemoved => "racer_dirty_discard_reasons_total" { "reason=\"cache_removed\"" },
             Self::DirtyWriteDeferred => "racer_dirty_write_deferred_total",
+            Self::OriginWalkRank0Self => "racer_origin_walk_reasons_total" { "reason=\"rank0_self\"" },
+            Self::OriginWalkRank0Miss => "racer_origin_walk_reasons_total" { "reason=\"rank0_miss\"" },
+            Self::OriginWalkRank0Overdue => "racer_origin_walk_reasons_total" { "reason=\"rank0_overdue\"" },
+            Self::OriginWalkRank0Failed => "racer_origin_walk_reasons_total" { "reason=\"rank0_failed\"" },
+            Self::OriginWalkRank0Shed => "racer_origin_walk_reasons_total" { "reason=\"rank0_shed\"" },
+            Self::OriginWalkRank0Unreachable => "racer_origin_walk_reasons_total" { "reason=\"rank0_unreachable\"" },
+            Self::OriginWalkRank0Unusable => "racer_origin_walk_reasons_total" { "reason=\"rank0_unusable\"" },
+            Self::OriginWalkRank0Stale => "racer_origin_walk_reasons_total" { "reason=\"rank0_stale\"" },
+            Self::OriginWalkRank0NotAsked => "racer_origin_walk_reasons_total" { "reason=\"rank0_not_asked\"" },
+}
+
+/// The labeled counter for why an origin fill's walk had authority.
+pub(crate) fn origin_walk_event(reason: racer_core::read::walk::OriginReason) -> Event {
+    use racer_core::read::walk::OriginReason as R;
+    match reason {
+        R::Rank0Self => Event::OriginWalkRank0Self,
+        R::Rank0Miss => Event::OriginWalkRank0Miss,
+        R::Rank0Overdue => Event::OriginWalkRank0Overdue,
+        R::Rank0Failed => Event::OriginWalkRank0Failed,
+        R::Rank0Shed => Event::OriginWalkRank0Shed,
+        R::Rank0Unreachable => Event::OriginWalkRank0Unreachable,
+        R::Rank0Unusable => Event::OriginWalkRank0Unusable,
+        R::Rank0Stale => Event::OriginWalkRank0Stale,
+        R::Rank0NotAsked => Event::OriginWalkRank0NotAsked,
+    }
 }
 
 /// The labeled request counter for one `gpu-read` outcome.
@@ -1939,6 +1964,7 @@ mod tests {
                         && !line.starts_with("racer_rdma_plan_http_total{")
                         && !line.starts_with("racer_rdma_send_declined_total{")
                         && !line.starts_with("racer_dirty_discard_reasons_total{")
+                        && !line.starts_with("racer_origin_walk_reasons_total{")
                         && !line.starts_with("racer_prefetch_")
                 })
                 .collect();

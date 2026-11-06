@@ -1436,6 +1436,30 @@ A failed client request also counts in one of
 thread logs at most one `stage=client-request state=failed` line every 10 s
 (with the number suppressed since). `/debug/terminal` keeps the details.
 
+`racer_origin_fills_total` counts pages this node fetched from origin and published.
+`racer_origin_walk_reasons_total{reason}` splits the fills that a candidate walk authorized
+by what the walk learned from the page's rank 0 owner:
+
+| `reason` | Meaning |
+|----------|---------|
+| `rank0_self` | This node is the page's rank 0. |
+| `rank0_miss` | Rank 0 answered that it holds no copy of the page. |
+| `rank0_overdue` | Rank 0 timed out or refused for load, and has stopped answering this node, so its watch for the page is overdue. |
+| `rank0_failed` | Rank 0 answered that its own acquisition failed. |
+| `rank0_shed` | Rank 0 shed the probe with a signed `Overloaded`. |
+| `rank0_unreachable` | The exchange with rank 0 failed: no route, a connection failure, or an unsigned `Unavailable`. |
+| `rank0_unusable` | Rank 0's copy could not be used. |
+| `rank0_stale` | Rank 0 was behind this node's membership. |
+| `rank0_not_asked` | The walk never probed rank 0. |
+
+An owner above rank 0 that is refused for load while probing rank 0 leaves the
+fetch to rank 0 and retries. It asks origin itself only after rank 0 stops answering
+this node for the hang interval (half the client request timeout). A rank 0 that
+still answers other probes is busy, not down. On a cluster where every node owns
+every page, most fills on a node that is not rank 0 should be `rank0_miss`. A
+large `rank0_overdue` or `rank0_unreachable` count means pages that rank 0 may
+hold went to origin.
+
 The diagnostics listener uses port 9090 by default.
 Persist scrape configuration on workload templates or supported overrides, not only live Pods.
 

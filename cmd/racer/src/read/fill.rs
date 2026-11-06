@@ -2497,7 +2497,13 @@ impl Fill {
                         Ok(source) => {
                             match source {
                                 Source::Local => {}
-                                Source::Origin => self.metrics.record(Event::OriginFill, 1),
+                                Source::Origin => {
+                                    self.metrics.record(Event::OriginFill, 1);
+                                    if let Some(reason) = acquisition.origin_reason() {
+                                        self.metrics
+                                            .record(crate::telemetry::origin_walk_event(reason), 1);
+                                    }
+                                }
                                 Source::Hedge | Source::Peer => {
                                     self.metrics.record(Event::PeerHit, 1)
                                 }

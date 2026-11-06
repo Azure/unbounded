@@ -125,6 +125,11 @@ impl Acquisition {
         })
     }
 
+    /// Why the walk that last ended at origin had authority.
+    pub(crate) fn origin_reason(&self) -> Option<racer_core::read::walk::OriginReason> {
+        self.machine.fill().origin_reason
+    }
+
     /// The ranking the walk probes.
     pub(crate) fn candidates(&self) -> &Candidates {
         self.machine.current().expect("ranked")
@@ -1577,6 +1582,16 @@ impl CandidatePolicy {
                 health.silence_timed_out(destination, id.clone(), sent, needed);
             }
             _ => {}
+        }
+        // Any answer the destination signed, shed included, shows it alive: a page whose rank 0
+        // is the destination and was refused only for load keeps waiting on it.
+        if matches!(
+            evidence.silence,
+            Some(SilenceNote::Answered | SilenceNote::Shed)
+        ) {
+            self.rank0_watch
+                .borrow_mut()
+                .alive(destination.clone(), self.ctx.now());
         }
         // Update the rank 0 watch from this owner's page probe of rank 0: a timeout notes the page
         // with the request's deadline, an answer signed by rank 0 itself forgets it.

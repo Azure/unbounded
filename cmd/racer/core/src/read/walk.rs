@@ -383,6 +383,68 @@ pub enum Outcome {
     Failed,
 }
 
+/// Why an owner's walk gave it origin authority: what its probe of the page's rank 0 showed.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum OriginReason {
+    /// This node is the page's rank 0.
+    Rank0Self,
+    /// Rank 0 answered that it holds no copy (or not this version).
+    Rank0Miss,
+    /// Rank 0 timed out or was refused for load, and its watch is overdue.
+    Rank0Overdue,
+    /// Rank 0 answered that its own acquisition failed.
+    Rank0Failed,
+    /// Rank 0 itself shed the probe.
+    Rank0Shed,
+    /// The exchange with rank 0 failed (route, connection, or an unsigned `Unavailable`).
+    Rank0Unreachable,
+    /// Rank 0's copy could not be used.
+    Rank0Unusable,
+    /// Rank 0 was behind this node's membership.
+    Rank0Stale,
+    /// The walk never probed rank 0 (not a page walk, or the probe was consumed earlier).
+    Rank0NotAsked,
+}
+
+impl OriginReason {
+    /// The `reason` label of `racer_origin_walk_reasons_total`.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Rank0Self => "rank0_self",
+            Self::Rank0Miss => "rank0_miss",
+            Self::Rank0Overdue => "rank0_overdue",
+            Self::Rank0Failed => "rank0_failed",
+            Self::Rank0Shed => "rank0_shed",
+            Self::Rank0Unreachable => "rank0_unreachable",
+            Self::Rank0Unusable => "rank0_unusable",
+            Self::Rank0Stale => "rank0_stale",
+            Self::Rank0NotAsked => "rank0_not_asked",
+        }
+    }
+
+    /// The reason a rank 0 probe ending in `outcome` gives, before the walk normalizes it.
+    fn of(outcome: Outcome) -> Self {
+        match outcome {
+            Outcome::TimedOut
+            | Outcome::Fetching
+            | Outcome::Probe(ProbeOutcome::Overloaded)
+            | Outcome::Transport(ProbeOutcome::Overloaded) => Self::Rank0Overdue,
+            Outcome::Failed => Self::Rank0Failed,
+            Outcome::Shed => Self::Rank0Shed,
+            Outcome::Copy
+            | Outcome::Probe(ProbeOutcome::CopyMiss | ProbeOutcome::VersionUnavailable)
+            | Outcome::Transport(ProbeOutcome::CopyMiss | ProbeOutcome::VersionUnavailable) => {
+                Self::Rank0Miss
+            }
+            Outcome::Probe(ProbeOutcome::Unreachable)
+            | Outcome::Transport(ProbeOutcome::Unreachable) => Self::Rank0Unreachable,
+            Outcome::Probe(ProbeOutcome::UnusableCopy)
+            | Outcome::Transport(ProbeOutcome::UnusableCopy) => Self::Rank0Unusable,
+            Outcome::StaleMembership | Outcome::StaleDestination => Self::Rank0Stale,
+        }
+    }
+}
+
 /// How the epoch ended.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum End {
@@ -433,6 +495,8 @@ pub(crate) struct CandidateWalk {
     /// An earlier owner was busy ([`Outcome::Shed`], [`Outcome::TimedOut`],
     /// `Overloaded`), so it is likely fetching ([`shared_share_short`]).
     saw_busy: bool,
+    /// What the last probe of rank 0 showed ([`CandidateWalk::origin_reason`]).
+    rank0_seen: Option<OriginReason>,
 }
 
 /// Overflow helper state of a non-owner page walk.
@@ -502,6 +566,7 @@ impl CandidateWalk {
             helper: Helper::Unset,
             rank0_unanswered: false,
             saw_busy: false,
+            rank0_seen: None,
         }
     }
 
@@ -899,6 +964,9 @@ impl CandidateWalk {
         outcome: Outcome,
     ) -> Result<Option<End>> {
         let pending = self.pending.take().expect("no pending probe");
+        if pending.rank0 {
+            self.rank0_seen = Some(OriginReason::of(outcome));
+        }
         // A successor's or the helper's grant is dropped: the walk's budget never grows.
         if let Some(bounded) = pending.bounded
             && !pending.granted
@@ -1037,6 +1105,15 @@ impl CandidateWalk {
                 }
                 Ok(None)
             }
+        }
+    }
+
+    /// Why an [`End::Origin`] of this walk had authority.
+    pub fn origin_reason(&self) -> OriginReason {
+        match (self.config.rank, self.rank0_seen) {
+            (Some(0), _) => OriginReason::Rank0Self,
+            (_, Some(reason)) => reason,
+            (_, None) => OriginReason::Rank0NotAsked,
         }
     }
 
@@ -1740,6 +1817,8 @@ pub struct Fill {
     source: Source,
     pub funding: bool,
     pub remaining_end: Option<RemainingEnd>,
+    /// Why the last walk that ended at origin had authority.
+    pub origin_reason: Option<OriginReason>,
     /// Exchanges that failed `Overloaded` (saturated peer admission, receive
     /// memory, or a refusing route), and probes with any other outcome. A walk
     /// that ran out of candidates having only been refused for load is busy, not
@@ -1787,6 +1866,7 @@ impl Fill {
             source: Source::Peer,
             funding: false,
             remaining_end: None,
+            origin_reason: None,
             busy: 0,
             other: 0,
             out: Evidence::default(),
@@ -2548,7 +2628,9 @@ impl Fill {
 
     /// The candidate walk ended.
     fn end(&mut self, end: End) -> Result<Action> {
+        let mut reason = None;
         if let Walking::Candidates(walk) = &self.walk {
+            reason = Some(walk.origin_reason());
             self.funding = walk.funding;
             if walk.rank0_unanswered {
                 // Rank 0 has not answered this owner's probe within the attempt; the owner does not
@@ -2575,6 +2657,7 @@ impl Fill {
             }
             End::Origin { rank, evidence } => {
                 // Only a ranked owner may fetch: rank again before origin.
+                self.origin_reason = reason;
                 self.evidence = evidence;
                 self.origin_rank = rank;
                 Ok(self.rank_next(Ranking::Authority, Some(self.version)))

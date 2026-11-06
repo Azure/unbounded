@@ -1631,6 +1631,153 @@ fn rank0_route_overloads_advance_the_watch_to_origin() {
     );
 }
 
+/// A page refused only for load keeps waiting on a rank 0 that still answers other probes: the
+/// watch never turns `Overdue`, so the owner never asks origin for a page rank 0 can serve.
+#[test]
+fn rank0_overloads_never_reach_origin_while_rank0_answers() {
+    use crate::liveness::{Rank0Watch, WATCH_TTL};
+    const HANG: Duration = Duration::from_secs(10);
+    let mut watch = Rank0Watch::new(8, WATCH_TTL, HANG);
+    let (page, rank0) = (7u32, 10u32);
+    let start = Instant::now();
+    for step in 0..20u32 {
+        let now = start + Duration::from_secs(4) * step;
+        // Rank 0 serves this node's other pages.
+        watch.alive(rank0, now);
+        let state = watch.state(&page, &rank0, now);
+        assert_ne!(state, Rank0State::Overdue, "overdue at step {step}");
+        let mut f = fill(false, Features::PRODUCTION);
+        let mut b = budget(8, 32);
+        for event in [
+            START,
+            Event::Ranked(Ok(owners(5, Some(1)))),
+            Event::Ranked(Err(Error::Unavailable)),
+            Event::Hints {
+                hints: &[],
+                rank0: state,
+            },
+            Event::Reply(Reply::Answer {
+                kind: ResponseKind::Overloaded,
+                signed: false,
+            }),
+            Event::Ranked(Ok(owners(5, Some(1)))),
+        ] {
+            let (action, _) = f.on(event, &mut b, now);
+            assert!(
+                !matches!(action, Action::Origin { .. }),
+                "origin at step {step}"
+            );
+            if matches!(action, Action::Done(_)) {
+                assert_eq!(action, Action::Done(Err(Error::Overloaded)));
+                break;
+            }
+        }
+        assert_eq!(f.origin_reason, None);
+        watch.busy(page, rank0, now, now);
+    }
+    // Once rank 0 stops answering, the same load reaches origin, labeled overdue.
+    let now = start + Duration::from_secs(200);
+    watch.busy(page, rank0, now, now);
+    let now = now + HANG + Duration::from_secs(1);
+    let state = watch.state(&page, &rank0, now);
+    assert_eq!(state, Rank0State::Overdue);
+    let mut f = fill(false, Features::PRODUCTION);
+    let mut b = budget(8, 32);
+    let mut origin = false;
+    for event in [
+        START,
+        Event::Ranked(Ok(owners(5, Some(1)))),
+        Event::Ranked(Err(Error::Unavailable)),
+        Event::Hints {
+            hints: &[],
+            rank0: state,
+        },
+        Event::Reply(Reply::Answer {
+            kind: ResponseKind::Overloaded,
+            signed: false,
+        }),
+        Event::Ranked(Ok(owners(5, Some(1)))),
+    ] {
+        let (action, _) = f.on(event, &mut b, now);
+        origin |= matches!(action, Action::Origin { .. });
+    }
+    assert!(origin);
+    assert_eq!(f.origin_reason, Some(OriginReason::Rank0Overdue));
+}
+
+/// Every walk that ends at origin says what its probe of rank 0 showed.
+#[test]
+fn origin_walks_report_why_they_had_authority() {
+    let rank0 = |rank, state| WalkConfig {
+        rank0: state,
+        ..owner(rank)
+    };
+    let cases: [(WalkConfig, &[Outcome], Option<OriginReason>); 13] = [
+        (owner(0), &[], Some(OriginReason::Rank0Self)),
+        (owner(1), &[MISS], Some(OriginReason::Rank0Miss)),
+        (
+            owner(1),
+            &[Outcome::Probe(ProbeOutcome::UnusableCopy)],
+            Some(OriginReason::Rank0Unusable),
+        ),
+        (owner(1), &[SHED], Some(OriginReason::Rank0Shed)),
+        (owner(1), &[T_UNR], Some(OriginReason::Rank0Unreachable)),
+        (owner(1), &[UNR], Some(OriginReason::Rank0Unreachable)),
+        (owner(1), &[BEHIND], Some(OriginReason::Rank0Stale)),
+        (
+            rank0(1, Rank0State::Overdue),
+            &[TIMEOUT],
+            Some(OriginReason::Rank0Overdue),
+        ),
+        (
+            rank0(1, Rank0State::Overdue),
+            &[T_OVL],
+            Some(OriginReason::Rank0Overdue),
+        ),
+        (
+            rank0(1, Rank0State::Overdue),
+            &[FAILED],
+            Some(OriginReason::Rank0Failed),
+        ),
+        // Withheld: rank 0 is busy or silent within its interval; a delegated version miss ends
+        // the walk without origin.
+        (owner(1), &[VU], None),
+        (owner(1), &[OVL], None),
+        (owner(1), &[TIMEOUT], None),
+    ];
+    for (cfg, script, expected) in cases {
+        let mut walk = CandidateWalk::new(cfg);
+        let mut b = budget(8, 32);
+        let mut outcomes = script.iter().copied();
+        let (_, end) = drive(&mut walk, &mut b, |_, _| outcomes.next().unwrap_or(MISS));
+        let reason = matches!(end, End::Origin { .. }).then(|| walk.origin_reason());
+        assert_eq!(reason, expected, "{script:?} => {end:?}");
+    }
+    // A rank 2 owner reports rank 0's answer, not a later predecessor's.
+    let mut walk = CandidateWalk::new(owner(2));
+    let mut b = budget(8, 32);
+    let mut outcomes = [SHED, MISS].into_iter();
+    let (_, end) = drive(&mut walk, &mut b, |_, _| outcomes.next().unwrap());
+    assert!(matches!(end, End::Origin { rank: 2, .. }), "{end:?}");
+    assert_eq!(walk.origin_reason(), OriginReason::Rank0Shed);
+    // Labels are distinct.
+    let labels: std::collections::HashSet<_> = [
+        OriginReason::Rank0Self,
+        OriginReason::Rank0Miss,
+        OriginReason::Rank0Overdue,
+        OriginReason::Rank0Failed,
+        OriginReason::Rank0Shed,
+        OriginReason::Rank0Unreachable,
+        OriginReason::Rank0Unusable,
+        OriginReason::Rank0Stale,
+        OriginReason::Rank0NotAsked,
+    ]
+    .iter()
+    .map(|r| r.label())
+    .collect();
+    assert_eq!(labels.len(), 9);
+}
+
 /// An unsigned `Overloaded` (a relay's, or a holder's that shed the request before verifying
 /// it) asks the overflow helper next, as a signed shed does: the owner is behind a busy hop, and
 /// the helper is the way around it. A signed `Unavailable` does not.

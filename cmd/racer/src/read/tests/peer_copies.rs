@@ -2389,6 +2389,39 @@ fn assert_unpublished(f: &Fixture) {
     assert_eq!(f.crypto.outstanding(), 0);
 }
 
+/// Rank 0 signing any answer to this node shows it alive: a page this node noted busy on rank 0
+/// stays `Fetching` past its interval instead of turning `Overdue` and reaching origin.
+#[test]
+fn a_signed_rank0_answer_keeps_its_busy_pages_waiting() {
+    use racer_core::liveness::{HANG_AFTER, Rank0State};
+    let env = racer_io::Env::host();
+    let mut f = fixture(&env);
+    let (peers, ordered) = install_peers(&env, &mut f, Some(1));
+    let mut other = f.page.clone();
+    other.number = PageNumber(f.page.number.0 + 1);
+    let earlier = racer_io::Clock::host().now() - HANG_AFTER - Duration::from_secs(1);
+    f.fill
+        .dependencies
+        .candidates
+        .rank0_watch
+        .borrow_mut()
+        .busy(other.clone(), ordered[0].clone(), earlier, earlier);
+    let state = |f: &Fixture| {
+        f.fill.dependencies.candidates.rank0_watch.borrow().state(
+            &other,
+            &ordered[0],
+            racer_io::Clock::host().now(),
+        )
+    };
+    assert_eq!(state(&f), Rank0State::Overdue);
+    // Rank 0 answers this page's probe with a miss: this owner fetches it, and rank 0 is alive.
+    peers.reply(&ordered[0], Reply::Miss);
+    let mut budget = AcquisitionBudget::new(f.scope.deadline.0, 8, 16);
+    acquire(&mut f, &mut budget).unwrap();
+    assert_eq!(f.fill.metrics.count(Event::OriginWalkRank0Miss), 1);
+    assert_eq!(state(&f), Rank0State::Fetching);
+}
+
 #[test]
 fn unusable_peer_copy_advances_to_alternate_or_authorized_origin() {
     let env = racer_io::Env::host();
@@ -2414,6 +2447,12 @@ fn unusable_peer_copy_advances_to_alternate_or_authorized_origin() {
                 u64::from(use_origin)
             );
             assert_eq!(f.fill.metrics.count(Event::PeerHit), u64::from(!use_origin));
+            // Rank 0's unusable copy is why the walk reached origin.
+            assert_eq!(
+                f.fill.metrics.count(Event::OriginWalkRank0Unusable),
+                u64::from(use_origin)
+            );
+            assert_eq!(f.fill.metrics.count(Event::OriginWalkRank0Miss), 0);
             assert_eq!(
                 f.fill.metrics.count(Event::FillDecryptPeerCorrupt),
                 if missing_key {
