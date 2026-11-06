@@ -483,8 +483,11 @@ func VerifyDaemonInstalled(ctx context.Context, log *slog.Logger) error {
 
 // RepairDaemon requires the caller's installation lock. It uses current applied
 // configuration, never the original bootstrap input that may name a retired slot.
-func RepairDaemon(ctx context.Context, log *slog.Logger) error {
-	if _, err := (hostOperator{}).FindActiveMachine(log); err != nil {
+// backends is the backend of every isolation mode this agent can operate, from
+// the agent's mode composition table: with two applied configs, the daemon asks
+// them which node stack runs, and so does the repair.
+func RepairDaemon(ctx context.Context, log *slog.Logger, backends ModeBackends) error {
+	if _, err := newHostOperator(backends).settleActiveMachine(log); err != nil {
 		return err
 	}
 
