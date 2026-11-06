@@ -319,8 +319,9 @@ pub struct ConnectionLease<C: Context> {
     /// Kernel TLS receive state; `Some` once the socket carries kernel TLS.
     kernel_tls: Option<Box<crate::tls::ControlRecords>>,
 
-    /// Userspace TLS relay and its buffer charge; dropped after the socket.
-    relay: Option<crate::tls::Relay<C::Charge>>,
+    /// Userspace TLS record layer; `Some` once the socket carries ciphertext
+    /// that this process encrypts and decrypts.
+    userspace_tls: Option<Box<crate::tls::Userspace<C>>>,
 }
 
 /// A head result and the connection and decoded-storage charge it retains.
@@ -381,7 +382,7 @@ pub struct RequestHead {
 
 /// Fixed admitted storage, zeroized before release or single-buffer reuse.
 pub struct OwnedBuffer<C: Context> {
-    bytes: Vec<u8>,
+    pub(crate) bytes: Vec<u8>,
 
     reservation: Option<C::Charge>,
 
@@ -952,6 +953,9 @@ where {
         scope: &C::Scope,
     ) -> Result<C, Completion<B, ConnectionLease<C>>>
 where {
+        if connection.userspace_tls.is_some() {
+            return self.recv_userspace(connection, buffer, scope).await;
+        }
         if connection.kernel_tls.is_none() {
             return self
                 .reactor
@@ -1250,7 +1254,7 @@ impl<C: Context> ConnectionLease<C> {
             request_is_head: false,
             close: false,
             kernel_tls: None,
-            relay: None,
+            userspace_tls: None,
         }
     }
 
@@ -1271,14 +1275,43 @@ impl<C: Context> ConnectionLease<C> {
         self.kernel_tls = Some(Box::default());
     }
 
-    /// Swap in the plaintext end of a userspace TLS relay.
+    /// Whether this connection's record layer is userspace TLS. Such a socket
+    /// carries ciphertext: only [`HttpIo`] operations may read or write it.
+    pub fn is_userspace_tls(&self) -> bool {
+        self.userspace_tls.is_some()
+    }
+
+    /// Swap in a fresh socket for a reconnect.
     pub(crate) fn replace_socket(&mut self, fd: Rc<Descriptor>) {
         self.fd = fd;
     }
 
-    /// Retain a userspace TLS relay and its buffer charge with this connection.
-    pub(crate) fn attach_relay(&mut self, relay: crate::tls::Relay<C::Charge>) {
-        self.relay = Some(relay);
+    /// Retain a userspace TLS record layer with this connection.
+    pub(crate) fn attach_userspace_tls(&mut self, tls: Box<crate::tls::Userspace<C>>) {
+        self.userspace_tls = Some(tls);
+    }
+
+    /// Receive already available plaintext without waiting, like a
+    /// nonblocking `recv`: `Ok(0)` is end of stream and `WouldBlock` means
+    /// nothing is queued. Userspace TLS decrypts any ciphertext the socket
+    /// holds; non-application records are consumed.
+    pub(crate) fn try_receive_plain(&mut self, out: &mut [u8]) -> std::io::Result<usize> {
+        let Some(tls) = self.userspace_tls.as_mut() else {
+            return self.fd.try_recv(out);
+        };
+        loop {
+            match tls.read_plain(out) {
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => (),
+                result => return result,
+            }
+            let rx = tls.rx_mut().ok_or(std::io::ErrorKind::BrokenPipe)?;
+            let received = self.fd.try_recv(rx)?;
+            if received == 0 {
+                return Ok(0);
+            }
+            let rx = tls.take_rx().ok_or(std::io::ErrorKind::BrokenPipe)?;
+            tls.restore_rx(rx, received);
+        }
     }
 
     /// Borrow the connection's live policy.
@@ -1456,7 +1489,7 @@ impl<C: Context> Drop for ConnectionLease<C> {
                     reservation,
                     since: now,
                     kernel_tls: self.kernel_tls.take(),
-                    relay: self.relay.take(),
+                    userspace_tls: self.userspace_tls.take(),
                 })
         } else {
             None
@@ -1795,7 +1828,7 @@ impl<C: Context> HttpPool<C> {
             let mut lease =
                 ConnectionLease::new(idle.fd, idle.reservation, idle.state, slot.0.take());
             lease.kernel_tls = idle.kernel_tls;
-            lease.relay = idle.relay;
+            lease.userspace_tls = idle.userspace_tls;
             lease.reused = true;
             return Ok((lease, None));
         }
@@ -2060,7 +2093,7 @@ struct Idle<C: Context> {
 
     kernel_tls: Option<Box<crate::tls::ControlRecords>>,
 
-    relay: Option<crate::tls::Relay<C::Charge>>,
+    userspace_tls: Option<Box<crate::tls::Userspace<C>>>,
 }
 
 /// Active and idle connections belonging to one endpoint generation.
@@ -2240,6 +2273,11 @@ impl<C: Context> HttpIo<C> {
         view: impl Fn(B, Range<usize>) -> Result<C, SendRange<B>>,
     ) -> Result<C, Completion<B, ConnectionLease<C>>>
 where {
+        if connection.userspace_tls.is_some() {
+            return self
+                .send_userspace(connection, buffer, range, scope, view)
+                .await;
+        }
         let mut offset = range.start;
         while offset < range.end {
             let completed = self
@@ -2263,6 +2301,154 @@ where {
             bytes: range.len(),
             lease: connection,
         })
+    }
+}
+
+impl<C: Context> HttpIo<C> {
+    /// Receive plaintext through the connection's userspace record layer.
+    /// Ciphertext arrives through ordinary reactor receives into the
+    /// connection's buffer and is decrypted into `buffer`. A TCP end of stream
+    /// reports zero bytes, as a plain socket would.
+    async fn recv_userspace<B: IoBuffer>(
+        &self,
+        mut connection: ConnectionLease<C>,
+        mut buffer: B,
+        scope: &C::Scope,
+    ) -> Result<C, Completion<B, ConnectionLease<C>>> {
+        loop {
+            // Decrypt what is buffered and what the socket already holds
+            // before waiting on the reactor.
+            match connection.try_receive_plain(buffer.bytes_mut()?) {
+                Ok(bytes) => {
+                    return Ok(Completion {
+                        buffer,
+                        bytes,
+                        lease: connection,
+                    });
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => (),
+                Err(e) => {
+                    connection.poison();
+                    return Err(if e.kind() == std::io::ErrorKind::InvalidData {
+                        racer_io::Error::Os(libc::EPROTO)
+                    } else {
+                        racer_io::Error::Io
+                    }
+                    .into());
+                }
+            }
+            let tls = connection.userspace_tls.as_mut().expect("userspace TLS");
+            if tls.wants_write() {
+                // For example a KeyUpdate acknowledgment.
+                connection = self.flush_userspace(connection, scope).await?;
+            }
+            let tls = connection.userspace_tls.as_mut().expect("userspace TLS");
+            let rx = tls.take_rx().ok_or(racer_io::Error::Io)?;
+            let completed = self
+                .reactor
+                .recv(connection.socket(), rx, connection, scope)
+                .await?;
+            connection = completed.lease;
+            let tls = connection.userspace_tls.as_mut().expect("userspace TLS");
+            tls.restore_rx(completed.buffer, completed.bytes);
+            if completed.bytes == 0 {
+                // A TCP end of stream without close_notify; report it as a
+                // plain socket would.
+                return Ok(Completion {
+                    buffer,
+                    bytes: 0,
+                    lease: connection,
+                });
+            }
+        }
+    }
+
+    /// Encrypt and send the range through the userspace record layer.
+    async fn send_userspace<B: SendBuffer>(
+        &self,
+        mut connection: ConnectionLease<C>,
+        mut buffer: B,
+        range: Range<usize>,
+        scope: &C::Scope,
+        view: impl Fn(B, Range<usize>) -> Result<C, SendRange<B>>,
+    ) -> Result<C, Completion<B, ConnectionLease<C>>> {
+        let mut offset = range.start;
+        while offset < range.end {
+            let checked = view(buffer, offset..range.end)?;
+            let tls = connection.userspace_tls.as_mut().expect("userspace TLS");
+            let accepted = tls
+                .write_plain(checked.send_bytes()?)
+                .map_err(|_| racer_io::Error::Io)?;
+            buffer = checked.buffer;
+            if accepted == 0 || accepted > range.end - offset {
+                return Err(racer_io::Error::Io.into());
+            }
+            connection = self.flush_userspace(connection, scope).await?;
+            offset += accepted;
+        }
+        Ok(Completion {
+            buffer,
+            bytes: range.len(),
+            lease: connection,
+        })
+    }
+
+    /// Send all queued ciphertext through ordinary reactor sends.
+    async fn flush_userspace(
+        &self,
+        mut connection: ConnectionLease<C>,
+        scope: &C::Scope,
+    ) -> Result<C, ConnectionLease<C>> {
+        loop {
+            let tls = connection.userspace_tls.as_mut().expect("userspace TLS");
+            if !tls.wants_write() {
+                return Ok(connection);
+            }
+            let (mut tx, used) = tls.take_tx().map_err(|_| racer_io::Error::Io)?;
+            if used == 0 {
+                return Err(racer_io::Error::Io.into());
+            }
+            let mut sent = 0;
+            while sent < used {
+                // Send synchronously while the socket accepts; wait on the
+                // reactor only under backpressure.
+                match connection.fd.try_send(&tx.bytes[sent..used]) {
+                    Ok(0) => return Err(racer_io::Error::Io.into()),
+                    Ok(n) => {
+                        sent += n;
+                        continue;
+                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => (),
+                    Err(_) => return Err(racer_io::Error::Io.into()),
+                }
+                let range = BufferRange::new::<C::Error>(tx, sent..used)?;
+                let completed = self
+                    .reactor
+                    .send(connection.socket(), range, connection, scope)
+                    .await?;
+                if completed.bytes == 0 || completed.bytes > used - sent {
+                    return Err(racer_io::Error::Io.into());
+                }
+                sent += completed.bytes;
+                tx = completed.buffer.into_inner();
+                connection = completed.lease;
+            }
+            let tls = connection.userspace_tls.as_mut().expect("userspace TLS");
+            tls.restore_tx(tx);
+        }
+    }
+
+    /// Plaintext send for callers outside the framed body paths (small
+    /// exchanges), honoring the connection's record layer.
+    pub(crate) async fn send_plain<B: SendBuffer>(
+        &self,
+        connection: ConnectionLease<C>,
+        buffer: B,
+        range: Range<usize>,
+        scope: &C::Scope,
+    ) -> Result<C, Completion<B, ConnectionLease<C>>> {
+        self.send_owned(connection, buffer, range, scope, SendRange::checked)
+            .await
     }
 }
 

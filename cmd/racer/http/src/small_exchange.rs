@@ -4,7 +4,7 @@
 //! connection, then receives one response whose head the caller parses and
 //! whose body is decoded by [`racer_wire::http::small`] (fixed-length, chunked,
 //! or close-delimited) into a capped, zeroizing buffer. It works the same over
-//! plain TCP, kernel TLS, and the userspace TLS relay.
+//! plain TCP, kernel TLS, and userspace TLS.
 //!
 //! The caller owns head policy: it receives the accumulated plaintext and
 //! returns `None` until a complete head is present, then the framing, decoder
@@ -151,7 +151,7 @@ impl<C: Context> HttpIo<C> {
                 // Plaintext already queued past the framed body is pipelining
                 // even when it arrived in a later record than the body.
                 let mut probe = [0u8; 1];
-                match connection.socket().try_recv(&mut probe) {
+                match connection.try_receive_plain(&mut probe) {
                     Ok(0) => connection.poison(),
                     Ok(_) => {
                         probe.zeroize();
@@ -187,23 +187,10 @@ impl<C: Context> HttpIo<C> {
             return Ok(connection);
         }
         let buffer = OwnedBuffer::copy_from(self.context(), request)?;
-        let mut connection = connection;
-        let mut offset = 0;
-        let mut buffer = buffer;
-        while offset < request.len() {
-            let range = BufferRange::new::<C::Error>(buffer, offset..request.len())?;
-            let completed = self
-                .reactor()
-                .send(connection.socket(), range, connection, scope)
-                .await?;
-            if completed.bytes == 0 || completed.bytes > request.len() - offset {
-                return Err(racer_io::Error::Io.into());
-            }
-            offset += completed.bytes;
-            buffer = completed.buffer.into_inner();
-            connection = completed.lease;
-        }
-        Ok(connection)
+        let completed = self
+            .send_plain(connection, buffer, 0..request.len(), scope)
+            .await?;
+        Ok(completed.lease)
     }
 
     /// Append one received fragment; zero bytes means the peer closed.

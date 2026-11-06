@@ -46,9 +46,12 @@ handshake and then move the record layer into the kernel (kernel TLS, the `tls`
 module) so response bodies are decrypted directly into page buffers. Kernel TLS is
 optional: if `setsockopt(TCP_ULP, "tls")` fails, for example because the module is
 not loaded and cannot be autoloaded from the container, Racer logs
-`racer: kernel TLS unavailable (...); using userspace TLS` once and uses a
-userspace rustls relay instead, which costs more CPU per byte. To get kernel TLS,
-load the module on the node (`modprobe tls`) or list it in `/etc/modules-load.d`.
+`racer: kernel TLS unavailable (...); using userspace TLS` once and encrypts and
+decrypts with rustls on the worker's own reactor instead, which costs more CPU per
+byte but no extra threads. A missing module is remembered per origin endpoint; an
+`EPERM` from a security policy is retried on each new connection. To get kernel
+TLS, load the module on the node (`modprobe tls`) or list it in
+`/etc/modules-load.d`.
 
 - `RACER_ORIGIN_TRUST_BUNDLE`: PEM trust roots for origin and token endpoint
   HTTPS. Defaults to `/etc/ssl/certs/ca-certificates.crt`, which the Racer image

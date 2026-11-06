@@ -129,6 +129,10 @@ pub mod delivery {
         O: DirectOwner<C>,
         H: Observer<C>,
     {
+        if connection.is_userspace_tls() {
+            // The socket carries ciphertext; raw sends would bypass TLS.
+            return Err(racer_io::Error::Unavailable.into());
+        }
         let mut stalled_at = reactor.ctx().clock.now();
         let mut budget = 0;
         let mut calls = 0;
@@ -194,6 +198,10 @@ pub mod delivery {
         O: Owner<C>,
         H: Observer<C>,
     {
+        if connection.is_userspace_tls() {
+            // The socket carries ciphertext; raw sends would bypass TLS.
+            return Err(racer_io::Error::Unavailable.into());
+        }
         let mut stalled_at = reactor.ctx().clock.now();
         let mut copying = false;
         let mut budget = 0;
@@ -1096,6 +1104,11 @@ pub mod relay {
                 || source.receive_remaining() != destination.send_remaining()
             {
                 return Err(crate::Error::Malformed.into());
+            }
+            // Userspace TLS sockets carry ciphertext; splicing or copying
+            // their raw bytes would bypass the record layer.
+            if source.is_userspace_tls() || destination.is_userspace_tls() {
+                return Err(racer_io::Error::Unavailable.into());
             }
             Ok(Self {
                 source,

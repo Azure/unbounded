@@ -1,4 +1,4 @@
-//! Pooled HTTPS exchanges through kernel TLS and the userspace relay.
+//! Pooled HTTPS exchanges through kernel TLS and userspace TLS.
 use flow_control::{Charge, Policy, Quotas, Rejection};
 use http1::connection::{self, Context as HttpContext, Endpoint as EndpointPolicy, PoolConfig};
 use http1::tls::{TlsClient, TlsMode, rustls};
@@ -730,15 +730,15 @@ fn cancelled_fallback_reconnect_releases_connection() {
     assert_eq!(fixture.admission.used(Resource::Context), 0);
 }
 
-/// A budget that admits the handshake but not the relay buffers rejects the
+/// A budget that admits the handshake but not the userspace TLS buffers rejects the
 /// userspace connect and leaks neither the charge nor the slot.
 #[test]
-fn userspace_relay_over_budget_is_rejected() {
+fn userspace_tls_over_budget_is_rejected() {
     let identity = identity(&["localhost"]);
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let address = listener.local_addr().unwrap();
     let (server, accepted) = serve(listener, Some(&identity), false, 1);
-    let fixture = fixture_with(http1::tls::RELAY_ALLOCATION - 1);
+    let fixture = fixture_with(http1::tls::USERSPACE_ALLOCATION - 1);
     let endpoint = tls_endpoint(&identity, address, TlsMode::Userspace);
     let scope = scope();
     let result = drive(&fixture.reactor, fixture.pool.checkout(&endpoint, &scope));
@@ -751,10 +751,10 @@ fn userspace_relay_over_budget_is_rejected() {
     server.join().unwrap();
 }
 
-/// The relay charge stays held while the connection idles in the pool and is
-/// released once the pool closes it and the relay thread exits.
+/// The userspace TLS charge stays held while the connection idles in the pool and is
+/// released once the pool closes it and drops the session.
 #[test]
-fn userspace_relay_charge_spans_idle_connection() {
+fn userspace_tls_charge_spans_idle_connection() {
     let identity = identity(&["localhost"]);
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let address = listener.local_addr().unwrap();
@@ -771,18 +771,18 @@ fn userspace_relay_charge_spans_idle_connection() {
             .iter()
             .any(|(key, counts)| *key == endpoint && *counts == (0, 1))
     );
-    assert!(fixture.admission.used(Resource::Context) >= http1::tls::RELAY_ALLOCATION);
+    assert!(fixture.admission.used(Resource::Context) >= http1::tls::USERSPACE_ALLOCATION);
     fixture.pool.close();
     // Only the I/O helper's cached head buffer may remain charged.
-    assert!(fixture.admission.used(Resource::Context) < http1::tls::RELAY_ALLOCATION);
+    assert!(fixture.admission.used(Resource::Context) < http1::tls::USERSPACE_ALLOCATION);
     drop(fixture);
     server.join().unwrap();
 }
 
-/// Cancelling an exchange on a userspace connection releases the relay charge
+/// Cancelling an exchange on a userspace connection releases the userspace TLS charge
 /// once the connection is dropped.
 #[test]
-fn cancelled_userspace_exchange_releases_relay_charge() {
+fn cancelled_userspace_exchange_releases_tls_charge() {
     let identity = identity(&["localhost"]);
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let address = listener.local_addr().unwrap();
@@ -791,7 +791,7 @@ fn cancelled_userspace_exchange_releases_relay_charge() {
     let endpoint = tls_endpoint(&identity, address, TlsMode::Userspace);
     let scope = scope();
     let connection = drive(&fixture.reactor, fixture.pool.checkout(&endpoint, &scope)).unwrap();
-    assert!(fixture.admission.used(Resource::Context) >= http1::tls::RELAY_ALLOCATION);
+    assert!(fixture.admission.used(Resource::Context) >= http1::tls::USERSPACE_ALLOCATION);
     // No request was sent, so the head receive stalls until cancelled.
     let result = {
         let receive = fixture.io.receive_head(connection, &scope);
@@ -812,7 +812,7 @@ fn cancelled_userspace_exchange_releases_relay_charge() {
     drive(&fixture.reactor, fixture.reactor.drain()).unwrap();
     assert_released(&fixture, &endpoint);
     // Only the I/O helper's cached head buffer may remain charged.
-    assert!(fixture.admission.used(Resource::Context) < http1::tls::RELAY_ALLOCATION);
+    assert!(fixture.admission.used(Resource::Context) < http1::tls::USERSPACE_ALLOCATION);
     drop(fixture);
     server.join().unwrap();
 }
@@ -1064,4 +1064,123 @@ fn userspace_tls_throughput() {
     fixture.pool.close();
     drop(fixture);
     server.join().unwrap();
+}
+
+/// Open and discard one fresh connection, reporting whether it used kernel TLS.
+fn connect_once(fixture: &Fixture, endpoint: &Endpoint) -> bool {
+    let scope = scope();
+    let mut connection = drive(&fixture.reactor, fixture.pool.checkout(endpoint, &scope)).unwrap();
+    let kernel = connection.is_kernel_tls();
+    assert_eq!(connection.is_userspace_tls(), !kernel);
+    connection.poison();
+    drop(connection);
+    kernel
+}
+
+/// A permanent ULP failure (module absent) stops kernel TLS attempts for that
+/// endpoint only; a policy failure (EPERM) is retried on every connection.
+#[test]
+fn kernel_unavailable_is_remembered_per_endpoint_and_not_for_eperm() {
+    let identity = identity(&["localhost"]);
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    let (server, accepted) = serve(listener, Some(&identity), false, 5);
+    let fixture = fixture();
+
+    let eperm = tls_endpoint(&identity, address, TlsMode::Auto);
+    http1::tls::fail_next_ulp_attaches(2, libc::EPERM);
+    assert!(!connect_once(&fixture, &eperm));
+    assert!(!connect_once(&fixture, &eperm));
+    assert_eq!(
+        http1::tls::pending_ulp_failures(),
+        0,
+        "EPERM is retried on the next connection"
+    );
+
+    let absent = tls_endpoint(&identity, address, TlsMode::Auto);
+    http1::tls::fail_next_ulp_attaches(2, libc::ENOENT);
+    assert!(!connect_once(&fixture, &absent));
+    assert!(!connect_once(&fixture, &absent));
+    assert_eq!(
+        http1::tls::pending_ulp_failures(),
+        1,
+        "the endpoint skips kernel TLS after ENOENT"
+    );
+
+    // A different endpoint still tries kernel TLS.
+    let other = tls_endpoint(&identity, address, TlsMode::Auto);
+    assert!(!connect_once(&fixture, &other));
+    assert_eq!(http1::tls::pending_ulp_failures(), 0);
+    http1::tls::fail_next_ulp_attaches(0, 0);
+
+    drive(&fixture.reactor, fixture.reactor.drain()).unwrap();
+    fixture.pool.close();
+    drop(fixture);
+    server.join().unwrap();
+    assert_eq!(accepted.load(Ordering::SeqCst), 5);
+}
+
+/// A TLS 1.3 KeyUpdate from the server mid-response is handled by userspace
+/// TLS: the client answers with its own KeyUpdate and the connection stays
+/// usable for the next request.
+#[test]
+fn userspace_tls_handles_server_key_update() {
+    let identity = identity(&["localhost"]);
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    let config = Arc::new(
+        rustls::ServerConfig::builder_with_protocol_versions(&[&rustls::version::TLS13])
+            .with_no_client_auth()
+            .with_single_cert(identity.chain.clone(), identity.key.clone_key())
+            .unwrap(),
+    );
+    let server = std::thread::spawn(move || {
+        let body: Vec<u8> = (0..PAGE * 2).map(pattern).collect();
+        let (tcp, _) = listener.accept().unwrap();
+        let session = rustls::ServerConnection::new(config).unwrap();
+        let mut stream = rustls::StreamOwned::new(session, tcp);
+        let mut served = 0;
+        loop {
+            let mut head = Vec::new();
+            let mut byte = [0];
+            while !head.ends_with(b"\r\n\r\n") {
+                match stream.read(&mut byte) {
+                    Ok(1) => head.push(byte[0]),
+                    _ => return served,
+                }
+            }
+            let text = String::from_utf8(head).unwrap();
+            let (a, b) = text
+                .lines()
+                .find_map(|l| l.strip_prefix("Range: bytes="))
+                .unwrap()
+                .split_once('-')
+                .unwrap();
+            let range = a.parse::<usize>().unwrap()..b.parse::<usize>().unwrap() + 1;
+            let response = format!(
+                "HTTP/1.1 206 Partial Content\r\nContent-Length: {}\r\nContent-Range: bytes {}-{}/{}\r\nETag: \"0x1\"\r\nx-ms-blob-type: BlockBlob\r\n\r\n",
+                range.len(),
+                range.start,
+                range.end - 1,
+                body.len()
+            );
+            stream.write_all(response.as_bytes()).unwrap();
+            let middle = range.start + range.len() / 2;
+            stream.write_all(&body[range.start..middle]).unwrap();
+            stream.conn.refresh_traffic_keys().unwrap();
+            stream.write_all(&body[middle..range.end]).unwrap();
+            stream.flush().unwrap();
+            served += 1;
+        }
+    });
+    let fixture = fixture();
+    let endpoint = tls_endpoint(&identity, address, TlsMode::Userspace);
+    assert!(!fetch_pages(&fixture, &endpoint, 3).unwrap());
+    fixture.pool.close();
+    drop(fixture);
+    assert_eq!(
+        server.join().unwrap(),
+        3,
+        "one connection served every page"
+    );
 }

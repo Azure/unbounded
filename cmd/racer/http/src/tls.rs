@@ -10,11 +10,14 @@
 //!   control buffer so TLS 1.3 post-handshake records (NewSessionTicket) are
 //!   reported instead of failing with `EIO`; tickets are discarded and any other
 //!   handshake message (KeyUpdate) or alert closes the connection.
-//! - Userspace fallback: if the kernel `tls` module is unavailable, a relay
-//!   thread owns the TCP socket and a rustls session and exchanges plaintext
-//!   with the pooled connection over a Unix socket pair. This costs extra
-//!   copies and a thread per connection, so it exists for correctness only.
-//!   In Auto mode, if the kernel rejects the negotiated keys after the socket
+//! - Userspace fallback: if the kernel `tls` module is unavailable, the
+//!   connection keeps its rustls session and the TCP socket carries
+//!   ciphertext. Receives and sends go through the same reactor operations as
+//!   plain TCP on per-connection ciphertext buffers, and rustls encrypts and
+//!   decrypts in the calling task: no thread, socket pair, or blocking wait.
+//!   An Auto mode endpoint whose `tls` ULP attach fails with `ENOENT`,
+//!   `EOPNOTSUPP`, or `ENOPROTOOPT` stops trying kernel TLS; other errors
+//!   (for example `EPERM`) are retried per connection. In Auto mode, if the kernel rejects the negotiated keys after the socket
 //!   switched to the `tls` ULP, the socket is closed and the connection is
 //!   redone on a fresh socket with userspace TLS; the endpoint then skips
 //!   kernel TLS for that cipher suite. Kernel mode fails instead.
@@ -28,7 +31,7 @@
 //! [`stats`] reports how many connections used each path, and the first use of
 //! each path is logged once to standard error.
 
-use crate::connection::{ConnectionLease, Context};
+use crate::connection::{ConnectionLease, Context, OwnedBuffer};
 use racer_io::{Scope as _, ring::Descriptor};
 use rustls::{
     ClientConfig, ClientConnection, ConnectionTrafficSecrets, ProtocolVersion, RootCertStore,
@@ -36,9 +39,9 @@ use rustls::{
 };
 use std::{
     io::{Read, Write},
-    os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd},
+    ops::Range,
+    os::fd::{AsRawFd, RawFd},
     path::Path,
-    rc::Rc,
     sync::{
         Arc,
         atomic::{AtomicBool, AtomicU64, Ordering},
@@ -72,14 +75,14 @@ const TLS_CIPHER_CHACHA20_POLY1305: u16 = 54;
 /// How a connection's record layer is placed.
 #[derive(Clone, Copy, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub enum TlsMode {
-    /// Kernel TLS when available, otherwise the userspace relay.
+    /// Kernel TLS when available, otherwise userspace TLS.
     #[default]
     Auto,
 
     /// Kernel TLS only; connections fail if it cannot be enabled.
     Kernel,
 
-    /// Always use the userspace relay.
+    /// Always use userspace TLS.
     Userspace,
 }
 
@@ -96,6 +99,12 @@ pub struct TlsClient {
     /// configured cipher suite; Auto mode then uses userspace TLS directly.
     /// Shared by clones so one endpoint learns once.
     rejected_suites: Arc<AtomicU64>,
+
+    /// Set once attaching the `tls` ULP failed in a way that will not change
+    /// (module absent or ULP unsupported). Per endpoint rather than per process
+    /// so one failure cannot disable kernel TLS for unrelated endpoints, and
+    /// shared by clones so the endpoint learns once.
+    kernel_unavailable: Arc<AtomicBool>,
 }
 
 impl std::fmt::Debug for TlsClient {
@@ -118,6 +127,7 @@ impl TlsClient {
             name,
             mode: TlsMode::Auto,
             rejected_suites: Arc::default(),
+            kernel_unavailable: Arc::default(),
         })
     }
 
@@ -224,7 +234,7 @@ pub struct TlsStats {
     /// Connections established with kernel TLS.
     pub kernel: u64,
 
-    /// Connections established with the userspace relay.
+    /// Connections established with userspace TLS.
     pub userspace: u64,
 
     /// Connections whose kernel TLS setup failed.
@@ -240,8 +250,6 @@ static KERNEL_FAILURES: AtomicU64 = AtomicU64::new(0);
 static TICKETS: AtomicU64 = AtomicU64::new(0);
 static KERNEL_LOGGED: AtomicBool = AtomicBool::new(false);
 static USERSPACE_LOGGED: AtomicBool = AtomicBool::new(false);
-/// Set once kernel TLS failed in a way that will not change (module absent).
-static KERNEL_UNAVAILABLE: AtomicBool = AtomicBool::new(false);
 
 /// Snapshot the process-wide record-layer counters.
 pub fn stats() -> TlsStats {
@@ -275,6 +283,19 @@ pub(crate) enum Established<C: Context> {
 #[cfg(any(test, feature = "test-util"))]
 thread_local! {
     static FAIL_KEY_INSTALL: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+    static FAIL_ULP: std::cell::Cell<(u32, i32)> = const { std::cell::Cell::new((0, 0)) };
+}
+
+/// Make the next `count` `tls` ULP attaches on this thread fail with `errno`.
+#[cfg(feature = "test-util")]
+pub fn fail_next_ulp_attaches(count: u32, errno: i32) {
+    FAIL_ULP.with(|c| c.set((count, errno)));
+}
+
+/// Injected ULP attach failures not yet consumed on this thread.
+#[cfg(feature = "test-util")]
+pub fn pending_ulp_failures() -> u32 {
+    FAIL_ULP.with(|c| c.get().0)
 }
 
 /// Make the next `count` kernel TLS key installations on this thread fail with
@@ -297,7 +318,7 @@ fn suite_bit(tls: &TlsClient, session: &ClientConnection) -> Option<u64> {
 }
 
 /// Complete the handshake on a freshly connected lease and place its record
-/// layer. `userspace` forces the userspace relay regardless of mode.
+/// layer. `userspace` forces userspace TLS regardless of mode.
 pub(crate) async fn establish<C: Context>(
     reactor: &C::Reactor,
     context: &C,
@@ -355,7 +376,7 @@ pub(crate) async fn establish<C: Context>(
         TlsMode::Userspace => false,
         TlsMode::Kernel => true,
         TlsMode::Auto => {
-            !KERNEL_UNAVAILABLE.load(Ordering::Relaxed)
+            !tls.kernel_unavailable.load(Ordering::Relaxed)
                 && suite.is_none_or(|bit| tls.rejected_suites.load(Ordering::Relaxed) & bit == 0)
         }
     };
@@ -369,9 +390,13 @@ pub(crate) async fn establish<C: Context>(
             }
             if matches!(
                 error.raw_os_error(),
-                Some(libc::ENOENT | libc::EOPNOTSUPP | libc::ENOPROTOOPT | libc::EPERM)
+                Some(libc::ENOENT | libc::EOPNOTSUPP | libc::ENOPROTOOPT)
             ) {
-                KERNEL_UNAVAILABLE.store(true, Ordering::Relaxed);
+                // The module is missing or the kernel lacks the ULP. Remember
+                // it for this endpoint only. EPERM (a seccomp or LSM policy,
+                // possibly temporary) is not remembered: each new connection
+                // retries, which costs one failed setsockopt.
+                tls.kernel_unavailable.store(true, Ordering::Relaxed);
             }
             log_once(
                 &USERSPACE_LOGGED,
@@ -439,13 +464,9 @@ pub(crate) async fn establish<C: Context>(
             return Ok(Established::Ready(connection));
         }
     }
-    // The relay's queue and scratch are payload copies outside `HttpIo`
-    // buffers; admit them before spawning so they count against the budget.
-    let charge = context.charge(RELAY_ALLOCATION)?;
-    let (app, relay) =
-        spawn_relay(session, &connection.socket(), charge).map_err(racer_io::Error::from_io)?;
-    connection.replace_socket(Rc::new(app));
-    connection.attach_relay(relay);
+    // The userspace record layer's buffers are payload copies outside
+    // `HttpIo` buffers; admit them so they count against the budget.
+    connection.attach_userspace_tls(Box::new(Userspace::new(session, context)?));
     USERSPACE.fetch_add(1, Ordering::Relaxed);
     log_once(&USERSPACE_LOGGED, "racer: origin HTTPS uses userspace TLS");
     Ok(Established::Ready(connection))
@@ -476,6 +497,16 @@ fn log_once(flag: &AtomicBool, message: &str) {
 }
 
 fn set_ulp(fd: RawFd) -> std::io::Result<()> {
+    #[cfg(any(test, feature = "test-util"))]
+    if let Some(errno) = FAIL_ULP.with(|c| {
+        let (count, errno) = c.get();
+        (count > 0).then(|| {
+            c.set((count - 1, errno));
+            errno
+        })
+    }) {
+        return Err(std::io::Error::from_raw_os_error(errno));
+    }
     // SAFETY: setsockopt reads the three-byte name.
     let result = unsafe { libc::setsockopt(fd, SOL_TCP, TCP_ULP, b"tls".as_ptr().cast(), 3) };
     if result < 0 {
@@ -703,201 +734,135 @@ impl ControlRecords {
     }
 }
 
-/// Decrypted plaintext queued toward the pool end of the relay.
-const RELAY_QUEUE: usize = 256 * 1024;
+/// Bytes of each per-connection ciphertext buffer (receive and send).
+const USERSPACE_BUFFER: usize = 64 * 1024;
 
-/// Scratch for one read from either side of the relay.
-const RELAY_SCRATCH: usize = 64 * 1024;
+/// Estimated rustls session storage: the record deframer, the received
+/// plaintext queue, and the pending ciphertext queue.
+const USERSPACE_SESSION: usize = 64 * 1024;
 
-/// Bytes charged per userspace relay for its queue and scratch buffers.
-pub const RELAY_ALLOCATION: usize = RELAY_QUEUE + RELAY_SCRATCH;
+/// Largest plaintext slice handed to rustls per send round. Four full records
+/// plus their overhead fit in the send buffer.
+const USERSPACE_PLAINTEXT: usize = 48 * 1024;
 
-/// A running userspace relay and the charge for its buffers.
+/// Bytes charged per userspace TLS connection: both ciphertext buffers and the
+/// session estimate. The charge is held while the connection idles in the pool.
+pub const USERSPACE_ALLOCATION: usize = 2 * USERSPACE_BUFFER + USERSPACE_SESSION;
+
+/// A rustls record layer driven on the connection's reactor.
 ///
-/// Dropping it shuts down the plaintext socket so the relay observes a
-/// hangup, joins the relay thread, and only then releases the charge. The
-/// relay never blocks without polling the plaintext socket, so the join is
-/// bounded by one nonblocking pass of its loop.
-pub(crate) struct Relay<K> {
-    app: OwnedFd,
-
-    thread: Option<std::thread::JoinHandle<()>>,
-
-    charge: Option<K>,
-}
-
-impl<K> Drop for Relay<K> {
-    fn drop(&mut self) {
-        // SAFETY: shutdown on a live owned descriptor.
-        unsafe { libc::shutdown(self.app.as_raw_fd(), libc::SHUT_RDWR) };
-        if let Some(thread) = self.thread.take() {
-            let _ = thread.join();
-        }
-        drop(self.charge.take());
-    }
-}
-
-/// Start the userspace relay, returning the plaintext end for the pool and
-/// the handle that retains `charge` until the relay thread exits.
-fn spawn_relay<K>(
+/// The TCP socket carries ciphertext. Receives fill `rx` through the reactor
+/// and decrypt in place into the caller's buffer; sends encrypt into `tx` and
+/// submit it through the reactor. No thread or extra descriptor is involved,
+/// and dropping the connection drops the session with it.
+pub(crate) struct Userspace<C: Context> {
     session: ClientConnection,
-    tcp: &Descriptor,
-    charge: K,
-) -> std::io::Result<(Descriptor, Relay<K>)> {
-    // SAFETY: dup of a live descriptor; the result is immediately owned.
-    let net = unsafe { libc::fcntl(tcp.as_raw_fd(), libc::F_DUPFD_CLOEXEC, 0) };
-    if net < 0 {
-        return Err(std::io::Error::last_os_error());
-    }
-    // SAFETY: fcntl returned a fresh descriptor.
-    let net = unsafe { OwnedFd::from_raw_fd(net) };
-    let mut pair = [0; 2];
-    // SAFETY: socketpair writes two descriptors on success.
-    if unsafe {
-        libc::socketpair(
-            libc::AF_UNIX,
-            libc::SOCK_STREAM | libc::SOCK_NONBLOCK | libc::SOCK_CLOEXEC,
-            0,
-            pair.as_mut_ptr(),
-        )
-    } < 0
-    {
-        return Err(std::io::Error::last_os_error());
-    }
-    // SAFETY: both descriptors are fresh and owned here.
-    let (pool_end, relay_end) =
-        unsafe { (OwnedFd::from_raw_fd(pair[0]), OwnedFd::from_raw_fd(pair[1])) };
-    // SAFETY: dup of a live descriptor; the result is immediately owned.
-    let control = unsafe { libc::fcntl(pool_end.as_raw_fd(), libc::F_DUPFD_CLOEXEC, 0) };
-    if control < 0 {
-        return Err(std::io::Error::last_os_error());
-    }
-    // SAFETY: fcntl returned a fresh descriptor.
-    let control = unsafe { OwnedFd::from_raw_fd(control) };
-    let thread = std::thread::Builder::new()
-        .name("racer-tls-relay".into())
-        .spawn(move || relay_loop(session, net, relay_end))?;
-    Ok((
-        Descriptor::from(pool_end),
-        Relay {
-            app: control,
-            thread: Some(thread),
-            charge: Some(charge),
-        },
-    ))
+
+    /// Ciphertext receive buffer; `None` while a receive owns it.
+    rx: Option<OwnedBuffer<C>>,
+
+    /// Received ciphertext in `rx` not yet passed to rustls.
+    pending: Range<usize>,
+
+    /// Ciphertext send buffer; `None` while a send owns it.
+    tx: Option<OwnedBuffer<C>>,
+
+    _charge: C::Charge,
 }
 
-/// Shuttle bytes until either side closes or fails.
-fn relay_loop(mut session: ClientConnection, net: OwnedFd, app: OwnedFd) {
-    const CAP: usize = RELAY_QUEUE;
-    let net = Descriptor::from(net);
-    let app = Descriptor::from(app);
-    let mut to_app = Vec::with_capacity(CAP);
-    let mut sent = 0;
-    let mut scratch = vec![0; RELAY_SCRATCH];
-    let mut net_eof = false;
-    loop {
-        // Move decrypted plaintext out of rustls while there is room.
-        while to_app.len() < CAP {
-            let room = (CAP - to_app.len()).min(scratch.len());
-            match session.reader().read(&mut scratch[..room]) {
-                Ok(0) => {
-                    net_eof = true;
+impl<C: Context> Userspace<C> {
+    fn new(session: ClientConnection, context: &C) -> crate::connection::Result<C, Self> {
+        let charge = context.charge(USERSPACE_SESSION)?;
+        Ok(Self {
+            session,
+            rx: Some(OwnedBuffer::new(context, USERSPACE_BUFFER)?),
+            pending: 0..0,
+            tx: Some(OwnedBuffer::new(context, USERSPACE_BUFFER)?),
+            _charge: charge,
+        })
+    }
+
+    /// Copy decrypted plaintext into `out` until it is full or the buffered
+    /// ciphertext is exhausted. `Ok(0)` is a close_notify (or an empty `out`);
+    /// `WouldBlock` asks for more ciphertext.
+    pub(crate) fn read_plain(&mut self, out: &mut [u8]) -> std::io::Result<usize> {
+        let mut filled = 0;
+        while filled < out.len() {
+            match self.session.reader().read(&mut out[filled..]) {
+                Ok(0) => return Ok(filled),
+                Ok(n) => {
+                    filled += n;
+                    continue;
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => (),
+                Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(filled),
+                Err(e) => return Err(e),
+            }
+            if self.pending.is_empty() {
+                if filled > 0 {
                     break;
                 }
-                Ok(n) => to_app.extend_from_slice(&scratch[..n]),
-                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
-                Err(_) => return,
+                return Err(std::io::ErrorKind::WouldBlock.into());
+            }
+            let rx = self.rx.as_ref().ok_or(std::io::ErrorKind::BrokenPipe)?;
+            let mut ciphertext = &rx.bytes[self.pending.clone()];
+            let n = self.session.read_tls(&mut ciphertext)?;
+            if n == 0 {
+                return Err(std::io::ErrorKind::InvalidData.into());
+            }
+            self.pending.start += n;
+            self.session
+                .process_new_packets()
+                .map_err(|_| std::io::Error::from(std::io::ErrorKind::InvalidData))?;
+        }
+        Ok(filled)
+    }
+
+    /// Take the receive buffer for a reactor receive.
+    pub(crate) fn take_rx(&mut self) -> Option<OwnedBuffer<C>> {
+        debug_assert!(self.pending.is_empty());
+        self.rx.take()
+    }
+
+    /// Return the receive buffer holding `received` new ciphertext bytes.
+    pub(crate) fn restore_rx(&mut self, rx: OwnedBuffer<C>, received: usize) {
+        self.pending = 0..received.min(rx.bytes.len());
+        self.rx = Some(rx);
+    }
+
+    /// Mutable receive buffer for a nonblocking probe.
+    pub(crate) fn rx_mut(&mut self) -> Option<&mut [u8]> {
+        self.rx.as_mut().map(|rx| rx.bytes.as_mut_slice())
+    }
+
+    /// Queue plaintext for encryption, returning how many bytes rustls took.
+    pub(crate) fn write_plain(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        let bytes = &bytes[..bytes.len().min(USERSPACE_PLAINTEXT)];
+        self.session.writer().write(bytes)
+    }
+
+    /// Whether ciphertext is waiting to be sent.
+    pub(crate) fn wants_write(&self) -> bool {
+        self.session.wants_write()
+    }
+
+    /// Take the send buffer filled with queued ciphertext and its length.
+    pub(crate) fn take_tx(&mut self) -> std::io::Result<(OwnedBuffer<C>, usize)> {
+        let mut tx = self.tx.take().ok_or(std::io::ErrorKind::BrokenPipe)?;
+        let total = tx.bytes.len();
+        let mut out = tx.bytes.as_mut_slice();
+        while self.session.wants_write() && !out.is_empty() {
+            if self.session.write_tls(&mut out)? == 0 {
+                break;
             }
         }
-        while sent < to_app.len() {
-            match app.try_send(&to_app[sent..]) {
-                Ok(n) => sent += n,
-                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
-                Err(_) => return,
-            }
-        }
-        if sent == to_app.len() {
-            to_app.clear();
-            sent = 0;
-            if net_eof {
-                let _ = app.shutdown(libc::SHUT_WR);
-                // Wait for the pool to close its end, then exit.
-                let mut fds = [libc::pollfd {
-                    fd: app.as_raw_fd(),
-                    events: libc::POLLHUP,
-                    revents: 0,
-                }];
-                // SAFETY: one live pollfd.
-                unsafe { libc::poll(fds.as_mut_ptr(), 1, -1) };
-                return;
-            }
-        }
-        while session.wants_write() {
-            match session.write_tls(&mut Socket(&net)) {
-                Ok(_) => (),
-                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
-                Err(_) => return,
-            }
-        }
-        let backlog = session.wants_write();
-        let mut fds = [
-            libc::pollfd {
-                fd: net.as_raw_fd(),
-                events: (if !net_eof && to_app.len() < CAP && session.wants_read() {
-                    libc::POLLIN
-                } else {
-                    0
-                }) | (if backlog { libc::POLLOUT } else { 0 }),
-                revents: 0,
-            },
-            libc::pollfd {
-                fd: app.as_raw_fd(),
-                events: (if backlog { 0 } else { libc::POLLIN })
-                    | (if to_app.is_empty() { 0 } else { libc::POLLOUT }),
-                revents: 0,
-            },
-        ];
-        // SAFETY: two live pollfds.
-        let ready = unsafe { libc::poll(fds.as_mut_ptr(), 2, -1) };
-        if ready < 0 {
-            if std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted {
-                continue;
-            }
-            return;
-        }
-        if fds[0].revents & (libc::POLLIN | libc::POLLHUP | libc::POLLERR) != 0 {
-            match session.read_tls(&mut Socket(&net)) {
-                Ok(0) => net_eof = true,
-                Ok(_) => {
-                    if session.process_new_packets().is_err() {
-                        let _ = session.write_tls(&mut Socket(&net));
-                        return;
-                    }
-                }
-                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => (),
-                Err(_) => return,
-            }
-        }
-        if fds[1].revents & libc::POLLNVAL != 0 {
-            return;
-        }
-        if fds[1].revents & (libc::POLLIN | libc::POLLHUP | libc::POLLERR) != 0 {
-            match app.try_recv(&mut scratch) {
-                Ok(0) => {
-                    session.send_close_notify();
-                    let _ = session.write_tls(&mut Socket(&net));
-                    return;
-                }
-                Ok(n) => {
-                    if session.writer().write_all(&scratch[..n]).is_err() {
-                        return;
-                    }
-                }
-                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => (),
-                Err(_) => return,
-            }
-        }
+        let used = total - out.len();
+        Ok((tx, used))
+    }
+
+    /// Return the send buffer after its ciphertext was sent.
+    pub(crate) fn restore_tx(&mut self, tx: OwnedBuffer<C>) {
+        self.tx = Some(tx);
     }
 }
 
