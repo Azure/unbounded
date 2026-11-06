@@ -1189,6 +1189,43 @@ struct RegisterSlot {
 /// Wakes the owner when a background registration finishes.
 pub(crate) type RegisterWake = Arc<dyn Fn() + Send + Sync>;
 
+/// Highest NUMA node [`prefer_node`] accepts. Linux allows at most 1024.
+const MAX_NUMA_NODES: usize = 1024;
+
+/// The `set_mempolicy` node mask that selects only `node`, in `c_ulong`
+/// words, or `None` when `node` is out of range.
+fn node_mask(node: usize) -> Option<Vec<libc::c_ulong>> {
+    if node >= MAX_NUMA_NODES {
+        return None;
+    }
+    let bits = libc::c_ulong::BITS as usize;
+    let mut mask = vec![0; node / bits + 1];
+    mask[node / bits] |= 1 << (node % bits);
+    Some(mask)
+}
+
+/// Prefer `node` for the calling thread's future page allocations, so pages
+/// it first touches land there (falling back to other nodes when it is
+/// full). Best effort: an unknown node or a failed call keeps the default
+/// local policy. Returns whether the policy was set.
+fn prefer_node(node: Option<usize>) -> bool {
+    const MPOL_PREFERRED: libc::c_int = 1;
+    let Some(mask) = node.and_then(node_mask) else {
+        return false;
+    };
+    // The kernel reads `maxnode - 1` bits.
+    let maxnode = (mask.len() * libc::c_ulong::BITS as usize + 1) as libc::c_ulong;
+    // SAFETY: `mask` holds `maxnode - 1` bits and outlives the call.
+    unsafe {
+        libc::syscall(
+            libc::SYS_set_mempolicy,
+            MPOL_PREFERRED,
+            mask.as_ptr(),
+            maxnode,
+        ) == 0
+    }
+}
+
 /// A region registration running off the owner thread.
 ///
 /// Pinning and registering a large buffer (`ibv_reg_mr`, `ibv_reg_dmabuf_mr`)
@@ -1232,6 +1269,9 @@ impl Registering {
         let bits = register_bits(&device, access);
         let register = device.api.register;
         let raw = device.raw.as_ptr() as usize;
+        // Registration first touches (pins) the buffer, so place it on the
+        // device's NUMA node rather than wherever the owner thread runs.
+        let node = device.numa_node();
         Ok(Self::start(
             device,
             None,
@@ -1239,6 +1279,7 @@ impl Registering {
             access,
             quota,
             wake,
+            node,
             move || unsafe { register(raw as *mut c_void, length as u64, bits) } as usize,
         ))
     }
@@ -1272,11 +1313,13 @@ impl Registering {
             Access::DEVICE,
             quota,
             wake,
+            None,
             move || unsafe { register(raw as *mut c_void, offset, length as u64, iova, fd) }
                 as usize,
         ))
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn start(
         device: Rc<NativeDevice>,
         memory: Option<DeviceMemory>,
@@ -1284,6 +1327,7 @@ impl Registering {
         access: Access,
         quota: Arc<GuardOwner>,
         wake: RegisterWake,
+        node: Option<usize>,
         call: impl FnOnce() -> usize + Send + 'static,
     ) -> Self {
         let slot = Arc::new(RegisterSlot {
@@ -1313,6 +1357,8 @@ impl Registering {
                 std::thread::Builder::new()
                     .name("racer-rdma-register".into())
                     .spawn(move || {
+                        // Only this short-lived helper thread takes the policy.
+                        prefer_node(node);
                         let call = call.lock().unwrap_or_else(PoisonError::into_inner).take();
                         if let Some(call) = call {
                             finish(call());
@@ -2421,6 +2467,47 @@ impl<T> Drop for NativeQueuePair<T> {
 mod tests {
     //! Endpoint validation and optional native discovery contracts.
     use super::*;
+
+    #[test]
+    fn node_mask_selects_one_node() {
+        let bits = libc::c_ulong::BITS as usize;
+        assert_eq!(node_mask(0), Some(vec![1]));
+        assert_eq!(node_mask(1), Some(vec![2]));
+        assert_eq!(node_mask(bits), Some(vec![0, 1]));
+        assert_eq!(node_mask(bits + 3), Some(vec![0, 8]));
+        assert_eq!(node_mask(1023).map(|m| m.len()), Some(1024 / bits));
+        assert_eq!(node_mask(1024), None);
+    }
+
+    #[test]
+    fn prefer_node_sets_a_preferred_policy_on_the_calling_thread_only() {
+        const MPOL_PREFERRED: libc::c_int = 1;
+        fn mode() -> libc::c_int {
+            let mut mode: libc::c_int = -1;
+            // SAFETY: a null mask with maxnode 0 only reads the mode.
+            let rc = unsafe {
+                libc::syscall(
+                    libc::SYS_get_mempolicy,
+                    &mut mode as *mut libc::c_int,
+                    std::ptr::null_mut::<libc::c_ulong>(),
+                    0 as libc::c_ulong,
+                    std::ptr::null_mut::<libc::c_void>(),
+                    0 as libc::c_ulong,
+                )
+            };
+            assert_eq!(rc, 0);
+            mode
+        }
+        assert!(!prefer_node(None));
+        assert!(!prefer_node(Some(4096)));
+        let before = mode();
+        // Node 0 exists on every Linux host.
+        let set = std::thread::spawn(|| (prefer_node(Some(0)), mode()))
+            .join()
+            .unwrap();
+        assert_eq!(set, (true, MPOL_PREFERRED));
+        assert_eq!(mode(), before);
+    }
 
     /// Require the real adapter's ABI and every symbol without opening any device.
     #[cfg(all(feature = "native", target_os = "linux"))]
@@ -3634,6 +3721,7 @@ pub(crate) mod lifetime_tests {
             Access::PAGES,
             quota,
             wake,
+            None,
             move || {
                 assert_ne!(std::thread::current().id(), owner, "ran on the owner");
                 Box::into_raw(Box::new(vec![0u8; 64])) as usize
@@ -3666,6 +3754,7 @@ pub(crate) mod lifetime_tests {
             Access::PAGES,
             quota,
             Arc::new(|| {}),
+            None,
             || 0,
         );
         settle(&registering);
@@ -3692,6 +3781,7 @@ pub(crate) mod lifetime_tests {
             Arc::new(move || {
                 let _ = finished.send(());
             }),
+            None,
             move || {
                 wait.recv().unwrap();
                 0
@@ -3713,6 +3803,7 @@ pub(crate) mod lifetime_tests {
             Access::PAGES,
             quota,
             Arc::new(|| {}),
+            None,
             || Box::into_raw(Box::new(vec![0u8; 64])) as usize,
         );
         settle(&registering);

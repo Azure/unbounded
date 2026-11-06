@@ -78,7 +78,8 @@ impl NativeNode {
             .remove(&worker))
     }
     /// The worker that drives activation. The owner thread runs on its paired
-    /// crypto CPU, so registered memory is first touched on its NUMA node.
+    /// crypto CPU. Registered page pools do not follow it: each is first
+    /// touched under a policy preferring its device's NUMA node.
     pub(super) fn owner_worker(&self) -> Option<WorkerId> {
         *self
             .owner_worker
