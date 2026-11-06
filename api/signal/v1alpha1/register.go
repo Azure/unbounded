@@ -16,6 +16,8 @@ var (
 	SchemeBuilder = runtime.NewSchemeBuilder(func(s *runtime.Scheme) error {
 		s.AddKnownTypes(
 			GroupVersion,
+			&CertificationTest{},
+			&CertificationTestList{},
 			&CertificationProfile{},
 			&CertificationProfileList{},
 			&CertificationPolicy{},

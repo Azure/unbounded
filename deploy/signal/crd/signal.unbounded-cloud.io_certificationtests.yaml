@@ -1,0 +1,829 @@
+# Copyright (c) Microsoft Corporation.
+# SPDX-License-Identifier: Apache-2.0
+---
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  annotations:
+    controller-gen.kubebuilder.io/version: v0.20.1
+  name: certificationtests.signal.unbounded-cloud.io
+spec:
+  group: signal.unbounded-cloud.io
+  names:
+    kind: CertificationTest
+    listKind: CertificationTestList
+    plural: certificationtests
+    shortNames:
+    - certtest
+    singular: certificationtest
+  scope: Cluster
+  versions:
+  - additionalPrinterColumns:
+    - jsonPath: .spec.displayName
+      name: Display Name
+      type: string
+    - jsonPath: .spec.driver.type
+      name: Driver
+      type: string
+    - jsonPath: .status.trust.state
+      name: Trust
+      type: string
+    name: v1alpha1
+    schema:
+      openAPIV3Schema:
+        properties:
+          apiVersion:
+            description: |-
+              APIVersion defines the versioned schema of this representation of an object.
+              Servers should convert recognized schemas to the latest internal value, and
+              may reject unrecognized values.
+              More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#resources
+            type: string
+          kind:
+            description: |-
+              Kind is a string value representing the REST resource this object represents.
+              Servers may infer this from the endpoint the client submits requests to.
+              Cannot be updated.
+              In CamelCase.
+              More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#types-kinds
+            type: string
+          metadata:
+            type: object
+          spec:
+            properties:
+              description:
+                maxLength: 2048
+                type: string
+              displayName:
+                description: Metadata name is the stable machine name.
+                maxLength: 128
+                minLength: 1
+                type: string
+              driver:
+                properties:
+                  container:
+                    properties:
+                      args:
+                        items:
+                          maxLength: 256
+                          type: string
+                        maxItems: 8
+                        type: array
+                      command:
+                        items:
+                          maxLength: 256
+                          type: string
+                        maxItems: 8
+                        type: array
+                      image:
+                        pattern: ^[^@\s]+@sha256:[0-9a-f]{64}$
+                        type: string
+                      resources:
+                        description: ResourceRequirements describes the compute resource
+                          requirements.
+                        properties:
+                          claims:
+                            description: |-
+                              Claims lists the names of resources, defined in spec.resourceClaims,
+                              that are used by this container.
+
+                              This field depends on the
+                              DynamicResourceAllocation feature gate.
+
+                              This field is immutable. It can only be set for containers.
+                            items:
+                              description: ResourceClaim references one entry in PodSpec.ResourceClaims.
+                              properties:
+                                name:
+                                  description: |-
+                                    Name must match the name of one entry in pod.spec.resourceClaims of
+                                    the Pod where this field is used. It makes that resource available
+                                    inside a container.
+                                  type: string
+                                request:
+                                  description: |-
+                                    Request is the name chosen for a request in the referenced claim.
+                                    If empty, everything from the claim is made available, otherwise
+                                    only the result of this request.
+                                  type: string
+                              required:
+                              - name
+                              type: object
+                            type: array
+                            x-kubernetes-list-map-keys:
+                            - name
+                            x-kubernetes-list-type: map
+                          limits:
+                            additionalProperties:
+                              anyOf:
+                              - type: integer
+                              - type: string
+                              pattern: ^(\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))(([KMGTPE]i)|[numkMGTPE]|([eE](\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))))?$
+                              x-kubernetes-int-or-string: true
+                            description: |-
+                              Limits describes the maximum amount of compute resources allowed.
+                              More info: https://kubernetes.io/docs/concepts/configuration/manage-resources-containers/
+                            type: object
+                          requests:
+                            additionalProperties:
+                              anyOf:
+                              - type: integer
+                              - type: string
+                              pattern: ^(\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))(([KMGTPE]i)|[numkMGTPE]|([eE](\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))))?$
+                              x-kubernetes-int-or-string: true
+                            description: |-
+                              Requests describes the minimum amount of compute resources required.
+                              If Requests is omitted for a container, it defaults to Limits if that is explicitly specified,
+                              otherwise to an implementation-defined value. Requests cannot exceed Limits.
+                              More info: https://kubernetes.io/docs/concepts/configuration/manage-resources-containers/
+                            type: object
+                        type: object
+                    required:
+                    - image
+                    type: object
+                    x-kubernetes-validations:
+                    - message: container resource limits must not exceed 16 entries
+                      rule: '!has(self.resources.limits) || size(self.resources.limits)
+                        <= 16'
+                    - message: container resource requests must not exceed 16 entries
+                      rule: '!has(self.resources.requests) || size(self.resources.requests)
+                        <= 16'
+                    - message: container resource claims must not exceed 16 entries
+                      rule: '!has(self.resources.claims) || size(self.resources.claims)
+                        <= 16'
+                  script:
+                    properties:
+                      language:
+                        enum:
+                        - Shell
+                        - Python
+                        type: string
+                      runnerImage:
+                        description: RunnerImage is the approved digest-pinned runtime
+                          for the payload.
+                        pattern: ^[^@\s]+@sha256:[0-9a-f]{64}$
+                        type: string
+                      source:
+                        properties:
+                          configMap:
+                            properties:
+                              digest:
+                                pattern: ^sha256:[0-9a-f]{64}$
+                                type: string
+                              key:
+                                maxLength: 253
+                                minLength: 1
+                                type: string
+                              name:
+                                maxLength: 253
+                                minLength: 1
+                                type: string
+                            required:
+                            - digest
+                            - key
+                            - name
+                            type: object
+                          git:
+                            properties:
+                              commit:
+                                pattern: ^[0-9a-f]{40}$
+                                type: string
+                              digest:
+                                pattern: ^sha256:[0-9a-f]{64}$
+                                type: string
+                              path:
+                                maxLength: 1024
+                                minLength: 1
+                                type: string
+                              repository:
+                                pattern: ^https://[^\s]+$
+                                type: string
+                            required:
+                            - commit
+                            - digest
+                            - path
+                            - repository
+                            type: object
+                          oci:
+                            properties:
+                              reference:
+                                description: Reference must include a digest and must
+                                  not be a mutable tag.
+                                pattern: ^[^@\s]+@sha256:[0-9a-f]{64}$
+                                type: string
+                            required:
+                            - reference
+                            type: object
+                          type:
+                            enum:
+                            - ConfigMap
+                            - OCI
+                            - Git
+                            type: string
+                        required:
+                        - type
+                        type: object
+                        x-kubernetes-validations:
+                        - message: ConfigMap sources require configMap
+                          rule: self.type != 'ConfigMap' || has(self.configMap)
+                        - message: configMap is valid only for ConfigMap sources
+                          rule: self.type == 'ConfigMap' || !has(self.configMap)
+                        - message: OCI sources require oci
+                          rule: self.type != 'OCI' || has(self.oci)
+                        - message: oci is valid only for OCI sources
+                          rule: self.type == 'OCI' || !has(self.oci)
+                        - message: Git sources require git
+                          rule: self.type != 'Git' || has(self.git)
+                        - message: git is valid only for Git sources
+                          rule: self.type == 'Git' || !has(self.git)
+                    required:
+                    - language
+                    - runnerImage
+                    - source
+                    type: object
+                  type:
+                    enum:
+                    - Script
+                    - Container
+                    - WorkflowTemplate
+                    type: string
+                  workflowTemplate:
+                    properties:
+                      digest:
+                        pattern: ^sha256:[0-9a-f]{64}$
+                        type: string
+                      name:
+                        maxLength: 253
+                        minLength: 1
+                        type: string
+                    required:
+                    - digest
+                    - name
+                    type: object
+                required:
+                - type
+                type: object
+                x-kubernetes-validations:
+                - message: Script drivers require script
+                  rule: self.type != 'Script' || has(self.script)
+                - message: script is valid only for Script drivers
+                  rule: self.type == 'Script' || !has(self.script)
+                - message: Container drivers require container
+                  rule: self.type != 'Container' || has(self.container)
+                - message: container is valid only for Container drivers
+                  rule: self.type == 'Container' || !has(self.container)
+                - message: WorkflowTemplate drivers require workflowTemplate
+                  rule: self.type != 'WorkflowTemplate' || has(self.workflowTemplate)
+                - message: workflowTemplate is valid only for WorkflowTemplate drivers
+                  rule: self.type == 'WorkflowTemplate' || !has(self.workflowTemplate)
+              metrics:
+                items:
+                  properties:
+                    displayName:
+                      maxLength: 128
+                      minLength: 1
+                      type: string
+                    name:
+                      maxLength: 63
+                      minLength: 1
+                      pattern: ^[a-z][a-z0-9]*([A-Z][a-z0-9]*)*$
+                      type: string
+                    required:
+                      type: boolean
+                    type:
+                      enum:
+                      - Boolean
+                      - Status
+                      - Count
+                      - Gauge
+                      - Duration
+                      - Ratio
+                      - Throughput
+                      - IOPS
+                      - Bandwidth
+                      - Latency
+                      type: string
+                    unit:
+                      maxLength: 32
+                      type: string
+                  required:
+                  - displayName
+                  - name
+                  - type
+                  type: object
+                maxItems: 16
+                minItems: 1
+                type: array
+                x-kubernetes-list-map-keys:
+                - name
+                x-kubernetes-list-type: map
+              owner:
+                maxLength: 128
+                minLength: 1
+                type: string
+              parameters:
+                items:
+                  properties:
+                    allowedValues:
+                      items:
+                        properties:
+                          booleanValue:
+                            type: boolean
+                          decimalValue:
+                            description: DecimalValue is a base-10 JSON-independent
+                              decimal representation.
+                            maxLength: 128
+                            pattern: ^-?(0|[1-9][0-9]*)(\.[0-9]+)?$
+                            type: string
+                          durationValue:
+                            type: string
+                          integerValue:
+                            format: int64
+                            type: integer
+                          quantityValue:
+                            description: QuantityValue uses Kubernetes quantity syntax.
+                            maxLength: 64
+                            minLength: 1
+                            type: string
+                          stringValue:
+                            maxLength: 256
+                            type: string
+                          type:
+                            enum:
+                            - String
+                            - Integer
+                            - Decimal
+                            - Boolean
+                            - Duration
+                            - Quantity
+                            type: string
+                        required:
+                        - type
+                        type: object
+                        x-kubernetes-validations:
+                        - message: exactly the value field matching type must be set
+                          rule: (self.type == 'String' && has(self.stringValue) &&
+                            !has(self.integerValue) && !has(self.decimalValue) &&
+                            !has(self.booleanValue) && !has(self.durationValue) &&
+                            !has(self.quantityValue)) || (self.type == 'Integer' &&
+                            !has(self.stringValue) && has(self.integerValue) && !has(self.decimalValue)
+                            && !has(self.booleanValue) && !has(self.durationValue)
+                            && !has(self.quantityValue)) || (self.type == 'Decimal'
+                            && !has(self.stringValue) && !has(self.integerValue) &&
+                            has(self.decimalValue) && !has(self.booleanValue) && !has(self.durationValue)
+                            && !has(self.quantityValue)) || (self.type == 'Boolean'
+                            && !has(self.stringValue) && !has(self.integerValue) &&
+                            !has(self.decimalValue) && has(self.booleanValue) && !has(self.durationValue)
+                            && !has(self.quantityValue)) || (self.type == 'Duration'
+                            && !has(self.stringValue) && !has(self.integerValue) &&
+                            !has(self.decimalValue) && !has(self.booleanValue) &&
+                            has(self.durationValue) && !has(self.quantityValue)) ||
+                            (self.type == 'Quantity' && !has(self.stringValue) &&
+                            !has(self.integerValue) && !has(self.decimalValue) &&
+                            !has(self.booleanValue) && !has(self.durationValue) &&
+                            has(self.quantityValue))
+                      maxItems: 32
+                      type: array
+                      x-kubernetes-list-type: atomic
+                    default:
+                      properties:
+                        booleanValue:
+                          type: boolean
+                        decimalValue:
+                          description: DecimalValue is a base-10 JSON-independent
+                            decimal representation.
+                          maxLength: 128
+                          pattern: ^-?(0|[1-9][0-9]*)(\.[0-9]+)?$
+                          type: string
+                        durationValue:
+                          type: string
+                        integerValue:
+                          format: int64
+                          type: integer
+                        quantityValue:
+                          description: QuantityValue uses Kubernetes quantity syntax.
+                          maxLength: 64
+                          minLength: 1
+                          type: string
+                        stringValue:
+                          maxLength: 256
+                          type: string
+                        type:
+                          enum:
+                          - String
+                          - Integer
+                          - Decimal
+                          - Boolean
+                          - Duration
+                          - Quantity
+                          type: string
+                      required:
+                      - type
+                      type: object
+                      x-kubernetes-validations:
+                      - message: exactly the value field matching type must be set
+                        rule: (self.type == 'String' && has(self.stringValue) && !has(self.integerValue)
+                          && !has(self.decimalValue) && !has(self.booleanValue) &&
+                          !has(self.durationValue) && !has(self.quantityValue)) ||
+                          (self.type == 'Integer' && !has(self.stringValue) && has(self.integerValue)
+                          && !has(self.decimalValue) && !has(self.booleanValue) &&
+                          !has(self.durationValue) && !has(self.quantityValue)) ||
+                          (self.type == 'Decimal' && !has(self.stringValue) && !has(self.integerValue)
+                          && has(self.decimalValue) && !has(self.booleanValue) &&
+                          !has(self.durationValue) && !has(self.quantityValue)) ||
+                          (self.type == 'Boolean' && !has(self.stringValue) && !has(self.integerValue)
+                          && !has(self.decimalValue) && has(self.booleanValue) &&
+                          !has(self.durationValue) && !has(self.quantityValue)) ||
+                          (self.type == 'Duration' && !has(self.stringValue) && !has(self.integerValue)
+                          && !has(self.decimalValue) && !has(self.booleanValue) &&
+                          has(self.durationValue) && !has(self.quantityValue)) ||
+                          (self.type == 'Quantity' && !has(self.stringValue) && !has(self.integerValue)
+                          && !has(self.decimalValue) && !has(self.booleanValue) &&
+                          !has(self.durationValue) && has(self.quantityValue))
+                    displayName:
+                      maxLength: 128
+                      minLength: 1
+                      type: string
+                    maximum:
+                      properties:
+                        booleanValue:
+                          type: boolean
+                        decimalValue:
+                          description: DecimalValue is a base-10 JSON-independent
+                            decimal representation.
+                          maxLength: 128
+                          pattern: ^-?(0|[1-9][0-9]*)(\.[0-9]+)?$
+                          type: string
+                        durationValue:
+                          type: string
+                        integerValue:
+                          format: int64
+                          type: integer
+                        quantityValue:
+                          description: QuantityValue uses Kubernetes quantity syntax.
+                          maxLength: 64
+                          minLength: 1
+                          type: string
+                        stringValue:
+                          maxLength: 256
+                          type: string
+                        type:
+                          enum:
+                          - String
+                          - Integer
+                          - Decimal
+                          - Boolean
+                          - Duration
+                          - Quantity
+                          type: string
+                      required:
+                      - type
+                      type: object
+                      x-kubernetes-validations:
+                      - message: exactly the value field matching type must be set
+                        rule: (self.type == 'String' && has(self.stringValue) && !has(self.integerValue)
+                          && !has(self.decimalValue) && !has(self.booleanValue) &&
+                          !has(self.durationValue) && !has(self.quantityValue)) ||
+                          (self.type == 'Integer' && !has(self.stringValue) && has(self.integerValue)
+                          && !has(self.decimalValue) && !has(self.booleanValue) &&
+                          !has(self.durationValue) && !has(self.quantityValue)) ||
+                          (self.type == 'Decimal' && !has(self.stringValue) && !has(self.integerValue)
+                          && has(self.decimalValue) && !has(self.booleanValue) &&
+                          !has(self.durationValue) && !has(self.quantityValue)) ||
+                          (self.type == 'Boolean' && !has(self.stringValue) && !has(self.integerValue)
+                          && !has(self.decimalValue) && has(self.booleanValue) &&
+                          !has(self.durationValue) && !has(self.quantityValue)) ||
+                          (self.type == 'Duration' && !has(self.stringValue) && !has(self.integerValue)
+                          && !has(self.decimalValue) && !has(self.booleanValue) &&
+                          has(self.durationValue) && !has(self.quantityValue)) ||
+                          (self.type == 'Quantity' && !has(self.stringValue) && !has(self.integerValue)
+                          && !has(self.decimalValue) && !has(self.booleanValue) &&
+                          !has(self.durationValue) && has(self.quantityValue))
+                    minimum:
+                      properties:
+                        booleanValue:
+                          type: boolean
+                        decimalValue:
+                          description: DecimalValue is a base-10 JSON-independent
+                            decimal representation.
+                          maxLength: 128
+                          pattern: ^-?(0|[1-9][0-9]*)(\.[0-9]+)?$
+                          type: string
+                        durationValue:
+                          type: string
+                        integerValue:
+                          format: int64
+                          type: integer
+                        quantityValue:
+                          description: QuantityValue uses Kubernetes quantity syntax.
+                          maxLength: 64
+                          minLength: 1
+                          type: string
+                        stringValue:
+                          maxLength: 256
+                          type: string
+                        type:
+                          enum:
+                          - String
+                          - Integer
+                          - Decimal
+                          - Boolean
+                          - Duration
+                          - Quantity
+                          type: string
+                      required:
+                      - type
+                      type: object
+                      x-kubernetes-validations:
+                      - message: exactly the value field matching type must be set
+                        rule: (self.type == 'String' && has(self.stringValue) && !has(self.integerValue)
+                          && !has(self.decimalValue) && !has(self.booleanValue) &&
+                          !has(self.durationValue) && !has(self.quantityValue)) ||
+                          (self.type == 'Integer' && !has(self.stringValue) && has(self.integerValue)
+                          && !has(self.decimalValue) && !has(self.booleanValue) &&
+                          !has(self.durationValue) && !has(self.quantityValue)) ||
+                          (self.type == 'Decimal' && !has(self.stringValue) && !has(self.integerValue)
+                          && has(self.decimalValue) && !has(self.booleanValue) &&
+                          !has(self.durationValue) && !has(self.quantityValue)) ||
+                          (self.type == 'Boolean' && !has(self.stringValue) && !has(self.integerValue)
+                          && !has(self.decimalValue) && has(self.booleanValue) &&
+                          !has(self.durationValue) && !has(self.quantityValue)) ||
+                          (self.type == 'Duration' && !has(self.stringValue) && !has(self.integerValue)
+                          && !has(self.decimalValue) && !has(self.booleanValue) &&
+                          has(self.durationValue) && !has(self.quantityValue)) ||
+                          (self.type == 'Quantity' && !has(self.stringValue) && !has(self.integerValue)
+                          && !has(self.decimalValue) && !has(self.booleanValue) &&
+                          !has(self.durationValue) && has(self.quantityValue))
+                    name:
+                      maxLength: 63
+                      minLength: 1
+                      pattern: ^[a-z][a-z0-9]*([A-Z][a-z0-9]*)*$
+                      type: string
+                    pattern:
+                      maxLength: 256
+                      type: string
+                    required:
+                      type: boolean
+                    type:
+                      enum:
+                      - String
+                      - Integer
+                      - Decimal
+                      - Boolean
+                      - Duration
+                      - Quantity
+                      type: string
+                  required:
+                  - displayName
+                  - name
+                  - type
+                  type: object
+                  x-kubernetes-validations:
+                  - message: default type must match parameter type
+                    rule: '!has(self.default) || self.default.type == self.type'
+                  - message: minimum type must match parameter type
+                    rule: '!has(self.minimum) || self.minimum.type == self.type'
+                  - message: maximum type must match parameter type
+                    rule: '!has(self.maximum) || self.maximum.type == self.type'
+                  - message: allowed value types must match parameter type
+                    rule: '!has(self.allowedValues) || self.allowedValues.all(x, x.type
+                      == self.type)'
+                maxItems: 16
+                type: array
+                x-kubernetes-list-map-keys:
+                - name
+                x-kubernetes-list-type: map
+              security:
+                properties:
+                  capabilities:
+                    items:
+                      pattern: ^[A-Z][A-Z0-9_]*$
+                      type: string
+                    maxItems: 16
+                    type: array
+                    x-kubernetes-list-type: set
+                  hostNetwork:
+                    type: boolean
+                  hostPaths:
+                    items:
+                      properties:
+                        mountPath:
+                          maxLength: 1024
+                          minLength: 1
+                          type: string
+                        path:
+                          maxLength: 1024
+                          minLength: 1
+                          type: string
+                        readOnly:
+                          type: boolean
+                      required:
+                      - mountPath
+                      - path
+                      type: object
+                      x-kubernetes-validations:
+                      - message: mountPath must be a clean absolute path
+                        rule: self.mountPath.startsWith('/') && !self.mountPath.contains('//')
+                          && !self.mountPath.contains('/./') && !self.mountPath.contains('/../')
+                          && !self.mountPath.endsWith('/.') && !self.mountPath.endsWith('/..')
+                      - message: mountPath must not replace or shadow a reserved Project
+                          Signal mount
+                        rule: self.mountPath != '/scripts' && !self.mountPath.startsWith('/scripts/')
+                          && self.mountPath != '/results' && !self.mountPath.startsWith('/results/')
+                      - message: path must be an approved proc leaf or a clean path
+                          under /sys or /var/lib/project-signal
+                        rule: (self.path == '/proc/cpuinfo' || self.path == '/proc/meminfo'
+                          || self.path == '/proc/version' || self.path == '/proc/sys/kernel/random/boot_id'
+                          || self.path == '/sys' || self.path.startsWith('/sys/')
+                          || self.path == '/var/lib/project-signal' || self.path.startsWith('/var/lib/project-signal/'))
+                          && !self.path.contains('//') && !self.path.contains('/./')
+                          && !self.path.contains('/../') && !self.path.endsWith('/.')
+                          && !self.path.endsWith('/..')
+                      - message: proc and sys host paths must be read-only
+                        rule: '!(self.path.startsWith(''/proc/'') || self.path ==
+                          ''/sys'' || self.path.startsWith(''/sys/'')) || self.readOnly'
+                    maxItems: 8
+                    type: array
+                    x-kubernetes-list-map-keys:
+                    - mountPath
+                    x-kubernetes-list-type: map
+                  ipcLock:
+                    type: boolean
+                  privileged:
+                    type: boolean
+                type: object
+              tags:
+                items:
+                  maxLength: 63
+                  type: string
+                maxItems: 16
+                type: array
+                x-kubernetes-list-type: set
+              topology:
+                properties:
+                  maxParticipants:
+                    format: int32
+                    maximum: 8
+                    minimum: 1
+                    type: integer
+                  minParticipants:
+                    format: int32
+                    maximum: 8
+                    minimum: 1
+                    type: integer
+                  roles:
+                    items:
+                      properties:
+                        displayName:
+                          maxLength: 128
+                          minLength: 1
+                          type: string
+                        maxCount:
+                          format: int32
+                          maximum: 8
+                          minimum: 1
+                          type: integer
+                        minCount:
+                          format: int32
+                          maximum: 8
+                          minimum: 0
+                          type: integer
+                        name:
+                          maxLength: 63
+                          minLength: 1
+                          pattern: ^[a-z]([-a-z0-9]*[a-z0-9])?$
+                          type: string
+                      required:
+                      - displayName
+                      - maxCount
+                      - name
+                      type: object
+                    maxItems: 8
+                    type: array
+                    x-kubernetes-list-map-keys:
+                    - name
+                    x-kubernetes-list-type: map
+                required:
+                - maxParticipants
+                - minParticipants
+                type: object
+                x-kubernetes-validations:
+                - message: role minCount must not exceed maxCount
+                  rule: self.roles.all(x, x.minCount <= x.maxCount)
+                - message: role minimum counts must fit maxParticipants
+                  rule: '!has(self.roles) || self.roles.map(x, x.minCount).sum() <=
+                    self.maxParticipants'
+                - message: role maximum counts must cover minParticipants
+                  rule: '!has(self.roles) || self.roles.map(x, x.maxCount).sum() >=
+                    self.minParticipants'
+              version:
+                description: Version is an operator-facing immutable source version,
+                  not a mutable channel.
+                maxLength: 64
+                minLength: 1
+                type: string
+            required:
+            - displayName
+            - driver
+            - metrics
+            - owner
+            - topology
+            - version
+            type: object
+            x-kubernetes-validations:
+            - message: minParticipants must not exceed maxParticipants
+              rule: self.topology.minParticipants <= self.topology.maxParticipants
+          status:
+            properties:
+              conditions:
+                items:
+                  description: Condition contains details for one aspect of the current
+                    state of this API Resource.
+                  properties:
+                    lastTransitionTime:
+                      description: |-
+                        lastTransitionTime is the last time the condition transitioned from one status to another.
+                        This should be when the underlying condition changed.  If that is not known, then using the time when the API field changed is acceptable.
+                      format: date-time
+                      type: string
+                    message:
+                      description: |-
+                        message is a human readable message indicating details about the transition.
+                        This may be an empty string.
+                      maxLength: 32768
+                      type: string
+                    observedGeneration:
+                      description: |-
+                        observedGeneration represents the .metadata.generation that the condition was set based upon.
+                        For instance, if .metadata.generation is currently 12, but the .status.conditions[x].observedGeneration is 9, the condition is out of date
+                        with respect to the current state of the instance.
+                      format: int64
+                      minimum: 0
+                      type: integer
+                    reason:
+                      description: |-
+                        reason contains a programmatic identifier indicating the reason for the condition's last transition.
+                        Producers of specific condition types may define expected values and meanings for this field,
+                        and whether the values are considered a guaranteed API.
+                        The value should be a CamelCase string.
+                        This field may not be empty.
+                      maxLength: 1024
+                      minLength: 1
+                      pattern: ^[A-Za-z]([A-Za-z0-9_,:]*[A-Za-z0-9_])?$
+                      type: string
+                    status:
+                      description: status of the condition, one of True, False, Unknown.
+                      enum:
+                      - "True"
+                      - "False"
+                      - Unknown
+                      type: string
+                    type:
+                      description: type of condition in CamelCase or in foo.example.com/CamelCase.
+                      maxLength: 316
+                      pattern: ^([a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*/)?(([A-Za-z0-9][-A-Za-z0-9_.]*)?[A-Za-z0-9])$
+                      type: string
+                  required:
+                  - lastTransitionTime
+                  - message
+                  - reason
+                  - status
+                  - type
+                  type: object
+                maxItems: 8
+                type: array
+                x-kubernetes-list-map-keys:
+                - type
+                x-kubernetes-list-type: map
+              observedGeneration:
+                format: int64
+                type: integer
+              trust:
+                properties:
+                  contentDigest:
+                    description: ContentDigest identifies the canonical approved test
+                      definition.
+                    pattern: ^sha256:[0-9a-f]{64}$
+                    type: string
+                  reason:
+                    maxLength: 256
+                    type: string
+                  state:
+                    enum:
+                    - Approved
+                    - Diagnostic
+                    - Rejected
+                    - Revoked
+                    type: string
+                required:
+                - contentDigest
+                - state
+                type: object
+            type: object
+        required:
+        - spec
+        type: object
+    served: true
+    storage: true
+    subresources:
+      status: {}

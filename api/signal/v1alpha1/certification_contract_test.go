@@ -25,6 +25,8 @@ func TestCertificationKindsRegistered(t *testing.T) {
 	}
 
 	for _, object := range []runtime.Object{
+		&CertificationTest{},
+		&CertificationTestList{},
 		&CertificationSuite{},
 		&CertificationSuiteList{},
 		&CertificationPolicy{},
@@ -52,7 +54,7 @@ func TestCertificationSuiteExecutionRequirements(t *testing.T) {
 		Properties["checks"].
 		Items.Schema
 
-	for _, property := range []string{"minDuration", "continuity"} {
+	for _, property := range []string{"minDuration", "continuity", "execution"} {
 		if _, found := check.Properties[property]; !found {
 			t.Fatalf("generated Suite check has no %s", property)
 		}
@@ -66,6 +68,54 @@ func TestCertificationSuiteExecutionRequirements(t *testing.T) {
 		if !hasValidationRule(check, rule) {
 			t.Fatalf("generated Suite check has no %q validation", rule)
 		}
+	}
+
+	execution := check.Properties["execution"]
+	for _, property := range []string{
+		"role",
+		"mode",
+		"coverageWindow",
+		"iterationTimeout",
+		"interval",
+		"minExecutions",
+		"maxGap",
+	} {
+		if _, found := execution.Properties[property]; !found {
+			t.Fatalf("generated Suite execution has no %s", property)
+		}
+	}
+
+	for _, rule := range []string{
+		"self.role == 'Validation' || self.mode == 'RunOnce'",
+		"self.mode != 'RunOnce' || (!has(self.coverageWindow) && !has(self.iterationTimeout) && !has(self.interval) && !has(self.minExecutions) && !has(self.maxGap))",
+		"self.mode == 'RunOnce' || (has(self.coverageWindow) && has(self.iterationTimeout) && has(self.minExecutions) && has(self.maxGap))",
+		"self.mode != 'Periodic' || has(self.interval)",
+		"self.mode == 'Periodic' || !has(self.interval)",
+		"!has(self.coverageWindow) || duration(self.coverageWindow).getMilliseconds() % 1000 == 0",
+		"!has(self.iterationTimeout) || duration(self.iterationTimeout).getMilliseconds() % 1000 == 0",
+		"!has(self.interval) || duration(self.interval).getMilliseconds() % 1000 == 0",
+		"!has(self.maxGap) || duration(self.maxGap).getMilliseconds() % 1000 == 0",
+		"!has(self.interval) || !has(self.iterationTimeout) || duration(self.iterationTimeout) <= duration(self.interval)",
+		"!has(self.interval) || !has(self.maxGap) || duration(self.interval) <= duration(self.maxGap)",
+		"!has(self.interval) || !has(self.coverageWindow) || !has(self.iterationTimeout) || !has(self.minExecutions) || duration(self.iterationTimeout).getMilliseconds() + duration(self.interval).getMilliseconds() * (self.minExecutions - 1) <= duration(self.coverageWindow).getMilliseconds()",
+	} {
+		if !hasValidationRule(&execution, rule) {
+			t.Fatalf("generated Suite execution has no %q validation", rule)
+		}
+	}
+
+	if !hasValidationRule(
+		check,
+		"!has(self.execution) || !has(self.execution.coverageWindow) || duration(self.execution.coverageWindow) <= duration(self.backendActiveDeadline)",
+	) {
+		t.Fatal("generated Suite check does not bound coverageWindow by backendActiveDeadline")
+	}
+
+	if !hasValidationRule(
+		check,
+		"!has(self.execution) || self.execution.mode == 'RunOnce' || duration(self.backendActiveDeadline).getMilliseconds() % 1000 == 0",
+	) {
+		t.Fatal("generated Suite check does not require whole-second repeated execution")
 	}
 }
 
@@ -114,16 +164,166 @@ func TestCertificationCheckListContract(t *testing.T) {
 				t.Fatalf("maxItems = %v, want %d", schema.MaxItems, MaxCertificationChecks)
 			}
 
-			if tt.schemaPath[0] == "spec" {
-				if schema.MinItems == nil || *schema.MinItems != MinCertificationChecks {
-					t.Fatalf("minItems = %v, want %d", schema.MinItems, MinCertificationChecks)
-				}
-			}
-
 			if schema.XListType == nil || *schema.XListType != "atomic" {
 				t.Fatalf("x-kubernetes-list-type = %v, want atomic", schema.XListType)
 			}
 		})
+	}
+}
+
+func TestCertificationTestContract(t *testing.T) {
+	t.Parallel()
+
+	crd := readCRD(t, "signal.unbounded-cloud.io_certificationtests.yaml")
+	if crd.Spec.Scope != apiextensionsv1.ClusterScoped {
+		t.Fatalf("CertificationTest scope = %s, want Cluster", crd.Spec.Scope)
+	}
+
+	root := crd.Spec.Versions[0].Schema.OpenAPIV3Schema
+	spec := root.Properties["spec"]
+	driver := spec.Properties["driver"]
+
+	for _, driverType := range []string{`"Script"`, `"Container"`, `"WorkflowTemplate"`} {
+		if !containsJSONEnum(driver.Properties["type"].Enum, driverType) {
+			t.Fatalf("driver enum = %s, missing %s", driver.Properties["type"].Enum, driverType)
+		}
+	}
+
+	for _, rule := range []string{
+		"self.type != 'Script' || has(self.script)",
+		"self.type == 'Script' || !has(self.script)",
+		"self.type != 'Container' || has(self.container)",
+		"self.type == 'Container' || !has(self.container)",
+		"self.type != 'WorkflowTemplate' || has(self.workflowTemplate)",
+		"self.type == 'WorkflowTemplate' || !has(self.workflowTemplate)",
+	} {
+		if !hasValidationRule(&driver, rule) {
+			t.Fatalf("generated test driver has no %q validation", rule)
+		}
+	}
+
+	script := driver.Properties["script"]
+	if script.Properties["runnerImage"].Pattern != DigestPinnedImagePattern {
+		t.Fatal("Script runner image is not digest-pinned")
+	}
+
+	container := driver.Properties["container"]
+	if container.Properties["image"].Pattern != DigestPinnedImagePattern {
+		t.Fatal("Container image is not digest-pinned")
+	}
+
+	if args := container.Properties["args"]; args.MaxItems == nil || *args.MaxItems != 8 ||
+		args.Items.Schema.MaxLength == nil || *args.Items.Schema.MaxLength != 256 {
+		t.Fatalf("container argument bounds = %v items of %v bytes, want 8 of 256", args.MaxItems, args.Items.Schema.MaxLength)
+	}
+
+	template := driver.Properties["workflowTemplate"]
+	if template.Properties["digest"].Pattern != SHA256DigestPattern {
+		t.Fatal("WorkflowTemplate digest is not pinned")
+	}
+
+	trust := root.Properties["status"].Properties["trust"]
+	for _, state := range []string{`"Approved"`, `"Diagnostic"`, `"Rejected"`, `"Revoked"`} {
+		if !containsJSONEnum(trust.Properties["state"].Enum, state) {
+			t.Fatalf("trust enum = %s, missing %s", trust.Properties["state"].Enum, state)
+		}
+	}
+
+	parameters := spec.Properties["parameters"]
+	if parameters.MaxItems == nil || *parameters.MaxItems != MaxTestParameters {
+		t.Fatalf("parameter maxItems = %v, want %d", parameters.MaxItems, MaxTestParameters)
+	}
+
+	typedValue := parameters.Items.Schema.Properties["default"]
+	if len(typedValue.XValidations) != 1 {
+		t.Fatalf("typed value validation count = %d, want 1", len(typedValue.XValidations))
+	}
+
+	metrics := spec.Properties["metrics"]
+	if metrics.MaxItems == nil || *metrics.MaxItems != MaxTestMetrics {
+		t.Fatalf("metric maxItems = %v, want %d", metrics.MaxItems, MaxTestMetrics)
+	}
+
+	roles := spec.Properties["topology"].Properties["roles"]
+	if roles.MaxItems == nil || *roles.MaxItems != MaxTestRoles {
+		t.Fatalf("role maxItems = %v, want %d", roles.MaxItems, MaxTestRoles)
+	}
+}
+
+func TestCertificationSuitePhaseContract(t *testing.T) {
+	t.Parallel()
+
+	crd := readCRD(t, "signal.unbounded-cloud.io_certificationsuites.yaml")
+	spec := crd.Spec.Versions[0].Schema.OpenAPIV3Schema.Properties["spec"]
+
+	for _, rule := range []string{
+		"(has(self.phases) && size(self.phases) > 0) != (has(self.checks) && size(self.checks) > 0)",
+		"!has(self.checks) || size(self.checks) == 0 || has(self.scriptBundle)",
+		"!has(self.phases) || size(self.phases) == 0 || !has(self.scriptBundle)",
+		"!has(self.phases) || self.phases.map(x, x.stages.size()).sum() <= 32",
+		"!has(self.phases) || self.phases.filter(x, x.role == 'Startup').size() <= 1",
+		"!has(self.phases) || self.phases.filter(x, x.role == 'Terminal').size() <= 1",
+	} {
+		if !hasValidationRule(&spec, rule) {
+			t.Fatalf("Suite spec has no %q migration rule", rule)
+		}
+	}
+
+	phases := spec.Properties["phases"]
+	if phases.MaxItems == nil || *phases.MaxItems != 16 {
+		t.Fatalf("phase maxItems = %v, want 16", phases.MaxItems)
+	}
+
+	if phases.XListType == nil || *phases.XListType != "atomic" {
+		t.Fatalf("phase list type = %v, want atomic", phases.XListType)
+	}
+
+	phase := phases.Items.Schema
+	if !hasValidationRule(
+		phase,
+		"self.role == 'Validation' || self.stages.all(x, x.schedule.mode == 'RunOnce')",
+	) {
+		t.Fatal("Startup and Terminal phases do not require RunOnce stages")
+	}
+
+	phaseStages := phase.Properties["stages"]
+	if phaseStages.MaxItems == nil || *phaseStages.MaxItems != MaxCertificationStages {
+		t.Fatalf("phase stage maxItems = %v, want %d", phaseStages.MaxItems, MaxCertificationStages)
+	}
+
+	stage := phaseStages.Items.Schema
+	for _, property := range []string{
+		"name",
+		"displayName",
+		"test",
+		"parameters",
+		"participantRoles",
+		"schedule",
+		"retry",
+		"optional",
+		"assertions",
+		"perDeviceCoverageInterval",
+	} {
+		if _, found := stage.Properties[property]; !found {
+			t.Fatalf("generated Suite stage has no %s", property)
+		}
+	}
+
+	schedule := stage.Properties["schedule"]
+	for _, rule := range []string{
+		"self.mode != 'RunOnce' || (!has(self.coverageWindow) && !has(self.interval) && !has(self.minExecutions) && !has(self.maxGap))",
+		"self.mode == 'RunOnce' || (has(self.coverageWindow) && has(self.minExecutions) && has(self.maxGap))",
+		"self.mode != 'Periodic' || has(self.interval)",
+		"self.mode == 'Periodic' || !has(self.interval)",
+		"duration(self.invocationTimeout).getMilliseconds() % 1000 == 0",
+		"!has(self.coverageWindow) || duration(self.coverageWindow).getMilliseconds() % 1000 == 0",
+		"!has(self.interval) || duration(self.interval).getMilliseconds() % 1000 == 0",
+		"!has(self.maxGap) || duration(self.maxGap).getMilliseconds() % 1000 == 0",
+		"!has(self.interval) || !has(self.coverageWindow) || !has(self.minExecutions) || duration(self.invocationTimeout).getMilliseconds() + duration(self.interval).getMilliseconds() * (self.minExecutions - 1) <= duration(self.coverageWindow).getMilliseconds()",
+	} {
+		if !hasValidationRule(&schedule, rule) {
+			t.Fatalf("generated stage schedule has no %q validation", rule)
+		}
 	}
 }
 
@@ -143,6 +343,16 @@ func TestCertificationSuiteWorkloadPathBounds(t *testing.T) {
 		maxLength := hostPath.Properties[property].MaxLength
 		if maxLength == nil || *maxLength != MaxWorkloadPathLength {
 			t.Fatalf("%s maxLength = %v, want %d", property, maxLength, MaxWorkloadPathLength)
+		}
+	}
+
+	for _, rule := range []string{
+		"self.mountPath != '/scripts' && !self.mountPath.startsWith('/scripts/') && self.mountPath != '/results' && !self.mountPath.startsWith('/results/')",
+		"(self.path == '/proc/cpuinfo' || self.path == '/proc/meminfo' || self.path == '/proc/version' || self.path == '/proc/sys/kernel/random/boot_id' || self.path == '/sys' || self.path.startsWith('/sys/') || self.path == '/var/lib/project-signal' || self.path.startsWith('/var/lib/project-signal/')) && !self.path.contains('//') && !self.path.contains('/./') && !self.path.contains('/../') && !self.path.endsWith('/.') && !self.path.endsWith('/..')",
+		"!(self.path.startsWith('/proc/') || self.path == '/sys' || self.path.startsWith('/sys/')) || self.readOnly",
+	} {
+		if !hasValidationRule(hostPath, rule) {
+			t.Fatalf("generated host path has no %q validation", rule)
 		}
 	}
 }
@@ -171,6 +381,19 @@ func TestCertificationProfileReferencesSuite(t *testing.T) {
 		if _, found := spec.Properties[removed]; found {
 			t.Fatalf("generated Profile CRD still owns %s", removed)
 		}
+	}
+
+	for _, property := range []string{"participantRoles", "environment"} {
+		if _, found := spec.Properties[property]; !found {
+			t.Fatalf("generated Profile CRD has no %s", property)
+		}
+	}
+
+	if !hasValidationRule(
+		&spec,
+		"!has(self.participantRoles) || size(self.participantRoles) == 0 || self.participantRoles.map(x, x.count).sum() == self.participants.count",
+	) {
+		t.Fatal("Profile participant role counts are not bound to participants.count")
 	}
 }
 
@@ -205,8 +428,14 @@ func TestCertificationRunPinsSuiteAndRemainsImmutable(t *testing.T) {
 		"self.suite == oldSelf.suite":               false,
 		"self.scriptBundle == oldSelf.scriptBundle": false,
 		"self.checks == oldSelf.checks":             false,
-		"has(self.planDigest) == has(oldSelf.planDigest) && (!has(self.planDigest) || self.planDigest == oldSelf.planDigest)":                     false,
-		"has(self.planProvenance) == has(oldSelf.planProvenance) && (!has(self.planProvenance) || self.planProvenance == oldSelf.planProvenance)": false,
+		"has(self.environment) == has(oldSelf.environment) && (!has(self.environment) || self.environment == oldSelf.environment)":                                                                                                                                             false,
+		"has(self.resolvedPlan) == has(oldSelf.resolvedPlan) && (!has(self.resolvedPlan) || self.resolvedPlan == oldSelf.resolvedPlan)":                                                                                                                                        false,
+		"(has(self.resolvedPlan) && size(self.resolvedPlan.phases) > 0) != (has(self.checks) && size(self.checks) > 0)":                                                                                                                                                        false,
+		"!has(self.resolvedPlan) || (has(self.planDigest) && has(self.planProvenance) && has(self.planProvenance.controllerImage))":                                                                                                                                            false,
+		"!has(self.resolvedPlan) || self.resolvedPlan.phases.all(p, p.stages.all(s, s.participantRoles.all(r, r.participantIndexes.all(i, i < size(self.participants)))))":                                                                                                     false,
+		"!has(self.resolvedPlan) || self.resolvedPlan.phases.all(p, p.stages.all(s, (has(s.participantRoles) && size(s.participantRoles) > 0) || (size(self.participants) >= s.test.topology.minParticipants && size(self.participants) <= s.test.topology.maxParticipants)))": false,
+		"has(self.planDigest) == has(oldSelf.planDigest) && (!has(self.planDigest) || self.planDigest == oldSelf.planDigest)":                                                                                                                                                  false,
+		"has(self.planProvenance) == has(oldSelf.planProvenance) && (!has(self.planProvenance) || self.planProvenance == oldSelf.planProvenance)":                                                                                                                              false,
 	}
 
 	for _, validation := range spec.XValidations {
@@ -245,6 +474,57 @@ func TestCertificationRunPlanAndEvidenceContract(t *testing.T) {
 		t.Fatalf("adapter image pattern = %q, want %q", adapterImage.Pattern, DigestPinnedImagePattern)
 	}
 
+	resolvedPlan := spec.Properties["resolvedPlan"]
+	if _, found := resolvedPlan.Properties["phases"]; !found {
+		t.Fatal("Run resolvedPlan has no phases")
+	}
+
+	resolvedStage := resolvedPlan.Properties["phases"].Items.Schema.
+		Properties["stages"].Items.Schema
+	for _, rule := range []string{
+		"!self.qualificationEligible || (self.test.identity.trust == 'Approved' && !self.diagnosticOnly)",
+		"!self.qualificationEligible || !has(self.resolvedInputs) || self.resolvedInputs.all(i, i.state == 'Complete')",
+		"!has(self.resolvedInputs) || self.resolvedInputs.all(i, i.state != 'Incomplete') || (self.diagnosticOnly && !self.qualificationEligible)",
+		"self.test.identity.trust == 'Approved' || (self.diagnosticOnly && !self.qualificationEligible)",
+		"self.test.identity.trust != 'Rejected' && self.test.identity.trust != 'Revoked'",
+		"!has(self.perDeviceCoverageInterval) || self.schedule.mode != 'RunOnce'",
+		"!has(self.schedule.coverageWindow) || !has(self.perDeviceCoverageInterval) || duration(self.perDeviceCoverageInterval) <= duration(self.schedule.coverageWindow)",
+	} {
+		if !hasValidationRule(resolvedStage, rule) {
+			t.Fatalf("resolved stage has no %q trust validation", rule)
+		}
+	}
+
+	resolvedInputs := resolvedStage.Properties["resolvedInputs"]
+	if resolvedInputs.MaxItems == nil || *resolvedInputs.MaxItems != 8 {
+		t.Fatalf("resolved input maxItems = %v, want 8", resolvedInputs.MaxItems)
+	}
+
+	if resolvedInputs.Items.Schema.Properties["digest"].Pattern != SHA256DigestPattern {
+		t.Fatal("resolved input digest is not SHA-256 constrained")
+	}
+
+	for _, rule := range []string{
+		"self.state != 'Complete' || (has(self.resolved) && size(self.resolved.trim()) > 0 && has(self.digest))",
+		"self.state != 'Incomplete' || (has(self.incompleteReason) && size(self.incompleteReason.trim()) > 0 && !has(self.digest))",
+	} {
+		if !hasValidationRule(resolvedInputs.Items.Schema, rule) {
+			t.Fatalf("resolved input has no %q completeness rule", rule)
+		}
+	}
+
+	resolvedRole := resolvedStage.Properties["participantRoles"].Items.Schema
+
+	indexes := resolvedRole.Properties["participantIndexes"]
+	if indexes.MinItems == nil || *indexes.MinItems != 1 ||
+		indexes.MaxItems == nil || *indexes.MaxItems != 8 {
+		t.Fatalf(
+			"resolved role participantIndexes bounds = %v..%v, want 1..8",
+			indexes.MinItems,
+			indexes.MaxItems,
+		)
+	}
+
 	evidence := root.Properties["status"].Properties["evidence"]
 	if maxLength := evidence.Properties["uri"].MaxLength; maxLength == nil || *maxLength != 2048 {
 		t.Fatalf("evidence URI maxLength = %v, want 2048", maxLength)
@@ -277,6 +557,73 @@ func TestCertificationRunPlanAndEvidenceContract(t *testing.T) {
 	checks := identity.Properties["checks"]
 	if checks.MaxItems == nil || *checks.MaxItems != MaxCertificationChecks {
 		t.Fatalf("evidence checks maxItems = %v, want %d", checks.MaxItems, MaxCertificationChecks)
+	}
+
+	checkSummary := checks.Items.Schema
+
+	executionSummary := checkSummary.Properties["execution"]
+	for _, property := range []string{
+		"role",
+		"mode",
+		"configuredCoverageWindow",
+		"startedAt",
+		"finishedAt",
+		"observedCoverageWindow",
+		"invocationCount",
+		"successfulInvocations",
+		"timedOutInvocations",
+		"failedInvocations",
+		"firstInvocationAt",
+		"lastInvocationAt",
+		"maxStartGap",
+	} {
+		if _, found := executionSummary.Properties[property]; !found {
+			t.Fatalf("generated evidence execution summary has no %s", property)
+		}
+	}
+
+	if !hasValidationRule(
+		&executionSummary,
+		"self.successfulInvocations + self.timedOutInvocations + self.failedInvocations == self.invocationCount",
+	) {
+		t.Fatal("evidence execution summary does not reconcile invocation outcomes")
+	}
+
+	stages := identity.Properties["stages"]
+	if stages.MaxItems == nil || *stages.MaxItems != MaxCertificationStages {
+		t.Fatalf("evidence stages maxItems = %v, want %d", stages.MaxItems, MaxCertificationStages)
+	}
+
+	stage := stages.Items.Schema
+	for _, property := range []string{
+		"phaseOrder",
+		"stageOrder",
+		"name",
+		"role",
+		"test",
+		"mode",
+		"verdict",
+		"configuredCoverageWindow",
+		"observedCoverageWindow",
+		"invocationCount",
+		"maxStartGap",
+		"deviceIntervalCoverage",
+		"assertions",
+		"invocationEvidence",
+		"durableEvidenceDigest",
+		"qualificationEligible",
+		"diagnosticOnly",
+	} {
+		if _, found := stage.Properties[property]; !found {
+			t.Fatalf("generated stage evidence has no %s", property)
+		}
+	}
+
+	if !hasValidationRule(
+		&identity,
+		"(has(self.stages) && size(self.stages) > 0) != (has(self.checks) && size(self.checks) > 0)",
+	) {
+		t.Fatal("evidence identity does not distinguish stage and legacy check evidence")
 	}
 }
 
@@ -522,6 +869,46 @@ func TestCertificationRunBackwardDecode(t *testing.T) {
 
 	if run.Spec.PlanDigest != "" || run.Spec.PlanProvenance != nil {
 		t.Fatal("existing Run unexpectedly acquired plan fields")
+	}
+
+	if run.Spec.Checks[0].Execution != nil {
+		t.Fatal("existing Run unexpectedly acquired an execution policy")
+	}
+}
+
+func TestCertificationSuiteBackwardDecode(t *testing.T) {
+	t.Parallel()
+
+	content := []byte(`{
+		"apiVersion":"signal.unbounded-cloud.io/v1alpha1",
+		"kind":"CertificationSuite",
+		"metadata":{"name":"existing"},
+		"spec":{
+			"scriptBundle":{"name":"scripts","digest":"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"},
+			"checks":[{
+				"scriptKey":"check.sh",
+				"backend":"Pod",
+				"backendActiveDeadline":"10m",
+				"minDuration":"5m"
+			}]
+		}
+	}`)
+
+	suite := &CertificationSuite{}
+	if err := json.Unmarshal(content, suite); err != nil {
+		t.Fatalf("decode existing Suite without execution policy: %v", err)
+	}
+
+	if suite.Spec.Checks[0].Execution != nil {
+		t.Fatal("existing Suite unexpectedly acquired an execution policy")
+	}
+
+	if EffectiveCheckExecutionMode(suite.Spec.Checks[0].Execution) != CheckExecutionModeRunOnce {
+		t.Fatal("existing Suite does not retain legacy RunOnce behavior")
+	}
+
+	if SupportsSustainedExecution(suite.Spec.Checks[0].Execution) {
+		t.Fatal("legacy minDuration unexpectedly qualifies as sustained execution")
 	}
 }
 
