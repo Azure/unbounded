@@ -29,13 +29,16 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          # nspawn -> none -> nspawn, each by reprovision, with a soft reboot
-          # and a host reboot at each stop.
+          # Every ordered pair of nspawn, none and container (nspawn and
+          # container in place, any pair with none by reprovision), with a soft
+          # reboot and a host reboot at each stop. The harness opts the host in
+          # to the experimental container mode for this suite.
           - id: isolation-matrix
             suite: isolation-matrix
             timeout: 120
-          # A same-mode declaration and a reprovision refused without the
-          # allow-reprovision annotation.
+          # A same-mode declaration, a reprovision refused without the
+          # allow-reprovision annotation, and container refused on a host that
+          # has not opted in.
           - id: isolation-rollback
             suite: isolation-rollback
             timeout: 60
