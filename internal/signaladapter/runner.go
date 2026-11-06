@@ -70,6 +70,7 @@ const (
 	resultCheckOrderAnnotation = "signal.unbounded-cloud.io/check-result-check-order"
 	resultPlanDigestAnnotation = "signal.unbounded-cloud.io/check-result-plan-digest"
 	runLabel                   = "signal.unbounded-cloud.io/run"
+	runUIDLabel                = "signal.unbounded-cloud.io/run-uid"
 )
 
 type resultLogSource struct {
@@ -243,12 +244,14 @@ func (r *Runner) Execute(ctx context.Context, config Config) (AggregateOutput, e
 	defer cancelExecution()
 
 	controller := true
+	blockOwnerDeletion := true
 	owner := metav1.OwnerReference{
-		APIVersion: workflow.GetAPIVersion(),
-		Kind:       workflow.GetKind(),
-		Name:       workflow.GetName(),
-		UID:        workflow.GetUID(),
-		Controller: &controller,
+		APIVersion:         workflow.GetAPIVersion(),
+		Kind:               workflow.GetKind(),
+		Name:               workflow.GetName(),
+		UID:                workflow.GetUID(),
+		Controller:         &controller,
+		BlockOwnerDeletion: &blockOwnerDeletion,
 	}
 
 	resources, err := RenderResources(
@@ -327,15 +330,16 @@ func (r *Runner) Execute(ctx context.Context, config Config) (AggregateOutput, e
 	waitGroup.Wait()
 
 	results := expandResults(resourceResults, created)
-	endFingerprints := r.captureParticipantFingerprints(context.WithoutCancel(ctx), participants)
+
+	captureContext, cancelCapture := context.WithTimeout(context.WithoutCancel(ctx), r.captureWait())
+	defer cancelCapture()
+
+	endFingerprints := r.captureParticipantFingerprints(captureContext, participants)
 
 	output, err := Aggregate(len(participants), references, results)
 	if err != nil {
 		return finishBackendFailure(fmt.Errorf("aggregate participant results: %w", err))
 	}
-
-	captureContext, cancelCapture := context.WithTimeout(context.Background(), r.captureWait())
-	defer cancelCapture()
 
 	var evidenceComplete bool
 

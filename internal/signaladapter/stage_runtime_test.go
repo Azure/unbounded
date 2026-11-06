@@ -7,6 +7,8 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"fmt"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -45,6 +47,7 @@ func (c *fakeStageClock) Sleep(ctx context.Context, duration time.Duration) erro
 
 type fakeStageExecutor struct {
 	clock    *fakeStageClock
+	duration time.Duration
 	outcomes []signalv1.InvocationOutcome
 	reasons  []signalv1.ResultReasonCode
 	calls    []StageInvocation
@@ -71,17 +74,22 @@ func (e *fakeStageExecutor) ExecuteInvocation(
 
 	started := e.clock.Now()
 	e.starts = append(e.starts, started)
+
+	duration := e.duration
+	if duration == 0 {
+		duration = time.Second
+	}
+
 	e.clock.mu.Lock()
-	e.clock.now = e.clock.now.Add(time.Second)
+	e.clock.now = e.clock.now.Add(duration)
 	e.clock.mu.Unlock()
 	finished := e.clock.Now()
 
 	participants := make([]signalv1.InvocationParticipantResult, 0, len(invocation.Participants))
-	for participantIndex := range invocation.Participants {
-		participant := invocation.Participants[participantIndex]
+	for _, participant := range invocation.Participants {
 		participants = append(participants, signalv1.InvocationParticipantResult{
-			Index:          int32(participantIndex),
-			Role:           invocation.ParticipantRole[int32(participantIndex)],
+			Index:          participant.Index,
+			Role:           invocation.ParticipantRole[participant.Index],
 			Outcome:        outcome,
 			Start:          signalv1.NodeFingerprint{NodeUID: participant.NodeUID, BootID: "boot"},
 			End:            signalv1.NodeFingerprint{NodeUID: participant.NodeUID, BootID: "boot"},
@@ -103,7 +111,7 @@ func (e *fakeStageExecutor) ExecuteInvocation(
 		ResolvedInputs:    invocation.Stage.ResolvedInputs,
 		StartedAt:         metav1.NewTime(started),
 		FinishedAt:        metav1.NewTime(finished),
-		MonotonicDuration: metav1.Duration{Duration: time.Second},
+		MonotonicDuration: metav1.Duration{Duration: duration},
 		Outcome:           outcome,
 		ReasonCode:        reason,
 		Measurements: []signalv1.MetricMeasurement{{
@@ -171,6 +179,36 @@ func TestStageRunnerPeriodicUsesAnchoredCadence(t *testing.T) {
 		if got := executor.starts[index]; !got.Equal(want) {
 			t.Fatalf("invocation %d start = %s, want %s", index, got, want)
 		}
+	}
+}
+
+func TestStageRunnerPeriodicObservesFullCoverageWindow(t *testing.T) {
+	t.Parallel()
+
+	start := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+	clock := &fakeStageClock{now: start}
+	executor := &fakeStageExecutor{clock: clock, duration: 100 * time.Millisecond}
+	minimum := int32(4)
+	request := stageExecutionRequest(signalv1.StageSchedule{
+		Mode:              signalv1.CheckExecutionModePeriodic,
+		InvocationTimeout: metav1.Duration{Duration: time.Second},
+		CoverageWindow:    &metav1.Duration{Duration: 10 * time.Second},
+		Interval:          &metav1.Duration{Duration: 3 * time.Second},
+		MinExecutions:     &minimum,
+		MaxGap:            &metav1.Duration{Duration: 4 * time.Second},
+	})
+
+	summary, err := (StageRunner{Clock: clock, Executor: executor}).Execute(context.Background(), request)
+	if err != nil {
+		t.Fatalf("Execute() error = %v", err)
+	}
+
+	if summary.Verdict != signalv1.StageVerdictPassed {
+		t.Fatalf("summary = %#v, want Passed", summary)
+	}
+
+	if got := summary.FinishedAt.Sub(summary.StartedAt.Time); got != 10*time.Second {
+		t.Fatalf("observed window = %s, want 10s", got)
 	}
 }
 
@@ -356,6 +394,69 @@ func TestStageRunnerRejectsRawGPUIdentity(t *testing.T) {
 	}
 }
 
+func TestStageRunnerRejectsGroupPassWithoutParticipantPass(t *testing.T) {
+	t.Parallel()
+
+	clock := &fakeStageClock{now: time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)}
+	request := stageExecutionRequest(signalv1.StageSchedule{
+		Mode:              signalv1.CheckExecutionModeRunOnce,
+		InvocationTimeout: metav1.Duration{Duration: time.Minute},
+	})
+	executor := &participantFailureExecutor{fakeStageExecutor: fakeStageExecutor{clock: clock}}
+
+	summary, err := (StageRunner{Clock: clock, Executor: executor}).Execute(context.Background(), request)
+	if err != nil {
+		t.Fatalf("Execute() error = %v", err)
+	}
+
+	if summary.Verdict != signalv1.StageVerdictInconclusive {
+		t.Fatalf("summary verdict = %s, want Inconclusive", summary.Verdict)
+	}
+}
+
+func TestStageRunnerExecutesOnlyAssignedParticipants(t *testing.T) {
+	t.Parallel()
+
+	clock := &fakeStageClock{now: time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)}
+	request := stageExecutionRequest(signalv1.StageSchedule{
+		Mode:              signalv1.CheckExecutionModeRunOnce,
+		InvocationTimeout: metav1.Duration{Duration: time.Minute},
+	})
+	request.Participants = []signalv1.Participant{
+		{
+			Index:    0,
+			NodeName: "worker-0",
+			NodeUID:  types.UID("node-uid-0"),
+		},
+		{
+			Index:    1,
+			NodeName: "worker-1",
+			NodeUID:  types.UID("node-uid-1"),
+		},
+	}
+	request.Stage.ParticipantRoles = []signalv1.ResolvedStageParticipantRoleBinding{{
+		Role:               "server",
+		ParticipantIndexes: []int32{1},
+	}}
+	executor := &fakeStageExecutor{clock: clock}
+
+	summary, err := (StageRunner{Clock: clock, Executor: executor}).Execute(context.Background(), request)
+	if err != nil {
+		t.Fatalf("Execute() error = %v", err)
+	}
+
+	if summary.Verdict != signalv1.StageVerdictPassed {
+		t.Fatalf("summary verdict = %s, want Passed", summary.Verdict)
+	}
+
+	if len(executor.calls) != 1 ||
+		len(executor.calls[0].Participants) != 1 ||
+		executor.calls[0].Participants[0].Index != 1 ||
+		executor.calls[0].ParticipantRole[1] != "server" {
+		t.Fatalf("assigned invocation = %#v", executor.calls)
+	}
+}
+
 func TestStageRunnerAcceptsSuccessfulRetryOnResume(t *testing.T) {
 	t.Parallel()
 
@@ -393,7 +494,9 @@ func TestStageRunnerAcceptsSuccessfulRetryOnResume(t *testing.T) {
 		t.Fatalf("Execute() error = %v", err)
 	}
 
-	if summary.Verdict != signalv1.StageVerdictPassed || len(executor.calls) != 0 {
+	if summary.Verdict != signalv1.StageVerdictPassed ||
+		len(executor.calls) != 0 ||
+		!summary.StartedAt.Equal(&envelope.StartedAt) {
 		t.Fatalf("resume summary = %#v, new calls = %d", summary, len(executor.calls))
 	}
 }
@@ -426,8 +529,177 @@ func TestStageRunnerBoundsInvocationReferences(t *testing.T) {
 	}
 }
 
+func TestStageRunnerPersistsNegativeOutcomesBeforeAssertions(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name        string
+		outcome     signalv1.InvocationOutcome
+		reason      signalv1.ResultReasonCode
+		wantVerdict signalv1.StageVerdict
+	}{
+		{
+			name:        "failed",
+			outcome:     signalv1.InvocationOutcomeFailed,
+			reason:      signalv1.ResultReasonAssertionFailed,
+			wantVerdict: signalv1.StageVerdictFailed,
+		},
+		{
+			name:        "inconclusive",
+			outcome:     signalv1.InvocationOutcomeInconclusive,
+			reason:      signalv1.ResultReasonInvalidResult,
+			wantVerdict: signalv1.StageVerdictInconclusive,
+		},
+		{
+			name:        "timeout",
+			outcome:     signalv1.InvocationOutcomeInconclusive,
+			reason:      signalv1.ResultReasonTimeout,
+			wantVerdict: signalv1.StageVerdictInconclusive,
+		},
+		{
+			name:        "canceled",
+			outcome:     signalv1.InvocationOutcomeCanceled,
+			reason:      signalv1.ResultReasonCanceled,
+			wantVerdict: signalv1.StageVerdictCanceled,
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+
+			clock := &fakeStageClock{now: time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)}
+			executor := &fakeStageExecutor{
+				clock:    clock,
+				outcomes: []signalv1.InvocationOutcome{test.outcome},
+				reasons:  []signalv1.ResultReasonCode{test.reason},
+			}
+			expected := true
+			request := stageExecutionRequest(signalv1.StageSchedule{
+				Mode:              signalv1.CheckExecutionModeRunOnce,
+				InvocationTimeout: metav1.Duration{Duration: time.Minute},
+			})
+			request.Stage.Assertions = []signalv1.TestAssertion{{
+				Name:     "required-metric",
+				Metric:   "missing",
+				Operator: signalv1.AssertionOperatorBooleanEquals,
+				Expected: &signalv1.TypedValue{
+					Type:         signalv1.TypedValueTypeBoolean,
+					BooleanValue: &expected,
+				},
+			}}
+
+			persisted := false
+			runner := StageRunner{
+				Clock:    clock,
+				Executor: executor,
+				Evidence: func(
+					_ context.Context,
+					_ StageExecutionRequest,
+					envelopes []signalv1.InvocationResultEnvelope,
+				) error {
+					persisted = len(envelopes) == 1 && envelopes[0].Outcome == test.outcome
+
+					return nil
+				},
+			}
+
+			summary, err := runner.Execute(context.Background(), request)
+			if err != nil {
+				t.Fatalf("Execute() error = %v", err)
+			}
+
+			if !persisted {
+				t.Fatal("negative invocation evidence was not persisted")
+			}
+
+			if summary.Verdict != test.wantVerdict {
+				t.Fatalf("verdict = %s, want %s", summary.Verdict, test.wantVerdict)
+			}
+
+			if len(summary.Assertions) != 1 ||
+				summary.Assertions[0].Passed ||
+				summary.Assertions[0].Actual != nil ||
+				summary.Assertions[0].Message == "" {
+				t.Fatalf("missing-metric assertion = %#v", summary.Assertions)
+			}
+
+			if !strings.Contains(summary.Assertions[0].Message, `"expected"`) {
+				t.Fatalf("assertion message does not retain typed expectation: %q", summary.Assertions[0].Message)
+			}
+		})
+	}
+}
+
+func TestStageRunnerPersistsCanceledInvocationWithLiveContext(t *testing.T) {
+	t.Parallel()
+
+	clock := &fakeStageClock{now: time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)}
+	request := stageExecutionRequest(signalv1.StageSchedule{
+		Mode:              signalv1.CheckExecutionModeRunOnce,
+		InvocationTimeout: metav1.Duration{Duration: time.Minute},
+	})
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	persisted := false
+	cancelDeadlineObserved := false
+	runner := StageRunner{
+		Clock:    clock,
+		Executor: canceledStageExecutor{deadlineObserved: &cancelDeadlineObserved},
+		Evidence: func(
+			evidenceCtx context.Context,
+			_ StageExecutionRequest,
+			envelopes []signalv1.InvocationResultEnvelope,
+		) error {
+			if err := evidenceCtx.Err(); err != nil {
+				return fmt.Errorf("evidence context is canceled: %w", err)
+			}
+
+			persisted = len(envelopes) == 1 &&
+				envelopes[0].Outcome == signalv1.InvocationOutcomeCanceled
+
+			return nil
+		},
+	}
+
+	summary, err := runner.Execute(ctx, request)
+	if err != nil {
+		t.Fatalf("Execute() error = %v", err)
+	}
+
+	if !persisted {
+		t.Fatal("canceled invocation evidence was not persisted")
+	}
+
+	if !cancelDeadlineObserved {
+		t.Fatal("canceled invocation cleanup context has no deadline")
+	}
+
+	if summary.Verdict != signalv1.StageVerdictCanceled {
+		t.Fatalf("verdict = %s, want Canceled", summary.Verdict)
+	}
+}
+
 type activityDroppingExecutor struct {
 	fakeStageExecutor
+}
+
+type canceledStageExecutor struct {
+	deadlineObserved *bool
+}
+
+func (canceledStageExecutor) ExecuteInvocation(
+	ctx context.Context,
+	_ StageInvocation,
+) (signalv1.InvocationResultEnvelope, error) {
+	return signalv1.InvocationResultEnvelope{}, ctx.Err()
+}
+
+func (e canceledStageExecutor) CancelInvocation(ctx context.Context, _ StageInvocation) error {
+	_, *e.deadlineObserved = ctx.Deadline()
+
+	return nil
 }
 
 type resolvedInputDroppingExecutor struct {
@@ -454,6 +726,20 @@ func (e *rawDeviceExecutor) ExecuteInvocation(
 ) (signalv1.InvocationResultEnvelope, error) {
 	envelope, err := e.fakeStageExecutor.ExecuteInvocation(ctx, invocation)
 	envelope.Participants[0].VisibleDevices = []string{"GPU-aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"}
+
+	return envelope, err
+}
+
+type participantFailureExecutor struct {
+	fakeStageExecutor
+}
+
+func (e *participantFailureExecutor) ExecuteInvocation(
+	ctx context.Context,
+	invocation StageInvocation,
+) (signalv1.InvocationResultEnvelope, error) {
+	envelope, err := e.fakeStageExecutor.ExecuteInvocation(ctx, invocation)
+	envelope.Participants[0].Outcome = signalv1.InvocationOutcomeFailed
 
 	return envelope, err
 }

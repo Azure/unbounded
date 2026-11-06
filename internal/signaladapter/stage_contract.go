@@ -10,13 +10,16 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"reflect"
 	"sort"
 	"strconv"
 
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
 
 	signalv1 "github.com/Azure/unbounded/api/signal/v1alpha1"
@@ -31,6 +34,9 @@ const (
 	stageResultPhaseOrderAnnotation   = "signal.unbounded-cloud.io/stage-result-phase-order"
 	stageResultStageOrderAnnotation   = "signal.unbounded-cloud.io/stage-result-stage-order"
 	stageResultRunnerImagesAnnotation = "signal.unbounded-cloud.io/stage-result-runner-images"
+	stageEvidenceRunUIDLabel          = "signal.unbounded-cloud.io/evidence-run-uid"
+	stageEvidencePhaseOrderLabel      = "signal.unbounded-cloud.io/evidence-phase-order"
+	stageEvidenceStageOrderLabel      = "signal.unbounded-cloud.io/evidence-stage-order"
 )
 
 type StageRequest struct {
@@ -89,28 +95,123 @@ func (r *Runner) ResolveStageRequest(
 		StageOrder:                     int32(request.StageIndex),
 		PhaseRole:                      phase.Role,
 		Stage:                          *phase.Stages[request.StageIndex].DeepCopy(),
-		Participants:                   append([]signalv1.Participant(nil), run.Spec.Participants...),
+		Participants:                   indexedParticipants(run.Spec.Participants),
 		DuplicateQualificationIdentity: duplicate,
 	}
 
-	evidence, err := r.Kubernetes.CoreV1().ConfigMaps(request.Namespace).
-		Get(ctx, request.ResultConfigMap+"-evidence", metav1.GetOptions{})
-	if err == nil {
-		if evidence.Annotations[stageResultRunUIDAnnotation] != string(run.UID) ||
-			evidence.Annotations[stageResultPlanDigestAnnotation] != run.Spec.PlanDigest ||
-			evidence.Annotations[stageResultPhaseOrderAnnotation] != strconv.Itoa(request.PhaseIndex) ||
-			evidence.Annotations[stageResultStageOrderAnnotation] != strconv.Itoa(request.StageIndex) {
-			return StageExecutionRequest{}, errors.New("persisted invocation evidence identity mismatch")
-		}
-
-		if err := json.Unmarshal(evidence.BinaryData[resultDataKey], &resolved.Resume); err != nil {
-			return StageExecutionRequest{}, fmt.Errorf("decode persisted invocation evidence: %w", err)
-		}
-	} else if !apierrors.IsNotFound(err) {
-		return StageExecutionRequest{}, fmt.Errorf("read persisted invocation evidence: %w", err)
+	resume, err := r.latestInvocationEvidence(ctx, request, &run)
+	if err != nil {
+		return StageExecutionRequest{}, err
 	}
 
+	resolved.Resume = resume
+
 	return resolved, nil
+}
+
+func indexedParticipants(participants []signalv1.Participant) []signalv1.Participant {
+	indexed := append([]signalv1.Participant(nil), participants...)
+	for index := range indexed {
+		indexed[index].Index = int32(index)
+	}
+
+	return indexed
+}
+
+func (r *Runner) latestInvocationEvidence(
+	ctx context.Context,
+	request StageRequest,
+	run *signalv1.CertificationRun,
+) ([]signalv1.InvocationResultEnvelope, error) {
+	candidates := make(map[string]*corev1.ConfigMap)
+	baseName := request.ResultConfigMap + "-evidence"
+
+	base, err := r.Kubernetes.CoreV1().ConfigMaps(request.Namespace).
+		Get(ctx, baseName, metav1.GetOptions{})
+	if err == nil {
+		candidates[base.Name] = base
+	} else if !apierrors.IsNotFound(err) {
+		return nil, fmt.Errorf("read persisted invocation evidence: %w", err)
+	}
+
+	selector := fmt.Sprintf(
+		"%s=%s,%s=%d,%s=%d",
+		stageEvidenceRunUIDLabel,
+		run.UID,
+		stageEvidencePhaseOrderLabel,
+		request.PhaseIndex,
+		stageEvidenceStageOrderLabel,
+		request.StageIndex,
+	)
+
+	list, err := r.Kubernetes.CoreV1().ConfigMaps(request.Namespace).
+		List(ctx, metav1.ListOptions{LabelSelector: selector})
+	if err != nil {
+		return nil, fmt.Errorf("list persisted invocation evidence: %w", err)
+	}
+
+	for index := range list.Items {
+		candidate := &list.Items[index]
+		candidates[candidate.Name] = candidate
+	}
+
+	versions := make([][]signalv1.InvocationResultEnvelope, 0, len(candidates))
+
+	for _, candidate := range candidates {
+		envelopes, err := decodeInvocationEvidence(candidate, request, run)
+		if err != nil {
+			return nil, err
+		}
+
+		versions = append(versions, envelopes)
+	}
+
+	sort.Slice(versions, func(left, right int) bool {
+		return len(versions[left]) < len(versions[right])
+	})
+
+	for index := 1; index < len(versions); index++ {
+		previous := versions[index-1]
+
+		current := versions[index]
+		if len(previous) == len(current) {
+			if !reflect.DeepEqual(previous, current) {
+				return nil, errors.New("persisted invocation evidence versions conflict")
+			}
+
+			continue
+		}
+
+		if !reflect.DeepEqual(previous, current[:len(previous)]) {
+			return nil, errors.New("persisted invocation evidence is not append-only")
+		}
+	}
+
+	if len(versions) == 0 {
+		return nil, nil
+	}
+
+	return versions[len(versions)-1], nil
+}
+
+func decodeInvocationEvidence(
+	evidence *corev1.ConfigMap,
+	request StageRequest,
+	run *signalv1.CertificationRun,
+) ([]signalv1.InvocationResultEnvelope, error) {
+	if evidence.Annotations[stageResultRunUIDAnnotation] != string(run.UID) ||
+		evidence.Annotations[stageResultPlanDigestAnnotation] != run.Spec.PlanDigest ||
+		evidence.Annotations[stageResultPhaseOrderAnnotation] != strconv.Itoa(request.PhaseIndex) ||
+		evidence.Annotations[stageResultStageOrderAnnotation] != strconv.Itoa(request.StageIndex) {
+		return nil, errors.New("persisted invocation evidence identity mismatch")
+	}
+
+	var envelopes []signalv1.InvocationResultEnvelope
+	if err := json.Unmarshal(evidence.BinaryData[resultDataKey], &envelopes); err != nil {
+		return nil, fmt.Errorf("decode persisted invocation evidence: %w", err)
+	}
+
+	return envelopes, nil
 }
 
 func (r *Runner) PersistStageResult(
@@ -167,7 +268,10 @@ func (r *Runner) PersistStageResult(
 		return fmt.Errorf("get owning Workflow: %w", err)
 	}
 
-	runnerImages := stageRunnerImages(execution.Stage)
+	runnerImages, err := r.stageRunnerImages(ctx, request.Namespace, execution.Stage)
+	if err != nil {
+		return err
+	}
 
 	runnerImagesJSON, err := json.Marshal(runnerImages)
 	if err != nil {
@@ -242,10 +346,21 @@ func (r *Runner) PersistInvocationEvidence(
 	controller := true
 	immutable := true
 	digest := sha256.Sum256(content)
+
+	name := request.ResultConfigMap + "-evidence"
+	if len(envelopes) > 1 {
+		name += "-" + strconv.Itoa(len(envelopes))
+	}
+
 	result := &corev1.ConfigMap{
 		ObjectMeta: metav1.ObjectMeta{
-			Name:      request.ResultConfigMap + "-evidence",
+			Name:      name,
 			Namespace: request.Namespace,
+			Labels: map[string]string{
+				stageEvidenceRunUIDLabel:     string(execution.RunUID),
+				stageEvidencePhaseOrderLabel: strconv.Itoa(int(execution.PhaseOrder)),
+				stageEvidenceStageOrderLabel: strconv.Itoa(int(execution.StageOrder)),
+			},
 			Annotations: map[string]string{
 				stageResultRunUIDAnnotation:     string(execution.RunUID),
 				stageResultPlanDigestAnnotation: execution.PlanDigest,
@@ -341,7 +456,11 @@ func driverIdentity(driver signalv1.CertificationTestDriver) (string, error) {
 	return hex.EncodeToString(digest[:]), nil
 }
 
-func stageRunnerImages(stage signalv1.ResolvedStagePlan) []string {
+func (r *Runner) stageRunnerImages(
+	ctx context.Context,
+	namespace string,
+	stage signalv1.ResolvedStagePlan,
+) ([]string, error) {
 	images := make([]string, 0, 2)
 
 	switch stage.Test.Driver.Type {
@@ -354,16 +473,76 @@ func stageRunnerImages(stage signalv1.ResolvedStagePlan) []string {
 			images = append(images, stage.Test.Driver.Container.Image)
 		}
 	case signalv1.TestDriverTypeWorkflowTemplate:
-		for _, input := range stage.ResolvedInputs {
-			if input.Kind == signalv1.ResolvedInputKindImage &&
-				input.State == signalv1.ResolvedInputStateComplete &&
-				signalv1.IsDigestPinnedImage(input.Resolved) {
-				images = append(images, input.Resolved)
+		driver := stage.Test.Driver.WorkflowTemplate
+		if driver == nil {
+			return nil, errors.New("WorkflowTemplate driver configuration is absent")
+		}
+
+		templateGVR := schema.GroupVersionResource{
+			Group:    "argoproj.io",
+			Version:  "v1alpha1",
+			Resource: "workflowtemplates",
+		}
+
+		template, err := r.Dynamic.Resource(templateGVR).Namespace(namespace).
+			Get(ctx, driver.Name, metav1.GetOptions{})
+		if err != nil {
+			return nil, fmt.Errorf("get approved WorkflowTemplate provenance: %w", err)
+		}
+
+		if err := validateWorkflowTemplateIdentity(StageInvocation{Stage: stage}, template); err != nil {
+			return nil, err
+		}
+
+		spec, found, err := unstructured.NestedFieldNoCopy(template.Object, "spec")
+		if err != nil {
+			return nil, fmt.Errorf("decode WorkflowTemplate provenance: %w", err)
+		}
+
+		if !found {
+			return nil, errors.New("approved WorkflowTemplate has no spec")
+		}
+
+		images = workflowTemplateImages(spec)
+		for _, image := range images {
+			if !signalv1.IsDigestPinnedImage(image) {
+				return nil, fmt.Errorf("WorkflowTemplate image %q is not digest pinned", image)
 			}
 		}
 	}
 
 	sort.Strings(images)
+
+	return slicesCompact(images), nil
+}
+
+func workflowTemplateImages(value any) []string {
+	images := make([]string, 0, 4)
+
+	var walk func(any)
+
+	walk = func(current any) {
+		switch typed := current.(type) {
+		case map[string]any:
+			for key, child := range typed {
+				if key == "image" {
+					if image, ok := child.(string); ok {
+						images = append(images, image)
+					}
+
+					continue
+				}
+
+				walk(child)
+			}
+		case []any:
+			for _, child := range typed {
+				walk(child)
+			}
+		}
+	}
+
+	walk(value)
 
 	return slicesCompact(images)
 }

@@ -10,6 +10,7 @@ import (
 	"os"
 	osSignal "os/signal"
 	"syscall"
+	"time"
 
 	"github.com/spf13/cobra"
 	"k8s.io/apimachinery/pkg/types"
@@ -22,7 +23,10 @@ import (
 	"github.com/Azure/unbounded/internal/version"
 )
 
-const adapterName = "project-signal-adapter"
+const (
+	adapterName                   = "project-signal-adapter"
+	stageResultPersistenceTimeout = 30 * time.Second
+)
 
 type config struct {
 	signaladapter.Request
@@ -133,7 +137,10 @@ func run(ctx context.Context, cfg config) error {
 			return executeErr
 		}
 
-		return runner.PersistStageResult(ctx, request, execution, summary)
+		persistCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), stageResultPersistenceTimeout)
+		defer cancel()
+
+		return runner.PersistStageResult(persistCtx, request, execution, summary)
 	}
 
 	resolved, check, err := runner.ResolveRequest(ctx, cfg.Request)
@@ -146,7 +153,10 @@ func run(ctx context.Context, cfg config) error {
 		return err
 	}
 
-	return runner.PersistResult(ctx, cfg.Request, check, output)
+	persistCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), stageResultPersistenceTimeout)
+	defer cancel()
+
+	return runner.PersistResult(persistCtx, cfg.Request, check, output)
 }
 
 type uidValue struct {

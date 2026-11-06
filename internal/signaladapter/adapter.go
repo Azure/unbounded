@@ -1393,7 +1393,7 @@ func workloadVolumes(scriptConfigMap string, policy signalv1.WorkloadPolicy) []c
 
 	for index := range policy.HostPaths {
 		hostPath := &policy.HostPaths[index]
-		hostPathType := corev1.HostPathDirectory
+		hostPathType := workloadHostPathType(hostPath.Path)
 		volumes = append(volumes, corev1.Volume{
 			Name: signalworkload.HostPathVolumeName(index),
 			VolumeSource: corev1.VolumeSource{
@@ -1415,11 +1415,23 @@ func workloadVolumeMounts(policy signalv1.WorkloadPolicy) []corev1.VolumeMount {
 		mounts = append(mounts, corev1.VolumeMount{
 			Name:      signalworkload.HostPathVolumeName(index),
 			MountPath: hostPath.MountPath,
-			ReadOnly:  true,
+			ReadOnly:  hostPath.ReadOnly,
 		})
 	}
 
 	return mounts
+}
+
+func workloadHostPathType(path string) corev1.HostPathType {
+	switch path {
+	case "/proc/cpuinfo",
+		"/proc/meminfo",
+		"/proc/version",
+		"/proc/sys/kernel/random/boot_id":
+		return corev1.HostPathFile
+	default:
+		return corev1.HostPathDirectory
+	}
 }
 
 func resultVolumeMounts() []corev1.VolumeMount {
@@ -1502,6 +1514,7 @@ func runLabels(config Config) map[string]string {
 	return map[string]string{
 		"app.kubernetes.io/name":        "project-signal-adapter",
 		"signal.unbounded-cloud.io/run": config.ExecutionName,
+		runUIDLabel:                     string(config.RunUID),
 	}
 }
 
@@ -1553,6 +1566,10 @@ func ownerReferenceMap(reference metav1.OwnerReference) map[string]any {
 	}
 	if reference.Controller != nil {
 		result["controller"] = *reference.Controller
+	}
+
+	if reference.BlockOwnerDeletion != nil {
+		result["blockOwnerDeletion"] = *reference.BlockOwnerDeletion
 	}
 
 	return result

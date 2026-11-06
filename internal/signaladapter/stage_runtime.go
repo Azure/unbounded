@@ -25,7 +25,11 @@ import (
 	signalv1 "github.com/Azure/unbounded/api/signal/v1alpha1"
 )
 
-const maxInvocationEvidenceReferences = 8
+const (
+	maxInvocationEvidenceReferences = 8
+	stageCancellationTimeout        = 30 * time.Second
+	stageEvidencePersistenceTimeout = 30 * time.Second
+)
 
 type StageClock interface {
 	Now() time.Time
@@ -109,11 +113,18 @@ func (r StageRunner) Execute(ctx context.Context, request StageExecutionRequest)
 		return signalv1.StageEvidenceSummary{}, err
 	}
 
-	startedAt := clock.Now()
+	participants := stageInvocationParticipants(request.Participants, roles)
 
 	envelopes := slices.Clone(request.Resume)
-	if err := validateResumeEnvelopes(request, envelopes); err != nil {
+	if err := validateResumeEnvelopes(request, participants, roles, envelopes); err != nil {
 		return signalv1.StageEvidenceSummary{}, err
+	}
+
+	startedAt := clock.Now()
+	for index := range envelopes {
+		if envelopes[index].StartedAt.Time.Before(startedAt) {
+			startedAt = envelopes[index].StartedAt.Time
+		}
 	}
 
 	nextOrdinal := int32(len(envelopes))
@@ -123,6 +134,8 @@ func (r StageRunner) Execute(ctx context.Context, request StageExecutionRequest)
 	if schedule.CoverageWindow != nil {
 		windowEnd = startedAt.Add(schedule.CoverageWindow.Duration)
 	}
+
+	schedulerCanceled := false
 
 	for schedule.Mode != signalv1.CheckExecutionModeRunOnce || nextOrdinal <= 0 {
 		if schedule.Mode != signalv1.CheckExecutionModeRunOnce {
@@ -134,6 +147,8 @@ func (r StageRunner) Execute(ctx context.Context, request StageExecutionRequest)
 					}
 
 					if err := clock.Sleep(ctx, maxDuration(0, nextStart.Sub(clock.Now()))); err != nil {
+						schedulerCanceled = errors.Is(err, context.Canceled)
+
 						break
 					}
 				} else if !clock.Now().Before(windowEnd) {
@@ -146,7 +161,7 @@ func (r StageRunner) Execute(ctx context.Context, request StageExecutionRequest)
 			}
 		}
 
-		envelope := r.executeWithRetry(ctx, clock, request, roles, nextOrdinal)
+		envelope := r.executeWithRetry(ctx, clock, request, participants, roles, nextOrdinal)
 		envelopes = append(envelopes, envelope)
 		nextOrdinal++
 
@@ -155,26 +170,36 @@ func (r StageRunner) Execute(ctx context.Context, request StageExecutionRequest)
 		}
 	}
 
-	finishedAt := clock.Now()
-
-	summary, err := summarizeStageExecution(request, startedAt, finishedAt, envelopes)
-	if err != nil {
-		return signalv1.StageEvidenceSummary{}, err
+	if schedule.Mode != signalv1.CheckExecutionModeRunOnce && clock.Now().Before(windowEnd) {
+		if err := clock.Sleep(ctx, windowEnd.Sub(clock.Now())); err != nil {
+			schedulerCanceled = errors.Is(err, context.Canceled)
+		}
 	}
 
+	finishedAt := clock.Now()
+
 	if r.Evidence != nil {
-		if err := r.Evidence(ctx, request, envelopes); err != nil {
+		evidenceCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), stageEvidencePersistenceTimeout)
+		defer cancel()
+
+		if err := r.Evidence(evidenceCtx, request, envelopes); err != nil {
 			return signalv1.StageEvidenceSummary{}, fmt.Errorf("persist invocation evidence: %w", err)
 		}
 	}
 
-	return summary, nil
+	summary, err := summarizeStageExecution(request, startedAt, finishedAt, envelopes)
+	if schedulerCanceled && err == nil {
+		summary.Verdict = signalv1.StageVerdictCanceled
+	}
+
+	return summary, err
 }
 
 func (r StageRunner) executeWithRetry(
 	ctx context.Context,
 	clock StageClock,
 	request StageExecutionRequest,
+	participants []signalv1.Participant,
 	roles map[int32]string,
 	ordinal int32,
 ) signalv1.InvocationResultEnvelope {
@@ -195,7 +220,7 @@ func (r StageRunner) executeWithRetry(
 			Ordinal:         ordinal,
 			Attempt:         attempt,
 			Stage:           *request.Stage.DeepCopy(),
-			Participants:    slices.Clone(request.Participants),
+			Participants:    slices.Clone(participants),
 			ParticipantRole: roles,
 		}
 
@@ -212,14 +237,30 @@ func (r StageRunner) executeWithRetry(
 				envelope.Outcome = signalv1.InvocationOutcomeInconclusive
 
 				envelope.ReasonCode = signalv1.ResultReasonTimeout
-				if cancelErr := r.Executor.CancelInvocation(context.WithoutCancel(ctx), invocation); cancelErr != nil {
+				cancelCtx, cancelInvocation := context.WithTimeout(
+					context.WithoutCancel(ctx),
+					stageCancellationTimeout,
+				)
+				cancelErr := r.Executor.CancelInvocation(cancelCtx, invocation)
+
+				cancelInvocation()
+
+				if cancelErr != nil {
 					envelope.Message = boundedStageMessage("cancel timed-out invocation: " + cancelErr.Error())
 				}
 			} else if errors.Is(err, context.Canceled) {
 				envelope.Outcome = signalv1.InvocationOutcomeCanceled
 
 				envelope.ReasonCode = signalv1.ResultReasonCanceled
-				if cancelErr := r.Executor.CancelInvocation(context.WithoutCancel(ctx), invocation); cancelErr != nil {
+				cancelCtx, cancelInvocation := context.WithTimeout(
+					context.WithoutCancel(ctx),
+					stageCancellationTimeout,
+				)
+				cancelErr := r.Executor.CancelInvocation(cancelCtx, invocation)
+
+				cancelInvocation()
+
+				if cancelErr != nil {
 					envelope.Message = boundedStageMessage("cancel interrupted invocation: " + cancelErr.Error())
 				}
 			}
@@ -258,13 +299,13 @@ func failedInvocationEnvelope(invocation StageInvocation, now time.Time, cause e
 	}
 
 	participants := make([]signalv1.InvocationParticipantResult, 0, len(invocation.Participants))
-	for index := range invocation.Participants {
+	for _, participant := range invocation.Participants {
 		participants = append(participants, signalv1.InvocationParticipantResult{
-			Index:   int32(index),
-			Role:    invocation.ParticipantRole[int32(index)],
+			Index:   participant.Index,
+			Role:    invocation.ParticipantRole[participant.Index],
 			Outcome: signalv1.InvocationOutcomeInconclusive,
-			Start:   signalv1.NodeFingerprint{NodeUID: invocation.Participants[index].NodeUID},
-			End:     signalv1.NodeFingerprint{NodeUID: invocation.Participants[index].NodeUID},
+			Start:   signalv1.NodeFingerprint{NodeUID: participant.NodeUID},
+			End:     signalv1.NodeFingerprint{NodeUID: participant.NodeUID},
 		})
 	}
 
@@ -316,17 +357,23 @@ func validateInvocationEnvelope(invocation StageInvocation, envelope *signalv1.I
 		}
 	}
 
-	expectedParticipants := make(map[int32]string, len(invocation.Participants))
-	for index := range invocation.Participants {
-		expectedParticipants[int32(index)] = invocation.ParticipantRole[int32(index)]
+	expectedParticipants := make(map[int32]signalv1.Participant, len(invocation.Participants))
+	for _, participant := range invocation.Participants {
+		expectedParticipants[participant.Index] = participant
 	}
 
 	for _, participant := range envelope.Participants {
-		role, exists := expectedParticipants[participant.Index]
-		if !exists || role != participant.Role ||
-			participant.Start.NodeUID != invocation.Participants[participant.Index].NodeUID ||
-			participant.End.NodeUID != invocation.Participants[participant.Index].NodeUID {
+		expected, exists := expectedParticipants[participant.Index]
+		if !exists ||
+			invocation.ParticipantRole[participant.Index] != participant.Role ||
+			participant.Start.NodeUID != expected.NodeUID ||
+			participant.End.NodeUID != expected.NodeUID {
 			return errors.New("invocation participant identity or role does not match the immutable stage")
+		}
+
+		if envelope.Outcome == signalv1.InvocationOutcomePassed &&
+			participant.Outcome != signalv1.InvocationOutcomePassed {
+			return errors.New("passed invocation includes a participant without a passed outcome")
 		}
 
 		for _, device := range append(
@@ -447,12 +494,16 @@ func stageVerdict(
 		return signalv1.StageVerdictCanceled
 	}
 
-	if summary.FailedInvocations > 0 || !assertionsPass {
+	if summary.FailedInvocations > 0 {
 		return signalv1.StageVerdictFailed
 	}
 
 	if summary.TimedOutInvocations > 0 || summary.InconclusiveInvocations > 0 {
 		return signalv1.StageVerdictInconclusive
+	}
+
+	if !assertionsPass {
+		return signalv1.StageVerdictFailed
 	}
 
 	if request.DuplicateQualificationIdentity {
@@ -493,10 +544,6 @@ func evaluateStageAssertions(
 	measurements := make(map[string]signalv1.TypedValue)
 
 	for _, envelope := range envelopes {
-		if envelope.Outcome != signalv1.InvocationOutcomePassed {
-			continue
-		}
-
 		for _, measurement := range envelope.Measurements {
 			measurements[measurement.Name] = measurement.Value
 		}
@@ -508,23 +555,61 @@ func evaluateStageAssertions(
 	for _, assertion := range stage.Assertions {
 		actual, exists := measurements[assertion.Metric]
 		if !exists {
-			return nil, false, fmt.Errorf("required assertion metric %s is absent", assertion.Metric)
+			results = append(results, signalv1.AssertionResult{
+				Name:    assertion.Name,
+				Passed:  false,
+				Message: missingAssertionMetricMessage(assertion),
+			})
+			allPassed = false
+
+			continue
 		}
 
 		passed, err := evaluateAssertion(assertion, actual, measurements)
 		if err != nil {
-			return nil, false, fmt.Errorf("evaluate assertion %s: %w", assertion.Name, err)
+			results = append(results, signalv1.AssertionResult{
+				Name:    assertion.Name,
+				Passed:  false,
+				Actual:  actual.DeepCopy(),
+				Message: boundedStageMessage("assertion evaluation failed: " + err.Error()),
+			})
+			allPassed = false
+
+			continue
 		}
 
 		results = append(results, signalv1.AssertionResult{
 			Name:   assertion.Name,
 			Passed: passed,
-			Actual: actual,
+			Actual: actual.DeepCopy(),
 		})
 		allPassed = allPassed && passed
 	}
 
 	return results, allPassed, nil
+}
+
+func missingAssertionMetricMessage(assertion signalv1.TestAssertion) string {
+	requirement := struct {
+		Metric   string                     `json:"metric"`
+		Operator signalv1.AssertionOperator `json:"operator"`
+		Expected *signalv1.TypedValue       `json:"expected,omitempty"`
+		Minimum  *signalv1.TypedValue       `json:"minimum,omitempty"`
+		Maximum  *signalv1.TypedValue       `json:"maximum,omitempty"`
+	}{
+		Metric:   assertion.Metric,
+		Operator: assertion.Operator,
+		Expected: assertion.Expected,
+		Minimum:  assertion.Minimum,
+		Maximum:  assertion.Maximum,
+	}
+
+	content, err := json.Marshal(requirement)
+	if err != nil {
+		return "required assertion metric is absent"
+	}
+
+	return boundedStageMessage("required assertion metric is absent: " + string(content))
 }
 
 func evaluateAssertion(
@@ -687,7 +772,26 @@ func stageParticipantRoles(stage signalv1.ResolvedStagePlan, participantCount in
 	return roles, nil
 }
 
-func validateResumeEnvelopes(request StageExecutionRequest, envelopes []signalv1.InvocationResultEnvelope) error {
+func stageInvocationParticipants(
+	participants []signalv1.Participant,
+	roles map[int32]string,
+) []signalv1.Participant {
+	selected := make([]signalv1.Participant, 0, len(roles))
+	for index := range participants {
+		if _, assigned := roles[int32(index)]; assigned {
+			selected = append(selected, participants[index])
+		}
+	}
+
+	return selected
+}
+
+func validateResumeEnvelopes(
+	request StageExecutionRequest,
+	participants []signalv1.Participant,
+	roles map[int32]string,
+	envelopes []signalv1.InvocationResultEnvelope,
+) error {
 	maxAttempts := int32(1)
 	if request.Stage.Retry != nil {
 		maxAttempts = request.Stage.Retry.MaxAttempts
@@ -695,19 +799,13 @@ func validateResumeEnvelopes(request StageExecutionRequest, envelopes []signalv1
 
 	for index := range envelopes {
 		invocation := StageInvocation{
-			RunUID:       request.RunUID,
-			PlanDigest:   request.PlanDigest,
-			StageOrder:   request.StageOrder,
-			Stage:        request.Stage,
-			Participants: request.Participants,
+			RunUID:          request.RunUID,
+			PlanDigest:      request.PlanDigest,
+			StageOrder:      request.StageOrder,
+			Stage:           request.Stage,
+			Participants:    participants,
+			ParticipantRole: roles,
 		}
-
-		roles, err := stageParticipantRoles(request.Stage, len(request.Participants))
-		if err != nil {
-			return err
-		}
-
-		invocation.ParticipantRole = roles
 
 		var validationErr error
 

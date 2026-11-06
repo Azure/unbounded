@@ -174,6 +174,94 @@ func TestPersistResultCreatesControllerContractConfigMap(t *testing.T) {
 	}
 }
 
+func TestPersistInvocationEvidenceAppendsImmutableVersions(t *testing.T) {
+	t.Parallel()
+
+	request := StageRequest{
+		Namespace:       "signal-system",
+		WorkflowName:    "run-workflow",
+		RunName:         "certification-run",
+		ExecutionName:   "certification-run-stage",
+		RunUID:          types.UID("run-uid"),
+		PhaseIndex:      1,
+		StageIndex:      2,
+		ResultConfigMap: "certification-run-stage-result",
+	}
+	execution := StageExecutionRequest{
+		RunUID:     request.RunUID,
+		PlanDigest: testStageDigest("plan"),
+		PhaseOrder: int32(request.PhaseIndex),
+		StageOrder: int32(request.StageIndex),
+	}
+	runner := Runner{
+		Dynamic: dynamicfake.NewSimpleDynamicClient(
+			runtime.NewScheme(),
+			testWorkflow(request.WorkflowName, "workflow-uid"),
+		),
+		Kubernetes: kubernetesfake.NewSimpleClientset(),
+	}
+	first := signalv1.InvocationResultEnvelope{InvocationID: "first"}
+	second := signalv1.InvocationResultEnvelope{InvocationID: "second"}
+
+	if err := runner.PersistInvocationEvidence(t.Context(), request, execution, []signalv1.InvocationResultEnvelope{
+		first,
+	}); err != nil {
+		t.Fatalf("persist first invocation evidence: %v", err)
+	}
+
+	if err := runner.PersistInvocationEvidence(t.Context(), request, execution, []signalv1.InvocationResultEnvelope{
+		first,
+		second,
+	}); err != nil {
+		t.Fatalf("append invocation evidence: %v", err)
+	}
+
+	run := &signalv1.CertificationRun{
+		ObjectMeta: metav1.ObjectMeta{UID: request.RunUID},
+		Spec: signalv1.CertificationRunSpec{
+			PlanDigest: execution.PlanDigest,
+		},
+	}
+
+	resume, err := runner.latestInvocationEvidence(t.Context(), request, run)
+	if err != nil {
+		t.Fatalf("latestInvocationEvidence() error = %v", err)
+	}
+
+	if len(resume) != 2 || resume[0].InvocationID != "first" || resume[1].InvocationID != "second" {
+		t.Fatalf("resumed invocation evidence = %#v", resume)
+	}
+
+	configMaps, err := runner.Kubernetes.CoreV1().ConfigMaps(request.Namespace).
+		List(t.Context(), metav1.ListOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if len(configMaps.Items) != 2 {
+		t.Fatalf("invocation evidence ConfigMaps = %d, want 2", len(configMaps.Items))
+	}
+
+	for index := range configMaps.Items {
+		if configMaps.Items[index].Immutable == nil || !*configMaps.Items[index].Immutable {
+			t.Fatalf("invocation evidence ConfigMap is mutable: %#v", configMaps.Items[index])
+		}
+	}
+}
+
+func TestIndexedParticipantsRestoresSerializedPositions(t *testing.T) {
+	t.Parallel()
+
+	participants := indexedParticipants([]signalv1.Participant{
+		{NodeName: "worker-0", NodeUID: "node-uid-0"},
+		{NodeName: "worker-1", NodeUID: "node-uid-1"},
+	})
+
+	if participants[0].Index != 0 || participants[1].Index != 1 {
+		t.Fatalf("indexed participants = %#v", participants)
+	}
+}
+
 func certificationRun() *signalv1.CertificationRun {
 	return &signalv1.CertificationRun{
 		TypeMeta: metav1.TypeMeta{

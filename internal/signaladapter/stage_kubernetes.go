@@ -54,6 +54,66 @@ func (e *KubernetesStageExecutor) ExecuteInvocation(
 	}
 }
 
+func mergeWorkflowArguments(existing any, adapterParameters []any) map[string]any {
+	arguments, ok := existing.(map[string]any)
+	if !ok {
+		arguments = map[string]any{}
+	}
+
+	parameters := []any{}
+	if existingParameters, ok := arguments["parameters"].([]any); ok {
+		parameters = existingParameters
+	}
+
+	byName := make(map[string]any, len(adapterParameters))
+	order := make([]string, 0, len(parameters)+len(adapterParameters))
+
+	for _, parameter := range parameters {
+		typed, ok := parameter.(map[string]any)
+		if !ok {
+			continue
+		}
+
+		name, ok := typed["name"].(string)
+		if !ok || name == "" {
+			continue
+		}
+
+		if _, exists := byName[name]; !exists {
+			order = append(order, name)
+		}
+
+		byName[name] = parameter
+	}
+
+	for _, parameter := range adapterParameters {
+		typed, ok := parameter.(map[string]any)
+		if !ok {
+			continue
+		}
+
+		name, ok := typed["name"].(string)
+		if !ok || name == "" {
+			continue
+		}
+
+		if _, exists := byName[name]; !exists {
+			order = append(order, name)
+		}
+
+		byName[name] = parameter
+	}
+
+	merged := make([]any, 0, len(order))
+	for _, name := range order {
+		merged = append(merged, byName[name])
+	}
+
+	arguments["parameters"] = merged
+
+	return arguments
+}
+
 func (e *KubernetesStageExecutor) CancelInvocation(
 	ctx context.Context,
 	invocation StageInvocation,
@@ -63,8 +123,8 @@ func (e *KubernetesStageExecutor) CancelInvocation(
 
 	var joined error
 
-	for index := range invocation.Participants {
-		name := invocationResourceName(e.ExecutionName, invocation, int32(index))
+	for _, participant := range invocation.Participants {
+		name := invocationResourceName(e.ExecutionName, invocation, participant.Index)
 
 		err := e.Runner.Kubernetes.CoreV1().Pods(e.Namespace).Delete(
 			ctx,
@@ -110,25 +170,49 @@ func (e *KubernetesStageExecutor) executePods(
 
 	var message string
 
-	for index := range invocation.Participants {
-		pod, podErr := e.stagePod(workflow, invocation, int32(index))
+	createdPods := make([]*corev1.Pod, 0, len(invocation.Participants))
+	for position := range invocation.Participants {
+		pod, podErr := e.stagePod(workflow, invocation, position)
 		if podErr != nil {
-			return signalv1.InvocationResultEnvelope{}, podErr
+			return signalv1.InvocationResultEnvelope{}, errors.Join(
+				podErr,
+				e.cleanupStagePods(ctx, createdPods),
+			)
 		}
 
 		created, createErr := e.Runner.Kubernetes.CoreV1().Pods(e.Namespace).
 			Create(ctx, pod, metav1.CreateOptions{})
 		if createErr != nil {
-			return signalv1.InvocationResultEnvelope{}, fmt.Errorf("create stage Pod: %w", createErr)
+			createdPods = append(createdPods, e.createdStagePodAfterError(ctx, workflow, pod))
+
+			return signalv1.InvocationResultEnvelope{}, errors.Join(
+				fmt.Errorf("create stage Pod: %w", createErr),
+				e.cleanupStagePods(ctx, createdPods),
+			)
 		}
 
+		createdPods = append(createdPods, created)
+	}
+
+	for position, created := range createdPods {
 		participantEnvelope, waitErr := e.waitStagePod(ctx, invocation, created)
+		podCleanupErr := e.cleanupStagePods(ctx, []*corev1.Pod{created})
+		createdPods[position] = nil
+
 		if waitErr != nil {
-			return signalv1.InvocationResultEnvelope{}, waitErr
+			return signalv1.InvocationResultEnvelope{}, errors.Join(
+				waitErr,
+				podCleanupErr,
+				e.cleanupStagePods(ctx, createdPods),
+			)
 		}
 
 		if len(participantEnvelope.Participants) != 1 {
-			return signalv1.InvocationResultEnvelope{}, errors.New("participant Pod result must contain one participant")
+			return signalv1.InvocationResultEnvelope{}, errors.Join(
+				errors.New("participant Pod result must contain one participant"),
+				podCleanupErr,
+				e.cleanupStagePods(ctx, createdPods),
+			)
 		}
 
 		participantResults = append(participantResults, participantEnvelope.Participants[0])
@@ -137,13 +221,13 @@ func (e *KubernetesStageExecutor) executePods(
 		}
 
 		activitySamples += participantEnvelope.Activity.SampleCount
-		if participantEnvelope.Outcome != signalv1.InvocationOutcomePassed {
+		if invocationOutcomePrecedence(participantEnvelope.Outcome) > invocationOutcomePrecedence(outcome) {
 			outcome = participantEnvelope.Outcome
 			reason = participantEnvelope.ReasonCode
 			message = participantEnvelope.Message
 		}
 
-		if deleteErr := e.deletePod(ctx, created); deleteErr != nil {
+		if podCleanupErr != nil {
 			cleanup = signalv1.CleanupOutcomeFailed
 
 			if outcome == signalv1.InvocationOutcomePassed {
@@ -191,12 +275,76 @@ func (e *KubernetesStageExecutor) executePods(
 	}, nil
 }
 
+func (e *KubernetesStageExecutor) createdStagePodAfterError(
+	ctx context.Context,
+	workflow *unstructured.Unstructured,
+	pod *corev1.Pod,
+) *corev1.Pod {
+	recoveryCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 30*time.Second)
+	defer cancel()
+
+	created, err := e.Runner.Kubernetes.CoreV1().Pods(e.Namespace).
+		Get(recoveryCtx, pod.Name, metav1.GetOptions{})
+	if err != nil ||
+		created.Labels[runUIDLabel] != pod.Labels[runUIDLabel] ||
+		!podControlledByWorkflow(created, workflow) {
+		return nil
+	}
+
+	return created
+}
+
+func (e *KubernetesStageExecutor) cleanupStagePods(ctx context.Context, pods []*corev1.Pod) error {
+	cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 30*time.Second)
+	defer cancel()
+
+	var joined error
+
+	for _, pod := range pods {
+		if pod == nil {
+			continue
+		}
+
+		if err := e.deletePod(cleanupCtx, pod); err != nil {
+			joined = errors.Join(joined, err)
+		}
+	}
+
+	return joined
+}
+
+func podControlledByWorkflow(pod *corev1.Pod, workflow *unstructured.Unstructured) bool {
+	for _, owner := range pod.OwnerReferences {
+		if owner.UID == workflow.GetUID() &&
+			owner.Controller != nil &&
+			*owner.Controller {
+			return true
+		}
+	}
+
+	return false
+}
+
+func invocationOutcomePrecedence(outcome signalv1.InvocationOutcome) int {
+	switch outcome {
+	case signalv1.InvocationOutcomeCanceled:
+		return 3
+	case signalv1.InvocationOutcomeFailed:
+		return 2
+	case signalv1.InvocationOutcomeInconclusive:
+		return 1
+	default:
+		return 0
+	}
+}
+
 func (e *KubernetesStageExecutor) stagePod(
 	workflow *unstructured.Unstructured,
 	invocation StageInvocation,
-	participantIndex int32,
+	position int,
 ) (*corev1.Pod, error) {
-	participant := invocation.Participants[participantIndex]
+	participant := invocation.Participants[position]
+	participantIndex := participant.Index
 	role := invocation.ParticipantRole[participantIndex]
 	driver := invocation.Stage.Test.Driver
 	name := invocationResourceName(e.ExecutionName, invocation, participantIndex)
@@ -239,7 +387,7 @@ func (e *KubernetesStageExecutor) stagePod(
 
 		source := driver.Script.Source.ConfigMap
 		container.Command = []string{"/bin/sh", "-ceu"}
-		container.Args = []string{scriptInvocationWrapper(source.Key, source.Digest)}
+		container.Args = []string{scriptInvocationWrapper(driver.Script.Language, source.Key, source.Digest)}
 		container.VolumeMounts = []corev1.VolumeMount{{
 			Name:      "script",
 			MountPath: "/scripts",
@@ -254,6 +402,10 @@ func (e *KubernetesStageExecutor) stagePod(
 		container.Args = append([]string(nil), driver.Container.Args...)
 	}
 
+	container.VolumeMounts = append(
+		container.VolumeMounts,
+		stageHostPathMounts(invocation.Stage.Test.Security.HostPaths)...,
+	)
 	applyStageSecurity(&container, invocation.Stage.Test.Security)
 
 	pod := &corev1.Pod{
@@ -261,14 +413,16 @@ func (e *KubernetesStageExecutor) stagePod(
 			Name:      name,
 			Namespace: e.Namespace,
 			Labels: map[string]string{
-				runLabel: string(invocation.RunUID),
+				runLabel:    e.ExecutionName,
+				runUIDLabel: string(invocation.RunUID),
 			},
 			OwnerReferences: []metav1.OwnerReference{{
-				APIVersion: workflow.GetAPIVersion(),
-				Kind:       workflow.GetKind(),
-				Name:       workflow.GetName(),
-				UID:        workflow.GetUID(),
-				Controller: &controller,
+				APIVersion:         workflow.GetAPIVersion(),
+				Kind:               workflow.GetKind(),
+				Name:               workflow.GetName(),
+				UID:                workflow.GetUID(),
+				Controller:         &controller,
+				BlockOwnerDeletion: &controller,
 			}},
 		},
 		Spec: corev1.PodSpec{
@@ -276,6 +430,7 @@ func (e *KubernetesStageExecutor) stagePod(
 			NodeName:      participant.NodeName,
 			HostNetwork:   invocation.Stage.Test.Security.HostNetwork,
 			Containers:    []corev1.Container{container},
+			Volumes:       stageHostPathVolumes(invocation.Stage.Test.Security.HostPaths),
 		},
 	}
 
@@ -292,6 +447,37 @@ func (e *KubernetesStageExecutor) stagePod(
 	}
 
 	return pod, nil
+}
+
+func stageHostPathVolumes(paths []signalv1.WorkloadHostPath) []corev1.Volume {
+	volumes := make([]corev1.Volume, 0, len(paths))
+	for index := range paths {
+		hostPathType := workloadHostPathType(paths[index].Path)
+		volumes = append(volumes, corev1.Volume{
+			Name: fmt.Sprintf("hostpath-%d", index),
+			VolumeSource: corev1.VolumeSource{
+				HostPath: &corev1.HostPathVolumeSource{
+					Path: paths[index].Path,
+					Type: &hostPathType,
+				},
+			},
+		})
+	}
+
+	return volumes
+}
+
+func stageHostPathMounts(paths []signalv1.WorkloadHostPath) []corev1.VolumeMount {
+	mounts := make([]corev1.VolumeMount, 0, len(paths))
+	for index := range paths {
+		mounts = append(mounts, corev1.VolumeMount{
+			Name:      fmt.Sprintf("hostpath-%d", index),
+			MountPath: paths[index].MountPath,
+			ReadOnly:  paths[index].ReadOnly,
+		})
+	}
+
+	return mounts
 }
 
 func (e *KubernetesStageExecutor) waitStagePod(
@@ -324,6 +510,12 @@ func (e *KubernetesStageExecutor) waitStagePod(
 				return signalv1.InvocationResultEnvelope{}, parseErr
 			}
 
+			if current.Status.Phase == corev1.PodFailed &&
+				envelope.Outcome == signalv1.InvocationOutcomePassed {
+				return signalv1.InvocationResultEnvelope{},
+					errors.New("failed stage Pod reported a passed invocation")
+			}
+
 			return envelope, nil
 		}
 
@@ -338,10 +530,16 @@ func (e *KubernetesStageExecutor) waitStagePod(
 func (e *KubernetesStageExecutor) executeWorkflowTemplate(
 	ctx context.Context,
 	invocation StageInvocation,
-) (signalv1.InvocationResultEnvelope, error) {
+) (envelope signalv1.InvocationResultEnvelope, returnErr error) {
 	driver := invocation.Stage.Test.Driver.WorkflowTemplate
 	if driver == nil {
 		return signalv1.InvocationResultEnvelope{}, errors.New("WorkflowTemplate driver configuration is absent")
+	}
+
+	parent, err := e.Runner.Dynamic.Resource(workflowGVR).Namespace(e.Namespace).
+		Get(ctx, e.WorkflowName, metav1.GetOptions{})
+	if err != nil {
+		return signalv1.InvocationResultEnvelope{}, fmt.Errorf("get owning Workflow: %w", err)
 	}
 
 	templateGVR := schema.GroupVersionResource{
@@ -392,7 +590,7 @@ func (e *KubernetesStageExecutor) executeWorkflowTemplate(
 	}
 
 	templateSpec["activeDeadlineSeconds"] = int64(invocation.Stage.Schedule.InvocationTimeout.Seconds())
-	templateSpec["arguments"] = map[string]any{"parameters": []any{
+	adapterParameters := []any{
 		map[string]any{"name": "invocation-id", "value": invocation.ID},
 		map[string]any{"name": "run-uid", "value": string(invocation.RunUID)},
 		map[string]any{"name": "plan-digest", "value": invocation.PlanDigest},
@@ -403,7 +601,8 @@ func (e *KubernetesStageExecutor) executeWorkflowTemplate(
 		map[string]any{"name": "participant-roles-json", "value": rolesJSON},
 		map[string]any{"name": "resolved-inputs-json", "value": inputsJSON},
 		map[string]any{"name": "result-configmap", "value": name + "-result"},
-	}}
+	}
+	templateSpec["arguments"] = mergeWorkflowArguments(templateSpec["arguments"], adapterParameters)
 
 	workflow := &unstructured.Unstructured{Object: map[string]any{
 		"apiVersion": "argoproj.io/v1alpha1",
@@ -412,8 +611,10 @@ func (e *KubernetesStageExecutor) executeWorkflowTemplate(
 			"name":      name,
 			"namespace": e.Namespace,
 			"labels": map[string]any{
-				runLabel: string(invocation.RunUID),
+				runLabel:    e.ExecutionName,
+				runUIDLabel: string(invocation.RunUID),
 			},
+			"ownerReferences": []any{workflowOwnerReferenceMap(parent)},
 		},
 		"spec": templateSpec,
 	}}
@@ -426,6 +627,20 @@ func (e *KubernetesStageExecutor) executeWorkflowTemplate(
 
 	resultName := name + "-result"
 
+	cleanupAttempted := false
+	defer func() {
+		if cleanupAttempted {
+			return
+		}
+
+		cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 30*time.Second)
+		defer cancel()
+
+		if err := e.cleanupWorkflowInvocation(cleanupCtx, created, resultName); err != nil {
+			returnErr = errors.Join(returnErr, fmt.Errorf("cleanup stage Workflow after failure: %w", err))
+		}
+	}()
+
 	ticker := time.NewTicker(e.Runner.pollInterval())
 	defer ticker.Stop()
 
@@ -435,15 +650,21 @@ func (e *KubernetesStageExecutor) executeWorkflowTemplate(
 		if resultErr == nil {
 			content := result.BinaryData[resultDataKey]
 
-			var envelope signalv1.InvocationResultEnvelope
 			if err := json.Unmarshal(content, &envelope); err != nil {
 				return signalv1.InvocationResultEnvelope{}, fmt.Errorf("decode WorkflowTemplate result: %w", err)
 			}
 
-			if err := e.deleteWorkflowInvocation(ctx, created, result); err != nil {
+			cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 30*time.Second)
+			cleanupErr := e.cleanupWorkflowInvocation(cleanupCtx, created, resultName)
+
+			cancel()
+
+			cleanupAttempted = true
+
+			if cleanupErr != nil {
 				envelope.Cleanup = signalv1.InvocationCleanupResult{
 					Outcome: signalv1.CleanupOutcomeFailed,
-					Message: boundedStageMessage(err.Error()),
+					Message: boundedStageMessage(cleanupErr.Error()),
 				}
 				if envelope.Outcome == signalv1.InvocationOutcomePassed {
 					envelope.Outcome = signalv1.InvocationOutcomeInconclusive
@@ -492,6 +713,19 @@ func validateWorkflowTemplateIdentity(
 	template *unstructured.Unstructured,
 ) error {
 	driver := invocation.Stage.Test.Driver.WorkflowTemplate
+	if driver == nil || template.GetName() != driver.Name {
+		return errors.New("live WorkflowTemplate identity does not match the approved driver")
+	}
+
+	digest, err := workflowTemplateSpecDigest(template)
+	if err != nil {
+		return err
+	}
+
+	if digest != driver.Digest {
+		return errors.New("live WorkflowTemplate digest does not match the approved driver")
+	}
+
 	for _, input := range invocation.Stage.ResolvedInputs {
 		if input.Kind != signalv1.ResolvedInputKindWorkflowTemplate ||
 			input.State != signalv1.ResolvedInputStateComplete {
@@ -510,13 +744,33 @@ func validateWorkflowTemplateIdentity(
 		return nil
 	}
 
-	return errors.New("WorkflowTemplate stage has no complete immutable template input")
+	return nil
 }
 
-func (e *KubernetesStageExecutor) deleteWorkflowInvocation(
+func workflowTemplateSpecDigest(template *unstructured.Unstructured) (string, error) {
+	spec, found, err := unstructured.NestedFieldNoCopy(template.Object, "spec")
+	if err != nil {
+		return "", fmt.Errorf("decode WorkflowTemplate spec: %w", err)
+	}
+
+	if !found {
+		return "", errors.New("approved WorkflowTemplate has no spec")
+	}
+
+	content, err := json.Marshal(spec)
+	if err != nil {
+		return "", fmt.Errorf("encode WorkflowTemplate spec: %w", err)
+	}
+
+	digest := sha256.Sum256(content)
+
+	return "sha256:" + hex.EncodeToString(digest[:]), nil
+}
+
+func (e *KubernetesStageExecutor) cleanupWorkflowInvocation(
 	ctx context.Context,
 	workflow *unstructured.Unstructured,
-	result *corev1.ConfigMap,
+	resultName string,
 ) error {
 	propagation := metav1.DeletePropagationForeground
 	workflowUID := workflow.GetUID()
@@ -533,18 +787,65 @@ func (e *KubernetesStageExecutor) deleteWorkflowInvocation(
 		return fmt.Errorf("delete WorkflowTemplate invocation: %w", err)
 	}
 
-	resultUID := result.UID
+	ticker := time.NewTicker(e.Runner.pollInterval())
+	defer ticker.Stop()
 
-	err = e.Runner.Kubernetes.CoreV1().ConfigMaps(e.Namespace).Delete(
-		ctx,
-		result.Name,
-		metav1.DeleteOptions{Preconditions: &metav1.Preconditions{UID: &resultUID}},
-	)
-	if err != nil && !apierrors.IsNotFound(err) {
-		return fmt.Errorf("delete WorkflowTemplate result: %w", err)
+	absentObserved := false
+
+	for {
+		_, workflowErr := e.Runner.Dynamic.Resource(workflowGVR).Namespace(e.Namespace).
+			Get(ctx, workflow.GetName(), metav1.GetOptions{})
+
+		result, resultErr := e.Runner.Kubernetes.CoreV1().ConfigMaps(e.Namespace).
+			Get(ctx, resultName, metav1.GetOptions{})
+		if apierrors.IsNotFound(workflowErr) && apierrors.IsNotFound(resultErr) {
+			if absentObserved {
+				return nil
+			}
+
+			absentObserved = true
+		} else {
+			absentObserved = false
+		}
+
+		if workflowErr != nil && !apierrors.IsNotFound(workflowErr) {
+			return fmt.Errorf("verify WorkflowTemplate invocation cleanup: %w", workflowErr)
+		}
+
+		if resultErr != nil && !apierrors.IsNotFound(resultErr) {
+			return fmt.Errorf("verify WorkflowTemplate result cleanup: %w", resultErr)
+		}
+
+		if resultErr == nil {
+			resultUID := result.UID
+
+			err = e.Runner.Kubernetes.CoreV1().ConfigMaps(e.Namespace).Delete(
+				ctx,
+				result.Name,
+				metav1.DeleteOptions{Preconditions: &metav1.Preconditions{UID: &resultUID}},
+			)
+			if err != nil && !apierrors.IsNotFound(err) {
+				return fmt.Errorf("delete WorkflowTemplate result: %w", err)
+			}
+		}
+
+		select {
+		case <-ctx.Done():
+			return fmt.Errorf("wait for WorkflowTemplate cleanup: %w", ctx.Err())
+		case <-ticker.C:
+		}
 	}
+}
 
-	return nil
+func workflowOwnerReferenceMap(workflow *unstructured.Unstructured) map[string]any {
+	return map[string]any{
+		"apiVersion":         workflow.GetAPIVersion(),
+		"kind":               workflow.GetKind(),
+		"name":               workflow.GetName(),
+		"uid":                string(workflow.GetUID()),
+		"controller":         true,
+		"blockOwnerDeletion": true,
+	}
 }
 
 func parseInvocationResultLog(
@@ -630,8 +931,8 @@ func convertLegacyInvocationResult(
 		Message:           boundedStageMessage(legacy.Reason),
 		Measurements:      measurements,
 		Participants: []signalv1.InvocationParticipantResult{{
-			Index:   0,
-			Role:    invocation.ParticipantRole[0],
+			Index:   participant.Index,
+			Role:    invocation.ParticipantRole[participant.Index],
 			Outcome: outcome,
 			Start:   signalv1.NodeFingerprint{NodeUID: participant.NodeUID},
 			End:     signalv1.NodeFingerprint{NodeUID: participant.NodeUID},
@@ -737,14 +1038,19 @@ func applyStageSecurity(container *corev1.Container, security signalv1.ResolvedS
 	}
 }
 
-func scriptInvocationWrapper(key, digest string) string {
+func scriptInvocationWrapper(language signalv1.ScriptLanguage, key, digest string) string {
+	interpreter := "/bin/sh"
+	if language == signalv1.ScriptLanguagePython {
+		interpreter = "python3"
+	}
+
 	return fmt.Sprintf(`
 script=/scripts/%s
 want=%s
 got=$(sha256sum "$script" | awk '{print $1}')
 test "sha256:$got" = "$want"
-exec /bin/sh "$script"
-`, key, digest)
+exec %s "$script"
+`, key, digest, interpreter)
 }
 
 func invocationResourceName(base string, invocation StageInvocation, participant int32) string {
