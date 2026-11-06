@@ -219,7 +219,14 @@ func (s *agentStages) VerifyInstalled(ctx context.Context) error {
 	return daemon.VerifyDaemonInstalled(ctx, s.log)
 }
 
-func (s *agentStages) RepairDaemon(ctx context.Context) error { return daemon.RepairDaemon(ctx, s.log) }
+func (s *agentStages) RepairDaemon(ctx context.Context) error {
+	backends, err := agentModes().backends()
+	if err != nil {
+		return err
+	}
+
+	return daemon.RepairDaemon(ctx, s.log, backends)
+}
 
 func (s *agentStages) StageStarted(_ context.Context, stage bootstrap.Stage) {
 	s.log.Info("bootstrap stage", "stage", stage)

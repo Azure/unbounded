@@ -140,3 +140,76 @@ func TestModeBackendsRunning(t *testing.T) {
 	_, err = backends.running(context.Background(), discardLogger(), &ActiveMachine{Name: "kube1", Mode: isolation.ModeNone})
 	require.ErrorContains(t, err, "no backend")
 }
+
+// The repair a re-run install makes picks the slot whose node stack runs, as
+// the daemon does, and removes the other slot's stale applied config so the
+// ambiguity does not outlive it.
+func TestSettleActiveMachine_TwoRecordsOneRunningRemovesTheStaleOne(t *testing.T) {
+	dir := twoSlotHost(t)
+
+	active, err := hostOperator{configDir: dir, slotRunning: runningSlots(map[string]bool{"kube2": true}, nil)}.settleActiveMachine(discardLogger())
+	require.NoError(t, err)
+	assert.Equal(t, "kube2", active.Name)
+
+	assert.NoFileExists(t, filepath.Join(dir, "kube1-applied-config.json"))
+	assert.NoFileExists(t, filepath.Join(dir, "kube1-applied-config.json.sha256"))
+	assert.FileExists(t, filepath.Join(dir, "kube2-applied-config.json"))
+	assert.FileExists(t, filepath.Join(dir, "kube2-applied-config.json.sha256"))
+
+	// What is left needs no question.
+	active, err = hostOperator{configDir: dir}.FindActiveMachine(discardLogger())
+	require.NoError(t, err)
+	assert.Equal(t, "kube2", active.Name)
+}
+
+func TestSettleActiveMachine_UndecidableRecordsAreKept(t *testing.T) {
+	for name, running := range map[string]func(context.Context, *slog.Logger, *ActiveMachine) (bool, error){
+		"nothing to ask": nil,
+		"none running":   runningSlots(nil, nil),
+		"both running":   runningSlots(map[string]bool{"kube1": true, "kube2": true}, nil),
+	} {
+		t.Run(name, func(t *testing.T) {
+			dir := twoSlotHost(t)
+
+			_, err := hostOperator{configDir: dir, slotRunning: running}.settleActiveMachine(discardLogger())
+			require.ErrorContains(t, err, "needs attention")
+			assert.FileExists(t, filepath.Join(dir, "kube1-applied-config.json"))
+			assert.FileExists(t, filepath.Join(dir, "kube2-applied-config.json"))
+		})
+	}
+}
+
+// Both records of an isolation change in progress belong to it.
+func TestSettleActiveMachine_KeepsBothRecordsOfAChangeInProgress(t *testing.T) {
+	dir := twoSlotHost(t)
+	require.NoError(t, migrate.JournalStore{Path: inPlaceJournalPathIn(dir)}.Save(migrate.Journal{
+		Strategy: migrate.InPlace, From: isolation.ModeNSpawn, To: isolation.ModeNSpawn,
+		SourceSlot: "kube2", TargetSlot: "kube1", Step: migrate.StepStartingTarget,
+	}))
+
+	active, err := hostOperator{configDir: dir}.settleActiveMachine(discardLogger())
+	require.NoError(t, err)
+	assert.Equal(t, "kube2", active.Name)
+	assert.FileExists(t, filepath.Join(dir, "kube1-applied-config.json"))
+	assert.FileExists(t, filepath.Join(dir, "kube2-applied-config.json"))
+}
+
+// A none record beside an nspawn one is a stale config too.
+func TestSettleActiveMachine_RemovesAStaleRecordOfAnotherMode(t *testing.T) {
+	dir := t.TempDir()
+	writeAppliedFixture(t, dir, "kube1", baseConfig())
+
+	cfg := baseConfig()
+	cfg.Isolation = "none"
+	writeAppliedFixture(t, dir, "none-kube1", cfg)
+
+	running := func(_ context.Context, _ *slog.Logger, active *ActiveMachine) (bool, error) {
+		return activeModeOf(active) == isolation.ModeNone, nil
+	}
+
+	active, err := hostOperator{configDir: dir, slotRunning: running}.settleActiveMachine(discardLogger())
+	require.NoError(t, err)
+	assert.Equal(t, isolation.ModeNone, active.Mode)
+	assert.NoFileExists(t, filepath.Join(dir, "kube1-applied-config.json"))
+	assert.FileExists(t, filepath.Join(dir, "none-kube1-applied-config.json"))
+}

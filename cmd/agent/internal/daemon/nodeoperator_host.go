@@ -50,16 +50,64 @@ func FindActiveMachine(log *slog.Logger) (*ActiveMachine, error) {
 }
 
 func (h hostOperator) FindActiveMachine(log *slog.Logger) (*ActiveMachine, error) {
-	dir := h.configDir
-	if dir == "" {
-		dir = goalstates.AgentConfigDir
-	}
-
 	return activeMachineLookup{
-		pathOf:      func(name string) string { return filepath.Join(dir, name+"-applied-config.json") },
-		journalPath: inPlaceJournalPathIn(dir),
+		pathOf:      h.appliedPath,
+		journalPath: inPlaceJournalPathIn(h.dir()),
 		running:     h.slotRunning,
 	}.find(log)
+}
+
+// dir is the agent configuration directory h works in.
+func (h hostOperator) dir() string {
+	if h.configDir == "" {
+		return goalstates.AgentConfigDir
+	}
+
+	return h.configDir
+}
+
+// appliedPath maps an applied config location name to its file.
+func (h hostOperator) appliedPath(name string) string {
+	return filepath.Join(h.dir(), name+"-applied-config.json")
+}
+
+// settleActiveMachine finds the active node like FindActiveMachine, then
+// removes the applied config of every other slot, so the next reader does not
+// have to tell two records apart again. A repave that fails between recording
+// the new slot and removing the old one leaves both, and nothing else removes
+// the stale one. The caller must hold the installation lock, so no repave is
+// writing either record meanwhile.
+//
+// While an isolation change journal exists, readable or not, both records
+// belong to that change, and nothing is removed.
+func (h hostOperator) settleActiveMachine(log *slog.Logger) (*ActiveMachine, error) {
+	active, err := h.FindActiveMachine(log)
+	if err != nil {
+		return nil, err
+	}
+
+	if _, err := (migrate.JournalStore{Path: inPlaceJournalPathIn(h.dir())}).Load(); !errors.Is(err, migrate.ErrNoJournal) {
+		return active, nil
+	}
+
+	for _, loc := range goalstates.AppliedConfigLocations() {
+		if loc.Slot == active.Name && loc.Mode == activeModeOf(active) {
+			continue
+		}
+
+		path := h.appliedPath(loc.Name)
+		if _, err := os.Stat(path); err != nil {
+			continue
+		}
+
+		log.Warn("removing the applied config of a node stack that is not active",
+			"path", path, "active_machine", active.Name, "active_mode", activeModeOf(active))
+		// The config goes first: a sidecar without its config is never read.
+		removeFileIfExists(log, path)
+		removeFileIfExists(log, path+".sha256")
+	}
+
+	return active, nil
 }
 
 // slotRunningTimeout bounds the question to a backend whether a recorded node
