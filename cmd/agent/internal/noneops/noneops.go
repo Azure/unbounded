@@ -94,6 +94,10 @@ type Overrides struct {
 	// WaitKubelet overrides the kubelet readiness wait. Nil uses the phase the
 	// nspawn mode uses.
 	WaitKubelet func(ctx context.Context) error
+	// ImageArchiveDir is the host directory staged container image archives
+	// are imported from after containerd starts. Empty means
+	// goalstates.ContainerImageArchiveHostDir.
+	ImageArchiveDir string
 }
 
 // Node is a none node bound to one configuration.
@@ -260,7 +264,7 @@ func (n *Node) newBackend() *none.Backend {
 		AfterStart: map[string]func(context.Context) error{
 			none.UnitLocalDNS: n.waitLocalDNS,
 			none.UnitContainerd: func(ctx context.Context) error {
-				return nodestart.ImportContainerImages(n.p.Log, n.gs.NodeStart).Do(ctx)
+				return nodestart.ImportContainerImagesFrom(n.p.Log, n.gs.NodeStart, n.p.ImageArchiveDir).Do(ctx)
 			},
 		},
 		AfterRestart: map[string]func(context.Context) error{
