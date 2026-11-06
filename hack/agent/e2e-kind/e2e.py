@@ -99,6 +99,7 @@ from typing import Any, Callable
 from xml.etree import ElementTree
 
 import isolation_report
+import kind_kubeconfig
 import ukiboot
 
 # ---------------------------------------------------------------------------
@@ -7458,6 +7459,33 @@ COMMANDS: dict[str, Command] = {
 }
 
 
+# Commands that can run before the Kind cluster exists or after it is gone. They
+# still get KUBECONFIG pointed at the cluster's own file, so nothing they start
+# can reach another cluster; they just do not fail when kind has no cluster.
+CLUSTER_OPTIONAL_COMMANDS = frozenset({
+    "list-suite", "resolve-host-image", "create-vm", "create-vm-bridge", "cleanup",
+    "collect-logs", "collect-isolation-evidence",
+})
+
+
+def pin_kubeconfig(command: str) -> None:
+    """Pin every kubeconfig reader to the Kind cluster, or stop.
+
+    The harness never uses the user's default kubeconfig: its current-context
+    can change under a running suite and send the suite's secrets and Machines
+    to whatever cluster it then names.
+    """
+    required = command not in CLUSTER_OPTIONAL_COMMANDS
+    try:
+        path = kind_kubeconfig.pin(REPO_ROOT, KIND_CLUSTER_NAME, required=required)
+    except kind_kubeconfig.KubeconfigError as exc:
+        die(f"refusing to run {command}: {exc}")
+    if path is not None and VERBOSE:
+        # stderr: list-suite's stdout is parsed.
+        print(f"[INFO]  Using kubeconfig {path} (context {kind_kubeconfig.kind_context(KIND_CLUSTER_NAME)})",
+              file=sys.stderr, flush=True)
+
+
 def main() -> None:
     global VERBOSE  # noqa: PLW0603
 
@@ -7493,6 +7521,7 @@ def main() -> None:
     parser.add_argument("--suite", choices=sorted(SUITES), default=None)
     args = parser.parse_args()
     VERBOSE = args.verbose
+    pin_kubeconfig(args.command)
     node_config = load_node_config(
         args.node_config,
         offline_artifacts_oci_ref_override=args.offline_artifacts_oci_ref,

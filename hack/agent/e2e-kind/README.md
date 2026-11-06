@@ -21,6 +21,16 @@ Focused configuration creates only the bridge rather than a colliding default VM
 Use matching cluster/VM/subnet variables when invoking commands or cleanup on a
 preserved environment. Same-disk reinstall checks host boot identity.
 
+The harness never uses your default kubeconfig. `run-local.sh` creates the Kind
+cluster into `tmp/e2e-kind/$KIND_CLUSTER_NAME.kubeconfig`, and every `e2e.py`
+command rewrites that file from `kind get kubeconfig` and points `KUBECONFIG` at
+it for itself and every tool it starts (`kubectl`, `kubectl-unbounded`, the
+bootstrap rendering). A command refuses to run unless the file holds only the
+`kind-$KIND_CLUSTER_NAME` context and uses it. `E2E_KUBECONFIG` names a file to
+use as it is instead; it gets the same check. The metalman smokes
+(`hack/smoke-metalman.py`, `hack/smoke-metalman-http.py`) do the same for the
+`kind` cluster with a file in their temporary directory.
+
 ## Azure Container Linux (immutable hosts)
 
 `HOST_BASE_OS=acl` boots an immutable host: `/usr` is a read-only dm-verity

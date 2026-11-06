@@ -33,6 +33,7 @@ from pathlib import Path
 from typing import Any, Callable, Protocol
 
 import isolation_report as report
+import kind_kubeconfig
 
 HERE = Path(__file__).resolve().parent
 REPO_ROOT = HERE.parent.parent.parent
@@ -268,6 +269,11 @@ class Driver:
         if tools.is_dir():
             env["PATH"] = f"{tools}{os.pathsep}{env.get('PATH', '')}"
         env["HOST_BASE_OS"] = self.host_base_os
+        # Never the user's default kubeconfig: e2e.py and run-local.sh pin
+        # themselves to the Kind cluster's file, and so does everything else
+        # the plan runs.
+        cluster = env.get("KIND_CLUSTER_NAME") or "kind"
+        env["KUBECONFIG"] = str(kind_kubeconfig.resolve_path(self.repo_root, cluster, env)[0])
         env.pop("ISOLATION_MODE", None)
         env.pop("E2E_SUITE", None)
         if scenario and scenario.isolation_mode:
