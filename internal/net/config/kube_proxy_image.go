@@ -50,21 +50,6 @@ func (r ImageReference) HasVersion() bool {
 	return r.Tag != "" || r.Digest != ""
 }
 
-// String reassembles the reference.
-func (r ImageReference) String() string {
-	out := r.Name
-
-	if r.Tag != "" {
-		out += ":" + r.Tag
-	}
-
-	if r.Digest != "" {
-		out += "@" + r.Digest
-	}
-
-	return out
-}
-
 // ParseImageReference splits an image reference into its name, tag and digest,
 // rejecting anything a registry would not accept.
 //

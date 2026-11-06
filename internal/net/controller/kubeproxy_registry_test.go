@@ -353,9 +353,15 @@ func TestKubeProxyRegistryPaginationIsBounded(t *testing.T) {
 	}
 }
 
-func TestKubeProxyRegistryLookupTimeoutAndCancellation(t *testing.T) {
-	for _, parentTimeout := range []time.Duration{0, 5 * time.Second} {
-		t.Run(parentTimeout.String(), func(t *testing.T) {
+func TestKubeProxyRegistryLookupHonorsDeadlines(t *testing.T) {
+	for _, tt := range []struct {
+		name          string
+		parentTimeout time.Duration
+	}{
+		{name: "lookup deadline"},
+		{name: "parent deadline", parentTimeout: 5 * time.Second},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
 			synctest.Test(t, func(t *testing.T) {
 				repo, err := newKubeProxyTagRepository("registry.example/kube-proxy")
 				if err != nil {
@@ -369,13 +375,13 @@ func TestKubeProxyRegistryLookupTimeoutAndCancellation(t *testing.T) {
 				ctx := t.Context()
 				wantElapsed := 30 * time.Second
 
-				if parentTimeout != 0 {
+				if tt.parentTimeout != 0 {
 					var cancel context.CancelFunc
 
-					ctx, cancel = context.WithTimeout(ctx, parentTimeout)
+					ctx, cancel = context.WithTimeout(ctx, tt.parentTimeout)
 					defer cancel()
 
-					wantElapsed = parentTimeout
+					wantElapsed = tt.parentTimeout
 				}
 
 				started := time.Now()

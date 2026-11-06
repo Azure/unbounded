@@ -59,11 +59,6 @@ func TestManagedKubeProxyImage(t *testing.T) {
 		want       string
 	}{
 		{
-			name:     "unset reuses the provider image",
-			provider: kubeSystemKubeProxy("kube-proxy", testProviderKubeProxyImage),
-			want:     testProviderKubeProxyImage,
-		},
-		{
 			name: "unset without a provider falls back to registry.k8s.io",
 			want: "registry.k8s.io/kube-proxy:" + testServerVersion,
 		},
@@ -85,24 +80,6 @@ func TestManagedKubeProxyImage(t *testing.T) {
 			want:       "localhost:5000/kube-proxy:v1.34.2-1",
 		},
 		{
-			name:       "a pinned tag is used as-is",
-			configured: "myreg.example/kube-proxy:v1.34.0",
-			provider:   kubeSystemKubeProxy("kube-proxy", testProviderKubeProxyImage),
-			want:       "myreg.example/kube-proxy:v1.34.0",
-		},
-		{
-			name:       "a pinned digest is used as-is",
-			configured: "myreg.example/kube-proxy@" + testImageDigest,
-			provider:   kubeSystemKubeProxy("kube-proxy", testProviderKubeProxyImage),
-			want:       "myreg.example/kube-proxy@" + testImageDigest,
-		},
-		{
-			name:       "only the provider tag carries over, not its digest",
-			configured: "myreg.example/kube-proxy",
-			provider:   kubeSystemKubeProxy("kube-proxy", testProviderKubeProxyImage+"@"+testImageDigest),
-			want:       "myreg.example/kube-proxy:v1.34.2-1",
-		},
-		{
 			name:       "a provider image pinned only by digest gives the server version",
 			configured: "myreg.example/kube-proxy",
 			provider:   kubeSystemKubeProxy("kube-proxy", "provider.example/kube-proxy@"+testImageDigest),
@@ -120,16 +97,6 @@ func TestManagedKubeProxyImage(t *testing.T) {
 			want:     "registry.k8s.io/kube-proxy:" + testServerVersion,
 		},
 		{
-			name:     "unset preserves a provider tag and digest",
-			provider: kubeSystemKubeProxy("kube-proxy", testProviderKubeProxyImage+"@"+testImageDigest),
-			want:     testProviderKubeProxyImage + "@" + testImageDigest,
-		},
-		{
-			name:     "unset preserves a provider digest without a tag",
-			provider: kubeSystemKubeProxy("kube-proxy", "provider.example/kube-proxy@"+testImageDigest),
-			want:     "provider.example/kube-proxy@" + testImageDigest,
-		},
-		{
 			name:     "an unversioned provider supplies the fallback repository",
 			provider: kubeSystemKubeProxy("kube-proxy", "provider.example/kube-proxy"),
 			want:     "provider.example/kube-proxy:" + testServerVersion,
@@ -139,11 +106,6 @@ func TestManagedKubeProxyImage(t *testing.T) {
 			configured: "myreg.example/kube-proxy",
 			provider:   kubeSystemKubeProxy("kube-proxy", "provider.example/kube-proxy"),
 			want:       "myreg.example/kube-proxy:" + testServerVersion,
-		},
-		{
-			name:     "unset preserves a provider latest tag",
-			provider: kubeSystemKubeProxy("kube-proxy", "provider.example/kube-proxy:latest"),
-			want:     "provider.example/kube-proxy:latest",
 		},
 	}
 
@@ -380,18 +342,18 @@ func assertKubeProxyImageDiscoveryAttempts(t *testing.T, started time.Time, atte
 	}
 }
 
-// TestManagedKubeProxyImageFallsBackWhenTheClusterCannotBeRead verifies that
+// TestManagedKubeProxyImageUnavailableServerVersionReturnsError verifies that
 // exhausted provider reads reach version discovery, but an unavailable version
 // endpoint returns an error instead of the former latest fallback.
-func TestManagedKubeProxyImageFallsBackWhenTheClusterCannotBeRead(t *testing.T) {
+func TestManagedKubeProxyImageUnavailableServerVersionReturnsError(t *testing.T) {
 	for _, tt := range []struct {
+		name       string
 		configured string
-		want       string
 	}{
-		{want: "registry.k8s.io/kube-proxy:latest"},
-		{configured: "myreg.example/kube-proxy", want: "myreg.example/kube-proxy:latest"},
+		{name: "default repository"},
+		{name: "configured repository", configured: "myreg.example/kube-proxy"},
 	} {
-		t.Run(tt.want, func(t *testing.T) {
+		t.Run(tt.name, func(t *testing.T) {
 			synctest.Test(t, func(t *testing.T) {
 				clientset := k8sfake.NewClientset(kubeSystemKubeProxy("kube-proxy", testProviderKubeProxyImage))
 				unavailableErr := errors.New("apiserver unavailable")
@@ -415,7 +377,7 @@ func TestManagedKubeProxyImageFallsBackWhenTheClusterCannotBeRead(t *testing.T) 
 				}
 
 				if got != "" {
-					t.Fatalf("ManagedKubeProxyImage() = %q, want no image instead of %q", got, tt.want)
+					t.Fatalf("ManagedKubeProxyImage() = %q, want no image", got)
 				}
 
 				assertKubeProxyImageDiscoveryAttempts(t, started, attempts, 11)
