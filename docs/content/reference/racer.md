@@ -1763,6 +1763,9 @@ while rails are active, and `racer_rdma_free_buffers` counts free page buffers.
 HTTP; `racer_rdma_fallback_no_link_total` and `racer_rdma_fallback_grant_total`
 split out the two common reasons: no ready link to the peer yet, and a grant that
 failed (usually because every page buffer was in use).
+`racer_rdma_prefetch_failures_total` counts sends whose source page could not
+be mapped into the NIC ahead of the write (window mode prefetches each page
+through implicit on-demand paging); those writes may stall on NIC page faults.
 `racer_rdma_fallback_overflow_total` counts page bodies received over HTTP because the hop
 qualified by Site and rail but was not among the 128 RDMA peers both nodes chose.
 The receiving node of each such hop counts each delivered body once. Requests that

@@ -791,6 +791,12 @@ pub(crate) mod send_in_place {
         assert_eq!(received, page.bytes());
         assert_eq!(mb.count(Event::RdmaPagesSent), 1);
         assert_eq!(mb.count(Event::RdmaSentBytes), 35);
+        // The worker mapped the page into the NIC before the owner posted it.
+        assert!(rdma_verbs::simulation::prefetched(
+            page.bytes().as_ptr() as u64,
+            35
+        ));
+        assert_eq!(mb.count(Event::RdmaPrefetchFailed), 0);
         pump!(w);
         assert_eq!(w.b.links.buffers(RAIL, BufferState::Free), Some(2));
         assert_eq!(w.a.links.buffers(RAIL, BufferState::Free), Some(2));

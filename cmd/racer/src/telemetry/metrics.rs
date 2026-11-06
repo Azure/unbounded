@@ -323,6 +323,7 @@ metrics! { Event, EVENTS, EVENT_COUNT;
             Self::AllocatorTrims => "racer_allocator_trims_total",
             Self::RdmaPagesSent => "racer_rdma_pages_sent_total",
             Self::RdmaSentBytes => "racer_rdma_sent_bytes_total",
+            Self::RdmaPrefetchFailed => "racer_rdma_prefetch_failures_total",
             Self::RdmaPagesReceived => "racer_rdma_pages_received_total",
             Self::RdmaReceivedBytes => "racer_rdma_received_bytes_total",
             Self::RdmaPagesLanded => "racer_rdma_pages_landed_total",

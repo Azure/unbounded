@@ -963,6 +963,12 @@ impl Links {
         // The owner posts the write straight from the page through the
         // device's implicit on-demand paging region and holds it until the
         // completion, or until the QP is destroyed if the link breaks.
+        // Map the page into the NIC first, here on the worker: an unmapped
+        // source takes a NIC page fault per 4 KiB page, each stalling the
+        // queue pair, and every write on the link waits behind them.
+        if self.client.prefetch(grant.rail.0, page.bytes()).is_err() {
+            self.record(crate::telemetry::Event::RdmaPrefetchFailed, 1);
+        }
         let source = Source::new(Arc::new(PageSource(page.clone())));
         let key = link_key(peer, grant.rail);
         let written = self
