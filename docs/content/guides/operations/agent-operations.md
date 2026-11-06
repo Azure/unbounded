@@ -46,9 +46,8 @@ active at a time.
 **Staging:**
 
 1. Downloads the release tarball from `downloadURL` and verifies `sha256` when provided.
-2. Takes the `unbounded-agent` file at the root of the archive, named
-   `unbounded-agent` or `./unbounded-agent`. Everything else in the archive is
-   ignored, including files named `unbounded-agent` in a directory.
+2. Takes the `unbounded-agent` file at the root of the archive and ignores
+   everything else.
 3. Runs `unbounded-agent version` against the staged binary as a binary
    validation check. If this fails, the operation is marked `Failed` and the
    current binary is unchanged.
@@ -84,35 +83,6 @@ version crashes on startup.
 | Download or extraction error | Operation marked `Failed`. Current binary unchanged. |
 | Binary validation (`unbounded-agent version`) fails | Operation marked `Failed`. Current binary unchanged. |
 | Upgraded daemon crashes after restart | Systemd recovery rolls back to last-good binary. Operation marked `Failed` with reason `DaemonFailed`. |
-
-### Agents That Reject Release Archives
-
-An agent from v0.2.3 until the release with the fix for
-[#1093](https://github.com/Azure/unbounded/issues/1093) accepts only an archive
-whose one file is `unbounded-agent`. Every `unbounded-agent` release archive
-through v0.22.0 also holds `LICENSE` and either `README.md` or `NOTICE`, so
-such an agent fails the operation with:
-
-```
-agent archive contains unexpected member "LICENSE"
-```
-
-Release archives published with the fix hold only the binary, so every agent
-accepts them. To apply an earlier release to an agent like this, do one of the
-following:
-
-- Repack the archive with only the binary, host it, and pass the SHA-256 of the
-  repacked archive:
-
-  ```bash
-  mkdir repack
-  tar -xzf unbounded-agent-linux-amd64.tar.gz -C repack unbounded-agent
-  tar -czf unbounded-agent-linux-amd64-repacked.tar.gz -C repack unbounded-agent
-  sha256sum unbounded-agent-linux-amd64-repacked.tar.gz
-  ```
-
-- For a release from v0.2.3 on, copy its `unbounded-agent` binary to the host
-  and run `sudo ./unbounded-agent agent-upgrade` with it.
 
 ### Verifying the Upgrade
 

@@ -39,14 +39,12 @@ type InstallOptions struct {
 	// ExpectedSHA256 may be empty only when the caller trusts both the archive
 	// source and the transport path.
 	ExpectedSHA256 string
+	// ExpectedMember is the file to install from the archive root, with or
+	// without a "./" prefix. Every other archive entry is ignored, including
+	// entries elsewhere in the archive with the same name.
 	ExpectedMember string
 	Mode           os.FileMode
 	HTTPClient     *http.Client
-	// ExactMember requires the archive to contain nothing but ExpectedMember,
-	// named exactly. Without it, ExpectedMember is the member at the archive
-	// root, with or without a "./" prefix, and every other member is ignored,
-	// including members elsewhere in the archive with the same name.
-	ExactMember bool
 }
 
 // SwitchResult describes a completed blue-green binary switch.
@@ -163,8 +161,7 @@ func installFromTarGz(ctx context.Context, targetPath string, opts InstallOption
 
 // InstallAndSwitchFromTarGz downloads an HTTP or HTTPS release archive,
 // installs the configured member into the inactive slot, and atomically
-// updates the last-good and current links. ExactMember selects which archive
-// members are accepted.
+// updates the last-good and current links.
 func InstallAndSwitchFromTarGz(
 	ctx context.Context,
 	log *slog.Logger,
@@ -418,16 +415,7 @@ func extractArchiveMember(archivePath, targetPath string, opts InstallOptions) (
 			return fmt.Errorf("read agent archive: %w", err)
 		}
 
-		name := header.Name
-		if !opts.ExactMember {
-			name = strings.TrimPrefix(name, "./")
-		}
-
-		if name != opts.ExpectedMember {
-			if opts.ExactMember {
-				return fmt.Errorf("agent archive contains unexpected member %q", header.Name)
-			}
-
+		if strings.TrimPrefix(header.Name, "./") != opts.ExpectedMember {
 			continue
 		}
 
@@ -444,17 +432,6 @@ func extractArchiveMember(archivePath, targetPath string, opts InstallOptions) (
 			return err
 		}
 		defer os.Remove(stagedPath) //nolint:errcheck // no-op once the binary is renamed into place
-
-		if opts.ExactMember {
-			next, err := tarReader.Next()
-			if err == nil {
-				return fmt.Errorf("agent archive contains unexpected member %q", next.Name)
-			}
-
-			if !errors.Is(err, io.EOF) {
-				return fmt.Errorf("read agent archive: %w", err)
-			}
-		}
 
 		// gzip verifies its checksum only at the end of the stream, and that
 		// checksum is all that catches a corrupted download without a SHA-256.

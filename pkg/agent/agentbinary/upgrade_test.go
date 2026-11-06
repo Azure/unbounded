@@ -49,7 +49,6 @@ func TestInstallAndSwitchFromTarGzWithOptions(t *testing.T) {
 		DownloadURL:    server.URL + "/agent.tar.gz?sig=secret",
 		ExpectedSHA256: fmt.Sprintf("%x", digest),
 		ExpectedMember: "custom-agent",
-		ExactMember:    true,
 		Mode:           0o755,
 		HTTPClient:     server.Client(),
 	})
@@ -82,13 +81,11 @@ func TestInstallAndSwitchFromTarGzWithOptionsRejectsInvalidInputs(t *testing.T) 
 			DownloadURL:    "ftp://example.com/agent.tar.gz",
 			ExpectedSHA256: strings.Repeat("a", 64),
 			ExpectedMember: "custom-agent",
-			ExactMember:    true,
 		},
 		"invalid digest": {
 			DownloadURL:    "https://example.com/agent.tar.gz",
 			ExpectedSHA256: "bad",
 			ExpectedMember: "custom-agent",
-			ExactMember:    true,
 		},
 		"nested member": {
 			DownloadURL:    "https://example.com/agent.tar.gz",
@@ -109,7 +106,6 @@ func TestInstallAndSwitchFromTarGzWithOptionsRejectsInvalidInputs(t *testing.T) 
 			DownloadURL:    "https://example.com/agent.tar.gz",
 			ExpectedSHA256: strings.Repeat("a", 64),
 			ExpectedMember: "custom-agent",
-			ExactMember:    true,
 			Mode:           os.ModeSetuid | 0o755,
 		},
 	}
@@ -166,38 +162,6 @@ func TestValidateLayoutRejectsAliasedEntries(t *testing.T) {
 	}
 }
 
-func TestInstallAndSwitchFromTarGzWithOptionsRejectsUnexpectedMember(t *testing.T) {
-	t.Parallel()
-
-	paths := secureUpgradeTestPaths(t)
-	if err := os.WriteFile(paths.BluePath, []byte("#!/bin/sh\nexit 0\n"), 0o755); err != nil {
-		t.Fatalf("write blue: %v", err)
-	}
-
-	if err := os.Symlink(paths.BluePath, paths.CurrentPath); err != nil {
-		t.Fatalf("symlink current: %v", err)
-	}
-
-	payload := secureUpgradeArchive(t, "other-agent", []byte("binary"))
-	server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		_, _ = w.Write(payload)
-	}))
-	t.Cleanup(server.Close)
-
-	digest := sha256.Sum256(payload)
-
-	_, err := InstallAndSwitchFromTarGz(t.Context(), slog.Default(), paths, InstallOptions{
-		DownloadURL:    server.URL + "/agent.tar.gz",
-		ExpectedSHA256: fmt.Sprintf("%x", digest),
-		ExpectedMember: "custom-agent",
-		ExactMember:    true,
-		HTTPClient:     server.Client(),
-	})
-	if err == nil || !strings.Contains(err.Error(), "unexpected member") {
-		t.Fatalf("error = %v", err)
-	}
-}
-
 func TestInstallAndSwitchFromTarGzWithOptionsPreservesCurrentOnVerificationFailures(t *testing.T) {
 	t.Parallel()
 
@@ -233,7 +197,6 @@ func TestInstallAndSwitchFromTarGzWithOptionsPreservesCurrentOnVerificationFailu
 				DownloadURL:    server.URL + "/agent.tar.gz?sig=secret",
 				ExpectedSHA256: digest,
 				ExpectedMember: "custom-agent",
-				ExactMember:    true,
 				HTTPClient:     server.Client(),
 			})
 			if err == nil {
@@ -271,7 +234,6 @@ func TestInstallAndSwitchFromTarGzProtectsDanglingLastGood(t *testing.T) {
 	_, err := InstallAndSwitchFromTarGz(t.Context(), slog.Default(), paths, InstallOptions{
 		DownloadURL:    server.URL + "/agent.tar.gz",
 		ExpectedMember: "custom-agent",
-		ExactMember:    true,
 		HTTPClient:     server.Client(),
 	})
 	if err == nil {
@@ -310,7 +272,6 @@ func TestInstallAndSwitchFromTarGzWithOptionsPreservesDistinctLastGoodOnCandidat
 		DownloadURL:    server.URL + "/agent.tar.gz",
 		ExpectedSHA256: fmt.Sprintf("%x", digest),
 		ExpectedMember: "custom-agent",
-		ExactMember:    true,
 		HTTPClient:     server.Client(),
 	})
 	if err == nil {
@@ -319,58 +280,6 @@ func TestInstallAndSwitchFromTarGzWithOptionsPreservesDistinctLastGoodOnCandidat
 
 	assertSecureUpgradeLink(t, paths.CurrentPath, paths.BluePath)
 	assertSecureUpgradeLink(t, paths.LastGoodPath, paths.BinaryPath)
-}
-
-func TestInstallAndSwitchFromTarGzWithOptionsRejectsUnsafeAndDuplicateMembers(t *testing.T) {
-	t.Parallel()
-
-	tests := map[string][]secureTarMember{
-		"unsafe":        {{name: "../custom-agent", body: []byte("binary")}},
-		"path prefixed": {{name: "./custom-agent", body: []byte("binary")}},
-		"duplicate": {
-			{name: "custom-agent", body: []byte("#!/bin/sh\nexit 0\n")},
-			{name: "custom-agent", body: []byte("#!/bin/sh\nexit 0\n")},
-		},
-		"extra member": {
-			{name: "custom-agent", body: []byte("#!/bin/sh\nexit 0\n")},
-			{name: "LICENSE", body: []byte("license")},
-		},
-		"dot root entry": {
-			{name: "./", typeflag: tar.TypeDir},
-			{name: "custom-agent", body: []byte("#!/bin/sh\nexit 0\n")},
-		},
-	}
-	for name, members := range tests {
-		t.Run(name, func(t *testing.T) {
-			t.Parallel()
-			paths := secureUpgradeReadyPaths(t)
-			payload := secureUpgradeArchiveWithMembers(t, members)
-			digest := sha256.Sum256(payload)
-			server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-				_, _ = w.Write(payload)
-			}))
-			t.Cleanup(server.Close)
-
-			_, err := InstallAndSwitchFromTarGz(t.Context(), slog.Default(), paths, InstallOptions{
-				DownloadURL:    server.URL + "/agent.tar.gz",
-				ExpectedSHA256: fmt.Sprintf("%x", digest),
-				ExpectedMember: "custom-agent",
-				ExactMember:    true,
-				HTTPClient:     server.Client(),
-			})
-			if err == nil {
-				t.Fatal("InstallAndSwitchFromTarGz error = nil")
-			}
-
-			assertSecureUpgradeLink(t, paths.CurrentPath, paths.BluePath)
-
-			if _, statErr := os.Stat(paths.GreenPath); !os.IsNotExist(statErr) {
-				t.Fatalf("inactive slot changed on invalid archive: %v", statErr)
-			}
-
-			assertNoStagedAgentBinaries(t, filepath.Dir(paths.GreenPath))
-		})
-	}
 }
 
 func TestInstallAndSwitchFromTarGzInstallsRootMemberAndIgnoresOthers(t *testing.T) {
@@ -494,6 +403,12 @@ func TestInstallAndSwitchFromTarGzRejectsInvalidRootMemberArchives(t *testing.T)
 			},
 			wantErr: `does not contain "custom-agent" at its root`,
 		},
+		"member outside the archive root": {
+			members: []secureTarMember{
+				{name: "../custom-agent", body: binary},
+			},
+			wantErr: `does not contain "custom-agent" at its root`,
+		},
 		"root symlink": {
 			members: []secureTarMember{
 				{name: "bin/agent", body: binary},
@@ -550,38 +465,32 @@ func TestInstallAndSwitchFromTarGzRejectsInvalidRootMemberArchives(t *testing.T)
 func TestInstallAndSwitchFromTarGzRejectsCorruptArchiveWithoutDigest(t *testing.T) {
 	t.Parallel()
 
-	for _, exact := range []bool{false, true} {
-		t.Run(fmt.Sprintf("exact=%t", exact), func(t *testing.T) {
-			t.Parallel()
-			paths := secureUpgradeReadyPaths(t)
-			payload := secureUpgradeArchive(t, "custom-agent", []byte("#!/bin/sh\nexit 0\n"))
-			// The gzip trailer is the CRC-32 of the content, then its size.
-			payload[len(payload)-8] ^= 0xff
+	paths := secureUpgradeReadyPaths(t)
+	payload := secureUpgradeArchive(t, "custom-agent", []byte("#!/bin/sh\nexit 0\n"))
+	// The gzip trailer is the CRC-32 of the content, then its size.
+	payload[len(payload)-8] ^= 0xff
 
-			server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-				_, _ = w.Write(payload)
-			}))
-			t.Cleanup(server.Close)
+	server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write(payload)
+	}))
+	t.Cleanup(server.Close)
 
-			_, err := InstallAndSwitchFromTarGz(t.Context(), slog.Default(), paths, InstallOptions{
-				DownloadURL:    server.URL + "/agent.tar.gz",
-				ExpectedMember: "custom-agent",
-				ExactMember:    exact,
-				HTTPClient:     server.Client(),
-			})
-			if !errors.Is(err, gzip.ErrChecksum) {
-				t.Fatalf("error = %v, want %v", err, gzip.ErrChecksum)
-			}
-
-			assertSecureUpgradeLink(t, paths.CurrentPath, paths.BluePath)
-
-			if _, statErr := os.Stat(paths.GreenPath); !os.IsNotExist(statErr) {
-				t.Fatalf("inactive slot changed on corrupt archive: %v", statErr)
-			}
-
-			assertNoStagedAgentBinaries(t, filepath.Dir(paths.GreenPath))
-		})
+	_, err := InstallAndSwitchFromTarGz(t.Context(), slog.Default(), paths, InstallOptions{
+		DownloadURL:    server.URL + "/agent.tar.gz",
+		ExpectedMember: "custom-agent",
+		HTTPClient:     server.Client(),
+	})
+	if !errors.Is(err, gzip.ErrChecksum) {
+		t.Fatalf("error = %v, want %v", err, gzip.ErrChecksum)
 	}
+
+	assertSecureUpgradeLink(t, paths.CurrentPath, paths.BluePath)
+
+	if _, statErr := os.Stat(paths.GreenPath); !os.IsNotExist(statErr) {
+		t.Fatalf("inactive slot changed on corrupt archive: %v", statErr)
+	}
+
+	assertNoStagedAgentBinaries(t, filepath.Dir(paths.GreenPath))
 }
 
 func TestInstallAndSwitchFromTarGzWithOptionsAllowsHTTPRedirect(t *testing.T) {
@@ -605,7 +514,6 @@ func TestInstallAndSwitchFromTarGzWithOptionsAllowsHTTPRedirect(t *testing.T) {
 		DownloadURL:    redirector.URL + "/agent.tar.gz",
 		ExpectedSHA256: fmt.Sprintf("%x", digest),
 		ExpectedMember: "custom-agent",
-		ExactMember:    true,
 	})
 	if err != nil {
 		t.Fatalf("InstallAndSwitchFromTarGz: %v", err)
@@ -631,7 +539,6 @@ func TestInstallAndSwitchFromTarGzRejectsHTTPSDowngrade(t *testing.T) {
 	_, err := InstallAndSwitchFromTarGz(t.Context(), slog.Default(), paths, InstallOptions{
 		DownloadURL:    secure.URL + "/agent.tar.gz",
 		ExpectedMember: "custom-agent",
-		ExactMember:    true,
 		HTTPClient:     secure.Client(),
 	})
 	if err == nil {
