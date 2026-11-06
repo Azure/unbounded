@@ -515,6 +515,11 @@ func (n *Node) Upgrade(ctx context.Context) (err error) {
 	prevUnits := prev.unitSpec()
 	n.backend.RollbackUnits = &prevUnits
 	n.backend.BeforeRollbackStart = func(ctx context.Context) error {
+		// The previous version starts with its own gates, as it does with its
+		// own units: this configuration's would wait on LocalDNS listeners and
+		// prepare GPU support for a configuration that is not running.
+		n.backend.BeforeStart, n.backend.AfterStart = prev.backend.BeforeStart, prev.backend.AfterStart
+
 		if err := snapshot.Restore(); err != nil {
 			return err
 		}

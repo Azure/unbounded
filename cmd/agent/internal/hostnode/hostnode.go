@@ -89,10 +89,11 @@ type Hooks struct {
 	// directory below HostRoot.
 	ConfigSnapshotDir string
 	// SetupNetwork and CleanupNetwork replace the shared LocalDNS network
-	// phases, and WaitLocalDNS the LocalDNS readiness wait.
+	// phases, and WaitLocalDNS the LocalDNS readiness wait. WaitLocalDNS is
+	// given the node start goal state whose listeners are waited on.
 	SetupNetwork   func(ctx context.Context) error
 	CleanupNetwork func(ctx context.Context) error
-	WaitLocalDNS   func(ctx context.Context) error
+	WaitLocalDNS   func(ctx context.Context, ns *goalstates.NodeStart) error
 }
 
 // SetupLocalDNSNetwork prepares the shared LocalDNS network.
@@ -117,7 +118,7 @@ func (h Hooks) CleanupHostNetwork(ctx context.Context, log *slog.Logger) error {
 // AwaitLocalDNS waits for LocalDNS to answer.
 func (h Hooks) AwaitLocalDNS(ctx context.Context, log *slog.Logger, ns *goalstates.NodeStart) error {
 	if h.WaitLocalDNS != nil {
-		return h.WaitLocalDNS(ctx)
+		return h.WaitLocalDNS(ctx, ns)
 	}
 
 	return nodestart.WaitForLocalDNS(log, ns).Do(ctx)

@@ -5,6 +5,7 @@ package noneops
 
 import (
 	"errors"
+	"net/netip"
 	"os"
 	"path/filepath"
 	"testing"
@@ -14,6 +15,7 @@ import (
 
 	"github.com/Azure/unbounded/cmd/agent/internal/hostnode"
 	"github.com/Azure/unbounded/cmd/agent/internal/hostnode/hostnodetest"
+	"github.com/Azure/unbounded/pkg/agent/goalstates"
 	"github.com/Azure/unbounded/pkg/agent/isolation/none"
 )
 
@@ -137,4 +139,26 @@ func TestUpgradeRollbackUsesThePreviousConfiguration(t *testing.T) {
 	assert.FileExists(t, filepath.Join(f.sys, none.UnitLocalDNS), "the rollback wrote the previous LocalDNS unit back")
 	assert.True(t, f.h.active[none.UnitLocalDNS], "and started it")
 	assert.Equal(t, 2, f.hook.cleanup, "the previous version also starts on a cleaned host")
+}
+
+// A rollback waits on the LocalDNS listeners of the configuration it returns
+// to. Waiting on the failed upgrade's would time out, and the previous version
+// would never start containerd or kubelet.
+func TestUpgradeRollbackWaitsOnThePreviousLocalDNSListeners(t *testing.T) {
+	f := newFixture(t, true, func(gs *goalstates.MachineGoalState) {
+		gs.NodeStart.LocalDNS.NodeListenerIP = netip.MustParseAddr("169.254.30.10")
+	})
+	installPrevious(t, f, "1.33.0-aaaaaaaa")
+
+	prevGS := hostnodetest.GoalState("kube1", true)
+	prevGS.RootFS.KubernetesVersion = "v1.33.0"
+	f.node.p.PreviousGoalState = prevGS
+
+	f.hook.kubeletErr = errors.New("kubelet crashlooping")
+
+	require.ErrorContains(t, f.node.Upgrade(t.Context()), "rolled back to 1.33.0-aaaaaaaa")
+	assert.Equal(t, []string{"169.254.30.10", "169.254.20.10"}, f.hook.dnsWaited,
+		"the upgrade waits on its own listeners, the rollback on the previous ones")
+	assert.True(t, f.h.active[none.UnitContainerd], "the previous version's containerd started")
+	assert.True(t, f.h.active[none.UnitKubelet], "and its kubelet")
 }
