@@ -7,6 +7,7 @@ import (
 	"context"
 	"encoding/json"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 	"unicode/utf8"
@@ -166,6 +167,101 @@ func TestPatchIsolationStatus_TruncatesTheMessage(t *testing.T) {
 	assert.LessOrEqual(t, len(msg), api.IsolationChangeMessageMaxLength)
 	assert.True(t, utf8.ValidString(msg))
 	assert.NotContains(t, string(sent), "\"isolation\":", "an empty Applied is not written")
+}
+
+// A refused change leaves a reason. A later attempt writes none, and the
+// stored reason must not survive it, or machina reports a failed reprovision
+// as a refusal that is still waiting for the opt-in.
+func TestPatchIsolationStatus_ReplacesTheWholeChange(t *testing.T) {
+	c, m := isolationStatusClient(t, nil)
+
+	get := func() *api.IsolationChangeStatus {
+		t.Helper()
+
+		var got api.Machine
+		require.NoError(t, c.Get(t.Context(), client.ObjectKeyFromObject(m), &got))
+		require.NotNil(t, got.Status.IsolationChange)
+
+		return got.Status.IsolationChange
+	}
+
+	for _, reason := range []string{api.IsolationChangeReasonReprovisionNotAllowed, api.IsolationChangeReasonUnsupportedMode} {
+		t.Run(reason, func(t *testing.T) {
+			refused := &api.IsolationChangeStatus{
+				TargetMode: "none", Phase: api.IsolationChangeFailed, Strategy: api.IsolationChangeReprovision,
+				Reason: reason, Message: "refused", LastTransitionTime: metav1.Now(),
+			}
+			require.NoError(t, patchIsolationStatus(t.Context(), c, m.Name, isolationStatus{Change: refused}))
+			assert.Equal(t, reason, get().Reason)
+
+			inProgress := &api.IsolationChangeStatus{TargetMode: "none", Phase: api.IsolationChangeInProgress, Strategy: api.IsolationChangeReprovision}
+			require.NoError(t, patchIsolationStatus(t.Context(), c, m.Name, isolationStatus{Change: inProgress}))
+
+			got := get()
+			assert.Equal(t, api.IsolationChangeInProgress, got.Phase)
+			assert.Empty(t, got.Reason, "the refusal reason is cleared")
+			assert.Empty(t, got.Message, "the refusal message is cleared")
+			assert.True(t, got.LastTransitionTime.IsZero(), "the old transition time is cleared")
+
+			failed := &api.IsolationChangeStatus{TargetMode: "none", Phase: api.IsolationChangeFailed, Message: "token rejected"}
+			require.NoError(t, patchIsolationStatus(t.Context(), c, m.Name, isolationStatus{Change: failed}))
+
+			got = get()
+			assert.Equal(t, api.IsolationChangeFailed, got.Phase)
+			assert.Empty(t, got.Reason)
+			assert.Empty(t, got.Strategy, "the strategy of the earlier attempt is cleared")
+			assert.Equal(t, "token rejected", got.Message)
+
+			// Applied alone still leaves the change as it is.
+			require.NoError(t, patchIsolationStatus(t.Context(), c, m.Name, isolationStatus{Applied: api.IsolationNSpawn}))
+			assert.Equal(t, "token rejected", get().Message)
+		})
+	}
+}
+
+// The patch sends every empty optional field as null, so it does not depend
+// on how a particular client or server merges a missing key.
+func TestIsolationChangePatch_NullsEmptyOptionalFields(t *testing.T) {
+	value, err := isolationChangePatch(api.IsolationChangeStatus{TargetMode: "none", Phase: api.IsolationChangeFailed})
+	require.NoError(t, err)
+
+	data, err := json.Marshal(value)
+	require.NoError(t, err)
+	assert.JSONEq(t, `{"targetMode":"none","phase":"Failed","strategy":null,"reason":null,"message":null,"lastTransitionTime":null}`, string(data))
+
+	// Set fields are sent as they are.
+	now := metav1.NewTime(metav1.Now().Rfc3339Copy().Time)
+	value, err = isolationChangePatch(api.IsolationChangeStatus{
+		TargetMode: "none", Phase: api.IsolationChangeFailed, Strategy: api.IsolationChangeReprovision,
+		Reason: api.IsolationChangeReasonReprovisionNotAllowed, Message: "refused", LastTransitionTime: now,
+	})
+	require.NoError(t, err)
+
+	data, err = json.Marshal(value)
+	require.NoError(t, err)
+
+	var back api.IsolationChangeStatus
+	require.NoError(t, json.Unmarshal(data, &back))
+	assert.Equal(t, api.IsolationChangeReprovision, back.Strategy)
+	assert.Equal(t, api.IsolationChangeReasonReprovisionNotAllowed, back.Reason)
+	assert.Equal(t, "refused", back.Message)
+	assert.True(t, now.Equal(&back.LastTransitionTime))
+}
+
+// Every optional field of IsolationChangeStatus must be listed, or a field
+// added later would keep its old value across writes.
+func TestIsolationChangeOptionalFields_CoverTheType(t *testing.T) {
+	var optional []string
+
+	typ := reflect.TypeOf(api.IsolationChangeStatus{})
+	for i := range typ.NumField() {
+		name, opts, _ := strings.Cut(typ.Field(i).Tag.Get("json"), ",")
+		if strings.Contains(opts, "omitempty") {
+			optional = append(optional, name)
+		}
+	}
+
+	assert.ElementsMatch(t, optional, isolationChangeOptionalFields)
 }
 
 func TestReportAppliedIsolation(t *testing.T) {

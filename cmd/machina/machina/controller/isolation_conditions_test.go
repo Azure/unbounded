@@ -359,6 +359,57 @@ func TestSyncIsolationConditions_RefusedChange(t *testing.T) {
 	require.Equal(t, "ChangeFailed", cond(m, unboundedv1alpha3.MachineConditionIsolationDrift).Reason)
 }
 
+// The agent replaces status.isolationChange as a whole, sending each empty
+// optional field as null. After a refusal, the opt-in and a reprovision that
+// gave up, the stored change has no reason left, so the condition reports a
+// failure rather than a refusal still waiting for the opt-in.
+func TestMachineReconciler_AFailureAfterARefusalIsNotReportedAsRefused(t *testing.T) {
+	t.Parallel()
+
+	s := newTestScheme(t)
+
+	machine := isolationMachine(isolationNone)
+	machine.Annotations = map[string]string{unboundedv1alpha3.AnnotationAllowReprovision: "true"}
+	machine.Status.Isolation = unboundedv1alpha3.IsolationNSpawn
+	machine.Status.IsolationChange = &unboundedv1alpha3.IsolationChangeStatus{
+		TargetMode: isolationNone, Phase: unboundedv1alpha3.IsolationChangeFailed,
+		Strategy: unboundedv1alpha3.IsolationChangeReprovision,
+		Reason:   unboundedv1alpha3.IsolationChangeReasonReprovisionNotAllowed, Message: "not allowed",
+	}
+
+	fakeClient := fake.NewClientBuilder().WithScheme(s).WithObjects(machine).WithStatusSubresource(machine).Build()
+	reconciler := &MachineReconciler{Client: fakeClient, Scheme: s}
+	key := types.NamespacedName{Name: "iso"}
+
+	reconcileDrift := func() *metav1.Condition {
+		t.Helper()
+
+		_, err := reconciler.Reconcile(context.Background(), ctrl.Request{NamespacedName: key})
+		require.NoError(t, err)
+
+		var got unboundedv1alpha3.Machine
+		require.NoError(t, fakeClient.Get(context.Background(), key, &got))
+
+		c := cond(&got, unboundedv1alpha3.MachineConditionIsolationDrift)
+		require.NotNil(t, c)
+
+		return c
+	}
+
+	require.Equal(t, "ChangeRefused", reconcileDrift().Reason)
+
+	// What the agent writes for the next attempt, which failed.
+	patch := []byte(`{"status":{"isolationChange":{"targetMode":"none","phase":"Failed",` +
+		`"strategy":null,"reason":null,"message":"bootstrap token rejected","lastTransitionTime":null}}}`)
+	require.NoError(t, fakeClient.Status().Patch(context.Background(),
+		&unboundedv1alpha3.Machine{ObjectMeta: metav1.ObjectMeta{Name: "iso"}}, client.RawPatch(types.MergePatchType, patch)))
+
+	c := reconcileDrift()
+	require.Equal(t, "ChangeFailed", c.Reason)
+	require.Contains(t, c.Message, "bootstrap token rejected")
+	require.NotContains(t, c.Message, "is now set")
+}
+
 // The agent's message is bounded by the API, but the condition adds to it. The
 // condition message must stay within what the API server accepts.
 func TestSyncIsolationConditions_MessageIsBounded(t *testing.T) {
