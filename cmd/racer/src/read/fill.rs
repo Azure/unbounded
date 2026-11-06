@@ -2890,15 +2890,20 @@ impl Fill {
                 .dependencies
                 .buffers
                 .plaintext_storage(reservation, length)?;
+            // Detach before decrypting: the RDMA buffer returns to its pool
+            // sooner, and the crypto helper reads the worker-local copy
+            // instead of the registered buffer on the NIC's NUMA node. Each
+            // registered page is then read from memory once, not twice.
+            let ciphertext = self.detach_registered(copy.ciphertext);
             let plaintext = self
                 .dependencies
                 .crypto
-                .decrypt(copy.ciphertext.clone(), storage, scope)
+                .decrypt(ciphertext.clone(), storage, scope)
                 .await?;
             let result = PageResult {
                 metadata: copy.metadata,
                 plaintext,
-                ciphertext: self.detach_registered(copy.ciphertext),
+                ciphertext,
             };
             result.validate_for(page)?;
             Ok(result)

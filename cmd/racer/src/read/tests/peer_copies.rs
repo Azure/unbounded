@@ -2922,6 +2922,7 @@ fn registered_ciphertext_decrypts_in_place_and_persists_a_copy() {
     tampered[0] ^= 1;
     let bad = registered_copy(&env, &f, &mut w, &good, tampered);
     let reservation = f.fill.reserve_bootstrap(&f.context.object.cache).unwrap();
+    let before = crate::memory::registered_copy_outs();
     let decrypted = drive(
         f.fill
             .decrypt(&f.page, bad, reservation, &f.scope, DecryptSource::Peer),
@@ -2930,10 +2931,14 @@ fn registered_ciphertext_decrypts_in_place_and_persists_a_copy() {
         f.fill.drivers(),
     );
     assert_eq!(decrypted.err(), Some(Error::CorruptRecord));
+    // The copy-out precedes decryption, so the crypto helper never reads the
+    // registered buffer; the failed page's copy is simply dropped.
+    assert_eq!(crate::memory::registered_copy_outs(), before + 1);
     crate::rdma::links::tests::pump(&mut w.a.owner, &mut w.b.owner);
     assert_eq!(free_buffers(&w), Some(2));
-    // Page-backed ciphertext decrypts in place, then is copied out once into
-    // pooled aligned storage so the cache and write queue share one page.
+    // Page-backed ciphertext is copied out once into pooled aligned storage
+    // before decryption, so the cache and write queue share one page and the
+    // crypto helper reads that worker-local copy.
     let copy = registered_copy(&env, &f, &mut w, &good, good.ciphertext.bytes().to_vec());
     let reservation = f.fill.reserve_bootstrap(&f.context.object.cache).unwrap();
     let copies = crate::memory::registered_copy_outs();
