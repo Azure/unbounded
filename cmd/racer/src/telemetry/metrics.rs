@@ -410,6 +410,13 @@ metrics! { Event, EVENTS, EVENT_COUNT;
             Self::GpuReadBusy => "racer_gpu_read_requests_total" { "outcome=\"busy\"" },
             Self::GpuReadInvalid => "racer_gpu_read_requests_total" { "outcome=\"invalid\"" },
             Self::GpuReadFailed => "racer_gpu_read_requests_total" { "outcome=\"failed\"" },
+            Self::DirtyDiscardDisplaced => "racer_dirty_discard_reasons_total" { "reason=\"displaced\"" },
+            Self::DirtyDiscardPressure => "racer_dirty_discard_reasons_total" { "reason=\"memory_pressure\"" },
+            Self::DirtyDiscardOwnedReclaim => "racer_dirty_discard_reasons_total" { "reason=\"owned_reclaim\"" },
+            Self::DirtyDiscardWriteFailed => "racer_dirty_discard_reasons_total" { "reason=\"write_failed\"" },
+            Self::DirtyDiscardSuperseded => "racer_dirty_discard_reasons_total" { "reason=\"superseded\"" },
+            Self::DirtyDiscardCanceled => "racer_dirty_discard_reasons_total" { "reason=\"canceled\"" },
+            Self::DirtyDiscardRemoved => "racer_dirty_discard_reasons_total" { "reason=\"cache_removed\"" },
 }
 
 /// The labeled request counter for one `gpu-read` outcome.
@@ -1925,6 +1932,7 @@ mod tests {
                         && !line.starts_with("racer_rdma_link_setups_total{")
                         && !line.starts_with("racer_rdma_plan_http_total{")
                         && !line.starts_with("racer_rdma_send_declined_total{")
+                        && !line.starts_with("racer_dirty_discard_reasons_total{")
                         && !line.starts_with("racer_prefetch_")
                 })
                 .collect();

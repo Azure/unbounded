@@ -1842,7 +1842,9 @@ fn checkpoint_exact_budget_matches_full_snapshot_with_holds() {
     let full = drive(&f.reactor, f.store.checkpoint.snapshot_shard()).unwrap();
     f.store.checkpoint.finish_snapshot();
     let incremental = drive(&f.reactor, f.store.checkpoint.snapshot_incremental(budget)).unwrap();
-    assert!(f.store.writer.paused.get());
+    // An incremental snapshot releases the writer as soon as its image is
+    // copied; only segment reuse stays frozen until finish_snapshot.
+    assert!(!f.store.writer.paused.get());
     let bytes = |shard| {
         encode(&CheckpointImage {
             version: CHECKPOINT_VERSION,
@@ -2127,6 +2129,114 @@ fn dirty_queue_is_bounded_and_cache_removal_discards_without_io() {
     // current positive cache/key set, independently tested through the app.
     assert!(f.enqueue(f.copy(4, 3)).is_ok());
     assert_eq!(f.metrics.count(crate::telemetry::Event::DirtyDiscard), 2);
+    assert_eq!(
+        f.metrics
+            .count(crate::telemetry::Event::DirtyDiscardRemoved),
+        2
+    );
+    assert_eq!(
+        f.metrics
+            .count(crate::telemetry::Event::DirtyDiscardDisplaced),
+        0
+    );
+}
+
+#[test]
+fn pipelined_progress_refills_window_until_total_or_fence() {
+    let env = racer_io::Env::host();
+    let f = Fixture::new(&env);
+    let _ = futures::executor::block_on(f.store.open()).unwrap();
+    f.reactor.init().expect("storage test requires io_uring");
+    let pages: Vec<_> = (1..=2).map(|i| f.copy(i, 64)).collect();
+    let ids: Vec<_> = pages
+        .iter()
+        .map(|p| p.ciphertext.envelope().page.clone())
+        .collect();
+    for page in pages {
+        f.enqueue(page).unwrap();
+    }
+    // One write in flight at a time, refilled until both persist.
+    let request = scope(&env);
+    let mut progress = f.store.writer.progress_pipelined(1, 8, &request);
+    let mut cx = Context::from_waker(futures::task::noop_waker_ref());
+    assert!(progress.as_mut().poll(&mut cx).is_pending());
+    assert_eq!(f.store.writer.writes_in_flight(), 1);
+    assert_eq!(drive(&f.reactor, progress).unwrap(), 2);
+    for id in &ids {
+        assert!(f.store.writer.index().lookup(id).unwrap().is_some());
+    }
+    // A refill fence limits the call to its first window.
+    for i in 3..=4 {
+        f.enqueue(f.copy(i, 64)).unwrap();
+    }
+    f.store.writer.set_refill_fence(true);
+    assert_eq!(
+        drive(
+            &f.reactor,
+            f.store.writer.progress_pipelined(1, 8, &request)
+        )
+        .unwrap(),
+        1
+    );
+    assert_eq!(f.store.writer.pending_count(), 1);
+    f.store.writer.set_refill_fence(false);
+    // `total` bounds the call even with the fence lifted.
+    f.enqueue(f.copy(5, 64)).unwrap();
+    assert_eq!(
+        drive(
+            &f.reactor,
+            f.store.writer.progress_pipelined(1, 1, &request)
+        )
+        .unwrap(),
+        1
+    );
+    assert_eq!(f.store.writer.pending_count(), 1);
+    assert_eq!(f.metrics.count(crate::telemetry::Event::DirtyDiscard), 0);
+}
+
+#[test]
+fn incremental_snapshot_resumes_appends_but_keeps_reuse_frozen() {
+    let env = racer_io::Env::host();
+    let f = Fixture::new(&env);
+    let _ = futures::executor::block_on(f.store.open()).unwrap();
+    f.reactor.init().expect("storage test requires io_uring");
+    let before = f.copy(1, 64);
+    let before_id = before.ciphertext.envelope().page.clone();
+    f.enqueue(before).unwrap();
+    let request = scope(&env);
+    assert_eq!(
+        drive(&f.reactor, f.store.writer.progress(1, &request)).unwrap(),
+        1
+    );
+    let shard = drive(&f.reactor, f.store.checkpoint.snapshot_incremental(1 << 30)).unwrap();
+    assert!(!f.store.writer.paused.get());
+    // A write after the snapshot persists without waiting for publication.
+    let after = f.copy(2, 64);
+    let after_id = after.ciphertext.envelope().page.clone();
+    f.enqueue(after).unwrap();
+    assert_eq!(
+        drive(&f.reactor, f.store.writer.progress(1, &request)).unwrap(),
+        1
+    );
+    assert!(f.store.writer.index().lookup(&after_id).unwrap().is_some());
+    // The image is the cut: it maps the earlier page only.
+    let mapped: Vec<_> = shard.index.entries.iter().map(|(p, _)| p.clone()).collect();
+    assert!(mapped.contains(&before_id));
+    assert!(!mapped.contains(&after_id));
+    // Segment reuse is still frozen, so no mapped extent can be overwritten.
+    let segment = f
+        .store
+        .writer
+        .index()
+        .lookup(&before_id)
+        .unwrap()
+        .unwrap()
+        .location
+        .segment;
+    assert!(f.segments.begin_evict(segment).is_err());
+    assert!(f.segments.freeze().is_err());
+    f.store.checkpoint.finish_snapshot();
+    drop(f.segments.freeze().unwrap());
 }
 
 #[test]

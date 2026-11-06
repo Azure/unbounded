@@ -471,6 +471,10 @@ impl Dirty {
 /// Foreground queue selection and positional removal inspect only this prefix.
 /// VecDeque::remove shifts the shorter side, so a prefix victim also bounds moves.
 const QUEUE_RECLAIM_CANDIDATES: usize = 64;
+/// Writes the worker writer keeps in flight, and the most one of its progress
+/// calls submits (refilling as writes complete) before returning.
+pub(crate) const WRITER_WINDOW: usize = 8;
+pub(crate) const WRITER_CALL_WRITES: usize = 4 * WRITER_WINDOW;
 
 /// Locate queued work without inspecting the unselected suffix.
 fn queued_position(queue: &VecDeque<PageId>, page: &PageId) -> Option<usize> {
@@ -580,6 +584,9 @@ pub struct StoreWriter {
     capacity: Cell<usize>,
     busy: Cell<bool>,
     paused: Cell<bool>,
+    /// Set by the owner while a checkpoint cut waits for this writer: the
+    /// current progress call finishes its in-flight writes without refilling.
+    refill_fenced: Cell<bool>,
     waiters: RefCell<HashMap<u64, Option<std::task::Waker>>>,
     next_waiter: Cell<u64>,
     active_scope: RefCell<Option<RequestScope>>,
@@ -625,6 +632,7 @@ impl StoreWriter {
             capacity: Cell::new(64),
             busy: Cell::new(false),
             paused: Cell::new(false),
+            refill_fenced: Cell::new(false),
             waiters: RefCell::new(HashMap::default()),
             next_waiter: Cell::new(0),
             active_scope: RefCell::new(None),
@@ -882,7 +890,7 @@ impl StoreWriter {
         if let Some(position) = position {
             self.queue.borrow_mut().remove(position);
             self.pending.borrow_mut().remove(page);
-            self.note_discard(1);
+            self.note_discard(crate::telemetry::Event::DirtyDiscardCanceled, 1);
         }
     }
 
@@ -1057,7 +1065,7 @@ impl StoreWriter {
         if let Some((position, victim)) = displace {
             self.queue.borrow_mut().remove(position);
             self.pending.borrow_mut().remove(&victim);
-            self.note_discard(1);
+            self.note_discard(crate::telemetry::Event::DirtyDiscardDisplaced, 1);
         }
         self.next.set(next);
         self.pending.borrow_mut().insert(id.clone(), entry);
@@ -1094,6 +1102,14 @@ impl StoreWriter {
     pub fn pending_count(&self) -> usize {
         self.pending.borrow().len()
     }
+    /// Stop (or resume) refilling in-flight writes beyond the first batch of
+    /// the current progress call. Used to let a checkpoint cut proceed.
+    pub(crate) fn set_refill_fence(&self, fenced: bool) {
+        self.refill_fenced.set(fenced);
+    }
+    fn refill_allowed(&self) -> bool {
+        !self.paused.get() && !self.refill_fenced.get()
+    }
     pub(crate) fn can_start_progress(&self) -> bool {
         !self.paused.get() && !self.busy.get()
     }
@@ -1106,9 +1122,13 @@ impl StoreWriter {
     pub fn discarded_count(&self) -> u64 {
         self.discarded.get()
     }
-    fn note_discard(&self, count: usize) {
+    fn note_discard(&self, reason: crate::telemetry::Event, count: usize) {
+        if count == 0 {
+            return;
+        }
         self.metrics
             .record(crate::telemetry::Event::DirtyDiscard, count as u64);
+        self.metrics.record(reason, count as u64);
         self.discarded
             .set(self.discarded.get().saturating_add(count as u64));
     }
@@ -1140,7 +1160,7 @@ impl StoreWriter {
             }
             removed += usize::from(pending.remove(&page).is_some());
         }
-        self.note_discard(removed);
+        self.note_discard(crate::telemetry::Event::DirtyDiscardCanceled, removed);
         removed
     }
     /// Unpin exactly one otherwise-idle memory bundle. The two ciphertext owners
@@ -1164,7 +1184,7 @@ impl StoreWriter {
         }) {
             queue.remove(position);
             let dirty = pending.remove(id).expect("located queued copy");
-            self.note_discard(1);
+            self.note_discard(crate::telemetry::Event::DirtyDiscardPressure, 1);
             return dirty.staging_bytes();
         }
         0
@@ -1218,7 +1238,7 @@ impl StoreWriter {
                 queue.remove(position);
             }
         }
-        self.note_discard(removed);
+        self.note_discard(crate::telemetry::Event::DirtyDiscardOwnedReclaim, removed);
         removed
     }
     /// Release only enough queued ciphertext/staging charges to cover a deficit.
@@ -1261,11 +1281,24 @@ impl StoreWriter {
                 queue.remove(position);
             }
         }
-        self.note_discard(removed);
+        self.note_discard(crate::telemetry::Event::DirtyDiscardPressure, removed);
         released
     }
     /// Drive at most `budget` writes. Keep polling this future through reactor completion.
     pub fn progress<'a>(&'a self, budget: usize, scope: &'a RequestScope) -> Operation<'a, usize> {
+        self.progress_pipelined(budget, budget, scope)
+    }
+    /// Drive at most `total` writes with up to `window` in flight, submitting
+    /// the next queued write as each completes so one slow write does not
+    /// idle the device for a whole batch. Refill beyond the first `window`
+    /// stops once a pause or refill fence is requested.
+    pub fn progress_pipelined<'a>(
+        &'a self,
+        window: usize,
+        total: usize,
+        scope: &'a RequestScope,
+    ) -> Operation<'a, usize> {
+        let budget = window.min(total);
         Box::pin(async move {
             if self.paused.get() {
                 WriterWaiter::new(self)?.ready(false).await;
@@ -1278,60 +1311,75 @@ impl StoreWriter {
             use futures::StreamExt;
             use futures::stream::FuturesUnordered;
             let mut writes = FuturesUnordered::new();
-            for _ in 0..budget {
-                if scope.check().is_err() {
-                    self.discard_unsubmitted();
-                    break;
-                }
-                let position = {
-                    let queue = self.queue.borrow();
-                    let retention = self.retention();
-                    let scoring = self.scoring(&retention);
-                    // Reverse the tie breaker to keep FIFO within equal value.
-                    queue
-                        .iter()
-                        .enumerate()
-                        .take(QUEUE_RECLAIM_CANDIDATES)
-                        .max_by_key(|(position, id)| {
-                            (scoring.rank(id), std::cmp::Reverse(*position))
-                        })
-                        .map(|(position, _)| position)
-                };
-                let id =
-                    match position.and_then(|position| self.queue.borrow_mut().remove(position)) {
+            // Refill stops at `total`, or once a pause or checkpoint fence is
+            // requested, so callers waiting for the batch still run.
+            let limit = total;
+            let mut submitted = 0usize;
+            let mut stopped = false;
+            let mut completed = 0;
+            let mut failure = None;
+            loop {
+                while !stopped
+                    && writes.len() < budget
+                    && submitted < limit
+                    && (submitted < budget || self.refill_allowed())
+                {
+                    if scope.check().is_err() {
+                        self.discard_unsubmitted();
+                        stopped = true;
+                        break;
+                    }
+                    let position = {
+                        let queue = self.queue.borrow();
+                        let retention = self.retention();
+                        let scoring = self.scoring(&retention);
+                        // Reverse the tie breaker to keep FIFO within equal value.
+                        queue
+                            .iter()
+                            .enumerate()
+                            .take(QUEUE_RECLAIM_CANDIDATES)
+                            .max_by_key(|(position, id)| {
+                                (scoring.rank(id), std::cmp::Reverse(*position))
+                            })
+                            .map(|(position, _)| position)
+                    };
+                    let id = match position
+                        .and_then(|position| self.queue.borrow_mut().remove(position))
+                    {
                         Some(id) => id,
                         None => break,
                     };
-                let page = match self.copy_only(&id)? {
-                    Some(p) => p,
-                    None => {
-                        self.pending.borrow_mut().remove(&id);
-                        continue;
-                    }
+                    let page = match self.copy_only(&id)? {
+                        Some(p) => p,
+                        None => {
+                            self.pending.borrow_mut().remove(&id);
+                            continue;
+                        }
+                    };
+                    // Install cleanup BEFORE allocation, reclamation or submission.
+                    // Every attempted copy leaves the queue, including disposable failures.
+                    let mut cleanup = DirtyCleanup {
+                        writer: self,
+                        persisted: false,
+                        page: id.clone(),
+                        ticket: self
+                            .pending
+                            .borrow()
+                            .get(&id)
+                            .ok_or(Error::Unavailable)?
+                            .ticket,
+                    };
+                    submitted += 1;
+                    writes.push(async move {
+                        let result = self.persist(&id, &page, scope).await;
+                        cleanup.persisted = result.is_ok();
+                        drop(cleanup);
+                        result
+                    });
+                }
+                let Some(result) = writes.next().await else {
+                    break;
                 };
-                // Install cleanup BEFORE allocation, reclamation or submission.
-                // Every attempted copy leaves the queue, including disposable failures.
-                let mut cleanup = DirtyCleanup {
-                    writer: self,
-                    persisted: false,
-                    page: id.clone(),
-                    ticket: self
-                        .pending
-                        .borrow()
-                        .get(&id)
-                        .ok_or(Error::Unavailable)?
-                        .ticket,
-                };
-                writes.push(async move {
-                    let result = self.persist(&id, &page, scope).await;
-                    cleanup.persisted = result.is_ok();
-                    drop(cleanup);
-                    result
-                });
-            }
-            let mut completed = 0;
-            let mut failure = None;
-            while let Some(result) = writes.next().await {
                 completed += 1;
                 if let Some(clock) = self.clock.borrow().as_ref() {
                     let _ = clock.reclaim_now();
@@ -1352,7 +1400,11 @@ impl StoreWriter {
                     }
                     if matches!(error, Error::Canceled | Error::DeadlineExceeded) {
                         self.discard_unsubmitted();
+                        stopped = true;
                     }
+                }
+                if failure.is_some() {
+                    stopped = true;
                 }
             }
             failure.map_or(Ok(completed), Err)
@@ -1471,7 +1523,7 @@ impl StoreWriter {
             self.retention()
                 .published(id, u64::from(page.ciphertext.envelope().plaintext_length));
         } else if self.pending.borrow().contains_key(id) {
-            self.note_discard(1);
+            self.note_discard(crate::telemetry::Event::DirtyDiscardSuperseded, 1);
         }
         Ok(())
     }
@@ -1522,7 +1574,10 @@ impl StoreWriter {
         let mut pending = self.pending.borrow_mut();
         let before = pending.len();
         pending.retain(|p, _| !caches.contains(&p.version.object.cache));
-        self.note_discard(before - pending.len());
+        self.note_discard(
+            crate::telemetry::Event::DirtyDiscardRemoved,
+            before - pending.len(),
+        );
         self.queue
             .borrow_mut()
             .retain(|p| !caches.contains(&p.version.object.cache));
@@ -1671,7 +1726,8 @@ impl Drop for DirtyCleanup<'_> {
         {
             pending.remove(&self.page);
             if !self.persisted {
-                self.writer.note_discard(1);
+                self.writer
+                    .note_discard(crate::telemetry::Event::DirtyDiscardWriteFailed, 1);
             }
         }
     }

@@ -2462,11 +2462,16 @@ impl WorkerApplication {
         {
             result?;
         }
-        let checkpoint_waiting = self
-            .node
-            .periodic_checkpoint
-            .lock()
-            .is_ok_and(|cut| cut.blocks_writer());
+        // A periodic cut fences new batches only until this worker's own
+        // snapshot is taken: the snapshot then thaws appends while segment
+        // reuse stays frozen through publication.
+        let checkpoint_waiting = self.node.periodic_checkpoint.lock().is_ok_and(|cut| {
+            cut.blocks_writer_before(self.checkpoint_generation)
+                || self.checkpoint_snapshot.is_some()
+        });
+        // A pending cut also stops an active batch from refilling, so this
+        // worker can vote once its in-flight writes drain.
+        self.store.writer.set_refill_fence(checkpoint_waiting);
         if !checkpoint_waiting
             && self.writer_task.is_none()
             && self.store.writer.can_start_progress()
@@ -2475,7 +2480,14 @@ impl WorkerApplication {
             let writer = self.store.writer.clone();
             let write_scope = scope(&self.ctx().clock, self.timeout)?;
             self.writer_task = Some(Box::pin(async move {
-                writer.progress(8, &write_scope).await.map(|_| ())
+                writer
+                    .progress_pipelined(
+                        crate::store::WRITER_WINDOW,
+                        crate::store::WRITER_CALL_WRITES,
+                        &write_scope,
+                    )
+                    .await
+                    .map(|_| ())
             }));
         }
         Ok(())

@@ -173,7 +173,9 @@ impl Checkpointer {
 
     /// Copy at most 128 retained mappings per reactor turn and reject budget
     /// pressure before retaining the next batch. Frozen segment reuse makes
-    /// concurrent invalidations safe; no payload is read or fsynced.
+    /// concurrent invalidations safe; no payload is read or fsynced. The
+    /// writer is paused only while copying: on success it may append again
+    /// while segment reuse stays frozen until [`Self::finish_snapshot`].
     pub fn snapshot_incremental(self: &Rc<Self>, budget: usize) -> Operation<'static, ShardImage> {
         let owner = self.clone();
         Box::pin(async move {
@@ -228,8 +230,13 @@ impl Checkpointer {
             }
             .await;
             if result.is_ok() {
+                // The image is an owned copy. Later appends land only in free
+                // slots or the open segment's unused tail, which it does not
+                // map, so resume the writer now. Eviction and recycling stay
+                // frozen through publication, so no mapped extent is reused.
+                frozen.thaw_appends();
+                drop(paused);
                 *owner.frozen.borrow_mut() = Some(frozen);
-                *owner.paused.borrow_mut() = paused;
             }
             result
         })

@@ -150,12 +150,26 @@ struct Slot {
 /// ```
 #[must_use = "keep the guard alive while the table must remain frozen"]
 #[derive(Debug)]
-pub struct FreezeGuard(Rc<Cell<bool>>);
+pub struct FreezeGuard {
+    frozen: Rc<Cell<bool>>,
+    appends: Rc<Cell<bool>>,
+}
+
+impl FreezeGuard {
+    /// Allow appends again while eviction, recycling, and restore stay frozen.
+    /// Appends only reserve free slots or the unused tail of the open
+    /// segment, so a snapshot taken before this call still describes every
+    /// byte it maps: no mapped extent can be recycled and overwritten.
+    pub fn thaw_appends(&self) {
+        self.appends.set(false);
+    }
+}
 
 impl Drop for FreezeGuard {
     /// Release mutation exclusion even if the table has already been dropped.
     fn drop(&mut self) {
-        self.0.set(false);
+        self.frozen.set(false);
+        self.appends.set(false);
     }
 }
 
@@ -175,6 +189,9 @@ pub struct Segments {
     slots: RefCell<Vec<Slot>>,
 
     frozen: Rc<Cell<bool>>,
+
+    /// Appends are blocked by a fresh freeze until the guard thaws them.
+    appends_frozen: Rc<Cell<bool>>,
 
     table: TableIdentity,
 
@@ -200,6 +217,7 @@ impl Segments {
             geometry: Cell::new(None),
             slots: RefCell::new(Vec::new()),
             frozen: Rc::new(Cell::new(false)),
+            appends_frozen: Rc::new(Cell::new(false)),
             table: TableIdentity::new(),
             restore_epoch: Cell::new(0),
             open: Cell::new(None),
@@ -340,7 +358,7 @@ impl Segments {
     /// before returning Busy, allowing reclamation to make a retry possible.
     /// Reservation does not write or initialize disk bytes; see [`SegmentLease`].
     pub fn append(&self, length: usize) -> Result<(SegmentLease, Extent)> {
-        if self.frozen.get() {
+        if self.appends_frozen.get() {
             return Err(Error::Busy);
         }
         let alignment = self.geometry().ok_or(Error::Unavailable)?.alignment();
@@ -521,13 +539,18 @@ impl Segments {
             .collect()
     }
 
-    /// Block allocation, eviction, recycling, and restore until the guard drops.
-    /// Reads and snapshots remain available; only one guard may exist at a time.
+    /// Block allocation, eviction, recycling, and restore until the guard drops
+    /// (allocation until [`FreezeGuard::thaw_appends`]). Reads and snapshots
+    /// remain available; only one guard may exist at a time.
     pub fn freeze(&self) -> Result<FreezeGuard> {
         if self.frozen.replace(true) {
             return Err(Error::Busy);
         }
-        Ok(FreezeGuard(self.frozen.clone()))
+        self.appends_frozen.set(true);
+        Ok(FreezeGuard {
+            frozen: self.frozen.clone(),
+            appends: self.appends_frozen.clone(),
+        })
     }
 
     /// Check the entire image and current restore eligibility without mutation.
@@ -991,6 +1014,27 @@ mod tests {
             .is_err()
         );
         drop(s.append(512).unwrap());
+    }
+
+    /// Thawed appends reserve space while reuse stays frozen until the drop.
+    #[test]
+    fn freeze_guard_thaws_appends_but_not_reuse() {
+        let s = segments(1024, 2);
+        let frozen = s.freeze().unwrap();
+        assert!(matches!(s.append(512), Err(Error::Busy)));
+        frozen.thaw_appends();
+        let (lease, _) = s.append(512).unwrap();
+        drop(lease);
+        assert!(matches!(s.freeze(), Err(Error::Busy)));
+        assert_eq!(s.restore(s.snapshot()), Err(Error::Busy));
+        assert_eq!(s.begin_evict(SegmentId(0)), Err(Error::Busy));
+        assert_eq!(s.recycle(SegmentId(0)), Err(Error::Busy));
+        drop(frozen);
+        drop(s.append(512).unwrap());
+        // A new freeze blocks appends again.
+        let frozen = s.freeze().unwrap();
+        assert!(matches!(s.append(512), Err(Error::Busy)));
+        drop(frozen);
     }
 
     /// A lease retains both validated dimensions and the nominal table identity.

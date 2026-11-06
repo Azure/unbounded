@@ -218,6 +218,13 @@ impl CheckpointCut {
     pub(super) fn blocks_writer(&self) -> bool {
         self.periodic_generation != 0 && self.result().is_none()
     }
+
+    /// Whether a worker whose last snapshot belongs to `snapshotted` must
+    /// still hold back new write batches. Once the worker has snapshotted
+    /// this cut, appends are safe: segment reuse stays frozen instead.
+    pub(super) fn blocks_writer_before(&self, snapshotted: u64) -> bool {
+        self.blocks_writer() && snapshotted != self.periodic_generation
+    }
 }
 
 /// Startup rendezvous for geometry validation and all-worker installation.
@@ -754,6 +761,24 @@ mod tests {
     use crate::store::checkpoint::CHECKPOINT_VERSION;
     use page_alloc::Alignment;
     use page_alloc::Segments;
+
+    /// A periodic cut fences a worker's writer only until that worker has
+    /// snapshotted the cut; a settled cut fences nobody.
+    #[test]
+    fn periodic_cut_fences_writer_until_worker_snapshot() {
+        let mut cut = CheckpointCut::default();
+        assert!(!cut.blocks_writer_before(0));
+        cut.restart(std::time::Instant::now()).unwrap();
+        assert!(cut.blocks_writer());
+        // Not yet snapshotted this generation (or an older one).
+        assert!(cut.blocks_writer_before(0));
+        // Snapshotted this generation: appends may resume.
+        assert!(!cut.blocks_writer_before(cut.periodic_generation));
+        cut.restart(std::time::Instant::now()).unwrap();
+        assert!(cut.blocks_writer_before(cut.periodic_generation - 1));
+        cut.skip();
+        assert!(!cut.blocks_writer_before(0));
+    }
 
     /// A written periodic cut records its fingerprint; a skipped one releases
     /// its reservation without moving the slot.
