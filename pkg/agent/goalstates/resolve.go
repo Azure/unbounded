@@ -170,9 +170,9 @@ func resolveMachine(
 		containerdVersion = ContainerdVersion
 	}
 
-	runcVersion := cfg.CRI.Runc.Version
-	if runcVersion == "" {
-		runcVersion = RunCVersion
+	runcVersion, err := resolveRunCVersion(log, kernel, cfg.CRI.Runc.Version, downloads)
+	if err != nil {
+		return nil, err
 	}
 
 	cniVersion := cfg.CNI.PluginVersion

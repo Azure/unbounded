@@ -215,6 +215,7 @@ func writeNSpawnConfigs(log *slog.Logger, goalState *goalstates.RootFS) error {
 		log.Info("host devices detected, configuring nspawn bind-mounts",
 			"total", len(hostDevicePaths),
 			"kvm", len(goalState.HostDevices.KVM),
+			"mshv", len(goalState.HostDevices.MSHV),
 			"network", len(goalState.HostDevices.Network),
 			"block", len(goalState.HostDevices.Block),
 			"deviceDirectories", len(goalState.HostDevices.DeviceDirectories),
