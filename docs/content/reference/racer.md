@@ -1765,7 +1765,11 @@ failed. `racer_rdma_fallback_grant_overloaded_total` counts the subset of grant
 failures that found every page buffer of the rail, or every grant slot of the
 link, in use. Each link may hold as many grants as its rail has page buffers
 (the `RACER_REGISTERED_BYTES` pool split across rails, at most 1024), capped by
-the peer's advertised limit.
+the largest value whose queue pair and completion queue fit the device's
+reported `max_qp_wr` and `max_cqe` (and, with memory windows, `max_mw`), and by
+the peer's advertised limit. Registration mode posts up to 4 send work requests
+per send, so a device that reports 2048 for both, as MANA does, allows 111
+grants per link. A device that cannot fit even one grant fails RDMA activation.
 `racer_rdma_links_ready`, `racer_rdma_links_connecting`, `racer_rdma_links_backoff`,
 and `racer_rdma_links_breaking` count the node's links by state.
 `racer_rdma_link_breaks_total{reason}` counts links torn down, by `reason`:

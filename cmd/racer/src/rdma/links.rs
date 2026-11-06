@@ -69,8 +69,10 @@ pub fn fund_publication<T>(publication: &mut Vec<T>, registered_bytes: usize) {
 }
 
 /// Most grants one link advertises. Each link posts `2 * grants + 4`
-/// receives, `4 * grants + 8` sends, and binds up to `grants` memory windows,
-/// all well inside common device limits (`max_qp_wr`, `max_mw`) at this value.
+/// receives, `4 * grants + 8` sends (times 4 work requests each in
+/// registration mode), and binds up to `grants` memory windows. Activation
+/// further caps the value so each link's QP and CQ fit the device's reported
+/// `max_qp_wr`, `max_cqe`, and `max_mw`.
 pub const GRANTS_PER_LINK_CAP: u32 = 1024;
 
 /// Grants per link for a rail funding `buffers_per_rail` page buffers.
