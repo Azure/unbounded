@@ -914,6 +914,46 @@ fn disk_observability_publication_read_and_pending_cleanup() {
     assert_eq!(retention.snapshot().disk[0].published_pages, 0);
 }
 #[test]
+fn record_cut_at_another_page_size_than_its_index_entry_is_a_corrupt_miss() {
+    let simulation = racer_io::sim::SimOs::new();
+    let env = racer_io::Env::sim(&simulation, racer_io::WorkerCtx::host());
+    let f = Fixture::new(&env);
+    let _ = drive(&f.reactor, f.store.open()).unwrap();
+    let copy = f.copy(1, 113);
+    let id = copy.ciphertext.envelope().page.clone();
+    f.enqueue(copy).unwrap();
+    drive(&f.reactor, f.store.writer.progress(1, &scope(&env))).unwrap();
+    let index = f.store.writer.index();
+    let entry = index.lookup(&id).unwrap().unwrap();
+    assert_eq!(entry.page_size, racer_wire::object::PageSize::DEFAULT);
+    let (_, token) = drive(
+        &f.reactor,
+        f.store.reader.read_with_token(&id, &scope(&env)),
+    )
+    .unwrap()
+    .unwrap();
+    // Point an entry for a smaller page size at the same record. The record
+    // still decodes and its plaintext fits either size, so only the page
+    // size comparison can refuse it.
+    f.store.reader.invalidate(&token).unwrap();
+    index
+        .publish(
+            id.clone(),
+            catalog::IndexedPage {
+                page_size: racer_wire::object::PageSize::new(64 << 10).unwrap(),
+                ..entry
+            },
+        )
+        .unwrap();
+    assert!(
+        drive(&f.reactor, f.store.reader.read(&id, &scope(&env)))
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(f.metrics.count(crate::telemetry::Event::CorruptMiss), 1);
+    assert!(index.lookup(&id).unwrap().is_none());
+}
+#[test]
 fn disk_observability_failed_write_and_read_do_not_credit_bytes() {
     use racer_io::sim::{Fault, SimOs};
     let simulation = SimOs::new();

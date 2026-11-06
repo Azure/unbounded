@@ -30,6 +30,7 @@ use crate::memory::UnverifiedPage;
 use crate::model::ObjectMetadata;
 use crate::model::PAGE_BYTES;
 use crate::model::PageId;
+use crate::model::PageSize;
 use crate::origin::Origin;
 use crate::peer::protocol::FetchMode;
 use crate::peer::protocol::Operation as PeerOperation;
@@ -531,7 +532,7 @@ impl Fill {
             };
             let page = grant.page.clone();
             let accepted = async {
-                let copy = response_copy(response.response(), &page)?;
+                let copy = response_copy(response.response(), &page, self.page_size()?)?;
                 drop(response);
                 // Allocate and authenticate on the stable owner, which can reclaim
                 // every payload charge retained by its page cache.
@@ -841,7 +842,13 @@ impl Fill {
     /// One page's plaintext at the published cluster page size: what an origin fill or
     /// bootstrap reserves before the page length is known.
     pub(crate) fn page_plaintext_bytes(&self) -> Result<usize> {
-        Ok(self.dependencies.origin.page_size()?.get() as usize)
+        Ok(self.page_size()?.get() as usize)
+    }
+
+    /// The published cluster page size. Every page this node accepts must be cut at
+    /// it, since ranges are sliced at it.
+    pub(crate) fn page_size(&self) -> Result<PageSize> {
+        self.dependencies.origin.page_size()
     }
 
     /// A received or retained copy already fixes the output length. Validate it
@@ -851,7 +858,7 @@ impl Fill {
         page: &PageId,
         copy: &crate::memory::CiphertextCopy,
     ) -> Result<flow_control::Charge<AdmissionPolicy>> {
-        validate_copy(copy, page)?;
+        validate_copy(copy, page, self.page_size()?)?;
         // Charge the pooled capacity up front so reclamation covers it.
         let capacity = self
             .dependencies
@@ -1264,7 +1271,8 @@ impl Fill {
                 // slot, or HTTP): use it privately rather than fetch it again.
                 crate::peer::Delivered::Response(response) => {
                     // A miss or unusable answer: ask the next provider.
-                    let Ok(copy) = response_copy(response.response(), page) else {
+                    let Ok(copy) = response_copy(response.response(), page, self.page_size()?)
+                    else {
                         continue;
                     };
                     return Ok(self
@@ -1292,7 +1300,9 @@ impl Fill {
         if landed.ordinal() != target.ordinal || envelope.page != *page {
             return Ok(None);
         }
-        metadata.immutable().validate_page(&envelope)?;
+        metadata
+            .immutable()
+            .validate_page_in(&envelope, self.page_size()?)?;
         let sealed = Box::new(super::sealed::SealedPage {
             aad: crate::security::page_aad(&envelope)?,
             key: self.dependencies.crypto.derive_page_key(&envelope)?,
@@ -1307,7 +1317,7 @@ impl Fill {
 
     /// Package host ciphertext for GPU verification.
     fn seal(&self, page: &PageId, copy: UnverifiedPage) -> Result<Box<super::sealed::SealedPage>> {
-        validate_copy(&copy.copy, page)?;
+        validate_copy(&copy.copy, page, self.page_size()?)?;
         let envelope = copy.copy.ciphertext.envelope().clone();
         let sealed = Box::new(super::sealed::SealedPage {
             metadata: copy.copy.metadata.clone(),
@@ -1982,7 +1992,7 @@ impl Fill {
                     self.dependencies.memory.ciphertext(page),
                 )?
             {
-                validate_copy(&copy, page)?;
+                validate_copy(&copy, page, self.page_size()?)?;
                 self.metrics.record(Event::MemoryHit, 1);
                 return Ok(Some((copy.metadata, copy.ciphertext)));
             }
@@ -1992,7 +2002,7 @@ impl Fill {
                     self.dependencies.writer.copy_only(page),
                 )?
             {
-                validate_copy(&copy, page)?;
+                validate_copy(&copy, page, self.page_size()?)?;
                 self.metrics.record(Event::MemoryHit, 1);
                 return Ok(Some((copy.metadata, copy.ciphertext)));
             }
@@ -2188,7 +2198,7 @@ impl Fill {
                     Err(error) => return Err(error),
                 }
             }
-            if !want_plaintext && validate_copy(&copy, page).is_ok() {
+            if !want_plaintext && validate_copy(&copy, page, self.page_size()?).is_ok() {
                 self.metrics.record(
                     if token.is_some() {
                         Event::DiskHit
@@ -2271,7 +2281,7 @@ impl Fill {
         token: &crate::store::ReadToken,
         scope: &RequestScope,
     ) -> Result<()> {
-        let result = match validate_copy(copy, page) {
+        let result = match validate_copy(copy, page, self.page_size()?) {
             Ok(()) => {
                 self.dependencies
                     .crypto
@@ -2358,7 +2368,7 @@ impl Fill {
                         .map(AcquiredPage::from)
                 } else {
                     Ok(AcquiredPage::Ciphertext(UnverifiedPage {
-                        copy: response_copy(response.response(), page)?,
+                        copy: response_copy(response.response(), page, self.page_size()?)?,
                         disk_token: None,
                     }))
                 }
@@ -2434,7 +2444,11 @@ impl Fill {
                                                 hedge_start,
                                                 self.dependencies.flights.clock().now(),
                                             );
-                                            let copy = response_copy(response.response(), page)?;
+                                            let copy = response_copy(
+                                                response.response(),
+                                                page,
+                                                self.page_size()?,
+                                            )?;
                                             if let Some(existing) = self
                                                 .retained_metadata(&page.version, &child)
                                                 .await?
@@ -2689,11 +2703,12 @@ impl Fill {
         scope: &RequestScope,
     ) -> Result<PageResult> {
         scope.check()?;
-        let copy = response_copy(response.response(), page).inspect_err(|error| {
-            if *error == Error::CorruptRecord {
-                self.metrics.record(Event::CorruptMiss, 1);
-            }
-        })?;
+        let copy =
+            response_copy(response.response(), page, self.page_size()?).inspect_err(|error| {
+                if *error == Error::CorruptRecord {
+                    self.metrics.record(Event::CorruptMiss, 1);
+                }
+            })?;
         let reservation = match reservation {
             Some(reserved) => reserved,
             None => {
@@ -2773,7 +2788,7 @@ impl Fill {
         // this helper. They are independent of the exact AEAD engine counters,
         // which are reaped even if a waiting fill has been abandoned.
         let result = async {
-            validate_copy(&copy, page)?;
+            validate_copy(&copy, page, self.page_size()?)?;
             // Keep the original immutable ciphertext lease across crypto submission.
             self.metrics.record(Event::PageDecrypt, 1);
             let length = copy.ciphertext.envelope().plaintext_length as usize;
@@ -3150,7 +3165,11 @@ impl Fill {
         Ok(())
     }
 }
-fn response_copy(response: &PeerResponse, page: &PageId) -> Result<crate::memory::CiphertextCopy> {
+fn response_copy(
+    response: &PeerResponse,
+    page: &PageId,
+    size: PageSize,
+) -> Result<crate::memory::CiphertextCopy> {
     match response {
         PeerResponse::Page {
             metadata,
@@ -3165,19 +3184,27 @@ fn response_copy(response: &PeerResponse, page: &PageId) -> Result<crate::memory
                 metadata: metadata.clone(),
                 ciphertext: ciphertext.clone(),
             };
-            validate_copy(&copy, page)?;
+            validate_copy(&copy, page, size)?;
             Ok(copy)
         }
         _ => Err(Error::CorruptRecord),
     }
 }
-pub(super) fn validate_copy(copy: &crate::memory::CiphertextCopy, page: &PageId) -> Result<()> {
+/// Structural checks for a received or retained copy of `page`. A copy cut at
+/// any page size other than the cluster's `size` is corrupt: its plaintext
+/// covers different object bytes than this node's ranges slice at, even though
+/// its tag authenticates.
+pub(super) fn validate_copy(
+    copy: &crate::memory::CiphertextCopy,
+    page: &PageId,
+    size: PageSize,
+) -> Result<()> {
     if &copy.ciphertext.envelope().page != page {
         return Err(Error::CorruptRecord);
     }
     copy.metadata
         .immutable()
-        .validate_page(copy.ciphertext.envelope())
+        .validate_page_in(copy.ciphertext.envelope(), size)
         .map_err(Into::into)
 }
 #[cfg(test)]
@@ -3189,6 +3216,41 @@ mod tests {
     use crate::model::StrongEtag;
     use crate::model::VersionMetadata;
     use racer_wire::control::CacheId;
+    #[test]
+    fn copies_cut_at_another_page_size_are_corrupt() {
+        use crate::read::range_stream::tests::metadata;
+        use crate::read::range_stream::tests::page_result_sized;
+        let admission = flow_control::Quotas::new(crate::admission::AdmissionPolicy::new(
+            crate::test_support::cluster::config(false).limits,
+        ));
+        let small = PageSize::new(64 << 10).unwrap();
+        let mut metadata = metadata();
+        metadata.length = 2 * PageSize::DEFAULT.get();
+        let full = page_result_sized(&admission, &metadata, 1, PageSize::DEFAULT);
+        let cut = page_result_sized(&admission, &metadata, 1, small);
+        let page = full.ciphertext.envelope().page.clone();
+        // Each copy is accepted only at the size it was cut at.
+        assert_eq!(
+            validate_copy(&full.copy(), &page, PageSize::DEFAULT),
+            Ok(())
+        );
+        assert_eq!(validate_copy(&cut.copy(), &page, small), Ok(()));
+        assert_eq!(
+            validate_copy(&cut.copy(), &page, PageSize::DEFAULT),
+            Err(Error::CorruptRecord)
+        );
+        assert_eq!(
+            validate_copy(&full.copy(), &page, small),
+            Err(Error::CorruptRecord)
+        );
+        // The page identity check still applies.
+        let mut other = page.clone();
+        other.number = crate::model::PageNumber(0);
+        assert_eq!(
+            validate_copy(&full.copy(), &other, PageSize::DEFAULT),
+            Err(Error::CorruptRecord)
+        );
+    }
     #[test]
     fn decrypt_source_counters_preserve_results_and_ignore_non_corruption() {
         let metrics = Metrics::default();

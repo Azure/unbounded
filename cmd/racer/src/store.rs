@@ -261,6 +261,7 @@ impl StoreReader {
                 }
             };
             if decoded.header.envelope.page != *page
+                || decoded.header.envelope.page_size != entry.page_size
                 || decoded.header.generation != entry.location.generation
                 || decoded.header.metadata != entry.metadata
                 || decoded.header.envelope.key_id != entry.key_id
@@ -384,6 +385,7 @@ impl StoreReader {
             };
             drop(buffer);
             if decoded.header.envelope.page != *page
+                || decoded.header.envelope.page_size != entry.page_size
                 || decoded.header.generation != location.generation
                 || decoded.header.metadata != entry.metadata
                 || decoded.header.envelope.key_id != entry.key_id

@@ -1336,6 +1336,11 @@ impl RangeStream {
     }
     fn validate_sealed(&self, sealed: &SealedPage, number: PageNumber) -> Result<()> {
         validate_pin(&self.metadata, &sealed.metadata)?;
+        // The range slices at its own page size. A page cut at another size
+        // authenticates but covers different object bytes.
+        if sealed.envelope.page_size != self.range.page_size() {
+            return Err(Error::CorruptRecord);
+        }
         sealed.validate_for(&PageId {
             version: self.metadata.version.clone(),
             number,
@@ -1343,6 +1348,9 @@ impl RangeStream {
     }
     fn validate(&self, result: &PageResult, number: PageNumber) -> Result<()> {
         validate_pin(&self.metadata, &result.metadata)?;
+        if result.ciphertext.envelope().page_size != self.range.page_size() {
+            return Err(Error::CorruptRecord);
+        }
         result.validate_for(&PageId {
             version: self.metadata.version.clone(),
             number,
@@ -1793,13 +1801,28 @@ pub(super) mod tests {
         metadata: &ObjectMetadata,
         number: u64,
     ) -> PageResult {
+        page_result_sized(
+            admission,
+            metadata,
+            number,
+            racer_wire::object::PageSize::DEFAULT,
+        )
+    }
+
+    /// Page `number` of `metadata` cut at `size`.
+    pub(crate) fn page_result_sized(
+        admission: &flow_control::Quotas<AdmissionPolicy>,
+        metadata: &ObjectMetadata,
+        number: u64,
+        size: racer_wire::object::PageSize,
+    ) -> PageResult {
         use crate::memory::CiphertextBytes;
         use crate::memory::CiphertextPage;
         use crate::memory::VerifiedBytes;
         use crate::memory::VerifiedPage;
         use crate::model::Nonce;
         use crate::model::PageEnvelope;
-        let length = (metadata.length - number * PAGE_BYTES).min(PAGE_BYTES) as usize;
+        let length = (metadata.length - number * size.get()).min(size.get()) as usize;
         let page = PageId {
             version: metadata.version.clone(),
             number: PageNumber(number),
@@ -1823,7 +1846,7 @@ pub(super) mod tests {
                 inner: Arc::new(CiphertextBytes {
                     pins: Default::default(),
                     envelope: PageEnvelope {
-                        page_size: racer_wire::object::PageSize::DEFAULT,
+                        page_size: size,
                         cipher: crate::model::PageCipher::Xaes256Gcm,
                         page,
                         key_id: crate::model::key_id_from_generation(1, 1).unwrap(),
@@ -2327,7 +2350,7 @@ pub(super) mod tests {
             ));
         }
     }
-    fn metadata() -> ObjectMetadata {
+    pub(crate) fn metadata() -> ObjectMetadata {
         ObjectMetadata {
             content_type: None,
             version: ObjectVersion {
@@ -3575,6 +3598,70 @@ pub(super) mod tests {
             // Credits sized for the largest page stay accepted.
             let mut reader = stream(&f, &metadata, range);
             reader.configure_subscription(4, 4 * PAGE_BYTES).unwrap();
+        }
+        #[test]
+        fn pages_cut_at_another_page_size_are_never_delivered() {
+            let env = racer_io::Env::host();
+            let f =
+                super::Fixture::new(&env, crate::test_support::cluster::config(false).limits, 1);
+            let small = racer_wire::object::PageSize::new(64 << 10).unwrap();
+            let mut metadata = super::metadata();
+            metadata.length = 2 * PAGE_BYTES;
+            let scope = || {
+                RequestScope::host(
+                    crate::model::RequestId([1; 16]),
+                    Instant::now() + Duration::from_secs(60),
+                )
+                .unwrap()
+            };
+            // A small page 1 holds object bytes 64 KiB onward; a default-size
+            // range wants page 1 to hold bytes 16 MiB onward.
+            let range = crate::model::ByteRange::From(PAGE_BYTES)
+                .resolve(metadata.length)
+                .unwrap();
+            let mut reader = f.open(&metadata, range, scope());
+            reader.configure_subscription(1, PAGE_BYTES).unwrap();
+            reader.inject(TestSlot::Ready(Ok(super::page_result_sized(
+                &f.admission,
+                &metadata,
+                1,
+                small,
+            ))));
+            assert_eq!(
+                futures::executor::block_on(reader.next_slice()).err(),
+                Some(Error::CorruptRecord)
+            );
+            drop(reader);
+            // A default-size page is equally foreign to a small-page range.
+            let range = crate::model::ByteRange::From(small.get())
+                .resolve_paged(metadata.length, small)
+                .unwrap();
+            let mut reader = f.open(&metadata, range, scope());
+            reader.configure_subscription(1, PAGE_BYTES).unwrap();
+            reader.inject(TestSlot::Ready(Ok(super::page_result(
+                &f.admission,
+                &metadata,
+                1,
+            ))));
+            assert_eq!(
+                futures::executor::block_on(reader.next_slice()).err(),
+                Some(Error::CorruptRecord)
+            );
+            drop(reader);
+            // The same small page is delivered whole to a range cut at its size.
+            let mut reader = f.open(&metadata, range, scope());
+            reader.configure_subscription(1, PAGE_BYTES).unwrap();
+            reader.inject(TestSlot::Ready(Ok(super::page_result_sized(
+                &f.admission,
+                &metadata,
+                1,
+                small,
+            ))));
+            let delivered = futures::executor::block_on(reader.next_slice())
+                .unwrap()
+                .unwrap();
+            assert_eq!(delivered.slice().page, PageNumber(1));
+            assert_eq!(u64::from(delivered.slice().length), small.get());
         }
         #[test]
         fn invalid_credit_contracts_never_admit_demand() {

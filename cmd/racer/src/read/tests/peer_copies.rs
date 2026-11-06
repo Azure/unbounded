@@ -2304,7 +2304,7 @@ fn unusable_copy(f: &Fixture, good: &CiphertextCopy, missing_key: bool) -> Ciphe
         metadata: good.metadata.clone(),
         ciphertext,
     };
-    validate_copy(&copy, &f.page).unwrap(); // Structural checks cannot detect flipped ciphertext.
+    validate_copy(&copy, &f.page, crate::model::PageSize::DEFAULT).unwrap(); // Structural checks cannot detect flipped ciphertext.
     copy
 }
 
