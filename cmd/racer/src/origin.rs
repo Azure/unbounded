@@ -78,8 +78,13 @@ pub trait Origin {
         Ok(PageSize::DEFAULT)
     }
 }
+type NodeIdKey = racer_wire::control::NodeId;
+/// Bound on cached health keys; the cache is cleared when it fills.
+const HEALTH_KEY_CACHE: usize = 256;
 pub struct OriginClient {
     health: crate::topology::LinkHealth,
+    /// Health keys by endpoint, so each call does not re-format its Debug key.
+    health_keys: std::cell::RefCell<std::collections::HashMap<Endpoint, Rc<NodeIdKey>>>,
     snapshots: std::sync::Arc<PublicationCell<Snapshot>>,
     pool: Rc<HttpPool>,
     io: Rc<HttpIo>,
@@ -116,6 +121,7 @@ impl OriginClient {
         }
         Ok(Self {
             health: crate::topology::LinkHealth::new(64, io.reactor().ctx().clock.clone()),
+            health_keys: Default::default(),
             snapshots,
             pool,
             io,
@@ -173,6 +179,20 @@ impl OriginClient {
             }),
             metadata,
         })
+    }
+
+    /// The link-health key for `endpoint`: its `Debug` form, formatted once.
+    fn health_key(&self, endpoint: &Endpoint) -> Rc<NodeIdKey> {
+        let mut keys = self.health_keys.borrow_mut();
+        if let Some(key) = keys.get(endpoint) {
+            return key.clone();
+        }
+        if keys.len() >= HEALTH_KEY_CACHE {
+            keys.clear();
+        }
+        let key = Rc::new(racer_wire::control::NodeId(format!("{endpoint:?}")));
+        keys.insert(endpoint.clone(), key.clone());
+        key
     }
 
     fn endpoint(&self, context: &OriginContext) -> Result<Endpoint> {
@@ -369,7 +389,7 @@ impl Origin for OriginClient {
             let endpoint = self.endpoint(context)?;
             self.health
                 .run(
-                    &racer_wire::control::NodeId(format!("{endpoint:?}")),
+                    &self.health_key(&endpoint),
                     self.bootstrap_reserved_at(&endpoint, context, reservation, scope),
                 )
                 .await
@@ -392,7 +412,7 @@ impl Origin for OriginClient {
             let endpoint = self.endpoint(context)?;
             self.health
                 .run(
-                    &racer_wire::control::NodeId(format!("{endpoint:?}")),
+                    &self.health_key(&endpoint),
                     self.page_reserved_at(&endpoint, context, page, reservation, scope),
                 )
                 .await
@@ -411,7 +431,7 @@ impl Origin for OriginClient {
             let endpoint = self.endpoint(context)?;
             self.health
                 .run(
-                    &racer_wire::control::NodeId(format!("{endpoint:?}")),
+                    &self.health_key(&endpoint),
                     self.metadata_at(&endpoint, context, selector, scope),
                 )
                 .await

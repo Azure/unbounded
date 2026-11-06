@@ -1783,3 +1783,26 @@ fn real_uds_fresh_connection_closed_before_response_is_not_retried() {
     server.join().unwrap();
     client.pool.close();
 }
+
+#[test]
+fn health_key_is_debug_form_cached_per_endpoint_and_bounded() {
+    let env = racer_io::Env::host();
+    let (client, _, _) = client(&env);
+    let endpoint = |n: usize| Endpoint::Origin {
+        cache: racer_wire::control::CacheId(format!("{n:08x}-1111-4111-8111-111111111111")),
+        path: format!("/run/racer/{n}/origin/socket").into(),
+    };
+    let first = client.health_key(&endpoint(0));
+    assert_eq!(first.0, format!("{:?}", endpoint(0)));
+    assert!(Rc::ptr_eq(&first, &client.health_key(&endpoint(0))));
+    let other = client.health_key(&endpoint(1));
+    assert_eq!(other.0, format!("{:?}", endpoint(1)));
+    assert_ne!(first, other);
+    for n in 0..HEALTH_KEY_CACHE * 2 {
+        assert_eq!(
+            client.health_key(&endpoint(n)).0,
+            format!("{:?}", endpoint(n))
+        );
+        assert!(client.health_keys.borrow().len() <= HEALTH_KEY_CACHE);
+    }
+}
