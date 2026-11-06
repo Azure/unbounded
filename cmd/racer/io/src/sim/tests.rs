@@ -1,4 +1,4 @@
-//! Simulated OS contracts ported from uring-runtime (reactor-independent ones).
+//! Reactor-independent contracts of the simulated OS: the syscall semantics it models.
 #![allow(clippy::type_complexity)]
 use super::*;
 use std::ops::Deref;

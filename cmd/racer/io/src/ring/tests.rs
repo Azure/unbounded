@@ -923,9 +923,10 @@ fn sim_cancel_fences_and_file_ops() {
     assert_eq!(reactor.in_flight(), 0);
 }
 
-/// Behaviors ported from the legacy `uring-runtime` reactor tests that the
-/// racer-io suite above did not already exercise.
-mod legacy_reactor_ports {
+/// Reactor edge cases: short progress and `EINTR` retries, publication
+/// rollback, cancellation fences, re-entrant owner destructors, and socket
+/// EOF and `EPIPE` handling.
+mod reactor_edge_cases {
     use super::*;
     use std::os::fd::{AsRawFd, OwnedFd};
 

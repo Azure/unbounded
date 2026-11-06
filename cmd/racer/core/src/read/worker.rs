@@ -283,10 +283,9 @@ pub struct Observed {
     pub helpers: u64,
     pub no_helper: u64,
     /// Waiters elected to lead a flight after an earlier leader of it ended without
-    /// settling it (production `Flights::fail`; racer-sim `flight_reelected`).
+    /// settling it (see `Flights::fail`).
     pub reelected: u64,
-    /// Acquisitions that ended with a result, and those whose result was an error
-    /// (racer-sim `fills_*`).
+    /// Acquisitions that ended with a result, and those whose result was an error.
     pub fills: u64,
     pub fills_failed: u64,
 }
