@@ -302,7 +302,8 @@ class BPFFSSentinelTests(unittest.TestCase):
     def test_script_needs_no_bpftool_and_stops_on_error(self):
         script = e2e.bpffs_sentinel_script()
         self.assertNotIn("bpftool", script)
-        self.assertTrue(script.startswith("set -e\n"))
+        self.assertNotIn("\n", script)
+        self.assertEqual(script.count(" && "), 3)
         self.assertIn(f"mkdir /sys/fs/bpf/{e2e.BPFFS_SENTINEL}", script)
 
     def test_nspawn_sentinel_is_checked_on_the_host(self):
