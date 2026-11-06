@@ -1671,13 +1671,16 @@ spec:
                                     type: object
                                     x-kubernetes-validations:
                                     - message: role minCount must not exceed maxCount
-                                      rule: self.roles.all(x, x.minCount <= x.maxCount)
+                                      rule: '!has(self.roles) || self.roles.all(x,
+                                        !has(x.minCount) || x.minCount <= x.maxCount)'
                                     - message: role minimum counts must fit maxParticipants
-                                      rule: '!has(self.roles) || self.roles.map(x,
-                                        x.minCount).sum() <= self.maxParticipants'
+                                      rule: '!has(self.roles) || size(self.roles)
+                                        == 0 || self.roles.map(x, has(x.minCount)
+                                        ? x.minCount : 0).sum() <= self.maxParticipants'
                                     - message: role maximum counts must cover minParticipants
-                                      rule: '!has(self.roles) || self.roles.map(x,
-                                        x.maxCount).sum() >= self.minParticipants'
+                                      rule: '!has(self.roles) || size(self.roles)
+                                        == 0 || self.roles.map(x, x.maxCount).sum()
+                                        >= self.minParticipants'
                                 required:
                                 - driver
                                 - identity
@@ -1697,42 +1700,46 @@ spec:
                             - message: qualification-eligible stages require an approved
                                 test and must not be diagnostic-only
                               rule: '!self.qualificationEligible || (self.test.identity.trust
-                                == ''Approved'' && !self.diagnosticOnly)'
+                                == ''Approved'' && (!has(self.diagnosticOnly) || !self.diagnosticOnly))'
                             - message: qualification-eligible stages require complete
                                 resolved inputs
                               rule: '!self.qualificationEligible || !has(self.resolvedInputs)
                                 || self.resolvedInputs.all(i, i.state == ''Complete'')'
                             - message: stages with incomplete inputs must be diagnostic-only
                               rule: '!has(self.resolvedInputs) || self.resolvedInputs.all(i,
-                                i.state != ''Incomplete'') || (self.diagnosticOnly
-                                && !self.qualificationEligible)'
+                                i.state != ''Incomplete'') || (has(self.diagnosticOnly)
+                                && self.diagnosticOnly && !self.qualificationEligible)'
                             - message: unapproved tests are diagnostic-only and cannot
                                 grant qualification credit
-                              rule: self.test.identity.trust == 'Approved' || (self.diagnosticOnly
-                                && !self.qualificationEligible)
+                              rule: self.test.identity.trust == 'Approved' || (has(self.diagnosticOnly)
+                                && self.diagnosticOnly && !self.qualificationEligible)
                             - message: rejected or revoked tests cannot be resolved
                                 into new Runs
                               rule: self.test.identity.trust != 'Rejected' && self.test.identity.trust
                                 != 'Revoked'
                             - message: role-aware tests require resolved participant
                                 role assignments
-                              rule: (size(self.test.topology.roles) == 0 && (!has(self.participantRoles)
-                                || size(self.participantRoles) == 0)) || (size(self.test.topology.roles)
+                              rule: ((!has(self.test.topology.roles) || size(self.test.topology.roles)
+                                == 0) && (!has(self.participantRoles) || size(self.participantRoles)
+                                == 0)) || (has(self.test.topology.roles) && size(self.test.topology.roles)
                                 > 0 && has(self.participantRoles) && size(self.participantRoles)
                                 > 0)
                             - message: resolved participant roles must exist in the
                                 test topology
-                              rule: '!has(self.participantRoles) || self.participantRoles.all(b,
-                                self.test.topology.roles.exists(r, r.name == b.role))'
+                              rule: '!has(self.participantRoles) || (has(self.test.topology.roles)
+                                && self.participantRoles.all(b, self.test.topology.roles.exists(r,
+                                r.name == b.role)))'
                             - message: resolved participant role counts must satisfy
                                 the test topology
-                              rule: self.test.topology.roles.all(r, (self.participantRoles.filter(b,
-                                b.role == r.name).size() == 0 && r.minCount == 0)
-                                || (self.participantRoles.filter(b, b.role == r.name).size()
-                                == 1 && self.participantRoles.filter(b, b.role ==
-                                r.name)[0].participantIndexes.size() >= r.minCount
-                                && self.participantRoles.filter(b, b.role == r.name)[0].participantIndexes.size()
-                                <= r.maxCount))
+                              rule: '!has(self.test.topology.roles) || !has(self.participantRoles)
+                                || self.test.topology.roles.all(r, (self.participantRoles.filter(b,
+                                b.role == r.name).size() == 0 && (!has(r.minCount)
+                                || r.minCount == 0)) || (self.participantRoles.filter(b,
+                                b.role == r.name).size() == 1 && self.participantRoles.filter(b,
+                                b.role == r.name)[0].participantIndexes.size() >=
+                                (has(r.minCount) ? r.minCount : 0) && self.participantRoles.filter(b,
+                                b.role == r.name)[0].participantIndexes.size() <=
+                                r.maxCount))'
                             - message: resolved participant role assignments must
                                 satisfy participant topology bounds
                               rule: '!has(self.participantRoles) || self.participantRoles.map(r,
@@ -1874,7 +1881,8 @@ spec:
                 && has(self.planProvenance.controllerImage))'
             - message: resolved stage participant indexes must reference Run participants
               rule: '!has(self.resolvedPlan) || self.resolvedPlan.phases.all(p, p.stages.all(s,
-                s.participantRoles.all(r, r.participantIndexes.all(i, i < size(self.participants)))))'
+                !has(s.participantRoles) || s.participantRoles.all(r, r.participantIndexes.all(i,
+                i < size(self.participants)))))'
             - message: resolved stages without explicit roles use all Run participants
                 and must satisfy the test topology
               rule: '!has(self.resolvedPlan) || self.resolvedPlan.phases.all(p, p.stages.all(s,
@@ -2598,7 +2606,7 @@ spec:
                           - message: qualification-eligible evidence requires an approved
                               test and must not be diagnostic-only
                             rule: '!self.qualificationEligible || (self.test.trust
-                              == ''Approved'' && !self.diagnosticOnly)'
+                              == ''Approved'' && (!has(self.diagnosticOnly) || !self.diagnosticOnly))'
                         maxItems: 32
                         type: array
                         x-kubernetes-list-type: atomic

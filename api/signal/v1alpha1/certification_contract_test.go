@@ -4,15 +4,20 @@
 package v1alpha1
 
 import (
+	"context"
 	"encoding/json"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 
+	apiextensions "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions"
 	apiextensionsv1 "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1"
+	"k8s.io/apiextensions-apiserver/pkg/apiserver/schema"
+	schemacel "k8s.io/apiextensions-apiserver/pkg/apiserver/schema/cel"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/util/validation"
+	"k8s.io/apimachinery/pkg/util/validation/field"
 	"k8s.io/apimachinery/pkg/util/yaml"
 )
 
@@ -250,6 +255,141 @@ func TestCertificationTestContract(t *testing.T) {
 	}
 }
 
+func TestCertificationTestTopologyCEL(t *testing.T) {
+	t.Parallel()
+
+	crd := readCRD(t, "signal.unbounded-cloud.io_certificationtests.yaml")
+	test, _, _ := genericVLLMContractFixture(t)
+	base := unstructuredObject(t, test)
+
+	tests := []struct {
+		name       string
+		mutate     func(map[string]any)
+		wantErrors bool
+	}{
+		{
+			name: "topology absent",
+			mutate: func(object map[string]any) {
+				delete(object["spec"].(map[string]any), "topology")
+			},
+		},
+		{
+			name: "roles omitted",
+			mutate: func(object map[string]any) {
+				delete(object["spec"].(map[string]any)["topology"].(map[string]any), "roles")
+			},
+		},
+		{
+			name: "empty roles",
+			mutate: func(object map[string]any) {
+				object["spec"].(map[string]any)["topology"].(map[string]any)["roles"] = []any{}
+			},
+		},
+		{
+			name: "valid roles",
+			mutate: func(object map[string]any) {
+				object["spec"].(map[string]any)["topology"].(map[string]any)["roles"] = []any{
+					map[string]any{
+						"name":        "worker",
+						"displayName": "Worker",
+						"minCount":    int64(1),
+						"maxCount":    int64(1),
+					},
+				}
+			},
+		},
+		{
+			name: "optional role minCount omitted",
+			mutate: func(object map[string]any) {
+				object["spec"].(map[string]any)["topology"].(map[string]any)["roles"] = []any{
+					map[string]any{
+						"name":        "observer",
+						"displayName": "Observer",
+						"maxCount":    int64(1),
+					},
+				}
+			},
+		},
+		{
+			name: "invalid role bounds",
+			mutate: func(object map[string]any) {
+				object["spec"].(map[string]any)["topology"].(map[string]any)["roles"] = []any{
+					map[string]any{
+						"name":        "worker",
+						"displayName": "Worker",
+						"minCount":    int64(2),
+						"maxCount":    int64(1),
+					},
+				}
+			},
+			wantErrors: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			object := deepCopyUnstructured(t, base)
+			tt.mutate(object)
+
+			errors := validateCRDCEL(t, crd, object)
+			if tt.wantErrors && len(errors) == 0 {
+				t.Fatal("server-equivalent CEL accepted invalid topology")
+			}
+
+			if !tt.wantErrors && len(errors) != 0 {
+				t.Fatalf("server-equivalent CEL rejected topology: %v", errors.ToAggregate())
+			}
+		})
+	}
+}
+
+func TestCertificationRunTopologyCELAllowsOmittedRoles(t *testing.T) {
+	t.Parallel()
+
+	crd := readCRD(t, "signal.unbounded-cloud.io_certificationruns.yaml")
+	_, _, run := genericVLLMContractFixture(t)
+
+	t.Run("roles omitted", func(t *testing.T) {
+		t.Parallel()
+
+		object := unstructuredObject(t, run)
+		stage := object["spec"].(map[string]any)["resolvedPlan"].(map[string]any)["phases"].([]any)[0].(map[string]any)["stages"].([]any)[0].(map[string]any)
+		delete(stage["test"].(map[string]any)["topology"].(map[string]any), "roles")
+		delete(stage, "participantRoles")
+
+		if errors := validateCRDCEL(t, crd, object); len(errors) != 0 {
+			t.Fatalf("server-equivalent CEL rejected resolved stage without roles: %v", errors.ToAggregate())
+		}
+	})
+
+	t.Run("optional role minCount omitted", func(t *testing.T) {
+		t.Parallel()
+
+		object := unstructuredObject(t, run)
+		stage := object["spec"].(map[string]any)["resolvedPlan"].(map[string]any)["phases"].([]any)[0].(map[string]any)["stages"].([]any)[0].(map[string]any)
+		topology := stage["test"].(map[string]any)["topology"].(map[string]any)
+		topology["roles"] = []any{
+			map[string]any{
+				"name":        "observer",
+				"displayName": "Observer",
+				"maxCount":    int64(1),
+			},
+		}
+		stage["participantRoles"] = []any{
+			map[string]any{
+				"role":               "observer",
+				"participantIndexes": []any{int64(0)},
+			},
+		}
+
+		if errors := validateCRDCEL(t, crd, object); len(errors) != 0 {
+			t.Fatalf("server-equivalent CEL rejected optional role without minCount: %v", errors.ToAggregate())
+		}
+	})
+}
+
 func TestCertificationSuitePhaseContract(t *testing.T) {
 	t.Parallel()
 
@@ -432,7 +572,7 @@ func TestCertificationRunPinsSuiteAndRemainsImmutable(t *testing.T) {
 		"has(self.resolvedPlan) == has(oldSelf.resolvedPlan) && (!has(self.resolvedPlan) || self.resolvedPlan == oldSelf.resolvedPlan)":                                                                                                                                        false,
 		"(has(self.resolvedPlan) && size(self.resolvedPlan.phases) > 0) != (has(self.checks) && size(self.checks) > 0)":                                                                                                                                                        false,
 		"!has(self.resolvedPlan) || (has(self.planDigest) && has(self.planProvenance) && has(self.planProvenance.controllerImage))":                                                                                                                                            false,
-		"!has(self.resolvedPlan) || self.resolvedPlan.phases.all(p, p.stages.all(s, s.participantRoles.all(r, r.participantIndexes.all(i, i < size(self.participants)))))":                                                                                                     false,
+		"!has(self.resolvedPlan) || self.resolvedPlan.phases.all(p, p.stages.all(s, !has(s.participantRoles) || s.participantRoles.all(r, r.participantIndexes.all(i, i < size(self.participants)))))":                                                                         false,
 		"!has(self.resolvedPlan) || self.resolvedPlan.phases.all(p, p.stages.all(s, (has(s.participantRoles) && size(s.participantRoles) > 0) || (size(self.participants) >= s.test.topology.minParticipants && size(self.participants) <= s.test.topology.maxParticipants)))": false,
 		"has(self.planDigest) == has(oldSelf.planDigest) && (!has(self.planDigest) || self.planDigest == oldSelf.planDigest)":                                                                                                                                                  false,
 		"has(self.planProvenance) == has(oldSelf.planProvenance) && (!has(self.planProvenance) || self.planProvenance == oldSelf.planProvenance)":                                                                                                                              false,
@@ -482,10 +622,10 @@ func TestCertificationRunPlanAndEvidenceContract(t *testing.T) {
 	resolvedStage := resolvedPlan.Properties["phases"].Items.Schema.
 		Properties["stages"].Items.Schema
 	for _, rule := range []string{
-		"!self.qualificationEligible || (self.test.identity.trust == 'Approved' && !self.diagnosticOnly)",
+		"!self.qualificationEligible || (self.test.identity.trust == 'Approved' && (!has(self.diagnosticOnly) || !self.diagnosticOnly))",
 		"!self.qualificationEligible || !has(self.resolvedInputs) || self.resolvedInputs.all(i, i.state == 'Complete')",
-		"!has(self.resolvedInputs) || self.resolvedInputs.all(i, i.state != 'Incomplete') || (self.diagnosticOnly && !self.qualificationEligible)",
-		"self.test.identity.trust == 'Approved' || (self.diagnosticOnly && !self.qualificationEligible)",
+		"!has(self.resolvedInputs) || self.resolvedInputs.all(i, i.state != 'Incomplete') || (has(self.diagnosticOnly) && self.diagnosticOnly && !self.qualificationEligible)",
+		"self.test.identity.trust == 'Approved' || (has(self.diagnosticOnly) && self.diagnosticOnly && !self.qualificationEligible)",
 		"self.test.identity.trust != 'Rejected' && self.test.identity.trust != 'Revoked'",
 		"!has(self.perDeviceCoverageInterval) || self.schedule.mode != 'RunOnce'",
 		"!has(self.schedule.coverageWindow) || !has(self.perDeviceCoverageInterval) || duration(self.perDeviceCoverageInterval) <= duration(self.schedule.coverageWindow)",
@@ -888,6 +1028,36 @@ func TestCertificationRunBackwardDecode(t *testing.T) {
 	}
 }
 
+func TestCertificationTestBackwardDecodeWithoutRoles(t *testing.T) {
+	t.Parallel()
+
+	content := []byte(`{
+		"apiVersion":"signal.unbounded-cloud.io/v1alpha1",
+		"kind":"CertificationTest",
+		"metadata":{"name":"existing"},
+		"spec":{
+			"displayName":"Existing test",
+			"owner":"operator",
+			"version":"1",
+			"metrics":[{"name":"passed","displayName":"Passed","type":"Boolean"}],
+			"topology":{"minParticipants":1,"maxParticipants":1},
+			"driver":{
+				"type":"Container",
+				"container":{"image":"example.invalid/test@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}
+			}
+		}
+	}`)
+
+	test := &CertificationTest{}
+	if err := json.Unmarshal(content, test); err != nil {
+		t.Fatalf("decode existing CertificationTest without topology roles: %v", err)
+	}
+
+	if test.Spec.Topology.Roles != nil {
+		t.Fatal("existing CertificationTest unexpectedly acquired topology roles")
+	}
+}
+
 func TestAssertionResultBackwardDecodeAndMissingMetric(t *testing.T) {
 	t.Parallel()
 
@@ -991,6 +1161,65 @@ func readCRD(t *testing.T, name string) *apiextensionsv1.CustomResourceDefinitio
 	}
 
 	return crd
+}
+
+func validateCRDCEL(
+	t *testing.T,
+	crd *apiextensionsv1.CustomResourceDefinition,
+	object map[string]any,
+) field.ErrorList {
+	t.Helper()
+
+	versioned := crd.Spec.Versions[0].Schema.OpenAPIV3Schema
+
+	internal := &apiextensions.JSONSchemaProps{}
+	if err := apiextensionsv1.Convert_v1_JSONSchemaProps_To_apiextensions_JSONSchemaProps(
+		versioned,
+		internal,
+		nil,
+	); err != nil {
+		t.Fatalf("convert CRD schema: %v", err)
+	}
+
+	structural, err := schema.NewStructural(internal)
+	if err != nil {
+		t.Fatalf("build structural schema: %v", err)
+	}
+
+	const costBudget = 10_000_000
+
+	validator := schemacel.NewValidator(structural, true, costBudget)
+	if validator == nil {
+		t.Fatal("generated CRD has no CEL validator")
+	}
+
+	errors, _ := validator.Validate(
+		context.Background(),
+		field.NewPath("object"),
+		structural,
+		object,
+		nil,
+		costBudget,
+	)
+
+	return errors
+}
+
+func unstructuredObject(t *testing.T, object any) map[string]any {
+	t.Helper()
+
+	unstructured, err := runtime.DefaultUnstructuredConverter.ToUnstructured(object)
+	if err != nil {
+		t.Fatalf("convert unstructured object: %v", err)
+	}
+
+	return unstructured
+}
+
+func deepCopyUnstructured(t *testing.T, object map[string]any) map[string]any {
+	t.Helper()
+
+	return runtime.DeepCopyJSON(object)
 }
 
 func hasValidationRule(schema *apiextensionsv1.JSONSchemaProps, want string) bool {

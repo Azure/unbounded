@@ -29,6 +29,10 @@ name; its spec provides an operator display name, owner, version, typed
 parameters, typed metrics, participant topology, a driver, and explicit
 security requirements.
 
+Participant roles are optional. Omitting `topology.roles` and explicitly
+supplying an empty role list are equivalent role-free topologies; per-role
+cardinality validation runs only when roles are present.
+
 Supported drivers are:
 
 - `Script`: an immutable ConfigMap, OCI, or exact Git source executed by a

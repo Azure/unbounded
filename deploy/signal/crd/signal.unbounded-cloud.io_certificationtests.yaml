@@ -709,13 +709,14 @@ spec:
                 type: object
                 x-kubernetes-validations:
                 - message: role minCount must not exceed maxCount
-                  rule: self.roles.all(x, x.minCount <= x.maxCount)
+                  rule: '!has(self.roles) || self.roles.all(x, !has(x.minCount) ||
+                    x.minCount <= x.maxCount)'
                 - message: role minimum counts must fit maxParticipants
-                  rule: '!has(self.roles) || self.roles.map(x, x.minCount).sum() <=
-                    self.maxParticipants'
+                  rule: '!has(self.roles) || size(self.roles) == 0 || self.roles.map(x,
+                    has(x.minCount) ? x.minCount : 0).sum() <= self.maxParticipants'
                 - message: role maximum counts must cover minParticipants
-                  rule: '!has(self.roles) || self.roles.map(x, x.maxCount).sum() >=
-                    self.minParticipants'
+                  rule: '!has(self.roles) || size(self.roles) == 0 || self.roles.map(x,
+                    x.maxCount).sum() >= self.minParticipants'
               version:
                 description: Version is an operator-facing immutable source version,
                   not a mutable channel.
@@ -732,7 +733,7 @@ spec:
             type: object
             x-kubernetes-validations:
             - message: minParticipants must not exceed maxParticipants
-              rule: self.topology.minParticipants <= self.topology.maxParticipants
+              rule: '!has(self.topology) || self.topology.minParticipants <= self.topology.maxParticipants'
           status:
             properties:
               conditions:

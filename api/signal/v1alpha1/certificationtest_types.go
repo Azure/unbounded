@@ -114,9 +114,9 @@ type TestParticipantRole struct {
 	MaxCount int32 `json:"maxCount"`
 }
 
-// +kubebuilder:validation:XValidation:rule="self.roles.all(x, x.minCount <= x.maxCount)",message="role minCount must not exceed maxCount"
-// +kubebuilder:validation:XValidation:rule="!has(self.roles) || self.roles.map(x, x.minCount).sum() <= self.maxParticipants",message="role minimum counts must fit maxParticipants"
-// +kubebuilder:validation:XValidation:rule="!has(self.roles) || self.roles.map(x, x.maxCount).sum() >= self.minParticipants",message="role maximum counts must cover minParticipants"
+// +kubebuilder:validation:XValidation:rule="!has(self.roles) || self.roles.all(x, !has(x.minCount) || x.minCount <= x.maxCount)",message="role minCount must not exceed maxCount"
+// +kubebuilder:validation:XValidation:rule="!has(self.roles) || size(self.roles) == 0 || self.roles.map(x, has(x.minCount) ? x.minCount : 0).sum() <= self.maxParticipants",message="role minimum counts must fit maxParticipants"
+// +kubebuilder:validation:XValidation:rule="!has(self.roles) || size(self.roles) == 0 || self.roles.map(x, x.maxCount).sum() >= self.minParticipants",message="role maximum counts must cover minParticipants"
 type TestTopology struct {
 	// +kubebuilder:validation:Minimum=1
 	// +kubebuilder:validation:Maximum=8
@@ -256,7 +256,7 @@ type TestSecurityRequirements struct {
 	HostPaths []WorkloadHostPath `json:"hostPaths,omitempty"`
 }
 
-// +kubebuilder:validation:XValidation:rule="self.topology.minParticipants <= self.topology.maxParticipants",message="minParticipants must not exceed maxParticipants"
+// +kubebuilder:validation:XValidation:rule="!has(self.topology) || self.topology.minParticipants <= self.topology.maxParticipants",message="minParticipants must not exceed maxParticipants"
 type CertificationTestSpec struct {
 	// Metadata name is the stable machine name.
 	// +kubebuilder:validation:MinLength=1
