@@ -6537,6 +6537,61 @@ def validate_none_repave_pod_cidr(node_config: NodeConfig) -> None:
     log(f"Every pod on the repaved none node has an IP in {after}")
 
 
+# What the none operator logs when a repave starts and ends
+# (cmd/agent/internal/daemon/nodeoperator_none.go RepaveNode).
+NONE_REPAVE_STARTED = "starting node upgrade"
+NONE_REPAVE_COMPLETED = "node upgrade completed"
+
+
+def daemon_kill_during_repave_script(since: int, timeout_secs: int) -> str:
+    """Return a host shell script that waits until the daemon has logged, since
+    host time *since*, the start of a none repave and SIGKILLs its main
+    process, as a crash would. systemctl kill signals every process in the
+    unit and can fail with EINVAL for one of them, which leaves the repave
+    running. It prints killed and exits 0, or prints finished and exits 2 when the repave was
+    already over, or prints timeout and exits 1."""
+    unit = "unbounded-agent-daemon.service"
+    return textwrap.dedent(f"""\
+        end=$(( $(date +%s) + {timeout_secs} ))
+        while [ "$(date +%s)" -lt "$end" ]; do
+          logs=$(journalctl -u {unit} --since @{since} -o cat --no-pager 2>/dev/null)
+          case "$logs" in *"{NONE_REPAVE_COMPLETED}"*) echo finished; exit 2;; esac
+          case "$logs" in *"{NONE_REPAVE_STARTED}"*)
+            pid=$(systemctl show -p MainPID --value {unit})
+            if [ "${{pid:-0}}" -gt 0 ] && kill -KILL "$pid"; then echo killed; exit 0; fi
+            echo "no daemon main PID to kill (MainPID=${{pid}})"; exit 1;;
+          esac
+          sleep 0.2
+        done
+        echo timeout
+        exit 1
+        """)
+
+
+def validate_none_repave_survives_daemon_kill(node_config: NodeConfig) -> None:
+    """In none mode, SIGKILL the agent daemon while it runs a configuration-only
+    repave and assert the daemon restarts, the Node comes back Ready and
+    containerd and kubelet run. Other modes skip it."""
+    if isolation_mode() != "none":
+        log(f"Skipping the daemon kill during a repave in {isolation_mode()} mode")
+        return
+    since = int(ssh_capture("date +%s"))
+    script = daemon_kill_during_repave_script(since, 300)
+    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+        watcher = pool.submit(ssh_capture_quiet, f"sudo sh -c {shlex.quote(script)}")
+        repave_with_config_change(node_config, "daemon-kill")
+        result = watcher.result()
+    outcome = result.stdout.strip()
+    if result.returncode != 0 or outcome != "killed":
+        die(f"could not kill the daemon during the none repave: {outcome or result.stderr.strip()!r} "
+            f"(exit {result.returncode})")
+    log("Killed the agent daemon with SIGKILL during the none repave")
+    wait_for_daemon_active()
+    wait_for_node()
+    validate_isolation_mode()
+    log("The none node came back Ready, with containerd and kubelet active, after the daemon was killed mid-repave")
+
+
 # ---------------------------------------------------------------------------
 # isolation mode change (spec.isolation declared, applied by the next repave)
 # ---------------------------------------------------------------------------
@@ -7503,7 +7558,8 @@ SUITES: dict[str, list[str]] = {
     # join, status, preflight, exec/logs, soft reboot (NodeReboot), host-driven
     # and operation-driven AgentUpgrade with rollback, repave, host reboot,
     # AgentReset, reinstall on the same disk. In none, a configuration-only
-    # repave must also put every pod in the new Node's pod CIDR.
+    # repave must also put every pod in the new Node's pod CIDR, and survive the
+    # daemon being killed in the middle of it.
     "isolation-operations": [
         "run-agent", "wait-for-node", "validate-isolation-mode", "validate-host-root",
         "validate-controllers-healthy", "validate-node-config", "dump-persisted-agent-config",
@@ -7511,7 +7567,7 @@ SUITES: dict[str, list[str]] = {
         "validate-isolation-preflight", "validate-isolation-exec-logs", "validate-workload",
         "validate-isolation-soft-reboot", "validate-host-agent-upgrade", "validate-agent-upgrade-operation",
         "validate-agent-upgrade-rollback", "validate-workload", "validate-node-repave-upgrade",
-        "validate-workload", "validate-none-repave-pod-cidr",
+        "validate-workload", "validate-none-repave-pod-cidr", "validate-none-repave-daemon-kill",
         "validate-host-reboot", "validate-isolation-mode", "validate-isolation-status",
         "reset-agent", "delete-machine-cr", "ensure-kind-bridge", "reinstall-agent", "wait-for-node",
         "validate-isolation-mode", "validate-isolation-exec-logs", "validate-workload",
@@ -7647,6 +7703,7 @@ COMMANDS: dict[str, Command] = {
     "validate-agent-upgrade-rollback": _without_node_config(validate_agent_upgrade_rollback),
     "validate-node-repave-upgrade": validate_node_repave_upgrade,
     "validate-none-repave-pod-cidr": validate_none_repave_pod_cidr,
+    "validate-none-repave-daemon-kill": validate_none_repave_survives_daemon_kill,
     "validate-node-configs": _without_node_config(validate_node_config_scenarios),
     "reset-agent": _without_node_config(reset_agent),
     "validate-host-root": _without_node_config(validate_host_root),

@@ -103,7 +103,8 @@ CATALOG: tuple[Scenario, ...] = (
         f"The isolation-operations suite with --isolation none: {OPERATIONS_TEXT}.",
         "containerd and kubelet run as agent-owned host units, no nspawn machine exists, NodeReboot leaves the host "
         "boot ID unchanged, repave and upgrade flip the version link, and after a configuration-only repave every "
-        "pod that is not host-network has an IP in the new Node's pod CIDR.",
+        "pod that is not host-network has an IP in the new Node's pod CIDR. A daemon killed with SIGKILL during a "
+        "configuration-only repave restarts and the node comes back Ready with containerd and kubelet active.",
         tags=("none",),
     ),
     Scenario(
