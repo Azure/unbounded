@@ -1832,6 +1832,9 @@ pub(crate) fn api() -> Arc<Api> {
         host_unregister,
         copy_d2h_async,
         flush_rdma,
+        // The simulation completes work only when polled, so it has no
+        // completion thread to call back from; callers poll instead.
+        launch_host: None,
     })
 }
 

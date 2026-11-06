@@ -167,6 +167,13 @@ int racer_gpu_event_sync(void *event);
 /* Make later work on `stream` wait for the event's captured work. The event
  * may belong to another context. */
 int racer_gpu_stream_wait(void *stream, void *event);
+/* Run `fn(data)` on a CUDA-owned thread once all work queued so far on
+ * `stream` completes (cuLaunchHostFunc). `fn` must not call CUDA. On any
+ * error `fn` is never called and the caller still owns `data`. CUDA may
+ * never call `fn` if the stream's context fails. RACER_GPU_EUNAVAILABLE
+ * when the driver lacks cuLaunchHostFunc. Additive: loaders resolve this
+ * symbol optionally, so it does not change RACER_GPU_ABI_VERSION. */
+int racer_gpu_launch_host(void *stream, void (*fn)(void *), void *data);
 
 /* Page-locked host memory, portable across contexts, for asynchronous host
  * copies. `context` only needs to be current for the call. */

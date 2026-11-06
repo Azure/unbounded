@@ -1105,6 +1105,25 @@ pub fn display_id(uuid: &[u8; 16]) -> String {
     )
 }
 
+/// A boxed [`Stream::on_complete`] callback; the host function's user data
+/// points at one.
+type HostCallback = Box<dyn FnOnce() + Send + 'static>;
+
+/// The host function [`Stream::on_complete`] launches. Reclaims and runs the
+/// callback exactly once. A panic is caught: it must not unwind into CUDA.
+///
+/// # Safety
+///
+/// `data` must come from `Box::into_raw(Box::new(callback))` for a
+/// [`HostCallback`], and must not be used again.
+unsafe extern "C" fn host_callback(data: *mut c_void) {
+    if data.is_null() {
+        return;
+    }
+    let callback = unsafe { Box::from_raw(data.cast::<HostCallback>()) };
+    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || (*callback)()));
+}
+
 /// A CUDA stream. Work is visible only after [`Stream::synchronize`].
 pub struct Stream {
     context: Context,
@@ -1492,6 +1511,32 @@ impl Stream {
         })
     }
 
+    /// Run `callback` on a CUDA-owned thread once all work queued so far on
+    /// this stream completes (`cuLaunchHostFunc`). Use it to wake a thread
+    /// that waits on a [`Fence`] instead of polling.
+    ///
+    /// `callback` must not call CUDA or anything in this crate, and should
+    /// return quickly: it runs on CUDA's completion thread. It owns what it
+    /// captures, so nothing it uses can be freed before it runs.
+    ///
+    /// [`Error::Unavailable`] when the backend or driver lacks host
+    /// functions; on any error `callback` is dropped without running. If the
+    /// stream's context fails, CUDA may never call it, and it is leaked.
+    pub fn on_complete(&self, callback: Box<dyn FnOnce() + Send + 'static>) -> Result<()> {
+        let shared = self.shared();
+        let Some(launch) = shared.api.launch_host else {
+            return Err(Error::Unavailable);
+        };
+        let data = Box::into_raw(Box::new(callback)).cast::<c_void>();
+        let rc = unsafe { launch(self.raw.as_ptr(), host_callback, data) };
+        if rc != 0 {
+            // SAFETY: on error the shim never calls `host_callback`, so
+            // `data` is still ours, made by `Box::into_raw` above.
+            drop(unsafe { Box::from_raw(data.cast::<HostCallback>()) });
+        }
+        shared.check(rc)
+    }
+
     /// The GPU this stream runs on.
     pub fn ordinal(&self) -> i32 {
         self.context.ordinal()
@@ -1662,6 +1707,55 @@ impl Drop for GpuFile {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Box `callback` the way [`Stream::on_complete`] hands it to CUDA.
+    fn host_data(callback: impl FnOnce() + Send + 'static) -> *mut c_void {
+        let callback: HostCallback = Box::new(callback);
+        Box::into_raw(Box::new(callback)).cast()
+    }
+
+    #[test]
+    fn host_callback_runs_once_and_frees_its_capture() {
+        let hits = Arc::new(AtomicU64::new(0));
+        let held = hits.clone();
+        let data = host_data(move || {
+            held.fetch_add(1, Ordering::SeqCst);
+        });
+        assert_eq!(Arc::strong_count(&hits), 2);
+        unsafe { host_callback(data) };
+        assert_eq!(hits.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            Arc::strong_count(&hits),
+            1,
+            "capture dropped after the call"
+        );
+    }
+
+    #[test]
+    fn host_callback_catches_panics_and_ignores_null() {
+        let token = Arc::new(());
+        let held = token.clone();
+        let data = host_data(move || {
+            let _held = held;
+            panic!("callback panic must not unwind into CUDA");
+        });
+        unsafe { host_callback(data) };
+        assert_eq!(Arc::strong_count(&token), 1);
+        unsafe { host_callback(std::ptr::null_mut()) };
+    }
+
+    #[test]
+    fn on_complete_without_host_functions_drops_the_callback() {
+        let sim = simulation::Simulation::new(vec![simulation::SimDevice::new(0)]);
+        let _env = sim.enter();
+        let gpu = Gpu::load().unwrap();
+        let stream = gpu.context(0).unwrap().stream().unwrap();
+        let token = Arc::new(());
+        let held = token.clone();
+        let result = stream.on_complete(Box::new(move || drop(held)));
+        assert_eq!(result, Err(Error::Unavailable));
+        assert_eq!(Arc::strong_count(&token), 1);
+    }
 
     fn open(path: &std::path::Path, flags: i32) -> OwnedFd {
         let path = std::ffi::CString::new(path.as_os_str().as_encoded_bytes()).unwrap();

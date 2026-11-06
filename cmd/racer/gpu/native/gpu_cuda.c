@@ -56,6 +56,7 @@ struct cufile_table { void *lib; int opened; RACER_CUFILE_FUNCTIONS(X_FIELD) };
 
 static struct cuda_table cu;
 static cuFlushGPUDirectRDMAWrites_fn cu_flush_rdma; /* optional */
+static cuLaunchHostFunc_fn cu_launch_host;           /* optional */
 static struct cufile_table cf;
 static pthread_mutex_t load_lock = PTHREAD_MUTEX_INITIALIZER;
 static __thread int32_t last_error;
@@ -161,6 +162,7 @@ int racer_gpu_init(void) {
             goto out;
         }
         cu_flush_rdma = (cuFlushGPUDirectRDMAWrites_fn)dlsym(table.lib, "cuFlushGPUDirectRDMAWrites");
+        cu_launch_host = (cuLaunchHostFunc_fn)dlsym(table.lib, "cuLaunchHostFunc");
         cu = table;
         goto out;
     missing:
@@ -806,6 +808,17 @@ int racer_gpu_stream_wait(void *stream, void *event) {
     int rc = push(s->context);
     if (rc) return rc;
     rc = drv(cu.cuStreamWaitEvent(s->stream, e->event, 0));
+    pop();
+    return rc;
+}
+
+int racer_gpu_launch_host(void *stream, void (*fn)(void *), void *data) {
+    struct gpu_stream *s = stream;
+    if (!s || !fn) return RACER_GPU_EINVAL;
+    if (!cu_launch_host) return RACER_GPU_EUNAVAILABLE;
+    int rc = push(s->context);
+    if (rc) return rc;
+    rc = drv(cu_launch_host(s->stream, fn, data));
     pop();
     return rc;
 }

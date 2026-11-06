@@ -59,6 +59,9 @@ typedef struct { char bytes[16]; } CUuuid;
 #define CU_FLUSH_GPU_DIRECT_RDMA_WRITES_TARGET_CURRENT_CTX 0
 /* cuFlushGPUDirectRDMAWrites (CUDA 11.3+); resolved optionally. */
 typedef CUresult (*cuFlushGPUDirectRDMAWrites_fn)(int target, int scope);
+/* cuLaunchHostFunc (CUDA 10.0+); resolved optionally. */
+typedef void (*CUhostFn)(void *user_data);
+typedef CUresult (*cuLaunchHostFunc_fn)(CUstream stream, CUhostFn fn, void *user_data);
 
 /* CUevent_flags */
 #define CU_EVENT_DISABLE_TIMING 0x2

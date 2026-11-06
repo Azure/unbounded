@@ -133,6 +133,12 @@ pub const MAX_AAD: usize = 4096;
 /// Opaque handle out-parameter.
 pub(crate) type Out = *mut *mut c_void;
 
+/// A host function CUDA calls with its user data (`CUhostFn`).
+pub(crate) type HostFn = unsafe extern "C" fn(*mut c_void);
+
+/// `racer_gpu_launch_host(stream, fn, data)`.
+pub(crate) type LaunchHost = unsafe extern "C" fn(*mut c_void, HostFn, *mut c_void) -> c_int;
+
 /// Build [`Api`] and its symbol loader from `racer_gpu_<name>` functions.
 macro_rules! native_api {
     ($($field:ident: $signature:ty),* $(,)?) => {
@@ -146,6 +152,10 @@ macro_rules! native_api {
                 pub(crate) $field: $signature,
 
             )*
+
+            /// `racer_gpu_launch_host`, resolved optionally: older shims
+            /// lack it and callers fall back to polling.
+            pub(crate) launch_host: Option<LaunchHost>,
         }
 
         impl Api {
@@ -160,6 +170,13 @@ macro_rules! native_api {
                         if pointer.is_null() { return Err(Error::Unavailable); }
                         unsafe { std::mem::transmute::<*mut c_void, $signature>(pointer) }
                     },)*
+                    launch_host: {
+                        let pointer = unsafe { libc::dlsym(library.as_ptr(),
+                            c"racer_gpu_launch_host".as_ptr()) };
+                        (!pointer.is_null()).then(|| unsafe {
+                            std::mem::transmute::<*mut c_void, LaunchHost>(pointer)
+                        })
+                    },
                 })
             }
         }
