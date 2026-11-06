@@ -105,6 +105,38 @@ class HarnessTest(unittest.TestCase):
         ):
             harness.verify_model_cache("/models/model")
 
+    def test_collect_gpu_fingerprint_matches_canonical_inventory_digest(self):
+        fingerprint = gpu_fingerprint()
+        uuid_lines = [
+            f"{index}, GPU-{index:08x}-0000-0000-0000-{index:012x}"
+            for index in reversed(range(8))
+        ]
+
+        with mock.patch.object(
+            harness,
+            "run_nvidia_smi",
+            side_effect=lambda query: (
+                uuid_lines
+                if query == "gpu=index,uuid"
+                else ["1.2.3"] * 8
+            ),
+        ):
+            self.assertEqual(harness.collect_gpu_fingerprint(), fingerprint)
+
+    def test_collect_gpu_fingerprint_rejects_duplicate_identity(self):
+        with (
+            mock.patch.object(
+                harness,
+                "run_nvidia_smi",
+                return_value=[
+                    "0, GPU-00000000-0000-0000-0000-000000000000",
+                    "1, GPU-00000000-0000-0000-0000-000000000000",
+                ],
+            ),
+            self.assertRaisesRegex(harness.HarnessError, "identity is invalid"),
+        ):
+            harness.collect_gpu_fingerprint()
+
     def test_run_harness_with_offline_mocks(self):
         args = argparse.Namespace(
             invocation_id="invocation-1",
@@ -153,7 +185,7 @@ class HarnessTest(unittest.TestCase):
 
         with (
             mock.patch.object(harness, "verify_model_cache"),
-            mock.patch.object(harness, "visible_gpu_count", return_value=8),
+            mock.patch.object(harness, "collect_gpu_fingerprint", return_value=gpu_fingerprint()),
             mock.patch.object(harness.subprocess, "Popen", return_value=process),
             mock.patch.object(harness, "wait_for_service", return_value=(True, 0)),
             mock.patch.object(harness, "active_gpu_count", return_value=8),
@@ -174,7 +206,7 @@ class HarnessTest(unittest.TestCase):
         ):
             envelope = harness.run_harness(args)
 
-        self.assertEqual(envelope["outcome"], "Passed")
+        self.assertEqual(envelope["outcome"], "Passed", envelope)
         self.assertEqual(envelope["test"]["uid"], "test-uid")
         self.assertEqual(
             measurement_value(envelope, "activeGpuCount")["integerValue"],
@@ -189,6 +221,15 @@ class HarnessTest(unittest.TestCase):
             [measurement["name"] for measurement in envelope["measurements"]],
         )
         self.assertNotIn("redacted", json.dumps(envelope))
+        self.assertEqual(envelope["participants"][0]["start"]["driverVersion"], "1.2.3")
+        self.assertEqual(
+            envelope["participants"][0]["start"]["gpuInventoryDigest"],
+            envelope["participants"][0]["end"]["gpuInventoryDigest"],
+        )
+        self.assertEqual(
+            envelope["participants"][0]["start"]["gpuInventoryDigest"],
+            gpu_fingerprint()["gpuInventoryDigest"],
+        )
 
     def test_run_harness_fails_when_all_visible_gpus_are_not_active(self):
         args = passing_args()
@@ -197,7 +238,7 @@ class HarnessTest(unittest.TestCase):
 
         with (
             mock.patch.object(harness, "verify_model_cache"),
-            mock.patch.object(harness, "visible_gpu_count", return_value=8),
+            mock.patch.object(harness, "collect_gpu_fingerprint", return_value=gpu_fingerprint()),
             mock.patch.object(harness.subprocess, "Popen", return_value=process),
             mock.patch.object(harness, "wait_for_service", return_value=(True, 0)),
             mock.patch.object(harness, "active_gpu_count", return_value=7),
@@ -207,7 +248,7 @@ class HarnessTest(unittest.TestCase):
         ):
             envelope = harness.run_harness(args)
 
-        self.assertEqual(envelope["outcome"], "Failed")
+        self.assertEqual(envelope["outcome"], "Failed", envelope)
         self.assertEqual(envelope["reasonCode"], "AssertionFailed")
         self.assertEqual(
             measurement_value(envelope, "activeGpuCount")["integerValue"],
@@ -221,7 +262,7 @@ class HarnessTest(unittest.TestCase):
 
         with (
             mock.patch.object(harness, "verify_model_cache"),
-            mock.patch.object(harness, "visible_gpu_count", return_value=8),
+            mock.patch.object(harness, "collect_gpu_fingerprint", return_value=gpu_fingerprint()),
             mock.patch.object(harness.subprocess, "Popen", return_value=process),
             mock.patch.object(harness, "wait_for_service", return_value=(True, 0)),
             mock.patch.object(harness, "active_gpu_count", return_value=8),
@@ -242,7 +283,7 @@ class HarnessTest(unittest.TestCase):
         ):
             envelope = harness.run_harness(args)
 
-        self.assertEqual(envelope["outcome"], "Inconclusive")
+        self.assertEqual(envelope["outcome"], "Inconclusive", envelope)
         self.assertEqual(envelope["reasonCode"], "InfrastructureFailure")
         self.assertIn("did not terminate cleanly", envelope["message"])
 
@@ -308,6 +349,19 @@ def approved_model_input():
             "digest": harness.MODEL_MANIFEST_DIGEST,
         }
     ]
+
+
+def gpu_fingerprint():
+    uuids = [
+        f"GPU-{index:08x}-0000-0000-0000-{index:012x}"
+        for index in range(8)
+    ]
+
+    return {
+        "driverVersion": "1.2.3",
+        "gpuInventoryDigest": harness.sha256_text("\0".join(uuids)),
+        "gpuCount": 8,
+    }
 
 
 def passing_args():

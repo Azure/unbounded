@@ -21,6 +21,19 @@
 {{- if and (eq $qualificationGateProtected "true") (ne .QualificationGateGuard "node-authorizer-node-restriction-rbac-verified") }}
 {{- fail "QualificationGateProtected requires an explicit Node authorizer, NodeRestriction, and restrictive Node-patch RBAC guard" }}
 {{- end }}
+{{- $executionAuthorityEnabled := default "false" .ExecutionAuthorityEnabled }}
+{{- if not (regexMatch "^(true|false)$" $executionAuthorityEnabled) }}
+{{- fail "ExecutionAuthorityEnabled must be true or false" }}
+{{- end }}
+{{- $authorityName := "project-signal-execution-authority-disabled" }}
+{{- $staticPackageDigest := "" }}
+{{- if eq $executionAuthorityEnabled "true" }}
+{{- if or (eq (default "project-signal" .Namespace) (default "project-signal-authority" .AuthorityNamespace)) (eq (default (default "project-signal" .Namespace) .ScriptNamespace) (default "project-signal-authority" .AuthorityNamespace)) }}
+{{- fail "AuthorityNamespace must be distinct from Namespace and ScriptNamespace" }}
+{{- end }}
+{{- $authorityName = .AuthorityName }}
+{{- $staticPackageDigest = .StaticPackageDigest }}
+{{- end }}
 {{- $resolverImages := compact (splitList "," (default "" .ResolverImages)) }}
 {{- range $resolverImage := $resolverImages }}
 {{- if not (regexMatch "^[^@[:space:]]+@sha256:[0-9a-f]{64}$" $resolverImage) }}
@@ -65,6 +78,9 @@ spec:
           args:
             - --namespace={{ default "project-signal" .Namespace }}
             - --script-namespace={{ default (default "project-signal" .Namespace) .ScriptNamespace }}
+            - --authority-namespace={{ default "project-signal-authority" .AuthorityNamespace }}
+            - --authority-name={{ $authorityName }}
+            - --static-package-digest={{ $staticPackageDigest }}
             - --runner-image={{ $runnerImage }}
             - --controller-image={{ $controllerImage }}
             - --adapter-image={{ $adapterImage }}

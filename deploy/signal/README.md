@@ -238,9 +238,10 @@ This renders separate `project-signal-gpu-baseline-v1` and
 `project-signal-gpu-compat-v1` Suites. The baseline has one qualification
 stage. The compatibility Suite has 15 ordered diagnostic phases so R01 through
 R15 remain sequential without creating duplicate qualification credit.
-Environment-specific Profiles are deliberately not rendered because their
-participant selectors, namespaces, storage, network, and resolver inputs must
-be reviewed at cutover.
+Environment-specific Profiles are not rendered by the static package because
+their participant selectors, namespaces, storage, network, and resolver inputs
+must be reviewed at cutover. The separate execution-authority overlay renders
+only the reviewed baseline, compatibility-diagnostic, and vLLM Profiles.
 
 ## CertificationProfile contract
 
@@ -723,7 +724,7 @@ kubectl describe certificationrun -n project-signal <run-name>
 Inspect the immutable canonical Script source and catalog:
 
 ```bash
-kubectl get configmap -n project-signal project-signal-gpu-inventory-v1 -o yaml
+kubectl get configmap -n project-signal project-signal-gpu-inventory-v2 -o yaml
 kubectl get certificationtests.signal.unbounded-cloud.io
 ```
 
@@ -735,6 +736,56 @@ Controller restarts are safe:
 - positional identities are re-derived after every Run read;
 - persisted terminal evidence can reconstruct compact Run status;
 - owned premature uncordons are repaired while a Run is active or retained.
+
+## Execution-authority overlay
+
+The static package remains inert. A separate authority render is required to
+record `acceptanceSuitesEnabled=true`, `cutoverApproved=true`, and the exact
+source commit and static package digest. The immutable authority ConfigMap is
+versioned by the first 12 hexadecimal characters of both identities. Its
+namespace must be distinct from the workload and Script namespaces, and the
+controller receives only `get` access to the exact authority and state
+ConfigMaps.
+
+The rendered state ConfigMap always bootstraps with `hardAbort: "true"`.
+`12-execution-authority-transition.yaml` is a one-time JSON Patch that first
+tests for `"true"` and then replaces it with `"false"`. Apply the ordinary
+authority objects first, verify zero active Runs and attempt-owned resources,
+then apply the transition deliberately:
+
+```bash
+kubectl apply --server-side --dry-run=server \
+  -f deploy/signal/rendered/10-acceptance-suites.yaml \
+  -f deploy/signal/rendered/11-execution-authority.yaml
+kubectl patch configmap project-signal-execution-state \
+  -n <authority-namespace> --type=json \
+  --patch-file deploy/signal/rendered/12-execution-authority-transition.yaml \
+  --dry-run=server
+```
+
+Remove `--dry-run=server` only after the exact render, live object comparison,
+image pullability, and hard-stop inventory are approved. Reapplying
+`11-execution-authority.yaml` restores `hardAbort: "true"`; it cannot silently
+release an abort. Rendering with execution authority disabled gives the
+controller an empty static package binding, so stale authority objects cannot
+continue admitting or starting Runs.
+
+The overlay does not create a Run. Start the canonical baseline and vLLM
+canary separately, only after the prior Run is terminal, cleaned up, and
+released:
+
+```bash
+kubectl label node <node-name> \
+  signal.unbounded-cloud.io/certification-request=project-signal-gpu-baseline-8x-v1
+# Inspect terminal evidence, cleanup, and release before continuing.
+kubectl label node <node-name> \
+  signal.unbounded-cloud.io/certification-request=project-signal-vllm-canary-8x-v1
+```
+
+The compatibility Profile remains diagnostic-only and receives no Policy
+credit. The Policy requires one current pass from the baseline Profile and one
+from the vLLM Profile, uses `nonPassBehavior: Revoke`, and keeps
+`gateProjection.mode: None`.
 
 ### Upgrade and migration
 

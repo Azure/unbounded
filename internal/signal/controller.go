@@ -54,6 +54,8 @@ const (
 	RunTriggerAnnotation       = "signal.unbounded-cloud.io/trigger"
 	RunAdmissionAnnotation     = "signal.unbounded-cloud.io/admission"
 	RunStartIdentityAnnotation = "signal.unbounded-cloud.io/start-fingerprints"
+	ExecutionAuthorityName     = "project-signal-execution-authority"
+	ExecutionStateName         = "project-signal-execution-state"
 	RunFinalizer               = "signal.unbounded-cloud.io/cleanup"
 	SnapshotRunLabel           = "signal.unbounded-cloud.io/run"
 	RunUIDLabel                = "signal.unbounded-cloud.io/run-uid"
@@ -452,29 +454,37 @@ func validateAdapterVerdictEvidence(verdict adapterVerdictEvidence) error {
 
 type AdmissionReconciler struct {
 	client.Client
-	APIReader       client.Reader
-	Namespace       string
-	ScriptNamespace string
-	RunnerImage     string
-	ControllerImage string
-	AdapterImage    string
-	WorkflowDigest  string
-	ResolverImages  []string
-	Recorder        recorder.EventRecorder
-	Now             func() time.Time
-	admissionMu     sync.Mutex
+	APIReader           client.Reader
+	Namespace           string
+	ScriptNamespace     string
+	AuthorityNamespace  string
+	AuthorityName       string
+	SourceCommit        string
+	StaticPackageDigest string
+	RunnerImage         string
+	ControllerImage     string
+	AdapterImage        string
+	WorkflowDigest      string
+	ResolverImages      []string
+	Recorder            recorder.EventRecorder
+	Now                 func() time.Time
+	admissionMu         sync.Mutex
 }
 
 // +kubebuilder:rbac:groups=signal.unbounded-cloud.io,resources=certificationprofiles;certificationsuites;certificationtests,verbs=get;list;watch
 
 type RunReconciler struct {
 	client.Client
-	APIReader         client.Reader
-	Evidence          EvidenceStore
-	Now               func() time.Time
-	MaxConcurrentRuns int
-	Recorder          recorder.EventRecorder
-	ControllerImage   string
+	APIReader           client.Reader
+	Evidence            EvidenceStore
+	Now                 func() time.Time
+	MaxConcurrentRuns   int
+	Recorder            recorder.EventRecorder
+	ControllerImage     string
+	AuthorityNamespace  string
+	AuthorityName       string
+	SourceCommit        string
+	StaticPackageDigest string
 }
 
 func (r *AdmissionReconciler) SetupWithManager(mgr ctrl.Manager) error {
@@ -688,6 +698,10 @@ func (r *AdmissionReconciler) Reconcile(ctx context.Context, req ctrl.Request) (
 func (r *AdmissionReconciler) admitNode(ctx context.Context, node *corev1.Node, profileName string) error {
 	r.admissionMu.Lock()
 	defer r.admissionMu.Unlock()
+
+	if err := r.requireExecutionAuthority(ctx); err != nil {
+		return err
+	}
 
 	if err := ValidateRunnerImage(r.RunnerImage); err != nil {
 		return err
@@ -907,6 +921,86 @@ func (r *AdmissionReconciler) admitNode(ctx context.Context, node *corev1.Node, 
 
 		r.Recorder.Eventf(run, nil, corev1.EventTypeNormal, "CertificationAdmitted", "AdmitCertification",
 			"Created CertificationRun %s with %d immutable executions", run.Name, executableCount)
+	}
+
+	return nil
+}
+
+func (r *AdmissionReconciler) requireExecutionAuthority(ctx context.Context) error {
+	reader := r.APIReader
+	if reader == nil {
+		reader = r.Client
+	}
+
+	return requireExecutionAuthority(
+		ctx,
+		reader,
+		r.AuthorityNamespace,
+		r.AuthorityName,
+		r.SourceCommit,
+		r.StaticPackageDigest,
+	)
+}
+
+func (r *RunReconciler) requireExecutionAuthority(ctx context.Context) error {
+	reader := r.APIReader
+	if reader == nil {
+		reader = r.Client
+	}
+
+	return requireExecutionAuthority(
+		ctx,
+		reader,
+		r.AuthorityNamespace,
+		r.AuthorityName,
+		r.SourceCommit,
+		r.StaticPackageDigest,
+	)
+}
+
+func requireExecutionAuthority(
+	ctx context.Context,
+	reader client.Reader,
+	namespace string,
+	name string,
+	sourceCommit string,
+	staticPackageDigest string,
+) error {
+	var authority corev1.ConfigMap
+
+	if name == "" {
+		name = ExecutionAuthorityName
+	}
+
+	if err := reader.Get(
+		ctx,
+		client.ObjectKey{Namespace: namespace, Name: name},
+		&authority,
+	); err != nil {
+		return fmt.Errorf("execution authority is unavailable: %w", err)
+	}
+
+	if authority.Immutable == nil || !*authority.Immutable ||
+		authority.Data["acceptanceSuitesEnabled"] != "true" ||
+		authority.Data["cutoverApproved"] != "true" ||
+		!isExactGitCommit(authority.Data["sourceCommit"]) ||
+		authority.Data["sourceCommit"] != sourceCommit ||
+		!signalv1.IsSHA256Digest(authority.Data["staticPackageDigest"]) ||
+		authority.Data["staticPackageDigest"] != staticPackageDigest {
+		return errors.New("execution authority is incomplete or hard-aborted")
+	}
+
+	var state corev1.ConfigMap
+	if err := reader.Get(
+		ctx,
+		client.ObjectKey{Namespace: namespace, Name: ExecutionStateName},
+		&state,
+	); err != nil {
+		return fmt.Errorf("execution state is unavailable: %w", err)
+	}
+
+	if state.Immutable != nil || state.Data["hardAbort"] != "false" {
+		return errors.New("execution authority is hard-aborted")
 	}
 
 	return nil
@@ -2283,6 +2377,10 @@ func (r *RunReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.R
 	}
 
 	if run.Status.Workflow.Name == "" {
+		if err := r.requireExecutionAuthority(ctx); err != nil {
+			return ctrl.Result{}, err
+		}
+
 		return r.startWorkflow(ctx, &run)
 	}
 
@@ -4861,6 +4959,21 @@ func sameBaseFingerprint(left, right signalv1.NodeFingerprint) bool {
 		(left.OSImage == "" || left.OSImage == right.OSImage) &&
 		(left.KubeletVersion == "" || left.KubeletVersion == right.KubeletVersion) &&
 		(left.SystemUUID == "" || left.SystemUUID == right.SystemUUID)
+}
+
+func isExactGitCommit(value string) bool {
+	if len(value) != 40 {
+		return false
+	}
+
+	for _, character := range value {
+		if (character < '0' || character > '9') &&
+			(character < 'a' || character > 'f') {
+			return false
+		}
+	}
+
+	return true
 }
 
 func nodeFingerprint(node *corev1.Node) signalv1.NodeFingerprint {

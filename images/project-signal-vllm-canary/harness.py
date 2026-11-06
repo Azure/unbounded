@@ -207,8 +207,49 @@ def run_nvidia_smi(query):
     return [line.strip() for line in completed.stdout.splitlines() if line.strip()]
 
 
-def visible_gpu_count():
-    return len(run_nvidia_smi("gpu=uuid"))
+def collect_gpu_fingerprint():
+    indexed_uuids = {}
+    seen_uuids = set()
+    for line in run_nvidia_smi("gpu=index,uuid"):
+        fields = [field.strip() for field in line.split(",", 1)]
+        if len(fields) != 2 or not re.fullmatch(r"0|[1-9][0-9]*", fields[0]):
+            raise HarnessError("GPU inventory index is invalid", "IdentityMismatch")
+
+        index = int(fields[0])
+        uuid = fields[1]
+        if (
+            index in indexed_uuids
+            or uuid in seen_uuids
+            or not re.fullmatch(
+                r"GPU-[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-"
+                r"[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}",
+                uuid,
+            )
+        ):
+            raise HarnessError("GPU inventory identity is invalid", "IdentityMismatch")
+
+        indexed_uuids[index] = uuid
+        seen_uuids.add(uuid)
+
+    ordered_uuids = []
+    for index in range(len(indexed_uuids)):
+        if index not in indexed_uuids:
+            raise HarnessError("GPU inventory index is not contiguous", "IdentityMismatch")
+
+        ordered_uuids.append(indexed_uuids[index])
+
+    versions = run_nvidia_smi("gpu=driver_version")
+    if len(versions) != len(ordered_uuids) or len(set(versions)) != 1:
+        raise HarnessError(
+            "GPU driver version is missing or inconsistent",
+            "IdentityMismatch",
+        )
+
+    return {
+        "driverVersion": versions[0],
+        "gpuInventoryDigest": sha256_text("\0".join(ordered_uuids)),
+        "gpuCount": len(ordered_uuids),
+    }
 
 
 def active_gpu_count():
@@ -435,6 +476,10 @@ def build_envelope(args, test, resolved_inputs, participants, roles, result):
     participant = participants[0]
     role = roles.get("0") or roles.get(0) or "primary"
     outcome = result["outcome"]
+    visible_devices = [f"gpu-index-{index}" for index in range(result["visibleGpuCount"])]
+    covered_devices = [f"gpu-index-{index}" for index in range(result["activeGpuCount"])]
+    start_fingerprint = {"nodeUID": participant["nodeUID"], **result["startFingerprint"]}
+    end_fingerprint = {"nodeUID": participant["nodeUID"], **result["endFingerprint"]}
 
     return {
         "schemaVersion": RESULT_SCHEMA,
@@ -458,10 +503,10 @@ def build_envelope(args, test, resolved_inputs, participants, roles, result):
                 "index": 0,
                 "role": role,
                 "outcome": outcome,
-                "start": {"nodeUID": participant["nodeUID"]},
-                "end": {"nodeUID": participant["nodeUID"]},
-                "visibleDevices": [f"gpu-{index}" for index in range(result["visibleGpuCount"])],
-                "coveredDevices": [f"gpu-{index}" for index in range(result["activeGpuCount"])],
+                "start": start_fingerprint,
+                "end": end_fingerprint,
+                "visibleDevices": visible_devices,
+                "coveredDevices": covered_devices,
             }
         ],
         "activity": {
@@ -483,6 +528,8 @@ def run_harness(args):
     server_errors = 0
     request_errors = 0
     visible_count = 0
+    start_fingerprint = {"driverVersion": "", "gpuInventoryDigest": ""}
+    end_fingerprint = {"driverVersion": "", "gpuInventoryDigest": ""}
     active_count = 0
     memory_used = 0
     completion = {
@@ -507,7 +554,9 @@ def run_harness(args):
         verify_contract(parameters, test, resolved_inputs)
         verify_model_cache(args.model_cache)
 
-        visible_count = visible_gpu_count()
+        start_fingerprint = collect_gpu_fingerprint()
+        end_fingerprint = start_fingerprint
+        visible_count = start_fingerprint["gpuCount"]
         if visible_count != TENSOR_PARALLEL_SIZE:
             raise HarnessError(
                 f"visible GPU count = {visible_count}, want {TENSOR_PARALLEL_SIZE}",
@@ -573,6 +622,26 @@ def run_harness(args):
             message = f"vLLM server error source count = {server_errors}"
             exit_code = 1
 
+        if start_fingerprint["driverVersion"]:
+            try:
+                end_fingerprint = collect_gpu_fingerprint()
+                if (
+                    end_fingerprint["gpuCount"] != visible_count
+                    or end_fingerprint["driverVersion"] != start_fingerprint["driverVersion"]
+                    or end_fingerprint["gpuInventoryDigest"]
+                    != start_fingerprint["gpuInventoryDigest"]
+                ):
+                    raise HarnessError(
+                        "GPU identity or driver version changed during execution",
+                        "IdentityMismatch",
+                    )
+            except (HarnessError, OSError, subprocess.SubprocessError) as error:
+                if outcome == "Passed":
+                    outcome = "Failed"
+                    reason = getattr(error, "reason", "IdentityMismatch")
+                    message = str(error)
+                    exit_code = 1
+
     finished = time.monotonic()
     measurements = [
         measurement("serviceReady", typed_boolean(service_ready)),
@@ -624,6 +693,14 @@ def run_harness(args):
             "measurements": measurements,
             "visibleGpuCount": visible_count,
             "activeGpuCount": active_count,
+            "startFingerprint": {
+                "driverVersion": start_fingerprint["driverVersion"],
+                "gpuInventoryDigest": start_fingerprint["gpuInventoryDigest"],
+            },
+            "endFingerprint": {
+                "driverVersion": end_fingerprint["driverVersion"],
+                "gpuInventoryDigest": end_fingerprint["gpuInventoryDigest"],
+            },
         },
     )
 

@@ -141,11 +141,26 @@ func TestRenderedGPUInventoryCatalogPinsSource(t *testing.T) {
 	}
 
 	script := scripts.Data["gpu-inventory.sh"]
+	if scripts.Name != "project-signal-gpu-inventory-v2" {
+		t.Fatalf("GPU inventory script ConfigMap name = %q, want immutable v2 name", scripts.Name)
+	}
+
 	scriptSum := sha256.Sum256([]byte(script))
 	scriptDigest := fmt.Sprintf("sha256:%x", scriptSum)
 
 	if scriptDigest != testScriptDigest {
 		t.Fatalf("GPU inventory script digest = %s, test fixture expects %s", scriptDigest, testScriptDigest)
+	}
+
+	assertContainsAll(
+		t,
+		script,
+		`printf '\000'`,
+		`printf '%s' "$gpu_uuid"`,
+	)
+
+	if strings.Contains(script, `printf '%s\000' "$gpu_uuid"`) {
+		t.Fatal("GPU inventory digest includes a trailing NUL separator")
 	}
 
 	for index, wantRole := range []string{"qualification", "compatibility-diagnostic"} {
@@ -227,6 +242,7 @@ func TestRenderedGPUInventoryScriptProducesCanonicalFingerprints(t *testing.T) {
 	}
 
 	participant := result.Participants[0]
+
 	const wantDigest = "sha256:b553224e314b1f8192da92db1febdbcd2bad39ab8bf106fb1da46cf148920cf8"
 
 	if participant.Start.DriverVersion != "590.48.01" ||
@@ -805,6 +821,165 @@ func TestRenderedAcceptanceSuitesSeparateQualificationDiagnosticsAndVLLM(t *test
 	}
 }
 
+func TestRenderedExecutionAuthorityIsExplicitAndFailClosed(t *testing.T) {
+	t.Parallel()
+
+	data := signalRenderData()
+	enableExecutionAuthorityRender(data)
+
+	output := renderSignal(t, data)
+
+	documents := splitYAMLDocuments(string(readRenderedFile(t, output, "11-execution-authority.yaml")))
+	if len(documents) != 9 {
+		t.Fatalf("execution authority documents = %d, want 9", len(documents))
+	}
+
+	text := strings.Join(documents, "\n---\n")
+	assertContainsAll(
+		t,
+		text,
+		"acceptanceSuitesEnabled: \"true\"",
+		"cutoverApproved: \"true\"",
+		"hardAbort: \"true\"",
+		"namespace: signal-authority",
+		"resourceNames:",
+		"- project-signal-execution-authority-aaaaaaaaaaaa-dddddddddddd",
+		"- project-signal-execution-state",
+		"uid: 11111111-1111-1111-1111-111111111111",
+		"uid: 33333333-3333-3333-3333-333333333333",
+		"pvc://signal-ns/approved-model-cache@"+data["VLLMModelCacheManifestDigest"],
+		"name: canonical-gpu-inventory",
+		"name: offline-vllm-canary",
+		"creditRule: PerParticipant",
+		"mode: Current",
+		"nonPassBehavior: Revoke",
+		"mode: None",
+	)
+
+	transition := string(readRenderedFile(t, output, "12-execution-authority-transition.yaml"))
+	assertContainsAll(
+		t,
+		transition,
+		`"op": "test"`,
+		`"value": "true"`,
+		`"op": "replace"`,
+		`"value": "false"`,
+	)
+
+	policy := documents[8]
+	if strings.Contains(policy, "project-signal-gpu-compat-8x-v1") {
+		t.Fatal("compatibility diagnostics must grant zero Policy credit")
+	}
+
+	deployment := string(readRenderedFile(t, output, "06-deployment.yaml"))
+	assertContainsAll(
+		t,
+		deployment,
+		"--authority-namespace=signal-authority",
+		"--authority-name=project-signal-execution-authority-aaaaaaaaaaaa-dddddddddddd",
+		"--static-package-digest="+testDigest,
+	)
+}
+
+func TestExecutionAuthorityRenderRejectsUnsafeTransition(t *testing.T) {
+	t.Parallel()
+
+	for _, tt := range []struct {
+		name  string
+		key   string
+		value string
+		error string
+	}{
+		{
+			name:  "suites disabled",
+			key:   "AcceptanceSuitesEnabled",
+			value: "false",
+			error: "AcceptanceSuitesEnabled=true",
+		},
+		{
+			name:  "cutover not approved",
+			key:   "CutoverApproved",
+			value: "false",
+			error: "CutoverApproved=true",
+		},
+		{
+			name:  "unversioned immutable authority",
+			key:   "AuthorityName",
+			value: "project-signal-execution-authority",
+			error: "AuthorityName must match",
+		},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			data := signalRenderData()
+			enableExecutionAuthorityRender(data)
+			data[tt.key] = tt.value
+
+			err := render.Render(".", t.TempDir(), data)
+			if err == nil || !strings.Contains(err.Error(), tt.error) {
+				t.Fatalf("render error = %v, want %q", err, tt.error)
+			}
+		})
+	}
+}
+
+func TestExecutionAuthorityRejectsSharedAuthorityNamespace(t *testing.T) {
+	t.Parallel()
+
+	data := signalRenderData()
+	enableExecutionAuthorityRender(data)
+	data["AuthorityNamespace"] = data["Namespace"]
+
+	err := render.Render(".", t.TempDir(), data)
+	if err == nil || !strings.Contains(err.Error(), "AuthorityNamespace must be distinct") {
+		t.Fatalf("render error = %v, want distinct authority namespace rejection", err)
+	}
+}
+
+func TestDisabledExecutionAuthorityClearsControllerBinding(t *testing.T) {
+	t.Parallel()
+
+	data := signalRenderData()
+	data["StaticPackageDigest"] = testDigest
+
+	output := renderSignal(t, data)
+	deployment := string(readRenderedFile(t, output, "06-deployment.yaml"))
+	assertContainsAll(
+		t,
+		deployment,
+		"--authority-name=project-signal-execution-authority-disabled",
+		"--static-package-digest=",
+	)
+
+	if strings.Contains(deployment, "--static-package-digest="+testDigest) {
+		t.Fatal("disabled execution authority retained the static package binding")
+	}
+}
+
+func TestExecutionAuthorityRendersAuditableHardAbort(t *testing.T) {
+	t.Parallel()
+
+	data := signalRenderData()
+	enableExecutionAuthorityRender(data)
+	data["HardAbort"] = "true"
+
+	output := renderSignal(t, data)
+	content := string(readRenderedFile(t, output, "11-execution-authority.yaml"))
+	assertContainsAll(
+		t,
+		content,
+		"name: project-signal-execution-authority",
+		"name: project-signal-execution-state",
+		"hardAbort: \"true\"",
+	)
+
+	transition := readRenderedFile(t, output, "12-execution-authority-transition.yaml")
+	if len(bytes.TrimSpace(transition)) != 0 {
+		t.Fatalf("hard-aborted authority rendered a release transition: %s", transition)
+	}
+}
+
 func TestRenderedVLLMAcceptanceFailsClosedWithoutExactModelProvenance(t *testing.T) {
 	t.Parallel()
 
@@ -1297,6 +1472,7 @@ func runGPUInventoryScript(
 	}
 
 	work := t.TempDir()
+
 	bin := filepath.Join(work, "bin")
 	if err := os.Mkdir(bin, 0o755); err != nil {
 		t.Fatalf("create mock binary directory: %v", err)
@@ -1352,6 +1528,7 @@ esac
 	}
 
 	command := exec.Command("/bin/sh", scriptPath)
+
 	command.Env = append(
 		os.Environ(),
 		"PATH="+bin+":"+os.Getenv("PATH"),
@@ -1383,6 +1560,7 @@ esac
 	}
 
 	const prefix = "PROJECT_SIGNAL_INVOCATION_RESULT_V1 "
+
 	line := strings.TrimSpace(string(output))
 	if !strings.HasPrefix(line, prefix) {
 		t.Fatalf("GPU inventory output = %q, want invocation result prefix", line)
@@ -1400,6 +1578,8 @@ func signalRenderData() map[string]string {
 	return map[string]string{
 		"Namespace":                    "signal-ns",
 		"ScriptNamespace":              "script-ns",
+		"AuthorityNamespace":           "signal-authority",
+		"AuthorityName":                "project-signal-execution-authority",
 		"ControllerImage":              testControllerImage,
 		"AdapterImage":                 testAdapterImage,
 		"RunnerImage":                  testRunnerImage,
@@ -1410,10 +1590,45 @@ func signalRenderData() map[string]string {
 		"VLLMModelCacheSubPath":        "EleutherAI--pythia-70m-deduped/snapshots/e93a9faa9c77e5d09219f6c868bfc7a1bd65593c",
 		"VLLMModelCacheManifestDigest": "sha256:52b9b0fa1a8a67424d2e8f7994675698c60e3eb1a7925091930ecc4958dbcd7e",
 		"AcceptanceSuitesEnabled":      "false",
+		"ExecutionAuthorityEnabled":    "false",
+		"CutoverApproved":              "false",
+		"HardAbort":                    "true",
 		"VLLMWorkflowTemplateDigest":   testDigest,
 		"WorkflowTemplateDigest":       testDigest,
 		"QualificationGateProtected":   "false",
 	}
+}
+
+func enableExecutionAuthorityRender(data map[string]string) {
+	data["AcceptanceSuitesEnabled"] = "true"
+	data["ExecutionAuthorityEnabled"] = "true"
+	data["CutoverApproved"] = "true"
+	data["HardAbort"] = "false"
+	data["SourceCommit"] = strings.Repeat("a", 40)
+	data["StaticPackageDigest"] = testDigest
+	data["AuthorityName"] = "project-signal-execution-authority-aaaaaaaaaaaa-dddddddddddd"
+	data["BaselineProfileUID"] = "11111111-1111-1111-1111-111111111111"
+	data["VLLMProfileUID"] = "33333333-3333-3333-3333-333333333333"
+	data["GPUInventoryTestUID"] = "11111111-1111-1111-1111-111111111111"
+	data["GPUInventoryTestGeneration"] = "1"
+	data["GPUInventoryTestContentDigest"] = testDigest
+	data["GPUCompatTestUID"] = "22222222-2222-2222-2222-222222222222"
+	data["GPUCompatTestGeneration"] = "1"
+	data["GPUCompatTestContentDigest"] = testDigest
+	data["VLLMCanaryEnabled"] = "true"
+	data["VLLMCanaryImage"] = "example.invalid/vllm-canary@sha256:" + strings.Repeat("f", 64)
+	data["VLLMCanaryCPU"] = "4"
+	data["VLLMCanaryMemory"] = "16Gi"
+	data["VLLMModelCachePVC"] = "approved-model-cache"
+	data["VLLMTestUID"] = "33333333-3333-3333-3333-333333333333"
+	data["VLLMTestGeneration"] = "1"
+	data["VLLMTestContentDigest"] = testDigest
+	data["VLLMModelIdentity"] = "approved-model@sha256:" + strings.Repeat("9", 64)
+	data["VLLMModelRevision"] = strings.Repeat("7", 40)
+	data["VLLMModelWeightsDigest"] = "sha256:" + strings.Repeat("6", 64)
+	data["VLLMPromptFixtureDigest"] = "sha256:" + strings.Repeat("8", 64)
+	data["VLLMRequestTimeout"] = "2m"
+	data["VLLMInvocationTimeout"] = "30m"
 }
 
 func renderSignal(t *testing.T, data map[string]string) string {

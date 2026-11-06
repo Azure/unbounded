@@ -121,6 +121,14 @@ SIGNAL_VLLM_MODEL_CACHE_STORAGE_CLASS ?=
 SIGNAL_VLLM_MODEL_CACHE_HANDOFF_TIMEOUT ?= 300s
 SIGNAL_VLLM_WORKFLOW_TEMPLATE_DIGEST ?=
 SIGNAL_ACCEPTANCE_SUITES_ENABLED ?= false
+SIGNAL_EXECUTION_AUTHORITY_ENABLED ?= false
+SIGNAL_CUTOVER_APPROVED ?= false
+SIGNAL_HARD_ABORT ?= true
+SIGNAL_SOURCE_COMMIT ?=
+SIGNAL_STATIC_PACKAGE_DIGEST ?=
+SIGNAL_AUTHORITY_NAME ?= project-signal-execution-authority
+SIGNAL_BASELINE_PROFILE_UID ?=
+SIGNAL_VLLM_PROFILE_UID ?=
 SIGNAL_GPU_INVENTORY_TEST_UID ?=
 SIGNAL_GPU_INVENTORY_TEST_GENERATION ?=
 SIGNAL_GPU_INVENTORY_TEST_CONTENT_DIGEST ?=
@@ -138,6 +146,7 @@ SIGNAL_VLLM_REQUEST_TIMEOUT ?=
 SIGNAL_VLLM_INVOCATION_TIMEOUT ?=
 SIGNAL_NAMESPACE ?= project-signal
 SIGNAL_SCRIPT_NAMESPACE ?= $(SIGNAL_NAMESPACE)
+SIGNAL_AUTHORITY_NAMESPACE ?= project-signal-authority
 SIGNAL_QUALIFICATION_GATE_PROTECTED ?= false
 SIGNAL_QUALIFICATION_GATE_GUARD ?=
 SIGNAL_WORKFLOW_TEMPLATE_DIGEST ?=
@@ -214,7 +223,7 @@ VERSION ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo dev)
 # is invalid in an image reference. VERSION itself is kept intact for the embedded
 # version string (ldflags) and release artifact paths.
 VERSION_TAG ?= $(subst /,-,$(VERSION))
-GIT_COMMIT ?= $(shell git rev-parse --short HEAD 2>/dev/null || echo unknown)
+GIT_COMMIT ?= $(shell git rev-parse HEAD 2>/dev/null || echo unknown)
 BUILD_TIME ?= $(shell date -u +%Y-%m-%dT%H:%M:%SZ)
 
 # Shared ldflags for injecting version metadata into all binaries.
@@ -285,7 +294,7 @@ NET_FRONTEND_CACHE_FILE    := $(NET_FRONTEND_DIST_DIR)/.frontend-build-key
 # Frontend build toggle (dev builds produce unminified output with sourcemaps).
 REACT_DEV ?= false
 
-.PHONY: all help fmt lint lint-actions test build vulncheck check-deps kubectl-unbounded kubectl-unbounded-build install-tools install-protoc install-helm generate kubectl-unbounded forge relctl relctl-build agent-artifacts-builder agent-artifacts-builder-build orcadev unbounded-agent machina machina-build machina-oci machina-oci-push machina-manifests machine-ops-controller machine-ops-controller-build machine-ops-controller-oci machine-ops-controller-oci-push machine-ops-manifests project-signal-controller project-signal-controller-build project-signal-adapter project-signal-adapter-build project-signal-model-cache project-signal-model-cache-build signal-manifests signal-vllm-cache-handoff image-project-signal-controller-local image-project-signal-adapter-local image-project-signal-vllm-canary-local image-project-signal-vllm-model-cache-local metalman metalman-build metalman-oci metalman-oci-push unbounded-operator unbounded-operator-build unbounded-operator-manifests playpen-manifests e2e-gantry e2e-playpen e2e-racer gomod docs-serve unbounded-net-controller unbounded-net-controller-build unbounded-net-node unbounded-net-node-build unbounded-net-routeplan-debug unping unping-build unroute unroute-build license-check notice notice-check gantry gantry-build gantry-manifests inventory-manifests
+.PHONY: all help fmt lint lint-actions test build vulncheck check-deps kubectl-unbounded kubectl-unbounded-build install-tools install-protoc install-helm generate kubectl-unbounded forge relctl relctl-build agent-artifacts-builder agent-artifacts-builder-build orcadev unbounded-agent machina machina-build machina-oci machina-oci-push machina-manifests machine-ops-controller machine-ops-controller-build machine-ops-controller-oci machine-ops-controller-oci-push machine-ops-manifests project-signal-controller project-signal-controller-build project-signal-verify-clean-source project-signal-adapter project-signal-adapter-build project-signal-model-cache project-signal-model-cache-build signal-manifests signal-vllm-cache-handoff image-project-signal-controller-local image-project-signal-adapter-local image-project-signal-vllm-canary-local image-project-signal-vllm-model-cache-local metalman metalman-build metalman-oci metalman-oci-push unbounded-operator unbounded-operator-build unbounded-operator-manifests playpen-manifests e2e-gantry e2e-playpen e2e-racer gomod docs-serve unbounded-net-controller unbounded-net-controller-build unbounded-net-node unbounded-net-node-build unbounded-net-routeplan-debug unping unping-build unroute unroute-build license-check notice notice-check gantry gantry-build gantry-manifests inventory-manifests
 .PHONY: net-frontend net-frontend-clean net-ebpf-build net-ebpf-generate net-ebpf-verify net-manifests gantry-chart-lint gantry-chart-package release-bom release-manifests unbounded-operator-release-manifest
 .PHONY: image-machina-local image-token-refresher-local image-machine-ops-controller-local image-metalman-local image-unbounded-operator-local image-unbounded-operator-push image-playpen-local image-net-controller-local image-net-node-local image-gantry-local image-gantry-push images-local
 .PHONY: image-net-controller-push image-net-node-push images-net-all images-net-all-push
@@ -1176,7 +1185,20 @@ machine-ops-controller-oci: image-machine-ops-controller-local ## Alias for imag
 machine-ops-controller-oci-push: machine-ops-controller-oci ## Build and push the machine-ops-controller image
 	$(CONTAINER_ENGINE) push $(MACHINE_OPS_CONTROLLER_IMAGE)
 
-project-signal-controller-build: signal-manifests ## Build Project Signal controller without lint/test
+project-signal-verify-clean-source:
+	@if git rev-parse --is-inside-work-tree >/dev/null 2>&1; then \
+		head="$$(git rev-parse HEAD)"; \
+		if [ "$(GIT_COMMIT)" != "$$head" ]; then \
+			echo "GIT_COMMIT must match the exact source HEAD: $(GIT_COMMIT) != $$head" >&2; \
+			exit 1; \
+		fi; \
+		if [ -n "$$(git status --porcelain --untracked-files=no)" ]; then \
+			echo "Project Signal controller source must be committed before build" >&2; \
+			exit 1; \
+		fi; \
+	fi
+
+project-signal-controller-build: project-signal-verify-clean-source signal-manifests ## Build Project Signal controller without lint/test
 	@mkdir -p bin
 	$(GOBUILD) -trimpath -ldflags '$(STAMP_LDFLAGS)' -o $(PROJECT_SIGNAL_CONTROLLER_BIN) $(PROJECT_SIGNAL_CONTROLLER_CMD)
 
@@ -1194,7 +1216,7 @@ project-signal-model-cache-build: ## Build Project Signal model cache verifier w
 
 project-signal-model-cache: test project-signal-model-cache-build ## Build Project Signal model cache verifier (implies test)
 
-image-project-signal-controller-local: ## Build Project Signal controller image locally
+image-project-signal-controller-local: project-signal-verify-clean-source ## Build Project Signal controller image locally
 	$(CONTAINER_ENGINE) build \
 		--build-arg VERSION=$(VERSION) \
 		--build-arg GIT_COMMIT=$(GIT_COMMIT) \
@@ -1314,6 +1336,18 @@ signal-manifests: ## Render Project Signal manifests into deploy/signal/rendered
 		true|false) ;; \
 		*) echo "SIGNAL_ACCEPTANCE_SUITES_ENABLED must be true or false" >&2; exit 1 ;; \
 	esac; \
+	case "$(SIGNAL_EXECUTION_AUTHORITY_ENABLED)" in \
+		true|false) ;; \
+		*) echo "SIGNAL_EXECUTION_AUTHORITY_ENABLED must be true or false" >&2; exit 1 ;; \
+	esac; \
+	case "$(SIGNAL_CUTOVER_APPROVED)" in \
+		true|false) ;; \
+		*) echo "SIGNAL_CUTOVER_APPROVED must be true or false" >&2; exit 1 ;; \
+	esac; \
+	case "$(SIGNAL_HARD_ABORT)" in \
+		true|false) ;; \
+		*) echo "SIGNAL_HARD_ABORT must be true or false" >&2; exit 1 ;; \
+	esac; \
 	if [ "$(SIGNAL_QUALIFICATION_GATE_PROTECTED)" = true ] && \
 		[ "$(SIGNAL_QUALIFICATION_GATE_GUARD)" != node-authorizer-node-restriction-rbac-verified ]; then \
 		echo "enabling the protected qualification gate requires SIGNAL_QUALIFICATION_GATE_GUARD=node-authorizer-node-restriction-rbac-verified" >&2; \
@@ -1327,6 +1361,8 @@ signal-manifests: ## Render Project Signal manifests into deploy/signal/rendered
 		--output-dir "$$temp_dir" \
 		--set Namespace=$(SIGNAL_NAMESPACE) \
 		--set ScriptNamespace=$(SIGNAL_SCRIPT_NAMESPACE) \
+		--set AuthorityNamespace=$(SIGNAL_AUTHORITY_NAMESPACE) \
+		--set AuthorityName=$(SIGNAL_AUTHORITY_NAME) \
 		--set ControllerImage=$(SIGNAL_CONTROLLER_IMAGE) \
 		--set AdapterImage=$(SIGNAL_ADAPTER_IMAGE) \
 		--set RunnerImage=$(SIGNAL_CERTIFICATION_RUNNER_IMAGE) \
@@ -1346,6 +1382,13 @@ signal-manifests: ## Render Project Signal manifests into deploy/signal/rendered
 		--set VLLMModelCacheStorageClass=$(SIGNAL_VLLM_MODEL_CACHE_STORAGE_CLASS) \
 		--set VLLMWorkflowTemplateDigest=sha256:0000000000000000000000000000000000000000000000000000000000000000 \
 		--set AcceptanceSuitesEnabled=$(SIGNAL_ACCEPTANCE_SUITES_ENABLED) \
+		--set ExecutionAuthorityEnabled=$(SIGNAL_EXECUTION_AUTHORITY_ENABLED) \
+		--set CutoverApproved=$(SIGNAL_CUTOVER_APPROVED) \
+		--set HardAbort=$(SIGNAL_HARD_ABORT) \
+		--set SourceCommit=$(SIGNAL_SOURCE_COMMIT) \
+		--set StaticPackageDigest=$(SIGNAL_STATIC_PACKAGE_DIGEST) \
+		--set BaselineProfileUID=$(SIGNAL_BASELINE_PROFILE_UID) \
+		--set VLLMProfileUID=$(SIGNAL_VLLM_PROFILE_UID) \
 		--set GPUInventoryTestUID=$(SIGNAL_GPU_INVENTORY_TEST_UID) \
 		--set GPUInventoryTestGeneration=$(SIGNAL_GPU_INVENTORY_TEST_GENERATION) \
 		--set GPUInventoryTestContentDigest=$(SIGNAL_GPU_INVENTORY_TEST_CONTENT_DIGEST) \
@@ -1391,7 +1434,7 @@ signal-manifests: ## Render Project Signal manifests into deploy/signal/rendered
 		$(GOCMD) run ./hack/cmd/manifest-digest \
 			--file "$$gpu_inventory_catalog" \
 			--kind ConfigMap \
-			--name project-signal-gpu-inventory-v1 \
+			--name project-signal-gpu-inventory-v2 \
 			--data-key gpu-inventory.sh \
 	)"; \
 	if [ "$(SIGNAL_GPU_INVENTORY_SCRIPT_DIGEST)" != "$$gpu_inventory_script_digest" ]; then \
@@ -1420,6 +1463,8 @@ signal-manifests: ## Render Project Signal manifests into deploy/signal/rendered
 		--output-dir $(SIGNAL_MANIFEST_RENDERED_DIR) \
 		--set Namespace=$(SIGNAL_NAMESPACE) \
 		--set ScriptNamespace=$(SIGNAL_SCRIPT_NAMESPACE) \
+		--set AuthorityNamespace=$(SIGNAL_AUTHORITY_NAMESPACE) \
+		--set AuthorityName=$(SIGNAL_AUTHORITY_NAME) \
 		--set ControllerImage=$(SIGNAL_CONTROLLER_IMAGE) \
 		--set AdapterImage=$(SIGNAL_ADAPTER_IMAGE) \
 		--set RunnerImage=$(SIGNAL_CERTIFICATION_RUNNER_IMAGE) \
@@ -1439,6 +1484,13 @@ signal-manifests: ## Render Project Signal manifests into deploy/signal/rendered
 		--set VLLMModelCacheStorageClass=$(SIGNAL_VLLM_MODEL_CACHE_STORAGE_CLASS) \
 		--set VLLMWorkflowTemplateDigest="$$vllm_workflow_digest" \
 		--set AcceptanceSuitesEnabled=$(SIGNAL_ACCEPTANCE_SUITES_ENABLED) \
+		--set ExecutionAuthorityEnabled=$(SIGNAL_EXECUTION_AUTHORITY_ENABLED) \
+		--set CutoverApproved=$(SIGNAL_CUTOVER_APPROVED) \
+		--set HardAbort=$(SIGNAL_HARD_ABORT) \
+		--set SourceCommit=$(SIGNAL_SOURCE_COMMIT) \
+		--set StaticPackageDigest=$(SIGNAL_STATIC_PACKAGE_DIGEST) \
+		--set BaselineProfileUID=$(SIGNAL_BASELINE_PROFILE_UID) \
+		--set VLLMProfileUID=$(SIGNAL_VLLM_PROFILE_UID) \
 		--set GPUInventoryTestUID=$(SIGNAL_GPU_INVENTORY_TEST_UID) \
 		--set GPUInventoryTestGeneration=$(SIGNAL_GPU_INVENTORY_TEST_GENERATION) \
 		--set GPUInventoryTestContentDigest=$(SIGNAL_GPU_INVENTORY_TEST_CONTENT_DIGEST) \

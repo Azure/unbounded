@@ -63,6 +63,136 @@ func TestValidateCheckPlanVariableLengths(t *testing.T) {
 	}
 }
 
+func TestExecutionAuthorityFailsClosed(t *testing.T) {
+	t.Parallel()
+
+	scheme := runtime.NewScheme()
+	if err := corev1.AddToScheme(scheme); err != nil {
+		t.Fatal(err)
+	}
+
+	immutable := true
+	authorityName := "project-signal-execution-authority-aaaaaaaaaaaa-bbbbbbbbbbbb"
+	valid := &corev1.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      authorityName,
+			Namespace: "signal-authority",
+		},
+		Immutable: &immutable,
+		Data: map[string]string{
+			"acceptanceSuitesEnabled": "true",
+			"cutoverApproved":         "true",
+			"sourceCommit":            strings.Repeat("a", 40),
+			"staticPackageDigest":     "sha256:" + strings.Repeat("b", 64),
+		},
+	}
+	validState := &corev1.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      ExecutionStateName,
+			Namespace: "signal-authority",
+		},
+		Data: map[string]string{"hardAbort": "false"},
+	}
+
+	for _, tt := range []struct {
+		name        string
+		mutate      func(*corev1.ConfigMap)
+		mutateState func(*corev1.ConfigMap)
+		valid       bool
+	}{
+		{name: "valid", valid: true},
+		{
+			name: "cutover absent",
+			mutate: func(authority *corev1.ConfigMap) {
+				delete(authority.Data, "cutoverApproved")
+			},
+		},
+		{
+			name: "mutable",
+			mutate: func(authority *corev1.ConfigMap) {
+				authority.Immutable = nil
+			},
+		},
+		{
+			name: "different source commit",
+			mutate: func(authority *corev1.ConfigMap) {
+				authority.Data["sourceCommit"] = strings.Repeat("b", 40)
+			},
+		},
+		{
+			name: "different static package",
+			mutate: func(authority *corev1.ConfigMap) {
+				authority.Data["staticPackageDigest"] = "sha256:" + strings.Repeat("c", 64)
+			},
+		},
+		{
+			name: "state hard abort active",
+			mutateState: func(state *corev1.ConfigMap) {
+				state.Data["hardAbort"] = "true"
+			},
+		},
+		{
+			name: "immutable state",
+			mutateState: func(state *corev1.ConfigMap) {
+				immutable := true
+				state.Immutable = &immutable
+			},
+		},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			authority := valid.DeepCopy()
+			if tt.mutate != nil {
+				tt.mutate(authority)
+			}
+
+			state := validState.DeepCopy()
+			if tt.mutateState != nil {
+				tt.mutateState(state)
+			}
+
+			kube := fake.NewClientBuilder().WithScheme(scheme).WithObjects(authority, state).Build()
+			reconciler := &AdmissionReconciler{
+				Client:              kube,
+				APIReader:           kube,
+				Namespace:           "signal-system",
+				AuthorityNamespace:  "signal-authority",
+				AuthorityName:       authorityName,
+				SourceCommit:        strings.Repeat("a", 40),
+				StaticPackageDigest: "sha256:" + strings.Repeat("b", 64),
+			}
+
+			err := reconciler.requireExecutionAuthority(context.Background())
+			if tt.valid && err != nil {
+				t.Fatalf("requireExecutionAuthority() error = %v", err)
+			}
+
+			if !tt.valid && err == nil {
+				t.Fatal("requireExecutionAuthority() accepted unsafe authority")
+			}
+
+			runReconciler := &RunReconciler{
+				Client:              kube,
+				APIReader:           kube,
+				AuthorityNamespace:  "signal-authority",
+				AuthorityName:       authorityName,
+				SourceCommit:        strings.Repeat("a", 40),
+				StaticPackageDigest: "sha256:" + strings.Repeat("b", 64),
+			}
+
+			runErr := runReconciler.requireExecutionAuthority(context.Background())
+			if tt.valid && runErr != nil {
+				t.Fatalf("RunReconciler.requireExecutionAuthority() error = %v", runErr)
+			}
+
+			if !tt.valid && runErr == nil {
+				t.Fatal("RunReconciler.requireExecutionAuthority() accepted unsafe authority")
+			}
+		})
+	}
+}
+
 func TestBuildResolvedWorkflowOrdersPhasesAndConcurrentStages(t *testing.T) {
 	t.Parallel()
 
