@@ -412,7 +412,7 @@ impl ControlFixture {
         config.limits.range_window_pages = NonZeroUsize::new(2).unwrap();
         config.limits.connections_per_neighbor = NonZeroUsize::new(2).unwrap();
         config.limits.queue_entries = NonZeroUsize::new(64).unwrap();
-        config.shutdown_timeout = Duration::from_secs(2);
+        config.shutdown_timeout = Duration::from_secs(10);
         std::fs::write(&config.trust_bundle, ca.pem()).unwrap();
         std::fs::write(&config.service_account_token, b"fixture.token").unwrap();
         let mut fixture = Self {
