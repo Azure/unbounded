@@ -618,3 +618,78 @@ func TestResetIncludesTheHandoffCleanupExceptForTheHandoffsOwnReset(t *testing.T
 	assert.NotContains(t, ResetAgentForReprovision(discardLogger()).Name(), "remove-reprovision-handoff")
 	assert.Contains(t, ResetAgent(discardLogger()).Name(), "remove-reprovision-handoff")
 }
+
+// Finding 4 of the #1103 review: a change refused for want of the reprovision
+// opt-in, then opted in and tried, reports its InProgress and Failed states
+// without the refusal's reason, so the machina controller does not report the
+// failure as ChangeRefused. Each status write is captured as the fake API
+// server stores it.
+func TestReconcileRepave_AFailureAfterARefusalDropsTheRefusalReason(t *testing.T) {
+	h := newMigHarness(t, isolation.ModeNSpawn)
+
+	var stored []v1alpha3.IsolationChangeStatus
+
+	recording := func(objs ...client.Object) client.Client {
+		return fake.NewClientBuilder().WithScheme(fakeScheme()).WithObjects(objs...).
+			WithStatusSubresource(&v1alpha3.Machine{}).
+			WithInterceptorFuncs(interceptor.Funcs{
+				SubResourcePatch: func(ctx context.Context, c client.Client, sub string, obj client.Object, patch client.Patch, opts ...client.SubResourcePatchOption) error {
+					if err := c.SubResource(sub).Patch(ctx, obj, patch, opts...); err != nil {
+						return err
+					}
+
+					var m v1alpha3.Machine
+					if err := c.Get(ctx, client.ObjectKeyFromObject(obj), &m); err != nil {
+						return err
+					}
+
+					if m.Status.IsolationChange != nil {
+						stored = append(stored, *m.Status.IsolationChange)
+					}
+
+					return nil
+				},
+			}).Build()
+	}
+
+	r, _, mig, c := changeFixture(t, h, v1alpha3.IsolationNone, h.active.Config.Cluster.Version, false, recording)
+
+	// Refused: no opt-in.
+	_, err := r.ReconcileRepave(t.Context(), "node-delete")
+	require.NoError(t, err)
+	require.Empty(t, mig.strategies)
+
+	refused := getChange(t, c)
+	require.NotNil(t, refused)
+	require.Equal(t, v1alpha3.IsolationChangeReasonReprovisionNotAllowed, refused.Reason)
+	require.Equal(t, v1alpha3.IsolationChangeReprovision, refused.Strategy)
+
+	// Opted in; the change is tried and fails.
+	m := getMachine(t, c)
+	m.Annotations = map[string]string{v1alpha3.AnnotationAllowReprovision: "true"}
+	require.NoError(t, c.Update(t.Context(), &m))
+
+	mig.err = errors.New("preflight failed (the nspawn node was not changed)")
+	stored = nil
+
+	_, err = r.ReconcileRepave(t.Context(), "node-delete")
+	require.NoError(t, err)
+	require.Equal(t, []migrate.Strategy{migrate.Reprovision}, mig.strategies, "the opted-in change is tried")
+
+	var phases []v1alpha3.IsolationChangePhase
+	for _, s := range stored {
+		phases = append(phases, s.Phase)
+		assert.Empty(t, s.Reason, "the %s state must not carry the refusal's reason", s.Phase)
+		assert.NotEqual(t, refused.Message, s.Message, "the %s state must not carry the refusal's message", s.Phase)
+	}
+
+	assert.Equal(t, []v1alpha3.IsolationChangePhase{v1alpha3.IsolationChangeInProgress, v1alpha3.IsolationChangeFailed}, phases)
+
+	failed := getChange(t, c)
+	require.NotNil(t, failed)
+	assert.Equal(t, v1alpha3.IsolationChangeFailed, failed.Phase)
+	assert.Empty(t, failed.Reason, "a failure after a refusal is not a refusal")
+	assert.Equal(t, v1alpha3.IsolationChangeReprovision, failed.Strategy, "the strategy is the one the tried change records")
+	assert.Contains(t, failed.Message, "preflight failed")
+	assert.NotContains(t, failed.Message, v1alpha3.AnnotationAllowReprovision)
+}
