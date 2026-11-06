@@ -896,7 +896,9 @@ fn drive<T>(
     inspect: impl Fn(),
 ) -> T {
     let mut work = std::pin::pin!(work);
-    let deadline = Instant::now() + Duration::from_secs(25);
+    // A hang detector, not a throughput bound: it trips only after reactors
+    // make no progress for the whole window, so a starved host cannot fail it.
+    let mut deadline = Instant::now() + Duration::from_secs(25);
     loop {
         if let Poll::Ready(result) = work
             .as_mut()
@@ -912,6 +914,8 @@ fn drive<T>(
         }
         if progress == 0 {
             std::thread::yield_now();
+        } else {
+            deadline = Instant::now() + Duration::from_secs(25);
         }
     }
 }
@@ -1232,9 +1236,12 @@ impl RelayFixture {
         )
         .with_transfers(transfers)
         .with_opaque_relay(!materialized);
-        let scope =
-            RequestScope::host(RequestId([1; 16]), Instant::now() + Duration::from_secs(25))
-                .unwrap();
+        let scope = RequestScope::with_clock(
+            RequestId([1; 16]),
+            env.ctx.now() + Duration::from_secs(25),
+            env.ctx.clock.clone(),
+        )
+        .unwrap();
         let plaintext: Vec<_> = (0..crate::model::PAGE_BYTES as usize)
             .map(|i| (i % 251) as u8)
             .collect();
@@ -1553,7 +1560,14 @@ fn cpu() -> Duration {
 }
 #[test]
 fn signed_full_page_bootstrap_and_page_stream_without_transit_allocation() {
-    let env = racer_io::Env::host();
+    // Sixty-four MiB through fragmented reads is CPU-bound, so a loaded host
+    // can exceed any wall-clock request budget. Freeze the request clock; the
+    // drive watchdog still catches a stalled relay.
+    let clock = racer_io::ctx::VirtualClock::new();
+    let env = racer_io::Env::new(
+        racer_io::Driver::Uring,
+        racer_io::WorkerCtx::simulated(&clock, 0, 0),
+    );
     for fallback in [false, true] {
         exchange(&env, false, fallback, 2, true, false);
     }
