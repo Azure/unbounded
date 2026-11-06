@@ -233,10 +233,11 @@ impl Signatures {
 
     /// Sign retained provenance; replay admission belongs to its carrying session.
     pub fn sign(&self, head: MessageHead) -> Result<SignedHead> {
-        if head.headers.iter().any(|h| {
-            is_auth_field(&h.name.to_ascii_lowercase())
-                && !h.name.eq_ignore_ascii_case("racer-receiver")
-        }) {
+        if head
+            .headers
+            .iter()
+            .any(|h| is_auth_field(&h.name) && !h.name.eq_ignore_ascii_case("racer-receiver"))
+        {
             return Err(Error::InvalidRequest);
         }
         receiver(&head)?;
@@ -592,6 +593,17 @@ pub const VERSION: &str = "2";
 pub const REQUEST_TARGET: &str = "/racer/peer/v1/exchange";
 /// Maximum carried hop count (links on one route), shared with `racer_wire::route`.
 pub const MAX_HOPS: usize = racer_wire::route::MAX_LINKS as usize;
+/// Field names `racer-hop-{i}` for every carried hop index.
+pub(crate) const HOP_FIELDS: [&str; MAX_HOPS] = [
+    "racer-hop-0",
+    "racer-hop-1",
+    "racer-hop-2",
+    "racer-hop-3",
+    "racer-hop-4",
+    "racer-hop-5",
+    "racer-hop-6",
+    "racer-hop-7",
+];
 /// Maximum retained signed HTTP head (one proof).
 ///
 /// Proofs name their chain by fingerprint, so this bounds only logical fields.

@@ -130,11 +130,7 @@ impl Session {
         {
             signers = crate::proof_signers(&head.headers.remove(index).value)?;
         }
-        if head
-            .headers
-            .iter()
-            .any(|h| is_auth_field(&h.name.to_ascii_lowercase()))
-        {
+        if head.headers.iter().any(|h| is_auth_field(&h.name)) {
             return Err(Error::Unauthorized);
         }
         let next = self.state.tx.checked_add(1).ok_or(Error::Replay)?;
@@ -204,8 +200,8 @@ impl Session {
             return Err(Error::Replay);
         }
         let mut last = head.unique("racer-original")?;
-        for i in 0..MAX_HOPS {
-            if let Some(hop) = head.unique(&format!("racer-hop-{i}"))? {
+        for name in HOP_FIELDS {
+            if let Some(hop) = head.unique(name)? {
                 last = Some(hop);
             }
         }
@@ -221,8 +217,7 @@ impl Session {
             crate::chains::remember(chain);
         }
         self.state.chains.admit(attached)?;
-        head.headers
-            .retain(|h| !is_auth_field(&h.name.to_ascii_lowercase()));
+        head.headers.retain(|h| !is_auth_field(&h.name));
         self.state.rx = next;
         Ok(head)
     }
@@ -688,8 +683,7 @@ mod tests {
             assert_eq!(b, [2; 32]);
 
             head.headers.retain(|h| {
-                !is_auth_field(&h.name.to_ascii_lowercase())
-                    || h.name.eq_ignore_ascii_case("racer-receiver")
+                !is_auth_field(&h.name) || h.name.eq_ignore_ascii_case("racer-receiver")
             });
             push(&mut head, "x-unknown", "value");
             let signed = n[0].sign(head).unwrap();

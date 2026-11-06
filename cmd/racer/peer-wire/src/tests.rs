@@ -1063,3 +1063,10 @@ fn signature_and_mac_bases_match_legacy_implementation_bytes() {
         }
     }
 }
+
+#[test]
+fn hop_field_table_matches_hop_names() {
+    for (i, name) in HOP_FIELDS.iter().enumerate() {
+        assert_eq!(*name, format!("racer-hop-{i}"));
+    }
+}
