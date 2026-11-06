@@ -31,31 +31,15 @@
 //! and cache lists, plus 8 for the publish-order (age) list that
 //! [`AgeCursor`] walks.
 //!
-//! # Replaces (wiring map)
+//! # Callers
 //!
-//! | Old (`src/store`, `alloc`) | New |
-//! |---|---|
-//! | `catalog::Index` page map, `PageIndex<K, V>` reverse/age maps, `IndexedPage` | entries in [`DiskIndex`], [`EntryView`] |
-//! | `catalog::RecordLocation` (public fields) | [`RecordLocation`] (only from `append`) |
-//! | `Index::reserve_page`, `PageTicket::publish`, `PublicationGuard` | [`DiskIndex::reserve`], [`DiskIndex::append`], [`DiskIndex::write_complete`], [`DiskIndex::publish`] |
-//! | queue replacement in `store.rs` (drops the victim first) | [`DiskIndex::reserve_replacing`] (validates, then removes) |
-//! | `holds.rs` `Holds`, `HoldEpoch`, `PageHolders`, wall-or-monotonic `live()` | [`HoldId`] holds, [`DiskIndex::expire_holds`] on [`Monotonic`] only |
-//! | `Holds::unused` O(holds), `segment_held` O(holds x locations) | [`DiskIndex::holds_unused`], [`DiskIndex::can_evict`] O(1) |
-//! | `SegmentClock::{reclaim, reclaim_index, reclaim_scored, mark_read}`, `SegmentEntries` (removed; the simulator keeps a copy) | [`DiskIndex::reclaim`] with [`DiskIndex::touch`] heat |
-//! | `retention::Heat` keyed per page, separate capacity (removed; the simulator keeps a copy) | per-segment heat derived from the index |
-//! | per-cache byte maps in `catalog.rs`/`retention.rs`, `remove_cache(s)` | [`DiskIndex::cache_bytes`], [`DiskIndex::remove_cache`] |
-//! | `Arc::strong_count` busy checks (`store.rs`) | `writes` counters and segment leases |
-//!
-//! Wiring needs: the caller interns `PageId -> PageSlot` (Phase 2 arena) and
-//! keeps `PageId` in records and checkpoints; `catalog.rs` drops its page map
-//! and calls into this index; `holds.rs` maps object-version holds to
-//! [`HoldId`]s (one per reservation, so a stale release cannot drop a newer
-//! holder and `HoldEpoch` disappears) and converts wall-clock TTLs to
-//! [`Monotonic`] deadlines once at reservation; `store.rs` calls `reserve` /
-//! `append` / `write_complete` / `publish` around each write and
-//! `expire_holds` + `reclaim` each turn; `retention.rs` replaces `Heat` with
-//! `touch`; `memory.rs` uses explicit pin counts, not this index. Restart
-//! restores holds with deadlines recomputed from persisted wall times.
+//! The racer storage worker (`src/store/pages.rs`) interns `PageId -> PageSlot`
+//! and cache IDs with [`crate::intern`], keeps `PageId` in records and
+//! checkpoints, and calls [`DiskIndex::reserve`], [`DiskIndex::append`],
+//! [`DiskIndex::write_complete`], and [`DiskIndex::publish`] around each write.
+//! Each object-version hold maps to one [`HoldId`] per reservation, so a stale
+//! release cannot drop a newer holder. Live hold expiry uses [`Monotonic`]
+//! deadlines only; restart recomputes them from persisted wall times.
 
 use crate::{Error, Extent, Generation, Result, SegmentId, SegmentLease, SegmentState, Segments};
 use std::collections::{BTreeMap, BTreeSet};

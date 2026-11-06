@@ -669,8 +669,9 @@ async fn reconcile(t: &Rc<Term_>) -> Result<(), StateError> {
                 let encoded = state::encode(&next)?;
                 let state_b64 = zeroize::Zeroizing::new(STANDARD.encode(&*encoded));
                 let mut body = secret.clone();
-                // TODO(phase 7b): the JSON body still copies the encoded record
-                // into non-zeroizing strings; the racer-io shell writes it directly.
+                // TODO: the Secret body is a `serde_json::Value`, so the encoded
+                // state record is copied into non-zeroizing strings. Serialize the
+                // request body directly into a zeroizing buffer instead.
                 body["data"] = json!({
                     annotations::CLUSTER_KEY: STANDARD.encode(cluster.as_bytes()),
                     annotations::STATE_KEY: state_b64.as_str(),
