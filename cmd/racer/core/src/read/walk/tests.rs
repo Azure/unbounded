@@ -1706,3 +1706,78 @@ fn a_failed_helper_detour_leaves_every_remaining_owner_funded() {
         );
     }
 }
+
+/// Drive a reader fill over owners 10, 11, 12, answering every probe with
+/// `replies` in turn (the last repeats), until it is done.
+fn reader_done(replies: &[Event<'static>]) -> Action {
+    let mut f = fill(false, Features::PRODUCTION);
+    let mut b = budget(64, 64);
+    let mut action = f.on(START, &mut b, Instant::now()).0;
+    action = match action {
+        Action::Rank { .. } => {
+            f.on(Event::Ranked(Ok(owners(5, None))), &mut b, Instant::now())
+                .0
+        }
+        other => other,
+    };
+    for i in 0..32 {
+        match action {
+            Action::Done(_) => return action,
+            Action::Probe(_) => {}
+            other => panic!("unexpected {other:?}"),
+        }
+        let reply = replies[i.min(replies.len() - 1)];
+        action = f.on(reply, &mut b, Instant::now()).0;
+    }
+    panic!("fill never finished");
+}
+
+const LOCAL_BUSY: Event<'static> = Event::Reply(Reply::Failed {
+    error: Error::Overloaded,
+    sent: false,
+    scope_live: true,
+});
+
+#[test]
+fn local_admission_saturation_is_overloaded_not_unavailable() {
+    // Every owner refused by this node's own peer admission: busy, retryable.
+    assert_eq!(
+        format!("{:?}", reader_done(&[LOCAL_BUSY])),
+        format!("{:?}", Action::Done(Err(Error::Overloaded)))
+    );
+    // An exchange that failed `Overloaded` after it went out (receive memory, a
+    // refusing route) is load too, alone or mixed with local refusals.
+    let sent_busy = Event::Reply(Reply::Failed {
+        error: Error::Overloaded,
+        sent: true,
+        scope_live: true,
+    });
+    assert_eq!(
+        format!("{:?}", reader_done(&[sent_busy, LOCAL_BUSY])),
+        format!("{:?}", Action::Done(Err(Error::Overloaded)))
+    );
+}
+
+#[test]
+fn unreachable_owners_still_fail_unavailable() {
+    // All owners down.
+    assert_eq!(
+        format!("{:?}", reader_done(&[UNAVAILABLE])),
+        format!("{:?}", Action::Done(Err(Error::Unavailable)))
+    );
+    // Some owners refused locally, one genuinely unreachable: real evidence wins.
+    assert_eq!(
+        format!("{:?}", reader_done(&[LOCAL_BUSY, UNAVAILABLE, LOCAL_BUSY])),
+        format!("{:?}", Action::Done(Err(Error::Unavailable)))
+    );
+    // A local failure that is not admission pressure stays unavailable.
+    let local_io = Event::Reply(Reply::Failed {
+        error: Error::Io,
+        sent: false,
+        scope_live: true,
+    });
+    assert_eq!(
+        format!("{:?}", reader_done(&[local_io])),
+        format!("{:?}", Action::Done(Err(Error::Unavailable)))
+    );
+}

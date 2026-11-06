@@ -1734,6 +1734,12 @@ pub struct Fill {
     source: Source,
     pub funding: bool,
     pub remaining_end: Option<RemainingEnd>,
+    /// Exchanges that failed `Overloaded` (saturated peer admission, receive
+    /// memory, or a refusing route), and probes with any other outcome. A walk
+    /// that ran out of candidates having only been refused for load is busy, not
+    /// unavailable ([`Fill::exhausted_error`]).
+    busy: u32,
+    other: u32,
     out: Evidence,
 }
 
@@ -1775,7 +1781,23 @@ impl Fill {
             source: Source::Peer,
             funding: false,
             remaining_end: None,
+            busy: 0,
+            other: 0,
             out: Evidence::default(),
+        }
+    }
+
+    /// The error of a walk that ran out of candidates. When every exchange of the
+    /// read failed `Overloaded` (for example this node's own peer admission hit
+    /// its per-neighbor or inflight caps), no peer was shown down and the read is
+    /// merely contended: report
+    /// `Overloaded`, local pressure the caller retries with backoff until its
+    /// scope ends. Any other evidence, or none, keeps `Unavailable`.
+    fn exhausted_error(&self) -> Error {
+        if self.busy > 0 && self.other == 0 {
+            Error::Overloaded
+        } else {
+            Error::Unavailable
         }
     }
 
@@ -1915,6 +1937,8 @@ impl Fill {
                         {
                             return Err(error);
                         }
+                        // The lost race is evidence about the peers it asked.
+                        self.other = self.other.saturating_add(1);
                         self.continuation = Continuation {
                             primary_consumed: !stale,
                             primary_outcome: (!stale)
@@ -2239,13 +2263,26 @@ impl Fill {
                         return Err(error);
                     }
                 };
+                // The exchange failed `Overloaded`: this node's peer admission (per-neighbor or
+                // inflight caps), its receive memory, or a route refusing the connection is
+                // saturated. Busy, not down.
+                let busy = outcome == ProbeOutcome::Overloaded;
+                if busy {
+                    self.busy = self.busy.saturating_add(1);
+                }
                 if !sent {
+                    if !busy {
+                        self.other = self.other.saturating_add(1);
+                    }
                     // Never sent: no evidence about the destination.
                     self.out = Evidence {
                         notes: self.out.notes,
                         ..Evidence::default()
                     };
                     return self.walk_complete(Outcome::Transport(outcome), budget);
+                }
+                if busy {
+                    return self.complete_busy(Outcome::Transport(outcome), budget);
                 }
                 Outcome::Transport(outcome)
             }
@@ -2270,6 +2307,17 @@ impl Fill {
 
     /// Record the outstanding probe's outcome and its evidence.
     fn complete(&mut self, outcome: Outcome, budget: &mut AcquisitionBudget) -> Result<Action> {
+        self.other = self.other.saturating_add(1);
+        self.complete_busy(outcome, budget)
+    }
+
+    /// [`Fill::complete`] without counting the outcome as evidence against the
+    /// peers ([`Fill::exhausted_error`]).
+    fn complete_busy(
+        &mut self,
+        outcome: Outcome,
+        budget: &mut AcquisitionBudget,
+    ) -> Result<Action> {
         self.pending();
         self.out.outcome = Some(Ok(outcome));
         // Only rank 0's own answer (or its silence) says anything about rank 0. An overload on
@@ -2525,7 +2573,7 @@ impl Fill {
                 if self.stale > 0 {
                     self.note(Notes::EXHAUSTED_STALE);
                 }
-                Err(Error::Unavailable)
+                Err(self.exhausted_error())
             }
         }
     }
@@ -2536,7 +2584,7 @@ impl Fill {
         match end {
             RemainingEnd::Copy => Ok(self.publish(Source::Peer)),
             RemainingEnd::None => Err(origin_miss_error(&self.evidence)),
-            RemainingEnd::Unavailable => Err(Error::Unavailable),
+            RemainingEnd::Unavailable => Err(self.exhausted_error()),
         }
     }
 
