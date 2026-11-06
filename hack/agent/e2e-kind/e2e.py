@@ -672,14 +672,23 @@ def active_nspawn_machine() -> str:
     die("no active nspawn machine found")
 
 
+def machine_shell_command(machine: str, command: str) -> str:
+    """Return the host command that runs *command* in nspawn machine *machine*.
+
+    It uses systemd-run --pipe --wait, which passes the command's output and
+    exit status back. machinectl shell does not: without a terminal it shows
+    nothing and exits 0 whatever the command does, so checks run through it
+    could never fail."""
+    return (f"sudo systemd-run -M {machine} --wait --pipe --quiet "
+            f"/bin/sh -lc {shlex.quote(command)}")
+
+
 def machine_shell(machine: str, command: str) -> str:
-    quoted = json.dumps(command)
-    return ssh_capture(f"sudo machinectl shell {machine} /bin/sh -lc {quoted}")
+    return ssh_capture(machine_shell_command(machine, command))
 
 
 def machine_shell_quiet(machine: str, command: str) -> subprocess.CompletedProcess[str]:
-    quoted = json.dumps(command)
-    return ssh_capture_quiet(f"sudo machinectl shell {machine} /bin/sh -lc {quoted}")
+    return ssh_capture_quiet(machine_shell_command(machine, command))
 
 
 def nspawn_os_release(machine: str) -> str:
@@ -687,7 +696,7 @@ def nspawn_os_release(machine: str) -> str:
     if result.returncode == 0 and result.stdout.strip():
         return result.stdout
 
-    diag(f"Could not read /var/lib/machines/{machine}/etc/os-release directly; trying machinectl shell")
+    diag(f"Could not read /var/lib/machines/{machine}/etc/os-release directly; running cat in the machine")
     return machine_shell(machine, "cat /etc/os-release")
 
 
@@ -935,18 +944,16 @@ def bpffs_sentinel_script() -> str:
     stack. A directory is a bpffs object of its own, so this needs neither
     bpftool (the node image ships only the kernel-versioned wrapper, which
     fails on a host whose kernel has no matching linux-tools) nor any BPF
-    program. It is one line: machine_shell passes the command through
-    json.dumps inside double quotes, where a newline would reach the shell as
-    a literal backslash-n."""
+    program."""
     sentinel = f"/sys/fs/bpf/{BPFFS_SENTINEL}"
     return (f"mountpoint -q /sys/fs/bpf && rm -rf {sentinel} && "
             f"mkdir {sentinel} && test -d {sentinel}")
 
 
 def create_bpffs_sentinel(machine: str) -> None:
-    """Make the sentinel in the bpffs of nspawn machine *machine*. machinectl
-    shell does not reliably pass on the exit status of the command it runs,
-    so the result is checked on the host, at the machine's bpffs mount."""
+    """Make the sentinel in the bpffs of nspawn machine *machine*, and check
+    it from the host too, at the machine's bpffs mount, so the check holds
+    whatever runs the command in the machine."""
     log(f"Creating bpffs sentinel in nspawn machine '{machine}'...")
     machine_shell(machine, bpffs_sentinel_script())
     result = ssh_capture_quiet(f"sudo test -d {NODE_BPFFS_BASE}/{machine}/{BPFFS_SENTINEL}")
@@ -4654,7 +4661,7 @@ EOF
     # device. The synthetic /dev/zero alias is not an RDMA device class.
     # `machinectl show` succeeds as soon as nspawn registers the machine, and
     # the node's Ready condition can still be the stale pre-reboot value, so
-    # the container's init may not accept `machinectl shell` yet. Poll the
+    # the container's init may not accept commands from the host yet. Poll the
     # in-container check instead of running it once.
     wait_for_machine_shell_success(
         machine,
@@ -6995,7 +7002,7 @@ def _collect_one_vm_logs(logs_dir: Path, vm_name: str, vm_ip: str, vm_dir: Path,
         ssh_log(f"vm-machine-{machine}-rootfs.txt", f"sudo ls -la /var/lib/machines/{machine} 2>&1 || true")
         ssh_log(
             f"nspawn-{machine}-units.txt",
-            f"sudo machinectl shell {machine} /usr/bin/systemctl list-units --no-pager",
+            machine_shell_command(machine, "systemctl list-units --no-pager"),
         )
 
 
