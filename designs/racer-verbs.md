@@ -144,7 +144,7 @@ Each worker has a FIFO command queue with capacity 64. The owner drains them
 round-robin. `try_send` returns the command with `Overloaded` when full or
 `Unavailable` when the owner is gone; `poll_ready` waits for room. Dropping a
 worker keeps its queued commands. Dropping the owner drops queued commands,
-whose one-shot results become `Cancelled`.
+whose one-shot results become `Canceled`.
 
 `Op<T>` yields its result once. A second poll after completion returns
 `InvalidRequest`. If the caller abandons an operation, `Completer::complete`

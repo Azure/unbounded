@@ -432,8 +432,8 @@ per group of GPUs that cannot reach each other's; past that, a request with
 no reachable fetch to join fetches privately. An abandoned fetch only sends
 its own waiters to look again.
 
-**Cancellation.** A waiter that is cancelled stops waiting and returns its
-error. If the leader is cancelled or times out, waiters are told the fetch
+**Cancellation.** A waiter that is canceled stops waiting and returns its
+error. If the leader is canceled or times out, waiters are told the fetch
 was abandoned and look again, up to two times (`GPU_COPY_JOIN_RETRIES`),
 then fetch on their own. If the leader's fetch ends with no GPU copy, waiters
 take the usual path through host memory rather than repeat the leader's

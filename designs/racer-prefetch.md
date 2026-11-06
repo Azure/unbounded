@@ -140,16 +140,16 @@ Let the ticket hold `(G, S)`.
 | `g > G` (any `s`) | Supersede, 200; the previous window is reported `superseded` in metrics only, the ticket keeps its id |
 | `g < G` | 409 `stale_generation` |
 
-A PUT on a terminal ticket (SUCCEEDED, PARTIAL, FAILED, CANCELLED) with a
+A PUT on a terminal ticket (SUCCEEDED, PARTIAL, FAILED, CANCELED) with a
 higher `(g, s)` restarts it. With equal `(g, s)` and same hash it returns the
 retained status (200). A one-shot batch is a single PUT with `(0, 0)`.
 
 Replacing the desired set: pages no longer desired drop this ticket's
 interest (queued units with zero interest are removed; in-flight fills are not
-cancelled). New pages are planned. Pages already admitted for this ticket stay
+canceled). New pages are planned. Pages already admitted for this ticket stay
 counted.
 
-Every accepted PUT renews the TTL. On expiry the ticket goes CANCELLED with
+Every accepted PUT renews the TTL. On expiry the ticket goes CANCELED with
 reason `expired` and releases its interest. Nothing is evicted.
 
 ### Status codes
@@ -225,8 +225,8 @@ Object read errors keep their empty bodies.
 
 - `state`: `QUEUED` (accepted, nothing dispatched), `RUNNING`, `SUCCEEDED`
   (every ref admitted), `PARTIAL` (settled, some refs failed), `FAILED` (settled,
-  every ref failed), `CANCELLED`.
-- `reason`: `null` unless CANCELLED: `client`, `expired`, `superseded`
+  every ref failed), `CANCELED`.
+- `reason`: `null` unless CANCELED: `client`, `expired`, `superseded`
   (only used for a ticket replaced by a cache UID change), `cache_removed`,
   `passthrough`.
 - `settled`: true when no unit for the current `(generation, sequence)` is
@@ -275,9 +275,9 @@ id, at most 1024 (the node ticket limit):
 
 ### DELETE
 
-Returns 200 with the CANCELLED status (`reason: "client"`). Interest is
+Returns 200 with the CANCELED status (`reason: "client"`). Interest is
 released; queued units with no remaining interest are dropped; in-flight fills
-complete normally; nothing is evicted. A cancelled ticket is retained like
+complete normally; nothing is evicted. A canceled ticket is retained like
 other terminal tickets.
 
 ## Configuration
@@ -532,7 +532,7 @@ specified above. Where the server had to choose, it did the following.
   no separate queue per owner.
 - Ticket limit: before answering 429 `ticket_limit`, the oldest retained
   terminal ticket is dropped to make room.
-- TTL expiry: an unsettled ticket becomes CANCELLED (`expired`). A settled
+- TTL expiry: an unsettled ticket becomes CANCELED (`expired`). A settled
   ticket keeps its SUCCEEDED, PARTIAL, or FAILED state and releases its
   interest. Retention (`RACER_PREFETCH_TICKET_RETENTION_SECS`) counts from
   expiry or cancellation.
@@ -593,7 +593,7 @@ specified above. Where the server had to choose, it did the following.
 - Parser: methods, ids, query params, body limits, content type, 405/413.
 - Idempotency table rows above, TTL expiry, retention GC, 429 limits.
 - Scheduler: dedup across tickets, priority and round-robin order, pending
-  bound, window replace dropping interest without cancelling flights,
+  bound, window replace dropping interest without canceling flights,
   re-plan on membership change.
 - Owner: resident, join, start, deferred under budget, probe bitmap,
   passthrough, old-peer `peer_unsupported`.
