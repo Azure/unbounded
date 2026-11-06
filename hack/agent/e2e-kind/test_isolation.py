@@ -847,10 +847,36 @@ class ResetOnHostTests(unittest.TestCase):
                 patch.object(e2e, "wait_for_node_absent", side_effect=lambda name: calls.append(("absent",))), \
                 patch.object(e2e, "validate_node_stack_removed", side_effect=lambda: calls.append(("stack",))), \
                 patch.object(e2e, "validate_reset_cleanup", side_effect=lambda: calls.append(("files",))), \
+                patch.object(e2e, "validate_nftables_flush_removed", side_effect=lambda: calls.append(("nft",))), \
                 patch.object(e2e, "validate_no_reprovision_handoff", side_effect=lambda: calls.append(("handoff",))):
             e2e.reset_agent_on_host()
         self.assertEqual(calls[0], ("ssh", f"sudo {e2e.DAEMON_BINARY} reset"))
-        self.assertEqual([c[0] for c in calls[1:]], ["run", "absent", "stack", "files", "handoff"])
+        self.assertEqual([c[0] for c in calls[1:]], ["run", "absent", "stack", "files", "nft", "handoff"])
+
+    def test_nothing_left_of_the_nftables_flush_passes(self):
+        self.assertEqual(e2e.nftables_flush_leftover([], ""), "")
+        self.assertEqual(e2e.nftables_flush_leftover([], "not-found\n"), "")
+
+    def test_a_leftover_nftables_flush_is_reported(self):
+        problem = e2e.nftables_flush_leftover(["/etc/unbounded/kube/nftables-clear.nft"], "")
+        self.assertIn("nftables-clear.nft", problem)
+        for state in ("enabled\n", "disabled", "static", "masked"):
+            self.assertIn(repr(state.strip()), e2e.nftables_flush_leftover([], state), state)
+
+    def test_the_nftables_flush_check_covers_every_mode(self):
+        """The unit is enabled by multi-user.target in none and by the nspawn
+        machines in nspawn; both links and the rules file are checked."""
+        for path in ("/etc/systemd/system/multi-user.target.wants/nftables-flush.service",
+                     "/etc/systemd/system/systemd-nspawn@.service.requires/nftables-flush.service",
+                     "/etc/unbounded/kube/nftables-clear.nft"):
+            self.assertIn(path, e2e.NFTABLES_FLUSH_ARTIFACTS)
+        with patch.object(e2e, "present_on_host", return_value=[]), \
+                patch.object(e2e, "ssh_capture_quiet", return_value=unittest.mock.Mock(stdout="enabled\n")):
+            with self.assertRaises(SystemExit):
+                e2e.validate_nftables_flush_removed()
+        with patch.object(e2e, "present_on_host", return_value=[]), \
+                patch.object(e2e, "ssh_capture_quiet", return_value=unittest.mock.Mock(stdout="")):
+            e2e.validate_nftables_flush_removed()
 
     def test_the_none_node_stack_must_be_gone(self):
         with patch.object(e2e, "ISOLATION_MODE", "none"), \

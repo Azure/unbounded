@@ -6644,17 +6644,57 @@ def validate_no_reprovision_handoff(timeout_secs: int = 120) -> None:
     log("No reprovision handoff unit or staged configuration is left on the host")
 
 
+# The nftables flush the agent installs in every mode
+# (pkg/agent/phases/host/configure_nftables.go): its unit, the links that
+# enable it (multi-user.target in none, the nspawn machines in nspawn) and the
+# rules file it loads. Left after a reset, it flushes the ruleset of whatever
+# the host runs next at every boot.
+NFTABLES_FLUSH_UNIT = "nftables-flush.service"
+NFTABLES_FLUSH_ARTIFACTS = (
+    f"/etc/systemd/system/{NFTABLES_FLUSH_UNIT}",
+    f"/etc/systemd/system/multi-user.target.wants/{NFTABLES_FLUSH_UNIT}",
+    f"/etc/systemd/system/systemd-nspawn@.service.requires/{NFTABLES_FLUSH_UNIT}",
+    "/etc/unbounded/kube/nftables-clear.nft",
+)
+
+
+def nftables_flush_leftover(present: list[str], enabled_state: str) -> str:
+    """Return what a reset left of the nftables flush, or "" when nothing is
+    left. *present* are the NFTABLES_FLUSH_ARTIFACTS still on the host and
+    *enabled_state* is what `systemctl is-enabled` printed for the unit: empty
+    or not-found once the unit is gone."""
+    problems = []
+    if present:
+        problems.append(f"still present: {', '.join(present)}")
+    state = enabled_state.strip()
+    if state not in ("", "not-found"):
+        problems.append(f"systemctl is-enabled {NFTABLES_FLUSH_UNIT} prints {state!r}")
+    return "reset left the nftables flush on the host: " + "; ".join(problems) if problems else ""
+
+
+def validate_nftables_flush_removed() -> None:
+    """Assert reset removed the nftables flush unit, its enablement and its
+    rules file."""
+    present = present_on_host(list(NFTABLES_FLUSH_ARTIFACTS))
+    state = ssh_capture_quiet(f"systemctl is-enabled {NFTABLES_FLUSH_UNIT}").stdout
+    problem = nftables_flush_leftover(present, state)
+    if problem:
+        die(problem)
+    log(f"Reset removed {NFTABLES_FLUSH_UNIT} and its rules file")
+
+
 def reset_agent_on_host() -> None:
     """Run `unbounded-agent reset` on the host, as an operator does without the
     control plane, and assert the node stack of the mode under test, the
-    agent's files and any reprovision handoff are gone. The Node object is
-    removed separately, as reset only cleans up the host."""
+    agent's files, the nftables flush and any reprovision handoff are gone. The
+    Node object is removed separately, as reset only cleans up the host."""
     log(f"Running unbounded-agent reset on the host ({isolation_mode()} mode)...")
     ssh_cmd(f"sudo {DAEMON_BINARY} reset")
     run_quiet([KUBECTL, "delete", "node", AGENT_MACHINE_NAME, "--ignore-not-found"], check=False)
     wait_for_node_absent(AGENT_MACHINE_NAME)
     validate_node_stack_removed()
     validate_reset_cleanup()
+    validate_nftables_flush_removed()
     validate_no_reprovision_handoff()
     log(f"unbounded-agent reset left a clean host in {isolation_mode()} mode")
 
