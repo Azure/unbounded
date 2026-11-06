@@ -84,7 +84,7 @@ func TestNoneOperatorRepaveOrder(t *testing.T) {
 	active := noneActive()
 
 	require.NoError(t, op.RepaveNode(t.Context(), discardLogger(), active, noneRepaveConfig("1.35.0")))
-	assert.Equal(t, []string{"resolve", "stage", "upgrade", "persist:none:1.35.0", "commit", "prune"}, *events)
+	assert.Equal(t, []string{"recover", "resolve", "stage", "upgrade", "persist:none:1.35.0", "commit", "prune"}, *events)
 	require.NotNil(t, node.params.Previous)
 	assert.Equal(t, active.Config.Cluster.Version, node.params.Previous.Cluster.Version)
 	assert.Equal(t, "1.35.0", node.params.Config.Cluster.Version)
@@ -96,7 +96,7 @@ func TestNoneOperatorRepaveFailureLeavesTheAppliedConfig(t *testing.T) {
 	node.upgrade = errors.New("rolled back")
 
 	require.ErrorContains(t, op.RepaveNode(t.Context(), discardLogger(), noneActive(), noneRepaveConfig("1.35.0")), "rolled back")
-	assert.Equal(t, []string{"resolve", "stage", "upgrade"}, *events)
+	assert.Equal(t, []string{"recover", "resolve", "stage", "upgrade"}, *events)
 }
 
 // A persist failure is reported and the upgrade is not committed, so the next
@@ -137,7 +137,7 @@ func TestNoneOperatorRepaveResolveAndStageFailures(t *testing.T) {
 	}
 
 	require.ErrorContains(t, op.RepaveNode(t.Context(), discardLogger(), noneActive(), noneRepaveConfig("1.35.0")), "resolve download overrides")
-	assert.Empty(t, *events)
+	assert.Equal(t, []string{"recover"}, *events)
 
 	op, _, events = newFakeNoneOperator()
 	op.StageArchives = func(context.Context, *slog.Logger, *goalstates.ContainerImageArchiveStaging) error {
@@ -169,9 +169,23 @@ func TestNoneOperatorEnsureLifecycleMigrationRecoversAnInterruptedUpgrade(t *tes
 	assert.Equal(t, []string{"recover"}, *events)
 	assert.Equal(t, active.Config.Cluster.Version, node.params.Config.Cluster.Version)
 
+	// A failed recovery does not stop the daemon: it would leave the node with
+	// no repave and no reset.
 	node.recover = errors.New("cannot roll back")
 
-	require.ErrorContains(t, op.EnsureLifecycleMigration(t.Context(), discardLogger(), active), "recover an interrupted node upgrade")
+	require.NoError(t, op.EnsureLifecycleMigration(t.Context(), discardLogger(), active))
+}
+
+// A repave retries an interrupted upgrade's recovery before it upgrades, and
+// reports a recovery that fails again instead of upgrading over its journal.
+func TestNoneOperatorRepaveRecoversAnInterruptedUpgradeFirst(t *testing.T) {
+	op, node, events := newFakeNoneOperator()
+	active := noneActive()
+	node.recover = errors.New("cannot roll back")
+
+	require.ErrorContains(t, op.RepaveNode(t.Context(), discardLogger(), active, noneRepaveConfig("1.35.0")), "recover an interrupted node upgrade: cannot roll back")
+	assert.Equal(t, []string{"recover"}, *events)
+	assert.Equal(t, active.Config.Cluster.Version, node.params.Config.Cluster.Version, "recovered against the applied config")
 }
 
 func TestNoneOperatorDefaultsAreTheRealNode(t *testing.T) {

@@ -482,12 +482,12 @@ func (n *Node) Upgrade(ctx context.Context) (err error) {
 	}
 
 	if _, jerr := n.readJournal(); jerr == nil {
-		return fmt.Errorf("an earlier upgrade was interrupted and has not been recovered (%s); restart the agent to finish it", n.journalPath())
+		return fmt.Errorf("an earlier upgrade was interrupted and has not been recovered (%s); restart the agent or repave again to finish it", n.journalPath())
 	} else if !errors.Is(jerr, os.ErrNotExist) {
 		return jerr
 	}
 
-	if err := n.writeJournal(upgradeJournal{Previous: current, Target: n.version}); err != nil {
+	if err := n.writeJournal(upgradeJournal{Previous: current, Target: n.version, TargetConfig: configDigest(n.p.Config)}); err != nil {
 		return err
 	}
 
@@ -588,11 +588,17 @@ func (n *Node) Commit() error {
 // RecoverUpgrade finishes an upgrade a crash interrupted. The daemon calls it
 // at startup with the applied config, which is the configuration the node ran
 // before the upgrade unless the upgrade had already succeeded and been
-// persisted. In that case only Commit is left. Otherwise the node is rolled
-// back: the stack is stopped, its pods ended, the link pointed at the version
-// the journal recorded, the units written for this configuration, the saved
-// configuration restored, host networking set up again, and the stack started.
-// It does nothing when no upgrade was in progress.
+// persisted. Which of the two it is is decided from the configuration itself:
+// the journal records a digest of the configuration the upgrade applied, and
+// only an applied config with that digest, on the version the upgrade
+// switched to, is a finished upgrade. The version name is not enough, because
+// a repave that changes only configuration keeps it. A finished upgrade is
+// committed, and its stack started if it is not running, since the agent may
+// have stopped after it stopped the stack. Otherwise the node is rolled back:
+// the stack is stopped, its pods ended, the link pointed at the version the
+// journal recorded, the units written for this configuration, the saved
+// configuration restored, host networking set up again, and the stack
+// started. It does nothing when no upgrade was in progress.
 func (n *Node) RecoverUpgrade(ctx context.Context) error {
 	j, err := n.readJournal()
 	if errors.Is(err, os.ErrNotExist) {
@@ -612,8 +618,14 @@ func (n *Node) RecoverUpgrade(ctx context.Context) error {
 		return err
 	}
 
-	if j.Target == n.version && current == n.version {
-		n.p.Log.Info("finishing an upgrade that succeeded before the agent stopped", "version", n.version)
+	if j.TargetConfig != "" && j.TargetConfig == configDigest(n.p.Config) && current == j.Target {
+		n.p.Log.Info("finishing an upgrade that succeeded before the agent stopped", "version", current)
+
+		if err := n.ensureRunning(ctx); err != nil {
+			// The journal stays, so the next start, or the next repave, tries
+			// again.
+			return fmt.Errorf("start the upgraded node: %w", err)
+		}
 
 		return n.Commit()
 	}
@@ -645,12 +657,45 @@ func (n *Node) RecoverUpgrade(ctx context.Context) error {
 	return n.Commit()
 }
 
+// ensureRunning starts the stack unless all of it is already active.
+func (n *Node) ensureRunning(ctx context.Context) error {
+	running, err := n.Running(ctx)
+	if err != nil {
+		return err
+	}
+
+	if running {
+		return nil
+	}
+
+	return n.Start(ctx, false, false, false)
+}
+
 // upgradeJournal is what Upgrade records before it changes anything.
 type upgradeJournal struct {
 	// Previous is the version the node ran before the upgrade.
 	Previous string `json:"previous"`
 	// Target is the version the upgrade installs.
 	Target string `json:"target"`
+	// TargetConfig is the configDigest of the configuration the upgrade
+	// applies, which its caller persists as the applied config once the
+	// upgrade is healthy. Empty when the node was built without one; such an
+	// upgrade is never taken as finished.
+	TargetConfig string `json:"targetConfig,omitempty"`
+}
+
+// configDigest identifies an agent configuration by the SHA-256 of its JSON
+// encoding, the encoding the applied config is persisted and read back in. It
+// is empty for no configuration.
+func configDigest(cfg *config.AgentConfig) string {
+	if cfg == nil {
+		return ""
+	}
+
+	data, _ := json.Marshal(cfg) //nolint:errcheck // plain data always marshals
+	sum := sha256.Sum256(data)
+
+	return hex.EncodeToString(sum[:])
 }
 
 func (n *Node) journalPath() string {
