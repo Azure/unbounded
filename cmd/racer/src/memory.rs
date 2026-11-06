@@ -2639,6 +2639,70 @@ pub(crate) mod tests {
                     }
                 }
 
+                /// A peer receive against a ciphertext share full of cache
+                /// entries reclaims idle entries before failing, and still
+                /// fails `Overloaded` without evicting when every entry is busy.
+                #[test]
+                fn peer_receive_reclaims_idle_cache_before_overloaded() {
+                    let env = racer_io::Env::host();
+                    let mut limits = crate::test_support::cluster::config(false).limits;
+                    limits.metadata_entries = std::num::NonZeroUsize::new(100).unwrap();
+                    limits.ciphertext_bytes = std::num::NonZeroUsize::new(4 * CIPHER).unwrap();
+                    let admission =
+                        Rc::new(flow_control::Quotas::new(AdmissionPolicy::new(limits)));
+                    let cache = MemoryCache::new(
+                        BufferPool::new(admission.clone()),
+                        crate::test_support::availability_for(&env, vec![id("a")]),
+                    );
+                    let pages: Vec<_> = (0..4)
+                        .map(|i| verified_in(&cache, "a", &format!("p{i}")))
+                        .collect();
+                    assert_eq!(admission.used(ResourceClass::Ciphertext), 4 * CIPHER);
+                    // The same policy production wires into `Transfers`.
+                    let reclaim = |owner: &CacheId, amount: usize| {
+                        let class = ResourceClass::Ciphertext;
+                        for _ in 0..2 {
+                            let Some((owner, bytes)) = admission.reclamation(owner, class, amount)
+                            else {
+                                break;
+                            };
+                            cache.reclaim(
+                                class,
+                                owner.as_ref(),
+                                bytes,
+                                |cache| admission.excess(cache, class),
+                                |_, _| 0,
+                                |_, _| 0,
+                            );
+                        }
+                    };
+                    let receive = |reclaim: Option<&crate::peer::transport::Reclaim<'_>>| {
+                        crate::peer::transport::reserve_ciphertext(
+                            &admission,
+                            reclaim,
+                            &id("a"),
+                            CIPHER,
+                        )
+                    };
+                    // Without reclamation the full share rejects the receive.
+                    assert_eq!(receive(None).err(), Some(Error::Overloaded));
+                    // Readers hold every entry: nothing is evicted.
+                    let readers: Vec<_> = pages
+                        .iter()
+                        .map(|page| cache.ciphertext(page).unwrap().unwrap())
+                        .collect();
+                    assert_eq!(receive(Some(&reclaim)).err(), Some(Error::Overloaded));
+                    assert_eq!(resident(&cache, "a"), 4);
+                    assert_eq!(admission.used(ResourceClass::Ciphertext), 4 * CIPHER);
+                    // Idle entries yield to the in-flight receive.
+                    drop(readers);
+                    let charge = receive(Some(&reclaim)).unwrap();
+                    assert_eq!(charge.amount(), CIPHER);
+                    assert!(resident(&cache, "a") < 4);
+                    assert!(admission.used(ResourceClass::Ciphertext) <= 4 * CIPHER);
+                    assert_lanes(&cache);
+                }
+
                 #[test]
                 fn global_reclaim_prefers_over_share_cache_after_live_reweight() {
                     let env = racer_io::Env::host();
