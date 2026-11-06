@@ -80,6 +80,14 @@ func (r *MachineOperationReconciler) Reconcile(ctx context.Context, req ctrl.Req
 		return ctrl.Result{}, client.IgnoreNotFound(err)
 	}
 
+	// HostAllocate and HostRelease act on a MachineAllocation, not on an
+	// existing host. This controller never executes, fails or deletes them,
+	// even when a provider registers the kind.
+	if op.Spec.OperationKind.IsAllocationOperation() {
+		logger.V(1).Info("ignoring allocation operation", "operation", op.Name, "operationKind", op.Spec.OperationKind)
+		return ctrl.Result{}, nil
+	}
+
 	if op.Status.IsTerminal() {
 		return r.reconcileTerminal(ctx, &op)
 	}
@@ -383,8 +391,10 @@ func shouldExecuteOperation(op *unboundedv1alpha3.MachineOperation, operation *p
 // execute operation. HostSoftReboot is executed by the in-host agent, so a
 // provider that does not register it must ignore rather than fail it. Host
 // operations do not wait for a HostSoftReboot; the agent waits for them.
+// HostAllocate and HostRelease act on a MachineAllocation, not on an existing
+// host, so they are not host operations here.
 func isHostOperation(operation unboundedv1alpha3.OperationKind) bool {
-	if operation == unboundedv1alpha3.OperationHostSoftReboot {
+	if operation == unboundedv1alpha3.OperationHostSoftReboot || operation.IsAllocationOperation() {
 		return false
 	}
 
@@ -427,6 +437,10 @@ func (r *MachineOperationReconciler) SetupWithManager(mgr ctrl.Manager) error {
 }
 
 func shouldReconcileOperation(op *unboundedv1alpha3.MachineOperation) bool {
+	if op.Spec.OperationKind.IsAllocationOperation() {
+		return false
+	}
+
 	if !op.Status.IsTerminal() {
 		return true
 	}

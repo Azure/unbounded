@@ -659,6 +659,65 @@ func TestReconcilerIgnoresHostOSReboot(t *testing.T) {
 	require.Empty(t, updated.Status.Phase)
 }
 
+func TestReconcilerIgnoresAllocationOperations(t *testing.T) {
+	t.Parallel()
+
+	for _, kind := range []v1alpha3.OperationKind{v1alpha3.OperationHostAllocate, v1alpha3.OperationHostRelease} {
+		t.Run(string(kind), func(t *testing.T) {
+			t.Parallel()
+
+			require.False(t, isHostOperation(kind))
+
+			ttl := int32(0)
+			completedAt := metav1.NewTime(fixedNow().Add(-time.Minute))
+			newAllocationOperation := func(name string) *v1alpha3.MachineOperation {
+				op := testOperation(name, kind)
+				op.Spec.MachineRef = "machine-1"
+				op.Spec.AllocationRef = &v1alpha3.UIDReference{Name: "alloc-1", UID: "alloc-1-uid"}
+
+				return op
+			}
+
+			pending := newAllocationOperation("op-pending")
+			require.False(t, shouldReconcile(pending), "non-terminal")
+
+			terminal := newAllocationOperation("op-terminal")
+			terminal.Spec.TTLSecondsAfterFinished = &ttl
+			terminal.Status.Phase = v1alpha3.OperationPhaseComplete
+			terminal.Status.CompletedAt = &completedAt
+			require.False(t, shouldReconcile(terminal), "terminal with ttl")
+
+			s := testScheme(t)
+			machine := testBareMetalMachine("machine-1", "rack-a")
+			c := fake.NewClientBuilder().
+				WithScheme(s).
+				WithObjects(machine, pending, terminal, testRedfishSecret()).
+				WithStatusSubresource(pending, terminal).
+				Build()
+			power := &recordingPowerClient{}
+			reconciler := testReconciler(c, power, "rack-a")
+
+			result, err := reconciler.Reconcile(context.Background(), ctrl.Request{NamespacedName: types.NamespacedName{Name: pending.Name}})
+			require.NoError(t, err)
+			require.Equal(t, ctrl.Result{}, result)
+			require.Empty(t, power.calls)
+
+			var updated v1alpha3.MachineOperation
+			require.NoError(t, c.Get(context.Background(), client.ObjectKey{Name: pending.Name}, &updated))
+			require.Equal(t, v1alpha3.MachineOperationStatus{}, updated.Status)
+
+			result, err = reconciler.Reconcile(context.Background(), ctrl.Request{NamespacedName: types.NamespacedName{Name: terminal.Name}})
+			require.NoError(t, err)
+			require.Equal(t, ctrl.Result{}, result)
+			require.Empty(t, power.calls)
+
+			var kept v1alpha3.MachineOperation
+			require.NoError(t, c.Get(context.Background(), client.ObjectKey{Name: terminal.Name}, &kept))
+			require.Equal(t, v1alpha3.OperationPhaseComplete, kept.Status.Phase)
+		})
+	}
+}
+
 func TestReconcilerRequestsHostReplaceOnceAndCompletesAfterRepave(t *testing.T) {
 	t.Parallel()
 

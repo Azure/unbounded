@@ -151,6 +151,10 @@ func (r *Reconciler) operationsForMachine(ctx context.Context, obj client.Object
 }
 
 func shouldReconcile(op *v1alpha3.MachineOperation) bool {
+	if op.Spec.OperationKind.IsAllocationOperation() {
+		return false
+	}
+
 	if isHostOperation(op.Spec.OperationKind) {
 		return true
 	}
@@ -162,6 +166,13 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 	var op v1alpha3.MachineOperation
 	if err := r.reader().Get(ctx, client.ObjectKey{Name: req.Name}, &op); err != nil {
 		return ctrl.Result{}, client.IgnoreNotFound(err)
+	}
+
+	// HostAllocate and HostRelease act on a MachineAllocation. Metalman never
+	// executes or deletes them.
+	if op.Spec.OperationKind.IsAllocationOperation() {
+		slog.DebugContext(ctx, "ignoring allocation operation", "machineOperation", op.Name, "operationKind", op.Spec.OperationKind)
+		return ctrl.Result{}, nil
 	}
 
 	handled, failedCleanup, cleanupErr := r.reconcileMediaCleanup(ctx, &op)

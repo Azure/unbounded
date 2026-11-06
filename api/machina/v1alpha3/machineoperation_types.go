@@ -26,12 +26,21 @@ func init() {
 // +kubebuilder:printcolumn:name="Operation",type="string",JSONPath=".spec.operationKind"
 // +kubebuilder:printcolumn:name="Phase",type="string",JSONPath=".status.phase"
 // +kubebuilder:printcolumn:name="Age",type="date",JSONPath=".metadata.creationTimestamp"
+// The allocation transition and status rules sit on the root, not on spec or
+// status, because a rule on a child node is skipped when an update drops that
+// whole node.
+// +kubebuilder:validation:XValidation:rule="!has(oldSelf.spec) || !has(oldSelf.spec.allocationRef) || (has(self.spec) && self.spec == oldSelf.spec)",message="spec is immutable for HostAllocate and HostRelease",fieldPath=".spec"
+// +kubebuilder:validation:XValidation:rule="(has(oldSelf.spec) && has(oldSelf.spec.allocationRef)) || !has(self.spec) || !has(self.spec.allocationRef)",message="allocationRef cannot be added after creation",fieldPath=".spec.allocationRef"
+// +kubebuilder:validation:XValidation:rule="!has(oldSelf.status) || !has(oldSelf.status.allocation) || (has(self.status) && has(self.status.allocation) && self.status.allocation == oldSelf.status.allocation)",message="allocation is immutable once set",fieldPath=".status.allocation"
+// +kubebuilder:validation:XValidation:rule="!has(self.status) || !has(self.status.allocation) || (has(self.spec) && self.spec.operationKind == 'HostAllocate')",message="allocation is allowed only for HostAllocate",fieldPath=".status.allocation"
 
 // MachineOperation represents a discrete operation to be performed on a
 // Machine. MachineOperations are created by CLI commands or controllers and
 // processed by the appropriate agent. The in-VM agent handles operations
 // like NodeReboot and HostSoftReboot, while cloud or PXE controllers handle
 // operations like HostHardReboot, HostPowerOff, and HostPowerOn.
+// HostAllocate and HostRelease act on a MachineAllocation, and neither the
+// agent nor the cloud or PXE controllers process them.
 type MachineOperation struct {
 	metav1.TypeMeta   `json:",inline"`
 	metav1.ObjectMeta `json:"metadata,omitempty"`
@@ -52,7 +61,7 @@ type MachineOperationList struct {
 // OperationKind identifies the kind of operation to perform. Predefined
 // operations cover common lifecycle actions; custom operations may be
 // supported by individual cloud controllers.
-// +kubebuilder:validation:Enum=NodeReboot;AgentUpgrade;AgentReset;HostHardReboot;HostSoftReboot;HostPowerOff;HostPowerOn;HostReplace
+// +kubebuilder:validation:Enum=NodeReboot;AgentUpgrade;AgentReset;HostHardReboot;HostSoftReboot;HostPowerOff;HostPowerOn;HostReplace;HostAllocate;HostRelease
 type OperationKind string
 
 const (
@@ -91,7 +100,24 @@ const (
 	// OperationHostReplace replaces the host VM through an out-of-band provider
 	// and reinstalls the unbounded-agent so the node can rejoin the cluster.
 	OperationHostReplace OperationKind = "HostReplace"
+
+	// OperationHostAllocate launches the host for the MachineAllocation named
+	// by spec.allocationRef. The shared machine-ops controller, metalman and
+	// the agent do not process it.
+	OperationHostAllocate OperationKind = "HostAllocate"
+
+	// OperationHostRelease releases the host for the MachineAllocation named
+	// by spec.allocationRef and the provider resources the allocation owns.
+	// The shared machine-ops controller, metalman and the agent do not
+	// process it.
+	OperationHostRelease OperationKind = "HostRelease"
 )
+
+// IsAllocationOperation reports whether k acts on a MachineAllocation rather
+// than on an existing host. It is true only for HostAllocate and HostRelease.
+func (k OperationKind) IsAllocationOperation() bool {
+	return k == OperationHostAllocate || k == OperationHostRelease
+}
 
 // OperationPhase represents the current phase of a MachineOperation.
 type OperationPhase string
@@ -215,11 +241,22 @@ type ProviderMachineSnapshot struct {
 }
 
 // MachineOperationSpec defines the desired state of a MachineOperation.
+// +kubebuilder:validation:XValidation:rule="!(self.operationKind in ['HostAllocate', 'HostRelease']) || has(self.allocationRef)",message="allocationRef is required for HostAllocate and HostRelease"
+// +kubebuilder:validation:XValidation:rule="!has(self.allocationRef) || self.operationKind in ['HostAllocate', 'HostRelease']",message="allocationRef is allowed only for HostAllocate and HostRelease"
+// +kubebuilder:validation:XValidation:rule="!(self.operationKind in ['HostAllocate', 'HostRelease']) || (has(self.machineRef) && self.machineRef != \"\")",message="machineRef is required for HostAllocate and HostRelease"
+// +kubebuilder:validation:XValidation:rule="!(self.operationKind in ['HostAllocate', 'HostRelease']) || !has(self.machineSelector)",message="machineSelector is not allowed for HostAllocate and HostRelease"
+// +kubebuilder:validation:XValidation:rule="!(self.operationKind in ['HostAllocate', 'HostRelease']) || !has(self.ttlSecondsAfterFinished)",message="ttlSecondsAfterFinished is not allowed for HostAllocate and HostRelease"
 type MachineOperationSpec struct {
 	// MachineRef is the name of the Machine CR this operation targets.
 	// Either machineRef or machineSelector must be set.
 	// +optional
 	MachineRef string `json:"machineRef,omitempty"`
+
+	// AllocationRef identifies the MachineAllocation incarnation that a
+	// HostAllocate or HostRelease acts on. It is required for those kinds,
+	// forbidden for all others, and immutable.
+	// +optional
+	AllocationRef *UIDReference `json:"allocationRef,omitempty"`
 
 	// MachineSelector selects machines by labels. When set, the
 	// controller creates individual MachineOperation children for
@@ -284,10 +321,43 @@ type MachineOperationStatus struct {
 	// +listMapKey=machineRef
 	Targets []MachineOperationTargetStatus `json:"targets,omitempty"`
 
+	// Allocation is the provider's result for a HostAllocate. It is accepted
+	// only on HostAllocate and cannot change or be removed once set.
+	// +optional
+	Allocation *MachineOperationAllocationResult `json:"allocation,omitempty"`
+
 	// Conditions represent the latest available observations of the
 	// operation's state.
 	// +optional
 	Conditions []metav1.Condition `json:"conditions,omitempty"`
+}
+
+// MachineOperationAllocationResult is the provider's result for a
+// HostAllocate. Field names match MachineAllocationStatus.
+type MachineOperationAllocationResult struct {
+	// ProviderResourceID is the provider-native host identifier.
+	// +optional
+	ProviderResourceID string `json:"providerResourceID,omitempty"`
+
+	// InstanceType is the launched instance type.
+	// +optional
+	InstanceType string `json:"instanceType,omitempty"`
+
+	// Zone is the launched zone.
+	// +optional
+	Zone string `json:"zone,omitempty"`
+
+	// Image is the launched host image.
+	// +optional
+	Image string `json:"image,omitempty"`
+
+	// OwnedResources are the provider resources confirmed as created for the
+	// allocation, with provider-native identity. A failed allocation may still
+	// report them.
+	// +optional
+	// +listType=map
+	// +listMapKey=id
+	OwnedResources []ProviderOwnedResource `json:"ownedResources,omitempty"`
 }
 
 // MachineOperationTargetStatus records execution state for one target Machine.

@@ -40,6 +40,8 @@ spec:
           processed by the appropriate agent. The in-VM agent handles operations
           like NodeReboot and HostSoftReboot, while cloud or PXE controllers handle
           operations like HostHardReboot, HostPowerOff, and HostPowerOn.
+          HostAllocate and HostRelease act on a MachineAllocation, and neither the
+          agent nor the cloud or PXE controllers process them.
         properties:
           apiVersion:
             description: |-
@@ -61,6 +63,24 @@ spec:
           spec:
             description: MachineOperationSpec defines the desired state of a MachineOperation.
             properties:
+              allocationRef:
+                description: |-
+                  AllocationRef identifies the MachineAllocation incarnation that a
+                  HostAllocate or HostRelease acts on. It is required for those kinds,
+                  forbidden for all others, and immutable.
+                properties:
+                  name:
+                    description: Name is the object name.
+                    minLength: 1
+                    type: string
+                  uid:
+                    description: UID is the object UID.
+                    minLength: 1
+                    type: string
+                required:
+                - name
+                - uid
+                type: object
               machineRef:
                 description: |-
                   MachineRef is the name of the Machine CR this operation targets.
@@ -128,6 +148,8 @@ spec:
                 - HostPowerOff
                 - HostPowerOn
                 - HostReplace
+                - HostAllocate
+                - HostRelease
                 type: string
               parameters:
                 additionalProperties:
@@ -151,9 +173,71 @@ spec:
             required:
             - operationKind
             type: object
+            x-kubernetes-validations:
+            - message: allocationRef is required for HostAllocate and HostRelease
+              rule: '!(self.operationKind in [''HostAllocate'', ''HostRelease''])
+                || has(self.allocationRef)'
+            - message: allocationRef is allowed only for HostAllocate and HostRelease
+              rule: '!has(self.allocationRef) || self.operationKind in [''HostAllocate'',
+                ''HostRelease'']'
+            - message: machineRef is required for HostAllocate and HostRelease
+              rule: '!(self.operationKind in [''HostAllocate'', ''HostRelease''])
+                || (has(self.machineRef) && self.machineRef != "")'
+            - message: machineSelector is not allowed for HostAllocate and HostRelease
+              rule: '!(self.operationKind in [''HostAllocate'', ''HostRelease''])
+                || !has(self.machineSelector)'
+            - message: ttlSecondsAfterFinished is not allowed for HostAllocate and
+                HostRelease
+              rule: '!(self.operationKind in [''HostAllocate'', ''HostRelease''])
+                || !has(self.ttlSecondsAfterFinished)'
           status:
             description: MachineOperationStatus defines the observed state of a MachineOperation.
             properties:
+              allocation:
+                description: |-
+                  Allocation is the provider's result for a HostAllocate. It is accepted
+                  only on HostAllocate and cannot change or be removed once set.
+                properties:
+                  image:
+                    description: Image is the launched host image.
+                    type: string
+                  instanceType:
+                    description: InstanceType is the launched instance type.
+                    type: string
+                  ownedResources:
+                    description: |-
+                      OwnedResources are the provider resources confirmed as created for the
+                      allocation, with provider-native identity. A failed allocation may still
+                      report them.
+                    items:
+                      description: ProviderOwnedResource is a provider resource owned
+                        by one allocation.
+                      properties:
+                        id:
+                          description: ID is the provider resource identifier.
+                          minLength: 1
+                          type: string
+                        nativeID:
+                          description: |-
+                            NativeID is the provider-assigned instance identity. A resource
+                            recreated under the same ID has a different NativeID.
+                          minLength: 1
+                          type: string
+                      required:
+                      - id
+                      - nativeID
+                      type: object
+                    type: array
+                    x-kubernetes-list-map-keys:
+                    - id
+                    x-kubernetes-list-type: map
+                  providerResourceID:
+                    description: ProviderResourceID is the provider-native host identifier.
+                    type: string
+                  zone:
+                    description: Zone is the launched zone.
+                    type: string
+                type: object
               completedAt:
                 description: |-
                   CompletedAt is when the operation reached a terminal state
@@ -721,6 +805,23 @@ spec:
                 x-kubernetes-list-type: map
             type: object
         type: object
+        x-kubernetes-validations:
+        - fieldPath: .spec
+          message: spec is immutable for HostAllocate and HostRelease
+          rule: '!has(oldSelf.spec) || !has(oldSelf.spec.allocationRef) || (has(self.spec)
+            && self.spec == oldSelf.spec)'
+        - fieldPath: .spec.allocationRef
+          message: allocationRef cannot be added after creation
+          rule: (has(oldSelf.spec) && has(oldSelf.spec.allocationRef)) || !has(self.spec)
+            || !has(self.spec.allocationRef)
+        - fieldPath: .status.allocation
+          message: allocation is immutable once set
+          rule: '!has(oldSelf.status) || !has(oldSelf.status.allocation) || (has(self.status)
+            && has(self.status.allocation) && self.status.allocation == oldSelf.status.allocation)'
+        - fieldPath: .status.allocation
+          message: allocation is allowed only for HostAllocate
+          rule: '!has(self.status) || !has(self.status.allocation) || (has(self.spec)
+            && self.spec.operationKind == ''HostAllocate'')'
     served: true
     storage: true
     subresources:

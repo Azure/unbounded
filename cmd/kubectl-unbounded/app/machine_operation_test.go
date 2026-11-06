@@ -248,6 +248,40 @@ func TestMachineOperationCreateRejectsRemovedKinds(t *testing.T) {
 	}
 }
 
+func TestMachineOperationCreateRejectsAllocationKinds(t *testing.T) {
+	t.Parallel()
+
+	for _, kind := range []v1alpha3.OperationKind{v1alpha3.OperationHostAllocate, v1alpha3.OperationHostRelease} {
+		t.Run(string(kind), func(t *testing.T) {
+			t.Parallel()
+
+			require.False(t, isSupportedOperationKind(kind))
+
+			out, err := executeMachineOperationCreateCommand(
+				t,
+				"allocate-worker-01",
+				"--kind", string(kind),
+				"--machine", "worker-01",
+				"--dry-run=client",
+			)
+
+			require.Error(t, err)
+			require.Contains(t, err.Error(), `unsupported operation kind "`+string(kind)+`"`)
+			require.Empty(t, out)
+
+			cmd := newMachineOperationCreateCommand(&machineCommandRuntime{})
+			require.NotContains(t, cmd.Flags().Lookup("kind").Usage, string(kind))
+
+			complete, ok := cmd.GetFlagCompletionFunc("kind")
+			require.True(t, ok)
+
+			completions, _ := complete(cmd, nil, "")
+			require.NotEmpty(t, completions)
+			require.NotContains(t, completions, string(kind))
+		})
+	}
+}
+
 func TestMachineHostRebootCommandNames(t *testing.T) {
 	t.Parallel()
 
