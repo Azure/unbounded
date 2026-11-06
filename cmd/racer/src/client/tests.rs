@@ -1235,14 +1235,21 @@ fn client_listener_readiness_recovers_from_queue_pressure() {
     );
 }
 
-fn sleep_until(deadline: Instant) {
-    std::thread::sleep(deadline.saturating_duration_since(Instant::now()));
+/// A kernel-backed environment whose monotonic clock only moves when the test
+/// advances it, so request-timeout tests do not race scheduler delays.
+fn frozen_env() -> (racer_io::Env, racer_io::ctx::VirtualClock) {
+    let clock = racer_io::ctx::VirtualClock::new();
+    let env = racer_io::Env::new(
+        racer_io::ring::Driver::Uring,
+        racer_io::WorkerCtx::simulated(&clock, 0, 0),
+    );
+    (env, clock)
 }
 
 #[test]
 fn configured_timeout_bounds_idle_partial_headers_and_keepalive() {
-    let env = racer_io::Env::host();
     for mode in ["idle", "partial", "keepalive"] {
+        let (env, clock) = frozen_env();
         let mut fixture = Fixture::new(&env);
         assert_eq!(fixture.listeners.request_timeout(), Duration::from_secs(30));
         let timeout = Duration::from_millis(200);
@@ -1264,16 +1271,16 @@ fn configured_timeout_bounds_idle_partial_headers_and_keepalive() {
         assert_no_head(&mut socket);
         // Make progress inside the header budget, then cross its original
         // deadline before a renewed budget could expire.
-        let started = Instant::now();
+        let started = clock.now();
         if mode == "partial" {
-            sleep_until(started + timeout / 2);
+            clock.advance_to(started + timeout / 2).unwrap();
             socket.write_all(b"HEAD /v1/objects/").unwrap();
             for _ in 0..16 {
                 fixture.pump(16);
             }
             assert_no_head(&mut socket);
         }
-        sleep_until(started + timeout + Duration::from_millis(20));
+        clock.advance_to(started + timeout).unwrap();
         // The expired budget closes the connection, but under load its timer
         // and close completions can take more than a fixed number of pumps to
         // be reaped. Wait for the close itself, bounded by wall-clock time.
@@ -1299,7 +1306,7 @@ fn configured_timeout_bounds_idle_partial_headers_and_keepalive() {
 
 #[test]
 fn configured_timeout_starts_fresh_operations_after_headers_and_on_reuse() {
-    let env = racer_io::Env::host();
+    let (env, clock) = frozen_env();
     let mut fixture = Fixture::new(&env);
     let timeout = Duration::from_millis(500);
     fixture.listeners = fixture.listeners.with_request_timeout(timeout);
@@ -1317,16 +1324,15 @@ fn configured_timeout_starts_fresh_operations_after_headers_and_on_reuse() {
         fixture.pump(16);
     }
     assert!(fixture.listeners.read_scopes.borrow().is_empty());
-    std::thread::sleep(Duration::from_millis(100));
-    let before = Instant::now();
+    clock.advance(Duration::from_millis(100)).unwrap();
+    let before = clock.now();
     socket.write_all(b"\r\n").unwrap();
     for _ in 0..16 {
         fixture.pump(16);
     }
     let first = fixture.listeners.read_scopes.borrow()[0].clone();
     fixture.wait_for_origin(RequestKind::Head, 1);
-    assert!(first.deadline.0 >= before + timeout);
-    assert!(first.deadline.0 <= Instant::now() + timeout);
+    assert_eq!(first.deadline.0, before + timeout);
     fixture
         .worker
         .as_ref()
@@ -1344,6 +1350,9 @@ fn configured_timeout_starts_fresh_operations_after_headers_and_on_reuse() {
         .unwrap()
         .origin
         .block(RequestKind::Head);
+    // Reuse the connection later so a fresh operation budget is observable.
+    clock.advance(Duration::from_millis(100)).unwrap();
+    let reused = clock.now();
     socket.write_all(&head).unwrap();
     for _ in 0..16 {
         fixture.pump(16);
@@ -1351,9 +1360,10 @@ fn configured_timeout_starts_fresh_operations_after_headers_and_on_reuse() {
     let second = fixture.listeners.read_scopes.borrow()[1].clone();
     fixture.wait_for_origin(RequestKind::Head, 2);
     assert_ne!(first.request, second.request);
+    assert_eq!(second.deadline.0, reused + timeout);
     assert!(second.deadline.0 > first.deadline.0);
     assert_no_head(&mut socket);
-    sleep_until(second.deadline.0 + Duration::from_millis(20));
+    clock.advance_to(second.deadline.0).unwrap();
     let output = fixture.receive(&mut socket, true);
     assert!(output.starts_with(b"HTTP/1.1 503 "), "{output:?}");
     assert!(output.ends_with(b"\r\n\r\n"));
@@ -1794,7 +1804,7 @@ fn assert_only_idle_pipes(fixture: &Fixture, pipes: &flow_control::PipePool<Admi
 
 #[test]
 fn configured_timeout_is_not_renewed_by_response_or_stream_progress() {
-    let env = racer_io::Env::host();
+    let (env, clock) = frozen_env();
     let (mut fixture, _pipes) = body_fixture_with_large_page(&env, 16, false, true);
     let timeout = Duration::from_millis(800);
     fixture.listeners = fixture.listeners.with_request_timeout(timeout);
@@ -1817,7 +1827,7 @@ fn configured_timeout_is_not_renewed_by_response_or_stream_progress() {
     let scope = fixture.listeners.read_scopes.borrow()[0].clone();
     // Consume part of the total budget before committing response headers.
     fixture.wait_for_origin(RequestKind::Head, 1);
-    sleep_until(scope.deadline.0 - timeout / 2);
+    clock.advance_to(scope.deadline.0 - timeout / 2).unwrap();
     fixture
         .worker
         .as_ref()
@@ -1833,6 +1843,7 @@ fn configured_timeout_is_not_renewed_by_response_or_stream_progress() {
         + 4;
     let mut bytes = [0; 8192];
     // Keep making observable body progress without draining the whole page.
+    let stalled = Instant::now() + Duration::from_secs(10);
     for _ in 0..4 {
         loop {
             fixture.pump(16);
@@ -1842,7 +1853,8 @@ fn configured_timeout_is_not_renewed_by_response_or_stream_progress() {
                     break;
                 }
                 Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                    assert!(Instant::now() < scope.deadline.0);
+                    assert!(clock.now() < scope.deadline.0);
+                    assert!(Instant::now() < stalled, "no streaming progress");
                 }
                 result => panic!("expected streaming progress: {result:?}"),
             }
@@ -1850,7 +1862,9 @@ fn configured_timeout_is_not_renewed_by_response_or_stream_progress() {
     }
     assert!(output.len() > head_end);
     assert_eq!(fixture.listeners.active_connections(), 1);
-    sleep_until(scope.deadline.0 + Duration::from_millis(20));
+    clock
+        .advance_to(scope.deadline.0 + Duration::from_millis(20))
+        .unwrap();
     for _ in 0..64 {
         fixture.pump(16);
     }
@@ -2051,8 +2065,8 @@ fn actual_uds_first_page_failure_is_complete_503() {
 
 #[test]
 fn actual_uds_waiting_deadline_and_cache_shutdown_release_all_leases() {
-    let env = racer_io::Env::host();
     for cancel in [false, true] {
+        let (env, clock) = frozen_env();
         let (mut fixture, pipes) = body_fixture(&env, 16, false);
         fixture.listeners = fixture
             .listeners
@@ -2064,7 +2078,7 @@ fn actual_uds_waiting_deadline_and_cache_shutdown_release_all_leases() {
         if cancel {
             fixture.listeners.cancel_cache(&definition().id).unwrap();
         } else {
-            std::thread::sleep(Duration::from_millis(220));
+            clock.advance(Duration::from_millis(200)).unwrap();
         }
         let output = fixture.receive(&mut socket, true);
         assert!(output.starts_with(b"HTTP/1.1 503 "), "{output:?}");
