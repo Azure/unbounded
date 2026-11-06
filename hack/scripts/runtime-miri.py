@@ -39,29 +39,29 @@ GROUPS = {
         "xthread::mailbox::tests::credits_wake_waiters_and_senders_notify_from_other_threads",
         "xthread::mailbox::tests::many_producers_deliver_every_call",
     ]),
-    "offload": ("racer", [
-        "rt::offload::tests::admission_raw_waker_and_scope_destructors_reenter_without_borrows",
-        "rt::offload::tests::registry_raw_waker_clone_drop_and_wake_allow_mutating_reentry",
-        "rt::offload::tests::client_completion_callbacks_can_receive_and_poll_reentrantly",
-        "rt::offload::tests::duplicate_registration_and_delivery_preserve_first_owner_and_stale_guard_is_inert",
-        "rt::offload::tests::result_destructors_can_reenter_delivery_registry",
-        "rt::offload::tests::success_and_failure_keep_credit_through_consumption",
-        "rt::offload::tests::accepted_registration_drop_fences_until_reap_and_completed_drop_reclaims",
-        "rt::offload::tests::worker_loss_fences_queued_but_not_executing_owners",
+    "offload": ("racer-io", [
+        "xthread::offload::tests::admission_raw_waker_and_scope_destructors_reenter_without_borrows",
+        "xthread::offload::tests::registry_raw_waker_clone_drop_and_wake_allow_mutating_reentry",
+        "xthread::offload::tests::client_completion_callbacks_can_receive_and_poll_reentrantly",
+        "xthread::offload::tests::duplicate_registration_and_delivery_preserve_first_owner_and_stale_guard_is_inert",
+        "xthread::offload::tests::result_destructors_can_reenter_delivery_registry",
+        "xthread::offload::tests::success_and_failure_keep_credit_through_consumption",
+        "xthread::offload::tests::accepted_registration_drop_fences_until_reap_and_completed_drop_reclaims",
+        "xthread::offload::tests::worker_loss_fences_queued_but_not_executing_owners",
     ]),
     "scheduler": ("racer", [
-        "rt::drivers::tests::budget_backlog_wakes_outer_owner_and_nested_poll_cannot_replace_it",
-        "rt::drivers::tests::replacing_owner_drops_waker_outside_queue_borrows",
-        "rt::drivers::tests::blocked_driver_is_not_repolled_until_its_own_wake",
-        "rt::drivers::tests::owned_operation_progresses_after_request_receiver_disappears",
-        "rt::drivers::tests::recursive_poll_defers_children_and_crash_preserves_unused_permits",
+        "drivers::tests::budget_backlog_wakes_outer_owner_and_nested_poll_cannot_replace_it",
+        "drivers::tests::replacing_owner_drops_waker_outside_queue_borrows",
+        "drivers::tests::blocked_driver_is_not_repolled_until_its_own_wake",
+        "drivers::tests::owned_operation_progresses_after_request_receiver_disappears",
+        "drivers::tests::recursive_poll_defers_children_and_crash_preserves_unused_permits",
     ]),
     "memory": ("racer-io", [
         "ring::owner::tests::inline_and_boxed_owners_round_trip_and_drop_once",
         "ring::owner::tests::overaligned_owners_are_boxed",
     ]),
-    "rt-memory": ("racer", [
-        "rt::filesystem::memory_tests::shared_allocation_preserves_cursor_and_fails_oversized",
+    "rt-memory": ("racer-io", [
+        "scoped::fs::memory_tests::shared_allocation_preserves_cursor_and_fails_oversized",
     ]),
 }
 
