@@ -341,10 +341,7 @@ pub mod metrics {
     use std::{
         fmt,
         marker::PhantomData,
-        sync::{
-            Arc,
-            atomic::{AtomicU64, Ordering},
-        },
+        sync::atomic::{AtomicU64, Ordering},
     };
 
     /// A fixed, dense metric enumeration. `ALL` must contain each metric exactly
@@ -381,9 +378,16 @@ pub mod metrics {
     /// store: clones retain their shard and may be moved to helper threads,
     /// and [`Metrics::add_on`] writes an arbitrary shard, so a shard is not
     /// guaranteed to have exactly one writer thread.
+    ///
+    /// The registry is allocated once by [`Metrics::shards`] and intentionally
+    /// leaked, so handles and leases hold a `&'static` reference instead of an
+    /// `Arc`. This keeps per-request lease acquire and release free of a shared
+    /// reference-count update, which would otherwise make every worker write
+    /// the same cache line. Create registries once per process (tests aside);
+    /// each call leaks one fixed-size allocation.
     #[derive(Clone)]
     pub struct Metrics<C: Metric, G: Metric> {
-        registry: Arc<Registry>,
+        registry: &'static Registry,
 
         shard: usize,
 
@@ -394,9 +398,7 @@ pub mod metrics {
     /// This owner cannot be cloned, so one acquisition has exactly one release.
     #[must_use = "dropping the lease immediately releases its gauge unit"]
     pub struct Lease {
-        registry: Arc<Registry>,
-
-        index: usize,
+        slot: &'static AtomicU64,
     }
 
     /// A fixed gauge schema with one numeric label. Names must be trusted valid
@@ -452,7 +454,7 @@ pub mod metrics {
     /// so a per-request owner needs no other registry handle.
     #[must_use = "dropping the lease immediately releases its gauge unit"]
     pub struct LocalLease<C: Metric> {
-        registry: Arc<Registry>,
+        registry: &'static Registry,
 
         shard: usize,
 
@@ -497,7 +499,7 @@ pub mod metrics {
             assert!(n >= 1, "at least one metrics shard is required");
             let stride = C::ALL.len().div_ceil(8);
             let gauge_stride = G::ALL.len().div_ceil(8);
-            let registry = Arc::new(Registry {
+            let registry: &'static Registry = Box::leak(Box::new(Registry {
                 counters: (0..stride.checked_mul(n).expect("metrics capacity overflow"))
                     .map(|_| CounterBlock::default())
                     .collect(),
@@ -510,10 +512,10 @@ pub mod metrics {
                     .map(|_| CounterBlock::default())
                     .collect(),
                 gauge_stride,
-            });
+            }));
             (0..n)
                 .map(|shard| Self {
-                    registry: registry.clone(),
+                    registry,
                     shard,
                     kinds: PhantomData,
                 })
@@ -582,7 +584,7 @@ pub mod metrics {
                 })
                 .ok()?;
             Some(LocalLease {
-                registry: self.registry.clone(),
+                registry: self.registry,
                 shard: self.shard,
                 index,
                 kinds: PhantomData,
@@ -606,17 +608,16 @@ pub mod metrics {
         /// Increment a gauge unless full; release exactly one unit when dropped.
         /// Do not replace a leased gauge's value while leases are outstanding.
         pub fn lease(&self, metric: G) -> Option<Lease> {
-            let index = metric.index();
-            self.registry.gauges[index]
-                .0
-                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |old| {
-                    old.checked_add(1)
-                })
-                .ok()?;
-            Some(Lease {
-                registry: self.registry.clone(),
-                index,
-            })
+            Lease::acquire(&self.registry.gauges[metric.index()].0)
+        }
+
+        /// Like [`Metrics::lease`], but count the unit on this handle's shard
+        /// contribution as [`Metrics::lease_local`] does, so concurrent workers
+        /// touch separate cache lines. The returned [`Lease`] may be dropped on
+        /// any thread; it releases the same shard slot it incremented. Do not
+        /// mix with [`Metrics::set`] on the same gauge.
+        pub fn lease_shard(&self, metric: G) -> Option<Lease> {
+            Lease::acquire(self.registry.local_gauge(self.shard, metric.index()))
         }
 
         /// Stream relaxed per-series observations, not a coherent worker snapshot.
@@ -646,12 +647,21 @@ pub mod metrics {
         }
     }
 
+    impl Lease {
+        /// Increment `slot` unless full and own exactly one unit of it.
+        fn acquire(slot: &'static AtomicU64) -> Option<Self> {
+            slot.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |old| {
+                old.checked_add(1)
+            })
+            .ok()?;
+            Some(Self { slot })
+        }
+    }
+
     impl Drop for Lease {
-        /// Release this acquisition against its retained registry.
+        /// Release this acquisition against the slot it incremented.
         fn drop(&mut self) {
-            self.registry.gauges[self.index]
-                .0
-                .fetch_sub(1, Ordering::Relaxed);
+            self.slot.fetch_sub(1, Ordering::Relaxed);
         }
     }
 
@@ -944,7 +954,7 @@ pub mod metrics {
             for (index, worker) in workers.iter().enumerate() {
                 let clone = worker.clone();
                 assert_eq!(clone.shard, index);
-                assert!(Arc::ptr_eq(&clone.registry, &workers[0].registry));
+                assert!(std::ptr::eq(clone.registry, workers[0].registry));
                 for event in EVENTS {
                     clone.add(event, (index + 1) as u64);
                     assert_eq!(
@@ -977,7 +987,7 @@ pub mod metrics {
             workers[1].increase(Level::Active, 3);
             assert_eq!(workers[0].gauge(Level::Active), 1);
             let lease = workers[0].lease(Level::Active).unwrap();
-            let registry = lease.registry.clone();
+            let registry = workers[0].registry;
             drop(workers);
             drop(lease);
             assert_eq!(registry.gauges[0].0.load(Ordering::Relaxed), 1);
@@ -994,7 +1004,7 @@ pub mod metrics {
             let third = workers[2].lease_local(Level::Active).unwrap();
             assert_eq!(workers[0].gauge(Level::Active), 3);
             assert_eq!(workers[0].gauge(Level::Other), 4);
-            let registry = &workers[0].registry;
+            let registry = workers[0].registry;
             assert_eq!(registry.local_gauge(2, 0).load(Ordering::Relaxed), 2);
             assert_eq!(registry.gauges[0].0.load(Ordering::Relaxed), 0);
             second.add(Event::B, 5);
@@ -1004,7 +1014,7 @@ pub mod metrics {
             drop(workers);
             drop(third);
             let reader = TestMetrics {
-                registry: first.registry.clone(),
+                registry: first.registry,
                 shard: 0,
                 kinds: PhantomData,
             };
@@ -1015,12 +1025,34 @@ pub mod metrics {
             assert!(reader.lease_local(Level::Active).is_none());
         }
 
+        /// Shard leases count on their own shard slot, never the shared gauge,
+        /// and release that slot from any thread.
+        #[test]
+        fn shard_leases_use_the_local_slot() {
+            let workers = TestMetrics::shards(2);
+            let first = workers[1].lease_shard(Level::Active).unwrap();
+            let second = workers[1].lease_shard(Level::Active).unwrap();
+            let registry = workers[0].registry;
+            assert_eq!(registry.local_gauge(1, 0).load(Ordering::Relaxed), 2);
+            assert_eq!(registry.local_gauge(0, 0).load(Ordering::Relaxed), 0);
+            assert_eq!(registry.gauges[0].0.load(Ordering::Relaxed), 0);
+            assert_eq!(workers[0].gauge(Level::Active), 2);
+            std::thread::spawn(move || drop(second)).join().unwrap();
+            drop(workers);
+            drop(first);
+            assert_eq!(registry.local_gauge(1, 0).load(Ordering::Relaxed), 0);
+            let full = TestMetrics::shards(1).pop().unwrap();
+            full.set_local(Level::Active, u64::MAX);
+            assert!(full.lease_shard(Level::Active).is_none());
+            assert_eq!(full.gauge(Level::Active), u64::MAX);
+        }
+
         /// Shared-shard writers may race scrapes without losing updates or leases.
         #[test]
         fn concurrent_shared_shard_writers_and_scrapes() {
             let workers = TestMetrics::shards(2);
             let reader = workers[0].clone();
-            let barrier = Arc::new(std::sync::Barrier::new(5));
+            let barrier = std::sync::Arc::new(std::sync::Barrier::new(5));
             std::thread::scope(|scope| {
                 for worker in workers.iter().chain(workers.iter()) {
                     let worker = worker.clone();
