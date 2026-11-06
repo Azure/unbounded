@@ -181,9 +181,7 @@ fn tls_fixture(trailing: bool) {
         ControlTransport::new(testing::config(format!("https://127.0.0.1:{port}"), trust));
     transport.attach_io(Rc::new(FixtureIo::default()));
     let scope = testing::scope();
-    let run = |future: Operation<'_, racer::control::rest::Response, Error>| {
-        futures::executor::block_on(future)
-    };
+    let run = |future: Operation<'_, racer::control::rest::Response, Error>| testing::drive(future);
     let first = run(Box::pin(async {
         let connection = transport.bootstrap(&scope).await?;
         connection

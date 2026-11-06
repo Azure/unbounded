@@ -146,9 +146,26 @@ impl<C: Context> HttpIo<C> {
                     }
                 }
             }
+            let closing = plan.close || eof || plan.framing == small::Framing::Close;
+            if !closing {
+                // Plaintext already queued past the framed body is pipelining
+                // even when it arrived in a later record than the body.
+                let mut probe = [0u8; 1];
+                match connection.socket().try_recv(&mut probe) {
+                    Ok(0) => connection.poison(),
+                    Ok(_) => {
+                        probe.zeroize();
+                        connection.poison();
+                        return Err(crate::Error::Malformed.into());
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
+                    // For example a kernel TLS control record; never reuse.
+                    Err(_) => connection.poison(),
+                }
+            }
             connection.mark_small_complete();
             connection.finish_exchange()?;
-            if plan.close || eof || plan.framing == small::Framing::Close {
+            if closing {
                 connection.poison();
             }
             Ok(Exchanged {

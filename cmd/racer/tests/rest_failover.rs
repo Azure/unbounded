@@ -229,7 +229,7 @@ fn get(
     bearer: Option<&str>,
 ) -> testing::Result<(u16, Vec<u8>)> {
     let scope = testing::scope();
-    futures::executor::block_on(async {
+    testing::drive(async {
         let connection = match identity {
             Some(identity) => transport.authenticated(identity, &scope).await?,
             None => transport.bootstrap(&scope).await?,

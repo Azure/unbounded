@@ -24,6 +24,12 @@ use std::{
 pub enum Error {
     /// A generic transport failure.
     Transport(RestError),
+
+    /// A reactor failure retained for transport classification.
+    Runtime(racer_io::Error),
+
+    /// An HTTP framing failure retained for transport classification.
+    Http(http1::Error),
 }
 
 impl Error {
@@ -77,9 +83,53 @@ impl Scope for TestScope {
 }
 
 impl From<racer_io::Error> for Error {
-    /// Preserve the original fixture's runtime-to-I/O error mapping.
-    fn from(_: racer_io::Error) -> Self {
-        Self::IO
+    /// Keep runtime failures distinct so the transport can classify them.
+    fn from(error: racer_io::Error) -> Self {
+        Self::Runtime(error)
+    }
+}
+
+impl From<http1::Error> for Error {
+    /// Keep framing failures distinct so the transport can classify them.
+    fn from(error: http1::Error) -> Self {
+        Self::Http(error)
+    }
+}
+
+/// The fixture reactor shared by every fixture owner on a thread.
+pub struct FixtureReactor(racer_io::scoped::Reactor<TestScope>);
+
+impl std::ops::Deref for FixtureReactor {
+    type Target = racer_io::scoped::Reactor<TestScope>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+thread_local! {
+    /// One host reactor per test thread, driven by [`drive`].
+    static REACTOR: Rc<FixtureReactor> = {
+        let reactor = racer_io::scoped::Reactor::new(256, &racer_io::Env::host());
+        reactor.init().unwrap();
+        Rc::new(FixtureReactor(reactor))
+    };
+}
+
+/// Run `future` to completion while driving this thread's fixture reactor.
+pub fn drive<T>(future: impl std::future::Future<Output = T>) -> T {
+    use std::task::{Context, Poll, Waker};
+    let reactor = REACTOR.with(Clone::clone);
+    let mut future = std::pin::pin!(future);
+    let mut cx = Context::from_waker(Waker::noop());
+    let watchdog = Instant::now() + Duration::from_secs(60);
+    loop {
+        if let Poll::Ready(value) = future.as_mut().poll(&mut cx) {
+            return value;
+        }
+        assert!(Instant::now() < watchdog, "fixture watchdog");
+        reactor.poll_budgeted(64).unwrap();
+        reactor.wait(Duration::from_millis(1)).unwrap();
     }
 }
 
@@ -89,16 +139,29 @@ pub fn scope() -> TestScope {
 }
 
 /// Blocking poll is confined to loopback tests; no io_uring or Racer dependency.
-pub struct FixtureIo(pub racer_io::WorkerCtx);
+pub struct FixtureIo(pub racer_io::WorkerCtx, Rc<FixtureReactor>);
 
 impl Default for FixtureIo {
-    /// Host clock and operating-system entropy.
+    /// Host clock and operating-system entropy on this thread's reactor.
     fn default() -> Self {
-        Self(racer_io::WorkerCtx::host())
+        Self(racer_io::WorkerCtx::host(), REACTOR.with(Clone::clone))
     }
 }
 
 impl Io for FixtureIo {
+    type Reactor = FixtureReactor;
+
+    type Charge = ();
+
+    fn reactor(&self) -> Rc<FixtureReactor> {
+        self.1.clone()
+    }
+
+    /// Loopback fixtures need no buffer admission.
+    fn charge(&self, _: usize) -> Result<()> {
+        Ok(())
+    }
+
     fn ctx(&self) -> &racer_io::WorkerCtx {
         &self.0
     }
@@ -520,7 +583,7 @@ pub fn rotation_request(
     identity: Option<&TestIdentity>,
 ) -> Result<Vec<u8>> {
     let scope = scope();
-    futures::executor::block_on(async {
+    drive(async {
         let connection = if let Some(identity) = identity {
             transport.authenticated(identity, &scope).await?
         } else {

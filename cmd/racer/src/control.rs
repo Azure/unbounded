@@ -46,9 +46,7 @@ use std::cell::RefCell;
 use std::ffi::CString;
 use std::net::SocketAddr;
 #[cfg(test)]
-use std::os::fd::AsRawFd;
 #[cfg(test)]
-use std::os::fd::FromRawFd;
 #[cfg(test)]
 use std::path::Path;
 use std::path::PathBuf;
@@ -446,6 +444,21 @@ impl secure::Host for ReactorControlIo {
 }
 
 impl rest::Io for ReactorControlIo {
+    type Reactor = crate::runtime::Reactor;
+
+    type Charge = flow_control::Charge<crate::admission::AdmissionPolicy>;
+
+    fn reactor(&self) -> Rc<crate::runtime::Reactor> {
+        self.reactor.clone()
+    }
+
+    fn charge(&self, bytes: usize) -> Result<Self::Charge> {
+        self.reactor
+            .admission()
+            .reserve(None, crate::admission::ResourceClass::RequestContext, bytes)
+            .map_err(Into::into)
+    }
+
     fn ctx(&self) -> &racer_io::WorkerCtx {
         self.reactor.ctx()
     }
@@ -463,9 +476,15 @@ impl rest::Io for ReactorControlIo {
     type Lease = crate::admission::ConnectionReservation;
 
     fn lease(&self) -> Result<Option<Rc<Self::Lease>>> {
-        self.reactor
-            .reserve_connection(crate::admission::ResourceClass::ControlConnection)
-            .map(|lease| Some(Rc::new(lease)))
+        let lease = Rc::new(
+            self.reactor
+                .reserve_connection(crate::admission::ResourceClass::ControlConnection)?,
+        );
+        #[cfg(test)]
+        if let Some(probe) = &self.connect_probe {
+            probe.observe(&lease);
+        }
+        Ok(Some(lease))
     }
 
     fn ready<'a>(
@@ -477,18 +496,6 @@ impl rest::Io for ReactorControlIo {
         scope: &'a RequestScope,
     ) -> Operation<'a, ()> {
         Box::pin(async move {
-            #[cfg(test)]
-            if let Some(probe) = &self.connect_probe
-                && probe.suppress(&fd, read, write, &lease, scope)?
-            {
-                let mut wait = scope.clone();
-                if probe.mode == "parent" {
-                    wait.deadline.0 = probe.parent_deadline;
-                }
-                return self
-                    .sleep(wait.deadline.0 + std::time::Duration::from_millis(1), &wait)
-                    .await;
-            }
             let interest =
                 if read { libc::POLLIN } else { 0 } | if write { libc::POLLOUT } else { 0 };
             self.reactor
@@ -1599,7 +1606,6 @@ pub(crate) mod tests {
 
         use super::*;
         use crate::test_support::enrollment as testing;
-        use std::cell::Cell;
         use std::cell::RefCell;
         use std::io::Read;
         use std::io::Write;
@@ -1733,58 +1739,30 @@ pub(crate) mod tests {
             (endpoint, server)
         }
 
-        /// Observe and suppress first-writable readiness on the real reactor adapter.
+        /// Count connection attempts through the real adapter's admission hook.
         pub(crate) struct ConnectProbe {
-            calls: Cell<usize>,
-
-            held: RefCell<Option<std::rc::Weak<Descriptor>>>,
-
             leases: RefCell<Vec<std::rc::Weak<crate::admission::ConnectionReservation>>>,
 
             pub(crate) addresses: [SocketAddr; 2],
-
-            pub(crate) mode: &'static str,
-
-            pub(crate) parent_deadline: Instant,
         }
 
         impl ConnectProbe {
-            /// Hold the first connect attempt and observe later address fallback.
-            pub(crate) fn suppress(
-                &self,
-                fd: &Rc<Descriptor>,
-                read: bool,
-                write: bool,
-                lease: &Option<Rc<crate::admission::ConnectionReservation>>,
-                scope: &RequestScope,
-            ) -> Result<bool> {
-                self.leases
-                    .borrow_mut()
-                    .push(Rc::downgrade(lease.as_ref().expect("admission lease")));
-                if !read && write {
-                    let call = self.calls.get();
-                    self.calls.set(call + 1);
-                    if call == 0 {
-                        *self.held.borrow_mut() = Some(Rc::downgrade(fd));
-                        assert!(scope.deadline.0 < self.parent_deadline);
-                        if self.mode == "cancel" {
-                            scope.cancel()?;
-                        }
-                        // Suppress a real socket's writable notification, not Simulation::connect.
-                        return Ok(true);
-                    }
-                    // Inspect the actual OS socket at the public readiness boundary.
-                    let raw = unsafe { libc::dup(fd.as_raw_fd()) };
-                    assert!(raw >= 0);
-                    let socket = unsafe { std::net::TcpStream::from_raw_fd(raw) };
-                    assert_eq!(socket.peer_addr().unwrap(), self.addresses[1]);
-                }
-                Ok(false)
+            /// Record one connection attempt's admission slot.
+            pub(crate) fn observe(&self, lease: &Rc<crate::admission::ConnectionReservation>) {
+                self.leases.borrow_mut().push(Rc::downgrade(lease));
+            }
+
+            /// Connection attempts admitted so far.
+            fn calls(&self) -> usize {
+                self.leases.borrow().len()
             }
         }
 
+        /// A first address that accepts TCP but never answers TLS gets only its
+        /// share of the deadline; the next address then connects, and
+        /// cancellation or overall expiry ends the attempt with every socket closed.
         #[test]
-        fn real_connect_readiness_blackhole_yields_to_next_address_and_cleans_fds() {
+        fn real_connect_blackhole_yields_to_next_address_and_cleans_fds() {
             use std::task::Context;
             use std::task::Poll;
             let env = racer_io::Env::host();
@@ -1800,6 +1778,9 @@ pub(crate) mod tests {
                 let first = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
                 let healthy = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
                 let addresses = [first.local_addr().unwrap(), healthy.local_addr().unwrap()];
+                // Outside "local" the second listener stays open but silent,
+                // so both addresses hang until the caller's deadline.
+                let silent = healthy.try_clone().unwrap();
                 let server = (mode == "local").then(|| {
                     std::thread::spawn(move || {
                         let mut socket = accept(&healthy);
@@ -1820,18 +1801,15 @@ pub(crate) mod tests {
                         assert_disconnected(&mut socket);
                     })
                 });
+                let started = Instant::now();
                 let scope = RequestScope::host(
                     crate::model::RequestId([7; 16]),
-                    Instant::now() + Duration::from_millis(300),
+                    started + Duration::from_millis(400),
                 )
                 .unwrap();
                 let io = Rc::new(ConnectProbe {
-                    calls: Cell::new(0),
-                    held: RefCell::new(None),
                     leases: RefCell::new(Vec::new()),
                     addresses,
-                    mode,
-                    parent_deadline: scope.deadline.0,
                 });
                 let transport = session::transport(&ControlEndpoint {
                     url: "https://localhost".into(),
@@ -1849,6 +1827,9 @@ pub(crate) mod tests {
                         break result;
                     }
                     assert!(Instant::now() < watchdog);
+                    if mode == "cancel" && Instant::now() >= started + Duration::from_millis(50) {
+                        let _ = scope.cancel();
+                    }
                     reactor.poll_budgeted(64).unwrap();
                     reactor.wait(Duration::from_millis(1)).unwrap();
                 };
@@ -1856,29 +1837,34 @@ pub(crate) mod tests {
                 match mode {
                     "local" => {
                         let connection = result.unwrap();
-                        assert_eq!(io.calls.get(), 2);
+                        assert_eq!(io.calls(), 2);
                         assert!(
                             Instant::now() < scope.deadline.0,
                             "TLS retains overall budget"
                         );
                         drop(connection);
                     }
-                    "cancel" => assert!(matches!(result, Err(Error::Cancelled))),
-                    _ => assert!(matches!(result, Err(Error::DeadlineExceeded))),
+                    "cancel" => {
+                        assert!(matches!(result, Err(Error::Cancelled)));
+                        assert_eq!(io.calls(), 1);
+                    }
+                    _ => {
+                        assert!(
+                            matches!(result, Err(Error::DeadlineExceeded)),
+                            "{:?}",
+                            result.as_ref().err()
+                        );
+                        assert_eq!(io.calls(), 2);
+                    }
                 }
-                if mode != "local" {
-                    assert_eq!(io.calls.get(), 1);
-                }
-                assert!(io.held.borrow().as_ref().unwrap().upgrade().is_none());
+                transport.close_idle();
                 let mut closed = accept(&first);
                 closed
                     .set_read_timeout(Some(Duration::from_secs(1)))
                     .unwrap();
-                assert_eq!(
-                    closed.read(&mut [0; 1]).unwrap(),
-                    0,
-                    "both failed socket FDs closed"
-                );
+                let mut byte = [0; 1];
+                // The client may have sent its TLS hello before closing.
+                while closed.read(&mut byte).unwrap() != 0 {}
                 assert_eq!(reactor.in_flight(), 0);
                 assert!(
                     io.leases
@@ -1889,6 +1875,7 @@ pub(crate) mod tests {
                 if let Some(server) = server {
                     server.join().unwrap();
                 }
+                drop(silent);
             }
         }
         fn enrolled(

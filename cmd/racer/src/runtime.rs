@@ -393,7 +393,7 @@ impl Deref for Reactor {
     }
 }
 impl Reactor {
-    #[cfg(test)]
+    /// The worker's admission quotas.
     pub(crate) fn admission(&self) -> &Rc<flow_control::Quotas<AdmissionPolicy>> {
         &self.admission
     }

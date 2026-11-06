@@ -1,13 +1,11 @@
-//! Bounded TLS 1.3 JSON HTTP on caller-owned readiness, deadlines, and leases.
+//! Bounded TLS 1.3 JSON HTTP over the shared http1 connection pool.
 //!
-//! Connections and the single idle slot stay on their I/O owner's thread. TLS
+//! Connections and their pool stay on their I/O owner's thread. TLS
 //! authenticates peers; endpoint health and identity admission belong to callers.
 
 use std::{
     cell::RefCell,
-    io::{Read, Write},
-    net::{SocketAddr, TcpStream},
-    os::fd::FromRawFd,
+    net::SocketAddr,
     path::{Path, PathBuf},
     rc::Rc,
     sync::Arc,
@@ -17,6 +15,8 @@ use std::{
 /// Owner-local future carrying the caller's transport error type.
 pub use racer_io::Operation;
 
+use http1::connection::{self as pool, HttpIo, HttpPool};
+use http1::tls::TlsClient;
 use racer_io::{Scope as _, ring::Descriptor};
 use racer_wire::http::{self, small};
 use zeroize::Zeroize as _;
@@ -66,7 +66,13 @@ pub trait Scope: racer_io::Scope {
 /// including cancellation cleanup. Futures run on the caller's sole I/O owner.
 pub trait Io: 'static {
     /// Caller errors preserve cancellation and transport failure classification.
-    type Error: Copy + Send + PartialEq + From<Error> + From<racer_io::Error> + 'static;
+    type Error: Copy
+        + Send
+        + PartialEq
+        + From<Error>
+        + From<racer_io::Error>
+        + From<http1::Error>
+        + 'static;
 
     /// Caller policy governing each I/O operation.
     type Scope: Scope<Error = Self::Error>;
@@ -76,6 +82,18 @@ pub trait Io: 'static {
 
     /// Caller-owned sensitive bytes, retaining any read admission charge.
     type FileBytes: AsRef<[u8]>;
+
+    /// Reactor that runs pooled connection I/O on this owner.
+    type Reactor: std::ops::Deref<Target = racer_io::scoped::Reactor<Self::Scope>> + 'static;
+
+    /// Admission charge for buffers owned by pooled connection I/O.
+    type Charge: 'static;
+
+    /// The owner's reactor.
+    fn reactor(&self) -> Rc<Self::Reactor>;
+
+    /// Admit `bytes` of connection buffer storage.
+    fn charge(&self, bytes: usize) -> Result<Self::Charge, Self::Error>;
 
     /// Worker clock and entropy for every transport decision on this owner.
     fn ctx(&self) -> &racer_io::WorkerCtx;
@@ -177,25 +195,161 @@ pub struct Request<'a> {
     pub limit: usize,
 }
 
-/// Owner-local HTTPS transport with at most one idle authenticated connection.
+/// Owner-local HTTPS transport over the shared http1 connection pool.
+///
+/// Authenticated connections idle in the pool between requests; this
+/// transport tracks their identity epoch and lifetime and decides reuse.
 pub struct Transport<I: Io + ?Sized> {
     /// Endpoint and byte limits retained across owner attachment.
     config: Config,
 
-    /// Attached readiness owner; never shared across threads.
-    io: RefCell<Option<Rc<I>>>,
+    /// Attached readiness owner and its pool; never shared across threads.
+    attached: RefCell<Option<Attached<I>>>,
 
-    /// Single authenticated connection available for exclusive checkout.
-    idle: Rc<RefCell<Option<Connection<I>>>>,
+    /// Authenticated connections currently idle in the attached pool.
+    idle: Rc<RefCell<Vec<Pooled>>>,
 
-    /// Only the current attachment keeps its recycling authorization alive.
-    owner: RefCell<Rc<()>>,
+    /// Process-unique pool generation; replacing it fences every connection
+    /// checked out or idle under the previous value.
+    generation: Rc<std::cell::Cell<u64>>,
 
     /// Discovered endpoints replacing the static URL and trust file when set.
     discovered: RefCell<Option<DiscoveredEndpoints>>,
 
     /// Discovered seat ranking hints shared with checked-out connections.
     health: Rc<std::cell::Cell<Health>>,
+}
+
+/// One owner attachment: the owner, its pool, and its exchange I/O.
+struct Attached<I: Io + ?Sized> {
+    io: Rc<I>,
+
+    pool: Rc<HttpPool<PoolContext<I>>>,
+
+    http: Rc<HttpIo<PoolContext<I>>>,
+}
+
+impl<I: Io + ?Sized> Clone for Attached<I> {
+    fn clone(&self) -> Self {
+        Self {
+            io: self.io.clone(),
+            pool: self.pool.clone(),
+            http: self.http.clone(),
+        }
+    }
+}
+
+/// Source of process-unique pool generations.
+static NEXT_GENERATION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+/// Allocate a generation never used by any transport in this process.
+fn next_generation() -> u64 {
+    NEXT_GENERATION.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Active connections allowed per address and trust epoch.
+const POOL_PER_ENDPOINT: usize = 4;
+
+/// Idle connections are reused only within this window.
+const IDLE_REUSE: Duration = Duration::from_secs(20);
+
+/// The http1 caller context for one transport attachment.
+pub struct PoolContext<I: Io + ?Sized>(Rc<I>);
+
+impl<I: Io + ?Sized> pool::Context for PoolContext<I> {
+    type Error = I::Error;
+
+    type Scope = I::Scope;
+
+    type Reactor = I::Reactor;
+
+    type Charge = I::Charge;
+
+    type Slot = Option<Rc<I::Lease>>;
+
+    type Opaque = ();
+
+    type State = ();
+
+    type Endpoint = PoolKey;
+
+    fn charge(&self, bytes: usize) -> Result<I::Charge, I::Error> {
+        self.0.charge(bytes)
+    }
+
+    fn outbound_slot(&self) -> Result<Option<Rc<I::Lease>>, I::Error> {
+        self.0.lease()
+    }
+
+    fn stopped(&self) -> bool {
+        false
+    }
+}
+
+/// Pool identity: address, TLS policy, trust epoch, and transport generation.
+///
+/// Connections are shared only between checkouts with the same address,
+/// epoch, and generation; the TLS policy is derived from the epoch.
+#[derive(Clone)]
+pub struct PoolKey {
+    address: SocketAddr,
+
+    tls: TlsClient,
+
+    epoch: [u8; 32],
+
+    generation: u64,
+}
+
+impl PoolKey {
+    fn order(&self) -> (u64, [u8; 32], SocketAddr) {
+        (self.generation, self.epoch, self.address)
+    }
+}
+
+impl PartialEq for PoolKey {
+    fn eq(&self, other: &Self) -> bool {
+        self.order() == other.order()
+    }
+}
+
+impl Eq for PoolKey {}
+
+impl PartialOrd for PoolKey {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for PoolKey {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.order().cmp(&other.order())
+    }
+}
+
+impl<E> pool::Endpoint<E> for PoolKey {
+    fn address(&self) -> Result<racer_io::ring::SocketAddress, E> {
+        Ok(racer_io::ring::SocketAddress::Inet(self.address))
+    }
+
+    fn tls(&self) -> Option<&TlsClient> {
+        Some(&self.tls)
+    }
+}
+
+/// An authenticated connection idle in the pool, with its reuse policy.
+struct Pooled {
+    /// Socket identity of the idle lease; dead once the pool closes it.
+    socket: std::rc::Weak<Descriptor>,
+
+    /// Pool key that returns this connection.
+    key: PoolKey,
+
+    /// Identity lifetime and redistribution age.
+    auth: Authenticated,
+
+    /// Host header authority for requests on this connection.
+    host: String,
 }
 
 /// Ranking hints for discovered seats. Both values are endpoint epochs.
@@ -250,26 +404,35 @@ impl Route {
 
 /// An exclusive TLS connection, consumed by one request before possible reuse.
 pub struct Connection<I: Io + ?Sized> {
-    /// Socket resources stay together until request or readiness cleanup finishes.
-    socket: Connected<I>,
+    /// Pooled socket, admission slot, and record layer.
+    lease: pool::ConnectionLease<PoolContext<I>>,
 
-    /// Exclusive TLS state for this connection.
-    tls: rustls::ClientConnection,
+    /// Owner and pool retained even if the transport attaches a new one.
+    attached: Attached<I>,
 
     /// Readiness owner retained even if the transport attaches a new one.
     io: Rc<I>,
+
+    /// Pool key used to return this connection.
+    key: PoolKey,
 
     /// Original endpoint authority used for the HTTP Host header.
     host: String,
 
     /// Bootstrap or authenticated pooling and lifetime policy.
-    authentication: Authentication<I>,
+    authentication: Authentication,
 
     /// Maximum response body size for statuses other than 200.
     max_error_body: usize,
 
     /// Discovered seat, if any, ranked by this connection's outcome.
     route: Option<Route>,
+
+    /// Non-owning destination for successful connection recycling.
+    idle: std::rc::Weak<RefCell<Vec<Pooled>>>,
+
+    /// Current generation of the transport that opened this connection.
+    generation: std::rc::Weak<std::cell::Cell<u64>>,
 }
 
 /// A framed JSON response whose body is erased when it is dropped.
@@ -285,27 +448,22 @@ pub struct Response {
 }
 
 /// Bootstrap connections cannot carry authenticated pooling metadata.
-enum Authentication<I: Io + ?Sized> {
-    /// Server-authenticated TLS without a client identity or pool destination.
+enum Authentication {
+    /// Server-authenticated TLS without a client identity; never reused.
     Bootstrap,
 
-    /// Client-authenticated TLS with its identity lifetime and pool destination.
-    Authenticated(Authenticated<I>),
+    /// Client-authenticated TLS with its identity lifetime.
+    Authenticated(Authenticated),
 }
 
 /// Identity lifetime and trust epoch required for authenticated reuse.
-struct Authenticated<I: Io + ?Sized> {
+#[derive(Clone, Copy)]
+struct Authenticated {
     /// Wall-clock identity deadline checked during active I/O.
     expires: SystemTime,
 
     /// Trust and certificate-chain fingerprint used at checkout.
     epoch: [u8; 32],
-
-    /// Non-owning destination for successful connection recycling.
-    idle: std::rc::Weak<RefCell<Option<Connection<I>>>>,
-
-    /// Invalidated on owner replacement, including while connect is awaiting I/O.
-    owner: std::rc::Weak<()>,
 
     /// Monotonic start of the current idle interval.
     idle_since: Instant,
@@ -325,47 +483,9 @@ fn authenticated_age(random: u64) -> Duration {
     AUTHENTICATED_AGE_MIN + Duration::from_millis(random % (AUTHENTICATED_AGE_JITTER_MS + 1))
 }
 
-/// A real or simulated nonblocking byte stream owned by this I/O thread.
-enum Stream {
-    /// Kernel TCP stream with readiness tracked by a separate descriptor.
-    Real(TcpStream),
-
-    /// Simulated TCP stream and readiness share one owner-local descriptor.
-    Sim(Rc<Descriptor>),
-}
-
-impl Read for Stream {
-    /// Read without waiting; the reactor handles readiness separately.
-    fn read(&mut self, bytes: &mut [u8]) -> std::io::Result<usize> {
-        match self {
-            Self::Real(stream) => stream.read(bytes),
-            Self::Sim(fd) => fd.try_recv(bytes),
-        }
-    }
-}
-
-impl Write for Stream {
-    /// Write without waiting; the reactor handles readiness separately.
-    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
-        match self {
-            Self::Real(stream) => stream.write(bytes),
-            Self::Sim(fd) => fd.try_send(bytes),
-        }
-    }
-
-    /// Flush the underlying stream, which has no simulation-side buffer.
-    fn flush(&mut self) -> std::io::Result<()> {
-        match self {
-            Self::Real(stream) => stream.flush(),
-            Self::Sim(_) => Ok(()),
-        }
-    }
-}
-
 impl Drop for Response {
     /// Erase response plaintext before releasing its allocation.
     fn drop(&mut self) {
-        use zeroize::Zeroize;
         self.body.zeroize();
     }
 }
@@ -432,9 +552,9 @@ impl<I: Io + ?Sized> Transport<I> {
     pub fn new(config: Config) -> Self {
         Self {
             config,
-            io: RefCell::new(None),
-            idle: Rc::new(RefCell::new(None)),
-            owner: RefCell::new(Rc::new(())),
+            attached: RefCell::new(None),
+            idle: Rc::new(RefCell::new(Vec::new())),
+            generation: Rc::new(std::cell::Cell::new(next_generation())),
             discovered: RefCell::new(None),
             health: Rc::new(std::cell::Cell::new(Health::default())),
         }
@@ -442,11 +562,10 @@ impl<I: Io + ?Sized> Transport<I> {
 
     /// Use a discovered, pinned endpoint set instead of the static URL and trust.
     ///
-    /// Replaces the owner token as well as the idle slot, so a connection
+    /// Replaces the generation as well as idle connections, so a connection
     /// checked out under the previous set can never be recycled afterward.
     pub fn set_endpoints(&self, endpoints: DiscoveredEndpoints) {
-        *self.owner.borrow_mut() = Rc::new(());
-        self.idle.borrow_mut().take();
+        self.invalidate();
         self.health.set(Health::default());
         *self.discovered.borrow_mut() = Some(endpoints);
     }
@@ -454,10 +573,10 @@ impl<I: Io + ?Sized> Transport<I> {
     /// Move the last successful discovered seat to the end of the next ranking.
     ///
     /// For failures seen above HTTP, such as a stale cursor in a 200
-    /// response. Drops the idle connection so the next request reconnects.
-    /// No effect without discovered endpoints.
+    /// response. Drops idle connections so the next request reconnects.
+    /// No effect on ranking without discovered endpoints.
     pub fn demote(&self) {
-        self.idle.borrow_mut().take();
+        self.close_idle();
         let mut health = self.health.get();
         if let Some(preferred) = health.preferred {
             health.demote(preferred);
@@ -467,22 +586,71 @@ impl<I: Io + ?Sized> Transport<I> {
 
     /// Replace the owner, discarding idle TLS and invalidating old recycling rights.
     pub fn attach_io(&self, io: Rc<I>) {
-        *self.owner.borrow_mut() = Rc::new(());
-        self.idle.borrow_mut().take();
-        *self.io.borrow_mut() = Some(io);
+        self.invalidate();
+        let context = Rc::new(PoolContext(io.clone()));
+        let reactor = io.reactor();
+        let pool = HttpPool::new(
+            reactor.clone(),
+            context.clone(),
+            pool::PoolConfig {
+                per_endpoint: POOL_PER_ENDPOINT,
+                secondary_cap: POOL_PER_ENDPOINT,
+                max_endpoints: 2 * MAX_DISCOVERED_ENDPOINTS + 64,
+                waiter_cap: 1,
+                idle_timeout: IDLE_REUSE,
+                tcp_nodelay: true,
+            },
+        );
+        let http = HttpIo::new(
+            reactor,
+            http1::Codec::new(MAX_HEAD),
+            context,
+            u64::MAX,
+            u64::MAX,
+        );
+        if let Some(old) = self.attached.borrow_mut().replace(Attached {
+            io,
+            pool: Rc::new(pool),
+            http: Rc::new(http),
+        }) {
+            old.pool.release_idle();
+        }
     }
 
     /// Retrieve the attached owner or report missing configuration.
     pub fn io(&self) -> Result<Rc<I>, I::Error> {
-        self.io
+        Ok(self.attached()?.io)
+    }
+
+    /// Retrieve the attachment or report missing configuration.
+    fn attached(&self) -> Result<Attached<I>, I::Error> {
+        self.attached
             .borrow()
             .clone()
             .ok_or_else(|| Error::InvalidConfiguration.into())
     }
 
-    /// Drop the idle connection without interrupting checked-out requests.
+    /// Drop idle connections without interrupting checked-out requests.
     pub fn close_idle(&self) {
-        self.idle.borrow_mut().take();
+        self.idle.borrow_mut().clear();
+        if let Some(attached) = &*self.attached.borrow() {
+            attached.pool.release_idle();
+        }
+    }
+
+    /// Whether any live authenticated connection is idle under this generation.
+    #[cfg(test)]
+    fn has_idle(&self) -> bool {
+        let generation = self.generation.get();
+        let mut idle = self.idle.borrow_mut();
+        idle.retain(|p| p.socket.strong_count() > 0 && p.key.generation == generation);
+        !idle.is_empty()
+    }
+
+    /// Fence every connection opened so far and release idle ones.
+    fn invalidate(&self) {
+        self.generation.set(next_generation());
+        self.close_idle();
     }
 
     /// Reread trust and reuse eligible authenticated TLS, or establish fresh TLS.
@@ -503,9 +671,10 @@ impl<I: Io + ?Sized> Transport<I> {
                 return self.connect_discovered(&discovered, identity, scope).await;
             }
             let endpoint = endpoint(&self.config.url)?;
-            let io = self.io()?;
-            let owner = Rc::downgrade(&self.owner.borrow());
-            let trust = io
+            let attached = self.attached()?;
+            let generation = self.generation.get();
+            let trust = attached
+                .io
                 .read_file(
                     &self.config.trust_bundle,
                     self.config.max_trust_bundle,
@@ -513,14 +682,14 @@ impl<I: Io + ?Sized> Transport<I> {
                 )
                 .await?;
             let epoch = trust_epoch(trust.as_ref(), identity);
-            if owner.upgrade().is_some()
-                && let Some(connection) = self.checkout(identity, &[epoch], scope)
-            {
+            if let Some(connection) = self.checkout(&attached, identity, &[epoch], scope).await {
                 return Ok(connection);
             }
             let config = tls_config(trust.as_ref(), identity)?;
-            self.handshake(io, endpoint, config, identity, epoch, owner, scope)
-                .await
+            self.handshake(
+                attached, endpoint, config, identity, epoch, generation, scope,
+            )
+            .await
         })
     }
 
@@ -543,17 +712,20 @@ impl<I: Io + ?Sized> Transport<I> {
             .take(MAX_DISCOVERED_ENDPOINTS)
             .cloned()
             .collect::<Vec<_>>();
-        let io = self.io()?;
-        let owner = Rc::downgrade(&self.owner.borrow());
+        let attached = self.attached()?;
+        let generation = self.generation.get();
         let epochs = endpoints
             .iter()
             .map(|e| discovered_epoch(e, identity))
             .collect::<Vec<_>>();
-        if owner.upgrade().is_some()
-            && let Some(connection) = self.checkout(identity, &epochs, scope)
-        {
+        if let Some(mut connection) = self.checkout(&attached, identity, &epochs, scope).await {
+            connection.route = Some(Route {
+                health: Rc::downgrade(&self.health),
+                epoch: connection.key.epoch,
+            });
             return Ok(connection);
         }
+        let io = attached.io.clone();
         let random = io.ctx().rng.next_u64().map_err(|_| Error::Io)?;
         let health = self.health.get();
         let order = rank(&epochs, health.preferred, health.avoid, random);
@@ -569,6 +741,7 @@ impl<I: Io + ?Sized> Transport<I> {
             let now = io.ctx().clock.now();
             let narrowed;
             let attempt = match scope.deadline() {
+                Some(_) if index + 1 == order.len() => scope,
                 Some(deadline) => {
                     narrowed = scope.narrowed(
                         now + deadline.saturating_duration_since(now)
@@ -580,12 +753,12 @@ impl<I: Io + ?Sized> Transport<I> {
             };
             let result = self
                 .handshake(
-                    io.clone(),
+                    attached.clone(),
                     parsed,
                     config,
                     identity,
                     epochs[*position],
-                    owner.clone(),
+                    generation,
                     attempt,
                 )
                 .await;
@@ -606,18 +779,20 @@ impl<I: Io + ?Sized> Transport<I> {
         Err(Error::Unavailable.into())
     }
 
-    /// Resolve, connect, and complete TLS before any request bytes are written.
+    /// Resolve, then connect and complete TLS through the pool, trying each
+    /// address with a share of the remaining deadline.
     #[allow(clippy::too_many_arguments)]
     async fn handshake(
         &self,
-        io: Rc<I>,
+        attached: Attached<I>,
         endpoint: Endpoint,
         config: rustls::ClientConfig,
         identity: Option<Identity<'_>>,
         epoch: [u8; 32],
-        owner: std::rc::Weak<()>,
+        generation: u64,
         scope: &I::Scope,
     ) -> Result<Connection<I>, I::Error> {
+        let io = attached.io.clone();
         let addresses = if let Ok(ip) = endpoint.host.parse() {
             vec![SocketAddr::new(ip, endpoint.port)]
         } else {
@@ -626,211 +801,209 @@ impl<I: Io + ?Sized> Transport<I> {
         if addresses.is_empty() || addresses.len() > 64 {
             return Err(Error::Unavailable.into());
         }
-        let socket = connect_addresses(io.as_ref(), &addresses, scope).await?;
-        let server = rustls::pki_types::ServerName::try_from(endpoint.host)
+        let tls = TlsClient::new(Arc::new(config), &endpoint.host)
             .map_err(|_| Error::InvalidConfiguration)?;
-        let mut tls = rustls::ClientConnection::new(Arc::new(config), server)
-            .map_err(|_| Error::Unauthorized)?;
-        tls.set_buffer_limit(Some(64 * 1024));
-        let authentication = self.authentication(io.ctx(), identity, epoch, owner)?;
-        let mut connection = Connection {
-            socket,
-            tls,
-            io,
-            host: endpoint.authority,
-            authentication,
-            max_error_body: self.config.max_error_body,
-            route: None,
-        };
-        while connection.tls.is_handshaking() {
-            connection.step(scope).await?;
-        }
-        Ok(connection)
-    }
-
-    /// Consume the idle slot even when its identity, epoch, or age is ineligible.
-    fn checkout(
-        &self,
-        identity: Option<Identity<'_>>,
-        epochs: &[[u8; 32]],
-        scope: &I::Scope,
-    ) -> Option<Connection<I>> {
-        let mut idle = self.idle.borrow_mut();
-        let connection = idle.take()?;
-        if let Authentication::Authenticated(auth) = &connection.authentication
-            && identity.is_some()
-            && epochs.contains(&auth.epoch)
-            && auth.owner.upgrade().is_some()
-            && connection.within_max_age()
-            && connection
-                .io
-                .ctx()
-                .clock
-                .now()
-                .saturating_duration_since(auth.idle_since)
-                < Duration::from_secs(20)
-            && connection.check(scope).is_ok()
-        {
-            Some(connection)
-        } else {
-            None
-        }
-    }
-
-    /// Create pooling metadata only for authenticated connections, after socket setup.
-    fn authentication(
-        &self,
-        ctx: &racer_io::WorkerCtx,
-        identity: Option<Identity<'_>>,
-        epoch: [u8; 32],
-        owner: std::rc::Weak<()>,
-    ) -> Result<Authentication<I>> {
-        let Some(identity) = identity else {
-            return Ok(Authentication::Bootstrap);
-        };
-        let random = ctx.rng.next_u64().map_err(|_| Error::Io)?;
-        let now = ctx.clock.now();
-        let retire_at = now + authenticated_age(random);
-        Ok(Authentication::Authenticated(Authenticated {
-            expires: identity.expires,
-            epoch,
-            idle: Rc::downgrade(&self.idle),
-            owner,
-            idle_since: now,
-            retire_at,
-        }))
-    }
-}
-
-/// Connected socket, readiness descriptor, and retained admission charge.
-struct Connected<I: Io + ?Sized> {
-    /// Admission charge, also retained by outstanding readiness operations.
-    charge: Option<Rc<I::Lease>>,
-
-    /// Owner-local nonblocking socket used by TLS.
-    stream: Stream,
-
-    /// Readiness registration handle for the same socket.
-    fd: Rc<Descriptor>,
-}
-
-/// Try addresses in order while reserving deadline shares for fallback and TLS.
-async fn connect_addresses<I: Io + ?Sized>(
-    io: &I,
-    addresses: &[SocketAddr],
-    scope: &I::Scope,
-) -> Result<Connected<I>, I::Error> {
-    for (index, address) in addresses.iter().enumerate() {
-        scope.check()?;
-        // Reserve a share for every remaining address and one for TLS. A local
-        // blackhole must not consume the parent's entire connection deadline.
-        let now = io.ctx().clock.now();
-        let share = scope.deadline().map_or(Duration::MAX, |deadline| {
-            deadline.saturating_duration_since(now) / (addresses.len() - index + 1) as u32
-        });
-        let attempt = scope.narrowed(now + share.min(Duration::from_secs(5)));
-        let charge = io.lease()?;
-        if let Some(sim) = io.sim() {
-            if let Ok(fd) = sim.connect(racer_io::ring::SocketAddress::Inet(*address)) {
-                let fd = Rc::new(fd);
-                return Ok(Connected {
-                    charge,
-                    stream: Stream::Sim(fd.clone()),
-                    fd,
-                });
-            }
-            continue;
-        }
-        if let Ok(stream) = connect_socket(*address) {
-            let fd = Rc::new(Descriptor::from(stream.try_clone().map_err(|_| Error::Io)?));
-            let ready = io
-                .ready(fd.clone(), false, true, charge.clone(), &attempt)
-                .await;
-            // Cancellation and overall expiry always win over local retry.
-            scope.check()?;
-            match ready {
-                Ok(()) => {}
+        let bounded = bounded_scope(io.as_ref(), identity.map(|i| i.expires), scope)?;
+        for (index, address) in addresses.iter().enumerate() {
+            bounded.check()?;
+            let key = PoolKey {
+                address: *address,
+                tls: tls.clone(),
+                epoch,
+                generation,
+            };
+            // Idle connections are adopted only through `checkout`, which
+            // applies this transport's reuse policy.
+            attached.pool.discard_idle(&key);
+            // Each remaining address gets an equal share, so one blackholed
+            // address cannot consume the parent's entire connection deadline.
+            let now = io.ctx().clock.now();
+            let attempt = match bounded.deadline() {
+                // The last address runs under the caller's own scope, so its
+                // expiry reports the caller's deadline rather than a share.
+                Some(_) if index + 1 == addresses.len() => bounded.clone(),
+                Some(deadline) => bounded.narrowed(
+                    now + deadline.saturating_duration_since(now)
+                        / (addresses.len() - index) as u32,
+                ),
+                None => bounded.clone(),
+            };
+            let result = attached.pool.checkout(&key, &attempt).await;
+            // Cancellation, identity expiry, and overall expiry always win.
+            check_identity(io.as_ref(), identity.map(|i| i.expires), scope)?;
+            bounded.check()?;
+            match result {
+                Ok(mut lease) => {
+                    if lease.reused() {
+                        // Idle connections were just discarded; never adopt
+                        // one without this transport's reuse metadata.
+                        lease.poison();
+                        continue;
+                    }
+                    let authentication = self.authentication(io.ctx(), identity, epoch)?;
+                    return Ok(Connection {
+                        lease,
+                        attached: attached.clone(),
+                        io: io.clone(),
+                        key,
+                        host: endpoint.authority,
+                        authentication,
+                        max_error_body: self.config.max_error_body,
+                        route: None,
+                        idle: Rc::downgrade(&self.idle),
+                        generation: Rc::downgrade(&self.generation),
+                    });
+                }
+                Err(error) if error == racer_io::Error::Os(libc::EPROTO).into() => {
+                    return Err(Error::Unauthorized.into());
+                }
                 Err(error)
-                    if error == racer_io::Error::DeadlineExceeded.into()
+                    if error == racer_io::Error::Unavailable.into()
+                        || error == racer_io::Error::DeadlineExceeded.into()
+                        || error == racer_io::Error::Io.into()
                         || error == Error::Io.into()
-                        || error == Error::Unavailable.into() =>
+                        || error == Error::Unavailable.into()
+                        || is_socket_error(error) =>
                 {
                     continue;
                 }
                 Err(error) => return Err(error),
             }
-            if stream.take_error().map_err(|_| Error::Io)?.is_none() {
-                return Ok(Connected {
-                    charge,
-                    stream: Stream::Real(stream),
-                    fd,
-                });
+        }
+        scope.check()?;
+        Err(Error::Unavailable.into())
+    }
+
+    /// Take an eligible idle connection for one of `epochs`, discarding any
+    /// ineligible idle connections met on the way.
+    async fn checkout(
+        &self,
+        attached: &Attached<I>,
+        identity: Option<Identity<'_>>,
+        epochs: &[[u8; 32]],
+        scope: &I::Scope,
+    ) -> Option<Connection<I>> {
+        identity?;
+        let generation = self.generation.get();
+        loop {
+            let now = attached.io.ctx().clock.now();
+            let wall = attached.io.ctx().clock.wall_now();
+            let (pooled, stale) = {
+                let mut idle = self.idle.borrow_mut();
+                idle.retain(|p| p.socket.strong_count() > 0 && p.key.generation == generation);
+                // Connections under a trust epoch no longer current are
+                // closed rather than left for a later checkout.
+                let stale = idle
+                    .extract_if(.., |p| !epochs.contains(&p.auth.epoch))
+                    .collect::<Vec<_>>();
+                (idle.pop(), stale)
+            };
+            for pooled in stale {
+                attached.pool.discard_idle(&pooled.key);
             }
+            let pooled = pooled?;
+            let eligible = now < pooled.auth.retire_at
+                && now.saturating_duration_since(pooled.auth.idle_since) < IDLE_REUSE
+                && wall < pooled.auth.expires
+                && scope.check().is_ok();
+            if !eligible {
+                attached.pool.discard_idle(&pooled.key);
+                continue;
+            }
+            let Ok(mut lease) = attached.pool.checkout(&pooled.key, scope).await else {
+                return None;
+            };
+            let same = pooled
+                .socket
+                .upgrade()
+                .is_some_and(|socket| Rc::ptr_eq(&socket, &lease.socket()));
+            if !lease.reused() || !same {
+                // The pool closed or reordered this connection; never adopt
+                // an unknown socket as authenticated reuse.
+                lease.poison();
+                attached.pool.discard_idle(&pooled.key);
+                continue;
+            }
+            return Some(Connection {
+                lease,
+                attached: attached.clone(),
+                io: attached.io.clone(),
+                host: pooled.host,
+                key: pooled.key,
+                authentication: Authentication::Authenticated(pooled.auth),
+                max_error_body: self.config.max_error_body,
+                route: None,
+                idle: Rc::downgrade(&self.idle),
+                generation: Rc::downgrade(&self.generation),
+            });
         }
     }
-    scope.check()?;
-    Err(Error::Unavailable.into())
+
+    /// Create pooling metadata only for authenticated connections.
+    fn authentication(
+        &self,
+        ctx: &racer_io::WorkerCtx,
+        identity: Option<Identity<'_>>,
+        epoch: [u8; 32],
+    ) -> Result<Authentication> {
+        let Some(identity) = identity else {
+            return Ok(Authentication::Bootstrap);
+        };
+        let random = ctx.rng.next_u64().map_err(|_| Error::Io)?;
+        let now = ctx.clock.now();
+        Ok(Authentication::Authenticated(Authenticated {
+            expires: identity.expires,
+            epoch,
+            idle_since: now,
+            retire_at: now + authenticated_age(random),
+        }))
+    }
 }
 
-/// Begin a close-on-exec, nonblocking TCP connection.
-fn connect_socket(address: SocketAddr) -> Result<TcpStream> {
-    let domain = if address.is_ipv4() {
-        libc::AF_INET
-    } else {
-        libc::AF_INET6
-    };
-    let raw = unsafe {
-        libc::socket(
-            domain,
-            libc::SOCK_STREAM | libc::SOCK_NONBLOCK | libc::SOCK_CLOEXEC,
-            0,
-        )
-    };
-    if raw < 0 {
-        return Err(Error::Io);
+/// Whether an error is an operating-system socket failure worth trying the
+/// next address for.
+fn is_socket_error<E: PartialEq + From<racer_io::Error>>(error: E) -> bool {
+    [
+        libc::ECONNREFUSED,
+        libc::ECONNRESET,
+        libc::ENETUNREACH,
+        libc::EHOSTUNREACH,
+        libc::ETIMEDOUT,
+        libc::EADDRNOTAVAIL,
+        libc::ECONNABORTED,
+        libc::EPIPE,
+    ]
+    .into_iter()
+    .any(|errno| error == racer_io::Error::Os(errno).into())
+}
+
+/// Fail with `Unauthorized` once the identity has expired.
+fn check_identity<I: Io + ?Sized>(
+    io: &I,
+    expires: Option<SystemTime>,
+    scope: &I::Scope,
+) -> Result<(), I::Error> {
+    scope.check()?;
+    if expires.is_some_and(|expires| io.ctx().clock.wall_now() >= expires) {
+        return Err(Error::Unauthorized.into());
     }
-    let stream = unsafe { TcpStream::from_raw_fd(raw) };
-    let result = match address {
-        SocketAddr::V4(a) => {
-            let addr = libc::sockaddr_in {
-                sin_family: libc::AF_INET as _,
-                sin_port: a.port().to_be(),
-                sin_addr: libc::in_addr {
-                    s_addr: u32::from_ne_bytes(a.ip().octets()),
-                },
-                sin_zero: [0; 8],
-            };
-            unsafe {
-                libc::connect(
-                    raw,
-                    (&addr as *const libc::sockaddr_in).cast(),
-                    std::mem::size_of_val(&addr) as _,
-                )
-            }
-        }
-        SocketAddr::V6(a) => {
-            let addr = libc::sockaddr_in6 {
-                sin6_family: libc::AF_INET6 as _,
-                sin6_port: a.port().to_be(),
-                sin6_flowinfo: a.flowinfo(),
-                sin6_addr: libc::in6_addr {
-                    s6_addr: a.ip().octets(),
-                },
-                sin6_scope_id: a.scope_id(),
-            };
-            unsafe {
-                libc::connect(
-                    raw,
-                    (&addr as *const libc::sockaddr_in6).cast(),
-                    std::mem::size_of_val(&addr) as _,
-                )
-            }
-        }
+    Ok(())
+}
+
+/// Limit `scope` to the identity's remaining lifetime.
+fn bounded_scope<I: Io + ?Sized>(
+    io: &I,
+    expires: Option<SystemTime>,
+    scope: &I::Scope,
+) -> Result<I::Scope, I::Error> {
+    check_identity(io, expires, scope)?;
+    let Some(expires) = expires else {
+        return Ok(scope.clone());
     };
-    if result < 0 && std::io::Error::last_os_error().raw_os_error() != Some(libc::EINPROGRESS) {
-        return Err(Error::Io);
-    }
-    Ok(stream)
+    let remaining = expires
+        .duration_since(io.ctx().clock.wall_now())
+        .map_err(|_| Error::Unauthorized)?;
+    Ok(scope.narrowed(io.ctx().clock.now() + remaining))
 }
 
 impl<I: Io + ?Sized> Connection<I> {
@@ -849,14 +1022,18 @@ impl<I: Io + ?Sized> Connection<I> {
                 body,
                 limit,
             } = request;
-            let request = request_head(&self.host, method, path, token, body.len(), header)?;
+            let head = request_head(&self.host, method, path, token, body.len(), header)?;
+            let mut wire = zeroize::Zeroizing::new(Vec::new());
+            wire.try_reserve_exact(head.len() + body.len())
+                .map_err(|_| Error::Overloaded)?;
+            wire.extend_from_slice(head.as_bytes());
+            wire.extend_from_slice(body);
+            drop(head);
             let route = self.route.take();
-            let exchange = async {
-                self.send(request.as_bytes(), body, scope).await?;
-                self.receive_response(limit, scope).await
-            };
-            let completed = match exchange.await {
-                Ok(completed) => completed,
+            let result = self.exchange(&wire, limit, scope).await;
+            drop(wire);
+            let (connection, head, body) = match result {
+                Ok(exchanged) => exchanged,
                 Err(error) => {
                     if let Some(route) = &route {
                         route.demote();
@@ -864,23 +1041,102 @@ impl<I: Io + ?Sized> Connection<I> {
                     return Err(error);
                 }
             };
+            self = connection;
             // Any non-success status, including 401, 403, and 503 from a
             // live but stale seat, moves the next attempt to another seat.
             if let Some(route) = &route {
-                if matches!(completed.head.status, 200 | 204) {
+                if matches!(head.status, 200 | 204) {
                     route.promote();
                 } else {
                     route.demote();
                 }
             }
-            self.route = route;
-            self.recycle(&completed);
+            self.recycle(&head);
             Ok(Response {
-                status: completed.head.status,
-                body: completed.body.to_vec(),
-                retry_after: completed.head.retry_after,
+                status: head.status,
+                body: body.to_vec(),
+                retry_after: head.retry_after,
             })
         })
+    }
+
+    /// Send one request and receive its framed response on this connection.
+    async fn exchange(
+        self,
+        wire: &[u8],
+        limit: usize,
+        scope: &I::Scope,
+    ) -> Result<(Self, ResponseHead, zeroize::Zeroizing<Vec<u8>>), I::Error> {
+        let Self {
+            lease,
+            attached,
+            io,
+            key,
+            host,
+            authentication,
+            max_error_body,
+            route,
+            idle,
+            generation,
+        } = self;
+        let expires = match &authentication {
+            Authentication::Authenticated(auth) => Some(auth.expires),
+            Authentication::Bootstrap => None,
+        };
+        let bounded = bounded_scope(io.as_ref(), expires, scope)?;
+        let result = {
+            let ctx = io.ctx();
+            let mut parse = |bytes: &[u8]| -> Result<_, I::Error> {
+                Ok(
+                    parse_head(bytes, limit, max_error_body, ctx.clock.wall_now())?.map(|head| {
+                        http1::small_exchange::Plan {
+                            head_length: head.header_len,
+                            framing: head.framing,
+                            limits: small::Limits {
+                                body: head.bound,
+                                line: 128,
+                                trailers: 4096,
+                            },
+                            close: head.close,
+                            body_error: |error| body_error(error).into(),
+                            value: head,
+                        }
+                    }),
+                )
+            };
+            attached
+                .http
+                .exchange_small(lease, wire, MAX_HEAD, &mut parse, &bounded)
+                .await
+        };
+        check_identity(io.as_ref(), expires, scope)?;
+        let exchanged = result.map_err(|error| {
+            if error == http1::Error::Malformed.into() {
+                Error::InvalidRequest.into()
+            } else if error == http1::Error::HeadTooLarge.into() {
+                Error::Overloaded.into()
+            } else if error == racer_io::Error::Io.into() || is_socket_error(error) {
+                Error::Io.into()
+            } else {
+                error
+            }
+        })?;
+        Ok((
+            Self {
+                lease: exchanged.connection,
+                attached,
+                io,
+                key,
+                host,
+                authentication,
+                max_error_body,
+                route,
+                idle,
+                generation,
+            },
+            exchanged.value,
+            exchanged.body,
+        ))
     }
 
     /// Check redistribution age only at request boundaries, not during I/O.
@@ -892,179 +1148,39 @@ impl<I: Io + ?Sized> Connection<I> {
     }
 
     /// Check caller cancellation first, then the authenticated identity lifetime.
+    #[cfg(test)]
     fn check(&self, scope: &I::Scope) -> Result<(), I::Error> {
-        scope.check()?;
-        if let Authentication::Authenticated(auth) = &self.authentication
-            && self.io.ctx().clock.wall_now() >= auth.expires
-        {
-            return Err(Error::Unauthorized.into());
-        }
-        Ok(())
-    }
-
-    /// Make bounded TLS progress, yielding and waiting on owner-local readiness.
-    async fn step(&mut self, scope: &I::Scope) -> Result<(), I::Error> {
-        self.check(scope)?;
-        // Even a continuously readable peer must yield to other owner work.
-        racer_io::exec::yield_now().await;
-        let mut progress = false;
-        if self.tls.wants_write() {
-            match self.tls.write_tls(&mut self.socket.stream) {
-                Ok(0) => return Err(Error::Io.into()),
-                Ok(_) => progress = true,
-                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => (),
-                Err(_) => return Err(Error::Io.into()),
-            }
-        }
-        if self.tls.wants_read() {
-            match self.tls.read_tls(&mut self.socket.stream) {
-                Ok(0) => return Err(Error::Io.into()),
-                Ok(_) => {
-                    self.tls.process_new_packets().map_err(tls_failure)?;
-                    progress = true;
-                }
-                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => (),
-                Err(_) => return Err(Error::Io.into()),
-            }
-        }
-        if !progress {
-            let mut bounded = scope.clone();
-            if let Authentication::Authenticated(auth) = &self.authentication {
-                let remaining = auth
-                    .expires
-                    .duration_since(self.io.ctx().clock.wall_now())
-                    .map_err(|_| Error::Unauthorized)?;
-                bounded = scope.narrowed(self.io.ctx().clock.now() + remaining);
-            }
-            self.io
-                .ready(
-                    self.socket.fd.clone(),
-                    self.tls.wants_read(),
-                    self.tls.wants_write(),
-                    self.socket.charge.clone(),
-                    &bounded,
-                )
-                .await?;
-        }
-        Ok(())
-    }
-
-    /// Send the already validated head and body, then flush pending TLS records.
-    async fn send(&mut self, head: &[u8], body: &[u8], scope: &I::Scope) -> Result<(), I::Error> {
-        for bytes in [head, body] {
-            let mut offset = 0;
-            while offset < bytes.len() {
-                self.check(scope)?;
-                match self.tls.writer().write(&bytes[offset..]) {
-                    Ok(n) if n != 0 => offset += n,
-                    Ok(_) => (),
-                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => (),
-                    Err(_) => return Err(Error::Io.into()),
-                }
-                self.step(scope).await?;
-            }
-        }
-        while self.tls.wants_write() {
-            self.step(scope).await?;
-        }
-        Ok(())
-    }
-
-    /// Receive one exact frame and check for plaintext left in the TLS reader.
-    async fn receive_response(
-        &mut self,
-        limit: usize,
-        scope: &I::Scope,
-    ) -> Result<CompletedResponse, I::Error> {
-        let mut received = zeroize::Zeroizing::new(Vec::new());
-        let mut scratch = zeroize::Zeroizing::new([0; 16384]);
-        let head = loop {
-            if let Some(head) = parse_head(
-                &received,
-                limit,
-                self.max_error_body,
-                self.io.ctx().clock.wall_now(),
-            )? {
-                break head;
-            }
-            if received.len() >= MAX_HEAD {
-                return Err(Error::Overloaded.into());
-            }
-            self.receive(&mut received, &mut scratch[..], scope).await?;
+        let expires = match &self.authentication {
+            Authentication::Authenticated(auth) => Some(auth.expires),
+            Authentication::Bootstrap => None,
         };
-        let mut decoder = small::Decoder::new(
-            head.framing,
-            small::Limits {
-                body: head.bound,
-                line: 128,
-                trailers: 4096,
-            },
-        )
-        .map_err(body_error)?;
-        let mut input = zeroize::Zeroizing::new(received[head.header_len..].to_vec());
-        loop {
-            match decoder.feed(&input).map_err(body_error)? {
-                // Read-ahead past one response is never pipelined by the server.
-                small::Status::Done(n) if n == input.len() => break,
-                small::Status::Done(_) => return Err(Error::InvalidRequest.into()),
-                small::Status::Need => {
-                    input.zeroize();
-                    input.clear();
-                    self.receive(&mut input, &mut scratch[..], scope).await?;
-                }
-            }
-        }
-        let body = zeroize::Zeroizing::new(decoder.into_body());
-        self.check(scope)?;
-        // A TLS record can contain more plaintext than the last bounded receive.
-        let reusable = match self.tls.reader().read(&mut scratch[..1]) {
-            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => true,
-            Ok(0) => false,
-            Ok(_) => return Err(Error::InvalidRequest.into()),
-            Err(_) => false,
-        };
-        Ok(CompletedResponse {
-            head,
-            body,
-            reusable,
-        })
+        check_identity(self.io.as_ref(), expires, scope)
     }
 
     /// Recycle only completed successful responses; failures reselect a backend.
-    fn recycle(mut self, completed: &CompletedResponse) {
+    fn recycle(mut self, head: &ResponseHead) {
         // An aged connection finishes its in-flight response, then retires.
-        if completed.reusable
-            && !completed.head.close
-            && matches!(completed.head.status, 200 | 204)
+        if self.lease.is_reusable()
+            && !head.close
+            && matches!(head.status, 200 | 204)
             && self.within_max_age()
+            && self
+                .generation
+                .upgrade()
+                .is_some_and(|current| current.get() == self.key.generation)
             && let Authentication::Authenticated(auth) = &mut self.authentication
-            && auth.owner.upgrade().is_some()
-            && let Some(idle) = auth.idle.upgrade()
+            && let Some(idle) = self.idle.upgrade()
         {
             auth.idle_since = self.io.ctx().clock.now();
-            *idle.borrow_mut() = Some(self);
+            idle.borrow_mut().push(Pooled {
+                socket: Rc::downgrade(&self.lease.socket()),
+                key: self.key.clone(),
+                auth: *auth,
+                host: self.host.clone(),
+            });
+            return;
         }
-    }
-
-    /// Append one available plaintext fragment without freeing unerased storage.
-    async fn receive(
-        &mut self,
-        into: &mut zeroize::Zeroizing<Vec<u8>>,
-        scratch: &mut [u8],
-        scope: &I::Scope,
-    ) -> Result<(), I::Error> {
-        loop {
-            self.check(scope)?;
-            match self.tls.reader().read(scratch) {
-                Ok(0) => return Err(Error::Io.into()),
-                Ok(n) => {
-                    append_sensitive(into, &scratch[..n]);
-                    return Ok(());
-                }
-                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => self.step(scope).await?,
-                Err(_) => return Err(Error::Io.into()),
-            }
-        }
+        self.lease.poison();
     }
 }
 
@@ -1119,25 +1235,6 @@ fn request_head(
     }
     request.push_str("\r\n");
     Ok(request)
-}
-
-/// Grow without freeing an allocation containing plaintext key material.
-fn append_sensitive(into: &mut zeroize::Zeroizing<Vec<u8>>, bytes: &[u8]) {
-    if into.capacity() - into.len() < bytes.len() {
-        let capacity = (into.len() + bytes.len()).max(into.capacity().saturating_mul(2));
-        let mut next = zeroize::Zeroizing::new(Vec::with_capacity(capacity));
-        next.extend_from_slice(into);
-        std::mem::swap(into, &mut next);
-    }
-    into.extend_from_slice(bytes);
-}
-
-/// Retry Go server admission saturation, but keep certificate/protocol failures terminal.
-fn tls_failure(error: rustls::Error) -> Error {
-    match error {
-        rustls::Error::AlertReceived(rustls::AlertDescription::InternalError) => Error::Unavailable,
-        _ => Error::Unauthorized,
-    }
 }
 
 /// Hash trust bytes and length-delimited certificates without copying key material.
@@ -1265,7 +1362,7 @@ fn pinned_tls_config(
     certificate: &[u8],
     identity: Option<Identity<'_>>,
 ) -> Result<rustls::ClientConfig> {
-    let provider = Arc::new(rustls::crypto::ring::default_provider());
+    let provider = Arc::new(http1::tls::kernel_provider());
     let mut roots = rustls::RootCertStore::empty();
     roots
         .add(rustls::pki_types::CertificateDer::from(
@@ -1300,16 +1397,15 @@ fn tls_config(mut trust: &[u8], identity: Option<Identity<'_>>) -> Result<rustls
     if roots.is_empty() {
         return Err(Error::Unauthorized);
     }
-    let builder = rustls::ClientConfig::builder_with_provider(Arc::new(
-        rustls::crypto::ring::default_provider(),
-    ))
-    .with_protocol_versions(&[&rustls::version::TLS13])
-    .map_err(|_| Error::Unauthorized)?
-    .with_root_certificates(roots);
+    let builder =
+        rustls::ClientConfig::builder_with_provider(Arc::new(http1::tls::kernel_provider()))
+            .with_protocol_versions(&[&rustls::version::TLS13])
+            .map_err(|_| Error::Unauthorized)?
+            .with_root_certificates(roots);
     finish_tls_config(builder, identity)
 }
 
-/// Add optional client authentication, HTTP/1.1 ALPN, and disable resumption.
+/// Add optional client authentication and the pooled-connection TLS requirements.
 fn finish_tls_config(
     builder: rustls::ConfigBuilder<rustls::ClientConfig, rustls::client::WantsClientCert>,
     identity: Option<Identity<'_>>,
@@ -1329,8 +1425,8 @@ fn finish_tls_config(
     } else {
         builder.with_no_client_auth()
     };
-    config.alpn_protocols = vec![b"http/1.1".to_vec()];
-    config.resumption = rustls::client::Resumption::disabled();
+    // Pooled connections may move their record layer into kernel TLS.
+    http1::tls::prepare_client_config(&mut config);
     Ok(config)
 }
 
@@ -1446,18 +1542,6 @@ struct ResponseHead {
 
     /// Whether any Connection header asks to close the socket.
     close: bool,
-}
-
-/// A fully received frame with no trailing plaintext, ready for reuse policy.
-struct CompletedResponse {
-    /// Validated metadata for the fully consumed frame.
-    head: ResponseHead,
-
-    /// Plaintext retained in zeroizing storage until response ownership transfers.
-    body: zeroize::Zeroizing<Vec<u8>>,
-
-    /// TLS reader reported WouldBlock rather than EOF or a read failure.
-    reusable: bool,
 }
 
 /// Map body framing failures onto transport errors: size is overload, the rest
@@ -1960,14 +2044,24 @@ mod testing;
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::{Read as _, Write as _};
     use testing::{FixtureIo, TestIdentity, TestTransport as _};
 
     /// Access authenticated metadata only inside tests that mutate pool boundaries.
-    fn authenticated(connection: &mut Connection<FixtureIo>) -> &mut Authenticated<FixtureIo> {
+    fn authenticated(connection: &mut Connection<FixtureIo>) -> &mut Authenticated {
         let Authentication::Authenticated(auth) = &mut connection.authentication else {
             panic!("expected authenticated connection");
         };
         auth
+    }
+
+    /// Access the single idle connection's reuse metadata.
+    fn idle_auth(transport: &Transport<FixtureIo>) -> std::cell::RefMut<'_, Authenticated> {
+        assert!(transport.has_idle());
+        std::cell::RefMut::map(transport.idle.borrow_mut(), |idle| {
+            assert_eq!(idle.len(), 1);
+            &mut idle[0].auth
+        })
     }
 
     /// Projected trust changes must invalidate the private idle slot before reuse.
@@ -1993,7 +2087,7 @@ mod tests {
         let transport = server.transport(trust);
         project(0, certs.roots[0].pem());
         let old = rotation_request(&transport, Some(&identity)).unwrap();
-        assert!(transport.idle.borrow().is_some());
+        assert!(transport.has_idle());
         assert_eq!(rotation_request(&transport, Some(&identity)).unwrap(), old);
         // Projected overlap accepts the live old server but discards cached TLS.
         project(
@@ -2012,7 +2106,7 @@ mod tests {
             rotation_request(&transport, Some(&identity)),
             Err(testing::Error::Transport(Error::Unauthorized))
         ));
-        assert!(transport.idle.borrow().is_none());
+        assert!(!transport.has_idle());
         server.rotate(certs.servers[2].clone());
         let current = rotation_request(&transport, Some(&identity)).unwrap();
         assert_ne!(current, overlap);
@@ -2025,7 +2119,7 @@ mod tests {
             rotation_request(&transport, Some(&identity)),
             Err(testing::Error::Transport(Error::Unauthorized))
         ));
-        assert!(transport.idle.borrow().is_none());
+        assert!(!transport.has_idle());
         // Recover through both cross certificates without reattaching transport.
         project(4, certs.roots[0].pem());
         assert!(rotation_request(&transport, Some(&identity)).is_ok());
@@ -2043,20 +2137,20 @@ mod tests {
         let server = RotationServer::new(certs.servers[0].clone());
         let transport = server.transport(trust);
         let scope = testing::scope();
-        let connection = futures::executor::block_on(transport.bootstrap(&scope)).unwrap();
+        let connection = testing::drive(transport.bootstrap(&scope)).unwrap();
         assert!(matches!(
             connection.authentication,
             Authentication::Bootstrap
         ));
-        let first = futures::executor::block_on(connection.request(
+        let first = testing::drive(connection.request(
             testing::request(Method::Get, "/snapshot", None, 1024),
             &scope,
         ))
         .unwrap();
-        assert!(transport.idle.borrow().is_none());
+        assert!(!transport.has_idle());
         let second = rotation_request(&transport, None).unwrap();
         assert_ne!(first.body, second);
-        assert!(transport.idle.borrow().is_none());
+        assert!(!transport.has_idle());
     }
 
     /// A checked-out request may finish on A but must never enter B's idle pool.
@@ -2078,25 +2172,24 @@ mod tests {
         transport.attach_io(owner_a.clone());
         let scope = testing::scope();
         let complete = |connection: Connection<FixtureIo>| {
-            futures::executor::block_on(connection.request(
+            testing::drive(connection.request(
                 testing::request(Method::Get, "/snapshot", None, 1024),
                 &scope,
             ))
             .unwrap()
         };
-        let connect =
-            || futures::executor::block_on(transport.authenticated(&identity, &scope)).unwrap();
+        let connect = || testing::drive(transport.authenticated(&identity, &scope)).unwrap();
         complete(connect());
         let old = connect();
         assert!(Rc::ptr_eq(&old.io, &owner_a));
         transport.attach_io(owner_b.clone());
         assert_eq!(complete(old).status, 200);
-        assert!(transport.idle.borrow().is_none());
+        assert!(!transport.has_idle());
         for _ in 0..2 {
             let current = connect();
             assert!(Rc::ptr_eq(&current.io, &owner_b));
             assert_eq!(complete(current).status, 200);
-            assert!(transport.idle.borrow().is_some());
+            assert!(transport.has_idle());
         }
         transport.close_idle();
         server.join().unwrap();
@@ -2139,7 +2232,7 @@ mod tests {
         transport.attach_io(Rc::new(FixtureIo::default()));
         let scope = testing::scope();
         let get = || {
-            futures::executor::block_on(async {
+            testing::drive(async {
                 transport
                     .authenticated(&identity, &scope)
                     .await
@@ -2153,18 +2246,14 @@ mod tests {
             })
         };
         assert_eq!(get().status, 200);
-        let retire_at = authenticated(transport.idle.borrow_mut().as_mut().unwrap()).retire_at;
+        let retire_at = idle_auth(&transport).retire_at;
         assert!(retire_at > Instant::now() + Duration::from_secs(239));
         assert!(retire_at <= Instant::now() + Duration::from_secs(300));
         assert_eq!(get().status, 204);
-        assert_eq!(
-            authenticated(transport.idle.borrow_mut().as_mut().unwrap()).retire_at,
-            retire_at
-        );
-        authenticated(transport.idle.borrow_mut().as_mut().unwrap()).retire_at = Instant::now();
+        assert_eq!(idle_auth(&transport).retire_at, retire_at);
+        idle_auth(&transport).retire_at = Instant::now();
         // Checkout retires the first connection. Active I/O ignores its age.
-        let mut connection =
-            futures::executor::block_on(transport.authenticated(&identity, &scope)).unwrap();
+        let mut connection = testing::drive(transport.authenticated(&identity, &scope)).unwrap();
         authenticated(&mut connection).retire_at = Instant::now();
         assert_eq!(connection.check(&scope), Ok(()));
         let expiry = authenticated(&mut connection).expires;
@@ -2174,45 +2263,42 @@ mod tests {
             Err(testing::Error::Transport(Error::Unauthorized))
         );
         authenticated(&mut connection).expires = expiry;
-        let result = futures::executor::block_on(connection.request(
+        let result = testing::drive(connection.request(
             testing::request(Method::Get, "/snapshot", None, 65536),
             &scope,
         ))
         .unwrap();
         assert_eq!(result.status, 204);
-        assert!(transport.idle.borrow().is_none());
+        assert!(!transport.has_idle());
         assert_eq!(get().status, 200);
-        authenticated(transport.idle.borrow_mut().as_mut().unwrap()).idle_since =
-            Instant::now() - Duration::from_secs(20);
+        idle_auth(&transport).idle_since = Instant::now() - Duration::from_secs(20);
         assert_eq!(get().status, 200);
-        authenticated(transport.idle.borrow_mut().as_mut().unwrap()).epoch = [0; 32];
+        idle_auth(&transport).epoch = [0; 32];
         for status in [429, 503] {
             assert_eq!(get().status, 200);
             assert_eq!(get().status, status);
-            assert!(transport.idle.borrow().is_none());
+            assert!(!transport.has_idle());
         }
         assert_eq!(get().status, 200);
-        let connection =
-            futures::executor::block_on(transport.authenticated(&identity, &scope)).unwrap();
+        let connection = testing::drive(transport.authenticated(&identity, &scope)).unwrap();
         assert!(matches!(
-            futures::executor::block_on(connection.request(
+            testing::drive(connection.request(
                 testing::request(Method::Get, "invalid", None, 65536),
                 &scope
             )),
             Err(testing::Error::Transport(Error::InvalidRequest))
         ));
-        assert!(transport.idle.borrow().is_none());
+        assert!(!transport.has_idle());
         assert_eq!(get().status, 200);
-        let connection =
-            futures::executor::block_on(transport.authenticated(&identity, &scope)).unwrap();
+        let connection = testing::drive(transport.authenticated(&identity, &scope)).unwrap();
         assert!(matches!(
-            futures::executor::block_on(connection.request(
+            testing::drive(connection.request(
                 testing::request(Method::Get, "/snapshot", None, 65536),
                 &scope
             )),
             Err(testing::Error::Transport(Error::Io))
         ));
-        assert!(transport.idle.borrow().is_none());
+        assert!(!transport.has_idle());
         assert_eq!(get().status, 204);
         transport.close_idle();
         server.join().unwrap();
