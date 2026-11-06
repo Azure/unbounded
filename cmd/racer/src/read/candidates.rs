@@ -1589,6 +1589,12 @@ impl CandidatePolicy {
                     self.ctx.now(),
                     budget.deadline().min(scope.deadline.0),
                 ),
+                Rank0Note::Busy => watch.busy(
+                    id.clone(),
+                    destination.clone(),
+                    self.ctx.now(),
+                    budget.deadline().min(scope.deadline.0),
+                ),
                 Rank0Note::Failed => watch.answered_failure(id, destination),
                 Rank0Note::Answered => watch.answered(id, destination),
             }

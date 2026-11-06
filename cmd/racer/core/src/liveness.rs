@@ -815,6 +815,31 @@ impl<K: Eq + Hash + Clone, N: Eq + Hash + Clone> Rank0Watch<K, N> {
         self.compact();
     }
 
+    /// A probe for `key` was refused for load. Like [`Self::timed_out`] for `key` alone: the page
+    /// turns [`Rank0State::Overdue`] once its interval passes, but `rank0` is never marked silent,
+    /// so load on one page (often this node's own admission) cannot send every page whose rank 0
+    /// is `rank0` to origin.
+    pub fn busy(&mut self, key: K, rank0: N, now: Instant, deadline: Instant) {
+        let live = self.entries.get(&key).is_some_and(|e| {
+            e.node == rank0 && !e.failed && now.saturating_duration_since(e.last) <= self.ttl
+        });
+        if live {
+            self.entries.get_mut(&key).expect("live").last = now;
+        } else {
+            self.insert(
+                key.clone(),
+                Rank0Entry {
+                    node: rank0,
+                    until: deadline.max(now + self.hang_after),
+                    last: now,
+                    failed: false,
+                },
+            );
+        }
+        self.order.push_back((key, now));
+        self.compact();
+    }
+
     /// This owner's own origin fetch for `key` failed. Failures inside the
     /// interval do not extend it.
     pub fn failed(&mut self, key: K, rank0: N, now: Instant) {
@@ -1032,6 +1057,29 @@ mod rank0_tests {
         assert_eq!(w.state(&2, &A, now + 2 * S), Rank0State::Overdue);
         w.answered_failure(&9, &A);
         assert_eq!(w.state(&2, &A, now + 2 * S), Rank0State::Unknown);
+    }
+
+    #[test]
+    fn busy_probes_make_only_their_page_overdue() {
+        let now = Instant::now();
+        let mut w = Rank0Watch::new(8, WATCH_TTL, 5 * S);
+        w.busy(1, A, now, now + S);
+        // Within the interval rank 0 may be fetching: the reader waits.
+        assert_eq!(w.state(&1, &A, now + S), Rank0State::Fetching);
+        // Refused past the interval: this page may reach origin.
+        w.busy(1, A, now + 6 * S, now + 7 * S);
+        assert_eq!(w.state(&1, &A, now + 6 * S), Rank0State::Overdue);
+        // Load is not silence: other pages of the same rank 0 are unaffected.
+        assert_eq!(w.state(&2, &A, now + 6 * S), Rank0State::Unknown);
+        // Contrast: repeated timeouts do mark rank 0 silent for every page.
+        w.timed_out(3, A, now, now + S);
+        w.timed_out(3, A, now + 6 * S, now + 7 * S);
+        assert_eq!(w.state(&2, &A, now + 6 * S), Rank0State::Overdue);
+        // An answer forgets the page.
+        let mut w = Rank0Watch::new(8, WATCH_TTL, 5 * S);
+        w.busy(1, A, now, now + S);
+        w.answered(&1, &A);
+        assert_eq!(w.state(&1, &A, now + 6 * S), Rank0State::Unknown);
     }
 
     #[test]

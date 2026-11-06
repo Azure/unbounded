@@ -1629,6 +1629,12 @@ pub enum Rank0Note {
     Answered,
     Failed,
     TimedOut,
+    /// The exchange with rank 0 was refused for load (this node's peer admission or
+    /// connection cap, receive memory, or a relay's `Overloaded`). Like `TimedOut` for this page,
+    /// so a page refused past its deadline still reaches origin, but never evidence that rank 0
+    /// itself is silent: it must not mark rank 0 overdue for every other page
+    /// ([`crate::liveness::Rank0Watch::busy`]).
+    Busy,
 }
 
 /// Facts from one [`Fill::on`] call for the caller's own state and counters.
@@ -2346,7 +2352,7 @@ impl Fill {
             self.out.rank0 = match outcome {
                 Outcome::TimedOut => Some(Rank0Note::TimedOut),
                 Outcome::Probe(ProbeOutcome::Overloaded)
-                | Outcome::Transport(ProbeOutcome::Overloaded) => Some(Rank0Note::TimedOut),
+                | Outcome::Transport(ProbeOutcome::Overloaded) => Some(Rank0Note::Busy),
                 Outcome::Failed => Some(Rank0Note::Failed),
                 // Rank 0 answered and is fetching: alive.
                 Outcome::Fetching => Some(Rank0Note::Answered),

@@ -1563,7 +1563,7 @@ fn fill_rank0_asks_previous_owners_on_grants() {
     assert!(trace.contains("Rank { ranking: Authority"), "{trace}");
 }
 
-/// Repeated relay overloads on rank 1's route to rank 0 feed the rank 0 watch like timeouts:
+/// Repeated relay overloads on rank 1's route to rank 0 feed the page's rank 0 watch entry:
 /// origin is withheld while rank 0 may be fetching, then used once the watch says `Overdue`.
 #[test]
 fn rank0_route_overloads_advance_the_watch_to_origin() {
@@ -1618,10 +1618,12 @@ fn rank0_route_overloads_advance_the_watch_to_origin() {
         );
         assert_eq!(
             note,
-            Some(Rank0Note::TimedOut),
+            Some(Rank0Note::Busy),
             "overload fed no note at step {step}"
         );
-        watch.timed_out(page, rank0, now, now);
+        watch.busy(page, rank0, now, now);
+        // Load on this page never marks rank 0 overdue for its other pages.
+        assert_ne!(watch.state(&(page + 1), &rank0, now), Rank0State::Overdue);
     }
     assert!(
         origin_at.is_some_and(|s| s > 0),
