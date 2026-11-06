@@ -606,6 +606,13 @@ pub(crate) struct NativeDevice {
     /// Source registrations whose deregistration failed for good. Each one
     /// leaked and quarantined its owner's charge.
     leaked_registrations: Cell<usize>,
+
+    /// Wakes the owner when a reaper thread finishes a teardown.
+    waker: RefCell<Option<std::task::Waker>>,
+
+    /// Destroy QPs and ids on a reaper thread (see `reaper.rs`) instead of
+    /// on the owner thread.
+    offload_teardown: bool,
 }
 
 impl NativeDevice {
@@ -644,6 +651,8 @@ impl NativeDevice {
             in_pass: Cell::new(false),
             cm: None,
             leaked_registrations: Cell::new(0),
+            waker: RefCell::new(None),
+            offload_teardown: false,
         }
     }
 
@@ -734,6 +743,14 @@ impl NativeDevice {
     pub(crate) fn begin_pass(&self) {
         self.progress();
         self.in_pass.set(true);
+    }
+
+    /// Wake `waker` when a teardown of a QP on this device finishes.
+    pub(crate) fn set_waker(&self, waker: &std::task::Waker) {
+        let mut current = self.waker.borrow_mut();
+        if !current.as_ref().is_some_and(|w| w.will_wake(waker)) {
+            *current = Some(waker.clone());
+        }
     }
 
     /// True once the connection manager reported the device removed. Every
@@ -883,6 +900,9 @@ fn discover_with_api(
             },
             mode,
         );
+        // Real devices tear QPs down on a reaper thread; the simulation is
+        // single-threaded and deterministic.
+        device.offload_teardown = !device.simulated();
         if unsafe { (api.query_caps)(raw.as_ptr(), port.port, &mut device.caps) } != 0 {
             continue;
         }
@@ -1622,6 +1642,20 @@ impl<T> Pending<T> {
     }
 }
 
+/// Teardown result bit: the QP is destroyed (or never existed).
+const TORN_QP: u64 = 1;
+
+/// Teardown result bit: the connection manager id is destroyed (or never
+/// existed).
+const TORN_ID: u64 = 2;
+
+/// A handle moved to a reaper thread. The owner no longer touches it.
+struct Raw(NonNull<c_void>);
+
+// SAFETY: libibverbs and librdmacm handles may be used from any thread; the
+// owner hands each one over and stops using it.
+unsafe impl Send for Raw {}
+
 /// A queue pair (QP) and its completion queue.
 ///
 /// Tracks posted work: this is the only ledger of work requests, and callers
@@ -1664,6 +1698,10 @@ pub(crate) struct NativeQueuePair<T = ()> {
 
     /// Stop was requested. No new work.
     terminating: Cell<bool>,
+
+    /// The QP and id teardown running on a reaper thread (native devices
+    /// only; see `reaper.rs`). Until it finishes, nothing is released.
+    teardown: RefCell<Option<crate::reaper::Ticket>>,
 
     connected: Cell<bool>,
 
@@ -1821,6 +1859,7 @@ impl<T> NativeQueuePair<T> {
             endpoint,
             stopped: Cell::new(false),
             terminating: Cell::new(false),
+            teardown: RefCell::new(None),
             connected: Cell::new(false),
             pending: RefCell::new(BTreeMap::new()),
             released: RefCell::new(Vec::new()),
@@ -2081,6 +2120,9 @@ impl<T> NativeQueuePair<T> {
         if self.conn.state.get() != State::Failed {
             self.conn.state.set(State::Failed);
         }
+        if self.device.offload_teardown {
+            self.teardown_off_thread()?;
+        }
         if let Some(qp) = self.conn.qp.get() {
             let _ = unsafe { (api.qp_error)(qp.as_ptr()) };
             if unsafe { (api.qp_free)(qp.as_ptr()) } != 0 {
@@ -2116,6 +2158,82 @@ impl<T> NativeQueuePair<T> {
         }
         self.released.borrow_mut().extend(records);
         Ok(())
+    }
+
+    /// True while the QP's teardown runs on a reaper thread.
+    pub(crate) fn reaping(&self) -> bool {
+        self.teardown
+            .borrow()
+            .as_ref()
+            .is_some_and(|ticket| ticket.result().is_none())
+    }
+
+    /// Destroy the QP and its connection manager id on a reaper thread, so
+    /// a teardown stuck in the kernel cannot stall the owner. `Ok` once both
+    /// are gone; else `Err(Io)`, like any failed stop, while the teardown
+    /// runs (see [`Self::reaping`]), when the reaper is full, or when it
+    /// failed (a later call retries what is left).
+    fn teardown_off_thread(&self) -> Result<()> {
+        if let Some(ticket) = self.teardown.borrow_mut().take_if(|t| t.result().is_some()) {
+            let result = ticket.result().unwrap_or(0);
+            if result & TORN_QP != 0 {
+                self.conn.qp.set(None);
+            }
+            if result & TORN_ID != 0 {
+                self.conn.id.set(None);
+            }
+            if self.conn.qp.get().is_some() || self.conn.id.get().is_some() {
+                return Err(Error::Io);
+            }
+            return Ok(());
+        }
+        if self.teardown.borrow().is_some() {
+            return Err(Error::Io);
+        }
+        let qp = self.conn.qp.get();
+        let id = self.conn.id.get();
+        if qp.is_none() && id.is_none() {
+            return Ok(());
+        }
+        if let (Some(cm), Some(id)) = (&self.device.cm, id) {
+            // Events for the id are ignored from now on: it may be freed on
+            // the reaper thread at any time.
+            cm.forget(id);
+        }
+        let api = &self.device.api;
+        let (qp_error, qp_free, destroy_id) = (api.qp_error, api.qp_free, api.cm_destroy_id);
+        let (qp, id) = (qp.map(Raw), id.map(Raw));
+        let ticket = crate::reaper::Reaper::global().submit(
+            move || {
+                let (qp, id) = (qp, id);
+                let mut result = 0;
+                match qp {
+                    Some(qp) => {
+                        let _ = unsafe { qp_error(qp.0.as_ptr()) };
+                        if unsafe { qp_free(qp.0.as_ptr()) } == 0 {
+                            result |= TORN_QP;
+                        }
+                    }
+                    None => result |= TORN_QP,
+                }
+                match id {
+                    // The QP must be gone before its id.
+                    Some(id) if result & TORN_QP != 0 => {
+                        if unsafe { destroy_id(id.0.as_ptr()) } == 0 {
+                            result |= TORN_ID;
+                        }
+                    }
+                    Some(_) => {}
+                    None => result |= TORN_ID,
+                }
+                result
+            },
+            self.device.waker.borrow().clone(),
+        );
+        // The C library stays loaded: this QP holds the device, and a
+        // teardown that never finishes leaks it (see `Drop`).
+        *self.teardown.borrow_mut() = ticket;
+        Err(Error::Io)
     }
 
     /// Validate and record a ranged post under the caller's `id`, then run
@@ -2665,6 +2783,11 @@ pub(crate) mod lifetime_tests {
 
     thread_local! { static FAULTS: RefCell<Faults> = RefCell::new(Faults::default()); }
 
+    /// While set, the fixture's QP destroy blocks, on every thread. Only the
+    /// offloaded-teardown test sets it, and only its QP is destroyed off
+    /// the test thread.
+    static HANG: AtomicBool = AtomicBool::new(false);
+
     /// Record the order of native ownership releases.
     fn event(value: &'static str) {
         FAULTS.with_borrow_mut(|f| f.events.push(value));
@@ -2790,6 +2913,10 @@ pub(crate) mod lifetime_tests {
     /// Record a terminal fence (QP destruction) and apply the scripted
     /// failure state.
     unsafe extern "C" fn qp_free(p: *mut c_void) -> c_int {
+        // Stand in for a destroy stuck in the kernel, on any thread.
+        while HANG.load(Ordering::Acquire) {
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
         event("stop");
         if FAULTS.with_borrow(|f| f.stop_fails) {
             return 5;
@@ -3007,6 +3134,11 @@ pub(crate) mod lifetime_tests {
 
     /// Reset faults and create a connected queue pair with charged source memory.
     pub(crate) fn fixture() -> (Rc<NativeQueuePair>, Rc<NativeRegion>, QuotaObserver) {
+        fixture_with(false)
+    }
+
+    /// [`fixture`] on a device that tears QPs down on a reaper thread.
+    fn fixture_with(offload: bool) -> (Rc<NativeQueuePair>, Rc<NativeRegion>, QuotaObserver) {
         FAULTS.with_borrow_mut(|f| *f = Faults::default());
         let api = Rc::new(Api {
             library: None,
@@ -3074,6 +3206,8 @@ pub(crate) mod lifetime_tests {
             },
             Mode::Window,
         ));
+        let mut device = device;
+        Rc::get_mut(&mut device).unwrap().offload_teardown = offload;
         let qp = NativeQueuePair::new_with_depth(
             device.clone(),
             GuardOwner::new(Arc::new(())),
@@ -3118,6 +3252,39 @@ pub(crate) mod lifetime_tests {
         assert_eq!(charged.get(), 0);
         drop(qp);
         FAULTS.with_borrow(|f| assert_eq!(f.events, ["stop", "mr", "cq", "pd-context"]));
+    }
+
+    #[test]
+    /// A QP destroy stuck in the kernel runs on a reaper thread: stop
+    /// returns at once and keeps reporting the teardown in progress, the
+    /// write's source stays charged (the NIC may still read it), and only
+    /// once the destroy returns does stop release it.
+    fn offloaded_teardown_never_blocks_and_releases_only_after_it_finishes() {
+        let (qp, region, charged) = fixture_with(true);
+        qp.write_imm(wr(1), &region, 0, 32, 4096, 7, 0).unwrap();
+        drop(region);
+        HANG.store(true, Ordering::Release);
+        let started = std::time::Instant::now();
+        assert_eq!(qp.stop(), Err(Error::Io));
+        assert!(qp.reaping());
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        assert_eq!(qp.stop(), Err(Error::Io));
+        assert!(started.elapsed() < std::time::Duration::from_secs(1));
+        assert_eq!(charged.get(), 1, "held while the destroy is stuck");
+        HANG.store(false, Ordering::Release);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while qp.reaping() {
+            assert!(std::time::Instant::now() < deadline);
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        qp.stop().unwrap();
+        assert!(!qp.reaping());
+        assert_eq!(charged.get(), 0);
+        drop(qp);
+        FAULTS.with_borrow(|f| {
+            assert!(!f.events.contains(&"stop"), "destroyed off this thread");
+            assert!(f.events.contains(&"cq"));
+        });
     }
 
     #[test]

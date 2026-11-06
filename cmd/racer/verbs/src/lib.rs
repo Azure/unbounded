@@ -91,6 +91,7 @@ mod ffi;
 mod link;
 mod node;
 mod pool;
+mod reaper;
 mod role;
 
 pub use channel::Op;

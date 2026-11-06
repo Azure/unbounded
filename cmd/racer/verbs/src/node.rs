@@ -877,6 +877,10 @@ struct Backoff {
 /// and shutdown checks.
 pub const RETRY_SOON: Duration = Duration::from_millis(1);
 
+/// Backup poll for link teardowns running on a reaper thread, which wake
+/// the owner themselves when they finish.
+const REAPER_POLL: Duration = Duration::from_millis(100);
+
 /// Runs on the native thread and owns every link, pool, and device.
 ///
 /// Not `Send`. Poll it with [`Self::poll_budgeted`], or run it on its own
@@ -977,6 +981,7 @@ impl Owner {
 
         for device in self.devices.values() {
             device.pool.register_owner(waker);
+            device.device.set_waker(waker);
         }
     }
 
@@ -1012,8 +1017,14 @@ impl Owner {
         }
         // Destroys to retry and shutdown checks retry on a short timer. The
         // snapshot always publishes within the poll that dirtied it.
-        if !self.dying.is_empty() || (self.closing && !self.leaked && !self.drained()) {
+        // A teardown on a reaper thread wakes the owner when it finishes;
+        // `REAPER_POLL` only backs that up.
+        if self.dying.iter().any(|d| !d.link.reaping())
+            || (self.closing && !self.leaked && !self.drained())
+        {
             at(now + RETRY_SOON);
+        } else if !self.dying.is_empty() {
+            at(now + REAPER_POLL);
         }
         for link in self.links.values() {
             if let Some(t) = link.next_deadline() {

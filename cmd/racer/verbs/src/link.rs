@@ -1624,6 +1624,12 @@ impl Link {
         true
     }
 
+    /// True while the QP's teardown runs on a reaper thread: the owner is
+    /// woken when it finishes, so [`Self::destroy`] need not be retried soon.
+    pub(crate) fn reaping(&self) -> bool {
+        self.qp.reaping()
+    }
+
     /// Owner shutdown after a failed destroy: the buffers are never reused.
     pub(crate) fn leak(&mut self, pool: &Pool) {
         if !self.failed {

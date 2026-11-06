@@ -316,6 +316,11 @@ impl Cm {
         self.tokens.borrow_mut().remove(&conn.token);
     }
 
+    /// Stop routing events to `id`: it is being destroyed elsewhere.
+    pub(crate) fn forget(&self, id: NonNull<c_void>) {
+        self.ids.borrow_mut().remove(&(id.as_ptr() as usize));
+    }
+
     /// Destroy `conn`'s id, if any. Its QP must already be gone. False if
     /// the id could not be destroyed (it stays on `conn`).
     pub(crate) fn destroy_id(&self, api: &Api, conn: &Conn) -> bool {
