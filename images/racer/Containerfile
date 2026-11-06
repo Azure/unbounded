@@ -93,6 +93,8 @@ COPY cmd/racer/core/Cargo.toml ./core/Cargo.toml
 COPY cmd/racer/core/src ./core/src
 COPY cmd/racer/peer-wire/Cargo.toml ./peer-wire/Cargo.toml
 COPY cmd/racer/peer-wire/src ./peer-wire/src
+COPY cmd/racer/io/Cargo.toml ./io/Cargo.toml
+COPY cmd/racer/io/src ./io/src
 COPY cmd/racer/alloc/Cargo.toml ./alloc/Cargo.toml
 COPY cmd/racer/alloc/src ./alloc/src
 COPY cmd/racer/flow/Cargo.toml ./flow/Cargo.toml
