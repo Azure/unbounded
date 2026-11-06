@@ -1648,9 +1648,17 @@ impl Future for FenceIds {
         if let Some((id, old)) = this.registered.take() {
             unregister(&mut state.id_waiters, &id, &old);
         }
-        this.ids.retain(|id| !Reactor::fenced(&mut state.slab, *id));
-        let Some(id) = this.ids.last().copied() else {
-            return Poll::Ready(());
+        // Fencing is permanent, and only the last id is registered, so a wake
+        // means the tail fenced. Pop fenced ids from the tail only; each id is
+        // checked O(1) amortized times instead of rescanning the whole list.
+        let id = loop {
+            let Some(&id) = this.ids.last() else {
+                return Poll::Ready(());
+            };
+            if !Reactor::fenced(&mut state.slab, id) {
+                break id;
+            }
+            this.ids.pop();
         };
         let waker = cx.waker().clone();
         state.id_waiters.push((id, waker.clone()));
