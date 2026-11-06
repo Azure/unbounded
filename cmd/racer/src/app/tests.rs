@@ -2368,6 +2368,11 @@ fn same_node_renewal_backs_off_expires_closed_and_recovers() {
     assert!(node.observations.health.ready(&env));
     // Retained-publication startup completes staging without another HTTP turn.
     // Establish a successful control turn before measuring renewal-only backoff.
+    // Inside a turn virtual time holds still, and the publication poll's next
+    // fetch is one tick after its startup receipt. Startup's driver may return
+    // before that tick has elapsed, so pass it here rather than depend on how
+    // many idle host iterations startup happened to take.
+    clock.advance(crate::control::poll::Schedule::control().tick);
     turn(&env, &mut worker, &runtime, &mut engine, None);
     let control = worker.control.clone().unwrap();
     let old = control.identity().unwrap();
