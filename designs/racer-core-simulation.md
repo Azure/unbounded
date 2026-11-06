@@ -101,8 +101,7 @@ world (real authorities against `simulation::FakeKube`), its fault model and inv
 Interpreters are dispatch-only: every decision comes from `racer-core` (`WorkerCore`, the walk,
 flights, serve, liveness, route budgets) and `topology`; the interpreter prices each effect with
 `resources` and completes it as an engine event. `dst/MODEL.md` lists what is modeled, what is
-not, every ported scenario with its parity against the retired `racer-sim`, and the accepted
-gaps.
+not, the scenario families and their checks, and the accepted divergences from production.
 
 ### Phantom caches
 
@@ -123,23 +122,23 @@ make racer-dst-report ARGS='--scenario full-cold-start --nodes 50000 --config cf
 ```
 
 Names are the control plans (`enrollment-storm`, `failover`, `ctl-churn`, `lagging`), the
-combined scenarios (`full-cold-start`, `full-failover`, `full-churn`, `full-lagging`), racer-sim's
-other names mapped to Model scenarios (`dst/src/cli.rs` `SIM_ALIASES`) and every catalog name.
-`--config` takes a JSON object of the keys listed in `dst/MODEL.md`, Command line; unknown keys
-are errors. `RACER_DST_REPORT_TIMEOUT` (default 7200s) bounds the make target.
+combined scenarios (`full-cold-start`, `full-failover`, `full-churn`, `full-lagging`), short
+aliases mapped to Model scenarios (`dst/src/cli.rs` `ALIASES`) and every catalog name.
+`--config` takes a JSON object of the keys in `dst/src/cli.rs` `KEYS` and `NODE_KEYS` (see
+`dst/MODEL.md`, Running); unknown keys are errors. `RACER_DST_REPORT_TIMEOUT` (default 7200s) bounds the make target.
 
 ### Mesh v2 metrics
 
 Topology-only mesh measurements (peers per node, route links by transport, edges changed by
 churn, selector pools, failover rebuilds) are `topology/tests/mesh_scenarios.rs`; the hot page
 storm with mesh helpers is `model-hot-page-storm-512` (and the ignored 2,048-node test in
-`dst/tests/model_parity.rs`).
+`dst/tests/model_scenarios.rs`).
 
 ## Memory budget
 
 32 GiB / 50,000 nodes is about 671 KiB per node. Model per-node state holds no payloads and no
-per-node copies of shareable data. `dst/tests/model_parity.rs` `model_memory_per_node` measures it,
-and `dst/MODEL.md` (Memory, Parity) records peak RSS: `full-cold-start` at 50,000 nodes peaks at
+per-node copies of shareable data. `dst/tests/model_scenarios.rs` `model_memory_per_node` measures it
+(`dst/MODEL.md`, Running, has the command). Measured peak RSS: `full-cold-start` at 50,000 nodes peaks at
 3.10 GB (62 KB per node).
 
 ## Determinism and replay
