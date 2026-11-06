@@ -24,8 +24,8 @@ import (
 )
 
 const (
-	nftablesFlushUnit = "nftables-flush.service"
-	nftablesClearPath = goalstates.ConfigDir + "/nftables-clear.nft"
+	nftablesFlushUnit = goalstates.NFTablesFlushUnit
+	nftablesClearPath = goalstates.NFTablesClearPath
 )
 
 //go:embed assets/nftables-flush.service
