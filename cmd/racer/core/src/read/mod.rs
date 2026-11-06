@@ -725,8 +725,21 @@ pub fn direct_fills(
     direct_ahead: usize,
     elsewhere: impl Fn(usize) -> bool,
 ) -> Vec<usize> {
-    let limit = first_failure(slots).unwrap_or(slots.len());
     let mut plan = Vec::new();
+    direct_fills_into(slots, direct_ahead, elsewhere, &mut plan);
+    plan
+}
+
+/// [`direct_fills`] into a caller-owned buffer, which is cleared first, so a hot caller can reuse
+/// its allocation.
+pub fn direct_fills_into(
+    slots: &[SlotKind],
+    direct_ahead: usize,
+    elsewhere: impl Fn(usize) -> bool,
+    plan: &mut Vec<usize>,
+) {
+    plan.clear();
+    let limit = first_failure(slots).unwrap_or(slots.len());
     if limit > 0 && matches!(slots[0], SlotKind::Missing { .. } | SlotKind::Selecting) {
         plan.push(0);
     }
@@ -743,7 +756,6 @@ pub fn direct_fills(
         }
         index += 1;
     }
-    plan
 }
 
 /// Position of the first failed slot; admission stops there.
@@ -865,6 +877,13 @@ mod range_tests {
             [1]
         );
         assert!(direct_fills(&[], DIRECT_AHEAD, |_| false).is_empty());
+        // The buffer form clears stale contents and matches the allocating form.
+        let mut plan = vec![7, 8, 9];
+        direct_fills_into(&[HOLE, HOLE, HOLE], DIRECT_AHEAD, |i| i == 1, &mut plan);
+        assert_eq!(
+            plan,
+            direct_fills(&[HOLE, HOLE, HOLE], DIRECT_AHEAD, |i| i == 1)
+        );
         assert_eq!(direct_fills(&[HOLE, HOLE, HOLE], 2, |_| false), [0, 1, 2]);
     }
 

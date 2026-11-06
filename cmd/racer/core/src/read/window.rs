@@ -13,7 +13,7 @@
 
 use super::effect::{EffectId, EffectIds, Stale};
 use super::{
-    AcquisitionBudget, DIRECT_AHEAD, Error, PageBudget, SlotKind, direct_fills, first_failure,
+    AcquisitionBudget, DIRECT_AHEAD, Error, PageBudget, SlotKind, direct_fills_into, first_failure,
     may_select, selection_demand, share,
 };
 use crate::subscriptions::MAX_DEMAND_INTERVALS;
@@ -265,6 +265,8 @@ pub struct ReadWindow {
     terminated: bool,
     /// Scratch slot kinds for planning, reused across pumps.
     kinds: Vec<SlotKind>,
+    /// Scratch direct-fill plan, reused across pumps.
+    plan: Vec<usize>,
     /// Page of each probe or fetch issued, so completions find their slot without a scan. An entry
     /// is only trusted while its slot still holds the id; it is dropped on completion.
     issued: BTreeMap<EffectId, u64>,
@@ -287,6 +289,7 @@ impl ReadWindow {
             error: None,
             terminated: false,
             kinds: Vec::new(),
+            plan: Vec::new(),
             issued: BTreeMap::new(),
         }
     }
@@ -496,11 +499,22 @@ impl ReadWindow {
         self.refresh_kinds();
         let failed = first_failure(&self.kinds);
         let next = self.next;
-        let plan = direct_fills(&self.kinds, self.direct_ahead(), |index| {
-            facts.elsewhere.contains(&(next + index as u64))
-        });
-        for index in plan {
-            let budget = self.page_budget(now)?;
+        let mut plan = std::mem::take(&mut self.plan);
+        direct_fills_into(
+            &self.kinds,
+            self.direct_ahead(),
+            |index| facts.elsewhere.contains(&(next + index as u64)),
+            &mut plan,
+        );
+        let mut started = Ok(());
+        for &index in &plan {
+            let budget = match self.page_budget(now) {
+                Ok(budget) => budget,
+                Err(error) => {
+                    started = Err(error);
+                    break;
+                }
+            };
             let id = ids.allocate();
             let page = self.page_at(index);
             self.slots[index] = Slot::Fetching(id);
@@ -512,6 +526,8 @@ impl ReadWindow {
                 sealed: self.config.sealed,
             });
         }
+        self.plan = plan;
+        started?;
         if failed.is_some() || self.config.passthrough || self.config.sealed || !facts.leased {
             return Ok(());
         }
