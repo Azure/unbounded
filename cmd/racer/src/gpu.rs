@@ -3968,11 +3968,27 @@ mod tests {
         let plaintext = plaintext();
         let fds: Vec<OwnedFd> = (1..=8).map(|id| import(&helper, id, 0)).collect();
         let streams = STREAMS as u64;
-        helper.run(|| simulation().set_query_delay(50));
+        // No event completes until every page has queued its decrypt, so the
+        // pages overlap however slowly the host runs the submissions.
+        helper.run(|| simulation().set_query_delay(u32::MAX));
         let mark = helper.run(|| simulation().trace().len());
         let pending = (1..=streams)
             .map(|id| submit(&helper, id, staged(&helper, 0, &plaintext), 0..5000).unwrap())
             .collect();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        while positions(&helper, Operation::Decrypt)
+            .into_iter()
+            .filter(|at| *at >= mark)
+            .count()
+            < STREAMS
+        {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "decrypts were not queued"
+            );
+            std::thread::yield_now();
+        }
+        helper.run(|| simulation().set_query_delay(50));
         assert!(answers(pending).into_iter().all(|result| result.is_ok()));
         let decrypts: Vec<usize> = positions(&helper, Operation::Decrypt)
             .into_iter()
