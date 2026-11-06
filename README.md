@@ -145,6 +145,22 @@ contains the kubeconfig and SSH key. Rerun with the same arguments to resume
 provisioning. Scale workers separately with `az vmss scale`; reruns preserve
 capacity. The script is not an upgrade or teardown tool.
 
+For ARM64 Flex workers, add `--worker-arch arm64`. This selects the ARM64
+Ubuntu 24.04 host and agent archive, with `Standard_D4ps_v6` as the default
+worker VM size; the system node keeps its existing AMD64 default.
+
+For a streaming-capable build, add `--artifact-streaming` to preload NBD before
+Flex bootstrap and enable operator-managed Gantry Artifact Streaming only on the
+Flex workers. The setting is pinned in deployment state and applies to new VMSS
+instances after scale-out. ARM64 streaming is experimental; successful ACR
+conversion does not by itself establish runtime compatibility.
+
+To install an unreleased build, use `--plugin-binary /path/to/kubectl-unbounded`,
+`--image-registry ghcr.io/myorg`, and `--operator-image unbounded-operator:TAG`.
+Publish the required component images under that registry with tags matching
+the operator's compiled version. These selections are pinned in the deployment
+state, so reruns cannot silently switch the installer or images.
+
 Gantry starts without ACR authentication. See the
 [ACR attachment guide](docs/content/guides/gantry.md#acr-attachment-and-explicit-authentication-on-flex-nodes)
 to enable it with a compatible plugin/operator; the script's pinned `v0.8.0`

@@ -147,7 +147,7 @@ func (b *benchmark) gantryRevision(ctx context.Context) (string, error) {
 		ctx,
 		nil,
 		"kubectl", "-n", b.config.GantryNamespace,
-		"get", "pods", "-l", "app.kubernetes.io/name="+b.config.GantryDaemonSet,
+		"get", "pods", "-l", b.config.gantryAgentSelector(),
 		"-o", "json",
 	)
 	if err != nil {
@@ -320,7 +320,7 @@ func (b *benchmark) waitForGantryMetricSettlement(
 	before gantryMetrics,
 	requirePeerActivity bool,
 ) (gantryMetrics, error) {
-	deadline := time.Now().Add(2 * time.Minute)
+	deadline := time.Now().Add(b.config.TelemetryTimeout)
 	settlement := gantryMetricSettlement{window: 20 * time.Second, requirePeerActivity: requirePeerActivity}
 
 	inFlightQuery := fmt.Sprintf(
