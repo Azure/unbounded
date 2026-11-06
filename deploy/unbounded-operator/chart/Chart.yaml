@@ -1,0 +1,6 @@
+apiVersion: v2
+name: unbounded-operator
+description: Unbounded operator, which installs Unbounded CRDs and reconciles components from Sites
+type: application
+version: 0.1.0
+appVersion: dev

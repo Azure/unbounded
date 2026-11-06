@@ -1,0 +1,35 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["imageRegistry", "image", "apiServerEndpoint", "reapLegacyResources", "resources", "namespace"],
+  "properties": {
+    "imageRegistry": {"type": "string", "minLength": 1},
+    "image": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["reference", "name", "tag", "digest", "pullPolicy"],
+      "properties": {
+        "reference": {"type": "string"},
+        "name": {"type": "string", "pattern": "^[a-z0-9]+([._-][a-z0-9]+)*$"},
+        "tag": {"type": "string"},
+        "digest": {"type": "string", "pattern": "^(sha256:[0-9a-f]{64})?$"},
+        "pullPolicy": {"enum": ["Always", "IfNotPresent", "Never"]}
+      }
+    },
+    "apiServerEndpoint": {"type": "string"},
+    "reapLegacyResources": {"type": "boolean"},
+    "resources": {"type": "object"},
+    "namespace": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["create"],
+      "properties": {"create": {"type": "boolean"}}
+    },
+    "global": {"type": "object"},
+    "Azure": {
+      "description": "Platform metadata injected by AKS cluster extensions (Azure.Cluster.*). Accepted and ignored.",
+      "type": "object"
+    }
+  }
+}

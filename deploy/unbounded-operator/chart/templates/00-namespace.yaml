@@ -1,0 +1,10 @@
+{{- if .Values.namespace.create }}
+# Only the static `kubectl apply` render creates the namespace (values-static.yaml).
+# Helm and AKS cluster extensions install into a release namespace they manage.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: {{ .Release.Namespace }}
+  labels:
+    app.kubernetes.io/name: unbounded-operator
+{{- end }}

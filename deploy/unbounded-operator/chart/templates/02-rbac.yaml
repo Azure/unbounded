@@ -1,14 +1,9 @@
-# Copyright (c) Microsoft Corporation.
-# SPDX-License-Identifier: Apache-2.0
-
----
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRole
 metadata:
   name: unbounded-operator
   labels:
-    app.kubernetes.io/name: unbounded-operator
-    app.kubernetes.io/component: controller
+    {{- include "unbounded-operator.labels" . | nindent 4 }}
 rules:
   - apiGroups: ["racer.unbounded-cloud.io"]
     resources: ["clustercaches"]
@@ -121,8 +116,7 @@ kind: ClusterRoleBinding
 metadata:
   name: unbounded-operator
   labels:
-    app.kubernetes.io/name: unbounded-operator
-    app.kubernetes.io/component: controller
+    {{- include "unbounded-operator.labels" . | nindent 4 }}
 roleRef:
   apiGroup: rbac.authorization.k8s.io
   kind: ClusterRole
@@ -130,17 +124,16 @@ roleRef:
 subjects:
   - kind: ServiceAccount
     name: unbounded-operator
-    namespace: {{ default "unbounded-system" .Namespace }}
+    namespace: {{ .Release.Namespace }}
 
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: Role
 metadata:
   name: unbounded-operator-registry-auth-migration
-  namespace: {{ default "unbounded-system" .Namespace }}
+  namespace: {{ .Release.Namespace }}
   labels:
-    app.kubernetes.io/name: unbounded-operator
-    app.kubernetes.io/component: controller
+    {{- include "unbounded-operator.labels" . | nindent 4 }}
 rules:
   - apiGroups: ["coordination.k8s.io"]
     resources: ["leases"]
@@ -152,10 +145,9 @@ apiVersion: rbac.authorization.k8s.io/v1
 kind: RoleBinding
 metadata:
   name: unbounded-operator-registry-auth-migration
-  namespace: {{ default "unbounded-system" .Namespace }}
+  namespace: {{ .Release.Namespace }}
   labels:
-    app.kubernetes.io/name: unbounded-operator
-    app.kubernetes.io/component: controller
+    {{- include "unbounded-operator.labels" . | nindent 4 }}
 roleRef:
   apiGroup: rbac.authorization.k8s.io
   kind: Role
@@ -163,4 +155,4 @@ roleRef:
 subjects:
   - kind: ServiceAccount
     name: unbounded-operator
-    namespace: {{ default "unbounded-system" .Namespace }}
+    namespace: {{ .Release.Namespace }}
