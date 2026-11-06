@@ -68,19 +68,56 @@ func validVersion(version string) error {
 	return nil
 }
 
-// Ensure creates the version directory (and its bin directory) if needed and
-// returns its path. It is idempotent.
+// Ensure creates the version directory (and its bin directory) if needed,
+// makes the base, version and bin directories 0755, and returns the version
+// directory's path. It is idempotent.
 func (l Layout) Ensure(version string) (string, error) {
 	if err := validVersion(version); err != nil {
 		return "", err
 	}
 
 	dir := l.VersionDir(version)
-	if err := os.MkdirAll(filepath.Join(dir, "bin"), 0o755); err != nil {
-		return "", fmt.Errorf("create %s: %w", dir, err)
+	for _, d := range []string{l.base(), dir, filepath.Join(dir, "bin")} {
+		if err := MkdirTraversable(d); err != nil {
+			return "", fmt.Errorf("create %s: %w", dir, err)
+		}
 	}
 
 	return dir, nil
+}
+
+// MkdirTraversable creates dir with any missing parents and makes dir, and each
+// parent it created, 0755 whatever the umask. The node's LocalDNS runs as a
+// dynamic user, which has to traverse the base and version directories to
+// reach its binaries; under the umask 027 of a hardened host, plain MkdirAll
+// leaves them 0750 and the unit fails to execute. A parent that already
+// existed keeps its mode: it is not the agent's to change.
+func MkdirTraversable(dir string) error {
+	dir = filepath.Clean(dir)
+
+	created := []string{dir}
+
+	for p := filepath.Dir(dir); p != filepath.Dir(p); p = filepath.Dir(p) {
+		if _, err := os.Lstat(p); err == nil {
+			break
+		} else if !errors.Is(err, os.ErrNotExist) {
+			return err
+		}
+
+		created = append(created, p)
+	}
+
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return err
+	}
+
+	for _, p := range created {
+		if err := os.Chmod(p, 0o755); err != nil { //nolint:gosec // traversable by the LocalDNS service user, by design
+			return err
+		}
+	}
+
+	return nil
 }
 
 // Current returns the active version, or "" when nothing is active yet.

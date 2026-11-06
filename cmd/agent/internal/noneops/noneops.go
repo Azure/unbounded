@@ -316,7 +316,9 @@ func (n *Node) writeSupervisor() error {
 // shell executes, while a rename leaves the open file as it was.
 func (n *Node) writeSupervisorWith(script []byte) error {
 	path := n.gs.RootFS.Root().Path(goalstates.LocalDNSSupervisorPath)
-	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+	// LocalDNS's dynamic user executes the script, so libexec must be
+	// traversable whatever the umask.
+	if err := none.MkdirTraversable(filepath.Dir(path)); err != nil {
 		return fmt.Errorf("create LocalDNS supervisor directory: %w", err)
 	}
 

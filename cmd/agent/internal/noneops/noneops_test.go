@@ -13,6 +13,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"syscall"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -245,6 +246,26 @@ func TestPrepareInstallsVersionWritesUnitsAndDoesNotActivate(t *testing.T) {
 	unit, err := os.ReadFile(filepath.Join(f.sys, none.UnitLocalDNS))
 	require.NoError(t, err)
 	require.Contains(t, string(unit), "ExecStart="+filepath.Join(f.node.p.Layout.CurrentLink(), "libexec", "unbounded-localdns-supervisor"))
+}
+
+// LocalDNS runs as a dynamic user, so every directory on the way to its
+// supervisor and binary must be traversable, even under a hardened host's
+// umask 027. The umask is process-wide, so this test is not parallel.
+func TestPrepareLeavesLocalDNSPathsTraversableUnderARestrictiveUmask(t *testing.T) {
+	old := syscall.Umask(0o027)
+	t.Cleanup(func() { syscall.Umask(old) })
+
+	f := newFixture(t, true, nil)
+
+	r, err := f.node.Prepare(t.Context())
+	require.NoError(t, err)
+
+	version := f.node.p.Layout.VersionDir(r.Slot())
+	for _, d := range []string{f.node.p.Layout.Base, version, filepath.Join(version, "bin"), filepath.Join(version, "libexec")} {
+		info, err := os.Stat(d)
+		require.NoError(t, err)
+		assert.Equal(t, os.FileMode(0o755), info.Mode().Perm(), d)
+	}
 }
 
 func TestPrepareWithoutLocalDNSWritesNoSupervisor(t *testing.T) {
