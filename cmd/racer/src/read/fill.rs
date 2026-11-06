@@ -1070,6 +1070,9 @@ impl Fill {
     /// page takes the usual path through host memory, which keeps the usual
     /// single-flight sharing, memory publication and disk persistence; only
     /// the CPU decrypt and the plaintext publication are skipped.
+    ///
+    /// A host target ([`super::sealed::SealedTarget::host`]) always takes
+    /// that host-memory path; its sink decrypts into the client's file.
     pub(crate) async fn acquire_sealed(
         &self,
         page: PageId,
@@ -1094,9 +1097,11 @@ impl Fill {
         let cached = self.dependencies.memory.unverified(&page)?.is_some();
         // Passthrough never serves a retained copy, so a residual disk copy
         // awaiting the worker purge is not staged, and a local-route read
-        // never contacts peers.
+        // never contacts peers. A host target has no GPU copies: its pages
+        // always come through host memory.
         let mode = self.mode(&page.version.object.cache);
         if !cached
+            && target.helper.is_some()
             && mode != racer_wire::control::CacheMode::PassthroughLocal
             && let Some(fetched) = self
                 .shared_gpu_copy(&page, membership.clone(), context, scope, budget, target)
@@ -1151,7 +1156,10 @@ impl Fill {
         let mut retries = GPU_COPY_JOIN_RETRIES;
         loop {
             scope.check()?;
-            match self.gpu_copies.lookup(page, &target.helper, target.ordinal) {
+            match self
+                .gpu_copies
+                .lookup(page, target.helper()?, target.ordinal)
+            {
                 Lookup::Live(copy) => {
                     if let Some(fetched) = self.joined_gpu_copy(page, &copy, target) {
                         return Ok(Some(fetched));
@@ -1236,7 +1244,9 @@ impl Fill {
         target: &super::sealed::SealedTarget,
     ) -> Option<super::sealed::Fetched> {
         let sealed = copy.sealed(&self.dependencies.crypto, page).ok()?;
-        target.helper.record_joined();
+        if let Ok(helper) = target.helper() {
+            helper.record_joined();
+        }
         self.metrics.record(Event::GpuDirectJoined, 1);
         Some(super::sealed::Fetched::Sealed(sealed))
     }
@@ -1253,7 +1263,7 @@ impl Fill {
         target: &super::sealed::SealedTarget,
     ) -> Result<Option<super::sealed::Fetched>> {
         if !self.passthrough(&page.version.object.cache)
-            && target.helper.cufile()
+            && target.helper()?.cufile()
             && self
                 .dependencies
                 .writer
@@ -1434,9 +1444,9 @@ impl Fill {
         scope: &RequestScope,
         target: &super::sealed::SealedTarget,
     ) -> Result<Option<Box<super::sealed::SealedPage>>> {
-        if target.helper.free_slots(target.ordinal) == 0 {
-            target
-                .helper
+        let helper = target.helper()?;
+        if helper.free_slots(target.ordinal) == 0 {
+            helper
                 .counters()
                 .exhausted
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -1469,8 +1479,7 @@ impl Fill {
         let aad = crate::security::page_aad(&envelope)?;
         let key = self.dependencies.crypto.derive_page_key(&envelope)?;
         let read_length = record.read_length;
-        let staged = target
-            .helper
+        let staged = helper
             .stage_file(
                 target.ordinal,
                 fd,

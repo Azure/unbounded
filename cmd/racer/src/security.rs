@@ -487,7 +487,8 @@ impl PageCrypto {
                 CryptoOutput::Decrypted(page, _original_ciphertext) => Ok(page),
                 CryptoOutput::Encrypted(..)
                 | CryptoOutput::TagVerified(_)
-                | CryptoOutput::EnvelopeVerified(_) => Err(Error::CorruptRecord),
+                | CryptoOutput::EnvelopeVerified(_)
+                | CryptoOutput::DecryptedInto(_) => Err(Error::CorruptRecord),
             }
         })
     }
@@ -530,7 +531,8 @@ impl PageCrypto {
                 CryptoOutput::Encrypted(plaintext, ciphertext) => Ok((plaintext, ciphertext)),
                 CryptoOutput::Decrypted(..)
                 | CryptoOutput::TagVerified(_)
-                | CryptoOutput::EnvelopeVerified(_) => Err(Error::CorruptRecord),
+                | CryptoOutput::EnvelopeVerified(_)
+                | CryptoOutput::DecryptedInto(_) => Err(Error::CorruptRecord),
             }
         })
     }
@@ -571,6 +573,30 @@ impl PageCryptoEngine {
         let input = match input {
             CryptoInput::VerifyEnvelope(job) => {
                 let outcome = job.verify(&scope);
+                permit.executed(ctx.clock.now(), measurement_start);
+                return CryptoCompletion {
+                    permit,
+                    outcome,
+                    _key: key,
+                };
+            }
+            CryptoInput::DecryptInto(job) => {
+                let outcome = match scope.check().and_then(|()| job.run()) {
+                    Ok(()) => CryptoOutcome::Completed(CryptoOutput::DecryptedInto(job)),
+                    Err(error) => {
+                        if error == Error::CorruptRecord {
+                            permit.rejected(IntegrityRejection::Aead);
+                        }
+                        permit.measurement.failure = Some(DecryptFailureMeta {
+                            request: scope.request,
+                            engine_ms: crate::telemetry::unix_millis(ctx.clock.wall_now()),
+                        });
+                        CryptoOutcome::Failed {
+                            input: CryptoInput::DecryptInto(job),
+                            error,
+                        }
+                    }
+                };
                 permit.executed(ctx.clock.now(), measurement_start);
                 return CryptoCompletion {
                     permit,
@@ -638,6 +664,7 @@ impl PageCryptoEngine {
         key.require_purpose(KeyPurpose::Page)?;
         let envelope = match input {
             CryptoInput::VerifyEnvelope(_) => unreachable!("envelope handled above"),
+            CryptoInput::DecryptInto(_) => unreachable!("decrypt-into handled above"),
             CryptoInput::VerifyTag { .. } => unreachable!("tag check handled above"),
             CryptoInput::Encrypt {
                 page,
@@ -754,6 +781,7 @@ impl PageCryptoEngine {
     fn complete(input: CryptoInput, envelope: PageEnvelope) -> CryptoOutcome {
         match input {
             CryptoInput::VerifyEnvelope(_) => unreachable!("envelope handled above"),
+            CryptoInput::DecryptInto(_) => unreachable!("decrypt-into handled above"),
             CryptoInput::VerifyTag { ciphertext } => {
                 CryptoOutcome::Completed(CryptoOutput::TagVerified(ciphertext))
             }
@@ -1177,6 +1205,9 @@ pub enum CryptoInput {
     VerifyEnvelope(Box<crate::peer::forwarding::EnvelopeJob>),
     /// Check the stored AEAD tag without allocating plaintext or decrypting.
     VerifyTag { ciphertext: CiphertextPage },
+    /// Authenticate a sealed page and decrypt it straight into a host-read
+    /// destination. Carries its own derived key, so it takes no key lease.
+    DecryptInto(Box<crate::client::direct::DecryptInto>),
     /// `plaintext` is pooled storage of exactly the plaintext length,
     /// checked out by the requesting worker.
     Decrypt {
@@ -1200,6 +1231,9 @@ pub enum CryptoOutput {
     /// retain it for peer copies/persistence after consuming the completion.
     Decrypted(VerifiedPage, CiphertextPage),
     Encrypted(VerifiedPage, CiphertextPage),
+    /// The page is in the destination. The job returns so its ciphertext is
+    /// released on I/O.
+    DecryptedInto(Box<crate::client::direct::DecryptInto>),
 }
 /// Non-cloneable, pair-bound reservation of both submission and completion space.
 /// Only the I/O endpoint can mint it. Failed submission returns the entire job.
@@ -1372,6 +1406,7 @@ impl CryptoPermit {
         self.measurement.decrypt = matches!(input, CryptoInput::Decrypt { .. });
         self.measurement.bytes = match &input {
             CryptoInput::VerifyEnvelope(_) => 0,
+            CryptoInput::DecryptInto(job) => job.len(),
             CryptoInput::Encrypt { plaintext, .. } => {
                 plaintext.bytes().map_or(0, |b| b.len() as u64)
             }
@@ -1428,6 +1463,7 @@ impl CryptoCompletion {
                 CryptoInput::Decrypt { ciphertext, .. } => {
                     Some(ciphertext.envelope().page.number.0)
                 }
+                CryptoInput::DecryptInto(job) => Some(job.page_number()),
                 _ => None,
             },
             engine_ms: m.failure.as_ref().map(|f| f.engine_ms),
@@ -1564,6 +1600,21 @@ impl CryptoClient {
     ) -> Operation<'a, CryptoOutput> {
         self.execute_inner(CryptoInput::VerifyEnvelope(job), None, scope, None)
     }
+    /// Decrypt a sealed page into a host-read destination on the crypto
+    /// worker. Returns the job once the page is authenticated and written.
+    pub(crate) async fn decrypt_into(
+        &self,
+        job: Box<crate::client::direct::DecryptInto>,
+        scope: &RequestScope,
+    ) -> Result<Box<crate::client::direct::DecryptInto>> {
+        match self
+            .execute_inner(CryptoInput::DecryptInto(job), None, scope, None)
+            .await?
+        {
+            CryptoOutput::DecryptedInto(job) => Ok(job),
+            _ => Err(Error::Internal),
+        }
+    }
     pub fn new(port: IoCryptoPort) -> Self {
         let executor = offload::Client::new(NonZeroUsize::new(port.queue.capacity()).unwrap());
         Self {
@@ -1625,6 +1676,15 @@ impl CryptoClient {
                         let mut permit = CryptoPermit::new(reservation, sample);
                         if let Some(key) = key {
                             permit.job(input, key, scope.clone())
+                        } else if let CryptoInput::DecryptInto(job) = &input {
+                            permit.measurement.decrypt = true;
+                            permit.measurement.bytes = job.len();
+                            CryptoJob {
+                                input,
+                                key: None,
+                                scope: scope.clone(),
+                                permit,
+                            }
                         } else {
                             permit.measurement.verify_only = true;
                             CryptoJob {
@@ -1657,6 +1717,14 @@ impl CryptoClient {
     fn observe(&self, completion: &CryptoCompletion) {
         if let Some(metrics) = self.metrics.borrow().as_ref() {
             completion.record(metrics);
+            if let CryptoOutcome::Completed(CryptoOutput::DecryptedInto(job)) = &completion.outcome
+            {
+                metrics.record(crate::telemetry::Event::HostReadDirectDecrypt, 1);
+                metrics.record(
+                    crate::telemetry::Event::HostReadDirectDecryptBytes,
+                    job.len(),
+                );
+            }
         }
         let observer = self.observer.borrow();
         if let Some(reap_ms) = observer.unix_millis()

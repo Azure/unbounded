@@ -251,6 +251,10 @@ pub struct Responses {
 
     /// The process GPU slot while it waits for its first `gpu-read`.
     lazy_gpu: Option<Arc<crate::gpu_slot::GpuSlot>>,
+
+    /// The worker's crypto client. With it, a `host-read` into a memfd
+    /// sealed against shrinking decrypts pages straight into the memfd.
+    host_crypto: Option<Rc<crate::security::CryptoClient>>,
 }
 
 /// Duplex subscription framing. Delivered leases stay pinned until exact release.
@@ -850,7 +854,14 @@ impl Responses {
             observer: Observer::default(),
             gpu: Default::default(),
             lazy_gpu: None,
+            host_crypto: None,
         }
+    }
+
+    /// Decrypt `host-read` pages straight into a sealed memfd with `crypto`.
+    pub fn with_host_crypto(mut self, crypto: Rc<crate::security::CryptoClient>) -> Self {
+        self.host_crypto = Some(crypto);
+        self
     }
 
     /// Serve `gpu-read` with this backend. Without one, `gpu-read` is 501.
@@ -911,7 +922,13 @@ impl Responses {
         received: http1::connection::ReceivedDescriptors,
     ) -> Result<Option<Box<dyn DirectSink>>> {
         let gpu = self.gpu.borrow().clone();
-        direct::open_sink(kind, received, &self.delivery, gpu.as_ref())
+        direct::open_sink(
+            kind,
+            received,
+            &self.delivery,
+            gpu.as_ref(),
+            self.host_crypto.as_ref(),
+        )
     }
 
     /// Route detailed delivery failures to the worker's observer.

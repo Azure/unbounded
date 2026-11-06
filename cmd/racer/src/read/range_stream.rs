@@ -1958,10 +1958,7 @@ pub(super) mod tests {
             let mut stream = f.open(&metadata, range, scope);
             assert_eq!(stream.direct_ahead(), DIRECT_AHEAD);
             stream
-                .set_sealed(SealedTarget {
-                    helper: crate::gpu::testing::helper(&[None]),
-                    ordinal: 0,
-                })
+                .set_sealed(SealedTarget::gpu(crate::gpu::testing::helper(&[None]), 0))
                 .unwrap();
             assert_eq!(stream.direct_ahead(), sealed, "window {window}");
         }

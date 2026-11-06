@@ -22,13 +22,18 @@ struct Memfd {
 
 impl Memfd {
     fn new() -> Self {
+        Self::new_with(libc::MFD_CLOEXEC)
+    }
+
+    /// A memfd created with `flags`.
+    fn new_with(flags: libc::c_uint) -> Self {
         let name = format!(
             "racer-direct-{}-{}",
             std::process::id(),
             NAMES.fetch_add(1, Ordering::Relaxed)
         );
         let c_name = CString::new(name.clone()).unwrap();
-        let fd = unsafe { libc::memfd_create(c_name.as_ptr(), libc::MFD_CLOEXEC) };
+        let fd = unsafe { libc::memfd_create(c_name.as_ptr(), flags) };
         assert!(fd >= 0);
         Self {
             file: unsafe { File::from_raw_fd(fd) },
@@ -108,16 +113,20 @@ fn direct_fixture_with(
     body: Vec<u8>,
     setup: impl FnOnce(Responses) -> Responses,
 ) -> Fixture {
+    direct_fixture_for(env, body, |responses, _| setup(responses))
+}
+
+/// Like [`direct_fixture_with`], with the read worker passed to `setup`.
+fn direct_fixture_for(
+    env: &racer_io::Env,
+    body: Vec<u8>,
+    setup: impl FnOnce(Responses, &crate::test_support::ReadWorker) -> Responses,
+) -> Fixture {
     let mut fixture = Fixture::new(env);
     let delivery = Rc::new(Delivery::new(
         fixture.reactor.clone(),
         Duration::from_secs(2),
     ));
-    let responses = setup(Responses::new(
-        fixture.listeners.io.clone(),
-        delivery.clone(),
-    ));
-    fixture.listeners.responses = Rc::new(responses);
     let worker = ReadWorker::new(
         env,
         definition(),
@@ -136,9 +145,14 @@ fn direct_fixture_with(
         },
         fixture.listeners.admission.clone(),
         fixture.reactor.clone(),
-        delivery,
+        delivery.clone(),
         1,
     );
+    let responses = setup(
+        Responses::new(fixture.listeners.io.clone(), delivery),
+        &worker,
+    );
+    fixture.listeners.responses = Rc::new(responses);
     worker.origin.set_body(body);
     fixture.listeners.reads = worker.coordinator.clone();
     fixture.worker = Some(worker);
@@ -612,6 +626,7 @@ fn gpu_read_rejects_a_malformed_gpu_uuid() {
 }
 
 mod gpu;
+mod host;
 
 /// A plain HEAD pipelined ahead of a host-read on one connection: one receive
 /// can return both heads with the host-read's descriptor. The descriptor must

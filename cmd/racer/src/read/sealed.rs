@@ -24,19 +24,45 @@ use crate::model::PageId;
 use crate::store::ReadToken;
 use std::sync::Arc;
 
-/// Where a GPU should read a sealed page from.
+/// Who authenticates and decrypts sealed pages: a GPU, or the CPU writing
+/// straight into a host-read destination.
 #[derive(Clone)]
 pub struct SealedTarget {
-    pub(crate) helper: Arc<GpuHelper>,
+    /// The GPU helper, or None for a host-read sink that decrypts on the CPU
+    /// into the client's mapped destination. A host target never takes the
+    /// GPU staging or landing paths: its sealed pages are always in host
+    /// memory ([`SealedSource::Host`]).
+    pub(crate) helper: Option<Arc<GpuHelper>>,
 
-    /// The GPU that holds the request's allocation.
+    /// The GPU that holds the request's allocation. Unused for a host target.
     pub(crate) ordinal: i32,
 }
 
 impl SealedTarget {
+    /// A target for a GPU that holds the request's allocation.
+    pub(crate) fn gpu(helper: Arc<GpuHelper>, ordinal: i32) -> Self {
+        Self {
+            helper: Some(helper),
+            ordinal,
+        }
+    }
+
+    /// A target for a host-read sink that decrypts into the client's file.
+    pub(crate) fn host() -> Self {
+        Self {
+            helper: None,
+            ordinal: -1,
+        }
+    }
+
     /// The GPU that holds the request's allocation.
     pub fn ordinal(&self) -> i32 {
         self.ordinal
+    }
+
+    /// The GPU helper. Fails for a host target, which has none.
+    pub(crate) fn helper(&self) -> Result<&Arc<GpuHelper>> {
+        self.helper.as_ref().ok_or(Error::Internal)
     }
 }
 

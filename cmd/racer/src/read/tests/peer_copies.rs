@@ -3183,10 +3183,7 @@ mod landing {
     }
 
     fn acquire_sealed_on(l: &mut Landing, ordinal: i32) -> Result<Fetched> {
-        let target = SealedTarget {
-            helper: l.helper.clone(),
-            ordinal,
-        };
+        let target = SealedTarget::gpu(l.helper.clone(), ordinal);
         let mut budget = AcquisitionBudget::new(l.f.scope.deadline.0, 16, 32);
         let f = &mut l.f;
         drive(
@@ -3209,10 +3206,7 @@ mod landing {
         let f = &mut l.f;
         let targets: Vec<SealedTarget> = ordinals
             .iter()
-            .map(|&ordinal| SealedTarget {
-                helper: l.helper.clone(),
-                ordinal,
-            })
+            .map(|&ordinal| SealedTarget::gpu(l.helper.clone(), ordinal))
             .collect();
         let deadline = f.scope.deadline.0;
         let fill = f.fill.clone();
@@ -3596,10 +3590,7 @@ mod landing {
             panic!("expected to lead");
         };
         let shared = crate::read::gpu_copies::SharedCopy::from_sealed(&copy).unwrap();
-        let target = SealedTarget {
-            helper: l.helper.clone(),
-            ordinal: 1,
-        };
+        let target = SealedTarget::gpu(l.helper.clone(), 1);
         let f = &mut l.f;
         let mut budget = AcquisitionBudget::new(f.scope.deadline.0, 16, 32);
         let fetch = f.fill.acquire_sealed(
@@ -3642,10 +3633,7 @@ mod landing {
         else {
             panic!("expected to lead");
         };
-        let target = SealedTarget {
-            helper: l.helper.clone(),
-            ordinal: 0,
-        };
+        let target = SealedTarget::gpu(l.helper.clone(), 0);
         let f = &mut l.f;
         let mut budget = AcquisitionBudget::new(f.scope.deadline.0, 16, 32);
         let fetch = f.fill.acquire_sealed(
@@ -3687,10 +3675,7 @@ mod landing {
         else {
             panic!("expected to lead");
         };
-        let target = SealedTarget {
-            helper: l.helper.clone(),
-            ordinal: 0,
-        };
+        let target = SealedTarget::gpu(l.helper.clone(), 0);
         let f = &mut l.f;
         let mut budget = AcquisitionBudget::new(f.scope.deadline.0, 16, 32);
         let fetch = f.fill.acquire_sealed(

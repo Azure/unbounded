@@ -685,6 +685,19 @@ Racer-Destination-Length: <length>
   credits.
 - If the read fails partway, the connection closes without the completion frame
   and the file may hold partial data.
+- If the file is a `memfd` created with `MFD_ALLOW_SEALING`, carries the
+  `F_SEAL_SHRINK` seal (and no write seal), is open for reading and writing,
+  and is at least `Racer-Destination-Offset + Racer-Destination-Length` bytes
+  long, the dataplane maps the destination and decrypts pages straight into
+  it on its crypto workers. That skips a plaintext copy in the dataplane and
+  the kernel copy of a positioned write. Pages that are already plaintext in
+  dataplane memory are still written with positioned writes. The client sees
+  the page's ciphertext briefly before the plaintext, and a page that fails
+  authentication is zeroed, but a page frame is still sent only after the
+  page is authenticated. Any other file gets positioned writes only.
+  `racer_host_read_direct_decrypt_pages_total` and
+  `racer_host_read_direct_decrypt_bytes_total` count pages and plaintext bytes
+  decrypted this way.
 
 `POST /v1/objects/<key>/gpu-read` writes into GPU memory. It works like
 `host-read`, with these differences:

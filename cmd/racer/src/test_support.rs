@@ -643,6 +643,11 @@ impl ReadWorker {
         &self.memory
     }
 
+    /// This worker's crypto client.
+    pub fn crypto(&self) -> Rc<CryptoClient> {
+        self.crypto.clone()
+    }
+
     /// CPU page decryptions started on this worker's crypto engine.
     pub fn cpu_decrypts(&self) -> u64 {
         self.metrics

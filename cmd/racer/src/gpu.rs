@@ -1065,10 +1065,8 @@ impl GpuHelper {
     /// Where a request on GPU `ordinal` should have sealed pages delivered,
     /// or None to get plaintext only.
     pub fn sealed_target(self: &Arc<Self>, ordinal: i32) -> Option<SealedTarget> {
-        self.decrypts(ordinal).then(|| SealedTarget {
-            helper: self.clone(),
-            ordinal,
-        })
+        self.decrypts(ordinal)
+            .then(|| SealedTarget::gpu(self.clone(), ordinal))
     }
 
     /// Usable GPUs found at startup.

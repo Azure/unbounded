@@ -1806,7 +1806,8 @@ impl WorkerApplication {
             admission.clone(),
         ));
         let mut responses = Responses::new(io.clone(), delivery)
-            .with_observer(admission.policy().observer().clone());
+            .with_observer(admission.policy().observer().clone())
+            .with_host_crypto(runtime.crypto.clone());
         if let Some(gpu) = node.gpu.get() {
             responses = responses.with_gpu(Rc::new(crate::gpu::GpuClient::new(gpu.clone())));
         } else if node.gpu.standby() {

@@ -27,6 +27,11 @@ pub use racer_wire::object::client::DirectDelivery;
 use std::os::fd::AsRawFd;
 use std::os::fd::OwnedFd;
 use std::rc::Rc;
+use std::sync::Arc;
+
+mod host_map;
+pub use host_map::DecryptInto;
+pub(crate) use host_map::HostMapping;
 
 /// The fewest pages the dataplane fetches ahead for one direct read. Clients
 /// send no credits, so this window, or `range_window_pages` when larger, alone
@@ -123,22 +128,30 @@ pub trait GpuService {
     ) -> Result<Box<dyn DirectSink>>;
 }
 
-/// Writes pages into a client file with positioned io_uring writes.
+/// Writes pages into a client file with positioned io_uring writes, or, for a
+/// memfd sealed against shrinking, decrypts sealed pages straight into a
+/// mapping of it (see [`HostMapping`]).
 pub(crate) struct HostSink {
     file: Rc<Descriptor>,
 
     delivery: Rc<Delivery>,
 
     window: Destination,
+
+    /// The mapped window and the crypto worker that decrypts into it. None
+    /// keeps positioned writes of verified plaintext for every page.
+    direct: Option<(Arc<HostMapping>, Rc<crate::security::CryptoClient>)>,
 }
 
 impl HostSink {
-    /// Accept only a regular file opened for writing. Never map it, so a
-    /// client that truncates the file cannot fault the dataplane.
+    /// Accept only a regular file opened for writing. Map it only when
+    /// [`HostMapping::new`] finds that the client cannot shrink it, so a
+    /// client cannot fault the dataplane.
     pub(crate) fn open(
         descriptor: OwnedFd,
         window: Destination,
         delivery: Rc<Delivery>,
+        crypto: Option<&Rc<crate::security::CryptoClient>>,
     ) -> Result<Self> {
         // SAFETY: fstat writes only into the zeroed stat buffer.
         let mut stat: libc::stat = unsafe { std::mem::zeroed() };
@@ -152,10 +165,14 @@ impl HostSink {
         if flags < 0 || flags & libc::O_ACCMODE == libc::O_RDONLY || flags & libc::O_APPEND != 0 {
             return Err(Error::InvalidRequest);
         }
+        let direct = crypto.and_then(|crypto| {
+            HostMapping::new(&descriptor, window).map(|mapping| (Arc::new(mapping), crypto.clone()))
+        });
         Ok(Self {
             file: Rc::new(Descriptor::from(descriptor)),
             delivery,
             window,
+            direct,
         })
     }
 }
@@ -180,10 +197,25 @@ impl DirectSink for HostSink {
                         .write_slice_at(reader, self.file.clone(), destination_offset, scope)
                         .await
                 }
-                // Never requested: host sinks have no sealed target.
-                DirectPage::Sealed { .. } => Err(Error::Internal),
+                DirectPage::Sealed { page, range } => {
+                    // Only requested when the file is mapped.
+                    let (mapping, crypto) = self.direct.as_ref().ok_or(Error::Internal)?;
+                    let job = Box::new(DecryptInto {
+                        page,
+                        range,
+                        mapping: mapping.clone(),
+                        destination: destination_offset,
+                    });
+                    // Drop the ciphertext here, on I/O, once the page is in.
+                    drop(crypto.decrypt_into(job, scope).await?);
+                    Ok(())
+                }
             }
         })
+    }
+
+    fn sealed_target(&self) -> Option<SealedTarget> {
+        self.direct.as_ref().map(|_| SealedTarget::host())
     }
 
     fn finish<'a>(&'a mut self, _scope: &'a RequestScope) -> Operation<'a, ()> {
@@ -199,6 +231,7 @@ pub(crate) fn open_sink(
     received: ReceivedDescriptors,
     delivery: &Rc<Delivery>,
     gpu: Option<&Rc<dyn GpuService>>,
+    crypto: Option<&Rc<crate::security::CryptoClient>>,
 ) -> Result<Option<Box<dyn DirectSink>>> {
     let ReceivedDescriptors {
         mut descriptors,
@@ -223,6 +256,7 @@ pub(crate) fn open_sink(
             descriptor,
             destination,
             delivery.clone(),
+            crypto,
         )?))),
         (
             DirectDelivery::Gpu,
