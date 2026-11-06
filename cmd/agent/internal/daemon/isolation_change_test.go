@@ -297,9 +297,10 @@ func TestRun_ResolvesAnInterruptedChangeBeforeItNeedsTheCluster(t *testing.T) {
 
 	op := &fakeNodeOperator{active: h.active}
 	err := run(context.Background(), discardLogger(), runOptions{
-		NodeOperator: op,
-		installation: installstate.NewStore(t.TempDir(), filepath.Join(t.TempDir(), "lock")),
-		Migration:    h.env,
+		NodeOperator:        op,
+		installation:        installstate.NewStore(t.TempDir(), filepath.Join(t.TempDir(), "lock")),
+		DaemonCredentialDir: t.TempDir(),
+		Migration:           h.env,
 		NewClient: func(*rest.Config, client.Options) (client.WithWatch, error) {
 			return nil, errors.New("no route to the API server")
 		},

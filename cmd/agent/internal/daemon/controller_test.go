@@ -688,6 +688,7 @@ func TestReconcileRepave_UsesDesiredMachineConfigurationVersion(t *testing.T) {
 	c := fakeStatusClient(machine, mcv)
 	reconciler := &repaveReconciler{
 		installation: installstate.NewStore(filepath.Join(t.TempDir(), "state"), filepath.Join(t.TempDir(), "install.lock")),
+		env:          testMigrationEnv(t),
 		Client:       c,
 		log:          discardLogger(),
 		machineName:  "test-machine",
@@ -744,6 +745,7 @@ func TestReconcileRepave_NoDriftMarksDesiredConfigurationApplied(t *testing.T) {
 	c := fakeStatusClient(machine, mcv)
 	reconciler := &repaveReconciler{
 		installation: installstate.NewStore(filepath.Join(t.TempDir(), "state"), filepath.Join(t.TempDir(), "install.lock")),
+		env:          testMigrationEnv(t),
 		Client:       c,
 		log:          discardLogger(),
 		machineName:  "test-machine",
