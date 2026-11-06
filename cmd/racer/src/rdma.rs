@@ -175,6 +175,62 @@ pub fn is_overflow(
         && !is_rdma_edge(membership, local, peer)
 }
 
+/// Why a peer page exchange was planned over HTTP although this node
+/// publishes RDMA rails.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum HttpPlanReason {
+    /// Both ends share a nonempty Site and publish rails, but not the page's
+    /// hashed rail.
+    NoRail,
+    /// The ends differ in Site, have no Site, or the peer publishes no rails.
+    Ineligible,
+    /// The hop qualifies by Site and rail but is not an RDMA edge.
+    Overflow,
+    /// The exchange was sent directly over HTTP by request.
+    DirectHttp,
+}
+
+impl HttpPlanReason {
+    /// The metric event for this reason.
+    pub fn event(self) -> crate::telemetry::Event {
+        use crate::telemetry::Event;
+        match self {
+            Self::NoRail => Event::RdmaPlanHttpNoRail,
+            Self::Ineligible => Event::RdmaPlanHttpIneligible,
+            Self::Overflow => Event::RdmaPlanHttpOverflow,
+            Self::DirectHttp => Event::RdmaPlanHttpDirect,
+        }
+    }
+}
+
+/// Classify an HTTP plan for `page` from `local` to `peer`. `None` when this
+/// node publishes no rails (RDMA is off here, so HTTP is expected) or when
+/// either node is not a member.
+pub fn http_plan_reason(
+    membership: &crate::topology::Membership,
+    page: &PageId,
+    local: &racer_wire::control::NodeId,
+    peer: &racer_wire::control::NodeId,
+    direct_http: bool,
+) -> Option<HttpPlanReason> {
+    let (Ok(a), Ok(b)) = (membership.member(local), membership.member(peer)) else {
+        return None;
+    };
+    if a.rails.is_empty() {
+        return None;
+    }
+    if direct_http {
+        return Some(HttpPlanReason::DirectHttp);
+    }
+    if a.site.is_empty() || a.site != b.site || b.rails.is_empty() {
+        return Some(HttpPlanReason::Ineligible);
+    }
+    if rail_plan(membership, &[a, b], page).is_none() {
+        return Some(HttpPlanReason::NoRail);
+    }
+    Some(HttpPlanReason::Overflow)
+}
+
 /// The symmetric RDMA eligibility of an edge: both ends are in the same
 /// nonempty Site and publish at least one common rail.
 fn rdma_eligible(ours: &crate::topology::Member, theirs: &crate::topology::Member) -> bool {
@@ -1003,6 +1059,10 @@ pub(crate) mod tests {
                     } else {
                         assert_eq!(plan, TransportPlan::Http);
                         assert!(is_overflow(&membership, &page(0), a, b));
+                        assert_eq!(
+                            http_plan_reason(&membership, &page(0), a, b, false),
+                            Some(HttpPlanReason::Overflow)
+                        );
                     }
                     // The cached peer set agrees with the topology crate.
                     let took = membership
@@ -1066,6 +1126,66 @@ pub(crate) mod tests {
                 &nodes[0],
                 &NodeId("unknown".into())
             ));
+        }
+        #[test]
+        fn http_plans_are_classified_by_reason() {
+            let membership = {
+                let members = (0..4)
+                    .map(|i| {
+                        let mut member = member(i, 4);
+                        member.site = if i == 2 { "site2" } else { "site1" }.into();
+                        member.rails = match i {
+                            // Only rail 2; page 0 hashes to rail 7.
+                            0 => mappings()[1..].to_vec(),
+                            1 => vec![],
+                            _ => mappings(),
+                        };
+                        member
+                    })
+                    .collect();
+                Arc::new(Membership::validate(MembershipVersion(1), members).unwrap())
+            };
+            let by_rails = |rails: usize, site: &str| {
+                membership
+                    .members()
+                    .iter()
+                    .find(|m| m.rails.len() == rails && m.site == site)
+                    .unwrap()
+                    .node
+                    .clone()
+            };
+            let local = by_rails(2, "site1");
+            let partial = by_rails(1, "site1");
+            let bare = by_rails(0, "site1");
+            let remote = by_rails(2, "site2");
+            let reason = |a: &NodeId, b: &NodeId, direct| {
+                http_plan_reason(&membership, &page(0), a, b, direct)
+            };
+            assert_eq!(hop(&membership, &local, &partial), TransportPlan::Http);
+            assert_eq!(
+                reason(&local, &partial, false),
+                Some(HttpPlanReason::NoRail)
+            );
+            assert_eq!(
+                reason(&local, &bare, false),
+                Some(HttpPlanReason::Ineligible)
+            );
+            assert_eq!(
+                reason(&local, &remote, false),
+                Some(HttpPlanReason::Ineligible)
+            );
+            assert_eq!(
+                reason(&local, &partial, true),
+                Some(HttpPlanReason::DirectHttp)
+            );
+            // A node without rails expects HTTP and counts nothing.
+            assert_eq!(reason(&bare, &local, false), None);
+            assert_eq!(reason(&bare, &local, true), None);
+            assert_eq!(reason(&local, &NodeId("unknown".into()), false), None);
+            assert_eq!(
+                HttpPlanReason::NoRail.event(),
+                crate::telemetry::Event::RdmaPlanHttpNoRail
+            );
         }
         #[test]
         fn golden_page_to_rail_vectors() {

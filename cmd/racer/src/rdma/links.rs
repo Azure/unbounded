@@ -473,6 +473,22 @@ impl Links {
         self.record(crate::telemetry::Event::RdmaFallbackOverflow, 1);
     }
 
+    /// Count a granted page the sender declined to write, so the receiver
+    /// gets its body over HTTP: the response was not a page body
+    /// (`not_page`), or the sender's own plan for the page and edge differs
+    /// from the granted rail (`plan_mismatch`), for example after a rail or
+    /// membership change.
+    pub fn record_send_declined(&self, not_page: bool) {
+        self.record(
+            if not_page {
+                crate::telemetry::Event::RdmaSendDeclinedNotPage
+            } else {
+                crate::telemetry::Event::RdmaSendDeclinedPlan
+            },
+            1,
+        );
+    }
+
     /// Free page buffers across the active rails.
     pub fn free_buffers(&self) -> usize {
         self.active()

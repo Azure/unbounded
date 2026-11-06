@@ -315,6 +315,7 @@ impl Transfers {
             &response.response
         else {
             links.release(peer, &grant);
+            links.record_send_declined(true);
             return Ok((connection, false));
         };
         let checked = (|| {
@@ -347,6 +348,7 @@ impl Transfers {
         let scope = &bounded;
         if plan != (TransportPlan::Rdma { rail: binding.rail }) {
             links.release(peer, &grant);
+            links.record_send_declined(false);
             return Ok((connection, false));
         }
         binding.response = envelope_digest(&response.authentication)?;
@@ -2384,6 +2386,8 @@ mod tests {
             completions: usize,
             released: bool,
             free: (Option<usize>, Option<usize>),
+            /// Sends the sender declined because its plan disagreed with the grant.
+            declined: u64,
         }
 
         fn page_membership(
@@ -2428,10 +2432,12 @@ mod tests {
             if case.reverse {
                 signers.swap(0, 2);
             }
-            let mut w = world_for(
+            let w = world_for(
                 [signers[0].node().clone(), signers[2].node().clone()],
                 false,
             );
+            // `w.b` is always the sending node.
+            let (mut w, _, sender_metrics) = crate::rdma::links::tests::send_in_place::metered(w);
             let env = w.env.clone();
             link_up(&env, &mut w);
             let admission = Rc::new(flow_control::Quotas::new(AdmissionPolicy::new(
@@ -2757,6 +2763,7 @@ mod tests {
                 completions: receiver.native_completions.get(),
                 released: released.get(),
                 free: free(&w),
+                declined: sender_metrics.count(crate::telemetry::Event::RdmaSendDeclinedPlan),
             }
         }
 
@@ -2779,6 +2786,7 @@ mod tests {
                     );
                     assert_eq!(page_bytes(&outcome.result), vec![0x5a; 144]);
                     assert_eq!(outcome.sent, Ok(true));
+                    assert_eq!(outcome.declined, 0);
                     assert_eq!(
                         (outcome.completed, outcome.fallbacks, outcome.completions),
                         (1, 0, 1),
@@ -2860,6 +2868,7 @@ mod tests {
                     );
                     assert_eq!(page_bytes(&outcome.result), vec![0x5a; 144]);
                     assert_eq!(outcome.sent, Ok(false));
+                    assert_eq!(outcome.declined, 1, "the declined send is counted");
                     assert!(outcome.released, "the receiver's grant is released");
                     assert_eq!(
                         (outcome.completed, outcome.fallbacks, outcome.completions),

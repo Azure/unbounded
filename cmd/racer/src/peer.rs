@@ -1049,7 +1049,7 @@ impl Requester {
                     return Err(Error::InvalidRequest);
                 }
                 crate::rdma::TransportPlan::Http
-            } else if let Some(page) = rail_hint {
+            } else if let Some(page) = &rail_hint {
                 let search = search_budget(budget, &network.local)?;
                 let route = paths
                     .shortest_async(membership.clone(), &network.local, &search, &scope)
@@ -1057,10 +1057,23 @@ impl Requester {
                 if route.nodes.get(1) != Some(&next) {
                     return Err(Error::Unavailable);
                 }
-                rdma::select_hop(&route, &page, &network.local, &next)?
+                rdma::select_hop(&route, page, &network.local, &next)?
             } else {
                 crate::rdma::TransportPlan::Http
             };
+            if plan == crate::rdma::TransportPlan::Http
+                && let Some(page) = &rail_hint
+                && let Some(reason) = crate::rdma::http_plan_reason(
+                    &membership,
+                    page,
+                    &network.local,
+                    &next,
+                    direct_http,
+                )
+                && let Self::Network { metrics, .. } = self
+            {
+                metrics.record(reason.event(), 1);
+            }
             // The last link: this sender learns whether the destination
             // answers.
             let last_page = match &request.request.operation {

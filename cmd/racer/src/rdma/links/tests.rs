@@ -971,6 +971,18 @@ pub(crate) mod send_in_place {
         assert_eq!(ma.count(Event::RdmaFallbackGrant), 2);
         assert_eq!(ma.count(Event::RdmaFallbackGrantOverloaded), 1);
     }
+
+    #[test]
+    fn declined_sends_are_counted_by_reason_apart_from_http_fallback() {
+        let w = world();
+        let (w, ma, _) = metered(w);
+        w.a.links.record_send_declined(false);
+        w.a.links.record_send_declined(false);
+        w.a.links.record_send_declined(true);
+        assert_eq!(ma.count(Event::RdmaSendDeclinedPlan), 2);
+        assert_eq!(ma.count(Event::RdmaSendDeclinedNotPage), 1);
+        assert_eq!(ma.count(Event::RdmaHttpFallback), 0);
+    }
 }
 
 #[test]

@@ -332,6 +332,12 @@ metrics! { Event, EVENTS, EVENT_COUNT;
             Self::RdmaFallbackGrant => "racer_rdma_fallback_grant_total",
             Self::RdmaFallbackGrantOverloaded => "racer_rdma_fallback_grant_overloaded_total",
             Self::RdmaFallbackOverflow => "racer_rdma_fallback_overflow_total",
+            Self::RdmaPlanHttpNoRail => "racer_rdma_plan_http_total" { "reason=\"no_rail\"" },
+            Self::RdmaPlanHttpIneligible => "racer_rdma_plan_http_total" { "reason=\"ineligible\"" },
+            Self::RdmaPlanHttpOverflow => "racer_rdma_plan_http_total" { "reason=\"overflow\"" },
+            Self::RdmaPlanHttpDirect => "racer_rdma_plan_http_total" { "reason=\"direct_http\"" },
+            Self::RdmaSendDeclinedNotPage => "racer_rdma_send_declined_total" { "reason=\"not_page\"" },
+            Self::RdmaSendDeclinedPlan => "racer_rdma_send_declined_total" { "reason=\"plan_mismatch\"" },
             Self::RdmaActivationFailure => "racer_rdma_activation_failures_total",
             Self::RdmaLinkBreakError => "racer_rdma_link_breaks_total" { "reason=\"error\"" },
             Self::RdmaLinkBreakTimeout => "racer_rdma_link_breaks_total" { "reason=\"timeout\"" },
@@ -1914,6 +1920,8 @@ mod tests {
                         && !line.starts_with("racer_gpu_read_requests_total{")
                         && !line.starts_with("racer_rdma_link_breaks_total{")
                         && !line.starts_with("racer_rdma_link_setups_total{")
+                        && !line.starts_with("racer_rdma_plan_http_total{")
+                        && !line.starts_with("racer_rdma_send_declined_total{")
                         && !line.starts_with("racer_prefetch_")
                 })
                 .collect();

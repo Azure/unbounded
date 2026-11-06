@@ -1782,6 +1782,17 @@ through implicit on-demand paging); those writes may stall on NIC page faults.
 qualified by Site and rail but was not among the 256 RDMA peers both nodes chose.
 The receiving node of each such hop counts each delivered body once. Requests that
 deliver no body, such as misses, overloads, and failed exchanges, do not count.
+`racer_rdma_plan_http_total{reason}` counts page exchanges this node sends to a peer
+over HTTP, without ever planning RDMA, while it publishes RDMA rails itself. `reason` is
+`no_rail` (both nodes share a Site and publish rails, but not the page's rail, which
+usually means the nodes number their rails differently), `ineligible` (different or
+missing Site, or the peer publishes no rails), `overflow` (the hop qualified but is not
+among the RDMA peers both nodes chose), or `direct_http` (the exchange was sent directly
+over HTTP). Nodes that publish no rails count nothing.
+`racer_rdma_send_declined_total{reason}` counts granted pages the sending node declined
+to write, so the body went over HTTP and the receiver's grant was released: `not_page`
+(the response carried no page body) or `plan_mismatch` (the sender's plan for the page
+and hop disagreed with the granted rail, for example across a Site or rail change).
 The Node annotation `racer.unbounded-cloud.io/rdma-nics` accepts at most 64 entries:
 
 ```json
