@@ -6392,7 +6392,7 @@ impl Origin for SizedOrigin {
     }
 }
 
-/// D13: a small-page cluster reserves one small page of plaintext per origin fill and bootstrap,
+/// A small-page cluster reserves one small page of plaintext per origin fill and bootstrap,
 /// not the 16 MiB maximum.
 #[test]
 fn small_page_cluster_reserves_page_sized_plaintext() {

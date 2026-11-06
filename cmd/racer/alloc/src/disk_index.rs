@@ -60,7 +60,7 @@
 use crate::{Error, Extent, Generation, Result, SegmentId, SegmentLease, SegmentState, Segments};
 use std::collections::{BTreeMap, BTreeSet};
 
-/// Maximum caches per publication (D11).
+/// Maximum caches a disk index tracks at once: the bound on live [`CacheIdx`] values.
 pub const MAX_CACHES: usize = 4096;
 
 const NIL: u32 = u32::MAX;

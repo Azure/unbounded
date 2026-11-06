@@ -2427,7 +2427,7 @@ mod tests {
             );
         }
     }
-    /// D13: a fill names the page size its pages were cut at, and the range
+    /// A fill names the page size its pages were cut at, and the range
     /// check runs at that size: a page past the end at 64 KiB is refused even
     /// though it would be page zero's neighbor at 16 MiB.
     #[test]

@@ -162,7 +162,7 @@ fn idempotency_and_ordering_table() {
     );
 }
 
-/// D13: refs are cut at the cluster page size, so a 16 MiB range of a
+/// Refs are cut at the cluster page size, so a 16 MiB range of a
 /// 64 KiB-page cluster is 256 units and every byte count uses 64 KiB.
 #[test]
 fn refs_are_cut_at_the_cluster_page_size() {

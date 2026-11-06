@@ -321,7 +321,7 @@ fn a_node_that_left_the_cache_pool_refuses_retained_membership_requests() {
     endpoint.uninstall().unwrap();
 }
 
-/// D13: an owner refuses a fill whose pages were cut at another page size
+/// An owner refuses a fill whose pages were cut at another page size
 /// than the cluster's, before probing or filling anything.
 #[test]
 fn owner_refuses_a_fill_cut_at_another_page_size() {

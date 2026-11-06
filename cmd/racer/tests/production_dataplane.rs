@@ -1639,7 +1639,7 @@ fn subscription_credits_persist_three_pages_and_serve_partial_disk_range_offline
 
 #[test]
 fn small_published_pages_fill_persist_and_serve_cross_page_ranges() {
-    // D13: the cluster publishes 64 KiB pages; origin fetches, records, and
+    // The cluster publishes 64 KiB pages; origin fetches, records, and
     // range slicing all follow it instead of the 16 MiB default.
     let size = racer_wire::object::PageSize::new(64 << 10).unwrap();
     FIXTURE_PAGE_SIZE.set(size);

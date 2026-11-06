@@ -1,11 +1,12 @@
 //! Simulation support for deterministic harnesses outside this crate.
 //!
-//! Not a stable API and not a cargo feature (simulation is always compiled,
-//! plan decision D9). It exposes what a deterministic simulation needs to run
-//! real [`Authority`](crate::Authority) instances against the in-memory
-//! Kubernetes API that this crate's own simulated tests use: [`FakeKube`] (the
-//! API server as a steppable role on the simulated network), [`KubeView`]
-//! (read-only observation and fault injection), and [`pod_config`].
+//! Not a stable API and not a cargo feature: simulation is always compiled so
+//! deterministic harnesses need no feature flag. It exposes what a
+//! deterministic simulation needs to run real [`Authority`](crate::Authority)
+//! instances against the in-memory Kubernetes API that this crate's own
+//! simulated tests use: [`FakeKube`] (the API server as a steppable role on the
+//! simulated network), [`KubeView`] (read-only observation and fault
+//! injection), and [`pod_config`].
 //!
 //! Every identity is fixed: Pod `i` (1-based) is `p{i}` on Node `n{i}` with
 //! control address `10.0.1.{i}:8443`; the API server is `10.0.0.1:443`. The

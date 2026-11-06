@@ -150,7 +150,11 @@ pub struct PageId {
 /// this constant bound every [`PageSize`].
 pub const PAGE_BYTES: u64 = PageSize::MAX.get();
 
-/// Cluster-wide logical page size, published by the authority (D13).
+/// Cluster-wide logical page size, published by the authority.
+///
+/// Every page, fill, stored record, and checkpoint carries the page size it was cut at. Nodes
+/// refuse data cut at another size and recover cold rather than reinterpret it, and a running
+/// node rejects a publication that changes the size.
 ///
 /// A power of two in [`PageSize::MIN`]..=[`PageSize::MAX`]; test-support constructors also allow
 /// sizes down to [`PageSize::TEST_MIN`].
@@ -629,7 +633,7 @@ pub trait PageDescriptor {
     /// Return the decoded page length, excluding transport or encryption overhead.
     fn plaintext_length(&self) -> u32;
 
-    /// Return the page size the page was cut at (D13).
+    /// Return the page size the page was cut at.
     fn page_size(&self) -> PageSize;
 }
 

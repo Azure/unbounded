@@ -88,7 +88,7 @@ pub struct Config {
 
     pub rotation: Rotation,
 
-    /// Cluster-wide page size published to every node (D13).
+    /// Cluster-wide page size published to every node.
     pub page_size: racer_wire::object::PageSize,
 }
 

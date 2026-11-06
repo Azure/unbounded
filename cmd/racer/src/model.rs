@@ -40,7 +40,7 @@ impl TryFrom<u32> for PageCipher {
 pub struct PageEnvelope {
     pub cipher: PageCipher,
 
-    /// Cluster page size the page was cut at (D13); bounds `plaintext_length`.
+    /// Cluster page size the page was cut at; bounds `plaintext_length`.
     pub page_size: PageSize,
 
     pub page: PageId,

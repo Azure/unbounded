@@ -1185,7 +1185,7 @@ pub enum CryptoInput {
     },
     Encrypt {
         page: PageId,
-        /// Cluster page size the plaintext was cut at (D13).
+        /// Cluster page size the plaintext was cut at.
         page_size: racer_wire::object::PageSize,
         plaintext: PlaintextBuffer,
         /// Aligned AEAD output checked out of the requesting worker's pool,
@@ -4085,7 +4085,7 @@ mod tests {
                     changed.plaintext_length += 1;
                     changed.ciphertext_length += 1;
                 }
-                // D13: the same page number at another page size.
+                // The same page number at another page size.
                 7 => changed.page_size = racer_wire::object::PageSize::new(64 << 10).unwrap(),
                 _ => changed.page.version.object.cache.0.replace_range(..1, "4"),
             }

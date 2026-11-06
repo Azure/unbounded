@@ -164,7 +164,7 @@ impl PageTicket {
 #[derive(Clone, Debug)]
 pub struct IndexedPage {
     pub location: RecordLocation,
-    /// Page size the stored record was cut at (D13).
+    /// Page size the stored record was cut at.
     pub page_size: racer_wire::object::PageSize,
     pub metadata: VersionMetadata,
     pub key_id: KeyId,

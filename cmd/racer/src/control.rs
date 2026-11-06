@@ -147,7 +147,7 @@ pub struct Snapshot {
     /// reads them through `membership`.
     pub pools: Vec<racer_wire::control::Pool>,
 
-    /// Cluster-wide page size (D13), fixed for the life of the process: a publication that
+    /// Cluster-wide page size, fixed for the life of the process: a publication that
     /// changes it is rejected.
     pub page_size: racer_wire::object::PageSize,
 

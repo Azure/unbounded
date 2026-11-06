@@ -171,7 +171,7 @@ pub struct Publication {
     /// Node pools of the catalog's caches. Each cache is in exactly one pool.
     pub pools: Vec<Pool>,
 
-    /// Cluster-wide logical page size every node adopts (D13).
+    /// Cluster-wide logical page size every node adopts.
     pub page_size: crate::object::PageSize,
 }
 
@@ -3138,7 +3138,7 @@ mod codec {
             let mut no_pools: Value = serde_json::from_str(&raw).unwrap();
             no_pools.as_object_mut().unwrap().remove("pools");
             assert!(decode_publication(&serde_json::to_vec(&no_pools).unwrap()).is_err());
-            // D13: the page size is required, validated, and part of the content hash.
+            // The page size is required, validated, and part of the content hash.
             let mut paged: Value = serde_json::from_str(&raw).unwrap();
             paged.as_object_mut().unwrap().remove("page_bytes");
             assert!(decode_publication(&serde_json::to_vec(&paged).unwrap()).is_err());

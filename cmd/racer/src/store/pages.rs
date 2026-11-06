@@ -99,7 +99,7 @@ pub(super) struct Pages {
     slots: u32,
     /// Stored pages (in-flight reservations excluded).
     stored: usize,
-    /// Page size of every stored record (D13). Fixed by the first stored page
+    /// Page size of every stored record. Fixed by the first stored page
     /// while the table is empty; a record cut at another size is refused.
     page_size: racer_wire::object::PageSize,
     versions: HashMap<ObjectVersion, (VersionMetadata, usize)>,

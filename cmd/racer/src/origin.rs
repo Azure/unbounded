@@ -499,7 +499,7 @@ pub fn validate_metadata(head: &MessageHead, object: &ObjectId) -> Result<Object
 pub struct OriginPage {
     pub metadata: ObjectMetadata,
     pub plaintext: PlaintextBuffer,
-    /// Page size the plaintext was cut at (D13).
+    /// Page size the plaintext was cut at.
     pub page_size: PageSize,
 }
 /// Require exact If-Match, Content-Range, whole-page length, and final-page bounds.

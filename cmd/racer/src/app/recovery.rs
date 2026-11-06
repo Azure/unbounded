@@ -676,7 +676,7 @@ fn select(
     candidates.into_iter().find_map(|image| {
         let sequence = image.sequence;
         // A cut taken under another published page size cuts every page at
-        // the wrong offsets: start cold rather than serve it (D13).
+        // the wrong offsets: start cold rather than serve it.
         if image.page_size != page_size {
             eprintln!("racer: skipping checkpoint sequence {sequence} cut at another page size");
             return None;
@@ -1203,7 +1203,7 @@ mod tests {
                 .sequence,
             2
         );
-        // A cut taken under another published page size starts cold (D13).
+        // A cut taken under another published page size starts cold.
         let mut resized = candidate(4, guarded);
         resized.page_size = racer_wire::object::PageSize::new(64 << 10).unwrap();
         assert_eq!(

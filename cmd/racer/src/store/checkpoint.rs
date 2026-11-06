@@ -849,7 +849,7 @@ impl ShardImage {
 
 pub struct CheckpointImage {
     pub version: u32,
-    /// Page size every entry was cut at (D13). Recovery under another
+    /// Page size every entry was cut at. Recovery under another
     /// published page size discards the image and starts cold.
     pub page_size: racer_wire::object::PageSize,
     /// Cluster UID that owns the keys named by page entries.
