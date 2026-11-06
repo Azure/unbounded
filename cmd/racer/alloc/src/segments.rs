@@ -701,6 +701,12 @@ impl Segments {
         self.evicting.get()
     }
 
+    /// Whether eviction and recycling are frozen by a live [`FreezeGuard`],
+    /// so no reclaim can add a free slot until the guard drops.
+    pub fn reuse_frozen(&self) -> bool {
+        self.frozen.get()
+    }
+
     /// Number of immediately appendable slots, excluding pending eviction.
     pub fn free_count(&self) -> usize {
         self.free.borrow().len()

@@ -416,9 +416,13 @@ metrics! { Event, EVENTS, EVENT_COUNT;
             Self::DirtyDiscardPressure => "racer_dirty_discard_reasons_total" { "reason=\"memory_pressure\"" },
             Self::DirtyDiscardOwnedReclaim => "racer_dirty_discard_reasons_total" { "reason=\"owned_reclaim\"" },
             Self::DirtyDiscardWriteFailed => "racer_dirty_discard_reasons_total" { "reason=\"write_failed\"" },
+            Self::DirtyDiscardWriteFailedNoSpace => "racer_dirty_discard_reasons_total" { "reason=\"write_failed_no_space\"" },
+            Self::DirtyDiscardWriteFailedIndexFull => "racer_dirty_discard_reasons_total" { "reason=\"write_failed_index_full\"" },
+            Self::DirtyDiscardWriteFailedIo => "racer_dirty_discard_reasons_total" { "reason=\"write_failed_io\"" },
             Self::DirtyDiscardSuperseded => "racer_dirty_discard_reasons_total" { "reason=\"superseded\"" },
             Self::DirtyDiscardCanceled => "racer_dirty_discard_reasons_total" { "reason=\"canceled\"" },
             Self::DirtyDiscardRemoved => "racer_dirty_discard_reasons_total" { "reason=\"cache_removed\"" },
+            Self::DirtyWriteDeferred => "racer_dirty_write_deferred_total",
 }
 
 /// The labeled request counter for one `gpu-read` outcome.

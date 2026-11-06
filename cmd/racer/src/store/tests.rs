@@ -116,6 +116,73 @@ mod index_pressure {
         assert!(index.snapshot().unwrap().entries.len() <= 2);
     }
     #[test]
+    fn full_index_while_checkpoint_freezes_reuse_defers_write_until_publication() {
+        let env = racer_io::Env::host();
+        let f = fixture(&env, 2);
+        let index = f.store.writer.index();
+        persist(&env, &f, 1);
+        persist(&env, &f, 2);
+        // The snapshot freezes eviction and recycling but thaws appends.
+        let image =
+            futures::executor::block_on(f.store.checkpoint.snapshot_incremental(1 << 30)).unwrap();
+        assert!(f.segments.reuse_frozen());
+        let copy = f.copy(3, 113);
+        let third = copy.ciphertext.envelope().page.clone();
+        f.enqueue(copy).unwrap();
+        // The index is full and no entry can be reclaimed while frozen: the
+        // page stays queued instead of being discarded as write_failed.
+        assert_eq!(
+            drive(&f.reactor, f.store.writer.progress(4, &scope(&env))).unwrap(),
+            1
+        );
+        assert!(index.lookup(&third).unwrap().is_none());
+        assert_eq!(f.store.writer.discarded_count(), 0);
+        assert_eq!(f.store.writer.pending_count(), 1);
+        assert_eq!(f.store.writer.queued_count(), 1);
+        assert!(f.store.writer.space_deferred());
+        assert!(!f.store.writer.can_start_progress());
+        assert_eq!(
+            f.metrics.count(crate::telemetry::Event::DirtyWriteDeferred),
+            1
+        );
+        // A deferred writer does not retry while still frozen.
+        assert_eq!(
+            drive(&f.reactor, f.store.writer.progress(4, &scope(&env))).unwrap(),
+            0
+        );
+        assert_eq!(
+            f.metrics.count(crate::telemetry::Event::DirtyWriteDeferred),
+            1
+        );
+        futures::executor::block_on(f.store.checkpoint.publish(
+            &env,
+            crate::store::checkpoint::test_cluster(),
+            vec![image],
+        ))
+        .unwrap();
+        f.store.checkpoint.finish_snapshot();
+        assert!(!f.store.writer.space_deferred());
+        assert!(f.store.writer.can_start_progress());
+        assert_eq!(
+            drive(&f.reactor, f.store.writer.progress(4, &scope(&env))).unwrap(),
+            1
+        );
+        assert!(index.lookup(&third).unwrap().is_some());
+        assert_eq!(f.store.writer.discarded_count(), 0);
+        assert_eq!(f.store.writer.pending_count(), 0);
+        for event in [
+            crate::telemetry::Event::DirtyDiscardWriteFailed,
+            crate::telemetry::Event::DirtyDiscardWriteFailedIndexFull,
+            crate::telemetry::Event::DirtyDiscardWriteFailedNoSpace,
+        ] {
+            assert_eq!(f.metrics.count(event), 0, "{event:?}");
+        }
+        let read = drive(&f.reactor, f.store.reader.read(&third, &scope(&env)))
+            .unwrap()
+            .unwrap();
+        assert_eq!(read.ciphertext.bytes(), vec![3; 129]);
+    }
+    #[test]
     fn replacement_does_not_evict_neighbors_or_let_old_tokens_remove_new_mapping() {
         let env = racer_io::Env::host();
         let f = fixture(&env, 2);
@@ -6276,4 +6343,36 @@ fn record_alignment_pads_pool_bodies_to_the_record_unit() {
     // A 4 KiB device is already at the record unit.
     let default = crate::memory::default_disk_alignment();
     assert_eq!(record_alignment(default).unwrap(), default);
+}
+
+#[test]
+fn write_failure_causes_map_to_distinct_discard_reasons() {
+    use crate::store::WriteFailure;
+    use crate::telemetry::Event;
+    assert_eq!(WriteFailure::classify(Error::Io), WriteFailure::Io);
+    assert_eq!(WriteFailure::classify(Error::Os(5)), WriteFailure::Io);
+    assert_eq!(
+        WriteFailure::classify(Error::Overloaded),
+        WriteFailure::Other
+    );
+    assert_eq!(
+        WriteFailure::classify(Error::Unavailable),
+        WriteFailure::Other
+    );
+    assert!(matches!(
+        WriteFailure::NoSpace.event(),
+        Event::DirtyDiscardWriteFailedNoSpace
+    ));
+    assert!(matches!(
+        WriteFailure::IndexFull.event(),
+        Event::DirtyDiscardWriteFailedIndexFull
+    ));
+    assert!(matches!(
+        WriteFailure::Io.event(),
+        Event::DirtyDiscardWriteFailedIo
+    ));
+    assert!(matches!(
+        WriteFailure::Other.event(),
+        Event::DirtyDiscardWriteFailed
+    ));
 }

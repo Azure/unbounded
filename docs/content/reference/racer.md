@@ -1113,13 +1113,19 @@ Ownership refresh affects subsequent events only, never rewrites old counters.
 | `racer_disk_publications_total` | Queued page writes that completed and were published to the disk index |
 | `racer_dirty_discards_total` | Queued page writes (accepted persistence attempts) dropped without a publication, all reasons |
 | `racer_dirty_discard_reasons_total{reason}` | The same discards split by reason, listed below |
+| `racer_dirty_write_deferred_total` | Writes kept queued because no free segment or index entry could be reclaimed during a checkpoint |
 
 Each worker's writer keeps up to 8 page writes in flight, submitting the next
 queued page as each write completes. A periodic checkpoint holds back new
 writes on a worker only until that worker has copied its snapshot. After that,
 writes continue into free segments while segment eviction and reuse stay frozen
-until the checkpoint is published. Writes that need a new segment while none
-is free fail and count as `write_failed`.
+until the checkpoint is published. A write that finds no free segment or
+index entry during that window is not discarded: the page stays queued, the
+worker stops starting new writes, and it retries once the checkpoint finishes.
+Each such deferral counts in `racer_dirty_write_deferred_total`. Outside a
+checkpoint, a write that still finds no space after reclamation fails and is
+discarded. Failed writes are logged at most once every 10 seconds per worker
+with `stage=persist` and the cause.
 
 `reason` takes these values:
 
@@ -1128,7 +1134,10 @@ is free fail and count as `write_failed`.
 | `displaced` | The writer queue was full, so a lower-ranked queued page made room for a new one |
 | `memory_pressure` | A queued page's ciphertext or staging memory was reclaimed for other work, such as new fills |
 | `owned_reclaim` | A queued optional page was dropped to make room for an owned page's persistence |
-| `write_failed` | The write was submitted but failed, for example no free segment, a full index, or an I/O error |
+| `write_failed_no_space` | The write failed because no free segment was available after reclamation |
+| `write_failed_index_full` | The write failed because no index entry was available after reclamation |
+| `write_failed_io` | The write failed with a device or OS I/O error |
+| `write_failed` | The write failed for any other reason |
 | `superseded` | The write finished, but the page was removed, replaced, or its cache became unavailable first |
 | `canceled` | A deadline, cancellation, or shutdown dropped the queued write |
 | `cache_removed` | The page's ClusterCache was removed while the write was queued |

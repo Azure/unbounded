@@ -593,7 +593,42 @@ pub struct StoreWriter {
     availability: Rc<crate::control::Availability>,
     discarded: Cell<u64>,
     closed: Cell<bool>,
+    /// Set when a write found no free segment (or index entry) while segment
+    /// reuse was frozen by a checkpoint. New writes wait until the freeze ends.
+    space_deferred: Cell<bool>,
+    /// Last time a persist failure was logged, for rate limiting.
+    last_failure_log: Cell<Option<std::time::Instant>>,
 }
+/// Why a dirty page write failed, for `racer_dirty_discard_reasons_total`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum WriteFailure {
+    /// No free segment slot was available after reclamation.
+    NoSpace,
+    /// No index entry was available after reclamation.
+    IndexFull,
+    /// The device or OS reported an I/O error.
+    Io,
+    /// Any other failure.
+    Other,
+}
+impl WriteFailure {
+    pub(crate) fn classify(error: Error) -> Self {
+        match error {
+            Error::Io | Error::Os(_) => Self::Io,
+            _ => Self::Other,
+        }
+    }
+    pub(crate) fn event(self) -> crate::telemetry::Event {
+        match self {
+            Self::NoSpace => crate::telemetry::Event::DirtyDiscardWriteFailedNoSpace,
+            Self::IndexFull => crate::telemetry::Event::DirtyDiscardWriteFailedIndexFull,
+            Self::Io => crate::telemetry::Event::DirtyDiscardWriteFailedIo,
+            Self::Other => crate::telemetry::Event::DirtyDiscardWriteFailed,
+        }
+    }
+}
+/// Minimum spacing between logged persist failures on one worker.
+const PERSIST_FAILURE_LOG_INTERVAL: std::time::Duration = std::time::Duration::from_secs(10);
 impl StoreWriter {
     pub fn retention(&self) -> Rc<crate::retention::Retention> {
         self.index.retention()
@@ -638,6 +673,8 @@ impl StoreWriter {
             active_scope: RefCell::new(None),
             availability,
             discarded: Cell::new(0),
+            space_deferred: Cell::new(false),
+            last_failure_log: Cell::new(None),
             closed: Cell::new(false),
         }
     }
@@ -1111,7 +1148,32 @@ impl StoreWriter {
         !self.paused.get() && !self.refill_fenced.get()
     }
     pub(crate) fn can_start_progress(&self) -> bool {
-        !self.paused.get() && !self.busy.get()
+        !self.paused.get() && !self.busy.get() && !self.space_deferred()
+    }
+    /// True while writes wait for a checkpoint freeze to end because no free
+    /// segment or index entry could be reclaimed. Clears once reuse thaws.
+    pub(crate) fn space_deferred(&self) -> bool {
+        if self.space_deferred.get() && !self.segments.reuse_frozen() {
+            self.space_deferred.set(false);
+        }
+        self.space_deferred.get()
+    }
+    /// Log a persist failure at most once per interval per worker.
+    fn log_persist_failure(&self, failure: WriteFailure, error: Error) {
+        let now = self.index.clock().now();
+        if self
+            .last_failure_log
+            .get()
+            .is_some_and(|last| now.saturating_duration_since(last) < PERSIST_FAILURE_LOG_INTERVAL)
+        {
+            return;
+        }
+        self.last_failure_log.set(Some(now));
+        eprintln!(
+            "racer: worker={} stage=persist cause={failure:?} error={error:?} discarded={}",
+            self.index.worker().0,
+            self.discarded.get()
+        );
     }
     pub fn queued_count(&self) -> usize {
         self.queue.borrow().len()
@@ -1323,6 +1385,7 @@ impl StoreWriter {
                     && writes.len() < budget
                     && submitted < limit
                     && (submitted < budget || self.refill_allowed())
+                    && !self.space_deferred()
                 {
                     if scope.check().is_err() {
                         self.discard_unsubmitted();
@@ -1361,6 +1424,8 @@ impl StoreWriter {
                     let mut cleanup = DirtyCleanup {
                         writer: self,
                         persisted: false,
+                        requeue: false,
+                        failure: None,
                         page: id.clone(),
                         ticket: self
                             .pending
@@ -1371,8 +1436,30 @@ impl StoreWriter {
                     };
                     submitted += 1;
                     writes.push(async move {
-                        let result = self.persist(&id, &page, scope).await;
+                        let cause = Cell::new(None);
+                        let result = self.persist(&id, &page, scope, &cause).await;
                         cleanup.persisted = result.is_ok();
+                        if let Err(error) = result {
+                            let failure = cause.get().unwrap_or(WriteFailure::classify(error));
+                            // Out of space while a checkpoint freezes reuse: no
+                            // reclaim can help until publication, so keep the
+                            // page queued (its staging is untouched) and retry
+                            // after the freeze ends instead of discarding it.
+                            if matches!(failure, WriteFailure::NoSpace | WriteFailure::IndexFull)
+                                && self.segments.reuse_frozen()
+                                && self.pending.borrow().get(&id).is_some_and(|dirty| {
+                                    dirty.ticket == cleanup.ticket && dirty.staging.is_some()
+                                })
+                            {
+                                cleanup.requeue = true;
+                                self.space_deferred.set(true);
+                                self.metrics
+                                    .record(crate::telemetry::Event::DirtyWriteDeferred, 1);
+                            } else {
+                                cleanup.failure = Some(failure);
+                                self.log_persist_failure(failure, error);
+                            }
+                        }
                         drop(cleanup);
                         result
                     });
@@ -1415,23 +1502,50 @@ impl StoreWriter {
         id: &PageId,
         page: &CiphertextCopy,
         scope: &RequestScope,
+        cause: &Cell<Option<WriteFailure>>,
     ) -> Result<()> {
         // Recovery or another publisher may have installed the mapping since enqueue.
         if self.index.lookup(id)?.is_some() {
             return Ok(());
         }
+        let index_full = |error: Error| {
+            if error == Error::Overloaded {
+                cause.set(Some(WriteFailure::IndexFull));
+            }
+            error
+        };
         // Capacity is owned across the await, including invalidation/replacement.
         let mut index_ticket = match self.index.reserve_page_for(id) {
             Err(Error::Overloaded) if self.clock.borrow().is_some() => {
                 let clock = self.clock.borrow().clone().expect("checked clock");
                 // Index full: evict a whole low-value segment, then retry.
                 let _ = clock.reclaim_entries();
-                self.index.reserve_page_for(id)?
+                self.index.reserve_page_for(id).map_err(index_full)?
             }
-            ticket => ticket?,
+            ticket => ticket.map_err(index_full)?,
         };
         let alignment = self.slabs.alignment()?;
         let disk_bytes = record_length(page, alignment)?;
+        // Reserve disk space before taking the staging charge, so a write
+        // that finds no space leaves the queued page intact for a retry.
+        let no_space = |error: Error| {
+            if error == Error::Overloaded {
+                cause.set(Some(WriteFailure::NoSpace));
+            }
+            error
+        };
+        let (segment, location) = match index_ticket.append(id, &self.segments, disk_bytes) {
+            Ok(append) => append,
+            Err(Error::Overloaded) => {
+                if let Some(clock) = self.clock.borrow().clone() {
+                    clock.reclaim_now().map_err(no_space)?;
+                }
+                index_ticket
+                    .append(id, &self.segments, disk_bytes)
+                    .map_err(no_space)?
+            }
+            Err(error) => return Err(error),
+        };
         let (staging, dirty, ticket) = {
             let mut pending = self.pending.borrow_mut();
             let entry = pending.get_mut(id).ok_or(Error::Unavailable)?;
@@ -1455,16 +1569,6 @@ impl StoreWriter {
         buffer.retain(dirty);
         // The appended record keeps its segment from eviction until the
         // ticket publishes or drops (including future cancellation).
-        let (segment, location) = match index_ticket.append(id, &self.segments, disk_bytes) {
-            Ok(append) => append,
-            Err(Error::Overloaded) => {
-                if let Some(clock) = self.clock.borrow().clone() {
-                    clock.reclaim_now()?;
-                }
-                index_ticket.append(id, &self.segments, disk_bytes)?
-            }
-            Err(error) => return Err(error),
-        };
         let extent = location.extent;
         let _publication_lease = self.segments.lease(location.segment, location.generation)?;
         if zero_copy {
@@ -1714,6 +1818,9 @@ impl Drop for WriterWaiter<'_> {
 struct DirtyCleanup<'a> {
     writer: &'a StoreWriter,
     persisted: bool,
+    /// Keep the page pending and put it back at the queue front.
+    requeue: bool,
+    failure: Option<WriteFailure>,
     page: PageId,
     ticket: u64,
 }
@@ -1724,10 +1831,15 @@ impl Drop for DirtyCleanup<'_> {
             .get(&self.page)
             .is_some_and(|dirty| dirty.ticket == self.ticket)
         {
+            if self.requeue && !self.persisted {
+                drop(pending);
+                self.writer.queue.borrow_mut().push_front(self.page.clone());
+                return;
+            }
             pending.remove(&self.page);
             if !self.persisted {
-                self.writer
-                    .note_discard(crate::telemetry::Event::DirtyDiscardWriteFailed, 1);
+                let failure = self.failure.unwrap_or(WriteFailure::Other);
+                self.writer.note_discard(failure.event(), 1);
             }
         }
     }
