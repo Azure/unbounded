@@ -55,6 +55,12 @@ spec:
               maximum:
                 type: Integer
                 integerValue: 8
+            - name: driver-version-consistent
+              metric: driverVersionSet
+              operator: StatusEquals
+              expected:
+                type: String
+                stringValue: consistent
 
 ---
 apiVersion: signal.unbounded-cloud.io/v1alpha1
@@ -98,6 +104,12 @@ spec:
               maximum:
                 type: Integer
                 integerValue: 8
+            - name: driver-version-consistent
+              metric: driverVersionSet
+              operator: StatusEquals
+              expected:
+                type: String
+                stringValue: consistent
 {{- end }}
 {{- if eq (default "false" .VLLMCanaryEnabled) "true" }}
 {{- if empty .VLLMTestUID }}

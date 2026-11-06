@@ -111,6 +111,17 @@ and Nodes for qualification changes. Legacy checks use the deployment-owned
 runner image. Generic Script and Container drivers must carry their own exact
 digest-pinned runtime identity in the approved Test.
 
+The canonical GPU inventory Test queries actual GPU indices and UUIDs but
+never emits UUIDs into durable evidence. It requires unique canonical indices
+forming exactly `0..N-1`, unique canonical GPU UUIDs, and one nonempty driver
+version shared by every observed GPU. The inventory digest is SHA-256 over the
+actual UUID bytes in numeric index order, separated by one NUL byte with no
+trailing NUL, and is recorded with the `sha256:` prefix. Participant
+start/end driver versions and inventory digests must match. Visible and
+covered device labels remain redacted as `gpu-index-N`; missing, mixed,
+malformed, duplicate, gapped, partial, or changed identity evidence fails
+closed.
+
 ## CertificationSuite contract
 
 A phase-based Suite is an ordered execution plan:

@@ -74,7 +74,7 @@ spec:
 {{- end }}
             - --qualification-gate-protected={{ $qualificationGateProtected }}
             - --leader-elect=true
-            - --max-concurrent-runs=4
+            - --max-concurrent-runs=1
             - --metrics-bind-address=:8080
             - --health-probe-bind-address=:8081
           ports:

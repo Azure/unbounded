@@ -9,6 +9,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"reflect"
 	"slices"
@@ -31,7 +32,7 @@ const (
 	testRunnerImage     = "example.invalid/runner@sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
 	testResolverImage   = "example.invalid/resolver@sha256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
 	testDigest          = "sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
-	testScriptDigest    = "sha256:c6386f7989280ce844b5e997377839434684f4c6b52dbd8f3d7d15def1fc72a3"
+	testScriptDigest    = "sha256:e29ac9e1988d6c6c2837f2ab3e480c54854dd315f030c4aef994019659a7b635"
 	qualificationGuard  = "node-authorizer-node-restriction-rbac-verified"
 )
 
@@ -116,6 +117,7 @@ func TestRenderedExecutionProvenanceIsPinnedAndDeterministic(t *testing.T) {
 		"--workflow-template-digest=" + workflowDigest,
 		"--resolver-image=" + testResolverImage,
 		"--qualification-gate-protected=false",
+		"--max-concurrent-runs=1",
 	} {
 		if !slices.Contains(controller.Args, argument) {
 			t.Fatalf("controller args do not contain %q: %v", argument, controller.Args)
@@ -195,6 +197,193 @@ func TestRenderedGPUInventoryCatalogPinsSource(t *testing.T) {
 				err,
 			)
 		}
+	}
+}
+
+func TestRenderedGPUInventoryScriptProducesCanonicalFingerprints(t *testing.T) {
+	t.Parallel()
+
+	script := renderedGPUInventoryScript(t)
+	result := runGPUInventoryScript(t, script, gpuInventoryFixture{
+		gpuCount: 3,
+		startDrivers: strings.Join([]string{
+			"590.48.01",
+			"590.48.01",
+			"590.48.01",
+		}, "\n"),
+		startInventory: strings.Join([]string{
+			"2, GPU-cccccccc-cccc-cccc-cccc-cccccccccccc",
+			"0, GPU-aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa",
+			"1, GPU-bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb",
+		}, "\n"),
+	})
+
+	if result.Outcome != "Passed" {
+		t.Fatalf("GPU inventory outcome = %q, want Passed", result.Outcome)
+	}
+
+	if len(result.Participants) != 1 {
+		t.Fatalf("GPU inventory participants = %d, want 1", len(result.Participants))
+	}
+
+	participant := result.Participants[0]
+	const wantDigest = "sha256:b553224e314b1f8192da92db1febdbcd2bad39ab8bf106fb1da46cf148920cf8"
+
+	if participant.Start.DriverVersion != "590.48.01" ||
+		participant.End.DriverVersion != participant.Start.DriverVersion ||
+		participant.Start.GPUInventoryDigest != wantDigest ||
+		participant.End.GPUInventoryDigest != wantDigest {
+		t.Fatalf("GPU inventory fingerprint = %#v", participant)
+	}
+
+	wantDevices := []string{"gpu-index-0", "gpu-index-1", "gpu-index-2"}
+	if !slices.Equal(participant.VisibleDevices, wantDevices) ||
+		!slices.Equal(participant.CoveredDevices, wantDevices) {
+		t.Fatalf(
+			"GPU inventory devices = visible %v, covered %v, want %v",
+			participant.VisibleDevices,
+			participant.CoveredDevices,
+			wantDevices,
+		)
+	}
+
+	encoded, err := json.Marshal(result)
+	if err != nil {
+		t.Fatalf("encode GPU inventory result: %v", err)
+	}
+
+	if bytes.Contains(encoded, []byte("GPU-aaaaaaaa")) {
+		t.Fatalf("GPU inventory result exposes a raw GPU UUID: %s", encoded)
+	}
+}
+
+func TestRenderedGPUInventoryScriptFailsClosed(t *testing.T) {
+	t.Parallel()
+
+	script := renderedGPUInventoryScript(t)
+	validDrivers := "590.48.01\n590.48.01\n590.48.01"
+	validInventory := strings.Join([]string{
+		"2, GPU-cccccccc-cccc-cccc-cccc-cccccccccccc",
+		"0, GPU-aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa",
+		"1, GPU-bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb",
+	}, "\n")
+
+	tests := []struct {
+		name    string
+		fixture gpuInventoryFixture
+	}{
+		{
+			name: "mixed driver versions",
+			fixture: gpuInventoryFixture{
+				gpuCount:       3,
+				startDrivers:   "590.48.01\n590.48.02\n590.48.01",
+				startInventory: validInventory,
+			},
+		},
+		{
+			name: "missing driver version",
+			fixture: gpuInventoryFixture{
+				gpuCount:       3,
+				startDrivers:   "590.48.01\n590.48.01",
+				startInventory: validInventory,
+			},
+		},
+		{
+			name: "duplicate index",
+			fixture: gpuInventoryFixture{
+				gpuCount:     3,
+				startDrivers: validDrivers,
+				startInventory: strings.Join([]string{
+					"0, GPU-aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa",
+					"0, GPU-bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb",
+					"2, GPU-cccccccc-cccc-cccc-cccc-cccccccccccc",
+				}, "\n"),
+			},
+		},
+		{
+			name: "duplicate UUID",
+			fixture: gpuInventoryFixture{
+				gpuCount:     3,
+				startDrivers: validDrivers,
+				startInventory: strings.Join([]string{
+					"0, GPU-aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa",
+					"1, GPU-aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa",
+					"2, GPU-cccccccc-cccc-cccc-cccc-cccccccccccc",
+				}, "\n"),
+			},
+		},
+		{
+			name: "gapped index",
+			fixture: gpuInventoryFixture{
+				gpuCount:     3,
+				startDrivers: validDrivers,
+				startInventory: strings.Join([]string{
+					"0, GPU-aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa",
+					"2, GPU-bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb",
+					"10, GPU-cccccccc-cccc-cccc-cccc-cccccccccccc",
+				}, "\n"),
+			},
+		},
+		{
+			name: "noncanonical index",
+			fixture: gpuInventoryFixture{
+				gpuCount:     3,
+				startDrivers: validDrivers,
+				startInventory: strings.Join([]string{
+					"00, GPU-aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa",
+					"1, GPU-bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb",
+					"2, GPU-cccccccc-cccc-cccc-cccc-cccccccccccc",
+				}, "\n"),
+			},
+		},
+		{
+			name: "missing UUID",
+			fixture: gpuInventoryFixture{
+				gpuCount:     3,
+				startDrivers: validDrivers,
+				startInventory: strings.Join([]string{
+					"0, ",
+					"1, GPU-bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb",
+					"2, GPU-cccccccc-cccc-cccc-cccc-cccccccccccc",
+				}, "\n"),
+			},
+		},
+		{
+			name: "malformed UUID",
+			fixture: gpuInventoryFixture{
+				gpuCount:     3,
+				startDrivers: validDrivers,
+				startInventory: strings.Join([]string{
+					"0, GPU-not-a-uuid",
+					"1, GPU-bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb",
+					"2, GPU-cccccccc-cccc-cccc-cccc-cccccccccccc",
+				}, "\n"),
+			},
+		},
+		{
+			name: "start end digest mismatch",
+			fixture: gpuInventoryFixture{
+				gpuCount:       3,
+				startDrivers:   validDrivers,
+				startInventory: validInventory,
+				endInventory: strings.Join([]string{
+					"0, GPU-dddddddd-dddd-dddd-dddd-dddddddddddd",
+					"1, GPU-bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb",
+					"2, GPU-cccccccc-cccc-cccc-cccc-cccccccccccc",
+				}, "\n"),
+			},
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+
+			result := runGPUInventoryScript(t, script, test.fixture)
+			if result.Outcome == "Passed" {
+				t.Fatalf("GPU inventory outcome = Passed, want fail-closed non-pass: %#v", result)
+			}
+		})
 	}
 }
 
@@ -550,6 +739,11 @@ func TestRenderedAcceptanceSuitesSeparateQualificationDiagnosticsAndVLLM(t *test
 		t.Fatal("baseline Suite must contain exactly one canonical qualification Test")
 	}
 
+	if !strings.Contains(documents[0], "metric: driverVersionSet") ||
+		!strings.Contains(documents[0], "stringValue: consistent") {
+		t.Fatal("baseline Suite must require a consistent driver version")
+	}
+
 	var compatibility unstructured.Unstructured
 	if err := yaml.Unmarshal([]byte(documents[1]), &compatibility.Object); err != nil {
 		t.Fatalf("decode compatibility Suite: %v", err)
@@ -572,6 +766,11 @@ func TestRenderedAcceptanceSuitesSeparateQualificationDiagnosticsAndVLLM(t *test
 	if !strings.Contains(documents[1], "project-signal-gpu-inventory-compat-v1") ||
 		strings.Contains(documents[1], "name: project-signal-gpu-inventory-v1") {
 		t.Fatal("compatibility Suite must reference only the diagnostic compatibility Test")
+	}
+
+	if strings.Count(documents[1], "metric: driverVersionSet") != 15 ||
+		strings.Count(documents[1], "stringValue: consistent") != 15 {
+		t.Fatal("every compatibility diagnostic must require a consistent driver version")
 	}
 
 	vllmText := documents[2]
@@ -1042,6 +1241,159 @@ func TestGeneratedCRDSetContainsAllCertificationResources(t *testing.T) {
 			)
 		}
 	}
+}
+
+type gpuInventoryFixture struct {
+	gpuCount       int
+	startDrivers   string
+	endDrivers     string
+	startInventory string
+	endInventory   string
+}
+
+type gpuInventoryResult struct {
+	Outcome      string `json:"outcome"`
+	Participants []struct {
+		Start struct {
+			DriverVersion      string `json:"driverVersion"`
+			GPUInventoryDigest string `json:"gpuInventoryDigest"`
+		} `json:"start"`
+		End struct {
+			DriverVersion      string `json:"driverVersion"`
+			GPUInventoryDigest string `json:"gpuInventoryDigest"`
+		} `json:"end"`
+		VisibleDevices []string `json:"visibleDevices"`
+		CoveredDevices []string `json:"coveredDevices"`
+	} `json:"participants"`
+}
+
+func renderedGPUInventoryScript(t *testing.T) string {
+	t.Helper()
+
+	output := renderSignal(t, signalRenderData())
+	documents := splitYAMLDocuments(string(readRenderedFile(t, output, "05-gpu-inventory-tests.yaml")))
+
+	var scripts corev1.ConfigMap
+	if err := yaml.Unmarshal([]byte(documents[0]), &scripts); err != nil {
+		t.Fatalf("decode GPU inventory ConfigMap: %v", err)
+	}
+
+	return scripts.Data["gpu-inventory.sh"]
+}
+
+func runGPUInventoryScript(
+	t *testing.T,
+	script string,
+	fixture gpuInventoryFixture,
+) gpuInventoryResult {
+	t.Helper()
+
+	if fixture.endDrivers == "" {
+		fixture.endDrivers = fixture.startDrivers
+	}
+
+	if fixture.endInventory == "" {
+		fixture.endInventory = fixture.startInventory
+	}
+
+	work := t.TempDir()
+	bin := filepath.Join(work, "bin")
+	if err := os.Mkdir(bin, 0o755); err != nil {
+		t.Fatalf("create mock binary directory: %v", err)
+	}
+
+	mock := `#!/bin/sh
+set -eu
+
+next_fixture() {
+  counter_file="$1"
+  start_value="$2"
+  end_value="$3"
+  count=0
+  if [ -f "$counter_file" ]; then
+    count="$(cat "$counter_file")"
+  fi
+  printf '%s' "$((count + 1))" >"$counter_file"
+  if [ "$count" -eq 0 ]; then
+    printf '%s\n' "$start_value"
+  else
+    printf '%s\n' "$end_value"
+  fi
+}
+
+case "$*" in
+  "-L")
+    index=0
+    while [ "$index" -lt "$TEST_GPU_COUNT" ]; do
+      printf 'GPU %s: Test GPU (UUID: redacted)\n' "$index"
+      index=$((index + 1))
+    done
+    ;;
+  "--query-gpu=driver_version --format=csv,noheader,nounits")
+    next_fixture "$TEST_STATE/driver-count" "$TEST_START_DRIVERS" "$TEST_END_DRIVERS"
+    ;;
+  "--query-gpu=index,uuid --format=csv,noheader,nounits")
+    next_fixture "$TEST_STATE/inventory-count" "$TEST_START_INVENTORY" "$TEST_END_INVENTORY"
+    ;;
+  *)
+    exit 2
+    ;;
+esac
+`
+
+	mockPath := filepath.Join(bin, "nvidia-smi")
+	if err := os.WriteFile(mockPath, []byte(mock), 0o755); err != nil {
+		t.Fatalf("write mock nvidia-smi: %v", err)
+	}
+
+	scriptPath := filepath.Join(work, "gpu-inventory.sh")
+	if err := os.WriteFile(scriptPath, []byte(script), 0o755); err != nil {
+		t.Fatalf("write GPU inventory script: %v", err)
+	}
+
+	command := exec.Command("/bin/sh", scriptPath)
+	command.Env = append(
+		os.Environ(),
+		"PATH="+bin+":"+os.Getenv("PATH"),
+		fmt.Sprintf("TEST_GPU_COUNT=%d", fixture.gpuCount),
+		"TEST_STATE="+work,
+		"TEST_START_DRIVERS="+fixture.startDrivers,
+		"TEST_END_DRIVERS="+fixture.endDrivers,
+		"TEST_START_INVENTORY="+fixture.startInventory,
+		"TEST_END_INVENTORY="+fixture.endInventory,
+		"PROJECT_SIGNAL_INVOCATION_ID=invocation-1",
+		"PROJECT_SIGNAL_RUN_UID=run-uid",
+		"PROJECT_SIGNAL_STAGE_ID=stage-1",
+		"PROJECT_SIGNAL_STAGE_ORDER=0",
+		"PROJECT_SIGNAL_PLAN_DIGEST="+testDigest,
+		"PROJECT_SIGNAL_TEST_NAME=project-signal-gpu-inventory-v1",
+		"PROJECT_SIGNAL_TEST_UID=test-uid",
+		"PROJECT_SIGNAL_TEST_GENERATION=1",
+		"PROJECT_SIGNAL_TEST_CONTENT_DIGEST="+testDigest,
+		"PROJECT_SIGNAL_TEST_TRUST=Approved",
+		"PROJECT_SIGNAL_RESOLVED_INPUTS_JSON=[]",
+		"PROJECT_SIGNAL_PARTICIPANT_INDEX=0",
+		"PROJECT_SIGNAL_PARTICIPANT_ROLE=worker",
+		"PROJECT_SIGNAL_NODE_UID=node-uid",
+	)
+
+	output, err := command.CombinedOutput()
+	if err != nil {
+		t.Fatalf("run GPU inventory script: %v\n%s", err, output)
+	}
+
+	const prefix = "PROJECT_SIGNAL_INVOCATION_RESULT_V1 "
+	line := strings.TrimSpace(string(output))
+	if !strings.HasPrefix(line, prefix) {
+		t.Fatalf("GPU inventory output = %q, want invocation result prefix", line)
+	}
+
+	var result gpuInventoryResult
+	if err := json.Unmarshal([]byte(strings.TrimPrefix(line, prefix)), &result); err != nil {
+		t.Fatalf("decode GPU inventory result: %v\n%s", err, line)
+	}
+
+	return result
 }
 
 func signalRenderData() map[string]string {
