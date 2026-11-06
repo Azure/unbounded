@@ -1054,16 +1054,20 @@ impl Reactor {
             state.stopped = true;
         }
         if !state.fence_waiters.is_empty() {
-            let classes = state.classes.clone();
-            let live = state.unfenced;
+            let State {
+                classes,
+                fence_waiters,
+                unfenced,
+                ..
+            } = &mut *state;
             let mut index = 0;
-            while index < state.fence_waiters.len() {
-                let done = match state.fence_waiters[index].0 {
-                    None => live == 0,
+            while index < fence_waiters.len() {
+                let done = match fence_waiters[index].0 {
+                    None => *unfenced == 0,
                     Some(class) => classes[class.0 as usize] == 0,
                 };
                 if done {
-                    wakers.push(state.fence_waiters.swap_remove(index).1);
+                    wakers.push(fence_waiters.swap_remove(index).1);
                 } else {
                     index += 1;
                 }
