@@ -816,3 +816,208 @@ fn cancelled_userspace_exchange_releases_relay_charge() {
     drop(fixture);
     server.join().unwrap();
 }
+
+/// Serve scripted small responses, one per request head, over TLS or plaintext.
+fn serve_small(
+    listener: TcpListener,
+    identity: Option<&Identity>,
+    responses: Vec<(&'static [u8], bool)>,
+) -> std::thread::JoinHandle<usize> {
+    let config = identity.map(|identity| {
+        Arc::new(
+            rustls::ServerConfig::builder_with_protocol_versions(&[&rustls::version::TLS13])
+                .with_no_client_auth()
+                .with_single_cert(identity.chain.clone(), identity.key.clone_key())
+                .unwrap(),
+        )
+    });
+    std::thread::spawn(move || {
+        let mut accepted = 0;
+        let mut responses = responses.into_iter();
+        while responses.len() > 0 {
+            let Ok((tcp, _)) = listener.accept() else {
+                break;
+            };
+            accepted += 1;
+            let mut stream: Box<dyn ReadWrite> = match &config {
+                Some(config) => Box::new(rustls::StreamOwned::new(
+                    rustls::ServerConnection::new(config.clone()).unwrap(),
+                    tcp,
+                )),
+                None => Box::new(tcp),
+            };
+            loop {
+                let mut head = Vec::new();
+                let mut byte = [0];
+                while !head.ends_with(b"\r\n\r\n") {
+                    match stream.read(&mut byte) {
+                        Ok(1) => head.push(byte[0]),
+                        _ => break,
+                    }
+                }
+                if !head.ends_with(b"\r\n\r\n") {
+                    break;
+                }
+                let Some((response, close)) = responses.next() else {
+                    break;
+                };
+                let _ = stream.write_all(response);
+                let _ = stream.flush();
+                if close {
+                    break;
+                }
+            }
+        }
+        accepted
+    })
+}
+
+trait ReadWrite: Read + Write {}
+impl<T: Read + Write> ReadWrite for T {}
+
+/// Parse with the shared codec and accept any small framing.
+fn small_plan(bytes: &[u8]) -> Result<Option<http1::small_exchange::Plan<Error, u16>>> {
+    let codec = Codec::<()>::new(16 * 1024).transfer_coding();
+    let Some((head, length)) = codec.decode_head(bytes)? else {
+        return Ok(None);
+    };
+    let StartLine::Response { status } = head.start else {
+        return Err(http1::Error::Malformed.into());
+    };
+    Ok(Some(http1::small_exchange::Plan {
+        head_length: length,
+        framing: http1::small::Framing::from_response(&head)
+            .map_err(|_| Error::Http(http1::Error::Malformed))?,
+        limits: http1::small::Limits {
+            body: 64,
+            ..Default::default()
+        },
+        close: head.closes_connection()?,
+        body_error: |_| Error::Http(http1::Error::Malformed),
+        value: status,
+    }))
+}
+
+fn small_exchange(fixture: &Fixture, endpoint: &Endpoint) -> Result<(u16, Vec<u8>, bool, bool)> {
+    let scope = scope();
+    drive(&fixture.reactor, async {
+        let connection = fixture.pool.checkout(endpoint, &scope).await?;
+        let reused = connection.reused();
+        let mut parse = small_plan;
+        let exchanged = fixture
+            .io
+            .exchange_small(
+                connection,
+                b"GET /small HTTP/1.1\r\nHost: test\r\n\r\n",
+                16 * 1024,
+                &mut parse,
+                &scope,
+            )
+            .await?;
+        Ok((
+            exchanged.value,
+            exchanged.body.to_vec(),
+            exchanged.connection.is_reusable(),
+            reused,
+        ))
+    })
+}
+
+fn small_modes() -> Vec<Option<TlsMode>> {
+    let mut modes = vec![None, Some(TlsMode::Userspace)];
+    if kernel_tls_available() {
+        modes.push(Some(TlsMode::Kernel));
+    }
+    modes
+}
+
+#[test]
+fn small_exchange_reuses_chunked_and_length_responses() {
+    let identity = identity(&["localhost"]);
+    for mode in small_modes() {
+        let fixture = fixture();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = serve_small(
+            listener,
+            mode.map(|_| &identity),
+            vec![
+                (
+                    &b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n3\r\nabc\r\n2\r\nde\r\n0\r\n\r\n"[..],
+                    false,
+                ),
+                (&b"HTTP/1.1 503 Busy\r\nContent-Length: 2\r\n\r\nno"[..], false),
+            ],
+        );
+        let endpoint = match mode {
+            Some(mode) => tls_endpoint(&identity, address, mode),
+            None => Endpoint { address, tls: None },
+        };
+        assert_eq!(
+            small_exchange(&fixture, &endpoint).unwrap(),
+            (200, b"abcde".to_vec(), true, false)
+        );
+        assert_eq!(
+            small_exchange(&fixture, &endpoint).unwrap(),
+            (503, b"no".to_vec(), true, true)
+        );
+        drop(fixture);
+        assert_eq!(server.join().unwrap(), 1, "{mode:?}");
+    }
+}
+
+#[test]
+fn small_exchange_close_delimited_body_is_not_reused() {
+    let identity = identity(&["localhost"]);
+    for mode in small_modes() {
+        let fixture = fixture();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = serve_small(
+            listener,
+            mode.map(|_| &identity),
+            vec![(b"HTTP/1.1 200 OK\r\nX: y\r\n\r\nclose-delimited", true)],
+        );
+        let endpoint = match mode {
+            Some(mode) => tls_endpoint(&identity, address, mode),
+            None => Endpoint { address, tls: None },
+        };
+        assert_eq!(
+            small_exchange(&fixture, &endpoint).unwrap(),
+            (200, b"close-delimited".to_vec(), false, false),
+            "{mode:?}"
+        );
+        server.join().unwrap();
+    }
+}
+
+#[test]
+fn small_exchange_rejects_pipelined_bytes_oversize_and_truncation() {
+    for (response, expected) in [
+        (
+            &b"HTTP/1.1 200 OK\r\nContent-Length: 1\r\n\r\nab"[..],
+            Error::Http(http1::Error::Malformed),
+        ),
+        (
+            &b"HTTP/1.1 200 OK\r\nContent-Length: 65\r\n\r\n"[..],
+            Error::Http(http1::Error::Malformed),
+        ),
+        (
+            &b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nab"[..],
+            Error::Runtime(racer_io::Error::Io),
+        ),
+        (
+            &b"HTTP/1.1 200 OK\r\n"[..],
+            Error::Runtime(racer_io::Error::Io),
+        ),
+    ] {
+        let fixture = fixture();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = serve_small(listener, None, vec![(response, true)]);
+        let endpoint = Endpoint { address, tls: None };
+        let result = small_exchange(&fixture, &endpoint);
+        assert_eq!(result.err(), Some(expected));
+        server.join().unwrap();
+    }
+}

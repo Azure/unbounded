@@ -927,6 +927,21 @@ where {
         })
     }
 
+    /// Receive plaintext without framing accounting, for small exchanges.
+    pub(crate) async fn receive_plain<B: IoBuffer>(
+        &self,
+        connection: ConnectionLease<C>,
+        buffer: B,
+        scope: &C::Scope,
+    ) -> Result<C, Completion<B, ConnectionLease<C>>> {
+        self.recv_data(connection, buffer, scope).await
+    }
+
+    /// The caller context used for admission charges.
+    pub(crate) fn context(&self) -> &C {
+        &self.context
+    }
+
     /// Receive plaintext. Kernel TLS sockets use `recvmsg` so post-handshake
     /// records are consumed (tickets) or rejected (anything else) instead of
     /// failing the receive; such records never count as progress.
@@ -1286,6 +1301,12 @@ impl<C: Context> ConnectionLease<C> {
     /// or policy attachments through completion and cancellation fences.
     pub fn socket(&self) -> Rc<Descriptor> {
         self.fd.clone()
+    }
+
+    /// Record that a small exchange consumed its complete framing.
+    pub(crate) fn mark_small_complete(&mut self) {
+        self.rx_remaining = Some(0);
+        self.tx_remaining = Some(0);
     }
 
     /// Disable reuse before starting any further I/O.

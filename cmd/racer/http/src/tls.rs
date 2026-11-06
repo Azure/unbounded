@@ -177,6 +177,28 @@ pub fn trust_store_from_pem(pem: &[u8]) -> std::io::Result<RootCertStore> {
 /// Client configuration restricted to kernel-TLS-capable suites, with secret
 /// extraction enabled, resumption disabled, and ALPN `http/1.1`.
 pub fn client_config(roots: RootCertStore) -> Arc<ClientConfig> {
+    let mut config = ClientConfig::builder_with_provider(Arc::new(kernel_provider()))
+        .with_protocol_versions(&[&rustls::version::TLS13, &rustls::version::TLS12])
+        .expect("ring supports TLS 1.2 and 1.3")
+        .with_root_certificates(roots)
+        .with_no_client_auth();
+    prepare_client_config(&mut config);
+    Arc::new(config)
+}
+
+/// Apply the pooled-connection requirements to a caller-built configuration:
+/// secret extraction for kernel TLS, no resumption, and ALPN `http/1.1`.
+///
+/// Callers with their own verifier or client certificate (for example pinned
+/// mutual TLS) build on [`kernel_provider`] and then call this.
+pub fn prepare_client_config(config: &mut ClientConfig) {
+    config.enable_secret_extraction = true;
+    config.resumption = rustls::client::Resumption::disabled();
+    config.alpn_protocols = vec![b"http/1.1".to_vec()];
+}
+
+/// The ring provider restricted to cipher suites Linux kernel TLS supports.
+pub fn kernel_provider() -> rustls::crypto::CryptoProvider {
     let mut provider = rustls::crypto::ring::default_provider();
     provider.cipher_suites.retain(|suite| {
         use rustls::CipherSuite::*;
@@ -193,15 +215,7 @@ pub fn client_config(roots: RootCertStore) -> Arc<ClientConfig> {
                 | TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256
         )
     });
-    let mut config = ClientConfig::builder_with_provider(Arc::new(provider))
-        .with_protocol_versions(&[&rustls::version::TLS13, &rustls::version::TLS12])
-        .expect("ring supports TLS 1.2 and 1.3")
-        .with_root_certificates(roots)
-        .with_no_client_auth();
-    config.enable_secret_extraction = true;
-    config.resumption = rustls::client::Resumption::disabled();
-    config.alpn_protocols = vec![b"http/1.1".to_vec()];
-    Arc::new(config)
+    provider
 }
 
 /// Process-wide record-layer placement counters.
@@ -312,10 +326,19 @@ pub(crate) async fn establish<C: Context>(
         match session.read_tls(&mut reader.over(&fd)) {
             Ok(0) => return Err(racer_io::Error::Io.into()),
             Ok(_) => {
-                if session.process_new_packets().is_err() {
+                if let Err(error) = session.process_new_packets() {
                     // Send any alert rustls queued, best effort.
                     let _ = session.write_tls(&mut Socket(&fd));
-                    return Err(racer_io::Error::Os(libc::EPROTO).into());
+                    // A peer reporting its own internal error (for example
+                    // admission saturation) is retryable; everything else,
+                    // including certificate rejection, is a protocol failure.
+                    return Err(match error {
+                        rustls::Error::AlertReceived(rustls::AlertDescription::InternalError) => {
+                            racer_io::Error::Unavailable
+                        }
+                        _ => racer_io::Error::Os(libc::EPROTO),
+                    }
+                    .into());
                 }
             }
             Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {

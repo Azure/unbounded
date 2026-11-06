@@ -33,6 +33,10 @@
 //! [`Header`] clears its value bytes on drop. Heads intentionally have no `Debug`
 //! implementation, so ordinary diagnostic formatting cannot expose those values.
 //!
+//! [`small_exchange`] sends one serialized request and receives a response
+//! through [`small`] on a pooled connection, for control-plane clients that
+//! must accept chunked or close-delimited bodies.
+//!
 //! [`ContentType`] preserves accepted MIME bytes without normalizing them.
 //! [`range`] parses single byte ranges while leaving numeric policy to the caller.
 //!
@@ -68,6 +72,8 @@
 #![warn(missing_docs)]
 
 pub mod connection;
+
+pub mod small_exchange;
 
 pub mod tls;
 
