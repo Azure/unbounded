@@ -1,15 +1,14 @@
-//! One-scenario report mode of the `racer-dst` binary: racer-sim's command line
-//! (`racer-sim --scenario NAME --nodes N --seed S --duration D --config FILE --out PATH`) on
-//! the Model fidelity. The report is the Model's JSON report (`model::run`) with racer-sim's
-//! top-level `scenario`, `seed`, `duration_ns` and `wall_ms` fields.
+//! One-scenario report mode of the `racer-dst` binary
+//! (`racer-dst --scenario NAME --nodes N --seed S --duration D --config FILE --out PATH`) on
+//! the Model fidelity. The report is the Model's JSON report (`model::run`) with top-level
+//! `scenario`, `seed`, `duration_ns` and `wall_ms` fields.
 //!
-//! Scenarios: racer-sim's control plans (`enrollment-storm`, `failover`, `ctl-churn`,
-//! `lagging`) and combined scenarios (`full-cold-start`, `full-failover`, `full-churn`,
-//! `full-lagging`), and every catalog scenario by name (`model-*`, `authority-*`, ...).
+//! Scenarios: the control plans (`enrollment-storm`, `failover`, `ctl-churn`, `lagging`),
+//! the combined scenarios (`full-cold-start`, `full-failover`, `full-churn`, `full-lagging`),
+//! and every catalog scenario by name (`model-*`, `authority-*`, ...).
 //!
-//! `--config` takes racer-sim's JSON keys the Model has a counterpart for (see [`KEYS`]); any
-//! other key is an error rather than silently ignored.
-
+//! `--config` takes the JSON keys the Model has a counterpart for (see [`KEYS`]); any other
+//! key is an error rather than silently ignored.
 use std::rc::Rc;
 
 use serde_json::{Map, Value, json};
