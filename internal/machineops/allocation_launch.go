@@ -940,7 +940,7 @@ func allocationFailureReason(reason string) unboundedv1alpha3.MachineAllocationF
 
 	switch reason {
 	case allocationReasonFenced, allocationReasonNotRecorded, allocationReasonUnavailable, reasonRequestBuildFailed,
-		"InvalidSpec", "InvalidHost", "InvalidProviderRef", "UnsupportedOperation":
+		"InvalidSpec", "InvalidHost", "InvalidProviderRef", reasonUnsupportedOperation:
 		return unboundedv1alpha3.FailureInvalidRequest
 	default:
 		return unboundedv1alpha3.FailureProviderFailed
