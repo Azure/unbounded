@@ -851,12 +851,12 @@ operations it owns.
 | `Released` | `False` | `ProviderConflict` | Hold: a `MachineOperation` with the `HostRelease` name belongs to someone else. |
 | `Released` | `True` | `Released` | The host and the token are released. |
 
-A hold keeps every finalizer and is never retried on a timer. Each needs an
-operator: find and release the provider resources by hand, using the allocation
-UID, `status.ownedResources`, and the operations' status, and then remove the
-finalizers. Never delete or edit an allocation `MachineOperation`, and never
-remove its finalizer, while the allocation exists: the operation is the record
-of what the provider may have started.
+An allocation-level hold keeps every finalizer and is never retried on a
+timer. Each needs an operator: find and release the provider resources by
+hand, using the allocation UID, `status.ownedResources`, and the operations'
+status, and then remove the finalizers. Never delete or edit an allocation
+`MachineOperation`, and never remove its finalizer, while the allocation
+exists: the operation is the record of what the provider may have started.
 
 ### Running HostAllocate and HostRelease
 
@@ -887,6 +887,13 @@ an artifact. The agent's kubelet registers with `status.providerID`. A
 `HostRelease` begins only once `spec.lifecycle` is `Released`, the Machine is
 fenced or being deleted, and the recorded `HostAllocate` has finished with
 known ownership.
+
+Credential failures leave `HostRelease` `InProgress`, even before `Begin`,
+with the reason in its `Completed` condition. The engine rechecks them at the
+stalled poll interval. Repairing a missing credential Secret lets the same
+recorded operation continue, but the Site and credential UIDs must still
+match the snapshot; replaced authority remains held. A terminal provider
+failure still requires manual recovery.
 
 On a Machine bound to an allocation, `HostReplace`, `HostPowerOn`, and
 `HostPowerOff` fail with `UnsupportedOperation`, and every host operation on a
