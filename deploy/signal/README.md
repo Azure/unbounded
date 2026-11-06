@@ -38,7 +38,10 @@ fleet scheduling are intentionally deferred.
   and WorkflowTemplate stages and captures typed invocation evidence. Script
   and Container stages use participant-pinned Pods. WorkflowTemplate stages
   verify the approved template name, live resource version, and semantic
-  digest before creating the bounded child Workflow.
+  digest before creating the bounded child Workflow. Child Workflows must use
+  the dedicated `project-signal-vllm-workload` ServiceAccount; the adapter
+  rejects another ServiceAccount, external template references, `podSpecPatch`,
+  or a template-level override of the controller-owned Run UID label.
 - `project-signal-participant-adapter` is the fixed controller-to-adapter
   WorkflowTemplate used by every legacy check and resolved stage. Profiles and
   Suites cannot replace that control-plane template.
@@ -93,7 +96,7 @@ The install creates:
 - the `CertificationTest`, `CertificationSuite`, `CertificationProfile`,
   `CertificationRun`, `CertificationPolicy`, and `NodeCertification` CRDs;
 - the `project-signal` namespace;
-- controller and adapter service accounts and RBAC;
+- controller, adapter, and minimal child-workload service accounts and RBAC;
 - the fixed participant adapter WorkflowTemplate;
 - the immutable GPU inventory source and untrusted catalog specifications;
 - the controller Deployment.
@@ -161,7 +164,12 @@ the same source cannot create independent qualification evidence.
 - **WorkflowTemplate:** uses an approved name and semantic SHA-256 digest. At
   admission, the controller reads the live template, recomputes the digest of
   its `spec`, and pins `name@resourceVersion`. At execution, the adapter
-  verifies all three values before creating the child Workflow.
+  verifies all three values before creating the child Workflow. The approved
+  spec and every nested template must select only
+  `project-signal-vllm-workload`; external template references,
+  `podSpecPatch`, and template-level Run UID label overrides are rejected.
+  This prevents generic child code from selecting the adapter or controller
+  identity or escaping the approved semantic digest.
 
 Test trust is a separate operator or policy decision through the
 `CertificationTest/status` subresource. Applying the catalog specification
@@ -480,7 +488,11 @@ make signal-manifests \
 The approved harness contract receives canonical invocation, Run, plan, stage,
 participant, role, parameter, resolved-input, and result ConfigMap values. It
 must create one bounded result ConfigMap containing the canonical invocation
-result envelope. The template pins eight GPUs to the exact primary participant,
+result envelope. The Workflow and its Pods use the dedicated
+`project-signal-vllm-workload` ServiceAccount. That identity can create only
+the result ConfigMap and create or patch Argo WorkflowTaskResults; it cannot
+create Pods, create Workflows, read Nodes, or use the controller or adapter
+identity. The template pins eight GPUs to the exact primary participant,
 mounts an operator-approved read-only model cache, disables container restart,
 and bounds temporary storage. The stage invocation timeout becomes the child
 Workflow deadline.
@@ -566,6 +578,10 @@ The adapter persists one immutable stage result ConfigMap owned by the Run
 Workflow. Script and Container invocation results are read from canonical
 bounded logs. WorkflowTemplate drivers create one bounded result ConfigMap,
 which the adapter verifies and deletes with the child Workflow after capture.
+Result names derive from the immutable execution and invocation identity, so a
+restart never overwrites a prior invocation result. Cleanup uses exact UID
+preconditions and retains durable evidence before removing the append-only
+result and child resources.
 The controller verifies ownership, Run and plan identity annotations, content
 digest, runner provenance, and bounded payloads before including the stage in
 durable evidence.
@@ -715,7 +731,9 @@ RBAC can read all six certification resources and perform the documented
 Run, ledger, evidence, and exact-identity Node operations. Verify the adapter
 retains Node `get`, Pod and ConfigMap lifecycle plus logs, Workflow and
 WorkflowTemplate execution access, and Argo `workflowtaskresults` `create` and
-`patch`.
+`patch`. Verify the child-workload Role contains only ConfigMap `create` and
+WorkflowTaskResult `create`/`patch`, has no Pod or Workflow creation, and binds
+only `project-signal-vllm-workload`.
 
 ### Safe rollback
 

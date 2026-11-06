@@ -20,6 +20,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime/schema"
+	utilptr "k8s.io/utils/ptr"
 
 	signalv1 "github.com/Azure/unbounded/api/signal/v1alpha1"
 )
@@ -30,10 +31,11 @@ const (
 )
 
 type KubernetesStageExecutor struct {
-	Runner        *Runner
-	Namespace     string
-	WorkflowName  string
-	ExecutionName string
+	Runner                 *Runner
+	Namespace              string
+	WorkflowName           string
+	ExecutionName          string
+	WorkflowServiceAccount string
 }
 
 func (e *KubernetesStageExecutor) ExecuteInvocation(
@@ -445,11 +447,12 @@ func (e *KubernetesStageExecutor) stagePod(
 			}},
 		},
 		Spec: corev1.PodSpec{
-			RestartPolicy: corev1.RestartPolicyNever,
-			NodeName:      participant.NodeName,
-			HostNetwork:   invocation.Stage.Test.Security.HostNetwork,
-			Containers:    []corev1.Container{container},
-			Volumes:       stageHostPathVolumes(invocation.Stage.Test.Security.HostPaths),
+			RestartPolicy:                corev1.RestartPolicyNever,
+			NodeName:                     participant.NodeName,
+			HostNetwork:                  invocation.Stage.Test.Security.HostNetwork,
+			AutomountServiceAccountToken: utilptr.To(false),
+			Containers:                   []corev1.Container{container},
+			Volumes:                      stageHostPathVolumes(invocation.Stage.Test.Security.HostPaths),
 		},
 	}
 
@@ -586,6 +589,10 @@ func (e *KubernetesStageExecutor) executeWorkflowTemplate(
 		return signalv1.InvocationResultEnvelope{}, errors.New("approved WorkflowTemplate has no spec")
 	}
 
+	if err := validateWorkflowServiceAccount(templateSpec, e.WorkflowServiceAccount); err != nil {
+		return signalv1.InvocationResultEnvelope{}, err
+	}
+
 	name := invocationResourceName(e.ExecutionName, invocation, -1)
 
 	parametersJSON, err := marshalStageJSON(invocation.Stage.Parameters)
@@ -629,6 +636,36 @@ func (e *KubernetesStageExecutor) executeWorkflowTemplate(
 	}
 
 	templateSpec["arguments"] = arguments
+
+	podMetadata, _, err := unstructured.NestedMap(templateSpec, "podMetadata")
+	if err != nil {
+		return signalv1.InvocationResultEnvelope{}, fmt.Errorf("decode WorkflowTemplate pod metadata: %w", err)
+	}
+
+	if podMetadata == nil {
+		podMetadata = map[string]any{}
+	}
+
+	podLabels, _, err := unstructured.NestedStringMap(podMetadata, "labels")
+	if err != nil {
+		return signalv1.InvocationResultEnvelope{}, fmt.Errorf("decode WorkflowTemplate Pod labels: %w", err)
+	}
+
+	if existing := podLabels[runUIDLabel]; existing != "" && existing != string(invocation.RunUID) {
+		return signalv1.InvocationResultEnvelope{}, errors.New("approved WorkflowTemplate sets a conflicting Run UID Pod label")
+	}
+
+	if podLabels == nil {
+		podLabels = map[string]string{}
+	}
+
+	podLabels[runUIDLabel] = string(invocation.RunUID)
+
+	if err := unstructured.SetNestedStringMap(podMetadata, podLabels, "labels"); err != nil {
+		return signalv1.InvocationResultEnvelope{}, fmt.Errorf("set WorkflowTemplate Pod labels: %w", err)
+	}
+
+	templateSpec["podMetadata"] = podMetadata
 
 	workflow := &unstructured.Unstructured{Object: map[string]any{
 		"apiVersion": "argoproj.io/v1alpha1",
@@ -732,6 +769,68 @@ func (e *KubernetesStageExecutor) executeWorkflowTemplate(
 		case <-ticker.C:
 		}
 	}
+}
+
+func validateWorkflowServiceAccount(spec map[string]any, allowed string) error {
+	if allowed == "" {
+		return errors.New("approved WorkflowTemplate execution requires an allowed ServiceAccount")
+	}
+
+	serviceAccount, found, err := unstructured.NestedString(spec, "serviceAccountName")
+	if err != nil {
+		return fmt.Errorf("decode WorkflowTemplate ServiceAccount: %w", err)
+	}
+
+	if !found || serviceAccount != allowed {
+		return fmt.Errorf("approved WorkflowTemplate must use ServiceAccount %q", allowed)
+	}
+
+	return validateWorkflowServiceAccountFields(spec, allowed)
+}
+
+func validateWorkflowServiceAccountFields(value any, allowed string) error {
+	switch typed := value.(type) {
+	case map[string]any:
+		for key, child := range typed {
+			switch key {
+			case "podSpecPatch":
+				return errors.New("approved WorkflowTemplate cannot use podSpecPatch")
+			case "serviceAccountName":
+				serviceAccount, ok := child.(string)
+				if !ok || serviceAccount != allowed {
+					return fmt.Errorf("approved WorkflowTemplate selects unauthorized ServiceAccount %q", child)
+				}
+			case "templateRef", "workflowTemplateRef":
+				return fmt.Errorf("approved WorkflowTemplate cannot use external reference %q", key)
+			case "metadata":
+				metadata, ok := child.(map[string]any)
+				if !ok {
+					break
+				}
+
+				labels, ok := metadata["labels"].(map[string]any)
+				if !ok {
+					break
+				}
+
+				if _, exists := labels[runUIDLabel]; exists {
+					return fmt.Errorf("approved WorkflowTemplate metadata label %q is reserved", runUIDLabel)
+				}
+			}
+
+			if err := validateWorkflowServiceAccountFields(child, allowed); err != nil {
+				return err
+			}
+		}
+	case []any:
+		for _, child := range typed {
+			if err := validateWorkflowServiceAccountFields(child, allowed); err != nil {
+				return err
+			}
+		}
+	}
+
+	return nil
 }
 
 func validateWorkflowTemplateIdentity(

@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"reflect"
 	"slices"
 	"strings"
 	"testing"
@@ -84,6 +85,14 @@ func TestRenderedExecutionProvenanceIsPinnedAndDeterministic(t *testing.T) {
 			t.Fatalf("WorkflowTemplate does not declare %s", parameter)
 		}
 	}
+
+	assertContainsAll(
+		t,
+		string(secondWorkflow),
+		"adapter WorkflowTemplate",
+		"--workflow-service-account",
+		"project-signal-vllm-workload",
+	)
 
 	var deployment appsv1.Deployment
 	if err := yaml.Unmarshal(readRenderedFile(t, secondOutput, "06-deployment.yaml"), &deployment); err != nil {
@@ -235,6 +244,8 @@ func TestRenderedVLLMCanaryUsesImmutableBoundedContract(t *testing.T) {
 		"primary-participant-node-name",
 		"resolved-inputs-json",
 		"result-configmap",
+		"serviceAccountName: project-signal-vllm-workload",
+		"automountServiceAccountToken: true",
 		"nvidia.com/gpu: \"8\"",
 		"readOnly: true",
 	} {
@@ -707,7 +718,7 @@ func TestRenderedRBACCoversQualificationAndEvidence(t *testing.T) {
 		"project-signal-adapter",
 		"argoproj.io",
 		"workflows",
-		[]string{"get", "create", "delete"},
+		[]string{"get", "list", "watch", "create", "delete"},
 	)
 	assertRule(
 		t,
@@ -727,7 +738,61 @@ func TestRenderedRBACCoversQualificationAndEvidence(t *testing.T) {
 		"project-signal-adapter",
 		"",
 		"configmaps",
-		[]string{"get", "create", "delete"},
+		[]string{"get", "list", "create", "delete"},
+	)
+	assertRule(
+		t,
+		adapterDocuments,
+		"Role",
+		"signal-ns",
+		"project-signal-adapter",
+		"",
+		"pods",
+		[]string{"get", "list", "watch", "create", "delete"},
+	)
+	assertRule(
+		t,
+		adapterDocuments,
+		"Role",
+		"signal-ns",
+		"project-signal-vllm-workload",
+		"",
+		"configmaps",
+		[]string{"create"},
+	)
+	assertRule(
+		t,
+		adapterDocuments,
+		"Role",
+		"signal-ns",
+		"project-signal-vllm-workload",
+		"argoproj.io",
+		"workflowtaskresults",
+		[]string{"create", "patch"},
+	)
+	assertExactRoleResources(
+		t,
+		adapterDocuments,
+		"signal-ns",
+		"project-signal-vllm-workload",
+		map[string][]string{
+			"/configmaps":                     {"create"},
+			"argoproj.io/workflowtaskresults": {"create", "patch"},
+		},
+	)
+	assertRoleBindingSubject(
+		t,
+		adapterDocuments,
+		"signal-ns",
+		"project-signal-vllm-workload",
+		"project-signal-vllm-workload",
+	)
+	assertServiceAccountAutomount(
+		t,
+		adapterDocuments,
+		"signal-ns",
+		"project-signal-vllm-workload",
+		true,
 	)
 	assertRule(
 		t,
@@ -918,6 +983,132 @@ func assertRule(
 	}
 
 	t.Fatalf("%s/%s in namespace %q not found", kind, name, namespace)
+}
+
+func assertExactRoleResources(
+	t *testing.T,
+	documents []string,
+	namespace string,
+	name string,
+	want map[string][]string,
+) {
+	t.Helper()
+
+	for _, document := range documents {
+		var object struct {
+			Kind     string `json:"kind"`
+			Metadata struct {
+				Name      string `json:"name"`
+				Namespace string `json:"namespace"`
+			} `json:"metadata"`
+			Rules []rbacv1.PolicyRule `json:"rules"`
+		}
+		if err := yaml.Unmarshal([]byte(document), &object); err != nil {
+			t.Fatalf("decode RBAC document: %v", err)
+		}
+
+		if object.Kind != "Role" || object.Metadata.Name != name || object.Metadata.Namespace != namespace {
+			continue
+		}
+
+		got := make(map[string][]string, len(object.Rules))
+		for _, rule := range object.Rules {
+			if len(rule.APIGroups) != 1 || len(rule.Resources) != 1 {
+				t.Fatalf("Role/%s has non-atomic rule: %#v", name, rule)
+			}
+
+			got[rule.APIGroups[0]+"/"+rule.Resources[0]] = rule.Verbs
+		}
+
+		if !reflect.DeepEqual(got, want) {
+			t.Fatalf("Role/%s rules = %#v, want %#v", name, got, want)
+		}
+
+		return
+	}
+
+	t.Fatalf("Role/%s in namespace %q not found", name, namespace)
+}
+
+func assertRoleBindingSubject(
+	t *testing.T,
+	documents []string,
+	namespace string,
+	name string,
+	serviceAccount string,
+) {
+	t.Helper()
+
+	found := false
+
+	for _, document := range documents {
+		var object rbacv1.RoleBinding
+		if err := yaml.Unmarshal([]byte(document), &object); err != nil {
+			t.Fatalf("decode RBAC document: %v", err)
+		}
+
+		if object.Kind != "RoleBinding" && object.Kind != "ClusterRoleBinding" {
+			continue
+		}
+
+		for _, subject := range object.Subjects {
+			if subject.Kind != "ServiceAccount" ||
+				subject.Name != serviceAccount ||
+				subject.Namespace != namespace {
+				continue
+			}
+
+			if object.Kind != "RoleBinding" ||
+				object.Name != name ||
+				object.Namespace != namespace ||
+				object.RoleRef.Kind != "Role" ||
+				object.RoleRef.Name != name ||
+				len(object.Subjects) != 1 {
+				t.Fatalf("ServiceAccount/%s has unexpected binding: %#v", serviceAccount, object)
+			}
+
+			found = true
+		}
+	}
+
+	if !found {
+		t.Fatalf("RoleBinding/%s in namespace %q not found", name, namespace)
+	}
+}
+
+func assertServiceAccountAutomount(
+	t *testing.T,
+	documents []string,
+	namespace string,
+	name string,
+	want bool,
+) {
+	t.Helper()
+
+	for _, document := range documents {
+		var object corev1.ServiceAccount
+		if err := yaml.Unmarshal([]byte(document), &object); err != nil {
+			t.Fatalf("decode ServiceAccount document: %v", err)
+		}
+
+		if object.Kind != "ServiceAccount" || object.Name != name || object.Namespace != namespace {
+			continue
+		}
+
+		if object.AutomountServiceAccountToken == nil ||
+			*object.AutomountServiceAccountToken != want {
+			t.Fatalf(
+				"ServiceAccount/%s automount = %v, want %t",
+				name,
+				object.AutomountServiceAccountToken,
+				want,
+			)
+		}
+
+		return
+	}
+
+	t.Fatalf("ServiceAccount/%s in namespace %q not found", name, namespace)
 }
 
 func assertContainsAll(t *testing.T, content, name string, values ...string) {

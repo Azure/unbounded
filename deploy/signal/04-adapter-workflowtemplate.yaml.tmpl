@@ -62,6 +62,8 @@ spec:
           - "{{`{{inputs.parameters.phase-index}}`}}"
           - --stage-index
           - "{{`{{inputs.parameters.stage-index}}`}}"
+          - --workflow-service-account
+          - project-signal-vllm-workload
           - --result-configmap
           - "{{`{{inputs.parameters.result-configmap}}`}}"
         env:

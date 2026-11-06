@@ -27,6 +27,8 @@ import (
 	signalv1 "github.com/Azure/unbounded/api/signal/v1alpha1"
 )
 
+const testWorkflowServiceAccount = "project-signal-vllm-workload"
+
 func TestLegacyMeasurementsRedactRawIdentity(t *testing.T) {
 	t.Parallel()
 
@@ -164,7 +166,10 @@ func TestWorkflowTemplateFailureCleansOwnerFencedChild(t *testing.T) {
 			"namespace":       "signal-system",
 			"resourceVersion": "42",
 		},
-		"spec": map[string]any{"entrypoint": "main"},
+		"spec": map[string]any{
+			"entrypoint":         "main",
+			"serviceAccountName": testWorkflowServiceAccount,
+		},
 	}}
 	dynamicClient := dynamicfake.NewSimpleDynamicClient(runtime.NewScheme(), parent, template)
 
@@ -199,10 +204,11 @@ func TestWorkflowTemplateFailureCleansOwnerFencedChild(t *testing.T) {
 		PollInterval: time.Millisecond,
 	}
 	executor := &KubernetesStageExecutor{
-		Runner:        runner,
-		Namespace:     "signal-system",
-		WorkflowName:  parent.GetName(),
-		ExecutionName: "stage",
+		Runner:                 runner,
+		Namespace:              "signal-system",
+		WorkflowName:           parent.GetName(),
+		ExecutionName:          "stage",
+		WorkflowServiceAccount: testWorkflowServiceAccount,
 	}
 	invocation := workflowTemplateInvocation(template)
 
@@ -217,6 +223,22 @@ func TestWorkflowTemplateFailureCleansOwnerFencedChild(t *testing.T) {
 
 	if createdChild.GetLabels()[runUIDLabel] != string(invocation.RunUID) {
 		t.Fatalf("child Workflow labels = %#v", createdChild.GetLabels())
+	}
+
+	podRunUID, found, nestedErr := unstructured.NestedString(
+		createdChild.Object,
+		"spec",
+		"podMetadata",
+		"labels",
+		runUIDLabel,
+	)
+	if nestedErr != nil || !found || podRunUID != string(invocation.RunUID) {
+		t.Fatalf(
+			"child Workflow Pod Run UID label = %q, found %t, error %v",
+			podRunUID,
+			found,
+			nestedErr,
+		)
 	}
 
 	owners := createdChild.GetOwnerReferences()
@@ -248,7 +270,10 @@ func TestWorkflowTemplateCancellationCleansChild(t *testing.T) {
 			"namespace":       "signal-system",
 			"resourceVersion": "42",
 		},
-		"spec": map[string]any{"entrypoint": "main"},
+		"spec": map[string]any{
+			"entrypoint":         "main",
+			"serviceAccountName": testWorkflowServiceAccount,
+		},
 	}}
 	dynamicClient := dynamicfake.NewSimpleDynamicClient(runtime.NewScheme(), parent, template)
 	runner := &Runner{
@@ -257,10 +282,11 @@ func TestWorkflowTemplateCancellationCleansChild(t *testing.T) {
 		PollInterval: time.Millisecond,
 	}
 	executor := &KubernetesStageExecutor{
-		Runner:        runner,
-		Namespace:     "signal-system",
-		WorkflowName:  parent.GetName(),
-		ExecutionName: "stage",
+		Runner:                 runner,
+		Namespace:              "signal-system",
+		WorkflowName:           parent.GetName(),
+		ExecutionName:          "stage",
+		WorkflowServiceAccount: testWorkflowServiceAccount,
 	}
 	invocation := workflowTemplateInvocation(template)
 	childName := invocationResourceName(executor.ExecutionName, invocation, -1)
@@ -477,6 +503,94 @@ func TestStagePodHasRunUIDLabelAndOwnerFence(t *testing.T) {
 		owners[0].BlockOwnerDeletion == nil ||
 		!*owners[0].BlockOwnerDeletion {
 		t.Fatalf("stage Pod owner fence = %#v", owners)
+	}
+
+	if pod.Spec.AutomountServiceAccountToken == nil || *pod.Spec.AutomountServiceAccountToken {
+		t.Fatal("stage Pod must not automount a ServiceAccount token")
+	}
+}
+
+func TestWorkflowTemplateRejectsUnauthorizedServiceAccountSelection(t *testing.T) {
+	t.Parallel()
+
+	for _, tt := range []struct {
+		name   string
+		mutate func(map[string]any)
+	}{
+		{
+			name: "privileged top-level ServiceAccount",
+			mutate: func(spec map[string]any) {
+				spec["serviceAccountName"] = "project-signal-controller"
+			},
+		},
+		{
+			name: "privileged template ServiceAccount",
+			mutate: func(spec map[string]any) {
+				spec["templates"] = []any{
+					map[string]any{
+						"name":               "main",
+						"serviceAccountName": "project-signal-adapter",
+					},
+				}
+			},
+		},
+		{
+			name: "PodSpec patch",
+			mutate: func(spec map[string]any) {
+				spec["podSpecPatch"] = `{"serviceAccountName":"project-signal-controller"}`
+			},
+		},
+		{
+			name: "referenced WorkflowTemplate",
+			mutate: func(spec map[string]any) {
+				spec["templates"] = []any{
+					map[string]any{
+						"name": "main",
+						"templateRef": map[string]any{
+							"name":     "privileged-template",
+							"template": "main",
+						},
+					},
+				}
+			},
+		},
+		{
+			name: "referenced WorkflowTemplate spec",
+			mutate: func(spec map[string]any) {
+				spec["workflowTemplateRef"] = map[string]any{
+					"name": "privileged-template",
+				}
+			},
+		},
+		{
+			name: "reserved Run UID template label",
+			mutate: func(spec map[string]any) {
+				spec["templates"] = []any{
+					map[string]any{
+						"name": "main",
+						"metadata": map[string]any{
+							"labels": map[string]any{
+								runUIDLabel: "different-run-uid",
+							},
+						},
+					},
+				}
+			},
+		},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			spec := map[string]any{
+				"entrypoint":         "main",
+				"serviceAccountName": testWorkflowServiceAccount,
+			}
+			tt.mutate(spec)
+
+			if err := validateWorkflowServiceAccount(spec, testWorkflowServiceAccount); err == nil {
+				t.Fatal("validateWorkflowServiceAccount() accepted unauthorized ServiceAccount selection")
+			}
+		})
 	}
 }
 

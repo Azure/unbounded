@@ -22,7 +22,8 @@ metadata:
     app.kubernetes.io/part-of: project-signal
 spec:
   entrypoint: canary
-  serviceAccountName: project-signal-adapter
+  serviceAccountName: project-signal-vllm-workload
+  automountServiceAccountToken: true
   podGC:
     strategy: OnWorkflowCompletion
   ttlStrategy:
