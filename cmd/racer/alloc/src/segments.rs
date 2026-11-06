@@ -187,6 +187,9 @@ pub struct Segments {
     evicting: Cell<usize>,
 
     usage: RefCell<Vec<(u64, u64)>>,
+
+    /// Bumped by every mutable borrow of `slots`; see [`Segments::generation`].
+    generation: Cell<u64>,
 }
 
 impl Segments {
@@ -203,7 +206,21 @@ impl Segments {
             free: RefCell::new(BTreeSet::new()),
             evicting: Cell::new(0),
             usage: RefCell::new(Vec::new()),
+            generation: Cell::new(0),
         }
+    }
+
+    /// Mutable slot table. Every caller counts as a change to
+    /// [`Self::snapshot`], so checkpoint skipping cannot miss one.
+    fn slots_mut(&self) -> std::cell::RefMut<'_, Vec<Slot>> {
+        self.generation.set(self.generation.get().wrapping_add(1));
+        self.slots.borrow_mut()
+    }
+
+    /// Mutation generation of the slot table: equal values mean
+    /// [`Self::snapshot`] is unchanged.
+    pub fn generation(&self) -> u64 {
+        self.generation.get()
     }
 
     /// Fixed size of a physical segment.
@@ -219,7 +236,7 @@ impl Segments {
     /// Group consecutive slots for storage metrics. Counts must cover every slot.
     /// Call at startup; regrouping scans the table once.
     pub fn configure_usage_groups(&self, counts: &[usize]) -> Result<()> {
-        let mut slots = self.slots.borrow_mut();
+        let mut slots = self.slots_mut();
         if !self.is_configured()
             || counts.is_empty()
             || counts.contains(&0)
@@ -301,7 +318,7 @@ impl Segments {
         let geometry = SegmentGeometry::new(capacity, self.segment_bytes, count as u64, alignment)
             .map_err(|_| Error::InvalidConfiguration)?;
         self.geometry.set(Some(geometry));
-        *self.slots.borrow_mut() = (0..count)
+        *self.slots_mut() = (0..count)
             .map(|id| Slot {
                 usage_group: 0,
                 image: SegmentSnapshot {
@@ -333,7 +350,7 @@ impl Segments {
         {
             return Err(Error::InvalidConfiguration);
         }
-        let mut slots = self.slots.borrow_mut();
+        let mut slots = self.slots_mut();
         let previous_open = self.open.get();
         let usable_open = previous_open.filter(|&position| {
             self.segment_bytes - slots[position].image.used_bytes >= length as u64
@@ -392,7 +409,7 @@ impl Segments {
         let Some(position) = self.open.take() else {
             return false;
         };
-        self.slots.borrow_mut()[position].image.state = SegmentState::Sealed;
+        self.slots_mut()[position].image.state = SegmentState::Sealed;
         true
     }
 
@@ -449,7 +466,7 @@ impl Segments {
         if self.frozen.get() {
             return Err(Error::Busy);
         }
-        let mut slots = self.slots.borrow_mut();
+        let mut slots = self.slots_mut();
         let slot = slots.get_mut(Self::position(id)?).ok_or(Error::Corrupt)?;
         if !matches!(
             slot.image.state,
@@ -475,7 +492,7 @@ impl Segments {
         if self.frozen.get() {
             return Err(Error::Busy);
         }
-        let mut slots = self.slots.borrow_mut();
+        let mut slots = self.slots_mut();
         let slot = slots.get_mut(Self::position(id)?).ok_or(Error::Corrupt)?;
         if slot.image.state != SegmentState::Evicting || slot.leases.get() != 0 {
             return Err(Error::Busy);
@@ -588,7 +605,7 @@ impl Segments {
     /// Frozen tables and outstanding leases return Busy without changing state.
     pub fn restore(&self, images: Vec<SegmentSnapshot>) -> Result<()> {
         let epoch = self.validate_restore_epoch(&images)?;
-        let mut slots = self.slots.borrow_mut();
+        let mut slots = self.slots_mut();
         self.open.set(None);
         self.free.borrow_mut().clear();
         self.evicting.set(0);
@@ -716,6 +733,31 @@ mod tests {
     }
 
     /// Lease ownership prevents reuse and old-generation acquisition.
+    #[test]
+    fn generation_moves_with_every_snapshot_change() {
+        let s = segments(1024, 2);
+        let start = s.generation();
+        let snapshot = s.snapshot();
+        let frozen = s.freeze().unwrap();
+        drop(frozen);
+        assert_eq!(s.generation(), start, "reads and freezes are not changes");
+        let mut last = start;
+        let mut changed = |s: &Segments, before: &[SegmentSnapshot]| {
+            assert_ne!(s.snapshot(), before);
+            assert_ne!(s.generation(), last);
+            last = s.generation();
+        };
+        let lease = s.append(1024).unwrap();
+        changed(&s, &snapshot);
+        let before = s.snapshot();
+        drop(lease);
+        s.begin_evict(SegmentId(0)).unwrap();
+        changed(&s, &before);
+        let before = s.snapshot();
+        s.recycle(SegmentId(0)).unwrap();
+        changed(&s, &before);
+    }
+
     #[test]
     fn no_reuse_before_lease_drop_and_no_aba() {
         let s = segments(1024, 2);

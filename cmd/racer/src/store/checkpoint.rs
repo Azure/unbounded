@@ -125,6 +125,21 @@ impl Checkpointer {
         Ok(())
     }
 
+    /// Combined mutation generation of the index and segment table, or `None`
+    /// while any hold exists: hold TTLs shrink with time, so a cut with holds
+    /// always differs from the last one. Equal values mean an equal image.
+    pub fn generation(&self) -> Option<u64> {
+        if self.index.has_holds() {
+            return None;
+        }
+        // Both counters only grow, so their sum changes whenever either does.
+        Some(
+            self.index
+                .generation()
+                .wrapping_add(self.segments.generation()),
+        )
+    }
+
     pub fn snapshot_shard(&self) -> Operation<'_, ShardImage> {
         Box::pin(async move {
             let geometry = self.geometry.get().ok_or(Error::InvalidConfiguration)?;

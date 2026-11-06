@@ -31,6 +31,13 @@ pub(super) struct CheckpointCut {
     /// Fingerprint of the last periodic cut this process wrote, if any. An
     /// identical cut is not rewritten.
     last_fingerprint: Option<[u8; 32]>,
+
+    /// Each worker's checkpoint generation for the current periodic cut,
+    /// read before its writer pauses. `None` when it has holds.
+    votes: HashMap<WorkerId, Option<u64>>,
+
+    /// Each worker's generation as of the last successful periodic cut.
+    published_generations: HashMap<WorkerId, u64>,
 }
 
 /// Publication ownership survives its result until every worker acknowledges it.
@@ -130,6 +137,7 @@ impl CheckpointCut {
         self.last_slot = publication.slot;
         // Only a periodic write records its fingerprint, after this returns.
         self.last_fingerprint = None;
+        self.published_generations.clear();
         Ok(())
     }
 
@@ -140,11 +148,14 @@ impl CheckpointCut {
             Some(fingerprint) => {
                 self.published(publication)?;
                 self.last_fingerprint = Some(fingerprint);
+                self.record_published_generations();
                 Ok(())
             }
             // No byte of this sequence reached disk, so reusing it is safe.
+            // The cut matched the one on disk, so its generations are current.
             None if publication.sequence == self.last_sequence => {
                 self.last_sequence -= 1;
+                self.record_published_generations();
                 Ok(())
             }
             None => Err(Error::Unavailable),
@@ -161,8 +172,46 @@ impl CheckpointCut {
         self.periodic_started = Some(now);
         self.periodic_finished = 0;
         self.shards.clear();
+        self.votes.clear();
         self.phase = CutPhase::Collecting;
         Ok(())
+    }
+
+    /// Record `worker`'s generation for this cut once, before it snapshots.
+    fn vote(&mut self, worker: WorkerId, generation: Option<u64>) {
+        self.votes.entry(worker).or_insert(generation);
+    }
+
+    /// Whether every one of `count` workers has voted in this cut.
+    fn votes_complete(&self, count: usize) -> bool {
+        self.votes.len() >= count
+    }
+
+    /// Whether every voting worker is unchanged since the last successful
+    /// periodic cut and has no holds, so this cut would match the one on disk.
+    fn unchanged(&self) -> bool {
+        !self.votes.is_empty()
+            && self.votes.iter().all(|(worker, generation)| {
+                generation.is_some_and(|generation| {
+                    self.published_generations.get(worker) == Some(&generation)
+                })
+            })
+    }
+
+    /// Complete this cut without snapshotting or publishing anything.
+    fn skip(&mut self) {
+        debug_assert!(matches!(self.phase, CutPhase::Collecting));
+        self.shards.clear();
+        self.phase = CutPhase::Published(Ok(()));
+    }
+
+    /// Remember this cut's votes as published; a worker with holds keeps none.
+    fn record_published_generations(&mut self) {
+        self.published_generations = self
+            .votes
+            .iter()
+            .filter_map(|(worker, generation)| generation.map(|generation| (*worker, generation)))
+            .collect();
     }
 
     /// Fence new write batches while a periodic cut still owns its snapshots.
@@ -348,6 +397,17 @@ impl WorkerApplication {
             // Stop starting batches while existing SQEs drain, then freeze only
             // this shard. No queue-idle requirement can starve a busy checkpoint.
             if self.writer_task.is_some() {
+                return Ok(());
+            }
+            // Vote before pausing the writer. If every worker is unchanged
+            // since the last successful cut and holds nothing, the cut would
+            // only rewrite (and re-hash) an identical image, so skip it.
+            cut.vote(self.worker, self.store.checkpoint.generation());
+            if !cut.votes_complete(node.count) {
+                return Ok(());
+            }
+            if cut.unchanged() {
+                cut.skip();
                 return Ok(());
             }
             self.checkpoint_generation = generation;
@@ -732,6 +792,101 @@ mod tests {
         // Shutdown publication invalidates the periodic fingerprint.
         cut.published(publication).unwrap();
         assert_eq!(cut.last_fingerprint, None);
+    }
+
+    /// Vote both workers of a fresh periodic cut.
+    fn voted(cut: &mut CheckpointCut, votes: [Option<u64>; 2]) {
+        cut.restart(std::time::Instant::now()).unwrap();
+        for (worker, generation) in votes.into_iter().enumerate() {
+            cut.vote(crate::model::WorkerId(worker as u16), generation);
+        }
+        assert!(cut.votes_complete(2));
+    }
+
+    /// Publish the current cut through `settled` with a written fingerprint.
+    fn publish_written(cut: &mut CheckpointCut) {
+        let publication = cut.reserve(CheckpointPolicy::Periodic).unwrap();
+        cut.settled((publication, Some([1; 32]))).unwrap();
+    }
+
+    /// An unchanged node with no holds skips; the first cut never does.
+    #[test]
+    fn periodic_cut_skips_when_every_worker_is_unchanged() {
+        let mut cut = CheckpointCut::default();
+        voted(&mut cut, [Some(4), Some(7)]);
+        assert!(!cut.unchanged(), "nothing published yet");
+        publish_written(&mut cut);
+        voted(&mut cut, [Some(4), Some(7)]);
+        assert!(cut.unchanged());
+        cut.skip();
+        assert_eq!(cut.result(), Some(Ok(())));
+        assert!(!cut.blocks_writer());
+        // A later cut stays skippable without another write.
+        voted(&mut cut, [Some(4), Some(7)]);
+        assert!(cut.unchanged());
+        // Only the first vote of a worker counts in one cut.
+        cut.vote(crate::model::WorkerId(0), Some(5));
+        assert!(cut.unchanged());
+        // Votes are incomplete until every worker reported.
+        cut.restart(std::time::Instant::now()).unwrap();
+        cut.vote(crate::model::WorkerId(0), Some(4));
+        assert!(!cut.votes_complete(2));
+    }
+
+    /// A mutation on any worker forces a full cut.
+    #[test]
+    fn periodic_cut_does_not_skip_after_a_mutation() {
+        let mut cut = CheckpointCut::default();
+        voted(&mut cut, [Some(4), Some(7)]);
+        publish_written(&mut cut);
+        voted(&mut cut, [Some(4), Some(8)]);
+        assert!(!cut.unchanged());
+        // An identical-fingerprint settlement still records the new state.
+        let publication = cut.reserve(CheckpointPolicy::Periodic).unwrap();
+        cut.settled((publication, None)).unwrap();
+        voted(&mut cut, [Some(4), Some(8)]);
+        assert!(cut.unchanged());
+    }
+
+    /// A worker with holds always forces a full cut, before and after one.
+    #[test]
+    fn periodic_cut_does_not_skip_with_holds() {
+        let mut cut = CheckpointCut::default();
+        voted(&mut cut, [Some(4), None]);
+        assert!(!cut.unchanged());
+        publish_written(&mut cut);
+        voted(&mut cut, [Some(4), None]);
+        assert!(!cut.unchanged());
+        // Holds that ended need one full cut before skipping resumes.
+        voted(&mut cut, [Some(4), Some(9)]);
+        assert!(!cut.unchanged());
+    }
+
+    /// A failed publication, or a shutdown cut, records nothing to skip against.
+    #[test]
+    fn periodic_cut_does_not_skip_after_a_failed_publish() {
+        let mut cut = CheckpointCut::default();
+        voted(&mut cut, [Some(4), Some(7)]);
+        publish_written(&mut cut);
+        voted(&mut cut, [Some(5), Some(7)]);
+        let _failed = cut.reserve(CheckpointPolicy::Periodic).unwrap();
+        cut.fail(Error::Unavailable);
+        voted(&mut cut, [Some(5), Some(7)]);
+        assert!(!cut.unchanged(), "the failed cut's state is not on disk");
+        // A stale settlement fails and records nothing either.
+        let stale = Publication {
+            sequence: 1,
+            slot: 1,
+        };
+        assert_eq!(cut.settled((stale, None)), Err(Error::Unavailable));
+        assert!(!cut.unchanged());
+        // A shutdown cut forgets the periodic state.
+        voted(&mut cut, [Some(5), Some(7)]);
+        publish_written(&mut cut);
+        let shutdown = cut.reserve(CheckpointPolicy::Shutdown).unwrap();
+        cut.published(shutdown).unwrap();
+        voted(&mut cut, [Some(5), Some(7)]);
+        assert!(!cut.unchanged());
     }
 
     /// Cold cuts keep their distinct slot policy; later cuts alternate after success.

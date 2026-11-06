@@ -414,6 +414,46 @@ fn hard_hold_checkpoint_roundtrip_restores_only_live_disk_reservations() {
     assert_eq!(index.hold_expiry(&id.version), None);
     assert!(index.lookup(&id).unwrap().is_some());
 }
+#[test]
+fn checkpoint_generation_tracks_content_mutations_and_holds() {
+    let simulation = racer_io::sim::SimOs::new();
+    let env = racer_io::Env::sim(&simulation, racer_io::WorkerCtx::host());
+    let f = Fixture::new(&env);
+    let _ = futures::executor::block_on(f.store.open()).unwrap();
+    f.reactor.init().unwrap();
+    let checkpoint = &f.store.checkpoint;
+    let index = f.store.writer.index();
+    let start = checkpoint.generation().unwrap();
+    // Reads and checkpoint snapshots leave the generation unchanged.
+    let shard = futures::executor::block_on(checkpoint.snapshot_incremental(1 << 30)).unwrap();
+    checkpoint.finish_snapshot();
+    assert_eq!(checkpoint.generation(), Some(start));
+    let copy = f.copy(1, 113);
+    let id = copy.ciphertext.envelope().page.clone();
+    index.touch(&id);
+    index.expire_holds(16);
+    assert_eq!(checkpoint.generation(), Some(start));
+    // A hold disables skipping until it ends; the hold itself is a mutation.
+    let until = racer_io::Clock::host().wall_now() + Duration::from_secs(60);
+    index.reserve_hold(&id.version, 1, until).unwrap();
+    assert_eq!(checkpoint.generation(), None);
+    drive(&f.reactor, f.store.writer.persist_held(copy, &scope(&env))).unwrap();
+    assert_eq!(checkpoint.generation(), None);
+    let epoch = index.hold_epoch(&id.version).unwrap();
+    index.release_hold_pages(&id.version, &std::iter::once(id.number).collect(), epoch);
+    let after = checkpoint.generation().unwrap();
+    assert_ne!(after, start);
+    // A stored page changes the next cut, and the generation moved with it.
+    let next = futures::executor::block_on(checkpoint.snapshot_incremental(1 << 30)).unwrap();
+    checkpoint.finish_snapshot();
+    assert_ne!(next.index.entries.len(), shard.index.entries.len());
+    assert_eq!(checkpoint.generation(), Some(after));
+    // Removing it is a mutation too.
+    let location = index.lookup(&id).unwrap().unwrap().location;
+    index.remove_if_matches(&id, &location);
+    assert_ne!(checkpoint.generation(), Some(after));
+}
+
 static NEXT: AtomicU64 = AtomicU64::new(0);
 
 #[test]

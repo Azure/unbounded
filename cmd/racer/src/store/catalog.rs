@@ -57,6 +57,10 @@ pub struct Index {
 
     holds: RefCell<super::holds::Holds>,
 
+    /// Bumped on every mutable borrow of `state` or `holds` through
+    /// [`Self::state_mut`] and [`Self::holds_mut`]; see [`Self::generation`].
+    generation: Cell<u64>,
+
     /// Keyring generation and age cursor of the unavailable-key sweep.
     key_sweep: Cell<(Option<u64>, Option<u64>)>,
 
@@ -118,7 +122,7 @@ impl Drop for PageTicket {
             self.index.reserved.set(self.index.reserved.get() - 1);
         }
         if let Some(reservation) = self.reservation.take() {
-            self.index.state.borrow_mut().pages.release(reservation);
+            self.index.state_mut().pages.release(reservation);
         }
     }
 }
@@ -133,7 +137,7 @@ impl PageTicket {
         length: usize,
     ) -> Result<(page_alloc::SegmentLease, RecordLocation)> {
         if self.reservation.is_none() {
-            self.reservation = Some(self.index.state.borrow_mut().pages.reserve(page)?);
+            self.reservation = Some(self.index.state_mut().pages.reserve(page)?);
         }
         self.reservation
             .as_mut()
@@ -208,7 +212,7 @@ fn page_value(scoring: &crate::retention::Scoring<'_>, page: &PageId, heat: u32)
 }
 impl Index {
     pub(super) fn bind_hold_segments(&self, segments: Rc<Segments>, free_reserve: usize) {
-        let mut holds = self.holds.borrow_mut();
+        let mut holds = self.holds_mut();
         holds.segments = Some(segments);
         holds.free_reserve = free_reserve;
     }
@@ -217,12 +221,12 @@ impl Index {
     /// The default is 50. One reserved page charges one whole segment.
     pub fn set_hold_capacity_percent(&self, percent: usize) -> Result<()> {
         self.expire_holds(usize::MAX);
-        let mut holds = self.holds.borrow_mut();
+        let mut holds = self.holds_mut();
         if percent > 100 || !holds.entries.is_empty() {
             return Err(Error::InvalidConfiguration);
         }
         let slots = page_slots(self.page_capacity.get(), percent)?;
-        self.state.borrow_mut().pages.resize(slots)?;
+        self.state_mut().pages.resize(slots)?;
         holds.percent = percent;
         Ok(())
     }
@@ -277,8 +281,8 @@ impl Index {
             return Err(Error::MissingKey);
         }
         self.expire_holds(HOLD_EXPIRY_BATCH);
-        let mut state = self.state.borrow_mut();
-        let mut holds = self.holds.borrow_mut();
+        let mut state = self.state_mut();
+        let mut holds = self.holds_mut();
         // An expired entry that is not swept yet no longer holds anything.
         if holds
             .entries
@@ -396,11 +400,12 @@ impl Index {
     /// Release up to `budget` expired holds. Runs every maintenance turn and,
     /// with a small budget, before capacity decisions.
     pub fn expire_holds(&self, budget: usize) {
-        let mut state = self.state.borrow_mut();
-        let mut holds = self.holds.borrow_mut();
-        if holds.entries.is_empty() {
+        // Checked first so an idle turn does not count as a mutation.
+        if self.holds.borrow().entries.is_empty() {
             return;
         }
+        let mut state = self.state_mut();
+        let mut holds = self.holds_mut();
         let now = holds.at(self.clock.now());
         let mut expired = Vec::new();
         state.pages.expire_holds(now, budget, |id| expired.push(id));
@@ -471,8 +476,8 @@ impl Index {
     /// all its holders. Published members keep theirs.
     #[cfg(test)]
     pub fn release_hold(&self, version: &ObjectVersion) -> Result<()> {
-        let mut state = self.state.borrow_mut();
-        let mut holds = self.holds.borrow_mut();
+        let mut state = self.state_mut();
+        let mut holds = self.holds_mut();
         let Some(hold) = holds.entries.get(version) else {
             return Ok(());
         };
@@ -556,8 +561,8 @@ impl Index {
         pages: &super::holds::HoldPages,
         epoch: super::holds::HoldEpoch,
     ) {
-        let mut state = self.state.borrow_mut();
-        let mut holds = self.holds.borrow_mut();
+        let mut state = self.state_mut();
+        let mut holds = self.holds_mut();
         let Some(hold) = holds.entries.get_mut(version) else {
             return;
         };
@@ -689,8 +694,8 @@ impl Index {
 
     /// Drop every hold.
     fn clear_holds(&self) {
-        let mut state = self.state.borrow_mut();
-        let mut holds = self.holds.borrow_mut();
+        let mut state = self.state_mut();
+        let mut holds = self.holds_mut();
         let versions: Vec<_> = holds.entries.keys().cloned().collect();
         for version in versions {
             holds.drop_version(&mut state.pages, &version);
@@ -709,7 +714,7 @@ impl Index {
             ObjectVersion,
             (std::time::SystemTime, std::time::Instant, Vec<PageId>),
         > = HashMap::default();
-        let mut state = self.state.borrow_mut();
+        let mut state = self.state_mut();
         for (page, ttl) in held {
             if !state.pages.contains_key(page) {
                 continue;
@@ -725,7 +730,7 @@ impl Index {
             entry.1 = entry.1.max(monotonic);
             entry.2.push(page.clone());
         }
-        let mut holds = self.holds.borrow_mut();
+        let mut holds = self.holds_mut();
         let at = holds.at(now);
         for (version, (until, monotonic, pages)) in versions {
             let (id, slots) = state.pages.hold(&pages, holds.at(monotonic), at)?;
@@ -807,9 +812,41 @@ impl Index {
                 Retention::new(256 * 1024, clock.clone()).expect("valid bounded retention"),
             )),
             holds: RefCell::new(super::holds::Holds::new(&clock)),
+            generation: Cell::new(0),
             key_sweep: Cell::default(),
         }
     }
+    /// Mutable page state. Every caller counts as a mutation of checkpoint
+    /// content, so a periodic checkpoint cannot skip a changed index.
+    fn state_mut(&self) -> std::cell::RefMut<'_, State> {
+        self.generation.set(self.generation.get().wrapping_add(1));
+        self.state.borrow_mut()
+    }
+
+    /// Mutable page state for updates that never change checkpoint content:
+    /// walk cursors and retention heat. Checkpoints record neither.
+    fn state_cursor(&self) -> std::cell::RefMut<'_, State> {
+        self.state.borrow_mut()
+    }
+
+    /// Mutable holds; counted like [`Self::state_mut`].
+    fn holds_mut(&self) -> std::cell::RefMut<'_, super::holds::Holds> {
+        self.generation.set(self.generation.get().wrapping_add(1));
+        self.holds.borrow_mut()
+    }
+
+    /// Mutation generation: changes whenever page, metadata or hold state may
+    /// have changed. Equal values mean an unchanged checkpoint image, apart
+    /// from hold TTLs, which callers check with [`Self::has_holds`].
+    pub fn generation(&self) -> u64 {
+        self.generation.get()
+    }
+
+    /// Whether any hold entry, live or not yet swept, exists.
+    pub fn has_holds(&self) -> bool {
+        !self.holds.borrow().entries.is_empty()
+    }
+
     /// Worker time for this index's freshness and expiry decisions.
     pub fn clock(&self) -> &racer_io::Clock {
         &self.clock
@@ -843,8 +880,7 @@ impl Index {
     pub fn seed_page_hash(&self, rng: &racer_io::Rng) -> Result<()> {
         let mut key = [0; 16];
         rng.fill(&mut key).map_err(|_| Error::Unavailable)?;
-        self.state
-            .borrow_mut()
+        self.state_mut()
             .pages
             .set_hash_key(page_alloc::intern::KeyedState::from_bytes(key))
     }
@@ -860,7 +896,7 @@ impl Index {
             return Err(Error::InvalidConfiguration);
         }
         let slots = page_slots(capacity, self.holds.borrow().percent)?;
-        self.state.borrow_mut().pages.resize(slots)?;
+        self.state_mut().pages.resize(slots)?;
         self.page_capacity.set(capacity);
         Ok(())
     }
@@ -902,7 +938,8 @@ impl Index {
     }
     /// Record a disk read of `page`, raising its segment's retention heat.
     pub fn touch(&self, page: &PageId) {
-        self.state.borrow_mut().pages.touch(page);
+        // Heat only steers retention scoring; checkpoints never record it.
+        self.state_cursor().pages.touch(page);
     }
     /// Reserve one potential new mapping for `page`. A full index returns
     /// `Overloaded`; the caller frees entries with
@@ -944,7 +981,7 @@ impl Index {
     ) -> Result<()> {
         let result = self.try_publish(page, entry, &mut reservation);
         if let Some(reservation) = reservation {
-            self.state.borrow_mut().pages.release(reservation);
+            self.state_mut().pages.release(reservation);
         }
         result
     }
@@ -962,7 +999,7 @@ impl Index {
         }
         Self::validate_descriptor(&entry.metadata)?;
         let payload_bytes = u64::from(entry.metadata.page_length_in(&page, entry.page_size)?);
-        let mut state = self.state.borrow_mut();
+        let mut state = self.state_mut();
         Self::check_length(&state, &entry.metadata)?;
         if !state.pages.contains_key(&page)
             && state.pages.len() + self.reserved.get() + Self::held_unused(&state)
@@ -1005,7 +1042,7 @@ impl Index {
             return Ok(());
         }
         Self::validate_descriptor(&metadata)?;
-        let mut s = self.state.borrow_mut();
+        let mut s = self.state_mut();
         Self::check_length(&s, &metadata)?;
         if self.metadata_capacity == 0 {
             return Err(Error::Overloaded);
@@ -1039,7 +1076,7 @@ impl Index {
             return Ok(());
         }
         self.publish_version(metadata.immutable())?;
-        let mut s = self.state.borrow_mut();
+        let mut s = self.state_mut();
         s.current.remove(&metadata.version.object);
         if self.clock.wall_now() < metadata.expires_at.as_system_time() {
             s.current.insert(
@@ -1054,13 +1091,13 @@ impl Index {
     }
     /// Drop volatile freshness on clock uncertainty, preserving version descriptors.
     pub fn invalidate_freshness(&self) -> Result<()> {
-        self.state.borrow_mut().current.clear();
+        self.state_mut().current.clear();
         Ok(())
     }
     /// Reclaim standalone catalog entries and any pointers depending on them.
     /// Page-attached descriptors follow page eviction instead; no page is removed.
     pub fn evict_metadata(&self, entries: usize) -> Result<usize> {
-        let mut s = self.state.borrow_mut();
+        let mut s = self.state_mut();
         let count = entries.min(s.metadata.len());
         for _ in 0..count {
             Self::evict_one(&mut s);
@@ -1083,8 +1120,7 @@ impl Index {
             return 0;
         };
         let (next, visited) =
-            self.state
-                .borrow_mut()
+            self.state_cursor()
                 .pages
                 .walk(Walk::KeySweep, after, budget, |view| {
                     Some(
@@ -1106,7 +1142,7 @@ impl Index {
         removed
     }
     pub fn remove_if_matches(&self, page: &PageId, location: &RecordLocation) {
-        let mut s = self.state.borrow_mut();
+        let mut s = self.state_mut();
         s.pages.remove(page, Some(location));
     }
     pub fn snapshot(&self) -> Result<IndexSnapshot> {
@@ -1120,8 +1156,7 @@ impl Index {
     /// the oldest page; pass back the returned token to continue. Removals are
     /// safe omissions; a replaced page is visited again at the tail.
     pub fn snapshot_pages(&self, after: u64, limit: usize) -> (u64, Vec<(PageId, IndexedPage)>) {
-        self.state
-            .borrow_mut()
+        self.state_cursor()
             .pages
             .walk(Walk::Ownership, after, limit, |view| {
                 Some(view.into_owned())
@@ -1197,8 +1232,7 @@ impl Index {
     ) -> Result<(u64, Vec<(PageId, IndexedPage)>)> {
         let mut over = false;
         let result = self
-            .state
-            .borrow_mut()
+            .state_cursor()
             .pages
             .walk(Walk::Checkpoint, after, limit, |view| {
                 match remaining.checked_sub(super::checkpoint::snapshot_entry_bytes(view.metadata))
@@ -1251,7 +1285,7 @@ impl Index {
             .borrow_mut()
             .pages
             .continue_hold_ids(last_hold);
-        *self.state.borrow_mut() = replacement.state.into_inner();
+        *self.state_mut() = replacement.state.into_inner();
         Ok(())
     }
     pub fn validate_snapshot(&self, snapshot: &IndexSnapshot) -> Result<()> {
@@ -1339,9 +1373,9 @@ impl Index {
         if caches.is_empty() {
             return;
         }
-        let mut s = self.state.borrow_mut();
+        let mut s = self.state_mut();
         {
-            let mut holds = self.holds.borrow_mut();
+            let mut holds = self.holds_mut();
             let removed: Vec<_> = holds
                 .entries
                 .keys()
@@ -1497,7 +1531,7 @@ impl SegmentClock {
         let size = self.index.state.borrow().pages.page_size();
         let unseen = racer_core::cache::unseen_value_for(size.get(), scoring.any_over_share());
         let mut evicted = Vec::new();
-        let result = self.index.state.borrow_mut().pages.reclaim(
+        let result = self.index.state_mut().pages.reclaim(
             &self.segments,
             page_alloc::disk_index::ReclaimBudget {
                 free_reserve,
