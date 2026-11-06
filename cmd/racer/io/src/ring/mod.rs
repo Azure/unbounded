@@ -855,9 +855,29 @@ impl Reactor {
         state.classes[ctx.class.0 as usize] += 1;
         state.unfenced += 1;
         if let Some(deadline) = ctx.deadline.instant() {
+            Self::compact_deadlines(&mut state);
             state.deadlines.push(Reverse((deadline, id)));
         }
         Ok(id)
+    }
+
+    /// Drop stale deadline entries once they outnumber live operations.
+    ///
+    /// Entries are invalidated lazily (completed operations leave theirs
+    /// behind), so without this the heap grows with op rate times timeout.
+    /// Compacting only when stale entries exceed the live count plus slack
+    /// keeps the heap within `2 * live + 64` at amortized O(1) per push.
+    fn compact_deadlines(state: &mut State) {
+        if state.deadlines.len() <= 2 * state.slab.live + 64 {
+            return;
+        }
+        let State {
+            deadlines, slab, ..
+        } = state;
+        deadlines.retain(|Reverse((deadline, id))| {
+            slab.lookup(*id)
+                .is_some_and(|slot| slot.deadline == Some(*deadline) && slot.done.is_none())
+        });
     }
 
     /// Queue one SQE, flushing the SQ once if it is full.

@@ -1347,3 +1347,25 @@ mod legacy_reactor_ports {
         assert_eq!(sent, bytes.len() as isize);
     }
 }
+
+#[test]
+fn sim_deadline_heap_stays_bounded_under_churn() {
+    let os = SimOs::new();
+    let clock = crate::ctx::VirtualClock::new();
+    let reactor = simulated(&os, &clock);
+    let executor = LocalExecutor::new(Some(reactor.wake_handle()));
+    let ctx = OpCtx::none().deadline(Deadline::after(clock.now(), Duration::from_secs(30)));
+    for _ in 0..1000 {
+        let (left, right) = os.socket_pair();
+        let (left, right) = (Rc::new(left), Rc::new(right));
+        let recv = executor.spawn(reactor.recv(right, vec![0; 4], (), &ctx));
+        let send = executor.spawn(reactor.send(left, b"data".to_vec(), (), &ctx));
+        executor.block_on(&reactor, send).unwrap().unwrap();
+        executor.block_on(&reactor, recv).unwrap().unwrap();
+    }
+    let len = reactor.state().deadlines.len();
+    assert!(
+        len <= 2 * reactor.state().slab.live + 64 + 1,
+        "heap len {len}"
+    );
+}
