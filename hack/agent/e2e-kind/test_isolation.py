@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import json
+import subprocess
 import unittest
 import unittest.mock
 from unittest.mock import patch
@@ -935,6 +936,48 @@ class NoneRepavePodCIDRTests(unittest.TestCase):
     def test_it_runs_in_the_operations_suite_after_the_repave_upgrade(self):
         steps = e2e.SUITES["isolation-operations"]
         self.assertLess(steps.index("validate-node-repave-upgrade"), steps.index("validate-none-repave-pod-cidr"))
+
+
+class NoneRepaveDaemonKillTests(unittest.TestCase):
+    def test_the_script_kills_the_daemon_once_the_repave_started(self):
+        script = e2e.daemon_kill_during_repave_script(1700000000, 300)
+        self.assertIn("--since @1700000000", script)
+        self.assertIn("systemctl show -p MainPID --value unbounded-agent-daemon.service", script)
+        self.assertIn('kill -KILL "$pid"', script)
+        self.assertNotIn("systemctl kill", script)
+        # A repave that is already over is reported, not killed after the fact.
+        self.assertLess(script.index(e2e.NONE_REPAVE_COMPLETED), script.index(e2e.NONE_REPAVE_STARTED))
+
+    def test_the_script_is_valid_shell(self):
+        script = e2e.daemon_kill_during_repave_script(1, 1)
+        self.assertEqual(subprocess.run(["sh", "-n", "-c", script], check=False).returncode, 0)
+
+    def test_the_node_must_come_back_after_the_kill(self):
+        calls = []
+        killed = unittest.mock.Mock(returncode=0, stdout="killed\n", stderr="")
+        with patch.object(e2e, "ISOLATION_MODE", "none"), \
+                patch.object(e2e, "ssh_capture", return_value="1700000000"), \
+                patch.object(e2e, "ssh_capture_quiet", return_value=killed), \
+                patch.object(e2e, "repave_with_config_change", side_effect=lambda nc, purpose: calls.append("repave")), \
+                patch.object(e2e, "wait_for_daemon_active", side_effect=lambda: calls.append("daemon")), \
+                patch.object(e2e, "wait_for_node", side_effect=lambda: calls.append("node")), \
+                patch.object(e2e, "validate_isolation_mode", side_effect=lambda: calls.append("units")):
+            e2e.validate_none_repave_survives_daemon_kill(e2e.load_node_config(""))
+        self.assertEqual(calls, ["repave", "daemon", "node", "units"])
+
+    def test_a_repave_that_was_not_interrupted_fails(self):
+        finished = unittest.mock.Mock(returncode=2, stdout="finished\n", stderr="")
+        with patch.object(e2e, "ISOLATION_MODE", "none"), \
+                patch.object(e2e, "ssh_capture", return_value="1700000000"), \
+                patch.object(e2e, "ssh_capture_quiet", return_value=finished), \
+                patch.object(e2e, "repave_with_config_change"):
+            with self.assertRaises(SystemExit):
+                e2e.validate_none_repave_survives_daemon_kill(e2e.load_node_config(""))
+
+    def test_other_modes_skip_it(self):
+        with patch.object(e2e, "ISOLATION_MODE", "nspawn"), patch.object(e2e, "repave_with_config_change") as repave:
+            e2e.validate_none_repave_survives_daemon_kill(e2e.load_node_config(""))
+        repave.assert_not_called()
 
 
 class RestoreDeletedNodeTests(unittest.TestCase):
