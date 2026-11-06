@@ -466,6 +466,37 @@ func TestUpgradeFlipsCleansNetworkAndResetsIdentity(t *testing.T) {
 	require.Less(t, strings.Index(joined, "stop "+none.UnitKubelet), strings.Index(joined, "enable --now "+none.UnitLocalDNS))
 }
 
+// The new Node can be given another pod CIDR. A conflist or IPAM state left
+// from the old one would start pods with addresses from the old range, so the
+// upgrade starts the new stack without them, as a new nspawn machine does.
+func TestUpgradeStartsTheNewStackWithoutTheOldCNIState(t *testing.T) {
+	f := newFixture(t, false, nil)
+	installPrevious(t, f, "1.33.0-aaaaaaaa")
+	seedSharedConfig(t, f)
+
+	reservation := "/var/lib/cni/networks/kindnet/10.244.1.5"
+	require.NoError(t, os.MkdirAll(filepath.Dir(f.hostPath(reservation)), 0o755))
+	require.NoError(t, os.WriteFile(f.hostPath(reservation), []byte("pod"), 0o600))
+
+	var leftAtStart []string
+
+	f.node.p.WaitKubelet = func(context.Context) error {
+		for _, p := range []string{"/etc/cni/net.d/10-old.conflist", reservation} {
+			if _, err := os.Lstat(f.hostPath(p)); err == nil {
+				leftAtStart = append(leftAtStart, p)
+			}
+		}
+
+		return nil
+	}
+
+	require.NoError(t, f.node.Upgrade(t.Context()))
+
+	require.Empty(t, leftAtStart, "the new stack started on CNI state of the old Node")
+	require.DirExists(t, f.hostPath(goalstates.CNIConfigDir), "the directory stays for the CNI to write into")
+	require.NoDirExists(t, f.hostPath(hostnode.CNIStateDir))
+}
+
 func TestUpgradeRollsBackWhenKubeletNeverComesUp(t *testing.T) {
 	f := newFixture(t, false, nil)
 	installPrevious(t, f, "1.33.0-aaaaaaaa")

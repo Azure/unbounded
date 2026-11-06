@@ -439,8 +439,8 @@ func (n *Node) Restart(ctx context.Context) error {
 
 // Upgrade installs this configuration's version beside the active one, writes
 // the new configuration, and switches over: stop the stack, end its pods, clean
-// host networking as repave does, flip the current link, start, and wait for
-// kubelet. If the new version does not come up the link is flipped back and the
+// host networking and the CNI configuration and state as repave does, flip the
+// current link, start, and wait for kubelet. If the new version does not come up the link is flipped back and the
 // previous version is started again with the units, configuration and host
 // networking of Params.Previous. The caller has already drained the node and
 // removed it from the cluster, as for an nspawn repave.
@@ -526,6 +526,12 @@ func (n *Node) Upgrade(ctx context.Context) (err error) {
 
 	n.backend.BeforeUpgradeStart = func(ctx context.Context) error {
 		if err := n.resetHostNetwork(ctx); err != nil {
+			return err
+		}
+
+		// The pods have ended. The snapshot holds the CNI configuration, so a
+		// rollback puts it back; the IPAM state names only pods that are gone.
+		if err := hostnode.ResetCNIState(n.p.HostRoot); err != nil {
 			return err
 		}
 

@@ -271,6 +271,42 @@ func ResetKubeletIdentity(ns *goalstates.NodeStart) error {
 	return nil
 }
 
+// CNIStateDir is where the CNI plugins keep per-node state, host-local IPAM's
+// address reservations among it.
+const CNIStateDir = "/var/lib/cni"
+
+// ResetCNIState removes the CNI network configuration and the CNI state a
+// stopped stack left below hostRoot, as a repave to a new nspawn machine starts
+// without them. The configuration directory itself stays, empty.
+//
+// A repave deletes the Node, and the new one can be given a different pod CIDR.
+// Left in place, the old configuration makes containerd report the network
+// ready at once and starts pods with addresses from the old range until the
+// CNI's own pod rewrites it, and host-local IPAM keeps reservations for pods
+// that were ended. Every file in the directory goes, those of add-ons
+// included: they are written by DaemonSet pods that write them again when they
+// start, and a repave to a new nspawn machine loses them all the same.
+func ResetCNIState(hostRoot string) error {
+	confDir := filepath.Join(hostRoot, goalstates.CNIConfigDir)
+
+	entries, err := os.ReadDir(confDir)
+	if err != nil && !errors.Is(err, os.ErrNotExist) {
+		return fmt.Errorf("list CNI configuration: %w", err)
+	}
+
+	for _, e := range entries {
+		if err := os.RemoveAll(filepath.Join(confDir, e.Name())); err != nil {
+			return fmt.Errorf("remove CNI configuration: %w", err)
+		}
+	}
+
+	if err := os.RemoveAll(filepath.Join(hostRoot, CNIStateDir)); err != nil {
+		return fmt.Errorf("remove CNI state: %w", err)
+	}
+
+	return nil
+}
+
 // Logger returns l, or the default logger when l is nil.
 func Logger(l *slog.Logger) *slog.Logger {
 	if l == nil {
