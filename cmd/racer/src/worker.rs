@@ -2286,13 +2286,35 @@ mod tests {
             let observed = factory.observed.clone();
             observed.release.store(true, Ordering::SeqCst);
             let mut group = WorkerGroup::new(plan, env.ctx.clone());
-            let mut scope = scope();
-            scope.deadline =
-                racer_io::deadline::Deadline(Instant::now() + Duration::from_millis(100));
+            // The startup deadline runs on a virtual clock that expires only
+            // after the ready sibling's crypto roundtrip is observed, so a
+            // slow host cannot expire it first.
+            let clock = racer_io::ctx::VirtualClock::new();
+            let scope = RequestScope::with_clock(
+                RequestId([7; 16]),
+                clock.now() + Duration::from_millis(100),
+                clock.clone().into(),
+            )
+            .unwrap();
+            let expire = {
+                let observed = observed.clone();
+                std::thread::spawn(move || {
+                    let watchdog = Instant::now() + Duration::from_secs(30);
+                    // Expire regardless after the watchdog; the assertion
+                    // below then reports the missing completion.
+                    while observed.completed.load(Ordering::SeqCst) == 0
+                        && Instant::now() < watchdog
+                    {
+                        std::thread::sleep(Duration::from_millis(1));
+                    }
+                    clock.advance(Duration::from_millis(100)).unwrap();
+                })
+            };
             assert_eq!(
                 group.start_recipe(Arc::new(factory), &scope),
                 Err(Error::DeadlineExceeded)
             );
+            expire.join().unwrap();
             assert_eq!(observed.completed.load(Ordering::SeqCst), 1);
             assert_eq!(group.runtime.stats().done, 3);
         }
