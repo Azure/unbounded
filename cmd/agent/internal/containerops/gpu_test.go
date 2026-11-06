@@ -6,6 +6,8 @@ package containerops
 import (
 	"context"
 	"errors"
+	"os"
+	"path/filepath"
 	"testing"
 
 	"github.com/stretchr/testify/require"
@@ -52,8 +54,14 @@ func TestReconcileNVIDIARebuildsGPUStateInsideTheContainer(t *testing.T) {
 	f := newFixture(t)
 	b := runningContainer(t, f)
 
+	// The archives the start imported are imported again once containerd is
+	// back, from the directory the hooks name.
+	require.NoError(t, os.MkdirAll(f.images(), 0o755))
+	require.NoError(t, os.WriteFile(filepath.Join(f.images(), "a.tar"), nil, 0o644))
+
 	err := ReconcileNVIDIA(t.Context(), quiet(), b, "kube1", NVIDIAHooks{
-		Resolve: func(string) (goalstates.NvidiaHost, error) { return gpuHostState(), nil },
+		Resolve:         func(string) (goalstates.NvidiaHost, error) { return gpuHostState(), nil },
+		ImageArchiveDir: f.images(),
 	})
 	require.NoError(t, err)
 
@@ -70,6 +78,7 @@ func TestReconcileNVIDIARebuildsGPUStateInsideTheContainer(t *testing.T) {
 		goalstates.NvidiaCTKPath+" cdi generate --driver-root "+goalstates.NvidiaDriverDir,
 		goalstates.NvidiaCTKPath+" config --set nvidia-container-runtime.mode=cdi --in-place",
 		"systemctl enable --now "+goalstates.SystemdUnitContainerd,
+		"ctr --namespace k8s.io images import "+filepath.Join(goalstates.ContainerImageArchiveDir, "a.tar"),
 		"systemctl enable --now "+goalstates.SystemdUnitKubelet,
 	)
 }
@@ -124,7 +133,8 @@ func TestReconcileNVIDIAReportsTheFailingStep(t *testing.T) {
 	f.h.failAll["cdi generate"] = errors.New("no spec")
 
 	err := ReconcileNVIDIA(t.Context(), quiet(), b, "kube1", NVIDIAHooks{
-		Resolve: func(string) (goalstates.NvidiaHost, error) { return gpuHostState(), nil },
+		Resolve:         func(string) (goalstates.NvidiaHost, error) { return gpuHostState(), nil },
+		ImageArchiveDir: f.images(),
 	})
 	require.ErrorContains(t, err, "no spec")
 	require.ErrorContains(t, err, "kube1")

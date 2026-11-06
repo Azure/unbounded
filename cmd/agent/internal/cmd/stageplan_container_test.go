@@ -106,7 +106,7 @@ func newContainerPlan(t *testing.T, running bool) (*containerPlan, *agentStages,
 	p.node = containerops.New(containerops.Params{
 		Log:       slog.New(slog.NewTextHandler(io.Discard, nil)),
 		GoalState: gs,
-		Overrides: containerops.Overrides{Layout: container.Layout{Base: filepath.Join(dir, "containers")}, SystemdDir: filepath.Join(dir, "units"), RuntimePath: containerTestRuntime, HelperPath: "/usr/local/bin/unbounded-agent", Run: h.run, MountInfoPath: filepath.Join(dir, "mountinfo"), Host: &container.HostFS{SELinuxEnforce: filepath.Join(dir, "absent")}, PollInterval: time.Millisecond, Unpack: func(_ context.Context, d string) error { return os.MkdirAll(filepath.Join(d, "etc"), 0o755) }, InstallRuntime: func(context.Context) error {
+		Overrides: containerops.Overrides{Layout: container.Layout{Base: filepath.Join(dir, "containers")}, SystemdDir: filepath.Join(dir, "units"), RuntimePath: containerTestRuntime, HelperPath: "/usr/local/bin/unbounded-agent", Run: h.run, MountInfoPath: filepath.Join(dir, "mountinfo"), ImageArchiveDir: filepath.Join(dir, "images"), Host: &container.HostFS{SELinuxEnforce: filepath.Join(dir, "absent")}, PollInterval: time.Millisecond, Unpack: func(_ context.Context, d string) error { return os.MkdirAll(filepath.Join(d, "etc"), 0o755) }, InstallRuntime: func(context.Context) error {
 			h.calls = append(h.calls, "install-runtime")
 			return nil
 		}, InstallHelper: func(context.Context) error { return nil }, ProvisionRootfs: func(context.Context) error { return nil }},
@@ -181,7 +181,7 @@ func TestContainerPlanPrepareNodeRootFailsWhenTheUnpackFails(t *testing.T) {
 	p.node = containerops.New(containerops.Params{
 		Log:       slog.New(slog.DiscardHandler),
 		GoalState: s.gs,
-		Overrides: containerops.Overrides{Layout: container.Layout{Base: filepath.Join(t.TempDir(), "c")}, SystemdDir: t.TempDir(), Run: (&containerHost{active: map[string]bool{}, fail: map[string]error{}}).run, MountInfoPath: filepath.Join(t.TempDir(), "mi"), Unpack: func(context.Context, string) error { return errors.New("registry unreachable") }, InstallRuntime: func(context.Context) error { return nil }, InstallHelper: func(context.Context) error { return nil }},
+		Overrides: containerops.Overrides{Layout: container.Layout{Base: filepath.Join(t.TempDir(), "c")}, SystemdDir: t.TempDir(), Run: (&containerHost{active: map[string]bool{}, fail: map[string]error{}}).run, MountInfoPath: filepath.Join(t.TempDir(), "mi"), ImageArchiveDir: filepath.Join(t.TempDir(), "images"), Unpack: func(context.Context, string) error { return errors.New("registry unreachable") }, InstallRuntime: func(context.Context) error { return nil }, InstallHelper: func(context.Context) error { return nil }},
 		Hooks:     hostnode.Hooks{HostRoot: t.TempDir()},
 	})
 

@@ -35,6 +35,10 @@ type NVIDIAHooks struct {
 	Execute func(ctx context.Context, log *slog.Logger, task phases.Task) error
 	// PollInterval and ReadyTimeout bound the wait for systemd in the container.
 	PollInterval, ReadyTimeout time.Duration
+	// ImageArchiveDir is where the staged container image archives the
+	// rebuild reimports are listed; see Overrides.ImageArchiveDir. Empty is the
+	// default.
+	ImageArchiveDir string
 }
 
 func (h NVIDIAHooks) resolve() func(string) (goalstates.NvidiaHost, error) {
@@ -155,7 +159,7 @@ func ReconcileNVIDIA(ctx context.Context, log *slog.Logger, b *container.Backend
 		Nvidia:     nvidia,
 	}
 
-	if err := h.execute()(ctx, log, nodestart.ReconcileNVIDIA(log, nodeStart)); err != nil {
+	if err := h.execute()(ctx, log, nodestart.ReconcileNVIDIAFrom(log, nodeStart, h.ImageArchiveDir)); err != nil {
 		return fmt.Errorf("reconcile NVIDIA state for %s: %w", slot, err)
 	}
 
