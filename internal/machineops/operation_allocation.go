@@ -295,11 +295,9 @@ func (r *MachineOperationReconciler) reconcileHostRelease(ctx context.Context, a
 	}
 
 	if failure != nil {
-		if failure.Reason == allocationReasonAuthorityReplaced || a.begun {
-			return r.holdAllocationOperation(ctx, a, failure.Reason, failure.Message)
-		}
-
-		return r.failAllocationOperation(ctx, a, failure.Reason, failure.Message)
+		// A terminal release cannot be replaced; repaired credentials must
+		// still be able to resume the recorded operation.
+		return r.holdAllocationOperation(ctx, a, failure.Reason, failure.Message)
 	}
 
 	request := r.allocationRequest(a, nil)
@@ -821,9 +819,9 @@ func (r *MachineOperationReconciler) failAllocationOperation(
 	return r.failOperation(ctx, a.op, reason, message)
 }
 
-// holdAllocationOperation keeps an operation on which Begin may have run
-// InProgress and reports why it cannot continue: in the target message and
-// as the reason of the Completed condition. Nothing terminal is written.
+// holdAllocationOperation keeps an operation InProgress and reports why it
+// cannot continue: in the target message and as the reason of the Completed
+// condition. Nothing terminal is written.
 func (r *MachineOperationReconciler) holdAllocationOperation(
 	ctx context.Context,
 	a *allocationOperation,

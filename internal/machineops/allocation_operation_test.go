@@ -537,17 +537,6 @@ func TestAllocationOperationBeginPermanentError(t *testing.T) {
 func TestReleaseOperationWaitsAndRequests(t *testing.T) {
 	t.Parallel()
 
-	allocateOwned := []unboundedv1alpha3.ProviderOwnedResource{{ID: "vm", NativeID: "vm-1"}, {ID: "nic", NativeID: "nic-1"}}
-	released := func(h *allocationHarness) {
-		h.settle()
-		h.setOperationHandle(allocTestNames.allocateOperation)
-		h.completeOperation(allocTestNames.allocateOperation, unboundedv1alpha3.OperationPhaseComplete, "Succeeded",
-			&unboundedv1alpha3.MachineOperationAllocationResult{OwnedResources: allocateOwned})
-		h.settle()
-		h.setLifecycle(unboundedv1alpha3.MachineAllocationReleased)
-		h.settle()
-	}
-
 	waits := []struct {
 		name   string
 		mutate func(*testing.T, *engineHarness)
@@ -604,7 +593,7 @@ func TestReleaseOperationWaitsAndRequests(t *testing.T) {
 		t.Run("waits while "+wait.name, func(t *testing.T) {
 			t.Parallel()
 
-			e := newEngineHarness(t, released)
+			e := newEngineHarness(t, prepareReleasedAllocation)
 			require.NotNil(t, e.allocation().Status.Operations.Release)
 			wait.mutate(t, e)
 			e.resetWrites()
@@ -619,7 +608,7 @@ func TestReleaseOperationWaitsAndRequests(t *testing.T) {
 	t.Run("begins with the merged owned resources", func(t *testing.T) {
 		t.Parallel()
 
-		e := newEngineHarness(t, released)
+		e := newEngineHarness(t, prepareReleasedAllocation)
 		e.updateAllocationStatus(t, func(status *unboundedv1alpha3.MachineAllocationStatus) {
 			status.OwnedResources = []unboundedv1alpha3.ProviderOwnedResource{{ID: "vm", NativeID: "vm-1"}, {ID: "disk", NativeID: "disk-1"}}
 		})
@@ -650,6 +639,89 @@ func TestReleaseOperationWaitsAndRequests(t *testing.T) {
 		require.Equal(t, unboundedv1alpha3.OperationPhaseComplete, release.Status.Phase)
 		require.Nil(t, release.Status.Allocation)
 	})
+}
+
+func TestReleaseOperationAuthFailureRecovery(t *testing.T) {
+	t.Parallel()
+
+	for _, tt := range []struct {
+		name             string
+		replaceAuthority bool
+	}{
+		{name: "secret restored"},
+		{name: "credential replaced", replaceAuthority: true},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			e := newEngineHarness(t, prepareReleasedAllocation)
+			fixture := newClassFixture()
+			ctx := context.Background()
+
+			var credential unboundedv1alpha3.MachineOperationCredential
+			require.NoError(t, e.raw.Get(ctx, client.ObjectKey{Name: fixture.credential.Name}, &credential))
+			credential.Spec.Auth = fixture.credential.Spec.Auth
+			require.NoError(t, e.raw.Update(ctx, &credential))
+
+			releaseUID := e.operation(allocTestNames.releaseOperation).UID
+			releaseRef := *e.allocation().Status.Operations.Release
+
+			for range 2 {
+				result := e.reconcile(allocTestNames.releaseOperation)
+				require.Equal(t, ctrl.Result{RequeueAfter: engineTestStalledInterval}, result)
+				e.requireNoProviderCalls(t)
+				e.requireCompleted(t, allocTestNames.releaseOperation, unboundedv1alpha3.OperationPhaseInProgress, authReasonSecretNotFound)
+
+				op := e.operation(allocTestNames.releaseOperation)
+				completed := apimeta.FindStatusCondition(op.Status.Conditions, OperationConditionCompleted)
+				require.Equal(t, metav1.ConditionFalse, completed.Status)
+				require.Contains(t, op.Finalizers, unboundedv1alpha3.MachineAllocationFinalizer)
+				require.True(t, e.machine().Spec.Fenced)
+				require.Equal(t, releaseRef, *e.allocation().Status.Operations.Release)
+			}
+
+			if tt.replaceAuthority {
+				replaceCredential(t, e)
+
+				result := e.reconcile(allocTestNames.releaseOperation)
+				require.Equal(t, ctrl.Result{RequeueAfter: engineTestStalledInterval}, result)
+				e.requireNoProviderCalls(t)
+				e.requireCompleted(t, allocTestNames.releaseOperation, unboundedv1alpha3.OperationPhaseInProgress, allocationReasonAuthorityReplaced)
+
+				return
+			}
+
+			require.NoError(t, e.raw.Create(ctx, fixture.secret))
+
+			e.reconcile(allocTestNames.releaseOperation)
+
+			_, _, begins, _ := e.provider.calls()
+			require.Len(t, begins, 1)
+			require.Equal(t, releaseUID, begins[0].OperationUID)
+			require.Equal(t, map[string]string{"token": classTestSecretValue}, begins[0].Auth.SecretData)
+
+			e.provider.setPoll(publicmachineops.PollResult{State: publicmachineops.ProviderOperationStateSucceeded}, nil)
+			e.reconcile(allocTestNames.releaseOperation)
+			e.requireCompleted(t, allocTestNames.releaseOperation, unboundedv1alpha3.OperationPhaseComplete, "Succeeded")
+			require.Equal(t, releaseUID, e.operation(allocTestNames.releaseOperation).UID)
+			require.Equal(t, releaseRef, *e.allocation().Status.Operations.Release)
+		})
+	}
+}
+
+func prepareReleasedAllocation(h *allocationHarness) {
+	h.settle()
+	h.setOperationHandle(allocTestNames.allocateOperation)
+	h.completeOperation(allocTestNames.allocateOperation, unboundedv1alpha3.OperationPhaseComplete, "Succeeded",
+		&unboundedv1alpha3.MachineOperationAllocationResult{
+			OwnedResources: []unboundedv1alpha3.ProviderOwnedResource{
+				{ID: "vm", NativeID: "vm-1"},
+				{ID: "nic", NativeID: "nic-1"},
+			},
+		})
+	h.settle()
+	h.setLifecycle(unboundedv1alpha3.MachineAllocationReleased)
+	h.settle()
 }
 
 func TestAllocationOperationIgnoresUnboundOps(t *testing.T) {
