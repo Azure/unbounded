@@ -260,17 +260,27 @@ fn start_and_shutdown_are_bounded_without_an_api() {
 fn start_serves_the_webhook_on_both_pod_ip_families() {
     let cluster = FakeCluster::start(1);
     let mut config = cluster.config(1);
+    config.webhook_alternate = Some("::1".parse().unwrap());
     // Ephemeral ports differ per bind; use one port free on both families.
-    let port = loop {
-        let v4 = std::net::TcpListener::bind("127.0.0.2:0").unwrap();
-        let port = v4.local_addr().unwrap().port();
-        if std::net::TcpListener::bind(("::1", port)).is_ok() {
-            break port;
+    // The probe releases the port before `start` binds it, so a concurrent
+    // test (or the control listener's own ephemeral bind) can take it in
+    // between; that race surfaces as `Error::Io`, so probe again and retry.
+    let mut attempts = 0;
+    let h = loop {
+        let port = loop {
+            let v4 = std::net::TcpListener::bind("127.0.0.2:0").unwrap();
+            let port = v4.local_addr().unwrap().port();
+            if std::net::TcpListener::bind(("::1", port)).is_ok() {
+                break port;
+            }
+        };
+        config.webhook_listen = std::net::SocketAddr::new(config.pod_ip, port);
+        match crate::start(config.clone()) {
+            Ok(h) => break h,
+            Err(crate::Error::Io) if attempts < 20 => attempts += 1,
+            Err(e) => panic!("start: {e:?}"),
         }
     };
-    config.webhook_listen = std::net::SocketAddr::new(config.pod_ip, port);
-    config.webhook_alternate = Some("::1".parse().unwrap());
-    let h = crate::start(config).unwrap();
     h.bootstrap(Duration::from_secs(20)).unwrap();
     let mut published = None;
     assert!(
@@ -315,7 +325,7 @@ fn start_serves_the_webhook_on_both_pod_ip_families() {
         .with_no_client_auth(),
     );
     for ip in ips.split(',') {
-        let address = std::net::SocketAddr::new(ip.parse().unwrap(), port);
+        let address = std::net::SocketAddr::new(ip.parse().unwrap(), config.webhook_listen.port());
         let tls = tls.clone();
         let status = Executor::new(64).unwrap().block_on(async move {
             let name =
