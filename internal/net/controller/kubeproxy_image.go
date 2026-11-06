@@ -10,6 +10,7 @@ import (
 
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/util/version"
 	"k8s.io/apimachinery/pkg/util/wait"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/klog/v2"
@@ -33,16 +34,27 @@ const (
 //     cluster.
 //   - A reference without one takes the tag of the image kube-system/kube-proxy
 //     runs, so a mirror of the provider's image keeps the provider's version.
-//     Without that DaemonSet, or when its image names no tag, the tag is the
-//     API server's version.
+//     Without a provider tag, the registry is searched for the API server's
+//     major.minor.patch version, preferring the highest numeric maintenance
+//     suffix over the exact version tag.
 //   - Empty reuses the kube-system/kube-proxy image, and otherwise falls back to
-//     registry.k8s.io/kube-proxy at the API server's version.
+//     registry.k8s.io/kube-proxy. An unversioned provider image supplies its
+//     repository, but still needs the API server version and registry search.
 //
-// Malformed configured values and context cancellation return errors. A cluster
-// that cannot be read falls back after retries: the image is worked out once,
-// when the controller starts leading, and failing there would leave managed
-// kube-proxy unreconciled until the next restart.
+// Provider reads fall back after retries. Fallback selection requires a valid
+// API server version and a matching registry tag; failures return errors rather
+// than choosing latest. Explicit and provider-supplied versions are used as-is.
+// The image is worked out once, when the controller starts leading.
 func ManagedKubeProxyImage(ctx context.Context, clientset kubernetes.Interface, configured string) (string, error) {
+	return managedKubeProxyImage(ctx, clientset, configured, registryKubeProxyTag)
+}
+
+func managedKubeProxyImage(
+	ctx context.Context,
+	clientset kubernetes.Interface,
+	configured string,
+	resolveTag func(context.Context, string, string) (string, error),
+) (string, error) {
 	repository := DefaultKubeProxyRepository
 
 	if configured != "" {
@@ -64,12 +76,29 @@ func ManagedKubeProxyImage(ctx context.Context, clientset kubernetes.Interface, 
 	}
 
 	if configured == "" && provider != "" {
-		return provider, nil
+		ref, parseErr := config.ParseImageReference(provider)
+		// Preserve provider references verbatim. Only a valid, unversioned
+		// reference needs its repository carried into fallback tag selection.
+		if parseErr != nil || ref.HasVersion() {
+			return provider, nil
+		}
+
+		repository = ref.Name
 	}
 
 	tag := imageTag(provider)
-	if tag == "" {
-		tag = serverVersionTag(clientset)
+	if tag != "" {
+		return repository + ":" + tag, nil
+	}
+
+	serverTag, err := serverVersionTag(ctx, clientset)
+	if err != nil {
+		return "", fmt.Errorf("managed kube-proxy image: %w", err)
+	}
+
+	tag, err = resolveTag(ctx, repository, serverTag)
+	if err != nil {
+		return "", fmt.Errorf("managed kube-proxy image: %w", err)
 	}
 
 	return repository + ":" + tag, nil
@@ -144,19 +173,31 @@ func imageTag(image string) string {
 	return ref.Tag
 }
 
-// serverVersionTag returns the API server's version for use as an image tag,
-// or latest when it cannot be read.
-func serverVersionTag(clientset kubernetes.Interface) string {
+// serverVersionTag returns the API server's major.minor.patch version, with a
+// leading v, for matching registry tags. Vendor prerelease and build metadata
+// are not part of the Kubernetes release version being matched.
+func serverVersionTag(ctx context.Context, clientset kubernetes.Interface) (string, error) {
+	if err := ctx.Err(); err != nil {
+		return "", err
+	}
+
 	serverVersion, err := clientset.Discovery().ServerVersion()
 	if err != nil {
-		klog.Warningf("Failed to discover Kubernetes server version for managed kube-proxy image: %v", err)
-
-		return "latest"
+		return "", fmt.Errorf("discover Kubernetes server version: %w", err)
 	}
 
-	if serverVersion.GitVersion == "" {
-		return "latest"
+	if err := ctx.Err(); err != nil {
+		return "", err
 	}
 
-	return serverVersion.GitVersion
+	if serverVersion == nil || serverVersion.GitVersion == "" {
+		return "", fmt.Errorf("empty Kubernetes server version")
+	}
+
+	parsed, err := version.ParseSemantic(serverVersion.GitVersion)
+	if err != nil {
+		return "", fmt.Errorf("parse Kubernetes server version %q: %w", serverVersion.GitVersion, err)
+	}
+
+	return fmt.Sprintf("v%d.%d.%d", parsed.Major(), parsed.Minor(), parsed.Patch()), nil
 }

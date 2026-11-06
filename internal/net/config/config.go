@@ -71,10 +71,10 @@ type Config struct {
 	ManagedKubeProxyEnabled bool
 	// ManagedKubeProxyImage sets the image of the managed per-site kube-proxy
 	// DaemonSets. A reference with a tag or digest is used as-is; one without
-	// takes its tag from the kube-system/kube-proxy image, or from the
-	// Kubernetes server version when that DaemonSet does not exist. Empty means
-	// reuse kube-system/kube-proxy if present, otherwise derive
-	// registry.k8s.io/kube-proxy from the Kubernetes server version.
+	// takes its tag from kube-system/kube-proxy, or searches its registry for
+	// the Kubernetes server's major.minor.patch version with the highest numeric
+	// maintenance suffix. Empty means reuse the provider image when versioned,
+	// otherwise use its repository or fall back to registry.k8s.io/kube-proxy.
 	ManagedKubeProxyImage string
 	// NetlinkResyncPeriod is the interval between full netlink cache resyncs on node agents.
 	NetlinkResyncPeriod time.Duration

@@ -156,17 +156,24 @@ large-cluster sysctl considerations, see
 
 The controller creates a kube-proxy DaemonSet for each Site whose nodes are not
 covered by the provider-managed kube-proxy. The image setting defaults to an
-empty string. When it is empty, the controller reuses the image from the
-`kube-system/kube-proxy` DaemonSet. If that DaemonSet does not exist, it uses
-`registry.k8s.io/kube-proxy:<server version>`.
+empty string. When it is empty, the controller copies a versioned image from
+`kube-system/kube-proxy` as-is, including any digest. An unversioned provider
+image supplies only its repository. Without a provider image, the final
+fallback repository is `registry.k8s.io/kube-proxy`.
 
 Set `controller.managedKubeProxy.image` to override the image for all
 unbounded-managed kube-proxy DaemonSets, for example when pulling kube-proxy
 through a private registry. A reference with a tag or digest is used as-is. A
-reference without one, such as `myregistry.example.com/kube-proxy`, takes the
-tag of the image `kube-system/kube-proxy` runs, or the server version if that
-DaemonSet does not exist or its image is pinned by digest alone. The controller
-works out the image once, when it starts.
+reference without one, such as `myregistry.example.com/kube-proxy`, takes only
+the tag of the image `kube-system/kube-proxy` runs. Without a provider tag, the
+controller searches the selected repository for the API server's
+major.minor.patch version, choosing the highest numeric `-N` maintenance
+suffix, or the exact matching tag when no maintenance tag exists. For example,
+`v1.36.2-2` wins over `v1.36.2-1` and `v1.36.2`. It never chooses `latest`
+as an automatic fallback; explicit versions, including `:latest`, are used
+unchanged. Anonymous registry lookup and version-discovery failures prevent
+managed kube-proxy from starting. The controller works out the image once,
+when it starts.
 
 When the operator manages unbounded-net, the image can also be set through the
 operator's overrides ConfigMap, which takes precedence over this setting. See
@@ -180,7 +187,7 @@ for scheduling and per-Site behavior.
 | Flag | Runtime setting | Type | Default | Description |
 |------|-----------------|------|---------|-------------|
 | `--managed-kube-proxy` | `controller.managedKubeProxy.enabled` | bool | `true` | Create kube-proxy DaemonSets for unbounded-managed Site nodes not covered by provider kube-proxy. |
-| `--managed-kube-proxy-image` | `controller.managedKubeProxy.image` | string | `""` | Override the kube-proxy image used by unbounded-managed DaemonSets. Without a tag or digest, the tag comes from `kube-system/kube-proxy`, or the server version. |
+| `--managed-kube-proxy-image` | `controller.managedKubeProxy.image` | string | `""` | Override the kube-proxy image used by unbounded-managed DaemonSets. Without a tag or digest, inherit the provider tag or search the selected registry for the server version's highest numeric maintenance suffix. |
 
 ### Pod CIDR Assignment (Site CRD)
 

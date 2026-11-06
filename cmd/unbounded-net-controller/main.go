@@ -139,7 +139,7 @@ on site configuration, and maintain SiteNodeSlice and GatewayPool status.`,
 	flags.DurationVar(&cfg.InformerResyncPeriod, "informer-resync-period", 300*time.Second, "Resync period for Kubernetes informers")
 	flags.DurationVar(&cfg.KubeProxyHealthInterval, "kube-proxy-health-interval", 30*time.Second, "Interval between kube-proxy health checks on the controller node (0 to disable)")
 	flags.BoolVar(&cfg.ManagedKubeProxyEnabled, "managed-kube-proxy", true, "Create kube-proxy DaemonSets for unbounded-managed site nodes not covered by provider kube-proxy")
-	flags.StringVar(&cfg.ManagedKubeProxyImage, config.ManagedKubeProxyImageFlag, "", "kube-proxy image for managed site DaemonSets. A reference without a tag or digest takes its tag from kube-system/kube-proxy, or the server version if that DaemonSet does not exist (default: the kube-system/kube-proxy image, else registry.k8s.io/kube-proxy:<server version>)")
+	flags.StringVar(&cfg.ManagedKubeProxyImage, config.ManagedKubeProxyImageFlag, "", "kube-proxy image for managed site DaemonSets. Tagged or digest references are used as-is; an unversioned reference inherits kube-system/kube-proxy's tag, or searches its registry for the API server version with the highest numeric maintenance suffix (default: the provider image, else registry.k8s.io/kube-proxy)")
 	flags.DurationVar(&cfg.NodeTokenLifetime, "node-token-lifetime", 4*time.Hour, "Lifetime of HMAC tokens issued to node agents")
 	flags.DurationVar(&cfg.ViewerTokenLifetime, "viewer-token-lifetime", 30*time.Minute, "Lifetime of HMAC tokens issued to dashboard viewers")
 

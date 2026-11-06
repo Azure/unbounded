@@ -6,6 +6,7 @@ package controller
 import (
 	"context"
 	"errors"
+	"strings"
 	"testing"
 	"testing/synctest"
 	"time"
@@ -44,6 +45,10 @@ func clientsetWithServerVersion(gitVersion string, objects ...runtime.Object) *k
 	clientset.Discovery().(*fakediscovery.FakeDiscovery).FakedServerVersion = &version.Info{GitVersion: gitVersion}
 
 	return clientset
+}
+
+func exactKubeProxyTagForTest(_ context.Context, _, serverTag string) (string, error) {
+	return serverTag, nil
 }
 
 func TestManagedKubeProxyImage(t *testing.T) {
@@ -114,6 +119,32 @@ func TestManagedKubeProxyImage(t *testing.T) {
 			provider: kubeSystemKubeProxy("proxy", testProviderKubeProxyImage),
 			want:     "registry.k8s.io/kube-proxy:" + testServerVersion,
 		},
+		{
+			name:     "unset preserves a provider tag and digest",
+			provider: kubeSystemKubeProxy("kube-proxy", testProviderKubeProxyImage+"@"+testImageDigest),
+			want:     testProviderKubeProxyImage + "@" + testImageDigest,
+		},
+		{
+			name:     "unset preserves a provider digest without a tag",
+			provider: kubeSystemKubeProxy("kube-proxy", "provider.example/kube-proxy@"+testImageDigest),
+			want:     "provider.example/kube-proxy@" + testImageDigest,
+		},
+		{
+			name:     "an unversioned provider supplies the fallback repository",
+			provider: kubeSystemKubeProxy("kube-proxy", "provider.example/kube-proxy"),
+			want:     "provider.example/kube-proxy:" + testServerVersion,
+		},
+		{
+			name:       "an override still wins over an unversioned provider repository",
+			configured: "myreg.example/kube-proxy",
+			provider:   kubeSystemKubeProxy("kube-proxy", "provider.example/kube-proxy"),
+			want:       "myreg.example/kube-proxy:" + testServerVersion,
+		},
+		{
+			name:     "unset preserves a provider latest tag",
+			provider: kubeSystemKubeProxy("kube-proxy", "provider.example/kube-proxy:latest"),
+			want:     "provider.example/kube-proxy:latest",
+		},
 	}
 
 	for _, tt := range tests {
@@ -123,7 +154,7 @@ func TestManagedKubeProxyImage(t *testing.T) {
 				objects = append(objects, tt.provider)
 			}
 
-			got, err := ManagedKubeProxyImage(t.Context(), clientsetWithServerVersion(testServerVersion, objects...), tt.configured)
+			got, err := managedKubeProxyImage(t.Context(), clientsetWithServerVersion(testServerVersion, objects...), tt.configured, exactKubeProxyTagForTest)
 			if err != nil {
 				t.Fatalf("ManagedKubeProxyImage() error = %v", err)
 			}
@@ -138,14 +169,28 @@ func TestManagedKubeProxyImage(t *testing.T) {
 // TestManagedKubeProxyImagePinnedReadsNothing pins that a configured version is
 // final: nothing in the cluster can change it, so nothing is read.
 func TestManagedKubeProxyImagePinnedReadsNothing(t *testing.T) {
-	clientset := clientsetWithServerVersion(testServerVersion, kubeSystemKubeProxy("kube-proxy", testProviderKubeProxyImage))
+	for _, configured := range []string{
+		"myreg.example/kube-proxy:v1.34.0",
+		"myreg.example/kube-proxy:latest",
+		"myreg.example/kube-proxy@" + testImageDigest,
+		"myreg.example/kube-proxy:v1.34.0@" + testImageDigest,
+	} {
+		t.Run(configured, func(t *testing.T) {
+			clientset := clientsetWithServerVersion(testServerVersion, kubeSystemKubeProxy("kube-proxy", testProviderKubeProxyImage))
 
-	if _, err := ManagedKubeProxyImage(t.Context(), clientset, "myreg.example/kube-proxy:v1.34.0"); err != nil {
-		t.Fatalf("ManagedKubeProxyImage() error = %v", err)
-	}
+			got, err := ManagedKubeProxyImage(t.Context(), clientset, configured)
+			if err != nil {
+				t.Fatalf("ManagedKubeProxyImage() error = %v", err)
+			}
 
-	if actions := clientset.Actions(); len(actions) != 0 {
-		t.Fatalf("a pinned image read the cluster: %v", actions)
+			if got != configured {
+				t.Fatalf("ManagedKubeProxyImage() = %q, want unchanged %q", got, configured)
+			}
+
+			if actions := clientset.Actions(); len(actions) != 0 {
+				t.Fatalf("a pinned image read the cluster: %v", actions)
+			}
+		})
 	}
 }
 
@@ -228,7 +273,7 @@ func TestManagedKubeProxyImageRetriesProviderDiscovery(t *testing.T) {
 
 						started := time.Now()
 
-						got, err := ManagedKubeProxyImage(t.Context(), clientset, configured.image)
+						got, err := managedKubeProxyImage(t.Context(), clientset, configured.image, exactKubeProxyTagForTest)
 						if err != nil {
 							t.Fatalf("ManagedKubeProxyImage() error = %v", err)
 						}
@@ -335,9 +380,9 @@ func assertKubeProxyImageDiscoveryAttempts(t *testing.T, started time.Time, atte
 	}
 }
 
-// TestManagedKubeProxyImageFallsBackWhenTheClusterCannotBeRead keeps the
-// behavior that predates repository values: exhausted retries degrade the
-// choice of image rather than stopping managed kube-proxy.
+// TestManagedKubeProxyImageFallsBackWhenTheClusterCannotBeRead verifies that
+// exhausted provider reads reach version discovery, but an unavailable version
+// endpoint returns an error instead of the former latest fallback.
 func TestManagedKubeProxyImageFallsBackWhenTheClusterCannotBeRead(t *testing.T) {
 	for _, tt := range []struct {
 		configured string
@@ -349,8 +394,9 @@ func TestManagedKubeProxyImageFallsBackWhenTheClusterCannotBeRead(t *testing.T) 
 		t.Run(tt.want, func(t *testing.T) {
 			synctest.Test(t, func(t *testing.T) {
 				clientset := k8sfake.NewClientset(kubeSystemKubeProxy("kube-proxy", testProviderKubeProxyImage))
+				unavailableErr := errors.New("apiserver unavailable")
 				unavailable := func(clienttesting.Action) (bool, runtime.Object, error) {
-					return true, nil, errors.New("apiserver unavailable")
+					return true, nil, unavailableErr
 				}
 
 				var attempts []time.Time
@@ -364,12 +410,12 @@ func TestManagedKubeProxyImageFallsBackWhenTheClusterCannotBeRead(t *testing.T) 
 				started := time.Now()
 
 				got, err := ManagedKubeProxyImage(t.Context(), clientset, tt.configured)
-				if err != nil {
-					t.Fatalf("ManagedKubeProxyImage() error = %v", err)
+				if !errors.Is(err, unavailableErr) {
+					t.Fatalf("ManagedKubeProxyImage() error = %v, want %v", err, unavailableErr)
 				}
 
-				if got != tt.want {
-					t.Fatalf("ManagedKubeProxyImage() = %q, want %q", got, tt.want)
+				if got != "" {
+					t.Fatalf("ManagedKubeProxyImage() = %q, want no image instead of %q", got, tt.want)
 				}
 
 				assertKubeProxyImageDiscoveryAttempts(t, started, attempts, 11)
@@ -378,6 +424,131 @@ func TestManagedKubeProxyImageFallsBackWhenTheClusterCannotBeRead(t *testing.T) 
 					t.Fatalf("discovery took %v, want %v", elapsed, 100*time.Second)
 				}
 			})
+		})
+	}
+}
+
+func TestManagedKubeProxyImageProviderVersionSkipsRegistry(t *testing.T) {
+	for _, tt := range []struct {
+		name       string
+		configured string
+		provider   string
+		want       string
+	}{
+		{name: "provider tag", provider: testProviderKubeProxyImage, want: testProviderKubeProxyImage},
+		{name: "provider tag and digest", provider: testProviderKubeProxyImage + "@" + testImageDigest, want: testProviderKubeProxyImage + "@" + testImageDigest},
+		{name: "provider digest", provider: "provider.example/kube-proxy@" + testImageDigest, want: "provider.example/kube-proxy@" + testImageDigest},
+		{name: "provider latest", provider: "provider.example/kube-proxy:latest", want: "provider.example/kube-proxy:latest"},
+		{name: "mirror keeps the provider tag", configured: "myreg.example/kube-proxy", provider: testProviderKubeProxyImage + "@" + testImageDigest, want: "myreg.example/kube-proxy:v1.34.2-1"},
+		{name: "mirror keeps a supplied latest tag", configured: "myreg.example/kube-proxy", provider: "provider.example/kube-proxy:latest", want: "myreg.example/kube-proxy:latest"},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			clientset := clientsetWithServerVersion("", kubeSystemKubeProxy("kube-proxy", tt.provider))
+
+			got, err := managedKubeProxyImage(t.Context(), clientset, tt.configured, func(context.Context, string, string) (string, error) {
+				t.Fatal("a provider version must not trigger a registry lookup")
+				return "", nil
+			})
+			if err != nil {
+				t.Fatalf("ManagedKubeProxyImage() error = %v", err)
+			}
+
+			if got != tt.want {
+				t.Fatalf("ManagedKubeProxyImage() = %q, want %q", got, tt.want)
+			}
+
+			if actions := clientset.Actions(); len(actions) != 1 || actions[0].GetResource().Resource != "daemonsets" {
+				t.Fatalf("provider image resolution read unexpected resources: %v", actions)
+			}
+		})
+	}
+}
+
+func TestManagedKubeProxyImageRegistryFallback(t *testing.T) {
+	for _, tt := range []struct {
+		name       string
+		configured string
+		provider   string
+		repository string
+	}{
+		{name: "default upstream repository", repository: DefaultKubeProxyRepository},
+		{name: "configured mirror repository", configured: "myreg.example/team/kube-proxy", repository: "myreg.example/team/kube-proxy"},
+		{name: "unversioned provider repository", provider: "provider.example/kube-proxy", repository: "provider.example/kube-proxy"},
+		{name: "mirror replaces an unversioned provider repository", configured: "myreg.example/kube-proxy", provider: "provider.example/kube-proxy", repository: "myreg.example/kube-proxy"},
+		{name: "mirror cannot inherit a provider digest as a tag", configured: "myreg.example/kube-proxy", provider: "provider.example/kube-proxy@" + testImageDigest, repository: "myreg.example/kube-proxy"},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			var objects []runtime.Object
+			if tt.provider != "" {
+				objects = append(objects, kubeSystemKubeProxy("kube-proxy", tt.provider))
+			}
+
+			clientset := clientsetWithServerVersion("v1.36.2-aks.1+build.7", objects...)
+			lookups := 0
+
+			got, err := managedKubeProxyImage(t.Context(), clientset, tt.configured, func(_ context.Context, repository, serverTag string) (string, error) {
+				lookups++
+
+				if repository != tt.repository || serverTag != "v1.36.2" {
+					t.Fatalf("registry lookup = %q, %q, want %q, v1.36.2", repository, serverTag, tt.repository)
+				}
+
+				return "v1.36.2-2", nil
+			})
+			if err != nil {
+				t.Fatalf("ManagedKubeProxyImage() error = %v", err)
+			}
+
+			if want := tt.repository + ":v1.36.2-2"; got != want {
+				t.Fatalf("ManagedKubeProxyImage() = %q, want %q", got, want)
+			}
+
+			if lookups != 1 {
+				t.Fatalf("registry lookups = %d, want 1", lookups)
+			}
+		})
+	}
+}
+
+func TestManagedKubeProxyImageRegistryFailureReturnsNoImage(t *testing.T) {
+	lookupErr := errors.New("registry unavailable")
+	clientset := clientsetWithServerVersion("v1.36.2")
+
+	got, err := managedKubeProxyImage(t.Context(), clientset, "myreg.example/kube-proxy", func(context.Context, string, string) (string, error) {
+		return "", lookupErr
+	})
+	if !errors.Is(err, lookupErr) || got != "" {
+		t.Fatalf("ManagedKubeProxyImage() = %q, %v, want no image and %v", got, err, lookupErr)
+	}
+}
+
+func TestServerVersionTag(t *testing.T) {
+	for _, gitVersion := range []string{"v1.36.2", "1.36.2", "v1.36.2-aks.1", "v1.36.2+build.7", "v1.36.2-aks.1+build.7"} {
+		t.Run(gitVersion, func(t *testing.T) {
+			got, err := serverVersionTag(t.Context(), clientsetWithServerVersion(gitVersion))
+			if err != nil || got != "v1.36.2" {
+				t.Fatalf("serverVersionTag() = %q, %v, want v1.36.2", got, err)
+			}
+		})
+	}
+}
+
+func TestServerVersionTagRejectsMissingOrInvalidVersions(t *testing.T) {
+	for _, gitVersion := range []string{"", "latest", "v1.36", "v1.036.2", "not-a-version"} {
+		t.Run(gitVersion, func(t *testing.T) {
+			clientset := clientsetWithServerVersion(gitVersion)
+
+			got, err := managedKubeProxyImage(t.Context(), clientset, "", func(context.Context, string, string) (string, error) {
+				t.Fatal("an invalid API server version must not trigger a registry lookup")
+				return "", nil
+			})
+			if err == nil || got != "" {
+				t.Fatalf("ManagedKubeProxyImage() = %q, %v, want no image and an error", got, err)
+			}
+
+			if !strings.Contains(err.Error(), "server version") {
+				t.Fatalf("error = %v, want a Kubernetes server version error", err)
+			}
 		})
 	}
 }
