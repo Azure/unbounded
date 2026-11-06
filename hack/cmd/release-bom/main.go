@@ -31,6 +31,7 @@ var releaseImageNames = []string{
 	"gantry",
 	"gantry-node-config",
 	"host-azurelinux3",
+	"host-azurelinux3-mshv",
 	"host-azurelinux3-nvidia",
 	"host-ubuntu2404",
 	"inventory-aggregator",

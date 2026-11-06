@@ -152,7 +152,7 @@ func TestServiceOverride_HostDeviceGroupSpecifiers(t *testing.T) {
 func TestServiceOverride_MultipleHostDevices(t *testing.T) {
 	t.Parallel()
 
-	devices := []string{"/dev/kvm", "/dev/net/tun", "/dev/vhost-net", "/dev/sda"}
+	devices := []string{"/dev/kvm", "/dev/mshv", "/dev/net/tun", "/dev/vhost-net", "/dev/sda"}
 
 	var nspawnBuf bytes.Buffer
 

@@ -106,6 +106,13 @@ func (r *MachinaMachineOperationReconciler) ReconcileMachineOperation(
 		return ctrl.Result{}, nil
 	}
 
+	// HostAllocate and HostRelease act on a MachineAllocation, not on this
+	// host. They are never dispatched, even when a handler is registered.
+	if op.Spec.OperationKind.IsAllocationOperation() {
+		log.FromContext(ctx).V(1).Info("ignoring allocation MachineOperation", "operation", op.Name, "operationKind", op.Spec.OperationKind)
+		return ctrl.Result{}, nil
+	}
+
 	operation := MachineOperation{
 		Name: op.Name,
 		Kind: op.Spec.OperationKind,
@@ -133,6 +140,10 @@ func (r *MachinaMachineOperationReconciler) mapMachineOperation(ctx context.Cont
 
 func (r *MachinaMachineOperationReconciler) shouldEnqueue(ctx context.Context, op *machinav1alpha3.MachineOperation) bool {
 	if op.Status.Phase != "" && op.Status.Phase != machinav1alpha3.OperationPhasePending {
+		return false
+	}
+
+	if op.Spec.OperationKind.IsAllocationOperation() {
 		return false
 	}
 

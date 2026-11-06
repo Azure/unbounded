@@ -30,6 +30,7 @@ name: unbounded release
 #                           racer-object, racer-vllm,
 #                           host-ubuntu2404,
 #                           host-azurelinux3, host-azurelinux3-nvidia,
+#                           host-azurelinux3-mshv,
 #                           inventory-aggregator, inventory-inspector,
 #                           inventory-viewer)
 #     -> gantry-chart      (OCI chart + signed downloadable archive)
@@ -772,6 +773,11 @@ jobs:
           - name: host-azurelinux3-nvidia
             file: images/host-azurelinux3-nvidia/Containerfile
             platforms: linux/amd64,linux/arm64
+            trivy: false
+          # The Microsoft Hypervisor packages are x86_64 only.
+          - name: host-azurelinux3-mshv
+            file: images/host-azurelinux3-mshv/Containerfile
+            platforms: linux/amd64
             trivy: false
           - name: inventory-aggregator
             file: images/inventory/aggregator/Containerfile
