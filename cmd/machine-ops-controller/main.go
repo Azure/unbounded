@@ -62,6 +62,9 @@ func main() {
 	cmd.Flags().StringVar(&cfg.apiServerEndpoint, "api-server-endpoint", "", "Kubernetes API server endpoint used in host replacement bootstrap config")
 	cmd.Flags().StringVar(&cfg.siteName, "site", "", "Site name this controller should operate on")
 	cmd.Flags().StringVar(&cfg.providerName, "provider", "", "Provider name this controller should operate on")
+	cmd.Flags().BoolVar(&cfg.experimentalContainerIsolation, "experimental-container-isolation", false,
+		"Enable the experimental container isolation mode for HostReplace: opt the replacement agent configuration in "+
+			"(Experimental.ContainerIsolation); without it a HostReplace of a Machine that declares spec.isolation container fails")
 
 	cmd.CompletionOptions.DisableDefaultCmd = true
 	cmd.SetVersionTemplate(`{{printf "%s\n" .Version}}`)
@@ -82,6 +85,8 @@ type config struct {
 	apiServerEndpoint         string
 	siteName                  string
 	providerName              string
+
+	experimentalContainerIsolation bool
 }
 
 func run(ctx context.Context, cfg config) error {
@@ -118,6 +123,8 @@ func run(ctx context.Context, cfg config) error {
 		MaxConcurrentReconciles:   cfg.maxConcurrentReconciles,
 		APIServerEndpoint:         cfg.apiServerEndpoint,
 		CredentialSecretNamespace: cfg.credentialSecretNamespace,
+
+		ExperimentalContainerIsolation: cfg.experimentalContainerIsolation,
 	}); err != nil {
 		return err
 	}

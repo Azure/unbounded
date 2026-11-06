@@ -31,6 +31,10 @@ type Options struct {
 	APIServerEndpoint           string
 	CredentialSecretNamespace   string
 	ClusterInfo                 *ClusterInfo
+	// ExperimentalContainerIsolation enables the experimental container
+	// isolation mode for HostReplace. See
+	// internal/machineops.MachineOperationReconciler.
+	ExperimentalContainerIsolation bool
 }
 
 // AddToManager validates provider registrations and adds one MachineOperation
@@ -71,6 +75,8 @@ func AddToManager(mgr ctrl.Manager, providers []*machineops.Provider, options Op
 		KubeClient:                  kubeClient,
 		APIServerEndpoint:           options.APIServerEndpoint,
 		CredentialSecretNamespace:   options.CredentialSecretNamespace,
+
+		ExperimentalContainerIsolation: options.ExperimentalContainerIsolation,
 	}
 
 	if err := reconciler.SetupWithManager(mgr); err != nil {

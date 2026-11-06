@@ -59,6 +59,13 @@ type MachineOperationReconciler struct {
 	KubeClient                  kubernetes.Interface
 	APIServerEndpoint           string
 	CredentialSecretNamespace   string
+
+	// ExperimentalContainerIsolation enables the experimental container
+	// isolation mode for HostReplace: the replacement's agent configuration
+	// opts in (Experimental.ContainerIsolation). When it is not set, a
+	// HostReplace of a Machine that declares container fails before the
+	// provider runs.
+	ExperimentalContainerIsolation bool
 }
 
 // +kubebuilder:rbac:groups=unbounded-cloud.io,resources=machineoperations,verbs=get;list;watch;delete
