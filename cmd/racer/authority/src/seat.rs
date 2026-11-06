@@ -1230,8 +1230,21 @@ mod tests {
             *shared.seat.borrow_mut() = Some(seat.clone());
             let started = crate::rt::now();
             rt::spawn(follower(shared.clone(), seat)).unwrap();
-            // The first read is in flight and answers sequence 4.
-            rt::sleep(Duration::from_millis(100)).await;
+            // The first read is in flight and answers sequence 4: the fake
+            // answers with the object as of arrival, 400 ms later. Wait for
+            // the arrival itself rather than a fixed host-time sleep.
+            let arrived = || {
+                api.requests()
+                    .iter()
+                    .any(|(method, target)| method == "GET" && target.starts_with(path.as_str()))
+            };
+            while !arrived() {
+                assert!(
+                    crate::rt::now() < started + Duration::from_secs(10),
+                    "the follower never read"
+                );
+                rt::sleep(Duration::from_millis(1)).await;
+            }
             put(&record(5));
             let endpoints: DiscoveredEndpoints = Default::default();
             let changed = RefCell::new((String::new(), None));
@@ -1244,15 +1257,27 @@ mod tests {
                 .insert(annotations::SEQUENCE.into(), "5".into());
             apply_primary(&shared, &lease, &endpoints, &changed);
             let sequence = || shared.serving.borrow().record.as_ref().map(|r| r.sequence);
-            rt::sleep_until(started + Duration::from_millis(600)).await;
+            while sequence().is_none() {
+                assert!(
+                    crate::rt::now() < started + Duration::from_secs(10),
+                    "the in-flight read never answered"
+                );
+                rt::sleep(Duration::from_millis(1)).await;
+            }
             assert_eq!(
                 sequence(),
                 Some(4),
                 "the in-flight read predates the change"
             );
-            // Next read at the 1 s floor, answered 400 ms later.
-            rt::sleep_until(started + Duration::from_millis(2_500)).await;
-            assert_eq!(sequence(), Some(5), "woken by the change during the read");
+            // Next read at the 1 s floor, answered 400 ms later. Without the
+            // wake it would wait out FOLLOW_INTERVAL after the first read.
+            while sequence() != Some(5) {
+                assert!(
+                    crate::rt::now() < started + crate::limits::FOLLOW_INTERVAL,
+                    "woken by the change during the read"
+                );
+                rt::sleep(Duration::from_millis(10)).await;
+            }
             shared.stopping.set(true);
             shared.changed.notify();
         });

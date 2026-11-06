@@ -584,7 +584,11 @@ mod tests {
 
     #[test]
     fn signal_wakes_many_waiters_in_linear_work() {
-        let mut ex = Executor::new(4096).unwrap();
+        // Virtual time: each sleep below resolves only once every runnable
+        // waiter has run, not after 5 ms of host time that a loaded host can
+        // spend before all 2000 have been polled.
+        let clock = racer_io::ctx::VirtualClock::new();
+        let mut ex = Executor::simulated(racer_io::sim::SimOs::new(), &clock, 0, 4096).unwrap();
         let signal = Signal::default();
         let woken = Rc::new(Cell::new(0usize));
         ex.block_on(async {
