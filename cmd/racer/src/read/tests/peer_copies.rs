@@ -1105,7 +1105,8 @@ fn hedge_suppresses_without_independent_route_credits_or_local_memory() {
             racer_io::Clock::host(),
         )
         .unwrap();
-        let _slot = (reason == "slots").then(|| hedges.acquire().unwrap());
+        let _slot =
+            (reason == "slots").then(|| hedges.acquire(crate::model::PAGE_BYTES as usize).unwrap());
         let mut deps = f.fill.dependencies.clone();
         deps.candidates = Rc::new(
             CandidatePolicy::new(
@@ -1160,6 +1161,7 @@ fn hedge_suppresses_without_independent_route_credits_or_local_memory() {
             &f.scope,
             &mut budget,
             admission,
+            f.fill.page_plaintext_bytes().unwrap(),
             |_, _| Box::pin(async { panic!("suppressed hedge validation") }),
         ));
         assert!(matches!(
@@ -2122,6 +2124,7 @@ fn hedge_loser_child_cancels_accepted_crypto_but_waits_for_completion_fence() {
         &f.scope,
         &mut budget,
         &f.fill.dependencies.admission,
+        f.fill.page_plaintext_bytes().unwrap(),
         |response, child| {
             let first = scopes.borrow().is_empty();
             scopes.borrow_mut().push(child.clone());

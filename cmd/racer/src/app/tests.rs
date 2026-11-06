@@ -4196,7 +4196,7 @@ fn workers_share_configured_page_hedge_slots_and_bytes() {
     let (first, _, _) = local_worker(&env, &config, &node, 0);
     let owner = first.coordinator.hedge_owner().unwrap();
     let (mut second, _, _) = local_worker(&env, &config, &node, 1);
-    let permit = owner.acquire().unwrap();
+    let permit = owner.acquire(crate::model::PAGE_BYTES as usize).unwrap();
     let wake = Arc::new(crate::test_support::WakeCounter::default());
     let waker = std::task::Waker::from(wake.clone());
     let mut cx = Context::from_waker(&waker);
@@ -4208,11 +4208,22 @@ fn workers_share_configured_page_hedge_slots_and_bytes() {
     assert!(wake.count() > 0);
     assert!(permit.delay(&mut cx).is_ready());
     assert!(matches!(
-        second.coordinator.hedge_owner().unwrap().acquire(),
+        second
+            .coordinator
+            .hedge_owner()
+            .unwrap()
+            .acquire(crate::model::PAGE_BYTES as usize),
         Err(Error::Overloaded)
     ));
     drop(permit);
-    assert!(second.coordinator.hedge_owner().unwrap().acquire().is_ok());
+    assert!(
+        second
+            .coordinator
+            .hedge_owner()
+            .unwrap()
+            .acquire(crate::model::PAGE_BYTES as usize)
+            .is_ok()
+    );
 }
 
 #[test]

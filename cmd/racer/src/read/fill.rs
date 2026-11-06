@@ -2404,6 +2404,7 @@ impl Fill {
                                     scope,
                                     budget,
                                     &self.dependencies.admission,
+                                    self.page_plaintext_bytes()?,
                                     |response, child| {
                                         Box::pin(async move {
                                             self.metrics.record_duration(
@@ -2910,12 +2911,18 @@ impl Fill {
             retention.persistence_attempt(false);
             return;
         }
+        // One sealed page at the published page size. Before a size is
+        // adopted, fall back to the largest page, which only over-reserves.
+        let sealed_page = self
+            .page_plaintext_bytes()
+            .unwrap_or(PAGE_BYTES as usize)
+            .saturating_add(16);
         if !owned
             && !optional_headroom(
                 admission.limit(ResourceClass::DirtyCiphertext),
                 admission.used(ResourceClass::DirtyCiphertext),
                 amount,
-                PAGE_BYTES as usize + 16,
+                sealed_page,
             )
         {
             retention.persistence_attempt(false);
@@ -2931,7 +2938,7 @@ impl Fill {
             .inner
             .reservation()
             .amount()
-            .max(PAGE_BYTES as usize + 16);
+            .max(sealed_page);
         let dirty = self.reserve_owned_persistence(
             id,
             ResourceClass::DirtyCiphertext,

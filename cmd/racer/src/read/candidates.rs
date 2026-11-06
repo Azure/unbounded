@@ -47,14 +47,14 @@ use std::time::Instant;
 fn reserve_hedge_pages(
     admission: &flow_control::Quotas<crate::admission::AdmissionPolicy>,
     cache: &racer_wire::control::CacheId,
+    page_bytes: usize,
     pages: usize,
 ) -> Result<(
     flow_control::Charge<crate::admission::AdmissionPolicy>,
     flow_control::Charge<crate::admission::AdmissionPolicy>,
 )> {
     use crate::admission::ResourceClass;
-    let (plaintext, ciphertext) =
-        racer_core::read::hedge_page_charges(crate::model::PAGE_BYTES as usize, pages);
+    let (plaintext, ciphertext) = racer_core::read::hedge_page_charges(page_bytes, pages);
     let plaintext = admission.reserve(Some(cache), ResourceClass::Plaintext, plaintext)?;
     let ciphertext = admission.reserve(Some(cache), ResourceClass::Ciphertext, ciphertext)?;
     Ok((plaintext, ciphertext))
@@ -336,6 +336,7 @@ impl CandidatePolicy {
         scope: &RequestScope,
         budget: &mut AcquisitionBudget,
         admission: &Rc<flow_control::Quotas<crate::admission::AdmissionPolicy>>,
+        page_bytes: usize,
         validate: impl Fn(VerifiedResponse, RequestScope) -> Operation<'a, crate::memory::PageResult>,
     ) -> Result<(Option<crate::memory::PageResult>, HedgeEnd)> {
         let Some(hedges) = self.hedge.as_ref().filter(|h| h.enabled()) else {
@@ -356,12 +357,12 @@ impl CandidatePolicy {
         }
         check_budget(scope, budget)?;
         let reservation = (|| {
-            let slot = hedges.acquire()?;
-            let escrow = reserve_hedge_pages(admission, &context.object.cache, 1)?;
+            let slot = hedges.acquire(page_bytes)?;
+            let escrow = reserve_hedge_pages(admission, &context.object.cache, page_bytes, 1)?;
             // The caller already holds its serial plaintext page. Escrow is
             // additional accounting, not a buffer consumed by either validator.
             // Fund BOTH contenders before spending credits or changing routing.
-            let working = reserve_hedge_pages(admission, &context.object.cache, 2)?;
+            let working = reserve_hedge_pages(admission, &context.object.cache, page_bytes, 2)?;
             drop(working);
             Ok::<_, Error>((slot, escrow))
         })();
@@ -419,7 +420,7 @@ impl CandidatePolicy {
             }
             // Recheck local headroom after the delay. The escrow remains held;
             // these trial reservations do not replace actual receive/crypto quota.
-            let capacity = reserve_hedge_pages(admission, &context.object.cache, 1);
+            let capacity = reserve_hedge_pages(admission, &context.object.cache, page_bytes, 1);
             let Ok(capacity) = capacity else {
                 hedges.suppressed();
                 return Err(Error::Overloaded);
@@ -2939,6 +2940,10 @@ fn validate_payload(response: &PeerResponse, operation: &PeerOperation) -> Resul
 // so low quotas fall back to the serial walk. The serial continuation skips the consumed primary.
 // A winner waits for the loser's exchange and crypto fence before returning.
 
+/// Duplicate bytes for the largest page size. This is the upper bound a
+/// single hedge can charge, so it sizes the default and the validation
+/// floor of `RACER_PAGE_HEDGE_BYTES`; each hedge charges
+/// `duplicate_bytes` at the published page size.
 pub const DUPLICATE_BYTES: usize =
     racer_core::read::duplicate_bytes(crate::model::PAGE_BYTES as usize);
 #[derive(Clone, Copy)]
@@ -2978,6 +2983,7 @@ pub(crate) struct Hedges {
 pub(crate) struct Permit {
     owner: Arc<Hedges>,
     capacity: flow_control::HedgePermit,
+    bytes: usize,
 }
 impl Hedges {
     pub(crate) fn for_worker(&self, metrics: Metrics) -> Arc<Self> {
@@ -3007,13 +3013,17 @@ impl Hedges {
     pub(crate) fn suppressed(&self) {
         self.metrics.record(Event::PageHedgeSuppressed, 1);
     }
-    pub(crate) fn acquire(self: &Arc<Self>) -> Result<Permit> {
+    /// Acquires a slot and one duplicate's bytes at `page_bytes`, the
+    /// published page size.
+    pub(crate) fn acquire(self: &Arc<Self>, page_bytes: usize) -> Result<Permit> {
+        let bytes = racer_core::read::duplicate_bytes(page_bytes);
         let capacity = self
             .capacity
-            .acquire(DUPLICATE_BYTES, self.clock.now() + self.config.delay)?;
+            .acquire(bytes, self.clock.now() + self.config.delay)?;
         Ok(Permit {
             owner: self.clone(),
             capacity,
+            bytes,
         })
     }
     pub(crate) fn poll(&self) {
@@ -3028,7 +3038,7 @@ impl Permit {
         self.owner.metrics.record(Event::PageHedgeStarted, 1);
         self.owner
             .metrics
-            .record(Event::PageHedgeDuplicateBytes, DUPLICATE_BYTES as u64);
+            .record(Event::PageHedgeDuplicateBytes, self.bytes as u64);
     }
     pub(crate) fn won(&self) {
         self.owner.metrics.record(Event::PageHedgeWon, 1);
@@ -4736,6 +4746,53 @@ pub(super) mod tests {
 
     mod hedging {
         use super::*;
+        const MAX_PAGE: usize = crate::model::PAGE_BYTES as usize;
+
+        #[test]
+        fn small_pages_charge_duplicates_at_the_published_page_size() {
+            let page = 64 * 1024;
+            let duplicate = racer_core::read::duplicate_bytes(page);
+            let metrics = Metrics::default();
+            // A budget of one max-size duplicate funds many small-page hedges.
+            let owner = Hedges::new(
+                HedgeConfig {
+                    slots: 4,
+                    bytes: DUPLICATE_BYTES,
+                    delay: Duration::from_millis(1),
+                },
+                metrics.clone(),
+                racer_io::Clock::host(),
+            )
+            .unwrap();
+            let permits: Vec<_> = (0..4).map(|_| owner.acquire(page).unwrap()).collect();
+            permits[0].started();
+            assert_eq!(
+                metrics.writer_count(Event::PageHedgeDuplicateBytes),
+                duplicate as u64
+            );
+            drop(permits);
+            // At the largest page, the same budget funds only one duplicate.
+            let first = owner.acquire(MAX_PAGE).unwrap();
+            assert!(matches!(owner.acquire(MAX_PAGE), Err(Error::Overloaded)));
+            drop(first);
+        }
+
+        #[test]
+        fn small_pages_reserve_hedge_buffers_at_the_published_page_size() {
+            use crate::admission::ResourceClass;
+            let page = 64 * 1024;
+            let mut limits = crate::test_support::cluster::config(false).limits;
+            limits.plaintext_bytes = std::num::NonZeroUsize::new(4 * page).unwrap();
+            limits.ciphertext_bytes = std::num::NonZeroUsize::new(4 * (page + 16)).unwrap();
+            let admission =
+                flow_control::Quotas::new(crate::admission::AdmissionPolicy::new(limits));
+            let cache = racer_wire::control::CacheId(crate::test_support::security::CACHE.into());
+            let (plaintext, ciphertext) = reserve_hedge_pages(&admission, &cache, page, 2).unwrap();
+            assert_eq!(admission.used(ResourceClass::Plaintext), 2 * page);
+            assert_eq!(admission.used(ResourceClass::Ciphertext), 2 * (page + 16));
+            drop((plaintext, ciphertext));
+            assert!(reserve_hedge_pages(&admission, &cache, MAX_PAGE, 1).is_err());
+        }
         #[test]
         fn worker_handles_share_capacity_but_not_counter_shards() {
             let metrics = Metrics::for_workers(2).unwrap();
@@ -4750,8 +4807,8 @@ pub(super) mod tests {
             )
             .unwrap();
             let second = first.for_worker(metrics[1].clone());
-            let permit = second.acquire().unwrap();
-            assert!(matches!(first.acquire(), Err(Error::Overloaded)));
+            let permit = second.acquire(MAX_PAGE).unwrap();
+            assert!(matches!(first.acquire(MAX_PAGE), Err(Error::Overloaded)));
             first.suppressed();
             permit.started();
             permit.won();
@@ -4766,7 +4823,7 @@ pub(super) mod tests {
             assert_eq!(metrics[0].writer_count(Event::PageHedgeSuppressed), 1);
             assert_eq!(metrics[1].writer_count(Event::PageHedgeSuppressed), 0);
             drop(permit);
-            assert!(first.acquire().is_ok());
+            assert!(first.acquire(MAX_PAGE).is_ok());
         }
         use crate::model::RequestId;
         use crate::read::tests::page;
@@ -4801,7 +4858,7 @@ pub(super) mod tests {
                     let clock = racer_io::SimClock::new(933);
                     let env = racer_io::Env::new(racer_io::Driver::Uring, clock.ctx(0));
                     let owner = controller(&env, 1, DUPLICATE_BYTES);
-                    let permit = owner.acquire().unwrap();
+                    let permit = owner.acquire(MAX_PAGE).unwrap();
                     let a = scope(&env);
                     let b = scope(&env);
                     let parent = scope(&env);
@@ -4877,7 +4934,7 @@ pub(super) mod tests {
         fn fast_primary_never_launches_secondary_or_records_duplicate_bytes() {
             let env = racer_io::Env::host();
             let owner = controller(&env, 1, DUPLICATE_BYTES);
-            let permit = owner.acquire().unwrap();
+            let permit = owner.acquire(MAX_PAGE).unwrap();
             let a = scope(&env);
             let b = scope(&env);
             let parent = scope(&env);
@@ -4901,7 +4958,7 @@ pub(super) mod tests {
         fn canceled_parent_never_polls_unlaunched_attempts() {
             let env = racer_io::Env::host();
             let owner = controller(&env, 1, DUPLICATE_BYTES);
-            let permit = owner.acquire().unwrap();
+            let permit = owner.acquire(MAX_PAGE).unwrap();
             let a = scope(&env);
             let b = scope(&env);
             let parent = scope(&env);
@@ -4921,7 +4978,7 @@ pub(super) mod tests {
             let clock = racer_io::SimClock::new(906);
             let env = racer_io::Env::new(racer_io::Driver::Uring, clock.ctx(0));
             let owner = controller(&env, 1, DUPLICATE_BYTES);
-            let permit = owner.acquire().unwrap();
+            let permit = owner.acquire(MAX_PAGE).unwrap();
             let queue = Rc::new(crate::drivers::DriverQueue::new(1024));
             let _guard = queue.enter();
             let (send, receive) = futures::channel::oneshot::channel();
@@ -4956,11 +5013,11 @@ pub(super) mod tests {
             queue.poll(&mut cx, 4);
             drop(receive);
             assert!(!completion.get());
-            assert!(matches!(owner.acquire(), Err(Error::Overloaded)));
+            assert!(matches!(owner.acquire(MAX_PAGE), Err(Error::Overloaded)));
             fence.set(true);
             queue.poll(&mut cx, 4);
             assert!(completion.get());
-            assert!(owner.acquire().is_ok());
+            assert!(owner.acquire(MAX_PAGE).is_ok());
             assert_eq!(queue.pending(), 0);
         }
         #[test]
@@ -4970,8 +5027,11 @@ pub(super) mod tests {
             let env = racer_io::Env::new(racer_io::Driver::Uring, sim_env.clone());
             let sim_ctx = sim_env.clone();
             let owner = controller(&env, 2, DUPLICATE_BYTES);
-            let permit = owner.acquire().unwrap();
-            assert!(matches!(owner.clone().acquire(), Err(Error::Overloaded)));
+            let permit = owner.acquire(MAX_PAGE).unwrap();
+            assert!(matches!(
+                owner.clone().acquire(MAX_PAGE),
+                Err(Error::Overloaded)
+            ));
             let wake = std::sync::Arc::new(crate::test_support::WakeCounter::default());
             let waker = std::task::Waker::from(wake.clone());
             let mut cx = Context::from_waker(&waker);
@@ -4983,7 +5043,7 @@ pub(super) mod tests {
             assert_eq!(wake.count(), 1);
             assert!(permit.delay(&mut cx).is_ready());
             drop(permit);
-            assert!(owner.acquire().is_ok());
+            assert!(owner.acquire(MAX_PAGE).is_ok());
             assert!(
                 !Hedges::new(
                     HedgeConfig::default(),
@@ -4999,7 +5059,7 @@ pub(super) mod tests {
             let clock = racer_io::SimClock::new(902);
             let env = racer_io::Env::new(racer_io::Driver::Uring, clock.ctx(0));
             let owner = controller(&env, 1, DUPLICATE_BYTES);
-            let permit = owner.acquire().unwrap();
+            let permit = owner.acquire(MAX_PAGE).unwrap();
             let a = scope(&env);
             let b = scope(&env);
             let parent = scope(&env);
@@ -5025,21 +5085,21 @@ pub(super) mod tests {
             assert!(race.as_mut().poll(&mut cx).is_pending());
             assert!(a.cancellation.is_cancelled());
             assert!(!parent.cancellation.is_cancelled());
-            assert!(matches!(owner.acquire(), Err(Error::Overloaded)));
+            assert!(matches!(owner.acquire(MAX_PAGE), Err(Error::Overloaded)));
             fence.set(true);
             assert!(
                 matches!(race.as_mut().poll(&mut cx), Poll::Ready(Ok(page)) if page.plaintext.bytes() == [42])
             );
             drop(race);
             drop(permit);
-            assert!(owner.acquire().is_ok());
+            assert!(owner.acquire(MAX_PAGE).is_ok());
         }
         #[test]
         fn invalid_fast_copy_does_not_displace_valid_slow_primary() {
             let clock = racer_io::SimClock::new(903);
             let env = racer_io::Env::new(racer_io::Driver::Uring, clock.ctx(0));
             let owner = controller(&env, 1, DUPLICATE_BYTES);
-            let permit = owner.acquire().unwrap();
+            let permit = owner.acquire(MAX_PAGE).unwrap();
             let a = scope(&env);
             let b = scope(&env);
             let parent = scope(&env);
@@ -5075,7 +5135,7 @@ pub(super) mod tests {
             let clock = racer_io::SimClock::new(904);
             let env = racer_io::Env::new(racer_io::Driver::Uring, clock.ctx(0));
             let owner = controller(&env, 1, DUPLICATE_BYTES);
-            let permit = owner.acquire().unwrap();
+            let permit = owner.acquire(MAX_PAGE).unwrap();
             let a = scope(&env);
             let b = scope(&env);
             let parent = scope(&env);
@@ -5097,7 +5157,7 @@ pub(super) mod tests {
             parent.cancel().unwrap();
             assert!(race.as_mut().poll(&mut cx).is_pending());
             assert!(a.cancellation.is_cancelled() && b.cancellation.is_cancelled());
-            assert!(matches!(owner.acquire(), Err(Error::Overloaded)));
+            assert!(matches!(owner.acquire(MAX_PAGE), Err(Error::Overloaded)));
             fence.set(true);
             assert!(matches!(
                 race.as_mut().poll(&mut cx),
