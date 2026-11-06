@@ -119,6 +119,12 @@ func (r *MachineOperationReconciler) buildReplaceAgentConfig(ctx context.Context
 		return provision.UnboundedAgentConfig{}, err
 	}
 
+	return buildAgentConfig(machine, clusterInfo, bootstrapToken), nil
+}
+
+// buildAgentConfig builds the agent config that a host launched or replaced
+// for machine starts with, joining with bootstrapToken.
+func buildAgentConfig(machine *unboundedv1alpha3.Machine, clusterInfo *ClusterInfo, bootstrapToken string) provision.UnboundedAgentConfig {
 	return provision.BuildAgentConfig(provision.BuildAgentConfigParams{
 		Machine: machine,
 		Cluster: provision.ClusterEndpoint{
@@ -130,7 +136,7 @@ func (r *MachineOperationReconciler) buildReplaceAgentConfig(ctx context.Context
 		ProviderLabels: clusterInfo.ProviderLabels,
 		BootstrapToken: bootstrapToken,
 		NodeName:       machine.Name,
-	}), nil
+	})
 }
 
 func (r *MachineOperationReconciler) clusterInfo(ctx context.Context) (*ClusterInfo, error) {

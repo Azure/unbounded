@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/stretchr/testify/require"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 
 	unboundedv1alpha3 "github.com/Azure/unbounded/api/machina/v1alpha3"
 	"github.com/Azure/unbounded/pkg/machineops"
@@ -159,6 +160,14 @@ func TestSelectCapacityProvidersValidatesIntervals(t *testing.T) {
 func TestMinimalCapacityMainImportsOnlyPublicPackages(t *testing.T) {
 	t.Parallel()
 
+	requireOnlyPublicImports(t, "capacity_envtest_test.go")
+}
+
+// requireOnlyPublicImports fails unless file imports pkg/machineops/controller
+// and no package of this module other than the public API and SDK packages.
+func requireOnlyPublicImports(t *testing.T, name string) {
+	t.Helper()
+
 	const module = "github.com/Azure/unbounded"
 
 	allowed := map[string]bool{
@@ -167,7 +176,7 @@ func TestMinimalCapacityMainImportsOnlyPublicPackages(t *testing.T) {
 		module + "/pkg/machineops/controller": true,
 	}
 
-	file, err := parser.ParseFile(token.NewFileSet(), "capacity_envtest_test.go", nil, parser.ImportsOnly)
+	file, err := parser.ParseFile(token.NewFileSet(), name, nil, parser.ImportsOnly)
 	require.NoError(t, err)
 
 	imported := false
@@ -180,14 +189,14 @@ func TestMinimalCapacityMainImportsOnlyPublicPackages(t *testing.T) {
 			continue
 		}
 
-		require.True(t, allowed[path], "capacity_envtest_test.go imports non-public package %s", path)
+		require.True(t, allowed[path], "%s imports non-public package %s", name, path)
 
 		if path == module+"/pkg/machineops/controller" {
 			imported = true
 		}
 	}
 
-	require.True(t, imported, "capacity_envtest_test.go does not import pkg/machineops/controller")
+	require.True(t, imported, "%s does not import pkg/machineops/controller", name)
 }
 
 func validCapacityOptions() CapacityOptions {
@@ -223,4 +232,95 @@ func newTestCapacityProvider(t *testing.T, name string) *machineops.Provider {
 	require.NoError(t, err)
 
 	return provider
+}
+
+func TestValidateAllocationOptions(t *testing.T) {
+	t.Parallel()
+
+	cloud := newTestCapacityProvider(t, "ExampleCloud")
+	nodeClaim := schema.GroupVersionKind{Group: "karpenter.sh", Version: "v1", Kind: "NodeClaim"}
+
+	tests := []struct {
+		name    string
+		mutate  func(*CapacityOptions)
+		message string
+	}{
+		{name: "zero value"},
+		{name: "enabled without consumer kinds", mutate: func(options *CapacityOptions) { options.EnableAllocationController = true }},
+		{
+			name: "enabled with consumer kinds",
+			mutate: func(options *CapacityOptions) {
+				options.EnableAllocationController = true
+				options.AllocationConsumerKinds = []schema.GroupVersionKind{nodeClaim, {Version: "v1", Kind: "Namespace"}}
+			},
+		},
+		{
+			name:    "consumer kinds without the enable flag",
+			mutate:  func(options *CapacityOptions) { options.AllocationConsumerKinds = []schema.GroupVersionKind{nodeClaim} },
+			message: "CapacityOptions.AllocationConsumerKinds requires EnableAllocationController",
+		},
+		{
+			name: "empty kind",
+			mutate: func(options *CapacityOptions) {
+				options.EnableAllocationController = true
+				options.AllocationConsumerKinds = []schema.GroupVersionKind{{Group: "karpenter.sh", Version: "v1"}}
+			},
+			message: "CapacityOptions.AllocationConsumerKinds[0]",
+		},
+		{
+			name: "empty version",
+			mutate: func(options *CapacityOptions) {
+				options.EnableAllocationController = true
+				options.AllocationConsumerKinds = []schema.GroupVersionKind{nodeClaim, {Group: "karpenter.sh", Kind: "Other"}}
+			},
+			message: "CapacityOptions.AllocationConsumerKinds[1]",
+		},
+		{
+			name: "duplicate group and kind",
+			mutate: func(options *CapacityOptions) {
+				options.EnableAllocationController = true
+				options.AllocationConsumerKinds = []schema.GroupVersionKind{nodeClaim, {Group: "karpenter.sh", Version: "v1beta1", Kind: "NodeClaim"}}
+			},
+			message: "CapacityOptions.AllocationConsumerKinds[1] repeats NodeClaim.karpenter.sh",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			options := validCapacityOptions()
+			if tt.mutate != nil {
+				tt.mutate(&options)
+			}
+
+			selected, err := selectCapacityProviders([]*machineops.Provider{cloud}, options)
+			if tt.message == "" {
+				require.NoError(t, err)
+				require.Equal(t, []*machineops.Provider{cloud}, selected)
+
+				return
+			}
+
+			require.ErrorContains(t, err, tt.message)
+			require.Nil(t, selected)
+		})
+	}
+}
+
+func TestCapacityControllersForOptions(t *testing.T) {
+	t.Parallel()
+
+	require.Equal(t, []string{"machineclass"}, capacityControllers(CapacityOptions{}))
+	require.Equal(t, []string{"machineclass"}, capacityControllers(validCapacityOptions()))
+
+	options := validCapacityOptions()
+	options.EnableAllocationController = true
+	require.Equal(t, []string{"machineclass", "machineallocation"}, capacityControllers(options))
+}
+
+func TestMinimalAllocationMainImportsOnlyPublicPackages(t *testing.T) {
+	t.Parallel()
+
+	requireOnlyPublicImports(t, "allocation_envtest_test.go")
 }

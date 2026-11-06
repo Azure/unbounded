@@ -142,6 +142,10 @@ func (r *MachineOperationReconciler) Reconcile(ctx context.Context, req ctrl.Req
 		return ctrl.Result{}, nil
 	}
 
+	if reason, message := allocationMachineRejection(op.Spec.OperationKind, &machine); reason != "" {
+		return r.failOperation(ctx, &op, reason, message)
+	}
+
 	if err := validateProviderReference(&machine, providerMatch.provider); err != nil {
 		return r.failOperation(ctx, &op, "InvalidProviderRef", err.Error())
 	}

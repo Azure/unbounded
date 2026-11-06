@@ -102,6 +102,14 @@ type AllocationRequest struct {
 
 // AllocationResult reports the host confirmed by HostAllocate. Field names
 // match v1alpha3.MachineOperationAllocationResult.
+//
+// Every terminal HostAllocate Poll result, whether Succeeded, Failed or
+// Canceled, must set OperationResult.Allocation. Its OwnedResources must list
+// every resource created for the allocation, and an empty list means nothing
+// exists. A missing report, or a Poll PermanentError, makes the engine fail
+// the operation with the reason OwnershipUnknown. The allocation then holds
+// and needs manual recovery, because release could act only on the resources
+// it knows.
 type AllocationResult struct {
 	// ProviderResourceID is the provider-native host identifier.
 	ProviderResourceID string
@@ -109,7 +117,7 @@ type AllocationResult struct {
 	Zone               string
 	Image              string
 	// OwnedResources are the resources created for the allocation, with
-	// provider-native identity. A failed HostAllocate may still report them
+	// provider-native identity. A failed HostAllocate must report them too,
 	// so release can clean them up.
 	OwnedResources []unboundedv1alpha3.ProviderOwnedResource
 }
@@ -126,6 +134,11 @@ type Capacity struct {
 // that registers capacity must also register HostAllocate and HostRelease as
 // long-running operations, and a provider that registers either kind must
 // register capacity.
+//
+// HostAllocate's Begin may return a PermanentError only when it created
+// nothing for the allocation. Once it may have created something, it must
+// return a handle and report the failure, with the owned resources, through
+// Poll (see AllocationResult).
 func WithCapacity(resolveClass ResolveClassFunc, planAllocation PlanAllocationFunc) ProviderOption {
 	return providerOptionFunc(func(provider *Provider) error {
 		if resolveClass == nil {

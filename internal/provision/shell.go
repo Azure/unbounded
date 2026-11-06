@@ -42,3 +42,17 @@ func AgentInstallEnv(agent *v1alpha3.AgentSpec) []string {
 
 	return env
 }
+
+// AgentArtifactInstallEnv returns the KEY=VALUE pairs that make the
+// unbounded-agent install script download the digest-pinned agent tarball and
+// verify its SHA-256 before extracting it. Values are POSIX-single-quoted.
+func AgentArtifactInstallEnv(artifact *v1alpha3.AgentArtifact) []string {
+	if artifact == nil {
+		return nil
+	}
+
+	return []string{
+		fmt.Sprintf("AGENT_URL=%s", ShellSingleQuote(artifact.URL)),
+		fmt.Sprintf("AGENT_SHA256=%s", ShellSingleQuote(artifact.SHA256)),
+	}
+}
