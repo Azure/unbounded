@@ -1122,7 +1122,12 @@ mod tests {
                 assert!(Instant::now() < until, "helper never finished");
                 std::thread::sleep(Duration::from_millis(1));
             }
-            assert_eq!(admission.used(class), 0, "helper returns the charge");
+            // The weak count reaches zero before the helper thread finishes
+            // dropping the state's fields, including the charge.
+            while admission.used(class) != 0 {
+                assert!(Instant::now() < until, "helper returns the charge");
+                std::thread::sleep(Duration::from_millis(1));
+            }
         }
 
         #[test]
