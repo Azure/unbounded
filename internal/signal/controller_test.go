@@ -196,7 +196,22 @@ func TestValidateStageEvidenceSummaryBoundaries(t *testing.T) {
 		FirstInvocationAt:        &started,
 		LastInvocationAt:         &finished,
 		MaxStartGap:              testDurationPointer(10 * time.Minute),
-		DurableEvidenceDigest:    "sha256:" + strings.Repeat("b", 64),
+		Participants: []signalv1.ParticipantEvidenceIdentity{{
+			Index:   0,
+			Role:    signalv1.ParticipantRoleRequester,
+			Verdict: signalv1.QualificationVerdictPass,
+			Start: signalv1.NodeFingerprint{
+				NodeUID:            "node-uid",
+				DriverVersion:      "580.1",
+				GPUInventoryDigest: "sha256:" + strings.Repeat("8", 64),
+			},
+			End: signalv1.NodeFingerprint{
+				NodeUID:            "node-uid",
+				DriverVersion:      "580.1",
+				GPUInventoryDigest: "sha256:" + strings.Repeat("8", 64),
+			},
+		}},
+		DurableEvidenceDigest: "sha256:" + strings.Repeat("b", 64),
 	}
 
 	if err := validateStageEvidenceSummary(
@@ -488,6 +503,95 @@ func TestResolvedTerminalEvidencePreservesFailureAndDiagnosticIdentity(t *testin
 			}
 		})
 	}
+}
+
+func TestResolvedQualificationEvidenceHandlesNonPassingStages(t *testing.T) {
+	t.Parallel()
+
+	node := qualificationNode("node", "node-uid", "boot-a")
+	scheme := qualificationScheme(t)
+	kube := fake.NewClientBuilder().WithScheme(scheme).WithObjects(node).Build()
+	reconciler := &RunReconciler{
+		Client:          kube,
+		APIReader:       kube,
+		ControllerImage: pinnedImage("controller", "a"),
+	}
+
+	t.Run("required failure preserves failure without success fingerprint", func(t *testing.T) {
+		run, summary, runnerImage := resolvedTerminalTestRun(
+			t,
+			node,
+			signalv1.StageVerdictFailed,
+			false,
+		)
+		summary.Participants[0].Start.DriverVersion = ""
+		summary.Participants[0].End.DriverVersion = ""
+		summary.Participants[0].Start.GPUInventoryDigest = ""
+		summary.Participants[0].End.GPUInventoryDigest = ""
+
+		identity, verdict, _, err := reconciler.resolvedQualificationEvidenceIdentity(
+			context.Background(),
+			run,
+			[]signalv1.StageEvidenceSummary{summary},
+			[]string{runnerImage},
+			"Fail",
+			"RequiredStageFailed",
+		)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		if identity == nil ||
+			verdict != "Fail" ||
+			identity.Participants[0].Verdict != signalv1.QualificationVerdictFail {
+			t.Fatalf("identity = %#v, verdict = %q", identity, verdict)
+		}
+	})
+
+	t.Run("optional failure does not poison participant verdict", func(t *testing.T) {
+		run, summary, runnerImage := resolvedTerminalTestRun(
+			t,
+			node,
+			signalv1.StageVerdictFailed,
+			false,
+		)
+		run.Spec.ResolvedPlan.Phases[0].Stages[0].Optional = true
+
+		digest, err := signalv1.DeriveResolvedExecutionPlanDigest(
+			int32(len(run.Spec.Participants)),
+			run.Spec.Environment,
+			*run.Spec.ResolvedPlan,
+			*run.Spec.PlanProvenance,
+		)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		run.Spec.PlanDigest = digest
+		summary.Participants[0].Start.DriverVersion = ""
+		summary.Participants[0].End.DriverVersion = ""
+		summary.Participants[0].Start.GPUInventoryDigest = ""
+		summary.Participants[0].End.GPUInventoryDigest = ""
+
+		identity, verdict, reason, err := reconciler.resolvedQualificationEvidenceIdentity(
+			context.Background(),
+			run,
+			[]signalv1.StageEvidenceSummary{summary},
+			[]string{runnerImage},
+			"Pass",
+			"AllRequiredStagesPassed",
+		)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		if identity == nil ||
+			verdict != "Pass" ||
+			reason != "AllRequiredStagesPassed" ||
+			identity.Participants[0].Verdict != signalv1.QualificationVerdictPass {
+			t.Fatalf("identity = %#v, verdict = %q, reason = %q", identity, verdict, reason)
+		}
+	})
 }
 
 func TestValidateStageEvidenceSummaryRejectsOmittedFailedAssertion(t *testing.T) {
@@ -988,6 +1092,9 @@ func resolvedTerminalTestRun(
 	}
 
 	fingerprint := nodeFingerprint(node)
+	stageFingerprint := fingerprint
+	stageFingerprint.DriverVersion = "580.1"
+	stageFingerprint.GPUInventoryDigest = "sha256:" + strings.Repeat("8", 64)
 	startedAt := metav1.NewTime(time.Date(2026, 11, 5, 17, 0, 0, 0, time.UTC))
 	finishedAt := metav1.NewTime(startedAt.Add(time.Minute))
 	assertionPassed := stageVerdict == signalv1.StageVerdictPassed
@@ -1026,6 +1133,21 @@ func resolvedTerminalTestRun(
 		QualificationEligible: !diagnostic,
 		DiagnosticOnly:        diagnostic,
 	}
+	if !diagnostic {
+		participantVerdict := signalv1.QualificationVerdictPass
+		if stageVerdict == signalv1.StageVerdictFailed {
+			participantVerdict = signalv1.QualificationVerdictFail
+		}
+
+		summary.Participants = []signalv1.ParticipantEvidenceIdentity{{
+			Index:   0,
+			Role:    signalv1.ParticipantRoleRequester,
+			Verdict: participantVerdict,
+			Start:   stageFingerprint,
+			End:     stageFingerprint,
+		}}
+	}
+
 	if stageVerdict == signalv1.StageVerdictFailed {
 		summary.SuccessfulInvocations = 0
 		summary.FailedInvocations = 1
@@ -1568,6 +1690,7 @@ func TestReadCheckResultEnforcesBoundedImmutableIdentity(t *testing.T) {
 				checkResultRunUID:     string(run.UID),
 				checkResultCheckID:    string(check.ID),
 				checkResultCheckOrder: strconv.FormatInt(int64(check.Order), 10),
+				checkResultPlanDigest: run.Spec.PlanDigest,
 			},
 			OwnerReferences: []metav1.OwnerReference{
 				*metav1.NewControllerRef(workflow, workflowGVK),
@@ -1607,6 +1730,15 @@ func TestReadCheckResultEnforcesBoundedImmutableIdentity(t *testing.T) {
 
 	if _, err := digestReconciler.readCheckResult(context.Background(), workflow, run, check); err == nil {
 		t.Fatal("readCheckResult() accepted a mismatched digest")
+	}
+
+	wrongPlan := result.DeepCopy()
+	wrongPlan.Annotations[checkResultPlanDigest] = "sha256:" + strings.Repeat("f", 64)
+	planClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(wrongPlan).Build()
+	planReconciler := &RunReconciler{Client: planClient, APIReader: planClient}
+
+	if _, err := planReconciler.readCheckResult(context.Background(), workflow, run, check); err == nil {
+		t.Fatal("readCheckResult() accepted a mismatched plan digest")
 	}
 
 	maximum := adapterCheckResult{
