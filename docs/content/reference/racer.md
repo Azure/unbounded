@@ -1140,14 +1140,13 @@ one active search, while distinct searches can report overload. The node's total
 distinct-search concurrency can reach I/O worker count times
 `RACER_ACTIVE_PATH_SEARCHES_PER_WORKER`.
 
-The overlay is the symmetric union of 32 independently hashed rings over
-stable node IDs. It has at most 64
-neighbors per member and is independent of shares. Building a new graph costs
-O(32 N log N) for bounded-size IDs and retains approximately 64N adjacency
-`usize` slots plus N vector headers. On a 64-bit target at 100,000 members,
-adjacency slots alone are about 48.8 MiB, in addition to membership records,
-construction scratch, and any retained old snapshots. These allocations are
-not covered by the path-cache byte limit.
+The overlay is a mesh per pool over stable node IDs and is independent of
+shares. A pool of up to 256 members is a full mesh: every member is a neighbor
+of every other, so a reader fetches each page directly from an owner. A larger
+pool is a grid of columns, with about `2.83 * sqrt(k)` neighbors per member,
+and some reads take one relay. Neighbors are computed on demand from the
+per-pool columns and hash rings. These allocations are not covered by the
+path-cache byte limit.
 
 Publications with unchanged validated membership version and content reuse the
 whole membership. New versions with identical node IDs share immutable graph
@@ -1776,7 +1775,7 @@ setups this node initiated as `success`, `declined`, or `failed`.
 be mapped into the NIC ahead of the write (window mode prefetches each page
 through implicit on-demand paging); those writes may stall on NIC page faults.
 `racer_rdma_fallback_overflow_total` counts page bodies received over HTTP because the hop
-qualified by Site and rail but was not among the 128 RDMA peers both nodes chose.
+qualified by Site and rail but was not among the 256 RDMA peers both nodes chose.
 The receiving node of each such hop counts each delivered body once. Requests that
 deliver no body, such as misses, overloads, and failed exchanges, do not count.
 The Node annotation `racer.unbounded-cloud.io/rdma-nics` accepts at most 64 entries:

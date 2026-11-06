@@ -78,7 +78,7 @@ identifies one incarnation; the signed handshake establishes a separate
 Only RDMA edges get links. An edge is eligible when both ends share a
 nonempty Site and at least one rail. Each node ranks its eligible mesh edges
 (see [racer-mesh-v2.md](racer-mesh-v2.md)) and takes the best `RDMA_PEERS`
-(128). An edge is an RDMA edge only when both ends took it. Each membership
+(256). An edge is an RDMA edge only when both ends took it. Each membership
 caches these peer sets, computed on first use per node. A hop that qualifies
 by Site and rail but is not an RDMA edge sends its page over HTTP. The node
 that receives the page body on that hop, the requester or a relay, counts
@@ -305,7 +305,7 @@ registered-page retention, and client delivery can still copy data. See
 - `RACER_NEIGHBOR_CONNECTIONS_PER_WORKER` also sets the per-link grant limit, clamped
   to 1..4096. The two nodes use the smaller advertised limit for issued grants.
 - The worker command queue holds 64 entries. The application allows up to
-  `2 * MAX_DEGREE` links per device.
+  `RDMA_PEERS` (256) live links per device.
 - `RACER_ENABLE_RDMA` still controls RDMA eligibility. There is no
   `RACER_RDMA_ZERO_COPY` setting or broad remote-write MR escape hatch.
 

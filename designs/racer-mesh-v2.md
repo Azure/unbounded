@@ -17,7 +17,7 @@ In order:
 
 1. **Hops per read.** At most 2 links from reader to owner in every pool. Relays do not cache, so
    every extra link copies the whole page again (`peer_bytes = page bytes x links`).
-2. **RDMA links.** Each device allows at most 128 queue pairs (`RDMA_PEERS`). Pools on the same
+2. **RDMA links.** Each device allows at most 256 queue pairs (`RDMA_PEERS`). Pools on the same
    node share them. Selector pools come first.
 3. **Peers per node.** Fewer peers means fewer TCP connections and less fan-in per node.
 4. **Hot keys.** An owner must not stream one hot page to every reader. Readers coalesce on a
@@ -78,7 +78,10 @@ bytes:
 
 Let `k` be the pool size.
 
-1. If `k <= 64` (`FULL_MESH_MAX`), there is one column, and the pool is a full mesh. 1 hop.
+1. If `k <= 256` (`FULL_MESH_MAX`), there is one column, and the pool is a full mesh. 1 hop. Every
+   member derives the overlay from this limit, so it is a constant. Only tests and simulations
+   lower it, per thread, with the `topology` crate's `test-util` feature (`FullMeshMax`), to get
+   multi-column pools with few members.
 2. Otherwise `C` is the largest power of two with `C * C <= k`, and the target column size is
    `T = ceil(k / C)`. `C` only changes when `k` crosses a power of four, so most joins and leaves
    do not move columns.
@@ -111,7 +114,8 @@ incoming delegate edges. With `T` about `sqrt(2k)` and `C` about `sqrt(k/2)`, th
 | k | C | T | peers per node |
 | --- | --- | --- | --- |
 | 64 | 1 | 64 | 63 |
-| 256 | 16 | 16 | about 45 |
+| 256 | 1 | 256 | 255 |
+| 257 | 16 | 17 | about 45 |
 | 1,024 | 32 | 32 | about 93 |
 | 4,096 | 64 | 64 | about 189 |
 | 20,000 | 128 | 157 | about 410 |
@@ -179,11 +183,11 @@ Every edge is a TCP edge. Some edges are also RDMA edges.
   1. the highest rank of a pool that has the edge,
   2. column edge before delegate edge (within that pool),
   3. a symmetric hash of the two IDs: `H("/mesh/v2/edge\0", min(id), max(id))`.
-- Each node takes its 128 best ranked RDMA capable edges (`RDMA_PEERS`).
+- Each node takes its 256 best ranked RDMA capable edges (`RDMA_PEERS`).
 - An edge uses RDMA only if both ends took it. The responder refuses other link setups. The
   initiator never asks. The page then goes over TCP. Each page body delivered this way counts in metrics as overflow.
 
-Selector pools with up to about 2,000 nodes mostly fit within 128 RDMA peers, so both hops can use
+Selector pools with up to about 2,000 nodes mostly fit within 256 RDMA peers, so both hops can use
 RDMA. Bigger pools, and the default pool on a large cluster, use TCP for the overflow edges.
 
 TCP limits cover the local peer count. Link health capacity, the peer admission key limit,
@@ -198,6 +202,16 @@ in-flight limits keep well below the degree. When slots run out, the pool closes
 connections and retries, so a node with more peers than slots reconnects more often but does
 not fail. Holding one socket per peer per worker would need degree times workers file
 descriptors.
+
+Inbound peer connections (`RACER_PEER_CONNECTIONS_PER_WORKER`, default 2,048) bound the
+fan-in. Each remote worker keeps at most `RACER_NEIGHBOR_CONNECTIONS_PER_WORKER` (default 8)
+connections to one neighbor, and at most its outbound slots (default 64) in total. In a
+256 member full mesh the worst case is 255 neighbors x 8 = 2,040 connections per remote worker
+count, which fits the default 2,048 per local worker when nodes run the same number of
+workers. Nodes with more workers than their peers, or a node whose pools add neighbors beyond
+the full mesh, can exceed it. The listener then answers new connections with an overload head
+and the sender asks elsewhere, so this costs retries, not failures. Raise
+`RACER_PEER_CONNECTIONS` (and the `nofile` limit it needs) if such nodes report overloads.
 
 ## Hot keys
 
