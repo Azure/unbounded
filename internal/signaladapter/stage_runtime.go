@@ -165,6 +165,12 @@ func (r StageRunner) Execute(ctx context.Context, request StageExecutionRequest)
 		envelopes = append(envelopes, envelope)
 		nextOrdinal++
 
+		if envelope.Outcome == signalv1.InvocationOutcomeCanceled {
+			schedulerCanceled = true
+
+			break
+		}
+
 		if schedule.Mode == signalv1.CheckExecutionModeRunOnce {
 			break
 		}
@@ -571,7 +577,7 @@ func evaluateStageAssertions(
 				Name:    assertion.Name,
 				Passed:  false,
 				Actual:  actual.DeepCopy(),
-				Message: boundedStageMessage("assertion evaluation failed: " + err.Error()),
+				Message: boundedAssertionMessage("assertion evaluation failed: " + err.Error()),
 			})
 			allPassed = false
 
@@ -609,7 +615,18 @@ func missingAssertionMetricMessage(assertion signalv1.TestAssertion) string {
 		return "required assertion metric is absent"
 	}
 
-	return boundedStageMessage("required assertion metric is absent: " + string(content))
+	return boundedAssertionMessage("required assertion metric is absent: " + string(content))
+}
+
+func boundedAssertionMessage(value string) string {
+	const maximumAssertionMessageRunes = 256
+
+	runes := []rune(value)
+	if len(runes) > maximumAssertionMessageRunes {
+		return string(runes[:maximumAssertionMessageRunes])
+	}
+
+	return value
 }
 
 func evaluateAssertion(

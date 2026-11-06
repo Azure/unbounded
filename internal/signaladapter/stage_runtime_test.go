@@ -681,6 +681,73 @@ func TestStageRunnerPersistsCanceledInvocationWithLiveContext(t *testing.T) {
 	}
 }
 
+func TestStageRunnerContinuousStopsAfterCanceledInvocation(t *testing.T) {
+	t.Parallel()
+
+	clock := &fakeStageClock{now: time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)}
+	minimum := int32(2)
+	request := stageExecutionRequest(signalv1.StageSchedule{
+		Mode:              signalv1.CheckExecutionModeContinuous,
+		InvocationTimeout: metav1.Duration{Duration: time.Minute},
+		CoverageWindow:    &metav1.Duration{Duration: time.Hour},
+		MinExecutions:     &minimum,
+		MaxGap:            &metav1.Duration{Duration: time.Minute},
+	})
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	persisted := 0
+	runner := StageRunner{
+		Clock:    clock,
+		Executor: canceledStageExecutor{deadlineObserved: new(bool)},
+		Evidence: func(
+			_ context.Context,
+			_ StageExecutionRequest,
+			envelopes []signalv1.InvocationResultEnvelope,
+		) error {
+			persisted = len(envelopes)
+
+			return nil
+		},
+	}
+
+	summary, err := runner.Execute(ctx, request)
+	if err != nil {
+		t.Fatalf("Execute() error = %v", err)
+	}
+
+	if persisted != 1 || summary.InvocationCount != 1 ||
+		summary.Verdict != signalv1.StageVerdictCanceled {
+		t.Fatalf("continuous cancellation summary = %#v, persisted = %d", summary, persisted)
+	}
+}
+
+func TestAssertionMessagesAreBoundedByControllerContract(t *testing.T) {
+	t.Parallel()
+
+	value := strings.Repeat("é", 300)
+
+	message := boundedAssertionMessage(value)
+	if len([]rune(message)) != 256 {
+		t.Fatalf("bounded assertion message runes = %d, want 256", len([]rune(message)))
+	}
+
+	expected := signalv1.TypedValue{
+		Type:        signalv1.TypedValueTypeString,
+		StringValue: &value,
+	}
+
+	assertion := signalv1.TestAssertion{
+		Name:     "missing",
+		Metric:   strings.Repeat("metric", 20),
+		Operator: signalv1.AssertionOperatorStatusEquals,
+		Expected: &expected,
+	}
+	if got := missingAssertionMetricMessage(assertion); len([]rune(got)) > 256 || got == "" {
+		t.Fatalf("missing assertion message = %q (%d runes)", got, len([]rune(got)))
+	}
+}
+
 type activityDroppingExecutor struct {
 	fakeStageExecutor
 }

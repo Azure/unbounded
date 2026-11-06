@@ -1054,23 +1054,14 @@ exec %s "$script"
 }
 
 func invocationResourceName(base string, invocation StageInvocation, participant int32) string {
-	suffix := invocation.ID[len(invocation.ID)-8:]
+	base = strings.Trim(strings.ToLower(base), "-.")
+
+	suffix := "-" + invocation.ID[len(invocation.ID)-8:]
 	if participant >= 0 {
-		return boundedDNSName(fmt.Sprintf("%s-%s-p%d", base, suffix, participant))
+		suffix += fmt.Sprintf("-p%d", participant)
 	}
 
-	return boundedDNSName(fmt.Sprintf("%s-%s", base, suffix))
-}
-
-func boundedDNSName(value string) string {
-	value = strings.ToLower(value)
-
-	value = strings.Trim(value, "-.")
-	if len(value) > 63 {
-		value = strings.TrimRight(value[:63], "-.")
-	}
-
-	return value
+	return resourceNameWithSuffix(base, suffix, 63)
 }
 
 func (e *KubernetesStageExecutor) deletePod(ctx context.Context, pod *corev1.Pod) error {

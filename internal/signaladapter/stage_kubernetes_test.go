@@ -592,6 +592,26 @@ func TestCancelInvocationUsesGlobalParticipantIndex(t *testing.T) {
 	}
 }
 
+func TestInvocationResourceNamePreservesUniqueSuffix(t *testing.T) {
+	t.Parallel()
+
+	invocation := stageExecutionInvocation()
+	base := strings.Repeat("a", 63)
+
+	first := invocationResourceName(base, invocation, 0)
+	second := invocationResourceName(base, invocation, 1)
+	workflow := invocationResourceName(base, invocation, -1)
+
+	if first == second || first == workflow || second == workflow {
+		t.Fatalf("invocation resource names collide: %q, %q, %q", first, second, workflow)
+	}
+
+	if len(first) > 63 || !strings.HasSuffix(first, "-p0") ||
+		len(second) > 63 || !strings.HasSuffix(second, "-p1") {
+		t.Fatalf("invocation resource suffixes were truncated: %q, %q", first, second)
+	}
+}
+
 func TestScriptInvocationWrapperUsesApprovedLanguage(t *testing.T) {
 	t.Parallel()
 
