@@ -46,13 +46,12 @@ pub struct Costs {
 }
 
 impl Costs {
-    /// Signing a peer request carrying `proofs` proofs (1 for the requester's own head),
-    /// racer-sim `Costs::sign_request`.
+    /// Signing a peer request carrying `proofs` proofs (1 for the requester's own head).
     pub fn sign_request(&self, proofs: usize) -> Nanos {
         self.crypto_sign_ns + self.crypto_sign_hop_ns * proofs.saturating_sub(1) as Nanos
     }
 
-    /// Verifying a peer head carrying `proofs` proofs, racer-sim `Costs::verify`.
+    /// Verifying a peer head carrying `proofs` proofs.
     pub fn verify(&self, proofs: usize) -> Nanos {
         self.crypto_verify_ns + self.crypto_verify_hop_ns * proofs.saturating_sub(1) as Nanos
     }
@@ -228,7 +227,7 @@ mod tests {
     }
 
     #[test]
-    fn peer_crypto_costs_match_racer_sim() {
+    fn peer_crypto_costs_match_checked_in_table() {
         let costs = Costs::checked_in();
         assert_eq!(costs.sign_request(1), 64_000);
         assert_eq!(costs.sign_request(2), 76_000);

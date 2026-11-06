@@ -1,16 +1,17 @@
-# Racer DST cost table, shared by Full and Model fidelity (plan D14, section 9.2).
+# Racer DST cost table, shared by Full and Model fidelity so both price the
+# same operation the same way.
 #
 # Every value is an unsigned integer (underscores allowed). Sections and keys
 # are fixed; `racer_dst::costs::Costs::parse` rejects unknown or missing keys.
-# Recalibrate from the Phase -1 / 9.4 perf harness when baselines move > 10%.
+# Recalibrate when the measured baselines move by more than 10%.
 #
 # Sources:
-#   [baseline]  tmp/baselines/README.md of the racer-refactor worktree, Phase -1
-#               baselines recorded 2026-11-04 on an AMD EPYC 9V74 Azure VM
-#               (noisy host, load 42-71 on 48 vCPUs; treat as order-of-magnitude).
-#   [racer-sim] cmd/racer/sim/src/config.rs `Config::default` / `Costs::default`
-#               at the time racer-dst was created; kept so Model fidelity can
-#               reproduce racer-sim reports (D14 behavioral parity).
+#   [baseline]  release-build measurements recorded 2026-11-04 on an AMD EPYC
+#               9V74 Azure VM (noisy host, load 42-71 on 48 vCPUs; treat as
+#               order-of-magnitude).
+#   [assumed]   modeling assumptions, not measurements: round numbers for a
+#               typical deployment that keep scenario results stable. Change
+#               them only together with the scenario bounds that depend on them.
 
 [crypto]
 # [baseline] "Crypto, 1 core, 16 MiB page: seal / open = 3.57 / 3.58 GiB/s".
@@ -25,7 +26,7 @@ memcpy_bytes_per_sec = 9_878_424_781
 # Peer wire v2 (certificate chains sent once per session), release build of
 # `peer_crypto_cost_benchmark` (src/peer/tests/opaque.rs, ignored): direct
 # request sign 64 us, relayed (one forwarder) sign 76 us, response sign 114 us,
-# direct verify 73 us, two-proof verify 160 us. Same as racer-sim Costs::default.
+# direct verify 73 us, two-proof verify 160 us.
 # A request carrying n proofs costs sign_ns + (n - 1) * sign_hop_ns to sign and
 # verify_ns + (n - 1) * verify_hop_ns to verify.
 sign_ns = 64_000
@@ -35,31 +36,31 @@ verify_ns = 73_000
 verify_hop_ns = 87_000
 
 [cpu]
-# [racer-sim] Config::default workers.
+# [assumed] Worker threads per node.
 workers = 2
-# [racer-sim] Costs::default request_ns (fixed per-request dispatch cost).
+# [assumed] Fixed per-request dispatch cost.
 request_ns = 5_000
-# [racer-sim] Costs::default ranking_chunk_ns.
+# [assumed] CPU per poll of a placement ranking.
 ranking_chunk_ns = 2_000
-# [racer-sim] Costs::default path_expand_ns_per_node.
+# [assumed] CPU per node expanded by a route search.
 path_expand_ns_per_node = 50
-# [racer-sim] Costs::default control_handshake_ns (200 us).
+# [assumed] Control-plane handshake CPU (200 us).
 control_handshake_ns = 200_000
 
 [nic]
-# [racer-sim] nic_bps 1.25e9 B/s (10 Gbit/s) and chunk_bytes 1 MiB.
+# [assumed] 10 Gbit/s NIC (1.25e9 B/s), transferred in 1 MiB chunks.
 bytes_per_sec = 1_250_000_000
 chunk_bytes = 1_048_576
 
 [disk]
-# [racer-sim] disk_read_bps / disk_write_bps / disk_latency_ns (100 us).
+# [assumed] Local NVMe: 2 GB/s read, 1 GB/s write, 100 us latency.
 read_bytes_per_sec = 2_000_000_000
 write_bytes_per_sec = 1_000_000_000
 latency_ns = 100_000
 
 [origin]
-# [racer-sim] origin_caches / origin_concurrency / origin_bps (5e9 B/s)
-# / origin_latency_ns (30 ms) / origin_retry_ns (50 ms).
+# [assumed] Origin: cache count, concurrent requests, aggregate bandwidth
+# (5e9 B/s), first-byte latency (30 ms) and retry delay (50 ms).
 caches = 4
 concurrency = 64
 bytes_per_sec = 5_000_000_000
@@ -67,7 +68,7 @@ latency_ns = 30_000_000
 retry_ns = 50_000_000
 
 [rtt]
-# [racer-sim] local_rtt_ns (200 us), remote_rtt_ns (20 ms), rtt_jitter_ns (5 ms).
+# [assumed] RTT within a site (200 us), between sites (20 ms), jitter (5 ms).
 local_ns = 200_000
 remote_ns = 20_000_000
 jitter_ns = 5_000_000
