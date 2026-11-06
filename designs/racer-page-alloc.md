@@ -266,4 +266,4 @@ change, so the same workflow tests run in both modes.
   commands, so feature unification cannot hide one from the other. The
   production run sets `PAGE_ALLOC_REQUIRE_REAL_IO=1`, so a host without
   io_uring or direct I/O fails instead of skipping. Miri runs only on
-  the worker-runtime allowlist in `hack/scripts/runtime-miri.py`, not on this crate.
+  the worker-runtime allowlist in `hack/scripts/racer-io-miri.py`, not on this crate.

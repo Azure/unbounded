@@ -81,7 +81,7 @@ def main():
         "timeout", "--signal=TERM", "--kill-after=10s", "1100s" if package == "racer" else "290s",
         "cargo", "+" + TOOLCHAIN, "miri", "test", "--locked",
         "--manifest-path", str(root / "cmd/racer/Cargo.toml"),
-        "--target-dir", os.environ.get("RUNTIME_MIRI_TARGET_DIR", str(root / "tmp/runtime-miri-target")),
+        "--target-dir", os.environ.get("RACER_IO_MIRI_TARGET_DIR", str(root / "tmp/racer-io-miri-target")),
         "-p", package, "--lib", "-j", "2",
         "--", "--exact", "--test-threads=1", *tests,
     ]
