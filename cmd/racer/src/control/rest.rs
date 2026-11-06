@@ -18,6 +18,11 @@ use std::{
 pub use racer_io::Operation;
 
 use racer_io::{Scope as _, ring::Descriptor};
+use racer_wire::http::{self, small};
+use zeroize::Zeroize as _;
+
+/// Largest request or response head, including the final empty line.
+const MAX_HEAD: usize = 16384;
 
 /// Transport failures contain no credentials, headers, or body bytes.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -982,30 +987,34 @@ impl<I: Io + ?Sized> Connection<I> {
             )? {
                 break head;
             }
-            if received.len() >= 16384 {
+            if received.len() >= MAX_HEAD {
                 return Err(Error::Overloaded.into());
             }
             self.receive(&mut received, &mut scratch[..], scope).await?;
         };
-        let body = match head.framing {
-            Framing::Length(length) => {
-                let end = length_frame_end(head.header_len, length)?;
-                loop {
-                    if received.len() > end {
-                        return Err(Error::InvalidRequest.into());
-                    }
-                    if received.len() == end {
-                        break;
-                    }
-                    self.receive(&mut received, &mut scratch[..], scope).await?;
+        let mut decoder = small::Decoder::new(
+            head.framing,
+            small::Limits {
+                body: head.bound,
+                line: 128,
+                trailers: 4096,
+            },
+        )
+        .map_err(body_error)?;
+        let mut input = zeroize::Zeroizing::new(received[head.header_len..].to_vec());
+        loop {
+            match decoder.feed(&input).map_err(body_error)? {
+                // Read-ahead past one response is never pipelined by the server.
+                small::Status::Done(n) if n == input.len() => break,
+                small::Status::Done(_) => return Err(Error::InvalidRequest.into()),
+                small::Status::Need => {
+                    input.zeroize();
+                    input.clear();
+                    self.receive(&mut input, &mut scratch[..], scope).await?;
                 }
-                zeroize::Zeroizing::new(received[head.header_len..].to_vec())
             }
-            Framing::Chunked { bound } => {
-                self.receive_chunked(&received[head.header_len..], bound, &mut scratch[..], scope)
-                    .await?
-            }
-        };
+        }
+        let body = zeroize::Zeroizing::new(decoder.into_body());
         self.check(scope)?;
         // A TLS record can contain more plaintext than the last bounded receive.
         let reusable = match self.tls.reader().read(&mut scratch[..1]) {
@@ -1034,65 +1043,6 @@ impl<I: Io + ?Sized> Connection<I> {
         {
             auth.idle_since = self.io.ctx().clock.now();
             *idle.borrow_mut() = Some(self);
-        }
-    }
-
-    /// Decode bounded chunks, rejecting extensions, trailers, and trailing bytes.
-    async fn receive_chunked(
-        &mut self,
-        initial: &[u8],
-        bound: usize,
-        scratch: &mut [u8],
-        scope: &I::Scope,
-    ) -> Result<zeroize::Zeroizing<Vec<u8>>, I::Error> {
-        let mut raw = zeroize::Zeroizing::new(initial.to_vec());
-        let mut body = zeroize::Zeroizing::new(Vec::new());
-        loop {
-            let line_end = loop {
-                if let Some(n) = raw.windows(2).position(|w| w == b"\r\n") {
-                    break n;
-                }
-                if raw.len() > 128 {
-                    return Err(Error::InvalidRequest.into());
-                }
-                self.receive(&mut raw, scratch, scope).await?;
-            };
-            if line_end == 0 || line_end > 16 || !raw[..line_end].iter().all(u8::is_ascii_hexdigit)
-            {
-                return Err(Error::InvalidRequest.into());
-            }
-            let length = usize::from_str_radix(
-                std::str::from_utf8(&raw[..line_end]).map_err(|_| Error::InvalidRequest)?,
-                16,
-            )
-            .map_err(|_| Error::Overloaded)?;
-            raw.drain(..line_end + 2);
-            if length > bound - body.len() {
-                return Err(Error::Overloaded.into());
-            }
-            let mut remaining = length;
-            while remaining != 0 {
-                if raw.is_empty() {
-                    self.receive(&mut raw, scratch, scope).await?;
-                }
-                let n = remaining.min(raw.len());
-                append_sensitive(&mut body, &raw[..n]);
-                raw.drain(..n);
-                remaining -= n;
-            }
-            while raw.len() < 2 {
-                self.receive(&mut raw, scratch, scope).await?;
-            }
-            if &raw[..2] != b"\r\n" {
-                return Err(Error::InvalidRequest.into());
-            }
-            raw.drain(..2);
-            if length == 0 {
-                if !raw.is_empty() {
-                    return Err(Error::InvalidRequest.into());
-                }
-                return Ok(body);
-            }
         }
     }
 
@@ -1127,9 +1077,6 @@ fn request_head(
     body_length: usize,
     header: Option<(&str, &str)>,
 ) -> Result<zeroize::Zeroizing<String>> {
-    /// Allocation ceiling including fixed syntax and variable header fields.
-    const MAX_HEAD: usize = 16384;
-
     if !path.starts_with('/')
         || path.bytes().any(|b| b <= 32 || b >= 127)
         || host.bytes().any(|b| b <= 32 || b >= 127)
@@ -1479,16 +1426,6 @@ mod discovery_tests {
     }
 }
 
-/// Supported, unambiguous HTTP body boundaries.
-#[derive(Debug, Eq, PartialEq)]
-enum Framing {
-    /// Exact plaintext body length, already checked against its status limit.
-    Length(usize),
-
-    /// Chunked body carrying the status-specific limit selected by the parser.
-    Chunked { bound: usize },
-}
-
 /// Validated response metadata, including the connection reuse directive.
 #[derive(Debug, Eq, PartialEq)]
 struct ResponseHead {
@@ -1498,8 +1435,11 @@ struct ResponseHead {
     /// Offset of the first body byte in the accumulated plaintext.
     header_len: usize,
 
-    /// Exact length or chunk limit validated together with the headers.
-    framing: Framing,
+    /// Fixed length or chunked framing, never close-delimited.
+    framing: small::Framing,
+
+    /// Status-specific decoded body limit.
+    bound: usize,
 
     /// Server retry hint, already converted to a relative delay.
     retry_after: Option<Duration>,
@@ -1520,9 +1460,21 @@ struct CompletedResponse {
     reusable: bool,
 }
 
-/// Bound the complete frame before receiving or allocating body storage.
-fn length_frame_end(header_len: usize, body_len: usize) -> Result<usize> {
-    header_len.checked_add(body_len).ok_or(Error::Overloaded)
+/// Map body framing failures onto transport errors: size is overload, the rest
+/// are protocol violations.
+fn body_error(error: small::Error) -> Error {
+    match error {
+        small::Error::TooLarge => Error::Overloaded,
+        small::Error::Malformed | small::Error::Truncated => Error::InvalidRequest,
+    }
+}
+
+/// Map head syntax failures; an oversized head is overload.
+fn head_error(error: http::Error) -> Error {
+    match error {
+        http::Error::HeadTooLarge => Error::Overloaded,
+        http::Error::Malformed => Error::InvalidRequest,
+    }
 }
 
 /// Parse framing and reuse metadata together, preserving failure precedence.
@@ -1532,101 +1484,56 @@ fn parse_head(
     max_error_body: usize,
     wall_now: SystemTime,
 ) -> Result<Option<ResponseHead>> {
-    let mut headers = [httparse::EMPTY_HEADER; 64];
-    let mut response = httparse::Response::new(&mut headers);
-    let length = match response.parse(bytes).map_err(|_| Error::InvalidRequest)? {
-        httparse::Status::Partial => return Ok(None),
-        httparse::Status::Complete(n) => n,
+    let codec = http::Codec::<()>::new(MAX_HEAD).transfer_coding();
+    let Some((head, length)) = codec.decode_head(bytes).map_err(head_error)? else {
+        return Ok(None);
     };
-    if length > 16384 || response.version != Some(1) {
+    let http::StartLine::Response { status } = head.start else {
+        return Err(Error::InvalidRequest);
+    };
+    if head.values("content-encoding").next().is_some() {
         return Err(Error::InvalidRequest);
     }
-    let status = response.code.ok_or(Error::InvalidRequest)?;
-    let mut content_length = None;
-    let mut retry = None;
-    let mut content_type = false;
-    let mut chunked = false;
-    let mut close = false;
-    for h in response.headers {
-        if h.name.eq_ignore_ascii_case("content-encoding") {
-            return Err(Error::InvalidRequest);
+    let framing = small::Framing::from_response(&head).map_err(body_error)?;
+    let retry = head
+        .unique("retry-after")
+        .map_err(head_error)?
+        .map(|value| retry_delay(value, wall_now))
+        .transpose()?;
+    let content_type = head.unique("content-type").map_err(head_error)?;
+    let framing = if status == 204 {
+        match framing {
+            small::Framing::Length(0) | small::Framing::Close => small::Framing::Length(0),
+            _ => return Err(Error::InvalidRequest),
         }
-        if h.name.eq_ignore_ascii_case("transfer-encoding") {
-            if chunked || !h.value.eq_ignore_ascii_case(b"chunked") {
-                return Err(Error::InvalidRequest);
-            }
-            chunked = true;
-        }
-        if h.name.eq_ignore_ascii_case("content-length") {
-            if content_length.is_some() {
-                return Err(Error::InvalidRequest);
-            }
-            let s = std::str::from_utf8(h.value).map_err(|_| Error::InvalidRequest)?;
-            if s.is_empty() || !s.bytes().all(|b| b.is_ascii_digit()) {
-                return Err(Error::InvalidRequest);
-            }
-            content_length = Some(s.parse::<usize>().map_err(|_| Error::Overloaded)?);
-        }
-        if h.name.eq_ignore_ascii_case("content-type") {
-            if content_type
-                || !std::str::from_utf8(h.value)
-                    .map_err(|_| Error::InvalidRequest)?
-                    .split(';')
-                    .next()
-                    .is_some_and(|s| s.trim().eq_ignore_ascii_case("application/json"))
-            {
-                return Err(Error::InvalidRequest);
-            }
-            content_type = true;
-        }
-        if h.name.eq_ignore_ascii_case("retry-after") {
-            if retry.is_some() {
-                return Err(Error::InvalidRequest);
-            }
-            retry = Some(retry_delay(h.value, wall_now)?);
-        }
-        if h.name.eq_ignore_ascii_case("connection") {
-            // Defer invalid UTF-8 until after framing validation.
-            if let Ok(value) = std::str::from_utf8(h.value) {
-                close |= value
-                    .split(',')
-                    .any(|token| token.trim().eq_ignore_ascii_case("close"));
-            }
-        }
-    }
-    if chunked && (content_length.is_some() || status == 204) {
-        return Err(Error::InvalidRequest);
-    }
-    let size = if status == 204 {
-        if content_length.is_some_and(|n| n != 0) {
-            return Err(Error::InvalidRequest);
-        }
-        0
     } else {
-        if !content_type {
+        if !content_type.is_some_and(|value| {
+            std::str::from_utf8(value)
+                .ok()
+                .and_then(|value| value.split(';').next())
+                .is_some_and(|value| value.trim().eq_ignore_ascii_case("application/json"))
+        }) {
             return Err(Error::InvalidRequest);
         }
-        if chunked {
-            0
-        } else {
-            content_length.ok_or(Error::InvalidRequest)?
+        match framing {
+            small::Framing::Close => return Err(Error::InvalidRequest),
+            framing => framing,
         }
     };
     let bound = if status == 200 { limit } else { max_error_body };
-    if size > bound {
+    if let small::Framing::Length(size) = framing
+        && usize::try_from(size).map_or(true, |size| size > bound)
+    {
         return Err(Error::Overloaded);
     }
-    // Every header, including ignored ones, must be valid UTF-8. Check this
-    // after size/framing checks, without reparsing Connection.
+    let close = head.closes_connection().map_err(head_error)?;
+    // Every header, including ignored ones, must be valid UTF-8.
     std::str::from_utf8(&bytes[..length]).map_err(|_| Error::InvalidRequest)?;
     Ok(Some(ResponseHead {
         status,
         header_len: length,
-        framing: if chunked {
-            Framing::Chunked { bound }
-        } else {
-            Framing::Length(size)
-        },
+        framing,
+        bound,
         retry_after: retry,
         close,
     }))
@@ -2523,23 +2430,18 @@ mod tests {
             )
             .unwrap()
             .unwrap();
-            let Framing::Length(length) = head.framing else {
-                panic!("expected content length framing");
-            };
-            assert_eq!(length, usize::MAX);
-            assert_eq!(
-                length_frame_end(head.header_len, length),
-                Err(Error::Overloaded)
-            );
-            assert_eq!(
-                length_frame_end(head.header_len, usize::MAX - head.header_len),
-                Ok(usize::MAX)
-            );
-            assert_eq!(length_frame_end(head.header_len, 0), Ok(head.header_len));
-            assert_eq!(
-                length_frame_end(head.header_len, 2),
-                Ok(head.header_len + 2)
-            );
+            assert_eq!(head.framing, small::Framing::Length(usize::MAX as u64));
+            // The decoder accepts the declared length without reserving it.
+            let decoder = small::Decoder::new(
+                head.framing,
+                small::Limits {
+                    body: head.bound,
+                    line: 128,
+                    trailers: 4096,
+                },
+            )
+            .unwrap();
+            assert!(decoder.body().is_empty());
         }
     }
 
@@ -2553,7 +2455,6 @@ mod tests {
             ("cOnNeCtIoN: keep-alive,\tClOsE \r\n", true),
             ("Connection: close\r\nConnection: keep-alive\r\n", true),
             ("Connection: keep-alive\r\nConnection: close\r\n", true),
-            ("Connection: \u{a0}close\u{a0}\r\n", true),
         ] {
             let bytes = format!("HTTP/1.1 204 No Content\r\n{headers}Retry-After: 2\r\n\r\n");
             assert_eq!(
@@ -2561,7 +2462,8 @@ mod tests {
                 Some(ResponseHead {
                     status: 204,
                     header_len: bytes.len(),
-                    framing: Framing::Length(0),
+                    framing: small::Framing::Length(0),
+                    bound: 20,
                     retry_after: Some(Duration::from_secs(2)),
                     close,
                 })
@@ -2576,17 +2478,28 @@ mod tests {
             ),
             Ok(None)
         );
+        // Connection options follow the shared token grammar.
+        let bytes = "HTTP/1.1 204 No Content\r\nConnection: \u{a0}close\u{a0}\r\n\r\n";
+        assert_eq!(
+            parse_head(bytes.as_bytes(), 10, 20, std::time::SystemTime::now()),
+            Err(Error::InvalidRequest)
+        );
     }
 
-    /// Ignored non-UTF-8 headers remain invalid, after framing and size errors.
+    /// Ignored non-UTF-8 headers remain invalid; non-UTF-8 bodies are opaque.
     #[test]
     fn response_head_preserves_utf8_acceptance_and_error_precedence() {
-        for name in ["X-Ignored", "Connection"] {
+        // Size errors precede the UTF-8 check for ignored fields; the shared
+        // head grammar rejects an invalid Connection token list up front.
+        for (name, oversized) in [
+            ("X-Ignored", Error::Overloaded),
+            ("Connection", Error::InvalidRequest),
+        ] {
             let mut bytes = format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 12\r\n{name}: ").into_bytes();
             bytes.extend_from_slice(b"\xff\r\n\r\n");
             assert_eq!(
                 parse_head(&bytes, 10, 20, std::time::SystemTime::now()),
-                Err(Error::Overloaded)
+                Err(oversized)
             );
             assert_eq!(
                 parse_head(&bytes, 12, 20, std::time::SystemTime::now()),
@@ -2595,7 +2508,7 @@ mod tests {
         }
         let bytes = b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 2\r\n\r\n\xff\xff";
         assert!(parse_head(bytes, 2, 20, std::time::SystemTime::now()).is_ok());
-        assert_eq!(parse_head(b"HTTP/1.1 429 Busy\r\nContent-Type: application/json\r\nContent-Length: 12\r\n\r\n", 10, 20, std::time::SystemTime::now()).unwrap().unwrap().framing, Framing::Length(12));
+        assert_eq!(parse_head(b"HTTP/1.1 429 Busy\r\nContent-Type: application/json\r\nContent-Length: 12\r\n\r\n", 10, 20, std::time::SystemTime::now()).unwrap().unwrap().framing, small::Framing::Length(12));
     }
 
     /// Chunked framing retains its status-specific bound, including zero limits.
@@ -2618,9 +2531,8 @@ mod tests {
                     std::time::SystemTime::now()
                 )
                 .unwrap()
-                .unwrap()
-                .framing,
-                Framing::Chunked { bound }
+                .map(|head| (head.framing, head.bound)),
+                Some((small::Framing::Chunked, bound))
             );
         }
         assert_eq!(

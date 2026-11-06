@@ -193,6 +193,13 @@ pub struct Decoder {
     body: Vec<u8>,
 }
 
+impl Drop for Decoder {
+    /// Erase any body bytes that were not taken.
+    fn drop(&mut self) {
+        zeroize::Zeroize::zeroize(&mut self.body);
+    }
+}
+
 impl Decoder {
     /// Construct a decoder, rejecting fixed lengths that already exceed the cap.
     pub fn new(framing: Framing, limits: Limits) -> Result<Self, Error> {
@@ -226,8 +233,8 @@ impl Decoder {
     }
 
     /// Take the decoded body bytes.
-    pub fn into_body(self) -> Vec<u8> {
-        self.body
+    pub fn into_body(mut self) -> Vec<u8> {
+        std::mem::take(&mut self.body)
     }
 
     /// Take the decoded body bytes so far, leaving the decoder running. The
@@ -272,10 +279,22 @@ impl Decoder {
         }
     }
 
-    /// Append bytes, enforcing the body cap.
+    /// Append bytes, enforcing the body cap. Growth copies into fresh storage
+    /// and erases the old buffer, so bodies carrying secrets (for example key
+    /// bundles) never leave unerased copies in freed memory.
     fn append(&mut self, bytes: &[u8]) -> Result<(), Error> {
         if bytes.len() > self.limits.body - self.body.len() {
             return Err(Error::TooLarge);
+        }
+        let needed = self.body.len() + bytes.len();
+        if needed > self.body.capacity() {
+            let capacity = needed
+                .max(self.body.capacity().saturating_mul(2))
+                .min(self.limits.body);
+            let mut grown = Vec::with_capacity(capacity);
+            grown.extend_from_slice(&self.body);
+            let mut old = std::mem::replace(&mut self.body, grown);
+            zeroize::Zeroize::zeroize(&mut old);
         }
         self.body.extend_from_slice(bytes);
         Ok(())
@@ -479,6 +498,23 @@ mod tests {
         line: 12,
         trailers: 24,
     };
+
+    /// Byte-at-a-time growth keeps every byte and never exceeds the body cap.
+    #[test]
+    fn growth_preserves_bytes_within_the_cap() {
+        let limits = Limits {
+            body: 1000,
+            ..Limits::default()
+        };
+        let mut decoder = Decoder::new(Framing::Close, limits).unwrap();
+        let expected: Vec<u8> = (0..1000u32).map(|i| i as u8).collect();
+        for byte in &expected {
+            assert_eq!(decoder.feed(std::slice::from_ref(byte)), Ok(Status::Need));
+            assert!(decoder.body.capacity() <= limits.body);
+        }
+        decoder.finish().unwrap();
+        assert_eq!(decoder.into_body(), expected);
+    }
 
     /// Decode `wire` in one call and finish, returning the body and consumed length.
     fn whole(framing: Framing, wire: &[u8]) -> Result<(Vec<u8>, usize), Error> {
