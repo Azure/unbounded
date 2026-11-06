@@ -6433,8 +6433,9 @@ impl Origin for SizedOrigin {
 /// not the 16 MiB maximum.
 #[test]
 fn small_page_cluster_reserves_page_sized_plaintext() {
+    let env = racer_io::Env::host();
     let small = racer_wire::object::PageSize::new(64 << 10).unwrap();
-    let mut f = fixture();
+    let mut f = fixture(&env);
     f.fill.dependencies.origin = Rc::new(SizedOrigin(small));
     assert_eq!(f.fill.page_plaintext_bytes(), Ok(64 << 10));
     let bootstrap = f.fill.reserve_bootstrap(&f.context.object.cache).unwrap();
