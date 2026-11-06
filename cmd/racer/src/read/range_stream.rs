@@ -141,6 +141,10 @@ impl Scheduler {
                         demand: Default::default(),
                         sequence: 0,
                         page_budget: u32::MAX,
+                        // Largest-page units on purpose: the provider debits the
+                        // same `PAGE_BYTES + 16` per selection
+                        // (`racer_core::subscriptions`), and `u32::MAX` of them
+                        // never binds whatever the published page size.
                         byte_budget: u64::from(u32::MAX) * (PAGE_BYTES + 16),
                         flights: None,
                     },

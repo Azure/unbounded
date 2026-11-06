@@ -637,6 +637,9 @@ impl From<page_alloc::SegmentGeometry> for CheckpointGeometry {
 impl CheckpointGeometry {
     /// Full-page capacity at actual direct-I/O alignment, conservatively allowing
     /// the largest supported record header. Short records can use tail space.
+    /// Pages are counted at the largest page size because storage opens before
+    /// the cluster page size is published, so this is a lower bound when the
+    /// published page size is smaller.
     pub fn payload_capacity(&self, reserve: usize, page_entries: usize) -> Result<(u64, u64)> {
         let record = self
             .alignment()?

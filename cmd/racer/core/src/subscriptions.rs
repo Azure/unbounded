@@ -14,6 +14,9 @@ use std::hash::Hash;
 pub const MAX_SUBSCRIPTION_FLIGHTS: u16 = 64;
 
 /// Bytes the requester debits per selection when it issues a request.
+/// Deliberately the largest page whatever the published page size: it is a
+/// contract both ends must apply identically, and requesters open contracts
+/// with a budget of `u32::MAX` such selections, so it never binds.
 const RESERVE: u64 = racer_wire::object::PAGE_BYTES + 16;
 
 /// Retained spent contracts outlive their deadline by the signature freshness

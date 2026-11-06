@@ -754,6 +754,8 @@ impl Config {
                 "byte budgets must total at most 256 GiB",
             );
         }
+        // Sized for the largest page: the cluster page size is published after
+        // startup, so local limits must fit any page size it may choose.
         // Keep one page of acquisition progress beyond a full range window. The
         // ciphertext margin also fits one maximum unpadded storage record.
         // Plaintext covers only in-flight decrypts and pages held by range

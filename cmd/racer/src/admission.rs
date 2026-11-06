@@ -46,6 +46,8 @@ impl AdmissionPolicy {
         Self {
             rules: Rules::new(
                 limits,
+                // Floors are fixed before the cluster page size is published, so
+                // they guarantee progress at the largest page size.
                 racer_core::admission::Floors::for_page(
                     PAGE_BYTES as usize,
                     crate::store::MAX_HEADER_BYTES,
