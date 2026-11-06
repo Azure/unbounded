@@ -46,6 +46,7 @@ pub use links::PendingReceive;
 pub use links::SETUP_DEADLINE;
 pub use links::SetupAdmission;
 pub use links::SetupAttempt;
+pub use links::SetupOutcome;
 pub use links::buffer_count;
 pub use links::grants_per_link;
 pub use links::link_key;

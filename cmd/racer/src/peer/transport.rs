@@ -811,6 +811,7 @@ pub(crate) async fn link_exchange(
     let (epoch, ours) = links.open(peer, rail, scope).await?;
     // Abandons the attempt on error or if this future is dropped mid-exchange.
     let attempt = crate::rdma::SetupAttempt::new(links, peer, rail, epoch);
+    let declined = std::cell::Cell::new(false);
     let result = async {
         let signed = peer_wire::link::RdmaLink {
             setup: ours.clone(),
@@ -822,11 +823,20 @@ pub(crate) async fn link_exchange(
             .await?
             .connection;
         let received = io.receive_head(connection, scope).await?;
-        if !matches!(received.value.start, StartLine::Response { status: 200 }) {
+        match received.value.start {
+            StartLine::Response { status: 200 } => {}
             // 409: our offer lost the tie-break; the peer's offer replaces it.
-            // 403 (not an RDMA edge in the responder's membership), 429 and
-            // 503: try again after backoff.
-            return Err(Error::Unavailable);
+            // 429 (rate limit or overload) and 503 (no RDMA there yet): benign,
+            // retry after the minimum backoff without escalating.
+            StartLine::Response {
+                status: 409 | 429 | 503,
+            } => {
+                declined.set(true);
+                return Err(Error::Unavailable);
+            }
+            // 403 (not an RDMA edge in the responder's membership) and anything
+            // else: try again after the escalating backoff.
+            _ => return Err(Error::Unavailable),
         }
         let mut connection = received.connection;
         let (verified, _) = peer_wire::link::RdmaLink::verify(
@@ -853,9 +863,18 @@ pub(crate) async fn link_exchange(
         Ok(connection)
     }
     .await;
-    if result.is_ok() {
-        attempt.finish();
-    }
+    let outcome = match &result {
+        Ok(_) => {
+            attempt.finish();
+            crate::rdma::SetupOutcome::Success
+        }
+        Err(_) if declined.get() => {
+            attempt.decline();
+            crate::rdma::SetupOutcome::Declined
+        }
+        Err(_) => crate::rdma::SetupOutcome::Failed,
+    };
+    links.record_setup(outcome);
     result
 }
 
@@ -2164,7 +2183,7 @@ mod tests {
                 } else {
                     2
                 };
-            let (w, client, serve, local, peer) = link_setup(
+            let (mut w, client, serve, local, peer) = link_setup(
                 &env,
                 LinkSetupCase {
                     initiator,
@@ -2181,6 +2200,10 @@ mod tests {
                 w.a.links.state(&peer, RailId(7)),
                 rdma_verbs::LinkState::Backoff(_) | rdma_verbs::LinkState::Breaking
             ));
+            // A lost tie-break is benign: declined, not abandoned.
+            w.a.owner.poll_budgeted(8).unwrap();
+            assert_eq!(w.a.links.link_breaks(rdma_verbs::BreakReason::Declined), 1);
+            assert_eq!(w.a.links.link_breaks(rdma_verbs::BreakReason::Abandoned), 0);
             assert!(matches!(
                 w.b.links.state(&local, RailId(7)),
                 rdma_verbs::LinkState::Connecting(_)
@@ -2195,7 +2218,7 @@ mod tests {
         #[test]
         fn signed_link_setup_declines_without_rdma_or_across_sites() {
             let env = racer_io::Env::host();
-            let (w, client, serve, _, peer) = link_setup(
+            let (mut w, client, serve, _, peer) = link_setup(
                 &env,
                 LinkSetupCase {
                     initiator: 0,
@@ -2208,6 +2231,10 @@ mod tests {
             assert_eq!(client, Err(Error::Unavailable));
             serve.unwrap();
             assert!(w.a.links.ready(&peer, RailId(7)).is_none());
+            // 503 (no RDMA there) is benign: declined, not abandoned.
+            w.a.owner.poll_budgeted(8).unwrap();
+            assert_eq!(w.a.links.link_breaks(rdma_verbs::BreakReason::Declined), 1);
+            assert_eq!(w.a.links.link_breaks(rdma_verbs::BreakReason::Abandoned), 0);
             for sites in [["site1", "site2"], ["", ""]] {
                 let (w, client, serve, local, peer) = link_setup(
                     &env,
@@ -2265,7 +2292,7 @@ mod tests {
             let admitted = budget_membership(&signers, 8, crate::topology::RDMA_PEERS);
             assert!(crate::rdma::is_rdma_edge(&admitted, a, b));
             assert_eq!(link_refusal(Some(&refused), a, b, RailId(7)), Ok(Some(403)));
-            let (w, client, serve, local, peer) = link_setup(
+            let (mut w, client, serve, local, peer) = link_setup(
                 &env,
                 LinkSetupCase {
                     initiator: 0,
@@ -2283,6 +2310,10 @@ mod tests {
                 rdma_verbs::LinkState::Idle,
                 "refused offers never reach the owner"
             );
+            // 403 is not benign: the attempt is abandoned and backs off.
+            w.a.owner.poll_budgeted(8).unwrap();
+            assert_eq!(w.a.links.link_breaks(rdma_verbs::BreakReason::Abandoned), 1);
+            assert_eq!(w.a.links.link_breaks(rdma_verbs::BreakReason::Declined), 0);
             let (w, client, serve, local, peer) = link_setup(
                 &env,
                 LinkSetupCase {

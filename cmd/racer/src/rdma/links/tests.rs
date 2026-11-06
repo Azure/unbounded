@@ -734,7 +734,7 @@ mod send_failures {
 /// paging, no pool buffer is used, and the metrics count it.
 pub(crate) mod send_in_place {
     use super::*;
-    use crate::telemetry::{Event, Metrics};
+    use crate::telemetry::{Event, Gauge, Metrics};
 
     /// `w` with `metrics` attached to both nodes' links.
     pub(crate) fn metered(w: World) -> (World, Metrics, Metrics) {
@@ -883,6 +883,73 @@ pub(crate) mod send_in_place {
         let (w, ma, _) = metered(w);
         w.a.links.record_http_fallback();
         assert_eq!(ma.count(Event::RdmaHttpFallback), 1);
+    }
+
+    #[test]
+    /// Link breaks are published by reason, once each, and link states as
+    /// gauges; both show up on `/metrics`.
+    fn link_breaks_and_states_are_published() {
+        let w = world();
+        let (mut w, ma, _) = metered(w);
+        let env = w.env.clone();
+        let b = node_id(2);
+        let epoch = match drive!(w, w.a.links.open(&b, RAIL, &scope(&env))) {
+            Ok((epoch, _)) => epoch,
+            Err(error) => panic!("open: {error:?}"),
+        };
+        pump!(w);
+        w.a.links.sync_link_metrics();
+        assert_eq!(ma.gauge(Gauge::RdmaLinksConnecting), 1);
+        assert_eq!(ma.gauge(Gauge::RdmaLinksReady), 0);
+        w.a.links.abandon(&b, RAIL, epoch);
+        pump!(w);
+        w.a.links.sync_link_metrics();
+        w.a.links.sync_link_metrics();
+        assert_eq!(ma.count(Event::RdmaLinkBreakAbandoned), 1);
+        assert_eq!(ma.count(Event::RdmaLinkBreakError), 0);
+        assert_eq!(ma.gauge(Gauge::RdmaLinksConnecting), 0);
+        assert_eq!(
+            ma.gauge(Gauge::RdmaLinksBackoff) + ma.gauge(Gauge::RdmaLinksBreaking),
+            1
+        );
+        w.a.links.record_setup(SetupOutcome::Declined);
+        let mut out = String::new();
+        ma.write_prometheus(&mut out).unwrap();
+        for line in [
+            "racer_rdma_link_breaks_total{reason=\"abandoned\"} 1",
+            "racer_rdma_link_breaks_total{reason=\"grant_expired\"} 0",
+            "racer_rdma_link_setups_total{outcome=\"declined\"} 1",
+            "racer_rdma_links_ready 0",
+            "racer_rdma_links_backoff ",
+        ] {
+            assert!(out.contains(line), "missing {line}");
+        }
+        assert_eq!(
+            out.matches("# TYPE racer_rdma_link_breaks_total").count(),
+            1
+        );
+    }
+
+    #[test]
+    /// A declined setup retries after the minimum backoff, not an escalated one.
+    fn declined_setup_retries_after_the_minimum_backoff() {
+        let mut w = world();
+        let env = w.env.clone();
+        let b = node_id(2);
+        for _ in 0..3 {
+            let epoch = match drive!(w, w.a.links.open(&b, RAIL, &scope(&env))) {
+                Ok((epoch, _)) => epoch,
+                Err(error) => panic!("open: {error:?}"),
+            };
+            SetupAttempt::new(&w.a.links, &b, RAIL, epoch).decline();
+            pump!(w);
+            assert_eq!(LinkNode::lock(&w.a.links.node.setup).len(), 0);
+            w.clock.advance(rdma_verbs::BACKOFF_MIN * 12 / 10);
+            pump!(w);
+            assert!(w.a.links.wants(&b, RAIL), "retries without escalating");
+        }
+        assert_eq!(w.a.links.link_breaks(rdma_verbs::BreakReason::Declined), 3);
+        assert_eq!(w.a.links.link_breaks(rdma_verbs::BreakReason::Abandoned), 0);
     }
 
     #[test]

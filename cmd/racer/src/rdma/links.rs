@@ -268,6 +268,14 @@ impl<'a> SetupAttempt<'a> {
     pub fn finish(mut self) {
         self.done = true;
     }
+
+    /// The peer declined the setup for a benign reason (lost tie-break, rate
+    /// limit, overload): drop the attempt and retry soon, without the
+    /// escalating backoff of a failure.
+    pub fn decline(mut self) {
+        self.done = true;
+        self.links.decline(self.peer, self.rail, self.epoch);
+    }
 }
 
 impl Drop for SetupAttempt<'_> {
@@ -279,6 +287,19 @@ impl Drop for SetupAttempt<'_> {
 }
 
 pub use super::setup::SetupAdmission;
+
+/// How a link setup this node initiated ended, for metrics.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SetupOutcome {
+    /// The link connected.
+    Success,
+
+    /// The peer refused for a benign reason (`409`, `429`, `503`).
+    Declined,
+
+    /// Anything else, including `403`.
+    Failed,
+}
 
 /// Per-worker facade over the node owner.
 pub struct Links {
@@ -295,6 +316,10 @@ pub struct Links {
     tasks: RefCell<Vec<Operation<'static, ()>>>,
 
     draining: Cell<bool>,
+
+    /// Owner break counters last recorded, by [`rdma_verbs::BreakReason`]
+    /// index, so [`Self::sync_link_metrics`] records only the growth.
+    breaks_seen: Cell<[u64; rdma_verbs::BreakReason::ALL.len()]>,
 
     /// Transfer counters, so benchmarks can tell which path pages took.
     metrics: Option<crate::telemetry::Metrics>,
@@ -324,6 +349,7 @@ impl Links {
             retry: reactor.map_or_else(NativeRetry::unattached, NativeRetry::new),
             tasks: RefCell::new(Vec::new()),
             draining: Cell::new(false),
+            breaks_seen: Cell::new([0; rdma_verbs::BreakReason::ALL.len()]),
             metrics: None,
             ctx,
         }
@@ -357,6 +383,63 @@ impl Links {
     /// Count a peer transfer that planned RDMA but carried its page over HTTP.
     pub fn record_http_fallback(&self) {
         self.record(crate::telemetry::Event::RdmaHttpFallback, 1);
+    }
+
+    /// Count one link setup this node initiated, by outcome.
+    pub fn record_setup(&self, outcome: SetupOutcome) {
+        self.record(
+            match outcome {
+                SetupOutcome::Success => crate::telemetry::Event::RdmaLinkSetupSuccess,
+                SetupOutcome::Declined => crate::telemetry::Event::RdmaLinkSetupDeclined,
+                SetupOutcome::Failed => crate::telemetry::Event::RdmaLinkSetupFailed,
+            },
+            1,
+        );
+    }
+
+    /// The owner's count of link breaks for `reason` since the node started.
+    pub fn link_breaks(&self, reason: rdma_verbs::BreakReason) -> u64 {
+        self.client.link_breaks(reason)
+    }
+
+    /// Publish the owner's link break counters and link state counts. Call
+    /// from one worker only (the native owner), since the break counters
+    /// are node-wide.
+    pub fn sync_link_metrics(&self) {
+        use crate::telemetry::{Event, Gauge};
+        use rdma_verbs::BreakReason;
+        let Some(metrics) = &self.metrics else {
+            return;
+        };
+        let mut seen = self.breaks_seen.get();
+        for (index, reason) in BreakReason::ALL.into_iter().enumerate() {
+            let now = self.client.link_breaks(reason);
+            let grown = now.saturating_sub(seen[index]);
+            seen[index] = now;
+            if grown == 0 {
+                continue;
+            }
+            let event = match reason {
+                BreakReason::Error => Event::RdmaLinkBreakError,
+                BreakReason::Timeout => Event::RdmaLinkBreakTimeout,
+                BreakReason::PeerClosed => Event::RdmaLinkBreakPeerClosed,
+                BreakReason::Closed => Event::RdmaLinkBreakClosed,
+                BreakReason::Abandoned => Event::RdmaLinkBreakAbandoned,
+                BreakReason::Declined => Event::RdmaLinkBreakDeclined,
+                BreakReason::GrantExpired => Event::RdmaLinkBreakGrantExpired,
+            };
+            metrics.record(event, grown);
+        }
+        self.breaks_seen.set(seen);
+        let counts = self.client.link_counts();
+        for (gauge, value) in [
+            (Gauge::RdmaLinksReady, counts.ready),
+            (Gauge::RdmaLinksConnecting, counts.connecting),
+            (Gauge::RdmaLinksBackoff, counts.backoff),
+            (Gauge::RdmaLinksBreaking, counts.breaking),
+        ] {
+            metrics.set_gauge(gauge, value as u64);
+        }
     }
 
     /// As [`Self::record_http_fallback`], because no ready link to the peer existed.
@@ -794,6 +877,14 @@ impl Links {
     pub fn abandon(&self, peer: &NodeId, rail: RailId, epoch: Epoch) {
         let key = link_key(peer, rail);
         self.client.break_link(key, epoch);
+        self.finish_initiating(key, epoch);
+    }
+
+    /// Initiator: the peer declined the setup on `epoch` for a benign reason.
+    /// Like [`Self::abandon`], but the key retries after the minimum backoff.
+    pub fn decline(&self, peer: &NodeId, rail: RailId, epoch: Epoch) {
+        let key = link_key(peer, rail);
+        self.client.decline_link(key, epoch);
         self.finish_initiating(key, epoch);
     }
 

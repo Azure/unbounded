@@ -270,6 +270,7 @@ impl WorkerApplication {
                 crate::telemetry::Gauge::RdmaFreeBuffers,
                 links.free_buffers() as u64,
             );
+            links.sync_link_metrics();
         }
         // The GPU helper started lazily after these rails activated: attach
         // its landing buffers to them now. Only the owner registers memory.

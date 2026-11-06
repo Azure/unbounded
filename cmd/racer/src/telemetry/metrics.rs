@@ -332,6 +332,16 @@ metrics! { Event, EVENTS, EVENT_COUNT;
             Self::RdmaFallbackGrant => "racer_rdma_fallback_grant_total",
             Self::RdmaFallbackOverflow => "racer_rdma_fallback_overflow_total",
             Self::RdmaActivationFailure => "racer_rdma_activation_failures_total",
+            Self::RdmaLinkBreakError => "racer_rdma_link_breaks_total" { "reason=\"error\"" },
+            Self::RdmaLinkBreakTimeout => "racer_rdma_link_breaks_total" { "reason=\"timeout\"" },
+            Self::RdmaLinkBreakPeerClosed => "racer_rdma_link_breaks_total" { "reason=\"peer_closed\"" },
+            Self::RdmaLinkBreakClosed => "racer_rdma_link_breaks_total" { "reason=\"closed\"" },
+            Self::RdmaLinkBreakAbandoned => "racer_rdma_link_breaks_total" { "reason=\"abandoned\"" },
+            Self::RdmaLinkBreakDeclined => "racer_rdma_link_breaks_total" { "reason=\"declined\"" },
+            Self::RdmaLinkBreakGrantExpired => "racer_rdma_link_breaks_total" { "reason=\"grant_expired\"" },
+            Self::RdmaLinkSetupSuccess => "racer_rdma_link_setups_total" { "outcome=\"success\"" },
+            Self::RdmaLinkSetupDeclined => "racer_rdma_link_setups_total" { "outcome=\"declined\"" },
+            Self::RdmaLinkSetupFailed => "racer_rdma_link_setups_total" { "outcome=\"failed\"" },
             Self::RdmaGrantCount => "racer_rdma_grant_nanoseconds_count",
             Self::RdmaGrantNs => "racer_rdma_grant_nanoseconds_sum",
             Self::RdmaHeadCount => "racer_rdma_head_nanoseconds_count",
@@ -423,6 +433,10 @@ metrics! { Gauge, GAUGES, GAUGE_COUNT;
             Self::MemoryPressureLevel => "racer_memory_pressure_level",
             Self::RdmaFreeBuffers => "racer_rdma_free_buffers",
             Self::RdmaActive => "racer_rdma_active",
+            Self::RdmaLinksReady => "racer_rdma_links_ready",
+            Self::RdmaLinksConnecting => "racer_rdma_links_connecting",
+            Self::RdmaLinksBackoff => "racer_rdma_links_backoff",
+            Self::RdmaLinksBreaking => "racer_rdma_links_breaking",
 }
 /// One nonempty intermediate HTTP relay_body call, after sending its response head.
 /// Success credits the entire ciphertext body only after both HTTP finish checks.
@@ -1897,6 +1911,8 @@ mod tests {
                 .filter(|line| {
                     line.contains('{')
                         && !line.starts_with("racer_gpu_read_requests_total{")
+                        && !line.starts_with("racer_rdma_link_breaks_total{")
+                        && !line.starts_with("racer_rdma_link_setups_total{")
                         && !line.starts_with("racer_prefetch_")
                 })
                 .collect();
