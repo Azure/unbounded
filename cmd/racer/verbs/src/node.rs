@@ -267,6 +267,11 @@ struct NodeShared {
     /// Device pools by rail and pool id, once attached.
     device_pools: RwLock<BTreeMap<(u16, u32), Arc<PoolShared>>>,
 
+    /// Write source prefetch by rail, for window-mode devices. The owner
+    /// withdraws an entry under the write lock before dropping its implicit
+    /// region, and [`Client::prefetch`] holds the read lock across the call.
+    prefetch: RwLock<BTreeMap<u16, ffi::Prefetcher>>,
+
     /// Breaks that did not fit in a command queue.
     breaks: Mutex<Vec<(LinkKey, Epoch)>>,
 
@@ -294,6 +299,7 @@ pub fn node(workers: usize) -> Result<(Vec<Client>, OwnerPort)> {
         links: Snapshot::new(),
         pools: RwLock::new(BTreeMap::new()),
         device_pools: RwLock::new(BTreeMap::new()),
+        prefetch: RwLock::new(BTreeMap::new()),
         breaks: Mutex::new(Vec::new()),
         retain: Mutex::new(None),
         closed: AtomicBool::new(false),
@@ -526,6 +532,32 @@ impl Client {
             deadline,
             done,
         })
+    }
+
+    /// Sender: map `bytes` into `rail`'s NIC page tables before writing
+    /// them, so the write does not stall the queue pair on NIC page faults
+    /// (window mode reads sources through implicit on-demand paging).
+    ///
+    /// Runs on the calling thread and blocks until the kernel has mapped
+    /// the range, so the cost lands on the caller rather than the owner.
+    /// Only advice: it never changes what a write reads.
+    ///
+    /// `Ok(false)` if `rail` has nothing to prefetch into (registration
+    /// mode, or not activated); `Ok(true)` once mapped. Fails `Unavailable`
+    /// if the provider cannot prefetch, and `Io` or `InvalidRange` if the
+    /// kernel refused the range; the write may then take NIC page faults.
+    pub fn prefetch(&self, rail: u16, bytes: &[u8]) -> Result<bool> {
+        let prefetch = self
+            .shared
+            .prefetch
+            .read()
+            .unwrap_or_else(PoisonError::into_inner);
+        let Some(prefetcher) = prefetch.get(&rail) else {
+            return Ok(false);
+        };
+        // SAFETY: the owner withdraws the entry under the write lock before
+        // it drops the region, and this read lock is held across the call.
+        unsafe { prefetcher.run(bytes) }.map(|()| true)
     }
 
     /// Sender: decline the peer's grant `tag`. Resolves on the send
@@ -1260,6 +1292,21 @@ impl Owner {
             );
         }
 
+        {
+            let mut prefetch = self
+                .shared
+                .prefetch
+                .write()
+                .unwrap_or_else(PoisonError::into_inner);
+            prefetch.clear();
+            prefetch.extend(
+                built
+                    .iter()
+                    .filter(|(_, d)| d.device.mode == ffi::Mode::Window)
+                    .filter_map(|(rail, d)| Some((*rail, d.pool.implicit().prefetcher()?))),
+            );
+        }
+
         self.devices = built;
         self.settings = Some(settings);
         Ok(())
@@ -1707,6 +1754,12 @@ impl Owner {
             .write()
             .unwrap_or_else(PoisonError::into_inner)
             .clear();
+        // Before any implicit region can drop.
+        self.shared
+            .prefetch
+            .write()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clear();
 
         if self.devices.values().any(|d| !d.pool.idle()) {
             return;
@@ -1805,6 +1858,12 @@ impl Drop for Owner {
             .clear();
         self.shared
             .device_pools
+            .write()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clear();
+        // Before any implicit region can drop.
+        self.shared
+            .prefetch
             .write()
             .unwrap_or_else(PoisonError::into_inner)
             .clear();

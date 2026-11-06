@@ -39,7 +39,10 @@
 //!
 //! - Window mode (devices with memory windows, such as mlx5): each device
 //!   gets one implicit on-demand paging (ODP) MR over the whole address
-//!   space, and writes use it as their SGE. Activation fails with
+//!   space, and writes use it as their SGE. A source the NIC has not mapped
+//!   yet takes NIC page faults that stall its queue pair, so senders call
+//!   [`Client::prefetch`] first, on their own thread, to map it in one
+//!   kernel call. Activation fails with
 //!   [`Error::Unavailable`] if a selected device lacks implicit ODP, and
 //!   releases everything it built.
 //! - Registration mode (devices without memory windows or ODP, such as Azure

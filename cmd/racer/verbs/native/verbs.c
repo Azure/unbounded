@@ -142,8 +142,8 @@ struct rdma_verbs_mr {
  * Version 5 added rdma_verbs_register_dmabuf. Version 6 added registration
  * mode in C. Version 7 moved registration mode, the connection manager state
  * machine, and the work request ledger to Rust; this file now only wraps
- * verbs and librdmacm calls. */
-uint32_t rdma_verbs_abi(void) { return 7; }
+ * verbs and librdmacm calls. Version 8 added rdma_verbs_prefetch. */
+uint32_t rdma_verbs_abi(void) { return 8; }
 
 /* Distinct from negative errno: cleanup leaked a resource. Rust must keep
  * the admission owner and adapter loaded. Stop before another resource leaks. */
@@ -519,6 +519,17 @@ void *rdma_verbs_register_implicit(struct rdma_verbs_device *d) {
     if (!m->mr) { free(m); return NULL; }
     m->bytes = NULL; m->length = SIZE_MAX;
     return m;
+}
+/* Fault [addr, addr + length) into the NIC's page tables for the implicit
+ * ODP region `m` and wait (IBV_ADVISE_MR_FLAG_FLUSH) until it is mapped, so a
+ * write posted from it next does not take NIC page faults. Thread safe: it
+ * only reads `m`, which must stay registered until it returns. Returns 0 or
+ * a positive errno (EOPNOTSUPP if the provider has no prefetch). */
+int rdma_verbs_prefetch(struct rdma_verbs_mr *m, uint64_t addr, uint32_t length) {
+    if (!m || !m->mr || !length) return EINVAL;
+    struct ibv_sge sge = { .addr = addr, .length = length, .lkey = m->mr->lkey };
+    return ibv_advise_mr(m->mr->pd, IBV_ADVISE_MR_ADVICE_PREFETCH, IBV_ADVISE_MR_FLAG_FLUSH,
+                         &sge, 1);
 }
 /* The buffer behind a registered region. NULL for an implicit or dma-buf region. */
 void *rdma_verbs_bytes(struct rdma_verbs_mr *m) { return m->bytes; }

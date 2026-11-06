@@ -791,6 +791,7 @@ pub(super) fn api() -> Rc<Api> {
         qp_free,
         register,
         register_implicit,
+        prefetch,
         register_dmabuf,
         deregister,
         bytes,
@@ -2054,6 +2055,28 @@ unsafe extern "C" fn register(device: *mut c_void, length: u64, access: u32) -> 
         .borrow_mut()
         .record(Operation::Register, h.id, None, 0, false);
     raw
+}
+
+/// Ranges passed to [`prefetch`], from any thread, as `(address, length)`.
+static PREFETCHED: std::sync::Mutex<Vec<(u64, u32)>> = std::sync::Mutex::new(Vec::new());
+
+/// Prefetch into an implicit region. Callable from any thread, so it never
+/// touches the thread-local world: it only logs the range for
+/// [`prefetched`]. The simulated NIC never faults.
+unsafe extern "C" fn prefetch(_: *mut c_void, address: u64, length: u32) -> c_int {
+    PREFETCHED
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .push((address, length));
+    0
+}
+
+/// True if a prefetch of exactly `[address, address + length)` was logged.
+pub fn prefetched(address: u64, length: u32) -> bool {
+    PREFETCHED
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .contains(&(address, length))
 }
 
 /// Register an implicit on-demand paging region. Rust checks the device's

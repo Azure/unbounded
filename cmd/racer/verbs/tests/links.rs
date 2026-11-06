@@ -280,6 +280,44 @@ fn pages_flow_both_ways_over_one_link() {
 }
 
 #[test]
+/// Window mode prefetches write sources into the rail's implicit region from
+/// any thread; registration mode, unknown rails, and closed nodes have
+/// nothing to prefetch into. Prefetch is advice only: the write still delivers.
+fn prefetch_maps_sources_on_window_rails_only() {
+    profiles(|| {
+        let mut w = world();
+        let (ea, eb) = link_up(&mut w);
+        let source: Arc<Vec<u8>> = Arc::new(vec![5; 64]);
+        let window = current_profile() == Profile::Window;
+        let client = &w.a.clients[1];
+        let prefetched = std::thread::scope(|s| {
+            s.spawn(|| client.prefetch(TO_B.rail, &source))
+                .join()
+                .unwrap()
+        });
+        let (address, length) = (source.as_ptr() as u64, source.len() as u32);
+        assert_eq!(prefetched, Ok(window));
+        // Only window mode logs: an earlier run may reuse the address.
+        assert!(!window || rdma_verbs::simulation::prefetched(address, length));
+        assert_eq!(w.a.clients[0].prefetch(TO_B.rail + 1, &source), Ok(false));
+        assert_eq!(w.a.clients[0].prefetch(TO_B.rail, &[]), Ok(window));
+
+        let deadline = w.now() + 5 * SECOND;
+        let granted = w.b.clients[0].grant(TO_A, eb, [4; 16], 64, deadline);
+        let granted = wait(&mut w, &granted).unwrap();
+        let written = w.a.clients[0].write(TO_B, ea, granted.tag, Source::new(source), deadline);
+        assert_eq!(wait(&mut w, &written), Ok(()));
+        assert_eq!(page(ready(&granted.arrival)).bytes(), [5; 64]);
+
+        // Teardown withdraws the handle before the implicit region drops.
+        w.a.clients[0].close();
+        pump(&mut w);
+        assert_eq!(w.a.clients[0].prefetch(TO_B.rail, &[1]), Ok(false));
+        shutdown(w);
+    });
+}
+
+#[test]
 /// A device without implicit on-demand paging cannot send in place, and
 /// there is no copy path: activation fails, frees every native object, and
 /// returns the charge. Once the device supports it, activation succeeds.

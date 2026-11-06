@@ -237,7 +237,7 @@ const WC_IMM: u32 = 1;
 
 /// Native adapter ABI version this crate speaks.
 #[cfg(any(test, all(feature = "native", target_os = "linux")))]
-const ABI_VERSION: u32 = 7;
+const ABI_VERSION: u32 = 8;
 
 /// Completions one [`NativeQueuePair::progress_with`] call reads. A full
 /// batch means more may be waiting without a new channel event.
@@ -427,6 +427,8 @@ native_api! {
     register: unsafe extern "C" fn(*mut c_void, u64, u32) -> *mut c_void,
 
     register_implicit: unsafe extern "C" fn(*mut c_void) -> *mut c_void,
+
+    prefetch: unsafe extern "C" fn(*mut c_void, u64, u32) -> c_int,
 
     register_dmabuf: unsafe extern "C" fn(*mut c_void, u64, u64, u64, c_int) -> *mut c_void,
 
@@ -1030,6 +1032,22 @@ impl NativeRegion {
         }))
     }
 
+    /// A thread-safe handle that faults source memory into this implicit
+    /// region's NIC page tables ahead of a write. `None` unless implicit.
+    ///
+    /// The handle does not keep the region alive: whoever shares it must
+    /// withdraw every copy before dropping the region (see
+    /// [`Prefetcher::run`]).
+    pub(crate) fn prefetcher(&self) -> Option<Prefetcher> {
+        if !self.is_implicit() {
+            return None;
+        }
+        Some(Prefetcher {
+            call: self.device.api.prefetch,
+            raw: self.raw?.as_ptr() as usize,
+        })
+    }
+
     /// True for an address-space region from [`Self::implicit`].
     pub(crate) fn is_implicit(&self) -> bool {
         self.access == Access::IMPLICIT
@@ -1091,6 +1109,43 @@ impl NativeRegion {
             addr,
             length,
             lkey: self.lkey,
+        }
+    }
+}
+
+/// Faults caller memory into one device's implicit on-demand paging region
+/// from any thread. See [`NativeRegion::prefetcher`].
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct Prefetcher {
+    call: unsafe extern "C" fn(*mut c_void, u64, u32) -> c_int,
+
+    /// The implicit region's native handle.
+    raw: usize,
+}
+
+impl Prefetcher {
+    /// Map `bytes` in the NIC's page tables and wait until done, so a write
+    /// posted from them does not stall on NIC page faults. Prefetching is
+    /// only advice: it never changes what a write reads, and a failure only
+    /// means the write may fault.
+    ///
+    /// # Safety
+    ///
+    /// The implicit region must stay registered until this returns. The
+    /// owner guarantees it by withdrawing the handle under a lock that the
+    /// caller holds across the call.
+    pub(crate) unsafe fn run(&self, bytes: &[u8]) -> Result<()> {
+        if bytes.is_empty() {
+            return Ok(());
+        }
+        let length = u32::try_from(bytes.len()).map_err(|_| Error::InvalidRange)?;
+        // SAFETY: the caller keeps the region registered; the C side only
+        // reads its handle and passes the range to the kernel as advice.
+        match unsafe { (self.call)(self.raw as *mut c_void, bytes.as_ptr() as u64, length) } {
+            0 => Ok(()),
+            libc::EOPNOTSUPP | libc::ENOSYS => Err(Error::Unavailable),
+            libc::EINVAL => Err(Error::InvalidRange),
+            _ => Err(Error::Io),
         }
     }
 }
@@ -2408,6 +2463,35 @@ mod tests {
 }
 
 #[cfg(test)]
+mod prefetch_tests {
+    use super::*;
+
+    /// Fails with the errno encoded in the low byte of `length`.
+    unsafe extern "C" fn advise(_: *mut c_void, _: u64, length: u32) -> c_int {
+        (length & 0xff) as c_int
+    }
+
+    #[test]
+    /// Native results map to crate errors; empty ranges never reach C.
+    fn prefetch_maps_native_results() {
+        let p = Prefetcher {
+            call: advise,
+            raw: 1,
+        };
+        let run = |len: usize| unsafe { p.run(&vec![0; len]) };
+        assert_eq!(unsafe { p.run(&[]) }, Ok(()));
+        assert_eq!(run(0x100), Ok(()));
+        assert_eq!(
+            run(0x100 + libc::EOPNOTSUPP as usize),
+            Err(Error::Unavailable)
+        );
+        assert_eq!(run(0x100 + libc::ENOSYS as usize), Err(Error::Unavailable));
+        assert_eq!(run(0x100 + libc::EINVAL as usize), Err(Error::InvalidRange));
+        assert_eq!(run(0x100 + libc::EFAULT as usize), Err(Error::Io));
+    }
+}
+
+#[cfg(test)]
 pub(crate) mod lifetime_tests {
     //! FFI fault injection exercises production ownership, ABI, and quarantine safety.
     use super::*;
@@ -2515,6 +2599,11 @@ pub(crate) mod lifetime_tests {
     /// The fixture device has no implicit ODP.
     unsafe extern "C" fn register_implicit(_: *mut c_void) -> *mut c_void {
         std::ptr::null_mut()
+    }
+
+    /// Nothing to prefetch without implicit ODP.
+    unsafe extern "C" fn prefetch(_: *mut c_void, _: u64, _: u32) -> c_int {
+        libc::EOPNOTSUPP
     }
 
     /// The fixture device has no dma-buf support.
@@ -2794,6 +2883,7 @@ pub(crate) mod lifetime_tests {
             qp_free,
             register,
             register_implicit,
+            prefetch,
             register_dmabuf,
             deregister,
             bytes,
