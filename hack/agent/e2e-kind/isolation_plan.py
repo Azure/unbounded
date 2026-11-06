@@ -102,7 +102,8 @@ CATALOG: tuple[Scenario, ...] = (
         "X01", "none: all operations", "operations", "isolation-operations", "none",
         f"The isolation-operations suite with --isolation none: {OPERATIONS_TEXT}.",
         "containerd and kubelet run as agent-owned host units, no nspawn machine exists, NodeReboot leaves the host "
-        "boot ID unchanged, repave and upgrade flip the version link.",
+        "boot ID unchanged, repave and upgrade flip the version link, and after a configuration-only repave every "
+        "pod that is not host-network has an IP in the new Node's pod CIDR.",
         tags=("none",),
     ),
     Scenario(

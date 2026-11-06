@@ -77,6 +77,7 @@ import datetime
 import functools
 import hashlib
 import http.client
+import ipaddress
 import json
 import os
 import re
@@ -6284,10 +6285,93 @@ def ensure_machine_configuration_for_repave(
     kubectl(["apply", "-f", "-"], input=json.dumps(manifest).encode())
 
 
+# The node label a repave configuration carries to tell its versions apart.
+CONFIG_VERSION_LABEL = "e2e.unbounded-cloud.io/config-version"
+
+
+def publish_repave_configuration(node_config: NodeConfig, current_kubelet_version: str, config_version: str,
+                                 kubernetes_version: str = "") -> tuple[int, str]:
+    """Publish a new version of the Machine's MachineConfiguration, with node
+    label CONFIG_VERSION_LABEL=*config_version* and, when given,
+    *kubernetes_version*, and return the number and name of the
+    MachineConfigurationVersion it produced. Without *kubernetes_version* the
+    version stays, so the repave changes configuration only. Assigning it and
+    deleting the Node is up to the caller."""
+    config_name = MACHINE_CONFIG_NAME
+    ensure_machine_configuration_for_repave(config_name, current_kubelet_version, node_config)
+    manifest = json.loads(kubectl_capture(["get", "machineconfiguration", config_name, "-o", "json"]))
+    metadata = manifest.setdefault("metadata", {})
+    for key in ["creationTimestamp", "generation", "resourceVersion", "uid", "managedFields"]:
+        metadata.pop(key, None)
+    manifest.pop("status", None)
+    kubernetes_template = manifest.setdefault("spec", {}).setdefault(
+        "template", {},
+    ).setdefault("kubernetes", {})
+    if kubernetes_version:
+        kubernetes_template["version"] = kubernetes_version
+    kubernetes_template["nodeLabels"] = {
+        **expected_node_labels(node_config),
+        CONFIG_VERSION_LABEL: config_version,
+    }
+    kubectl(["apply", "-f", "-"], input=json.dumps(manifest).encode())
+    wanted = (kubernetes_template.get("version"), config_version)
+
+    timeout_secs = 120
+    elapsed = 0
+    while elapsed < timeout_secs:
+        result = subprocess.run(
+            [KUBECTL, "get", "machineconfigurationversion",
+             "-l", f"unbounded-cloud.io/machine-configuration={config_name}", "-o", "json"],
+            capture_output=True, text=True,
+        )
+        if result.returncode == 0:
+            mcvs = json.loads(result.stdout).get("items", [])
+            matching_mcvs = []
+            for mcv in mcvs:
+                kubernetes = mcv.get("spec", {}).get("template", {}).get("kubernetes", {})
+                if (kubernetes.get("version"), (kubernetes.get("nodeLabels") or {}).get(CONFIG_VERSION_LABEL)) == wanted:
+                    matching_mcvs.append(mcv)
+            if matching_mcvs:
+                latest = max(matching_mcvs, key=lambda mcv: mcv.get("spec", {}).get("version", 0))
+                number = latest.get("spec", {}).get("version", 0)
+                name = latest.get("metadata", {}).get("name", "")
+                if number == 0 or not name:
+                    die("Resolved target MachineConfigurationVersion was empty")
+                log(f"MachineConfigurationVersion '{name}' is ready")
+                return number, name
+        if elapsed > 0 and elapsed % 30 == 0:
+            log(f"  ({elapsed}s) waiting for an MCV with Kubernetes {wanted[0]} and {CONFIG_VERSION_LABEL}={config_version}...")
+        time.sleep(5)
+        elapsed += 5
+
+    print_controller_logs(UNBOUNDED_NS, "app=machina-controller")
+    die(f"No MachineConfigurationVersion reached Kubernetes {wanted[0]} and {CONFIG_VERSION_LABEL}={config_version} "
+        f"after {timeout_secs}s")
+    raise AssertionError("unreachable")
+
+
+def assign_repave_configuration(number: int, name: str) -> None:
+    """Assign the Machine to MachineConfigurationVersion *name*, number *number*."""
+    log(f"Assigning Machine '{AGENT_MACHINE_NAME}' to {name}...")
+    run([KUBECTL_UNBOUNDED, "machine", "config", "assign", AGENT_MACHINE_NAME,
+         "--config", MACHINE_CONFIG_NAME, "--version", str(number)])
+
+
+def repave_with_config_change(node_config: NodeConfig, purpose: str) -> None:
+    """Publish and assign a configuration that only changes a node label, so
+    the repave changes no binaries, and delete the Node to start the repave.
+    Waiting for the node to come back is up to the caller."""
+    current = node_kubelet_version(AGENT_MACHINE_NAME)
+    if not current:
+        die(f"Node '{AGENT_MACHINE_NAME}' did not report a kubelet version")
+    number, name = publish_repave_configuration(node_config, current, f"{purpose}-{int(time.time())}")
+    assign_repave_configuration(number, name)
+    log(f"Deleting Node '{AGENT_MACHINE_NAME}' to trigger a configuration-only repave ({purpose})...")
+    kubectl(["delete", "node", AGENT_MACHINE_NAME])
+
+
 def validate_node_repave_upgrade(node_config: NodeConfig) -> None:
     """Validate OnDelete repave applies a new MCV Kubernetes version."""
-
-    config_name = MACHINE_CONFIG_NAME
 
     current_kubelet_version = node_kubelet_version(AGENT_MACHINE_NAME)
     if not current_kubelet_version:
@@ -6298,55 +6382,8 @@ def validate_node_repave_upgrade(node_config: NodeConfig) -> None:
     log(f"Current kubelet version: {current_kubelet_version}")
     log(f"Target kubelet version: {target_kubelet_version}")
 
-    ensure_machine_configuration_for_repave(config_name, current_kubelet_version, node_config)
-    manifest = json.loads(kubectl_capture(["get", "machineconfiguration", config_name, "-o", "json"]))
-    metadata = manifest.setdefault("metadata", {})
-    for key in ["creationTimestamp", "generation", "resourceVersion", "uid", "managedFields"]:
-        metadata.pop(key, None)
-    manifest.pop("status", None)
-    kubernetes_template = manifest.setdefault("spec", {}).setdefault(
-        "template", {},
-    ).setdefault("kubernetes", {})
-    kubernetes_template["version"] = target_kubelet_version
-    kubernetes_template["nodeLabels"] = {
-        **expected_node_labels(node_config),
-        "e2e.unbounded-cloud.io/config-version": "v3",
-    }
-    kubectl(["apply", "-f", "-"], input=json.dumps(manifest).encode())
-
-    timeout_secs = 120
-    elapsed = 0
-    target_version_number = 0
-    target_mcv = ""
-    while elapsed < timeout_secs:
-        result = subprocess.run(
-            [KUBECTL, "get", "machineconfigurationversion",
-             "-l", f"unbounded-cloud.io/machine-configuration={config_name}", "-o", "json"],
-            capture_output=True, text=True,
-        )
-        if result.returncode == 0:
-            mcvs = json.loads(result.stdout).get("items", [])
-            matching_mcvs = [
-                mcv for mcv in mcvs
-                if mcv.get("spec", {}).get("template", {}).get("kubernetes", {}).get("version")
-                == target_kubelet_version
-            ]
-            if matching_mcvs:
-                latest = max(matching_mcvs, key=lambda mcv: mcv.get("spec", {}).get("version", 0))
-                target_version_number = latest.get("spec", {}).get("version", 0)
-                target_mcv = latest.get("metadata", {}).get("name", "")
-                log(f"MachineConfigurationVersion '{target_mcv}' is ready")
-                break
-        if elapsed > 0 and elapsed % 30 == 0:
-            log(f"  ({elapsed}s) waiting for MCV with Kubernetes {target_kubelet_version}...")
-        time.sleep(5)
-        elapsed += 5
-    else:
-        print_controller_logs(UNBOUNDED_NS, "app=machina-controller")
-        die(f"No MachineConfigurationVersion reached Kubernetes {target_kubelet_version} after {timeout_secs}s")
-
-    if target_version_number == 0 or not target_mcv:
-        die("Resolved target MachineConfigurationVersion was empty")
+    target_version_number, target_mcv = publish_repave_configuration(
+        node_config, current_kubelet_version, "v3", kubernetes_version=target_kubelet_version)
 
     if isolation_mode() == "nspawn":
         old_nspawn = active_nspawn_machine()
@@ -6354,9 +6391,7 @@ def validate_node_repave_upgrade(node_config: NodeConfig) -> None:
     else:
         old_marker = isolation_node_marker()
 
-    log(f"Assigning Machine '{AGENT_MACHINE_NAME}' to {target_mcv}...")
-    run([KUBECTL_UNBOUNDED, "machine", "config", "assign", AGENT_MACHINE_NAME,
-         "--config", config_name, "--version", str(target_version_number)])
+    assign_repave_configuration(target_version_number, target_mcv)
 
     log(f"Deleting Node '{AGENT_MACHINE_NAME}' to trigger OnDelete repave...")
     kubectl(["delete", "node", AGENT_MACHINE_NAME])
@@ -6397,6 +6432,110 @@ def validate_node_repave_upgrade(node_config: NodeConfig) -> None:
     log("============================================")
     kubectl(["get", "machine", AGENT_MACHINE_NAME, "-o", "wide"])
     kubectl(["get", "node", AGENT_MACHINE_NAME, "-o", "wide"])
+
+# A DaemonSet whose pod is not host-network, pinned to the agent node.
+POD_CIDR_DAEMONSET = "e2e-pod-cidr"
+
+
+def node_pod_cidrs(node: dict[str, Any]) -> list[str]:
+    """Return the pod CIDRs a Node object was assigned."""
+    spec = node.get("spec", {})
+    return spec.get("podCIDRs") or ([spec["podCIDR"]] if spec.get("podCIDR") else [])
+
+
+def pod_ips_outside_cidrs(pods: list[dict[str, Any]], cidrs: list[str]) -> list[str]:
+    """Return "<namespace>/<name> <ip>" for every IP of a running pod in *pods*
+    that is not host-network, is not being deleted and lies in none of *cidrs*."""
+    networks = [ipaddress.ip_network(cidr, strict=False) for cidr in cidrs]
+    outside = []
+    for pod in pods:
+        metadata, spec, status = pod.get("metadata", {}), pod.get("spec", {}), pod.get("status", {})
+        if spec.get("hostNetwork") or metadata.get("deletionTimestamp") or status.get("phase") != "Running":
+            continue
+        ips = [entry.get("ip", "") for entry in status.get("podIPs") or []]
+        if not ips and status.get("podIP"):
+            ips = [status["podIP"]]
+        for ip in filter(None, ips):
+            if not any(ipaddress.ip_address(ip) in network for network in networks):
+                outside.append(f"{metadata.get('namespace', '')}/{metadata.get('name', '')} {ip}")
+    return outside
+
+
+def pod_cidr_daemonset() -> dict[str, Any]:
+    """Return the DaemonSet validate_none_repave_pod_cidr runs on the agent node."""
+    return {
+        "apiVersion": "apps/v1",
+        "kind": "DaemonSet",
+        "metadata": {"name": POD_CIDR_DAEMONSET, "namespace": TEST_NS},
+        "spec": {
+            "selector": {"matchLabels": {"app": POD_CIDR_DAEMONSET}},
+            "template": {
+                "metadata": {"labels": {"app": POD_CIDR_DAEMONSET}},
+                "spec": {
+                    "affinity": {"nodeAffinity": {"requiredDuringSchedulingIgnoredDuringExecution": {
+                        "nodeSelectorTerms": [{"matchFields": [
+                            {"key": "metadata.name", "operator": "In", "values": [AGENT_MACHINE_NAME]},
+                        ]}],
+                    }}},
+                    "tolerations": [{"operator": "Exists"}],
+                    "terminationGracePeriodSeconds": 1,
+                    "containers": [{"name": "sleep", "image": E2E_WORKLOAD_IMAGE, "command": ["sleep", "infinity"]}],
+                },
+            },
+        },
+    }
+
+
+def agent_node_pods() -> list[dict[str, Any]]:
+    """Return every pod bound to the agent node, in every namespace."""
+    return json.loads(kubectl_capture(["get", "pods", "-A", "--field-selector", f"spec.nodeName={AGENT_MACHINE_NAME}",
+                                       "-o", "json"])).get("items", [])
+
+
+def _pod_cidr_daemonset_problem() -> str:
+    """Return "" once the DaemonSet's pod runs on the agent node."""
+    running = [pod for pod in agent_node_pods()
+               if pod.get("metadata", {}).get("labels", {}).get("app") == POD_CIDR_DAEMONSET
+               and not pod.get("metadata", {}).get("deletionTimestamp")
+               and pod.get("status", {}).get("phase") == "Running" and pod.get("status", {}).get("podIP")]
+    return "" if running else f"the {POD_CIDR_DAEMONSET} DaemonSet pod is not running on {AGENT_MACHINE_NAME}"
+
+
+def validate_none_repave_pod_cidr(node_config: NodeConfig) -> None:
+    """In none mode, run a DaemonSet whose pod is not host-network, repave the
+    node with a configuration-only change and assert every pod IP on the node
+    that is not host-network lies in the new Node's spec.podCIDR. The Node is
+    created again by the repave and can be given another range; a node stack
+    that kept the old range hands out addresses that do not route. Other modes
+    skip it."""
+    if isolation_mode() != "none":
+        log(f"Skipping the repave pod CIDR check in {isolation_mode()} mode")
+        return
+    ns_yaml = capture([KUBECTL, "create", "namespace", TEST_NS, "--dry-run=client", "-o", "yaml"])
+    kubectl(["apply", "-f", "-"], input=ns_yaml.encode())
+    kubectl(["apply", "-f", "-"], input=json.dumps(pod_cidr_daemonset()).encode())
+    _wait_until(_pod_cidr_daemonset_problem, 300)
+    before = node_pod_cidrs(json.loads(kubectl_capture(["get", "node", AGENT_MACHINE_NAME, "-o", "json"])))
+
+    repave_with_config_change(node_config, "pod-cidr")
+    wait_for_node_absent(AGENT_MACHINE_NAME)
+    wait_for_node()
+    after = node_pod_cidrs(json.loads(kubectl_capture(["get", "node", AGENT_MACHINE_NAME, "-o", "json"])))
+    if not after:
+        die(f"the repaved Node '{AGENT_MACHINE_NAME}' has no spec.podCIDR")
+    log(f"Pod CIDRs before the repave {before}, after {after}"
+        + ("" if before != after else " (the same range was assigned again)"))
+
+    _wait_until(_pod_cidr_daemonset_problem, 300)
+
+    def outside() -> str:
+        found = pod_ips_outside_cidrs(agent_node_pods(), after)
+        return f"pods on the repaved node have IPs outside its pod CIDRs {after}: {found}" if found else ""
+
+    _wait_until(outside, 180)
+    kubectl(["delete", "daemonset", POD_CIDR_DAEMONSET, "-n", TEST_NS, "--ignore-not-found"])
+    log(f"Every pod on the repaved none node has an IP in {after}")
+
 
 # ---------------------------------------------------------------------------
 # isolation mode change (spec.isolation declared, applied by the next repave)
@@ -7363,7 +7502,8 @@ SUITES: dict[str, list[str]] = {
     # every mode. Every agent and host operation that applies to a node stack:
     # join, status, preflight, exec/logs, soft reboot (NodeReboot), host-driven
     # and operation-driven AgentUpgrade with rollback, repave, host reboot,
-    # AgentReset, reinstall on the same disk.
+    # AgentReset, reinstall on the same disk. In none, a configuration-only
+    # repave must also put every pod in the new Node's pod CIDR.
     "isolation-operations": [
         "run-agent", "wait-for-node", "validate-isolation-mode", "validate-host-root",
         "validate-controllers-healthy", "validate-node-config", "dump-persisted-agent-config",
@@ -7371,7 +7511,8 @@ SUITES: dict[str, list[str]] = {
         "validate-isolation-preflight", "validate-isolation-exec-logs", "validate-workload",
         "validate-isolation-soft-reboot", "validate-host-agent-upgrade", "validate-agent-upgrade-operation",
         "validate-agent-upgrade-rollback", "validate-workload", "validate-node-repave-upgrade",
-        "validate-workload", "validate-host-reboot", "validate-isolation-mode", "validate-isolation-status",
+        "validate-workload", "validate-none-repave-pod-cidr",
+        "validate-host-reboot", "validate-isolation-mode", "validate-isolation-status",
         "reset-agent", "delete-machine-cr", "ensure-kind-bridge", "reinstall-agent", "wait-for-node",
         "validate-isolation-mode", "validate-isolation-exec-logs", "validate-workload",
     ],
@@ -7505,6 +7646,7 @@ COMMANDS: dict[str, Command] = {
     "validate-agent-upgrade-from-legacy": _without_node_config(lambda: validate_agent_upgrade_operation(in_place=False)),
     "validate-agent-upgrade-rollback": _without_node_config(validate_agent_upgrade_rollback),
     "validate-node-repave-upgrade": validate_node_repave_upgrade,
+    "validate-none-repave-pod-cidr": validate_none_repave_pod_cidr,
     "validate-node-configs": _without_node_config(validate_node_config_scenarios),
     "reset-agent": _without_node_config(reset_agent),
     "validate-host-root": _without_node_config(validate_host_root),
