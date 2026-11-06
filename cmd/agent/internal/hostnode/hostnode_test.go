@@ -318,3 +318,25 @@ func TestOrDefaultAndLogger(t *testing.T) {
 	assert.Same(t, l, Logger(l))
 	assert.Same(t, slog.Default(), Logger(nil))
 }
+
+func TestResetCNIStateEmptiesTheConfigurationAndRemovesTheState(t *testing.T) {
+	root := t.TempDir()
+
+	for _, p := range []string{
+		"/etc/cni/net.d/10-kindnet.conflist",
+		"/etc/cni/net.d/multus.d/multus.kubeconfig",
+		"/var/lib/cni/networks/kindnet/10.244.1.5",
+	} {
+		require.NoError(t, os.MkdirAll(filepath.Dir(filepath.Join(root, p)), 0o755))
+		require.NoError(t, os.WriteFile(filepath.Join(root, p), []byte("x"), 0o600))
+	}
+
+	require.NoError(t, ResetCNIState(root))
+
+	entries, err := os.ReadDir(filepath.Join(root, goalstates.CNIConfigDir))
+	require.NoError(t, err, "the configuration directory stays for the CNI to write into")
+	require.Empty(t, entries)
+	require.NoDirExists(t, filepath.Join(root, CNIStateDir))
+
+	require.NoError(t, ResetCNIState(t.TempDir()), "a host without CNI state has nothing to remove")
+}
