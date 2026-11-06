@@ -915,6 +915,28 @@ func TestPreflightRequiresSystemd254(t *testing.T) {
 	})
 }
 
+func TestCheckLabel(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+
+	// A file echoes the write, as the kernel does for a known context.
+	accepting := filepath.Join(dir, "context")
+	require.NoError(t, os.WriteFile(accepting, nil, 0o644))
+	require.NoError(t, HostFS{SELinuxContext: accepting}.CheckLabel())
+
+	require.ErrorContains(t, HostFS{SELinuxContext: filepath.Join(dir, "absent")}.CheckLabel(), "selinux label check")
+
+	// A rejected write is reported as such, not masked by the close.
+	if _, err := os.Stat("/dev/full"); err != nil {
+		t.Skip("no /dev/full to reject a write")
+	}
+
+	err := HostFS{SELinuxContext: "/dev/full"}.CheckLabel()
+	require.ErrorContains(t, err, "selinux does not accept label "+SELinuxLabel)
+	require.NotContains(t, err.Error(), "closing")
+}
+
 func TestParseSystemdVersion(t *testing.T) {
 	t.Parallel()
 
