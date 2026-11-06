@@ -16,10 +16,13 @@ import (
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
+	storagev1 "k8s.io/api/storage/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime/schema"
+	"k8s.io/apimachinery/pkg/types"
+	utilptr "k8s.io/utils/ptr"
 
 	signalv1 "github.com/Azure/unbounded/api/signal/v1alpha1"
 )
@@ -27,13 +30,23 @@ import (
 const (
 	invocationResultPrefix            = "PROJECT_SIGNAL_INVOCATION_RESULT_V1 "
 	maximumWorkflowArgumentParameters = 256
+	argoWorkflowLabel                 = "workflows.argoproj.io/workflow"
+	workflowRestartMetricName         = "restartSourceCounts"
+	rawWorkflowResultArtifactName     = "rawWorkflowResult"
+	maxInvocationResultArtifacts      = 16
 )
 
+type workflowRestartSourceCounts struct {
+	Container   int32 `json:"container"`
+	WorkflowPod int32 `json:"workflowPod"`
+}
+
 type KubernetesStageExecutor struct {
-	Runner        *Runner
-	Namespace     string
-	WorkflowName  string
-	ExecutionName string
+	Runner                 *Runner
+	Namespace              string
+	WorkflowName           string
+	ExecutionName          string
+	WorkflowServiceAccount string
 }
 
 func (e *KubernetesStageExecutor) ExecuteInvocation(
@@ -380,6 +393,14 @@ func (e *KubernetesStageExecutor) stagePod(
 			{Name: "PROJECT_SIGNAL_PLAN_DIGEST", Value: invocation.PlanDigest},
 			{Name: "PROJECT_SIGNAL_STAGE_ID", Value: invocation.Stage.Name},
 			{Name: "PROJECT_SIGNAL_STAGE_ORDER", Value: strconv.Itoa(int(invocation.StageOrder))},
+			{Name: "PROJECT_SIGNAL_TEST_NAME", Value: invocation.Stage.Test.Identity.Name},
+			{Name: "PROJECT_SIGNAL_TEST_UID", Value: string(invocation.Stage.Test.Identity.UID)},
+			{
+				Name:  "PROJECT_SIGNAL_TEST_GENERATION",
+				Value: strconv.FormatInt(invocation.Stage.Test.Identity.Generation, 10),
+			},
+			{Name: "PROJECT_SIGNAL_TEST_CONTENT_DIGEST", Value: invocation.Stage.Test.Identity.ContentDigest},
+			{Name: "PROJECT_SIGNAL_TEST_TRUST", Value: string(invocation.Stage.Test.Identity.Trust)},
 			{Name: "PROJECT_SIGNAL_PARTICIPANT_INDEX", Value: strconv.Itoa(int(participantIndex))},
 			{Name: "PROJECT_SIGNAL_PARTICIPANT_ROLE", Value: role},
 			{Name: "PROJECT_SIGNAL_NODE_UID", Value: string(participant.NodeUID)},
@@ -437,11 +458,12 @@ func (e *KubernetesStageExecutor) stagePod(
 			}},
 		},
 		Spec: corev1.PodSpec{
-			RestartPolicy: corev1.RestartPolicyNever,
-			NodeName:      participant.NodeName,
-			HostNetwork:   invocation.Stage.Test.Security.HostNetwork,
-			Containers:    []corev1.Container{container},
-			Volumes:       stageHostPathVolumes(invocation.Stage.Test.Security.HostPaths),
+			RestartPolicy:                corev1.RestartPolicyNever,
+			NodeName:                     participant.NodeName,
+			HostNetwork:                  invocation.Stage.Test.Security.HostNetwork,
+			AutomountServiceAccountToken: utilptr.To(false),
+			Containers:                   []corev1.Container{container},
+			Volumes:                      stageHostPathVolumes(invocation.Stage.Test.Security.HostPaths),
 		},
 	}
 
@@ -578,6 +600,30 @@ func (e *KubernetesStageExecutor) executeWorkflowTemplate(
 		return signalv1.InvocationResultEnvelope{}, errors.New("approved WorkflowTemplate has no spec")
 	}
 
+	if err := validateWorkflowServiceAccount(templateSpec, e.WorkflowServiceAccount); err != nil {
+		return signalv1.InvocationResultEnvelope{}, err
+	}
+
+	claims := workflowPersistentVolumeClaims(templateSpec)
+
+	locks, err := e.acquireWorkflowPersistentVolumeClaimLocks(ctx, claims, parent, invocation)
+	if err != nil {
+		return signalv1.InvocationResultEnvelope{}, err
+	}
+
+	defer func() {
+		cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 30*time.Second)
+		defer cancel()
+
+		if err := e.releaseWorkflowPersistentVolumeClaimLocks(cleanupCtx, locks); err != nil {
+			returnErr = errors.Join(returnErr, err)
+		}
+	}()
+
+	if err := e.validateWorkflowPersistentVolumeClaimsReady(ctx, claims); err != nil {
+		return signalv1.InvocationResultEnvelope{}, err
+	}
+
 	name := invocationResourceName(e.ExecutionName, invocation, -1)
 
 	parametersJSON, err := marshalStageJSON(invocation.Stage.Parameters)
@@ -600,6 +646,11 @@ func (e *KubernetesStageExecutor) executeWorkflowTemplate(
 		return signalv1.InvocationResultEnvelope{}, err
 	}
 
+	testJSON, err := marshalStageJSON(invocation.Stage.Test)
+	if err != nil {
+		return signalv1.InvocationResultEnvelope{}, err
+	}
+
 	templateSpec["activeDeadlineSeconds"] = int64(invocation.Stage.Schedule.InvocationTimeout.Seconds())
 	adapterParameters := []any{
 		map[string]any{"name": "invocation-id", "value": invocation.ID},
@@ -607,9 +658,11 @@ func (e *KubernetesStageExecutor) executeWorkflowTemplate(
 		map[string]any{"name": "plan-digest", "value": invocation.PlanDigest},
 		map[string]any{"name": "stage-id", "value": invocation.Stage.Name},
 		map[string]any{"name": "stage-order", "value": strconv.Itoa(int(invocation.StageOrder))},
+		map[string]any{"name": "test-json", "value": testJSON},
 		map[string]any{"name": "parameters-json", "value": parametersJSON},
 		map[string]any{"name": "participants-json", "value": participantsJSON},
 		map[string]any{"name": "participant-roles-json", "value": rolesJSON},
+		map[string]any{"name": "primary-participant-node-name", "value": invocation.Participants[0].NodeName},
 		map[string]any{"name": "resolved-inputs-json", "value": inputsJSON},
 		map[string]any{"name": "result-configmap", "value": name + "-result"},
 	}
@@ -620,6 +673,41 @@ func (e *KubernetesStageExecutor) executeWorkflowTemplate(
 	}
 
 	templateSpec["arguments"] = arguments
+
+	podMetadata, _, err := unstructured.NestedMap(templateSpec, "podMetadata")
+	if err != nil {
+		return signalv1.InvocationResultEnvelope{}, fmt.Errorf("decode WorkflowTemplate pod metadata: %w", err)
+	}
+
+	if podMetadata == nil {
+		podMetadata = map[string]any{}
+	}
+
+	podLabels, _, err := unstructured.NestedStringMap(podMetadata, "labels")
+	if err != nil {
+		return signalv1.InvocationResultEnvelope{}, fmt.Errorf("decode WorkflowTemplate Pod labels: %w", err)
+	}
+
+	if existing := podLabels[runUIDLabel]; existing != "" && existing != string(invocation.RunUID) {
+		return signalv1.InvocationResultEnvelope{}, errors.New("approved WorkflowTemplate sets a conflicting Run UID Pod label")
+	}
+
+	if existing := podLabels[argoWorkflowLabel]; existing != "" && existing != name {
+		return signalv1.InvocationResultEnvelope{}, errors.New("approved WorkflowTemplate sets a conflicting Workflow Pod label")
+	}
+
+	if podLabels == nil {
+		podLabels = map[string]string{}
+	}
+
+	podLabels[runUIDLabel] = string(invocation.RunUID)
+	podLabels[argoWorkflowLabel] = name
+
+	if err := unstructured.SetNestedStringMap(podMetadata, podLabels, "labels"); err != nil {
+		return signalv1.InvocationResultEnvelope{}, fmt.Errorf("set WorkflowTemplate Pod labels: %w", err)
+	}
+
+	templateSpec["podMetadata"] = podMetadata
 
 	workflow := &unstructured.Unstructured{Object: map[string]any{
 		"apiVersion": "argoproj.io/v1alpha1",
@@ -635,6 +723,12 @@ func (e *KubernetesStageExecutor) executeWorkflowTemplate(
 		},
 		"spec": templateSpec,
 	}}
+
+	if workflowRestartMetricRequired(invocation) {
+		if err := validateWorkflowRestartObservationSpec(workflow); err != nil {
+			return signalv1.InvocationResultEnvelope{}, fmt.Errorf("%w: %w", errInvocationEvidenceIntegrity, err)
+		}
+	}
 
 	created, err := e.Runner.Dynamic.Resource(workflowGVR).Namespace(e.Namespace).
 		Create(ctx, workflow, metav1.CreateOptions{})
@@ -669,6 +763,29 @@ func (e *KubernetesStageExecutor) executeWorkflowTemplate(
 
 			if err := json.Unmarshal(content, &envelope); err != nil {
 				return signalv1.InvocationResultEnvelope{}, fmt.Errorf("decode WorkflowTemplate result: %w", err)
+			}
+
+			if err := validateInvocationEnvelope(invocation, &envelope); err != nil {
+				return signalv1.InvocationResultEnvelope{}, fmt.Errorf(
+					"%w: validate raw WorkflowTemplate result: %w",
+					errInvocationEvidenceIntegrity,
+					err,
+				)
+			}
+
+			if workflowRestartMetricRequired(invocation) {
+				counts, err := e.observeWorkflowRestartSources(ctx, invocation, parent, created)
+				if err != nil {
+					return signalv1.InvocationResultEnvelope{}, err
+				}
+
+				if err := replaceWorkflowRestartMetric(&envelope, counts); err != nil {
+					return signalv1.InvocationResultEnvelope{}, fmt.Errorf("%w: %w", errInvocationEvidenceIntegrity, err)
+				}
+
+				if err := appendRawWorkflowResultArtifact(&envelope, resultName, content); err != nil {
+					return signalv1.InvocationResultEnvelope{}, fmt.Errorf("%w: %w", errInvocationEvidenceIntegrity, err)
+				}
 			}
 
 			cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 30*time.Second)
@@ -723,6 +840,527 @@ func (e *KubernetesStageExecutor) executeWorkflowTemplate(
 		case <-ticker.C:
 		}
 	}
+}
+
+func workflowRestartMetricRequired(invocation StageInvocation) bool {
+	for _, metric := range invocation.Stage.Test.Metrics {
+		if metric.Name == workflowRestartMetricName {
+			return true
+		}
+	}
+
+	return false
+}
+
+func validateWorkflowRestartObservationSpec(workflow *unstructured.Unstructured) error {
+	spec, found, err := unstructured.NestedMap(workflow.Object, "spec")
+	if err != nil {
+		return fmt.Errorf("decode Workflow spec for restart observation: %w", err)
+	}
+
+	if !found {
+		return errors.New("workflow restart observation requires a Workflow spec")
+	}
+
+	if _, hasPodGC := spec["podGC"]; hasPodGC {
+		return errors.New("workflow restart observation forbids Pod GC")
+	}
+
+	if _, hasTTLStrategy := spec["ttlStrategy"]; hasTTLStrategy {
+		return errors.New("workflow restart observation forbids a TTL strategy")
+	}
+
+	entrypoint, found, err := unstructured.NestedString(spec, "entrypoint")
+	if err != nil {
+		return fmt.Errorf("decode Workflow entrypoint for restart observation: %w", err)
+	}
+
+	if !found || entrypoint == "" {
+		return errors.New("workflow restart observation requires an entrypoint")
+	}
+
+	templates, found, err := unstructured.NestedSlice(spec, "templates")
+	if err != nil {
+		return fmt.Errorf("decode Workflow templates for restart observation: %w", err)
+	}
+
+	if !found || len(templates) != 1 {
+		return errors.New("workflow restart observation requires exactly one Pod template")
+	}
+
+	template, ok := templates[0].(map[string]any)
+	if !ok {
+		return errors.New("workflow restart observation template is invalid")
+	}
+
+	name, _, err := unstructured.NestedString(template, "name")
+	if err != nil {
+		return fmt.Errorf("decode Workflow template name for restart observation: %w", err)
+	}
+
+	if name != entrypoint {
+		return errors.New("workflow restart observation entrypoint must select the only template")
+	}
+
+	if _, hasContainer := template["container"]; !hasContainer {
+		return errors.New("workflow restart observation requires a container template")
+	}
+
+	for _, unsupported := range []string{"containerSet", "dag", "data", "http", "resource", "script", "steps", "suspend"} {
+		if _, hasUnsupported := template[unsupported]; hasUnsupported {
+			return fmt.Errorf("workflow restart observation does not support %s templates", unsupported)
+		}
+	}
+
+	retryStrategy, found, err := unstructured.NestedMap(template, "retryStrategy")
+	if err != nil {
+		return fmt.Errorf("decode Workflow retry strategy for restart observation: %w", err)
+	}
+
+	if !found {
+		return errors.New("workflow restart observation requires an explicit zero retry limit")
+	}
+
+	limit, found := retryStrategy["limit"]
+	if !found || (limit != "0" && limit != int64(0) && limit != float64(0)) {
+		return errors.New("workflow restart observation requires a zero retry limit")
+	}
+
+	return nil
+}
+
+func (e *KubernetesStageExecutor) observeWorkflowRestartSources(
+	ctx context.Context,
+	invocation StageInvocation,
+	parent *unstructured.Unstructured,
+	created *unstructured.Unstructured,
+) (workflowRestartSourceCounts, error) {
+	current, err := e.Runner.Dynamic.Resource(workflowGVR).Namespace(e.Namespace).
+		Get(ctx, created.GetName(), metav1.GetOptions{})
+	if err != nil {
+		return workflowRestartSourceCounts{}, fmt.Errorf("observe child Workflow restart sources: %w", err)
+	}
+
+	if current.GetUID() != created.GetUID() ||
+		current.GetLabels()[runUIDLabel] != string(invocation.RunUID) ||
+		!hasControllerOwner(current.GetOwnerReferences(), parent.GetUID(), parent.GetName(), "Workflow") {
+		return workflowRestartSourceCounts{}, errors.New("child Workflow identity or ownership is ambiguous")
+	}
+
+	selector := fmt.Sprintf(
+		"%s=%s,%s=%s",
+		runUIDLabel,
+		invocation.RunUID,
+		argoWorkflowLabel,
+		created.GetName(),
+	)
+
+	pods, err := e.Runner.Kubernetes.CoreV1().Pods(e.Namespace).
+		List(ctx, metav1.ListOptions{LabelSelector: selector})
+	if err != nil {
+		return workflowRestartSourceCounts{}, fmt.Errorf("list child Workflow Pods: %w", err)
+	}
+
+	if len(pods.Items) == 0 {
+		return workflowRestartSourceCounts{}, errors.New("child Workflow has no observable Pod")
+	}
+
+	counts := workflowRestartSourceCounts{WorkflowPod: int32(len(pods.Items) - 1)}
+	for index := range pods.Items {
+		pod := &pods.Items[index]
+		if pod.Labels[runUIDLabel] != string(invocation.RunUID) ||
+			pod.Labels[argoWorkflowLabel] != created.GetName() ||
+			!hasControllerOwner(pod.OwnerReferences, created.GetUID(), created.GetName(), "Workflow") {
+			return workflowRestartSourceCounts{}, fmt.Errorf("child Workflow Pod %q identity or ownership is ambiguous", pod.Name)
+		}
+
+		if len(pod.Status.ContainerStatuses) == 0 {
+			return workflowRestartSourceCounts{}, fmt.Errorf("child Workflow Pod %q has no container status", pod.Name)
+		}
+
+		for _, status := range pod.Status.InitContainerStatuses {
+			counts.Container += status.RestartCount
+		}
+
+		for _, status := range pod.Status.ContainerStatuses {
+			counts.Container += status.RestartCount
+		}
+
+		for _, status := range pod.Status.EphemeralContainerStatuses {
+			counts.Container += status.RestartCount
+		}
+	}
+
+	return counts, nil
+}
+
+func hasControllerOwner(
+	owners []metav1.OwnerReference,
+	uid types.UID,
+	name string,
+	kind string,
+) bool {
+	controllerFound := false
+
+	for _, owner := range owners {
+		if owner.Controller == nil || !*owner.Controller {
+			continue
+		}
+
+		if controllerFound ||
+			owner.UID != uid ||
+			owner.Name != name ||
+			owner.Kind != kind ||
+			owner.APIVersion != "argoproj.io/v1alpha1" {
+			return false
+		}
+
+		controllerFound = true
+	}
+
+	return controllerFound
+}
+
+func replaceWorkflowRestartMetric(
+	envelope *signalv1.InvocationResultEnvelope,
+	counts workflowRestartSourceCounts,
+) error {
+	content, err := json.Marshal(counts)
+	if err != nil {
+		return fmt.Errorf("encode observed Workflow restart sources: %w", err)
+	}
+
+	measurementIndex := -1
+
+	for index := range envelope.Measurements {
+		if envelope.Measurements[index].Name != workflowRestartMetricName {
+			continue
+		}
+
+		if measurementIndex >= 0 {
+			return errors.New("raw WorkflowTemplate result duplicates restartSourceCounts")
+		}
+
+		measurementIndex = index
+	}
+
+	measurement := signalv1.MetricMeasurement{
+		Name: workflowRestartMetricName,
+		Value: signalv1.TypedValue{
+			Type:        signalv1.TypedValueTypeString,
+			StringValue: utilptr.To(string(content)),
+		},
+	}
+	if measurementIndex >= 0 {
+		envelope.Measurements[measurementIndex] = measurement
+
+		return nil
+	}
+
+	if len(envelope.Measurements) >= 16 {
+		return errors.New("raw WorkflowTemplate result has no room for observed restartSourceCounts")
+	}
+
+	envelope.Measurements = append(envelope.Measurements, measurement)
+
+	return nil
+}
+
+func appendRawWorkflowResultArtifact(
+	envelope *signalv1.InvocationResultEnvelope,
+	resultName string,
+	content []byte,
+) error {
+	for _, artifact := range envelope.Artifacts {
+		if artifact.Name == rawWorkflowResultArtifactName {
+			return errors.New("raw WorkflowTemplate result uses reserved artifact name")
+		}
+	}
+
+	if len(envelope.Artifacts) >= maxInvocationResultArtifacts {
+		return errors.New("raw WorkflowTemplate result has no room for platform provenance")
+	}
+
+	sum := sha256.Sum256(content)
+	envelope.Artifacts = append(envelope.Artifacts, signalv1.ResultArtifactReference{
+		Name:   rawWorkflowResultArtifactName,
+		URI:    "urn:project-signal:workflow-result:" + resultName,
+		Digest: "sha256:" + hex.EncodeToString(sum[:]),
+	})
+
+	return nil
+}
+
+func validateWorkflowServiceAccount(spec map[string]any, allowed string) error {
+	if allowed == "" {
+		return errors.New("approved WorkflowTemplate execution requires an allowed ServiceAccount")
+	}
+
+	serviceAccount, found, err := unstructured.NestedString(spec, "serviceAccountName")
+	if err != nil {
+		return fmt.Errorf("decode WorkflowTemplate ServiceAccount: %w", err)
+	}
+
+	if !found || serviceAccount != allowed {
+		return fmt.Errorf("approved WorkflowTemplate must use ServiceAccount %q", allowed)
+	}
+
+	return validateWorkflowServiceAccountFields(spec, allowed)
+}
+
+func (e *KubernetesStageExecutor) validateWorkflowPersistentVolumeClaimsReady(
+	ctx context.Context,
+	claims []string,
+) error {
+	for _, claimName := range claims {
+		claim, err := e.Runner.Kubernetes.CoreV1().PersistentVolumeClaims(e.Namespace).
+			Get(ctx, claimName, metav1.GetOptions{})
+		if err != nil {
+			return fmt.Errorf("get WorkflowTemplate PVC %s/%s: %w", e.Namespace, claimName, err)
+		}
+
+		if claim.Status.Phase != corev1.ClaimBound || claim.Spec.VolumeName == "" {
+			return fmt.Errorf(
+				"WorkflowTemplate PVC %s/%s is not bound to a PV",
+				e.Namespace,
+				claimName,
+			)
+		}
+
+		pods, err := e.Runner.Kubernetes.CoreV1().Pods(e.Namespace).
+			List(ctx, metav1.ListOptions{})
+		if err != nil {
+			return fmt.Errorf("list Pods before mounting PVC %s/%s: %w", e.Namespace, claimName, err)
+		}
+
+		for index := range pods.Items {
+			if podReferencesPersistentVolumeClaim(&pods.Items[index], claimName) {
+				return fmt.Errorf(
+					"WorkflowTemplate PVC %s/%s is still referenced by Pod %s/%s",
+					e.Namespace,
+					claimName,
+					pods.Items[index].Namespace,
+					pods.Items[index].Name,
+				)
+			}
+		}
+
+		attachments, err := e.Runner.Kubernetes.StorageV1().VolumeAttachments().
+			List(ctx, metav1.ListOptions{})
+		if err != nil {
+			return fmt.Errorf(
+				"list VolumeAttachments before mounting PVC %s/%s: %w",
+				e.Namespace,
+				claimName,
+				err,
+			)
+		}
+
+		for index := range attachments.Items {
+			if volumeAttachmentReferencesPV(&attachments.Items[index], claim.Spec.VolumeName) {
+				return fmt.Errorf(
+					"WorkflowTemplate PVC %s/%s bound PV %s is still referenced by VolumeAttachment %s",
+					e.Namespace,
+					claimName,
+					claim.Spec.VolumeName,
+					attachments.Items[index].Name,
+				)
+			}
+		}
+	}
+
+	return nil
+}
+
+func workflowPersistentVolumeClaims(spec map[string]any) []string {
+	claimSet := map[string]struct{}{}
+	collectPersistentVolumeClaims(spec, claimSet)
+
+	claims := make([]string, 0, len(claimSet))
+	for claimName := range claimSet {
+		claims = append(claims, claimName)
+	}
+
+	sort.Strings(claims)
+
+	return claims
+}
+
+func collectPersistentVolumeClaims(value any, claims map[string]struct{}) {
+	switch typed := value.(type) {
+	case map[string]any:
+		if source, ok := typed["persistentVolumeClaim"].(map[string]any); ok {
+			if claimName, ok := source["claimName"].(string); ok && claimName != "" {
+				claims[claimName] = struct{}{}
+			}
+		}
+
+		for _, child := range typed {
+			collectPersistentVolumeClaims(child, claims)
+		}
+	case []any:
+		for _, child := range typed {
+			collectPersistentVolumeClaims(child, claims)
+		}
+	}
+}
+
+func (e *KubernetesStageExecutor) acquireWorkflowPersistentVolumeClaimLocks(
+	ctx context.Context,
+	claims []string,
+	parent *unstructured.Unstructured,
+	invocation StageInvocation,
+) ([]*corev1.ConfigMap, error) {
+	locks := make([]*corev1.ConfigMap, 0, len(claims))
+
+	for _, claimName := range claims {
+		lock := &corev1.ConfigMap{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      workflowPersistentVolumeClaimLockName(e.Namespace, claimName),
+				Namespace: e.Namespace,
+				Labels: map[string]string{
+					"app.kubernetes.io/name":    "project-signal-pvc-lock",
+					"app.kubernetes.io/part-of": "project-signal",
+				},
+				OwnerReferences: []metav1.OwnerReference{{
+					APIVersion:         parent.GetAPIVersion(),
+					Kind:               parent.GetKind(),
+					Name:               parent.GetName(),
+					UID:                parent.GetUID(),
+					Controller:         utilptr.To(true),
+					BlockOwnerDeletion: utilptr.To(true),
+				}},
+			},
+			Data: map[string]string{
+				"claim":       claimName,
+				"invocation":  invocation.ID,
+				"runUID":      string(invocation.RunUID),
+				"workflowUID": string(parent.GetUID()),
+			},
+		}
+
+		created, err := e.Runner.Kubernetes.CoreV1().ConfigMaps(e.Namespace).
+			Create(ctx, lock, metav1.CreateOptions{})
+		if err != nil {
+			cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 30*time.Second)
+			releaseErr := e.releaseWorkflowPersistentVolumeClaimLocks(
+				cleanupCtx,
+				locks,
+			)
+
+			cancel()
+
+			return nil, errors.Join(
+				fmt.Errorf(
+					"acquire exclusive WorkflowTemplate PVC lock for %s/%s: %w",
+					e.Namespace,
+					claimName,
+					err,
+				),
+				releaseErr,
+			)
+		}
+
+		locks = append(locks, created)
+	}
+
+	return locks, nil
+}
+
+func (e *KubernetesStageExecutor) releaseWorkflowPersistentVolumeClaimLocks(
+	ctx context.Context,
+	locks []*corev1.ConfigMap,
+) error {
+	var joined error
+
+	for index := len(locks) - 1; index >= 0; index-- {
+		lockUID := locks[index].UID
+
+		err := e.Runner.Kubernetes.CoreV1().ConfigMaps(e.Namespace).Delete(
+			ctx,
+			locks[index].Name,
+			metav1.DeleteOptions{
+				Preconditions: &metav1.Preconditions{UID: &lockUID},
+			},
+		)
+		if err != nil && !apierrors.IsNotFound(err) {
+			joined = errors.Join(
+				joined,
+				fmt.Errorf("release WorkflowTemplate PVC lock %s: %w", locks[index].Name, err),
+			)
+		}
+	}
+
+	return joined
+}
+
+func workflowPersistentVolumeClaimLockName(namespace, claimName string) string {
+	digest := sha256.Sum256([]byte(namespace + "\x00" + claimName))
+
+	return "project-signal-pvc-lock-" + hex.EncodeToString(digest[:8])
+}
+
+func podReferencesPersistentVolumeClaim(pod *corev1.Pod, claimName string) bool {
+	for index := range pod.Spec.Volumes {
+		source := pod.Spec.Volumes[index].PersistentVolumeClaim
+		if source != nil && source.ClaimName == claimName {
+			return true
+		}
+	}
+
+	return false
+}
+
+func volumeAttachmentReferencesPV(attachment *storagev1.VolumeAttachment, pvName string) bool {
+	return attachment.Spec.Source.PersistentVolumeName != nil &&
+		*attachment.Spec.Source.PersistentVolumeName == pvName
+}
+
+func validateWorkflowServiceAccountFields(value any, allowed string) error {
+	switch typed := value.(type) {
+	case map[string]any:
+		for key, child := range typed {
+			switch key {
+			case "podSpecPatch":
+				return errors.New("approved WorkflowTemplate cannot use podSpecPatch")
+			case argoWorkflowLabel:
+				return errors.New("approved WorkflowTemplate cannot set the reserved Workflow Pod label")
+			case "serviceAccountName":
+				serviceAccount, ok := child.(string)
+				if !ok || serviceAccount != allowed {
+					return fmt.Errorf("approved WorkflowTemplate selects unauthorized ServiceAccount %q", child)
+				}
+			case "templateRef", "workflowTemplateRef":
+				return fmt.Errorf("approved WorkflowTemplate cannot use external reference %q", key)
+			case "metadata":
+				metadata, ok := child.(map[string]any)
+				if !ok {
+					break
+				}
+
+				labels, ok := metadata["labels"].(map[string]any)
+				if !ok {
+					break
+				}
+
+				if _, exists := labels[runUIDLabel]; exists {
+					return fmt.Errorf("approved WorkflowTemplate metadata label %q is reserved", runUIDLabel)
+				}
+			}
+
+			if err := validateWorkflowServiceAccountFields(child, allowed); err != nil {
+				return err
+			}
+		}
+	case []any:
+		for _, child := range typed {
+			if err := validateWorkflowServiceAccountFields(child, allowed); err != nil {
+				return err
+			}
+		}
+	}
+
+	return nil
 }
 
 func validateWorkflowTemplateIdentity(
@@ -1026,6 +1664,10 @@ func stageDriverImage(driver signalv1.CertificationTestDriver) string {
 }
 
 func driverResources(driver signalv1.CertificationTestDriver) corev1.ResourceRequirements {
+	if driver.Script != nil {
+		return *driver.Script.Resources.DeepCopy()
+	}
+
 	if driver.Container != nil {
 		return *driver.Container.Resources.DeepCopy()
 	}

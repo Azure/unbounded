@@ -189,12 +189,16 @@ const (
 	ScriptLanguagePython ScriptLanguage = "Python"
 )
 
+// +kubebuilder:validation:XValidation:rule="!has(self.resources) || !has(self.resources.limits) || size(self.resources.limits) <= 16",message="script resource limits must not exceed 16 entries"
+// +kubebuilder:validation:XValidation:rule="!has(self.resources) || !has(self.resources.requests) || size(self.resources.requests) <= 16",message="script resource requests must not exceed 16 entries"
+// +kubebuilder:validation:XValidation:rule="!has(self.resources) || !has(self.resources.claims) || size(self.resources.claims) <= 16",message="script resource claims must not exceed 16 entries"
 type ScriptTestDriver struct {
 	Language ScriptLanguage          `json:"language"`
 	Source   ImmutableArtifactSource `json:"source"`
 	// RunnerImage is the approved digest-pinned runtime for the payload.
 	// +kubebuilder:validation:Pattern=`^[^@\s]+@sha256:[0-9a-f]{64}$`
-	RunnerImage string `json:"runnerImage"`
+	RunnerImage string                      `json:"runnerImage"`
+	Resources   corev1.ResourceRequirements `json:"resources,omitempty"`
 }
 
 // +kubebuilder:validation:XValidation:rule="!has(self.resources) || !has(self.resources.limits) || size(self.resources.limits) <= 16",message="container resource limits must not exceed 16 entries"

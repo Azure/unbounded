@@ -29,18 +29,21 @@ import (
 const controllerName = "project-signal-controller"
 
 type config struct {
-	namespace         string
-	scriptNamespace   string
-	runnerImage       string
-	controllerImage   string
-	adapterImage      string
-	workflowDigest    string
-	resolverImages    []string
-	gateProtected     bool
-	metricsAddress    string
-	probeAddress      string
-	leaderElect       bool
-	maxConcurrentRuns int
+	namespace           string
+	scriptNamespace     string
+	authorityNamespace  string
+	authorityName       string
+	staticPackageDigest string
+	runnerImage         string
+	controllerImage     string
+	adapterImage        string
+	workflowDigest      string
+	resolverImages      []string
+	gateProtected       bool
+	metricsAddress      string
+	probeAddress        string
+	leaderElect         bool
+	maxConcurrentRuns   int
 }
 
 func main() {
@@ -60,6 +63,9 @@ func main() {
 
 	cmd.Flags().StringVar(&cfg.namespace, "namespace", "project-signal", "Namespace for CertificationRuns and Workflows")
 	cmd.Flags().StringVar(&cfg.scriptNamespace, "script-namespace", "project-signal", "Namespace containing immutable source script ConfigMaps")
+	cmd.Flags().StringVar(&cfg.authorityNamespace, "authority-namespace", "project-signal-authority", "Operator-only namespace containing execution authority")
+	cmd.Flags().StringVar(&cfg.authorityName, "authority-name", projectsignal.ExecutionAuthorityName, "Immutable execution authority ConfigMap name")
+	cmd.Flags().StringVar(&cfg.staticPackageDigest, "static-package-digest", "", "Certified immutable static package SHA-256 digest")
 	cmd.Flags().StringVar(&cfg.runnerImage, "runner-image", "", "Digest-pinned certification runner image")
 	cmd.Flags().StringVar(&cfg.controllerImage, "controller-image", "", "Digest-pinned controller image recorded in evidence")
 	cmd.Flags().StringVar(&cfg.adapterImage, "adapter-image", "", "Digest-pinned adapter image included in execution plans")
@@ -91,8 +97,12 @@ func main() {
 func run(ctx context.Context, cfg config) error {
 	ctrl.SetLogger(zap.New())
 
-	if cfg.namespace == "" || cfg.scriptNamespace == "" {
-		return errors.New("namespace and script namespace are required")
+	if cfg.namespace == "" || cfg.scriptNamespace == "" || cfg.authorityNamespace == "" || cfg.authorityName == "" {
+		return errors.New("namespace, script namespace, authority namespace, and authority name are required")
+	}
+
+	if cfg.authorityNamespace == cfg.namespace || cfg.authorityNamespace == cfg.scriptNamespace {
+		return errors.New("authority namespace must be distinct from workload and script namespaces")
 	}
 
 	if err := projectsignal.ValidateRunnerImage(cfg.runnerImage); err != nil {
@@ -153,28 +163,36 @@ func run(ctx context.Context, cfg config) error {
 	}
 
 	admission := &projectsignal.AdmissionReconciler{
-		Client:          mgr.GetClient(),
-		APIReader:       mgr.GetAPIReader(),
-		Namespace:       cfg.namespace,
-		ScriptNamespace: cfg.scriptNamespace,
-		RunnerImage:     cfg.runnerImage,
-		ControllerImage: cfg.controllerImage,
-		AdapterImage:    cfg.adapterImage,
-		WorkflowDigest:  cfg.workflowDigest,
-		ResolverImages:  cfg.resolverImages,
-		Recorder:        mgr.GetEventRecorder(controllerName),
+		Client:              mgr.GetClient(),
+		APIReader:           mgr.GetAPIReader(),
+		Namespace:           cfg.namespace,
+		ScriptNamespace:     cfg.scriptNamespace,
+		AuthorityNamespace:  cfg.authorityNamespace,
+		AuthorityName:       cfg.authorityName,
+		SourceCommit:        version.GitCommit,
+		StaticPackageDigest: cfg.staticPackageDigest,
+		RunnerImage:         cfg.runnerImage,
+		ControllerImage:     cfg.controllerImage,
+		AdapterImage:        cfg.adapterImage,
+		WorkflowDigest:      cfg.workflowDigest,
+		ResolverImages:      cfg.resolverImages,
+		Recorder:            mgr.GetEventRecorder(controllerName),
 	}
 	if err := admission.SetupWithManager(mgr); err != nil {
 		return fmt.Errorf("register admission reconciler: %w", err)
 	}
 
 	runs := &projectsignal.RunReconciler{
-		Client:            mgr.GetClient(),
-		APIReader:         mgr.GetAPIReader(),
-		Evidence:          evidence,
-		MaxConcurrentRuns: cfg.maxConcurrentRuns,
-		ControllerImage:   cfg.controllerImage,
-		Recorder:          mgr.GetEventRecorder(controllerName),
+		Client:              mgr.GetClient(),
+		APIReader:           mgr.GetAPIReader(),
+		Evidence:            evidence,
+		MaxConcurrentRuns:   cfg.maxConcurrentRuns,
+		ControllerImage:     cfg.controllerImage,
+		AuthorityNamespace:  cfg.authorityNamespace,
+		AuthorityName:       cfg.authorityName,
+		SourceCommit:        version.GitCommit,
+		StaticPackageDigest: cfg.staticPackageDigest,
+		Recorder:            mgr.GetEventRecorder(controllerName),
 	}
 	if err := runs.SetupWithManager(mgr); err != nil {
 		return fmt.Errorf("register run reconciler: %w", err)

@@ -50,6 +50,7 @@ type fakeStageExecutor struct {
 	duration time.Duration
 	outcomes []signalv1.InvocationOutcome
 	reasons  []signalv1.ResultReasonCode
+	errors   []error
 	calls    []StageInvocation
 	starts   []time.Time
 	canceled []string
@@ -106,7 +107,7 @@ func (e *fakeStageExecutor) ExecuteInvocation(
 
 	passed := true
 
-	return signalv1.InvocationResultEnvelope{
+	envelope := signalv1.InvocationResultEnvelope{
 		SchemaVersion:     signalv1.InvocationResultSchemaV1,
 		InvocationID:      invocation.ID,
 		RunUID:            invocation.RunUID,
@@ -133,7 +134,13 @@ func (e *fakeStageExecutor) ExecuteInvocation(
 			SampleSequenceDigest: testStageDigest("activity"),
 		},
 		Cleanup: signalv1.InvocationCleanupResult{Outcome: signalv1.CleanupOutcomeSucceeded},
-	}, nil
+	}
+
+	if index < len(e.errors) {
+		return envelope, e.errors[index]
+	}
+
+	return envelope, nil
 }
 
 func (e *fakeStageExecutor) CancelInvocation(_ context.Context, invocation StageInvocation) error {
@@ -275,6 +282,41 @@ func TestStageRunnerRetriesOnlyInfrastructureFailures(t *testing.T) {
 
 	if len(executor.calls) != 2 || summary.Verdict != signalv1.StageVerdictPassed {
 		t.Fatalf("retry calls = %d, summary = %#v", len(executor.calls), summary)
+	}
+}
+
+func TestStageRunnerDoesNotRetryEvidenceIntegrityErrors(t *testing.T) {
+	t.Parallel()
+
+	clock := &fakeStageClock{now: time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)}
+	executor := &fakeStageExecutor{
+		clock:  clock,
+		errors: []error{fmt.Errorf("%w: forged Workflow result", errInvocationEvidenceIntegrity)},
+	}
+	request := stageExecutionRequest(signalv1.StageSchedule{
+		Mode:              signalv1.CheckExecutionModeRunOnce,
+		InvocationTimeout: metav1.Duration{Duration: time.Minute},
+	})
+	request.Stage.Retry = &signalv1.StageRetryPolicy{
+		MaxAttempts:       2,
+		RetryableFailures: []signalv1.RetryableFailureClass{signalv1.RetryableFailureClassInfrastructure},
+	}
+
+	envelope := (StageRunner{Clock: clock, Executor: executor}).executeWithRetry(
+		context.Background(),
+		clock,
+		request,
+		request.Participants,
+		map[int32]string{0: "participant"},
+		0,
+	)
+
+	if len(executor.calls) != 1 {
+		t.Fatalf("evidence integrity attempts = %d, want 1", len(executor.calls))
+	}
+
+	if envelope.ReasonCode != signalv1.ResultReasonEvidenceIntegrityFailure {
+		t.Fatalf("evidence integrity envelope = %#v", envelope)
 	}
 }
 

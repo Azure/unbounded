@@ -1,0 +1,83 @@
+{{- $adapterImage := default "example.invalid/project-signal-adapter@sha256:0000000000000000000000000000000000000000000000000000000000000000" .AdapterImage }}
+{{- if not (regexMatch "^[^@[:space:]]+@sha256:[0-9a-f]{64}$" $adapterImage) }}
+{{- fail "AdapterImage must be an immutable sha256 digest reference" }}
+{{- end }}
+{{- $vllmCanaryEnabled := default "false" .VLLMCanaryEnabled }}
+{{- if not (regexMatch "^(true|false)$" $vllmCanaryEnabled) }}
+{{- fail "VLLMCanaryEnabled must be true or false" }}
+{{- end }}
+apiVersion: argoproj.io/v1alpha1
+kind: WorkflowTemplate
+metadata:
+  name: project-signal-participant-adapter
+  namespace: {{ default "project-signal" .Namespace }}
+spec:
+  templates:
+    - name: certification
+      inputs:
+        parameters:
+          - name: run-name
+          - name: execution-name
+          - name: run-uid
+          - name: check-index
+            default: "-1"
+          - name: phase-index
+            default: "-1"
+          - name: stage-index
+            default: "-1"
+          - name: result-configmap
+      tolerations:
+        - key: node.kubernetes.io/unschedulable
+          operator: Exists
+          effect: NoSchedule
+      securityContext:
+        seccompProfile:
+          type: RuntimeDefault
+      container:
+        image: {{ $adapterImage }}
+        imagePullPolicy: IfNotPresent
+        resources:
+          requests:
+            cpu: 50m
+            memory: 96Mi
+          limits:
+            cpu: 500m
+            memory: 256Mi
+        securityContext:
+          allowPrivilegeEscalation: false
+          readOnlyRootFilesystem: true
+          runAsNonRoot: true
+          capabilities:
+            drop: [ALL]
+        args:
+          - --namespace
+          - "$(POD_NAMESPACE)"
+          - --workflow-name
+          - "$(WORKFLOW_NAME)"
+          - --run-name
+          - "{{`{{inputs.parameters.run-name}}`}}"
+          - --execution-name
+          - "{{`{{inputs.parameters.execution-name}}`}}"
+          - --run-uid
+          - "{{`{{inputs.parameters.run-uid}}`}}"
+          - --check-index
+          - "{{`{{inputs.parameters.check-index}}`}}"
+          - --phase-index
+          - "{{`{{inputs.parameters.phase-index}}`}}"
+          - --stage-index
+          - "{{`{{inputs.parameters.stage-index}}`}}"
+{{ if eq $vllmCanaryEnabled "true" }}
+          - --workflow-service-account
+          - project-signal-vllm-workload
+{{ end }}
+          - --result-configmap
+          - "{{`{{inputs.parameters.result-configmap}}`}}"
+        env:
+          - name: POD_NAMESPACE
+            valueFrom:
+              fieldRef:
+                fieldPath: metadata.namespace
+          - name: WORKFLOW_NAME
+            valueFrom:
+              fieldRef:
+                fieldPath: metadata.labels['workflows.argoproj.io/workflow']

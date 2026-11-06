@@ -30,8 +30,9 @@ const (
 
 type config struct {
 	signaladapter.Request
-	PhaseIndex int
-	StageIndex int
+	PhaseIndex             int
+	StageIndex             int
+	WorkflowServiceAccount string
 }
 
 func main() {
@@ -58,6 +59,12 @@ func main() {
 	flags.IntVar(&cfg.CheckIndex, "check-index", -1, "Zero-based check position in the CertificationRun suite")
 	flags.IntVar(&cfg.PhaseIndex, "phase-index", -1, "Zero-based phase position in the resolved CertificationRun plan")
 	flags.IntVar(&cfg.StageIndex, "stage-index", -1, "Zero-based stage position in the resolved CertificationRun phase")
+	flags.StringVar(
+		&cfg.WorkflowServiceAccount,
+		"workflow-service-account",
+		"",
+		"Required ServiceAccount for approved child WorkflowTemplate execution",
+	)
 	flags.StringVar(&cfg.ResultConfigMap, "result-configmap", "", "Immutable check result ConfigMap name")
 
 	command.CompletionOptions.DisableDefaultCmd = true
@@ -94,6 +101,10 @@ func run(ctx context.Context, cfg config) error {
 			return errors.New("stage mode requires phase-index and stage-index and excludes check-index")
 		}
 
+		if cfg.WorkflowServiceAccount == "" {
+			return errors.New("stage mode requires workflow-service-account")
+		}
+
 		request := signaladapter.StageRequest{
 			Namespace:       cfg.Namespace,
 			WorkflowName:    cfg.WorkflowName,
@@ -111,10 +122,11 @@ func run(ctx context.Context, cfg config) error {
 		}
 
 		executor := &signaladapter.KubernetesStageExecutor{
-			Runner:        runner,
-			Namespace:     cfg.Namespace,
-			WorkflowName:  cfg.WorkflowName,
-			ExecutionName: cfg.ExecutionName,
+			Runner:                 runner,
+			Namespace:              cfg.Namespace,
+			WorkflowName:           cfg.WorkflowName,
+			ExecutionName:          cfg.ExecutionName,
+			WorkflowServiceAccount: cfg.WorkflowServiceAccount,
 		}
 		stageRunner := signaladapter.StageRunner{
 			Executor: executor,

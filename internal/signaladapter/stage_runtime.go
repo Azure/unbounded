@@ -72,6 +72,8 @@ type StageInvocationExecutor interface {
 	CancelInvocation(context.Context, StageInvocation) error
 }
 
+var errInvocationEvidenceIntegrity = errors.New("invocation evidence integrity failure")
+
 type StageExecutionRequest struct {
 	RunUID                         types.UID
 	PlanDigest                     string
@@ -239,7 +241,9 @@ func (r StageRunner) executeWithRetry(
 			now := clock.Now()
 
 			envelope = failedInvocationEnvelope(invocation, now, err)
-			if errors.Is(err, context.DeadlineExceeded) {
+			if errors.Is(err, errInvocationEvidenceIntegrity) {
+				envelope.ReasonCode = signalv1.ResultReasonEvidenceIntegrityFailure
+			} else if errors.Is(err, context.DeadlineExceeded) {
 				envelope.Outcome = signalv1.InvocationOutcomeInconclusive
 
 				envelope.ReasonCode = signalv1.ResultReasonTimeout

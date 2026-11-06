@@ -119,6 +119,8 @@ func (r *QualificationReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		Watches(&corev1.Node{}, handler.EnqueueRequestsFromMapFunc(r.requestsForAllPolicies)).
 		Watches(&signalv1.CertificationRun{}, handler.EnqueueRequestsFromMapFunc(r.requestsForAllPolicies)).
 		Watches(&signalv1.NodeCertification{}, handler.EnqueueRequestsFromMapFunc(r.requestsForAllPolicies)).
+		Watches(&signalv1.CertificationProfile{}, handler.EnqueueRequestsFromMapFunc(r.requestsForAllPolicies)).
+		Watches(&signalv1.CertificationSuite{}, handler.EnqueueRequestsFromMapFunc(r.requestsForAllPolicies)).
 		WithOptions(controller.Options{MaxConcurrentReconciles: 1}).
 		Complete(r)
 }

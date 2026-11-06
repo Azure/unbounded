@@ -1,0 +1,120 @@
+{{- if eq (default "false" .VLLMCanaryEnabled) "true" }}
+{{- $templateDigest := .VLLMWorkflowTemplateDigest }}
+{{- if not (regexMatch "^sha256:[0-9a-f]{64}$" $templateDigest) }}
+{{- fail "VLLMWorkflowTemplateDigest must be an algorithm-qualified sha256 digest" }}
+{{- end }}
+apiVersion: signal.unbounded-cloud.io/v1alpha1
+kind: CertificationTest
+metadata:
+  name: project-signal-vllm-canary-v1
+  labels:
+    app.kubernetes.io/name: project-signal-vllm-canary
+    app.kubernetes.io/part-of: project-signal
+    signal.unbounded-cloud.io/catalog-role: acceptance-canary
+spec:
+  displayName: vLLM acceptance canary
+  description: Bounded single-participant serving correctness canary; performance values are measurements until separately approved.
+  owner: project-signal
+  version: "1"
+  tags: [gpu, inference, vllm, canary, rwo-cache]
+  parameters:
+    - name: expectedModelIdentity
+      displayName: Expected model identity
+      type: String
+      required: true
+      pattern: "^.+@sha256:[0-9a-f]{64}$"
+    - name: expectedModelRevision
+      displayName: Expected model revision
+      type: String
+      required: true
+      pattern: "^[0-9a-f]{40,64}$"
+    - name: expectedModelWeightsDigest
+      displayName: Expected model weights digest
+      type: String
+      required: true
+      pattern: "^sha256:[0-9a-f]{64}$"
+    - name: promptFixtureDigest
+      displayName: Prompt fixture digest
+      type: String
+      required: true
+      pattern: "^sha256:[0-9a-f]{64}$"
+    - name: requestTimeout
+      displayName: Request timeout
+      type: Duration
+      required: true
+  metrics:
+    - name: serviceReady
+      displayName: Service ready
+      type: Boolean
+      required: true
+    - name: modelIdentity
+      displayName: Loaded model identity
+      type: Status
+      required: true
+    - name: modelRevision
+      displayName: Loaded model revision
+      type: Status
+      required: true
+    - name: modelWeightsDigest
+      displayName: Loaded model weights digest
+      type: Status
+      required: true
+    - name: requestSucceeded
+      displayName: Request succeeded
+      type: Boolean
+      required: true
+    - name: promptTokens
+      displayName: Prompt tokens
+      type: Count
+      required: true
+    - name: completionTokens
+      displayName: Completion tokens
+      type: Count
+      required: true
+    - name: errorSourceCounts
+      displayName: Named server and request error counts
+      type: Status
+      required: true
+    - name: restartSourceCounts
+      displayName: Named harness container and Workflow Pod restart counts
+      type: Status
+      required: true
+    - name: tensorParallelSize
+      displayName: Tensor parallel size
+      type: Count
+      required: true
+    - name: observedGpuCount
+      displayName: Observed GPU count
+      type: Count
+      unit: devices
+      required: true
+    - name: activeGpuCount
+      displayName: GPUs used by the serving process
+      type: Count
+      unit: devices
+      required: true
+    - name: endToEndLatency
+      displayName: End-to-end latency
+      type: Latency
+      unit: ms
+    - name: timeToFirstToken
+      displayName: Time to first token
+      type: Latency
+      unit: ms
+    - name: outputTokensPerSecond
+      displayName: Output token throughput
+      type: Throughput
+      unit: tokens/s
+    - name: gpuMemoryUsed
+      displayName: GPU memory used
+      type: Gauge
+      unit: bytes
+  topology:
+    minParticipants: 1
+    maxParticipants: 1
+  driver:
+    type: WorkflowTemplate
+    workflowTemplate:
+      name: project-signal-vllm-canary-v1
+      digest: {{ $templateDigest }}
+{{- end }}

@@ -244,7 +244,7 @@ type ResolvedStagePlan struct {
 	Schedule         StageSchedule                         `json:"schedule"`
 	Retry            *StageRetryPolicy                     `json:"retry,omitempty"`
 	Optional         bool                                  `json:"optional,omitempty"`
-	// +kubebuilder:validation:MaxItems=8
+	// +kubebuilder:validation:MaxItems=16
 	// +listType=map
 	// +listMapKey=name
 	Assertions                []TestAssertion  `json:"assertions,omitempty"`

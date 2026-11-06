@@ -63,6 +63,136 @@ func TestValidateCheckPlanVariableLengths(t *testing.T) {
 	}
 }
 
+func TestExecutionAuthorityFailsClosed(t *testing.T) {
+	t.Parallel()
+
+	scheme := runtime.NewScheme()
+	if err := corev1.AddToScheme(scheme); err != nil {
+		t.Fatal(err)
+	}
+
+	immutable := true
+	authorityName := "project-signal-execution-authority-aaaaaaaaaaaa-bbbbbbbbbbbb"
+	valid := &corev1.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      authorityName,
+			Namespace: "signal-authority",
+		},
+		Immutable: &immutable,
+		Data: map[string]string{
+			"acceptanceSuitesEnabled": "true",
+			"cutoverApproved":         "true",
+			"sourceCommit":            strings.Repeat("a", 40),
+			"staticPackageDigest":     "sha256:" + strings.Repeat("b", 64),
+		},
+	}
+	validState := &corev1.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      ExecutionStateName,
+			Namespace: "signal-authority",
+		},
+		Data: map[string]string{"hardAbort": "false"},
+	}
+
+	for _, tt := range []struct {
+		name        string
+		mutate      func(*corev1.ConfigMap)
+		mutateState func(*corev1.ConfigMap)
+		valid       bool
+	}{
+		{name: "valid", valid: true},
+		{
+			name: "cutover absent",
+			mutate: func(authority *corev1.ConfigMap) {
+				delete(authority.Data, "cutoverApproved")
+			},
+		},
+		{
+			name: "mutable",
+			mutate: func(authority *corev1.ConfigMap) {
+				authority.Immutable = nil
+			},
+		},
+		{
+			name: "different source commit",
+			mutate: func(authority *corev1.ConfigMap) {
+				authority.Data["sourceCommit"] = strings.Repeat("b", 40)
+			},
+		},
+		{
+			name: "different static package",
+			mutate: func(authority *corev1.ConfigMap) {
+				authority.Data["staticPackageDigest"] = "sha256:" + strings.Repeat("c", 64)
+			},
+		},
+		{
+			name: "state hard abort active",
+			mutateState: func(state *corev1.ConfigMap) {
+				state.Data["hardAbort"] = "true"
+			},
+		},
+		{
+			name: "immutable state",
+			mutateState: func(state *corev1.ConfigMap) {
+				immutable := true
+				state.Immutable = &immutable
+			},
+		},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			authority := valid.DeepCopy()
+			if tt.mutate != nil {
+				tt.mutate(authority)
+			}
+
+			state := validState.DeepCopy()
+			if tt.mutateState != nil {
+				tt.mutateState(state)
+			}
+
+			kube := fake.NewClientBuilder().WithScheme(scheme).WithObjects(authority, state).Build()
+			reconciler := &AdmissionReconciler{
+				Client:              kube,
+				APIReader:           kube,
+				Namespace:           "signal-system",
+				AuthorityNamespace:  "signal-authority",
+				AuthorityName:       authorityName,
+				SourceCommit:        strings.Repeat("a", 40),
+				StaticPackageDigest: "sha256:" + strings.Repeat("b", 64),
+			}
+
+			err := reconciler.requireExecutionAuthority(context.Background())
+			if tt.valid && err != nil {
+				t.Fatalf("requireExecutionAuthority() error = %v", err)
+			}
+
+			if !tt.valid && err == nil {
+				t.Fatal("requireExecutionAuthority() accepted unsafe authority")
+			}
+
+			runReconciler := &RunReconciler{
+				Client:              kube,
+				APIReader:           kube,
+				AuthorityNamespace:  "signal-authority",
+				AuthorityName:       authorityName,
+				SourceCommit:        strings.Repeat("a", 40),
+				StaticPackageDigest: "sha256:" + strings.Repeat("b", 64),
+			}
+
+			runErr := runReconciler.requireExecutionAuthority(context.Background())
+			if tt.valid && runErr != nil {
+				t.Fatalf("RunReconciler.requireExecutionAuthority() error = %v", runErr)
+			}
+
+			if !tt.valid && runErr == nil {
+				t.Fatal("RunReconciler.requireExecutionAuthority() accepted unsafe authority")
+			}
+		})
+	}
+}
+
 func TestBuildResolvedWorkflowOrdersPhasesAndConcurrentStages(t *testing.T) {
 	t.Parallel()
 
@@ -974,6 +1104,57 @@ func TestResolvePhasePlanEnforcesCertificationTestTrust(t *testing.T) {
 	}
 }
 
+func TestResolveWorkflowTemplateInputPinsLiveSemanticIdentity(t *testing.T) {
+	t.Parallel()
+
+	template := &unstructured.Unstructured{Object: map[string]any{
+		"apiVersion": "argoproj.io/v1alpha1",
+		"kind":       "WorkflowTemplate",
+		"metadata": map[string]any{
+			"name":            "vllm-canary",
+			"namespace":       "signal-system",
+			"resourceVersion": "42",
+		},
+		"spec": map[string]any{
+			"entrypoint": "canary",
+			"templates": []any{
+				map[string]any{"name": "canary", "container": map[string]any{"image": pinnedImage("vllm", "a")}},
+			},
+		},
+	}}
+	template.SetGroupVersionKind(workflowTemplateGVK)
+
+	digest, err := workflowTemplateSemanticDigest(template)
+	if err != nil {
+		t.Fatalf("workflowTemplateSemanticDigest() error = %v", err)
+	}
+
+	kube := fake.NewClientBuilder().WithObjects(template).Build()
+	reconciler := &AdmissionReconciler{
+		Client:    kube,
+		APIReader: kube,
+		Namespace: "signal-system",
+	}
+	driver := &signalv1.WorkflowTemplateTestDriver{Name: "vllm-canary", Digest: digest}
+
+	input, err := reconciler.resolveWorkflowTemplateInput(context.Background(), driver)
+	if err != nil {
+		t.Fatalf("resolveWorkflowTemplateInput() error = %v", err)
+	}
+
+	if input.Kind != signalv1.ResolvedInputKindWorkflowTemplate ||
+		input.State != signalv1.ResolvedInputStateComplete ||
+		input.Resolved != "vllm-canary@42" ||
+		input.Digest != digest {
+		t.Fatalf("resolved WorkflowTemplate input = %#v", input)
+	}
+
+	driver.Digest = "sha256:" + strings.Repeat("f", 64)
+	if _, err := reconciler.resolveWorkflowTemplateInput(context.Background(), driver); err == nil {
+		t.Fatal("resolveWorkflowTemplateInput() accepted a semantic digest mismatch")
+	}
+}
+
 func resolvedWorkflowTestRun() *signalv1.CertificationRun {
 	runOnce := signalv1.StageSchedule{
 		Mode:              signalv1.CheckExecutionModeRunOnce,
@@ -1416,6 +1597,44 @@ func TestSuiteWatchRequestsProfileNodes(t *testing.T) {
 	requests := reconciler.requestsForSuite(context.Background(), suite)
 	if len(requests) != 1 || requests[0].Name != node.Name {
 		t.Fatalf("requestsForSuite() = %#v, want Node %s", requests, node.Name)
+	}
+}
+
+func TestProfileWatchRequestsProfileNodes(t *testing.T) {
+	t.Parallel()
+
+	scheme := runtime.NewScheme()
+	if err := corev1.AddToScheme(scheme); err != nil {
+		t.Fatalf("add core scheme: %v", err)
+	}
+
+	if err := signalv1.AddToScheme(scheme); err != nil {
+		t.Fatalf("add signal scheme: %v", err)
+	}
+
+	profile := &signalv1.CertificationProfile{ObjectMeta: metav1.ObjectMeta{Name: "profile-a"}}
+	node := &corev1.Node{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:   "node-a",
+			Labels: map[string]string{RequestLabel: profile.Name},
+		},
+	}
+	otherNode := &corev1.Node{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:   "node-b",
+			Labels: map[string]string{RequestLabel: "profile-b"},
+		},
+	}
+
+	kube := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(node, otherNode).
+		Build()
+	reconciler := &AdmissionReconciler{Client: kube}
+
+	requests := reconciler.requestsForProfile(context.Background(), profile)
+	if len(requests) != 1 || requests[0].Name != node.Name {
+		t.Fatalf("requestsForProfile() = %#v, want Node %s", requests, node.Name)
 	}
 }
 
