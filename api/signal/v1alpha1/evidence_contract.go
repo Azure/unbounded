@@ -198,7 +198,7 @@ type StageEvidenceSummary struct {
 	// +listMapKey=participantIndex
 	// +listMapKey=deviceID
 	DeviceIntervalCoverage []DeviceIntervalCoverageSummary `json:"deviceIntervalCoverage,omitempty"`
-	// +kubebuilder:validation:MaxItems=8
+	// +kubebuilder:validation:MaxItems=16
 	// +listType=map
 	// +listMapKey=index
 	Participants []ParticipantEvidenceIdentity `json:"participants,omitempty"`

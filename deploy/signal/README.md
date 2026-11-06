@@ -14,8 +14,14 @@ fleet scheduling are intentionally deferred.
 
 ## Components
 
-- `CertificationSuite` is the cluster-scoped executable policy: it selects an
-  immutable script bundle and defines a named ordered executable plan.
+- `CertificationTest` is the cluster-scoped reusable test catalog entry. It
+  declares typed parameters and metrics, participant topology, security
+  requirements, and one immutable Script, Container, or WorkflowTemplate
+  driver. Trust is an explicit status decision: `Approved`, `Diagnostic`,
+  `Rejected`, or `Revoked`.
+- `CertificationSuite` is the cluster-scoped executable policy. New Suites
+  define ordered Startup, Validation, and Terminal phases containing named
+  stages. Stages within one phase execute concurrently.
 - `CertificationProfile` is cluster-scoped admission policy: it defines
   participant selection and references one Suite.
 - `CertificationRun` is a namespaced, immutable execution snapshot.
@@ -28,19 +34,17 @@ fleet scheduling are intentionally deferred.
   creates the Workflow, persists status and evidence, performs teardown, and
   reconciles qualification ledgers and the optional protected qualification
   gate.
-- `project-signal-participant-adapter` creates Pod or MPIJob backends and
-  captures typed evidence. Ordinary completed Pods remain until controller
-  teardown. The adapter retains MPI workers long enough to prove their Node
-  identities, persists each check result in an immutable ConfigMap, and then
-  deletes the MPIJob before the next sequential check so its GPUs are released.
-  On setup, observation, or wall-clock deadline failures, the adapter first
-  persists the available evidence and then quiesces uncertain backends.
-- `project-signal-participant-adapter` is a fixed WorkflowTemplate used by
-  every check. Profiles and Suites cannot replace it or pass arbitrary
-  Workflow wiring.
+- `project-signal-participant-adapter` executes resolved Script, Container,
+  and WorkflowTemplate stages and captures typed invocation evidence. Script
+  and Container stages use participant-pinned Pods. WorkflowTemplate stages
+  verify the approved template name, live resource version, and semantic
+  digest before creating the bounded child Workflow.
+- `project-signal-participant-adapter` is the fixed controller-to-adapter
+  WorkflowTemplate used by every legacy check and resolved stage. Profiles and
+  Suites cannot replace that control-plane template.
 
-Argo Workflows is required. The Kubeflow MPI Operator is required only when a
-referenced Suite contains an `MPIJob` check.
+Argo Workflows is required. The Kubeflow MPI Operator is required only for
+legacy Suites that still contain an `MPIJob` check.
 
 ## First deployment
 
@@ -60,6 +64,22 @@ digest in the controller arguments. Supplying
 `SIGNAL_WORKFLOW_TEMPLATE_DIGEST=sha256:<digest>` turns that value into an
 expected digest and makes rendering fail if the rendered template differs.
 Controller, adapter, and runner images must all be immutable digest references.
+Set `SIGNAL_RESOLVER_IMAGES` to a comma-separated list of digest-pinned
+resolver images when external input resolution is part of the accepted plan.
+Those images are recorded in immutable plan and evidence provenance.
+
+Rendering also installs an immutable `project-signal-gpu-inventory-v1` script
+ConfigMap and two catalog entries:
+
+- `project-signal-gpu-inventory-v1` is the single canonical qualification
+  test after an operator records an `Approved` trust decision for its exact
+  generation and content digest.
+- `project-signal-gpu-inventory-compat-v1` is compatibility-only and must
+  receive `Diagnostic` trust. R01 through R15 may reference it to preserve
+  legacy names and order, but those stages receive no qualification credit.
+
+The renderer independently hashes the exact ConfigMap script bytes and fails
+when they do not match `SIGNAL_GPU_INVENTORY_SCRIPT_DIGEST`.
 
 Install the rendered CRDs and namespaced resources:
 
@@ -70,80 +90,138 @@ kubectl apply -f deploy/signal/rendered/
 
 The install creates:
 
-- the `CertificationSuite`, `CertificationProfile`, `CertificationRun`,
-  `CertificationPolicy`, and `NodeCertification` CRDs;
+- the `CertificationTest`, `CertificationSuite`, `CertificationProfile`,
+  `CertificationRun`, `CertificationPolicy`, and `NodeCertification` CRDs;
 - the `project-signal` namespace;
 - controller and adapter service accounts and RBAC;
 - the fixed participant adapter WorkflowTemplate;
+- the immutable GPU inventory source and untrusted catalog specifications;
 - the controller Deployment.
 
 The controller requires cluster permission to get, list, watch, update, and
 patch Nodes because it owns participant reservation markers, cordons, and
 qualification-label reconciliation. Exact Node UID checks in the controller
 prevent a replacement Node with the same name from inheriting reservation or
-qualification state. The controller watches Profiles and Suites for admission
-changes, and Policies, NodeCertifications, Runs, Profiles, Suites, and Nodes
-for qualification changes. The deployment-owned runner image is copied into
-every immutable Run check snapshot. Profile and Suite authors cannot replace
-it.
+qualification state. The controller watches Profiles, Suites, and Tests for
+admission changes, and Policies, NodeCertifications, Runs, Profiles, Suites,
+and Nodes for qualification changes. Legacy checks use the deployment-owned
+runner image. Generic Script and Container drivers must carry their own exact
+digest-pinned runtime identity in the approved Test.
 
 ## CertificationSuite contract
 
-A Suite is a named ordered executable plan. It owns the script bundle and
-check definitions that admission resolves into a Run:
+A phase-based Suite is an ordered execution plan:
 
 | Field | Meaning |
 |---|---|
-| `spec.scriptBundle.name` | Immutable source ConfigMap containing the selected scripts |
-| `spec.scriptBundle.digest` | Aggregate SHA-256 digest of the selected script contents in check order |
-| `spec.checks` | Ordered executable plan; position defines the stable check ID starting at R01 |
+| `spec.phases` | Ordered phases; Startup must be first and Terminal must be last |
+| `phase.role` | `Startup`, `Validation`, or `Terminal` |
+| `phase.stages` | Named stages that execute concurrently within the phase |
+| `stage.test` | Exact Test name, UID, generation, and accepted content digest |
+| `stage.schedule` | `RunOnce`, `Continuous`, or `Periodic` execution contract |
+| `stage.assertions` | Typed assertions over metrics declared by the referenced Test |
+| `stage.retry` | Optional retry of infrastructure failures only |
 
-**Implementation and safety limit:** a Suite currently accepts between 1 and
-256 checks. This guardrail bounds Kubernetes object growth, CEL evaluation
-cost, generated Workflow size, and evidence size. It is not the product
-abstraction exposed to operators.
+`RunOnce` always has one positive, whole-second `invocationTimeout` and cannot
+declare repeated-execution fields. `Continuous` and `Periodic` additionally
+require a positive coverage window, minimum execution count, and maximum gap.
+`Periodic` also requires an interval. Startup and Terminal stages must use
+`RunOnce`.
 
-The source ConfigMap must set `immutable: true` and must not use `binaryData`.
-The aggregate digest is derived by computing the algorithm-qualified SHA-256
-digest of each selected script's exact bytes, writing those digest strings
-with one newline after each string in Suite check order, and computing the
-SHA-256 digest of that manifest. Certification admission rejects the request
-if the current source bytes do not match the pinned aggregate digest.
-Unreferenced ConfigMap keys are not part of the digest because they cannot
-execute in that Suite.
+The adapter owns repeated invocation scheduling. An interruption never
+silently resumes or aggregates prior activity into a new qualification window.
+Persisted invocation evidence may be used only to resume the same immutable
+execution identity. A replacement Run starts coverage from zero.
 
-Each check contains:
+The controller resolves every Test and fails admission when:
 
-| Field | Meaning |
-|---|---|
-| `scriptKey` | Key in the Suite's `spec.scriptBundle.name`; admission snapshots the verified bytes and records their SHA-256 digest |
-| `backend` | `Pod` or `MPIJob` |
-| `backendActiveDeadline` | Backend execution deadline |
-| `minDuration` | Optional minimum uninterrupted observed duration required for a passing check |
-| `continuity` | Optional maximum sample gap, same-boot, and per-device coverage requirements |
-| `gpuCount` | GPU request; must be positive for MPIJob |
-| `workloadPolicy` | Narrow container resources and host access policy |
+- the Test UID, generation, or accepted content digest differs from the Suite;
+- trust status is missing, stale, rejected, or revoked;
+- required parameters, participant roles, or metric assertions are invalid;
+- a mutable environment input remains unresolved for an otherwise approved
+  stage;
+- a WorkflowTemplate's live semantic digest differs from its approved driver
+  digest; or
+- phase deadlines cannot be represented safely.
 
-When `minDuration` is set, backend success before that observed duration does
-not prove the check. `continuity.maxSampleGap` must not exceed either the
-backend deadline or `minDuration`. `requireSameBootID` rejects evidence that
-spans a participant reboot, and `requirePerDeviceCoverage` requires evidence
-for every device in the starting inventory. These requirements are verified
-from evidence; the controller does not infer continuity from elapsed wall-clock
-time alone.
+An approved Test with complete immutable inputs may be qualification eligible.
+A Diagnostic Test or a stage with incomplete inputs is always diagnostic.
+The adapter detects repeated qualification stages with the same Test identity
+and driver identity and forces the duplicate execution inconclusive. Renaming
+the same source cannot create independent qualification evidence.
 
-Workload policy is intentionally constrained:
+### CertificationTest drivers
 
-- `ipcLock` is the only supported added Linux capability;
-- host sources must be under `/proc`, `/sys`, or
-  `/var/lib/project-signal`;
-- host mounts are read-only and their volume names and `Directory` type are
-  controller-owned;
-- scheduling tolerations are controller-owned;
-- arbitrary PodSpec, Workflow, retry, TTL, queue, and cleanup settings are not
-  accepted.
+- **Script:** uses an immutable ConfigMap, OCI artifact, or Git commit plus an
+  exact source digest, digest-pinned runner image, and explicit resource
+  requirements. The current Kubernetes executor supports immutable ConfigMap
+  script sources.
+- **Container:** uses a digest-pinned image with bounded command, arguments,
+  resources, and reviewed security requirements.
+- **WorkflowTemplate:** uses an approved name and semantic SHA-256 digest. At
+  admission, the controller reads the live template, recomputes the digest of
+  its `spec`, and pins `name@resourceVersion`. At execution, the adapter
+  verifies all three values before creating the child Workflow.
+
+Test trust is a separate operator or policy decision through the
+`CertificationTest/status` subresource. Applying the catalog specification
+does not approve it.
+
+After applying a Test specification, read its live generation, independently
+compute the canonical specification digest, and record the trust decision
+through the status subresource. For example:
+
+```bash
+test_name=project-signal-gpu-inventory-v1
+generation="$(kubectl get certificationtest "$test_name" -o jsonpath='{.metadata.generation}')"
+content_digest="$(go run ./hack/cmd/manifest-digest \
+  --file deploy/signal/rendered/05-gpu-inventory-tests.yaml \
+  --kind CertificationTest --name "$test_name" --field spec)"
+kubectl patch certificationtest "$test_name" --subresource=status --type=merge \
+  -p "{\"status\":{\"observedGeneration\":${generation},\"trust\":{\"state\":\"Approved\",\"contentDigest\":\"${content_digest}\",\"reason\":\"reviewed immutable qualification test\"}}}"
+```
+
+Use `Diagnostic`, not `Approved`, for
+`project-signal-gpu-inventory-compat-v1`. A new Test generation invalidates
+the prior trust decision until it is reviewed again.
+
+### Legacy compatibility
+
+Legacy `spec.scriptBundle` plus `spec.checks` remains readable and executable
+for migration. A Suite must use exactly one model: phases or legacy checks.
+Do not create new qualification definitions with the legacy model.
+
+The prior R01 through R15 baseline used 15 byte-identical copies of one GPU
+inventory script. Migration preserves those names only as ordered diagnostic
+stages referencing `project-signal-gpu-inventory-compat-v1`. The qualification
+Suite contains one separate stage referencing the canonical
+`project-signal-gpu-inventory-v1` Test. The compatibility stages must not be
+represented as 15 independent tests or credited 15 times.
 
 Suite edits affect only future Runs.
+
+The acceptance Suite catalog is disabled until the applied Test objects have
+live UIDs, generations, reviewed content digests, and trust decisions. Render
+the catalog only after recording those exact identities:
+
+```bash
+make signal-manifests \
+  SIGNAL_ACCEPTANCE_SUITES_ENABLED=true \
+  SIGNAL_GPU_INVENTORY_TEST_UID=<live-uid> \
+  SIGNAL_GPU_INVENTORY_TEST_GENERATION=<live-generation> \
+  SIGNAL_GPU_INVENTORY_TEST_CONTENT_DIGEST=sha256:<reviewed-spec-digest> \
+  SIGNAL_GPU_COMPAT_TEST_UID=<live-uid> \
+  SIGNAL_GPU_COMPAT_TEST_GENERATION=<live-generation> \
+  SIGNAL_GPU_COMPAT_TEST_CONTENT_DIGEST=sha256:<reviewed-spec-digest>
+```
+
+This renders separate `project-signal-gpu-baseline-v1` and
+`project-signal-gpu-compat-v1` Suites. The baseline has one qualification
+stage. The compatibility Suite has 15 ordered diagnostic phases so R01 through
+R15 remain sequential without creating duplicate qualification credit.
+Environment-specific Profiles are deliberately not rendered because their
+participant selectors, namespaces, storage, network, and resolver inputs must
+be reviewed at cutover.
 
 ## CertificationProfile contract
 
@@ -154,12 +232,15 @@ A Profile contains the participant policy and references one Suite:
 | `spec.participants.count` | Total Nodes selected for a Run |
 | `spec.participants.selector` | Labels every selected Node must match |
 | `spec.suite.name` | Cluster-scoped Suite resolved and pinned at admission |
+| `spec.environment` | Approved namespace, storage, network, secret names, resolvers, model caches, object stores, and resource bounds |
 
 The requesting Node is participant zero. The remaining participants are
 selected deterministically from currently ready, schedulable, unreserved
-Nodes matching the participant selector and the resource floor derived from
-the largest per-Node check request. Every Suite check runs on this complete
-immutable participant set. Profile edits affect only future Runs.
+Nodes matching the participant selector. Named participant-role bindings must
+satisfy the Test topology. Environment references become qualification inputs
+only when they resolve to immutable digest identities. Secret values never
+enter Profile, Run, plan digest, or evidence objects. Profile edits affect only
+future Runs.
 
 For example, define the executable Suite separately from the participant
 Profile:
@@ -170,13 +251,35 @@ kind: CertificationSuite
 metadata:
   name: standard
 spec:
-  scriptBundle:
-    name: standard-scripts
-    digest: sha256:<aggregate-digest>
-  checks:
-    - scriptKey: node-readiness.sh
-      backend: Pod
-      backendActiveDeadline: 10m
+  phases:
+    - name: validation
+      role: Validation
+      stages:
+        - name: gpu-inventory
+          test:
+            name: project-signal-gpu-inventory-v1
+            uid: <test-uid>
+            generation: 1
+            contentDigest: sha256:<approved-test-content-digest>
+          schedule:
+            mode: RunOnce
+            invocationTimeout: 2m
+          assertions:
+            - name: nvidia-smi-available
+              metric: nvidiaSmiAvailable
+              operator: BooleanEquals
+              expected:
+                type: Boolean
+                booleanValue: true
+            - name: eight-gpus-visible
+              metric: observedGpuCount
+              operator: Range
+              minimum:
+                type: Integer
+                integerValue: 8
+              maximum:
+                type: Integer
+                integerValue: 8
 ---
 apiVersion: signal.unbounded-cloud.io/v1alpha1
 kind: CertificationProfile
@@ -203,24 +306,25 @@ kubectl label node <node-name> \
 
 Admission then:
 
-1. resolves the Profile's Suite and validates every configured check, source ConfigMap immutability, and the pinned aggregate script digest;
+1. resolves the Profile's Suite, every Test identity and trust decision, all
+   typed bindings and assertions, immutable environment inputs, and driver
+   provenance;
 2. selects the requesting Node plus any additional participants;
 3. atomically records the Run reservation name, participant Node UID, and
    `spec.unschedulable=true` on each participant;
-4. copies all verified scripts into one immutable Run-owned ConfigMap;
+4. resolves phase and stage schedules into one immutable plan and derives its
+   exact deadline and digest;
 5. creates one immutable `CertificationRun`;
 6. projects the pending certification state and marks admission ready.
 
 Ordinary workloads cannot schedule onto cordoned participants. Signal backend
-Pods receive only the fixed GPU toleration and the fixed
-`node.kubernetes.io/unschedulable` toleration needed to execute on the Nodes
-reserved by this Run. Ordinary Pod backends are pinned to one admitted Node
-name and UID. An MPI check creates one coordinated MPIJob with one launcher and
-one worker per participant. Required Node affinity limits workers to the exact
-admitted Node names and UIDs, required hostname anti-affinity places one worker
-per Node, and evidence maps each scheduled worker back to the immutable
-participant identity. The adapter has read-only `get` access to Nodes solely to
-record and verify the scheduled Node UID; it cannot mutate Nodes.
+Pods receive only the fixed unschedulable toleration needed to execute on
+participants reserved by this Run. Script and Container Pods are pinned to the
+admitted Node. A WorkflowTemplate invocation receives the complete participant
+and role bindings plus the primary participant name; the approved template
+remains responsible for its bounded workload shape. The adapter has read-only
+`get` access to Nodes solely to record and verify scheduled Node UIDs; it
+cannot mutate Nodes.
 
 ## CertificationRun contract
 
@@ -229,18 +333,21 @@ The Run spec snapshots:
 - Profile name, UID, and generation;
 - Suite name, UID, and generation;
 - ordered participants with Node name and Node UID;
-- the immutable script bundle name, UID, and aggregate digest;
-- the resolved executable plan snapshot;
-- each check's minimum-duration and continuity requirements;
+- the resolved phases and stages, Test identities, typed schemas, drivers,
+  parameters, participant roles, schedules, retries, assertions, and immutable
+  input identities;
+- controller, adapter, WorkflowTemplate, runner, and resolver provenance;
+- for legacy Runs only, the immutable script bundle and check snapshots;
 - monotonic `cancel` and `release` actions.
 
-The controller derives the Workflow deadline from the immutable backend
-deadlines plus a fixed one-minute evidence reserve for each check.
+The controller derives the Workflow deadline from ordered phase deadlines.
+Concurrent stages contribute the maximum stage deadline for their phase.
+Repeated schedules include the coverage window, invocation timeout, approved
+infrastructure retry tail, and bounded evidence reserve.
 
-Participant and check identity is positional. Participant zero is the
-requesting Node. Check positions derive stable IDs starting at R01.
-The controller derives these identities after every API read rather than
-serializing duplicate index and ID fields.
+Participant and stage positions remain immutable within the Run. Participant
+zero is the requesting Node. Legacy check positions still derive stable IDs
+starting at R01.
 
 Run status contains:
 
@@ -248,7 +355,7 @@ Run status contains:
 - phase and bounded reason;
 - Workflow name, UID, and observed phase;
 - evidence URI and SHA-256 digest;
-- positional check phases and bounded reasons;
+- phase and stage summaries with typed assertion and continuity results;
 - `Cordoned`, `WorkloadCleanupComplete`, and `Released` conditions.
 
 Measurements, backend identities, backend evidence, and execution timestamps
@@ -331,6 +438,70 @@ zero. Multiple shorter Runs do not prove one uninterrupted duration unless a
 Policy explicitly defines a repeated-Run requirement, and even then they remain
 separate credited executions rather than a continuous observation.
 
+## Bounded vLLM acceptance canary
+
+The vLLM canary is a separate WorkflowTemplate Test and must run separately
+from the GPU inventory baseline. It is disabled by default. Rendering it
+requires explicit immutable and bounded inputs:
+
+```bash
+make signal-manifests \
+  SIGNAL_VLLM_CANARY_ENABLED=true \
+  SIGNAL_VLLM_CANARY_IMAGE=<approved-harness>@sha256:<digest> \
+  SIGNAL_VLLM_CANARY_CPU=<approved-cpu-quantity> \
+  SIGNAL_VLLM_CANARY_MEMORY=<approved-memory-quantity> \
+  SIGNAL_VLLM_MODEL_CACHE_PVC=<approved-read-only-cache-pvc>
+```
+
+The renderer computes the semantic digest of the exact
+`project-signal-vllm-canary-v1` WorkflowTemplate `spec`. Supplying
+`SIGNAL_VLLM_WORKFLOW_TEMPLATE_DIGEST=sha256:<digest>` makes rendering fail on
+a mismatch. The corresponding Test records only that exact template digest.
+To render the separate vLLM acceptance Suite, also enable the acceptance Suite
+catalog and provide the live vLLM Test UID, generation, reviewed content
+digest, exact model identity, and bounded invocation timeout:
+
+```bash
+make signal-manifests \
+  SIGNAL_VLLM_CANARY_ENABLED=true \
+  SIGNAL_ACCEPTANCE_SUITES_ENABLED=true \
+  SIGNAL_VLLM_TEST_UID=<live-uid> \
+  SIGNAL_VLLM_TEST_GENERATION=<live-generation> \
+  SIGNAL_VLLM_TEST_CONTENT_DIGEST=sha256:<reviewed-spec-digest> \
+  SIGNAL_VLLM_MODEL_IDENTITY=<approved-model>@sha256:<digest> \
+  SIGNAL_VLLM_PROMPT_FIXTURE_DIGEST=sha256:<digest> \
+  SIGNAL_VLLM_REQUEST_TIMEOUT=<approved-duration> \
+  SIGNAL_VLLM_INVOCATION_TIMEOUT=<approved-duration> \
+  <the other required baseline and vLLM render inputs>
+```
+
+The approved harness contract receives canonical invocation, Run, plan, stage,
+participant, role, parameter, resolved-input, and result ConfigMap values. It
+must create one bounded result ConfigMap containing the canonical invocation
+result envelope. The template pins eight GPUs to the exact primary participant,
+mounts an operator-approved read-only model cache, disables container restart,
+and bounds temporary storage. The stage invocation timeout becomes the child
+Workflow deadline.
+
+Before creating the vLLM Suite and Profile, resolve and approve:
+
+- the harness image digest;
+- model, tokenizer, optional remote-code, and cache snapshot identities;
+- the exact WorkflowTemplate live resource version and semantic digest;
+- CPU, memory, cache capacity, startup timeout, request timeout, and total
+  invocation timeout; and
+- one deterministic prompt and decoding fixture.
+
+Hard assertions are limited to service readiness, exact model identity,
+request success, positive prompt and completion tokens, zero server errors,
+zero container restarts, exactly eight visible GPUs, and successful cleanup.
+All nine are explicit Suite assertions. The adapter additionally prevents a
+passed invocation from reporting failed Kubernetes cleanup.
+Latency, time to first token, output throughput, and GPU memory are recorded
+as measurements only until separate thresholds are approved. Do not infer
+MPI, burn, collective, CUDA correctness, or general serving performance from
+this canary.
+
 ## Terminal behavior
 
 The controller never releases a participant before evidence is durable and
@@ -342,8 +513,8 @@ all Workflow and backend resources are gone.
 - Set `spec.release: true` to release a non-successful Run after inspection.
 - Deleting a Run requests teardown. Its finalizer stops and removes owned
   workloads, verifies participant identity and reservation ownership, removes
-  owned cordons and reservations, deletes the script bundle, and then permits
-  deletion.
+    owned cordons and reservations, deletes legacy snapshots and generic stage
+    resources, and then permits deletion.
 
 Release uncordons a Node only when all of these still match:
 
@@ -373,40 +544,40 @@ kubectl patch certificationrun -n project-signal <run-name> \
 
 Evidence manifest v2 stores bounded, chunked evidence and includes:
 
-- Run, Profile, Suite, participant, script-bundle, and Workflow identities;
-- the immutable check snapshots and script contents;
+- Run, Profile, Suite, Test, participant, Workflow, and resolved-plan
+  identities;
+- immutable parameters, driver provenance, resolved inputs, and typed metric
+  schemas;
 - aggregate execution state, verdict, reason, phase, and timestamps;
-- each positional check's verdict and timing;
-- minimum-duration and continuity summaries, including observed duration,
-  sample count, maximum observed gap, same-boot status, and per-device
-  coverage;
-- typed Pod or MPIJob evidence, including Pods, containers, states, bounded
-  logs, and capture errors;
-- backend identities and participant positions;
-- a per-check cleanup disposition showing that deletion is deferred to the
-  controller.
+- each phase and stage verdict, execution mode, invocation sequence, assertion
+  result, observed coverage, maximum gap, per-device interval coverage, and
+  cleanup outcome;
+- redacted participant fingerprints and device aliases; and
+- controller, adapter, Script or Container runner, resolver, and
+  WorkflowTemplate provenance.
 
-The adapter persists typed backend evidence and leaves completed ordinary Pods
-in place. For each check, it creates one immutable result ConfigMap owned by
-the Workflow. The controller verifies the ConfigMap's ownership, run and check
-identity annotations, content digest, and bounded `result.json` payload before
-including the result in the durable evidence document. MPIJobs use
-`cleanPodPolicy: None` so the launcher and every worker remain available for
-evidence capture. After that evidence is durable, the adapter terminates the
-retained MPI workers without their ordinary Pod grace period, deletes the
-MPIJob in the foreground, and waits for the complete ownership tree to
-disappear before completing the task. If any backend cannot be quiesced, the
-adapter task fails and later checks are skipped rather than overlapping
-execution. The controller deletes the Workflow, its owned per-check result
-ConfigMaps, and all remaining owned backends only after the final evidence
-document is durable.
+The adapter persists one immutable stage result ConfigMap owned by the Run
+Workflow. Script and Container invocation results are read from canonical
+bounded logs. WorkflowTemplate drivers create one bounded result ConfigMap,
+which the adapter verifies and deletes with the child Workflow after capture.
+The controller verifies ownership, Run and plan identity annotations, content
+digest, runner provenance, and bounded payloads before including the stage in
+durable evidence.
+
+Raw Node names, GPU UUIDs, registry identities, and mutable model references
+must not enter typed measurements or durable artifacts. Participant identity
+projection uses the configured keyed HMAC contract when available; otherwise
+the external projection leaves the participant hash null.
+
+If any backend cannot be quiesced, the adapter reports failed cleanup and the
+stage cannot pass. The controller deletes the Run Workflow, owned stage result
+ConfigMaps, and remaining owned backends only after final evidence is durable.
 `WorkloadCleanupComplete=True` is the authoritative record that this
 controller-owned cleanup finished.
 
 Qualification reads terminal Run and evidence references, verifies the
-controller, adapter, runner, WorkflowTemplate, plan, Node UID, and evidence
-digests, and credits only evidence that satisfies the Policy. Adapter inputs,
-mounts, and environment do not change for evidence v2.
+controller, adapter, runner, resolver, WorkflowTemplate, Test, plan, Node UID,
+and evidence digests, and credits only evidence that satisfies the Policy.
 
 ## Operations
 
@@ -417,10 +588,11 @@ kubectl get certificationruns -n project-signal
 kubectl describe certificationrun -n project-signal <run-name>
 ```
 
-Inspect the immutable script bundle before terminal cleanup:
+Inspect the immutable canonical Script source and catalog:
 
 ```bash
-kubectl get configmap -n project-signal <run-name>-scripts -o yaml
+kubectl get configmap -n project-signal project-signal-gpu-inventory-v1 -o yaml
+kubectl get certificationtests.signal.unbounded-cloud.io
 ```
 
 Controller restarts are safe:
@@ -443,22 +615,29 @@ Use a guarded two-stage upgrade:
    before replacing controller execution semantics.
 3. Render with qualification protection disabled and verify the computed
    WorkflowTemplate digest is stable across two renders.
-4. Apply all five CRDs first, then controller and adapter RBAC, the
-   WorkflowTemplate, and finally the controller Deployment.
-5. Verify all five CRDs are Established, controller rollout is ready, the
+4. Apply all six CRDs first, then controller and adapter RBAC, catalog sources,
+   the adapter WorkflowTemplate, and finally the controller Deployment.
+5. Verify all six CRDs are Established, controller rollout is ready, the
    WorkflowTemplate adapter image matches `--adapter-image`, and the rendered
    WorkflowTemplate digest matches `--workflow-template-digest`.
 6. Confirm the default controller argument is
    `--qualification-gate-protected=false`, stale direct
    `signal.unbounded-cloud.io/eligibility=production` labels are removed, and
    protected-label ledgers report `NodeRestrictionUnverified`.
-7. Create or migrate Policies only after terminal evidence compatibility is
+7. Record Test trust only after independently hashing exact Test specs, source
+   bytes, images, and WorkflowTemplate semantics. A stale generation must not
+   remain trusted.
+8. Create the canonical GPU inventory Suite with one qualification stage.
+   Preserve R01-R15 only in a separate compatibility Suite using Diagnostic
+   trust and verify zero additional qualification credit.
+9. Run the GPU inventory baseline and vLLM acceptance as separate Runs.
+10. Create or migrate Policies only after terminal evidence compatibility is
    understood. Existing Runs remain readable, but only evidence satisfying the
    current Policy and evidence-v2 identity requirements receives qualification
    credit. Existing ledgers without a latest non-pass watermark remain
    readable; future Reset or Revoke evaluations persist the monotonic
    watermark.
-8. Enable protected projection only in a separate reviewed rollout after the
+11. Enable protected projection only in a separate reviewed rollout after the
    operator guard prerequisites are positively verified.
 
 Do not delete `CertificationPolicy` or `NodeCertification` CRDs while objects
@@ -470,6 +649,7 @@ Verify the deployed provenance and default-off gate:
 
 ```bash
 kubectl get crd \
+  certificationtests.signal.unbounded-cloud.io \
   certificationsuites.signal.unbounded-cloud.io \
   certificationprofiles.signal.unbounded-cloud.io \
   certificationruns.signal.unbounded-cloud.io \
@@ -485,9 +665,11 @@ kubectl get workflowtemplate -n project-signal \
 
 Independently hash the exact rendered WorkflowTemplate file and compare the
 algorithm-qualified digest with the controller argument. Verify controller
-RBAC can read all five certification resources and perform the documented
+RBAC can read all six certification resources and perform the documented
 Run, ledger, evidence, and exact-identity Node operations. Verify the adapter
-retains Node `get` and Argo `workflowtaskresults` `create` and `patch`.
+retains Node `get`, Pod and ConfigMap lifecycle plus logs, Workflow and
+WorkflowTemplate execution access, and Argo `workflowtaskresults` `create` and
+`patch`.
 
 ### Safe rollback
 
@@ -510,9 +692,10 @@ reconciler remove it before rolling back controller behavior.
 ## Non-goals
 
 - Kueue or other queue integration;
-- a Campaign CR, recurring campaign orchestration, or automatic retry;
-- arbitrary WorkflowTemplate, PodSpec, toleration, capability, or host-path
-  pass-through;
+- a Campaign CR, recurring campaign orchestration, or automatic cross-Run
+  retry;
+- unapproved WorkflowTemplates, arbitrary PodSpec, toleration, capability, or
+  host-path pass-through;
 - treating one successful Run as production eligibility;
 - converting repeated short Runs into an uninterrupted-duration claim;
 - general-purpose workload scheduling;

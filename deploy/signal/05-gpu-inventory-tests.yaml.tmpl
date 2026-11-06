@@ -1,0 +1,171 @@
+{{- $runnerImage := default "example.invalid/project-signal-runner@sha256:0000000000000000000000000000000000000000000000000000000000000000" .RunnerImage }}
+{{- if not (regexMatch "^[^@[:space:]]+@sha256:[0-9a-f]{64}$" $runnerImage) }}
+{{- fail "RunnerImage must be an immutable sha256 digest reference" }}
+{{- end }}
+{{- $scriptDigest := .GPUInventoryScriptDigest }}
+{{- if not (regexMatch "^sha256:[0-9a-f]{64}$" $scriptDigest) }}
+{{- fail "GPUInventoryScriptDigest must be an algorithm-qualified sha256 digest" }}
+{{- end }}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: project-signal-gpu-inventory-v1
+  namespace: {{ default "project-signal" .ScriptNamespace }}
+  labels:
+    app.kubernetes.io/name: project-signal-gpu-inventory
+    app.kubernetes.io/part-of: project-signal
+immutable: true
+data:
+  gpu-inventory.sh: |
+    #!/bin/sh
+    set -eu
+
+    started_at="$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
+    nvidia_smi_available=false
+    observed_gpu_count=0
+    driver_version_set=unavailable
+    outcome=Inconclusive
+    reason_code=TestHarnessFailure
+    message="nvidia-smi is unavailable"
+
+    if command -v nvidia-smi >/dev/null 2>&1; then
+      inventory="$(nvidia-smi -L 2>/dev/null || true)"
+      if [ -n "$inventory" ]; then
+        nvidia_smi_available=true
+        observed_gpu_count="$(printf '%s\n' "$inventory" | awk 'NF { count++ } END { print count + 0 }')"
+        driver_versions="$(nvidia-smi --query-gpu=driver_version --format=csv,noheader,nounits 2>/dev/null || true)"
+        distinct_driver_versions="$(printf '%s\n' "$driver_versions" | awk 'NF { seen[$0] = 1 } END { print length(seen) }')"
+        if [ "$distinct_driver_versions" -eq 1 ]; then
+          driver_version_set=consistent
+        elif [ "$distinct_driver_versions" -gt 1 ]; then
+          driver_version_set=mixed
+        else
+          driver_version_set=unknown
+        fi
+        outcome=Passed
+        reason_code=Completed
+        message="GPU inventory collected"
+      else
+        message="nvidia-smi did not return a GPU inventory"
+      fi
+    fi
+
+    visible_devices=
+    device_index=0
+    while [ "$device_index" -lt "$observed_gpu_count" ]; do
+      separator=
+      if [ -n "$visible_devices" ]; then
+        separator=,
+      fi
+      visible_devices="${visible_devices}${separator}\"gpu-index-${device_index}\""
+      device_index=$((device_index + 1))
+    done
+
+    finished_at="$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
+    printf '%s\n' "PROJECT_SIGNAL_INVOCATION_RESULT_V1 {\"schemaVersion\":\"signal.unbounded-cloud.io/invocation-result/v1\",\"invocationID\":\"${PROJECT_SIGNAL_INVOCATION_ID}\",\"runUID\":\"${PROJECT_SIGNAL_RUN_UID}\",\"stageID\":\"${PROJECT_SIGNAL_STAGE_ID}\",\"stageOrder\":${PROJECT_SIGNAL_STAGE_ORDER},\"planDigest\":\"${PROJECT_SIGNAL_PLAN_DIGEST}\",\"test\":{\"name\":\"${PROJECT_SIGNAL_TEST_NAME}\",\"uid\":\"${PROJECT_SIGNAL_TEST_UID}\",\"generation\":${PROJECT_SIGNAL_TEST_GENERATION},\"contentDigest\":\"${PROJECT_SIGNAL_TEST_CONTENT_DIGEST}\",\"trust\":\"${PROJECT_SIGNAL_TEST_TRUST}\"},\"resolvedInputs\":${PROJECT_SIGNAL_RESOLVED_INPUTS_JSON:-[]},\"startedAt\":\"${started_at}\",\"finishedAt\":\"${finished_at}\",\"monotonicDuration\":\"0s\",\"outcome\":\"${outcome}\",\"reasonCode\":\"${reason_code}\",\"message\":\"${message}\",\"exitCode\":0,\"measurements\":[{\"name\":\"nvidiaSmiAvailable\",\"value\":{\"type\":\"Boolean\",\"booleanValue\":${nvidia_smi_available}}},{\"name\":\"observedGpuCount\",\"value\":{\"type\":\"Integer\",\"integerValue\":${observed_gpu_count}},\"unit\":\"devices\"},{\"name\":\"driverVersionSet\",\"value\":{\"type\":\"String\",\"stringValue\":\"${driver_version_set}\"}}],\"participants\":[{\"index\":${PROJECT_SIGNAL_PARTICIPANT_INDEX},\"role\":\"${PROJECT_SIGNAL_PARTICIPANT_ROLE}\",\"outcome\":\"${outcome}\",\"start\":{\"nodeUID\":\"${PROJECT_SIGNAL_NODE_UID}\"},\"end\":{\"nodeUID\":\"${PROJECT_SIGNAL_NODE_UID}\"},\"visibleDevices\":[${visible_devices}],\"coveredDevices\":[${visible_devices}]}],\"activity\":{\"sampleCount\":1},\"cleanup\":{\"outcome\":\"NotRequired\"}}"
+
+---
+apiVersion: signal.unbounded-cloud.io/v1alpha1
+kind: CertificationTest
+metadata:
+  name: project-signal-gpu-inventory-v1
+  labels:
+    app.kubernetes.io/name: project-signal-gpu-inventory
+    app.kubernetes.io/part-of: project-signal
+    signal.unbounded-cloud.io/catalog-role: qualification
+spec:
+  displayName: GPU inventory
+  description: Collects a redacted GPU inventory and exposes typed availability, count, and driver consistency measurements.
+  owner: project-signal
+  version: "1"
+  tags: [gpu, inventory]
+  metrics:
+    - name: nvidiaSmiAvailable
+      displayName: nvidia-smi available
+      type: Boolean
+      required: true
+    - name: observedGpuCount
+      displayName: Observed GPU count
+      type: Count
+      unit: devices
+      required: true
+    - name: driverVersionSet
+      displayName: Driver version consistency
+      type: Status
+      required: true
+  topology:
+    minParticipants: 1
+    maxParticipants: 1
+  driver:
+    type: Script
+    script:
+      language: Shell
+      source:
+        type: ConfigMap
+        configMap:
+          name: project-signal-gpu-inventory-v1
+          key: gpu-inventory.sh
+          digest: {{ $scriptDigest }}
+      runnerImage: {{ $runnerImage }}
+      resources:
+        requests:
+          cpu: 100m
+          memory: 64Mi
+          nvidia.com/gpu: "8"
+        limits:
+          cpu: 500m
+          memory: 128Mi
+          nvidia.com/gpu: "8"
+
+---
+apiVersion: signal.unbounded-cloud.io/v1alpha1
+kind: CertificationTest
+metadata:
+  name: project-signal-gpu-inventory-compat-v1
+  labels:
+    app.kubernetes.io/name: project-signal-gpu-inventory
+    app.kubernetes.io/part-of: project-signal
+    signal.unbounded-cloud.io/catalog-role: compatibility-diagnostic
+spec:
+  displayName: GPU inventory compatibility diagnostic
+  description: Compatibility-only alias for ordered legacy R01-R15 diagnostics; it must never receive qualification trust.
+  owner: project-signal
+  version: "1"
+  tags: [gpu, inventory, compatibility, diagnostic]
+  metrics:
+    - name: nvidiaSmiAvailable
+      displayName: nvidia-smi available
+      type: Boolean
+      required: true
+    - name: observedGpuCount
+      displayName: Observed GPU count
+      type: Count
+      unit: devices
+      required: true
+    - name: driverVersionSet
+      displayName: Driver version consistency
+      type: Status
+      required: true
+  topology:
+    minParticipants: 1
+    maxParticipants: 1
+  driver:
+    type: Script
+    script:
+      language: Shell
+      source:
+        type: ConfigMap
+        configMap:
+          name: project-signal-gpu-inventory-v1
+          key: gpu-inventory.sh
+          digest: {{ $scriptDigest }}
+      runnerImage: {{ $runnerImage }}
+      resources:
+        requests:
+          cpu: 100m
+          memory: 64Mi
+          nvidia.com/gpu: "8"
+        limits:
+          cpu: 500m
+          memory: 128Mi
+          nvidia.com/gpu: "8"

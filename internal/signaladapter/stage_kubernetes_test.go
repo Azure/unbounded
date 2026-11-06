@@ -14,6 +14,7 @@ import (
 
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -788,5 +789,91 @@ func stageExecutionInvocation() StageInvocation {
 			NodeUID:  "node-uid",
 		}},
 		ParticipantRole: map[int32]string{0: "participant"},
+	}
+}
+
+func TestStagePodCarriesScriptResourcesAndImmutableIdentity(t *testing.T) {
+	t.Parallel()
+
+	workflow := &unstructured.Unstructured{}
+	workflow.SetAPIVersion("argoproj.io/v1alpha1")
+	workflow.SetKind("Workflow")
+	workflow.SetName("run-workflow")
+	workflow.SetUID("workflow-uid")
+
+	invocation := StageInvocation{
+		ID:         "invocation-1",
+		RunUID:     types.UID("run-uid"),
+		PlanDigest: testStageDigest("plan"),
+		StageOrder: 2,
+		Stage: signalv1.ResolvedStagePlan{
+			Name: "gpu-inventory",
+			Test: signalv1.ResolvedCertificationTest{
+				Identity: signalv1.TestIdentitySnapshot{
+					Name:          "gpu-inventory",
+					UID:           types.UID("test-uid"),
+					Generation:    3,
+					ContentDigest: testStageDigest("test"),
+					Trust:         signalv1.CertificationTestTrustApproved,
+				},
+				Driver: signalv1.CertificationTestDriver{
+					Type: signalv1.TestDriverTypeScript,
+					Script: &signalv1.ScriptTestDriver{
+						Language: signalv1.ScriptLanguageShell,
+						Source: signalv1.ImmutableArtifactSource{
+							Type: signalv1.ArtifactSourceTypeConfigMap,
+							ConfigMap: &signalv1.ConfigMapArtifactSource{
+								Name:   "gpu-inventory",
+								Key:    "gpu-inventory.sh",
+								Digest: testStageDigest("script"),
+							},
+						},
+						RunnerImage: "example.invalid/runner@sha256:" + strings.Repeat("a", 64),
+						Resources: corev1.ResourceRequirements{
+							Requests: corev1.ResourceList{
+								corev1.ResourceName("nvidia.com/gpu"): resource.MustParse("8"),
+							},
+						},
+					},
+				},
+			},
+			Schedule: signalv1.StageSchedule{
+				Mode:              signalv1.CheckExecutionModeRunOnce,
+				InvocationTimeout: metav1.Duration{Duration: 2},
+			},
+		},
+		Participants: []signalv1.Participant{{
+			NodeName: "participant",
+			NodeUID:  types.UID("participant-uid"),
+		}},
+		ParticipantRole: map[int32]string{0: "participant"},
+	}
+
+	executor := KubernetesStageExecutor{Namespace: "signal-system", ExecutionName: "execution"}
+	pod, err := executor.stagePod(workflow, invocation, 0)
+	if err != nil {
+		t.Fatalf("stagePod() error = %v", err)
+	}
+
+	gpu := pod.Spec.Containers[0].Resources.Requests[corev1.ResourceName("nvidia.com/gpu")]
+	if gpu.Cmp(resource.MustParse("8")) != 0 {
+		t.Fatalf("script GPU request = %s, want 8", gpu.String())
+	}
+
+	env := make(map[string]string)
+	for _, variable := range pod.Spec.Containers[0].Env {
+		env[variable.Name] = variable.Value
+	}
+
+	for name, want := range map[string]string{
+		"PROJECT_SIGNAL_TEST_NAME":           "gpu-inventory",
+		"PROJECT_SIGNAL_TEST_UID":            "test-uid",
+		"PROJECT_SIGNAL_TEST_GENERATION":     "3",
+		"PROJECT_SIGNAL_TEST_CONTENT_DIGEST": testStageDigest("test"),
+		"PROJECT_SIGNAL_TEST_TRUST":          string(signalv1.CertificationTestTrustApproved),
+	} {
+		if env[name] != want {
+			t.Fatalf("%s = %q, want %q", name, env[name], want)
+		}
 	}
 }

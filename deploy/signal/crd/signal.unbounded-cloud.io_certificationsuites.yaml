@@ -605,7 +605,7 @@ spec:
                               - message: percentile is valid only for PercentileMaximum
                                   assertions
                                 rule: self.operator == 'PercentileMaximum' || !has(self.percentile)
-                            maxItems: 8
+                            maxItems: 16
                             type: array
                             x-kubernetes-list-map-keys:
                             - name

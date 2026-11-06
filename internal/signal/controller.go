@@ -111,6 +111,12 @@ var workflowGVK = schema.GroupVersionKind{
 	Kind:    "Workflow",
 }
 
+var workflowTemplateGVK = schema.GroupVersionKind{
+	Group:   "argoproj.io",
+	Version: "v1alpha1",
+	Kind:    "WorkflowTemplate",
+}
+
 type adapterBackendEvidence struct {
 	Version      string                              `json:"version"`
 	Identity     adapterEvidenceIdentity             `json:"identity"`
@@ -1158,6 +1164,15 @@ func (r *AdmissionReconciler) resolveStage(
 	}
 
 	inputs := deepCopyResolvedInputs(environmentInputs)
+	if test.Spec.Driver.Type == signalv1.TestDriverTypeWorkflowTemplate {
+		templateInput, err := r.resolveWorkflowTemplateInput(ctx, test.Spec.Driver.WorkflowTemplate)
+		if err != nil {
+			return nil, err
+		}
+
+		inputs = append(inputs, templateInput)
+	}
+
 	completeInputs := slices.IndexFunc(inputs, func(input signalv1.ResolvedInputIdentity) bool {
 		return input.State != signalv1.ResolvedInputStateComplete
 	}) == -1
@@ -1221,6 +1236,79 @@ func (r *AdmissionReconciler) resolveStage(
 	}
 
 	return resolved, nil
+}
+
+func (r *AdmissionReconciler) resolveWorkflowTemplateInput(
+	ctx context.Context,
+	driver *signalv1.WorkflowTemplateTestDriver,
+) (signalv1.ResolvedInputIdentity, error) {
+	if driver == nil {
+		return signalv1.ResolvedInputIdentity{}, errors.New("WorkflowTemplate driver configuration is absent")
+	}
+
+	reader := r.APIReader
+	if reader == nil {
+		reader = r.Client
+	}
+
+	template := &unstructured.Unstructured{}
+	template.SetGroupVersionKind(workflowTemplateGVK)
+	if err := reader.Get(
+		ctx,
+		client.ObjectKey{Namespace: r.Namespace, Name: driver.Name},
+		template,
+	); err != nil {
+		return signalv1.ResolvedInputIdentity{}, fmt.Errorf(
+			"get WorkflowTemplate %s: %w",
+			driver.Name,
+			err,
+		)
+	}
+
+	digest, err := workflowTemplateSemanticDigest(template)
+	if err != nil {
+		return signalv1.ResolvedInputIdentity{}, fmt.Errorf(
+			"digest WorkflowTemplate %s: %w",
+			driver.Name,
+			err,
+		)
+	}
+
+	if digest != driver.Digest {
+		return signalv1.ResolvedInputIdentity{}, fmt.Errorf(
+			"WorkflowTemplate %s semantic digest %s does not match approved digest %s",
+			driver.Name,
+			digest,
+			driver.Digest,
+		)
+	}
+
+	return signalv1.ResolvedInputIdentity{
+		Name:      "workflow-template",
+		Kind:      signalv1.ResolvedInputKindWorkflowTemplate,
+		Requested: driver.Name,
+		State:     signalv1.ResolvedInputStateComplete,
+		Resolved:  driver.Name + "@" + template.GetResourceVersion(),
+		Digest:    digest,
+	}, nil
+}
+
+func workflowTemplateSemanticDigest(template *unstructured.Unstructured) (string, error) {
+	spec, found, err := unstructured.NestedMap(template.Object, "spec")
+	if err != nil {
+		return "", err
+	}
+
+	if !found {
+		return "", errors.New("WorkflowTemplate spec is missing")
+	}
+
+	content, err := json.Marshal(spec)
+	if err != nil {
+		return "", err
+	}
+
+	return digestBytes(content), nil
 }
 
 func canonicalDigest(value any) (string, error) {

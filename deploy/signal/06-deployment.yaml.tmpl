@@ -21,6 +21,12 @@
 {{- if and (eq $qualificationGateProtected "true") (ne .QualificationGateGuard "node-authorizer-node-restriction-rbac-verified") }}
 {{- fail "QualificationGateProtected requires an explicit Node authorizer, NodeRestriction, and restrictive Node-patch RBAC guard" }}
 {{- end }}
+{{- $resolverImages := compact (splitList "," (default "" .ResolverImages)) }}
+{{- range $resolverImage := $resolverImages }}
+{{- if not (regexMatch "^[^@[:space:]]+@sha256:[0-9a-f]{64}$" $resolverImage) }}
+{{- fail "ResolverImages entries must be immutable sha256 digest references" }}
+{{- end }}
+{{- end }}
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -63,6 +69,9 @@ spec:
             - --controller-image={{ $controllerImage }}
             - --adapter-image={{ $adapterImage }}
             - --workflow-template-digest={{ $workflowTemplateDigest }}
+{{- range $resolverImage := $resolverImages }}
+            - --resolver-image={{ $resolverImage }}
+{{- end }}
             - --qualification-gate-protected={{ $qualificationGateProtected }}
             - --leader-elect=true
             - --max-concurrent-runs=4

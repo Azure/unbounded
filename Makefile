@@ -100,6 +100,28 @@ PROJECT_SIGNAL_ADAPTER_CMD=./cmd/project-signal-adapter
 SIGNAL_ADAPTER_IMAGE ?= example.invalid/project-signal-adapter@sha256:0000000000000000000000000000000000000000000000000000000000000000
 SIGNAL_ADAPTER_BUILD_IMAGE ?= example.invalid/project-signal-adapter:replace-me
 SIGNAL_CERTIFICATION_RUNNER_IMAGE ?= example.invalid/project-signal-runner@sha256:0000000000000000000000000000000000000000000000000000000000000000
+SIGNAL_RESOLVER_IMAGES ?=
+SIGNAL_GPU_INVENTORY_SCRIPT_DIGEST ?= sha256:c6386f7989280ce844b5e997377839434684f4c6b52dbd8f3d7d15def1fc72a3
+SIGNAL_VLLM_CANARY_ENABLED ?= false
+SIGNAL_VLLM_CANARY_IMAGE ?=
+SIGNAL_VLLM_CANARY_CPU ?=
+SIGNAL_VLLM_CANARY_MEMORY ?=
+SIGNAL_VLLM_MODEL_CACHE_PVC ?=
+SIGNAL_VLLM_WORKFLOW_TEMPLATE_DIGEST ?=
+SIGNAL_ACCEPTANCE_SUITES_ENABLED ?= false
+SIGNAL_GPU_INVENTORY_TEST_UID ?=
+SIGNAL_GPU_INVENTORY_TEST_GENERATION ?=
+SIGNAL_GPU_INVENTORY_TEST_CONTENT_DIGEST ?=
+SIGNAL_GPU_COMPAT_TEST_UID ?=
+SIGNAL_GPU_COMPAT_TEST_GENERATION ?=
+SIGNAL_GPU_COMPAT_TEST_CONTENT_DIGEST ?=
+SIGNAL_VLLM_TEST_UID ?=
+SIGNAL_VLLM_TEST_GENERATION ?=
+SIGNAL_VLLM_TEST_CONTENT_DIGEST ?=
+SIGNAL_VLLM_MODEL_IDENTITY ?=
+SIGNAL_VLLM_PROMPT_FIXTURE_DIGEST ?=
+SIGNAL_VLLM_REQUEST_TIMEOUT ?=
+SIGNAL_VLLM_INVOCATION_TIMEOUT ?=
 SIGNAL_NAMESPACE ?= project-signal
 SIGNAL_SCRIPT_NAMESPACE ?= $(SIGNAL_NAMESPACE)
 SIGNAL_QUALIFICATION_GATE_PROTECTED ?= false
@@ -1246,6 +1268,14 @@ signal-manifests: ## Render Project Signal manifests into deploy/signal/rendered
 		true|false) ;; \
 		*) echo "SIGNAL_QUALIFICATION_GATE_PROTECTED must be true or false" >&2; exit 1 ;; \
 	esac; \
+	case "$(SIGNAL_VLLM_CANARY_ENABLED)" in \
+		true|false) ;; \
+		*) echo "SIGNAL_VLLM_CANARY_ENABLED must be true or false" >&2; exit 1 ;; \
+	esac; \
+	case "$(SIGNAL_ACCEPTANCE_SUITES_ENABLED)" in \
+		true|false) ;; \
+		*) echo "SIGNAL_ACCEPTANCE_SUITES_ENABLED must be true or false" >&2; exit 1 ;; \
+	esac; \
 	if [ "$(SIGNAL_QUALIFICATION_GATE_PROTECTED)" = true ] && \
 		[ "$(SIGNAL_QUALIFICATION_GATE_GUARD)" != node-authorizer-node-restriction-rbac-verified ]; then \
 		echo "enabling the protected qualification gate requires SIGNAL_QUALIFICATION_GATE_GUARD=node-authorizer-node-restriction-rbac-verified" >&2; \
@@ -1262,10 +1292,34 @@ signal-manifests: ## Render Project Signal manifests into deploy/signal/rendered
 		--set ControllerImage=$(SIGNAL_CONTROLLER_IMAGE) \
 		--set AdapterImage=$(SIGNAL_ADAPTER_IMAGE) \
 		--set RunnerImage=$(SIGNAL_CERTIFICATION_RUNNER_IMAGE) \
+		--set ResolverImages=$(SIGNAL_RESOLVER_IMAGES) \
+		--set GPUInventoryScriptDigest=$(SIGNAL_GPU_INVENTORY_SCRIPT_DIGEST) \
+		--set VLLMCanaryEnabled=$(SIGNAL_VLLM_CANARY_ENABLED) \
+		--set VLLMCanaryImage=$(SIGNAL_VLLM_CANARY_IMAGE) \
+		--set VLLMCanaryCPU=$(SIGNAL_VLLM_CANARY_CPU) \
+		--set VLLMCanaryMemory=$(SIGNAL_VLLM_CANARY_MEMORY) \
+		--set VLLMModelCachePVC=$(SIGNAL_VLLM_MODEL_CACHE_PVC) \
+		--set VLLMWorkflowTemplateDigest=sha256:0000000000000000000000000000000000000000000000000000000000000000 \
+		--set AcceptanceSuitesEnabled=$(SIGNAL_ACCEPTANCE_SUITES_ENABLED) \
+		--set GPUInventoryTestUID=$(SIGNAL_GPU_INVENTORY_TEST_UID) \
+		--set GPUInventoryTestGeneration=$(SIGNAL_GPU_INVENTORY_TEST_GENERATION) \
+		--set GPUInventoryTestContentDigest=$(SIGNAL_GPU_INVENTORY_TEST_CONTENT_DIGEST) \
+		--set GPUCompatTestUID=$(SIGNAL_GPU_COMPAT_TEST_UID) \
+		--set GPUCompatTestGeneration=$(SIGNAL_GPU_COMPAT_TEST_GENERATION) \
+		--set GPUCompatTestContentDigest=$(SIGNAL_GPU_COMPAT_TEST_CONTENT_DIGEST) \
+		--set VLLMTestUID=$(SIGNAL_VLLM_TEST_UID) \
+		--set VLLMTestGeneration=$(SIGNAL_VLLM_TEST_GENERATION) \
+		--set VLLMTestContentDigest=$(SIGNAL_VLLM_TEST_CONTENT_DIGEST) \
+		--set VLLMModelIdentity=$(SIGNAL_VLLM_MODEL_IDENTITY) \
+		--set VLLMPromptFixtureDigest=$(SIGNAL_VLLM_PROMPT_FIXTURE_DIGEST) \
+		--set VLLMRequestTimeout=$(SIGNAL_VLLM_REQUEST_TIMEOUT) \
+		--set VLLMInvocationTimeout=$(SIGNAL_VLLM_INVOCATION_TIMEOUT) \
 		--set WorkflowTemplateDigest=sha256:0000000000000000000000000000000000000000000000000000000000000000 \
 		--set QualificationGateProtected=$(SIGNAL_QUALIFICATION_GATE_PROTECTED) \
 		--set QualificationGateGuard=$(SIGNAL_QUALIFICATION_GATE_GUARD); \
 	workflow_template="$$temp_dir/04-adapter-workflowtemplate.yaml"; \
+	gpu_inventory_catalog="$$temp_dir/05-gpu-inventory-tests.yaml"; \
+	vllm_workflow_template="$$temp_dir/07-vllm-canary-workflowtemplate.yaml"; \
 	if command -v sha256sum >/dev/null 2>&1; then \
 		workflow_hash="$$(sha256sum "$$workflow_template" | awk '{print $$1}')"; \
 	elif command -v shasum >/dev/null 2>&1; then \
@@ -1286,6 +1340,32 @@ signal-manifests: ## Render Project Signal manifests into deploy/signal/rendered
 		echo "WorkflowTemplate digest mismatch: expected $(SIGNAL_WORKFLOW_TEMPLATE_DIGEST), rendered $$workflow_digest" >&2; \
 		exit 1; \
 	fi; \
+	gpu_inventory_script_digest="$$( \
+		$(GOCMD) run ./hack/cmd/manifest-digest \
+			--file "$$gpu_inventory_catalog" \
+			--kind ConfigMap \
+			--name project-signal-gpu-inventory-v1 \
+			--data-key gpu-inventory.sh \
+	)"; \
+	if [ "$(SIGNAL_GPU_INVENTORY_SCRIPT_DIGEST)" != "$$gpu_inventory_script_digest" ]; then \
+		echo "GPU inventory script digest mismatch: expected $(SIGNAL_GPU_INVENTORY_SCRIPT_DIGEST), rendered $$gpu_inventory_script_digest" >&2; \
+		exit 1; \
+	fi; \
+	vllm_workflow_digest=sha256:0000000000000000000000000000000000000000000000000000000000000000; \
+	if [ "$(SIGNAL_VLLM_CANARY_ENABLED)" = true ]; then \
+		vllm_workflow_digest="$$( \
+			$(GOCMD) run ./hack/cmd/manifest-digest \
+				--file "$$vllm_workflow_template" \
+				--kind WorkflowTemplate \
+				--name project-signal-vllm-canary-v1 \
+				--field spec \
+		)"; \
+		if [ -n "$(SIGNAL_VLLM_WORKFLOW_TEMPLATE_DIGEST)" ] && \
+			[ "$(SIGNAL_VLLM_WORKFLOW_TEMPLATE_DIGEST)" != "$$vllm_workflow_digest" ]; then \
+			echo "vLLM WorkflowTemplate digest mismatch: expected $(SIGNAL_VLLM_WORKFLOW_TEMPLATE_DIGEST), rendered $$vllm_workflow_digest" >&2; \
+			exit 1; \
+		fi; \
+	fi; \
 	mkdir -p $(SIGNAL_MANIFEST_RENDERED_DIR)/crd; \
 	find $(SIGNAL_MANIFEST_RENDERED_DIR) -mindepth 1 -not -name .gitignore -delete; \
 	$(GOCMD) run ./hack/cmd/render-manifests \
@@ -1296,6 +1376,28 @@ signal-manifests: ## Render Project Signal manifests into deploy/signal/rendered
 		--set ControllerImage=$(SIGNAL_CONTROLLER_IMAGE) \
 		--set AdapterImage=$(SIGNAL_ADAPTER_IMAGE) \
 		--set RunnerImage=$(SIGNAL_CERTIFICATION_RUNNER_IMAGE) \
+		--set ResolverImages=$(SIGNAL_RESOLVER_IMAGES) \
+		--set GPUInventoryScriptDigest=$(SIGNAL_GPU_INVENTORY_SCRIPT_DIGEST) \
+		--set VLLMCanaryEnabled=$(SIGNAL_VLLM_CANARY_ENABLED) \
+		--set VLLMCanaryImage=$(SIGNAL_VLLM_CANARY_IMAGE) \
+		--set VLLMCanaryCPU=$(SIGNAL_VLLM_CANARY_CPU) \
+		--set VLLMCanaryMemory=$(SIGNAL_VLLM_CANARY_MEMORY) \
+		--set VLLMModelCachePVC=$(SIGNAL_VLLM_MODEL_CACHE_PVC) \
+		--set VLLMWorkflowTemplateDigest="$$vllm_workflow_digest" \
+		--set AcceptanceSuitesEnabled=$(SIGNAL_ACCEPTANCE_SUITES_ENABLED) \
+		--set GPUInventoryTestUID=$(SIGNAL_GPU_INVENTORY_TEST_UID) \
+		--set GPUInventoryTestGeneration=$(SIGNAL_GPU_INVENTORY_TEST_GENERATION) \
+		--set GPUInventoryTestContentDigest=$(SIGNAL_GPU_INVENTORY_TEST_CONTENT_DIGEST) \
+		--set GPUCompatTestUID=$(SIGNAL_GPU_COMPAT_TEST_UID) \
+		--set GPUCompatTestGeneration=$(SIGNAL_GPU_COMPAT_TEST_GENERATION) \
+		--set GPUCompatTestContentDigest=$(SIGNAL_GPU_COMPAT_TEST_CONTENT_DIGEST) \
+		--set VLLMTestUID=$(SIGNAL_VLLM_TEST_UID) \
+		--set VLLMTestGeneration=$(SIGNAL_VLLM_TEST_GENERATION) \
+		--set VLLMTestContentDigest=$(SIGNAL_VLLM_TEST_CONTENT_DIGEST) \
+		--set VLLMModelIdentity=$(SIGNAL_VLLM_MODEL_IDENTITY) \
+		--set VLLMPromptFixtureDigest=$(SIGNAL_VLLM_PROMPT_FIXTURE_DIGEST) \
+		--set VLLMRequestTimeout=$(SIGNAL_VLLM_REQUEST_TIMEOUT) \
+		--set VLLMInvocationTimeout=$(SIGNAL_VLLM_INVOCATION_TIMEOUT) \
 		--set WorkflowTemplateDigest="$$workflow_digest" \
 		--set QualificationGateProtected=$(SIGNAL_QUALIFICATION_GATE_PROTECTED) \
 		--set QualificationGateGuard=$(SIGNAL_QUALIFICATION_GATE_GUARD); \

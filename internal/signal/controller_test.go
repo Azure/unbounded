@@ -974,6 +974,56 @@ func TestResolvePhasePlanEnforcesCertificationTestTrust(t *testing.T) {
 	}
 }
 
+func TestResolveWorkflowTemplateInputPinsLiveSemanticIdentity(t *testing.T) {
+	t.Parallel()
+
+	template := &unstructured.Unstructured{Object: map[string]any{
+		"apiVersion": "argoproj.io/v1alpha1",
+		"kind":       "WorkflowTemplate",
+		"metadata": map[string]any{
+			"name":            "vllm-canary",
+			"namespace":       "signal-system",
+			"resourceVersion": "42",
+		},
+		"spec": map[string]any{
+			"entrypoint": "canary",
+			"templates": []any{
+				map[string]any{"name": "canary", "container": map[string]any{"image": pinnedImage("vllm", "a")}},
+			},
+		},
+	}}
+	template.SetGroupVersionKind(workflowTemplateGVK)
+	digest, err := workflowTemplateSemanticDigest(template)
+	if err != nil {
+		t.Fatalf("workflowTemplateSemanticDigest() error = %v", err)
+	}
+
+	kube := fake.NewClientBuilder().WithObjects(template).Build()
+	reconciler := &AdmissionReconciler{
+		Client:    kube,
+		APIReader: kube,
+		Namespace: "signal-system",
+	}
+	driver := &signalv1.WorkflowTemplateTestDriver{Name: "vllm-canary", Digest: digest}
+
+	input, err := reconciler.resolveWorkflowTemplateInput(context.Background(), driver)
+	if err != nil {
+		t.Fatalf("resolveWorkflowTemplateInput() error = %v", err)
+	}
+
+	if input.Kind != signalv1.ResolvedInputKindWorkflowTemplate ||
+		input.State != signalv1.ResolvedInputStateComplete ||
+		input.Resolved != "vllm-canary@42" ||
+		input.Digest != digest {
+		t.Fatalf("resolved WorkflowTemplate input = %#v", input)
+	}
+
+	driver.Digest = "sha256:" + strings.Repeat("f", 64)
+	if _, err := reconciler.resolveWorkflowTemplateInput(context.Background(), driver); err == nil {
+		t.Fatal("resolveWorkflowTemplateInput() accepted a semantic digest mismatch")
+	}
+}
+
 func resolvedWorkflowTestRun() *signalv1.CertificationRun {
 	runOnce := signalv1.StageSchedule{
 		Mode:              signalv1.CheckExecutionModeRunOnce,

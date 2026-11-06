@@ -16,6 +16,11 @@ spec:
           - name: execution-name
           - name: run-uid
           - name: check-index
+            default: "-1"
+          - name: phase-index
+            default: "-1"
+          - name: stage-index
+            default: "-1"
           - name: result-configmap
       tolerations:
         - key: node.kubernetes.io/unschedulable
@@ -53,6 +58,10 @@ spec:
           - "{{`{{inputs.parameters.run-uid}}`}}"
           - --check-index
           - "{{`{{inputs.parameters.check-index}}`}}"
+          - --phase-index
+          - "{{`{{inputs.parameters.phase-index}}`}}"
+          - --stage-index
+          - "{{`{{inputs.parameters.stage-index}}`}}"
           - --result-configmap
           - "{{`{{inputs.parameters.result-configmap}}`}}"
         env:

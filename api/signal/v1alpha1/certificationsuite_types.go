@@ -263,7 +263,7 @@ type CertificationStage struct {
 	Retry            *StageRetryPolicy             `json:"retry,omitempty"`
 	// Optional stages are reported but do not determine phase or Run success.
 	Optional bool `json:"optional,omitempty"`
-	// +kubebuilder:validation:MaxItems=8
+	// +kubebuilder:validation:MaxItems=16
 	// +listType=map
 	// +listMapKey=name
 	Assertions []TestAssertion `json:"assertions,omitempty"`

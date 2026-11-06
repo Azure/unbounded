@@ -1,0 +1,220 @@
+{{- if eq (default "false" .AcceptanceSuitesEnabled) "true" }}
+{{- if empty .GPUInventoryTestUID }}
+{{- fail "GPUInventoryTestUID is required when acceptance Suites are enabled" }}
+{{- end }}
+{{- if not (regexMatch "^[1-9][0-9]*$" .GPUInventoryTestGeneration) }}
+{{- fail "GPUInventoryTestGeneration must be a positive integer when acceptance Suites are enabled" }}
+{{- end }}
+{{- if not (regexMatch "^sha256:[0-9a-f]{64}$" .GPUInventoryTestContentDigest) }}
+{{- fail "GPUInventoryTestContentDigest must be an algorithm-qualified sha256 digest" }}
+{{- end }}
+{{- if empty .GPUCompatTestUID }}
+{{- fail "GPUCompatTestUID is required when acceptance Suites are enabled" }}
+{{- end }}
+{{- if not (regexMatch "^[1-9][0-9]*$" .GPUCompatTestGeneration) }}
+{{- fail "GPUCompatTestGeneration must be a positive integer when acceptance Suites are enabled" }}
+{{- end }}
+{{- if not (regexMatch "^sha256:[0-9a-f]{64}$" .GPUCompatTestContentDigest) }}
+{{- fail "GPUCompatTestContentDigest must be an algorithm-qualified sha256 digest" }}
+{{- end }}
+apiVersion: signal.unbounded-cloud.io/v1alpha1
+kind: CertificationSuite
+metadata:
+  name: project-signal-gpu-baseline-v1
+  labels:
+    app.kubernetes.io/name: project-signal-gpu-baseline
+    app.kubernetes.io/part-of: project-signal
+spec:
+  phases:
+    - name: validation
+      role: Validation
+      stages:
+        - name: gpu-inventory
+          displayName: GPU inventory
+          test:
+            name: project-signal-gpu-inventory-v1
+            uid: {{ .GPUInventoryTestUID }}
+            generation: {{ .GPUInventoryTestGeneration }}
+            contentDigest: {{ .GPUInventoryTestContentDigest }}
+          schedule:
+            mode: RunOnce
+            invocationTimeout: 2m
+          assertions:
+            - name: nvidia-smi-available
+              metric: nvidiaSmiAvailable
+              operator: BooleanEquals
+              expected:
+                type: Boolean
+                booleanValue: true
+            - name: eight-gpus-visible
+              metric: observedGpuCount
+              operator: Range
+              minimum:
+                type: Integer
+                integerValue: 8
+              maximum:
+                type: Integer
+                integerValue: 8
+
+---
+apiVersion: signal.unbounded-cloud.io/v1alpha1
+kind: CertificationSuite
+metadata:
+  name: project-signal-gpu-compat-v1
+  labels:
+    app.kubernetes.io/name: project-signal-gpu-compat
+    app.kubernetes.io/part-of: project-signal
+    signal.unbounded-cloud.io/catalog-role: compatibility-diagnostic
+spec:
+  phases:
+{{- range $index := until 15 }}
+    - name: {{ printf "compat-r%02d" (add1 $index) }}
+      displayName: {{ printf "R%02d compatibility diagnostic" (add1 $index) }}
+      role: Validation
+      stages:
+        - name: {{ printf "r%02d" (add1 $index) }}
+          displayName: {{ printf "R%02d" (add1 $index) }}
+          test:
+            name: project-signal-gpu-inventory-compat-v1
+            uid: {{ $.GPUCompatTestUID }}
+            generation: {{ $.GPUCompatTestGeneration }}
+            contentDigest: {{ $.GPUCompatTestContentDigest }}
+          schedule:
+            mode: RunOnce
+            invocationTimeout: 2m
+          assertions:
+            - name: nvidia-smi-available
+              metric: nvidiaSmiAvailable
+              operator: BooleanEquals
+              expected:
+                type: Boolean
+                booleanValue: true
+            - name: eight-gpus-visible
+              metric: observedGpuCount
+              operator: Range
+              minimum:
+                type: Integer
+                integerValue: 8
+              maximum:
+                type: Integer
+                integerValue: 8
+{{- end }}
+{{- if eq (default "false" .VLLMCanaryEnabled) "true" }}
+{{- if empty .VLLMTestUID }}
+{{- fail "VLLMTestUID is required when vLLM acceptance Suite rendering is enabled" }}
+{{- end }}
+{{- if not (regexMatch "^[1-9][0-9]*$" .VLLMTestGeneration) }}
+{{- fail "VLLMTestGeneration must be a positive integer when vLLM acceptance Suite rendering is enabled" }}
+{{- end }}
+{{- if not (regexMatch "^sha256:[0-9a-f]{64}$" .VLLMTestContentDigest) }}
+{{- fail "VLLMTestContentDigest must be an algorithm-qualified sha256 digest" }}
+{{- end }}
+{{- if not (regexMatch "^.+@sha256:[0-9a-f]{64}$" .VLLMModelIdentity) }}
+{{- fail "VLLMModelIdentity must be an immutable sha256 identity when vLLM acceptance Suite rendering is enabled" }}
+{{- end }}
+{{- if not (regexMatch "^sha256:[0-9a-f]{64}$" .VLLMPromptFixtureDigest) }}
+{{- fail "VLLMPromptFixtureDigest must be an algorithm-qualified sha256 digest when vLLM acceptance Suite rendering is enabled" }}
+{{- end }}
+{{- if empty .VLLMRequestTimeout }}
+{{- fail "VLLMRequestTimeout is required when vLLM acceptance Suite rendering is enabled" }}
+{{- end }}
+{{- if empty .VLLMInvocationTimeout }}
+{{- fail "VLLMInvocationTimeout is required when vLLM acceptance Suite rendering is enabled" }}
+{{- end }}
+
+---
+apiVersion: signal.unbounded-cloud.io/v1alpha1
+kind: CertificationSuite
+metadata:
+  name: project-signal-vllm-canary-v1
+  labels:
+    app.kubernetes.io/name: project-signal-vllm-canary
+    app.kubernetes.io/part-of: project-signal
+spec:
+  phases:
+    - name: validation
+      role: Validation
+      stages:
+        - name: vllm-canary
+          displayName: vLLM acceptance canary
+          test:
+            name: project-signal-vllm-canary-v1
+            uid: {{ .VLLMTestUID }}
+            generation: {{ .VLLMTestGeneration }}
+            contentDigest: {{ .VLLMTestContentDigest }}
+          parameters:
+            - name: expectedModelIdentity
+              value:
+                type: String
+                stringValue: {{ .VLLMModelIdentity | quote }}
+            - name: promptFixtureDigest
+              value:
+                type: String
+                stringValue: {{ .VLLMPromptFixtureDigest }}
+            - name: requestTimeout
+              value:
+                type: Duration
+                durationValue: {{ .VLLMRequestTimeout }}
+          schedule:
+            mode: RunOnce
+            invocationTimeout: {{ .VLLMInvocationTimeout }}
+          assertions:
+            - name: service-ready
+              metric: serviceReady
+              operator: BooleanEquals
+              expected:
+                type: Boolean
+                booleanValue: true
+            - name: model-identity
+              metric: modelIdentity
+              operator: StatusEquals
+              expected:
+                type: String
+                stringValue: {{ .VLLMModelIdentity | quote }}
+            - name: request-succeeded
+              metric: requestSucceeded
+              operator: BooleanEquals
+              expected:
+                type: Boolean
+                booleanValue: true
+            - name: prompt-tokens
+              metric: promptTokens
+              operator: CountMinimum
+              expected:
+                type: Integer
+                integerValue: 1
+            - name: completion-tokens
+              metric: completionTokens
+              operator: CountMinimum
+              expected:
+                type: Integer
+                integerValue: 1
+            - name: no-server-errors
+              metric: errorCount
+              operator: Maximum
+              expected:
+                type: Integer
+                integerValue: 0
+            - name: no-container-restarts
+              metric: restartCount
+              operator: Maximum
+              expected:
+                type: Integer
+                integerValue: 0
+            - name: eight-gpus-visible
+              metric: observedGpuCount
+              operator: Range
+              minimum:
+                type: Integer
+                integerValue: 8
+              maximum:
+                type: Integer
+                integerValue: 8
+            - name: cleanup-succeeded
+              metric: cleanupSucceeded
+              operator: BooleanEquals
+              expected:
+                type: Boolean
+                booleanValue: true
+{{- end }}
+{{- end }}

@@ -6,6 +6,7 @@ package signal
 import (
 	"bytes"
 	"crypto/sha256"
+	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -14,8 +15,10 @@ import (
 	"testing"
 
 	appsv1 "k8s.io/api/apps/v1"
+	corev1 "k8s.io/api/core/v1"
 	rbacv1 "k8s.io/api/rbac/v1"
 	apiextensionsv1 "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"sigs.k8s.io/yaml"
 
 	"github.com/Azure/unbounded/hack/cmd/render-manifests/render"
@@ -25,7 +28,9 @@ const (
 	testControllerImage = "example.invalid/controller@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
 	testAdapterImage    = "example.invalid/adapter@sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
 	testRunnerImage     = "example.invalid/runner@sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+	testResolverImage   = "example.invalid/resolver@sha256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
 	testDigest          = "sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
+	testScriptDigest    = "sha256:c6386f7989280ce844b5e997377839434684f4c6b52dbd8f3d7d15def1fc72a3"
 	qualificationGuard  = "node-authorizer-node-restriction-rbac-verified"
 )
 
@@ -74,6 +79,12 @@ func TestRenderedExecutionProvenanceIsPinnedAndDeterministic(t *testing.T) {
 		t.Fatalf("WorkflowTemplate adapter identity = %#v", workflow.Spec.Templates)
 	}
 
+	for _, parameter := range []string{"check-index", "phase-index", "stage-index"} {
+		if !bytes.Contains(secondWorkflow, []byte("- name: "+parameter)) {
+			t.Fatalf("WorkflowTemplate does not declare %s", parameter)
+		}
+	}
+
 	var deployment appsv1.Deployment
 	if err := yaml.Unmarshal(readRenderedFile(t, secondOutput, "06-deployment.yaml"), &deployment); err != nil {
 		t.Fatalf("decode Deployment: %v", err)
@@ -94,10 +105,342 @@ func TestRenderedExecutionProvenanceIsPinnedAndDeterministic(t *testing.T) {
 		"--controller-image=" + testControllerImage,
 		"--adapter-image=" + testAdapterImage,
 		"--workflow-template-digest=" + workflowDigest,
+		"--resolver-image=" + testResolverImage,
 		"--qualification-gate-protected=false",
 	} {
 		if !slices.Contains(controller.Args, argument) {
 			t.Fatalf("controller args do not contain %q: %v", argument, controller.Args)
+		}
+	}
+}
+
+func TestRenderedGPUInventoryCatalogPinsSource(t *testing.T) {
+	t.Parallel()
+
+	output := renderSignal(t, signalRenderData())
+	documents := splitYAMLDocuments(string(readRenderedFile(t, output, "05-gpu-inventory-tests.yaml")))
+	if len(documents) != 3 {
+		t.Fatalf("GPU inventory documents = %d, want 3", len(documents))
+	}
+
+	var scripts corev1.ConfigMap
+	if err := yaml.Unmarshal([]byte(documents[0]), &scripts); err != nil {
+		t.Fatalf("decode GPU inventory ConfigMap: %v", err)
+	}
+
+	script := scripts.Data["gpu-inventory.sh"]
+	scriptSum := sha256.Sum256([]byte(script))
+	scriptDigest := fmt.Sprintf("sha256:%x", scriptSum)
+	if scriptDigest != testScriptDigest {
+		t.Fatalf("GPU inventory script digest = %s, test fixture expects %s", scriptDigest, testScriptDigest)
+	}
+
+	for index, wantRole := range []string{"qualification", "compatibility-diagnostic"} {
+		var test unstructured.Unstructured
+		if err := yaml.Unmarshal([]byte(documents[index+1]), &test.Object); err != nil {
+			t.Fatalf("decode CertificationTest %d: %v", index, err)
+		}
+
+		if test.GetKind() != "CertificationTest" ||
+			test.GetLabels()["signal.unbounded-cloud.io/catalog-role"] != wantRole {
+			t.Fatalf("CertificationTest %d identity = %s/%v", index, test.GetKind(), test.GetLabels())
+		}
+
+		gotDigest, found, err := unstructured.NestedString(
+			test.Object,
+			"spec",
+			"driver",
+			"script",
+			"source",
+			"configMap",
+			"digest",
+		)
+		if err != nil || !found || gotDigest != scriptDigest {
+			t.Fatalf(
+				"CertificationTest %d script digest = %q, found %t, error %v, want %s",
+				index,
+				gotDigest,
+				found,
+				err,
+				scriptDigest,
+			)
+		}
+
+		gotGPU, found, err := unstructured.NestedString(
+			test.Object,
+			"spec",
+			"driver",
+			"script",
+			"resources",
+			"requests",
+			"nvidia.com/gpu",
+		)
+		if err != nil || !found || gotGPU != "8" {
+			t.Fatalf(
+				"CertificationTest %d GPU request = %q, found %t, error %v, want 8",
+				index,
+				gotGPU,
+				found,
+				err,
+			)
+		}
+	}
+}
+
+func TestRenderedVLLMCanaryUsesImmutableBoundedContract(t *testing.T) {
+	t.Parallel()
+
+	data := signalRenderData()
+	data["VLLMCanaryEnabled"] = "true"
+	data["VLLMCanaryImage"] = "example.invalid/vllm-canary@sha256:" + strings.Repeat("f", 64)
+	data["VLLMCanaryCPU"] = "4"
+	data["VLLMCanaryMemory"] = "16Gi"
+	data["VLLMModelCachePVC"] = "approved-model-cache"
+	data["VLLMWorkflowTemplateDigest"] = testDigest
+
+	firstOutput := renderSignal(t, data)
+	firstTemplate := readRenderedFile(t, firstOutput, "07-vllm-canary-workflowtemplate.yaml")
+
+	var workflow unstructured.Unstructured
+	if err := yaml.Unmarshal(firstTemplate, &workflow.Object); err != nil {
+		t.Fatalf("decode vLLM WorkflowTemplate: %v", err)
+	}
+
+	spec, found, err := unstructured.NestedMap(workflow.Object, "spec")
+	if err != nil || !found {
+		t.Fatalf("read vLLM WorkflowTemplate spec: found %t, error %v", found, err)
+	}
+
+	specJSON, err := json.Marshal(spec)
+	if err != nil {
+		t.Fatalf("encode vLLM WorkflowTemplate spec: %v", err)
+	}
+
+	sum := sha256.Sum256(specJSON)
+	workflowDigest := fmt.Sprintf("sha256:%x", sum)
+	data["VLLMWorkflowTemplateDigest"] = workflowDigest
+	secondOutput := renderSignal(t, data)
+	if !bytes.Equal(
+		firstTemplate,
+		readRenderedFile(t, secondOutput, "07-vllm-canary-workflowtemplate.yaml"),
+	) {
+		t.Fatal("vLLM WorkflowTemplate changed when only its recorded digest changed")
+	}
+
+	templateText := string(firstTemplate)
+	for _, value := range []string{
+		"primary-participant-node-name",
+		"resolved-inputs-json",
+		"result-configmap",
+		"nvidia.com/gpu: \"8\"",
+		"readOnly: true",
+	} {
+		if !strings.Contains(templateText, value) {
+			t.Fatalf("vLLM WorkflowTemplate does not contain %q", value)
+		}
+	}
+
+	var test unstructured.Unstructured
+	if err := yaml.Unmarshal(
+		readRenderedFile(t, secondOutput, "08-vllm-canary-test.yaml"),
+		&test.Object,
+	); err != nil {
+		t.Fatalf("decode vLLM CertificationTest: %v", err)
+	}
+
+	gotDigest, found, err := unstructured.NestedString(
+		test.Object,
+		"spec",
+		"driver",
+		"workflowTemplate",
+		"digest",
+	)
+	if err != nil || !found || gotDigest != workflowDigest {
+		t.Fatalf(
+			"vLLM test template digest = %q, found %t, error %v, want %s",
+			gotDigest,
+			found,
+			err,
+			workflowDigest,
+		)
+	}
+
+	testText := string(readRenderedFile(t, secondOutput, "08-vllm-canary-test.yaml"))
+	for _, metric := range []string{
+		"serviceReady",
+		"modelIdentity",
+		"requestSucceeded",
+		"promptTokens",
+		"completionTokens",
+		"errorCount",
+		"restartCount",
+		"observedGpuCount",
+		"cleanupSucceeded",
+		"endToEndLatency",
+		"timeToFirstToken",
+		"outputTokensPerSecond",
+		"gpuMemoryUsed",
+	} {
+		if !strings.Contains(testText, "name: "+metric) {
+			t.Fatalf("vLLM CertificationTest does not declare metric %s", metric)
+		}
+	}
+
+	for _, parameter := range []string{
+		"expectedModelIdentity",
+		"promptFixtureDigest",
+		"requestTimeout",
+	} {
+		if !strings.Contains(testText, "name: "+parameter) {
+			t.Fatalf("vLLM CertificationTest does not declare parameter %s", parameter)
+		}
+	}
+
+	if strings.Contains(testText, "assertions:") ||
+		strings.Contains(testText, "minimum:") ||
+		strings.Contains(testText, "maximum:") {
+		t.Fatal("vLLM CertificationTest invents workload performance thresholds")
+	}
+}
+
+func TestVLLMCanaryFailsClosedWithoutImmutableInputs(t *testing.T) {
+	t.Parallel()
+
+	for _, tt := range []struct {
+		name  string
+		key   string
+		value string
+		error string
+	}{
+		{
+			name:  "mutable image",
+			key:   "VLLMCanaryImage",
+			value: "example.invalid/vllm-canary:latest",
+			error: "VLLMCanaryImage must be an immutable sha256 digest reference",
+		},
+		{
+			name:  "missing CPU",
+			key:   "VLLMCanaryCPU",
+			value: "",
+			error: "VLLMCanaryCPU is required",
+		},
+		{
+			name:  "missing memory",
+			key:   "VLLMCanaryMemory",
+			value: "",
+			error: "VLLMCanaryMemory is required",
+		},
+		{
+			name:  "missing model cache",
+			key:   "VLLMModelCachePVC",
+			value: "",
+			error: "VLLMModelCachePVC is required",
+		},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			data := signalRenderData()
+			data["VLLMCanaryEnabled"] = "true"
+			data["VLLMCanaryImage"] = "example.invalid/vllm-canary@sha256:" + strings.Repeat("f", 64)
+			data["VLLMCanaryCPU"] = "4"
+			data["VLLMCanaryMemory"] = "16Gi"
+			data["VLLMModelCachePVC"] = "approved-model-cache"
+			data["VLLMWorkflowTemplateDigest"] = testDigest
+			data[tt.key] = tt.value
+
+			err := render.Render(".", t.TempDir(), data)
+			if err == nil || !strings.Contains(err.Error(), tt.error) {
+				t.Fatalf("render error = %v, want %q", err, tt.error)
+			}
+		})
+	}
+}
+
+func TestRenderedAcceptanceSuitesSeparateQualificationDiagnosticsAndVLLM(t *testing.T) {
+	t.Parallel()
+
+	data := signalRenderData()
+	data["AcceptanceSuitesEnabled"] = "true"
+	data["GPUInventoryTestUID"] = "11111111-1111-1111-1111-111111111111"
+	data["GPUInventoryTestGeneration"] = "1"
+	data["GPUInventoryTestContentDigest"] = testDigest
+	data["GPUCompatTestUID"] = "22222222-2222-2222-2222-222222222222"
+	data["GPUCompatTestGeneration"] = "2"
+	data["GPUCompatTestContentDigest"] = testDigest
+	data["VLLMCanaryEnabled"] = "true"
+	data["VLLMCanaryImage"] = "example.invalid/vllm-canary@sha256:" + strings.Repeat("f", 64)
+	data["VLLMCanaryCPU"] = "4"
+	data["VLLMCanaryMemory"] = "16Gi"
+	data["VLLMModelCachePVC"] = "approved-model-cache"
+	data["VLLMTestUID"] = "33333333-3333-3333-3333-333333333333"
+	data["VLLMTestGeneration"] = "3"
+	data["VLLMTestContentDigest"] = testDigest
+	data["VLLMModelIdentity"] = "approved-model@sha256:" + strings.Repeat("9", 64)
+	data["VLLMPromptFixtureDigest"] = "sha256:" + strings.Repeat("8", 64)
+	data["VLLMRequestTimeout"] = "2m"
+	data["VLLMInvocationTimeout"] = "30m"
+
+	output := renderSignal(t, data)
+	documents := splitYAMLDocuments(string(readRenderedFile(t, output, "09-acceptance-suites.yaml")))
+	if len(documents) != 3 {
+		t.Fatalf("acceptance Suite documents = %d, want 3", len(documents))
+	}
+
+	var baseline unstructured.Unstructured
+	if err := yaml.Unmarshal([]byte(documents[0]), &baseline.Object); err != nil {
+		t.Fatalf("decode baseline Suite: %v", err)
+	}
+
+	baselinePhases, found, err := unstructured.NestedSlice(baseline.Object, "spec", "phases")
+	if err != nil || !found || len(baselinePhases) != 1 {
+		t.Fatalf("baseline phases = %d, found %t, error %v, want 1", len(baselinePhases), found, err)
+	}
+
+	var compatibility unstructured.Unstructured
+	if err := yaml.Unmarshal([]byte(documents[1]), &compatibility.Object); err != nil {
+		t.Fatalf("decode compatibility Suite: %v", err)
+	}
+
+	compatibilityPhases, found, err := unstructured.NestedSlice(
+		compatibility.Object,
+		"spec",
+		"phases",
+	)
+	if err != nil || !found || len(compatibilityPhases) != 15 {
+		t.Fatalf(
+			"compatibility phases = %d, found %t, error %v, want 15 ordered diagnostics",
+			len(compatibilityPhases),
+			found,
+			err,
+		)
+	}
+
+	vllmText := documents[2]
+	for _, metric := range []string{
+		"serviceReady",
+		"modelIdentity",
+		"requestSucceeded",
+		"promptTokens",
+		"completionTokens",
+		"errorCount",
+		"restartCount",
+		"observedGpuCount",
+		"cleanupSucceeded",
+	} {
+		if !strings.Contains(vllmText, "metric: "+metric) {
+			t.Fatalf("vLLM Suite does not assert %s", metric)
+		}
+	}
+
+	for _, measurementOnly := range []string{
+		"endToEndLatency",
+		"timeToFirstToken",
+		"outputTokensPerSecond",
+		"gpuMemoryUsed",
+	} {
+		if strings.Contains(vllmText, "metric: "+measurementOnly) {
+			t.Fatalf("vLLM Suite asserts measurement-only metric %s", measurementOnly)
 		}
 	}
 }
@@ -128,6 +471,18 @@ func TestRenderRejectsMutableExecutionProvenance(t *testing.T) {
 			key:   "RunnerImage",
 			value: "example.invalid/runner:latest",
 			error: "RunnerImage must be an immutable sha256 digest reference",
+		},
+		{
+			name:  "resolver image",
+			key:   "ResolverImages",
+			value: "example.invalid/resolver:latest",
+			error: "ResolverImages entries must be immutable sha256 digest references",
+		},
+		{
+			name:  "GPU inventory script digest",
+			key:   "GPUInventoryScriptDigest",
+			value: "sha256:not-a-digest",
+			error: "GPUInventoryScriptDigest must be an algorithm-qualified sha256 digest",
 		},
 		{
 			name:  "workflow digest",
@@ -208,6 +563,16 @@ func TestRenderedRBACCoversQualificationAndEvidence(t *testing.T) {
 		"",
 		"project-signal-controller",
 		"signal.unbounded-cloud.io",
+		"certificationtests",
+		[]string{"get", "list", "watch"},
+	)
+	assertRule(
+		t,
+		controllerDocuments,
+		"ClusterRole",
+		"",
+		"project-signal-controller",
+		"signal.unbounded-cloud.io",
 		"certificationpolicies",
 		[]string{"get", "list", "watch", "update", "patch"},
 	)
@@ -250,6 +615,36 @@ func TestRenderedRBACCoversQualificationAndEvidence(t *testing.T) {
 	assertRule(
 		t,
 		adapterDocuments,
+		"Role",
+		"signal-ns",
+		"project-signal-adapter",
+		"argoproj.io",
+		"workflows",
+		[]string{"get", "create", "delete"},
+	)
+	assertRule(
+		t,
+		adapterDocuments,
+		"Role",
+		"signal-ns",
+		"project-signal-adapter",
+		"argoproj.io",
+		"workflowtemplates",
+		[]string{"get"},
+	)
+	assertRule(
+		t,
+		adapterDocuments,
+		"Role",
+		"signal-ns",
+		"project-signal-adapter",
+		"",
+		"configmaps",
+		[]string{"get", "create", "delete"},
+	)
+	assertRule(
+		t,
+		adapterDocuments,
 		"ClusterRole",
 		"",
 		"project-signal-adapter-node-reader",
@@ -267,6 +662,7 @@ func TestGeneratedCRDSetContainsAllCertificationResources(t *testing.T) {
 		"signal.unbounded-cloud.io_certificationprofiles.yaml",
 		"signal.unbounded-cloud.io_certificationruns.yaml",
 		"signal.unbounded-cloud.io_certificationsuites.yaml",
+		"signal.unbounded-cloud.io_certificationtests.yaml",
 		"signal.unbounded-cloud.io_nodecertifications.yaml",
 	}
 
@@ -314,10 +710,22 @@ func TestGeneratedCRDSetContainsAllCertificationResources(t *testing.T) {
 				t,
 				string(content),
 				name,
-				"minDuration",
-				"continuity",
-				"maxSampleGap must not exceed backendActiveDeadline",
-				"maxSampleGap must not exceed minDuration",
+				"invocationTimeout",
+				"coverageWindow",
+				"RunOnce",
+				"repeated-execution",
+				"Continuous and Periodic",
+			)
+		case "signal.unbounded-cloud.io_certificationtests.yaml":
+			assertContainsAll(
+				t,
+				string(content),
+				name,
+				"Approved",
+				"Diagnostic",
+				"WorkflowTemplate",
+				"RunnerImage is the approved digest-pinned runtime",
+				"script resource requests must not exceed 16 entries",
 			)
 		case "signal.unbounded-cloud.io_nodecertifications.yaml":
 			assertContainsAll(
@@ -338,6 +746,11 @@ func signalRenderData() map[string]string {
 		"ControllerImage":            testControllerImage,
 		"AdapterImage":               testAdapterImage,
 		"RunnerImage":                testRunnerImage,
+		"ResolverImages":             testResolverImage,
+		"GPUInventoryScriptDigest":   testScriptDigest,
+		"VLLMCanaryEnabled":          "false",
+		"AcceptanceSuitesEnabled":    "false",
+		"VLLMWorkflowTemplateDigest": testDigest,
 		"WorkflowTemplateDigest":     testDigest,
 		"QualificationGateProtected": "false",
 	}

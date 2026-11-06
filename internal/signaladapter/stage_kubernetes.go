@@ -380,6 +380,14 @@ func (e *KubernetesStageExecutor) stagePod(
 			{Name: "PROJECT_SIGNAL_PLAN_DIGEST", Value: invocation.PlanDigest},
 			{Name: "PROJECT_SIGNAL_STAGE_ID", Value: invocation.Stage.Name},
 			{Name: "PROJECT_SIGNAL_STAGE_ORDER", Value: strconv.Itoa(int(invocation.StageOrder))},
+			{Name: "PROJECT_SIGNAL_TEST_NAME", Value: invocation.Stage.Test.Identity.Name},
+			{Name: "PROJECT_SIGNAL_TEST_UID", Value: string(invocation.Stage.Test.Identity.UID)},
+			{
+				Name:  "PROJECT_SIGNAL_TEST_GENERATION",
+				Value: strconv.FormatInt(invocation.Stage.Test.Identity.Generation, 10),
+			},
+			{Name: "PROJECT_SIGNAL_TEST_CONTENT_DIGEST", Value: invocation.Stage.Test.Identity.ContentDigest},
+			{Name: "PROJECT_SIGNAL_TEST_TRUST", Value: string(invocation.Stage.Test.Identity.Trust)},
 			{Name: "PROJECT_SIGNAL_PARTICIPANT_INDEX", Value: strconv.Itoa(int(participantIndex))},
 			{Name: "PROJECT_SIGNAL_PARTICIPANT_ROLE", Value: role},
 			{Name: "PROJECT_SIGNAL_NODE_UID", Value: string(participant.NodeUID)},
@@ -610,6 +618,7 @@ func (e *KubernetesStageExecutor) executeWorkflowTemplate(
 		map[string]any{"name": "parameters-json", "value": parametersJSON},
 		map[string]any{"name": "participants-json", "value": participantsJSON},
 		map[string]any{"name": "participant-roles-json", "value": rolesJSON},
+		map[string]any{"name": "primary-participant-node-name", "value": invocation.Participants[0].NodeName},
 		map[string]any{"name": "resolved-inputs-json", "value": inputsJSON},
 		map[string]any{"name": "result-configmap", "value": name + "-result"},
 	}
@@ -1026,6 +1035,10 @@ func stageDriverImage(driver signalv1.CertificationTestDriver) string {
 }
 
 func driverResources(driver signalv1.CertificationTestDriver) corev1.ResourceRequirements {
+	if driver.Script != nil {
+		return *driver.Script.Resources.DeepCopy()
+	}
+
 	if driver.Container != nil {
 		return *driver.Container.Resources.DeepCopy()
 	}
