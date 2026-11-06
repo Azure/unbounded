@@ -2009,7 +2009,8 @@ fn hot_page_owner_sheds_non_helper_readers_with_signed_overload() {
 }
 
 /// A hot owner sheds a requester in its own mesh column of the page's pool
-/// only past the exempt cap: with more than 64 members the pool has several
+/// only past the exempt cap: with more than 64 members (the test full mesh
+/// limit) the pool has several
 /// columns, and the same hot page that sheds a requester in another column is
 /// served to one in the owner's column until the cap.
 #[test]
@@ -2021,6 +2022,9 @@ fn hot_page_owner_serves_its_column_mates() {
 /// Drive a hot owner C with requester A, where A is in C's mesh column of the
 /// cache's pool exactly when `mate`.
 fn hot_page_shedding(env: &racer_io::Env, mate: bool) {
+    // Production full meshes reach 256 members; keep the 64 member limit so 80
+    // members make several columns.
+    let _mesh = ::topology::test_util::FullMeshMax::set(64);
     use crate::http::Codec;
     use crate::runtime::Reactor;
     use crate::topology::LinkHealth;

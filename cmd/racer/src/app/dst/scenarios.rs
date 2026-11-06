@@ -399,9 +399,15 @@ pub(super) fn healthy_relayed_page_reads_opaque_opt_in() {
     healthy_relayed_page_reads_with_mode(true);
 }
 
-/// Cluster size for relayed read scenarios: above the 64 member full mesh
-/// of mesh v2, so some reads need a relay.
-const RELAY_NODES: usize = 65;
+/// Full mesh limit of relayed read scenarios. Production meshes are full up
+/// to [`topology::FULL_MESH_MAX`] members; a smaller limit keeps these
+/// scenarios multi-column with few simulated nodes. Every node runs on the
+/// harness thread, so all of them derive the same overlay.
+const RELAY_FULL_MESH_MAX: usize = 64;
+
+/// Cluster size for relayed read scenarios: above [`RELAY_FULL_MESH_MAX`],
+/// so some reads need a relay.
+const RELAY_NODES: usize = RELAY_FULL_MESH_MAX + 1;
 
 /// Nodes that read in the healthy relayed scenario.
 const READERS: usize = 40;
@@ -410,6 +416,7 @@ fn healthy_relayed_page_reads_with_mode(opaque: bool) {
     let sim = SimOs::new();
     let clock = racer_io::SimClock::new(71);
     let env = &racer_io::Env::sim(&sim, clock.ctx(0));
+    let _mesh = ::topology::test_util::FullMeshMax::set(RELAY_FULL_MESH_MAX);
     let mut harness = Harness::new(71, sim, clock, false);
     harness.opaque_relay = opaque;
     // Match the deployed 64 MiB per-worker payload budgets. A five-page layer
@@ -454,6 +461,7 @@ fn concurrent_relayed_layers_with_mode(opaque: bool) {
     let sim = SimOs::new();
     let clock = racer_io::SimClock::new(73);
     let env = &racer_io::Env::sim(&sim, clock.ctx(0));
+    let _mesh = ::topology::test_util::FullMeshMax::set(RELAY_FULL_MESH_MAX);
     let mut harness = Harness::new(73, sim, clock, false);
     harness.concurrent_layers = true;
     harness.opaque_relay = opaque;

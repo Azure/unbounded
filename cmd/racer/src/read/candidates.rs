@@ -3352,6 +3352,8 @@ pub(super) mod tests {
     #[test]
     fn policy_visit_order_is_deterministic_and_neighbor_first_on_large_membership() {
         let env = racer_io::Env::host();
+        // A 64 member full mesh limit, so 100 members make several columns.
+        let _mesh = ::topology::test_util::FullMeshMax::set(64);
         let membership = spread_membership(100);
         let placement = Placement::new(64);
         let mut neighbor_first = 0;
@@ -3689,6 +3691,8 @@ pub(super) mod tests {
     fn shed_reader_asks_the_page_helper_once_then_the_other_owners() {
         use crate::test_support::security::{network, node};
         let env = racer_io::Env::host();
+        // A 64 member full mesh limit, so 100 members make several columns.
+        let _mesh = ::topology::test_util::FullMeshMax::set(64);
         futures::executor::block_on(async {
             // More than 64 members: several mesh columns, so readers outside
             // the owners' columns have a helper.

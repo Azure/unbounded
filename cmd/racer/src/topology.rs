@@ -2255,7 +2255,8 @@ pub(crate) mod tests {
         #[test]
         fn a_ping_reaches_the_silent_neighbor_it_tests() {
             let env = racer_io::Env::host();
-            // Above the 64 member full mesh, so a non-neighbor exists.
+            // Above a 64 member full mesh, so a non-neighbor exists.
+            let _mesh = ::topology::test_util::FullMeshMax::set(64);
             let members = membership(200);
             let source = &members.members()[0].node;
             let neighbors = members.neighbors(source).unwrap();
