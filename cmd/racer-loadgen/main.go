@@ -69,7 +69,7 @@ func parseOptions(args []string, output io.Writer) (options, error) {
 	f.IntVar(&opts.catalogBlobs, "catalog-blobs", 0, fmt.Sprintf("Select generic workload: 1-%d independent raw blobs, one blob per operation; excludes image sizing flags", maxCatalogBlobs))
 	f.IntVar(&opts.catalogWorkers, "catalog-workers", 1, "Parallel catalog hashing workers, 1-64; requires catalog-blobs")
 	f.Int64Var(&opts.blobBytes, "blob-bytes", 64<<20, "Exact bytes per generic blob (no jitter or tar framing); requires catalog-blobs")
-	f.StringVar(&opts.pull.Profile, "profile", profileShuffle, "Catalog selection profile: shuffle or zipf")
+	f.StringVar(&opts.pull.Profile, "profile", profileShuffle, "Catalog selection profile: shuffle, zipf, or sweep (one shared in-order pass across workers)")
 	f.Float64Var(&opts.pull.ZipfExponent, "zipf-exponent", defaultZipfExponent, "Finite positive Zipf exponent; larger values increase skew (zipf profile only)")
 	f.DurationVar(&opts.startupTimeout, "startup-timeout", 0, "Deadline for catalog generation, hashing, and origin startup; zero disables the overall deadline (UDS readiness is always bounded)")
 	f.StringVar(&opts.pull.Target, "target", "http://127.0.0.1:5000", "Gantry mirror URL (or origin URL for baseline)")

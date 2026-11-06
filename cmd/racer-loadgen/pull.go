@@ -17,6 +17,7 @@ import (
 	"net/url"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/opencontainers/go-digest"
@@ -71,6 +72,8 @@ type puller struct {
 	expected     map[digest.Digest]blobSource
 	// Shared by workers; production uses the concurrency-safe package RNG.
 	randomFloat64 func() float64
+	// Shared cursor for the sweep profile.
+	sweep atomic.Uint64
 }
 
 func newPuller(img *syntheticImage, opts pullOptions, metrics *loadMetrics) (*puller, error) {

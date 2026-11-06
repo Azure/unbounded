@@ -187,6 +187,9 @@ expected digest and size.
   Independent single-blob operations always use one request.
 - `--profile=shuffle` traverses the catalog in shuffled passes; `--profile=zipf`
   samples by stable catalog rank with `--zipf-exponent` controlling skew.
+  `--profile=sweep` shares one in-order cursor across all workers in the
+  process, so each pass reads every entry once. Use it to measure cold reads
+  without the repeats that independent per-worker shuffles produce.
 - Live `--concurrency-file` and node caps apply to the same admission loop for
   both backends. Reducing concurrency drains admitted operations under their
   original deadline. Zero pauses reads while keeping the origin available.
