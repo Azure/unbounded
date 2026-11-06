@@ -3461,7 +3461,14 @@ pub(crate) mod lifetime_tests {
                 Box::into_raw(Box::new(vec![0u8; 64])) as usize
             },
         );
-        settle(&registering);
+        // The helper publishes the result before it wakes the owner, so wait
+        // for the wake: `ready` alone can be observed before the wake runs.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while wakes.load(Ordering::Acquire) == 0 {
+            assert!(std::time::Instant::now() < deadline, "helper never woke");
+            std::thread::yield_now();
+        }
+        assert!(registering.ready(), "woken before the result was ready");
         assert_eq!(wakes.load(Ordering::Acquire), 1);
         let built = registering.finish().unwrap();
         assert_eq!(built.length(), 64);
