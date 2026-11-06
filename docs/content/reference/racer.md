@@ -1460,6 +1460,21 @@ every page, most fills on a node that is not rank 0 should be `rank0_miss`. A
 large `rank0_overdue` or `rank0_unreachable` count means pages that rank 0 may
 hold went to origin.
 
+A peer connect that fails because this node ran out of a local resource is load,
+not an unreachable peer: `EADDRNOTAVAIL` (no free ephemeral port toward that peer,
+usually because closed connections still sit in `TIME_WAIT`), `EADDRINUSE`,
+`EMFILE`, `ENFILE`, `ENOBUFS`, `ENOMEM`, and `EAGAIN` fail the probe `Overloaded`,
+so the walk retries the owner later instead of counting it `rank0_unreachable`
+and asking origin. `racer_peer_connect_local_exhausted_total` counts these connects.
+`/debug/failures` keeps the original errno at `stage=PeerCheckout`.
+
+A peer page body that is already arriving over HTTP when this worker's ciphertext
+budget is full waits for budget, polling every 1 ms for up to 250 ms (at most a
+quarter of the time left in the request), instead of failing at once. Failing
+would close the connection mid-body and leave its port in `TIME_WAIT`.
+`racer_peer_receive_ciphertext_waits_total` counts bodies that waited and
+`racer_peer_receive_ciphertext_wait_granted_total` those that then got budget.
+
 The diagnostics listener uses port 9090 by default.
 Persist scrape configuration on workload templates or supported overrides, not only live Pods.
 

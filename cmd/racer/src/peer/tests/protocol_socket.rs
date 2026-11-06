@@ -1841,6 +1841,11 @@ mod established_sessions {
         // The answer is the bare unsigned overload head: no envelope, no body.
         assert!(peer_wire::is_overloaded(&response.value));
         assert_eq!(response.connection.remaining_body(), Some(0));
+        // The holder keeps the connection, so the sender pools it (`Transfers::exchange`) rather
+        // than closing it into `TIME_WAIT` on every shed.
+        let mut connection = response.connection;
+        connection.finish_exchange().unwrap();
+        assert!(connection.is_reusable());
         assert!(served.is_ok(), "{:?}", served.err());
         assert_eq!(f.calls.get(), 0, "an unverified request reached service");
         drop(held);

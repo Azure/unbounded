@@ -1900,7 +1900,14 @@ pub(super) fn dst_native_faults_reach_warmed_peers_in_small_topologies() {
 }
 
 pub(super) fn dst_refused_peer_connect_preserves_candidate_fallback() {
-    for native in [false, true] {
+    // A refused connect is the peer's failure; EADDRNOTAVAIL (this node out of ephemeral ports)
+    // is local load and must retry rather than fail the read. Both reads succeed.
+    for (native, errno) in [
+        (false, libc::ECONNREFUSED),
+        (true, libc::ECONNREFUSED),
+        (false, libc::EADDRNOTAVAIL),
+        (true, libc::EADDRNOTAVAIL),
+    ] {
         let sim = SimOs::new();
         let clock = racer_io::SimClock::new(119);
         let env = racer_io::Env::sim(&sim, clock.ctx(0));
@@ -1913,16 +1920,17 @@ pub(super) fn dst_refused_peer_connect_preserves_candidate_fallback() {
         let requester = (0..4).find(|node| !ranked.contains(node)).unwrap();
         // The first cold request from a noncandidate connects to a peer before
         // origin. Raw ECONNREFUSED must retain the same fallback as synthetic Io.
-        harness
-            .sim
-            .inject("connect", Fault::Errno(libc::ECONNREFUSED))
-            .unwrap();
+        harness.sim.inject("connect", Fault::Errno(errno)).unwrap();
         let client = harness.request_on(2, false, false, requester);
         harness.exchange(client, false);
         assert_eq!(harness.coverage.observed.get("connect"), Some(&1));
         assert_eq!(harness.coverage.success, 1);
         assert_eq!(harness.coverage.failures, 0);
-        assert!(harness.coverage.relay_turns > 0);
+        // A refused owner is routed around through another candidate; an exhausted local port
+        // range retries the same owner later.
+        if errno == libc::ECONNREFUSED {
+            assert!(harness.coverage.relay_turns > 0);
+        }
         while !harness.nodes.is_empty() {
             harness.remove(&env, 0);
         }

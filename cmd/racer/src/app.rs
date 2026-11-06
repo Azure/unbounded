@@ -1518,7 +1518,8 @@ impl WorkerApplication {
             admission.clone(),
             memory.clone(),
             writer.clone(),
-        ));
+        ))
+        .with_metrics(metrics.clone());
         let transfers = Rc::new(match &links {
             Some(links) => transfers.with_links(links.clone()),
             None => transfers,

@@ -209,6 +209,10 @@ fn recoverable(error: Error) -> bool {
         Error::Unavailable | Error::Io | Error::Os(_) | Error::Overloaded | Error::FlightFull
     )
 }
+/// Longest a peer body already on the wire waits for this worker's ciphertext budget
+/// ([`Transfers::reserve_ciphertext_waiting`]).
+pub(crate) const CIPHERTEXT_WAIT: Duration = Duration::from_millis(250);
+
 fn native_scope(scope: &RequestScope) -> RequestScope {
     let mut bounded = scope.clone();
     bounded.deadline.0 = bounded
@@ -604,8 +608,9 @@ impl Transfers {
         let buffer = match cache {
             Some(cache) if length != 0 => {
                 let buffers = codec.buffers();
-                let reservation =
-                    self.reserve_ciphertext(cache, buffers.aligned_capacity(length)?)?;
+                let reservation = self
+                    .reserve_ciphertext_waiting(cache, buffers.aligned_capacity(length)?, scope)
+                    .await?;
                 WireBuffer::aligned(buffers, reservation, length)?
             }
             _ => WireBuffer::unkeyed(codec.buffers(), admission, length)?,
@@ -1137,6 +1142,28 @@ pub(crate) fn reserve_ciphertext(
     }
 }
 
+/// A connect that failed for want of a local resource says nothing about the peer.
+///
+/// `EADDRNOTAVAIL` is the kernel out of ephemeral ports for this destination (its closed
+/// connections still sit in `TIME_WAIT`), and the rest are descriptor or buffer exhaustion on
+/// this node. Each is this node being busy: the walk retries the same owner later
+/// (`Overloaded`) instead of treating it as unreachable and asking origin for every page until
+/// the ports free up.
+pub(crate) fn local_connect_overload(error: Error) -> Error {
+    match error {
+        Error::Os(
+            libc::EADDRNOTAVAIL
+            | libc::EADDRINUSE
+            | libc::EMFILE
+            | libc::ENFILE
+            | libc::ENOBUFS
+            | libc::ENOMEM
+            | libc::EAGAIN,
+        ) => Error::Overloaded,
+        error => error,
+    }
+}
+
 /// Generic Io has lost errno and may mean local ENOBUFS/ENOMEM. It is not link
 /// evidence. Only an observed orderly EOF is classified here; connect preserves
 /// its errno separately in HttpPool.
@@ -1258,6 +1285,7 @@ pub struct Transfers {
     pub(super) io: Rc<HttpIo>,
     pub(super) wire: (Rc<flow_control::Quotas<AdmissionPolicy>>, Rc<SecurityCodec>),
     pub(super) links: Option<Rc<crate::rdma::Links>>,
+    metrics: Option<crate::telemetry::Metrics>,
 }
 impl Transfers {
     /// Authentication and charged decoding are mandatory, even for HTTP-only peers.
@@ -1290,6 +1318,17 @@ impl Transfers {
             io,
             wire: (admission, codec),
             links: None,
+            metrics: None,
+        }
+    }
+    /// Count this worker's local peer-transport refusals.
+    pub(crate) fn with_metrics(mut self, metrics: crate::telemetry::Metrics) -> Self {
+        self.metrics = Some(metrics);
+        self
+    }
+    fn record(&self, event: Event, amount: u64) {
+        if let Some(metrics) = &self.metrics {
+            metrics.record(event, amount);
         }
     }
     /// Use persistent RDMA links for pages and link setup.
@@ -1332,6 +1371,41 @@ impl Transfers {
         capacity: usize,
     ) -> Result<flow_control::Charge<AdmissionPolicy>> {
         reserve_ciphertext(&self.wire.0, self.reclaim.as_deref(), cache, capacity)
+    }
+    /// Reserve a keyed peer-receive body whose bytes are already on the wire, waiting briefly
+    /// for this worker's ciphertext budget instead of failing at once.
+    ///
+    /// The peer has answered and its body is in flight, so a refusal here closes a healthy
+    /// connection mid-body: the walk retries on a new one, and every refusal parks an ephemeral
+    /// port in `TIME_WAIT`. Pages in decode release ciphertext within milliseconds, so a short
+    /// wait ([`CIPHERTEXT_WAIT`], at most a quarter of what is left of the request) usually
+    /// keeps the connection. A wait that runs out still fails `Overloaded`.
+    pub(crate) async fn reserve_ciphertext_waiting(
+        &self,
+        cache: &racer_wire::control::CacheId,
+        capacity: usize,
+        scope: &RequestScope,
+    ) -> Result<flow_control::Charge<AdmissionPolicy>> {
+        let first = self.reserve_ciphertext(cache, capacity);
+        if !matches!(first, Err(Error::Overloaded)) {
+            return first;
+        }
+        let reactor = self.io.reactor();
+        let clock = || scope.clock().now();
+        let now = clock();
+        let until = now + CIPHERTEXT_WAIT.min(scope.deadline.0.saturating_duration_since(now) / 4);
+        let (reserved, _) = crate::rdma::links::retry_overloaded(
+            || std::future::ready(self.reserve_ciphertext(cache, capacity)),
+            |wake| reactor.sleep_until(wake, scope),
+            clock,
+            until,
+        )
+        .await;
+        self.record(Event::PeerReceiveCiphertextWaits, 1);
+        if reserved.is_ok() {
+            self.record(Event::PeerReceiveCiphertextWaitGranted, 1);
+        }
+        reserved
     }
     pub(crate) fn with_reclamation(
         mut self,
@@ -1391,25 +1465,33 @@ impl Transfers {
             if let Some(timing) = timing.as_deref_mut() {
                 timing.enable(&request.request, plan, relay.is_some());
             }
-            let mut connection = observer.result(
-                Stage::PeerCheckout,
-                scope,
-                self.http
-                    .checkout_with_state(
-                        &endpoint,
-                        crate::http::State {
-                            relay: crate::http::RelayResources::admitted(relay.clone()),
-                            exchange: crate::http::PeerExchange::new(
-                                peer_admission.clone(),
-                                receive_permit,
-                                Some(failure.clone()),
-                            ),
-                            ..Default::default()
-                        },
-                        scope,
-                    )
-                    .await,
-            )?;
+            let mut connection = observer
+                .result(
+                    Stage::PeerCheckout,
+                    scope,
+                    self.http
+                        .checkout_with_state(
+                            &endpoint,
+                            crate::http::State {
+                                relay: crate::http::RelayResources::admitted(relay.clone()),
+                                exchange: crate::http::PeerExchange::new(
+                                    peer_admission.clone(),
+                                    receive_permit,
+                                    Some(failure.clone()),
+                                ),
+                                ..Default::default()
+                            },
+                            scope,
+                        )
+                        .await,
+                )
+                .map_err(|error| {
+                    let error = local_connect_overload(error);
+                    if error == Error::Overloaded {
+                        self.record(Event::PeerConnectLocalExhausted, 1);
+                    }
+                    error
+                })?;
             connection.state_mut().exchange.admission = peer_admission.clone();
             if let Some(timing) = timing.as_deref_mut() {
                 timing.end(0);
@@ -1495,7 +1577,13 @@ impl Transfers {
             if peer_wire::is_overloaded(&received.value) {
                 // The next holder shed the request before verifying it
                 // (`racer_core::route::unverified_failure`): a relay signs its own `Overloaded`,
-                // a requester's walk asks its helper.
+                // a requester's walk asks its helper. The answer is complete (no body) and the
+                // holder keeps the connection open (`PeerServer` finishes the exchange), so pool it:
+                // closing it here would park an ephemeral port in `TIME_WAIT` for every shed, and
+                // a hot holder's sheds would run this node out of ports for that holder.
+                let mut connection = received.connection;
+                let _ = connection.finish_exchange();
+                drop(connection);
                 return Err(Error::Overloaded);
             }
             let control = detach(
@@ -1605,7 +1693,9 @@ impl Transfers {
             let buffers = codec.buffers();
             // Charge the whole pooled size class of the aligned body.
             let capacity = buffers.aligned_capacity(length)?;
-            let reservation = self.reserve_ciphertext(cache, capacity);
+            let reservation = self
+                .reserve_ciphertext_waiting(cache, capacity, scope)
+                .await;
             let mut buffer = WireBuffer::aligned(
                 buffers,
                 observer.result(Stage::PeerReceiveAdmission, scope, reservation)?,
@@ -3281,6 +3371,183 @@ mod tests {
         assert_eq!(requests.take(), Some((cache, 64)));
         drop(charge);
         assert_eq!(admission.used(ResourceClass::Ciphertext), 0);
+    }
+    /// A body already on the wire waits briefly for ciphertext budget: it gets the budget once
+    /// decode frees some, fails `Overloaded` when none frees within the bound, and passes other
+    /// results through without waiting.
+    #[test]
+    fn transfers_keyed_receive_waits_for_ciphertext_budget() {
+        use std::task::{Context, Poll};
+        let env = racer_io::Env::host();
+        let admission = Rc::new(flow_control::Quotas::new(AdmissionPolicy::new(
+            crate::test_support::cluster::config(false).limits,
+        )));
+        let reactor = Rc::new(crate::runtime::Reactor::new(admission.clone(), &env));
+        let signers = crate::peer::tests::signers(&env);
+        let metrics = crate::telemetry::Metrics::for_workers(1).unwrap().remove(0);
+        let transfers = |metrics: crate::telemetry::Metrics| {
+            let io = Rc::new(crate::http::new_io(
+                reactor.clone(),
+                crate::http::Codec::new(crate::peer::protocol::MAX_ENVELOPE_HEAD),
+                admission.clone(),
+                crate::model::PAGE_BYTES + 16,
+            ));
+            Transfers::new(
+                Rc::new(crate::http::new_pool(reactor.clone(), admission.clone(), 1)),
+                io,
+                admission.clone(),
+                Rc::new(crate::peer::protocol::SecurityCodec::new(
+                    admission.clone(),
+                    crate::memory::BufferPool::new(admission.clone()),
+                )),
+                signers[0].clone(),
+            )
+            .with_metrics(metrics)
+        };
+        fn drive<T>(
+            reactor: &crate::runtime::Reactor,
+            future: impl std::future::Future<Output = T>,
+        ) -> T {
+            let mut future = std::pin::pin!(future);
+            let mut cx = Context::from_waker(futures::task::noop_waker_ref());
+            let watchdog = std::time::Instant::now() + Duration::from_secs(10);
+            loop {
+                if let Poll::Ready(result) = future.as_mut().poll(&mut cx) {
+                    return result;
+                }
+                assert!(std::time::Instant::now() < watchdog, "wait did not end");
+                reactor.poll_budgeted(128).unwrap();
+                reactor.wait(Duration::from_millis(1)).unwrap();
+            }
+        }
+        let scope = |seconds| {
+            RequestScope::host(
+                crate::model::RequestId([5; 16]),
+                std::time::Instant::now() + Duration::from_secs(seconds),
+            )
+            .unwrap()
+        };
+        let cache = racer_wire::control::CacheId("11111111-4444-4444-8444-444444444444".into());
+        // Free budget: granted at once, no wait counted.
+        let free = transfers(metrics.clone());
+        let charge = {
+            let scope = scope(30);
+            drive(
+                &reactor,
+                free.reserve_ciphertext_waiting(&cache, 64, &scope),
+            )
+            .unwrap()
+        };
+        assert_eq!(charge.amount(), 64);
+        drop(charge);
+        assert_eq!(metrics.count(Event::PeerReceiveCiphertextWaits), 0);
+        let held = Rc::new(std::cell::RefCell::new(Vec::new()));
+        for shift in (0..48).rev() {
+            while let Ok(charge) =
+                admission.reserve(Some(&cache), ResourceClass::Ciphertext, 1 << shift)
+            {
+                held.borrow_mut().push(charge);
+            }
+        }
+        // Nothing frees: the wait ends `Overloaded` within its bound.
+        let started = std::time::Instant::now();
+        {
+            let scope = scope(30);
+            assert_eq!(
+                drive(
+                    &reactor,
+                    free.reserve_ciphertext_waiting(&cache, 64, &scope)
+                )
+                .err(),
+                Some(Error::Overloaded)
+            );
+        }
+        assert!(started.elapsed() < CIPHERTEXT_WAIT * 4);
+        assert_eq!(metrics.count(Event::PeerReceiveCiphertextWaits), 1);
+        assert_eq!(metrics.count(Event::PeerReceiveCiphertextWaitGranted), 0);
+        // Decode frees budget during the wait: the third reclaim (the first poll after the
+        // initial attempt and its reclaim) releases it and the body is admitted.
+        let calls = Rc::new(std::cell::Cell::new(0));
+        let freeing = transfers(metrics.clone()).with_reclamation({
+            let (held, calls) = (held.clone(), calls.clone());
+            move |_, _| {
+                calls.set(calls.get() + 1);
+                if calls.get() == 3 {
+                    held.borrow_mut().clear();
+                }
+            }
+        });
+        let charge = {
+            let scope = scope(30);
+            drive(
+                &reactor,
+                freeing.reserve_ciphertext_waiting(&cache, 64, &scope),
+            )
+            .unwrap()
+        };
+        assert_eq!(charge.amount(), 64);
+        assert_eq!(calls.get(), 3);
+        assert_eq!(metrics.count(Event::PeerReceiveCiphertextWaits), 2);
+        assert_eq!(metrics.count(Event::PeerReceiveCiphertextWaitGranted), 1);
+        drop(charge);
+        // A stopped quota is not load: it fails at once without waiting.
+        admission.stop();
+        {
+            let scope = scope(30);
+            assert_eq!(
+                drive(
+                    &reactor,
+                    free.reserve_ciphertext_waiting(&cache, 64, &scope)
+                )
+                .err(),
+                Some(Error::Unavailable)
+            );
+        }
+        assert_eq!(metrics.count(Event::PeerReceiveCiphertextWaits), 2);
+    }
+    /// Connect failures for want of a local resource are load on this node, not evidence that
+    /// the peer is down; refusals, resets, and lost errnos keep their meaning.
+    #[test]
+    fn local_connect_exhaustion_is_overloaded_not_unreachable() {
+        for errno in [
+            libc::EADDRNOTAVAIL,
+            libc::EADDRINUSE,
+            libc::EMFILE,
+            libc::ENFILE,
+            libc::ENOBUFS,
+            libc::ENOMEM,
+            libc::EAGAIN,
+        ] {
+            assert_eq!(
+                local_connect_overload(Error::Os(errno)),
+                Error::Overloaded,
+                "{errno}"
+            );
+        }
+        for error in [
+            Error::Os(libc::ECONNREFUSED),
+            Error::Os(libc::ECONNRESET),
+            Error::Os(libc::EHOSTUNREACH),
+            Error::Os(libc::ETIMEDOUT),
+            Error::Io,
+            Error::Unavailable,
+            Error::Overloaded,
+            Error::Canceled,
+        ] {
+            assert_eq!(local_connect_overload(error), error);
+        }
+        // The walk treats the result as busy (retry the owner) rather than unreachable.
+        assert_eq!(
+            transport_outcome_of(local_connect_overload(Error::Os(libc::EADDRNOTAVAIL))),
+            Some(racer_core::read::ProbeOutcome::Overloaded)
+        );
+        assert_eq!(
+            transport_outcome_of(Error::Os(libc::ECONNREFUSED)),
+            Some(racer_core::read::ProbeOutcome::Unreachable)
+        );
+    }
+    fn transport_outcome_of(error: Error) -> Option<racer_core::read::ProbeOutcome> {
+        racer_core::read::walk::transport_outcome(racer_core::read::Error::try_from(error).unwrap())
     }
     mod native_control_tests {
         use super::*;
