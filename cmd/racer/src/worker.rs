@@ -532,9 +532,14 @@ fn startup_scope(budget: Duration, clock: &racer_io::Clock) -> Result<RequestSco
 }
 
 fn poll_runtime(runtime: &WorkerRuntime) -> Result<()> {
-    let crypto = runtime.crypto.poll_budgeted(WORK_BUDGET);
+    // Reap before draining crypto. The reap consumes the lane's eventfd wake
+    // and clears its coalescing flag, so a completion published before that
+    // clear may not have written the eventfd. Draining crypto afterwards
+    // receives it; any later completion sees the cleared flag and wakes the
+    // park itself.
     let reactor = runtime.reactor.poll_budgeted(WORK_BUDGET);
-    crypto.and(reactor.map(|_| ()))
+    let crypto = runtime.crypto.poll_budgeted(WORK_BUDGET);
+    reactor.map(|_| ()).and(crypto)
 }
 
 fn fence_runtime<'a>(

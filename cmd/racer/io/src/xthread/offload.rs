@@ -96,13 +96,21 @@ where
         budget: usize,
         mut observe: impl FnMut(&C),
     ) -> crate::Result<(), S::Error> {
-        for _ in 0..budget {
+        let mut delivered = 0;
+        while delivered < budget {
             let Some(completion) = port.receive()? else {
                 break;
             };
             observe(&completion);
             let id = completion.permit().id();
             self.waiters.deliver(id, completion);
+            delivered += 1;
+        }
+        if budget != 0 && delivered == budget {
+            // The producer's wake for completions still queued may already
+            // have been consumed, so ask the driver for another turn rather
+            // than letting it park on them.
+            port.handoff.client_waker.wake();
         }
         if port.completions_closed() {
             port.discard_closed();
@@ -1117,6 +1125,53 @@ mod tests {
             executor.poll(&mut worker, &mut cx, 1, |job| job).unwrap();
             assert!(executor.is_drained());
         }
+    }
+
+    /// A drain that stops at its budget asks the driver for another turn, since
+    /// the producer's wake for the remaining completions may already be spent.
+    #[test]
+    fn client_budget_exhaustion_rewakes_driver() {
+        let (port, mut worker) = pair(7, 3);
+        let client = super::Client::<Id, Message, ClientScope>::new(NonZeroUsize::new(3).unwrap());
+        let drops = Arc::new(AtomicUsize::new(0));
+        for sequence in 1..=3 {
+            assert!(
+                port.try_submit(message(&port, sequence, &drops), |_| {})
+                    .is_ok()
+            );
+            let job = dequeue(&mut worker);
+            assert!(worker.complete(job).is_ok());
+        }
+        let (count, waker) = wake_counter();
+        let mut observed = 0;
+
+        port.register_driver(&waker);
+        client.poll_budgeted(&port, 0, |_| observed += 1).unwrap();
+        assert_eq!(observed, 0);
+        assert_eq!(
+            count.0.load(Ordering::SeqCst),
+            0,
+            "a zero budget delivers nothing"
+        );
+
+        client.poll_budgeted(&port, 2, |_| observed += 1).unwrap();
+        assert_eq!(observed, 2);
+        assert_eq!(
+            count.0.swap(0, Ordering::SeqCst),
+            1,
+            "completions may remain"
+        );
+
+        port.register_driver(&waker);
+        client.poll_budgeted(&port, 2, |_| observed += 1).unwrap();
+        assert_eq!(observed, 3);
+        assert_eq!(
+            count.0.load(Ordering::SeqCst),
+            0,
+            "queue drained below budget"
+        );
+        assert_eq!(port.outstanding(), 0);
+        assert_eq!(drops.load(Ordering::SeqCst), 3);
     }
 
     /// Failed completion publication retains its payload rather than dropping ownership.
