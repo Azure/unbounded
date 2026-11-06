@@ -1228,7 +1228,6 @@ mod tests {
             native.client(WorkerId(0)).unwrap().unwrap(),
             native.link_node(),
             NodeId("node".into()),
-            2,
             None,
             racer_io::WorkerCtx::host(),
         );

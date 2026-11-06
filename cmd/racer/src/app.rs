@@ -1434,7 +1434,6 @@ impl WorkerApplication {
                         client,
                         node.native.link_node(),
                         config.node.clone(),
-                        limits.connections_per_neighbor.get(),
                         Some(reactor.clone()),
                         reactor.ctx().clone(),
                     )

@@ -1761,7 +1761,11 @@ while rails are active, and `racer_rdma_free_buffers` counts free page buffers.
 `racer_rdma_http_fallback_total` counts pages that planned RDMA but went over
 HTTP; `racer_rdma_fallback_no_link_total` and `racer_rdma_fallback_grant_total`
 split out the two common reasons: no ready link to the peer yet, and a grant that
-failed (usually because every page buffer was in use).
+failed. `racer_rdma_fallback_grant_overloaded_total` counts the subset of grant
+failures that found every page buffer of the rail, or every grant slot of the
+link, in use. Each link may hold as many grants as its rail has page buffers
+(the `RACER_REGISTERED_BYTES` pool split across rails, at most 1024), capped by
+the peer's advertised limit.
 `racer_rdma_links_ready`, `racer_rdma_links_connecting`, `racer_rdma_links_backoff`,
 and `racer_rdma_links_breaking` count the node's links by state.
 `racer_rdma_link_breaks_total{reason}` counts links torn down, by `reason`:

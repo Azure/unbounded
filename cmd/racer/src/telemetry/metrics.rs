@@ -330,6 +330,7 @@ metrics! { Event, EVENTS, EVENT_COUNT;
             Self::RdmaHttpFallback => "racer_rdma_http_fallback_total",
             Self::RdmaFallbackNoLink => "racer_rdma_fallback_no_link_total",
             Self::RdmaFallbackGrant => "racer_rdma_fallback_grant_total",
+            Self::RdmaFallbackGrantOverloaded => "racer_rdma_fallback_grant_overloaded_total",
             Self::RdmaFallbackOverflow => "racer_rdma_fallback_overflow_total",
             Self::RdmaActivationFailure => "racer_rdma_activation_failures_total",
             Self::RdmaLinkBreakError => "racer_rdma_link_breaks_total" { "reason=\"error\"" },

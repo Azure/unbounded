@@ -500,7 +500,7 @@ impl Transfers {
         let pending = match granted {
             Ok(pending) => pending,
             Err(error) if native_failure(error, scope) => {
-                links.record_fallback_grant();
+                links.record_fallback_grant(error);
                 return Ok(None);
             }
             Err(error) => return Err(error),

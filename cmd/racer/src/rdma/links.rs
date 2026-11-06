@@ -68,11 +68,21 @@ pub fn fund_publication<T>(publication: &mut Vec<T>, registered_bytes: usize) {
     publication.truncate(funded_devices(registered_bytes, publication.len()));
 }
 
-/// Grants per link: each concurrent page to a peer already needs one HTTP connection.
-pub fn grants_per_link(connections_per_neighbor: usize) -> u32 {
-    u32::try_from(connections_per_neighbor)
+/// Most grants one link advertises. Each link posts `2 * grants + 4`
+/// receives, `4 * grants + 8` sends, and binds up to `grants` memory windows,
+/// all well inside common device limits (`max_qp_wr`, `max_mw`) at this value.
+pub const GRANTS_PER_LINK_CAP: u32 = 1024;
+
+/// Grants per link for a rail funding `buffers_per_rail` page buffers.
+///
+/// A link may hold as many grants as its rail has buffers: the rail's pool is
+/// the real limit, and a smaller per-link cap only turns hash skew across
+/// rails (several concurrent pages landing on one rail) into HTTP fallbacks.
+/// The peer's advertised value still caps each link at `min(local, peer)`.
+pub fn grants_per_link(buffers_per_rail: usize) -> u32 {
+    u32::try_from(buffers_per_rail)
         .unwrap_or(u32::MAX)
-        .clamp(1, link_setup::MAX_GRANTS_PER_LINK)
+        .clamp(1, GRANTS_PER_LINK_CAP.min(link_setup::MAX_GRANTS_PER_LINK))
 }
 
 /// Opaque verbs key for a peer and rail: `SHA-256(NodeId)` and the rail.
@@ -309,8 +319,6 @@ pub struct Links {
 
     local: NodeId,
 
-    grants_per_link: u32,
-
     retry: Rc<NativeRetry>,
 
     tasks: RefCell<Vec<Operation<'static, ()>>>,
@@ -335,7 +343,6 @@ impl Links {
         client: Client,
         node: Arc<LinkNode>,
         local: NodeId,
-        connections_per_neighbor: usize,
         reactor: Option<Rc<crate::runtime::Reactor>>,
         ctx: racer_io::WorkerCtx,
     ) -> Self {
@@ -345,7 +352,6 @@ impl Links {
             client,
             node,
             local,
-            grants_per_link: grants_per_link(connections_per_neighbor),
             retry: reactor.map_or_else(NativeRetry::unattached, NativeRetry::new),
             tasks: RefCell::new(Vec::new()),
             draining: Cell::new(false),
@@ -448,11 +454,15 @@ impl Links {
         self.record(crate::telemetry::Event::RdmaFallbackNoLink, 1);
     }
 
-    /// As [`Self::record_http_fallback`], because the grant failed, typically
-    /// with every page buffer in use.
-    pub fn record_fallback_grant(&self) {
+    /// As [`Self::record_http_fallback`], because the grant failed with
+    /// `error`. [`Error::Overloaded`] (every page buffer or grant slot of the
+    /// link in use, or the owner queue full) also counts separately.
+    pub fn record_fallback_grant(&self, error: Error) {
         self.record_http_fallback();
         self.record(crate::telemetry::Event::RdmaFallbackGrant, 1);
+        if error == Error::Overloaded {
+            self.record(crate::telemetry::Event::RdmaFallbackGrantOverloaded, 1);
+        }
     }
 
     /// Count a page body delivered over HTTP because its hop qualified for RDMA by Site and
@@ -601,7 +611,7 @@ impl Links {
                     pool_bytes,
                     buffer_len: BUFFER_LEN,
                     max_links: crate::topology::RDMA_PEERS,
-                    grants_per_link: self.grants_per_link,
+                    grants_per_link: grants_per_link(pool_bytes / BUFFER_LEN),
                     idle: LINK_IDLE,
                     guard,
                 }),
@@ -828,7 +838,7 @@ impl Links {
             rail,
             opened.setup.endpoint.to_bytes(),
             opened.setup.recv_credits,
-            self.grants_per_link,
+            opened.setup.grants_per_link,
             &self.ctx.rng,
         );
         match setup {
@@ -942,7 +952,7 @@ impl Links {
             nonce,
             endpoint: opened.setup.endpoint.to_bytes(),
             recv_credits: opened.setup.recv_credits,
-            grants_per_link: self.grants_per_link,
+            grants_per_link: opened.setup.grants_per_link,
         };
         Ok(setup.encode())
     }

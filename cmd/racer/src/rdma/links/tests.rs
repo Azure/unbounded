@@ -65,7 +65,6 @@ fn node(sim: &Simulation, n: u8, id: NodeId, environment: Option<&racer_io::Work
             clients.remove(0),
             Arc::new(LinkNode::default()),
             id,
-            2,
             None,
             ctx,
         )),
@@ -268,10 +267,11 @@ fn constants_and_keys() {
     assert_eq!(buffer_count(2 * BUFFER_LEN), 2);
     assert_eq!(grants_per_link(0), 1);
     assert_eq!(grants_per_link(16), 16);
-    assert_eq!(
-        grants_per_link(usize::MAX),
-        crate::rdma::link_setup::MAX_GRANTS_PER_LINK
-    );
+    // Default sizing: 32 GiB over 8 rails funds ~229 buffers per rail.
+    assert_eq!(grants_per_link(buffer_count(32 << 30) / 8), 227);
+    assert_eq!(grants_per_link(usize::MAX), GRANTS_PER_LINK_CAP);
+    const { assert!(GRANTS_PER_LINK_CAP <= crate::rdma::link_setup::MAX_GRANTS_PER_LINK) };
+
     let key = link_key(&node_id(1), RAIL);
     assert_eq!(key, link_key(&node_id(1), RAIL));
     assert_ne!(key, link_key(&node_id(2), RAIL));
@@ -959,6 +959,17 @@ pub(crate) mod send_in_place {
         w.a.links.record_fallback_overflow();
         assert_eq!(ma.count(Event::RdmaFallbackOverflow), 1);
         assert_eq!(ma.count(Event::RdmaHttpFallback), 0);
+    }
+
+    #[test]
+    fn overloaded_grant_fallback_is_counted_apart() {
+        let w = world();
+        let (w, ma, _) = metered(w);
+        w.a.links.record_fallback_grant(Error::Overloaded);
+        w.a.links.record_fallback_grant(Error::Unavailable);
+        assert_eq!(ma.count(Event::RdmaHttpFallback), 2);
+        assert_eq!(ma.count(Event::RdmaFallbackGrant), 2);
+        assert_eq!(ma.count(Event::RdmaFallbackGrantOverloaded), 1);
     }
 }
 
