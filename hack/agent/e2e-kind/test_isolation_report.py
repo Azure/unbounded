@@ -7,6 +7,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
+import e2e
 import isolation_report as report
 
 TESTDATA = Path(__file__).resolve().parent / "testdata"
@@ -90,6 +91,15 @@ class AnnotateTests(unittest.TestCase):
         self.assertEqual([s["transition"]["strategy"] for s in steps], ["reprovision", "reprovision"])
         self.assertEqual(steps[0]["operation"], "Mode change to none (reprovision)")
 
+    def test_the_matrix_order_alternates_in_place_and_reprovision(self):
+        steps = [{"name": n, "status": "pass"} for n in (
+            "change-to-container", "change-to-none", "change-to-container", "change-to-nspawn")]
+        report.annotate_steps("nspawn", steps)
+        self.assertEqual([s["transition"]["strategy"] for s in steps],
+                         ["inPlace", "reprovision", "reprovision", "inPlace"])
+        self.assertEqual(steps[0]["operation"], "Mode change to container (inPlace)")
+        self.assertEqual(steps[3]["mode"], "container")
+
     def test_failed_change_keeps_the_source_mode(self):
         steps = [{"name": "change-to-none", "status": "fail"},
                  {"name": "validate-workload", "status": "not-run"}]
@@ -100,16 +110,23 @@ class AnnotateTests(unittest.TestCase):
         self.assertEqual(report.parse_change_step("change-to-nspawn"), "nspawn")
         self.assertEqual(report.parse_change_step("change-to-none"), "none")
         self.assertIsNone(report.parse_change_step("validate-workload"))
-        self.assertIsNone(report.parse_change_step("change-to-vm"))
+        self.assertEqual(report.parse_change_step("change-to-container"), "container")
         # A mode this harness does not know is not a change step.
-        self.assertIsNone(report.parse_change_step("change-to-container"))
+        self.assertIsNone(report.parse_change_step("change-to-vm"))
         self.assertIsNone(report.parse_change_step("migrate-to-none-reprovision"))
 
     def test_change_strategy(self):
-        # none has no slot, so no pair of nspawn and none changes in place.
-        for pair in (("nspawn", "none"), ("none", "nspawn")):
+        # nspawn and container change in place in both directions; none has
+        # no slot, so any pair involving none is a reprovision.
+        for pair in (("nspawn", "container"), ("container", "nspawn")):
+            self.assertEqual(report.change_strategy(*pair), "inPlace", pair)
+        for pair in (("nspawn", "none"), ("none", "nspawn"), ("container", "none"), ("none", "container")):
             self.assertEqual(report.change_strategy(*pair), "reprovision", pair)
-        self.assertEqual(report.STRATEGIES, ("reprovision",))
+        self.assertEqual(report.STRATEGIES, ("inPlace", "reprovision"))
+
+    def test_the_report_and_the_harness_agree_on_modes_and_in_place_pairs(self):
+        self.assertEqual(report.MODES, e2e.ISOLATION_MODES)
+        self.assertEqual(report.IN_PLACE_PAIRS, e2e.IN_PLACE_PAIRS)
 
     def test_an_in_place_pair_is_reported_as_in_place(self):
         """IN_PLACE_PAIRS is where a mode with slots adds its pairs."""
