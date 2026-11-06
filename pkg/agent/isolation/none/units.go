@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 
 	"github.com/Azure/unbounded/internal/fsutil"
 	"github.com/Azure/unbounded/pkg/agent/goalstates"
@@ -42,6 +43,11 @@ type UnitSpec struct {
 	// ContainerdConfigPath is the configuration containerd runs with. Empty
 	// means ContainerdConfigPath.
 	ContainerdConfigPath string
+	// GPUSetup are the commands containerd runs before each start to prepare
+	// GPU support: the NVIDIA CDI spec names driver libraries by version, so it
+	// is regenerated whenever the stack starts, a boot included, not only when
+	// the agent starts it. Empty, on a node without GPUs, writes no drop-in.
+	GPUSetup [][]string
 }
 
 // DefaultKubeletConfigPath is where the node-start phases write the kubelet
@@ -136,6 +142,18 @@ func WriteUnits(dir string, s UnitSpec) ([]string, error) {
 	return paths, nil
 }
 
+// RenderGPUSetupDropIn returns the containerd drop-in that runs each command
+// before containerd starts. A failure fails the start, as it does when the
+// agent runs the same setup, and Restart= retries it.
+func RenderGPUSetupDropIn(cmds [][]string) []byte {
+	out := []byte("# Managed by unbounded-agent. Do not edit directly.\n[Service]\n")
+	for _, c := range cmds {
+		out = fmt.Appendf(out, "ExecStartPre=%s\n", strings.Join(c, " "))
+	}
+
+	return out
+}
+
 // DropInDir is the drop-in directory of an agent-owned unit.
 func DropInDir(dir, unit string) string { return filepath.Join(dir, unit+".d") }
 
@@ -164,6 +182,13 @@ func WriteDropIns(dir string, s UnitSpec) ([]string, error) {
 		for _, u := range []string{UnitContainerd, UnitKubelet} {
 			files = append(files, file{filepath.Join(DropInDir(dir, u), "05-localdns.conf"), RenderLocalDNSDropIn()})
 		}
+	}
+
+	gpuDropIn := filepath.Join(DropInDir(dir, UnitContainerd), "10-gpu-setup.conf")
+	if len(s.GPUSetup) > 0 {
+		files = append(files, file{gpuDropIn, RenderGPUSetupDropIn(s.GPUSetup)})
+	} else if err := os.Remove(gpuDropIn); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return nil, err
 	}
 
 	if !s.LocalDNS {
