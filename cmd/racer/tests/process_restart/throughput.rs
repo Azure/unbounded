@@ -1219,11 +1219,13 @@ fn production_idle_wakes() {
     // Let startup traffic settle before sampling.
     thread::sleep(Duration::from_secs(3));
     let before = context_switches(pid);
+    let polls_before = control.polls.load(Ordering::Acquire);
     let cpu_before = observe(pid);
     let start = Instant::now();
     thread::sleep(Duration::from_secs(seconds));
     let elapsed = start.elapsed().as_secs_f64();
     let after = context_switches(pid);
+    let snapshot_polls = control.polls.load(Ordering::Acquire) - polls_before;
     let cpu_after = observe(pid);
     let per_thread: BTreeMap<_, _> = after
         .iter()
@@ -1241,7 +1243,7 @@ fn production_idle_wakes() {
             )
         })
         .collect();
-    let report = json!({"pairs": pairs, "hold_ms": hold, "seconds": elapsed, "pid": pid, "threads": per_thread});
+    let report = json!({"pairs": pairs, "hold_ms": hold, "snapshot_polls": snapshot_polls, "seconds": elapsed, "pid": pid, "threads": per_thread});
     println!("IDLE_WAKES {report}");
     let mut output = fs::OpenOptions::new()
         .create(true)

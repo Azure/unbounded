@@ -574,8 +574,13 @@ impl LocalSigningIdentity {
 
     /// Renew after two thirds of the issued lifetime, capped by wire policy.
     pub fn renewal_due_at(&self, now: SystemTime) -> bool {
+        now >= self.renewal_at()
+    }
+
+    /// Wall time from which [`Self::renewal_due_at`] holds.
+    pub fn renewal_at(&self) -> SystemTime {
         let lifetime = Duration::from_secs(self.not_after - self.not_before);
-        now >= UNIX_EPOCH
+        UNIX_EPOCH
             + Duration::from_secs(self.not_before)
             + (lifetime * 2 / 3).min(wire::RENEW_AFTER)
     }
@@ -1640,6 +1645,9 @@ mod tests {
         let lifetime = identity.not_after - identity.not_before;
         clock.set_wall_time(start + Duration::from_secs(lifetime * 2 / 3 - 1));
         assert!(!identity.renewal_due_at(sim_ctx.clock.clone().wall_now()));
+        // The renewal instant is exactly where `renewal_due_at` turns true.
+        assert!(!identity.renewal_due_at(identity.renewal_at() - Duration::from_nanos(1)));
+        assert!(identity.renewal_due_at(identity.renewal_at()));
         clock.set_wall_time(start + Duration::from_secs(lifetime * 2 / 3 + 1));
         assert!(identity.renewal_due_at(sim_ctx.clock.clone().wall_now()));
         assert!(identity.valid_at(sim_ctx.clock.clone().wall_now()));

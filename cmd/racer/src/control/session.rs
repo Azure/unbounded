@@ -21,6 +21,12 @@ use std::{
 };
 use zeroize::Zeroizing;
 
+/// Shortest serving renewal recheck, the former fixed cadence.
+const RENEWAL_MIN_WAIT: Duration = Duration::from_secs(1);
+
+/// Longest serving renewal sleep, bounding wall-clock steps.
+const RENEWAL_MAX_WAIT: Duration = Duration::from_secs(30);
+
 /// Owner-local session. Only the two polls own cursors, retry, and preparation jobs.
 pub struct Session {
     block_devices: RefCell<Option<String>>,
@@ -512,6 +518,31 @@ impl Session {
         }
     }
 
+    /// When the serving renewal loop next needs to check `renew_if_due`: the
+    /// identity's renewal time or a scheduled retry, at least [`RENEWAL_MIN_WAIT`]
+    /// and at most [`RENEWAL_MAX_WAIT`] from `now`. The cap bounds the effect of
+    /// wall-clock steps on a monotonic sleep.
+    fn renewal_wake(&self, now: Instant) -> Instant {
+        let wall = self.auth.enrollment.wall_now();
+        let due = self.identity().map_or(Duration::ZERO, |identity| {
+            identity
+                .renewal_at()
+                .duration_since(wall)
+                .unwrap_or(Duration::ZERO)
+        });
+        let retry = self
+            .renewal_next
+            .get()
+            .map(|next| next.saturating_duration_since(now));
+        // A due identity waits only on its scheduled retry.
+        let wait = match retry {
+            Some(retry) if due.is_zero() => retry,
+            Some(retry) => due.min(retry),
+            None => due,
+        };
+        now + wait.clamp(RENEWAL_MIN_WAIT, RENEWAL_MAX_WAIT)
+    }
+
     /// Token issuance is not a feed; preserve bounded independent renewal retry.
     fn issuance_backoff(&self, ctx: &racer_io::WorkerCtx) -> Result<Instant> {
         let failures = self.issuance_failures.get().saturating_add(1);
@@ -694,10 +725,22 @@ impl Session {
                 loop {
                     self.renew_if_due(scope).await?;
                     renewed.set(true);
-                    self.enrollment_transport
-                        .io()?
-                        .sleep(scope.clock().now() + Duration::from_secs(1), scope)
-                        .await?;
+                    let wake = self.renewal_wake(scope.clock().now());
+                    let io = self.enrollment_transport.io()?;
+                    let sleep = io.sleep(wake, scope);
+                    // A rejected fetch sets `binding_check` on this lane and wakes
+                    // this select, so renewal starts without waiting for `wake`.
+                    let rejected = std::future::poll_fn(|_| {
+                        if self.auth.binding_check.get() {
+                            std::task::Poll::Ready(Ok(()))
+                        } else {
+                            std::task::Poll::Pending
+                        }
+                    });
+                    futures::future::select(sleep, Box::pin(rejected))
+                        .await
+                        .factor_first()
+                        .0?;
                 }
                 #[allow(unreachable_code)]
                 Ok::<(), Error>(())
@@ -1467,6 +1510,27 @@ pub(super) mod tests {
         assert_eq!(seen.lock().unwrap().len(), 1, "same rails reported twice");
         session.report_rails(&[]);
         assert_eq!(*seen.lock().unwrap(), vec![(4, vec![rail]), (4, vec![])]);
+    }
+
+    /// The serving renewal loop sleeps until its scheduled retry within
+    /// fixed bounds instead of rechecking every second.
+    #[test]
+    fn renewal_wake_follows_retry_within_bounds() {
+        let env = racer_io::Env::host();
+        let session = session(&env);
+        let now = Instant::now();
+        // No identity and no retry keeps the former one-second recheck.
+        assert_eq!(session.renewal_wake(now), now + RENEWAL_MIN_WAIT);
+        session
+            .renewal_next
+            .set(Some(now + Duration::from_secs(10)));
+        assert_eq!(session.renewal_wake(now), now + Duration::from_secs(10));
+        session
+            .renewal_next
+            .set(Some(now + Duration::from_secs(100)));
+        assert_eq!(session.renewal_wake(now), now + RENEWAL_MAX_WAIT);
+        session.renewal_next.set(Some(now));
+        assert_eq!(session.renewal_wake(now), now + RENEWAL_MIN_WAIT);
     }
 
     /// Without any persisted rails, serving reports nothing (there is
