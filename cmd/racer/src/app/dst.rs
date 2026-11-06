@@ -3,7 +3,6 @@
 
 use crate::admission::ResourceClass;
 use crate::app::*;
-#[cfg(any(test, feature = "dst"))]
 use crate::lifecycle::Service;
 use crate::model::PAGE_BYTES;
 use crate::model::*;
