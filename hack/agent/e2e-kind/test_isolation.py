@@ -298,6 +298,19 @@ class NodeStackDiagnosticsTests(unittest.TestCase):
         self._run("none", ssh)
 
 
+class MachineShellTests(unittest.TestCase):
+    def test_runs_through_systemd_run_so_status_and_output_come_back(self):
+        cmd = e2e.machine_shell_command("kube1", "test -d /x && echo 'ok'")
+        self.assertTrue(cmd.startswith("sudo systemd-run -M kube1 --wait --pipe --quiet /bin/sh -lc "))
+        self.assertNotIn("machinectl shell", cmd)
+        self.assertIn("'test -d /x && echo '\"'\"'ok'\"'\"''", cmd)
+
+    def test_quiet_variant_uses_the_same_command(self):
+        with patch.object(e2e, "ssh_capture_quiet") as capture:
+            e2e.machine_shell_quiet("kube2", "true")
+        capture.assert_called_once_with(e2e.machine_shell_command("kube2", "true"))
+
+
 class BPFFSSentinelTests(unittest.TestCase):
     def test_script_needs_no_bpftool_and_stops_on_error(self):
         script = e2e.bpffs_sentinel_script()
