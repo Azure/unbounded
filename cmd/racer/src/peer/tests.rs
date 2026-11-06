@@ -145,7 +145,16 @@ mod body_progress {
                 } else {
                     Duration::from_secs(3)
                 };
-            let share = start + Duration::from_millis(250);
+            // Only cases that assert on the share's expiry use the short share.
+            // Success, cancel, and EOF end on their own terms, so their share is
+            // far enough out that setup and paced writes on a loaded host cannot
+            // reach it and turn the expected outcome into `DeadlineExceeded`.
+            let share = start
+                + if matches!(case, "success" | "cancel" | "eof") {
+                    Duration::from_millis(2500)
+                } else {
+                    Duration::from_millis(250)
+                };
             let mut local = request(env, &admission, 9);
             let signed_deadline = if idle { original } else { share };
             local.route.deadline = Deadline(signed_deadline);
