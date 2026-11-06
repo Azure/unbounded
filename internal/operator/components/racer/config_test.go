@@ -272,3 +272,22 @@ func TestValidateDataplaneConfigRejectsBothBudgetForms(t *testing.T) {
 	})
 	require.ErrorContains(t, err, "RACER_FLIGHTS and RACER_FLIGHTS_PER_WORKER must not both be set")
 }
+
+func TestCheckDataplaneValueUnsignedBounds(t *testing.T) {
+	unbounded := dataplaneSetting{Name: "RACER_TEST", Kind: "unsigned"}
+	require.Empty(t, checkDataplaneValue(unbounded, "0"))
+	require.Empty(t, checkDataplaneValue(unbounded, "18446744073709551615"))
+	require.NotEmpty(t, checkDataplaneValue(unbounded, "x"))
+
+	for field, setting := range map[string]dataplaneSetting{
+		"min":  {Name: "RACER_TEST", Kind: "unsigned", Min: "a", Max: "10", Step: "1"},
+		"max":  {Name: "RACER_TEST", Kind: "unsigned", Min: "0", Max: "-1", Step: "1"},
+		"step": {Name: "RACER_TEST", Kind: "unsigned", Min: "0", Max: "10", Step: "1.5"},
+	} {
+		t.Run(field, func(t *testing.T) {
+			rule := checkDataplaneValue(setting, "5")
+			require.Contains(t, rule, "RACER_TEST")
+			require.Contains(t, rule, "invalid "+field+" bound")
+		})
+	}
+}

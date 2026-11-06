@@ -7,6 +7,7 @@ import (
 	_ "embed"
 	"encoding/json"
 	"fmt"
+	"math"
 	"slices"
 	"sort"
 	"strconv"
@@ -88,9 +89,10 @@ func checkDataplaneValue(setting dataplaneSetting, value string) string {
 			return "must be one of " + strings.Join(setting.Values, ", ")
 		}
 	case "unsigned":
-		minimum, _ := strconv.ParseUint(setting.Min, 10, 64)
-		maximum, _ := strconv.ParseUint(setting.Max, 10, 64)
-		step, _ := strconv.ParseUint(setting.Step, 10, 64)
+		minimum, maximum, step, err := unsignedBounds(setting)
+		if err != nil {
+			return "cannot be checked: " + err.Error()
+		}
 
 		n, valid := dataplaneDecimal(value)
 		if !valid || n < minimum || n > maximum {
@@ -103,6 +105,38 @@ func checkDataplaneValue(setting dataplaneSetting, value string) string {
 	}
 
 	return ""
+}
+
+// unsignedBounds parses an unsigned setting's bounds from the generated table.
+// An empty bound means none: Min defaults to 0, Max to the uint64 maximum, and
+// Step to 1.
+func unsignedBounds(setting dataplaneSetting) (minimum, maximum, step uint64, err error) {
+	parse := func(field, raw string, fallback uint64) (uint64, error) {
+		if raw == "" {
+			return fallback, nil
+		}
+
+		n, err := strconv.ParseUint(raw, 10, 64)
+		if err != nil {
+			return 0, fmt.Errorf("setting %s has invalid %s bound %q: %w", setting.Name, field, raw, err)
+		}
+
+		return n, nil
+	}
+
+	if minimum, err = parse("min", setting.Min, 0); err != nil {
+		return 0, 0, 0, err
+	}
+
+	if maximum, err = parse("max", setting.Max, math.MaxUint64); err != nil {
+		return 0, 0, 0, err
+	}
+
+	if step, err = parse("step", setting.Step, 1); err != nil {
+		return 0, 0, 0, err
+	}
+
+	return minimum, maximum, step, nil
 }
 
 // validateDataplaneConfig reports every racer-settings value the
