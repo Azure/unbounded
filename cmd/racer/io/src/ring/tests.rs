@@ -1415,14 +1415,14 @@ fn fence_ids_waits_for_every_id_regardless_of_fence_order() {
     let ids: Vec<_> = ops.iter().map(|op| op.id().unwrap()).collect();
     let mut fence = reactor.fence_ids(ids.clone());
     // Fence the tail first, then a middle id: the head stays unfenced.
-    reactor.cancel_op(ids[3], Error::Cancelled);
-    reactor.cancel_op(ids[1], Error::Cancelled);
+    reactor.cancel_op(ids[3], Error::Canceled);
+    reactor.cancel_op(ids[1], Error::Canceled);
     for _ in 0..4 {
         reactor.reap(16).unwrap();
     }
     assert!(Pin::new(&mut fence).poll(&mut cx).is_pending());
-    reactor.cancel_op(ids[0], Error::Cancelled);
-    reactor.cancel_op(ids[2], Error::Cancelled);
+    reactor.cancel_op(ids[0], Error::Canceled);
+    reactor.cancel_op(ids[2], Error::Canceled);
     executor.block_on(&reactor, fence).unwrap();
     assert!(ids.iter().all(|id| reactor.is_fenced(*id)));
     drop(ops);
