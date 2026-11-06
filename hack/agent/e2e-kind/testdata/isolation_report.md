@@ -23,20 +23,20 @@ Run 20260101-000000: 1 passed, 1 failed, 1 skipped, 0 errors, of 3 scenarios. St
 
 Each cell is the worst result of every step that exercised the operation while the node was in that mode. A dash means no scenario ran the operation in that mode.
 
-| Operation | nspawn | none |
-|---|---|---|
-| Join (bootstrap) | PASS | PASS |
-| Workload and DNS | PASS | PASS |
-| NodeReboot (node stack restart) | - | FAIL |
+| Operation | nspawn | none | container |
+|---|---|---|---|
+| Join (bootstrap) | PASS | PASS | - |
+| Workload and DNS | PASS | PASS | - |
+| NodeReboot (node stack restart) | - | FAIL | - |
 
 ## Mode transitions
 
-Every move between nspawn and none is a reprovision; none has no slot to prepare the target in beside the source.
+In place is supported between nspawn and container only; any move involving none is a reprovision, as none has no slot to prepare the target in beside the source.
 
-| Transition | reprovision |
-|---|---|
-| none -> nspawn | PASS |
-| nspawn -> none | PASS |
+| Transition | inPlace | reprovision |
+|---|---|---|
+| none -> nspawn | - | PASS |
+| nspawn -> none | - | PASS |
 
 ## Scenario details
 

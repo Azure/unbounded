@@ -199,33 +199,42 @@ HOST_BASE_OS=ubuntu2404 E2E_SUITE=migration KEEP_ENV=1 \
 
 ## Isolation modes
 
-The agent runs the node stack in one of two isolation modes: `nspawn` (the
-default) and `none`. `ISOLATION_MODE` selects the mode under test and adds
-`--isolation <mode>` to `kubectl unbounded machine manual-bootstrap`. Left
-unset, no flag is passed and the existing suites behave exactly as before.
+The agent runs the node stack in one of three isolation modes: `nspawn` (the
+default), `none` and `container` (experimental and provisional).
+`ISOLATION_MODE` selects the mode under test and adds `--isolation <mode>` to
+`kubectl unbounded machine manual-bootstrap`, together with
+`--experimental-container-isolation`, so the agent configuration opts in to the
+experimental `container` mode and an `nspawn` host can later change to it. Left
+unset, no flag is passed and the existing suites behave exactly as before,
+except that a suite that changes the node to `container` (`isolation-matrix`,
+`isolation-rollback-in-place`) still passes `--experimental-container-isolation`.
+`E2E_EXPERIMENTAL_CONTAINER_ISOLATION=1` passes it for any other run.
 
 Every isolation suite is listed here. "Mode" is the value of `ISOLATION_MODE` to
 run it with; the suites that change the mode start in the default mode and move
 the node themselves. A change is declared the way an operator does it: the
 harness patches `spec.isolation` on the Machine, checks that nothing moves and
 `IsolationDrift` shows the declared mode as not yet applied, then deletes the
-Node, which triggers the repave that applies it. Every change between `nspawn`
-and `none` is a reprovision (the host is reset and bootstrapped again), and the
-agent only reprovisions a Machine annotated
+Node, which triggers the repave that applies it. `nspawn` <-> `container` is
+done in place, in both directions; any pair involving `none` is a reprovision
+(the host is reset and bootstrapped again), and the agent only reprovisions a Machine annotated
 `unbounded-cloud.io/allow-reprovision: "true"`; without it the change is
 reported `Failed` with reason `ReprovisionNotAllowed` and the repave goes ahead
 in the current mode. The harness sets the annotation for the changes it expects
-to succeed and removes it afterward. It does not choose the strategy: it asserts
+to succeed and removes it afterward. A change to `container` on a host whose
+agent configuration does not opt in is reported `Failed` with reason
+`ExperimentalNotEnabled`. The harness does not choose the strategy: it asserts
 the one `status.isolationChange` records.
 
 | Suite | Mode | Covers |
 |---|---|---|
-| `isolation-operations` | `nspawn`, `none` or unset | The full operation set in one mode: join, status, preflight, `unbounded-agent exec` and `logs`, soft reboot (`NodeReboot`, which must restart the kubelet of the node stack), host-driven and operation-driven `AgentUpgrade` with rollback, repave, host reboot, `AgentReset`, and reinstall on the same disk. |
-| `isolation-reset` | `nspawn`, `none` or unset | `unbounded-agent reset` run on the host removes the node stack of the mode, the agent's files and units, and leaves no reprovision handoff (unit, staged agent or staged configuration with the bootstrap token). |
+| `isolation-operations` | `nspawn`, `none`, `container` or unset | The full operation set in one mode: join, status, preflight, `unbounded-agent exec` and `logs`, soft reboot (`NodeReboot`, which must restart the kubelet of the node stack), host-driven and operation-driven `AgentUpgrade` with rollback, repave, host reboot, `AgentReset`, and reinstall on the same disk. |
+| `isolation-reset` | `nspawn`, `none`, `container` or unset | `unbounded-agent reset` run on the host removes the node stack of the mode, the agent's files and units, and leaves no reprovision handoff (unit, staged agent or staged configuration with the bootstrap token). |
 | `isolation-reset-after-reprovision` | unset | The same reset on a node that reached `none` by a reprovision, after checking the handoff was cleaned up once the change succeeded. |
-| `isolation-matrix` | unset | Every ordered pair of modes (`nspawn` -> `none` -> `nspawn`), by reprovision. After each change it also runs a soft reboot and a host reboot (and the `none` preflight), so a node that was changed behaves like one that was bootstrapped, and checks no reprovision handoff is left. |
+| `isolation-matrix` | unset | Every ordered pair of modes: `nspawn` -> `container` (in place), `container` -> `none` and `none` -> `container` (reprovision), `container` -> `nspawn` (in place), `nspawn` -> `none` and `none` -> `nspawn` (reprovision). After the changes to `none` and back to `nspawn` it also runs a soft reboot and a host reboot (and the `none` preflight), so a node that was changed behaves like one that was bootstrapped, and after every reprovision it checks no reprovision handoff is left. |
 | `isolation-drift` | unset | The `IsolationDrift` states: an empty spec declares nothing (`NoModeDeclared`), a declared unapplied mode shows `AppliedModeDiffers` while nothing moves, withdrawing it clears the drift, and a change refused for want of the reprovision opt-in shows `ChangeRefused` and is not retried. A change that succeeds ends at `AppliedModeMatches`; `isolation-matrix` asserts that after every change. |
-| `isolation-rollback` | `nspawn`, `none` or unset | A change that cannot go ahead leaves the node in its mode: declaring the applied mode moves nothing and records nothing, and a change that needs a reprovision is refused without the opt-in (`ReprovisionNotAllowed`) while the repave brings the node back in its mode, with no handoff staged and no retry. |
+| `isolation-rollback` | `nspawn`, `none`, `container` or unset | A change that cannot go ahead leaves the node in its mode: declaring the applied mode moves nothing and records nothing, a change that needs a reprovision is refused without the opt-in (`ReprovisionNotAllowed`) and, with `ISOLATION_MODE` unset, a change to `container` is refused without the experimental opt-in (`ExperimentalNotEnabled`), each time while the repave brings the node back in its mode, with no handoff staged and no retry. |
+| `isolation-rollback-in-place` | `container` | A change to `nspawn` is refused before the node is touched while the host lacks `machinectl`; a failed in-place `container` -> `nspawn` change restores the source and the shared host configuration byte for byte, is not retried, and shows `ChangeFailed`; then the node changes to `nspawn` in place and a failed `nspawn` -> `container` change rolls back the same way. It must start in `container` mode: an `nspawn` host keeps its configuration inside the machine, so there is nothing at the shared host paths to compare. |
 
 ```sh
 HOST_BASE_OS=ubuntu2404 ISOLATION_MODE=none E2E_SUITE=isolation-operations KEEP_ENV=1 \
@@ -233,6 +242,8 @@ HOST_BASE_OS=ubuntu2404 ISOLATION_MODE=none E2E_SUITE=isolation-operations KEEP_
 HOST_BASE_OS=ubuntu2404 E2E_SUITE=isolation-matrix KEEP_ENV=1 \
   bash hack/agent/e2e-kind/run-local.sh
 HOST_BASE_OS=ubuntu2404 E2E_SUITE=isolation-rollback KEEP_ENV=1 \
+  bash hack/agent/e2e-kind/run-local.sh
+HOST_BASE_OS=ubuntu2404 ISOLATION_MODE=container E2E_SUITE=isolation-rollback-in-place KEEP_ENV=1 \
   bash hack/agent/e2e-kind/run-local.sh
 ```
 
@@ -249,11 +260,21 @@ Kind cluster and boots a VM, and the set is too expensive to run on every change
 whole plan with `isolation_plan.py`, when you change the agent's isolation code.
 
 When a step fails, the harness prints the unit state, the journals of the agent
-and the node stack, and the state of any mode change and reprovision handoff.
-Bootstrap tokens and kubeconfig credentials are redacted from that output.
+and the node stack, the state of any mode change and reprovision handoff and, in
+`container` mode, the `runc` state, the in-container kubelet and containerd
+journals and the OCI bundle. Bootstrap tokens and kubeconfig credentials are
+redacted from that output.
 
-After a refused change the harness waits `RETRY_SOAK` seconds (default 60) to
-prove nothing retries the change without a new trigger. `MIGRATION_TIMEOUT`
+The in-place rollback cases need a fault that fails the change's target after
+the source stopped. The default fault places a directory where the checksum of
+the target slot's applied config belongs, which makes persisting the target
+fail, and the check requires `status.isolationChange` to report that persist
+failure followed by a rollback to the source. Replace it with
+`MIGRATION_FAULT_CMD` and `MIGRATION_FAULT_CLEANUP_CMD`, shell commands run on
+the VM; the check then requires only the rollback.
+
+After a refused or failed change the harness waits `RETRY_SOAK` seconds (default
+60) to prove nothing retries the change without a new trigger. `MIGRATION_TIMEOUT`
 (seconds, default 900) bounds how long each mode change may take to reach a
 terminal `status.isolationChange`.
 NodeConfig variants that check nspawn files (`additional-host-mounts.json`) are
@@ -263,7 +284,8 @@ nspawn-only and are not part of the isolation suites.
 
 `isolation_plan.py` runs the scenarios in
 `designs/agent-isolation-modes-test-plan.md` (every operation in each mode,
-every ordered mode transition, drift, a refused change, reset on the host) and
+every ordered mode transition, drift, a refused change, an in-place rollback,
+reset on the host) and
 writes a report.
 Each scenario is one e2e suite on a fresh VM; a failed scenario does not stop the
 run unless `--fail-fast`.
