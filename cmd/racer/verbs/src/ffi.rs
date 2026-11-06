@@ -105,6 +105,7 @@ pub(crate) struct Caps {
 }
 
 /// `RDMA_VERBS_CAP_MW`: type 2B memory windows.
+#[cfg(any(test, feature = "simulation"))]
 const CAP_MW: u32 = 1;
 
 /// `RDMA_VERBS_CAP_ODP`: implicit on-demand paging for RC writes.

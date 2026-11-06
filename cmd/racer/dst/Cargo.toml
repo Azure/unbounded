@@ -11,6 +11,7 @@ name = "racer-dst"
 path = "src/main.rs"
 
 [dependencies]
+racer = { path = "..", features = ["dst"] }
 racer-authority = { path = "../authority" }
 racer-io = { path = "../io" }
 racer-core = { path = "../core" }

@@ -3,7 +3,7 @@
 
 use crate::admission::ResourceClass;
 use crate::app::*;
-#[cfg(test)]
+#[cfg(any(test, feature = "dst"))]
 use crate::lifecycle::Service;
 use crate::model::PAGE_BYTES;
 use crate::model::*;
@@ -24,8 +24,358 @@ use std::collections::BTreeMap;
 use std::collections::VecDeque;
 use std::num::NonZeroUsize;
 
+/// Assembles one worker graph on `env` through `WorkerApplication::assemble`.
+pub(crate) fn local_worker_with_fabric(
+    env: &racer_io::Env,
+    config: &Config,
+    node: &Arc<NodeState>,
+    id: u16,
+    discovered_nics: Vec<racer_wire::control::RailMapping>,
+) -> (WorkerApplication, WorkerRuntime, PageCryptoEngine) {
+    let worker = WorkerId(id);
+    let admission = Rc::new(flow_control::Quotas::new(AdmissionPolicy::new(
+        config.limits.clone(),
+    )));
+    let (io, engine) = crate::security::pair(worker, 0, config.limits.queue_entries);
+    let runtime = WorkerRuntime {
+        reactor: Rc::new(Reactor::new(admission.clone(), env)),
+        admission,
+        crypto: Rc::new(crate::security::CryptoClient::new(io)),
+    };
+    let local = WorkerRuntime {
+        reactor: runtime.reactor.clone(),
+        admission: runtime.admission.clone(),
+        crypto: runtime.crypto.clone(),
+    };
+    let app =
+        WorkerApplication::assemble(config, node.clone(), worker, local, discovered_nics).unwrap();
+    (
+        app,
+        runtime,
+        PageCryptoEngine::new(CryptoRuntime {
+            port: engine,
+            ctx: env.ctx.clone(),
+        }),
+    )
+}
+
+/// A one-member publication carrying `caches` at `sequence`.
+pub(crate) fn publication(
+    config: &Config,
+    sequence: u64,
+    caches: Vec<racer_wire::control::CacheDefinition>,
+) -> wire::Publication {
+    wire::Publication {
+        pools: Vec::new(),
+        schema_version: racer_wire::control::SCHEMA_VERSION,
+        cluster: config.cluster.clone(),
+        sequence: wire::PublicationSequence(sequence),
+        // Pools cover the caches, so each catalog takes its own version.
+        membership_version: racer_wire::control::MembershipVersion(sequence),
+        members: vec![racer_wire::control::Member {
+            node: config.node.clone(),
+            shares: std::num::NonZeroU32::new(1).unwrap(),
+            peer_endpoint: "127.0.0.1:7443".into(),
+            rails: vec![],
+            site: String::new(),
+        }],
+        caches,
+        page_size: racer_wire::object::PageSize::DEFAULT,
+    }
+    .with_default_pool()
+}
+
+/// Base node configuration shared by the simulation and unit fixtures.
+pub mod cluster {
+    use crate::config::Config;
+    use crate::config::Limits;
+    use racer_wire::control::ClusterId;
+    use racer_wire::control::NodeId;
+    use std::num::NonZeroU32;
+    use std::num::NonZeroUsize;
+    use std::time::Duration;
+
+    pub fn config(enable_rdma: bool) -> Config {
+        let count = NonZeroUsize::new(16).unwrap();
+        let bytes = NonZeroUsize::new(128 * 1024 * 1024).unwrap();
+        Config {
+            spill: Default::default(),
+            prefetch: Default::default(),
+            send_tag_pair: None,
+            page_hedge: Default::default(),
+            replica_selection: Default::default(),
+            peer_admission: Default::default(),
+            peer_receive: Default::default(),
+            shares: NonZeroU32::new(4).unwrap(),
+            disk_page_entries: NonZeroUsize::new(65536).unwrap(),
+            admission_mode: crate::config::AdmissionMode::SecondSight,
+            admission_history_bytes: NonZeroUsize::new(4 * 1024 * 1024).unwrap(),
+            admission_period: Duration::from_secs(60),
+            checkpoint_bytes: NonZeroUsize::new(64 * 1024 * 1024).unwrap(),
+            device_directory: "/host/dev".into(),
+            device_busy_wait: Duration::ZERO,
+            cluster: ClusterId("00000000-0000-4000-8000-000000000001".into()),
+            node: NodeId("00000000-0000-4000-8000-000000000002".into()),
+            max_threads: 2,
+            io_workers: None,
+            crypto_helpers: None,
+            allow_smt: false,
+            opaque_relay: false,
+            peer_tcp_nodelay: false,
+            memory_pressure: true,
+            pprof_enabled: false,
+            enable_rdma,
+            enable_gpu: crate::config::GpuMode::Disabled,
+            gpu_staging_bytes: crate::config::DEFAULT_GPU_STAGING_BYTES,
+            gpu_landing_bytes: crate::config::DEFAULT_GPU_LANDING_BYTES,
+            gpu_pci_p2pdma: false,
+            gpu_peer: true,
+            control_endpoint: Some("https://control.invalid".into()),
+            managed_control: None,
+            enrollment_directory: None,
+            peer_listen: "127.0.0.1:0".parse().unwrap(),
+            diagnostics_listen: "127.0.0.1:0".parse().unwrap(),
+            trust_bundle: "unused/ca".into(),
+            service_account_token: "unused/token".into(),
+            identity_directory: "unused/identity".into(),
+            slab_directory: "unused/slabs".into(),
+            slab_bytes: 1024 * 1024 * 1024,
+            segment_bytes: 64 * 1024 * 1024,
+            free_segment_reserve: 2,
+            origin_connections_per_cache: NonZeroUsize::new(8).unwrap(),
+            request_timeout: Duration::from_secs(30),
+            peer_attempt_timeout: Duration::from_secs(30),
+            reader_stall_timeout: Duration::from_secs(10),
+            shutdown_timeout: Duration::from_secs(30),
+            limits: Limits {
+                plaintext_bytes: bytes,
+                ciphertext_bytes: bytes,
+                dirty_bytes: bytes,
+                registered_bytes: bytes,
+                request_context_bytes: bytes,
+                flights: count,
+                waiters_per_flight: count,
+                queue_entries: count,
+                connections_per_neighbor: count,
+                client_connections: count,
+                peer_connections: count,
+                outbound_connections: count,
+                pipes: count,
+                range_window_pages: count,
+                header_bytes: NonZeroUsize::new(16 * 1024).unwrap(),
+                placement_cache_bytes: NonZeroUsize::new(16 * crate::topology::RANKING_BYTES)
+                    .unwrap(),
+                path_cache_bytes: NonZeroUsize::new(8 * 1024 * 1024).unwrap(),
+                active_path_searches: NonZeroUsize::new(8).unwrap(),
+                cached_paths: count,
+                retained_snapshots: count,
+                metadata_entries: count,
+                relay_transfers: count,
+            },
+            scaled_limits: Default::default(),
+            origin: Default::default(),
+            authority: None,
+        }
+    }
+}
+
+/// Re-encodes a signed head so tests can mutate a private copy.
+pub(crate) fn clone_head(
+    head: &crate::peer::protocol::SignedHead,
+) -> crate::peer::protocol::SignedHead {
+    use crate::http::Codec;
+    use crate::peer::protocol;
+    use crate::peer::protocol::SignedHead;
+    let codec = Codec::new(protocol::MAX_HEAD);
+    let encoded = codec.encode_head(&head.head).unwrap();
+    SignedHead {
+        head: codec.decode_head(&encoded).unwrap().unwrap().0,
+        signature: head.signature.clone(),
+        chain: head.chain.clone(),
+    }
+}
+
+/// Issues and accepts a node signing identity under the harness CA.
+fn signing_identity(
+    pending: PendingIdentity,
+    ca: &rcgen::Certificate,
+    ca_key: &rcgen::KeyPair,
+    cluster: racer_wire::control::ClusterId,
+    node: racer_wire::control::NodeId,
+) -> Arc<SigningIdentity> {
+    let (pending, chain) = racer_crypto::identity::test_util::issue_pending(
+        pending,
+        ca,
+        ca_key,
+        &cluster,
+        &node,
+        |_| {},
+    );
+    Arc::new(
+        pending
+            .accept(
+                cluster,
+                node,
+                chain,
+                &[ca.der().to_vec()],
+                &racer_crypto::identity::WallClock::host(),
+            )
+            .unwrap(),
+    )
+}
+
+/// Real wakers for every poll the harness makes. Wakes are recorded rather
+/// than ignored, so [`Harness::settle`] can fail a run whose pending work has
+/// no wake source left (no completion, no in-flight operation, no wake).
+mod wake {
+    use std::cell::RefCell;
+    use std::sync::Arc;
+    use std::sync::atomic::AtomicBool;
+    use std::sync::atomic::Ordering;
+    use std::task::Waker;
+
+    #[derive(Default)]
+    struct Flag(AtomicBool);
+
+    impl std::task::Wake for Flag {
+        fn wake(self: Arc<Self>) {
+            self.0.store(true, Ordering::Release);
+        }
+
+        fn wake_by_ref(self: &Arc<Self>) {
+            self.0.store(true, Ordering::Release);
+        }
+    }
+
+    thread_local! {
+        static FLAG: RefCell<Option<Arc<Flag>>> = const { RefCell::new(None) };
+    }
+
+    fn flag() -> Arc<Flag> {
+        FLAG.with(|flag| {
+            flag.borrow_mut()
+                .get_or_insert_with(Default::default)
+                .clone()
+        })
+    }
+
+    /// The harness thread's recording waker.
+    pub(super) fn waker() -> Waker {
+        Waker::from(flag())
+    }
+
+    /// Whether any task was woken since the last call; clears the record.
+    pub(super) fn take() -> bool {
+        flag().0.swap(false, Ordering::AcqRel)
+    }
+}
+
+/// Seeds of the default generated corpus; together they meet every coverage
+/// obligation in `coverage_misses`.
+const DEFAULT_SEEDS: [u64; 3] = [1, 7, 42];
+
+/// Result of one app scenario run.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Run {
+    /// Digest of the run's replay trace; equal inputs give equal digests.
+    pub digest: [u8; 32],
+}
+
+/// App scenario names accepted by [`run`]: `generated` and
+/// `generated-native` replay one seed through generated traffic, churn and
+/// faults; `corpus` and `corpus-native` run the default seed set with its
+/// coverage obligations; the rest are targeted regressions on fixed seeds.
+pub const SCENARIOS: &[&str] = &[
+    "generated",
+    "generated-native",
+    "corpus",
+    "corpus-native",
+    "default-grace-staggered-checkpoint",
+    "origin-recovery-before-healthy-reads",
+    "native-faults-warmed-peers",
+    "refused-peer-connect-fallback",
+    "shutdown-checkpoint-async-io",
+    "worker-subscriptions-contend",
+    "completed-peer-dispatches-cancellation",
+    "healthy-relayed-page-reads",
+    "healthy-relayed-page-reads-opaque",
+    "listeners-survive-queue-pressure",
+    "concurrent-relayed-layers",
+    "concurrent-relayed-layers-opaque",
+];
+
+/// Runs app scenario `name` (see [`SCENARIOS`]) with `seed` and up to
+/// `steps` generated actions (generated scenarios only; 0 means one full
+/// action cycle). Every safety invariant (oracle bytes, 412/502 contract,
+/// resource bounds, release at quiescence, stranded work) is a panic, which
+/// becomes `Err` carrying the panic message.
+pub fn run(name: &str, seed: u64, steps: usize) -> std::result::Result<Run, String> {
+    let steps = if steps == 0 {
+        WEIGHTED_ACTIONS.len()
+    } else {
+        steps.min(512)
+    };
+    let outcome = std::panic::catch_unwind(|| {
+        let fixed = |f: fn()| {
+            f();
+            Sha256::digest(name.as_bytes()).into()
+        };
+        match name {
+            "generated" => replay(seed, steps, false).trace.digest(),
+            "generated-native" => replay(seed, steps, true).trace.digest(),
+            "corpus" => run_corpus(false, &DEFAULT_SEEDS, WEIGHTED_ACTIONS.len(), true),
+            "corpus-native" => run_corpus(true, &DEFAULT_SEEDS, WEIGHTED_ACTIONS.len(), true),
+            "default-grace-staggered-checkpoint" => {
+                fixed(default_grace_staggered_nodes_and_periodic_checkpoint_traffic)
+            }
+            "origin-recovery-before-healthy-reads" => {
+                fixed(dst_origin_recovery_completes_before_concurrent_healthy_reads)
+            }
+            "native-faults-warmed-peers" => {
+                fixed(dst_native_faults_reach_warmed_peers_in_small_topologies)
+            }
+            "refused-peer-connect-fallback" => {
+                fixed(dst_refused_peer_connect_preserves_candidate_fallback)
+            }
+            "shutdown-checkpoint-async-io" => {
+                fixed(dst_shutdown_checkpoint_uses_async_io_and_releases_all_shards)
+            }
+            "worker-subscriptions-contend" => fixed(
+                scenarios::worker_subscriptions_contend_across_servers_and_recover_after_release,
+            ),
+            "completed-peer-dispatches-cancellation" => {
+                fixed(scenarios::completed_peer_dispatches_do_not_exhaust_worker_cancellation)
+            }
+            "healthy-relayed-page-reads" => fixed(scenarios::healthy_relayed_page_reads),
+            "healthy-relayed-page-reads-opaque" => {
+                fixed(scenarios::healthy_relayed_page_reads_opaque_opt_in)
+            }
+            "listeners-survive-queue-pressure" => {
+                fixed(scenarios::listeners_survive_repeated_reactor_queue_pressure)
+            }
+            "concurrent-relayed-layers" => {
+                fixed(scenarios::concurrent_relayed_layers_diagnose_receive_pressure_and_recover)
+            }
+            "concurrent-relayed-layers-opaque" => {
+                fixed(scenarios::concurrent_relayed_layers_opaque_opt_in_pressure_and_recovery)
+            }
+            other => panic!("unknown app scenario {other}"),
+        }
+    });
+    outcome.map(|digest| Run { digest }).map_err(|panic| {
+        panic
+            .downcast_ref::<String>()
+            .cloned()
+            .or_else(|| panic.downcast_ref::<&str>().map(|s| (*s).to_string()))
+            .unwrap_or_else(|| "non-string panic".into())
+    })
+}
+
 const MAX_NODES: usize = 32;
 const MAX_TURNS: usize = 100_000;
+/// Consecutive settle turns with unfinished work but no completion, no
+/// in-flight operation and no wake before the run fails as stranded.
+const STRANDED_TURNS: usize = 2_000;
 /// Subscription fields every simulated reader sends with its POST.
 // Keeps the removed Racer-Ordered header as a compatibility check: the
 // dataplane ignores it.
@@ -254,7 +604,7 @@ mod faults {
                 // The envelope wraps the signed original in a base64 field. Mutate the
                 // signed signature before encoding so the outer HTTP remains legal.
                 let original = &envelope.original;
-                let mut signed = crate::test_support::security::clone_head(original);
+                let mut signed = clone_head(original);
                 let signature = signed
                     .head
                     .headers
@@ -645,11 +995,8 @@ mod faults {
                     match adapter.stage(&[]) {
                         Ok(transition) => {
                             let node = &self.nodes[index];
-                            let mut publication = crate::app::tests::publication(
-                                &node.config,
-                                self.generation,
-                                vec![],
-                            );
+                            let mut publication =
+                                publication(&node.config, self.generation, vec![]);
                             publication.membership_version = MembershipVersion(self.generation);
                             publication.members = members.iter().cloned().map(Into::into).collect();
                             node.workers[0]
@@ -784,8 +1131,7 @@ mod scenarios {
     //! Targeted regressions using the same assembled multi-node harness as the corpus.
     use super::*;
 
-    #[test]
-    fn worker_subscriptions_contend_across_servers_and_recover_after_release() {
+    pub(super) fn worker_subscriptions_contend_across_servers_and_recover_after_release() {
         use crate::peer::protocol::FetchMode;
         use crate::peer::protocol::Operation as PeerOperation;
         use crate::peer::protocol::PeerRequest;
@@ -887,7 +1233,8 @@ mod scenarios {
         let (first, _) = signed(0);
         let (contending, binding) = signed(1);
         let (retry, retry_binding) = signed(2);
-        let mut cx = Context::from_waker(futures::task::noop_waker_ref());
+        let waker = wake::waker();
+        let mut cx = Context::from_waker(&waker);
         // Drive only verification, not the owner mailbox. The first server must
         // hold a live selection before the other server finishes verification.
         let mut held = servers[0].dispatch(first, &scope);
@@ -937,8 +1284,7 @@ mod scenarios {
         ));
     }
 
-    #[test]
-    fn completed_peer_dispatches_do_not_exhaust_worker_cancellation() {
+    pub(super) fn completed_peer_dispatches_do_not_exhaust_worker_cancellation() {
         use crate::model::MetadataSelector;
         use crate::peer::protocol::FetchMode;
         use crate::peer::protocol::Operation as PeerOperation;
@@ -1042,7 +1388,7 @@ mod scenarios {
                         .directory
                         .simulation_scope(Some((app.worker, app.coordinator.clone())));
                     if let Poll::Ready(Some(result)) = std::pin::Pin::new(&mut pending)
-                        .poll_next(&mut Context::from_waker(futures::task::noop_waker_ref()))
+                        .poll_next(&mut Context::from_waker(&wake::waker()))
                     {
                         response = Some(result.unwrap());
                         break;
@@ -1067,13 +1413,11 @@ mod scenarios {
         assert!(worker_scope.check().is_ok());
     }
 
-    #[test]
-    fn healthy_relayed_page_reads() {
+    pub(super) fn healthy_relayed_page_reads() {
         healthy_relayed_page_reads_with_mode(false);
     }
 
-    #[test]
-    fn listeners_survive_repeated_reactor_queue_pressure() {
+    pub(super) fn listeners_survive_repeated_reactor_queue_pressure() {
         let sim = SimOs::new();
         let clock = racer_io::SimClock::new(73);
         let env = racer_io::Env::sim(&sim, clock.ctx(0));
@@ -1093,7 +1437,8 @@ mod scenarios {
         let reactor = harness.nodes[0].workers[0].runtime.reactor.clone();
         let limit = harness.nodes[0].config.limits.queue_entries.get();
         let address = SocketAddress::Inet(harness.nodes[0].config.diagnostics_listen);
-        let mut cx = Context::from_waker(futures::task::noop_waker_ref());
+        let waker = wake::waker();
+        let mut cx = Context::from_waker(&waker);
         for round in 0..4 {
             // Complete the existing diagnostic accept, then fill the ordinary
             // partition before the service consumes that CQE and submits its receive.
@@ -1181,8 +1526,7 @@ mod scenarios {
         assert_eq!(reactor.in_flight(), 0);
     }
 
-    #[test]
-    fn healthy_relayed_page_reads_opaque_opt_in() {
+    pub(super) fn healthy_relayed_page_reads_opaque_opt_in() {
         healthy_relayed_page_reads_with_mode(true);
     }
 
@@ -1229,13 +1573,11 @@ mod scenarios {
         assert!(harness.coverage.relay_turns > 0);
     }
 
-    #[test]
-    fn concurrent_relayed_layers_diagnose_receive_pressure_and_recover() {
+    pub(super) fn concurrent_relayed_layers_diagnose_receive_pressure_and_recover() {
         concurrent_relayed_layers_with_mode(false);
     }
 
-    #[test]
-    fn concurrent_relayed_layers_opaque_opt_in_pressure_and_recovery() {
+    pub(super) fn concurrent_relayed_layers_opaque_opt_in_pressure_and_recovery() {
         concurrent_relayed_layers_with_mode(true);
     }
 
@@ -2222,7 +2564,9 @@ struct LocalWorker {
     crypto: Box<dyn crate::lifecycle::Service<RequestScope>>,
 }
 impl Node {
-    fn poll(&mut self, budget: usize) {
+    /// Steps every worker once; returns the completions reaped.
+    fn poll(&mut self, budget: usize) -> usize {
+        let mut completions = 0;
         for worker in &mut self.workers {
             if worker.app.control.is_some() {
                 // This harness supplies accepted publications and keys directly.
@@ -2234,21 +2578,15 @@ impl Node {
                 .app
                 .directory
                 .simulation_scope(Some((worker.app.worker, worker.app.coordinator.clone())));
-            worker.runtime.reactor.poll_budgeted(budget).unwrap();
+            completions += worker.runtime.reactor.poll_budgeted(budget).unwrap();
             worker
                 .crypto
-                .poll_budgeted(
-                    &mut Context::from_waker(futures::task::noop_waker_ref()),
-                    budget,
-                )
+                .poll_budgeted(&mut Context::from_waker(&wake::waker()), budget)
                 .unwrap();
             worker.runtime.crypto.poll_budgeted(budget).unwrap();
             worker
                 .app
-                .poll_budgeted(
-                    &mut Context::from_waker(futures::task::noop_waker_ref()),
-                    budget,
-                )
+                .poll_budgeted(&mut Context::from_waker(&wake::waker()), budget)
                 .unwrap();
             for class in CLASSES {
                 assert!(
@@ -2265,6 +2603,7 @@ impl Node {
                     <= self.config.limits.client_connections.get()
             );
         }
+        completions
     }
 }
 
@@ -2375,7 +2714,7 @@ impl Harness {
             .to_pkcs8_der()
             .unwrap();
         let pending = PendingIdentity::recover(&key).unwrap();
-        crate::test_support::enrollment::signing_identity(
+        signing_identity(
             pending,
             &self.ca,
             &self.ca_key,
@@ -2402,7 +2741,7 @@ impl Harness {
             )])
             .unwrap();
         let _fabric = fabric.enter();
-        let mut config = crate::test_support::cluster::config(self.native);
+        let mut config = cluster::config(self.native);
         config.opaque_relay = self.opaque_relay;
         // Memory pressure reads the real host cgroup and PSI files, which the
         // simulation does not control. Turn it off so replays stay deterministic.
@@ -2461,7 +2800,7 @@ impl Harness {
             Vec::new()
         };
         let (mut app, runtime, engine) =
-            crate::app::tests::local_worker_with_fabric(&env, &config, &node, 0, discovered_nics);
+            local_worker_with_fabric(&env, &config, &node, 0, discovered_nics);
         let crypto = stepped_crypto(&node, engine);
         app.keys
             .install(self.bundle(&config, u64::from(self.key_epoch) + 1))
@@ -2476,8 +2815,7 @@ impl Harness {
         // datapath dependency remain the production application implementation.
         let control = app.control.take();
         self.generation += 1;
-        let mut publication =
-            crate::app::tests::publication(&config, self.generation, vec![self.definition(id)]);
+        let mut publication = publication(&config, self.generation, vec![self.definition(id)]);
         publication.membership_version = MembershipVersion(self.generation);
         publication.members = self.members().into_iter().map(Into::into).collect();
         publication.members.push(member(&config).into());
@@ -2493,7 +2831,7 @@ impl Harness {
                 .clock
                 .ctx(1 + id as u64 + (self.generation << 32) + ((worker as u64) << 48));
             let env = racer_io::Env::new(env.driver.clone(), role.clone());
-            let (app, runtime, engine) = crate::app::tests::local_worker_with_fabric(
+            let (app, runtime, engine) = local_worker_with_fabric(
                 &env,
                 &config,
                 &node,
@@ -2631,14 +2969,15 @@ impl Harness {
         let members = self.members();
         let definitions: Vec<_> = self.nodes.iter().map(|n| self.definition(n.id)).collect();
         for (node, definition) in self.nodes.iter_mut().zip(definitions) {
-            let mut p =
-                crate::app::tests::publication(&node.config, self.generation, vec![definition]);
+            let mut p = publication(&node.config, self.generation, vec![definition]);
             p.membership_version = MembershipVersion(self.generation);
             p.members = members.iter().cloned().map(Into::into).collect();
             node.workers[0].app.snapshots.apply(p).unwrap();
         }
     }
-    fn tick(&mut self) {
+    /// Advances 1 ms and steps every node once; returns completions reaped.
+    fn tick(&mut self) -> usize {
+        let mut completions = 0;
         self.clock.advance(Duration::from_millis(1));
         let start = self.rng.pick(self.nodes.len());
         let budget = 1 + self.rng.pick(64);
@@ -2652,7 +2991,7 @@ impl Harness {
                 .sim
                 .enter_endpoint(SocketAddress::Inet(self.nodes[index].config.peer_listen));
             self.nodes[index].adapter.poll(&self.catalog);
-            self.nodes[index].poll(budget);
+            completions += self.nodes[index].poll(budget);
             for worker in &self.nodes[index].workers {
                 let used: Vec<_> = CLASSES
                     .iter()
@@ -2693,6 +3032,7 @@ impl Harness {
                 <= self.nodes.iter().map(|n| n.workers.len()).sum::<usize>() * 256 + 32,
             "descriptor bound"
         );
+        completions
     }
     fn remove(&mut self, env: &racer_io::Env, index: usize) -> usize {
         self.retire(env, index, false)
@@ -2760,7 +3100,7 @@ impl Harness {
                     runtime.reactor.poll_budgeted(64).unwrap();
                     if let Poll::Ready(result) = fence
                         .as_mut()
-                        .poll(&mut Context::from_waker(futures::task::noop_waker_ref()))
+                        .poll(&mut Context::from_waker(&wake::waker()))
                     {
                         result.unwrap();
                         done = true;
@@ -2795,8 +3135,27 @@ impl Harness {
         id
     }
     fn settle(&mut self) {
+        let mut idle = 0;
         for _ in 0..MAX_TURNS {
-            self.tick();
+            let completions = self.tick();
+            let woken = wake::take();
+            let in_flight: usize = self
+                .nodes
+                .iter()
+                .flat_map(|n| &n.workers)
+                .map(|w| w.runtime.reactor.in_flight() + w.runtime.crypto.outstanding())
+                .sum();
+            idle = if completions == 0 && !woken && in_flight == 0 {
+                idle + 1
+            } else {
+                0
+            };
+            assert!(
+                idle < STRANDED_TURNS,
+                "seed={} pending work without a wake source for {idle} turns: {:?}",
+                self.seed,
+                self.coverage
+            );
             if self.nodes.iter().flat_map(|n| &n.workers).all(|n| {
                 n.app.store.writer.is_idle()
                     && n.app.writer_task.is_none()
@@ -3137,21 +3496,7 @@ struct Client {
     expected_status: Option<u16>,
 }
 
-fn setting(name: &str, default: usize, max: usize) -> usize {
-    let value = std::env::var(name).map_or(default, |v| {
-        v.parse().expect("positive integer DST setting")
-    });
-    assert!((1..=max).contains(&value), "{name} must be in 1..={max}");
-    value
-}
-
-#[test]
-fn dst_generated_traffic_churn_oracle() {
-    run_corpus(false);
-}
-
-#[test]
-fn default_grace_staggered_nodes_and_periodic_checkpoint_traffic() {
+pub(super) fn default_grace_staggered_nodes_and_periodic_checkpoint_traffic() {
     let sim = SimOs::new();
     let clock = racer_io::SimClock::new(505);
     let env = racer_io::Env::sim(&sim, clock.ctx(0));
@@ -3176,7 +3521,7 @@ fn default_grace_staggered_nodes_and_periodic_checkpoint_traffic() {
     harness.generation += 1;
     for i in 1..4 {
         let node = &harness.nodes[i];
-        let mut p = crate::app::tests::publication(
+        let mut p = publication(
             &node.config,
             harness.generation,
             vec![harness.definition(node.id)],
@@ -3216,13 +3561,7 @@ fn default_grace_staggered_nodes_and_periodic_checkpoint_traffic() {
     harness.traffic(4, false);
 }
 
-#[test]
-fn dst_generated_native_traffic_churn_oracle() {
-    run_corpus(true);
-}
-
-#[test]
-fn dst_origin_recovery_completes_before_concurrent_healthy_reads() {
+pub(super) fn dst_origin_recovery_completes_before_concurrent_healthy_reads() {
     for native in [false, true] {
         let sim = SimOs::new();
         let clock = racer_io::SimClock::new(106);
@@ -3261,8 +3600,7 @@ fn dst_origin_recovery_completes_before_concurrent_healthy_reads() {
     }
 }
 
-#[test]
-fn dst_native_faults_reach_warmed_peers_in_small_topologies() {
+pub(super) fn dst_native_faults_reach_warmed_peers_in_small_topologies() {
     for nodes in [1, 2, 3] {
         let sim = SimOs::new();
         let clock = racer_io::SimClock::new(118);
@@ -3288,8 +3626,7 @@ fn dst_native_faults_reach_warmed_peers_in_small_topologies() {
     }
 }
 
-#[test]
-fn dst_refused_peer_connect_preserves_candidate_fallback() {
+pub(super) fn dst_refused_peer_connect_preserves_candidate_fallback() {
     for native in [false, true] {
         let sim = SimOs::new();
         let clock = racer_io::SimClock::new(119);
@@ -3321,8 +3658,7 @@ fn dst_refused_peer_connect_preserves_candidate_fallback() {
     }
 }
 
-#[test]
-fn dst_shutdown_checkpoint_uses_async_io_and_releases_all_shards() {
+pub(super) fn dst_shutdown_checkpoint_uses_async_io_and_releases_all_shards() {
     use crate::store::checkpoint::read_candidates;
     for case in [
         "empty",
@@ -3412,7 +3748,8 @@ fn dst_shutdown_checkpoint_uses_async_io_and_releases_all_shards() {
             .collect();
         let mut results = Vec::new();
         let mut delayed = false;
-        let mut cx = Context::from_waker(futures::task::noop_waker_ref());
+        let waker = wake::waker();
+        let mut cx = Context::from_waker(&waker);
         for turn in 0..256 {
             for worker in &node.workers {
                 worker.runtime.reactor.poll_budgeted(64).unwrap();
@@ -3498,48 +3835,19 @@ fn dst_shutdown_checkpoint_uses_async_io_and_releases_all_shards() {
     }
 }
 
-fn run_corpus(native: bool) {
-    // Harness knobs carry no `RACER_` prefix, so the dataplane's
-    // unknown-variable check never sees them. `DST_VERBOSE` and `DST_COVERAGE`
-    // belong to the page-alloc DST and may share the environment.
-    for (name, _) in std::env::vars().filter(|(name, _)| name.starts_with("DST_")) {
-        assert!(
-            matches!(
-                name.as_str(),
-                "DST_SEEDS" | "DST_STEPS" | "DST_FILTER" | "DST_VERBOSE" | "DST_COVERAGE"
-            ),
-            "unsupported DST parameter {name}"
-        );
-    }
-    let custom_seeds = std::env::var("DST_SEEDS").ok();
-    let seeds: Vec<u64> = custom_seeds
-        .as_deref()
-        .unwrap_or("1,7,42")
-        .split(',')
-        .map(|s| s.trim().parse().expect("comma-separated u64 DST seeds"))
-        .collect();
-    assert!(!seeds.is_empty() && seeds.len() <= 1024);
-    let steps = setting("DST_STEPS", WEIGHTED_ACTIONS.len(), 512);
-    let required = requires_corpus_coverage(custom_seeds.as_deref(), steps);
+/// Replays every seed once (racer-dst double-runs the whole corpus) and, when `required`,
+/// asserts the corpus coverage obligations; returns a digest over all seeds.
+fn run_corpus(native: bool, seeds: &[u64], steps: usize, required: bool) -> [u8; 32] {
+    let mut digest = Sha256::new();
     let mut counts = BTreeMap::new();
     eprintln!(
         "dst corpus native={native} seeds={seeds:?} steps={steps} coverage-required={required}"
     );
-    for seed in seeds {
+    for &seed in seeds {
         let first = replay(seed, steps, native);
-        let second = replay(seed, steps, native);
-        let mismatch = first
-            .trace
-            .checkpoints
-            .iter()
-            .zip(&second.trace.checkpoints)
-            .position(|(a, b)| a != b);
-        assert_eq!(
-            first, second,
-            "DST CORRECTNESS FAILURE: whole-app replay diverged seed={seed} steps={steps} native={native} first checkpoint={mismatch:?}"
-        );
+        digest.update(first.trace.digest());
         eprintln!(
-            "dst replay verified seed={seed} native={native} events={} digest={:x}",
+            "dst replay seed={seed} native={native} events={} digest={:x}",
             first.trace.events,
             first.trace.hash.clone().finalize()
         );
@@ -3553,8 +3861,10 @@ fn run_corpus(native: bool) {
         !required || missing.is_empty(),
         "DST COVERAGE MISS: default corpus native={native} steps={steps} missing={missing:?}; per-run correctness and exact replay passed"
     );
+    digest.finalize().into()
 }
 
+#[cfg(test)]
 fn requires_corpus_coverage(custom_seeds: Option<&str>, steps: usize) -> bool {
     custom_seeds.is_none() && steps >= WEIGHTED_ACTIONS.len()
 }
@@ -3731,16 +4041,12 @@ fn lifecycle(workers: &mut [LocalWorker], scope: &RequestScope, phase: Lifecycle
         for (runtime, crypto, operation) in &mut pending {
             runtime.reactor.poll_budgeted(64).unwrap();
             crypto
-                .poll_budgeted(
-                    &mut Context::from_waker(futures::task::noop_waker_ref()),
-                    64,
-                )
+                .poll_budgeted(&mut Context::from_waker(&wake::waker()), 64)
                 .unwrap();
             runtime.crypto.poll_budgeted(64).unwrap();
             if let Some(op) = operation
-                && let Poll::Ready(result) = op
-                    .as_mut()
-                    .poll(&mut Context::from_waker(futures::task::noop_waker_ref()))
+                && let Poll::Ready(result) =
+                    op.as_mut().poll(&mut Context::from_waker(&wake::waker()))
             {
                 result.unwrap();
                 *operation = None;
@@ -3759,14 +4065,11 @@ fn drive_local<T>(
 ) -> Result<T> {
     for _ in 0..MAX_TURNS {
         runtime.reactor.poll_budgeted(64)?;
-        crypto.poll_budgeted(
-            &mut Context::from_waker(futures::task::noop_waker_ref()),
-            64,
-        )?;
+        crypto.poll_budgeted(&mut Context::from_waker(&wake::waker()), 64)?;
         runtime.crypto.poll_budgeted(64)?;
         if let Poll::Ready(result) = operation
             .as_mut()
-            .poll(&mut Context::from_waker(futures::task::noop_waker_ref()))
+            .poll(&mut Context::from_waker(&wake::waker()))
         {
             return result;
         }

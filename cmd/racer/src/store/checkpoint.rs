@@ -563,7 +563,7 @@ async fn publish_next(
 }
 
 /// Run `make` on a private reactor for the current test environment's driver.
-#[cfg(test)]
+#[cfg(any(test, feature = "dst"))]
 pub(crate) fn block_on_io<T: 'static, F: std::future::Future<Output = T> + 'static>(
     env: &racer_io::Env,
     make: impl FnOnce(racer_io::Reactor, racer_io::OpCtx) -> F,
@@ -582,7 +582,7 @@ pub(crate) fn block_on_io<T: 'static, F: std::future::Future<Output = T> + 'stat
         .unwrap()
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "dst"))]
 pub(crate) fn read_candidates(
     env: &racer_io::Env,
     directory: &Path,
@@ -591,7 +591,7 @@ pub(crate) fn read_candidates(
 }
 
 /// Decode every valid slot newest first on a private test reactor.
-#[cfg(test)]
+#[cfg(any(test, feature = "dst"))]
 pub(crate) fn read_candidates_with_budget(
     env: &racer_io::Env,
     directory: &Path,

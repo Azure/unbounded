@@ -482,7 +482,7 @@ impl PeerServer {
         self.request_timeout = timeout;
         self
     }
-    #[cfg(test)]
+    #[cfg(any(test, feature = "dst"))]
     pub(crate) fn transfers(&self) -> &Rc<super::transport::Transfers> {
         &self.transfers
     }

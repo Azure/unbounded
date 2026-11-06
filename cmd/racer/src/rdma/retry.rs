@@ -13,10 +13,10 @@ use std::time::Duration;
 pub(super) struct NativeRetry {
     reactor: Option<Rc<crate::runtime::Reactor>>,
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "dst"))]
     alarms: RefCell<Vec<futures::channel::oneshot::Sender<()>>>,
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "dst"))]
     immediate: Cell<bool>,
 }
 
@@ -25,9 +25,9 @@ impl NativeRetry {
     pub(super) fn new(reactor: Rc<crate::runtime::Reactor>) -> Rc<Self> {
         Rc::new(Self {
             reactor: Some(reactor),
-            #[cfg(test)]
+            #[cfg(any(test, feature = "dst"))]
             alarms: RefCell::new(Vec::new()),
-            #[cfg(test)]
+            #[cfg(any(test, feature = "dst"))]
             immediate: Cell::new(false),
         })
     }
@@ -36,9 +36,9 @@ impl NativeRetry {
     pub(super) fn unattached() -> Rc<Self> {
         Rc::new(Self {
             reactor: None,
-            #[cfg(test)]
+            #[cfg(any(test, feature = "dst"))]
             alarms: RefCell::new(Vec::new()),
-            #[cfg(test)]
+            #[cfg(any(test, feature = "dst"))]
             immediate: Cell::new(false),
         })
     }
@@ -46,7 +46,7 @@ impl NativeRetry {
     /// Fire at the scope deadline.
     fn alarm<'a>(&'a self, scope: &'a RequestScope) -> Operation<'a, ()> {
         Box::pin(async move {
-            #[cfg(test)]
+            #[cfg(any(test, feature = "dst"))]
             if self.immediate.replace(false) {
                 return Ok(());
             }
@@ -54,13 +54,13 @@ impl NativeRetry {
             if let Some(reactor) = &self.reactor {
                 reactor.sleep_until(until, scope).await
             } else {
-                #[cfg(test)]
+                #[cfg(any(test, feature = "dst"))]
                 {
                     let (send, receive) = futures::channel::oneshot::channel();
                     self.alarms.borrow_mut().push(send);
                     receive.await.map_err(|_| Error::Unavailable)
                 }
-                #[cfg(not(test))]
+                #[cfg(not(any(test, feature = "dst")))]
                 Err(Error::Unavailable)
             }
         })

@@ -114,9 +114,9 @@ impl Drop for FlightCharge {
 /// Local caps in addition to shared admission quotas.
 pub use flight::FlightLimits;
 
-#[cfg(not(test))]
+#[cfg(not(any(test, feature = "dst")))]
 type FlightHashState = std::collections::hash_map::RandomState;
-#[cfg(test)]
+#[cfg(any(test, feature = "dst"))]
 type FlightHashState = crate::runtime::HashState;
 /// Production page flight payloads; the same [`flight::PageFlightTable`] family the core
 /// `WorkerCore` owns, instantiated with real pages, wakers, and admission charges.

@@ -938,6 +938,7 @@ dependencies = [
 name = "racer-dst"
 version = "0.1.0"
 dependencies = [
+ "racer",
  "racer-authority",
  "racer-core",
  "racer-io",

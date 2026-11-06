@@ -101,7 +101,7 @@ impl NativeNode {
     }
 
     /// The owner, built on the calling thread, for tests that step it.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "dst"))]
     pub(super) fn take_owner(&self, ctx: racer_io::WorkerCtx) -> Option<rdma_verbs::Owner> {
         let port = self.owner.lock().unwrap().take()?;
         Some(rdma_verbs::Owner::new(port, ctx))

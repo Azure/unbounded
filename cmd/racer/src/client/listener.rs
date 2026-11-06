@@ -40,7 +40,7 @@ use std::time::Duration;
 
 enum Listener {
     Real(crate::uds_endpoint::BoundSocket),
-    #[cfg(test)]
+    #[cfg(any(test, feature = "dst"))]
     Sim(crate::uds_endpoint::simulation::BoundSocket),
 }
 impl Listener {
@@ -51,14 +51,14 @@ impl Listener {
         }
         match self {
             Self::Real(listener) => listener.accept().map(|(socket, _)| (socket.into(), ())),
-            #[cfg(test)]
+            #[cfg(any(test, feature = "dst"))]
             Self::Sim(socket) => socket.accept().map(|fd| (fd, ())),
         }
     }
 }
 enum Directory {
     Real(Rc<File>),
-    #[cfg(test)]
+    #[cfg(any(test, feature = "dst"))]
     Sim,
 }
 
@@ -149,7 +149,7 @@ impl BoundListener {
         }
         match &self.listener {
             Listener::Real(socket) => socket.set_mode(mode),
-            #[cfg(test)]
+            #[cfg(any(test, feature = "dst"))]
             Listener::Sim(socket) => socket.set_mode(mode),
         }
     }
@@ -616,9 +616,9 @@ impl ClientListeners {
             {
                 break;
             }
-            #[cfg(not(test))]
+            #[cfg(not(any(test, feature = "dst")))]
             let simulated = false;
-            #[cfg(test)]
+            #[cfg(any(test, feature = "dst"))]
             let simulated = self.io.reactor().sim_os().is_some();
             let listener = if simulated {
                 let listeners = self.listeners.borrow();
@@ -1147,7 +1147,7 @@ impl ReadyListeners {
                 #[allow(clippy::infallible_destructuring_match)]
                 let socket = match &listener.listener {
                     Listener::Real(socket) => socket,
-                    #[cfg(test)]
+                    #[cfg(any(test, feature = "dst"))]
                     _ => return Err(Error::InvalidConfiguration),
                 };
                 ready.insert(socket.as_raw_fd(), index)?;
@@ -1337,13 +1337,13 @@ pub(super) fn prepare_origin_directory(cache: &File) -> Result<()> {
         .map_err(directory_error)
 }
 
-#[cfg(not(test))]
+#[cfg(not(any(test, feature = "dst")))]
 fn origin_owner() -> super::origin_directory::Owner {
     super::origin_directory::Owner::ORIGIN
 }
 
 /// Unit tests run unprivileged, so assign the directory to the test user.
-#[cfg(test)]
+#[cfg(any(test, feature = "dst"))]
 fn origin_owner() -> super::origin_directory::Owner {
     // SAFETY: geteuid/getegid have no preconditions.
     super::origin_directory::Owner {
@@ -1402,7 +1402,7 @@ fn bind(
     basename: &str,
     previous: Option<&BoundListener>,
 ) -> Result<BoundListener> {
-    #[cfg(test)]
+    #[cfg(any(test, feature = "dst"))]
     if let Some(sim) = reactor.sim_os() {
         let directory = root.join(&definition.name).join("client");
         let listener =
@@ -1416,6 +1416,7 @@ fn bind(
             backlog_allowed: Arc::new(std::sync::atomic::AtomicBool::new(true)),
             owner: None,
         };
+        #[cfg(test)]
         if FAIL_CHMOD.with(|fail| fail.replace(false)) {
             return Err(Error::Io);
         }
@@ -1467,7 +1468,7 @@ impl Endpoint for BoundListener {
                 .owns_checked(basename)
                 .map_err(directory_error)
                 .unwrap_or(false),
-            #[cfg(test)]
+            #[cfg(any(test, feature = "dst"))]
             Listener::Sim(socket) => socket.owns(basename),
         }
     }
@@ -1478,7 +1479,7 @@ impl Endpoint for BoundListener {
                 .absent_checked(basename)
                 .map_err(directory_error)
                 .unwrap_or(false),
-            #[cfg(test)]
+            #[cfg(any(test, feature = "dst"))]
             Listener::Sim(socket) => socket.absent(basename),
         }
     }
@@ -1488,11 +1489,11 @@ impl Endpoint for BoundListener {
             (Listener::Real(first), Listener::Real(second)) => {
                 first.same_directory(second).map_err(directory_error)
             }
-            #[cfg(test)]
+            #[cfg(any(test, feature = "dst"))]
             (Listener::Sim(first), Listener::Sim(second)) => {
                 first.same_directory(second).map_err(|_| Error::Io)
             }
-            #[cfg(test)]
+            #[cfg(any(test, feature = "dst"))]
             _ => Ok(false),
         }
     }
@@ -1514,7 +1515,7 @@ impl Endpoint for BoundListener {
         }
         match &self.listener {
             Listener::Real(socket) => socket.rename(from, to, mode).map_err(directory_error),
-            #[cfg(test)]
+            #[cfg(any(test, feature = "dst"))]
             Listener::Sim(socket) => socket.rename(from, to, mode).map_err(|_| Error::Io),
         }
     }
@@ -1522,7 +1523,7 @@ impl Endpoint for BoundListener {
     fn set_basename(&self, basename: String) {
         match &self.listener {
             Listener::Real(socket) => socket.set_basename(basename),
-            #[cfg(test)]
+            #[cfg(any(test, feature = "dst"))]
             Listener::Sim(socket) => socket.set_basename(basename),
         }
     }
@@ -1530,7 +1531,7 @@ impl Endpoint for BoundListener {
     fn owns_checked(&self, basename: &str) -> Result<bool> {
         match &self.listener {
             Listener::Real(socket) => socket.owns_checked(basename).map_err(directory_error),
-            #[cfg(test)]
+            #[cfg(any(test, feature = "dst"))]
             Listener::Sim(_) => Ok(self.owns(basename)),
         }
     }
@@ -1538,7 +1539,7 @@ impl Endpoint for BoundListener {
     fn absent_checked(&self, basename: &str) -> Result<bool> {
         match &self.listener {
             Listener::Real(socket) => socket.absent_checked(basename).map_err(directory_error),
-            #[cfg(test)]
+            #[cfg(any(test, feature = "dst"))]
             Listener::Sim(_) => Ok(self.absent(basename)),
         }
     }
@@ -1548,13 +1549,13 @@ impl Endpoint for BoundListener {
             Listener::Real(socket) => socket
                 .validate_names(temporary, canonical)
                 .map_err(directory_error),
-            #[cfg(test)]
+            #[cfg(any(test, feature = "dst"))]
             Listener::Sim(_)
                 if temporary_name(temporary) && canonical == endpoint_layout()?.canonical() =>
             {
                 Ok(())
             }
-            #[cfg(test)]
+            #[cfg(any(test, feature = "dst"))]
             Listener::Sim(_) => Err(Self::ownership_error()),
         }
     }

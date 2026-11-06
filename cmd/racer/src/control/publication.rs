@@ -45,7 +45,7 @@ impl PublicationTarget {
     }
 
     /// Synchronously project a fixture using the production preparation closure.
-    #[cfg(any(test, feature = "subscription-interop"))]
+    #[cfg(any(test, feature = "subscription-interop", feature = "dst"))]
     pub(crate) fn project(&self, document: Publication) -> Result<Arc<Snapshot>> {
         let job = self.projection(Arc::new(document))?;
         job()
@@ -75,13 +75,13 @@ impl PublicationTarget {
     }
 
     /// Publish fixture state without a serving listener lifecycle.
-    #[cfg(any(test, feature = "subscription-interop"))]
+    #[cfg(any(test, feature = "subscription-interop", feature = "dst"))]
     pub(crate) fn apply(&self, document: Publication) -> Result<Arc<Snapshot>> {
         self.accept(self.project(document)?, None)
     }
 
     /// Project and accept a document with a caller-owned cache rollback guard.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "dst"))]
     pub(crate) fn apply_staged(
         &self,
         document: Publication,

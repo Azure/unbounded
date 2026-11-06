@@ -22,19 +22,19 @@ use std::sync::OnceLock;
 use std::time::Instant;
 
 // Seeded hashing only in simulated worlds; production retains std hashing.
-#[cfg(not(test))]
+#[cfg(not(any(test, feature = "dst")))]
 pub(crate) type HashMap<K, V> = std::collections::HashMap<K, V>;
-#[cfg(not(test))]
+#[cfg(not(any(test, feature = "dst")))]
 pub(crate) type HashSet<K> = std::collections::HashSet<K>;
-#[cfg(test)]
+#[cfg(any(test, feature = "dst"))]
 pub(crate) type HashMap<K, V> = std::collections::HashMap<K, V, HashState>;
-#[cfg(test)]
+#[cfg(any(test, feature = "dst"))]
 pub(crate) type HashSet<K> = std::collections::HashSet<K, HashState>;
 /// Test hasher with a fixed seed so simulated runs iterate maps identically.
-#[cfg(test)]
+#[cfg(any(test, feature = "dst"))]
 #[derive(Clone, Debug, Default)]
 pub(crate) struct HashState;
-#[cfg(test)]
+#[cfg(any(test, feature = "dst"))]
 impl std::hash::BuildHasher for HashState {
     type Hasher = std::collections::hash_map::DefaultHasher;
     fn build_hasher(&self) -> Self::Hasher {
@@ -257,7 +257,7 @@ impl RequestScope {
 
     /// Test support: a scope on `clock`, with the clock first so tests read
     /// left to right.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "dst"))]
     pub fn on(clock: &racer_io::Clock, request: RequestId, deadline: Instant) -> Result<Self> {
         Self::with_clock(request, deadline, clock.clone())
     }

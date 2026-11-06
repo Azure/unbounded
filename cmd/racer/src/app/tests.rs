@@ -648,39 +648,8 @@ pub(super) fn local_worker(
     local_worker_with_fabric(env, config, node, id, Vec::new())
 }
 
-pub(super) fn local_worker_with_fabric(
-    env: &racer_io::Env,
-    config: &Config,
-    node: &Arc<NodeState>,
-    id: u16,
-    discovered_nics: Vec<racer_wire::control::RailMapping>,
-) -> (WorkerApplication, WorkerRuntime, PageCryptoEngine) {
-    let worker = WorkerId(id);
-    let admission = Rc::new(flow_control::Quotas::new(AdmissionPolicy::new(
-        config.limits.clone(),
-    )));
-    let (io, engine) = crate::security::pair(worker, 0, config.limits.queue_entries);
-    let runtime = WorkerRuntime {
-        reactor: Rc::new(Reactor::new(admission.clone(), env)),
-        admission,
-        crypto: Rc::new(crate::security::CryptoClient::new(io)),
-    };
-    let local = WorkerRuntime {
-        reactor: runtime.reactor.clone(),
-        admission: runtime.admission.clone(),
-        crypto: runtime.crypto.clone(),
-    };
-    let app =
-        WorkerApplication::assemble(config, node.clone(), worker, local, discovered_nics).unwrap();
-    (
-        app,
-        runtime,
-        PageCryptoEngine::new(CryptoRuntime {
-            port: engine,
-            ctx: env.ctx.clone(),
-        }),
-    )
-}
+pub(super) use super::dst::local_worker_with_fabric;
+pub(super) use super::dst::publication;
 
 pub(super) fn definition() -> racer_wire::control::CacheDefinition {
     let (client_socket, origin_socket) =
@@ -694,31 +663,6 @@ pub(super) fn definition() -> racer_wire::control::CacheDefinition {
         mode: racer_wire::control::CacheMode::Cached,
         origin: None,
     }
-}
-
-pub(super) fn publication(
-    config: &Config,
-    sequence: u64,
-    caches: Vec<racer_wire::control::CacheDefinition>,
-) -> state::Publication {
-    state::Publication {
-        pools: Vec::new(),
-        schema_version: racer_wire::control::SCHEMA_VERSION,
-        cluster: config.cluster.clone(),
-        sequence: wire::PublicationSequence(sequence),
-        // Pools cover the caches, so each catalog takes its own version.
-        membership_version: racer_wire::control::MembershipVersion(sequence),
-        members: vec![racer_wire::control::Member {
-            node: config.node.clone(),
-            shares: std::num::NonZeroU32::new(1).unwrap(),
-            peer_endpoint: "127.0.0.1:7443".into(),
-            rails: vec![],
-            site: String::new(),
-        }],
-        caches,
-        page_size: racer_wire::object::PageSize::DEFAULT,
-    }
-    .with_default_pool()
 }
 
 pub(super) fn page(app: &WorkerApplication) -> crate::memory::PageResult {
@@ -5219,8 +5163,6 @@ mod lifecycle {
         assert_eq!(observations.health.state(&env), Ok(State::Stopped));
     }
 }
-
-mod dst;
 
 #[test]
 fn shared_pressure_constrains_pools_and_releases_retained_buffers() {

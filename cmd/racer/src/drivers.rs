@@ -112,7 +112,7 @@ impl DriverQueue {
 
     /// Discard simulated process tasks without polling them. Outstanding permits
     /// retain their reservations. Call only outside an active polling turn.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "dst"))]
     pub fn simulation_crash(&self) {
         self.abandon();
     }

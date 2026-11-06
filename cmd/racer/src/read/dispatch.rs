@@ -351,7 +351,7 @@ impl WorkerDirectory {
     /// A simulated process loss discards queued messages and their producer permits.
     /// Remaining receipts observe producer loss, not successful completion fences.
     /// Do not execute commands or mark kernel/NIC operations complete here.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "dst"))]
     pub(crate) fn simulation_crash(&self) {
         for mailbox in &self.mailboxes {
             mailbox.stop_admission();
@@ -360,7 +360,7 @@ impl WorkerDirectory {
     }
     /// Select a logical worker on the single-threaded simulation scheduler.
     /// Production gets this isolation from its owning OS thread.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "dst"))]
     pub(crate) fn simulation_scope(
         self: &Rc<Self>,
         local: Option<(WorkerId, Rc<Coordinator>)>,
@@ -946,12 +946,12 @@ impl WorkerDirectory {
     }
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "dst"))]
 pub(crate) struct SimulationLocal {
     directory: std::rc::Rc<WorkerDirectory>,
     previous: Option<(WorkerId, std::rc::Weak<Coordinator>)>,
 }
-#[cfg(test)]
+#[cfg(any(test, feature = "dst"))]
 impl Drop for SimulationLocal {
     fn drop(&mut self) {
         self.directory.local.replace(self.previous.take());
@@ -967,7 +967,7 @@ impl WorkerEndpoint {
 
     /// Simulated process loss occurs after the OS crash cut. Drop accepted tasks
     /// without polling them; the simulated reactor still fences owned buffers.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "dst"))]
     pub(crate) fn simulation_crash(&mut self) {
         self.directory.simulation_crash();
         self.active.simulation_crash();

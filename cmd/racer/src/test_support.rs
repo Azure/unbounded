@@ -279,98 +279,7 @@ impl NoPeers {
 }
 
 /// Side-effect-free configuration for assembled worker scenarios.
-pub mod cluster {
-    use crate::config::Config;
-    use crate::config::Limits;
-    use racer_wire::control::ClusterId;
-    use racer_wire::control::NodeId;
-    use std::num::NonZeroU32;
-    use std::num::NonZeroUsize;
-    use std::time::Duration;
-
-    pub fn config(enable_rdma: bool) -> Config {
-        let count = NonZeroUsize::new(16).unwrap();
-        let bytes = NonZeroUsize::new(128 * 1024 * 1024).unwrap();
-        Config {
-            spill: Default::default(),
-            prefetch: Default::default(),
-            send_tag_pair: None,
-            page_hedge: Default::default(),
-            replica_selection: Default::default(),
-            peer_admission: Default::default(),
-            peer_receive: Default::default(),
-            shares: NonZeroU32::new(4).unwrap(),
-            disk_page_entries: NonZeroUsize::new(65536).unwrap(),
-            admission_mode: crate::config::AdmissionMode::SecondSight,
-            admission_history_bytes: NonZeroUsize::new(4 * 1024 * 1024).unwrap(),
-            admission_period: Duration::from_secs(60),
-            checkpoint_bytes: NonZeroUsize::new(64 * 1024 * 1024).unwrap(),
-            device_directory: "/host/dev".into(),
-            device_busy_wait: Duration::ZERO,
-            cluster: ClusterId("00000000-0000-4000-8000-000000000001".into()),
-            node: NodeId("00000000-0000-4000-8000-000000000002".into()),
-            max_threads: 2,
-            io_workers: None,
-            crypto_helpers: None,
-            allow_smt: false,
-            opaque_relay: false,
-            peer_tcp_nodelay: false,
-            memory_pressure: true,
-            pprof_enabled: false,
-            enable_rdma,
-            enable_gpu: crate::config::GpuMode::Disabled,
-            gpu_staging_bytes: crate::config::DEFAULT_GPU_STAGING_BYTES,
-            gpu_landing_bytes: crate::config::DEFAULT_GPU_LANDING_BYTES,
-            gpu_pci_p2pdma: false,
-            gpu_peer: true,
-            control_endpoint: Some("https://control.invalid".into()),
-            managed_control: None,
-            enrollment_directory: None,
-            peer_listen: "127.0.0.1:0".parse().unwrap(),
-            diagnostics_listen: "127.0.0.1:0".parse().unwrap(),
-            trust_bundle: "unused/ca".into(),
-            service_account_token: "unused/token".into(),
-            identity_directory: "unused/identity".into(),
-            slab_directory: "unused/slabs".into(),
-            slab_bytes: 1024 * 1024 * 1024,
-            segment_bytes: 64 * 1024 * 1024,
-            free_segment_reserve: 2,
-            origin_connections_per_cache: NonZeroUsize::new(8).unwrap(),
-            request_timeout: Duration::from_secs(30),
-            peer_attempt_timeout: Duration::from_secs(30),
-            reader_stall_timeout: Duration::from_secs(10),
-            shutdown_timeout: Duration::from_secs(30),
-            limits: Limits {
-                plaintext_bytes: bytes,
-                ciphertext_bytes: bytes,
-                dirty_bytes: bytes,
-                registered_bytes: bytes,
-                request_context_bytes: bytes,
-                flights: count,
-                waiters_per_flight: count,
-                queue_entries: count,
-                connections_per_neighbor: count,
-                client_connections: count,
-                peer_connections: count,
-                outbound_connections: count,
-                pipes: count,
-                range_window_pages: count,
-                header_bytes: NonZeroUsize::new(16 * 1024).unwrap(),
-                placement_cache_bytes: NonZeroUsize::new(16 * crate::topology::RANKING_BYTES)
-                    .unwrap(),
-                path_cache_bytes: NonZeroUsize::new(8 * 1024 * 1024).unwrap(),
-                active_path_searches: NonZeroUsize::new(8).unwrap(),
-                cached_paths: count,
-                retained_snapshots: count,
-                metadata_entries: count,
-                relay_transfers: count,
-            },
-            scaled_limits: Default::default(),
-            origin: Default::default(),
-            authority: None,
-        }
-    }
-}
+pub use crate::app::dst::cluster;
 
 /// Assemble the real worker without activating I/O for wake and quota scenarios.
 pub(crate) fn wake_test_worker(env: &racer_io::Env) -> crate::app::WorkerApplication {
@@ -439,7 +348,6 @@ pub(crate) mod enrollment {
     pub(crate) use io::drive;
     pub(crate) use io::issue;
     pub(crate) use io::issue_at;
-    pub(crate) use io::signing_identity;
     pub(crate) struct Directory(pub PathBuf);
     impl Directory {
         pub fn new() -> Self {
@@ -839,10 +747,7 @@ impl ReadWorker {
 }
 pub(crate) mod security {
     //! Shared security fixtures. Never linked into production.
-    use crate::http::Codec;
-    use crate::peer::protocol;
     use crate::peer::protocol::Signatures;
-    use crate::peer::protocol::SignedHead;
     use racer_crypto::identity::Certificates;
     use racer_crypto::identity::KeyEpochs;
     use racer_crypto::identity::KeyLease;
@@ -992,15 +897,7 @@ pub(crate) mod security {
         keys[0].key.cache = CacheId(cache.into());
         keys
     }
-    pub(crate) fn clone_head(head: &SignedHead) -> SignedHead {
-        let codec = Codec::new(protocol::MAX_HEAD);
-        let encoded = codec.encode_head(&head.head).unwrap();
-        SignedHead {
-            head: codec.decode_head(&encoded).unwrap().unwrap().0,
-            signature: head.signature.clone(),
-            chain: head.chain.clone(),
-        }
-    }
+    pub(crate) use crate::app::dst::clone_head;
     pub fn identities(
         env: &racer_io::Env,
         cluster: ClusterId,

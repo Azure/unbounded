@@ -97,3 +97,94 @@ record) or a new `HashMap` iteration on a behavior path.
   cycle), so a restarted Pod failed to bind its addresses. Fixed in
   `authority/src/rt.rs`; regression test
   `dropped_authority_restarts_with_the_same_identity`.
+
+# Full fidelity: application nodes
+
+`dst/src/app.rs` runs real Racer application nodes. Each `app-<name>` scenario
+is one world role that runs `racer::app::dst::run(name, seed, 0)`, the
+whole-application harness that used to live in `src/app/tests/dst.rs`. The
+harness is compiled only for tests and for the root crate's `dst` feature,
+which `racer-dst` enables; it is `#[doc(hidden)]` and is not a public API.
+
+## World
+
+- Every node is assembled through `WorkerApplication::assemble` and started
+  through the production lifecycle on `racer_io::Env::sim` (`Driver::Sim`,
+  `SimOs`, `SimClock`). Page crypto and the RDMA owner are stepped on the
+  harness thread (`SteppedCrypto`); the RDMA fabric is
+  `rdma_verbs::simulation`.
+- Nodes talk over one simulated network. Control is supplied by the harness:
+  it signs node identities under its own CA, publishes publications and
+  keyring bundles directly and parks the live control and keyring feeds. It
+  does not use the `racer-authority` world (see "Remaining work").
+- Clients are simulated UDS readers; origins are fake UDS adapters serving an
+  immutable versioned catalog with injected faults (credential reject and
+  forbidden, slow and failed origins).
+- The harness owns its own `SimOs` and `SimClock` and advances time itself
+  (1 ms per turn), so to the world the role finishes in one step at time 0.
+  The role draws its seed from the choice stream and folds the run's replay
+  digest into the world trace.
+- All polls use a recording waker (`wake` in `src/app/dst.rs`), not a no-op
+  waker.
+
+## Invariants
+
+All are harness assertions; a panic becomes the world violation
+`role-assert` with the panic message.
+
+- Oracle: every successful response equals the origin version's bytes;
+  pinned reads whose version changed get the 412 contract, origin failures
+  get 502.
+- Resource bounds per worker on every turn (admission classes, writer queue,
+  client connections, descriptor bound).
+- Release at quiescence: after teardown no live handles, no live fabric
+  resources, all checkpoint shards released.
+- Stranded work: `settle` fails when work is pending for `STRANDED_TURNS`
+  consecutive turns with no completion, no in-flight reactor or crypto
+  operation and no recorded wake.
+- Liveness after heal: `verify_recovery` reads every object after faults
+  are cleared.
+- Corpus coverage: `app-corpus` and `app-corpus-native` replay seeds 1, 7
+  and 42 and fail when a coverage obligation (actions, origin faults, native
+  faults, byte and response counts) is never met.
+
+## Determinism
+
+`make racer-dst` runs every `app-*` entry twice and compares the world trace,
+which holds the app replay digest. The corpus no longer replays each seed a
+second time internally; a divergence is reported as a trace hash mismatch
+without the first differing checkpoint.
+
+## Mapping from `src/app/tests/dst.rs`
+
+| Old test | Scenario |
+|---|---|
+| `dst_generated_traffic_churn_oracle` | `app-corpus` (`app-generated` for one seed) |
+| `dst_generated_native_traffic_churn_oracle` | `app-corpus-native` (`app-generated-native`) |
+| `default_grace_staggered_nodes_and_periodic_checkpoint_traffic` | `app-default-grace-staggered-checkpoint` |
+| `dst_origin_recovery_completes_before_concurrent_healthy_reads` | `app-origin-recovery-before-healthy-reads` |
+| `dst_native_faults_reach_warmed_peers_in_small_topologies` | `app-native-faults-warmed-peers` |
+| `dst_refused_peer_connect_preserves_candidate_fallback` | `app-refused-peer-connect-fallback` |
+| `dst_shutdown_checkpoint_uses_async_io_and_releases_all_shards` | `app-shutdown-checkpoint-async-io` |
+| `scenarios::worker_subscriptions_contend_across_servers_and_recover_after_release` | `app-worker-subscriptions-contend` |
+| `scenarios::completed_peer_dispatches_do_not_exhaust_worker_cancellation` | `app-completed-peer-dispatches-cancellation` |
+| `scenarios::healthy_relayed_page_reads` | `app-healthy-relayed-page-reads` |
+| `scenarios::healthy_relayed_page_reads_opaque_opt_in` | `app-healthy-relayed-page-reads-opaque` |
+| `scenarios::listeners_survive_repeated_reactor_queue_pressure` | `app-listeners-survive-queue-pressure` |
+| `scenarios::concurrent_relayed_layers_diagnose_receive_pressure_and_recover` | `app-concurrent-relayed-layers` |
+| `scenarios::concurrent_relayed_layers_opaque_opt_in_pressure_and_recovery` | `app-concurrent-relayed-layers-opaque` |
+| `racer_entropy_replay_bytes_are_stable`, `dst_coverage_policy_and_aggregation` | unit tests kept in `src/app/dst.rs` |
+
+`DST_SEEDS`, `DST_STEPS` and `DST_FILTER` keep their `racer-dst` meanings;
+the old harness's comma-separated `DST_SEEDS` list is replaced by seed file
+entries such as `app-generated seed=N`.
+
+## Remaining work
+
+- Run app nodes as world roles on the world's `SimOs` and `VirtualClock`
+  (one role per worker lane), so world faults (partition, crash/restart,
+  clock skew) and the world's wake-based scheduler apply to them directly.
+- Drive enrollment, publication and keyring from the `racer-authority`
+  world instead of harness-signed documents.
+- Crash during a write with torn `SimOs` disk faults, then restart from the
+  checkpoint and assert hits never return wrong bytes.

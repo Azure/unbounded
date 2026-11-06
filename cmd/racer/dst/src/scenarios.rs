@@ -1071,5 +1071,8 @@ pub fn catalog() -> Vec<Scenario> {
 
 /// The scenario named `name`.
 pub fn find(name: &str) -> Option<Scenario> {
-    catalog().into_iter().find(|s| s.name == name)
+    catalog()
+        .into_iter()
+        .chain(crate::app::catalog())
+        .find(|s| s.name == name)
 }

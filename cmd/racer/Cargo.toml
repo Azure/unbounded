@@ -18,6 +18,15 @@ rdma = ["rdma-verbs/native"]
 cuda = ["racer-gpu/native"]
 # Test-only Go SDK launcher; keeps crate-private fixture assembly out of default builds.
 subscription-interop = []
+# Test support for racer-dst: exposes the whole-application simulation harness.
+dst = [
+    "peer-wire/test-util",
+    "racer-wire/test-util",
+    "racer-crypto/test-util",
+    "rdma-verbs/simulation",
+    "racer-gpu/simulation",
+    "http1/test-util",
+]
 
 [[test]]
 name = "subscription_interop"

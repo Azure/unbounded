@@ -10,6 +10,7 @@
 //!
 //! | Module | Role |
 //! |---|---|
+//! | [`app`] | Full fidelity Racer application worlds (`racer::app::dst`) |
 //! | [`authority`] | Full fidelity control plane: real `racer-authority` authorities and the fake API |
 //! | [`choices`] | The choice stream: seeded PRNG (CI), fuzzer bytes, record/replay, shrinking, seed files |
 //! | [`engine`] | Virtual time ([`engine::Nanos`]), event queue with deterministic ties, [`engine::TraceHash`] |
@@ -80,6 +81,7 @@
 #![deny(missing_docs)]
 #![recursion_limit = "512"]
 
+pub mod app;
 pub mod authority;
 pub mod choices;
 pub mod cli;

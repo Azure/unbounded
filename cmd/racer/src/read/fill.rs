@@ -79,7 +79,7 @@ type LocalPlaintextKeys = std::cell::RefCell<
 /// A host descriptor to hand to cuFile, or None for simulated descriptors.
 fn host_descriptor(descriptor: &racer_io::ring::Descriptor) -> Option<std::os::fd::OwnedFd> {
     use std::os::fd::AsFd;
-    #[cfg(test)]
+    #[cfg(any(test, feature = "dst"))]
     if descriptor.as_sim().is_some() {
         return None;
     }

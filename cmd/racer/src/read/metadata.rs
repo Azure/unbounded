@@ -86,9 +86,9 @@ struct RefreshOutput {
 
 // Match runtime::HashMap's cfg exactly: dependency simulation features must not
 // switch production or integration-test builds to seeded hashing.
-#[cfg(not(test))]
+#[cfg(not(any(test, feature = "dst")))]
 type RefreshHashState = std::collections::hash_map::RandomState;
-#[cfg(test)]
+#[cfg(any(test, feature = "dst"))]
 type RefreshHashState = crate::runtime::HashState;
 type Cohorts = MetadataCohort<ObjectId, Result<RefreshOutput>, (), RefreshHashState, WakeTarget>;
 

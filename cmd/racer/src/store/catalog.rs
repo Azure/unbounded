@@ -146,7 +146,7 @@ impl PageTicket {
         }
         let reservation = self.reservation.take();
         // Only tests publish a caller-chosen location through a ticket.
-        #[cfg(not(test))]
+        #[cfg(not(any(test, feature = "dst")))]
         if reservation.is_none() {
             return Err(Error::InvalidConfiguration);
         }

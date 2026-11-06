@@ -109,6 +109,11 @@ use std::time::UNIX_EPOCH;
 use crate::drivers::poll_task;
 
 mod devices;
+/// Whole-application deterministic simulation harness: real worker graphs on
+/// `Driver::Sim`, driven by `racer-dst` (test support only, not a public API).
+#[cfg(any(test, feature = "dst"))]
+#[doc(hidden)]
+pub mod dst;
 mod native;
 mod recovery;
 pub(crate) mod rollout;
@@ -1597,9 +1602,9 @@ impl WorkerApplication {
             admission.clone(),
             network.clone(),
         ));
-        #[cfg(not(test))]
+        #[cfg(not(any(test, feature = "dst")))]
         let distributed = true;
-        #[cfg(test)]
+        #[cfg(any(test, feature = "dst"))]
         let distributed = runtime.reactor.sim_os().is_none();
         let peers = PeerServer::new(
             io.clone(),
@@ -1922,7 +1927,7 @@ impl WorkerApplication {
             // checkpoint that outlives its payload.
             .reset_mismatched_size()
         });
-        #[cfg(test)]
+        #[cfg(any(test, feature = "dst"))]
         if let Some(sim) = runtime.reactor.sim_os() {
             slabs.simulate_in(sim);
         }
@@ -2328,15 +2333,21 @@ impl WorkerApplication {
     /// Admit a bounded batch of handed-off connections and poll active peer work.
     fn poll_ingress(&mut self, cx: &mut Context<'_>, budget: usize) -> Result<()> {
         if !self.stopping {
-            let clients = self
+            let mut clients = self
                 .node
                 .ingress
                 .pop_batch::<64>(self.worker, cx.waker(), budget)?;
-            let peers = self
-                .node
-                .peer_ingress
-                .pop_batch::<64>(self.worker, cx.waker(), budget)?;
-            for accepted in clients.into_iter().chain(peers).flatten() {
+            let mut peers =
+                self.node
+                    .peer_ingress
+                    .pop_batch::<64>(self.worker, cx.waker(), budget)?;
+            // Take items in place: moving whole batches through iterator adapters
+            // copies both arrays on every poll, even when the queues are empty.
+            for accepted in clients
+                .iter_mut()
+                .chain(peers.iter_mut())
+                .filter_map(Option::take)
+            {
                 let connection =
                     crate::http::from_reserved(accepted.fd.into(), accepted.reservation);
                 // Isolated retirement failures must not terminate listener service.
@@ -2843,7 +2854,7 @@ impl CacheTransition for Transition<'_> {
 
 impl CachePublication {
     /// Propose changed definitions or reserve the acknowledged cut for atomic commit.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "dst"))]
     pub(crate) fn stage(
         &self,
         definitions: &[CacheDefinition],
