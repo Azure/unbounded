@@ -1272,9 +1272,7 @@ impl RangeStream {
     /// The page of the window slot waiting on `id`.
     fn number_of(&self, id: EffectId) -> Option<PageNumber> {
         let window = self.window.as_ref()?;
-        let index = window.slots().position(
-            |slot| matches!(slot, win::Slot::Probing(i) | win::Slot::Fetching(i) if *i == id),
-        )?;
+        let index = window.index_of(id)?;
         Some(PageNumber(window.cursor() + index as u64))
     }
 

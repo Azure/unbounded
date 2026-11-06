@@ -816,3 +816,48 @@ fn seeded_reads_deliver_in_order_and_release_each_hold_once() {
         }
     }
 }
+
+#[test]
+fn index_of_tracks_probes_and_fetches_and_forgets_completions() {
+    let mut h = Harness::new(config(3, 3));
+    let effects = h.pump();
+    let ids: Vec<_> = effects
+        .iter()
+        .filter_map(|e| match e {
+            Effect::Probe { id, .. } => Some(*id),
+            _ => None,
+        })
+        .collect();
+    for (index, id) in ids.iter().enumerate() {
+        assert_eq!(h.window.index_of(*id), Some(index));
+    }
+    assert_eq!(h.window.index_of(EffectId(999)), None);
+    // A miss turns into a direct fill at the same index.
+    let effects = h.on(Input::Probed {
+        id: ids[0],
+        found: false,
+    });
+    assert_eq!(h.window.index_of(ids[0]), None);
+    let effects = [effects, h.pump()].concat();
+    let fill = fetches(&effects);
+    assert_eq!(fill[0].0, 0);
+    assert_eq!(h.window.index_of(fill[0].1), Some(0));
+    // A repeated completion is stale.
+    h.on(Input::Probed {
+        id: ids[1],
+        found: true,
+    });
+    let mut out = Vec::new();
+    assert_eq!(
+        h.window.on(
+            Input::Probed {
+                id: ids[1],
+                found: true
+            },
+            true,
+            &mut h.ids,
+            &mut out
+        ),
+        Err(Stale(ids[1]))
+    );
+}

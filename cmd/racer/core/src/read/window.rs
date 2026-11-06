@@ -265,6 +265,9 @@ pub struct ReadWindow {
     terminated: bool,
     /// Scratch slot kinds for planning, reused across pumps.
     kinds: Vec<SlotKind>,
+    /// Page of each probe or fetch issued, so completions find their slot without a scan. An entry
+    /// is only trusted while its slot still holds the id; it is dropped on completion.
+    issued: BTreeMap<EffectId, u64>,
 }
 
 impl ReadWindow {
@@ -284,6 +287,7 @@ impl ReadWindow {
             error: None,
             terminated: false,
             kinds: Vec::new(),
+            issued: BTreeMap::new(),
         }
     }
 
@@ -306,8 +310,14 @@ impl ReadWindow {
     #[doc(hidden)]
     pub fn place(&mut self, index: usize, slot: Slot) {
         let number = self.page_at(index);
-        if let Slot::Selecting(id) = slot {
-            self.selections.entry(id).or_default().insert(number);
+        match slot {
+            Slot::Selecting(id) => {
+                self.selections.entry(id).or_default().insert(number);
+            }
+            Slot::Probing(id) | Slot::Fetching(id) => {
+                self.issued.insert(id, number);
+            }
+            _ => {}
         }
         if index == self.slots.len() {
             self.slots.push_back(slot);
@@ -383,11 +393,21 @@ impl ReadWindow {
         self.slots.get_mut(index)
     }
 
-    fn index_of(&self, id: EffectId) -> Option<usize> {
-        self.slots.iter().position(|slot| match slot {
-            Slot::Probing(i) | Slot::Fetching(i) => *i == id,
-            _ => false,
-        })
+    /// Window index of the probe or fetch `id`, if its slot still holds it.
+    pub fn index_of(&self, id: EffectId) -> Option<usize> {
+        let number = *self.issued.get(&id)?;
+        let index = usize::try_from(number.checked_sub(self.next)?).ok()?;
+        match self.slots.get(index)? {
+            Slot::Probing(i) | Slot::Fetching(i) if *i == id => Some(index),
+            _ => None,
+        }
+    }
+
+    /// Like [`Self::index_of`], forgetting `id`: for its completion.
+    fn complete(&mut self, id: EffectId) -> Option<usize> {
+        let index = self.index_of(id);
+        self.issued.remove(&id);
+        index
     }
 
     /// Plan new work. `reserve(page)` takes the client credit of a page entering the window and
@@ -451,6 +471,7 @@ impl ReadWindow {
                 _ => ProbeFrom::Memory,
             };
             let id = ids.allocate();
+            self.issued.insert(id, number);
             self.slots.push_back(Slot::Probing(id));
             out.push(Effect::Probe {
                 id,
@@ -483,6 +504,7 @@ impl ReadWindow {
             let id = ids.allocate();
             let page = self.page_at(index);
             self.slots[index] = Slot::Fetching(id);
+            self.issued.insert(id, page);
             out.push(Effect::Fetch {
                 id,
                 page,
@@ -599,7 +621,7 @@ impl ReadWindow {
                 Ok(())
             }
             Input::Probed { id, found } => {
-                let index = self.index_of(id).ok_or(Stale(id))?;
+                let index = self.complete(id).ok_or(Stale(id))?;
                 self.slots[index] = if found {
                     Slot::Ready {
                         handle: id,
@@ -611,7 +633,7 @@ impl ReadWindow {
                 Ok(())
             }
             Input::Fetched { id, result } => {
-                let index = self.index_of(id).ok_or(Stale(id))?;
+                let index = self.complete(id).ok_or(Stale(id))?;
                 let number = self.page_at(index);
                 self.slots[index] = match result {
                     Ok(kind) => Slot::Ready {
@@ -795,6 +817,7 @@ impl ReadWindow {
             }
         }
         self.selections.clear();
+        self.issued.clear();
         if let Some(spill) = self.spill.take() {
             for (page, state) in &spill.pages {
                 match state {
