@@ -887,6 +887,56 @@ class ResetOnHostTests(unittest.TestCase):
             e2e.validate_node_stack_removed()
 
 
+def pod(name, ip, phase="Running", host_network=False, deleting=False, ips=None):
+    metadata = {"namespace": "ns", "name": name}
+    if deleting:
+        metadata["deletionTimestamp"] = "2026-01-01T00:00:00Z"
+    status = {"phase": phase, "podIP": ip}
+    if ips is not None:
+        status["podIPs"] = [{"ip": i} for i in ips]
+    return {"metadata": metadata, "spec": {"hostNetwork": host_network}, "status": status}
+
+
+class NoneRepavePodCIDRTests(unittest.TestCase):
+    def test_only_running_pod_network_pods_outside_the_range_are_reported(self):
+        pods = [
+            pod("inside", "10.244.1.5"),
+            pod("outside", "10.244.0.7"),
+            pod("host", "192.168.100.10", host_network=True),
+            pod("pending", "10.244.0.8", phase="Pending"),
+            pod("deleting", "10.244.0.9", deleting=True),
+            pod("no-ip", ""),
+        ]
+        self.assertEqual(e2e.pod_ips_outside_cidrs(pods, ["10.244.1.0/24"]), ["ns/outside 10.244.0.7"])
+
+    def test_every_family_of_a_dual_stack_pod_is_checked(self):
+        cidrs = ["10.244.1.0/24", "fd00:10:244:1::/64"]
+        good = pod("good", "10.244.1.5", ips=["10.244.1.5", "fd00:10:244:1::5"])
+        bad = pod("bad", "10.244.1.6", ips=["10.244.1.6", "fd00:10:244:0::6"])
+        self.assertEqual(e2e.pod_ips_outside_cidrs([good, bad], cidrs), ["ns/bad fd00:10:244:0::6"])
+
+    def test_node_pod_cidrs_prefers_the_list(self):
+        self.assertEqual(e2e.node_pod_cidrs({"spec": {"podCIDR": "10.244.1.0/24"}}), ["10.244.1.0/24"])
+        self.assertEqual(e2e.node_pod_cidrs({"spec": {"podCIDR": "10.244.1.0/24", "podCIDRs": ["10.244.1.0/24", "fd00::/64"]}}),
+                         ["10.244.1.0/24", "fd00::/64"])
+        self.assertEqual(e2e.node_pod_cidrs({"spec": {}}), [])
+
+    def test_the_daemonset_pod_is_on_the_pod_network_of_the_agent_node(self):
+        spec = e2e.pod_cidr_daemonset()["spec"]["template"]["spec"]
+        self.assertFalse(spec.get("hostNetwork", False))
+        terms = spec["affinity"]["nodeAffinity"]["requiredDuringSchedulingIgnoredDuringExecution"]["nodeSelectorTerms"]
+        self.assertEqual(terms[0]["matchFields"][0]["values"], [e2e.AGENT_MACHINE_NAME])
+
+    def test_other_modes_skip_it(self):
+        with patch.object(e2e, "ISOLATION_MODE", "nspawn"), patch.object(e2e, "kubectl") as kubectl:
+            e2e.validate_none_repave_pod_cidr(e2e.load_node_config(""))
+        kubectl.assert_not_called()
+
+    def test_it_runs_in_the_operations_suite_after_the_repave_upgrade(self):
+        steps = e2e.SUITES["isolation-operations"]
+        self.assertLess(steps.index("validate-node-repave-upgrade"), steps.index("validate-none-repave-pod-cidr"))
+
+
 class RestoreDeletedNodeTests(unittest.TestCase):
     def test_a_node_reboot_brings_the_node_back(self):
         with patch.object(e2e, "run_quiet"), patch.object(e2e, "create_machine_operation") as created, \
