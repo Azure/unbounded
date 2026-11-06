@@ -23,6 +23,8 @@ import (
 	"github.com/Azure/unbounded/pkg/agent/isolation"
 	"github.com/Azure/unbounded/pkg/agent/isolation/migrate"
 	"github.com/Azure/unbounded/pkg/agent/isolation/nspawn"
+	"github.com/Azure/unbounded/pkg/agent/phases"
+	"github.com/Azure/unbounded/pkg/agent/phases/host"
 	"github.com/Azure/unbounded/pkg/agent/phases/nodestart"
 	"github.com/Azure/unbounded/pkg/agent/phases/reset"
 	"github.com/Azure/unbounded/pkg/agent/phases/rootfs"
@@ -126,6 +128,9 @@ type migrationEnv struct {
 	ReadConfig func(log *slog.Logger, mode isolation.Mode, slot string) (*ActiveMachine, error)
 	// WaitReady waits for the node stack of slot in mode to be up on the host.
 	WaitReady func(ctx context.Context, log *slog.Logger, mode isolation.Mode, slot string) error
+	// PrepareHost applies the host preparation a bootstrap in mode would have
+	// (see prepareHostFor), once an in-place change to mode is up.
+	PrepareHost func(ctx context.Context, log *slog.Logger, mode isolation.Mode) error
 	// Preflight checks the target mode's host requirements for a change by
 	// strategy, without changing anything.
 	Preflight func(ctx context.Context, log *slog.Logger, mode isolation.Mode, strategy migrate.Strategy) error
@@ -284,6 +289,36 @@ func (e *migrationEnv) waitReady(ctx context.Context, log *slog.Logger, mode iso
 	}
 
 	return nodestart.WaitForKubelet(log, slot).Do(ctx)
+}
+
+func (e *migrationEnv) prepareHost(ctx context.Context, log *slog.Logger, mode isolation.Mode) error {
+	if e.PrepareHost != nil {
+		return e.PrepareHost(ctx, log, mode)
+	}
+
+	task, err := prepareHostFor(log, mode)
+	if err != nil {
+		return err
+	}
+
+	return task.Do(ctx)
+}
+
+// prepareHostFor is the host preparation that a bootstrap in mode does and
+// that differs between the slot modes, for an in-place change to mode: the
+// nftables flush unit, which an nspawn host installs for its machines and a
+// container host for its node units, and the apt guards, which only an nspawn
+// machine needs. The flush unit is not started while the target node runs
+// (see host.ConfigureNFTablesFor), so it takes effect at the next boot.
+func prepareHostFor(log *slog.Logger, mode isolation.Mode) (phases.Task, error) {
+	switch mode {
+	case isolation.ModeNSpawn:
+		return phases.Serial(log, host.ConfigureNFTablesFor(log, mode), host.HardenAPT(log)), nil
+	case isolation.ModeContainer:
+		return phases.Serial(log, host.ConfigureNFTablesFor(log, mode), host.RemoveAPTHardening(log)), nil
+	default:
+		return nil, fmt.Errorf("in-place migration is not supported for isolation mode %q", mode)
+	}
 }
 
 func (e *migrationEnv) preflight(ctx context.Context, log *slog.Logger, mode isolation.Mode, strategy migrate.Strategy) error {

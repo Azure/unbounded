@@ -332,6 +332,84 @@ func TestRunInPlaceCleanupFailureAfterSuccessDoesNotRollBack(t *testing.T) {
 	require.Equal(t, []string{"prepare kube2", "start kube2"}, h.target.Calls())
 }
 
+// withPrepareHost adds a PrepareHost hook to the harness that records itself
+// and fails with h.fail["prepare-host"].
+func (h *harness) withPrepareHost() {
+	h.spec.PrepareHost = func(context.Context) error {
+		*h.log = append(*h.log, "prepare-host")
+		return h.fail["prepare-host"]
+	}
+}
+
+func TestRunInPlacePreparesTheHostOnceTheTargetIsUp(t *testing.T) {
+	t.Parallel()
+
+	h := newHarness()
+	h.withPrepareHost()
+
+	var steps []Step
+
+	h.spec.Record = func(_ context.Context, step Step) error {
+		steps = append(steps, step)
+		*h.log = append(*h.log, "record "+string(step))
+
+		return nil
+	}
+
+	_, err := RunInPlace(context.Background(), h.spec)
+	require.NoError(t, err)
+
+	hooks := h.hooks()
+	require.Equal(t, []string{"wait-ready", "record ready", "prepare-host", "remove-source-config", "record complete"}, hooks[len(hooks)-5:])
+	require.Equal(t, StepComplete, steps[len(steps)-1])
+}
+
+func TestRunInPlaceHostPreparationFailureDoesNotRollBack(t *testing.T) {
+	t.Parallel()
+
+	h := newHarness()
+	h.withPrepareHost()
+	h.fail["prepare-host"] = errors.New("nft busy")
+
+	var steps []Step
+
+	h.spec.Record = func(_ context.Context, step Step) error {
+		steps = append(steps, step)
+		return nil
+	}
+
+	res, err := RunInPlace(context.Background(), h.spec)
+	require.ErrorContains(t, err, "prepare the host for container: nft busy")
+	require.NotNil(t, res.Target, "the node already runs on the target")
+	require.False(t, res.RolledBack)
+	require.Equal(t, []string{"stop kube1", "destroy kube1"}, h.source.Calls(), "the source is still cleaned up")
+	require.Equal(t, StepReady, steps[len(steps)-1], "not complete, so a resume prepares the host again")
+}
+
+func TestRunInPlaceRollbackDoesNotPrepareTheHost(t *testing.T) {
+	t.Parallel()
+
+	h := newHarness()
+	h.withPrepareHost()
+	h.fail["wait-ready"] = errors.New("not ready")
+
+	_, err := RunInPlace(context.Background(), h.spec)
+	require.Error(t, err)
+	require.NotContains(t, h.hooks(), "prepare-host")
+}
+
+func TestResumeInPlaceAtReadyPreparesTheHost(t *testing.T) {
+	t.Parallel()
+
+	h := newHarness()
+	h.withPrepareHost()
+	h.spec.TargetRoot = isolation.SlotName("kube2")
+
+	_, err := ResumeInPlace(context.Background(), h.spec, StepReady)
+	require.NoError(t, err)
+	require.Equal(t, []string{"prepare-host", "remove-source-config"}, h.hooks())
+}
+
 func TestRunInPlaceIncompleteSpec(t *testing.T) {
 	t.Parallel()
 

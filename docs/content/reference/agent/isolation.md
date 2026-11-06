@@ -150,7 +150,12 @@ agent performs when the Node is deleted. Setting it never moves a running node.
 A change between `nspawn` and `container` is made in place (`InPlace`): the
 new mode's node is built in the other slot beside the running one, the old
 node is stopped, and the new one is started and waited on. If it does not come
-up it is removed and the old node is started again. The change is journaled in
+up it is removed and the old node is started again. Once the new node is up,
+the agent installs the new mode's `nftables-flush.service` (ordered before the
+`nspawn` machines or before the container units) and, for `nspawn`, the apt
+guards that keep a package upgrade from restarting `systemd-machined`, or
+removes them for `container`. The flush is not run under the running node; it
+applies at the next boot. The change is journaled in
 `/etc/unbounded/agent/isolation-migration.json`, so an agent that restarts in
 the middle finishes it or rolls it back. It needs no annotation, but the target
 `container` must be enabled on the host (see

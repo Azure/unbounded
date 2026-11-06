@@ -135,6 +135,9 @@ func (e *migrationEnv) newInPlaceMigration(
 			return e.waitReady(ctx, log, j.To, j.TargetSlot)
 		},
 		RemoveSourceConfig: func(ctx context.Context) error { return e.removeConfig(ctx, log, j.From, j.SourceSlot) },
+		// The bootstrap of the target mode installs a flush unit and apt
+		// guards of its own; the source mode's would otherwise stay.
+		PrepareHost: func(ctx context.Context) error { return e.prepareHost(ctx, log, j.To) },
 		Record:             m.record,
 	}
 
