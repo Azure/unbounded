@@ -114,11 +114,30 @@ struct Installer {
     install_error: Rc<Cell<Option<Error>>>,
 
     prepare_error: Rc<Cell<Option<Error>>>,
+
+    /// Preparations handed out but not yet returned from their thread.
+    outstanding: Arc<AtomicU64>,
+}
+
+thread_local! {
+    /// Installers on this test thread, so [`drive`] holds simulated time still
+    /// while released preparation runs on a real thread.
+    static INSTALLERS: RefCell<Vec<(Arc<AtomicU64>, Arc<AtomicBool>)>> =
+        const { RefCell::new(Vec::new()) };
+}
+
+/// Whether a released preparation is still running on its host thread.
+fn preparing() -> bool {
+    INSTALLERS.with_borrow(|installers| {
+        installers.iter().any(|(outstanding, release)| {
+            outstanding.load(Ordering::Acquire) > 0 && release.load(Ordering::Acquire)
+        })
+    })
 }
 
 impl Installer {
     fn new() -> Self {
-        Self {
+        let installer = Self {
             installed: Rc::new(RefCell::new(Vec::new())),
             blocked: Rc::new(Cell::new(false)),
             release: Arc::new(AtomicBool::new(true)),
@@ -127,7 +146,12 @@ impl Installer {
             fail: Arc::new(AtomicBool::new(false)),
             install_error: Rc::new(Cell::new(None)),
             prepare_error: Rc::new(Cell::new(None)),
-        }
+            outstanding: Arc::new(AtomicU64::new(0)),
+        };
+        INSTALLERS.with_borrow_mut(|installers| {
+            installers.push((installer.outstanding.clone(), installer.release.clone()));
+        });
+        installer
     }
 }
 
@@ -143,7 +167,10 @@ impl Install for Installer {
         let started = self.started.clone();
         let threads = self.threads.clone();
         let fail = self.fail.clone();
+        let outstanding = self.outstanding.clone();
+        outstanding.fetch_add(1, Ordering::AcqRel);
         Ok(Box::new(move || {
+            let _done = scopeguard(outstanding);
             threads.lock().unwrap().push(std::thread::current().id());
             started.fetch_add(1, Ordering::SeqCst);
             let deadline = Instant::now() + Duration::from_secs(3);
@@ -173,6 +200,17 @@ impl Install for Installer {
         self.installed.borrow_mut().push(prepared.generation.0);
         Ok(())
     }
+}
+
+/// Mark a preparation finished when its closure returns or unwinds.
+fn scopeguard(outstanding: Arc<AtomicU64>) -> impl Drop {
+    struct Done(Arc<AtomicU64>);
+    impl Drop for Done {
+        fn drop(&mut self) {
+            self.0.fetch_sub(1, Ordering::AcqRel);
+        }
+    }
+    Done(outstanding)
 }
 
 /// Real reactor adapter over the entered simulated environment.
@@ -209,7 +247,9 @@ fn schedule() -> Schedule {
     }
 }
 
-/// Advance simulated time while repolling, with a host watchdog.
+/// Advance simulated time while repolling, with a host watchdog. Simulated time
+/// holds still while a released preparation runs on its host thread, so host
+/// scheduling delay never turns into simulated deadline expiry.
 fn drive<T>(clock: &racer_io::SimClock, operation: impl Future<Output = T>) -> T {
     let mut operation = std::pin::pin!(operation);
     let until = Instant::now() + Duration::from_secs(10);
@@ -221,6 +261,10 @@ fn drive<T>(clock: &racer_io::SimClock, operation: impl Future<Output = T>) -> T
             return result;
         }
         assert!(Instant::now() < until, "bounded scripted driver stalled");
+        if preparing() {
+            std::thread::sleep(Duration::from_micros(200));
+            continue;
+        }
         clock.advance(Duration::from_millis(1));
         std::thread::sleep(Duration::from_micros(200));
     }
@@ -228,6 +272,7 @@ fn drive<T>(clock: &racer_io::SimClock, operation: impl Future<Output = T>) -> T
 
 /// Run `body` inside an entered simulated environment.
 fn sim(seed: u64, body: impl FnOnce(&racer_io::SimClock, &racer_io::Env)) {
+    INSTALLERS.with_borrow_mut(Vec::clear);
     let clock = racer_io::SimClock::new(seed);
     let env = racer_io::Env::new(racer_io::Env::host().driver.clone(), clock.ctx(0));
     body(&clock, &env);
