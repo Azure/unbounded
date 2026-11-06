@@ -53,7 +53,7 @@ scoping is inherent to the per-site component):
 | `--health-port` | 8081 | Health/readiness probe port |
 | `--serve-url` | | External URL of this metalman instance |
 | `--default-netboot-image` | release-matched `netboot` image | Configured netboot OCI artifact used when `spec.host.netboot.netbootImage` is omitted |
-| `--experimental-container-isolation` | `false` | Enable the experimental `container` isolation mode: every agent configuration metalman renders opts in. Without it, a Machine that declares `spec.isolation: container` is not replaced and gets no agent configuration. Not set by the operator; append it with a metalman `extraArgs` [workload override]({{< relref "reference/workload-overrides" >}}). See [Enabling the container mode]({{< relref "reference/agent/isolation#enabling-the-container-mode" >}}) |
+| `--experimental-container-isolation` | `false` | Enable the experimental `container` isolation mode: every agent configuration metalman renders opts in. Without it, a Machine that declares `spec.isolation: container` is not replaced and gets no agent configuration, but `grub.cfg` still chainloads its local disk when no install is pending. Not set by the operator; append it with a metalman `extraArgs` [workload override]({{< relref "reference/workload-overrides" >}}). See [Enabling the container mode]({{< relref "reference/agent/isolation#enabling-the-container-mode" >}}) |
 
 When `--dhcp-interface` is set, metalman binds to the interface for broadcast DHCP, and the DHCP server requires leader election. Without it, metalman accepts relayed (unicast) DHCP packets and the DHCP server responds regardless of leader status. Leader election always runs at the manager level for the reconcilers.
 

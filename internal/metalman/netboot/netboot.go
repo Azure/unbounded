@@ -80,7 +80,9 @@ type FileResolver struct {
 	// isolation mode (serve-pxe --experimental-container-isolation). When set,
 	// every agent configuration the resolver renders opts in
 	// (Experimental.ContainerIsolation); when not, a Machine that declares
-	// container gets no agent configuration, since its agent would refuse it.
+	// container gets no agent configuration and no installer boot, since its
+	// agent would refuse it, but still gets a grub.cfg that chainloads its
+	// local disk when no install is pending.
 	ExperimentalContainerIsolation bool
 }
 
@@ -239,8 +241,21 @@ func (f *FileResolver) ResolveFileByPathForIP(ctx context.Context, path string, 
 		}
 
 		if node != nil {
-			if err := CheckIsolationEnabled(node, f.ExperimentalContainerIsolation); err != nil {
-				return nil, fmt.Errorf("rendering %s for Machine %s: %w", path, node.Name, err)
+			installRequested, err := f.installRequested(ctx, node)
+			if err != nil {
+				return nil, err
+			}
+
+			// The experimental gate refuses only what would act on the
+			// Machine's isolation mode: a template that embeds the agent
+			// configuration, or any template while an install is pending
+			// (which boots the installer). Without either, the template
+			// (grub.cfg chainloading the local disk) must still render so
+			// a refused Machine keeps booting what it has installed.
+			if installRequested || templateEmbedsAgentConfig(content) {
+				if err := CheckIsolationEnabled(node, f.ExperimentalContainerIsolation); err != nil {
+					return nil, fmt.Errorf("rendering %s for Machine %s: %w", path, node.Name, err)
+				}
 			}
 
 			ci := f.Cluster.ClusterInfo()
@@ -273,11 +288,6 @@ func (f *FileResolver) ResolveFileByPathForIP(ctx context.Context, path string, 
 			agentConfigJSON, err := json.MarshalIndent(agentConfig, "    ", "  ")
 			if err != nil {
 				return nil, fmt.Errorf("marshal agent config: %w", err)
-			}
-
-			installRequested, err := f.installRequested(ctx, node)
-			if err != nil {
-				return nil, err
 			}
 
 			data, err := renderTemplate(string(content), newTemplateData(node, ci, f.ServeURL, string(agentConfigJSON), requestIP, installRequested))
@@ -385,6 +395,16 @@ func selectBootLease(node *v1alpha3.Machine, requestIP string) *v1alpha3.DHCPLea
 	}
 
 	return &node.Spec.Netboot().DHCPLeases[0]
+}
+
+// agentConfigField is the template field that carries the rendered agent
+// configuration.
+const agentConfigField = ".AgentConfigJSON"
+
+// templateEmbedsAgentConfig reports whether a template renders the agent
+// configuration into what it serves.
+func templateEmbedsAgentConfig(content []byte) bool {
+	return bytes.Contains(content, []byte(agentConfigField))
 }
 
 func (f *FileResolver) installRequested(ctx context.Context, node *v1alpha3.Machine) (bool, error) {
