@@ -248,6 +248,18 @@ impl GpuCopies {
         self.entries.borrow().len()
     }
 
+    /// In-flight fetches, and requests waiting on them to finish.
+    #[cfg(test)]
+    pub(crate) fn flights(&self) -> (usize, usize) {
+        let entries = self.entries.borrow();
+        let flights = entries.values().flat_map(|entry| &entry.flights);
+        flights.fold((0, 0), |(count, waiters), flight| {
+            // The table holds one handle; each waiter holds a clone.
+            let handles = flight.receive.strong_count().unwrap_or(1);
+            (count + 1, waiters + handles.saturating_sub(1))
+        })
+    }
+
     /// Find a reusable copy of `page` for GPU `ordinal`: one on the same
     /// GPU first, then one on a GPU it can copy from. Otherwise join a
     /// reachable in-flight fetch, the same GPU's first, or lead a new one.

@@ -613,6 +613,9 @@ fn concurrent_gpu_reads_on_peer_gpus_share_cufile_reads() {
     let size = (length as u64 + 64).next_multiple_of(GRANULE);
     let allocations = [allocate(&helper, 0, size), allocate(&helper, 1, size)];
     let request = direct_request("gpu-read", &fields("", 64, length as u64, size));
+    // Hold each cuFile read until the other request has joined every fetch in
+    // flight, so the two requests overlap however the host schedules them.
+    helper.run(|| sim().hold(Operation::FileRead, true));
     let mut sockets: Vec<_> = allocations
         .iter()
         .map(|allocation| {
@@ -621,6 +624,25 @@ fn concurrent_gpu_reads_on_peer_gpus_share_cufile_reads() {
             socket
         })
         .collect();
+    let deadline = Instant::now() + Duration::from_secs(60);
+    let mut admitted = 0;
+    while admitted < 3 {
+        fixture.pump(16);
+        let (flights, waiters) = worker(&fixture).coordinator.gpu_flights();
+        if flights > 0
+            && waiters >= flights
+            && helper.run(|| sim().waiting(Operation::FileRead)) > 0
+        {
+            helper.run(|| sim().admit(Operation::FileRead));
+            admitted += 1;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "reads did not overlap: {flights} {waiters}"
+        );
+        std::thread::yield_now();
+    }
+    helper.run(|| sim().hold(Operation::FileRead, false));
     for (socket, allocation) in sockets.iter_mut().zip(&allocations) {
         let output = fixture.receive(socket, true);
         let (head, body) = split(&output);

@@ -117,6 +117,12 @@ impl Coordinator {
         self.fill.hedge_owner()
     }
 
+    /// In-flight GPU fetches and requests joined to them, for tests.
+    #[cfg(test)]
+    pub(crate) fn gpu_flights(&self) -> (usize, usize) {
+        self.fill.gpu_copies.flights()
+    }
+
     /// Assemble worker-local services without transferring their reactor ownership.
     pub fn new(
         snapshots: std::sync::Arc<PublicationCell<Snapshot>>,
