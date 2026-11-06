@@ -86,6 +86,35 @@ func TestWriteDropInsWithAndWithoutLocalDNS(t *testing.T) {
 	require.NoError(t, err)
 }
 
+// A GPU node's containerd regenerates the CDI spec before every start, so a
+// host that reboots after a driver update does not start GPU containers on a
+// spec that names the old driver's libraries.
+func TestWriteDropInsRegeneratesGPUSupportBeforeContainerdStarts(t *testing.T) {
+	dir := t.TempDir()
+	spec := UnitSpec{BinDir: "/b/bin", GPUSetup: [][]string{
+		{"/usr/bin/nvidia-ctk", "config", "--in-place"},
+		{"/usr/bin/nvidia-ctk", "cdi", "generate", "--output", "/etc/cdi/nvidia.yaml"},
+	}}
+
+	_, err := WriteDropIns(dir, spec)
+	require.NoError(t, err)
+
+	dropIn := filepath.Join(DropInDir(dir, UnitContainerd), "10-gpu-setup.conf")
+	got, err := os.ReadFile(dropIn)
+	require.NoError(t, err)
+	require.Equal(t, "# Managed by unbounded-agent. Do not edit directly.\n[Service]\n"+
+		"ExecStartPre=/usr/bin/nvidia-ctk config --in-place\n"+
+		"ExecStartPre=/usr/bin/nvidia-ctk cdi generate --output /etc/cdi/nvidia.yaml\n",
+		string(got), "in order, and without '-': a failed setup fails the start as the agent's does")
+	require.NoFileExists(t, filepath.Join(DropInDir(dir, UnitKubelet), "10-gpu-setup.conf"), "kubelet runs no GPU setup")
+
+	// A node reconfigured without GPUs stops running the toolkit at boot.
+	spec.GPUSetup = nil
+	_, err = WriteDropIns(dir, spec)
+	require.NoError(t, err)
+	require.NoFileExists(t, dropIn)
+}
+
 func TestPrepareRunsInstallBeforeUnitsAndDefaultsKubeletConfig(t *testing.T) {
 	b, rec := newBackend(t)
 	b.Units = UnitSpec{LocalDNS: true}

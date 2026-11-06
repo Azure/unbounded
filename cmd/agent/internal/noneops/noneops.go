@@ -221,6 +221,17 @@ func (n *Node) setupGPU(ctx context.Context) error {
 	return nodestart.SetupNVIDIAOnHost(n.p.Log, n.gs.NodeStart).Do(ctx)
 }
 
+// gpuSetup is what containerd runs before each start on a GPU node, so a
+// host reboot regenerates the CDI spec as a start by the agent does. It is
+// empty on a node without NVIDIA GPUs.
+func (n *Node) gpuSetup() [][]string {
+	if !n.gs.NodeStart.Nvidia.Required {
+		return nil
+	}
+
+	return nodestart.NVIDIAHostCDICommands(n.gs.NodeStart.NvidiaToolkit)
+}
+
 func (n *Node) waitLocalDNS(ctx context.Context) error {
 	return n.p.AwaitLocalDNS(ctx, n.p.Log, n.gs.NodeStart)
 }
@@ -253,6 +264,7 @@ func (n *Node) newBackend() *none.Backend {
 		Units: none.UnitSpec{
 			KubeletConfigPath: goalstates.KubeletConfigurationPath,
 			LocalDNS:          n.gs.NodeStart.LocalDNS.Enabled,
+			GPUSetup:          n.gpuSetup(),
 		},
 		Install: n.install,
 		// The stack is the host: GPU devices and libraries are already visible,

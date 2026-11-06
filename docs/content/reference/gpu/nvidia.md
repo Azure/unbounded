@@ -63,8 +63,10 @@ image.
   `nvidia-ctk config --set nvidia-container-runtime.mode=cdi --in-place` and
   regenerates `/etc/cdi/nvidia.yaml` from the host driver with
   `nvidia-ctk cdi generate`, using the `create-symlinks` and `update-ldcache`
-  hooks only, as `nspawn` does. The spec therefore follows the devices present
-  at that start.
+  hooks only, as `nspawn` does. `unbounded-containerd.service` runs the same two
+  commands in `ExecStartPre` (drop-in `10-gpu-setup.conf`), so a host reboot,
+  which starts the units without the agent, regenerates the spec too. The spec
+  therefore follows the devices and driver present at that start.
 - This changes two host-global files, the toolkit's `config.toml` and
   `/etc/cdi/nvidia.yaml`. Reset removes the spec and leaves `config.toml` in CDI
   mode.

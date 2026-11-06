@@ -75,11 +75,9 @@ func (s *setupNVIDIAOnHost) Do(ctx context.Context) error {
 		}
 	}
 
-	if _, err := gs.Exec(ctx, s.log,
-		gs.NvidiaToolkit.CTK(), "config",
-		"--set", "nvidia-container-runtime.mode=cdi",
-		"--in-place",
-	); err != nil {
+	cmds := NVIDIAHostCDICommands(gs.NvidiaToolkit)
+
+	if _, err := gs.Exec(ctx, s.log, cmds[0]...); err != nil {
 		return fmt.Errorf("configure NVIDIA container runtime CDI mode: %w", err)
 	}
 
@@ -90,17 +88,35 @@ func (s *setupNVIDIAOnHost) Do(ctx context.Context) error {
 
 	s.log.Info("generating CDI spec from the host NVIDIA driver", slog.String("output", goalstates.CDISpecFile))
 
-	if _, err := gs.Exec(ctx, s.log,
-		gs.NvidiaToolkit.CTK(), "cdi", "generate",
-		"--driver-root", "/",
-		"--dev-root", "/",
-		"--output", goalstates.CDISpecFile,
-		"--disable-hook", "all",
-		"--enable-hook", "create-symlinks",
-		"--enable-hook", "update-ldcache",
-	); err != nil {
+	if _, err := gs.Exec(ctx, s.log, cmds[1]...); err != nil {
 		return fmt.Errorf("nvidia-ctk cdi generate: %w", err)
 	}
 
 	return nil
+}
+
+// NVIDIAHostCDICommands are the commands that prepare the host for GPU
+// workloads once the toolkit is known to be installed, in order: select CDI
+// runtime mode, then generate the CDI spec from the host driver, with the same
+// hook selection as the nspawn flow (create-symlinks and update-ldcache only).
+// SetupNVIDIAOnHost runs them when the agent starts the stack; the none
+// containerd unit runs them before every start of its own, so a host reboot
+// after a driver change does not start GPU containers on a stale spec.
+func NVIDIAHostCDICommands(toolkit goalstates.NvidiaToolkit) [][]string {
+	return [][]string{
+		{
+			toolkit.CTK(), "config",
+			"--set", "nvidia-container-runtime.mode=cdi",
+			"--in-place",
+		},
+		{
+			toolkit.CTK(), "cdi", "generate",
+			"--driver-root", "/",
+			"--dev-root", "/",
+			"--output", goalstates.CDISpecFile,
+			"--disable-hook", "all",
+			"--enable-hook", "create-symlinks",
+			"--enable-hook", "update-ldcache",
+		},
+	}
 }
