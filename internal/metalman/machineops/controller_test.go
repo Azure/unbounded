@@ -104,7 +104,7 @@ func TestReconcilerDoesNotCompletePowerOnForTransientState(t *testing.T) {
 	require.Equal(t, v1alpha3.OperationPhaseInProgress, updated.Status.Phase)
 	require.Equal(t, v1alpha3.OperationPhaseInProgress, updated.Status.Targets[0].Phase)
 	require.Equal(t, "waiting for power on", updated.Status.Targets[0].Message)
-	require.Equal(t, []string{"machine-1:DisableBootOverride"}, power.calls)
+	require.Empty(t, power.calls)
 }
 
 func TestReconcilerWaitsForRedfishReadiness(t *testing.T) {
@@ -121,7 +121,7 @@ func TestReconcilerWaitsForRedfishReadiness(t *testing.T) {
 		{"poweron boot", v1alpha3.OperationHostPowerOn, "disable", redfish.PowerOff, ""},
 		{"poweron state", v1alpha3.OperationHostPowerOn, "state", redfish.PowerOff, ""},
 		{"poweron reset", v1alpha3.OperationHostPowerOn, "On", redfish.PowerOff, ""},
-		{"reboot boot", v1alpha3.OperationHostHardReboot, "disable", redfish.PowerOn, ""},
+		{"reboot boot", v1alpha3.OperationHostHardReboot, "disable", redfish.PowerOff, v1alpha3.OperationStagePoweringOn},
 		{"reboot state", v1alpha3.OperationHostHardReboot, "state", redfish.PowerOn, ""},
 		{"reboot off", v1alpha3.OperationHostHardReboot, "ForceOff", redfish.PowerOn, ""},
 		{"reboot on", v1alpha3.OperationHostHardReboot, "On", redfish.PowerOff, v1alpha3.OperationStagePoweringOn},
@@ -302,6 +302,16 @@ func TestReconcilerOrdinaryRedfishErrorsStillRetryAndFail(t *testing.T) {
 				method = "boot"
 			}
 
+			if kind == v1alpha3.OperationHostHardReboot {
+				// The boot override is cleared right before power on, after the
+				// host has been observed off.
+				op.Status.Targets = []v1alpha3.MachineOperationTargetStatus{{
+					MachineRef: machine.Name,
+					Phase:      v1alpha3.OperationPhaseInProgress,
+					Stage:      v1alpha3.OperationStagePoweringOn,
+				}}
+			}
+
 			c := fake.NewClientBuilder().WithScheme(testScheme(t)).WithObjects(machine, op).WithStatusSubresource(op).Build()
 			power := &recordingPowerClient{
 				states:       map[string]redfish.PowerState{machine.Name: redfish.PowerOff},
@@ -357,7 +367,7 @@ func TestReconcilerDoesNotCompleteRebootPowerOnForTransientState(t *testing.T) {
 	require.Equal(t, v1alpha3.OperationPhaseInProgress, updated.Status.Phase)
 	require.Equal(t, v1alpha3.OperationPhaseInProgress, updated.Status.Targets[0].Phase)
 	require.Equal(t, "waiting for power on", updated.Status.Targets[0].Message)
-	require.Equal(t, []string{"machine-1:DisableBootOverride"}, power.calls)
+	require.Empty(t, power.calls)
 }
 
 func TestReconcilerRecordsBootDisableFallbackOnOperationTarget(t *testing.T) {
@@ -1968,4 +1978,101 @@ func targetNames(targets []v1alpha3.MachineOperationTargetStatus) []string {
 	}
 
 	return names
+}
+
+func TestReconcilerRebootClearsBootOverrideOnlyWhileOff(t *testing.T) {
+	t.Parallel()
+
+	machine := testBareMetalMachine("machine-1", "rack-a")
+	op := testOperation("op-reboot-order", v1alpha3.OperationHostHardReboot)
+	op.Spec.MachineRef = machine.Name
+
+	c := fake.NewClientBuilder().WithScheme(testScheme(t)).WithObjects(machine, op).WithStatusSubresource(op).Build()
+	power := &recordingPowerClient{states: map[string]redfish.PowerState{machine.Name: redfish.PowerOn}}
+	r := testReconciler(c, power, "rack-a")
+	req := ctrl.Request{NamespacedName: types.NamespacedName{Name: op.Name}}
+
+	for range 4 {
+		_, err := r.Reconcile(t.Context(), req)
+		require.NoError(t, err)
+	}
+
+	var updated v1alpha3.MachineOperation
+	require.NoError(t, c.Get(t.Context(), client.ObjectKeyFromObject(op), &updated))
+	require.Equal(t, v1alpha3.OperationPhaseComplete, updated.Status.Phase)
+	require.Equal(t, []string{"machine-1:ForceOff", "machine-1:DisableBootOverride", "machine-1:On"}, power.calls)
+}
+
+func TestReconcilerDoesNotChangeBootOverrideWhileHostBoots(t *testing.T) {
+	t.Parallel()
+
+	// Some BMCs, such as HPE iLO, reject boot override changes while the host
+	// is in POST. Waiting for the host to come up must not touch the override.
+	postErr := errors.New(`Redfish PATCH /redfish/v1/Systems/1 returned HTTP 400: {"MessageId":"iLO.2.32.UnableToModifyDuringSystemPOST"}`)
+
+	for _, tc := range []struct {
+		kind  v1alpha3.OperationKind
+		state redfish.PowerState
+		phase v1alpha3.OperationPhase
+	}{
+		{v1alpha3.OperationHostHardReboot, redfish.PowerOn, v1alpha3.OperationPhaseComplete},
+		{v1alpha3.OperationHostHardReboot, redfish.PowerState("PoweringOn"), v1alpha3.OperationPhaseInProgress},
+		{v1alpha3.OperationHostPowerOn, redfish.PowerOn, v1alpha3.OperationPhaseComplete},
+		{v1alpha3.OperationHostPowerOn, redfish.PowerState("PoweringOn"), v1alpha3.OperationPhaseInProgress},
+	} {
+		t.Run(string(tc.kind)+"/"+string(tc.state), func(t *testing.T) {
+			t.Parallel()
+
+			machine := testBareMetalMachine("machine-1", "rack-a")
+			op := testOperation("op-post", tc.kind)
+			op.Spec.MachineRef = machine.Name
+			op.Status.Targets = []v1alpha3.MachineOperationTargetStatus{{
+				MachineRef:    machine.Name,
+				Phase:         v1alpha3.OperationPhaseInProgress,
+				Stage:         v1alpha3.OperationStageWaitingOn,
+				Attempts:      2,
+				LastAttemptAt: ptrTo(metav1.NewTime(fixedNow().Add(-30 * time.Second))),
+				StartedAt:     ptrTo(fixedNow()),
+			}}
+
+			c := fake.NewClientBuilder().WithScheme(testScheme(t)).WithObjects(machine, op).WithStatusSubresource(op).Build()
+			power := &recordingPowerClient{
+				states:       map[string]redfish.PowerState{machine.Name: tc.state},
+				methodErrors: map[string]error{"disable": postErr},
+			}
+			r := testReconciler(c, power, "rack-a")
+
+			_, err := r.Reconcile(t.Context(), ctrl.Request{NamespacedName: types.NamespacedName{Name: op.Name}})
+			require.NoError(t, err)
+
+			var updated v1alpha3.MachineOperation
+			require.NoError(t, c.Get(t.Context(), client.ObjectKeyFromObject(op), &updated))
+			require.Equal(t, tc.phase, updated.Status.Phase)
+			require.Equal(t, int32(2), updated.Status.Targets[0].Attempts)
+			require.Empty(t, power.calls)
+		})
+	}
+}
+
+func TestReconcilerPowerOnClearsBootOverrideBeforeOn(t *testing.T) {
+	t.Parallel()
+
+	machine := testBareMetalMachine("machine-1", "rack-a")
+	op := testOperation("op-poweron-order", v1alpha3.OperationHostPowerOn)
+	op.Spec.MachineRef = machine.Name
+
+	c := fake.NewClientBuilder().WithScheme(testScheme(t)).WithObjects(machine, op).WithStatusSubresource(op).Build()
+	power := &recordingPowerClient{states: map[string]redfish.PowerState{machine.Name: redfish.PowerOff}}
+	r := testReconciler(c, power, "rack-a")
+	req := ctrl.Request{NamespacedName: types.NamespacedName{Name: op.Name}}
+
+	for range 2 {
+		_, err := r.Reconcile(t.Context(), req)
+		require.NoError(t, err)
+	}
+
+	var updated v1alpha3.MachineOperation
+	require.NoError(t, c.Get(t.Context(), client.ObjectKeyFromObject(op), &updated))
+	require.Equal(t, v1alpha3.OperationPhaseComplete, updated.Status.Phase)
+	require.Equal(t, []string{"machine-1:DisableBootOverride", "machine-1:On"}, power.calls)
 }

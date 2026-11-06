@@ -12,8 +12,8 @@ name: unbounded agent offline artifacts
 #
 #   ghcr.io/azure/unbounded/bootstrap-artifacts:v0.4.0-k8s-v1.34.2
 #
-# The main release workflow calls this workflow after GoReleaser creates the
-# draft release. Manual dispatch can publish OCI and Actions artifacts without
+# The main release workflow calls this workflow once its `version` job has
+# opened the draft release. Manual dispatch can publish OCI and Actions artifacts without
 # a release, or target an existing release explicitly.
 on:
   workflow_call:

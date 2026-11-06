@@ -127,8 +127,8 @@ Initialize a new Unbounded site. This command:
 > not yet rolled out, `site init` warns and proceeds (the operator reconciles the
 > Site once ready).
 
-Global components (`unbounded-net` and `machina`) are
-enabled on the cluster Site. `metalman` is per-site and is enabled on the remote
+Global components (`unbounded-net` and `machina`) are required and deployed
+whenever at least one Site exists. `metalman` is per-site and is enabled on the remote
 Site when `--enable-metalman` is set.
 
 #### Required Flags
@@ -147,13 +147,17 @@ Site when `--enable-metalman` is set.
 |------|------|---------|-------------|
 | `--kubeconfig` | `string` | `$KUBECONFIG` or default | Path to kubeconfig file |
 | `--manage-cni-plugin` | `bool` | `true` | Whether unbounded-net manages the CNI plugin |
-| `--enable-machina` | `bool` | `true` | Enable machina in `Site.spec.components` |
 | `--enable-metalman` | `bool` | `false` | Enable metalman in `Site.spec.components` |
 
 > **Breaking change:** the `--skip-install` and `--install-timeout` flags have
 > been removed. `site init` no longer installs the operator, so there is nothing
 > to skip or time out. Run `kubectl unbounded install` first. Automation passing
 > `--skip-install` must drop it.
+
+The `--enable-machina` flag has also been removed. Machina is required for
+machine configuration and daemon credentials, not just SSH provisioning.
+The deprecated `Site.spec.components.machina` field is ignored, including
+`enabled: false`; Machina cannot be disabled.
 
 #### Validation
 

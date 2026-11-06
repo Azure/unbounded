@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 // Package machina implements the machina controller cluster component. Machina
-// is a singleton for now: it is deployed whenever any Site enables it and kept
+// is a required singleton: it is deployed whenever any Site exists and kept
 // reconciled when an installation already exists.
 package machina
 
@@ -43,19 +43,10 @@ func (Component) Name() string { return "machina" }
 // ConditionType implements component.ClusterComponent.
 func (Component) ConditionType() string { return "MachinaReady" }
 
-// Reconcile deploys the machina controller singleton whenever any Site enables
-// it and keeps an existing installation reconciled when none do.
+// Plan deploys the machina controller singleton whenever at least one Site
+// exists and keeps an existing installation reconciled with no Sites.
 func (c Component) Plan(ctx context.Context, env *component.Env, sites []unboundedv1alpha3.Site) (*component.Plan, component.Result, error) {
-	enabled := false
-
-	for i := range sites {
-		if EnabledFor(&sites[i]) {
-			enabled = true
-			break
-		}
-	}
-
-	if !enabled {
+	if len(sites) == 0 {
 		// Keep machina installed once the operator has taken ownership. Automatic
 		// singleton removal is surprising and can strand related
 		// controllers/RBAC; a future explicit uninstall flow should handle it.
@@ -65,7 +56,7 @@ func (c Component) Plan(ctx context.Context, env *component.Env, sites []unbound
 		}
 
 		if !retained {
-			return nil, component.Disabled("no site enables machina; retained"), nil
+			return nil, component.NoSites("no sites; machina retained"), nil
 		}
 	}
 
@@ -119,13 +110,10 @@ func (Component) SetupWatches(b *builder.Builder, env *component.Env) {
 		builder.WithPredicates(env.ManagedWorkloadPredicate(env.InNamespaceNamed(controllerName))))
 }
 
-// EnabledFor reports whether a Site enables the machina component.
-func EnabledFor(site *unboundedv1alpha3.Site) bool {
-	if site.Spec.Components.Machina == nil {
-		return false
-	}
-
-	return unboundedv1alpha3.ComponentEnabled(&site.Spec.Components.Machina.SiteComponentSpec)
+// EnabledFor reports whether a Site requires the machina component.
+// Machina is required regardless of the deprecated per-Site setting.
+func EnabledFor(_ *unboundedv1alpha3.Site) bool {
+	return true
 }
 
 func resourcesExist(ctx context.Context, env *component.Env) (bool, error) {

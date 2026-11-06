@@ -373,7 +373,7 @@ This command creates:
 - A **GatewayPool** (`gw-main`) selecting labeled gateway nodes
 - **SiteGatewayPoolAssignments** linking both sites to the gateway pool
 - A **bootstrap token** for the remote site
-- Component settings that enable unbounded-net and the **machina** controller
+- Sites that cause the operator to deploy required unbounded-net and **machina** singletons
 
 ---
 

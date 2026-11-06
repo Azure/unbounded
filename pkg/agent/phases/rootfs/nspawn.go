@@ -11,6 +11,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"text/template"
 
@@ -132,7 +133,10 @@ type nspawnTemplateData struct {
 	ContainerImageArchiveHostDir string
 	HostDevicePaths              []string
 	HostDeviceGroupSpecifiers    []string
-	AdditionalHostMounts         []config.AdditionalHostMount
+	// MountDeviceAllow holds DeviceAllow entries (paths or device groups)
+	// declared by host mounts, such as whole device directories.
+	MountDeviceAllow     []string
+	AdditionalHostMounts []config.AdditionalHostMount
 	// NvidiaDeviceTargets contains render-ready Bind+DeviceAllow pairs.
 	NvidiaDeviceTargets    []NSpawnDeviceTarget
 	NvidiaLibDirMounts     []goalstates.NvidiaLibDirMount
@@ -148,6 +152,20 @@ type nspawnTemplateData struct {
 
 // TODO: migrate AdditionalHostMounts, HostDevicePaths/HostDeviceGroupSpecifiers,
 // and AMDGPUDevicePaths to structured bind/device-allow targets in a follow-up PR.
+
+// mountDeviceAllowEntries returns the de-duplicated, sorted DeviceAllow entries
+// declared by mounts.
+func mountDeviceAllowEntries(mounts []config.AdditionalHostMount) []string {
+	var entries []string
+
+	for _, m := range mounts {
+		entries = append(entries, m.DeviceAllow...)
+	}
+
+	slices.Sort(entries)
+
+	return slices.Compact(entries)
+}
 
 // writeNSpawnConfigs renders the nspawn-related templates with device and GPU
 // data (when present) and writes them to their configured paths.
@@ -165,6 +183,8 @@ func writeNSpawnConfigs(log *slog.Logger, goalState *goalstates.RootFS) error {
 
 	hostDevicePaths := goalState.HostDevices.Paths()
 	hostDeviceGroupSpecifiers := goalState.HostDevices.DeviceGroupSpecifiers()
+	hostMounts := append(slices.Clone(goalState.HostDevices.DeviceDirectories), goalState.AdditionalHostMounts...)
+	mountDeviceAllow := mountDeviceAllowEntries(hostMounts)
 	amdGPUDevicePaths := pathsExcluding(goalState.AMD.GPUDevicePaths, goalState.Nvidia.GPUDevicePaths)
 
 	archiveDir := filepath.Join(goalState.MachineDir, strings.TrimPrefix(goalstates.ContainerImageArchiveDir, "/"))
@@ -179,7 +199,8 @@ func writeNSpawnConfigs(log *slog.Logger, goalState *goalstates.RootFS) error {
 		ContainerImageArchiveHostDir: goalstates.ContainerImageArchiveHostDir,
 		HostDevicePaths:              hostDevicePaths,
 		HostDeviceGroupSpecifiers:    hostDeviceGroupSpecifiers,
-		AdditionalHostMounts:         goalState.AdditionalHostMounts,
+		MountDeviceAllow:             mountDeviceAllow,
+		AdditionalHostMounts:         hostMounts,
 		NvidiaDeviceTargets:          nvidiaNSpawnDeviceTargets(goalState.Nvidia.GPUDevicePaths),
 		NvidiaLibDirMounts:           goalState.Nvidia.LibDirMounts,
 		NvidiaI386LibDirMounts:       goalState.Nvidia.I386LibDirMounts,
@@ -197,13 +218,13 @@ func writeNSpawnConfigs(log *slog.Logger, goalState *goalstates.RootFS) error {
 			"mshv", len(goalState.HostDevices.MSHV),
 			"network", len(goalState.HostDevices.Network),
 			"block", len(goalState.HostDevices.Block),
-			"infiniband", len(goalState.HostDevices.Infiniband),
+			"deviceDirectories", len(goalState.HostDevices.DeviceDirectories),
 			"additional", len(goalState.HostDevices.Additional))
 	}
 
-	if len(goalState.AdditionalHostMounts) > 0 {
+	if len(hostMounts) > 0 {
 		log.Info("additional host mounts configured",
-			"count", len(goalState.AdditionalHostMounts))
+			"count", len(hostMounts))
 	}
 
 	if len(goalState.Nvidia.GPUDevicePaths) > 0 {

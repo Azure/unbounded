@@ -7,6 +7,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -29,13 +30,25 @@ const (
 	// (e.g. sda1, nvme0n1p1), which is why it is preferred over /sys/block.
 	sysClassBlockDir = "/sys/class/block"
 	// infinibandDir holds InfiniBand/RDMA HCA character devices
-	// (e.g. uverbs0, umad0, issm0, rdma_cm).
+	// (e.g. uverbs0, umad0, issm0, rdma_cm). It is bind-mounted as a directory
+	// so devices created later are visible in the machine.
 	infinibandDir = "/dev/infiniband"
 	// rdmaCMMiscDevPath is the kernel-published major:minor for the RDMA-CM
 	// misc device. systemd-nspawn needs the corresponding /dev/infiniband/rdma_cm
 	// node bind-mounted for workloads using RDMA-CM.
 	rdmaCMMiscDevPath = "/sys/class/misc/rdma_cm/dev"
 )
+
+// infinibandDeviceAllow grants cgroup access to every RDMA device class in
+// /dev/infiniband by major: uverbs (infiniband_verbs), umad and issm
+// (infiniband_mad), and ucm (infiniband_cm). rdma_cm is a misc device whose
+// major is shared with unrelated devices, so it is allowed by path only.
+var infinibandDeviceAllow = []string{
+	"char-infiniband_verbs",
+	"char-infiniband_mad",
+	"char-infiniband_cm",
+	infinibandDir + "/rdma_cm",
+}
 
 // excludedBlockDevicePrefixes lists /sys/class/block entry name prefixes that
 // are pseudo or virtual devices rather than real storage and so should not be
@@ -66,9 +79,10 @@ type HostDevices struct {
 	// /sys/class/block (whole disks and partitions, excluding virtual
 	// devices such as loop/ram/zram).
 	Block []string
-	// Infiniband holds InfiniBand/RDMA HCA character device node paths from
-	// /dev/infiniband.
-	Infiniband []string
+	// DeviceDirectories holds whole-directory device mounts (for example
+	// /dev/infiniband) that are bind-mounted as directories, with cgroup
+	// device permissions covering nodes created after the machine starts.
+	DeviceDirectories []config.AdditionalHostMount
 	// Additional holds extra host device node paths and systemd device group
 	// specifiers requested by config.
 	Additional []string
@@ -82,7 +96,7 @@ func (d HostDevices) Paths() []string {
 
 	var paths []string
 
-	for _, group := range [][]string{d.KVM, d.MSHV, d.Network, d.Block, d.Infiniband, d.Additional} {
+	for _, group := range [][]string{d.KVM, d.MSHV, d.Network, d.Block, d.Additional} {
 		for _, p := range group {
 			if config.IsSystemdDeviceGroupSpecifier(p) {
 				continue
@@ -169,7 +183,7 @@ func discoverHostDevices(probe hostDeviceProbe, additional []string) HostDevices
 	devices.MSHV = discoverExistingDevicePaths(probe.mshv)
 	devices.Network = discoverExistingDevicePaths(probe.tun, probe.vhostNet)
 	devices.Block = discoverBlockDevicePaths(probe.sysClassBlockDir, probe.devDir)
-	devices.Infiniband = discoverInfinibandDevicePaths(probe.infinibandDir, probe.rdmaCMMiscDev, probe.loadRDMACM)
+	devices.DeviceDirectories = discoverInfinibandDeviceDirectories(probe.infinibandDir, probe.rdmaCMMiscDev, probe.loadRDMACM)
 	devices.Additional = additional
 
 	return devices
@@ -258,33 +272,26 @@ func isExcludedBlockDevice(name string) bool {
 	return false
 }
 
-// discoverInfinibandDevicePaths enumerates InfiniBand/RDMA HCA character
-// devices under infinibandDir and returns their device node paths in sorted
-// order. Returns nil (not an error) when the directory is absent, which is the
-// common case on hosts without RDMA hardware.
-func discoverInfinibandDevicePaths(infinibandDir, rdmaCMMiscDevPath string, loadRDMACM bool) []string {
+// discoverInfinibandDeviceDirectories returns a mount of infinibandDir when
+// the directory exists after RDMA-CM setup, including when it is empty, so
+// devices created later appear in the machine. When the directory is absent
+// (no RDMA hardware or drivers) nothing is mounted, because nspawn fails to
+// start when a bind source is missing.
+func discoverInfinibandDeviceDirectories(infinibandDir, rdmaCMMiscDevPath string, loadRDMACM bool) []config.AdditionalHostMount {
 	if loadRDMACM {
 		ensureRDMACMDevice(infinibandDir, rdmaCMMiscDevPath)
 	}
 
-	entries, err := os.ReadDir(infinibandDir)
-	if err != nil {
+	info, err := os.Stat(infinibandDir)
+	if err != nil || !info.IsDir() {
 		return nil
 	}
 
-	var paths []string
-
-	for _, e := range entries {
-		if e.IsDir() {
-			continue
-		}
-
-		paths = append(paths, filepath.Join(infinibandDir, e.Name()))
-	}
-
-	sort.Strings(paths)
-
-	return paths
+	return []config.AdditionalHostMount{{
+		Source:      infinibandDir,
+		Target:      infinibandDir,
+		DeviceAllow: slices.Clone(infinibandDeviceAllow),
+	}}
 }
 
 func ensureRDMACMDevice(infinibandDir, miscDevPath string) string {

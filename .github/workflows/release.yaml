@@ -19,7 +19,8 @@ name: unbounded release
 #   version
 #     -> changelog
 #     -> frontend
-#     -> binaries          (GoReleaser; creates draft GitHub release)
+#     -> binaries          (GoReleaser; adopts the draft GitHub release)
+#     -> agent-offline-artifacts (bootstrap bundles + rootfs OCI layout archives)
 #     -> net-images        (matrix: amd64-native, arm64-native)
 #         -> net-images-manifest (multi-arch tag stitch + sign + SBOM attest)
 #     -> netboot-image     (PXE boot artifact images)
@@ -32,7 +33,7 @@ name: unbounded release
 #                           host-azurelinux3-mshv,
 #                           inventory-aggregator, inventory-inspector,
 #                           inventory-viewer)
-#         -> gantry-chart  (OCI chart + signed downloadable archive)
+#     -> gantry-chart      (OCI chart + signed downloadable archive)
 #     -> manifests-tarball (make release-manifests + cosign sign)
 #     -> python-packages   (racer-client and racer-vllm sdists and wheels)
 #     -> finalize          (attach extras + krew manifest)
@@ -323,11 +324,12 @@ jobs:
           retention-days: 7
 
   # ---------------------------------------------------------------------------
-  # Publish offline bootstrap bundles and rootfs OCI layout archives after
-  # GoReleaser has created the draft GitHub release.
+  # Publish offline bootstrap bundles and rootfs OCI layout archives. This
+  # builds its own tooling and consumes no GoReleaser output; the draft release
+  # it uploads to is opened by `version`, so it runs alongside `binaries`.
   # ---------------------------------------------------------------------------
   agent-offline-artifacts:
-    needs: [version, binaries]
+    needs: [version]
     uses: ./.github/workflows/agent-artifacts.yaml
     with:
       tag: ${{ needs.version.outputs.tag }}
@@ -805,10 +807,12 @@ jobs:
   # ---------------------------------------------------------------------------
   # Package the same Gantry chart revision used to render the operator's
   # embedded manifests, publish it as an OCI artifact, and attach a signed
-  # chart archive for users that require an offline install path.
+  # chart archive for users that require an offline install path. Packaging
+  # only reads the chart sources in the tree, so this does not wait for the
+  # component images; finalize still gates the release on both.
   # ---------------------------------------------------------------------------
   gantry-chart:
-    needs: [version, component-images]
+    needs: [version]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1

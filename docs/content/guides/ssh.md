@@ -37,7 +37,7 @@ command handles:
 - Creating site resources for both the cluster and the new site
 - Recording requested components in `Site.spec.components`
 - Creating a **bootstrap token** Secret in `kube-system` (labeled `unbounded-cloud.io/site=<name>`)
-- Letting the operator deploy unbounded-net, machina, and optional components
+- Letting the operator deploy required unbounded-net and machina singletons, plus optional components
 
 ```bash
 kubectl unbounded site init \
@@ -54,7 +54,6 @@ All five flags above are required. Optional flags:
 |---|---|
 | `--kubeconfig` | Path to kubeconfig file |
 | `--manage-cni-plugin` | Set to `false` when the cluster already has a CNI (default: `true`) |
-| `--enable-machina` | Enable machina on the cluster Site (default: `true`) |
 | `--enable-metalman` | Enable the metalman component in the Site spec |
 
 ## Creating Machines

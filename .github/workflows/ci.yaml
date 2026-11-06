@@ -221,6 +221,42 @@ jobs:
           timeout --signal=TERM --kill-after=10s 600s cargo +1.96.0 clippy --locked --manifest-path cmd/racer/Cargo.toml -p page-alloc --all-targets --no-default-features -- -D warnings
           timeout --signal=TERM --kill-after=10s 600s cargo +1.96.0 clippy --locked --manifest-path cmd/racer/Cargo.toml -p page-alloc --all-targets --no-default-features --features simulation -- -D warnings
 
+  # ---------- racer-object Rust sidecar ----------
+  # Standalone crate (not a member of the cmd/racer workspace) with its own
+  # lock file, so it gets its own target directory and cache key.
+  racer-object-rust:
+    name: racer-object Rust
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    env:
+      CARGO_TARGET_DIR: ${{ github.workspace }}/bin/racer-object-cargo
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Set up pinned Rust
+        run: timeout --signal=TERM --kill-after=10s 300s rustup toolchain install 1.96.0 --profile minimal --component rustfmt,clippy
+
+      - name: Cache Cargo dependencies and artifacts
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            bin/racer-object-cargo
+          key: racer-object-${{ runner.os }}-${{ runner.arch }}-1.96.0-${{ hashFiles('cmd/racer-object/Cargo.lock', 'cmd/racer-object/Cargo.toml') }}-${{ github.sha }}
+          restore-keys: |
+            racer-object-${{ runner.os }}-${{ runner.arch }}-1.96.0-${{ hashFiles('cmd/racer-object/Cargo.lock', 'cmd/racer-object/Cargo.toml') }}-
+
+      - name: Check Rust formatting
+        run: timeout --signal=TERM --kill-after=10s 300s cargo +1.96.0 fmt --manifest-path cmd/racer-object/Cargo.toml --all --check
+
+      - name: Clippy
+        run: timeout --signal=TERM --kill-after=10s 600s cargo +1.96.0 clippy --locked --manifest-path cmd/racer-object/Cargo.toml --all-targets -- -D warnings
+
+      - name: Test
+        run: timeout --signal=TERM --kill-after=10s 600s cargo +1.96.0 test --locked --manifest-path cmd/racer-object/Cargo.toml
+
   racer-rust:
     name: Racer Rust Workspace (${{ matrix.suite }})
     # Library real-I/O tests need a VM rather than a seccomp-restricted container.
@@ -841,6 +877,7 @@ jobs:
         run: |
           timeout --signal=TERM --kill-after=10s 300s rustup toolchain install 1.96.0 --profile minimal
           timeout --signal=TERM --kill-after=10s 300s cargo +1.96.0 fetch --locked --manifest-path cmd/racer/Cargo.toml
+          timeout --signal=TERM --kill-after=10s 300s cargo +1.96.0 fetch --locked --manifest-path cmd/racer-object/Cargo.toml
 
       - name: Save Cargo registry
         if: github.event_name == 'push' && steps.cargo-registry.outputs.cache-hit != 'true'
@@ -962,9 +999,11 @@ jobs:
       - name: Smoke-test racer-loadgen entrypoint
         run: timeout --signal=TERM --kill-after=10s 300s docker run --rm --network=none racer-loadgen:ci --help
 
+      # A cold Cargo release build (LTO, one codegen unit) is slow; the gha
+      # cache keeps warm builds short.
       - name: Build racer-object image
         uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7
-        timeout-minutes: 5
+        timeout-minutes: 15
         with:
           context: .
           file: images/racer-object/Containerfile
