@@ -1207,6 +1207,13 @@ fn production_idle_wakes() {
     let scratch = Scratch::new();
     let profile = Profile::new(pairs, 113, 1);
     let control = control::Control::start_with(&scratch.0, profile.caches.clone());
+    // Hold unchanged polls like production (`POLL_WAIT`) unless overridden; the
+    // fixture's short default hold would measure re-poll churn, not idleness.
+    let hold = number(
+        "RACER_IDLE_HOLD_MS",
+        racer_wire::control::POLL_WAIT.as_millis() as u64,
+    );
+    control.hold_ms.store(hold as usize, Ordering::Release);
     let (mut process, _origins) = Process::start_profile(&scratch, &control, 0, Some(&profile));
     let pid = process.child.id();
     // Let startup traffic settle before sampling.
@@ -1234,7 +1241,7 @@ fn production_idle_wakes() {
             )
         })
         .collect();
-    let report = json!({"pairs": pairs, "seconds": elapsed, "pid": pid, "threads": per_thread});
+    let report = json!({"pairs": pairs, "hold_ms": hold, "seconds": elapsed, "pid": pid, "threads": per_thread});
     println!("IDLE_WAKES {report}");
     let mut output = fs::OpenOptions::new()
         .create(true)

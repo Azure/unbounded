@@ -12,6 +12,9 @@ pub struct Control {
     pub enrollments: Arc<AtomicUsize>,
     pub polls: Arc<AtomicUsize>,
     pub blocked: Arc<AtomicBool>,
+    /// How long an unchanged snapshot or keyring poll is held before 204,
+    /// in milliseconds. Production holds `POLL_WAIT`; the default keeps tests fast.
+    pub hold_ms: Arc<AtomicUsize>,
     pub publication: Arc<Mutex<wire::Publication>>,
     stop: Arc<AtomicBool>,
     thread: Option<thread::JoinHandle<()>>,
@@ -130,6 +133,8 @@ impl Control {
         let enrollments = Arc::new(AtomicUsize::new(0));
         let polls = Arc::new(AtomicUsize::new(0));
         let blocked = Arc::new(AtomicBool::new(false));
+        let hold_ms = Arc::new(AtomicUsize::new(0));
+        let holding = hold_ms.clone();
         let (observed, paused) = (polls.clone(), blocked.clone());
         let (stopping, issued) = (stop.clone(), enrollments.clone());
         let ca = Arc::new(ca);
@@ -151,6 +156,7 @@ impl Control {
                 socket
                     .set_write_timeout(Some(Duration::from_secs(2)))
                     .unwrap();
+                let holding = holding.clone();
                 let (tls, published, observed, paused, stopping, issued) = (
                     tls.clone(),
                     published.clone(),
@@ -182,7 +188,7 @@ impl Control {
                     if head.starts_with("GET /v1/keyring?after=1 ") {
                         // Production holds an unchanged poll open. Hold briefly so
                         // idle clients are not measured against a busy loop.
-                        thread::sleep(Duration::from_secs(1));
+                        hold(&holding, &stopping, Duration::from_secs(1));
                         (204, Vec::new())
                     } else {
                         (200, bundle.to_vec())
@@ -248,7 +254,8 @@ impl Control {
                         .unwrap()
                         .contains(&format!("?after={} ", publication.sequence.0))
                     {
-                        thread::sleep(Duration::from_millis(20));
+                        drop(publication);
+                        hold(&holding, &stopping, Duration::from_millis(20));
                         (204, Vec::new())
                     } else {
                         (200, wire::encode_publication(&publication).unwrap())
@@ -282,10 +289,27 @@ impl Control {
             enrollments,
             polls,
             blocked,
+            hold_ms,
             publication,
             stop,
             thread: Some(thread),
         }
+    }
+}
+/// Hold an unchanged long poll for the configured time, or `default` when unset.
+fn hold(hold_ms: &AtomicUsize, stopping: &AtomicBool, default: Duration) {
+    let configured = hold_ms.load(Ordering::Acquire);
+    let until = std::time::Instant::now()
+        + if configured == 0 {
+            default
+        } else {
+            Duration::from_millis(configured as u64)
+        };
+    while std::time::Instant::now() < until && !stopping.load(Ordering::Acquire) {
+        thread::sleep(
+            Duration::from_millis(20)
+                .min(until.saturating_duration_since(std::time::Instant::now())),
+        );
     }
 }
 impl Drop for Control {
