@@ -772,8 +772,8 @@ continue admitting or starting Runs.
 
 The overlay does not create a Run. With `VLLMCanaryEnabled=false`, it requires
 no vLLM image, Test identity, Profile UID, cache, WorkflowTemplate, Profile, or
-Policy requirement. This baseline-only mode can deploy while vLLM remains
-deferred.
+Policy requirement, and renders no vLLM service accounts or RBAC. This
+baseline-only mode can deploy while vLLM remains deferred.
 
 When vLLM is explicitly enabled, start the canonical baseline and vLLM canary
 separately, only after the prior Run is terminal, cleaned up, and released:

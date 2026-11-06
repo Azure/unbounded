@@ -87,14 +87,6 @@ func TestRenderedExecutionProvenanceIsPinnedAndDeterministic(t *testing.T) {
 		}
 	}
 
-	assertContainsAll(
-		t,
-		string(secondWorkflow),
-		"adapter WorkflowTemplate",
-		"--workflow-service-account",
-		"project-signal-vllm-workload",
-	)
-
 	var deployment appsv1.Deployment
 	if err := yaml.Unmarshal(readRenderedFile(t, secondOutput, "06-deployment.yaml"), &deployment); err != nil {
 		t.Fatalf("decode Deployment: %v", err)
@@ -895,22 +887,36 @@ func TestRenderedBaselineOnlyAuthorityOmitsVLLM(t *testing.T) {
 		t.Fatalf("baseline-only authority documents = %d, want 8", len(documents))
 	}
 
-	for _, file := range []string{
-		"07-vllm-model-cache.yaml",
-		"08-vllm-canary-workflowtemplate.yaml",
-		"09-vllm-canary-test.yaml",
-		"10-acceptance-suites.yaml",
-		"11-execution-authority.yaml",
+	entries, err := os.ReadDir(output)
+	if err != nil {
+		t.Fatalf("read baseline-only render directory: %v", err)
+	}
+
+	for _, entry := range entries {
+		if entry.IsDir() {
+			continue
+		}
+
+		content := strings.ToLower(string(readRenderedFile(t, output, entry.Name())))
+		if strings.Contains(content, "project-signal-vllm") {
+			t.Fatalf("baseline-only render %s contains deferred vLLM resource", entry.Name())
+		}
+	}
+
+	rbac := string(readRenderedFile(t, output, "03-adapter-serviceaccount-rbac.yaml"))
+	for _, deferredPermission := range []string{
+		`resources: ["persistentvolumeclaims"]`,
+		`resources: ["volumeattachments"]`,
 	} {
-		content := strings.ToLower(string(readRenderedFile(t, output, file)))
-		if strings.Contains(content, "vllm") {
-			t.Fatalf("baseline-only render %s contains deferred vLLM content", file)
+		if strings.Contains(rbac, deferredPermission) {
+			t.Fatalf("baseline-only RBAC contains deferred vLLM permission %q", deferredPermission)
 		}
 	}
 
 	assertContainsAll(
 		t,
 		authority,
+		"baseline-only authority",
 		"name: canonical-gpu-inventory",
 		"nonPassBehavior: Revoke",
 		"mode: None",
@@ -1210,7 +1216,19 @@ func TestQualificationGateRequiresExplicitGuard(t *testing.T) {
 func TestRenderedRBACCoversQualificationAndEvidence(t *testing.T) {
 	t.Parallel()
 
-	output := renderSignal(t, signalRenderData())
+	data := signalRenderData()
+	enableExecutionAuthorityRender(data)
+
+	output := renderSignal(t, data)
+	workflow := string(readRenderedFile(t, output, "04-adapter-workflowtemplate.yaml"))
+	assertContainsAll(
+		t,
+		workflow,
+		"vLLM-enabled adapter WorkflowTemplate",
+		"--workflow-service-account",
+		"project-signal-vllm-workload",
+	)
+
 	controllerDocuments := splitYAMLDocuments(string(readRenderedFile(t, output, "02-rbac.yaml")))
 
 	assertRule(

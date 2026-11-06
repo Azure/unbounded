@@ -2,6 +2,10 @@
 {{- if not (regexMatch "^[^@[:space:]]+@sha256:[0-9a-f]{64}$" $adapterImage) }}
 {{- fail "AdapterImage must be an immutable sha256 digest reference" }}
 {{- end }}
+{{- $vllmCanaryEnabled := default "false" .VLLMCanaryEnabled }}
+{{- if not (regexMatch "^(true|false)$" $vllmCanaryEnabled) }}
+{{- fail "VLLMCanaryEnabled must be true or false" }}
+{{- end }}
 apiVersion: argoproj.io/v1alpha1
 kind: WorkflowTemplate
 metadata:
@@ -62,8 +66,10 @@ spec:
           - "{{`{{inputs.parameters.phase-index}}`}}"
           - --stage-index
           - "{{`{{inputs.parameters.stage-index}}`}}"
+{{ if eq $vllmCanaryEnabled "true" }}
           - --workflow-service-account
           - project-signal-vllm-workload
+{{ end }}
           - --result-configmap
           - "{{`{{inputs.parameters.result-configmap}}`}}"
         env:
