@@ -1341,7 +1341,7 @@ mod tests {
                 }
                 assert!(matches!(
                     drive(&reactor, work.as_mut()),
-                    Err(Error::Cancelled)
+                    Err(Error::Canceled)
                 ));
                 assert!(start.elapsed() < Duration::from_secs(2));
                 assert!(
@@ -1350,7 +1350,7 @@ mod tests {
                 );
                 assert_eq!(reactor.in_flight(), 0, "both IO and watch must be fenced");
                 assert_eq!(admission.used(ResourceClass::Relay), 0);
-                assert_eq!(parent.cancellation.is_cancelled(), cancel_parent);
+                assert_eq!(parent.cancellation.is_canceled(), cancel_parent);
                 drop(work);
                 downstream
                     .set_read_timeout(Some(Duration::from_secs(1)))
@@ -1534,7 +1534,7 @@ mod tests {
                     send_completion.send(()).unwrap();
                     assert!(matches!(
                         poll(work.as_mut()),
-                        Poll::Ready(Err(Error::Cancelled))
+                        Poll::Ready(Err(Error::Canceled))
                     ));
                 }
                 drop(work);
@@ -1623,7 +1623,7 @@ mod tests {
                 } else if end == "cancel" {
                     assert!(matches!(
                         poll(work.as_mut()),
-                        Poll::Ready(Err(Error::Cancelled))
+                        Poll::Ready(Err(Error::Canceled))
                     ));
                 }
                 drop(work);
@@ -1664,8 +1664,8 @@ mod tests {
         assert_eq!(clock.check_deadline(next.deadline), Ok(()));
         assert_eq!(clock.check_deadline(listener.deadline), Ok(()));
         listener.cancel().unwrap();
-        assert_eq!(first.check(), Err(Error::Cancelled));
-        assert_eq!(next.check(), Err(Error::Cancelled));
+        assert_eq!(first.check(), Err(Error::Canceled));
+        assert_eq!(next.check(), Err(Error::Canceled));
     }
 
     #[test]
@@ -1941,7 +1941,7 @@ mod tests {
                     let expected = if matches!(end, "expiry" | "handshake-cap") {
                         Error::DeadlineExceeded
                     } else {
-                        Error::Cancelled
+                        Error::Canceled
                     };
                     assert!(
                         matches!(result, Err(error) if error == expected),

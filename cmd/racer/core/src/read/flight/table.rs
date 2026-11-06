@@ -781,7 +781,7 @@ impl<
         if let Some(entry) = self.entries.get_mut(key)
             && entry.state.validate_leader(id, true).is_ok()
         {
-            entry.state.revoke(Error::Cancelled.into(), wakes);
+            entry.state.revoke(Error::Canceled.into(), wakes);
             let idle = entry.idle();
             settle(&mut entry.state, idle, split, wakes);
         }
@@ -789,7 +789,7 @@ impl<
 
     /// Cancel waiter `id`.
     pub fn cancel(&mut self, key: &K, id: u64, wakes: &mut Vec<T>) {
-        self.cancel_with(key, id, Error::Cancelled.into(), wakes);
+        self.cancel_with(key, id, Error::Canceled.into(), wakes);
     }
 
     /// Fail waiter `id` with `error` (its request scope ended).
@@ -834,7 +834,7 @@ impl<
         self.stopping = true;
         let split = self.split;
         for entry in self.entries.values_mut() {
-            entry.state.stop(Error::Cancelled.into(), wakes);
+            entry.state.stop(Error::Canceled.into(), wakes);
             let idle = entry.idle();
             settle(&mut entry.state, idle, split, wakes);
         }
@@ -953,7 +953,7 @@ impl<K: Eq + Hash + Clone, C: Clone, P: Clone, O, R, S: BuildHasher, T: Clone + 
     }
 
     /// Poll waiter `id` at `now` with its remaining `attempts`; parks `token` when nothing is
-    /// ready. A canceled waiter fails `Cancelled`; one past its deadline fails `DeadlineExceeded`.
+    /// ready. A canceled waiter fails `Canceled`; one past its deadline fails `DeadlineExceeded`.
     pub fn poll(
         &mut self,
         key: &K,
@@ -968,8 +968,8 @@ impl<K: Eq + Hash + Clone, C: Clone, P: Clone, O, R, S: BuildHasher, T: Clone + 
         let entry = self.entries.get_mut(key).ok_or(Error::Internal)?;
         let waiter = entry.state.waiters.get(&id).ok_or(Error::Internal)?;
         let (deadline, copy) = (waiter.deadline, !waiter.acquisition());
-        if waiter.error == Some(Error::Cancelled) {
-            return Ok(Wait::Failed(Error::Cancelled));
+        if waiter.error == Some(Error::Canceled) {
+            return Ok(Wait::Failed(Error::Canceled));
         }
         if now >= deadline {
             entry.state.cancel(id, Error::DeadlineExceeded);

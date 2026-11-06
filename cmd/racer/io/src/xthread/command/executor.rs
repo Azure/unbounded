@@ -105,7 +105,7 @@ impl<V: 'static, B: 'static, S: ExecutionScope> Executor<V, B, S> {
                             ..
                         } = command;
                         let value = if reply.is_abandoned() {
-                            Err(Error::Cancelled.into())
+                            Err(Error::Canceled.into())
                         } else {
                             handler.execute(work, &scope, budget.as_mut()).await
                         };
@@ -169,7 +169,7 @@ impl<V: 'static, B: 'static, S: ExecutionScope> Executor<V, B, S> {
         for active in &self.active {
             let _ = active.scope.cancel();
         }
-        Self::reject_queued(mailbox, Error::Cancelled.into());
+        Self::reject_queued(mailbox, Error::Canceled.into());
     }
 
     /// Fence unstarted work by non-submission, returning the exact retained budget.
@@ -230,8 +230,8 @@ mod tests {
 
         /// Reject cancellation without manufacturing a completion fence.
         fn check(&self) -> Result<()> {
-            if self.0.is_cancelled() {
-                Err(Error::Cancelled)
+            if self.0.is_canceled() {
+                Err(Error::Canceled)
             } else {
                 Ok(())
             }
@@ -330,7 +330,7 @@ mod tests {
             let Poll::Ready(Ok(completion)) = receipt.poll_completion(&mut cx) else {
                 panic!("missing queued fence");
             };
-            assert_eq!(completion.value, Err(Error::Cancelled));
+            assert_eq!(completion.value, Err(Error::Canceled));
             assert_eq!(completion.budget, Some(10));
             drop(receipt);
             assert_eq!(
@@ -397,7 +397,7 @@ mod tests {
                     .complete(
                         command.generation,
                         Completion {
-                            value: Err(Error::Cancelled),
+                            value: Err(Error::Canceled),
                             budget: None,
                         },
                     )
@@ -417,7 +417,7 @@ mod tests {
                 .poll_drain(&mailbox, &shutdown, &mut cx, Rc::new(Unused))
                 .is_pending()
         );
-        assert_eq!(active_scope.check(), Err(Error::Cancelled));
+        assert_eq!(active_scope.check(), Err(Error::Canceled));
         assert!(receipt.poll_completion(&mut cx).is_pending());
         drop(receipt);
         assert_eq!(mailbox.outstanding(), 1);

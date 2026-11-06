@@ -86,7 +86,7 @@ fn start_with(
     config.reserve_control_thread()?;
     let bootstrapped = loop {
         if stop() {
-            return Err(Error::Cancelled);
+            return Err(Error::Canceled);
         }
         let started = std::time::Instant::now();
         // One logical attempt waits up to BOOTSTRAP_WAIT in short slices so a stop
@@ -96,7 +96,7 @@ fn start_with(
             match control.bootstrap(slice) {
                 Err(BootstrapError::Pending) if started.elapsed() < BOOTSTRAP_WAIT => {
                     if stop() {
-                        return Err(Error::Cancelled);
+                        return Err(Error::Canceled);
                     }
                 }
                 Err(BootstrapError::Pending) => break Err(BootstrapError::Retry),
@@ -113,7 +113,7 @@ fn start_with(
                         break;
                     }
                     if stop() {
-                        return Err(Error::Cancelled);
+                        return Err(Error::Canceled);
                     }
                     std::thread::sleep(left.min(BOOTSTRAP_POLL));
                 }
@@ -492,7 +492,7 @@ mod tests {
         let never = std::sync::Arc::new(Scripted::new(vec![]));
         assert_eq!(
             start(&mut config, never.clone(), &|| true),
-            Err(Error::Cancelled)
+            Err(Error::Canceled)
         );
         let mut config = managed_config(&d.0);
         config.max_threads = 2;

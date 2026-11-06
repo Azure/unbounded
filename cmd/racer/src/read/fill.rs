@@ -245,7 +245,7 @@ impl Fill {
         };
         let cancellation = scope.cancellation.subscribe()?;
         // A joined job runs under the scope of the caller that started it. If
-        // that inherited scope expires or is cancelled while this caller's own
+        // that inherited scope expires or is canceled while this caller's own
         // scope is still valid, retry under this caller's own scope. A job this
         // caller started shares its deadline, so its failure is final. The
         // bound stops a stream of short-lived starters from looping forever.
@@ -338,7 +338,7 @@ impl Fill {
             })
             .await;
             match result {
-                Err(Error::DeadlineExceeded | Error::Cancelled) if !started && joins_left > 0 => {
+                Err(Error::DeadlineExceeded | Error::Canceled) if !started && joins_left > 0 => {
                     scope.check()?;
                     joins_left -= 1;
                 }
@@ -1102,7 +1102,7 @@ impl Fill {
                             super::gpu_copies::SharedCopy::from_sealed(sealed)
                                 .map_or(Outcome::Nothing, Outcome::Copy)
                         }
-                        Err(Error::Cancelled | Error::DeadlineExceeded) => Outcome::Abandoned,
+                        Err(Error::Canceled | Error::DeadlineExceeded) => Outcome::Abandoned,
                         _ => Outcome::Nothing,
                     });
                     return result;
@@ -1171,7 +1171,7 @@ impl Fill {
             match self.stage_from_disk(page, scope, target).await {
                 Ok(Some(sealed)) => return Ok(Some(super::sealed::Fetched::Sealed(sealed))),
                 Ok(None) => {}
-                Err(error @ (Error::Cancelled | Error::DeadlineExceeded)) => return Err(error),
+                Err(error @ (Error::Canceled | Error::DeadlineExceeded)) => return Err(error),
                 // Any other failure reads the page through host memory.
                 Err(_) => {}
             }
@@ -1185,7 +1185,7 @@ impl Fill {
             .await
         {
             Ok(fetched) => Ok(fetched),
-            Err(error @ (Error::Cancelled | Error::DeadlineExceeded)) => Err(error),
+            Err(error @ (Error::Canceled | Error::DeadlineExceeded)) => Err(error),
             // Any other failure takes the usual path through host memory.
             Err(_) => Ok(None),
         }
@@ -1258,7 +1258,7 @@ impl Fill {
                 .await
             {
                 Ok(delivered) => delivered,
-                Err(error @ (Error::Cancelled | Error::DeadlineExceeded)) => return Err(error),
+                Err(error @ (Error::Canceled | Error::DeadlineExceeded)) => return Err(error),
                 // A failed provider: ask the next one.
                 Err(_) => continue,
             };
@@ -1395,7 +1395,7 @@ impl Fill {
         drop(lease);
         let staged = match staged {
             Ok(staged) => staged,
-            Err(error @ (Error::Cancelled | Error::DeadlineExceeded)) => return Err(error),
+            Err(error @ (Error::Canceled | Error::DeadlineExceeded)) => return Err(error),
             Err(_) => return Ok(None),
         };
         let sealed = Box::new(super::sealed::SealedPage {
@@ -1795,10 +1795,10 @@ impl Fill {
                 }
             });
             let result = std::future::poll_fn(|cx| {
-                if !caller_scope.cancellation.is_cancelled() {
+                if !caller_scope.cancellation.is_canceled() {
                     caller_cancellation.register(cx.waker());
                 }
-                if !owned_scope.cancellation.is_cancelled()
+                if !owned_scope.cancellation.is_canceled()
                     && ((!handover && caller_scope.check().is_err())
                         || operation.poll_cancellation(cx))
                 {
@@ -1854,7 +1854,7 @@ impl Fill {
         }));
         let remaining = std::future::poll_fn(|cx| {
             self.dependencies.candidates.drivers().poll(cx, 64);
-            if !self.fence_acquisition || !acquisition.scope.cancellation.is_cancelled() {
+            if !self.fence_acquisition || !acquisition.scope.cancellation.is_canceled() {
                 acquisition.cancellation.register(cx.waker());
             }
             if !self.fence_acquisition {
@@ -3268,7 +3268,7 @@ mod tests {
                 &[42]
             );
             for error in [
-                Error::Cancelled,
+                Error::Canceled,
                 Error::MissingKey,
                 Error::Overloaded,
                 Error::Io,

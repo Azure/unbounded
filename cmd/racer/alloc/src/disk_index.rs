@@ -660,7 +660,7 @@ impl DiskIndex {
 
     /// Stop serving `key` and remove up to `budget` of its entries. Returns
     /// `true` once the cache is gone and its index can be reused; in-flight
-    /// publications must be published (rejected) or cancelled first.
+    /// publications must be published (rejected) or canceled first.
     pub fn remove_cache(
         &mut self,
         key: CacheKey,

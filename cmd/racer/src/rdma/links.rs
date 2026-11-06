@@ -457,7 +457,7 @@ impl Links {
             }
             match &result {
                 Ok(rails) => self.node.settle(rails.clone()),
-                Err(Error::Cancelled | Error::DeadlineExceeded) => {}
+                Err(Error::Canceled | Error::DeadlineExceeded) => {}
                 Err(_) => self.node.settle(Vec::new()),
             }
             result
@@ -977,7 +977,7 @@ impl Links {
             // consumed the tag. Release is idempotent per epoch: it frees a
             // grant the write never used and completes at once for a tag
             // already written, so the link survives either way.
-            if matches!(error, Error::Cancelled | Error::DeadlineExceeded) {
+            if matches!(error, Error::Canceled | Error::DeadlineExceeded) {
                 self.release_epoch(key, epoch, grant.tag);
             }
             return Err(error);
@@ -1116,7 +1116,7 @@ impl PendingReceive {
         let page = match arrival {
             Ok(Arrival::Device(page)) => page,
             Ok(Arrival::Released | Arrival::Page(_)) => return Err(Error::Io),
-            Err(error @ Error::Cancelled) => return Err(error),
+            Err(error @ Error::Canceled) => return Err(error),
             Err(_) => {
                 scope.check()?;
                 return Err(Error::Io);
@@ -1186,7 +1186,7 @@ impl PendingReceive {
             Ok(Arrival::Page(page)) => page,
             // A landing grant finishes with `finish_landed`.
             Ok(Arrival::Released | Arrival::Device(_)) => return Err(Error::Io),
-            Err(error @ Error::Cancelled) => return Err(error),
+            Err(error @ Error::Canceled) => return Err(error),
             Err(_) => {
                 scope.check()?;
                 return Err(Error::Io);

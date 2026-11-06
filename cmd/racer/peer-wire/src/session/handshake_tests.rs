@@ -31,8 +31,8 @@ impl Scope for TestScope {
     type Error = Error;
 
     fn check(&self) -> Result<()> {
-        if self.cancellation.is_cancelled() {
-            return Err(racer_io::Error::Cancelled.into());
+        if self.cancellation.is_canceled() {
+            return Err(racer_io::Error::Canceled.into());
         }
         if self.clock.now() >= self.deadline {
             return Err(Error::DeadlineExceeded);
@@ -645,7 +645,7 @@ fn cancellation_and_deadlines_abort_each_handshake_wait_and_release_slots() {
                     }
                     let expected = if stop == "cancel" {
                         scope.cancellation.cancel().unwrap();
-                        Error::Runtime(racer_io::Error::Cancelled)
+                        Error::Runtime(racer_io::Error::Canceled)
                     } else {
                         let seconds = if stop == "parent-deadline" { 2 } else { 5 };
                         let remaining = Duration::from_secs(seconds - u64::from(second_round));
@@ -714,7 +714,7 @@ fn pooled_sessions_reject_wrong_peer_expiry_and_canceled_parent_without_io() {
                 };
                 let expected = match fault {
                     "peer" => Error::Unauthorized,
-                    "cancel" => Error::Runtime(racer_io::Error::Cancelled),
+                    "cancel" => Error::Runtime(racer_io::Error::Canceled),
                     _ => Error::DeadlineExceeded,
                 };
                 assert!(

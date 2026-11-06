@@ -48,7 +48,7 @@ const ATTEMPT_FLOOR: Duration = Duration::from_millis(250);
 /// past the request deadline), so an address that blackholes the TCP connect
 /// or stalls the TLS handshake cannot consume the whole request before the
 /// next resolved address is tried. The narrowed clone shares the request's
-/// cancellation, so cancelling the request still releases every attempt.
+/// cancellation, so canceling the request still releases every attempt.
 fn attempt_scope(scope: &RequestScope, remaining: usize) -> RequestScope {
     if remaining <= 1 {
         return scope.clone();

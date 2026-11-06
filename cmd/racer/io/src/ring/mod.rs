@@ -977,7 +977,7 @@ impl Reactor {
         }
         slot.abandoned = true;
         slot.waker = None;
-        Self::cancel_locked(&mut state, id, Error::Cancelled);
+        Self::cancel_locked(&mut state, id, Error::Canceled);
     }
 
     /// Process expired deadlines and timers, then up to `budget` CQEs, then
@@ -1008,7 +1008,7 @@ impl Reactor {
         }
         let backlog = std::mem::take(&mut state.cancel_backlog);
         for id in backlog {
-            Self::cancel_locked(&mut state, id, Error::Cancelled);
+            Self::cancel_locked(&mut state, id, Error::Canceled);
         }
         if let Backend::Sim(driver) = &mut state.backend {
             driver.run_turn(now);
@@ -1272,7 +1272,7 @@ impl Reactor {
         state.stopped = true;
         let ids: Vec<IoId> = live_ids(&mut state.slab);
         for id in ids {
-            Self::cancel_locked(&mut state, id, Error::Cancelled);
+            Self::cancel_locked(&mut state, id, Error::Canceled);
         }
     }
 
@@ -1296,7 +1296,7 @@ impl Reactor {
                 })
                 .collect();
             for id in ids {
-                Self::cancel_locked(&mut state, id, Error::Cancelled);
+                Self::cancel_locked(&mut state, id, Error::Canceled);
             }
         }
         FenceWait {

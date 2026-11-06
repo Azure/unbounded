@@ -347,7 +347,7 @@ mod capture_tests {
             detail.is_none(),
             "recovered operation must not report final rejection"
         );
-        let (_, detail) = capture_rejection(&quotas, || Err::<(), _>(Error::Cancelled));
+        let (_, detail) = capture_rejection(&quotas, || Err::<(), _>(Error::Canceled));
         assert!(detail.is_none());
     }
 

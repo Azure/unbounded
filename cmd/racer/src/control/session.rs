@@ -103,7 +103,7 @@ impl Authentication {
     /// Reject every new submission after stop or authenticated node replacement.
     fn check(&self) -> Result<()> {
         if self.stopped.get() {
-            return Err(Error::Cancelled);
+            return Err(Error::Canceled);
         }
         if self.restart_required.get() {
             return Err(Error::NodeIdentityChanged);
@@ -813,7 +813,7 @@ impl Session {
                     driver.status().error
                 });
             match result {
-                Err(Error::NodeIdentityChanged | Error::Cancelled) => result,
+                Err(Error::NodeIdentityChanged | Error::Canceled) => result,
                 _ if self.auth.started.get() => scope.check(),
                 _ => result,
             }
@@ -1270,11 +1270,11 @@ pub(super) mod tests {
         drive(&clock, session.shutdown(&scope)).unwrap();
         assert_eq!(
             drive(&clock, session.progress(&scope)),
-            Err(Error::Cancelled)
+            Err(Error::Canceled)
         );
         assert_eq!(
             drive(&clock, session.keyring_progress(&scope)),
-            Err(Error::Cancelled)
+            Err(Error::Canceled)
         );
         assert!(
             session

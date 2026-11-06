@@ -92,8 +92,8 @@ impl Scope for RequestScope {
     type Error = Error;
 
     fn check(&self) -> Result<()> {
-        if self.cancellation.is_cancelled() {
-            return Err(racer_io::Error::Cancelled.into());
+        if self.cancellation.is_canceled() {
+            return Err(racer_io::Error::Canceled.into());
         }
         if Instant::now() >= self.deadline {
             return Err(racer_io::Error::DeadlineExceeded.into());
@@ -669,11 +669,11 @@ fn abandoned_tls_handshake_releases_connection() {
     }
 }
 
-/// Cancelling a checkout while the userspace reconnect after a failed kernel
+/// Canceling a checkout while the userspace reconnect after a failed kernel
 /// key install is stalled releases both sockets and the slot.
 #[cfg(feature = "test-util")]
 #[test]
-fn cancelled_fallback_reconnect_releases_connection() {
+fn canceled_fallback_reconnect_releases_connection() {
     if !kernel_tls_available() {
         return;
     }
@@ -722,7 +722,7 @@ fn cancelled_fallback_reconnect_releases_connection() {
     http1::tls::fail_next_key_installs(0);
     assert!(matches!(
         result.err(),
-        Some(Error::Runtime(racer_io::Error::Cancelled))
+        Some(Error::Runtime(racer_io::Error::Canceled))
     ));
     drive(&fixture.reactor, fixture.reactor.drain()).unwrap();
     assert_released(&fixture, &endpoint);
@@ -779,10 +779,10 @@ fn userspace_tls_charge_spans_idle_connection() {
     server.join().unwrap();
 }
 
-/// Cancelling an exchange on a userspace connection releases the userspace TLS charge
+/// Canceling an exchange on a userspace connection releases the userspace TLS charge
 /// once the connection is dropped.
 #[test]
-fn cancelled_userspace_exchange_releases_tls_charge() {
+fn canceled_userspace_exchange_releases_tls_charge() {
     let identity = identity(&["localhost"]);
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let address = listener.local_addr().unwrap();
@@ -792,7 +792,7 @@ fn cancelled_userspace_exchange_releases_tls_charge() {
     let scope = scope();
     let connection = drive(&fixture.reactor, fixture.pool.checkout(&endpoint, &scope)).unwrap();
     assert!(fixture.admission.used(Resource::Context) >= http1::tls::USERSPACE_ALLOCATION);
-    // No request was sent, so the head receive stalls until cancelled.
+    // No request was sent, so the head receive stalls until canceled.
     let result = {
         let receive = fixture.io.receive_head(connection, &scope);
         let mut receive = std::pin::pin!(receive);
@@ -807,7 +807,7 @@ fn cancelled_userspace_exchange_releases_tls_charge() {
     };
     assert!(matches!(
         result.err(),
-        Some(Error::Runtime(racer_io::Error::Cancelled))
+        Some(Error::Runtime(racer_io::Error::Canceled))
     ));
     drive(&fixture.reactor, fixture.reactor.drain()).unwrap();
     assert_released(&fixture, &endpoint);

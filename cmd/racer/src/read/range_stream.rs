@@ -1085,8 +1085,8 @@ impl RangeStream {
             budget,
         ) {
             Ok(operation) => self.io.push((id, Io::Select(operation))),
-            Err(error @ (Error::Cancelled | Error::DeadlineExceeded)) => {
-                let error = read::Error::try_from(error).unwrap_or(read::Error::Cancelled);
+            Err(error @ (Error::Canceled | Error::DeadlineExceeded)) => {
+                let error = read::Error::try_from(error).unwrap_or(read::Error::Canceled);
                 self.inputs.push_back(win::Input::Cancel(error));
             }
             Err(_) => self.inputs.push_back(win::Input::Selected {
@@ -2213,7 +2213,7 @@ pub(super) mod tests {
             Err(Error::Overloaded)
         ));
         futures::executor::block_on(stream.cancel()).unwrap();
-        assert!(scope.cancellation.is_cancelled());
+        assert!(scope.cancellation.is_canceled());
         assert!(stream.lease.is_none());
         assert!(stream.retained.is_empty());
         assert!(directory.subscriptions.open(metadata.version).is_ok());
@@ -2479,7 +2479,7 @@ pub(super) mod tests {
         stream.inject(TestSlot::Fetching(Box::pin(async move {
             let _guard = guard;
             std::future::pending::<()>().await;
-            Err(Error::Cancelled)
+            Err(Error::Canceled)
         })));
         let mut cx = Context::from_waker(futures::task::noop_waker_ref());
         assert!(stream.next_slice().as_mut().poll(&mut cx).is_pending());
@@ -2676,7 +2676,7 @@ pub(super) mod tests {
         for error in [
             Error::Unavailable,
             Error::Overloaded,
-            Error::Cancelled,
+            Error::Canceled,
             Error::DeadlineExceeded,
         ] {
             let scope =
@@ -2706,7 +2706,7 @@ pub(super) mod tests {
             // Canceling the stream itself is fatal.
             scope.cancel().unwrap();
             stream.poll_prefetch(&mut cx);
-            assert_eq!(stream.error, Some(Error::Cancelled));
+            assert_eq!(stream.error, Some(Error::Canceled));
         }
     }
     #[test]

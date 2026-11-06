@@ -107,7 +107,7 @@ impl Demand {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Kind {
     DeadlineExceeded,
-    Cancelled,
+    Canceled,
     Overloaded,
     Unavailable,
     StaleFlight,
@@ -702,7 +702,7 @@ where
 
     /// Abandon acquisition `work` (the dataplane drops `Work` unfinished).
     pub fn cancel_work(&mut self, work: u64) {
-        self.finish(work, Err(E::from(Kind::Cancelled)), false);
+        self.finish(work, Err(E::from(Kind::Canceled)), false);
     }
 
     fn finish(&mut self, flight: u64, result: Result<(P, u64), E>, promote: bool) {
@@ -814,7 +814,7 @@ where
     }
 
     /// Abandon a response slot (the dataplane drops `Waiter`). An elected but
-    /// untaken acquisition is cancelled with it.
+    /// untaken acquisition is canceled with it.
     pub fn cancel_waiter(&mut self, waiter: u64) {
         if let Some(pending) = self.remove_pending(waiter)
             && pending.promoted
@@ -970,7 +970,7 @@ mod tests {
         s.cancel_work(work);
         assert_eq!(
             ready(s.poll(follow.waiter, 1)).unwrap_err(),
-            Err::Kind(Kind::Cancelled)
+            Err::Kind(Kind::Canceled)
         );
         assert_eq!(s.flight_count(), 0);
     }

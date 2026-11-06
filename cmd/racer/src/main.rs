@@ -80,7 +80,7 @@ fn run() -> std::result::Result<(), (&'static str, Error)> {
                 Ok(()) => {}
                 // A requested stop during bootstrap is a clean exit; dropping the
                 // handle stops embedded control boundedly.
-                Err(Error::Cancelled) if signals.requested() => {
+                Err(Error::Canceled) if signals.requested() => {
                     eprintln!("racer: stage=cluster-bootstrap stopped by signal");
                     return Ok(());
                 }

@@ -439,7 +439,7 @@ mod chunked_tests {
                     request.cancel().unwrap();
                     assert_eq!(
                         drive(&r, future).map_err(|e| e.cause()),
-                        Err(Error::Cancelled)
+                        Err(Error::Canceled)
                     );
                 }
                 fault => {
@@ -543,7 +543,7 @@ mod tests {
             .is_empty()
         );
         request.cancel().unwrap();
-        assert!(matches!(drive(&r, read(6)), Err(Error::Cancelled)));
+        assert!(matches!(drive(&r, read(6)), Err(Error::Canceled)));
     }
 
     /// Create a fresh stage and pinned parent using the selected durability policy.
@@ -744,7 +744,7 @@ mod tests {
             if cancel {
                 assert_eq!(
                     result,
-                    Err(ReplacementError::RenameUncertain(Error::Cancelled))
+                    Err(ReplacementError::RenameUncertain(Error::Canceled))
                 );
             } else {
                 assert_eq!(

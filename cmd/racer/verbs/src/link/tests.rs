@@ -350,7 +350,7 @@ fn release_frees_without_exposing() {
         // Release before the Grant arrives, replacing a waiting write.
         let waiting = write(&mut p.b, 2, vec![1], deadline, now);
         let early = release(&mut p.b, 2, now);
-        assert_eq!(poll(&waiting), Some(Err(Error::Cancelled)));
+        assert_eq!(poll(&waiting), Some(Err(Error::Canceled)));
         assert_eq!(poll(&release(&mut p.b, 2, now)), Some(Ok(())));
         let second = grant(&mut p.a, 10, deadline, now);
         assert_eq!(pump(&mut p), (None, None));

@@ -605,7 +605,7 @@ impl Application {
 /// Whether `error` is the cancellation a requested SIGTERM/SIGINT produces, so the
 /// process stops cleanly instead of reporting a fatal failure.
 fn signal_stop(error: Error, requested: bool) -> bool {
-    requested && error == Error::Cancelled
+    requested && error == Error::Canceled
 }
 
 /// Budget for one managed enrollment attempt, independent of data request deadlines.
@@ -642,7 +642,7 @@ fn retry_enrollment<T>(
     let mut attempts = 0u64;
     loop {
         if stop() {
-            return Err(Error::Cancelled);
+            return Err(Error::Canceled);
         }
         let started = std::time::Instant::now();
         match attempt() {
@@ -654,7 +654,7 @@ fn retry_enrollment<T>(
                 );
             }
             Err(error) if stop() && crate::control::transient(error) => {
-                return Err(Error::Cancelled);
+                return Err(Error::Canceled);
             }
             Err(error) => return Err(error),
         }
@@ -662,7 +662,7 @@ fn retry_enrollment<T>(
         let resume = started + pace;
         while std::time::Instant::now() < resume {
             if stop() {
-                return Err(Error::Cancelled);
+                return Err(Error::Canceled);
             }
             std::thread::sleep(
                 resume
@@ -714,7 +714,7 @@ async fn start_control(
 /// failure cannot be attributed. Cancellation is the normal stop path.
 fn stage_result<T>(worker: WorkerId, stage: &str, result: Result<T>) -> Result<T> {
     if let Err(error) = &result
-        && *error != Error::Cancelled
+        && *error != Error::Canceled
     {
         eprintln!(
             "racer: worker={} stage={stage} fatal error={error:?}",
@@ -743,7 +743,7 @@ fn listener_completion(
         return Err(Error::Unavailable);
     }
     match result {
-        Ok(()) | Err(Error::Cancelled | Error::DeadlineExceeded) => Ok(()),
+        Ok(()) | Err(Error::Canceled | Error::DeadlineExceeded) => Ok(()),
         Err(error) => Err(error),
     }
 }
@@ -814,7 +814,7 @@ fn bootstrap(
 /// Drive one bootstrap `operation` on `reactor` until it completes, parking on
 /// the reactor's wake sources (completions, its wake handle, the process stop
 /// eventfd, ring deadlines, and this thread's alarms) and on `scope`'s
-/// deadline. With `stoppable`, a process stop ends it with `Cancelled`; a
+/// deadline. With `stoppable`, a process stop ends it with `Canceled`; a
 /// failed `scope` check or reactor turn ends it with that error.
 fn drive_bootstrap<T>(
     reactor: &Reactor,
@@ -826,7 +826,7 @@ fn drive_bootstrap<T>(
     let mut cx = Context::from_waker(&waker);
     loop {
         if stoppable && stop_requested() {
-            return Err(Error::Cancelled);
+            return Err(Error::Canceled);
         }
         if let Some(scope) = scope {
             scope.check()?;
@@ -849,7 +849,7 @@ fn drive_bootstrap<T>(
 /// bootstrap wait ends on a wake source or deadline first.
 const BOOTSTRAP_MAX_PARK: Duration = Duration::from_secs(3600);
 
-/// End `operation` with `Cancelled` as soon as a process stop is requested.
+/// End `operation` with `Canceled` as soon as a process stop is requested.
 ///
 /// The lifecycle driver re-polls startup periodically, so a stop request is
 /// observed promptly even while the operation waits on a long control turn.
@@ -866,7 +866,7 @@ async fn stoppable_by<T>(
     let mut operation = std::pin::pin!(operation);
     std::future::poll_fn(|cx| {
         if stop() {
-            return Poll::Ready(Err(Error::Cancelled));
+            return Poll::Ready(Err(Error::Canceled));
         }
         operation.as_mut().poll(cx)
     })
@@ -2444,7 +2444,7 @@ impl WorkerApplication {
                     | Error::Unavailable
                     | Error::Overloaded
                     | Error::MissingKey
-                    | Error::Cancelled
+                    | Error::Canceled
                     | Error::DeadlineExceeded)
             )
         {
@@ -2780,7 +2780,7 @@ impl crate::lifecycle::Service<RequestScope> for WorkerApplication {
                 scope.cancel()?;
             }
             std::future::poll_fn(|cx| match poll_task(&mut self.diagnostic_task, cx) {
-                Some(Ok(()) | Err(Error::Cancelled | Error::DeadlineExceeded)) | None
+                Some(Ok(()) | Err(Error::Canceled | Error::DeadlineExceeded)) | None
                     if self.diagnostic_task.is_none() =>
                 {
                     Poll::Ready(Ok(()))
@@ -3331,7 +3331,7 @@ impl WorkerApplication {
             startup.check()?;
             self.poll_cache_preparation(cx)?;
             if stop_requested() {
-                return Poll::Ready(Err(Error::Cancelled));
+                return Poll::Ready(Err(Error::Canceled));
             }
             if node.prepared.load(Ordering::Acquire) == node.count
                 && self.snapshots.current().is_ok()
@@ -3635,7 +3635,7 @@ mod lifecycle_policy_tests {
         stop.store(true, Ordering::Relaxed);
         assert_eq!(
             pending.as_mut().poll(&mut cx),
-            Poll::Ready(Err(Error::Cancelled))
+            Poll::Ready(Err(Error::Canceled))
         );
         let clear = AtomicBool::new(false);
         let mut done = Box::pin(stoppable_by(|| clear.load(Ordering::Relaxed), async {
@@ -3674,9 +3674,9 @@ mod lifecycle_policy_tests {
         let result: Result<()> = retry_enrollment(|| unreachable!(), || true, Duration::ZERO);
         // Only a signal-requested cancellation is a clean stop; other errors stay fatal.
         assert!(signal_stop(result.unwrap_err(), true));
-        assert!(!signal_stop(Error::Cancelled, false));
+        assert!(!signal_stop(Error::Canceled, false));
         assert!(!signal_stop(Error::Unavailable, true));
-        assert_eq!(result, Err(Error::Cancelled));
+        assert_eq!(result, Err(Error::Canceled));
         // Stop during a long pace is observed within a short slice.
         let begun = std::time::Instant::now();
         let calls = std::cell::Cell::new(0);
@@ -3688,7 +3688,7 @@ mod lifecycle_policy_tests {
             || begun.elapsed() > Duration::from_millis(100),
             Duration::from_secs(3600),
         );
-        assert_eq!((result, calls.get()), (Err(Error::Cancelled), 1));
+        assert_eq!((result, calls.get()), (Err(Error::Canceled), 1));
         assert!(begun.elapsed() < Duration::from_secs(2));
     }
 
@@ -3917,7 +3917,7 @@ mod lifecycle_policy_tests {
     fn listener_completion_preserves_serving_and_shutdown_errors() {
         for result in [
             Ok(()),
-            Err(Error::Cancelled),
+            Err(Error::Canceled),
             Err(Error::DeadlineExceeded),
             Err(Error::Io),
             Err(Error::Unavailable),
@@ -3930,7 +3930,7 @@ mod lifecycle_policy_tests {
                 result.and(Err(Error::Unavailable)),
             );
             let expected = match result {
-                Ok(()) | Err(Error::Cancelled | Error::DeadlineExceeded) => Ok(()),
+                Ok(()) | Err(Error::Canceled | Error::DeadlineExceeded) => Ok(()),
                 other => other,
             };
             assert_eq!(

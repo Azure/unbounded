@@ -310,7 +310,7 @@ fn changed_operation_credentials_replay_and_deadlines_fail() {
     let local = request(&env, &admission, 4);
     let narrowed = request_scope(&local, &scope).unwrap();
     scope.cancel().unwrap();
-    assert_eq!(narrowed.check(), Err(Error::Cancelled));
+    assert_eq!(narrowed.check(), Err(Error::Canceled));
 }
 
 #[test]
@@ -1069,7 +1069,7 @@ fn signed_tcp_case(env: &racer_io::Env, case: &str) {
         }
         "cancel" => {
             scope.cancel().unwrap();
-            Some(Error::Cancelled)
+            Some(Error::Canceled)
         }
         "deadline" => {
             local.route.deadline.0 = Instant::now();
@@ -1301,7 +1301,7 @@ fn incoming_header_timeout_closes_silent_partial_and_idle_keepalive_peers() {
             assert!(admission.used(ResourceClass::RequestContext) > baseline);
         } else {
             let expected = if case == "cancel" {
-                Error::Cancelled
+                Error::Canceled
             } else {
                 Error::DeadlineExceeded
             };
@@ -1974,7 +1974,7 @@ mod established_sessions {
         assert!(prefix[..count].starts_with(b"POST "));
         assert!(!prefix[..count].windows(4).any(|w| w == b"\r\n\r\n"));
         scope.cancel().unwrap();
-        assert!(matches!(f.drive(sending), Err(Error::Cancelled)));
+        assert!(matches!(f.drive(sending), Err(Error::Canceled)));
         assert!(matches!(
             f.drive(f.server.serve_connection(b, &f.scope)),
             Err(Error::Io)

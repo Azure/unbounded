@@ -395,10 +395,7 @@ fn refresh_lock_wait_observes_waiter_cancellation() {
         std::thread::sleep(Duration::from_millis(50));
         canceller.cancel().unwrap();
     });
-    assert_eq!(
-        bearer_in(&source, &waiter).err(),
-        Some(AuthError::Cancelled)
-    );
+    assert_eq!(bearer_in(&source, &waiter).err(), Some(AuthError::Canceled));
     assert!(started.elapsed() < Duration::from_secs(5));
     thread.join().unwrap();
     drop(fetch);

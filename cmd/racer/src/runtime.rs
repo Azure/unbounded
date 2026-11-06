@@ -70,8 +70,8 @@ impl Cancellation {
             }),
         })
     }
-    pub fn is_cancelled(&self) -> bool {
-        self.inner.is_cancelled()
+    pub fn is_canceled(&self) -> bool {
+        self.inner.is_canceled()
     }
     /// Subscribe for one operation's lifetime, even when several operations share
     /// an executor waker. Dropping the subscription removes its wake. Never fails.
@@ -221,7 +221,7 @@ impl RequestScope {
         })
     }
 
-    /// A lifetime scope with no deadline; it ends only when cancelled.
+    /// A lifetime scope with no deadline; it ends only when canceled.
     pub fn untimed(request: RequestId, clock: racer_io::Clock) -> Result<Self> {
         let placeholder = clock
             .now()
@@ -268,8 +268,8 @@ impl RequestScope {
     /// [`RequestScope::check`] against an explicit instant instead of the
     /// environment clock.
     pub fn check_at(&self, now: Instant) -> Result<()> {
-        if self.cancellation.is_cancelled() {
-            Err(Error::Cancelled)
+        if self.cancellation.is_canceled() {
+            Err(Error::Canceled)
         } else if self.deadline_at().is_some_and(|deadline| now >= deadline) {
             Err(Error::DeadlineExceeded)
         } else {
@@ -514,7 +514,7 @@ mod tests {
                 assert_eq!(header.deadline_at(), Some(until));
                 assert_eq!(header.check(), Err(Error::DeadlineExceeded));
                 scope.cancel().unwrap();
-                assert_eq!(scope.check(), Err(Error::Cancelled));
+                assert_eq!(scope.check(), Err(Error::Canceled));
             }
 
             #[test]
@@ -536,7 +536,7 @@ mod tests {
                 clock.advance(Duration::from_secs(10));
                 assert_eq!(narrowed.check(), Err(Error::DeadlineExceeded));
                 scope.cancel().unwrap();
-                assert_eq!(narrowed.check(), Err(Error::Cancelled));
+                assert_eq!(narrowed.check(), Err(Error::Canceled));
             }
 
             #[test]
@@ -794,7 +794,7 @@ mod tests {
                 let registration = racer_io::Scope::cancel_wait(&clone).unwrap();
                 registration.register(&Waker::from(count.clone()));
                 scope.cancel().unwrap();
-                assert_eq!(racer_io::Scope::check(&clone), Err(Error::Cancelled));
+                assert_eq!(racer_io::Scope::check(&clone), Err(Error::Canceled));
                 assert_eq!(count.0.load(Ordering::Relaxed), 1);
             }
             /// Explicit-time checks match the environment clock without reading it.
@@ -818,7 +818,7 @@ mod tests {
                 late.cancel().unwrap();
                 assert_eq!(
                     late.check_at(start - Duration::from_secs(1)),
-                    Err(Error::Cancelled)
+                    Err(Error::Canceled)
                 );
             }
             #[test]
@@ -835,7 +835,7 @@ mod tests {
                 let clone = scope.clone();
                 assert_eq!(clone.deadline.0, scope.deadline.0);
                 clone.cancel().unwrap();
-                assert_eq!(scope.check(), Err(Error::Cancelled));
+                assert_eq!(scope.check(), Err(Error::Canceled));
                 assert_eq!(a.0.load(Ordering::Relaxed), 1);
                 assert_eq!(b.0.load(Ordering::Relaxed), 1);
                 assert_eq!(
@@ -1028,7 +1028,7 @@ mod tests {
                 assert!(poll(&mut b).is_pending());
                 drive(&reactor, reactor.file_fence(first.request)).unwrap();
                 assert_eq!(reactor.in_flight(), 1);
-                assert!(matches!(poll(&mut a), Poll::Ready(Err(Error::Cancelled))));
+                assert!(matches!(poll(&mut a), Poll::Ready(Err(Error::Canceled))));
                 assert!(poll(&mut b).is_pending());
                 drop((a, b));
                 drive(&reactor, reactor.file_fence(second.request)).unwrap();
@@ -1122,7 +1122,7 @@ mod tests {
                 assert_eq!(reactor.in_flight(), 0);
                 assert!(matches!(
                     poll(&mut pending),
-                    Poll::Ready(Err(Error::Cancelled))
+                    Poll::Ready(Err(Error::Canceled))
                 ));
                 assert_eq!(reactor.init(), Err(Error::Unavailable));
                 assert_eq!(reactor.admission.used(ResourceClass::ControlProgress), 2);
@@ -1446,7 +1446,7 @@ mod tests {
                     assert_eq!(r.poll_budgeted(1), Ok(0));
                     clock.advance(Duration::from_secs(1));
                     assert_eq!(r.poll_budgeted(1), Ok(0));
-                    assert!(!request.cancellation.is_cancelled());
+                    assert!(!request.cancellation.is_canceled());
                     assert_eq!(request.deadline.0, start + Duration::from_secs(60));
                     assert_eq!(r.poll_budgeted(1), Ok(1));
                     assert!(poll(&mut recv).is_pending());
@@ -1779,7 +1779,7 @@ mod tests {
             let env = racer_io::Env::new(racer_io::Driver::Uring, environment.clone());
             let r = sim_reactor(&clock);
             let mut cx = Context::from_waker(futures::task::noop_waker_ref());
-            for expected in [Error::Cancelled, Error::DeadlineExceeded] {
+            for expected in [Error::Canceled, Error::DeadlineExceeded] {
                 let scope = RequestScope::on(
                     &env.ctx.clock,
                     RequestId([0; 16]),
@@ -1790,7 +1790,7 @@ mod tests {
                     Box::pin(std::future::ready(Err(Error::Overloaded)))
                 });
                 assert!(operation.as_mut().poll(&mut cx).is_pending());
-                if expected == Error::Cancelled {
+                if expected == Error::Canceled {
                     scope.cancel().unwrap();
                 } else {
                     clock.advance(Duration::from_millis(1));
@@ -1851,7 +1851,7 @@ mod tests {
             }
             assert_eq!(
                 operation.as_mut().poll(&mut cx),
-                Poll::Ready(Err(Error::Cancelled))
+                Poll::Ready(Err(Error::Canceled))
             );
             assert_eq!(reactor.in_flight(), 0);
         }

@@ -1797,7 +1797,7 @@ pub mod dns {
                         Ok(ips) => {
                             addresses.extend(ips.into_iter().map(|ip| SocketAddr::new(ip, port)))
                         }
-                        Err(error) if error == racer_io::Error::Cancelled.into() => {
+                        Err(error) if error == racer_io::Error::Canceled.into() => {
                             return Err(error);
                         }
                         Err(_) => {
@@ -2001,7 +2001,7 @@ pub mod dns {
 
             fn check(&self) -> Result<(), FixtureError> {
                 if self.0.get() {
-                    Err(racer_io::Error::Cancelled.into())
+                    Err(racer_io::Error::Canceled.into())
                 } else {
                     Ok(())
                 }
@@ -2205,7 +2205,7 @@ pub mod dns {
                 }
                 io.reactor.poll_budgeted(64).unwrap();
             }
-            assert_eq!(result, Some(Err(racer_io::Error::Cancelled.into())));
+            assert_eq!(result, Some(Err(racer_io::Error::Canceled.into())));
         }
     }
 }

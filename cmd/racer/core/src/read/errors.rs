@@ -90,7 +90,7 @@ pub const fn disposition(error: Error) -> Disposition {
         | Error::CorruptRecord
         | Error::Internal => row(NextCandidate, Some(P::UnusableCopy), None, F::Unavailable),
         Error::DeadlineExceeded => row(Never, None, Some(K::Unavailable), F::Unavailable),
-        Error::Cancelled | Error::IncompatibleMembership | Error::InvalidConfiguration => {
+        Error::Canceled | Error::IncompatibleMembership | Error::InvalidConfiguration => {
             row(Never, None, None, F::Unavailable)
         }
         Error::OriginRejected => row(Never, None, Some(K::OriginRejected), F::Forbidden),
@@ -150,7 +150,7 @@ mod tests {
         Error::Overloaded,
         Error::FlightFull,
         Error::DeadlineExceeded,
-        Error::Cancelled,
+        Error::Canceled,
         Error::Unauthorized,
         Error::OriginRejected,
         Error::OriginForbidden,
@@ -177,7 +177,7 @@ mod tests {
                 | Error::Overloaded
                 | Error::FlightFull
                 | Error::DeadlineExceeded
-                | Error::Cancelled
+                | Error::Canceled
                 | Error::Unauthorized
                 | Error::OriginRejected
                 | Error::OriginForbidden
@@ -225,7 +225,7 @@ mod tests {
                 F::Overloaded,
             ),
             Error::DeadlineExceeded => (Never, None, Some(K::Unavailable), F::Unavailable),
-            Error::Cancelled => (Never, None, None, F::Unavailable),
+            Error::Canceled => (Never, None, None, F::Unavailable),
             Error::Unauthorized => (NextCandidate, Some(P::UnusableCopy), None, F::Unavailable),
             Error::OriginRejected => (Never, None, Some(K::OriginRejected), F::Forbidden),
             Error::OriginForbidden => (Never, None, Some(K::OriginForbidden), F::Forbidden),

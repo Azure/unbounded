@@ -159,7 +159,7 @@ impl ScriptedPeers {
                 }
                 Reply::Cancel(parent) => {
                     parent.cancel()?;
-                    return Err(Error::Cancelled);
+                    return Err(Error::Canceled);
                 }
                 Reply::Deadline => return Err(Error::DeadlineExceeded),
                 Reply::Serve => {
@@ -708,7 +708,7 @@ fn serial_zero_grant_copy_failures_and_positive_grant_acquire() {
                 }
                 // A last owner whose answer fails verification is that owner's unusable copy,
                 // not the read's end (formerly terminal `Unauthorized`).
-                "cancel" => assert!(matches!(result, Err(Error::Cancelled))),
+                "cancel" => assert!(matches!(result, Err(Error::Canceled))),
                 _ => assert!(matches!(result, Err(Error::Unavailable))),
             }
             if case != "good" {
@@ -812,7 +812,7 @@ fn serial_zero_grant_cancel_waits_for_accepted_copy_fence() {
     completed.set(true);
     assert!(matches!(
         resolve.as_mut().poll(&mut cx),
-        Poll::Ready(Err(Error::Cancelled))
+        Poll::Ready(Err(Error::Canceled))
     ));
     drop(resolve);
     assert!(allocation.upgrade().is_none());
@@ -1311,7 +1311,7 @@ fn known_copy_admission_validates_before_reclaim_and_preserves_failures() {
         match case {
             "success" => assert!(result.is_ok(), "{result:?}"),
             "short" => assert_eq!(result, Err(Error::Overloaded)),
-            "canceled" => assert_eq!(result, Err(Error::Cancelled)),
+            "canceled" => assert_eq!(result, Err(Error::Canceled)),
             _ => assert_eq!(result, Err(Error::CorruptRecord)),
         }
         assert_eq!(pressure.amount(), before);
@@ -2133,7 +2133,7 @@ fn hedge_loser_child_cancels_accepted_crypto_but_waits_for_completion_fence() {
             Box::pin(async move {
                 if first {
                     let result = fill.decrypt_response(page, response, None, &child).await;
-                    canceled.set(matches!(result, Err(Error::Cancelled)));
+                    canceled.set(matches!(result, Err(Error::Canceled)));
                     result
                 } else {
                     Ok(crate::read::tests::page(2))
@@ -2149,8 +2149,8 @@ fn hedge_loser_child_cancels_accepted_crypto_but_waits_for_completion_fence() {
         "primary crypto accepted before winner"
     );
     assert_eq!(scopes.borrow().len(), 2);
-    assert!(scopes.borrow()[0].cancellation.is_cancelled());
-    assert!(!f.scope.cancellation.is_cancelled());
+    assert!(scopes.borrow()[0].cancellation.is_canceled());
+    assert!(!f.scope.cancellation.is_canceled());
     assert!(
         pair.as_mut().poll(&mut cx).is_pending(),
         "cancellation is not the crypto fence"
@@ -2254,10 +2254,10 @@ fn hedge_child_cancellation_removes_crypto_admission_wait_without_canceling_acce
     child.cancel().unwrap();
     assert!(matches!(
         waiting.as_mut().poll(&mut cx),
-        Poll::Ready(Err(Error::Cancelled))
+        Poll::Ready(Err(Error::Canceled))
     ));
     drop(waiting);
-    assert!(!f.scope.cancellation.is_cancelled());
+    assert!(!f.scope.cancellation.is_canceled());
     assert_eq!(f.crypto.outstanding(), 1);
     crate::lifecycle::Service::poll_budgeted(
         &mut f.engine,
@@ -3698,7 +3698,7 @@ mod landing {
         );
         let cancel = async move {
             yield_once().await;
-            // The leading request was cancelled: its future is dropped.
+            // The leading request was canceled: its future is dropped.
             drop(lead);
         };
         let (fetched, ()) = drive(
@@ -3715,16 +3715,13 @@ mod landing {
     }
 
     #[test]
-    /// A cancelled leading fetch abandons its lead, and the next fetch
+    /// A canceled leading fetch abandons its lead, and the next fetch
     /// leads instead of waiting forever.
-    fn cancelled_leading_fetch_does_not_block_later_fetches() {
+    fn canceled_leading_fetch_does_not_block_later_fetches() {
         let env = racer_io::Env::host();
         let mut l = landing(&env, 0, true);
         l.f.scope.cancellation.cancel().unwrap();
-        assert!(matches!(
-            acquire_sealed_on(&mut l, 0),
-            Err(Error::Cancelled)
-        ));
+        assert!(matches!(acquire_sealed_on(&mut l, 0), Err(Error::Canceled)));
         assert_eq!(l.f.fill.gpu_copies.len(), 0);
         l.f.scope = RequestScope::host(l.f.scope.request, l.f.scope.deadline.0).unwrap();
         let page = sealed(acquire_sealed_on(&mut l, 0));

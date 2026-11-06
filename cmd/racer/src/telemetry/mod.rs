@@ -91,7 +91,7 @@ pub(crate) const HARDWARE_DEADLINE: Duration = Duration::from_secs(5);
 
 /// Owned, `Send` hardware discovery prepared on the control worker and run on a
 /// helper thread, so blocking sysfs reads never stall the worker. The job charges
-/// the walk's working budget and stops early once the request is cancelled.
+/// the walk's working budget and stops early once the request is canceled.
 pub(crate) type HardwareJob = Box<
     dyn FnOnce(
             &crate::hardware::Walk,

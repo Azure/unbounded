@@ -1804,7 +1804,7 @@ fn snapshot_refresh_retries_canceled_publication_and_applies_skipped_removal() {
     assert_eq!(index.snapshot_metadata(), vec![metadata]);
     let canceled = scope(&racer_io::Clock::host(), Duration::from_secs(1)).unwrap();
     canceled.cancel().unwrap();
-    assert_eq!(worker.refresh_snapshot(&canceled), Err(Error::Cancelled));
+    assert_eq!(worker.refresh_snapshot(&canceled), Err(Error::Canceled));
     assert_eq!(worker.caches, vec![original]);
     assert_eq!(worker.snapshot_sequence, Some(wire::PublicationSequence(1)));
     // Removal precedes the scope check, even though installation must retry.
@@ -1881,7 +1881,7 @@ fn two_worker_removal_preserves_late_driver_and_blocks_late_memory_and_disk_fill
         .reserve()
         .unwrap()
         .submit_detached(Box::pin(async move {
-            receive.await.map_err(|_| Error::Cancelled)?;
+            receive.await.map_err(|_| Error::Canceled)?;
             assert_eq!(memory.publish(late), Err(Error::Unavailable));
             Ok::<_, Error>(())
         }));
@@ -3840,7 +3840,7 @@ fn peer_tcp_nodelay_assembled_outbound_and_distributed_accept() {
         loop {
             runtime.reactor.poll_budgeted(64).unwrap();
             if let Poll::Ready(result) = serving.as_mut().poll(&mut cx) {
-                assert_eq!(result, Err(Error::Cancelled));
+                assert_eq!(result, Err(Error::Canceled));
                 break;
             }
             assert!(Instant::now() < until, "peer cancellation stalled");
@@ -3954,7 +3954,7 @@ fn a_full_peer_listener_refuses_with_the_overload_head() {
     loop {
         runtime.reactor.poll_budgeted(64).unwrap();
         if let Poll::Ready(result) = serving.as_mut().poll(&mut cx) {
-            assert_eq!(result, Err(Error::Cancelled));
+            assert_eq!(result, Err(Error::Canceled));
             break;
         }
         assert!(Instant::now() < until, "peer cancellation stalled");
@@ -4250,7 +4250,7 @@ fn distributed_peer_listener_recovers_from_queue_pressure() {
     loop {
         runtime.reactor.poll_budgeted(64).unwrap();
         if let Poll::Ready(result) = serving.as_mut().poll(&mut cx) {
-            assert_eq!(result, Err(Error::Cancelled));
+            assert_eq!(result, Err(Error::Canceled));
             break;
         }
         assert!(Instant::now() < until, "peer cancellation stalled");
@@ -5116,8 +5116,8 @@ mod lifecycle {
             Err(Error::Unavailable)
         );
         assert_eq!(
-            stage_result::<()>(WorkerId(3), "writer", Err(Error::Cancelled)),
-            Err(Error::Cancelled)
+            stage_result::<()>(WorkerId(3), "writer", Err(Error::Canceled)),
+            Err(Error::Canceled)
         );
     }
 
@@ -5139,7 +5139,7 @@ mod lifecycle {
             Ok(())
         );
         assert_eq!(
-            listener_completion(Err(Error::Cancelled), true, worker, "peer-listener"),
+            listener_completion(Err(Error::Canceled), true, worker, "peer-listener"),
             Ok(())
         );
         assert_eq!(

@@ -945,7 +945,7 @@ impl Owner {
 
     fn handle(&mut self, command: Command, now: Instant) {
         if self.closing {
-            // Dropping the command fails its op with `Cancelled`; say why.
+            // Dropping the command fails its op with `Canceled`; say why.
             fail(command, Error::Unavailable);
             return;
         }
@@ -1970,7 +1970,7 @@ mod tests {
         for op in ops.drain(..) {
             assert_eq!(
                 op.poll(&mut cx).map(|r| r.err()),
-                Poll::Ready(Some(Error::Cancelled))
+                Poll::Ready(Some(Error::Canceled))
             );
         }
         assert_eq!(

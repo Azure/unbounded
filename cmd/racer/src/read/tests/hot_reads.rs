@@ -390,13 +390,13 @@ mod duplex_release {
                 }
                 "cancel" => {
                     scope.cancel().unwrap();
-                    Error::Cancelled
+                    Error::Canceled
                 }
                 "deadline" => {
                     clock.advance(Duration::from_secs(31));
                     Error::DeadlineExceeded
                 }
-                "drop" => Error::Cancelled,
+                "drop" => Error::Canceled,
                 _ => unreachable!(),
             };
             if mode != "drop" {
@@ -541,7 +541,7 @@ mod duplex_release {
             drop((send, done));
         }
         assert_eq!(other.bytes_sent(), 0);
-        assert!(!other_scope.cancellation.is_cancelled());
+        assert!(!other_scope.cancellation.is_canceled());
         let (socket, mut independent_client) = std::os::unix::net::UnixStream::pair().unwrap();
         independent_client
             .set_read_timeout(Some(Duration::from_secs(1)))

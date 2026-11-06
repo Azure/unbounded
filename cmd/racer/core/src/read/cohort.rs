@@ -486,7 +486,7 @@ mod tests {
             Error::OriginRejected,
             Error::OriginForbidden,
             Error::DeadlineExceeded,
-            Error::Cancelled,
+            Error::Canceled,
             Error::HopBudgetExhausted,
         ] {
             let mut f = fx();

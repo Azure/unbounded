@@ -211,7 +211,7 @@ fn a_canceled_leader_hands_its_acquisition_over() {
     let b = c.read_page(7, spec(now), now, &mut out);
     out.clear();
     c.cancel(a, now, &mut out);
-    assert_eq!(completed(&out), vec![(a, Err(Error::Cancelled))]);
+    assert_eq!(completed(&out), vec![(a, Err(Error::Canceled))]);
     assert_eq!(c.reads(), 1, "the acquisition keeps running for b");
     out = effects;
     run_to_publish(&mut c, now, &mut out);

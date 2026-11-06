@@ -188,7 +188,7 @@ pub(super) enum Outcome {
     /// through host memory, or the fetch failed. Waiters fetch for themselves.
     Nothing,
 
-    /// The fetching request ended first (cancelled or out of time). Waiters
+    /// The fetching request ended first (canceled or out of time). Waiters
     /// may look again, and one of them fetches.
     Abandoned,
 }
@@ -365,7 +365,7 @@ impl GpuCopies {
 }
 
 /// The right and duty to finish one shared fetch. Dropping it, as when the
-/// fetching request is cancelled, tells waiters the fetch was abandoned.
+/// fetching request is canceled, tells waiters the fetch was abandoned.
 pub(super) struct Lead {
     table: Rc<GpuCopies>,
     page: PageId,

@@ -196,7 +196,7 @@ pub enum FailureClass {
     /// Authentication was explicitly rejected.
     Rejected,
     /// The caller abandoned this turn; do not count it as a failed attempt.
-    Cancelled,
+    Canceled,
     /// Invalid or incompatible state.
     Permanent,
 }
@@ -204,7 +204,7 @@ pub enum FailureClass {
 /// Classify a control error for retry and rejection policy.
 pub fn classify(error: Error) -> FailureClass {
     match error {
-        Error::Cancelled => FailureClass::Cancelled,
+        Error::Canceled => FailureClass::Canceled,
         Error::Unauthorized => FailureClass::Rejected,
         error if transient(error) => FailureClass::Retry,
         _ => FailureClass::Permanent,
@@ -604,7 +604,7 @@ impl Poll {
     /// later fetch may supersede them without retaining a rejected delta base.
     pub async fn turn(&mut self, scope: &RequestScope) -> Result<()> {
         if self.stopped.get() {
-            return Err(Error::Cancelled);
+            return Err(Error::Canceled);
         }
         let now = self.now();
         let scope = scope.narrowed(now.checked_add(self.schedule.turn).unwrap_or(now));
@@ -659,7 +659,7 @@ impl Poll {
                     return Ok(());
                 }
                 Err(failure) => {
-                    if classify(failure.error) != FailureClass::Cancelled {
+                    if classify(failure.error) != FailureClass::Canceled {
                         progress.error = Some(failure.error);
                         progress.failures = progress.failures.saturating_add(1);
                         let delay = retry_delay(this.rng(), this.schedule, progress.failures);
@@ -689,7 +689,7 @@ impl Poll {
     /// preparation outlasts one tick.
     pub async fn settle(&mut self, scope: &RequestScope) -> Result<()> {
         if self.stopped.get() {
-            return Err(Error::Cancelled);
+            return Err(Error::Canceled);
         }
         let now = self.now();
         let scope = scope.narrowed(now.checked_add(self.schedule.turn).unwrap_or(now));
@@ -802,12 +802,12 @@ impl Progress {
                 match result {
                     Ok(prepared) => self.prepared = Some((job.document, prepared)),
                     Err(error) => {
-                        if classify(error) != FailureClass::Cancelled {
+                        if classify(error) != FailureClass::Canceled {
                             self.error = Some(error);
                         }
                         if matches!(
                             classify(error),
-                            FailureClass::Retry | FailureClass::Cancelled
+                            FailureClass::Retry | FailureClass::Canceled
                         ) {
                             self.requeue(poll, job.document, now);
                         } else {
@@ -834,7 +834,7 @@ impl Progress {
                     self.rejected = None;
                 }
                 Err(error) => {
-                    if classify(error) == FailureClass::Cancelled {
+                    if classify(error) == FailureClass::Canceled {
                         return Err(error);
                     }
                     self.error = Some(error);
@@ -863,14 +863,14 @@ impl Progress {
                 Ok(work) => work,
                 Err(error) => {
                     match classify(error) {
-                        FailureClass::Retry | FailureClass::Cancelled => {
+                        FailureClass::Retry | FailureClass::Canceled => {
                             self.requeue(poll, document, now);
                         }
                         FailureClass::Rejected | FailureClass::Permanent => {
                             self.reject(poll, document.version(), now);
                         }
                     }
-                    if classify(error) != FailureClass::Cancelled {
+                    if classify(error) != FailureClass::Canceled {
                         self.error = Some(error);
                     }
                     return Err(error);

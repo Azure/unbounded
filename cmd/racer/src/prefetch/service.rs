@@ -80,7 +80,7 @@ impl Drop for Waiter<'_> {
     }
 }
 
-/// One owner fill admission. Dropping it, including with a cancelled fill
+/// One owner fill admission. Dropping it, including with a canceled fill
 /// future, returns the reference so the slot and its bookkeeping are released.
 pub(crate) struct OwnerFill<'a> {
     prefetch: &'a Prefetch,

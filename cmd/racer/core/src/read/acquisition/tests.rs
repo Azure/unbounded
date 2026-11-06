@@ -515,9 +515,9 @@ fn a_failed_batch_aborts() {
     let id = h.id();
     h.act(Input::Batched {
         id,
-        result: Err(Error::Cancelled),
+        result: Err(Error::Canceled),
     });
-    assert_eq!(h.done().result, Err(Error::Cancelled));
+    assert_eq!(h.done().result, Err(Error::Canceled));
 }
 
 fn stale_answer() -> Reply {
@@ -610,9 +610,9 @@ fn a_stale_wait_sleeps_and_a_failed_sleep_is_terminal() {
     let id = h.id();
     h.act(Input::Timer {
         id,
-        result: Err(Error::Cancelled),
+        result: Err(Error::Canceled),
     });
-    assert_eq!(h.done().result, Err(Error::Cancelled));
+    assert_eq!(h.done().result, Err(Error::Canceled));
 }
 
 #[test]
@@ -680,9 +680,9 @@ fn cancel_ends_an_outstanding_send_and_late_replies_are_stale() {
     start(&mut h);
     h.ranked(5, None, "r5");
     let id = h.id();
-    let effects = h.act(Input::Cancel(Error::Cancelled));
+    let effects = h.act(Input::Cancel(Error::Canceled));
     assert_eq!(kinds(&effects), ["Done"]);
-    assert_eq!(h.done().result, Err(Error::Cancelled));
+    assert_eq!(h.done().result, Err(Error::Canceled));
     let mut out = Vec::new();
     let late = h.acq.on(
         Input::Replied {

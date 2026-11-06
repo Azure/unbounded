@@ -1726,14 +1726,14 @@ mod tests {
             .complete(
                 command.generation,
                 Completion {
-                    value: Err(Error::Cancelled),
+                    value: Err(Error::Canceled),
                     budget: None,
                 },
             )
             .unwrap();
         assert!(matches!(
             selected.as_mut().poll(&mut cx),
-            Poll::Ready(Err(Error::Cancelled))
+            Poll::Ready(Err(Error::Canceled))
         ));
         drop((selected, command));
         assert_eq!(directory.mailbox(owner).unwrap().outstanding(), 0);
@@ -1800,7 +1800,7 @@ mod tests {
             assert_eq!(mailbox.outstanding(), 1, "unread receipt retains its slot");
             assert!(matches!(
                 selected.as_mut().poll(&mut cx),
-                Poll::Ready(Err(Error::Cancelled))
+                Poll::Ready(Err(Error::Canceled))
             ));
             assert_eq!(mailbox.outstanding(), 0);
             assert_eq!(drain.as_mut().poll(&mut cx), Poll::Ready(Ok(())));
@@ -1851,7 +1851,7 @@ mod tests {
                 let Poll::Ready(Ok(completion)) = Pin::new(&mut receipt).poll(&mut cx) else {
                     panic!("queued non-submission must return a normal completion");
                 };
-                assert!(matches!(completion.value, Err(Error::Cancelled)));
+                assert!(matches!(completion.value, Err(Error::Canceled)));
                 let budget = completion.budget.unwrap();
                 assert_eq!(budget.remaining_attempts(), 3);
                 assert_eq!(budget.remaining_links(), 5);
@@ -1869,7 +1869,7 @@ mod tests {
 
     #[test]
     fn cached_page_handoff_is_lookup_only_and_propagates_misses_and_errors() {
-        for error in [None, Some(Error::Cancelled), Some(Error::CorruptRecord)] {
+        for error in [None, Some(Error::Canceled), Some(Error::CorruptRecord)] {
             let directory = directory(1);
             let scope = scope();
             let page = PageId {

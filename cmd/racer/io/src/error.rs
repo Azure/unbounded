@@ -4,7 +4,7 @@
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
 pub enum Error {
     /// The operation's owner requested cancellation.
-    Cancelled,
+    Canceled,
     /// The operation's deadline expired.
     DeadlineExceeded,
     /// A bounded queue or resource has no available capacity.
@@ -39,7 +39,7 @@ impl Error {
         match errno {
             libc::ENOENT => Self::NotFound,
             libc::EEXIST => Self::AlreadyExists,
-            libc::ECANCELED => Self::Cancelled,
+            libc::ECANCELED => Self::Canceled,
             errno if errno > 0 => Self::Os(errno),
             _ => Self::Io,
         }
@@ -55,7 +55,7 @@ impl Error {
         match self {
             Self::NotFound => Some(libc::ENOENT),
             Self::AlreadyExists => Some(libc::EEXIST),
-            Self::Cancelled => Some(libc::ECANCELED),
+            Self::Canceled => Some(libc::ECANCELED),
             Self::Os(errno) => Some(errno),
             _ => None,
         }
@@ -66,7 +66,7 @@ impl std::fmt::Display for Error {
     /// Describe the failure without losing raw operating-system diagnostics.
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(match self {
-            Self::Cancelled => "operation canceled",
+            Self::Canceled => "operation canceled",
             Self::DeadlineExceeded => "deadline exceeded",
             Self::Overloaded => "capacity exhausted",
             Self::Unavailable => "resource unavailable",
@@ -100,7 +100,7 @@ mod tests {
     fn errno_classification_round_trips() {
         assert_eq!(Error::from_errno(libc::ENOENT), Error::NotFound);
         assert_eq!(Error::from_errno(libc::EEXIST), Error::AlreadyExists);
-        assert_eq!(Error::from_errno(libc::ECANCELED), Error::Cancelled);
+        assert_eq!(Error::from_errno(libc::ECANCELED), Error::Canceled);
         assert_eq!(Error::from_errno(libc::EIO), Error::Os(libc::EIO));
         assert_eq!(Error::from_errno(0), Error::Io);
         assert_eq!(Error::from_errno(-3), Error::Io);
@@ -123,7 +123,7 @@ mod classification_tests {
         for (errno, expected) in [
             (libc::ENOENT, Error::NotFound),
             (libc::EEXIST, Error::AlreadyExists),
-            (libc::ECANCELED, Error::Cancelled),
+            (libc::ECANCELED, Error::Canceled),
             (libc::EIO, Error::Os(libc::EIO)),
             (libc::EINTR, Error::Os(libc::EINTR)),
         ] {
@@ -139,7 +139,7 @@ mod classification_tests {
     #[test]
     fn classified_errors_implement_standard_error_without_fabricated_sources() {
         for error in [
-            Error::Cancelled,
+            Error::Canceled,
             Error::DeadlineExceeded,
             Error::Overloaded,
             Error::Unavailable,

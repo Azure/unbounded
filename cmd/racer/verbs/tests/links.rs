@@ -725,7 +725,7 @@ fn owner_drop() {
         let queued = w.a.clients[1].grant(TO_B, ea, [3; 16], 10, deadline);
         drop(w.a.owner.take());
         assert_eq!(ready(&second.arrival).err(), Some(Error::Unavailable));
-        assert_eq!(ready(&queued).err(), Some(Error::Cancelled));
+        assert_eq!(ready(&queued).err(), Some(Error::Canceled));
         assert_eq!(
             ready(&w.a.clients[0].open(TO_B)).err(),
             Some(Error::Unavailable)

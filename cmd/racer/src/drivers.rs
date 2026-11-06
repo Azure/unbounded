@@ -1009,9 +1009,9 @@ mod scheduler_tests {
             if self
                 .cancellation
                 .as_ref()
-                .is_some_and(Cancellation::is_cancelled)
+                .is_some_and(Cancellation::is_canceled)
             {
-                return Err(Error::Cancelled);
+                return Err(Error::Canceled);
             }
             self.error.get().map_or(Ok(()), Err)
         }
@@ -1078,7 +1078,7 @@ mod scheduler_tests {
         assert_eq!(count.count(), 1);
         assert_eq!(
             future.as_mut().poll(&mut cx),
-            Poll::Ready(Err(Error::Cancelled))
+            Poll::Ready(Err(Error::Canceled))
         );
         drop(future);
         assert_eq!(Arc::strong_count(&count), 2);
@@ -1161,8 +1161,8 @@ mod hedge_tests {
 
         /// Admit the contender unless its scope has been canceled.
         fn check(&self) -> Result<(), Error> {
-            if self.0.is_cancelled() {
-                Err(Error::Cancelled)
+            if self.0.is_canceled() {
+                Err(Error::Canceled)
             } else {
                 Ok(())
             }
@@ -1333,7 +1333,7 @@ mod hedge_tests {
         fenced.set(true);
         assert_eq!(
             work.as_mut().poll(&mut cx),
-            Poll::Ready(Err(Error::Cancelled))
+            Poll::Ready(Err(Error::Canceled))
         );
         assert_eq!(classified.get(), 2);
         assert_eq!((a.requests.get(), b.requests.get()), (1, 1));
@@ -1392,7 +1392,7 @@ mod hedge_tests {
         };
         assert_eq!(
             futures::executor::block_on(race(never(), never(), &a, &b, &parent, fixture.hooks())),
-            Err(Error::Cancelled)
+            Err(Error::Canceled)
         );
         assert_eq!(fixture.won.get(), None);
         assert_eq!(fixture.failures.get(), 0);
@@ -1427,13 +1427,13 @@ mod hedge_tests {
         parent.cancel();
         fixture.due.set(true);
         assert!(work.as_mut().poll(&mut cx).is_pending());
-        assert!(primary_scope.0.is_cancelled());
-        assert!(secondary_scope.0.is_cancelled());
+        assert!(primary_scope.0.is_canceled());
+        assert!(secondary_scope.0.is_canceled());
         assert_eq!(fixture.won.get(), None);
         fenced.set(true);
         assert_eq!(
             work.as_mut().poll(&mut cx),
-            Poll::Ready(Err(Error::Cancelled))
+            Poll::Ready(Err(Error::Canceled))
         );
         assert_eq!(fixture.failures.get(), 0);
     }
@@ -1449,7 +1449,7 @@ mod hedge_tests {
             let fenced = Cell::new(false);
             let primary = std::future::poll_fn(|_| {
                 if fenced.get() {
-                    Poll::Ready(Err(Error::Cancelled))
+                    Poll::Ready(Err(Error::Canceled))
                 } else {
                     Poll::Pending
                 }
@@ -1468,15 +1468,15 @@ mod hedge_tests {
             fixture.due.set(true);
             assert!(work.as_mut().poll(&mut cx).is_pending());
             assert_eq!(fixture.won.get(), Some(Contender::Secondary));
-            assert!(a.0.is_cancelled());
-            assert!(!parent.0.is_cancelled());
+            assert!(a.0.is_canceled());
+            assert!(!parent.0.is_canceled());
             if cancel_parent {
                 parent.cancel();
             }
             assert!(work.as_mut().poll(&mut cx).is_pending());
             fenced.set(true);
             let expected = if cancel_parent {
-                Err(Error::Cancelled)
+                Err(Error::Canceled)
             } else {
                 Ok(String::from("secondary"))
             };
@@ -1513,7 +1513,7 @@ mod hedge_tests {
                 ));
                 let mut cx = Context::from_waker(Waker::noop());
                 assert!(work.as_mut().poll(&mut cx).is_pending());
-                assert_eq!(a.0.is_cancelled(), secondary_error == Error::InvalidInput);
+                assert_eq!(a.0.is_canceled(), secondary_error == Error::InvalidInput);
                 fenced.set(true);
                 let expected = if secondary_error == Error::InvalidInput {
                     Err(secondary_error)
@@ -1566,7 +1566,7 @@ mod hedge_tests {
         parent.cancel();
         assert_eq!(wake.count(), 1);
         assert!(work.as_mut().poll(&mut cx).is_pending());
-        assert!(a.0.is_cancelled() && b.0.is_cancelled());
+        assert!(a.0.is_canceled() && b.0.is_canceled());
         for _ in 0..100 {
             assert!(work.as_mut().poll(&mut cx).is_pending());
         }
@@ -1580,7 +1580,7 @@ mod hedge_tests {
         b_fence.set(true);
         assert_eq!(
             work.as_mut().poll(&mut cx),
-            Poll::Ready(Err(Error::Cancelled))
+            Poll::Ready(Err(Error::Canceled))
         );
         assert_eq!(fixture.won.get(), None);
         assert_eq!(fixture.failures.get(), 0);
@@ -1605,7 +1605,7 @@ mod hedge_tests {
         });
         let secondary = std::future::poll_fn(|_| {
             if ready.get() {
-                assert!(b.0.is_cancelled());
+                assert!(b.0.is_canceled());
                 secondary_drained.set(true);
                 Poll::Ready(Ok(2))
             } else {

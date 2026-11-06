@@ -63,7 +63,7 @@ impl Scope for RequestScope {
     /// Reject canceled requests and requests whose deadline has passed.
     fn check(&self) -> Result<()> {
         if self.canceled.get() {
-            Err(Error::Cancelled)
+            Err(Error::Canceled)
         } else if Instant::now() >= self.deadline {
             Err(Error::DeadlineExceeded)
         } else {
@@ -661,7 +661,7 @@ fn real_partial_read_and_abandoned_open_fence_own_resources() {
     let mut stat = r.file_stat(fd.clone(), &canceled);
     assert!(poll(&mut stat).is_pending());
     canceled.cancel();
-    assert!(matches!(drive(&r, stat), Err(Error::Cancelled)));
+    assert!(matches!(drive(&r, stat), Err(Error::Canceled)));
     drop(fd);
     fs::remove_file(path).unwrap();
     assert_eq!(r.in_flight(), 0);

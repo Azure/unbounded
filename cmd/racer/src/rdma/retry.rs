@@ -208,7 +208,7 @@ mod tests {
             assert_eq!(
                 operation.as_mut().poll(&mut cx),
                 Poll::Ready(Err(if cancel {
-                    Error::Cancelled
+                    Error::Canceled
                 } else {
                     Error::Unavailable
                 }))

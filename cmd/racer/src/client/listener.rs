@@ -572,8 +572,7 @@ impl ClientListeners {
             }
             let deadline = active.deadline.get();
             let force = active.expired != Some(deadline)
-                && (self.io.reactor().ctx().now() >= deadline
-                    || active.cancellation.is_cancelled());
+                && (self.io.reactor().ctx().now() >= deadline || active.cancellation.is_canceled());
             if force {
                 active.expired = Some(deadline);
             }

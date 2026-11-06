@@ -50,13 +50,13 @@ const MIN_GROWTH: usize = 4;
 pub enum Abort {
     /// The working-memory budget was exhausted.
     TooLarge,
-    /// The request was cancelled or timed out.
-    Cancelled,
+    /// The request was canceled or timed out.
+    Canceled,
 }
 
 /// Cancellation flag and remaining working-memory budget for one discovery.
 pub struct Walk {
-    cancelled: Arc<AtomicBool>,
+    canceled: Arc<AtomicBool>,
     remaining: Cell<usize>,
     reads: Cell<usize>,
     #[cfg(test)]
@@ -64,10 +64,10 @@ pub struct Walk {
 }
 
 impl Walk {
-    /// A walk that may retain at most `budget` bytes and stops once `cancelled` is set.
-    pub fn new(cancelled: Arc<AtomicBool>, budget: usize) -> Self {
+    /// A walk that may retain at most `budget` bytes and stops once `canceled` is set.
+    pub fn new(canceled: Arc<AtomicBool>, budget: usize) -> Self {
         Self {
-            cancelled,
+            canceled,
             remaining: Cell::new(budget),
             reads: Cell::new(0),
             #[cfg(test)]
@@ -75,10 +75,10 @@ impl Walk {
         }
     }
 
-    /// Fail if the request has been cancelled.
+    /// Fail if the request has been canceled.
     pub fn check(&self) -> Result<(), Abort> {
-        if self.cancelled.load(Ordering::Acquire) {
-            Err(Abort::Cancelled)
+        if self.canceled.load(Ordering::Acquire) {
+            Err(Abort::Canceled)
         } else {
             Ok(())
         }
@@ -151,7 +151,7 @@ impl Walk {
         self.reads.set(reads);
         #[cfg(test)]
         if self.cancel_after_reads == Some(reads) {
-            self.cancelled.store(true, Ordering::Release);
+            self.canceled.store(true, Ordering::Release);
         }
         Ok(())
     }
@@ -1352,21 +1352,21 @@ mod tests {
     }
 
     #[test]
-    fn cancelled_before_walk_reads_nothing() {
+    fn canceled_before_walk_reads_nothing() {
         let f = Fixture::new();
         block_tree(&f);
         let walk = walk();
-        walk.cancelled.store(true, Ordering::Release);
+        walk.canceled.store(true, Ordering::Release);
         assert_eq!(
             discover(&walk, &f.sys(), &f.dev()).unwrap_err(),
-            Abort::Cancelled
+            Abort::Canceled
         );
         assert_eq!(walk.reads.get(), 0);
         assert_eq!(walk.remaining(), WORKING_BYTES);
     }
 
     #[test]
-    fn cancelled_during_walk_stops_at_the_next_read() {
+    fn canceled_during_walk_stops_at_the_next_read() {
         let f = Fixture::new();
         block_tree(&f);
         rdma_tree(&f);
@@ -1374,7 +1374,7 @@ mod tests {
         walk.cancel_after_reads = Some(5);
         assert_eq!(
             discover(&walk, &f.sys(), &f.dev()).unwrap_err(),
-            Abort::Cancelled
+            Abort::Canceled
         );
         assert_eq!(walk.reads.get(), 5, "no read after cancellation");
     }

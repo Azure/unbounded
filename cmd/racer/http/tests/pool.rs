@@ -101,8 +101,8 @@ impl Scope for RequestScope {
     type Error = Error;
 
     fn check(&self) -> Result<()> {
-        if self.cancellation.is_cancelled() {
-            return Err(racer_io::Error::Cancelled.into());
+        if self.cancellation.is_canceled() {
+            return Err(racer_io::Error::Canceled.into());
         }
         if Instant::now() >= self.deadline {
             return Err(racer_io::Error::DeadlineExceeded.into());
@@ -358,7 +358,7 @@ fn waiting_cancel_deadline_close_stop_and_drop_release_only_waiter_quota() {
         let expected = match case {
             "cancel" => {
                 scope.cancellation.cancel().unwrap();
-                racer_io::Error::Cancelled
+                racer_io::Error::Canceled
             }
             "deadline" => {
                 std::thread::sleep(Duration::from_millis(30));
@@ -662,7 +662,7 @@ fn canceled_receive_retains_resources_until_completion_and_reports_canceled() {
     assert_eq!(admission.used(Resource::Connection), 1);
     assert!(matches!(
         drive(&reactor, future),
-        Err(Error::Runtime(racer_io::Error::Cancelled))
+        Err(Error::Runtime(racer_io::Error::Canceled))
     ));
     assert_eq!(admission.used(Resource::Connection), 0);
     assert_eq!(

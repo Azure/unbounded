@@ -582,7 +582,7 @@ impl<T: Types> WorkerCore<T> {
         let (page, waiter) = (r.page.clone(), r.waiter);
         let mut wakes = Vec::new();
         self.flights.cancel(&page, waiter, &mut wakes);
-        self.respond(request, Err(Error::Cancelled), now, out);
+        self.respond(request, Err(Error::Canceled), now, out);
         self.wake(wakes, now, out);
     }
 

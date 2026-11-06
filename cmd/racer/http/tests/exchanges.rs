@@ -204,7 +204,7 @@ fn disconnect_waits_for_work_cleanup_before_returning_failure() {
             work,
         ),
     );
-    assert_eq!(result, Err(Failure::Runtime(racer_io::Error::Cancelled)));
+    assert_eq!(result, Err(Failure::Runtime(racer_io::Error::Canceled)));
     assert!(canceled.get() && cleaned.get() && watch_canceled.get());
     assert_eq!(io.reactor().in_flight(), 0);
 }
@@ -223,8 +223,8 @@ mod disconnect_scopes {
         type Error = Failure;
 
         fn check(&self) -> Result<(), Failure> {
-            if self.0.is_cancelled() {
-                Err(racer_io::Error::Cancelled.into())
+            if self.0.is_canceled() {
+                Err(racer_io::Error::Canceled.into())
             } else {
                 Ok(())
             }
@@ -287,7 +287,7 @@ mod disconnect_scopes {
             let watch = CancelScope(Cancellation::new().unwrap());
             let cleanup_turns = Cell::new(0);
             let work = std::future::poll_fn(|cx| {
-                if cancel && !exchange.0.is_cancelled() {
+                if cancel && !exchange.0.is_canceled() {
                     return Poll::Pending;
                 }
                 cleanup_turns.set(cleanup_turns.get() + 1);
@@ -323,14 +323,14 @@ mod disconnect_scopes {
             assert_eq!(
                 result,
                 if cancel {
-                    Err(Failure::Runtime(racer_io::Error::Cancelled))
+                    Err(Failure::Runtime(racer_io::Error::Canceled))
                 } else {
                     Ok(7)
                 }
             );
-            assert!(watch.0.is_cancelled());
-            assert_eq!(parent.0.is_cancelled(), cancel);
-            assert_eq!(exchange.0.is_cancelled(), cancel);
+            assert!(watch.0.is_canceled());
+            assert_eq!(parent.0.is_canceled(), cancel);
+            assert_eq!(exchange.0.is_canceled(), cancel);
             assert_eq!(cleanup_turns.get(), 2);
             assert_eq!(io.reactor().in_flight(), 0);
         }
@@ -361,7 +361,7 @@ mod disconnect_scopes {
         ));
         assert_eq!(result, Err(error));
         assert_eq!(io.reactor().in_flight(), 0);
-        assert!(!parent.0.is_cancelled());
+        assert!(!parent.0.is_canceled());
     }
 }
 /// Poll one operation and its reactor under a fixed progress deadline.

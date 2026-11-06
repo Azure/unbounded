@@ -218,7 +218,7 @@ impl<W, V, B, S: Scope> Mailbox<W, V, B, S> {
 
     /// Mark queued replies abandoned without releasing commands or their capacity.
     /// Delivery may end immediately, but completion-only polling still waits for
-    /// actual completion (reported as `Cancelled`) or producer loss (`Unavailable`).
+    /// actual completion (reported as `Canceled`) or producer loss (`Unavailable`).
     pub fn abandon_queued(&self) {
         let replies: Vec<_> = lock(&self.state)
             .queue
@@ -257,12 +257,12 @@ impl<W, V, B, S: Scope> Mailbox<W, V, B, S> {
 impl<W, V, B, S: Scope> Receipt<W, V, B, S> {
     /// Wait for the accepted work's fence, ignoring cancellation as an early
     /// return condition. The caller must check its scope after completion.
-    /// `Cancelled` means actual completion arrived but abandoned delivery discarded
+    /// `Canceled` means actual completion arrived but abandoned delivery discarded
     /// its output, not merely that cancellation or abandonment was requested.
     /// Producer loss returns `Unavailable`, not a successful ownership fence.
     /// Producers must retain `Command::permit` until external resources are safe.
     /// Values are consumed once; polling again after a value returns `Pending`,
-    /// not `Cancelled`. Discarded and producer-loss errors remain observable.
+    /// not `Canceled`. Discarded and producer-loss errors remain observable.
     pub fn poll_completion(&self, cx: &mut Context<'_>) -> Poll<Result<Completion<V, B>>> {
         self.reply.poll_completion(cx)
     }
@@ -281,12 +281,12 @@ impl<W, V, B, S: Scope> Future for Receipt<W, V, B, S> {
             return Poll::Ready(Err(error));
         }
         if self.reply.is_abandoned() {
-            return Poll::Ready(Err(Error::Cancelled.into()));
+            return Poll::Ready(Err(Error::Canceled.into()));
         }
         let result = self.reply.poll_completion(cx);
         // Abandonment may precede waker registration after the first check.
         if result.is_pending() && self.reply.is_abandoned() {
-            return Poll::Ready(Err(Error::Cancelled.into()));
+            return Poll::Ready(Err(Error::Canceled.into()));
         }
         result.map(|result| result.map_err(Into::into))
     }
@@ -359,7 +359,7 @@ impl<V, B> Reply<V, B> {
             return Poll::Ready(Err(Error::Unavailable));
         }
         if state.status == ReplyStatus::Discarded {
-            return Poll::Ready(Err(Error::Cancelled));
+            return Poll::Ready(Err(Error::Canceled));
         }
         let old = state.waker.replace(waker);
         drop(state);
@@ -512,8 +512,8 @@ mod tests {
 
         /// Admit work only while its shared cancellation scope remains active.
         fn check(&self) -> Result<()> {
-            if self.0.is_cancelled() {
-                Err(Error::Cancelled)
+            if self.0.is_canceled() {
+                Err(Error::Canceled)
             } else {
                 Ok(())
             }
@@ -563,7 +563,7 @@ mod tests {
         assert!(count.count() > 0);
         assert!(matches!(
             Pin::new(&mut receipt).poll(&mut cx),
-            Poll::Ready(Err(Error::Cancelled))
+            Poll::Ready(Err(Error::Canceled))
         ));
         assert!(receipt.poll_completion(&mut cx).is_pending());
         drop(receipt);
@@ -631,7 +631,7 @@ mod tests {
         assert_eq!(counter.wakes.load(Ordering::Relaxed), 1);
         assert!(matches!(
             Pin::new(&mut receipt).poll(&mut cx),
-            Poll::Ready(Err(Error::Cancelled))
+            Poll::Ready(Err(Error::Canceled))
         ));
         assert!(mailbox.has_queued());
         assert_eq!(mailbox.outstanding(), 1);
@@ -651,7 +651,7 @@ mod tests {
             .unwrap();
         assert!(matches!(
             receipt.poll_completion(&mut fence_cx),
-            Poll::Ready(Err(Error::Cancelled))
+            Poll::Ready(Err(Error::Canceled))
         ));
         assert_eq!(dropped.load(Ordering::Relaxed), 1);
         drop(command);
@@ -691,7 +691,7 @@ mod tests {
         let waker = unsafe { Waker::from_raw(RawWaker::new(std::ptr::null(), &VTABLE)) };
         assert!(matches!(
             Pin::new(&mut receipt).poll(&mut Context::from_waker(&waker)),
-            Poll::Ready(Err(Error::Cancelled))
+            Poll::Ready(Err(Error::Canceled))
         ));
         assert_eq!(mailbox.outstanding(), 1);
         drop(mailbox.take_queued());
@@ -717,7 +717,7 @@ mod tests {
                 let mut cx = Context::from_waker(&waker);
                 assert!(matches!(
                     Pin::new(&mut receipt).poll(&mut cx),
-                    Poll::Ready(Err(Error::Cancelled))
+                    Poll::Ready(Err(Error::Canceled))
                 ));
                 if poll_before_complete {
                     assert!(receipt.poll_completion(&mut cx).is_pending());
@@ -743,7 +743,7 @@ mod tests {
                 for _ in 0..2 {
                     assert!(matches!(
                         receipt.poll_completion(&mut cx),
-                        Poll::Ready(Err(Error::Cancelled))
+                        Poll::Ready(Err(Error::Canceled))
                     ));
                 }
                 assert_eq!(
@@ -772,7 +772,7 @@ mod tests {
                     assert_eq!(mailbox.outstanding(), 1);
                     assert!(matches!(
                         receipt.poll_completion(&mut cx),
-                        Poll::Ready(Err(Error::Cancelled))
+                        Poll::Ready(Err(Error::Canceled))
                     ));
                     drop(receipt);
                 }
@@ -960,7 +960,7 @@ mod tests {
     }
 
     #[test]
-    fn cancelled_completion_poll_waits_for_reply_not_cancellation() {
+    fn canceled_completion_poll_waits_for_reply_not_cancellation() {
         let (mailbox, scope) = setup();
         let receipt = mailbox.submit(1, String::new(), &scope, None).unwrap();
         let command = mailbox.pop().unwrap();
@@ -1011,7 +1011,7 @@ mod tests {
         let mut cx = Context::from_waker(futures::task::noop_waker_ref());
         assert!(matches!(
             Pin::new(&mut receipt).poll(&mut cx),
-            Poll::Ready(Err(Error::Cancelled))
+            Poll::Ready(Err(Error::Canceled))
         ));
         drop(receipt);
         mailbox.uninstall().unwrap();

@@ -69,6 +69,7 @@ impl Outcome {
             Self::Succeeded => "succeeded",
             Self::Partial => "partial",
             Self::Failed => "failed",
+            // Published label value; keeps the British spelling.
             Self::Canceled => "cancelled",
         }
     }

@@ -221,7 +221,7 @@ metrics! { Event, EVENTS, EVENT_COUNT;
             Self::PeerReceiveAdmitted => "racer_peer_receive_admitted_total",
             Self::PeerReceiveFull => "racer_peer_receive_full_total",
             Self::PeerReceiveTimeout => "racer_peer_receive_timeout_total",
-            Self::PeerReceiveCancelled => "racer_peer_receive_canceled_total",
+            Self::PeerReceiveCanceled => "racer_peer_receive_canceled_total",
             Self::PeerReceiveWaitNs => "racer_peer_receive_wait_ns_total",
             Self::PageHedgeStarted => "racer_page_hedges_started_total",
             Self::PageHedgeWon => "racer_page_hedges_won_total",
@@ -239,7 +239,8 @@ metrics! { Event, EVENTS, EVENT_COUNT;
             Self::RequestErrorOverloaded => "racer_request_errors_overloaded_total",
             Self::RequestErrorUnavailable => "racer_request_errors_unavailable_total",
             Self::RequestErrorDeadline => "racer_request_errors_deadline_total",
-            Self::RequestErrorCancelled => "racer_request_errors_cancelled_total",
+            // Published metric names keep the British "cancelled" spelling.
+            Self::RequestErrorCanceled => "racer_request_errors_cancelled_total",
             Self::RequestErrorOther => "racer_request_errors_other_total",
             Self::MemoryHit => "racer_memory_hits_total",
             Self::DiskHit => "racer_disk_hits_total",
@@ -308,7 +309,8 @@ metrics! { Event, EVENTS, EVENT_COUNT;
             Self::OpaqueRelayBodyCompleted => "racer_opaque_relay_body_completed_total",
             Self::OpaqueRelayBodyBytes => "racer_opaque_relay_body_completed_bytes_total",
             Self::OpaqueRelayBodyFailed => "racer_opaque_relay_body_failed_total",
-            Self::CryptoDecryptFailureCancelled => "racer_crypto_decrypt_failure_cancelled_total",
+            // Published metric name; keeps the British "cancelled" spelling.
+            Self::CryptoDecryptFailureCanceled => "racer_crypto_decrypt_failure_cancelled_total",
             Self::CryptoDecryptFailureDeadlineExceeded => "racer_crypto_decrypt_failure_deadline_exceeded_total",
             Self::CryptoDecryptFailureMissingKey => "racer_crypto_decrypt_failure_missing_key_total",
             Self::CryptoDecryptFailureInvalidConfiguration => "racer_crypto_decrypt_failure_invalid_configuration_total",
@@ -487,7 +489,7 @@ fn request_error_reason(failure: Option<crate::error::Error>) -> Event {
         Some(Error::Overloaded | Error::FlightFull) => Event::RequestErrorOverloaded,
         Some(Error::Unavailable) => Event::RequestErrorUnavailable,
         Some(Error::DeadlineExceeded) => Event::RequestErrorDeadline,
-        Some(Error::Cancelled) => Event::RequestErrorCancelled,
+        Some(Error::Canceled) => Event::RequestErrorCanceled,
         _ => Event::RequestErrorOther,
     }
 }

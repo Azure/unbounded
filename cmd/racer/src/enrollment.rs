@@ -884,10 +884,10 @@ mod tests {
     impl Scope for Request {
         type Error = Failure;
 
-        /// Stop cancelled requests before admitting more simulated I/O.
+        /// Stop canceled requests before admitting more simulated I/O.
         fn check(&self) -> Result<(), Failure> {
-            if self.cancellation.is_cancelled() {
-                Err(racer_io::Error::Cancelled.into())
+            if self.cancellation.is_canceled() {
+                Err(racer_io::Error::Canceled.into())
             } else {
                 Ok(())
             }
@@ -1551,7 +1551,7 @@ mod tests {
                 }
                 let expected = Failure {
                     cause: Cause::Runtime(if case == "cancel-rename" {
-                        racer_io::Error::Cancelled
+                        racer_io::Error::Canceled
                     } else {
                         racer_io::Error::Os(if case == "write" { 28 } else { 5 })
                     }),
@@ -1614,7 +1614,7 @@ mod tests {
         scope.cancellation.cancel().unwrap();
         let before = sim.trace().len();
         assert!(
-            matches!(drive(&files, e.load_identity(&scope)), Err(error) if error == racer_io::Error::Cancelled.into())
+            matches!(drive(&files, e.load_identity(&scope)), Err(error) if error == racer_io::Error::Canceled.into())
         );
         assert_eq!(sim.trace().len(), before);
         assert_eq!(files.next.get(), 2);

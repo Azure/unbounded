@@ -935,7 +935,7 @@ impl Error {
             Self::DeadlineExceeded => Fault::DeadlineExceeded,
             Self::BadGateway => Fault::BadGateway,
             Self::CorruptRecord => Fault::CorruptRecord,
-            Self::Cancelled => Fault::Cancelled,
+            Self::Canceled => Fault::Canceled,
             Self::HopBudgetExhausted => Fault::HopBudgetExhausted,
             Self::IncompatibleMembership => Fault::IncompatibleMembership,
             Self::NotFound => Fault::NotFound,
@@ -2076,7 +2076,7 @@ pub(crate) mod tests {
             scope.cancel().unwrap();
             assert!(matches!(
                 future.as_mut().poll(&mut cx),
-                Poll::Ready(Err(Error::Cancelled))
+                Poll::Ready(Err(Error::Canceled))
             ));
             assert_eq!(scored_members(), before, "ranking uses frozen weights");
         }
@@ -2377,7 +2377,7 @@ pub(crate) mod tests {
         }
         /// Production `Paths::new` queues searches beyond its 8
         /// slots instead of failing them with `Overloaded`; a queued search runs
-        /// when a slot frees, and a cancelled one leaves the queue.
+        /// when a slot frees, and a canceled one leaves the queue.
         #[test]
         fn searches_beyond_the_slot_limit_wait_for_a_slot() {
             let env = racer_io::Env::host();
@@ -2400,13 +2400,13 @@ pub(crate) mod tests {
             for search in &mut running {
                 assert!(search.as_mut().poll(&mut cx).is_pending());
             }
-            let mut cancelled =
+            let mut canceled =
                 paths.shortest_async(members.clone(), source, &budgets[8], &scopes[8]);
-            assert!(cancelled.as_mut().poll(&mut cx).is_pending());
+            assert!(canceled.as_mut().poll(&mut cx).is_pending());
             let mut waiting =
                 paths.shortest_async(members.clone(), source, &budgets[9], &scopes[9]);
             assert!(waiting.as_mut().poll(&mut cx).is_pending());
-            drop(cancelled);
+            drop(canceled);
             drop(running.pop());
             let route = loop {
                 if let std::task::Poll::Ready(route) = waiting.as_mut().poll(&mut cx) {
@@ -2739,7 +2739,7 @@ pub(crate) mod tests {
                     clock.advance(Duration::from_secs(2));
                 }
                 let expected = if case == 0 {
-                    Error::Cancelled
+                    Error::Canceled
                 } else {
                     Error::DeadlineExceeded
                 };

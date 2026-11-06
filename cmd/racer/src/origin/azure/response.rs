@@ -86,7 +86,7 @@ pub fn transport_error(error: Error) -> Error {
     match error {
         Error::Io | Error::Os(_) | Error::Unavailable => Error::Unavailable,
         Error::DeadlineExceeded
-        | Error::Cancelled
+        | Error::Canceled
         | Error::Overloaded
         | Error::OriginRejected
         | Error::OriginForbidden => error,
@@ -269,7 +269,7 @@ mod tests {
         for error in [Error::Io, Error::Os(104), Error::Unavailable] {
             assert_eq!(transport_error(error), Error::Unavailable);
         }
-        for error in [Error::DeadlineExceeded, Error::Cancelled] {
+        for error in [Error::DeadlineExceeded, Error::Canceled] {
             assert_eq!(transport_error(error), error);
         }
         for error in [

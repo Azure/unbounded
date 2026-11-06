@@ -415,7 +415,7 @@ fn kernel_cancel_token_and_abandonment_retain_owners_until_fenced() {
     let remote = token.clone();
     std::thread::spawn(move || remote.cancel()).join().unwrap();
     let result = executor.block_on(&reactor, handle).unwrap();
-    assert_eq!(result.unwrap_err(), Error::Cancelled);
+    assert_eq!(result.unwrap_err(), Error::Canceled);
     assert_eq!(drops.get(), 1);
     assert_eq!(reactor.in_flight(), 0);
 
@@ -540,11 +540,11 @@ fn kernel_timers_and_class_fences() {
     executor
         .block_on(&reactor, reactor.fence_class(IoClass(3)))
         .unwrap();
-    assert_eq!(fenced.try_take().unwrap().unwrap_err(), Error::Cancelled);
+    assert_eq!(fenced.try_take().unwrap().unwrap_err(), Error::Canceled);
     assert!(!other.is_finished());
     assert_eq!(reactor.in_flight(), 1);
     executor.block_on(&reactor, reactor.fence_all()).unwrap();
-    assert_eq!(other.try_take().unwrap().unwrap_err(), Error::Cancelled);
+    assert_eq!(other.try_take().unwrap().unwrap_err(), Error::Canceled);
     assert!(reactor.is_stopped());
 }
 
@@ -624,7 +624,7 @@ fn reserved_partition_is_kept_for_reserved_operations() {
     for handle in [a, b, d] {
         assert_eq!(
             executor.block_on(&reactor, handle).unwrap().unwrap_err(),
-            Error::Cancelled
+            Error::Canceled
         );
     }
     assert!(
@@ -676,7 +676,7 @@ fn reserved_partition_can_be_resized_while_running() {
     for handle in [a, b, d] {
         assert_eq!(
             executor.block_on(&reactor, handle).unwrap().unwrap_err(),
-            Error::Cancelled
+            Error::Canceled
         );
     }
     reactor.set_reserved_entries(0).unwrap();
@@ -918,7 +918,7 @@ fn sim_cancel_fences_and_file_ops() {
     executor.run_ready(16);
     token.cancel();
     let result = executor.block_on(&reactor, handle).unwrap();
-    assert_eq!(result.unwrap_err(), Error::Cancelled);
+    assert_eq!(result.unwrap_err(), Error::Canceled);
     assert_eq!(drops.get(), 1);
     assert_eq!(reactor.in_flight(), 0);
 }
@@ -1075,10 +1075,10 @@ mod reactor_edge_cases {
         );
         let mut cx = Context::from_waker(Waker::noop());
         assert!(Pin::new(&mut recv).poll(&mut cx).is_pending());
-        reactor.cancel_op(recv.id().unwrap(), Error::Cancelled);
+        reactor.cancel_op(recv.id().unwrap(), Error::Canceled);
         let executor = LocalExecutor::new(Some(reactor.wake_handle()));
         let result = executor.block_on(&reactor, recv).unwrap();
-        assert_eq!(result.unwrap_err(), Error::Cancelled);
+        assert_eq!(result.unwrap_err(), Error::Canceled);
         assert_eq!(reactor.stats().retries, 0);
         assert_eq!(drops.get(), 1);
         assert_eq!(reactor.in_flight(), 0);

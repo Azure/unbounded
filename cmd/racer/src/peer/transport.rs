@@ -1856,7 +1856,7 @@ mod tests {
             Error::Overloaded,
             Error::Unavailable,
             Error::DeadlineExceeded,
-            Error::Cancelled,
+            Error::Canceled,
             Error::InvalidRequest,
             Error::Io,
         ] {
@@ -2292,7 +2292,7 @@ mod tests {
             ));
             assert!(!native_failure(Error::Unauthorized, &scope));
             scope.cancel().unwrap();
-            assert_eq!(native.check(), Err(Error::Cancelled));
+            assert_eq!(native.check(), Err(Error::Canceled));
             assert!(!native_failure(Error::DeadlineExceeded, &scope));
             assert!(!native_failure(Error::Os(libc::ECONNRESET), &scope));
         }

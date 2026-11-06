@@ -964,11 +964,7 @@ pub mod secure {
 
                 /// Reject canceled parent requests before any host callbacks.
                 fn check(&self) -> Result<()> {
-                    if self.1 {
-                        Err(Error::Cancelled)
-                    } else {
-                        Ok(())
-                    }
+                    if self.1 { Err(Error::Canceled) } else { Ok(()) }
                 }
             }
 
@@ -1036,7 +1032,7 @@ pub mod secure {
             });
             assert!(std::ptr::eq(Host::reactor(&host), &host.reactor));
             assert!(<Rc<Hosting> as Host>::is_missing(Error::NotFound));
-            assert!(!<Rc<Hosting> as Host>::is_missing(Error::Cancelled));
+            assert!(!<Rc<Hosting> as Host>::is_missing(Error::Canceled));
             let attempts = Attempts::default();
             let parent = Request(0, false);
             let (guard, scope) =
@@ -1072,7 +1068,7 @@ pub mod secure {
             drop(guard);
             assert!(matches!(
                 futures::executor::block_on(attempts.begin(&host, &Request(0, true))),
-                Err(Error::Cancelled)
+                Err(Error::Canceled)
             ));
             assert_eq!(host.next.get(), 2);
             let (guard, _) = futures::executor::block_on(attempts.begin(&host, &parent)).unwrap();
@@ -1282,7 +1278,7 @@ mod secure_tests {
         request.cancel().unwrap();
         assert!(matches!(
             drive(&r, r.file_directory(Path::new("/"), false, 4096, &request)),
-            Err(Error::Cancelled)
+            Err(Error::Canceled)
         ));
     }
 

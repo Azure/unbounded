@@ -671,7 +671,7 @@ fn cancel_discards_ready_pages_and_late_fills() {
         id: ids[0],
         found: true,
     });
-    let out = h.on(Input::Cancel(Error::Cancelled));
+    let out = h.on(Input::Cancel(Error::Canceled));
     assert_eq!(out, [Effect::Discard(ids[0])]);
     assert_eq!(
         h.on(Input::Probed {
@@ -680,7 +680,7 @@ fn cancel_discards_ready_pages_and_late_fills() {
         }),
         [Effect::Discard(ids[1])]
     );
-    assert_eq!(h.next().0, Next::Fail(Error::Cancelled));
+    assert_eq!(h.next().0, Next::Fail(Error::Canceled));
     assert!(h.pump().is_empty());
 }
 

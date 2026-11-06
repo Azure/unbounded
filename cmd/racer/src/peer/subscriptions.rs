@@ -95,7 +95,7 @@ impl From<racer_core::subscriptions::Kind> for Error {
         use racer_core::subscriptions::Kind;
         match kind {
             Kind::DeadlineExceeded => Self::DeadlineExceeded,
-            Kind::Cancelled => Self::Cancelled,
+            Kind::Canceled => Self::Canceled,
             Kind::Overloaded => Self::Overloaded,
             Kind::Unavailable => Self::Unavailable,
             Kind::StaleFlight => Self::StaleFlight,

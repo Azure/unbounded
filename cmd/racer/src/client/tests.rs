@@ -1908,13 +1908,13 @@ fn client_disconnect_cancels_pending_metadata_before_acquisition_deadline() {
     // is observed and the connection is gone, well inside the acquisition
     // deadline.
     let wait = Instant::now() + Duration::from_secs(1);
-    while (!scope.cancellation.is_cancelled() || fixture.listeners.active_connections() != 0)
+    while (!scope.cancellation.is_canceled() || fixture.listeners.active_connections() != 0)
         && Instant::now() < wait
     {
         fixture.pump(16);
         std::thread::yield_now();
     }
-    assert!(scope.cancellation.is_cancelled());
+    assert!(scope.cancellation.is_canceled());
     assert!(Instant::now() < scope.deadline.0);
     assert_no_body_leases(&fixture);
 }
@@ -2494,7 +2494,7 @@ fn actual_uds_read_failures_and_immutable_result_validation() {
             416,
             Some("content-range: bytes */17\r\n"),
         ),
-        (Error::Cancelled, "", 503, None),
+        (Error::Canceled, "", 503, None),
         (Error::OriginRejected, "", 401, None),
         (Error::OriginForbidden, "", 403, None),
         (Error::Overloaded, "", 503, None),
@@ -2507,7 +2507,7 @@ fn actual_uds_read_failures_and_immutable_result_validation() {
                 etag: StrongEtag::parse(b"\"v1\"").unwrap(),
             }
         };
-        let output = fixture.result_output(kind, Err(error), error == Error::Cancelled);
+        let output = fixture.result_output(kind, Err(error), error == Error::Canceled);
         let text = std::str::from_utf8(&output).unwrap().to_ascii_lowercase();
         assert!(text.starts_with(&format!("http/1.1 {status}")), "{text}");
         assert!(text.contains("content-length: 0\r\n"));
@@ -3718,7 +3718,7 @@ mod response {
             Error::Overloaded,
             Error::Io,
             Error::InvalidRequest,
-            Error::Cancelled,
+            Error::Canceled,
             Error::DeadlineExceeded,
         ] {
             assert!(
@@ -3818,11 +3818,7 @@ mod response {
     #[test]
     fn slice_failure_never_submits_auxiliary_readiness() {
         let mut cx = Context::from_waker(futures::task::noop_waker_ref());
-        for error in [
-            Error::Cancelled,
-            Error::DeadlineExceeded,
-            Error::Unavailable,
-        ] {
+        for error in [Error::Canceled, Error::DeadlineExceeded, Error::Unavailable] {
             assert!(
                 matches!(poll_slice_or_readiness(&mut cx, |_| Poll::Ready(Err(error)), |_| panic!("terminal acquisition must not submit readiness")), Poll::Ready(Err(actual)) if actual == error)
             );

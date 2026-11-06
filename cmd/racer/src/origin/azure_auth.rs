@@ -94,7 +94,7 @@ pub enum AuthError {
     Configuration,
 
     /// The caller's scope was canceled.
-    Cancelled,
+    Canceled,
 
     /// The caller's deadline expired.
     DeadlineExceeded,
@@ -108,7 +108,7 @@ impl std::fmt::Display for AuthError {
             Self::Malformed => f.write_str("malformed token response"),
             Self::TenantUnknown => f.write_str("workload identity tenant unknown"),
             Self::Configuration => f.write_str("invalid Azure credential configuration"),
-            Self::Cancelled => f.write_str("canceled"),
+            Self::Canceled => f.write_str("canceled"),
             Self::DeadlineExceeded => f.write_str("deadline exceeded"),
         }
     }
@@ -119,7 +119,7 @@ impl std::error::Error for AuthError {}
 impl From<Error> for AuthError {
     fn from(error: Error) -> Self {
         match error {
-            Error::Cancelled => Self::Cancelled,
+            Error::Canceled => Self::Canceled,
             Error::DeadlineExceeded => Self::DeadlineExceeded,
             Error::InvalidConfiguration => Self::Configuration,
             _ => Self::Unavailable,
@@ -130,7 +130,7 @@ impl From<Error> for AuthError {
 impl From<AuthError> for Error {
     fn from(error: AuthError) -> Self {
         match error {
-            AuthError::Cancelled => Self::Cancelled,
+            AuthError::Canceled => Self::Canceled,
             AuthError::DeadlineExceeded => Self::DeadlineExceeded,
             AuthError::Configuration => Self::InvalidConfiguration,
             AuthError::Rejected(_) | AuthError::TenantUnknown => Self::OriginForbidden,
@@ -219,7 +219,7 @@ struct Flight {
 }
 
 /// Leadership of the node-wide refresh. Dropping it without
-/// [`FlightGuard::finish`] (a cancelled fetch) releases leadership without
+/// [`FlightGuard::finish`] (a canceled fetch) releases leadership without
 /// a result, so a waiter takes over.
 struct FlightGuard<'a> {
     cache: &'a AzureTokenCache,
@@ -476,7 +476,7 @@ impl AzureTokenSource {
                 Err(seen) => seen,
             };
             self.wait(seen, scope).await?;
-            // A finished fetch answers every waiter; a cancelled one does not,
+            // A finished fetch answers every waiter; a canceled one does not,
             // and the next pass leads a new fetch.
             if let Some(failure) = self.cache.completed_since(seen) {
                 let now = self.wall_now();
@@ -513,7 +513,7 @@ impl AzureTokenSource {
                 Ok(value)
             }
             Err(error) => {
-                if !matches!(error, AuthError::Cancelled | AuthError::DeadlineExceeded) {
+                if !matches!(error, AuthError::Canceled | AuthError::DeadlineExceeded) {
                     flight.finish(Some(error));
                     if let Some(token) = self.cache.unexpired(self.wall_now()) {
                         return Ok(token);
@@ -703,7 +703,7 @@ async fn read_assertion(
     let bytes = secure::read_path(reactor, path, MAX_ASSERTION as usize + 1, scope)
         .await
         .map_err(|error| match error {
-            Error::Cancelled => AuthError::Cancelled,
+            Error::Canceled => AuthError::Canceled,
             Error::DeadlineExceeded => AuthError::DeadlineExceeded,
             _ => AuthError::Configuration,
         })?;

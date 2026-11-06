@@ -4432,7 +4432,7 @@ mod tests {
             assert_eq!(drain(&link.a), Err(Error::Io));
             assert_eq!(link.a.failure().unwrap().status, status::RNR_RETRY_EXC_ERR);
             // The next progress retries the stop.
-            assert_eq!(drain(&link.b), Err(Error::Cancelled));
+            assert_eq!(drain(&link.b), Err(Error::Canceled));
             assert!(link.b.stopped());
             assert_eq!(peek(&link.pages, 4096, 17), [0xa5; 17]);
             stop_both(&link);

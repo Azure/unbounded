@@ -679,7 +679,7 @@ pub(crate) mod tests {
             let expected = match case {
                 "write" => Err(Error::Os(libc::ENOSPC)),
                 "rename" => Err(Error::RenameUncertain(PublicationCause::Os(libc::EIO))),
-                "cancel-rename" => Err(Error::RenameUncertain(PublicationCause::Cancelled)),
+                "cancel-rename" => Err(Error::RenameUncertain(PublicationCause::Canceled)),
                 "sync" => Err(Error::PublishedNotDurable(PublicationCause::Os(libc::EIO))),
                 _ => Ok(()),
             };
@@ -1281,19 +1281,19 @@ pub(crate) mod tests {
                 scope.cancel().unwrap();
                 assert!(matches!(
                     turn.as_mut().poll(&mut cx),
-                    std::task::Poll::Ready(Err(Error::Cancelled))
+                    std::task::Poll::Ready(Err(Error::Canceled))
                 ));
             } else {
                 scope.cancel().unwrap();
                 assert_eq!(
                     testing::drive(&reactor, Box::pin(sync.turn(&scope))),
-                    Err(Error::Cancelled)
+                    Err(Error::Canceled)
                 );
             }
             assert_eq!(submissions.get(), 1);
             assert_eq!(
                 testing::drive(&reactor, Box::pin(sync.shutdown(&scope))),
-                Err(Error::Cancelled)
+                Err(Error::Canceled)
             );
             release.send(()).unwrap();
             let shutdown_scope = RequestScope::on(
@@ -1845,7 +1845,7 @@ pub(crate) mod tests {
                         drop(connection);
                     }
                     "cancel" => {
-                        assert!(matches!(result, Err(Error::Cancelled)));
+                        assert!(matches!(result, Err(Error::Canceled)));
                         assert_eq!(io.calls(), 1);
                     }
                     _ => {

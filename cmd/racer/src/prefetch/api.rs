@@ -173,7 +173,7 @@ pub enum State {
     Partial,
     #[serde(rename = "FAILED")]
     Failed,
-    #[serde(rename = "CANCELLED")]
+    #[serde(rename = "CANCELED")]
     Canceled,
 }
 

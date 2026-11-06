@@ -4068,7 +4068,7 @@ pub(super) mod tests {
         let (membership, placement, context, scope, credentials) = fixture(&env);
         let peer = Rc::new(ProbePeer {
             calls: RefCell::new(vec![]),
-            error: Error::Cancelled,
+            error: Error::Canceled,
         });
         let policy = CandidatePolicy::new(
             NodeId("outside".into()),
@@ -4100,11 +4100,7 @@ pub(super) mod tests {
             &mut budget,
         ));
         assert_eq!(peer.calls.borrow().len(), 1);
-        assert!(
-            matches!(result, Err(Error::Cancelled)),
-            "{:?}",
-            result.err()
-        );
+        assert!(matches!(result, Err(Error::Canceled)), "{:?}", result.err());
     }
 
     /// A failure before the request leaves this node is reported as not sent, so the walk does
@@ -4471,11 +4467,11 @@ pub(super) mod tests {
         });
         let mut policy = policy(&env, owner, peers);
         policy.published = crate::test_support::published_membership(members);
-        let cancelled = scope();
-        cancelled.cancel().unwrap();
+        let canceled = scope();
+        canceled.cancel().unwrap();
         assert_eq!(
-            futures::executor::block_on(policy.refresh_ownership_scoped(&page, &cancelled)),
-            Err(Error::Cancelled)
+            futures::executor::block_on(policy.refresh_ownership_scoped(&page, &canceled)),
+            Err(Error::Canceled)
         );
         assert!(!policy.owns_current(&page));
         futures::executor::block_on(policy.refresh_ownership_scoped(&page, &scope())).unwrap();
@@ -4940,7 +4936,7 @@ pub(super) mod tests {
                         );
                     } else {
                         assert!(result.is_pending());
-                        assert!(!a.cancellation.is_cancelled());
+                        assert!(!a.cancellation.is_canceled());
                         ready.set(true);
                         assert!(
                             matches!(work.as_mut().poll(&mut cx), Poll::Ready(Ok(page)) if page.plaintext.bytes() == [42])
@@ -4989,7 +4985,7 @@ pub(super) mod tests {
             };
             assert_eq!(
                 futures::executor::block_on(race(never(), never(), &a, &b, &parent, &permit)).err(),
-                Some(Error::Cancelled)
+                Some(Error::Canceled)
             );
         }
         #[test]
@@ -5013,7 +5009,7 @@ pub(super) mod tests {
                     let parent = scope(&env);
                     let primary = std::future::poll_fn(|cx| {
                         if primary_fence.get() {
-                            Poll::Ready(Err(Error::Cancelled))
+                            Poll::Ready(Err(Error::Canceled))
                         } else {
                             cx.waker().wake_by_ref();
                             Poll::Pending
@@ -5085,7 +5081,7 @@ pub(super) mod tests {
             let fence = Rc::new(Cell::new(false));
             let primary = std::future::poll_fn(|_| {
                 if fence.get() {
-                    Poll::Ready(Err(Error::Cancelled))
+                    Poll::Ready(Err(Error::Canceled))
                 } else {
                     Poll::Pending
                 }
@@ -5102,8 +5098,8 @@ pub(super) mod tests {
             assert!(race.as_mut().poll(&mut cx).is_pending());
             clock.advance(Duration::from_millis(10));
             assert!(race.as_mut().poll(&mut cx).is_pending());
-            assert!(a.cancellation.is_cancelled());
-            assert!(!parent.cancellation.is_cancelled());
+            assert!(a.cancellation.is_canceled());
+            assert!(!parent.cancellation.is_canceled());
             assert!(matches!(owner.acquire(MAX_PAGE), Err(Error::Overloaded)));
             fence.set(true);
             assert!(
@@ -5142,7 +5138,7 @@ pub(super) mod tests {
             assert!(race.as_mut().poll(&mut cx).is_pending());
             clock.advance(Duration::from_millis(10));
             assert!(race.as_mut().poll(&mut cx).is_pending());
-            assert!(!a.cancellation.is_cancelled());
+            assert!(!a.cancellation.is_canceled());
             ready.set(true);
             assert!(
                 matches!(race.as_mut().poll(&mut cx), Poll::Ready(Ok(page)) if page.plaintext.bytes() == [7])
@@ -5175,12 +5171,12 @@ pub(super) mod tests {
             assert!(race.as_mut().poll(&mut cx).is_pending());
             parent.cancel().unwrap();
             assert!(race.as_mut().poll(&mut cx).is_pending());
-            assert!(a.cancellation.is_cancelled() && b.cancellation.is_cancelled());
+            assert!(a.cancellation.is_canceled() && b.cancellation.is_canceled());
             assert!(matches!(owner.acquire(MAX_PAGE), Err(Error::Overloaded)));
             fence.set(true);
             assert!(matches!(
                 race.as_mut().poll(&mut cx),
-                Poll::Ready(Err(Error::Cancelled))
+                Poll::Ready(Err(Error::Canceled))
             ));
         }
     }

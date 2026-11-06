@@ -1211,7 +1211,7 @@ fn bootstrap_preserves_active_reader_and_inflight_admission_until_cancellation()
     };
     let (pending_result, ()) =
         rig.drive(async { futures::join!(rig.bootstrap.acquire(2, &pending_scope), observer) });
-    assert!(matches!(pending_result, Err(Error::Cancelled)));
+    assert!(matches!(pending_result, Err(Error::Canceled)));
     rig.drive(std::future::poll_fn(|_| {
         if rig.admission.used(ResourceClass::Plaintext) == 113 {
             Poll::Ready(())
@@ -2050,7 +2050,7 @@ fn cancel_backpressured_reader_preserves_fast_reader_and_releases_leases() {
             cancel
         )
     });
-    assert_eq!(slow, Err(Error::Cancelled));
+    assert_eq!(slow, Err(Error::Canceled));
     fast.unwrap();
     drop(slow_reader.join().unwrap());
     check(&fast_reader.join().unwrap(), 1, 0, P, P);

@@ -241,7 +241,7 @@ pub fn refresh<C, P, O, W: WaiterPolicy<Error = E>, T, E: Copy + PartialEq + Fro
     state.refresh(
         idle,
         Error::Unavailable.into(),
-        Error::Cancelled.into(),
+        Error::Canceled.into(),
         now,
         split,
         wakes,
@@ -386,8 +386,7 @@ pub fn fail<C, P, O, W: WaiterPolicy<Error = E>, T, E: Copy + PartialEq + From<E
         }
         FailureKind::Terminal(error)
             if state.handed_over()
-                && (error == Error::DeadlineExceeded.into()
-                    || error == Error::Cancelled.into()) =>
+                && (error == Error::DeadlineExceeded.into() || error == Error::Canceled.into()) =>
         {
             Outcome::Retry
         }

@@ -253,7 +253,7 @@ mod materialized_pairing {
             let conn = crate::http::from_accepted(relay_socket.into(), &admissions[1])?;
             assert!(matches!(
                 server.serve_connection(conn, &scope).await,
-                Err(Error::Cancelled)
+                Err(Error::Canceled)
             ));
             canceled.set(true);
             Ok::<_, Error>(())
@@ -489,7 +489,7 @@ mod safety {
             let result = f.server.serve_connection(conn, &relay_scope).await;
             assert!(matches!(
                 result,
-                Err(Error::DeadlineExceeded | Error::Cancelled | Error::Io)
+                Err(Error::DeadlineExceeded | Error::Canceled | Error::Io)
             ));
             assert!(Instant::now() <= deadline.get().unwrap() + Duration::from_secs(1));
             if prompt {
@@ -566,7 +566,7 @@ mod safety {
         )
         .unwrap();
         assert!(admitted.get() && finished.get());
-        assert_eq!(relay_scope.cancellation.is_cancelled(), cancel_parent);
+        assert_eq!(relay_scope.cancellation.is_canceled(), cancel_parent);
         assert!(
             f.scope.check().is_ok(),
             "unrelated listener scope remains usable"

@@ -348,7 +348,7 @@ fn document_policy_is_per_variant() {
     assert_eq!(Doc::Keyring.rejection(), Rejection::TokenFallback);
     assert!(Doc::Publication.deltas());
     assert!(!Doc::Keyring.deltas());
-    assert_eq!(classify(Error::Cancelled), FailureClass::Cancelled);
+    assert_eq!(classify(Error::Canceled), FailureClass::Canceled);
     assert_eq!(classify(Error::Unauthorized), FailureClass::Rejected);
     assert_eq!(classify(Error::Unavailable), FailureClass::Retry);
     assert_eq!(classify(Error::InvalidRequest), FailureClass::Permanent);
@@ -455,7 +455,7 @@ fn feed_rejects_unbased_unchanged_oversized_and_canceled_responses() {
         scope.cancel().unwrap();
         assert_eq!(
             drive(clock, feed.fetch(&scope)).unwrap_err().error,
-            Error::Cancelled
+            Error::Canceled
         );
         assert_eq!(script.requests.borrow().len(), 2);
         assert!(feed.last().is_none());
@@ -516,7 +516,7 @@ fn cancellation_after_no_change_response_is_not_reported_as_success() {
         feed.restore(Some(key(1)));
         assert_eq!(
             drive(clock, feed.fetch(&scope(env))).unwrap_err().error,
-            Error::Cancelled
+            Error::Canceled
         );
         assert_eq!(feed.last().unwrap().version(), 1);
     });
@@ -538,7 +538,7 @@ fn latest_pending_wins_one_job_survives_cancellation_and_owner_stays_local() {
         assert_eq!(sync.status().accepted, None);
         assert_eq!(sync.status().pending, Some(3));
         turn_scope.cancel().unwrap();
-        assert_eq!(drive(clock, sync.turn(&turn_scope)), Err(Error::Cancelled));
+        assert_eq!(drive(clock, sync.turn(&turn_scope)), Err(Error::Canceled));
         assert_eq!(sync.status().error, None);
         assert!(target.started.load(Ordering::Acquire) <= 1);
         target.release.store(true, Ordering::Release);
@@ -660,10 +660,7 @@ fn settle_installs_slow_preparation_without_network() {
         assert_eq!(sync.status().accepted, Some(1));
         assert_eq!(script.requests.borrow().len(), 1, "settle never fetches");
         drive(clock, sync.shutdown(&scope(env))).unwrap();
-        assert_eq!(
-            drive(clock, sync.settle(&scope(env))),
-            Err(Error::Cancelled)
-        );
+        assert_eq!(drive(clock, sync.settle(&scope(env))), Err(Error::Canceled));
     });
 }
 
@@ -681,7 +678,7 @@ fn bounded_shutdown_retains_unfinished_job_for_later_fence() {
             Err(Error::DeadlineExceeded)
         );
         assert!(sync.status().stopped);
-        assert_eq!(drive(clock, sync.turn(&scope(env))), Err(Error::Cancelled));
+        assert_eq!(drive(clock, sync.turn(&scope(env))), Err(Error::Canceled));
         target.release.store(true, Ordering::Release);
         drive(clock, sync.shutdown(&scope(env))).unwrap();
         assert!(target.installed.borrow().is_empty());
@@ -754,10 +751,7 @@ fn driver_drop_joins_unfinished_preparation_even_after_canceled_shutdown() {
         drive(clock, sync.turn(&scope(env))).unwrap();
         let canceled = scope(env);
         canceled.cancel().unwrap();
-        assert_eq!(
-            drive(clock, sync.shutdown(&canceled)),
-            Err(Error::Cancelled)
-        );
+        assert_eq!(drive(clock, sync.shutdown(&canceled)), Err(Error::Canceled));
         let release = target.release.clone();
         // Release from an independent finite helper, never from the joined owner.
         let helper = std::thread::spawn(move || {
@@ -817,15 +811,12 @@ fn canceled_install_preserves_prepared_state_and_later_supersession_wins() {
     sim(15, |clock, env| {
         let io = host(env);
         let target = Installer::new();
-        target.install_error.set(Some(Error::Cancelled));
+        target.install_error.set(Some(Error::Canceled));
         let script = Script::new(&io, [full(2)]);
         let mut sync = poll(&io, Doc::Keyring, &script, &target);
         sync.seed(key(1)).unwrap();
         drive(clock, sync.turn(&scope(env))).unwrap();
-        assert_eq!(
-            drive(clock, sync.settle(&scope(env))),
-            Err(Error::Cancelled)
-        );
+        assert_eq!(drive(clock, sync.settle(&scope(env))), Err(Error::Canceled));
         assert_eq!(sync.status().accepted, Some(1));
         assert_eq!(sync.status().pending, Some(2));
         assert_eq!(sync.status().error, None);

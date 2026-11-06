@@ -285,7 +285,7 @@ fn canceled_leader_is_revoked_and_follower_takes_over() {
     assert_eq!(f.poll(4, b, 0, 2), Ok(Wait::Pending));
     assert!(f.woken(|f| f.cancel(4, a)).contains(&2));
     assert_eq!(f.poll(4, b, 0, 2), Ok(Wait::Lead));
-    assert_eq!(f.poll(4, a, 0, 1), failed(Error::Cancelled));
+    assert_eq!(f.poll(4, a, 0, 1), failed(Error::Canceled));
 }
 
 #[test]
@@ -473,7 +473,7 @@ fn operation_errors_and_completed_operation_settles_published_result() {
 }
 
 /// Production checks a waiter's scope before its recorded error: a rejected leader polled after
-/// its deadline reports `DeadlineExceeded`, and a canceled waiter stays `Cancelled`.
+/// its deadline reports `DeadlineExceeded`, and a canceled waiter stays `Canceled`.
 #[test]
 fn deadline_takes_precedence_over_recorded_rejection() {
     let mut f = fx();
@@ -483,7 +483,7 @@ fn deadline_takes_precedence_over_recorded_rejection() {
     f.cancel(23, b);
     assert_eq!(f.poll(23, a, 0, 1), failed(Error::OriginRejected));
     assert_eq!(f.poll(23, a, 1, 1), failed(Error::DeadlineExceeded));
-    assert_eq!(f.poll(23, b, 1, 2), failed(Error::Cancelled));
+    assert_eq!(f.poll(23, b, 1, 2), failed(Error::Canceled));
 }
 
 /// With handover allowed, an expired leader's running fill continues for the live waiter with the
@@ -559,10 +559,10 @@ fn handed_over_fill_deadline_retries_and_last_expiry_revokes() {
 fn handover_failure_retries_only_caller_scope_failures() {
     for (handed_over, failure, retry) in [
         (true, FailureKind::Terminal(Error::DeadlineExceeded), true),
-        (true, FailureKind::Terminal(Error::Cancelled), true),
+        (true, FailureKind::Terminal(Error::Canceled), true),
         (true, FailureKind::Terminal(Error::Io), false),
         (false, FailureKind::Terminal(Error::DeadlineExceeded), false),
-        (false, FailureKind::Terminal(Error::Cancelled), false),
+        (false, FailureKind::Terminal(Error::Canceled), false),
         (false, FailureKind::OriginRejected, true),
     ] {
         let now = Rc::new(Cell::new(Instant::now()));

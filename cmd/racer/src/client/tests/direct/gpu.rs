@@ -1132,7 +1132,7 @@ fn gated_loader(
 }
 
 #[test]
-/// A `gpu-read` that expires or is cancelled while the GPU start stalls
+/// A `gpu-read` that expires or is canceled while the GPU start stalls
 /// stops waiting and releases its connection; the shared start keeps going
 /// and a later `gpu-read` uses the helper it started.
 fn stalled_gpu_start_honors_request_expiry_and_cancellation() {

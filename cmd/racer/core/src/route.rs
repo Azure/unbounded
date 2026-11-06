@@ -105,7 +105,7 @@ pub enum Fault {
     DeadlineExceeded,
     BadGateway,
     CorruptRecord,
-    Cancelled,
+    Canceled,
     HopBudgetExhausted,
     IncompatibleMembership,
     NotFound,
@@ -249,7 +249,7 @@ pub fn operation_link_outcome(result: Result<(), Fault>) -> Option<LinkOutcome> 
         Err(Fault::Io | Fault::Os | Fault::Unavailable) => Some(LinkOutcome::Refused),
         Err(Fault::DeadlineExceeded) => Some(LinkOutcome::Timeout),
         Err(Fault::BadGateway | Fault::CorruptRecord) => Some(LinkOutcome::ProtocolFailure),
-        Err(Fault::Cancelled | Fault::Overloaded) => None,
+        Err(Fault::Canceled | Fault::Overloaded) => None,
         _ => Some(LinkOutcome::Success),
     }
 }
@@ -293,7 +293,7 @@ pub fn exchange_evidence(
                 Fault::Overloaded => Outcome::LocalPressure,
                 _ => Outcome::Neutral,
             },
-            (!socket_failure && matches!(fault, Fault::DeadlineExceeded | Fault::Cancelled))
+            (!socket_failure && matches!(fault, Fault::DeadlineExceeded | Fault::Canceled))
                 .then_some(false),
         ),
     }
@@ -563,7 +563,7 @@ mod tests {
             DeadlineExceeded,
             BadGateway,
             CorruptRecord,
-            Cancelled,
+            Canceled,
             HopBudgetExhausted,
             IncompatibleMembership,
             NotFound,
@@ -620,7 +620,7 @@ mod tests {
             let link = operation_link_outcome(Err(fault));
             assert_eq!(
                 link.is_none(),
-                matches!(fault, Cancelled | Overloaded),
+                matches!(fault, Canceled | Overloaded),
                 "{fault:?}"
             );
         }
@@ -687,9 +687,9 @@ mod tests {
             (Exchange::Complete { overloaded: true }, Some(true)),
             (Exchange::Streaming, Some(true)),
             (failed(DeadlineExceeded, false), Some(false)),
-            (failed(Cancelled, false), Some(false)),
+            (failed(Canceled, false), Some(false)),
             (failed(DeadlineExceeded, true), None),
-            (failed(Cancelled, true), None),
+            (failed(Canceled, true), None),
             (failed(Unavailable, false), None),
             (failed(Io, false), None),
             (failed(Overloaded, false), None),

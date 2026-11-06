@@ -812,7 +812,7 @@ fn owner_promotion_releases_the_prefetch_slot() {
     assert_eq!(prefetch.filling_for_test(), 0);
 }
 
-/// Dropping an owner fill (for example a cancelled `serve_fill` future)
+/// Dropping an owner fill (for example a canceled `serve_fill` future)
 /// releases its slot and bookkeeping; a joined admission of the same page
 /// keeps the slot until it is dropped too.
 #[test]

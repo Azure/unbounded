@@ -183,7 +183,7 @@ pub enum Error {
     DeadlineExceeded,
 
     /// Canceled before it finished.
-    Cancelled,
+    Canceled,
 
     /// An RDMA call failed, or a lock was poisoned.
     Io,

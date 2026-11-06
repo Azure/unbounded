@@ -1482,7 +1482,7 @@ mod tests {
             waiting_scope.cancellation.cancel().unwrap();
             assert!(matches!(
                 waiting.as_mut().poll(&mut cx),
-                Poll::Ready(Err(Error::Cancelled))
+                Poll::Ready(Err(Error::Canceled))
             ));
             scope.cancellation.cancel().unwrap();
             assert!(first.as_mut().poll(&mut cx).is_pending());
@@ -1490,13 +1490,13 @@ mod tests {
             complete(&env, &client, &mut port);
             assert!(matches!(
                 first.as_mut().poll(&mut cx),
-                Poll::Ready(Err(Error::Cancelled))
+                Poll::Ready(Err(Error::Canceled))
             ));
             assert_eq!(client.outstanding(), 0);
             let mut canceled = Box::pin(receiver.verify_request_async(make(), &scope));
             assert!(matches!(
                 canceled.as_mut().poll(&mut cx),
-                Poll::Ready(Err(Error::Cancelled))
+                Poll::Ready(Err(Error::Canceled))
             ));
             assert_eq!(client.outstanding(), 0);
             let clock = racer_io::SimClock::new(929);
@@ -1535,7 +1535,7 @@ mod tests {
             scope.cancellation.cancel().unwrap();
             assert!(matches!(
                 late_cancel.as_mut().poll(&mut cx),
-                Poll::Ready(Err(Error::Cancelled))
+                Poll::Ready(Err(Error::Canceled))
             ));
             assert_eq!(client.outstanding(), 0);
             let scope = RequestScope::on(

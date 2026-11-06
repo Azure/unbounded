@@ -241,7 +241,7 @@ enum Outcome {
     Released,
 
     /// Never exposed to the peer; the grant op fails with this.
-    Cancelled(Error),
+    Canceled(Error),
 }
 
 /// A grant we issued (receiver side).
@@ -838,7 +838,7 @@ impl Link {
 
         match self.waiting.remove(&tag) {
             Some(Waiting::Write { done: write, .. }) => {
-                let _ = write.complete(Err(Error::Cancelled));
+                let _ = write.complete(Err(Error::Canceled));
                 self.waiting.insert(
                     tag,
                     Waiting::Release {
@@ -1027,11 +1027,11 @@ impl Link {
 
                 if abandoned || now >= entry.deadline {
                     let error = if abandoned {
-                        Error::Cancelled
+                        Error::Canceled
                     } else {
                         Error::DeadlineExceeded
                     };
-                    entry.state = GrantState::Invalidating(Outcome::Cancelled(error));
+                    entry.state = GrantState::Invalidating(Outcome::Canceled(error));
                     self.outbox.push_back(Outgoing::Invalidate(tag));
                 } else {
                     entry.state = GrantState::Bound;
@@ -1070,7 +1070,7 @@ impl Link {
                             let _ = arrival.complete(Ok(Arrival::Released));
                         }
                     }
-                    Outcome::Cancelled(error) => {
+                    Outcome::Canceled(error) => {
                         pool.release(buffer);
 
                         if let Some(granted) = entry.granted.take() {
@@ -1237,7 +1237,7 @@ impl Link {
 
     /// Fail or break on passed deadlines.
     fn expire(&mut self, now: Instant) -> std::result::Result<(), Break> {
-        let mut cancelled = Vec::new();
+        let mut canceled = Vec::new();
 
         for (&tag, entry) in &mut self.grants {
             if now < entry.deadline {
@@ -1249,14 +1249,14 @@ impl Link {
                 GrantState::Exposed => return Err(Break::Error),
                 GrantState::Bound => {
                     entry.state =
-                        GrantState::Invalidating(Outcome::Cancelled(Error::DeadlineExceeded));
-                    cancelled.push(tag);
+                        GrantState::Invalidating(Outcome::Canceled(Error::DeadlineExceeded));
+                    canceled.push(tag);
                 }
                 GrantState::Binding | GrantState::Invalidating(_) => {}
             }
         }
 
-        for tag in cancelled {
+        for tag in canceled {
             self.outbox
                 .retain(|o| !matches!(o, Outgoing::Grant(t) if *t == tag));
             self.outbox.push_back(Outgoing::Invalidate(tag));
@@ -1403,7 +1403,7 @@ impl Link {
 
                 if entry.granted.as_ref().is_none_or(Completer::is_abandoned) {
                     // Never exposed: fence the bound window and free it.
-                    entry.state = GrantState::Invalidating(Outcome::Cancelled(Error::Cancelled));
+                    entry.state = GrantState::Invalidating(Outcome::Canceled(Error::Canceled));
                     return self.post(pool, Outgoing::Invalidate(tag));
                 }
 

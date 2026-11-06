@@ -504,7 +504,7 @@ fn tie_break_rate_limit_and_bad_response() {
 }
 
 #[test]
-fn cancelled_open_clears_its_reservation() {
+fn canceled_open_clears_its_reservation() {
     let mut w = world();
     let env = w.env.clone();
     let b = node_id(2);
@@ -658,10 +658,10 @@ mod send_failures {
         }
     }
 
-    /// A write cancelled after the owner consumed its tag keeps the link:
+    /// A write canceled after the owner consumed its tag keeps the link:
     /// the follow-up release completes at once for a consumed tag.
     #[test]
-    fn cancelled_after_the_write_lands_keeps_the_link() {
+    fn canceled_after_the_write_lands_keeps_the_link() {
         let mut w = world();
         let env = w.env.clone();
         link_up(&env, &mut w);
@@ -678,7 +678,7 @@ mod send_failures {
         scope.cancel().unwrap();
         assert!(matches!(
             send.as_mut().poll(&mut cx),
-            Poll::Ready(Err(Error::Cancelled))
+            Poll::Ready(Err(Error::Canceled))
         ));
         // The caller still releases, as `send_native` does; the tag is gone.
         links.release(&to, &grant);

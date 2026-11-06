@@ -52,7 +52,7 @@ fn bootstrap_stops_on(signal: libc::c_int) {
     assert!(config.managed());
     let started = Instant::now();
     let result = managed::start(&mut config, control.clone(), &|| signals.requested());
-    assert_eq!(result, Err(Error::Cancelled));
+    assert_eq!(result, Err(Error::Canceled));
     // The stop arrives inside a blocking wait; it must end well before one
     // full 30 s bootstrap wait, within a couple of short polls.
     assert!(

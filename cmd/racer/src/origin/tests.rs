@@ -1193,7 +1193,7 @@ fn real_uds_canceled_and_expired_reads_release_owned_resources() {
         let infrastructure_bytes = admission.used(ResourceClass::RequestContext);
         let result = drive(&reactor, client.bootstrap_at(&endpoint, &context(), &scope));
         assert!(
-            matches!(result, Err(error) if error == if cancel { Error::Cancelled } else { Error::DeadlineExceeded })
+            matches!(result, Err(error) if error == if cancel { Error::Canceled } else { Error::DeadlineExceeded })
         );
         release.send(()).unwrap();
         server.join().unwrap();
@@ -1222,7 +1222,7 @@ fn exchange_errors_preserve_resource_and_request_failures() {
     }
     for error in [
         Error::Overloaded,
-        Error::Cancelled,
+        Error::Canceled,
         Error::DeadlineExceeded,
         Error::OriginRejected,
         Error::OriginForbidden,

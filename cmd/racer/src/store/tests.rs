@@ -688,7 +688,7 @@ fn hard_hold_cancel_waits_for_stalled_background_writer_without_self_wakes() {
     assert_eq!(f.store.writer.writes_in_flight(), 0);
     assert_eq!(
         held.as_mut().poll(&mut cx),
-        Poll::Ready(Err(Error::Cancelled))
+        Poll::Ready(Err(Error::Canceled))
     );
     assert!(f.store.writer.waiters.borrow().is_empty());
     index.release_hold(&id.version).unwrap();
@@ -724,7 +724,7 @@ fn hard_hold_cancel_removes_unsubmitted_ticket_after_background_fence() {
     drop(busy);
     assert_eq!(
         held.as_mut().poll(&mut cx),
-        Poll::Ready(Err(Error::Cancelled))
+        Poll::Ready(Err(Error::Canceled))
     );
     assert_eq!(f.store.writer.pending_count(), 0);
     index.release_hold(&id.version).unwrap();
@@ -764,7 +764,7 @@ fn hard_hold_cancel_fences_kernel_write_after_background_future_is_dropped() {
     assert_eq!(f.store.writer.writes_in_flight(), 1);
     assert!(held.as_mut().poll(&mut cx).is_pending());
     assert_eq!(index.release_hold(&id.version), Err(Error::Overloaded));
-    assert_eq!(drive(&f.reactor, held), Err(Error::Cancelled));
+    assert_eq!(drive(&f.reactor, held), Err(Error::Canceled));
     assert_eq!(f.store.writer.writes_in_flight(), 0);
     index.release_hold(&id.version).unwrap();
     assert_eq!(index.hold_expiry(&id.version), None);
@@ -803,7 +803,7 @@ fn prefetch_cancel_before_submission_removes_queued_ticket() {
     drop(busy);
     assert_eq!(
         prefetch.as_mut().poll(&mut cx),
-        Poll::Ready(Err(Error::Cancelled))
+        Poll::Ready(Err(Error::Canceled))
     );
     drop(prefetch);
     assert!(f.store.writer.index().lookup(&id).unwrap().is_none());
@@ -831,7 +831,7 @@ fn prefetch_cancel_waits_for_accepted_write() {
         assert!(prefetch.as_mut().poll(&mut cx).is_pending());
         assert_eq!(f.store.writer.writes_in_flight(), 1);
     }
-    assert_eq!(drive(&f.reactor, prefetch), Err(Error::Cancelled));
+    assert_eq!(drive(&f.reactor, prefetch), Err(Error::Canceled));
     assert_eq!(f.store.writer.writes_in_flight(), 0);
     let _ = f.store.writer.index().lookup(&id).unwrap();
     assert_prefetch_released(&f);
@@ -2062,7 +2062,7 @@ fn checkpoint_directory_startup_is_bounded_and_simulation_compatible() {
             &f.reactor,
             Box::pin(checkpoint.prepare_directory(&f.reactor, &canceled))
         ),
-        Err(Error::Cancelled)
+        Err(Error::Canceled)
     );
 }
 
@@ -4431,7 +4431,7 @@ mod checkpoint {
                     )
                     .unwrap()
             ),
-            Err(Error::Cancelled)
+            Err(Error::Canceled)
         );
         assert_eq!(reactor.in_flight(), 0);
         for slot in ["checkpoint.0", "checkpoint.1"] {

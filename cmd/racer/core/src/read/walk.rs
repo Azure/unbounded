@@ -1150,7 +1150,7 @@ fn transient(outcome: ProbeOutcome) -> bool {
 /// | `Unavailable`, `Io`, `Os`, `HopBudgetExhausted` | `Unreachable` (next owner) |
 /// | `Overloaded` | `Overloaded` (next owner) |
 /// | `Unauthorized`, `InvalidRequest`, `HeaderTooLarge`, `CorruptRecord`, `MissingKey`, `Internal` | `UnusableCopy` (next owner) |
-/// | `Cancelled`, `DeadlineExceeded` | terminal: the caller's scope is over |
+/// | `Canceled`, `DeadlineExceeded` | terminal: the caller's scope is over |
 /// | `OriginRejected`, `OriginForbidden` | terminal: the caller's credential is refused |
 /// | `NotFound`, `VersionUnavailable` | terminal: an authoritative answer |
 /// | `IncompatibleMembership`, `InvalidConfiguration` | terminal: local state is unusable |

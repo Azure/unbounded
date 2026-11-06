@@ -41,7 +41,7 @@ pub enum Error {
     /// acquiring the page, unlike [`Error::Overloaded`].
     FlightFull,
     DeadlineExceeded,
-    Cancelled,
+    Canceled,
     Unauthorized,
     OriginRejected,
     OriginForbidden,
@@ -267,7 +267,7 @@ pub fn refresh_settlement(error: Error, remaining_attempts: u32) -> Settlement {
     let rejected = matches!(error, Error::OriginRejected | Error::OriginForbidden);
     let caller_budget = matches!(
         error,
-        Error::Cancelled | Error::DeadlineExceeded | Error::HopBudgetExhausted
+        Error::Canceled | Error::DeadlineExceeded | Error::HopBudgetExhausted
     ) || (error == Error::Unavailable && remaining_attempts == 0);
     if rejected || caller_budget {
         Settlement::Retry
@@ -285,7 +285,7 @@ mod metadata_tests {
         for error in [
             Error::OriginRejected,
             Error::OriginForbidden,
-            Error::Cancelled,
+            Error::Canceled,
             Error::DeadlineExceeded,
             Error::HopBudgetExhausted,
         ] {
@@ -482,7 +482,7 @@ pub fn recoverable(error: Error) -> bool {
             | Error::FlightFull
             | Error::CorruptRecord
             | Error::MissingKey
-            | Error::Cancelled
+            | Error::Canceled
             | Error::InvalidRequest
             | Error::HeaderTooLarge
     )
@@ -579,7 +579,7 @@ mod policy_tests {
             Error::FlightFull,
             Error::CorruptRecord,
             Error::MissingKey,
-            Error::Cancelled,
+            Error::Canceled,
             Error::InvalidRequest,
             Error::HeaderTooLarge,
         ] {

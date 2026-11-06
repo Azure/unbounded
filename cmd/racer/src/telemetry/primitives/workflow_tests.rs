@@ -144,8 +144,8 @@ impl Scope for RequestScope {
 
     /// Report cancellation before checking the deadline.
     fn check(&self) -> Result<(), Error> {
-        if self.cancellation.is_cancelled() {
-            Err(Error::Cancelled)
+        if self.cancellation.is_canceled() {
+            Err(Error::Canceled)
         } else if Instant::now() >= self.deadline {
             Err(Error::DeadlineExceeded)
         } else {
@@ -306,7 +306,7 @@ fn failed_and_oversized_handler_output_closes_only_that_connection() {
     let mut cx = Context::from_waker(Waker::noop());
     assert_eq!(
         service.as_mut().poll(&mut cx),
-        Poll::Ready(Err(Error::Cancelled))
+        Poll::Ready(Err(Error::Canceled))
     );
     drop(service);
     drop(owner);
@@ -375,7 +375,7 @@ fn exact_request_limit_distinguishes_complete_and_unterminated_headers() {
     let mut cx = Context::from_waker(Waker::noop());
     assert_eq!(
         service.as_mut().poll(&mut cx),
-        Poll::Ready(Err(Error::Cancelled))
+        Poll::Ready(Err(Error::Canceled))
     );
     drop(service);
     drop(owner);

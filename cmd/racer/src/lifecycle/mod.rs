@@ -196,7 +196,7 @@ impl<E: Copy + PartialEq + From<Error>> FailureReporter<E> {
     }
 
     /// Request a clean stop ([`StopReason::Requested`]). A service then
-    /// returning `Error::Cancelled` stops the group without failing it.
+    /// returning `Error::Canceled` stops the group without failing it.
     pub fn request_stop(&self) {
         self.control.request_stop(StopReason::Requested);
     }
@@ -444,7 +444,7 @@ pub enum StopReason {
     /// A process stop signal (see [`racer_io::signal::raise_stop`]).
     Signal,
     /// A service, caller, or startup scope requested the stop
-    /// (surfaced by the service as `Error::Cancelled`).
+    /// (surfaced by the service as `Error::Canceled`).
     Requested,
 }
 
@@ -479,10 +479,10 @@ struct State<E> {
 
 impl<E: Copy + From<Error>> State<E> {
     /// The error that interrupts a barrier wait: the first failure, or
-    /// `Cancelled` once a stop was requested.
+    /// `Canceled` once a stop was requested.
     fn interrupted(&self) -> Option<E> {
         self.error
-            .or_else(|| self.stop.map(|_| E::from(Error::Cancelled)))
+            .or_else(|| self.stop.map(|_| E::from(Error::Canceled)))
     }
 }
 
@@ -594,15 +594,15 @@ impl<E: Copy + PartialEq + From<Error>> Control<E> {
 
     /// Retain the first error and notify all threads to begin draining.
     ///
-    /// `Error::Cancelled` is the echo of a stop, not a failure, but only when
+    /// `Error::Canceled` is the echo of a stop, not a failure, but only when
     /// a real stop exists: one already recorded in the group or the raised
     /// process stop signal (recorded as [`StopReason::Signal`]). A stray
-    /// `Cancelled` with no stop behind it is a failure, so the process exits
+    /// `Canceled` with no stop behind it is a failure, so the process exits
     /// nonzero instead of reporting a clean stop. Drain, checkpoint, or fence
     /// errors during a stop are still reported.
     fn fail(&self, error: E) {
         let mut state = self.lock();
-        if error == E::from(Error::Cancelled) {
+        if error == E::from(Error::Canceled) {
             if state.stop.is_some() {
                 return;
             }
@@ -1169,7 +1169,7 @@ async fn drive<S: Scope>(
             scope.check()?;
             control.poll_signal();
             if control.lock().phase != Phase::Running {
-                return Poll::Ready(Err(Error::Cancelled.into()));
+                return Poll::Ready(Err(Error::Canceled.into()));
             }
         } else {
             // Deadlines diagnose a stuck teardown, never cancel its ownership.
@@ -1442,7 +1442,7 @@ fn helper_service<'a, S: Scope>(
             std::future::poll_fn(|cx| {
                 startup.check()?;
                 if control.lock().phase != Phase::Running {
-                    return Poll::Ready(Err(Error::Cancelled.into()));
+                    return Poll::Ready(Err(Error::Canceled.into()));
                 }
                 operation.as_mut().poll(cx)
             })

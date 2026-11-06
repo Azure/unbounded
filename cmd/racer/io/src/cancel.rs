@@ -16,7 +16,7 @@ use std::{
 };
 
 const LIVE: u8 = 0;
-const CANCELLED: u8 = 1;
+const CANCELED: u8 = 1;
 const EXPIRED: u8 = 2;
 
 /// A shared cancellation flag with registered wakers and child tokens.
@@ -107,11 +107,11 @@ impl CancelToken {
 
     /// Whether cancellation was requested.
     #[inline]
-    pub fn is_cancelled(&self) -> bool {
+    pub fn is_canceled(&self) -> bool {
         self.0.state.load(Ordering::Acquire) != LIVE
     }
 
-    /// The cancellation reason: [`Error::Cancelled`] or
+    /// The cancellation reason: [`Error::Canceled`] or
     /// [`Error::DeadlineExceeded`].
     #[inline]
     pub fn reason(&self) -> Option<Error> {
@@ -127,18 +127,18 @@ impl CancelToken {
         self.reason().map_or(Ok(()), Err)
     }
 
-    /// Cancel with [`Error::Cancelled`].
+    /// Cancel with [`Error::Canceled`].
     pub fn cancel(&self) {
-        self.cancel_with(Error::Cancelled);
+        self.cancel_with(Error::Canceled);
     }
 
     /// Cancel with `reason`; [`Error::DeadlineExceeded`] is kept, every other
-    /// reason is recorded as [`Error::Cancelled`]. The first reason wins.
+    /// reason is recorded as [`Error::Canceled`]. The first reason wins.
     pub fn cancel_with(&self, reason: Error) {
         let state = if reason == Error::DeadlineExceeded {
             EXPIRED
         } else {
-            CANCELLED
+            CANCELED
         };
         if self
             .0
@@ -224,8 +224,8 @@ impl CancelToken {
     }
 
     /// Resolve with the reason once canceled.
-    pub fn cancelled(&self) -> Cancelled<'_> {
-        Cancelled {
+    pub fn canceled(&self) -> Canceled<'_> {
+        Canceled {
             token: self,
             key: None,
         }
@@ -252,7 +252,7 @@ fn reason(state: u8) -> Error {
     if state == EXPIRED {
         Error::DeadlineExceeded
     } else {
-        Error::Cancelled
+        Error::Canceled
     }
 }
 
@@ -260,14 +260,14 @@ fn reason_of(state: u8) -> Error {
     reason(state)
 }
 
-/// Future returned by [`CancelToken::cancelled`].
-pub struct Cancelled<'a> {
+/// Future returned by [`CancelToken::canceled`].
+pub struct Canceled<'a> {
     token: &'a CancelToken,
 
     key: Option<WaitKey>,
 }
 
-impl Future for Cancelled<'_> {
+impl Future for Canceled<'_> {
     type Output = Error;
 
     /// Ready with the reason once the token is canceled.
@@ -283,7 +283,7 @@ impl Future for Cancelled<'_> {
     }
 }
 
-impl Drop for Cancelled<'_> {
+impl Drop for Canceled<'_> {
     /// Remove the registration.
     fn drop(&mut self) {
         self.token.deregister(&mut self.key);
@@ -397,8 +397,8 @@ impl Cancellation {
     }
 
     /// Whether any owner has requested cancellation.
-    pub fn is_cancelled(&self) -> bool {
-        self.state.token.is_cancelled()
+    pub fn is_canceled(&self) -> bool {
+        self.state.token.is_canceled()
     }
 
     /// Subscribe for one operation's lifetime, even when operations share a waker.
@@ -495,31 +495,31 @@ mod tests {
         let grandchild = child.child();
         let sibling = parent.child();
         sibling.cancel();
-        assert!(!parent.is_cancelled());
+        assert!(!parent.is_canceled());
         for _ in 0..1000 {
             drop(parent.child());
         }
         assert!(parent.lock().children.len() <= 32);
         parent.cancel();
-        assert!(child.is_cancelled() && grandchild.is_cancelled());
-        assert!(parent.child().is_cancelled());
+        assert!(child.is_canceled() && grandchild.is_canceled());
+        assert!(parent.child().is_canceled());
         let expired = CancelToken::new();
         expired.cancel_with(Error::DeadlineExceeded);
         assert_eq!(expired.child().reason(), Some(Error::DeadlineExceeded));
     }
 
     #[test]
-    fn cancelled_future_resolves_and_cancels_from_another_thread() {
+    fn canceled_future_resolves_and_cancels_from_another_thread() {
         let token = CancelToken::new();
         let count = Arc::new(Count(AtomicUsize::new(0)));
         let waker = Waker::from(count.clone());
         let mut cx = Context::from_waker(&waker);
-        let mut wait = Box::pin(token.cancelled());
+        let mut wait = Box::pin(token.canceled());
         assert!(wait.as_mut().poll(&mut cx).is_pending());
         let remote = token.clone();
         std::thread::spawn(move || remote.cancel()).join().unwrap();
         assert_eq!(count.0.load(Ordering::SeqCst), 1);
-        assert_eq!(wait.as_mut().poll(&mut cx), Poll::Ready(Error::Cancelled));
+        assert_eq!(wait.as_mut().poll(&mut cx), Poll::Ready(Error::Canceled));
         drop(wait);
         assert_eq!(token.waiters(), 0);
     }
@@ -562,7 +562,7 @@ mod tests {
         let disabled = Cancellation::with_registration_limit(0);
         assert!(matches!(disabled.subscribe(), Err(Error::Overloaded)));
         disabled.cancel().unwrap();
-        assert!(disabled.is_cancelled());
+        assert!(disabled.is_canceled());
         for _ in 0..64 {
             let cancellation = Cancellation::with_registration_limit(1);
             let registration = cancellation.subscribe().unwrap();
@@ -611,7 +611,7 @@ mod tests {
         assert!(weak.upgrade().is_some());
         drop(registration);
         assert!(weak.upgrade().is_none());
-        assert!(!cancellation.is_cancelled());
+        assert!(!cancellation.is_canceled());
 
         // A worker that subscribes after cancellation must still be notified.
         cancellation.cancel().unwrap();
@@ -640,7 +640,7 @@ mod tests {
         assert_eq!(token.check(), Ok(()));
         cancellation.cancel().unwrap();
         assert_eq!(woke.load(Ordering::Acquire), 1);
-        assert_eq!(token.check(), Err(Error::Cancelled));
+        assert_eq!(token.check(), Err(Error::Canceled));
         // Registering after cancellation wakes immediately.
         registration.register(&waker);
         assert_eq!(woke.load(Ordering::Acquire), 2);

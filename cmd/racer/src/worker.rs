@@ -515,7 +515,7 @@ impl crate::lifecycle::Park<Error> for ReactorPark {
 /// Attribute a runtime error that is about to end the worker group. The process
 /// exit message carries only the error, so name the failing stage first.
 fn log_fatal(stage: &str, error: Error) {
-    if error != Error::Cancelled {
+    if error != Error::Canceled {
         eprintln!("racer: stage={stage} fatal error={error:?}");
     }
 }
@@ -551,7 +551,7 @@ fn fence_runtime<'a>(
     // still retaining every accepted job until the engine returns its completion.
     Box::pin(async move {
         let fence_scope = lifecycle_scope(scope.clock()).unwrap_or_else(|_| scope.clone());
-        let cancelled = fence_scope.cancel();
+        let canceled = fence_scope.cancel();
         let drained = drive_local(
             Box::pin(async {
                 let (crypto, reactor) =
@@ -580,7 +580,7 @@ fn fence_runtime<'a>(
             }
         })
         .await;
-        cancelled.and(drained).and(error.map_or(Ok(()), Err))
+        canceled.and(drained).and(error.map_or(Ok(()), Err))
     })
 }
 
@@ -2278,7 +2278,7 @@ mod tests {
             // A canceled drain wait may return immediately, but join must still run the
             // real crypto engines and fence every abandoned accepted job.
             let drained = group.drain(&scope);
-            assert!(drained == Err(Error::Cancelled) || drained == Ok(()));
+            assert!(drained == Err(Error::Canceled) || drained == Ok(()));
             group.join().unwrap();
             assert_eq!(group.runtime.stats().done, 3);
         }
@@ -2494,7 +2494,7 @@ mod tests {
                 assert_eq!(Rc::strong_count(&self.local), 1);
                 if self.factory.stop_on_poll {
                     self.reporter.as_ref().unwrap().request_stop();
-                    Err(Error::Cancelled)
+                    Err(Error::Canceled)
                 } else {
                     Ok(())
                 }

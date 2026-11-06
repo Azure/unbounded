@@ -833,7 +833,7 @@ impl<S: Scope> Reactor<S> {
         self.release_parked(io);
         for (id, record) in checks {
             if record.scope.check().is_err() {
-                io.cancel_op(id, Error::Cancelled);
+                io.cancel_op(id, Error::Canceled);
             }
         }
     }
@@ -959,7 +959,7 @@ impl<S: Scope> Reactor<S> {
                 .collect();
             drop(records);
             for id in &ids {
-                io.cancel_op(*id, Error::Cancelled);
+                io.cancel_op(*id, Error::Canceled);
             }
             io.fence_ids(ids).await;
             self.release_parked(io);
@@ -1072,7 +1072,7 @@ pub mod timer {
                     if let Some(token) = &ctx.cancel
                         && token.register(&mut key, cx.waker()).is_some()
                     {
-                        return Poll::Ready(scope.check().and(Err(Error::Cancelled.into())));
+                        return Poll::Ready(scope.check().and(Err(Error::Canceled.into())));
                     }
                     if let Err(error) = scope.check() {
                         return Poll::Ready(Err(error));
@@ -1371,8 +1371,8 @@ pub mod ready_set {
             set.clear();
             drop(reader);
             assert_eq!(
-                set.next(&mut cx, 1, |_| Box::pin(async { Err(Error::Cancelled) })),
-                Err(Error::Cancelled)
+                set.next(&mut cx, 1, |_| Box::pin(async { Err(Error::Canceled) })),
+                Err(Error::Canceled)
             );
         }
 

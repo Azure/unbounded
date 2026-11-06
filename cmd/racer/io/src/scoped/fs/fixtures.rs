@@ -66,8 +66,8 @@ impl Scope for RequestScope {
 
     /// Give cancellation precedence over expiration in the active clock domain.
     fn check(&self) -> Result<()> {
-        if self.cancellation.is_cancelled() {
-            Err(Error::Cancelled)
+        if self.cancellation.is_canceled() {
+            Err(Error::Canceled)
         } else if Instant::now() >= self.deadline {
             Err(Error::DeadlineExceeded)
         } else {

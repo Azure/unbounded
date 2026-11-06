@@ -871,7 +871,7 @@ impl Responses {
     /// Awaits without blocking the worker. Other requests never call this,
     /// so nothing else touches a GPU.
     ///
-    /// The wait honors `scope`: an expired or cancelled request stops waiting
+    /// The wait honors `scope`: an expired or canceled request stops waiting
     /// and releases its connection, while the shared start keeps running for
     /// later requests.
     pub(crate) async fn prepare_gpu(&self, scope: &RequestScope) -> Result<()> {
@@ -1087,7 +1087,7 @@ fn error_head(error: Error) -> Result<MessageHead> {
         Error::VersionUnavailable => 412,
         Error::UnsatisfiableRangeWithLength(length) if length <= i64::MAX as u64 => 416,
         Error::BadGateway | Error::CorruptRecord => 502,
-        Error::Unavailable | Error::Overloaded | Error::FlightFull | Error::DeadlineExceeded | Error::Cancelled | Error::StaleFlight | Error::IncompatibleMembership | Error::HopBudgetExhausted | Error::MissingKey
+        Error::Unavailable | Error::Overloaded | Error::FlightFull | Error::DeadlineExceeded | Error::Canceled | Error::StaleFlight | Error::IncompatibleMembership | Error::HopBudgetExhausted | Error::MissingKey
         // Clock rollback or peer restart can reject an otherwise valid attempt's
         // freshness. It is unavailable to this client, not an internal failure.
         | Error::Replay | Error::Io | Error::Os(_) => 503,

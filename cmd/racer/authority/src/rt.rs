@@ -243,7 +243,7 @@ impl Drop for Executor {
 pub fn to_io(e: racer_io::Error) -> io::Error {
     match e {
         racer_io::Error::DeadlineExceeded => io::ErrorKind::TimedOut.into(),
-        racer_io::Error::Cancelled => io::ErrorKind::Interrupted.into(),
+        racer_io::Error::Canceled => io::ErrorKind::Interrupted.into(),
         e => match e.errno() {
             Some(errno) => io::Error::from_raw_os_error(errno),
             None => io::Error::other(format!("{e:?}")),
@@ -369,7 +369,7 @@ const RECV_BYTES: usize = 16 * 1024;
 /// A connected stream socket on the reactor.
 pub struct Tcp {
     fd: Rc<Descriptor>,
-    /// Receive buffer, reused across reads. `None` after a cancelled read
+    /// Receive buffer, reused across reads. `None` after a canceled read
     /// kept it in the reactor until its fence.
     buf: Option<Vec<u8>>,
 }
@@ -660,7 +660,7 @@ mod tests {
             // Deadline passes while queued.
             let soon = Instant::now() + Duration::from_millis(10);
             assert!(slots.acquire(soon).await.is_none());
-            // A cancelled waiter (timeout around acquire) is skipped.
+            // A canceled waiter (timeout around acquire) is skipped.
             let far = Instant::now() + Duration::from_secs(5);
             assert!(
                 timeout(Duration::from_millis(5), slots.acquire(far))

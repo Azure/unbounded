@@ -88,7 +88,7 @@ pub async fn disconnect_fenced<C: Context, T>(
             watch = None;
             match result {
                 Ok(ready) if ready & events != 0 => {
-                    failure.get_or_insert(racer_io::Error::Cancelled.into());
+                    failure.get_or_insert(racer_io::Error::Canceled.into());
                 }
                 Err(error) => {
                     failure.get_or_insert(error);
@@ -103,7 +103,7 @@ pub async fn disconnect_fenced<C: Context, T>(
         // A FIN may be visible on the socket before its watch CQE is delivered.
         // Check once at the result boundary, not on every pending work poll.
         if result.is_ready() && failure.is_none() && socket.peer_read_closed() {
-            failure = Some(racer_io::Error::Cancelled.into());
+            failure = Some(racer_io::Error::Canceled.into());
             cancel_exchange();
         }
         result

@@ -59,8 +59,8 @@ pub(super) mod fixtures {
 
         /// Give cancellation precedence over expiration on host time.
         fn check(&self) -> Result<()> {
-            if self.cancellation.is_cancelled() {
-                Err(Error::Cancelled)
+            if self.cancellation.is_canceled() {
+                Err(Error::Canceled)
             } else if Instant::now() >= self.deadline {
                 Err(Error::DeadlineExceeded)
             } else {
@@ -146,10 +146,7 @@ mod adapter {
         let scope = scope();
         scope.cancel();
         let mut recv = r.recv(Rc::new(right), vec![0; 1], (), &scope);
-        assert!(matches!(
-            poll(&mut recv),
-            Poll::Ready(Err(Error::Cancelled))
-        ));
+        assert!(matches!(poll(&mut recv), Poll::Ready(Err(Error::Canceled))));
         assert_eq!(r.in_flight(), 0);
     }
 
@@ -175,7 +172,7 @@ mod adapter {
             Poll::Ready(Err(Error::DeadlineExceeded))
         ));
         scope.cancel();
-        assert!(matches!(drive(&r, recv), Err(Error::Cancelled)));
+        assert!(matches!(drive(&r, recv), Err(Error::Canceled)));
         assert_eq!(r.in_flight(), 0);
     }
 
@@ -196,7 +193,7 @@ mod adapter {
             r.fence_matching(move |scope| scope.cancellation.same(&target)),
         )
         .unwrap();
-        assert!(matches!(poll(&mut one), Poll::Ready(Err(Error::Cancelled))));
+        assert!(matches!(poll(&mut one), Poll::Ready(Err(Error::Canceled))));
         assert!(poll(&mut two).is_pending());
         assert_eq!(r.in_flight(), 1);
         drop(two);
@@ -379,14 +376,14 @@ mod retry {
             assert_eq!(attempts.get(), 1);
             assert_eq!(wake.count(), 0);
             if cancel {
-                scope.0.set(Some(Error::Cancelled));
+                scope.0.set(Some(Error::Canceled));
             }
             clock.advance(Duration::from_millis(1));
             r.poll_budgeted(8).unwrap();
             assert_eq!(wake.count(), 1, "the backoff timer wakes the task once");
             assert_eq!(
                 future.as_mut().poll(&mut cx),
-                Poll::Ready(if cancel { Err(Error::Cancelled) } else { Ok(7) })
+                Poll::Ready(if cancel { Err(Error::Canceled) } else { Ok(7) })
             );
             assert_eq!(attempts.get(), if cancel { 1 } else { 2 });
         }
@@ -411,7 +408,7 @@ mod retry {
         });
         let mut cx = Context::from_waker(Waker::noop());
         assert!(future.as_mut().poll(&mut cx).is_pending());
-        scope.0.set(Some(Error::Cancelled));
+        scope.0.set(Some(Error::Canceled));
         assert!(future.as_mut().poll(&mut cx).is_pending());
         completed.set(true);
         assert_eq!(future.as_mut().poll(&mut cx), Poll::Ready(Err(Error::Io)));

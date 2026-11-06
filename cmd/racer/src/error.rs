@@ -54,7 +54,7 @@ boundary_errors! {
     /// The page's flight is fetching and holds its waiter cap: busy, and proof of the fetch.
     FlightFull,
     DeadlineExceeded,
-    Cancelled,
+    Canceled,
     StaleFlight,
     Unauthorized,
     /// Authenticated Node binding changed; drain the entire graph and restart.
@@ -97,7 +97,7 @@ impl From<racer_core::read::Error> for Error {
             Core::Overloaded => Self::Overloaded,
             Core::FlightFull => Self::FlightFull,
             Core::DeadlineExceeded => Self::DeadlineExceeded,
-            Core::Cancelled => Self::Cancelled,
+            Core::Canceled => Self::Canceled,
             Core::Unauthorized => Self::Unauthorized,
             Core::OriginRejected => Self::OriginRejected,
             Core::OriginForbidden => Self::OriginForbidden,
@@ -129,7 +129,7 @@ impl TryFrom<Error> for racer_core::read::Error {
             Error::Overloaded => Core::Overloaded,
             Error::FlightFull => Core::FlightFull,
             Error::DeadlineExceeded => Core::DeadlineExceeded,
-            Error::Cancelled => Core::Cancelled,
+            Error::Canceled => Core::Canceled,
             Error::Unauthorized => Core::Unauthorized,
             Error::OriginRejected => Core::OriginRejected,
             Error::OriginForbidden => Core::OriginForbidden,
@@ -234,7 +234,7 @@ impl From<rdma_verbs::Error> for Error {
             rdma_verbs::Error::Unavailable => Self::Unavailable,
             rdma_verbs::Error::Overloaded => Self::Overloaded,
             rdma_verbs::Error::DeadlineExceeded => Self::DeadlineExceeded,
-            rdma_verbs::Error::Cancelled => Self::Cancelled,
+            rdma_verbs::Error::Canceled => Self::Canceled,
             rdma_verbs::Error::Io => Self::Io,
         }
     }
@@ -270,7 +270,7 @@ impl From<page_alloc::Error> for Error {
 impl From<racer_io::Error> for Error {
     fn from(error: racer_io::Error) -> Self {
         match error {
-            racer_io::Error::Cancelled => Self::Cancelled,
+            racer_io::Error::Canceled => Self::Canceled,
             racer_io::Error::DeadlineExceeded => Self::DeadlineExceeded,
             racer_io::Error::Overloaded => Self::Overloaded,
             racer_io::Error::Unavailable => Self::Unavailable,
@@ -329,7 +329,7 @@ mod tests {
     fn publication_causes_and_display_preserve_payloads() {
         use super::{Error, PublicationCause};
         for (error, cause, text) in [
-            (Error::Cancelled, PublicationCause::Cancelled, "Cancelled"),
+            (Error::Canceled, PublicationCause::Canceled, "Canceled"),
             (Error::Os(-1), PublicationCause::Os(-1), "Os(-1)"),
             (
                 Error::UnsatisfiableRangeWithLength(u64::MAX),
@@ -470,7 +470,7 @@ mod tests {
             (Verbs::Unavailable, Error::Unavailable),
             (Verbs::Overloaded, Error::Overloaded),
             (Verbs::DeadlineExceeded, Error::DeadlineExceeded),
-            (Verbs::Cancelled, Error::Cancelled),
+            (Verbs::Canceled, Error::Canceled),
             (Verbs::Io, Error::Io),
         ] {
             assert_eq!(Error::from(verbs), racer);
@@ -514,7 +514,7 @@ mod tests {
     fn runtime_errors_keep_racer_boundary_meanings() {
         use racer_io::Error as RuntimeError;
         for (runtime, racer) in [
-            (RuntimeError::Cancelled, Error::Cancelled),
+            (RuntimeError::Canceled, Error::Canceled),
             (RuntimeError::DeadlineExceeded, Error::DeadlineExceeded),
             (RuntimeError::Overloaded, Error::Overloaded),
             (RuntimeError::Unavailable, Error::Unavailable),
@@ -540,8 +540,8 @@ mod tests {
             Error::Os(libc::ENOSPC)
         );
         assert_eq!(
-            Error::from(ReplacementError::RenameUncertain(Error::Cancelled)),
-            Error::RenameUncertain(super::PublicationCause::Cancelled)
+            Error::from(ReplacementError::RenameUncertain(Error::Canceled)),
+            Error::RenameUncertain(super::PublicationCause::Canceled)
         );
         assert_eq!(
             Error::from(ReplacementError::Published(Error::Os(libc::EIO))),

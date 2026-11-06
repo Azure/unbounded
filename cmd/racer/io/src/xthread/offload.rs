@@ -900,7 +900,7 @@ impl<I: Copy + Ord, C> Waiters<I, C> {
         let waker = Rc::new(cx.waker().clone());
         let mut entries = self.entries.borrow_mut();
         let Some(waiter) = entries.get_mut(&id) else {
-            return Poll::Ready(Err(crate::Error::Cancelled));
+            return Poll::Ready(Err(crate::Error::Canceled));
         };
         let old = std::mem::replace(&mut waiter.waker, waker);
         if let Some(result) = waiter.result.take() {
@@ -909,7 +909,7 @@ impl<I: Copy + Ord, C> Waiters<I, C> {
             drop(entries);
             drop((old, removed));
             if abandoned {
-                Poll::Ready(Err(crate::Error::Cancelled))
+                Poll::Ready(Err(crate::Error::Canceled))
             } else {
                 Poll::Ready(Ok(result))
             }
@@ -1055,8 +1055,8 @@ mod tests {
 
         /// Reject canceled admission without ending accepted work.
         fn check(&self) -> Result<(), Self::Error> {
-            if self.0.is_cancelled() {
-                Err(crate::Error::Cancelled.into())
+            if self.0.is_canceled() {
+                Err(crate::Error::Canceled.into())
             } else {
                 Ok(())
             }
@@ -1115,7 +1115,7 @@ mod tests {
             if let Some(mut operation) = operation {
                 assert!(matches!(
                     operation.as_mut().poll(&mut cx),
-                    Poll::Ready(Err(Error::Runtime(crate::Error::Cancelled)))
+                    Poll::Ready(Err(Error::Runtime(crate::Error::Canceled)))
                 ));
             }
             assert_eq!(port.outstanding(), 0);
@@ -1479,7 +1479,7 @@ mod tests {
         assert_eq!(count.0.load(Ordering::SeqCst), 1);
         assert_eq!(
             waiters.poll_result(7, &mut cx),
-            Poll::Ready(Err(crate::Error::Cancelled))
+            Poll::Ready(Err(crate::Error::Canceled))
         );
 
         let waker = callback_waker();
@@ -1652,7 +1652,7 @@ mod tests {
                 .await?;
                 futures::future::poll_fn(|cx| {
                     if scope.get() {
-                        return Poll::Ready(Err(crate::Error::Cancelled));
+                        return Poll::Ready(Err(crate::Error::Canceled));
                     }
                     guard.poll(cx, |_| Poll::<crate::Result<()>>::Pending)
                 })
@@ -1669,7 +1669,7 @@ mod tests {
         assert_eq!(next_count.0.load(Ordering::SeqCst), 0);
         assert!(matches!(
             first.as_mut().poll(&mut first_cx),
-            Poll::Ready(Err(crate::Error::Cancelled))
+            Poll::Ready(Err(crate::Error::Canceled))
         ));
         assert_eq!(pending.len(), 1);
         assert_eq!(next_count.0.load(Ordering::SeqCst), 1);
@@ -2149,7 +2149,7 @@ mod tests {
         assert_eq!(client.outstanding(), 1);
         assert!(matches!(
             waiters.poll_result(Id(1, 7, 1), &mut cx),
-            Poll::Ready(Err(crate::Error::Cancelled))
+            Poll::Ready(Err(crate::Error::Canceled))
         ));
         waiters.worker_closed(1, false);
         assert_eq!(waiters.len(), 2);

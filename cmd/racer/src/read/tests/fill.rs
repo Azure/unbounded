@@ -1293,7 +1293,7 @@ fn network_plaintext_cleared_pressure_retry_checks_original_scope() {
             },
         ));
         assert!(
-            matches!(result, Err(error) if error == if deadline { Error::DeadlineExceeded } else { Error::Cancelled })
+            matches!(result, Err(error) if error == if deadline { Error::DeadlineExceeded } else { Error::Canceled })
         );
         assert_eq!(admission.used(ResourceClass::Plaintext), 0);
         let mut out = String::new();
@@ -1474,7 +1474,7 @@ fn cooperative_reclaim_bounds_busy_cycle_and_preserves_cancellation() {
                 Error::DeadlineExceeded
             } else {
                 scope.cancel().unwrap();
-                Error::Cancelled
+                Error::Canceled
             };
             assert!(matches!(
                 reserve.as_mut().poll(&mut cx),
@@ -2225,12 +2225,12 @@ mod metadata {
             if cancel_leader {
                 assert!(matches!(
                     leader.as_mut().poll(&mut cx),
-                    Poll::Ready(Err(Error::Cancelled))
+                    Poll::Ready(Err(Error::Canceled))
                 ));
             } else {
                 assert!(matches!(
                     follower.as_mut().poll(&mut cx),
-                    Poll::Ready(Err(Error::Cancelled))
+                    Poll::Ready(Err(Error::Canceled))
                 ));
             }
             // Parent cancellation now wakes the independent driver too. Consume
@@ -3825,7 +3825,7 @@ fn selected_owner_reclaims_foreign_receive_charges_across_full_pages() {
                 &target.crypto,
                 target.fill.drivers()
             ),
-            Err(Error::Cancelled)
+            Err(Error::Canceled)
         ));
         assert_eq!(target.fill.metrics.count(Event::PeerHit), number);
         let copy = received.copy();
@@ -4699,7 +4699,7 @@ fn cold_copy_full_page_boundary_and_canceled_disk_read_release_staging() {
         }
         assert!(matches!(
             drive_io(work, &f.reactor, &mut f.engine, &f.crypto, f.fill.drivers()),
-            Err(Error::Cancelled)
+            Err(Error::Canceled)
         ));
         drive_disk(&f, f.reactor.drain()).unwrap();
         f.fill.dependencies.writer.slabs().reclaim_idle();
@@ -5040,7 +5040,7 @@ fn detached_copy_only_keeps_disk_fence_and_independent_waiters() {
     caller.cancel().unwrap();
     assert!(matches!(
         first.as_mut().poll(&mut cx),
-        Poll::Ready(Err(Error::Cancelled))
+        Poll::Ready(Err(Error::Canceled))
     ));
     drop((first, second));
     assert_eq!(f.fill.dependencies.admission.used(ResourceClass::Waiter), 0);
@@ -5244,7 +5244,7 @@ fn canceled_leader_fill_driver_continues_for_remaining_caller() {
     f.scope.cancel().unwrap();
     assert!(matches!(
         a.as_mut().poll(&mut cx),
-        Poll::Ready(Err(Error::Cancelled))
+        Poll::Ready(Err(Error::Canceled))
     ));
     drop(a);
     f.fill.drivers().poll(&mut cx, 64);
@@ -5294,11 +5294,11 @@ fn canceled_before_lookup_has_no_outcome() {
     f.scope.cancel().unwrap();
     assert!(matches!(
         f.fill.cached_page(&f.page, &f.scope),
-        Err(Error::Cancelled)
+        Err(Error::Canceled)
     ));
     assert!(matches!(
         futures::executor::block_on(f.fill.copy_only(&f.page, &f.scope)),
-        Err(Error::Cancelled)
+        Err(Error::Canceled)
     ));
     for event in [
         Event::PlaintextLookupHit,

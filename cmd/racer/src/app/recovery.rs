@@ -381,7 +381,7 @@ impl WorkerApplication {
         }
         let generation = cut.periodic_generation;
         if self.stopping && !cut.publication_started() {
-            cut.fail(Error::Cancelled);
+            cut.fail(Error::Canceled);
         }
         if cut.result().is_some() {
             self.checkpoint_snapshot.take();
@@ -495,7 +495,7 @@ impl WorkerApplication {
         std::future::poll_fn(|cx| {
             startup.check()?;
             if super::stop_requested() {
-                return Poll::Ready(Err(Error::Cancelled));
+                return Poll::Ready(Err(Error::Canceled));
             }
             let cut = node.recovery.lock().map_err(|_| Error::Unavailable)?;
             if let Some(error) = cut.failure {
@@ -1013,9 +1013,9 @@ mod tests {
         assert!(!cut.blocks_writer());
         assert!(!cut.publication_started());
         assert_eq!(cut.result(), Some(Err(Error::Overloaded)));
-        cut.finish(Err(Error::Cancelled));
-        assert_eq!(cut.result(), Some(Err(Error::Cancelled)));
-        for result in [Ok(()), Err(Error::Io), Err(Error::Cancelled)] {
+        cut.finish(Err(Error::Canceled));
+        assert_eq!(cut.result(), Some(Err(Error::Canceled)));
+        for result in [Ok(()), Err(Error::Io), Err(Error::Canceled)] {
             cut.restart(now).unwrap();
             cut.shards = image(1, &[WorkerId(0)]).shards;
             assert_eq!(cut.start_publication().len(), 1);
@@ -1034,7 +1034,7 @@ mod tests {
     fn checkpoint_close_error_preserves_phase_ownership_and_original_error() {
         for phase in [
             CutPhase::Collecting,
-            CutPhase::Aborted(Error::Cancelled),
+            CutPhase::Aborted(Error::Canceled),
             CutPhase::Publishing,
             CutPhase::Published(Ok(())),
             CutPhase::Published(Err(Error::Overloaded)),
@@ -1080,7 +1080,7 @@ mod tests {
             ..Default::default()
         };
         cut.shards = image(1, &[WorkerId(0)]).shards;
-        cut.finish(Err(Error::Cancelled));
+        cut.finish(Err(Error::Canceled));
         cut.restart(now).unwrap();
         assert_eq!(cut.periodic_generation, 1);
         assert_eq!(cut.periodic_started, Some(now));

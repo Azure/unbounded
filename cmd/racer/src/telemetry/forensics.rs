@@ -80,7 +80,7 @@ pub(crate) enum DecryptScopeFailure {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum DecryptReason {
-    Cancelled,
+    Canceled,
     DeadlineExceeded,
     MissingKey,
     InvalidConfiguration,
@@ -93,7 +93,7 @@ pub(crate) enum DecryptReason {
 impl DecryptReason {
     #[cfg(test)]
     pub(crate) const ALL: [Self; 9] = [
-        Self::Cancelled,
+        Self::Canceled,
         Self::DeadlineExceeded,
         Self::MissingKey,
         Self::InvalidConfiguration,
@@ -109,7 +109,7 @@ impl DecryptReason {
     ) -> Self {
         use crate::security::IntegrityRejection;
         match error {
-            Error::Cancelled => Self::Cancelled,
+            Error::Canceled => Self::Canceled,
             Error::DeadlineExceeded => Self::DeadlineExceeded,
             Error::MissingKey => Self::MissingKey,
             Error::InvalidConfiguration => Self::InvalidConfiguration,
@@ -124,7 +124,7 @@ impl DecryptReason {
     }
     pub(crate) fn event(self) -> Event {
         match self {
-            Self::Cancelled => Event::CryptoDecryptFailureCancelled,
+            Self::Canceled => Event::CryptoDecryptFailureCanceled,
             Self::DeadlineExceeded => Event::CryptoDecryptFailureDeadlineExceeded,
             Self::MissingKey => Event::CryptoDecryptFailureMissingKey,
             Self::InvalidConfiguration => Event::CryptoDecryptFailureInvalidConfiguration,
@@ -137,7 +137,8 @@ impl DecryptReason {
     }
     fn name(self) -> &'static str {
         match self {
-            Self::Cancelled => "cancelled",
+            // Published label value; keeps the British spelling.
+            Self::Canceled => "cancelled",
             Self::DeadlineExceeded => "deadline_exceeded",
             Self::MissingKey => "missing_key",
             Self::InvalidConfiguration => "invalid_configuration",
@@ -259,7 +260,7 @@ pub(crate) enum WaitGate {
     Queued,
     ScopeDeadline,
     BudgetDeadline,
-    Cancelled,
+    Canceled,
     QueueAdmissionRejected,
     AdmissionFailed,
 }
@@ -705,7 +706,7 @@ impl Failures {
                     "Queued",
                     "ScopeDeadline",
                     "BudgetDeadline",
-                    "Cancelled",
+                    "Canceled",
                     "QueueAdmissionRejected",
                     "AdmissionFailed",
                 ][(index - 42) / 2]
@@ -1239,7 +1240,7 @@ mod gate_event_tests {
             58
         );
         assert!(output.contains("counter=42 reason=QueueFull kind=Join events=0"));
-        assert!(output.contains("counter=53 reason=Cancelled kind=JoinCopy events=0"));
+        assert!(output.contains("counter=53 reason=Canceled kind=JoinCopy events=0"));
         assert!(output.contains("reason=EntryCap kind=Join events=65"));
         assert!(output.contains("terminal_cause=false operation_identity=not_recorded"));
         assert!(output.contains("request=ffffffffffffffffffffffffffffffff"));
@@ -1495,7 +1496,7 @@ mod tests {
             use crate::security::IntegrityRejection::Aead;
             // Classification only: this does not exercise the allocator failure path.
             let cases = [
-                (Error::Cancelled, None, "cancelled"),
+                (Error::Canceled, None, "cancelled"),
                 (Error::DeadlineExceeded, None, "deadline_exceeded"),
                 (Error::MissingKey, None, "missing_key"),
                 (Error::InvalidConfiguration, None, "invalid_configuration"),

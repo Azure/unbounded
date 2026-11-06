@@ -806,7 +806,7 @@ impl crate::lifecycle::Service<RequestScope> for PageCryptoEngine {
     fn poll_budgeted(&mut self, cx: &mut Context<'_>, work_budget: usize) -> Result<()> {
         // A helper error ends the worker group; name it before the process exits.
         self.drive(cx, work_budget).inspect_err(|error| {
-            if *error != Error::Cancelled {
+            if *error != Error::Canceled {
                 eprintln!("racer: stage=crypto-helper fatal error={error:?}");
             }
         })
@@ -1864,7 +1864,7 @@ mod tests {
             scope.cancel().unwrap();
             assert!(matches!(
                 crypto.local_context(&first, &scope),
-                Err(Error::Cancelled)
+                Err(Error::Canceled)
             ));
             drop((first, second));
             assert_eq!(admission.used(ResourceClass::RequestContext), 0);
@@ -1922,7 +1922,7 @@ mod tests {
             scope.cancel().unwrap();
             assert!(matches!(
                 crypto.seal(&original, attempt, &scope),
-                Err(Error::Cancelled)
+                Err(Error::Canceled)
             ));
             assert_eq!(admission.used(ResourceClass::RequestContext), 0);
             let mut limits = crate::test_support::cluster::config(false).limits;
@@ -1967,7 +1967,7 @@ mod tests {
             scope.cancel().unwrap();
             assert!(matches!(
                 crypto.open_charged(sealed, scope.request, attempt),
-                Err(Error::Cancelled)
+                Err(Error::Canceled)
             ));
             assert_eq!(admission.used(ResourceClass::RequestContext), 0);
         }
@@ -2539,7 +2539,7 @@ mod tests {
                             .map(|f| f.engine_ms);
                         let expected_error = match mode {
                             "success" | "abandon" | "late_cancel" => None,
-                            "cancel" => Some(Error::Cancelled),
+                            "cancel" => Some(Error::Canceled),
                             "deadline" => Some(Error::DeadlineExceeded),
                             "missing_key" => Some(Error::MissingKey),
                             "invalid_configuration" => Some(Error::InvalidConfiguration),
@@ -2559,7 +2559,7 @@ mod tests {
                                     f.scope_failure,
                                     match mode {
                                         "cancel" => crate::telemetry::DecryptScopeFailure::Entry(
-                                            Error::Cancelled
+                                            Error::Canceled
                                         ),
                                         "deadline" => crate::telemetry::DecryptScopeFailure::Entry(
                                             Error::DeadlineExceeded
@@ -2609,7 +2609,7 @@ mod tests {
                                         mode,
                                         "cancel" | "late_cancel" | "failure_late_cancel"
                                     ) {
-                                        Error::Cancelled
+                                        Error::Canceled
                                     } else {
                                         expected_error.unwrap()
                                     }
@@ -2973,7 +2973,7 @@ mod tests {
                             scope.cancel().unwrap();
                             assert!(matches!(
                                 future.as_mut().poll(&mut cx),
-                                Poll::Ready(Err(Error::Cancelled))
+                                Poll::Ready(Err(Error::Canceled))
                             ));
                             drop(future);
                             drop(held);
@@ -3160,7 +3160,7 @@ mod tests {
                         match (mode, future.as_mut().poll(&mut cx)) {
                             ("success", Poll::Ready(Ok(_)))
                             | ("failure", Poll::Ready(Err(_)))
-                            | ("cancel", Poll::Ready(Err(Error::Cancelled))) => {}
+                            | ("cancel", Poll::Ready(Err(Error::Canceled))) => {}
                             _ => panic!("unexpected {mode} result"),
                         }
                     }
@@ -3564,7 +3564,7 @@ mod tests {
                 client.poll_budgeted(1).unwrap();
                 assert!(matches!(
                     future.as_mut().poll(&mut cx),
-                    Poll::Ready(Err(Error::Cancelled))
+                    Poll::Ready(Err(Error::Canceled))
                 ));
                 assert_eq!(client.outstanding(), 0);
                 assert_eq!(admission.used(ResourceClass::Plaintext), 0);
@@ -3631,7 +3631,7 @@ mod tests {
                             permit,
                             outcome: CryptoOutcome::Failed {
                                 input,
-                                error: Error::Cancelled
+                                error: Error::Canceled
                             },
                             _key: key,
                         })
@@ -3652,7 +3652,7 @@ mod tests {
                 ));
                 assert!(matches!(
                     future.as_mut().poll(&mut cx),
-                    Poll::Ready(Err(Error::Cancelled))
+                    Poll::Ready(Err(Error::Canceled))
                 ));
             }
 
@@ -3851,7 +3851,7 @@ mod tests {
                             permit,
                             outcome: CryptoOutcome::Failed {
                                 input,
-                                error: Error::Cancelled
+                                error: Error::Canceled
                             },
                             _key: key,
                         })
@@ -4474,7 +4474,7 @@ mod tests {
                     assert_eq!(
                         *error,
                         if canceled {
-                            Error::Cancelled
+                            Error::Canceled
                         } else {
                             Error::CorruptRecord
                         }
@@ -4730,7 +4730,7 @@ mod tests {
                     assert_eq!(
                         *error,
                         if canceled {
-                            Error::Cancelled
+                            Error::Canceled
                         } else {
                             Error::InvalidConfiguration
                         }
@@ -4871,7 +4871,7 @@ mod tests {
                     assert_eq!(
                         *error,
                         if sequence % 3 == 2 {
-                            Error::Cancelled
+                            Error::Canceled
                         } else {
                             Error::CorruptRecord
                         }

@@ -5039,7 +5039,7 @@ pub(crate) mod tests {
             use std::time::Instant;
             let env = racer_io::Env::host();
             for failure in [
-                Some(Error::Cancelled),
+                Some(Error::Canceled),
                 Some(Error::DeadlineExceeded),
                 Some(Error::Unavailable),
                 None,
@@ -5067,7 +5067,7 @@ pub(crate) mod tests {
                     pool.waiter_bytes()
                 );
                 match failure {
-                    Some(Error::Cancelled) => {
+                    Some(Error::Canceled) => {
                         scope.cancel().unwrap();
                         assert!(count.count() > 0);
                     }

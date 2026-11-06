@@ -946,7 +946,7 @@ mod tests {
         body_bytes: usize,
         ready: Rc<Cell<bool>>,
         live: Rc<Cell<usize>>,
-        cancelled: Rc<Cell<bool>>,
+        canceled: Rc<Cell<bool>>,
     }
 
     impl BinarySession for Producer {
@@ -963,7 +963,7 @@ mod tests {
             })
         }
         fn cancel(&self) {
-            self.cancelled.set(true);
+            self.canceled.set(true);
         }
     }
 
@@ -982,7 +982,7 @@ mod tests {
     struct SimProducer {
         fd: RefCell<Option<Descriptor>>,
         live: Rc<Cell<usize>>,
-        cancelled: Rc<Cell<bool>>,
+        canceled: Rc<Cell<bool>>,
     }
     impl BinarySession for SimProducer {
         fn completion_fd(&self) -> Result<Descriptor, BinaryError> {
@@ -992,7 +992,7 @@ mod tests {
             Some(Ok(vec![7; MAX_BINARY_BYTES]))
         }
         fn cancel(&self) {
-            self.cancelled.set(true);
+            self.canceled.set(true);
         }
     }
     impl Drop for SimProducer {
@@ -1222,14 +1222,14 @@ mod tests {
         let (completion, signal) = sim.socket_pair();
         signal.try_send(&[1]).unwrap();
         let live = Rc::new(Cell::new(1));
-        let cancelled = Rc::new(Cell::new(false));
+        let canceled = Rc::new(Cell::new(false));
         let response = BinaryResponse {
             kind: BinaryKind::Profile,
             duration: Duration::from_secs(1),
             session: Box::new(SimProducer {
                 fd: RefCell::new(Some(completion)),
                 live: live.clone(),
-                cancelled: cancelled.clone(),
+                canceled: canceled.clone(),
             }),
         };
         let mut task = Box::pin(owner.binary_exchange(
@@ -1274,7 +1274,7 @@ mod tests {
         }
         assert!(done);
         assert_eq!(live.get(), 0);
-        assert!(cancelled.get());
+        assert!(canceled.get());
         assert_eq!(owner.resources.active.get(), 0);
     }
 
@@ -1344,7 +1344,7 @@ mod tests {
             completion.set_nonblocking(true).unwrap();
             let ready = Rc::new(Cell::new(false));
             let live = Rc::new(Cell::new(1));
-            let cancelled = Rc::new(Cell::new(false));
+            let canceled = Rc::new(Cell::new(false));
             let handler = BinaryRoutes {
                 routes: Routes::default(),
                 producer: RefCell::new(Some(Producer {
@@ -1356,7 +1356,7 @@ mod tests {
                     },
                     ready: ready.clone(),
                     live: live.clone(),
-                    cancelled: cancelled.clone(),
+                    canceled: canceled.clone(),
                 })),
             };
             let listener = TcpListener::bind("127.0.0.1:0").unwrap();
@@ -1413,7 +1413,7 @@ mod tests {
             let mut bytes = [0; 512];
             let n = busy.read(&mut bytes).unwrap();
             assert!(bytes[..n].starts_with(b"HTTP/1.1 409 Conflict\r\n"));
-            assert!(!cancelled.get());
+            assert!(!canceled.get());
             drop(rejected);
             // Saturate ordinary capacity: both capture waits must use prepaid slots.
             let (idle, _idle_peer) = UnixStream::pair().unwrap();
@@ -1461,7 +1461,7 @@ mod tests {
                         let result = exchange.as_mut().poll(&mut cx);
                         assert!(result.is_pending(), "half-close: {result:?}");
                     }
-                    assert!(!cancelled.get());
+                    assert!(!canceled.get());
                     ready.set(true);
                     signal.write_all(&[1]).unwrap();
                 }
@@ -1524,7 +1524,7 @@ mod tests {
             }
             drop(exchange);
             if outcome == "abandon" || outcome == "backpressure" {
-                assert!(cancelled.get());
+                assert!(canceled.get());
                 assert_eq!(live.get(), 1, "readiness leases must survive until fenced");
                 assert!(owner.binary.as_ref().unwrap().active.get());
             }
@@ -1541,7 +1541,7 @@ mod tests {
                 reactor.wait(Duration::from_millis(1)).unwrap();
             }
             assert_eq!(live.get(), 0);
-            assert!(cancelled.get());
+            assert!(canceled.get());
             assert!(!owner.binary.as_ref().unwrap().active.get());
             assert_eq!(owner.resources.active.get(), 0);
         }
@@ -1892,8 +1892,8 @@ mod tests {
 
         /// Prioritize cancellation over deadline expiry.
         fn check(&self) -> Result<()> {
-            if self.cancellation.is_cancelled() {
-                Err(Error::Cancelled)
+            if self.cancellation.is_canceled() {
+                Err(Error::Canceled)
             } else if self.clock.now() >= self.deadline {
                 Err(Error::DeadlineExceeded)
             } else {

@@ -180,8 +180,8 @@ impl Ticket {
         }) {
             self.terminal = true;
             self.gate.metrics.record(
-                if error == Error::Cancelled {
-                    Event::PeerReceiveCancelled
+                if error == Error::Canceled {
+                    Event::PeerReceiveCanceled
                 } else {
                     Event::PeerReceiveTimeout
                 },
@@ -241,7 +241,7 @@ impl Drop for Ticket {
             wake
         };
         if !self.terminal {
-            self.gate.metrics.record(Event::PeerReceiveCancelled, 1);
+            self.gate.metrics.record(Event::PeerReceiveCanceled, 1);
         }
         if let Some(wake) = wake {
             wake.wake();
@@ -305,7 +305,7 @@ mod tests {
         drop(ticket);
         assert_eq!(metrics[0].writer_count(Event::PeerReceiveFull), 1);
         assert_eq!(metrics[1].writer_count(Event::PeerReceiveFull), 0);
-        for event in [Event::PeerReceiveAdmitted, Event::PeerReceiveCancelled] {
+        for event in [Event::PeerReceiveAdmitted, Event::PeerReceiveCanceled] {
             assert_eq!(metrics[0].writer_count(event), 0);
             assert_eq!(metrics[1].writer_count(event), 1);
         }
@@ -386,7 +386,7 @@ mod tests {
                 "{cause}: no unrelated CQE required"
             );
             let expected = if cause == "cancel" {
-                Error::Cancelled
+                Error::Canceled
             } else {
                 Error::DeadlineExceeded
             };
@@ -399,7 +399,7 @@ mod tests {
             assert_eq!(metrics.gauge(Gauge::PeerReceiveActive), 1);
             assert_eq!(
                 metrics.count(if cause == "cancel" {
-                    Event::PeerReceiveCancelled
+                    Event::PeerReceiveCanceled
                 } else {
                     Event::PeerReceiveTimeout
                 }),
@@ -521,7 +521,7 @@ mod tests {
         scope.cancel().unwrap();
         assert!(matches!(
             ticket.poll(&scope, &mut cx),
-            Poll::Ready(Err(Error::Cancelled))
+            Poll::Ready(Err(Error::Canceled))
         ));
         drop(ticket);
         assert_eq!(admission.used(ResourceClass::RequestContext), 0);

@@ -2595,7 +2595,7 @@ pub(crate) mod tests {
                     let result = drive(&reactor, work.as_mut());
                     assert!(matches!(
                         result,
-                        Err(Error::Cancelled | Error::DeadlineExceeded)
+                        Err(Error::Canceled | Error::DeadlineExceeded)
                     ));
                 }
                 drop(work);

@@ -348,7 +348,7 @@ impl WorkerApplication {
             Ok(actual) => {
                 self.actual_rails = actual;
             }
-            Err(Error::Cancelled | Error::DeadlineExceeded) => {
+            Err(Error::Canceled | Error::DeadlineExceeded) => {
                 startup.check()?;
             }
             Err(error) => {

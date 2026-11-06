@@ -229,7 +229,7 @@ fn hardware_request(
 /// State shared by one hardware helper thread and its response session.
 pub(super) struct HardwareState {
     completion: std::os::fd::OwnedFd,
-    cancelled: Arc<std::sync::atomic::AtomicBool>,
+    canceled: Arc<std::sync::atomic::AtomicBool>,
     result: Mutex<Option<std::result::Result<Vec<u8>, server::BinaryError>>>,
     /// Memory funding discovery and the result, held until the helper and the
     /// response both finish, even if the diagnostics owner drops first.
@@ -258,7 +258,7 @@ impl HardwareSession {
         let state = Arc::new(HardwareState {
             // SAFETY: raw is a new, successful eventfd descriptor.
             completion: unsafe { std::os::fd::OwnedFd::from_raw_fd(raw) },
-            cancelled: Arc::default(),
+            canceled: Arc::default(),
             result: Mutex::new(None),
             _charge: charge,
         });
@@ -273,23 +273,23 @@ impl HardwareSession {
 }
 
 impl HardwareState {
-    /// Discover, encode unless cancelled, publish, then notify the worker.
+    /// Discover, encode unless canceled, publish, then notify the worker.
     fn run(&self, job: HardwareJob, limit: usize) {
         use std::os::fd::AsRawFd;
         use std::sync::atomic::Ordering;
         let result = (|| {
             let walk =
-                crate::hardware::Walk::new(self.cancelled.clone(), crate::hardware::WORKING_BYTES);
+                crate::hardware::Walk::new(self.canceled.clone(), crate::hardware::WORKING_BYTES);
             let report = match job(&walk) {
                 Ok(report) => report,
                 Err(crate::hardware::Abort::TooLarge) => {
                     return Err(server::BinaryError::Unavailable("response_too_large"));
                 }
-                Err(crate::hardware::Abort::Cancelled) => {
+                Err(crate::hardware::Abort::Canceled) => {
                     return Err(server::BinaryError::Unavailable("unavailable"));
                 }
             };
-            if self.cancelled.load(Ordering::Acquire) {
+            if self.canceled.load(Ordering::Acquire) {
                 return Err(server::BinaryError::Unavailable("unavailable"));
             }
             match encode_report(&report, limit) {
@@ -300,7 +300,7 @@ impl HardwareState {
                 Err(Encode::Failed) => Err(server::BinaryError::Unavailable("unavailable")),
             }
         })();
-        if self.cancelled.load(Ordering::Acquire) {
+        if self.canceled.load(Ordering::Acquire) {
             return;
         }
         *self.result.lock().unwrap_or_else(|e| e.into_inner()) = Some(result);
@@ -330,7 +330,7 @@ impl server::BinarySession for HardwareSession {
     }
     fn cancel(&self) {
         self.state
-            .cancelled
+            .canceled
             .store(true, std::sync::atomic::Ordering::Release);
     }
 }
@@ -723,7 +723,7 @@ mod tests {
             let mut cx = Context::from_waker(futures::task::noop_waker_ref());
             assert!(matches!(
                 server.as_mut().poll(&mut cx),
-                Poll::Ready(Err(Error::Cancelled))
+                Poll::Ready(Err(Error::Canceled))
             ));
             drop(server);
             let mut drain = reactor.drain();
@@ -961,9 +961,9 @@ mod tests {
             session.cancel();
             assert_eq!(
                 seen.recv_timeout(Duration::from_secs(5)).unwrap(),
-                crate::hardware::Abort::Cancelled
+                crate::hardware::Abort::Canceled
             );
-            assert!(session.result().is_none(), "cancelled result is discarded");
+            assert!(session.result().is_none(), "canceled result is discarded");
         }
 
         #[test]
@@ -1041,7 +1041,7 @@ mod tests {
         }
 
         #[test]
-        fn hardware_cancelled_helper_finishes_detached_and_stays_busy_until_done() {
+        fn hardware_canceled_helper_finishes_detached_and_stays_busy_until_done() {
             use std::sync::mpsc;
             let (release, gate) = mpsc::channel::<()>();
             let (done, finished) = mpsc::channel::<()>();
@@ -1788,8 +1788,8 @@ mod tests {
             );
             assert_eq!(longer.deadline.0, parent.deadline.0);
             parent.cancel().unwrap();
-            assert_eq!(shorter.check(), Err(Error::Cancelled));
-            assert_eq!(longer.check(), Err(Error::Cancelled));
+            assert_eq!(shorter.check(), Err(Error::Canceled));
+            assert_eq!(longer.check(), Err(Error::Canceled));
         }
 
         #[test]

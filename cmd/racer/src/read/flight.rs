@@ -836,7 +836,7 @@ impl Flights {
         validate_context(&page, context)?;
         scope.check()?;
         if self.table.borrow().is_stopping() {
-            return Err(Error::Cancelled);
+            return Err(Error::Canceled);
         }
         if !self.table.borrow().contains(&page) {
             if self.clock.now() >= budget.deadline() {
@@ -883,7 +883,7 @@ impl Flights {
         let page_number = page.number.0;
         let result = self.update(|table, wakes| {
             if table.is_stopping() {
-                return Err(Error::Cancelled);
+                return Err(Error::Canceled);
             }
             self.admit_join(&page, table.entry(&page))?;
             match table.join_existing(&page, plaintext, wakes) {
@@ -1021,7 +1021,7 @@ impl Flights {
             return self.join(page, membership, context, scope, budget);
         }
         if self.table.borrow().is_stopping() {
-            return Err(Error::Cancelled);
+            return Err(Error::Canceled);
         }
         self.admit_join(&page, None)?;
         if self.clock.now() >= budget.deadline() {
@@ -1070,8 +1070,8 @@ impl Flights {
             cancellation.register(cx.waker());
             let _ = expiry.poll_expired(cx);
             if let Err(error) = scope.check() {
-                reason = if error == Error::Cancelled {
-                    crate::telemetry::WaitGate::Cancelled
+                reason = if error == Error::Canceled {
+                    crate::telemetry::WaitGate::Canceled
                 } else {
                     crate::telemetry::WaitGate::ScopeDeadline
                 };
@@ -1088,8 +1088,8 @@ impl Flights {
                 return Poll::Ready(Err(Error::Overloaded));
             }
             if self.table.borrow().is_stopping() {
-                reason = crate::telemetry::WaitGate::Cancelled;
-                return Poll::Ready(Err(Error::Cancelled));
+                reason = crate::telemetry::WaitGate::Canceled;
+                return Poll::Ready(Err(Error::Canceled));
             }
             self.admit_join(&page, self.table.borrow().entry(&page))?;
             if self.table.borrow().contains(&page) {
@@ -1341,7 +1341,7 @@ impl Flights {
         let mut quota_detail = None;
         let result = self.update(|table, wakes| {
             if table.is_stopping() {
-                return Err(Error::Cancelled);
+                return Err(Error::Canceled);
             }
             let Some(entry) = table.entry(page) else {
                 return Ok(JoinedCopy::Miss);
@@ -1674,7 +1674,7 @@ fn wake_driver(entry: &mut Entry, wakes: &mut Vec<WakeTarget>) {
 
 fn registered(table: &Table, registration: &Registration) -> Result<()> {
     if table.is_stopping() {
-        return Err(Error::Cancelled);
+        return Err(Error::Canceled);
     }
     if !registration.attached
         || !table.registered(

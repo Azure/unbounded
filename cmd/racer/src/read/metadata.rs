@@ -233,7 +233,7 @@ impl Registration {
             return;
         };
         let error =
-            racer_core::read::Error::try_from(error).unwrap_or(racer_core::read::Error::Cancelled);
+            racer_core::read::Error::try_from(error).unwrap_or(racer_core::read::Error::Canceled);
         // A stale leader has nothing to release.
         let _ = owner
             .table
@@ -536,10 +536,10 @@ impl MetadataService {
                             &mut owned_budget,
                         ));
                         let result = poll_fn(|cx| {
-                            if !caller_scope.cancellation.is_cancelled() {
+                            if !caller_scope.cancellation.is_canceled() {
                                 caller_cancellation.register(cx.waker());
                             }
-                            if !owned_scope.cancellation.is_cancelled()
+                            if !owned_scope.cancellation.is_canceled()
                                 && (caller_scope.check().is_err()
                                     || driver_registration.is_only_handle())
                             {

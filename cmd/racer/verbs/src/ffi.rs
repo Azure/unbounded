@@ -1815,7 +1815,7 @@ impl<T> NativeQueuePair<T> {
         }
         if self.terminating.get() {
             self.stop()?;
-            return Err(Error::Cancelled);
+            return Err(Error::Canceled);
         }
         let api = &self.device.api;
         if self.device.mode == Mode::Registration && self.conn.state.get() != State::Established {

@@ -2063,7 +2063,7 @@ pub(super) fn dst_shutdown_checkpoint_uses_async_io_and_releases_all_shards() {
             ))),
             "budget" | "populated-budget" => Err(Error::Overloaded),
             "overflow" => Err(Error::Unavailable),
-            "cancel" | "cancel-write" => Err(Error::Cancelled),
+            "cancel" | "cancel-write" => Err(Error::Canceled),
             _ => Ok(()),
         };
         assert!(

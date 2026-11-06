@@ -143,42 +143,42 @@ fn service_owner_requires_both_fences_and_explicit_release() {
 }
 
 /// A requested stop is not a failure: it records a stop reason and leaves the
-/// result clean, the `Cancelled` echo of that stop is absorbed, and real
+/// result clean, the `Canceled` echo of that stop is absorbed, and real
 /// failures before or after it are reported and the first one is kept.
 #[test]
 fn stop_is_not_an_error_but_later_failures_are_kept() {
     let control = Control::<Error>::new(1, 0, false);
     control.request_stop(StopReason::Requested);
-    control.fail(Error::Cancelled);
+    control.fail(Error::Canceled);
     assert_eq!(control.result(), Ok(()));
     assert_eq!(control.stop_reason(), Some(StopReason::Requested));
-    assert_eq!(control.lock().interrupted(), Some(Error::Cancelled));
+    assert_eq!(control.lock().interrupted(), Some(Error::Canceled));
     control.request_stop(StopReason::Signal);
     assert_eq!(control.stop_reason(), Some(StopReason::Requested));
     control.fail(Error::Io);
     assert_eq!(control.result(), Err(Error::Io));
     control.fail(Error::DeadlineExceeded);
-    control.fail(Error::Cancelled);
+    control.fail(Error::Canceled);
     assert_eq!(control.result(), Err(Error::Io));
 
     let control = Control::<Error>::new(1, 0, false);
     control.fail(Error::DeadlineExceeded);
     control.request_stop(StopReason::Requested);
-    control.fail(Error::Cancelled);
+    control.fail(Error::Canceled);
     assert_eq!(control.result(), Err(Error::DeadlineExceeded));
     assert_eq!(control.stop_reason(), Some(StopReason::Requested));
 }
 
-/// A `Cancelled` with no stop behind it (none recorded, no stop signal) is a
+/// A `Canceled` with no stop behind it (none recorded, no stop signal) is a
 /// failure, not a clean stop, so the process exits nonzero.
 #[test]
-fn cancelled_without_a_stop_is_a_failure() {
+fn canceled_without_a_stop_is_a_failure() {
     assert!(!racer_io::signal::stop_raised());
     let control = Control::<Error>::new(1, 0, false);
-    control.fail(Error::Cancelled);
-    assert_eq!(control.result(), Err(Error::Cancelled));
+    control.fail(Error::Canceled);
+    assert_eq!(control.result(), Err(Error::Canceled));
     assert_eq!(control.stop_reason(), None);
-    assert_eq!(control.lock().interrupted(), Some(Error::Cancelled));
+    assert_eq!(control.lock().interrupted(), Some(Error::Canceled));
 }
 
 /// Failed fences and incomplete ownership stages abort before service destruction.
@@ -487,7 +487,7 @@ impl Service<TestScope> for Local {
         assert_eq!(budget, 64);
         if self.stop.load(Ordering::SeqCst) {
             self.reporter.as_ref().unwrap().request_stop();
-            Err(Error::Cancelled)
+            Err(Error::Canceled)
         } else {
             Ok(())
         }

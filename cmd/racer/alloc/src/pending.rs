@@ -3,7 +3,7 @@
 //! [`PendingWrite`] owns a [`PageTicket`] and then the [`Writing`] token for
 //! one record. The order reserve -> append -> write -> publish is enforced by
 //! the tokens; dropping a `PendingWrite` (for example when a persist future
-//! is cancelled) cancels the reservation or reports the write failed, so no
+//! is canceled) cancels the reservation or reports the write failed, so no
 //! in-flight or write count leaks.
 
 use crate::disk_index::{
@@ -150,7 +150,7 @@ mod tests {
     }
 
     #[test]
-    fn cancelled_persist_future_mid_write_leaks_nothing() {
+    fn canceled_persist_future_mid_write_leaks_nothing() {
         let (index, segments, cache) = fixture();
         let persist = {
             let index = index.clone();

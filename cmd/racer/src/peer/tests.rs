@@ -404,7 +404,7 @@ mod body_progress {
                 }
             } else {
                 assert!(
-                    matches!(result, Err(e) if e == match case { "share" | "stall" | "hard" | "reserved_slow" | "capped_trickle" | "capped_stall" => Error::DeadlineExceeded, "cancel" | "idle_cancel" => Error::Cancelled, _ => Error::Io }),
+                    matches!(result, Err(e) if e == match case { "share" | "stall" | "hard" | "reserved_slow" | "capped_trickle" | "capped_stall" => Error::DeadlineExceeded, "cancel" | "idle_cancel" => Error::Canceled, _ => Error::Io }),
                     "{case}"
                 );
             }
@@ -912,7 +912,7 @@ mod destination_disconnect {
                         upstream.shutdown(Shutdown::Write).unwrap();
                         assert!(matches!(
                             drive(&reactor, work.as_mut()),
-                            Err(Error::Cancelled)
+                            Err(Error::Canceled)
                         ));
                         assert_eq!(admission.used(ResourceClass::Waiter), 2);
                         assert_eq!(admission.used(ResourceClass::Flight), 1);
@@ -971,7 +971,7 @@ mod destination_disconnect {
                     if !matches!(order, CompletionOrder::SuccessAfterFin) {
                         assert!(matches!(
                             drive(&reactor, work.as_mut()),
-                            Err(Error::Cancelled)
+                            Err(Error::Canceled)
                         ));
                     }
                     drop(client);
@@ -1011,7 +1011,7 @@ mod destination_disconnect {
             upstream.shutdown(Shutdown::Write).unwrap();
             assert!(matches!(
                 drive(&reactor, work.as_mut()),
-                Err(Error::Cancelled)
+                Err(Error::Canceled)
             ));
             drop(work);
             assert_eq!(parent.check(), Ok(()));
@@ -1355,7 +1355,7 @@ mod encrypted_http {
                     .await;
                 if attempt == 0 {
                     assert!(prefix_sent.get());
-                    assert!(matches!(response, Err(Error::Cancelled)));
+                    assert!(matches!(response, Err(Error::Canceled)));
                     assert_eq!(metrics.count(Event::CryptoDecryptStarted), 0);
                     continue;
                 }
@@ -2243,7 +2243,7 @@ mod subscriptions {
         let before = scored_members();
         assert!(matches!(
             work.as_mut().poll(&mut cx),
-            Poll::Ready(Err(Error::Cancelled))
+            Poll::Ready(Err(Error::Canceled))
         ));
         assert_eq!(
             scored_members(),

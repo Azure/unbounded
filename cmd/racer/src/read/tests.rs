@@ -544,7 +544,7 @@ mod flight {
             canceled.cancel().unwrap();
             assert!(matches!(
                 head.as_mut().poll(&mut cx),
-                Poll::Ready(Err(Error::Cancelled))
+                Poll::Ready(Err(Error::Canceled))
             ));
             drop(head);
             assert!(count.count() > before);
@@ -622,7 +622,7 @@ mod flight {
             head_scope.cancel().unwrap();
             assert!(matches!(
                 head.as_mut().poll(&mut cx),
-                Poll::Ready(Err(Error::Cancelled))
+                Poll::Ready(Err(Error::Canceled))
             ));
             drop(head);
             let mut next =
@@ -683,11 +683,11 @@ mod flight {
             canceled.cancel().unwrap();
             assert!(matches!(
                 flights.join(page, membership, &context, &canceled, &mut budget()),
-                Err(Error::Cancelled)
+                Err(Error::Canceled)
             ));
             assert!(matches!(
                 waiting.as_mut().poll(&mut cx),
-                Poll::Ready(Err(Error::Cancelled))
+                Poll::Ready(Err(Error::Canceled))
             ));
             drop(waiting);
             assert_eq!(flights.admission_state(), (0, 0, false));
@@ -725,7 +725,7 @@ mod flight {
             assert!(drain.as_mut().poll(&mut cx).is_pending());
             assert!(matches!(
                 waiting.as_mut().poll(&mut cx),
-                Poll::Ready(Err(Error::Cancelled))
+                Poll::Ready(Err(Error::Canceled))
             ));
             drop(waiting);
             assert!(matches!(drain.as_mut().poll(&mut cx), Poll::Ready(Ok(()))));
@@ -1036,7 +1036,7 @@ mod flight {
             );
             assert!(matches!(
                 second.wait().as_mut().poll(&mut cx),
-                Poll::Ready(Err(Error::Cancelled))
+                Poll::Ready(Err(Error::Canceled))
             ));
             drop(second);
             assert_eq!(flights.admission.used(ResourceClass::ControlProgress), 1);
@@ -1255,7 +1255,7 @@ mod flight {
             scope_a.cancel().unwrap();
             flights.poll_budgeted(1).unwrap();
             assert!(operation.cancellation_requested());
-            failed(&mut a, Error::Cancelled);
+            failed(&mut a, Error::Canceled);
             assert!(poll(copy.wait()).is_pending());
             operation.complete().unwrap();
             assert!(matches!(
@@ -1308,7 +1308,7 @@ mod flight {
             flights.poll_budgeted(1).unwrap();
             assert!(!operation.cancellation_requested(), "b adopts the work");
             assert!(!operation.poll_cancellation(cx));
-            failed(&mut a, Error::Cancelled);
+            failed(&mut a, Error::Canceled);
             drop(a);
             assert!(poll(b.wait()).is_pending(), "no second election");
             operation.complete().unwrap();
@@ -1348,7 +1348,7 @@ mod flight {
                 operation.cancellation_requested(),
                 "copy waiters cannot adopt"
             );
-            failed(&mut b, Error::Cancelled);
+            failed(&mut b, Error::Canceled);
             operation.complete().unwrap();
             assert!(matches!(
                 poll(copy.wait()),
@@ -1367,7 +1367,7 @@ mod flight {
             assert!(!operation.cancellation_requested());
             operation.complete().unwrap();
             assert_eq!(
-                flights.fail(leader, AcquisitionFailure::Terminal(Error::Cancelled)),
+                flights.fail(leader, AcquisitionFailure::Terminal(Error::Canceled)),
                 Ok(FlightState::RetryPending)
             );
             let retry = lead(&mut e);
@@ -1410,7 +1410,7 @@ mod flight {
             flights.allow_handover(&leader).unwrap();
             assert!(!operation.poll_cancellation(cx));
             scope_a.cancel().unwrap();
-            failed(&mut a, Error::Cancelled);
+            failed(&mut a, Error::Canceled);
             drop(a);
             assert!(!operation.poll_cancellation(cx), "b and c adopt");
             let before = wakes.0.load(Ordering::SeqCst);
@@ -1427,7 +1427,7 @@ mod flight {
             assert!(operation.poll_cancellation(cx));
             drop(c);
             operation.complete().unwrap();
-            let _ = flights.fail(leader, AcquisitionFailure::Terminal(Error::Cancelled));
+            let _ = flights.fail(leader, AcquisitionFailure::Terminal(Error::Canceled));
             assert!(!flights.acquiring(&page));
             let drain_scope = scope(&env);
             assert!(
@@ -1778,7 +1778,7 @@ mod flight {
             assert_eq!(flights.table.borrow().len(), 1);
             assert!(matches!(
                 flights.join_copy(&test_page(), &scope),
-                Err(Error::Cancelled)
+                Err(Error::Canceled)
             ));
             operation.complete().unwrap();
             assert!(matches!(poll(flights.drain(&scope)), Poll::Ready(Ok(()))));
@@ -2109,7 +2109,7 @@ mod flight {
         let mut bad = result(&flights, test_page());
         bad.metadata.length = 4;
         assert_eq!(flights.publish(leader, bad), Err(Error::CorruptRecord));
-        failed(&mut a, Error::Cancelled);
+        failed(&mut a, Error::Canceled);
         let retry = lead(&mut b);
         assert!(retry.ticket.generation > generation);
         assert_eq!(
@@ -2510,10 +2510,10 @@ mod timeouts {
                     let result = if self.late_success {
                         self.reply(request)
                     } else {
-                        Err(Error::Cancelled)
+                        Err(Error::Canceled)
                     };
                     poll_fn(|_| {
-                        if scope.cancellation.is_cancelled() && self.fenced.get() {
+                        if scope.cancellation.is_canceled() && self.fenced.get() {
                             Poll::Ready(())
                         } else {
                             Poll::Pending
@@ -2722,7 +2722,7 @@ mod timeouts {
             Err(Error::DeadlineExceeded)
         );
         assert!(poll(resolve.as_mut()).is_pending());
-        assert!(first.cancellation.is_cancelled());
+        assert!(first.cancellation.is_canceled());
         assert_eq!(
             f.peers.calls.borrow().len(),
             1,
@@ -2787,7 +2787,7 @@ mod timeouts {
                 Err(Error::DeadlineExceeded)
             );
             assert!(poll(request.as_mut()).is_pending());
-            assert!(first.cancellation.is_cancelled());
+            assert!(first.cancellation.is_canceled());
             assert_eq!(first.deadline.0, original);
             assert_eq!(f.scope.check(), Ok(()));
             assert_eq!(f.peers.calls.borrow()[0].signed_deadline, original);
@@ -2834,14 +2834,14 @@ mod timeouts {
                 clock.advance(Duration::from_secs(2));
                 first.candidate_body_progress(received, 80).unwrap();
                 assert!(poll(request.as_mut()).is_pending());
-                assert!(!first.cancellation.is_cancelled());
+                assert!(!first.cancellation.is_canceled());
             }
             assert!(sim_ctx.clock.now() > first.body_deadlines.unwrap().1);
             assert_eq!(f.peers.calls.borrow()[0].signed_deadline, original);
             f.scope.cancel().unwrap();
             assert!(matches!(
                 poll(request.as_mut()),
-                Poll::Ready(Err(Error::Cancelled))
+                Poll::Ready(Err(Error::Canceled))
             ));
             drop(request);
             assert_eq!(f.peers.calls.borrow().len(), 1);
@@ -2878,7 +2878,7 @@ mod timeouts {
         clock.advance(Duration::from_secs(1));
         assert_eq!(first.candidate_progress(), Err(Error::DeadlineExceeded));
         assert!(poll(request.as_mut()).is_pending());
-        assert!(first.cancellation.is_cancelled());
+        assert!(first.cancellation.is_canceled());
         assert_eq!(f.scope.check(), Ok(()));
         assert_eq!(first.deadline.0, original);
         assert_eq!(f.peers.calls.borrow()[0].signed_deadline, original);
@@ -3328,7 +3328,7 @@ mod timeouts {
             } else {
                 assert!(matches!(result, Poll::Ready(Err(Error::DeadlineExceeded))));
             }
-            assert!(child.cancellation.is_cancelled());
+            assert!(child.cancellation.is_canceled());
         }
         drop(resolve);
         let calls = f.peers.calls.borrow();
@@ -3343,7 +3343,7 @@ mod timeouts {
         );
         assert_eq!(f.budget.remaining_links(), 4);
         assert_eq!(f.budget.deadline(), original);
-        assert!(!f.scope.cancellation.is_cancelled());
+        assert!(!f.scope.cancellation.is_canceled());
     }
 
     #[test]
@@ -3387,7 +3387,7 @@ mod timeouts {
             poll(subscribe.as_mut()).is_pending(),
             "accepted exchange is not fenced"
         );
-        assert!(f.peers.calls.borrow()[0].scope.cancellation.is_cancelled());
+        assert!(f.peers.calls.borrow()[0].scope.cancellation.is_canceled());
         assert!(f.scope.check().is_ok());
         f.peers.fenced.set(true);
         assert!(matches!(poll(subscribe.as_mut()), Poll::Ready(Ok(None))));
@@ -3654,11 +3654,11 @@ mod timeouts {
         assert!(poll(subscribe.as_mut()).is_pending());
         f.scope.cancel().unwrap();
         assert!(poll(subscribe.as_mut()).is_pending());
-        assert!(f.peers.calls.borrow()[0].scope.cancellation.is_cancelled());
+        assert!(f.peers.calls.borrow()[0].scope.cancellation.is_canceled());
         f.peers.fenced.set(true);
         assert!(matches!(
             poll(subscribe.as_mut()),
-            Poll::Ready(Err(Error::Cancelled))
+            Poll::Ready(Err(Error::Canceled))
         ));
         drop(subscribe);
         assert_eq!(f.peers.calls.borrow().len(), 1);
@@ -3693,7 +3693,7 @@ mod timeouts {
             1,
             "must wait for completion fence"
         );
-        assert!(f.peers.calls.borrow()[0].scope.cancellation.is_cancelled());
+        assert!(f.peers.calls.borrow()[0].scope.cancellation.is_canceled());
         assert_eq!(f.scope.check(), Ok(()), "attempt must not cancel parent");
         f.peers.fenced.set(true);
         let Poll::Ready(Ok(CandidateResolution::Copy(response))) = poll(resolve.as_mut()) else {
@@ -3847,7 +3847,7 @@ mod timeouts {
         assert_eq!(f.peers.calls.borrow().len(), 3);
         assert_eq!(f.budget.remaining_attempts(), 0);
         assert_eq!(f.budget.remaining_links(), 4);
-        assert!(!f.scope.cancellation.is_cancelled());
+        assert!(!f.scope.cancellation.is_canceled());
     }
 
     #[test]
@@ -3867,7 +3867,7 @@ mod timeouts {
         assert!(poll(resolve.as_mut()).is_pending());
         f.scope.cancel().unwrap();
         assert!(poll(resolve.as_mut()).is_pending());
-        assert!(f.peers.calls.borrow()[0].scope.cancellation.is_cancelled());
+        assert!(f.peers.calls.borrow()[0].scope.cancellation.is_canceled());
         assert!(
             membership.upgrade().is_some(),
             "cancellation is not a membership completion fence"
@@ -3875,7 +3875,7 @@ mod timeouts {
         f.peers.fenced.set(true);
         assert!(matches!(
             poll(resolve.as_mut()),
-            Poll::Ready(Err(Error::Cancelled))
+            Poll::Ready(Err(Error::Canceled))
         ));
         drop(resolve);
         assert!(

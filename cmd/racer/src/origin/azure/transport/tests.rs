@@ -681,7 +681,7 @@ fn attempt_scope_narrows_only_non_final_attempts() {
     // Narrowed scopes share the request's cancellation.
     let narrowed = attempt_scope(&parent, 2);
     parent.cancel().unwrap();
-    assert_eq!(narrowed.check(), Err(Error::Cancelled));
+    assert_eq!(narrowed.check(), Err(Error::Canceled));
 }
 
 #[test]

@@ -1393,13 +1393,13 @@ pub(crate) mod tests {
                     }
                     "drain" => {
                         drive(&reactor, reactor.drain()).unwrap();
-                        assert!(matches!(drive(&reactor, operation), Err(Error::Cancelled)));
+                        assert!(matches!(drive(&reactor, operation), Err(Error::Canceled)));
                     }
                     _ => {
                         let expected = match failure {
                             "cancel" => {
                                 scope.cancel().unwrap();
-                                Error::Cancelled
+                                Error::Canceled
                             }
                             "disconnect" => {
                                 drop(peer);
@@ -1674,14 +1674,14 @@ pub(crate) mod tests {
         fn canceled_expired_and_disconnected_readers_release_resources() {
             let env = racer_io::Env::host();
             let (admission, reactor, delivery) = setup(&env, 1, Duration::from_secs(1));
-            for failure in [Error::Cancelled, Error::DeadlineExceeded, Error::Io] {
+            for failure in [Error::Canceled, Error::DeadlineExceeded, Error::Io] {
                 let mut scope = scope();
                 let (socket, peer) = UnixStream::pair().unwrap();
                 let page = page(&admission, b"abc".to_vec());
                 let weak = Arc::downgrade(&page.inner);
                 let reader = delivery.attach(page, slice(0, 3)).unwrap();
                 match failure {
-                    Error::Cancelled => scope.cancel().unwrap(),
+                    Error::Canceled => scope.cancel().unwrap(),
                     Error::DeadlineExceeded => scope.deadline = Deadline(Instant::now()),
                     Error::Io => drop(peer),
                     _ => unreachable!(),
@@ -1823,7 +1823,7 @@ pub(crate) mod tests {
             assert!(delivery.pipes.acquire().is_ok());
             assert_eq!(admission.used(ResourceClass::Connection), 1);
             scope.cancel().unwrap();
-            assert!(matches!(drive(&reactor, operation), Err(Error::Cancelled)));
+            assert!(matches!(drive(&reactor, operation), Err(Error::Canceled)));
             assert_eq!(reactor.in_flight(), 0);
             assert!(weak.upgrade().is_none());
             assert_eq!(
@@ -1918,7 +1918,7 @@ pub(crate) mod tests {
                 // driver must keep polling CQEs until the outstanding send is fenced.
                 drive(&reactor, reactor.drain()).unwrap();
                 if let Some(operation) = operation.take() {
-                    assert!(matches!(drive(&reactor, operation), Err(Error::Cancelled)));
+                    assert!(matches!(drive(&reactor, operation), Err(Error::Canceled)));
                 }
                 drop(operation);
                 assert_eq!(reactor.in_flight(), 0);
@@ -2018,7 +2018,7 @@ pub(crate) mod tests {
             let env = racer_io::Env::host();
             let (admission, reactor, delivery) = setup(&env, 1, Duration::from_millis(25));
             for failure in [
-                Error::Cancelled,
+                Error::Canceled,
                 Error::Os(libc::EPIPE),
                 Error::DeadlineExceeded,
             ] {
@@ -2030,13 +2030,13 @@ pub(crate) mod tests {
                 assert!(operation.as_mut().poll(&mut cx).is_pending());
                 assert_eq!(reactor.in_flight(), 1);
                 match failure {
-                    Error::Cancelled => scope.cancel().unwrap(),
+                    Error::Canceled => scope.cancel().unwrap(),
                     Error::Os(libc::EPIPE) => drop(peer),
                     _ => {}
                 }
                 assert!(matches!(drive(&reactor, operation), Err(error) if error == failure));
                 assert_eq!(scope.deadline.0, original);
-                if failure != Error::Cancelled {
+                if failure != Error::Canceled {
                     assert_eq!(scope.check(), Ok(()));
                 }
                 assert_eq!(reactor.in_flight(), 0);
@@ -2977,7 +2977,7 @@ pub(crate) mod tests {
                     if end != "drop" {
                         let result = drive(&f.reactor, work.as_mut());
                         let expected = match end {
-                            "cancel" => Error::Cancelled,
+                            "cancel" => Error::Canceled,
                             "deadline" => Error::DeadlineExceeded,
                             _ => Error::Io,
                         };

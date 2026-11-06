@@ -1349,12 +1349,12 @@ impl StoreWriter {
                             | Error::Os(_)
                             | Error::Unavailable
                             | Error::MissingKey
-                            | Error::Cancelled
+                            | Error::Canceled
                             | Error::DeadlineExceeded
                     ) {
                         failure = Some(error);
                     }
-                    if matches!(error, Error::Cancelled | Error::DeadlineExceeded) {
+                    if matches!(error, Error::Canceled | Error::DeadlineExceeded) {
                         self.discard_unsubmitted();
                     }
                 }
