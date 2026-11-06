@@ -7,6 +7,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"strings"
 	"testing"
 	"time"
@@ -638,10 +639,14 @@ func TestMergeWorkflowArgumentsPreservesApprovedDefaultsAndArtifacts(t *testing.
 			map[string]any{"name": "dataset", "from": "approved"},
 		},
 	}
-	merged := mergeWorkflowArguments(existing, []any{
+
+	merged, err := mergeWorkflowArguments(existing, []any{
 		map[string]any{"name": "run-uid", "value": "immutable-run-uid"},
 		map[string]any{"name": "plan-digest", "value": testStageDigest("plan")},
 	})
+	if err != nil {
+		t.Fatalf("mergeWorkflowArguments() error = %v", err)
+	}
 
 	if len(merged["artifacts"].([]any)) != 1 {
 		t.Fatalf("merged artifacts = %#v", merged["artifacts"])
@@ -659,6 +664,48 @@ func TestMergeWorkflowArgumentsPreservesApprovedDefaultsAndArtifacts(t *testing.
 		values["run-uid"] != "immutable-run-uid" ||
 		values["plan-digest"] != testStageDigest("plan") {
 		t.Fatalf("merged parameters = %#v", values)
+	}
+}
+
+func TestMergeWorkflowArgumentsBoundsAllocation(t *testing.T) {
+	t.Parallel()
+
+	adapterParameters := []any{
+		map[string]any{"name": "run-uid", "value": "immutable-run-uid"},
+		map[string]any{"name": "plan-digest", "value": testStageDigest("plan")},
+	}
+
+	existingParameters := make([]any, maximumWorkflowArgumentParameters-len(adapterParameters))
+	for index := range existingParameters {
+		existingParameters[index] = map[string]any{
+			"name":  fmt.Sprintf("approved-%03d", index),
+			"value": "value",
+		}
+	}
+
+	merged, err := mergeWorkflowArguments(
+		map[string]any{"parameters": existingParameters},
+		adapterParameters,
+	)
+	if err != nil {
+		t.Fatalf("mergeWorkflowArguments() boundary error = %v", err)
+	}
+
+	if got := len(merged["parameters"].([]any)); got != maximumWorkflowArgumentParameters {
+		t.Fatalf("merged parameter count = %d, want %d", got, maximumWorkflowArgumentParameters)
+	}
+
+	overLimit := append(existingParameters, map[string]any{"name": "overflow", "value": "value"})
+	if _, err := mergeWorkflowArguments(
+		map[string]any{"parameters": overLimit},
+		adapterParameters,
+	); err == nil {
+		t.Fatal("mergeWorkflowArguments() accepted an over-limit allocation")
+	}
+
+	tooManyInjected := make([]any, maximumWorkflowArgumentParameters+1)
+	if _, err := mergeWorkflowArguments(nil, tooManyInjected); err == nil {
+		t.Fatal("mergeWorkflowArguments() accepted an overflowing injected parameter count")
 	}
 }
 

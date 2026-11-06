@@ -24,7 +24,10 @@ import (
 	signalv1 "github.com/Azure/unbounded/api/signal/v1alpha1"
 )
 
-const invocationResultPrefix = "PROJECT_SIGNAL_INVOCATION_RESULT_V1 "
+const (
+	invocationResultPrefix            = "PROJECT_SIGNAL_INVOCATION_RESULT_V1 "
+	maximumWorkflowArgumentParameters = 256
+)
 
 type KubernetesStageExecutor struct {
 	Runner        *Runner
@@ -54,7 +57,7 @@ func (e *KubernetesStageExecutor) ExecuteInvocation(
 	}
 }
 
-func mergeWorkflowArguments(existing any, adapterParameters []any) map[string]any {
+func mergeWorkflowArguments(existing any, adapterParameters []any) (map[string]any, error) {
 	arguments, ok := existing.(map[string]any)
 	if !ok {
 		arguments = map[string]any{}
@@ -63,6 +66,14 @@ func mergeWorkflowArguments(existing any, adapterParameters []any) map[string]an
 	parameters := []any{}
 	if existingParameters, ok := arguments["parameters"].([]any); ok {
 		parameters = existingParameters
+	}
+
+	if len(adapterParameters) > maximumWorkflowArgumentParameters ||
+		len(parameters) > maximumWorkflowArgumentParameters-len(adapterParameters) {
+		return nil, fmt.Errorf(
+			"WorkflowTemplate arguments exceed the %d-parameter limit",
+			maximumWorkflowArgumentParameters,
+		)
 	}
 
 	byName := make(map[string]any, len(adapterParameters))
@@ -111,7 +122,7 @@ func mergeWorkflowArguments(existing any, adapterParameters []any) map[string]an
 
 	arguments["parameters"] = merged
 
-	return arguments
+	return arguments, nil
 }
 
 func (e *KubernetesStageExecutor) CancelInvocation(
@@ -602,7 +613,13 @@ func (e *KubernetesStageExecutor) executeWorkflowTemplate(
 		map[string]any{"name": "resolved-inputs-json", "value": inputsJSON},
 		map[string]any{"name": "result-configmap", "value": name + "-result"},
 	}
-	templateSpec["arguments"] = mergeWorkflowArguments(templateSpec["arguments"], adapterParameters)
+
+	arguments, err := mergeWorkflowArguments(templateSpec["arguments"], adapterParameters)
+	if err != nil {
+		return signalv1.InvocationResultEnvelope{}, err
+	}
+
+	templateSpec["arguments"] = arguments
 
 	workflow := &unstructured.Unstructured{Object: map[string]any{
 		"apiVersion": "argoproj.io/v1alpha1",
