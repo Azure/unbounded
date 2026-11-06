@@ -127,9 +127,11 @@ fn name(path: &Path) -> CString {
     CString::new(path.as_os_str().as_bytes()).unwrap()
 }
 
-/// Give each operation group a fresh five-second host deadline.
+/// Give each operation group a fresh host deadline. It only bounds a stuck
+/// test: these operations sync files on a real ring, and a contended disk can
+/// park one sync for seconds.
 fn scope() -> RequestScope {
-    RequestScope::new(Instant::now() + Duration::from_secs(5))
+    RequestScope::new(Instant::now() + Duration::from_secs(30))
 }
 
 /// Poll delivery without implicitly driving kernel progress.
@@ -141,7 +143,7 @@ fn poll<T, E>(future: &mut Operation<'_, T, E>) -> Poll<Result<T, E>> {
 
 /// Explicitly drive bounded completion turns until the public operation resolves.
 fn drive<T, E>(reactor: &Reactor, mut future: Operation<'_, T, E>) -> Result<T, E> {
-    let deadline = Instant::now() + Duration::from_secs(5);
+    let deadline = Instant::now() + Duration::from_secs(30);
     loop {
         if let Poll::Ready(result) = poll(&mut future) {
             return result;
