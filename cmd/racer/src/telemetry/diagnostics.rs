@@ -1115,6 +1115,9 @@ mod tests {
                 "a later request stays busy while the charge is held"
             );
             release.send(()).unwrap();
+            // A fresh watchdog: startup and teardown above may have used most
+            // of the first one on a loaded host.
+            let until = Instant::now() + Duration::from_secs(5);
             while telemetry.hardware_active.borrow().strong_count() > 0 {
                 assert!(Instant::now() < until, "helper never finished");
                 std::thread::sleep(Duration::from_millis(1));
