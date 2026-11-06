@@ -56,12 +56,13 @@ func TestDaemonSetRuntimeContract(t *testing.T) {
 	}
 
 	for name, value := range map[string]string{
-		"RACER_CONTROL_LISTEN":        "[$(RACER_POD_IP)]:8443",
-		"RACER_WEBHOOK_LISTEN":        "[$(RACER_POD_IP)]:9443",
-		"RACER_PEER_LISTEN":           "[$(RACER_POD_IP)]:8082",
-		"RACER_DIAGNOSTICS_LISTEN":    "[$(RACER_POD_IP)]:9090",
-		"RACER_OBJECT_IMAGE":          "registry.test/racer-object:v1",
-		"RACER_SERVICE_ACCOUNT_TOKEN": "/var/run/racer-token/token",
+		"RACER_CONTROL_LISTEN":             "[$(RACER_POD_IP)]:8443",
+		"RACER_WEBHOOK_LISTEN":             "[$(RACER_POD_IP)]:9443",
+		"RACER_PEER_LISTEN":                "[$(RACER_POD_IP)]:8082",
+		"RACER_DIAGNOSTICS_LISTEN":         "[$(RACER_POD_IP)]:9090",
+		"RACER_OBJECT_IMAGE":               "registry.test/racer-object:v1",
+		"RACER_SERVICE_ACCOUNT_TOKEN":      "/var/run/racer-token/token",
+		"RACER_AZURE_FEDERATED_TOKEN_FILE": "/var/run/secrets/azure/tokens/azure-identity-token",
 	} {
 		if env[name].Value != value {
 			t.Fatalf("%s = %q, want %q", name, env[name].Value, value)
@@ -108,9 +109,25 @@ func TestDaemonSetRuntimeContract(t *testing.T) {
 		t.Fatalf("control token = %+v", control)
 	}
 
+	azure := volumes["azure-identity-token"].Projected
+	if azure == nil || len(azure.Sources) != 1 || azure.Sources[0].ServiceAccountToken == nil ||
+		azure.Sources[0].ServiceAccountToken.Audience != "api://AzureADTokenExchange" ||
+		azure.Sources[0].ServiceAccountToken.Path != "azure-identity-token" ||
+		azure.Sources[0].ServiceAccountToken.ExpirationSeconds == nil || *azure.Sources[0].ServiceAccountToken.ExpirationSeconds != 3600 {
+		t.Fatalf("Azure federated token = %+v", azure)
+	}
+
 	mounts := map[string]string{}
 	for _, m := range pod.Containers[0].VolumeMounts {
 		mounts[m.Name] = m.MountPath
+
+		if m.Name == "azure-identity-token" && !m.ReadOnly {
+			t.Fatal("Azure federated token mount must be read-only")
+		}
+	}
+
+	if mounts["azure-identity-token"] != "/var/run/secrets/azure/tokens" {
+		t.Fatalf("Azure federated token mount = %q", mounts["azure-identity-token"])
 	}
 
 	if mounts["kube-api-access"] != "/var/run/secrets/kubernetes.io/serviceaccount" || mounts["token"] != "/var/run/racer-token" {

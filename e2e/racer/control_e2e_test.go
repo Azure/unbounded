@@ -110,7 +110,6 @@ func TestControlPlaneSeatsAndFailover(t *testing.T) {
 		requireAzureEgress(t, containerURL+"/"+blobKey)
 
 		child := h.forTest(t)
-		child.rollout("daemonset", "racer-origin-"+cacheName, 5*time.Minute)
 		child.kubectl("create", "namespace", ns)
 		child.apply(fetchPod(ns, "s3"))
 		child.waitFetch(ns)

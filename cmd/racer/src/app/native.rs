@@ -436,7 +436,8 @@ mod tests {
         let mut service = app.build_crypto(WorkerId(0), engine).unwrap();
         let mut cx = Context::from_waker(futures::task::noop_waker_ref());
         let mut publication = racer_control_wire::Publication {
-            schema_version: 1,
+            pools: Vec::new(),
+            schema_version: racer_control_wire::SCHEMA_VERSION,
             cluster: app.config.cluster.clone(),
             sequence: PublicationSequence(2),
             membership_version: MembershipVersion(2),
@@ -454,7 +455,8 @@ mod tests {
                 site: "site1".into(),
             }],
             caches: vec![],
-        };
+        }
+        .with_default_pool();
         worker.snapshots.apply(publication.clone()).unwrap();
         app.node.inventory.update(vec![]).unwrap();
         worker.poll_native(&mut cx).unwrap();
@@ -1156,24 +1158,28 @@ mod tests {
         worker.discovered_nics = app.discovered_nics.clone();
         worker
             .snapshots
-            .apply(Publication {
-                schema_version: 1,
-                cluster: app.config.cluster.clone(),
-                sequence: PublicationSequence(1),
-                membership_version: MembershipVersion(1),
-                members: vec![racer_control_wire::Member {
-                    node: app.config.node.clone(),
-                    shares: std::num::NonZeroU32::new(1).unwrap(),
-                    peer_endpoint: "127.0.0.1:7443".into(),
-                    rails: if published_rails && aligned {
-                        app.discovered_nics.clone()
-                    } else {
-                        vec![]
-                    },
-                    site: "site1".into(),
-                }],
-                caches: vec![],
-            })
+            .apply(
+                Publication {
+                    pools: Vec::new(),
+                    schema_version: racer_control_wire::SCHEMA_VERSION,
+                    cluster: app.config.cluster.clone(),
+                    sequence: PublicationSequence(1),
+                    membership_version: MembershipVersion(1),
+                    members: vec![racer_control_wire::Member {
+                        node: app.config.node.clone(),
+                        shares: std::num::NonZeroU32::new(1).unwrap(),
+                        peer_endpoint: "127.0.0.1:7443".into(),
+                        rails: if published_rails && aligned {
+                            app.discovered_nics.clone()
+                        } else {
+                            vec![]
+                        },
+                        site: "site1".into(),
+                    }],
+                    caches: vec![],
+                }
+                .with_default_pool(),
+            )
             .unwrap();
         (worker, CryptoRuntime { port: engine })
     }
@@ -1225,20 +1231,24 @@ mod tests {
         );
         worker
             .snapshots
-            .apply(Publication {
-                schema_version: 1,
-                cluster: app.config.cluster.clone(),
-                sequence: PublicationSequence(2),
-                membership_version: MembershipVersion(2),
-                members: vec![racer_control_wire::Member {
-                    node: app.config.node.clone(),
-                    shares: std::num::NonZeroU32::new(1).unwrap(),
-                    peer_endpoint: "127.0.0.1:7443".into(),
-                    rails: vec![],
-                    site: "site1".into(),
-                }],
-                caches: vec![],
-            })
+            .apply(
+                Publication {
+                    pools: Vec::new(),
+                    schema_version: racer_control_wire::SCHEMA_VERSION,
+                    cluster: app.config.cluster.clone(),
+                    sequence: PublicationSequence(2),
+                    membership_version: MembershipVersion(2),
+                    members: vec![racer_control_wire::Member {
+                        node: app.config.node.clone(),
+                        shares: std::num::NonZeroU32::new(1).unwrap(),
+                        peer_endpoint: "127.0.0.1:7443".into(),
+                        rails: vec![],
+                        site: "site1".into(),
+                    }],
+                    caches: vec![],
+                }
+                .with_default_pool(),
+            )
             .unwrap();
         worker
             .refresh_snapshot(&scope(Duration::from_secs(1)).unwrap())
@@ -1293,14 +1303,18 @@ mod tests {
         let (mut worker, _engine) = worker(&app, true, true);
         worker
             .snapshots
-            .apply(Publication {
-                schema_version: 1,
-                cluster: app.config.cluster.clone(),
-                sequence: PublicationSequence(2),
-                membership_version: MembershipVersion(2),
-                members: vec![],
-                caches: vec![],
-            })
+            .apply(
+                Publication {
+                    pools: Vec::new(),
+                    schema_version: racer_control_wire::SCHEMA_VERSION,
+                    cluster: app.config.cluster.clone(),
+                    sequence: PublicationSequence(2),
+                    membership_version: MembershipVersion(2),
+                    members: vec![],
+                    caches: vec![],
+                }
+                .with_default_pool(),
+            )
             .unwrap();
         // Not a member yet (a new node joins only once it serves): startup continues without native rails, and local
         // configuration does not stand in for the missing membership.
@@ -1335,14 +1349,18 @@ mod tests {
         assert!(!worker.membership_usable(None));
         worker
             .snapshots
-            .apply(Publication {
-                schema_version: 1,
-                cluster: app.config.cluster.clone(),
-                sequence: PublicationSequence(2),
-                membership_version: MembershipVersion(2),
-                members: vec![],
-                caches: vec![],
-            })
+            .apply(
+                Publication {
+                    pools: Vec::new(),
+                    schema_version: racer_control_wire::SCHEMA_VERSION,
+                    cluster: app.config.cluster.clone(),
+                    sequence: PublicationSequence(2),
+                    membership_version: MembershipVersion(2),
+                    members: vec![],
+                    caches: vec![],
+                }
+                .with_default_pool(),
+            )
             .unwrap();
         let unlisted = worker.snapshots.current().unwrap();
         worker.snapshot_sequence = Some(unlisted.sequence);
@@ -1369,14 +1387,18 @@ mod tests {
         let listed = worker.snapshots.current().unwrap().membership.clone();
         worker
             .snapshots
-            .apply(Publication {
-                schema_version: 1,
-                cluster: app.config.cluster.clone(),
-                sequence: PublicationSequence(2),
-                membership_version: MembershipVersion(2),
-                members: vec![],
-                caches: vec![],
-            })
+            .apply(
+                Publication {
+                    pools: Vec::new(),
+                    schema_version: racer_control_wire::SCHEMA_VERSION,
+                    cluster: app.config.cluster.clone(),
+                    sequence: PublicationSequence(2),
+                    membership_version: MembershipVersion(2),
+                    members: vec![],
+                    caches: vec![],
+                }
+                .with_default_pool(),
+            )
             .unwrap();
         assert_eq!(
             futures::executor::block_on(
@@ -1392,20 +1414,24 @@ mod tests {
         let member = listed.member(&app.config.node).unwrap().clone();
         worker
             .snapshots
-            .apply(Publication {
-                schema_version: 1,
-                cluster: app.config.cluster.clone(),
-                sequence: PublicationSequence(3),
-                membership_version: MembershipVersion(3),
-                members: vec![racer_control_wire::Member {
-                    node: app.config.node.clone(),
-                    shares: member.shares,
-                    peer_endpoint: member.peer_endpoint.clone(),
-                    rails: app.discovered_nics.clone(),
-                    site: member.site.clone(),
-                }],
-                caches: vec![],
-            })
+            .apply(
+                Publication {
+                    pools: Vec::new(),
+                    schema_version: racer_control_wire::SCHEMA_VERSION,
+                    cluster: app.config.cluster.clone(),
+                    sequence: PublicationSequence(3),
+                    membership_version: MembershipVersion(3),
+                    members: vec![racer_control_wire::Member {
+                        node: app.config.node.clone(),
+                        shares: member.shares,
+                        peer_endpoint: member.peer_endpoint.clone(),
+                        rails: app.discovered_nics.clone(),
+                        site: member.site.clone(),
+                    }],
+                    caches: vec![],
+                }
+                .with_default_pool(),
+            )
             .unwrap();
         worker.native_retry = uring_runtime::environment::now();
         for _ in 0..20 {

@@ -15,6 +15,7 @@ use crate::{
         election::{self, LeaseObservation, Observer},
         keyring::{self, Offer, Policy},
         members::{self, NodeInfo, Ownership, PodInfo},
+        pools,
         publication::{self, Image, Record},
         state::{self, StateError, StateRecord, Writer},
     },
@@ -107,6 +108,8 @@ pub struct PassPlan {
     pub changed: bool,
     /// Root offers refused because the keyring root slots are full.
     pub refused_roots: usize,
+    /// Names of ClusterCaches left out for an invalid `spec.nodeSelector`.
+    pub rejected_caches: Vec<String>,
 }
 
 fn record_of(r: Option<&StateRecord>) -> Record {
@@ -180,11 +183,24 @@ pub fn plan_pass(i: &PassInputs<'_>, rng: &mut dyn Entropy) -> Result<PassPlan, 
     // fails to build or admit and no image of the committed record exists.
     // Unknown is not empty: it must neither publish an empty catalog nor
     // drop cache keys.
-    let catalog: Option<Vec<_>> = inv
+    let built = inv
         .caches_synced
         .then(|| catalog::build(&catalog_input).ok())
-        .flatten()
-        .and_then(|c| keyring::admit_catalog(&c, &durable).ok())
+        .flatten();
+    let rejected_caches = built
+        .as_ref()
+        .map(|c| c.rejected.clone())
+        .unwrap_or_default();
+    // Selectors of caches that admission dropped are not needed: only pools
+    // of admitted caches are published.
+    let admitted = built.and_then(|c| {
+        keyring::admit_catalog(&c.caches, &durable)
+            .ok()
+            .map(|caches| (caches, c.selectors))
+    });
+    let catalog: Option<Vec<_>> = admitted
+        .as_ref()
+        .map(|(caches, _)| caches.clone())
         .or_else(|| previous_image.map(|im| im.publication.caches.clone()));
     let plan = keyring::plan_with(
         i.policy,
@@ -199,11 +215,37 @@ pub fn plan_pass(i: &PassInputs<'_>, rng: &mut dyn Entropy) -> Result<PassPlan, 
     // Without a full observation, keep the committed publication.
     let (member_count, prepared) = match (&members, i.synced, &catalog) {
         (Ok(m), true, Some(catalog)) => {
+            // With a known catalog, evaluate selectors against member Node
+            // labels. Otherwise keep the committed pools for current members.
+            let plans = match &admitted {
+                Some((caches, selectors)) => {
+                    let labels: BTreeMap<&str, &BTreeMap<String, String>> = inv
+                        .nodes
+                        .values()
+                        .map(|n| (n.uid.as_str(), &n.labels))
+                        .collect();
+                    let empty = BTreeMap::new();
+                    pools::plan(
+                        caches,
+                        selectors,
+                        m.members.keys().map(|uid| {
+                            (
+                                uid.as_str(),
+                                labels.get(uid.as_str()).copied().unwrap_or(&empty),
+                            )
+                        }),
+                    )
+                }
+                None => previous_image
+                    .map(|im| pools::from_publication(&im.publication))
+                    .unwrap_or_default(),
+            };
             let p = publication::prepare(
                 &previous_record,
                 cluster,
                 m.members.values().cloned(),
                 catalog.clone(),
+                &plans,
             )
             .map_err(|_| StateError::TooLarge)?;
             // Held joiners count: seats must not shrink while they wait.
@@ -253,6 +295,7 @@ pub fn plan_pass(i: &PassInputs<'_>, rng: &mut dyn Entropy) -> Result<PassPlan, 
         eligible,
         changed,
         refused_roots: plan.refused_roots,
+        rejected_caches,
     })
 }
 
@@ -594,6 +637,136 @@ mod tests {
             image3.delta.as_ref().map(|(s, h, _)| (*s, h.clone()))
         );
         assert!(std::sync::Arc::ptr_eq(&image4.encoded, &image3.encoded));
+    }
+
+    fn add_cache(inv: &mut Inventory, n: u8, spec: serde_json::Value) {
+        let uid = format!("{n:08x}-2222-4000-8000-000000000000");
+        inv.caches.insert(
+            uid.clone(),
+            CacheInfo::from_json(&json!({
+                "metadata": {"name": format!("c{n}"), "uid": uid},
+                "spec": spec
+            })),
+        );
+    }
+
+    fn label(inv: &mut Inventory, node: usize, key: &str, value: &str) {
+        inv.nodes
+            .get_mut(&format!("n{node}"))
+            .unwrap()
+            .labels
+            .insert(key.into(), value.into());
+    }
+
+    fn pools_of(p: &PassPlan) -> Vec<racer_control_wire::Pool> {
+        p.image.as_ref().unwrap().publication.pools.clone()
+    }
+
+    #[test]
+    fn selector_pools_follow_node_labels() {
+        let mut inv = inventory(4);
+        let gpu = json!({"matchLabels": {"gpu": "yes"}});
+        add_cache(&mut inv, 1, json!({"nodeSelector": gpu.clone()}));
+        add_cache(&mut inv, 2, json!({"priority": 900}));
+        add_cache(
+            &mut inv,
+            3,
+            json!({"nodeSelector": {"matchExpressions": [{"key": "gpu", "operator": "In"}]}}),
+        );
+        add_cache(&mut inv, 4, json!({"priority": 7, "nodeSelector": gpu}));
+        label(&mut inv, 1, "gpu", "yes");
+        label(&mut inv, 3, "gpu", "yes");
+        let p = seeded(&inv, None, 1);
+        assert_eq!(p.rejected_caches, ["c3"]);
+        let image = p.image.clone().unwrap();
+        // The invalid cache is out; the others are published.
+        let names: Vec<_> = image
+            .publication
+            .caches
+            .iter()
+            .map(|c| c.name.as_str())
+            .collect();
+        assert_eq!(names, ["c1", "c2", "c4"]);
+        let pools = pools_of(&p);
+        assert_eq!(pools.len(), 2);
+        let default = pools.iter().find(|p| p.id.is_default()).unwrap();
+        assert_eq!((default.rank, default.members.clone()), (900, None));
+        let sel = pools.iter().find(|p| !p.id.is_default()).unwrap();
+        assert_eq!(
+            sel.rank,
+            (1 << 32) | u64::from(racer_control_wire::DEFAULT_PRIORITY)
+        );
+        assert_eq!(sel.members, Some(vec![1, 3]));
+        assert_eq!(sel.caches.len(), 2);
+
+        // Another primary with other entropy publishes the same bytes.
+        let other = seeded(&inv, None, 99);
+        assert_eq!(
+            other.image.as_ref().unwrap().encoded,
+            image.encoded,
+            "publication is deterministic"
+        );
+
+        // Same labels: nothing to commit.
+        let committed = p.next.clone();
+        let same = seeded(&inv, Some((&committed, &image)), 2);
+        assert!(!same.changed);
+
+        // A label change moves a Node into the pool: new membership version.
+        label(&mut inv, 0, "gpu", "yes");
+        let moved = seeded(&inv, Some((&committed, &image)), 3);
+        assert!(moved.changed);
+        assert_eq!(
+            moved.next.membership_version,
+            committed.membership_version + 1
+        );
+        let sel = pools_of(&moved)
+            .into_iter()
+            .find(|p| !p.id.is_default())
+            .unwrap();
+        assert_eq!(sel.members, Some(vec![0, 1, 3]));
+
+        // Removing the label moves it out again.
+        inv.nodes.get_mut("n3").unwrap().labels.clear();
+        let image2 = moved.image.clone().unwrap();
+        let out = seeded(&inv, Some((&moved.next, &image2)), 4);
+        let sel = pools_of(&out)
+            .into_iter()
+            .find(|p| !p.id.is_default())
+            .unwrap();
+        assert_eq!(sel.members, Some(vec![0, 1]));
+        assert_eq!(
+            out.next.membership_version,
+            moved.next.membership_version + 1
+        );
+    }
+
+    #[test]
+    fn unknown_catalog_keeps_committed_pools() {
+        let mut inv = inventory(3);
+        add_cache(
+            &mut inv,
+            1,
+            json!({"nodeSelector": {"matchLabels": {"gpu": "yes"}}}),
+        );
+        label(&mut inv, 2, "gpu", "yes");
+        let p = seeded(&inv, None, 1);
+        let image = p.image.clone().unwrap();
+        // A duplicate cache name fails the whole catalog build.
+        let mut broken = inventory(3);
+        label(&mut broken, 2, "gpu", "yes");
+        broken.caches = inv.caches.clone();
+        let dup = broken.caches.values().next().unwrap().clone();
+        broken.caches.insert(
+            "x".into(),
+            CacheInfo {
+                uid: "99999999-2222-4000-8000-000000000000".into(),
+                ..dup
+            },
+        );
+        let kept = seeded(&broken, Some((&p.next, &image)), 2);
+        assert!(!kept.changed);
+        assert_eq!(pools_of(&kept), image.publication.pools);
     }
 
     #[test]

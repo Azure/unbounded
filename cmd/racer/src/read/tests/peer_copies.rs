@@ -4369,10 +4369,10 @@ fn owner_asks_previous_membership_owners_before_origin() {
             assert!(asked.is_empty(), "{asked:?}");
             assert_eq!(f.origin.calls.get(), 1);
         } else if copy {
-            assert_eq!(asked, previous[..1]);
+            // Rank 0 asks every previous owner at once, each on its own grant.
+            assert_eq!(asked, previous);
             assert_eq!(f.origin.calls.get(), 0);
         } else {
-            // Handoff probes keep one credit for origin: 8 credits ask all.
             assert_eq!(asked, previous);
             assert_eq!(f.origin.calls.get(), 1);
         }

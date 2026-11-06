@@ -15,6 +15,10 @@ import (
 // Workspace members use the root lock. Only explicitly declared relative members
 // are read; missing declared inputs fail closed.
 func workspaceVersions(root string) (map[string]string, error) {
+	return workspaceVersionsAt(root, cratePath, crateName)
+}
+
+func workspaceVersionsAt(root, cratePath, crateName string) (map[string]string, error) {
 	base := filepath.Join(root, cratePath)
 
 	manifest, err := os.ReadFile(filepath.Join(base, "Cargo.toml"))

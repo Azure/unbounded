@@ -216,6 +216,19 @@ func TestAgentConfig_Validate(t *testing.T) {
 			},
 		},
 		{
+			name: "additional host mount device allow",
+			mutate: func(cfg *AgentConfig) {
+				cfg.AdditionalHostMounts = []AdditionalHostMount{{Source: "/dev/dri", DeviceAllow: []string{"char-drm", "/dev/dri/card0"}}}
+			},
+		},
+		{
+			name: "additional host mount device allow outside dev",
+			mutate: func(cfg *AgentConfig) {
+				cfg.AdditionalHostMounts = []AdditionalHostMount{{Source: "/dev/dri", DeviceAllow: []string{"/etc/passwd"}}}
+			},
+			wantErr: "AdditionalHostMounts[0].DeviceAllow[0]",
+		},
+		{
 			name: "additional host device group with invalid characters",
 			mutate: func(cfg *AgentConfig) {
 				cfg.AdditionalHostDevices = []string{"char-input=all"}

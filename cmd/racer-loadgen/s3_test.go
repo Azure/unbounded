@@ -14,8 +14,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/aws/aws-sdk-go-v2/aws"
-	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/testutil"
 	"github.com/stretchr/testify/require"
@@ -163,21 +161,58 @@ func TestS3OriginHTTP(t *testing.T) {
 	}
 }
 
+// s3TestOrigin is a synthetic Racer origin that serves the catalog objects
+// for bucket, standing in for the Racer dataplane's Azure Blob origin.
+func s3TestOrigin(t *testing.T, c *blobCatalog, bucket string, reads *atomic.Int32) racersdk.Origin {
+	t.Helper()
+
+	return func(_ context.Context, request racersdk.OriginRequest) (racersdk.Metadata, io.ReadCloser, error) {
+		reads.Add(1)
+
+		for index, batch := range c.batches {
+			want, err := racerobject.NewRequest(bucket, s3ObjectKey(index), "")
+			if err != nil {
+				return racersdk.Metadata{}, nil, err
+			}
+
+			if want.Key != request.Key || want.Metadata != request.Metadata {
+				continue
+			}
+
+			desc := batch.blobs[0].descriptor
+			metadata := racersdk.Metadata{
+				Size: desc.Size, ETag: `"` + desc.Digest.Encoded() + `"`,
+				ContentType: "application/octet-stream", ExpiresAt: time.Now().Add(time.Minute),
+			}
+
+			if request.ETag != "" && request.ETag != metadata.ETag {
+				return racersdk.Metadata{}, nil, racersdk.ErrVersionMismatch
+			}
+
+			if request.Head {
+				return metadata, nil, nil
+			}
+
+			length := max(min(request.Length, desc.Size-request.Offset), 0)
+
+			return metadata, io.NopCloser(io.NewSectionReader(c.blobs[desc.Digest].data, request.Offset, length)), nil
+		}
+
+		return racersdk.Metadata{}, nil, racersdk.ErrNotFound
+	}
+}
+
 func TestS3DirectAndRacerObject(t *testing.T) {
-	// Crossing a Racer page boundary exercises pinned HEAD/GET and exact ranges
-	// through the real AWS HTTP client and racer-object adapters, not S3 stubs.
+	// Crossing a Racer page boundary exercises pinned page reads and exact
+	// ranges through the racer-object sidecar and a real Racer SDK client.
 	c := s3TestCatalog(t, 1, int64(racersdk.PageSize)+73)
 	originMetrics := newMetrics(prometheus.NewRegistry())
 	originServer := httptest.NewServer(originMetrics.instrument(c.s3Handler("benchmark")))
 	t.Cleanup(originServer.Close)
-	client := s3.New(s3.Options{
-		Region: "us-east-1", BaseEndpoint: aws.String(originServer.URL), UsePathStyle: true,
-		Credentials: aws.AnonymousCredentials{}, HTTPClient: originServer.Client(),
-		ResponseChecksumValidation: aws.ResponseChecksumValidationWhenRequired,
-	})
-	origin, err := racerobject.NewOrigin(client, racerobject.OriginConfig{Bucket: "benchmark", MetadataTTL: time.Minute})
-	require.NoError(t, err)
-	sdk := racersdktest.NewClient(t, origin)
+
+	var reads atomic.Int32
+
+	sdk := racersdktest.NewClient(t, s3TestOrigin(t, c, "benchmark", &reads))
 
 	handler, err := racerobject.NewSidecar(sdk, racerobject.SidecarConfig{})
 	require.NoError(t, err)
@@ -195,8 +230,8 @@ func TestS3DirectAndRacerObject(t *testing.T) {
 		require.Equal(t, float64(1), testutil.ToFloat64(m.pulls.WithLabelValues("success")))
 	}
 
-	require.GreaterOrEqual(t, testutil.ToFloat64(originMetrics.originRequests.WithLabelValues("HEAD", "200")), float64(2))
-	require.Equal(t, float64(2), testutil.ToFloat64(originMetrics.originRequests.WithLabelValues("GET", "206")))
+	require.Equal(t, float64(1), testutil.ToFloat64(originMetrics.originRequests.WithLabelValues("GET", "200")))
+	require.GreaterOrEqual(t, reads.Load(), int32(2), "sidecar reads cross a page boundary through the origin")
 }
 
 func TestS3ClientFailuresAndVerification(t *testing.T) {

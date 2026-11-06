@@ -187,6 +187,11 @@ pub struct NodeConfig {
     // measure without the fix.
     /// Overflow fan-out to page helpers.
     pub fanout: bool,
+    /// Mesh v2 hot-key rule (`designs/racer-mesh-v2.md`, "Hot keys"): an owner never sheds a
+    /// requester in its own mesh column, and a shed reader asks `Pool::helper(reader, owner)`, the
+    /// middle node of its primary path. Off: the v1 rule (about sqrt(N) helpers hashed over all
+    /// members, `racer_core::read::budget::is_helper`).
+    pub mesh_helpers: bool,
     /// Bodies of one page an owner streams before shedding its readers; 0 derives it from the page
     /// size like production.
     pub hot_page_bodies: u32,
@@ -261,6 +266,7 @@ impl Default for NodeConfig {
             hedge_delay_ns: 100 * MILLIS,
             hedge_bytes: DUPLICATE_BYTES as u64,
             fanout: true,
+            mesh_helpers: true,
             hot_page_bodies: 0,
             flight_handover: true,
             successor_hints: true,
@@ -405,6 +411,7 @@ impl Config {
                             "hedge_delay_ns" => node.hedge_delay_ns = n,
                             "hedge_bytes" => node.hedge_bytes = n,
                             "fanout" if n <= 1 => node.fanout = n == 1,
+                            "mesh_helpers" if n <= 1 => node.mesh_helpers = n == 1,
                             "hot_page_bodies" => node.hot_page_bodies = small()?,
                             "flight_handover" if n <= 1 => node.flight_handover = n == 1,
                             "successor_hints" if n <= 1 => node.successor_hints = n == 1,

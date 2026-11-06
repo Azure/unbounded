@@ -37,7 +37,11 @@
 #      release.yaml AT THIS TAG. That binding is what makes the signature mean
 #      anything: one from @refs/heads/main, or from a fork, is rejected.
 #   2. The BOM's recorded tag and commit match what the caller expected.
-#   3. Every image the BOM pins is itself signed by the same identity.
+#   3. Every image the BOM pins is signed by this repo AT THIS TAG, from either
+#      release.yaml or the multiarch-image.yaml reusable workflow it calls.
+#      Keyless signing inside a reusable workflow puts the callee's
+#      job_workflow_ref in the certificate, so images built there carry
+#      multiarch-image.yaml@refs/tags/<tag>. Blobs still require release.yaml.
 #   4. Every CHECKSUM_FILES entry is listed in checksums.txt, that file carries
 #      the same signed identity, and the bytes on disk match it.
 #   5. The release still carries every artifact the BOM declares, and each
@@ -70,6 +74,14 @@ done
 TAG_PATTERN="${TAG//./\\.}"
 
 IDENTITY="^https://github.com/${GITHUB_REPOSITORY}/\.github/workflows/release\.yaml@refs/tags/${TAG_PATTERN}$"
+
+# Images may also be signed by the multiarch-image.yaml reusable workflow,
+# whose certificate names the callee, not the caller. The caller is not pinned
+# separately: the identity is bound to this repo and this exact tag, a local
+# `uses: ./...` call resolves at the caller's ref, and the only caller that
+# signs (sign: true) is release.yaml; images.yaml never signs and does not run
+# at release tags.
+IMAGE_IDENTITY="^https://github.com/${GITHUB_REPOSITORY}/\.github/workflows/(release|multiarch-image)\.yaml@refs/tags/${TAG_PATTERN}$"
 OIDC_ISSUER="https://token.actions.githubusercontent.com"
 
 ARCHIVE="${DIST}/unbounded-manifests-${TAG}.tar.gz"
@@ -242,7 +254,7 @@ fi
 
 for image in "${images[@]}" "${charts[@]}"; do
   cosign verify \
-    --certificate-identity-regexp "${IDENTITY}" \
+    --certificate-identity-regexp "${IMAGE_IDENTITY}" \
     --certificate-oidc-issuer "${OIDC_ISSUER}" \
     "${image}" >/dev/null
 done

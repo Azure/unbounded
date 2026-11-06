@@ -592,10 +592,6 @@ func (r *Reconciler) advancePowerOn(ctx context.Context, op *v1alpha3.MachineOpe
 		return retryTarget(target, err, now, r.maxAttempts())
 	}
 
-	if err := disableBootOverride(ctx, pc, &target, op.Generation, now); err != nil {
-		return retryTarget(target, err, now, r.maxAttempts())
-	}
-
 	state, err := pc.PowerState(ctx)
 	if err != nil {
 		return retryTarget(target, err, now, r.maxAttempts())
@@ -607,6 +603,10 @@ func (r *Reconciler) advancePowerOn(ctx context.Context, op *v1alpha3.MachineOpe
 
 	if change, handled := r.waitForPowerAction(target, v1alpha3.OperationStageWaitingOn, "waiting for power on", "timed out waiting for power on", now); handled {
 		return change
+	}
+
+	if err := disableBootOverride(ctx, pc, &target, op.Generation, now); err != nil {
+		return retryTarget(target, err, now, r.maxAttempts())
 	}
 
 	if err := pc.Reset(ctx, redfish.ResetOn); err != nil {
@@ -624,10 +624,6 @@ func (r *Reconciler) advancePowerOn(ctx context.Context, op *v1alpha3.MachineOpe
 func (r *Reconciler) advanceReboot(ctx context.Context, op *v1alpha3.MachineOperation, machine *v1alpha3.Machine, target v1alpha3.MachineOperationTargetStatus, now metav1.Time) targetChange {
 	pc, err := r.PowerClients.ForMachine(ctx, machine)
 	if err != nil {
-		return retryTarget(target, err, now, r.maxAttempts())
-	}
-
-	if err := disableBootOverride(ctx, pc, &target, op.Generation, now); err != nil {
 		return retryTarget(target, err, now, r.maxAttempts())
 	}
 
@@ -667,6 +663,10 @@ func (r *Reconciler) advanceReboot(ctx context.Context, op *v1alpha3.MachineOper
 			return change
 		}
 
+		if err := disableBootOverride(ctx, pc, &target, op.Generation, now); err != nil {
+			return retryTarget(target, err, now, r.maxAttempts())
+		}
+
 		if err := pc.Reset(ctx, redfish.ResetOn); err != nil {
 			return retryTarget(target, err, now, r.maxAttempts())
 		}
@@ -683,6 +683,10 @@ func (r *Reconciler) advanceReboot(ctx context.Context, op *v1alpha3.MachineOper
 	}
 }
 
+// disableBootOverride clears the Redfish boot source override so the next boot
+// follows the firmware boot order. Callers clear it only while the host is off,
+// right before sending On: some BMCs, such as HPE iLO, reject boot changes
+// while the host is in POST, and the override only matters for the next boot.
 func disableBootOverride(ctx context.Context, pc PowerClient, target *v1alpha3.MachineOperationTargetStatus, observedGeneration int64, now metav1.Time) error {
 	if apimeta.IsStatusConditionTrue(target.Conditions, v1alpha3.MachineOperationTargetConditionRedfishDisableBootOverrideUnsupported) {
 		return pc.SetBootOverride(ctx, redfish.BootTargetHdd, redfish.BootContinuous)

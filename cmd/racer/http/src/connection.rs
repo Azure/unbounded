@@ -236,6 +236,11 @@ pub trait Endpoint<E>: Clone + Ord + 'static {
     fn allocation(&self) -> usize {
         std::mem::size_of_val(self)
     }
+
+    /// TLS policy for new connections; `None` (the default) is plaintext.
+    fn tls(&self) -> Option<&crate::tls::TlsClient> {
+        None
+    }
 }
 
 /// Connection, waiter, and idle-retention limits supplied by the caller.
@@ -311,6 +316,12 @@ pub struct ConnectionLease<C: Context> {
     request_is_head: bool,
 
     close: bool,
+
+    /// Kernel TLS receive state; `Some` once the socket carries kernel TLS.
+    kernel_tls: Option<Box<crate::tls::ControlRecords>>,
+
+    /// Userspace TLS relay and its buffer charge; dropped after the socket.
+    relay: Option<crate::tls::Relay<C::Charge>>,
 }
 
 /// A head result and the connection and decoded-storage charge it retains.
@@ -789,9 +800,7 @@ impl<C: Context> HttpIo<C> {
                         lease: received.lease,
                     }
                 } else {
-                    self.reactor
-                        .recv(connection.socket(), range, connection, scope)
-                        .await?
+                    self.recv_data(connection, range, scope).await?
                 };
                 if completed.bytes == 0 || completed.bytes > end - used {
                     return Err(uring_runtime::Error::Io.into());
@@ -887,6 +896,56 @@ impl<C: Context> HttpIo<C> {
             self.read_body_range_impl(connection, buffer, 0..length, scope)
                 .await
         })
+    }
+
+    /// Receive plaintext. Kernel TLS sockets use `recvmsg` so post-handshake
+    /// records are consumed (tickets) or rejected (anything else) instead of
+    /// failing the receive; such records never count as progress.
+    async fn recv_data<B: IoBuffer>(
+        &self,
+        mut connection: ConnectionLease<C>,
+        mut buffer: B,
+        scope: &C::Scope,
+    ) -> Result<C, Completion<B, ConnectionLease<C>>>
+    where
+        C::Error: From<B::Error>,
+    {
+        if connection.kernel_tls.is_none() {
+            return self
+                .reactor
+                .recv(connection.socket(), buffer, connection, scope)
+                .await;
+        }
+        loop {
+            let received = self
+                .reactor
+                .recv_msg(connection.socket(), buffer, connection, scope)
+                .await?;
+            buffer = received.buffer;
+            connection = received.lease;
+            match received.tls_record_type {
+                None | Some(23) => {
+                    return Ok(Completion {
+                        buffer,
+                        bytes: received.bytes,
+                        lease: connection,
+                    });
+                }
+                Some(kind) => {
+                    if received.bytes == 0 {
+                        return Err(uring_runtime::Error::Io.into());
+                    }
+                    let control = connection.kernel_tls.as_mut().expect("kernel TLS");
+                    let bytes = buffer.bytes_mut()?;
+                    let absorbed = control.absorb(kind, &bytes[..received.bytes]);
+                    bytes[..received.bytes].zeroize();
+                    if absorbed.is_err() {
+                        connection.poison();
+                        return Err(uring_runtime::Error::Os(libc::EPROTO).into());
+                    }
+                }
+            }
+        }
     }
 
     /// Send the complete buffer, accessing its bytes only when polled.
@@ -1028,11 +1087,9 @@ impl<C: Context> HttpIo<C> {
             });
         }
         let completed = self
-            .reactor
-            .recv(
-                connection.socket(),
-                BufferRange::new::<C::Error>(buffer, range.start..range.start + length)?,
+            .recv_data(
                 connection,
+                BufferRange::new::<C::Error>(buffer, range.start..range.start + length)?,
                 scope,
             )
             .await?;
@@ -1163,7 +1220,29 @@ impl<C: Context> ConnectionLease<C> {
             tx_remaining: None,
             request_is_head: false,
             close: false,
+            kernel_tls: None,
+            relay: None,
         }
+    }
+
+    /// Whether this connection's record layer is kernel TLS.
+    pub fn is_kernel_tls(&self) -> bool {
+        self.kernel_tls.is_some()
+    }
+
+    /// Route receives through `recvmsg` to observe kernel TLS record types.
+    pub(crate) fn enable_kernel_tls(&mut self) {
+        self.kernel_tls = Some(Box::default());
+    }
+
+    /// Swap in the plaintext end of a userspace TLS relay.
+    pub(crate) fn replace_socket(&mut self, fd: Rc<Descriptor>) {
+        self.fd = fd;
+    }
+
+    /// Retain a userspace TLS relay and its buffer charge with this connection.
+    pub(crate) fn attach_relay(&mut self, relay: crate::tls::Relay<C::Charge>) {
+        self.relay = Some(relay);
     }
 
     /// Borrow the connection's live policy.
@@ -1333,6 +1412,8 @@ impl<C: Context> Drop for ConnectionLease<C> {
                     fd: self.fd.clone(),
                     reservation,
                     since: uring_runtime::environment::now(),
+                    kernel_tls: self.kernel_tls.take(),
+                    relay: self.relay.take(),
                 })
         } else {
             None
@@ -1404,7 +1485,7 @@ impl<C: Context> HttpPool<C> {
             scope.check()?;
             let (mut connection, address) = self.prepare_connection_inner(endpoint, false)?;
             connection.state_mut().attach(checkout);
-            self.connect(connection, address, scope).await
+            self.connect(connection, address, endpoint, scope).await
         })
     }
 
@@ -1490,7 +1571,7 @@ impl<C: Context> HttpPool<C> {
             })
             .await?;
             drop(waiting);
-            self.connect(connection, address, scope).await
+            self.connect(connection, address, endpoint, scope).await
         })
     }
 
@@ -1665,10 +1746,11 @@ impl<C: Context> HttpPool<C> {
         }
         drop(skipped);
         if let Some(idle) = reused {
-            return Ok((
-                ConnectionLease::new(idle.fd, idle.reservation, idle.state, slot.0.take()),
-                None,
-            ));
+            let mut lease =
+                ConnectionLease::new(idle.fd, idle.reservation, idle.state, slot.0.take());
+            lease.kernel_tls = idle.kernel_tls;
+            lease.relay = idle.relay;
+            return Ok((lease, None));
         }
         if let Some(e) = rejected {
             // Ordinary admission is held by active connections; the slot guard releases `active`.
@@ -1689,12 +1771,7 @@ impl<C: Context> HttpPool<C> {
             result => result?,
         };
         let address = endpoint.address()?;
-        let domain = match &address {
-            SocketAddress::Inet(a) if a.is_ipv4() => libc::AF_INET,
-            SocketAddress::Inet(_) => libc::AF_INET6,
-            SocketAddress::Unix(_) => libc::AF_UNIX,
-        };
-        let fd = Descriptor::socket(domain)?;
+        let fd = Descriptor::socket(socket_domain(&address))?;
         if matches!(address, SocketAddress::Inet(_)) {
             fd.enable_tcp_nodelay(self.config.tcp_nodelay)?;
         }
@@ -1705,15 +1782,63 @@ impl<C: Context> HttpPool<C> {
     }
 
     /// Connect while keeping observation policy and admission inside runtime fencing.
+    /// Endpoints with TLS policy complete the handshake before the lease is returned.
     async fn connect(
         &self,
         connection: ConnectionLease<C>,
         address: Option<SocketAddress>,
+        endpoint: &C::Endpoint,
         scope: &C::Scope,
     ) -> Result<C, ConnectionLease<C>> {
         let Some(address) = address else {
             return Ok(connection);
         };
+        let mut connection = self
+            .connect_socket(connection, address.clone(), scope)
+            .await?;
+        let Some(tls) = endpoint.tls() else {
+            return Ok(connection);
+        };
+        let mut userspace = false;
+        loop {
+            match crate::tls::establish::<C>(
+                &self.reactor,
+                &self.context,
+                connection,
+                tls,
+                userspace,
+                scope,
+            )
+            .await?
+            {
+                crate::tls::Established::Ready(ready) => return Ok(ready),
+                crate::tls::Established::Retry(mut retry) if !userspace => {
+                    // The kernel rejected the negotiated keys after the socket
+                    // switched to the `tls` ULP. Close it and redo TCP and the
+                    // handshake on a fresh socket under the same scope.
+                    scope.check()?;
+                    let fd = Descriptor::socket(socket_domain(&address))?;
+                    if matches!(address, SocketAddress::Inet(_)) {
+                        fd.enable_tcp_nodelay(self.config.tcp_nodelay)?;
+                    }
+                    retry.replace_socket(Rc::new(fd));
+                    connection = self.connect_socket(retry, address.clone(), scope).await?;
+                    userspace = true;
+                }
+                crate::tls::Established::Retry(_) => {
+                    return Err(uring_runtime::Error::Unavailable.into());
+                }
+            }
+        }
+    }
+
+    /// Complete the TCP connect for a prepared lease.
+    async fn connect_socket(
+        &self,
+        connection: ConnectionLease<C>,
+        address: SocketAddress,
+        scope: &C::Scope,
+    ) -> Result<C, ConnectionLease<C>> {
         // Observation is shared separately from the completion-owned connection.
         // A guard references policy without moving it out of the operation's fence.
         let charge = self.context.charge(ConnectOwner::<C>::allocation())?;
@@ -1737,12 +1862,11 @@ impl<C: Context> HttpPool<C> {
                 .connect_failed(errno.get());
         }
         drop(result?);
-        let connection = observation
+        Ok(observation
             .connection
             .borrow_mut()
             .take()
-            .expect("connect owner");
-        Ok(connection)
+            .expect("connect owner"))
     }
 
     /// Evict idle owners and drop their policies after releasing the pool borrow.
@@ -1865,6 +1989,10 @@ struct Idle<C: Context> {
     reservation: C::Slot,
 
     since: Instant,
+
+    kernel_tls: Option<Box<crate::tls::ControlRecords>>,
+
+    relay: Option<crate::tls::Relay<C::Charge>>,
 }
 
 /// Active and idle connections belonging to one endpoint generation.
@@ -2172,6 +2300,15 @@ fn rejected_head<C: Context>(
 }
 
 /// Connection framing, ownership, policy, and cancellation regression tests.
+/// Socket domain for a connect address.
+fn socket_domain(address: &SocketAddress) -> libc::c_int {
+    match address {
+        SocketAddress::Inet(a) if a.is_ipv4() => libc::AF_INET,
+        SocketAddress::Inet(_) => libc::AF_INET6,
+        SocketAddress::Unix(_) => libc::AF_UNIX,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3048,7 +3185,7 @@ mod tests {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let address = SocketAddress::Inet(listener.local_addr().unwrap());
         let (connection, _) = pool.prepare_connection(&Key).unwrap();
-        let mut connect = Box::pin(pool.connect(connection, Some(address), &TestScope));
+        let mut connect = Box::pin(pool.connect(connection, Some(address), &Key, &TestScope));
         assert!(connect.as_mut().poll(&mut cx).is_pending());
         assert_eq!(hooks.used.get(), ConnectOwner::<Hooks>::allocation());
         assert_eq!(reactor.in_flight(), 1);
@@ -3074,6 +3211,7 @@ mod tests {
             pool.connect(
                 connection,
                 Some(SocketAddress::Inet(listener.local_addr().unwrap())),
+                &Key,
                 &TestScope,
             ),
         )

@@ -1,0 +1,140 @@
+name: Set up Go with shared caches
+description: >-
+  Install Go from go.mod and restore the shared module cache (unless
+  restore-mod-cache is false) plus one build cache profile. Build cache keys
+  end in a UTC date, so each profile saves at most once per day per branch. Caches are saved only from push events (main and release
+  branches), and only by the job that owns them, so pull request and
+  merge_group runs restore what their base branch wrote without adding
+  entries of their own. Call the post step (this action with
+  phase: save) at the end of the job to save.
+inputs:
+  phase:
+    description: "restore (default) to install Go and restore caches, or save to save them at the end of the job."
+    required: false
+    default: restore
+  profile:
+    description: >-
+      Build cache profile to restore and save, for example build, race, or
+      lint. Jobs that compile with the same flags should share a profile so
+      the cache holds one entry per profile.
+    required: true
+  save-build-cache:
+    description: Whether this job owns the profile and saves it on push.
+    required: false
+    default: "false"
+  save-mod-cache:
+    description: Whether this job owns the module cache and saves it on push. Exactly one job should set this.
+    required: false
+    default: "false"
+  restore-mod-cache:
+    description: Whether to restore the shared module cache. Set to "false" for jobs where module downloads are fast enough to skip it.
+    required: false
+    default: "true"
+  extra-build-paths:
+    description: Extra newline-separated paths stored with the build cache profile (for example the golangci-lint cache).
+    required: false
+    default: ""
+outputs:
+  go-version:
+    description: The installed Go version (go env GOVERSION).
+    value: ${{ steps.keys.outputs.go-version }}
+runs:
+  using: composite
+  steps:
+    - name: Set up Go
+      if: inputs.phase == 'restore'
+      uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+      with:
+        go-version-file: go.mod
+        # setup-go's built-in cache uses one key for every job, so only the
+        # first job to finish gets its build cache saved, and the key never
+        # changes as code changes. The steps below replace it.
+        cache: false
+
+    - name: Compute Go cache keys
+      id: keys
+      shell: bash
+      env:
+        PROFILE: ${{ inputs.profile }}
+        EXTRA: ${{ inputs.extra-build-paths }}
+      run: |
+        set -euo pipefail
+        goversion="$(go env GOVERSION)"
+        sum="$(sha256sum go.sum | cut -c1-16)"
+        prefix="go-${PROFILE}-${RUNNER_OS}-${RUNNER_ARCH}-${goversion}"
+        {
+          echo "go-version=${goversion}"
+          echo "gomodcache=$(go env GOMODCACHE)"
+          echo "mod-key=go-mod-${RUNNER_OS}-${RUNNER_ARCH}-${goversion}-${sum}"
+          echo "build-prefix=${prefix}-"
+          echo "build-sum-prefix=${prefix}-${sum}-"
+          # A UTC date suffix instead of the commit SHA limits each profile
+          # to one saved entry per day per branch, which keeps churn in the
+          # repository cache low.
+          echo "build-key=${prefix}-${sum}-$(date -u +%Y%m%d)"
+          echo "build-paths<<EOF"
+          go env GOCACHE
+          if [ -n "$EXTRA" ]; then printf '%s\n' "$EXTRA"; fi
+          echo "EOF"
+        } >> "$GITHUB_OUTPUT"
+
+    - name: Restore Go module cache
+      if: inputs.phase == 'restore' && inputs.restore-mod-cache == 'true'
+      uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+      with:
+        path: ${{ steps.keys.outputs.gomodcache }}
+        key: ${{ steps.keys.outputs.mod-key }}
+
+    - name: Restore Go build cache
+      if: inputs.phase == 'restore'
+      uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+      with:
+        path: ${{ steps.keys.outputs.build-paths }}
+        key: ${{ steps.keys.outputs.build-key }}
+        restore-keys: |
+          ${{ steps.keys.outputs.build-sum-prefix }}
+          ${{ steps.keys.outputs.build-prefix }}
+
+    # The module cache key has no date or commit suffix, so an existing entry is never
+    # overwritten; skip the save when it already exists.
+    - name: Check for existing Go module cache
+      id: mod-exists
+      if: inputs.phase == 'save' && inputs.save-mod-cache == 'true' && github.event_name == 'push'
+      uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+      with:
+        path: ${{ steps.keys.outputs.gomodcache }}
+        key: ${{ steps.keys.outputs.mod-key }}
+        lookup-only: true
+
+    # The owning job may compile only part of the module graph; download the
+    # rest so jobs that run tests or other packages find every module.
+    - name: Download all modules
+      if: inputs.phase == 'save' && inputs.save-mod-cache == 'true' && github.event_name == 'push' && steps.mod-exists.outputs.cache-hit != 'true'
+      shell: bash
+      run: timeout --signal=TERM --kill-after=10s 300s go mod download
+
+    - name: Save Go module cache
+      if: inputs.phase == 'save' && inputs.save-mod-cache == 'true' && github.event_name == 'push' && steps.mod-exists.outputs.cache-hit != 'true'
+      uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+      with:
+        path: ${{ steps.keys.outputs.gomodcache }}
+        key: ${{ steps.keys.outputs.mod-key }}
+
+    # The build key changes once per day, so later pushes on the same day
+    # would build an archive only for the save to be rejected. Skip the save
+    # when the entry already exists.
+    - name: Check for existing Go build cache
+      id: build-exists
+      if: inputs.phase == 'save' && inputs.save-build-cache == 'true' && github.event_name == 'push'
+      uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+      with:
+        path: ${{ steps.keys.outputs.build-paths }}
+        key: ${{ steps.keys.outputs.build-key }}
+        lookup-only: true
+
+    - name: Save Go build cache
+      if: inputs.phase == 'save' && inputs.save-build-cache == 'true' && github.event_name == 'push' && steps.build-exists.outputs.cache-hit != 'true'
+      uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+      with:
+        path: ${{ steps.keys.outputs.build-paths }}
+        key: ${{ steps.keys.outputs.build-key }}

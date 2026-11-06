@@ -187,6 +187,10 @@ RUN set -eu; \
         false) ;; \
         *) echo "RACER_NATIVE_CUDA must be true or false" >&2; exit 1 ;; \
     esac
+# ca-certificates provides the default origin trust bundle
+# (/etc/ssl/certs/ca-certificates.crt, override with RACER_ORIGIN_TRUST_BUNDLE).
+# Kernel TLS (the `tls` module) is optional: without it origin HTTPS falls back
+# to userspace rustls.
 RUN set -eu; \
     case "$RACER_NATIVE_RDMA" in \
         true) set -- libnl-3-200 libnl-route-3-200 ;; \
@@ -195,7 +199,7 @@ RUN set -eu; \
     esac; \
     apt-get update; \
     apt-get upgrade -y; \
-    apt-get install -y --no-install-recommends libgcc-s1 "$@"; \
+    apt-get install -y --no-install-recommends ca-certificates libgcc-s1 "$@"; \
     apt-get clean; \
     rm -rf /var/lib/apt/lists/*; \
     mkdir -p /run/racer /var/lib/racer/identity /var/lib/racer/slabs; \

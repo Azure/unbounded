@@ -3,6 +3,15 @@ use super::*;
 const IMAGE: &str = "example.com/racer-object:v1";
 const CACHE: &str = "test-cache";
 
+/// Every cache exists with no node selector.
+fn admit(review: &[u8], image: &str) -> Result<Vec<u8>, Error> {
+    let lookups = Lookups {
+        cache: &|_| CacheLookup::Found(None),
+        node: &|n| panic!("unexpected Node lookup {n}"),
+    };
+    super::admit(review, image, &lookups)
+}
+
 /// Opted-in pod naming CACHE. A `null` annotation value removes the key.
 fn pod(anno: Value) -> Value {
     let mut a = json!({CACHE_ANNOTATION: CACHE});
@@ -1072,4 +1081,440 @@ fn client_socket_bad_container_fields_are_400() {
         let resp = run(&p).expect_err("expected rejection");
         assert_eq!(resp["status"]["code"], 400, "{field}: {resp}");
     }
+}
+
+const REQUIRED: &str = "requiredDuringSchedulingIgnoredDuringExecution";
+
+/// Runs the review with `lookup` and returns the response.
+/// Any Node lookup fails the test.
+fn run_with(pod: &Value, lookup: &dyn Fn(&str) -> CacheLookup) -> Value {
+    run_nodes(pod, lookup, &|n| panic!("unexpected Node lookup {n}"))
+}
+
+/// Runs the review with cache and Node lookups and returns the response.
+fn run_nodes(
+    pod: &Value,
+    cache: &dyn Fn(&str) -> CacheLookup,
+    node: &dyn Fn(&str) -> NodeLookup,
+) -> Value {
+    let lookups = Lookups { cache, node };
+    response(&super::admit(&review("CREATE", pod), IMAGE, &lookups).unwrap())
+}
+
+/// Runs the review where CACHE has `sel` and returns the patched pod.
+fn run_selector(pod: &Value, sel: Value) -> Value {
+    let resp = run_with(pod, &|c| {
+        assert_eq!(c, CACHE);
+        CacheLookup::Found(Some(sel.clone()))
+    });
+    assert_eq!(resp["allowed"], true, "{resp}");
+    let raw = base64::engine::general_purpose::STANDARD
+        .decode(resp["patch"].as_str().unwrap())
+        .unwrap();
+    apply(pod, &serde_json::from_slice::<Vec<Value>>(&raw).unwrap())
+}
+
+fn terms(p: &Value) -> Value {
+    p["spec"]["affinity"]["nodeAffinity"][REQUIRED]["nodeSelectorTerms"].clone()
+}
+
+#[test]
+fn unknown_cache_is_denied() {
+    for p in [pod(json!({})), client_pod(json!({}))] {
+        let resp = run_with(&p, &|_| CacheLookup::NotFound);
+        assert_eq!(resp["allowed"], false);
+        assert_eq!(resp["status"]["code"], 403);
+        let msg = resp["status"]["message"].as_str().unwrap();
+        assert!(
+            msg.contains("does not exist") && msg.contains(CACHE),
+            "{msg}"
+        );
+        assert!(resp.get("patch").is_none());
+    }
+}
+
+#[test]
+fn lookup_failure_is_retryable_denial() {
+    for p in [pod(json!({})), client_pod(json!({}))] {
+        let resp = run_with(&p, &|_| CacheLookup::Unavailable);
+        assert_eq!(resp["allowed"], false);
+        assert_eq!(resp["status"]["code"], 503);
+        assert_eq!(resp["status"]["reason"], "ServiceUnavailable");
+        assert!(
+            resp["status"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("retry")
+        );
+        assert!(resp.get("patch").is_none());
+    }
+}
+
+#[test]
+fn lookup_is_skipped_when_not_needed() {
+    // Not opted in, or already injected: no lookup, so an outage cannot block.
+    let mut plain = pod(json!({}));
+    plain["metadata"]["labels"] = json!({});
+    let mut done = client_pod(json!({CLIENT_SOCKET_INJECTED_ANNOTATION: CACHE}));
+    done["metadata"]["annotations"][CLIENT_SOCKET_INJECTED_ANNOTATION] = json!(CACHE);
+    for p in [plain, done] {
+        let resp = run_with(&p, &|_| panic!("unexpected lookup"));
+        assert_eq!(resp["allowed"], true);
+    }
+}
+
+#[test]
+fn no_selector_keeps_affinity() {
+    for sel in [
+        json!(null),
+        json!({}),
+        json!({"matchLabels": {}, "matchExpressions": []}),
+    ] {
+        let p = client_pod(json!({}));
+        let out = run_selector(&p, sel);
+        assert_eq!(terms(&out), json!([{"matchExpressions": [excl()]}]));
+    }
+}
+
+#[test]
+fn selector_match_labels_and_expressions() {
+    let sel = json!({
+        "matchLabels": {"pool": "gpu", "a.example/zone": "z1"},
+        "matchExpressions": [
+            {"key": "tier", "operator": "NotIn", "values": ["spot", "low"]},
+            {"key": "rdma", "operator": "Exists"},
+            {"key": "drain", "operator": "DoesNotExist", "values": []},
+            {"key": "rack", "operator": "In", "values": ["r1"]},
+        ],
+    });
+    let want = json!([{"matchExpressions": [
+        excl(),
+        {"key": "a.example/zone", "operator": "In", "values": ["z1"]},
+        {"key": "pool", "operator": "In", "values": ["gpu"]},
+        {"key": "tier", "operator": "NotIn", "values": ["spot", "low"]},
+        {"key": "rdma", "operator": "Exists"},
+        {"key": "drain", "operator": "DoesNotExist"},
+        {"key": "rack", "operator": "In", "values": ["r1"]},
+    ]}]);
+    // Client socket and object sidecar paths both apply the selector.
+    for p in [client_pod(json!({})), pod(json!({}))] {
+        let out = run_selector(&p, sel.clone());
+        assert_eq!(terms(&out), want);
+        assert_eq!(out["spec"]["nodeSelector"][OS_LABEL], "linux");
+    }
+}
+
+#[test]
+fn selector_is_anded_into_every_term() {
+    let gpu = json!({"key": "pool", "operator": "In", "values": ["gpu"]});
+    let user = |k: &str| json!({"key": k, "operator": "In", "values": ["a"]});
+    let field = json!({"key": "metadata.name", "operator": "In", "values": ["n1"]});
+    let mut p = client_pod(json!({}));
+    p["spec"]["affinity"] = json!({"nodeAffinity": {REQUIRED: {"nodeSelectorTerms": [
+        {"matchExpressions": [user("zone")]},
+        {"matchFields": [field]},
+        {},
+        {"matchExpressions": [user("rack"), gpu.clone()]},
+    ]}}});
+    let out = run_selector(&p, json!({"matchLabels": {"pool": "gpu"}}));
+    assert_eq!(
+        terms(&out),
+        json!([
+            {"matchExpressions": [user("zone"), excl(), gpu.clone()]},
+            {"matchFields": [field], "matchExpressions": [excl(), gpu.clone()]},
+            {},
+            {"matchExpressions": [user("rack"), gpu.clone(), excl()]},
+        ])
+    );
+}
+
+#[test]
+fn selector_is_idempotent_and_shared_by_both_opt_ins() {
+    let sel = json!({"matchLabels": {"pool": "gpu"}});
+    let mut p = pod(json!({}));
+    p["metadata"]["labels"][CLIENT_SOCKET_LABEL] = json!(ENABLED_VALUE);
+    p["metadata"]["annotations"][CLIENT_CACHE_ANNOTATION] = json!(CACHE);
+    let out = run_selector(&p, sel.clone());
+    let gpu = json!({"key": "pool", "operator": "In", "values": ["gpu"]});
+    assert_eq!(terms(&out), json!([{"matchExpressions": [excl(), gpu]}]));
+    // A second pass changes nothing.
+    let resp = run_with(&out, &|_| CacheLookup::Found(Some(sel.clone())));
+    assert_eq!(resp["allowed"], true);
+    assert!(resp.get("patch").is_none(), "{resp}");
+}
+
+#[test]
+fn different_caches_are_looked_up_separately() {
+    let mut p = pod(json!({CLIENT_CACHE_ANNOTATION: "other"}));
+    p["metadata"]["labels"][CLIENT_SOCKET_LABEL] = json!(ENABLED_VALUE);
+    let r = Review::parse(&review("CREATE", &p)).unwrap();
+    assert_eq!(r.caches(), vec![CACHE.to_owned(), "other".to_owned()]);
+    let resp = run_with(&p, &|c| match c {
+        CACHE => CacheLookup::Found(Some(json!({"matchLabels": {"a": "1"}}))),
+        _ => CacheLookup::Found(Some(json!({"matchLabels": {"b": "2"}}))),
+    });
+    let raw = base64::engine::general_purpose::STANDARD
+        .decode(resp["patch"].as_str().unwrap())
+        .unwrap();
+    let out = apply(&p, &serde_json::from_slice::<Vec<Value>>(&raw).unwrap());
+    assert_eq!(
+        terms(&out),
+        json!([{"matchExpressions": [
+            excl(),
+            {"key": "a", "operator": "In", "values": ["1"]},
+            {"key": "b", "operator": "In", "values": ["2"]},
+        ]}])
+    );
+    let resp = run_with(&p, &|c| {
+        if c == CACHE {
+            CacheLookup::Found(None)
+        } else {
+            CacheLookup::NotFound
+        }
+    });
+    assert_eq!(resp["status"]["code"], 403);
+}
+
+#[test]
+fn review_caches() {
+    let mut off = client_pod(json!({}));
+    off["metadata"]["labels"] = json!({});
+    let bad = client_pod(json!({CLIENT_CACHE_ANNOTATION: "Bad Name"}));
+    for (p, want) in [
+        (client_pod(json!({})), vec![CACHE.to_owned()]),
+        (pod(json!({})), vec![CACHE.to_owned()]),
+        (off, vec![]),
+        (bad, vec![]),
+    ] {
+        assert_eq!(Review::parse(&review("CREATE", &p)).unwrap().caches(), want);
+    }
+}
+
+#[test]
+fn invalid_selector_is_denied() {
+    for (sel, want) in [
+        (json!("x"), "must be an object"),
+        (json!({"matchLabels": []}), "matchLabels must be an object"),
+        (json!({"matchLabels": {"a": 1}}), "must be a string"),
+        (json!({"matchLabels": {"bad key!": "v"}}), "label key"),
+        (json!({"matchLabels": {"k": "-v"}}), "label value"),
+        (
+            json!({"matchLabels": {"Bad.Prefix/k": "v"}}),
+            "invalid prefix",
+        ),
+        (json!({"matchExpressions": {}}), "must be an array"),
+        (
+            json!({"matchExpressions": [{"key": "k", "operator": "In"}]}),
+            "at least one value",
+        ),
+        (
+            json!({"matchExpressions": [{"key": "k", "operator": "NotIn", "values": []}]}),
+            "at least one value",
+        ),
+        (
+            json!({"matchExpressions": [{"key": "k", "operator": "Exists", "values": ["a"]}]}),
+            "must not have values",
+        ),
+        (
+            json!({"matchExpressions": [{"key": "k", "operator": "DoesNotExist", "values": ["a"]}]}),
+            "must not have values",
+        ),
+        (
+            json!({"matchExpressions": [{"key": "k", "operator": "Gt", "values": ["1"]}]}),
+            "is not one of",
+        ),
+        (
+            json!({"matchExpressions": [{"operator": "Exists"}]}),
+            "key must be a string",
+        ),
+        (
+            json!({"matchExpressions": [{"key": "", "operator": "Exists"}]}),
+            "label key",
+        ),
+        (
+            json!({"matchExpressions": [{"key": "k", "operator": "In", "values": [1]}]}),
+            "values must be strings",
+        ),
+        (json!({"matchExpressions": ["x"]}), "matchExpressions[0]"),
+    ] {
+        for p in [client_pod(json!({})), pod(json!({}))] {
+            let resp = run_with(&p, &|_| CacheLookup::Found(Some(sel.clone())));
+            assert_eq!(resp["allowed"], false, "{sel}");
+            assert_eq!(resp["status"]["code"], 403);
+            let msg = resp["status"]["message"].as_str().unwrap();
+            assert!(
+                msg.contains("invalid spec.nodeSelector") && msg.contains(want),
+                "{sel}: {msg}"
+            );
+        }
+    }
+}
+
+/// Both opt-ins naming different caches.
+fn both_pod() -> Value {
+    let mut p = pod(json!({CLIENT_CACHE_ANNOTATION: "other"}));
+    p["metadata"]["labels"][CLIENT_SOCKET_LABEL] = json!(ENABLED_VALUE);
+    p
+}
+
+#[test]
+fn review_caches_skips_injected_sidecar() {
+    for list in ["initContainers", "containers"] {
+        let mut p = both_pod();
+        if p["spec"][list].is_null() {
+            p["spec"][list] = json!([]);
+        }
+        p["spec"][list]
+            .as_array_mut()
+            .unwrap()
+            .push(json!({"name": CONTAINER_NAME, "image": "x"}));
+        let r = Review::parse(&review("CREATE", &p)).unwrap();
+        assert_eq!(r.caches(), vec!["other".to_owned()], "{list}");
+        // A cache missing from the lookup result is still unavailable, not
+        // silently allowed.
+        let resp = run_with(&p, &|c| match c {
+            "other" => CacheLookup::Found(None),
+            _ => CacheLookup::Unavailable,
+        });
+        assert_eq!(resp["allowed"], json!(true), "{list}");
+        let resp = run_with(&p, &|_| CacheLookup::Unavailable);
+        assert_eq!(resp["allowed"], json!(false), "{list}");
+    }
+}
+
+#[test]
+fn review_caches_skips_injected_client_socket() {
+    let mut p = both_pod();
+    p["metadata"]["annotations"][CLIENT_SOCKET_INJECTED_ANNOTATION] = json!("true");
+    let r = Review::parse(&review("CREATE", &p)).unwrap();
+    assert_eq!(r.caches(), vec![CACHE.to_owned()]);
+}
+
+#[test]
+fn review_caches_empty_when_nothing_mutates() {
+    let mut p = both_pod();
+    p["metadata"]["annotations"][CLIENT_SOCKET_INJECTED_ANNOTATION] = json!("true");
+    p["spec"]["containers"]
+        .as_array_mut()
+        .unwrap()
+        .push(json!({"name": CONTAINER_NAME, "image": "x"}));
+    let r = Review::parse(&review("CREATE", &p)).unwrap();
+    assert!(r.caches().is_empty());
+    let resp = run_with(&p, &|_| panic!("no lookup expected"));
+    assert_eq!(resp["allowed"], json!(true));
+    assert!(resp.get("patch").is_none());
+    // A malformed pod needs no lookup; the mutation rejects it.
+    let mut bad = both_pod();
+    bad["spec"]["hostNetwork"] = json!("yes");
+    assert!(
+        Review::parse(&review("CREATE", &bad))
+            .unwrap()
+            .caches()
+            .is_empty()
+    );
+}
+
+fn bound(mut p: Value, node: &str) -> Value {
+    p["spec"]["nodeName"] = json!(node);
+    p
+}
+
+fn gpu_cache(_: &str) -> CacheLookup {
+    CacheLookup::Found(Some(json!({"matchLabels": {"pool": "gpu"}})))
+}
+
+#[test]
+fn bound_pod_on_matching_node_is_admitted() {
+    for p in [
+        bound(pod(json!({})), "n1"),
+        bound(client_pod(json!({})), "n1"),
+    ] {
+        let resp = run_nodes(&p, &gpu_cache, &|n| {
+            assert_eq!(n, "n1");
+            NodeLookup::Found(BTreeMap::from([("pool".into(), "gpu".into())]))
+        });
+        assert_eq!(resp["allowed"], true, "{resp}");
+        assert!(resp.get("patch").is_some());
+    }
+}
+
+#[test]
+fn bound_pod_on_other_node_is_denied() {
+    for p in [
+        bound(pod(json!({})), "n1"),
+        bound(client_pod(json!({})), "n1"),
+    ] {
+        let resp = run_nodes(&p, &gpu_cache, &|_| {
+            NodeLookup::Found(BTreeMap::from([("pool".into(), "cpu".into())]))
+        });
+        assert_eq!(resp["allowed"], false);
+        assert_eq!(resp["status"]["code"], 403);
+        let msg = resp["status"]["message"].as_str().unwrap();
+        assert!(
+            msg.contains("does not match") && msg.contains("n1"),
+            "{msg}"
+        );
+        assert!(resp.get("patch").is_none());
+    }
+}
+
+#[test]
+fn bound_pod_on_missing_node_is_denied() {
+    for p in [
+        bound(pod(json!({})), "n1"),
+        bound(client_pod(json!({})), "n1"),
+    ] {
+        let resp = run_nodes(&p, &gpu_cache, &|_| NodeLookup::NotFound);
+        assert_eq!(resp["allowed"], false);
+        assert_eq!(resp["status"]["code"], 403);
+        let msg = resp["status"]["message"].as_str().unwrap();
+        assert!(msg.contains("does not exist"), "{msg}");
+    }
+}
+
+#[test]
+fn node_lookup_failure_is_retryable_denial() {
+    for p in [
+        bound(pod(json!({})), "n1"),
+        bound(client_pod(json!({})), "n1"),
+    ] {
+        let resp = run_nodes(&p, &gpu_cache, &|_| NodeLookup::Unavailable);
+        assert_eq!(resp["allowed"], false);
+        assert_eq!(resp["status"]["code"], 503);
+        assert_eq!(resp["status"]["reason"], "ServiceUnavailable");
+    }
+}
+
+#[test]
+fn node_lookup_is_skipped_when_not_needed() {
+    // No selector, or an empty one: a bound pod needs no Node check.
+    for sel in [None, Some(json!({}))] {
+        for p in [
+            bound(pod(json!({})), "n1"),
+            bound(client_pod(json!({})), "n1"),
+        ] {
+            let resp = run_with(&p, &|_| CacheLookup::Found(sel.clone()));
+            assert_eq!(resp["allowed"], true, "{resp}");
+        }
+    }
+    // Unbound pods rely on node affinity; an empty nodeName is unbound.
+    for p in [
+        pod(json!({})),
+        client_pod(json!({})),
+        bound(client_pod(json!({})), ""),
+    ] {
+        let resp = run_with(&p, &gpu_cache);
+        assert_eq!(resp["allowed"], true, "{resp}");
+    }
+}
+
+#[test]
+fn review_reports_node_name() {
+    let r = |p: &Value| Review::parse(&review("CREATE", p)).unwrap().node_name();
+    assert_eq!(
+        r(&bound(client_pod(json!({})), "n1")).as_deref(),
+        Some("n1")
+    );
+    assert_eq!(r(&bound(client_pod(json!({})), "")), None);
+    assert_eq!(r(&client_pod(json!({}))), None);
 }

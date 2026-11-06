@@ -1,70 +1,139 @@
 # racer-object
 
-Read S3 objects and Azure block blobs through Racer. The origin holds upstream
-credentials; the sidecar serves trusted pod-local clients without authentication.
+Serve cached objects to pods through Racer with an S3 or Azure Blob client API.
+The Racer dataplane reads the cache's Azure Blob container directly, using the
+ClusterCache `spec.origin`. The sidecar holds no upstream credentials and
+serves trusted pod-local clients without authentication.
 See the [Azure Blob guide](../../docs/content/guides/azure-blob-cache.md) for setup, and the
 [reference](../../docs/content/reference/racer-object.md) for flags, deployment
 requirements, request limits, and the security model.
 
+This directory is a standalone Rust crate (its own Cargo workspace). The
+object identity (canonical JSON and its SHA-256 Racer key) matches the
+in-tree library [`internal/racerobject`](../../internal/racerobject) byte for
+byte, so both compute the same keys.
+
 ## Example
 
-Use the same `--cache` on the origin and sidecar. Each cache serves exactly one
-bucket or container: an S3 origin takes `--bucket`, an Azure origin takes
-`--container-url`, and the origin forbids requests for any other bucket or
-container. The sidecar forwards `/<bucket>/<key>` requests unchanged.
-This pairs an Azure Blob origin with the Azure Blob client API:
+Set `--cache` to a ClusterCache with `spec.origin.azure`. The sidecar forwards
+`/<bucket>/<key>` requests unchanged; Racer forbids any bucket other than the
+cache's container. This serves the Azure Blob client API:
 
 ```sh
-racer-object origin --cache=racer-object \
-  --provider=azure \
-  --container-url=https://ACCOUNT.blob.core.windows.net/example-container \
-  --azure-credential=default
 racer-object sidecar --cache=racer-object \
   --api=azure --listen=127.0.0.1:8080
 ```
 
-Run these as separate processes with their Racer sockets mounted. The origin
-provider (`--provider`) and sidecar API (`--api`) are independent; both default
-to `s3`. **Use a new cache when changing bucket, account, provider, or endpoint**;
-the cache key includes only the bucket, key, and version, so reusing a cache
-can serve stale data. Pass `--cache-uid=<ClusterCache UID>` to the origin so
-that, if a ClusterCache is recreated under the same name, a leftover origin for
-the old UID refuses requests for the new one instead of filling it. Manifests for both are in
-[`deploy/racer-object`](../../deploy/racer-object).
+Use `--api=s3` (the default) for S3 clients. Mount the cache's Racer client
+socket directory into the sidecar container. The sidecar connects to
+`/run/racer/<cache>/client/socket`.
+
+Flags: `--cache` (required), `--api`,
+`--listen` (loopback IP and port), `--request-timeout`, `--max-connections`,
+`--workers` (see [Workers](#workers)), `--debug-listen`, and `--version`. `--flag=value`, `--flag value`, and a
+single dash all work. Invalid arguments print `racer-object: <message>` and
+exit with status 1.
+
+## Build and test
+
+```sh
+cargo build --release --locked --manifest-path cmd/racer-object/Cargo.toml
+cargo test --locked --manifest-path cmd/racer-object/Cargo.toml
+cargo clippy --locked --manifest-path cmd/racer-object/Cargo.toml --all-targets -- -D warnings
+```
+
+Set `RACER_OBJECT_VERSION`, `RACER_OBJECT_GIT_COMMIT`, and
+`RACER_OBJECT_BUILD_TIME` at build time to fill in `--version`.
+
+Unit tests in each module cover the request rules, the Racer client socket
+protocol (request bytes, response heads, and page frames), and response
+building. Integration tests in `tests/` run the server over TCP with no Racer
+listening, so they cover rejected requests, connection handling, workers, and
+shutdown. Reads through a real Racer are covered by the kind-based suite in
+[`e2e/racer`](../../e2e/racer).
+
+## Design
+
+- `src/object.rs`: request rules. Paths, queries, headers, conditions, ranges,
+  error codes, and the object identity (canonical JSON, byte for byte the same
+  as `internal/racerobject`, and its SHA-256 key).
+- `src/racer.rs`: Racer client socket protocol. Metadata `HEAD` requests reuse
+  at most four idle connections in total, shared by all workers. Reads are credit-paced
+  subscriptions on their own connection, with frame checks.
+- `src/server.rs`: a small HTTP/1.1 server with keep-alive and pipelining, and
+  the request flow.
+- `src/splice.rs`: the zero-copy body path.
+- `src/debug.rs`: the optional `--debug-listen` listener.
+
+Request flow:
+
+- An unconditional `GET` sends one subscription to Racer with the client's
+  range. It does not send a `HEAD` first. The sidecar checks that Racer chose
+  the same bytes it would have chosen.
+- `HEAD` and conditional `GET` requests (`If-Match`, `If-None-Match`) ask Racer
+  for metadata first. A `GET` then reads that exact version (`If-Match` on the
+  Racer request).
+- Bodies up to 64 KiB are read into memory and sent with the response head in
+  one `writev`. If Racer fails before the end, the client still gets an error
+  status.
+- Larger bodies move from the Racer socket to the client socket with
+  `splice(2)` through a pipe (1 MiB when the kernel allows it). The data never
+  enters user space. The last byte is held back until Racer confirms the read
+  completed, so a cut-off read can never look complete. If the first Racer
+  frame is broken, the client gets `502`. If Racer fails after the head was
+  sent, the sidecar closes the connection early.
+- Requests with a body get a response, then the connection closes.
+- Request heads over 36 KiB get `431` and malformed requests get `400`, both
+  as the S3 or Azure XML error, then the connection closes.
+- When an S3 query has both a malformed parameter (`400`) and an unsupported
+  one (`501`), the sidecar returns `400`.
+
+### Why tokio and splice, not io_uring
+
+- Pods normally run with the `RuntimeDefault` seccomp profile. The containerd
+  and Docker default profiles block `io_uring_setup`, so io_uring is not
+  available.
+- io_uring does not run `IORING_OP_SPLICE` inline. The kernel hands it to an
+  io-wq worker thread, so it saves no CPU compared to calling `splice(2)` from
+  an epoll loop.
+
+### Workers
+
+`--workers=N` (1 to 256; default: usable CPUs, at most 4) starts N OS
+threads, each running its own single-threaded tokio runtime (epoll) with its
+own Racer idle connection pool; the process keeps at most four idle
+connections in total, shared by all workers. There is no work stealing:
+
+- The first worker accepts every connection and hands it to the worker
+  serving the fewest connections (one cross-thread wakeup per connection,
+  not per request). A shared listener or `SO_REUSEPORT` would let a few
+  long-lived connections land on one worker, and `SO_REUSEPORT` would also
+  split `--max-connections` per worker.
+- `--max-connections` stays global: one semaphore bounds accepted client
+  connections and another two bound concurrent Racer reads, all shared.
+- SIGTERM or SIGINT stops every worker; each lets in-flight requests finish
+  for up to 5 seconds. The debug listener runs on the first worker.
+- With one worker the binary runs a plain current_thread runtime.
+
+Separate single-threaded runtimes keep the one-thread cost per request and
+per byte; a shared work-stealing runtime adds cross-thread wakeups and costs
+more CPU per request. The cap of 4 bounds idle threads in pods without CPU
+limits; set `--workers=1` for the smallest footprint.
 
 ## Diagnostics
 
-Both `origin` and `sidecar` accept `--debug-listen`. Its default is empty,
-which disables the diagnostic listener. For local access, explicitly use
-`--debug-listen=127.0.0.1:6060`.
+`--debug-listen` is empty by default, which disables the diagnostics
+listener. When set (for example `--debug-listen=127.0.0.1:6060`), it serves
+only `GET /healthz`, which returns 200. Health only means the listener is up,
+not that the cache is ready. A bind failure stops startup.
 
-The separate HTTP listener uses an explicit mux exposing `/debug/pprof/`
-(including CPU `profile`, heap, goroutine, cmdline, symbol, and trace) and
-`/healthz`. Health only indicates that diagnostics is serving, not that the
-origin, cache, or sidecar is ready. Diagnostic routes are not added to the
-sidecar object listener. A bind failure prevents startup; the diagnostic
-listener closes when the main server exits, including startup errors and
-context cancellation. Active profiles can be interrupted on exit.
-
-These endpoints have **no authentication or TLS**. Profiles and command lines
-can reveal sensitive process information, and profiling consumes resources.
-Allow only trusted diagnostic access. `--debug-listen=:6060` is supported for
-pod-IP access through a Kubernetes API pod proxy, but binds all interfaces:
-the proxy's authentication does not protect direct access to the pod port.
-Restrict direct access with network policy or equivalent controls, avoid public
-Services, and disable the listener after profiling. Use distinct ports if
-origin and sidecar share a pod network namespace.
-
-Capture a CPU profile during a representative steady workload through your
-trusted diagnostic connection, for example from a local listener:
+Profile the sidecar with `perf`; release builds keep line tables, and the
+container image builds with frame pointers:
 
 ```sh
-timeout --signal=TERM --kill-after=10s 45s curl --fail --max-time 40 \
-  -o racer-object-cpu.pprof 'http://127.0.0.1:6060/debug/pprof/profile?seconds=30'
-timeout --signal=TERM --kill-after=10s 60s go tool pprof -top racer-object-cpu.pprof
+timeout --signal=INT 40s perf record -F 999 -g -p "$(pidof racer-object)" -- sleep 30
+timeout --signal=TERM 60s perf report --stdio
 ```
 
-Capture each process separately and retain the workload concurrency, object
-size, verification setting, throughput, CPU usage, and binary revision with
-the profile. Profiling enables measurement; it does not change object handling
-or imply a particular CPU bottleneck.
+The listener has **no authentication or TLS**. `--debug-listen=:6060` binds
+all interfaces. Allow only trusted access.

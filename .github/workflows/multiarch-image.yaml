@@ -1,0 +1,436 @@
+# Copyright (c) Microsoft Corporation.
+# SPDX-License-Identifier: Apache-2.0
+
+name: multi-arch image
+
+# ---------------------------------------------------------------------------
+# Reusable workflow: build and push a multi-platform container image without
+# QEMU emulation.
+#
+# Each requested platform builds on a native GitHub-hosted runner
+# (linux/amd64 on ubuntu-latest, linux/arm64 on ubuntu-24.04-arm) and is
+# pushed by digest only, with no tag. The merge job then stitches the
+# per-platform digests into one image index, tags it, and optionally signs it
+# and attests an SBOM to it. Nothing is tagged until every platform has built,
+# so a failed arch never leaves a tag pointing at a partial image.
+#
+# Permissions are inherited from the caller; this file deliberately declares
+# none, because a called workflow cannot request more than its caller holds.
+# Callers must grant:
+#   packages: write   always (push to ghcr.io).
+#   id-token: write   when sign is true (keyless cosign via Sigstore OIDC).
+#   contents: write   when release-tag is set (SBOM attached to the release).
+#
+# The image is pushed to ghcr.io/<lowercased repository owner>/<name>. That
+# lowercased registry is also passed to the build as CONTAINER_REGISTRY, since
+# callers cannot lowercase it in an expression.
+#
+# Re-running must work (see release.yaml): pushes are content-addressed, tags
+# and release assets are replaced, and the digest artifacts overwrite.
+# ---------------------------------------------------------------------------
+
+on:
+  workflow_call:
+    inputs:
+      name:
+        description: Image repository name under ghcr.io/<owner>, e.g. "orca".
+        required: true
+        type: string
+      file:
+        description: Path to the Containerfile.
+        required: true
+        type: string
+      tags:
+        description: Tags to apply to the image index, separated by commas or newlines.
+        required: true
+        type: string
+      platforms:
+        description: Platforms to build, separated by commas. Only linux/amd64 and linux/arm64 have native runners.
+        required: false
+        type: string
+        default: linux/amd64,linux/arm64
+      build-args:
+        description: Newline-separated KEY=VALUE build arguments.
+        required: false
+        type: string
+        default: ""
+      cache-scope:
+        description: GitHub Actions cache scope prefix; the arch is appended. Defaults to the image name with characters outside [A-Za-z0-9._-] replaced by -.
+        required: false
+        type: string
+        default: ""
+      trivy:
+        description: Build each platform locally and gate the push on a CRITICAL/HIGH Trivy scan.
+        required: false
+        type: boolean
+        default: false
+      trivyignores:
+        description: Comma-separated Trivy ignore files, passed to the Trivy scan.
+        required: false
+        type: string
+        default: ""
+      free-disk-space:
+        description: Remove preinstalled toolchains before building and before SBOM generation, for images larger than a hosted runner's free disk.
+        required: false
+        type: boolean
+        default: false
+      sign:
+        description: Sign the image index with cosign and attest an SPDX SBOM to it.
+        required: false
+        type: boolean
+        default: false
+      large-sbom:
+        description: >-
+          With sign, use cosign sign-blob instead of attesting the SBOM.
+          Also attach the bundle to the release. Rekor cannot take very large
+          attestations (racer-vllm's SBOM is ~18 MB); sign-blob logs only the
+          digest.
+        required: false
+        type: boolean
+        default: false
+      include-unowned-executables:
+        description: >-
+          Include unowned executable files (those Syft cannot attribute to a
+          package) in the SBOM.
+        required: false
+        type: boolean
+        default: true
+      release-tag:
+        description: When set with sign, also attach the SBOM to this GitHub release (replacing any existing asset).
+        required: false
+        type: string
+        default: ""
+    outputs:
+      digest:
+        description: Digest of the pushed image index.
+        value: ${{ jobs.merge.outputs.digest }}
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # Map each platform to its native runner and resolve the registry.
+  # ---------------------------------------------------------------------------
+  plan:
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.plan.outputs.matrix }}
+      registry: ${{ steps.plan.outputs.registry }}
+      cache-scope: ${{ steps.plan.outputs.cache-scope }}
+      key: ${{ steps.plan.outputs.key }}
+    steps:
+      - name: Plan native builds
+        id: plan
+        env:
+          NAME: ${{ inputs.name }}
+          PLATFORMS: ${{ inputs.platforms }}
+          CACHE_SCOPE: ${{ inputs.cache-scope }}
+          REGISTRY: ghcr.io/${{ github.repository_owner }}
+        run: |
+          set -euo pipefail
+
+          include='[]'
+          for platform in ${PLATFORMS//,/ }; do
+            case "$platform" in
+              linux/amd64) runner=ubuntu-latest ;;
+              linux/arm64) runner=ubuntu-24.04-arm ;;
+              *)
+                echo "::error::No native runner for platform ${platform}; supported: linux/amd64, linux/arm64"
+                exit 1
+                ;;
+            esac
+
+            include="$(jq -c \
+              --arg platform "$platform" \
+              --arg arch "${platform#linux/}" \
+              --arg runner "$runner" \
+              '. + [{platform: $platform, arch: $arch, runner: $runner}] | unique_by(.platform)' \
+              <<<"$include")"
+          done
+
+          if [[ "$include" == '[]' ]]; then
+            echo "::error::No platforms requested"
+            exit 1
+          fi
+
+          # Artifact names cannot contain "/", but nested image names such as
+          # inventory/viewer do. Derive an artifact-safe key: the name with
+          # anything outside [A-Za-z0-9._-] replaced by "-", plus a short hash
+          # of the raw name. The hash keeps distinct names distinct
+          # (inventory/viewer vs inventory-viewer) and stops the merge job's
+          # download pattern from matching another image's artifacts by
+          # prefix (racer vs racer-object).
+          safe="$(LC_ALL=C sed 's/[^A-Za-z0-9._-]/-/g' <<<"$NAME")"
+          hash="$(printf '%s' "$NAME" | sha256sum | cut -c1-8)"
+
+          # The default cache scope uses the sanitized name without the hash,
+          # so existing caches for plain names stay valid. A collision there
+          # only shares a cache, which is harmless.
+          {
+            echo "matrix={\"include\":${include}}"
+            echo "registry=${REGISTRY,,}"
+            echo "cache-scope=${CACHE_SCOPE:-$safe}"
+            echo "key=${safe}-${hash}"
+          } >> "$GITHUB_OUTPUT"
+          echo "Image: ${REGISTRY,,}/${NAME}"
+          jq . <<<"$include"
+
+  # ---------------------------------------------------------------------------
+  # Build (and optionally scan) each platform natively, then push it by digest.
+  # ---------------------------------------------------------------------------
+  build:
+    name: build (${{ matrix.arch }})
+    needs: plan
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: true
+      matrix: ${{ fromJSON(needs.plan.outputs.matrix) }}
+    steps:
+      - name: Free disk space for large images
+        if: inputs.free-disk-space
+        run: |
+          set -euo pipefail
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+          df -h /
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+
+      - name: Log in to ghcr.io
+        uses: docker/login-action@81c6f93d4bc991e510b342a00b419b3bb4efc5c6 # v4.7.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # Trivy scan on a single-platform load build before pushing.
+      - name: Build image for scanning
+        if: inputs.trivy
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: .
+          file: ${{ inputs.file }}
+          platforms: ${{ matrix.platform }}
+          push: false
+          load: true
+          build-args: |
+            ${{ inputs.build-args }}
+            CONTAINER_REGISTRY=${{ needs.plan.outputs.registry }}
+          tags: scan/${{ inputs.name }}:${{ matrix.arch }}
+          cache-from: type=gha,scope=${{ needs.plan.outputs.cache-scope }}-${{ matrix.arch }}
+
+      - name: Scan with Trivy
+        if: inputs.trivy
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          image-ref: scan/${{ inputs.name }}:${{ matrix.arch }}
+          format: table
+          severity: CRITICAL,HIGH
+          exit-code: "1"
+          trivyignores: ${{ inputs.trivyignores }}
+
+      - name: Build and push by digest
+        id: push
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: .
+          file: ${{ inputs.file }}
+          platforms: ${{ matrix.platform }}
+          outputs: type=image,name=${{ needs.plan.outputs.registry }}/${{ inputs.name }},push-by-digest=true,name-canonical=true,push=true,oci-mediatypes=true
+          build-args: |
+            ${{ inputs.build-args }}
+            CONTAINER_REGISTRY=${{ needs.plan.outputs.registry }}
+          cache-from: type=gha,scope=${{ needs.plan.outputs.cache-scope }}-${{ matrix.arch }}
+          cache-to: type=gha,scope=${{ needs.plan.outputs.cache-scope }}-${{ matrix.arch }},mode=max
+
+      - name: Export digest
+        env:
+          ARCH: ${{ matrix.arch }}
+          DIGEST: ${{ steps.push.outputs.digest }}
+        run: |
+          set -euo pipefail
+
+          if [[ ! "$DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+            echo "::error::Unexpected digest from build: '${DIGEST}'"
+            exit 1
+          fi
+
+          # The file is named for the arch and holds the digest, so the merge
+          # job finds it by arch however many artifacts it downloads.
+          mkdir -p "${RUNNER_TEMP}/digests"
+          echo "$DIGEST" > "${RUNNER_TEMP}/digests/${ARCH}"
+
+      - name: Upload digest
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: digests-${{ needs.plan.outputs.key }}-${{ matrix.arch }}
+          path: ${{ runner.temp }}/digests/${{ matrix.arch }}
+          if-no-files-found: error
+          # 7, not 1: match release.yaml's retry window so a
+          # "re-run failed jobs" can still merge digests from arch
+          # builds that succeeded and are not rerun.
+          retention-days: 7
+          # A full re-run of the calling workflow uploads the same name again.
+          overwrite: true
+
+  # ---------------------------------------------------------------------------
+  # Stitch the per-platform digests into one tagged index, then sign and
+  # attest it.
+  # ---------------------------------------------------------------------------
+  merge:
+    needs: [plan, build]
+    runs-on: ubuntu-latest
+    outputs:
+      digest: ${{ steps.create.outputs.digest }}
+    steps:
+      # The SBOM step pulls the image again on this fresh runner, so it needs
+      # the same headroom as the build job.
+      - name: Free disk space for large images
+        if: inputs.free-disk-space && inputs.sign
+        run: |
+          set -euo pipefail
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+          df -h /
+
+      # The key's hash suffix keeps this pattern from matching other images
+      # whose names share a prefix (racer vs racer-object). Each artifact holds
+      # one file named for its arch, so merging them into one directory is
+      # unambiguous and does not depend on how many artifacts matched (a single
+      # match is extracted without a per-artifact subdirectory).
+      - name: Download digests
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.0
+        with:
+          pattern: digests-${{ needs.plan.outputs.key }}-*
+          path: ${{ runner.temp }}/digests
+          merge-multiple: true
+
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+
+      - name: Log in to ghcr.io
+        uses: docker/login-action@81c6f93d4bc991e510b342a00b419b3bb4efc5c6 # v4.7.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Create and verify image index
+        id: create
+        env:
+          IMAGE: ${{ needs.plan.outputs.registry }}/${{ inputs.name }}
+          MATRIX: ${{ needs.plan.outputs.matrix }}
+          TAGS: ${{ inputs.tags }}
+        run: |
+          set -euo pipefail
+
+          sources=()
+          while IFS= read -r arch; do
+            file="${RUNNER_TEMP}/digests/${arch}"
+            if [[ ! -f "$file" ]]; then
+              echo "::error::No ${arch} digest was downloaded (expected ${file})"
+              exit 1
+            fi
+
+            arch_digest="$(<"$file")"
+            if [[ ! "$arch_digest" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+              echo "::error::Unexpected ${arch} digest in ${file}: '${arch_digest}'"
+              exit 1
+            fi
+
+            sources+=("${IMAGE}@${arch_digest}")
+          done < <(jq -r '.include[].arch' <<<"$MATRIX")
+
+          tag_args=()
+          for tag in ${TAGS//,/ }; do
+            tag_args+=(--tag "${IMAGE}:${tag}")
+          done
+          if [[ "${#tag_args[@]}" -eq 0 ]]; then
+            echo "::error::No tags given"
+            exit 1
+          fi
+
+          metadata="$(mktemp)"
+          docker buildx imagetools create "${tag_args[@]}" --metadata-file "$metadata" "${sources[@]}"
+
+          digest="$(jq -r '.["containerimage.descriptor"].digest // empty' "$metadata")"
+          rm -f "$metadata"
+          if [[ -z "$digest" ]]; then
+            echo "::error::Could not resolve the index digest for ${IMAGE}"
+            exit 1
+          fi
+
+          # The index must carry exactly the planned platforms. Attestation
+          # manifests are listed as unknown/unknown and are not counted.
+          docker buildx imagetools inspect --raw "${IMAGE}@${digest}" | jq -e \
+            --argjson want "$(jq -c '[.include[].platform] | sort' <<<"$MATRIX")" '
+              .mediaType == "application/vnd.oci.image.index.v1+json" and
+              ([.manifests[].platform
+                | select(.os != "unknown")
+                | "\(.os)/\(.architecture)"] | sort) == $want
+            '
+
+          docker buildx imagetools inspect "${IMAGE}@${digest}"
+          echo "digest=${digest}" >> "$GITHUB_OUTPUT"
+
+      - name: Install cosign
+        if: inputs.sign
+        uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+
+      # Keyless: the certificate identity is this reusable workflow's
+      # job_workflow_ref, multiarch-image.yaml@refs/tags/<tag> on release,
+      # not the caller. hack/release/verify-release-artifacts.sh trusts it.
+      - name: Sign container image
+        if: inputs.sign
+        env:
+          REF: ${{ needs.plan.outputs.registry }}/${{ inputs.name }}@${{ steps.create.outputs.digest }}
+        run: cosign sign --yes "$REF"
+
+      - name: Generate SBOM
+        if: inputs.sign
+        uses: anchore/sbom-action@66cbf4bc1f1c0d2edc94016e65bc221b6bb0ad6c # v0.24.3
+        env:
+          SYFT_UNKNOWNS_EXECUTABLES_WITHOUT_PACKAGES: >-
+            ${{ inputs.include-unowned-executables }}
+        with:
+          image: ${{ needs.plan.outputs.registry }}/${{ inputs.name }}@${{ steps.create.outputs.digest }}
+          registry-username: ${{ github.actor }}
+          registry-password: ${{ secrets.GITHUB_TOKEN }}
+          format: spdx-json
+          artifact-name: sbom-${{ inputs.name }}.spdx.json
+          output-file: sbom-${{ inputs.name }}.spdx.json
+          # Defaults to true, and its uploader is neither idempotent nor able
+          # to cope with a release that does not exist yet. A later step
+          # attaches this with --clobber instead; see the release.yaml header.
+          upload-release-assets: false
+
+      - name: Attest SBOM to image
+        if: inputs.sign && !inputs.large-sbom
+        env:
+          REF: ${{ needs.plan.outputs.registry }}/${{ inputs.name }}@${{ steps.create.outputs.digest }}
+          SBOM: sbom-${{ inputs.name }}.spdx.json
+        run: cosign attest --yes --predicate "$SBOM" --type spdxjson "$REF"
+
+      - name: Sign the SBOM
+        if: inputs.sign && inputs.large-sbom
+        env:
+          SBOM: sbom-${{ inputs.name }}.spdx.json
+        run: cosign sign-blob --yes --bundle "${SBOM}.bundle.json" "$SBOM"
+
+      # After the attestation or signature, not before: that is the
+      # authoritative copy, and it should never be blocked by the releases API
+      # having a bad minute.
+      - name: Attach SBOM to the release
+        if: inputs.sign && inputs.release-tag != ''
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ inputs.release-tag }}
+          SBOM: sbom-${{ inputs.name }}.spdx.json
+          LARGE_SBOM: ${{ inputs.large-sbom }}
+        run: |
+          set -euo pipefail
+
+          assets=("$SBOM")
+          if [[ "$LARGE_SBOM" == "true" ]]; then
+            assets+=("${SBOM}.bundle.json")
+          fi
+
+          gh release upload "$TAG" "${assets[@]}" --clobber

@@ -134,7 +134,7 @@ pub fn issue_at(
     let cert = csr.signed_by(ca, key).unwrap();
     racer_control_wire::EnrollmentResponse {
         block_devices: None,
-        schema_version: 1,
+        schema_version: racer_control_wire::SCHEMA_VERSION,
         cluster: request.cluster.clone(),
         node: racer_control_wire::NodeId(node.into()),
         enrollment: request.enrollment.clone(),

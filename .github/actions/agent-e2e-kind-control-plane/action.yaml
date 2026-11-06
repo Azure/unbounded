@@ -21,20 +21,25 @@ runs:
         sudo udevadm control --reload-rules
         sudo udevadm trigger --name-match=kvm
 
+    # setup-go's built-in cache shares one key across every workflow and
+    # saves from pull requests too. The harness builds the same binaries in
+    # every job, so restore one build cache scoped to this suite instead.
+    # Only GOCACHE is cached. Modules download quickly from the proxy, and
+    # leaving them out keeps the entry small. The agent-config-e2e job saves
+    # the e2e-agent profile on push.
     - name: Set up Go
-      uses: actions/setup-go@4a3601121dd01d1626a1e23e37211e3254c1c06c # v6.4.0
+      uses: ./.github/actions/setup-go-cached
       with:
-        go-version-file: go.mod
+        profile: e2e-agent
+        restore-mod-cache: "false"
 
+    # ovmf is the UEFI firmware an Ignition host boots through; qemu-utils
+    # also provides the qemu-nbd used to patch its boot command line.
     - name: Install system dependencies
-      shell: bash
-      run: |
-        sudo apt-get update
-        # ovmf is the UEFI firmware an Ignition host boots through; qemu-utils
-        # also provides the qemu-nbd used to patch its boot command line.
-        sudo apt-get install -y --no-install-recommends \
-          qemu-system-x86 qemu-utils genisoimage ovmf \
-          iptables
+      uses: ./.github/actions/apt-install-cached
+      with:
+        cache-name: agent-e2e-kind
+        packages: qemu-system-x86 qemu-utils genisoimage ovmf iptables
 
     - name: Create Kind cluster
       uses: helm/kind-action@ef37e7f390d99f746eb8b610417061a60e82a6cc # v1.14.0

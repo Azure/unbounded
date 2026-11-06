@@ -1403,12 +1403,14 @@ pub(super) mod tests {
         let mut next = pending.clone();
         next.sequence.0 = 12;
         next.caches.clear();
+        next.pools.clear();
         let delta = serde_json::json!({
-            "delta_version": 1, "cluster": pending.cluster.0,
+            "delta_version": wire::DELTA_VERSION, "cluster": pending.cluster.0,
             "base_sequence": "11", "base_hash": wire::content_hash(&pending).unwrap(),
             "sequence": "12", "membership_version": next.membership_version.0.to_string(),
             "content_hash": wire::content_hash(&next).unwrap(),
-            "upsert_members": [], "remove_members": [], "caches": []
+            "upsert_members": [], "remove_members": [], "caches": [],
+            "pools": []
         });
         let requests = Rc::new(RefCell::new(vec![]));
         let source = Script {

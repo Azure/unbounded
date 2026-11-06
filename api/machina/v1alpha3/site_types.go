@@ -24,7 +24,6 @@ func init() {
 // +kubebuilder:subresource:status
 // +kubebuilder:printcolumn:name="Node CIDRs",type=string,JSONPath=".spec.nodeCidrs"
 // +kubebuilder:printcolumn:name="Pod CIDR Assignments",type=string,JSONPath=".spec.podCidrAssignments"
-// +kubebuilder:printcolumn:name="Machina",type=boolean,JSONPath=".spec.components.machina.enabled",priority=1
 // +kubebuilder:printcolumn:name="Metalman",type=boolean,JSONPath=".spec.components.metalman.enabled",priority=1
 // +kubebuilder:printcolumn:name="Gantry",type=boolean,JSONPath=".spec.components.gantry.enabled",priority=1
 // +kubebuilder:printcolumn:name="Token Refresher",type=boolean,JSONPath=".spec.components.tokenRefresher.enabled",priority=1
@@ -118,7 +117,7 @@ func (s SiteSpec) PodCIDRAssignmentEnabled(assignment unboundednetv1alpha1.PodCi
 }
 
 // SiteComponents declares optional components managed by the unbounded operator.
-// Networking (unbounded-net) is not a component: it is a cluster singleton the
+// Networking (unbounded-net) and machina are required cluster singletons the
 // operator deploys whenever at least one Site exists.
 //
 // Each field corresponds to a component reconciler registered with the operator.
@@ -126,7 +125,8 @@ func (s SiteSpec) PodCIDRAssignmentEnabled(assignment unboundednetv1alpha1.PodCi
 // component.ClusterComponent or component.SiteComponent in a package under
 // internal/operator/components, then register it in operator.DefaultRegistry.
 type SiteComponents struct {
-	// Machina configures the machina controller for this site.
+	// Machina is a deprecated compatibility setting and is ignored.
+	// Machina is required and cannot be disabled.
 	// +optional
 	Machina *MachinaComponentSpec `json:"machina,omitempty"`
 
@@ -167,7 +167,8 @@ type SiteComponentSpec struct {
 	Enabled *bool `json:"enabled,omitempty"`
 }
 
-// MachinaComponentSpec configures the machina controller for a site.
+// MachinaComponentSpec is a deprecated compatibility setting and is ignored.
+// Machina is required and cannot be disabled.
 type MachinaComponentSpec struct {
 	SiteComponentSpec `json:",inline"`
 }

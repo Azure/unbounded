@@ -11,6 +11,7 @@ import (
 
 	"github.com/stretchr/testify/require"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -80,7 +81,6 @@ func TestEnvtestClusterCacheOriginValidation(t *testing.T) {
 		})},
 		"default":           {"origin": azureCredential(map[string]any{"default": map[string]any{}})},
 		"default client":    {"origin": azureCredential(map[string]any{"default": map[string]any{"clientID": testClientID}})},
-		"default secret":    {"origin": azureCredential(map[string]any{"default": map[string]any{"secretRef": map[string]any{"name": "azure"}}})},
 		"workload identity": {"origin": azureCredential(map[string]any{"workloadIdentity": map[string]any{"clientID": testClientID, "tenantID": testClientID}})},
 		"tuning": {"origin": withOrigin(func(o map[string]any) {
 			o["metadataTTL"] = "0s"
@@ -156,12 +156,12 @@ func TestEnvtestClusterCacheOriginValidation(t *testing.T) {
 		"http workload": {map[string]any{"origin": withOrigin(func(o map[string]any) {
 			o["azure"] = map[string]any{"containerURL": "http://account/models", "credential": map[string]any{"workloadIdentity": map[string]any{"clientID": testClientID}}}
 		})}, "containerURL must use https"},
-		"client and secret":     {map[string]any{"origin": azureCredential(map[string]any{"default": map[string]any{"clientID": testClientID, "secretRef": map[string]any{"name": "azure"}}})}, "clientID and secretRef are mutually exclusive"},
-		"malformed secret name": {map[string]any{"origin": azureCredential(map[string]any{"default": map[string]any{"secretRef": map[string]any{"name": "bad/name"}}})}, "name"},
-		"empty secret name":     {map[string]any{"origin": azureCredential(map[string]any{"default": map[string]any{"secretRef": map[string]any{"name": ""}}})}, "name"},
-		"bad default client":    {map[string]any{"origin": azureCredential(map[string]any{"default": map[string]any{"clientID": "not-a-uuid"}})}, "clientID"},
-		"workload no client":    {map[string]any{"origin": azureCredential(map[string]any{"workloadIdentity": map[string]any{}})}, "clientID"},
-		"workload bad tenant":   {map[string]any{"origin": azureCredential(map[string]any{"workloadIdentity": map[string]any{"clientID": testClientID, "tenantID": "tenant"}})}, "tenantID"},
+		"bad default client":      {map[string]any{"origin": azureCredential(map[string]any{"default": map[string]any{"clientID": "not-a-uuid"}})}, "clientID"},
+		"named secretRef":         {map[string]any{"origin": azureCredential(map[string]any{"default": map[string]any{"secretRef": map[string]any{"name": "azure"}}})}, "secretRef is no longer supported; use clientID or workloadIdentity"},
+		"empty secretRef":         {map[string]any{"origin": azureCredential(map[string]any{"default": map[string]any{"secretRef": map[string]any{}}})}, "secretRef is no longer supported; use clientID or workloadIdentity"},
+		"secretRef with clientID": {map[string]any{"origin": azureCredential(map[string]any{"default": map[string]any{"clientID": testClientID, "secretRef": map[string]any{"name": "azure"}}})}, "secretRef is no longer supported; use clientID or workloadIdentity"},
+		"workload no client":      {map[string]any{"origin": azureCredential(map[string]any{"workloadIdentity": map[string]any{}})}, "clientID"},
+		"workload bad tenant":     {map[string]any{"origin": azureCredential(map[string]any{"workloadIdentity": map[string]any{"clientID": testClientID, "tenantID": "tenant"}})}, "tenantID"},
 	}
 	for name, tc := range invalid {
 		t.Run("rejects "+name, func(t *testing.T) {
@@ -472,6 +472,22 @@ func TestEnvtestClusterCachePassthroughValidation(t *testing.T) {
 		cache := &ClusterCache{}
 		require.NoError(t, c.Get(t.Context(), client.ObjectKey{Name: name}, cache))
 		require.Nil(t, cache.Spec.Passthrough)
+		require.Nil(t, cache.Spec.NodeSelector)
+	})
+
+	t.Run("node selector round-trips", func(t *testing.T) {
+		name, err := create(map[string]any{"nodeSelector": map[string]any{
+			"matchLabels":      map[string]any{"pool": "gpu"},
+			"matchExpressions": []any{map[string]any{"key": "zone", "operator": "In", "values": []any{"a", "b"}}},
+		}})
+		require.NoError(t, err)
+
+		cache := &ClusterCache{}
+		require.NoError(t, c.Get(t.Context(), client.ObjectKey{Name: name}, cache))
+		require.Equal(t, &metav1.LabelSelector{
+			MatchLabels:      map[string]string{"pool": "gpu"},
+			MatchExpressions: []metav1.LabelSelectorRequirement{{Key: "zone", Operator: metav1.LabelSelectorOpIn, Values: []string{"a", "b"}}},
+		}, cache.Spec.NodeSelector)
 	})
 
 	update := func(t *testing.T, name string, passthrough any) error {

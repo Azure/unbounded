@@ -556,6 +556,8 @@ dependencies = [
  "futures",
  "httparse",
  "libc",
+ "rcgen",
+ "rustls",
  "uring-runtime",
  "zeroize",
 ]
@@ -824,6 +826,7 @@ dependencies = [
  "futures",
  "getrandom",
  "http1",
+ "httparse",
  "io-uring",
  "libc",
  "page-alloc",

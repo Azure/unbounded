@@ -467,7 +467,11 @@ impl Coordinator {
         cache: &racer_control_wire::CacheId,
     ) -> Result<std::sync::Arc<crate::topology::Membership>> {
         let snapshot = self.snapshots.current()?.ok_or(Error::Unavailable)?;
-        if !snapshot.caches.iter().any(|c| &c.id == cache) || !self.availability.metadata(cache) {
+        // Only the cache's pool members place, fill and track its pages.
+        if !snapshot.caches.iter().any(|c| &c.id == cache)
+            || !self.availability.metadata(cache)
+            || !snapshot.membership.serves(cache, &self.local_node())
+        {
             return Err(Error::Unavailable);
         }
         Ok(snapshot.membership.clone())
@@ -481,7 +485,7 @@ impl Coordinator {
         self.fill.dependencies.candidates.node.clone()
     }
 
-    /// The page's rank-0 owner, the same ranking reads and the warm plan used.
+    /// The page's rank-0 owner within its cache's pool, the same ranking reads use.
     pub(crate) async fn rank_owner(
         &self,
         membership: std::sync::Arc<crate::topology::Membership>,

@@ -5386,6 +5386,7 @@ fn over_share_fixture() -> (Fixture, CacheId, CacheId) {
         origin_socket: "/o".into(),
         priority,
         mode: racer_control_wire::CacheMode::Cached,
+        origin: None,
     };
     f.store
         .writer
@@ -5490,6 +5491,7 @@ fn cache_definition(id: &str, name: &str) -> racer_control_wire::CacheDefinition
         origin_socket: "/o".into(),
         priority: 1,
         mode: racer_control_wire::CacheMode::Cached,
+        origin: None,
     }
 }
 
@@ -5633,6 +5635,7 @@ fn owned_reclaim_never_lets_unheld_over_share_page_take_under_share_write() {
         origin_socket: "/o".into(),
         priority,
         mode: racer_control_wire::CacheMode::Cached,
+        origin: None,
     };
     writer
         .retention()

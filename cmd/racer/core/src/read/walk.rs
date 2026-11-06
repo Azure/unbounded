@@ -923,6 +923,9 @@ impl CandidateWalk {
             // Overloaded on the route to the owner or by the owner: load,
             // not a missing owner ([`shared_share_short`]).
             self.saw_busy = true;
+            // A congested route to rank 0 says nothing about rank 0's own fetch: like a timeout,
+            // leave the fetch to rank 0 unless it is overdue, so origin is not asked twice.
+            self.rank0_unanswered |= pending.rank0 && self.config.rank0 != Rank0State::Overdue;
         }
         if pending.helper {
             // The helper does not consume a visit-order position. Its
@@ -1786,7 +1789,7 @@ impl Fill {
             TargetKind::Successor
         } else if i < self.granted && self.demoted.contains(&self.handoff[i]) {
             TargetKind::Demoted
-        } else if i < self.granted {
+        } else if i < self.granted && self.lineage_targets.contains(&self.handoff[i]) {
             TargetKind::Lineage
         } else {
             TargetKind::Handoff
@@ -2038,13 +2041,20 @@ impl Fill {
     fn start_walk(&mut self, budget: &mut AcquisitionBudget) -> Result<Action> {
         let page = self.page();
         // Successor targets come first, then lineage targets, each on its own
-        // grant; version - 1 targets after them spend the walk's credits.
-        self.granted = self.successors
-            + if self.has(Features::LINEAGE_GRANTS) && self.rank.is_some() {
-                granted_prefix(&self.handoff[self.successors..], &self.lineage_targets)
-            } else {
-                0
-            };
+        // grant; version - 1 targets after them spend the walk's credits, except at rank 0.
+        self.granted = if self.has(Features::LINEAGE_GRANTS) && self.rank == Some(0) && page {
+            // Rank 0 fetches for every owner that delegated to it, and a delegation carries
+            // only rank 0's origin credit: every previous owner is asked on its own grant, so a
+            // page that moved to newly joined owners is copied before origin is asked again.
+            self.handoff.len()
+        } else {
+            self.successors
+                + if self.has(Features::LINEAGE_GRANTS) && self.rank.is_some() {
+                    granted_prefix(&self.handoff[self.successors..], &self.lineage_targets)
+                } else {
+                    0
+                }
+        };
         let continuation = std::mem::take(&mut self.continuation);
         self.bounded = continuation.bounded_routes;
         self.walk = Walking::Candidates(CandidateWalk::new(WalkConfig {
@@ -2221,10 +2231,23 @@ impl Fill {
     fn complete(&mut self, outcome: Outcome, budget: &mut AcquisitionBudget) -> Result<Action> {
         self.pending();
         self.out.outcome = Some(Ok(outcome));
-        // Only rank 0's own answer (or its silence) says anything about rank 0.
-        if self.out.rank0_probe && (self.signed || outcome == Outcome::TimedOut) {
+        // Only rank 0's own answer (or its silence) says anything about rank 0. An overload on
+        // the route to rank 0 (or by rank 0) withholds origin like a timeout does
+        // ([`CandidateWalk::complete`]), so it feeds the watch like a timeout too: otherwise
+        // repeated overloads would never advance the page to `Overdue` and origin would never be
+        // asked.
+        let overloaded = matches!(
+            outcome,
+            Outcome::Probe(ProbeOutcome::Overloaded) | Outcome::Transport(ProbeOutcome::Overloaded)
+        );
+        if self.out.rank0_probe
+            && !self.out.helper
+            && (self.signed || outcome == Outcome::TimedOut || overloaded)
+        {
             self.out.rank0 = match outcome {
                 Outcome::TimedOut => Some(Rank0Note::TimedOut),
+                Outcome::Probe(ProbeOutcome::Overloaded)
+                | Outcome::Transport(ProbeOutcome::Overloaded) => Some(Rank0Note::TimedOut),
                 Outcome::Failed => Some(Rank0Note::Failed),
                 Outcome::Copy
                 | Outcome::Probe(

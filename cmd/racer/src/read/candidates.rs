@@ -1426,7 +1426,7 @@ impl CandidatePolicy {
             .iter()
             .position(|node| node == &self.node);
         let mut ranked = Ranked::new(membership.version.0, &positions(candidates), rank);
-        ranked.members = membership.members().len();
+        ranked.members = membership.pool_size(&object.cache);
         // Arrival order of the page's owners in this node's membership chain.
         for (since, node) in ranked.since.iter_mut().zip(&candidates.ordered) {
             *since = membership.since(node);
@@ -1806,29 +1806,23 @@ impl CandidatePolicy {
     }
 
     /// The member this non-owner asks to acquire `page` for it when an owner
-    /// sheds the request (`racer_core::read::budget`): one of the page's
-    /// hash-chosen helpers, never an owner and never this node, preferring a
-    /// direct overlay neighbor so the exchange needs no relay.
+    /// sheds the request (`racer_core::read::budget::mesh_helper`): the middle
+    /// node of this node's primary mesh path to an owner, starting at a hashed
+    /// owner rank (`helper_start`) so readers spread over the owners' columns,
+    /// never an owner and never this node.
     pub(crate) fn fanout_helper(
         &self,
         candidates: &Candidates,
         object: &ObjectId,
-        page: PageNumber,
+        _page: PageNumber,
     ) -> Option<NodeId> {
         let membership = &candidates.membership;
-        let members = membership.members();
-        racer_core::read::budget::fanout_helper(
-            object,
-            page,
-            &self.node,
-            members.len(),
-            |p| {
-                let node = &members[p].node;
-                node == &self.node || candidates.ordered.contains(node)
-            },
-            |p| membership.is_neighbor(&self.node, &members[p].node),
+        racer_core::read::budget::mesh_helper(
+            &candidates.ordered,
+            racer_core::read::budget::helper_start(self.node.0.as_bytes()),
+            |owner| membership.helper(&object.cache, &self.node, owner),
+            |node| node == &self.node || candidates.ordered.contains(node),
         )
-        .map(|p| members[p].node.clone())
     }
 
     /// After an origin version miss, old copies on later candidates remain useful.
@@ -3615,14 +3609,16 @@ pub(super) mod tests {
     }
 
     /// A non-owner whose owner itself sheds it (a signed `Overloaded` from the destination) asks
-    /// the page's overflow helper once, with an Acquire funded from what is left (too little for
+    /// its mesh helper (the delegate in the owner's column) once, with an Acquire funded from what is left (too little for
     /// the helper to ask another helper), then the remaining owners. A transport `Overloaded` (no
     /// signed answer, as from a congested route) does not.
     #[test]
     fn shed_reader_asks_the_page_helper_once_then_the_other_owners() {
         use crate::test_support::security::{network, node};
         futures::executor::block_on(async {
-            let count = 16;
+            // More than 64 members: several mesh columns, so readers outside
+            // the owners' columns have a helper.
+            let count = 100;
             let nodes: Vec<NodeId> = (0..count).map(node).collect();
             let membership = std::sync::Arc::new(
                 crate::topology::Membership::validate(

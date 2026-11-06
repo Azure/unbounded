@@ -129,6 +129,7 @@ func planDataplane(ctx context.Context, env *component.Env, plan *component.Plan
 	}
 
 	ds.Spec.Template.Annotations[dataplaneConfigHash] = component.ConfigMapPayloadHash(config)
+	ds.Spec.Template.Annotations[nativeOriginAnnotation] = "true"
 
 	container := &ds.Spec.Template.Spec.Containers[0]
 	// Explicit env wiring wins over these imports.

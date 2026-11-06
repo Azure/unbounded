@@ -28,6 +28,8 @@ on:
       - go.mod
       - go.sum
       - .github/workflows/agent-e2e-kind.yaml
+      - .github/actions/setup-go-cached/**
+      - .github/actions/apt-install-cached/**
       - .github/actions/agent-e2e-*/**
   push:
     # release-* included so a cherry-pick onto a release branch gets the same
@@ -57,8 +59,14 @@ on:
       - go.mod
       - go.sum
       - .github/workflows/agent-e2e-kind.yaml
+      - .github/actions/setup-go-cached/**
+      - .github/actions/apt-install-cached/**
       - .github/actions/agent-e2e-*/**
   workflow_dispatch:
+
+concurrency:
+  group: agent-e2e-kind-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 permissions:
   contents: read
@@ -253,6 +261,7 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Set up test control plane
+        id: control-plane
         uses: ./.github/actions/agent-e2e-kind-control-plane
         with:
           cluster-name: ${{ env.KIND_CLUSTER_NAME }}
@@ -269,6 +278,16 @@ jobs:
           python3 ./hack/agent/e2e-kind/monitor_suite.py --timeout 2700 -- \
             python3 ./hack/agent/e2e-kind/e2e.py --verbose run-suite --suite configuration \
             2>&1 | tee logs/configuration-suite.log
+
+      # Every job restores the Go build cache from the control-plane action.
+      # This job builds every binary the other jobs build, so it alone saves
+      # the cache, and only from push runs.
+      - name: Save Go build cache
+        uses: ./.github/actions/setup-go-cached
+        with:
+          phase: save
+          profile: e2e-agent
+          save-build-cache: "true"
 
       - name: Collect logs
         if: always()

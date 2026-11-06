@@ -52,7 +52,6 @@ func TestEnsureUnboundedSite_DefaultTemplates(t *testing.T) {
 		NodeCIDRs:            []string{"10.0.0.0/24"},
 		PodCIDRs:             []string{"10.1.0.0/24"},
 		ManageCniPlugin:      true,
-		EnableMachina:        true,
 		EnableMetalman:       true,
 		EnableTokenRefresher: true,
 		Manifests:            []string{"site.yaml"},
@@ -83,11 +82,9 @@ func TestSiteInitCommand_ComponentFlags(t *testing.T) {
 	require.Nil(t, cmd.Flags().Lookup("machina-manifests"))
 	require.Nil(t, cmd.Flags().Lookup("enable-net"))
 
-	flag := cmd.Flags().Lookup("enable-machina")
-	require.NotNil(t, flag)
-	require.Equal(t, "true", flag.DefValue)
+	require.Nil(t, cmd.Flags().Lookup("enable-machina"))
 
-	flag = cmd.Flags().Lookup("enable-metalman")
+	flag := cmd.Flags().Lookup("enable-metalman")
 	require.NotNil(t, flag)
 	require.Equal(t, "false", flag.DefValue)
 
@@ -119,7 +116,6 @@ func TestEnsureUnboundedSite_ManageCniPluginFalse(t *testing.T) {
 		NodeCIDRs:       []string{"10.0.0.0/24"},
 		PodCIDRs:        []string{"10.1.0.0/24"},
 		ManageCniPlugin: false,
-		EnableMachina:   true,
 		Manifests:       []string{"site.yaml"},
 	}
 
@@ -160,7 +156,6 @@ func TestEnsureUnboundedSite_ManageCniPluginTrue(t *testing.T) {
 		NodeCIDRs:       []string{"10.0.0.0/24"},
 		PodCIDRs:        []string{"10.1.0.0/24"},
 		ManageCniPlugin: true,
-		EnableMachina:   true,
 		Manifests:       []string{"site.yaml"},
 	}
 
@@ -193,7 +188,6 @@ func TestEnsureUnboundedSite_ComponentConfig(t *testing.T) {
 		NodeCIDRs:            []string{"10.0.0.0/24"},
 		PodCIDRs:             []string{"10.1.0.0/24"},
 		ManageCniPlugin:      true,
-		EnableMachina:        true,
 		EnableMetalman:       true,
 		EnableTokenRefresher: true,
 	}
@@ -210,7 +204,7 @@ func TestEnsureUnboundedSite_ComponentConfig(t *testing.T) {
 	rendered := buf.String()
 	assert.Contains(t, rendered, "apiVersion: unbounded-cloud.io/v1alpha3")
 	assert.NotContains(t, rendered, "net:")
-	assert.Contains(t, rendered, "machina:\n      enabled: true")
+	assert.NotContains(t, rendered, "machina:")
 	assert.Contains(t, rendered, "metalman:\n      enabled: true")
 	assert.Contains(t, rendered, "tokenRefresher:\n      enabled: true")
 }
@@ -223,17 +217,14 @@ func TestSiteInitComponentOwnership(t *testing.T) {
 		nodeCIDR:        "10.2.0.0/24",
 		podCIDR:         "10.3.0.0/24",
 		manageCniPlugin: true,
-		enableMachina:   true,
 		enableMetalman:  true,
 	}
 
 	cluster := h.clusterSiteConfig()
-	assert.True(t, cluster.EnableMachina)
 	assert.False(t, cluster.EnableMetalman)
 	assert.False(t, cluster.EnableTokenRefresher)
 
 	remote := h.remoteSiteConfig()
-	assert.False(t, remote.EnableMachina)
 	assert.True(t, remote.EnableMetalman)
 	assert.True(t, remote.EnableTokenRefresher)
 }

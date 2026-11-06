@@ -16,6 +16,7 @@ on:
       - go.sum
       - Makefile
       - .github/workflows/gantry-e2e.yaml
+      - .github/actions/setup-go-cached/**
   push:
     branches:
       - main
@@ -31,6 +32,7 @@ on:
       - go.sum
       - Makefile
       - .github/workflows/gantry-e2e.yaml
+      - .github/actions/setup-go-cached/**
   schedule:
     - cron: "41 8 * * *"
   workflow_dispatch:
@@ -55,14 +57,31 @@ jobs:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
+      # setup-go's built-in cache shares one key across every workflow and
+      # saves from pull requests too. Use a build cache scoped to this suite
+      # instead, saved only from push runs. The suite compiles Gantry packages
+      # and their OpenTelemetry and gRPC dependencies, so GOCACHE is worth
+      # keeping. Modules download quickly from the proxy, and leaving them out
+      # keeps the entry small.
       - name: Set up Go
-        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        uses: ./.github/actions/setup-go-cached
         with:
-          go-version-file: go.mod
-          cache-dependency-path: go.sum
+          profile: e2e-gantry
+          restore-mod-cache: "false"
 
+      # The release binary avoids compiling kind on every run.
       - name: Install kind
-        run: go install sigs.k8s.io/kind@v0.30.0
+        env:
+          KIND_VERSION: v0.30.0
+          KIND_SHA256: 517ab7fc89ddeed5fa65abf71530d90648d9638ef0c4cde22c2c11f8097b8889
+        run: |
+          set -euo pipefail
+          curl -fsSL --retry 3 -o "${RUNNER_TEMP}/kind" \
+            "https://github.com/kubernetes-sigs/kind/releases/download/${KIND_VERSION}/kind-linux-amd64"
+          echo "${KIND_SHA256}  ${RUNNER_TEMP}/kind" | sha256sum --check -
+          sudo install -m 0755 "${RUNNER_TEMP}/kind" /usr/local/bin/kind
+          rm -f "${RUNNER_TEMP}/kind"
+          kind version
 
       # The suite skips when prerequisites are absent. Verify them first so CI
       # cannot report success without creating a cluster.
@@ -76,6 +95,14 @@ jobs:
 
       - name: Run Gantry e2e
         run: make e2e-gantry
+
+      # Runs only when the steps above succeed; the action saves only on push.
+      - name: Save Go build cache
+        uses: ./.github/actions/setup-go-cached
+        with:
+          phase: save
+          profile: e2e-gantry
+          save-build-cache: "true"
 
       - name: Upload Gantry e2e logs
         if: always()

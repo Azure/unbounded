@@ -1,7 +1,7 @@
 ---
 title: "racer-object Reference"
 weight: 8
-description: "Flags, deployment requirements, supported requests, and the security model for the racer-object adapter."
+description: "Flags, deployment requirements, supported requests, and the security model for the racer-object sidecar."
 ---
 
 {{< callout type="warning" >}}
@@ -10,27 +10,24 @@ migration path. Cached data is disposable; Racer is not durable storage. Start
 with the [Azure Blob cache guide]({{< relref "guides/azure-blob-cache" >}}).
 {{< /callout >}}
 
-`racer-object` is a read-only object storage adapter for Racer. It reads from S3,
-S3-compatible stores, and Azure Blob Storage, and serves either an S3 or an Azure
-Blob API to applications. For a working setup, start with
+`racer-object` is a read-only object API sidecar for Racer. It serves an S3 or an
+Azure Blob API on pod loopback and reads through the Racer cache. For a working
+setup, start with
 [Cache Azure Blob Storage with Racer]({{< relref "guides/azure-blob-cache" >}}).
 
-The binary has two commands:
+The binary has one command, `sidecar`. It runs in the application pod. A webhook
+adds it to labeled pods. See [Automatic Injection](#automatic-injection).
 
-- `origin` runs on every eligible Racer node and reads the upstream store. For
-  Azure Blob, the operator can run it from the ClusterCache. See
-  [Managed Azure origin]({{< relref "reference/racer" >}}#managed-azure-origin).
-- `sidecar` runs in the application pod and serves the read API on pod loopback.
-  A webhook adds it to labeled pods. See [Automatic Injection](#automatic-injection).
-
-The read path is application -> sidecar -> Racer -> origin -> upstream. Racer owns
-the cache. Neither command keeps a separate cache, and neither falls back to the
+The read path is application -> sidecar -> Racer -> Azure Blob. The Racer
+dataplane reads the container set in the ClusterCache `spec.origin`. See
+[Azure origin]({{< relref "reference/racer" >}}#azure-origin). The sidecar
+keeps no cache and holds no upstream credentials, and it never falls back to the
 upstream when a cache read fails.
 
-The origin provider (`--provider`) and the sidecar API (`--api`) are independent.
-Both default to `s3`, and any combination works. In this page, "bucket" means an S3
-bucket or an Azure container, and "key" means an S3 object key or an Azure blob
-name.
+The sidecar API (`--api`) is independent of the upstream. In this page,
+"bucket" means an S3 bucket or an Azure container, and "key" means an S3 object
+key or an Azure blob name. With either API, the bucket must be the cache's
+container.
 
 Unbounded releases publish the image as `ghcr.io/azure/racer-object:vX.Y.Z`; use
 the same [release](https://github.com/Azure/unbounded/releases) tag as your
@@ -40,191 +37,40 @@ from source with `make racer-object` (binary at `bin/racer-object`) or
 
 ## Flags
 
-### Both Commands
+Usage: `racer-object sidecar [flags]`.
 
 | Flag | Default | Meaning |
 |------|---------|---------|
-| `--cache` | none, required | Racer ClusterCache name. Must match the socket mount paths. |
-| `--debug-listen` | empty | Optional pprof and `/healthz` address. Unauthenticated and unencrypted. Restrict access. |
+| `--cache` | none, required | Racer ClusterCache name. Must match the socket mount path. |
+| `--api` | `s3` | Client-facing API: `s3` or `azure`. |
+| `--listen` | `127.0.0.1:8080` | Loopback IP literal and port. Non-loopback addresses are rejected. |
+| `--request-timeout` | `5m` | Request timeout. |
+| `--max-connections` | `128` | Client connections accepted at once, and concurrent reads from Racer, across all workers. 1 to 65536. |
+| `--workers` | usable CPUs, at most `4` | Serving threads, each with its own event loop. 1 to 256. The default counts CPUs allowed by the cgroup quota and CPU affinity. Use `1` for the lowest footprint. |
+| `--debug-listen` | empty | Optional `/healthz` address. Unauthenticated and unencrypted. Restrict access. |
 | `--version` | | Print version and exit. |
 
-### Origin Only
+To profile the sidecar, use
+`perf` or another sampling profiler on the node. The binary is built with frame
+pointers, so `perf record -g -p <pid>` gives usable call stacks.
 
-| Flag | Default | Meaning |
-|------|---------|---------|
-| `--cache-uid` | empty | Optional ClusterCache UID, as a lowercase UUID. When set, the origin answers `503` to requests whose `Racer-Cache` header names any other UID, so an origin left from a deleted ClusterCache cannot fill a recreated one with the same name. The operator always sets it. Empty accepts every cache UID. |
-| `--bucket` | empty | S3 only, required. The one bucket the origin serves. Requests for other buckets get `403`. |
-| `--provider` | `s3` | `s3` or `azure`. |
-| `--region` | empty | S3 only. Falls back to the AWS config chain. A region is required one way or the other. |
-| `--endpoint` | empty | S3 only. HTTP or HTTPS origin for an S3-compatible store. No path, query, fragment, or credentials. |
-| `--path-style` | `true` | S3 only. Set `false` for virtual-host addressing. |
-| `--container-url` | empty | Azure only, required. The one container the origin serves, for example `https://ACCOUNT.blob.core.windows.net/CONTAINER`. Requests for other containers get `403`. |
-| `--azure-credential` | `default` | Azure only. `default` or `anonymous`. |
-| `--metadata-ttl` | `30s` | How long upstream metadata stays valid. Zero expires immediately. |
-| `--request-timeout` | `1m` | Upstream request timeout. Must be positive. |
-| `--max-concurrent-requests` | `512` | Page requests served to Racer at once, and the size of the idle upstream connection pool. Requests beyond the limit are rejected as overloaded. 1 to 65536. |
+Earlier releases also had an `origin` command. The Racer dataplane now reads
+Azure Blob itself, so it was removed. racer-object no longer reads S3 or any
+other upstream.
 
-S3 and Azure flags are mutually exclusive. Setting `--bucket`, `--region`,
-`--endpoint`, or `--path-style` with `--provider=azure` is an error, and so is
-setting `--container-url` or `--azure-credential` with `--provider=s3`.
+## Upstream Requirements
 
-### Sidecar Only
-
-| Flag | Default | Meaning |
-|------|---------|---------|
-| `--api` | `s3` | Client-facing API: `s3` or `azure`. Independent of the origin's `--provider`. |
-| `--listen` | `127.0.0.1:8080` | Loopback IP literal and port. Non-loopback addresses are rejected. |
-| `--request-timeout` | `5m` | Request timeout. Note the different default from the origin. |
-| `--max-connections` | `128` | Client connections accepted at once, and concurrent reads from Racer. 1 to 65536. |
-
-## Upstream Providers
-
-### S3
-
-Set `--provider=s3` (the default) and a region, either with `--region` or through
-the AWS config chain. For an S3-compatible store other than AWS, also set
-`--endpoint`. Prefer HTTPS. Use `--path-style=false` only if the store requires
-virtual-host addressing.
-
-Credentials come from the AWS default credential chain: environment variables,
-shared config, web identity, or instance and container credentials. Prefer
-workload identity or another short-lived provider. The S3 example below reads
-static keys from an optional Secret named `racer-object-aws` for quick tests only.
-
-Grant the origin read access to the objects it serves, such as `s3:GetObject`, and
-`s3:GetObjectVersion` if clients request versions.
-
-### Azure Blob
-
-Set `--provider=azure` and `--container-url`. Do not set the S3 flags or AWS
-environment variables. Only block blobs are served.
-
-`--azure-credential=default` uses `DefaultAzureCredential`, covering environment,
-workload identity, and managed identity. With it, `--container-url` must use HTTPS.
-Select a user-assigned identity with the `AZURE_CLIENT_ID` environment variable;
-there is no flag for it. One option is to read that variable from an optional
-Secret, for example `racer-object-azure`, with `envFrom`.
-
-Setting a client ID does not attach an identity or grant access. The identity must
-be attached to the origin pods and hold **Storage Blob Data Reader** at the account
-or container scope, on every eligible node.
-
-For workload identity you also need the pod label
-`azure.workload.identity/use: "true"`, a service account with the
-`azure.workload.identity/client-id` annotation, federated credential trust matching
-the cluster issuer and service account subject, and `AZURE_TENANT_ID` plus
-`AZURE_FEDERATED_TOKEN_FILE`. The example below configures none of this, and sets
-`automountServiceAccountToken: false`.
-
-SAS tokens and shared keys are not supported. Use `--azure-credential=anonymous`
-only for blobs that allow public reads. It controls origin-to-Azure access only,
-not sidecar access.
-
-### Upstream Requirements
-
-The upstream must return strong quoted ETags and keep bytes stable for a given
-ETag. The ETag does not have to be an MD5 hash. Page reads use `If-Match` so a
+Racer serves only block blobs. The upstream must return strong quoted ETags and
+keep bytes stable for a given ETag. The ETag does not have to be an MD5 hash. Page reads use `If-Match` so a
 read cannot mix versions.
 
 Objects with a non-identity `Content-Encoding`, such as gzip, are rejected,
 because Racer's metadata cannot carry that header. Store unencoded bytes.
 
-Mutable object names can stay stale for the length of `--metadata-ttl`. An
+Mutable object names can stay stale for the length of the ClusterCache
+`spec.origin.metadataTTL`. An
 overwritten version may become unavailable mid-read. Request a specific version
 when you need an exact one and the upstream supports versioning.
-
-## Deploying the Origin
-
-For Azure Blob, the operator can run the origin for you. See
-[Managed Azure origin](racer.md#managed-azure-origin). The rest of this section
-covers deploying an origin yourself.
-
-Run the origin as a DaemonSet in the Racer installation namespace, one per
-ClusterCache. Start from the S3 example below and change the provider flags for
-Azure Blob. Run only one origin DaemonSet per cache.
-
-Requirements:
-
-- **Placement.** Run exactly one origin per cache on every eligible Racer node,
-  not only the nodes running application pods. Racer can select any eligible node
-  to supply an origin read. The examples follow Racer's default Linux placement and
-  skip nodes labeled `racer.unbounded-cloud.io/exclude`. Match any custom Racer
-  selectors, affinity, and tolerations.
-- **Socket mount.** Mount `/run/racer/<cache>/origin` from the host, writable,
-  with hostPath type `Directory`. The Racer dataplane creates this directory,
-  owned by UID/GID 65532 with mode `0700`, when it sets up the cache on the node.
-  Until then the pod waits in `ContainerCreating`. The origin never creates it.
-  See [Socket Mounts](#socket-mounts).
-- **Security context.** Run as UID/GID 65532, the image's default user, with
-  `runAsNonRoot: true`, no privilege escalation, all capabilities dropped,
-  `RuntimeDefault` seccomp, and a read-only root filesystem. The origin refuses
-  to start unless the origin directory is owned by its UID, so other UIDs,
-  including 0, do not work.
-- **Credentials.** Supply upstream credentials to the origin pods only. See
-  [Upstream Providers](#upstream-providers).
-- **Arguments.** Set `--cache` to match the sidecars, `--bucket` for S3
-  or `--container-url` for Azure, and the provider flags. Set `--cache-uid`
-  to the ClusterCache UID when you recreate caches under the same name.
-
-The essential parts of the S3 example:
-
-```yaml
-apiVersion: apps/v1
-kind: DaemonSet
-metadata:
-  name: racer-object-origin
-spec:
-  template:
-    spec:
-      automountServiceAccountToken: false
-      nodeSelector:
-        kubernetes.io/os: linux
-      affinity:
-        nodeAffinity:
-          requiredDuringSchedulingIgnoredDuringExecution:
-            nodeSelectorTerms:
-              - matchExpressions:
-                  - key: racer.unbounded-cloud.io/exclude
-                    operator: DoesNotExist
-      securityContext:
-        runAsUser: 65532
-        runAsGroup: 65532
-        runAsNonRoot: true
-        seccompProfile:
-          type: RuntimeDefault
-      containers:
-        - name: origin
-          image: ghcr.io/azure/racer-object:vX.Y.Z
-          args:
-            - origin
-            - --cache=racer-object
-            - --bucket=example-bucket
-            - --region=us-east-1
-          envFrom:
-            - secretRef:
-                name: racer-object-aws
-                optional: true
-          securityContext:
-            allowPrivilegeEscalation: false
-            readOnlyRootFilesystem: true
-            capabilities:
-              drop: [ALL]
-          volumeMounts:
-            - name: origin
-              mountPath: /run/racer/racer-object/origin
-      volumes:
-        - name: origin
-          hostPath:
-            path: /run/racer/racer-object/origin
-            type: Directory
-```
-
-For Azure Blob, replace the S3 arguments with `--provider=azure`,
-`--container-url`, and optionally `--azure-credential`, and replace `envFrom` with
-your Azure identity configuration.
-
-A running origin pod does not prove upstream access; only a real object read does.
-Changing a credentials Secret requires restarting the origin pods.
 
 ## Deploying the Sidecar
 
@@ -362,7 +208,7 @@ Requirements:
   `runAsNonRoot: true`, no privilege escalation, all capabilities dropped,
   `RuntimeDefault` seccomp, and a read-only root filesystem. The
   application containers can run as any user.
-- **Arguments.** Set `--cache` to match the origin. Add `--api=azure` if the application uses the Azure Blob API.
+- **Arguments.** Set `--cache` to the ClusterCache name. Add `--api=azure` if the application uses the Azure Blob API.
 - **No credentials.** Do not give the sidecar or the application upstream
   credentials.
 - **No probes or Services.** Do not add an HTTP readiness probe or expose the
@@ -421,18 +267,14 @@ container with `restartPolicy: Always` so it starts before the application.
 ## Cache Identity
 
 The cache key is the SHA-256 of canonical JSON holding the schema version,
-bucket, key, and version ID. It does **not** include the region, endpoint,
-provider, or account URL.
+bucket, key, and version ID. It does **not** include the account URL.
 
-Each cache serves one source. Do not point an existing cache at a different
-account, provider, or endpoint, or Racer can serve bytes cached from the old
-store. Create a new cache instead. A managed ClusterCache enforces this: its
-`azure.containerURL` cannot change, and a new ClusterCache gets a new UID
-and an empty cache. Requests cannot select origin credentials or an upstream
-endpoint.
+Each cache serves one container. The ClusterCache enforces this:
+`azure.containerURL` cannot change, and a new ClusterCache gets a new UID and an
+empty cache. Requests cannot select credentials or an upstream endpoint.
 
 The sidecar forwards any path-style request, `/<bucket>/<key>` for S3 or
-`/<container>/<blob>` for Azure. The origin rejects other buckets with `403`.
+`/<container>/<blob>` for Azure. Racer rejects other buckets with `403`.
 
 Limits: bucket up to 255 characters from `[a-zA-Z0-9._-]` and not `.` or `..`,
 key 1 to 1024 bytes, version ID up to 1024 bytes, and 8 KiB for the whole
@@ -510,7 +352,7 @@ Errors are XML bodies with a `Code` and `Message`. The Azure API also sets the
 | Status | S3 code | Azure code | Usual cause |
 |--------|---------|------------|-------------|
 | `400` | `InvalidArgument` | `InvalidInput` | A malformed path or range, including a listing request or a multi-range read. |
-| `403` | `AccessDenied` | `AuthorizationFailure` | Bucket is not the origin's `--bucket` or `--container-url` container, or the origin cannot read the object. |
+| `403` | `AccessDenied` | `AuthorizationFailure` | Bucket is not the cache's container, or Racer cannot read the blob. |
 | `404` | `NoSuchKey` | `BlobNotFound` | No such object upstream. |
 | `405` | `MethodNotAllowed` | `UnsupportedHttpVerb` | Anything other than `GET` or `HEAD`. |
 | `412` | `PreconditionFailed` | `ConditionNotMet` | ETag mismatch, or the version is gone. |
@@ -524,8 +366,8 @@ rather than treating it as a complete object.
 
 ## Security Model
 
-**There is no per-client authorization.** The origin holds the upstream
-credentials. Authorization headers sent to the sidecar, including SigV4 and Azure
+**There is no per-client authorization.** The Racer dataplane holds the
+upstream credentials. Authorization headers sent to the sidecar, including SigV4 and Azure
 credentials, are ignored. They are not verified and not forwarded. Unsigned
 requests work. SDKs that insist on credentials can use placeholders. Presigned and
 SAS query parameters are rejected. Do not send real credentials to the sidecar.
@@ -538,38 +380,31 @@ Consequences:
   Origin-side checks cannot authorize a cache hit.
 - Separate trust domains with separate caches, namespaces, socket mount
   permissions, and upstream access policies.
-- The origin's `--bucket` or `--container-url` limits what the adapter fetches.
+- The ClusterCache `azure.containerURL` limits what Racer fetches.
   Any pod attached to the cache can read the whole bucket or container. It is not a per-user policy.
 
-Keep credentials out of flags, images, and source control. Grant the origin only
-the object read permissions it needs, including version reads if you use them.
+Grant the identity Racer uses only the blob read permissions it needs.
 
 ## Socket Mounts
 
 | Container | Host path and container mount path | hostPath type | Access |
 |-----------|------------------------------------|---------------|--------|
-| Origin | `/run/racer/<cache>/origin` | `Directory` | Writable |
 | Sidecar | `/run/racer/<cache>/client` | `Directory` | Read-only |
 
 The sidecar runs as the non-root UID/GID 65532. Racer creates client sockets with
 mode `0666`, so access is controlled by which directory the pod mounts, not by the
-process UID. The origin also runs as UID/GID 65532. The Racer dataplane creates
-the origin directory owned by UID/GID 65532 with mode `0700` and repairs its
-owner and mode if they drift. The origin creates its socket there with mode
-`0600`; the privileged dataplane can still connect to it. Both drop all capabilities, disable
-privilege escalation, use the `RuntimeDefault` seccomp profile, and have read-only
-root filesystems. The adapter
-does not need privileged mode.
+process UID. The sidecar drops all capabilities, disables
+privilege escalation, uses the `RuntimeDefault` seccomp profile, and has a
+read-only root filesystem. It does not need privileged mode.
 
-Mount only these cache-specific directories, never all of `/run/racer`. Keep
+Mount only the cache-specific client directory, never all of `/run/racer`. Keep
 their ancestors trusted and free of symlinks. A read-only client mount still
 allows socket connections; it does not remove read access to cached data. Never
 delete a live socket to take over from another owner.
 
 ## Placement and Readiness
 
-Origins must cover every eligible Racer node. Application pods must run on nodes
-running Racer.
+Application pods must run on nodes running Racer.
 
 Injection starts the sidecar process first, but does not wait for its HTTP
 listener to be ready. Applications must retry connection failures during startup.
@@ -585,6 +420,11 @@ that only reports that the diagnostic listener is up.
 make racer-object-test
 ```
 
-These cover adapter behavior through the Go SDK test bridge. The bridge does not cache data. They do not establish live multi-node
-behavior, admission compatibility, or compatibility with every S3 provider or Azure
-identity setup. Validate those in your own environment.
+This checks formatting, runs Clippy, and runs the Rust unit and integration
+tests for the sidecar. Unit tests cover the request rules, the Racer client
+socket protocol, and response building. Integration tests serve requests over
+TCP with no Racer listening, so they cover only requests that never reach
+Racer, connection handling, and the unavailable case. Reads through a real
+Racer are covered by the kind-based suite in `e2e/racer`. None of these
+establish live multi-node behavior, admission compatibility, or compatibility
+with every S3 or Azure SDK. Validate those in your own environment.

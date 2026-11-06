@@ -35,6 +35,18 @@ const (
 	// control seats.
 	ControlTokenAudience = "racer-control"
 
+	// AzureTokenAudience is the audience of the projected ServiceAccount token
+	// the dataplane exchanges for Microsoft Entra tokens when a ClusterCache
+	// origin uses workloadIdentity.
+	AzureTokenAudience = "api://AzureADTokenExchange"
+
+	// AzureTokenDirectory holds the Azure federated token file.
+	AzureTokenDirectory = "/var/run/secrets/azure/tokens"
+
+	// AzureTokenFile is the Azure federated token path, passed to the
+	// dataplane as RACER_AZURE_FEDERATED_TOKEN_FILE.
+	AzureTokenFile = AzureTokenDirectory + "/azure-identity-token"
+
 	// ControlPort serves the control API on seat holders.
 	ControlPort = 8443
 
@@ -285,6 +297,24 @@ func dataplaneVolumes(c Config) []corev1.Volume {
 				},
 			},
 		},
+		// Always projected so any ClusterCache can use workloadIdentity
+		// without rolling the dataplane. The token is useless to Microsoft
+		// Entra until an identity trusts this ServiceAccount.
+		{
+			Name: "azure-identity-token",
+			VolumeSource: corev1.VolumeSource{
+				Projected: &corev1.ProjectedVolumeSource{
+					DefaultMode: ptr.To(int32(0o400)),
+					Sources: []corev1.VolumeProjection{{
+						ServiceAccountToken: &corev1.ServiceAccountTokenProjection{
+							Audience:          AzureTokenAudience,
+							ExpirationSeconds: ptr.To(int64(3600)),
+							Path:              "azure-identity-token",
+						},
+					}},
+				},
+			},
+		},
 	}
 
 	// DirectoryOrCreate also permits HTTP-only nodes without RDMA hardware.
@@ -308,6 +338,7 @@ func dataplaneContainer(c Config) corev1.Container {
 	mounts := []corev1.VolumeMount{
 		{Name: "kube-api-access", MountPath: APITokenPath, ReadOnly: true},
 		{Name: "token", MountPath: "/var/run/racer-token", ReadOnly: true},
+		{Name: "azure-identity-token", MountPath: AzureTokenDirectory, ReadOnly: true},
 		{Name: "identity", MountPath: "/var/lib/racer/identity"},
 		{Name: "slabs", MountPath: "/var/lib/racer/slabs"},
 		{Name: "sockets", MountPath: "/run/racer"},
@@ -375,6 +406,7 @@ func dataplaneEnvironment(c Config) []corev1.EnvVar {
 		{Name: "RACER_WEBHOOK_LISTEN", Value: listen(WebhookPort)},
 		{Name: "RACER_OBJECT_IMAGE", Value: c.ObjectImage},
 		{Name: "RACER_SERVICE_ACCOUNT_TOKEN", Value: "/var/run/racer-token/token"},
+		{Name: "RACER_AZURE_FEDERATED_TOKEN_FILE", Value: AzureTokenFile},
 		// Kubelet creates the hostPath mount with mode 0755. Let the
 		// dataplane create its private 0700 directory beneath it.
 		{Name: "RACER_IDENTITY_DIRECTORY", Value: "/var/lib/racer/identity/private"},

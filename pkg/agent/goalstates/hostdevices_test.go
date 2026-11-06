@@ -9,6 +9,8 @@ import (
 	"testing"
 
 	"github.com/stretchr/testify/require"
+
+	"github.com/Azure/unbounded/pkg/agent/config"
 )
 
 func TestDiscoverKVMDevicePath_Present(t *testing.T) {
@@ -120,34 +122,41 @@ func TestDiscoverBlockDevicePaths_MissingDir(t *testing.T) {
 	require.Nil(t, discoverBlockDevicePaths("/nonexistent/sys/class/block", "/dev"))
 }
 
-func TestDiscoverInfinibandDevicePaths(t *testing.T) {
+func TestDiscoverInfinibandDeviceDirectories(t *testing.T) {
 	t.Parallel()
 
+	missing := filepath.Join(t.TempDir(), "missing")
+
+	// An empty directory is still mounted so later devices appear.
 	ibDir := t.TempDir()
 
-	for _, name := range []string{"uverbs0", "umad0", "rdma_cm"} {
-		f, err := os.Create(filepath.Join(ibDir, name))
-		require.NoError(t, err)
-		require.NoError(t, f.Close())
-	}
+	got := discoverInfinibandDeviceDirectories(ibDir, missing, false)
+	require.Len(t, got, 1)
+	require.Equal(t, ibDir, got[0].Source)
+	require.Equal(t, ibDir, got[0].Target)
+	require.False(t, got[0].ReadOnly)
+	require.Contains(t, got[0].DeviceAllow, "char-infiniband_verbs")
+	require.Contains(t, got[0].DeviceAllow, "char-infiniband_mad")
+	require.Contains(t, got[0].DeviceAllow, infinibandDir+"/rdma_cm")
 
-	// A subdirectory must be skipped.
-	require.NoError(t, os.Mkdir(filepath.Join(ibDir, "subdir"), 0o755))
-
-	got := discoverInfinibandDevicePaths(ibDir, filepath.Join(t.TempDir(), "missing"), false)
-
-	want := []string{
-		filepath.Join(ibDir, "rdma_cm"),
-		filepath.Join(ibDir, "umad0"),
-		filepath.Join(ibDir, "uverbs0"),
-	}
-	require.Equal(t, want, got)
+	// Populating the directory does not change the mount: the directory
+	// itself is bound, not its children.
+	require.NoError(t, os.WriteFile(filepath.Join(ibDir, "uverbs0"), nil, 0o644))
+	require.Equal(t, got, discoverInfinibandDeviceDirectories(ibDir, missing, false))
 }
 
-func TestDiscoverInfinibandDevicePaths_MissingDir(t *testing.T) {
+func TestDiscoverInfinibandDeviceDirectories_MissingDir(t *testing.T) {
 	t.Parallel()
 
-	require.Nil(t, discoverInfinibandDevicePaths("/nonexistent/dev/infiniband", filepath.Join(t.TempDir(), "missing"), false))
+	require.Nil(t, discoverInfinibandDeviceDirectories("/nonexistent/dev/infiniband", filepath.Join(t.TempDir(), "missing"), false))
+}
+
+func TestDiscoverInfinibandDeviceDirectories_FileNotDir(t *testing.T) {
+	t.Parallel()
+
+	f := filepath.Join(t.TempDir(), "infiniband")
+	require.NoError(t, os.WriteFile(f, nil, 0o644))
+	require.Nil(t, discoverInfinibandDeviceDirectories(f, filepath.Join(t.TempDir(), "missing"), false))
 }
 
 func TestRDMACMDeviceNumber(t *testing.T) {
@@ -218,15 +227,14 @@ func TestHostDevices_Paths_MergesDedupesSorts(t *testing.T) {
 	t.Parallel()
 
 	d := HostDevices{
-		KVM:        []string{"/dev/kvm"},
-		Network:    []string{"/dev/net/tun", "/dev/vhost-net"},
-		Block:      []string{"/dev/sdb", "/dev/sda", "/dev/kvm"},
-		Infiniband: []string{"/dev/infiniband/uverbs0"},
-		Additional: []string{"/dev/uinput", "/dev/net/tun"},
+		KVM:               []string{"/dev/kvm"},
+		Network:           []string{"/dev/net/tun", "/dev/vhost-net"},
+		Block:             []string{"/dev/sdb", "/dev/sda", "/dev/kvm"},
+		DeviceDirectories: []config.AdditionalHostMount{{Source: "/dev/infiniband"}},
+		Additional:        []string{"/dev/uinput", "/dev/net/tun"},
 	}
 
 	want := []string{
-		"/dev/infiniband/uverbs0",
 		"/dev/kvm",
 		"/dev/net/tun",
 		"/dev/sda",

@@ -395,8 +395,10 @@ mod budget_tests {
 }
 
 // Overflow fan-out for hot pages. An owner streaming [`hot_page_bodies`] bodies sheds further
-// readers ([`shed_hot_page`]); a shed non-owner asks one of the page's [`fanout_width`] hash-chosen
-// helpers ([`crate::read::walk::WalkConfig::helper`]). A helper probe carries at most
+// readers ([`shed_hot_page`]), except its column mates in the page's pool and the other owners; a
+// shed non-owner asks its mesh helper ([`mesh_helper`], [`crate::read::walk::WalkConfig::helper`]):
+// the middle node of its primary path to the owner, a column mate of the owner. [`fanout_helper`]
+// and [`is_helper`] are the v1 hashed helpers, kept for comparison. A helper probe carries at most
 // [`HELPER_ATTEMPTS`] and only walks starting with [`HELPER_MIN_ATTEMPTS`] may ask one, so requests
 // never chain. Helpers are non-owners, so they never reach origin.
 
@@ -473,27 +475,102 @@ pub const fn hot_page_bodies(page_bytes: u64) -> usize {
 /// Whether `local` sheds `requester`'s request for a page it is already writing to at least
 /// `threshold` requesters ([`hot_page_bodies`]), when that page is at least half of the `all`
 /// bodies it is writing (otherwise moving readers to helpers only adds a relayed hop). Only one
-/// of the first three ranked `owners` sheds, and never sheds another owner or one of the page's
-/// helpers (`helper`, evaluated last), so the owner's NIC feeds at most [`fanout_width`] helpers.
+/// of the first three ranked `owners` sheds, and never sheds another owner. An `exempt` requester
+/// (evaluated last) is shed only once `streaming` reaches the `exempt_cap` of `limits`. With mesh
+/// helpers ([`HotPageLimits::mesh`]), `exempt` is true for `local`'s column mates in the page's
+/// pool, so owner fan-in for one page is at most [`hot_page_exempt_bodies`] plus the other
+/// owners, whatever the column size.
 pub fn shed_hot_page<N: PartialEq>(
     owners: &[N],
     local: &N,
     requester: &N,
-    helper: impl FnOnce() -> bool,
+    exempt: impl FnOnce() -> bool,
     streaming: usize,
     all: usize,
-    threshold: usize,
+    limits: HotPageLimits,
 ) -> bool {
+    let HotPageLimits {
+        threshold,
+        exempt_cap,
+    } = limits;
     let owners = &owners[..owners.len().min(3)];
     streaming >= threshold.max(1)
         && streaming * 2 >= all
         && owners.contains(local)
         && !owners.contains(requester)
-        && !helper()
+        && (streaming >= exempt_cap || !exempt())
 }
 
-/// Whether the member at `position` is one of `page`'s helpers (any reader
-/// may pick it; see [`fanout_helper`]). At most [`fanout_width`] hashes.
+/// When an owner sheds requesters of a hot page ([`shed_hot_page`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct HotPageLimits {
+    /// Bodies of the page being written before any requester is shed ([`hot_page_bodies`]).
+    pub threshold: usize,
+    /// Bodies of the page being written before `exempt` requesters are shed too.
+    pub exempt_cap: usize,
+}
+
+impl HotPageLimits {
+    /// Mesh v2: column mates are shed past [`hot_page_exempt_bodies`].
+    pub const fn mesh(threshold: usize) -> Self {
+        Self {
+            threshold,
+            exempt_cap: hot_page_exempt_bodies(threshold),
+        }
+    }
+
+    /// v1: hashed helpers are never shed.
+    pub const fn v1(threshold: usize) -> Self {
+        Self {
+            threshold,
+            exempt_cap: usize::MAX,
+        }
+    }
+}
+
+/// Most bodies of one page an owner writes before it sheds its column mates too (the `exempt_cap`
+/// of [`shed_hot_page`] under mesh helpers): `threshold` plus [`HOT_PAGE_EXEMPT_BODIES`]. Without
+/// a cap the whole column (up to `3T / 2` nodes) may stream from the owner at once.
+pub const fn hot_page_exempt_bodies(threshold: usize) -> usize {
+    threshold.saturating_add(HOT_PAGE_EXEMPT_BODIES)
+}
+
+/// Extra bodies of a hot page an owner writes to its column mates (the helpers shed readers ask)
+/// past the shed threshold. Small, so owner fan-in stays near the threshold; nonzero, so helpers
+/// keep a little room when plain readers fill it.
+pub const HOT_PAGE_EXEMPT_BODIES: usize = HOT_PAGE_MIN_BODIES;
+
+/// The helper a shed reader asks: for the first of the (at most three) ranked `owners`, starting
+/// at index `start` (modulo their count) and wrapping, whose `helper_of(owner)` exists and is not
+/// `excluded`, that helper. `helper_of` is the middle node of the reader's primary mesh path to the
+/// owner (`delegate(reader, column(owner))`), so it is a column mate of the owner and a direct
+/// neighbor of the reader. `excluded` must be true for the reader and the page's owners. `None`
+/// when the reader shares a column with every owner, or no helper is eligible: the reader then has
+/// no helper to ask. Callers pass [`helper_start`] so readers spread over every owner's column.
+pub fn mesh_helper<N>(
+    owners: &[N],
+    start: usize,
+    helper_of: impl Fn(&N) -> Option<N>,
+    excluded: impl Fn(&N) -> bool,
+) -> Option<N> {
+    let owners = &owners[..owners.len().min(3)];
+    let start = start.checked_rem(owners.len()).unwrap_or(0);
+    owners[start..]
+        .iter()
+        .chain(&owners[..start])
+        .filter_map(helper_of)
+        .find(|helper| !excluded(helper))
+}
+
+/// Where a reader starts in the ranked owners when it picks its [`mesh_helper`]: a stable hash of
+/// its node id, so shed readers spread evenly over the owners' columns instead of all feeding
+/// from rank 0's column.
+pub fn helper_start(reader: &[u8]) -> usize {
+    (fnv(&[b"racer/mesh-helper", reader]) % 3) as usize
+}
+
+/// v1: whether the member at `position` is one of `page`'s hashed helpers (any
+/// reader may pick it; see [`fanout_helper`]). At most [`fanout_width`] hashes.
 pub fn is_helper(object: &ObjectId, page: PageNumber, position: usize, members: usize) -> bool {
     let cache = object.cache.0.as_bytes();
     let key = &object.key.0[..];
@@ -502,6 +579,7 @@ pub fn is_helper(object: &ObjectId, page: PageNumber, position: usize, members: 
         .any(|j| fnv(&[cache, key, &number, &j.to_le_bytes()]) as usize % members == position)
 }
 
+/// v1 hashed helper (superseded by [`mesh_helper`]).
 /// Position (in membership order) of the member `requester` asks to acquire `page` for it, or
 /// `None` when the membership has no eligible helper. `excluded(position)` must be true for the
 /// page's owners and the requester. Starting at `hash(requester, page) % width`, takes the first
@@ -627,9 +705,66 @@ mod fanout_tests {
     }
 
     #[test]
+    fn mesh_helper_is_the_first_eligible_owner_delegate() {
+        // Reader 9; owner 1 shares its column (no helper), owner 2's delegate is 20.
+        let delegate = |owner: &u32| match owner {
+            1 => None,
+            2 => Some(20),
+            3 => Some(30),
+            4 => Some(40),
+            _ => unreachable!("only the first three owners are asked"),
+        };
+        let excluded = |node: &u32| [9, 1, 2, 3].contains(node);
+        assert_eq!(mesh_helper(&[1, 2, 3, 4], 0, delegate, excluded), Some(20));
+        // A delegate that is itself an owner or the reader is skipped.
+        let delegate = |owner: &u32| Some(if *owner == 2 { 3 } else { 9 });
+        assert_eq!(mesh_helper(&[1, 2, 3], 1, delegate, excluded), None);
+        // Sharing a column with every owner: no helper.
+        assert_eq!(mesh_helper(&[1, 2, 3], 2, |_| None, excluded), None::<u32>);
+        assert_eq!(mesh_helper(&[], 7, |_: &u32| Some(5), |_| false), None);
+    }
+
+    #[test]
+    fn mesh_helper_starts_at_the_reader_offset_and_wraps() {
+        let delegate = |owner: &u32| Some(owner * 10);
+        let none = |_: &u32| false;
+        assert_eq!(mesh_helper(&[1, 2, 3], 0, delegate, none), Some(10));
+        assert_eq!(mesh_helper(&[1, 2, 3], 1, delegate, none), Some(20));
+        assert_eq!(mesh_helper(&[1, 2, 3], 2, delegate, none), Some(30));
+        // Offsets wrap modulo the first three owners; a fourth is never asked.
+        assert_eq!(mesh_helper(&[1, 2, 3, 4], 3, delegate, none), Some(10));
+        assert_eq!(mesh_helper(&[1, 2], 5, delegate, none), Some(20));
+        // Past an ineligible start owner, the next ones are tried, wrapping to the first.
+        let excluded = |node: &u32| *node == 30;
+        assert_eq!(mesh_helper(&[1, 2, 3], 2, delegate, excluded), Some(10));
+    }
+
+    #[test]
+    fn helper_start_spreads_readers_over_the_owners() {
+        let mut counts = [0usize; 3];
+        for reader in 0u32..3_000 {
+            let start = helper_start(&reader.to_be_bytes());
+            assert_eq!(start, helper_start(&reader.to_be_bytes()), "stable");
+            counts[start] += 1;
+        }
+        assert!(
+            counts.iter().all(|c| (800..1_200).contains(c)),
+            "{counts:?}"
+        );
+    }
+
+    #[test]
     fn owners_shed_only_non_exempt_requesters_of_a_dominant_hot_page() {
         let shed = |owners: &[u8], requester, helper, streaming, all, n| {
-            shed_hot_page(owners, &0, &requester, || helper, streaming, all, n)
+            shed_hot_page(
+                owners,
+                &0,
+                &requester,
+                || helper,
+                streaming,
+                all,
+                HotPageLimits::v1(n),
+            )
         };
         for n in [hot_page_bodies(1 << 20), hot_page_bodies(16 << 20)] {
             assert!(!shed(&[0, 1, 2], 9, false, n - 1, n - 1, n));
@@ -648,6 +783,43 @@ mod fanout_tests {
         }
         // A zero threshold still needs one body in flight.
         assert!(!shed(&[0], 9, false, 0, 0, 0));
+    }
+
+    #[test]
+    fn exempt_requesters_are_shed_past_the_exempt_cap_but_owners_never_are() {
+        let n = hot_page_bodies(1 << 20);
+        let cap = hot_page_exempt_bodies(n);
+        assert_eq!(cap, n + HOT_PAGE_EXEMPT_BODIES);
+        let shed = |requester, exempt, streaming| {
+            shed_hot_page(
+                &[0, 1, 2],
+                &0,
+                &requester,
+                || exempt,
+                streaming,
+                streaming,
+                HotPageLimits::mesh(n),
+            )
+        };
+        // Column mates keep room past the threshold, up to the cap.
+        assert!(!shed(9, true, n));
+        assert!(!shed(9, true, cap - 1));
+        assert!(shed(9, true, cap));
+        assert!(shed(9, true, cap * 4));
+        // Plain readers still shed at the threshold.
+        assert!(shed(9, false, n));
+        // Other owners are never shed, so owners always reach each other.
+        assert!(!shed(1, true, cap * 4));
+        assert!(!shed(2, false, cap * 4));
+        // The cap never sheds below the threshold.
+        let limits = HotPageLimits {
+            threshold: n,
+            exempt_cap: 0,
+        };
+        let low = shed_hot_page(&[0, 1], &0, &9, || true, n - 1, n - 1, limits);
+        assert!(!low);
+        assert_eq!(hot_page_exempt_bodies(usize::MAX), usize::MAX);
+        assert_eq!(HotPageLimits::v1(n).exempt_cap, usize::MAX);
     }
 
     #[test]

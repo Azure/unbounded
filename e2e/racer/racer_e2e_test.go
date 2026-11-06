@@ -22,7 +22,8 @@ const (
 )
 
 // TestObjectCacheFromAzureOrigin installs Racer through the operator from a
-// ClusterCache with an anonymous Azure origin, then reads a public blob
+// ClusterCache with an anonymous Azure origin, which the Racer dataplane
+// reads directly, then reads a public blob
 // through the injected racer-object sidecar using both the S3 and Azure APIs.
 func TestObjectCacheFromAzureOrigin(t *testing.T) {
 	requireAzureEgress(t, containerURL+"/"+blobKey)
@@ -41,7 +42,6 @@ func TestObjectCacheFromAzureOrigin(t *testing.T) {
 	h.applyCache()
 	h.installRacer()
 	h.checkDataplaneHardware()
-	h.rollout("daemonset", "racer-origin-"+cacheName, 5*time.Minute)
 	h.waitWebhook()
 
 	for i, api := range apis {
@@ -57,8 +57,6 @@ func TestObjectCacheFromAzureOrigin(t *testing.T) {
 	}
 }
 
-// fetchPod returns a pod that reads the blob twice through the sidecar and
-// verifies its digest each time.
 // checkDataplaneHardware reads /debug/hardware from a racer pod
 // through the API server pod proxy and checks the report shape. Kind nodes
 // always expose block devices, but RDMA devices are not expected.
@@ -119,6 +117,9 @@ func (h *harness) checkDataplaneHardware() {
 	h.t.Logf("/debug/hardware on %s reported %d block devices", pod, len(blockDevices))
 }
 
+// fetchPod returns a pod that reads the blob twice through the sidecar and
+// verifies its digest each time, then checks HEAD, a byte range, and a
+// conditional GET that must return 304.
 func fetchPod(ns, api string) string {
 	url := fmt.Sprintf("http://127.0.0.1:8080/%s/%s", bucket, blobKey)
 	script := fmt.Sprintf(`set -eu
@@ -128,7 +129,20 @@ for i in 1 2; do
     n=$((n+1)); [ "$n" -lt 60 ] || exit 1; sleep 2
   done
   echo "%[2]s  /tmp/blob" | sha256sum -c - && echo "fetch $i sha256-ok"
-done`, url, blobSHA256)
+done
+size=$(wc -c < /tmp/blob | tr -d ' ')
+curl -fsS -I %[1]s | tr -d '\r' > /tmp/head
+grep -q '^HTTP/1.1 200 ' /tmp/head
+grep -qix "content-length: $size" /tmp/head
+etag=$(grep -i '^etag: ' /tmp/head | cut -d' ' -f2-)
+[ -n "$etag" ] && echo "head-ok"
+curl -fsS -r 1-10 -D /tmp/range-head -o /tmp/range %[1]s
+tr -d '\r' < /tmp/range-head > /tmp/range-head.txt
+grep -q '^HTTP/1.1 206 ' /tmp/range-head.txt
+grep -qix "content-range: bytes 1-10/$size" /tmp/range-head.txt
+head -c 11 /tmp/blob | tail -c 10 | cmp - /tmp/range && echo "range-ok"
+code=$(curl -sS -o /dev/null -w '%%{http_code}' -H "If-None-Match: $etag" %[1]s)
+[ "$code" = 304 ] && echo "not-modified-ok"`, url, blobSHA256)
 
 	return fmt.Sprintf(`apiVersion: v1
 kind: Pod
@@ -166,7 +180,8 @@ spec:
 }
 
 // waitFetch waits for the fetch pod in ns to succeed, then checks the sidecar
-// was injected and both fetches verified.
+// was injected, both fetches verified, and the HEAD, range, and conditional
+// checks passed.
 func (h *harness) waitFetch(ns string) {
 	h.t.Helper()
 	h.waitFor("fetch pod in "+ns+" to succeed", 5*time.Minute, func() (bool, string) {
@@ -189,5 +204,11 @@ func (h *harness) waitFetch(ns string) {
 	logs := h.kubectl("-n", ns, "logs", "fetch", "-c", "app")
 	if got := strings.Count(logs, "sha256-ok"); got != 2 {
 		h.t.Fatalf("want 2 verified fetches, got %d; logs:\n%s", got, logs)
+	}
+
+	for _, marker := range []string{"head-ok", "range-ok", "not-modified-ok"} {
+		if !strings.Contains(logs, marker) {
+			h.t.Fatalf("missing %q; logs:\n%s", marker, logs)
+		}
 	}
 }

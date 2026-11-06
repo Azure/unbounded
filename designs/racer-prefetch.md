@@ -314,9 +314,13 @@ A per-node `PrefetchCoordinator` replaces `WarmRegistry`. It owns:
   `normal` over `low`; within a priority, round-robin across tickets; within a
   ticket, ref order. A ticket dispatches only while its queued-and-in-flight
   bytes are under its `max_pending_bytes`.
-- Planning sends each page to its rank-0 owner using the same ranking the warm
-  plan used. Pages the coordinator node owns are filled locally through the
-  same owner path.
+- Planning sends each page to its rank-0 owner using the same ranking reads
+  use. With mesh v2 node pools (`designs/racer-mesh-v2.md`), owners are ranked
+  only within the cache's pool. Pages the coordinator node owns are filled
+  locally through the same owner path. A page with no owner is retried.
+- Only pool members accept tickets for a cache. A node outside the pool answers
+  `PUT` with `503 unavailable` and peer prefetch operations with
+  `StaleMembership`.
 - Results update every interested ticket.
 - Retries for `Overloaded`, `Unavailable`, `Io`, and `deferred` with the
   backoff above, up to `RACER_PREFETCH_MAX_ATTEMPTS`; then the ref fails
@@ -326,9 +330,11 @@ A per-node `PrefetchCoordinator` replaces `WarmRegistry`. It owns:
   `forbidden`.
 - Membership change re-plans queued and in-flight-to-departed-owner units.
   Active windows (not settled or within TTL) re-queue admitted pages whose
-  owner left.
+  owner left the cluster or the cache's pool. A selector change publishes a new
+  membership version, so it re-plans too.
 - Passthrough switch cancels the cache's tickets (`passthrough`); ClusterCache
-  removal or UID change cancels them (`cache_removed`).
+  removal or UID change, or this node leaving the cache's pool, cancels them
+  (`cache_removed`).
 
 ETag resolution at submit uses the normal metadata path with the ticket's
 `Authorization`. A resolution failure fails the ref without failing the PUT.

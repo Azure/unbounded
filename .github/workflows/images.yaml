@@ -23,9 +23,6 @@ permissions:
   contents: read
   packages: write
 
-env:
-  CONTAINER_REGISTRY: ghcr.io/${{ github.repository_owner }}
-
 jobs:
   # ---------------------------------------------------------------------------
   # Resolve the image name and tag from the trigger context.
@@ -90,67 +87,46 @@ jobs:
           echo "Platforms: ${platforms}"
 
   # ---------------------------------------------------------------------------
-  # Build and push multi-arch container image.
+  # metalman is stamped with the netboot images of the same tag, so publish
+  # those first.
+  # ---------------------------------------------------------------------------
+  netboot:
+    needs: resolve
+    if: needs.resolve.outputs.should_build == 'true' && needs.resolve.outputs.name == 'metalman'
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          - name: netboot
+            kernel: ubuntu
+          - name: netboot-azurelinux
+            kernel: azurelinux
+    uses: ./.github/workflows/multiarch-image.yaml
+    with:
+      name: ${{ matrix.name }}
+      file: images/netboot/Containerfile
+      platforms: ${{ needs.resolve.outputs.platforms }}
+      tags: ${{ needs.resolve.outputs.tag }}
+      build-args: |
+        INSTALLER_KERNEL=${{ matrix.kernel }}
+
+  # ---------------------------------------------------------------------------
+  # Build and push the multi-arch container image, each arch on its own native
+  # runner; see multiarch-image.yaml.
   # ---------------------------------------------------------------------------
   build:
-    needs: resolve
-    if: needs.resolve.outputs.should_build == 'true'
-    runs-on: ubuntu-latest
-    steps:
-      - name: Normalize container registry
-        run: echo "CONTAINER_REGISTRY=${CONTAINER_REGISTRY,,}" >> "$GITHUB_ENV"
-
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-
-      - uses: docker/setup-qemu-action@99012661954931238ded8c8b007157a8430204e1 # v4.4.0
-        with:
-          platforms: linux/amd64,linux/arm64
-
-      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
-
-      - name: Log in to ghcr.io
-        uses: docker/login-action@81c6f93d4bc991e510b342a00b419b3bb4efc5c6 # v4.7.0
-        with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Build and push netboot dependency
-        if: needs.resolve.outputs.name == 'metalman'
-        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
-        with:
-          context: .
-          file: images/netboot/Containerfile
-          platforms: ${{ needs.resolve.outputs.platforms }}
-          push: true
-          tags: ${{ env.CONTAINER_REGISTRY }}/netboot:${{ needs.resolve.outputs.tag }}
-          cache-from: type=gha,scope=netboot
-          cache-to: type=gha,scope=netboot,mode=max
-
-      - name: Build and push Azure Linux netboot dependency
-        if: needs.resolve.outputs.name == 'metalman'
-        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
-        with:
-          context: .
-          file: images/netboot/Containerfile
-          platforms: ${{ needs.resolve.outputs.platforms }}
-          push: true
-          build-args: |
-            INSTALLER_KERNEL=azurelinux
-          tags: ${{ env.CONTAINER_REGISTRY }}/netboot-azurelinux:${{ needs.resolve.outputs.tag }}
-          cache-from: type=gha,scope=netboot-azurelinux
-          cache-to: type=gha,scope=netboot-azurelinux,mode=max
-
-      - name: Build and push
-        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
-        with:
-          context: .
-          file: ${{ needs.resolve.outputs.file }}
-          platforms: ${{ needs.resolve.outputs.platforms }}
-          push: true
-          tags: ${{ env.CONTAINER_REGISTRY }}/${{ needs.resolve.outputs.name }}:${{ needs.resolve.outputs.tag }}
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
-          build-args: |
-            VERSION=${{ needs.resolve.outputs.tag }}
-            CONTAINER_REGISTRY=${{ env.CONTAINER_REGISTRY }}
+    needs: [resolve, netboot]
+    # Runs when netboot was skipped (any image but metalman), not only when it
+    # succeeded.
+    if: >-
+      !cancelled() &&
+      needs.resolve.outputs.should_build == 'true' &&
+      (needs.netboot.result == 'success' || needs.netboot.result == 'skipped')
+    uses: ./.github/workflows/multiarch-image.yaml
+    with:
+      name: ${{ needs.resolve.outputs.name }}
+      file: ${{ needs.resolve.outputs.file }}
+      platforms: ${{ needs.resolve.outputs.platforms }}
+      tags: ${{ needs.resolve.outputs.tag }}
+      build-args: |
+        VERSION=${{ needs.resolve.outputs.tag }}

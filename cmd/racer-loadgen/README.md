@@ -51,21 +51,18 @@ allowed; loadgen neither uploads objects nor signs requests.
 
 Recommended DaemonSet split:
 
-1. Run origin-only loadgen containers using
-   `--s3-origin --concurrency=0`. Run a `racer-object origin` container on every
-   eligible Racer origin node, with `--cache=racer-object --bucket=benchmark --region=us-east-1 --path-style=true
-   --endpoint=http://127.0.0.1:8080` when colocated with the synthetic server.
-   Mount the cache's origin socket directory only into racer-object origin.
-   The AWS client still needs credentials: for this unauthenticated fixture,
-   supply non-secret placeholder AWS credential environment values and set
-   `AWS_EC2_METADATA_DISABLED=true`. Do not use real cloud credentials.
+1. Back the Racer cache with an Azure Blob container named like `--bucket`
+   (default `benchmark`) that holds the exact catalog keys and payloads. Set
+   the ClusterCache `spec.origin.azure.containerURL` to it; the Racer
+   dataplane reads the container directly. Loadgen does not upload objects.
 2. Run another loadgen DaemonSet with a `racer-object sidecar` container:
    `sidecar --cache=racer-object --listen=127.0.0.1:8080`. Mount the cache's client socket directory only into
    the sidecar. The loadgen container needs no socket mounts or credentials.
    Without `--s3-origin`, S3 loadgen starts only its metrics/probe listener,
    leaving port 8080 free for the sidecar. Do not expose the sidecar with a Service
    or host networking.
-3. For a direct-origin comparison, use the same client flags but change
+3. For a direct-origin comparison, run origin-only loadgen containers with
+   `--s3-origin --concurrency=0` and use the same client flags, but change
    `--endpoint` to the origin Service URL (for example,
    `http://racer-s3-origin:8080`). Run comparisons separately with identical
    concurrency, catalog, profile, verification, and resource limits. Label the
@@ -75,8 +72,9 @@ Recommended DaemonSet split:
 
 The synthetic origin implements object HEAD/GET, one closed/open/suffix byte
 range, strong quoted ETags, If-Match/If-None-Match (including wildcard conditions),
-and S3 XML errors. Racer-object's pinned HEAD and ranged GET requests are tested
-with the real AWS HTTP client. ETags are quoted `sha256:<hex>`, not MD5.
+and S3 XML errors. It is a direct S3 baseline only: Racer reads Azure Blob, not
+S3. The racer-object sidecar path is tested against a synthetic Racer SDK
+origin. ETags are quoted `sha256:<hex>`, not MD5.
 This is an **unauthenticated, read-only test fixture**, not a general S3 server:
 no listing, writes, versioning, date conditions, If-Range, or multipart reads.
 Keep it on a trusted benchmark network; it accepts signed requests without
@@ -87,8 +85,8 @@ Existing `--profile=shuffle|zipf`, `--zipf-exponent`, `--concurrency-file`, node
 caps, `--interval`, `--retry-delay`, `--duration`, and `--diagnose-integrity` work
 unchanged. One operation is one full object GET; per-blob concurrency is fixed to
 one. S3 mode rejects OCI sizing/transport flags instead of silently ignoring them;
-use `--endpoint`, not `--target`, and configure the upstream bucket on the
-racer-object origin, not loadgen.
+use `--endpoint`, not `--target`, and configure the upstream container on the
+ClusterCache, not loadgen.
 
 Metrics retain their existing names and the `kind="blob"` label. Successful
 operations appear in `racer_loadgen_pulls_total{result="success"}`; verified goodput

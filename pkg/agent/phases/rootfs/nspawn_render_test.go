@@ -152,7 +152,7 @@ func TestServiceOverride_HostDeviceGroupSpecifiers(t *testing.T) {
 func TestServiceOverride_MultipleHostDevices(t *testing.T) {
 	t.Parallel()
 
-	devices := []string{"/dev/kvm", "/dev/net/tun", "/dev/vhost-net", "/dev/sda", "/dev/infiniband/uverbs0"}
+	devices := []string{"/dev/kvm", "/dev/net/tun", "/dev/vhost-net", "/dev/sda"}
 
 	var nspawnBuf bytes.Buffer
 
@@ -724,4 +724,48 @@ func TestAdditionalHostMounts_ConfigToNSpawn(t *testing.T) {
 	require.Contains(t, out, "Bind=/var/lib/data:/data")
 	// The writable mount must not appear as a BindReadOnly entry.
 	require.NotContains(t, out, "BindReadOnly=/var/lib/data")
+}
+
+func TestNSpawnConfig_DeviceDirectoryMounts(t *testing.T) {
+	t.Parallel()
+
+	mounts := []config.AdditionalHostMount{
+		{
+			Source:      "/dev/infiniband",
+			Target:      "/dev/infiniband",
+			DeviceAllow: []string{"char-infiniband_verbs", "/dev/infiniband/rdma_cm"},
+		},
+		{
+			Source:      "/dev/dri",
+			Target:      "/dev/dri",
+			DeviceAllow: []string{"char-drm"},
+		},
+	}
+
+	data := defaultNSpawnTemplateData("kube1")
+	data.AdditionalHostMounts = mounts
+	data.MountDeviceAllow = mountDeviceAllowEntries(mounts)
+
+	var nspawnBuf bytes.Buffer
+	require.NoError(t, nspawnTemplates.ExecuteTemplate(&nspawnBuf, "nspawn.conf", data))
+	require.Contains(t, nspawnBuf.String(), "Bind=/dev/infiniband:/dev/infiniband\n")
+	require.Contains(t, nspawnBuf.String(), "Bind=/dev/dri:/dev/dri\n")
+	require.NotContains(t, nspawnBuf.String(), "Bind=/dev/infiniband/")
+
+	var overrideBuf bytes.Buffer
+	require.NoError(t, nspawnTemplates.ExecuteTemplate(&overrideBuf, "service-override.conf", data))
+
+	for _, allow := range []string{"char-infiniband_verbs", "/dev/infiniband/rdma_cm", "char-drm"} {
+		require.Contains(t, overrideBuf.String(), "DeviceAllow="+allow+" rwm\n")
+	}
+}
+
+func TestMountDeviceAllowEntries(t *testing.T) {
+	t.Parallel()
+
+	require.Nil(t, mountDeviceAllowEntries([]config.AdditionalHostMount{{Source: "/a"}}))
+	require.Equal(t, []string{"char-a", "char-b"}, mountDeviceAllowEntries([]config.AdditionalHostMount{
+		{DeviceAllow: []string{"char-b", "char-a"}},
+		{DeviceAllow: []string{"char-a"}},
+	}))
 }

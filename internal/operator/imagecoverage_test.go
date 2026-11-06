@@ -99,10 +99,19 @@ var registryTagPattern = regexp.MustCompile(`^\$\{\{\s*env\.REGISTRY\s*\}\}/([^:
 // component matrix, which is expanded against that job's matrix entries.
 var matrixComponentPattern = regexp.MustCompile(`^\$\{\{\s*matrix\.component\.name\s*\}\}$`)
 
+// multiArchWorkflow is the reusable workflow that builds and pushes a
+// multi-arch image named by its `name` input under the caller's registry.
+const multiArchWorkflow = "./.github/workflows/multiarch-image.yaml"
+
 // workflow is the subset of GitHub Actions workflow schema needed to find every
 // image a workflow builds and pushes.
 type workflow struct {
 	Jobs map[string]struct {
+		// Uses and With are set on jobs that call a reusable workflow.
+		Uses string `yaml:"uses"`
+		With struct {
+			Name string `yaml:"name"`
+		} `yaml:"with"`
 		Strategy struct {
 			Matrix struct {
 				Component []struct {
@@ -206,6 +215,23 @@ func workflowImages(t *testing.T, path string) map[string]string {
 		matrix := make([]string, 0, len(job.Strategy.Matrix.Component))
 		for _, component := range job.Strategy.Matrix.Component {
 			matrix = append(matrix, component.Name)
+		}
+
+		// A job calling the multi-arch reusable workflow always pushes the
+		// image named by its `name` input.
+		if job.Uses == multiArchWorkflow {
+			steps++
+
+			name := strings.TrimSpace(job.With.Name)
+			if matrixComponentPattern.MatchString(name) {
+				for _, component := range matrix {
+					images[component] = jobName
+				}
+			} else if name != "" {
+				images[name] = jobName
+			}
+
+			continue
 		}
 
 		for _, step := range job.Steps {
@@ -419,6 +445,61 @@ func TestReleaseBOMCoversEveryComponentImage(t *testing.T) {
 					"would not cover it.",
 				repository, releaseBOMVar, releaseBOMSource,
 			)
+		}
+	}
+}
+
+// TestWorkflowImagesReadsReusableWorkflowJobs checks that images pushed through
+// the multi-arch reusable workflow are seen, for both a literal name and a
+// component matrix, and that jobs calling other workflows are ignored.
+func TestWorkflowImagesReadsReusableWorkflowJobs(t *testing.T) {
+	const content = `
+jobs:
+  literal:
+    uses: ./.github/workflows/multiarch-image.yaml
+    with:
+      name: metalman
+  matrixed:
+    strategy:
+      matrix:
+        component:
+          - name: machina
+          - name: gantry
+    uses: ./.github/workflows/multiarch-image.yaml
+    with:
+      name: ${{ matrix.component.name }}
+  unrelated:
+    uses: ./.github/workflows/other.yaml
+    with:
+      name: not-an-image
+  step:
+    steps:
+      - uses: docker/build-push-action@v6
+        with:
+          push: true
+          tags: ${{ env.REGISTRY }}/orca:${{ env.TAG }}
+`
+
+	path := filepath.Join(t.TempDir(), "workflow.yaml")
+	if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
+		t.Fatalf("write workflow: %v", err)
+	}
+
+	got := workflowImages(t, path)
+	want := map[string]string{
+		"metalman": "literal",
+		"machina":  "matrixed",
+		"gantry":   "matrixed",
+		"orca":     "step",
+	}
+
+	if len(got) != len(want) {
+		t.Fatalf("workflowImages() = %v, want %v", got, want)
+	}
+
+	for repository, job := range want {
+		if got[repository] != job {
+			t.Errorf("repository %q: got job %q, want %q", repository, got[repository], job)
 		}
 	}
 }

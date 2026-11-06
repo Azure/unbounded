@@ -19,7 +19,8 @@ name: unbounded release
 #   version
 #     -> changelog
 #     -> frontend
-#     -> binaries          (GoReleaser; creates draft GitHub release)
+#     -> binaries          (GoReleaser; adopts the draft GitHub release)
+#     -> agent-offline-artifacts (bootstrap bundles + rootfs OCI layout archives)
 #     -> net-images        (matrix: amd64-native, arm64-native)
 #         -> net-images-manifest (multi-arch tag stitch + sign + SBOM attest)
 #     -> netboot-image     (PXE boot artifact images)
@@ -31,10 +32,15 @@ name: unbounded release
 #                           host-azurelinux3, host-azurelinux3-nvidia,
 #                           inventory-aggregator, inventory-inspector,
 #                           inventory-viewer)
-#         -> gantry-chart  (OCI chart + signed downloadable archive)
+#     -> gantry-chart      (OCI chart + signed downloadable archive)
 #     -> manifests-tarball (make release-manifests + cosign sign)
 #     -> python-packages   (racer-client and racer-vllm sdists and wheels)
 #     -> finalize          (attach extras + krew manifest)
+#
+# No image is built under QEMU. netboot-image, metalman-image, and
+# component-images call multiarch-image.yaml, which builds each arch on its own
+# native runner, pushes it by digest, then stitches, tags, signs, and
+# SBOM-attests one multi-arch index.
 #
 # All artifacts land on a single GitHub release that is left as a draft.
 # Prerelease status is derived from the tag (a `-` suffix, e.g. v1.2.3-rc1).
@@ -102,7 +108,7 @@ env:
   # By default, syft adds a file entry for every executable it can't tie to a
   # package, with an all-zero SHA-1. Syft doesn't tie Python wheels' native
   # libraries to their packages, so 12 MB of racer-vllm's 30 MB SBOM was these
-  # entries (mostly flashinfer cubins). The packages themselves are still listed.
+  # entries (mostly flashinfer cubins). The package list is unchanged.
   SYFT_UNKNOWNS_EXECUTABLES_WITHOUT_PACKAGES: "false"
 
 jobs:
@@ -322,11 +328,12 @@ jobs:
           retention-days: 7
 
   # ---------------------------------------------------------------------------
-  # Publish offline bootstrap bundles and rootfs OCI layout archives after
-  # GoReleaser has created the draft GitHub release.
+  # Publish offline bootstrap bundles and rootfs OCI layout archives. This
+  # builds its own tooling and consumes no GoReleaser output; the draft release
+  # it uploads to is opened by `version`, so it runs alongside `binaries`.
   # ---------------------------------------------------------------------------
   agent-offline-artifacts:
-    needs: [version, binaries]
+    needs: [version]
     uses: ./.github/workflows/agent-artifacts.yaml
     with:
       tag: ${{ needs.version.outputs.tag }}
@@ -647,11 +654,11 @@ jobs:
   # Build, push, sign, and SBOM-attest the netboot images before metalman is
   # built. The metalman binary is stamped with this exact default netboot tag.
   # netboot-azurelinux runs the Azure Linux installer kernel for hosts whose
-  # NIC driver the Ubuntu kernel lacks.
+  # NIC driver the Ubuntu kernel lacks. Each arch builds on its own native
+  # runner; see multiarch-image.yaml.
   # ---------------------------------------------------------------------------
   netboot-image:
     needs: version
-    runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix:
@@ -660,83 +667,17 @@ jobs:
             kernel: ubuntu
           - name: netboot-azurelinux
             kernel: azurelinux
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-
-      - name: Normalize container registry to lowercase
-        run: echo "REGISTRY=${REGISTRY,,}" >> "$GITHUB_ENV"
-
-      - name: Install cosign
-        uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
-
-      - uses: docker/setup-qemu-action@99012661954931238ded8c8b007157a8430204e1 # v4.4.0
-        with:
-          platforms: linux/amd64,linux/arm64
-
-      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
-
-      - name: Log in to ghcr.io
-        uses: docker/login-action@81c6f93d4bc991e510b342a00b419b3bb4efc5c6 # v4.7.0
-        with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Build and push image
-        id: push
-        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
-        with:
-          context: .
-          file: images/netboot/Containerfile
-          platforms: linux/amd64,linux/arm64
-          push: true
-          build-args: |
-            VERSION=${{ needs.version.outputs.tag }}
-            GIT_COMMIT=${{ github.sha }}
-            CONTAINER_REGISTRY=${{ env.REGISTRY }}
-            INSTALLER_KERNEL=${{ matrix.component.kernel }}
-          tags: ${{ env.REGISTRY }}/${{ matrix.component.name }}:${{ needs.version.outputs.tag }}
-          cache-from: type=gha,scope=${{ matrix.component.name }}
-          cache-to: type=gha,scope=${{ matrix.component.name }},mode=max
-
-      - name: Sign container image
-        run: |
-          cosign sign --yes \
-            "${{ env.REGISTRY }}/${{ matrix.component.name }}@${{ steps.push.outputs.digest }}"
-
-      - name: Generate and attach SBOM
-        uses: anchore/sbom-action@66cbf4bc1f1c0d2edc94016e65bc221b6bb0ad6c # v0.24.3
-        with:
-          image: ${{ env.REGISTRY }}/${{ matrix.component.name }}@${{ steps.push.outputs.digest }}
-          registry-username: ${{ github.actor }}
-          registry-password: ${{ secrets.GITHUB_TOKEN }}
-          format: spdx-json
-          artifact-name: sbom-${{ matrix.component.name }}.spdx.json
-          output-file: sbom-${{ matrix.component.name }}.spdx.json
-          # Defaults to true, and its uploader is neither idempotent nor
-          # able to cope with a release that does not exist yet. The next
-          # step attaches this with --clobber instead; see the header.
-          upload-release-assets: false
-
-      - name: Attest SBOM to image
-        run: |
-          cosign attest --yes \
-            --predicate sbom-${{ matrix.component.name }}.spdx.json \
-            --type spdxjson \
-            "${{ env.REGISTRY }}/${{ matrix.component.name }}@${{ steps.push.outputs.digest }}"
-
-      # After the attestation, not before: the attestation is the
-      # authoritative, digest-bound copy, and it should never be blocked by the
-      # releases API having a bad minute.
-      - name: Attach SBOM to the release
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          GH_REPO: ${{ github.repository }}
-          TAG: ${{ needs.version.outputs.tag }}
-        run: |
-          set -euo pipefail
-
-          gh release upload "$TAG" sbom-${{ matrix.component.name }}.spdx.json --clobber
+    uses: ./.github/workflows/multiarch-image.yaml
+    with:
+      name: ${{ matrix.component.name }}
+      file: images/netboot/Containerfile
+      tags: ${{ needs.version.outputs.tag }}
+      build-args: |
+        VERSION=${{ needs.version.outputs.tag }}
+        GIT_COMMIT=${{ github.sha }}
+        INSTALLER_KERNEL=${{ matrix.component.kernel }}
+      sign: true
+      release-tag: ${{ needs.version.outputs.tag }}
 
   # ---------------------------------------------------------------------------
   # Build, scan, push, sign, and SBOM-attest metalman after its default netboot
@@ -744,117 +685,30 @@ jobs:
   # ---------------------------------------------------------------------------
   metalman-image:
     needs: [version, netboot-image]
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-
-      - name: Normalize container registry to lowercase
-        run: echo "REGISTRY=${REGISTRY,,}" >> "$GITHUB_ENV"
-
-      - name: Install cosign
-        uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
-
-      - uses: docker/setup-qemu-action@99012661954931238ded8c8b007157a8430204e1 # v4.4.0
-        with:
-          platforms: linux/amd64,linux/arm64
-
-      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
-
-      - name: Log in to ghcr.io
-        uses: docker/login-action@81c6f93d4bc991e510b342a00b419b3bb4efc5c6 # v4.7.0
-        with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Build image for scanning
-        if: env.RUN_TRIVY == 'true'
-        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
-        with:
-          context: .
-          file: images/metalman/Containerfile
-          push: false
-          load: true
-          build-args: |
-            VERSION=${{ needs.version.outputs.tag }}
-            GIT_COMMIT=${{ github.sha }}
-            CONTAINER_REGISTRY=${{ env.REGISTRY }}
-          tags: scan/metalman:${{ needs.version.outputs.tag }}
-
-      - name: Scan with Trivy
-        if: env.RUN_TRIVY == 'true'
-        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
-        with:
-          image-ref: scan/metalman:${{ needs.version.outputs.tag }}
-          format: table
-          severity: CRITICAL,HIGH
-          exit-code: "1"
-          trivyignores: images/metalman/.trivyignore
-
-      - name: Build and push image
-        id: push
-        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
-        with:
-          context: .
-          file: images/metalman/Containerfile
-          platforms: linux/amd64,linux/arm64
-          push: true
-          build-args: |
-            VERSION=${{ needs.version.outputs.tag }}
-            GIT_COMMIT=${{ github.sha }}
-            CONTAINER_REGISTRY=${{ env.REGISTRY }}
-          tags: ${{ env.REGISTRY }}/metalman:${{ needs.version.outputs.tag }}
-          cache-from: type=gha,scope=metalman
-          cache-to: type=gha,scope=metalman,mode=max
-
-      - name: Sign container image
-        run: |
-          cosign sign --yes \
-            "${{ env.REGISTRY }}/metalman@${{ steps.push.outputs.digest }}"
-
-      - name: Generate and attach SBOM
-        uses: anchore/sbom-action@66cbf4bc1f1c0d2edc94016e65bc221b6bb0ad6c # v0.24.3
-        with:
-          image: ${{ env.REGISTRY }}/metalman@${{ steps.push.outputs.digest }}
-          registry-username: ${{ github.actor }}
-          registry-password: ${{ secrets.GITHUB_TOKEN }}
-          format: spdx-json
-          artifact-name: sbom-metalman.spdx.json
-          output-file: sbom-metalman.spdx.json
-          # Defaults to true, and its uploader is neither idempotent nor
-          # able to cope with a release that does not exist yet. The next
-          # step attaches this with --clobber instead; see the header.
-          upload-release-assets: false
-
-      - name: Attest SBOM to image
-        run: |
-          cosign attest --yes \
-            --predicate sbom-metalman.spdx.json \
-            --type spdxjson \
-            "${{ env.REGISTRY }}/metalman@${{ steps.push.outputs.digest }}"
-
-      # After the attestation, not before: the attestation is the
-      # authoritative, digest-bound copy, and it should never be blocked by the
-      # releases API having a bad minute.
-      - name: Attach SBOM to the release
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          GH_REPO: ${{ github.repository }}
-          TAG: ${{ needs.version.outputs.tag }}
-        run: |
-          set -euo pipefail
-
-          gh release upload "$TAG" sbom-metalman.spdx.json --clobber
+    uses: ./.github/workflows/multiarch-image.yaml
+    with:
+      name: metalman
+      file: images/metalman/Containerfile
+      tags: ${{ needs.version.outputs.tag }}
+      build-args: |
+        VERSION=${{ needs.version.outputs.tag }}
+        GIT_COMMIT=${{ github.sha }}
+      # Opt-in at run time; see RUN_TRIVY. The env context is not available
+      # to a reusable workflow call, so the variable is read directly.
+      trivy: ${{ vars.RELEASE_TRIVY_SCAN == 'true' }}
+      trivyignores: images/metalman/.trivyignore
+      sign: true
+      release-tag: ${{ needs.version.outputs.tag }}
 
   # ---------------------------------------------------------------------------
   # Build, scan, push, sign, and SBOM-attest the component images that have no
-  # release-time image ordering requirements.
-  # Go components cross-compile natively for amd64 and arm64; the host-* machine
-  # images publish both platforms for PXE architecture support.
+  # release-time image ordering requirements. Each arch builds on its own
+  # native runner, and is Trivy-scanned there when trivy is set; see
+  # multiarch-image.yaml. The host-* machine images publish both platforms for
+  # PXE architecture support.
   # ---------------------------------------------------------------------------
   component-images:
     needs: version
-    runs-on: ubuntu-latest
     strategy:
       # One bad component must not cancel the other ten. Runner minutes are the
       # wrong thing to optimize on a release: knowing the full blast radius in
@@ -900,7 +754,8 @@ jobs:
             platforms: linux/amd64,linux/arm64
             trivy: true
           # vLLM with racer-client and racer-vllm. The upstream vLLM base is
-          # not ours to patch, so it is not gated on Trivy.
+          # not ours to patch, so it is not gated on Trivy. The base image
+          # alone is larger than a hosted runner's free disk.
           - name: racer-vllm
             file: images/racer-vllm/Containerfile
             platforms: linux/amd64
@@ -931,138 +786,33 @@ jobs:
             file: images/inventory/viewer/Containerfile
             platforms: linux/amd64,linux/arm64
             trivy: true
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-
-      - name: Normalize container registry to lowercase
-        run: echo "REGISTRY=${REGISTRY,,}" >> "$GITHUB_ENV"
-
-      - name: Free disk space for large images
-        # The vLLM base image alone is larger than a hosted runner's free disk.
-        if: matrix.component.large
-        run: |
-          set -euo pipefail
-          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
-          df -h /
-
-      - name: Install cosign
-        uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
-
-      - uses: docker/setup-qemu-action@99012661954931238ded8c8b007157a8430204e1 # v4.4.0
-        with:
-          platforms: linux/amd64,linux/arm64
-
-      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
-
-      - name: Log in to ghcr.io
-        uses: docker/login-action@81c6f93d4bc991e510b342a00b419b3bb4efc5c6 # v4.7.0
-        with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Build image for scanning
-        if: matrix.component.trivy && env.RUN_TRIVY == 'true'
-        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
-        with:
-          context: .
-          file: ${{ matrix.component.file }}
-          push: false
-          load: true
-          build-args: |
-            VERSION=${{ needs.version.outputs.tag }}
-            GIT_COMMIT=${{ github.sha }}
-            CONTAINER_REGISTRY=${{ env.REGISTRY }}
-          tags: scan/${{ matrix.component.name }}:${{ needs.version.outputs.tag }}
-
-      - name: Scan with Trivy
-        if: matrix.component.trivy && env.RUN_TRIVY == 'true'
-        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
-        with:
-          image-ref: scan/${{ matrix.component.name }}:${{ needs.version.outputs.tag }}
-          format: table
-          severity: CRITICAL,HIGH
-          exit-code: "1"
-
-      - name: Build and push image
-        id: push
-        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
-        with:
-          context: .
-          file: ${{ matrix.component.file }}
-          platforms: ${{ matrix.component.platforms }}
-          push: true
-          build-args: |
-            VERSION=${{ needs.version.outputs.tag }}
-            GIT_COMMIT=${{ github.sha }}
-            CONTAINER_REGISTRY=${{ env.REGISTRY }}
-          tags: ${{ env.REGISTRY }}/${{ matrix.component.name }}:${{ needs.version.outputs.tag }}
-          cache-from: type=gha,scope=${{ matrix.component.name }}
-          cache-to: type=gha,scope=${{ matrix.component.name }},mode=max
-
-      - name: Sign container image
-        run: |
-          cosign sign --yes \
-            "${{ env.REGISTRY }}/${{ matrix.component.name }}@${{ steps.push.outputs.digest }}"
-
-      - name: Generate and attach SBOM
-        uses: anchore/sbom-action@66cbf4bc1f1c0d2edc94016e65bc221b6bb0ad6c # v0.24.3
-        with:
-          image: ${{ env.REGISTRY }}/${{ matrix.component.name }}@${{ steps.push.outputs.digest }}
-          registry-username: ${{ github.actor }}
-          registry-password: ${{ secrets.GITHUB_TOKEN }}
-          format: spdx-json
-          artifact-name: sbom-${{ matrix.component.name }}.spdx.json
-          output-file: sbom-${{ matrix.component.name }}.spdx.json
-          # Defaults to true, and its uploader is neither idempotent nor
-          # able to cope with a release that does not exist yet. The next
-          # step attaches this with --clobber instead; see the header.
-          upload-release-assets: false
-
-      - name: Attest SBOM to image
-        # Opt-in: an unset matrix key compares equal to false.
-        if: ${{ !matrix.component.large-sbom }}
-        run: |
-          cosign attest --yes \
-            --predicate sbom-${{ matrix.component.name }}.spdx.json \
-            --type spdxjson \
-            "${{ env.REGISTRY }}/${{ matrix.component.name }}@${{ steps.push.outputs.digest }}"
-
-      # Rekor can't take attestations this large (racer-vllm's SBOM is ~18 MB).
-      # sign-blob logs only the digest.
-      - name: Sign the SBOM
-        if: matrix.component.large-sbom
-        run: |
-          cosign sign-blob --yes \
-            --bundle "sbom-${{ matrix.component.name }}.spdx.json.bundle.json" \
-            "sbom-${{ matrix.component.name }}.spdx.json"
-
-      # After the attestation or signature, so the releases API having a bad
-      # minute never blocks the authoritative copy.
-      - name: Attach SBOM to the release
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          GH_REPO: ${{ github.repository }}
-          TAG: ${{ needs.version.outputs.tag }}
-          SBOM: sbom-${{ matrix.component.name }}.spdx.json
-          LARGE_SBOM: ${{ matrix.component.large-sbom }}
-        run: |
-          set -euo pipefail
-
-          assets=("$SBOM")
-          if [[ "$LARGE_SBOM" == "true" ]]; then
-            assets+=("${SBOM}.bundle.json")
-          fi
-
-          gh release upload "$TAG" "${assets[@]}" --clobber
+    uses: ./.github/workflows/multiarch-image.yaml
+    with:
+      name: ${{ matrix.component.name }}
+      file: ${{ matrix.component.file }}
+      platforms: ${{ matrix.component.platforms }}
+      tags: ${{ needs.version.outputs.tag }}
+      build-args: |
+        VERSION=${{ needs.version.outputs.tag }}
+        GIT_COMMIT=${{ github.sha }}
+      # Opt-in at run time; see RUN_TRIVY. The env context is not available
+      # to a reusable workflow call, so the variable is read directly.
+      trivy: ${{ matrix.component.trivy && vars.RELEASE_TRIVY_SCAN == 'true' }}
+      free-disk-space: ${{ matrix.component.large == true }}
+      large-sbom: ${{ matrix.component.large-sbom == true }}
+      include-unowned-executables: false
+      sign: true
+      release-tag: ${{ needs.version.outputs.tag }}
 
   # ---------------------------------------------------------------------------
   # Package the same Gantry chart revision used to render the operator's
   # embedded manifests, publish it as an OCI artifact, and attach a signed
-  # chart archive for users that require an offline install path.
+  # chart archive for users that require an offline install path. Packaging
+  # only reads the chart sources in the tree, so this does not wait for the
+  # component images; finalize still gates the release on both.
   # ---------------------------------------------------------------------------
   gantry-chart:
-    needs: [version, component-images]
+    needs: [version]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1

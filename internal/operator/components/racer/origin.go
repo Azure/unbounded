@@ -5,85 +5,45 @@ package racer
 
 import (
 	"context"
-	"crypto/sha256"
-	"encoding/hex"
-	"encoding/json"
 	"errors"
 	"fmt"
-	"maps"
 	"slices"
-	"strconv"
 	"strings"
 
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
-	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/apimachinery/pkg/util/intstr"
-	"k8s.io/apimachinery/pkg/util/validation"
-	"k8s.io/utils/ptr"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	racerv1 "github.com/Azure/unbounded/api/racer/v1alpha1"
 	"github.com/Azure/unbounded/internal/operator/component"
-	"github.com/Azure/unbounded/internal/racer/workload"
 	"github.com/Azure/unbounded/internal/racerobject"
 )
 
+// The Racer dataplane reads ClusterCache spec.origin itself. Earlier operator
+// versions ran one racer-object origin DaemonSet and ServiceAccount per cache,
+// named racer-origin-<cache> and labeled with the component below; they are
+// only pruned now.
 const (
-	originPrefix        = "racer-origin-"
-	originContainerName = "origin"
-	originAppName       = "racer-origin"
-	originCacheLabel    = "racer.unbounded-cloud.io/origin-cache"
-	originConfigHash    = "racer.unbounded-cloud.io/origin-config-hash"
-	originMaxRequests   = 65536
+	originPrefix      = "racer-origin-"
+	originAppName     = "racer-origin"
+	originMaxRequests = 65536
 
-	workloadIdentityUse      = "azure.workload.identity/use"
-	workloadIdentityClientID = "azure.workload.identity/client-id"
-	workloadIdentityTenantID = "azure.workload.identity/tenant-id"
+	// nativeOriginAnnotation marks a dataplane Pod template that reads
+	// ClusterCache origins in-process. Legacy origin DaemonSets are pruned
+	// only once every dataplane Pod runs such a template.
+	nativeOriginAnnotation = "unbounded-cloud.io/racer-native-origin"
 )
 
-// originName is the DaemonSet and ServiceAccount name for a cache origin.
-// ClusterCache names are DNS subdomains of at most 82 characters, so the
-// result is always a valid object name.
-func originName(cache string) string {
-	return originPrefix + cache
-}
-
-// originCacheValue is a label-safe stable selector value for a cache name,
-// which may be longer than a label value or contain dots.
-func originCacheValue(cache string) string {
-	sum := sha256.Sum256([]byte(cache))
-	return hex.EncodeToString(sum[:])[:16]
-}
-
-func originLabels() map[string]string {
-	return map[string]string{"app.kubernetes.io/name": originAppName, "app.kubernetes.io/component": originAppName}
-}
-
-// originSpec is the validated, rendered form of a ClusterCache origin.
-type originSpec struct {
-	args          []string
-	env           []corev1.EnvVar
-	envFrom       []corev1.EnvFromSource
-	saAnnotations map[string]string
-	podLabels     map[string]string
-	// secretDigest digests the data of the credential Secret named by envFrom.
-	// envFrom is resolved only at container start, so the digest makes a
-	// rotated Secret roll the origin Pods.
-	secretDigest string
-}
-
-// renderOrigin validates spec.origin and renders the origin process inputs. It
-// re-checks the CRD rules so a cache that bypassed admission fails closed.
-func renderOrigin(cache *racerv1.ClusterCache) (originSpec, error) {
+// validateOrigin re-checks the CRD rules for spec.origin so a cache that
+// bypassed admission is reported instead of being silently served.
+func validateOrigin(cache *racerv1.ClusterCache) error {
 	origin := cache.Spec.Origin
 	if origin.Azure == nil {
-		return originSpec{}, errors.New("spec.origin.azure is required")
+		return errors.New("spec.origin.azure is required")
 	}
 
-	out := originSpec{}
 	credential := "anonymous"
 
 	if c := origin.Azure.Credential; c != nil {
@@ -91,348 +51,40 @@ func renderOrigin(cache *racerv1.ClusterCache) (originSpec, error) {
 
 		switch {
 		case (c.Default == nil) == (c.WorkloadIdentity == nil):
-			return originSpec{}, errors.New("spec.origin.azure.credential must set exactly one of default or workloadIdentity")
-		case c.Default != nil:
-			if c.Default.ClientID != "" && c.Default.SecretRef != nil {
-				return originSpec{}, errors.New("spec.origin.azure.credential.default clientID and secretRef are mutually exclusive")
-			}
-
-			if c.Default.ClientID != "" {
-				out.env = []corev1.EnvVar{{Name: "AZURE_CLIENT_ID", Value: c.Default.ClientID}}
-			}
-
-			if c.Default.SecretRef != nil {
-				if c.Default.SecretRef.Name == "" {
-					return originSpec{}, errors.New("spec.origin.azure.credential.default.secretRef.name is required")
-				}
-
-				if errs := validation.IsDNS1123Subdomain(c.Default.SecretRef.Name); len(errs) > 0 {
-					return originSpec{}, fmt.Errorf("spec.origin.azure.credential.default.secretRef.name: %s", strings.Join(errs, "; "))
-				}
-
-				out.envFrom = []corev1.EnvFromSource{{SecretRef: &corev1.SecretEnvSource{LocalObjectReference: corev1.LocalObjectReference{Name: c.Default.SecretRef.Name}}}}
-			}
-		default:
-			if c.WorkloadIdentity.ClientID == "" {
-				return originSpec{}, errors.New("spec.origin.azure.credential.workloadIdentity.clientID is required")
-			}
-
-			out.saAnnotations = map[string]string{workloadIdentityClientID: c.WorkloadIdentity.ClientID}
-			if c.WorkloadIdentity.TenantID != "" {
-				out.saAnnotations[workloadIdentityTenantID] = c.WorkloadIdentity.TenantID
-			}
-
-			out.podLabels = map[string]string{workloadIdentityUse: "true"}
+			return errors.New("spec.origin.azure.credential must set exactly one of default or workloadIdentity")
+		case c.WorkloadIdentity != nil && c.WorkloadIdentity.ClientID == "":
+			return errors.New("spec.origin.azure.credential.workloadIdentity.clientID is required")
+		case c.Default != nil && c.Default.SecretRef != nil:
+			return errors.New("spec.origin.azure.credential.default.secretRef is no longer supported; use clientID or workloadIdentity")
 		}
 	}
 
 	if _, _, err := racerobject.ParseAzureContainerURL(origin.Azure.ContainerURL, credential); err != nil {
-		return originSpec{}, fmt.Errorf("spec.origin.azure.containerURL: %w", err)
+		return fmt.Errorf("spec.origin.azure.containerURL: %w", err)
 	}
 
-	// The socket path is name-based, so bind the origin to this ClusterCache
-	// UID: an origin left from a deleted cache with the same name then refuses
-	// requests for the recreated one instead of filling it.
-	if cache.UID == "" {
-		return originSpec{}, errors.New("metadata.uid is required")
+	if origin.MetadataTTL != nil && origin.MetadataTTL.Duration < 0 {
+		return errors.New("spec.origin.metadataTTL must not be negative")
 	}
 
-	out.args = []string{"origin", "--cache=" + cache.Name, "--cache-uid=" + string(cache.UID), "--provider=azure", "--container-url=" + escapeKubeArg(origin.Azure.ContainerURL), "--azure-credential=" + credential}
-
-	if origin.MetadataTTL != nil {
-		if origin.MetadataTTL.Duration < 0 {
-			return originSpec{}, errors.New("spec.origin.metadataTTL must not be negative")
-		}
-
-		out.args = append(out.args, "--metadata-ttl="+origin.MetadataTTL.Duration.String())
-	}
-
-	if origin.RequestTimeout != nil {
-		if origin.RequestTimeout.Duration <= 0 {
-			return originSpec{}, errors.New("spec.origin.requestTimeout must be positive")
-		}
-
-		out.args = append(out.args, "--request-timeout="+origin.RequestTimeout.Duration.String())
+	if origin.RequestTimeout != nil && origin.RequestTimeout.Duration <= 0 {
+		return errors.New("spec.origin.requestTimeout must be positive")
 	}
 
 	if origin.MaxConcurrentRequests != nil {
 		if n := *origin.MaxConcurrentRequests; n < 1 || n > originMaxRequests {
-			return originSpec{}, fmt.Errorf("spec.origin.maxConcurrentRequests must be between 1 and %d", originMaxRequests)
-		}
-
-		out.args = append(out.args, "--max-concurrent-requests="+strconv.Itoa(int(*origin.MaxConcurrentRequests)))
-	}
-
-	return out, nil
-}
-
-// hash covers every rendered input that does not otherwise change the pod
-// template, so credential edits roll the origin Pods.
-func (o originSpec) hash() (string, error) {
-	data, err := json.Marshal(struct {
-		Args          []string               `json:"args"`
-		Env           []corev1.EnvVar        `json:"env"`
-		EnvFrom       []corev1.EnvFromSource `json:"envFrom"`
-		SAAnnotations map[string]string      `json:"saAnnotations"`
-		SecretDigest  string                 `json:"secretDigest,omitempty"`
-	}{o.args, o.env, o.envFrom, o.saAnnotations, o.secretDigest})
-	if err != nil {
-		return "", err
-	}
-
-	sum := sha256.Sum256(data)
-
-	return hex.EncodeToString(sum[:]), nil
-}
-
-// credentialSecretName returns the credential Secret a cache's origin reads
-// through envFrom, or "" when it reads none.
-func credentialSecretName(cache *racerv1.ClusterCache) string {
-	if cache.Spec.Origin == nil || cache.Spec.Origin.Azure == nil {
-		return ""
-	}
-
-	c := cache.Spec.Origin.Azure.Credential
-	if c == nil || c.Default == nil || c.Default.SecretRef == nil {
-		return ""
-	}
-
-	return c.Default.SecretRef.Name
-}
-
-// credentialDigest digests the data of the credential Secret in the origin
-// namespace without exposing it. A missing Secret digests to "", so creating
-// it later still rolls the origin Pods, which otherwise stay stuck failing to
-// start on the absent envFrom source.
-func credentialDigest(ctx context.Context, env *component.Env, name string) (string, error) {
-	if name == "" {
-		return "", nil
-	}
-
-	secret := &corev1.Secret{}
-
-	err := env.LiveReader().Get(ctx, objectKey(env, name), secret)
-	if apierrors.IsNotFound(err) {
-		return "", nil
-	}
-
-	if err != nil {
-		return "", fmt.Errorf("get origin credential secret %s: %w", name, err)
-	}
-
-	h := sha256.New()
-
-	keys := slices.Sorted(maps.Keys(secret.Data))
-	for _, k := range keys {
-		h.Write(fmt.Appendf(nil, "%d:%s%d:", len(k), k, len(secret.Data[k])))
-		h.Write(secret.Data[k])
-	}
-
-	return hex.EncodeToString(h.Sum(nil)), nil
-}
-
-// originMirror holds the pod template fields an origin copies from the live
-// dataplane DaemonSet.
-type originMirror struct {
-	affinity     *corev1.Affinity
-	nodeSelector map[string]string
-	tolerations  []corev1.Toleration
-	pullSecrets  []corev1.LocalObjectReference
-}
-
-// clone returns a deep copy so each origin owns its slices and maps.
-func (m originMirror) clone() originMirror {
-	return originMirror{
-		affinity:     m.affinity.DeepCopy(),
-		nodeSelector: maps.Clone(m.nodeSelector),
-		tolerations:  slices.Clone(m.tolerations),
-		pullSecrets:  slices.Clone(m.pullSecrets),
-	}
-}
-
-// originPlacement follows the node-level constraints (node affinity, node
-// selector, tolerations) and image pull secrets of the live dataplane
-// DaemonSet, including user overrides, so origins run wherever the dataplane
-// serving their cache runs and can pull from the same registry. Origins share
-// the dataplane namespace, so the Secret references resolve.
-// found is false while the dataplane DaemonSet does not exist yet: placement
-// overrides are applied after planning, so no safe placement is known and
-// callers must defer origins rather than guess one.
-// See workload.PlacementOf for why pod affinity rules are not copied.
-func originPlacement(ctx context.Context, env *component.Env) (mirror originMirror, found bool, err error) {
-	ds := &appsv1.DaemonSet{}
-
-	err = env.LiveReader().Get(ctx, objectKey(env, dataplaneName), ds)
-	if apierrors.IsNotFound(err) {
-		return originMirror{}, false, nil
-	}
-
-	if err != nil {
-		return originMirror{}, false, err
-	}
-
-	pod := ds.Spec.Template.Spec
-
-	placement := workload.PlacementOf(&pod)
-	mirror.affinity = placement.Affinity
-	mirror.nodeSelector = placement.NodeSelector
-	mirror.tolerations = placement.Tolerations
-	mirror.pullSecrets = slices.Clone(pod.ImagePullSecrets)
-
-	// Kubernetes adds ServiceAccount imagePullSecrets to admitted Pods, not
-	// to the DaemonSet template, and origins run under their own
-	// ServiceAccount. Fall back to the dataplane ServiceAccount's secrets so
-	// origins can pull from the same registry. A missing ServiceAccount
-	// means there is nothing to copy.
-	if len(mirror.pullSecrets) == 0 {
-		accountName := pod.ServiceAccountName
-		if accountName == "" {
-			accountName = dataplaneName
-		}
-
-		account := &corev1.ServiceAccount{}
-
-		err = env.LiveReader().Get(ctx, objectKey(env, accountName), account)
-		if err != nil && !apierrors.IsNotFound(err) {
-			return originMirror{}, false, err
-		}
-
-		if err == nil {
-			mirror.pullSecrets = slices.Clone(account.ImagePullSecrets)
+			return fmt.Errorf("spec.origin.maxConcurrentRequests must be between 1 and %d", originMaxRequests)
 		}
 	}
-
-	return mirror, true, nil
-}
-
-func cacheOwnerReference(cache *racerv1.ClusterCache) metav1.OwnerReference {
-	return metav1.OwnerReference{APIVersion: racerv1.GroupVersion.String(), Kind: "ClusterCache", Name: cache.Name, UID: cache.UID, Controller: ptr.To(true)}
-}
-
-func originDaemonSet(env *component.Env, cache *racerv1.ClusterCache, spec originSpec, hash string, mirror originMirror) *appsv1.DaemonSet {
-	name := originName(cache.Name)
-	selector := map[string]string{"app.kubernetes.io/name": originAppName, originCacheLabel: originCacheValue(cache.Name)}
-
-	podLabels := originLabels()
-	podLabels[originCacheLabel] = selector[originCacheLabel]
-
-	for key, value := range spec.podLabels {
-		podLabels[key] = value
-	}
-
-	socketDir := "/run/racer/" + cache.Name + "/origin"
-
-	return &appsv1.DaemonSet{
-		TypeMeta: metav1.TypeMeta{APIVersion: "apps/v1", Kind: "DaemonSet"},
-		ObjectMeta: metav1.ObjectMeta{
-			Name: name, Namespace: env.Namespace, Labels: originLabels(),
-			OwnerReferences: []metav1.OwnerReference{cacheOwnerReference(cache)},
-		},
-		Spec: appsv1.DaemonSetSpec{
-			Selector: &metav1.LabelSelector{MatchLabels: selector},
-			UpdateStrategy: appsv1.DaemonSetUpdateStrategy{
-				Type: appsv1.RollingUpdateDaemonSetStrategyType,
-				RollingUpdate: &appsv1.RollingUpdateDaemonSet{
-					MaxUnavailable: ptr.To(intstr.FromString("100%")),
-					MaxSurge:       ptr.To(intstr.FromInt32(0)),
-				},
-			},
-			Template: corev1.PodTemplateSpec{
-				ObjectMeta: metav1.ObjectMeta{
-					Labels:      podLabels,
-					Annotations: map[string]string{originConfigHash: hash},
-				},
-				Spec: corev1.PodSpec{
-					ServiceAccountName:            name,
-					AutomountServiceAccountToken:  ptr.To(false),
-					RestartPolicy:                 corev1.RestartPolicyAlways,
-					DNSPolicy:                     corev1.DNSClusterFirst,
-					SchedulerName:                 corev1.DefaultSchedulerName,
-					EnableServiceLinks:            ptr.To(false),
-					PreemptionPolicy:              ptr.To(corev1.PreemptLowerPriority),
-					TerminationGracePeriodSeconds: ptr.To(int64(5)),
-					SecurityContext: &corev1.PodSecurityContext{
-						RunAsUser: ptr.To(int64(65532)), RunAsGroup: ptr.To(int64(65532)), RunAsNonRoot: ptr.To(true),
-						SeccompProfile: &corev1.SeccompProfile{Type: corev1.SeccompProfileTypeRuntimeDefault},
-					},
-					Affinity:         mirror.affinity,
-					NodeSelector:     mirror.nodeSelector,
-					Tolerations:      mirror.tolerations,
-					ImagePullSecrets: mirror.pullSecrets,
-					Containers: []corev1.Container{{
-						Name:                     originContainerName,
-						Image:                    env.Config.Image(objectImageName),
-						ImagePullPolicy:          corev1.PullIfNotPresent,
-						TerminationMessagePath:   corev1.TerminationMessagePathDefault,
-						TerminationMessagePolicy: corev1.TerminationMessageReadFile,
-						Args:                     spec.args,
-						Env:                      spec.env,
-						EnvFrom:                  spec.envFrom,
-						Resources: corev1.ResourceRequirements{Requests: corev1.ResourceList{
-							corev1.ResourceCPU:    resource.MustParse("50m"),
-							corev1.ResourceMemory: resource.MustParse("64Mi"),
-						}},
-						SecurityContext: &corev1.SecurityContext{
-							AllowPrivilegeEscalation: ptr.To(false), ReadOnlyRootFilesystem: ptr.To(true),
-							Capabilities: &corev1.Capabilities{Drop: []corev1.Capability{"ALL"}},
-						},
-						VolumeMounts: []corev1.VolumeMount{{Name: originContainerName, MountPath: socketDir}},
-					}},
-					Volumes: []corev1.Volume{{
-						Name:         originContainerName,
-						VolumeSource: corev1.VolumeSource{HostPath: &corev1.HostPathVolumeSource{Path: socketDir, Type: ptr.To(corev1.HostPathDirectory)}},
-					}},
-				},
-			},
-		},
-	}
-}
-
-// planOrigin adds one cache's ServiceAccount and DaemonSet, or neither.
-func planOrigin(ctx context.Context, env *component.Env, plan *component.Plan, cache *racerv1.ClusterCache, spec originSpec, mirror originMirror) error {
-	hash, err := spec.hash()
-	if err != nil {
-		return err
-	}
-
-	domain := "racer-origin/" + cache.Name
-	account := &corev1.ServiceAccount{
-		TypeMeta: metav1.TypeMeta{APIVersion: "v1", Kind: "ServiceAccount"},
-		ObjectMeta: metav1.ObjectMeta{
-			Name: originName(cache.Name), Namespace: env.Namespace, Labels: originLabels(), Annotations: maps.Clone(spec.saAnnotations),
-			OwnerReferences: []metav1.OwnerReference{cacheOwnerReference(cache)},
-		},
-		AutomountServiceAccountToken: ptr.To(false),
-	}
-
-	accountOp, err := ownedOperation(ctx, env, component.Operation{Kind: component.OpApply, Object: component.ToUnstructured(account), Component: name, FailureDomain: domain})
-	if err != nil {
-		return err
-	}
-
-	ds := originDaemonSet(env, cache, spec, hash, mirror)
-
-	dsOp, err := ownedOperation(ctx, env, component.Operation{
-		Kind: component.OpApply, Object: component.ToUnstructured(ds), Component: name, FailureDomain: domain,
-		DependsOn: []component.ObjectRef{accountOp.Ref()},
-	})
-	if err != nil {
-		return err
-	}
-
-	plan.Add(accountOp)
-	plan.Add(dsOp)
 
 	return nil
 }
 
-// planOrigins deploys one racer-object origin DaemonSet per ClusterCache with
-// spec.origin and prunes origins of caches that no longer request one. Invalid
-// or conflicting caches are skipped, keep their existing objects, and are
-// returned for status; they never block other caches or the dataplane.
-// waiting reports that some cache wants an origin but the dataplane DaemonSet
-// does not exist yet; no origin is applied until its placement is known, while
-// pruning still proceeds and existing origins of wanted caches are kept.
+// planOrigins returns the ClusterCaches whose spec.origin is invalid, for
+// status, and prunes every origin DaemonSet and ServiceAccount left by
+// earlier operator versions. Until the dataplane has rolled out its
+// native-origin revision, the leftovers are kept, because nodes still on the
+// old dataplane read through their origin sockets; waiting is then true.
 func planOrigins(ctx context.Context, env *component.Env, plan *component.Plan) (invalid []string, waiting bool, err error) {
 	caches := &racerv1.ClusterCacheList{}
 	if err := env.LiveReader().List(ctx, caches); err != nil {
@@ -441,77 +93,136 @@ func planOrigins(ctx context.Context, env *component.Env, plan *component.Plan) 
 
 	slices.SortFunc(caches.Items, func(a, b racerv1.ClusterCache) int { return strings.Compare(a.Name, b.Name) })
 
-	wanted := map[string]bool{}
-
-	var (
-		placement bool
-		found     bool
-		mirror    originMirror
-	)
-
 	for i := range caches.Items {
 		cache := &caches.Items[i]
-		// A terminating cache keeps no origin, even while finalizers hold it.
 		if cache.Spec.Origin == nil || cache.DeletionTimestamp != nil {
 			continue
 		}
 
-		wanted[originName(cache.Name)] = true
-
-		spec, err := renderOrigin(cache)
-		if err != nil {
+		if err := validateOrigin(cache); err != nil {
 			invalid = append(invalid, fmt.Sprintf("%s (%v)", cache.Name, err))
-			continue
-		}
-
-		spec.secretDigest, err = credentialDigest(ctx, env, credentialSecretName(cache))
-		if err != nil {
-			return nil, false, err
-		}
-
-		if !placement {
-			mirror, found, err = originPlacement(ctx, env)
-			if err != nil {
-				return nil, false, err
-			}
-
-			placement = true
-		}
-
-		if !found {
-			waiting = true
-			continue
-		}
-
-		err = planOrigin(ctx, env, plan, cache, spec, mirror.clone())
-		if errors.Is(err, errNotOwned) {
-			invalid = append(invalid, fmt.Sprintf("%s (%v)", cache.Name, err))
-			continue
-		}
-
-		if err != nil {
-			return nil, false, err
 		}
 	}
 
-	if err := pruneOrigins(ctx, env, plan, wanted); err != nil {
+	waiting, err = pruneOrigins(ctx, env, plan)
+	if err != nil {
 		return nil, false, err
 	}
 
 	return invalid, waiting, nil
 }
 
-func pruneOrigins(ctx context.Context, env *component.Env, plan *component.Plan, wanted map[string]bool) error {
+// nativeOriginRolledOut reports whether the live dataplane DaemonSet runs the
+// native-origin template on every scheduled node. A missing DaemonSet is not
+// rolled out: it is created in this pass, and a pre-rename dataplane may still
+// read through origin sockets until it is replaced.
+func nativeOriginRolledOut(ctx context.Context, env *component.Env) (bool, error) {
+	ds := &appsv1.DaemonSet{}
+
+	err := env.LiveReader().Get(ctx, objectKey(env, dataplaneName), ds)
+	if apierrors.IsNotFound(err) {
+		return false, nil
+	}
+
+	if err != nil {
+		return false, err
+	}
+
+	if ds.DeletionTimestamp != nil || ds.Spec.Template.Annotations[nativeOriginAnnotation] != "true" {
+		return false, nil
+	}
+
+	st := ds.Status
+	if st.ObservedGeneration < ds.Generation ||
+		st.UpdatedNumberScheduled != st.DesiredNumberScheduled ||
+		st.NumberAvailable != st.DesiredNumberScheduled ||
+		st.NumberUnavailable != 0 {
+		return false, nil
+	}
+
+	// The counters alone are not enough: during a surge rollout a ready old
+	// Pod and an unready replacement on the same node can satisfy all of
+	// them. Require every live Pod the DaemonSet owns to run the
+	// native-origin template and be Ready.
+	return dataplanePodsNative(ctx, env, ds)
+}
+
+// dataplanePodsNative reports whether every non-terminating Pod owned by ds
+// carries the native-origin annotation and is Ready.
+func dataplanePodsNative(ctx context.Context, env *component.Env, ds *appsv1.DaemonSet) (bool, error) {
+	if ds.Spec.Selector == nil {
+		return false, nil
+	}
+
+	selector, err := metav1.LabelSelectorAsSelector(ds.Spec.Selector)
+	if err != nil {
+		return false, err
+	}
+
+	pods := &corev1.PodList{}
+	if err := env.LiveReader().List(ctx, pods, client.InNamespace(ds.Namespace), client.MatchingLabelsSelector{Selector: selector}); err != nil {
+		return false, err
+	}
+
+	for i := range pods.Items {
+		pod := &pods.Items[i]
+		if !ownedBy(pod, ds) {
+			continue
+		}
+
+		if pod.Annotations[nativeOriginAnnotation] != "true" {
+			// An old-revision Pod may still serve origin reads, even while
+			// terminating.
+			return false, nil
+		}
+
+		if pod.DeletionTimestamp != nil {
+			continue
+		}
+
+		if !podReady(pod) {
+			return false, nil
+		}
+	}
+
+	return true, nil
+}
+
+func ownedBy(pod *corev1.Pod, ds *appsv1.DaemonSet) bool {
+	for _, ref := range pod.OwnerReferences {
+		if ref.UID == ds.UID && ref.Controller != nil && *ref.Controller {
+			return true
+		}
+	}
+
+	return false
+}
+
+func podReady(pod *corev1.Pod) bool {
+	for _, c := range pod.Status.Conditions {
+		if c.Type == corev1.PodReady {
+			return c.Status == corev1.ConditionTrue
+		}
+	}
+
+	return false
+}
+
+// pruneOrigins deletes the origin DaemonSets and ServiceAccounts that this
+// operator created before the dataplane read origins in-process. Objects it
+// does not manage are left alone. Pruning waits for the native-origin
+// dataplane rollout; waiting reports that leftovers remain for that reason.
+func pruneOrigins(ctx context.Context, env *component.Env, plan *component.Plan) (waiting bool, err error) {
 	opts := []client.ListOption{client.InNamespace(env.Namespace), client.MatchingLabels{"app.kubernetes.io/component": originAppName}}
 
 	daemonSets := &appsv1.DaemonSetList{}
 	if err := env.LiveReader().List(ctx, daemonSets, opts...); err != nil {
-		return err
+		return false, err
 	}
 
 	accounts := &corev1.ServiceAccountList{}
 	if err := env.LiveReader().List(ctx, accounts, opts...); err != nil {
-		return err
+		return false, err
 	}
 
 	var stale []client.Object
@@ -528,32 +239,43 @@ func pruneOrigins(ctx context.Context, env *component.Env, plan *component.Plan,
 		stale = append(stale, sa)
 	}
 
+	var prunable []client.Object
+
 	for _, obj := range stale {
-		if !strings.HasPrefix(obj.GetName(), originPrefix) || wanted[obj.GetName()] {
+		if !strings.HasPrefix(obj.GetName(), originPrefix) {
 			continue
 		}
 
 		ok, err := adoptable(ctx, env, obj)
 		if err != nil {
-			return err
+			return false, err
 		}
 
-		if !ok {
-			continue
+		if ok {
+			prunable = append(prunable, obj)
 		}
+	}
 
+	if len(prunable) == 0 {
+		return false, nil
+	}
+
+	// Leftovers for deleted caches wait too: an old dataplane Pod may still
+	// hold the cache open until it is replaced.
+	done, err := nativeOriginRolledOut(ctx, env)
+	if err != nil {
+		return false, err
+	}
+
+	if !done {
+		return true, nil
+	}
+
+	for _, obj := range prunable {
 		op := component.DeleteOperation(obj, name, "")
 		op.FailureDomain = "racer-origin/" + strings.TrimPrefix(obj.GetName(), originPrefix)
 		plan.Add(op)
 	}
 
-	return nil
-}
-
-// escapeKubeArg escapes "$" as "$$" so kubelet does not expand "$(NAME)"
-// references in a container argument. The origin imports the credential
-// Secret through envFrom, so an unescaped reference in a user-controlled value
-// would let the Secret silently rewrite the argument.
-func escapeKubeArg(value string) string {
-	return strings.ReplaceAll(value, "$", "$$")
+	return false, nil
 }

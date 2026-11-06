@@ -532,6 +532,8 @@ fn same_name_new_uid_dials_replacement_without_reusing_old_keepalive() {
     replacement_listener.set_nonblocking(true).unwrap();
     publication.sequence.0 += 2; // The worker can skip the intervening removal.
     publication.caches[0].id = CacheId("55555555-5555-4555-8555-555555555555".into());
+    publication.pools = racer_control_wire::default_pools(&publication.caches);
+    publication.membership_version.0 += 1;
     let mut new_context = context();
     new_context.object.cache = publication.caches[0].id.clone();
     new_context.authorization =

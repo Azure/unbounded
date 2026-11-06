@@ -26,6 +26,7 @@ pub mod priority;
 pub mod profiling;
 pub mod rdma;
 pub mod read;
+pub mod remote;
 pub mod retention;
 pub mod runtime;
 pub mod security;

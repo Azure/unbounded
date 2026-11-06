@@ -402,7 +402,7 @@ impl ControlFixture {
         std::fs::write(&config.service_account_token, b"fixture.token").unwrap();
         let mut fixture = Self {
             bundle: Arc::new(Mutex::new(wire::KeyringBundle {
-                schema_version: 1,
+                schema_version: racer_control_wire::SCHEMA_VERSION,
                 cluster: config.cluster.clone(),
                 generation: wire::BundleGeneration(1),
                 peer_trust_roots: vec![ca.der().to_vec()],
@@ -671,6 +671,7 @@ pub(super) fn definition() -> racer_control_wire::CacheDefinition {
         origin_socket,
         priority: racer_control_wire::DEFAULT_PRIORITY,
         mode: racer_control_wire::CacheMode::Cached,
+        origin: None,
     }
 }
 
@@ -680,10 +681,12 @@ pub(super) fn publication(
     caches: Vec<racer_control_wire::CacheDefinition>,
 ) -> state::Publication {
     state::Publication {
-        schema_version: 1,
+        pools: Vec::new(),
+        schema_version: racer_control_wire::SCHEMA_VERSION,
         cluster: config.cluster.clone(),
         sequence: wire::PublicationSequence(sequence),
-        membership_version: racer_control_wire::MembershipVersion(1),
+        // Pools cover the caches, so each catalog takes its own version.
+        membership_version: racer_control_wire::MembershipVersion(sequence),
         members: vec![racer_control_wire::Member {
             node: config.node.clone(),
             shares: std::num::NonZeroU32::new(1).unwrap(),
@@ -693,6 +696,7 @@ pub(super) fn publication(
         }],
         caches,
     }
+    .with_default_pool()
 }
 
 pub(super) fn page(app: &WorkerApplication) -> crate::memory::PageResult {
@@ -1854,7 +1858,7 @@ fn two_worker_removal_preserves_late_driver_and_blocks_late_memory_and_disk_fill
     first
         .keys
         .install(wire::KeyringBundle {
-            schema_version: 1,
+            schema_version: racer_control_wire::SCHEMA_VERSION,
             cluster: config.cluster.clone(),
             generation: wire::BundleGeneration(2),
             peer_trust_roots: (*first.keys.peer_trust_roots().unwrap()).clone(),
@@ -1875,6 +1879,8 @@ fn two_worker_removal_preserves_late_driver_and_blocks_late_memory_and_disk_fill
     second.memory.publish(late1.clone()).unwrap();
     let adapter = CachePublication {
         proposal: RefCell::new(None),
+        local: None,
+        served: Rc::new(RefCell::new(None)),
         node: node.clone(),
         listeners: first.prepared_listeners.clone(),
         capacity: config.limits.metadata_entries.get(),
@@ -1912,6 +1918,7 @@ fn two_worker_removal_preserves_late_driver_and_blocks_late_memory_and_disk_fill
     }
     let rejected = adapter.stage(&[]).unwrap();
     let mut invalid = publication(&config, 2, vec![]);
+    invalid.membership_version.0 = 1;
     invalid.members[0].peer_endpoint = "127.0.0.1:7444".into();
     assert!(matches!(
         first.snapshots.apply_staged(invalid, Some(rejected)),
@@ -2539,6 +2546,7 @@ fn removal_publication_finishes_locally_after_controller_disappears() {
         origin_socket: "/run/racer/keep/origin/socket".into(),
         priority: racer_control_wire::DEFAULT_PRIORITY,
         mode: racer_control_wire::CacheMode::Cached,
+        origin: None,
     };
     *fixture.publication.lock().unwrap() =
         Some(publication(&config, 1, vec![definition(), keep.clone()]));
@@ -2564,7 +2572,7 @@ fn removal_publication_finishes_locally_after_controller_disappears() {
     worker
         .keys
         .install(wire::KeyringBundle {
-            schema_version: 1,
+            schema_version: racer_control_wire::SCHEMA_VERSION,
             cluster: config.cluster.clone(),
             generation: wire::BundleGeneration(2),
             peer_trust_roots: (*worker.keys.peer_trust_roots().unwrap()).clone(),
@@ -2954,7 +2962,7 @@ fn two_worker_real_control_key_lease_drain_and_checkpoint_cut() {
     };
     let roots = (*keys.peer_trust_roots().unwrap()).clone();
     keys.install(wire::KeyringBundle {
-        schema_version: 1,
+        schema_version: racer_control_wire::SCHEMA_VERSION,
         cluster: app.config.cluster.clone(),
         generation: wire::BundleGeneration(2),
         peer_trust_roots: roots.clone(),
@@ -2967,7 +2975,7 @@ fn two_worker_real_control_key_lease_drain_and_checkpoint_cut() {
     .unwrap();
     let lease = keys.lease(Some(&cache), key.id, KeyPurpose::Page).unwrap();
     keys.install(wire::KeyringBundle {
-        schema_version: 1,
+        schema_version: racer_control_wire::SCHEMA_VERSION,
         cluster: app.config.cluster.clone(),
         generation: wire::BundleGeneration(3),
         peer_trust_roots: roots,
@@ -3435,7 +3443,7 @@ fn real_control_bootstrap_recovery_publication_readiness_and_shutdown() {
     worker
         .keys
         .install(wire::KeyringBundle {
-            schema_version: 1,
+            schema_version: racer_control_wire::SCHEMA_VERSION,
             cluster: config.cluster.clone(),
             generation: wire::BundleGeneration(2),
             peer_trust_roots: roots.clone(),
@@ -3523,7 +3531,7 @@ fn real_control_bootstrap_recovery_publication_readiness_and_shutdown() {
     worker
         .keys
         .install(wire::KeyringBundle {
-            schema_version: 1,
+            schema_version: racer_control_wire::SCHEMA_VERSION,
             cluster: config.cluster.clone(),
             generation: wire::BundleGeneration(3),
             peer_trust_roots: roots,
@@ -4438,6 +4446,8 @@ mod cache_publication {
         let (mut second, _, _) = crate::app::tests::local_worker(&config, &node, 1);
         let adapter = CachePublication {
             proposal: RefCell::new(None),
+            local: None,
+            served: Rc::new(RefCell::new(None)),
             node: node.clone(),
             listeners: worker.prepared_listeners.clone(),
             capacity: config.limits.metadata_entries.get(),
@@ -4476,6 +4486,8 @@ mod cache_publication {
             .unwrap();
         let mut adapter = CachePublication {
             proposal: RefCell::new(None),
+            local: None,
+            served: Rc::new(RefCell::new(None)),
             node: node.clone(),
             listeners: Rc::new(RefCell::new(None)),
             capacity: 0,
@@ -4497,6 +4509,112 @@ mod cache_publication {
             store.cursor().unwrap(),
             Some(racer_control_wire::PublicationSequence(1))
         );
+    }
+
+    /// Sockets are bound only for caches whose pool has this node. Joining or
+    /// leaving the pool alone proposes again, so sockets follow membership.
+    #[test]
+    fn sockets_are_bound_only_on_pool_members_and_unbound_on_leave() {
+        use crate::topology::tests::pool_tests::{NARROW, pooled};
+        let config = crate::test_support::cluster::config(false);
+        let node = Arc::new(NodeState::default());
+        let (mut worker, _, _) = crate::app::tests::local_worker(&config, &node, 0);
+        let (mut second, _, _) = crate::app::tests::local_worker(&config, &node, 1);
+        let mut narrow = crate::app::tests::definition();
+        narrow.id = racer_control_wire::CacheId(NARROW.into());
+        let local = crate::topology::tests::fixtures::member(0, 4).node;
+        let adapter = CachePublication {
+            proposal: RefCell::new(None),
+            local: Some(local.clone()),
+            served: worker.served_caches.clone(),
+            node: node.clone(),
+            listeners: worker.prepared_listeners.clone(),
+            capacity: config.limits.metadata_entries.get(),
+        };
+        let outside = pooled(1, 4, vec![1, 2], None);
+        assert!(!outside.serves(&narrow.id, &local));
+        let definitions = std::slice::from_ref(&narrow);
+        assert!(matches!(
+            adapter.stage_for(definitions, Some(&outside)),
+            Err(Error::Unavailable)
+        ));
+        assert_eq!(
+            adapter.served.borrow().as_deref().map(Vec::as_slice),
+            Some(&[][..])
+        );
+        // The control worker prepares listeners for the served caches only.
+        let mut cx = Context::from_waker(futures::task::noop_waker_ref());
+        worker.poll_cache_preparation(&mut cx).unwrap();
+        second.poll_cache_preparation(&mut cx).unwrap();
+        assert_eq!(
+            worker
+                .prepared_listeners
+                .borrow()
+                .as_ref()
+                .unwrap()
+                .definitions(),
+            &[][..]
+        );
+        adapter
+            .stage_for(definitions, Some(&outside))
+            .unwrap()
+            .commit();
+        // Joining the pool, with the same definitions, proposes again.
+        let generation = adapter.proposal.borrow().as_ref().unwrap().0;
+        let inside = pooled(2, 4, vec![0, 1, 2], Some(&outside));
+        assert!(matches!(
+            adapter.stage_for(definitions, Some(&inside)),
+            Err(Error::Unavailable)
+        ));
+        assert_eq!(
+            adapter.proposal.borrow().as_ref().unwrap().0,
+            generation + 1
+        );
+        assert_eq!(
+            adapter.served.borrow().as_deref().map(Vec::as_slice),
+            Some(definitions)
+        );
+        // Leaving it proposes again without the cache.
+        let left = pooled(3, 4, vec![1, 2], Some(&inside));
+        assert!(matches!(
+            adapter.stage_for(definitions, Some(&left)),
+            Err(Error::Unavailable)
+        ));
+        assert_eq!(
+            adapter.served.borrow().as_deref().map(Vec::as_slice),
+            Some(&[][..])
+        );
+    }
+
+    /// Prefetch tickets of a cache are kept only while the cache is published
+    /// and this node is in its pool, so leaving the pool cancels them.
+    #[test]
+    fn prefetch_tickets_are_kept_only_on_pool_members() {
+        use crate::topology::tests::pool_tests::{NARROW, pooled};
+        let mut narrow = crate::app::tests::definition();
+        narrow.id = racer_control_wire::CacheId(NARROW.into());
+        let local = crate::topology::tests::fixtures::member(0, 4).node;
+        let snapshot = |membership: &Arc<crate::topology::Membership>| {
+            let mut snapshot = crate::control::Snapshot::membership_fixture(membership.clone());
+            snapshot.caches = vec![narrow.clone()];
+            snapshot
+        };
+        let inside = Arc::new(pooled(1, 4, vec![0, 1, 2], None));
+        assert!(crate::app::prefetch_keeps(
+            &snapshot(&inside),
+            &local,
+            &narrow.id
+        ));
+        let left = Arc::new(pooled(2, 4, vec![1, 2], Some(&inside)));
+        assert!(!crate::app::prefetch_keeps(
+            &snapshot(&left),
+            &local,
+            &narrow.id
+        ));
+        // A removed cache is not kept even on a pool member.
+        let mut removed = snapshot(&inside);
+        removed.caches.clear();
+        assert!(!crate::app::prefetch_keeps(&removed, &local, &narrow.id));
     }
 }
 

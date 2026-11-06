@@ -14,7 +14,8 @@ This guide sets up a Racer cache in front of an Azure Blob container. Your pods
 then read blobs from a local endpoint at `http://127.0.0.1:8080`. The first read
 of a blob fetches it from Azure. Later reads come from the cache.
 
-The cache runs on your existing nodes, so you need no extra cache servers.
+The cache runs on your existing nodes, so you need no extra cache servers. The
+Racer dataplane reads Azure itself, so there is no separate origin process.
 Racer splits each blob into 16 MiB pages. Each page is read from Azure only
 by its few owner nodes, even when every node reads it. Apps keep using the Azure Blob or S3 SDK they already use and change only
 settings: the endpoint, plus
@@ -67,11 +68,10 @@ Wait for the cache to start:
 
 ```bash
 kubectl -n unbounded-system rollout status daemonset/racer --timeout=5m
-kubectl -n unbounded-system rollout status daemonset/racer-origin-racer-object --timeout=5m
 ```
 
-If a command reports that the workload does not exist, wait a few seconds and
-run it again.
+If the command reports that the DaemonSet does not exist, wait a few seconds
+and run it again.
 
 Racer elects its control seats from the dataplane pods. There is no separate
 controller Deployment to wait for. To inspect the election, run:
@@ -87,9 +87,25 @@ role on the account or container. Then add a `credential` to
 `spec.origin.azure`. Pick one of the options below. SAS tokens and shared keys
 are not supported.
 
-**Workload identity.** Use this if the cluster runs the
-[Azure Workload Identity](https://azure.github.io/azure-workload-identity/)
-webhook:
+All caches on a node share one Racer pod, so the identity is set per cache but
+runs as that pod.
+
+**Managed identity on the nodes.** Racer gets a token from the node's Azure
+Instance Metadata Service (IMDS). Attach the identity to every Racer node. With
+one identity, `default: {}` is enough. With several user-assigned identities,
+pick one by client ID:
+
+```yaml
+    azure:
+      containerURL: https://ACCOUNT.blob.core.windows.net/CONTAINER
+      credential:
+        default:
+          clientID: 00000000-0000-0000-0000-000000000000
+```
+
+**Workload identity.** Racer exchanges a token for its own ServiceAccount,
+`racer` in the operator namespace, for a Microsoft Entra token. No webhook is
+needed.
 
 ```yaml
     azure:
@@ -97,47 +113,31 @@ webhook:
       credential:
         workloadIdentity:
           clientID: 00000000-0000-0000-0000-000000000000
+          tenantID: 00000000-0000-0000-0000-000000000000 # optional
 ```
 
-Then let the identity trust the cache's ServiceAccount, `racer-origin-racer-object`:
+Then let the identity trust the Racer ServiceAccount. Do this once per identity,
+not once per cache:
 
 ```bash
 az identity federated-credential create \
-  --name racer-origin-racer-object \
+  --name racer \
   --identity-name "$IDENTITY_NAME" \
   --resource-group "$RESOURCE_GROUP" \
   --issuer "$CLUSTER_OIDC_ISSUER" \
-  --subject system:serviceaccount:unbounded-system:racer-origin-racer-object \
+  --subject system:serviceaccount:unbounded-system:racer \
   --audience api://AzureADTokenExchange
 ```
 
-**Managed identity on the nodes.** Attach a user-assigned identity to every
-Racer node, then select it:
+If you upgrade from a version that ran a `racer-origin-<cache>` DaemonSet per
+cache, add this credential before you upgrade. See
+[Upgrading from per-cache origin DaemonSets]({{< relref "reference/racer" >}}#upgrading-from-per-cache-origin-daemonsets).
 
-```yaml
-      credential:
-        default:
-          clientID: 00000000-0000-0000-0000-000000000000
-```
-
-**Service principal.** Store its credentials in a Secret:
-
-```bash
-kubectl -n unbounded-system create secret generic racer-object-azure \
-  --from-literal=AZURE_TENANT_ID="$AZURE_TENANT_ID" \
-  --from-literal=AZURE_CLIENT_ID="$AZURE_CLIENT_ID" \
-  --from-literal=AZURE_CLIENT_SECRET="$AZURE_CLIENT_SECRET"
-```
-
-```yaml
-      credential:
-        default:
-          secretRef:
-            name: racer-object-azure
-```
+Any cache that names this identity can read what the identity can read.
+Limit who can create ClusterCaches accordingly.
 
 For all fields, see
-[Managed Azure origin]({{< relref "reference/racer" >}}#managed-azure-origin).
+[Azure origin]({{< relref "reference/racer" >}}#azure-origin).
 
 ## 2. Deploy an Application
 
@@ -223,7 +223,7 @@ a workload, run `kubectl describe` on the ReplicaSet, StatefulSet, or Job.
 
 ```bash
 kubectl -n racer-object-example logs racer-object-example -c racer-object
-kubectl -n unbounded-system logs daemonset/racer-origin-racer-object
+kubectl -n unbounded-system logs daemonset/racer
 ```
 
 Common errors:

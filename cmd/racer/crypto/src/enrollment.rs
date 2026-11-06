@@ -980,7 +980,7 @@ mod tests {
         customize(&mut csr.params);
         EnrollmentResponse {
             block_devices: None,
-            schema_version: 1,
+            schema_version: racer_control_wire::SCHEMA_VERSION,
             cluster: request.cluster.clone(),
             node: NodeId(NODE.into()),
             enrollment: request.enrollment.clone(),

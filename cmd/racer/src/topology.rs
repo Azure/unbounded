@@ -24,7 +24,7 @@ use std::time::Duration;
 use std::time::Instant;
 use uring_runtime::environment::Deadline;
 
-pub use ::topology::MAX_DEGREE;
+pub use ::topology::RDMA_PEERS;
 pub use ::topology::{Maintenance, SLOT_COUNT};
 
 // Application wire/hash schemas are independent of the topology implementation.
@@ -37,8 +37,10 @@ pub(crate) fn hash_bytes(hash: &mut Sha256, value: &[u8]) {
 
 // Immutable placement, authenticated routing, and worker-local endpoint circuits.
 
-/// Shared capacity bound for every supported topology, including first-hop masks.
-const _: () = assert!(MAX_DEGREE <= u64::BITS as usize);
+/// Default bound on tracked link failure records per worker. Mesh v2 degree
+/// grows with pool size (about 940 peers in a 100,000 member pool), so this
+/// is a generous fixed bound until capacities derive from the local peer count.
+pub const LINK_HEALTH_CAPACITY: usize = 4096;
 
 // Worker-local link circuits, distinct from process readiness and placement.
 pub struct LinkHealth {
@@ -47,12 +49,15 @@ pub struct LinkHealth {
     /// (`racer_core::liveness`). A ping carries the
     /// page of the last unanswered exchange.
     silence: std::cell::RefCell<Silence<NodeId, crate::model::PageId>>,
+    /// Destinations whose routes skip relays that left an exchange
+    /// unanswered (`racer_core::liveness::Detours`).
+    detours: std::cell::RefCell<racer_core::liveness::Detours<NodeId>>,
 }
 pub type LinkProbe<'a> = flow_control::Probe<'a, NodeId>;
 impl Default for LinkHealth {
     /// Construct independent worker-local circuit state for all possible neighbors.
     fn default() -> Self {
-        Self::new(MAX_DEGREE)
+        Self::new(LINK_HEALTH_CAPACITY)
     }
 }
 impl LinkHealth {
@@ -86,6 +91,9 @@ impl LinkHealth {
                 racer_core::liveness::HANG_AFTER,
                 SILENCE_PING_TIMEOUT,
             )),
+            detours: std::cell::RefCell::new(racer_core::liveness::Detours::new(
+                racer_core::liveness::SILENCE_CAPACITY,
+            )),
         }
     }
     /// Silence timing (`racer_core::liveness::Silence::new`):
@@ -104,7 +112,9 @@ impl LinkHealth {
         );
     }
     /// An exchange for `page` sent to `peer` at `sent` ended unanswered; see
-    /// `Silence::timed_out`. Returns whether a ping is wanted.
+    /// `Silence::timed_out`. Returns whether a ping is wanted. Later routes
+    /// to `peer` also detour around the relay that may have eaten it
+    /// (`Detours::timed_out`).
     pub fn silence_timed_out(
         &self,
         peer: &NodeId,
@@ -112,13 +122,15 @@ impl LinkHealth {
         sent: Instant,
         needed: u32,
     ) -> bool {
-        self.silence.borrow_mut().timed_out(
-            peer.clone(),
-            page,
-            sent,
-            uring_runtime::environment::now(),
-            needed,
-        )
+        let now = uring_runtime::environment::now();
+        self.detours.borrow_mut().timed_out(peer.clone(), sent, now);
+        self.silence
+            .borrow_mut()
+            .timed_out(peer.clone(), page, sent, now, needed)
+    }
+    /// Detour level for routes to `peer` (`Detours::level`).
+    pub fn detour_level(&self, peer: &NodeId, now: Instant) -> u8 {
+        self.detours.borrow().level(peer, now)
     }
     /// `peer` answered an exchange: it is not hung.
     pub fn silence_answered(&self, peer: &NodeId) {
@@ -263,6 +275,32 @@ pub struct Membership {
     pub(crate) inner: ::topology::Membership<Member>,
     retained_bytes: usize,
     rail_domain: Vec<racer_control_wire::RailId>,
+    /// Lazily computed RDMA peer sets, one per queried position.
+    pub(crate) rdma_edges: crate::rdma::RdmaEdges,
+    /// Published pools, in publication order.
+    pools: Vec<PoolView>,
+    /// Which entry of `pools` each published cache uses.
+    cache_pools: std::collections::HashMap<racer_control_wire::CacheId, usize>,
+}
+
+/// One published pool as placement sees it.
+#[derive(Debug)]
+struct PoolView {
+    id: Box<[u8]>,
+    /// The pool's members alone, without a mesh, for placement. `None` means
+    /// every member: placement then uses the full membership.
+    placement: Option<::topology::Membership<Member>>,
+}
+
+/// The pool a cache uses: who owns its pages and the mesh between them.
+#[derive(Clone, Copy)]
+pub(crate) struct CachePool<'a> {
+    /// Pool ID bytes; selects the per-pool placement cache.
+    pub(crate) id: &'a [u8],
+    /// Placement membership: positions index its own members.
+    pub(crate) members: &'a ::topology::Membership<Member>,
+    /// The pool's mesh; positions index the full membership.
+    pub(crate) mesh: Option<&'a ::topology::Pool>,
 }
 
 impl From<racer_control_wire::Member> for Member {
@@ -295,7 +333,30 @@ impl Membership {
     /// Validate application metadata and reuse ID-stable predecessor adjacency.
     pub(crate) fn validate_with_predecessor(
         version: MembershipVersion,
+        members: Vec<Member>,
+        old: Option<&Self>,
+    ) -> Result<Self> {
+        Self::build(version, members, None, old)
+    }
+
+    /// Validate a publication's members and pools. Every cache of a pool
+    /// places its pages over that pool's members only. A publication
+    /// without pools has no mesh.
+    pub(crate) fn validate_with_pools(
+        version: MembershipVersion,
+        members: Vec<Member>,
+        pools: Vec<racer_control_wire::Pool>,
+        old: Option<&Self>,
+    ) -> Result<Self> {
+        Self::build(version, members, Some(pools), old)
+    }
+
+    /// `pools: None` builds one default pool and maps no caches, so every
+    /// cache uses every member.
+    fn build(
+        version: MembershipVersion,
         mut members: Vec<Member>,
+        pools: Option<Vec<racer_control_wire::Pool>>,
         old: Option<&Self>,
     ) -> Result<Self> {
         if version.0 == 0 || members.len() > MAX_MEMBERS {
@@ -329,16 +390,181 @@ impl Membership {
                         + m.rails.iter().map(|r| r.device.capacity()).sum::<usize>()
                 })
                 .sum::<usize>();
+        let wire_pools = pools.unwrap_or_else(|| {
+            vec![racer_control_wire::Pool {
+                id: racer_control_wire::PoolId::default_pool(),
+                rank: 0,
+                members: None,
+                caches: Vec::new(),
+            }]
+        });
+        // Wire pool members index the members sorted by node ID.
+        let mut sorted: Vec<&Member> = members.iter().collect();
+        sorted.sort_unstable_by(|a, b| a.node.0.cmp(&b.node.0));
+        let mut specs = Vec::with_capacity(wire_pools.len());
+        let mut views = Vec::with_capacity(wire_pools.len());
+        let mut cache_pools = std::collections::HashMap::new();
+        for (index, pool) in wire_pools.into_iter().enumerate() {
+            let id: Box<[u8]> = pool.id.0.as_bytes().into();
+            let selected = match &pool.members {
+                None => None,
+                Some(indexes) => Some(
+                    indexes
+                        .iter()
+                        .map(|&i| {
+                            sorted
+                                .get(i as usize)
+                                .map(|m| (*m).clone())
+                                .ok_or(Error::InvalidConfiguration)
+                        })
+                        .collect::<Result<Vec<_>>>()?,
+                ),
+            };
+            for cache in pool.caches {
+                if cache_pools.insert(cache, index).is_some() {
+                    return Err(Error::InvalidConfiguration);
+                }
+            }
+            specs.push(::topology::PoolSpec {
+                id: id.clone(),
+                rank: pool.rank,
+                members: selected.as_ref().map(|selected| {
+                    selected
+                        .iter()
+                        .map(|m| Box::<[u8]>::from(m.node.0.as_bytes()))
+                        .collect()
+                }),
+            });
+            let placement = match selected {
+                None => None,
+                Some(selected) => {
+                    // Chain to the same pool's previous placement members, so
+                    // placement maintenance warms its demanded slots.
+                    let previous = old.map(|old| {
+                        old.pools
+                            .iter()
+                            .find(|view| view.id == id)
+                            .and_then(|view| view.placement.as_ref())
+                            .unwrap_or(&old.inner)
+                    });
+                    Some(
+                        match previous {
+                            Some(previous) => ::topology::Membership::with_pools_and_predecessor(
+                                selected,
+                                Vec::new(),
+                                previous,
+                            ),
+                            None => ::topology::Membership::with_pools(selected, Vec::new()),
+                        }
+                        .map_err(|_| Error::InvalidConfiguration)?,
+                    )
+                }
+            };
+            views.push(PoolView { id, placement });
+        }
+        let retained_bytes = retained_bytes
+            + views
+                .iter()
+                .map(|view| {
+                    std::mem::size_of::<PoolView>()
+                        + view.id.len()
+                        + view.placement.as_ref().map_or(0, |placement| {
+                            placement.retained_bytes()
+                                + placement
+                                    .members()
+                                    .iter()
+                                    .map(|m| m.node.0.capacity() + m.peer_endpoint.capacity())
+                                    .sum::<usize>()
+                        })
+                })
+                .sum::<usize>()
+            + cache_pools
+                .keys()
+                .map(|c| c.0.capacity() + 16)
+                .sum::<usize>();
         Ok(Self {
             version,
             inner: match old {
-                Some(old) => ::topology::Membership::new_with_predecessor(members, &old.inner),
-                None => ::topology::Membership::new(members),
+                Some(old) => {
+                    ::topology::Membership::with_pools_and_predecessor(members, specs, &old.inner)
+                }
+                None => ::topology::Membership::with_pools(members, specs),
             }
             .map_err(|_| Error::InvalidConfiguration)?,
             retained_bytes,
             rail_domain,
+            rdma_edges: Default::default(),
+            pools: views,
+            cache_pools,
         })
+    }
+
+    /// The pool `cache` uses. A cache no pool lists (fixtures without
+    /// published pools) uses every member.
+    pub(crate) fn cache_pool(&self, cache: &racer_control_wire::CacheId) -> CachePool<'_> {
+        match self.cache_pools.get(cache).map(|&i| &self.pools[i]) {
+            Some(view) => CachePool {
+                id: &view.id,
+                members: view.placement.as_ref().unwrap_or(&self.inner),
+                mesh: self.inner.pool(&view.id),
+            },
+            None => CachePool {
+                id: racer_control_wire::PoolId::DEFAULT.as_bytes(),
+                members: &self.inner,
+                mesh: self
+                    .inner
+                    .pool(racer_control_wire::PoolId::DEFAULT.as_bytes()),
+            },
+        }
+    }
+
+    /// Placement pools in publication order: ID and placement members.
+    fn placement_pools(&self) -> impl Iterator<Item = (&[u8], &::topology::Membership<Member>)> {
+        self.pools
+            .iter()
+            .map(|view| (&*view.id, view.placement.as_ref().unwrap_or(&self.inner)))
+    }
+
+    /// Whether `node` is a member of `cache`'s pool: it stores, serves, and
+    /// reads that cache.
+    pub fn serves(&self, cache: &racer_control_wire::CacheId, node: &NodeId) -> bool {
+        self.cache_pool(cache)
+            .members
+            .position(node.0.as_bytes())
+            .is_some()
+    }
+
+    /// Members of `cache`'s pool.
+    pub fn pool_size(&self, cache: &racer_control_wire::CacheId) -> usize {
+        self.cache_pool(cache).members.members().len()
+    }
+
+    /// Whether `a` and `b` are in the same column of `cache`'s pool mesh.
+    pub fn same_column(&self, cache: &racer_control_wire::CacheId, a: &NodeId, b: &NodeId) -> bool {
+        let (Some(a), Some(b)) = (
+            self.inner.position(a.0.as_bytes()),
+            self.inner.position(b.0.as_bytes()),
+        ) else {
+            return false;
+        };
+        self.cache_pool(cache)
+            .mesh
+            .is_some_and(|pool| pool.same_column(a, b))
+    }
+
+    /// The hot-key helper of `reader` for `cache` pages owned by `owner`: the
+    /// middle node of the reader's primary path in the cache's pool. `None`
+    /// if they share a column or either is not in the pool.
+    pub fn helper(
+        &self,
+        cache: &racer_control_wire::CacheId,
+        reader: &NodeId,
+        owner: &NodeId,
+    ) -> Option<NodeId> {
+        let reader = self.inner.position(reader.0.as_bytes())?;
+        let owner = self.inner.position(owner.0.as_bytes())?;
+        let helper = self.cache_pool(cache).mesh?.helper(reader, owner)?;
+        Some(self.members()[helper].node.clone())
     }
     /// Prepare bounded incremental ranking hints outside the publication lock.
     /// Larger changes use exact cooperative cold computation on demand.
@@ -406,9 +632,22 @@ fn valid_identity(value: &str) -> bool {
 /// Crate structural allocation estimate per cached ranking.
 pub const RANKING_BYTES: usize = ::topology::Placement::ENTRY_BYTES;
 
+/// Per-worker placement: one ranking cache per pool, with the memory budget
+/// split evenly between the pools of the newest membership. A page is ranked
+/// over its cache's pool members only.
 pub struct Placement {
-    inner: ::topology::Placement,
+    capacity: usize,
+    pools: std::cell::RefCell<PoolPlacements>,
 }
+
+/// Ranking caches by pool ID, sized for the newest membership seen.
+#[derive(Default)]
+struct PoolPlacements {
+    version: u64,
+    split: usize,
+    by_pool: Vec<(Box<[u8]>, Rc<::topology::Placement>)>,
+}
+
 #[derive(Clone, Debug)]
 pub struct Candidates {
     pub membership: std::sync::Arc<crate::topology::Membership>,
@@ -430,18 +669,12 @@ pub fn slot(object: &ObjectId, page: PageNumber) -> u32 {
     ::topology::slot::<Member>(&encoded_key(object, page))
 }
 
-fn candidates(
-    membership: std::sync::Arc<crate::topology::Membership>,
-    ranked: Vec<usize>,
-) -> Candidates {
-    let ordered = ranked
+/// Node IDs of positions in a pool's placement membership.
+fn nodes(pool: &::topology::Membership<Member>, ranked: Vec<usize>) -> Vec<NodeId> {
+    ranked
         .into_iter()
-        .map(|i| membership.members()[i].node.clone())
-        .collect();
-    Candidates {
-        membership,
-        ordered,
-    }
+        .map(|i| pool.members()[i].node.clone())
+        .collect()
 }
 
 fn placement_error(error: ::topology::Error) -> Error {
@@ -455,12 +688,42 @@ fn placement_error(error: ::topology::Error) -> Error {
 impl Placement {
     pub fn new(capacity: usize) -> Self {
         Self {
-            inner: ::topology::Placement::new(capacity),
+            capacity,
+            pools: Default::default(),
         }
     }
 
     pub fn with_memory_budget(bytes: usize) -> Self {
         Self::new(bytes / RANKING_BYTES)
+    }
+
+    /// The ranking cache of pool `id`. A newer membership resizes the split
+    /// when its pool count changes and drops caches of pools it no longer has.
+    fn pool(&self, membership: &Membership, id: &[u8]) -> Rc<::topology::Placement> {
+        let mut pools = self.pools.borrow_mut();
+        if pools.split == 0 || membership.version.0 > pools.version {
+            let split = membership.pools.len().max(1);
+            if split != pools.split {
+                pools.by_pool.clear();
+                pools.split = split;
+            } else {
+                pools
+                    .by_pool
+                    .retain(|(pool, _)| membership.pools.iter().any(|view| view.id == *pool));
+            }
+            pools.version = pools.version.max(membership.version.0);
+        }
+        if let Some((_, placement)) = pools.by_pool.iter().find(|(pool, _)| **pool == *id) {
+            return placement.clone();
+        }
+        let capacity = if self.capacity == 0 {
+            0
+        } else {
+            (self.capacity / pools.split).max(1)
+        };
+        let placement = Rc::new(::topology::Placement::new(capacity));
+        pools.by_pool.push((id.into(), placement.clone()));
+        placement
     }
 
     pub fn rank(
@@ -469,10 +732,16 @@ impl Placement {
         object: &ObjectId,
         page: PageNumber,
     ) -> Candidates {
-        let ranked = self
-            .inner
-            .rank(&membership.inner, &encoded_key(object, page));
-        candidates(membership, ranked)
+        let pool = membership.cache_pool(&object.cache);
+        let ordered = nodes(
+            pool.members,
+            self.pool(&membership, pool.id)
+                .rank(pool.members, &encoded_key(object, page)),
+        );
+        Candidates {
+            membership,
+            ordered,
+        }
     }
 
     /// Cache-only retention hint. Never starts or advances a cold ranking.
@@ -482,9 +751,16 @@ impl Placement {
         object: &ObjectId,
         page: PageNumber,
     ) -> Option<Candidates> {
-        self.inner
-            .cached(&membership.inner, &encoded_key(object, page))
-            .map(|ranked| candidates(membership, ranked))
+        let pool = membership.cache_pool(&object.cache);
+        let ordered = nodes(
+            pool.members,
+            self.pool(&membership, pool.id)
+                .cached(pool.members, &encoded_key(object, page))?,
+        );
+        Some(Candidates {
+            membership,
+            ordered,
+        })
     }
 
     /// Cache-only: members ranked just below the page's owners, best first,
@@ -495,12 +771,13 @@ impl Placement {
         object: &ObjectId,
         page: PageNumber,
     ) -> Vec<NodeId> {
-        self.inner
-            .demoted(&membership.inner, &encoded_key(object, page))
-            .unwrap_or_default()
-            .into_iter()
-            .map(|index| membership.members()[index].node.clone())
-            .collect()
+        let pool = membership.cache_pool(&object.cache);
+        nodes(
+            pool.members,
+            self.pool(membership, pool.id)
+                .demoted(pool.members, &encoded_key(object, page))
+                .unwrap_or_default(),
+        )
     }
 
     pub fn is_owner(
@@ -510,9 +787,10 @@ impl Placement {
         page: PageNumber,
         node: &NodeId,
     ) -> bool {
-        self.inner
-            .is_owner(&membership.inner, &encoded_key(object, page), |index| {
-                &membership.members()[index].node == node
+        let pool = membership.cache_pool(&object.cache);
+        self.pool(membership, pool.id)
+            .is_owner(pool.members, &encoded_key(object, page), |index| {
+                &pool.members.members()[index].node == node
             })
     }
 
@@ -523,9 +801,16 @@ impl Placement {
         object: &ObjectId,
         page: PageNumber,
     ) -> Option<Candidates> {
-        self.inner
-            .refresh(&membership.inner, &encoded_key(object, page))
-            .map(|ranked| candidates(membership, ranked))
+        let pool = membership.cache_pool(&object.cache);
+        let ordered = nodes(
+            pool.members,
+            self.pool(&membership, pool.id)
+                .refresh(pool.members, &encoded_key(object, page))?,
+        );
+        Some(Candidates {
+            membership,
+            ordered,
+        })
     }
 
     /// Reactor-friendly cold ranking. Concurrent requests for a resident slot
@@ -549,6 +834,7 @@ impl Placement {
         scope: Option<&'a crate::runtime::RequestScope>,
     ) -> Operation<'a, Candidates> {
         let key = encoded_key(object, page);
+        let cache = object.cache.clone();
         Box::pin(async move {
             if let Some(scope) = scope {
                 scope.check()?;
@@ -556,7 +842,9 @@ impl Placement {
             let cancellation = scope
                 .map(|scope| scope.cancellation.subscribe())
                 .transpose()?;
-            let mut ranking = std::pin::pin!(self.inner.rank_async(&membership.inner, &key));
+            let pool = membership.cache_pool(&cache);
+            let placement = self.pool(&membership, pool.id);
+            let mut ranking = std::pin::pin!(placement.rank_async(pool.members, &key));
             let ranked = std::future::poll_fn(|cx| {
                 if let Some(scope) = scope {
                     if let Some(cancellation) = &cancellation {
@@ -574,17 +862,31 @@ impl Placement {
                 result
             })
             .await?;
-            Ok(candidates(membership.clone(), ranked))
+            Ok(Candidates {
+                ordered: nodes(pool.members, ranked),
+                membership: membership.clone(),
+            })
         })
     }
 
-    /// Warm only already-demanded predecessor slots. Each turn hashes at most
-    /// one cold quantum or visits one retained key, with no full-cache sweep.
+    /// Warm only already-demanded predecessor slots, one pool at a time.
+    /// Each turn hashes at most one cold quantum or visits one retained key
+    /// per pool, with no full-cache sweep.
     pub fn maintain(
         &self,
         membership: &std::sync::Arc<crate::topology::Membership>,
     ) -> Maintenance {
-        self.inner.maintain(&membership.inner)
+        let mut result = Maintenance::Idle;
+        for (id, members) in membership.placement_pools() {
+            match self.pool(membership, id).maintain(members) {
+                Maintenance::Progress => result = Maintenance::Progress,
+                Maintenance::Blocked if result == Maintenance::Idle => {
+                    result = Maintenance::Blocked;
+                }
+                _ => {}
+            }
+        }
+        result
     }
 }
 
@@ -718,6 +1020,10 @@ impl Paths {
     /// able to reach the peer it holds silent. Circuit
     /// health and peer admission still apply, and silent intermediate
     /// neighbors are still routed around.
+    ///
+    /// Routes skip the relays from `Membership::detour` at this worker's
+    /// detour level for the destination (`LinkHealth::detour_level`); a ping
+    /// uses at least level 1, so it takes the alternate relay.
     pub fn shortest_probe_async<'a>(
         &'a self,
         membership: std::sync::Arc<crate::topology::Membership>,
@@ -744,6 +1050,17 @@ impl Paths {
                 .collect::<Result<Vec<_>>>()?;
             let exempt = ping.then_some(&budget.destination);
             let blocked = self.blocked(&membership, source, exempt)?;
+            // Skip relays that may have eaten earlier exchanges with the
+            // destination. A ping always detours: it must not cross the
+            // primary relay that may have eaten the exchanges it follows up.
+            let mut level = self
+                .health
+                .detour_level(&budget.destination, uring_runtime::environment::now());
+            if ping {
+                level = level.max(1);
+            }
+            let mut hint = blocked.clone();
+            hint.extend(membership.inner.detour(source, to, level));
             let mut seed = [0; 32];
             seed[..16].copy_from_slice(&budget.request.0);
             seed[16..].copy_from_slice(&budget.attempt.0);
@@ -753,7 +1070,7 @@ impl Paths {
                     to,
                     links: budget.remaining_links,
                     visited: &visited,
-                    blocked: &blocked,
+                    blocked: &hint,
                     seed: &seed,
                 };
                 let mut operation = std::pin::pin!(self.inner.route(&membership.inner, query));
@@ -892,11 +1209,11 @@ pub(crate) mod tests {
         use std::num::NonZeroU32;
         use std::sync::Arc;
 
-        // Fixed next-hop vectors for the 32-ring overlay.
+        // Fixed next-hop vectors for the mesh v2 default pool.
         // N=1500, source=0, destination=1499, request=[1;16]; weights 1 at
         // multiples of 3 and 4 elsewhere; attempts encoded as big-endian u128.
-        pub(crate) const NEXT_HOPS: [(u128, usize); 4] =
-            [(0, 1301), (1, 1301), (2, 251), (127, 251)];
+        // The primary delegate is unique, so every attempt picks it.
+        pub(crate) const NEXT_HOPS: [(u128, usize); 4] = [(0, 350), (1, 350), (2, 350), (127, 350)];
 
         pub(crate) fn member(index: usize, shares: u32) -> Member {
             Member {
@@ -1053,23 +1370,23 @@ pub(crate) mod tests {
             assert_eq!(health.tracked_links(), 0);
         }
         #[test]
-        fn default_tracks_all_64_neighbors_without_eviction() {
+        fn default_tracks_link_health_capacity_without_eviction() {
             let health = LinkHealth::default();
             let independent = LinkHealth::default();
             let now = Instant::now();
-            for i in 0..64 {
+            for i in 0..LINK_HEALTH_CAPACITY {
                 health
                     .observe_at(&NodeId(format!("peer-{i}")), LinkOutcome::Timeout, now)
                     .unwrap();
             }
-            assert_eq!(health.tracked_links(), 64);
+            assert_eq!(health.tracked_links(), LINK_HEALTH_CAPACITY);
             assert_eq!(independent.tracked_links(), 0);
             assert!(
                 independent
                     .available_at(&NodeId("peer-0".into()), now)
                     .unwrap()
             );
-            for i in 0..64 {
+            for i in 0..LINK_HEALTH_CAPACITY {
                 assert!(
                     !health
                         .available_at(&NodeId(format!("peer-{i}")), now)
@@ -1118,6 +1435,183 @@ pub(crate) mod tests {
                     .collect();
                 assert_eq!(actual, expected);
             }
+        }
+    }
+
+    pub(crate) mod pool_tests {
+        use super::*;
+        use crate::model::{CacheKey, PageNumber};
+        use crate::topology::tests::fixtures::member;
+        use racer_control_wire::{Pool, PoolId};
+
+        pub(crate) const NARROW: &str = "44444444-4444-4444-8444-444444444444";
+        const SELECTED: &str = "sel-0123456789abcdef0123456789abcdef";
+
+        fn cache(name: &str) -> CacheId {
+            CacheId(name.into())
+        }
+
+        /// `count` members; cache `wide` uses the default pool and cache
+        /// `narrow` the selector pool of `selected` member indexes.
+        pub(crate) fn pooled(
+            version: u64,
+            count: usize,
+            selected: Vec<u32>,
+            old: Option<&Membership>,
+        ) -> Membership {
+            Membership::validate_with_pools(
+                MembershipVersion(version),
+                (0..count).map(|i| member(i, 4)).collect(),
+                vec![
+                    Pool {
+                        id: PoolId::default_pool(),
+                        rank: 0,
+                        members: None,
+                        caches: vec![cache("wide")],
+                    },
+                    Pool {
+                        id: PoolId(SELECTED.into()),
+                        rank: 1 << 32,
+                        members: Some(selected),
+                        caches: vec![cache(NARROW)],
+                    },
+                ],
+                old,
+            )
+            .unwrap()
+        }
+
+        fn object(name: &str, key: u8) -> ObjectId {
+            ObjectId {
+                cache: cache(name),
+                key: CacheKey([key; 32]),
+            }
+        }
+
+        #[test]
+        fn selector_pool_pages_are_owned_only_by_pool_members() {
+            let selected: Vec<u32> = vec![1, 4, 7, 9, 12, 15, 18];
+            let membership = Arc::new(pooled(1, 20, selected.clone(), None));
+            let inside: Vec<NodeId> = selected
+                .iter()
+                .map(|&i| member(i as usize, 4).node)
+                .collect();
+            let placement = Placement::new(64);
+            let mut outside_default = false;
+            for key in 0..64 {
+                let narrow =
+                    placement.rank(membership.clone(), &object(NARROW, key), PageNumber(0));
+                assert_eq!(narrow.ordered.len(), 3);
+                assert!(narrow.ordered.iter().all(|node| inside.contains(node)));
+                for node in &narrow.ordered {
+                    assert!(placement.is_owner(
+                        &membership,
+                        &object(NARROW, key),
+                        PageNumber(0),
+                        node
+                    ));
+                }
+                let wide = placement.rank(membership.clone(), &object("wide", key), PageNumber(0));
+                outside_default |= wide.ordered.iter().any(|node| !inside.contains(node));
+            }
+            assert!(outside_default, "the default pool ranks every member");
+            assert!(membership.serves(&cache(NARROW), &inside[0]));
+            assert!(!membership.serves(&cache(NARROW), &member(0, 4).node));
+            assert!(membership.serves(&cache("wide"), &member(0, 4).node));
+            assert_eq!(membership.pool_size(&cache(NARROW)), selected.len());
+            assert_eq!(membership.pool_size(&cache("wide")), 20);
+            // Async ranking agrees with the synchronous one.
+            let ranked = futures::executor::block_on(placement.rank_async(
+                membership.clone(),
+                &object(NARROW, 3),
+                PageNumber(0),
+            ))
+            .unwrap();
+            assert!(ranked.ordered.iter().all(|node| inside.contains(node)));
+        }
+
+        #[test]
+        fn an_empty_pool_has_no_owners() {
+            let membership = Arc::new(pooled(1, 8, vec![], None));
+            let placement = Placement::new(8);
+            let ranked = placement.rank(membership.clone(), &object(NARROW, 1), PageNumber(0));
+            assert!(ranked.ordered.is_empty());
+            assert!(!membership.serves(&cache(NARROW), &member(0, 4).node));
+            assert_eq!(placement.maintain(&membership), Maintenance::Idle);
+        }
+
+        #[test]
+        fn pool_membership_changes_follow_the_publication() {
+            let old = pooled(1, 20, vec![0, 1, 2], None);
+            let next = pooled(2, 20, vec![1, 2, 3], Some(&old));
+            let joined = member(3, 4).node;
+            let left = member(0, 4).node;
+            assert!(!old.serves(&cache(NARROW), &joined));
+            assert!(next.serves(&cache(NARROW), &joined));
+            assert!(old.serves(&cache(NARROW), &left));
+            assert!(!next.serves(&cache(NARROW), &left));
+            let placement = Placement::new(64);
+            let next = Arc::new(next);
+            for key in 0..16 {
+                let ranked = placement.rank(next.clone(), &object(NARROW, key), PageNumber(0));
+                assert!(!ranked.ordered.contains(&left));
+            }
+        }
+
+        #[test]
+        fn unlisted_caches_use_every_member() {
+            let membership = Arc::new(pooled(1, 10, vec![2], None));
+            let placement = Placement::new(8);
+            let ranked = placement.rank(membership.clone(), &object("other", 1), PageNumber(0));
+            assert_eq!(ranked.ordered.len(), 3);
+            assert_eq!(membership.pool_size(&cache("other")), 10);
+        }
+
+        #[test]
+        fn helpers_are_primary_delegates_and_column_mates_are_exempt() {
+            // 300 members in one selector pool: more than one column.
+            let selected: Vec<u32> = (0..300).collect();
+            let membership = pooled(1, 320, selected, None);
+            let narrow = cache(NARROW);
+            let pool = membership.cache_pool(&narrow).mesh.unwrap();
+            assert!(pool.columns() > 1);
+            let node = |p: usize| membership.members()[p].node.clone();
+            let mut checked = 0;
+            for reader in 0..40 {
+                for owner in [100, 200, 299] {
+                    let (r, o) = (node(reader), node(owner));
+                    let r_pos = membership.position(&r).unwrap();
+                    let o_pos = membership.position(&o).unwrap();
+                    if pool.same_column(r_pos, o_pos) {
+                        assert!(membership.same_column(&narrow, &o, &r));
+                        assert_eq!(membership.helper(&narrow, &r, &o), None);
+                        continue;
+                    }
+                    assert!(!membership.same_column(&narrow, &o, &r));
+                    let helper = membership.helper(&narrow, &r, &o).unwrap();
+                    if helper == o {
+                        // The reader's delegate is the owner: they are linked.
+                        assert!(membership.is_neighbor(&r, &o));
+                        continue;
+                    }
+                    let h_pos = membership.position(&helper).unwrap();
+                    assert_eq!(
+                        Some(h_pos),
+                        pool.delegate(r_pos, pool.column(o_pos).unwrap())
+                    );
+                    // The helper is one hop from both and in the owner's column,
+                    // so the owner never sheds it.
+                    assert!(membership.is_neighbor(&r, &helper));
+                    assert!(membership.is_neighbor(&helper, &o));
+                    assert!(membership.same_column(&narrow, &o, &helper));
+                    checked += 1;
+                }
+            }
+            assert!(checked > 0);
+            // Members outside the pool have no helper and no column.
+            let outsider = node(310);
+            assert_eq!(membership.helper(&narrow, &outsider, &node(5)), None);
+            assert!(!membership.same_column(&narrow, &node(5), &outsider));
         }
     }
 
@@ -1241,6 +1735,9 @@ pub(crate) mod tests {
                     + membership.inner.retained_bytes()
                     + membership.rail_domain.capacity() * std::mem::size_of::<RailId>()
                     + nested
+                    // The default pool view: no separate placement members.
+                    + std::mem::size_of::<PoolView>()
+                    + racer_control_wire::PoolId::DEFAULT.len()
             );
         }
 
@@ -1682,12 +2179,66 @@ pub(crate) mod tests {
                 ping,
             ))
         }
+        /// A route to a non-neighbor takes the primary relay until an
+        /// exchange with the destination goes unanswered, then the disjoint
+        /// alternate relay, then neither. A ping always skips the primary
+        /// relay, and the destination is never marked silent by the detour.
+        #[test]
+        fn timeouts_detour_routes_and_pings_around_the_primary_relay() {
+            let members = membership(1500);
+            let source = &members.members()[0].node;
+            let to = 1499;
+            assert!(!members.inner.is_neighbor(0, to));
+            let pool = &members.inner.pools()[0];
+            let primary = &members.members()[pool.primary(0, to).unwrap()].node;
+            let alternate = &members.members()[pool.alternate(0, to).unwrap()].node;
+            assert_ne!(primary, alternate);
+            let destination = &members.members()[to].node;
+            let health = Rc::new(LinkHealth::default());
+            let paths = Paths::new(health.clone(), 8);
+            let request = budget(&members, to, NORMAL_LINKS);
+            let route = |ping| probe(&paths, &members, source, &request, ping).unwrap();
+            assert_eq!(route(false).nodes[1], *primary);
+            assert_eq!(route(true).nodes[1], *alternate);
+            assert_eq!(route(true).nodes.len(), 3);
+            let page = crate::model::PageId {
+                version: crate::model::ObjectVersion {
+                    object: crate::topology::tests::fixtures::object(),
+                    etag: crate::model::StrongEtag::test_value("v"),
+                },
+                number: PageNumber(0),
+            };
+            let sent = Instant::now() - Duration::from_secs(5);
+            health.silence_timed_out(
+                destination,
+                page.clone(),
+                sent,
+                racer_core::liveness::NO_PING,
+            );
+            assert_eq!(route(false).nodes[1], *alternate);
+            assert_eq!(route(true).nodes[1], *alternate);
+            assert!(!health.silent(destination));
+            // An exchange sent on the detour also went unanswered: skip both.
+            health.silence_timed_out(
+                destination,
+                page,
+                Instant::now(),
+                racer_core::liveness::NO_PING,
+            );
+            for ping in [false, true] {
+                let nodes = route(ping).nodes;
+                assert!(!nodes.contains(primary) && !nodes.contains(alternate));
+                assert!(nodes.len() <= 4);
+                assert_eq!(nodes.last(), Some(destination));
+            }
+        }
         /// An origin's recovery ping to a neighbor it holds
         /// silent goes over the direct link; other requests route around it,
         /// and an open circuit or a silent intermediate still blocks.
         #[test]
         fn a_ping_reaches_the_silent_neighbor_it_tests() {
-            let members = membership(64);
+            // Above the 64 member full mesh, so a non-neighbor exists.
+            let members = membership(200);
             let source = &members.members()[0].node;
             let neighbors = members.neighbors(source).unwrap();
             let target = neighbors[0].clone();
