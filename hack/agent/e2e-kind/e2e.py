@@ -935,14 +935,12 @@ def bpffs_sentinel_script() -> str:
     stack. A directory is a bpffs object of its own, so this needs neither
     bpftool (the node image ships only the kernel-versioned wrapper, which
     fails on a host whose kernel has no matching linux-tools) nor any BPF
-    program."""
-    return textwrap.dedent(f"""\
-        set -e
-        mountpoint -q /sys/fs/bpf
-        rm -rf /sys/fs/bpf/{BPFFS_SENTINEL}
-        mkdir /sys/fs/bpf/{BPFFS_SENTINEL}
-        test -d /sys/fs/bpf/{BPFFS_SENTINEL}
-    """)
+    program. It is one line: machine_shell passes the command through
+    json.dumps inside double quotes, where a newline would reach the shell as
+    a literal backslash-n."""
+    sentinel = f"/sys/fs/bpf/{BPFFS_SENTINEL}"
+    return (f"mountpoint -q /sys/fs/bpf && rm -rf {sentinel} && "
+            f"mkdir {sentinel} && test -d {sentinel}")
 
 
 def create_bpffs_sentinel(machine: str) -> None:
