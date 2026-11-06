@@ -15,6 +15,8 @@ use page_alloc::Extent;
 use page_alloc::Generation;
 use page_alloc::SegmentId;
 use page_alloc::Segments;
+use page_alloc::disk_index::HoldId;
+use page_alloc::disk_index::PageSlot;
 use racer_wire::control::KeyId;
 use std::cell::Cell;
 use std::cell::RefCell;
@@ -503,24 +505,31 @@ impl Index {
         let Some(hold) = holds.entries.get_mut(version) else {
             return;
         };
-        let mut gone = Vec::new();
+        // Batch the released slots per disk hold so each hold is touched once.
+        let mut released: Vec<(HoldId, PageSlot)> = Vec::new();
         for number in numbers {
-            let Some(holder) = hold.holders.remove(number) else {
-                continue;
-            };
-            let id = holder.since.0;
-            if !state.pages.release_hold_slot(id, holder.slot) {
-                hold.ids.retain(|held| *held != id);
+            if let Some(holder) = hold.holders.remove(number) {
+                released.push((holder.since.0, holder.slot));
+            }
+        }
+        released.sort_unstable();
+        let slots: Vec<PageSlot> = released.iter().map(|(_, slot)| *slot).collect();
+        let mut gone = Vec::new();
+        let mut start = 0;
+        while start < released.len() {
+            let id = released[start].0;
+            let end = start + released[start..].partition_point(|(held, _)| *held == id);
+            if !state.pages.release_hold_slots(id, &slots[start..end]) {
                 gone.push(id);
             }
+            start = end;
+        }
+        if !gone.is_empty() {
+            hold.ids.retain(|held| gone.binary_search(held).is_err());
         }
         let holders = &hold.holders;
         let before = hold.pages.len();
-        hold.pages = hold
-            .pages
-            .iter()
-            .filter(|page| holders.contains_key(page))
-            .collect();
+        hold.pages.retain(|page| holders.contains_key(&page));
         let removed = before - hold.pages.len();
         let empty = hold.pages.is_empty();
         holds.members -= removed;
@@ -1825,6 +1834,46 @@ mod tests {
         assert_eq!(index.hold_expiry(&version), None);
         index.release_hold_pages(&version, &page_set(&[2]), epoch);
         assert_eq!(index.hold_expiry(&version), None);
+    }
+
+    #[test]
+    fn release_hold_pages_batches_across_reservations() {
+        let env = racer_io::Env::host();
+        let segments = Rc::new(segments(1024, 64));
+        let index = Rc::new(index(&env, 64));
+        index.set_page_capacity(64).unwrap();
+        let _clock = SegmentClock::new(index.clone(), segments.clone(), 1);
+        let (page, entry) = indexed(descriptor("batched", 17), 0);
+        drop(segments.append(1024).unwrap());
+        index.publish(page.clone(), entry).unwrap();
+        let version = page.version.clone();
+        let at = |number| PageId {
+            version: version.clone(),
+            number: crate::model::PageNumber(number),
+        };
+        let until = racer_io::Clock::host().wall_now() + std::time::Duration::from_secs(60);
+        // Two reservations add members under two disk holds.
+        let first = index
+            .reserve_hold_pages(&version, &page_set(&[0, 1, 2, 3]), until)
+            .unwrap();
+        let second = index
+            .reserve_hold_pages(&version, &page_set(&[4, 5, 6]), until)
+            .unwrap();
+        assert!(second > first);
+        // One release spans both disk holds and empties the first.
+        index.release_hold_pages(&version, &page_set(&[0, 1, 2, 3, 5]), second);
+        for number in [0, 1, 2, 3, 5] {
+            assert!(!index.is_held(&at(number)), "page {number}");
+        }
+        for number in [4, 6] {
+            assert_eq!(index.hold_holders(&at(number)), 1);
+        }
+        assert!(index.can_evict(SegmentId(0)));
+        assert!(index.hold_expiry(&version).is_some());
+        // Releasing the rest removes the entry.
+        index.release_hold_pages(&version, &page_set(&[4, 6]), second);
+        assert_eq!(index.hold_expiry(&version), None);
+        assert_eq!(index.hold_epoch(&version), None);
     }
 
     #[test]

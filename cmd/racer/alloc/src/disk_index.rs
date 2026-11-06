@@ -1033,14 +1033,36 @@ impl DiskIndex {
     /// An emptied hold is removed.
     pub fn release_hold_slots(&mut self, id: HoldId, slots: &[PageSlot]) -> Result<()> {
         let hold = self.holds.get_mut(&id).ok_or(Error::Stale)?;
+        // `hold.slots` is sorted and deduplicated; sort the request too so
+        // membership is a binary search instead of a linear scan per slot.
+        let sorted;
+        let slots = if slots.is_sorted() {
+            slots
+        } else {
+            sorted = {
+                let mut copy = slots.to_vec();
+                copy.sort_unstable();
+                copy
+            };
+            &sorted
+        };
         let mut released = Vec::new();
-        hold.slots.retain(|slot| {
-            let keep = !slots.contains(slot);
-            if !keep {
-                released.push(*slot);
+        if slots.len() < hold.slots.len() / 8 {
+            // Few slots: locate each one instead of scanning the whole hold.
+            for slot in slots {
+                if let Ok(at) = hold.slots.binary_search(slot) {
+                    released.push(hold.slots.remove(at));
+                }
             }
-            keep
-        });
+        } else {
+            hold.slots.retain(|slot| {
+                let keep = slots.binary_search(slot).is_err();
+                if !keep {
+                    released.push(*slot);
+                }
+                keep
+            });
+        }
         if hold.slots.is_empty() {
             let until = hold.until;
             self.holds.remove(&id);
@@ -1665,6 +1687,42 @@ mod tests {
         assert_eq!(index.expire_holds(Monotonic(200), 8), 1);
         assert_eq!(index.holds_unused(), 0);
         assert_eq!(index.release_hold(hold), Err(Error::Stale));
+        index.check_invariants();
+    }
+
+    #[test]
+    fn release_hold_slots_batches_unsorted_and_sparse_requests() {
+        let mut index = DiskIndex::new(64, 64, 4).unwrap();
+        let all: Vec<PageSlot> = (0..32).map(PageSlot).collect();
+        let hold = index.hold(&all, Monotonic(100), Monotonic(0)).unwrap();
+        assert_eq!(index.holds_unused(), 32);
+        // Sparse request (binary search path), unsorted, with duplicates and
+        // slots the hold does not cover.
+        index
+            .release_hold_slots(hold, &[PageSlot(9), PageSlot(2), PageSlot(9), PageSlot(40)])
+            .unwrap();
+        assert_eq!(index.holds_unused(), 30);
+        assert!(!index.is_held(PageSlot(2)));
+        assert!(!index.is_held(PageSlot(9)));
+        assert!(index.is_held(PageSlot(3)));
+        let left = index.hold_slots(hold).unwrap();
+        assert_eq!(left.len(), 30);
+        assert!(left.is_sorted());
+        // Dense unsorted request (retain path) leaves one slot.
+        let mut rest: Vec<PageSlot> = left.iter().copied().filter(|s| s.0 != 31).collect();
+        rest.reverse();
+        index.release_hold_slots(hold, &rest).unwrap();
+        assert_eq!(index.hold_slots(hold), Some(&[PageSlot(31)][..]));
+        assert_eq!(index.holds_unused(), 1);
+        // Emptying the hold removes it and its expiry entry.
+        index.release_hold_slots(hold, &[PageSlot(31)]).unwrap();
+        assert_eq!(index.hold_slots(hold), None);
+        assert_eq!(index.next_hold_expiry(), None);
+        assert_eq!(index.holds_unused(), 0);
+        assert_eq!(
+            index.release_hold_slots(hold, &[PageSlot(31)]),
+            Err(Error::Stale)
+        );
         index.check_invariants();
     }
 

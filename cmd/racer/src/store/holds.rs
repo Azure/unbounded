@@ -62,6 +62,11 @@ impl HoldPages {
         }
     }
 
+    /// Keep only the pages for which `keep` returns true.
+    pub fn retain(&mut self, mut keep: impl FnMut(PageNumber) -> bool) {
+        self.0.retain(|page| keep(*page));
+    }
+
     /// Sorted merge of two page sets.
     pub fn union(&self, other: &Self) -> Self {
         let mut merged = Vec::with_capacity(self.0.len() + other.0.len());

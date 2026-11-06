@@ -618,14 +618,16 @@ impl Pages {
     }
 
     /// Drop `slot` from hold `id`. Returns whether the hold still exists.
-    pub fn release_hold_slot(&mut self, id: HoldId, slot: PageSlot) -> bool {
+    pub fn release_hold_slots(&mut self, id: HoldId, slots: &[PageSlot]) -> bool {
         let Some(inner) = self.inner.as_mut() else {
             return false;
         };
         let mut disk = inner.disk.borrow_mut();
-        // A released or expired hold has already dropped the slot.
-        let _ = disk.release_hold_slots(id, &[slot]);
-        inner.slots.release_unused(&disk, slot);
+        // A released or expired hold has already dropped the slots.
+        let _ = disk.release_hold_slots(id, slots);
+        for slot in slots {
+            inner.slots.release_unused(&disk, *slot);
+        }
         disk.hold_deadline(id).is_some()
     }
 
