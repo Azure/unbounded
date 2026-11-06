@@ -920,7 +920,8 @@ impl RangeStream {
                     page,
                     budget,
                     sealed: _,
-                } => self.start_fetch(id, PageNumber(page), budget.build(), scope),
+                    retry,
+                } => self.start_fetch(id, PageNumber(page), budget.build(), retry, scope),
                 win::Effect::Select {
                     id,
                     intervals,
@@ -1009,41 +1010,41 @@ impl RangeStream {
         id: EffectId,
         number: PageNumber,
         budget: AcquisitionBudget,
+        retry: u8,
         scope: &RequestScope,
     ) {
         let mut child_scope = scope.clone();
         child_scope.deadline.0 = budget.deadline();
+        let reactor = self.delivery.reactor().clone();
         let page = self.page_id(number);
-        let started = match &self.sealed {
-            Some(target) => self
-                .directory
-                .start_page_sealed(
+        let io = match &self.sealed {
+            Some(target) => Io::FetchSealed(with_backoff(
+                reactor,
+                scope.clone(),
+                retry,
+                self.directory.start_page_sealed(
                     page,
                     self.membership.clone(),
                     &self.context,
                     &child_scope,
                     budget,
                     target.clone(),
-                )
-                .map(Io::FetchSealed),
-            None => self
-                .directory
-                .start_page(
+                ),
+            )),
+            None => Io::Fetch(with_backoff(
+                reactor,
+                scope.clone(),
+                retry,
+                self.directory.start_page(
                     page,
                     self.membership.clone(),
                     &self.context,
                     &child_scope,
                     budget,
-                )
-                .map(Io::Fetch),
+                ),
+            )),
         };
-        match started {
-            Ok(io) => self.io.push((id, io)),
-            Err(error) => {
-                let result = Err(self.core_error(number.0, error));
-                self.inputs.push_back(win::Input::Fetched { id, result });
-            }
-        }
+        self.io.push((id, io));
     }
 
     /// Select pages from a peer provider. A selection that cannot start leaves
@@ -1664,6 +1665,40 @@ impl RangeStream {
             racer_core::subscriptions::MAX_DEMAND_INTERVALS,
         )
     }
+}
+
+/// Whether the window restarts a fill that failed with `error` (while its
+/// retries last); see [`win::PAGE_RETRIES`].
+fn restarted(error: Error) -> bool {
+    matches!(
+        error,
+        Error::Overloaded | Error::FlightFull | Error::Unavailable
+    )
+}
+
+/// Hold a restartable fill failure for the next restart's backoff before the
+/// window sees it, so pressure that other reads relieve is waited out rather
+/// than retried in a tight loop. A fill that could not start fails the same way.
+fn with_backoff<T: 'static>(
+    reactor: Rc<crate::runtime::Reactor>,
+    scope: RequestScope,
+    retry: u8,
+    started: Result<Operation<'static, T>>,
+) -> Operation<'static, T> {
+    Box::pin(async move {
+        let result = match started {
+            Ok(operation) => operation.await,
+            Err(error) => Err(error),
+        };
+        if let Err(error) = &result
+            && restarted(*error)
+        {
+            let until = scope.clock().now() + win::retry_delay(retry.saturating_add(1));
+            // A canceled or expired scope ends the read; the window sees that.
+            let _ = reactor.sleep_until(until, &scope).await;
+        }
+        result
+    })
 }
 
 /// How a slot shows in the scheduler: wanted, busy, both or neither.
@@ -2390,7 +2425,7 @@ pub(super) mod tests {
         stream
     }
     /// Sealed (GPU) fills retry `Overloaded` and `Unavailable` like plaintext fills instead of
-    /// ending the read on the first transient failure.
+    /// ending the read on the first transient failure; only `Unavailable` is capped.
     #[test]
     fn transient_sealed_fill_failures_are_refetched_until_retries_run_out() {
         let env = racer_io::Env::host();
@@ -2403,14 +2438,22 @@ pub(super) mod tests {
         stream.inject(failing(Error::Overloaded));
         assert!(stream.poll_slots(&mut cx));
         assert_eq!(stream.slot(0), win::Slot::Missing { select: false });
-        for _ in 1..PAGE_RETRIES {
+        // The first `Overloaded` is uncapped, so all `Unavailable` retries remain.
+        for _ in 0..PAGE_RETRIES {
             stream.place(0, failing(Error::Unavailable));
             stream.poll_slots(&mut cx);
             assert_eq!(stream.slot(0), win::Slot::Missing { select: false });
         }
-        stream.place(0, failing(Error::Overloaded));
+        // Local pressure is waited out past the `Unavailable` cap.
+        for _ in 0..PAGE_RETRIES {
+            stream.place(0, failing(Error::Overloaded));
+            stream.poll_slots(&mut cx);
+            assert_eq!(stream.slot(0), win::Slot::Missing { select: false });
+        }
+        // The page's `Unavailable` retries are spent: the failure now reaches the reader.
+        stream.place(0, failing(Error::Unavailable));
         stream.poll_slots(&mut cx);
-        assert_eq!(stream.slot(0), win::Slot::Failed(read::Error::Overloaded));
+        assert_eq!(stream.slot(0), win::Slot::Failed(read::Error::Unavailable));
         // A non-transient failure is not retried.
         let mut stream = stream_with_budget(&f, &metadata(), PageBudget::Client { deadline });
         stream.inject(failing(Error::OriginForbidden));
@@ -2432,15 +2475,87 @@ pub(super) mod tests {
         stream.inject(failing(Error::Overloaded));
         stream.poll_slots(&mut cx);
         assert_eq!(stream.slot(0), win::Slot::Missing { select: false });
-        for _ in 1..PAGE_RETRIES {
+        // The first `Overloaded` is uncapped, so all `Unavailable` retries remain.
+        for _ in 0..PAGE_RETRIES {
             stream.place(0, failing(Error::Unavailable));
             stream.poll_slots(&mut cx);
             assert_eq!(stream.slot(0), win::Slot::Missing { select: false });
         }
-        // The page's retries are spent: the failure now reaches the reader.
-        stream.place(0, failing(Error::Overloaded));
+        // Local pressure is waited out past the `Unavailable` cap.
+        for _ in 0..PAGE_RETRIES {
+            stream.place(0, failing(Error::Overloaded));
+            stream.poll_slots(&mut cx);
+            assert_eq!(stream.slot(0), win::Slot::Missing { select: false });
+        }
+        // The page's `Unavailable` retries are spent: the failure now reaches the reader.
+        stream.place(0, failing(Error::Unavailable));
         stream.poll_slots(&mut cx);
-        assert_eq!(stream.slot(0), win::Slot::Failed(read::Error::Overloaded));
+        assert_eq!(stream.slot(0), win::Slot::Failed(read::Error::Unavailable));
+    }
+
+    /// A restartable fill failure is held for the next restart's backoff;
+    /// success and final errors are not, and a canceled scope ends the wait.
+    #[test]
+    fn restartable_fill_failures_wait_for_their_backoff() {
+        let clock = racer_io::SimClock::new(907);
+        let env = racer_io::Env::new(racer_io::Driver::Uring, clock.ctx(0));
+        let admission = Rc::new(flow_control::Quotas::new(
+            crate::admission::AdmissionPolicy::new(
+                crate::test_support::cluster::config(false).limits,
+            ),
+        ));
+        let reactor = Rc::new(crate::runtime::Reactor::new(admission, &env));
+        let scope = || {
+            RequestScope::with_clock(
+                RequestId([3; 16]),
+                env.ctx.clock.now() + Duration::from_secs(60),
+                env.ctx.clock.clone(),
+            )
+            .unwrap()
+        };
+        let mut cx = Context::from_waker(futures::task::noop_waker_ref());
+        let fill = |result: Result<u8>| -> Result<Operation<'static, u8>> {
+            Ok(Box::pin(std::future::ready(result)))
+        };
+        // Success and final errors pass through at once.
+        for result in [Ok(7), Err(Error::CorruptRecord)] {
+            let mut op = with_backoff(reactor.clone(), scope(), 3, fill(result));
+            assert_eq!(op.as_mut().poll(&mut cx), Poll::Ready(result));
+        }
+        // Restartable failures, including one that could not start, wait.
+        for (retry, started) in [
+            (0, fill(Err(Error::Overloaded))),
+            (3, fill(Err(Error::Unavailable))),
+            (u8::MAX, Err(Error::FlightFull)),
+        ] {
+            let error = match &started {
+                Ok(_) if retry == 0 => Error::Overloaded,
+                Ok(_) => Error::Unavailable,
+                Err(error) => *error,
+            };
+            let delay = win::retry_delay(retry.saturating_add(1));
+            assert!(!delay.is_zero());
+            let mut op = with_backoff(reactor.clone(), scope(), retry, started);
+            assert!(op.as_mut().poll(&mut cx).is_pending());
+            clock.advance(delay - Duration::from_millis(1));
+            assert!(op.as_mut().poll(&mut cx).is_pending());
+            clock.advance(Duration::from_millis(1));
+            assert_eq!(op.as_mut().poll(&mut cx), Poll::Ready(Err(error)));
+        }
+        // Cancellation ends the wait with the fill's own error.
+        let canceled = scope();
+        let mut op = with_backoff(
+            reactor.clone(),
+            canceled.clone(),
+            0,
+            fill(Err(Error::Overloaded)),
+        );
+        assert!(op.as_mut().poll(&mut cx).is_pending());
+        canceled.cancel().unwrap();
+        assert_eq!(
+            op.as_mut().poll(&mut cx),
+            Poll::Ready(Err(Error::Overloaded))
+        );
     }
 
     #[test]

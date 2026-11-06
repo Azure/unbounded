@@ -673,6 +673,10 @@ impl http1::delivery::Observer<HttpContext> for DeliveryObserver<'_> {
     }
 }
 impl Delivery {
+    /// The ingress reactor that delivers this worker's streams.
+    pub(crate) fn reactor(&self) -> &Rc<Reactor> {
+        &self.reactor
+    }
     pub fn new(reactor: Rc<Reactor>, stall_timeout: Duration) -> Self {
         Self {
             metrics: crate::telemetry::Metrics::default(),
