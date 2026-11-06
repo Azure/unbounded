@@ -206,6 +206,9 @@ type startContainerd struct {
 type importContainerImages struct {
 	log       *slog.Logger
 	goalState *goalstates.NodeStart
+	// hostDir is the host directory the staged archives are read from. Empty
+	// means goalstates.ContainerImageArchiveHostDir.
+	hostDir string
 }
 
 func (i *importContainerImages) archivePath(a stagedContainerImageArchive) string {
@@ -230,6 +233,14 @@ func ImportContainerImages(log *slog.Logger, goalState *goalstates.NodeStart) ph
 	return &importContainerImages{log: log, goalState: goalState}
 }
 
+// ImportContainerImagesFrom is ImportContainerImages reading the staged
+// archives from hostDir instead of goalstates.ContainerImageArchiveHostDir. An
+// empty hostDir is the default. It is for host-native node stacks whose
+// operator carries the archive directory, so tests can point it elsewhere.
+func ImportContainerImagesFrom(log *slog.Logger, goalState *goalstates.NodeStart, hostDir string) phases.Task {
+	return &importContainerImages{log: log, goalState: goalState, hostDir: hostDir}
+}
+
 func (s *startContainerd) Name() string { return "start-containerd" }
 
 func (s *startContainerd) Do(ctx context.Context) error {
@@ -244,7 +255,12 @@ func (s *startContainerd) Do(ctx context.Context) error {
 func (i *importContainerImages) Name() string { return "import-container-images" }
 
 func (i *importContainerImages) Do(ctx context.Context) error {
-	archives, err := stagedContainerImageArchives(goalstates.ContainerImageArchiveHostDir)
+	hostDir := i.hostDir
+	if hostDir == "" {
+		hostDir = goalstates.ContainerImageArchiveHostDir
+	}
+
+	archives, err := stagedContainerImageArchives(hostDir)
 	if err != nil {
 		return err
 	}

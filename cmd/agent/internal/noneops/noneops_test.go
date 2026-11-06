@@ -76,8 +76,10 @@ type fixture struct {
 	node *Node
 	root string
 	sys  string
-	gs   *goalstates.MachineGoalState
-	hook struct {
+	// images is the staged image archive directory the node imports from.
+	images string
+	gs     *goalstates.MachineGoalState
+	hook   struct {
 		setup, cleanup, dns, kubelet, download int
 		kubeletErr                             error
 	}
@@ -86,7 +88,7 @@ type fixture struct {
 func newFixture(t *testing.T, dns bool, mutate func(*goalstates.MachineGoalState)) *fixture {
 	t.Helper()
 
-	f := &fixture{t: t, h: &host{active: map[string]bool{}, fail: map[string]error{}}, root: t.TempDir(), sys: t.TempDir()}
+	f := &fixture{t: t, h: &host{active: map[string]bool{}, fail: map[string]error{}}, root: t.TempDir(), sys: t.TempDir(), images: filepath.Join(t.TempDir(), "images")}
 
 	f.gs = hostnodetest.GoalState("kube1", dns)
 	if mutate != nil {
@@ -96,7 +98,7 @@ func newFixture(t *testing.T, dns bool, mutate func(*goalstates.MachineGoalState
 	f.node = New(Params{
 		Log:       quiet(),
 		GoalState: f.gs,
-		Overrides: Overrides{Layout: none.Layout{Base: filepath.Join(t.TempDir(), "node")}, SystemdDir: f.sys, Run: f.h.run, Proc: filepath.Join(t.TempDir(), "noproc"), Download: func(ctx context.Context) error {
+		Overrides: Overrides{Layout: none.Layout{Base: filepath.Join(t.TempDir(), "node")}, SystemdDir: f.sys, Run: f.h.run, Proc: filepath.Join(t.TempDir(), "noproc"), ImageArchiveDir: f.images, Download: func(ctx context.Context) error {
 			f.hook.download++
 			return nil
 		}, WaitKubelet: func(context.Context) error { f.hook.kubelet++; return f.hook.kubeletErr }},
@@ -316,6 +318,45 @@ func TestStartOrdersUnitsAndGates(t *testing.T) {
 		"test -s " + goalstates.KubeletKubeconfigPath,
 	}, f.h.calls)
 	require.Equal(t, 1, f.hook.dns, "LocalDNS is waited on before containerd starts")
+}
+
+// The staged archives are imported from the directory the node was given, at
+// their host path, once containerd is up and before the kubelet starts.
+func TestStartImportsStagedImagesFromTheConfiguredDirectory(t *testing.T) {
+	f := newFixture(t, false, nil)
+	_, err := f.node.Prepare(t.Context())
+	require.NoError(t, err)
+
+	require.NoError(t, os.MkdirAll(f.images, 0o755))
+	require.NoError(t, os.WriteFile(filepath.Join(f.images, "b.tar"), nil, 0o644))
+	require.NoError(t, os.WriteFile(filepath.Join(f.images, "a.tar"), nil, 0o644))
+	require.NoError(t, os.WriteFile(filepath.Join(f.images, "notes.txt"), nil, 0o644))
+
+	f.h.reset()
+	require.NoError(t, f.node.Start(t.Context(), false, false, false))
+
+	importA := "ctr --namespace k8s.io images import " + filepath.Join(f.images, "a.tar")
+	importB := "ctr --namespace k8s.io images import " + filepath.Join(f.images, "b.tar")
+	require.Equal(t, []string{
+		"systemctl enable --now " + none.UnitContainerd,
+		importA,
+		importB,
+		"systemctl enable --now " + none.UnitKubelet,
+	}, f.h.calls[:4])
+}
+
+// An unreadable archive directory fails the start instead of silently skipping
+// the import: only a missing one means nothing was staged.
+func TestStartFailsWhenTheImageDirectoryCannotBeRead(t *testing.T) {
+	f := newFixture(t, false, nil)
+	_, err := f.node.Prepare(t.Context())
+	require.NoError(t, err)
+
+	// A file where the directory belongs cannot be listed.
+	require.NoError(t, os.WriteFile(f.images, nil, 0o644))
+
+	require.ErrorContains(t, f.node.Start(t.Context(), false, false, false), "read staged container image archive directory "+f.images)
+	require.NotContains(t, f.h.calls, "systemctl enable --now "+none.UnitKubelet)
 }
 
 func TestStartRestartsOnlyChangedServicesOfARunningNode(t *testing.T) {
@@ -736,7 +777,7 @@ func TestGPUSetupFailureStopsTheStartBeforeAnyUnit(t *testing.T) {
 	f.node = New(Params{
 		Log:       quiet(),
 		GoalState: f.gs,
-		Overrides: Overrides{Layout: none.Layout{Base: filepath.Join(t.TempDir(), "node")}, SystemdDir: f.sys, Run: f.h.run, Proc: filepath.Join(t.TempDir(), "noproc"), SetupGPU: func(context.Context) error { return errors.New("no toolkit") }},
+		Overrides: Overrides{Layout: none.Layout{Base: filepath.Join(t.TempDir(), "node")}, SystemdDir: f.sys, Run: f.h.run, Proc: filepath.Join(t.TempDir(), "noproc"), ImageArchiveDir: f.images, SetupGPU: func(context.Context) error { return errors.New("no toolkit") }},
 		Hooks:     hostnode.Hooks{HostRoot: f.root, SetupNetwork: func(context.Context) error { return nil }, WaitLocalDNS: func(context.Context) error { return nil }},
 	})
 
@@ -796,7 +837,7 @@ func TestPrepareNamesAMissingConfiguredToolkit(t *testing.T) {
 	node := New(Params{
 		Log:       quiet(),
 		GoalState: f.gs,
-		Overrides: Overrides{Layout: none.Layout{Base: filepath.Join(t.TempDir(), "node")}, SystemdDir: f.sys, Run: f.h.run, Proc: filepath.Join(t.TempDir(), "noproc")},
+		Overrides: Overrides{Layout: none.Layout{Base: filepath.Join(t.TempDir(), "node")}, SystemdDir: f.sys, Run: f.h.run, Proc: filepath.Join(t.TempDir(), "noproc"), ImageArchiveDir: f.images},
 		Hooks:     hostnode.Hooks{HostRoot: f.root, SetupNetwork: func(context.Context) error { return nil }, WaitLocalDNS: func(context.Context) error { return nil }},
 	})
 
