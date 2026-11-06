@@ -114,6 +114,12 @@ pub struct OwnerRole {
 
     /// Diagnostics printed for this drain.
     reported: u32,
+
+    /// Scratch for [`Self::park`], reused across parks.
+    fds: Vec<std::os::fd::RawFd>,
+
+    /// Scratch for [`Self::park`], reused across parks.
+    pollfds: Vec<libc::pollfd>,
 }
 
 impl OwnerRole {
@@ -131,6 +137,8 @@ impl OwnerRole {
             waker: Waker::from(wake),
             closing_since: None,
             reported: 0,
+            fds: Vec::new(),
+            pollfds: Vec::new(),
         };
         Ok((role, stop))
     }
@@ -196,14 +204,16 @@ impl Role for OwnerRole {
             Next::WaitUntil(at) => Some(at.saturating_duration_since(self.owner.ctx_now())),
             Next::Idle => None,
         };
-        let mut fds: Vec<libc::pollfd> = std::iter::once(self.stop.wake.0.as_raw_fd())
-            .chain(self.owner.poll_fds())
-            .map(|fd| libc::pollfd {
-                fd,
-                events: libc::POLLIN,
-                revents: 0,
-            })
-            .collect();
+        self.fds.clear();
+        self.fds.push(self.stop.wake.0.as_raw_fd());
+        self.owner.poll_fds_into(&mut self.fds);
+        let fds = &mut self.pollfds;
+        fds.clear();
+        fds.extend(self.fds.iter().map(|&fd| libc::pollfd {
+            fd,
+            events: libc::POLLIN,
+            revents: 0,
+        }));
         let spec = timeout.map(|t| libc::timespec {
             tv_sec: t.as_secs().min(i64::MAX as u64) as libc::time_t,
             tv_nsec: libc::c_long::from(t.subsec_nanos() as i32),

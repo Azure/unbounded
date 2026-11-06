@@ -799,10 +799,16 @@ impl Owner {
     /// with activation. Timers and commands still need the driver waker and
     /// periodic polls.
     pub fn poll_fds(&self) -> Vec<std::os::fd::RawFd> {
-        self.devices
-            .values()
-            .flat_map(|device| device.device.fds())
-            .collect()
+        let mut fds = Vec::new();
+        self.poll_fds_into(&mut fds);
+        fds
+    }
+
+    /// Append [`Self::poll_fds`] to `out`, so a caller can reuse its buffer.
+    pub fn poll_fds_into(&self, out: &mut Vec<std::os::fd::RawFd>) {
+        for device in self.devices.values() {
+            device.device.fds_into(out);
+        }
     }
 
     /// When the owner next needs a poll that no wake source announces:

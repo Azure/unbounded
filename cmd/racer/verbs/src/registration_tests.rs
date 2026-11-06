@@ -516,6 +516,10 @@ fn channel_fds_signal_work() {
         let fds = p.a.device.fds();
         assert_eq!(fds.len(), 2);
         let (comp, cm) = (fds[0], fds[1]);
+        // fds_into appends to a reused buffer rather than replacing it.
+        let mut reused = vec![-7];
+        p.a.device.fds_into(&mut reused);
+        assert_eq!(reused, [-7, comp, cm]);
         assert!(!readable(comp) && !readable(cm));
         p.b.connect(p.a.endpoint, false).unwrap();
         p.a.connect(p.b.endpoint, true).unwrap();

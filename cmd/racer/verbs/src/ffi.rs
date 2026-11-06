@@ -654,15 +654,21 @@ impl NativeDevice {
     /// File descriptors to wait on for this device's progress: the
     /// completion channel and, in registration mode, the connection manager
     /// channel. Both are nonblocking; poll the owner when one is readable.
+    #[cfg(test)]
     pub(crate) fn fds(&self) -> Vec<c_int> {
         let mut fds = Vec::new();
+        self.fds_into(&mut fds);
+        fds
+    }
+
+    /// Append [`Self::fds`] to `out` without allocating a new Vec.
+    pub(crate) fn fds_into(&self, out: &mut Vec<c_int>) {
         if let Some(comp) = self.comp {
-            fds.push(unsafe { (self.api.comp_channel_fd)(comp.as_ptr()) });
+            out.push(unsafe { (self.api.comp_channel_fd)(comp.as_ptr()) });
         }
         if let Some(cm) = &self.cm {
-            fds.push(cm.fd());
+            out.push(cm.fd());
         }
-        fds
     }
 
     /// Handle every waiting completion channel and connection manager
