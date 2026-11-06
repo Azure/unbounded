@@ -4161,6 +4161,88 @@ func TestResolveFileByPath_ExperimentalContainerIsolation(t *testing.T) {
 		require.ErrorContains(t, err, "--experimental-container-isolation")
 	})
 
+	t.Run("grub.cfg", func(t *testing.T) {
+		t.Parallel()
+
+		grubTmpl, err := os.ReadFile(filepath.Join("..", "..", "..", "images", "netboot", "assets", "grub.cfg.tmpl"))
+		require.NoError(t, err)
+
+		resolveGrub := func(t *testing.T, mode v1alpha3.IsolationMode, enabled, pending bool) (*ResolvedFile, error) {
+			t.Helper()
+
+			node := &v1alpha3.Machine{
+				ObjectMeta: metav1.ObjectMeta{Name: "node-grub", Namespace: "default"},
+				Spec: v1alpha3.MachineSpec{
+					Isolation: mode,
+					PXE: &v1alpha3.PXESpec{
+						TargetDisk: "/dev/disk/by-id/test-os-disk",
+						DHCPLeases: []v1alpha3.DHCPLease{{IPv4: "10.0.1.21", MAC: "aa:bb:cc:dd:ee:21"}},
+					},
+				},
+			}
+			objs := []client.Object{node}
+
+			if pending {
+				objs = append(objs, &v1alpha3.MachineOperation{
+					ObjectMeta: metav1.ObjectMeta{Name: "replace-node-grub", Namespace: "default"},
+					Spec: v1alpha3.MachineOperationSpec{
+						OperationKind: v1alpha3.OperationHostReplace,
+						MachineRef:    node.Name,
+					},
+					Status: v1alpha3.MachineOperationStatus{Phase: v1alpha3.OperationPhaseInProgress},
+				})
+			}
+
+			resolver := FileResolver{
+				Cache: setupOCICache(t, imageRef, strings.Repeat("d", 64), map[string][]byte{
+					"grub.cfg.tmpl": grubTmpl,
+				}),
+				Cluster:                        &StaticClusterInfo{},
+				Reader:                         fake.NewClientBuilder().WithScheme(newScheme(t)).WithObjects(objs...).Build(),
+				ExperimentalContainerIsolation: enabled,
+			}
+
+			return resolver.ResolveFileByPath(t.Context(), "grub.cfg", node, imageRef)
+		}
+
+		t.Run("no install pending chainloads a refused Machine", func(t *testing.T) {
+			t.Parallel()
+
+			for _, mode := range []v1alpha3.IsolationMode{"", v1alpha3.IsolationNSpawn, v1alpha3.IsolationContainer} {
+				resolved, err := resolveGrub(t, mode, false, false)
+				require.NoError(t, err, mode)
+				require.Contains(t, string(resolved.Data), "No pending repave", mode)
+				require.Contains(t, string(resolved.Data), "chainloader", mode)
+			}
+		})
+
+		t.Run("install pending refuses container", func(t *testing.T) {
+			t.Parallel()
+
+			_, err := resolveGrub(t, v1alpha3.IsolationContainer, false, true)
+			require.ErrorContains(t, err, `spec.isolation "container" is experimental and not enabled on this metalman`)
+		})
+
+		t.Run("install pending renders the installer for other modes", func(t *testing.T) {
+			t.Parallel()
+
+			for _, mode := range []v1alpha3.IsolationMode{"", v1alpha3.IsolationNSpawn} {
+				resolved, err := resolveGrub(t, mode, false, true)
+				require.NoError(t, err, mode)
+				require.NotContains(t, string(resolved.Data), "No pending repave", mode)
+				require.Contains(t, string(resolved.Data), "Unbounded Metal Install", mode)
+			}
+		})
+
+		t.Run("install pending renders container when enabled", func(t *testing.T) {
+			t.Parallel()
+
+			resolved, err := resolveGrub(t, v1alpha3.IsolationContainer, true, true)
+			require.NoError(t, err)
+			require.Contains(t, string(resolved.Data), "Unbounded Metal Install")
+		})
+	})
+
 	t.Run("on opts every Machine in", func(t *testing.T) {
 		t.Parallel()
 
