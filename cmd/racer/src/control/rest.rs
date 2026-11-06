@@ -2018,9 +2018,20 @@ pub mod dns {
             }
         }
 
+        /// The simulated reactor, owned behind the `Io::Reactor` deref.
+        struct SimReactor(racer_io::scoped::Reactor<SimScope>);
+
+        impl std::ops::Deref for SimReactor {
+            type Target = racer_io::scoped::Reactor<SimScope>;
+
+            fn deref(&self) -> &Self::Target {
+                &self.0
+            }
+        }
+
         /// Resolver I/O on a simulated reactor with a fixed resolv.conf.
         struct SimIo {
-            reactor: Rc<Box<racer_io::scoped::Reactor<SimScope>>>,
+            reactor: Rc<SimReactor>,
             os: SimOs,
             resolv: &'static str,
         }
@@ -2030,7 +2041,7 @@ pub mod dns {
             type Scope = SimScope;
             type Lease = ();
             type FileBytes = Vec<u8>;
-            type Reactor = Box<racer_io::scoped::Reactor<SimScope>>;
+            type Reactor = SimReactor;
             type Charge = ();
 
             fn reactor(&self) -> Rc<Self::Reactor> {
@@ -2092,7 +2103,7 @@ pub mod dns {
             let reactor = racer_io::scoped::Reactor::new(8, &Env::sim(&os, clock.ctx(0)));
             let socket = os.bind_datagram(server).unwrap();
             let io = SimIo {
-                reactor: Rc::new(Box::new(reactor)),
+                reactor: Rc::new(SimReactor(reactor)),
                 os,
                 resolv,
             };
