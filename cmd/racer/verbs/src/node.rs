@@ -743,6 +743,9 @@ pub struct Owner {
 
     /// The last poll left commands in the queue: poll again at once.
     backlog: bool,
+
+    /// Scratch for the commands taken in one poll, reused across polls.
+    commands: Vec<Command>,
 }
 
 impl Owner {
@@ -775,6 +778,7 @@ impl Owner {
             expiry: None,
             leaked: false,
             backlog: false,
+            commands: Vec::new(),
         }
     }
 
@@ -862,14 +866,16 @@ impl Owner {
             self.begin_shutdown(now);
         }
 
-        let mut commands = Vec::new();
+        let mut commands = std::mem::take(&mut self.commands);
         self.channel
             .try_drain(budget, |_, command| commands.push(command));
         self.backlog = commands.len() >= budget;
 
-        for command in commands {
+        for command in commands.drain(..) {
             self.handle(command, now);
         }
+
+        self.commands = commands;
 
         let breaks = std::mem::take(
             &mut *self
