@@ -557,130 +557,65 @@ impl std::io::Write for Plain<'_> {
 }
 
 /// Parse a complete response, `None` while more bytes are needed. Supports
-/// `Content-Length`, `Transfer-Encoding: chunked`, and close-delimited bodies.
+/// `Content-Length`, `Transfer-Encoding: chunked`, and close-delimited bodies
+/// through the shared head codec and small-body decoder.
 pub(crate) fn parse_small_response(
     bytes: &[u8],
     eof: bool,
     limit: usize,
 ) -> Result<Option<SmallResponse>> {
-    let mut fields = [httparse::EMPTY_HEADER; 64];
-    let mut response = httparse::Response::new(&mut fields);
-    let end = match response.parse(bytes) {
-        Ok(httparse::Status::Complete(end)) => end,
-        Ok(httparse::Status::Partial) if !eof && bytes.len() <= MAX_SMALL_HEAD => {
-            return Ok(None);
-        }
+    use racer_wire::http::{Codec, StartLine, small};
+    let codec = Codec::<()>::new(MAX_SMALL_HEAD)
+        .trim_ows()
+        .transfer_coding();
+    let (head, end) = match codec.decode_head(bytes) {
+        Ok(Some(head)) => head,
+        Ok(None) if !eof => return Ok(None),
         _ => return Err(Error::BadGateway),
     };
-    if end > MAX_SMALL_HEAD {
+    let StartLine::Response { status } = head.start else {
         return Err(Error::BadGateway);
-    }
-    let status = response.code.ok_or(Error::BadGateway)?;
+    };
     if (100..200).contains(&status) {
         return Err(Error::BadGateway);
     }
-    let headers: Vec<(String, String)> = response
+    let framing = small::Framing::from_response(&head).map_err(|_| Error::BadGateway)?;
+    // 204 and 304 never carry a body unless one is explicitly framed.
+    let framing = match framing {
+        small::Framing::Close if status == 204 || status == 304 => small::Framing::Length(0),
+        framing => framing,
+    };
+    let mut decoder = small::Decoder::new(
+        framing,
+        small::Limits {
+            body: limit,
+            ..small::Limits::default()
+        },
+    )
+    .map_err(|_| Error::BadGateway)?;
+    match decoder.feed(&bytes[end..]).map_err(|_| Error::BadGateway)? {
+        small::Status::Done(_) => {}
+        small::Status::Need if eof => decoder.finish().map_err(|_| Error::BadGateway)?,
+        small::Status::Need => return Ok(None),
+    }
+    let headers = head
         .headers
         .iter()
         .map(|h| {
             Ok((
-                h.name.to_owned(),
-                std::str::from_utf8(h.value)
+                h.name.clone(),
+                std::str::from_utf8(&h.value)
                     .map_err(|_| Error::BadGateway)?
                     .trim()
                     .to_owned(),
             ))
         })
         .collect::<Result<_>>()?;
-    let field = |name: &str| {
-        headers
-            .iter()
-            .find(|(n, _)| n.eq_ignore_ascii_case(name))
-            .map(|(_, v)| v.as_str())
-    };
-    let rest = &bytes[end..];
-    let body = if let Some(coding) = field("transfer-encoding") {
-        if !coding.eq_ignore_ascii_case("chunked") {
-            return Err(Error::BadGateway);
-        }
-        match decode_chunked(rest, limit)? {
-            Some(body) => body,
-            None if eof => return Err(Error::BadGateway),
-            None => return Ok(None),
-        }
-    } else if let Some(length) = field("content-length") {
-        let length: usize = length.parse().map_err(|_| Error::BadGateway)?;
-        if length > limit {
-            return Err(Error::BadGateway);
-        }
-        if rest.len() < length {
-            return if eof {
-                Err(Error::BadGateway)
-            } else {
-                Ok(None)
-            };
-        }
-        Zeroizing::new(rest[..length].to_vec())
-    } else if status == 204 || status == 304 {
-        Zeroizing::new(Vec::new())
-    } else {
-        if rest.len() > limit {
-            return Err(Error::BadGateway);
-        }
-        if !eof {
-            return Ok(None);
-        }
-        Zeroizing::new(rest.to_vec())
-    };
     Ok(Some(SmallResponse {
         status,
         headers,
-        body,
+        body: Zeroizing::new(decoder.into_body()),
     }))
-}
-
-/// Decode a complete chunked body (trailers ignored), `None` if incomplete.
-fn decode_chunked(mut bytes: &[u8], limit: usize) -> Result<Option<Zeroizing<Vec<u8>>>> {
-    let mut body = Zeroizing::new(Vec::new());
-    loop {
-        let Some(line_end) = bytes.windows(2).position(|w| w == b"\r\n") else {
-            return if bytes.len() > 1024 {
-                Err(Error::BadGateway)
-            } else {
-                Ok(None)
-            };
-        };
-        let line = std::str::from_utf8(&bytes[..line_end]).map_err(|_| Error::BadGateway)?;
-        let size = line.split(';').next().unwrap_or("").trim();
-        if size.is_empty() || size.len() > 8 {
-            return Err(Error::BadGateway);
-        }
-        let size = usize::from_str_radix(size, 16).map_err(|_| Error::BadGateway)?;
-        bytes = &bytes[line_end + 2..];
-        if size == 0 {
-            // Trailer fields end with an empty line.
-            loop {
-                let Some(end) = bytes.windows(2).position(|w| w == b"\r\n") else {
-                    return Ok(None);
-                };
-                bytes = &bytes[end + 2..];
-                if end == 0 {
-                    return Ok(Some(body));
-                }
-            }
-        }
-        if body.len() + size > limit {
-            return Err(Error::BadGateway);
-        }
-        if bytes.len() < size + 2 {
-            return Ok(None);
-        }
-        if &bytes[size..size + 2] != b"\r\n" {
-            return Err(Error::BadGateway);
-        }
-        body.extend_from_slice(&bytes[..size]);
-        bytes = &bytes[size + 2..];
-    }
 }
 
 #[cfg(test)]
