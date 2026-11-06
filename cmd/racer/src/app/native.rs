@@ -481,7 +481,7 @@ impl WorkerApplication {
                 let key = self
                     .node
                     .inventory
-                    .rail_key(m.rail)
+                    .device_key(&m.device, m.port)
                     .unwrap_or_else(|| m.device.clone());
                 (m.device.clone(), key)
             })
@@ -1601,6 +1601,80 @@ mod tests {
         drop(service);
         assert_eq!(sim.live_resources(), 0);
     }
+    #[test]
+    /// Regression: a healthy rail is never reported lost when the node's
+    /// published rail number differs from the inventory's reservation for
+    /// its device (the inventory also holds ports the mapping excludes,
+    /// sorted first). The probe used to read another device's key by rail
+    /// number and looped between lost and reactivated forever.
+    fn healthy_device_with_shifted_inventory_rail_is_not_lost() {
+        use crate::telemetry::Event;
+        use rdma_verbs::simulation::Device;
+        use rdma_verbs::simulation::Simulation;
+        use std::os::unix::fs::symlink;
+        struct Scratch(std::path::PathBuf);
+        impl Drop for Scratch {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        let dir = Scratch(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("target")
+                .join(format!("shifted-rail-{}", std::process::id())),
+        );
+        let root = dir.0.join("infiniband");
+        let pci = dir.0.join("7870:00:00.0");
+        let other_pci = dir.0.join("0000:d2:00.0");
+        std::fs::create_dir_all(&pci).unwrap();
+        std::fs::create_dir_all(&other_pci).unwrap();
+        for (name, target) in [("test-device", &pci), ("ibp210s0f0", &other_pci)] {
+            std::fs::create_dir_all(root.join(name)).unwrap();
+            symlink(target, root.join(name).join("device")).unwrap();
+        }
+        let sim = Simulation::new();
+        let simulated = sim
+            .with_devices(vec![Device::new("test-device", [1; 16])])
+            .unwrap();
+        let _devices = simulated.enter();
+        let env = racer_io::Env::host();
+        let mut app = configured();
+        app.discovered_nics[0].device = "test-device".into();
+        app.discovered_nics[0].rail = RailId(0);
+        let mut excluded = app.discovered_nics[0].clone();
+        excluded.device = "ibp210s0f0".into();
+        // The excluded port takes inventory rail 0; the published device
+        // gets inventory rail 1 but is published as rail 0.
+        app.node
+            .inventory
+            .update_keyed(vec![
+                (excluded, Some("0000:d2:00.0".into())),
+                (app.discovered_nics[0].clone(), Some("7870:00:00.0".into())),
+            ])
+            .unwrap();
+        let (mut worker, engine) = worker(&env, &app, true, true);
+        worker.rdma_sysfs = root.clone();
+        let mut service = test_owner(&app, engine);
+        let mut run = |worker: &mut WorkerApplication| {
+            let mut cx = Context::from_waker(futures::task::noop_waker_ref());
+            for _ in 0..20 {
+                worker.poll_native(&mut cx).unwrap();
+                service.poll_budgeted(&mut cx, 64).unwrap();
+            }
+        };
+        run(&mut worker);
+        let links = worker.links.clone().unwrap();
+        assert!(links.rail_ready(RailId(0)));
+        let metrics = worker.telemetry.metrics.clone();
+        for _ in 0..3 {
+            worker.rail_probe = worker.ctx().now();
+            run(&mut worker);
+        }
+        assert!(links.rail_ready(RailId(0)));
+        assert!(worker.rdma_lost.is_none());
+        assert_eq!(metrics.count(Event::RdmaDeviceLoss), 0);
+    }
+
     #[test]
     /// A rail whose device leaves sysfs (an Azure VF hot-unplug) closes the
     /// round at once so reads use HTTP, activation waits while the device is

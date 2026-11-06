@@ -209,6 +209,26 @@ impl Inventory {
             .map(|(key, _, _)| key.clone())
     }
 
+    /// The hardware key reserved for `device`'s `port` (`pci:<address>` or
+    /// a device name), if published. Look up by device, not by rail: the
+    /// active rails come from the node's published mapping, whose rail
+    /// numbers need not match this inventory's reservations (for example
+    /// when the inventory also holds ports the mapping excludes).
+    pub fn device_key(&self, device: &str, port: u8) -> Option<String> {
+        let state = self.lock().ok()?;
+        let rail = state
+            .snapshot
+            .nics
+            .iter()
+            .find(|n| n.device == device && n.port == port)?
+            .rail;
+        state
+            .assigned
+            .iter()
+            .find(|(_, p, r)| *r == rail.0 && *p == port)
+            .map(|(key, _, _)| key.clone())
+    }
+
     /// The reservations as a versioned JSON journal of `[key, port, rail]`
     /// tuples, where `key` is `pci:<address>` or a device name.
     pub fn reservations(&self) -> Result<Vec<u8>> {
@@ -734,6 +754,30 @@ mod tests {
             Some("pci:7870:00:00.0")
         );
         assert_eq!(inventory.rail_key(RailId(1)), None);
+    }
+
+    #[test]
+    /// A device's key is found by name even when its inventory rail differs
+    /// from the published rail: extra ports sorted first must not shift it.
+    fn device_key_ignores_rail_numbering() {
+        let inventory = Inventory::default();
+        inventory
+            .update_keyed(vec![
+                keyed("ibp210s0f0", "0000:d2:00.0"),
+                keyed("mlx5_00", "0000:04:00.0"),
+            ])
+            .unwrap();
+        assert_eq!(
+            inventory.device_key("mlx5_00", 1).as_deref(),
+            Some("pci:0000:04:00.0")
+        );
+        assert_eq!(
+            inventory.rail_key(RailId(0)).as_deref(),
+            Some("pci:0000:d2:00.0"),
+            "rail 0 is another device in this inventory"
+        );
+        assert_eq!(inventory.device_key("mlx5_00", 2), None);
+        assert_eq!(inventory.device_key("missing", 1), None);
     }
 
     #[test]
