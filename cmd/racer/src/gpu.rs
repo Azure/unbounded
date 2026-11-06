@@ -639,6 +639,9 @@ struct Queue {
     depth: usize,
     /// Page jobs submitted and not yet answered.
     pending: AtomicUsize,
+    /// Set by a CUDA host callback when a fence's work completed, so the
+    /// executor polls at once instead of finishing its nap.
+    woken: AtomicBool,
 }
 
 #[derive(Default)]
@@ -654,7 +657,17 @@ impl Queue {
             ready: std::sync::Condvar::new(),
             depth,
             pending: AtomicUsize::new(0),
+            woken: AtomicBool::new(false),
         }
+    }
+
+    /// Wake the executor to poll its fences. Called on CUDA's completion
+    /// thread, so it takes no lock: an executor that holds the queue lock
+    /// can then never stall CUDA. A wakeup that races the executor going to
+    /// sleep may be missed; the executor's poll nap still bounds that.
+    fn wake(&self) {
+        self.woken.store(true, Ordering::Release);
+        self.ready.notify_one();
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, QueueState> {
@@ -700,17 +713,25 @@ impl Queue {
     /// `None`. Also returns whether the queue is closed.
     fn take(&self, wait: Option<std::time::Duration>) -> (Vec<Task>, bool) {
         let mut state = self.lock();
-        if state.tasks.is_empty() && !state.closed {
+        let woken = wait.is_some() && self.woken.swap(false, Ordering::AcqRel);
+        if state.tasks.is_empty() && !state.closed && !woken {
             state = match wait {
                 None => self
                     .ready
                     .wait_while(state, |state| state.tasks.is_empty() && !state.closed)
                     .unwrap_or_else(|poisoned| poisoned.into_inner()),
                 Some(wait) => {
-                    self.ready
-                        .wait_timeout(state, wait)
+                    let state = self
+                        .ready
+                        .wait_timeout_while(state, wait, |state| {
+                            state.tasks.is_empty()
+                                && !state.closed
+                                && !self.woken.load(Ordering::Acquire)
+                        })
                         .unwrap_or_else(|poisoned| poisoned.into_inner())
-                        .0
+                        .0;
+                    self.woken.store(false, Ordering::Release);
+                    state
                 }
             };
         }
@@ -2439,7 +2460,7 @@ impl Executor {
                 sealed.range.end - sealed.range.start,
             )
             .map_err(gpu_error)?;
-        stream.fence_in(&self.device.events).map_err(gpu_error)
+        self.fence(stream)
     }
 
     /// Answer a page whose work completed, and free its lane and scratch.
@@ -2632,6 +2653,16 @@ impl Executor {
         }
     }
 
+    /// Fence the work queued so far on lane `stream`, and ask CUDA to wake
+    /// this executor when it completes. Without host functions, or if the
+    /// launch fails, the executor still learns of completion by polling.
+    fn fence(&self, stream: &racer_gpu::Stream) -> Result<racer_gpu::Fence> {
+        let fence = stream.fence_in(&self.device.events).map_err(gpu_error)?;
+        let queue = self.device.queue.clone();
+        let _ = stream.on_complete(Box::new(move || queue.wake()));
+        Ok(fence)
+    }
+
     /// Lane `index`'s pinned slot holding a copy of `bytes`, or `None` to
     /// copy from pageable memory instead.
     fn pinned_for(&mut self, index: usize, bytes: &[u8]) -> Option<racer_gpu::PinnedBuffer> {
@@ -2670,7 +2701,7 @@ impl Executor {
         }
         .map_err(gpu_error)?;
         Ok(Queued {
-            fence: stream.fence_in(&self.device.events).map_err(gpu_error)?,
+            fence: self.fence(stream)?,
             step: Step::Copied,
             peer: None,
             bounced: false,
@@ -2828,7 +2859,7 @@ impl Executor {
         }
         decrypted.map_err(gpu_error)?;
         Ok(Queued {
-            fence: stream.fence_in(&self.device.events).map_err(gpu_error)?,
+            fence: self.fence(stream)?,
             step: Step::Decrypted { whole },
             peer,
             bounced,
@@ -3098,6 +3129,37 @@ mod tests {
     use super::*;
     use crate::model::*;
     use rdma_verbs::DmabufMemory;
+
+    #[test]
+    fn queue_wake_ends_a_poll_nap_early() {
+        let queue = Arc::new(Queue::new(1));
+        let waker = queue.clone();
+        let handle = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+            waker.wake();
+        });
+        let started = std::time::Instant::now();
+        let (tasks, closed) = queue.take(Some(std::time::Duration::from_secs(30)));
+        handle.join().unwrap();
+        assert!(tasks.is_empty() && !closed);
+        assert!(started.elapsed() < std::time::Duration::from_secs(10));
+        assert!(!queue.woken.load(Ordering::Acquire), "wake is consumed");
+    }
+
+    #[test]
+    fn queue_wake_before_take_skips_the_nap() {
+        let queue = Queue::new(1);
+        queue.wake();
+        let started = std::time::Instant::now();
+        let _ = queue.take(Some(std::time::Duration::from_secs(30)));
+        assert!(started.elapsed() < std::time::Duration::from_secs(10));
+        assert!(!queue.woken.load(Ordering::Acquire));
+        // Idle waits ignore the flag: they wait for messages only.
+        queue.wake();
+        queue.close();
+        let (_, closed) = queue.take(None);
+        assert!(closed);
+    }
 
     #[test]
     fn fence_poll_nap_is_bounded() {
