@@ -309,9 +309,10 @@ impl Checkpointer {
                 shards,
             })
             .await?;
-            if bytes.len() > budget / 2 {
-                return Err(Error::Overloaded);
-            }
+            // Never replace a slot with a cut recovery would reject: the
+            // reader caps the file and charges decoded memory against the
+            // same budget, so check both before touching either slot.
+            publishable(&bytes, budget)?;
             let current = fingerprint(&bytes)?;
             if previous == Some(current) {
                 return Ok(None);
@@ -644,7 +645,10 @@ pub(crate) fn read_candidates_with_budget(
 pub const CHECKPOINT_VERSION: u32 = 4;
 const CLUSTER_BYTES: usize = 36;
 pub const FILE_LAYOUT_DIGEST: [u8; 32] = *b"racer-file-layout-v1\0\0\0\0\0\0\0\0\0\0\0\0";
-pub const MAX_CHECKPOINT_BYTES: usize = 64 * 1024 * 1024;
+/// Largest encoded checkpoint file. Recovery additionally bounds decoded memory
+/// by the configured budget, so this only guards the read buffer allocation and
+/// must admit any cut [`checkpoint_budget`] can size for large raw devices.
+pub const MAX_CHECKPOINT_BYTES: usize = 2 * 1024 * 1024 * 1024;
 const MAGIC: &[u8; 8] = b"RACERCP\0";
 const HEADER_BYTES: usize = 32;
 pub(super) const DIGEST_BYTES: usize = 32;
@@ -1106,6 +1110,51 @@ pub fn decode_with_budget(bytes: &[u8], budget: usize) -> Result<CheckpointImage
     Ok(image)
 }
 
+/// Reject a cut that the writer budget or recovery would refuse.
+fn publishable(bytes: &[u8], budget: usize) -> Result<()> {
+    if bytes.len() > budget / 2 || recovery_memory(bytes, budget).is_err() {
+        return Err(Error::Overloaded);
+    }
+    Ok(())
+}
+
+/// Budget that lets periodic cuts of `workers` shards, each with `segments`
+/// segment records, `pages` disk page entries and `metadata` catalog entries
+/// whose descriptor strings total `strings` bytes, be both written and
+/// recovered. Mirrors the writer limits (`budget / (4 * workers)` per shard and
+/// `budget / 2` per image) and the [`recovery_memory`] charges, so a cut that
+/// fits this budget is never skipped on restart.
+pub(crate) fn checkpoint_budget(
+    workers: usize,
+    segments: usize,
+    pages: usize,
+    metadata: usize,
+    strings: usize,
+) -> usize {
+    let shard_encoded = SHARD_BYTES
+        .saturating_add(segments.saturating_mul(SEGMENT_BYTES))
+        .saturating_add(pages.saturating_mul(PAGE_ENTRY_BYTES + strings))
+        .saturating_add(metadata.saturating_mul(DESCRIPTOR_BYTES + strings));
+    let encoded = shard_encoded
+        .saturating_mul(workers)
+        .saturating_add(HEADER_BYTES + CLUSTER_BYTES + 4 + DIGEST_BYTES);
+    let shard_decoded = (std::mem::size_of::<ShardImage>() + 512)
+        .saturating_add(segments.saturating_mul(std::mem::size_of::<SegmentSnapshot>() + 512))
+        .saturating_add(
+            pages.saturating_mul(std::mem::size_of::<(PageId, IndexedPage)>() + 512 + 4 * strings),
+        )
+        .saturating_add(
+            metadata.saturating_mul(std::mem::size_of::<VersionMetadata>() + 512 + 4 * strings),
+        );
+    let decoded = shard_decoded
+        .saturating_mul(workers)
+        .saturating_add(encoded)
+        .saturating_add(std::mem::size_of::<CheckpointImage>());
+    decoded
+        .max(encoded.saturating_mul(2))
+        .max(shard_encoded.saturating_mul(4).saturating_mul(workers))
+}
+
 /// Conservative accounting, not serialized size: per-item scratch covers growing
 /// reference hash tables (including old buckets during growth), extent sorting,
 /// isolated segment slots, lease Rc allocations and free-tree nodes. String copies
@@ -1417,6 +1466,93 @@ mod budget_tests {
                 assert_eq!(PAGE_ENTRY_BYTES, 108);
             }
         }
+    }
+
+    /// A full single-shard cut over `segments` segments with `per_segment`
+    /// short records each and one catalog entry.
+    fn full_image(segments: u64, per_segment: usize) -> CheckpointImage {
+        let alignment = Alignment::new(4096, 4096, 4096).unwrap();
+        let segment_bytes = 4 * 4096u64;
+        let geometry =
+            CheckpointGeometry::new(segment_bytes * segments, segment_bytes, segments, alignment)
+                .unwrap();
+        let store = Segments::from_geometry(geometry.allocation_geometry().unwrap()).unwrap();
+        let metadata = metadata();
+        let mut entries = Vec::new();
+        let mut leases = Vec::new();
+        for number in 0..segments as usize * per_segment {
+            let (lease, extent) = store.append(4096).unwrap();
+            let mut descriptor = metadata.clone();
+            descriptor.version.object.key.0[..8].copy_from_slice(&(number as u64).to_le_bytes());
+            entries.push((
+                PageId {
+                    version: descriptor.version.clone(),
+                    number: PageNumber(0),
+                },
+                IndexedPage {
+                    page_size: racer_wire::object::PageSize::DEFAULT,
+                    metadata: descriptor,
+                    key_id: crate::model::key_id_from_generation(1, 1).unwrap(),
+                    location: RecordLocation {
+                        segment: lease.id(),
+                        generation: lease.generation(),
+                        extent,
+                    },
+                },
+            ));
+            leases.push(lease);
+        }
+        CheckpointImage {
+            version: CHECKPOINT_VERSION,
+            page_size: racer_wire::object::PageSize::DEFAULT,
+            cluster: crate::store::checkpoint::test_cluster(),
+            sequence: 1,
+            shards: vec![ShardImage {
+                worker: WorkerId(0),
+                geometry,
+                index: IndexSnapshot {
+                    entries,
+                    metadata: vec![metadata],
+                },
+                segments: store.snapshot(),
+                holds: Vec::new(),
+            }],
+        }
+    }
+
+    #[test]
+    fn planned_budget_writes_and_recovers_a_full_cut() {
+        let strings = descriptor_string_bytes(&metadata());
+        for (segments, per_segment) in [(1, 0), (1, 4), (64, 4), (512, 2)] {
+            let image = full_image(segments, per_segment);
+            let bytes = encode(&image).unwrap();
+            let pages = segments as usize * per_segment;
+            let budget = checkpoint_budget(1, segments as usize, pages, 1, strings);
+            // Whatever the planned budget lets the writer publish, recovery accepts.
+            assert_eq!(publishable(&bytes, budget), Ok(()));
+            assert!(bytes.len() <= MAX_CHECKPOINT_BYTES);
+            let decoded = decode_with_budget(&bytes, budget).unwrap();
+            assert_eq!(decoded.shards[0].index.entries.len(), pages);
+            // The writer refuses a cut that recovery would skip.
+            let needed = recovery_memory(&bytes, usize::MAX).unwrap();
+            assert_eq!(publishable(&bytes, needed - 1), Err(Error::Overloaded));
+            assert!(decode_with_budget(&bytes, needed - 1).is_err());
+        }
+    }
+
+    #[test]
+    fn planned_budget_covers_per_shard_writer_split_and_saturates() {
+        let strings = 256;
+        let one = checkpoint_budget(1, 1000, 3000, 48, strings);
+        let many = checkpoint_budget(86, 1000, 3000, 48, strings);
+        // Writers snapshot each shard against budget / (4 * workers).
+        let shard = SHARD_BYTES + 1000 * SEGMENT_BYTES + 3000 * (PAGE_ENTRY_BYTES + strings);
+        assert!(many / (4 * 86) >= shard);
+        assert!(many >= 86 * one / 2);
+        assert_eq!(
+            checkpoint_budget(usize::MAX, usize::MAX, 1, 1, 1),
+            usize::MAX
+        );
     }
 
     #[test]
