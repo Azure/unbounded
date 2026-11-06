@@ -182,9 +182,16 @@ jobs:
   # separate jobs so they build and test concurrently. Lint runs no tests, so
   # formatting and Clippy failures report within minutes.
   racer-rust-lint:
-    name: Racer Rust Lint
+    name: Racer Rust Lint (${{ matrix.features }})
     runs-on: ubuntu-24.04
-    timeout-minutes: 60
+    timeout-minutes: 30
+    # The two workspace Clippy passes resolve different feature sets, so most
+    # crates recompile between them. Running them as parallel legs halves wall
+    # time with identical lint coverage. Non-Clippy checks run in one leg only.
+    strategy:
+      fail-fast: false
+      matrix:
+        features: [default, all-features]
     env:
       CARGO_TARGET_DIR: ${{ github.workspace }}/bin/racer-cargo
       # Make the pinned toolchain active so rust-cache keys on its rustc -vV.
@@ -202,23 +209,29 @@ jobs:
         uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           workspaces: cmd/racer -> ../../bin/racer-cargo
-          shared-key: racer-lint
+          shared-key: racer-lint-${{ matrix.features }}
           save-if: ${{ github.event_name == 'push' }}
 
       - name: Check Rust formatting
+        if: matrix.features == 'default'
         run: timeout --signal=TERM --kill-after=10s 300s cargo +1.96.0 fmt --manifest-path cmd/racer/Cargo.toml --all --check
 
-      - name: Strict workspace Clippy
-        run: |
-          timeout --signal=TERM --kill-after=10s 1200s cargo +1.96.0 clippy --locked --manifest-path cmd/racer/Cargo.toml --workspace --all-targets -- -D warnings
-          timeout --signal=TERM --kill-after=10s 1200s cargo +1.96.0 clippy --locked --manifest-path cmd/racer/Cargo.toml --workspace --all-targets --all-features -- -D warnings
+      - name: Strict workspace Clippy (default features)
+        if: matrix.features == 'default'
+        run: timeout --signal=TERM --kill-after=10s 1200s cargo +1.96.0 clippy --locked --manifest-path cmd/racer/Cargo.toml --workspace --all-targets -- -D warnings
+
+      - name: Strict workspace Clippy (all features)
+        if: matrix.features == 'all-features'
+        run: timeout --signal=TERM --kill-after=10s 1200s cargo +1.96.0 clippy --locked --manifest-path cmd/racer/Cargo.toml --workspace --all-targets --all-features -- -D warnings
 
       - name: Enforce Racer dependency purity
+        if: matrix.features == 'default'
         run: timeout --signal=TERM --kill-after=10s 300s python3 hack/scripts/racer-purity-graph.py --manifest-path cmd/racer/Cargo.toml --strict
 
       # Allocator simulation is explicit test support (Slab::simulate_in), not a
       # cargo feature. Clippy also type-checks every allocator target.
       - name: Strict allocator Clippy
+        if: matrix.features == 'default'
         run: |
           timeout --signal=TERM --kill-after=10s 600s cargo +1.96.0 clippy --locked --manifest-path cmd/racer/Cargo.toml -p page-alloc --all-targets --no-default-features -- -D warnings
 
