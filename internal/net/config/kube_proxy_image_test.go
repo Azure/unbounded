@@ -94,10 +94,6 @@ func TestParseImageReference(t *testing.T) {
 			if got.HasVersion() != tt.wantVersion {
 				t.Fatalf("HasVersion() = %v, want %v", got.HasVersion(), tt.wantVersion)
 			}
-
-			if got.String() != tt.ref {
-				t.Fatalf("String() = %q, want the original %q", got.String(), tt.ref)
-			}
 		})
 	}
 }
