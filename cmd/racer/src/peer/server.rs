@@ -77,6 +77,9 @@ pub struct PeerServer {
     serve: Rc<std::cell::RefCell<ServeDecision<crate::model::PageId>>>,
     /// The encoded unsigned overload head a full listener answers with ([`Self::refuse`]).
     refusal: Rc<[u8]>,
+    /// The published cluster page size, which sizes the hot-page threshold.
+    /// Without one, `serve` keeps the largest page's threshold.
+    page_size: Option<Rc<dyn crate::origin::Origin>>,
 }
 
 /// Bodies of one page an owner writes before it may shed readers of that page:
@@ -136,6 +139,11 @@ impl PeerServer {
         let mut discard = [0u8; 512];
         let _ = accepted.try_recv(&mut discard);
         let _ = accepted.shutdown(libc::SHUT_WR);
+    }
+    /// Size the hot-page threshold by `origin`'s published page size.
+    pub(crate) fn with_page_size(mut self, origin: Rc<dyn crate::origin::Origin>) -> Self {
+        self.page_size = Some(origin);
+        self
     }
     pub(crate) fn with_metrics(mut self, metrics: crate::telemetry::Metrics) -> Self {
         self.metrics = metrics;
@@ -386,6 +394,7 @@ impl PeerServer {
             signatures,
             transfers,
             request_timeout: settings.request_timeout,
+            // The largest page until `with_page_size` supplies the published one.
             serve: Rc::new(std::cell::RefCell::new(ServeDecision::new(
                 crate::model::PAGE_BYTES,
             ))),
@@ -393,6 +402,7 @@ impl PeerServer {
                 .encode_head(&peer_wire::overloaded_head())
                 .expect("the overload head encodes")
                 .into(),
+            page_size: None,
         }
     }
 
@@ -446,6 +456,9 @@ impl PeerServer {
         requester: &racer_wire::control::NodeId,
         membership: &std::sync::Arc<crate::topology::Membership>,
     ) -> bool {
+        if let Some(size) = self.page_size.as_ref().and_then(|o| o.page_size().ok()) {
+            self.serve.borrow_mut().set_page_bytes(size.get());
+        }
         if !self.serve.borrow().hot(page) {
             return false;
         }

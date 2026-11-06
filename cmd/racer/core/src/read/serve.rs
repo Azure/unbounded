@@ -74,6 +74,18 @@ impl<P: Clone + Eq + Hash> ServeDecision<P> {
         }
     }
 
+    /// Re-derive the mesh v2 hot-page threshold for `page_bytes` pages, the
+    /// cluster page size once it is published. Bodies being written keep
+    /// their counts.
+    pub fn set_page_bytes(&mut self, page_bytes: u64) {
+        self.limits = HotPageLimits::mesh(hot_page_bodies(page_bytes));
+    }
+
+    /// The hot-page limits in force.
+    pub fn limits(&self) -> HotPageLimits {
+        self.limits
+    }
+
     /// Bodies of `page` being written, and of every page.
     pub fn streaming(&self, page: &P) -> (usize, usize) {
         (self.streaming.get(page).copied().unwrap_or(0), self.all)
@@ -193,6 +205,20 @@ mod tests {
 
     fn page() -> ServeRequest {
         request(OperationKind::Page, false, true, false)
+    }
+
+    #[test]
+    fn page_bytes_rederive_the_hot_threshold() {
+        let mut serve = ServeDecision::<u32>::new(16 << 20);
+        assert_eq!(serve.limits().threshold, hot_page_bodies(16 << 20));
+        let _body = serve.begin_body(7);
+        serve.set_page_bytes(64 << 10);
+        assert_eq!(
+            serve.limits(),
+            HotPageLimits::mesh(hot_page_bodies(64 << 10))
+        );
+        assert!(serve.limits().threshold > hot_page_bodies(16 << 20));
+        assert_eq!(serve.streaming(&7), (1, 1));
     }
 
     fn machine(threshold: usize) -> ServeDecision<u32> {

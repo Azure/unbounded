@@ -1617,6 +1617,7 @@ impl WorkerApplication {
                 opaque_relay: config.opaque_relay,
             },
         )
+        .with_page_size(origin.clone())
         .with_metrics(metrics.clone());
         let peers = Rc::new(peers.with_send_tag(
             config.send_tag_pair.clone(),
