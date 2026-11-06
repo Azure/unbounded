@@ -15,7 +15,6 @@ import (
 	"sort"
 	"text/template"
 
-	"github.com/Azure/unbounded/internal/executil"
 	"github.com/Azure/unbounded/pkg/agent/goalstates"
 	"github.com/Azure/unbounded/pkg/agent/internal/utilio"
 	"github.com/Azure/unbounded/pkg/agent/phases"
@@ -92,13 +91,13 @@ func (c *configureContainerd) ensureContainerdConfig() error {
 		return err
 	}
 
-	dest := filepath.Join(c.goalState.MachineDir, goalstates.ContainerdConfigPath)
+	dest := c.goalState.Root().Path(goalstates.ContainerdConfigPath)
 
 	return c.write(dest, buf.Bytes(), 0o644)
 }
 
 func (c *configureContainerd) ensureGantryHostsConfig() error {
-	dest := filepath.Join(c.goalState.MachineDir, goalstates.ContainerdDefaultHostsPath)
+	dest := c.goalState.Root().Path(goalstates.ContainerdDefaultHostsPath)
 
 	existing, err := os.ReadFile(dest)
 	switch {
@@ -140,7 +139,7 @@ func (c *configureContainerd) ensureContainerdServiceUnit() error {
 		return err
 	}
 
-	dest := filepath.Join(c.goalState.MachineDir, goalstates.SystemdSystemDir, goalstates.SystemdUnitContainerd)
+	dest := c.goalState.Root().Path(filepath.Join(goalstates.SystemdSystemDir, goalstates.SystemdUnitContainerd))
 
 	return c.write(dest, buf.Bytes(), 0o644)
 }
@@ -152,7 +151,7 @@ func (c *configureContainerd) ensureGPUDropInConfigs() error {
 	nvidia := c.goalState.Containerd.NvidiaRuntime
 
 	return ensureDropInConfig(
-		c.goalState.MachineDir,
+		c.goalState.Root().Path("/"),
 		filepath.Base(goalstates.NvidiaRuntimeDropInPath),
 		nvidia.Enabled,
 		map[string]any{
@@ -188,9 +187,7 @@ func ImportContainerImages(log *slog.Logger, goalState *goalstates.NodeStart) ph
 func (s *startContainerd) Name() string { return "start-containerd" }
 
 func (s *startContainerd) Do(ctx context.Context) error {
-	if _, err := executil.MachineRun(ctx, s.log, s.goalState.MachineName,
-		"systemctl", "enable", "--now", goalstates.SystemdUnitContainerd,
-	); err != nil {
+	if _, err := s.goalState.Exec(ctx, s.log, "systemctl", "enable", "--now", goalstates.SystemdUnitContainerd); err != nil {
 		return fmt.Errorf("systemctl enable --now %s in %s: %w",
 			goalstates.SystemdUnitContainerd, s.goalState.MachineName, err)
 	}
@@ -212,9 +209,7 @@ func (i *importContainerImages) Do(ctx context.Context) error {
 			"host_archive", archive.hostPath,
 		)
 
-		if _, err := executil.MachineRun(ctx, i.log, i.goalState.MachineName,
-			"ctr", "--namespace", "k8s.io", "images", "import", archive.machinePath,
-		); err != nil {
+		if _, err := i.goalState.Exec(ctx, i.log, "ctr", "--namespace", "k8s.io", "images", "import", archive.machinePath); err != nil {
 			return fmt.Errorf("import container image archive %s in %s: %w", archive.machinePath, i.goalState.MachineName, err)
 		}
 

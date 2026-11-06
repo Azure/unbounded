@@ -10,6 +10,8 @@ import (
 	"testing"
 
 	"github.com/stretchr/testify/require"
+
+	"github.com/Azure/unbounded/pkg/agent/isolation/nspawn"
 )
 
 // hostMissingOurPackages builds a PATH resembling a host where bootstrap died
@@ -88,6 +90,6 @@ func TestCleanupStillFailsOnRealInspectionErrors(t *testing.T) {
 		[]byte("#!/bin/sh\necho denied >&2\nexit 1\n"), 0o755))
 	t.Setenv("PATH", dir)
 
-	_, err := registeredMachineForCleanup(t.Context(), slog.New(slog.DiscardHandler), "kube1")
+	_, err := nspawn.RegisteredForCleanup(t.Context(), slog.New(slog.DiscardHandler), "kube1")
 	require.Error(t, err, "a tool that ran and failed is not proof of absence")
 }

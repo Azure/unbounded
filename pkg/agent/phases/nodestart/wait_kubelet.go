@@ -10,8 +10,8 @@ import (
 	"strings"
 	"time"
 
-	"github.com/Azure/unbounded/internal/executil"
 	"github.com/Azure/unbounded/pkg/agent/goalstates"
+	"github.com/Azure/unbounded/pkg/agent/isolation/nspawn"
 	"github.com/Azure/unbounded/pkg/agent/phases"
 )
 
@@ -52,9 +52,7 @@ func (w *waitForKubelet) Do(ctx context.Context) error {
 	defer cancel()
 
 	for {
-		out, err := executil.MachineRun(ctx, w.log, w.machine,
-			"systemctl", "is-active", goalstates.SystemdUnitKubelet,
-		)
+		out, err := nspawn.Exec(ctx, w.log, w.machine, "systemctl", "is-active", goalstates.SystemdUnitKubelet)
 		if err == nil && strings.TrimSpace(out) == "active" {
 			w.log.Info("kubelet is active", "machine", w.machine)
 			return nil
@@ -78,7 +76,7 @@ func (w *waitForKubeletBootstrap) Do(ctx context.Context) error {
 	defer cancel()
 
 	for {
-		if _, err := executil.MachineRun(ctx, w.log, w.machine, "test", "-s", goalstates.KubeletKubeconfigPath); err == nil {
+		if _, err := nspawn.Exec(ctx, w.log, w.machine, "test", "-s", goalstates.KubeletKubeconfigPath); err == nil {
 			w.log.Info("kubelet bootstrap completed", "machine", w.machine, "kubeconfig", goalstates.KubeletKubeconfigPath)
 			return nil
 		}

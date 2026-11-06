@@ -18,6 +18,7 @@ import (
 
 	"github.com/Azure/unbounded/pkg/agent/config"
 	"github.com/Azure/unbounded/pkg/agent/goalstates"
+	"github.com/Azure/unbounded/pkg/agent/isolation/nspawn"
 )
 
 func TestServiceOverride_RenderedSnapshot(t *testing.T) {
@@ -45,7 +46,7 @@ func TestNSpawnRenderedScenarios(t *testing.T) {
 		"cpu-only": nspawnRenderScenarioData(),
 		"nvidia-gb300-rack-full": func() nspawnTemplateData {
 			data := nspawnRenderScenarioData()
-			data.NvidiaDeviceTargets = nvidiaNSpawnDeviceTargets([]string{
+			data.NvidiaDeviceTargets = nspawn.NvidiaDeviceTargets([]string{
 				"/dev/dri/card0",
 				"/dev/dri/card1",
 				"/dev/dri/card2",
@@ -82,17 +83,17 @@ func TestNSpawnRenderedScenarios(t *testing.T) {
 		}(),
 		"nvidia-all-helpers": func() nspawnTemplateData {
 			data := nspawnRenderScenarioData()
-			data.NvidiaDeviceTargets = nvidiaNSpawnDeviceTargets([]string{
+			data.NvidiaDeviceTargets = nspawn.NvidiaDeviceTargets([]string{
 				"/dev/nvidia0",
 				"/dev/nvidiactl",
 				"/dev/nvidia-uvm",
 				"/dev/dri/renderD128",
 			})
-			data.NvidiaBinDir = nvidiaHostBinDir(goalstates.NvidiaHost{
+			data.NvidiaBinDir = goalstates.NvidiaHost{
 				NvidiaSMIPath:     "/usr/bin/nvidia-smi",
 				NvidiaIMEXPath:    "/usr/bin/nvidia-imex",
 				NvidiaIMEXCtlPath: "/usr/bin/nvidia-imex-ctl",
-			})
+			}.HostBinDir()
 
 			return data
 		}(),
@@ -113,7 +114,7 @@ func TestServiceOverride_HostDevicesDeviceAllow(t *testing.T) {
 
 	data := defaultNSpawnTemplateData("kube1")
 	data.HostDevicePaths = []string{"/dev/kvm"}
-	require.NoError(t, nspawnTemplates.ExecuteTemplate(&buf, "service-override.conf", data))
+	require.NoError(t, nspawn.Templates.ExecuteTemplate(&buf, "service-override.conf", data))
 
 	out := buf.String()
 
@@ -130,7 +131,7 @@ func TestServiceOverride_HostDeviceGroupSpecifiers(t *testing.T) {
 	t.Parallel()
 
 	var nspawnBuf bytes.Buffer
-	require.NoError(t, nspawnTemplates.ExecuteTemplate(&nspawnBuf, "nspawn.conf", nspawnTemplateData{
+	require.NoError(t, nspawn.Templates.ExecuteTemplate(&nspawnBuf, "nspawn.conf", nspawnTemplateData{
 		BPFFSMountPath:               goalstates.BPFFSMountPath("kube1"),
 		ContainerImageArchiveDir:     goalstates.ContainerImageArchiveDir,
 		ContainerImageArchiveHostDir: goalstates.ContainerImageArchiveHostDir,
@@ -138,7 +139,7 @@ func TestServiceOverride_HostDeviceGroupSpecifiers(t *testing.T) {
 	}))
 
 	var overrideBuf bytes.Buffer
-	require.NoError(t, nspawnTemplates.ExecuteTemplate(&overrideBuf, "service-override.conf", nspawnTemplateData{
+	require.NoError(t, nspawn.Templates.ExecuteTemplate(&overrideBuf, "service-override.conf", nspawnTemplateData{
 		MachineName:               "kube1",
 		BPFFSMountPath:            goalstates.BPFFSMountPath("kube1"),
 		HostDeviceGroupSpecifiers: []string{"char-input", "char-pts"},
@@ -158,10 +159,10 @@ func TestServiceOverride_MultipleHostDevices(t *testing.T) {
 
 	data := defaultNSpawnTemplateData("kube1")
 	data.HostDevicePaths = devices
-	require.NoError(t, nspawnTemplates.ExecuteTemplate(&nspawnBuf, "nspawn.conf", data))
+	require.NoError(t, nspawn.Templates.ExecuteTemplate(&nspawnBuf, "nspawn.conf", data))
 
 	var overrideBuf bytes.Buffer
-	require.NoError(t, nspawnTemplates.ExecuteTemplate(&overrideBuf, "service-override.conf", data))
+	require.NoError(t, nspawn.Templates.ExecuteTemplate(&overrideBuf, "service-override.conf", data))
 
 	// Every host device must get both a bind mount in the .nspawn config and a
 	// matching cgroup DeviceAllow in the service drop-in; otherwise the node is
@@ -178,14 +179,14 @@ func TestNSpawnConfig_NVIDIAModesetDevice(t *testing.T) {
 	const modeset = "/dev/nvidia-modeset"
 
 	data := defaultNSpawnTemplateData("kube1")
-	data.NvidiaDeviceTargets = nvidiaNSpawnDeviceTargets([]string{modeset})
+	data.NvidiaDeviceTargets = nspawn.NvidiaDeviceTargets([]string{modeset})
 
 	var nspawnBuf bytes.Buffer
-	require.NoError(t, nspawnTemplates.ExecuteTemplate(&nspawnBuf, "nspawn.conf", data))
+	require.NoError(t, nspawn.Templates.ExecuteTemplate(&nspawnBuf, "nspawn.conf", data))
 	require.Contains(t, nspawnBuf.String(), "Bind="+modeset)
 
 	var overrideBuf bytes.Buffer
-	require.NoError(t, nspawnTemplates.ExecuteTemplate(&overrideBuf, "service-override.conf", data))
+	require.NoError(t, nspawn.Templates.ExecuteTemplate(&overrideBuf, "service-override.conf", data))
 	require.Contains(t, overrideBuf.String(), "DeviceAllow="+modeset+" rwm")
 }
 
@@ -195,21 +196,21 @@ func TestNSpawnConfig_NVIDIAGPUDirectStorage(t *testing.T) {
 	const nvidiaFS = "/dev/nvidia-fs0"
 
 	data := defaultNSpawnTemplateData("kube1")
-	data.NvidiaDeviceTargets = nvidiaNSpawnDeviceTargets([]string{"/dev/nvidia0", nvidiaFS})
+	data.NvidiaDeviceTargets = nspawn.NvidiaDeviceTargets([]string{"/dev/nvidia0", nvidiaFS})
 
 	var nspawnBuf bytes.Buffer
-	require.NoError(t, nspawnTemplates.ExecuteTemplate(&nspawnBuf, "nspawn.conf", data))
+	require.NoError(t, nspawn.Templates.ExecuteTemplate(&nspawnBuf, "nspawn.conf", data))
 	require.Contains(t, nspawnBuf.String(), "Bind="+nvidiaFS+"\n")
 	require.Contains(t, nspawnBuf.String(), "BindReadOnly=/run/udev\n")
 
 	var overrideBuf bytes.Buffer
-	require.NoError(t, nspawnTemplates.ExecuteTemplate(&overrideBuf, "service-override.conf", data))
+	require.NoError(t, nspawn.Templates.ExecuteTemplate(&overrideBuf, "service-override.conf", data))
 	require.Contains(t, overrideBuf.String(), "DeviceAllow="+nvidiaFS+" rwm")
 
 	data.NvidiaDeviceTargets = nil
 
 	nspawnBuf.Reset()
-	require.NoError(t, nspawnTemplates.ExecuteTemplate(&nspawnBuf, "nspawn.conf", data))
+	require.NoError(t, nspawn.Templates.ExecuteTemplate(&nspawnBuf, "nspawn.conf", data))
 	require.NotContains(t, nspawnBuf.String(), "/run/udev")
 }
 
@@ -223,10 +224,10 @@ func TestServiceOverride_AMDGPUDevices(t *testing.T) {
 	data := defaultNSpawnTemplateData("kube1")
 	data.AMDGPUDevicePaths = devices
 	data.AMDSysFSPaths = []string{"/sys/module/amdgpu", "/sys/class/kfd"}
-	require.NoError(t, nspawnTemplates.ExecuteTemplate(&nspawnBuf, "nspawn.conf", data))
+	require.NoError(t, nspawn.Templates.ExecuteTemplate(&nspawnBuf, "nspawn.conf", data))
 
 	var overrideBuf bytes.Buffer
-	require.NoError(t, nspawnTemplates.ExecuteTemplate(&overrideBuf, "service-override.conf", data))
+	require.NoError(t, nspawn.Templates.ExecuteTemplate(&overrideBuf, "service-override.conf", data))
 
 	for _, dev := range devices {
 		require.Contains(t, nspawnBuf.String(), "Bind="+dev)
@@ -243,8 +244,8 @@ func TestNSpawnConfig_NVIDIADriverRootMounts(t *testing.T) {
 	t.Parallel()
 
 	var buf bytes.Buffer
-	require.NoError(t, nspawnTemplates.ExecuteTemplate(&buf, "nspawn.conf", nspawnTemplateData{
-		NvidiaDeviceTargets: nvidiaNSpawnDeviceTargets([]string{"/dev/nvidia0"}),
+	require.NoError(t, nspawn.Templates.ExecuteTemplate(&buf, "nspawn.conf", nspawnTemplateData{
+		NvidiaDeviceTargets: nspawn.NvidiaDeviceTargets([]string{"/dev/nvidia0"}),
 		NvidiaLibDirMounts: []goalstates.NvidiaLibDirMount{{
 			HostDir:      "/usr/lib/x86_64-linux-gnu",
 			ContainerDir: "/run/host-nvidia/0",
@@ -266,7 +267,7 @@ func TestNSpawnConfig_AdditionalHostMounts(t *testing.T) {
 	t.Parallel()
 
 	var buf bytes.Buffer
-	require.NoError(t, nspawnTemplates.ExecuteTemplate(&buf, "nspawn.conf", nspawnTemplateData{
+	require.NoError(t, nspawn.Templates.ExecuteTemplate(&buf, "nspawn.conf", nspawnTemplateData{
 		AdditionalHostMounts: []config.AdditionalHostMount{
 			{Source: "/opt/config", Target: "/opt/config", ReadOnly: true},
 			{Source: "/var/lib/data", Target: "/data"},
@@ -332,16 +333,16 @@ func TestNSpawnConfig_NvidiaIMEXDevice(t *testing.T) {
 		BPFFSMountPath:               goalstates.BPFFSMountPath("kube1"),
 		ContainerImageArchiveDir:     goalstates.ContainerImageArchiveDir,
 		ContainerImageArchiveHostDir: goalstates.ContainerImageArchiveHostDir,
-		NvidiaDeviceTargets:          nvidiaNSpawnDeviceTargets([]string{"/dev/nvidia-caps", channels}),
+		NvidiaDeviceTargets:          nspawn.NvidiaDeviceTargets([]string{"/dev/nvidia-caps", channels}),
 	}
 
 	var nspawnBuf bytes.Buffer
-	require.NoError(t, nspawnTemplates.ExecuteTemplate(&nspawnBuf, "nspawn.conf", data))
+	require.NoError(t, nspawn.Templates.ExecuteTemplate(&nspawnBuf, "nspawn.conf", data))
 	require.Contains(t, nspawnBuf.String(), "Bind=/dev/nvidia-caps")
 	require.Contains(t, nspawnBuf.String(), "Bind="+channels)
 
 	var overrideBuf bytes.Buffer
-	require.NoError(t, nspawnTemplates.ExecuteTemplate(&overrideBuf, "service-override.conf", data))
+	require.NoError(t, nspawn.Templates.ExecuteTemplate(&overrideBuf, "service-override.conf", data))
 	require.Contains(t, overrideBuf.String(), "DeviceAllow=char-nvidia-caps rwm")
 	require.Contains(t, overrideBuf.String(), "DeviceAllow=char-nvidia-caps-imex-channels rwm")
 	require.NotContains(t, overrideBuf.String(), "DeviceAllow=/dev/nvidia-caps rwm")
@@ -349,31 +350,11 @@ func TestNSpawnConfig_NvidiaIMEXDevice(t *testing.T) {
 	require.NotContains(t, overrideBuf.String(), "DevicePolicy=")
 }
 
-func TestNvidiaHostBinDirFallsBackToIMEX(t *testing.T) {
-	t.Parallel()
-
-	require.Equal(t, "/usr/bin", nvidiaHostBinDir(goalstates.NvidiaHost{
-		NvidiaIMEXPath:    "/usr/bin/nvidia-imex",
-		NvidiaIMEXCtlPath: "/usr/bin/nvidia-imex-ctl",
-	}))
-}
-
-func TestPathsExcluding(t *testing.T) {
-	t.Parallel()
-
-	got := pathsExcluding(
-		[]string{"/dev/dri/card0", "/dev/dri/renderD128", "/dev/kfd"},
-		[]string{"/dev/dri/card0", "/dev/dri/renderD128"},
-	)
-
-	require.Equal(t, []string{"/dev/kfd"}, got)
-}
-
 func TestServiceOverride_BaseDeviceAllow(t *testing.T) {
 	t.Parallel()
 
 	var buf bytes.Buffer
-	require.NoError(t, nspawnTemplates.ExecuteTemplate(&buf, "service-override.conf", defaultNSpawnTemplateData("kube1")))
+	require.NoError(t, nspawn.Templates.ExecuteTemplate(&buf, "service-override.conf", defaultNSpawnTemplateData("kube1")))
 
 	out := buf.String()
 
@@ -401,7 +382,7 @@ func TestConfigRegenerationUnit(t *testing.T) {
 	t.Parallel()
 
 	var buf bytes.Buffer
-	require.NoError(t, nspawnTemplates.ExecuteTemplate(&buf, "config-regeneration.service", defaultNSpawnTemplateData("kube1")))
+	require.NoError(t, nspawn.Templates.ExecuteTemplate(&buf, "config-regeneration.service", defaultNSpawnTemplateData("kube1")))
 
 	out := buf.String()
 	require.Contains(t, out, "Description=Regenerate configuration for kube1")
@@ -421,7 +402,7 @@ func TestServiceOverride_NVIDIAReconcilesOnEveryStart(t *testing.T) {
 	data := defaultNSpawnTemplateData("kube1")
 
 	var buf bytes.Buffer
-	require.NoError(t, nspawnTemplates.ExecuteTemplate(&buf, "service-override.conf", data))
+	require.NoError(t, nspawn.Templates.ExecuteTemplate(&buf, "service-override.conf", data))
 	require.Contains(t, buf.String(), "ExecStartPost=/opt/unbounded/agent/bin/unbounded-agent-nspawn-lifecycle nspawn-lifecycle post-start kube1")
 	require.NotContains(t, buf.String(), "ExecStartPost=-")
 	require.NotContains(t, buf.String(), "if [ ! -x")
@@ -431,7 +412,7 @@ func TestServiceOverride_CPUNodesRunCommonPostStartHook(t *testing.T) {
 	t.Parallel()
 
 	var buf bytes.Buffer
-	require.NoError(t, nspawnTemplates.ExecuteTemplate(&buf, "service-override.conf", defaultNSpawnTemplateData("kube1")))
+	require.NoError(t, nspawn.Templates.ExecuteTemplate(&buf, "service-override.conf", defaultNSpawnTemplateData("kube1")))
 	require.Contains(t, buf.String(), "nspawn-lifecycle post-start")
 }
 
@@ -608,7 +589,7 @@ func requireRenderedGolden(t *testing.T, name string, data nspawnTemplateData) {
 
 	for _, templateName := range []string{"nspawn.conf", "service-override.conf"} {
 		var buf bytes.Buffer
-		require.NoError(t, nspawnTemplates.ExecuteTemplate(&buf, templateName, data))
+		require.NoError(t, nspawn.Templates.ExecuteTemplate(&buf, templateName, data))
 		requireGolden(t, filepath.Join("testdata", "render", name+"."+templateName+".golden"), buf.String())
 	}
 }
@@ -632,7 +613,7 @@ func requireRenderedSnapshot(t *testing.T, goldenFile, templateName string, data
 	t.Helper()
 
 	var buf bytes.Buffer
-	require.NoError(t, nspawnTemplates.ExecuteTemplate(&buf, templateName, data))
+	require.NoError(t, nspawn.Templates.ExecuteTemplate(&buf, templateName, data))
 
 	expected, err := os.ReadFile("testdata/" + goldenFile)
 	require.NoError(t, err)
@@ -710,7 +691,7 @@ func TestAdditionalHostMounts_ConfigToNSpawn(t *testing.T) {
 	// Step 4: render the nspawn.conf template with the resolved mounts and
 	// verify that the correct Bind / BindReadOnly directives are emitted.
 	var buf bytes.Buffer
-	require.NoError(t, nspawnTemplates.ExecuteTemplate(&buf, "nspawn.conf", nspawnTemplateData{
+	require.NoError(t, nspawn.Templates.ExecuteTemplate(&buf, "nspawn.conf", nspawnTemplateData{
 		BPFFSMountPath:               goalstates.BPFFSMountPath("machine-1"),
 		ContainerImageArchiveDir:     goalstates.ContainerImageArchiveDir,
 		ContainerImageArchiveHostDir: goalstates.ContainerImageArchiveHostDir,
@@ -744,28 +725,18 @@ func TestNSpawnConfig_DeviceDirectoryMounts(t *testing.T) {
 
 	data := defaultNSpawnTemplateData("kube1")
 	data.AdditionalHostMounts = mounts
-	data.MountDeviceAllow = mountDeviceAllowEntries(mounts)
+	data.MountDeviceAllow = nspawn.MountDeviceAllowEntries(mounts)
 
 	var nspawnBuf bytes.Buffer
-	require.NoError(t, nspawnTemplates.ExecuteTemplate(&nspawnBuf, "nspawn.conf", data))
+	require.NoError(t, nspawn.Templates.ExecuteTemplate(&nspawnBuf, "nspawn.conf", data))
 	require.Contains(t, nspawnBuf.String(), "Bind=/dev/infiniband:/dev/infiniband\n")
 	require.Contains(t, nspawnBuf.String(), "Bind=/dev/dri:/dev/dri\n")
 	require.NotContains(t, nspawnBuf.String(), "Bind=/dev/infiniband/")
 
 	var overrideBuf bytes.Buffer
-	require.NoError(t, nspawnTemplates.ExecuteTemplate(&overrideBuf, "service-override.conf", data))
+	require.NoError(t, nspawn.Templates.ExecuteTemplate(&overrideBuf, "service-override.conf", data))
 
 	for _, allow := range []string{"char-infiniband_verbs", "/dev/infiniband/rdma_cm", "char-drm"} {
 		require.Contains(t, overrideBuf.String(), "DeviceAllow="+allow+" rwm\n")
 	}
-}
-
-func TestMountDeviceAllowEntries(t *testing.T) {
-	t.Parallel()
-
-	require.Nil(t, mountDeviceAllowEntries([]config.AdditionalHostMount{{Source: "/a"}}))
-	require.Equal(t, []string{"char-a", "char-b"}, mountDeviceAllowEntries([]config.AdditionalHostMount{
-		{DeviceAllow: []string{"char-b", "char-a"}},
-		{DeviceAllow: []string{"char-a"}},
-	}))
 }

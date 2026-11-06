@@ -5,7 +5,7 @@ package goalstates
 
 type NodeStart struct {
 	// MachineName is the local systemd-nspawn machine name (e.g. "kube1").
-	// Used by machinectl commands and nspawn service management.
+	// Used by nspawn service management.
 	MachineName string
 
 	// KubeMachineName is the Kubernetes Machine CR name (e.g. "agent-e2e").
@@ -16,6 +16,8 @@ type NodeStart struct {
 	// NodeName is the Kubernetes Node name used by kubelet and host-side daemon watches.
 	NodeName string
 
+	// MachineDir is the nspawn backend's root directory. It is an intentional
+	// nspawn-only goal state field; phases reach it through Root().
 	MachineDir string // e.g. /var/lib/machines/node
 	Containerd Containerd
 	Gantry     Gantry

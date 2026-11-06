@@ -134,3 +134,35 @@ func TestMountedNoexec(t *testing.T) {
 	_, err = fsutil.MountedNoexec(filepath.Join(t.TempDir(), "missing"))
 	require.ErrorContains(t, err, "inspect the filesystem of")
 }
+
+func TestWriteFileAtomicCreatesParentsAndReplaces(t *testing.T) {
+	t.Parallel()
+
+	path := filepath.Join(t.TempDir(), "a", "b", "file")
+	require.NoError(t, fsutil.WriteFileAtomic(path, []byte("one"), 0o644))
+	require.NoError(t, fsutil.WriteFileAtomic(path, []byte("two"), 0o644))
+
+	got, err := os.ReadFile(path)
+	require.NoError(t, err)
+	require.Equal(t, "two", string(got))
+
+	info, err := os.Stat(path)
+	require.NoError(t, err)
+	require.Equal(t, os.FileMode(0o644), info.Mode().Perm())
+	require.NoFileExists(t, path+".tmp")
+
+	dir, err := os.Stat(filepath.Dir(path))
+	require.NoError(t, err)
+	require.Equal(t, os.FileMode(0o755), dir.Mode().Perm())
+}
+
+func TestWriteFileAtomicFailureLeavesNoTemporaryFile(t *testing.T) {
+	t.Parallel()
+
+	// A directory at the destination makes the rename fail.
+	path := filepath.Join(t.TempDir(), "dest")
+	require.NoError(t, os.MkdirAll(filepath.Join(path, "child"), 0o755))
+
+	require.Error(t, fsutil.WriteFileAtomic(path, []byte("x"), 0o644))
+	require.NoFileExists(t, path+".tmp")
+}
