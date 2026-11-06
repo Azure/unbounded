@@ -87,14 +87,20 @@ func (e *fakeStageExecutor) ExecuteInvocation(
 
 	participants := make([]signalv1.InvocationParticipantResult, 0, len(invocation.Participants))
 	for _, participant := range invocation.Participants {
+		fingerprint := signalv1.NodeFingerprint{
+			NodeUID:            participant.NodeUID,
+			BootID:             "boot",
+			DriverVersion:      "580.1",
+			GPUInventoryDigest: "sha256:" + strings.Repeat("a", 64),
+		}
 		participants = append(participants, signalv1.InvocationParticipantResult{
 			Index:          participant.Index,
 			Role:           invocation.ParticipantRole[participant.Index],
 			Outcome:        outcome,
-			Start:          signalv1.NodeFingerprint{NodeUID: participant.NodeUID, BootID: "boot"},
-			End:            signalv1.NodeFingerprint{NodeUID: participant.NodeUID, BootID: "boot"},
-			VisibleDevices: []string{"gpu-0"},
-			CoveredDevices: []string{"gpu-0"},
+			Start:          fingerprint,
+			End:            fingerprint,
+			VisibleDevices: []string{"gpu-index-0"},
+			CoveredDevices: []string{"gpu-index-0"},
 		})
 	}
 
@@ -385,6 +391,107 @@ func TestStageRunnerRejectsRawGPUIdentity(t *testing.T) {
 	executor := &rawDeviceExecutor{fakeStageExecutor: fakeStageExecutor{clock: clock}}
 
 	summary, err := (StageRunner{Clock: clock, Executor: executor}).Execute(context.Background(), request)
+	if err != nil {
+		t.Fatalf("Execute() error = %v", err)
+	}
+
+	if summary.Verdict != signalv1.StageVerdictInconclusive {
+		t.Fatalf("summary verdict = %s, want Inconclusive", summary.Verdict)
+	}
+}
+
+func TestStageRunnerRejectsInvalidQualificationFingerprints(t *testing.T) {
+	t.Parallel()
+
+	for _, testCase := range []struct {
+		name   string
+		mutate func(*signalv1.InvocationResultEnvelope)
+	}{
+		{
+			name: "missing driver",
+			mutate: func(envelope *signalv1.InvocationResultEnvelope) {
+				envelope.Participants[0].Start.DriverVersion = ""
+				envelope.Participants[0].End.DriverVersion = ""
+			},
+		},
+		{
+			name: "mismatched driver",
+			mutate: func(envelope *signalv1.InvocationResultEnvelope) {
+				envelope.Participants[0].End.DriverVersion = "590.0"
+			},
+		},
+		{
+			name: "missing digest",
+			mutate: func(envelope *signalv1.InvocationResultEnvelope) {
+				envelope.Participants[0].Start.GPUInventoryDigest = ""
+				envelope.Participants[0].End.GPUInventoryDigest = ""
+			},
+		},
+		{
+			name: "invalid digest",
+			mutate: func(envelope *signalv1.InvocationResultEnvelope) {
+				envelope.Participants[0].Start.GPUInventoryDigest = "sha256:invalid"
+				envelope.Participants[0].End.GPUInventoryDigest = "sha256:invalid"
+			},
+		},
+		{
+			name: "noncanonical visible device",
+			mutate: func(envelope *signalv1.InvocationResultEnvelope) {
+				envelope.Participants[0].VisibleDevices = []string{"gpu-index-01"}
+			},
+		},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			clock := &fakeStageClock{now: time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)}
+			request := stageExecutionRequest(signalv1.StageSchedule{
+				Mode:              signalv1.CheckExecutionModeRunOnce,
+				InvocationTimeout: metav1.Duration{Duration: time.Minute},
+			})
+			executor := &fingerprintMutationExecutor{
+				fakeStageExecutor: fakeStageExecutor{clock: clock},
+				mutate:            testCase.mutate,
+			}
+
+			summary, err := (StageRunner{Clock: clock, Executor: executor}).Execute(
+				context.Background(),
+				request,
+			)
+			if err != nil {
+				t.Fatalf("Execute() error = %v", err)
+			}
+
+			if summary.Verdict != signalv1.StageVerdictInconclusive {
+				t.Fatalf("summary verdict = %s, want Inconclusive", summary.Verdict)
+			}
+		})
+	}
+}
+
+func TestStageRunnerRejectsMixedParticipantDriverVersions(t *testing.T) {
+	t.Parallel()
+
+	clock := &fakeStageClock{now: time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)}
+	request := stageExecutionRequest(signalv1.StageSchedule{
+		Mode:              signalv1.CheckExecutionModeRunOnce,
+		InvocationTimeout: metav1.Duration{Duration: time.Minute},
+	})
+	request.Participants = append(request.Participants, signalv1.Participant{
+		Index:    1,
+		NodeName: "worker-1",
+		NodeUID:  types.UID("node-uid-1"),
+	})
+	executor := &fingerprintMutationExecutor{
+		fakeStageExecutor: fakeStageExecutor{clock: clock},
+		mutate: func(envelope *signalv1.InvocationResultEnvelope) {
+			envelope.Participants[1].Start.DriverVersion = "590.0"
+			envelope.Participants[1].End.DriverVersion = "590.0"
+		},
+	}
+
+	summary, err := (StageRunner{Clock: clock, Executor: executor}).Execute(
+		context.Background(),
+		request,
+	)
 	if err != nil {
 		t.Fatalf("Execute() error = %v", err)
 	}
@@ -793,6 +900,21 @@ func (e *rawDeviceExecutor) ExecuteInvocation(
 ) (signalv1.InvocationResultEnvelope, error) {
 	envelope, err := e.fakeStageExecutor.ExecuteInvocation(ctx, invocation)
 	envelope.Participants[0].VisibleDevices = []string{"GPU-aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"}
+
+	return envelope, err
+}
+
+type fingerprintMutationExecutor struct {
+	fakeStageExecutor
+	mutate func(*signalv1.InvocationResultEnvelope)
+}
+
+func (e *fingerprintMutationExecutor) ExecuteInvocation(
+	ctx context.Context,
+	invocation StageInvocation,
+) (signalv1.InvocationResultEnvelope, error) {
+	envelope, err := e.fakeStageExecutor.ExecuteInvocation(ctx, invocation)
+	e.mutate(&envelope)
 
 	return envelope, err
 }

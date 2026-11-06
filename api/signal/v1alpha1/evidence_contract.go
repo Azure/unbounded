@@ -200,6 +200,10 @@ type StageEvidenceSummary struct {
 	DeviceIntervalCoverage []DeviceIntervalCoverageSummary `json:"deviceIntervalCoverage,omitempty"`
 	// +kubebuilder:validation:MaxItems=8
 	// +listType=map
+	// +listMapKey=index
+	Participants []ParticipantEvidenceIdentity `json:"participants,omitempty"`
+	// +kubebuilder:validation:MaxItems=8
+	// +listType=map
 	// +listMapKey=name
 	Assertions []AssertionResult `json:"assertions,omitempty"`
 	// InvocationEvidence is a bounded index into the durable invocation

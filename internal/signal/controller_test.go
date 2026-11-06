@@ -196,7 +196,22 @@ func TestValidateStageEvidenceSummaryBoundaries(t *testing.T) {
 		FirstInvocationAt:        &started,
 		LastInvocationAt:         &finished,
 		MaxStartGap:              testDurationPointer(10 * time.Minute),
-		DurableEvidenceDigest:    "sha256:" + strings.Repeat("b", 64),
+		Participants: []signalv1.ParticipantEvidenceIdentity{{
+			Index:   0,
+			Role:    signalv1.ParticipantRoleRequester,
+			Verdict: signalv1.QualificationVerdictPass,
+			Start: signalv1.NodeFingerprint{
+				NodeUID:            "node-uid",
+				DriverVersion:      "580.1",
+				GPUInventoryDigest: "sha256:" + strings.Repeat("8", 64),
+			},
+			End: signalv1.NodeFingerprint{
+				NodeUID:            "node-uid",
+				DriverVersion:      "580.1",
+				GPUInventoryDigest: "sha256:" + strings.Repeat("8", 64),
+			},
+		}},
+		DurableEvidenceDigest: "sha256:" + strings.Repeat("b", 64),
 	}
 
 	if err := validateStageEvidenceSummary(
@@ -988,6 +1003,9 @@ func resolvedTerminalTestRun(
 	}
 
 	fingerprint := nodeFingerprint(node)
+	stageFingerprint := fingerprint
+	stageFingerprint.DriverVersion = "580.1"
+	stageFingerprint.GPUInventoryDigest = "sha256:" + strings.Repeat("8", 64)
 	startedAt := metav1.NewTime(time.Date(2026, 11, 5, 17, 0, 0, 0, time.UTC))
 	finishedAt := metav1.NewTime(startedAt.Add(time.Minute))
 	assertionPassed := stageVerdict == signalv1.StageVerdictPassed
@@ -1026,6 +1044,21 @@ func resolvedTerminalTestRun(
 		QualificationEligible: !diagnostic,
 		DiagnosticOnly:        diagnostic,
 	}
+	if !diagnostic {
+		participantVerdict := signalv1.QualificationVerdictPass
+		if stageVerdict == signalv1.StageVerdictFailed {
+			participantVerdict = signalv1.QualificationVerdictFail
+		}
+
+		summary.Participants = []signalv1.ParticipantEvidenceIdentity{{
+			Index:   0,
+			Role:    signalv1.ParticipantRoleRequester,
+			Verdict: participantVerdict,
+			Start:   stageFingerprint,
+			End:     stageFingerprint,
+		}}
+	}
+
 	if stageVerdict == signalv1.StageVerdictFailed {
 		summary.SuccessfulInvocations = 0
 		summary.FailedInvocations = 1

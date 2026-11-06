@@ -2046,6 +2046,11 @@ func (in *StageEvidenceSummary) DeepCopyInto(out *StageEvidenceSummary) {
 		*out = make([]DeviceIntervalCoverageSummary, len(*in))
 		copy(*out, *in)
 	}
+	if in.Participants != nil {
+		in, out := &in.Participants, &out.Participants
+		*out = make([]ParticipantEvidenceIdentity, len(*in))
+		copy(*out, *in)
+	}
 	if in.Assertions != nil {
 		in, out := &in.Assertions, &out.Assertions
 		*out = make([]AssertionResult, len(*in))

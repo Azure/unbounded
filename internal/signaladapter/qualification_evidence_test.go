@@ -28,6 +28,7 @@ func TestApplyQualificationEvidenceAttributesPodParticipants(t *testing.T) {
 		qualificationResult(0, "Pass", "participant-zero", started),
 		qualificationResult(1, "Fail", "participant-one", started),
 	}
+	results[0].Measurements = `{"qualification":{"driverVersion":"580.1","gpuInventoryDigest":"sha256:b553224e314b1f8192da92db1febdbcd2bad39ab8bf106fb1da46cf148920cf8","visibleDevices":["gpu-index-0"],"coveredDevices":["gpu-index-0"]}}`
 
 	applyQualificationEvidence(
 		&evidence,
@@ -56,8 +57,8 @@ func TestApplyQualificationEvidenceSeparatesMPIGroupAndParticipantObservation(t 
 	started := time.Date(2026, 1, 2, 3, 4, 5, 0, time.UTC)
 	evidence := qualificationEvidenceSkeleton(2)
 	measurements := `{"qualification":{"participants":[` +
-		`{"participantIndex":0,"visibleDevices":["gpu-a"],"coveredDevices":["gpu-a"]},` +
-		`{"participantIndex":1,"visibleDevices":["gpu-b"],"coveredDevices":["gpu-b"]}]}}`
+		`{"participantIndex":0,"driverVersion":"1.0","gpuInventoryDigest":"sha256:b553224e314b1f8192da92db1febdbcd2bad39ab8bf106fb1da46cf148920cf8","visibleDevices":["gpu-index-2","gpu-index-0","gpu-index-1"],"coveredDevices":["gpu-index-0","gpu-index-1","gpu-index-2"]},` +
+		`{"participantIndex":1,"driverVersion":"1.0","gpuInventoryDigest":"sha256:27c73c2f1eb444c0c09847b6d533641e3c9e56327456793bb2e0d8c2ff78b9a0","visibleDevices":["gpu-index-0"],"coveredDevices":["gpu-index-0"]}]}}`
 	results := []Result{
 		qualificationResult(0, "Pass", "group-passed", started),
 		qualificationResult(1, "Pass", "group-passed", started),
@@ -84,6 +85,15 @@ func TestApplyQualificationEvidenceSeparatesMPIGroupAndParticipantObservation(t 
 		}
 	}
 
+	if evidence.Participants[0].Start.DriverVersion != "1.0" ||
+		evidence.Participants[1].Start.DriverVersion != "1.0" ||
+		evidence.Participants[0].Start.GPUInventoryDigest !=
+			"sha256:b553224e314b1f8192da92db1febdbcd2bad39ab8bf106fb1da46cf148920cf8" ||
+		evidence.Participants[1].Start.GPUInventoryDigest !=
+			"sha256:27c73c2f1eb444c0c09847b6d533641e3c9e56327456793bb2e0d8c2ff78b9a0" {
+		t.Fatalf("per-participant fingerprint provenance = %#v", evidence.Participants)
+	}
+
 	evidence.Participants[1].CaptureError = "worker identity was not observed"
 	applyQualificationEvidence(
 		&evidence,
@@ -100,7 +110,7 @@ func TestApplyQualificationEvidenceSeparatesMPIGroupAndParticipantObservation(t 
 	evidence = qualificationEvidenceSkeleton(2)
 	addHealthyMPIWorkers(&evidence)
 
-	results[0].Measurements = `{"qualification":{"participants":[{"participantIndex":0,"visibleDevices":["gpu-a"],"coveredDevices":["gpu-a"]}]}}`
+	results[0].Measurements = `{"qualification":{"participants":[{"participantIndex":0,"driverVersion":"1.0","gpuInventoryDigest":"sha256:b553224e314b1f8192da92db1febdbcd2bad39ab8bf106fb1da46cf148920cf8","visibleDevices":["gpu-index-0"],"coveredDevices":["gpu-index-0"]}]}}`
 	results[1].Measurements = results[0].Measurements
 	applyQualificationEvidence(
 		&evidence,
@@ -110,7 +120,7 @@ func TestApplyQualificationEvidenceSeparatesMPIGroupAndParticipantObservation(t 
 		qualificationFingerprints("boot-a", "boot-a"),
 	)
 
-	if evidence.Participants[1].Verdict.Reason != "PerDeviceCoverageNotProven" {
+	if evidence.Participants[1].Verdict.Reason != "ParticipantFingerprintNotProven" {
 		t.Fatalf("missing MPI participant evidence = %#v", evidence.Participants[1].Verdict)
 	}
 }
@@ -134,7 +144,7 @@ func TestApplyQualificationEvidenceEnforcesContinuity(t *testing.T) {
 		started.Add(10 * time.Second),
 		started.Add(20 * time.Second),
 	}
-	result.Measurements = `{"throughput":42,"qualification":{"driverVersion":"1.2.3","visibleDevices":["gpu-a","gpu-b"],"coveredDevices":["gpu-b","gpu-a"]}}`
+	result.Measurements = `{"throughput":42,"qualification":{"driverVersion":"1.2.3","gpuInventoryDigest":"sha256:b553224e314b1f8192da92db1febdbcd2bad39ab8bf106fb1da46cf148920cf8","visibleDevices":["gpu-index-1","gpu-index-0"],"coveredDevices":["gpu-index-0","gpu-index-1"]}}`
 
 	evidence := qualificationEvidenceSkeleton(1)
 	applyQualificationEvidence(
@@ -179,7 +189,7 @@ func TestApplyQualificationEvidenceEnforcesContinuity(t *testing.T) {
 		{
 			name: "incomplete devices",
 			mutate: func(result *Result, _ []signalv1.NodeFingerprint) {
-				result.Measurements = `{"qualification":{"visibleDevices":["gpu-a","gpu-b"],"coveredDevices":["gpu-a"]}}`
+				result.Measurements = `{"qualification":{"driverVersion":"1.2.3","gpuInventoryDigest":"sha256:b553224e314b1f8192da92db1febdbcd2bad39ab8bf106fb1da46cf148920cf8","visibleDevices":["gpu-index-0","gpu-index-1"],"coveredDevices":["gpu-index-0"]}}`
 			},
 			wantReason: "PerDeviceCoverageNotProven",
 		},
@@ -188,7 +198,7 @@ func TestApplyQualificationEvidenceEnforcesContinuity(t *testing.T) {
 			mutate: func(result *Result, _ []signalv1.NodeFingerprint) {
 				result.Measurements = `{"qualification":`
 			},
-			wantReason: "PerDeviceCoverageNotProven",
+			wantReason: "ParticipantFingerprintNotProven",
 		},
 	}
 
@@ -212,6 +222,109 @@ func TestApplyQualificationEvidenceEnforcesContinuity(t *testing.T) {
 			if testEvidence.Participants[0].Verdict.Verdict != "Inconclusive" ||
 				testEvidence.Participants[0].Verdict.Reason != testCase.wantReason {
 				t.Fatalf("verdict = %#v", testEvidence.Participants[0].Verdict)
+			}
+		})
+	}
+}
+
+func TestCanonicalGPUInventoryUsesNumericIndexOrder(t *testing.T) {
+	t.Parallel()
+
+	canonical, err := canonicalGPUInventory([]string{
+		"gpu-index-2",
+		"gpu-index-0",
+		"gpu-index-1",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if strings.Join(canonical, "\x00") != "gpu-index-0\x00gpu-index-1\x00gpu-index-2" {
+		t.Fatalf("canonical inventory = %#v", canonical)
+	}
+
+	for _, inventory := range [][]string{
+		nil,
+		{"gpu-0"},
+		{"gpu-index-02"},
+		{"gpu-index--1"},
+		{"gpu-index-"},
+		{"gpu-index-+1"},
+		{"gpu-index- 1"},
+		{"other-index-1"},
+		{"gpu-index-2147483648"},
+		{"gpu-index-0", "gpu-index-0"},
+		{"gpu-index-0", "gpu-index-2"},
+	} {
+		if _, err := canonicalGPUInventory(inventory); err == nil {
+			t.Fatalf("canonicalGPUInventory(%#v) unexpectedly succeeded", inventory)
+		}
+	}
+}
+
+func TestQualificationDigestIsIndependentOfRedactedDeviceOrder(t *testing.T) {
+	t.Parallel()
+
+	const digest = "sha256:b553224e314b1f8192da92db1febdbcd2bad39ab8bf106fb1da46cf148920cf8"
+	for _, visible := range []string{
+		`["gpu-index-2","gpu-index-0","gpu-index-1"]`,
+		`["gpu-index-0","gpu-index-1","gpu-index-2"]`,
+	} {
+		measurements, err := decodeQualificationMeasurements(
+			`{"qualification":{"driverVersion":"580.1","gpuInventoryDigest":"`+
+				digest+`","visibleDevices":`+visible+`,"coveredDevices":`+visible+`}}`,
+			0,
+			string(signalv1.ExecutionBackendPod),
+		)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		if measurements.GPUInventoryDigest != digest {
+			t.Fatalf("explicit digest = %q, want %q", measurements.GPUInventoryDigest, digest)
+		}
+	}
+}
+
+func TestApplyQualificationEvidenceRequiresExplicitFingerprint(t *testing.T) {
+	t.Parallel()
+
+	config := qualificationConfig(signalv1.ExecutionBackendPod)
+	started := time.Date(2026, 1, 2, 3, 4, 5, 0, time.UTC)
+
+	for _, testCase := range []struct {
+		name          string
+		qualification string
+	}{
+		{
+			name:          "missing digest",
+			qualification: `"driverVersion":"580.1","visibleDevices":["gpu-index-0"],"coveredDevices":["gpu-index-0"]`,
+		},
+		{
+			name:          "invalid digest",
+			qualification: `"driverVersion":"580.1","gpuInventoryDigest":"sha256:invalid","visibleDevices":["gpu-index-0"],"coveredDevices":["gpu-index-0"]`,
+		},
+		{
+			name:          "missing driver",
+			qualification: `"gpuInventoryDigest":"sha256:b553224e314b1f8192da92db1febdbcd2bad39ab8bf106fb1da46cf148920cf8","visibleDevices":["gpu-index-0"],"coveredDevices":["gpu-index-0"]`,
+		},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			result := qualificationResult(0, "Pass", "passed", started)
+			result.Measurements = `{"qualification":{` + testCase.qualification + `}}`
+			evidence := qualificationEvidenceSkeleton(1)
+
+			applyQualificationEvidence(
+				&evidence,
+				config,
+				[]Result{result},
+				qualificationFingerprints("boot-a"),
+				qualificationFingerprints("boot-a"),
+			)
+
+			if evidence.Participants[0].Verdict.Verdict != "Inconclusive" ||
+				evidence.Participants[0].Verdict.Reason != "ParticipantFingerprintNotProven" {
+				t.Fatalf("verdict = %#v", evidence.Participants[0].Verdict)
 			}
 		})
 	}

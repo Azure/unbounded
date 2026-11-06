@@ -2506,6 +2506,107 @@ spec:
                               x-kubernetes-validations:
                               - message: observedCoverageWindow must not be negative
                                 rule: duration(self) >= duration('0s')
+                            participants:
+                              items:
+                                properties:
+                                  end:
+                                    properties:
+                                      bootID:
+                                        maxLength: 128
+                                        type: string
+                                      driverVersion:
+                                        maxLength: 128
+                                        type: string
+                                      gpuInventoryDigest:
+                                        pattern: ^sha256:[0-9a-f]{64}$
+                                        type: string
+                                      kernelVersion:
+                                        maxLength: 256
+                                        type: string
+                                      kubeletVersion:
+                                        maxLength: 128
+                                        type: string
+                                      nodeUID:
+                                        description: |-
+                                          UID is a type that holds unique ID values, including UUIDs.  Because we
+                                          don't ONLY use UUIDs, this is an alias to string.  Being a type captures
+                                          intent and helps make sure that UIDs and names do not get conflated.
+                                        type: string
+                                      osImage:
+                                        maxLength: 256
+                                        type: string
+                                      systemUUID:
+                                        maxLength: 128
+                                        type: string
+                                    required:
+                                    - nodeUID
+                                    type: object
+                                    x-kubernetes-validations:
+                                    - message: nodeUID is required
+                                      rule: size(self.nodeUID) > 0
+                                  index:
+                                    format: int32
+                                    maximum: 7
+                                    minimum: 0
+                                    type: integer
+                                  role:
+                                    enum:
+                                    - Requester
+                                    - Participant
+                                    type: string
+                                  start:
+                                    properties:
+                                      bootID:
+                                        maxLength: 128
+                                        type: string
+                                      driverVersion:
+                                        maxLength: 128
+                                        type: string
+                                      gpuInventoryDigest:
+                                        pattern: ^sha256:[0-9a-f]{64}$
+                                        type: string
+                                      kernelVersion:
+                                        maxLength: 256
+                                        type: string
+                                      kubeletVersion:
+                                        maxLength: 128
+                                        type: string
+                                      nodeUID:
+                                        description: |-
+                                          UID is a type that holds unique ID values, including UUIDs.  Because we
+                                          don't ONLY use UUIDs, this is an alias to string.  Being a type captures
+                                          intent and helps make sure that UIDs and names do not get conflated.
+                                        type: string
+                                      osImage:
+                                        maxLength: 256
+                                        type: string
+                                      systemUUID:
+                                        maxLength: 128
+                                        type: string
+                                    required:
+                                    - nodeUID
+                                    type: object
+                                    x-kubernetes-validations:
+                                    - message: nodeUID is required
+                                      rule: size(self.nodeUID) > 0
+                                  verdict:
+                                    enum:
+                                    - Pass
+                                    - Fail
+                                    - Inconclusive
+                                    type: string
+                                required:
+                                - end
+                                - index
+                                - role
+                                - start
+                                - verdict
+                                type: object
+                              maxItems: 8
+                              type: array
+                              x-kubernetes-list-map-keys:
+                              - index
+                              x-kubernetes-list-type: map
                             phaseOrder:
                               format: int32
                               maximum: 15

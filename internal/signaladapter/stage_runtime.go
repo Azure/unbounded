@@ -368,6 +368,8 @@ func validateInvocationEnvelope(invocation StageInvocation, envelope *signalv1.I
 		expectedParticipants[participant.Index] = participant
 	}
 
+	driverVersion := ""
+
 	for _, participant := range envelope.Participants {
 		expected, exists := expectedParticipants[participant.Index]
 		if !exists ||
@@ -391,11 +393,62 @@ func validateInvocationEnvelope(invocation StageInvocation, envelope *signalv1.I
 			}
 		}
 
+		if invocation.Stage.QualificationEligible &&
+			!invocation.Stage.DiagnosticOnly &&
+			envelope.Outcome == signalv1.InvocationOutcomePassed {
+			if err := validateQualificationParticipantFingerprint(participant); err != nil {
+				return fmt.Errorf(
+					"invocation participant %d qualification fingerprint: %w",
+					participant.Index,
+					err,
+				)
+			}
+
+			if driverVersion == "" {
+				driverVersion = participant.Start.DriverVersion
+			} else if driverVersion != participant.Start.DriverVersion {
+				return errors.New("invocation result contains mixed participant driver versions")
+			}
+
+			if _, err := canonicalGPUInventory(participant.VisibleDevices); err != nil {
+				return fmt.Errorf(
+					"invocation participant %d visible GPU inventory: %w",
+					participant.Index,
+					err,
+				)
+			}
+
+			if _, err := canonicalGPUInventory(participant.CoveredDevices); err != nil {
+				return fmt.Errorf(
+					"invocation participant %d covered GPU inventory: %w",
+					participant.Index,
+					err,
+				)
+			}
+		}
+
 		delete(expectedParticipants, participant.Index)
 	}
 
 	if len(expectedParticipants) != 0 {
 		return errors.New("invocation result omits participants")
+	}
+
+	return nil
+}
+
+func validateQualificationParticipantFingerprint(participant signalv1.InvocationParticipantResult) error {
+	if participant.Start.DriverVersion == "" ||
+		participant.End.DriverVersion == "" ||
+		participant.Start.DriverVersion != participant.End.DriverVersion ||
+		len(participant.Start.DriverVersion) > 128 {
+		return errors.New("driver version is missing, mismatched, or invalid")
+	}
+
+	if !signalv1.IsSHA256Digest(participant.Start.GPUInventoryDigest) ||
+		!signalv1.IsSHA256Digest(participant.End.GPUInventoryDigest) ||
+		participant.Start.GPUInventoryDigest != participant.End.GPUInventoryDigest {
+		return errors.New("GPU inventory digest is missing, mismatched, or invalid")
 	}
 
 	return nil
@@ -433,6 +486,13 @@ func summarizeStageExecution(
 	}
 
 	summary.DurableEvidenceDigest = durableDigest
+
+	participants, err := summarizeStageParticipants(envelopes)
+	if err != nil {
+		return signalv1.StageEvidenceSummary{}, err
+	}
+
+	summary.Participants = participants
 
 	if request.Stage.Schedule.CoverageWindow != nil {
 		coverage := *request.Stage.Schedule.CoverageWindow
@@ -487,6 +547,143 @@ func summarizeStageExecution(
 	summary.Verdict = stageVerdict(request, summary, assertionsPass)
 
 	return summary, nil
+}
+
+func summarizeStageParticipants(
+	envelopes []signalv1.InvocationResultEnvelope,
+) ([]signalv1.ParticipantEvidenceIdentity, error) {
+	participants := map[int32]signalv1.ParticipantEvidenceIdentity{}
+
+	for envelopeIndex := range envelopes {
+		envelope := &envelopes[envelopeIndex]
+		for participantIndex := range envelope.Participants {
+			observed := &envelope.Participants[participantIndex]
+
+			current, exists := participants[observed.Index]
+			if !exists {
+				current = signalv1.ParticipantEvidenceIdentity{
+					Index: observed.Index,
+					Role:  evidenceParticipantRole(observed.Index),
+				}
+			}
+
+			start, err := mergeStageFingerprint(current.Start, observed.Start)
+			if err != nil {
+				return nil, fmt.Errorf(
+					"participant %d start fingerprint disagreement: %w",
+					observed.Index,
+					err,
+				)
+			}
+
+			end, err := mergeStageFingerprint(current.End, observed.End)
+			if err != nil {
+				return nil, fmt.Errorf(
+					"participant %d end fingerprint disagreement: %w",
+					observed.Index,
+					err,
+				)
+			}
+
+			current.Start = start
+			current.End = end
+			current.Verdict = combineStageParticipantVerdict(
+				current.Verdict,
+				invocationQualificationVerdict(observed.Outcome),
+			)
+			participants[observed.Index] = current
+		}
+	}
+
+	indexes := make([]int32, 0, len(participants))
+	for index := range participants {
+		indexes = append(indexes, index)
+	}
+
+	slices.Sort(indexes)
+
+	result := make([]signalv1.ParticipantEvidenceIdentity, 0, len(indexes))
+	for _, index := range indexes {
+		result = append(result, participants[index])
+	}
+
+	return result, nil
+}
+
+func mergeStageFingerprint(
+	current signalv1.NodeFingerprint,
+	observed signalv1.NodeFingerprint,
+) (signalv1.NodeFingerprint, error) {
+	fields := []struct {
+		name     string
+		current  *string
+		observed string
+	}{
+		{name: "boot ID", current: &current.BootID, observed: observed.BootID},
+		{name: "kernel version", current: &current.KernelVersion, observed: observed.KernelVersion},
+		{name: "OS image", current: &current.OSImage, observed: observed.OSImage},
+		{name: "kubelet version", current: &current.KubeletVersion, observed: observed.KubeletVersion},
+		{name: "system UUID", current: &current.SystemUUID, observed: observed.SystemUUID},
+		{name: "driver version", current: &current.DriverVersion, observed: observed.DriverVersion},
+		{
+			name:     "GPU inventory digest",
+			current:  &current.GPUInventoryDigest,
+			observed: observed.GPUInventoryDigest,
+		},
+	}
+
+	if current.NodeUID == "" {
+		current.NodeUID = observed.NodeUID
+	} else if observed.NodeUID != "" && current.NodeUID != observed.NodeUID {
+		return signalv1.NodeFingerprint{}, errors.New("node UID changed")
+	}
+
+	for _, field := range fields {
+		if *field.current == "" {
+			*field.current = field.observed
+		} else if field.observed != "" && *field.current != field.observed {
+			return signalv1.NodeFingerprint{}, fmt.Errorf("%s changed", field.name)
+		}
+	}
+
+	return current, nil
+}
+
+func evidenceParticipantRole(index int32) signalv1.ParticipantRole {
+	if index == 0 {
+		return signalv1.ParticipantRoleRequester
+	}
+
+	return signalv1.ParticipantRoleParticipant
+}
+
+func invocationQualificationVerdict(
+	outcome signalv1.InvocationOutcome,
+) signalv1.QualificationVerdict {
+	switch outcome {
+	case signalv1.InvocationOutcomePassed:
+		return signalv1.QualificationVerdictPass
+	case signalv1.InvocationOutcomeFailed:
+		return signalv1.QualificationVerdictFail
+	default:
+		return signalv1.QualificationVerdictInconclusive
+	}
+}
+
+func combineStageParticipantVerdict(
+	current signalv1.QualificationVerdict,
+	observed signalv1.QualificationVerdict,
+) signalv1.QualificationVerdict {
+	if current == signalv1.QualificationVerdictFail || observed == signalv1.QualificationVerdictFail {
+		return signalv1.QualificationVerdictFail
+	}
+
+	if current == signalv1.QualificationVerdictInconclusive ||
+		observed == signalv1.QualificationVerdictInconclusive {
+		return signalv1.QualificationVerdictInconclusive
+	}
+
+	return signalv1.QualificationVerdictPass
 }
 
 func stageVerdict(

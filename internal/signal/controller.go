@@ -3247,6 +3247,46 @@ func validateStageEvidenceSummary(
 		return errors.New("stage invocation outcome counts are inconsistent")
 	}
 
+	seenParticipants := make(map[int32]struct{}, len(summary.Participants))
+	for index := range summary.Participants {
+		participant := &summary.Participants[index]
+		if participant.Index < 0 ||
+			participant.Index >= participantCount ||
+			participant.Role != resolvedParticipantRole(participant.Index) ||
+			participant.Start.NodeUID == "" ||
+			participant.Start.NodeUID != participant.End.NodeUID {
+			return errors.New("stage participant evidence identity is invalid")
+		}
+
+		if _, duplicate := seenParticipants[participant.Index]; duplicate {
+			return errors.New("stage participant evidence repeats an index")
+		}
+
+		seenParticipants[participant.Index] = struct{}{}
+
+		if summary.QualificationEligible &&
+			!summary.DiagnosticOnly &&
+			summary.Verdict == signalv1.StageVerdictPassed {
+			if err := mergeResolvedQualificationFingerprint(
+				&signalv1.ParticipantEvidenceIdentity{},
+				*participant,
+			); err != nil {
+				return fmt.Errorf(
+					"stage participant %d qualification fingerprint: %w",
+					participant.Index,
+					err,
+				)
+			}
+		}
+	}
+
+	if summary.QualificationEligible &&
+		!summary.DiagnosticOnly &&
+		summary.Verdict == signalv1.StageVerdictPassed &&
+		len(summary.Participants) == 0 {
+		return errors.New("passed qualification stage omits participant fingerprints")
+	}
+
 	schedule := stage.Schedule
 	if schedule.Mode == signalv1.CheckExecutionModeRunOnce {
 		maxAttempts := int32(1)
@@ -4468,7 +4508,7 @@ func (r *RunReconciler) resolvedQualificationEvidenceIdentity(
 		participants[index] = signalv1.ParticipantEvidenceIdentity{
 			Index:   int32(index),
 			Role:    resolvedParticipantRole(int32(index)),
-			Verdict: qualificationVerdict(verdict),
+			Verdict: "",
 			Start:   starts[index],
 			End:     nodeBaseFingerprint(&node),
 		}
@@ -4478,14 +4518,79 @@ func (r *RunReconciler) resolvedQualificationEvidenceIdentity(
 		return nil, verdict, reason, nil
 	}
 
+	observedParticipants := make([]bool, len(participants))
+	hasQualificationStage := false
+
+	for stageIndex := range stages {
+		stage := &stages[stageIndex]
+		if !stage.QualificationEligible || stage.DiagnosticOnly {
+			continue
+		}
+		hasQualificationStage = true
+
+		for participantIndex := range stage.Participants {
+			observed := &stage.Participants[participantIndex]
+			if observed.Index < 0 || int(observed.Index) >= len(participants) {
+				return nil,
+					"Inconclusive",
+					"QualificationEvidenceMalformed: stage participant index is invalid",
+					nil
+			}
+
+			participant := &participants[observed.Index]
+			if !sameBaseFingerprint(observed.Start, participant.Start) ||
+				!sameBaseFingerprint(observed.End, participant.End) {
+				return nil,
+					"Inconclusive",
+					fmt.Sprintf(
+						"ParticipantIdentityChanged: participant %d stage fingerprint differs from the Run",
+						observed.Index,
+					),
+					nil
+			}
+
+			if err := mergeResolvedQualificationFingerprint(participant, *observed); err != nil {
+				return nil,
+					"Inconclusive",
+					fmt.Sprintf(
+						"QualificationEvidenceMalformed: participant %d fingerprint: %v",
+						observed.Index,
+						err,
+					),
+					nil
+			}
+
+			participant.Verdict = combineQualificationVerdicts(
+				participant.Verdict,
+				observed.Verdict,
+			)
+			observedParticipants[observed.Index] = true
+		}
+	}
+
 	resolverImages := append([]string(nil), run.Spec.PlanProvenance.ResolverImages...)
 	sort.Strings(resolverImages)
 
 	for index := range participants {
-		if len(participants) > 1 {
+		if hasQualificationStage &&
+			(!observedParticipants[index] ||
+				participants[index].Start.DriverVersion == "" ||
+				participants[index].Start.GPUInventoryDigest == "") {
 			participants[index].Verdict = signalv1.QualificationVerdictInconclusive
-		} else {
+			verdict = "Inconclusive"
+			reason = fmt.Sprintf(
+				"QualificationEvidenceMissing: participant %d has no qualification fingerprint",
+				index,
+			)
+		} else if !hasQualificationStage {
 			participants[index].Verdict = qualificationVerdict(verdict)
+		}
+
+		if verdict != "Pass" {
+			participants[index].Verdict = combineQualificationVerdicts(
+				participants[index].Verdict,
+				qualificationVerdict(verdict),
+			)
 		}
 	}
 
@@ -4501,6 +4606,40 @@ func (r *RunReconciler) resolvedQualificationEvidenceIdentity(
 			ResolverImages:         resolverImages,
 		},
 	}, verdict, reason, nil
+}
+
+func mergeResolvedQualificationFingerprint(
+	current *signalv1.ParticipantEvidenceIdentity,
+	observed signalv1.ParticipantEvidenceIdentity,
+) error {
+	if observed.Start.DriverVersion == "" ||
+		observed.End.DriverVersion == "" ||
+		observed.Start.DriverVersion != observed.End.DriverVersion {
+		return errors.New("driver version is missing or mismatched")
+	}
+
+	if !signalv1.IsSHA256Digest(observed.Start.GPUInventoryDigest) ||
+		!signalv1.IsSHA256Digest(observed.End.GPUInventoryDigest) ||
+		observed.Start.GPUInventoryDigest != observed.End.GPUInventoryDigest {
+		return errors.New("GPU inventory digest is missing, mismatched, or invalid")
+	}
+
+	if current.Start.DriverVersion != "" &&
+		current.Start.DriverVersion != observed.Start.DriverVersion {
+		return errors.New("driver version disagrees across qualification stages")
+	}
+
+	if current.Start.GPUInventoryDigest != "" &&
+		current.Start.GPUInventoryDigest != observed.Start.GPUInventoryDigest {
+		return errors.New("GPU inventory digest disagrees across qualification stages")
+	}
+
+	current.Start.DriverVersion = observed.Start.DriverVersion
+	current.End.DriverVersion = observed.End.DriverVersion
+	current.Start.GPUInventoryDigest = observed.Start.GPUInventoryDigest
+	current.End.GPUInventoryDigest = observed.End.GPUInventoryDigest
+
+	return nil
 }
 
 func resolvedTestRunnerImage(driver signalv1.CertificationTestDriver) string {

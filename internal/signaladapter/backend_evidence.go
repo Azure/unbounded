@@ -5,8 +5,6 @@ package signaladapter
 
 import (
 	"context"
-	"crypto/sha256"
-	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -14,6 +12,7 @@ import (
 	"regexp"
 	"slices"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -28,6 +27,7 @@ import (
 
 const (
 	backendEvidenceVersion = "v2"
+	gpuIndexPrefix         = "gpu-index-"
 	maxEvidenceLogBytes    = 512
 	maxEvidenceTextBytes   = 512
 	maxEvidenceSamples     = 64
@@ -274,17 +274,19 @@ func (r *Runner) captureBackendEvidence(
 }
 
 type qualificationMeasurement struct {
-	DriverVersion  string                                `json:"driverVersion,omitempty"`
-	VisibleDevices []string                              `json:"visibleDevices,omitempty"`
-	CoveredDevices []string                              `json:"coveredDevices,omitempty"`
-	Participants   []participantQualificationMeasurement `json:"participants,omitempty"`
+	DriverVersion      string                                `json:"driverVersion,omitempty"`
+	GPUInventoryDigest string                                `json:"gpuInventoryDigest,omitempty"`
+	VisibleDevices     []string                              `json:"visibleDevices,omitempty"`
+	CoveredDevices     []string                              `json:"coveredDevices,omitempty"`
+	Participants       []participantQualificationMeasurement `json:"participants,omitempty"`
 }
 
 type participantQualificationMeasurement struct {
-	ParticipantIndex int      `json:"participantIndex"`
-	DriverVersion    string   `json:"driverVersion,omitempty"`
-	VisibleDevices   []string `json:"visibleDevices,omitempty"`
-	CoveredDevices   []string `json:"coveredDevices,omitempty"`
+	ParticipantIndex   int      `json:"participantIndex"`
+	DriverVersion      string   `json:"driverVersion,omitempty"`
+	GPUInventoryDigest string   `json:"gpuInventoryDigest,omitempty"`
+	VisibleDevices     []string `json:"visibleDevices,omitempty"`
+	CoveredDevices     []string `json:"coveredDevices,omitempty"`
 }
 
 func applyQualificationEvidence(
@@ -368,10 +370,9 @@ func applyQualificationEvidence(
 				participant.End.DriverVersion = measurements.DriverVersion
 			}
 
-			if len(measurements.VisibleDevices) > 0 {
-				digest := deviceInventoryDigest(measurements.VisibleDevices)
-				participant.Start.GPUInventoryDigest = digest
-				participant.End.GPUInventoryDigest = digest
+			if measurements.GPUInventoryDigest != "" {
+				participant.Start.GPUInventoryDigest = measurements.GPUInventoryDigest
+				participant.End.GPUInventoryDigest = measurements.GPUInventoryDigest
 			}
 
 			participant.PerDeviceCoverage = sameStringSet(
@@ -461,6 +462,18 @@ func enforceQualificationRequirements(
 
 	if participant.CaptureError != "" || participant.Start.NodeUID == "" || participant.End.NodeUID == "" {
 		participant.Verdict = inconclusiveVerdict("ParticipantEvidenceIncomplete", participant.Verdict.Attribution)
+
+		return
+	}
+
+	if result.Verdict == "Pass" &&
+		(measurementErr != nil ||
+			participant.Start.DriverVersion == "" ||
+			!signalv1.IsSHA256Digest(participant.Start.GPUInventoryDigest)) {
+		participant.Verdict = inconclusiveVerdict(
+			"ParticipantFingerprintNotProven",
+			participant.Verdict.Attribution,
+		)
 
 		return
 	}
@@ -607,9 +620,10 @@ func decodeQualificationMeasurements(
 		}
 
 		returnMeasurement := &qualificationMeasurement{
-			DriverVersion:  selected.DriverVersion,
-			VisibleDevices: selected.VisibleDevices,
-			CoveredDevices: selected.CoveredDevices,
+			DriverVersion:      selected.DriverVersion,
+			GPUInventoryDigest: selected.GPUInventoryDigest,
+			VisibleDevices:     selected.VisibleDevices,
+			CoveredDevices:     selected.CoveredDevices,
 		}
 		measurement = *returnMeasurement
 	} else if len(measurement.Participants) != 0 {
@@ -635,8 +649,28 @@ func decodeQualificationMeasurements(
 		return nil, errors.New("driverVersion exceeds 128 bytes")
 	}
 
-	measurement.VisibleDevices = normalizedStringSet(measurement.VisibleDevices)
-	measurement.CoveredDevices = normalizedStringSet(measurement.CoveredDevices)
+	if measurement.GPUInventoryDigest != "" &&
+		!signalv1.IsSHA256Digest(measurement.GPUInventoryDigest) {
+		return nil, errors.New("gpuInventoryDigest is invalid")
+	}
+
+	if len(measurement.VisibleDevices) > 0 {
+		canonical, err := canonicalGPUInventory(measurement.VisibleDevices)
+		if err != nil {
+			return nil, fmt.Errorf("visibleDevices: %w", err)
+		}
+
+		measurement.VisibleDevices = canonical
+	}
+
+	if len(measurement.CoveredDevices) > 0 {
+		canonical, err := canonicalGPUInventory(measurement.CoveredDevices)
+		if err != nil {
+			return nil, fmt.Errorf("coveredDevices: %w", err)
+		}
+
+		measurement.CoveredDevices = canonical
+	}
 
 	return &measurement, nil
 }
@@ -652,10 +686,47 @@ func sameStringSet(left, right []string) bool {
 	return slices.Equal(normalizedStringSet(left), normalizedStringSet(right))
 }
 
-func deviceInventoryDigest(devices []string) string {
-	sum := sha256.Sum256([]byte(strings.Join(normalizedStringSet(devices), "\x00")))
+func canonicalGPUInventory(devices []string) ([]string, error) {
+	if len(devices) < 1 || len(devices) > maxEvidenceDevices {
+		return nil, fmt.Errorf(
+			"GPU inventory must contain between 1 and %d entries",
+			maxEvidenceDevices,
+		)
+	}
 
-	return "sha256:" + hex.EncodeToString(sum[:])
+	indexes := make([]uint64, 0, len(devices))
+	for _, device := range devices {
+		if device == "" || len(device) > maxEvidenceDeviceBytes {
+			return nil, errors.New("GPU inventory contains an invalid index")
+		}
+
+		suffix, found := strings.CutPrefix(device, gpuIndexPrefix)
+		if !found {
+			return nil, fmt.Errorf("GPU inventory index %q has an invalid prefix", device)
+		}
+
+		index, err := strconv.ParseUint(suffix, 10, 31)
+		if err != nil || strconv.FormatUint(index, 10) != suffix {
+			return nil, fmt.Errorf("GPU inventory index %q is not canonical", device)
+		}
+
+		indexes = append(indexes, index)
+	}
+
+	slices.Sort(indexes)
+
+	for expected, index := range indexes {
+		if index != uint64(expected) {
+			return nil, errors.New("GPU inventory indexes must be unique and contiguous from zero")
+		}
+	}
+
+	canonical := make([]string, len(indexes))
+	for index := range indexes {
+		canonical[index] = gpuIndexPrefix + strconv.FormatUint(indexes[index], 10)
+	}
+
+	return canonical, nil
 }
 
 func marshalBackendEvidence(evidence BackendEvidence, limit int) ([]byte, bool, error) {
