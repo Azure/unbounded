@@ -507,6 +507,11 @@ impl Poll {
         Ok(())
     }
 
+    /// Prefer another seat on the next fetch, after a rejection seen outside the poll.
+    pub fn demote(&self) {
+        self.fetch.demote();
+    }
+
     /// Inspect acceptance, pending receipt, and retry state without network I/O.
     pub fn status(&self) -> Status {
         let state = self.state.borrow();

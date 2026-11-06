@@ -27,6 +27,18 @@ const RENEWAL_MIN_WAIT: Duration = Duration::from_secs(1);
 /// Longest serving renewal sleep, bounding wall-clock steps.
 const RENEWAL_MAX_WAIT: Duration = Duration::from_secs(30);
 
+/// Consecutive seat 401/403 startup rejections retried before `Unauthorized`
+/// is reported as fatal.
+///
+/// During an all-at-once rollout, control seats restart together with nodes. A
+/// seat that is up but has not yet loaded current credentials can answer a
+/// valid bootstrap token or identity with 401/403. Each retry demotes the seats
+/// involved and backs off with the issuance policy (about 1s, 2s, 4s, 8s, 16s).
+/// Nothing rejected is accepted. Local and TLS-level authentication failures are
+/// not retried, and a persistent seat rejection still ends startup once this
+/// bound is spent.
+pub(crate) const STARTUP_UNAUTHORIZED_RETRIES: u32 = 5;
+
 /// Owner-local session. Only the two polls own cursors, retry, and preparation jobs.
 pub struct Session {
     block_devices: RefCell<Option<String>>,
@@ -71,6 +83,9 @@ pub struct Session {
 
     issuance_failures: Cell<u32>,
 
+    /// Consecutive startup attempts rejected with `Unauthorized`.
+    startup_rejections: Cell<u32>,
+
     issuance_retry_after: Cell<Option<Duration>>,
 
     busy: Cell<bool>,
@@ -97,6 +112,11 @@ pub(super) struct Authentication {
     restart_required: Cell<bool>,
 
     startup_bundle: RefCell<Option<wire::KeyringBundle>>,
+
+    /// Whether the last control response was an HTTP 401/403 from a seat, as
+    /// opposed to a local or TLS-level authentication failure. Only the former
+    /// is retried during startup.
+    seat_rejected: Cell<bool>,
 }
 
 impl Authentication {
@@ -213,7 +233,11 @@ impl Client {
                 scope,
             )
             .await?;
-        Self::validate(response)
+        let result = Self::validate(response);
+        self.auth
+            .seat_rejected
+            .set(matches!(&result, Err(f) if f.error == Error::Unauthorized));
+        result
     }
 }
 
@@ -230,6 +254,7 @@ impl Fetch for Client {
             started.set(true);
         }
         Box::pin(async move {
+            self.auth.seat_rejected.set(false);
             let policy = self.doc.rejection();
             if let Some(identity) = self.identity()? {
                 let result = async {
@@ -263,6 +288,8 @@ impl Fetch for Client {
             } else if policy == Rejection::IdentityOnly {
                 return Err(Error::Unauthorized.into());
             }
+            // The token attempt decides the outcome; a TLS failure here is local.
+            self.auth.seat_rejected.set(false);
             // No token leaves this owner until CA and server name verification.
             let connection = self.transport.connect(None, scope).await?;
             self.auth.check()?;
@@ -409,6 +436,7 @@ impl Session {
                 binding_check: Cell::new(false),
                 restart_required: Cell::new(false),
                 startup_bundle: RefCell::new(None),
+                seat_rejected: Cell::new(false),
             }),
             snapshots,
             publications: RefCell::new(None),
@@ -420,6 +448,7 @@ impl Session {
             renewal_error: Cell::new(None),
             renewal_next: Cell::new(None),
             issuance_failures: Cell::new(0),
+            startup_rejections: Cell::new(0),
             issuance_retry_after: Cell::new(None),
             busy: Cell::new(false),
             enrollment_busy: Cell::new(false),
@@ -577,6 +606,7 @@ impl Session {
         Box::pin(async move {
             self.auth.check()?;
             let _busy = super::enter(&self.enrollment_busy)?;
+            self.auth.seat_rejected.set(false);
             let body = wire::encode_enrollment_request(request)?;
             let connection = self.enrollment_transport.connect(None, scope).await?;
             let token = self.auth.enrollment.read_token(scope).await?;
@@ -594,6 +624,7 @@ impl Session {
                 )
                 .await?;
             if let Err(error) = validate_response(&response) {
+                self.auth.seat_rejected.set(error == Error::Unauthorized);
                 if matches!(error, Error::Unavailable | Error::Overloaded) {
                     self.issuance_retry_after.set(response.retry_after);
                 }
@@ -622,7 +653,15 @@ impl Session {
             {
                 return Err(Error::Unavailable);
             }
-            let result = self.start_inner(scope).await;
+            self.auth.seat_rejected.set(false);
+            let mut result = self.start_inner(scope).await;
+            if result.as_ref().is_err_and(|e| *e == Error::Unauthorized)
+                && self.auth.seat_rejected.get()
+            {
+                result = Err(self.startup_rejected(scope));
+            } else if result.is_ok() {
+                self.startup_rejections.set(0);
+            }
             if result.as_ref().is_err_and(|e| transient(*e)) {
                 self.renewal_next.set(Some(
                     self.issuance_backoff(&self.enrollment_transport.io()?.reactor.ctx().clone())?,
@@ -630,6 +669,28 @@ impl Session {
             }
             result
         })
+    }
+
+    /// Bound startup retries after a seat answered 401/403.
+    ///
+    /// Returns `Unavailable` (retryable) while within
+    /// [`STARTUP_UNAUTHORIZED_RETRIES`], after demoting the enrollment and key
+    /// feed seats so the next attempt prefers another seat. Once the bound is
+    /// spent, or the startup scope has ended, returns `Unauthorized` so a
+    /// permanent rejection still surfaces. The rejected response was never
+    /// accepted; this only changes whether startup tries again.
+    fn startup_rejected(&self, scope: &RequestScope) -> Error {
+        self.renewal_error.set(Some(Error::Unauthorized));
+        let rejections = self.startup_rejections.get().saturating_add(1);
+        self.startup_rejections.set(rejections);
+        if rejections > STARTUP_UNAUTHORIZED_RETRIES || scope.check().is_err() {
+            return Error::Unauthorized;
+        }
+        self.enrollment_transport.demote();
+        if let Some(keyrings) = self.keyrings.borrow().as_ref() {
+            keyrings.demote();
+        }
+        Error::Unavailable
     }
 
     /// Key feed must accept trust before identity recovery and fresh issuance.
@@ -1065,6 +1126,191 @@ pub(super) mod tests {
         }
         // The shared keys were never rolled back.
         assert_eq!(session.auth.keys.borrow().generation().unwrap(), Some(2));
+    }
+
+    /// Scripted key feed that also counts seat demotions.
+    struct Demoting {
+        script: Script,
+
+        auth: Rc<Authentication>,
+
+        demotes: Rc<Cell<u32>>,
+    }
+
+    impl Fetch for Demoting {
+        /// Mark 401/403 as seat-originated, as the session's real client does.
+        fn get<'a>(
+            &'a self,
+            path: &'a str,
+            digest: Option<&'a str>,
+            limit: usize,
+            scope: &'a RequestScope,
+        ) -> racer_io::Operation<'a, rest::Response, FetchError> {
+            Box::pin(async move {
+                let result = self.script.get(path, digest, limit, scope).await;
+                self.auth
+                    .seat_rejected
+                    .set(matches!(&result, Err(f) if f.error == Error::Unauthorized));
+                result
+            })
+        }
+
+        fn close(&self) {}
+
+        fn demote(&self) {
+            self.demotes.set(self.demotes.get() + 1);
+        }
+    }
+
+    fn unauthenticated() -> rest::Response {
+        rest::Response {
+            status: 401,
+            body: br#"{"code":"unauthenticated"}"#.to_vec(),
+            retry_after: None,
+        }
+    }
+
+    /// Install a scripted startup key feed and return its demotion counter.
+    fn startup_feed(
+        env: &racer_io::Env,
+        session: &Session,
+        responses: Vec<rest::Response>,
+    ) -> Rc<Cell<u32>> {
+        let demotes = Rc::new(Cell::new(0));
+        session.enrollment_transport.attach_io(host(env));
+        *session.keyrings.borrow_mut() = Some(
+            Poll::new(
+                host(env),
+                Doc::Keyring,
+                Box::new(Demoting {
+                    script: Script {
+                        responses: RefCell::new(responses.into()),
+                        requests: Rc::new(RefCell::new(vec![])),
+                    },
+                    auth: session.auth.clone(),
+                    demotes: demotes.clone(),
+                }),
+                Box::new(BundleInstall {
+                    auth: session.auth.clone(),
+                    error: session.keyring_error.clone(),
+                }),
+                Schedule::control(),
+            )
+            .unwrap(),
+        );
+        demotes
+    }
+
+    /// One startup attempt after its scheduled retry time.
+    fn start_once(
+        clock: &racer_io::SimClock,
+        env: &racer_io::Env,
+        session: &Session,
+    ) -> Result<()> {
+        if let Some(next) = session.next_attempt() {
+            let now = env.ctx.now();
+            if next > now {
+                clock.advance(next - now);
+            }
+        }
+        drive(clock, session.start(&scope(env))).map(|_| ())
+    }
+
+    /// A seat that rejects startup (for example one restarted during a rollout
+    /// that has not loaded current credentials) is retried on another seat with
+    /// backoff, and nothing it served is staged. A genuine bundle from a later
+    /// seat is then accepted normally.
+    #[test]
+    fn startup_unauthorized_from_seat_is_retried_and_not_accepted() {
+        let clock = racer_io::SimClock::new(741);
+        let env = racer_io::Env::new(racer_io::Env::host().driver.clone(), clock.ctx(0));
+        let session = session(&env);
+        let demotes = startup_feed(
+            &env,
+            &session,
+            vec![
+                unauthenticated(),
+                unauthenticated(),
+                rest::Response {
+                    status: 200,
+                    body: include_bytes!(concat!(
+                        env!("CARGO_MANIFEST_DIR"),
+                        "/wire/testdata/bundle.json"
+                    ))
+                    .to_vec(),
+                    retry_after: None,
+                },
+            ],
+        );
+        for attempt in 1..=2u32 {
+            assert_eq!(start_once(&clock, &env, &session), Err(Error::Unavailable));
+            assert!(session.auth.startup_bundle.borrow().is_none());
+            assert!(!session.auth.started.get());
+            assert!(session.identity().is_none());
+            assert_eq!(session.renewal_error(), Some(Error::Unauthorized));
+            assert_eq!(session.startup_rejections.get(), attempt);
+            // The poll and the startup policy each move off the rejecting seat.
+            assert!(demotes.get() >= 2 * attempt);
+            assert!(
+                session
+                    .next_attempt()
+                    .is_some_and(|next| next > env.ctx.now())
+            );
+        }
+        // The next seat serves a valid bundle, which the startup key turn
+        // accepts as usual.
+        if let Some(next) = session.next_attempt() {
+            clock.advance(next.saturating_duration_since(env.ctx.now()));
+        }
+        drive(&clock, session.keyring_startup_turn(&scope(&env))).unwrap();
+        assert_eq!(
+            session
+                .auth
+                .startup_bundle
+                .borrow()
+                .as_ref()
+                .map(|b| b.generation.0),
+            Some(u64::MAX)
+        );
+        assert!(!session.auth.started.get());
+    }
+
+    /// A rejection that persists past the bounded retries is still fatal.
+    #[test]
+    fn startup_unauthorized_is_fatal_once_retries_are_spent() {
+        let clock = racer_io::SimClock::new(742);
+        let env = racer_io::Env::new(racer_io::Env::host().driver.clone(), clock.ctx(0));
+        let session = session(&env);
+        let attempts = STARTUP_UNAUTHORIZED_RETRIES + 1;
+        startup_feed(
+            &env,
+            &session,
+            (0..attempts).map(|_| unauthenticated()).collect(),
+        );
+        for _ in 0..STARTUP_UNAUTHORIZED_RETRIES {
+            assert_eq!(start_once(&clock, &env, &session), Err(Error::Unavailable));
+        }
+        assert_eq!(start_once(&clock, &env, &session), Err(Error::Unauthorized));
+        assert!(session.auth.startup_bundle.borrow().is_none());
+        assert!(!session.auth.started.get());
+        assert!(session.identity().is_none());
+    }
+
+    /// A seat rejection seen after the startup scope has ended is not retried.
+    #[test]
+    fn startup_unauthorized_after_scope_end_is_fatal() {
+        let clock = racer_io::SimClock::new(743);
+        let env = racer_io::Env::new(racer_io::Env::host().driver.clone(), clock.ctx(0));
+        let session = session(&env);
+        let ended = RequestScope::on(
+            &env.ctx.clock,
+            crate::model::RequestId([9; 16]),
+            env.ctx.now() + Duration::from_millis(1),
+        )
+        .unwrap();
+        clock.advance(Duration::from_millis(5));
+        assert_eq!(session.startup_rejected(&ended), Error::Unauthorized);
+        assert_eq!(session.startup_rejected(&scope(&env)), Error::Unavailable);
     }
 
     /// Receipts never regress by sequence and remain independent of acceptance.
