@@ -128,12 +128,16 @@ const (
 	StageVerdictSkipped      StageVerdict = "Skipped"
 )
 
+// +kubebuilder:validation:XValidation:rule="has(self.actual) || (!self.passed && has(self.message) && size(self.message.trim()) > 0)",message="an assertion without an actual value must fail with a reason"
 type AssertionResult struct {
 	// +kubebuilder:validation:MinLength=1
 	// +kubebuilder:validation:MaxLength=63
-	Name   string     `json:"name"`
-	Passed bool       `json:"passed"`
-	Actual TypedValue `json:"actual"`
+	Name   string `json:"name"`
+	Passed bool   `json:"passed"`
+	// Actual is absent only when the metric could not be produced or observed.
+	// The immutable Run assertion retains the typed expected value or threshold.
+	Actual *TypedValue `json:"actual,omitempty"`
+	// Message explains the failure and is required when Actual is absent.
 	// +kubebuilder:validation:MaxLength=256
 	Message string `json:"message,omitempty"`
 }

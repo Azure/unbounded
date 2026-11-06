@@ -107,6 +107,12 @@ stage, test, plan, participant, artifact, fingerprint, timing, outcome,
 reason-code, measurement, device-coverage, and workload-activity identities.
 The adapter hashes the canonical envelope and persists it immutably.
 
+An assertion result normally records its typed actual value. When a required
+metric could not be produced or observed, `actual` is absent, `passed` is
+`false`, and `message` records the failure reason. The immutable Run plan still
+contains the typed expected value or threshold. Assertion results are evidence
+only and do not change `planDigest`.
+
 Missing, malformed, oversized, replayed, partial, mismatched, untrusted, or
 unverifiable evidence is `Inconclusive`. It is never converted into success.
 

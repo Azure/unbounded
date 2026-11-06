@@ -2262,6 +2262,9 @@ spec:
                               items:
                                 properties:
                                   actual:
+                                    description: |-
+                                      Actual is absent only when the metric could not be produced or observed.
+                                      The immutable Run assertion retains the typed expected value or threshold.
                                     properties:
                                       booleanValue:
                                         type: boolean
@@ -2325,6 +2328,8 @@ spec:
                                         && !has(self.booleanValue) && !has(self.durationValue)
                                         && has(self.quantityValue))
                                   message:
+                                    description: Message explains the failure and
+                                      is required when Actual is absent.
                                     maxLength: 256
                                     type: string
                                   name:
@@ -2334,10 +2339,14 @@ spec:
                                   passed:
                                     type: boolean
                                 required:
-                                - actual
                                 - name
                                 - passed
                                 type: object
+                                x-kubernetes-validations:
+                                - message: an assertion without an actual value must
+                                    fail with a reason
+                                  rule: has(self.actual) || (!self.passed && has(self.message)
+                                    && size(self.message.trim()) > 0)
                               maxItems: 8
                               type: array
                               x-kubernetes-list-map-keys:
