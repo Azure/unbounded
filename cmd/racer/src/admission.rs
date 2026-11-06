@@ -1128,9 +1128,9 @@ mod rules_equivalence_tests {
     use super::*;
     use std::num::NonZeroUsize;
 
-    /// The policy as it read before the rules moved to racer-core, kept
-    /// verbatim so the delegation is checked against it.
-    fn legacy_limit(limits: &Limits, class: ResourceClass) -> usize {
+    /// Each class's limit restated directly from `Limits`, independent of the
+    /// racer-core rules the policy delegates to.
+    fn reference_limit(limits: &Limits, class: ResourceClass) -> usize {
         match class {
             ResourceClass::Plaintext => limits.plaintext_bytes.get(),
             ResourceClass::Ciphertext => limits.ciphertext_bytes.get(),
@@ -1152,14 +1152,14 @@ mod rules_equivalence_tests {
             // apart from client connections (`dst/MODEL.md`, "Peer connection slots").
             ResourceClass::OutboundConnection => limits.outbound_connections.get(),
             ResourceClass::OrdinaryOutboundConnection => {
-                let outbound = legacy_limit(limits, ResourceClass::OutboundConnection);
+                let outbound = reference_limit(limits, ResourceClass::OutboundConnection);
                 outbound
                     - usize::from(outbound >= 2) * racer_core::admission::METADATA_OUTBOUND_RESERVE
             }
             ResourceClass::IngressConnection => limits
                 .client_connections
                 .get()
-                .saturating_sub(legacy_limit(limits, ResourceClass::ControlConnection)),
+                .saturating_sub(reference_limit(limits, ResourceClass::ControlConnection)),
             ResourceClass::PeerIngressConnection => limits.peer_connections.get(),
             ResourceClass::Pipe => limits.pipes.get(),
             ResourceClass::ControlProgress => limits.queue_entries.get(),
@@ -1168,7 +1168,7 @@ mod rules_equivalence_tests {
         }
     }
 
-    fn legacy_floor(class: ResourceClass) -> usize {
+    fn reference_floor(class: ResourceClass) -> usize {
         match class {
             ResourceClass::Plaintext => PAGE_BYTES as usize,
             ResourceClass::Ciphertext => page_alloc::buffer_capacity(
@@ -1180,9 +1180,9 @@ mod rules_equivalence_tests {
         }
     }
 
-    /// Cache priority's per-cache allowance as it read before it moved to
+    /// Cache priority's per-cache allowance restated independently of
     /// racer-core.
-    fn legacy_progress(limits: &Limits, class: ResourceClass) -> usize {
+    fn reference_progress(limits: &Limits, class: ResourceClass) -> usize {
         let window = limits.range_window_pages.get();
         let record = PAGE_BYTES as usize + 16 + crate::store::MAX_HEADER_BYTES;
         match class {
@@ -1201,7 +1201,7 @@ mod rules_equivalence_tests {
         for class in ResourceClass::ALL {
             assert_eq!(
                 policy.progress(class),
-                legacy_progress(&limits, class),
+                reference_progress(&limits, class),
                 "{class:?}"
             );
             assert_eq!(
@@ -1215,10 +1215,10 @@ mod rules_equivalence_tests {
             );
             assert_eq!(
                 policy.limit(class),
-                legacy_limit(&limits, class),
+                reference_limit(&limits, class),
                 "{class:?}"
             );
-            assert_eq!(policy.floor(class), legacy_floor(class), "{class:?}");
+            assert_eq!(policy.floor(class), reference_floor(class), "{class:?}");
             assert_eq!(
                 AdmissionPolicy::wakes(class),
                 matches!(
@@ -1241,7 +1241,7 @@ mod rules_equivalence_tests {
     }
 
     #[test]
-    fn moved_rules_match_legacy_policy() {
+    fn delegated_rules_match_reference_policy() {
         let config = crate::test_support::cluster::config(false);
         check(config.limits.clone());
         // Unset environment yields exactly the racer-core per-worker defaults.

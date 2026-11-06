@@ -3,7 +3,8 @@
 use super::*;
 use std::ops::Deref;
 
-/// A test owner of a simulated descriptor exposing its resource view.
+/// A test owner of a simulated descriptor exposing its resource view. The
+/// descriptor is never read; holding it keeps the resource open.
 pub(super) struct Owned(#[allow(dead_code)] Descriptor, Handle);
 
 impl Deref for Owned {

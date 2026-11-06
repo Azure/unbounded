@@ -111,6 +111,7 @@ mod hotpath;
 #[allow(dead_code)]
 pub(crate) mod counting_alloc;
 use racer as dataplane;
+// Shared fixture module; this test binary uses only part of it.
 #[path = "support/enrollment.rs"]
 #[allow(dead_code)]
 mod fixture_io;

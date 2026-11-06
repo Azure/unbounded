@@ -1039,11 +1039,12 @@ pub enum Destination<'a> {
 
 /// Something a stream keeps alive until synchronized.
 enum Retained {
+    // Never read: held only to keep the import alive until the stream syncs.
     Import(#[allow(dead_code)] Arc<ImportInner>),
 
     Staging(Arc<StagingInner>),
 
-    /// Host bytes a queued copy may still read.
+    /// Host bytes a queued copy may still read. Never read here, only kept alive.
     Host(#[allow(dead_code)] Box<dyn AsRef<[u8]> + Send>),
 
     Pinned(Arc<PinnedInner>),

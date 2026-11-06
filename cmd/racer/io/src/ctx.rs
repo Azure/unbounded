@@ -531,7 +531,7 @@ impl Xoshiro {
     }
 
     /// A value in `0..bound` (`bound > 0`), without modulo bias.
-    #[allow(dead_code)]
+    #[cfg(test)]
     pub(crate) fn below(&mut self, bound: u64) -> u64 {
         debug_assert!(bound > 0);
         let zone = u64::MAX - u64::MAX % bound;

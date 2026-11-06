@@ -32,7 +32,7 @@
 //! projection adapters remain caller-owned under Rust's orphan rules; rail
 //! mappings and cache definitions pass through without conversion.
 //!
-//! Tests consume the legacy canonical interop vectors in `wire/testdata`.
+//! Tests consume the canonical interop vectors in `wire/testdata`.
 //! Rust owns these checked-in vectors; no Go generator exists, and tests never
 //! rewrite them. Change a vector only with a deliberate wire-format change. Run
 //! from the repository root:

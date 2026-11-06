@@ -140,6 +140,7 @@ mod tests {
     use super::*;
     use std::{cell::Cell, rc::Rc};
 
+    // The payload is never read; it only sets the owner's size and alignment.
     struct Tracked(Rc<Cell<usize>>, #[allow(dead_code)] Vec<u8>);
 
     impl Drop for Tracked {

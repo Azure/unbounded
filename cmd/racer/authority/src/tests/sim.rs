@@ -65,8 +65,6 @@ struct Node {
 /// [`Authority`] per started Pod, all on this thread.
 pub(super) struct World {
     os: SimOs,
-    origin: Instant,
-    wall: SystemTime,
     api_clock: VirtualClock,
     api_ex: Executor,
     pub api: fake::FakeApi,
@@ -112,8 +110,6 @@ impl World {
             .collect();
         Self {
             os,
-            origin,
-            wall,
             api_clock,
             api_ex,
             api,
@@ -393,11 +389,6 @@ impl World {
         (1..=self.nodes.len())
             .filter(|&i| self.running(i) && matches!(self.role(i), Role::Primary(_)))
             .collect()
-    }
-
-    #[allow(dead_code)]
-    pub fn anchors(&self) -> (Instant, SystemTime) {
-        (self.origin, self.wall)
     }
 }
 
