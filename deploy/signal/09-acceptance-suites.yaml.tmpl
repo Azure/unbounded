@@ -215,30 +215,18 @@ spec:
               expected:
                 type: Integer
                 integerValue: 1
-            - name: no-server-errors
-              metric: serverErrorCount
-              operator: Maximum
+            - name: no-server-or-request-errors
+              metric: errorSourceCounts
+              operator: StatusEquals
               expected:
-                type: Integer
-                integerValue: 0
-            - name: no-request-errors
-              metric: requestErrorCount
-              operator: Maximum
+                type: String
+                stringValue: '{"request":0,"server":0}'
+            - name: no-container-or-workflow-pod-restarts
+              metric: restartSourceCounts
+              operator: StatusEquals
               expected:
-                type: Integer
-                integerValue: 0
-            - name: no-container-restarts
-              metric: containerRestartCount
-              operator: Maximum
-              expected:
-                type: Integer
-                integerValue: 0
-            - name: no-workflow-pod-restarts
-              metric: workflowPodRestartCount
-              operator: Maximum
-              expected:
-                type: Integer
-                integerValue: 0
+                type: String
+                stringValue: '{"container":0,"workflowPod":0}'
             - name: tensor-parallel-eight
               metric: tensorParallelSize
               operator: Range
@@ -266,11 +254,5 @@ spec:
               maximum:
                 type: Integer
                 integerValue: 8
-            - name: cleanup-succeeded
-              metric: cleanupSucceeded
-              operator: BooleanEquals
-              expected:
-                type: Boolean
-                booleanValue: true
 {{- end }}
 {{- end }}

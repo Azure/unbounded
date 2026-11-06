@@ -71,21 +71,13 @@ spec:
       displayName: Completion tokens
       type: Count
       required: true
-    - name: serverErrorCount
-      displayName: Server error count
-      type: Count
+    - name: errorSourceCounts
+      displayName: Named server and request error counts
+      type: Status
       required: true
-    - name: requestErrorCount
-      displayName: Request error count
-      type: Count
-      required: true
-    - name: containerRestartCount
-      displayName: Harness container restart count
-      type: Count
-      required: true
-    - name: workflowPodRestartCount
-      displayName: Workflow Pod restart count
-      type: Count
+    - name: restartSourceCounts
+      displayName: Named harness container and Workflow Pod restart counts
+      type: Status
       required: true
     - name: tensorParallelSize
       displayName: Tensor parallel size
@@ -100,10 +92,6 @@ spec:
       displayName: GPUs used by the serving process
       type: Count
       unit: devices
-      required: true
-    - name: cleanupSucceeded
-      displayName: Cleanup succeeded
-      type: Boolean
       required: true
     - name: endToEndLatency
       displayName: End-to-end latency

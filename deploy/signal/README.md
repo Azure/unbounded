@@ -461,6 +461,63 @@ make signal-manifests \
   SIGNAL_VLLM_MODEL_CACHE_PVC=<approved-read-only-cache-pvc>
 ```
 
+The repository publishes `project-signal-vllm-canary` and
+`project-signal-vllm-model-cache` through the existing
+`.github/workflows/images.yaml` workflow. The harness is based on vLLM v0.25.1
+at
+`docker.io/vllm/vllm-openai@sha256:e4f88a835143cd22aee2397a26ec6bb80b3a4a6fe0c882bcbc63822904766089`.
+The cache image contains only the approved
+`EleutherAI/pythia-70m-deduped` Apache-2.0 snapshot at revision
+`e93a9faa9c77e5d09219f6c868bfc7a1bd65593c`. Its canonical sorted TSV
+manifest digest is
+`sha256:52b9b0fa1a8a67424d2e8f7994675698c60e3eb1a7925091930ecc4958dbcd7e`;
+the `model.safetensors` digest is
+`sha256:3da388330e4549156d76b58d6d268c63cd005e9336b4f4d2d378421e7b7a33fd`.
+The deterministic prompt fixture digest is
+`sha256:87c87bfc4863e490bdef827c5aa1c0b48f47311e2fed3fd002c3e05dfad23d99`.
+
+Pre-stage the immutable snapshot before creating a Run. Use published image
+digests and a unique DNS-compatible seed identity:
+
+```bash
+make signal-manifests \
+  SIGNAL_VLLM_CANARY_ENABLED=true \
+  SIGNAL_VLLM_CANARY_IMAGE=<approved-harness>@sha256:<digest> \
+  SIGNAL_VLLM_CANARY_CPU=<approved-cpu-quantity> \
+  SIGNAL_VLLM_CANARY_MEMORY=<approved-memory-quantity> \
+  SIGNAL_VLLM_MODEL_CACHE_PVC=<approved-cache-pvc> \
+  SIGNAL_VLLM_MODEL_CACHE_SEED_ENABLED=true \
+  SIGNAL_VLLM_MODEL_CACHE_IMAGE=<approved-cache-image>@sha256:<digest> \
+  SIGNAL_VLLM_MODEL_CACHE_SEED_ID=<unique-seed-identity> \
+  SIGNAL_VLLM_MODEL_CACHE_CAPACITY=<approved-capacity> \
+  SIGNAL_VLLM_MODEL_CACHE_STORAGE_CLASS=<approved-storage-class>
+
+kubectl apply -f deploy/signal/rendered/10-vllm-model-cache.yaml
+kubectl wait -n project-signal \
+  --for=condition=complete \
+  job/project-signal-vllm-cache-<unique-seed-identity> \
+  --timeout=<approved-timeout>
+kubectl logs -n project-signal \
+  job/project-signal-vllm-cache-<unique-seed-identity>
+```
+
+The seed Job has no API token or RBAC. It verifies the embedded manifest and
+every file before copying, writes through a Pod-UID-scoped temporary
+directory, verifies the copy, and atomically publishes the final snapshot.
+An existing valid target is accepted idempotently; an invalid target, extra
+file, symlink, digest mismatch, or size mismatch fails closed. Record the PVC
+UID, Job UID, cache image digest, manifest digest, and successful verifier log.
+Delete the completed Job only after re-reading and matching its exact UID.
+The PVC is deliberately retained as a pre-staged input and is mounted into the
+runtime Pod through the exact revision subpath as read-only.
+
+Do not delete the PVC as ordinary Run cleanup. Dispose of it only in a
+separate reviewed operation after proving that no active Run or Workflow
+references its exact UID, recording a final digest verification, and
+re-reading the UID immediately before deletion. A canceled or restarted Run
+removes only its append-only result ConfigMap and child Workflow resources;
+it does not mutate or replace the shared model cache.
+
 The renderer computes the semantic digest of the exact
 `project-signal-vllm-canary-v1` WorkflowTemplate `spec`. Supplying
 `SIGNAL_VLLM_WORKFLOW_TEMPLATE_DIGEST=sha256:<digest>` makes rendering fail on
@@ -486,7 +543,9 @@ make signal-manifests \
 ```
 
 The approved harness contract receives canonical invocation, Run, plan, stage,
-participant, role, parameter, resolved-input, and result ConfigMap values. It
+Test, participant, role, parameter, resolved-input, and result ConfigMap
+values. It rejects any resolved input that does not contain the exact approved
+model manifest digest. It
 must create one bounded result ConfigMap containing the canonical invocation
 result envelope. The Workflow and its Pods use the dedicated
 `project-signal-vllm-workload` ServiceAccount. That identity can create only
@@ -494,8 +553,9 @@ the result ConfigMap and create or patch Argo WorkflowTaskResults; it cannot
 create Pods, create Workflows, read Nodes, or use the controller or adapter
 identity. The template pins eight GPUs to the exact primary participant,
 mounts an operator-approved read-only model cache, disables container restart,
-and bounds temporary storage. The stage invocation timeout becomes the child
-Workflow deadline.
+bounds temporary storage, and provides a bounded memory-backed `/dev/shm` for
+the eight tensor-parallel workers without exposing host IPC. The stage
+invocation timeout becomes the child Workflow deadline.
 
 Before creating the vLLM Suite and Profile, resolve and approve:
 
@@ -509,16 +569,20 @@ Before creating the vLLM Suite and Profile, resolve and approve:
 
 Hard assertions are limited to service readiness, exact model identity,
 revision and weight-set digest, request success, positive prompt and
-completion tokens, zero server and request errors, zero harness-container and
-Workflow-Pod restarts, tensor parallel size eight, exactly eight visible and
-actively used GPUs, and successful cleanup. Every error and restart count has
-a named source. All assertions are explicit Suite assertions. The adapter
-additionally prevents a passed invocation from reporting failed Kubernetes
-cleanup.
+completion tokens, zero named server/request error sources, zero named
+harness-container/Workflow-Pod restart sources, tensor parallel size eight,
+exactly eight visible and actively used GPUs, and successful cleanup. The
+restart sources are structurally zero because the Pod uses
+`restartPolicy: Never`, the Workflow has retry limit zero, and no nested
+workload is created. All Test assertions are explicit Suite assertions.
+Cleanup is also part of the canonical result envelope, and the adapter
+prevents a passed invocation from reporting failed Kubernetes cleanup.
 Latency, time to first token, output throughput, and GPU memory are recorded
 as measurements only until separate thresholds are approved. Do not infer
 MPI, burn, collective, CUDA correctness, or general serving performance from
-this canary.
+this canary. Rendering and offline mocks prove the contract only; GPU runtime
+success is unproven until an authorized executor runs the exact published
+digests on an eight-device participant.
 
 ## Terminal behavior
 

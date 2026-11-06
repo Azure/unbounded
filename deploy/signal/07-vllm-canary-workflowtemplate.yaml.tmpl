@@ -12,6 +12,12 @@
 {{- if empty .VLLMModelCachePVC }}
 {{- fail "VLLMModelCachePVC is required when the vLLM canary is enabled" }}
 {{- end }}
+{{- if empty .VLLMModelCacheSubPath }}
+{{- fail "VLLMModelCacheSubPath is required when the vLLM canary is enabled" }}
+{{- end }}
+{{- if not (regexMatch "^[A-Za-z0-9_-]+(\\.[A-Za-z0-9_-]+)*(/[A-Za-z0-9_-]+(\\.[A-Za-z0-9_-]+)*)*$" .VLLMModelCacheSubPath) }}
+{{- fail "VLLMModelCacheSubPath must be a safe relative path when the vLLM canary is enabled" }}
+{{- end }}
 apiVersion: argoproj.io/v1alpha1
 kind: WorkflowTemplate
 metadata:
@@ -35,6 +41,7 @@ spec:
       - name: plan-digest
       - name: stage-id
       - name: stage-order
+      - name: test-json
       - name: parameters-json
       - name: participants-json
       - name: participant-roles-json
@@ -43,6 +50,8 @@ spec:
       - name: result-configmap
   templates:
     - name: canary
+      retryStrategy:
+        limit: "0"
       nodeSelector:
         kubernetes.io/hostname: "{{`{{workflow.parameters.primary-participant-node-name}}`}}"
       tolerations:
@@ -61,12 +70,18 @@ spec:
           - --plan-digest={{`{{workflow.parameters.plan-digest}}`}}
           - --stage-id={{`{{workflow.parameters.stage-id}}`}}
           - --stage-order={{`{{workflow.parameters.stage-order}}`}}
+          - --test-json={{`{{workflow.parameters.test-json}}`}}
           - --parameters-json={{`{{workflow.parameters.parameters-json}}`}}
           - --participants-json={{`{{workflow.parameters.participants-json}}`}}
           - --participant-roles-json={{`{{workflow.parameters.participant-roles-json}}`}}
           - --resolved-inputs-json={{`{{workflow.parameters.resolved-inputs-json}}`}}
           - --result-configmap={{`{{workflow.parameters.result-configmap}}`}}
-          - --model-cache=/models
+          - --model-cache=/models/model
+        env:
+          - name: POD_NAMESPACE
+            valueFrom:
+              fieldRef:
+                fieldPath: metadata.namespace
         resources:
           requests:
             cpu: {{ .VLLMCanaryCPU }}
@@ -84,10 +99,13 @@ spec:
             drop: [ALL]
         volumeMounts:
           - name: model-cache
-            mountPath: /models
+            mountPath: /models/model
+            subPath: {{ .VLLMModelCacheSubPath }}
             readOnly: true
           - name: tmp
             mountPath: /tmp
+          - name: shared-memory
+            mountPath: /dev/shm
       volumes:
         - name: model-cache
           persistentVolumeClaim:
@@ -95,5 +113,9 @@ spec:
             readOnly: true
         - name: tmp
           emptyDir:
+            sizeLimit: 1Gi
+        - name: shared-memory
+          emptyDir:
+            medium: Memory
             sizeLimit: 1Gi
 {{- end }}

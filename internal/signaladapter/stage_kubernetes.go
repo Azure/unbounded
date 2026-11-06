@@ -615,6 +615,11 @@ func (e *KubernetesStageExecutor) executeWorkflowTemplate(
 		return signalv1.InvocationResultEnvelope{}, err
 	}
 
+	testJSON, err := marshalStageJSON(invocation.Stage.Test)
+	if err != nil {
+		return signalv1.InvocationResultEnvelope{}, err
+	}
+
 	templateSpec["activeDeadlineSeconds"] = int64(invocation.Stage.Schedule.InvocationTimeout.Seconds())
 	adapterParameters := []any{
 		map[string]any{"name": "invocation-id", "value": invocation.ID},
@@ -622,6 +627,7 @@ func (e *KubernetesStageExecutor) executeWorkflowTemplate(
 		map[string]any{"name": "plan-digest", "value": invocation.PlanDigest},
 		map[string]any{"name": "stage-id", "value": invocation.Stage.Name},
 		map[string]any{"name": "stage-order", "value": strconv.Itoa(int(invocation.StageOrder))},
+		map[string]any{"name": "test-json", "value": testJSON},
 		map[string]any{"name": "parameters-json", "value": parametersJSON},
 		map[string]any{"name": "participants-json", "value": participantsJSON},
 		map[string]any{"name": "participant-roles-json", "value": rolesJSON},

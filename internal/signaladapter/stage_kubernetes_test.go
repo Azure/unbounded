@@ -241,6 +241,34 @@ func TestWorkflowTemplateFailureCleansOwnerFencedChild(t *testing.T) {
 		)
 	}
 
+	arguments, found, nestedErr := unstructured.NestedSlice(
+		createdChild.Object,
+		"spec",
+		"arguments",
+		"parameters",
+	)
+	if nestedErr != nil || !found {
+		t.Fatalf("child Workflow arguments found %t, error %v", found, nestedErr)
+	}
+
+	var testJSON string
+
+	for _, argument := range arguments {
+		parameter := argument.(map[string]any)
+		if parameter["name"] == "test-json" {
+			testJSON = parameter["value"].(string)
+		}
+	}
+
+	var test signalv1.ResolvedCertificationTest
+	if err := json.Unmarshal([]byte(testJSON), &test); err != nil {
+		t.Fatalf("decode child Workflow test-json: %v", err)
+	}
+
+	if test.Identity != invocation.Stage.Test.Identity {
+		t.Fatalf("child Workflow test identity = %#v, want %#v", test.Identity, invocation.Stage.Test.Identity)
+	}
+
 	owners := createdChild.GetOwnerReferences()
 	if len(owners) != 1 ||
 		owners[0].UID != parent.GetUID() ||

@@ -242,11 +242,15 @@ func TestRenderedVLLMCanaryUsesImmutableBoundedContract(t *testing.T) {
 	templateText := string(firstTemplate)
 	for _, value := range []string{
 		"primary-participant-node-name",
+		"test-json",
 		"resolved-inputs-json",
 		"result-configmap",
 		"serviceAccountName: project-signal-vllm-workload",
 		"automountServiceAccountToken: true",
+		"subPath: EleutherAI--pythia-70m-deduped/snapshots/e93a9faa9c77e5d09219f6c868bfc7a1bd65593c",
 		"nvidia.com/gpu: \"8\"",
+		"mountPath: /dev/shm",
+		"medium: Memory",
 		"readOnly: true",
 	} {
 		if !strings.Contains(templateText, value) {
@@ -280,6 +284,21 @@ func TestRenderedVLLMCanaryUsesImmutableBoundedContract(t *testing.T) {
 	}
 
 	testText := string(readRenderedFile(t, secondOutput, "08-vllm-canary-test.yaml"))
+
+	var testObject unstructured.Unstructured
+	if err := yaml.Unmarshal([]byte(testText), &testObject); err != nil {
+		t.Fatalf("decode vLLM CertificationTest: %v", err)
+	}
+
+	metrics, found, err := unstructured.NestedSlice(testObject.Object, "spec", "metrics")
+	if err != nil || !found {
+		t.Fatalf("read vLLM CertificationTest metrics: found=%t err=%v", found, err)
+	}
+
+	if len(metrics) != 16 {
+		t.Fatalf("vLLM CertificationTest metric count = %d, want schema maximum 16", len(metrics))
+	}
+
 	for _, metric := range []string{
 		"serviceReady",
 		"modelIdentity",
@@ -288,14 +307,11 @@ func TestRenderedVLLMCanaryUsesImmutableBoundedContract(t *testing.T) {
 		"requestSucceeded",
 		"promptTokens",
 		"completionTokens",
-		"serverErrorCount",
-		"requestErrorCount",
-		"containerRestartCount",
-		"workflowPodRestartCount",
+		"errorSourceCounts",
+		"restartSourceCounts",
 		"tensorParallelSize",
 		"observedGpuCount",
 		"activeGpuCount",
-		"cleanupSucceeded",
 		"endToEndLatency",
 		"timeToFirstToken",
 		"outputTokensPerSecond",
@@ -374,6 +390,76 @@ func TestVLLMCanaryFailsClosedWithoutImmutableInputs(t *testing.T) {
 			err := render.Render(".", t.TempDir(), data)
 			if err == nil || !strings.Contains(err.Error(), tt.error) {
 				t.Fatalf("render error = %v, want %q", err, tt.error)
+			}
+		})
+	}
+}
+
+func TestRenderedVLLMModelCacheSeedsVerifiedOfflinePVC(t *testing.T) {
+	t.Parallel()
+
+	data := signalRenderData()
+	data["VLLMCanaryEnabled"] = "true"
+	data["VLLMCanaryImage"] = "example.invalid/vllm-canary@sha256:" + strings.Repeat("f", 64)
+	data["VLLMCanaryCPU"] = "4"
+	data["VLLMCanaryMemory"] = "16Gi"
+	data["VLLMModelCachePVC"] = "approved-model-cache"
+	data["VLLMModelCacheSeedEnabled"] = "true"
+	data["VLLMModelCacheImage"] = "example.invalid/vllm-cache@sha256:" + strings.Repeat("9", 64)
+	data["VLLMModelCacheSeedID"] = "52b9b0fa1a8a"
+	data["VLLMModelCacheCapacity"] = "1Gi"
+	data["VLLMModelCacheStorageClass"] = "approved-storage"
+
+	output := renderSignal(t, data)
+	content := string(readRenderedFile(t, output, "10-vllm-model-cache.yaml"))
+	assertContainsAll(
+		t,
+		content,
+		"vLLM model cache",
+		"kind: PersistentVolumeClaim",
+		"name: approved-model-cache",
+		"storageClassName: approved-storage",
+		"kind: Job",
+		"serviceAccountName: project-signal-vllm-cache-seeder",
+		"automountServiceAccountToken: false",
+		"--source-dir=/model",
+		"--target-dir=/cache/EleutherAI--pythia-70m-deduped/snapshots/e93a9faa9c77e5d09219f6c868bfc7a1bd65593c",
+		"--manifest-digest=sha256:52b9b0fa1a8a67424d2e8f7994675698c60e3eb1a7925091930ecc4958dbcd7e",
+		"--seed-uid=$(POD_UID)",
+		"readOnlyRootFilesystem: true",
+	)
+}
+
+func TestVLLMModelCacheSeedFailsClosedWithoutImmutableInputs(t *testing.T) {
+	t.Parallel()
+
+	for _, tt := range []struct {
+		name  string
+		key   string
+		value string
+	}{
+		{name: "mutable image", key: "VLLMModelCacheImage", value: "example.invalid/cache:latest"},
+		{name: "unsafe subpath", key: "VLLMModelCacheSubPath", value: "../model"},
+		{name: "missing capacity", key: "VLLMModelCacheCapacity", value: ""},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			data := signalRenderData()
+			data["VLLMCanaryEnabled"] = "true"
+			data["VLLMCanaryImage"] = "example.invalid/vllm-canary@sha256:" + strings.Repeat("f", 64)
+			data["VLLMCanaryCPU"] = "4"
+			data["VLLMCanaryMemory"] = "16Gi"
+			data["VLLMModelCachePVC"] = "approved-model-cache"
+			data["VLLMModelCacheSeedEnabled"] = "true"
+			data["VLLMModelCacheImage"] = "example.invalid/vllm-cache@sha256:" + strings.Repeat("9", 64)
+			data["VLLMModelCacheSeedID"] = "52b9b0fa1a8a"
+			data["VLLMModelCacheCapacity"] = "1Gi"
+			data[tt.key] = tt.value
+
+			output := t.TempDir()
+			if err := render.Render(".", output, data); err == nil {
+				t.Fatal("render accepted an unsafe vLLM model cache input")
 			}
 		})
 	}
@@ -460,14 +546,11 @@ func TestRenderedAcceptanceSuitesSeparateQualificationDiagnosticsAndVLLM(t *test
 		"requestSucceeded",
 		"promptTokens",
 		"completionTokens",
-		"serverErrorCount",
-		"requestErrorCount",
-		"containerRestartCount",
-		"workflowPodRestartCount",
+		"errorSourceCounts",
+		"restartSourceCounts",
 		"tensorParallelSize",
 		"observedGpuCount",
 		"activeGpuCount",
-		"cleanupSucceeded",
 	} {
 		if !strings.Contains(vllmText, "metric: "+metric) {
 			t.Fatalf("vLLM Suite does not assert %s", metric)
@@ -794,6 +877,19 @@ func TestRenderedRBACCoversQualificationAndEvidence(t *testing.T) {
 		"project-signal-vllm-workload",
 		true,
 	)
+	assertServiceAccountAutomount(
+		t,
+		adapterDocuments,
+		"signal-ns",
+		"project-signal-vllm-cache-seeder",
+		false,
+	)
+	assertNoRoleBindingSubject(
+		t,
+		adapterDocuments,
+		"signal-ns",
+		"project-signal-vllm-cache-seeder",
+	)
 	assertRule(
 		t,
 		adapterDocuments,
@@ -893,18 +989,21 @@ func TestGeneratedCRDSetContainsAllCertificationResources(t *testing.T) {
 
 func signalRenderData() map[string]string {
 	return map[string]string{
-		"Namespace":                  "signal-ns",
-		"ScriptNamespace":            "script-ns",
-		"ControllerImage":            testControllerImage,
-		"AdapterImage":               testAdapterImage,
-		"RunnerImage":                testRunnerImage,
-		"ResolverImages":             testResolverImage,
-		"GPUInventoryScriptDigest":   testScriptDigest,
-		"VLLMCanaryEnabled":          "false",
-		"AcceptanceSuitesEnabled":    "false",
-		"VLLMWorkflowTemplateDigest": testDigest,
-		"WorkflowTemplateDigest":     testDigest,
-		"QualificationGateProtected": "false",
+		"Namespace":                    "signal-ns",
+		"ScriptNamespace":              "script-ns",
+		"ControllerImage":              testControllerImage,
+		"AdapterImage":                 testAdapterImage,
+		"RunnerImage":                  testRunnerImage,
+		"ResolverImages":               testResolverImage,
+		"GPUInventoryScriptDigest":     testScriptDigest,
+		"VLLMCanaryEnabled":            "false",
+		"VLLMModelCacheSeedEnabled":    "false",
+		"VLLMModelCacheSubPath":        "EleutherAI--pythia-70m-deduped/snapshots/e93a9faa9c77e5d09219f6c868bfc7a1bd65593c",
+		"VLLMModelCacheManifestDigest": "sha256:52b9b0fa1a8a67424d2e8f7994675698c60e3eb1a7925091930ecc4958dbcd7e",
+		"AcceptanceSuitesEnabled":      "false",
+		"VLLMWorkflowTemplateDigest":   testDigest,
+		"WorkflowTemplateDigest":       testDigest,
+		"QualificationGateProtected":   "false",
 	}
 }
 
@@ -1073,6 +1172,34 @@ func assertRoleBindingSubject(
 
 	if !found {
 		t.Fatalf("RoleBinding/%s in namespace %q not found", name, namespace)
+	}
+}
+
+func assertNoRoleBindingSubject(
+	t *testing.T,
+	documents []string,
+	namespace string,
+	serviceAccount string,
+) {
+	t.Helper()
+
+	for _, document := range documents {
+		var object rbacv1.RoleBinding
+		if err := yaml.Unmarshal([]byte(document), &object); err != nil {
+			t.Fatalf("decode RBAC document: %v", err)
+		}
+
+		if object.Kind != "RoleBinding" && object.Kind != "ClusterRoleBinding" {
+			continue
+		}
+
+		for _, subject := range object.Subjects {
+			if subject.Kind == "ServiceAccount" &&
+				subject.Name == serviceAccount &&
+				subject.Namespace == namespace {
+				t.Fatalf("ServiceAccount/%s has unexpected binding: %#v", serviceAccount, object)
+			}
+		}
 	}
 }
 

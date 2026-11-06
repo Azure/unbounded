@@ -101,12 +101,23 @@ SIGNAL_ADAPTER_IMAGE ?= example.invalid/project-signal-adapter@sha256:0000000000
 SIGNAL_ADAPTER_BUILD_IMAGE ?= example.invalid/project-signal-adapter:replace-me
 SIGNAL_CERTIFICATION_RUNNER_IMAGE ?= example.invalid/project-signal-runner@sha256:0000000000000000000000000000000000000000000000000000000000000000
 SIGNAL_RESOLVER_IMAGES ?=
+PROJECT_SIGNAL_MODEL_CACHE_BIN=bin/project-signal-model-cache
+PROJECT_SIGNAL_MODEL_CACHE_CMD=./cmd/project-signal-model-cache
+SIGNAL_VLLM_CANARY_BUILD_IMAGE ?= example.invalid/project-signal-vllm-canary:replace-me
+SIGNAL_VLLM_MODEL_CACHE_BUILD_IMAGE ?= example.invalid/project-signal-vllm-model-cache:replace-me
 SIGNAL_GPU_INVENTORY_SCRIPT_DIGEST ?= sha256:c6386f7989280ce844b5e997377839434684f4c6b52dbd8f3d7d15def1fc72a3
 SIGNAL_VLLM_CANARY_ENABLED ?= false
 SIGNAL_VLLM_CANARY_IMAGE ?=
 SIGNAL_VLLM_CANARY_CPU ?=
 SIGNAL_VLLM_CANARY_MEMORY ?=
 SIGNAL_VLLM_MODEL_CACHE_PVC ?=
+SIGNAL_VLLM_MODEL_CACHE_SUBPATH ?= EleutherAI--pythia-70m-deduped/snapshots/e93a9faa9c77e5d09219f6c868bfc7a1bd65593c
+SIGNAL_VLLM_MODEL_CACHE_MANIFEST_DIGEST ?= sha256:52b9b0fa1a8a67424d2e8f7994675698c60e3eb1a7925091930ecc4958dbcd7e
+SIGNAL_VLLM_MODEL_CACHE_SEED_ENABLED ?= false
+SIGNAL_VLLM_MODEL_CACHE_IMAGE ?=
+SIGNAL_VLLM_MODEL_CACHE_SEED_ID ?=
+SIGNAL_VLLM_MODEL_CACHE_CAPACITY ?=
+SIGNAL_VLLM_MODEL_CACHE_STORAGE_CLASS ?=
 SIGNAL_VLLM_WORKFLOW_TEMPLATE_DIGEST ?=
 SIGNAL_ACCEPTANCE_SUITES_ENABLED ?= false
 SIGNAL_GPU_INVENTORY_TEST_UID ?=
@@ -273,7 +284,7 @@ NET_FRONTEND_CACHE_FILE    := $(NET_FRONTEND_DIST_DIR)/.frontend-build-key
 # Frontend build toggle (dev builds produce unminified output with sourcemaps).
 REACT_DEV ?= false
 
-.PHONY: all help fmt lint lint-actions test build vulncheck check-deps kubectl-unbounded kubectl-unbounded-build install-tools install-protoc install-helm generate kubectl-unbounded forge relctl relctl-build agent-artifacts-builder agent-artifacts-builder-build orcadev unbounded-agent machina machina-build machina-oci machina-oci-push machina-manifests machine-ops-controller machine-ops-controller-build machine-ops-controller-oci machine-ops-controller-oci-push machine-ops-manifests project-signal-controller project-signal-controller-build project-signal-adapter project-signal-adapter-build signal-manifests image-project-signal-controller-local image-project-signal-adapter-local metalman metalman-build metalman-oci metalman-oci-push unbounded-operator unbounded-operator-build unbounded-operator-manifests playpen-manifests e2e-gantry e2e-playpen e2e-racer gomod docs-serve unbounded-net-controller unbounded-net-controller-build unbounded-net-node unbounded-net-node-build unbounded-net-routeplan-debug unping unping-build unroute unroute-build license-check notice notice-check gantry gantry-build gantry-manifests inventory-manifests
+.PHONY: all help fmt lint lint-actions test build vulncheck check-deps kubectl-unbounded kubectl-unbounded-build install-tools install-protoc install-helm generate kubectl-unbounded forge relctl relctl-build agent-artifacts-builder agent-artifacts-builder-build orcadev unbounded-agent machina machina-build machina-oci machina-oci-push machina-manifests machine-ops-controller machine-ops-controller-build machine-ops-controller-oci machine-ops-controller-oci-push machine-ops-manifests project-signal-controller project-signal-controller-build project-signal-adapter project-signal-adapter-build project-signal-model-cache project-signal-model-cache-build signal-manifests image-project-signal-controller-local image-project-signal-adapter-local image-project-signal-vllm-canary-local image-project-signal-vllm-model-cache-local metalman metalman-build metalman-oci metalman-oci-push unbounded-operator unbounded-operator-build unbounded-operator-manifests playpen-manifests e2e-gantry e2e-playpen e2e-racer gomod docs-serve unbounded-net-controller unbounded-net-controller-build unbounded-net-node unbounded-net-node-build unbounded-net-routeplan-debug unping unping-build unroute unroute-build license-check notice notice-check gantry gantry-build gantry-manifests inventory-manifests
 .PHONY: net-frontend net-frontend-clean net-ebpf-build net-ebpf-generate net-ebpf-verify net-manifests gantry-chart-lint gantry-chart-package release-bom release-manifests unbounded-operator-release-manifest
 .PHONY: image-machina-local image-token-refresher-local image-machine-ops-controller-local image-metalman-local image-unbounded-operator-local image-unbounded-operator-push image-playpen-local image-net-controller-local image-net-node-local image-gantry-local image-gantry-push images-local
 .PHONY: image-net-controller-push image-net-node-push images-net-all images-net-all-push
@@ -334,6 +345,7 @@ help: ## Show this help
 	@echo "  machine-ops-controller           Build machine-ops-controller"
 	@echo "  project-signal-controller        Build Project Signal controller"
 	@echo "  project-signal-adapter           Build Project Signal participant adapter"
+	@echo "  project-signal-model-cache       Build Project Signal model cache verifier"
 	@echo "  signal-manifests                 Render Project Signal manifests"
 	@echo "  metalman | metalman-build        Build metalman controller (with/without lint/test)"
 	@echo "  unbounded-operator | unbounded-operator-build  Build the top-level Site operator"
@@ -1174,6 +1186,12 @@ project-signal-adapter-build: signal-manifests ## Build Project Signal adapter w
 
 project-signal-adapter: test project-signal-adapter-build ## Build Project Signal adapter (implies test)
 
+project-signal-model-cache-build: ## Build Project Signal model cache verifier without lint/test
+	@mkdir -p bin
+	$(GOBUILD) -trimpath -o $(PROJECT_SIGNAL_MODEL_CACHE_BIN) $(PROJECT_SIGNAL_MODEL_CACHE_CMD)
+
+project-signal-model-cache: test project-signal-model-cache-build ## Build Project Signal model cache verifier (implies test)
+
 image-project-signal-controller-local: ## Build Project Signal controller image locally
 	$(CONTAINER_ENGINE) build \
 		--build-arg VERSION=$(VERSION) \
@@ -1191,6 +1209,18 @@ image-project-signal-adapter-local: ## Build Project Signal adapter image locall
 		-t project-signal-adapter:$(VERSION_TAG) -t $(SIGNAL_ADAPTER_BUILD_IMAGE) \
 		-f ./images/project-signal-adapter/Containerfile .
 	$(call trivy-maybe,$(SIGNAL_ADAPTER_BUILD_IMAGE))
+
+image-project-signal-vllm-canary-local: ## Build Project Signal vLLM canary image locally
+	$(CONTAINER_ENGINE) build \
+		-t $(SIGNAL_VLLM_CANARY_BUILD_IMAGE) \
+		-f ./images/project-signal-vllm-canary/Containerfile .
+	$(call trivy-maybe,$(SIGNAL_VLLM_CANARY_BUILD_IMAGE))
+
+image-project-signal-vllm-model-cache-local: ## Build Project Signal vLLM model cache image locally
+	$(CONTAINER_ENGINE) build \
+		-t $(SIGNAL_VLLM_MODEL_CACHE_BUILD_IMAGE) \
+		-f ./images/project-signal-vllm-model-cache/Containerfile .
+	$(call trivy-maybe,$(SIGNAL_VLLM_MODEL_CACHE_BUILD_IMAGE))
 
 MACHINA_NAMESPACE ?= $(UNBOUNDED_NAMESPACE)
 MACHINA_API_SERVER_ENDPOINT ?=
@@ -1274,6 +1304,10 @@ signal-manifests: ## Render Project Signal manifests into deploy/signal/rendered
 		true|false) ;; \
 		*) echo "SIGNAL_VLLM_CANARY_ENABLED must be true or false" >&2; exit 1 ;; \
 	esac; \
+	case "$(SIGNAL_VLLM_MODEL_CACHE_SEED_ENABLED)" in \
+		true|false) ;; \
+		*) echo "SIGNAL_VLLM_MODEL_CACHE_SEED_ENABLED must be true or false" >&2; exit 1 ;; \
+	esac; \
 	case "$(SIGNAL_ACCEPTANCE_SUITES_ENABLED)" in \
 		true|false) ;; \
 		*) echo "SIGNAL_ACCEPTANCE_SUITES_ENABLED must be true or false" >&2; exit 1 ;; \
@@ -1301,6 +1335,13 @@ signal-manifests: ## Render Project Signal manifests into deploy/signal/rendered
 		--set VLLMCanaryCPU=$(SIGNAL_VLLM_CANARY_CPU) \
 		--set VLLMCanaryMemory=$(SIGNAL_VLLM_CANARY_MEMORY) \
 		--set VLLMModelCachePVC=$(SIGNAL_VLLM_MODEL_CACHE_PVC) \
+		--set VLLMModelCacheSubPath=$(SIGNAL_VLLM_MODEL_CACHE_SUBPATH) \
+		--set VLLMModelCacheManifestDigest=$(SIGNAL_VLLM_MODEL_CACHE_MANIFEST_DIGEST) \
+		--set VLLMModelCacheSeedEnabled=$(SIGNAL_VLLM_MODEL_CACHE_SEED_ENABLED) \
+		--set VLLMModelCacheImage=$(SIGNAL_VLLM_MODEL_CACHE_IMAGE) \
+		--set VLLMModelCacheSeedID=$(SIGNAL_VLLM_MODEL_CACHE_SEED_ID) \
+		--set VLLMModelCacheCapacity=$(SIGNAL_VLLM_MODEL_CACHE_CAPACITY) \
+		--set VLLMModelCacheStorageClass=$(SIGNAL_VLLM_MODEL_CACHE_STORAGE_CLASS) \
 		--set VLLMWorkflowTemplateDigest=sha256:0000000000000000000000000000000000000000000000000000000000000000 \
 		--set AcceptanceSuitesEnabled=$(SIGNAL_ACCEPTANCE_SUITES_ENABLED) \
 		--set GPUInventoryTestUID=$(SIGNAL_GPU_INVENTORY_TEST_UID) \
@@ -1387,6 +1428,13 @@ signal-manifests: ## Render Project Signal manifests into deploy/signal/rendered
 		--set VLLMCanaryCPU=$(SIGNAL_VLLM_CANARY_CPU) \
 		--set VLLMCanaryMemory=$(SIGNAL_VLLM_CANARY_MEMORY) \
 		--set VLLMModelCachePVC=$(SIGNAL_VLLM_MODEL_CACHE_PVC) \
+		--set VLLMModelCacheSubPath=$(SIGNAL_VLLM_MODEL_CACHE_SUBPATH) \
+		--set VLLMModelCacheManifestDigest=$(SIGNAL_VLLM_MODEL_CACHE_MANIFEST_DIGEST) \
+		--set VLLMModelCacheSeedEnabled=$(SIGNAL_VLLM_MODEL_CACHE_SEED_ENABLED) \
+		--set VLLMModelCacheImage=$(SIGNAL_VLLM_MODEL_CACHE_IMAGE) \
+		--set VLLMModelCacheSeedID=$(SIGNAL_VLLM_MODEL_CACHE_SEED_ID) \
+		--set VLLMModelCacheCapacity=$(SIGNAL_VLLM_MODEL_CACHE_CAPACITY) \
+		--set VLLMModelCacheStorageClass=$(SIGNAL_VLLM_MODEL_CACHE_STORAGE_CLASS) \
 		--set VLLMWorkflowTemplateDigest="$$vllm_workflow_digest" \
 		--set AcceptanceSuitesEnabled=$(SIGNAL_ACCEPTANCE_SUITES_ENABLED) \
 		--set GPUInventoryTestUID=$(SIGNAL_GPU_INVENTORY_TEST_UID) \

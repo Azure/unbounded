@@ -1,0 +1,36 @@
+# Copyright (c) Microsoft Corporation.
+# SPDX-License-Identifier: Apache-2.0
+
+ARG GO_IMAGE=docker.io/library/golang:1.27.0-trixie@sha256:df98008ecd2b0ecc9f0a94d1b07e3564a9c92b555369b33d9b5f60d0765b2db7
+
+FROM ${GO_IMAGE} AS builder
+WORKDIR /src
+COPY go.mod go.sum ./
+RUN go mod download
+COPY cmd/project-signal-model-cache ./cmd/project-signal-model-cache
+RUN CGO_ENABLED=0 go build -trimpath -o /out/project-signal-model-cache ./cmd/project-signal-model-cache
+
+FROM scratch
+
+ARG MODEL_REVISION=e93a9faa9c77e5d09219f6c868bfc7a1bd65593c
+ARG MODEL_BASE_URL=https://huggingface.co/EleutherAI/pythia-70m-deduped/resolve
+
+COPY --from=builder /out/project-signal-model-cache /project-signal-model-cache
+COPY images/project-signal-vllm-model-cache/model-manifest.tsv /model/model-manifest.tsv
+COPY images/project-signal-vllm-model-cache/model-provenance.json /licenses/model-provenance.json
+COPY LICENSE /licenses/EleutherAI-pythia-70m-deduped-LICENSE
+COPY NOTICE /licenses/unbounded-NOTICE
+
+ADD --chmod=0444 --checksum=sha256:002050231a9b1ec3ac77aa6b9b3bbdc4d923f4068a7dd33b8da72a9bd6ad9a43 \
+    ${MODEL_BASE_URL}/${MODEL_REVISION}/config.json /model/config.json
+ADD --chmod=0444 --checksum=sha256:3da388330e4549156d76b58d6d268c63cd005e9336b4f4d2d378421e7b7a33fd \
+    ${MODEL_BASE_URL}/${MODEL_REVISION}/model.safetensors /model/model.safetensors
+ADD --chmod=0444 --checksum=sha256:6f50ab5a5a509a1c309d6171f339b196a900dc9c99ad0408ff23bb615fdae7ad \
+    ${MODEL_BASE_URL}/${MODEL_REVISION}/special_tokens_map.json /model/special_tokens_map.json
+ADD --chmod=0444 --checksum=sha256:c24618a1b3e6a38167beff1c72cffd126c3a66254347304b50547d12c5f25624 \
+    ${MODEL_BASE_URL}/${MODEL_REVISION}/tokenizer.json /model/tokenizer.json
+ADD --chmod=0444 --checksum=sha256:70e38394e494931c6f773ba41e19460dd4436526b852207367f04341b4066d3f \
+    ${MODEL_BASE_URL}/${MODEL_REVISION}/tokenizer_config.json /model/tokenizer_config.json
+
+USER 65532:65532
+ENTRYPOINT ["/project-signal-model-cache"]
