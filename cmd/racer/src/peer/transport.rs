@@ -346,7 +346,8 @@ impl Transfers {
             }
         };
         let scope = &bounded;
-        if plan != (TransportPlan::Rdma { rail: binding.rail }) {
+        // The receiver chose the rail; it must be one both ends publish.
+        if !crate::rdma::admits_rail(plan, membership, self.signatures.node(), peer, binding.rail) {
             links.release(peer, &grant);
             links.record_send_declined(false);
             return Ok((connection, false));
@@ -444,6 +445,7 @@ impl Transfers {
         &self,
         request: &SignedRequest,
         plan: TransportPlan,
+        membership: &crate::topology::Membership,
         landing: Option<i32>,
         scope: &RequestScope,
     ) -> Result<Option<(Binding, SignedHead, NodeId, PendingReceive)>> {
@@ -461,6 +463,23 @@ impl Transfers {
                 .unwrap_or(&request.authentication.original)
                 .head,
         )?;
+        // Land the page on a rail whose NIC shares this worker's NUMA node
+        // when one is ready, so the NIC writes and this worker copies
+        // node-local memory. A GPU landing keeps the hashed rail, whose
+        // landing buffers were placed for that GPU.
+        let rail = if landing.is_none() {
+            let local: Vec<_> = links
+                .local_rails(&peer)
+                .into_iter()
+                .filter(|&r| {
+                    crate::rdma::admits_rail(plan, membership, self.signatures.node(), &peer, r)
+                })
+                .collect();
+            let page = super::rail_hint(&request.request.operation);
+            crate::rdma::receiver_rail(page.as_ref(), rail, &local)
+        } else {
+            rail
+        };
         if links.ready(&peer, rail).is_none() {
             links.record_fallback_no_link();
             return Ok(None);
@@ -616,15 +635,21 @@ impl Transfers {
         if binding.membership != membership.version.0 {
             return Err(Error::IncompatibleMembership);
         }
-        if self.response_plan(
+        let plan = self.response_plan(
             &connection,
             &authentication,
             membership,
             &envelope.page,
             verified.peer.node(),
             false,
-        )? != (TransportPlan::Rdma { rail: binding.rail })
-        {
+        )?;
+        if !crate::rdma::admits_rail(
+            plan,
+            membership,
+            self.signatures.node(),
+            verified.peer.node(),
+            binding.rail,
+        ) {
             return Err(Error::Unauthorized);
         }
         if phase == Phase::Finish {
@@ -1403,8 +1428,9 @@ impl Transfers {
             }
             // Native response verification requires an authenticated membership lease.
             let granting = scope.clock().now();
-            let native = if membership.is_some() {
-                self.accept_native(&request, plan, landing, scope).await?
+            let native = if let Some(membership) = &membership {
+                self.accept_native(&request, plan, membership, landing, scope)
+                    .await?
             } else {
                 None
             };

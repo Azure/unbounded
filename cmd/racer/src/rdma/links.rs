@@ -337,6 +337,9 @@ pub struct Links {
     /// This worker's clock (setup rate limits, stage timing) and entropy
     /// (setup nonces).
     ctx: racer_io::WorkerCtx,
+
+    /// This worker's NUMA node, if known, for NUMA-local rail choice.
+    numa: Option<usize>,
 }
 
 impl Links {
@@ -360,7 +363,29 @@ impl Links {
             breaks_seen: Cell::new([0; rdma_verbs::BreakReason::ALL.len()]),
             metrics: None,
             ctx,
+            numa: None,
         }
+    }
+
+    /// Set this worker's NUMA node, so [`Self::local_rails`] prefers rails
+    /// whose NIC is on it.
+    pub fn with_numa(mut self, numa: Option<usize>) -> Self {
+        self.numa = numa;
+        self
+    }
+
+    /// Rails whose NIC is on this worker's NUMA node and whose link to
+    /// `peer` is ready. Empty when the worker's node is unknown.
+    pub fn local_rails(&self, peer: &NodeId) -> Vec<RailId> {
+        let Some(numa) = self.numa else {
+            return Vec::new();
+        };
+        self.active()
+            .into_iter()
+            .filter(|m| m.numa_node == Some(numa))
+            .map(|m| m.rail)
+            .filter(|&rail| self.ready(peer, rail).is_some())
+            .collect()
     }
 
     /// Count pages and bytes in `metrics`.

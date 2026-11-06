@@ -395,6 +395,54 @@ fn rail_plan(
     Some(rail)
 }
 
+/// Whether a hop planned as `plan` may carry its page on `chosen`, the rail
+/// the receiver named in its signed `Accept`: the plan is RDMA and both ends
+/// publish `chosen` in the membership's rail domain. The receiver picks the
+/// rail (see [`receiver_rail`]), so `chosen` need not be the page's hashed
+/// rail.
+pub fn admits_rail(
+    plan: TransportPlan,
+    membership: &crate::topology::Membership,
+    local: &racer_wire::control::NodeId,
+    peer: &racer_wire::control::NodeId,
+    chosen: RailId,
+) -> bool {
+    let (Ok(a), Ok(b)) = (membership.member(local), membership.member(peer)) else {
+        return false;
+    };
+    matches!(plan, TransportPlan::Rdma { .. })
+        && membership.rail_domain().contains(&chosen)
+        && [a, b]
+            .iter()
+            .all(|m| m.rails.iter().any(|r| r.rail == chosen))
+}
+
+/// The rail a receiver grants `page` on, given the page's hashed rail
+/// `planned` and the ready rails whose NIC shares the receiving worker's
+/// NUMA node (`local`), so the NIC writes and the worker copies memory on
+/// one node.
+///
+/// Keeps `planned` when it is local or no rail is. Otherwise picks one of
+/// `local` by an independent hash of the page, so pages whose hashed rail is
+/// remote spread evenly over the local rails. With rails split evenly across
+/// nodes and workers spread evenly across them, every rail stays evenly used.
+pub fn receiver_rail(page: Option<&PageId>, planned: RailId, local: &[RailId]) -> RailId {
+    if local.is_empty() || local.contains(&planned) {
+        return planned;
+    }
+    let Some(page) = page else {
+        return planned;
+    };
+    let mut local = local.to_vec();
+    local.sort_unstable();
+    local.dedup();
+    let mut digest = crate::topology::hash_domain(b"racer/rail-numa/v1\0");
+    crate::topology::hash_object(&mut digest, &page.version.object, page.number);
+    let digest = crate::topology::hash_finish(digest);
+    let sample = u64::from_be_bytes(digest[..8].try_into().unwrap());
+    local[(sample % local.len() as u64) as usize]
+}
+
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
@@ -917,6 +965,85 @@ pub(crate) mod tests {
                 membership,
             }
         }
+        #[test]
+        fn admits_rail_accepts_any_rail_both_ends_publish() {
+            let both = route(|_| {});
+            let (a, b) = (&both.nodes[0], &both.nodes[1]);
+            let rdma = TransportPlan::Rdma { rail: RailId(7) };
+            for rail in [RailId(7), RailId(2)] {
+                assert!(admits_rail(rdma, &both.membership, a, b, rail));
+                assert!(admits_rail(rdma, &both.membership, b, a, rail));
+            }
+            // Not a published rail, an HTTP plan, or an unknown peer.
+            assert!(!admits_rail(rdma, &both.membership, a, b, RailId(3)));
+            assert!(!admits_rail(
+                TransportPlan::Http,
+                &both.membership,
+                a,
+                b,
+                RailId(7)
+            ));
+            let unknown = NodeId("unknown".into());
+            assert!(!admits_rail(rdma, &both.membership, a, &unknown, RailId(7)));
+            // A rail only one end publishes.
+            let one = route(|m| m[1].rails.retain(|r| r.rail == RailId(7)));
+            let (a, b) = (&one.nodes[0], &one.nodes[1]);
+            assert!(admits_rail(rdma, &one.membership, a, b, RailId(7)));
+            assert!(!admits_rail(rdma, &one.membership, a, b, RailId(2)));
+            assert!(!admits_rail(rdma, &one.membership, b, a, RailId(2)));
+        }
+
+        #[test]
+        fn receiver_rail_keeps_local_or_unplaceable_pages_on_the_hashed_rail() {
+            let local = [RailId(0), RailId(1)];
+            assert_eq!(receiver_rail(Some(&page(0)), RailId(1), &local), RailId(1));
+            assert_eq!(receiver_rail(Some(&page(0)), RailId(5), &[]), RailId(5));
+            assert_eq!(receiver_rail(None, RailId(5), &local), RailId(5));
+            // Order and duplicates of the local set do not change the choice.
+            for number in 0..64 {
+                let p = page(number);
+                assert_eq!(
+                    receiver_rail(Some(&p), RailId(5), &[RailId(1), RailId(0), RailId(1)]),
+                    receiver_rail(Some(&p), RailId(5), &local),
+                );
+                assert!(local.contains(&receiver_rail(Some(&p), RailId(5), &local)));
+            }
+        }
+
+        /// Eight rails, four per NUMA node, as on the benchmark nodes. Pages
+        /// owned by workers on either node land only on that node's rails,
+        /// and every rail carries an even share overall.
+        #[test]
+        fn receiver_rail_is_numa_local_and_even() {
+            let domain: Vec<_> = (0..8).map(RailId).collect();
+            let node_rails = |numa: u16| -> Vec<RailId> {
+                domain.iter().copied().filter(|r| r.0 / 4 == numa).collect()
+            };
+            let pages = 16_000u64;
+            let mut counts = [0u64; 8];
+            for number in 0..pages {
+                let p = page(number);
+                let mut digest = crate::topology::hash_domain(b"racer/rail/v1\0");
+                crate::topology::hash_object(&mut digest, &p.version.object, p.number);
+                let digest = crate::topology::hash_finish(digest);
+                let sample = u64::from_be_bytes(digest[..8].try_into().unwrap());
+                let planned = domain[(sample % 8) as usize];
+                // Owner workers alternate between the two nodes.
+                let numa = (number % 2) as u16;
+                let local = node_rails(numa);
+                let rail = receiver_rail(Some(&p), planned, &local);
+                assert!(local.contains(&rail), "page {number} left node {numa}");
+                counts[usize::from(rail.0)] += 1;
+            }
+            let expected = pages / 8;
+            for (rail, &count) in counts.iter().enumerate() {
+                assert!(
+                    count.abs_diff(expected) < expected / 10,
+                    "rail {rail} carried {count}, expected about {expected}"
+                );
+            }
+        }
+
         #[test]
         fn mixed_site_hops_preserve_global_rail_mapping_and_hardware_vetoes() {
             let mixed = route(|m| m[2].site = "site2".into());

@@ -367,6 +367,33 @@ fn activation_with_one_buffer_funds_one_receive_buffer() {
 }
 
 #[test]
+fn local_rails_are_ready_rails_on_the_worker_numa_node() {
+    let mut w = world();
+    let env = w.env.clone();
+    let (a, b) = (node_id(1), node_id(2));
+    let set_rail_numa = |w: &World, numa| {
+        LinkNode::lock(&w.a.links.node().active)
+            .iter_mut()
+            .for_each(|m| m.numa_node = numa);
+    };
+    set_rail_numa(&w, Some(1));
+    Rc::get_mut(&mut w.a.links).unwrap().numa = Some(1);
+    // A local rail without a ready link to the peer is not offered.
+    assert!(w.a.links.local_rails(&b).is_empty());
+    link_up(&env, &mut w);
+    assert_eq!(w.a.links.local_rails(&b), vec![RAIL]);
+    assert!(w.a.links.local_rails(&a).is_empty(), "no link to self");
+    // The rail's NIC on another node, or of unknown locality.
+    for numa in [Some(0), None] {
+        set_rail_numa(&w, numa);
+        assert!(w.a.links.local_rails(&b).is_empty());
+    }
+    // A worker of unknown locality has no local rails.
+    set_rail_numa(&w, Some(1));
+    assert!(w.b.links.local_rails(&a).is_empty());
+}
+
+#[test]
 fn setup_page_both_directions_and_release() {
     let mut w = world();
     let env = w.env.clone();

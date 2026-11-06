@@ -208,8 +208,17 @@ The HTTP requester receives the page; the HTTP responder sends it.
    The signed request already binds the transfer id. If no grant is available,
    the request has no RDMA control and uses HTTP. There is no empty `Accept`.
 
+   The requester picks the grant's `rail`. The plan names the page's hashed
+   rail. When that rail's NIC is not on the requesting worker's NUMA node and
+   a rail on that node has a ready link to the responder, the requester picks
+   one of those rails by a second hash of the page instead. The NIC then
+   writes, and the worker copies and decrypts, memory on one node. A GPU
+   landing grant keeps the hashed rail. Each rail's page pool is registered
+   under a memory policy preferring its device's NUMA node.
+
 2. The responder verifies the request and grant, then rechecks the response's
-   membership and transport plan. It writes the immutable page with
+   membership and transport plan. The plan must be RDMA and both nodes must
+   publish the granted rail. It need not be the page's hashed rail. It writes the immutable page with
    `WRITE_WITH_IMM`, using the grant tag as the immediate. A write may wait for
    the in-band grant if the HTTP request arrives first.
 

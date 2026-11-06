@@ -1430,6 +1430,7 @@ impl WorkerApplication {
         let writer = store.writer.clone();
 
         let links = if config.enable_rdma {
+            let numa = node.native.numa(worker)?.and_then(|p| p.numa_node);
             node.native.client(worker)?.map(|client| {
                 Rc::new(
                     Links::new(
@@ -1439,6 +1440,7 @@ impl WorkerApplication {
                         Some(reactor.clone()),
                         reactor.ctx().clone(),
                     )
+                    .with_numa(numa)
                     .with_metrics(metrics.clone()),
                 )
             })
