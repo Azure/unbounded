@@ -35,7 +35,8 @@ that have not been checked on a node.
   and only in this mode. Only `runc` is supported. The host's own docker and
   containerd are not used, and the host's containerd and kubelet units are
   disabled because the container shares `/run/containerd` with the host.
-- cgroup v2, and systemd 254 or newer for `DelegateSubgroup=`.
+- cgroup v2, and systemd 254 or newer for `DelegateSubgroup=`, `RestartSteps=`
+  and `RestartMaxDelaySec=`. Preflight checks the version.
 - Kernel modules the node stack needs. The agent loads them on the host and
   lists them in `/etc/modules-load.d/unbounded-kubernetes.conf`, because the
   container does not load modules at boot. `/lib/modules` is bound read-only

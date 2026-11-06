@@ -359,7 +359,9 @@ func newBackend(t *testing.T) (*Backend, *stub, string) {
 	t.Helper()
 
 	dir := t.TempDir()
-	st := &stub{fail: map[string]error{}, out: map[string]string{}}
+	st := &stub{fail: map[string]error{}, out: map[string]string{
+		"systemctl --version": "systemd 255 (255.4-1ubuntu8)\n+PAM +AUDIT +SELINUX\n",
+	}}
 	b := &Backend{
 		Layout:        Layout{Base: filepath.Join(dir, "containers")},
 		SystemdDir:    filepath.Join(dir, "systemd"),
@@ -864,6 +866,72 @@ func TestPreflight(t *testing.T) {
 
 	b.WritableCheck = func(...string) error { return errors.New("/usr is read only") }
 	require.ErrorContains(t, b.Preflight(), "read only")
+}
+
+func TestPreflightRequiresSystemd254(t *testing.T) {
+	ready := func(t *testing.T) (*Backend, *stub) {
+		t.Helper()
+
+		b, st, dir := newBackend(t)
+		b.WritableCheck = func(...string) error { return nil }
+		b.RuntimePath = filepath.Join(dir, "runc")
+		require.NoError(t, os.WriteFile(b.RuntimePath, []byte("#!/bin/sh\n"), 0o755))
+		require.NoError(t, os.WriteFile(b.Host.CgroupControllers, []byte("cpu memory\n"), 0o644))
+		require.NoError(t, os.WriteFile(b.Host.SELinuxEnforce, []byte("0\n"), 0o644))
+
+		return b, st
+	}
+
+	for _, tc := range []struct {
+		name, out, wantErr string
+	}{
+		{name: "ubuntu 24.04", out: "systemd 255 (255.4-1ubuntu8)\n+PAM +AUDIT\n"},
+		{name: "exactly 254", out: "systemd 254 (254.5-1)\n"},
+		{name: "no distro suffix", out: "systemd 256\n"},
+		{name: "ubuntu 22.04", out: "systemd 249 (249.11-0ubuntu3.12)\n", wantErr: "systemd 249 is too old: the container mode needs systemd 254 or newer"},
+		{name: "rhel 9", out: "systemd 252 (252-46.el9_5.2)\n", wantErr: "systemd 252 is too old"},
+		{name: "unparsable", out: "not systemd at all\n", wantErr: `unrecognized systemctl --version output "not systemd at all"`},
+		{name: "empty", out: "", wantErr: "unrecognized systemctl --version output"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			b, st := ready(t)
+			st.out["systemctl --version"] = tc.out
+
+			err := b.Preflight()
+			if tc.wantErr == "" {
+				require.NoError(t, err)
+			} else {
+				require.ErrorContains(t, err, tc.wantErr)
+			}
+
+			require.Contains(t, st.calls, "systemctl --version")
+		})
+	}
+
+	t.Run("systemctl fails", func(t *testing.T) {
+		b, st := ready(t)
+		st.fail["systemctl --version"] = errors.New("exec: systemctl: not found")
+		require.ErrorContains(t, b.Preflight(), "reading the systemd version (systemctl --version): exec: systemctl: not found")
+	})
+}
+
+func TestParseSystemdVersion(t *testing.T) {
+	t.Parallel()
+
+	for out, want := range map[string]int{
+		"systemd 255 (255.4-1ubuntu8)\n+PAM": 255,
+		"  systemd 239 (239-74.el8)\n":       239,
+		"systemd 1000":                       1000,
+	} {
+		got, err := parseSystemdVersion(out)
+		require.NoError(t, err, out)
+		require.Equal(t, want, got, out)
+	}
+
+	for _, out := range []string{"", "systemd", "systemd x", "systemd255", "udev 255", "systemd 25a"} {
+		_, err := parseSystemdVersion(out)
+		require.Error(t, err, out)
+	}
 }
 
 func TestSELinuxModeDetection(t *testing.T) {
