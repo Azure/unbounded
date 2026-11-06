@@ -105,7 +105,10 @@ The same-path contract holds, as in every mode; see
   that version, or finishes the upgrade if the applied config shows it had
   already succeeded, and either way leaves the stack running. A recovery that
   fails is logged, the daemon keeps running, and the next repave tries it again
-  before it upgrades.
+  before it upgrades. CNI configuration in `/etc/cni/net.d` and the CNI state in
+  `/var/lib/cni` are removed before the new version starts, as a new `nspawn`
+  machine starts without them, so pods get addresses from the new Node's pod
+  CIDR.
 - **Pods outlive the units.** containerd runs with `KillMode=process`, so a plain
   unit stop leaves pods running, and ending a shim reparents the pod's processes
   instead of stopping them. Reset ends the shims and then kills the pods' whole
