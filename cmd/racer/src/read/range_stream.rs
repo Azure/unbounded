@@ -15,6 +15,7 @@ use crate::error::Result;
 use crate::http::Delivery;
 use crate::http::ReaderLease;
 use crate::memory::PageResult;
+use crate::memory::VerifiedPage;
 use crate::model::ObjectMetadata;
 use crate::model::ObjectVersion;
 use crate::model::PAGE_BYTES;
@@ -506,10 +507,27 @@ enum Io {
 }
 
 /// A page the window holds under a handle until it is delivered or discarded.
-#[allow(clippy::large_enum_variant)] // Plaintext pages are the common case; boxing them costs an allocation per page.
 enum Held {
-    Page(PageResult),
+    Page(WindowPage),
     Sealed(Box<SealedPage>),
+}
+
+/// A validated plaintext page held for in-order delivery. It keeps only the
+/// plaintext the client reads, never the page's ciphertext: a window waiting
+/// on its head would otherwise pin the ciphertext (and the memory cache entry
+/// sharing it) of every ready page behind the head. Windows on one worker can
+/// then fill that worker's ciphertext share between them and wait for one
+/// another's heads until a request deadline frees the pages.
+struct WindowPage {
+    plaintext: VerifiedPage,
+}
+
+impl WindowPage {
+    fn new(result: PageResult) -> Self {
+        Self {
+            plaintext: result.plaintext,
+        }
+    }
 }
 
 /// Open pinned streams on the ingress reactor using the shared worker directory.
@@ -1170,7 +1188,7 @@ impl RangeStream {
                             (Ok(Some(page)), Some(number))
                                 if self.validate(&page, number).is_ok() =>
                             {
-                                self.pages.insert(id, Held::Page(page));
+                                self.pages.insert(id, Held::Page(WindowPage::new(page)));
                                 true
                             }
                             _ => false,
@@ -1241,11 +1259,20 @@ impl RangeStream {
         let number = self.number_of(id);
         let result = match result {
             Ok(Fetched::Page(page)) => {
-                if self.lease.is_some() {
-                    self.filled.push(page.clone());
+                // Validate now: the held page keeps no ciphertext to check later.
+                let checked = number
+                    .ok_or(Error::StaleFlight)
+                    .and_then(|number| self.validate(&page, number));
+                match checked {
+                    Ok(()) => {
+                        if self.lease.is_some() {
+                            self.filled.push(page.clone());
+                        }
+                        self.pages.insert(id, Held::Page(WindowPage::new(page)));
+                        Ok(win::Fetched::Page)
+                    }
+                    Err(error) => Err(error),
                 }
-                self.pages.insert(id, Held::Page(page));
-                Ok(win::Fetched::Page)
             }
             Ok(Fetched::Sealed(sealed)) => {
                 let checked = number
@@ -1286,7 +1313,8 @@ impl RangeStream {
                 continue;
             }
             let handle = self.ids.allocate();
-            self.pages.insert(handle, Held::Page(page.clone()));
+            self.pages
+                .insert(handle, Held::Page(WindowPage::new(page.clone())));
             let discarded = self.effects.len();
             self.window();
             let Some(window) = self.window.as_mut() else {
@@ -1487,7 +1515,9 @@ impl RangeStream {
                 Ok(Some(DirectItem::Sealed(sealed, slice)))
             }
             Some(Held::Page(result)) => {
-                self.validate(&result, number)?;
+                if result.plaintext.page().number != number {
+                    return Err(Error::CorruptRecord);
+                }
                 let slice = self.range.slice_at(number)?.ok_or(Error::CorruptRecord)?;
                 self.issue(number)?;
                 self.retained.insert(number, result.plaintext.clone());
@@ -1580,13 +1610,16 @@ impl RangeStream {
                 }
             }
             TestSlot::Selecting => win::Slot::Selecting(id),
-            TestSlot::Ready(Ok(page)) => {
-                self.pages.insert(id, Held::Page(page));
-                win::Slot::Ready {
-                    handle: id,
-                    sealed: false,
+            TestSlot::Ready(Ok(page)) => match self.validate(&page, PageNumber(number)) {
+                Ok(()) => {
+                    self.pages.insert(id, Held::Page(WindowPage::new(page)));
+                    win::Slot::Ready {
+                        handle: id,
+                        sealed: false,
+                    }
                 }
-            }
+                Err(error) => win::Slot::Failed(self.core_error(number, error)),
+            },
             TestSlot::Ready(Err(error)) => win::Slot::Failed(self.core_error(number, error)),
         };
         self.window().place(index, slot);
@@ -2010,6 +2043,83 @@ pub(super) mod tests {
             futures::executor::block_on(stream.next_slice()).err(),
             Some(Error::Internal)
         );
+    }
+
+    /// Pages filled behind a waiting head keep only their plaintext. Holding
+    /// their ciphertext let windows on one worker fill its ciphertext share
+    /// with ready pages while each waited for a head whose fill needed that
+    /// share, a stall only request deadlines broke.
+    #[test]
+    fn ready_pages_behind_a_waiting_head_release_their_ciphertext() {
+        let env = racer_io::Env::host();
+        let f = Fixture::new(&env, crate::test_support::cluster::config(false).limits, 4);
+        let admission = &f.admission;
+        let mut metadata = metadata();
+        metadata.length = 3 * PAGE_BYTES;
+        let range = ByteRange::Closed {
+            first: 0,
+            last: 3 * PAGE_BYTES - 1,
+        }
+        .resolve(metadata.length)
+        .unwrap();
+        let scope =
+            RequestScope::host(RequestId([7; 16]), Instant::now() + Duration::from_secs(60))
+                .unwrap();
+        let mut stream = f.open(&metadata, range, scope);
+        stream.configure_subscription(4, 4 * PAGE_BYTES).unwrap();
+        let (head, gate) = futures::channel::oneshot::channel::<PageResult>();
+        stream.inject(TestSlot::Fetching(Box::pin(async move {
+            gate.await.map_err(|_| Error::Unavailable)
+        })));
+        for number in 1..3 {
+            let page = page_result(admission, &metadata, number);
+            stream.inject(TestSlot::Fetching(Box::pin(async move { Ok(page) })));
+        }
+        let waker = futures::task::noop_waker();
+        let mut cx = Context::from_waker(&waker);
+        assert!(stream.next_slice().as_mut().poll(&mut cx).is_pending());
+        // Both ready pages are held, but only their plaintext stays charged.
+        assert_eq!(
+            admission.used(ResourceClass::Plaintext),
+            2 * PAGE_BYTES as usize
+        );
+        assert_eq!(admission.used(ResourceClass::Ciphertext), 0);
+        // The head fill still needs ciphertext and now finds the share free.
+        head.send(page_result(admission, &metadata, 0))
+            .ok()
+            .unwrap();
+        for number in 0..3 {
+            let reader = futures::executor::block_on(stream.next_slice())
+                .unwrap()
+                .unwrap();
+            assert_eq!(reader.slice().page, PageNumber(number));
+        }
+        assert_eq!(admission.used(ResourceClass::Ciphertext), 0);
+    }
+
+    /// A filled page for another page number fails its slot instead of being held.
+    #[test]
+    fn filled_pages_for_another_number_fail_their_slot() {
+        let env = racer_io::Env::host();
+        let f = Fixture::new(&env, crate::test_support::cluster::config(false).limits, 4);
+        let admission = &f.admission;
+        let mut metadata = metadata();
+        metadata.length = 2 * PAGE_BYTES;
+        let range = ByteRange::Closed {
+            first: 0,
+            last: 2 * PAGE_BYTES - 1,
+        }
+        .resolve(metadata.length)
+        .unwrap();
+        let scope =
+            RequestScope::host(RequestId([8; 16]), Instant::now() + Duration::from_secs(60))
+                .unwrap();
+        let mut stream = f.open(&metadata, range, scope);
+        stream.configure_subscription(4, 4 * PAGE_BYTES).unwrap();
+        let wrong = page_result(admission, &metadata, 1);
+        stream.inject(TestSlot::Fetching(Box::pin(async move { Ok(wrong) })));
+        assert!(futures::executor::block_on(stream.next_slice()).is_err());
+        assert_eq!(admission.used(ResourceClass::Ciphertext), 0);
     }
 
     #[test]
