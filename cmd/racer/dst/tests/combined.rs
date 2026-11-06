@@ -99,7 +99,7 @@ fn failover_repeats_are_skips_or_their_orphans() {
 }
 
 /// The Model has no `membership_adoptions` counter;
-/// a node adopts exactly what its client applied (`dst/MODEL.md`, Combined scenarios).
+/// a node adopts exactly what its client applied (`dst/MODEL.md`, Control plane).
 #[test]
 fn churn_grows_the_data_plane() {
     let r = quick("full-churn", 320, 400, 1, 0.1);

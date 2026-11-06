@@ -294,7 +294,7 @@ fn membership_churn_refreshes_falls_back_and_waits() {
 /// connections their peers keep pooled (30 s on both sides), so later connections wait in the
 /// accept queue; evicting the longest-idle inbound connection cuts the waits that outlive their
 /// attempt and never fails more reads. Production (2,048 peer slots per worker, refusal when full)
-/// never queues. See `dst/MODEL.md`, "Peer connection slots".
+/// never queues. See `dst/MODEL.md`.
 #[test]
 fn idle_connections_pin_ingress_slots() {
     let counters = |connections: fn(u32) -> model::ConnectionConfig, evict: bool| {
@@ -343,7 +343,7 @@ fn range_deadline_discards_held_pages() {
     );
 }
 
-/// Gap closed by link circuits (`dst/MODEL.md`, Combined scenarios): `full-failover`
+/// Gap closed by link circuits (`dst/MODEL.md`): `full-failover`
 /// cuts sites 0 and 1. Production opens a worker's circuit to a peer whose connect failed
 /// (`src/peer.rs` `request_network`, `src/topology.rs` `LinkHealth`) and routes around it
 /// (`Paths::blocked`). With circuits off, more reads fail at seed 8.
@@ -523,8 +523,8 @@ fn expired_leaders_hand_their_fill_to_later_waiters() {
     assert_eq!(o["repeats"]["after_failure"], 0, "{o}");
     assert_eq!(o["max_failure_retries_per_page"], 0, "{o}");
     assert_eq!(counter(&r, "flights_reelected"), 0);
-    // The repeats are ranks 1 and 2 fetching while rank 0 still does (the slow origin gap in
-    // `dst/MODEL.md`), never a restart.
+    // The repeats are ranks 1 and 2 fetching while rank 0 still does (rank 0's fill is
+    // still running), never a restart.
     assert_eq!(
         o["repeats"]["concurrent"].as_u64().unwrap() + 16,
         counter(&r, "origin_requests"),

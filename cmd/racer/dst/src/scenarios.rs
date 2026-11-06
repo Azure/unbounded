@@ -465,8 +465,7 @@ pub fn hung_peers() -> Scenario {
         // signing to the crypto helper. Production signs on the I/O worker (`src/peer.rs`
         // `sign_request_to`); charged there, each worker's 32-page burst holds its 8 route search
         // slots longer (production `Paths::with_limits` has no queue, `src/app.rs`), and 8 to 30
-        // reads over seeds 1 to 8 fail on search sheds (`search_sheds`; see `dst/MODEL.md`,
-        // "Signing placement").
+        // reads over seeds 1 to 8 fail on search sheds (`search_sheds`).
         .check("few-reads-fail", |r| {
             let failed = counter(r, "reads_failed");
             (failed <= 64)
@@ -487,8 +486,7 @@ pub fn hung_peers() -> Scenario {
 /// of origin twice, and pings find rank 0 busy, not hung.
 ///
 /// Owners above rank 0 that probe it copy-only wait on its running fill (production
-/// `Fill::copy_only_joining`) rather than fetching the page themselves (see `dst/MODEL.md`, "Slow
-/// origin").
+/// `Fill::copy_only_joining`) rather than fetching the page themselves.
 pub fn slow_origin() -> Scenario {
     const NODES: u32 = 300;
     let spec = ModelSpec {

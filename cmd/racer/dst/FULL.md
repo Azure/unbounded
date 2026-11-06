@@ -102,7 +102,7 @@ record) or a new `HashMap` iteration on a behavior path.
 
 `dst/src/app.rs` runs real Racer application nodes. Each `app-<name>` scenario
 is one world role that runs `racer::app::dst::run(name, seed, 0)`, the
-whole-application harness that used to live in `src/app/tests/dst.rs`. The
+whole-application harness in `src/app/dst.rs`. The
 harness is compiled only for tests and for the root crate's `dst` feature,
 which `racer-dst` enables; it is `#[doc(hidden)]` and is not a public API.
 
@@ -151,33 +151,14 @@ All are harness assertions; a panic becomes the world violation
 ## Determinism
 
 `make racer-dst` runs every `app-*` entry twice and compares the world trace,
-which holds the app replay digest. The corpus no longer replays each seed a
+which holds the app replay digest. The corpus does not replay each seed a
 second time internally; a divergence is reported as a trace hash mismatch
 without the first differing checkpoint.
 
-## Mapping from `src/app/tests/dst.rs`
+## Seeds
 
-| Old test | Scenario |
-|---|---|
-| `dst_generated_traffic_churn_oracle` | `app-corpus` (`app-generated` for one seed) |
-| `dst_generated_native_traffic_churn_oracle` | `app-corpus-native` (`app-generated-native`) |
-| `default_grace_staggered_nodes_and_periodic_checkpoint_traffic` | `app-default-grace-staggered-checkpoint` |
-| `dst_origin_recovery_completes_before_concurrent_healthy_reads` | `app-origin-recovery-before-healthy-reads` |
-| `dst_native_faults_reach_warmed_peers_in_small_topologies` | `app-native-faults-warmed-peers` |
-| `dst_refused_peer_connect_preserves_candidate_fallback` | `app-refused-peer-connect-fallback` |
-| `dst_shutdown_checkpoint_uses_async_io_and_releases_all_shards` | `app-shutdown-checkpoint-async-io` |
-| `scenarios::worker_subscriptions_contend_across_servers_and_recover_after_release` | `app-worker-subscriptions-contend` |
-| `scenarios::completed_peer_dispatches_do_not_exhaust_worker_cancellation` | `app-completed-peer-dispatches-cancellation` |
-| `scenarios::healthy_relayed_page_reads` | `app-healthy-relayed-page-reads` |
-| `scenarios::healthy_relayed_page_reads_opaque_opt_in` | `app-healthy-relayed-page-reads-opaque` |
-| `scenarios::listeners_survive_repeated_reactor_queue_pressure` | `app-listeners-survive-queue-pressure` |
-| `scenarios::concurrent_relayed_layers_diagnose_receive_pressure_and_recover` | `app-concurrent-relayed-layers` |
-| `scenarios::concurrent_relayed_layers_opaque_opt_in_pressure_and_recovery` | `app-concurrent-relayed-layers-opaque` |
-| `racer_entropy_replay_bytes_are_stable`, `dst_coverage_policy_and_aggregation` | unit tests kept in `src/app/dst.rs` |
-
-`DST_SEEDS`, `DST_STEPS` and `DST_FILTER` keep their `racer-dst` meanings;
-the old harness's comma-separated `DST_SEEDS` list is replaced by seed file
-entries such as `app-generated seed=N`.
+`DST_SEEDS`, `DST_STEPS` and `DST_FILTER` have their `racer-dst` meanings;
+seed file entries such as `app-generated seed=N` pick app seeds.
 
 ## Remaining work
 

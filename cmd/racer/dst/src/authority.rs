@@ -18,7 +18,7 @@
 //!   drawn by the API server role on its steps ([`ApiFaults`]).
 //!
 //! Invariants ([`invariants`]) observe every live authority and the
-//! committed state record after every step. See `dst/MODEL.md` (section
+//! committed state record after every step. See `dst/FULL.md` (section
 //! "Full fidelity: control plane").
 use std::{
     cell::{Cell, RefCell},
