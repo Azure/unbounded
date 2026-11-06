@@ -1031,6 +1031,9 @@ pub struct WorkerApplication {
 
     native_retry: std::time::Instant,
 
+    /// Consecutive failed activations, for the retry backoff.
+    native_failures: u32,
+
     /// Managed-mode report sink and shares, so a failed native activation can
     /// withdraw this node's RDMA rails instead of advertising rails it cannot
     /// serve. `None` outside managed mode.
@@ -1686,6 +1689,7 @@ impl WorkerApplication {
             inventory_generation: 0,
             native_task: None,
             native_retry: started,
+            native_failures: 0,
             rdma_report: config
                 .managed_control
                 .as_ref()

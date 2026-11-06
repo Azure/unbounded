@@ -250,15 +250,19 @@ impl WorkerApplication {
             && let Poll::Ready(result) = task.as_mut().poll(cx)
         {
             self.native_task = None;
-            self.native_retry = self.ctx().now() + Duration::from_secs(1);
             match &result {
                 Err(error) => {
                     links.close();
+                    self.native_failures = self.native_failures.saturating_add(1);
                     self.native_activation_failed(*error);
                 }
-                Ok(rails) if !rails.is_empty() => self.native_activation_succeeded(),
+                Ok(rails) if !rails.is_empty() => {
+                    self.native_failures = 0;
+                    self.native_activation_succeeded();
+                }
                 Ok(_) => {}
             }
+            self.native_retry = self.ctx().now() + activation_retry_delay(self.native_failures);
         }
         self.actual_rails = links.active();
         if self.native_owner() {
@@ -307,7 +311,10 @@ impl WorkerApplication {
         }
         let admission = self.runtime.admission.clone();
         let registered = admission.limit(crate::admission::ResourceClass::Registered);
-        let turn = scope(&self.ctx().clock, activation_turn(registered))?;
+        let turn = scope(
+            &self.ctx().clock,
+            activation_turn(registered, publication.len()),
+        )?;
         self.native_task = Some(Box::pin(async move {
             links
                 .activate(publication, &admission, registered, &turn)
@@ -362,13 +369,31 @@ impl WorkerApplication {
     }
 }
 
-/// Time one native activation may take: 5 s plus 1 s per GiB of registered
-/// page buffers, because registering memory that is not huge-page backed costs
-/// up to about 0.75 s per GiB. A fixed 5 s turn silently failed every retry on
-/// large pools.
-pub(crate) fn activation_turn(registered_bytes: usize) -> Duration {
+/// Time one native activation of `devices` rails may take: 5 s, plus 1 s per
+/// GiB of registered page buffers, because registering memory that is not
+/// huge-page backed costs up to about 0.75 s per GiB, plus 2 s per device for
+/// its implicit on-demand paging region, which takes about 1.5 s per mlx5
+/// device. Those regions are created in parallel, but the per-device term
+/// keeps activation within its turn even when the kernel serializes them. A
+/// fixed 5 s turn silently failed every retry on large pools, and a turn
+/// without the per-device term failed every retry on 8 rails with 8 GiB.
+pub(crate) fn activation_turn(registered_bytes: usize, devices: usize) -> Duration {
     const GIB: usize = 1 << 30;
-    Duration::from_secs(5 + registered_bytes.div_ceil(GIB) as u64)
+    const PER_DEVICE: u64 = 2;
+    Duration::from_secs(
+        (5 + registered_bytes.div_ceil(GIB) as u64)
+            .saturating_add(PER_DEVICE.saturating_mul(devices as u64)),
+    )
+}
+
+/// How long to wait before the next activation after `failures` consecutive
+/// failed ones: 1 s, doubling per failure up to 60 s. Each attempt opens
+/// devices and registers memory from scratch, so a persistently failing
+/// activation must not retry in a tight loop.
+pub(crate) fn activation_retry_delay(failures: u32) -> Duration {
+    const MAX: Duration = Duration::from_secs(60);
+    let shift = failures.saturating_sub(1).min(6);
+    Duration::from_secs(1u64 << shift).min(MAX)
 }
 
 impl WorkerApplication {
@@ -1061,10 +1086,37 @@ mod tests {
 
     #[test]
     fn activation_turn_scales_with_registered_bytes() {
-        assert_eq!(activation_turn(0), Duration::from_secs(5));
-        assert_eq!(activation_turn(1), Duration::from_secs(6));
-        assert_eq!(activation_turn(1 << 30), Duration::from_secs(6));
-        assert_eq!(activation_turn(32 << 30), Duration::from_secs(37));
+        assert_eq!(activation_turn(0, 0), Duration::from_secs(5));
+        assert_eq!(activation_turn(1, 0), Duration::from_secs(6));
+        assert_eq!(activation_turn(1 << 30, 0), Duration::from_secs(6));
+        assert_eq!(activation_turn(32 << 30, 0), Duration::from_secs(37));
+    }
+
+    #[test]
+    /// 8 rails with 8 GiB took about 12 s of serial implicit MR creation
+    /// alone, past the old 13 s turn once pool registration was added. The
+    /// turn now leaves room for it even if the devices run serially.
+    fn activation_turn_covers_per_device_setup() {
+        assert_eq!(activation_turn(0, 1), Duration::from_secs(7));
+        assert_eq!(activation_turn(8 << 30, 8), Duration::from_secs(29));
+        let observed = Duration::from_millis(1500) * 8 + Duration::from_secs(8);
+        assert!(activation_turn(8 << 30, 8) > observed);
+        // Saturates rather than overflowing.
+        assert!(activation_turn(usize::MAX, usize::MAX) > Duration::from_secs(1 << 40));
+    }
+
+    #[test]
+    /// Failed activations back off exponentially to a cap instead of
+    /// retrying every second.
+    fn activation_retry_backs_off() {
+        assert_eq!(activation_retry_delay(0), Duration::from_secs(1));
+        assert_eq!(activation_retry_delay(1), Duration::from_secs(1));
+        assert_eq!(activation_retry_delay(2), Duration::from_secs(2));
+        assert_eq!(activation_retry_delay(3), Duration::from_secs(4));
+        assert_eq!(activation_retry_delay(7), Duration::from_secs(60));
+        assert_eq!(activation_retry_delay(u32::MAX), Duration::from_secs(60));
+        let total: Duration = (1..=20).map(activation_retry_delay).sum();
+        assert!(total > Duration::from_secs(20 * 30), "hot retry loop");
     }
 
     #[test]
@@ -1430,6 +1482,76 @@ mod tests {
         drop(service);
         assert_eq!(sim.live_resources(), 0);
     }
+    #[test]
+    /// A failed activation backs off exponentially before the next attempt
+    /// instead of retrying every second, and a success resets the backoff.
+    fn failed_activation_backs_off_and_success_resets() {
+        use rdma_verbs::simulation::Device;
+        use rdma_verbs::simulation::Simulation;
+        let sim = Simulation::new()
+            .with_devices(vec![Device::new("new", [2; 16])])
+            .unwrap();
+        let _devices = sim.enter();
+        let env = racer_io::Env::host();
+        let app = configured();
+        let (mut worker, engine) = worker(&env, &app, true, true);
+        let mut service = test_owner(&app, engine);
+        let mut cx = Context::from_waker(futures::task::noop_waker_ref());
+        let publication = racer_wire::control::Publication {
+            pools: Vec::new(),
+            schema_version: racer_wire::control::SCHEMA_VERSION,
+            cluster: app.config.cluster.clone(),
+            sequence: PublicationSequence(2),
+            membership_version: MembershipVersion(2),
+            members: vec![racer_wire::control::Member {
+                node: app.config.node.clone(),
+                shares: std::num::NonZeroU32::new(1).unwrap(),
+                peer_endpoint: "127.0.0.1:7443".into(),
+                rails: vec![racer_wire::control::RailMapping {
+                    device: "new".into(),
+                    port: 1,
+                    gid: None,
+                    rail: RailId(7),
+                    numa_node: None,
+                }],
+                site: "site1".into(),
+            }],
+            caches: vec![],
+            page_size: racer_wire::object::PageSize::DEFAULT,
+        }
+        .with_default_pool();
+        worker.snapshots.apply(publication).unwrap();
+        app.node.inventory.update(crate::rdma::inventory()).unwrap();
+        // Without implicit ODP every activation fails.
+        sim.implicit_odp(false);
+        let mut attempt = |worker: &mut WorkerApplication| {
+            worker.native_retry = racer_io::Clock::host().now();
+            let mut cx = Context::from_waker(futures::task::noop_waker_ref());
+            for _ in 0..20 {
+                worker.poll_native(&mut cx).unwrap();
+                service.poll_budgeted(&mut cx, 8).unwrap();
+                if worker.native_task.is_none() && worker.native_retry > worker.ctx().now() {
+                    break;
+                }
+            }
+        };
+        for failures in 1..=3u32 {
+            attempt(&mut worker);
+            assert_eq!(worker.native_failures, failures);
+            let wait = worker.native_retry - worker.ctx().now();
+            assert!(wait > activation_retry_delay(failures) - Duration::from_millis(500));
+            assert!(wait <= activation_retry_delay(failures));
+            // Polling again before the retry time starts nothing.
+            worker.poll_native(&mut cx).unwrap();
+            assert!(worker.native_task.is_none(), "retried before the backoff");
+        }
+        assert!(worker.actual_rails.is_empty());
+        sim.implicit_odp(true);
+        attempt(&mut worker);
+        assert!(worker.links.as_ref().unwrap().rail_ready(RailId(7)));
+        assert_eq!(worker.native_failures, 0);
+    }
+
     #[test]
     fn duplicate_discovery_cannot_activate_a_binding() {
         let mut app = configured();
