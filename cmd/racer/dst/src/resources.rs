@@ -1,12 +1,10 @@
 //! FIFO cost model: deterministic servers for NICs, disks, CPUs and the origin.
 //!
-//! Copied from `racer-sim`'s `resources.rs` (which keeps its own copy until
-//! Phase 7 deletes it). Differences: parameters come from [`Costs`]
-//! (`costs.toml`) instead of the simulator config, and every random draw
-//! (RTT jitter, origin error outcomes) comes from [`Choices`]. Both
-//! fidelities price operations with this model: Model fidelity charges it
-//! directly, Full fidelity through `Driver::Sim` latency (once racer-io exposes
-//! a latency hook; see the crate docs).
+//! Parameters come from [`Costs`] (`costs.toml`), and every random draw (RTT
+//! jitter, origin error outcomes) comes from [`Choices`]. Model fidelity
+//! charges every operation to this model. Full fidelity prices simulated OS
+//! operations from the same [`Costs`] table through `Driver::Sim` op costs and
+//! uses the [`Fabric`] here only for per-node slowdown state.
 //!
 //! Every resource is a deterministic FIFO server: a request that becomes
 //! ready at `t` starts at `max(t, free_at)` and holds the server for its
@@ -66,18 +64,22 @@ impl RttMatrix {
         Self { sites, rtt }
     }
 
+    /// Number of sites.
     pub fn sites(&self) -> u32 {
         self.sites
     }
 
+    /// Round-trip time between sites `a` and `b`.
     pub fn rtt(&self, a: u16, b: u16) -> Nanos {
         Nanos::from(self.rtt[a as usize * self.sites as usize + b as usize])
     }
 
+    /// One-way latency between sites `a` and `b` (half the RTT).
     pub fn one_way(&self, a: u16, b: u16) -> Nanos {
         self.rtt(a, b) / 2
     }
 
+    /// Approximate heap bytes held.
     pub fn approximate_bytes(&self) -> usize {
         self.rtt.capacity() * 4
     }
@@ -85,12 +87,17 @@ impl RttMatrix {
 
 /// Per-node NICs, disks, CPUs, with node placement into sites.
 pub struct Fabric {
+    /// Site of each node, indexed by node id.
     pub site: std::rc::Rc<[u16]>,
     /// Slowdown multiplier per node (1 = normal), applied to CPU, disk and NIC service times.
     pub slow: Vec<u8>,
+    /// When each node's NIC transmit side is next free.
     pub tx_free: Vec<Nanos>,
+    /// When each node's NIC receive side is next free.
     pub rx_free: Vec<Nanos>,
+    /// When each node's disk read queue is next free.
     pub disk_read_free: Vec<Nanos>,
+    /// When each node's disk write queue is next free.
     pub disk_write_free: Vec<Nanos>,
     /// `nodes * workers` entries.
     pub cpu_free: Vec<Nanos>,
@@ -101,13 +108,21 @@ pub struct Fabric {
     /// first. Production bounds a worker's crypto submissions (`src/security.rs`
     /// `CryptoClient::new`, `runtime/src/offload.rs` `AdmissionQueue::enter`).
     pub crypto_jobs: Vec<std::collections::VecDeque<Nanos>>,
+    /// Workers per node.
     pub workers: u8,
+    /// NIC bandwidth in bytes per second.
     pub nic_bps: u64,
+    /// Bytes per NIC transfer chunk.
     pub chunk_bytes: u64,
+    /// Disk read bandwidth in bytes per second.
     pub disk_read_bps: u64,
+    /// Disk write bandwidth in bytes per second.
     pub disk_write_bps: u64,
+    /// Fixed latency added to every disk operation.
     pub disk_latency: Nanos,
+    /// Inter-site round-trip times.
     pub rtt: RttMatrix,
+    /// The cost table the fabric was built from.
     pub costs: Costs,
 }
 
@@ -146,6 +161,7 @@ impl Fabric {
         }
     }
 
+    /// Number of nodes.
     pub fn nodes(&self) -> u32 {
         self.site.len() as u32
     }
@@ -216,11 +232,13 @@ impl Fabric {
         (done < cutoff || cutoff == Nanos::MAX).then_some(done)
     }
 
+    /// Read `bytes` from `node`'s disk starting at `now`; returns when the read completes.
     pub fn disk_read(&mut self, now: Nanos, node: u32, bytes: u64) -> Nanos {
         let service = self.scale(node, service_ns(bytes, self.disk_read_bps));
         reserve(&mut self.disk_read_free[node as usize], now, service).1 + self.disk_latency
     }
 
+    /// Write `bytes` to `node`'s disk starting at `now`; returns when the write completes.
     pub fn disk_write(&mut self, now: Nanos, node: u32, bytes: u64) -> Nanos {
         let service = self.scale(node, service_ns(bytes, self.disk_write_bps));
         reserve(&mut self.disk_write_free[node as usize], now, service).1 + self.disk_latency
@@ -293,6 +311,7 @@ impl Fabric {
         }
     }
 
+    /// Approximate heap bytes held.
     pub fn approximate_bytes(&self) -> usize {
         self.site.len() * 2
             + self.slow.capacity()
@@ -312,6 +331,7 @@ impl Fabric {
 /// Result of one origin request.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum OriginOutcome {
+    /// The request succeeded.
     Ok,
     /// 412: the object changed; the caller must refresh metadata.
     PreconditionFailed,
@@ -322,6 +342,7 @@ pub enum OriginOutcome {
 }
 
 impl OriginOutcome {
+    /// Short name used in reports.
     pub fn name(self) -> &'static str {
         match self {
             Self::Ok => "ok",
@@ -335,8 +356,11 @@ impl OriginOutcome {
 /// Injected origin error rates, each a probability in `[0, 1]`.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct OriginErrors {
+    /// Probability of a 412 answer.
     pub p412: f64,
+    /// Probability of a 403 answer.
     pub p403: f64,
+    /// Probability of a 5xx answer.
     pub p5xx: f64,
 }
 
@@ -665,6 +689,7 @@ impl Origin {
         self.pending.len() - self.dead
     }
 
+    /// Approximate heap bytes held.
     pub fn approximate_bytes(&self) -> usize {
         self.slots.capacity() * 16 + self.pending.capacity() * size_of::<OriginEntry>()
     }
