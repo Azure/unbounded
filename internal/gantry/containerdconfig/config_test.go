@@ -236,3 +236,51 @@ snapshotter = "overlaybd"
 		t.Fatalf("CRI snapshotter = %q, want gantry-overlaybd", got)
 	}
 }
+
+func TestMarshalDropInEnablesRemoteSnapshotPulls(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		config string
+		legacy bool
+	}{
+		{name: "legacy", config: "version = 2\n", legacy: true},
+		{name: "modern", config: "version = 3\n"},
+		{name: "modern plugin in legacy config", config: "version = 2\n[plugins.'io.containerd.cri.v1.images']\nsnapshotter = 'overlayfs'\n"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			data, err := marshalDropIn([]byte(tc.config), "/run/adapter.sock", "gantry-overlaybd")
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			var dropIn struct {
+				Plugins map[string]struct {
+					DisableAnnotations *bool `toml:"disable_snapshot_annotations"`
+					LocalPull          *bool `toml:"use_local_image_pull"`
+					Containerd         struct {
+						DisableAnnotations *bool `toml:"disable_snapshot_annotations"`
+					} `toml:"containerd"`
+				} `toml:"plugins"`
+			}
+			if err := toml.Unmarshal(data, &dropIn); err != nil {
+				t.Fatal(err)
+			}
+
+			images := dropIn.Plugins["io.containerd.cri.v1.images"]
+			if images.LocalPull == nil || !*images.LocalPull {
+				t.Fatal("custom snapshotter must use CRI-local pulls instead of unsupported transfer unpacking")
+			}
+
+			if images.DisableAnnotations == nil || *images.DisableAnnotations {
+				t.Fatal("remote snapshot annotations must be explicitly enabled")
+			}
+
+			if tc.legacy {
+				disabled := dropIn.Plugins["io.containerd.grpc.v1.cri"].Containerd.DisableAnnotations
+				if disabled == nil || *disabled {
+					t.Fatal("legacy CRI remote snapshot annotations must be explicitly enabled")
+				}
+			}
+		})
+	}
+}

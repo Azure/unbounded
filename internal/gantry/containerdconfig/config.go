@@ -321,17 +321,22 @@ func marshalDropIn(config []byte, address, snapshotterName string) ([]byte, erro
 		return nil, fmt.Errorf("containerd config: parse version: %w", err)
 	}
 
-	plugins := make(map[string]any, 1)
+	// Containerd 2.x also migrates legacy configs, so include its pull settings
+	// even when the snapshotter is selected through the legacy CRI plugin.
+	images := map[string]any{
+		"disable_snapshot_annotations": false,
+		"use_local_image_pull":         true,
+	}
+	plugins := map[string]any{"io.containerd.cri.v1.images": images}
 
 	_, hasCRIImagesPlugin := source.Plugins["io.containerd.cri.v1.images"]
 	if hasCRIImagesPlugin || source.Version >= 3 {
-		plugins["io.containerd.cri.v1.images"] = map[string]any{
-			"snapshotter": snapshotterName,
-		}
+		images["snapshotter"] = snapshotterName
 	} else {
 		plugins["io.containerd.grpc.v1.cri"] = map[string]any{
 			"containerd": map[string]any{
-				"snapshotter": snapshotterName,
+				"snapshotter":                  snapshotterName,
+				"disable_snapshot_annotations": false,
 			},
 		}
 	}
