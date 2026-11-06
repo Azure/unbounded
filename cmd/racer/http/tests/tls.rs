@@ -1021,3 +1021,47 @@ fn small_exchange_rejects_pipelined_bytes_oversize_and_truncation() {
         server.join().unwrap();
     }
 }
+
+/// Process CPU time (user plus system) in seconds.
+fn process_cpu() -> f64 {
+    // SAFETY: getrusage writes one rusage structure.
+    let usage = unsafe {
+        let mut usage = std::mem::zeroed::<libc::rusage>();
+        assert_eq!(libc::getrusage(libc::RUSAGE_SELF, &mut usage), 0);
+        usage
+    };
+    let seconds = |t: libc::timeval| t.tv_sec as f64 + t.tv_usec as f64 / 1e6;
+    seconds(usage.ru_utime) + seconds(usage.ru_stime)
+}
+
+/// Userspace TLS 1.3 throughput over loopback: wall time and process CPU per
+/// GiB, including the in-process rustls server. Run with
+/// `cargo test -p http1 --release --all-features --test tls -- --ignored --nocapture userspace_tls_throughput`.
+#[test]
+#[ignore = "benchmark"]
+fn userspace_tls_throughput() {
+    const PAGES: usize = 64;
+    let identity = identity(&["localhost"]);
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    let (server, _) = serve(listener, Some(&identity), false, 1);
+    let fixture = fixture();
+    let endpoint = tls_endpoint(&identity, address, TlsMode::Userspace);
+    // Warm up the connection and handshake.
+    fetch(&fixture, &endpoint, 1, false).unwrap();
+    let cpu = process_cpu();
+    let started = Instant::now();
+    fetch(&fixture, &endpoint, PAGES, false).unwrap();
+    let wall = started.elapsed().as_secs_f64();
+    let cpu = process_cpu() - cpu;
+    let gib = (PAGES * PAGE) as f64 / (1u64 << 30) as f64;
+    eprintln!(
+        "userspace TLS: {:.2} GiB in {wall:.3}s = {:.2} GiB/s, {:.3} CPU s/GiB",
+        gib,
+        gib / wall,
+        cpu / gib
+    );
+    fixture.pool.close();
+    drop(fixture);
+    server.join().unwrap();
+}
