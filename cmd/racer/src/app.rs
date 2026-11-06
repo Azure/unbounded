@@ -1042,6 +1042,21 @@ pub struct WorkerApplication {
     /// The rails were withdrawn after a failed activation.
     rdma_withdrawn: bool,
 
+    /// Device losses the owner reported so far (see
+    /// `rdma_verbs::Client::device_losses`), so only new ones close the round.
+    rdma_losses_seen: u64,
+
+    /// Rails lost to a removed device, as `(device, hardware key)`, until
+    /// RDMA reactivates. While set, activation waits for every key to be
+    /// back in sysfs and for the old round to drain.
+    rdma_lost: Option<Vec<(String, String)>>,
+
+    /// Next sysfs presence probe of the active rails.
+    rail_probe: std::time::Instant,
+
+    /// Where the presence probe reads RDMA devices (sysfs, or a test tree).
+    rdma_sysfs: std::path::PathBuf,
+
     telemetry: Rc<Telemetry>,
 
     directory: std::rc::Rc<WorkerDirectory>,
@@ -1695,6 +1710,10 @@ impl WorkerApplication {
                 .as_ref()
                 .map(|managed| (managed.report.clone(), config.shares.get())),
             rdma_withdrawn: false,
+            rdma_losses_seen: 0,
+            rdma_lost: None,
+            rail_probe: started,
+            rdma_sysfs: crate::rdma::SYSFS_INFINIBAND.into(),
             telemetry: Rc::new(telemetry),
             directory: directory.clone(),
             node,

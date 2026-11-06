@@ -858,6 +858,18 @@ impl Links {
         self.node.landing(rail, ordinal).is_some()
     }
 
+    /// Devices the owner lost since the node started (see
+    /// [`rdma_verbs::Client::device_losses`]).
+    pub fn device_losses(&self) -> u64 {
+        self.client.device_losses()
+    }
+
+    /// True once the closed node freed every native object, so a new
+    /// activation can reopen it.
+    pub fn drained(&self) -> bool {
+        self.client.drained()
+    }
+
     /// Close the node: every link breaks and the owner drains. A later
     /// [`Self::activate`] reopens once drained.
     pub fn close(&self) {

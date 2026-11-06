@@ -198,6 +198,17 @@ impl Inventory {
         Ok(state.snapshot.clone())
     }
 
+    /// The hardware key reserved for `rail` (`pci:<address>` or a device
+    /// name), if any.
+    pub fn rail_key(&self, rail: RailId) -> Option<String> {
+        self.lock()
+            .ok()?
+            .assigned
+            .iter()
+            .find(|(_, _, r)| *r == rail.0)
+            .map(|(key, _, _)| key.clone())
+    }
+
     /// The reservations as a versioned JSON journal of `[key, port, rail]`
     /// tuples, where `key` is `pci:<address>` or a device name.
     pub fn reservations(&self) -> Result<Vec<u8>> {
@@ -270,11 +281,67 @@ pub fn inventory() -> Vec<RailMapping> {
     keyed_inventory().into_iter().map(|(n, _)| n).collect()
 }
 
+/// Where sysfs puts RDMA devices.
+pub const SYSFS_INFINIBAND: &str = "/sys/class/infiniband";
+
+/// What sysfs says about an active rail's device, without touching the
+/// device itself (no verbs call, so it is cheap and cannot hang on a sick
+/// device).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RailPresence {
+    /// The device is there under its activated name (and, for a PCI key,
+    /// at its PCI address).
+    Present,
+
+    /// The device's PCI address is back under another name, as after an
+    /// Azure VF hot-unplug and replug (`mana_0` becoming `roceP30832p0s0`).
+    Renamed,
+
+    /// Nothing at the device's name or PCI address.
+    Missing,
+}
+
+/// The PCI address sysfs reports for `device` under `root`.
+fn sysfs_pci(root: &Path, device: &str) -> Option<String> {
+    if !valid_device(device) {
+        return None;
+    }
+    std::fs::canonicalize(root.join(device).join("device"))
+        .ok()
+        .and_then(|p| p.file_name().map(|s| s.to_string_lossy().into_owned()))
+}
+
+/// Check `device`, reserved under hardware `key` (see
+/// [`Inventory::rail_key`]), in sysfs under `root`.
+pub fn rail_presence(root: &Path, device: &str, key: &str) -> RailPresence {
+    let Some(bdf) = key.strip_prefix(PCI_KEY_PREFIX) else {
+        // Keyed by name: only the name can be checked.
+        return if valid_device(device) && root.join(device).exists() {
+            RailPresence::Present
+        } else {
+            RailPresence::Missing
+        };
+    };
+    if sysfs_pci(root, device).as_deref() == Some(bdf) {
+        return RailPresence::Present;
+    }
+    let renamed = std::fs::read_dir(root).ok().is_some_and(|entries| {
+        entries
+            .filter_map(|entry| entry.ok()?.file_name().into_string().ok())
+            .any(|name| sysfs_pci(root, &name).as_deref() == Some(bdf))
+    });
+    if renamed {
+        RailPresence::Renamed
+    } else {
+        RailPresence::Missing
+    }
+}
+
 /// [`inventory`] with each port's PCI address, when sysfs reports one.
 fn keyed_inventory() -> Vec<(RailMapping, Option<String>)> {
     inventory_keyed_at(
         rdma_verbs::inventory().unwrap_or_default(),
-        Path::new("/sys/class/infiniband"),
+        Path::new(SYSFS_INFINIBAND),
     )
 }
 
@@ -598,6 +665,75 @@ mod tests {
             .update_keyed(vec![keyed("mana_0", "7870:00:00.0")])
             .unwrap();
         assert_eq!(snapshot.nics[0].rail, RailId(0));
+    }
+
+    #[test]
+    /// The sysfs probe tells a present device from one renamed at the same
+    /// PCI address (a VF replug) and from a missing one, and a name key only
+    /// checks the name.
+    fn rail_presence_tracks_vf_unplug_and_rename() {
+        use std::os::unix::fs::symlink;
+        struct Scratch(std::path::PathBuf);
+        impl Drop for Scratch {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        let dir = Scratch(
+            Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("target")
+                .join(format!("rail-presence-{}", std::process::id())),
+        );
+        let root = dir.0.join("infiniband");
+        let pci = dir.0.join("7870:00:00.0");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::create_dir_all(&pci).unwrap();
+        let plug = |name: &str| {
+            std::fs::create_dir_all(root.join(name)).unwrap();
+            symlink(&pci, root.join(name).join("device")).unwrap();
+        };
+        let key = "pci:7870:00:00.0";
+        plug("mana_0");
+        assert_eq!(rail_presence(&root, "mana_0", key), RailPresence::Present);
+        assert_eq!(
+            rail_presence(&root, "mana_0", "pci:0000:01:00.0"),
+            RailPresence::Missing,
+            "a different device at the name"
+        );
+        std::fs::remove_dir_all(root.join("mana_0")).unwrap();
+        assert_eq!(rail_presence(&root, "mana_0", key), RailPresence::Missing);
+        assert_eq!(
+            rail_presence(&root, "mana_0", "mana_0"),
+            RailPresence::Missing
+        );
+        plug("roceP30832p0s0");
+        assert_eq!(rail_presence(&root, "mana_0", key), RailPresence::Renamed);
+        assert_eq!(
+            rail_presence(&root, "roceP30832p0s0", key),
+            RailPresence::Present
+        );
+        assert_eq!(
+            rail_presence(&root, "roceP30832p0s0", "roceP30832p0s0"),
+            RailPresence::Present
+        );
+        assert_eq!(
+            rail_presence(&dir.0.join("absent"), "mana_0", key),
+            RailPresence::Missing
+        );
+    }
+
+    #[test]
+    /// A rail's reservation key is readable for the presence probe.
+    fn rail_key_names_the_reserved_hardware() {
+        let inventory = Inventory::default();
+        inventory
+            .update_keyed(vec![keyed("mana_0", "7870:00:00.0")])
+            .unwrap();
+        assert_eq!(
+            inventory.rail_key(RailId(0)).as_deref(),
+            Some("pci:7870:00:00.0")
+        );
+        assert_eq!(inventory.rail_key(RailId(1)), None);
     }
 
     #[test]
