@@ -358,15 +358,35 @@ Logs and errors omit URL query and fragment data.
 `InstallAndSwitchFromTarGz` performs the upgrade as one logical operation:
 
 1. Require an HTTP or HTTPS URL and verify the compressed-archive SHA-256 when provided.
-2. Download the tarball within the configured size bound.
-3. Require the archive to contain only the exact `unbounded-agent` entry.
-4. Bound decompression and atomically install the inactive slot.
+2. Download the tarball.
+3. Take the first `unbounded-agent` or `./unbounded-agent` entry at the archive root, which must be a non-empty regular file. Every other entry is skipped, including nested entries with the same name.
+4. Stage the binary beside the inactive slot, read the rest of the archive so gzip verifies its checksum, then rename the binary into the slot.
 5. Run `unbounded-agent version` against the staged binary without exposing output.
 6. If the inactive slot is last-good, protect the running binary through `LastGoodPath` before replacing it; otherwise defer the last-good update until candidate verification succeeds.
 7. Atomically update `CurrentPath` to the staged binary.
 
 Symlink replacement uses `renameio.Symlink` through `utilio`, so each link is
 replaced atomically after parent directory creation.
+
+### Archive contract
+
+The running daemon installs the next version, so every daemon in the field
+decides which archives the fleet can upgrade to, until it is replaced. Agents
+from v0.2.3 until the fix for #1093 accepted only an archive holding nothing but
+`unbounded-agent`, so they could not install any published release archive,
+each of which also held license files.
+
+A daemon from that fix on installs any archive that meets these rules. They
+cannot change while such a daemon may still be running:
+
+- The archive is a gzip-compressed tar.
+- It holds a regular file named `unbounded-agent` at its root.
+- That binary exits 0 when run as `unbounded-agent version`.
+
+Anything else in the archive is free to change, such as `plugins/` or
+`config/` directories. The daemon ignores it. A future version that needs
+those files installed must do so itself, after it starts, rather than rely on
+the daemon that installed it.
 
 ## Signal file
 

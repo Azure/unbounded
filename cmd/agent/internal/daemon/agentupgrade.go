@@ -73,15 +73,21 @@ func upgradeDaemonBinary(ctx context.Context, log *slog.Logger, request agentUpg
 		CurrentPath:  paths.CurrentPath,
 		LastGoodPath: paths.LastGoodPath,
 	}
-	_, err = agentbinary.InstallAndSwitchFromTarGz(ctx, log, layout, agentbinary.InstallOptions{
+	_, err = agentbinary.InstallAndSwitchFromTarGz(ctx, log, layout, agentUpgradeInstallOptions(request))
+
+	return err
+}
+
+// agentUpgradeInstallOptions installs the unbounded-agent at the archive root
+// and ignores every other member, so release archives can carry other files.
+func agentUpgradeInstallOptions(request agentUpgradeRequest) agentbinary.InstallOptions {
+	return agentbinary.InstallOptions{
 		DownloadURL:    request.downloadURL,
 		ExpectedSHA256: request.sha256,
 		ExpectedMember: goalstates.AgentUpgradeBinaryName,
 		Mode:           agentUpgradeBinaryMode,
-		ExactMember:    true,
-	})
-
-	return err
+		ExactMember:    false,
+	}
 }
 
 func newAgentUpgradeSignalOperator() (agentUpgradeSignalOperator, error) {

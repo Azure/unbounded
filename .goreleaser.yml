@@ -90,16 +90,22 @@ archives:
   - id: unbounded-agent
     ids:
       - unbounded-agent
+    # AgentUpgrade installs this archive, so it must stay a tar.gz with the
+    # unbounded-agent binary at its root (see "Archive contract" in
+    # designs/agent-upgrade.md).
     formats:
       - tar.gz
     name_template: "unbounded-agent-{{ .Os }}-{{ .Arch }}"
+    # Only the binary, for now. Agents from v0.2.3 until the fix for #1093
+    # reject an AgentUpgrade archive holding any other file. Without `files`,
+    # GoReleaser adds LICENSE* and README*, and `none*` matches nothing.
+    # Restoring LICENSE and NOTICE is tracked in #1094.
     files:
-      - LICENSE
-      - NOTICE
+      - none*
 
   # Direct-download consumers can use the agent without extracting an archive.
   # These binaries are included in checksums.txt alongside the existing archives.
-  # LICENSE and NOTICE remain in the tar.gz; binary outputs carry no extra files.
+  # Binary outputs carry no extra files.
   - id: unbounded-agent-binary
     ids:
       - unbounded-agent
