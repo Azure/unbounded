@@ -1607,8 +1607,9 @@ impl Owner {
     fn progress(&mut self, now: Instant) {
         // Completion channel and connection manager events first: the
         // links below re-arm and poll their CQs.
+        // Each device pass lets links skip CQs that raised no event.
         for device in self.devices.values() {
-            device.device.progress();
+            device.device.begin_pass();
         }
 
         let mut broken = Vec::new();
@@ -1625,6 +1626,10 @@ impl Owner {
             } else if link.phase() != phase {
                 self.dirty = true;
             }
+        }
+
+        for device in self.devices.values() {
+            device.device.end_pass();
         }
 
         for (key, reason) in broken {

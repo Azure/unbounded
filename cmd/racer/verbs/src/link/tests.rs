@@ -1261,3 +1261,49 @@ fn tags_stay_below_24_bits_and_skip_zero() {
         assert_eq!(side.link.allocate_tag(), 1);
     });
 }
+
+/// Poll `side` inside a device pass, as the node does. Returns how many CQ
+/// polls the simulator saw.
+fn pass(sim: &Simulation, side: &mut Side, now: Instant) -> usize {
+    sim.take_trace();
+    side.device.begin_pass();
+    let result = side.link.poll(&side.pool, now);
+    side.device.end_pass();
+    assert_eq!(result, Ok(()));
+    sim.take_trace()
+        .iter()
+        .filter(|e| e.operation == Operation::Poll)
+        .count()
+}
+
+#[test]
+/// Inside a device pass, a drained CQ that raised no event is not polled,
+/// and an event (here from posting work) brings polling back.
+fn device_pass_skips_quiet_cqs_until_an_event() {
+    profiles(|| {
+        let mut p = pair();
+        let now = p.now;
+        let sim = p.sim.clone();
+        // The first pass consumes events from the handshake and drains.
+        pass(&sim, &mut p.a, now);
+        assert_eq!(pass(&sim, &mut p.a, now), 0, "quiet CQ is skipped");
+        assert_eq!(pass(&sim, &mut p.a, now), 0, "still quiet");
+        // Outside a pass, polling is never skipped.
+        sim.take_trace();
+        assert_eq!(p.a.link.poll(&p.a.pool, now), Ok(()));
+        assert!(
+            sim.take_trace()
+                .iter()
+                .any(|e| e.operation == Operation::Poll)
+        );
+        let granted = grant(&mut p.a, 10, now + 5 * SECOND, now);
+        let mut polls = 0;
+        for _ in 0..12 {
+            polls += pass(&sim, &mut p.a, now);
+            assert_eq!(p.b.link.poll(&p.b.pool, now), Ok(()));
+        }
+        assert!(polls > 0, "posted work raised an event");
+        assert!(poll(&granted).unwrap().is_ok(), "no completion was missed");
+        finish(p);
+    });
+}

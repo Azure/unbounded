@@ -57,7 +57,8 @@
 //!   differs from the last one), registration keys with generation 0.
 //! - A CQ armed with `req_notify` raises one event on its completion channel
 //!   (a real eventfd) when work is posted to its QP, a receive completion
-//!   lands on it, or its QP enters the error state.
+//!   lands on it, its QP enters the error state, or a poll leaves work
+//!   queued.
 //! - The connection manager delivers events through a real eventfd per
 //!   channel. In registration mode a QP is named by the token the caller
 //!   passed in `*qpn` (trace resources and fault targets use it).
@@ -2609,6 +2610,17 @@ unsafe extern "C" fn poll(cq: *mut c_void, out: *mut Completion, capacity: u32) 
         if completion.status != 0 && executed {
             break;
         }
+    }
+    // Work still queued (delayed, reordered, or past this batch) completes
+    // later, as real hardware would raise an event then: re-raise one now
+    // so an armed CQ is not left waiting for a completion it never hears of.
+    let unfinished = matches!(
+        world.resources.get(&qp),
+        Some(Resource::Qp { work, recvs, cq_entries, error, .. })
+            if !work.is_empty() || !cq_entries.is_empty() || (*error && !recvs.is_empty())
+    );
+    if unfinished {
+        world.notify(qp);
     }
     world.record(Operation::Poll, qp, None, 0, false);
     count as c_int

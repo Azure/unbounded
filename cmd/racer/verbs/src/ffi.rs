@@ -579,6 +579,12 @@ pub(crate) struct NativeDevice {
 
     /// Whether each live CQ is armed, by CQ handle.
     armed: RefCell<BTreeMap<usize, Rc<Cell<bool>>>>,
+    /// Counts [`Self::progress`] passes over the completion channel.
+    passes: Cell<u64>,
+    /// Inside a [`Self::begin_pass`] window: every event raised before the
+    /// window opened has been consumed, so a QP whose CQ is still armed and
+    /// was drained in an earlier pass has nothing new to poll.
+    in_pass: Cell<bool>,
 
     /// Registration mode: the connection manager.
     cm: Option<Cm>,
@@ -608,6 +614,8 @@ impl NativeDevice {
             caps: Caps::default(),
             comp: None,
             armed: RefCell::new(BTreeMap::new()),
+            passes: Cell::new(0),
+            in_pass: Cell::new(false),
             cm: None,
             leaked_registrations: Cell::new(0),
         }
@@ -669,10 +677,24 @@ impl NativeDevice {
                     armed.set(false);
                 }
             }
+            self.passes.set(self.passes.get().wrapping_add(1));
         }
         if let Some(cm) = &self.cm {
             cm.progress(self);
         }
+    }
+
+    /// Handle channel events like [`Self::progress`] and open a pass in
+    /// which QPs may skip polling CQs that raised no event. The owner must
+    /// poll every QP on the device, then call [`Self::end_pass`].
+    pub(crate) fn begin_pass(&self) {
+        self.progress();
+        self.in_pass.set(true);
+    }
+
+    /// Close the pass opened by [`Self::begin_pass`].
+    pub(crate) fn end_pass(&self) {
+        self.in_pass.set(false);
     }
 
     #[cfg(test)]
@@ -1440,6 +1462,18 @@ pub(crate) struct NativeQueuePair<T = ()> {
     /// The CQ is armed on the device's completion channel.
     armed: Rc<Cell<bool>>,
 
+    /// The CQ was successfully armed and a poll since left it empty: until
+    /// the channel reports an event (which clears `armed`), the CQ holds
+    /// nothing new and, inside a device pass, polling it can be skipped.
+    quiet: Cell<bool>,
+
+    /// The device's channel pass count when `quiet` was set. Skipping is
+    /// only safe after a later pass consumed any event raised since.
+    quiet_pass: Cell<u64>,
+
+    /// The last arm of the CQ succeeded.
+    notify_ok: Cell<bool>,
+
     /// The QP handle and its connection state.
     conn: Rc<Conn>,
 
@@ -1600,6 +1634,9 @@ impl<T> NativeQueuePair<T> {
             device,
             cq,
             armed,
+            quiet: Cell::new(false),
+            quiet_pass: Cell::new(0),
+            notify_ok: Cell::new(false),
             conn,
             endpoint,
             stopped: Cell::new(false),
@@ -1766,9 +1803,16 @@ impl<T> NativeQueuePair<T> {
         if self.device.comp.is_some() && !self.armed.get() {
             // Arm, then poll: a completion between the two still raises an
             // event, and one before is polled below.
-            let _ = unsafe { (api.req_notify)(self.cq.as_ptr()) };
+            self.notify_ok
+                .set(unsafe { (api.req_notify)(self.cq.as_ptr()) } == 0);
             self.armed.set(true);
+            self.quiet.set(false);
         }
+        // Armed, drained since, and no event yet: nothing new to poll.
+        let skip = self.device.in_pass.get()
+            && self.armed.get()
+            && self.quiet.get()
+            && self.quiet_pass.get() != self.device.passes.get();
         let mut completions = [Completion::default(); POLL_BATCH];
         let mut n = 0;
         {
@@ -1781,13 +1825,19 @@ impl<T> NativeQueuePair<T> {
             }
         }
         let room = (completions.len() - n) as u32;
-        if room > 0 {
+        if room > 0 && !skip {
             let got = unsafe { (api.poll)(self.cq.as_ptr(), completions[n..].as_mut_ptr(), room) };
             if !(0..=room as c_int).contains(&got) {
                 self.stop()?;
                 return Err(Error::Io);
             }
             n += got as usize;
+            // Only a successful arm followed by a short poll proves the
+            // CQ is drained and an event will announce the next completion.
+            if self.armed.get() && self.notify_ok.get() && (got as u32) < room {
+                self.quiet.set(true);
+                self.quiet_pass.set(self.device.passes.get());
+            }
         }
         for c in &mut completions[..n] {
             if self.device.mode == Mode::Registration
