@@ -522,9 +522,49 @@ func TestReconcileRepave_AnUnreadableJournalBlocksTheRepave(t *testing.T) {
 
 	res, err := r.ReconcileRepave(t.Context(), "node-delete")
 	require.NoError(t, err)
-	assert.Equal(t, ctrl.Result{}, res)
+	assert.Equal(t, ctrl.Result{RequeueAfter: blockedSettleRequeueDelay}, res, "the repave is held back, not consumed")
 	assert.Nil(t, op.repaveConfig)
 	assert.Empty(t, mig.strategies)
+	assert.False(t, op.restartCalled, "the host may be mid-change")
+
+	res, err = r.ReconcileRepave(t.Context(), "node-delete")
+	require.NoError(t, err)
+	assert.Equal(t, blockedSettleRequeueDelay, res.RequeueAfter, "still blocked while the journal is unreadable")
+	assert.Nil(t, op.repaveConfig)
+
+	// The operator removes the journal; the Node deletion still gets its
+	// repave.
+	require.NoError(t, os.Remove(inPlaceJournalPathIn(h.env.ConfigDir)))
+
+	_, err = r.ReconcileRepave(t.Context(), "node-delete")
+	require.NoError(t, err)
+	assert.NotEmpty(t, mig.strategies, "the requeued reconcile goes on with the repave")
+}
+
+// A change that is still not over after it was resolved, here a source cleanup
+// that keeps failing, holds the repave back, and the repave runs once the
+// cleanup succeeds.
+func TestReconcileRepave_AChangeThatIsNotOverRequeuesTheRepave(t *testing.T) {
+	h := newMigHarness(t, isolation.ModeNSpawn)
+	r, op, _, _ := changeFixture(t, h, "", "1.34.9", false, healthyClient(t))
+	writeJournal(t, h, migrate.StepReady)
+	h.applied["kube2"] = h.active.Config.DeepCopy()
+	h.source.DestroyErr = errors.New("busy")
+
+	res, err := r.ReconcileRepave(t.Context(), "node-delete")
+	require.NoError(t, err)
+	assert.Equal(t, blockedSettleRequeueDelay, res.RequeueAfter)
+	assert.Nil(t, op.repaveConfig)
+
+	h.source.DestroyErr = nil
+
+	res, err = r.ReconcileRepave(t.Context(), "node-delete")
+	require.NoError(t, err)
+	assert.Equal(t, settleRequeueDelay, res.RequeueAfter, "the change is now over")
+
+	_, err = r.ReconcileRepave(t.Context(), "node-delete")
+	require.NoError(t, err)
+	require.NotNil(t, op.repaveConfig, "the Node deletion gets its repave")
 }
 
 func TestIsolationStatusFromJournal(t *testing.T) {
