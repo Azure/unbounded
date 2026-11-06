@@ -6,6 +6,7 @@ package host
 import (
 	"context"
 	"errors"
+	"fmt"
 	"log/slog"
 	"os"
 	"path/filepath"
@@ -30,6 +31,13 @@ func containerTestBackend(t *testing.T) *container.Backend {
 		RuntimeProvisioned: true,
 		RuntimePath:        filepath.Join(dir, "runc"),
 		WritableCheck:      func(...string) error { return nil },
+		Run: func(_ context.Context, _ *slog.Logger, name string, args ...string) (string, error) {
+			if name == "systemctl" && len(args) == 1 && args[0] == "--version" {
+				return "systemd 255 (255.4-1ubuntu8)\n", nil
+			}
+
+			return "", fmt.Errorf("unexpected command %s %v", name, args)
+		},
 		Host:               &container.HostFS{CgroupControllers: filepath.Join(dir, "cgroup.controllers"), SELinuxEnforce: filepath.Join(dir, "absent")},
 	}
 }
@@ -84,6 +92,16 @@ func TestCheckContainerBackendFailures(t *testing.T) {
 	results = checkContainerBackend(log, notExecutable).Check(context.Background())
 	require.Len(t, results, 1)
 	assert.Contains(t, results[0].Message, "not executable")
+
+	oldSystemd := containerTestBackend(t)
+	oldSystemd.Run = func(context.Context, *slog.Logger, string, ...string) (string, error) {
+		return "systemd 249 (249.11-0ubuntu3.12)\n", nil
+	}
+
+	results = checkContainerBackend(log, oldSystemd).Check(context.Background())
+	require.Len(t, results, 1)
+	assert.Equal(t, preflight.SeverityError, results[0].Severity)
+	assert.Contains(t, results[0].Message, "systemd 249 is too old")
 }
 
 func TestExistingDeploymentForContainerFindsContainerArtifacts(t *testing.T) {
