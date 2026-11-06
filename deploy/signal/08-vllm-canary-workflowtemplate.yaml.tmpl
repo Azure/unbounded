@@ -26,6 +26,7 @@ metadata:
   labels:
     app.kubernetes.io/name: project-signal-vllm-canary
     app.kubernetes.io/part-of: project-signal
+    signal.unbounded-cloud.io/cache-access: sequential-rwo
 spec:
   entrypoint: canary
   serviceAccountName: project-signal-vllm-workload

@@ -210,7 +210,7 @@ func TestRenderedVLLMCanaryUsesImmutableBoundedContract(t *testing.T) {
 	data["VLLMWorkflowTemplateDigest"] = testDigest
 
 	firstOutput := renderSignal(t, data)
-	firstTemplate := readRenderedFile(t, firstOutput, "07-vllm-canary-workflowtemplate.yaml")
+	firstTemplate := readRenderedFile(t, firstOutput, "08-vllm-canary-workflowtemplate.yaml")
 
 	var workflow unstructured.Unstructured
 	if err := yaml.Unmarshal(firstTemplate, &workflow.Object); err != nil {
@@ -220,6 +220,29 @@ func TestRenderedVLLMCanaryUsesImmutableBoundedContract(t *testing.T) {
 	spec, found, err := unstructured.NestedMap(workflow.Object, "spec")
 	if err != nil || !found {
 		t.Fatalf("read vLLM WorkflowTemplate spec: found %t, error %v", found, err)
+	}
+
+	templates, found, err := unstructured.NestedSlice(spec, "templates")
+	if err != nil || !found || len(templates) != 1 {
+		t.Fatalf("vLLM WorkflowTemplate templates = %#v, found %t, error %v", templates, found, err)
+	}
+
+	canary, ok := templates[0].(map[string]any)
+	if !ok {
+		t.Fatalf("vLLM WorkflowTemplate canary = %#v", templates[0])
+	}
+
+	if _, hasContainer := canary["container"]; !hasContainer {
+		t.Fatal("vLLM WorkflowTemplate does not define exactly one container template")
+	}
+
+	if _, hasContainers := canary["containers"]; hasContainers {
+		t.Fatal("vLLM WorkflowTemplate defines a container set instead of one container")
+	}
+
+	retryStrategy, ok := canary["retryStrategy"].(map[string]any)
+	if !ok || retryStrategy["limit"] != "0" {
+		t.Fatalf("vLLM WorkflowTemplate retry strategy = %#v, want limit 0", retryStrategy)
 	}
 
 	specJSON, err := json.Marshal(spec)
@@ -234,7 +257,7 @@ func TestRenderedVLLMCanaryUsesImmutableBoundedContract(t *testing.T) {
 	secondOutput := renderSignal(t, data)
 	if !bytes.Equal(
 		firstTemplate,
-		readRenderedFile(t, secondOutput, "07-vllm-canary-workflowtemplate.yaml"),
+		readRenderedFile(t, secondOutput, "08-vllm-canary-workflowtemplate.yaml"),
 	) {
 		t.Fatal("vLLM WorkflowTemplate changed when only its recorded digest changed")
 	}
@@ -266,7 +289,7 @@ func TestRenderedVLLMCanaryUsesImmutableBoundedContract(t *testing.T) {
 
 	var test unstructured.Unstructured
 	if err := yaml.Unmarshal(
-		readRenderedFile(t, secondOutput, "08-vllm-canary-test.yaml"),
+		readRenderedFile(t, secondOutput, "09-vllm-canary-test.yaml"),
 		&test.Object,
 	); err != nil {
 		t.Fatalf("decode vLLM CertificationTest: %v", err)
@@ -289,7 +312,7 @@ func TestRenderedVLLMCanaryUsesImmutableBoundedContract(t *testing.T) {
 		)
 	}
 
-	testText := string(readRenderedFile(t, secondOutput, "08-vllm-canary-test.yaml"))
+	testText := string(readRenderedFile(t, secondOutput, "09-vllm-canary-test.yaml"))
 
 	var testObject unstructured.Unstructured
 	if err := yaml.Unmarshal([]byte(testText), &testObject); err != nil {
@@ -417,14 +440,19 @@ func TestRenderedVLLMModelCacheSeedsVerifiedOfflinePVC(t *testing.T) {
 	data["VLLMModelCacheStorageClass"] = "approved-storage"
 
 	output := renderSignal(t, data)
-	content := string(readRenderedFile(t, output, "10-vllm-model-cache.yaml"))
+
+	content := string(readRenderedFile(t, output, "07-vllm-model-cache.yaml"))
+	if _, err := os.Stat(filepath.Join(output, "08-vllm-canary-workflowtemplate.yaml")); err != nil {
+		t.Fatalf("runtime WorkflowTemplate is not packaged after the cache seed manifest: %v", err)
+	}
+
 	assertContainsAll(
 		t,
 		content,
 		"vLLM model cache",
 		"kind: PersistentVolumeClaim",
 		"name: approved-model-cache",
-		"accessModes: [ReadWriteMany]",
+		"accessModes: [ReadWriteOnce]",
 		"storageClassName: approved-storage",
 		"kind: Job",
 		"serviceAccountName: project-signal-vllm-cache-seeder",
@@ -501,7 +529,7 @@ func TestRenderedAcceptanceSuitesSeparateQualificationDiagnosticsAndVLLM(t *test
 	data["VLLMInvocationTimeout"] = "30m"
 
 	output := renderSignal(t, data)
-	documents := splitYAMLDocuments(string(readRenderedFile(t, output, "09-acceptance-suites.yaml")))
+	documents := splitYAMLDocuments(string(readRenderedFile(t, output, "10-acceptance-suites.yaml")))
 
 	if len(documents) != 3 {
 		t.Fatalf("acceptance Suite documents = %d, want 3", len(documents))
@@ -798,6 +826,16 @@ func TestRenderedRBACCoversQualificationAndEvidence(t *testing.T) {
 		"Role",
 		"signal-ns",
 		"project-signal-adapter",
+		"",
+		"persistentvolumeclaims",
+		[]string{"get"},
+	)
+	assertRule(
+		t,
+		adapterDocuments,
+		"Role",
+		"signal-ns",
+		"project-signal-adapter",
 		"argoproj.io",
 		"workflowtaskresults",
 		[]string{"create", "patch"},
@@ -904,10 +942,20 @@ func TestRenderedRBACCoversQualificationAndEvidence(t *testing.T) {
 		adapterDocuments,
 		"ClusterRole",
 		"",
-		"project-signal-adapter-node-reader",
+		"project-signal-adapter-infrastructure-reader",
 		"",
 		"nodes",
 		[]string{"get"},
+	)
+	assertRule(
+		t,
+		adapterDocuments,
+		"ClusterRole",
+		"",
+		"project-signal-adapter-infrastructure-reader",
+		"storage.k8s.io",
+		"volumeattachments",
+		[]string{"list"},
 	)
 }
 

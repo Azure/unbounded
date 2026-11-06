@@ -16,6 +16,7 @@ import (
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
+	storagev1 "k8s.io/api/storage/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
@@ -603,6 +604,26 @@ func (e *KubernetesStageExecutor) executeWorkflowTemplate(
 		return signalv1.InvocationResultEnvelope{}, err
 	}
 
+	claims := workflowPersistentVolumeClaims(templateSpec)
+
+	locks, err := e.acquireWorkflowPersistentVolumeClaimLocks(ctx, claims, parent, invocation)
+	if err != nil {
+		return signalv1.InvocationResultEnvelope{}, err
+	}
+
+	defer func() {
+		cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 30*time.Second)
+		defer cancel()
+
+		if err := e.releaseWorkflowPersistentVolumeClaimLocks(cleanupCtx, locks); err != nil {
+			returnErr = errors.Join(returnErr, err)
+		}
+	}()
+
+	if err := e.validateWorkflowPersistentVolumeClaimsReady(ctx, claims); err != nil {
+		return signalv1.InvocationResultEnvelope{}, err
+	}
+
 	name := invocationResourceName(e.ExecutionName, invocation, -1)
 
 	parametersJSON, err := marshalStageJSON(invocation.Stage.Parameters)
@@ -1085,6 +1106,214 @@ func validateWorkflowServiceAccount(spec map[string]any, allowed string) error {
 	}
 
 	return validateWorkflowServiceAccountFields(spec, allowed)
+}
+
+func (e *KubernetesStageExecutor) validateWorkflowPersistentVolumeClaimsReady(
+	ctx context.Context,
+	claims []string,
+) error {
+	for _, claimName := range claims {
+		claim, err := e.Runner.Kubernetes.CoreV1().PersistentVolumeClaims(e.Namespace).
+			Get(ctx, claimName, metav1.GetOptions{})
+		if err != nil {
+			return fmt.Errorf("get WorkflowTemplate PVC %s/%s: %w", e.Namespace, claimName, err)
+		}
+
+		if claim.Status.Phase != corev1.ClaimBound || claim.Spec.VolumeName == "" {
+			return fmt.Errorf(
+				"WorkflowTemplate PVC %s/%s is not bound to a PV",
+				e.Namespace,
+				claimName,
+			)
+		}
+
+		pods, err := e.Runner.Kubernetes.CoreV1().Pods(e.Namespace).
+			List(ctx, metav1.ListOptions{})
+		if err != nil {
+			return fmt.Errorf("list Pods before mounting PVC %s/%s: %w", e.Namespace, claimName, err)
+		}
+
+		for index := range pods.Items {
+			if podReferencesPersistentVolumeClaim(&pods.Items[index], claimName) {
+				return fmt.Errorf(
+					"WorkflowTemplate PVC %s/%s is still referenced by Pod %s/%s",
+					e.Namespace,
+					claimName,
+					pods.Items[index].Namespace,
+					pods.Items[index].Name,
+				)
+			}
+		}
+
+		attachments, err := e.Runner.Kubernetes.StorageV1().VolumeAttachments().
+			List(ctx, metav1.ListOptions{})
+		if err != nil {
+			return fmt.Errorf(
+				"list VolumeAttachments before mounting PVC %s/%s: %w",
+				e.Namespace,
+				claimName,
+				err,
+			)
+		}
+
+		for index := range attachments.Items {
+			if volumeAttachmentReferencesPV(&attachments.Items[index], claim.Spec.VolumeName) {
+				return fmt.Errorf(
+					"WorkflowTemplate PVC %s/%s bound PV %s is still referenced by VolumeAttachment %s",
+					e.Namespace,
+					claimName,
+					claim.Spec.VolumeName,
+					attachments.Items[index].Name,
+				)
+			}
+		}
+	}
+
+	return nil
+}
+
+func workflowPersistentVolumeClaims(spec map[string]any) []string {
+	claimSet := map[string]struct{}{}
+	collectPersistentVolumeClaims(spec, claimSet)
+
+	claims := make([]string, 0, len(claimSet))
+	for claimName := range claimSet {
+		claims = append(claims, claimName)
+	}
+
+	sort.Strings(claims)
+
+	return claims
+}
+
+func collectPersistentVolumeClaims(value any, claims map[string]struct{}) {
+	switch typed := value.(type) {
+	case map[string]any:
+		if source, ok := typed["persistentVolumeClaim"].(map[string]any); ok {
+			if claimName, ok := source["claimName"].(string); ok && claimName != "" {
+				claims[claimName] = struct{}{}
+			}
+		}
+
+		for _, child := range typed {
+			collectPersistentVolumeClaims(child, claims)
+		}
+	case []any:
+		for _, child := range typed {
+			collectPersistentVolumeClaims(child, claims)
+		}
+	}
+}
+
+func (e *KubernetesStageExecutor) acquireWorkflowPersistentVolumeClaimLocks(
+	ctx context.Context,
+	claims []string,
+	parent *unstructured.Unstructured,
+	invocation StageInvocation,
+) ([]*corev1.ConfigMap, error) {
+	locks := make([]*corev1.ConfigMap, 0, len(claims))
+
+	for _, claimName := range claims {
+		lock := &corev1.ConfigMap{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      workflowPersistentVolumeClaimLockName(e.Namespace, claimName),
+				Namespace: e.Namespace,
+				Labels: map[string]string{
+					"app.kubernetes.io/name":    "project-signal-pvc-lock",
+					"app.kubernetes.io/part-of": "project-signal",
+				},
+				OwnerReferences: []metav1.OwnerReference{{
+					APIVersion:         parent.GetAPIVersion(),
+					Kind:               parent.GetKind(),
+					Name:               parent.GetName(),
+					UID:                parent.GetUID(),
+					Controller:         utilptr.To(true),
+					BlockOwnerDeletion: utilptr.To(true),
+				}},
+			},
+			Data: map[string]string{
+				"claim":       claimName,
+				"invocation":  invocation.ID,
+				"runUID":      string(invocation.RunUID),
+				"workflowUID": string(parent.GetUID()),
+			},
+		}
+
+		created, err := e.Runner.Kubernetes.CoreV1().ConfigMaps(e.Namespace).
+			Create(ctx, lock, metav1.CreateOptions{})
+		if err != nil {
+			cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 30*time.Second)
+			releaseErr := e.releaseWorkflowPersistentVolumeClaimLocks(
+				cleanupCtx,
+				locks,
+			)
+
+			cancel()
+
+			return nil, errors.Join(
+				fmt.Errorf(
+					"acquire exclusive WorkflowTemplate PVC lock for %s/%s: %w",
+					e.Namespace,
+					claimName,
+					err,
+				),
+				releaseErr,
+			)
+		}
+
+		locks = append(locks, created)
+	}
+
+	return locks, nil
+}
+
+func (e *KubernetesStageExecutor) releaseWorkflowPersistentVolumeClaimLocks(
+	ctx context.Context,
+	locks []*corev1.ConfigMap,
+) error {
+	var joined error
+
+	for index := len(locks) - 1; index >= 0; index-- {
+		lockUID := locks[index].UID
+
+		err := e.Runner.Kubernetes.CoreV1().ConfigMaps(e.Namespace).Delete(
+			ctx,
+			locks[index].Name,
+			metav1.DeleteOptions{
+				Preconditions: &metav1.Preconditions{UID: &lockUID},
+			},
+		)
+		if err != nil && !apierrors.IsNotFound(err) {
+			joined = errors.Join(
+				joined,
+				fmt.Errorf("release WorkflowTemplate PVC lock %s: %w", locks[index].Name, err),
+			)
+		}
+	}
+
+	return joined
+}
+
+func workflowPersistentVolumeClaimLockName(namespace, claimName string) string {
+	digest := sha256.Sum256([]byte(namespace + "\x00" + claimName))
+
+	return "project-signal-pvc-lock-" + hex.EncodeToString(digest[:8])
+}
+
+func podReferencesPersistentVolumeClaim(pod *corev1.Pod, claimName string) bool {
+	for index := range pod.Spec.Volumes {
+		source := pod.Spec.Volumes[index].PersistentVolumeClaim
+		if source != nil && source.ClaimName == claimName {
+			return true
+		}
+	}
+
+	return false
+}
+
+func volumeAttachmentReferencesPV(attachment *storagev1.VolumeAttachment, pvName string) bool {
+	return attachment.Spec.Source.PersistentVolumeName != nil &&
+		*attachment.Spec.Source.PersistentVolumeName == pvName
 }
 
 func validateWorkflowServiceAccountFields(value any, allowed string) error {

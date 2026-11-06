@@ -13,6 +13,7 @@ import (
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
+	storagev1 "k8s.io/api/storage/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -23,6 +24,7 @@ import (
 	dynamicfake "k8s.io/client-go/dynamic/fake"
 	kubernetesfake "k8s.io/client-go/kubernetes/fake"
 	clienttesting "k8s.io/client-go/testing"
+	utilptr "k8s.io/utils/ptr"
 
 	signalv1 "github.com/Azure/unbounded/api/signal/v1alpha1"
 )
@@ -100,6 +102,176 @@ func TestValidateWorkflowTemplateIdentityUsesApprovedSpecDigest(t *testing.T) {
 
 	if err := validateWorkflowTemplateIdentity(invocation, template); err == nil {
 		t.Fatal("validateWorkflowTemplateIdentity() accepted changed template content")
+	}
+}
+
+func TestWorkflowTemplatePersistentVolumeClaimRequiresExclusiveRelease(t *testing.T) {
+	t.Parallel()
+
+	const (
+		namespace = "signal-system"
+		claimName = "approved-model-cache"
+		pvName    = "approved-model-cache-pv"
+	)
+
+	templateSpec := map[string]any{
+		"templates": []any{map[string]any{
+			"name": "main",
+			"volumes": []any{map[string]any{
+				"name": "model-cache",
+				"persistentVolumeClaim": map[string]any{
+					"claimName": claimName,
+				},
+			}},
+		}},
+	}
+	claim := &corev1.PersistentVolumeClaim{
+		ObjectMeta: metav1.ObjectMeta{Name: claimName, Namespace: namespace},
+		Spec:       corev1.PersistentVolumeClaimSpec{VolumeName: pvName},
+		Status:     corev1.PersistentVolumeClaimStatus{Phase: corev1.ClaimBound},
+	}
+
+	t.Run("ready after release", func(t *testing.T) {
+		t.Parallel()
+
+		executor := &KubernetesStageExecutor{
+			Namespace: namespace,
+			Runner: &Runner{
+				Kubernetes: kubernetesfake.NewSimpleClientset(claim.DeepCopy()),
+			},
+		}
+
+		if err := executor.validateWorkflowPersistentVolumeClaimsReady(
+			context.Background(),
+			workflowPersistentVolumeClaims(templateSpec),
+		); err != nil {
+			t.Fatalf("validateWorkflowPersistentVolumeClaimsReady() error = %v", err)
+		}
+	})
+
+	t.Run("seed Pod remains", func(t *testing.T) {
+		t.Parallel()
+
+		seedPod := &corev1.Pod{
+			ObjectMeta: metav1.ObjectMeta{Name: "cache-seed", Namespace: namespace},
+			Spec: corev1.PodSpec{Volumes: []corev1.Volume{{
+				Name: "model-cache",
+				VolumeSource: corev1.VolumeSource{
+					PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{
+						ClaimName: claimName,
+					},
+				},
+			}}},
+		}
+		executor := &KubernetesStageExecutor{
+			Namespace: namespace,
+			Runner: &Runner{
+				Kubernetes: kubernetesfake.NewSimpleClientset(claim.DeepCopy(), seedPod),
+			},
+		}
+
+		err := executor.validateWorkflowPersistentVolumeClaimsReady(
+			context.Background(),
+			workflowPersistentVolumeClaims(templateSpec),
+		)
+		if err == nil || !strings.Contains(err.Error(), "still referenced by Pod") {
+			t.Fatalf("validateWorkflowPersistentVolumeClaimsReady() error = %v, want Pod reference", err)
+		}
+	})
+
+	t.Run("VolumeAttachment remains", func(t *testing.T) {
+		t.Parallel()
+
+		attachment := &storagev1.VolumeAttachment{
+			ObjectMeta: metav1.ObjectMeta{Name: "cache-attachment"},
+			Spec: storagev1.VolumeAttachmentSpec{
+				Attacher: "example.csi.invalid",
+				NodeName: "gpu-node",
+				Source: storagev1.VolumeAttachmentSource{
+					PersistentVolumeName: utilptr.To(pvName),
+				},
+			},
+		}
+		executor := &KubernetesStageExecutor{
+			Namespace: namespace,
+			Runner: &Runner{
+				Kubernetes: kubernetesfake.NewSimpleClientset(claim.DeepCopy(), attachment),
+			},
+		}
+
+		err := executor.validateWorkflowPersistentVolumeClaimsReady(
+			context.Background(),
+			workflowPersistentVolumeClaims(templateSpec),
+		)
+		if err == nil || !strings.Contains(err.Error(), "still referenced by VolumeAttachment") {
+			t.Fatalf(
+				"validateWorkflowPersistentVolumeClaimsReady() error = %v, want VolumeAttachment reference",
+				err,
+			)
+		}
+	})
+}
+
+func TestWorkflowTemplatePersistentVolumeClaimLockIsExclusiveAndUIDFenced(t *testing.T) {
+	t.Parallel()
+
+	const namespace = "signal-system"
+
+	parent := testWorkflow("parent", "parent-uid")
+	invocation := StageInvocation{ID: "invocation", RunUID: "run-uid"}
+	kubernetesClient := kubernetesfake.NewSimpleClientset()
+	executor := &KubernetesStageExecutor{
+		Namespace: namespace,
+		Runner:    &Runner{Kubernetes: kubernetesClient},
+	}
+
+	locks, err := executor.acquireWorkflowPersistentVolumeClaimLocks(
+		context.Background(),
+		[]string{"approved-model-cache"},
+		parent,
+		invocation,
+	)
+	if err != nil {
+		t.Fatalf("acquireWorkflowPersistentVolumeClaimLocks() error = %v", err)
+	}
+
+	if len(locks) != 1 {
+		t.Fatalf("acquired locks = %d, want 1", len(locks))
+	}
+
+	_, err = executor.acquireWorkflowPersistentVolumeClaimLocks(
+		context.Background(),
+		[]string{"approved-model-cache"},
+		parent,
+		invocation,
+	)
+	if err == nil || !apierrors.IsAlreadyExists(err) {
+		t.Fatalf("second lock acquisition error = %v, want AlreadyExists", err)
+	}
+
+	locks[0].UID = "lock-uid"
+	lockUID := locks[0].UID
+
+	kubernetesClient.PrependReactor("delete", "configmaps", func(action clienttesting.Action) (
+		bool,
+		runtime.Object,
+		error,
+	) {
+		deletion := action.(clienttesting.DeleteAction).GetDeleteOptions()
+		if deletion.Preconditions == nil ||
+			deletion.Preconditions.UID == nil ||
+			*deletion.Preconditions.UID != lockUID {
+			t.Fatalf("lock deletion preconditions = %#v, want UID %q", deletion.Preconditions, lockUID)
+		}
+
+		return false, nil, nil
+	})
+
+	if err := executor.releaseWorkflowPersistentVolumeClaimLocks(
+		context.Background(),
+		locks,
+	); err != nil {
+		t.Fatalf("releaseWorkflowPersistentVolumeClaimLocks() error = %v", err)
 	}
 }
 

@@ -118,6 +118,7 @@ SIGNAL_VLLM_MODEL_CACHE_IMAGE ?=
 SIGNAL_VLLM_MODEL_CACHE_SEED_ID ?=
 SIGNAL_VLLM_MODEL_CACHE_CAPACITY ?=
 SIGNAL_VLLM_MODEL_CACHE_STORAGE_CLASS ?=
+SIGNAL_VLLM_MODEL_CACHE_HANDOFF_TIMEOUT ?= 300s
 SIGNAL_VLLM_WORKFLOW_TEMPLATE_DIGEST ?=
 SIGNAL_ACCEPTANCE_SUITES_ENABLED ?= false
 SIGNAL_GPU_INVENTORY_TEST_UID ?=
@@ -284,7 +285,7 @@ NET_FRONTEND_CACHE_FILE    := $(NET_FRONTEND_DIST_DIR)/.frontend-build-key
 # Frontend build toggle (dev builds produce unminified output with sourcemaps).
 REACT_DEV ?= false
 
-.PHONY: all help fmt lint lint-actions test build vulncheck check-deps kubectl-unbounded kubectl-unbounded-build install-tools install-protoc install-helm generate kubectl-unbounded forge relctl relctl-build agent-artifacts-builder agent-artifacts-builder-build orcadev unbounded-agent machina machina-build machina-oci machina-oci-push machina-manifests machine-ops-controller machine-ops-controller-build machine-ops-controller-oci machine-ops-controller-oci-push machine-ops-manifests project-signal-controller project-signal-controller-build project-signal-adapter project-signal-adapter-build project-signal-model-cache project-signal-model-cache-build signal-manifests image-project-signal-controller-local image-project-signal-adapter-local image-project-signal-vllm-canary-local image-project-signal-vllm-model-cache-local metalman metalman-build metalman-oci metalman-oci-push unbounded-operator unbounded-operator-build unbounded-operator-manifests playpen-manifests e2e-gantry e2e-playpen e2e-racer gomod docs-serve unbounded-net-controller unbounded-net-controller-build unbounded-net-node unbounded-net-node-build unbounded-net-routeplan-debug unping unping-build unroute unroute-build license-check notice notice-check gantry gantry-build gantry-manifests inventory-manifests
+.PHONY: all help fmt lint lint-actions test build vulncheck check-deps kubectl-unbounded kubectl-unbounded-build install-tools install-protoc install-helm generate kubectl-unbounded forge relctl relctl-build agent-artifacts-builder agent-artifacts-builder-build orcadev unbounded-agent machina machina-build machina-oci machina-oci-push machina-manifests machine-ops-controller machine-ops-controller-build machine-ops-controller-oci machine-ops-controller-oci-push machine-ops-manifests project-signal-controller project-signal-controller-build project-signal-adapter project-signal-adapter-build project-signal-model-cache project-signal-model-cache-build signal-manifests signal-vllm-cache-handoff image-project-signal-controller-local image-project-signal-adapter-local image-project-signal-vllm-canary-local image-project-signal-vllm-model-cache-local metalman metalman-build metalman-oci metalman-oci-push unbounded-operator unbounded-operator-build unbounded-operator-manifests playpen-manifests e2e-gantry e2e-playpen e2e-racer gomod docs-serve unbounded-net-controller unbounded-net-controller-build unbounded-net-node unbounded-net-node-build unbounded-net-routeplan-debug unping unping-build unroute unroute-build license-check notice notice-check gantry gantry-build gantry-manifests inventory-manifests
 .PHONY: net-frontend net-frontend-clean net-ebpf-build net-ebpf-generate net-ebpf-verify net-manifests gantry-chart-lint gantry-chart-package release-bom release-manifests unbounded-operator-release-manifest
 .PHONY: image-machina-local image-token-refresher-local image-machine-ops-controller-local image-metalman-local image-unbounded-operator-local image-unbounded-operator-push image-playpen-local image-net-controller-local image-net-node-local image-gantry-local image-gantry-push images-local
 .PHONY: image-net-controller-push image-net-node-push images-net-all images-net-all-push
@@ -347,6 +348,7 @@ help: ## Show this help
 	@echo "  project-signal-adapter           Build Project Signal participant adapter"
 	@echo "  project-signal-model-cache       Build Project Signal model cache verifier"
 	@echo "  signal-manifests                 Render Project Signal manifests"
+	@echo "  signal-vllm-cache-handoff        Prove exclusive RWO cache release after seeding"
 	@echo "  metalman | metalman-build        Build metalman controller (with/without lint/test)"
 	@echo "  unbounded-operator | unbounded-operator-build  Build the top-level Site operator"
 	@echo "  unbounded-net-controller         Build net controller"
@@ -1364,7 +1366,7 @@ signal-manifests: ## Render Project Signal manifests into deploy/signal/rendered
 		--set QualificationGateGuard=$(SIGNAL_QUALIFICATION_GATE_GUARD); \
 	workflow_template="$$temp_dir/04-adapter-workflowtemplate.yaml"; \
 	gpu_inventory_catalog="$$temp_dir/05-gpu-inventory-tests.yaml"; \
-	vllm_workflow_template="$$temp_dir/07-vllm-canary-workflowtemplate.yaml"; \
+	vllm_workflow_template="$$temp_dir/08-vllm-canary-workflowtemplate.yaml"; \
 	if command -v sha256sum >/dev/null 2>&1; then \
 		workflow_hash="$$(sha256sum "$$workflow_template" | awk '{print $$1}')"; \
 	elif command -v shasum >/dev/null 2>&1; then \
@@ -1458,6 +1460,22 @@ signal-manifests: ## Render Project Signal manifests into deploy/signal/rendered
 	mkdir -p $(SIGNAL_MANIFEST_RENDERED_DIR)/crd; \
 	cp $(SIGNAL_MANIFEST_TEMPLATES_DIR)/crd/*.yaml $(SIGNAL_MANIFEST_RENDERED_DIR)/crd/; \
 	echo "Rendered Project Signal manifests into $(SIGNAL_MANIFEST_RENDERED_DIR) (controller: $(SIGNAL_CONTROLLER_IMAGE), workflow: $$workflow_digest)"
+
+signal-vllm-cache-handoff: ## Delete the completed seed Job and prove exclusive RWO cache release
+	@set -eu; \
+	if [ -z "$(SIGNAL_VLLM_MODEL_CACHE_PVC)" ]; then \
+		echo "SIGNAL_VLLM_MODEL_CACHE_PVC is required" >&2; \
+		exit 1; \
+	fi; \
+	if [ -z "$(SIGNAL_VLLM_MODEL_CACHE_SEED_ID)" ]; then \
+		echo "SIGNAL_VLLM_MODEL_CACHE_SEED_ID is required" >&2; \
+		exit 1; \
+	fi; \
+	hack/scripts/signal-vllm-cache-handoff.sh \
+		"$(SIGNAL_NAMESPACE)" \
+		"$(SIGNAL_VLLM_MODEL_CACHE_PVC)" \
+		"project-signal-vllm-cache-$(SIGNAL_VLLM_MODEL_CACHE_SEED_ID)" \
+		"$(SIGNAL_VLLM_MODEL_CACHE_HANDOFF_TIMEOUT)"
 
 playpen-manifests: ## Render playpen operator and runner manifests into deploy/playpen/rendered
 	@mkdir -p $(PLAYPEN_MANIFEST_RENDERED_DIR)

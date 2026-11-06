@@ -477,7 +477,8 @@ The deterministic prompt fixture digest is
 `sha256:87c87bfc4863e490bdef827c5aa1c0b48f47311e2fed3fd002c3e05dfad23d99`.
 
 Pre-stage the immutable snapshot before creating a Run. Use published image
-digests and a unique DNS-compatible seed identity:
+digests, an approved `ReadWriteOnce` StorageClass, a unique DNS-compatible
+seed identity, and a bounded handoff timeout:
 
 ```bash
 make signal-manifests \
@@ -492,19 +493,36 @@ make signal-manifests \
   SIGNAL_VLLM_MODEL_CACHE_CAPACITY=<approved-capacity> \
   SIGNAL_VLLM_MODEL_CACHE_STORAGE_CLASS=<approved-storage-class>
 
-kubectl apply -f deploy/signal/rendered/10-vllm-model-cache.yaml
-kubectl wait -n project-signal \
-  --for=condition=complete \
-  job/project-signal-vllm-cache-<unique-seed-identity> \
-  --timeout=<approved-timeout>
-kubectl logs -n project-signal \
-  job/project-signal-vllm-cache-<unique-seed-identity>
+kubectl apply -f deploy/signal/rendered/07-vllm-model-cache.yaml
+make signal-vllm-cache-handoff \
+  SIGNAL_VLLM_MODEL_CACHE_PVC=<approved-cache-pvc> \
+  SIGNAL_VLLM_MODEL_CACHE_SEED_ID=<unique-seed-identity> \
+  SIGNAL_VLLM_MODEL_CACHE_HANDOFF_TIMEOUT=<approved-timeout-seconds>s
 ```
 
-The approved storage class must provide multi-node `ReadWriteMany` access.
-The seeder writes the immutable cache once, and runtime Pods mount the exact
-revision subpath read-only. This avoids attach conflicts when bounded canary
-Runs execute concurrently on different participants.
+The handoff command prints the seed Job UID and cache PVC UID before waiting so
+they can be retained with the verifier log. It fails closed unless the seed Job
+completes, its verifier log is readable, the exact Job UID remains unchanged,
+a UID-preconditioned foreground deletion removes the Job and its Pods, the
+exact PVC UID remains unchanged and bound, and two consecutive observations
+find zero Pods referencing the PVC and zero `VolumeAttachment`
+objects referencing its bound PV before the bounded timeout. Only after that
+command succeeds may operators render and apply the runtime WorkflowTemplate,
+Test, Suite, Profile, or create the separate vLLM Run. Re-render with
+`SIGNAL_VLLM_MODEL_CACHE_SEED_ENABLED=false` before applying the runtime
+package. The adapter acquires a create-only, exact-UID-deleted ConfigMap lock
+for every Workflow PVC before checking storage readiness and holds it through
+foreground Workflow cleanup. A concurrent Run therefore fails closed before
+creating a second cache consumer. The adapter also rejects Workflow startup
+while any Pod references the cache PVC or any `VolumeAttachment` references
+its bound PV.
+
+The approved storage class must provide `ReadWriteOnce` access. The portable
+contract is strictly sequential: one seed Pod writes and verifies the
+immutable cache, the seed Job and Pod are removed, the CSI attachment is
+observed absent, and only then one vLLM Pod with one container mounts the exact
+revision subpath read-only. The Workflow retry limit remains zero. This is not
+general `ReadWriteMany`, multi-node shared-cache, or concurrent-canary support.
 
 The seed Job has no API token or RBAC. It verifies the embedded manifest and
 every file before copying, writes through a Pod-UID-scoped temporary
@@ -512,9 +530,9 @@ directory, verifies the copy, and atomically publishes the final snapshot.
 An existing valid target is accepted idempotently; an invalid target, extra
 file, symlink, digest mismatch, or size mismatch fails closed. Record the PVC
 UID, Job UID, cache image digest, manifest digest, and successful verifier log.
-Delete the completed Job only after re-reading and matching its exact UID.
-The PVC is deliberately retained as a pre-staged input and is mounted into the
-runtime Pod through the exact revision subpath as read-only.
+The handoff script performs the required exact-UID re-read and foreground
+deletion. The PVC is deliberately retained as a pre-staged input and is
+mounted into the runtime Pod through the exact revision subpath as read-only.
 
 Do not delete the PVC as ordinary Run cleanup. Dispose of it only in a
 separate reviewed operation after proving that no active Run or Workflow
