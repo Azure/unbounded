@@ -581,6 +581,8 @@ pub(crate) struct NativeDevice {
     armed: RefCell<BTreeMap<usize, Rc<Cell<bool>>>>,
     /// Counts [`Self::progress`] passes over the completion channel.
     passes: Cell<u64>,
+    /// Scratch for [`Self::progress`]: events to ack, counted per CQ.
+    acks: RefCell<Vec<(*mut c_void, u32)>>,
     /// Inside a [`Self::begin_pass`] window: every event raised before the
     /// window opened has been consumed, so a QP whose CQ is still armed and
     /// was drained in an earlier pass has nothing new to poll.
@@ -615,6 +617,7 @@ impl NativeDevice {
             comp: None,
             armed: RefCell::new(BTreeMap::new()),
             passes: Cell::new(0),
+            acks: RefCell::new(Vec::new()),
             in_pass: Cell::new(false),
             cm: None,
             leaked_registrations: Cell::new(0),
@@ -667,16 +670,28 @@ impl NativeDevice {
     /// re-polled) by its QP's next progress.
     pub(crate) fn progress(&self) {
         if let Some(comp) = self.comp {
+            // Ack once per CQ rather than once per event: each ack takes the
+            // CQ's lock in libibverbs.
+            let mut acks = self.acks.borrow_mut();
+            acks.clear();
             loop {
                 let mut cq = std::ptr::null_mut();
                 if unsafe { (self.api.get_cq_event)(comp.as_ptr(), &mut cq) } != 0 {
                     break;
                 }
-                unsafe { (self.api.ack_cq_events)(cq, 1) };
+                match acks.iter_mut().find(|(c, _)| *c == cq) {
+                    Some((_, count)) => *count += 1,
+                    None => acks.push((cq, 1)),
+                }
                 if let Some(armed) = self.armed.borrow().get(&(cq as usize)) {
                     armed.set(false);
                 }
             }
+            for &(cq, count) in acks.iter() {
+                unsafe { (self.api.ack_cq_events)(cq, count) };
+            }
+            acks.clear();
+            drop(acks);
             self.passes.set(self.passes.get().wrapping_add(1));
         }
         if let Some(cm) = &self.cm {
