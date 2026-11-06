@@ -90,6 +90,12 @@ type InPlaceSpec struct {
 	WaitReady func(ctx context.Context) error
 	// RemoveSourceConfig removes the source's applied config after success.
 	RemoveSourceConfig func(ctx context.Context) error
+	// PrepareHost applies the host preparation a bootstrap in the target mode
+	// would have, once the target is up: the mode's boot-time firewall flush
+	// unit and package-manager guards. Optional. Like the source cleanup, a
+	// failure does not undo the migration; it leaves the migration short of
+	// StepComplete, so a resume runs it again.
+	PrepareHost func(ctx context.Context) error
 
 	// Record, when set, is called before each step that changes the host, with
 	// the step about to run (and with StepReady and StepComplete after the
@@ -306,6 +312,13 @@ func (st *state) finish(ctx context.Context) (Result, error) {
 	targetRoot := st.targetRoot
 
 	var cleanup error
+
+	if s.PrepareHost != nil {
+		if err := s.PrepareHost(ctx); err != nil {
+			cleanup = errors.Join(cleanup, fmt.Errorf("prepare the host for %s: %w", s.Target.Mode(), err))
+		}
+	}
+
 	if err := s.Source.Destroy(ctx, s.SourceRoot); err != nil {
 		cleanup = errors.Join(cleanup, fmt.Errorf("destroy source: %w", err))
 	}
