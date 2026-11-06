@@ -1,4 +1,4 @@
-//! Model fidelity (plan D14, section 9.2): a byte-free interpreter over the real
+//! Model fidelity: a byte-free interpreter over the real
 //! [`WorkerCore`] machines.
 //!
 //! Every node runs `workers` real [`WorkerCore`]s and a real [`Placement`] over
@@ -6,7 +6,7 @@
 //! effect the cores emit on the shared FIFO cost model ([`crate::resources`]), priced from
 //! `costs.toml`, as an [`Engine`] event, and answers it with the facts of the world (which
 //! node holds which page). It never decides where to probe, when to fetch from origin or
-//! whom to shed; the cores do. See `dst/MODEL.md` for what is and is not modeled yet.
+//! whom to shed; the cores do. See `dst/MODEL.md` for what is and is not modeled.
 
 mod combined;
 pub mod control;
