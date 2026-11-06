@@ -139,7 +139,11 @@ func run(ctx context.Context, cfg config) error {
 		return fmt.Errorf("create manager: %w", err)
 	}
 
-	evidence, err := projectsignal.NewKubernetesEvidenceStore(mgr.GetClient(), cfg.namespace)
+	evidence, err := projectsignal.NewKubernetesEvidenceStore(
+		mgr.GetClient(),
+		mgr.GetAPIReader(),
+		cfg.namespace,
+	)
 	if err != nil {
 		return err
 	}

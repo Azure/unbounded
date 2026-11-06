@@ -28,6 +28,7 @@ type EvidenceStore interface {
 
 type KubernetesEvidenceStore struct {
 	kube      client.Client
+	reader    client.Reader
 	namespace string
 }
 
@@ -40,16 +41,20 @@ type evidenceChunkManifest struct {
 	CompressedDigest string `json:"compressedDigest"`
 }
 
-func NewKubernetesEvidenceStore(kube client.Client, namespace string) (*KubernetesEvidenceStore, error) {
-	if kube == nil {
-		return nil, fmt.Errorf("kubernetes client is required")
+func NewKubernetesEvidenceStore(
+	kube client.Client,
+	reader client.Reader,
+	namespace string,
+) (*KubernetesEvidenceStore, error) {
+	if kube == nil || reader == nil {
+		return nil, fmt.Errorf("kubernetes client and API reader are required")
 	}
 
 	if namespace == "" {
 		return nil, fmt.Errorf("evidence namespace is required")
 	}
 
-	return &KubernetesEvidenceStore{kube: kube, namespace: namespace}, nil
+	return &KubernetesEvidenceStore{kube: kube, reader: reader, namespace: namespace}, nil
 }
 
 func (s *KubernetesEvidenceStore) Put(ctx context.Context, path string, data []byte) (string, string, error) {
@@ -146,7 +151,7 @@ func (s *KubernetesEvidenceStore) Get(
 	}
 
 	var evidence corev1.ConfigMap
-	if err := s.kube.Get(
+	if err := s.reader.Get(
 		ctx,
 		client.ObjectKey{Namespace: s.namespace, Name: name + "-evidence"},
 		&evidence,
@@ -184,7 +189,7 @@ func (s *KubernetesEvidenceStore) Get(
 		compressed = make([]byte, 0, manifest.Chunks*maximumEvidenceChunkBytes)
 		for index := range manifest.Chunks {
 			var chunk corev1.ConfigMap
-			if err := s.kube.Get(
+			if err := s.reader.Get(
 				ctx,
 				client.ObjectKey{
 					Namespace: s.namespace,

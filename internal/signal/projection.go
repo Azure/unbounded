@@ -24,14 +24,16 @@ const (
 	EligibilityLabel = "signal.unbounded-cloud.io/eligibility"
 	ProfileLabel     = "signal.unbounded-cloud.io/profile"
 
-	ProfileNameAnnotation       = "signal.unbounded-cloud.io/profile-name"
-	ProfileGenerationAnnotation = "signal.unbounded-cloud.io/profile-generation"
-	LastRunAnnotation           = "signal.unbounded-cloud.io/last-run"
-	LastRunAtAnnotation         = "signal.unbounded-cloud.io/last-run-at"
-	LastSuccessfulRunAnnotation = "signal.unbounded-cloud.io/last-successful-run"
-	LastSuccessfulAtAnnotation  = "signal.unbounded-cloud.io/last-successful-at"
-	EvidenceDigestAnnotation    = "signal.unbounded-cloud.io/evidence-digest"
-	ScriptDigestAnnotation      = "signal.unbounded-cloud.io/script-digest"
+	ProfileNameAnnotation        = "signal.unbounded-cloud.io/profile-name"
+	ProfileGenerationAnnotation  = "signal.unbounded-cloud.io/profile-generation"
+	LastRunAnnotation            = "signal.unbounded-cloud.io/last-run"
+	LastRunAtAnnotation          = "signal.unbounded-cloud.io/last-run-at"
+	LastSuccessfulRunAnnotation  = "signal.unbounded-cloud.io/last-successful-run"
+	LastSuccessfulAtAnnotation   = "signal.unbounded-cloud.io/last-successful-at"
+	EvidenceDigestAnnotation     = "signal.unbounded-cloud.io/evidence-digest"
+	ScriptDigestAnnotation       = "signal.unbounded-cloud.io/script-digest"
+	DriverVersionAnnotation      = "signal.unbounded-cloud.io/driver-version"
+	GPUInventoryDigestAnnotation = "signal.unbounded-cloud.io/gpu-inventory-digest"
 
 	maxProjectionAnnotationValue = 1024
 )
@@ -95,6 +97,7 @@ func projectTerminal(
 		case signalv1.RunPhaseSucceeded:
 			node.Labels[StateLabel] = "passed"
 			delete(node.Labels, EligibilityLabel)
+			projectSuccessfulFingerprint(node, run.Status.Evidence.Identity)
 
 			if !projectionTimeAfter(node.Annotations[LastSuccessfulAtAnnotation], completedAt) {
 				node.Annotations[LastSuccessfulRunAnnotation] = boundedAnnotationValue(run.Name)
@@ -110,6 +113,39 @@ func projectTerminal(
 
 		return nil
 	})
+}
+
+func projectSuccessfulFingerprint(
+	node *corev1.Node,
+	identity *signalv1.QualificationEvidenceIdentity,
+) {
+	if identity == nil {
+		return
+	}
+
+	for index := range identity.Participants {
+		participant := &identity.Participants[index]
+		if participant.End.NodeUID != node.UID ||
+			participant.Verdict != signalv1.QualificationVerdictPass {
+			continue
+		}
+
+		if participant.End.DriverVersion != "" {
+			node.Annotations[DriverVersionAnnotation] = boundedAnnotationValue(
+				participant.End.DriverVersion,
+			)
+		} else {
+			delete(node.Annotations, DriverVersionAnnotation)
+		}
+
+		if signalv1.IsSHA256Digest(participant.End.GPUInventoryDigest) {
+			node.Annotations[GPUInventoryDigestAnnotation] = participant.End.GPUInventoryDigest
+		} else {
+			delete(node.Annotations, GPUInventoryDigestAnnotation)
+		}
+
+		return
+	}
 }
 
 func runScriptDigest(run *signalv1.CertificationRun) string {

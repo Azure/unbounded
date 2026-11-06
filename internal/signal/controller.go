@@ -1668,7 +1668,7 @@ func (r *AdmissionReconciler) captureParticipantFingerprints(
 			)
 		}
 
-		fingerprints[index] = nodeFingerprint(&node)
+		fingerprints[index] = nodeBaseFingerprint(&node)
 	}
 
 	return fingerprints, nil
@@ -4142,7 +4142,7 @@ func (r *RunReconciler) qualificationEvidenceIdentity(
 			return nil, "Inconclusive", "ParticipantIdentityChanged: node UID changed during execution", nil
 		}
 
-		ends[index] = nodeFingerprint(&node)
+		ends[index] = nodeBaseFingerprint(&node)
 
 		role := signalv1.ParticipantRoleParticipant
 		if index == 0 {
@@ -4311,7 +4311,7 @@ func (r *RunReconciler) resolvedQualificationEvidenceIdentity(
 			Role:    resolvedParticipantRole(int32(index)),
 			Verdict: qualificationVerdict(verdict),
 			Start:   starts[index],
-			End:     nodeFingerprint(&node),
+			End:     nodeBaseFingerprint(&node),
 		}
 	}
 
@@ -4399,6 +4399,14 @@ func qualificationVerdict(verdict string) signalv1.QualificationVerdict {
 }
 
 func nodeFingerprint(node *corev1.Node) signalv1.NodeFingerprint {
+	fingerprint := nodeBaseFingerprint(node)
+	fingerprint.DriverVersion = node.Annotations[DriverVersionAnnotation]
+	fingerprint.GPUInventoryDigest = node.Annotations[GPUInventoryDigestAnnotation]
+
+	return fingerprint
+}
+
+func nodeBaseFingerprint(node *corev1.Node) signalv1.NodeFingerprint {
 	return signalv1.NodeFingerprint{
 		NodeUID:        node.UID,
 		BootID:         node.Status.NodeInfo.BootID,

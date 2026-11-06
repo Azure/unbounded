@@ -10,9 +10,11 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net"
 	"reflect"
 	"slices"
 	"sort"
+	"sync"
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
@@ -30,9 +32,10 @@ import (
 )
 
 const (
-	qualificationPolicyUIDLabel  = "signal.unbounded-cloud.io/policy-uid"
-	qualificationNodeUIDLabel    = "signal.unbounded-cloud.io/node-uid"
-	qualificationPolicyFinalizer = "signal.unbounded-cloud.io/qualification-ledgers"
+	qualificationPolicyUIDLabel   = "signal.unbounded-cloud.io/policy-uid"
+	qualificationNodeUIDLabel     = "signal.unbounded-cloud.io/node-uid"
+	qualificationPolicyFinalizer  = "signal.unbounded-cloud.io/qualification-ledgers"
+	qualificationEvidenceCacheTTL = time.Minute
 )
 
 type QualificationReconciler struct {
@@ -42,6 +45,9 @@ type QualificationReconciler struct {
 	Namespace     string
 	GateProtected bool
 	Now           func() time.Time
+
+	evidenceCacheMu sync.RWMutex
+	evidenceCache   map[qualificationEvidenceCacheKey]qualificationEvidenceCacheEntry
 }
 
 // +kubebuilder:rbac:groups=signal.unbounded-cloud.io,resources=certificationpolicies,verbs=get;list;watch;update;patch
@@ -64,7 +70,40 @@ type qualificationRecord struct {
 
 type qualificationRunIndex map[types.UID][]qualificationRecord
 
+type qualificationRunError struct {
+	Profile signalv1.PinnedProfile
+	Err     error
+}
+
+type qualificationRunErrors map[types.UID][]qualificationRunError
+
+type qualificationEvidenceCacheKey struct {
+	RunUID     types.UID
+	PlanDigest string
+	URI        string
+	Digest     string
+}
+
+type qualificationEvidenceCacheEntry struct {
+	Record     qualificationRecord
+	VerifiedAt time.Time
+}
+
+type qualificationEvidenceReadError struct {
+	err error
+}
+
+func (e qualificationEvidenceReadError) Error() string {
+	return e.err.Error()
+}
+
+func (e qualificationEvidenceReadError) Unwrap() error {
+	return e.err
+}
+
 type qualificationRunIndexContextKey struct{}
+
+type qualificationRunErrorsContextKey struct{}
 
 func (r *QualificationReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	if r.Client == nil || r.APIReader == nil || r.Evidence == nil {
@@ -129,12 +168,13 @@ func (r *QualificationReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 		return ctrl.Result{}, err
 	}
 
-	runIndex, err := r.buildQualificationRunIndex(ctx)
+	runIndex, runErrors, err := r.buildQualificationRunIndex(ctx)
 	if err != nil {
 		return ctrl.Result{}, err
 	}
 
 	ctx = context.WithValue(ctx, qualificationRunIndexContextKey{}, runIndex)
+	ctx = context.WithValue(ctx, qualificationRunErrorsContextKey{}, runErrors)
 
 	var reconcileErrors []error
 
@@ -281,7 +321,7 @@ func (r *QualificationReconciler) evaluateLedger(
 		return status, nil
 	}
 
-	records, err := r.qualificationRecords(ctx, ledger, node.UID)
+	records, transientReadUIDs, err := r.qualificationRecords(ctx, policy, ledger, node.UID)
 	if err != nil {
 		apimeta.SetStatusCondition(&status.Conditions, metav1.Condition{
 			Type:               "EvidenceHealthy",
@@ -323,6 +363,19 @@ func (r *QualificationReconciler) evaluateLedger(
 		clearQualificationStatus(&status)
 	}
 
+	if evidenceErr != nil {
+		verified := retainedVerifiedRecords(status.ContributingRuns, records, transientReadUIDs)
+		status.ContributingRuns = recordReferences(verified)
+		status.PlanDigests = recordPlanDigests(verified)
+		status.Fingerprint = nil
+		status.QualifiedAt = nil
+		status.ExpiresAt = nil
+		status.Phase = signalv1.NodeCertificationPhasePending
+		status.Reason = "Qualification evidence is unavailable"
+
+		return status, evidenceErr
+	}
+
 	if status.LatestNonPass != nil &&
 		policy.Spec.NonPassBehavior != signalv1.NonPassBehaviorIgnore {
 		records = slices.DeleteFunc(records, func(record qualificationRecord) bool {
@@ -331,6 +384,7 @@ func (r *QualificationReconciler) evaluateLedger(
 	}
 
 	contributions := make([]qualificationRecord, 0)
+	requirementExpiries := make([]time.Time, 0, len(policy.Spec.Requirements))
 
 	for requirementIndex := range policy.Spec.Requirements {
 		requirement := &policy.Spec.Requirements[requirementIndex]
@@ -343,10 +397,14 @@ func (r *QualificationReconciler) evaluateLedger(
 			records,
 		)
 		if err != nil {
-			return status, errors.Join(evidenceErr, err)
+			return status, err
 		}
 
-		if !requirementSatisfied(requirement, accepted) {
+		selected := selectRequirementRecords(
+			requirement,
+			accepted,
+		)
+		if len(selected) == 0 {
 			switch {
 			case policy.Spec.NonPassBehavior == signalv1.NonPassBehaviorRevoke &&
 				status.LatestNonPass != nil:
@@ -373,7 +431,11 @@ func (r *QualificationReconciler) evaluateLedger(
 			return status, evidenceErr
 		}
 
-		contributions = append(contributions, accepted...)
+		contributions = append(contributions, selected...)
+		requirementExpiries = append(
+			requirementExpiries,
+			earliestRecordTime(selected).Add(policy.Spec.Validity.Duration),
+		)
 	}
 
 	contributions = uniqueRecords(contributions)
@@ -389,7 +451,7 @@ func (r *QualificationReconciler) evaluateLedger(
 	}
 
 	qualifiedAt := latestRecordTime(contributions)
-	expiresAt := qualifiedAt.Add(policy.Spec.Validity.Duration)
+	expiresAt := earliestTime(requirementExpiries)
 	now := r.now()
 	status.ContributingRuns = recordReferences(contributions)
 	status.PlanDigests = recordPlanDigests(contributions)
@@ -521,11 +583,13 @@ func clearQualificationStatus(status *signalv1.NodeCertificationStatus) {
 
 func (r *QualificationReconciler) qualificationRecords(
 	ctx context.Context,
+	policy *signalv1.CertificationPolicy,
 	ledger *signalv1.NodeCertification,
 	nodeUID types.UID,
-) ([]qualificationRecord, error) {
+) ([]qualificationRecord, map[types.UID]struct{}, error) {
 	records := make([]qualificationRecord, 0, len(ledger.Status.ContributingRuns))
 	seen := map[types.UID]struct{}{}
+	transientReadUIDs := map[types.UID]struct{}{}
 
 	var evidenceErrors []error
 
@@ -533,8 +597,13 @@ func (r *QualificationReconciler) qualificationRecords(
 		reference := ledger.Status.ContributingRuns[index]
 		seen[reference.UID] = struct{}{}
 
-		record, found, err := r.recordFromEvidence(ctx, reference)
+		record, found, err := r.recordFromEvidence(ctx, reference, false)
 		if err != nil {
+			var readErr qualificationEvidenceReadError
+			if errors.As(err, &readErr) {
+				transientReadUIDs[reference.UID] = struct{}{}
+			}
+
 			evidenceErrors = append(evidenceErrors, fmt.Errorf(
 				"verify retained Run %s evidence: %w",
 				reference.Name,
@@ -555,9 +624,25 @@ func (r *QualificationReconciler) qualificationRecords(
 	if !ok {
 		var err error
 
-		runIndex, err = r.buildQualificationRunIndex(ctx)
+		var runErrors qualificationRunErrors
+
+		runIndex, runErrors, err = r.buildQualificationRunIndex(ctx)
 		if err != nil {
 			evidenceErrors = append(evidenceErrors, err)
+		}
+
+		for index := range runErrors[nodeUID] {
+			if recordMatchesPolicy(policy, qualificationRecord{Profile: runErrors[nodeUID][index].Profile}) {
+				evidenceErrors = append(evidenceErrors, runErrors[nodeUID][index].Err)
+			}
+		}
+	} else if runErrors, found := ctx.Value(
+		qualificationRunErrorsContextKey{},
+	).(qualificationRunErrors); found {
+		for index := range runErrors[nodeUID] {
+			if recordMatchesPolicy(policy, qualificationRecord{Profile: runErrors[nodeUID][index].Profile}) {
+				evidenceErrors = append(evidenceErrors, runErrors[nodeUID][index].Err)
+			}
 		}
 	}
 
@@ -570,25 +655,27 @@ func (r *QualificationReconciler) qualificationRecords(
 		records = append(records, record)
 	}
 
-	sort.Slice(records, func(i, j int) bool {
-		return records[i].FinishedAt.Before(records[j].FinishedAt)
-	})
+	sortQualificationRecords(records)
 
-	return records, errors.Join(evidenceErrors...)
+	return records, transientReadUIDs, errors.Join(evidenceErrors...)
 }
 
 func (r *QualificationReconciler) buildQualificationRunIndex(
 	ctx context.Context,
-) (qualificationRunIndex, error) {
+) (qualificationRunIndex, qualificationRunErrors, error) {
 	var runs signalv1.CertificationRunList
 	if err := r.List(ctx, &runs, client.InNamespace(r.Namespace)); err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 
 	index := make(qualificationRunIndex)
+	runErrors := make(qualificationRunErrors)
+	liveRunUIDs := make(map[types.UID]struct{}, len(runs.Items))
 
 	for runIndex := range runs.Items {
 		run := &runs.Items[runIndex]
+		liveRunUIDs[run.UID] = struct{}{}
+
 		if !run.Status.Phase.Terminal() || run.Status.Evidence.Identity == nil ||
 			run.Spec.PlanDigest == "" || run.Spec.PlanProvenance == nil {
 			continue
@@ -608,27 +695,60 @@ func (r *QualificationReconciler) buildQualificationRunIndex(
 			continue
 		}
 
-		record := qualificationRecord{
-			Reference: signalv1.ContributingRunReference{
-				Name:           run.Name,
-				UID:            run.UID,
-				PlanDigest:     run.Spec.PlanDigest,
-				EvidenceURI:    run.Status.Evidence.URI,
-				EvidenceDigest: run.Status.Evidence.Digest,
-			},
-			Profile:  run.Spec.Profile,
-			Suite:    run.Spec.Suite,
-			Identity: *run.Status.Evidence.Identity.DeepCopy(),
-			CreditEligible: qualificationCreditEligible(
-				run.Spec.ResolvedPlan,
-				run.Status.Evidence.Identity,
-			),
-			Phase:      run.Status.Phase,
-			StartedAt:  identityStartedAt(run.Status.Evidence.Identity),
-			FinishedAt: identityFinishedAt(run.Status.Evidence.Identity),
+		reference := signalv1.ContributingRunReference{
+			Name:           run.Name,
+			UID:            run.UID,
+			PlanDigest:     run.Spec.PlanDigest,
+			EvidenceURI:    run.Status.Evidence.URI,
+			EvidenceDigest: run.Status.Evidence.Digest,
 		}
-		for participantIndex := range run.Status.Evidence.Identity.Participants {
-			nodeUID := run.Status.Evidence.Identity.Participants[participantIndex].End.NodeUID
+		statusRecord := qualificationRecord{
+			Reference:      reference,
+			Profile:        run.Spec.Profile,
+			Suite:          run.Spec.Suite,
+			Identity:       *run.Status.Evidence.Identity.DeepCopy(),
+			CreditEligible: false,
+			Phase:          run.Status.Phase,
+			StartedAt:      identityStartedAt(run.Status.Evidence.Identity),
+			FinishedAt:     identityFinishedAt(run.Status.Evidence.Identity),
+		}
+
+		record, found, evidenceErr := r.recordFromEvidence(ctx, reference, true)
+		if evidenceErr != nil {
+			evidenceErr = fmt.Errorf(
+				"verify terminal Run %s evidence: %w",
+				run.Name,
+				evidenceErr,
+			)
+			for participantIndex := range run.Status.Evidence.Identity.Participants {
+				participant := &run.Status.Evidence.Identity.Participants[participantIndex]
+
+				nodeUID := participant.End.NodeUID
+				if nodeUID == "" {
+					nodeUID = participant.Start.NodeUID
+				}
+
+				if nodeUID != "" {
+					runErrors[nodeUID] = append(runErrors[nodeUID], qualificationRunError{
+						Profile: run.Spec.Profile,
+						Err:     evidenceErr,
+					})
+					if run.Status.Phase != signalv1.RunPhaseSucceeded &&
+						recordIncludesNode(statusRecord, nodeUID) {
+						index[nodeUID] = append(index[nodeUID], statusRecord)
+					}
+				}
+			}
+
+			continue
+		}
+
+		if !found {
+			continue
+		}
+
+		for participantIndex := range record.Identity.Participants {
+			nodeUID := record.Identity.Participants[participantIndex].End.NodeUID
 			if nodeUID == "" || !recordIncludesNode(record, nodeUID) {
 				continue
 			}
@@ -638,20 +758,42 @@ func (r *QualificationReconciler) buildQualificationRunIndex(
 	}
 
 	for nodeUID := range index {
-		sort.Slice(index[nodeUID], func(i, j int) bool {
-			return index[nodeUID][i].FinishedAt.Before(index[nodeUID][j].FinishedAt)
-		})
+		sortQualificationRecords(index[nodeUID])
 	}
 
-	return index, nil
+	r.pruneEvidenceCache(liveRunUIDs)
+
+	return index, runErrors, nil
 }
 
 func (r *QualificationReconciler) recordFromEvidence(
 	ctx context.Context,
 	reference signalv1.ContributingRunReference,
+	useCache bool,
 ) (qualificationRecord, bool, error) {
-	data, _, digest, found, err := r.Evidence.Get(ctx, reference.Name+".json")
+	cacheKey := qualificationEvidenceCacheKey{
+		RunUID:     reference.UID,
+		PlanDigest: reference.PlanDigest,
+		URI:        reference.EvidenceURI,
+		Digest:     reference.EvidenceDigest,
+	}
+
+	if useCache {
+		r.evidenceCacheMu.RLock()
+		cached, found := r.evidenceCache[cacheKey]
+		r.evidenceCacheMu.RUnlock()
+
+		if found && r.now().Sub(cached.VerifiedAt) < qualificationEvidenceCacheTTL {
+			return cached.Record, true, nil
+		}
+	}
+
+	data, uri, digest, found, err := r.Evidence.Get(ctx, reference.Name+".json")
 	if err != nil {
+		if isTransientEvidenceReadError(err) {
+			return qualificationRecord{}, false, qualificationEvidenceReadError{err: err}
+		}
+
 		return qualificationRecord{}, false, err
 	}
 
@@ -661,6 +803,10 @@ func (r *QualificationReconciler) recordFromEvidence(
 
 	if digest != reference.EvidenceDigest {
 		return qualificationRecord{}, false, errors.New("evidence digest does not match the retained reference")
+	}
+
+	if uri != reference.EvidenceURI {
+		return qualificationRecord{}, false, errors.New("evidence URI does not match the retained reference")
 	}
 
 	var document struct {
@@ -723,7 +869,7 @@ func (r *QualificationReconciler) recordFromEvidence(
 		return qualificationRecord{}, false, err
 	}
 
-	return qualificationRecord{
+	record := qualificationRecord{
 		Reference: reference,
 		Profile:   document.Profile,
 		Suite:     document.Suite,
@@ -735,7 +881,33 @@ func (r *QualificationReconciler) recordFromEvidence(
 		Phase:      document.Phase,
 		StartedAt:  identityStartedAt(document.QualificationIdentity),
 		FinishedAt: identityFinishedAt(document.QualificationIdentity),
-	}, true, nil
+	}
+
+	if useCache {
+		r.evidenceCacheMu.Lock()
+		if r.evidenceCache == nil {
+			r.evidenceCache = make(map[qualificationEvidenceCacheKey]qualificationEvidenceCacheEntry)
+		}
+
+		r.evidenceCache[cacheKey] = qualificationEvidenceCacheEntry{
+			Record:     record,
+			VerifiedAt: r.now(),
+		}
+		r.evidenceCacheMu.Unlock()
+	}
+
+	return record, true, nil
+}
+
+func (r *QualificationReconciler) pruneEvidenceCache(liveRunUIDs map[types.UID]struct{}) {
+	r.evidenceCacheMu.Lock()
+	defer r.evidenceCacheMu.Unlock()
+
+	for key := range r.evidenceCache {
+		if _, found := liveRunUIDs[key.RunUID]; !found {
+			delete(r.evidenceCache, key)
+		}
+	}
 }
 
 func qualificationCreditEligible(
@@ -755,11 +927,17 @@ func qualificationCreditEligible(
 		summaries[[2]int32{summary.PhaseOrder, summary.StageOrder}] = summary
 	}
 
+	mandatoryStages := 0
+
 	for phaseIndex := range resolvedPlan.Phases {
 		for stageIndex := range resolvedPlan.Phases[phaseIndex].Stages {
 			stage := &resolvedPlan.Phases[phaseIndex].Stages[stageIndex]
 			if stage.Optional {
 				continue
+			}
+
+			if stage.QualificationEligible && !stage.DiagnosticOnly {
+				mandatoryStages++
 			}
 
 			summary, found := summaries[[2]int32{int32(phaseIndex), int32(stageIndex)}]
@@ -774,7 +952,7 @@ func qualificationCreditEligible(
 		}
 	}
 
-	return true
+	return mandatoryStages > 0
 }
 
 func canonicalQualificationPlanDigest(
@@ -948,6 +1126,9 @@ func requirementSatisfied(
 	}
 
 	if requirement.Variation.MinRunSeparation != nil {
+		records = slices.Clone(records)
+		sortQualificationRecords(records)
+
 		separated := 0
 
 		var previous time.Time
@@ -967,6 +1148,59 @@ func requirementSatisfied(
 	}
 
 	return true
+}
+
+func selectRequirementRecords(
+	requirement *signalv1.CertificationRequirement,
+	records []qualificationRecord,
+) []qualificationRecord {
+	candidates := slices.Clone(records)
+	sort.SliceStable(candidates, func(i, j int) bool {
+		if candidates[i].FinishedAt.Equal(candidates[j].FinishedAt) {
+			return candidates[i].Reference.UID > candidates[j].Reference.UID
+		}
+
+		return candidates[i].FinishedAt.After(candidates[j].FinishedAt)
+	})
+
+	selected := make([]qualificationRecord, 0, len(candidates))
+	for index := range candidates {
+		selected = append(selected, candidates[index])
+		if requirementSatisfied(requirement, selected) {
+			break
+		}
+	}
+
+	if !requirementSatisfied(requirement, selected) {
+		return nil
+	}
+
+	for index := len(selected) - 1; index >= 0; index-- {
+		candidate := append([]qualificationRecord(nil), selected[:index]...)
+
+		candidate = append(candidate, selected[index+1:]...)
+		if requirementSatisfied(requirement, candidate) {
+			selected = candidate
+		}
+	}
+
+	sortQualificationRecords(selected)
+
+	return selected
+}
+
+func sortQualificationRecords(records []qualificationRecord) {
+	sort.SliceStable(records, func(i, j int) bool {
+		if records[i].StartedAt.Equal(records[j].StartedAt) {
+			if records[i].FinishedAt.Equal(records[j].FinishedAt) {
+				return records[i].Reference.UID < records[j].Reference.UID
+			}
+
+			return records[i].FinishedAt.Before(records[j].FinishedAt)
+		}
+
+		return records[i].StartedAt.Before(records[j].StartedAt)
+	})
 }
 
 func recordMatchesPolicy(policy *signalv1.CertificationPolicy, record qualificationRecord) bool {
@@ -1282,6 +1516,19 @@ func policyDigest(spec signalv1.CertificationPolicySpec) (string, error) {
 	return digestBytes(data), nil
 }
 
+func isTransientEvidenceReadError(err error) bool {
+	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) ||
+		apierrors.IsTimeout(err) || apierrors.IsServerTimeout(err) ||
+		apierrors.IsTooManyRequests(err) || apierrors.IsServiceUnavailable(err) ||
+		apierrors.IsInternalError(err) {
+		return true
+	}
+
+	var networkErr net.Error
+
+	return errors.As(err, &networkErr) && networkErr.Timeout()
+}
+
 func recordIncludesNode(record qualificationRecord, nodeUID types.UID) bool {
 	_, found := recordParticipant(record, nodeUID)
 
@@ -1360,6 +1607,35 @@ func uniqueRecords(records []qualificationRecord) []qualificationRecord {
 	return result
 }
 
+func retainedVerifiedRecords(
+	references []signalv1.ContributingRunReference,
+	records []qualificationRecord,
+	transientReadUIDs map[types.UID]struct{},
+) []qualificationRecord {
+	verified := make(map[types.UID]qualificationRecord, len(records))
+	for index := range records {
+		if records[index].Phase == signalv1.RunPhaseSucceeded {
+			verified[records[index].Reference.UID] = records[index]
+		}
+	}
+
+	result := make([]qualificationRecord, 0, len(references))
+	for index := range references {
+		if record, found := verified[references[index].UID]; found {
+			result = append(result, record)
+		} else if _, transient := transientReadUIDs[references[index].UID]; transient {
+			result = append(result, qualificationRecord{
+				Reference: references[index],
+				Identity: signalv1.QualificationEvidenceIdentity{
+					PlanDigest: references[index].PlanDigest,
+				},
+			})
+		}
+	}
+
+	return result
+}
+
 func recordReferences(records []qualificationRecord) []signalv1.ContributingRunReference {
 	records = uniqueRecords(records)
 	if len(records) > signalv1.MaxContributingRuns {
@@ -1400,4 +1676,26 @@ func latestRecordTime(records []qualificationRecord) time.Time {
 	}
 
 	return latest
+}
+
+func earliestRecordTime(records []qualificationRecord) time.Time {
+	var earliest time.Time
+	for index := range records {
+		if earliest.IsZero() || records[index].FinishedAt.Before(earliest) {
+			earliest = records[index].FinishedAt
+		}
+	}
+
+	return earliest
+}
+
+func earliestTime(values []time.Time) time.Time {
+	var earliest time.Time
+	for index := range values {
+		if earliest.IsZero() || values[index].Before(earliest) {
+			earliest = values[index]
+		}
+	}
+
+	return earliest
 }
