@@ -6,9 +6,11 @@ package controller
 import (
 	"context"
 	"fmt"
+	"time"
 
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/util/wait"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/klog/v2"
 
@@ -18,6 +20,11 @@ import (
 // DefaultKubeProxyRepository is where the managed kube-proxy image comes from
 // when neither the configuration nor the cluster's own kube-proxy names one.
 const DefaultKubeProxyRepository = "registry.k8s.io/kube-proxy"
+
+const (
+	providerKubeProxyImageRetries       = 10
+	providerKubeProxyImageRetryInterval = 10 * time.Second
+)
 
 // ManagedKubeProxyImage works out the image the managed kube-proxy DaemonSets
 // run from the configured --managed-kube-proxy-image value:
@@ -31,10 +38,10 @@ const DefaultKubeProxyRepository = "registry.k8s.io/kube-proxy"
 //   - Empty reuses the kube-system/kube-proxy image, and otherwise falls back to
 //     registry.k8s.io/kube-proxy at the API server's version.
 //
-// The only error is a configured value that is not an image reference. A
-// cluster that cannot be read falls back instead, as it always has: the image
-// is worked out once, when the controller starts leading, and failing there
-// would leave managed kube-proxy unreconciled until the next restart.
+// Malformed configured values and context cancellation return errors. A cluster
+// that cannot be read falls back after retries: the image is worked out once,
+// when the controller starts leading, and failing there would leave managed
+// kube-proxy unreconciled until the next restart.
 func ManagedKubeProxyImage(ctx context.Context, clientset kubernetes.Interface, configured string) (string, error) {
 	repository := DefaultKubeProxyRepository
 
@@ -51,7 +58,11 @@ func ManagedKubeProxyImage(ctx context.Context, clientset kubernetes.Interface, 
 		repository = configured
 	}
 
-	provider := providerKubeProxyImage(ctx, clientset)
+	provider, err := providerKubeProxyImage(ctx, clientset)
+	if err != nil {
+		return "", fmt.Errorf("managed kube-proxy image discovery: %w", err)
+	}
+
 	if configured == "" && provider != "" {
 		return provider, nil
 	}
@@ -66,23 +77,53 @@ func ManagedKubeProxyImage(ctx context.Context, clientset kubernetes.Interface, 
 
 // providerKubeProxyImage returns the image of the kube-proxy container in
 // kube-system/kube-proxy, or an empty string when there is none to read.
-func providerKubeProxyImage(ctx context.Context, clientset kubernetes.Interface) string {
-	ds, err := clientset.AppsV1().DaemonSets(metav1.NamespaceSystem).Get(ctx, "kube-proxy", metav1.GetOptions{})
+// NotFound falls back immediately; other read errors get ten retries at
+// ten-second intervals before falling back. Context cancellation stops discovery.
+func providerKubeProxyImage(ctx context.Context, clientset kubernetes.Interface) (string, error) {
+	backoff := wait.Backoff{
+		Duration: providerKubeProxyImageRetryInterval,
+		Factor:   1,
+		Steps:    providerKubeProxyImageRetries + 1,
+	}
+
+	var (
+		image    string
+		attempts int
+	)
+
+	err := wait.ExponentialBackoffWithContext(ctx, backoff, func(ctx context.Context) (bool, error) {
+		attempts++
+
+		ds, err := clientset.AppsV1().DaemonSets(metav1.NamespaceSystem).Get(ctx, "kube-proxy", metav1.GetOptions{})
+		if apierrors.IsNotFound(err) {
+			return true, nil
+		}
+
+		if err != nil {
+			klog.Warningf("Failed to read kube-system/kube-proxy for managed kube-proxy image (attempt %d/%d): %v", attempts, providerKubeProxyImageRetries+1, err)
+
+			return false, nil
+		}
+
+		for _, container := range ds.Spec.Template.Spec.Containers {
+			if container.Name == "kube-proxy" && container.Image != "" {
+				image = container.Image
+
+				break
+			}
+		}
+
+		return true, nil
+	})
 	if err != nil {
-		if !apierrors.IsNotFound(err) {
-			klog.Warningf("Failed to read kube-system/kube-proxy for managed kube-proxy image: %v", err)
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return "", ctxErr
 		}
 
-		return ""
+		klog.Warningf("Falling back to defaults after %d failed attempts to read kube-system/kube-proxy", attempts)
 	}
 
-	for _, container := range ds.Spec.Template.Spec.Containers {
-		if container.Name == "kube-proxy" && container.Image != "" {
-			return container.Image
-		}
-	}
-
-	return ""
+	return image, nil
 }
 
 // imageTag returns the tag of the provider's kube-proxy image. Its digest is
