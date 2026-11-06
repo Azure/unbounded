@@ -178,9 +178,11 @@ class Runner(Protocol):
     """Runs commands. The driver is tested with a fake."""
 
     def run(self, argv: list[str], env: dict[str, str], cwd: Path,
-            on_line: Callable[[str], None], timeout: float) -> int: ...
+            on_line: Callable[[str], None], timeout: float) -> int:
+        """Runs argv, passing each output line to on_line, and returns its exit code."""
 
-    def capture(self, argv: list[str], env: dict[str, str], cwd: Path, timeout: float) -> tuple[int, str]: ...
+    def capture(self, argv: list[str], env: dict[str, str], cwd: Path, timeout: float) -> tuple[int, str]:
+        """Runs argv and returns its exit code and output."""
 
 
 class SubprocessRunner:
