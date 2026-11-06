@@ -5,16 +5,15 @@
 //! - [`Class::Safety`]: after every role step (and roles report violations
 //!   observed inside their own code through [`crate::world::Reporter`]).
 //! - [`Class::Resource`]: when the world is quiescent (every charge, slot and
-//!   flight released; filled in by Phase 3).
+//!   flight released).
 //! - [`Class::Liveness`]: at the end of the run. The built-in liveness check,
 //!   "pending work with no wake scheduled", runs whenever the world runs out of
 //!   timers, events and ready roles; a second built-in, "busy-loop", bounds the
 //!   steps taken without virtual time advancing.
 //!
 //! Checks see a [`Probe`]: world time, step count and per-role scheduler state.
-//! Application-level observations (bytes delivered, keys installed) arrive in
-//! later phases as typed observers on the probe; until then roles fold them
-//! into the trace and report violations through the reporter.
+//! Application-level observations (bytes delivered, keys installed) are folded
+//! into the trace by the roles, which report violations through the reporter.
 use std::rc::Rc;
 
 use racer_io::exec::Next;

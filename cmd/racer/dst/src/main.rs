@@ -53,9 +53,9 @@ fn entries() -> Result<Vec<SeedEntry>, String> {
     }
 }
 
-/// Plan section 9.2: the Model entries of the seed set together exercise every core effect and
+/// Coverage check: the Model entries of the seed set together exercise every core effect and
 /// serve outcome variant ([`model::coverage`]). Returns 1 on a gap, 0 otherwise.
-fn coverage_parity(entries: &[SeedEntry]) -> u32 {
+fn coverage_check(entries: &[SeedEntry]) -> u32 {
     let mut seen = std::collections::BTreeSet::new();
     for entry in entries {
         let Some(scenario) = scenarios::find(&entry.scenario) else {
@@ -71,10 +71,10 @@ fn coverage_parity(entries: &[SeedEntry]) -> u32 {
     }
     let (missing, stale) = model::coverage::check(&seen);
     if missing.is_empty() && stale.is_empty() {
-        println!("ok   coverage parity: {} variants seen", seen.len());
+        println!("ok   coverage: {} variants seen", seen.len());
         return 0;
     }
-    eprintln!("FAIL coverage parity: missing {missing:?}, exercised but exempt {stale:?}");
+    eprintln!("FAIL coverage: missing {missing:?}, exercised but exempt {stale:?}");
     1
 }
 
@@ -172,7 +172,7 @@ fn main() -> ExitCode {
         }
     }
     if filter.is_empty() && var("DST_SEEDS").is_none() {
-        failed += coverage_parity(&entries_for_coverage);
+        failed += coverage_check(&entries_for_coverage);
     }
     println!("racer-dst: {ran} entries, {failed} failed");
     if failed == 0 && ran > 0 {

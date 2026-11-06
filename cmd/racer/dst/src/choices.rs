@@ -9,8 +9,7 @@
 //!
 //! - [`Choices::seeded`]: a xoshiro256** generator. CI runs a fixed seed set.
 //! - [`Choices::from_bytes`]: a byte slice, eight little-endian bytes per
-//!   draw. This is the cargo-fuzz entry point (Phase 10): the fuzzer mutates
-//!   the bytes and coverage guides it through the whole application.
+//!   draw. Any byte source, such as a fuzzer, can drive a run this way.
 //! - [`Choices::replay`]: a recorded list of raw draws (see
 //!   [`Choices::recording`]); this is what the shrinker edits and what
 //!   regression seeds check in.

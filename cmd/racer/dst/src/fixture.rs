@@ -1,8 +1,8 @@
 //! A minimal test node built from racer-io primitives only.
 //!
-//! Until the racer application runs on racer-io (Phase 1 migration), this node
-//! proves the harness exercises real racer-io code: two [`Lane`]s per node on
-//! `Driver::Sim`.
+//! A small, fast Full-fidelity workload that exercises real racer-io code
+//! without the whole application: two [`Lane`]s per node on `Driver::Sim`.
+//! The world tests and the `lane-pair` scenarios use it.
 //!
 //! - `writer`: opens `/state` on the node's simulated disk, recovers its
 //!   counter from `/state/counter` (so a crash and restart resumes from what

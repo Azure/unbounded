@@ -1,5 +1,4 @@
-//! `racer-dst`: the unified deterministic simulation test harness (plan D12,
-//! D14, section 9.2).
+//! `racer-dst`: the deterministic simulation test harness for Racer.
 //!
 //! One harness, one choice stream, one engine, one invariant set and one cost
 //! model for the whole Racer application. Production code runs unmodified;
@@ -32,7 +31,7 @@
 //! run), `DST_FILTER` (scenario name substring). A failure prints a shrunk
 //! `words=` entry; check it into `dst/seeds/regressions.txt`.
 //!
-//! # Plugging in the real application (Full fidelity, Phase 1 onward)
+//! # Plugging in the real application (Full fidelity)
 //!
 //! A scenario's node factory ([`Scenario::roles`]) receives a
 //! [`world::NodeEnv`] and returns the node's roles. For Full fidelity the
@@ -52,11 +51,11 @@
 //!   through the real startup path on the surviving simulated disk.
 //!
 //! Application observations become invariants: roles report violations via
-//! [`world::Reporter`] and fold observed data into the [`world::Trace`];
-//! later phases add typed observers to [`invariants::Probe`] (delivered bytes
-//! vs origin bytes, key exposure, authority terms).
+//! [`world::Reporter`] and fold observed data into the [`world::Trace`].
+//! Invariant checks see an [`invariants::Probe`] with world time, step count
+//! and per-role scheduler state.
 //!
-//! # Model fidelity (Phase 5)
+//! # Model fidelity
 //!
 //! [`scenario::Fidelity::Model`] runs [`model`]: a byte-free interpreter over the real
 //! `WorkerCore` machines and a real `topology::Placement` (with [`model::phantom`]
@@ -67,11 +66,13 @@
 //! decisions), which is what makes Full/Model overlap calibration meaningful. What is
 //! modeled is listed in `dst/MODEL.md`.
 //!
-//! //! # Fuzzing (Phase 10)
+//! # Byte-driven runs
 //!
-//! The non-workspace `fuzz/` crate feeds libFuzzer bytes to
-//! [`Choices::from_bytes`] and runs a scenario; the shrinking contract in
-//! [`choices`] keeps fuzzer-found streams minimizable.
+//! [`Choices::from_bytes`] turns an arbitrary byte stream into a choice
+//! stream, so any byte source (for example a fuzzer) can drive a run, and the
+//! shrinking contract in [`choices`] keeps such streams minimizable. The
+//! libFuzzer targets in `cmd/racer/fuzz` do not use this crate; they exercise
+//! Racer's parsers directly.
 //!
 //! # Determinism rules
 //!
@@ -91,8 +92,6 @@ pub mod engine;
 pub mod fixture;
 pub mod invariants;
 pub mod model;
-// Copied from racer-sim with its documentation as is.
-#[allow(missing_docs)]
 pub mod resources;
 pub mod scenario;
 pub mod scenarios;

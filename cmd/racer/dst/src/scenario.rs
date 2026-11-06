@@ -26,7 +26,8 @@ use crate::{
     world::{Fault, NodeFactory, Outcome, World},
 };
 
-/// Which interpreter runs the nodes (plan D14).
+/// Which interpreter runs the nodes. Both share the choice stream, engine,
+/// cost table and determinism checks.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum Fidelity {
     /// Real application roles on `Driver::Sim`.
@@ -46,7 +47,8 @@ pub struct FaultMix {
     pub max_faults: u32,
     /// Crash followed by a restart after up to `max_downtime`.
     pub crash_restart: u64,
-    /// Partition followed by a heal (placeholder until Phase 6).
+    /// Partition followed by a heal. Only takes effect with a shared network
+    /// ([`Scenario::shared_network`]); otherwise it is recorded in the trace only.
     pub partition: u64,
     /// Slow peer.
     pub slow_peer: u64,

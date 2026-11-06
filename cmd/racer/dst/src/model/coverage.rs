@@ -1,4 +1,4 @@
-//! Coverage parity (plan section 9.2): every core effect and serve outcome variant must be
+//! Coverage check: every core effect and serve outcome variant must be
 //! exercised by the CI Model scenario set.
 //!
 //! [`super::effect_name`] and the serve outcome names match exhaustively on the core types, so a
@@ -47,7 +47,7 @@ pub const VARIANTS: &[&str] = &[
 ];
 
 /// Variants the core never emits by construction, with the reason. They are exempt from the
-/// parity check; the interpreter counts one as a hard failure if it ever appears.
+/// coverage check; the interpreter counts one as a hard failure if it ever appears.
 pub const UNREACHABLE: &[(&str, &str)] = &[
     (
         "Window::Fetch",
@@ -59,8 +59,8 @@ pub const UNREACHABLE: &[(&str, &str)] = &[
     ),
 ];
 
-/// Variants the Model cannot drive yet, with the reason. Each is a known parity gap listed in
-/// `dst/MODEL.md`; shrinking this list is Phase 5 work. A variant here that the CI set does
+/// Variants the Model cannot drive yet, with the reason. Each is a known gap listed in
+/// `dst/MODEL.md`. A variant here that the CI set does
 /// exercise fails the check, so the list cannot go stale.
 pub const NOT_YET: &[(&str, &str)] = &[
     (
