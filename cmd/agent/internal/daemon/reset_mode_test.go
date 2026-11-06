@@ -93,7 +93,7 @@ func TestResetOrderWithANoneNode(t *testing.T) {
 		"remove-daemon-unit", "stop-machine", "stop-none-node", "remove-wireguard-keys",
 		"remove-nspawn-config", "remove-none-config",
 		"remove-machine", "remove-none-node", "remove-bpffs-mount",
-		"cleanup-routes", "remove-first-boot-unit", "remove-agent-artifacts", "reload-systemd",
+		"cleanup-routes", "remove-nftables-flush", "remove-first-boot-unit", "remove-agent-artifacts", "reload-systemd",
 	} {
 		idx := strings.Index(name, step)
 		require.GreaterOrEqual(t, idx, 0, "%s missing from %s", step, name)

@@ -208,8 +208,8 @@ func resetResources(log *slog.Logger) phases.Task {
 // of its mode, so it never touches what another installation owns.
 //
 // The order is the same for every mode: daemon unit, stop, WireGuard keys,
-// config, node, bpffs, network and routes, bootstrap unit, artifacts, systemd
-// reload. Each mode's tasks sit in the position of the nspawn task they
+// config, node, bpffs, network and routes, nftables flush unit, bootstrap unit,
+// artifacts, systemd reload. Each mode's tasks sit in the position of the nspawn task they
 // correspond to.
 func resetResourcesOn(log *slog.Logger, h resetHost) phases.Task {
 	var noneNode hostNodeTeardown
@@ -245,6 +245,10 @@ func resetResourcesOn(log *slog.Logger, h resetHost) phases.Task {
 			reset.RemoveBPFFSMount(log, goalstates.NSpawnMachineKube2),
 		),
 		reset.CleanupNetwork(log),
+		// Every mode installs it, and the none and container variants run on
+		// every boot, so it is host-global rather than part of a mode's
+		// teardown. reload-systemd below picks up the removal.
+		reset.RemoveNFTablesFlush(log),
 		// Before the artifacts, so a failure stops the reset while the host is
 		// still recognizably installed.
 		RemoveFirstBootBootstrapUnit(log),
