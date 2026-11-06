@@ -5178,16 +5178,25 @@ fn offers_wait_out_a_cut_toward_their_site() {
     let mut budget = AcquisitionBudget::new(f.scope.deadline.0, 8, 16);
     assert!(acquire(&mut f, &mut budget).is_ok());
     let candidates = f.fill.dependencies.candidates.clone();
-    let start = racer_io::Clock::host().now();
+    let start = env.ctx.now();
     let poll = |f: &mut Fixture, now: Instant, n: u64| drive_offers(f, now, n, true);
     // The first offer fails in transport: the group is blocked until its
-    // next offer, 15 s after the failure. The offer task reports at the
-    // runtime clock, which this test does not advance, so that is
-    // `start + 15 s` while `poll` passes later times explicitly.
+    // next offer, 15 s after the failure. The offer task reports the failure
+    // at the runtime clock, which keeps running while `poll` passes explicit
+    // times, so the block's end is read back rather than assumed to be
+    // `start + 15 s`: under load the report lands measurably after `start`.
     peers.reply(&ordered[0], Reply::Deadline);
     let first = start + NOTICE_DELAYS[0];
     poll(&mut f, first, 1);
     assert_eq!(peers.calls.borrow().len(), 2);
+    let reported = env.ctx.now();
+    let until = candidates
+        .notices
+        .borrow()
+        .blocked(&String::new(), first)
+        .expect("a transport failure blocks the group");
+    assert!(until >= start + NOTICE_DELAYS[1]);
+    assert!(until <= reported + NOTICE_DELAYS[1]);
     // A second notice, due at `first` too, is deferred: no request.
     // A page with the same rank 0 and this node after it.
     let local = candidates.node.clone();
@@ -5210,17 +5219,13 @@ fn offers_wait_out_a_cut_toward_their_site() {
         &[crate::read::candidates::ProbeOutcome::CopyMiss]
     ));
     poll(&mut f, first, 0);
-    poll(
-        &mut f,
-        start + NOTICE_DELAYS[1] - Duration::from_millis(1),
-        0,
-    );
+    poll(&mut f, until - Duration::from_millis(1), 0);
     assert_eq!(peers.calls.borrow().len(), 2);
     assert_eq!(candidates.notices.borrow().len(), 2);
     // The block ends: one probe offer, delivered; the other stays held
     // behind it, then goes on its first try.
     peers.reply(&ordered[0], Reply::Miss);
-    let open = start + NOTICE_DELAYS[1] + Duration::from_millis(1);
+    let open = until + Duration::from_millis(1);
     poll(&mut f, open, 1);
     assert_eq!(peers.calls.borrow().len(), 3);
     assert_eq!(candidates.notices.borrow().len(), 1);
