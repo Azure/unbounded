@@ -2744,7 +2744,6 @@ pub(crate) mod tests {
         fn saturated_rail_journal_still_persists_and_enrolls_known_ports() {
             use crate::rdma::MAX_JOURNAL_BYTES;
             use racer_wire::control::RailId;
-            use racer_wire::control::RailMapping;
             let env = racer_io::Env::host();
             let Some(r) = testing::reactor(&env) else {
                 return;
@@ -2755,27 +2754,42 @@ pub(crate) mod tests {
             use rdma_verbs::simulation::Device;
             use rdma_verbs::simulation::Simulation;
             let name = |i| format!("{i:04}{}", "x".repeat(59));
-            for batch in 0..20 {
-                inventory
-                    .update(
-                        (batch * 64..(batch + 1) * 64)
-                            .map(|i| RailMapping {
-                                device: name(i),
-                                port: 1,
-                                rail: RailId(0),
-                                gid: Some([1; 16]),
-                                numa_node: None,
-                            })
-                            .collect(),
-                    )
-                    .unwrap();
-                assert!(inventory.reservations().unwrap().len() <= MAX_JOURNAL_BYTES);
+            // Hot-plug reuses withdrawn rails, so only a restored journal
+            // can sit at the byte bound.
+            let mut bytes = 0;
+            let mut rails: Vec<_> = (0..1024)
+                .map(|i| (name(i), 1u8, i as u16))
+                .take_while(|e| {
+                    bytes += serde_json::to_vec(e).unwrap().len() + 1;
+                    bytes + 40 < MAX_JOURNAL_BYTES
+                })
+                .collect();
+            // Top up with a shorter name so a longer replacement cannot fit.
+            let encoded =
+                |rails: &Vec<(String, u8, u16)>| serde_json::to_vec(rails).unwrap().len() + 22;
+            for len in (1..=63).rev() {
+                let mut topped = rails.clone();
+                topped.push(("y".repeat(len), 1u8, rails.len() as u16));
+                if encoded(&topped) <= MAX_JOURNAL_BYTES {
+                    rails = topped;
+                    break;
+                }
             }
+            inventory
+                .restore(
+                    format!(
+                        r#"{{"version":2,"rails":{}}}"#,
+                        serde_json::to_string(&rails).unwrap()
+                    )
+                    .as_bytes(),
+                )
+                .unwrap();
+            assert!(inventory.reservations().unwrap().len() <= MAX_JOURNAL_BYTES);
             let expected_journal = inventory.reservations().unwrap();
             let sim = Simulation::new()
                 .with_devices(vec![
                     Device::new(name(0), [2; 16]),
-                    Device::new(name(2000), [3; 16]),
+                    Device::new(format!("2000{}", "\"".repeat(59)), [3; 16]),
                 ])
                 .unwrap();
             let _devices = sim.enter();

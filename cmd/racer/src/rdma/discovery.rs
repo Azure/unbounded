@@ -39,8 +39,16 @@ pub struct Snapshot {
 }
 
 /// One process-wide inventory, shared by enrollment and every worker.
-/// Withdrawn ports keep their rail reservation: neither outages nor GID
-/// changes renumber surviving ports. Enrollment persists reservations across
+///
+/// A rail is reserved for a stable hardware key: the port's PCI address and
+/// port number when sysfs reports one, else its device name and port. A
+/// device renamed by a VF hot-unplug/replug (for example `mana_0` becoming
+/// `roceP30832p0s0` at the same PCI address) therefore keeps its rail. A
+/// withdrawn port keeps its reservation until a new port needs a rail; the
+/// new port then takes the lowest rail whose port is absent, so a replaced
+/// device reuses its predecessor's rail instead of growing the rail space.
+/// On a node with no journal, rails follow PCI/port order, so homogeneous
+/// nodes agree on what rail N means. Enrollment persists reservations across
 /// process restarts.
 #[derive(Default)]
 pub struct Inventory {
@@ -50,13 +58,43 @@ pub struct Inventory {
     generation: AtomicU64,
 }
 
-/// Reservations include withdrawn ports so rails are never recycled.
+/// Journal format version written by [`Inventory::reservations`].
+const JOURNAL_VERSION: u32 = 2;
+
+/// Prefix of a PCI-address hardware key.
+const PCI_KEY_PREFIX: &str = "pci:";
+
+/// The durable journal: `rails[i]` is `(key, port, i)`.
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Journal {
+    version: u32,
+    rails: Vec<(String, u8, u16)>,
+}
+
+/// Reservations include withdrawn ports until a replacement needs the rail.
 #[derive(Default)]
 struct InventoryState {
-    /// `(device, port, rail)`; rail `i` is entry `i`.
+    /// `(key, port, rail)`; rail `i` is entry `i`.
     assigned: Vec<(String, u8, u16)>,
 
     snapshot: Snapshot,
+}
+
+/// The hardware key for a port: `pci:<bdf>` when known, else the device name.
+fn hardware_key(device: &str, pci: Option<&str>) -> String {
+    match pci {
+        Some(bdf) => format!("{PCI_KEY_PREFIX}{bdf}"),
+        None => device.to_owned(),
+    }
+}
+
+/// True if `key` is a device name or a `pci:` key with a safe address.
+fn valid_key(key: &str) -> bool {
+    match key.strip_prefix(PCI_KEY_PREFIX) {
+        Some(bdf) => valid_device(bdf),
+        None => valid_device(key),
+    }
 }
 
 impl Inventory {
@@ -77,85 +115,117 @@ impl Inventory {
     /// Discover ports and publish them. Discovery failures withdraw RDMA,
     /// not HTTP service.
     pub fn refresh(&self) -> Result<Snapshot> {
-        self.update(inventory())
+        self.update_keyed(keyed_inventory())
     }
 
-    /// Publish available ports, reserving bounded, permanent rails for new
-    /// ones. Invalid input withdraws every port without erasing existing
-    /// reservations. A port that would overflow the journal is dropped.
-    pub fn update(&self, mut nics: Vec<RailMapping>) -> Result<Snapshot> {
+    /// [`Self::update_keyed`] keyed by device name alone.
+    pub fn update(&self, nics: Vec<RailMapping>) -> Result<Snapshot> {
+        self.update_keyed(nics.into_iter().map(|n| (n, None)).collect())
+    }
+
+    /// Publish available ports with their PCI addresses, reserving bounded
+    /// rails for new ones. Invalid input withdraws every port without
+    /// erasing existing reservations. A port that would overflow the journal
+    /// is dropped.
+    pub fn update_keyed(&self, mut nics: Vec<(RailMapping, Option<String>)>) -> Result<Snapshot> {
         let mut state = self.lock()?;
         let mut seen = std::collections::BTreeSet::new();
+        let mut keys = std::collections::BTreeSet::new();
         if nics.len() > MAX_PORTS
-            || nics.iter().any(|n| {
-                n.port == 0 || !valid_device(&n.device) || !seen.insert((n.device.clone(), n.port))
+            || nics.iter().any(|(n, pci)| {
+                n.port == 0
+                    || !valid_device(&n.device)
+                    || pci.as_deref().is_some_and(|p| !valid_device(p))
+                    || !seen.insert((n.device.clone(), n.port))
+                    || !keys.insert((hardware_key(&n.device, pci.as_deref()), n.port))
             })
         {
             nics.clear();
+            keys.clear();
         }
-        let mut encoded_bytes = serde_json::to_vec(&state.assigned)
-            .map_err(|_| Error::InvalidConfiguration)?
-            .len();
-        nics.retain_mut(|nic| {
-            let rail = state
+        let mut published = Vec::with_capacity(nics.len());
+        for (mut nic, pci) in nics {
+            let key = hardware_key(&nic.device, pci.as_deref());
+            let known = state
                 .assigned
                 .iter()
-                .find(|(d, p, _)| *d == nic.device && *p == nic.port)
+                .find(|(k, p, _)| *k == key && *p == nic.port)
                 .map(|(_, _, r)| *r);
-            let rail = match rail {
+            let rail = match known {
                 Some(rail) => rail,
-                None if state.assigned.len() < MAX_RAILS => {
-                    let rail = state.assigned.len() as u16;
-                    // Include JSON escaping and the comma before reserving a rail.
-                    let Ok(entry) = serde_json::to_vec(&(&nic.device, nic.port, rail)) else {
-                        return false;
+                None => {
+                    // Reuse the lowest rail whose port is absent, else append.
+                    let reusable = state
+                        .assigned
+                        .iter()
+                        .find(|(k, p, _)| !keys.contains(&(k.clone(), *p)))
+                        .map(|(_, _, r)| *r);
+                    let rail = match reusable {
+                        Some(rail) => rail,
+                        None if state.assigned.len() < MAX_RAILS => state.assigned.len() as u16,
+                        None => continue,
                     };
-                    let added = entry.len() + usize::from(!state.assigned.is_empty());
-                    if added > MAX_JOURNAL_BYTES.saturating_sub(encoded_bytes) {
-                        return false;
+                    let index = usize::from(rail);
+                    let reservation = (key, nic.port, rail);
+                    let previous = if index < state.assigned.len() {
+                        Some(std::mem::replace(&mut state.assigned[index], reservation))
+                    } else {
+                        state.assigned.push(reservation);
+                        None
+                    };
+                    // Keep the encoded journal within bounds, or undo.
+                    if journal_bytes(&state.assigned).map_or(true, |b| b.len() > MAX_JOURNAL_BYTES)
+                    {
+                        match previous {
+                            Some(old) => state.assigned[index] = old,
+                            None => drop(state.assigned.pop()),
+                        }
+                        continue;
                     }
-                    encoded_bytes += added;
-                    state.assigned.push((nic.device.clone(), nic.port, rail));
                     rail
                 }
-                None => return false,
             };
             nic.rail = RailId(rail);
-            true
-        });
-        nics.sort_by_key(|n| n.rail);
-        if state.snapshot.generation == 0 || state.snapshot.nics != nics {
+            published.push(nic);
+        }
+        published.sort_by_key(|n| n.rail);
+        if state.snapshot.generation == 0 || state.snapshot.nics != published {
             state.snapshot.generation += 1;
-            state.snapshot.nics = nics;
+            state.snapshot.nics = published;
         }
         self.generation
             .store(state.snapshot.generation, Ordering::Release);
         Ok(state.snapshot.clone())
     }
 
-    /// The reservations as a JSON array of `[device, port, rail]` tuples.
+    /// The reservations as a versioned JSON journal of `[key, port, rail]`
+    /// tuples, where `key` is `pci:<address>` or a device name.
     pub fn reservations(&self) -> Result<Vec<u8>> {
-        serde_json::to_vec(&self.lock()?.assigned).map_err(|_| Error::InvalidConfiguration)
+        journal_bytes(&self.lock()?.assigned)
     }
 
     /// Restore reservations before issuing rails. A malformed journal is
     /// `CorruptRecord` and leaves existing state intact: a corrupt journal is
-    /// never discarded and renumbered.
+    /// never discarded and renumbered. A legacy (version 1) journal, a bare
+    /// array keyed by device name, is discarded: its names do not survive
+    /// device renames and may have drifted from other nodes, so rails are
+    /// renumbered from PCI/port order.
     pub fn restore(&self, bytes: &[u8]) -> Result<()> {
         if bytes.len() > MAX_JOURNAL_BYTES {
             return Err(Error::CorruptRecord);
         }
-        let assigned: Vec<(String, u8, u16)> =
-            serde_json::from_slice(bytes).map_err(|_| Error::CorruptRecord)?;
-        let mut seen = std::collections::BTreeSet::new();
-        if assigned.len() > MAX_RAILS
-            || assigned.iter().enumerate().any(|(i, (d, p, r))| {
-                !valid_device(d) || *p == 0 || usize::from(*r) != i || !seen.insert((d, p))
-            })
-        {
-            return Err(Error::CorruptRecord);
-        }
-        if serde_json::to_vec(&assigned)
+        let assigned = match serde_json::from_slice::<Journal>(bytes) {
+            Ok(journal) if journal.version == JOURNAL_VERSION => journal.rails,
+            Ok(_) => return Err(Error::CorruptRecord),
+            Err(_) => {
+                let legacy: Vec<(String, u8, u16)> =
+                    serde_json::from_slice(bytes).map_err(|_| Error::CorruptRecord)?;
+                validate(&legacy)?;
+                Vec::new()
+            }
+        };
+        validate(&assigned)?;
+        if journal_bytes(&assigned)
             .map_err(|_| Error::CorruptRecord)?
             .len()
             > MAX_JOURNAL_BYTES
@@ -172,27 +242,72 @@ impl Inventory {
     }
 }
 
+/// Reject a journal with an invalid key or port, a gap, or a duplicate.
+fn validate(assigned: &[(String, u8, u16)]) -> Result<()> {
+    let mut seen = std::collections::BTreeSet::new();
+    if assigned.len() > MAX_RAILS
+        || assigned.iter().enumerate().any(|(i, (k, p, r))| {
+            !valid_key(k) || *p == 0 || usize::from(*r) != i || !seen.insert((k, p))
+        })
+    {
+        return Err(Error::CorruptRecord);
+    }
+    Ok(())
+}
+
+/// Encode the versioned journal.
+fn journal_bytes(assigned: &[(String, u8, u16)]) -> Result<Vec<u8>> {
+    serde_json::to_vec(&Journal {
+        version: JOURNAL_VERSION,
+        rails: assigned.to_vec(),
+    })
+    .map_err(|_| Error::InvalidConfiguration)
+}
+
 /// Discovered ports with sequential provisional rails. Discovery failures
 /// are optional-transport failures, never HTTP startup failures.
 pub fn inventory() -> Vec<RailMapping> {
-    inventory_at(
+    keyed_inventory().into_iter().map(|(n, _)| n).collect()
+}
+
+/// [`inventory`] with each port's PCI address, when sysfs reports one.
+fn keyed_inventory() -> Vec<(RailMapping, Option<String>)> {
+    inventory_keyed_at(
         rdma_verbs::inventory().unwrap_or_default(),
         Path::new("/sys/class/infiniband"),
     )
 }
 
 /// [`inventory`] over `ports`, reading PCI and NUMA info under `root`.
+#[cfg(test)]
 pub(crate) fn inventory_at(ports: Vec<PortInfo>, root: &Path) -> Vec<RailMapping> {
+    inventory_keyed_at(ports, root)
+        .into_iter()
+        .map(|(n, _)| n)
+        .collect()
+}
+
+/// [`inventory_at`] with each port's PCI address, when sysfs reports one.
+pub(crate) fn inventory_keyed_at(
+    ports: Vec<PortInfo>,
+    root: &Path,
+) -> Vec<(RailMapping, Option<String>)> {
     rdma_verbs::discovery::inventory_at(ports, root)
         .into_iter()
         .take(MAX_PORTS)
         .enumerate()
-        .map(|(i, p)| RailMapping {
-            device: p.device,
-            port: p.port,
-            rail: RailId(i as u16),
-            gid: Some(p.gid),
-            numa_node: p.numa_node,
+        .map(|(i, p)| {
+            let pci = std::fs::canonicalize(root.join(&p.device).join("device"))
+                .ok()
+                .and_then(|p| p.file_name().map(|s| s.to_string_lossy().into_owned()));
+            let nic = RailMapping {
+                device: p.device,
+                port: p.port,
+                rail: RailId(i as u16),
+                gid: Some(p.gid),
+                numa_node: p.numa_node,
+            };
+            (nic, pci)
         })
         .collect()
 }
@@ -342,12 +457,16 @@ mod tests {
             .update(vec![nic("a", 9, None), nic("b", 9, None)])
             .unwrap();
         let journal = inventory.reservations().unwrap();
-        assert_eq!(journal, br#"[["a",1,0],["b",1,1]]"#);
+        assert_eq!(journal, br#"{"version":2,"rails":[["a",1,0],["b",1,1]]}"#);
         let generation = inventory.snapshot().unwrap().generation;
         for invalid in [
             b"bad".as_slice(),
             br#"[["a",1,1]]"#,
             br#"[["a",1,0],["a",1,1]]"#,
+            br#"{"version":2,"rails":[["a",1,1]]}"#,
+            br#"{"version":3,"rails":[]}"#,
+            br#"{"version":2,"rails":[["pci:",1,0]]}"#,
+            br#"{"version":2,"rails":[],"extra":1}"#,
         ] {
             assert_eq!(inventory.restore(invalid), Err(Error::CorruptRecord));
             assert_eq!(inventory.reservations().unwrap(), journal);
@@ -394,5 +513,107 @@ mod tests {
             Err(Error::Unavailable)
         );
         assert_eq!(match_publication(&duplicate, &[]), Err(Error::Unavailable));
+    }
+
+    /// A keyed port at `pci` with a distinct GID.
+    fn keyed(device: &str, pci: &str) -> (RailMapping, Option<String>) {
+        (nic(device, 0, None), Some(pci.into()))
+    }
+
+    fn rails(snapshot: &Snapshot) -> Vec<(String, u16)> {
+        snapshot
+            .nics
+            .iter()
+            .map(|n| (n.device.clone(), n.rail.0))
+            .collect()
+    }
+
+    #[test]
+    /// A VF hot-replug that renames the device at the same PCI address keeps
+    /// its rail, in process and across a restart.
+    fn renamed_device_keeps_rail() {
+        let inventory = Inventory::default();
+        inventory
+            .update_keyed(vec![keyed("mana_0", "7870:00:00.0")])
+            .unwrap();
+        inventory.update_keyed(vec![]).unwrap();
+        let renamed = inventory
+            .update_keyed(vec![keyed("roceP30832p0s0", "7870:00:00.0")])
+            .unwrap();
+        assert_eq!(rails(&renamed), vec![("roceP30832p0s0".into(), 0)]);
+        let journal = inventory.reservations().unwrap();
+        assert_eq!(
+            journal,
+            br#"{"version":2,"rails":[["pci:7870:00:00.0",1,0]]}"#
+        );
+        let restarted = Inventory::default();
+        restarted.restore(&journal).unwrap();
+        let snapshot = restarted
+            .update_keyed(vec![keyed("mana_0", "7870:00:00.0")])
+            .unwrap();
+        assert_eq!(rails(&snapshot), vec![("mana_0".into(), 0)]);
+    }
+
+    #[test]
+    /// A replacement at a new address reuses the withdrawn port's rail;
+    /// present ports keep theirs.
+    fn replaced_device_reuses_rail() {
+        let inventory = Inventory::default();
+        inventory
+            .update_keyed(vec![keyed("a", "0000:01:00.0"), keyed("b", "0000:02:00.0")])
+            .unwrap();
+        let replaced = inventory
+            .update_keyed(vec![keyed("b", "0000:02:00.0"), keyed("c", "0000:09:00.0")])
+            .unwrap();
+        assert_eq!(rails(&replaced), vec![("c".into(), 0), ("b".into(), 1)]);
+        let journal: serde_json::Value =
+            serde_json::from_slice(&inventory.reservations().unwrap()).unwrap();
+        assert_eq!(journal["rails"].as_array().unwrap().len(), 2);
+    }
+
+    #[test]
+    /// Nodes with the same hardware publish the same rails regardless of
+    /// journal history, and a drifted legacy journal self-corrects.
+    fn homogeneous_nodes_agree_and_legacy_journal_self_corrects() {
+        let fresh = Inventory::default();
+        let hardware = vec![keyed("roceP30832p0s0", "7870:00:00.0")];
+        let expected = rails(&fresh.update_keyed(hardware.clone()).unwrap());
+        assert_eq!(expected, vec![("roceP30832p0s0".into(), 0)]);
+        // The live drift: the old name holds rail 0, the new name rail 1.
+        let drifted = Inventory::default();
+        drifted
+            .restore(br#"[["mana_0",1,0],["roceP30832p0s0",1,1]]"#)
+            .unwrap();
+        assert_eq!(rails(&drifted.update_keyed(hardware).unwrap()), expected);
+        assert_eq!(
+            drifted.reservations().unwrap(),
+            fresh.reservations().unwrap()
+        );
+        // A renamed node with a version 2 journal also agrees.
+        let renamed = Inventory::default();
+        renamed
+            .restore(br#"{"version":2,"rails":[["pci:7870:00:00.0",1,0]]}"#)
+            .unwrap();
+        let snapshot = renamed
+            .update_keyed(vec![keyed("mana_0", "7870:00:00.0")])
+            .unwrap();
+        assert_eq!(snapshot.nics[0].rail, RailId(0));
+    }
+
+    #[test]
+    /// Two names at one PCI address and port are ambiguous and withdraw.
+    fn duplicate_hardware_keys_withdraw() {
+        let inventory = Inventory::default();
+        let snapshot = inventory
+            .update_keyed(vec![keyed("a", "0000:01:00.0"), keyed("b", "0000:01:00.0")])
+            .unwrap();
+        assert!(snapshot.nics.is_empty());
+        assert!(
+            inventory
+                .update_keyed(vec![keyed("a", "../x")])
+                .unwrap()
+                .nics
+                .is_empty()
+        );
     }
 }

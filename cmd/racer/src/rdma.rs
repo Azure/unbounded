@@ -527,26 +527,49 @@ pub(crate) mod tests {
                     gid: Some([1; 16]),
                     numa_node: None,
                 };
-                let mut accepted = 0;
+                // Replacement batches reuse withdrawn rails instead of growing.
                 for batch in 0..20 {
                     let snapshot = inventory
                         .update((batch * 64..(batch + 1) * 64).map(nic).collect())
                         .unwrap();
-                    accepted += snapshot.nics.len();
+                    assert_eq!(snapshot.nics.len(), 64);
+                    assert_eq!(snapshot.nics.last().unwrap().rail, RailId(63));
                     assert!(inventory.reservations().unwrap().len() <= MAX_JOURNAL_BYTES);
                 }
-                assert!(
-                    accepted > 0 && accepted < 1024,
-                    "byte bound must precede identity cap"
-                );
-                let journal = inventory.reservations().unwrap();
-                assert!(inventory.update(vec![nic(2000)]).unwrap().nics.is_empty());
-                assert_eq!(inventory.reservations().unwrap(), journal);
+                // A journal restored at saturation admits only known ports.
+                let mut bytes = 0;
+                let mut rails: Vec<_> = (0..1024)
+                    .map(|i| (format!("{i:04}{}", "x".repeat(59)), 255u8, i as u16))
+                    .take_while(|e| {
+                        bytes += serde_json::to_vec(e).unwrap().len() + 1;
+                        bytes + 40 < MAX_JOURNAL_BYTES
+                    })
+                    .collect();
+                // Top up with a shorter name so a longer replacement cannot fit.
+                let encoded =
+                    |rails: &Vec<(String, u8, u16)>| serde_json::to_vec(rails).unwrap().len() + 22;
+                for len in (1..=63).rev() {
+                    let mut topped = rails.clone();
+                    topped.push(("y".repeat(len), 255u8, rails.len() as u16));
+                    if encoded(&topped) <= MAX_JOURNAL_BYTES {
+                        rails = topped;
+                        break;
+                    }
+                }
+                let journal = format!(
+                    r#"{{"version":2,"rails":{}}}"#,
+                    serde_json::to_string(&rails).unwrap()
+                )
+                .into_bytes();
                 let restarted = Inventory::default();
                 restarted.restore(&journal).unwrap();
+                // An escaped name encodes longer than the rail it would reuse.
+                let mut longer = nic(2000);
+                longer.device = format!("2000{}", "\"".repeat(59));
                 let mut old = nic(0);
+                old.device = format!("0000{}", "x".repeat(59));
                 old.gid = Some([2; 16]);
-                let snapshot = restarted.update(vec![nic(2000), old]).unwrap();
+                let snapshot = restarted.update(vec![longer, old]).unwrap();
                 assert_eq!(snapshot.nics.len(), 1);
                 assert_eq!(snapshot.nics[0].rail, RailId(0));
                 assert_eq!(snapshot.nics[0].gid, Some([2; 16]));
@@ -623,10 +646,14 @@ pub(crate) mod tests {
             let journal = inventory.reservations().unwrap();
             let restarted = Inventory::default();
             restarted.restore(&journal).unwrap();
+            // The new port "c" reuses absent "a"'s rail rather than growing.
             let next = restarted.update(vec![nic("b", 3), nic("c", 4)]).unwrap();
             assert_eq!(
-                next.nics.iter().map(|n| n.rail).collect::<Vec<_>>(),
-                vec![RailId(1), RailId(2)]
+                next.nics
+                    .iter()
+                    .map(|n| (n.device.as_str(), n.rail))
+                    .collect::<Vec<_>>(),
+                vec![("c", RailId(0)), ("b", RailId(1))]
             );
             assert_eq!(
                 restarted.update(vec![nic("a", 5)]).unwrap().nics[0].rail,

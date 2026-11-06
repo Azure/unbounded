@@ -1820,8 +1820,15 @@ on the node's IPv4 address:
 `[]` disables eligibility; a list overrides automatic rails. Discovery cannot infer cabling
 or correct asymmetric initial inventories: use explicit mappings when ordinals do not match.
 
-The private identity directory's `rdma-rails.json` preserves physical-port reservations
-across renewal/restart: missing ports retain rails; new ports append. Do not delete it
+The private identity directory's `rdma-rails.json` (on the host,
+`/var/lib/racer/identity/rdma-rails.json`) preserves physical-port reservations across
+renewal/restart. A port is identified by its PCI address and port number, or by its device
+name when sysfs reports no PCI address, so a device renamed by a VF hot-unplug/replug (for
+example `mana_0` becoming `roceP30832p0s0`) keeps its rail. Missing ports retain their rails
+until a new port appears; the new port then takes the lowest rail whose port is missing, so
+a replaced device reuses its predecessor's rail. Ports with no reservation append. The
+journal is versioned; a legacy unversioned journal, which was keyed by device name, is
+discarded on start and rails are renumbered in PCI BDF/port order. Do not delete it
 independently of coordinated topology changes. Corruption fails enrollment instead of renumbering rails.
 
 Dataplanes run privileged as root with escalation allowed and a read-only root filesystem.
