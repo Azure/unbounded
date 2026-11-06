@@ -106,6 +106,12 @@ pub struct RequestScope {
     pub(crate) body_deadlines: Option<(Instant, Instant)>,
     /// Time source for deadline and candidate timer checks.
     pub(crate) clock: racer_io::Clock,
+    /// The work serves a read page past its window's head. Such work may take
+    /// plaintext only while a page stays free for heads (see
+    /// [`crate::read::Fill`]), and it never waits for plaintext, so ready pages
+    /// held behind heads cannot use up a worker's share while the heads wait.
+    /// Children inherit it.
+    pub(crate) ahead: bool,
 }
 impl RequestScope {
     /// The scope's clock.
@@ -218,6 +224,7 @@ impl RequestScope {
             cancellation: Cancellation::new()?,
             body_deadlines: None,
             clock,
+            ahead: false,
         })
     }
 
@@ -246,7 +253,9 @@ impl RequestScope {
     /// A new scope for `request` with its own cancellation, on this scope's
     /// clock.
     pub fn child(&self, request: RequestId, deadline: Instant) -> Result<Self> {
-        Self::with_clock(request, deadline, self.clock.clone())
+        let mut child = Self::with_clock(request, deadline, self.clock.clone())?;
+        child.ahead = self.ahead;
+        Ok(child)
     }
 
     /// Test support: a scope on the host clock.

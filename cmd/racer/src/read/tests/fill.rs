@@ -1524,6 +1524,96 @@ fn plaintext_wait_grows_to_its_ceiling_with_jitter() {
     assert!(spread.len() > 32);
 }
 
+/// Work for a page past its window's head takes plaintext only while one more
+/// page stays free, and never waits for it; a head may take the last page and
+/// still waits. Without that spare page, ready pages behind waiting heads could
+/// fill a worker's share and stall every head on it until request deadlines.
+#[test]
+fn ahead_plaintext_keeps_a_page_free_for_heads_and_never_waits() {
+    let clock = racer_io::SimClock::new(917);
+    let sim_env = clock.ctx(0);
+    let env = racer_io::Env::new(racer_io::Driver::Uring, sim_env.clone());
+    let page = PAGE_BYTES as usize;
+    let mut limits = crate::test_support::cluster::config(false).limits;
+    limits.plaintext_bytes = std::num::NonZeroUsize::new(4 * page).unwrap();
+    let f = fixture_with(&env, 3, Some(limits));
+    let fill = f.fill.clone().with_plaintext_wait(f.reactor.clone());
+    let admission = &fill.dependencies.admission;
+    let cache = &f.context.object.cache;
+    let head = RequestScope::on(
+        &sim_env.clock,
+        f.scope.request,
+        sim_env.clock.now() + Duration::from_secs(60),
+    )
+    .unwrap();
+    let mut ahead = head.clone();
+    ahead.ahead = true;
+    // Children (a flight's owned scope) keep the mark.
+    let child = ahead
+        .child(ahead.request, sim_env.clock.now() + Duration::from_secs(1))
+        .unwrap();
+    assert!(child.ahead);
+    assert!(!head.child(head.request, sim_env.clock.now()).unwrap().ahead);
+    let mut cx = Context::from_waker(futures::task::noop_waker_ref());
+    let mut reserve = |scope: &RequestScope| {
+        let mut op = Box::pin(fill.reserve_network_plaintext(scope, &f.page));
+        match op.as_mut().poll(&mut cx) {
+            Poll::Ready(result) => Some(result),
+            Poll::Pending => None,
+        }
+    };
+    // Two pages free: an ahead page fits and leaves one.
+    let first = admission
+        .reserve(Some(cache), ResourceClass::Plaintext, 2 * page)
+        .unwrap();
+    let taken = reserve(&ahead).unwrap().unwrap();
+    assert_eq!(taken.amount(), page);
+    assert_eq!(fill.metrics.count(Event::AheadPlaintextDeferred), 0);
+    // One page free: an ahead page is refused at once, without waiting, and
+    // without taking anything.
+    assert!(matches!(reserve(&ahead), Some(Err(Error::Overloaded))));
+    assert_eq!(fill.metrics.count(Event::AheadPlaintextDeferred), 1);
+    assert_eq!(admission.used(ResourceClass::Plaintext), 3 * page);
+    // The same check guards the other plaintext sites.
+    let observed = fill.observe_reservation(
+        &ahead,
+        &f.page,
+        crate::telemetry::FillAdmissionSite::LocalPlaintext,
+        || -> Result<()> { panic!("an ahead page must not reserve the last page") },
+    );
+    assert_eq!(observed, Err(Error::Overloaded));
+    // Ciphertext sites are not plaintext and are not checked here.
+    assert_eq!(
+        fill.observe_reservation(
+            &ahead,
+            &f.page,
+            crate::telemetry::FillAdmissionSite::OriginCiphertext,
+            || Ok(7),
+        ),
+        Ok(7)
+    );
+    // A head takes the last page.
+    let last = reserve(&head).unwrap().unwrap();
+    assert_eq!(admission.used(ResourceClass::Plaintext), 4 * page);
+    // With the share full a head waits for a release instead.
+    assert!(reserve(&head).is_none());
+    assert!(matches!(reserve(&ahead), Some(Err(Error::Overloaded))));
+    drop((first, taken, last));
+    // A share of one page never admits ahead work; heads still progress.
+    let mut tiny = crate::test_support::cluster::config(false).limits;
+    tiny.plaintext_bytes = std::num::NonZeroUsize::new(page).unwrap();
+    let f = fixture_with(&env, 3, Some(tiny));
+    let mut ahead = head.clone();
+    ahead.ahead = true;
+    let mut op = Box::pin(f.fill.reserve_network_plaintext(&ahead, &f.page));
+    assert!(matches!(
+        op.as_mut().poll(&mut cx),
+        Poll::Ready(Err(Error::Overloaded))
+    ));
+    let mut op = Box::pin(f.fill.reserve_network_plaintext(&head, &f.page));
+    assert!(matches!(op.as_mut().poll(&mut cx), Poll::Ready(Ok(_))));
+}
+
 #[test]
 fn network_plaintext_waits_for_a_release_until_its_scope_ends() {
     for mode in ["release", "deadline", "cancel"] {

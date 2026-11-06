@@ -401,6 +401,7 @@ metrics! { Event, EVENTS, EVENT_COUNT;
             Self::SilencePeerSilent => "racer_silence_peers_silent_total",
             Self::GpuDirectJoined => "racer_gpu_direct_joined_total",
             Self::PassthroughLocalOrigin => "racer_passthrough_local_origin_fills_total",
+            Self::AheadPlaintextDeferred => "racer_ahead_plaintext_deferred_total",
             Self::GpuReadGpu => "racer_gpu_read_requests_total" { "outcome=\"gpu\"" },
             Self::GpuReadNotEnabled => "racer_gpu_read_requests_total" { "outcome=\"not_enabled\"" },
             Self::GpuReadWrongDevice => "racer_gpu_read_requests_total" { "outcome=\"wrong_device\"" },

@@ -596,6 +596,20 @@ pub(crate) enum FillAdmissionSite {
     OriginPlaintext,
     ResponsePlaintext,
 }
+impl FillAdmissionSite {
+    /// The site reserves plaintext.
+    pub(crate) fn plaintext(self) -> bool {
+        matches!(
+            self,
+            Self::RetainedPlaintext
+                | Self::SelectedPlaintext
+                | Self::LocalPlaintext
+                | Self::NetworkPlaintext
+                | Self::OriginPlaintext
+                | Self::ResponsePlaintext
+        )
+    }
+}
 #[derive(Clone, Copy)]
 struct ProtectedFailure {
     worker: WorkerId,

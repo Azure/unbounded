@@ -974,6 +974,14 @@ impl RangeStream {
         }
     }
 
+    /// Whether `number` is past the window's head: its plaintext would wait
+    /// behind the head for delivery (see [`RequestScope::ahead`]).
+    fn ahead(&self, number: PageNumber) -> bool {
+        self.window
+            .as_ref()
+            .is_some_and(|window| number.0 > window.cursor())
+    }
+
     fn page_id(&self, number: PageNumber) -> PageId {
         PageId {
             version: self.metadata.version.clone(),
@@ -994,7 +1002,8 @@ impl RangeStream {
     ) -> Operation<'static, Option<PageResult>> {
         let page = self.page_id(number);
         let directory = self.directory.clone();
-        let scope = scope.clone();
+        let mut scope = scope.clone();
+        scope.ahead = self.ahead(number);
         match from {
             win::ProbeFrom::Memory if self.sealed.is_some() => {
                 Box::pin(async move { directory.cached_page(page, &scope).await })
@@ -1033,6 +1042,7 @@ impl RangeStream {
     ) {
         let mut child_scope = scope.clone();
         child_scope.deadline.0 = budget.deadline();
+        child_scope.ahead = self.ahead(number);
         let reactor = self.delivery.reactor().clone();
         let page = self.page_id(number);
         let io = match &self.sealed {
@@ -2095,6 +2105,44 @@ pub(super) mod tests {
             assert_eq!(reader.slice().page, PageNumber(number));
         }
         assert_eq!(admission.used(ResourceClass::Ciphertext), 0);
+    }
+
+    /// Only work for the window's head may wait for plaintext; pages past it are
+    /// marked ahead (see [`RequestScope::ahead`]), and the mark moves with the
+    /// head as pages are delivered.
+    #[test]
+    fn pages_past_the_window_head_are_ahead() {
+        let env = racer_io::Env::host();
+        let f = Fixture::new(&env, crate::test_support::cluster::config(false).limits, 4);
+        let admission = &f.admission;
+        let mut metadata = metadata();
+        metadata.length = 3 * PAGE_BYTES;
+        let range = ByteRange::Closed {
+            first: 0,
+            last: 3 * PAGE_BYTES - 1,
+        }
+        .resolve(metadata.length)
+        .unwrap();
+        let scope =
+            RequestScope::host(RequestId([8; 16]), Instant::now() + Duration::from_secs(60))
+                .unwrap();
+        let mut stream = f.open(&metadata, range, scope);
+        stream.configure_subscription(4, 4 * PAGE_BYTES).unwrap();
+        // No window yet: nothing is ahead.
+        assert!(!stream.ahead(PageNumber(1)));
+        for number in 0..3 {
+            let page = page_result(admission, &metadata, number);
+            stream.inject(TestSlot::Fetching(Box::pin(async move { Ok(page) })));
+        }
+        assert!(!stream.ahead(PageNumber(0)));
+        assert!(stream.ahead(PageNumber(1)));
+        assert!(stream.ahead(PageNumber(2)));
+        let reader = futures::executor::block_on(stream.next_slice())
+            .unwrap()
+            .unwrap();
+        assert_eq!(reader.slice().page, PageNumber(0));
+        assert!(!stream.ahead(PageNumber(1)));
+        assert!(stream.ahead(PageNumber(2)));
     }
 
     /// A filled page for another page number fails its slot instead of being held.

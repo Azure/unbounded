@@ -757,6 +757,8 @@ impl Fill {
         let mut waits: u8 = 0;
         loop {
             scope.check()?;
+            // Work ahead of a head never waits here; the window retries it.
+            self.ahead_headroom(scope, cache)?;
             let (mut result, mut detail) =
                 crate::admission::capture_rejection(admission, &mut reserve);
             if !matches!(result, Err(Error::Overloaded)) {
@@ -806,6 +808,40 @@ impl Fill {
         }
     }
 
+    /// Refuse plaintext to work for a page past its window's head (see
+    /// [`RequestScope::ahead`]) unless one more page stays free after it, in both
+    /// this worker's plaintext total and the cache's share. Window pages hold
+    /// their plaintext until the head before them is delivered, and a head's
+    /// fill waits for plaintext. Without this spare page, ready pages behind
+    /// waiting heads can fill the share, and every head on the worker then waits
+    /// for the others until a request deadline frees their pages. With it, the
+    /// last free page always goes to a head, which completes and moves its
+    /// window on. `Overloaded` makes the window retry the page after a backoff,
+    /// by then possibly as a head.
+    pub(super) fn ahead_headroom(
+        &self,
+        scope: &RequestScope,
+        cache: &racer_wire::control::CacheId,
+    ) -> Result<()> {
+        if !scope.ahead {
+            return Ok(());
+        }
+        let page = self.page_plaintext_bytes()?;
+        let admission = &self.dependencies.admission;
+        let class = ResourceClass::Plaintext;
+        let need = page.saturating_mul(2);
+        // `reclamation` is None both when `need` fits and when it never fits.
+        let fits = need <= admission.limit(class)
+            && need <= admission.fair_limit(cache, class)
+            && admission.reclamation(cache, class, need).is_none();
+        if fits {
+            Ok(())
+        } else {
+            self.metrics.record(Event::AheadPlaintextDeferred, 1);
+            Err(Error::Overloaded)
+        }
+    }
+
     /// Observe mandatory acquisition only, never optional persistence or hedges.
     pub(super) fn observe_reservation<T>(
         &self,
@@ -814,6 +850,9 @@ impl Fill {
         site: FillAdmissionSite,
         operation: impl FnOnce() -> Result<T>,
     ) -> Result<T> {
+        if site.plaintext() {
+            self.ahead_headroom(scope, &page.version.object.cache)?;
+        }
         let (result, detail) =
             crate::admission::capture_rejection(&self.dependencies.admission, operation);
         if matches!(result, Err(Error::Overloaded)) {
