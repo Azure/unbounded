@@ -154,9 +154,10 @@ const IDLE_EVENTS: usize = 2 * STREAMS + 4;
 /// Shortest and longest nap between fence polls while pages are in flight.
 /// The executor sleeps on its queue's condition variable instead, so a new
 /// page wakes it at once; with nothing in flight it sleeps without a
-/// timeout.
+/// timeout. `POLL_MAX` bounds the extra latency a completed page can wait
+/// before the executor notices its fence, so it stays near 100us.
 const POLL_MIN: std::time::Duration = std::time::Duration::from_micros(20);
-const POLL_MAX: std::time::Duration = std::time::Duration::from_millis(1);
+const POLL_MAX: std::time::Duration = std::time::Duration::from_micros(100);
 
 /// Scratch pairs (ciphertext and partial plaintext slots) per GPU with
 /// `slots` staging slots: one per stream when staging is large, at least
@@ -3097,6 +3098,14 @@ mod tests {
     use super::*;
     use crate::model::*;
     use rdma_verbs::DmabufMemory;
+
+    #[test]
+    fn fence_poll_nap_is_bounded() {
+        // A completed page waits at most one nap before the executor notices
+        // its fence; keep that added latency small.
+        assert!(POLL_MIN <= POLL_MAX);
+        assert!(POLL_MAX <= std::time::Duration::from_micros(100));
+    }
 
     const LENGTH: u64 = 2 * SLOT_BYTES;
 
