@@ -38,7 +38,7 @@ func containerTestBackend(t *testing.T) *container.Backend {
 
 			return "", fmt.Errorf("unexpected command %s %v", name, args)
 		},
-		Host:               &container.HostFS{CgroupControllers: filepath.Join(dir, "cgroup.controllers"), SELinuxEnforce: filepath.Join(dir, "absent")},
+		Host: &container.HostFS{CgroupControllers: filepath.Join(dir, "cgroup.controllers"), SELinuxEnforce: filepath.Join(dir, "absent")},
 	}
 }
 

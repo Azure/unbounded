@@ -911,6 +911,7 @@ func TestPreflightRequiresSystemd254(t *testing.T) {
 	t.Run("systemctl fails", func(t *testing.T) {
 		b, st := ready(t)
 		st.fail["systemctl --version"] = errors.New("exec: systemctl: not found")
+
 		require.ErrorContains(t, b.Preflight(), "reading the systemd version (systemctl --version): exec: systemctl: not found")
 	})
 }
