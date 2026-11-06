@@ -9,8 +9,9 @@
 //! sockets and bodies can be received directly into caller buffers.
 //!
 //! [`exchange_small`] is for infrequent, small requests such as token endpoints.
-//! It opens a fresh connection with `Connection: close`, uses userspace TLS, and
-//! accepts fixed-length, chunked, or close-delimited response bodies up to a cap.
+//! It opens a fresh connection with `Connection: close` through a single-use
+//! http1 pool (the same TLS path as pooled origins) and accepts fixed-length,
+//! chunked, or close-delimited response bodies up to a cap.
 
 use crate::admission::ResourceClass;
 use crate::error::Error;
@@ -19,10 +20,6 @@ use crate::error::Result;
 use crate::runtime::Reactor;
 use crate::runtime::RequestScope;
 use http1::tls::TlsClient;
-use http1::tls::rustls;
-use racer_io::ring::Descriptor;
-use racer_io::ring::SocketAddress;
-use std::io::Read as _;
 use std::io::Write as _;
 use std::net::IpAddr;
 use std::net::SocketAddr;
@@ -375,8 +372,48 @@ impl SmallResponse {
     }
 }
 
+/// The http1 caller context for one small exchange: control-class
+/// connection admission and request-context buffer charges.
+struct SmallContext(Rc<Reactor>);
+
+impl http1::connection::Context for SmallContext {
+    type Error = Error;
+
+    type Scope = RequestScope;
+
+    type Reactor = Reactor;
+
+    type Charge = flow_control::Charge<crate::admission::AdmissionPolicy>;
+
+    type Slot = crate::admission::ConnectionReservation;
+
+    type Opaque = ();
+
+    type State = ();
+
+    type Endpoint = crate::http::Endpoint;
+
+    fn charge(&self, bytes: usize) -> Result<Self::Charge> {
+        self.0
+            .admission()
+            .reserve(None, ResourceClass::RequestContext, bytes)
+            .map_err(Into::into)
+    }
+
+    fn outbound_slot(&self) -> Result<Self::Slot> {
+        self.0.reserve_connection(ResourceClass::ControlConnection)
+    }
+
+    fn stopped(&self) -> bool {
+        self.0.admission().is_stopped()
+    }
+}
+
 /// Send one request on a fresh connection and read the complete response.
-/// HTTPS uses userspace rustls; bodies above `limit` are rejected.
+///
+/// The connection comes from a single-use http1 pool, so HTTPS uses the
+/// shared TLS path (kernel TLS when available). Bodies above `limit` are
+/// rejected.
 pub async fn exchange_small(
     reactor: &Rc<Reactor>,
     resolver: &dyn Resolver,
@@ -386,24 +423,6 @@ pub async fn exchange_small(
     scope: &RequestScope,
 ) -> Result<SmallResponse> {
     endpoint.resolve(resolver, scope).await?;
-    let address = endpoint.address()?;
-    let lease = Rc::new(reactor.reserve_connection(ResourceClass::ControlConnection)?);
-    let fd = Rc::new(racer_io::scoped::descriptor::socket(
-        reactor.sim_os().as_ref(),
-        if address.is_ipv4() {
-            libc::AF_INET
-        } else {
-            libc::AF_INET6
-        },
-    )?);
-    reactor
-        .connect_with_lease(
-            fd.clone(),
-            SocketAddress::Inet(address),
-            lease.clone(),
-            scope,
-        )
-        .await?;
     let mut wire = Zeroizing::new(Vec::with_capacity(256 + request.body.len()));
     write!(
         wire,
@@ -427,151 +446,63 @@ pub async fn exchange_small(
     }
     wire.extend_from_slice(b"\r\n");
     wire.extend_from_slice(request.body);
-    let mut session = match endpoint.tls() {
-        Some(tls) => Some(
-            rustls::ClientConnection::new(tls.config().clone(), tls.server_name().clone())
-                .map_err(|_| Error::InvalidConfiguration)?,
-        ),
-        None => None,
-    };
-    let wait = |interest: libc::c_short| {
-        reactor.readiness_with_lease(fd.clone(), interest as u32, lease.clone(), scope)
-    };
-    // Send everything.
-    match &mut session {
-        Some(session) => {
-            session
-                .writer()
-                .write_all(&wire)
-                .map_err(|_| Error::Internal)?;
-            while session.wants_write() || session.is_handshaking() {
-                if session.wants_write() {
-                    match session.write_tls(&mut Plain(&fd)) {
-                        Ok(_) => continue,
-                        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                            wait(libc::POLLOUT).await?;
-                            continue;
-                        }
-                        Err(_) => return Err(Error::Io),
-                    }
-                }
-                match session.read_tls(&mut Plain(&fd)) {
-                    Ok(0) => return Err(Error::Io),
-                    Ok(_) => {
-                        session
-                            .process_new_packets()
-                            .map_err(|_| Error::Os(libc::EPROTO))?;
-                    }
-                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                        wait(libc::POLLIN).await?;
-                    }
-                    Err(_) => return Err(Error::Io),
-                }
-            }
-        }
-        None => {
-            let mut sent = 0;
-            while sent < wire.len() {
-                match fd.try_send(&wire[sent..]) {
-                    Ok(n) => sent += n,
-                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                        wait(libc::POLLOUT).await?;
-                    }
-                    Err(_) => return Err(Error::Io),
-                }
-            }
-        }
-    }
-    drop(wire);
-    // Receive until the response is complete or the peer closes.
-    let cap = MAX_SMALL_HEAD + limit.saturating_mul(2).saturating_add(4096);
-    let mut received = Zeroizing::new(Vec::new());
-    let mut scratch = Zeroizing::new(vec![0u8; 16 * 1024]);
-    loop {
-        scope.check()?;
-        let (read, eof) = match &mut session {
-            Some(session) => match session.reader().read(&mut scratch) {
-                Ok(0) => (0, true),
-                Ok(n) => (n, false),
-                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                    match session.read_tls(&mut Plain(&fd)) {
-                        // Truncation without close_notify still ends the body;
-                        // framing checks below reject incomplete messages.
-                        Ok(0) => (0, true),
-                        Ok(_) => {
-                            session
-                                .process_new_packets()
-                                .map_err(|_| Error::Os(libc::EPROTO))?;
-                            continue;
-                        }
-                        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                            wait(libc::POLLIN).await?;
-                            continue;
-                        }
-                        Err(_) => return Err(Error::Io),
-                    }
-                }
-                Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => (0, true),
-                Err(_) => return Err(Error::Io),
-            },
-            None => match fd.try_recv(&mut scratch) {
-                Ok(0) => (0, true),
-                Ok(n) => (n, false),
-                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                    wait(libc::POLLIN).await?;
-                    continue;
-                }
-                Err(_) => return Err(Error::Io),
-            },
-        };
-        received.extend_from_slice(&scratch[..read]);
-        if received.len() > cap {
-            return Err(Error::BadGateway);
-        }
-        if let Some(response) = parse_small_response(&received, eof, limit)? {
-            return Ok(response);
-        }
-        if eof {
-            return Err(Error::BadGateway);
-        }
-    }
+    let context = Rc::new(SmallContext(reactor.clone()));
+    let pool = http1::connection::HttpPool::new(
+        reactor.clone(),
+        context.clone(),
+        http1::connection::PoolConfig {
+            per_endpoint: 1,
+            secondary_cap: 1,
+            max_endpoints: 1,
+            waiter_cap: 1,
+            idle_timeout: Duration::from_secs(1),
+            tcp_nodelay: true,
+        },
+    );
+    let io = http1::connection::HttpIo::new(
+        reactor.clone(),
+        http1::Codec::new(MAX_SMALL_HEAD),
+        context,
+        u64::MAX,
+        u64::MAX,
+    );
+    let key = crate::http::Endpoint::Remote(endpoint.clone());
+    let lease = pool.checkout(&key, scope).await?;
+    let mut parse = |bytes: &[u8]| small_plan(bytes, limit);
+    let exchanged = io
+        .exchange_small(lease, &wire, MAX_SMALL_HEAD, &mut parse, scope)
+        .await
+        .map_err(|error| match error {
+            // Framing violations, including pipelined bytes, are the peer's.
+            Error::InvalidRequest | Error::HeaderTooLarge => Error::BadGateway,
+            error => error,
+        })?;
+    let (status, headers) = exchanged.value;
+    Ok(SmallResponse {
+        status,
+        headers,
+        body: exchanged.body,
+    })
 }
 
-/// Nonblocking `Read`/`Write` over a borrowed descriptor.
-struct Plain<'a>(&'a Descriptor);
+/// Status and header fields of a small response.
+type SmallHead = (u16, Vec<(String, String)>);
 
-impl std::io::Read for Plain<'_> {
-    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
-        self.0.try_recv(buf)
-    }
-}
-
-impl std::io::Write for Plain<'_> {
-    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        self.0.try_send(buf)
-    }
-
-    fn flush(&mut self) -> std::io::Result<()> {
-        Ok(())
-    }
-}
-
-/// Parse a complete response, `None` while more bytes are needed. Supports
+/// Plan a small response once its head is complete. Supports
 /// `Content-Length`, `Transfer-Encoding: chunked`, and close-delimited bodies
 /// through the shared head codec and small-body decoder.
-pub(crate) fn parse_small_response(
+fn small_plan(
     bytes: &[u8],
-    eof: bool,
     limit: usize,
-) -> Result<Option<SmallResponse>> {
+) -> Result<Option<http1::small_exchange::Plan<Error, SmallHead>>> {
     use racer_wire::http::{Codec, StartLine, small};
     let codec = Codec::<()>::new(MAX_SMALL_HEAD)
         .trim_ows()
         .transfer_coding();
     let (head, end) = match codec.decode_head(bytes) {
         Ok(Some(head)) => head,
-        Ok(None) if !eof => return Ok(None),
-        _ => return Err(Error::BadGateway),
+        Ok(None) => return Ok(None),
+        Err(_) => return Err(Error::BadGateway),
     };
     let StartLine::Response { status } = head.start else {
         return Err(Error::BadGateway);
@@ -585,19 +516,7 @@ pub(crate) fn parse_small_response(
         small::Framing::Close if status == 204 || status == 304 => small::Framing::Length(0),
         framing => framing,
     };
-    let mut decoder = small::Decoder::new(
-        framing,
-        small::Limits {
-            body: limit,
-            ..small::Limits::default()
-        },
-    )
-    .map_err(|_| Error::BadGateway)?;
-    match decoder.feed(&bytes[end..]).map_err(|_| Error::BadGateway)? {
-        small::Status::Done(_) => {}
-        small::Status::Need if eof => decoder.finish().map_err(|_| Error::BadGateway)?,
-        small::Status::Need => return Ok(None),
-    }
+    let close = head.closes_connection().map_err(|_| Error::BadGateway)?;
     let headers = head
         .headers
         .iter()
@@ -611,6 +530,42 @@ pub(crate) fn parse_small_response(
             ))
         })
         .collect::<Result<_>>()?;
+    Ok(Some(http1::small_exchange::Plan {
+        head_length: end,
+        framing,
+        limits: small::Limits {
+            body: limit,
+            ..small::Limits::default()
+        },
+        close,
+        body_error: |_| Error::BadGateway,
+        value: (status, headers),
+    }))
+}
+
+/// Parse a complete buffered response, `None` while more bytes are needed.
+#[cfg(test)]
+pub(crate) fn parse_small_response(
+    bytes: &[u8],
+    eof: bool,
+    limit: usize,
+) -> Result<Option<SmallResponse>> {
+    use racer_wire::http::small;
+    let plan = match small_plan(bytes, limit)? {
+        Some(plan) => plan,
+        None if !eof => return Ok(None),
+        None => return Err(Error::BadGateway),
+    };
+    let mut decoder = small::Decoder::new(plan.framing, plan.limits).map_err(plan.body_error)?;
+    match decoder
+        .feed(&bytes[plan.head_length..])
+        .map_err(plan.body_error)?
+    {
+        small::Status::Done(_) => {}
+        small::Status::Need if eof => decoder.finish().map_err(plan.body_error)?,
+        small::Status::Need => return Ok(None),
+    }
+    let (status, headers) = plan.value;
     Ok(Some(SmallResponse {
         status,
         headers,
