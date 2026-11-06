@@ -748,6 +748,24 @@ impl Poll {
     }
 }
 
+/// Map an install-time replay to a retryable stale-source failure.
+///
+/// Local acceptance can see newer state than the poll's own cursor: another
+/// session in this process may already have installed a newer generation into
+/// shared state, or a seat restarted during a rollout may serve an older
+/// generation to a fresh poll that has no cursor to send. The install already
+/// refused the document and the caller has rejected it and restored the base,
+/// so nothing older is ever accepted. Demote the seat that served it and report
+/// `Unavailable` so the owner retries with backoff instead of exiting. The
+/// recorded status error stays `Replay` for diagnostics.
+fn stale_install(poll: &Poll, error: Error) -> Error {
+    if error != Error::Replay {
+        return error;
+    }
+    poll.fetch.demote();
+    Error::Unavailable
+}
+
 /// Enforce success framing even when a scripted fetch is used.
 fn check_response(response: &rest::Response, limit: usize) -> Result<()> {
     if response.status != 200 || response.body.len() > limit {
@@ -853,7 +871,7 @@ impl Progress {
                         let version = document.version();
                         self.prepared.take();
                         self.reject(poll, version, now);
-                        return Err(error);
+                        return Err(stale_install(poll, error));
                     }
                 }
             }

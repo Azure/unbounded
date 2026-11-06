@@ -542,6 +542,64 @@ fn stale_seat_rollback_is_retryable_and_never_accepted() {
     });
 }
 
+/// A document the poll has never seen can still be a replay against shared
+/// local state (for example a fresh poll served an older generation by a seat
+/// restarted during a rollout). Install-time replay is retried on another seat,
+/// never accepted, and never surfaced as a fatal error.
+#[test]
+fn install_replay_is_retryable_and_never_accepted() {
+    sim(40, |clock, env| {
+        let io = host(env);
+        let target = Installer::new();
+        let script = Script::new(&io, [full(1), full(2)]);
+        let mut sync = poll(&io, Doc::Keyring, &script, &target);
+        target.install_error.set(Some(Error::Replay));
+        let result = drive(clock, async {
+            sync.turn(&scope(env)).await?;
+            sync.settle(&scope(env)).await
+        });
+        assert_eq!(result, Err(Error::Unavailable));
+        assert!(crate::control::transient(result.unwrap_err()));
+        assert_eq!(sync.status().error, Some(Error::Replay));
+        assert_eq!(sync.status().accepted, None);
+        assert!(target.installed.borrow().is_empty());
+        assert_eq!(script.demoted.get(), 1);
+        // The refused document is not retained as a delta or cursor base.
+        assert!(sync.last().is_none());
+        let mut result = drive(clock, sync.turn(&scope(env)));
+        for _ in 0..8 {
+            if result.is_ok() {
+                break;
+            }
+            result = drive(clock, sync.turn(&scope(env)));
+        }
+        result.unwrap();
+        drive(clock, sync.settle(&scope(env))).unwrap();
+        assert_eq!(sync.status().accepted, Some(2));
+        assert_eq!(*target.installed.borrow(), vec![2]);
+        assert_eq!(script.requests.borrow()[1].0, Doc::Keyring.path());
+    });
+}
+
+/// Other permanent install failures stay fatal and do not demote the seat.
+#[test]
+fn install_permanent_failure_is_not_masked() {
+    sim(40, |clock, env| {
+        let io = host(env);
+        let target = Installer::new();
+        let script = Script::new(&io, [full(1)]);
+        let mut sync = poll(&io, Doc::Keyring, &script, &target);
+        target.install_error.set(Some(Error::InvalidRequest));
+        let result = drive(clock, async {
+            sync.turn(&scope(env)).await?;
+            sync.settle(&scope(env)).await
+        });
+        assert_eq!(result, Err(Error::InvalidRequest));
+        assert_eq!(script.demoted.get(), 0);
+        assert_eq!(sync.status().accepted, None);
+    });
+}
+
 /// Cancellation after a valid no-change reply remains cancellation, not success.
 #[test]
 fn cancellation_after_no_change_response_is_not_reported_as_success() {

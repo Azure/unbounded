@@ -351,6 +351,19 @@ impl Install for BundleInstall {
             self.auth.check()?;
             if self.auth.started.get() {
                 self.auth.secrets.install((**prepared).clone())?;
+            } else if self
+                .auth
+                .keys
+                .borrow()
+                .generation()?
+                .is_some_and(|accepted| prepared.generation.0 < accepted)
+            {
+                // Keys are shared node-wide, so an earlier session may already
+                // have installed a newer bundle. A fresh startup poll has no
+                // cursor, so a seat restarted during a rollout can still serve
+                // it an older generation. Refuse it here, before it becomes the
+                // startup bundle that `activate_identity` would fail to install.
+                return Err(Error::Replay);
             }
             self.auth
                 .enrollment
@@ -987,6 +1000,72 @@ pub(super) mod tests {
     use super::*;
     use std::sync::Arc;
     use std::{collections::VecDeque, future::Future, task::Context};
+
+    /// Valid bundle at `generation` whose peer trust roots and key material pass validation.
+    fn startup_bundle(generation: u64, ca: &[u8]) -> wire::KeyringBundle {
+        let mut bundle = wire::decode_bundle(include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/wire/testdata/bundle.json"
+        )))
+        .unwrap();
+        bundle.generation = racer_wire::control::BundleGeneration(generation);
+        bundle.peer_trust_roots = vec![ca.to_vec()];
+        // The wire vector repeats material across purposes; use distinct material.
+        let key = &bundle.cache_keys[2];
+        bundle.cache_keys[2] = wire::CacheEncryptionKey::new(
+            key.key.clone(),
+            key.state,
+            zeroize::Zeroizing::new([2; 32]),
+        );
+        bundle
+    }
+
+    /// Before startup completes, a bundle older than the node-wide accepted one
+    /// (installed by an earlier session in this process) is refused as a replay
+    /// instead of becoming the startup bundle. Equal and newer ones are staged.
+    #[test]
+    fn startup_bundle_older_than_shared_keys_is_refused() {
+        let env = racer_io::Env::host();
+        let session = session(&env);
+        let (ca, _) = crate::test_support::enrollment::ca();
+        // An earlier session in this process already installed generation 2.
+        session
+            .auth
+            .secrets
+            .install(startup_bundle(2, ca.der()))
+            .unwrap();
+        assert!(!session.auth.started.get());
+        let error = Rc::new(Cell::new(None));
+        let install = BundleInstall {
+            auth: session.auth.clone(),
+            error: error.clone(),
+        };
+        let stage = |generation| {
+            let bundle = Arc::new(startup_bundle(generation, ca.der()));
+            install.install(
+                &Document::Keyring(bundle.clone()),
+                &Prepared::Keyring(bundle),
+            )
+        };
+        assert_eq!(stage(1), Err(Error::Replay));
+        assert_eq!(error.get(), Some(Error::Replay));
+        assert!(session.auth.startup_bundle.borrow().is_none());
+        for generation in [2, 3] {
+            stage(generation).unwrap();
+            assert_eq!(error.get(), None);
+            assert_eq!(
+                session
+                    .auth
+                    .startup_bundle
+                    .borrow()
+                    .as_ref()
+                    .map(|b| b.generation.0),
+                Some(generation)
+            );
+        }
+        // The shared keys were never rolled back.
+        assert_eq!(session.auth.keys.borrow().generation().unwrap(), Some(2));
+    }
 
     /// Receipts never regress by sequence and remain independent of acceptance.
     #[test]
