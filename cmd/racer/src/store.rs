@@ -986,11 +986,7 @@ impl StoreWriter {
         if page.ciphertext.is_registered() {
             // Copy out into storage aligned for this device, so persist writes
             // the body in place and staging only covers the header block.
-            let device = self.slabs.alignment()?;
-            // The record body is padded to the record unit, which may be
-            // coarser than the device's length unit.
-            let alignment = Alignment::new(device.memory(), device.offset(), record_unit(device)?)
-                .map_err(|_| Error::InvalidConfiguration)?;
+            let alignment = record_alignment(self.slabs.alignment()?)?;
             let length = page.ciphertext.rehome_capacity(alignment)?;
             let reservation = reserve_staging(length)?;
             reservation.validate(ResourceClass::Ciphertext, length)?;
@@ -1872,6 +1868,14 @@ fn record_unit(alignment: Alignment) -> Result<usize> {
     } else {
         Ok(unit)
     }
+}
+/// `device` with its length unit raised to the record unit. The record body is
+/// padded to the record unit, which may be coarser than the device's length
+/// unit (512-byte sectors pad to 4 KiB), so aligned ciphertext must be padded
+/// to it too for persist to write the body in place.
+pub(crate) fn record_alignment(device: Alignment) -> Result<Alignment> {
+    Alignment::new(device.memory(), device.offset(), record_unit(device)?)
+        .map_err(|_| Error::InvalidConfiguration)
 }
 fn align_up(len: usize, unit: usize) -> Result<usize> {
     len.checked_next_multiple_of(unit)

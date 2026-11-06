@@ -1393,15 +1393,17 @@ impl WorkerApplication {
             admission.clone(),
             crate::model::PAGE_BYTES + 16,
         ));
-        // Aligned ciphertext matches this worker's store devices so pages can
-        // be written without copying; file-backed slabs use the 4 KiB default.
+        // Aligned ciphertext matches this worker's store records (device
+        // alignment padded to the record unit) so pages can be written without
+        // copying; file-backed slabs use the 4 KiB default.
         let buffers = BufferPool::with_alignment(
             admission.clone(),
-            node.devices
-                .as_ref()
-                .map_or_else(crate::memory::default_disk_alignment, |plan| {
-                    plan.workers[worker.0 as usize].alignment
-                }),
+            match node.devices.as_ref() {
+                Some(plan) => {
+                    crate::store::record_alignment(plan.workers[worker.0 as usize].alignment)?
+                }
+                None => crate::memory::default_disk_alignment(),
+            },
         );
         let memory = Rc::new(MemoryCache::new(buffers.clone(), availability.clone()));
         let crypto = Rc::new(PageCrypto::new(

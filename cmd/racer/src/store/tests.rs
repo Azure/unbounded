@@ -6130,3 +6130,40 @@ fn retention_sweep_drops_pages_whose_key_left_the_keyring() {
     assert_eq!(removed, 3);
     assert!(memory.resident().is_empty());
 }
+
+/// Pools aligned only to a 512-byte device unit pad bodies short of the 4 KiB
+/// record unit, so every persist fell back to a copy. Pools aligned with
+/// `record_alignment` produce bodies persist writes in place.
+#[test]
+fn record_alignment_pads_pool_bodies_to_the_record_unit() {
+    let env = racer_io::Env::host();
+    let f = Fixture::new(&env);
+    let device = Alignment::new(512, 512, 512).unwrap();
+    let record = record_alignment(device).unwrap();
+    assert_eq!(record.length(), CIPHERTEXT_ALIGNMENT);
+    assert_eq!((record.memory(), record.offset()), (512, 512));
+    let page = |alignment| {
+        let pool = BufferPool::with_alignment(f.admission.clone(), alignment);
+        let owned = f.copy(5, 100);
+        let cache = &owned.metadata.version.object.cache;
+        let capacity = pool.aligned_capacity(116).unwrap();
+        let reservation = f
+            .admission
+            .reserve(Some(cache), ResourceClass::Ciphertext, capacity)
+            .unwrap();
+        let mut buffer = pool.aligned_ciphertext(reservation, 116).unwrap();
+        buffer.as_mut_slice().fill(5);
+        let ciphertext = pool
+            .aligned_ciphertext_page(buffer, owned.ciphertext.envelope().clone())
+            .unwrap();
+        CiphertextCopy {
+            metadata: owned.metadata,
+            ciphertext,
+        }
+    };
+    assert!(zero_copy_body(&page(device), device).unwrap().is_none());
+    assert!(zero_copy_body(&page(record), device).unwrap().is_some());
+    // A 4 KiB device is already at the record unit.
+    let default = crate::memory::default_disk_alignment();
+    assert_eq!(record_alignment(default).unwrap(), default);
+}
