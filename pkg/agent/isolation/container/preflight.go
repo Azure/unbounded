@@ -99,13 +99,19 @@ func (h HostFS) SELinuxMode() SELinuxMode {
 // CheckLabel verifies the kernel accepts the spc_t label. PROVISIONAL: the
 // context interface behavior is assumed from the SELinux kernel API and has
 // not been checked on Azure Container Linux.
-func (h HostFS) CheckLabel() error {
+// A failure to close the handle is reported only when every check passed, so
+// the first failure keeps precedence.
+func (h HostFS) CheckLabel() (retErr error) {
 	f, err := os.OpenFile(h.SELinuxContext, os.O_RDWR, 0)
 	if err != nil {
 		return fmt.Errorf("selinux label check: %w", err)
 	}
 
-	defer f.Close() //nolint:errcheck // read/write probe only
+	defer func() {
+		if cerr := f.Close(); cerr != nil && retErr == nil {
+			retErr = fmt.Errorf("selinux label check: closing %s: %w", h.SELinuxContext, cerr)
+		}
+	}()
 
 	if _, err := f.WriteString(SELinuxLabel); err != nil {
 		return fmt.Errorf("selinux does not accept label %s: %w", SELinuxLabel, err)
