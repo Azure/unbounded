@@ -585,12 +585,23 @@ A document may set `images` alone or alongside an `overrides` list. The image
 takes one of two forms:
 
 - **With a tag or digest**, such as `myregistry.example.com/kube-proxy:v1.34.2`,
-  it is used as-is.
+  it is used as-is, without Kubernetes discovery or registry search. This also
+  applies to an explicitly supplied `:latest` tag.
 - **Without one**, it takes the tag of the image the cluster's own
   `kube-system/kube-proxy` DaemonSet runs, so a mirror of the provider's
-  kube-proxy keeps the provider's version. Without that DaemonSet, or when its
-  image is pinned by digest alone, the tag is the API server's version. A
-  registry port, as in `localhost:5000/kube-proxy`, is not a tag.
+  kube-proxy keeps the provider's version. Only the tag carries over, not its
+  digest. Without a provider tag, the controller searches the override's
+  registry/repository for the API server's major.minor.patch version, preferring
+  the highest numeric maintenance suffix. For a `1.36.2` cluster,
+  `v1.36.2-2` wins over `v1.36.2-1` and `v1.36.2`; without maintenance tags,
+  it uses the exact matching tag. A registry port, as in
+  `localhost:5000/kube-proxy`, is not a tag.
+
+Fallback selection never chooses `latest`. Registry searches are anonymous;
+failure to discover a valid server version or a matching registry tag leaves
+managed kube-proxy unstarted instead of guessing an image. See
+[Managed kube-proxy]({{< relref "reference/networking/configuration#managed-kube-proxy" >}})
+for lookup limits and failure handling.
 
 The operator passes the image to the net controller as its
 `--managed-kube-proxy-image` flag, on the `controller` container of the

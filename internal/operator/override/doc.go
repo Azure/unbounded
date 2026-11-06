@@ -62,7 +62,7 @@ type Images struct {
 // ImageOverride sets one image.
 type ImageOverride struct {
 	// Image is either a reference with a tag or digest, used as-is, or one
-	// without, which takes the version of the image it replaces.
+	// without, whose tag is determined by the controller.
 	Image string `yaml:"image"`
 }
 

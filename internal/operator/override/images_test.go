@@ -146,6 +146,7 @@ func TestValidateKubeProxyImage(t *testing.T) {
 		{image: "myreg.example/kube-proxy"},
 		{image: "localhost:5000/kube-proxy"},
 		{image: "myreg.example/kube-proxy:v1.34.2"},
+		{image: "myreg.example/kube-proxy:latest"},
 		{image: "myreg.example/kube-proxy@sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"},
 		{image: `""`, want: "image is required"},
 		{image: "myreg.example/Kube-Proxy", want: "malformed name"},

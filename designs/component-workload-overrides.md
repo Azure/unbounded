@@ -577,7 +577,7 @@ images:
 
 | Field | Required | Meaning |
 |---|---|---|
-| `images.kubeProxy.image` | yes, when `kubeProxy` is set | Image of the managed kube-proxy DaemonSets. A reference with a tag or digest is used as-is; one without takes the tag of the image `kube-system/kube-proxy` runs, or the API server's version when that DaemonSet does not exist. |
+| `images.kubeProxy.image` | yes, when `kubeProxy` is set | Image of the managed kube-proxy DaemonSets. A reference with a tag or digest is used as-is; one without inherits the provider tag or searches the selected registry for the API server's exact major.minor.patch version with the highest numeric maintenance suffix. Automatic fallback never chooses `latest`; explicit versions remain unchanged. |
 
 This is the only typed field, and [§5.2](#52-why-not-a-typed-override-struct)
 argues against typed fields as *the* mechanism, which is a different question.
