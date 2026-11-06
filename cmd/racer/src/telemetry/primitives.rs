@@ -130,7 +130,17 @@ impl<T, const N: usize> Drop for SampleLease<T, N> {
 /// Poisoned locks retain records rather than discarding diagnostic evidence.
 /// Record-level synchronization remains the caller's responsibility: an `Arc`
 /// snapshot retains the same records, not frozen copies of their mutable contents.
-pub struct SharedRing<T, const N: usize>(Arc<Mutex<Ring<T, N>>>);
+///
+/// [`Self::try_push`] lets hot rejection paths skip a record instead of
+/// queuing behind the writer lock; skipped records are counted, not retained.
+pub struct SharedRing<T, const N: usize>(Arc<SharedRingState<T, N>>);
+
+/// The writer lock and its contention-drop counter.
+struct SharedRingState<T, const N: usize> {
+    ring: Mutex<Ring<T, N>>,
+
+    contended: std::sync::atomic::AtomicU64,
+}
 
 impl<T, const N: usize> Clone for SharedRing<T, N> {
     /// Share the existing writer without cloning any records.
@@ -142,28 +152,65 @@ impl<T, const N: usize> Clone for SharedRing<T, N> {
 impl<T, const N: usize> Default for SharedRing<T, N> {
     /// Create an empty shared ring; panic if capacity is zero.
     fn default() -> Self {
-        Self(Arc::new(Mutex::new(Ring::default())))
+        Self(Arc::new(SharedRingState {
+            ring: Mutex::new(Ring::default()),
+            contended: std::sync::atomic::AtomicU64::new(0),
+        }))
     }
 }
 
 impl<T, const N: usize> SharedRing<T, N> {
     /// Append a record, recovering retained state if a writer poisoned the lock.
     pub fn push(&self, value: T) {
-        self.0.lock().unwrap_or_else(|e| e.into_inner()).push(value);
+        self.0
+            .ring
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(value);
+    }
+
+    /// Append a record unless another thread holds the writer lock. On
+    /// contention the record is discarded and counted in [`Self::contended`]
+    /// so a burst of rejections never serializes workers on this lock. The
+    /// ring then retains a sample of the burst rather than its newest `N`.
+    /// Poisoning is recovered just as in [`Self::push`].
+    pub fn try_push(&self, value: T) -> bool {
+        let mut ring = match self.0.ring.try_lock() {
+            Ok(ring) => ring,
+            Err(TryLockError::Poisoned(error)) => error.into_inner(),
+            Err(TryLockError::WouldBlock) => {
+                self.0
+                    .contended
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                return false;
+            }
+        };
+        ring.push(value);
+        true
+    }
+
+    /// Records discarded by [`Self::try_push`] under lock contention. They
+    /// are not included in a snapshot's total.
+    pub fn contended(&self) -> u64 {
+        self.0.contended.load(std::sync::atomic::Ordering::Relaxed)
     }
 }
 
 impl<T: Clone, const N: usize> SharedRing<T, N> {
     /// Clone retention and release the lock before returning for formatting.
     pub fn snapshot(&self) -> Ring<T, N> {
-        self.0.lock().unwrap_or_else(|e| e.into_inner()).clone()
+        self.0
+            .ring
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
     }
 
     /// Snapshot without waiting for the writer lock; return `None` on contention.
     /// Poisoning is recovered just as in [`Self::snapshot`]. The returned ring
     /// holds no lock, so callers cannot accidentally format under the writer lock.
     pub fn try_snapshot(&self) -> Option<Ring<T, N>> {
-        let ring = match self.0.try_lock() {
+        let ring = match self.0.ring.try_lock() {
             Ok(ring) => ring,
             Err(TryLockError::Poisoned(error)) => error.into_inner(),
             Err(TryLockError::WouldBlock) => return None,
@@ -1419,13 +1466,13 @@ mod ring_tests {
         assert!(ring.try_snapshot().unwrap().is_empty());
         ring.push(1);
         ring.push(2);
-        let guard = ring.0.lock().unwrap();
+        let guard = ring.0.ring.lock().unwrap();
         assert!(ring.try_snapshot().is_none());
         drop(guard);
         let snapshot = ring.try_snapshot().unwrap();
         assert_eq!(snapshot.total(), 2);
         assert_eq!(snapshot.iter().collect::<Vec<_>>(), [(1, 1), (2, 2)]);
-        assert!(ring.0.try_lock().is_ok());
+        assert!(ring.0.ring.try_lock().is_ok());
         ring.push(3);
         assert_eq!(snapshot.iter().collect::<Vec<_>>(), [(1, 1), (2, 2)]);
         assert_eq!(
@@ -1434,12 +1481,39 @@ mod ring_tests {
         );
     }
 
+    /// `try_push` appends when uncontended, counts and discards on contention,
+    /// and recovers a poisoned lock.
+    #[test]
+    fn try_push_counts_contended_drops() {
+        let ring = SharedRing::<u8, 2>::default();
+        assert!(ring.try_push(1));
+        let guard = ring.0.ring.lock().unwrap();
+        assert!(!ring.try_push(2));
+        assert!(!ring.try_push(3));
+        drop(guard);
+        assert_eq!(ring.contended(), 2);
+        assert!(ring.try_push(4));
+        let snapshot = ring.snapshot();
+        assert_eq!(snapshot.total(), 2);
+        assert_eq!(snapshot.iter().collect::<Vec<_>>(), [(1, 1), (2, 4)]);
+        let poisoner = ring.clone();
+        std::thread::spawn(move || {
+            let _guard = poisoner.0.ring.lock().unwrap();
+            panic!("poison");
+        })
+        .join()
+        .unwrap_err();
+        assert!(ring.try_push(5));
+        assert_eq!(ring.contended(), 2);
+        assert_eq!(ring.snapshot().total(), 3);
+    }
+
     /// A held writer lock returns no snapshot immediately, without losing records.
     #[test]
     fn try_snapshot_returns_none_while_writer_holds_lock() {
         let ring = SharedRing::<u8, 2>::default();
         ring.push(1);
-        let guard = ring.0.lock().unwrap();
+        let guard = ring.0.ring.lock().unwrap();
         assert!(ring.try_snapshot().is_none());
         drop(guard);
         assert_eq!(
@@ -1455,7 +1529,7 @@ mod ring_tests {
         let writer = ring.clone();
         assert!(
             std::thread::spawn(move || {
-                let mut guard = writer.0.lock().unwrap();
+                let mut guard = writer.0.ring.lock().unwrap();
                 guard.push(1);
                 panic!("poison diagnostics");
             })
@@ -1466,7 +1540,11 @@ mod ring_tests {
             ring.try_snapshot().unwrap().iter().collect::<Vec<_>>(),
             [(1, 1)]
         );
-        let guard = ring.0.lock().unwrap_or_else(|error| error.into_inner());
+        let guard = ring
+            .0
+            .ring
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
         assert!(ring.try_snapshot().is_none());
         drop(guard);
         ring.push(2);

@@ -680,10 +680,11 @@ impl Failures {
         let snapshot = self.gates.ring.snapshot();
         writeln!(
             out,
-            "schema_version=1 counter_rows=58 coverage=flight_join_and_reactor_submit_events terminal_cause=false operation_identity=not_recorded page_identity=request_relative_number existing_failed=propagated_not_new_rejection unclassified=join_overload_origin_unknown wait_events=terminal_once wait_cause=prior_observation_not_terminal_capacity counters_and_ring=non_atomic_snapshot total={} retained={} overwritten={} capacity=64",
+            "schema_version=1 counter_rows=58 coverage=flight_join_and_reactor_submit_events terminal_cause=false operation_identity=not_recorded page_identity=request_relative_number existing_failed=propagated_not_new_rejection unclassified=join_overload_origin_unknown wait_events=terminal_once wait_cause=prior_observation_not_terminal_capacity counters_and_ring=non_atomic_snapshot total={} retained={} overwritten={} capacity=64 contended_drops={}",
             snapshot.total(),
             snapshot.len(),
-            snapshot.total().saturating_sub(snapshot.len() as u64)
+            snapshot.total().saturating_sub(snapshot.len() as u64),
+            self.gates.ring.contended()
         )?;
         for (index, count) in self.gates.counts.iter().enumerate() {
             let reason = if index < 24 {
@@ -835,10 +836,11 @@ impl Failures {
         let snapshot = ring.snapshot();
         writeln!(
             out,
-            "schema_version=1 total={} retained={} overwritten={} capacity=64 coverage={}",
+            "schema_version=1 total={} retained={} overwritten={} capacity=64 contended_drops={} coverage={}",
             snapshot.total(),
             snapshot.len(),
             snapshot.total().saturating_sub(snapshot.len() as u64),
+            ring.contended(),
             if admission {
                 "fill_only"
             } else {
@@ -1056,7 +1058,7 @@ impl Observer {
             return;
         };
         failures.gates.counts[facts.index()].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        failures.gates.ring.push(GateEvent {
+        failures.gates.ring.try_push(GateEvent {
             worker: *worker,
             failure: Failure::new(
                 Stage::Admission,
@@ -1120,7 +1122,7 @@ impl Observer {
         let Some((failures, worker)) = &self.0 else {
             return;
         };
-        failures.admission.push(ProtectedFailure {
+        failures.admission.try_push(ProtectedFailure {
             worker: *worker,
             failure: Failure::new(Stage::Admission, Error::Overloaded)
                 .request(scope)
