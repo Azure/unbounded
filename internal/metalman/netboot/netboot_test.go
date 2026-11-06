@@ -4107,3 +4107,70 @@ func TestResolveFile_AgentConfigPinsNodeName(t *testing.T) {
 		})
 	}
 }
+
+func TestResolveFileByPath_ExperimentalContainerIsolation(t *testing.T) {
+	t.Parallel()
+
+	const imageRef = "ghcr.io/test/image:v1"
+
+	resolve := func(t *testing.T, mode v1alpha3.IsolationMode, enabled bool) (*ResolvedFile, error) {
+		t.Helper()
+
+		resolver := FileResolver{
+			Cache: setupOCICache(t, imageRef, strings.Repeat("c", 64), map[string][]byte{
+				"cloud-init/vendor-data.tmpl": []byte(`{{ .AgentConfigJSON }}`),
+			}),
+			Cluster:                        &StaticClusterInfo{},
+			ExperimentalContainerIsolation: enabled,
+		}
+		node := &v1alpha3.Machine{
+			ObjectMeta: metav1.ObjectMeta{Name: "node-1"},
+			Spec:       v1alpha3.MachineSpec{Isolation: mode},
+		}
+
+		return resolver.ResolveFileByPath(t.Context(), "cloud-init/vendor-data", node, imageRef)
+	}
+
+	decode := func(t *testing.T, resolved *ResolvedFile) provision.UnboundedAgentConfig {
+		t.Helper()
+
+		var cfg provision.UnboundedAgentConfig
+		require.NoError(t, json.Unmarshal(resolved.Data, &cfg))
+
+		return cfg
+	}
+
+	t.Run("off renders other modes without the opt-in", func(t *testing.T) {
+		t.Parallel()
+
+		for _, mode := range []v1alpha3.IsolationMode{"", v1alpha3.IsolationNSpawn, v1alpha3.IsolationNone} {
+			resolved, err := resolve(t, mode, false)
+			require.NoError(t, err, mode)
+
+			cfg := decode(t, resolved)
+			require.Nil(t, cfg.Experimental, mode)
+			require.False(t, cfg.ContainerIsolationEnabled(), mode)
+		}
+	})
+
+	t.Run("off refuses container", func(t *testing.T) {
+		t.Parallel()
+
+		_, err := resolve(t, v1alpha3.IsolationContainer, false)
+		require.ErrorContains(t, err, `spec.isolation "container" is experimental and not enabled on this metalman`)
+		require.ErrorContains(t, err, "--experimental-container-isolation")
+	})
+
+	t.Run("on opts every Machine in", func(t *testing.T) {
+		t.Parallel()
+
+		for _, mode := range []v1alpha3.IsolationMode{"", v1alpha3.IsolationNSpawn, v1alpha3.IsolationContainer} {
+			resolved, err := resolve(t, mode, true)
+			require.NoError(t, err, mode)
+
+			cfg := decode(t, resolved)
+			require.True(t, cfg.ContainerIsolationEnabled(), mode)
+			require.Equal(t, string(mode), cfg.Isolation)
+		}
+	})
+}

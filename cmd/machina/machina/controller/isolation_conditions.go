@@ -12,6 +12,7 @@ import (
 
 	unboundedv1alpha3 "github.com/Azure/unbounded/api/machina/v1alpha3"
 	"github.com/Azure/unbounded/internal/machineops"
+	"github.com/Azure/unbounded/internal/provision"
 )
 
 // Reasons for the IsolationDrift condition.
@@ -186,10 +187,6 @@ func setConditionIfChanged(machine *unboundedv1alpha3.Machine, cond metav1.Condi
 // machina does not enable it. Machina then neither provisions a host in that
 // mode nor reports a pending change to it as on its way.
 func checkIsolationEnabled(mode unboundedv1alpha3.IsolationMode, containerEnabled bool) error {
-	if mode == unboundedv1alpha3.IsolationContainer && !containerEnabled {
-		return fmt.Errorf("spec.isolation %q is experimental and not enabled on this machina; "+
-			"set experimentalContainerIsolation: true in the machina configuration to use it", mode)
-	}
-
-	return nil
+	return provision.CheckIsolationEnabled(mode, containerEnabled, "machina",
+		"set experimentalContainerIsolation: true in the machina configuration")
 }
