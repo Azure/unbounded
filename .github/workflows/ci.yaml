@@ -588,7 +588,7 @@ jobs:
           workspaces: cmd/racer -> ../../tmp/runtime-miri-target
           shared-key: runtime-miri
           cache-directories: ~/.cache/miri
-          save-if: ${{ github.event_name == 'push' && matrix.group == 'channel' }}
+          save-if: ${{ github.event_name == 'push' && matrix.group == 'spsc' }}
 
       - name: Prepare Miri sysroot
         run: timeout --signal=TERM --kill-after=10s 300s cargo +nightly-2025-11-21 miri setup
