@@ -7,6 +7,10 @@ the cores. The interpreter completes each effect on the FIFO cost model
 (`src/resources.rs`) priced from `costs.toml`, and answers it with facts of the world,
 such as which node holds which page.
 
+References to racer-sim (including `sim/src/...` paths) describe the retired simulator
+the Model was validated against; that crate is no longer in the workspace. The parity
+numbers below are the historical record of that comparison.
+
 ## Modeled
 
 - N nodes with W real `WorkerCore`s each. A page's flight lives on the worker that
