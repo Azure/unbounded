@@ -47,6 +47,7 @@ const (
 	reasonExecutionFailed          = "ExecutionFailed"
 	reasonWaitingForOlderOperation = "WaitingForOlderOperation"
 	reasonTimedOut                 = "TimedOut"
+	reasonExperimentalModeDisabled = "ExperimentalModeDisabled"
 
 	cloudInitTimeout = 5 * time.Minute
 )
@@ -85,6 +86,11 @@ type Reconciler struct {
 	MediaInstallTimeout   time.Duration
 	MediaBootTimeout      time.Duration
 	Now                   func() metav1.Time
+
+	// ExperimentalContainerIsolation enables the experimental container
+	// isolation mode. When it is not set, a HostReplace of a Machine that
+	// declares container fails before the host is touched.
+	ExperimentalContainerIsolation bool
 }
 
 // +kubebuilder:rbac:groups=unbounded-cloud.io,resources=machineoperations,verbs=get;list;watch;delete;update;patch
@@ -556,6 +562,14 @@ func (r *Reconciler) advanceTarget(ctx context.Context, op *v1alpha3.MachineOper
 	case v1alpha3.OperationHostHardReboot:
 		return r.advanceReboot(ctx, op, &machine, target, now)
 	case v1alpha3.OperationHostReplace:
+		// Refuse before the first power action; a replace already under way
+		// is left to finish or time out.
+		if target.Stage == "" {
+			if err := netboot.CheckIsolationEnabled(&machine, r.ExperimentalContainerIsolation); err != nil {
+				return failTarget(target, reasonExperimentalModeDisabled, err.Error(), now)
+			}
+		}
+
 		if machine.Spec.Netboot().TargetBootProtocol() == v1alpha3.PXEBootProtocolVirtualMedia {
 			return r.advanceVirtualMedia(ctx, op, &machine, target, now)
 		}

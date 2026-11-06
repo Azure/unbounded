@@ -75,6 +75,21 @@ type FileResolver struct {
 	KubernetesVersion string
 	ClusterDNS        string
 	ProviderLabels    map[string]string
+
+	// ExperimentalContainerIsolation enables the experimental container
+	// isolation mode (serve-pxe --experimental-container-isolation). When set,
+	// every agent configuration the resolver renders opts in
+	// (Experimental.ContainerIsolation); when not, a Machine that declares
+	// container gets no agent configuration, since its agent would refuse it.
+	ExperimentalContainerIsolation bool
+}
+
+// CheckIsolationEnabled returns an error when machine declares an
+// experimental isolation mode that this metalman does not enable. Metalman then
+// neither renders an agent configuration for it nor starts a HostReplace of it.
+func CheckIsolationEnabled(machine *v1alpha3.Machine, containerEnabled bool) error {
+	return provision.CheckIsolationEnabled(machine.Spec.Isolation, containerEnabled, "metalman",
+		"start metalman serve-pxe with --experimental-container-isolation")
 }
 
 func (f *FileResolver) NetbootImageRef(node *v1alpha3.Machine) string {
@@ -224,6 +239,10 @@ func (f *FileResolver) ResolveFileByPathForIP(ctx context.Context, path string, 
 		}
 
 		if node != nil {
+			if err := CheckIsolationEnabled(node, f.ExperimentalContainerIsolation); err != nil {
+				return nil, fmt.Errorf("rendering %s for Machine %s: %w", path, node.Name, err)
+			}
+
 			ci := f.Cluster.ClusterInfo()
 
 			agentConfig := provision.BuildAgentConfig(provision.BuildAgentConfigParams{
@@ -242,8 +261,9 @@ func (f *FileResolver) ResolveFileByPathForIP(ctx context.Context, path string, 
 					ClusterDNS:   f.ClusterDNS,
 					KubeVersion:  f.KubernetesVersion,
 				},
-				ProviderLabels: f.ProviderLabels,
-				AttestURL:      f.ServeURL,
+				ProviderLabels:                 f.ProviderLabels,
+				AttestURL:                      f.ServeURL,
+				ExperimentalContainerIsolation: f.ExperimentalContainerIsolation,
 			})
 
 			// The MarshalIndent prefix "    " (4 spaces) must match the
