@@ -790,7 +790,12 @@ struct PendingDevice {
 
     region: Option<Result<Rc<NativeRegion>>>,
 
-    implicit: Rc<NativeRegion>,
+    /// The implicit region being created off this thread (window mode);
+    /// `None` once finished into `implicit` or when none is needed.
+    implicit_registering: Option<Registering>,
+
+    /// `None` until the implicit region exists (or failed).
+    implicit: Option<Result<Rc<NativeRegion>>>,
 
     device: Rc<NativeDevice>,
 }
@@ -1334,6 +1339,14 @@ impl Owner {
         let mut pending = false;
 
         for device in &mut activation.devices {
+            match device.implicit_registering.as_ref().map(Registering::ready) {
+                Some(true) => {
+                    let registering = device.implicit_registering.take().expect("ready");
+                    device.implicit = Some(registering.finish());
+                }
+                Some(false) => pending = true,
+                None => {}
+            }
             match device.registering.as_ref().map(Registering::ready) {
                 Some(true) => {
                     device.region = Some(device.registering.take().expect("ready").finish());
@@ -1382,7 +1395,8 @@ impl Owner {
 
         for pending in devices {
             let region = pending.region.ok_or(Error::Unavailable)??;
-            let pool = Pool::new(region, pending.implicit, buffer_len, quota.clone())?;
+            let implicit = pending.implicit.ok_or(Error::Unavailable)??;
+            let pool = Pool::new(region, implicit, buffer_len, quota.clone())?;
             built.insert(
                 pending.tag,
                 DeviceState {
@@ -1524,14 +1538,23 @@ impl Owner {
                 return Err(Error::InvalidConfiguration);
             }
             // Writes read caller memory in place; there is no copy path.
-            // Probe implicit ODP first (window mode) so an unsupported device
-            // fails before the receive pool is allocated and registered.
-            let implicit =
-                NativeRegion::implicit(device.clone(), quota.clone()).ok_or(Error::Unavailable)?;
+            // Check implicit ODP support first (window mode) so an
+            // unsupported device fails before anything slow starts.
+            let implicit = match device.mode {
+                ffi::Mode::Registration => {
+                    Some(Ok(NativeRegion::implicit(device.clone(), quota.clone())
+                        .ok_or(Error::Unavailable)?))
+                }
+                ffi::Mode::Window if !device.supports_implicit() => {
+                    return Err(Error::Unavailable);
+                }
+                ffi::Mode::Window => None,
+            };
             pending.push(PendingDevice {
                 tag: selection.tag as u16,
                 registering: None,
                 region: None,
+                implicit_registering: None,
                 implicit,
                 device,
             });
@@ -1545,10 +1568,16 @@ impl Owner {
             grants = grants.min(device.device.max_grants().ok_or(Error::Unavailable)?);
         }
 
-        // Every check passed: start the slow registrations.
+        // Every check passed: start the slow registrations, each on its own
+        // helper thread, so the devices proceed in parallel. Creating an
+        // implicit ODP region alone takes over a second per mlx5 device.
         let wake = self.register_wake();
 
         for device in &mut pending {
+            if device.implicit.is_none() {
+                device.implicit_registering =
+                    ffi::Registering::implicit(device.device.clone(), quota.clone(), wake.clone())?;
+            }
             device.registering = Some(Registering::host(
                 device.device.clone(),
                 count * config.buffer_len,

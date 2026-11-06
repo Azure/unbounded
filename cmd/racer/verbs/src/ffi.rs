@@ -609,6 +609,11 @@ pub(crate) struct NativeDevice {
 }
 
 impl NativeDevice {
+    /// Whether the device supports implicit on-demand paging for RC writes.
+    pub(crate) fn supports_implicit(&self) -> bool {
+        self.caps.flags & CAP_ODP != 0
+    }
+
     /// The largest grants per link whose QP and CQ fit this device's
     /// reported limits, or `None` if not even one grant fits.
     pub(crate) fn max_grants(&self) -> Option<u32> {
@@ -1282,6 +1287,37 @@ impl Registering {
             node,
             move || unsafe { register(raw as *mut c_void, length as u64, bits) } as usize,
         ))
+    }
+
+    /// Start creating `device`'s implicit on-demand paging region, as
+    /// [`NativeRegion::implicit`] does, off the owner thread. On mlx5 this
+    /// one call takes over a second per device (the kernel populates the
+    /// implicit MR's translation tables through UMR), so creating each
+    /// device's region on its own helper makes activation cost the slowest
+    /// device instead of the sum. `Ok(None)` for a registration-mode device,
+    /// which needs no native region: use [`NativeRegion::implicit`].
+    pub(crate) fn implicit(
+        device: Rc<NativeDevice>,
+        quota: Arc<GuardOwner>,
+        wake: RegisterWake,
+    ) -> Result<Option<Self>> {
+        match device.mode {
+            Mode::Registration => return Ok(None),
+            Mode::Window if !device.supports_implicit() => return Err(Error::Unavailable),
+            Mode::Window => {}
+        }
+        let register = device.api.register_implicit;
+        let raw = device.raw.as_ptr() as usize;
+        Ok(Some(Self::start(
+            device,
+            None,
+            usize::MAX,
+            Access::IMPLICIT,
+            quota,
+            wake,
+            None,
+            move || unsafe { register(raw as *mut c_void) } as usize,
+        )))
     }
 
     /// Start registering all of `memory`'s dma-buf range, as
@@ -3740,6 +3776,48 @@ pub(crate) mod lifetime_tests {
         assert_eq!(built.length(), 64);
         drop(built);
         assert_eq!(charged.get(), 0, "charge returned after deregister");
+    }
+
+    #[test]
+    /// Registrations started together run concurrently, one helper each, so
+    /// activating many devices costs the slowest one, not the sum. Every
+    /// helper waits for all of them to start: run serially, none succeeds.
+    fn registrations_run_in_parallel() {
+        const DEVICES: usize = 8;
+        let (_qp, region, _charged) = fixture();
+        let started = Arc::new(AtomicUsize::new(0));
+        let wake: RegisterWake = Arc::new(|| {});
+        let pending: Vec<_> = (0..DEVICES)
+            .map(|_| {
+                let (quota, _) = quota();
+                let started = started.clone();
+                Registering::start(
+                    region.device.clone(),
+                    None,
+                    64,
+                    Access::PAGES,
+                    quota,
+                    wake.clone(),
+                    None,
+                    move || {
+                        started.fetch_add(1, Ordering::AcqRel);
+                        let deadline =
+                            std::time::Instant::now() + std::time::Duration::from_secs(10);
+                        while started.load(Ordering::Acquire) < DEVICES {
+                            if std::time::Instant::now() >= deadline {
+                                return 0;
+                            }
+                            std::thread::yield_now();
+                        }
+                        Box::into_raw(Box::new(vec![0u8; 64])) as usize
+                    },
+                )
+            })
+            .collect();
+        for registering in pending {
+            settle(&registering);
+            assert!(registering.finish().is_ok(), "helpers ran serially");
+        }
     }
 
     #[test]
