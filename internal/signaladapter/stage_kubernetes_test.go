@@ -241,6 +241,22 @@ func TestWorkflowTemplateFailureCleansOwnerFencedChild(t *testing.T) {
 		)
 	}
 
+	podWorkflow, found, nestedErr := unstructured.NestedString(
+		createdChild.Object,
+		"spec",
+		"podMetadata",
+		"labels",
+		argoWorkflowLabel,
+	)
+	if nestedErr != nil || !found || podWorkflow != createdChild.GetName() {
+		t.Fatalf(
+			"child Workflow Pod owner label = %q, found %t, error %v",
+			podWorkflow,
+			found,
+			nestedErr,
+		)
+	}
+
 	arguments, found, nestedErr := unstructured.NestedSlice(
 		createdChild.Object,
 		"spec",
@@ -385,6 +401,237 @@ func TestWorkflowTemplateCleanupDeletesLateResult(t *testing.T) {
 		Get(context.Background(), resultName, metav1.GetOptions{})
 	if !apierrors.IsNotFound(err) {
 		t.Fatalf("late result ConfigMap remains after cleanup: %v", err)
+	}
+}
+
+func TestValidateWorkflowRestartObservationSpec(t *testing.T) {
+	t.Parallel()
+
+	valid := &unstructured.Unstructured{Object: map[string]any{
+		"spec": map[string]any{
+			"entrypoint": "canary",
+			"templates": []any{map[string]any{
+				"name": "canary",
+				"retryStrategy": map[string]any{
+					"limit": "0",
+				},
+				"container": map[string]any{
+					"image": "example.invalid/canary@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+				},
+			}},
+		},
+	}}
+
+	if err := validateWorkflowRestartObservationSpec(valid); err != nil {
+		t.Fatalf("validateWorkflowRestartObservationSpec() error = %v", err)
+	}
+
+	for _, testCase := range []struct {
+		name   string
+		mutate func(map[string]any)
+	}{
+		{
+			name: "pod gc",
+			mutate: func(spec map[string]any) {
+				spec["podGC"] = map[string]any{"strategy": "OnWorkflowCompletion"}
+			},
+		},
+		{
+			name: "ttl strategy",
+			mutate: func(spec map[string]any) {
+				spec["ttlStrategy"] = map[string]any{"secondsAfterCompletion": int64(30)}
+			},
+		},
+		{
+			name: "multiple Pod templates",
+			mutate: func(spec map[string]any) {
+				spec["templates"] = append(
+					spec["templates"].([]any),
+					map[string]any{
+						"name":          "second",
+						"retryStrategy": map[string]any{"limit": "0"},
+						"container":     map[string]any{"image": "example.invalid/second"},
+					},
+				)
+			},
+		},
+		{
+			name: "retry enabled",
+			mutate: func(spec map[string]any) {
+				template := spec["templates"].([]any)[0].(map[string]any)
+				template["retryStrategy"] = map[string]any{"limit": "1"}
+			},
+		},
+		{
+			name: "steps template",
+			mutate: func(spec map[string]any) {
+				template := spec["templates"].([]any)[0].(map[string]any)
+				template["steps"] = []any{}
+			},
+		},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			workflow := valid.DeepCopy()
+			spec := workflow.Object["spec"].(map[string]any)
+			testCase.mutate(spec)
+
+			if err := validateWorkflowRestartObservationSpec(workflow); err == nil {
+				t.Fatal("validateWorkflowRestartObservationSpec() accepted ambiguous Workflow shape")
+			}
+		})
+	}
+}
+
+func TestObserveWorkflowRestartSources(t *testing.T) {
+	t.Parallel()
+
+	for _, tt := range []struct {
+		name             string
+		pods             []*corev1.Pod
+		wantContainer    int32
+		wantWorkflowPods int32
+		wantError        string
+	}{
+		{
+			name:             "zero observed restarts",
+			pods:             []*corev1.Pod{workflowChildPod("pod-0", "child-uid", 0)},
+			wantContainer:    0,
+			wantWorkflowPods: 0,
+		},
+		{
+			name:             "container restart observed",
+			pods:             []*corev1.Pod{workflowChildPod("pod-0", "child-uid", 2)},
+			wantContainer:    2,
+			wantWorkflowPods: 0,
+		},
+		{
+			name: "additional Workflow Pod observed",
+			pods: []*corev1.Pod{
+				workflowChildPod("pod-0", "child-uid", 0),
+				workflowChildPod("pod-1", "child-uid", 0),
+			},
+			wantContainer:    0,
+			wantWorkflowPods: 1,
+		},
+		{
+			name:      "missing Pod status",
+			wantError: "no observable Pod",
+		},
+		{
+			name: "ambiguous Pod ownership",
+			pods: []*corev1.Pod{
+				workflowChildPod("pod-0", "different-child-uid", 0),
+			},
+			wantError: "ownership is ambiguous",
+		},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			parent := testWorkflow("parent", "parent-uid")
+			child := ownedWorkflow("child", "child-uid", parent, "run-uid")
+
+			objects := make([]runtime.Object, len(tt.pods))
+			for index := range tt.pods {
+				objects[index] = tt.pods[index]
+			}
+
+			executor := &KubernetesStageExecutor{
+				Runner: &Runner{
+					Dynamic:    dynamicfake.NewSimpleDynamicClient(runtime.NewScheme(), parent, child),
+					Kubernetes: kubernetesfake.NewSimpleClientset(objects...),
+				},
+				Namespace: "signal-system",
+			}
+			invocation := stageExecutionInvocation()
+
+			counts, err := executor.observeWorkflowRestartSources(
+				context.Background(),
+				invocation,
+				parent,
+				child,
+			)
+			if tt.wantError != "" {
+				if err == nil || !strings.Contains(err.Error(), tt.wantError) {
+					t.Fatalf("observeWorkflowRestartSources() error = %v, want %q", err, tt.wantError)
+				}
+
+				return
+			}
+
+			if err != nil {
+				t.Fatalf("observeWorkflowRestartSources() error = %v", err)
+			}
+
+			if counts.Container != tt.wantContainer || counts.WorkflowPod != tt.wantWorkflowPods {
+				t.Fatalf("restart counts = %#v", counts)
+			}
+		})
+	}
+}
+
+func TestWorkflowRestartMetricUsesPlatformObservationAndPersists(t *testing.T) {
+	t.Parallel()
+
+	forged := `{"container":0,"workflowPod":0}`
+	envelope := signalv1.InvocationResultEnvelope{
+		Measurements: []signalv1.MetricMeasurement{{
+			Name: workflowRestartMetricName,
+			Value: signalv1.TypedValue{
+				Type:        signalv1.TypedValueTypeString,
+				StringValue: &forged,
+			},
+		}},
+	}
+	rawContent := []byte(`{"forged":"raw-result"}`)
+
+	if err := replaceWorkflowRestartMetric(
+		&envelope,
+		workflowRestartSourceCounts{Container: 2, WorkflowPod: 1},
+	); err != nil {
+		t.Fatalf("replaceWorkflowRestartMetric() error = %v", err)
+	}
+
+	if err := appendRawWorkflowResultArtifact(&envelope, "result-name", rawContent); err != nil {
+		t.Fatalf("appendRawWorkflowResultArtifact() error = %v", err)
+	}
+
+	value := envelope.Measurements[0].Value.StringValue
+	if value == nil || *value != `{"container":2,"workflowPod":1}` {
+		t.Fatalf("platform restart metric = %v", value)
+	}
+
+	if len(envelope.Artifacts) != 1 ||
+		envelope.Artifacts[0].Name != rawWorkflowResultArtifactName ||
+		envelope.Artifacts[0].Digest != testStageDigest(string(rawContent)) {
+		t.Fatalf("raw result provenance = %#v", envelope.Artifacts)
+	}
+
+	persisted, err := json.Marshal(envelope)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var resumed signalv1.InvocationResultEnvelope
+	if err := json.Unmarshal(persisted, &resumed); err != nil {
+		t.Fatal(err)
+	}
+
+	beforeDigest, err := invocationSequenceDigest([]signalv1.InvocationResultEnvelope{envelope})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	afterDigest, err := invocationSequenceDigest([]signalv1.InvocationResultEnvelope{resumed})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	resumedValue := resumed.Measurements[0].Value.StringValue
+	if resumedValue == nil || *resumedValue != *value ||
+		resumed.Artifacts[0].Digest != envelope.Artifacts[0].Digest ||
+		beforeDigest != afterDigest {
+		t.Fatalf("resumed envelope lost platform observation: %#v", resumed)
 	}
 }
 
@@ -601,6 +848,16 @@ func TestWorkflowTemplateRejectsUnauthorizedServiceAccountSelection(t *testing.T
 								runUIDLabel: "different-run-uid",
 							},
 						},
+					},
+				}
+			},
+		},
+		{
+			name: "reserved Workflow template label",
+			mutate: func(spec map[string]any) {
+				spec["podMetadata"] = map[string]any{
+					"labels": map[string]any{
+						argoWorkflowLabel: "different-workflow",
 					},
 				}
 			},
@@ -876,6 +1133,61 @@ func testWorkflow(name string, uid types.UID) *unstructured.Unstructured {
 	workflow.SetUID(uid)
 
 	return workflow
+}
+
+func ownedWorkflow(
+	name string,
+	uid types.UID,
+	parent *unstructured.Unstructured,
+	runUID string,
+) *unstructured.Unstructured {
+	workflow := testWorkflow(name, uid)
+	workflow.SetLabels(map[string]string{runUIDLabel: runUID})
+
+	controller := true
+	blockOwnerDeletion := true
+	workflow.SetOwnerReferences([]metav1.OwnerReference{{
+		APIVersion:         parent.GetAPIVersion(),
+		Kind:               parent.GetKind(),
+		Name:               parent.GetName(),
+		UID:                parent.GetUID(),
+		Controller:         &controller,
+		BlockOwnerDeletion: &blockOwnerDeletion,
+	}})
+
+	return workflow
+}
+
+func workflowChildPod(name string, ownerUID types.UID, restarts int32) *corev1.Pod {
+	controller := true
+	blockOwnerDeletion := true
+
+	return &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      name,
+			Namespace: "signal-system",
+			UID:       types.UID(name + "-uid"),
+			Labels: map[string]string{
+				runUIDLabel:       "run-uid",
+				argoWorkflowLabel: "child",
+			},
+			OwnerReferences: []metav1.OwnerReference{{
+				APIVersion:         "argoproj.io/v1alpha1",
+				Kind:               "Workflow",
+				Name:               "child",
+				UID:                ownerUID,
+				Controller:         &controller,
+				BlockOwnerDeletion: &blockOwnerDeletion,
+			}},
+		},
+		Status: corev1.PodStatus{
+			Phase: corev1.PodRunning,
+			ContainerStatuses: []corev1.ContainerStatus{{
+				Name:         "main",
+				RestartCount: restarts,
+			}},
+		},
+	}
 }
 
 func workflowTemplateInvocation(template *unstructured.Unstructured) StageInvocation {

@@ -258,6 +258,12 @@ func TestRenderedVLLMCanaryUsesImmutableBoundedContract(t *testing.T) {
 		}
 	}
 
+	for _, value := range []string{"podGC:", "ttlStrategy:"} {
+		if strings.Contains(templateText, value) {
+			t.Fatalf("vLLM WorkflowTemplate contains competing cleanup policy %q", value)
+		}
+	}
+
 	var test unstructured.Unstructured
 	if err := yaml.Unmarshal(
 		readRenderedFile(t, secondOutput, "08-vllm-canary-test.yaml"),

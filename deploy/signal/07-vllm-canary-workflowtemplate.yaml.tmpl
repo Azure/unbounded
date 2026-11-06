@@ -30,10 +30,6 @@ spec:
   entrypoint: canary
   serviceAccountName: project-signal-vllm-workload
   automountServiceAccountToken: true
-  podGC:
-    strategy: OnWorkflowCompletion
-  ttlStrategy:
-    secondsAfterCompletion: 300
   arguments:
     parameters:
       - name: invocation-id

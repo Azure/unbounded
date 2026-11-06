@@ -580,10 +580,6 @@ def run_harness(args):
             "errorSourceCounts",
             typed_string(canonical_json({"request": request_errors, "server": server_errors})),
         ),
-        measurement(
-            "restartSourceCounts",
-            typed_string(canonical_json({"container": 0, "workflowPod": 0})),
-        ),
         measurement("tensorParallelSize", typed_integer(TENSOR_PARALLEL_SIZE)),
         measurement("observedGpuCount", typed_integer(visible_count), "devices"),
         measurement("activeGpuCount", typed_integer(active_count), "devices"),

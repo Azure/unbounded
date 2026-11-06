@@ -20,6 +20,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime/schema"
+	"k8s.io/apimachinery/pkg/types"
 	utilptr "k8s.io/utils/ptr"
 
 	signalv1 "github.com/Azure/unbounded/api/signal/v1alpha1"
@@ -28,7 +29,16 @@ import (
 const (
 	invocationResultPrefix            = "PROJECT_SIGNAL_INVOCATION_RESULT_V1 "
 	maximumWorkflowArgumentParameters = 256
+	argoWorkflowLabel                 = "workflows.argoproj.io/workflow"
+	workflowRestartMetricName         = "restartSourceCounts"
+	rawWorkflowResultArtifactName     = "rawWorkflowResult"
+	maxInvocationResultArtifacts      = 16
 )
+
+type workflowRestartSourceCounts struct {
+	Container   int32 `json:"container"`
+	WorkflowPod int32 `json:"workflowPod"`
+}
 
 type KubernetesStageExecutor struct {
 	Runner                 *Runner
@@ -661,11 +671,16 @@ func (e *KubernetesStageExecutor) executeWorkflowTemplate(
 		return signalv1.InvocationResultEnvelope{}, errors.New("approved WorkflowTemplate sets a conflicting Run UID Pod label")
 	}
 
+	if existing := podLabels[argoWorkflowLabel]; existing != "" && existing != name {
+		return signalv1.InvocationResultEnvelope{}, errors.New("approved WorkflowTemplate sets a conflicting Workflow Pod label")
+	}
+
 	if podLabels == nil {
 		podLabels = map[string]string{}
 	}
 
 	podLabels[runUIDLabel] = string(invocation.RunUID)
+	podLabels[argoWorkflowLabel] = name
 
 	if err := unstructured.SetNestedStringMap(podMetadata, podLabels, "labels"); err != nil {
 		return signalv1.InvocationResultEnvelope{}, fmt.Errorf("set WorkflowTemplate Pod labels: %w", err)
@@ -687,6 +702,12 @@ func (e *KubernetesStageExecutor) executeWorkflowTemplate(
 		},
 		"spec": templateSpec,
 	}}
+
+	if workflowRestartMetricRequired(invocation) {
+		if err := validateWorkflowRestartObservationSpec(workflow); err != nil {
+			return signalv1.InvocationResultEnvelope{}, fmt.Errorf("%w: %w", errInvocationEvidenceIntegrity, err)
+		}
+	}
 
 	created, err := e.Runner.Dynamic.Resource(workflowGVR).Namespace(e.Namespace).
 		Create(ctx, workflow, metav1.CreateOptions{})
@@ -721,6 +742,29 @@ func (e *KubernetesStageExecutor) executeWorkflowTemplate(
 
 			if err := json.Unmarshal(content, &envelope); err != nil {
 				return signalv1.InvocationResultEnvelope{}, fmt.Errorf("decode WorkflowTemplate result: %w", err)
+			}
+
+			if err := validateInvocationEnvelope(invocation, &envelope); err != nil {
+				return signalv1.InvocationResultEnvelope{}, fmt.Errorf(
+					"%w: validate raw WorkflowTemplate result: %w",
+					errInvocationEvidenceIntegrity,
+					err,
+				)
+			}
+
+			if workflowRestartMetricRequired(invocation) {
+				counts, err := e.observeWorkflowRestartSources(ctx, invocation, parent, created)
+				if err != nil {
+					return signalv1.InvocationResultEnvelope{}, err
+				}
+
+				if err := replaceWorkflowRestartMetric(&envelope, counts); err != nil {
+					return signalv1.InvocationResultEnvelope{}, fmt.Errorf("%w: %w", errInvocationEvidenceIntegrity, err)
+				}
+
+				if err := appendRawWorkflowResultArtifact(&envelope, resultName, content); err != nil {
+					return signalv1.InvocationResultEnvelope{}, fmt.Errorf("%w: %w", errInvocationEvidenceIntegrity, err)
+				}
 			}
 
 			cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 30*time.Second)
@@ -777,6 +821,255 @@ func (e *KubernetesStageExecutor) executeWorkflowTemplate(
 	}
 }
 
+func workflowRestartMetricRequired(invocation StageInvocation) bool {
+	for _, metric := range invocation.Stage.Test.Metrics {
+		if metric.Name == workflowRestartMetricName {
+			return true
+		}
+	}
+
+	return false
+}
+
+func validateWorkflowRestartObservationSpec(workflow *unstructured.Unstructured) error {
+	spec, found, err := unstructured.NestedMap(workflow.Object, "spec")
+	if err != nil {
+		return fmt.Errorf("decode Workflow spec for restart observation: %w", err)
+	}
+
+	if !found {
+		return errors.New("workflow restart observation requires a Workflow spec")
+	}
+
+	if _, hasPodGC := spec["podGC"]; hasPodGC {
+		return errors.New("workflow restart observation forbids Pod GC")
+	}
+
+	if _, hasTTLStrategy := spec["ttlStrategy"]; hasTTLStrategy {
+		return errors.New("workflow restart observation forbids a TTL strategy")
+	}
+
+	entrypoint, found, err := unstructured.NestedString(spec, "entrypoint")
+	if err != nil {
+		return fmt.Errorf("decode Workflow entrypoint for restart observation: %w", err)
+	}
+
+	if !found || entrypoint == "" {
+		return errors.New("workflow restart observation requires an entrypoint")
+	}
+
+	templates, found, err := unstructured.NestedSlice(spec, "templates")
+	if err != nil {
+		return fmt.Errorf("decode Workflow templates for restart observation: %w", err)
+	}
+
+	if !found || len(templates) != 1 {
+		return errors.New("workflow restart observation requires exactly one Pod template")
+	}
+
+	template, ok := templates[0].(map[string]any)
+	if !ok {
+		return errors.New("workflow restart observation template is invalid")
+	}
+
+	name, _, err := unstructured.NestedString(template, "name")
+	if err != nil {
+		return fmt.Errorf("decode Workflow template name for restart observation: %w", err)
+	}
+
+	if name != entrypoint {
+		return errors.New("workflow restart observation entrypoint must select the only template")
+	}
+
+	if _, hasContainer := template["container"]; !hasContainer {
+		return errors.New("workflow restart observation requires a container template")
+	}
+
+	for _, unsupported := range []string{"containerSet", "dag", "data", "http", "resource", "script", "steps", "suspend"} {
+		if _, hasUnsupported := template[unsupported]; hasUnsupported {
+			return fmt.Errorf("workflow restart observation does not support %s templates", unsupported)
+		}
+	}
+
+	retryStrategy, found, err := unstructured.NestedMap(template, "retryStrategy")
+	if err != nil {
+		return fmt.Errorf("decode Workflow retry strategy for restart observation: %w", err)
+	}
+
+	if !found {
+		return errors.New("workflow restart observation requires an explicit zero retry limit")
+	}
+
+	limit, found := retryStrategy["limit"]
+	if !found || (limit != "0" && limit != int64(0) && limit != float64(0)) {
+		return errors.New("workflow restart observation requires a zero retry limit")
+	}
+
+	return nil
+}
+
+func (e *KubernetesStageExecutor) observeWorkflowRestartSources(
+	ctx context.Context,
+	invocation StageInvocation,
+	parent *unstructured.Unstructured,
+	created *unstructured.Unstructured,
+) (workflowRestartSourceCounts, error) {
+	current, err := e.Runner.Dynamic.Resource(workflowGVR).Namespace(e.Namespace).
+		Get(ctx, created.GetName(), metav1.GetOptions{})
+	if err != nil {
+		return workflowRestartSourceCounts{}, fmt.Errorf("observe child Workflow restart sources: %w", err)
+	}
+
+	if current.GetUID() != created.GetUID() ||
+		current.GetLabels()[runUIDLabel] != string(invocation.RunUID) ||
+		!hasControllerOwner(current.GetOwnerReferences(), parent.GetUID(), parent.GetName(), "Workflow") {
+		return workflowRestartSourceCounts{}, errors.New("child Workflow identity or ownership is ambiguous")
+	}
+
+	selector := fmt.Sprintf(
+		"%s=%s,%s=%s",
+		runUIDLabel,
+		invocation.RunUID,
+		argoWorkflowLabel,
+		created.GetName(),
+	)
+
+	pods, err := e.Runner.Kubernetes.CoreV1().Pods(e.Namespace).
+		List(ctx, metav1.ListOptions{LabelSelector: selector})
+	if err != nil {
+		return workflowRestartSourceCounts{}, fmt.Errorf("list child Workflow Pods: %w", err)
+	}
+
+	if len(pods.Items) == 0 {
+		return workflowRestartSourceCounts{}, errors.New("child Workflow has no observable Pod")
+	}
+
+	counts := workflowRestartSourceCounts{WorkflowPod: int32(len(pods.Items) - 1)}
+	for index := range pods.Items {
+		pod := &pods.Items[index]
+		if pod.Labels[runUIDLabel] != string(invocation.RunUID) ||
+			pod.Labels[argoWorkflowLabel] != created.GetName() ||
+			!hasControllerOwner(pod.OwnerReferences, created.GetUID(), created.GetName(), "Workflow") {
+			return workflowRestartSourceCounts{}, fmt.Errorf("child Workflow Pod %q identity or ownership is ambiguous", pod.Name)
+		}
+
+		if len(pod.Status.ContainerStatuses) == 0 {
+			return workflowRestartSourceCounts{}, fmt.Errorf("child Workflow Pod %q has no container status", pod.Name)
+		}
+
+		for _, status := range pod.Status.InitContainerStatuses {
+			counts.Container += status.RestartCount
+		}
+
+		for _, status := range pod.Status.ContainerStatuses {
+			counts.Container += status.RestartCount
+		}
+
+		for _, status := range pod.Status.EphemeralContainerStatuses {
+			counts.Container += status.RestartCount
+		}
+	}
+
+	return counts, nil
+}
+
+func hasControllerOwner(
+	owners []metav1.OwnerReference,
+	uid types.UID,
+	name string,
+	kind string,
+) bool {
+	controllerFound := false
+
+	for _, owner := range owners {
+		if owner.Controller == nil || !*owner.Controller {
+			continue
+		}
+
+		if controllerFound ||
+			owner.UID != uid ||
+			owner.Name != name ||
+			owner.Kind != kind ||
+			owner.APIVersion != "argoproj.io/v1alpha1" {
+			return false
+		}
+
+		controllerFound = true
+	}
+
+	return controllerFound
+}
+
+func replaceWorkflowRestartMetric(
+	envelope *signalv1.InvocationResultEnvelope,
+	counts workflowRestartSourceCounts,
+) error {
+	content, err := json.Marshal(counts)
+	if err != nil {
+		return fmt.Errorf("encode observed Workflow restart sources: %w", err)
+	}
+
+	measurementIndex := -1
+
+	for index := range envelope.Measurements {
+		if envelope.Measurements[index].Name != workflowRestartMetricName {
+			continue
+		}
+
+		if measurementIndex >= 0 {
+			return errors.New("raw WorkflowTemplate result duplicates restartSourceCounts")
+		}
+
+		measurementIndex = index
+	}
+
+	measurement := signalv1.MetricMeasurement{
+		Name: workflowRestartMetricName,
+		Value: signalv1.TypedValue{
+			Type:        signalv1.TypedValueTypeString,
+			StringValue: utilptr.To(string(content)),
+		},
+	}
+	if measurementIndex >= 0 {
+		envelope.Measurements[measurementIndex] = measurement
+
+		return nil
+	}
+
+	if len(envelope.Measurements) >= 16 {
+		return errors.New("raw WorkflowTemplate result has no room for observed restartSourceCounts")
+	}
+
+	envelope.Measurements = append(envelope.Measurements, measurement)
+
+	return nil
+}
+
+func appendRawWorkflowResultArtifact(
+	envelope *signalv1.InvocationResultEnvelope,
+	resultName string,
+	content []byte,
+) error {
+	for _, artifact := range envelope.Artifacts {
+		if artifact.Name == rawWorkflowResultArtifactName {
+			return errors.New("raw WorkflowTemplate result uses reserved artifact name")
+		}
+	}
+
+	if len(envelope.Artifacts) >= maxInvocationResultArtifacts {
+		return errors.New("raw WorkflowTemplate result has no room for platform provenance")
+	}
+
+	sum := sha256.Sum256(content)
+	envelope.Artifacts = append(envelope.Artifacts, signalv1.ResultArtifactReference{
+		Name:   rawWorkflowResultArtifactName,
+		URI:    "urn:project-signal:workflow-result:" + resultName,
+		Digest: "sha256:" + hex.EncodeToString(sum[:]),
+	})
+
+	return nil
+}
+
 func validateWorkflowServiceAccount(spec map[string]any, allowed string) error {
 	if allowed == "" {
 		return errors.New("approved WorkflowTemplate execution requires an allowed ServiceAccount")
@@ -801,6 +1094,8 @@ func validateWorkflowServiceAccountFields(value any, allowed string) error {
 			switch key {
 			case "podSpecPatch":
 				return errors.New("approved WorkflowTemplate cannot use podSpecPatch")
+			case argoWorkflowLabel:
+				return errors.New("approved WorkflowTemplate cannot set the reserved Workflow Pod label")
 			case "serviceAccountName":
 				serviceAccount, ok := child.(string)
 				if !ok || serviceAccount != allowed {

@@ -180,6 +180,10 @@ class HarnessTest(unittest.TestCase):
             measurement_value(envelope, "promptTokens")["integerValue"],
             5,
         )
+        self.assertNotIn(
+            "restartSourceCounts",
+            [measurement["name"] for measurement in envelope["measurements"]],
+        )
         self.assertNotIn("redacted", json.dumps(envelope))
 
     def test_run_harness_fails_when_all_visible_gpus_are_not_active(self):

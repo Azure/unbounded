@@ -572,11 +572,16 @@ revision and weight-set digest, request success, positive prompt and
 completion tokens, zero named server/request error sources, zero named
 harness-container/Workflow-Pod restart sources, tensor parallel size eight,
 exactly eight visible and actively used GPUs, and successful cleanup. The
-restart sources are structurally zero because the Pod uses
-`restartPolicy: Never`, the Workflow has retry limit zero, and no nested
-workload is created. All Test assertions are explicit Suite assertions.
-Cleanup is also part of the canonical result envelope, and the adapter
-prevents a passed invocation from reporting failed Kubernetes cleanup.
+unprivileged harness does not report restart counts. After validating the raw
+result, the adapter observes the exact owner-fenced child Workflow and its
+Run-UID-fenced Pods, replaces any forged restart metric with named container
+restart and additional Workflow-Pod counts, and records the raw result digest
+separately before assertions or persistence. The child template does not use
+Argo Pod GC or TTL cleanup, so Pods remain available for this observation and
+are removed by the adapter's UID-fenced foreground Workflow deletion. Missing
+or ambiguous Pod ownership fails closed. All Test assertions are explicit Suite assertions.
+Cleanup is also part of the canonical result envelope, and the adapter prevents
+a passed invocation from reporting failed Kubernetes cleanup.
 Latency, time to first token, output throughput, and GPU memory are recorded
 as measurements only until separate thresholds are approved. Do not infer
 MPI, burn, collective, CUDA correctness, or general serving performance from
