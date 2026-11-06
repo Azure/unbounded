@@ -33,6 +33,15 @@ import (
 // triggered the reconcile still asks for a repave.
 const settleRequeueDelay = 2 * time.Second
 
+// blockedSettleRequeueDelay is how soon a repave that a blocked settle held
+// back tries again. A repave runs only on a Node delete event, and a running
+// kubelet does not re-create a deleted Node, so a blocked settle that ended the
+// reconcile would leave the node unregistered for good. Retrying keeps the
+// Node deletion's request for a repave: once the journal is repaired or
+// removed, or the cleanup that kept the change open succeeds, the repave goes
+// ahead.
+const blockedSettleRequeueDelay = time.Minute
+
 // isolationChangeStrategy maps the engine's strategy to the status enum.
 func isolationChangeStrategy(s migrate.Strategy) v1alpha3.IsolationChangeStrategy {
 	switch s {
@@ -227,8 +236,12 @@ func (e *migrationEnv) settleIsolationChanges(ctx context.Context, log *slog.Log
 // settleBeforeRepave settles earlier changes at the start of a repave and says
 // how the reconcile goes on: done is true when it must stop here with result.
 // A settle that resolved something requeues the repave rather than consuming
-// it, since the Node deletion still asks for one. A blocked settle or a
-// reprovision in progress ends the reconcile: nothing new starts over it.
+// it, since the Node deletion still asks for one. A blocked settle requeues the
+// repave after blockedSettleRequeueDelay, and starts nothing over the change it
+// could not settle. It does not restart the node stack to bring the Node back
+// either: the host may be mid-change, and the settle says why nothing
+// changed. A reprovision in progress ends the reconcile: the daemon it
+// installs takes over.
 func (r *repaveReconciler) settleBeforeRepave(ctx context.Context) (reconcile.Result, bool) {
 	res := r.migration().settleIsolationChanges(ctx, r.log, r.Client, r.machineName)
 
@@ -238,7 +251,9 @@ func (r *repaveReconciler) settleBeforeRepave(ctx context.Context) (reconcile.Re
 
 		return reconcile.Result{}, true
 	case res.blocked:
-		return reconcile.Result{}, true
+		r.log.Info("repave deferred: an earlier isolation change is not settled", "retry_after", blockedSettleRequeueDelay)
+
+		return reconcile.Result{RequeueAfter: blockedSettleRequeueDelay}, true
 	case res.resolved:
 		if res.failedTarget != "" {
 			// The change was tried and failed. The repave this settle
