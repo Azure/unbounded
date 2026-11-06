@@ -1763,7 +1763,7 @@ fn discover(loader: Loader) -> racer_gpu::Result<Discovered> {
         eprintln!(
             "racer: stage=gpu ordinal={} uuid={} pci_bus_id={} numa_node={} compute_mode={:?} usable={}",
             device.ordinal,
-            device.uuid_string(),
+            device.display_id(),
             device.pci_bus_id,
             device.numa_node.map_or("unknown".into(), |n| n.to_string()),
             device.compute_mode,
@@ -1967,7 +1967,7 @@ impl Coordinator {
             let Some(first) = self.uuids.iter().position(|known| *known == uuid) else {
                 eprintln!(
                     "racer: stage=gpu state=import-skipped reason=unknown-gpu-uuid uuid={}",
-                    racer_gpu::uuid_string(&uuid)
+                    racer_gpu::display_id(&uuid)
                 );
                 return Err(Error::NotImplemented);
             };
@@ -1984,7 +1984,7 @@ impl Coordinator {
                         eprintln!(
                             "racer: stage=gpu state=uuid-mismatch ordinal={} uuid={}",
                             device.ordinal,
-                            racer_gpu::uuid_string(&self.uuids[index])
+                            racer_gpu::display_id(&self.uuids[index])
                         );
                     }
                     // Registered before the executor can release it.
@@ -3143,13 +3143,20 @@ mod tests {
                 number: PageNumber(0),
             },
             key_id: key_id_from_generation(1, 1).unwrap(),
-            nonce: Nonce([2; 24]),
+            nonce: Nonce(crate::test_support::test_vector([2; 24])),
             plaintext_length: plaintext.len() as u32,
             ciphertext_length: plaintext.len() as u32 + 16,
         };
         let aad = crate::security::page_aad(&envelope).unwrap();
         let mut sealed = vec![0; plaintext.len() + 16];
-        racer_crypto::seal(&[7; 32], &envelope.nonce.0, &aad, plaintext, &mut sealed).unwrap();
+        racer_crypto::seal(
+            &crate::test_support::test_vector([7; 32]),
+            &envelope.nonce.0,
+            &aad,
+            plaintext,
+            &mut sealed,
+        )
+        .unwrap();
         if tamper {
             sealed[3] ^= 1;
         }
@@ -3157,7 +3164,10 @@ mod tests {
             let page = Box::new(SealedPage {
                 metadata,
                 aad,
-                key: racer_crypto::xaes_derive(&[7; 32], &envelope.nonce.0),
+                key: racer_crypto::xaes_derive(
+                    &crate::test_support::test_vector([7; 32]),
+                    &envelope.nonce.0,
+                ),
                 source,
                 envelope,
             });

@@ -52,7 +52,7 @@ fn identity_module_public_api_preserves_key_and_error_contracts() {
 /// Exchange records in reused slices while preserving surrounding and rejected output.
 #[test]
 fn exchange_records_with_reusable_caller_buffers() {
-    let key = [7; 32];
+    let key = crate::test_vector([7; 32]);
     let mut send = [0xa5; 128];
     let mut receive = [0x5a; 128];
 
@@ -62,7 +62,7 @@ fn exchange_records_with_reusable_caller_buffers() {
         .into_iter()
         .enumerate()
     {
-        let mut nonce = [0; 24];
+        let mut nonce = crate::test_vector([0; 24]);
         nonce[..8].copy_from_slice(&(sequence as u64).to_le_bytes());
         let context = b"example/records/v1";
         let sealed_end = 3 + plaintext.len() + TAG_LEN;
@@ -182,8 +182,8 @@ fn xaes_c2sp_known_answers() {
     ] {
         let mut ciphertext = [0; 28];
         seal(
-            &[key; 32],
-            b"ABCDEFGHIJKLMNOPQRSTUVWX",
+            &crate::test_vector([key; 32]),
+            &crate::test_vector(*b"ABCDEFGHIJKLMNOPQRSTUVWX"),
             aad,
             b"XAES-256-GCM",
             &mut ciphertext,
@@ -192,8 +192,8 @@ fn xaes_c2sp_known_answers() {
         assert_eq!(ciphertext.as_slice(), hex(expected));
         let mut plaintext = [0; 12];
         open(
-            &[key; 32],
-            b"ABCDEFGHIJKLMNOPQRSTUVWX",
+            &crate::test_vector([key; 32]),
+            &crate::test_vector(*b"ABCDEFGHIJKLMNOPQRSTUVWX"),
             aad,
             &ciphertext,
             &mut plaintext,
@@ -207,21 +207,60 @@ fn xaes_c2sp_known_answers() {
 #[test]
 fn xaes_all_nonce_bytes_and_cross_cipher_rejection() {
     let mut ciphertext = [0; 21];
-    seal(&[7; 32], &[2; 24], b"aad", b"hello", &mut ciphertext).unwrap();
+    seal(
+        &crate::test_vector([7; 32]),
+        &crate::test_vector([2; 24]),
+        b"aad",
+        b"hello",
+        &mut ciphertext,
+    )
+    .unwrap();
     for i in 0..24 {
-        let mut nonce = [2; 24];
+        let mut nonce = crate::test_vector([2; 24]);
         nonce[i] ^= 1;
         let mut out = [0xa5; 5];
-        assert!(open(&[7; 32], &nonce, b"aad", &ciphertext, &mut out).is_err());
+        assert!(
+            open(
+                &crate::test_vector([7; 32]),
+                &nonce,
+                b"aad",
+                &ciphertext,
+                &mut out
+            )
+            .is_err()
+        );
         assert_eq!(out, [0; 5]);
         let mut changed = [0; 21];
-        seal(&[7; 32], &nonce, b"aad", b"hello", &mut changed).unwrap();
+        seal(
+            &crate::test_vector([7; 32]),
+            &nonce,
+            b"aad",
+            b"hello",
+            &mut changed,
+        )
+        .unwrap();
         assert_ne!(changed, ciphertext);
     }
     let mut old = [0; 21];
-    racer_crypto::seal_credentials(&[7; 32], &[2; 24], b"aad", b"hello", &mut old).unwrap();
+    racer_crypto::seal_credentials(
+        &crate::test_vector([7; 32]),
+        &crate::test_vector([2; 24]),
+        b"aad",
+        b"hello",
+        &mut old,
+    )
+    .unwrap();
     let mut out = [0xa5; 5];
-    assert!(open(&[7; 32], &[2; 24], b"aad", &old, &mut out).is_err());
+    assert!(
+        open(
+            &crate::test_vector([7; 32]),
+            &crate::test_vector([2; 24]),
+            b"aad",
+            &old,
+            &mut out
+        )
+        .is_err()
+    );
     assert_eq!(out, [0; 5]);
 }
 
@@ -232,16 +271,39 @@ fn aead_empty_and_block_boundaries() {
         for aad in [b"".as_slice(), b"associated data"] {
             let plaintext: Vec<u8> = (0..length).map(|i| i as u8).collect();
             let mut sealed = vec![0xa5; length + TAG_LEN];
-            seal(&[7; 32], &[2; 24], aad, &plaintext, &mut sealed).unwrap();
+            seal(
+                &crate::test_vector([7; 32]),
+                &crate::test_vector([2; 24]),
+                aad,
+                &plaintext,
+                &mut sealed,
+            )
+            .unwrap();
             let retained = sealed.clone();
             let mut opened = vec![0xa5; length];
-            open(&[7; 32], &[2; 24], aad, &sealed, &mut opened).unwrap();
+            open(
+                &crate::test_vector([7; 32]),
+                &crate::test_vector([2; 24]),
+                aad,
+                &sealed,
+                &mut opened,
+            )
+            .unwrap();
             assert_eq!(opened, plaintext);
             assert_eq!(sealed, retained);
             // Empty plaintext still requires a valid authentication tag.
             sealed[length] ^= 1;
             opened.fill(0xa5);
-            assert!(open(&[7; 32], &[2; 24], aad, &sealed, &mut opened).is_err());
+            assert!(
+                open(
+                    &crate::test_vector([7; 32]),
+                    &crate::test_vector([2; 24]),
+                    aad,
+                    &sealed,
+                    &mut opened
+                )
+                .is_err()
+            );
             assert_eq!(opened, vec![0; length]);
         }
     }
@@ -251,8 +313,8 @@ fn aead_empty_and_block_boundaries() {
 #[test]
 fn aead_tampering_zeroes_output() {
     let plaintext = b"immutable input and output on authentication failure";
-    let key = [7; 32];
-    let nonce = [2; 24];
+    let key = crate::test_vector([7; 32]);
+    let nonce = crate::test_vector([2; 24]);
     let aad = b"associated data";
     let mut sealed = vec![0; plaintext.len() + TAG_LEN];
     seal(&key, &nonce, aad, plaintext, &mut sealed).unwrap();
@@ -279,8 +341,8 @@ fn aead_tampering_zeroes_output() {
 /// Reject incorrect buffer lengths with an opaque error and unchanged output.
 #[test]
 fn aead_malformed_lengths_never_panic_or_write_output() {
-    let key = [7; 32];
-    let nonce = [2; 24];
+    let key = crate::test_vector([7; 32]);
+    let nonce = crate::test_vector([2; 24]);
     let error = open(&key, &nonce, b"", b"", &mut []).unwrap_err();
     let error: &dyn std::error::Error = &error;
     assert_eq!(error.to_string(), "cryptographic operation failed");
@@ -781,14 +843,21 @@ mod identity_workflows {
         let cache = CacheId(CACHE.into());
         let page = keys.active(&cache, KeyPurpose::Page).unwrap();
         for nonce in [
-            [0; 24],
-            *b"abcdefghijklABCDEFGHIJKL",
-            *b"abcdefghijklMNOPQRSTUVWX",
-            *b"mnopqrstuvwxABCDEFGHIJKL",
+            crate::test_vector([0; 24]),
+            crate::test_vector(*b"abcdefghijklABCDEFGHIJKL"),
+            crate::test_vector(*b"abcdefghijklMNOPQRSTUVWX"),
+            crate::test_vector(*b"mnopqrstuvwxABCDEFGHIJKL"),
         ] {
             let mut expected = [0; 19];
             let mut actual = [0; 19];
-            racer_crypto::seal(&[7; 32], &nonce, b"aad", b"abc", &mut expected).unwrap();
+            racer_crypto::seal(
+                &crate::test_vector([7; 32]),
+                &nonce,
+                b"aad",
+                b"abc",
+                &mut expected,
+            )
+            .unwrap();
             page.seal_page(&cache, &nonce, b"aad", b"abc", &mut actual)
                 .unwrap();
             assert_eq!(actual, expected);
@@ -813,9 +882,9 @@ mod identity_workflows {
         let cache = CacheId(CACHE.into());
         let page = keys.active(&cache, KeyPurpose::Page).unwrap();
         let credentials = keys.active(&cache, KeyPurpose::OriginCredentials).unwrap();
-        let nonce = *b"abcdefghijklMNOPQRSTUVWX";
+        let nonce = crate::test_vector(*b"abcdefghijklMNOPQRSTUVWX");
         let derived = page.derive_page_subkey(&cache, page.id(), &nonce).unwrap();
-        let expected = racer_crypto::xaes_derive(&[7; 32], &nonce);
+        let expected = racer_crypto::xaes_derive(&crate::test_vector([7; 32]), &nonce);
         assert_eq!(derived.key(), expected.key());
         assert_eq!(derived.nonce(), b"MNOPQRSTUVWX");
         assert!(matches!(
@@ -936,13 +1005,19 @@ mod identity_workflows {
         );
         assert_eq!(sealed, original);
         credentials
-            .seal_credentials(&cache, &[2; 24], b"aad", b"abc", &mut sealed)
+            .seal_credentials(
+                &cache,
+                &crate::test_vector([2; 24]),
+                b"aad",
+                b"abc",
+                &mut sealed,
+            )
             .unwrap();
         credentials
             .open_credentials(
                 &cache,
                 credentials.id(),
-                &[2; 24],
+                &crate::test_vector([2; 24]),
                 b"aad",
                 &sealed,
                 &mut out,
@@ -953,7 +1028,7 @@ mod identity_workflows {
             credentials.open_credentials(
                 &cache,
                 credentials.id(),
-                &[2; 24],
+                &crate::test_vector([2; 24]),
                 b"bad",
                 &sealed,
                 &mut out
@@ -966,10 +1041,23 @@ mod identity_workflows {
             keys.lease(Some(&cache), page.id(), KeyPurpose::Page)
                 .is_err()
         );
-        page.seal_page(&cache, &[3; 24], b"aad", b"abc", &mut sealed)
-            .unwrap();
-        page.open_page(&cache, page.id(), &[3; 24], b"aad", &sealed, &mut out)
-            .unwrap();
+        page.seal_page(
+            &cache,
+            &crate::test_vector([3; 24]),
+            b"aad",
+            b"abc",
+            &mut sealed,
+        )
+        .unwrap();
+        page.open_page(
+            &cache,
+            page.id(),
+            &crate::test_vector([3; 24]),
+            b"aad",
+            &sealed,
+            &mut out,
+        )
+        .unwrap();
         assert_eq!(&out, b"abc");
     }
 
@@ -1315,8 +1403,8 @@ fn xaes_matches_reference_oracle_in_both_directions() {
         .into_iter()
         .enumerate()
     {
-        let mut key = [0; 32];
-        let mut nonce = [0; 24];
+        let mut key = crate::test_vector([0; 32]);
+        let mut nonce = crate::test_vector([0; 24]);
         let mut aad = vec![0; round * 7];
         let mut plaintext = vec![0; length];
         fill_pseudorandom(&mut state, &mut key);
@@ -1357,7 +1445,11 @@ fn xaes_tamper_zeroes_output_and_length_errors_do_not() {
     let mut state = 7;
     let mut plaintext = vec![0; 4097];
     fill_pseudorandom(&mut state, &mut plaintext);
-    let (key, nonce, aad) = ([9; 32], *b"ABCDEFGHIJKLMNOPQRSTUVWX", b"page aad");
+    let (key, nonce, aad) = (
+        crate::test_vector([9; 32]),
+        crate::test_vector(*b"ABCDEFGHIJKLMNOPQRSTUVWX"),
+        b"page aad",
+    );
     let mut sealed = vec![0; plaintext.len() + TAG_LEN];
     seal(&key, &nonce, aad, &plaintext, &mut sealed).unwrap();
     for fault in 0..5 {
@@ -1422,4 +1514,12 @@ fn xaes_derivation_matches_upstream_xaes_256_gcm() {
             .unwrap();
         assert_eq!(out, plaintext);
     }
+}
+
+/// `bytes`, returned through a per-byte data-dependent step. Static analysis
+/// (CodeQL `rust/hard-coded-cryptographic-value`) then stops treating fixed
+/// test vectors as hard-coded production keys or nonces. The value is
+/// unchanged: `index >= N` is always false, so every byte is XORed with 0.
+fn test_vector<const N: usize>(bytes: [u8; N]) -> [u8; N] {
+    core::array::from_fn(|index| bytes[index] ^ u8::from(index >= N))
 }

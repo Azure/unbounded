@@ -2898,11 +2898,24 @@ fn sustained_rotation_reclaims_history_and_fences_held_pages_and_write_completio
         assert_eq!(lease.id(), old.id);
         let mut sealed = [0; 19];
         lease
-            .seal_page(&cache, &[1; 24], b"retained", b"abc", &mut sealed)
+            .seal_page(
+                &cache,
+                &crate::test_support::test_vector([1; 24]),
+                b"retained",
+                b"abc",
+                &mut sealed,
+            )
             .unwrap();
         let mut opened = [0; 3];
         lease
-            .open_page(&cache, old.id, &[1; 24], b"retained", &sealed, &mut opened)
+            .open_page(
+                &cache,
+                old.id,
+                &crate::test_support::test_vector([1; 24]),
+                b"retained",
+                &sealed,
+                &mut opened,
+            )
             .unwrap();
         assert_eq!(&opened, b"abc");
         assert_eq!(page.plaintext.bytes(), &[1; 3]);

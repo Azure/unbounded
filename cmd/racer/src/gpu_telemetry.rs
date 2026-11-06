@@ -130,7 +130,7 @@ impl GpuTelemetry {
                 out,
                 "racer_gpu_decrypt_available{{ordinal=\"{}\",uuid=\"{}\"}} {}",
                 device.ordinal,
-                device.uuid_string(),
+                device.display_id(),
                 u8::from(helper.decrypts(device.ordinal))
             )?;
         }
@@ -427,7 +427,7 @@ mod tests {
             1
         );
         assert!(!text.contains("racer_gpu_joined"));
-        let uuid = helper.devices()[0].uuid_string();
+        let uuid = helper.devices()[0].display_id();
         assert!(text.contains(&format!(
             "racer_gpu_decrypt_available{{ordinal=\"0\",uuid=\"{uuid}\"}} 1\n"
         )));

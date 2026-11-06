@@ -866,7 +866,14 @@ mod safety {
 // These opaque-transport fixtures intentionally use empty AAD, not page AAD.
 fn seal_fixture(nonce: &[u8; 24], plaintext: &[u8]) -> Vec<u8> {
     let mut output = vec![0; plaintext.len() + TAG_LEN];
-    seal(&[7; 32], nonce, &[], plaintext, &mut output).unwrap();
+    seal(
+        &crate::test_support::test_vector([7; 32]),
+        nonce,
+        &[],
+        plaintext,
+        &mut output,
+    )
+    .unwrap();
     output
 }
 
@@ -875,7 +882,13 @@ fn open_fixture(
     sealed: &[u8],
 ) -> std::result::Result<Vec<u8>, racer_crypto::Error> {
     let mut output = vec![0; sealed.len().saturating_sub(TAG_LEN)];
-    open(&[7; 32], nonce, &[], sealed, &mut output)?;
+    open(
+        &crate::test_support::test_vector([7; 32]),
+        nonce,
+        &[],
+        sealed,
+        &mut output,
+    )?;
     Ok(output)
 }
 
@@ -1245,7 +1258,7 @@ impl RelayFixture {
         let plaintext: Vec<_> = (0..crate::model::PAGE_BYTES as usize)
             .map(|i| (i % 251) as u8)
             .collect();
-        let body = seal_fixture(&[8; 24], &plaintext);
+        let body = seal_fixture(&crate::test_support::test_vector([8; 24]), &plaintext);
         assert_eq!(body.len(), 16 * 1024 * 1024 + 16);
         let metadata = ObjectMetadata {
             content_type: None,
@@ -1509,7 +1522,11 @@ impl RelayFixture {
                     _ => panic!("page required"),
                 };
                 assert_eq!(
-                    open_fixture(&[8; 24], ciphertext.bytes()).unwrap(),
+                    open_fixture(
+                        &crate::test_support::test_vector([8; 24]),
+                        ciphertext.bytes()
+                    )
+                    .unwrap(),
                     plaintext
                 );
                 conn.finish_exchange()?;

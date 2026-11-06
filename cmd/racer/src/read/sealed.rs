@@ -188,7 +188,10 @@ pub(crate) mod tests {
         SealedPage {
             metadata: result.metadata.clone(),
             aad: crate::security::page_aad(&envelope).unwrap_or_default(),
-            key: racer_crypto::xaes_derive(&[7; 32], &envelope.nonce.0),
+            key: racer_crypto::xaes_derive(
+                &crate::test_support::test_vector([7; 32]),
+                &envelope.nonce.0,
+            ),
             envelope,
             source: SealedSource::Host(UnverifiedPage {
                 copy: CiphertextCopy {

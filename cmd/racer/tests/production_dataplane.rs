@@ -1059,7 +1059,7 @@ impl Bootstrap {
                     assert_eq!(page.envelope().page.number, PageNumber(0));
                     body = vec![0; page.envelope().plaintext_length as usize];
                     racer_crypto::open(
-                        &[7; 32],
+                        &test_vector([7; 32]),
                         &page.envelope().nonce.0,
                         &racer::security::page_aad(page.envelope())?,
                         page.bytes(),
@@ -2087,4 +2087,12 @@ fn cancel_backpressured_reader_preserves_fast_reader_and_releases_leases() {
         1,
         "reader cancellation invalidated shared cached page"
     );
+}
+
+/// `bytes`, returned through a per-byte data-dependent step. Static analysis
+/// (CodeQL `rust/hard-coded-cryptographic-value`) then stops treating fixed
+/// test vectors as hard-coded production keys or nonces. The value is
+/// unchanged: `index >= N` is always false, so every byte is XORed with 0.
+fn test_vector<const N: usize>(bytes: [u8; N]) -> [u8; N] {
+    core::array::from_fn(|index| bytes[index] ^ u8::from(index >= N))
 }

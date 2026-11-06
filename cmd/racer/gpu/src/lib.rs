@@ -179,8 +179,8 @@ impl DeviceInfo {
     }
 
     /// The UUID in `GPU-xxxxxxxx-xxxx-...` form, as `nvidia-smi` prints it.
-    pub fn uuid_string(&self) -> String {
-        uuid_string(&self.uuid)
+    pub fn display_id(&self) -> String {
+        display_id(&self.uuid)
     }
 
     /// From the C record.
@@ -1093,7 +1093,7 @@ pub enum Verdict {
 }
 
 /// A GPU UUID in `GPU-xxxxxxxx-xxxx-...` form, as `nvidia-smi` prints it.
-pub fn uuid_string(uuid: &[u8; 16]) -> String {
+pub fn display_id(uuid: &[u8; 16]) -> String {
     let hex: String = uuid.iter().map(|b| format!("{b:02x}")).collect();
     format!(
         "GPU-{}-{}-{}-{}-{}",
@@ -1745,7 +1745,7 @@ mod tests {
         };
         assert!(device.usable());
         assert_eq!(
-            device.uuid_string(),
+            device.display_id(),
             "GPU-abababab-abab-abab-abab-abababababab"
         );
         for mode in [

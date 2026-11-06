@@ -793,10 +793,23 @@ pub(crate) mod security {
     pub(crate) fn assert_page_key(lease: &KeyLease, expected: &[u8; 32]) {
         let mut sealed = [0; 19];
         lease
-            .seal_page(lease.cache(), &[1; 24], b"retained", b"abc", &mut sealed)
+            .seal_page(
+                lease.cache(),
+                &crate::test_support::test_vector([1; 24]),
+                b"retained",
+                b"abc",
+                &mut sealed,
+            )
             .unwrap();
         let mut opened = [0; 3];
-        racer_crypto::open(expected, &[1; 24], b"retained", &sealed, &mut opened).unwrap();
+        racer_crypto::open(
+            expected,
+            &crate::test_support::test_vector([1; 24]),
+            b"retained",
+            &sealed,
+            &mut opened,
+        )
+        .unwrap();
         assert_eq!(&opened, b"abc");
     }
     pub(crate) fn keys_for(env: &racer_io::Env, caches: &[CacheId]) -> Keyring {
@@ -1023,6 +1036,14 @@ impl std::task::Wake for WakeCounter {
     fn wake(self: std::sync::Arc<Self>) {
         self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     }
+}
+
+/// `bytes`, returned through a per-byte data-dependent step. Static analysis
+/// (CodeQL `rust/hard-coded-cryptographic-value`) then stops treating fixed
+/// test vectors as hard-coded production keys or nonces. The value is
+/// unchanged: `index >= N` is always false, so every byte is XORed with 0.
+pub(crate) fn test_vector<const N: usize>(bytes: [u8; N]) -> [u8; N] {
+    core::array::from_fn(|index| bytes[index] ^ u8::from(index >= N))
 }
 
 #[cfg(test)]

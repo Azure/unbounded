@@ -112,7 +112,7 @@ fn gpu_read_writes_the_range_at_the_destination_offset() {
 fn uuid_field(index: u8) -> String {
     format!(
         "Racer-Gpu-Uuid: {}\r\n",
-        racer_gpu::uuid_string(&[index; 16])
+        racer_gpu::display_id(&[index; 16])
     )
 }
 

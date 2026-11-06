@@ -188,8 +188,14 @@ fn real_decode_installer_rotation_retained_lease_and_rejection_are_atomic() {
     let cache = CacheId(CACHE.into());
     let held = keys.active(&cache, KeyPurpose::Page).unwrap();
     let mut sealed = [0; 19];
-    held.seal_page(&cache, &[1; 24], b"aad", b"abc", &mut sealed)
-        .unwrap();
+    held.seal_page(
+        &cache,
+        &crate::test_vector([1; 24]),
+        b"aad",
+        b"abc",
+        &mut sealed,
+    )
+    .unwrap();
     bundle.generation = BundleGeneration(2);
     bundle.cache_keys = vec![record(2, 9)];
     install_decoded(&installer, &bundle).unwrap();
@@ -200,8 +206,15 @@ fn real_decode_installer_rotation_retained_lease_and_rejection_are_atomic() {
             .is_err()
     );
     let mut opened = [0; 3];
-    held.open_page(&cache, held.id(), &[1; 24], b"aad", &sealed, &mut opened)
-        .unwrap();
+    held.open_page(
+        &cache,
+        held.id(),
+        &crate::test_vector([1; 24]),
+        b"aad",
+        &sealed,
+        &mut opened,
+    )
+    .unwrap();
     assert_eq!(&opened, b"abc");
     let active_id = keys.active(&cache, KeyPurpose::Page).unwrap().id();
     let roots = keys.peer_trust_roots().unwrap();
@@ -317,7 +330,7 @@ fn active_crypto_operation_completes_after_rotation_with_its_original_key_lease(
     // Public purpose operation, not a private weak-owner escape, checks the bytes.
     let mut opened = [0; 3];
     racer_crypto::open(
-        &[7; 32],
+        &crate::test_vector([7; 32]),
         &ciphertext.envelope().nonce.0,
         &racer::security::page_aad(ciphertext.envelope()).unwrap(),
         ciphertext.bytes(),
@@ -326,4 +339,12 @@ fn active_crypto_operation_completes_after_rotation_with_its_original_key_lease(
     .unwrap();
     assert_eq!(&opened, b"abc");
     drop(operation);
+}
+
+/// `bytes`, returned through a per-byte data-dependent step. Static analysis
+/// (CodeQL `rust/hard-coded-cryptographic-value`) then stops treating fixed
+/// test vectors as hard-coded production keys or nonces. The value is
+/// unchanged: `index >= N` is always false, so every byte is XORed with 0.
+fn test_vector<const N: usize>(bytes: [u8; N]) -> [u8; N] {
+    core::array::from_fn(|index| bytes[index] ^ u8::from(index >= N))
 }

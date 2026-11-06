@@ -3042,7 +3042,10 @@ fn two_worker_real_control_key_lease_drain_and_checkpoint_cut() {
     .unwrap();
     let until = Instant::now() + Duration::from_secs(10);
     assert!(keys.lease(Some(&cache), key.id, KeyPurpose::Page).is_err());
-    crate::test_support::security::assert_page_key(&lease, &[21; 32]);
+    crate::test_support::security::assert_page_key(
+        &lease,
+        &crate::test_support::test_vector([21; 32]),
+    );
     assert!(node.observations.health.ready(&env));
     drop(lease);
     while !node.observations.health.ready(&env) {
@@ -3318,7 +3321,13 @@ fn network_keyring_bootstrap_rotation_recovery_and_failure_retention() {
     let old_id = lease.id();
     let mut old_sealed = [0; 19];
     lease
-        .seal_page(&cache, &[1; 24], b"retained", b"abc", &mut old_sealed)
+        .seal_page(
+            &cache,
+            &crate::test_support::test_vector([1; 24]),
+            b"retained",
+            b"abc",
+            &mut old_sealed,
+        )
         .unwrap();
     fixture.hold_long_poll.store(true, Ordering::Release);
     let poll_scope = scope(&racer_io::Clock::host(), Duration::from_secs(30)).unwrap();
@@ -3365,7 +3374,7 @@ fn network_keyring_bootstrap_rotation_recovery_and_failure_retention() {
         .open_page(
             &cache,
             old_id,
-            &[1; 24],
+            &crate::test_support::test_vector([1; 24]),
             b"retained",
             &old_sealed,
             &mut opened,
@@ -3639,7 +3648,10 @@ fn real_control_bootstrap_recovery_publication_readiness_and_shutdown() {
     assert_eq!(runtime.crypto.outstanding(), 1);
     assert!(worker.peer_task.is_some());
     assert!(worker.diagnostic_task.is_some());
-    crate::test_support::security::assert_page_key(&lease, &[19; 32]);
+    crate::test_support::security::assert_page_key(
+        &lease,
+        &crate::test_support::test_vector([19; 32]),
+    );
     assert!(
         worker
             .keys

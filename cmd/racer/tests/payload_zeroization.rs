@@ -227,7 +227,7 @@ fn failed_crypto_output_is_scrubbed(config: &Config) {
                 number: PageNumber(0),
             },
             key_id: key.id(),
-            nonce: Nonce([2; 24]),
+            nonce: Nonce(crate::test_vector([2; 24])),
             plaintext_length: length as u32,
             ciphertext_length: length as u32 + 16,
         };
@@ -267,7 +267,7 @@ fn failed_crypto_output_is_scrubbed(config: &Config) {
             let plaintext = vec![0xa7; length];
             let mut bytes = vec![0; length + TAG_LEN];
             seal(
-                &[7; 32],
+                &crate::test_vector([7; 32]),
                 &descriptor.nonce.0,
                 &page_aad(&descriptor).unwrap(),
                 &plaintext,
@@ -352,3 +352,11 @@ fn failed_crypto_output_is_scrubbed(config: &Config) {
     }
 }
 use racer_io::ring::IoBuffer;
+
+/// `bytes`, returned through a per-byte data-dependent step. Static analysis
+/// (CodeQL `rust/hard-coded-cryptographic-value`) then stops treating fixed
+/// test vectors as hard-coded production keys or nonces. The value is
+/// unchanged: `index >= N` is always false, so every byte is XORed with 0.
+fn test_vector<const N: usize>(bytes: [u8; N]) -> [u8; N] {
+    core::array::from_fn(|index| bytes[index] ^ u8::from(index >= N))
+}

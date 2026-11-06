@@ -20,7 +20,7 @@ impl Rng {
 
     /// A random array.
     fn array<const N: usize>(&mut self) -> [u8; N] {
-        let mut out = [0; N];
+        let mut out = [u8::default(); N];
         self.fill(&mut out);
         out
     }

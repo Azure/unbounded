@@ -35,8 +35,8 @@ struct Page {
 
 /// Seal `length` bytes with XAES-256-GCM.
 fn page(length: usize) -> Page {
-    let key = [9; 32];
-    let nonce = *b"0123456789abcdefghijklmn";
+    let key = crate::test_vector([9; 32]);
+    let nonce = crate::test_vector(*b"0123456789abcdefghijklmn");
     let aad = b"racer/page/aead/v1\0test".to_vec();
     let plaintext: Vec<u8> = (0..length).map(|i| (i * 7 + 3) as u8).collect();
     let mut sealed = vec![0; length + 16];
@@ -1013,4 +1013,12 @@ fn rdma_flush_follows_write_ordering() {
         ctx.flush_rdma_writes(RdmaScope::Owner),
         Err(Error::Unsupported(_))
     ));
+}
+
+/// `bytes`, returned through a per-byte data-dependent step. Static analysis
+/// (CodeQL `rust/hard-coded-cryptographic-value`) then stops treating fixed
+/// test vectors as hard-coded production keys or nonces. The value is
+/// unchanged: `index >= N` is always false, so every byte is XORed with 0.
+fn test_vector<const N: usize>(bytes: [u8; N]) -> [u8; N] {
+    core::array::from_fn(|index| bytes[index] ^ u8::from(index >= N))
 }

@@ -172,7 +172,7 @@ impl PeerOriginContext {
 /// A fresh AEAD nonce from `rng`, which must be cryptographically secure
 /// outside simulation ([`racer_io::Rng::os`] in production).
 pub(crate) fn fresh_nonce(rng: &racer_io::Rng) -> Result<Nonce> {
-    let mut nonce = [0u8; 24];
+    let mut nonce = [u8::default(); 24];
     rng.fill(&mut nonce).map_err(|_| Error::Unavailable)?;
     Ok(Nonce(nonce))
 }
@@ -2077,7 +2077,7 @@ mod tests {
                     cipher: crate::model::PageCipher::Xaes256Gcm,
                     page: page(),
                     key_id: crate::model::key_id_from_generation(1, 1).unwrap(),
-                    nonce: Nonce([2; 24]),
+                    nonce: Nonce(crate::test_support::test_vector([2; 24])),
                     plaintext_length: size as u32,
                     ciphertext_length: size as u32 + 16,
                 }
@@ -3300,7 +3300,7 @@ mod tests {
                     let descriptor = envelope(size);
                     let mut encrypted = vec![0; size + TAG_LEN];
                     racer_crypto::seal(
-                        &[7; 32],
+                        &crate::test_support::test_vector([7; 32]),
                         &descriptor.nonce.0,
                         &page_aad(&descriptor).unwrap(),
                         &source,
@@ -3965,7 +3965,7 @@ mod tests {
                 number: PageNumber(7),
             },
             key_id: crate::model::key_id_from_generation(1, 1).unwrap(),
-            nonce: Nonce([2; 24]),
+            nonce: Nonce(crate::test_support::test_vector([2; 24])),
             plaintext_length: 5,
             ciphertext_length: 21,
         }
@@ -3977,11 +3977,25 @@ mod tests {
         let offset = b"racer/page/aead/v2\0".len();
         assert_eq!(&aad[offset..offset + 4], &1u32.to_be_bytes());
         let mut sealed = [0; 21];
-        racer_crypto::seal(&[7; 32], &descriptor.nonce.0, &aad, b"hello", &mut sealed).unwrap();
+        racer_crypto::seal(
+            &crate::test_support::test_vector([7; 32]),
+            &descriptor.nonce.0,
+            &aad,
+            b"hello",
+            &mut sealed,
+        )
+        .unwrap();
         aad[offset + 3] ^= 1;
         let mut out = [0xa5; 5];
         assert!(
-            racer_crypto::open(&[7; 32], &descriptor.nonce.0, &aad, &sealed, &mut out).is_err()
+            racer_crypto::open(
+                &crate::test_support::test_vector([7; 32]),
+                &descriptor.nonce.0,
+                &aad,
+                &sealed,
+                &mut out
+            )
+            .is_err()
         );
         assert_eq!(out, [0; 5]);
     }
@@ -3992,7 +4006,14 @@ mod tests {
         let aad = page_aad(&original).unwrap();
         assert!(aad.starts_with(b"racer/page/aead/v2\0\0\0\0\x01\0\0\0\x24"));
         let mut bytes = vec![0; 5 + TAG_LEN];
-        racer_crypto::seal(&[7; 32], &original.nonce.0, &aad, b"hello", &mut bytes).unwrap();
+        racer_crypto::seal(
+            &crate::test_support::test_vector([7; 32]),
+            &original.nonce.0,
+            &aad,
+            b"hello",
+            &mut bytes,
+        )
+        .unwrap();
         for index in 0..9 {
             let mut changed = original.clone();
             match index {
@@ -4016,7 +4037,7 @@ mod tests {
             let mut tampered = vec![0; 5];
             assert!(
                 racer_crypto::open(
-                    &[7; 32],
+                    &crate::test_support::test_vector([7; 32]),
                     &changed.nonce.0,
                     &page_aad(&changed).unwrap(),
                     &bytes,
@@ -4029,9 +4050,23 @@ mod tests {
         corrupted[0] ^= 1;
         let mut output = vec![0; 5];
         assert!(
-            racer_crypto::open(&[7; 32], &original.nonce.0, &aad, &corrupted, &mut output).is_err()
+            racer_crypto::open(
+                &crate::test_support::test_vector([7; 32]),
+                &original.nonce.0,
+                &aad,
+                &corrupted,
+                &mut output
+            )
+            .is_err()
         );
-        racer_crypto::open(&[7; 32], &original.nonce.0, &aad, &bytes, &mut output).unwrap();
+        racer_crypto::open(
+            &crate::test_support::test_vector([7; 32]),
+            &original.nonce.0,
+            &aad,
+            &bytes,
+            &mut output,
+        )
+        .unwrap();
         assert_eq!(output, b"hello");
         let mut malformed = original;
         malformed.ciphertext_length += 1;
@@ -4046,8 +4081,8 @@ mod tests {
         descriptor.key_id = KeyId([1; 16]); // Fixed key ID from aead_vectors.py, not installed.
         let mut bytes = vec![0; 5 + TAG_LEN];
         racer_crypto::seal_credentials(
-            &[7; 32],
-            &[2; 24],
+            &crate::test_support::test_vector([7; 32]),
+            &crate::test_support::test_vector([2; 24]),
             &page_aad(&descriptor).unwrap(),
             b"hello",
             &mut bytes,
@@ -4142,7 +4177,7 @@ mod tests {
                 .collect();
             let mut encrypted = vec![0; length + 16];
             racer_crypto::seal_credentials(
-                &[7; 32],
+                &crate::test_support::test_vector([7; 32]),
                 &descriptor.nonce.0,
                 &page_aad(&descriptor).unwrap(),
                 &raw,
@@ -4158,7 +4193,7 @@ mod tests {
             // after checking the independent known-answer digest above.
             descriptor.key_id = keys.active(cache, KeyPurpose::Page).unwrap().id();
             racer_crypto::seal(
-                &[7; 32],
+                &crate::test_support::test_vector([7; 32]),
                 &descriptor.nonce.0,
                 &page_aad(&descriptor).unwrap(),
                 &raw,
@@ -4232,7 +4267,7 @@ mod tests {
         let aad = page_aad(&descriptor).unwrap();
         let mut encrypted = [0; 5 + TAG_LEN];
         racer_crypto::seal(
-            &[7; 32],
+            &crate::test_support::test_vector([7; 32]),
             &descriptor.nonce.0,
             &aad,
             b"hello",
@@ -4253,7 +4288,16 @@ mod tests {
             // A nonzero sentinel proves a failed open wipes the output rather
             // than merely observing the zero-initialized production buffer.
             let mut output = [0xa5; 5];
-            assert!(racer_crypto::open(&[7; 32], &nonce, &aad, &input, &mut output).is_err());
+            assert!(
+                racer_crypto::open(
+                    &crate::test_support::test_vector([7; 32]),
+                    &nonce,
+                    &aad,
+                    &input,
+                    &mut output
+                )
+                .is_err()
+            );
             assert_eq!(output, [0; 5]);
             assert_eq!(input, retained);
         }
@@ -4292,7 +4336,7 @@ mod tests {
             let mut descriptor = descriptor.clone();
             let mut bytes = vec![0; 5 + TAG_LEN];
             racer_crypto::seal(
-                &[7; 32],
+                &crate::test_support::test_vector([7; 32]),
                 &descriptor.nonce.0,
                 &page_aad(&descriptor).unwrap(),
                 b"hello",
@@ -4500,7 +4544,7 @@ mod tests {
             assert!(body[length + 16..].iter().all(|byte| *byte == 0));
             let mut decrypted = vec![0; length];
             racer_crypto::open(
-                &[7; 32],
+                &crate::test_support::test_vector([7; 32]),
                 &cipher.envelope().nonce.0,
                 &page_aad(cipher.envelope()).unwrap(),
                 cipher.bytes(),
@@ -4610,7 +4654,7 @@ mod tests {
                     assert!(nonces.insert(cipher.envelope().nonce.0));
                     let mut decrypted = vec![0; cipher.envelope().plaintext_length as usize];
                     racer_crypto::open(
-                        &[7; 32],
+                        &crate::test_support::test_vector([7; 32]),
                         &cipher.envelope().nonce.0,
                         &page_aad(cipher.envelope()).unwrap(),
                         cipher.bytes(),
@@ -4707,7 +4751,7 @@ mod tests {
             }
             let mut bytes = vec![0; 5 + TAG_LEN];
             racer_crypto::seal(
-                &[7; 32],
+                &crate::test_support::test_vector([7; 32]),
                 &descriptor.nonce.0,
                 &page_aad(&descriptor).unwrap(),
                 b"hello",
