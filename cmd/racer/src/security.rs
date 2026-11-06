@@ -255,6 +255,33 @@ impl<'a> PageAad<'a> {
 pub fn page_aad(envelope: &PageEnvelope) -> Result<Vec<u8>> {
     Ok(PageAad::new(envelope)?.parts().concat())
 }
+/// Run `f` over the canonical page AAD bytes, staged in a reused per-thread
+/// buffer so the seal and open paths (whose AEAD API needs contiguous AAD) do
+/// not allocate per page. Falls back to a fresh buffer if reentered.
+fn with_page_aad<R>(envelope: &PageEnvelope, f: impl FnOnce(&[u8]) -> R) -> Result<R> {
+    use std::cell::RefCell;
+    thread_local! {
+        static SCRATCH: RefCell<Vec<u8>> = const { RefCell::new(Vec::new()) };
+    }
+    let aad = PageAad::new(envelope)?;
+    let fill = |buffer: &mut Vec<u8>| {
+        buffer.clear();
+        for part in aad.parts() {
+            buffer.extend_from_slice(part);
+        }
+    };
+    SCRATCH.with(|scratch| match scratch.try_borrow_mut() {
+        Ok(mut buffer) => {
+            fill(&mut buffer);
+            Ok(f(&buffer))
+        }
+        Err(_) => {
+            let mut buffer = Vec::new();
+            fill(&mut buffer);
+            Ok(f(&buffer))
+        }
+    })
+}
 /// The stored AEAD tag: the last [`TAG_LEN`] ciphertext bytes, or zeros when
 /// the ciphertext is shorter than a tag. Reads only the tag bytes.
 fn stored_tag(ciphertext: &[u8]) -> [u8; TAG_LEN] {
@@ -638,7 +665,7 @@ impl PageCryptoEngine {
                     plaintext_length: length,
                     ciphertext_length: length.checked_add(16).ok_or(Error::InvalidRequest)?,
                 };
-                let aad = page_aad(&envelope)?;
+                PageAad::new(&envelope)?;
                 let charge = ciphertext.charge();
                 charge.validate(ResourceClass::Ciphertext, ciphertext.capacity())?;
                 if charge.key() != Some(&page.version.object.cache) {
@@ -652,8 +679,9 @@ impl PageCryptoEngine {
                 // Plaintext input remains immutable until the final cancellation
                 // check. AEAD output is erased if sealing fails part way, since
                 // pooled ciphertext storage is recycled without a wipe.
-                if let Err(error) = key.seal_page(cache, &envelope.nonce.0, &aad, raw, &mut *output)
-                {
+                if let Err(error) = with_page_aad(&envelope, |aad| {
+                    key.seal_page(cache, &envelope.nonce.0, aad, raw, &mut *output)
+                })? {
                     output.fill(0);
                     return Err(error.into());
                 }
@@ -670,7 +698,7 @@ impl PageCryptoEngine {
                     {
                         return Err(Error::MissingKey);
                     }
-                    let aad = page_aad(envelope)?;
+                    PageAad::new(envelope)?;
                     let length = envelope.plaintext_length as usize;
                     if ciphertext.bytes().len() != envelope.ciphertext_length as usize
                         || length.checked_add(TAG_LEN) != Some(ciphertext.bytes().len())
@@ -688,15 +716,18 @@ impl PageCryptoEngine {
                     if charge.key() != Some(&envelope.page.version.object.cache) {
                         return Err(Error::InvalidConfiguration);
                     }
-                    key.open_page(
-                        &envelope.page.version.object.cache,
-                        envelope.key_id,
-                        &envelope.nonce.0,
-                        &aad,
-                        ciphertext.bytes(),
-                        &mut plaintext[..],
-                    )
-                    .map_err(|_| {
+                    with_page_aad(envelope, |aad| {
+                        key.open_page(
+                            &envelope.page.version.object.cache,
+                            envelope.key_id,
+                            &envelope.nonce.0,
+                            aad,
+                            ciphertext.bytes(),
+                            &mut plaintext[..],
+                        )
+                        .map_err(|_| aad.to_vec())
+                    })?
+                    .map_err(|aad| {
                         // Erase partial output now; the storage outlives the
                         // failure with the returned input.
                         plaintext.fill(0);
@@ -3969,6 +4000,30 @@ mod tests {
             plaintext_length: 5,
             ciphertext_length: 21,
         }
+    }
+    #[test]
+    fn scratch_page_aad_matches_canonical_bytes_and_survives_reentry() {
+        let descriptor = envelope();
+        let expected = page_aad(&descriptor).unwrap();
+        let mut other = envelope();
+        other.plaintext_length = 6;
+        other.ciphertext_length = 22;
+        let other_expected = page_aad(&other).unwrap();
+        for _ in 0..2 {
+            with_page_aad(&descriptor, |aad| {
+                assert_eq!(aad, expected.as_slice());
+                with_page_aad(&other, |inner| assert_eq!(inner, other_expected.as_slice()))
+                    .unwrap();
+                assert_eq!(aad, expected.as_slice());
+            })
+            .unwrap();
+        }
+        let mut malformed = envelope();
+        malformed.ciphertext_length = 0;
+        assert_eq!(
+            with_page_aad(&malformed, |_| ()).is_err(),
+            page_aad(&malformed).is_err()
+        );
     }
     #[test]
     fn page_cipher_id_is_authenticated_in_aad() {
