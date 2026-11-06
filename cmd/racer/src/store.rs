@@ -696,6 +696,7 @@ impl StoreWriter {
             return Err(Error::InvalidConfiguration);
         }
         self.index.set_page_capacity(page_entries)?;
+        self.publish_headroom(&clock);
         *self.clock.borrow_mut() = Some(clock);
         self.capacity.set(queue_entries);
         Ok(())
@@ -1150,6 +1151,17 @@ impl StoreWriter {
     pub(crate) fn can_start_progress(&self) -> bool {
         !self.paused.get() && !self.busy.get() && !self.space_deferred()
     }
+    /// Publish this worker's free segments and reclamation headroom target.
+    fn publish_headroom(&self, clock: &SegmentClock) {
+        self.metrics.set_local_gauge(
+            crate::telemetry::Gauge::FreeSegments,
+            clock.free_count() as u64,
+        );
+        self.metrics.set_local_gauge(
+            crate::telemetry::Gauge::FreeSegmentTarget,
+            clock.target() as u64,
+        );
+    }
     /// True while writes wait for a checkpoint freeze to end because no free
     /// segment or index entry could be reclaimed. Clears once reuse thaws.
     pub(crate) fn space_deferred(&self) -> bool {
@@ -1453,6 +1465,9 @@ impl StoreWriter {
                             {
                                 cleanup.requeue = true;
                                 self.space_deferred.set(true);
+                                if let Some(clock) = self.clock.borrow().as_ref() {
+                                    clock.note_starved();
+                                }
                                 self.metrics
                                     .record(crate::telemetry::Event::DirtyWriteDeferred, 1);
                             } else {
@@ -1470,6 +1485,7 @@ impl StoreWriter {
                 completed += 1;
                 if let Some(clock) = self.clock.borrow().as_ref() {
                     let _ = clock.reclaim_now();
+                    self.publish_headroom(clock);
                 }
                 // Quota/space pressure and cache I/O failures never fail the node.
                 if let Err(error) = result {
@@ -1537,12 +1553,17 @@ impl StoreWriter {
         let (segment, location) = match index_ticket.append(id, &self.segments, disk_bytes) {
             Ok(append) => append,
             Err(Error::Overloaded) => {
-                if let Some(clock) = self.clock.borrow().clone() {
-                    clock.reclaim_now().map_err(no_space)?;
+                // Retry even when reclamation falls short of its headroom
+                // target: one recycled segment is enough for this record.
+                let reclaimed = self
+                    .clock
+                    .borrow()
+                    .clone()
+                    .map_or(Ok(()), |clock| clock.reclaim_now());
+                match index_ticket.append(id, &self.segments, disk_bytes) {
+                    Ok(append) => append,
+                    Err(error) => return Err(no_space(reclaimed.err().unwrap_or(error))),
                 }
-                index_ticket
-                    .append(id, &self.segments, disk_bytes)
-                    .map_err(no_space)?
             }
             Err(error) => return Err(error),
         };

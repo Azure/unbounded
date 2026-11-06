@@ -1114,6 +1114,8 @@ Ownership refresh affects subsequent events only, never rewrites old counters.
 | `racer_dirty_discards_total` | Queued page writes (accepted persistence attempts) dropped without a publication, all reasons |
 | `racer_dirty_discard_reasons_total{reason}` | The same discards split by reason, listed below |
 | `racer_dirty_write_deferred_total` | Writes kept queued because no free segment or index entry could be reclaimed during a checkpoint |
+| `racer_free_segments` | Gauge of free segments, summed over workers, refreshed as writes complete |
+| `racer_free_segment_target` | Gauge of the free segments reclamation keeps ready, summed over workers; see below |
 
 Each worker's writer keeps up to 8 page writes in flight, submitting the next
 queued page as each write completes. A periodic checkpoint holds back new
@@ -1126,6 +1128,23 @@ Each such deferral counts in `racer_dirty_write_deferred_total`. Outside a
 checkpoint, a write that still finds no space after reclamation fails and is
 discarded. Failed writes are logged at most once every 10 seconds per worker
 with `stage=persist` and the cause.
+
+Because a checkpoint freezes segment reuse, writes during that window can only
+fill segments that were already free. Each worker therefore adapts how many
+free segments it keeps ready (`racer_free_segment_target`). It starts at
+`RACER_FREE_SEGMENT_RESERVE_PER_WORKER`. When a checkpoint ends, the target
+becomes the reserve plus 1.5 times the free segments that checkpoint consumed.
+If a write was deferred during it, the target doubles instead. Lower demand
+lowers the target gradually, never below the reserve. The target is capped at
+one eighth of the worker's segments, because free segments hold no cached
+pages. Reclamation evicts whole low-value segments by metadata only: it copies,
+reads, and trims nothing.
+
+On raw devices, each segment holds only whole page records (the page plus a
+small header), so the rest of each segment is unused (`racer_segment_tail_bytes`).
+With 16 MiB pages, a 64 MiB segment fits three records and leaves about 25% of
+the device unused. Racer logs a warning at startup when the unused share is 10%
+or more. The 1 GiB default fits 63 records and leaves under 2% unused.
 
 `reason` takes these values:
 

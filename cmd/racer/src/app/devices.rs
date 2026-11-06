@@ -444,6 +444,14 @@ fn device_alignment(file: &File) -> io::Result<Alignment> {
     Alignment::new(memory, offset, offset as usize).map_err(io::Error::other)
 }
 
+/// Warn when full-page records leave at least this much of each segment unused.
+const TAIL_WARNING_PERCENT: u64 = 10;
+
+/// Percent of a segment left unused after packing whole `record`s.
+fn tail_percent(segment_bytes: u64, record: u64) -> u64 {
+    (segment_bytes % record).saturating_mul(100) / segment_bytes
+}
+
 fn plan(mut devices: Vec<Device>, config: &Config, workers: usize) -> Result<Plan> {
     if workers == 0 || devices.is_empty() || config.segment_bytes == 0 {
         return Err(Error::InvalidConfiguration);
@@ -495,6 +503,15 @@ fn plan(mut devices: Vec<Device>, config: &Config, workers: usize) -> Result<Pla
         .length() as u64;
     if record > config.segment_bytes {
         return Err(Error::InvalidConfiguration);
+    }
+    let tail = tail_percent(config.segment_bytes, record);
+    if tail >= TAIL_WARNING_PERCENT {
+        eprintln!(
+            "racer: RACER_SEGMENT_BYTES={} fits {} full pages per segment; {tail}% of device \
+             capacity is unusable segment tail. Use a larger segment, such as 1 GiB",
+            config.segment_bytes,
+            config.segment_bytes / record,
+        );
     }
     let mut device_index = 0;
     let mut offset = GUARD_BYTES;
@@ -625,6 +642,18 @@ pub(super) fn recovery_layout_fixture() -> Vec<crate::store::checkpoint::Checkpo
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn tail_percent_flags_small_segments() {
+        let record = 16 * 1024 * 1024 + 4096;
+        // 64 MiB fits three 16 MiB records and leaves a quarter unused.
+        assert_eq!(tail_percent(64 << 20, record), 24);
+        assert!(tail_percent(64 << 20, record) >= TAIL_WARNING_PERCENT);
+        // 1 GiB fits 63 records: under the warning threshold.
+        assert_eq!(tail_percent(1 << 30, record), 1);
+        // An exact multiple wastes nothing.
+        assert_eq!(tail_percent(record * 4, record), 0);
+    }
 
     struct FakeClock(Duration);
 

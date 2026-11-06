@@ -168,6 +168,17 @@ mod index_pressure {
             1
         );
         assert!(index.lookup(&third).unwrap().is_some());
+        // The starved freeze was observed and the headroom gauges published.
+        let eviction = &f.store.eviction;
+        assert!(eviction.target() >= eviction.reserve());
+        assert_eq!(
+            f.metrics.gauge(crate::telemetry::Gauge::FreeSegmentTarget),
+            eviction.target() as u64
+        );
+        assert_eq!(
+            f.metrics.gauge(crate::telemetry::Gauge::FreeSegments),
+            eviction.free_count() as u64
+        );
         assert_eq!(f.store.writer.discarded_count(), 0);
         assert_eq!(f.store.writer.pending_count(), 0);
         for event in [

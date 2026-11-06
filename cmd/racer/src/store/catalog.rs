@@ -1429,7 +1429,30 @@ pub struct SegmentClock {
     free_reserve: usize,
     budget: ReclaimBudget,
     segments: Rc<Segments>,
+    /// Free segments reclamation keeps ready: at least `free_reserve`, raised
+    /// to bridge the write demand of a checkpoint freeze. See [`Self::observe`].
+    target: Cell<usize>,
+    /// Free-segment low water of the checkpoint freeze in progress, if any.
+    freeze: Cell<Option<FreezeWatch>>,
 }
+
+/// One observed checkpoint freeze: segment eviction and recycling stop from
+/// the shard snapshot until the cut publishes, so appends can only consume
+/// free segments that reclamation prepared before the freeze.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct FreezeWatch {
+    /// Free segments at the first observation inside the freeze.
+    start: usize,
+    /// Fewest free segments observed during the freeze.
+    low: usize,
+    /// A write found no free segment or index entry during the freeze.
+    starved: bool,
+}
+
+/// Largest headroom target, as a fraction (1/N) of a worker's segments. Free
+/// segments hold no cached pages, so the bound caps how much resident cache
+/// adaptive headroom can displace.
+pub const MAX_HEADROOM_DIVISOR: usize = 8;
 
 /// Per-call reactor work limits, selected by the application, not the allocator.
 #[derive(Clone, Copy, Debug)]
@@ -1496,7 +1519,72 @@ impl SegmentClock {
             free_reserve,
             budget,
             segments,
+            target: Cell::new(free_reserve),
+            freeze: Cell::new(None),
         }
+    }
+    /// Free segments reclamation currently keeps ready (at least the reserve).
+    pub fn target(&self) -> usize {
+        self.target.get()
+    }
+    /// Free segments right now.
+    pub fn free_count(&self) -> usize {
+        self.segments.free_count()
+    }
+    /// Track checkpoint freezes and adapt the headroom target when one ends.
+    ///
+    /// While a checkpoint freezes segment reuse, appends can only consume
+    /// segments that were already free, so a reserve smaller than the write
+    /// demand of one freeze stalls every write until publication. Each freeze
+    /// records how many free segments it consumed; when it ends the target is
+    /// raised to cover that demand with 50% margin above the reserve (index
+    /// entries for new pages run out once free segments fall to the reserve),
+    /// or doubled if writes starved. Lower demand decays the target gradually.
+    pub fn observe(&self) {
+        let free = self.segments.free_count();
+        if self.segments.reuse_frozen() {
+            let watch = self.freeze.get().unwrap_or(FreezeWatch {
+                start: free,
+                low: free,
+                starved: false,
+            });
+            self.freeze.set(Some(FreezeWatch {
+                low: watch.low.min(free),
+                ..watch
+            }));
+        } else if let Some(watch) = self.freeze.take() {
+            self.adapt(watch);
+        }
+    }
+    /// A write found no free segment or index entry while reuse was frozen.
+    pub fn note_starved(&self) {
+        self.observe();
+        if let Some(watch) = self.freeze.get() {
+            self.freeze.set(Some(FreezeWatch {
+                starved: true,
+                ..watch
+            }));
+        }
+    }
+    fn adapt(&self, watch: FreezeWatch) {
+        let current = self.target.get();
+        let used = watch.start.saturating_sub(watch.low);
+        let needed = if watch.starved {
+            current.max(self.free_reserve + used).saturating_mul(2)
+        } else {
+            self.free_reserve
+                .saturating_add(used)
+                .saturating_add(used.div_ceil(2))
+        };
+        let next = if needed >= current {
+            needed
+        } else {
+            current - (current - needed).div_ceil(4)
+        };
+        let ceiling = self
+            .free_reserve
+            .max(self.segments.count() / MAX_HEADROOM_DIVISOR);
+        self.target.set(next.clamp(self.free_reserve, ceiling));
     }
     /// Rank at most 64 slots before eviction. Busy segments remain Evicting until
     /// a later poll; ownership and heat cannot prevent eventual reclamation.
@@ -1505,7 +1593,8 @@ impl SegmentClock {
     }
     /// [`Self::reclaim_now`] with retention heat evaluated at an explicit time.
     pub fn reclaim_at(&self, now: std::time::Instant) -> Result<()> {
-        self.reclaim_to(now, self.free_reserve)
+        self.observe();
+        self.reclaim_to(now, self.target.get())
     }
     /// Free index entries when the index is full: evict at least one more
     /// segment than is free or evicting now, chosen by the same score as
@@ -1522,8 +1611,9 @@ impl SegmentClock {
     }
     fn reclaim_one(&self) -> Result<()> {
         let segments = &self.segments;
+        self.observe();
         let target = segments.free_count() + segments.evicting_count() + 1;
-        self.reclaim_to(self.index.clock.now(), target.max(self.free_reserve))
+        self.reclaim_to(self.index.clock.now(), target.max(self.target.get()))
     }
     fn reclaim_to(&self, now: std::time::Instant, free_reserve: usize) -> Result<()> {
         let retention = self.index.retention();
@@ -1599,6 +1689,85 @@ mod tests {
         drop(held);
         clock.reclaim_now().unwrap();
         assert_eq!(segments.free_count(), 2);
+    }
+
+    fn clock_over(segments: Rc<Segments>, reserve: usize) -> SegmentClock {
+        let env = racer_io::Env::host();
+        SegmentClock::new(Rc::new(index(&env, 64)), segments, reserve)
+    }
+
+    /// Fill `n` free segments with one sealed record each.
+    fn consume(segments: &Segments, n: usize) {
+        for _ in 0..n {
+            drop(segments.append(512).unwrap());
+        }
+    }
+
+    #[test]
+    fn headroom_grows_to_cover_freeze_demand() {
+        let segments = Rc::new(segments(512, 64));
+        let clock = clock_over(segments.clone(), 2);
+        assert_eq!(clock.target(), 2);
+        let frozen = segments.freeze().unwrap();
+        frozen.thaw_appends();
+        clock.observe();
+        consume(&segments, 4);
+        clock.observe();
+        // Still frozen: nothing adapts yet.
+        assert_eq!(clock.target(), 2);
+        drop(frozen);
+        clock.observe();
+        // Reserve 2 plus 4 consumed plus 50% margin.
+        assert_eq!(clock.target(), 8);
+        // Reclamation now keeps the raised headroom free.
+        let _ = clock.reclaim_now();
+        assert!(segments.free_count() >= 8);
+    }
+
+    #[test]
+    fn headroom_doubles_on_starvation_and_is_capped() {
+        let segments = Rc::new(segments(512, 64));
+        let clock = clock_over(segments.clone(), 2);
+        for expected in [4, 8, 8] {
+            let frozen = segments.freeze().unwrap();
+            clock.note_starved();
+            drop(frozen);
+            clock.observe();
+            // 64 segments cap the headroom at 64 / 8 = 8.
+            assert_eq!(clock.target(), expected);
+        }
+    }
+
+    #[test]
+    fn headroom_decays_gradually_but_not_below_reserve() {
+        let segments = Rc::new(segments(512, 64));
+        let clock = clock_over(segments.clone(), 2);
+        let frozen = segments.freeze().unwrap();
+        clock.note_starved();
+        drop(frozen);
+        clock.observe();
+        assert_eq!(clock.target(), 4);
+        let mut previous = clock.target();
+        for _ in 0..8 {
+            let frozen = segments.freeze().unwrap();
+            clock.observe();
+            drop(frozen);
+            clock.observe();
+            assert!(clock.target() <= previous);
+            assert!(clock.target() >= 2);
+            previous = clock.target();
+        }
+        assert_eq!(clock.target(), 2);
+    }
+
+    #[test]
+    fn headroom_ignores_observations_without_freeze() {
+        let segments = Rc::new(segments(512, 64));
+        let clock = clock_over(segments.clone(), 3);
+        consume(&segments, 10);
+        clock.observe();
+        clock.note_starved();
+        assert_eq!(clock.target(), 3);
     }
 
     #[test]

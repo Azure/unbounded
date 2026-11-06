@@ -483,6 +483,8 @@ metrics! { Gauge, GAUGES, GAUGE_COUNT;
             Self::EffectivePayloadBytes => "racer_effective_payload_bytes",
             Self::SegmentTailBytes => "racer_segment_tail_bytes",
             Self::DiskPageEntries => "racer_disk_page_index_capacity",
+            Self::FreeSegments => "racer_free_segments",
+            Self::FreeSegmentTarget => "racer_free_segment_target",
             Self::CheckpointSequence => "racer_checkpoint_sequence",
             Self::MemoryPressureLevel => "racer_memory_pressure_level",
             Self::RdmaFreeBuffers => "racer_rdma_free_buffers",
@@ -952,6 +954,11 @@ impl Metrics {
     }
     pub(crate) fn set_gauge(&self, gauge: Gauge, value: u64) {
         self.core.set(gauge, value);
+    }
+    /// Replace this worker shard's contribution to a summed gauge. Do not mix
+    /// with leases or [`Self::set_gauge`] on the same gauge.
+    pub(crate) fn set_local_gauge(&self, gauge: Gauge, value: u64) {
+        self.core.set_local(gauge, value);
     }
     pub(crate) fn add_gauge(&self, gauge: Gauge, value: u64) {
         self.core.increase(gauge, value);
