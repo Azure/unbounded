@@ -12,15 +12,32 @@ metadata:
     app.kubernetes.io/name: unbounded-machineclass-controller
     app.kubernetes.io/component: controller
 rules:
-  - apiGroups: ["unbounded-cloud.io"]
-    resources: ["machineclasses"]
-    verbs: ["get", "list", "watch"]
-  - apiGroups: ["unbounded-cloud.io"]
-    resources: ["machineclasses/status"]
-    verbs: ["get", "update", "patch"]
-  - apiGroups: ["unbounded-cloud.io"]
-    resources: ["sites", "machineconfigurationversions", "machineoperationcredentials"]
-    verbs: ["get", "list", "watch"]
+  - apiGroups:
+      - "unbounded-cloud.io"
+    resources:
+      - "machineclasses"
+    verbs:
+      - "get"
+      - "list"
+      - "watch"
+  - apiGroups:
+      - "unbounded-cloud.io"
+    resources:
+      - "machineclasses/status"
+    verbs:
+      - "get"
+      - "update"
+      - "patch"
+  - apiGroups:
+      - "unbounded-cloud.io"
+    resources:
+      - "sites"
+      - "machineconfigurationversions"
+      - "machineoperationcredentials"
+    verbs:
+      - "get"
+      - "list"
+      - "watch"
 
 ---
 # Bind unbounded-machineclass-controller-provider-config with a RoleBinding in
@@ -34,9 +51,14 @@ metadata:
     app.kubernetes.io/name: unbounded-machineclass-controller
     app.kubernetes.io/component: controller
 rules:
-  - apiGroups: [""]
-    resources: ["configmaps"]
-    verbs: ["get", "list", "watch"]
+  - apiGroups:
+      - ""
+    resources:
+      - "configmaps"
+    verbs:
+      - "get"
+      - "list"
+      - "watch"
 
 ---
 # Bind unbounded-machineclass-controller-credentials with a RoleBinding in the
@@ -50,6 +72,9 @@ metadata:
     app.kubernetes.io/name: unbounded-machineclass-controller
     app.kubernetes.io/component: controller
 rules:
-  - apiGroups: [""]
-    resources: ["secrets"]
-    verbs: ["get"]
+  - apiGroups:
+      - ""
+    resources:
+      - "secrets"
+    verbs:
+      - "get"
