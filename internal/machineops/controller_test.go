@@ -1147,6 +1147,8 @@ type allocationCallRecorder struct {
 	beginCalls   int
 	pollCalls    int
 	cleanupCalls int
+	resolveCalls int
+	planCalls    int
 }
 
 func (r *allocationCallRecorder) Execute(context.Context, OperationRequest) (OperationResult, error) {
@@ -1169,6 +1171,16 @@ func (r *allocationCallRecorder) Cleanup(context.Context, OperationRequest, Oper
 	return nil
 }
 
+func (r *allocationCallRecorder) ResolveClass(context.Context, publicmachineops.ClassRequest) (publicmachineops.ClassResolution, error) {
+	r.resolveCalls++
+	return publicmachineops.ClassResolution{}, nil
+}
+
+func (r *allocationCallRecorder) PlanAllocation(context.Context, publicmachineops.AllocationPlanRequest) (publicmachineops.AllocationPlan, error) {
+	r.planCalls++
+	return publicmachineops.AllocationPlan{}, nil
+}
+
 func newAllocationOperation(name, machineRef string, kind unboundedv1alpha3.OperationKind) *unboundedv1alpha3.MachineOperation {
 	op := newMachineOperation(name, machineRef, kind)
 	op.UID = types.UID(name + "-uid")
@@ -1185,32 +1197,41 @@ func TestMachineOperationReconciler_IgnoresAllocationOperations(t *testing.T) {
 		unboundedv1alpha3.OperationHostRelease,
 	}
 
+	capacityBundle := func(recorder *allocationCallRecorder) []publicmachineops.ProviderOption {
+		return []publicmachineops.ProviderOption{
+			publicmachineops.WithCapacity(recorder.ResolveClass, recorder.PlanAllocation),
+			publicmachineops.WithLongRunningOperation(unboundedv1alpha3.OperationHostAllocate, recorder.Begin, recorder.Poll),
+			publicmachineops.WithLongRunningOperation(unboundedv1alpha3.OperationHostRelease, recorder.Begin, recorder.Poll),
+		}
+	}
+
 	registrations := []struct {
 		name    string
-		options func(unboundedv1alpha3.OperationKind, *allocationCallRecorder) []publicmachineops.ProviderOption
+		options func(*allocationCallRecorder) []publicmachineops.ProviderOption
 	}{
 		{
 			name: "kind not registered",
-			options: func(_ unboundedv1alpha3.OperationKind, recorder *allocationCallRecorder) []publicmachineops.ProviderOption {
+			options: func(recorder *allocationCallRecorder) []publicmachineops.ProviderOption {
 				return []publicmachineops.ProviderOption{
 					publicmachineops.WithLongRunningOperation(unboundedv1alpha3.OperationHostHardReboot, recorder.Begin, recorder.Poll),
 				}
 			},
 		},
 		{
-			name: "kind registered as immediate",
-			options: func(kind unboundedv1alpha3.OperationKind, recorder *allocationCallRecorder) []publicmachineops.ProviderOption {
-				return []publicmachineops.ProviderOption{
-					publicmachineops.WithImmediateOperation(kind, recorder.Execute, publicmachineops.WithCleanup(recorder.Cleanup)),
-				}
-			},
+			name:    "capacity bundle registered",
+			options: capacityBundle,
 		},
 		{
-			name: "kind registered as long-running",
-			options: func(kind unboundedv1alpha3.OperationKind, recorder *allocationCallRecorder) []publicmachineops.ProviderOption {
-				return []publicmachineops.ProviderOption{
-					publicmachineops.WithLongRunningOperation(kind, recorder.Begin, recorder.Poll, publicmachineops.WithCleanup(recorder.Cleanup)),
-				}
+			name: "capacity bundle with immediate host operation",
+			options: func(recorder *allocationCallRecorder) []publicmachineops.ProviderOption {
+				return append(
+					capacityBundle(recorder),
+					publicmachineops.WithImmediateOperation(
+						unboundedv1alpha3.OperationHostHardReboot,
+						recorder.Execute,
+						publicmachineops.WithCleanup(recorder.Cleanup),
+					),
+				)
 			},
 		},
 	}
@@ -1270,7 +1291,7 @@ func TestMachineOperationReconciler_IgnoresAllocationOperations(t *testing.T) {
 					state.mutate(op)
 
 					recorder := &allocationCallRecorder{}
-					provider, err := publicmachineops.NewProvider(testLongRunningProviderName, registration.options(kind, recorder)...)
+					provider, err := publicmachineops.NewProvider(testLongRunningProviderName, registration.options(recorder)...)
 					require.NoError(t, err)
 
 					writes := 0
@@ -1329,6 +1350,8 @@ func TestMachineOperationReconciler_IgnoresAllocationOperations(t *testing.T) {
 					require.Zero(t, recorder.beginCalls, "Begin calls")
 					require.Zero(t, recorder.pollCalls, "Poll calls")
 					require.Zero(t, recorder.cleanupCalls, "Cleanup calls")
+					require.Zero(t, recorder.resolveCalls, "ResolveClass calls")
+					require.Zero(t, recorder.planCalls, "PlanAllocation calls")
 					require.Zero(t, writes, "API writes")
 
 					var after unboundedv1alpha3.MachineOperation
@@ -1406,4 +1429,32 @@ func TestIsHostOperation(t *testing.T) {
 	for _, tt := range tests {
 		require.Equal(t, tt.want, isHostOperation(tt.kind), "isHostOperation(%s)", tt.kind)
 	}
+}
+
+func TestMachineOperationReconciler_LeavesAllocationFieldsUnsetForHostOperations(t *testing.T) {
+	t.Parallel()
+
+	machine := newExternalMachine("machine-1", unboundedv1alpha3.ExternalProviderAzureVM)
+	op := newMachineOperation("op-1", "machine-1", unboundedv1alpha3.OperationHostHardReboot)
+	credential := newWorkloadIdentityCredential("cred-a", "site-a", unboundedv1alpha3.ExternalProviderAzureVM)
+	provider := &recordingProvider{
+		provider:  unboundedv1alpha3.ExternalProviderAzureVM,
+		supported: map[unboundedv1alpha3.OperationKind]bool{unboundedv1alpha3.OperationHostHardReboot: true},
+		result:    OperationResult{Allocation: &publicmachineops.AllocationResult{ProviderResourceID: "x"}},
+	}
+
+	c := fake.NewClientBuilder().WithScheme(newOperationTestScheme(t)).WithObjects(machine, op, credential).WithStatusSubresource(op).Build()
+	reconciler := &MachineOperationReconciler{Client: c, Providers: []*Provider{newRecordingProviderRegistration(provider)}, Now: fixedOperationNow}
+
+	result, err := reconciler.Reconcile(context.Background(), ctrl.Request{NamespacedName: types.NamespacedName{Name: "op-1"}})
+	require.NoError(t, err)
+	require.Equal(t, ctrl.Result{}, result)
+
+	require.Len(t, provider.requests, 1)
+	require.Nil(t, provider.requests[0].Allocation)
+
+	var updated unboundedv1alpha3.MachineOperation
+	require.NoError(t, c.Get(context.Background(), client.ObjectKey{Name: "op-1"}, &updated))
+	require.Equal(t, unboundedv1alpha3.OperationPhaseComplete, updated.Status.Phase)
+	require.Nil(t, updated.Status.Allocation)
 }
