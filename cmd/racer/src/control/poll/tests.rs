@@ -505,6 +505,43 @@ fn conflicting_publications_and_full_fallback_never_poison_the_retained_base() {
     });
 }
 
+/// A stale seat (for example one restarted during a full rollout) serving an
+/// older document is dropped and retried, not reported as a fatal replay.
+#[test]
+fn stale_seat_rollback_is_retryable_and_never_accepted() {
+    sim(40, |clock, env| {
+        let io = host(env);
+        let target = Installer::new();
+        let script = Script::new(&io, [full(1), full(2), full(1), full(1), full(3)]);
+        let mut sync = poll(&io, Doc::Keyring, &script, &target);
+        drive(clock, sync.turn(&scope(env))).unwrap();
+        drive(clock, sync.settle(&scope(env))).unwrap();
+        drive(clock, sync.turn(&scope(env))).unwrap();
+        drive(clock, sync.settle(&scope(env))).unwrap();
+        assert_eq!(sync.status().accepted, Some(2));
+        let base = sync.last().unwrap().digest().unwrap();
+        for demoted in 1..=2 {
+            let result = drive(clock, sync.turn(&scope(env)));
+            assert_eq!(result, Err(Error::Unavailable));
+            assert!(crate::control::transient(result.unwrap_err()));
+            assert_eq!(sync.status().error, Some(Error::Replay));
+            assert_eq!(script.demoted.get(), demoted);
+            assert_eq!(sync.status().accepted, Some(2));
+            assert_eq!(sync.last().unwrap().digest().unwrap(), base);
+        }
+        let mut result = drive(clock, sync.turn(&scope(env)));
+        for _ in 0..8 {
+            if result.is_ok() {
+                break;
+            }
+            result = drive(clock, sync.turn(&scope(env)));
+        }
+        result.unwrap();
+        drive(clock, sync.settle(&scope(env))).unwrap();
+        assert_eq!(sync.status().accepted, Some(3));
+    });
+}
+
 /// Cancellation after a valid no-change reply remains cancellation, not success.
 #[test]
 fn cancellation_after_no_change_response_is_not_reported_as_success() {

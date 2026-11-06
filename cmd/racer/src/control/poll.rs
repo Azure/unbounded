@@ -659,11 +659,19 @@ impl Poll {
                     return Ok(());
                 }
                 Err(failure) => {
+                    // A seat serving an older or conflicting generation (for
+                    // example one that restarted during a rollout and has not
+                    // caught up) is a stale source, not local corruption. The
+                    // document was discarded and the retained base is
+                    // unchanged, and `fetch` already demoted the seat, so
+                    // retry with backoff instead of failing the process.
+                    let stale_seat = failure.error == Error::Replay;
                     if classify(failure.error) != FailureClass::Canceled {
                         progress.error = Some(failure.error);
                         progress.failures = progress.failures.saturating_add(1);
                         let delay = retry_delay(this.rng(), this.schedule, progress.failures);
-                        let delay = if classify(failure.error) == FailureClass::Retry {
+                        let delay = if stale_seat || classify(failure.error) == FailureClass::Retry
+                        {
                             delay.max(failure.retry_after.unwrap_or_default())
                         } else {
                             delay
@@ -671,6 +679,9 @@ impl Poll {
                         let now = this.now();
                         progress.next_fetch =
                             now.checked_add(delay).or(scope.deadline()).unwrap_or(now);
+                    }
+                    if stale_seat {
+                        return Err(Error::Unavailable);
                     }
                     return Err(failure.error);
                 }
