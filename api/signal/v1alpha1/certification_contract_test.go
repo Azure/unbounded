@@ -625,6 +625,18 @@ func TestCertificationRunPlanAndEvidenceContract(t *testing.T) {
 	) {
 		t.Fatal("evidence identity does not distinguish stage and legacy check evidence")
 	}
+
+	assertionResult := stage.Properties["assertions"].Items.Schema
+	if contains(assertionResult.Required, "actual") {
+		t.Fatal("assertion result actual must remain optional for missing metric evidence")
+	}
+
+	if !hasValidationRule(
+		assertionResult,
+		"has(self.actual) || (!self.passed && has(self.message) && size(self.message.trim()) > 0)",
+	) {
+		t.Fatal("assertion result does not require a failed reason when actual is absent")
+	}
 }
 
 func TestCertificationPolicyContract(t *testing.T) {
@@ -873,6 +885,54 @@ func TestCertificationRunBackwardDecode(t *testing.T) {
 
 	if run.Spec.Checks[0].Execution != nil {
 		t.Fatal("existing Run unexpectedly acquired an execution policy")
+	}
+}
+
+func TestAssertionResultBackwardDecodeAndMissingMetric(t *testing.T) {
+	t.Parallel()
+
+	existing := []byte(`{
+		"name": "throughput-floor",
+		"passed": true,
+		"actual": {
+			"type": "Decimal",
+			"decimalValue": "25.0"
+		}
+	}`)
+
+	var decodedExisting AssertionResult
+	if err := json.Unmarshal(existing, &decodedExisting); err != nil {
+		t.Fatalf("decode existing assertion result: %v", err)
+	}
+
+	if decodedExisting.Actual == nil ||
+		decodedExisting.Actual.DecimalValue == nil ||
+		*decodedExisting.Actual.DecimalValue != "25.0" {
+		t.Fatal("existing assertion actual value was not preserved")
+	}
+
+	missing := []byte(`{
+		"name": "throughput-floor",
+		"passed": false,
+		"message": "required throughput metric was not produced"
+	}`)
+
+	var decodedMissing AssertionResult
+	if err := json.Unmarshal(missing, &decodedMissing); err != nil {
+		t.Fatalf("decode missing-metric assertion result: %v", err)
+	}
+
+	if decodedMissing.Actual != nil || decodedMissing.Passed || decodedMissing.Message == "" {
+		t.Fatal("missing-metric assertion result did not preserve failed evidence without actual")
+	}
+
+	encodedMissing, err := json.Marshal(decodedMissing)
+	if err != nil {
+		t.Fatalf("encode missing-metric assertion result: %v", err)
+	}
+
+	if strings.Contains(string(encodedMissing), `"actual"`) {
+		t.Fatalf("missing-metric assertion result encoded an invented actual value: %s", encodedMissing)
 	}
 }
 

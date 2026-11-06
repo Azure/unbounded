@@ -163,6 +163,59 @@ func TestIncompleteMutableVLLMInputCannotQualify(t *testing.T) {
 	}
 }
 
+func TestGenericVLLMMissingMetricFailureEvidenceDoesNotChangePlanDigest(t *testing.T) {
+	t.Parallel()
+
+	_, _, run := genericVLLMContractFixture(t)
+	want := run.Spec.PlanDigest
+	run.Status.Evidence.Identity = &QualificationEvidenceIdentity{
+		PlanDigest: run.Spec.PlanDigest,
+		Participants: []ParticipantEvidenceIdentity{{
+			Index: 0,
+			Role:  ParticipantRoleParticipant,
+		}},
+		Stages: []StageEvidenceSummary{{
+			Name:                   "vllm-smoke",
+			Role:                   CheckStageRoleValidation,
+			Test:                   run.Spec.ResolvedPlan.Phases[0].Stages[0].Test.Identity,
+			Mode:                   CheckExecutionModeRunOnce,
+			Verdict:                StageVerdictFailed,
+			InvocationCount:        1,
+			FailedInvocations:      1,
+			DurableEvidenceDigest:  fixtureDigestE,
+			QualificationEligible:  true,
+			ObservedCoverageWindow: metav1.Duration{},
+			Assertions: []AssertionResult{{
+				Name:    "request-throughput",
+				Passed:  false,
+				Message: "required request throughput metric was not produced",
+			}},
+		}},
+		Provenance: EvidenceProvenance{
+			ControllerImage: fixtureImageA,
+			AdapterImage:    fixtureImageA,
+		},
+	}
+
+	content, err := json.Marshal(run.Status.Evidence.Identity.Stages[0].Assertions[0])
+	if err != nil {
+		t.Fatalf("marshal missing-metric vLLM evidence: %v", err)
+	}
+
+	if string(content) != `{"name":"request-throughput","passed":false,"message":"required request throughput metric was not produced"}` {
+		t.Fatalf("missing-metric vLLM evidence = %s", content)
+	}
+
+	got, err := deriveFixturePlanDigest(run)
+	if err != nil {
+		t.Fatalf("derive plan digest with missing-metric evidence: %v", err)
+	}
+
+	if got != want {
+		t.Fatalf("evidence-only missing metric changed plan digest: got %q, want %q", got, want)
+	}
+}
+
 func TestResolvedStageRejectsUnsafeSecurityAndTopology(t *testing.T) {
 	t.Parallel()
 
