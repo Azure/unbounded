@@ -93,14 +93,64 @@ pub fn jump(mut key: u64, buckets: u32) -> u32 {
     u32::try_from(bucket).unwrap()
 }
 
+/// Full mesh limit the current thread derives meshes with.
+///
+/// Always [`FULL_MESH_MAX`] unless the `test-util` feature is on and the thread
+/// set a smaller limit with [`test_util::FullMeshMax`]. The limit is part of the
+/// overlay every member derives, so production never changes it.
+#[must_use]
+pub fn full_mesh_max() -> usize {
+    #[cfg(feature = "test-util")]
+    if let Some(max) = test_util::OVERRIDE.get() {
+        return max;
+    }
+    FULL_MESH_MAX
+}
+
+/// Test support for building meshes with a smaller full mesh limit.
+#[cfg(feature = "test-util")]
+pub mod test_util {
+    use std::cell::Cell;
+
+    thread_local! {
+        /// Full mesh limit of this thread, if a test set one.
+        pub(super) static OVERRIDE: Cell<Option<usize>> = const { Cell::new(None) };
+    }
+
+    /// While alive, meshes built on this thread are full meshes only up to the
+    /// given size. Tests and simulations use it to reach multi-column meshes
+    /// with few members. Every simulated node must run on the same thread, so
+    /// they all derive the same overlay. Dropping it restores the previous limit.
+    #[derive(Debug)]
+    #[must_use = "the limit applies only while the guard is alive"]
+    pub struct FullMeshMax {
+        previous: Option<usize>,
+    }
+
+    impl FullMeshMax {
+        /// Use `max` as this thread's full mesh limit until the guard drops.
+        pub fn set(max: usize) -> Self {
+            Self {
+                previous: OVERRIDE.replace(Some(max)),
+            }
+        }
+    }
+
+    impl Drop for FullMeshMax {
+        fn drop(&mut self) {
+            OVERRIDE.set(self.previous);
+        }
+    }
+}
+
 /// Target column count `C` and column size `T` for a pool of `k` members.
 ///
-/// `C` is 1 up to [`FULL_MESH_MAX`], then the largest power of two with
+/// `C` is 1 up to [`full_mesh_max`] ([`FULL_MESH_MAX`] in production), then the largest power of two with
 /// `C * C <= k`, so it only changes when `k` crosses a power of four.
 /// `T = ceil(k / C)`.
 #[must_use]
 pub fn target_columns(k: usize) -> (usize, usize) {
-    if k <= FULL_MESH_MAX {
+    if k <= full_mesh_max() {
         return (1, k);
     }
     let columns = 1usize << (k.ilog2() / 2);
@@ -182,7 +232,7 @@ impl Mesh {
             target,
             ..Self::default()
         };
-        if k <= FULL_MESH_MAX {
+        if k <= full_mesh_max() {
             mesh.columns = vec![(0..k as u32).collect()];
             mesh.members = positions;
             if k == 0 {
@@ -589,6 +639,30 @@ mod tests {
             }
         }
         assert!((700..1100).contains(&moved), "{moved}");
+    }
+
+    /// A thread's full mesh limit applies only while its guard is alive, nests,
+    /// and does not leak to other threads.
+    #[cfg(feature = "test-util")]
+    #[test]
+    fn test_full_mesh_limit_is_scoped_to_the_guard_and_thread() {
+        use super::test_util::FullMeshMax;
+        assert_eq!(full_mesh_max(), FULL_MESH_MAX);
+        {
+            let _outer = FullMeshMax::set(16);
+            assert_eq!(target_columns(16), (1, 16));
+            assert_eq!(target_columns(17), (4, 5));
+            {
+                let _inner = FullMeshMax::set(4);
+                assert_eq!(full_mesh_max(), 4);
+            }
+            assert_eq!(full_mesh_max(), 16);
+            std::thread::spawn(|| assert_eq!(full_mesh_max(), FULL_MESH_MAX))
+                .join()
+                .unwrap();
+        }
+        assert_eq!(full_mesh_max(), FULL_MESH_MAX);
+        assert_eq!(target_columns(17), (1, 17));
     }
 
     /// `C` only changes at powers of four and matches the spec table.

@@ -152,7 +152,12 @@ mod paths;
 /// Choosing which members store a key.
 mod placement;
 
-pub use mesh::{EdgeKind, FULL_MESH_MAX, POINTS, Pool, PoolSpec, RDMA_PEERS, jump, target_columns};
+#[cfg(feature = "test-util")]
+pub use mesh::test_util;
+pub use mesh::{
+    EdgeKind, FULL_MESH_MAX, POINTS, Pool, PoolSpec, RDMA_PEERS, full_mesh_max, jump,
+    target_columns,
+};
 
 pub use paths::{
     Alternatives, DEFAULT_SEARCH_QUEUE, Exhaustive, MAX_BLOCKED, MeshSearch, PathKey, PathQuery,
