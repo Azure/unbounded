@@ -850,6 +850,7 @@ func TestStagePodCarriesScriptResourcesAndImmutableIdentity(t *testing.T) {
 	}
 
 	executor := KubernetesStageExecutor{Namespace: "signal-system", ExecutionName: "execution"}
+
 	pod, err := executor.stagePod(workflow, invocation, 0)
 	if err != nil {
 		t.Fatalf("stagePod() error = %v", err)

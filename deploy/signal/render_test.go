@@ -119,6 +119,7 @@ func TestRenderedGPUInventoryCatalogPinsSource(t *testing.T) {
 
 	output := renderSignal(t, signalRenderData())
 	documents := splitYAMLDocuments(string(readRenderedFile(t, output, "05-gpu-inventory-tests.yaml")))
+
 	if len(documents) != 3 {
 		t.Fatalf("GPU inventory documents = %d, want 3", len(documents))
 	}
@@ -131,6 +132,7 @@ func TestRenderedGPUInventoryCatalogPinsSource(t *testing.T) {
 	script := scripts.Data["gpu-inventory.sh"]
 	scriptSum := sha256.Sum256([]byte(script))
 	scriptDigest := fmt.Sprintf("sha256:%x", scriptSum)
+
 	if scriptDigest != testScriptDigest {
 		t.Fatalf("GPU inventory script digest = %s, test fixture expects %s", scriptDigest, testScriptDigest)
 	}
@@ -219,6 +221,7 @@ func TestRenderedVLLMCanaryUsesImmutableBoundedContract(t *testing.T) {
 	sum := sha256.Sum256(specJSON)
 	workflowDigest := fmt.Sprintf("sha256:%x", sum)
 	data["VLLMWorkflowTemplateDigest"] = workflowDigest
+
 	secondOutput := renderSignal(t, data)
 	if !bytes.Equal(
 		firstTemplate,
@@ -269,12 +272,18 @@ func TestRenderedVLLMCanaryUsesImmutableBoundedContract(t *testing.T) {
 	for _, metric := range []string{
 		"serviceReady",
 		"modelIdentity",
+		"modelRevision",
+		"modelWeightsDigest",
 		"requestSucceeded",
 		"promptTokens",
 		"completionTokens",
-		"errorCount",
-		"restartCount",
+		"serverErrorCount",
+		"requestErrorCount",
+		"containerRestartCount",
+		"workflowPodRestartCount",
+		"tensorParallelSize",
 		"observedGpuCount",
+		"activeGpuCount",
 		"cleanupSucceeded",
 		"endToEndLatency",
 		"timeToFirstToken",
@@ -288,6 +297,8 @@ func TestRenderedVLLMCanaryUsesImmutableBoundedContract(t *testing.T) {
 
 	for _, parameter := range []string{
 		"expectedModelIdentity",
+		"expectedModelRevision",
+		"expectedModelWeightsDigest",
 		"promptFixtureDigest",
 		"requestTimeout",
 	} {
@@ -377,12 +388,15 @@ func TestRenderedAcceptanceSuitesSeparateQualificationDiagnosticsAndVLLM(t *test
 	data["VLLMTestGeneration"] = "3"
 	data["VLLMTestContentDigest"] = testDigest
 	data["VLLMModelIdentity"] = "approved-model@sha256:" + strings.Repeat("9", 64)
+	data["VLLMModelRevision"] = strings.Repeat("7", 40)
+	data["VLLMModelWeightsDigest"] = "sha256:" + strings.Repeat("6", 64)
 	data["VLLMPromptFixtureDigest"] = "sha256:" + strings.Repeat("8", 64)
 	data["VLLMRequestTimeout"] = "2m"
 	data["VLLMInvocationTimeout"] = "30m"
 
 	output := renderSignal(t, data)
 	documents := splitYAMLDocuments(string(readRenderedFile(t, output, "09-acceptance-suites.yaml")))
+
 	if len(documents) != 3 {
 		t.Fatalf("acceptance Suite documents = %d, want 3", len(documents))
 	}
@@ -395,6 +409,11 @@ func TestRenderedAcceptanceSuitesSeparateQualificationDiagnosticsAndVLLM(t *test
 	baselinePhases, found, err := unstructured.NestedSlice(baseline.Object, "spec", "phases")
 	if err != nil || !found || len(baselinePhases) != 1 {
 		t.Fatalf("baseline phases = %d, found %t, error %v, want 1", len(baselinePhases), found, err)
+	}
+
+	if strings.Count(documents[0], "name: project-signal-gpu-inventory-v1") != 1 ||
+		strings.Contains(documents[0], "project-signal-gpu-inventory-compat-v1") {
+		t.Fatal("baseline Suite must contain exactly one canonical qualification Test")
 	}
 
 	var compatibility unstructured.Unstructured
@@ -416,16 +435,27 @@ func TestRenderedAcceptanceSuitesSeparateQualificationDiagnosticsAndVLLM(t *test
 		)
 	}
 
+	if !strings.Contains(documents[1], "project-signal-gpu-inventory-compat-v1") ||
+		strings.Contains(documents[1], "name: project-signal-gpu-inventory-v1") {
+		t.Fatal("compatibility Suite must reference only the diagnostic compatibility Test")
+	}
+
 	vllmText := documents[2]
 	for _, metric := range []string{
 		"serviceReady",
 		"modelIdentity",
+		"modelRevision",
+		"modelWeightsDigest",
 		"requestSucceeded",
 		"promptTokens",
 		"completionTokens",
-		"errorCount",
-		"restartCount",
+		"serverErrorCount",
+		"requestErrorCount",
+		"containerRestartCount",
+		"workflowPodRestartCount",
+		"tensorParallelSize",
 		"observedGpuCount",
+		"activeGpuCount",
 		"cleanupSucceeded",
 	} {
 		if !strings.Contains(vllmText, "metric: "+metric) {
@@ -442,6 +472,63 @@ func TestRenderedAcceptanceSuitesSeparateQualificationDiagnosticsAndVLLM(t *test
 		if strings.Contains(vllmText, "metric: "+measurementOnly) {
 			t.Fatalf("vLLM Suite asserts measurement-only metric %s", measurementOnly)
 		}
+	}
+}
+
+func TestRenderedVLLMAcceptanceFailsClosedWithoutExactModelProvenance(t *testing.T) {
+	t.Parallel()
+
+	for _, tt := range []struct {
+		name  string
+		key   string
+		value string
+		error string
+	}{
+		{
+			name:  "missing model revision",
+			key:   "VLLMModelRevision",
+			value: "",
+			error: "VLLMModelRevision must be an exact 40-64 character hexadecimal revision",
+		},
+		{
+			name:  "mutable model weights",
+			key:   "VLLMModelWeightsDigest",
+			value: "weights-latest",
+			error: "VLLMModelWeightsDigest must be an algorithm-qualified sha256 digest",
+		},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			data := signalRenderData()
+			data["AcceptanceSuitesEnabled"] = "true"
+			data["GPUInventoryTestUID"] = "11111111-1111-1111-1111-111111111111"
+			data["GPUInventoryTestGeneration"] = "1"
+			data["GPUInventoryTestContentDigest"] = testDigest
+			data["GPUCompatTestUID"] = "22222222-2222-2222-2222-222222222222"
+			data["GPUCompatTestGeneration"] = "2"
+			data["GPUCompatTestContentDigest"] = testDigest
+			data["VLLMCanaryEnabled"] = "true"
+			data["VLLMCanaryImage"] = "example.invalid/vllm-canary@sha256:" + strings.Repeat("f", 64)
+			data["VLLMCanaryCPU"] = "4"
+			data["VLLMCanaryMemory"] = "16Gi"
+			data["VLLMModelCachePVC"] = "approved-model-cache"
+			data["VLLMTestUID"] = "33333333-3333-3333-3333-333333333333"
+			data["VLLMTestGeneration"] = "3"
+			data["VLLMTestContentDigest"] = testDigest
+			data["VLLMModelIdentity"] = "approved-model@sha256:" + strings.Repeat("9", 64)
+			data["VLLMModelRevision"] = strings.Repeat("7", 40)
+			data["VLLMModelWeightsDigest"] = "sha256:" + strings.Repeat("6", 64)
+			data["VLLMPromptFixtureDigest"] = "sha256:" + strings.Repeat("8", 64)
+			data["VLLMRequestTimeout"] = "2m"
+			data["VLLMInvocationTimeout"] = "30m"
+			data[tt.key] = tt.value
+
+			err := render.Render(".", t.TempDir(), data)
+			if err == nil || !strings.Contains(err.Error(), tt.error) {
+				t.Fatalf("render error = %v, want %q", err, tt.error)
+			}
+		})
 	}
 }
 

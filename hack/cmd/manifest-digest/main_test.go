@@ -13,6 +13,7 @@ func TestManifestDigest(t *testing.T) {
 	t.Parallel()
 
 	path := filepath.Join(t.TempDir(), "objects.yaml")
+
 	content := `apiVersion: v1
 kind: ConfigMap
 metadata:

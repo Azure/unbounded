@@ -112,6 +112,12 @@ spec:
 {{- if not (regexMatch "^.+@sha256:[0-9a-f]{64}$" .VLLMModelIdentity) }}
 {{- fail "VLLMModelIdentity must be an immutable sha256 identity when vLLM acceptance Suite rendering is enabled" }}
 {{- end }}
+{{- if not (regexMatch "^[0-9a-f]{40,64}$" .VLLMModelRevision) }}
+{{- fail "VLLMModelRevision must be an exact 40-64 character hexadecimal revision when vLLM acceptance Suite rendering is enabled" }}
+{{- end }}
+{{- if not (regexMatch "^sha256:[0-9a-f]{64}$" .VLLMModelWeightsDigest) }}
+{{- fail "VLLMModelWeightsDigest must be an algorithm-qualified sha256 digest when vLLM acceptance Suite rendering is enabled" }}
+{{- end }}
 {{- if not (regexMatch "^sha256:[0-9a-f]{64}$" .VLLMPromptFixtureDigest) }}
 {{- fail "VLLMPromptFixtureDigest must be an algorithm-qualified sha256 digest when vLLM acceptance Suite rendering is enabled" }}
 {{- end }}
@@ -147,6 +153,14 @@ spec:
               value:
                 type: String
                 stringValue: {{ .VLLMModelIdentity | quote }}
+            - name: expectedModelRevision
+              value:
+                type: String
+                stringValue: {{ .VLLMModelRevision | quote }}
+            - name: expectedModelWeightsDigest
+              value:
+                type: String
+                stringValue: {{ .VLLMModelWeightsDigest | quote }}
             - name: promptFixtureDigest
               value:
                 type: String
@@ -171,6 +185,18 @@ spec:
               expected:
                 type: String
                 stringValue: {{ .VLLMModelIdentity | quote }}
+            - name: model-revision
+              metric: modelRevision
+              operator: StatusEquals
+              expected:
+                type: String
+                stringValue: {{ .VLLMModelRevision | quote }}
+            - name: model-weights-digest
+              metric: modelWeightsDigest
+              operator: StatusEquals
+              expected:
+                type: String
+                stringValue: {{ .VLLMModelWeightsDigest | quote }}
             - name: request-succeeded
               metric: requestSucceeded
               operator: BooleanEquals
@@ -190,19 +216,49 @@ spec:
                 type: Integer
                 integerValue: 1
             - name: no-server-errors
-              metric: errorCount
+              metric: serverErrorCount
+              operator: Maximum
+              expected:
+                type: Integer
+                integerValue: 0
+            - name: no-request-errors
+              metric: requestErrorCount
               operator: Maximum
               expected:
                 type: Integer
                 integerValue: 0
             - name: no-container-restarts
-              metric: restartCount
+              metric: containerRestartCount
               operator: Maximum
               expected:
                 type: Integer
                 integerValue: 0
+            - name: no-workflow-pod-restarts
+              metric: workflowPodRestartCount
+              operator: Maximum
+              expected:
+                type: Integer
+                integerValue: 0
+            - name: tensor-parallel-eight
+              metric: tensorParallelSize
+              operator: Range
+              minimum:
+                type: Integer
+                integerValue: 8
+              maximum:
+                type: Integer
+                integerValue: 8
             - name: eight-gpus-visible
               metric: observedGpuCount
+              operator: Range
+              minimum:
+                type: Integer
+                integerValue: 8
+              maximum:
+                type: Integer
+                integerValue: 8
+            - name: eight-gpus-active
+              metric: activeGpuCount
               operator: Range
               minimum:
                 type: Integer

@@ -23,6 +23,16 @@ spec:
       type: String
       required: true
       pattern: "^.+@sha256:[0-9a-f]{64}$"
+    - name: expectedModelRevision
+      displayName: Expected model revision
+      type: String
+      required: true
+      pattern: "^[0-9a-f]{40,64}$"
+    - name: expectedModelWeightsDigest
+      displayName: Expected model weights digest
+      type: String
+      required: true
+      pattern: "^sha256:[0-9a-f]{64}$"
     - name: promptFixtureDigest
       displayName: Prompt fixture digest
       type: String
@@ -41,6 +51,14 @@ spec:
       displayName: Loaded model identity
       type: Status
       required: true
+    - name: modelRevision
+      displayName: Loaded model revision
+      type: Status
+      required: true
+    - name: modelWeightsDigest
+      displayName: Loaded model weights digest
+      type: Status
+      required: true
     - name: requestSucceeded
       displayName: Request succeeded
       type: Boolean
@@ -53,16 +71,33 @@ spec:
       displayName: Completion tokens
       type: Count
       required: true
-    - name: errorCount
-      displayName: Server errors
+    - name: serverErrorCount
+      displayName: Server error count
       type: Count
       required: true
-    - name: restartCount
-      displayName: Container restarts
+    - name: requestErrorCount
+      displayName: Request error count
+      type: Count
+      required: true
+    - name: containerRestartCount
+      displayName: Harness container restart count
+      type: Count
+      required: true
+    - name: workflowPodRestartCount
+      displayName: Workflow Pod restart count
+      type: Count
+      required: true
+    - name: tensorParallelSize
+      displayName: Tensor parallel size
       type: Count
       required: true
     - name: observedGpuCount
       displayName: Observed GPU count
+      type: Count
+      unit: devices
+      required: true
+    - name: activeGpuCount
+      displayName: GPUs used by the serving process
       type: Count
       unit: devices
       required: true

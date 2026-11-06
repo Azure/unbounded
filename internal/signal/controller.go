@@ -1164,6 +1164,7 @@ func (r *AdmissionReconciler) resolveStage(
 	}
 
 	inputs := deepCopyResolvedInputs(environmentInputs)
+
 	if test.Spec.Driver.Type == signalv1.TestDriverTypeWorkflowTemplate {
 		templateInput, err := r.resolveWorkflowTemplateInput(ctx, test.Spec.Driver.WorkflowTemplate)
 		if err != nil {
@@ -1253,6 +1254,7 @@ func (r *AdmissionReconciler) resolveWorkflowTemplateInput(
 
 	template := &unstructured.Unstructured{}
 	template.SetGroupVersionKind(workflowTemplateGVK)
+
 	if err := reader.Get(
 		ctx,
 		client.ObjectKey{Namespace: r.Namespace, Name: driver.Name},

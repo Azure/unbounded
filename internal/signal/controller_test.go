@@ -993,6 +993,7 @@ func TestResolveWorkflowTemplateInputPinsLiveSemanticIdentity(t *testing.T) {
 		},
 	}}
 	template.SetGroupVersionKind(workflowTemplateGVK)
+
 	digest, err := workflowTemplateSemanticDigest(template)
 	if err != nil {
 		t.Fatalf("workflowTemplateSemanticDigest() error = %v", err)

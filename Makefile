@@ -119,6 +119,8 @@ SIGNAL_VLLM_TEST_UID ?=
 SIGNAL_VLLM_TEST_GENERATION ?=
 SIGNAL_VLLM_TEST_CONTENT_DIGEST ?=
 SIGNAL_VLLM_MODEL_IDENTITY ?=
+SIGNAL_VLLM_MODEL_REVISION ?=
+SIGNAL_VLLM_MODEL_WEIGHTS_DIGEST ?=
 SIGNAL_VLLM_PROMPT_FIXTURE_DIGEST ?=
 SIGNAL_VLLM_REQUEST_TIMEOUT ?=
 SIGNAL_VLLM_INVOCATION_TIMEOUT ?=
@@ -1311,6 +1313,8 @@ signal-manifests: ## Render Project Signal manifests into deploy/signal/rendered
 		--set VLLMTestGeneration=$(SIGNAL_VLLM_TEST_GENERATION) \
 		--set VLLMTestContentDigest=$(SIGNAL_VLLM_TEST_CONTENT_DIGEST) \
 		--set VLLMModelIdentity=$(SIGNAL_VLLM_MODEL_IDENTITY) \
+		--set VLLMModelRevision=$(SIGNAL_VLLM_MODEL_REVISION) \
+		--set VLLMModelWeightsDigest=$(SIGNAL_VLLM_MODEL_WEIGHTS_DIGEST) \
 		--set VLLMPromptFixtureDigest=$(SIGNAL_VLLM_PROMPT_FIXTURE_DIGEST) \
 		--set VLLMRequestTimeout=$(SIGNAL_VLLM_REQUEST_TIMEOUT) \
 		--set VLLMInvocationTimeout=$(SIGNAL_VLLM_INVOCATION_TIMEOUT) \
@@ -1395,6 +1399,8 @@ signal-manifests: ## Render Project Signal manifests into deploy/signal/rendered
 		--set VLLMTestGeneration=$(SIGNAL_VLLM_TEST_GENERATION) \
 		--set VLLMTestContentDigest=$(SIGNAL_VLLM_TEST_CONTENT_DIGEST) \
 		--set VLLMModelIdentity=$(SIGNAL_VLLM_MODEL_IDENTITY) \
+		--set VLLMModelRevision=$(SIGNAL_VLLM_MODEL_REVISION) \
+		--set VLLMModelWeightsDigest=$(SIGNAL_VLLM_MODEL_WEIGHTS_DIGEST) \
 		--set VLLMPromptFixtureDigest=$(SIGNAL_VLLM_PROMPT_FIXTURE_DIGEST) \
 		--set VLLMRequestTimeout=$(SIGNAL_VLLM_REQUEST_TIMEOUT) \
 		--set VLLMInvocationTimeout=$(SIGNAL_VLLM_INVOCATION_TIMEOUT) \

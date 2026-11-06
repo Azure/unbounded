@@ -469,6 +469,8 @@ make signal-manifests \
   SIGNAL_VLLM_TEST_GENERATION=<live-generation> \
   SIGNAL_VLLM_TEST_CONTENT_DIGEST=sha256:<reviewed-spec-digest> \
   SIGNAL_VLLM_MODEL_IDENTITY=<approved-model>@sha256:<digest> \
+  SIGNAL_VLLM_MODEL_REVISION=<exact-40-to-64-character-hex-revision> \
+  SIGNAL_VLLM_MODEL_WEIGHTS_DIGEST=sha256:<weight-set-digest> \
   SIGNAL_VLLM_PROMPT_FIXTURE_DIGEST=sha256:<digest> \
   SIGNAL_VLLM_REQUEST_TIMEOUT=<approved-duration> \
   SIGNAL_VLLM_INVOCATION_TIMEOUT=<approved-duration> \
@@ -486,17 +488,21 @@ Workflow deadline.
 Before creating the vLLM Suite and Profile, resolve and approve:
 
 - the harness image digest;
-- model, tokenizer, optional remote-code, and cache snapshot identities;
+- model identity, exact source revision, weight-set digest, tokenizer,
+  optional remote-code, and cache snapshot identities;
 - the exact WorkflowTemplate live resource version and semantic digest;
 - CPU, memory, cache capacity, startup timeout, request timeout, and total
   invocation timeout; and
 - one deterministic prompt and decoding fixture.
 
 Hard assertions are limited to service readiness, exact model identity,
-request success, positive prompt and completion tokens, zero server errors,
-zero container restarts, exactly eight visible GPUs, and successful cleanup.
-All nine are explicit Suite assertions. The adapter additionally prevents a
-passed invocation from reporting failed Kubernetes cleanup.
+revision and weight-set digest, request success, positive prompt and
+completion tokens, zero server and request errors, zero harness-container and
+Workflow-Pod restarts, tensor parallel size eight, exactly eight visible and
+actively used GPUs, and successful cleanup. Every error and restart count has
+a named source. All assertions are explicit Suite assertions. The adapter
+additionally prevents a passed invocation from reporting failed Kubernetes
+cleanup.
 Latency, time to first token, output throughput, and GPU memory are recorded
 as measurements only until separate thresholds are approved. Do not infer
 MPI, burn, collective, CUDA correctness, or general serving performance from
@@ -575,6 +581,13 @@ ConfigMaps, and remaining owned backends only after final evidence is durable.
 `WorkloadCleanupComplete=True` is the authoritative record that this
 controller-owned cleanup finished.
 
+The cutover inventory must also prove zero attempt-owned Workflows,
+`WorkflowTaskResult` objects, Pods, Services, PVCs or model-cache claims,
+ConfigMaps, and Secrets. Shared pre-existing caches are preserved only when
+their exact UID and non-ownership by the Run are recorded before execution.
+Do not treat deletion of the parent Workflow as proof that all children are
+gone.
+
 Qualification reads terminal Run and evidence references, verifies the
 controller, adapter, runner, resolver, WorkflowTemplate, Test, plan, Node UID,
 and evidence digests, and credits only evidence that satisfies the Policy.
@@ -606,42 +619,75 @@ Controller restarts are safe:
 
 ### Upgrade and migration
 
-Use a guarded two-stage upgrade:
+Use a guarded cutover. The old controller must finish old-runtime cancellation
+and release before any CRD or controller replacement:
 
-1. Capture the currently installed CRDs, RBAC, WorkflowTemplate, Deployment,
-   immutable image references, active Runs, terminal Runs, evidence objects,
-   reservations, and Node cordon state as a rollback bundle.
-2. Require zero active Runs, Workflows, backend Pods, MPIJobs, and reservations
-   before replacing controller execution semantics.
-3. Render with qualification protection disabled and verify the computed
+1. Freeze repository pushes and record the exact accepted commit ancestry.
+   Capture a final old-runtime snapshot of every Signal CR, installed CRD,
+   RBAC object, WorkflowTemplate, Deployment, image reference and live
+   container `imageID`, active and terminal Run, evidence reference,
+   reservation, Node cordon, and legacy eligibility label. Store the complete
+   YAML export as the rollback bundle.
+2. If an old-runtime Run is still active, deliberately set `spec.cancel=true`
+   while the old controller remains deployed. Classify the result as Canceled
+   or another truthful non-pass; cancellation is never a successful
+   qualification result. Wait for terminal evidence and
+   `WorkloadCleanupComplete=True`, inspect it, then set `spec.release=true`.
+3. Require `Released=True`, the exact pre-run cordon/reservation projection,
+   and zero attempt-owned Workflows, WorkflowTaskResults, Pods, Services,
+   PVCs, ConfigMaps, Secrets, MPIJobs, and reservations. Only then may the CRD
+   or controller upgrade begin.
+4. Back up all Signal CRs before applying CRDs. Validate every historical
+   object against the new served schemas and record which legacy objects are
+   readable but intentionally non-qualifying. Preserve CRDs across rollback
+   when new stored fields or Policy/ledger objects exist.
+5. Render with qualification protection disabled and verify the computed
    WorkflowTemplate digest is stable across two renders.
-4. Apply all six CRDs first, then controller and adapter RBAC, catalog sources,
+6. Apply all six CRDs first, then controller and adapter RBAC, catalog sources,
    the adapter WorkflowTemplate, and finally the controller Deployment.
-5. Verify all six CRDs are Established, controller rollout is ready, the
+7. Verify all six CRDs are Established, controller rollout is ready, the
    WorkflowTemplate adapter image matches `--adapter-image`, and the rendered
-   WorkflowTemplate digest matches `--workflow-template-digest`.
-6. Confirm the default controller argument is
-   `--qualification-gate-protected=false`, stale direct
-   `signal.unbounded-cloud.io/eligibility=production` labels are removed, and
-   protected-label ledgers report `NodeRestrictionUnverified`.
-7. Record Test trust only after independently hashing exact Test specs, source
-   bytes, images, and WorkflowTemplate semantics. A stale generation must not
-   remain trusted.
-8. Create the canonical GPU inventory Suite with one qualification stage.
+   WorkflowTemplate digest matches `--workflow-template-digest`. Record one
+   commit-to-controller/adapter/runner/template digest mapping and verify the
+   live Pod `imageID` values match it.
+8. Inventory and remove stale direct
+   `signal.unbounded-cloud.io/eligibility=production` labels. Confirm
+   `--qualification-gate-protected=false`, no protected-label projection, no
+   controller mutation of Policy specifications, and
+   `NodeRestrictionUnverified` on protected-label ledger projection.
+9. Record Test trust only after independently hashing exact Test specs, source
+   bytes, images, and WorkflowTemplate semantics. The immutable approval
+   record must contain Test name, UID, generation, and reviewed content digest;
+   a stale generation must not remain trusted.
+10. Create the canonical GPU inventory Suite with one qualification stage.
    Preserve R01-R15 only in a separate compatibility Suite using Diagnostic
-   trust and verify zero additional qualification credit.
-9. Run the GPU inventory baseline and vLLM acceptance as separate Runs.
-10. Create or migrate Policies only after terminal evidence compatibility is
+   trust. Mechanically verify that no qualification Suite or Policy references
+   R01-R15 and that the ledger receives exactly one canonical Test credit.
+11. Run the GPU inventory baseline and vLLM acceptance as separate Runs.
+   Independently recompute Test, source, image, WorkflowTemplate, plan, and
+   evidence digests from the live objects before accepting either result.
+12. Create or migrate Policies only after terminal evidence compatibility is
    understood. Existing Runs remain readable, but only evidence satisfying the
    current Policy and evidence-v2 identity requirements receives qualification
    credit. Existing ledgers without a latest non-pass watermark remain
    readable; future Reset or Revoke evaluations persist the monotonic
    watermark.
-11. Enable protected projection only in a separate reviewed rollout after the
+13. Freeze pushes again and recheck exact-head ancestry, required CI, and
+    review immediately before deployment. Abort on any head, base, digest,
+    imageID, schema, ownership, cleanup, redaction, or prerequisite mismatch.
+14. Enable protected projection only in a separate reviewed rollout after the
    operator guard prerequisites are positively verified.
 
 Do not delete `CertificationPolicy` or `NodeCertification` CRDs while objects
 exist. Removing a CRD deletes its API storage and is not a rollback.
+
+The review package used for a deployment decision must be context-free and
+redacted. It pins the source commit and every controller, adapter, runner,
+resolver, harness, model, weight-set, Script, Test, and WorkflowTemplate
+digest; lists cluster prerequisites and registry-reachability checks; includes
+deterministic render plus client and server dry-run output; scans artifacts for
+raw participant, infrastructure, provider, and registry identities; and states
+only the bounded claims proven by the planned baseline and canary.
 
 ### Verification
 
@@ -685,6 +731,13 @@ If deployment or a bounded canary fails:
 5. retain the new CRDs whenever Policies or ledgers exist; and
 6. verify participant cordon state, reservations, active-resource counts,
    terminal Run bytes, and unrelated resources match the rollback snapshot.
+
+Abort and begin rollback on a digest or live `imageID` mismatch, schema
+rejection, historical-object incompatibility, ownership ambiguity, stalled
+cleanup, reservation-release failure, unexpected protected or legacy label,
+redaction failure, missing registry artifact, failed hard assertion, or any
+resource beyond the reviewed bounded shape. Recompute immutable digests
+independently from live objects before deciding that rollback completed.
 
 Never restore a protected label manually. Let the default-off qualification
 reconciler remove it before rolling back controller behavior.

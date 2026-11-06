@@ -49,14 +49,19 @@ func main() {
 	fmt.Println(digest)
 }
 
-func manifestDigest(filePath, kind, name, dataKey, field string) (string, error) {
+func manifestDigest(filePath, kind, name, dataKey, field string) (digest string, err error) {
 	file, err := os.Open(filePath)
 	if err != nil {
 		return "", err
 	}
-	defer file.Close()
+	defer func() {
+		if closeErr := file.Close(); err == nil && closeErr != nil {
+			err = fmt.Errorf("close manifest: %w", closeErr)
+		}
+	}()
 
 	decoder := utilyaml.NewYAMLOrJSONDecoder(file, 64*1024)
+
 	for {
 		var object unstructured.Unstructured
 		if err := decoder.Decode(&object.Object); err != nil {
@@ -72,6 +77,7 @@ func manifestDigest(filePath, kind, name, dataKey, field string) (string, error)
 		}
 
 		var content []byte
+
 		switch {
 		case dataKey != "":
 			value, found, nestedErr := unstructured.NestedString(object.Object, "data", dataKey)
