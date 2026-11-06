@@ -505,6 +505,95 @@ func TestResolvedTerminalEvidencePreservesFailureAndDiagnosticIdentity(t *testin
 	}
 }
 
+func TestResolvedQualificationEvidenceHandlesNonPassingStages(t *testing.T) {
+	t.Parallel()
+
+	node := qualificationNode("node", "node-uid", "boot-a")
+	scheme := qualificationScheme(t)
+	kube := fake.NewClientBuilder().WithScheme(scheme).WithObjects(node).Build()
+	reconciler := &RunReconciler{
+		Client:          kube,
+		APIReader:       kube,
+		ControllerImage: pinnedImage("controller", "a"),
+	}
+
+	t.Run("required failure preserves failure without success fingerprint", func(t *testing.T) {
+		run, summary, runnerImage := resolvedTerminalTestRun(
+			t,
+			node,
+			signalv1.StageVerdictFailed,
+			false,
+		)
+		summary.Participants[0].Start.DriverVersion = ""
+		summary.Participants[0].End.DriverVersion = ""
+		summary.Participants[0].Start.GPUInventoryDigest = ""
+		summary.Participants[0].End.GPUInventoryDigest = ""
+
+		identity, verdict, _, err := reconciler.resolvedQualificationEvidenceIdentity(
+			context.Background(),
+			run,
+			[]signalv1.StageEvidenceSummary{summary},
+			[]string{runnerImage},
+			"Fail",
+			"RequiredStageFailed",
+		)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		if identity == nil ||
+			verdict != "Fail" ||
+			identity.Participants[0].Verdict != signalv1.QualificationVerdictFail {
+			t.Fatalf("identity = %#v, verdict = %q", identity, verdict)
+		}
+	})
+
+	t.Run("optional failure does not poison participant verdict", func(t *testing.T) {
+		run, summary, runnerImage := resolvedTerminalTestRun(
+			t,
+			node,
+			signalv1.StageVerdictFailed,
+			false,
+		)
+		run.Spec.ResolvedPlan.Phases[0].Stages[0].Optional = true
+
+		digest, err := signalv1.DeriveResolvedExecutionPlanDigest(
+			int32(len(run.Spec.Participants)),
+			run.Spec.Environment,
+			*run.Spec.ResolvedPlan,
+			*run.Spec.PlanProvenance,
+		)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		run.Spec.PlanDigest = digest
+		summary.Participants[0].Start.DriverVersion = ""
+		summary.Participants[0].End.DriverVersion = ""
+		summary.Participants[0].Start.GPUInventoryDigest = ""
+		summary.Participants[0].End.GPUInventoryDigest = ""
+
+		identity, verdict, reason, err := reconciler.resolvedQualificationEvidenceIdentity(
+			context.Background(),
+			run,
+			[]signalv1.StageEvidenceSummary{summary},
+			[]string{runnerImage},
+			"Pass",
+			"AllRequiredStagesPassed",
+		)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		if identity == nil ||
+			verdict != "Pass" ||
+			reason != "AllRequiredStagesPassed" ||
+			identity.Participants[0].Verdict != signalv1.QualificationVerdictPass {
+			t.Fatalf("identity = %#v, verdict = %q, reason = %q", identity, verdict, reason)
+		}
+	})
+}
+
 func TestValidateStageEvidenceSummaryRejectsOmittedFailedAssertion(t *testing.T) {
 	t.Parallel()
 

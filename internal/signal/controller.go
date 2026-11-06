@@ -4526,6 +4526,21 @@ func (r *RunReconciler) resolvedQualificationEvidenceIdentity(
 		if !stage.QualificationEligible || stage.DiagnosticOnly {
 			continue
 		}
+
+		if stage.PhaseOrder < 0 ||
+			int(stage.PhaseOrder) >= len(run.Spec.ResolvedPlan.Phases) ||
+			stage.StageOrder < 0 ||
+			int(stage.StageOrder) >= len(run.Spec.ResolvedPlan.Phases[stage.PhaseOrder].Stages) {
+			return nil,
+				"Inconclusive",
+				"QualificationEvidenceMalformed: stage order is outside the resolved plan",
+				nil
+		}
+
+		if run.Spec.ResolvedPlan.Phases[stage.PhaseOrder].Stages[stage.StageOrder].Optional {
+			continue
+		}
+
 		hasQualificationStage = true
 
 		for participantIndex := range stage.Participants {
@@ -4549,22 +4564,25 @@ func (r *RunReconciler) resolvedQualificationEvidenceIdentity(
 					nil
 			}
 
-			if err := mergeResolvedQualificationFingerprint(participant, *observed); err != nil {
-				return nil,
-					"Inconclusive",
-					fmt.Sprintf(
-						"QualificationEvidenceMalformed: participant %d fingerprint: %v",
-						observed.Index,
-						err,
-					),
-					nil
+			if stage.Verdict == signalv1.StageVerdictPassed {
+				if err := mergeResolvedQualificationFingerprint(participant, *observed); err != nil {
+					return nil,
+						"Inconclusive",
+						fmt.Sprintf(
+							"QualificationEvidenceMalformed: participant %d fingerprint: %v",
+							observed.Index,
+							err,
+						),
+						nil
+				}
+
+				observedParticipants[observed.Index] = true
 			}
 
 			participant.Verdict = combineQualificationVerdicts(
 				participant.Verdict,
 				observed.Verdict,
 			)
-			observedParticipants[observed.Index] = true
 		}
 	}
 
@@ -4572,7 +4590,8 @@ func (r *RunReconciler) resolvedQualificationEvidenceIdentity(
 	sort.Strings(resolverImages)
 
 	for index := range participants {
-		if hasQualificationStage &&
+		if verdict == "Pass" &&
+			hasQualificationStage &&
 			(!observedParticipants[index] ||
 				participants[index].Start.DriverVersion == "" ||
 				participants[index].Start.GPUInventoryDigest == "") {
