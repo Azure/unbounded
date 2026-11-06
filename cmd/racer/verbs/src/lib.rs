@@ -7,7 +7,10 @@
 //!
 //! This crate runs no executor. Its only threads are short-lived helpers
 //! that pin and register page and device pools (`ibv_reg_mr`,
-//! `ibv_reg_dmabuf_mr`) so the owner keeps serving meanwhile; the RDMA
+//! `ibv_reg_dmabuf_mr`) so the owner keeps serving meanwhile, and a few
+//! reaper threads that destroy queue pairs and connection manager ids, paced,
+//! because those calls can hang in the kernel on a failing device (see
+//! `reaper.rs`); the RDMA
 //! connection manager is an event-driven state machine the owner advances
 //! when polled. Time and randomness come from the explicit
 //! `racer_io::WorkerCtx` passed to `Owner::new`.
@@ -60,6 +63,14 @@
 //! destroying the QP does. If the native side cannot free something, it leaks
 //! it on purpose instead of freeing memory the NIC might still use. The
 //! [`NodeConfig`] guard leaks with it, so the leak counts against your limits.
+//!
+//! # Device loss
+//!
+//! A connection manager `DEVICE_REMOVAL` event (registration mode) breaks
+//! every link on the device's rail with [`BreakReason::DeviceLost`], fails
+//! their ops at once, and refuses new links on the rail for the rest of the
+//! round. [`Client::device_losses`] and [`Client::lost_rails`] report it; the
+//! caller closes the round and activates again once the device is back.
 //!
 //! # Shutdown and reuse
 //!

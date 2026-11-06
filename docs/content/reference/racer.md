@@ -1849,7 +1849,8 @@ and `racer_rdma_links_breaking` count the node's links by state.
 `declined` (the peer refused the setup with `409`, `429`, or `503`; retries after
 1 s), `peer_closed` and `closed` (no backoff), and `grant_expired` (an exposed grant
 was neither written nor released within 10 s of its deadline, so the link closed;
-also counted as `closed`). `racer_rdma_link_setups_total{outcome}` counts link
+also counted as `closed`), and `device_lost` (the link's RDMA device was removed;
+no backoff). `racer_rdma_link_setups_total{outcome}` counts link
 setups this node initiated as `success`, `declined`, or `failed`.
 `racer_rdma_prefetch_failures_total` counts sends whose source page could not
 be mapped into the NIC ahead of the write (window mode prefetches each page
@@ -1869,6 +1870,37 @@ over HTTP). Nodes that publish no rails count nothing.
 to write, so the body went over HTTP and the receiver's grant was released: `not_page`
 (the response carried no page body) or `plan_mismatch` (the sender's plan for the page
 and hop disagreed with the granted rail, for example across a Site or rail change).
+
+An RDMA device can disappear while the dataplane runs, for example when an
+Azure host hot-unplugs and later replugs a MANA VF (`hv_netvsc ... VF slot 0
+removed` in `dmesg`), sometimes bringing it back under a new name such as
+`roceP30832p0s0`. The dataplane notices in either of two ways: the RDMA
+connection manager reports the device removed, or the device's PCI address is
+no longer at its activated name under `/sys/class/infiniband` (checked every
+2 s for rails whose PCI address is known). It then breaks every link on the
+device at once, so pending RDMA transfers fail and their reads fall back to
+HTTP without waiting for their deadlines. It also deactivates RDMA, so
+`racer_rdma_active` drops to 0 and new reads plan HTTP, and it stops
+advertising its rails, the same way as after a failed activation. Each loss
+logs `stage=rdma-device state=lost` and counts `racer_rdma_device_losses_total`.
+While the device is missing, the dataplane does not retry activation. Once
+every lost PCI address is back in sysfs and the old links and page buffers are
+released, it reactivates RDMA. A device that came back under a new name
+refreshes the device inventory first; rails are keyed by PCI address, so it
+keeps its rail. A successful reactivation logs `stage=rdma-device
+state=reactivated` and counts `racer_rdma_device_reactivations_total`.
+
+The RDMA owner thread hands queue pair and connection manager teardowns to
+helper threads named `racer-rdma-reaper`, at most one teardown every 2 ms per
+helper. A burst of link closes, such as every link going idle at once or a node
+close, therefore reaches the device spread out. A teardown that hangs in the
+kernel also cannot stall the owner. The dataplane keeps every buffer the queue
+pair may still use until the teardown returns, so a teardown that never returns
+leaks that memory instead of freeing it early. Such a hang also keeps RDMA from
+reactivating until the dataplane restarts. Restarting may not help either: a
+thread in uninterruptible sleep can keep the process from exiting, and that
+takes a node reboot.
+
 The Node annotation `racer.unbounded-cloud.io/rdma-nics` accepts at most 64 entries:
 
 ```json
