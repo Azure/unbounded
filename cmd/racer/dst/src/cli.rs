@@ -25,19 +25,18 @@ pub const USAGE: &str = "usage: racer-dst [--scenario NAME] [--nodes N] [--seed 
 [--duration D] [--config FILE.json] [--out PATH]\n\
 scenarios: enrollment-storm, failover, ctl-churn, lagging,\n\
            full-cold-start, full-failover, full-churn, full-lagging,\n\
-           racer-sim's storm, churn, faults, smoke, caches-only, zipf and empty,\n\
+           aliases storm, churn, faults, smoke, caches-only, zipf and empty,\n\
            or any racer-dst catalog scenario name\n\
 durations: integer with ns, us, ms or s suffix (plain numbers are seconds)\n\
 without arguments racer-dst runs its seed set (DST_SEEDS, DST_STEPS, DST_FILTER)";
 
-/// racer-sim control plans.
+/// Control-plane scenario names: each runs a control plan ([`crate::model::control::plan`]).
 pub const CONTROL: &[&str] = &["enrollment-storm", "failover", "ctl-churn", "lagging"];
 
-/// racer-sim's other scenario names and the racer-dst scenario each runs (`dst/MODEL.md`,
-/// Command line). `storm` is [`scenarios::cold_start`] at `--nodes`; racer-sim's Poisson node
-/// scenarios (`smoke`, `caches-only`, `zipf`) run the combined Zipf load, and `empty` runs it
+/// Short scenario aliases and the catalog scenario each runs. `storm` is
+/// [`scenarios::cold_start`] at `--nodes`; the steady-load aliases (`smoke`, `caches-only`, `zipf`) run the combined Zipf load, and `empty` runs it
 /// with no reads.
-pub const SIM_ALIASES: &[(&str, &str)] = &[
+pub const ALIASES: &[(&str, &str)] = &[
     ("storm", "storm"),
     ("churn", "model-membership-churn"),
     ("faults", "model-faults"),
@@ -47,10 +46,10 @@ pub const SIM_ALIASES: &[(&str, &str)] = &[
     ("empty", "full-cold-start"),
 ];
 
-/// racer-sim's topology-only scenarios, now `topology/tests/mesh_scenarios.rs`.
+/// Topology-only scenario names; they run as `topology/tests/mesh_scenarios.rs`, not here.
 pub const MESH: &[&str] = &["mesh", "mesh-selector"];
 
-/// racer-sim combined scenarios.
+/// Combined scenarios: a control plan co-stepped with the Model read path.
 pub const COMBINED: &[&str] = &[
     "full-cold-start",
     "full-failover",
@@ -58,7 +57,7 @@ pub const COMBINED: &[&str] = &[
     "full-lagging",
 ];
 
-/// Top-level `--config` keys the Model takes (racer-sim `Config::apply_json` names).
+/// Top-level `--config` keys the Model takes.
 pub const KEYS: &[&str] = &[
     "nodes",
     "sites",
@@ -77,7 +76,7 @@ pub const KEYS: &[&str] = &[
     "node",
 ];
 
-/// `"node"` keys the Model takes (racer-sim `NodeConfig`).
+/// `"node"` keys the Model takes.
 pub const NODE_KEYS: &[&str] = &[
     "crypto_queue",
     "relay_transfers",
@@ -116,8 +115,7 @@ impl Default for Options {
     }
 }
 
-/// Parse `10s`, `250ms`, `5us`, `7ns` or a plain number of seconds (racer-sim
-/// `parse_duration`).
+/// Parse `10s`, `250ms`, `5us`, `7ns` or a plain number of seconds.
 pub fn parse_duration(raw: &str) -> Result<Nanos, String> {
     let (digits, unit) = match raw.find(|c: char| !c.is_ascii_digit()) {
         Some(i) => raw.split_at(i),
@@ -181,7 +179,7 @@ impl Options {
             ));
         }
         let known = CONTROL.contains(&options.scenario.as_str())
-            || SIM_ALIASES.iter().any(|(n, _)| *n == options.scenario)
+            || ALIASES.iter().any(|(n, _)| *n == options.scenario)
             || COMBINED.contains(&options.scenario.as_str())
             || scenarios::find(&options.scenario).is_some();
         if !known {
@@ -321,7 +319,7 @@ impl Config {
 /// Build the scenario `options` names with `config` applied.
 fn build(options: &Options, config: &Config) -> Result<Scenario, String> {
     let sim_name = options.scenario.as_str();
-    let name = SIM_ALIASES
+    let name = ALIASES
         .iter()
         .find(|(n, _)| *n == sim_name)
         .map_or(sim_name, |(_, to)| to);
@@ -338,8 +336,7 @@ fn build(options: &Options, config: &Config) -> Result<Scenario, String> {
         }
         scenario
     } else if COMBINED.contains(&name) {
-        // racer-sim `data_defaults`: 0.02 reads per node per second; its `Config::default`
-        // has 16 nodes.
+        // Defaults: 0.02 reads per node per second on 16 nodes.
         let secs = duration.map(|d| d.div_ceil(SECONDS));
         let nodes = nodes.unwrap_or(16);
         scenarios::combined_with(name, nodes, rate.unwrap_or(0.02), secs, &config.faults)
@@ -534,7 +531,7 @@ mod tests {
     }
 
     #[test]
-    fn runs_a_combined_scenario_with_racer_sim_fields() {
+    fn runs_a_combined_scenario_with_report_fields() {
         let o = Options {
             scenario: "full-failover".into(),
             nodes: Some(40),
@@ -555,14 +552,14 @@ mod tests {
         assert!(run(&missing).is_err());
     }
 
-    /// Every racer-sim `--scenario` name (`sim/src/lib.rs` `USAGE`) runs and reports under its
-    /// own name, except the topology-only mesh scenarios, which point at the topology tests.
+    /// Every non-catalog `--scenario` name listed in [`USAGE`] runs and reports under its own
+    /// name, except the topology-only mesh scenarios, which point at the topology tests.
     #[test]
-    fn every_racer_sim_scenario_name_runs() {
+    fn every_named_scenario_runs() {
         let names = CONTROL
             .iter()
             .chain(COMBINED)
-            .chain(SIM_ALIASES.iter().map(|(n, _)| n));
+            .chain(ALIASES.iter().map(|(n, _)| n));
         for name in names {
             let catalog = matches!(*name, "churn" | "faults");
             let o = Options {

@@ -1,4 +1,4 @@
-//! Versioned memberships (racer-sim `node/state.rs` `Versions`, standalone mode).
+//! Versioned memberships for standalone Model runs.
 //!
 //! Membership changes are batched into published versions; each node adopts a version after a
 //! per-node lag and still resolves the `retained` versions before the one it adopted. Members
@@ -30,13 +30,11 @@ impl Member for ModelMember {
 /// A Model membership.
 pub type Members = topology::Membership<ModelMember>;
 
-/// Membership changes are batched and published at this period (racer-sim
-/// `NodeConfig::membership_batch_ns`).
+/// Membership changes are batched and published at this period.
 pub const BATCH: Nanos = 250 * MILLIS;
-/// Most adoption lag of a node (racer-sim `NodeConfig::membership_lag_ns`).
+/// Most adoption lag of a node.
 pub const LAG: Nanos = 100 * MILLIS;
-/// Old versions a node still resolves (production `retained_snapshots`, racer-sim
-/// `retained_versions`).
+/// Old versions a node still resolves (production `retained_snapshots`).
 pub const RETAINED: u64 = 2;
 
 /// One published membership.
@@ -73,7 +71,7 @@ pub struct Versions {
     dirty: bool,
     lag: Nanos,
     retained: u64,
-    /// Combined mode (racer-sim `Versions::external`): the version each node's control client
+    /// Combined mode: the version each node's control client
     /// applied (0: none yet). Versions are committed by the control plane, not published here.
     external: Option<Vec<u64>>,
     /// Combined mode: version 0, the empty membership of a node without a snapshot.
@@ -83,7 +81,7 @@ pub struct Versions {
     pub now: Nanos,
 }
 
-/// racer-sim's `mix` (SplitMix64 finalizer): the per-node lag draw.
+/// SplitMix64 finalizer: the per-node lag draw.
 fn mix(mut z: u64) -> u64 {
     z = z.wrapping_add(0x9e37_79b9_7f4a_7c15);
     z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
@@ -300,7 +298,7 @@ impl Versions {
     }
 
     /// Whether `version`'s predecessor lists `node` and `version` replaced it within
-    /// [`racer_core::read::walk::PREVIOUS_MEMBERSHIP_WITHIN`] (racer-sim `previous_facts`).
+    /// [`racer_core::read::walk::PREVIOUS_MEMBERSHIP_WITHIN`].
     pub fn previous_recent_member(&self, node: u32, version: u64) -> bool {
         let within = racer_core::read::walk::PREVIOUS_MEMBERSHIP_WITHIN.as_nanos() as Nanos;
         let member = version

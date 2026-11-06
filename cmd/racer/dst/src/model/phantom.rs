@@ -1,6 +1,3 @@
-//! Copied from racer-sim (`sim/src/phantom.rs`), which keeps its own copy until Phase 7
-//! deletes it; memo maps use a fixed-seed hasher here.
-//!
 //! Memory-lean stand-ins for the per-node placement and route caches.
 //!
 //! [`Phantom`] and [`SharedRoutes`] plug into [`topology::Placement`] and

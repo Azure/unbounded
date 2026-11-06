@@ -44,14 +44,14 @@ use crate::engine::{Engine as Queue, MILLIS, Nanos, SECONDS, TraceHash};
 /// A fixed-hasher set (deterministic; only membership is queried).
 type PollSet = std::collections::HashSet<u32, BuildHasherDefault<DefaultHasher>>;
 
-/// racer-sim's `Streams::new(seed).stream(Role::Control, 0)`, so a seed draws the same control
-/// stream in both harnesses.
+/// The control-plane random stream of `seed`, kept separate from the read path's draws so the
+/// two do not perturb each other.
 fn control_stream(seed: u64) -> SplitMix64 {
     const CONTROL: u64 = 7;
     SplitMix64::new(mix(mix(seed ^ CONTROL.wrapping_mul(0x9E37_79B9_7F4A_7C15))))
 }
 
-/// The dst event queue plus the control trace digest (racer-sim's engine carries both).
+/// The dst event queue plus the control trace digest .
 pub(crate) struct Engine<E> {
     queue: Queue<E>,
     pub(crate) trace: TraceHash,
@@ -2392,15 +2392,15 @@ impl ControlSim {
     }
 }
 
-/// The control part of a Model scenario: a racer-sim control plan run at
+/// The control part of a Model scenario: a control plan run at
 /// the scenario's node count and end time.
 #[derive(Clone, Debug)]
 pub struct ControlSpec {
-    /// racer-sim control scenario whose plan ([`plan`]) is used.
+    /// Control scenario whose plan ([`plan`]) is used.
     pub plan: &'static str,
-    /// racer-sim `"control"` overrides ([`Settings::apply_json`]).
+    /// `"control"` overrides ([`Settings::apply_json`]).
     pub overrides: Option<Value>,
-    /// Co-step with the Model read path (racer-sim `combined.rs`).
+    /// Co-step with the Model read path.
     pub combined: bool,
 }
 
@@ -2475,7 +2475,7 @@ fn outcome(
 }
 
 /// The control plane of a combined run: `ctl`'s plan at `nodes` Pods for
-/// `end`, with its overrides (racer-sim `combined::run`).
+/// `end`, with its overrides.
 pub fn combined(ctl: &ControlSpec, nodes: u32, seed: u64, end: Nanos) -> ControlSim {
     let (mut settings, _, faults) = plan(ctl.plan, nodes, Some(end));
     if let Some(o) = &ctl.overrides {

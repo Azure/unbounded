@@ -19,8 +19,7 @@ fn counter(report: &Value, name: &str) -> u64 {
     report["metrics"]["counters"][name].as_u64().unwrap_or(0)
 }
 
-/// Ported from racer-sim `concurrent_cold_readers_join_flights`
-/// (`sim/tests/contention_scenarios.rs`): 64 nodes read every page of one cold object within
+/// 64 nodes read every page of one cold object within
 /// 1 ms. Every read is delivered, readers join flights, and origin traffic stays per owner.
 pub fn concurrent_cold_readers() -> Scenario {
     const NODES: u32 = 64;
@@ -86,11 +85,11 @@ fn storm(at: Nanos, object: u64, nodes: u32, window: Nanos) -> Storm {
     }
 }
 
-/// Ported from racer-sim `cold_start_completes_with_bounded_origin_traffic` and
-/// `two_thousand_nodes_cold_start` (`sim/tests/contention_scenarios.rs`): every node cold-starts
+/// Every node cold-starts
 /// on one object within 10 ms. Every read ends; reads fail only with `Overloaded`, `FlightFull` or
 /// `Unavailable`, at most 1 in 100; each page reaches origin at most once per owner; pages are
-/// published. racer-sim's per-node memory bound has no Model counterpart (see MODEL.md).
+/// published. The Model does
+/// not bound per-node memory (see MODEL.md).
 pub fn cold_start(nodes: u32) -> Scenario {
     cold_start_with(nodes, ModelSpec::default().attempt_timeout)
 }
@@ -140,9 +139,7 @@ pub fn cold_start_with(nodes: u32, attempt_timeout: Nanos) -> Scenario {
         .max_steps(u64::MAX)
 }
 
-/// Ported from racer-sim `hot_page_storm` with `hot_page_readers_fan_out_through_helpers` and
-/// `mesh_hot_page_readers_fan_out_through_column_helpers`
-/// (`sim/tests/contention_scenarios.rs`): one node reads a one-page object, then 5 s later
+/// One node reads a one-page object, then 5 s later
 /// `nodes` nodes read it within 1 ms over 32 MiB/s NICs. Owners streaming their hot-page body
 /// limit shed readers to helpers; every read completes, helpers serve copies and the page
 /// reaches origin once.
@@ -182,8 +179,7 @@ pub fn hot_page_storm(nodes: u32) -> Scenario {
         .max_steps(u64::MAX)
 }
 
-/// Ported from racer-sim `origin_forbidden_reelects_a_waiter`
-/// (`sim/tests/contention_scenarios.rs`): 64 nodes read one object while half of the origin
+/// 64 nodes read one object while half of the origin
 /// fetches answer 403. A 403 fails only the leader that received it, so some reads fail with
 /// `OriginForbidden` and the rest complete through re-elected waiters.
 pub fn origin_forbidden() -> Scenario {
@@ -241,7 +237,7 @@ pub fn range_deadline() -> Scenario {
         .end(3 * SECONDS)
 }
 
-/// Model-only (racer-sim's range reads do not run through `ReadWindow`): 32 nodes read one
+/// Range reads through `ReadWindow`: 32 nodes read one
 /// cold object as a range through windows of 4 pages with 4 spill pages, then read it again
 /// 1 s later from their local copies. Every page is delivered in order, origin traffic stays
 /// per owner, and the second pass reads from disk.
@@ -390,12 +386,10 @@ pub fn faults() -> Scenario {
         .end(10 * SECONDS)
 }
 
-/// Ported from racer-sim `reads_recover_after_partition_heals`
-/// (`sim/tests/contention_scenarios.rs`, seed 6): 32 nodes in 4 sites; sites 0 and 1 cannot
+/// 32 nodes in 4 sites; sites 0 and 1 cannot
 /// reach each other for the first 2 s while every node reads object 0, and every node reads
-/// object 1 at 4 s, after the heal. racer-sim's check: at least one object's worth of reads
-/// completes; the Model also requires every read to end and every second-storm read to
-/// complete.
+/// object 1 at 4 s, after the heal. At least one object's worth of reads
+/// completes, every read ends, and every second-storm read completes.
 pub fn partition_heals() -> Scenario {
     const NODES: u32 = 32;
     const SITES: u32 = 4;
@@ -440,12 +434,10 @@ pub fn partition_heals() -> Scenario {
     scenario
 }
 
-/// Ported from racer-sim `hung_relays_are_routed_around` and
-/// `hung_peers_are_found_and_recovered_peers_are_used_again` (the `GRID` layout, silence on):
-/// 200 nodes, every 20th node's peer server hangs until 40 s (it accepts requests, as owner or
+/// Hung peers, with silence tracking on: 200 nodes, every 20th node's peer server hangs until 40 s (it accepts requests, as owner or
 /// relay, and never answers), past both storms, and 100 readers read one 64-page object twice, 30 s apart.
 /// Readers find the hung peers (silence timeouts and pings) and route around them: at most 2
-/// reads fail in the first storm and at most 1 in the second (racer-sim's bounds).
+/// reads fail in the first storm and at most 1 in the second.
 pub fn hung_peers() -> Scenario {
     const NODES: u32 = 200;
     let spec = ModelSpec {
@@ -488,8 +480,7 @@ pub fn hung_peers() -> Scenario {
         .end(60 * SECONDS)
 }
 
-/// Ported from racer-sim `relay_shed_rank0_probes_do_not_overlap_a_slow_origin_fetch`
-/// (`sim/tests/contention_scenarios.rs`, seed 3): 300 nodes, 48 readers of one 64-page object
+/// 300 nodes, 48 readers of one 64-page object
 /// from an 8 MiB/s origin, so rank 0's origin requests queue past the owners' 2 s attempt
 /// timeout; 16 `Relay` transfers per worker and room for 128 waiters per flight. Owners whose
 /// probes of rank 0 time out or are shed by a relay leave the fetch to rank 0: no page is asked
@@ -583,11 +574,11 @@ pub fn node_faults() -> Scenario {
         .end(24 * SECONDS)
 }
 
-/// Ported from racer-sim's `churn` scenario (`sim/src/lib.rs` `scenario_schedules`): a tenth of
+/// Membership churn: a tenth of
 /// the nodes leave at a drawn time and rejoin a quarter of the run later. Changes publish every
 /// 250 ms and each node adopts a version up to 100 ms late, so requests meet destinations that
 /// are behind (`StaleMembership`) and readers refresh, fall back to the previous membership or
-/// wait. racer-sim drives a Poisson workload; here 200 nodes read a new object every 250 ms.
+/// wait. 200 nodes read a new object every 250 ms.
 /// Every read ends, and reads fail only with transient errors.
 pub fn membership_churn() -> Scenario {
     const NODES: u32 = 200;
@@ -715,7 +706,7 @@ pub fn authority_api_faults() -> Scenario {
     )
 }
 
-/// The racer-sim control scenario `plan` (`sim/src/control.rs` `plan`) at
+/// The control scenario `plan` ([`crate::model::control::plan`]) at
 /// `nodes` Pods for its default duration, in Model fidelity: real seat,
 /// election, admission and authorization rules, and primary passes driven
 /// by the real `Shell`. Checks: every live client enrolled, and the plan's
@@ -788,19 +779,18 @@ pub fn control(plan: &'static str, nodes: u32) -> Scenario {
         .end(end)
 }
 
-/// racer-sim's combined scenario `name` (`sim/src/combined.rs`): the control
+/// The combined scenario `name`: the control
 /// plan it names plus the Model read path on one timeline, at `nodes` nodes
 /// over 4 sites with a Zipf read load of `rate` reads per node per second for
-/// `secs` (the racer-sim default duration when `None`), and racer-sim's
-/// default data-plane faults (`DataFaults::plan`): slow nodes, origin error
+/// `secs` (400 s to 1200 s by scenario when `None`), and the
+/// default data-plane faults ([`DataFaults::default`]): slow nodes, origin error
 /// bursts, a site cut, and in `full-cold-start` a storm on object 0 by every
 /// node at three quarters of the run.
 pub fn combined(name: &str, nodes: u32, rate: f64, secs: Option<u64>) -> Scenario {
     combined_with(name, nodes, rate, secs, &DataFaults::default())
 }
 
-/// racer-sim's data-plane faults of the combined scenarios (`sim/src/combined.rs`
-/// `DataFaults`, `"combined_faults"` in its `--config`).
+/// Data-plane faults of the combined scenarios (`"combined_faults"` in the `--config` file).
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct DataFaults {
     /// No data-plane faults at all when false.
@@ -820,7 +810,7 @@ pub struct DataFaults {
 }
 
 impl Default for DataFaults {
-    /// racer-sim's defaults.
+    /// Every fault on, at the default rates.
     fn default() -> Self {
         Self {
             enabled: true,
@@ -835,7 +825,7 @@ impl Default for DataFaults {
 }
 
 impl DataFaults {
-    /// Apply racer-sim's `"combined_faults"` JSON object (`DataFaults::apply_json`).
+    /// Apply a `"combined_faults"` JSON object.
     pub fn apply_json(&mut self, value: &serde_json::Value) -> Result<(), String> {
         let obj = value
             .as_object()
@@ -994,8 +984,7 @@ pub fn combined_with(
 /// Every built-in scenario.
 pub fn catalog() -> Vec<Scenario> {
     vec![
-        // Smaller than racer-sim's test sizes so the debug CI run stays fast; the parity table
-        // in `dst/MODEL.md` runs racer-sim's sizes through `tests/control.rs`.
+        // Small sizes so the debug CI run stays fast; `tests/control.rs` can run larger ones.
         combined("full-cold-start", 200, 0.05, Some(120)),
         combined("full-failover", 120, 0.05, Some(300)),
         combined("full-churn", 160, 0.02, Some(400)),

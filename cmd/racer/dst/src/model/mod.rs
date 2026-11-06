@@ -119,7 +119,7 @@ impl Types for ModelTypes {
     fn value(_page: &Self::Page, _source: racer_core::read::Source) -> Self::Value {}
 }
 
-/// A steady read load (racer-sim's Poisson arrivals and Zipf popularity, `workload.rs`): every
+/// A steady read load (Poisson arrivals and Zipf popularity): every
 /// node reads one uniformly drawn page of a Zipf-drawn object at Poisson arrivals of `rate`
 /// reads per second, while it is up and a member.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -130,15 +130,14 @@ pub struct Workload {
     pub zipf_s: f64,
     /// Reads per node per second.
     pub rate: f64,
-    /// Fraction of reads that read `range_pages` consecutive pages (racer-sim `range_fraction`);
+    /// Fraction of reads that read `range_pages` consecutive pages;
     /// the Model issues them as concurrent page reads.
     pub range_fraction: f64,
     /// Pages of a range read, capped at the object's end.
     pub range_pages: u32,
 }
 
-/// Origin errors injected during `[from, until)` on top of [`ModelSpec::origin_errors`]
-/// (racer-sim `Fault::OriginErrors`).
+/// Origin errors injected during `[from, until)` on top of [`ModelSpec::origin_errors`].
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct OriginBurst {
     /// Start.
@@ -149,8 +148,7 @@ pub struct OriginBurst {
     pub errors: OriginErrors,
 }
 
-/// Every link between site `a` and site `b` is cut during `[from, until)` (racer-sim
-/// `Fault::Partition { site_a, site_b }`).
+/// Every link between site `a` and site `b` is cut during `[from, until)`.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct SiteCut {
     /// Start.
@@ -194,7 +192,7 @@ pub struct Outage {
     pub until: Nanos,
 }
 
-/// Membership churn (racer-sim `Churn`): `node` joins or leaves at `at`. A node that left keeps
+/// Membership churn: `node` joins or leaves at `at`. A node that left keeps
 /// running; it is only absent from the memberships published after.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Churn {
@@ -206,7 +204,7 @@ pub struct Churn {
     pub join: bool,
 }
 
-/// Random churn (racer-sim `Churn::random`): `events` leave and rejoin pairs, each leave drawn
+/// Random churn: `events` leave and rejoin pairs, each leave drawn
 /// below `within` on a drawn node that rejoins `away` later.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct RandomChurn {
@@ -246,7 +244,7 @@ pub struct ModelSpec {
     /// Client read deadline.
     pub read_timeout: Nanos,
     /// Per-attempt exchange cap of a peer probe (`AttemptInputs::attempt_timeout`); a probe
-    /// unanswered by then times out (`Reply::TimedOut`). Production and racer-sim use
+    /// unanswered by then times out (`Reply::TimedOut`). Production uses
     /// [`ATTEMPT_TIMEOUT`], the default; [`NO_ATTEMPT_CAP`] bounds an attempt by its signed
     /// overall deadline only.
     pub attempt_timeout: Nanos,
@@ -256,7 +254,7 @@ pub struct ModelSpec {
     pub origin_errors: OriginErrors,
     /// Cache outages.
     pub outages: Vec<Outage>,
-    /// Hung peer servers (racer-sim `Fault::Hang`): during `[at, until)` the node accepts every
+    /// Hung peer servers: during `[at, until)` the node accepts every
     /// peer request, as destination or relay, and never answers or forwards it.
     pub hangs: Vec<Outage>,
     /// Client page reads refresh the object's metadata through the worker's
@@ -266,13 +264,12 @@ pub struct ModelSpec {
     pub churn: Vec<Churn>,
     /// Drawn membership changes, added to [`Self::churn`].
     pub random_churn: Option<RandomChurn>,
-    /// Most adoption lag of a node (racer-sim `membership_lag_ns`, at most one batch).
+    /// Most adoption lag of a node (at most one batch).
     pub membership_lag: Nanos,
-    /// `Relay` transfers per worker; production's default unless a scenario overrides it
-    /// (racer-sim `NodeConfig::relay_transfers`).
+    /// `Relay` transfers per worker; production's default unless a scenario overrides it.
     pub relay_transfers: usize,
     /// Crypto jobs one worker may hold before a new request's verification fails `Overloaded`
-    /// and the server answers the unsigned overload head (racer-sim `NodeConfig::crypto_queue`);
+    /// and the server answers the unsigned overload head;
     /// zero is unbounded.
     pub crypto_queue: usize,
     /// Peer connection slots (`racer_core::connections`): per-worker outbound pools, per-node
@@ -283,8 +280,7 @@ pub struct ModelSpec {
     /// that failed to connect backs off (`racer_core::route::link_backoff`), sends over it fail
     /// at once, and route searches route around it. On by default; off only for ablation.
     pub circuits: bool,
-    /// Waiters per flight; production's default unless a scenario overrides it (racer-sim
-    /// `NodeConfig::waiters_per_flight`).
+    /// Waiters per flight; production's default unless a scenario overrides it.
     pub waiters_per_flight: usize,
     /// Report checks, by name.
     pub checks: Vec<(String, ReportCheck)>,
@@ -323,7 +319,7 @@ pub enum PeerConnections {
 }
 
 impl Default for ModelSpec {
-    /// racer-sim's `Config::default` node shape: 2 workers, 16 pages of 1 MiB, 10 s reads.
+    /// The default node shape: 2 workers, 16 pages of 1 MiB, 10 s reads.
     fn default() -> Self {
         Self {
             workers: 2,
@@ -392,7 +388,7 @@ enum Ev {
     /// The destination verified request `msg`; its worker takes it next.
     Verified { msg: u64 },
     /// The requester of `msg` gave up: a last link still unanswered is a timeout for its
-    /// sender (racer-sim `Event::LastHop`).
+    /// sender.
     LastHop { msg: u64 },
     /// The requester of `msg` gave up: it closes its connection and the relays see theirs close
     /// (`Model::conns`).
@@ -501,7 +497,7 @@ struct Route {
     charged: u8,
 }
 
-/// A peer request on its route (racer-sim `Msg`; production `peer/forwarding.rs`).
+/// A peer request on its route (production `peer/forwarding.rs`).
 struct Msg {
     from: u32,
     worker: u32,
@@ -548,12 +544,12 @@ struct Asker {
 struct Node {
     cores: Vec<WorkerCore<ModelTypes>>,
     stored: Store,
-    /// Production `LinkHealth` silence, shared by the node's workers (racer-sim
-    /// `NodeState::silence`): fed by [`Effect::Silence`], read by every non-owner ranking.
+    /// Production `LinkHealth` silence, shared by the node's workers: fed by
+    /// [`Effect::Silence`], read by every non-owner ranking.
     silence: Silence<u32, Page>,
     /// Silence pings in flight (production `CandidatePolicy::pings`).
     pings: usize,
-    /// Production `LinkHealth` detours (racer-sim `NodeState::detours`): first hops a route
+    /// Production `LinkHealth` detours: first hops a route
     /// skips after timeouts.
     detours: Detours<u32>,
     /// Crashed and not yet restarted: its peer server takes no connections.
@@ -583,8 +579,7 @@ impl Links {
     }
 }
 
-/// How a walk probe's reply ended, for repeat classification (racer-sim's mapping from the
-/// walk outcome to `Asked`).
+/// How a walk probe's reply ended, for repeat classification.
 fn asked(reply: &Reply, cut: Option<Cut>) -> Asked {
     use racer_core::read::ResponseKind as K;
     match *reply {
@@ -621,7 +616,7 @@ fn asked(reply: &Reply, cut: Option<Cut>) -> Asked {
 const LINK_HEALTH_CAPACITY: usize = 4096;
 
 /// Production link backoff (`racer_core::route::link_backoff`); the jitter is a fixed mix of
-/// the peer and failure count instead of SHA-256 of the node name (as racer-sim).
+/// the peer and failure count instead of SHA-256 of the node name
 fn link_backoff(node: &u32, failures: u32) -> Duration {
     racer_core::route::link_backoff(
         failures,
@@ -629,8 +624,8 @@ fn link_backoff(node: &u32, failures: u32) -> Duration {
     )
 }
 
-/// A node's published pages, bounded by least-recently-used eviction (racer-sim keeps a
-/// bounded page set too; the real disk index arrives in a later phase).
+/// A node's published pages, bounded by least-recently-used eviction (the Model does not
+/// model the production disk index).
 #[derive(Default)]
 struct Store {
     /// 0 is unbounded.
@@ -698,7 +693,7 @@ struct Model<'s> {
     engine: Engine<Ev>,
     trace: TraceHash,
     choices: Choices,
-    /// [`Workload`] draws (racer-sim's workload stream) and its Zipf CDF.
+    /// [`Workload`] draws and its Zipf CDF.
     workload_rng: SplitMix64,
     zipf: Vec<f64>,
     /// No [`Workload`] read starts after this, so every read ends by the scenario's end.
@@ -760,16 +755,15 @@ struct Model<'s> {
     /// Peer requests on their routes.
     msgs: BTreeMap<u64, Msg>,
     next_msg: u64,
-    /// Last links awaiting their destination's answer: sender, destination, page, send time
-    /// (racer-sim `last_hops`).
+    /// Last links awaiting their destination's answer: sender, destination, page, send time.
     last_hops: BTreeMap<u64, (u32, u32, Page, Nanos)>,
     /// Silence pings in flight by id: requester and destination.
     pings: BTreeMap<u64, (u32, u32)>,
     /// Partitioned node pairs, smaller id first.
     partitions: BTreeSet<(u32, u32)>,
     /// Route searches: the real `topology::Paths` over exhaustive mesh searches, one cache
-    /// shared by every node. Production keeps one per worker (`src/app.rs` `Paths::with_limits`)
-    /// and racer-sim one per node, but a cache entry's routes depend only on its key, not on the
+    /// shared by every node. Production keeps one per worker (`src/app.rs` `Paths::with_limits`),
+    /// but a cache entry's routes depend only on its key, not on the
     /// node that searched (`topology/src/paths.rs` `PathKey` leaves out the seed, which only
     /// picks among the cached alternatives), so sharing changes search counts and CPU, not
     /// which relays carry requests. Per-node caches of production's 128 entries left the 10,000
@@ -789,21 +783,21 @@ struct Model<'s> {
 const TAG_EVENT: u64 = 1;
 const TAG_READ_END: u64 = 2;
 const TICK: Nanos = 50 * MILLIS;
-/// Per-attempt exchange cap (racer-sim `NodeConfig::attempt_timeout_ns`).
+/// Per-attempt exchange cap.
 pub const ATTEMPT_TIMEOUT: Nanos = 2 * SECONDS;
 /// No per-attempt cap: an attempt ends at its overall deadline.
 pub const NO_ATTEMPT_CAP: Nanos = Nanos::MAX;
-/// A serving read's own scope (racer-sim `NodeConfig::serve_timeout_ns`).
+/// A serving read's own scope.
 const SERVE_TIMEOUT: Nanos = 5 * SECONDS;
-/// Client attempts per read, as in racer-sim.
+/// Client attempts per read.
 const MAX_ATTEMPTS: u8 = 4;
-/// A link to an unreachable peer fails after this (racer-sim `NodeConfig::connect_timeout_ns`).
+/// A link to an unreachable peer fails after this.
 const CONNECT_TIMEOUT: Nanos = 100 * MILLIS;
 /// Route searches per worker at once (production `RACER_ACTIVE_PATH_SEARCHES_PER_WORKER`
-/// default, `src/worker.rs`; racer-sim `NodeConfig::active_searches`).
+/// default, `src/worker.rs`).
 const ACTIVE_SEARCHES: usize = 8;
 /// Route searches per worker that may wait for a slot (production `topology::DEFAULT_SEARCH_QUEUE`,
-/// `src/app.rs`; racer-sim `NodeConfig::search_queue`).
+/// `src/app.rs`).
 const SEARCH_QUEUE: usize = topology::DEFAULT_SEARCH_QUEUE;
 
 /// When a new route search starts given the end times of a worker's searches still running or
@@ -832,7 +826,7 @@ fn owners(placement: &Placement<Phantom>, version: &Version, page: Page) -> Vec<
     ranked.into_iter().map(|p| version.node(p)).collect()
 }
 
-/// racer-sim's `Zipf::new` CDF over `objects` ranks with exponent `s`.
+/// The Zipf CDF over `objects` ranks with exponent `s`.
 fn zipf_cdf(objects: u64, s: f64) -> Vec<f64> {
     let n = objects.max(1);
     let mut cdf = Vec::with_capacity(n as usize);
@@ -847,7 +841,7 @@ fn zipf_cdf(objects: u64, s: f64) -> Vec<f64> {
     cdf
 }
 
-/// Uniform in `[0, 1)` from 53 random bits (racer-sim `engine::unit`).
+/// Uniform in `[0, 1)` from 53 random bits.
 fn unit(rng: &mut SplitMix64) -> f64 {
     (rng.next_u64() >> 11) as f64 * (1.0 / (1u64 << 53) as f64)
 }
@@ -952,7 +946,7 @@ impl<'s> Model<'s> {
 
     /// Whether `node` is listed in the membership it adopted. A node that is not is not ready
     /// (production `/readyz`, `WorkerApplication::membership_usable`), so its clients do not
-    /// read through it (racer-sim `reads_skipped_not_member`).
+    /// read through it.
     fn member(&self, node: u32) -> bool {
         let versions = self.versions.borrow();
         versions.adopted(node).position(node).is_some()
@@ -1297,8 +1291,8 @@ impl<'s> Model<'s> {
                         self.nodes[node as usize].down = true;
                         self.nodes[node as usize].down_at = now;
                         // The process loses its memory. The Model has one page tier, so every
-                        // stored page goes with it (racer-sim drops a crashed node's memory
-                        // pages; production recovers only its last checkpoint).
+                        // stored page goes with it (production recovers only its last
+                        // checkpoint).
                         let lost = self.nodes[node as usize].stored.len() as u64;
                         self.report.counters.crash_lost_pages += lost;
                         self.nodes[node as usize].stored = Store::new(self.spec.stored_pages);
@@ -1360,8 +1354,8 @@ impl<'s> Model<'s> {
                         return;
                     };
                     if let Reply::Answer { .. } = reply {
-                        // The requester verifies the signed response on its crypto helper; like
-                        // racer-sim (`reply`), the walk does not wait for the slot.
+                        // The requester verifies the signed response on its crypto helper: the
+                        // walk does not wait for the slot.
                         let verify = self.fabric.costs.crypto_verify_ns;
                         self.fabric.crypto(now, node, worker as u8, verify);
                     }
@@ -1795,8 +1789,8 @@ impl<'s> Model<'s> {
         }
     }
 
-    /// Rank `page` for `node` (production `CandidatePolicy::rank_for`, racer-sim `rank_for`).
-    /// Polls of `node`'s ranking of `page` on `worker` (racer-sim `spawn`: one
+    /// Rank `page` for `node` (production `CandidatePolicy::rank_for`).
+    /// Polls of `node`'s ranking of `page` on `worker` (one
     /// `ranking_chunk_ns` each). A worker's first ranking of a page under a membership scores
     /// every member, `WORK_QUANTUM` (256) per poll; later ones answer from its placement cache
     /// in one poll.
@@ -1876,8 +1870,8 @@ impl<'s> Model<'s> {
         })
     }
 
-    /// A non-owner's visit order over `owners` (production `CandidatePolicy::visit_order`,
-    /// racer-sim `walk_ranking`): `Spread` visits mesh neighbors first, then by descending
+    /// A non-owner's visit order over `owners` (production
+    /// `CandidatePolicy::visit_order`): `Spread` visits mesh neighbors first, then by descending
     /// `replica_score`, so readers spread over the owners instead of all asking rank 0. One
     /// membership version, so `lineage_first` never moves an owner. Owners that left this
     /// node's requests unanswered or shed them go last (`demote_unanswered`).
@@ -1939,8 +1933,8 @@ impl<'s> Model<'s> {
         let (owners, column_mate) = {
             let versions = self.versions.borrow();
             let version = versions.get(route.version).expect("a known version");
-            // Production `Membership::same_column` in the default pool (racer-sim
-            // `column_mates`): an owner never sheds its own column mates below the exempt cap.
+            // Production `Membership::same_column` in the default pool: an owner never sheds its
+            // own column mates below the exempt cap.
             let column_mate = match (version.position(to), version.position(asker.from)) {
                 (Some(a), Some(b)) => version
                     .members
@@ -2011,7 +2005,7 @@ impl<'s> Model<'s> {
             }
             Decision::CopyOnly { join: false } => self.reply(&asker, to, ResponseKind::Miss),
             Decision::Acquire => {
-                // Production `inherited_budget` (`src/read.rs`; racer-sim `serve`): the serving
+                // Production `inherited_budget` (`src/read.rs`): the serving
                 // read spends the probe's credits within its own serve scope and the route's
                 // signed deadline. The probe travelled one hop.
                 let scope = self.instant(now + SERVE_TIMEOUT);
@@ -2096,7 +2090,7 @@ impl<'s> Model<'s> {
         let key = self.next_body;
         self.bodies.insert(key, (to, worker, body));
         // Production drops an exchange its requester abandoned: no chunk starts at or after the
-        // requester's attempt bound (racer-sim `transfer_until`, `replies_abandoned`).
+        // requester's attempt bound.
         self.answering(&asker, to, now);
         let sealed = self.sign(to, asker.msg);
         let route = Self::back(&asker, to);
@@ -2158,7 +2152,7 @@ impl<'s> Model<'s> {
         );
     }
 
-    /// `msg` reached its holder (racer-sim `hop`; production `peer/server.rs` verifies, then
+    /// `msg` reached its holder (production `peer/server.rs` verifies, then
     /// `decide_hop` serves or relays).
     fn hop(&mut self, mid: u64, verified: bool) {
         let now = self.now();
@@ -2189,7 +2183,7 @@ impl<'s> Model<'s> {
         if !verified {
             // Production verifies every request's signature on the crypto helper
             // (`peer/server.rs` `verify_request_async`) before it dispatches or relays it; the
-            // destination's worker then takes it (racer-sim `want`, `request_ns`).
+            // destination's worker then takes it.
             // The helper is the one paired with the worker holding the connection
             // (`src/worker.rs` `WorkerPair`).
             let costs = self.fabric.costs;
@@ -2197,7 +2191,7 @@ impl<'s> Model<'s> {
             let m = &self.msgs[&mid];
             let bound = self.spec.crypto_queue;
             if bound != 0 && self.fabric.crypto_outstanding(now, at, conn) >= bound {
-                // The crypto submission fails `Overloaded` before any key work (racer-sim `hop`).
+                // The crypto submission fails `Overloaded` before any key work.
                 self.report.counters.verify_sheds += 1;
                 // The unsigned overload head ends the last link's exchange cleanly
                 // (`peer/server.rs` `serve_connection` returns the connection for reuse).
@@ -2243,14 +2237,14 @@ impl<'s> Model<'s> {
         match decide_hop(&at, &m.path, &m.dest, m.route.links, known) {
             Hop::StaleMembership => {
                 // Production `peer/server.rs`: a node that does not resolve the request's
-                // version answers `StaleMembership`, signed (racer-sim `hop`).
+                // version answers `StaleMembership`, signed.
                 self.report.counters.stale_membership_replies += 1;
                 let asker = self.asker(mid, now);
                 self.reply(&asker, at, ResponseKind::StaleMembership);
             }
             Hop::Serve if m.ping.is_some() => {
                 // Production mode `ping` is answered `Miss` at once, without looking at the
-                // cache or flights (racer-sim `serve`).
+                // cache or flights.
                 let asker = self.asker(mid, now);
                 self.reply(&asker, at, ResponseKind::Miss);
             }
@@ -2265,7 +2259,7 @@ impl<'s> Model<'s> {
                     return self.violation(format!("relay {at} received a route revisiting it"));
                 }
                 // Production `peer/server.rs` reserves one `ResourceClass::Relay` transfer on the
-                // relay's worker before it forwards (racer-sim `hop`); none free is `Overloaded`.
+                // relay's worker before it forwards; none free is `Overloaded`.
                 let worker = (mid % u64::from(self.spec.workers.max(1))) as u8;
                 let active = self.relays_active.entry((at, worker)).or_default();
                 if *active >= self.spec.relay_transfers {
@@ -2413,7 +2407,7 @@ impl<'s> Model<'s> {
         }
     }
 
-    /// Route `msg` one link from `holder` (racer-sim `forward`; production `Paths::shortest`
+    /// Route `msg` one link from `holder` (production `Paths::shortest`
     /// with `LinkHealth` blocks and `Paths::detour`). `plan` is the relay plan at a relay.
     fn forward(&mut self, mid: u64, holder: u32, plan: Option<RelayPlan>) {
         let now = self.now();
@@ -2441,7 +2435,7 @@ impl<'s> Model<'s> {
             .get(m.route.version)
             .map(|v| v.members.clone())
         else {
-            // racer-sim `forward`: the request's version is no longer resolvable here.
+            // The request's version is no longer resolvable here.
             return self.fail_hop(mid, holder, Fault::IncompatibleMembership);
         };
         let position = |n: u32| members.position(&n.to_be_bytes());
@@ -2503,7 +2497,7 @@ impl<'s> Model<'s> {
         };
         let (route, polls) = self.route(&members, query, || start.is_some());
 
-        // racer-sim `spawn`: a cache hit answers on the first poll, each further poll expands
+        // A cache hit answers on the first poll, each further poll expands
         // up to 32 nodes, on one worker's CPU. A queued search starts when a slot frees.
         let costs = self.fabric.costs;
         let cost = polls.saturating_sub(1) * 32 * costs.cpu_path_expand_ns_per_node;
@@ -2566,7 +2560,7 @@ impl<'s> Model<'s> {
         }
     }
 
-    /// Send `msg` from `holder` over its link to `next` once `ready` (racer-sim `link`).
+    /// Send `msg` from `holder` over its link to `next` once `ready`.
     fn link(&mut self, mid: u64, holder: u32, plan: Option<RelayPlan>, next: u32, ready: Nanos) {
         let now = self.now();
         if plan.is_some_and(|plan| plan.outbound.is_err()) {
@@ -2589,7 +2583,7 @@ impl<'s> Model<'s> {
         let cut = self.cut(holder, next);
         if cut {
             let why = if self.nodes[next as usize].down {
-                // A peer chose a crashed member (racer-sim `dead_member_links`): how long after
+                // A peer chose a crashed member: how long after
                 // the crash.
                 let age = (now - self.nodes[next as usize].down_at) / SECONDS;
                 let c = &mut self.report.counters;
@@ -2642,7 +2636,7 @@ impl<'s> Model<'s> {
             return self.engine.at(now + CONNECT_TIMEOUT, failed);
         }
         // The link connected: production records `LinkOutcome::Success` once the exchange
-        // completes (`route::exchange_evidence`); the Model records it on connect, as racer-sim.
+        // completes (`route::exchange_evidence`); the Model records it on connect.
         if let Some(links) = self.links.get_mut(&(holder, conn))
             && links.failed.remove(&next)
         {
@@ -2684,7 +2678,7 @@ impl<'s> Model<'s> {
         }
     }
 
-    /// Forwarding `msg` from `holder` failed with `fault` (racer-sim `fail_hop`; production
+    /// Forwarding `msg` from `holder` failed with `fault` (production
     /// `relay_failure`).
     fn fail_hop(&mut self, mid: u64, holder: u32, fault: Fault) {
         let Some(m) = self.msgs.remove(&mid) else {
@@ -2755,7 +2749,7 @@ impl<'s> Model<'s> {
     }
 
     /// `from` answers `asker`, ready at `ready`: an answer from the destination before the
-    /// requester gave up clears its last link (racer-sim `send_reply`). Returns whether the
+    /// requester gave up clears its last link. Returns whether the
     /// answer is the destination's own (signed by it).
     fn answering(&mut self, asker: &Asker, from: u32, ready: Nanos) -> bool {
         let own = from == asker.dest;
@@ -2769,7 +2763,7 @@ impl<'s> Model<'s> {
         own
     }
 
-    /// Whether every link of `route` is up (racer-sim `send_reply`: a reply over a cut link is
+    /// Whether every link of `route` is up (a reply over a cut link is
     /// lost and the requester times out).
     fn alive(&mut self, route: &[u32]) -> bool {
         let alive = !self.nodes[route[0] as usize].down
@@ -2788,8 +2782,8 @@ impl<'s> Model<'s> {
     }
 
     /// `node` signs a peer response on the I/O worker holding `mid`'s connection, inline as
-    /// production does (`Forwarding::sign_response` from `peer/server.rs`; racer-sim
-    /// `send_reply`); returns when the signature is ready.
+    /// production does (`Forwarding::sign_response` from `peer/server.rs`); returns when the
+    /// signature is ready.
     fn sign(&mut self, node: u32, mid: u64) -> Nanos {
         let now = self.now();
         let conn = self.conn_worker(mid);
@@ -2798,7 +2792,7 @@ impl<'s> Model<'s> {
     }
 
     /// The worker of a node that holds request `mid`'s connection, as the Model spreads peer
-    /// connections over workers (racer-sim `hop`: `probe % workers`). An inference: production
+    /// connections over workers (`probe % workers`). An inference: production
     /// assigns accepted connections to workers by its listener, not by request.
     /// Record acquisition `read` when first seen; every so often forget ended ones.
     fn track_acquisition(&mut self, node: u32, worker: u32, read: ReadId) {
@@ -2824,7 +2818,7 @@ impl<'s> Model<'s> {
         }
     }
 
-    /// Note why the walk probe `mid` failed in transport (racer-sim `note_cut`).
+    /// Note why the walk probe `mid` failed in transport.
     fn note_cut(&mut self, mid: u64, cut: Cut) {
         if let Some(m) = self.msgs.get(&mid)
             && m.ping.is_none()
@@ -2834,7 +2828,7 @@ impl<'s> Model<'s> {
     }
 
     /// Classify an origin request of acquisition `read` for `page`, ending at `done` with
-    /// `outcome` (racer-sim `classify_repeat`).
+    /// `outcome`.
     fn classify_origin(
         &mut self,
         node: u32,
@@ -2873,10 +2867,9 @@ impl<'s> Model<'s> {
             let holder = &nodes[n as usize];
             !holder.down && holder.stored.contains(&page)
         };
-        // racer-sim makes an unexplained repeat a hard invariant (`origin_repeat_explained`).
-        // The Model counts it (`origin_per_page.repeats.unexplained`) and the ported tests
-        // assert it is zero: `model-range-readers` refetches pages a node holds through its
-        // range windows (see `dst/MODEL.md`, Origin repeats).
+        // An unexplained repeat is counted (`origin_per_page.repeats.unexplained`), not a hard
+        // invariant: `model-range-readers` refetches pages a node holds through its range windows
+        // (see `dst/MODEL.md`). The combined failover test asserts it is zero.
         if let Some(why) = self.report.repeats.origin(&request, held)
             && self.diag
         {
@@ -2913,11 +2906,10 @@ impl<'s> Model<'s> {
     }
 
     /// Send `from`'s due silence pings, at most [`MAX_PINGS_IN_FLIGHT`] at once (production
-    /// `CandidatePolicy::poll_pings` in `src/read/candidates.rs`; racer-sim `poll_pings`). A ping
+    /// `CandidatePolicy::poll_pings` in `src/read/candidates.rs`). A ping
     /// is a peer request (`FetchMode::Ping`) routed over the mesh like any other, on a fresh
     /// grant: no remote attempts, [`NOTICE_LINKS`] links and the peer attempt timeout
-    /// (production `CandidatePolicy::ping` through `request_traced`; racer-sim
-    /// `launch_control`).
+    /// (production `CandidatePolicy::ping` through `request_traced`).
     fn poll_pings(&mut self, from: u32) {
         let now = self.now();
         let at = self.instant(now);
@@ -2967,7 +2959,7 @@ impl<'s> Model<'s> {
         self.engine.at(at, Ev::PingEnd { ping, answered });
     }
 
-    /// `from`'s ping to `to` ended (racer-sim `ping_done`; production `LinkHealth::ping_outcome`).
+    /// `from`'s ping to `to` ended (production `LinkHealth::ping_outcome`).
     fn ping_done(&mut self, from: u32, to: u32, answered: Option<bool>) {
         let at = self.instant(self.now());
         let n = &mut self.nodes[from as usize];
@@ -3037,7 +3029,7 @@ impl<'s> Model<'s> {
         if kind == ResponseKind::StaleMembership {
             // Production `request_traced`: the answering node could not resolve the request's
             // membership, so the remote credits it carried were never used, and neither were the
-            // links past the hops that carried it there (racer-sim `stale_links_refunded`).
+            // links past the hops that carried it there.
             let refund = Ev::Refund {
                 node: asker.from,
                 worker: asker.worker,
@@ -3122,7 +3114,7 @@ impl<'s> Model<'s> {
                     self.engine.at(now, input(read, answer));
                 }
                 Acq::Refresh { id, version } => {
-                    // racer-sim `Action::Refresh`: the newest version this node adopted, and
+                    // Refresh: the newest version this node adopted, and
                     // version - 1 while it is recent and lists this node.
                     let versions = self.versions.borrow();
                     let latest = versions.adopted(node).number;
@@ -3160,7 +3152,7 @@ impl<'s> Model<'s> {
                         self.engine.at(now, input(read, failed));
                         return;
                     };
-                    // Production `request_traced` (racer-sim `probe`): reserve the route and
+                    // Production `request_traced`: reserve the route and
                     // the remote credits on the read's request budget, then bound the exchange.
                     let at_now = self.instant(now);
                     let Some(budget) =
@@ -3287,7 +3279,7 @@ impl<'s> Model<'s> {
                         let key = format!("origin:rank{rank:?}:{}", walk.unwrap_or_default());
                         *self.report.attempt_errors.entry(key).or_default() += 1;
                     }
-                    // racer-sim's mapping (`sim/src/node/world.rs`, origin completion).
+                    // Count the origin outcome.
                     let c = &mut self.report.counters;
                     let result = match outcome {
                         OriginOutcome::Ok => {
@@ -3363,7 +3355,7 @@ impl<'s> Model<'s> {
                 sent,
                 note,
             } => {
-                // Production `CandidatePolicy::apply` (racer-sim `apply`, `shed_busy` on).
+                // Production `CandidatePolicy::apply` (with `shed_busy` on).
                 let at = self.instant(now);
                 let silence = &mut self.nodes[node as usize].silence;
                 match note {
@@ -3436,7 +3428,7 @@ impl<'s> Model<'s> {
             if result.is_ok() && self.nodes[node as usize].stored.contains(&page) {
                 self.send_page(asker, node, page);
             } else {
-                // Production `peer_error` (`src/read.rs`, racer-sim `err_reply`): an expected
+                // Production `peer_error` (`src/read.rs`): an expected
                 // acquisition failure is answered with its response kind; any other is a
                 // transport failure.
                 let error = result.err().unwrap_or(Error::Unavailable);
@@ -3480,8 +3472,7 @@ impl<'s> Model<'s> {
             .entry(format!("{error:?}#{attempt}@{elapsed}s"))
             .or_default() += 1;
         match error {
-            // racer-sim's client retries a recoverable failure (`resolve` in
-            // `sim/src/node/world.rs`) after a linear backoff.
+            // The client retries a recoverable failure after a linear backoff.
             error if recoverable(error) && attempt + 1 < MAX_ATTEMPTS => {
                 self.report.counters.read_retries += 1;
                 let backoff = 2 * self.fabric.rtt.rtt(0, 0).max(MILLIS) * u64::from(attempt + 1);
@@ -3708,7 +3699,7 @@ fn core(
 }
 
 /// Production `Relay` transfers per worker (`racer_core::admission::Limits::default`
-/// `relay_transfers`, racer-sim `NodeConfig::relay_transfers`).
+/// `relay_transfers`).
 fn relay_transfers() -> usize {
     racer_core::admission::Limits::default()
         .relay_transfers
@@ -3717,13 +3708,13 @@ fn relay_transfers() -> usize {
 
 /// Production crypto submissions per worker: `queue_entries` port slots plus as many admission
 /// waiters (`src/security.rs` `CryptoClient::new`, `runtime/src/offload.rs`
-/// `AdmissionQueue::enter`), racer-sim `NodeConfig::crypto_queue`.
+/// `AdmissionQueue::enter`).
 fn crypto_queue() -> usize {
     racer_core::admission::Limits::default().crypto_submissions()
 }
 
-/// Production per-worker flight bounds (`racer_core::admission::Limits::default`, racer-sim
-/// `NodeConfig`): 64 flights of 64 waiters each. A join past the entry cap is answered
+/// Production per-worker flight bounds (`racer_core::admission::Limits::default`): 64 flights
+/// of 64 waiters each. A join past the entry cap is answered
 /// `Overloaded`; past a flight's waiter cap, `FlightFull`.
 fn flight_limits() -> FlightLimits {
     let limits = racer_core::admission::Limits::default();
@@ -3864,7 +3855,7 @@ fn ranking_polls(first: bool, members: u64) -> u64 {
     }
 }
 
-/// The response kind a relay signs for `r` (racer-sim `response_kind`).
+/// The response kind a relay signs for `r`.
 fn response_kind(r: Response) -> ResponseKind {
     match r {
         Response::Overloaded => ResponseKind::Overloaded,

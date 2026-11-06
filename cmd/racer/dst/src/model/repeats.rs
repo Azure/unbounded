@@ -1,4 +1,4 @@
-//! Origin repeat classification: racer-sim's `classify_repeat` (`sim/src/node/world.rs`) over
+//! Origin repeat classification: classification over
 //! Model acquisitions. Each origin request for a page that was fetched before is classified
 //! against the page's previous request `A`: rank 0 moved, `A` failed, `A` still in flight
 //! (concurrent), `A`'s copy is gone, or `A` still holds it (`copy_held`, with a cause). An owner
@@ -14,7 +14,7 @@ use serde_json::{Map, Value, json};
 use super::Page;
 use crate::engine::Nanos;
 
-/// How one walk probe ended (racer-sim `Asked`).
+/// How one walk probe ended.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Asked {
     Copy,
@@ -31,7 +31,7 @@ pub enum Asked {
     Unfunded,
 }
 
-/// Why a walk probe failed in transport (racer-sim `Cut`). The Model has no member that does not
+/// Why a walk probe failed in transport. The Model has no member that does not
 /// serve yet (`NotServing`).
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Cut {
@@ -46,7 +46,7 @@ pub enum Cut {
 }
 
 /// Skip causes with their `origin_skips_*` and `origin_repeats_orphan_*` counters, in
-/// racer-sim's order (`SKIPS`); `copy` never orphans and is not reported.
+/// report order; `copy` never orphans and is not reported.
 pub const SKIPS: [(&str, &str, &str); 12] = [
     (
         "not_serving",
@@ -232,7 +232,7 @@ impl Repeats {
         unexplained
     }
 
-    /// racer-sim's `origin_per_page` repeat fields, from `per_page` origin requests by page.
+    /// The `origin_per_page` repeat fields, from `per_page` origin requests by page.
     pub fn json(&self, per_page: &BTreeMap<Page, u64>) -> Map<String, Value> {
         let c = |k: &str| self.get(k);
         let retries = |page: &Page| self.failure_retries.get(page).copied().unwrap_or(0);

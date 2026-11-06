@@ -1,5 +1,5 @@
-//! The Model run report: counters, read latency, origin traffic per page, invariants. Shaped
-//! like racer-sim's `report.rs` so its scenario checks port over.
+//! The Model run report: counters, read latency, origin traffic per page, invariants. Scenario
+//! checks read it as JSON.
 
 use std::collections::BTreeMap;
 
@@ -8,7 +8,7 @@ use serde_json::{Value, json};
 use super::{ModelSpec, Page};
 use crate::{engine::Nanos, scenario::Scenario};
 
-/// Run counters (racer-sim names where one exists).
+/// Run counters.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct Counters {
     /// Client reads that delivered the page.
@@ -61,8 +61,7 @@ pub struct Counters {
     pub outage_lost_pages: u64,
     /// Client read attempts retried after a recoverable failure.
     pub read_retries: u64,
-    /// Flight waiters elected to lead after an earlier leader failed (racer-sim
-    /// `flight_reelected`).
+    /// Flight waiters elected to lead after an earlier leader failed.
     pub flights_reelected: u64,
     /// Probes unanswered at their attempt bound (`AttemptPlan::attempt_end`).
     pub probe_timeouts: u64,
@@ -72,50 +71,47 @@ pub struct Counters {
     pub replies_abandoned: u64,
     /// Probe answers that arrived after their attempt timed out.
     pub late_answers: u64,
-    /// Requests a relay forwarded (racer-sim `relays`).
+    /// Requests a relay forwarded.
     pub relays: u64,
-    /// Relay failures answered by the relay, or dropped (racer-sim `relay_failures_dropped`).
+    /// Relay failures answered by the relay, or dropped.
     pub relay_failures: u64,
-    /// Route searches that found no route (racer-sim `route_unreachable`).
+    /// Route searches that found no route.
     pub route_unreachable: u64,
-    /// Last links unanswered when the requester gave up (racer-sim `silence_timeouts`).
+    /// Last links unanswered when the requester gave up.
     pub silence_timeouts: u64,
-    /// Requests dropped at a relay or destination after the requester gave up (racer-sim
-    /// `requests_abandoned`).
+    /// Requests dropped at a relay or destination after the requester gave up.
     pub requests_abandoned: u64,
     /// Node crashes.
     pub crashes: u64,
-    /// Requests lost at a crashed or hung holder (racer-sim `messages_lost_to_crash`,
-    /// `messages_lost_to_hang`).
+    /// Requests lost at a crashed or hung holder.
     pub messages_lost: u64,
-    /// Links that failed to connect (racer-sim `link_failures`).
+    /// Links that failed to connect.
     pub link_failures: u64,
-    /// Sends refused by an open link circuit (racer-sim `link_circuit_open`).
+    /// Sends refused by an open link circuit.
     pub link_circuit_open: u64,
-    /// Walk probes sent with acquisition authority (racer-sim `peer_requests_acquire`).
+    /// Walk probes sent with acquisition authority.
     pub peer_requests_acquire: u64,
-    /// Walk probes sent copy-only (racer-sim `peer_requests_copy_only`).
+    /// Walk probes sent copy-only.
     pub peer_requests_copy_only: u64,
     /// Acquisitions that ended with a result.
     pub fills: u64,
-    /// Acquisitions that ended with an error (racer-sim `fills_failed`).
+    /// Acquisitions that ended with an error.
     pub fills_failed: u64,
-    /// Replies lost on a cut route (racer-sim `replies_lost`).
+    /// Replies lost on a cut route.
     pub replies_lost: u64,
     /// Most pages any node stores at the end of the run.
     pub stored_pages_max: u64,
-    /// Most bodies of one page one node streamed at once (racer-sim `mesh.page_peak_fanin`).
+    /// Most bodies of one page one node streamed at once.
     pub page_peak_fanin: u64,
     /// Pages crashed nodes lost.
     pub crash_lost_pages: u64,
-    /// Links chosen to a crashed member (racer-sim `dead_member_links`).
+    /// Links chosen to a crashed member.
     pub dead_member_links: u64,
-    /// The most seconds after its crash such a link was chosen (racer-sim
-    /// `dead_member_link_age_s` max).
+    /// The most seconds after its crash such a link was chosen.
     pub dead_member_link_age_max_s: u64,
-    /// Relays that found no free `Relay` transfer (racer-sim fails the hop `Overloaded`).
+    /// Relays that found no free `Relay` transfer (the hop fails `Overloaded`).
     pub relay_sheds: u64,
-    /// Requests whose verification found the crypto queue full (racer-sim `verify_sheds`).
+    /// Requests whose verification found the crypto queue full.
     pub verify_sheds: u64,
     /// Links that reused an idle connection (`racer_core::connections::Stats`).
     pub conn_reused: u64,
@@ -141,23 +137,21 @@ pub struct Counters {
     pub conn_refused: u64,
     /// Requests whose accept-queue wait outlived their requester's attempt.
     pub conn_queue_abandoned: u64,
-    /// Route searches refused with every search slot busy (racer-sim `route_search_overloaded`).
+    /// Route searches refused with every search slot busy.
     pub search_sheds: u64,
-    /// Membership changes (racer-sim `membership_changes`).
+    /// Membership changes.
     pub membership_changes: u64,
-    /// Membership versions published (racer-sim `membership_publications`).
+    /// Membership versions published.
     pub membership_publications: u64,
-    /// Requests answered `StaleMembership` (racer-sim `stale_membership_replies`).
+    /// Requests answered `StaleMembership`.
     pub stale_membership_replies: u64,
-    /// Stale-destination waits (racer-sim `stale_waits`).
+    /// Stale-destination waits.
     pub stale_waits: u64,
-    /// Links returned after `StaleMembership` answers (racer-sim `stale_links_refunded`).
+    /// Links returned after `StaleMembership` answers.
     pub stale_links_refunded: u64,
-    /// Client reads not started on a node outside its own membership (racer-sim
-    /// `reads_skipped_not_member`).
+    /// Client reads not started on a node outside its own membership.
     pub reads_skipped_not_member: u64,
-    /// Combined runs: reads on a node whose control client holds no snapshot (racer-sim
-    /// `reads_skipped_not_enrolled`).
+    /// Combined runs: reads on a node whose control client holds no snapshot.
     pub reads_skipped_not_enrolled: u64,
     /// [`super::Workload`] range reads started.
     pub range_reads: u64,
@@ -179,7 +173,7 @@ pub struct Report {
     pub attempt_errors: BTreeMap<String, u64>,
     /// Origin requests by page.
     pub origin_per_page: BTreeMap<Page, u64>,
-    /// Origin repeat classification (racer-sim `classify_repeat`).
+    /// Origin repeat classification.
     pub repeats: super::repeats::Repeats,
     /// Core effect and serve outcome variants seen, by [`super::effect_name`].
     pub coverage: BTreeMap<&'static str, u64>,
@@ -326,7 +320,7 @@ impl Report {
                 "violations": self.violations,
             },
         });
-        // racer-sim's repeat fields and counters, under the same names.
+        // Origin repeat fields and counters.
         if let Some(o) = report["origin_per_page"].as_object_mut() {
             o.extend(self.repeats.json(&self.origin_per_page));
         }

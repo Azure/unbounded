@@ -1,6 +1,6 @@
 //! Discrete-event core: virtual time, an event queue, and the trace digest.
 //!
-//! Adapted from `racer-sim`'s `engine.rs`. Time is `u64` nanoseconds since
+//! Time is `u64` nanoseconds since
 //! the start of the run. Events with the same time pop in the order they were
 //! scheduled (a sequence number breaks ties), so the queue itself never adds
 //! nondeterminism; any reordering the scenario wants must be drawn from

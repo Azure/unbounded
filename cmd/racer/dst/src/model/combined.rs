@@ -1,4 +1,4 @@
-//! Combined Model runs (racer-sim `combined.rs`): the control plane ([`ControlSim`]) and the read
+//! Combined Model runs: the control plane ([`ControlSim`]) and the read
 //! path ([`Model`]) on one timeline. Pod `i` is node `i`. Control events at or before a read-path
 //! event run first; their recorded [`Changes`] then apply: committed memberships become
 //! [`super::membership::Versions`] entries, each node adopts exactly the version its client
@@ -85,7 +85,7 @@ fn sync(model: &mut Model<'_>, ctl: &mut ControlSim, at: Nanos, pruned: &mut Nan
     }
 }
 
-/// Fold the control report into the read-path `report` (racer-sim `Combined::report`).
+/// Fold the control report into the read-path `report`.
 pub(super) fn report(report: &mut Value, model: &Model<'_>, ctl: &mut ControlSim, scenario: &str) {
     let ctl_report = ctl.report(scenario, model.choices.seed());
     let ctl_failures = ctl_report["invariants"]["hard_failures"]

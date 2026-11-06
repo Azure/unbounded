@@ -2,8 +2,7 @@
 //! RDMA links and edges changed by churn, measured on the production mesh and route search
 //! ([`Paths`]) for memberships of up to 20k members without traffic.
 //!
-//! Moved from racer-sim (`sim/tests/mesh_scenarios.rs` and `sim/src/mesh.rs`) with the same
-//! assertions. The hot page storm with mesh helpers is `model-hot-page-storm-512` in racer-dst.
+//! The hot page storm with mesh helpers is the `model-hot-page-storm-512` scenario in racer-dst.
 
 use std::collections::HashMap;
 use std::num::NonZeroU32;
