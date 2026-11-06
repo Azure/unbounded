@@ -1763,6 +1763,15 @@ while rails are active, and `racer_rdma_free_buffers` counts free page buffers.
 HTTP; `racer_rdma_fallback_no_link_total` and `racer_rdma_fallback_grant_total`
 split out the two common reasons: no ready link to the peer yet, and a grant that
 failed (usually because every page buffer was in use).
+`racer_rdma_links_ready`, `racer_rdma_links_connecting`, `racer_rdma_links_backoff`,
+and `racer_rdma_links_breaking` count the node's links by state.
+`racer_rdma_link_breaks_total{reason}` counts links torn down, by `reason`:
+`error` and `timeout` (back off), `abandoned` (a failed setup exchange; backs off),
+`declined` (the peer refused the setup with `409`, `429`, or `503`; retries after
+1 s), `peer_closed` and `closed` (no backoff), and `grant_expired` (an exposed grant
+was neither written nor released within 10 s of its deadline, so the link closed;
+also counted as `closed`). `racer_rdma_link_setups_total{outcome}` counts link
+setups this node initiated as `success`, `declined`, or `failed`.
 `racer_rdma_prefetch_failures_total` counts sends whose source page could not
 be mapped into the NIC ahead of the write (window mode prefetches each page
 through implicit on-demand paging); those writes may stall on NIC page faults.

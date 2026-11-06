@@ -282,7 +282,10 @@ A write or release whose grant has not arrived waits separately, with at most
 `2 * g` waiters. A release replaces a waiting write for that tag and cancels
 the write. A write larger than its grant fails without consuming the grant.
 Unposted work can expire and return its unused grant. An exposed receive
-grant that expires breaks the link instead.
+grant that expires stays exposed for `EXPOSED_GRACE` (10 seconds) more, in
+case the peer's write or release is late, and then the link sends `Close`
+without error backoff. The protocol has no grantor-side revoke, so only the
+QP teardown fences the grant; its buffer stays exposed until then.
 
 Credit overruns, excess or duplicate grants, invalid releases, unknown or
 duplicate immediates, bad lengths, malformed controls, and failed posts or

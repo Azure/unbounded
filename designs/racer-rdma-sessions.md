@@ -181,9 +181,10 @@ The responder becomes ready on its first receive completion. Receives are
 posted before either side can send.
 
 - Setup times out after 5 seconds.
-- Error and timeout breaks back off from 1 second to 60 seconds, doubling
+- Error and timeout breaks back off from 1 second to 5 seconds, doubling
   with plus or minus 20 percent jitter. A link ready for 60 seconds resets
-  the backoff. Incoming authenticated setup can replace an old link.
+  the backoff. A setup the peer declines with `409`, `429`, or `503` retries
+  after 1 second without escalating; `403` backs off as an error. Incoming authenticated setup can replace an old link.
 - An idle link closes after 120 seconds. A ready link sends `Close` and breaks
   when that completes or the 1-second close grace expires.
 - Idle and peer-requested closes return to `Idle`, without error backoff.
@@ -245,7 +246,8 @@ errors; they are not silently converted to successful HTTP responses.
 Before a grant is exposed, cancellation can invalidate it locally. Once it
 is exposed, dropping the arrival does not make its memory reusable. The owner
 waits for the peer's ordered write or release, followed by invalidation. An
-exposed grant that expires breaks the link.
+exposed grant that is still exposed 10 seconds past its deadline closes the
+link gracefully, without error backoff.
 
 If cancellation or a deadline wins after a write was submitted, `Links::send`
 breaks that epoch: the remote tag might already be consumed, so a later
