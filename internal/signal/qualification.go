@@ -593,10 +593,12 @@ func (r *QualificationReconciler) buildQualificationRunIndex(
 			continue
 		}
 
-		canonical, err := signalv1.DeriveExecutionPlanDigest(
+		canonical, err := canonicalQualificationPlanDigest(
 			int32(len(run.Spec.Participants)),
-			run.Spec.ScriptBundle.Digest,
+			run.Spec.ScriptBundle,
 			run.Spec.Checks,
+			run.Spec.Environment,
+			run.Spec.ResolvedPlan,
 			*run.Spec.PlanProvenance,
 		)
 		if err != nil || canonical != run.Spec.PlanDigest ||
@@ -657,16 +659,19 @@ func (r *QualificationReconciler) recordFromEvidence(
 	}
 
 	var document struct {
-		RunID                 string                                  `json:"runID"`
-		Profile               signalv1.PinnedProfile                  `json:"profile"`
-		Suite                 signalv1.PinnedSuite                    `json:"suite"`
-		Participants          []signalv1.Participant                  `json:"participants"`
-		ScriptBundle          signalv1.ScriptBundleReference          `json:"scriptBundle"`
-		Checks                []signalv1.CertificationCheckSnapshot   `json:"checks"`
-		Phase                 signalv1.RunPhase                       `json:"phase"`
-		FinishedAt            string                                  `json:"finishedAt"`
-		StartedAt             string                                  `json:"startedAt"`
-		QualificationIdentity *signalv1.QualificationEvidenceIdentity `json:"qualificationIdentity"`
+		RunID                 string                                     `json:"runID"`
+		Profile               signalv1.PinnedProfile                     `json:"profile"`
+		Suite                 signalv1.PinnedSuite                       `json:"suite"`
+		Participants          []signalv1.Participant                     `json:"participants"`
+		ScriptBundle          *signalv1.ScriptBundleReference            `json:"scriptBundle"`
+		Checks                []signalv1.CertificationCheckSnapshot      `json:"checks"`
+		Environment           *signalv1.CertificationEnvironmentBindings `json:"environment"`
+		ResolvedPlan          *signalv1.ResolvedCertificationPlan        `json:"resolvedPlan"`
+		PlanProvenance        *signalv1.ExecutionPlanProvenance          `json:"planProvenance"`
+		Phase                 signalv1.RunPhase                          `json:"phase"`
+		FinishedAt            string                                     `json:"finishedAt"`
+		StartedAt             string                                     `json:"startedAt"`
+		QualificationIdentity *signalv1.QualificationEvidenceIdentity    `json:"qualificationIdentity"`
 	}
 	if err := json.Unmarshal(data, &document); err != nil {
 		return qualificationRecord{}, false, err
@@ -677,16 +682,21 @@ func (r *QualificationReconciler) recordFromEvidence(
 		return qualificationRecord{}, false, errors.New("evidence identity does not match the retained reference")
 	}
 
-	provenance := signalv1.ExecutionPlanProvenance{
-		AdapterImage:           document.QualificationIdentity.Provenance.AdapterImage,
-		WorkflowTemplateDigest: document.QualificationIdentity.Provenance.WorkflowTemplateDigest,
+	provenance := document.PlanProvenance
+	if provenance == nil {
+		provenance = &signalv1.ExecutionPlanProvenance{
+			AdapterImage:           document.QualificationIdentity.Provenance.AdapterImage,
+			WorkflowTemplateDigest: document.QualificationIdentity.Provenance.WorkflowTemplateDigest,
+		}
 	}
 
-	canonical, err := signalv1.DeriveExecutionPlanDigest(
+	canonical, err := canonicalQualificationPlanDigest(
 		int32(len(document.Participants)),
-		document.ScriptBundle.Digest,
+		document.ScriptBundle,
 		document.Checks,
-		provenance,
+		document.Environment,
+		document.ResolvedPlan,
+		*provenance,
 	)
 	if err != nil {
 		return qualificationRecord{}, false, fmt.Errorf("derive evidence plan digest: %w", err)
@@ -721,6 +731,38 @@ func (r *QualificationReconciler) recordFromEvidence(
 	}, true, nil
 }
 
+func canonicalQualificationPlanDigest(
+	participantCount int32,
+	scriptBundle *signalv1.ScriptBundleReference,
+	checks []signalv1.CertificationCheckSnapshot,
+	environment *signalv1.CertificationEnvironmentBindings,
+	resolvedPlan *signalv1.ResolvedCertificationPlan,
+	provenance signalv1.ExecutionPlanProvenance,
+) (string, error) {
+	switch {
+	case resolvedPlan != nil:
+		if scriptBundle != nil || len(checks) != 0 {
+			return "", errors.New("resolved plan contains legacy fields")
+		}
+
+		return signalv1.DeriveResolvedExecutionPlanDigest(
+			participantCount,
+			environment,
+			*resolvedPlan,
+			provenance,
+		)
+	case scriptBundle == nil:
+		return "", errors.New("legacy plan is missing its script bundle")
+	default:
+		return signalv1.DeriveExecutionPlanDigest(
+			participantCount,
+			scriptBundle.Digest,
+			checks,
+			provenance,
+		)
+	}
+}
+
 func qualificationIdentityProvenanceValid(identity *signalv1.QualificationEvidenceIdentity) bool {
 	if identity == nil ||
 		!signalv1.IsDigestPinnedImage(identity.Provenance.ControllerImage) ||
@@ -731,6 +773,12 @@ func qualificationIdentityProvenanceValid(identity *signalv1.QualificationEviden
 	}
 
 	for _, image := range identity.Provenance.RunnerImages {
+		if !signalv1.IsDigestPinnedImage(image) {
+			return false
+		}
+	}
+
+	for _, image := range identity.Provenance.ResolverImages {
 		if !signalv1.IsDigestPinnedImage(image) {
 			return false
 		}

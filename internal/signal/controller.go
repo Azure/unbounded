@@ -60,6 +60,12 @@ const (
 	checkResultRunUID          = "signal.unbounded-cloud.io/check-result-run-uid"
 	checkResultCheckID         = "signal.unbounded-cloud.io/check-result-check-id"
 	checkResultCheckOrder      = "signal.unbounded-cloud.io/check-result-check-order"
+	stageResultDigest          = "signal.unbounded-cloud.io/stage-result-digest"
+	stageResultRunUID          = "signal.unbounded-cloud.io/stage-result-run-uid"
+	stageResultPlanDigest      = "signal.unbounded-cloud.io/stage-result-plan-digest"
+	stageResultPhaseOrder      = "signal.unbounded-cloud.io/stage-result-phase-order"
+	stageResultStageOrder      = "signal.unbounded-cloud.io/stage-result-stage-order"
+	stageResultRunnerImages    = "signal.unbounded-cloud.io/stage-result-runner-images"
 	runAdmissionReady          = "ready"
 	runAdmissionPending        = "pending"
 	profileSuiteNameField      = "spec.suite.name"
@@ -332,14 +338,16 @@ type AdmissionReconciler struct {
 	Namespace       string
 	ScriptNamespace string
 	RunnerImage     string
+	ControllerImage string
 	AdapterImage    string
 	WorkflowDigest  string
+	ResolverImages  []string
 	Recorder        recorder.EventRecorder
 	Now             func() time.Time
 	admissionMu     sync.Mutex
 }
 
-// +kubebuilder:rbac:groups=signal.unbounded-cloud.io,resources=certificationprofiles;certificationsuites,verbs=get;list;watch
+// +kubebuilder:rbac:groups=signal.unbounded-cloud.io,resources=certificationprofiles;certificationsuites;certificationtests,verbs=get;list;watch
 
 type RunReconciler struct {
 	client.Client
@@ -370,6 +378,10 @@ func (r *AdmissionReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		Watches(
 			&signalv1.CertificationSuite{},
 			handler.EnqueueRequestsFromMapFunc(r.requestsForSuite),
+		).
+		Watches(
+			&signalv1.CertificationTest{},
+			handler.EnqueueRequestsFromMapFunc(r.requestsForTest),
 		).
 		WithOptions(controller.Options{MaxConcurrentReconciles: 1}).
 		Complete(r)
@@ -423,6 +435,61 @@ func (r *AdmissionReconciler) requestsForSuite(ctx context.Context, object clien
 	}
 
 	return requests
+}
+
+func (r *AdmissionReconciler) requestsForTest(ctx context.Context, object client.Object) []ctrl.Request {
+	test, ok := object.(*signalv1.CertificationTest)
+	if !ok {
+		return nil
+	}
+
+	var suites signalv1.CertificationSuiteList
+	if err := r.List(ctx, &suites); err != nil {
+		log.FromContext(ctx).Error(err, "failed to list CertificationSuites for Test", "test", test.Name)
+
+		return nil
+	}
+
+	requests := make([]ctrl.Request, 0)
+
+	for index := range suites.Items {
+		suite := &suites.Items[index]
+		if !suiteReferencesTest(suite, test.Name) {
+			continue
+		}
+
+		requests = append(requests, r.requestsForSuite(ctx, suite)...)
+	}
+
+	return uniqueRequests(requests)
+}
+
+func suiteReferencesTest(suite *signalv1.CertificationSuite, testName string) bool {
+	for phaseIndex := range suite.Spec.Phases {
+		for stageIndex := range suite.Spec.Phases[phaseIndex].Stages {
+			if suite.Spec.Phases[phaseIndex].Stages[stageIndex].Test.Name == testName {
+				return true
+			}
+		}
+	}
+
+	return false
+}
+
+func uniqueRequests(requests []ctrl.Request) []ctrl.Request {
+	seen := make(map[types.NamespacedName]struct{}, len(requests))
+	result := make([]ctrl.Request, 0, len(requests))
+
+	for _, request := range requests {
+		if _, exists := seen[request.NamespacedName]; exists {
+			continue
+		}
+
+		seen[request.NamespacedName] = struct{}{}
+		result = append(result, request)
+	}
+
+	return result
 }
 
 func (r *RunReconciler) SetupWithManager(mgr ctrl.Manager) error {
@@ -493,11 +560,6 @@ func (r *AdmissionReconciler) admitNode(ctx context.Context, node *corev1.Node, 
 	}
 
 	suite, checks, err := r.resolveSuite(ctx, &profile)
-	if err != nil {
-		return err
-	}
-
-	sourceScripts, err := r.loadScriptBundle(ctx, suite.Spec.ScriptBundle, checks)
 	if err != nil {
 		return err
 	}
@@ -588,38 +650,78 @@ func (r *AdmissionReconciler) admitNode(ctx context.Context, node *corev1.Node, 
 		}
 	}()
 
-	snapshot, checkSnapshots, err := r.createSnapshot(ctx, runName, sourceScripts, checks)
-	if err != nil {
-		return err
+	var snapshot *corev1.ConfigMap
+
+	var run *signalv1.CertificationRun
+
+	if len(suite.Spec.Phases) > 0 {
+		resolvedPlan, resolveErr := r.resolvePhasePlan(ctx, &profile, suite, participants)
+		if resolveErr != nil {
+			return resolveErr
+		}
+
+		run, err = newResolvedCertificationRun(
+			runName,
+			r.Namespace,
+			node,
+			&profile,
+			suite,
+			participants,
+			resolvedPlan,
+			signalv1.ExecutionPlanProvenance{
+				ControllerImage:        r.ControllerImage,
+				AdapterImage:           r.AdapterImage,
+				WorkflowTemplateDigest: r.WorkflowDigest,
+				ResolverImages:         slices.Clone(r.ResolverImages),
+			},
+			startFingerprints,
+		)
+	} else {
+		sourceScripts, loadErr := r.loadScriptBundle(ctx, *suite.Spec.ScriptBundle, checks)
+		if loadErr != nil {
+			return loadErr
+		}
+
+		var checkSnapshots []signalv1.CertificationCheckSnapshot
+
+		snapshot, checkSnapshots, err = r.createSnapshot(ctx, runName, sourceScripts, checks)
+		if err == nil {
+			run, err = newCertificationRun(
+				runName,
+				r.Namespace,
+				node,
+				&profile,
+				suite,
+				participants,
+				snapshot,
+				checkSnapshots,
+				signalv1.ExecutionPlanProvenance{
+					AdapterImage:           r.AdapterImage,
+					WorkflowTemplateDigest: r.WorkflowDigest,
+				},
+				startFingerprints,
+			)
+		}
 	}
 
-	run, err := newCertificationRun(
-		runName,
-		r.Namespace,
-		node,
-		&profile,
-		suite,
-		participants,
-		snapshot,
-		checkSnapshots,
-		signalv1.ExecutionPlanProvenance{
-			AdapterImage:           r.AdapterImage,
-			WorkflowTemplateDigest: r.WorkflowDigest,
-		},
-		startFingerprints,
-	)
 	if err != nil {
 		return fmt.Errorf("build immutable CertificationRun execution plan: %w", err)
 	}
 
 	if _, err := buildWorkflow(run); err != nil {
-		deleteErr := r.Delete(context.WithoutCancel(ctx), snapshot)
+		var deleteErr error
+		if snapshot != nil {
+			deleteErr = r.Delete(context.WithoutCancel(ctx), snapshot)
+		}
 
 		return errors.Join(fmt.Errorf("validate executable plan: %w", err), client.IgnoreNotFound(deleteErr))
 	}
 
 	if err := r.Create(ctx, run); err != nil {
-		deleteErr := r.Delete(context.WithoutCancel(ctx), snapshot)
+		var deleteErr error
+		if snapshot != nil {
+			deleteErr = r.Delete(context.WithoutCancel(ctx), snapshot)
+		}
 
 		return errors.Join(fmt.Errorf("create CertificationRun: %w", err), client.IgnoreNotFound(deleteErr))
 	}
@@ -632,9 +734,13 @@ func (r *AdmissionReconciler) admitNode(ctx context.Context, node *corev1.Node, 
 		return errors.Join(cause, client.IgnoreNotFound(deleteRunErr))
 	}
 
-	snapshot.OwnerReferences = []metav1.OwnerReference{*metav1.NewControllerRef(run, signalv1.GroupVersion.WithKind("CertificationRun"))}
-	if err := r.Update(ctx, snapshot); err != nil {
-		return cleanupFailedAdmission(fmt.Errorf("bind script snapshot to run: %w", err))
+	if snapshot != nil {
+		snapshot.OwnerReferences = []metav1.OwnerReference{
+			*metav1.NewControllerRef(run, signalv1.GroupVersion.WithKind("CertificationRun")),
+		}
+		if err := r.Update(ctx, snapshot); err != nil {
+			return cleanupFailedAdmission(fmt.Errorf("bind script snapshot to run: %w", err))
+		}
 	}
 
 	releaseOnFailure = false
@@ -644,8 +750,13 @@ func (r *AdmissionReconciler) admitNode(ctx context.Context, node *corev1.Node, 
 	}
 
 	if r.Recorder != nil {
+		executableCount := len(run.Spec.Checks)
+		if run.Spec.ResolvedPlan != nil {
+			executableCount = resolvedStageCount(*run.Spec.ResolvedPlan)
+		}
+
 		r.Recorder.Eventf(run, nil, corev1.EventTypeNormal, "CertificationAdmitted", "AdmitCertification",
-			"Created CertificationRun %s with %d immutable checks", run.Name, len(checkSnapshots))
+			"Created CertificationRun %s with %d immutable executions", run.Name, executableCount)
 	}
 
 	return nil
@@ -707,7 +818,7 @@ func newCertificationRun(
 				Generation: suite.Generation,
 			},
 			Participants: participants,
-			ScriptBundle: signalv1.ScriptBundleReference{
+			ScriptBundle: &signalv1.ScriptBundleReference{
 				Name:   snapshot.Name,
 				UID:    snapshot.UID,
 				Digest: suite.Spec.ScriptBundle.Digest,
@@ -717,6 +828,410 @@ func newCertificationRun(
 			PlanProvenance: &provenance,
 		},
 	}, nil
+}
+
+func newResolvedCertificationRun(
+	runName string,
+	namespace string,
+	node *corev1.Node,
+	profile *signalv1.CertificationProfile,
+	suite *signalv1.CertificationSuite,
+	participants []signalv1.Participant,
+	resolvedPlan *signalv1.ResolvedCertificationPlan,
+	provenance signalv1.ExecutionPlanProvenance,
+	startFingerprints []signalv1.NodeFingerprint,
+) (*signalv1.CertificationRun, error) {
+	environment := profile.Spec.Environment.DeepCopy()
+
+	planDigest, err := signalv1.DeriveResolvedExecutionPlanDigest(
+		int32(len(participants)),
+		environment,
+		*resolvedPlan,
+		provenance,
+	)
+	if err != nil {
+		return nil, err
+	}
+
+	startIdentity, err := json.Marshal(startFingerprints)
+	if err != nil {
+		return nil, fmt.Errorf("encode participant start fingerprints: %w", err)
+	}
+
+	return &signalv1.CertificationRun{
+		TypeMeta: metav1.TypeMeta{APIVersion: signalv1.GroupVersion.String(), Kind: "CertificationRun"},
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      runName,
+			Namespace: namespace,
+			Labels: map[string]string{
+				RunNodeLabel:    node.Name,
+				RunProfileLabel: profile.Name,
+				RunSuiteLabel:   suite.Name,
+			},
+			Annotations: map[string]string{
+				RunTriggerAnnotation:       "manual",
+				RunAdmissionAnnotation:     runAdmissionPending,
+				RunStartIdentityAnnotation: string(startIdentity),
+			},
+			Finalizers: []string{RunFinalizer},
+		},
+		Spec: signalv1.CertificationRunSpec{
+			Profile: signalv1.PinnedProfile{
+				Name:       profile.Name,
+				UID:        profile.UID,
+				Generation: profile.Generation,
+			},
+			Suite: signalv1.PinnedSuite{
+				Name:       suite.Name,
+				UID:        suite.UID,
+				Generation: suite.Generation,
+			},
+			Participants:   participants,
+			Environment:    environment,
+			ResolvedPlan:   resolvedPlan.DeepCopy(),
+			PlanDigest:     planDigest,
+			PlanProvenance: provenance.DeepCopy(),
+		},
+	}, nil
+}
+
+func (r *AdmissionReconciler) resolvePhasePlan(
+	ctx context.Context,
+	profile *signalv1.CertificationProfile,
+	suite *signalv1.CertificationSuite,
+	participants []signalv1.Participant,
+) (*signalv1.ResolvedCertificationPlan, error) {
+	if len(suite.Spec.Phases) == 0 {
+		return nil, errors.New("suite has no phase plan")
+	}
+
+	resolvedInputs := resolvedEnvironmentInputs(profile.Spec.Environment)
+	plan := &signalv1.ResolvedCertificationPlan{
+		Phases: make([]signalv1.ResolvedPhasePlan, len(suite.Spec.Phases)),
+	}
+
+	for phaseIndex := range suite.Spec.Phases {
+		phase := &suite.Spec.Phases[phaseIndex]
+		if len(phase.Stages) == 0 {
+			return nil, fmt.Errorf("suite %s phase %s has no stages", suite.Name, phase.Name)
+		}
+
+		resolvedPhase := &plan.Phases[phaseIndex]
+		resolvedPhase.Name = phase.Name
+		resolvedPhase.DisplayName = phase.DisplayName
+		resolvedPhase.Role = phase.Role
+		resolvedPhase.Stages = make([]signalv1.ResolvedStagePlan, len(phase.Stages))
+
+		for stageIndex := range phase.Stages {
+			stage := &phase.Stages[stageIndex]
+
+			resolvedStage, err := r.resolveStage(
+				ctx,
+				profile,
+				participants,
+				phase.Role,
+				stage,
+				resolvedInputs,
+			)
+			if err != nil {
+				return nil, fmt.Errorf(
+					"suite %s phase %s stage %s: %w",
+					suite.Name,
+					phase.Name,
+					stage.Name,
+					err,
+				)
+			}
+
+			resolvedPhase.Stages[stageIndex] = *resolvedStage
+		}
+	}
+
+	if _, err := signalv1.DeriveResolvedPlanDeadline(plan.Phases); err != nil {
+		return nil, fmt.Errorf("suite %s phase deadlines: %w", suite.Name, err)
+	}
+
+	return plan, nil
+}
+
+func (r *AdmissionReconciler) resolveStage(
+	ctx context.Context,
+	profile *signalv1.CertificationProfile,
+	participants []signalv1.Participant,
+	phaseRole signalv1.CheckStageRole,
+	stage *signalv1.CertificationStage,
+	environmentInputs []signalv1.ResolvedInputIdentity,
+) (*signalv1.ResolvedStagePlan, error) {
+	reader := r.APIReader
+	if reader == nil {
+		reader = r.Client
+	}
+
+	var test signalv1.CertificationTest
+	if err := reader.Get(ctx, client.ObjectKey{Name: stage.Test.Name}, &test); err != nil {
+		return nil, fmt.Errorf("get CertificationTest %s: %w", stage.Test.Name, err)
+	}
+
+	if test.UID != stage.Test.UID ||
+		test.Generation != stage.Test.Generation {
+		return nil, errors.New("CertificationTest identity does not match the Suite reference")
+	}
+
+	if test.Status.Trust == nil ||
+		test.Status.ObservedGeneration != test.Generation ||
+		test.Status.Trust.ContentDigest != stage.Test.ContentDigest {
+		return nil, errors.New("CertificationTest trust decision is missing or stale")
+	}
+
+	if test.Status.Trust.State == signalv1.CertificationTestTrustRejected ||
+		test.Status.Trust.State == signalv1.CertificationTestTrustRevoked {
+		return nil, fmt.Errorf("CertificationTest trust state is %s", test.Status.Trust.State)
+	}
+
+	if test.Status.Trust.State != signalv1.CertificationTestTrustApproved &&
+		test.Status.Trust.State != signalv1.CertificationTestTrustDiagnostic {
+		return nil, fmt.Errorf("unsupported CertificationTest trust state %q", test.Status.Trust.State)
+	}
+
+	parameters, err := resolvedStageParameters(test.Spec.Parameters, stage.Parameters)
+	if err != nil {
+		return nil, err
+	}
+
+	if err := validateStageAssertions(test.Spec.Metrics, stage.Assertions); err != nil {
+		return nil, err
+	}
+
+	roles, err := r.resolveStageParticipantRoles(
+		ctx,
+		profile,
+		participants,
+		test.Spec.Topology,
+		stage.ParticipantRoles,
+	)
+	if err != nil {
+		return nil, err
+	}
+
+	inputs := deepCopyResolvedInputs(environmentInputs)
+	completeInputs := slices.IndexFunc(inputs, func(input signalv1.ResolvedInputIdentity) bool {
+		return input.State != signalv1.ResolvedInputStateComplete
+	}) == -1
+	approved := test.Status.Trust.State == signalv1.CertificationTestTrustApproved
+
+	parameterSchemaDigest, err := canonicalDigest(test.Spec.Parameters)
+	if err != nil {
+		return nil, fmt.Errorf("digest parameter schema: %w", err)
+	}
+
+	metricSchemaDigest, err := canonicalDigest(test.Spec.Metrics)
+	if err != nil {
+		return nil, fmt.Errorf("digest metric schema: %w", err)
+	}
+
+	securityRequirementsDigest, err := canonicalDigest(test.Spec.Security)
+	if err != nil {
+		return nil, fmt.Errorf("digest security requirements: %w", err)
+	}
+
+	resolved := &signalv1.ResolvedStagePlan{
+		Name:        stage.Name,
+		DisplayName: stage.DisplayName,
+		Test: signalv1.ResolvedCertificationTest{
+			Identity: signalv1.TestIdentitySnapshot{
+				Name:          test.Name,
+				UID:           test.UID,
+				Generation:    test.Generation,
+				ContentDigest: stage.Test.ContentDigest,
+				Trust:         test.Status.Trust.State,
+			},
+			ParameterSchemaDigest:      parameterSchemaDigest,
+			MetricSchemaDigest:         metricSchemaDigest,
+			SecurityRequirementsDigest: securityRequirementsDigest,
+			Metrics:                    append([]signalv1.TestMetricDefinition(nil), test.Spec.Metrics...),
+			Topology:                   *test.Spec.Topology.DeepCopy(),
+			Driver:                     *test.Spec.Driver.DeepCopy(),
+			Security: signalv1.ResolvedSecurityRequirements{
+				Privileged:   test.Spec.Security.Privileged,
+				HostNetwork:  test.Spec.Security.HostNetwork,
+				IPCLock:      test.Spec.Security.IPCLock,
+				Capabilities: slices.Clone(test.Spec.Security.Capabilities),
+				HostPaths:    deepCopyHostPaths(test.Spec.Security.HostPaths),
+			},
+		},
+		Parameters:                parameters,
+		ParticipantRoles:          roles,
+		Schedule:                  *stage.Schedule.DeepCopy(),
+		Retry:                     stage.Retry.DeepCopy(),
+		Optional:                  stage.Optional,
+		Assertions:                append([]signalv1.TestAssertion(nil), stage.Assertions...),
+		PerDeviceCoverageInterval: stage.PerDeviceCoverageInterval.DeepCopy(),
+		ResolvedInputs:            inputs,
+		QualificationEligible:     approved && completeInputs,
+		DiagnosticOnly:            !approved || !completeInputs,
+	}
+
+	if phaseRole != signalv1.CheckStageRoleValidation &&
+		resolved.Schedule.Mode != signalv1.CheckExecutionModeRunOnce {
+		return nil, errors.New("startup and terminal stages must use RunOnce mode")
+	}
+
+	return resolved, nil
+}
+
+func canonicalDigest(value any) (string, error) {
+	content, err := json.Marshal(value)
+	if err != nil {
+		return "", err
+	}
+
+	return digestBytes(content), nil
+}
+
+func resolvedStageParameters(
+	definitions []signalv1.TestParameterDefinition,
+	bindings []signalv1.StageParameterBinding,
+) ([]signalv1.StageParameterBinding, error) {
+	bound := make(map[string]signalv1.TypedValue, len(bindings))
+	for _, binding := range bindings {
+		if _, exists := bound[binding.Name]; exists {
+			return nil, fmt.Errorf("parameter %s is bound more than once", binding.Name)
+		}
+
+		bound[binding.Name] = *binding.Value.DeepCopy()
+	}
+
+	result := make([]signalv1.StageParameterBinding, 0, len(definitions))
+	for index := range definitions {
+		definition := &definitions[index]
+
+		value, exists := bound[definition.Name]
+		if !exists && definition.Default != nil {
+			value = *definition.Default.DeepCopy()
+			exists = true
+		}
+
+		if !exists {
+			if definition.Required {
+				return nil, fmt.Errorf("required parameter %s is not bound", definition.Name)
+			}
+
+			continue
+		}
+
+		if value.Type != definition.Type {
+			return nil, fmt.Errorf(
+				"parameter %s type %s does not match %s",
+				definition.Name,
+				value.Type,
+				definition.Type,
+			)
+		}
+
+		result = append(result, signalv1.StageParameterBinding{Name: definition.Name, Value: value})
+		delete(bound, definition.Name)
+	}
+
+	if len(bound) != 0 {
+		names := make([]string, 0, len(bound))
+		for name := range bound {
+			names = append(names, name)
+		}
+
+		sort.Strings(names)
+
+		return nil, fmt.Errorf("unknown parameter bindings: %s", strings.Join(names, ", "))
+	}
+
+	return result, nil
+}
+
+func validateStageAssertions(
+	metrics []signalv1.TestMetricDefinition,
+	assertions []signalv1.TestAssertion,
+) error {
+	known := make(map[string]struct{}, len(metrics))
+	for _, metric := range metrics {
+		known[metric.Name] = struct{}{}
+	}
+
+	for _, assertion := range assertions {
+		if _, exists := known[assertion.Metric]; !exists {
+			return fmt.Errorf(
+				"assertion %s references unknown metric %s",
+				assertion.Name,
+				assertion.Metric,
+			)
+		}
+	}
+
+	return nil
+}
+
+func resolvedEnvironmentInputs(
+	environment *signalv1.CertificationEnvironmentBindings,
+) []signalv1.ResolvedInputIdentity {
+	if environment == nil {
+		return nil
+	}
+
+	result := make([]signalv1.ResolvedInputIdentity, 0,
+		len(environment.Resolvers)+len(environment.ModelCaches)+len(environment.ObjectStores))
+	appendReferences := func(kind signalv1.ResolvedInputKind, values []signalv1.NamedEnvironmentReference) {
+		for _, value := range values {
+			result = append(result, resolvedNamedInput(kind, value))
+		}
+	}
+
+	appendReferences(signalv1.ResolvedInputKindResolverOutput, environment.Resolvers)
+	appendReferences(signalv1.ResolvedInputKindModel, environment.ModelCaches)
+	appendReferences(signalv1.ResolvedInputKindArtifact, environment.ObjectStores)
+
+	return result
+}
+
+func resolvedNamedInput(
+	kind signalv1.ResolvedInputKind,
+	value signalv1.NamedEnvironmentReference,
+) signalv1.ResolvedInputIdentity {
+	input := signalv1.ResolvedInputIdentity{
+		Name:             value.Name,
+		Kind:             kind,
+		Requested:        value.Reference,
+		State:            signalv1.ResolvedInputStateIncomplete,
+		IncompleteReason: "environment reference is not an immutable digest identity",
+	}
+
+	digestIndex := strings.LastIndex(value.Reference, "@sha256:")
+	if digestIndex >= 0 {
+		digest := value.Reference[digestIndex+1:]
+		if signalv1.IsSHA256Digest(digest) {
+			input.State = signalv1.ResolvedInputStateComplete
+			input.Resolved = value.Reference
+			input.Digest = digest
+			input.IncompleteReason = ""
+		}
+	}
+
+	return input
+}
+
+func deepCopyResolvedInputs(values []signalv1.ResolvedInputIdentity) []signalv1.ResolvedInputIdentity {
+	result := make([]signalv1.ResolvedInputIdentity, len(values))
+	for index := range values {
+		values[index].DeepCopyInto(&result[index])
+	}
+
+	return result
+}
+
+func deepCopyHostPaths(values []signalv1.WorkloadHostPath) []signalv1.WorkloadHostPath {
+	result := make([]signalv1.WorkloadHostPath, len(values))
+	for index := range values {
+		values[index].DeepCopyInto(&result[index])
+	}
+
+	return result
 }
 
 func ValidateExecutionProvenance(controllerImage, adapterImage, workflowDigest string) error {
@@ -759,6 +1274,18 @@ func (r *AdmissionReconciler) resolveSuite(
 	}
 
 	checks := suiteChecks(&suite)
+	if len(suite.Spec.Phases) > 0 {
+		if len(checks) != 0 {
+			return nil, nil, fmt.Errorf("suite %s configures both phases and legacy checks", suite.Name)
+		}
+
+		if err := validateSourcePhases(suite.Spec.Phases); err != nil {
+			return nil, nil, fmt.Errorf("suite %s phases: %w", suite.Name, err)
+		}
+
+		return &suite, nil, nil
+	}
+
 	if _, err := validateCheckPlan(checks); err != nil {
 		return nil, nil, fmt.Errorf("suite %s checks: %w", suite.Name, err)
 	}
@@ -771,6 +1298,77 @@ func (r *AdmissionReconciler) resolveSuite(
 	}
 
 	return &suite, checks, nil
+}
+
+func validateSourcePhases(phases []signalv1.CertificationPhase) error {
+	if len(phases) == 0 {
+		return errors.New("at least one phase is required")
+	}
+
+	phaseNames := make(map[string]struct{}, len(phases))
+	stageCount := 0
+	startupCount := 0
+	terminalCount := 0
+
+	for phaseIndex := range phases {
+		phase := &phases[phaseIndex]
+		if _, exists := phaseNames[phase.Name]; exists {
+			return fmt.Errorf("phase name %s is duplicated", phase.Name)
+		}
+
+		phaseNames[phase.Name] = struct{}{}
+		switch phase.Role {
+		case signalv1.CheckStageRoleStartup:
+			startupCount++
+
+			if phaseIndex != 0 {
+				return errors.New("startup phase must be first")
+			}
+		case signalv1.CheckStageRoleValidation:
+		case signalv1.CheckStageRoleTerminal:
+			terminalCount++
+
+			if phaseIndex != len(phases)-1 {
+				return errors.New("terminal phase must be last")
+			}
+		default:
+			return fmt.Errorf("phase %s has invalid role %q", phase.Name, phase.Role)
+		}
+
+		if len(phase.Stages) == 0 {
+			return fmt.Errorf("phase %s has no stages", phase.Name)
+		}
+
+		stageNames := make(map[string]struct{}, len(phase.Stages))
+
+		stageCount += len(phase.Stages)
+		for stageIndex := range phase.Stages {
+			stage := &phase.Stages[stageIndex]
+			if _, exists := stageNames[stage.Name]; exists {
+				return fmt.Errorf("phase %s stage name %s is duplicated", phase.Name, stage.Name)
+			}
+
+			stageNames[stage.Name] = struct{}{}
+			if err := signalv1.ValidateStageSchedule(stage.Schedule); err != nil {
+				return fmt.Errorf("phase %s stage %s schedule: %w", phase.Name, stage.Name, err)
+			}
+
+			if phase.Role != signalv1.CheckStageRoleValidation &&
+				stage.Schedule.Mode != signalv1.CheckExecutionModeRunOnce {
+				return fmt.Errorf("phase %s non-validation stage %s must use RunOnce", phase.Name, stage.Name)
+			}
+		}
+	}
+
+	if startupCount > 1 || terminalCount > 1 {
+		return errors.New("at most one startup and one terminal phase are allowed")
+	}
+
+	if stageCount > signalv1.MaxCertificationStages {
+		return fmt.Errorf("stage count %d exceeds maximum %d", stageCount, signalv1.MaxCertificationStages)
+	}
+
+	return nil
 }
 
 func (r *AdmissionReconciler) resumeOrReleaseReservation(ctx context.Context, runName string) (bool, error) {
@@ -938,6 +1536,110 @@ func (r *AdmissionReconciler) selectParticipants(
 	}
 
 	return participants, nil
+}
+
+func (r *AdmissionReconciler) resolveStageParticipantRoles(
+	ctx context.Context,
+	profile *signalv1.CertificationProfile,
+	participants []signalv1.Participant,
+	topology signalv1.TestTopology,
+	stageBindings []signalv1.StageParticipantRoleBinding,
+) ([]signalv1.ResolvedStageParticipantRoleBinding, error) {
+	if len(topology.Roles) == 0 {
+		if len(stageBindings) != 0 {
+			return nil, errors.New("participant role bindings require a role-aware CertificationTest")
+		}
+
+		return nil, nil
+	}
+
+	profileRoles := make(map[string]signalv1.ProfileParticipantRole, len(profile.Spec.ParticipantRoles))
+	for _, role := range profile.Spec.ParticipantRoles {
+		profileRoles[role.Role] = role
+	}
+
+	reader := r.APIReader
+	if reader == nil {
+		reader = r.Client
+	}
+
+	nodes := make([]corev1.Node, len(participants))
+	for index := range participants {
+		if err := reader.Get(
+			ctx,
+			client.ObjectKey{Name: participants[index].NodeName},
+			&nodes[index],
+		); err != nil {
+			return nil, fmt.Errorf("read participant %s for role binding: %w", participants[index].NodeName, err)
+		}
+
+		if nodes[index].UID != participants[index].NodeUID {
+			return nil, fmt.Errorf("participant %s identity changed during role binding", participants[index].NodeName)
+		}
+	}
+
+	assigned := make(map[int32]struct{}, len(participants))
+	result := make([]signalv1.ResolvedStageParticipantRoleBinding, 0, len(stageBindings))
+
+	for _, binding := range stageBindings {
+		profileRole, found := profileRoles[binding.Role]
+		if !found {
+			return nil, fmt.Errorf("stage role %s has no Profile binding", binding.Role)
+		}
+
+		if binding.Count > profileRole.Count {
+			return nil, fmt.Errorf(
+				"stage role %s requires %d participants, Profile binds %d",
+				binding.Role,
+				binding.Count,
+				profileRole.Count,
+			)
+		}
+
+		selector := labels.Everything()
+
+		if !reflect.DeepEqual(profileRole.Selector, metav1.LabelSelector{}) {
+			var err error
+
+			selector, err = metav1.LabelSelectorAsSelector(&profileRole.Selector)
+			if err != nil {
+				return nil, fmt.Errorf("profile role %s selector: %w", binding.Role, err)
+			}
+		}
+
+		indexes := make([]int32, 0, binding.Count)
+
+		for index := range nodes {
+			participantIndex := int32(index)
+			if _, exists := assigned[participantIndex]; exists ||
+				!selector.Matches(labels.Set(nodes[index].Labels)) {
+				continue
+			}
+
+			assigned[participantIndex] = struct{}{}
+
+			indexes = append(indexes, participantIndex)
+			if int32(len(indexes)) == binding.Count {
+				break
+			}
+		}
+
+		if int32(len(indexes)) != binding.Count {
+			return nil, fmt.Errorf(
+				"stage role %s requires %d matching selected participants, found %d",
+				binding.Role,
+				binding.Count,
+				len(indexes),
+			)
+		}
+
+		result = append(result, signalv1.ResolvedStageParticipantRoleBinding{
+			Role:               binding.Role,
+			ParticipantIndexes: indexes,
+		})
+	}
+
+	return result, nil
 }
 
 func (r *AdmissionReconciler) captureParticipantFingerprints(
@@ -1427,6 +2129,18 @@ func (r *RunReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.R
 }
 
 func (r *RunReconciler) verifyScriptBundle(ctx context.Context, run *signalv1.CertificationRun) error {
+	if run.Spec.ResolvedPlan != nil {
+		if run.Spec.ScriptBundle != nil || len(run.Spec.Checks) != 0 {
+			return errors.New("resolved plan run contains legacy script fields")
+		}
+
+		return nil
+	}
+
+	if run.Spec.ScriptBundle == nil {
+		return errors.New("legacy run is missing its script bundle")
+	}
+
 	reader := r.APIReader
 	if reader == nil {
 		reader = r.Client
@@ -1748,6 +2462,10 @@ func (r *RunReconciler) recordWorkflowStarted(
 }
 
 func buildWorkflow(run *signalv1.CertificationRun) (*unstructured.Unstructured, error) {
+	if run.Spec.ResolvedPlan != nil {
+		return buildResolvedWorkflow(run)
+	}
+
 	checks := run.Spec.Checks
 
 	suiteDeadline, err := validateRunCheckPlan(checks)
@@ -1818,6 +2536,162 @@ func buildWorkflow(run *signalv1.CertificationRun) (*unstructured.Unstructured, 
 	return workflow, nil
 }
 
+func buildResolvedWorkflow(run *signalv1.CertificationRun) (*unstructured.Unstructured, error) {
+	if run.Spec.ResolvedPlan == nil {
+		return nil, errors.New("run has no resolved plan")
+	}
+
+	deadline, err := signalv1.DeriveResolvedPlanDeadline(run.Spec.ResolvedPlan.Phases)
+	if err != nil {
+		return nil, err
+	}
+
+	tasks := make([]any, 0, resolvedStageCount(*run.Spec.ResolvedPlan))
+
+	var previousPhase []struct {
+		name     string
+		optional bool
+	}
+
+	for phaseIndex := range run.Spec.ResolvedPlan.Phases {
+		phase := &run.Spec.ResolvedPlan.Phases[phaseIndex]
+		currentPhaseNames := make([]string, len(phase.Stages))
+
+		for stageIndex := range phase.Stages {
+			stage := &phase.Stages[stageIndex]
+			taskName := stageTaskName(int32(phaseIndex), int32(stageIndex), stage.Name)
+			currentPhaseNames[stageIndex] = taskName
+			task := map[string]any{
+				"name": taskName,
+				"templateRef": map[string]any{
+					"name":     adapterWorkflowTemplateName,
+					"template": "certification-stage",
+				},
+				"arguments": map[string]any{
+					"parameters": stageWorkflowParameters(
+						run,
+						int32(phaseIndex),
+						int32(stageIndex),
+						stage,
+					),
+				},
+			}
+
+			if len(previousPhase) > 0 {
+				dependencies := make([]string, len(previousPhase))
+				for index, previous := range previousPhase {
+					if previous.optional {
+						dependencies[index] = fmt.Sprintf(
+							"(%s.Succeeded || %s.Failed || %s.Errored || %s.Skipped || %s.Omitted)",
+							previous.name,
+							previous.name,
+							previous.name,
+							previous.name,
+							previous.name,
+						)
+					} else {
+						dependencies[index] = previous.name + ".Succeeded"
+					}
+				}
+
+				task["depends"] = strings.Join(dependencies, " && ")
+			}
+
+			tasks = append(tasks, task)
+		}
+
+		previousPhase = make([]struct {
+			name     string
+			optional bool
+		}, len(currentPhaseNames))
+		for index := range currentPhaseNames {
+			previousPhase[index].name = currentPhaseNames[index]
+			previousPhase[index].optional = phase.Stages[index].Optional
+		}
+	}
+
+	workflow := &unstructured.Unstructured{Object: map[string]any{
+		"apiVersion": workflowGVK.GroupVersion().String(),
+		"kind":       workflowGVK.Kind,
+		"metadata": map[string]any{
+			"name":      run.Name + "-a1",
+			"namespace": run.Namespace,
+			"labels": map[string]any{
+				SnapshotRunLabel: run.Name,
+			},
+		},
+		"spec": map[string]any{
+			"activeDeadlineSeconds":        int64(deadline.Seconds()),
+			"serviceAccountName":           adapterServiceAccountName,
+			"automountServiceAccountToken": true,
+			"entrypoint":                   "certification-suite",
+			"templates": []any{
+				map[string]any{
+					"name": "certification-suite",
+					"dag": map[string]any{
+						"failFast": false,
+						"tasks":    tasks,
+					},
+				},
+			},
+		},
+	}}
+	workflow.SetOwnerReferences([]metav1.OwnerReference{
+		*metav1.NewControllerRef(run, signalv1.GroupVersion.WithKind("CertificationRun")),
+	})
+
+	if err := validateWorkflowSize(workflow); err != nil {
+		return nil, err
+	}
+
+	return workflow, nil
+}
+
+func stageWorkflowParameters(
+	run *signalv1.CertificationRun,
+	phaseIndex int32,
+	stageIndex int32,
+	stage *signalv1.ResolvedStagePlan,
+) []any {
+	return []any{
+		map[string]any{"name": "run-name", "value": run.Name},
+		map[string]any{
+			"name":  "execution-name",
+			"value": stageRunName(run.Name, phaseIndex, stageIndex, stage.Name),
+		},
+		map[string]any{"name": "run-uid", "value": string(run.UID)},
+		map[string]any{"name": "phase-index", "value": strconv.FormatInt(int64(phaseIndex), 10)},
+		map[string]any{"name": "stage-index", "value": strconv.FormatInt(int64(stageIndex), 10)},
+		map[string]any{
+			"name":  "result-configmap",
+			"value": stageResultName(run.Name, phaseIndex, stageIndex),
+		},
+	}
+}
+
+func resolvedStageCount(plan signalv1.ResolvedCertificationPlan) int {
+	count := 0
+	for index := range plan.Phases {
+		count += len(plan.Phases[index].Stages)
+	}
+
+	return count
+}
+
+func stageTaskName(phaseIndex, stageIndex int32, name string) string {
+	return sanitizeTaskName(fmt.Sprintf("p%02d-s%02d-%s", phaseIndex+1, stageIndex+1, name))
+}
+
+func stageRunName(runName string, phaseIndex, stageIndex int32, name string) string {
+	return boundedDNSName(
+		fmt.Sprintf("%s-p%02d-s%02d-%s", runName, phaseIndex+1, stageIndex+1, sanitizeTaskName(name)),
+	)
+}
+
+func stageResultName(runName string, phaseIndex, stageIndex int32) string {
+	return boundedDNSName(fmt.Sprintf("%s-p%02d-s%02d-result", runName, phaseIndex+1, stageIndex+1))
+}
+
 func checkWorkflowParameters(
 	run *signalv1.CertificationRun,
 	check *signalv1.CertificationCheckSnapshot,
@@ -1868,6 +2742,10 @@ func (r *RunReconciler) finishGrouped(
 	workflow *unstructured.Unstructured,
 	workflowPhase string,
 ) (ctrl.Result, error) {
+	if run.Spec.ResolvedPlan != nil {
+		return r.finishResolved(ctx, run, workflow, workflowPhase)
+	}
+
 	checks, verdict, reason := r.terminalCheckStatuses(ctx, workflow, run)
 	executionState := "Completed"
 
@@ -1932,6 +2810,443 @@ func (r *RunReconciler) finishGrouped(
 	}
 
 	return ctrl.Result{RequeueAfter: time.Millisecond}, nil
+}
+
+func (r *RunReconciler) finishResolved(
+	ctx context.Context,
+	run *signalv1.CertificationRun,
+	workflow *unstructured.Unstructured,
+	workflowPhase string,
+) (ctrl.Result, error) {
+	stages, runnerImages, verdict, reason := r.terminalStageSummaries(ctx, workflow, run)
+	if workflowPhase != "Succeeded" {
+		verdict = "Inconclusive"
+
+		if reason == "" {
+			reason = "Workflow" + workflowPhase + ": " + workflowMessage(workflow)
+		}
+	}
+
+	identity, enforcedVerdict, enforcedReason, err := r.resolvedQualificationEvidenceIdentity(
+		ctx,
+		run,
+		stages,
+		runnerImages,
+		verdict,
+		reason,
+	)
+	if err != nil {
+		return ctrl.Result{}, err
+	}
+
+	verdict = enforcedVerdict
+	reason = enforcedReason
+	evidenceRun := run.DeepCopy()
+	evidenceRun.Status.Reason = reason
+	evidenceRun.Status.Phase = runPhaseForVerdict(verdict)
+	evidenceRun.Status.Workflow.Phase = workflowPhase
+	evidenceRun.Status.Evidence.Identity = identity
+
+	startedAt := groupedStartedAt(workflow, run)
+	finishedAt := groupedFinishedAt(workflow, run)
+
+	evidence, err := r.evidenceDocument(
+		ctx,
+		evidenceRun,
+		"Completed",
+		verdict,
+		reason,
+		startedAt,
+		finishedAt,
+	)
+	if err != nil {
+		return ctrl.Result{}, err
+	}
+
+	uri, digest, err := r.Evidence.Put(ctx, evidencePath(run), evidence)
+	if err != nil {
+		return ctrl.Result{}, err
+	}
+
+	before := run.DeepCopy()
+	run.Status = evidenceRun.Status
+	run.Status.Evidence = signalv1.EvidenceStatus{URI: uri, Digest: digest, Identity: identity}
+	run.Status.Phase = runPhaseForVerdict(verdict)
+	run.Status.Reason = boundedStatusText(reason)
+
+	if err := r.Status().Patch(ctx, run, client.MergeFrom(before)); err != nil {
+		return ctrl.Result{}, err
+	}
+
+	if err := projectTerminal(ctx, r.Client, run, finishedAt.Time); err != nil {
+		return ctrl.Result{}, err
+	}
+
+	return ctrl.Result{RequeueAfter: time.Millisecond}, nil
+}
+
+func (r *RunReconciler) terminalStageSummaries(
+	ctx context.Context,
+	workflow *unstructured.Unstructured,
+	run *signalv1.CertificationRun,
+) ([]signalv1.StageEvidenceSummary, []string, string, string) {
+	stages := make([]signalv1.StageEvidenceSummary, 0, resolvedStageCount(*run.Spec.ResolvedPlan))
+	runnerImages := make([]string, 0)
+	seenRunnerImages := map[string]struct{}{}
+	verdict := "Pass"
+	reason := "AllRequiredStagesPassed"
+
+	for phaseIndex := range run.Spec.ResolvedPlan.Phases {
+		phase := &run.Spec.ResolvedPlan.Phases[phaseIndex]
+		for stageIndex := range phase.Stages {
+			stage := &phase.Stages[stageIndex]
+
+			summary, stageRunnerImages, err := r.readStageResult(
+				ctx,
+				workflow,
+				run,
+				int32(phaseIndex),
+				int32(stageIndex),
+				phase.Role,
+				stage,
+			)
+			if err != nil {
+				if stage.Optional {
+					continue
+				}
+
+				return stages,
+					runnerImages,
+					"Inconclusive",
+					fmt.Sprintf("StageEvidenceInvalid: phase %s stage %s: %v", phase.Name, stage.Name, err)
+			}
+
+			stages = append(stages, *summary)
+
+			for _, image := range stageRunnerImages {
+				if _, exists := seenRunnerImages[image]; exists {
+					continue
+				}
+
+				seenRunnerImages[image] = struct{}{}
+				runnerImages = append(runnerImages, image)
+			}
+
+			if stage.Optional {
+				continue
+			}
+
+			switch summary.Verdict {
+			case signalv1.StageVerdictPassed:
+			case signalv1.StageVerdictFailed:
+				verdict = "Fail"
+				reason = fmt.Sprintf("RequiredStageFailed: phase %s stage %s", phase.Name, stage.Name)
+			default:
+				if verdict != "Fail" {
+					verdict = "Inconclusive"
+					reason = fmt.Sprintf(
+						"RequiredStageInconclusive: phase %s stage %s",
+						phase.Name,
+						stage.Name,
+					)
+				}
+			}
+		}
+	}
+
+	sort.Strings(runnerImages)
+
+	return stages, runnerImages, verdict, reason
+}
+
+func (r *RunReconciler) readStageResult(
+	ctx context.Context,
+	workflow *unstructured.Unstructured,
+	run *signalv1.CertificationRun,
+	phaseIndex int32,
+	stageIndex int32,
+	phaseRole signalv1.CheckStageRole,
+	stage *signalv1.ResolvedStagePlan,
+) (*signalv1.StageEvidenceSummary, []string, error) {
+	reader := r.APIReader
+	if reader == nil {
+		reader = r.Client
+	}
+
+	var result corev1.ConfigMap
+
+	name := stageResultName(run.Name, phaseIndex, stageIndex)
+	if err := reader.Get(ctx, client.ObjectKey{Namespace: run.Namespace, Name: name}, &result); err != nil {
+		return nil, nil, fmt.Errorf("read immutable stage result ConfigMap: %w", err)
+	}
+
+	if result.Immutable == nil || !*result.Immutable ||
+		result.Labels[SnapshotRunLabel] != run.Name ||
+		result.Annotations[stageResultRunUID] != string(run.UID) ||
+		result.Annotations[stageResultPlanDigest] != run.Spec.PlanDigest ||
+		result.Annotations[stageResultPhaseOrder] != strconv.FormatInt(int64(phaseIndex), 10) ||
+		result.Annotations[stageResultStageOrder] != strconv.FormatInt(int64(stageIndex), 10) {
+		return nil, nil, errors.New("stage result identity does not match the Run")
+	}
+
+	content, found := result.BinaryData[checkResultDataKey]
+	if !found || len(content) == 0 || len(content) > maximumCheckResultBytes {
+		return nil, nil, errors.New("stage result payload is missing or oversized")
+	}
+
+	if result.Annotations[stageResultDigest] != digestBytes(content) {
+		return nil, nil, errors.New("stage result digest does not match its payload")
+	}
+
+	if !metav1.IsControlledBy(&result, workflow) {
+		return nil, nil, errors.New("stage result is not owned by the Run Workflow")
+	}
+
+	var summary signalv1.StageEvidenceSummary
+	if err := json.Unmarshal(content, &summary); err != nil {
+		return nil, nil, fmt.Errorf("decode stage result: %w", err)
+	}
+
+	if err := validateStageEvidenceSummary(
+		&summary,
+		phaseIndex,
+		stageIndex,
+		phaseRole,
+		stage,
+		int32(len(run.Spec.Participants)),
+	); err != nil {
+		return nil, nil, err
+	}
+
+	runnerImages, err := stageRunnerImageProvenance(
+		result.Annotations[stageResultRunnerImages],
+		stage.Test.Driver,
+	)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	return &summary, runnerImages, nil
+}
+
+func stageRunnerImageProvenance(
+	value string,
+	driver signalv1.CertificationTestDriver,
+) ([]string, error) {
+	var images []string
+	if err := json.Unmarshal([]byte(value), &images); err != nil {
+		return nil, errors.New("stage result runner image provenance is missing or invalid")
+	}
+
+	if len(images) == 0 || len(images) > 32 {
+		return nil, errors.New("stage result runner image provenance must contain between 1 and 32 images")
+	}
+
+	seen := make(map[string]struct{}, len(images))
+	for _, image := range images {
+		if !signalv1.IsDigestPinnedImage(image) {
+			return nil, fmt.Errorf("stage result runner image %q is not digest pinned", image)
+		}
+
+		if _, exists := seen[image]; exists {
+			return nil, fmt.Errorf("stage result repeats runner image %q", image)
+		}
+
+		seen[image] = struct{}{}
+	}
+
+	expected := resolvedTestRunnerImage(driver)
+	if expected != "" {
+		if _, found := seen[expected]; !found {
+			return nil, errors.New("stage result omits the immutable planned runner image")
+		}
+	}
+
+	sort.Strings(images)
+
+	return images, nil
+}
+
+func validateStageEvidenceSummary(
+	summary *signalv1.StageEvidenceSummary,
+	phaseIndex int32,
+	stageIndex int32,
+	phaseRole signalv1.CheckStageRole,
+	stage *signalv1.ResolvedStagePlan,
+	participantCount int32,
+) error {
+	if summary.PhaseOrder != phaseIndex ||
+		summary.StageOrder != stageIndex ||
+		summary.Name != stage.Name ||
+		summary.Role != phaseRole ||
+		summary.Test != stage.Test.Identity ||
+		summary.Mode != stage.Schedule.Mode ||
+		summary.QualificationEligible != stage.QualificationEligible ||
+		summary.DiagnosticOnly != stage.DiagnosticOnly {
+		return errors.New("stage evidence identity does not match the immutable plan")
+	}
+
+	if summary.FinishedAt.Before(&summary.StartedAt) ||
+		summary.ObservedCoverageWindow.Duration < 0 ||
+		!signalv1.IsSHA256Digest(summary.DurableEvidenceDigest) {
+		return errors.New("stage evidence timing or durable digest is invalid")
+	}
+
+	if summary.ObservedCoverageWindow.Duration > summary.FinishedAt.Sub(summary.StartedAt.Time) {
+		return errors.New("stage observed coverage exceeds its execution interval")
+	}
+
+	if summary.FirstInvocationAt != nil &&
+		(summary.FirstInvocationAt.Before(&summary.StartedAt) ||
+			summary.FirstInvocationAt.After(summary.FinishedAt.Time)) {
+		return errors.New("first invocation is outside the stage execution interval")
+	}
+
+	if summary.LastInvocationAt != nil &&
+		(summary.FirstInvocationAt == nil ||
+			summary.LastInvocationAt.Before(summary.FirstInvocationAt) ||
+			summary.LastInvocationAt.After(summary.FinishedAt.Time)) {
+		return errors.New("last invocation is outside the stage invocation interval")
+	}
+
+	if summary.InvocationCount != summary.SuccessfulInvocations+
+		summary.TimedOutInvocations+
+		summary.FailedInvocations+
+		summary.InconclusiveInvocations+
+		summary.CanceledInvocations {
+		return errors.New("stage invocation outcome counts are inconsistent")
+	}
+
+	schedule := stage.Schedule
+	if schedule.Mode == signalv1.CheckExecutionModeRunOnce {
+		maxAttempts := int32(1)
+		if stage.Retry != nil {
+			maxAttempts = stage.Retry.MaxAttempts
+		}
+
+		if summary.InvocationCount < 1 ||
+			summary.InvocationCount > maxAttempts ||
+			summary.ConfiguredCoverageWindow != nil ||
+			summary.MaxStartGap != nil {
+			return errors.New("RunOnce stage evidence has invalid invocation or coverage fields")
+		}
+
+		if summary.Verdict == signalv1.StageVerdictPassed && summary.SuccessfulInvocations != 1 {
+			return errors.New("passed RunOnce stage must contain exactly one successful invocation")
+		}
+	} else {
+		if schedule.CoverageWindow == nil ||
+			summary.ConfiguredCoverageWindow == nil ||
+			summary.ConfiguredCoverageWindow.Duration != schedule.CoverageWindow.Duration ||
+			summary.MaxStartGap == nil {
+			return errors.New("repeated stage evidence does not match its configured window")
+		}
+
+		if summary.Verdict == signalv1.StageVerdictPassed &&
+			(summary.ObservedCoverageWindow.Duration < schedule.CoverageWindow.Duration ||
+				schedule.MinExecutions == nil ||
+				summary.SuccessfulInvocations < *schedule.MinExecutions ||
+				schedule.MaxGap == nil ||
+				summary.MaxStartGap == nil ||
+				summary.MaxStartGap.Duration > schedule.MaxGap.Duration ||
+				summary.FirstInvocationAt == nil ||
+				summary.LastInvocationAt == nil) {
+			return errors.New("repeated stage evidence does not prove its configured window, count, or gap")
+		}
+	}
+
+	if stage.PerDeviceCoverageInterval != nil && summary.Verdict == signalv1.StageVerdictPassed {
+		if schedule.CoverageWindow == nil || len(summary.DeviceIntervalCoverage) == 0 {
+			return errors.New("per-device interval coverage evidence is missing")
+		}
+
+		required := int32(
+			(schedule.CoverageWindow.Duration + stage.PerDeviceCoverageInterval.Duration - 1) /
+				stage.PerDeviceCoverageInterval.Duration,
+		)
+
+		expectedParticipants := make(map[int32]struct{}, participantCount)
+		if len(stage.ParticipantRoles) == 0 {
+			for participantIndex := int32(0); participantIndex < participantCount; participantIndex++ {
+				expectedParticipants[participantIndex] = struct{}{}
+			}
+		} else {
+			for _, binding := range stage.ParticipantRoles {
+				for _, participantIndex := range binding.ParticipantIndexes {
+					expectedParticipants[participantIndex] = struct{}{}
+				}
+			}
+		}
+
+		seenDevices := make(map[string]struct{}, len(summary.DeviceIntervalCoverage))
+		for _, coverage := range summary.DeviceIntervalCoverage {
+			key := fmt.Sprintf("%d\x00%s", coverage.ParticipantIndex, coverage.DeviceID)
+			if coverage.ParticipantIndex < 0 ||
+				coverage.ParticipantIndex >= participantCount ||
+				coverage.DeviceID == "" {
+				return errors.New("per-device interval coverage identity is invalid")
+			}
+
+			if _, duplicate := seenDevices[key]; duplicate {
+				return errors.New("per-device interval coverage repeats a device")
+			}
+
+			seenDevices[key] = struct{}{}
+
+			delete(expectedParticipants, coverage.ParticipantIndex)
+
+			if coverage.RequiredIntervals != required ||
+				coverage.CoveredIntervals < required {
+				return errors.New("per-device interval coverage is incomplete")
+			}
+		}
+
+		if len(expectedParticipants) != 0 {
+			return errors.New("per-device interval coverage omits a participant")
+		}
+	}
+
+	expectedAssertions := make(map[string]struct{}, len(stage.Assertions))
+	for _, assertion := range stage.Assertions {
+		expectedAssertions[assertion.Name] = struct{}{}
+	}
+
+	for _, assertion := range summary.Assertions {
+		if _, exists := expectedAssertions[assertion.Name]; !exists {
+			return fmt.Errorf("stage evidence contains unknown assertion %s", assertion.Name)
+		}
+
+		if !assertion.Passed && summary.Verdict == signalv1.StageVerdictPassed {
+			return fmt.Errorf("stage passed despite failed assertion %s", assertion.Name)
+		}
+
+		delete(expectedAssertions, assertion.Name)
+	}
+
+	if summary.Verdict == signalv1.StageVerdictPassed && len(expectedAssertions) != 0 {
+		return errors.New("stage evidence is missing assertion results")
+	}
+
+	if summary.Verdict == signalv1.StageVerdictPassed && summary.SuccessfulInvocations == 0 {
+		return errors.New("passed stage contains no successful invocation")
+	}
+
+	seenInvocations := make(map[string]struct{}, len(summary.InvocationEvidence))
+	for _, invocation := range summary.InvocationEvidence {
+		if invocation.InvocationID == "" ||
+			!signalv1.IsSHA256Digest(invocation.Digest) ||
+			invocation.FinishedAt.Before(&invocation.StartedAt) {
+			return errors.New("stage invocation evidence reference is invalid")
+		}
+
+		if _, duplicate := seenInvocations[invocation.InvocationID]; duplicate {
+			return errors.New("stage invocation evidence repeats an invocation")
+		}
+
+		seenInvocations[invocation.InvocationID] = struct{}{}
+	}
+
+	return nil
 }
 
 func (r *RunReconciler) resumeGroupedEvidence(
@@ -2661,6 +3976,31 @@ func (r *RunReconciler) evidenceDocument(
 	startedAt metav1.Time,
 	finishedAt metav1.Time,
 ) ([]byte, error) {
+	if run.Spec.ResolvedPlan != nil {
+		doc := map[string]any{
+			"apiVersion":            "signal.unbounded-cloud.io/evidence/v1alpha1",
+			"runID":                 string(run.UID),
+			"runName":               run.Name,
+			"profile":               run.Spec.Profile,
+			"suite":                 run.Spec.Suite,
+			"participants":          run.Spec.Participants,
+			"resolvedPlan":          run.Spec.ResolvedPlan,
+			"environment":           run.Spec.Environment,
+			"planDigest":            run.Spec.PlanDigest,
+			"planProvenance":        run.Spec.PlanProvenance,
+			"workflow":              run.Status.Workflow,
+			"executionState":        executionState,
+			"verdict":               verdict,
+			"reason":                reason,
+			"phase":                 run.Status.Phase,
+			"qualificationIdentity": run.Status.Evidence.Identity,
+			"startedAt":             startedAt.UTC().Format(time.RFC3339Nano),
+			"finishedAt":            finishedAt.UTC().Format(time.RFC3339Nano),
+		}
+
+		return json.MarshalIndent(doc, "", "  ")
+	}
+
 	checks := run.Spec.Checks
 	if len(checks) == 0 {
 		return nil, errors.New("run has no certification checks")
@@ -2817,16 +4157,6 @@ func (r *RunReconciler) qualificationEvidenceIdentity(
 		}
 
 		check := &run.Spec.Checks[index]
-		if verdict == "Pass" && check.MinDuration != nil && duration < check.MinDuration.Duration {
-			verdict = "Inconclusive"
-			reason = fmt.Sprintf(
-				"MinimumDurationNotMet: check %s ran for %s, requires %s",
-				check.ID,
-				duration,
-				check.MinDuration.Duration,
-			)
-		}
-
 		if verdict == "Pass" && check.Continuity != nil {
 			switch {
 			case check.Continuity.RequireSameBootID && !sameBoot:
@@ -2838,6 +4168,15 @@ func (r *RunReconciler) qualificationEvidenceIdentity(
 			case check.Continuity.RequirePerDeviceCoverage:
 				verdict = "Inconclusive"
 				reason = fmt.Sprintf("ContinuityNotProven: check %s lacks per-device coverage evidence", check.ID)
+			}
+		}
+
+		for index := range run.Spec.Checks {
+			if run.Spec.Checks[index].MinDuration != nil {
+				return nil,
+					"Inconclusive",
+					"LegacyDurationSemanticsUnsupported: legacy backend lifetime cannot prove sustained execution",
+					nil
 			}
 		}
 	}
@@ -2876,6 +4215,148 @@ func (r *RunReconciler) qualificationEvidenceIdentity(
 			RunnerImages:           runnerImages,
 		},
 	}, verdict, reason, nil
+}
+
+func (r *RunReconciler) resolvedQualificationEvidenceIdentity(
+	ctx context.Context,
+	run *signalv1.CertificationRun,
+	stages []signalv1.StageEvidenceSummary,
+	runnerImages []string,
+	verdict string,
+	reason string,
+) (*signalv1.QualificationEvidenceIdentity, string, string, error) {
+	if run.Spec.PlanDigest == "" ||
+		run.Spec.PlanProvenance == nil ||
+		run.Spec.ResolvedPlan == nil {
+		return nil, verdict, reason, nil
+	}
+
+	canonical, err := signalv1.DeriveResolvedExecutionPlanDigest(
+		int32(len(run.Spec.Participants)),
+		run.Spec.Environment,
+		*run.Spec.ResolvedPlan,
+		*run.Spec.PlanProvenance,
+	)
+	if err != nil || canonical != run.Spec.PlanDigest {
+		return nil, "Inconclusive", "ExecutionPlanIdentityInvalid: immutable resolved plan provenance is invalid", nil
+	}
+
+	qualificationEligible := true
+
+	summaryByPosition := make(map[[2]int32]signalv1.StageEvidenceSummary, len(stages))
+	for _, summary := range stages {
+		summaryByPosition[[2]int32{summary.PhaseOrder, summary.StageOrder}] = summary
+	}
+
+	for phaseIndex := range run.Spec.ResolvedPlan.Phases {
+		phase := &run.Spec.ResolvedPlan.Phases[phaseIndex]
+		for stageIndex := range phase.Stages {
+			stage := &phase.Stages[stageIndex]
+			if stage.Optional {
+				continue
+			}
+
+			if !stage.QualificationEligible {
+				qualificationEligible = false
+			}
+
+			summary, found := summaryByPosition[[2]int32{int32(phaseIndex), int32(stageIndex)}]
+			if !found || summary.Verdict != signalv1.StageVerdictPassed {
+				return nil, "Inconclusive", "StageEvidenceMissing: required stage evidence is incomplete", nil
+			}
+		}
+	}
+
+	if !qualificationEligible {
+		return nil, verdict, "DiagnosticOnly: required stages are not qualification eligible", nil
+	}
+
+	starts, err := decodeStartFingerprints(run)
+	if err != nil {
+		return nil, "Inconclusive", "ParticipantIdentityMissing: " + err.Error(), nil
+	}
+
+	participants := make([]signalv1.ParticipantEvidenceIdentity, len(run.Spec.Participants))
+	for index := range run.Spec.Participants {
+		var node corev1.Node
+		if err := r.APIReader.Get(
+			ctx,
+			client.ObjectKey{Name: run.Spec.Participants[index].NodeName},
+			&node,
+		); err != nil {
+			if apierrors.IsNotFound(err) {
+				return nil, "Inconclusive", "ParticipantIdentityMissing: end fingerprint unavailable", nil
+			}
+
+			return nil, verdict, reason, fmt.Errorf(
+				"read participant %s end fingerprint: %w",
+				run.Spec.Participants[index].NodeName,
+				err,
+			)
+		}
+
+		if node.UID != run.Spec.Participants[index].NodeUID {
+			return nil, "Inconclusive", "ParticipantIdentityChanged: node UID changed during execution", nil
+		}
+
+		participants[index] = signalv1.ParticipantEvidenceIdentity{
+			Index:   int32(index),
+			Role:    resolvedParticipantRole(int32(index)),
+			Verdict: qualificationVerdict(verdict),
+			Start:   starts[index],
+			End:     nodeFingerprint(&node),
+		}
+	}
+
+	if len(participants) > 1 {
+		return nil,
+			"Inconclusive",
+			"ParticipantVerdictsMissing: stage evidence does not provide per-participant verdicts",
+			nil
+	}
+
+	if len(runnerImages) == 0 {
+		return nil, "Inconclusive", "RunnerProvenanceMissing: stage evidence has no runner images", nil
+	}
+
+	resolverImages := append([]string(nil), run.Spec.PlanProvenance.ResolverImages...)
+	sort.Strings(resolverImages)
+
+	for index := range participants {
+		participants[index].Verdict = qualificationVerdict(verdict)
+	}
+
+	return &signalv1.QualificationEvidenceIdentity{
+		PlanDigest:   run.Spec.PlanDigest,
+		Participants: participants,
+		Stages:       stages,
+		Provenance: signalv1.EvidenceProvenance{
+			ControllerImage:        run.Spec.PlanProvenance.ControllerImage,
+			AdapterImage:           run.Spec.PlanProvenance.AdapterImage,
+			WorkflowTemplateDigest: run.Spec.PlanProvenance.WorkflowTemplateDigest,
+			RunnerImages:           runnerImages,
+			ResolverImages:         resolverImages,
+		},
+	}, verdict, reason, nil
+}
+
+func resolvedTestRunnerImage(driver signalv1.CertificationTestDriver) string {
+	switch {
+	case driver.Script != nil:
+		return driver.Script.RunnerImage
+	case driver.Container != nil:
+		return driver.Container.Image
+	default:
+		return ""
+	}
+}
+
+func resolvedParticipantRole(participantIndex int32) signalv1.ParticipantRole {
+	if participantIndex == 0 {
+		return signalv1.ParticipantRoleRequester
+	}
+
+	return signalv1.ParticipantRoleParticipant
 }
 
 func decodeStartFingerprints(run *signalv1.CertificationRun) ([]signalv1.NodeFingerprint, error) {

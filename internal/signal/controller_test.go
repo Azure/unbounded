@@ -7,6 +7,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"slices"
 	"strconv"
 	"strings"
 	"testing"
@@ -56,6 +57,484 @@ func TestValidateCheckPlanVariableLengths(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestBuildResolvedWorkflowOrdersPhasesAndConcurrentStages(t *testing.T) {
+	t.Parallel()
+
+	run := resolvedWorkflowTestRun()
+
+	workflow, err := buildWorkflow(run)
+	if err != nil {
+		t.Fatalf("buildWorkflow() error = %v", err)
+	}
+
+	templates, found, err := unstructured.NestedSlice(workflow.Object, "spec", "templates")
+	if err != nil || !found || len(templates) != 1 {
+		t.Fatalf("workflow templates = %#v, found %t, error %v", templates, found, err)
+	}
+
+	template := templates[0].(map[string]any)
+	dag := template["dag"].(map[string]any)
+
+	dagTasks := dag["tasks"].([]any)
+	if len(dagTasks) != 3 {
+		t.Fatalf("DAG task count = %d, want 3", len(dagTasks))
+	}
+
+	startup := dagTasks[0].(map[string]any)
+	optional := dagTasks[1].(map[string]any)
+	validation := dagTasks[2].(map[string]any)
+
+	if _, exists := startup["depends"]; exists {
+		t.Fatal("first phase startup stage unexpectedly depends on another task")
+	}
+
+	if _, exists := optional["depends"]; exists {
+		t.Fatal("concurrent first-phase stage unexpectedly depends on another task")
+	}
+
+	depends, ok := validation["depends"].(string)
+	if !ok ||
+		!strings.Contains(depends, startup["name"].(string)+".Succeeded") ||
+		!strings.Contains(depends, optional["name"].(string)+".Failed") {
+		t.Fatalf("validation dependency = %q", depends)
+	}
+
+	gotDeadline, found, err := unstructured.NestedInt64(workflow.Object, "spec", "activeDeadlineSeconds")
+	if err != nil || !found {
+		t.Fatalf("workflow deadline missing: found %t, error %v", found, err)
+	}
+
+	wantDeadline, err := signalv1.DeriveResolvedPlanDeadline(run.Spec.ResolvedPlan.Phases)
+	if err != nil {
+		t.Fatalf("derive expected deadline: %v", err)
+	}
+
+	if gotDeadline != int64(wantDeadline.Seconds()) {
+		t.Fatalf("workflow deadline = %d, want %d", gotDeadline, int64(wantDeadline.Seconds()))
+	}
+}
+
+func TestValidateSourcePhasesStageLimit(t *testing.T) {
+	t.Parallel()
+
+	phaseWithStages := func(count int) []signalv1.CertificationPhase {
+		stages := make([]signalv1.CertificationStage, count)
+		for index := range stages {
+			stages[index] = signalv1.CertificationStage{
+				Name: fmt.Sprintf("stage-%02d", index),
+				Schedule: signalv1.StageSchedule{
+					Mode:              signalv1.CheckExecutionModeRunOnce,
+					InvocationTimeout: metav1.Duration{Duration: time.Minute},
+				},
+			}
+		}
+
+		return []signalv1.CertificationPhase{{
+			Name:   "validation",
+			Role:   signalv1.CheckStageRoleValidation,
+			Stages: stages,
+		}}
+	}
+
+	if err := validateSourcePhases(phaseWithStages(signalv1.MaxCertificationStages)); err != nil {
+		t.Fatalf("maximum stage plan rejected: %v", err)
+	}
+
+	if err := validateSourcePhases(phaseWithStages(signalv1.MaxCertificationStages + 1)); err == nil {
+		t.Fatal("over-limit stage plan was accepted")
+	}
+}
+
+func TestValidateStageEvidenceSummaryBoundaries(t *testing.T) {
+	t.Parallel()
+
+	minExecutions := int32(6)
+	stage := signalv1.ResolvedStagePlan{
+		Name: "sustained",
+		Test: signalv1.ResolvedCertificationTest{
+			Identity: signalv1.TestIdentitySnapshot{
+				Name:          "test",
+				UID:           "test-uid",
+				Generation:    1,
+				ContentDigest: "sha256:" + strings.Repeat("a", 64),
+				Trust:         signalv1.CertificationTestTrustApproved,
+			},
+		},
+		Schedule: signalv1.StageSchedule{
+			Mode:              signalv1.CheckExecutionModePeriodic,
+			InvocationTimeout: metav1.Duration{Duration: time.Minute},
+			CoverageWindow:    testDurationPointer(time.Hour),
+			Interval:          testDurationPointer(10 * time.Minute),
+			MinExecutions:     &minExecutions,
+			MaxGap:            testDurationPointer(11 * time.Minute),
+		},
+		QualificationEligible: true,
+	}
+	started := metav1.NewTime(time.Date(2026, 1, 2, 3, 4, 5, 0, time.UTC))
+	finished := metav1.NewTime(started.Add(time.Hour))
+	summary := signalv1.StageEvidenceSummary{
+		PhaseOrder:               0,
+		StageOrder:               0,
+		Name:                     stage.Name,
+		Role:                     signalv1.CheckStageRoleValidation,
+		Test:                     stage.Test.Identity,
+		Mode:                     stage.Schedule.Mode,
+		QualificationEligible:    true,
+		Verdict:                  signalv1.StageVerdictPassed,
+		StartedAt:                started,
+		FinishedAt:               finished,
+		ConfiguredCoverageWindow: testDurationPointer(time.Hour),
+		ObservedCoverageWindow:   metav1.Duration{Duration: time.Hour},
+		InvocationCount:          minExecutions,
+		SuccessfulInvocations:    minExecutions,
+		FirstInvocationAt:        &started,
+		LastInvocationAt:         &finished,
+		MaxStartGap:              testDurationPointer(10 * time.Minute),
+		DurableEvidenceDigest:    "sha256:" + strings.Repeat("b", 64),
+	}
+
+	if err := validateStageEvidenceSummary(
+		&summary,
+		0,
+		0,
+		signalv1.CheckStageRoleValidation,
+		&stage,
+		1,
+	); err != nil {
+		t.Fatalf("valid boundary summary rejected: %v", err)
+	}
+
+	tests := []struct {
+		name   string
+		mutate func(*signalv1.StageEvidenceSummary)
+	}{
+		{
+			name: "short window",
+			mutate: func(value *signalv1.StageEvidenceSummary) {
+				value.ObservedCoverageWindow.Duration--
+			},
+		},
+		{
+			name: "missing invocation",
+			mutate: func(value *signalv1.StageEvidenceSummary) {
+				value.InvocationCount--
+				value.SuccessfulInvocations--
+			},
+		},
+		{
+			name: "excessive gap",
+			mutate: func(value *signalv1.StageEvidenceSummary) {
+				value.MaxStartGap = testDurationPointer(12 * time.Minute)
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			value := summary
+			tt.mutate(&value)
+
+			if err := validateStageEvidenceSummary(
+				&value,
+				0,
+				0,
+				signalv1.CheckStageRoleValidation,
+				&stage,
+				1,
+			); err == nil {
+				t.Fatal("invalid stage evidence was accepted")
+			}
+		})
+	}
+}
+
+func TestStageRunnerImageProvenanceRequiresPinnedPlannedImage(t *testing.T) {
+	t.Parallel()
+
+	image := pinnedImage("runner", "a")
+	driver := signalv1.CertificationTestDriver{
+		Type:      signalv1.TestDriverTypeContainer,
+		Container: &signalv1.ContainerTestDriver{Image: image},
+	}
+
+	got, err := stageRunnerImageProvenance(`["`+image+`"]`, driver)
+	if err != nil {
+		t.Fatalf("stageRunnerImageProvenance() error = %v", err)
+	}
+
+	if len(got) != 1 || got[0] != image {
+		t.Fatalf("runner images = %#v, want %q", got, image)
+	}
+
+	for _, value := range []string{
+		`[]`,
+		`["runner:latest"]`,
+		`["` + pinnedImage("other", "b") + `"]`,
+	} {
+		if _, err := stageRunnerImageProvenance(value, driver); err == nil {
+			t.Fatalf("stageRunnerImageProvenance(%s) unexpectedly succeeded", value)
+		}
+	}
+}
+
+func TestResolveStageParticipantRolesFreezesSelectedIndexes(t *testing.T) {
+	t.Parallel()
+
+	scheme := runtime.NewScheme()
+	if err := AddToScheme(scheme); err != nil {
+		t.Fatalf("add signal scheme: %v", err)
+	}
+
+	if err := corev1.AddToScheme(scheme); err != nil {
+		t.Fatalf("add core scheme: %v", err)
+	}
+
+	clientNode := &corev1.Node{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:   "client-node",
+			UID:    "client-node-uid",
+			Labels: map[string]string{"role": "client"},
+		},
+	}
+	serverNode := &corev1.Node{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:   "server-node",
+			UID:    "server-node-uid",
+			Labels: map[string]string{"role": "server"},
+		},
+	}
+	kube := fake.NewClientBuilder().WithScheme(scheme).WithObjects(clientNode, serverNode).Build()
+	reconciler := &AdmissionReconciler{Client: kube, APIReader: kube}
+	profile := &signalv1.CertificationProfile{
+		Spec: signalv1.CertificationProfileSpec{
+			ParticipantRoles: []signalv1.ProfileParticipantRole{
+				{
+					Role:     "client",
+					Count:    1,
+					Selector: metav1.LabelSelector{MatchLabels: map[string]string{"role": "client"}},
+				},
+				{
+					Role:     "server",
+					Count:    1,
+					Selector: metav1.LabelSelector{MatchLabels: map[string]string{"role": "server"}},
+				},
+			},
+		},
+	}
+	participants := []signalv1.Participant{
+		{NodeName: clientNode.Name, NodeUID: clientNode.UID},
+		{NodeName: serverNode.Name, NodeUID: serverNode.UID},
+	}
+	topology := signalv1.TestTopology{
+		MinParticipants: 2,
+		MaxParticipants: 2,
+		Roles: []signalv1.TestParticipantRole{
+			{Name: "client", MinCount: 1, MaxCount: 1},
+			{Name: "server", MinCount: 1, MaxCount: 1},
+		},
+	}
+	bindings := []signalv1.StageParticipantRoleBinding{
+		{Role: "client", Count: 1},
+		{Role: "server", Count: 1},
+	}
+
+	got, err := reconciler.resolveStageParticipantRoles(
+		context.Background(),
+		profile,
+		participants,
+		topology,
+		bindings,
+	)
+	if err != nil {
+		t.Fatalf("resolveStageParticipantRoles() error = %v", err)
+	}
+
+	if len(got) != 2 ||
+		!slices.Equal(got[0].ParticipantIndexes, []int32{0}) ||
+		!slices.Equal(got[1].ParticipantIndexes, []int32{1}) {
+		t.Fatalf("resolved role bindings = %#v", got)
+	}
+}
+
+func TestResolvePhasePlanEnforcesCertificationTestTrust(t *testing.T) {
+	t.Parallel()
+
+	for _, tt := range []struct {
+		name         string
+		trust        signalv1.CertificationTestTrustState
+		mutableInput bool
+		wantError    bool
+		wantQualify  bool
+	}{
+		{name: "approved", trust: signalv1.CertificationTestTrustApproved, wantQualify: true},
+		{name: "approved incomplete input", trust: signalv1.CertificationTestTrustApproved, mutableInput: true},
+		{name: "diagnostic", trust: signalv1.CertificationTestTrustDiagnostic},
+		{name: "rejected", trust: signalv1.CertificationTestTrustRejected, wantError: true},
+		{name: "revoked", trust: signalv1.CertificationTestTrustRevoked, wantError: true},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			scheme := runtime.NewScheme()
+			if err := AddToScheme(scheme); err != nil {
+				t.Fatalf("add signal scheme: %v", err)
+			}
+
+			contentDigest := "sha256:" + strings.Repeat("a", 64)
+			test := &signalv1.CertificationTest{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:       "generic-test",
+					UID:        "generic-test-uid",
+					Generation: 3,
+				},
+				Spec: signalv1.CertificationTestSpec{
+					DisplayName: "Generic test",
+					Owner:       "project-signal",
+					Version:     "1",
+					Metrics: []signalv1.TestMetricDefinition{{
+						Name:        "completed",
+						DisplayName: "Completed",
+						Type:        signalv1.MetricValueTypeBoolean,
+						Required:    true,
+					}},
+					Topology: signalv1.TestTopology{MinParticipants: 1, MaxParticipants: 1},
+					Driver: signalv1.CertificationTestDriver{
+						Type: signalv1.TestDriverTypeContainer,
+						Container: &signalv1.ContainerTestDriver{
+							Image: pinnedImage("test", "a"),
+						},
+					},
+				},
+				Status: signalv1.CertificationTestStatus{
+					ObservedGeneration: 3,
+					Trust: &signalv1.CertificationTestTrustStatus{
+						State:         tt.trust,
+						ContentDigest: contentDigest,
+					},
+				},
+			}
+			kube := fake.NewClientBuilder().WithScheme(scheme).WithObjects(test).Build()
+			reconciler := &AdmissionReconciler{Client: kube, APIReader: kube}
+
+			profile := &signalv1.CertificationProfile{
+				Spec: signalv1.CertificationProfileSpec{
+					Participants: signalv1.ParticipantPolicy{Count: 1},
+					Environment: &signalv1.CertificationEnvironmentBindings{
+						Namespace: "signal-system",
+					},
+				},
+			}
+			if tt.mutableInput {
+				profile.Spec.Environment.Resolvers = []signalv1.NamedEnvironmentReference{{
+					Name:      "model-resolver",
+					Reference: "resolver:mutable",
+				}}
+			}
+
+			suite := &signalv1.CertificationSuite{
+				Spec: signalv1.CertificationSuiteSpec{
+					Phases: []signalv1.CertificationPhase{{
+						Name: "validation",
+						Role: signalv1.CheckStageRoleValidation,
+						Stages: []signalv1.CertificationStage{{
+							Name: "generic",
+							Test: signalv1.CertificationTestReference{
+								Name:          test.Name,
+								UID:           test.UID,
+								Generation:    test.Generation,
+								ContentDigest: contentDigest,
+							},
+							Schedule: signalv1.StageSchedule{
+								Mode:              signalv1.CheckExecutionModeRunOnce,
+								InvocationTimeout: metav1.Duration{Duration: time.Minute},
+							},
+						}},
+					}},
+				},
+			}
+			participants := []signalv1.Participant{{
+				NodeName: "node",
+				NodeUID:  "node-uid",
+			}}
+
+			plan, err := reconciler.resolvePhasePlan(
+				context.Background(),
+				profile,
+				suite,
+				participants,
+			)
+			if tt.wantError {
+				if err == nil {
+					t.Fatal("resolvePhasePlan() unexpectedly accepted blocked trust state")
+				}
+
+				return
+			}
+
+			if err != nil {
+				t.Fatalf("resolvePhasePlan() error = %v", err)
+			}
+
+			stage := plan.Phases[0].Stages[0]
+			if stage.QualificationEligible != tt.wantQualify ||
+				stage.DiagnosticOnly == tt.wantQualify {
+				t.Fatalf(
+					"resolved eligibility = qualify %t, diagnostic %t",
+					stage.QualificationEligible,
+					stage.DiagnosticOnly,
+				)
+			}
+		})
+	}
+}
+
+func resolvedWorkflowTestRun() *signalv1.CertificationRun {
+	runOnce := signalv1.StageSchedule{
+		Mode:              signalv1.CheckExecutionModeRunOnce,
+		InvocationTimeout: metav1.Duration{Duration: 2 * time.Minute},
+	}
+	stage := func(name string, optional bool) signalv1.ResolvedStagePlan {
+		return signalv1.ResolvedStagePlan{
+			Name:     name,
+			Optional: optional,
+			Schedule: runOnce,
+		}
+	}
+
+	return &signalv1.CertificationRun{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "resolved-run",
+			Namespace: "signal-system",
+			UID:       "resolved-run-uid",
+		},
+		Spec: signalv1.CertificationRunSpec{
+			ResolvedPlan: &signalv1.ResolvedCertificationPlan{
+				Phases: []signalv1.ResolvedPhasePlan{
+					{
+						Name: "startup",
+						Role: signalv1.CheckStageRoleStartup,
+						Stages: []signalv1.ResolvedStagePlan{
+							stage("prepare", false),
+							stage("optional-observer", true),
+						},
+					},
+					{
+						Name:   "validation",
+						Role:   signalv1.CheckStageRoleValidation,
+						Stages: []signalv1.ResolvedStagePlan{stage("validate", false)},
+					},
+				},
+			},
+		},
+	}
+}
+
+func testDurationPointer(value time.Duration) *metav1.Duration {
+	return &metav1.Duration{Duration: value}
 }
 
 func TestValidateRunCheckPlanAssignsPositionalIdentity(t *testing.T) {
@@ -266,7 +745,7 @@ func TestSuiteSnapshotAndRunPinning(t *testing.T) {
 			Generation: 4,
 		},
 		Spec: signalv1.CertificationSuiteSpec{
-			ScriptBundle: signalv1.ScriptBundleSource{
+			ScriptBundle: &signalv1.ScriptBundleSource{
 				Name:   "suite-scripts",
 				Digest: bundleDigest,
 			},
@@ -307,7 +786,7 @@ func TestSuiteSnapshotAndRunPinning(t *testing.T) {
 
 	sourceScripts, err := reconciler.loadScriptBundle(
 		context.Background(),
-		resolvedSuite.Spec.ScriptBundle,
+		*resolvedSuite.Spec.ScriptBundle,
 		resolvedChecks,
 	)
 	if err != nil {

@@ -35,6 +35,7 @@ type config struct {
 	controllerImage   string
 	adapterImage      string
 	workflowDigest    string
+	resolverImages    []string
 	gateProtected     bool
 	metricsAddress    string
 	probeAddress      string
@@ -63,6 +64,12 @@ func main() {
 	cmd.Flags().StringVar(&cfg.controllerImage, "controller-image", "", "Digest-pinned controller image recorded in evidence")
 	cmd.Flags().StringVar(&cfg.adapterImage, "adapter-image", "", "Digest-pinned adapter image included in execution plans")
 	cmd.Flags().StringVar(&cfg.workflowDigest, "workflow-template-digest", "", "SHA-256 digest of rendered WorkflowTemplate semantics")
+	cmd.Flags().StringSliceVar(
+		&cfg.resolverImages,
+		"resolver-image",
+		nil,
+		"Digest-pinned resolver image included in phase-based execution plans; repeat for multiple resolvers",
+	)
 	cmd.Flags().BoolVar(
 		&cfg.gateProtected,
 		"qualification-gate-protected",
@@ -98,6 +105,12 @@ func run(ctx context.Context, cfg config) error {
 		cfg.workflowDigest,
 	); err != nil {
 		return err
+	}
+
+	for index, image := range cfg.resolverImages {
+		if !signalv1.IsDigestPinnedImage(image) {
+			return fmt.Errorf("resolver image %d must use an immutable sha256 digest", index)
+		}
 	}
 
 	scheme := runtime.NewScheme()
@@ -141,8 +154,10 @@ func run(ctx context.Context, cfg config) error {
 		Namespace:       cfg.namespace,
 		ScriptNamespace: cfg.scriptNamespace,
 		RunnerImage:     cfg.runnerImage,
+		ControllerImage: cfg.controllerImage,
 		AdapterImage:    cfg.adapterImage,
 		WorkflowDigest:  cfg.workflowDigest,
+		ResolverImages:  cfg.resolverImages,
 		Recorder:        mgr.GetEventRecorder(controllerName),
 	}
 	if err := admission.SetupWithManager(mgr); err != nil {

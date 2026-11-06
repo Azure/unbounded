@@ -68,8 +68,8 @@ func TestQualificationEvidenceRejectsEarlySuccessAndUnsupportedContinuity(t *tes
 		t.Fatalf("qualificationEvidenceIdentity() error = %v", err)
 	}
 
-	if identity == nil || verdict != "Inconclusive" ||
-		!strings.Contains(reason, "MinimumDurationNotMet") {
+	if identity != nil || verdict != "Inconclusive" ||
+		!strings.Contains(reason, "LegacyDurationSemanticsUnsupported") {
 		t.Fatalf("early success = identity %#v, verdict %q, reason %q", identity, verdict, reason)
 	}
 
@@ -1121,7 +1121,7 @@ func qualificationRun(
 				NodeName: node.Name,
 				NodeUID:  node.UID,
 			}},
-			ScriptBundle: signalv1.ScriptBundleReference{
+			ScriptBundle: &signalv1.ScriptBundleReference{
 				Name:   "scripts",
 				UID:    "scripts-uid",
 				Digest: "sha256:" + strings.Repeat("b", 64),
