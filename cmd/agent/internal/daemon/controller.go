@@ -31,10 +31,13 @@ import (
 type repaveReconciler struct {
 	installation *installstate.Store
 	client.Client
-	log          *slog.Logger
-	machineName  string
-	nodeName     string
-	nodeOperator nodeOperator
+	// apiReader reads the API server live for the allocation launch guard.
+	apiReader        client.Reader
+	allocationLaunch allocationLaunchOptions
+	log              *slog.Logger
+	machineName      string
+	nodeName         string
+	nodeOperator     nodeOperator
 }
 
 func runController(
@@ -81,6 +84,7 @@ func runController(
 		installation:         installation,
 		Client:               c,
 		apiReader:            mgr.GetAPIReader(),
+		allocationLaunch:     defaultAllocationLaunchOptions(),
 		log:                  log,
 		machineName:          machineName,
 		nodeOperator:         nodeOperator,
@@ -100,12 +104,14 @@ func runController(
 	}
 
 	repaveReconciler := &repaveReconciler{
-		installation: installation,
-		Client:       c,
-		log:          log,
-		machineName:  machineName,
-		nodeName:     nodeName,
-		nodeOperator: nodeOperator,
+		installation:     installation,
+		Client:           c,
+		apiReader:        mgr.GetAPIReader(),
+		allocationLaunch: defaultAllocationLaunchOptions(),
+		log:              log,
+		machineName:      machineName,
+		nodeName:         nodeName,
+		nodeOperator:     nodeOperator,
 	}
 
 	if err := daemon.SetupController(

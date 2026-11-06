@@ -16,6 +16,7 @@ import (
 
 	"github.com/stretchr/testify/require"
 
+	"github.com/Azure/unbounded/cmd/agent/internal/daemon"
 	"github.com/Azure/unbounded/cmd/agent/internal/installstate"
 	"github.com/Azure/unbounded/internal/provision"
 	"github.com/Azure/unbounded/pkg/agent/goalstates"
@@ -255,4 +256,15 @@ func TestClassifyNodeStartFailure(t *testing.T) {
 			require.Equal(t, tc.want, classifyNodeStartFailure(err))
 		})
 	}
+
+	t.Run("allocation launch refused", func(t *testing.T) {
+		t.Parallel()
+
+		err := fmt.Errorf("starting-node: %w", daemon.ErrAllocationLaunchRefused)
+		require.Equal(t, "AllocationLaunchRefused", classifyNodeStartFailure(err))
+
+		// The error decides, even when the message names a node-start task.
+		err = fmt.Errorf("start-kubelet: starting-node: %w", daemon.ErrAllocationLaunchRefused)
+		require.Equal(t, "AllocationLaunchRefused", classifyNodeStartFailure(err))
+	})
 }

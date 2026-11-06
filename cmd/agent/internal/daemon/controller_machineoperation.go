@@ -28,8 +28,10 @@ type machineOperationTarget struct {
 	client.Client
 	// apiReader reads from the API server rather than the cache. It is used
 	// where a stale cache could start a host reboot that must wait; see
-	// reconcileHostSoftReboot. Client is used when it is nil.
+	// reconcileHostSoftReboot. Client is used when it is nil. The allocation
+	// launch guard reads only through it, never through the cache.
 	apiReader            client.Reader
+	allocationLaunch     allocationLaunchOptions
 	log                  *slog.Logger
 	machineName          string
 	nodeOperator         nodeOperator
@@ -97,6 +99,16 @@ func (t *machineOperationTarget) reconcileNodeReboot(ctx context.Context, store 
 	active, err := t.nodeOperator.FindActiveMachine(t.log)
 	if err != nil {
 		return finishFailedMachineOperation(ctx, store, op, err)
+	}
+
+	// Checked live before the restart, so a refusal leaves the running node
+	// alone. The restarted machine's pre-start checks again.
+	if err := verifyAllocationMachine(ctx, t.log, t.apiReader, active.Config, t.allocationLaunch); err != nil {
+		return ctrl.Result{}, store.Finish(ctx, op, daemon.MachineOperationResult[int64]{
+			Phase:   v1alpha3.OperationPhaseFailed,
+			Reason:  AllocationLaunchRefusedReason,
+			Message: err.Error(),
+		})
 	}
 
 	if err := t.nodeOperator.RestartNode(ctx, t.log, active); err != nil {

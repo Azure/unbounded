@@ -45,6 +45,15 @@ const (
 	// Deprecated: use ResolveHostPaths.
 	DaemonRecoveryScriptPath = "/usr/local/bin/unbounded-agent-daemon-recovery.sh"
 
+	// NSpawnPreStartRefusedExitCode is the code the agent's nspawn pre-start
+	// exits with when the allocation launch guard refuses for good. The
+	// config-regeneration unit names it in RestartPreventExitStatus= so a
+	// refused start fails rather than loops. It must never be in
+	// SuccessExitStatus=: the nspawn machine would then start.
+	//
+	// 77 is EX_NOPERM.
+	NSpawnPreStartRefusedExitCode = 77
+
 	DaemonAgentUpgradeSignalPath = AgentConfigDir + "/agent-upgrade-signal"
 	DaemonAgentUpgradeLockPath   = "/run/unbounded-agent-upgrade.lock"
 

@@ -31,6 +31,10 @@ const (
 // +kubebuilder:printcolumn:name="Phase",type="string",JSONPath=".status.phase"
 // +kubebuilder:printcolumn:name="K8s Version",type="string",JSONPath=".spec.kubernetes.version"
 // +kubebuilder:printcolumn:name="Age",type="date",JSONPath=".metadata.creationTimestamp"
+// The allocationRef and fenced transition rules sit on the root, not on spec,
+// because a rule on the spec node is skipped when an update drops the whole spec.
+// +kubebuilder:validation:XValidation:rule="(has(self.spec) && has(self.spec.allocationRef)) == (has(oldSelf.spec) && has(oldSelf.spec.allocationRef)) && (!has(self.spec) || !has(self.spec.allocationRef) || self.spec.allocationRef == oldSelf.spec.allocationRef)",message="allocationRef is immutable",fieldPath=".spec.allocationRef"
+// +kubebuilder:validation:XValidation:rule="!has(oldSelf.spec) || !has(oldSelf.spec.fenced) || !oldSelf.spec.fenced || (has(self.spec) && has(self.spec.fenced) && self.spec.fenced)",message="fenced cannot be unset",fieldPath=".spec.fenced"
 
 // Machine represents a machine that can be managed by machina.
 type Machine struct {
@@ -112,6 +116,7 @@ const (
 // MachineSpec defines the desired state of a Machine.
 // +kubebuilder:validation:XValidation:rule="!has(oldSelf.provider) || (has(self.provider) && self.provider == oldSelf.provider)",message="provider is immutable once set"
 // +kubebuilder:validation:XValidation:rule="!has(self.host) || (!has(self.host.netboot) && !has(self.host.azure) && !has(self.host.external)) || (!has(self.pxe) && !has(self.provider) && !has(self.providerID))",message="host ownership cannot be combined with legacy pxe, provider, or providerID fields"
+// +kubebuilder:validation:XValidation:rule="!has(self.fenced) || !self.fenced || has(self.allocationRef)",message="fenced requires allocationRef"
 type MachineSpec struct {
 	// SSH contains the SSH connection and credential details for the
 	// machine.
@@ -160,6 +165,16 @@ type MachineSpec struct {
 	// controller.
 	// +optional
 	ConfigurationRef *MachineConfigurationRef `json:"configurationRef,omitempty"`
+
+	// AllocationRef identifies the MachineAllocation this Machine was
+	// created for. It can be set only when the Machine is created.
+	// +optional
+	AllocationRef *UIDReference `json:"allocationRef,omitempty"`
+
+	// Fenced forbids the agent from starting this Machine's node again. It
+	// can only change from false to true, and requires AllocationRef.
+	// +optional
+	Fenced bool `json:"fenced,omitempty"`
 }
 
 // ProviderMachineReference identifies a cluster-scoped provider-owned Machine
