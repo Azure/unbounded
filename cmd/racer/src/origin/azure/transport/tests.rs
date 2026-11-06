@@ -550,10 +550,54 @@ fn decoded_response_head_stays_charged_while_the_exchange_lives() {
     server.join().unwrap();
 }
 
-fn refused_address() -> std::net::SocketAddr {
-    // Bind then drop, so connects to this port are refused.
-    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-    listener.local_addr().unwrap()
+/// A loopback port that refuses connections for as long as this lives.
+struct Refused {
+    address: std::net::SocketAddr,
+    _socket: std::os::fd::OwnedFd,
+}
+
+/// Reserve a port with a bound but never listening socket, so connects are
+/// refused and no other socket can take the port while the test runs. A port
+/// bound and released instead could be reused by a concurrent test's
+/// listener, which would then accept the "dead" connect.
+fn refused_address() -> Refused {
+    use std::os::fd::FromRawFd;
+    // SAFETY: socket has no pointer arguments; the result is checked.
+    let fd = unsafe { libc::socket(libc::AF_INET, libc::SOCK_STREAM | libc::SOCK_CLOEXEC, 0) };
+    assert!(fd >= 0, "{}", std::io::Error::last_os_error());
+    // SAFETY: fd is a freshly created descriptor owned by nothing else.
+    let socket = unsafe { std::os::fd::OwnedFd::from_raw_fd(fd) };
+    let mut address = libc::sockaddr_in {
+        sin_family: libc::AF_INET as libc::sa_family_t,
+        sin_port: 0,
+        sin_addr: libc::in_addr {
+            s_addr: u32::from(std::net::Ipv4Addr::LOCALHOST).to_be(),
+        },
+        sin_zero: [0; 8],
+    };
+    let mut length = std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t;
+    // SAFETY: address is a valid sockaddr_in of the given length for both calls.
+    unsafe {
+        assert_eq!(
+            libc::bind(fd, (&raw const address).cast(), length),
+            0,
+            "{}",
+            std::io::Error::last_os_error()
+        );
+        assert_eq!(
+            libc::getsockname(fd, (&raw mut address).cast(), &mut length),
+            0,
+            "{}",
+            std::io::Error::last_os_error()
+        );
+    }
+    Refused {
+        address: std::net::SocketAddr::from((
+            std::net::Ipv4Addr::LOCALHOST,
+            u16::from_be(address.sin_port),
+        )),
+        _socket: socket,
+    }
 }
 
 #[test]
@@ -568,7 +612,8 @@ fn connect_failure_fails_over_to_the_next_resolved_address() {
     let (address, accepted, server) = serve(Some(identity.server.clone()), 1, move |head, _| {
         azure(head, &state)
     });
-    let dead = std::net::SocketAddr::new(address.ip(), refused_address().port());
+    let refused = refused_address();
+    let dead = std::net::SocketAddr::new(address.ip(), refused.address.port());
     let url = format!(
         "https://account.blob.example:{}/account/models",
         address.port()
@@ -596,13 +641,15 @@ fn connect_failure_fails_over_to_the_next_resolved_address() {
 fn connect_failure_on_every_address_is_reported() {
     let env = racer_io::Env::host();
     let Some(reactor) = reactor(&env) else { return };
-    let dead = refused_address();
+    let refused = refused_address();
+    let second = refused_address();
+    let dead = refused.address;
     let url = format!("http://account.blob.example:{}/account/models", dead.port());
     let f = fixture(
         reactor,
         &url,
         AzureCredential::Anonymous,
-        MapResolver::new(vec![dead, refused_address()]),
+        MapResolver::new(vec![dead, second.address]),
         TrustRoots::unavailable("/nonexistent/racer-bundle.pem".into()),
         AnonymousOnly,
     );
@@ -753,7 +800,8 @@ fn admission_wait_does_not_spend_an_address_attempt() {
     }));
     let state = blobs.clone();
     let (address, accepted, server) = serve(None, 2, move |head, _| azure(head, &state));
-    let dead = std::net::SocketAddr::new(address.ip(), refused_address().port());
+    let refused = refused_address();
+    let dead = std::net::SocketAddr::new(address.ip(), refused.address.port());
     let admission = reactor.admission().clone();
     // One connection per endpoint, so a second exchange waits for admission.
     let transport = PoolTransport::new(
