@@ -735,7 +735,14 @@ fn endpoints_for_unpublished_origins_are_dropped() {
 
 #[test]
 fn admission_wait_does_not_spend_an_address_attempt() {
-    let env = racer_io::Env::host();
+    // Request and checkout deadlines run on a virtual clock that only the
+    // freeing step below advances, so a slow host cannot reorder the
+    // narrowed checkout expiry, the slot release, and the request deadline.
+    let clock = racer_io::ctx::VirtualClock::new();
+    let env = racer_io::Env::new(
+        racer_io::Driver::Uring,
+        racer_io::WorkerCtx::simulated(&clock, 0, 0),
+    );
     let Some(reactor) = reactor(&env) else { return };
     let blobs = Arc::new(Mutex::new(Blobs {
         etag: "\"v1\"".into(),
@@ -769,7 +776,12 @@ fn admission_wait_does_not_spend_an_address_attempt() {
         ],
     };
     // The first exchange takes the healthy address and holds the only slot.
-    let scope = scope();
+    let scope = RequestScope::with_clock(
+        crate::model::RequestId([7; 16]),
+        clock.now() + Duration::from_secs(10),
+        env.ctx.clock.clone(),
+    )
+    .unwrap();
     let held = drive(&reactor, transport.exchange(&container, head(), &scope)).unwrap();
     let held = std::cell::RefCell::new(Some(held));
 
@@ -778,15 +790,16 @@ fn admission_wait_does_not_spend_an_address_attempt() {
     // frees after that. The wait must not spend an attempt, so the refused
     // connect still fails over to the healthy address.
     let mut scope = scope.clone();
-    let started = Instant::now();
+    let started = clock.now();
     scope.deadline.0 = started + Duration::from_secs(2);
     let release = started + Duration::from_millis(1300);
     let waiting = transport.exchange(&container, head(), &scope);
     let freeing = std::future::poll_fn(|_| {
-        if Instant::now() >= release {
+        if clock.now() >= release {
             drop(held.borrow_mut().take());
             std::task::Poll::Ready(())
         } else {
+            clock.advance(Duration::from_millis(1)).unwrap();
             std::task::Poll::Pending
         }
     });
@@ -800,7 +813,7 @@ fn admission_wait_does_not_spend_an_address_attempt() {
         Some(&b"5"[..])
     );
     exchange.finish().unwrap();
-    assert!(started.elapsed() >= Duration::from_millis(1300));
+    assert!(clock.now() - started >= Duration::from_millis(1300));
     assert_eq!(accepted.load(Ordering::SeqCst), 2);
     drop(transport);
     server.join().unwrap();
