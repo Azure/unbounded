@@ -697,9 +697,15 @@ impl<C: Charge> Drop for Allocation<C> {
         match self.release {
             Release::Heap => unsafe { dealloc(self.pointer.as_ptr(), self.layout) },
             #[cfg(all(target_os = "linux", not(miri)))]
-            Release::Mapping(length) => unsafe {
-                libc::munmap(self.pointer.as_ptr().cast(), length);
-            },
+            Release::Mapping(length) => {
+                let _result = unsafe { libc::munmap(self.pointer.as_ptr().cast(), length) };
+                #[cfg(test)]
+                buffer_tests::UNMAPS.with(|unmaps| {
+                    unmaps
+                        .borrow_mut()
+                        .push((self.pointer.as_ptr() as usize, length, _result));
+                });
+            }
         }
     }
 }
@@ -933,6 +939,13 @@ mod buffer_tests {
     use super::*;
     use std::cell::Cell;
 
+    #[cfg(all(target_os = "linux", not(miri)))]
+    thread_local! {
+        /// Address, length, and result of each mapping release on this thread.
+        pub(super) static UNMAPS: RefCell<Vec<(usize, usize, i32)>> =
+            const { RefCell::new(Vec::new()) };
+    }
+
     #[test]
     fn size_class_reuse_keeps_mismatches_and_full_capacity_charged() {
         let alignment = Alignment::new(4096, 1, 1).unwrap();
@@ -1007,19 +1020,18 @@ mod buffer_tests {
                 assert!((pointer as usize).is_multiple_of(HUGE_PAGE_BYTES));
             }
             buffer.as_mut_slice()[length - 1] = 0xa5;
+            UNMAPS.with(|unmaps| unmaps.borrow_mut().clear());
             drop(buffer);
+            // Record the release itself: probing the freed address races with
+            // other test threads that may map new memory there.
+            let unmaps = UNMAPS.with(|unmaps| std::mem::take(&mut *unmaps.borrow_mut()));
             if mapped {
-                let mut residency = 0u8;
-                // SAFETY: mincore queries a numeric address without dereferencing
-                // released storage; one output byte covers this one-page query.
-                assert_eq!(
-                    unsafe { libc::mincore(pointer.cast_mut().cast(), 1, &mut residency) },
-                    -1
-                );
-                assert_eq!(
-                    std::io::Error::last_os_error().raw_os_error(),
-                    Some(libc::ENOMEM)
-                );
+                // SAFETY: sysconf reads a process constant.
+                let page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) } as usize;
+                let rounded = length.next_multiple_of(page);
+                assert_eq!(unmaps, vec![(pointer as usize, rounded, 0)]);
+            } else {
+                assert!(unmaps.is_empty());
             }
         }
         let buffer = Alignment::new(2 * HUGE_PAGE_BYTES, 1, 1)
