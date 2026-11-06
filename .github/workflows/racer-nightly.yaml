@@ -1,0 +1,147 @@
+# Copyright (c) Microsoft Corporation.
+# SPDX-License-Identifier: Apache-2.0
+
+name: racer nightly
+
+# Long-running Racer verification that is too slow for every pull request:
+#
+# - fuzz: every libFuzzer parser target in cmd/racer/fuzz (`make racer-fuzz`)
+#   for FUZZ_SECONDS each, built with the pinned stable toolchain and
+#   RUSTC_BOOTSTRAP=1 (see cmd/racer/fuzz/README.md).
+# - dst: the deterministic simulation seed set widened to DST_SEEDS seeds per
+#   scenario (`make racer-dst`); every seed runs twice and must match.
+# - model-scale: the ignored large Model tests in
+#   cmd/racer/dst/tests/model_parity.rs (hot-page storm on a large pool, the
+#   2000-node cold start) and the per-node memory check at 5x10^4 nodes.
+on:
+  workflow_dispatch:
+    inputs:
+      fuzz_seconds:
+        description: Seconds per fuzz target
+        required: false
+        default: "600"
+      dst_seeds:
+        description: Seeds per DST scenario
+        required: false
+        default: "200"
+  schedule:
+    - cron: "41 3 * * *"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: racer-nightly-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  fuzz:
+    name: Racer Fuzz
+    runs-on: ubuntu-24.04
+    timeout-minutes: 150
+    env:
+      FUZZ_SECONDS: ${{ github.event.inputs.fuzz_seconds || '600' }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Set up pinned Rust
+        run: timeout --signal=TERM --kill-after=10s 300s rustup toolchain install 1.96.0 --profile minimal
+
+      - name: Cache Cargo dependencies and artifacts
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            ~/.cargo/bin/cargo-fuzz
+            cmd/racer/fuzz/target
+          key: racer-fuzz-${{ runner.os }}-${{ runner.arch }}-1.96.0-${{ hashFiles('cmd/racer/Cargo.lock', 'cmd/racer/fuzz/Cargo.lock', 'cmd/racer/**/Cargo.toml') }}-${{ github.sha }}
+          restore-keys: |
+            racer-fuzz-${{ runner.os }}-${{ runner.arch }}-1.96.0-${{ hashFiles('cmd/racer/Cargo.lock', 'cmd/racer/fuzz/Cargo.lock', 'cmd/racer/**/Cargo.toml') }}-
+
+      - name: Install cargo-fuzz
+        run: |
+          if ! cargo fuzz --version 2>/dev/null | grep -qx 'cargo-fuzz 0.13.2'; then
+            timeout --signal=TERM --kill-after=10s 900s cargo +1.96.0 install cargo-fuzz --version 0.13.2 --locked --force
+          fi
+
+      - name: Run fuzz targets
+        run: make racer-fuzz FUZZ_SECONDS="$FUZZ_SECONDS"
+
+      - name: Upload crash artifacts
+        if: failure()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: racer-fuzz-artifacts
+          path: cmd/racer/fuzz/artifacts
+          if-no-files-found: ignore
+
+  dst:
+    name: Racer DST
+    runs-on: ubuntu-24.04
+    timeout-minutes: 150
+    env:
+      CARGO_TARGET_DIR: ${{ github.workspace }}/bin/racer-cargo
+      DST_SEEDS: ${{ github.event.inputs.dst_seeds || '200' }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Set up pinned Rust
+        run: timeout --signal=TERM --kill-after=10s 300s rustup toolchain install 1.96.0 --profile minimal
+
+      - name: Cache Cargo dependencies and artifacts
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            bin/racer-cargo
+          key: racer-nightly-dst-${{ runner.os }}-${{ runner.arch }}-1.96.0-${{ hashFiles('cmd/racer/Cargo.lock', 'cmd/racer/**/Cargo.toml') }}-${{ github.sha }}
+          restore-keys: |
+            racer-nightly-dst-${{ runner.os }}-${{ runner.arch }}-1.96.0-${{ hashFiles('cmd/racer/Cargo.lock', 'cmd/racer/**/Cargo.toml') }}-
+
+      - name: Run DST seed set
+        run: make racer-dst DST_SEEDS="$DST_SEEDS" RACER_DST_TIMEOUT=7800s
+
+  model-scale:
+    name: Racer Model Scale
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    env:
+      CARGO_TARGET_DIR: ${{ github.workspace }}/bin/racer-cargo
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Set up pinned Rust
+        run: timeout --signal=TERM --kill-after=10s 300s rustup toolchain install 1.96.0 --profile minimal
+
+      - name: Cache Cargo dependencies and artifacts
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            bin/racer-cargo
+          key: racer-nightly-model-${{ runner.os }}-${{ runner.arch }}-1.96.0-${{ hashFiles('cmd/racer/Cargo.lock', 'cmd/racer/**/Cargo.toml') }}-${{ github.sha }}
+          restore-keys: |
+            racer-nightly-model-${{ runner.os }}-${{ runner.arch }}-1.96.0-${{ hashFiles('cmd/racer/Cargo.lock', 'cmd/racer/**/Cargo.toml') }}-
+
+      - name: Large Model scenarios
+        run: >-
+          timeout --signal=TERM --kill-after=10s 2400s
+          cargo +1.96.0 test --release --locked --manifest-path cmd/racer/Cargo.toml -p racer-dst --test model_parity
+          -- --ignored --exact --nocapture
+          mesh_hot_page_storm_stays_bounded_on_a_large_pool cold_start_2000
+
+      # Run alone: the test reads the process peak RSS.
+      - name: Model memory per node at 5x10^4 nodes
+        env:
+          MODEL_NODES: "50000"
+        run: >-
+          timeout --signal=TERM --kill-after=10s 2400s
+          cargo +1.96.0 test --release --locked --manifest-path cmd/racer/Cargo.toml -p racer-dst --test model_parity
+          -- --ignored --exact --nocapture --test-threads=1
+          model_memory_per_node
