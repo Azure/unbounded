@@ -100,3 +100,16 @@ data:
                     resources:
                       limits:
                         memory: 128Mi
+
+  kube-proxy.yaml: |
+    apiVersion: overrides.unbounded-cloud.io/v1alpha1
+    # The managed kube-proxy DaemonSets are created by the net controller, not
+    # the operator, so no patch can reach them. Their image is set here instead
+    # and passed to the controller as --managed-kube-proxy-image.
+    #
+    # Without a tag or digest, the image takes the tag kube-system/kube-proxy
+    # runs, or the API server's version when that DaemonSet does not exist.
+    # Add one, for example :v1.34.2, to pin it.
+    images:
+      kubeProxy:
+        image: myregistry.example.com/kube-proxy

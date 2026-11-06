@@ -109,18 +109,54 @@ CIDR and runs only on nodes labeled for that Site and for unbounded-managed
 kube-proxy.
 
 The image setting defaults to an empty string. When it is empty, the controller
-reuses the image from the `kube-system/kube-proxy` DaemonSet. If that DaemonSet
-does not exist, it uses `registry.k8s.io/kube-proxy:<server version>`.
+copies a versioned image from the `kube-system/kube-proxy` DaemonSet as-is,
+including any digest. An unversioned provider image supplies only the registry
+and repository. Without a provider image, the final fallback repository is
+`registry.k8s.io/kube-proxy`.
 
 Set `controller.managedKubeProxy.image` to override the image for all
 unbounded-managed kube-proxy DaemonSets, for example when pulling kube-proxy
-through a private registry. Set `controller.managedKubeProxy.enabled` to `false`
-to disable their creation.
+through a private registry. It takes one of two forms:
+
+- A reference with a tag or digest, such as
+  `myregistry.example.com/kube-proxy:v1.34.2`, is used as-is.
+- A reference without one, such as `myregistry.example.com/kube-proxy`, takes
+  the tag of the image `kube-system/kube-proxy` runs, so a mirror of the
+  provider's kube-proxy keeps the provider's version. Only the tag carries over,
+  not its digest. If there is no provider tag, the controller searches the
+  selected repository as described below. A registry port, as in
+  `localhost:5000/kube-proxy`, is not a tag.
+
+When the version is still missing, the controller uses the API server's
+major.minor.patch version to search that repository's tags. It selects the
+highest numeric `-N` maintenance suffix for that exact version: for a `1.36.2`
+cluster, `v1.36.2-2` wins over `v1.36.2-1` and `v1.36.2`. If no maintenance tag
+exists, it uses the exact matching tag. Other patch/minor versions, prereleases
+such as `rc` or `beta`, and architecture-specific suffixes are not candidates.
+Explicit and provider-supplied versions are not changed or searched for newer
+maintenance tags. The controller never chooses `latest` as an automatic fallback;
+an explicitly supplied `:latest` reference is still used as-is.
+
+Provider discovery stops immediately on NotFound. Other read errors get ten
+additional attempts at ten-second intervals before fallback version selection.
+Registry searches use anonymous access and have a 30-second total timeout. A
+private registry that requires credentials for tag listing needs an explicit
+version or a provider tag. Failure to discover a valid API server version,
+complete the tag listing, or find a matching tag prevents the managed kube-proxy
+controller from starting instead of selecting an unverified image.
+
+The controller works out the image once, when it starts. When the operator
+manages unbounded-net, the image can also be set through the operator's
+overrides ConfigMap, which validates it before anything is written and takes
+precedence over this setting. See
+[Overriding the managed kube-proxy image]({{< relref "reference/workload-overrides#overriding-the-managed-kube-proxy-image" >}}).
+
+Set `controller.managedKubeProxy.enabled` to `false` to disable their creation.
 
 | Flag | Runtime setting | Default | Description |
 |------|-----------------|---------|-------------|
 | `--managed-kube-proxy` | `controller.managedKubeProxy.enabled` | `true` | Create kube-proxy DaemonSets for unbounded-managed Site nodes not covered by provider kube-proxy. |
-| `--managed-kube-proxy-image` | `controller.managedKubeProxy.image` | `""` | Override the kube-proxy image used by unbounded-managed DaemonSets. |
+| `--managed-kube-proxy-image` | `controller.managedKubeProxy.image` | `""` | Override the kube-proxy image used by unbounded-managed DaemonSets. Without a tag or digest, inherit the provider tag or search the selected registry for the server version's highest numeric maintenance suffix. |
 
 ### Leader Election
 
