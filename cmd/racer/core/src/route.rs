@@ -289,10 +289,12 @@ pub fn exchange_evidence(
             socket_failure,
         } => (
             (socket_failure && !admitted).then_some(LinkOutcome::Refused),
-            match fault {
-                Fault::Overloaded => Outcome::LocalPressure,
-                _ => Outcome::Neutral,
-            },
+            // A local Overloaded is a refused worker quota (ciphertext,
+            // request context, receive window). Those quotas already reject
+            // fast and recover by reclaim, and they are per worker, so halving
+            // the node-wide peer limit would throttle every worker for one
+            // worker's budget and take minutes to recover.
+            Outcome::Neutral,
             (!socket_failure && matches!(fault, Fault::DeadlineExceeded | Fault::Canceled))
                 .then_some(false),
         ),
@@ -665,9 +667,10 @@ mod tests {
             exchange_evidence(Exchange::Complete { overloaded: false }, false).1,
             A::Verified
         ));
+        // Local quota refusals do not shrink node-wide peer admission.
         assert!(matches!(
             exchange_evidence(failed(Fault::Overloaded, false), false).1,
-            A::LocalPressure
+            A::Neutral
         ));
         assert!(matches!(
             exchange_evidence(Exchange::Streaming, false).1,
