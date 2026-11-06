@@ -41,20 +41,29 @@ impl UringDriver {
     /// Build a ring with `sq` submission and `2 * sq` completion entries,
     /// probing `SINGLE_ISSUER` and `SUBMIT_ALL` and falling back when the
     /// kernel rejects them.
+    ///
+    /// The kernel charges ring memory to `RLIMIT_MEMLOCK` for unprivileged
+    /// users, and the limit is shared by every ring the user holds. When
+    /// setup fails with `ENOMEM` the ring is halved, down to
+    /// [`MIN_FALLBACK_SQ`]: a full SQ is flushed before the next push and
+    /// the kernel keeps overflowing completions, so a smaller ring only
+    /// costs extra submissions.
     pub(crate) fn new(sq: u32) -> Result<Self> {
-        let cq = sq.checked_mul(2).ok_or(Error::InvalidConfiguration)?;
+        sq.checked_mul(2).ok_or(Error::InvalidConfiguration)?;
         let mut used = 0;
-        let ring = probe_ring(|flags| {
-            used = flags;
-            let mut builder = IoUring::builder();
-            builder.setup_cqsize(cq);
-            if flags & SETUP_SUBMIT_ALL != 0 {
-                builder.setup_submit_all();
-            }
-            if flags & SETUP_SINGLE_ISSUER != 0 {
-                builder.setup_single_issuer();
-            }
-            builder.build(sq)
+        let ring = shrink_ring(sq, |sq| {
+            probe_ring(|flags| {
+                used = flags;
+                let mut builder = IoUring::builder();
+                builder.setup_cqsize(sq * 2);
+                if flags & SETUP_SUBMIT_ALL != 0 {
+                    builder.setup_submit_all();
+                }
+                if flags & SETUP_SINGLE_ISSUER != 0 {
+                    builder.setup_single_issuer();
+                }
+                builder.build(sq)
+            })
         })
         .map_err(Error::from_io)?;
         let ext_arg = ring.params().is_feature_ext_arg();
@@ -174,6 +183,26 @@ fn probe_ring<T>(mut build: impl FnMut(u32) -> std::io::Result<T>) -> std::io::R
     unreachable!("the baseline setup returns its result")
 }
 
+/// Smallest SQ [`shrink_ring`] falls back to under memory pressure.
+const MIN_FALLBACK_SQ: u32 = 64;
+
+/// Build with `sq` entries, halving on `ENOMEM` until it succeeds, fails
+/// otherwise, or reaches [`MIN_FALLBACK_SQ`] (or `sq`, if smaller).
+fn shrink_ring<T>(
+    mut sq: u32,
+    mut build: impl FnMut(u32) -> std::io::Result<T>,
+) -> std::io::Result<T> {
+    let floor = sq.min(MIN_FALLBACK_SQ);
+    loop {
+        match build(sq) {
+            Err(error) if error.raw_os_error() == Some(libc::ENOMEM) && sq > floor => {
+                sq = (sq / 2).max(floor);
+            }
+            result => return result,
+        }
+    }
+}
+
 /// Skip empty submissions only for known interrupt-driven modes.
 fn submission_required(setup_flags: u32, empty: bool, cq_overflow: bool, taskrun: bool) -> bool {
     setup_flags & !SETUP_NORMAL != 0 || !empty || cq_overflow || taskrun
@@ -215,6 +244,45 @@ mod tests {
         let result: std::io::Result<u32> =
             probe_ring(|_| Err(std::io::Error::from_raw_os_error(libc::ENOMEM)));
         assert_eq!(result.unwrap_err().raw_os_error(), Some(libc::ENOMEM));
+    }
+
+    #[test]
+    fn ring_shrinks_only_on_enomem() {
+        let enomem = || std::io::Error::from_raw_os_error(libc::ENOMEM);
+        let mut tried = Vec::new();
+        let result = shrink_ring(1024, |sq| {
+            tried.push(sq);
+            if sq <= 256 { Ok(sq) } else { Err(enomem()) }
+        });
+        assert_eq!(result.unwrap(), 256);
+        assert_eq!(tried, [1024, 512, 256]);
+
+        // Stops at the floor and reports the last error.
+        tried.clear();
+        let result: std::io::Result<u32> = shrink_ring(300, |sq| {
+            tried.push(sq);
+            Err(enomem())
+        });
+        assert_eq!(result.unwrap_err().raw_os_error(), Some(libc::ENOMEM));
+        assert_eq!(tried, [300, 150, 75, 64]);
+
+        // A ring already below the floor is tried once.
+        tried.clear();
+        let result: std::io::Result<u32> = shrink_ring(8, |sq| {
+            tried.push(sq);
+            Err(enomem())
+        });
+        assert!(result.is_err());
+        assert_eq!(tried, [8]);
+
+        // Other errors are not retried.
+        tried.clear();
+        let result: std::io::Result<u32> = shrink_ring(1024, |sq| {
+            tried.push(sq);
+            Err(std::io::Error::from_raw_os_error(libc::EPERM))
+        });
+        assert_eq!(result.unwrap_err().raw_os_error(), Some(libc::EPERM));
+        assert_eq!(tried, [1024]);
     }
 
     #[test]
