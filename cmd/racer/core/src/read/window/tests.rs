@@ -268,32 +268,108 @@ fn without_a_lease_or_in_passthrough_and_sealed_modes_nothing_is_selected() {
     }
 }
 
+/// The fill restart number and its backoff, from the fetch for page 0.
+fn retry_of(effects: &[Effect]) -> Option<(EffectId, u8)> {
+    effects.iter().find_map(|e| match e {
+        Effect::Fetch {
+            page: 0, id, retry, ..
+        } => Some((*id, *retry)),
+        _ => None,
+    })
+}
+
 #[test]
-fn transient_failures_retry_up_to_the_page_limit() {
+fn unavailable_retries_up_to_the_page_limit_with_backoff() {
     let mut h = Harness::new(config(1, 1));
     let effects = h.pump();
     h.miss_all(&effects);
     for round in 0..=PAGE_RETRIES {
         let effects = h.pump();
-        let [(0, id)] = fetches(&effects)[..] else {
+        let Some((id, retry)) = retry_of(&effects) else {
             panic!("round {round}: {effects:?}");
         };
+        // Every restart reports how many came before it, for the backoff.
+        assert_eq!(retry, round, "round {round}");
+        h.on(Input::Fetched {
+            id,
+            result: Err(Error::Unavailable),
+        });
+    }
+    assert_eq!(h.kinds(), [SlotKind::Failed]);
+    assert!(h.pump().is_empty());
+    assert!(matches!(h.next().0, Next::Fail(Error::Unavailable)));
+}
+
+/// Local pressure waits for other reads to release memory: it backs off and
+/// retries past the `Unavailable` cap, and still counts toward the backoff.
+#[test]
+fn local_pressure_retries_without_the_page_limit() {
+    let mut h = Harness::new(config(1, 1));
+    let effects = h.pump();
+    h.miss_all(&effects);
+    let rounds = 4 * u16::from(PAGE_RETRIES);
+    for round in 0..rounds {
+        let (id, retry) = retry_of(&h.pump()).expect("restarted");
+        assert_eq!(u16::from(retry), round.min(255));
         let error = if round % 2 == 0 {
             Error::Overloaded
         } else {
-            Error::Unavailable
+            Error::FlightFull
         };
         h.on(Input::Fetched {
             id,
             result: Err(error),
         });
+        assert_eq!(h.kinds(), [SlotKind::Missing { select: false }]);
     }
+    // `Unavailable` keeps its own full allowance after local pressure.
+    for _ in 0..PAGE_RETRIES {
+        let (id, _) = retry_of(&h.pump()).expect("restarted");
+        h.on(Input::Fetched {
+            id,
+            result: Err(Error::Unavailable),
+        });
+        assert_eq!(h.kinds(), [SlotKind::Missing { select: false }]);
+    }
+    let (id, _) = retry_of(&h.pump()).expect("restarted");
+    h.on(Input::Fetched {
+        id,
+        result: Err(Error::Unavailable),
+    });
     assert_eq!(h.kinds(), [SlotKind::Failed]);
-    assert!(h.pump().is_empty());
-    assert!(matches!(
-        h.next().0,
-        Next::Fail(Error::Overloaded | Error::Unavailable)
-    ));
+}
+
+/// A dead scope ends local-pressure retries at once.
+#[test]
+fn local_pressure_does_not_retry_after_the_scope_ends() {
+    let mut h = Harness::new(config(1, 1));
+    let effects = h.pump();
+    h.miss_all(&effects);
+    let (id, retry) = retry_of(&h.pump()).expect("fetched");
+    assert_eq!(retry, 0);
+    h.on_scope(
+        Input::Fetched {
+            id,
+            result: Err(Error::Overloaded),
+        },
+        false,
+    );
+    assert_eq!(h.kinds(), [SlotKind::Failed]);
+    assert!(matches!(h.next().0, Next::Fail(Error::Overloaded)));
+}
+
+#[test]
+fn retry_delay_doubles_from_the_minimum_to_the_cap() {
+    assert_eq!(retry_delay(0), Duration::ZERO);
+    assert_eq!(retry_delay(1), RETRY_DELAY_MIN);
+    assert_eq!(retry_delay(2), 2 * RETRY_DELAY_MIN);
+    assert_eq!(retry_delay(3), 4 * RETRY_DELAY_MIN);
+    assert_eq!(retry_delay(8), RETRY_DELAY_MAX.min(128 * RETRY_DELAY_MIN));
+    assert_eq!(retry_delay(9), RETRY_DELAY_MAX);
+    assert_eq!(retry_delay(u8::MAX), RETRY_DELAY_MAX);
+    for retry in 1..u8::MAX {
+        assert!(retry_delay(retry) <= retry_delay(retry + 1));
+    }
 }
 
 #[test]

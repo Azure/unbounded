@@ -21,10 +21,27 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::ops::Range;
 use std::time::{Duration, Instant};
 
-/// Restarts of one page's direct fill after transient failures (`Overloaded`, `Unavailable`).
-/// Each restart gets a fresh page budget ([`PageBudget::next_page`]), so this bounds total attempts
-/// per page.
+/// Restarts of one page's direct fill after `Unavailable`. Each restart gets a fresh page budget
+/// ([`PageBudget::next_page`]), so this bounds those attempts per page. Local pressure
+/// (`Overloaded`, `FlightFull`) resolves as other reads release memory and flight slots, so it is
+/// retried without this cap, after a [`retry_delay`] backoff, until the read's scope ends.
 pub const PAGE_RETRIES: u8 = 16;
+
+/// First retry backoff of a page fill; each later retry doubles it up to [`RETRY_DELAY_MAX`].
+pub const RETRY_DELAY_MIN: Duration = Duration::from_millis(2);
+
+/// Largest retry backoff of a page fill.
+pub const RETRY_DELAY_MAX: Duration = Duration::from_millis(250);
+
+/// Backoff before the `retry`th restart of a page fill; zero for the first attempt.
+pub fn retry_delay(retry: u8) -> Duration {
+    match retry {
+        0 => Duration::ZERO,
+        retry => RETRY_DELAY_MIN
+            .saturating_mul(1 << u32::from(retry - 1).min(16))
+            .min(RETRY_DELAY_MAX),
+    }
+}
 
 /// Spill work (hold plus spill fill) a read keeps in flight.
 pub const SPILL_FILLS: usize = 2;
@@ -117,6 +134,9 @@ pub enum Effect {
         page: u64,
         budget: AcquisitionBudgetSpec,
         sealed: bool,
+        /// Restarts of this page's fill so far; the interpreter waits
+        /// [`retry_delay`] of it before starting the fill.
+        retry: u8,
     },
     /// Select `pages` (as `intervals`) from a provider; answer [`Input::Selected`].
     Select {
@@ -255,7 +275,8 @@ pub struct ReadWindow {
     next: u64,
     slots: VecDeque<Slot>,
     selections: BTreeMap<EffectId, BTreeSet<u64>>,
-    retries: BTreeMap<u64, u8>,
+    /// Per page: `Unavailable` restarts (capped by [`PAGE_RETRIES`]) and all restarts.
+    retries: BTreeMap<u64, (u8, u8)>,
     spill: Option<Spill>,
     /// Spill fills moved into a probe; their completion is ignored.
     moved: BTreeSet<EffectId>,
@@ -524,6 +545,7 @@ impl ReadWindow {
                 page,
                 budget,
                 sealed: self.config.sealed,
+                retry: self.retries.get(&page).map_or(0, |&(_, all)| all),
             });
         }
         self.plan = plan;
@@ -657,8 +679,8 @@ impl ReadWindow {
                         sealed: kind == Fetched::Sealed,
                     },
                     // Sealed fills share the plaintext retry policy.
-                    Err(Error::Overloaded | Error::FlightFull | Error::Unavailable)
-                        if scope_live && self.retry_page(number) =>
+                    Err(error @ (Error::Overloaded | Error::FlightFull | Error::Unavailable))
+                        if scope_live && self.retry_page(number, error == Error::Unavailable) =>
                     {
                         Slot::Missing { select: false }
                     }
@@ -695,15 +717,19 @@ impl ReadWindow {
         }
     }
 
-    /// Count one restart of `number`'s fill; false once its retries are spent.
-    fn retry_page(&mut self, number: u64) -> bool {
+    /// Count one restart of `number`'s fill; false once its `capped` retries are spent.
+    /// Uncapped (local pressure) restarts only grow the backoff.
+    fn retry_page(&mut self, number: u64, capped: bool) -> bool {
         let next = self.next;
         self.retries.retain(|page, _| *page >= next);
-        let count = self.retries.entry(number).or_insert(0);
-        if *count >= PAGE_RETRIES {
-            return false;
+        let (count, all) = self.retries.entry(number).or_insert((0, 0));
+        if capped {
+            if *count >= PAGE_RETRIES {
+                return false;
+            }
+            *count += 1;
         }
-        *count += 1;
+        *all = all.saturating_add(1);
         true
     }
 

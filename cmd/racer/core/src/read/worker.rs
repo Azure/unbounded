@@ -1081,6 +1081,8 @@ impl<T: Types> WorkerCore<T> {
                 page,
                 budget,
                 sealed,
+                // The modeled flight joins at once; the dataplane applies the backoff.
+                retry: _,
             } = effect
             else {
                 out.push(Effect::Window { window, effect });
