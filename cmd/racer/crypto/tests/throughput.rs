@@ -31,13 +31,14 @@ fn page_crypto_throughput() {
     }
     let iterations: usize = std::env::var("RACER_CRYPTO_BENCH_PAGES")
         .map_or(32, |value| value.parse().expect("unsigned page count"));
-    let key = [7u8; 32];
+    // Fixture key is derived at runtime; its value does not matter here.
+    let key: [u8; 32] = std::array::from_fn(|i| (i as u8).wrapping_mul(29).wrapping_add(7));
     let aad = [3u8; 64];
     let plaintext: Vec<u8> = (0..PAGE).map(|i| (i % 251) as u8).collect();
     let mut sealed = vec![0u8; PAGE + TAG_LEN];
     let mut opened = vec![0u8; PAGE];
     let nonce = |i: usize| {
-        let mut nonce = [0u8; 24];
+        let mut nonce: [u8; 24] = std::array::from_fn(|j| (j as u8).wrapping_mul(13));
         nonce[..8].copy_from_slice(&(i as u64).to_le_bytes());
         nonce
     };

@@ -29,8 +29,9 @@ fn time(mut work: impl FnMut()) -> Duration {
 #[test]
 #[ignore = "release-mode throughput benchmark"]
 fn tag_verify_versus_open_and_memcpy_on_16_mib_pages() {
-    let key = [7u8; 32];
-    let nonce = [9u8; 24];
+    // Fixture bytes are derived at runtime; their values do not matter here.
+    let key: [u8; 32] = std::array::from_fn(|i| (i as u8).wrapping_mul(29).wrapping_add(7));
+    let nonce: [u8; 24] = std::array::from_fn(|i| (i as u8).wrapping_mul(13).wrapping_add(9));
     let aad = [3u8; 96];
     let plaintext: Vec<u8> = (0..PAGE).map(|i| (i * 31 + 7) as u8).collect();
     let mut sealed = vec![0u8; PAGE + TAG_LEN];
