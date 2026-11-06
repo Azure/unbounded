@@ -3668,6 +3668,39 @@ mod adaptive {
         assert!(matches!(owner.acquire(&node), Err(Error::Overloaded)));
         drop(held);
     }
+    /// A collapsed node limit recovers by verified completions, about one slot
+    /// per round trip, without waiting for the recovery interval.
+    #[test]
+    fn collapsed_limit_recovers_with_completions_not_wall_time() {
+        let clock = racer_io::SimClock::new(781);
+        let sim_ctx = clock.ctx(0);
+        let metrics = Metrics::default();
+        let owner = AdaptivePeers::new(
+            Config {
+                total: 512,
+                per_peer: 512,
+                ..Default::default()
+            },
+            metrics.clone(),
+            sim_ctx.clock.clone(),
+        )
+        .unwrap();
+        let node = NodeId("a".into());
+        // Collapse 512 to 8 with rate-limited pressure halvings.
+        let permit = owner.acquire(&node).unwrap();
+        for _ in 0..6 {
+            clock.advance(BACKOFF);
+            permit.observe(Outcome::LocalPressure);
+        }
+        drop(permit);
+        assert_eq!(metrics.gauge(Gauge::PeerAdmissionLimit), 8);
+        // Sum of 8..512 completions restores the full limit with time frozen.
+        let completions: usize = (8..512).sum();
+        for _ in 0..completions {
+            owner.acquire(&node).unwrap().observe(Outcome::Verified);
+        }
+        assert_eq!(metrics.gauge(Gauge::PeerAdmissionLimit), 512);
+    }
     #[test]
     fn state_capacity_never_evicts_live_permits_and_ages_retired_entries() {
         let clock = racer_io::SimClock::new(780);

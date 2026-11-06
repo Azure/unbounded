@@ -52,7 +52,9 @@ pub struct Config {
     /// A retry beyond the clock's range keeps the peer circuit open indefinitely.
     pub backoff: Duration,
 
-    /// Minimum interval between one-slot verified-success recoveries.
+    /// Longest interval between one-slot verified-success recoveries. A limit
+    /// also recovers one slot per `limit` verified completions since its last
+    /// change, about one per round trip, so recovery scales with throughput.
     pub recovery: Duration,
 
     /// Minimum idle age before an eligible peer record can be replaced.
@@ -134,6 +136,9 @@ struct State<K> {
 
     limit: usize,
 
+    /// Verified completions since the limit last changed.
+    credit: usize,
+
     updated: Instant,
 
     peers: BTreeMap<K, Peer>,
@@ -151,6 +156,9 @@ struct Peer {
     retry: Option<Deadline>,
 
     probe: bool,
+
+    /// Verified completions since the limit last changed.
+    credit: usize,
 
     updated: Instant,
 
@@ -193,6 +201,7 @@ impl<K: Ord + Clone, O: Observer> Adaptive<K, O> {
             state: Mutex::new(State {
                 active: 0,
                 limit: config.total,
+                credit: 0,
                 updated,
                 peers: BTreeMap::new(),
             }),
@@ -261,6 +270,7 @@ impl<K: Ord + Clone, O: Observer> Adaptive<K, O> {
             generation: Some(0),
             retry: None,
             probe: false,
+            credit: 0,
             updated: now,
             idle_since: None,
         });
@@ -310,18 +320,26 @@ impl<K: Ord + Clone, O: Observer> Permit<K, O> {
                 .event_on(self.shard, Event::LocalPressure);
             if now.saturating_duration_since(state.updated) >= config.backoff {
                 state.limit = (state.limit / 2).max(1);
+                state.credit = 0;
                 state.updated = now;
                 self.owner.observer.limit(state.limit);
             }
             return;
         }
-        if outcome == Outcome::Verified
-            && state.limit < config.total
-            && now.saturating_duration_since(state.updated) >= config.recovery
-        {
-            state.limit = state.limit.saturating_add(1).min(config.total);
-            state.updated = now;
-            self.owner.observer.limit(state.limit);
+        if outcome == Outcome::Verified && state.limit < config.total {
+            state.credit = state.credit.saturating_add(1);
+            if recovers(
+                state.credit,
+                state.limit,
+                state.updated,
+                now,
+                config.recovery,
+            ) {
+                state.limit = state.limit.saturating_add(1).min(config.total);
+                state.credit = 0;
+                state.updated = now;
+                self.owner.observer.limit(state.limit);
+            }
         }
         let peer = state
             .peers
@@ -340,6 +358,7 @@ impl<K: Ord + Clone, O: Observer> Permit<K, O> {
         match outcome {
             Outcome::PeerFailure => {
                 peer.limit = (peer.limit / 2).max(1);
+                peer.credit = 0;
                 peer.generation = self.generation.checked_add(1);
                 peer.retry = Some(Deadline::after(now, config.backoff));
                 peer.updated = now;
@@ -349,14 +368,31 @@ impl<K: Ord + Clone, O: Observer> Permit<K, O> {
                     return;
                 }
                 peer.retry = None;
-                if now.saturating_duration_since(peer.updated) >= config.recovery {
+                if peer.limit >= config.per_key {
+                    return;
+                }
+                peer.credit = peer.credit.saturating_add(1);
+                if recovers(peer.credit, peer.limit, peer.updated, now, config.recovery) {
                     peer.limit = peer.limit.saturating_add(1).min(config.per_key);
+                    peer.credit = 0;
                     peer.updated = now;
                 }
             }
             Outcome::LocalPressure | Outcome::Neutral => {}
         }
     }
+}
+
+/// Additive increase: one slot per `limit` verified completions (about one per
+/// round trip, as in TCP congestion avoidance) or after `recovery` elapses.
+fn recovers(
+    credit: usize,
+    limit: usize,
+    updated: Instant,
+    now: Instant,
+    recovery: Duration,
+) -> bool {
+    credit >= limit || now.saturating_duration_since(updated) >= recovery
 }
 
 impl<K: Ord + Clone, O: Observer> Drop for Permit<K, O> {
@@ -2249,6 +2285,57 @@ mod tests {
                 ]
             );
         }
+    }
+
+    /// With a frozen clock, a reduced limit recovers one slot per `limit`
+    /// verified completions, for both the total and per-key limits.
+    #[test]
+    fn verified_completions_recover_one_slot_per_limit() {
+        fn now() -> Instant {
+            static NOW: OnceLock<Instant> = OnceLock::new();
+            *NOW.get_or_init(Instant::now)
+        }
+
+        let config = Config {
+            total: 64,
+            per_key: 32,
+            ..config()
+        };
+        let owner = Adaptive::new(config, Counts::default(), now).unwrap();
+        let work = owner.acquire(&1).unwrap();
+        {
+            let mut state = owner.state.lock().unwrap();
+            state.limit = 4;
+            state.updated = now();
+            let peer = state.peers.get_mut(&1).unwrap();
+            peer.limit = 2;
+            peer.updated = now();
+        }
+        for _ in 0..3 {
+            work.observe(Outcome::Verified);
+        }
+        assert_eq!(owner.state.lock().unwrap().limit, 4);
+        work.observe(Outcome::Verified);
+        assert_eq!(*owner.observer.limit.lock().unwrap(), 5);
+        assert_eq!(owner.state.lock().unwrap().peers[&1].limit, 3);
+        // Credit restarts at each change: five more completions add one slot.
+        for _ in 0..4 {
+            work.observe(Outcome::Verified);
+        }
+        assert_eq!(owner.state.lock().unwrap().limit, 5);
+        work.observe(Outcome::Verified);
+        assert_eq!(owner.state.lock().unwrap().limit, 6);
+        // Each limit stops at its ceiling.
+        for _ in 0..10_000 {
+            work.observe(Outcome::Verified);
+        }
+        assert_eq!(owner.state.lock().unwrap().limit, config.total);
+        assert_eq!(owner.state.lock().unwrap().peers[&1].limit, config.per_key);
+        // A reduction discards accumulated credit.
+        owner.state.lock().unwrap().updated = now() - config.backoff;
+        work.observe(Outcome::LocalPressure);
+        assert_eq!(owner.state.lock().unwrap().limit, config.total / 2);
+        assert_eq!(owner.state.lock().unwrap().credit, 0);
     }
 
     /// Restoring the final slot still starts backoff and rate-limits pressure.

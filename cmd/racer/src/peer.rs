@@ -110,8 +110,9 @@ impl Drop for PageTiming<'_> {
 pub struct Config {
     pub total: usize,
     pub per_peer: usize,
-    /// Least time between one-slot recoveries of a reduced limit after
-    /// verified successes.
+    /// Longest time between one-slot recoveries of a reduced limit after
+    /// verified successes. A limit also recovers one slot per `limit`
+    /// verified completions, about one per round trip.
     pub recovery: Duration,
 }
 impl Default for Config {
