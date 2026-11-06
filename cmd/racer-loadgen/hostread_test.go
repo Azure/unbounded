@@ -13,6 +13,7 @@ import (
 
 	"github.com/prometheus/client_golang/prometheus/testutil"
 	"github.com/stretchr/testify/require"
+	"golang.org/x/sys/unix"
 
 	"github.com/Azure/unbounded/pkg/racersdk"
 )
@@ -237,6 +238,12 @@ func TestMemfdPool(t *testing.T) {
 	require.Same(t, m, again, "a free memfd is reused")
 	require.EqualValues(t, 4096, again.size)
 	require.Nil(t, again.mapping, "growing drops the stale mapping")
+
+	seals, err := unix.FcntlInt(again.file.Fd(), unix.F_GET_SEALS, 0)
+	require.NoError(t, err)
+	require.NotZero(t, seals&unix.F_SEAL_SHRINK, "sealed against shrinking")
+	require.Zero(t, seals&unix.F_SEAL_WRITE, "still writable")
+	require.Error(t, again.file.Truncate(1), "cannot shrink")
 
 	other, err := pool.get(1)
 	require.NoError(t, err)

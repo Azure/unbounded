@@ -34,7 +34,8 @@ var _ hostReader = (*racersdk.Client)(nil)
 
 // memfd is one reusable destination. Its pages are allocated by the loadgen
 // with fallocate, so they are charged to this process's memory cgroup rather
-// than the dataplane's, and stay populated across pulls.
+// than the dataplane's, and stay populated across pulls. It is sealed against
+// shrinking, so Racer may decrypt into a mapping of it.
 type memfd struct {
 	file *os.File
 	size int64
@@ -127,9 +128,16 @@ func (p *memfdPool) get(size int64) (*memfd, error) {
 	p.mu.Unlock()
 
 	if m == nil {
-		fd, err := unix.MemfdCreate("racer-loadgen", unix.MFD_CLOEXEC)
+		fd, err := unix.MemfdCreate("racer-loadgen", unix.MFD_CLOEXEC|unix.MFD_ALLOW_SEALING)
 		if err != nil {
 			return nil, fmt.Errorf("create memfd: %w", err)
+		}
+
+		// A memfd that cannot shrink lets Racer map it and decrypt pages
+		// straight into it. The file can still grow.
+		if _, err := unix.FcntlInt(uintptr(fd), unix.F_ADD_SEALS, unix.F_SEAL_SHRINK); err != nil {
+			_ = unix.Close(fd)
+			return nil, fmt.Errorf("seal memfd: %w", err)
 		}
 
 		m = &memfd{file: os.NewFile(uintptr(fd), "racer-loadgen-memfd")}
