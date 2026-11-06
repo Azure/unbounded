@@ -253,6 +253,7 @@ func TestPrepareInstallsVersionWritesUnitsAndDoesNotActivate(t *testing.T) {
 // umask 027. The umask is process-wide, so this test is not parallel.
 func TestPrepareLeavesLocalDNSPathsTraversableUnderARestrictiveUmask(t *testing.T) {
 	old := syscall.Umask(0o027)
+
 	t.Cleanup(func() { syscall.Umask(old) })
 
 	f := newFixture(t, true, nil)
