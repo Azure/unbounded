@@ -257,6 +257,28 @@ impl Checkpointer {
         slot: usize,
         budget: usize,
     ) -> Result<Operation<'static, ()>> {
+        let publish = self.publish_changed_async(
+            cluster, shards, reactor, scope, sequence, slot, budget, None,
+        )?;
+        Ok(Box::pin(async move { publish.await.map(drop) }))
+    }
+
+    /// [`Self::publish_async`] that skips all I/O when the encoded cut, ignoring
+    /// its sequence, matches `previous`. Resolves to the cut's [`fingerprint`]
+    /// when written and `None` when skipped, so an idle node does not rewrite
+    /// an identical checkpoint every period.
+    #[allow(clippy::too_many_arguments)]
+    pub fn publish_changed_async(
+        &self,
+        cluster: ClusterId,
+        shards: Vec<ShardImage>,
+        reactor: Rc<crate::runtime::Reactor>,
+        scope: crate::runtime::RequestScope,
+        sequence: u64,
+        slot: usize,
+        budget: usize,
+        previous: Option<[u8; DIGEST_BYTES]>,
+    ) -> Result<Operation<'static, Option<[u8; DIGEST_BYTES]>>> {
         // Bound simultaneous decoded image, encoding and submission scratch.
         let estimated = snapshot_image_bytes(&shards)?;
         if estimated > budget / 2 {
@@ -275,6 +297,10 @@ impl Checkpointer {
             if bytes.len() > budget / 2 {
                 return Err(Error::Overloaded);
             }
+            let current = fingerprint(&bytes)?;
+            if previous == Some(current) {
+                return Ok(None);
+            }
             reactor
                 .run(
                     &scope,
@@ -291,9 +317,23 @@ impl Checkpointer {
                     |_: &racer_io::Operation<'static, Published>| None,
                 )
                 .await?
-                .map_err(Into::into)
+                .map_err(Into::<Error>::into)?;
+            Ok(Some(current))
         }))
     }
+}
+
+/// Sequence-independent digest of an encoded checkpoint: SHA-256 over the
+/// header without its sequence field, and the body without its trailing digest.
+/// Two cuts with equal fingerprints recover identically.
+pub(crate) fn fingerprint(bytes: &[u8]) -> Result<[u8; DIGEST_BYTES]> {
+    if bytes.len() < HEADER_BYTES + DIGEST_BYTES {
+        return Err(Error::CorruptRecord);
+    }
+    let mut hasher = Sha256::new();
+    hasher.update(&bytes[..16]);
+    hasher.update(&bytes[24..bytes.len() - DIGEST_BYTES]);
+    Ok(hasher.finalize().into())
 }
 
 impl Drop for Checkpointer {

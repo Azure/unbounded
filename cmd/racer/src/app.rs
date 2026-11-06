@@ -1052,7 +1052,7 @@ pub struct WorkerApplication {
     writer_task: Option<Operation<'static, ()>>,
 
     /// Successful I/O returns its reserved slot instead of toggling shared state blindly.
-    checkpoint_task: Option<Operation<'static, recovery::Publication>>,
+    checkpoint_task: Option<Operation<'static, recovery::PeriodicOutcome>>,
 
     checkpoint_snapshot: Option<Operation<'static, ShardImage>>,
 

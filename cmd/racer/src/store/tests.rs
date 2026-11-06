@@ -1836,6 +1836,60 @@ fn incremental_checkpoint_budget_thaws_and_async_publication_roundtrips() {
     assert!(tail > 200 * 1024 * 1024);
 }
 
+/// An unchanged periodic cut is not rewritten; any change is.
+#[test]
+fn changed_publication_skips_identical_cuts_regardless_of_sequence() {
+    let env = racer_io::Env::host();
+    let f = Fixture::new(&env);
+    let _ = drive(&f.reactor, f.store.open()).unwrap();
+    f.enqueue(f.copy(1, 4096)).unwrap();
+    drive(&f.reactor, f.store.writer.progress(8, &scope(&env))).unwrap();
+    let path = f._directory.0.join("checkpoint.1");
+    let publish = |sequence: u64, previous: Option<[u8; 32]>| {
+        let shard = drive(
+            &f.reactor,
+            f.store.checkpoint.snapshot_incremental(1024 * 1024),
+        )
+        .unwrap();
+        let task = f
+            .store
+            .checkpoint
+            .publish_changed_async(
+                crate::store::checkpoint::test_cluster(),
+                vec![shard],
+                f.reactor.clone(),
+                scope(&env),
+                sequence,
+                1,
+                1024 * 1024,
+                previous,
+            )
+            .unwrap();
+        let written = drive(&f.reactor, task).unwrap();
+        f.store.checkpoint.finish_snapshot();
+        written
+    };
+    let first = publish(7, None).expect("first cut is written");
+    let image = super::checkpoint::decode(&std::fs::read(&path).unwrap()).unwrap();
+    assert_eq!(image.sequence, 7);
+    // Same content under a new sequence: no I/O, the old file stays.
+    std::fs::remove_file(&path).unwrap();
+    assert_eq!(publish(8, Some(first)), None);
+    assert!(!path.exists());
+    // A stale fingerprint forces the write.
+    let mut stale = first;
+    stale[0] ^= 1;
+    assert_eq!(publish(9, Some(stale)), Some(first));
+    assert!(path.exists());
+    // New content changes the fingerprint and is written.
+    f.enqueue(f.copy(2, 4096)).unwrap();
+    drive(&f.reactor, f.store.writer.progress(8, &scope(&env))).unwrap();
+    let changed = publish(10, Some(first)).expect("changed cut is written");
+    assert_ne!(changed, first);
+    let image = super::checkpoint::decode(&std::fs::read(&path).unwrap()).unwrap();
+    assert_eq!(image.sequence, 10);
+}
+
 #[test]
 fn checkpoint_preflights_segment_metadata_and_page_clones() {
     let env = racer_io::Env::host();

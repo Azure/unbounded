@@ -27,6 +27,10 @@ pub(super) struct CheckpointCut {
 
     /// Last successful slot, or the initial periodic slot-selection baseline.
     last_slot: usize,
+
+    /// Fingerprint of the last periodic cut this process wrote, if any. An
+    /// identical cut is not rewritten.
+    last_fingerprint: Option<[u8; 32]>,
 }
 
 /// Publication ownership survives its result until every worker acknowledges it.
@@ -41,6 +45,10 @@ enum CutPhase {
 
     Published(Result<()>),
 }
+
+/// A periodic publication and the fingerprint it wrote, or `None` when the cut
+/// matched the previous one and no I/O was issued.
+pub(super) type PeriodicOutcome = (Publication, Option<[u8; 32]>);
 
 /// The two callers deliberately choose different slots for their first cold cut.
 #[derive(Clone, Copy)]
@@ -120,7 +128,27 @@ impl CheckpointCut {
             return Err(Error::Unavailable);
         }
         self.last_slot = publication.slot;
+        // Only a periodic write records its fingerprint, after this returns.
+        self.last_fingerprint = None;
         Ok(())
+    }
+
+    /// Settle a periodic reservation: record a written cut's fingerprint and
+    /// slot, or release an unwritten reservation so slot alternation is unchanged.
+    fn settled(&mut self, (publication, written): PeriodicOutcome) -> Result<()> {
+        match written {
+            Some(fingerprint) => {
+                self.published(publication)?;
+                self.last_fingerprint = Some(fingerprint);
+                Ok(())
+            }
+            // No byte of this sequence reached disk, so reusing it is safe.
+            None if publication.sequence == self.last_sequence => {
+                self.last_sequence -= 1;
+                Ok(())
+            }
+            None => Err(Error::Unavailable),
+        }
     }
 
     /// Start a new periodic collection after the caller checks timing and acknowledgments.
@@ -282,7 +310,7 @@ impl WorkerApplication {
                 .periodic_checkpoint
                 .lock()
                 .map_err(|_| Error::Unavailable)?;
-            let result = result.and_then(|publication| cut.published(publication));
+            let result = result.and_then(|outcome| cut.settled(outcome));
             cut.finish(result);
         }
         let mut cut = node
@@ -353,6 +381,7 @@ impl WorkerApplication {
             && !cut.publication_started()
         {
             let shards = cut.start_publication();
+            let previous = cut.last_fingerprint;
             let publication = match cut.reserve(CheckpointPolicy::Periodic) {
                 Ok(publication) => publication,
                 Err(error) => {
@@ -361,7 +390,7 @@ impl WorkerApplication {
                 }
             };
             drop(cut);
-            match self.store.checkpoint.publish_async(
+            match self.store.checkpoint.publish_changed_async(
                 self.keys.cluster().clone(),
                 shards,
                 self.runtime.reactor.clone(),
@@ -369,13 +398,16 @@ impl WorkerApplication {
                 publication.sequence,
                 publication.slot,
                 self.checkpoint_budget,
+                previous,
             ) {
                 Ok(task) => {
                     let metrics = self.telemetry.metrics.clone();
                     self.checkpoint_task = Some(Box::pin(async move {
-                        task.await?;
-                        metrics.set_gauge(Gauge::CheckpointSequence, publication.sequence);
-                        Ok(publication)
+                        let written = task.await?;
+                        if written.is_some() {
+                            metrics.set_gauge(Gauge::CheckpointSequence, publication.sequence);
+                        }
+                        Ok((publication, written))
                     }));
                 }
                 Err(error) => node
@@ -662,6 +694,45 @@ mod tests {
     use crate::store::checkpoint::CHECKPOINT_VERSION;
     use page_alloc::Alignment;
     use page_alloc::Segments;
+
+    /// A written periodic cut records its fingerprint; a skipped one releases
+    /// its reservation without moving the slot.
+    #[test]
+    fn periodic_settlement_records_written_cuts_and_releases_skipped_ones() {
+        let mut cut = CheckpointCut {
+            last_sequence: 9,
+            last_slot: 1,
+            ..Default::default()
+        };
+        let publication = cut.reserve(CheckpointPolicy::Periodic).unwrap();
+        cut.settled((publication, Some([3; 32]))).unwrap();
+        assert_eq!((cut.last_sequence, cut.last_slot), (10, 0));
+        assert_eq!(cut.last_fingerprint, Some([3; 32]));
+        let publication = cut.reserve(CheckpointPolicy::Periodic).unwrap();
+        assert_eq!(publication.slot, 1);
+        cut.settled((publication, None)).unwrap();
+        assert_eq!((cut.last_sequence, cut.last_slot), (10, 0));
+        assert_eq!(cut.last_fingerprint, Some([3; 32]));
+        // The next write reuses the released sequence and the same slot.
+        let publication = cut.reserve(CheckpointPolicy::Periodic).unwrap();
+        assert_eq!(
+            publication,
+            Publication {
+                sequence: 11,
+                slot: 1
+            }
+        );
+        // A stale skipped reservation cannot roll back a newer one.
+        let stale = Publication {
+            sequence: 10,
+            slot: 1,
+        };
+        assert_eq!(cut.settled((stale, None)), Err(Error::Unavailable));
+        assert_eq!(cut.last_sequence, 11);
+        // Shutdown publication invalidates the periodic fingerprint.
+        cut.published(publication).unwrap();
+        assert_eq!(cut.last_fingerprint, None);
+    }
 
     /// Cold cuts keep their distinct slot policy; later cuts alternate after success.
     #[test]
