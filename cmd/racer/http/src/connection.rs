@@ -16,7 +16,7 @@ use std::{
     task::{Poll, Waker},
     time::{Duration, Instant},
 };
-use zeroize::{Zeroize, Zeroizing};
+use zeroize::Zeroize;
 
 /// A result using the caller's connection error type.
 pub type Result<C, T> = std::result::Result<T, <C as Context>::Error>;
@@ -886,11 +886,9 @@ impl<C: Context> HttpIo<C> {
             if let StartLine::Request { method, .. } = &head.start {
                 connection.request_is_head = method == "HEAD";
             }
-            let encoded = Zeroizing::new(self.codec.encode_head(&head)?);
-            let mut buffer = self.buffer(encoded.len())?;
-            buffer.bytes.copy_from_slice(&encoded);
-            let length_encoded = encoded.len();
-            drop(encoded);
+            let length_encoded = self.codec.encoded_head_len(&head)?;
+            let mut buffer = self.buffer(length_encoded)?;
+            self.codec.encode_head_into(&head, &mut buffer.bytes)?;
             drop(scratch);
             let completed = self
                 .send_owned(

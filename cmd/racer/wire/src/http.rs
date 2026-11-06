@@ -266,6 +266,16 @@ impl<O: Opaque> Codec<O> {
     ///
     /// Size errors are checked before syntax errors, without allocating output.
     pub fn encode_head(&self, head: &MessageHead) -> Result<Vec<u8>> {
+        let length = self.encoded_head_len(head)?;
+        let mut bytes = vec![0; length];
+        Self::write_head(head, &mut bytes);
+        Ok(bytes)
+    }
+
+    /// Validate a head and return its exact encoded length, without allocating.
+    ///
+    /// Size errors are checked before syntax errors, as in [`Self::encode_head`].
+    pub fn encoded_head_len(&self, head: &MessageHead) -> Result<usize> {
         let start_length = match &head.start {
             StartLine::Request { method, target } => method
                 .len()
@@ -288,20 +298,53 @@ impl<O: Opaque> Codec<O> {
             return Err(Error::HeadTooLarge);
         }
         self.validate(head)?;
-        let start = match &head.start {
-            StartLine::Request { method, target } => format!("{method} {target} HTTP/1.1\r\n"),
-            StartLine::Response { status } => format!("HTTP/1.1 {status:03} \r\n"),
-        };
-        let mut bytes = Vec::with_capacity(length);
-        bytes.extend_from_slice(start.as_bytes());
-        for h in &head.headers {
-            bytes.extend_from_slice(h.name.as_bytes());
-            bytes.extend_from_slice(b": ");
-            bytes.extend_from_slice(&h.value);
-            bytes.extend_from_slice(b"\r\n");
+        Ok(length)
+    }
+
+    /// Encode a validated head into `out`, whose length must be exactly
+    /// [`Self::encoded_head_len`] for the same head.
+    pub fn encode_head_into(&self, head: &MessageHead, out: &mut [u8]) -> Result<()> {
+        if out.len() != self.encoded_head_len(head)? {
+            return Err(Error::HeadTooLarge);
         }
-        bytes.extend_from_slice(b"\r\n");
-        Ok(bytes)
+        Self::write_head(head, out);
+        Ok(())
+    }
+
+    /// Write an already validated head; `out` has its exact encoded length.
+    fn write_head(head: &MessageHead, out: &mut [u8]) {
+        let mut at = 0;
+        let mut put = |bytes: &[u8]| {
+            out[at..at + bytes.len()].copy_from_slice(bytes);
+            at += bytes.len();
+        };
+        match &head.start {
+            StartLine::Request { method, target } => {
+                put(method.as_bytes());
+                put(b" ");
+                put(target.as_bytes());
+                put(b" HTTP/1.1\r\n");
+            }
+            StartLine::Response { status } => {
+                // Validation bounds the status to 100..=599: three digits.
+                let digits = [
+                    b'0' + (status / 100 % 10) as u8,
+                    b'0' + (status / 10 % 10) as u8,
+                    b'0' + (status % 10) as u8,
+                ];
+                put(b"HTTP/1.1 ");
+                put(&digits);
+                put(b" \r\n");
+            }
+        }
+        for h in &head.headers {
+            put(h.name.as_bytes());
+            put(b": ");
+            put(&h.value);
+            put(b"\r\n");
+        }
+        put(b"\r\n");
+        debug_assert_eq!(at, out.len());
     }
 
     /// Check owned syntax, opaque edges, and supported framing in that order.
@@ -809,6 +852,49 @@ mod tests {
                 Err(Error::HeadTooLarge)
             ));
         }
+    }
+
+    /// Encoding into a caller buffer matches the allocating encoder exactly.
+    #[test]
+    fn encode_head_into_matches_encode_head_and_checks_length() {
+        let codec = TestCodec::new(1024);
+        let mut heads = vec![MessageHead {
+            start: StartLine::Request {
+                method: "GET".into(),
+                target: "/a?b=c".into(),
+            },
+            headers: vec![
+                Header::new("Host", b"x"),
+                Header::new("X-Opaque", b"a\tb\x80"),
+                Header::new("Empty", b""),
+            ],
+        }];
+        for status in [100, 200, 404, 599] {
+            heads.push(MessageHead {
+                start: StartLine::Response { status },
+                headers: vec![Header::new("Content-Length", b"0")],
+            });
+        }
+        for head in &heads {
+            let expected = codec.encode_head(head).unwrap();
+            assert_eq!(codec.encoded_head_len(head).unwrap(), expected.len());
+            let mut out = vec![0xaa; expected.len()];
+            codec.encode_head_into(head, &mut out).unwrap();
+            assert_eq!(out, expected);
+            let mut short = vec![0; expected.len() - 1];
+            assert!(codec.encode_head_into(head, &mut short).is_err());
+        }
+        assert_eq!(
+            codec.encode_head(&heads[1]).unwrap(),
+            b"HTTP/1.1 100 \r\nContent-Length: 0\r\n\r\n"
+        );
+        let mut invalid = MessageHead {
+            start: StartLine::Response { status: 600 },
+            headers: Vec::new(),
+        };
+        assert!(codec.encoded_head_len(&invalid).is_err());
+        invalid.start = StartLine::Response { status: 99 };
+        assert!(codec.encode_head_into(&invalid, &mut [0; 17]).is_err());
     }
 
     /// Every fragment boundary retains ordinary field bytes and duplicate ordering.
