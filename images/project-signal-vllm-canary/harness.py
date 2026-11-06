@@ -6,6 +6,7 @@ import argparse
 import base64
 import hashlib
 import json
+import math
 import os
 import re
 import signal
@@ -425,6 +426,11 @@ def utc_now():
     return datetime.now(timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z")
 
 
+def monotonic_duration(duration):
+    milliseconds = math.floor(max(duration, 0) * 1000)
+    return f"{milliseconds / 1000:.3f}s"
+
+
 def build_envelope(args, test, resolved_inputs, participants, roles, result):
     participant = participants[0]
     role = roles.get("0") or roles.get(0) or "primary"
@@ -441,7 +447,7 @@ def build_envelope(args, test, resolved_inputs, participants, roles, result):
         "resolvedInputs": resolved_inputs,
         "startedAt": result["startedAt"],
         "finishedAt": result["finishedAt"],
-        "monotonicDuration": f"{max(result['duration'], 0):.3f}s",
+        "monotonicDuration": monotonic_duration(result["duration"]),
         "outcome": outcome,
         "reasonCode": result["reasonCode"],
         "message": bounded_message(result["message"]),

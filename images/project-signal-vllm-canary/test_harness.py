@@ -12,6 +12,10 @@ import harness
 
 
 class HarnessTest(unittest.TestCase):
+    def test_monotonic_duration_never_rounds_above_timestamp_window(self):
+        self.assertEqual(harness.monotonic_duration(0.010999), "0.010s")
+        self.assertEqual(harness.monotonic_duration(-1), "0.000s")
+
     def test_prompt_fixture_digest_is_canonical(self):
         self.assertEqual(
             harness.sha256_text(harness.canonical_json(harness.PROMPT_FIXTURE)),

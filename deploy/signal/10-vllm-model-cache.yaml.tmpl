@@ -17,6 +17,9 @@
 {{- if empty .VLLMModelCacheCapacity }}
 {{- fail "VLLMModelCacheCapacity is required when cache seeding is enabled" }}
 {{- end }}
+{{- if empty .VLLMModelCacheStorageClass }}
+{{- fail "VLLMModelCacheStorageClass is required when cache seeding is enabled" }}
+{{- end }}
 apiVersion: v1
 kind: PersistentVolumeClaim
 metadata:
@@ -29,10 +32,8 @@ metadata:
     signal.unbounded-cloud.io/model-manifest-digest: {{ .VLLMModelCacheManifestDigest }}
     signal.unbounded-cloud.io/model-revision: e93a9faa9c77e5d09219f6c868bfc7a1bd65593c
 spec:
-  accessModes: [ReadWriteOnce]
-  {{- if not (empty .VLLMModelCacheStorageClass) }}
+  accessModes: [ReadWriteMany]
   storageClassName: {{ .VLLMModelCacheStorageClass }}
-  {{- end }}
   resources:
     requests:
       storage: {{ .VLLMModelCacheCapacity }}

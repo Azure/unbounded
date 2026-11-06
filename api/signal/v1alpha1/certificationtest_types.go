@@ -189,9 +189,9 @@ const (
 	ScriptLanguagePython ScriptLanguage = "Python"
 )
 
-// +kubebuilder:validation:XValidation:rule="!has(self.resources.limits) || size(self.resources.limits) <= 16",message="script resource limits must not exceed 16 entries"
-// +kubebuilder:validation:XValidation:rule="!has(self.resources.requests) || size(self.resources.requests) <= 16",message="script resource requests must not exceed 16 entries"
-// +kubebuilder:validation:XValidation:rule="!has(self.resources.claims) || size(self.resources.claims) <= 16",message="script resource claims must not exceed 16 entries"
+// +kubebuilder:validation:XValidation:rule="!has(self.resources) || !has(self.resources.limits) || size(self.resources.limits) <= 16",message="script resource limits must not exceed 16 entries"
+// +kubebuilder:validation:XValidation:rule="!has(self.resources) || !has(self.resources.requests) || size(self.resources.requests) <= 16",message="script resource requests must not exceed 16 entries"
+// +kubebuilder:validation:XValidation:rule="!has(self.resources) || !has(self.resources.claims) || size(self.resources.claims) <= 16",message="script resource claims must not exceed 16 entries"
 type ScriptTestDriver struct {
 	Language ScriptLanguage          `json:"language"`
 	Source   ImmutableArtifactSource `json:"source"`

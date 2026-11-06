@@ -488,6 +488,44 @@ func TestResourceCELAllowsResourcesOmitted(t *testing.T) {
 		}
 	})
 
+	t.Run("CertificationTest script", func(t *testing.T) {
+		t.Parallel()
+
+		crd := readCRD(t, "signal.unbounded-cloud.io_certificationtests.yaml")
+		object := map[string]any{
+			"apiVersion": GroupVersion.String(),
+			"kind":       "CertificationTest",
+			"metadata": map[string]any{
+				"name": "minimal",
+			},
+			"spec": map[string]any{
+				"topology": map[string]any{
+					"minParticipants": int64(1),
+					"maxParticipants": int64(1),
+				},
+				"driver": map[string]any{
+					"type": "Script",
+					"script": map[string]any{
+						"language": "Shell",
+						"source": map[string]any{
+							"type": "ConfigMap",
+							"configMap": map[string]any{
+								"name":   "scripts",
+								"key":    "check.sh",
+								"digest": "sha256:" + strings.Repeat("a", 64),
+							},
+						},
+						"runnerImage": fixtureImageA,
+					},
+				},
+			},
+		}
+
+		if errors := validateCRDCEL(t, crd, object); len(errors) != 0 {
+			t.Fatalf("server-equivalent CEL rejected Script driver without resources: %v", errors.ToAggregate())
+		}
+	})
+
 	t.Run("CertificationRun environment", func(t *testing.T) {
 		t.Parallel()
 
@@ -498,6 +536,35 @@ func TestResourceCELAllowsResourcesOmitted(t *testing.T) {
 
 		if errors := validateCRDCEL(t, crd, object); len(errors) != 0 {
 			t.Fatalf("server-equivalent CEL rejected resolved environment without resources: %v", errors.ToAggregate())
+		}
+	})
+
+	t.Run("CertificationRun script", func(t *testing.T) {
+		t.Parallel()
+
+		crd := readCRD(t, "signal.unbounded-cloud.io_certificationruns.yaml")
+		_, _, run := genericVLLMContractFixture(t)
+		object := unstructuredObject(t, run)
+		stages := object["spec"].(map[string]any)["resolvedPlan"].(map[string]any)["phases"].([]any)[0].(map[string]any)["stages"].([]any)
+		stage := stages[0].(map[string]any)
+		stage["test"].(map[string]any)["driver"] = map[string]any{
+			"type": "Script",
+			"script": map[string]any{
+				"language": "Shell",
+				"source": map[string]any{
+					"type": "ConfigMap",
+					"configMap": map[string]any{
+						"name":   "scripts",
+						"key":    "check.sh",
+						"digest": "sha256:" + strings.Repeat("a", 64),
+					},
+				},
+				"runnerImage": fixtureImageA,
+			},
+		}
+
+		if errors := validateCRDCEL(t, crd, object); len(errors) != 0 {
+			t.Fatalf("server-equivalent CEL rejected resolved Script driver without resources: %v", errors.ToAggregate())
 		}
 	})
 }

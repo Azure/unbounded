@@ -424,6 +424,7 @@ func TestRenderedVLLMModelCacheSeedsVerifiedOfflinePVC(t *testing.T) {
 		"vLLM model cache",
 		"kind: PersistentVolumeClaim",
 		"name: approved-model-cache",
+		"accessModes: [ReadWriteMany]",
 		"storageClassName: approved-storage",
 		"kind: Job",
 		"serviceAccountName: project-signal-vllm-cache-seeder",
@@ -447,6 +448,7 @@ func TestVLLMModelCacheSeedFailsClosedWithoutImmutableInputs(t *testing.T) {
 		{name: "mutable image", key: "VLLMModelCacheImage", value: "example.invalid/cache:latest"},
 		{name: "unsafe subpath", key: "VLLMModelCacheSubPath", value: "../model"},
 		{name: "missing capacity", key: "VLLMModelCacheCapacity", value: ""},
+		{name: "missing storage class", key: "VLLMModelCacheStorageClass", value: ""},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
@@ -461,6 +463,7 @@ func TestVLLMModelCacheSeedFailsClosedWithoutImmutableInputs(t *testing.T) {
 			data["VLLMModelCacheImage"] = "example.invalid/vllm-cache@sha256:" + strings.Repeat("9", 64)
 			data["VLLMModelCacheSeedID"] = "52b9b0fa1a8a"
 			data["VLLMModelCacheCapacity"] = "1Gi"
+			data["VLLMModelCacheStorageClass"] = "approved-storage"
 			data[tt.key] = tt.value
 
 			output := t.TempDir()

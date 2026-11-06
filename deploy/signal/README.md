@@ -501,6 +501,11 @@ kubectl logs -n project-signal \
   job/project-signal-vllm-cache-<unique-seed-identity>
 ```
 
+The approved storage class must provide multi-node `ReadWriteMany` access.
+The seeder writes the immutable cache once, and runtime Pods mount the exact
+revision subpath read-only. This avoids attach conflicts when bounded canary
+Runs execute concurrently on different participants.
+
 The seed Job has no API token or RBAC. It verifies the embedded manifest and
 every file before copying, writes through a Pod-UID-scoped temporary
 directory, verifies the copy, and atomically publishes the final snapshot.
