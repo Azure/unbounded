@@ -423,22 +423,26 @@ pub fn mac_base(head: &MessageHead) -> Result<Vec<u8>> {
         out.extend_from_slice(value);
         Ok(())
     }
-    let mut out = b"racer/request-mac/message/v1\0".to_vec();
-    let start = match &head.start {
-        StartLine::Request { method, target } => format!("{method} {target}"),
-        _ => return Err(Error::Unauthorized),
+    let StartLine::Request { method, target } = &head.start else {
+        return Err(Error::Unauthorized);
     };
-    append(&mut out, start.as_bytes())?;
-    for name in components(head)? {
+    let components = Components::new(head)?;
+    let mut out = b"racer/request-mac/message/v1\0".to_vec();
+    let start_len =
+        u32::try_from(method.len() + 1 + target.len()).map_err(|_| Error::InvalidRequest)?;
+    out.extend_from_slice(&start_len.to_be_bytes());
+    out.extend_from_slice(method.as_bytes());
+    out.push(b' ');
+    out.extend_from_slice(target.as_bytes());
+    for (name, value) in &components.fields {
         if name.starts_with('@') || name == "racer-request-mac" {
             continue;
         }
         append(&mut out, name.as_bytes())?;
-        append(&mut out, head.unique(&name)?.ok_or(Error::Unauthorized)?)?;
+        append(&mut out, value)?;
     }
     Ok(out)
 }
-
 /// Parse a canonical UUID node field.
 pub fn node_field(head: &MessageHead, name: &str) -> Result<NodeId> {
     let node = field(head, name)?;
@@ -451,74 +455,123 @@ pub fn receiver(head: &MessageHead) -> Result<NodeId> {
     node_field(head, "racer-receiver")
 }
 
-fn components(head: &MessageHead) -> Result<Vec<String>> {
-    Codec::new(MAX_ENVELOPE_HEAD).encode_head(head)?;
-    let mut names = BTreeSet::new();
-    for h in &head.headers {
-        let name = h.name.to_ascii_lowercase();
-        if !names.insert(name)
-            || h.value.first().is_some_and(|b| b.is_ascii_whitespace())
-            || h.value.last().is_some_and(|b| b.is_ascii_whitespace())
-            || h.value.iter().any(u8::is_ascii_control)
-        {
+/// Covered components of one head, validated and indexed once per frame.
+///
+/// `fields` holds lowercased header names (excluding the signature fields)
+/// sorted bytewise with their values; duplicate names are rejected here, so
+/// each lookup is unique by construction.
+struct Components<'a> {
+    start: &'a StartLine,
+    fields: Vec<(String, &'a [u8])>,
+}
+
+impl<'a> Components<'a> {
+    fn new(head: &'a MessageHead) -> Result<Self> {
+        // Full head validation (names, size, framing); not implied elsewhere on
+        // the verify path.
+        Codec::new(MAX_ENVELOPE_HEAD).encode_head(head)?;
+        let mut fields = Vec::with_capacity(head.headers.len());
+        for h in &head.headers {
+            if h.value.first().is_some_and(|b| b.is_ascii_whitespace())
+                || h.value.last().is_some_and(|b| b.is_ascii_whitespace())
+                || h.value.iter().any(u8::is_ascii_control)
+            {
+                return Err(Error::Unauthorized);
+            }
+            fields.push((h.name.to_ascii_lowercase(), h.value.as_slice()));
+        }
+        fields.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+        if fields.windows(2).any(|w| w[0].0 == w[1].0) {
             return Err(Error::Unauthorized);
         }
+        fields.retain(|(name, _)| name != "signature" && name != "signature-input");
+        Ok(Self {
+            start: &head.start,
+            fields,
+        })
     }
-    names.remove("signature");
-    names.remove("signature-input");
-    let mut components = match head.start {
-        StartLine::Request { .. } => vec!["@method".into(), "@request-target".into()],
-        StartLine::Response { .. } => vec!["@status".into()],
-    };
-    components.extend(names);
-    Ok(components)
+
+    fn derived(&self) -> &'static [&'static str] {
+        match self.start {
+            StartLine::Request { .. } => &["@method", "@request-target"],
+            StartLine::Response { .. } => &["@status"],
+        }
+    }
+
+    fn signature_input(&self, head: &MessageHead) -> Result<String> {
+        let timestamp = number(head, "racer-timestamp")? / 1000;
+        let keyid = field(head, "racer-signer")?;
+        uuid(&keyid)?;
+        let mut out = String::with_capacity(160 + 24 * self.fields.len());
+        out.push('(');
+        let names = self
+            .derived()
+            .iter()
+            .copied()
+            .chain(self.fields.iter().map(|(n, _)| n.as_str()));
+        for (i, name) in names.enumerate() {
+            if i > 0 {
+                out.push(' ');
+            }
+            out.push('"');
+            out.push_str(name);
+            out.push('"');
+        }
+        use std::fmt::Write as _;
+        let _ = write!(
+            out,
+            ");created={timestamp};keyid=\"{keyid}\";alg=\"ed25519\";tag=\"{PROFILE}\""
+        );
+        Ok(out)
+    }
+
+    fn signature_base(&self, input: &str) -> Vec<u8> {
+        let mut base = Vec::with_capacity(
+            128 + input.len()
+                + self
+                    .fields
+                    .iter()
+                    .map(|(n, v)| n.len() + v.len() + 5)
+                    .sum::<usize>(),
+        );
+        let line = |base: &mut Vec<u8>, name: &str, value: &[u8]| {
+            base.push(b'"');
+            base.extend_from_slice(name.as_bytes());
+            base.extend_from_slice(b"\": ");
+            base.extend_from_slice(value);
+            base.push(b'\n');
+        };
+        match self.start {
+            StartLine::Request { method, target } => {
+                line(&mut base, "@method", method.as_bytes());
+                line(&mut base, "@request-target", target.as_bytes());
+            }
+            StartLine::Response { status } => {
+                line(&mut base, "@status", status.to_string().as_bytes());
+            }
+        }
+        for (name, value) in &self.fields {
+            line(&mut base, name, value);
+        }
+        base.extend_from_slice(b"\"@signature-params\": ");
+        base.extend_from_slice(input.as_bytes());
+        base
+    }
 }
 
 fn signature_input(head: &MessageHead) -> Result<String> {
-    signature_input_for_components(head, &components(head)?)
-}
-
-fn signature_input_for_components(head: &MessageHead, components: &[String]) -> Result<String> {
-    let components = components
-        .iter()
-        .map(|s| format!("\"{s}\""))
-        .collect::<Vec<_>>()
-        .join(" ");
-    let timestamp = number(head, "racer-timestamp")? / 1000;
-    let keyid = field(head, "racer-signer")?;
-    uuid(&keyid)?;
-    Ok(format!(
-        "({components});created={timestamp};keyid=\"{keyid}\";alg=\"ed25519\";tag=\"{}\"",
-        PROFILE
-    ))
+    Components::new(head)?.signature_input(head)
 }
 
 /// RFC 9421 section 2.5 signature base under the strict canonical peer profile.
 fn signature_base(head: &MessageHead) -> Result<Vec<u8>> {
-    let components = components(head)?;
-    let input = signature_input_for_components(head, &components)?;
-    if field(head, "signature-input")? != format!("racer={input}") {
+    let components = Components::new(head)?;
+    let input = components.signature_input(head)?;
+    let carried = field(head, "signature-input")?;
+    if carried.strip_prefix("racer=") != Some(input.as_str()) {
         return Err(Error::Unauthorized);
     }
-    let mut base = Vec::new();
-    for name in components {
-        base.extend_from_slice(format!("\"{name}\": ").as_bytes());
-        match (name.as_str(), &head.start) {
-            ("@method", StartLine::Request { method, .. }) => {
-                base.extend_from_slice(method.as_bytes());
-            }
-            ("@request-target", StartLine::Request { target, .. }) => {
-                base.extend_from_slice(target.as_bytes());
-            }
-            ("@status", StartLine::Response { status }) => {
-                base.extend_from_slice(status.to_string().as_bytes());
-            }
-            _ => base.extend_from_slice(head.unique(&name)?.ok_or(Error::Unauthorized)?),
-        }
-        base.push(b'\n');
-    }
-    base.extend_from_slice(format!("\"@signature-params\": {input}").as_bytes());
-    Ok(base)
+    Ok(components.signature_base(&input))
 }
 
 /// Bind the exact signature base and signature without hashing payload bytes.

@@ -909,3 +909,157 @@ fn overloaded_head_is_exact_and_bodiless() {
     // A signed envelope is never mistaken for it, and it never decodes as one.
     assert!(decode_envelope(overloaded_head(), true, &test_util::AnyChain).is_err());
 }
+
+/// Previous allocation-heavy implementation, kept as a byte-for-byte oracle.
+mod legacy {
+    use super::*;
+
+    fn components(head: &MessageHead) -> Result<Vec<String>> {
+        Codec::new(MAX_ENVELOPE_HEAD).encode_head(head)?;
+        let mut names = BTreeSet::new();
+        for h in &head.headers {
+            let name = h.name.to_ascii_lowercase();
+            if !names.insert(name)
+                || h.value.first().is_some_and(|b| b.is_ascii_whitespace())
+                || h.value.last().is_some_and(|b| b.is_ascii_whitespace())
+                || h.value.iter().any(u8::is_ascii_control)
+            {
+                return Err(Error::Unauthorized);
+            }
+        }
+        names.remove("signature");
+        names.remove("signature-input");
+        let mut components = match head.start {
+            StartLine::Request { .. } => vec!["@method".into(), "@request-target".into()],
+            StartLine::Response { .. } => vec!["@status".into()],
+        };
+        components.extend(names);
+        Ok(components)
+    }
+
+    pub(super) fn signature_input(head: &MessageHead) -> Result<String> {
+        let components = components(head)?
+            .iter()
+            .map(|s| format!("\"{s}\""))
+            .collect::<Vec<_>>()
+            .join(" ");
+        let timestamp = number(head, "racer-timestamp")? / 1000;
+        let keyid = field(head, "racer-signer")?;
+        uuid(&keyid)?;
+        Ok(format!(
+            "({components});created={timestamp};keyid=\"{keyid}\";alg=\"ed25519\";tag=\"{}\"",
+            PROFILE
+        ))
+    }
+
+    pub(super) fn signature_base(head: &MessageHead) -> Result<Vec<u8>> {
+        let components = components(head)?;
+        let input = signature_input(head)?;
+        if field(head, "signature-input")? != format!("racer={input}") {
+            return Err(Error::Unauthorized);
+        }
+        let mut base = Vec::new();
+        for name in components {
+            base.extend_from_slice(format!("\"{name}\": ").as_bytes());
+            match (name.as_str(), &head.start) {
+                ("@method", StartLine::Request { method, .. }) => {
+                    base.extend_from_slice(method.as_bytes())
+                }
+                ("@request-target", StartLine::Request { target, .. }) => {
+                    base.extend_from_slice(target.as_bytes())
+                }
+                ("@status", StartLine::Response { status }) => {
+                    base.extend_from_slice(status.to_string().as_bytes())
+                }
+                _ => base.extend_from_slice(head.unique(&name)?.ok_or(Error::Unauthorized)?),
+            }
+            base.push(b'\n');
+        }
+        base.extend_from_slice(format!("\"@signature-params\": {input}").as_bytes());
+        Ok(base)
+    }
+
+    pub(super) fn mac_base(head: &MessageHead) -> Result<Vec<u8>> {
+        fn append(out: &mut Vec<u8>, value: &[u8]) -> Result<()> {
+            let length = u32::try_from(value.len()).map_err(|_| Error::InvalidRequest)?;
+            out.extend_from_slice(&length.to_be_bytes());
+            out.extend_from_slice(value);
+            Ok(())
+        }
+        let mut out = b"racer/request-mac/message/v1\0".to_vec();
+        let start = match &head.start {
+            StartLine::Request { method, target } => format!("{method} {target}"),
+            _ => return Err(Error::Unauthorized),
+        };
+        append(&mut out, start.as_bytes())?;
+        for name in components(head)? {
+            if name.starts_with('@') || name == "racer-request-mac" {
+                continue;
+            }
+            append(&mut out, name.as_bytes())?;
+            append(&mut out, head.unique(&name)?.ok_or(Error::Unauthorized)?)?;
+        }
+        Ok(out)
+    }
+}
+
+fn copy(head: &MessageHead) -> MessageHead {
+    MessageHead {
+        start: match &head.start {
+            StartLine::Request { method, target } => StartLine::Request {
+                method: method.clone(),
+                target: target.clone(),
+            },
+            StartLine::Response { status } => StartLine::Response { status: *status },
+        },
+        headers: head
+            .headers
+            .iter()
+            .map(|h| Header {
+                name: h.name.clone(),
+                value: h.value.clone(),
+            })
+            .collect(),
+    }
+}
+
+#[test]
+fn signature_and_mac_bases_match_legacy_implementation_bytes() {
+    for response in [false, true] {
+        for (fields, value_bytes) in [(0, 0), (1, 1), (8, 16), (40, 3)] {
+            let mut head = canonical_fixture(response, fields, value_bytes);
+            push(&mut head, "Racer-Request-Mac", "racer=:abc:");
+            head.headers.push(Header {
+                name: "X-Obs".into(),
+                value: vec![b'a', 0x80, b'z'],
+            });
+            // Refresh signature-input to cover the added fields.
+            head.headers
+                .retain(|h| !h.name.eq_ignore_ascii_case("signature-input"));
+            let input = signature_input(&head).unwrap();
+            assert_eq!(input, legacy::signature_input(&head).unwrap());
+            push(&mut head, "signature-input", format!("racer={input}"));
+            for mixed in [false, true] {
+                let mut head = copy(&head);
+                if mixed {
+                    head.headers.reverse();
+                    for h in &mut head.headers {
+                        h.name = h.name.to_ascii_uppercase();
+                    }
+                }
+                assert_eq!(
+                    signature_base(&head).unwrap(),
+                    legacy::signature_base(&head).unwrap()
+                );
+                assert_eq!(mac_base(&head).is_ok(), legacy::mac_base(&head).is_ok());
+                if !response {
+                    assert_eq!(mac_base(&head).unwrap(), legacy::mac_base(&head).unwrap());
+                }
+            }
+            let mut dup = copy(&head);
+            push(&mut dup, "x-obs", "again");
+            assert!(signature_base(&dup).is_err() && legacy::signature_base(&dup).is_err());
+            assert!(mac_base(&dup).is_err() && legacy::mac_base(&dup).is_err());
+        }
+    }
+}
