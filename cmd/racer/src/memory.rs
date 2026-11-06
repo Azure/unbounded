@@ -1439,6 +1439,8 @@ pub struct MemoryCache {
     availability: Rc<crate::control::Availability>,
     expiry: RefCell<racer_core::cache::Expiry>,
     key_sweep: RefCell<KeySweep>,
+    /// Evict idle entries on publish to keep in-flight ciphertext headroom.
+    headroom: bool,
 }
 
 /// Progress of a bounded pass that drops entries whose page key the node no
@@ -1472,7 +1474,15 @@ impl MemoryCache {
             availability,
             expiry: RefCell::new(racer_core::cache::Expiry::default()),
             key_sweep: RefCell::default(),
+            headroom: true,
         }
+    }
+    /// Let retained entries fill the whole ciphertext share, for tests of
+    /// reclaim under a full cache.
+    #[cfg(test)]
+    pub(crate) fn without_headroom(mut self) -> Self {
+        self.headroom = false;
+        self
     }
     /// Published cache admission and modes shared with the read path.
     pub(crate) fn availability(&self) -> &Rc<crate::control::Availability> {
@@ -1570,8 +1580,41 @@ impl MemoryCache {
         if entries.len() + self.entries.borrow().len() >= self.pool.entry_limit() {
             return Err(Error::Overloaded);
         }
+        let cache = id.version.object.cache.clone();
         entries.insert(id.clone(), page);
+        drop(entries);
+        self.keep_headroom(&cache);
         Ok(())
+    }
+    /// Evict idle entries so `cache` can still admit one range window of
+    /// ciphertext. Retained entries keep their Ciphertext charge, so a full
+    /// cache would otherwise leave no room for in-flight fills, disk reads,
+    /// hedges, or relays, and admission sites that do not reclaim would fail
+    /// `Overloaded`. Pinned entries are never evicted, so the reserve is best
+    /// effort. Skipped when the window exceeds a quarter of the cache's fair
+    /// share, where it would cost more retention than it protects.
+    fn keep_headroom(&self, cache: &CacheId) {
+        use flow_control::Policy as _;
+        if !self.headroom {
+            return;
+        }
+        let class = ResourceClass::Ciphertext;
+        let admission = &self.pool.admission;
+        let reserve = admission.policy().progress(class);
+        if reserve > admission.fair_limit(cache, class) / 4 {
+            return;
+        }
+        let Some((owner, bytes)) = admission.reclamation(cache, class, reserve) else {
+            return;
+        };
+        self.reclaim(
+            class,
+            owner.as_ref(),
+            bytes,
+            |cache| admission.excess(cache, class),
+            |_, _| 0,
+            |_, _| 0,
+        );
     }
     pub(crate) fn invalidate_ciphertext(&self, page: &UnverifiedPage) {
         let id = &page.copy.ciphertext.envelope().page;
@@ -1669,7 +1712,11 @@ impl MemoryCache {
             let id = entries.victim(idle).ok_or(Error::Overloaded)?;
             entries.remove(&id);
         }
-        entries.insert(page)
+        let cache = page.metadata.version.object.cache.clone();
+        entries.insert(page)?;
+        drop(entries);
+        self.keep_headroom(&cache);
+        Ok(())
     }
     pub(crate) fn metadata(&self, version: &ObjectVersion) -> Result<Option<VersionMetadata>> {
         if self.availability.passthrough(&version.object.cache) {
@@ -3083,7 +3130,9 @@ pub(crate) mod tests {
                             &env,
                             vec![low.clone(), high.clone()],
                         ),
-                    );
+                    )
+                    // This test pins exact over-share reclaim of a full cache.
+                    .without_headroom();
                     // High activates first, alone, with 20 pages of accounted bytes.
                     let high_pages: Vec<_> = (0..4)
                         .map(|i| verified_in(&cache, "high", &format!("h{i}")))
@@ -4169,6 +4218,123 @@ pub(crate) mod tests {
             );
             drop(lease);
             assert_eq!(admission.used(ResourceClass::Ciphertext), 0);
+        }
+        /// A cache whose ciphertext limit affords the headroom reserve plus
+        /// `granules` granule-sized entries, with everything but those
+        /// entries and the reserve held by `in_flight`.
+        fn headroom_cache(
+            env: &racer_io::Env,
+            granules: usize,
+        ) -> (
+            Rc<flow_control::Quotas<AdmissionPolicy>>,
+            MemoryCache,
+            flow_control::Charge<AdmissionPolicy>,
+            usize,
+        ) {
+            use flow_control::Policy as _;
+            let mut limits = crate::test_support::cluster::config(false).limits;
+            limits.metadata_entries = std::num::NonZeroUsize::new(64).unwrap();
+            let probe = AdmissionPolicy::new(limits.clone());
+            let reserve = probe.progress(ResourceClass::Ciphertext);
+            let limit = 4 * reserve + granules * page_alloc::buf::GRANULE;
+            limits.ciphertext_bytes = std::num::NonZeroUsize::new(limit).unwrap();
+            let admission = Rc::new(flow_control::Quotas::new(AdmissionPolicy::new(limits)));
+            let cache = MemoryCache::new(
+                BufferPool::new(admission.clone()),
+                crate::test_support::availability(env),
+            );
+            let key = CacheId(crate::test_support::security::CACHE.into());
+            let in_flight = admission
+                .reserve(Some(&key), ResourceClass::Ciphertext, 3 * reserve)
+                .unwrap();
+            (admission, cache, in_flight, reserve)
+        }
+        fn headroom_key() -> CacheId {
+            CacheId(crate::test_support::security::CACHE.into())
+        }
+        /// Publishing evicts the oldest idle entries until one range window
+        /// of ciphertext is free again for in-flight work.
+        #[test]
+        fn publish_keeps_ciphertext_headroom_by_evicting_idle_entries() {
+            let env = racer_io::Env::host();
+            let (admission, cache, _in_flight, reserve) = headroom_cache(&env, 4);
+            let limit = admission.limit(ResourceClass::Ciphertext);
+            let mut ids = Vec::new();
+            for version in 0..8 {
+                let page = bundle(&admission, &format!("v{version}"));
+                ids.push(page.plaintext.page().clone());
+                cache.publish(page).unwrap();
+                assert!(admission.used(ResourceClass::Ciphertext) <= limit - reserve);
+            }
+            assert_eq!(cache.resident().len(), 4);
+            for id in &ids[4..] {
+                assert!(cache.resident().contains(id), "newest entries stay");
+            }
+            // The headroom admits a fresh window without any reclaim.
+            let _window = admission
+                .reserve(Some(&headroom_key()), ResourceClass::Ciphertext, reserve)
+                .unwrap();
+        }
+        /// Pinned entries are never evicted to make headroom, and publish
+        /// still succeeds while every entry is pinned.
+        #[test]
+        fn publish_headroom_never_evicts_pinned_entries() {
+            let env = racer_io::Env::host();
+            let (admission, cache, _in_flight, reserve) = headroom_cache(&env, 4);
+            let limit = admission.limit(ResourceClass::Ciphertext);
+            let pinned: Vec<_> = (0..8)
+                .map(|version| {
+                    let page = bundle(&admission, &format!("v{version}"));
+                    cache.publish(page.clone()).unwrap();
+                    page
+                })
+                .collect();
+            // Past the headroom target, yet nothing was evicted.
+            assert_eq!(cache.resident().len(), 8);
+            assert!(admission.used(ResourceClass::Ciphertext) > limit - reserve);
+            // Once readers release, the next publish restores the headroom.
+            drop(pinned);
+            cache.publish(bundle(&admission, "fresh")).unwrap();
+            assert!(admission.used(ResourceClass::Ciphertext) <= limit - reserve);
+            assert!(cache.resident().len() <= 4);
+        }
+        /// Unverified ciphertext entries obey the same headroom.
+        #[test]
+        fn publish_ciphertext_keeps_headroom() {
+            let env = racer_io::Env::host();
+            let (admission, cache, _in_flight, reserve) = headroom_cache(&env, 4);
+            let limit = admission.limit(ResourceClass::Ciphertext);
+            for version in 0..8 {
+                let page = bundle(&admission, &format!("c{version}"));
+                cache
+                    .publish_ciphertext(UnverifiedPage {
+                        copy: page.copy(),
+                        disk_token: None,
+                    })
+                    .unwrap();
+                drop(page);
+            }
+            assert!(admission.used(ResourceClass::Ciphertext) <= limit - reserve);
+        }
+        /// A budget too small to spare a window keeps every idle entry.
+        #[test]
+        fn publish_skips_headroom_when_budget_cannot_afford_it() {
+            let env = racer_io::Env::host();
+            let mut limits = crate::test_support::cluster::config(false).limits;
+            limits.metadata_entries = std::num::NonZeroUsize::new(64).unwrap();
+            limits.ciphertext_bytes =
+                std::num::NonZeroUsize::new(8 * page_alloc::buf::GRANULE).unwrap();
+            let admission = Rc::new(flow_control::Quotas::new(AdmissionPolicy::new(limits)));
+            let cache = MemoryCache::new(
+                BufferPool::new(admission.clone()),
+                crate::test_support::availability(&env),
+            );
+            for version in 0..6 {
+                cache
+                    .publish(bundle(&admission, &format!("v{version}")))
+                    .unwrap();
+            }
+            assert_eq!(cache.resident().len(), 6);
         }
         #[test]
         fn eviction_is_idempotent_and_churn_needs_no_tombstones() {
