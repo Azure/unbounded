@@ -68,11 +68,14 @@ QGA_SOCK = TMPDIR / "qga.sock"
 # The nspawn machine name used by the agent (must match the constant in
 # cmd/agent/internal/goalstates/constants.go - NSpawnMachineKube1).
 NSPAWN_MACHINE = "kube1"
-# Isolation mode under test, from SMOKE_ISOLATION: nspawn or none. Empty
-# keeps today's behavior: no spec.isolation is set and the host runs the
-# default nspawn mode. none is not exercised by default. A new mode is added
-# to SMOKE_ISOLATION_MODES and to isolation_debug_commands.
-SMOKE_ISOLATION_MODES = ("nspawn", "none")
+# Isolation mode under test, from SMOKE_ISOLATION: nspawn, none or container.
+# Empty keeps today's behavior: no spec.isolation is set and the host runs the
+# default nspawn mode. none and container are not exercised by default. A new
+# mode is added to SMOKE_ISOLATION_MODES and to isolation_debug_commands.
+# container is experimental: metalman serve-pxe runs with
+# --experimental-container-isolation for it (metalman_isolation_args), so the
+# agent configuration it renders opts in.
+SMOKE_ISOLATION_MODES = ("nspawn", "none", "container")
 SMOKE_ISOLATION = os.environ.get("SMOKE_ISOLATION", "")
 if SMOKE_ISOLATION and SMOKE_ISOLATION not in SMOKE_ISOLATION_MODES:
     sys.exit(f"SMOKE_ISOLATION must be one of {', '.join(SMOKE_ISOLATION_MODES)}, got {SMOKE_ISOLATION!r}")
@@ -250,6 +253,17 @@ def guest_exec(command: str, timeout: int = 30) -> tuple[int, str, str]:
         time.sleep(0.5)
 
 
+def metalman_isolation_args() -> list[str]:
+    """Return the serve-pxe flags the isolation mode under test needs.
+
+    container is experimental: without the flag metalman neither starts the
+    HostReplace nor renders an agent configuration for the Machine, and the
+    agent would refuse the mode without the opt-in the flag writes."""
+    if SMOKE_ISOLATION == "container":
+        return ["--experimental-container-isolation"]
+    return []
+
+
 def isolation_debug_commands() -> list[tuple[str, str]]:
     """Return the node-stack diagnostics for the isolation mode under test."""
     if SMOKE_ISOLATION == "none":
@@ -259,6 +273,14 @@ def isolation_debug_commands() -> list[tuple[str, str]]:
             ("node stack journal (none)", (
                 "journalctl --no-pager -n 200 " + " ".join(f"-u {u}" for u in NONE_UNITS)
             )),
+        ]
+    if SMOKE_ISOLATION == "container":
+        # The supervising units are unbounded-node-<slot>.service
+        # (container.UnitName); exec and logs go through the node stack itself.
+        return [
+            ("node stack unit status (container)", "systemctl --no-pager status 'unbounded-node-*.service'"),
+            ("node stack logs (container)", "unbounded-agent logs --lines 200"),
+            ("node stack units (container)", "unbounded-agent exec -- systemctl --no-pager list-units"),
         ]
     return [
         ("machinectl list", "machinectl list --no-pager"),
@@ -1043,14 +1065,16 @@ def run_operation_smoke_suite() -> None:
     wait_k8s_node(NODE_NAME, timeout=300)
     wait_node_boot_id_changed(NODE_NAME, boot_id, timeout=600)
 
-    if SMOKE_ISOLATION == "none":
+    if SMOKE_ISOLATION in ("none", "container"):
         # Soft reboot restarts the node stack only. In none mode the node
-        # shares the host kernel boot ID, so it must not change.
+        # shares the host kernel boot ID, so it must not change. The container
+        # mode's boot ID behavior has not been checked on a real node, so only
+        # readiness is asserted for it.
         boot_id = get_node_boot_id(NODE_NAME)
         node_reboot = create_machine_operation("smoke-node-reboot", "NodeReboot")
         wait_machine_operation_complete(node_reboot, timeout=600)
         wait_k8s_node(NODE_NAME, timeout=300)
-        if get_node_boot_id(NODE_NAME) != boot_id:
+        if SMOKE_ISOLATION == "none" and get_node_boot_id(NODE_NAME) != boot_id:
             die("NodeReboot changed the host boot ID; it must restart only the node stack")
 
 
@@ -1352,6 +1376,7 @@ def main() -> None:
         "--leader-elect-lease-duration=60s",
         "--leader-elect-renew-deadline=40s",
         "--leader-elect-retry-period=5s",
+        *metalman_isolation_args(),
     ], TMPDIR / "serve.log")
     log(f"  serve PID={proc.pid}")
 
