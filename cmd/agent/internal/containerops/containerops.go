@@ -105,6 +105,11 @@ type Overrides struct {
 	// ReadyTimeout bounds the wait for systemd in the container. Zero means two
 	// minutes.
 	ReadyTimeout time.Duration
+	// ImageArchiveDir is the host directory listed for the staged container
+	// image archives to import after containerd starts. Empty means
+	// goalstates.ContainerImageArchiveHostDir, the directory the container
+	// bind-mounts; the archives are imported at their path inside it.
+	ImageArchiveDir string
 }
 
 // Node is a container node bound to one configuration and slot.
@@ -369,7 +374,7 @@ func (n *Node) Start(ctx context.Context, wasRunning, containerdChanged, kubelet
 		hostnode.Func("wait-container-ready", n.waitReady),
 		hostnode.Func("wait-localdns", n.waitLocalDNS),
 		nodestart.StartContainerd(n.p.Log, gs),
-		nodestart.ImportContainerImages(n.p.Log, gs),
+		nodestart.ImportContainerImagesFrom(n.p.Log, gs, n.p.ImageArchiveDir),
 		nodestart.StartKubelet(n.p.Log, gs),
 		hostnode.Func("restart-reconfigured-services", func(ctx context.Context) error {
 			return n.restartChanged(ctx, wasRunning, containerdChanged, kubeletChanged)

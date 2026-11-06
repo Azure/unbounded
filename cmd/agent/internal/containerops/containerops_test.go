@@ -205,7 +205,7 @@ func (f *fixture) node(slot string, dns bool) *Node {
 		Log:       quiet(),
 		Slot:      slot,
 		GoalState: f.goalState(slot, dns),
-		Overrides: Overrides{Layout: container.Layout{Base: filepath.Join(f.dir, "containers")}, SystemdDir: filepath.Join(f.dir, "systemd"), RuntimePath: testRuntime, HelperPath: "/usr/local/bin/unbounded-agent", Run: f.h.run, MountInfoPath: f.mountInfo(), Host: &container.HostFS{SELinuxEnforce: filepath.Join(f.dir, "absent")}, PollInterval: time.Millisecond, GoneTimeout: 20 * time.Millisecond, ReadyTimeout: 50 * time.Millisecond, Unpack: func(_ context.Context, dir string) error {
+		Overrides: Overrides{Layout: container.Layout{Base: filepath.Join(f.dir, "containers")}, SystemdDir: filepath.Join(f.dir, "systemd"), RuntimePath: testRuntime, HelperPath: "/usr/local/bin/unbounded-agent", Run: f.h.run, MountInfoPath: f.mountInfo(), Host: &container.HostFS{SELinuxEnforce: filepath.Join(f.dir, "absent")}, PollInterval: time.Millisecond, GoneTimeout: 20 * time.Millisecond, ReadyTimeout: 50 * time.Millisecond, ImageArchiveDir: f.images(), Unpack: func(_ context.Context, dir string) error {
 			if err := c.inc(&c.unpack, &c.unpackErr); err != nil {
 				return err
 			}
@@ -215,6 +215,9 @@ func (f *fixture) node(slot string, dns bool) *Node {
 		Hooks: hostnode.Hooks{HostRoot: filepath.Join(f.dir, "host"), SetupNetwork: func(context.Context) error { return c.inc(&c.setup, &c.setupErr) }, CleanupNetwork: func(context.Context) error { return c.inc(&c.cleanup, &c.cleanupErr) }, WaitLocalDNS: func(context.Context, *goalstates.NodeStart) error { return c.inc(&c.dns, new(error)) }},
 	})
 }
+
+// images is the staged image archive directory the node lists.
+func (f *fixture) images() string { return filepath.Join(f.dir, "images") }
 
 func (f *fixture) hostPath(p string) string  { return filepath.Join(f.dir, "host", p) }
 func (f *fixture) rootfs(slot string) string { return filepath.Join(f.dir, "containers", slot) }
@@ -440,6 +443,49 @@ func TestStartRunsTheStackInOrder(t *testing.T) {
 	running, err := n.Running(t.Context())
 	require.NoError(t, err)
 	require.True(t, running)
+}
+
+// The staged archives are listed in the directory the node was given and
+// imported at their path inside the container, which bind-mounts them, once
+// containerd is up and before the kubelet starts.
+func TestStartImportsStagedImagesFromTheConfiguredDirectory(t *testing.T) {
+	f := newFixture(t)
+	n := f.node("kube1", false)
+
+	_, err := n.Prepare(t.Context())
+	require.NoError(t, err)
+
+	require.NoError(t, os.MkdirAll(f.images(), 0o755))
+	require.NoError(t, os.WriteFile(filepath.Join(f.images(), "a.tar"), nil, 0o644))
+	require.NoError(t, os.WriteFile(filepath.Join(f.images(), "notes.txt"), nil, 0o644))
+	f.h.reset()
+
+	require.NoError(t, n.Start(t.Context(), false, false, false))
+
+	calls := f.h.snapshot()
+	requireOrder(t, calls,
+		testRuntime+" exec unbounded-kube1 systemctl enable --now containerd.service",
+		testRuntime+" exec unbounded-kube1 ctr --namespace k8s.io images import "+filepath.Join(goalstates.ContainerImageArchiveDir, "a.tar"),
+		testRuntime+" exec unbounded-kube1 systemctl enable --now kubelet.service",
+	)
+	require.Equal(t, -1, index(calls, "notes.txt", 0), "only .tar archives are imported")
+}
+
+// An unreadable archive directory fails the start before the kubelet: only a
+// missing one means nothing was staged.
+func TestStartFailsWhenTheImageDirectoryCannotBeRead(t *testing.T) {
+	f := newFixture(t)
+	n := f.node("kube1", false)
+
+	_, err := n.Prepare(t.Context())
+	require.NoError(t, err)
+
+	// A file where the directory belongs cannot be listed.
+	require.NoError(t, os.WriteFile(f.images(), nil, 0o644))
+	f.h.reset()
+
+	require.ErrorContains(t, n.Start(t.Context(), false, false, false), "read staged container image archive directory "+f.images())
+	require.Equal(t, -1, index(f.h.snapshot(), testRuntime+" exec unbounded-kube1 systemctl enable --now kubelet.service", 0))
 }
 
 func TestStartRestartsOnlyChangedServicesOfARunningNode(t *testing.T) {
