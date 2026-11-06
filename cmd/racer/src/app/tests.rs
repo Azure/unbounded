@@ -3809,6 +3809,28 @@ fn tcp_nodelay(fd: &impl std::os::fd::AsRawFd) -> i32 {
     value
 }
 
+/// Start a peer listener on a free loopback port. The listener binds on its
+/// first poll, so another process can take a port probed and released here
+/// before that; retry with a fresh port when the bind fails.
+fn listen_on_free_port<'a>(
+    peers: &'a crate::peer::server::PeerServer,
+    scope: &'a RequestScope,
+) -> (Operation<'a, ()>, std::net::SocketAddr) {
+    let mut cx = Context::from_waker(futures::task::noop_waker_ref());
+    for _ in 0..32 {
+        let address = std::net::TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap();
+        let mut serving = peers.listen(address, scope);
+        match serving.as_mut().poll(&mut cx) {
+            Poll::Pending => return (serving, address),
+            Poll::Ready(result) => assert_eq!(result, Err(Error::Io), "{address}"),
+        }
+    }
+    panic!("no free peer listener port");
+}
+
 #[test]
 fn peer_tcp_nodelay_assembled_outbound_and_distributed_accept() {
     let env = racer_io::Env::host();
@@ -3817,13 +3839,9 @@ fn peer_tcp_nodelay_assembled_outbound_and_distributed_accept() {
         config.peer_tcp_nodelay = enabled;
         let node = Arc::new(NodeState::on(env.ctx.clone()));
         let (app, runtime, _) = local_worker(&env, &config, &node, 0);
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let address = listener.local_addr().unwrap();
-        drop(listener);
         let scope = scope(&racer_io::Clock::host(), Duration::from_secs(5)).unwrap();
-        let mut serving = app.peers.listen(address, &scope);
+        let (mut serving, address) = listen_on_free_port(&app.peers, &scope);
         let mut cx = Context::from_waker(futures::task::noop_waker_ref());
-        assert!(serving.as_mut().poll(&mut cx).is_pending());
         let endpoint = crate::http::Endpoint::Peer(address.to_string());
         let mut connecting = app.http.checkout(&endpoint, &scope);
         let mut outbound = None;
@@ -3899,13 +3917,9 @@ fn a_full_peer_listener_refuses_with_the_overload_head() {
             .limit(ResourceClass::PeerIngressConnection),
         1
     );
-    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-    let address = listener.local_addr().unwrap();
-    drop(listener);
     let scope = scope(&racer_io::Clock::host(), Duration::from_secs(5)).unwrap();
-    let mut serving = app.peers.listen(address, &scope);
+    let (mut serving, address) = listen_on_free_port(&app.peers, &scope);
     let mut cx = Context::from_waker(futures::task::noop_waker_ref());
-    assert!(serving.as_mut().poll(&mut cx).is_pending());
     let mut pump = |until: Instant, done: &mut dyn FnMut() -> bool| {
         while !done() {
             assert!(serving.as_mut().poll(&mut cx).is_pending());
