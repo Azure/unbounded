@@ -5,9 +5,9 @@
 //! `seeds/regressions.txt`), `DST_STEPS` (step budget per run) and
 //! `DST_FILTER` (scenario name substring).
 //!
-//! With arguments it runs one scenario and writes its JSON report instead, with racer-sim's
-//! command line (`--scenario`, `--nodes`, `--seed`, `--duration`, `--config`, `--out`; see
-//! [`racer_dst::cli`]). It exits 1 when the run fails a check or invariant (the report is
+//! With arguments it runs one scenario and writes its JSON report instead, using the
+//! `racer-dst` command line (`--scenario`, `--nodes`, `--seed`, `--duration`, `--config`,
+//! `--out`; see [`racer_dst::cli`]). It exits 1 when the run fails a check or invariant (the report is
 //! still written) and 2 on a usage error.
 use std::process::ExitCode;
 
