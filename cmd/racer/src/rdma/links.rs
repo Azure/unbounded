@@ -1169,13 +1169,16 @@ impl PendingReceive {
         head: &VerifiedHead,
         envelope: PageEnvelope,
         admission: &Rc<flow_control::Quotas<AdmissionPolicy>>,
+        reclaim: Option<&crate::peer::transport::Reclaim<'_>>,
         scope: &RequestScope,
     ) -> Result<CiphertextPage> {
         scope.check()?;
         let length = self.check_completion(head, &envelope)?;
-        let reservation = admission.reserve(
-            Some(&envelope.page.version.object.cache),
-            ResourceClass::Ciphertext,
+        // Idle cache entries yield to the in-flight receive before it fails.
+        let reservation = crate::peer::transport::reserve_ciphertext(
+            admission,
+            reclaim,
+            &envelope.page.version.object.cache,
             length as usize,
         )?;
         let arrival = self

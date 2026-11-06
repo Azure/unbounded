@@ -571,11 +571,8 @@ impl Transfers {
         let buffer = match cache {
             Some(cache) if length != 0 => {
                 let buffers = codec.buffers();
-                let reservation = admission.reserve(
-                    Some(cache),
-                    ResourceClass::Ciphertext,
-                    buffers.aligned_capacity(length)?,
-                )?;
+                let reservation =
+                    self.reserve_ciphertext(cache, buffers.aligned_capacity(length)?)?;
                 WireBuffer::aligned(buffers, reservation, length)?
             }
             _ => WireBuffer::unkeyed(codec.buffers(), admission, length)?,
@@ -683,7 +680,13 @@ impl Transfers {
         let (admission, _) = &self.wire;
         // The arrival stays in registered memory; retaining paths copy it out.
         let page = pending
-            .finish(&verified, envelope, admission, &native_scope(scope))
+            .finish(
+                &verified,
+                envelope,
+                admission,
+                self.reclaim.as_deref(),
+                &native_scope(scope),
+            )
             .await?;
         #[cfg(test)]
         self.native_completions
@@ -1048,7 +1051,33 @@ unsafe impl IoBuffer for WireBuffer {
     }
 }
 
-type ReclaimCiphertext = dyn Fn(&racer_wire::control::CacheId, usize);
+/// Frees idle memory for a cache's ciphertext reservation of the given size.
+pub(crate) type Reclaim<'a> = dyn Fn(&racer_wire::control::CacheId, usize) + 'a;
+type ReclaimCiphertext = Reclaim<'static>;
+
+/// Reserve keyed peer-receive ciphertext, reclaiming idle cache memory once
+/// before failing. Idle cache entries keep their Ciphertext charge, so without
+/// this a full cache share would reject every in-flight peer receive.
+pub(crate) fn reserve_ciphertext(
+    admission: &flow_control::Quotas<AdmissionPolicy>,
+    reclaim: Option<&Reclaim<'_>>,
+    cache: &racer_wire::control::CacheId,
+    capacity: usize,
+) -> Result<flow_control::Charge<AdmissionPolicy>> {
+    let reserve = || {
+        admission
+            .reserve(Some(cache), ResourceClass::Ciphertext, capacity)
+            .map_err(Error::from)
+    };
+    let result = reserve();
+    match (result, reclaim) {
+        (Err(Error::Overloaded), Some(reclaim)) => {
+            reclaim(cache, capacity);
+            reserve()
+        }
+        (result, _) => result,
+    }
+}
 
 /// Generic Io has lost errno and may mean local ENOBUFS/ENOMEM. It is not link
 /// evidence. Only an observed orderly EOF is classified here; connect preserves
@@ -1237,6 +1266,14 @@ impl Transfers {
             Some(gate) => gate.acquire(&self.wire.0, scope).await,
             None => Ok(None),
         }
+    }
+    /// Reserve a keyed peer-receive body, reclaiming idle cache memory first.
+    pub(crate) fn reserve_ciphertext(
+        &self,
+        cache: &racer_wire::control::CacheId,
+        capacity: usize,
+    ) -> Result<flow_control::Charge<AdmissionPolicy>> {
+        reserve_ciphertext(&self.wire.0, self.reclaim.as_deref(), cache, capacity)
     }
     pub(crate) fn with_reclamation(
         mut self,
@@ -1509,17 +1546,7 @@ impl Transfers {
             let buffers = codec.buffers();
             // Charge the whole pooled size class of the aligned body.
             let capacity = buffers.aligned_capacity(length)?;
-            let mut reservation = admission
-                .reserve(Some(cache), ResourceClass::Ciphertext, capacity)
-                .map_err(Error::from);
-            if matches!(reservation, Err(Error::Overloaded))
-                && let Some(reclaim) = &self.reclaim
-            {
-                reclaim(cache, capacity);
-                reservation = admission
-                    .reserve(Some(cache), ResourceClass::Ciphertext, capacity)
-                    .map_err(Error::from);
-            }
+            let reservation = self.reserve_ciphertext(cache, capacity);
             let mut buffer = WireBuffer::aligned(
                 buffers,
                 observer.result(Stage::PeerReceiveAdmission, scope, reservation)?,
@@ -2849,6 +2876,126 @@ mod tests {
             }
         }
 
+        /// The native receive reserves its landing charge through the
+        /// transfer's reclaim hook: a full share fails `Overloaded` unless the
+        /// hook frees idle bytes, and then the receive proceeds to its arrival.
+        #[test]
+        fn native_finish_reclaims_before_overloaded() {
+            use crate::rdma::links::tests::drive;
+            use crate::rdma::links::tests::link_up;
+            use crate::rdma::links::tests::page;
+            use crate::rdma::links::tests::world_for;
+            use base64::Engine;
+            let env = racer_io::Env::host();
+            let signers = crate::peer::tests::signers(&env);
+            let (a, b) = (signers[0].node().clone(), signers[2].node().clone());
+            let mut w = world_for([a.clone(), b.clone()], false);
+            let env = w.env.clone();
+            let scope =
+                RequestScope::host(RequestId([8; 16]), Instant::now() + Duration::from_secs(30))
+                    .unwrap();
+            link_up(&env, &mut w);
+            let binding = Binding {
+                request: [4; 32],
+                response: [5; 32],
+                transfer: TransferId([6; 16]),
+                membership: 1,
+                deadline: p::encode_deadline(scope.clock(), scope.deadline).unwrap(),
+                rail: RailId(7),
+            };
+            let admission = w.a.admission.clone();
+            let envelope = page(&admission, 35, 1).envelope().clone();
+            let cache = envelope.page.version.object.cache.clone();
+            // Stand-in for idle cache entries: hold the cache's whole share.
+            let held = std::cell::RefCell::new(Vec::new());
+            for shift in (0..48).rev() {
+                while let Ok(charge) =
+                    admission.reserve(Some(&cache), ResourceClass::Ciphertext, 1 << shift)
+                {
+                    held.borrow_mut().push(charge);
+                }
+            }
+            let used = admission.used(ResourceClass::Ciphertext);
+            let calls = std::cell::Cell::new(0);
+            let busy = |_: &racer_wire::control::CacheId, _: usize| calls.set(calls.get() + 1);
+            let idle = |owner: &racer_wire::control::CacheId, _: usize| {
+                assert_eq!(owner, &cache);
+                held.borrow_mut().clear();
+            };
+            let hooks: [(Option<&Reclaim<'_>>, bool); 3] =
+                [(None, false), (Some(&busy), false), (Some(&idle), true)];
+            for (reclaim, reclaimed) in hooks {
+                let pending = drive(
+                    &mut w.a.owner,
+                    &mut w.b.owner,
+                    w.a.links.grant(&b, RailId(7), binding.transfer, &scope),
+                )
+                .unwrap();
+                let value = crate::rdma::links::completion_value(
+                    pending.link(),
+                    pending.tag(),
+                    35,
+                    binding.transfer,
+                );
+                let complete = binding
+                    .sign(
+                        &signers[2],
+                        &a,
+                        Phase::Complete,
+                        &[9; 32],
+                        0,
+                        vec![extension(
+                            COMPLETION_HEADER,
+                            base64::engine::general_purpose::STANDARD
+                                .encode(value)
+                                .into_bytes(),
+                        )],
+                    )
+                    .unwrap();
+                let (verified, _) = binding
+                    .verify(
+                        &signers[0],
+                        &b,
+                        complete,
+                        &[Phase::Complete],
+                        &[9; 32],
+                        0,
+                        &scope,
+                    )
+                    .unwrap();
+                let grant = crate::rdma::AuthenticatedGrant {
+                    link: pending.link(),
+                    tag: pending.tag(),
+                    length: crate::rdma::MAX_CIPHERTEXT as u32,
+                    rail: RailId(7),
+                    transfer: binding.transfer,
+                };
+                if !reclaimed {
+                    let result = drive(
+                        &mut w.a.owner,
+                        &mut w.b.owner,
+                        pending.finish(&verified, envelope.clone(), &admission, reclaim, &scope),
+                    );
+                    assert!(matches!(result, Err(Error::Overloaded)));
+                    assert_eq!(admission.used(ResourceClass::Ciphertext), used);
+                    w.b.links.release(&a, &grant);
+                } else {
+                    // Admission passes; the lost arrival then fails `Io`.
+                    let (epoch, _) = w.a.links.ready(&b, RailId(7)).unwrap();
+                    w.a.links.abandon(&b, RailId(7), epoch);
+                    let result = drive(
+                        &mut w.a.owner,
+                        &mut w.b.owner,
+                        pending.finish(&verified, envelope.clone(), &admission, reclaim, &scope),
+                    );
+                    assert!(matches!(result, Err(Error::Io)));
+                }
+            }
+            assert_eq!(calls.get(), 1);
+            assert!(held.borrow().is_empty());
+            assert_eq!(admission.used(ResourceClass::Ciphertext), 0);
+        }
+
         #[test]
         fn completion_must_name_the_grant_and_a_lost_arrival_is_io() {
             use crate::rdma::links::tests::drive;
@@ -2937,7 +3084,7 @@ mod tests {
                     let result = drive(
                         &mut w.a.owner,
                         &mut w.b.owner,
-                        pending.finish(&verified, envelope.clone(), &admission, &scope),
+                        pending.finish(&verified, envelope.clone(), &admission, None, &scope),
                     );
                     assert!(matches!(result, Err(Error::Unauthorized)), "{mutation}");
                     w.b.links.release(&a, &grant);
@@ -2949,7 +3096,7 @@ mod tests {
                     let result = drive(
                         &mut w.a.owner,
                         &mut w.b.owner,
-                        pending.finish(&verified, envelope.clone(), &admission, &scope),
+                        pending.finish(&verified, envelope.clone(), &admission, None, &scope),
                     );
                     assert!(matches!(result, Err(Error::Io)));
                 }
@@ -2998,6 +3145,63 @@ mod tests {
             WireBuffer::unkeyed(&buffers, &admission, length),
             Err(Error::Unavailable)
         ));
+        assert_eq!(admission.used(ResourceClass::Ciphertext), 0);
+    }
+    /// Keyed TCP and HTTP peer bodies reserve through the production reclaim
+    /// hook wired by `with_reclamation`, and fail `Overloaded` without it.
+    #[test]
+    fn transfers_keyed_receive_reclaims_before_overloaded() {
+        let env = racer_io::Env::host();
+        let admission = Rc::new(flow_control::Quotas::new(AdmissionPolicy::new(
+            crate::test_support::cluster::config(false).limits,
+        )));
+        let reactor = Rc::new(crate::runtime::Reactor::new(admission.clone(), &env));
+        let signers = crate::peer::tests::signers(&env);
+        let transfers = || {
+            let io = Rc::new(crate::http::new_io(
+                reactor.clone(),
+                crate::http::Codec::new(crate::peer::protocol::MAX_ENVELOPE_HEAD),
+                admission.clone(),
+                crate::model::PAGE_BYTES + 16,
+            ));
+            Transfers::new(
+                Rc::new(crate::http::new_pool(reactor.clone(), admission.clone(), 1)),
+                io,
+                admission.clone(),
+                Rc::new(crate::peer::protocol::SecurityCodec::new(
+                    admission.clone(),
+                    crate::memory::BufferPool::new(admission.clone()),
+                )),
+                signers[0].clone(),
+            )
+        };
+        let cache = racer_wire::control::CacheId("11111111-4444-4444-8444-444444444444".into());
+        let held = Rc::new(std::cell::RefCell::new(Vec::new()));
+        for shift in (0..48).rev() {
+            while let Ok(charge) =
+                admission.reserve(Some(&cache), ResourceClass::Ciphertext, 1 << shift)
+            {
+                held.borrow_mut().push(charge);
+            }
+        }
+        let used = admission.used(ResourceClass::Ciphertext);
+        assert_eq!(
+            transfers().reserve_ciphertext(&cache, 64).err(),
+            Some(Error::Overloaded)
+        );
+        let requests = Rc::new(std::cell::Cell::new(None));
+        let reclaiming = transfers().with_reclamation({
+            let (held, requests) = (held.clone(), requests.clone());
+            move |owner, bytes| {
+                requests.set(Some((owner.clone(), bytes)));
+                held.borrow_mut().clear();
+            }
+        });
+        assert_eq!(admission.used(ResourceClass::Ciphertext), used);
+        let charge = reclaiming.reserve_ciphertext(&cache, 64).unwrap();
+        assert_eq!(charge.amount(), 64);
+        assert_eq!(requests.take(), Some((cache, 64)));
+        drop(charge);
         assert_eq!(admission.used(ResourceClass::Ciphertext), 0);
     }
     mod native_control_tests {
