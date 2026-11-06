@@ -52,13 +52,14 @@ type QualificationReconciler struct {
 // +kubebuilder:rbac:groups="",resources=nodes,verbs=get;list;watch;update;patch
 
 type qualificationRecord struct {
-	Reference  signalv1.ContributingRunReference
-	Profile    signalv1.PinnedProfile
-	Suite      signalv1.PinnedSuite
-	Identity   signalv1.QualificationEvidenceIdentity
-	Phase      signalv1.RunPhase
-	StartedAt  time.Time
-	FinishedAt time.Time
+	Reference      signalv1.ContributingRunReference
+	Profile        signalv1.PinnedProfile
+	Suite          signalv1.PinnedSuite
+	Identity       signalv1.QualificationEvidenceIdentity
+	CreditEligible bool
+	Phase          signalv1.RunPhase
+	StartedAt      time.Time
+	FinishedAt     time.Time
 }
 
 type qualificationRunIndex map[types.UID][]qualificationRecord
@@ -615,9 +616,13 @@ func (r *QualificationReconciler) buildQualificationRunIndex(
 				EvidenceURI:    run.Status.Evidence.URI,
 				EvidenceDigest: run.Status.Evidence.Digest,
 			},
-			Profile:    run.Spec.Profile,
-			Suite:      run.Spec.Suite,
-			Identity:   *run.Status.Evidence.Identity.DeepCopy(),
+			Profile:  run.Spec.Profile,
+			Suite:    run.Spec.Suite,
+			Identity: *run.Status.Evidence.Identity.DeepCopy(),
+			CreditEligible: qualificationCreditEligible(
+				run.Spec.ResolvedPlan,
+				run.Status.Evidence.Identity,
+			),
 			Phase:      run.Status.Phase,
 			StartedAt:  identityStartedAt(run.Status.Evidence.Identity),
 			FinishedAt: identityFinishedAt(run.Status.Evidence.Identity),
@@ -710,25 +715,66 @@ func (r *QualificationReconciler) recordFromEvidence(
 		return qualificationRecord{}, false, errors.New("evidence provenance is incomplete")
 	}
 
-	finishedAt, err := time.Parse(time.RFC3339Nano, document.FinishedAt)
-	if err != nil {
+	if _, err := time.Parse(time.RFC3339Nano, document.FinishedAt); err != nil {
 		return qualificationRecord{}, false, err
 	}
 
-	startedAt, err := time.Parse(time.RFC3339Nano, document.StartedAt)
-	if err != nil {
+	if _, err := time.Parse(time.RFC3339Nano, document.StartedAt); err != nil {
 		return qualificationRecord{}, false, err
 	}
 
 	return qualificationRecord{
-		Reference:  reference,
-		Profile:    document.Profile,
-		Suite:      document.Suite,
-		Identity:   *document.QualificationIdentity,
+		Reference: reference,
+		Profile:   document.Profile,
+		Suite:     document.Suite,
+		Identity:  *document.QualificationIdentity,
+		CreditEligible: qualificationCreditEligible(
+			document.ResolvedPlan,
+			document.QualificationIdentity,
+		),
 		Phase:      document.Phase,
-		StartedAt:  startedAt,
-		FinishedAt: finishedAt,
+		StartedAt:  identityStartedAt(document.QualificationIdentity),
+		FinishedAt: identityFinishedAt(document.QualificationIdentity),
 	}, true, nil
+}
+
+func qualificationCreditEligible(
+	resolvedPlan *signalv1.ResolvedCertificationPlan,
+	identity *signalv1.QualificationEvidenceIdentity,
+) bool {
+	if identity == nil {
+		return false
+	}
+
+	if resolvedPlan == nil {
+		return len(identity.Checks) > 0
+	}
+
+	summaries := make(map[[2]int32]signalv1.StageEvidenceSummary, len(identity.Stages))
+	for _, summary := range identity.Stages {
+		summaries[[2]int32{summary.PhaseOrder, summary.StageOrder}] = summary
+	}
+
+	for phaseIndex := range resolvedPlan.Phases {
+		for stageIndex := range resolvedPlan.Phases[phaseIndex].Stages {
+			stage := &resolvedPlan.Phases[phaseIndex].Stages[stageIndex]
+			if stage.Optional {
+				continue
+			}
+
+			summary, found := summaries[[2]int32{int32(phaseIndex), int32(stageIndex)}]
+			if !found ||
+				!stage.QualificationEligible ||
+				stage.DiagnosticOnly ||
+				!summary.QualificationEligible ||
+				summary.DiagnosticOnly ||
+				summary.Verdict != signalv1.StageVerdictPassed {
+				return false
+			}
+		}
+	}
+
+	return true
 }
 
 func canonicalQualificationPlanDigest(
@@ -812,6 +858,10 @@ func (r *QualificationReconciler) acceptedRecords(
 
 	for index := range records {
 		record := records[index]
+		if !record.CreditEligible || record.Phase != signalv1.RunPhaseSucceeded {
+			continue
+		}
+
 		if record.Profile.Name != requirement.Profile.Name ||
 			(requirement.Profile.UID != "" && record.Profile.UID != requirement.Profile.UID) {
 			continue
@@ -1254,9 +1304,16 @@ func recordParticipant(
 
 func identityFinishedAt(identity *signalv1.QualificationEvidenceIdentity) time.Time {
 	var finished time.Time
+
 	for index := range identity.Checks {
 		if identity.Checks[index].FinishedAt.After(finished) {
 			finished = identity.Checks[index].FinishedAt.Time
+		}
+	}
+
+	for index := range identity.Stages {
+		if identity.Stages[index].FinishedAt.After(finished) {
+			finished = identity.Stages[index].FinishedAt.Time
 		}
 	}
 
@@ -1268,6 +1325,13 @@ func identityStartedAt(identity *signalv1.QualificationEvidenceIdentity) time.Ti
 
 	for index := range identity.Checks {
 		value := identity.Checks[index].StartedAt.Time
+		if started.IsZero() || value.Before(started) {
+			started = value
+		}
+	}
+
+	for index := range identity.Stages {
+		value := identity.Stages[index].StartedAt.Time
 		if started.IsZero() || value.Before(started) {
 			started = value
 		}

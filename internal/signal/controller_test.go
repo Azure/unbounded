@@ -13,11 +13,15 @@ import (
 	"testing"
 	"time"
 
+	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 
 	signalv1 "github.com/Azure/unbounded/api/signal/v1alpha1"
@@ -360,6 +364,380 @@ func TestResolveStageParticipantRolesFreezesSelectedIndexes(t *testing.T) {
 	}
 }
 
+func TestResolvedTerminalEvidencePreservesFailureAndDiagnosticIdentity(t *testing.T) {
+	t.Parallel()
+
+	node := qualificationNode("node", "node-uid", "boot-a")
+	scheme := qualificationScheme(t)
+	kube := fake.NewClientBuilder().WithScheme(scheme).WithObjects(node).Build()
+	reconciler := &RunReconciler{
+		Client:          kube,
+		APIReader:       kube,
+		ControllerImage: pinnedImage("controller", "a"),
+	}
+
+	for _, tt := range []struct {
+		name            string
+		stageVerdict    signalv1.StageVerdict
+		runVerdict      string
+		reason          string
+		diagnostic      bool
+		wantParticipant signalv1.QualificationVerdict
+		wantCredit      bool
+	}{
+		{
+			name:            "failed assertion",
+			stageVerdict:    signalv1.StageVerdictFailed,
+			runVerdict:      "Fail",
+			reason:          "RequiredStageFailed: assertion throughput failed",
+			wantParticipant: signalv1.QualificationVerdictFail,
+		},
+		{
+			name:            "diagnostic pass",
+			stageVerdict:    signalv1.StageVerdictPassed,
+			runVerdict:      "Pass",
+			reason:          "AllRequiredStagesPassed",
+			diagnostic:      true,
+			wantParticipant: signalv1.QualificationVerdictPass,
+		},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			run, summary, runnerImage := resolvedTerminalTestRun(t, node, tt.stageVerdict, tt.diagnostic)
+
+			stage := &run.Spec.ResolvedPlan.Phases[0].Stages[0]
+			if err := validateStageEvidenceSummary(
+				&summary,
+				0,
+				0,
+				signalv1.CheckStageRoleValidation,
+				stage,
+				1,
+			); err != nil {
+				t.Fatalf("validateStageEvidenceSummary() error = %v", err)
+			}
+
+			if stage.Assertions[0].Expected == nil ||
+				stage.Assertions[0].Expected.DecimalValue == nil ||
+				*stage.Assertions[0].Expected.DecimalValue != "25.0" {
+				t.Fatalf("immutable assertion threshold = %#v", stage.Assertions[0])
+			}
+
+			if tt.stageVerdict == signalv1.StageVerdictFailed &&
+				(summary.Assertions[0].Actual != nil ||
+					summary.Assertions[0].Passed ||
+					summary.Assertions[0].Message == "") {
+				t.Fatalf("missing-metric assertion evidence = %#v", summary.Assertions[0])
+			}
+
+			identity, verdict, reason, err := reconciler.resolvedQualificationEvidenceIdentity(
+				context.Background(),
+				run,
+				[]signalv1.StageEvidenceSummary{summary},
+				[]string{runnerImage},
+				tt.runVerdict,
+				tt.reason,
+			)
+			if err != nil {
+				t.Fatalf("resolvedQualificationEvidenceIdentity() error = %v", err)
+			}
+
+			if identity == nil || verdict != tt.runVerdict || reason != tt.reason {
+				t.Fatalf("terminal identity = %#v, verdict %q, reason %q", identity, verdict, reason)
+			}
+
+			if identity.Participants[0].Verdict != tt.wantParticipant ||
+				len(identity.Stages) != 1 ||
+				identity.Stages[0].Verdict != tt.stageVerdict {
+				t.Fatalf("terminal identity = %#v", identity)
+			}
+
+			if got := qualificationCreditEligible(run.Spec.ResolvedPlan, identity); got != tt.wantCredit {
+				t.Fatalf("qualificationCreditEligible() = %t, want %t", got, tt.wantCredit)
+			}
+
+			run.Status.Evidence.Identity = nil
+			startedAt := summary.StartedAt
+			finishedAt := summary.FinishedAt
+
+			document, err := reconciler.evidenceDocument(
+				context.Background(),
+				run,
+				[]signalv1.StageEvidenceSummary{summary},
+				"Completed",
+				tt.runVerdict,
+				tt.reason,
+				startedAt,
+				finishedAt,
+			)
+			if err != nil {
+				t.Fatalf("evidenceDocument() error = %v", err)
+			}
+
+			var decoded struct {
+				StageSummaries []signalv1.StageEvidenceSummary `json:"stageSummaries"`
+			}
+			if err := json.Unmarshal(document, &decoded); err != nil {
+				t.Fatalf("decode evidence document: %v", err)
+			}
+
+			if len(decoded.StageSummaries) != 1 ||
+				decoded.StageSummaries[0].Verdict != tt.stageVerdict {
+				t.Fatalf("durable stage summaries = %#v", decoded.StageSummaries)
+			}
+		})
+	}
+}
+
+func TestValidateStageEvidenceSummaryRejectsOmittedFailedAssertion(t *testing.T) {
+	t.Parallel()
+
+	node := qualificationNode("node", "node-uid", "boot-a")
+	run, summary, _ := resolvedTerminalTestRun(
+		t,
+		node,
+		signalv1.StageVerdictFailed,
+		false,
+	)
+	summary.Assertions = nil
+
+	if err := validateStageEvidenceSummary(
+		&summary,
+		0,
+		0,
+		signalv1.CheckStageRoleValidation,
+		&run.Spec.ResolvedPlan.Phases[0].Stages[0],
+		1,
+	); err == nil {
+		t.Fatal("failed stage evidence without its configured assertion was accepted")
+	}
+}
+
+func TestResolvedWorkflowFailurePreservesStageFailure(t *testing.T) {
+	t.Parallel()
+
+	workflow := &unstructured.Unstructured{Object: map[string]any{
+		"status": map[string]any{"message": "required assertion failed"},
+	}}
+
+	verdict, reason := resolvedWorkflowVerdict(
+		workflow,
+		"Failed",
+		"Fail",
+		"RequiredStageFailed: assertion throughput failed",
+	)
+	if verdict != "Fail" || reason != "RequiredStageFailed: assertion throughput failed" {
+		t.Fatalf("resolved Workflow verdict = %q, reason = %q", verdict, reason)
+	}
+
+	verdict, reason = resolvedWorkflowVerdict(workflow, "Failed", "Pass", "AllRequiredStagesPassed")
+	if verdict != "Inconclusive" ||
+		reason != "WorkflowFailed: required assertion failed" {
+		t.Fatalf("failed Workflow without stage failure = %q, reason = %q", verdict, reason)
+	}
+}
+
+func TestResolvedRunCleanupReleasesAndDeletesWithoutScriptBundle(t *testing.T) {
+	t.Parallel()
+
+	scheme := resolvedCleanupScheme(t)
+	finishedAt := time.Date(2026, 11, 5, 18, 30, 0, 0, time.UTC)
+	node := qualificationNode("node", "node-uid", "boot-a")
+	node.Spec.Unschedulable = true
+	node.Labels = map[string]string{}
+	node.Labels[RequestLabel] = "profile"
+	node.Labels[signalv1.ReservationNodeUIDLabel] = string(node.UID)
+	node.Annotations = map[string]string{ReservationLabel: "resolved-run"}
+
+	run := &signalv1.CertificationRun{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:       "resolved-run",
+			Namespace:  "signal-system",
+			UID:        "resolved-run-uid",
+			Finalizers: []string{RunFinalizer},
+		},
+		Spec: signalv1.CertificationRunSpec{
+			Profile: signalv1.PinnedProfile{Name: "profile"},
+			Participants: []signalv1.Participant{{
+				NodeName: node.Name,
+				NodeUID:  node.UID,
+			}},
+			ResolvedPlan: &signalv1.ResolvedCertificationPlan{
+				Phases: []signalv1.ResolvedPhasePlan{{Name: "validation"}},
+			},
+		},
+		Status: signalv1.CertificationRunStatus{
+			Phase: signalv1.RunPhaseSucceeded,
+			Evidence: signalv1.EvidenceStatus{
+				URI:    "kubernetes://signal-system/resolved-run-evidence/evidence.json.gz",
+				Digest: "sha256:" + strings.Repeat("a", 64),
+			},
+		},
+	}
+	evidence := []byte(fmt.Sprintf(
+		`{"runID":%q,"runName":%q,"finishedAt":%q}`,
+		run.UID,
+		run.Name,
+		finishedAt.Format(time.RFC3339Nano),
+	))
+	store := staticEvidenceStore{
+		data:   evidence,
+		uri:    run.Status.Evidence.URI,
+		digest: run.Status.Evidence.Digest,
+	}
+	kube := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithStatusSubresource(&signalv1.CertificationRun{}).
+		WithObjects(node, run).
+		Build()
+	reconciler := &RunReconciler{Client: kube, APIReader: kube, Evidence: store}
+
+	var current signalv1.CertificationRun
+	if err := kube.Get(
+		context.Background(),
+		client.ObjectKey{Namespace: run.Namespace, Name: run.Name},
+		&current,
+	); err != nil {
+		t.Fatalf("get Run before cleanup: %v", err)
+	}
+
+	if _, err := reconciler.cleanup(context.Background(), &current); err != nil {
+		t.Fatalf("cleanup() error = %v", err)
+	}
+
+	if err := kube.Get(
+		context.Background(),
+		client.ObjectKey{Namespace: run.Namespace, Name: run.Name},
+		&current,
+	); err != nil {
+		t.Fatalf("get Run after cleanup: %v", err)
+	}
+
+	if slices.Contains(current.Finalizers, RunFinalizer) {
+		t.Fatalf("Run finalizers = %#v", current.Finalizers)
+	}
+
+	var released corev1.Node
+	if err := kube.Get(context.Background(), client.ObjectKey{Name: node.Name}, &released); err != nil {
+		t.Fatalf("get released Node: %v", err)
+	}
+
+	if released.Spec.Unschedulable ||
+		released.Labels[RequestLabel] != "" ||
+		released.Labels[signalv1.ReservationNodeUIDLabel] != "" ||
+		released.Annotations[ReservationLabel] != "" {
+		t.Fatalf("Node was not fully released: %#v", released)
+	}
+
+	if err := kube.Delete(context.Background(), &current); err != nil {
+		t.Fatalf("delete cleaned Run: %v", err)
+	}
+
+	if err := kube.Get(
+		context.Background(),
+		client.ObjectKey{Namespace: run.Namespace, Name: run.Name},
+		&current,
+	); !apierrors.IsNotFound(err) {
+		t.Fatalf("deleted Run lookup error = %v, want NotFound", err)
+	}
+}
+
+func TestResolvedCleanupWaitsForAndFencesChildWorkflowsAndPods(t *testing.T) {
+	t.Parallel()
+
+	scheme := resolvedCleanupScheme(t)
+	run := &signalv1.CertificationRun{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "resolved-run",
+			Namespace: "signal-system",
+			UID:       "resolved-run-uid",
+		},
+		Spec: signalv1.CertificationRunSpec{
+			ResolvedPlan: &signalv1.ResolvedCertificationPlan{},
+		},
+	}
+	root := cleanupWorkflow("root", run.Namespace, "root-uid", run.UID, nil)
+	childOwner := metav1.OwnerReference{UID: root.GetUID(), Name: root.GetName(), Kind: "Workflow"}
+	child := cleanupWorkflow("child", run.Namespace, "child-uid", run.UID, []metav1.OwnerReference{childOwner})
+	podOwner := metav1.OwnerReference{UID: child.GetUID(), Name: child.GetName(), Kind: "Workflow"}
+	pod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:            "child-pod",
+			Namespace:       run.Namespace,
+			UID:             "child-pod-uid",
+			Labels:          map[string]string{RunUIDLabel: string(run.UID)},
+			OwnerReferences: []metav1.OwnerReference{podOwner},
+		},
+	}
+	kube := fake.NewClientBuilder().WithScheme(scheme).WithObjects(child, pod).Build()
+	reconciler := &RunReconciler{Client: kube, APIReader: kube}
+
+	if err := reconciler.fenceWorkflowDependents(
+		context.Background(),
+		kube,
+		root,
+		run,
+	); err != nil {
+		t.Fatalf("fenceWorkflowDependents() error = %v", err)
+	}
+
+	var fencedChild unstructured.Unstructured
+	fencedChild.SetGroupVersionKind(workflowGVK)
+
+	if err := kube.Get(
+		context.Background(),
+		client.ObjectKey{Namespace: child.GetNamespace(), Name: child.GetName()},
+		&fencedChild,
+	); err != nil {
+		t.Fatalf("get fenced child Workflow: %v", err)
+	}
+
+	if len(fencedChild.GetOwnerReferences()) != 1 ||
+		fencedChild.GetOwnerReferences()[0].BlockOwnerDeletion == nil ||
+		!*fencedChild.GetOwnerReferences()[0].BlockOwnerDeletion {
+		t.Fatalf("child Workflow owner fence = %#v", fencedChild.GetOwnerReferences())
+	}
+
+	var fencedPod corev1.Pod
+	if err := kube.Get(
+		context.Background(),
+		client.ObjectKey{Namespace: pod.Namespace, Name: pod.Name},
+		&fencedPod,
+	); err != nil {
+		t.Fatalf("get fenced Pod: %v", err)
+	}
+
+	if len(fencedPod.OwnerReferences) != 1 ||
+		fencedPod.OwnerReferences[0].BlockOwnerDeletion == nil ||
+		!*fencedPod.OwnerReferences[0].BlockOwnerDeletion {
+		t.Fatalf("child Pod owner fence = %#v", fencedPod.OwnerReferences)
+	}
+
+	gone, err := reconciler.runWorkloadsGone(context.Background(), kube, run)
+	if err != nil || gone {
+		t.Fatalf("runWorkloadsGone() = %t, %v with children present", gone, err)
+	}
+
+	if err := kube.Delete(context.Background(), &fencedChild); err != nil {
+		t.Fatalf("delete child Workflow: %v", err)
+	}
+
+	gone, err = reconciler.runWorkloadsGone(context.Background(), kube, run)
+	if err != nil || gone {
+		t.Fatalf("runWorkloadsGone() = %t, %v with child Pod present", gone, err)
+	}
+
+	if err := kube.Delete(context.Background(), &fencedPod); err != nil {
+		t.Fatalf("delete child Pod: %v", err)
+	}
+
+	gone, err = reconciler.runWorkloadsGone(context.Background(), kube, run)
+	if err != nil || !gone {
+		t.Fatalf("runWorkloadsGone() = %t, %v after child deletion", gone, err)
+	}
+}
+
 func TestResolvePhasePlanEnforcesCertificationTestTrust(t *testing.T) {
 	t.Parallel()
 
@@ -535,6 +913,213 @@ func resolvedWorkflowTestRun() *signalv1.CertificationRun {
 
 func testDurationPointer(value time.Duration) *metav1.Duration {
 	return &metav1.Duration{Duration: value}
+}
+
+func resolvedTerminalTestRun(
+	t *testing.T,
+	node *corev1.Node,
+	stageVerdict signalv1.StageVerdict,
+	diagnostic bool,
+) (*signalv1.CertificationRun, signalv1.StageEvidenceSummary, string) {
+	t.Helper()
+
+	runnerImage := pinnedImage("runner", "b")
+	minimumThroughput := "25.0"
+	stage := signalv1.ResolvedStagePlan{
+		Name: "validation",
+		Test: signalv1.ResolvedCertificationTest{
+			Identity: signalv1.TestIdentitySnapshot{
+				Name:          "test",
+				UID:           "test-uid",
+				Generation:    1,
+				ContentDigest: "sha256:" + strings.Repeat("c", 64),
+				Trust:         signalv1.CertificationTestTrustApproved,
+			},
+			ParameterSchemaDigest:      "sha256:" + strings.Repeat("1", 64),
+			MetricSchemaDigest:         "sha256:" + strings.Repeat("2", 64),
+			SecurityRequirementsDigest: "sha256:" + strings.Repeat("3", 64),
+			Metrics: []signalv1.TestMetricDefinition{{
+				Name:        "throughput",
+				DisplayName: "Throughput",
+				Type:        signalv1.MetricValueTypeThroughput,
+				Required:    true,
+			}},
+			Driver: signalv1.CertificationTestDriver{
+				Type:      signalv1.TestDriverTypeContainer,
+				Container: &signalv1.ContainerTestDriver{Image: runnerImage},
+			},
+			Topology: signalv1.TestTopology{
+				MinParticipants: 1,
+				MaxParticipants: 1,
+			},
+		},
+		Schedule: signalv1.StageSchedule{
+			Mode:              signalv1.CheckExecutionModeRunOnce,
+			InvocationTimeout: metav1.Duration{Duration: time.Minute},
+		},
+		Assertions: []signalv1.TestAssertion{{
+			Name:     "throughput",
+			Metric:   "throughput",
+			Operator: signalv1.AssertionOperatorMinimum,
+			Expected: &signalv1.TypedValue{
+				Type:         signalv1.TypedValueTypeDecimal,
+				DecimalValue: &minimumThroughput,
+			},
+		}},
+		QualificationEligible: !diagnostic,
+		DiagnosticOnly:        diagnostic,
+	}
+	plan := &signalv1.ResolvedCertificationPlan{
+		Phases: []signalv1.ResolvedPhasePlan{{
+			Name:   "validation",
+			Role:   signalv1.CheckStageRoleValidation,
+			Stages: []signalv1.ResolvedStagePlan{stage},
+		}},
+	}
+	provenance := signalv1.ExecutionPlanProvenance{
+		ControllerImage:        pinnedImage("controller", "a"),
+		AdapterImage:           pinnedImage("adapter", "d"),
+		WorkflowTemplateDigest: "sha256:" + strings.Repeat("e", 64),
+	}
+
+	digest, err := signalv1.DeriveResolvedExecutionPlanDigest(1, nil, *plan, provenance)
+	if err != nil {
+		t.Fatalf("derive resolved plan digest: %v", err)
+	}
+
+	fingerprint := nodeFingerprint(node)
+	startedAt := metav1.NewTime(time.Date(2026, 11, 5, 17, 0, 0, 0, time.UTC))
+	finishedAt := metav1.NewTime(startedAt.Add(time.Minute))
+	assertionPassed := stageVerdict == signalv1.StageVerdictPassed
+	actualThroughput := "30.0"
+	actual := &signalv1.TypedValue{
+		Type:         signalv1.TypedValueTypeDecimal,
+		DecimalValue: &actualThroughput,
+	}
+	message := ""
+
+	if !assertionPassed {
+		actual = nil
+		message = "required throughput metric was not produced"
+	}
+
+	summary := signalv1.StageEvidenceSummary{
+		PhaseOrder:             0,
+		StageOrder:             0,
+		Name:                   stage.Name,
+		Role:                   signalv1.CheckStageRoleValidation,
+		Test:                   stage.Test.Identity,
+		Mode:                   stage.Schedule.Mode,
+		Verdict:                stageVerdict,
+		StartedAt:              startedAt,
+		FinishedAt:             finishedAt,
+		ObservedCoverageWindow: metav1.Duration{Duration: time.Minute},
+		InvocationCount:        1,
+		SuccessfulInvocations:  1,
+		Assertions: []signalv1.AssertionResult{{
+			Name:    "throughput",
+			Passed:  assertionPassed,
+			Actual:  actual,
+			Message: message,
+		}},
+		DurableEvidenceDigest: "sha256:" + strings.Repeat("f", 64),
+		QualificationEligible: !diagnostic,
+		DiagnosticOnly:        diagnostic,
+	}
+	if stageVerdict == signalv1.StageVerdictFailed {
+		summary.SuccessfulInvocations = 0
+		summary.FailedInvocations = 1
+	}
+
+	startIdentity, err := json.Marshal([]signalv1.NodeFingerprint{fingerprint})
+	if err != nil {
+		t.Fatalf("encode start identity: %v", err)
+	}
+
+	run := &signalv1.CertificationRun{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "resolved-terminal",
+			Namespace: "signal-system",
+			UID:       "resolved-terminal-uid",
+			Annotations: map[string]string{
+				RunStartIdentityAnnotation: string(startIdentity),
+			},
+		},
+		Spec: signalv1.CertificationRunSpec{
+			Profile: signalv1.PinnedProfile{Name: "profile", UID: "profile-uid", Generation: 1},
+			Suite:   signalv1.PinnedSuite{Name: "suite", UID: "suite-uid", Generation: 1},
+			Participants: []signalv1.Participant{{
+				NodeName: node.Name,
+				NodeUID:  node.UID,
+			}},
+			ResolvedPlan:   plan,
+			PlanDigest:     digest,
+			PlanProvenance: &provenance,
+		},
+	}
+
+	return run, summary, runnerImage
+}
+
+type staticEvidenceStore struct {
+	data   []byte
+	uri    string
+	digest string
+}
+
+func (s staticEvidenceStore) Put(context.Context, string, []byte) (string, string, error) {
+	return s.uri, s.digest, nil
+}
+
+func (s staticEvidenceStore) Get(context.Context, string) ([]byte, string, string, bool, error) {
+	return s.data, s.uri, s.digest, true, nil
+}
+
+func resolvedCleanupScheme(t *testing.T) *runtime.Scheme {
+	t.Helper()
+
+	scheme := runtime.NewScheme()
+	if err := corev1.AddToScheme(scheme); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := batchv1.AddToScheme(scheme); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := signalv1.AddToScheme(scheme); err != nil {
+		t.Fatal(err)
+	}
+
+	scheme.AddKnownTypeWithName(workflowGVK, &unstructured.Unstructured{})
+	scheme.AddKnownTypeWithName(
+		schema.GroupVersionKind{
+			Group:   workflowGVK.Group,
+			Version: workflowGVK.Version,
+			Kind:    workflowGVK.Kind + "List",
+		},
+		&unstructured.UnstructuredList{},
+	)
+
+	return scheme
+}
+
+func cleanupWorkflow(
+	name string,
+	namespace string,
+	uid types.UID,
+	runUID types.UID,
+	owners []metav1.OwnerReference,
+) *unstructured.Unstructured {
+	workflow := &unstructured.Unstructured{}
+	workflow.SetGroupVersionKind(workflowGVK)
+	workflow.SetName(name)
+	workflow.SetNamespace(namespace)
+	workflow.SetUID(uid)
+	workflow.SetLabels(map[string]string{RunUIDLabel: string(runUID)})
+	workflow.SetOwnerReferences(owners)
+
+	return workflow
 }
 
 func TestValidateRunCheckPlanAssignsPositionalIdentity(t *testing.T) {

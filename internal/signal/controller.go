@@ -56,6 +56,7 @@ const (
 	RunStartIdentityAnnotation = "signal.unbounded-cloud.io/start-fingerprints"
 	RunFinalizer               = "signal.unbounded-cloud.io/cleanup"
 	SnapshotRunLabel           = "signal.unbounded-cloud.io/run"
+	RunUIDLabel                = "signal.unbounded-cloud.io/run-uid"
 	checkResultDigest          = "signal.unbounded-cloud.io/check-result-digest"
 	checkResultRunUID          = "signal.unbounded-cloud.io/check-result-run-uid"
 	checkResultCheckID         = "signal.unbounded-cloud.io/check-result-check-id"
@@ -2402,6 +2403,7 @@ func (r *RunReconciler) finishInvalidExecutionPlan(
 	evidence, err := r.evidenceDocument(
 		ctx,
 		evidenceRun,
+		nil,
 		"Error",
 		"Inconclusive",
 		reason,
@@ -2618,6 +2620,7 @@ func buildResolvedWorkflow(run *signalv1.CertificationRun) (*unstructured.Unstru
 			"namespace": run.Namespace,
 			"labels": map[string]any{
 				SnapshotRunLabel: run.Name,
+				RunUIDLabel:      string(run.UID),
 			},
 		},
 		"spec": map[string]any{
@@ -2779,6 +2782,7 @@ func (r *RunReconciler) finishGrouped(
 	evidence, err := r.evidenceDocument(
 		ctx,
 		evidenceRun,
+		nil,
 		executionState,
 		verdict,
 		reason,
@@ -2819,13 +2823,7 @@ func (r *RunReconciler) finishResolved(
 	workflowPhase string,
 ) (ctrl.Result, error) {
 	stages, runnerImages, verdict, reason := r.terminalStageSummaries(ctx, workflow, run)
-	if workflowPhase != "Succeeded" {
-		verdict = "Inconclusive"
-
-		if reason == "" {
-			reason = "Workflow" + workflowPhase + ": " + workflowMessage(workflow)
-		}
-	}
+	verdict, reason = resolvedWorkflowVerdict(workflow, workflowPhase, verdict, reason)
 
 	identity, enforcedVerdict, enforcedReason, err := r.resolvedQualificationEvidenceIdentity(
 		ctx,
@@ -2853,6 +2851,7 @@ func (r *RunReconciler) finishResolved(
 	evidence, err := r.evidenceDocument(
 		ctx,
 		evidenceRun,
+		stages,
 		"Completed",
 		verdict,
 		reason,
@@ -2885,6 +2884,19 @@ func (r *RunReconciler) finishResolved(
 	return ctrl.Result{RequeueAfter: time.Millisecond}, nil
 }
 
+func resolvedWorkflowVerdict(
+	workflow *unstructured.Unstructured,
+	workflowPhase string,
+	verdict string,
+	reason string,
+) (string, string) {
+	if workflowPhase != "Succeeded" && verdict != "Fail" {
+		return "Inconclusive", "Workflow" + workflowPhase + ": " + workflowMessage(workflow)
+	}
+
+	return verdict, reason
+}
+
 func (r *RunReconciler) terminalStageSummaries(
 	ctx context.Context,
 	workflow *unstructured.Unstructured,
@@ -2915,10 +2927,17 @@ func (r *RunReconciler) terminalStageSummaries(
 					continue
 				}
 
-				return stages,
-					runnerImages,
-					"Inconclusive",
-					fmt.Sprintf("StageEvidenceInvalid: phase %s stage %s: %v", phase.Name, stage.Name, err)
+				if verdict != "Fail" {
+					verdict = "Inconclusive"
+					reason = fmt.Sprintf(
+						"StageEvidenceInvalid: phase %s stage %s: %v",
+						phase.Name,
+						stage.Name,
+						err,
+					)
+				}
+
+				continue
 			}
 
 			stages = append(stages, *summary)
@@ -3216,6 +3235,18 @@ func validateStageEvidenceSummary(
 			return fmt.Errorf("stage evidence contains unknown assertion %s", assertion.Name)
 		}
 
+		if len([]rune(assertion.Message)) > 256 {
+			return fmt.Errorf("stage assertion %s message is oversized", assertion.Name)
+		}
+
+		if assertion.Actual == nil &&
+			(assertion.Passed || strings.TrimSpace(assertion.Message) == "") {
+			return fmt.Errorf(
+				"stage assertion %s without an actual value must fail with a message",
+				assertion.Name,
+			)
+		}
+
 		if !assertion.Passed && summary.Verdict == signalv1.StageVerdictPassed {
 			return fmt.Errorf("stage passed despite failed assertion %s", assertion.Name)
 		}
@@ -3223,7 +3254,7 @@ func validateStageEvidenceSummary(
 		delete(expectedAssertions, assertion.Name)
 	}
 
-	if summary.Verdict == signalv1.StageVerdictPassed && len(expectedAssertions) != 0 {
+	if len(expectedAssertions) != 0 {
 		return errors.New("stage evidence is missing assertion results")
 	}
 
@@ -3970,6 +4001,7 @@ func compactEvidenceCheckStatuses(statuses []evidenceCheckStatus) []signalv1.Che
 func (r *RunReconciler) evidenceDocument(
 	ctx context.Context,
 	run *signalv1.CertificationRun,
+	stageSummaries []signalv1.StageEvidenceSummary,
 	executionState string,
 	verdict string,
 	reason string,
@@ -3994,6 +4026,7 @@ func (r *RunReconciler) evidenceDocument(
 			"reason":                reason,
 			"phase":                 run.Status.Phase,
 			"qualificationIdentity": run.Status.Evidence.Identity,
+			"stageSummaries":        stageSummaries,
 			"startedAt":             startedAt.UTC().Format(time.RFC3339Nano),
 			"finishedAt":            finishedAt.UTC().Format(time.RFC3339Nano),
 		}
@@ -4241,34 +4274,8 @@ func (r *RunReconciler) resolvedQualificationEvidenceIdentity(
 		return nil, "Inconclusive", "ExecutionPlanIdentityInvalid: immutable resolved plan provenance is invalid", nil
 	}
 
-	qualificationEligible := true
-
-	summaryByPosition := make(map[[2]int32]signalv1.StageEvidenceSummary, len(stages))
-	for _, summary := range stages {
-		summaryByPosition[[2]int32{summary.PhaseOrder, summary.StageOrder}] = summary
-	}
-
-	for phaseIndex := range run.Spec.ResolvedPlan.Phases {
-		phase := &run.Spec.ResolvedPlan.Phases[phaseIndex]
-		for stageIndex := range phase.Stages {
-			stage := &phase.Stages[stageIndex]
-			if stage.Optional {
-				continue
-			}
-
-			if !stage.QualificationEligible {
-				qualificationEligible = false
-			}
-
-			summary, found := summaryByPosition[[2]int32{int32(phaseIndex), int32(stageIndex)}]
-			if !found || summary.Verdict != signalv1.StageVerdictPassed {
-				return nil, "Inconclusive", "StageEvidenceMissing: required stage evidence is incomplete", nil
-			}
-		}
-	}
-
-	if !qualificationEligible {
-		return nil, verdict, "DiagnosticOnly: required stages are not qualification eligible", nil
+	if len(stages) == 0 {
+		return nil, verdict, reason, nil
 	}
 
 	starts, err := decodeStartFingerprints(run)
@@ -4308,22 +4315,19 @@ func (r *RunReconciler) resolvedQualificationEvidenceIdentity(
 		}
 	}
 
-	if len(participants) > 1 {
-		return nil,
-			"Inconclusive",
-			"ParticipantVerdictsMissing: stage evidence does not provide per-participant verdicts",
-			nil
-	}
-
 	if len(runnerImages) == 0 {
-		return nil, "Inconclusive", "RunnerProvenanceMissing: stage evidence has no runner images", nil
+		return nil, verdict, reason, nil
 	}
 
 	resolverImages := append([]string(nil), run.Spec.PlanProvenance.ResolverImages...)
 	sort.Strings(resolverImages)
 
 	for index := range participants {
-		participants[index].Verdict = qualificationVerdict(verdict)
+		if len(participants) > 1 {
+			participants[index].Verdict = signalv1.QualificationVerdictInconclusive
+		} else {
+			participants[index].Verdict = qualificationVerdict(verdict)
+		}
 	}
 
 	return &signalv1.QualificationEvidenceIdentity{
@@ -4842,6 +4846,7 @@ func (r *RunReconciler) cancel(ctx context.Context, run *signalv1.CertificationR
 	evidence, err := r.evidenceDocument(
 		ctx,
 		evidenceRun,
+		nil,
 		"Interrupted",
 		"Inconclusive",
 		evidenceRun.Status.Reason,
@@ -5008,6 +5013,10 @@ func (r *RunReconciler) cleanup(ctx context.Context, run *signalv1.Certification
 }
 
 func (r *RunReconciler) deleteScriptBundle(ctx context.Context, run *signalv1.CertificationRun) error {
+	if run.Spec.ScriptBundle == nil {
+		return nil
+	}
+
 	snapshot := &corev1.ConfigMap{}
 
 	reader := r.APIReader
@@ -5199,6 +5208,31 @@ func (r *RunReconciler) ensureWorkflowStopped(ctx context.Context, run *signalv1
 }
 
 func (r *RunReconciler) runWorkloadsGone(ctx context.Context, reader client.Reader, run *signalv1.CertificationRun) (bool, error) {
+	if run.Spec.ResolvedPlan != nil {
+		for _, kind := range []schema.GroupVersionKind{
+			workflowGVK,
+			corev1.SchemeGroupVersion.WithKind("Pod"),
+		} {
+			list := &unstructured.UnstructuredList{}
+			list.SetGroupVersionKind(kind.GroupVersion().WithKind(kind.Kind + "List"))
+
+			if err := reader.List(
+				ctx,
+				list,
+				client.InNamespace(run.Namespace),
+				client.MatchingLabels{RunUIDLabel: string(run.UID)},
+			); err != nil {
+				return false, fmt.Errorf("confirm resolved %s cleanup: %w", kind.Kind, err)
+			}
+
+			if len(list.Items) > 0 {
+				return false, nil
+			}
+		}
+
+		return true, nil
+	}
+
 	for _, check := range run.Spec.Checks {
 		for _, kind := range []schema.GroupVersionKind{
 			corev1.SchemeGroupVersion.WithKind("Pod"),
@@ -5235,11 +5269,15 @@ func (r *RunReconciler) fenceWorkflowDependents(
 	owners := map[types.UID]struct{}{workflow.GetUID(): {}}
 	kinds := []schema.GroupVersionKind{}
 
-	for _, check := range run.Spec.Checks {
-		if check.Backend == signalv1.ExecutionBackendMPIJob {
-			kinds = append(kinds, schema.GroupVersionKind{Group: "kubeflow.org", Version: "v2beta1", Kind: "MPIJob"})
+	if run.Spec.ResolvedPlan != nil {
+		kinds = append(kinds, workflowGVK)
+	} else {
+		for _, check := range run.Spec.Checks {
+			if check.Backend == signalv1.ExecutionBackendMPIJob {
+				kinds = append(kinds, schema.GroupVersionKind{Group: "kubeflow.org", Version: "v2beta1", Kind: "MPIJob"})
 
-			break
+				break
+			}
 		}
 	}
 
@@ -5255,7 +5293,12 @@ func (r *RunReconciler) fenceWorkflowDependents(
 		list := &unstructured.UnstructuredList{}
 		list.SetGroupVersionKind(kind.GroupVersion().WithKind(kind.Kind + "List"))
 
-		if err := reader.List(ctx, list, client.InNamespace(run.Namespace)); err != nil {
+		listOptions := []client.ListOption{client.InNamespace(run.Namespace)}
+		if run.Spec.ResolvedPlan != nil && (kind == workflowGVK || kind == corev1.SchemeGroupVersion.WithKind("Pod")) {
+			listOptions = append(listOptions, client.MatchingLabels{RunUIDLabel: string(run.UID)})
+		}
+
+		if err := reader.List(ctx, list, listOptions...); err != nil {
 			return fmt.Errorf("list %s before Workflow cleanup: %w", kind.Kind, err)
 		}
 

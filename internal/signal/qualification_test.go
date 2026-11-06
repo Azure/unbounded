@@ -603,6 +603,201 @@ func TestEvaluateLedgerRevokeWatermarkSurvivesFailedRunDeletion(t *testing.T) {
 	}
 }
 
+func TestResolvedFailedRunAdvancesRevokeWatermark(t *testing.T) {
+	t.Parallel()
+
+	now := time.Date(2026, 11, 5, 18, 0, 0, 0, time.UTC)
+	node := qualificationNode("node", "node-uid", "boot-a")
+	run, summary, runnerImage := resolvedTerminalTestRun(
+		t,
+		node,
+		signalv1.StageVerdictFailed,
+		false,
+	)
+	run.Name = "resolved-fail"
+	run.UID = "resolved-fail-uid"
+	run.Status.Phase = signalv1.RunPhaseFailed
+	run.Status.Evidence.URI = "kubernetes://signal-system/resolved-fail-evidence/evidence.json.gz"
+	run.Status.Evidence.Digest = "sha256:" + strings.Repeat("9", 64)
+
+	scheme := qualificationScheme(t)
+	kube := fake.NewClientBuilder().WithScheme(scheme).WithObjects(node).Build()
+	runReconciler := &RunReconciler{
+		Client:          kube,
+		APIReader:       kube,
+		ControllerImage: pinnedImage("controller", "a"),
+	}
+
+	identity, verdict, reason, err := runReconciler.resolvedQualificationEvidenceIdentity(
+		context.Background(),
+		run,
+		[]signalv1.StageEvidenceSummary{summary},
+		[]string{runnerImage},
+		"Fail",
+		"RequiredStageFailed: assertion throughput failed",
+	)
+	if err != nil {
+		t.Fatalf("resolvedQualificationEvidenceIdentity() error = %v", err)
+	}
+
+	if identity == nil || verdict != "Fail" ||
+		reason != "RequiredStageFailed: assertion throughput failed" {
+		t.Fatalf("resolved failure identity = %#v, verdict %q, reason %q", identity, verdict, reason)
+	}
+
+	run.Status.Evidence.Identity = identity
+
+	if got := identityStartedAt(identity); !got.Equal(summary.StartedAt.Time) {
+		t.Fatalf("resolved identity start = %v, want %v", got, summary.StartedAt.Time)
+	}
+
+	if got := identityFinishedAt(identity); !got.Equal(summary.FinishedAt.Time) {
+		t.Fatalf("resolved identity finish = %v, want %v", got, summary.FinishedAt.Time)
+	}
+
+	kube = fake.NewClientBuilder().WithScheme(scheme).WithObjects(node, run).Build()
+	policy := qualificationPolicy("policy", "policy-uid", signalv1.NonPassBehaviorRevoke)
+	policy.Spec.Requirements[0].AcceptedPlans.Digests = []string{run.Spec.PlanDigest}
+	reconciler := &QualificationReconciler{
+		Client:    kube,
+		APIReader: kube,
+		Evidence:  missingEvidenceStore{},
+		Namespace: run.Namespace,
+		Now:       func() time.Time { return now },
+	}
+	ledger := qualificationLedger(policy, node)
+	previousFinishedAt := metav1.NewTime(summary.StartedAt.Add(-time.Minute))
+	ledger.Status.LatestNonPass = &signalv1.LatestNonPassWatermark{
+		Name:           "previous-failure",
+		UID:            "previous-failure-uid",
+		FinishedAt:     previousFinishedAt,
+		Classification: signalv1.NonPassClassificationFailed,
+		EvidenceDigest: "sha256:" + strings.Repeat("8", 64),
+	}
+
+	status, err := reconciler.evaluateLedger(context.Background(), policy, node, ledger)
+	if err != nil {
+		t.Fatalf("evaluateLedger() error = %v", err)
+	}
+
+	if status.Phase != signalv1.NodeCertificationPhaseRevoked ||
+		status.LatestNonPass == nil ||
+		status.LatestNonPass.UID != run.UID ||
+		!status.LatestNonPass.FinishedAt.Equal(&summary.FinishedAt) ||
+		status.LatestNonPass.Classification != signalv1.NonPassClassificationFailed {
+		t.Fatalf("resolved failure watermark = %#v", status)
+	}
+}
+
+func TestResolvedPassUsesStageFinishForQualificationTime(t *testing.T) {
+	t.Parallel()
+
+	now := time.Date(2026, 11, 5, 18, 0, 0, 0, time.UTC)
+	node := qualificationNode("node", "node-uid", "boot-a")
+	run, summary, runnerImage := resolvedTerminalTestRun(
+		t,
+		node,
+		signalv1.StageVerdictPassed,
+		false,
+	)
+	run.Name = "resolved-pass"
+	run.UID = "resolved-pass-uid"
+	run.Status.Phase = signalv1.RunPhaseSucceeded
+	run.Status.Evidence.URI = "kubernetes://signal-system/resolved-pass-evidence/evidence.json.gz"
+	run.Status.Evidence.Digest = "sha256:" + strings.Repeat("7", 64)
+
+	scheme := qualificationScheme(t)
+	kube := fake.NewClientBuilder().WithScheme(scheme).WithObjects(node).Build()
+	runReconciler := &RunReconciler{
+		Client:          kube,
+		APIReader:       kube,
+		ControllerImage: pinnedImage("controller", "a"),
+	}
+
+	identity, verdict, reason, err := runReconciler.resolvedQualificationEvidenceIdentity(
+		context.Background(),
+		run,
+		[]signalv1.StageEvidenceSummary{summary},
+		[]string{runnerImage},
+		"Pass",
+		"AllRequiredStagesPassed",
+	)
+	if err != nil {
+		t.Fatalf("resolvedQualificationEvidenceIdentity() error = %v", err)
+	}
+
+	if identity == nil || verdict != "Pass" || reason != "AllRequiredStagesPassed" {
+		t.Fatalf("resolved pass identity = %#v, verdict %q, reason %q", identity, verdict, reason)
+	}
+
+	run.Status.Evidence.Identity = identity
+
+	kube = fake.NewClientBuilder().WithScheme(scheme).WithObjects(node, run).Build()
+	policy := qualificationPolicy("policy", "policy-uid", signalv1.NonPassBehaviorIgnore)
+	policy.Spec.Requirements[0].AcceptedPlans.Digests = []string{run.Spec.PlanDigest}
+	reconciler := &QualificationReconciler{
+		Client:    kube,
+		APIReader: kube,
+		Evidence:  missingEvidenceStore{},
+		Namespace: run.Namespace,
+		Now:       func() time.Time { return now },
+	}
+
+	status, err := reconciler.evaluateLedger(
+		context.Background(),
+		policy,
+		node,
+		qualificationLedger(policy, node),
+	)
+	if err != nil {
+		t.Fatalf("evaluateLedger() error = %v", err)
+	}
+
+	if status.Phase != signalv1.NodeCertificationPhaseQualified ||
+		status.QualifiedAt == nil ||
+		!status.QualifiedAt.Equal(&summary.FinishedAt) {
+		t.Fatalf("resolved qualification time = %#v", status)
+	}
+
+	workflowFinishedAt := metav1.NewTime(summary.FinishedAt.Add(10 * time.Minute))
+
+	document, err := runReconciler.evidenceDocument(
+		context.Background(),
+		run,
+		[]signalv1.StageEvidenceSummary{summary},
+		"Completed",
+		"Pass",
+		"AllRequiredStagesPassed",
+		summary.StartedAt,
+		workflowFinishedAt,
+	)
+	if err != nil {
+		t.Fatalf("evidenceDocument() error = %v", err)
+	}
+
+	kube = fake.NewClientBuilder().WithScheme(scheme).WithObjects(node).Build()
+	reconciler.Client = kube
+	reconciler.APIReader = kube
+	reconciler.Evidence = staticEvidenceStore{
+		data:   document,
+		uri:    run.Status.Evidence.URI,
+		digest: run.Status.Evidence.Digest,
+	}
+	ledger := qualificationLedger(policy, node)
+	ledger.Status = status
+
+	status, err = reconciler.evaluateLedger(context.Background(), policy, node, ledger)
+	if err != nil {
+		t.Fatalf("evaluateLedger(retained evidence) error = %v", err)
+	}
+
+	if status.Phase != signalv1.NodeCertificationPhaseQualified ||
+		status.QualifiedAt == nil ||
+		!status.QualifiedAt.Equal(&summary.FinishedAt) {
+		t.Fatalf("retained resolved qualification time = %#v", status)
+	}
+}
+
 func TestEvaluateLedgerResetWatermarkSurvivesFailedRunDeletion(t *testing.T) {
 	t.Parallel()
 
