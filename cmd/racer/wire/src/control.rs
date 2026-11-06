@@ -1588,7 +1588,11 @@ mod codec {
 
     /// Decode and normalize a bounded full publication.
     pub fn decode_publication(b: &[u8]) -> Result<Publication> {
-        let value = strict_json(b, MAX_PUBLICATION_BYTES)?;
+        publication_from_value(strict_json(b, MAX_PUBLICATION_BYTES)?)
+    }
+
+    /// Validate a full publication from already-parsed strict JSON.
+    fn publication_from_value(value: Value) -> Result<Publication> {
         if value
             .get("members")
             .and_then(Value::as_array)
@@ -1834,11 +1838,59 @@ mod codec {
     /// Apply only against the exact authenticated base. Caller requests a full image
     /// on any delta failure; no partially applied state is ever published.
     pub fn apply_delta(base: &Publication, bytes: &[u8]) -> Result<Publication> {
-        let d: DeltaDto = decode(bytes, 4 * 1024 * 1024)?;
+        let value = strict_json(bytes, MAX_DELTA_BYTES)?;
+        apply_delta_value(base, &content_hash(base)?, value).map(|(next, _)| next)
+    }
+
+    /// Byte bound for one encoded delta.
+    const MAX_DELTA_BYTES: usize = 4 * 1024 * 1024;
+
+    /// Decode a publication response once, as a delta when it carries a
+    /// top-level `delta_version` and `base` is supplied, and otherwise as a
+    /// full image. Returns the validated publication and its [`content_hash`].
+    ///
+    /// `base` pairs the retained base with its [`content_hash`], which the
+    /// caller must have computed from that exact publication; it saves
+    /// rehashing the base on every delta. Full images and deltas cannot be
+    /// confused: both schemas reject unknown fields, and only deltas carry
+    /// `delta_version`. A delta is still bound to the base and target content
+    /// hashes exactly as in [`apply_delta`].
+    pub fn decode_publication_response(
+        bytes: &[u8],
+        base: Option<(&Publication, &str)>,
+    ) -> Result<(Publication, String)> {
+        let value = strict_json(bytes, MAX_PUBLICATION_BYTES)?;
+        let delta = value
+            .as_object()
+            .is_some_and(|object| object.contains_key("delta_version"));
+        match base {
+            Some((base, base_hash)) if delta => {
+                if bytes.len() > MAX_DELTA_BYTES {
+                    return Err(Error::Overloaded);
+                }
+                apply_delta_value(base, base_hash, value)
+            }
+            _ => {
+                let next = publication_from_value(value)?;
+                let hash = content_hash(&next)?;
+                Ok((next, hash))
+            }
+        }
+    }
+
+    /// Apply a parsed delta against `base`, whose content hash is `base_hash`,
+    /// and return the target with its verified content hash.
+    fn apply_delta_value(
+        base: &Publication,
+        base_hash: &str,
+        value: Value,
+    ) -> Result<(Publication, String)> {
+        debug_assert_eq!(content_hash(base).ok().as_deref(), Some(base_hash));
+        let d: DeltaDto = serde_json::from_value(value).map_err(|_| Error::InvalidRequest)?;
         if d.delta_version != DELTA_VERSION
             || d.cluster != base.cluster.0
             || counter(&d.base_sequence)? != base.sequence.0
-            || d.base_hash != content_hash(base)?
+            || d.base_hash != base_hash
             || counter(&d.sequence)? <= base.sequence.0
             || counter(&d.membership_version)? < base.membership_version.0
         {
@@ -1873,10 +1925,11 @@ mod codec {
         original.membership_version = d.membership_version;
         encode(&original, MAX_PUBLICATION_BYTES)?;
         let next = publication_from_dto(original)?;
-        if content_hash(&next)? != d.content_hash {
+        let hash = content_hash(&next)?;
+        if hash != d.content_hash {
             return Err(Error::Replay);
         }
-        Ok(next)
+        Ok((next, hash))
     }
 
     /// Complete wire keyring with encoded certificates and one compact,
@@ -2308,6 +2361,33 @@ mod codec {
                 content_hash(&next).unwrap()
             );
             assert!(apply_delta(&next, &bytes).is_err());
+            let base_hash = content_hash(&base).unwrap();
+            let (decoded, hash) =
+                decode_publication_response(&bytes, Some((&base, &base_hash))).unwrap();
+            assert_eq!(hash, content_hash(&next).unwrap());
+            assert_eq!(content_hash(&decoded).unwrap(), hash);
+            // Without a base, a delta is not a valid full image.
+            assert!(decode_publication_response(&bytes, None).is_err());
+            // A delta against the wrong base is refused.
+            let next_hash = content_hash(&next).unwrap();
+            assert!(decode_publication_response(&bytes, Some((&next, &next_hash))).is_err());
+            // A full image dispatches to full decode even with a base.
+            let full = serde_json::to_vec(&dto).unwrap();
+            let (decoded, hash) =
+                decode_publication_response(&full, Some((&base, &base_hash))).unwrap();
+            assert_eq!(hash, next_hash);
+            assert_eq!(decoded.sequence.0, next.sequence.0);
+            assert_eq!(
+                decode_publication_response(&full, None).unwrap().1,
+                next_hash
+            );
+            // An oversized delta keeps the delta byte bound.
+            let mut padded = bytes.clone();
+            padded.resize(MAX_DELTA_BYTES + 1, b' ');
+            assert!(matches!(
+                decode_publication_response(&padded, Some((&base, &base_hash))),
+                Err(Error::Overloaded)
+            ));
             delta["content_hash"] = "00".repeat(32).into();
             assert!(apply_delta(&base, &serde_json::to_vec(&delta).unwrap()).is_err());
         }
