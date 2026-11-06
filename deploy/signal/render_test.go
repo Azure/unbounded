@@ -881,6 +881,42 @@ func TestRenderedExecutionAuthorityIsExplicitAndFailClosed(t *testing.T) {
 	)
 }
 
+func TestRenderedBaselineOnlyAuthorityOmitsVLLM(t *testing.T) {
+	t.Parallel()
+
+	data := signalRenderData()
+	enableBaselineExecutionAuthorityRender(data)
+
+	output := renderSignal(t, data)
+	authority := string(readRenderedFile(t, output, "11-execution-authority.yaml"))
+
+	documents := splitYAMLDocuments(authority)
+	if len(documents) != 8 {
+		t.Fatalf("baseline-only authority documents = %d, want 8", len(documents))
+	}
+
+	for _, file := range []string{
+		"07-vllm-model-cache.yaml",
+		"08-vllm-canary-workflowtemplate.yaml",
+		"09-vllm-canary-test.yaml",
+		"10-acceptance-suites.yaml",
+		"11-execution-authority.yaml",
+	} {
+		content := strings.ToLower(string(readRenderedFile(t, output, file)))
+		if strings.Contains(content, "vllm") {
+			t.Fatalf("baseline-only render %s contains deferred vLLM content", file)
+		}
+	}
+
+	assertContainsAll(
+		t,
+		authority,
+		"name: canonical-gpu-inventory",
+		"nonPassBehavior: Revoke",
+		"mode: None",
+	)
+}
+
 func TestExecutionAuthorityRenderRejectsUnsafeTransition(t *testing.T) {
 	t.Parallel()
 
@@ -915,6 +951,45 @@ func TestExecutionAuthorityRenderRejectsUnsafeTransition(t *testing.T) {
 			data := signalRenderData()
 			enableExecutionAuthorityRender(data)
 			data[tt.key] = tt.value
+
+			err := render.Render(".", t.TempDir(), data)
+			if err == nil || !strings.Contains(err.Error(), tt.error) {
+				t.Fatalf("render error = %v, want %q", err, tt.error)
+			}
+		})
+	}
+}
+
+func TestEnabledVLLMAuthorityRequiresCompleteBinding(t *testing.T) {
+	t.Parallel()
+
+	for _, tt := range []struct {
+		name  string
+		key   string
+		error string
+	}{
+		{
+			name:  "profile UID",
+			key:   "VLLMProfileUID",
+			error: "VLLMProfileUID must be the exact live Profile UID",
+		},
+		{
+			name:  "model cache PVC",
+			key:   "VLLMModelCachePVC",
+			error: "VLLMModelCachePVC is required",
+		},
+		{
+			name:  "model cache digest",
+			key:   "VLLMModelCacheManifestDigest",
+			error: "VLLMModelCacheManifestDigest must be",
+		},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			data := signalRenderData()
+			enableExecutionAuthorityRender(data)
+			data[tt.key] = ""
 
 			err := render.Render(".", t.TempDir(), data)
 			if err == nil || !strings.Contains(err.Error(), tt.error) {
@@ -1600,22 +1675,9 @@ func signalRenderData() map[string]string {
 }
 
 func enableExecutionAuthorityRender(data map[string]string) {
-	data["AcceptanceSuitesEnabled"] = "true"
-	data["ExecutionAuthorityEnabled"] = "true"
-	data["CutoverApproved"] = "true"
-	data["HardAbort"] = "false"
-	data["SourceCommit"] = strings.Repeat("a", 40)
-	data["StaticPackageDigest"] = testDigest
-	data["AuthorityName"] = "project-signal-execution-authority-aaaaaaaaaaaa-dddddddddddd"
-	data["BaselineProfileUID"] = "11111111-1111-1111-1111-111111111111"
-	data["VLLMProfileUID"] = "33333333-3333-3333-3333-333333333333"
-	data["GPUInventoryTestUID"] = "11111111-1111-1111-1111-111111111111"
-	data["GPUInventoryTestGeneration"] = "1"
-	data["GPUInventoryTestContentDigest"] = testDigest
-	data["GPUCompatTestUID"] = "22222222-2222-2222-2222-222222222222"
-	data["GPUCompatTestGeneration"] = "1"
-	data["GPUCompatTestContentDigest"] = testDigest
+	enableBaselineExecutionAuthorityRender(data)
 	data["VLLMCanaryEnabled"] = "true"
+	data["VLLMProfileUID"] = "33333333-3333-3333-3333-333333333333"
 	data["VLLMCanaryImage"] = "example.invalid/vllm-canary@sha256:" + strings.Repeat("f", 64)
 	data["VLLMCanaryCPU"] = "4"
 	data["VLLMCanaryMemory"] = "16Gi"
@@ -1629,6 +1691,23 @@ func enableExecutionAuthorityRender(data map[string]string) {
 	data["VLLMPromptFixtureDigest"] = "sha256:" + strings.Repeat("8", 64)
 	data["VLLMRequestTimeout"] = "2m"
 	data["VLLMInvocationTimeout"] = "30m"
+}
+
+func enableBaselineExecutionAuthorityRender(data map[string]string) {
+	data["AcceptanceSuitesEnabled"] = "true"
+	data["ExecutionAuthorityEnabled"] = "true"
+	data["CutoverApproved"] = "true"
+	data["HardAbort"] = "false"
+	data["SourceCommit"] = strings.Repeat("a", 40)
+	data["StaticPackageDigest"] = testDigest
+	data["AuthorityName"] = "project-signal-execution-authority-aaaaaaaaaaaa-dddddddddddd"
+	data["BaselineProfileUID"] = "11111111-1111-1111-1111-111111111111"
+	data["GPUInventoryTestUID"] = "11111111-1111-1111-1111-111111111111"
+	data["GPUInventoryTestGeneration"] = "1"
+	data["GPUInventoryTestContentDigest"] = testDigest
+	data["GPUCompatTestUID"] = "22222222-2222-2222-2222-222222222222"
+	data["GPUCompatTestGeneration"] = "1"
+	data["GPUCompatTestContentDigest"] = testDigest
 }
 
 func renderSignal(t *testing.T, data map[string]string) string {

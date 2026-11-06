@@ -22,17 +22,23 @@
 {{- if ne .AuthorityName $expectedAuthorityName }}
 {{- fail "AuthorityName must match the exact source and static package digest" }}
 {{- end }}
+{{- $vllmCanaryEnabled := default "false" .VLLMCanaryEnabled }}
+{{- if not (regexMatch "^(true|false)$" $vllmCanaryEnabled) }}
+{{- fail "VLLMCanaryEnabled must be true or false" }}
+{{- end }}
 {{- if not (regexMatch "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$" .BaselineProfileUID) }}
 {{- fail "BaselineProfileUID must be the exact live Profile UID" }}
 {{- end }}
+{{ if eq $vllmCanaryEnabled "true" }}
 {{- if not (regexMatch "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$" .VLLMProfileUID) }}
 {{- fail "VLLMProfileUID must be the exact live Profile UID" }}
-{{- end }}
+{{ end }}
 {{- if empty .VLLMModelCachePVC }}
 {{- fail "VLLMModelCachePVC is required for execution authority" }}
 {{- end }}
 {{- if not (regexMatch "^sha256:[0-9a-f]{64}$" .VLLMModelCacheManifestDigest) }}
 {{- fail "VLLMModelCacheManifestDigest must be an algorithm-qualified sha256 digest for execution authority" }}
+{{- end }}
 {{- end }}
 apiVersion: v1
 kind: Namespace
@@ -140,6 +146,7 @@ spec:
   suite:
     name: project-signal-gpu-compat-v1
 
+{{ if eq $vllmCanaryEnabled "true" }}
 ---
 apiVersion: signal.unbounded-cloud.io/v1alpha1
 kind: CertificationProfile
@@ -162,6 +169,7 @@ spec:
     modelCaches:
       - name: project-signal-vllm-model-cache
         reference: {{ printf "pvc://%s/%s@%s" (default "project-signal" .Namespace) .VLLMModelCachePVC .VLLMModelCacheManifestDigest | quote }}
+{{ end }}
 
 ---
 apiVersion: signal.unbounded-cloud.io/v1alpha1
@@ -180,6 +188,7 @@ spec:
       creditRule: PerParticipant
       acceptedPlans:
         mode: Current
+{{ if eq $vllmCanaryEnabled "true" }}
     - name: offline-vllm-canary
       profile:
         name: project-signal-vllm-canary-8x-v1
@@ -188,6 +197,7 @@ spec:
       creditRule: PerParticipant
       acceptedPlans:
         mode: Current
+{{ end }}
   validity: 24h
   renewBefore: 1h
   invalidationFingerprintFields:

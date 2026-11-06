@@ -770,9 +770,13 @@ release an abort. Rendering with execution authority disabled gives the
 controller an empty static package binding, so stale authority objects cannot
 continue admitting or starting Runs.
 
-The overlay does not create a Run. Start the canonical baseline and vLLM
-canary separately, only after the prior Run is terminal, cleaned up, and
-released:
+The overlay does not create a Run. With `VLLMCanaryEnabled=false`, it requires
+no vLLM image, Test identity, Profile UID, cache, WorkflowTemplate, Profile, or
+Policy requirement. This baseline-only mode can deploy while vLLM remains
+deferred.
+
+When vLLM is explicitly enabled, start the canonical baseline and vLLM canary
+separately, only after the prior Run is terminal, cleaned up, and released:
 
 ```bash
 kubectl label node <node-name> \
@@ -783,9 +787,9 @@ kubectl label node <node-name> \
 ```
 
 The compatibility Profile remains diagnostic-only and receives no Policy
-credit. The Policy requires one current pass from the baseline Profile and one
-from the vLLM Profile, uses `nonPassBehavior: Revoke`, and keeps
-`gateProjection.mode: None`.
+credit. The Policy always requires one current pass from the baseline Profile;
+it requires one vLLM pass only when vLLM is explicitly enabled. It uses
+`nonPassBehavior: Revoke` and keeps `gateProjection.mode: None`.
 
 ### Upgrade and migration
 
