@@ -989,6 +989,106 @@ pub(crate) mod send_in_place {
     }
 
     #[test]
+    fn grant_wait_is_bounded_by_its_cap_and_a_quarter_of_the_deadline() {
+        let now = Instant::now();
+        let long = now + Duration::from_secs(10);
+        assert_eq!(grant_wait_until(now, long), now + GRANT_WAIT);
+        let short = now + Duration::from_millis(40);
+        assert_eq!(
+            grant_wait_until(now, short),
+            now + Duration::from_millis(10)
+        );
+        assert_eq!(grant_wait_until(now, now), now);
+        assert_eq!(grant_wait_until(now, now - Duration::from_secs(1)), now);
+    }
+
+    /// Drive [`retry_overloaded`] with a fake clock that each sleep advances.
+    fn run_retry(
+        results: Vec<Result<u8>>,
+        until_ms: u64,
+        sleep_fails: bool,
+    ) -> (Result<u8>, u32, usize) {
+        let start = Instant::now();
+        let clock = Cell::new(start);
+        let results = RefCell::new(std::collections::VecDeque::from(results));
+        let attempts = Cell::new(0usize);
+        let (result, waits) = futures::executor::block_on(retry_overloaded(
+            || {
+                attempts.set(attempts.get() + 1);
+                let next = results
+                    .borrow_mut()
+                    .pop_front()
+                    .unwrap_or(Err(Error::Overloaded));
+                async move { next }
+            },
+            |wake| {
+                clock.set(wake);
+                async move {
+                    if sleep_fails {
+                        Err(Error::Canceled)
+                    } else {
+                        Ok(())
+                    }
+                }
+            },
+            || clock.get(),
+            start + Duration::from_millis(until_ms),
+        ));
+        (result, waits, attempts.get())
+    }
+
+    #[test]
+    fn grant_retry_returns_a_slot_that_frees_within_the_wait() {
+        let (result, waits, attempts) = run_retry(
+            vec![Err(Error::Overloaded), Err(Error::Overloaded), Ok(7)],
+            20,
+            false,
+        );
+        assert_eq!(result, Ok(7));
+        assert_eq!((waits, attempts), (2, 3));
+    }
+
+    #[test]
+    fn grant_retry_succeeds_at_once_without_waiting() {
+        assert_eq!(run_retry(vec![Ok(1)], 20, false), (Ok(1), 0, 1));
+    }
+
+    #[test]
+    fn grant_retry_gives_up_overloaded_at_its_bound() {
+        let (result, waits, attempts) = run_retry(vec![], 5, false);
+        assert_eq!(result, Err(Error::Overloaded));
+        assert_eq!(waits, 5);
+        assert_eq!(attempts, 6);
+        // No time to wait at all: one attempt.
+        assert_eq!(run_retry(vec![], 0, false), (Err(Error::Overloaded), 0, 1));
+    }
+
+    #[test]
+    fn grant_retry_does_not_wait_on_other_errors() {
+        assert_eq!(
+            run_retry(vec![Err(Error::Unavailable), Ok(1)], 20, false),
+            (Err(Error::Unavailable), 0, 1)
+        );
+        // A canceled sleep ends the wait with its error.
+        assert_eq!(run_retry(vec![], 20, true), (Err(Error::Canceled), 1, 1));
+    }
+
+    #[test]
+    fn grant_waits_are_counted() {
+        let w = world();
+        let (w, ma, _) = metered(w);
+        w.a.links.record_grant_wait(0, true);
+        w.a.links.record_grant_wait(3, true);
+        w.a.links.record_grant_wait(2, false);
+        assert_eq!(ma.count(Event::RdmaGrantWaits), 2);
+        assert_eq!(ma.count(Event::RdmaGrantWaitGranted), 1);
+        let mut out = String::new();
+        ma.write_prometheus(&mut out).unwrap();
+        assert!(out.contains("racer_rdma_grant_waits_total 2"));
+        assert!(out.contains("racer_rdma_grant_wait_granted_total 1"));
+    }
+
+    #[test]
     fn overloaded_grant_fallback_is_counted_apart() {
         let w = world();
         let (w, ma, _) = metered(w);

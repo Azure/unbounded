@@ -21,6 +21,7 @@ use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::PoisonError;
 use std::time::Duration;
+use std::time::Instant;
 
 /// Signed `Accept` extension naming the receiver's in-band grant.
 pub const GRANT_HEADER: &str = "racer-rdma-grant";
@@ -85,6 +86,72 @@ pub fn grants_per_link(buffers_per_rail: usize) -> u32 {
     u32::try_from(buffers_per_rail)
         .unwrap_or(u32::MAX)
         .clamp(1, GRANTS_PER_LINK_CAP.min(link_setup::MAX_GRANTS_PER_LINK))
+}
+
+/// Longest a receiver waits for a free grant slot or page buffer on a rail
+/// before it carries the page over HTTP instead. A page transfer holds its
+/// buffer for a few milliseconds, so a slot usually frees well within this,
+/// and the wait is far cheaper than the HTTP path's CPU cost. Nothing is
+/// reserved while waiting, so memory stays bounded by the registered pool.
+pub const GRANT_WAIT: Duration = Duration::from_millis(20);
+
+/// Interval between grant attempts while waiting ([`GRANT_WAIT`]).
+pub const GRANT_WAIT_POLL: Duration = Duration::from_millis(1);
+
+/// When a receiver that found its rail's grants exhausted at `now` stops
+/// waiting: [`GRANT_WAIT`], but never more than a quarter of the time left
+/// before `deadline`, so the HTTP fallback keeps most of the request.
+pub fn grant_wait_until(now: Instant, deadline: Instant) -> Instant {
+    now + GRANT_WAIT.min(deadline.saturating_duration_since(now) / 4)
+}
+
+/// Run `attempt` until it does not fail [`Error::Overloaded`], sleeping
+/// [`GRANT_WAIT_POLL`] between attempts (`sleep` takes the wake time), until
+/// another attempt would start after `until`. Returns the last result and the
+/// number of waits. Any other error, including a failed sleep, ends at once.
+pub async fn retry_overloaded<T, A, AF, S, SF>(
+    mut attempt: A,
+    mut sleep: S,
+    now: impl Fn() -> Instant,
+    until: Instant,
+) -> (Result<T>, u32)
+where
+    A: FnMut() -> AF,
+    AF: std::future::Future<Output = Result<T>>,
+    S: FnMut(Instant) -> SF,
+    SF: std::future::Future<Output = Result<()>>,
+{
+    let mut waits = 0u32;
+    loop {
+        match attempt().await {
+            Err(Error::Overloaded) => {
+                let wake = now() + GRANT_WAIT_POLL;
+                if wake > until {
+                    return (Err(Error::Overloaded), waits);
+                }
+                waits = waits.saturating_add(1);
+                if let Err(error) = sleep(wake).await {
+                    return (Err(error), waits);
+                }
+            }
+            result => return (result, waits),
+        }
+    }
+}
+
+/// Count one receiver grant that `waited` for a slot ([`retry_overloaded`])
+/// and whether it was `granted` in the end.
+pub fn record_grant_wait(metrics: Option<&crate::telemetry::Metrics>, waited: u32, granted: bool) {
+    let Some(metrics) = metrics else {
+        return;
+    };
+    if waited == 0 {
+        return;
+    }
+    metrics.record(crate::telemetry::Event::RdmaGrantWaits, 1);
+    if granted {
+        metrics.record(crate::telemetry::Event::RdmaGrantWaitGranted, 1);
+    }
 }
 
 /// Opaque verbs key for a peer and rail: `SHA-256(NodeId)` and the rail.
@@ -490,6 +557,11 @@ impl Links {
         if error == Error::Overloaded {
             self.record(crate::telemetry::Event::RdmaFallbackGrantOverloaded, 1);
         }
+    }
+
+    /// Count a grant that waited for a slot ([`record_grant_wait`]).
+    pub fn record_grant_wait(&self, waited: u32, granted: bool) {
+        record_grant_wait(self.metrics.as_ref(), waited, granted);
     }
 
     /// Count a page body delivered over HTTP because its hop qualified for RDMA by Site and

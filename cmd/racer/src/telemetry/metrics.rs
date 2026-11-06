@@ -332,6 +332,8 @@ metrics! { Event, EVENTS, EVENT_COUNT;
             Self::RdmaFallbackGrant => "racer_rdma_fallback_grant_total",
             Self::RdmaFallbackGrantOverloaded => "racer_rdma_fallback_grant_overloaded_total",
             Self::RdmaFallbackOverflow => "racer_rdma_fallback_overflow_total",
+            Self::RdmaGrantWaits => "racer_rdma_grant_waits_total",
+            Self::RdmaGrantWaitGranted => "racer_rdma_grant_wait_granted_total",
             Self::RdmaPlanHttpNoRail => "racer_rdma_plan_http_total" { "reason=\"no_rail\"" },
             Self::RdmaPlanHttpIneligible => "racer_rdma_plan_http_total" { "reason=\"ineligible\"" },
             Self::RdmaPlanHttpOverflow => "racer_rdma_plan_http_total" { "reason=\"overflow\"" },

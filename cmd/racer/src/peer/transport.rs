@@ -513,9 +513,21 @@ impl Transfers {
         let granted = match landed {
             Some(pending) => Ok(pending),
             None => {
-                links
-                    .grant(&peer, rail, binding.transfer, &native_scope(scope))
-                    .await
+                // All of the rail's buffers or the link's grant slots are in use: wait briefly for
+                // one rather than carry the page over the far costlier HTTP path.
+                let native = native_scope(scope);
+                let reactor = self.io.reactor();
+                let clock = || native.clock().now();
+                let until = crate::rdma::links::grant_wait_until(clock(), native.deadline.0);
+                let (granted, waited) = crate::rdma::links::retry_overloaded(
+                    || links.grant(&peer, rail, binding.transfer, &native),
+                    |wake| reactor.sleep_until(wake, &native),
+                    clock,
+                    until,
+                )
+                .await;
+                links.record_grant_wait(waited, granted.is_ok());
+                granted
             }
         };
         let pending = match granted {

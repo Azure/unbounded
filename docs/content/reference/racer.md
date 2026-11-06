@@ -1798,7 +1798,11 @@ HTTP; `racer_rdma_fallback_no_link_total` and `racer_rdma_fallback_grant_total`
 split out the two common reasons: no ready link to the peer yet, and a grant that
 failed. `racer_rdma_fallback_grant_overloaded_total` counts the subset of grant
 failures that found every page buffer of the rail, or every grant slot of the
-link, in use. Each link may hold as many grants as its rail has page buffers
+link, in use. Before falling back, a receiver whose grant finds no free slot
+retries every 1 ms for up to 20 ms (at most a quarter of the time left in the
+request), since a slot usually frees within a page transfer; nothing is
+reserved while it waits. `racer_rdma_grant_waits_total` counts grants that
+waited and `racer_rdma_grant_wait_granted_total` those that then got a slot. Each link may hold as many grants as its rail has page buffers
 (the `RACER_REGISTERED_BYTES` pool split across rails, at most 1024), capped by
 the largest value whose queue pair and completion queue fit the device's
 reported `max_qp_wr` and `max_cqe` (and, with memory windows, `max_mw`), and by
