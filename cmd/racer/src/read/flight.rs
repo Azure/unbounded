@@ -41,6 +41,9 @@ use std::task::Waker;
 use std::time::Instant;
 
 pub struct Flights {
+    /// This worker's detached driver queue, polled during flight turns.
+    drivers: Rc<crate::drivers::DriverQueue>,
+
     pub(super) admission: Rc<flow_control::Quotas<AdmissionPolicy>>,
 
     availability: Rc<crate::control::Availability>,
@@ -678,6 +681,7 @@ impl Flights {
         admission: Rc<flow_control::Quotas<AdmissionPolicy>>,
         availability: Rc<crate::control::Availability>,
         clock: racer_io::Clock,
+        drivers: Rc<crate::drivers::DriverQueue>,
     ) -> Self {
         let limits = FlightLimits {
             entries: admission.policy().limits().flights.get(),
@@ -686,6 +690,7 @@ impl Flights {
             generations_per_flight: 1024,
         };
         Self {
+            drivers,
             admission: admission.clone(),
             availability,
             limits,
@@ -710,6 +715,7 @@ impl Flights {
         availability: Rc<crate::control::Availability>,
         limits: FlightLimits,
         clock: racer_io::Clock,
+        drivers: Rc<crate::drivers::DriverQueue>,
     ) -> Result<Self> {
         if limits.entries == 0
             || limits.waiters_per_flight == 0
@@ -719,6 +725,7 @@ impl Flights {
             return Err(Error::InvalidConfiguration);
         }
         Ok(Self {
+            drivers,
             admission: admission.clone(),
             availability,
             limits,
@@ -1495,8 +1502,14 @@ impl Flights {
 
     /// Reactor-facing variant registers its real waker with owned drivers. The
     /// worker must also poll at request deadlines to expire parked waiters.
+    /// This worker's detached driver queue.
+    #[cfg(test)]
+    pub(crate) fn drivers(&self) -> &Rc<crate::drivers::DriverQueue> {
+        &self.drivers
+    }
+
     pub fn poll_with_context(&self, cx: &mut Context<'_>, work_budget: usize) -> Result<()> {
-        crate::drivers::poll(cx, work_budget);
+        self.drivers.poll(cx, work_budget);
         self.admission_deadlines.poll(self.clock.now(), work_budget);
         self.sweep_budgeted(work_budget)
     }
@@ -1534,7 +1547,7 @@ impl Flights {
                 self.poll_with_context(cx, self.limits.entries)?;
                 let waker = WakeTarget(cx.waker().clone());
                 let mut table = self.table.borrow_mut();
-                if table.is_empty() && self.waiting.is_empty() && crate::drivers::pending() == 0 {
+                if table.is_empty() && self.waiting.is_empty() && self.drivers.pending() == 0 {
                     return Poll::Ready(Ok(()));
                 }
                 scope.check()?;
@@ -1812,6 +1825,7 @@ mod admission_wake_tests {
             admission.clone(),
             crate::test_support::availability(&env),
             racer_io::Clock::host(),
+            std::rc::Rc::new(crate::drivers::DriverQueue::new(1024)),
         ));
         let page = crate::memory::tests::bundle_for(
             &admission,

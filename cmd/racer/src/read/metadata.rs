@@ -487,7 +487,7 @@ impl MetadataService {
             let deadline = self.deadlines.register(scope.deadline.0)?;
             let cancellation = scope.cancellation.subscribe()?;
             let event = poll_fn(|cx| {
-                crate::drivers::poll(cx, 64);
+                self.candidates.drivers().poll(cx, 64);
                 cancellation.register(cx.waker());
                 if let Err(error) = deadline.check(scope, cx.waker()) {
                     return Poll::Ready(Err(error));
@@ -506,7 +506,7 @@ impl MetadataService {
                     if budget.remaining_attempts() == 0 {
                         return Err(Error::Unavailable);
                     }
-                    let driver_permit = crate::drivers::reserve().map_err(Error::from)?;
+                    let driver_permit = self.candidates.drivers().reserve().map_err(Error::from)?;
                     let mut nonce = [0; 16];
                     self.candidates
                         .ctx()
@@ -576,7 +576,7 @@ impl MetadataService {
                     let (result, remaining) = poll_fn(|cx| {
                         cancellation.register(cx.waker());
                         deadline.check(scope, cx.waker())?;
-                        crate::drivers::poll(cx, 64);
+                        self.candidates.drivers().poll(cx, 64);
                         match Pin::new(&mut receive).poll(cx) {
                             Poll::Ready(Ok(value)) => Poll::Ready(Ok(value)),
                             Poll::Ready(Err(_)) => Poll::Ready(Err(Error::Unavailable)),
@@ -1276,7 +1276,6 @@ pub(crate) mod tests {
     #[test]
     fn worker_driver_retains_leadership_after_request_drop_until_completion() {
         let queue = Rc::new(crate::drivers::DriverQueue::new(1024));
-        let _owner = queue.enter();
         let table = Rc::new(RefreshTable::new(1, Instant::now()));
         let request = table.join(key()).unwrap();
         let follower = table.join(key()).unwrap();
@@ -1287,7 +1286,8 @@ pub(crate) mod tests {
         ));
         let driver = request.clone();
         let (complete, fence) = futures::channel::oneshot::channel::<()>();
-        crate::drivers::reserve()
+        queue
+            .reserve()
             .unwrap()
             .submit_detached(Box::pin(async move {
                 fence.await.map_err(|_| Error::Io)?;
@@ -1295,12 +1295,12 @@ pub(crate) mod tests {
                 Ok::<_, Error>(())
             }));
         let mut cx = std::task::Context::from_waker(&waker);
-        crate::drivers::poll(&mut cx, 64);
+        queue.poll(&mut cx, 64);
         drop(request);
         assert!(follower.event(&waker).is_pending());
         assert_eq!(table.registration_count(), 2);
         complete.send(()).unwrap();
-        crate::drivers::poll(&mut cx, 64);
+        queue.poll(&mut cx, 64);
         assert_eq!(table.registration_count(), 1);
         assert!(matches!(
             follower.event(&waker),

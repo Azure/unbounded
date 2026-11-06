@@ -418,7 +418,6 @@ fn adapter_connection(
 
 struct Rig {
     bootstrap: Bootstrap,
-    drivers: Rc<racer::drivers::DriverQueue>,
     admission: Rc<flow_control::Quotas<AdmissionPolicy>>,
     reactor: Rc<Reactor>,
     crypto: Rc<CryptoClient>,
@@ -576,6 +575,7 @@ impl Rig {
             admission.clone(),
             racer_io::Rng::os(),
         ));
+        let drivers = Rc::new(racer::drivers::DriverQueue::new(1024));
         let candidates = Rc::new(CandidatePolicy::new(
             NodeId(NODE.into()),
             Rc::new(Placement::new(64)),
@@ -583,6 +583,7 @@ impl Rig {
             credentials.clone(),
             published.clone(),
             racer_io::WorkerCtx::host(),
+            drivers.clone(),
         ));
         let origin = Rc::new(
             OriginClient::new(
@@ -620,6 +621,7 @@ impl Rig {
             admission.clone(),
             availability.clone(),
             racer_io::Clock::host(),
+            drivers.clone(),
         ));
         let fill = Rc::new(Fill::new(FillDependencies {
             memory: memory.clone(),
@@ -657,7 +659,12 @@ impl Rig {
             // two-second client stall while the fixture executor is occupied.
             TIMEOUT,
         ));
-        let streams = Rc::new(RangeStreams::new(directory.clone(), delivery.clone(), 2));
+        let streams = Rc::new(RangeStreams::new(
+            directory.clone(),
+            delivery.clone(),
+            2,
+            drivers.clone(),
+        ));
         let coordinator = Rc::new(Coordinator::new(
             published,
             metadata,
@@ -679,7 +686,6 @@ impl Rig {
         Self {
             bootstrap,
             admission,
-            drivers: Rc::new(racer::drivers::DriverQueue::new(1024)),
             reactor,
             crypto,
             engine,
@@ -697,7 +703,6 @@ impl Rig {
         }
     }
     fn tick(&self) {
-        let _queue = self.drivers.enter();
         let mut cx = Context::from_waker(futures::task::noop_waker_ref());
         self.reactor.poll_budgeted(128).unwrap();
         if let Some(engine) = &self.engine {
@@ -727,7 +732,6 @@ impl Rig {
         }
     }
     fn drive<T>(&self, future: impl Future<Output = T>) -> T {
-        let _queue = self.drivers.enter();
         let mut future = std::pin::pin!(future);
         let mut cx = Context::from_waker(futures::task::noop_waker_ref());
         let deadline = Instant::now() + TIMEOUT;

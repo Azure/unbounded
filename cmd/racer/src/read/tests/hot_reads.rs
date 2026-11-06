@@ -35,8 +35,6 @@ mod duplex_release {
         for mode in ["valid", "duplicate", "malformed", "short", "drop"] {
             let sim = SimOs::new();
             let env = racer_io::Env::sim(&sim, racer_io::WorkerCtx::host());
-            let queue = Rc::new(crate::drivers::DriverQueue::new(1024));
-            let _owner = queue.enter();
             let signers = network(&env, 1);
             let mut f = fixture(&env);
             f.reactor.init().unwrap();
@@ -81,7 +79,7 @@ mod duplex_release {
             let mut bytes = Vec::new();
             let mut pump = |endpoint: &mut crate::read::dispatch::WorkerEndpoint| {
                 endpoint.poll(&mut cx, 64).unwrap();
-                crate::drivers::poll(&mut cx, 64);
+                f.fill.drivers().poll(&mut cx, 64);
                 crate::lifecycle::Service::poll_budgeted(
                     &mut f.engine,
                     &mut std::task::Context::from_waker(futures::task::noop_waker_ref()),
@@ -219,8 +217,6 @@ mod duplex_release {
     }
 
     fn run(env: &racer_io::Env, mode: &str) {
-        let queue = Rc::new(crate::drivers::DriverQueue::new(1024));
-        let _owner = queue.enter();
         let clock = racer_io::SimClock::new(311);
         let environment = clock.ctx(0);
         let env = racer_io::Env::new(env.driver.clone(), environment.clone());
@@ -751,6 +747,7 @@ pub(super) fn coordinator_with_window(
             Snapshot::retention(2),
         )),
         env.ctx.clone(),
+        deps.candidates.drivers().clone(),
     ));
     f.read_graph(
         env,
@@ -770,8 +767,6 @@ pub(super) fn coordinator_with_window(
 #[test]
 fn concurrent_reads_share_page_work_and_bound_fetch_by_credit() {
     let env = racer_io::Env::host();
-    let queue = Rc::new(crate::drivers::DriverQueue::new(1024));
-    let _owner = queue.enter();
     let signers = network(&env, 1);
     let mut f = fixture_with(&env, 3 * PAGE_BYTES + 7, None);
     f.reactor.init().unwrap();
@@ -891,8 +886,6 @@ fn concurrent_reads_share_page_work_and_bound_fetch_by_credit() {
 #[test]
 fn fetch_window_is_not_an_unreleased_credit_ceiling() {
     let env = racer_io::Env::host();
-    let queue = Rc::new(crate::drivers::DriverQueue::new(1024));
-    let _owner = queue.enter();
     // Full-page batch, then a one-byte boundary with byte credit just below
     // and exactly at the threshold for two additional full pages.
     for (start, bytes, batch) in [
@@ -1003,8 +996,6 @@ fn zero_priority_read_beside_active_cache_progresses_while_first_page_is_held() 
     use crate::admission::ResourceClass;
     use flow_control::Policy;
     let env = racer_io::Env::host();
-    let queue = Rc::new(crate::drivers::DriverQueue::new(1024));
-    let _owner = queue.enter();
     let signers = network(&env, 1);
     // Production sizes stream and admission windows from the same setting.
     let mut limits = crate::test_support::cluster::config(false).limits;
@@ -1116,8 +1107,6 @@ fn zero_priority_read_beside_active_cache_progresses_while_first_page_is_held() 
 #[test]
 fn later_page_completes_before_head_and_cancellation_keeps_completion_fence() {
     let env = racer_io::Env::host();
-    let queue = Rc::new(crate::drivers::DriverQueue::new(1024));
-    let _owner = queue.enter();
     for mode in ["success", "cancel", "drop", "failure"] {
         let signers = network(&env, 1);
         let mut f = fixture_with(&env, 2 * PAGE_BYTES + 7, None);
@@ -1150,7 +1139,7 @@ fn later_page_completes_before_head_and_cancellation_keeps_completion_fence() {
         let mut pump = |endpoint: &mut crate::read::dispatch::WorkerEndpoint| {
             let mut cx = Context::from_waker(futures::task::noop_waker_ref());
             endpoint.poll(&mut cx, 64).unwrap();
-            crate::drivers::poll(&mut cx, 64);
+            f.fill.drivers().poll(&mut cx, 64);
             crate::lifecycle::Service::poll_budgeted(
                 &mut f.engine,
                 &mut std::task::Context::from_waker(futures::task::noop_waker_ref()),
@@ -1200,14 +1189,18 @@ fn later_page_completes_before_head_and_cancellation_keeps_completion_fence() {
                 pump(&mut endpoint);
             }
             assert!(
-                queue.pending() > 0,
+                local.drivers().pending() > 0,
                 "canceled waiter is not actual origin completion"
             );
             f.origin.blocked_pages.borrow_mut().clear();
             for _ in 0..1024 {
                 pump(&mut endpoint);
             }
-            assert_eq!(queue.pending(), 0, "accepted head work drains its fence");
+            assert_eq!(
+                local.drivers().pending(),
+                0,
+                "accepted head work drains its fence"
+            );
             assert_eq!(&*f.origin.started_pages.borrow(), &[0, 1]);
         } else if mode == "failure" {
             f.origin.version_unavailable.set(true);
@@ -1347,8 +1340,6 @@ fn production_range_windows(env: &racer_io::Env, old_provider: bool) -> Vec<Rc<L
             })
         })
         .collect();
-    let queue = Rc::new(crate::drivers::DriverQueue::new(1024));
-    let _owner = queue.enter();
     let signers = network(env, 3);
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let address = listener.local_addr().unwrap();
@@ -1542,12 +1533,16 @@ fn production_range_windows(env: &racer_io::Env, old_provider: bool) -> Vec<Rc<L
                     64,
                 )
                 .unwrap();
+            endpoint.drivers().poll(
+                &mut Context::from_waker(futures::task::noop_waker_ref()),
+                64,
+            );
         }
-        crate::drivers::poll(
-            &mut Context::from_waker(futures::task::noop_waker_ref()),
-            64,
-        );
         for f in &mut fixtures {
+            f.fill.drivers().poll(
+                &mut Context::from_waker(futures::task::noop_waker_ref()),
+                64,
+            );
             crate::lifecycle::Service::poll_budgeted(
                 &mut f.engine,
                 &mut std::task::Context::from_waker(futures::task::noop_waker_ref()),
@@ -1676,8 +1671,6 @@ fn production_range_windows(env: &racer_io::Env, old_provider: bool) -> Vec<Rc<L
 #[test]
 fn origin_fill_preserves_ciphertext_for_memory_and_pending_candidate_copy() {
     let env = racer_io::Env::host();
-    let queue = Rc::new(crate::drivers::DriverQueue::new(1024));
-    let _owner = queue.enter();
     let mut f = fixture(&env);
     let mut budget = AcquisitionBudget::new(f.scope.deadline.0, 8, 8);
     let result = acquire(&mut f, &mut budget).unwrap();
@@ -1715,6 +1708,7 @@ fn origin_fill_preserves_ciphertext_for_memory_and_pending_candidate_copy() {
         &f.reactor,
         &mut f.engine,
         &f.crypto,
+        f.fill.drivers(),
     )
     .unwrap()
     .unwrap();
@@ -1755,6 +1749,7 @@ fn acquire_pair(f: &mut Fixture) -> (Result<PageResult>, Result<PageResult>) {
         ),
         &mut f.engine,
         &f.crypto,
+        f.fill.drivers(),
     )
 }
 
@@ -1772,8 +1767,6 @@ fn fill_and_release(f: &mut Fixture) -> CiphertextPage {
 #[test]
 fn memory_cache_retains_only_ciphertext_after_delivery() {
     let env = racer_io::Env::host();
-    let queue = Rc::new(crate::drivers::DriverQueue::new(1024));
-    let _owner = queue.enter();
     let mut f = fixture(&env);
     let ciphertext = fill_and_release(&mut f);
     let deps = &f.fill.dependencies;
@@ -1787,8 +1780,6 @@ fn memory_cache_retains_only_ciphertext_after_delivery() {
 #[test]
 fn cached_ciphertext_hit_decrypts_without_refetching() {
     let env = racer_io::Env::host();
-    let queue = Rc::new(crate::drivers::DriverQueue::new(1024));
-    let _owner = queue.enter();
     let mut f = fixture(&env);
     let ciphertext = fill_and_release(&mut f);
     let decrypts = f.fill.metrics.count(Event::FillDecryptCount);
@@ -1817,8 +1808,6 @@ fn cached_ciphertext_hit_decrypts_without_refetching() {
 #[test]
 fn concurrent_cached_ciphertext_hits_coalesce_into_one_decrypt() {
     let env = racer_io::Env::host();
-    let queue = Rc::new(crate::drivers::DriverQueue::new(1024));
-    let _owner = queue.enter();
     let mut f = fixture(&env);
     fill_and_release(&mut f);
     let decrypts = f.fill.metrics.count(Event::FillDecryptCount);
@@ -1833,8 +1822,6 @@ fn concurrent_cached_ciphertext_hits_coalesce_into_one_decrypt() {
 #[test]
 fn live_plaintext_is_reused_without_another_decrypt() {
     let env = racer_io::Env::host();
-    let queue = Rc::new(crate::drivers::DriverQueue::new(1024));
-    let _owner = queue.enter();
     let mut f = fixture(&env);
     let mut budget = AcquisitionBudget::new(f.scope.deadline.0, 8, 8);
     let held = acquire(&mut f, &mut budget).unwrap();
@@ -1857,8 +1844,6 @@ fn live_plaintext_is_reused_without_another_decrypt() {
 #[test]
 fn peers_receive_cached_ciphertext_without_plaintext() {
     let env = racer_io::Env::host();
-    let queue = Rc::new(crate::drivers::DriverQueue::new(1024));
-    let _owner = queue.enter();
     let mut f = fixture(&env);
     let ciphertext = fill_and_release(&mut f);
     let decrypts = f.fill.metrics.count(Event::FillDecryptCount);
@@ -1902,6 +1887,7 @@ fn cache_ciphertext_only(
                     .acquire(page, membership.clone(), &f.context, &f.scope, &mut budget),
                 &mut f.engine,
                 &f.crypto,
+                f.fill.drivers(),
             )
             .unwrap(),
         );
@@ -1972,7 +1958,7 @@ fn read_range(
             continue;
         }
         endpoint.poll(&mut cx, 64).unwrap();
-        crate::drivers::poll(&mut cx, 64);
+        f.fill.drivers().poll(&mut cx, 64);
         crate::lifecycle::Service::poll_budgeted(&mut f.engine, &mut cx, 64).unwrap();
         f.crypto.poll_budgeted(64).unwrap();
         f.reactor.poll_budgeted(128).unwrap();
@@ -1981,7 +1967,7 @@ fn read_range(
     drop(stream);
     for _ in 0..32 {
         endpoint.poll(&mut cx, 64).unwrap();
-        crate::drivers::poll(&mut cx, 64);
+        f.fill.drivers().poll(&mut cx, 64);
     }
     delivered
 }
@@ -1991,8 +1977,6 @@ fn warm_range_reread_decrypts_cached_ciphertext_without_any_transfer() {
     let env = racer_io::Env::host();
     const PAGES: u64 = 6;
     const WINDOW: usize = 4;
-    let queue = Rc::new(crate::drivers::DriverQueue::new(1024));
-    let _owner = queue.enter();
     let signers = network(&env, 2);
     let mut f = roomy_fixture(&env, PAGES);
     f.reactor.init().unwrap();
@@ -2040,8 +2024,6 @@ fn warm_range_reread_transfers_only_uncached_pages() {
     let env = racer_io::Env::host();
     const PAGES: u64 = 6;
     const WINDOW: usize = 4;
-    let queue = Rc::new(crate::drivers::DriverQueue::new(1024));
-    let _owner = queue.enter();
     let signers = network(&env, 1);
     let mut f = roomy_fixture(&env, PAGES);
     f.reactor.init().unwrap();

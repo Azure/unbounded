@@ -86,16 +86,11 @@ pub(crate) fn page(byte: u8) -> crate::memory::PageResult {
 #[test]
 fn racer_capacity_and_reservation_errors_are_preserved() {
     use crate::drivers::*;
-    assert!(matches!(
-        reserve().map_err(Error::from),
-        Err(Error::InvalidConfiguration)
-    ));
     let queue = Rc::new(DriverQueue::new(1024));
-    let _owner = queue.enter();
-    let permits: Vec<_> = (0..1024).map(|_| reserve().unwrap()).collect();
+    let permits: Vec<_> = (0..1024).map(|_| queue.reserve().unwrap()).collect();
     assert_eq!(queue.pending(), 1024);
     assert!(matches!(
-        reserve().map_err(Error::from),
+        queue.reserve().map_err(Error::from),
         Err(Error::Overloaded)
     ));
     drop(permits);
@@ -105,15 +100,15 @@ fn racer_capacity_and_reservation_errors_are_preserved() {
 fn detached_operation_errors_release_capacity() {
     use crate::drivers::*;
     let queue = Rc::new(DriverQueue::new(1024));
-    let _owner = queue.enter();
-    reserve()
+    queue
+        .reserve()
         .unwrap()
         .submit_detached(async { Err::<(), _>(Error::Io) });
-    poll(
+    queue.poll(
         &mut std::task::Context::from_waker(futures::task::noop_waker_ref()),
         1,
     );
-    assert_eq!(pending(), 0);
+    assert_eq!(queue.pending(), 0);
 }
 #[test]
 fn remote_budget_charges_final_incoming_link_and_never_restores_attempts() {
@@ -584,6 +579,7 @@ mod flight {
                         ..FlightLimits::default()
                     },
                     racer_io::Clock::host(),
+                    std::rc::Rc::new(crate::drivers::DriverQueue::new(1024)),
                 )
                 .unwrap(),
             );
@@ -1056,8 +1052,6 @@ mod flight {
         #[test]
         fn worker_poll_drives_owned_completion_after_waiter_disappears() {
             let env = racer_io::Env::host();
-            let queue = Rc::new(crate::drivers::DriverQueue::new(1024));
-            let _owner = queue.enter();
             let flights = flights(&env, FlightLimits::default());
             let (context, scope) = (origin(), scope(&env));
             let mut a_budget = budget();
@@ -1066,7 +1060,9 @@ mod flight {
             let operation = flights.retain_operation(&leader, metric_lease()).unwrap();
             let (send, receive) = futures::channel::oneshot::channel::<()>();
             let worker = flights.clone();
-            crate::drivers::reserve()
+            flights
+                .drivers()
+                .reserve()
                 .unwrap()
                 .submit_detached(Box::pin(async move {
                     receive.await.map_err(|_| Error::Io)?;
@@ -1083,7 +1079,7 @@ mod flight {
             send.send(()).unwrap();
             flights.poll_budgeted(1).unwrap();
             assert!(flights.table.borrow().is_empty());
-            assert_eq!(crate::drivers::pending(), 0);
+            assert_eq!(flights.drivers().pending(), 0);
         }
 
         #[test]
@@ -1842,6 +1838,7 @@ mod flight {
                 crate::test_support::availability(env),
                 limits,
                 env.ctx.clock.clone(),
+                std::rc::Rc::new(crate::drivers::DriverQueue::new(1024)),
             )
             .unwrap(),
         )
@@ -2179,8 +2176,6 @@ mod flight {
     #[test]
     fn worker_poll_drives_parent_owned_queue_after_caller_drop() {
         let env = racer_io::Env::host();
-        let queue = Rc::new(crate::drivers::DriverQueue::new(1024));
-        let _owner = queue.enter();
         let flights = flights(&env, FlightLimits::default());
         let (context, scope) = (origin(), scope(&env));
         let mut budget = budget();
@@ -2188,7 +2183,9 @@ mod flight {
         let leader = lead(&mut a);
         let operation = flights.retain_operation(&leader, metric_lease()).unwrap();
         let (send, recv) = futures::channel::oneshot::channel::<()>();
-        crate::drivers::reserve()
+        flights
+            .drivers()
+            .reserve()
             .unwrap()
             .submit_detached(Box::pin(async move {
                 recv.await.map_err(|_| Error::Io)?;
@@ -2201,7 +2198,7 @@ mod flight {
         assert_eq!(flights.table.borrow().len(), 1);
         send.send(()).unwrap();
         assert!(matches!(poll(flights.drain(&scope)), Poll::Ready(Ok(()))));
-        assert_eq!(crate::drivers::pending(), 0);
+        assert_eq!(flights.drivers().pending(), 0);
     }
 
     fn test_page() -> PageId {
@@ -2606,6 +2603,7 @@ mod timeouts {
                     crate::control::Snapshot::retention(2),
                 )),
                 env.ctx.clone(),
+                std::rc::Rc::new(crate::drivers::DriverQueue::new(1024)),
             );
             let scope = RequestScope::on(
                 &env.ctx.clock,

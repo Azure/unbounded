@@ -25,6 +25,7 @@ fn acquire_cipher(f: &mut Fixture) -> Result<crate::memory::CiphertextCopy> {
         ),
         &mut f.engine,
         &f.crypto,
+        f.fill.drivers(),
     )
 }
 
@@ -45,8 +46,6 @@ fn assert_retains_nothing(f: &Fixture) {
 fn passthrough_reads_refetch_from_origin_and_retain_nothing() {
     let env = racer_io::Env::host();
     for mode in [CacheMode::Cached, MODES[0], MODES[1]] {
-        let queue = Rc::new(crate::drivers::DriverQueue::new(1024));
-        let _queue = queue.enter();
         let mut f = fixture(&env);
         f.set_mode(&env, mode);
         for read in 1..=3 {
@@ -77,8 +76,6 @@ fn passthrough_reads_refetch_from_origin_and_retain_nothing() {
 fn passthrough_owner_ciphertext_fill_retains_nothing() {
     let env = racer_io::Env::host();
     for mode in MODES {
-        let queue = Rc::new(crate::drivers::DriverQueue::new(1024));
-        let _queue = queue.enter();
         let mut f = fixture(&env);
         f.set_mode(&env, mode);
         for read in 1..=2 {
@@ -97,8 +94,6 @@ fn passthrough_owner_ciphertext_fill_retains_nothing() {
 fn passthrough_concurrent_reads_coalesce_into_one_origin_call() {
     let env = racer_io::Env::host();
     for mode in MODES {
-        let queue = Rc::new(crate::drivers::DriverQueue::new(1024));
-        let _queue = queue.enter();
         let mut f = fixture(&env);
         f.set_mode(&env, mode);
         f.origin.blocked_pages.borrow_mut().insert(0);
@@ -134,7 +129,7 @@ fn passthrough_concurrent_reads_coalesce_into_one_origin_call() {
             assert!(first.as_mut().poll(&mut cx).is_pending());
             assert!(second.as_mut().poll(&mut cx).is_pending());
             assert!(third.as_mut().poll(&mut cx).is_pending());
-            crate::drivers::poll(&mut cx, 64);
+            f.fill.drivers().poll(&mut cx, 64);
         }
         assert_eq!(f.origin.calls.get(), 1, "{mode:?}");
         f.origin.blocked_pages.borrow_mut().clear();
@@ -142,6 +137,7 @@ fn passthrough_concurrent_reads_coalesce_into_one_origin_call() {
             async { futures::join!(first, second, third) },
             &mut f.engine,
             &f.crypto,
+            f.fill.drivers(),
         );
         assert_eq!(a.unwrap().plaintext.bytes(), b"abc");
         assert_eq!(b.unwrap().plaintext.bytes(), b"abc");
@@ -159,8 +155,6 @@ fn passthrough_concurrent_reads_coalesce_into_one_origin_call() {
 #[test]
 fn passthrough_local_route_never_asks_page_owners() {
     let env = racer_io::Env::host();
-    let queue = Rc::new(crate::drivers::DriverQueue::new(1024));
-    let _queue = queue.enter();
     let mut f = fixture(&env);
     let local = f.fill.dependencies.candidates.node.clone();
     let mut members: Vec<_> = (0..8)
@@ -269,8 +263,6 @@ fn local_origin_authority_requires_local_route() {
 fn residual_pages_are_not_served_after_switching_to_passthrough() {
     let env = racer_io::Env::host();
     for mode in MODES {
-        let queue = Rc::new(crate::drivers::DriverQueue::new(1024));
-        let _queue = queue.enter();
         let mut f = fixture(&env);
         let cached = acquire_plain(&mut f).unwrap();
         assert!(
@@ -318,8 +310,6 @@ fn residual_pages_are_not_served_after_switching_to_passthrough() {
 #[test]
 fn residual_disk_copy_is_not_served_after_switching_to_passthrough() {
     let env = racer_io::Env::host();
-    let queue = Rc::new(crate::drivers::DriverQueue::new(1024));
-    let _queue = queue.enter();
     let mut f = fixture(&env);
     let result = acquire_plain(&mut f).unwrap();
     let deps = f.fill.dependencies.clone();
@@ -351,8 +341,6 @@ fn passthrough_metadata_is_revalidated_on_every_read() {
     use crate::test_support::origin::RequestKind;
     let env = racer_io::Env::host();
     for mode in [CacheMode::Cached, MODES[0], MODES[1]] {
-        let queue = Rc::new(crate::drivers::DriverQueue::new(1024));
-        let _queue = queue.enter();
         let mut f = fixture(&env);
         f.set_mode(&env, mode);
         let mut metadata = f.origin.metadata.clone();
@@ -374,6 +362,7 @@ fn passthrough_metadata_is_revalidated_on_every_read() {
                 &f.reactor,
                 &mut f.engine,
                 &f.crypto,
+                f.fill.drivers(),
             )
             .unwrap_or_else(|error| panic!("{mode:?} read {read}: {error:?}"));
             assert_eq!(resolved, metadata);
@@ -396,6 +385,7 @@ fn passthrough_metadata_is_revalidated_on_every_read() {
             &f.reactor,
             &mut f.engine,
             &f.crypto,
+            f.fill.drivers(),
         )
         .unwrap();
         assert_eq!(pinned.version, metadata.version);
@@ -409,8 +399,6 @@ fn passthrough_refuses_holds_and_prefetch_fills() {
     use crate::test_support::security::network;
     let env = racer_io::Env::host();
     for mode in [CacheMode::Cached, MODES[0], MODES[1]] {
-        let queue = Rc::new(crate::drivers::DriverQueue::new(1024));
-        let _queue = queue.enter();
         let signers = network(&env, 1);
         let mut f = fixture_with(&env, PAGE_BYTES + 7, None);
         f.reactor.init().unwrap();
@@ -482,8 +470,6 @@ fn queued_publication_is_dropped_after_switching_to_passthrough() {
     use crate::test_support::security::network;
     let env = racer_io::Env::host();
     for mode in [CacheMode::Cached, MODES[0], MODES[1]] {
-        let queue = Rc::new(crate::drivers::DriverQueue::new(1024));
-        let _queue = queue.enter();
         let signers = network(&env, 1);
         let mut f = fixture_with(&env, PAGE_BYTES + 7, None);
         f.reactor.init().unwrap();
@@ -528,8 +514,6 @@ fn delayed_retained_metadata_is_dropped_after_switching_to_passthrough() {
     use crate::test_support::security::network;
     let env = racer_io::Env::host();
     for mode in [CacheMode::Cached, MODES[0], MODES[1]] {
-        let queue = Rc::new(crate::drivers::DriverQueue::new(1024));
-        let _queue = queue.enter();
         let signers = network(&env, 1);
         let mut f = fixture_with(&env, PAGE_BYTES + 7, None);
         f.reactor.init().unwrap();
@@ -590,8 +574,6 @@ fn passthrough_stream_keeps_its_whole_window_of_origin_reads_in_flight() {
     let env = racer_io::Env::host();
     const WINDOW: usize = 4;
     for mode in MODES {
-        let queue = Rc::new(crate::drivers::DriverQueue::new(1024));
-        let _owner = queue.enter();
         let signers = network(&env, 1);
         let mut f = fixture_with(&env, 6 * PAGE_BYTES + 7, None);
         f.reactor.init().unwrap();
@@ -656,8 +638,6 @@ fn passthrough_pinned_origin_miss_keeps_transient_predecessors_retryable() {
     use crate::test_support::origin::AdapterOrigin;
     let env = racer_io::Env::host();
     for mode in MODES {
-        let queue = Rc::new(crate::drivers::DriverQueue::new(1024));
-        let _queue = queue.enter();
         let mut f = fixture(&env);
         f.set_mode(&env, mode);
         let adapter = AdapterOrigin::new("fixture", f.origin.metadata.clone());
@@ -695,6 +675,7 @@ fn passthrough_pinned_origin_miss_keeps_transient_predecessors_retryable() {
                 &f.reactor,
                 &mut f.engine,
                 &f.crypto,
+                f.fill.drivers(),
             );
             assert_eq!(result.err(), Some(expected), "{mode:?} {evidence:?}");
         }

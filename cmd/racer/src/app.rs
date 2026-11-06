@@ -938,11 +938,13 @@ impl StopSignals {
 impl Drop for WorkerApplication {
     /// Break the `Links` task cycle when the worker is dropped without a drain
     /// (crash, failed startup, or an aborted group), so setup tasks release
-    /// their connections and admission charges.
+    /// their connections and admission charges, and release detached drivers.
     fn drop(&mut self) {
         if let Some(links) = &self.links {
             links.abandon_setups();
         }
+        // Detached drivers retain worker services that retain this queue.
+        self.drivers.abandon();
     }
 }
 
@@ -1301,7 +1303,6 @@ impl WorkerApplication {
             .crypto
             .set_failure_observer(node.failures.observer(worker));
         let drivers = Rc::new(crate::drivers::DriverQueue::new(1024));
-        let _queue = drivers.enter();
         let admission = runtime.admission.clone();
         config.page_hedge.validate()?;
         let hedges = node
@@ -1510,6 +1511,7 @@ impl WorkerApplication {
                 credentials.clone(),
                 node.publications.clone(),
                 reactor.ctx().clone(),
+                drivers.clone(),
             )
             .with_hedges(hedges)
             .with_reactor(reactor.clone())
@@ -1562,6 +1564,7 @@ impl WorkerApplication {
             admission.clone(),
             availability.clone(),
             reactor.ctx().clock.clone(),
+            drivers.clone(),
         ));
         let (coordinator, metadata) = Self::assemble_reads(
             config,
@@ -1616,6 +1619,7 @@ impl WorkerApplication {
                 request_timeout: config.request_timeout,
                 opaque_relay: config.opaque_relay,
             },
+            drivers.clone(),
         )
         .with_page_size(origin.clone())
         .with_metrics(metrics.clone());
@@ -1737,6 +1741,7 @@ impl WorkerApplication {
         dependencies: FillDependencies,
     ) -> (Rc<Coordinator>, Rc<MetadataService>) {
         let candidates = dependencies.candidates.clone();
+        let drivers = candidates.drivers().clone();
         let origin = dependencies.origin.clone();
         let credentials = dependencies.credentials.clone();
         let index = dependencies.writer.index().clone();
@@ -1757,6 +1762,7 @@ impl WorkerApplication {
             node.workers.clone(),
             delivery,
             config.limits.range_window_pages.get(),
+            drivers,
         ));
         let coordinator = Rc::new(Coordinator::new(
             snapshots.published.clone(),
@@ -2094,7 +2100,6 @@ impl WorkerApplication {
     /// Any error here ends the worker group and the process, so each stage names
     /// itself in the log before the error propagates.
     fn poll_services(&mut self, cx: &mut Context<'_>, work_budget: usize) -> Result<()> {
-        let _queue = self.drivers.enter();
         if work_budget == 0 {
             return Ok(());
         }
@@ -2496,8 +2501,7 @@ impl WorkerApplication {
 
     /// Fence control preparation and release this worker's remaining service owners.
     pub fn shutdown<'a>(&'a mut self, shutdown_scope: &'a RequestScope) -> Operation<'a, ()> {
-        let drivers = self.drivers.clone();
-        Box::pin(drivers.scope(async move {
+        Box::pin(async move {
             self.stop_profiling(shutdown_scope).await?;
             self.control_task.take();
             self.keyring_task.take();
@@ -2514,7 +2518,7 @@ impl WorkerApplication {
                 .health
                 .transition_at(crate::telemetry::State::Stopped, self.node.clock.now())?;
             Ok(())
-        }))
+        })
     }
 
     async fn stop_profiling(&self, deadline: &RequestScope) -> Result<()> {
@@ -2655,7 +2659,6 @@ impl crate::lifecycle::Service<RequestScope> for WorkerApplication {
     }
 
     fn stop_admission(&mut self) -> Result<()> {
-        let _queue = self.drivers.enter();
         self.stopping = true;
         if let Some(profiling) = self.node.profiling.get() {
             profiling.stop();
@@ -2692,8 +2695,7 @@ impl crate::lifecycle::Service<RequestScope> for WorkerApplication {
     }
 
     fn drain<'a>(&'a mut self, _scope: &'a RequestScope) -> Operation<'a, ()> {
-        let drivers = self.drivers.clone();
-        Box::pin(drivers.scope(async move {
+        Box::pin(async move {
             self.stop_admission()?;
             let deadline = scope(&self.ctx().clock, self.shutdown_timeout)?;
             self.stop_profiling(&deadline).await?;
@@ -2785,7 +2787,7 @@ impl crate::lifecycle::Service<RequestScope> for WorkerApplication {
                 self.checkpoint(&deadline).await?;
             }
             Ok(())
-        }))
+        })
     }
 
     fn shutdown<'a>(&'a mut self, scope: &'a RequestScope) -> Operation<'a, ()> {
@@ -3201,8 +3203,7 @@ impl WorkerApplication {
 
     /// Recover storage and accept initial control state before opening listeners.
     pub fn start<'a>(&'a mut self, startup: &'a RequestScope) -> Operation<'a, ()> {
-        let drivers = self.drivers.clone();
-        Box::pin(drivers.scope(stoppable(async move {
+        Box::pin(stoppable(async move {
             startup.check()?;
             if self.started || self.stopping {
                 return Err(Error::InvalidConfiguration);
@@ -3236,7 +3237,7 @@ impl WorkerApplication {
             self.started = true;
             self.observe_health()?;
             Ok(())
-        })))
+        }))
     }
 
     /// Open storage and publish the effective disk capacity metrics.

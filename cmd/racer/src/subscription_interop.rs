@@ -335,6 +335,7 @@ impl SubscriptionFixture {
             NoPeer::request,
             NoPeer::request_direct,
         );
+        let drivers = Rc::new(crate::drivers::DriverQueue::new(1024));
         let candidates = Rc::new(CandidatePolicy::new(
             keys.node().clone(),
             Rc::new(topology::Placement::new(16)),
@@ -342,6 +343,7 @@ impl SubscriptionFixture {
             credentials.clone(),
             Arc::new(PublicationCell::new(Snapshot::retention(2))),
             racer_io::WorkerCtx::host(),
+            drivers.clone(),
         ));
         let origin = Rc::new(GeneratedOrigin(buffers.clone()));
         let memory = Rc::new(MemoryCache::new(buffers.clone(), availability.clone()));
@@ -356,6 +358,7 @@ impl SubscriptionFixture {
                 admission.clone(),
                 availability.clone(),
                 racer_io::Clock::host(),
+                drivers.clone(),
             )),
             crypto: Rc::new(PageCrypto::new(
                 keys,
@@ -378,7 +381,12 @@ impl SubscriptionFixture {
             },
         ));
         let delivery = Rc::new(Delivery::new(reactor.clone(), Duration::from_secs(10)));
-        let streams = Rc::new(RangeStreams::new(directory.clone(), delivery.clone(), 2));
+        let streams = Rc::new(RangeStreams::new(
+            directory.clone(),
+            delivery.clone(),
+            2,
+            drivers.clone(),
+        ));
         let coordinator = Rc::new(Coordinator::new(
             snapshots.published.clone(),
             metadata,
@@ -412,7 +420,6 @@ impl SubscriptionFixture {
         futures::executor::block_on(clients.reconcile(std::slice::from_ref(&cache), &scope))
             .unwrap();
         std::fs::write(root.join("ready"), b"ready").unwrap();
-        let drivers = Rc::new(crate::drivers::DriverQueue::new(1024));
         Self {
             root,
             clients,
@@ -430,7 +437,6 @@ impl SubscriptionFixture {
     }
 
     fn serve(&mut self) -> usize {
-        let _guard = self.drivers.enter();
         let mut cx = Context::from_waker(futures::task::noop_waker_ref());
         let mut peak = 0;
         while !self.root.join("stop").exists() {
@@ -461,7 +467,6 @@ impl SubscriptionFixture {
     }
 
     fn teardown(&mut self) {
-        let _guard = self.drivers.enter();
         let mut cx = Context::from_waker(futures::task::noop_waker_ref());
         self.clients.cancel_cache(&self.cache.id).unwrap();
         self.clients.stop_admission();

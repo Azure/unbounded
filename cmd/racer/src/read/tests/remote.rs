@@ -152,8 +152,6 @@ fn remote_origin_absence_preserves_fresh_404_pinned_412_and_later_cached_version
 #[test]
 fn coordinator_copy_miss_is_not_origin_absence_and_pinned_missing_is_412() {
     let env = racer_io::Env::host();
-    let queue = Rc::new(crate::drivers::DriverQueue::new(1024));
-    let _owner = queue.enter();
     use crate::test_support::NoPeers;
     let ids = identities(&env, &[node(0), node(1)]);
     let membership = Arc::new(
@@ -291,8 +289,6 @@ fn remote_candidate_with_churn(
     forbidden: bool,
     churn: bool,
 ) {
-    let queue = Rc::new(crate::drivers::DriverQueue::new(1024));
-    let _owner = queue.enter();
     use crate::control::Snapshot;
     use crate::control::cell::PublicationCell;
     use crate::control::publication::PublicationTarget;
@@ -537,6 +533,7 @@ fn remote_candidate_with_churn(
             crate::control::Snapshot::retention(2),
         )),
         racer_io::WorkerCtx::host(),
+        std::rc::Rc::new(crate::drivers::DriverQueue::new(1024)),
     );
     let context = OriginContext {
         object: object.clone(),
@@ -1034,6 +1031,7 @@ fn metadata_coordinator_with_newer_publication(
             crate::control::Snapshot::retention(2),
         )),
         racer_io::WorkerCtx::host(),
+        std::rc::Rc::new(crate::drivers::DriverQueue::new(1024)),
     ));
     let origin = adapter.client(
         snapshots.clone(),
@@ -1063,6 +1061,7 @@ fn metadata_coordinator_with_newer_publication(
                 admission.clone(),
                 availability.clone(),
                 racer_io::Clock::host(),
+                std::rc::Rc::new(crate::drivers::DriverQueue::new(1024)),
             )),
             crypto: Rc::new(PageCrypto::new(
                 keys,
@@ -1090,6 +1089,7 @@ fn metadata_coordinator_with_newer_publication(
         owners.clone(),
         delivery,
         2,
+        std::rc::Rc::new(crate::drivers::DriverQueue::new(1024)),
     ));
     let coordinator = Rc::new(super::Coordinator::new(
         snapshots.published.clone(),

@@ -326,6 +326,7 @@ fn real_uds_root_remapping_keeps_public_authority_and_http_validation() {
         credentials(admission.clone()),
         Arc::new(PublicationCell::new(Snapshot::retention(2))),
         racer_io::WorkerCtx::host(),
+        Rc::new(crate::drivers::DriverQueue::new(1024)),
     );
     let scope = scope();
     let CandidateResolution::Origin(authority) = block_on(policy.resolve(
@@ -1013,6 +1014,7 @@ fn public_operations_reject_wrong_authority_before_io() {
         credentials(client(&env).1),
         Arc::new(PublicationCell::new(Snapshot::retention(2))),
         racer_io::WorkerCtx::host(),
+        Rc::new(crate::drivers::DriverQueue::new(1024)),
     );
     let context = context();
     let scope = scope();

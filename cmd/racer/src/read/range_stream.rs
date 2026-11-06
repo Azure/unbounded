@@ -519,6 +519,9 @@ pub struct RangeStreams {
     delivery: Rc<Delivery>,
 
     window_pages: usize,
+
+    /// This worker's detached driver queue for stream cleanup and hints.
+    drivers: Rc<crate::drivers::DriverQueue>,
 }
 
 /// The body stays on the ingress reactor, including its delivery pipe leases.
@@ -528,6 +531,9 @@ pub struct RangeStreams {
 /// send::<RangeStream>();
 /// ```
 pub struct RangeStream {
+    /// The opening worker's detached driver queue.
+    drivers: Rc<crate::drivers::DriverQueue>,
+
     /// The cache retains nothing: no peer selections and no spill holds.
     passthrough: bool,
 
@@ -608,11 +614,13 @@ impl RangeStreams {
         directory: Arc<WorkerDirectory>,
         delivery: Rc<Delivery>,
         window_pages: usize,
+        drivers: Rc<crate::drivers::DriverQueue>,
     ) -> Self {
         Self {
             directory,
             delivery,
             window_pages,
+            drivers,
         }
     }
 
@@ -650,6 +658,7 @@ impl RangeStreams {
             return Err(Error::InvalidRange);
         }
         Ok(RangeStream {
+            drivers: self.drivers.clone(),
             passthrough: false,
             error: None,
             lease: None,
@@ -759,7 +768,8 @@ impl RangeStream {
 
     /// Tell a sealed page's owner what the GPU decided.
     pub(crate) fn report_sealed(&self, report: SealedReport, passed: bool) {
-        self.directory.report_sealed(report, passed, &self.scope);
+        self.directory
+            .report_sealed(&self.drivers, report, passed, &self.scope);
     }
 
     /// Release exactly one delivered page and its retained plaintext charge.
@@ -931,6 +941,7 @@ impl RangeStream {
                         .collect::<Vec<_>>();
                     if !pages.is_empty() {
                         self.directory.release_read_pages(
+                            &self.drivers,
                             &self.metadata.version,
                             pages,
                             self.scope.request,
@@ -1298,7 +1309,7 @@ impl RangeStream {
             if accepted {
                 // Selected pages are accepted unobserved on their owner; record
                 // this reader's interest once it takes the page.
-                self.directory.observe_verified(page, scope);
+                self.directory.observe_verified(&self.drivers, page, scope);
                 changed = true;
             }
         }
@@ -1397,15 +1408,16 @@ impl RangeStream {
                 continue;
             };
             // A pending hold may still be applied; its completion fence says so.
-            let Ok(permit) = crate::drivers::reserve() else {
+            let Ok(permit) = self.drivers.reserve() else {
                 continue;
             };
+            let drivers = self.drivers.clone();
             let directory = self.directory.clone();
             let version = self.metadata.version.clone();
             let request = self.scope.request;
             permit.submit_detached(Box::pin(async move {
                 if let Ok(epoch) = holding.await {
-                    directory.release_read_pages(&version, [(number, epoch)], request);
+                    directory.release_read_pages(&drivers, &version, [(number, epoch)], request);
                 }
                 Ok::<(), Error>(())
             }));
@@ -1746,6 +1758,7 @@ pub(super) mod tests {
                 directory,
                 Rc::new(Delivery::new(reactor, Duration::from_secs(30))),
                 capacity,
+                std::rc::Rc::new(crate::drivers::DriverQueue::new(1024)),
             );
             Self {
                 admission,
@@ -2003,9 +2016,8 @@ pub(super) mod tests {
     fn optional_remote_observation_never_blocks_ready_delivery_or_duplicates_on_repoll() {
         let env = racer_io::Env::host();
         for repoll in [false, true] {
-            let queue = Rc::new(crate::drivers::DriverQueue::new(8));
-            let _queue = queue.enter();
             let f = Fixture::new(&env, crate::test_support::cluster::config(false).limits, 2);
+            let queue = f.streams.drivers.clone();
             let directory = f.streams.directory();
             assert_eq!(directory.test_observation_mailbox(), 0);
             let mut metadata = metadata();
@@ -2934,7 +2946,6 @@ pub(super) mod tests {
                 delivery.clone(),
                 4,
             );
-            let _queue = worker.drivers.enter();
             let scope = RequestScope::on(
                 &env.ctx.clock,
                 RequestId([7; 16]),

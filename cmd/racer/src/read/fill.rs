@@ -160,6 +160,12 @@ const GPU_COPY_JOIN_RETRIES: usize = 2;
 const LANDING_PROVIDERS: usize = 2;
 
 impl Fill {
+    /// This worker's detached driver queue.
+    #[cfg(test)]
+    pub(crate) fn drivers(&self) -> &std::rc::Rc<crate::drivers::DriverQueue> {
+        self.dependencies.candidates.drivers()
+    }
+
     /// Published mode of `cache`.
     pub(crate) fn mode(
         &self,
@@ -256,7 +262,12 @@ impl Fill {
             } else {
                 self.dependencies.flights.admit_local(page, None)?;
                 started = true;
-                let permit = crate::drivers::reserve().map_err(Error::from)?;
+                let permit = self
+                    .dependencies
+                    .candidates
+                    .drivers()
+                    .reserve()
+                    .map_err(Error::from)?;
                 let flight = if probe {
                     Some(self.dependencies.flights.reserve_copy_flight(page, scope)?)
                 } else {
@@ -319,7 +330,7 @@ impl Fill {
                 if probe {
                     scope.check()?;
                 }
-                crate::drivers::poll(cx, 64);
+                self.dependencies.candidates.drivers().poll(cx, 64);
                 let result = std::task::ready!(std::pin::Pin::new(&mut receive).poll(cx));
                 scope.check()?;
                 std::task::Poll::Ready(result)
@@ -1647,7 +1658,12 @@ impl Fill {
                 cached
             }
         };
-        let driver_permit = crate::drivers::reserve().map_err(Error::from)?;
+        let driver_permit = self
+            .dependencies
+            .candidates
+            .drivers()
+            .reserve()
+            .map_err(Error::from)?;
         let acquisition = waiter.acquisition(&leader)?;
         // The driver stays on this owner. Admit an independent zeroizing context
         // without crossing an AEAD domain.
@@ -1827,7 +1843,7 @@ impl Fill {
             Ok(())
         }));
         let remaining = std::future::poll_fn(|cx| {
-            crate::drivers::poll(cx, 64);
+            self.dependencies.candidates.drivers().poll(cx, 64);
             if !self.fence_acquisition || !acquisition.scope.cancellation.is_cancelled() {
                 acquisition.cancellation.register(cx.waker());
             }
@@ -2038,7 +2054,12 @@ impl Fill {
         let mut receive = if let Some(existing) = existing {
             existing
         } else {
-            let permit = crate::drivers::reserve().map_err(Error::from)?;
+            let permit = self
+                .dependencies
+                .candidates
+                .drivers()
+                .reserve()
+                .map_err(Error::from)?;
             let flight = self.dependencies.flights.reserve_copy_flight(page, scope)?;
             let owned_scope = scope.child(scope.request, scope.deadline.0)?;
             let (receive, completion) = self
@@ -2080,7 +2101,7 @@ impl Fill {
         std::future::poll_fn(|cx| {
             cancellation.register(cx.waker());
             scope.check()?;
-            crate::drivers::poll(cx, 64);
+            self.dependencies.candidates.drivers().poll(cx, 64);
             std::pin::Pin::new(&mut receive).poll(cx)
         })
         .await
@@ -2818,7 +2839,7 @@ impl Fill {
         {
             return;
         }
-        let Ok(permit) = crate::drivers::reserve() else {
+        let Ok(permit) = self.dependencies.candidates.drivers().reserve() else {
             return;
         };
         let mut fill = self.clone();

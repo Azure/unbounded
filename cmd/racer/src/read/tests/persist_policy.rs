@@ -44,8 +44,6 @@ fn fill_persistence_matches_core_policy() {
             (CIPHER, CIPHER),
             (CIPHER, CIPHER - 8),
         ] {
-            let queue = Rc::new(crate::drivers::DriverQueue::new(1024));
-            let _queue = queue.enter();
             let f = persisting(&env, owned, limit);
             let deps = &f.fill.dependencies;
             let admission = &deps.admission;
@@ -98,8 +96,6 @@ fn fill_persistence_matches_core_policy() {
 fn dirty_pressure_skips_persistence_while_bootstrap_read_succeeds() {
     let env = racer_io::Env::host();
     for full in [false, true] {
-        let queue = Rc::new(crate::drivers::DriverQueue::new(1024));
-        let _queue = queue.enter();
         let mut f = persisting(&env, true, CIPHER);
         let cache = f.context.object.cache.clone();
         let admission = f.fill.dependencies.admission.clone();
@@ -132,6 +128,7 @@ fn dirty_pressure_skips_persistence_while_bootstrap_read_succeeds() {
             ),
             &mut f.engine,
             &f.crypto,
+            f.fill.drivers(),
         )
         .expect("dirty pressure must not fail the bootstrap read");
         assert_eq!(result.plaintext.bytes(), b"abc");

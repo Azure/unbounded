@@ -1932,15 +1932,15 @@ fn two_worker_removal_preserves_late_driver_and_blocks_late_memory_and_disk_fill
     let (release, receive) = futures::channel::oneshot::channel::<()>();
     let memory = second.memory.clone();
     let late = late1.clone();
-    let owner = second.drivers.enter();
-    crate::drivers::reserve()
+    second
+        .drivers
+        .reserve()
         .unwrap()
         .submit_detached(Box::pin(async move {
             receive.await.map_err(|_| Error::Cancelled)?;
             assert_eq!(memory.publish(late), Err(Error::Unavailable));
             Ok::<_, Error>(())
         }));
-    drop(owner);
     for _ in 0..4 {
         first.poll_cache_preparation(&mut cx).unwrap();
         second.poll_cache_preparation(&mut cx).unwrap();

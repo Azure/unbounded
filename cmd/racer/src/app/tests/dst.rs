@@ -1041,7 +1041,6 @@ mod scenarios {
                     let _local = app
                         .directory
                         .simulation_scope(Some((app.worker, app.coordinator.clone())));
-                    let _drivers = app.drivers.enter();
                     if let Poll::Ready(Some(result)) = std::pin::Pin::new(&mut pending)
                         .poll_next(&mut Context::from_waker(futures::task::noop_waker_ref()))
                     {

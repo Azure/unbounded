@@ -183,6 +183,8 @@ fn positions(candidates: &Candidates) -> List<u32, MAX_HANDOFF> {
 pub struct CandidatePolicy {
     /// Time and entropy for this worker's candidate walks.
     ctx: racer_io::WorkerCtx,
+    /// This worker's detached driver queue, shared with its other owners.
+    drivers: Rc<crate::drivers::DriverQueue>,
     hedge: Option<Arc<Hedges>>,
     replica_selection: ReplicaSelection,
     attempt_timeout: std::time::Duration,
@@ -690,9 +692,11 @@ impl CandidatePolicy {
         credentials: Rc<CredentialCrypto>,
         published: Arc<crate::control::cell::PublicationCell<crate::control::Snapshot>>,
         ctx: racer_io::WorkerCtx,
+        drivers: Rc<crate::drivers::DriverQueue>,
     ) -> Self {
         Self {
             ctx,
+            drivers,
             hedge: None,
             // Low-level construction keeps canonical order; the service reads
             // its selection from configuration (default `Spread`).
@@ -763,6 +767,10 @@ impl CandidatePolicy {
     /// Let readers wait for a destination that is behind this node's membership instead of skipping
     /// it.
     /// This worker's time and entropy.
+    pub(crate) fn drivers(&self) -> &Rc<crate::drivers::DriverQueue> {
+        &self.drivers
+    }
+
     pub(crate) fn ctx(&self) -> &racer_io::WorkerCtx {
         &self.ctx
     }
@@ -2409,7 +2417,7 @@ impl CandidatePolicy {
                 self.notices.borrow_mut().release(&group);
                 continue;
             }
-            let Ok(permit) = crate::drivers::reserve() else {
+            let Ok(permit) = self.drivers.reserve() else {
                 // No driver slot this turn: count it as a failed offer
                 // (local, so not a cut).
                 let _ = self
@@ -2458,7 +2466,7 @@ impl CandidatePolicy {
             return;
         }
         for (peer, page) in health.due_pings(now, room) {
-            let Ok(permit) = crate::drivers::reserve() else {
+            let Ok(permit) = self.drivers.reserve() else {
                 // No driver slot this turn: the ping's slot goes stale and
                 // the next timeout asks again.
                 return;
@@ -3172,6 +3180,7 @@ pub(super) mod tests {
                 crate::control::Snapshot::retention(2),
             )),
             racer_io::WorkerCtx::host(),
+            std::rc::Rc::new(crate::drivers::DriverQueue::new(1024)),
         );
         let mut budget = AcquisitionBudget::new(scope.deadline.0, 16, 24);
         let result = futures::executor::block_on(policy.resolve_with_budget(
@@ -3542,6 +3551,7 @@ pub(super) mod tests {
                     probe.credentials.clone(),
                     probe.published.clone(),
                     racer_io::WorkerCtx::host(),
+                    std::rc::Rc::new(crate::drivers::DriverQueue::new(1024)),
                 )
                 .with_replica_selection(selection);
                 let context = OriginContext {
@@ -3741,6 +3751,7 @@ pub(super) mod tests {
                     probe.credentials.clone(),
                     probe.published.clone(),
                     racer_io::WorkerCtx::host(),
+                    std::rc::Rc::new(crate::drivers::DriverQueue::new(1024)),
                 );
                 let context = OriginContext {
                     object: object(),
@@ -3877,6 +3888,7 @@ pub(super) mod tests {
                 crate::control::Snapshot::retention(2),
             )),
             racer_io::WorkerCtx::host(),
+            std::rc::Rc::new(crate::drivers::DriverQueue::new(1024)),
         );
         let candidates = policy.candidates(membership, &context.object, PageNumber(0));
         let mut budget = AcquisitionBudget::new(scope.deadline.0, attempts, 8);
@@ -3933,6 +3945,7 @@ pub(super) mod tests {
                 crate::control::Snapshot::retention(2),
             )),
             racer_io::WorkerCtx::host(),
+            std::rc::Rc::new(crate::drivers::DriverQueue::new(1024)),
         );
         let mut budget = AcquisitionBudget::new(scope.deadline.0, 4, 8);
         let result = futures::executor::block_on(policy.resolve_with_budget(
@@ -3976,6 +3989,7 @@ pub(super) mod tests {
                 crate::control::Snapshot::retention(2),
             )),
             racer_io::WorkerCtx::host(),
+            std::rc::Rc::new(crate::drivers::DriverQueue::new(1024)),
         );
         let mut budget = AcquisitionBudget::new(scope.deadline.0, 16, 24);
         let result = futures::executor::block_on(policy.resolve_with_budget(
@@ -4029,6 +4043,7 @@ pub(super) mod tests {
                     crate::control::Snapshot::retention(2),
                 )),
                 racer_io::WorkerCtx::host(),
+                std::rc::Rc::new(crate::drivers::DriverQueue::new(1024)),
             );
             let mut budget = AcquisitionBudget::new(scope.deadline.0, 16, 24);
             let result = futures::executor::block_on(policy.resolve_with_budget(
@@ -4070,6 +4085,7 @@ pub(super) mod tests {
                 crate::control::Snapshot::retention(2),
             )),
             racer_io::WorkerCtx::host(),
+            std::rc::Rc::new(crate::drivers::DriverQueue::new(1024)),
         );
         let mut budget = AcquisitionBudget::new(scope.deadline.0, 16, 24);
         let result = futures::executor::block_on(policy.resolve_with_budget(
@@ -4116,6 +4132,7 @@ pub(super) mod tests {
                 crate::control::Snapshot::retention(2),
             )),
             racer_io::WorkerCtx::host(),
+            std::rc::Rc::new(crate::drivers::DriverQueue::new(1024)),
         );
         let destination = membership.members()[0].node.clone();
         let operation = PeerOperation::Metadata {
@@ -4324,6 +4341,7 @@ pub(super) mod tests {
                 crate::control::Snapshot::retention(2),
             )),
             racer_io::WorkerCtx::host(),
+            std::rc::Rc::new(crate::drivers::DriverQueue::new(1024)),
         )
     }
     fn scope() -> RequestScope {
@@ -4592,6 +4610,7 @@ pub(super) mod tests {
                 )),
                 published,
                 racer_io::WorkerCtx::host(),
+                std::rc::Rc::new(crate::drivers::DriverQueue::new(1024)),
             ));
             let weak_policy = Rc::downgrade(&policy);
             let callback = policy.ownership_callback();
@@ -4980,13 +4999,13 @@ pub(super) mod tests {
             let owner = controller(&env, 1, DUPLICATE_BYTES);
             let permit = owner.acquire(MAX_PAGE).unwrap();
             let queue = Rc::new(crate::drivers::DriverQueue::new(1024));
-            let _guard = queue.enter();
             let (send, receive) = futures::channel::oneshot::channel();
             let fence = Rc::new(Cell::new(false));
             let primary_fence = fence.clone();
             let completion = Rc::new(Cell::new(false));
             let done = completion.clone();
-            crate::drivers::reserve()
+            queue
+                .reserve()
                 .unwrap()
                 .submit_detached(Box::pin(async move {
                     let a = scope(&env);

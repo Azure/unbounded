@@ -736,6 +736,7 @@ mod destination_disconnect {
                 admission.clone(),
                 crate::test_support::availability_for(env, vec![CacheId(CACHE.into())]),
                 racer_io::Clock::host(),
+                Rc::new(crate::drivers::DriverQueue::new(1024)),
             ));
             let service = Rc::new(PendingPage {
                 flights: flights.clone(),

@@ -51,6 +51,8 @@ pub(crate) struct Settings {
 }
 
 pub struct PeerServer {
+    /// This worker's detached driver queue for diagnostic samples.
+    drivers: std::rc::Rc<crate::drivers::DriverQueue>,
     tcp_nodelay: bool,
     metrics: crate::telemetry::Metrics,
     send_tag: Option<(
@@ -178,7 +180,7 @@ impl PeerServer {
         let receiver = connection.state().session.as_ref()?.peer();
         let (ticket, sample) =
             samples.begin(pair, self.signatures.node(), receiver, scope.clock().now())?;
-        let permit = match crate::drivers::reserve().map_err(Error::from) {
+        let permit = match self.drivers.reserve().map_err(Error::from) {
             Ok(p) => p,
             Err(error) => {
                 sample.finish(Some(error));
@@ -250,6 +252,7 @@ impl PeerServer {
                 request_timeout: Duration::from_secs(30),
                 opaque_relay: false,
             },
+            Rc::new(crate::drivers::DriverQueue::new(1024)),
         )
     }
     #[cfg(test)]
@@ -375,8 +378,10 @@ impl PeerServer {
         pipes: Rc<flow_control::PipePool<AdmissionPolicy>>,
         transfers: Rc<super::transport::Transfers>,
         settings: Settings,
+        drivers: std::rc::Rc<crate::drivers::DriverQueue>,
     ) -> Self {
         Self {
+            drivers,
             subscriptions,
             metrics: crate::telemetry::Metrics::default(),
             tcp_nodelay: settings.tcp_nodelay,

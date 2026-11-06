@@ -629,6 +629,7 @@ impl ReadWorker {
             admission.clone(),
             reactor_ctx.rng.clone(),
         ));
+        let drivers = Rc::new(DriverQueue::new(1024));
         let candidates = Rc::new(CandidatePolicy::new(
             keys.node().clone(),
             Rc::new(Placement::new(16)),
@@ -636,6 +637,7 @@ impl ReadWorker {
             credentials.clone(),
             Arc::new(PublicationCell::new(Snapshot::retention(2))),
             reactor_ctx.clone(),
+            drivers.clone(),
         ));
         let client = origin.client(
             snapshots.clone(),
@@ -656,6 +658,7 @@ impl ReadWorker {
                     admission.clone(),
                     availability.clone(),
                     reactor_ctx.clock.clone(),
+                    drivers.clone(),
                 )),
                 crypto: Rc::new(PageCrypto::new(
                     keys,
@@ -679,7 +682,12 @@ impl ReadWorker {
                 fill: fill.clone(),
             },
         ));
-        let streams = Rc::new(RangeStreams::new(directory.clone(), delivery, window));
+        let streams = Rc::new(RangeStreams::new(
+            directory.clone(),
+            delivery,
+            window,
+            drivers.clone(),
+        ));
         let membership = snapshots.current().unwrap().membership.clone();
         let coordinator = Rc::new(Coordinator::new(
             snapshots.published.clone(),
@@ -695,7 +703,7 @@ impl ReadWorker {
             streams,
             membership,
             origin,
-            drivers: Rc::new(DriverQueue::new(1024)),
+            drivers,
             endpoint: RefCell::new(endpoint),
             engine: RefCell::new(PageCryptoEngine::new(CryptoRuntime {
                 port: engine,
@@ -808,7 +816,6 @@ impl ReadWorker {
     }
 
     pub fn poll(&self, cx: &mut Context<'_>) {
-        let _queue = self.drivers.enter();
         self.endpoint.borrow_mut().poll_budgeted(64).unwrap();
         self.drivers.poll(cx, 64);
         crate::lifecycle::Service::poll_budgeted(

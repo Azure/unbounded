@@ -894,7 +894,6 @@ fn simulated_listener_preparation_rollback_and_real_http_exchange() {
     let mut response = Vec::new();
     let mut bytes = [0; 4096];
     for _ in 0..1000 {
-        let _queue = worker.drivers.enter();
         listeners
             .poll_budgeted(
                 &mut Context::from_waker(futures::task::noop_waker_ref()),
@@ -1143,7 +1142,6 @@ impl Fixture {
         stream
     }
     fn pump(&self, budget: usize) {
-        let _queue = self.worker.as_ref().map(|worker| worker.drivers.enter());
         self.listeners
             .poll_budgeted(
                 &mut Context::from_waker(futures::task::noop_waker_ref()),

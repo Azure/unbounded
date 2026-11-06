@@ -76,8 +76,6 @@ fn holders(f: &Fixture, number: u64) -> u32 {
 #[test]
 fn read_spill_holds_pages_past_the_window_and_releases_each_after_delivery() {
     let env = racer_io::Env::host();
-    let queue = Rc::new(crate::drivers::DriverQueue::new(1024));
-    let _queue = queue.enter();
     let (mut f, _local, mut endpoint, mut stream) = spill_reader(&env, 4, 2);
     let mut cx = Context::from_waker(futures::task::noop_waker_ref());
     // Without delivering, the window holds page 0 and spill parks 1 and 2.
@@ -142,8 +140,6 @@ fn read_spill_holds_pages_past_the_window_and_releases_each_after_delivery() {
 #[test]
 fn read_spill_cancel_releases_every_hold() {
     let env = racer_io::Env::host();
-    let queue = Rc::new(crate::drivers::DriverQueue::new(1024));
-    let _queue = queue.enter();
     let (mut f, _local, mut endpoint, mut stream) = spill_reader(&env, 4, 2);
     let mut cx = Context::from_waker(futures::task::noop_waker_ref());
     for _ in 0..4096 {
@@ -167,8 +163,6 @@ fn read_spill_cancel_releases_every_hold() {
 #[test]
 fn read_spill_hold_refused_falls_back_to_memory_window() {
     let env = racer_io::Env::host();
-    let queue = Rc::new(crate::drivers::DriverQueue::new(1024));
-    let _queue = queue.enter();
     let (mut f, _local, mut endpoint, mut stream) = spill_reader(&env, 4, 2);
     // Another version takes every hold the node admits.
     let mut other = f.page.version.clone();
@@ -212,8 +206,6 @@ fn read_spill_hold_refused_falls_back_to_memory_window() {
 #[test]
 fn read_spill_fill_failure_stops_spill_without_retrying() {
     let env = racer_io::Env::host();
-    let queue = Rc::new(crate::drivers::DriverQueue::new(1024));
-    let _queue = queue.enter();
     let (mut f, _local, mut endpoint, mut stream) = spill_reader(&env, 3, 1);
     // The head stays blocked while every origin fill fails, so only the spill
     // path can reach page 1.

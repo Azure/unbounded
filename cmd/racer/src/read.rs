@@ -106,6 +106,11 @@ pub(crate) fn inherited_budget(
 }
 
 impl Coordinator {
+    /// This worker's detached driver queue.
+    pub(crate) fn drivers(&self) -> &Rc<crate::drivers::DriverQueue> {
+        self.fill.dependencies.candidates.drivers()
+    }
+
     /// Expose the fill's hedge owner for coordinator tests.
     #[cfg(test)]
     pub(crate) fn hedge_owner(&self) -> Option<&std::sync::Arc<candidates::Hedges>> {

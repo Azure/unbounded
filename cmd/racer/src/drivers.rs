@@ -1,7 +1,7 @@
 //! Explicitly polled worker tasks, cooperative turns, retries, and draining races.
 //!
 //! The caller supplies capacity and polling budgets, handles task results, and owns
-//! shutdown fencing. Selection is thread-local; queues and permits retain their
+//! shutdown fencing. Owners pass queues explicitly; queues and permits retain their
 //! original owner across nested scopes. No executor or application policy is hidden
 //! here. For example, a local proxy can drive detached cache writes alongside I/O.
 
@@ -66,10 +66,6 @@ pub fn poll_task<F: Future + ?Sized>(
     }
 }
 
-thread_local! {
-    static CURRENT: RefCell<Option<Rc<DriverQueue>>> = const { RefCell::new(None) };
-}
-
 /// A bounded queue, including reservations not yet submitted. Zero disables admission.
 ///
 /// Queues cannot move between workers:
@@ -101,23 +97,6 @@ struct Driver {
 
 pub use racer_io::exec::Runnable;
 
-/// Restores the previous queue. Keep guards stack-nested, never across suspension.
-/// ```compile_fail
-/// use crate::drivers::QueueGuard;
-/// fn require_send<T: Send>() {}
-/// require_send::<QueueGuard>();
-/// ```
-pub struct QueueGuard {
-    previous: Option<Rc<DriverQueue>>,
-}
-
-impl Drop for QueueGuard {
-    /// Restore the queue selected before entering this stack-nested guard.
-    fn drop(&mut self) {
-        CURRENT.with(|current| current.replace(self.previous.take()));
-    }
-}
-
 impl DriverQueue {
     /// Create an empty queue with a bound covering both tasks and reservations.
     pub fn new(capacity: usize) -> Self {
@@ -135,25 +114,43 @@ impl DriverQueue {
     /// retain their reservations. Call only outside an active polling turn.
     #[cfg(test)]
     pub fn simulation_crash(&self) {
-        let drivers = std::mem::take(&mut *self.drivers.borrow_mut());
-        let new = std::mem::take(&mut *self.new.borrow_mut());
-        self.count.set(self.count.get() - drivers.len() - new.len());
-        drop((drivers, new));
+        self.abandon();
     }
 
-    /// Select this queue only during poll/drop, never across async suspension.
-    pub fn scope<F: Future>(self: &Rc<Self>, future: F) -> Queued<F> {
-        Queued {
+    /// Destroy queued tasks without polling them, including tasks their destructors
+    /// submit. Owners call this when their worker is dropped: tasks commonly retain
+    /// services that retain this queue, so dropping the handle alone would leak the
+    /// cycle. Outstanding permits retain their reservations. Call outside a turn.
+    pub fn abandon(&self) {
+        loop {
+            let drivers = std::mem::take(&mut *self.drivers.borrow_mut());
+            let new = std::mem::take(&mut *self.new.borrow_mut());
+            if drivers.is_empty() && new.is_empty() {
+                return;
+            }
+            self.count.set(self.count.get() - drivers.len() - new.len());
+            drop((drivers, new));
+        }
+    }
+
+    /// Reserve capacity in this queue. Exhausted capacity is Overloaded and zero
+    /// capacity disables admission. Dropping an unused permit returns capacity.
+    pub fn reserve(self: &Rc<Self>) -> Result<Permit> {
+        if self.count.get() >= self.capacity {
+            return Err(Error::Overloaded);
+        }
+        self.count.set(self.count.get() + 1);
+        Ok(Permit {
             queue: self.clone(),
-            future: Some(Box::pin(future)),
-        }
+            reserved: true,
+        })
     }
 
-    /// Select this queue until the returned stack-nested guard is dropped.
-    pub fn enter(self: &Rc<Self>) -> QueueGuard {
-        QueueGuard {
-            previous: CURRENT.with(|current| current.replace(Some(self.clone()))),
-        }
+    /// Reserve capacity and submit a task to this queue.
+    #[cfg(test)]
+    fn spawn(self: &Rc<Self>, driver: Task) -> Result<()> {
+        self.reserve()?.submit(driver);
+        Ok(())
     }
 
     /// Count submitted tasks and unused reservations, including sleeping tasks.
@@ -163,12 +160,11 @@ impl DriverQueue {
 
     /// Give at most budget queued tasks a turn, deferring children to a later turn.
     /// Recursive calls are ignored and remaining runnable work wakes the owner.
-    pub fn poll(self: &Rc<Self>, cx: &mut Context<'_>, budget: usize) {
+    pub fn poll(&self, cx: &mut Context<'_>, budget: usize) {
         // Reject nested turns before touching the outer owner's wake registration.
         let Ok(_turn) = Busy::try_enter(&self.polling) else {
             return;
         };
-        let _queue = self.enter();
         let owner = Rc::new(cx.waker().clone());
         let old = self.owner.replace(Some(owner));
         drop(old);
@@ -238,49 +234,7 @@ impl Drop for ActiveDriver<'_> {
     }
 }
 
-/// A future that selects its queue while polling and destroying its inner future.
-/// Even a Send inner future remains worker-local:
-/// ```compile_fail
-/// use crate::drivers::Queued;
-/// fn require_send<T: Send>() {}
-/// require_send::<Queued<std::future::Ready<()>>>();
-/// ```
-pub struct Queued<F> {
-    queue: Rc<DriverQueue>,
-
-    future: Option<Pin<Box<F>>>,
-}
-
-impl<F: Future> Future for Queued<F> {
-    /// Preserve the inner future's output without changing its ownership policy.
-    type Output = F::Output;
-
-    /// Select the captured queue for one poll, then restore the caller's selection.
-    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        let this = self.get_mut();
-        let _queue = this.queue.enter();
-        this.future
-            .as_mut()
-            .expect("queued future")
-            .as_mut()
-            .poll(cx)
-    }
-}
-
-impl<F> Drop for Queued<F> {
-    /// Destroy the inner future while its original queue is selected.
-    fn drop(&mut self) {
-        let _queue = self.queue.enter();
-        self.future.take();
-    }
-}
-
-/// Capture the selected queue without retaining its thread-local borrow.
-fn current() -> Option<Rc<DriverQueue>> {
-    CURRENT.with(|current| current.borrow().clone())
-}
-
-/// A reservation bound to its original worker, even if another queue is selected.
+/// A reservation bound to its original worker queue.
 /// ```compile_fail
 /// use crate::drivers::Permit;
 /// fn require_send<T: Send>() {}
@@ -333,39 +287,6 @@ impl Drop for Permit {
             self.queue.count.set(self.queue.count.get() - 1);
         }
     }
-}
-
-/// Reserve capacity in the selected queue. Missing selection is InvalidConfiguration;
-/// exhausted capacity is Overloaded. Dropping an unused permit returns capacity.
-pub fn reserve() -> Result<Permit> {
-    let queue = current().ok_or(Error::InvalidConfiguration)?;
-    if queue.count.get() >= queue.capacity {
-        return Err(Error::Overloaded);
-    }
-    queue.count.set(queue.count.get() + 1);
-    Ok(Permit {
-        queue,
-        reserved: true,
-    })
-}
-
-/// Reserve capacity and submit a task to the currently selected queue.
-#[cfg(test)]
-fn spawn(driver: Task) -> Result<()> {
-    reserve()?.submit(driver);
-    Ok(())
-}
-
-/// Poll the selected queue, doing nothing when no worker queue is installed.
-pub fn poll(cx: &mut Context<'_>, budget: usize) {
-    if let Some(queue) = current() {
-        queue.poll(cx, budget);
-    }
-}
-
-/// Count tasks and reservations in the selected queue, or zero without a queue.
-pub fn pending() -> usize {
-    current().map_or(0, |queue| queue.pending())
 }
 
 pub use racer_io::exec::Busy;
@@ -575,28 +496,45 @@ mod tests {
     use super::*;
     use futures::{channel::oneshot, task::noop_waker};
 
+    thread_local! {
+        /// The queue reached by stateless or Send test wakers. Production queues are
+        /// always passed explicitly; only these waker callbacks need a lookup.
+        static QUEUE: RefCell<Option<Rc<DriverQueue>>> = const { RefCell::new(None) };
+    }
+
+    /// Make a queue reachable from this thread's test waker callbacks.
+    fn install(queue: &Rc<DriverQueue>) {
+        QUEUE.with(|current| current.replace(Some(queue.clone())));
+    }
+
+    /// The queue installed for this thread's test waker callbacks.
+    fn fixture() -> Rc<DriverQueue> {
+        QUEUE.with(|queue| queue.borrow().clone()).unwrap()
+    }
+
     /// Nested polling cannot steal the outer owner's notifications for ready backlog.
     #[test]
     fn budget_backlog_wakes_outer_owner_and_nested_poll_cannot_replace_it() {
         let queue = Rc::new(DriverQueue::new(2));
-        let _owner = queue.enter();
         let nested = Arc::new(WakeCount::default());
         let nested_waker = Waker::from(nested.clone());
-        spawn(Box::pin(async move {
-            poll(&mut Context::from_waker(&nested_waker), 1);
-        }))
-        .unwrap();
-        spawn(Box::pin(async {})).unwrap();
+        let inner = queue.clone();
+        queue
+            .spawn(Box::pin(async move {
+                inner.poll(&mut Context::from_waker(&nested_waker), 1);
+            }))
+            .unwrap();
+        queue.spawn(Box::pin(async {})).unwrap();
         let outer = Arc::new(WakeCount::default());
         let waker = Waker::from(outer.clone());
         let mut cx = Context::from_waker(&waker);
         queue.poll(&mut cx, 1);
         assert_eq!(outer.count(), 1);
-        spawn(Box::pin(async {})).unwrap();
+        queue.spawn(Box::pin(async {})).unwrap();
         assert_eq!(outer.count(), 2);
         assert_eq!(nested.count(), 0);
         queue.poll(&mut cx, 2);
-        assert_eq!(pending(), 0);
+        assert_eq!(queue.pending(), 0);
         assert_eq!(outer.count(), 2);
     }
 
@@ -618,22 +556,23 @@ mod tests {
             fn drop(&mut self) {
                 // Submission reads the owner; nested polling must be rejected
                 // without any owner or driver-table borrow held by its caller.
-                spawn(Box::pin(async {})).unwrap();
-                poll(&mut Context::from_waker(Waker::noop()), 1);
+                let queue = fixture();
+                queue.spawn(Box::pin(async {})).unwrap();
+                queue.poll(&mut Context::from_waker(Waker::noop()), 1);
             }
         }
         let queue = Rc::new(DriverQueue::new(1));
-        let _owner = queue.enter();
+        install(&queue);
         queue.poll(&mut Context::from_waker(&Waker::from(Arc::new(OnDrop))), 0);
         queue.poll(&mut Context::from_waker(Waker::noop()), 1);
-        assert_eq!(pending(), 0);
+        assert_eq!(queue.pending(), 0);
     }
 
     /// Detached results do not destroy their future before queue capacity is returned.
     #[test]
     fn completed_operation_is_dropped_after_releasing_capacity() {
         /// Completes with an ignored failure and checks admission when destroyed.
-        struct Complete;
+        struct Complete(Rc<DriverQueue>);
 
         impl Future for Complete {
             /// A deliberately ignored application error exercises detached results.
@@ -648,34 +587,36 @@ mod tests {
         impl Drop for Complete {
             /// Verify the completed task's slot is available despite other reservations.
             fn drop(&mut self) {
-                assert_eq!(pending(), 1023);
-                assert!(reserve().is_ok());
+                assert_eq!(self.0.pending(), 1023);
+                assert!(self.0.reserve().is_ok());
             }
         }
         let queue = Rc::new(DriverQueue::new(1024));
-        let _owner = queue.enter();
-        let permits: Vec<_> = (0..1023).map(|_| reserve().unwrap()).collect();
-        reserve().unwrap().submit_detached(Complete);
-        poll(&mut Context::from_waker(futures::task::noop_waker_ref()), 1);
+        let permits: Vec<_> = (0..1023).map(|_| queue.reserve().unwrap()).collect();
+        queue
+            .reserve()
+            .unwrap()
+            .submit_detached(Complete(queue.clone()));
+        queue.poll(&mut Context::from_waker(futures::task::noop_waker_ref()), 1);
         drop(permits);
-        assert_eq!(pending(), 0);
+        assert_eq!(queue.pending(), 0);
     }
 
     /// Sleeping tasks receive no extra polls until their own readiness waker fires.
     #[test]
     fn blocked_driver_is_not_repolled_until_its_own_wake() {
         let queue = Rc::new(DriverQueue::new(4));
-        let _owner = queue.enter();
         let polls = Rc::new(Cell::new(0));
         let observed = polls.clone();
         let wake = Rc::new(RefCell::new(None::<Waker>));
         let saved = wake.clone();
-        spawn(Box::pin(std::future::poll_fn(move |cx| {
-            observed.set(observed.get() + 1);
-            *saved.borrow_mut() = Some(cx.waker().clone());
-            Poll::Pending
-        })))
-        .unwrap();
+        queue
+            .spawn(Box::pin(std::future::poll_fn(move |cx| {
+                observed.set(observed.get() + 1);
+                *saved.borrow_mut() = Some(cx.waker().clone());
+                Poll::Pending
+            })))
+            .unwrap();
         let mut cx = Context::from_waker(futures::task::noop_waker_ref());
         for _ in 0..100 {
             queue.poll(&mut cx, 64);
@@ -691,18 +632,18 @@ mod tests {
     /// Transfer every sleeping task's wake destination without spending polling budget.
     fn assert_sleeping_owner_transfer(budget: usize) {
         let queue = Rc::new(DriverQueue::new(2));
-        let _owner = queue.enter();
         let polls = Rc::new([Cell::new(0), Cell::new(0)]);
         let saved = Rc::new(RefCell::new(Vec::new()));
         for index in 0..2 {
             let polls = polls.clone();
             let saved = saved.clone();
-            spawn(Box::pin(std::future::poll_fn(move |cx| {
-                polls[index].set(polls[index].get() + 1);
-                saved.borrow_mut().push(cx.waker().clone());
-                Poll::Pending
-            })))
-            .unwrap();
+            queue
+                .spawn(Box::pin(std::future::poll_fn(move |cx| {
+                    polls[index].set(polls[index].get() + 1);
+                    saved.borrow_mut().push(cx.waker().clone());
+                    Poll::Pending
+                })))
+                .unwrap();
         }
         let first = Arc::new(WakeCount::default());
         let second = Arc::new(WakeCount::default());
@@ -742,13 +683,13 @@ mod tests {
     fn owner_refresh_callbacks_run_outside_queue_borrows() {
         use std::task::{RawWaker, RawWakerVTable};
 
-        /// Inspect and reenter the selected queue from arbitrary waker callbacks.
+        /// Inspect and reenter the fixture queue from arbitrary waker callbacks.
         fn reenter() {
-            let queue = current().unwrap();
+            let queue = fixture();
             assert!(queue.drivers.try_borrow_mut().is_ok());
             assert!(queue.new.try_borrow_mut().is_ok());
             assert!(queue.owner.try_borrow_mut().is_ok());
-            drop(reserve().unwrap());
+            drop(queue.reserve().unwrap());
             assert!(queue.polling.get());
             queue.poll(&mut Context::from_waker(Waker::noop()), 0);
         }
@@ -767,18 +708,19 @@ mod tests {
         static VTABLE: RawWakerVTable = RawWakerVTable::new(clone, callback, callback, callback);
 
         let queue = Rc::new(DriverQueue::new(3));
-        let _owner = queue.enter();
+        install(&queue);
         let saved = Rc::new(RefCell::new(Vec::new()));
         for _ in 0..2 {
             let saved = saved.clone();
-            spawn(Box::pin(std::future::poll_fn(move |cx| {
-                saved.borrow_mut().push(cx.waker().clone());
-                cx.waker().wake_by_ref();
-                Poll::Pending
-            })))
-            .unwrap();
+            queue
+                .spawn(Box::pin(std::future::poll_fn(move |cx| {
+                    saved.borrow_mut().push(cx.waker().clone());
+                    cx.waker().wake_by_ref();
+                    Poll::Pending
+                })))
+                .unwrap();
         }
-        // SAFETY: callbacks use no raw data and access only this thread's selected
+        // SAFETY: callbacks use no raw data and access only this test's fixture
         // queue. The stateless waker owns no allocation and can be cloned freely.
         let waker = unsafe { Waker::from_raw(RawWaker::new(std::ptr::null(), &VTABLE)) };
         queue.poll(&mut Context::from_waker(&waker), 2);
@@ -795,20 +737,20 @@ mod tests {
     fn workers_isolate_permits_children_and_capacity_on_one_thread() {
         let a = Rc::new(DriverQueue::new(2));
         let b = Rc::new(DriverQueue::new(3));
-        let _a = a.enter();
-        let permit = reserve().unwrap();
+        let permit = a.reserve().unwrap();
         let completed = Rc::new(Cell::new(false));
         let child = completed.clone();
+        let owner = a.clone();
         {
-            let _b = b.enter();
             permit.submit(Box::pin(async move {
-                spawn(Box::pin(async move {
-                    child.set(true);
-                }))
-                .unwrap();
+                owner
+                    .spawn(Box::pin(async move {
+                        child.set(true);
+                    }))
+                    .unwrap();
             }));
-            let permits: Vec<_> = (0..3).map(|_| reserve().unwrap()).collect();
-            assert!(matches!(reserve(), Err(Error::Overloaded)));
+            let permits: Vec<_> = (0..3).map(|_| b.reserve().unwrap()).collect();
+            assert!(matches!(b.reserve(), Err(Error::Overloaded)));
             assert_eq!(a.pending(), 1);
             drop(permits);
         }
@@ -828,67 +770,54 @@ mod tests {
     #[test]
     fn owned_operation_progresses_after_request_receiver_disappears() {
         let queue = Rc::new(DriverQueue::new(1));
-        let _owner = queue.enter();
         let complete = Rc::new(Cell::new(false));
         let observed = complete.clone();
         let (completion, fence) = oneshot::channel::<()>();
         let (reply, reader) = oneshot::channel::<()>();
-        spawn(Box::pin(async move {
-            fence.await.unwrap();
-            observed.set(true);
-            let _ = reply.send(());
-        }))
-        .unwrap();
+        queue
+            .spawn(Box::pin(async move {
+                fence.await.unwrap();
+                observed.set(true);
+                let _ = reply.send(());
+            }))
+            .unwrap();
         let waker = noop_waker();
         let mut cx = Context::from_waker(&waker);
-        poll(&mut cx, 8);
+        queue.poll(&mut cx, 8);
         drop(reader);
         assert!(!complete.get());
-        assert_eq!(pending(), 1);
+        assert_eq!(queue.pending(), 1);
         completion.send(()).unwrap();
-        poll(&mut cx, 8);
+        queue.poll(&mut cx, 8);
         assert!(complete.get());
-        assert_eq!(pending(), 0);
+        assert_eq!(queue.pending(), 0);
     }
 
     /// Child submission during polling progresses without recursively borrowing the queue.
     #[test]
     fn nested_bootstrap_driver_is_polled_without_recursive_table_borrow() {
         let queue = Rc::new(DriverQueue::new(2));
-        let _owner = queue.enter();
         let (send, mut result) = oneshot::channel();
-        spawn(Box::pin(async move {
-            let (child, receive) = oneshot::channel();
-            spawn(Box::pin(async move {
-                child.send(7).unwrap();
+        let inner = queue.clone();
+        queue
+            .spawn(Box::pin(async move {
+                let (child, receive) = oneshot::channel();
+                inner
+                    .spawn(Box::pin(async move {
+                        child.send(7).unwrap();
+                    }))
+                    .unwrap();
+                let value = receive.await.unwrap();
+                let _ = send.send(value);
             }))
             .unwrap();
-            let value = receive.await.unwrap();
-            let _ = send.send(value);
-        }))
-        .unwrap();
         let waker = noop_waker();
         let mut cx = Context::from_waker(&waker);
         for _ in 0..4 {
-            poll(&mut cx, 8);
+            queue.poll(&mut cx, 8);
         }
         assert_eq!(result.try_recv().unwrap(), Some(7));
-        assert_eq!(pending(), 0);
-    }
-
-    /// Admission requires a selected queue and unused permits restore its capacity.
-    #[test]
-    fn acquisition_requires_an_installed_worker_queue() {
-        assert!(matches!(reserve(), Err(Error::InvalidConfiguration)));
-        let queue = Rc::new(DriverQueue::new(1));
-        {
-            let _owner = queue.enter();
-            let permit = reserve().unwrap();
-            assert_eq!(queue.pending(), 1);
-            drop(permit);
-            assert_eq!(queue.pending(), 0);
-        }
-        assert!(matches!(reserve(), Err(Error::InvalidConfiguration)));
+        assert_eq!(queue.pending(), 0);
     }
 
     /// Zero capacity disables admission, and polling budgets preserve reservations.
@@ -896,79 +825,45 @@ mod tests {
     fn zero_capacity_budget_and_completion_accounting() {
         let disabled = Rc::new(DriverQueue::new(0));
         {
-            let _owner = disabled.enter();
-            assert!(matches!(reserve(), Err(Error::Overloaded)));
-            assert_eq!(pending(), 0);
+            assert!(matches!(disabled.reserve(), Err(Error::Overloaded)));
+            assert_eq!(disabled.pending(), 0);
         }
         let queue = Rc::new(DriverQueue::new(2));
-        let _owner = queue.enter();
-        spawn(Box::pin(async {})).unwrap();
-        spawn(Box::pin(async {})).unwrap();
-        assert!(matches!(reserve(), Err(Error::Overloaded)));
+        queue.spawn(Box::pin(async {})).unwrap();
+        queue.spawn(Box::pin(async {})).unwrap();
+        assert!(matches!(queue.reserve(), Err(Error::Overloaded)));
         let mut cx = Context::from_waker(futures::task::noop_waker_ref());
-        poll(&mut cx, 0);
-        assert_eq!(pending(), 2);
-        poll(&mut cx, 1);
-        assert_eq!(pending(), 1);
-        let permit = reserve().unwrap();
-        poll(&mut cx, usize::MAX);
-        assert_eq!(pending(), 1);
+        queue.poll(&mut cx, 0);
+        assert_eq!(queue.pending(), 2);
+        queue.poll(&mut cx, 1);
+        assert_eq!(queue.pending(), 1);
+        let permit = queue.reserve().unwrap();
+        queue.poll(&mut cx, usize::MAX);
+        assert_eq!(queue.pending(), 1);
         drop(permit);
-        assert_eq!(pending(), 0);
-    }
-
-    /// Scoped polling and destruction restore the previously selected worker queue.
-    #[test]
-    fn scoped_poll_and_drop_restore_previous_selection() {
-        /// Submits work while verifying the queue selected for future destruction.
-        struct OnDrop(Rc<DriverQueue>);
-
-        impl Drop for OnDrop {
-            /// Check the captured queue and submit a replacement task into it.
-            fn drop(&mut self) {
-                assert!(Rc::ptr_eq(&current().unwrap(), &self.0));
-                spawn(Box::pin(async {})).unwrap();
-            }
-        }
-        let a = Rc::new(DriverQueue::new(2));
-        let b = Rc::new(DriverQueue::new(2));
-        let dropper = OnDrop(a.clone());
-        let expected = a.clone();
-        let mut scoped = Box::pin(a.scope(async move {
-            let _dropper = dropper;
-            assert!(Rc::ptr_eq(&current().unwrap(), &expected));
-            std::future::pending::<()>().await;
-        }));
-        let _owner = b.enter();
-        let mut cx = Context::from_waker(futures::task::noop_waker_ref());
-        assert!(scoped.as_mut().poll(&mut cx).is_pending());
-        assert!(Rc::ptr_eq(&current().unwrap(), &b));
-        drop(scoped);
-        assert_eq!(a.pending(), 1);
-        assert!(Rc::ptr_eq(&current().unwrap(), &b));
-        a.poll(&mut cx, 1);
-        assert_eq!(a.pending(), 0);
+        assert_eq!(queue.pending(), 0);
     }
 
     /// Recursive turns defer children and simulated process loss retains unused permits.
     #[test]
     fn recursive_poll_defers_children_and_crash_preserves_unused_permits() {
         let queue = Rc::new(DriverQueue::new(3));
-        let _owner = queue.enter();
-        let permit = reserve().unwrap();
-        spawn(Box::pin(async {
-            spawn(Box::pin(std::future::pending())).unwrap();
-            let mut cx = Context::from_waker(futures::task::noop_waker_ref());
-            poll(&mut cx, 8);
-        }))
-        .unwrap();
+        let permit = queue.reserve().unwrap();
+        let inner = queue.clone();
+        queue
+            .spawn(Box::pin(async move {
+                inner.spawn(Box::pin(std::future::pending())).unwrap();
+                let mut cx = Context::from_waker(futures::task::noop_waker_ref());
+                inner.poll(&mut cx, 8);
+            }))
+            .unwrap();
         let mut cx = Context::from_waker(futures::task::noop_waker_ref());
-        poll(&mut cx, 8);
-        assert_eq!(pending(), 2);
+        queue.poll(&mut cx, 8);
+        assert_eq!(queue.pending(), 2);
         queue.simulation_crash();
-        assert_eq!(pending(), 1);
+        assert_eq!(queue.pending(), 1);
         drop(permit);
-        assert_eq!(pending(), 0);
+        assert_eq!(queue.pending(), 0);
     }
 
     use crate::test_support::WakeCounter as WakeCount;
@@ -1029,11 +924,10 @@ mod tests {
     #[test]
     fn submission_wakes_last_polling_owner() {
         let queue = Rc::new(DriverQueue::new(1));
-        let _owner = queue.enter();
         let wake = Arc::new(WakeCount::default());
         let waker = Waker::from(wake.clone());
         queue.poll(&mut Context::from_waker(&waker), 0);
-        spawn(Box::pin(async {})).unwrap();
+        queue.spawn(Box::pin(async {})).unwrap();
         assert_eq!(wake.count(), 1);
     }
 

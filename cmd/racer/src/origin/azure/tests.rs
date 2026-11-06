@@ -925,6 +925,7 @@ mod router {
             credentials,
             h.snapshots.clone(),
             racer_io::WorkerCtx::host(),
+            std::rc::Rc::new(crate::drivers::DriverQueue::new(1024)),
         )
         .local_authority(
             membership,

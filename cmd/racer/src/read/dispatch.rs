@@ -240,13 +240,18 @@ impl WorkerDirectory {
     /// Scheduler fanout bypasses Fill flights. Count each consuming subscription
     /// on the stable page owner, retaining its original verified ciphertext.
     /// A full mailbox only loses an optional retention hint, never a page read.
-    pub(crate) fn observe_verified(&self, page: PageResult, scope: &RequestScope) {
+    pub(crate) fn observe_verified(
+        &self,
+        drivers: &std::rc::Rc<crate::drivers::DriverQueue>,
+        page: PageResult,
+        scope: &RequestScope,
+    ) {
         let Ok(owner) = self.page_owner(page.plaintext.page()) else {
             return;
         };
         // Reserve bounded worker-owned progress BEFORE retaining a mailbox
         // receipt. Dropping or delaying this optional task cannot hold delivery.
-        let Ok(permit) = crate::drivers::reserve() else {
+        let Ok(permit) = drivers.reserve() else {
             return;
         };
         if self.is_local(owner) {
@@ -519,6 +524,7 @@ impl WorkerDirectory {
     /// returns its holds; hold expiry is the backstop if this cannot submit.
     pub(super) fn release_read_pages(
         &self,
+        drivers: &std::rc::Rc<crate::drivers::DriverQueue>,
         version: &ObjectVersion,
         pages: impl IntoIterator<Item = (PageNumber, HoldEpoch)>,
         request: crate::model::RequestId,
@@ -546,7 +552,7 @@ impl WorkerDirectory {
                 }
                 continue;
             }
-            let Ok(permit) = crate::drivers::reserve() else {
+            let Ok(permit) = drivers.reserve() else {
                 continue;
             };
             let clock = self.ctx.clock.clone();
@@ -836,6 +842,7 @@ impl WorkerDirectory {
     /// Tell a sealed page's owner what the GPU decided, in the background.
     pub(crate) fn report_sealed(
         &self,
+        drivers: &std::rc::Rc<crate::drivers::DriverQueue>,
         report: super::sealed::SealedReport,
         passed: bool,
         scope: &RequestScope,
@@ -860,7 +867,7 @@ impl WorkerDirectory {
                 mailbox.retain_failed_verdict(report);
             }
         };
-        let Ok(permit) = crate::drivers::reserve() else {
+        let Ok(permit) = drivers.reserve() else {
             retain(report);
             return;
         };
@@ -1019,6 +1026,12 @@ impl Drop for SimulationLocal {
 }
 
 impl WorkerEndpoint {
+    /// The local worker's detached driver queue.
+    #[cfg(test)]
+    pub(crate) fn drivers(&self) -> &std::rc::Rc<crate::drivers::DriverQueue> {
+        self.local.drivers()
+    }
+
     /// Simulated process loss occurs after the OS crash cut. Drop accepted tasks
     /// without polling them; the simulated reactor still fences owned buffers.
     #[cfg(test)]
@@ -1440,7 +1453,6 @@ mod tests {
     fn failed_sealed_verdict_survives_full_driver_queue() {
         let env = racer_io::Env::host();
         let queue = Rc::new(crate::drivers::DriverQueue::new(1));
-        let _queue = queue.enter();
         let workers = vec![WorkerId(0), WorkerId(1)];
         let directory = Arc::new(
             WorkerDirectory::new(
@@ -1452,13 +1464,13 @@ mod tests {
             .unwrap(),
         );
         let page = page_owned_by(&directory, WorkerId(1));
-        let full = crate::drivers::reserve().unwrap();
+        let full = queue.reserve().unwrap();
         {
             let (local, _fixture) = crate::read::tests::admission_coordinator(&env);
             let _local = directory.simulation_scope(Some((WorkerId(0), local)));
-            directory.report_sealed(failed_report(page.clone()), false, &scope());
+            directory.report_sealed(&queue, failed_report(page.clone()), false, &scope());
             // A passing verdict is only a persistence hint and is not retained.
-            directory.report_sealed(failed_report(page), true, &scope());
+            directory.report_sealed(&queue, failed_report(page), true, &scope());
         }
         drop(full);
         assert_eq!(applied_by_owner(&env, &directory), 1);
@@ -1468,7 +1480,6 @@ mod tests {
     fn failed_sealed_verdict_survives_full_mailbox() {
         let env = racer_io::Env::host();
         let queue = Rc::new(crate::drivers::DriverQueue::new(64));
-        let _queue = queue.enter();
         let workers = vec![WorkerId(0), WorkerId(1)];
         let directory = Arc::new(
             WorkerDirectory::new(
@@ -1485,9 +1496,9 @@ mod tests {
             let (local, _fixture) = crate::read::tests::admission_coordinator(&env);
             let _local = directory.simulation_scope(Some((WorkerId(0), local)));
             // The first verdict takes the only mailbox slot; the second is retained.
-            directory.report_sealed(failed_report(page.clone()), false, &scope());
+            directory.report_sealed(&queue, failed_report(page.clone()), false, &scope());
             assert_eq!(directory.mailboxes[1].outstanding(), 1);
-            directory.report_sealed(failed_report(page), false, &scope());
+            directory.report_sealed(&queue, failed_report(page), false, &scope());
         }
         assert_eq!(directory.mailboxes[1].take_failed_verdicts().len(), 1);
     }
@@ -1495,7 +1506,6 @@ mod tests {
     /// and return worker 0's new CorruptMiss count and worker 1's mailbox.
     fn landed_verdict(env: &racer_io::Env, passed: bool) -> (u64, usize) {
         let queue = Rc::new(crate::drivers::DriverQueue::new(64));
-        let _queue = queue.enter();
         let workers = vec![WorkerId(0), WorkerId(1)];
         let directory = Arc::new(
             WorkerDirectory::new(
@@ -1515,7 +1525,7 @@ mod tests {
             .count(crate::telemetry::Event::CorruptMiss);
         {
             let _local = directory.simulation_scope(Some((WorkerId(0), local.clone())));
-            directory.report_sealed(landed_report(page), passed, &scope());
+            directory.report_sealed(&queue, landed_report(page), passed, &scope());
         }
         let local_misses = local
             .fill
@@ -1994,8 +2004,6 @@ mod tests {
     #[test]
     fn bounded_admission_mailbox_keeps_other_work_progressing() {
         let env = racer_io::Env::host();
-        let queue = Rc::new(crate::drivers::DriverQueue::new(1024));
-        let _owner = queue.enter();
         let directory = Arc::new(directory(4));
         let (local, _fixture) = crate::read::tests::admission_coordinator(&env);
         let mut endpoint = WorkerEndpoint {

@@ -996,8 +996,6 @@ fn send_tag_http_success_failure_drop_do_not_wait_for_crypto() {
     let env = racer_io::Env::host();
     for mode in ["success", "failure", "drop"] {
         let f = RelayFixture::new(&env, true);
-        let queue = Rc::new(crate::drivers::DriverQueue::new(1024));
-        let _guard = queue.enter();
         let (_, ids) = identities(&env);
         let (io, _engine) = pair(
             crate::model::WorkerId(0),
@@ -1126,8 +1124,6 @@ fn send_tag_http_success_failure_drop_do_not_wait_for_crypto() {
             "{text}"
         );
         assert!(text.contains("status=pending"));
-        drop(queue);
-        drop(_guard);
     }
 }
 
