@@ -755,18 +755,26 @@ enum Route<'a> {
     TooLarge,
 }
 
+/// Most header fields accepted in one request.
+const MAX_HEADERS: usize = 16;
+
 /// Accept exactly the supported HTTP version, headers, and bodyless GET method.
 fn parse(bytes: &[u8]) -> Route<'_> {
-    let mut headers = [httparse::EMPTY_HEADER; 16];
-    let mut request = httparse::Request::new(&mut headers);
-    if !matches!(request.parse(bytes), Ok(httparse::Status::Complete(_)))
-        || request.version != Some(1)
-    {
+    use racer_wire::http::{Codec, StartLine};
+    // The caller passes exactly one complete head; size is bounded there.
+    let codec = Codec::<()>::new(bytes.len().max(1)).trim_ows();
+    let Ok(Some((head, end))) = codec.decode_head(bytes) else {
+        return Route::BadRequest;
+    };
+    let StartLine::Request { method, target } = &head.start else {
+        return Route::BadRequest;
+    };
+    if end != bytes.len() || head.headers.len() > MAX_HEADERS {
         return Route::BadRequest;
     }
     let mut host = false;
     let mut length = false;
-    for header in request.headers.iter() {
+    for header in &head.headers {
         if header.name.eq_ignore_ascii_case("host") {
             if host || header.value.is_empty() {
                 return Route::BadRequest;
@@ -786,10 +794,16 @@ fn parse(bytes: &[u8]) -> Route<'_> {
     if !host {
         return Route::BadRequest;
     }
-    if request.method != Some("GET") {
+    if method != "GET" {
         return Route::Method;
     }
-    request.path.map(Route::Get).unwrap_or(Route::BadRequest)
+    // Borrow the target from the request line: "GET " precedes it.
+    let start = method.len() + 1;
+    bytes
+        .get(start..start + target.len())
+        .and_then(|path| std::str::from_utf8(path).ok())
+        .filter(|path| *path == target)
+        .map_or(Route::BadRequest, Route::Get)
 }
 
 /// A formatter that fails rather than growing beyond the caller's slice.
@@ -1720,6 +1734,15 @@ mod tests {
             "X: a\r\n".repeat(16)
         );
         assert_eq!(parse(many.as_bytes()), Route::BadRequest);
+        let most = format!(
+            "GET /metrics?x=1 HTTP/1.1\r\nHost: a\r\n{}\r\n",
+            "X: a\r\n".repeat(15)
+        );
+        assert_eq!(parse(most.as_bytes()), Route::Get("/metrics?x=1"));
+        assert_eq!(
+            parse(b"GET /live HTTP/1.1\r\nHost: a\r\n\r\nGET"),
+            Route::BadRequest
+        );
         assert_eq!(
             parse(b"POST /debug/pprof/profile?seconds=1 HTTP/1.1\r\nHost: a\r\n\r\n"),
             Route::Method
