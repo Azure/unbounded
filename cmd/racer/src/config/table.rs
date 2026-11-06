@@ -587,7 +587,7 @@ const BASE: &[Var] = &[
         Group::Network,
         uint(1, 60_000, MS),
         Value("1000"),
-        "Least time between one-slot recoveries of the peer-exchange limit after local pressure halved it.",
+        "Longest time between one-slot recoveries of a reduced peer-exchange limit; it also recovers one slot per `limit` verified completions.",
     ),
     var(
         "RACER_PEER_RECEIVE_MAX",

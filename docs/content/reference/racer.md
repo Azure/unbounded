@@ -442,7 +442,7 @@ each worker and are never divided.
 | `RACER_OPAQUE_RELAY` | `false` | Node | `true`, `false` | Experimental opaque HTTP transit instead of materialized relay. |
 | `RACER_PEER_INFLIGHT_MAX` | `256` | Node | 1..65,536 | Peer exchanges in flight. |
 | `RACER_PEER_PER_NEIGHBOR_MAX` | `32` | Node | 1..65,536 | Peer exchanges in flight to one neighbor; at most `RACER_PEER_INFLIGHT_MAX`. |
-| `RACER_PEER_ADMISSION_RECOVERY_MS` | `1000` | Node | 1..60,000 ms | Least time between one-slot recoveries of the peer-exchange limit after local pressure halved it. |
+| `RACER_PEER_ADMISSION_RECOVERY_MS` | `1000` | Node | 1..60,000 ms | Longest time between one-slot recoveries of a reduced peer-exchange limit; it also recovers one slot per `limit` verified completions. |
 | `RACER_PEER_RECEIVE_MAX` | `0` | Node | 0..65,536 | Concurrently served peer requests; `0` turns the receive gate off. |
 | `RACER_PEER_RECEIVE_QUEUE_MAX` | `256` | Node | 1..65,536 | Peer requests queued at the receive gate. |
 | `RACER_PEER_RECEIVE_WAIT_MS` | `1000` | Node | 1..30,000 ms | Longest wait at the receive gate. |
