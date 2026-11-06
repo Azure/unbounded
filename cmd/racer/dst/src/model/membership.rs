@@ -16,6 +16,9 @@ use crate::engine::{MILLIS, Nanos};
 pub struct ModelMember(pub [u8; 4]);
 
 impl Member for ModelMember {
+    // The placement hash domain. Every Model ranking, and so every seed-specific scenario
+    // outcome the tests and the CI seed set rely on, derives from it: changing it reshuffles
+    // placement for every seed. The value is a historical name kept for that stability.
     const DOMAIN: &'static str = "racer-sim";
 
     fn id(&self) -> &[u8] {

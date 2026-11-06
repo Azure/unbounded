@@ -80,7 +80,7 @@ impl MeshMember {
 }
 
 impl Member for MeshMember {
-    const DOMAIN: &'static str = "racer-sim";
+    const DOMAIN: &'static str = "racer-mesh-scenarios";
 
     /// Return the ID.
     fn id(&self) -> &[u8] {
