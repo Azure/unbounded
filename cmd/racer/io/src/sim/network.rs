@@ -197,6 +197,14 @@ impl Handle {
         Ok((count, address))
     }
 
+    /// Whether this handle names a datagram socket.
+    fn is_datagram(&self) -> bool {
+        matches!(
+            self.sim.0.borrow().resources.get(&self.id),
+            Some(Resource::Datagram { .. })
+        )
+    }
+
     /// Sends one packet to the previously connected datagram peer.
     pub fn send_datagram(&self, bytes: &[u8]) -> io::Result<usize> {
         let peer = match self.sim.0.borrow().resources.get(&self.id) {
@@ -344,6 +352,10 @@ impl Handle {
 
     /// Transfers a bounded stream prefix, honoring partitions and half-closes.
     pub fn send(&self, bytes: &[u8]) -> io::Result<usize> {
+        if self.is_datagram() {
+            // Linux `send` on a connected UDP socket sends one packet.
+            return self.send_datagram(bytes);
+        }
         let mut w = self.sim.0.borrow_mut();
         let limit = w.transfer_limit("send")?;
         let capacity = w.stream_capacity;
@@ -398,6 +410,10 @@ impl Handle {
 
     /// Drains buffered stream bytes before reporting EOF from a closed peer.
     pub fn recv(&self, bytes: &mut [u8]) -> io::Result<usize> {
+        if self.is_datagram() {
+            // Linux `recv` on a UDP socket takes one packet and drops its tail.
+            return self.recv_from(bytes).map(|(n, _)| n);
+        }
         let mut w = self.sim.0.borrow_mut();
         let limit = w.transfer_limit("recv")?;
         let max_chunk = w.max_chunk;

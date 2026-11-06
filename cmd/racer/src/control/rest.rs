@@ -1814,73 +1814,34 @@ pub mod dns {
         Err(Error::Unavailable.into())
     }
 
-    /// A connected real or simulated DNS datagram socket.
-    enum Datagram {
-        /// Connected nonblocking UDP socket owned by this thread.
-        Real(UdpSocket),
-
-        /// Simulated socket restricted to one resolver peer.
-        Sim(Rc<Descriptor>),
-    }
-
-    impl Datagram {
-        /// Bind an ephemeral socket and restrict its peer to the chosen resolver.
-        fn connect(
-            server: SocketAddr,
-            sim: Option<racer_io::sim::SimOs>,
-        ) -> Result<(Self, Rc<Descriptor>)> {
-            if let Some(sim) = sim {
-                let fd = sim
-                    .bind_datagram(
-                        if server.is_ipv4() {
-                            "127.0.0.1:0"
-                        } else {
-                            "[::1]:0"
-                        }
-                        .parse()
-                        .unwrap(),
-                    )
-                    .map_err(|_| Error::Io)?;
-                let Some(handle) = fd.as_sim() else {
-                    unreachable!()
-                };
-                handle.connect_datagram(server).map_err(|_| Error::Io)?;
-                let fd = Rc::new(fd);
-                return Ok((Self::Sim(fd.clone()), fd));
-            }
-            let socket = UdpSocket::bind(if server.is_ipv4() {
-                "0.0.0.0:0"
+    /// Bind an ephemeral UDP socket restricted to the chosen resolver.
+    ///
+    /// The descriptor is driven by reactor `send`/`recv` operations, which the
+    /// kernel and simulated drivers both complete, so a query never polls
+    /// readiness by hand.
+    fn connect(server: SocketAddr, sim: Option<racer_io::sim::SimOs>) -> Result<Rc<Descriptor>> {
+        if let Some(sim) = sim {
+            let local = if server.is_ipv4() {
+                SocketAddr::from((Ipv4Addr::LOCALHOST, 0))
             } else {
-                "[::]:0"
-            })
-            .map_err(|_| Error::Io)?;
-            socket.set_nonblocking(true).map_err(|_| Error::Io)?;
-            socket.connect(server).map_err(|_| Error::Io)?;
-            let fd = Rc::new(Descriptor::from(socket.try_clone().map_err(|_| Error::Io)?));
-            Ok((Self::Real(socket), fd))
+                SocketAddr::from((Ipv6Addr::LOCALHOST, 0))
+            };
+            let fd = sim.bind_datagram(local).map_err(|_| Error::Io)?;
+            let Some(handle) = fd.as_sim() else {
+                unreachable!()
+            };
+            handle.connect_datagram(server).map_err(|_| Error::Io)?;
+            return Ok(Rc::new(fd));
         }
-
-        /// Send one query without waiting for readiness.
-        fn send(&self, bytes: &[u8]) -> std::io::Result<usize> {
-            match self {
-                Self::Real(socket) => socket.send(bytes),
-                Self::Sim(fd) => {
-                    let Some(h) = fd.as_sim() else { unreachable!() };
-                    h.send_datagram(bytes)
-                }
-            }
-        }
-
-        /// Receive one answer from the connected resolver without waiting.
-        fn recv(&self, bytes: &mut [u8]) -> std::io::Result<usize> {
-            match self {
-                Self::Real(socket) => socket.recv(bytes),
-                Self::Sim(fd) => {
-                    let Some(h) = fd.as_sim() else { unreachable!() };
-                    h.recv_from(bytes).map(|(n, _)| n)
-                }
-            }
-        }
+        let socket = UdpSocket::bind(if server.is_ipv4() {
+            "0.0.0.0:0"
+        } else {
+            "[::]:0"
+        })
+        .map_err(|_| Error::Io)?;
+        socket.set_nonblocking(true).map_err(|_| Error::Io)?;
+        socket.connect(server).map_err(|_| Error::Io)?;
+        Ok(Rc::new(Descriptor::from(socket)))
     }
 
     /// Exchange one bounded DNS question with a random transaction identifier.
@@ -1907,28 +1868,16 @@ pub mod dns {
         request.push(0);
         request.extend_from_slice(&kind.to_be_bytes());
         request.extend_from_slice(&[0, 1]);
-        let (socket, fd) = Datagram::connect(server, io.sim())?;
-        loop {
-            scope.check()?;
-            match socket.send(&request) {
-                Ok(n) if n == request.len() => break,
-                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                    io.ready(fd.clone(), false, true, None, scope).await?
-                }
-                _ => return Err(Error::Io.into()),
-            }
+        let fd = connect(server, io.sim())?;
+        let reactor = io.reactor();
+        let length = request.len();
+        let sent = reactor.send(fd.clone(), request, (), scope).await?;
+        if sent.bytes != length {
+            return Err(Error::Io.into());
         }
-        let mut response = [0; 4096];
-        loop {
-            scope.check()?;
-            match socket.recv(&mut response) {
-                Ok(n) => return parse(&response[..n], &request, kind).map_err(Into::into),
-                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                    io.ready(fd.clone(), true, false, None, scope).await?
-                }
-                _ => return Err(Error::Io.into()),
-            }
-        }
+        let request = sent.buffer;
+        let received = reactor.recv(fd, vec![0; 4096], (), scope).await?;
+        parse(&received.buffer[..received.bytes], &request, kind).map_err(Into::into)
     }
 
     /// Read a network-order integer without indexing beyond the packet.
@@ -2031,6 +1980,221 @@ pub mod dns {
             response[13] = b'a';
             response.pop();
             assert!(parse(&response, &request, 1).is_err());
+        }
+
+        use super::super::{Io, Scope as RestScope, testing::Error as FixtureError};
+        use racer_io::{Env, Operation, SimClock, sim::SimOs};
+        use std::{
+            cell::Cell,
+            path::Path,
+            pin::pin,
+            task::{Context, Poll, Waker},
+            time::Instant,
+        };
+
+        /// Untimed scope that fails only once the test cancels it.
+        #[derive(Clone, Default)]
+        struct SimScope(Rc<Cell<bool>>);
+
+        impl racer_io::Scope for SimScope {
+            type Error = FixtureError;
+
+            fn check(&self) -> Result<(), FixtureError> {
+                if self.0.get() {
+                    Err(racer_io::Error::Cancelled.into())
+                } else {
+                    Ok(())
+                }
+            }
+        }
+
+        impl RestScope for SimScope {
+            fn deadline(&self) -> Option<Instant> {
+                None
+            }
+
+            fn narrowed(&self, _: Instant) -> Self {
+                self.clone()
+            }
+        }
+
+        /// Resolver I/O on a simulated reactor with a fixed resolv.conf.
+        struct SimIo {
+            reactor: Rc<Box<racer_io::scoped::Reactor<SimScope>>>,
+            os: SimOs,
+            resolv: &'static str,
+        }
+
+        impl Io for SimIo {
+            type Error = FixtureError;
+            type Scope = SimScope;
+            type Lease = ();
+            type FileBytes = Vec<u8>;
+            type Reactor = Box<racer_io::scoped::Reactor<SimScope>>;
+            type Charge = ();
+
+            fn reactor(&self) -> Rc<Self::Reactor> {
+                self.reactor.clone()
+            }
+
+            fn charge(&self, _: usize) -> Result<(), FixtureError> {
+                Ok(())
+            }
+
+            fn ctx(&self) -> &racer_io::WorkerCtx {
+                self.reactor.ctx()
+            }
+
+            fn sim(&self) -> Option<SimOs> {
+                Some(self.os.clone())
+            }
+
+            fn lease(&self) -> Result<Option<Rc<()>>, FixtureError> {
+                Ok(None)
+            }
+
+            /// DNS must not fall back to hand-polled readiness.
+            fn ready<'a>(
+                &'a self,
+                _: Rc<Descriptor>,
+                _: bool,
+                _: bool,
+                _: Option<Rc<()>>,
+                _: &'a SimScope,
+            ) -> Operation<'a, (), FixtureError> {
+                panic!("DNS queries run on reactor send and recv operations")
+            }
+
+            fn resolve<'a>(
+                &'a self,
+                _: &'a str,
+                _: u16,
+                _: &'a SimScope,
+            ) -> Operation<'a, Vec<SocketAddr>, FixtureError> {
+                unreachable!()
+            }
+
+            fn read_file<'a>(
+                &'a self,
+                path: &'a Path,
+                _: usize,
+                _: &'a SimScope,
+            ) -> Operation<'a, Vec<u8>, FixtureError> {
+                assert_eq!(path, Path::new("/etc/resolv.conf"));
+                Box::pin(async move { Ok(self.resolv.as_bytes().to_vec()) })
+            }
+        }
+
+        /// Build a simulated resolver world with one UDP server socket.
+        fn world(resolv: &'static str, server: SocketAddr) -> (SimIo, Descriptor) {
+            let os = SimOs::new();
+            let clock = SimClock::new(7);
+            let reactor = racer_io::scoped::Reactor::new(8, &Env::sim(&os, clock.ctx(0)));
+            let socket = os.bind_datagram(server).unwrap();
+            let io = SimIo {
+                reactor: Rc::new(Box::new(reactor)),
+                os,
+                resolv,
+            };
+            (io, socket)
+        }
+
+        /// Answer one query: `Some(ip)` sends a matching record for A
+        /// questions and an empty answer otherwise; `None` corrupts the ID.
+        fn answer(server: &Descriptor, ip: Option<Ipv4Addr>) -> Option<Vec<u8>> {
+            let server = server.as_sim().unwrap();
+            let mut query = [0; 512];
+            let (n, source) = server.recv_from(&mut query).ok()?;
+            let query = &query[..n];
+            let mut reply = query.to_vec();
+            reply[2] = 0x81;
+            reply[3] = 0x80;
+            let kind = u16_at(query, n - 4).unwrap();
+            match ip {
+                Some(ip) if kind == 1 => {
+                    reply[7] = 1;
+                    reply.extend_from_slice(&[0xc0, 0x0c, 0, 1, 0, 1, 0, 0, 0, 1, 0, 4]);
+                    reply.extend_from_slice(&ip.octets());
+                }
+                Some(_) => (),
+                None => reply[0] ^= 0xff,
+            }
+            server.send_to(&reply, source).unwrap();
+            Some(query.to_vec())
+        }
+
+        /// Poll `resolve` on the sim reactor, answering queries as they land.
+        fn run(
+            io: &SimIo,
+            server: &Descriptor,
+            host: &str,
+            ip: Option<Ipv4Addr>,
+            scope: &SimScope,
+        ) -> (Result<Vec<SocketAddr>, FixtureError>, Vec<Vec<u8>>) {
+            let mut future = pin!(resolve(io, host, 443, scope));
+            let mut cx = Context::from_waker(Waker::noop());
+            let mut queries = Vec::new();
+            for _ in 0..1000 {
+                if let Poll::Ready(result) = future.as_mut().poll(&mut cx) {
+                    return (result, queries);
+                }
+                queries.extend(answer(server, ip));
+                io.reactor.poll_budgeted(64).unwrap();
+            }
+            panic!("resolution never settled on the sim reactor");
+        }
+
+        /// Search-list resolution completes on the simulated driver without
+        /// readiness polling, sending one A and one AAAA question.
+        #[test]
+        fn resolves_through_sim_reactor_send_and_recv() {
+            let server: SocketAddr = "127.0.0.53:53".parse().unwrap();
+            let (io, socket) = world("nameserver 127.0.0.53\nsearch svc\n", server);
+            let scope = SimScope::default();
+            let ip = Ipv4Addr::new(192, 0, 2, 7);
+            let (result, queries) = run(&io, &socket, "api", Some(ip), &scope);
+            assert_eq!(result.unwrap(), vec![SocketAddr::from((ip, 443))]);
+            assert_eq!(queries.len(), 2);
+            assert!(
+                queries
+                    .iter()
+                    .all(|q| q.windows(5).any(|w| w == b"\x03api\x03"))
+            );
+        }
+
+        /// A reply with the wrong transaction ID never yields addresses.
+        #[test]
+        fn rejects_mismatched_transaction_on_sim_reactor() {
+            let server: SocketAddr = "127.0.0.53:53".parse().unwrap();
+            let (io, socket) = world("nameserver 127.0.0.53\n", server);
+            let scope = SimScope::default();
+            let (result, queries) = run(&io, &socket, "api.example.", None, &scope);
+            assert_eq!(result, Err(Error::Unavailable.into()));
+            assert_eq!(queries.len(), 2);
+        }
+
+        /// Cancellation while a query waits on the reactor ends resolution.
+        #[test]
+        fn cancellation_ends_a_pending_sim_query() {
+            let server: SocketAddr = "127.0.0.53:53".parse().unwrap();
+            let (io, _socket) = world("nameserver 127.0.0.53\n", server);
+            let scope = SimScope::default();
+            let mut future = pin!(resolve(&io, "api.example.", 443, &scope));
+            let mut cx = Context::from_waker(Waker::noop());
+            for _ in 0..8 {
+                assert!(future.as_mut().poll(&mut cx).is_pending());
+                io.reactor.poll_budgeted(64).unwrap();
+            }
+            scope.0.set(true);
+            let mut result = None;
+            for _ in 0..64 {
+                if let Poll::Ready(r) = future.as_mut().poll(&mut cx) {
+                    result = Some(r);
+                    break;
+                }
+                io.reactor.poll_budgeted(64).unwrap();
+            }
+            assert_eq!(result, Some(Err(racer_io::Error::Cancelled.into())));
         }
     }
 }

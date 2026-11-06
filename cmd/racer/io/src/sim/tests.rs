@@ -1160,6 +1160,35 @@ mod network {
         assert_eq!(source, server_address);
         assert_eq!(&bytes[..count], b"reply");
     }
+
+    #[test]
+    /// Plain `send`/`recv` on a connected datagram socket move whole packets,
+    /// as on Linux, so reactor stream operations can drive UDP.
+    fn connected_datagrams_accept_send_and_recv() {
+        let sim = SimOs::new();
+        let server_address = "127.0.0.1:53".parse().unwrap();
+        let server = sim.bind_datagram(server_address).unwrap();
+        let client = sim.bind_datagram("127.0.0.1:0".parse().unwrap()).unwrap();
+        let (server, client) = (server.into_sim().unwrap(), client.into_sim().unwrap());
+        let mut bytes = [0; 4];
+        assert_eq!(
+            client.recv(&mut bytes).unwrap_err().kind(),
+            io::ErrorKind::WouldBlock
+        );
+        assert_eq!(
+            client.send(b"q").unwrap_err().raw_os_error(),
+            Some(libc::ENOTCONN)
+        );
+        client.connect_datagram(server_address).unwrap();
+        assert_eq!(client.send(b"query").unwrap(), 5);
+        let (_, source) = server.recv_from(&mut [0; 8]).unwrap();
+        server.send_to(b"long reply", source).unwrap();
+        server.send_to(b"next", source).unwrap();
+        assert_eq!(client.recv(&mut bytes).unwrap(), 4);
+        assert_eq!(&bytes, b"long");
+        assert_eq!(client.recv(&mut bytes).unwrap(), 4);
+        assert_eq!(&bytes, b"next");
+    }
 }
 
 mod driver {
