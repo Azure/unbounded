@@ -220,7 +220,8 @@ fn drive_secure<T, E>(
     future: impl std::future::Future<Output = Result<T, E>>,
 ) -> Result<T, E> {
     let mut future = Box::pin(future);
-    let deadline = Instant::now() + Duration::from_secs(5);
+    // Only a stuck-test bound: a contended disk can park one sync for seconds.
+    let deadline = Instant::now() + Duration::from_secs(30);
     loop {
         if let Poll::Ready(result) = future
             .as_mut()
