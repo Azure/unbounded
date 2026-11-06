@@ -75,9 +75,9 @@ type NamedEnvironmentReference struct {
 	Reference string `json:"reference"`
 }
 
-// +kubebuilder:validation:XValidation:rule="!has(self.resources.limits) || size(self.resources.limits) <= 16",message="environment resource limits must not exceed 16 entries"
-// +kubebuilder:validation:XValidation:rule="!has(self.resources.requests) || size(self.resources.requests) <= 16",message="environment resource requests must not exceed 16 entries"
-// +kubebuilder:validation:XValidation:rule="!has(self.resources.claims) || size(self.resources.claims) <= 16",message="environment resource claims must not exceed 16 entries"
+// +kubebuilder:validation:XValidation:rule="!has(self.resources) || !has(self.resources.limits) || size(self.resources.limits) <= 16",message="environment resource limits must not exceed 16 entries"
+// +kubebuilder:validation:XValidation:rule="!has(self.resources) || !has(self.resources.requests) || size(self.resources.requests) <= 16",message="environment resource requests must not exceed 16 entries"
+// +kubebuilder:validation:XValidation:rule="!has(self.resources) || !has(self.resources.claims) || size(self.resources.claims) <= 16",message="environment resource claims must not exceed 16 entries"
 type CertificationEnvironmentBindings struct {
 	// Namespace is the approved execution namespace.
 	// +kubebuilder:validation:MinLength=1

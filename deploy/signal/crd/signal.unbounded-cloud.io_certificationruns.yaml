@@ -582,13 +582,13 @@ spec:
                 type: object
                 x-kubernetes-validations:
                 - message: environment resource limits must not exceed 16 entries
-                  rule: '!has(self.resources.limits) || size(self.resources.limits)
+                  rule: '!has(self.resources) || !has(self.resources.limits) || size(self.resources.limits)
                     <= 16'
                 - message: environment resource requests must not exceed 16 entries
-                  rule: '!has(self.resources.requests) || size(self.resources.requests)
-                    <= 16'
+                  rule: '!has(self.resources) || !has(self.resources.requests) ||
+                    size(self.resources.requests) <= 16'
                 - message: environment resource claims must not exceed 16 entries
-                  rule: '!has(self.resources.claims) || size(self.resources.claims)
+                  rule: '!has(self.resources) || !has(self.resources.claims) || size(self.resources.claims)
                     <= 16'
               participants:
                 items:
@@ -1327,16 +1327,16 @@ spec:
                                         x-kubernetes-validations:
                                         - message: container resource limits must
                                             not exceed 16 entries
-                                          rule: '!has(self.resources.limits) || size(self.resources.limits)
-                                            <= 16'
+                                          rule: '!has(self.resources) || !has(self.resources.limits)
+                                            || size(self.resources.limits) <= 16'
                                         - message: container resource requests must
                                             not exceed 16 entries
-                                          rule: '!has(self.resources.requests) ||
-                                            size(self.resources.requests) <= 16'
+                                          rule: '!has(self.resources) || !has(self.resources.requests)
+                                            || size(self.resources.requests) <= 16'
                                         - message: container resource claims must
                                             not exceed 16 entries
-                                          rule: '!has(self.resources.claims) || size(self.resources.claims)
-                                            <= 16'
+                                          rule: '!has(self.resources) || !has(self.resources.claims)
+                                            || size(self.resources.claims) <= 16'
                                       script:
                                         properties:
                                           language:
@@ -1851,9 +1851,11 @@ spec:
             - message: participants are immutable
               rule: self.participants == oldSelf.participants
             - message: scriptBundle is immutable
-              rule: self.scriptBundle == oldSelf.scriptBundle
+              rule: has(self.scriptBundle) == has(oldSelf.scriptBundle) && (!has(self.scriptBundle)
+                || self.scriptBundle == oldSelf.scriptBundle)
             - message: checks are immutable
-              rule: self.checks == oldSelf.checks
+              rule: has(self.checks) == has(oldSelf.checks) && (!has(self.checks)
+                || self.checks == oldSelf.checks)
             - message: environment is immutable
               rule: has(self.environment) == has(oldSelf.environment) && (!has(self.environment)
                 || self.environment == oldSelf.environment)
