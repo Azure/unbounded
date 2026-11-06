@@ -818,7 +818,6 @@ dependencies = [
  "futures",
  "getrandom 0.2.17",
  "http1",
- "httparse",
  "io-uring",
  "libc",
  "page-alloc",

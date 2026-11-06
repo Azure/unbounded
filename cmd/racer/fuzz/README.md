@@ -23,6 +23,16 @@ its `Cargo.lock`, and the NOTICE generator (`hack/cmd/notice`, which rejects
 Seed inputs live in `corpus/<target>/seed-*` and are committed. Inputs that
 the fuzzer discovers, plus `artifacts/`, are ignored by `.gitignore`.
 
+`tests/seeds.rs` checks that every seed decodes with the current parsers and
+that encoder-built seeds (publication, keyring bundle, and enrollment
+documents copied from `wire/testdata`, peer v2 envelopes, the checkpoint
+image, and the store record) are current. Regenerate them after a format
+change with:
+
+```sh
+RUSTC_BOOTSTRAP=1 cargo +1.96.0 test --test seeds -- --ignored regenerate
+```
+
 ## Running
 
 The root `racer` crate uses language features newer than the pinned nightly,
