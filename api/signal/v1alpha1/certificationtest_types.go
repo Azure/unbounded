@@ -197,9 +197,9 @@ type ScriptTestDriver struct {
 	RunnerImage string `json:"runnerImage"`
 }
 
-// +kubebuilder:validation:XValidation:rule="!has(self.resources.limits) || size(self.resources.limits) <= 16",message="container resource limits must not exceed 16 entries"
-// +kubebuilder:validation:XValidation:rule="!has(self.resources.requests) || size(self.resources.requests) <= 16",message="container resource requests must not exceed 16 entries"
-// +kubebuilder:validation:XValidation:rule="!has(self.resources.claims) || size(self.resources.claims) <= 16",message="container resource claims must not exceed 16 entries"
+// +kubebuilder:validation:XValidation:rule="!has(self.resources) || !has(self.resources.limits) || size(self.resources.limits) <= 16",message="container resource limits must not exceed 16 entries"
+// +kubebuilder:validation:XValidation:rule="!has(self.resources) || !has(self.resources.requests) || size(self.resources.requests) <= 16",message="container resource requests must not exceed 16 entries"
+// +kubebuilder:validation:XValidation:rule="!has(self.resources) || !has(self.resources.claims) || size(self.resources.claims) <= 16",message="container resource claims must not exceed 16 entries"
 type ContainerTestDriver struct {
 	// +kubebuilder:validation:Pattern=`^[^@\s]+@sha256:[0-9a-f]{64}$`
 	Image string `json:"image"`

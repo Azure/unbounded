@@ -390,6 +390,118 @@ func TestCertificationRunTopologyCELAllowsOmittedRoles(t *testing.T) {
 	})
 }
 
+func TestCertificationRunUpdateCELAllowsOmittedLegacyFields(t *testing.T) {
+	t.Parallel()
+
+	crd := readCRD(t, "signal.unbounded-cloud.io_certificationruns.yaml")
+	_, _, run := genericVLLMContractFixture(t)
+	base := unstructuredObject(t, run)
+
+	for _, tt := range []struct {
+		name   string
+		mutate func(map[string]any)
+	}{
+		{
+			name: "metadata update",
+			mutate: func(object map[string]any) {
+				object["metadata"].(map[string]any)["labels"] = map[string]any{"example": "updated"}
+			},
+		},
+		{
+			name: "status update",
+			mutate: func(object map[string]any) {
+				object["status"] = map[string]any{"phase": string(RunPhasePending)}
+			},
+		},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			oldObject := deepCopyUnstructured(t, base)
+			object := deepCopyUnstructured(t, base)
+			tt.mutate(object)
+
+			if errors := validateCRDCELUpdate(t, crd, object, oldObject); len(errors) != 0 {
+				t.Fatalf("server-equivalent CEL rejected resolved Run update with legacy fields omitted: %v", errors.ToAggregate())
+			}
+		})
+	}
+}
+
+func TestResourceCELAllowsResourcesOmitted(t *testing.T) {
+	t.Parallel()
+
+	t.Run("CertificationProfile environment", func(t *testing.T) {
+		t.Parallel()
+
+		crd := readCRD(t, "signal.unbounded-cloud.io_certificationprofiles.yaml")
+		object := map[string]any{
+			"apiVersion": GroupVersion.String(),
+			"kind":       "CertificationProfile",
+			"metadata": map[string]any{
+				"name": "minimal",
+			},
+			"spec": map[string]any{
+				"participants": map[string]any{
+					"count": int64(1),
+					"selector": map[string]any{
+						"matchLabels": map[string]any{"example": "participant"},
+					},
+				},
+				"environment": map[string]any{
+					"namespace": "default",
+				},
+			},
+		}
+
+		if errors := validateCRDCEL(t, crd, object); len(errors) != 0 {
+			t.Fatalf("server-equivalent CEL rejected Profile environment without resources: %v", errors.ToAggregate())
+		}
+	})
+
+	t.Run("CertificationTest container", func(t *testing.T) {
+		t.Parallel()
+
+		crd := readCRD(t, "signal.unbounded-cloud.io_certificationtests.yaml")
+		object := map[string]any{
+			"apiVersion": GroupVersion.String(),
+			"kind":       "CertificationTest",
+			"metadata": map[string]any{
+				"name": "minimal",
+			},
+			"spec": map[string]any{
+				"topology": map[string]any{
+					"minParticipants": int64(1),
+					"maxParticipants": int64(1),
+				},
+				"driver": map[string]any{
+					"type": "Container",
+					"container": map[string]any{
+						"image": fixtureImageA,
+					},
+				},
+			},
+		}
+
+		if errors := validateCRDCEL(t, crd, object); len(errors) != 0 {
+			t.Fatalf("server-equivalent CEL rejected Container driver without resources: %v", errors.ToAggregate())
+		}
+	})
+
+	t.Run("CertificationRun environment", func(t *testing.T) {
+		t.Parallel()
+
+		crd := readCRD(t, "signal.unbounded-cloud.io_certificationruns.yaml")
+		_, _, run := genericVLLMContractFixture(t)
+		object := unstructuredObject(t, run)
+		delete(object["spec"].(map[string]any)["environment"].(map[string]any), "resources")
+
+		if errors := validateCRDCEL(t, crd, object); len(errors) != 0 {
+			t.Fatalf("server-equivalent CEL rejected resolved environment without resources: %v", errors.ToAggregate())
+		}
+	})
+}
+
 func TestCertificationSuitePhaseContract(t *testing.T) {
 	t.Parallel()
 
@@ -564,10 +676,10 @@ func TestCertificationRunPinsSuiteAndRemainsImmutable(t *testing.T) {
 	}
 
 	requiredRules := map[string]bool{
-		"self.profile == oldSelf.profile":           false,
-		"self.suite == oldSelf.suite":               false,
-		"self.scriptBundle == oldSelf.scriptBundle": false,
-		"self.checks == oldSelf.checks":             false,
+		"self.profile == oldSelf.profile": false,
+		"self.suite == oldSelf.suite":     false,
+		"has(self.scriptBundle) == has(oldSelf.scriptBundle) && (!has(self.scriptBundle) || self.scriptBundle == oldSelf.scriptBundle)":                                                                                                                                        false,
+		"has(self.checks) == has(oldSelf.checks) && (!has(self.checks) || self.checks == oldSelf.checks)":                                                                                                                                                                      false,
 		"has(self.environment) == has(oldSelf.environment) && (!has(self.environment) || self.environment == oldSelf.environment)":                                                                                                                                             false,
 		"has(self.resolvedPlan) == has(oldSelf.resolvedPlan) && (!has(self.resolvedPlan) || self.resolvedPlan == oldSelf.resolvedPlan)":                                                                                                                                        false,
 		"(has(self.resolvedPlan) && size(self.resolvedPlan.phases) > 0) != (has(self.checks) && size(self.checks) > 0)":                                                                                                                                                        false,
@@ -1170,6 +1282,17 @@ func validateCRDCEL(
 ) field.ErrorList {
 	t.Helper()
 
+	return validateCRDCELUpdate(t, crd, object, nil)
+}
+
+func validateCRDCELUpdate(
+	t *testing.T,
+	crd *apiextensionsv1.CustomResourceDefinition,
+	object map[string]any,
+	oldObject map[string]any,
+) field.ErrorList {
+	t.Helper()
+
 	versioned := crd.Spec.Versions[0].Schema.OpenAPIV3Schema
 
 	internal := &apiextensions.JSONSchemaProps{}
@@ -1198,7 +1321,7 @@ func validateCRDCEL(
 		field.NewPath("object"),
 		structural,
 		object,
-		nil,
+		oldObject,
 		costBudget,
 	)
 

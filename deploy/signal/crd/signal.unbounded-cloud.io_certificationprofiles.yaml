@@ -270,13 +270,13 @@ spec:
                 type: object
                 x-kubernetes-validations:
                 - message: environment resource limits must not exceed 16 entries
-                  rule: '!has(self.resources.limits) || size(self.resources.limits)
+                  rule: '!has(self.resources) || !has(self.resources.limits) || size(self.resources.limits)
                     <= 16'
                 - message: environment resource requests must not exceed 16 entries
-                  rule: '!has(self.resources.requests) || size(self.resources.requests)
-                    <= 16'
+                  rule: '!has(self.resources) || !has(self.resources.requests) ||
+                    size(self.resources.requests) <= 16'
                 - message: environment resource claims must not exceed 16 entries
-                  rule: '!has(self.resources.claims) || size(self.resources.claims)
+                  rule: '!has(self.resources) || !has(self.resources.claims) || size(self.resources.claims)
                     <= 16'
               participantRoles:
                 items:
