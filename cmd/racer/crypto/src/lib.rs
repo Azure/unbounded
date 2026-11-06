@@ -467,6 +467,36 @@ impl DerivedPageKey {
     }
 }
 
+impl DerivedPageKey {
+    /// Authenticate and decrypt `inout`, which holds a page's ciphertext body,
+    /// in place against the separate 16-byte `tag`, with the AES-256-GCM key
+    /// and nonce [`xaes_derive`] produced. Equivalent to [`open`] with the
+    /// original key and nonce, without the copy [`open`] makes. Any failure,
+    /// including a bad tag length, zeroes `inout`, since a failed tag check
+    /// leaves unauthenticated plaintext behind.
+    pub fn open_in_place(&self, aad: &[u8], inout: &mut [u8], tag: &[u8]) -> Result<(), Error> {
+        let result = (|| {
+            let tag = ring::aead::Tag::try_from(tag).map_err(|_| Error(()))?;
+            let key = ring::aead::UnboundKey::new(&ring::aead::AES_256_GCM, &self.key[..])
+                .map_err(|_| Error(()))?;
+            ring::aead::LessSafeKey::new(key)
+                .open_in_place_separate_tag(
+                    ring::aead::Nonce::assume_unique_for_key(self.nonce),
+                    ring::aead::Aad::from(aad),
+                    tag,
+                    inout,
+                    0..,
+                )
+                .map(|_| ())
+                .map_err(|_| Error(()))
+        })();
+        if result.is_err() {
+            inout.fill(0);
+        }
+        result
+    }
+}
+
 /// Derive the AES-256-GCM key and nonce XAES-256-GCM uses for `nonce`, as
 /// specified at <https://c2sp.org/XAES-256-GCM>:
 /// `L = AES-256(K, 0^128)`, `K1 = L << 1` (xor `0x87` on carry), and the key is

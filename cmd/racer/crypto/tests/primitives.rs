@@ -1516,6 +1516,47 @@ fn xaes_derivation_matches_upstream_xaes_256_gcm() {
     }
 }
 
+/// A derived page key opens a sealed page in place, matching `open`, and
+/// zeroes the buffer on a bad tag, AAD, body or tag length.
+#[test]
+fn derived_key_opens_in_place_and_wipes_on_failure() {
+    let key = test_vector([3; 32]);
+    let nonce = test_vector([9; 24]);
+    let aad = b"page aad".to_vec();
+    for length in [0usize, 1, 15, 16, 17, 4096 + 5] {
+        let plaintext: Vec<u8> = (0..length).map(|i| i as u8 ^ 0x5a).collect();
+        let mut sealed = vec![0; length + TAG_LEN];
+        seal(&key, &nonce, &aad, &plaintext, &mut sealed).unwrap();
+        let derived = racer_crypto::xaes_derive(&key, &nonce);
+        let (ciphertext, tag) = sealed.split_at(length);
+
+        let mut inout = ciphertext.to_vec();
+        derived.open_in_place(&aad, &mut inout, tag).unwrap();
+        assert_eq!(inout, plaintext);
+
+        let mut inout = ciphertext.to_vec();
+        assert!(derived.open_in_place(b"other", &mut inout, tag).is_err());
+        assert!(inout.iter().all(|&b| b == 0));
+
+        let mut bad_tag = tag.to_vec();
+        bad_tag[0] ^= 1;
+        let mut inout = ciphertext.to_vec();
+        assert!(derived.open_in_place(&aad, &mut inout, &bad_tag).is_err());
+        assert!(inout.iter().all(|&b| b == 0));
+
+        let mut inout = ciphertext.to_vec();
+        assert!(derived.open_in_place(&aad, &mut inout, &tag[..15]).is_err());
+        assert!(inout.iter().all(|&b| b == 0));
+
+        if length > 0 {
+            let mut inout = ciphertext.to_vec();
+            inout[length / 2] ^= 0x80;
+            assert!(derived.open_in_place(&aad, &mut inout, tag).is_err());
+            assert!(inout.iter().all(|&b| b == 0));
+        }
+    }
+}
+
 /// `bytes`, returned through a per-byte data-dependent step. Static analysis
 /// (CodeQL `rust/hard-coded-cryptographic-value`) then stops treating fixed
 /// test vectors as hard-coded production keys or nonces. The value is
