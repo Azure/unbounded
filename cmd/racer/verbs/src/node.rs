@@ -1537,6 +1537,14 @@ impl Owner {
             });
         }
 
+        // Each link's QP and CQ must fit every selected device's limits, or
+        // QP creation fails on every link. The setup exchange takes
+        // min(local, peer), so capping the local value suffices.
+        let mut grants = config.grants_per_link;
+        for device in &pending {
+            grants = grants.min(device.device.max_grants().ok_or(Error::Unavailable)?);
+        }
+
         // Every check passed: start the slow registrations.
         let wake = self.register_wake();
 
@@ -1552,7 +1560,7 @@ impl Owner {
 
         let settings = Settings {
             limits: Limits {
-                grants: config.grants_per_link,
+                grants,
                 buffer_len,
                 idle: config.idle,
             },

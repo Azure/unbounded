@@ -67,6 +67,8 @@ struct rdma_verbs_caps {
     uint32_t max_msg_sz;
     int32_t ipv4_index;
     uint8_t ipv4[4];
+    /* Device limits: work requests per queue, CQ entries, memory windows. */
+    uint32_t max_qp_wr, max_cqe, max_mw;
 };
 #define RDMA_VERBS_CAP_MW 1u  /* type 2B memory windows */
 #define RDMA_VERBS_CAP_ODP 2u /* implicit on-demand paging for RC writes */
@@ -106,7 +108,8 @@ _Static_assert(offsetof(struct rdma_verbs_endpoint, qpn) == 16, "endpoint ABI of
 _Static_assert(sizeof(struct rdma_verbs_wc) == 32, "completion ABI size");
 _Static_assert(offsetof(struct rdma_verbs_wc, byte_len) == 16, "completion ABI offset");
 _Static_assert(offsetof(struct rdma_verbs_wc, flags) == 24, "completion ABI offset");
-_Static_assert(sizeof(struct rdma_verbs_caps) == 16, "caps ABI size");
+_Static_assert(sizeof(struct rdma_verbs_caps) == 28, "caps ABI size");
+_Static_assert(offsetof(struct rdma_verbs_caps, max_qp_wr) == 16, "caps ABI offset");
 _Static_assert(offsetof(struct rdma_verbs_caps, ipv4) == 12, "caps ABI offset");
 _Static_assert(sizeof(struct rdma_verbs_sge) == 16, "sge ABI size");
 _Static_assert(offsetof(struct rdma_verbs_sge, lkey) == 12, "sge ABI offset");
@@ -143,7 +146,7 @@ struct rdma_verbs_mr {
  * mode in C. Version 7 moved registration mode, the connection manager state
  * machine, and the work request ledger to Rust; this file now only wraps
  * verbs and librdmacm calls. Version 8 added rdma_verbs_prefetch. */
-uint32_t rdma_verbs_abi(void) { return 8; }
+uint32_t rdma_verbs_abi(void) { return 9; }
 
 /* Distinct from negative errno: cleanup leaked a resource. Rust must keep
  * the admission owner and adapter loaded. Stop before another resource leaks. */
@@ -295,8 +298,9 @@ int rdma_verbs_close(struct rdma_verbs_device *d) {
     return rc;
 }
 
-/* Report memory window and implicit ODP support, `port`'s maximum message
- * size, and its IPv4-mapped GID, if any. */
+/* Report memory window and implicit ODP support, the device's queue, CQ, and
+ * memory window limits, `port`'s maximum message size, and its IPv4-mapped
+ * GID, if any. */
 int rdma_verbs_query_caps(struct rdma_verbs_device *d, uint8_t port, struct rdma_verbs_caps *out) {
     memset(out, 0, sizeof(*out));
     out->ipv4_index = -1;
@@ -308,6 +312,9 @@ int rdma_verbs_query_caps(struct rdma_verbs_device *d, uint8_t port, struct rdma
         (attr.odp_caps.general_caps & IBV_ODP_SUPPORT_IMPLICIT) &&
         (attr.odp_caps.per_transport_caps.rc_odp_caps & IBV_ODP_SUPPORT_WRITE))
         out->flags |= RDMA_VERBS_CAP_ODP;
+    out->max_qp_wr = attr.orig_attr.max_qp_wr > 0 ? (uint32_t)attr.orig_attr.max_qp_wr : 0;
+    out->max_cqe = attr.orig_attr.max_cqe > 0 ? (uint32_t)attr.orig_attr.max_cqe : 0;
+    out->max_mw = attr.orig_attr.max_mw > 0 ? (uint32_t)attr.orig_attr.max_mw : 0;
     struct ibv_port_attr pa;
     if (ibv_query_port(d->ctx, port, &pa)) return err();
     out->max_msg_sz = pa.max_msg_sz;

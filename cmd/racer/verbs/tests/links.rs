@@ -356,6 +356,63 @@ fn activation_requires_implicit_odp_and_releases_on_failure() {
 }
 
 #[test]
+/// Grants per link are capped so each link's QP and CQ fit the device's
+/// reported `max_qp_wr` and `max_cqe`: the advertised setup carries the
+/// capped value, and links still come up.
+fn grants_are_capped_by_device_limits() {
+    profiles(|| {
+        let sim = Simulation::new();
+        // Registration posts 4 WRs per send: 4 * (4g + 8) <= 64 gives 2.
+        // Window mode: 4g + 8 <= 64 gives 14.
+        sim.device_limits(64, 2048, 0);
+        let clock = SimClock::new(7);
+        let mut a = node(&sim, 1, clock.ctx(1));
+        let mut b = node(&sim, 2, clock.ctx(1));
+        for node in [&mut a, &mut b] {
+            let mut config = config(&node.charge);
+            config.grants_per_link = 1000;
+            let activation = node.clients[0].activate(config);
+            node.owner().poll_budgeted(4).unwrap();
+            assert_eq!(ready(&activation).unwrap()[0].tag, 7);
+        }
+        let mut w = World { sim, clock, a, b };
+        let opened = w.a.clients[0].open(TO_B);
+        let Opened { epoch, setup } = wait(&mut w, &opened).unwrap();
+        let expected = match current_profile() {
+            Profile::Window => 14,
+            Profile::Registration => 2,
+        };
+        assert_eq!(setup.grants_per_link, expected);
+        let accepted = w.b.clients[0].accept(TO_A, setup, ID, false);
+        let remote = wait(&mut w, &accepted).unwrap().setup;
+        assert_eq!(remote.grants_per_link, expected);
+        let connected = w.a.clients[0].connect(TO_B, epoch, remote, ID);
+        wait(&mut w, &connected).unwrap();
+        pump(&mut w);
+        assert!(matches!(w.a.clients[1].link(TO_B), LinkState::Ready { .. }));
+        shutdown(w);
+    });
+}
+
+#[test]
+/// A device whose limits cannot fit one grant's QP and CQ fails activation
+/// instead of failing every link's QP creation later.
+fn activation_fails_when_device_limits_fit_no_grant() {
+    profiles(|| {
+        let sim = Simulation::new();
+        // One grant needs 12 send WRs (48 in registration mode) and 6 receives.
+        sim.device_limits(8, 2048, 0);
+        let clock = SimClock::new(7);
+        let mut node = node(&sim, 1, clock.ctx(1));
+        let activation = node.clients[0].activate(config(&node.charge));
+        node.owner().poll_budgeted(4).unwrap();
+        assert_eq!(ready(&activation).err(), Some(Error::Unavailable));
+        assert_eq!(node.charge.load(Ordering::Acquire), 0, "charge returned");
+        assert_eq!(sim.live_resources(), 0);
+    });
+}
+
+#[test]
 /// `release_link` names the link by handshake id: the owner resolves it, so
 /// the release goes out without the caller's snapshot. A wrong id is refused
 /// and leaves the grant and link alone.

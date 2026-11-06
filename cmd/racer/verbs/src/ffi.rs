@@ -37,8 +37,8 @@ mod registration;
 #[path = "registration_tests.rs"]
 mod registration_tests;
 
-pub(crate) use registration::HUGE;
 use registration::{Cm, Conn, State};
+pub(crate) use registration::{HUGE, WRITE_WRS};
 
 /// One port from `discover`. Matches `struct rdma_verbs_port` in C.
 #[repr(C)]
@@ -102,6 +102,16 @@ pub(crate) struct Caps {
 
     /// The IPv4 address in that GID.
     ipv4: [u8; 4],
+
+    /// The device's `max_qp_wr`: work requests per send or receive queue.
+    /// Zero means unknown, treated as unlimited.
+    pub(crate) max_qp_wr: u32,
+
+    /// The device's `max_cqe`: entries per CQ. Zero means unknown.
+    pub(crate) max_cqe: u32,
+
+    /// The device's `max_mw`: memory windows. Zero means unknown.
+    pub(crate) max_mw: u32,
 }
 
 /// `RDMA_VERBS_CAP_MW`: type 2B memory windows.
@@ -237,7 +247,7 @@ const WC_IMM: u32 = 1;
 
 /// Native adapter ABI version this crate speaks.
 #[cfg(any(test, all(feature = "native", target_os = "linux")))]
-const ABI_VERSION: u32 = 8;
+const ABI_VERSION: u32 = 9;
 
 /// Completions one [`NativeQueuePair::progress_with`] call reads. A full
 /// batch means more may be waiting without a new channel event.
@@ -599,6 +609,12 @@ pub(crate) struct NativeDevice {
 }
 
 impl NativeDevice {
+    /// The largest grants per link whose QP and CQ fit this device's
+    /// reported limits, or `None` if not even one grant fits.
+    pub(crate) fn max_grants(&self) -> Option<u32> {
+        crate::link::max_grants(self.mode, &self.caps)
+    }
+
     /// A device over `raw` with nothing else created yet.
     fn new(
         api: Rc<Api>,
@@ -3113,7 +3129,7 @@ pub(crate) mod lifetime_tests {
         assert_eq!(std::mem::offset_of!(Port, mtu), 80);
         assert_eq!(std::mem::offset_of!(Port, ipv4_gid), 88);
         assert_eq!(std::mem::offset_of!(Port, flags), 108);
-        assert_eq!(std::mem::size_of::<Caps>(), 16);
+        assert_eq!(std::mem::size_of::<Caps>(), 28);
         assert_eq!(std::mem::offset_of!(Caps, ipv4), 12);
         assert_eq!(std::mem::size_of::<Sge>(), 16);
         assert_eq!(std::mem::offset_of!(Sge, lkey), 12);

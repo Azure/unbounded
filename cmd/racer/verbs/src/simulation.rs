@@ -323,6 +323,9 @@ struct World {
     /// Registration-profile maximum message size, if not the default.
     max_message: Option<u32>,
 
+    /// `(max_qp_wr, max_cqe, max_mw)` every device reports; zero is unknown.
+    device_limits: (u32, u32, u32),
+
     trace: Vec<Event>,
 
     sequence: u64,
@@ -716,6 +719,12 @@ impl Simulation {
     /// Below 8 MiB such a device is unusable.
     pub fn max_message(&self, bytes: u32) {
         self.world.borrow_mut().max_message = Some(bytes);
+    }
+
+    /// Set the `max_qp_wr`, `max_cqe`, and `max_mw` every device reports.
+    /// Zero, the default, means unknown and unbounded.
+    pub fn device_limits(&self, max_qp_wr: u32, max_cqe: u32, max_mw: u32) {
+        self.world.borrow_mut().device_limits = (max_qp_wr, max_cqe, max_mw);
     }
 
     /// Copy of the trace so far.
@@ -1660,12 +1669,18 @@ unsafe extern "C" fn query_caps(device: *mut c_void, _port: u8, out: *mut Caps) 
             max_msg_sz: 1 << 30,
             ipv4_index: -1,
             ipv4: [0; 4],
+            max_qp_wr: world.device_limits.0,
+            max_cqe: world.device_limits.1,
+            max_mw: world.device_limits.2,
         },
         Profile::Registration => Caps {
             flags: 0,
             max_msg_sz: world.max_message.unwrap_or(1 << 30),
             ipv4_index: 1,
             ipv4: d.ipv4(),
+            max_qp_wr: world.device_limits.0,
+            max_cqe: world.device_limits.1,
+            max_mw: world.device_limits.2,
         },
     };
     unsafe { *out = caps };

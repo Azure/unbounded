@@ -234,6 +234,47 @@ fn depths_match_design() {
 }
 
 #[test]
+/// Grants fit the device's queue, CQ, and window limits.
+fn max_grants_fit_device_limits() {
+    use crate::ffi::{Caps, Mode};
+    let caps = |max_qp_wr, max_cqe, max_mw| {
+        let mut caps = Caps::default();
+        caps.max_qp_wr = max_qp_wr;
+        caps.max_cqe = max_cqe;
+        caps.max_mw = max_mw;
+        caps
+    };
+    // MANA: 2048 WRs and CQ entries. The CQ (18g + 36) binds first.
+    let mana = caps(2048, 2048, 0);
+    assert_eq!(super::max_grants(Mode::Registration, &mana), Some(111));
+    let (send, recv) = depths(111).unwrap();
+    assert!(send * crate::ffi::WRITE_WRS + recv <= 2048);
+    let (send, recv) = depths(112).unwrap();
+    assert!(send * crate::ffi::WRITE_WRS + recv > 2048);
+    // Window mode: CQ is 6g + 12, and windows bound it too.
+    assert_eq!(super::max_grants(Mode::Window, &mana), Some(339));
+    assert_eq!(
+        super::max_grants(Mode::Window, &caps(2048, 2048, 64)),
+        Some(64)
+    );
+    // Large limits leave the pool-based value (at most 1024) unchanged.
+    let big = caps(1 << 15, 1 << 22, 1 << 20);
+    assert!(super::max_grants(Mode::Registration, &big).unwrap() >= 1024);
+    assert!(super::max_grants(Mode::Window, &big).unwrap() >= 1024);
+    // Unknown limits are unbounded except by the CQ's i32 depth.
+    assert!(super::max_grants(Mode::Registration, &Caps::default()).unwrap() > 1 << 20);
+    // Not even one grant fits.
+    assert_eq!(
+        super::max_grants(Mode::Registration, &caps(16, 2048, 0)),
+        None
+    );
+    assert_eq!(
+        super::max_grants(Mode::Window, &caps(2048, 2048, 0)),
+        Some(339)
+    );
+}
+
+#[test]
 /// Pages flow both ways over one QP, concurrently, and buffers return.
 fn pages_in_both_directions_on_one_link() {
     profiles(|| {

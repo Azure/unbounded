@@ -121,7 +121,8 @@ static struct ibv_qp *test_create_qp(struct ibv_pd *value, struct ibv_qp_init_at
 }
 static int test_destroy_qp(struct ibv_qp *qp) { (void)qp; return 0; }
 
-/* Capabilities: windows unless mode 1, and implicit ODP for RC writes. */
+/* Capabilities: windows unless mode 1, implicit ODP for RC writes, and
+ * fixed queue, CQ, and window limits. */
 static int test_query_device_ex(struct ibv_context *ctx, const struct ibv_query_device_ex_input *in,
                                 struct ibv_device_attr_ex *attr) {
     (void)ctx; (void)in;
@@ -129,6 +130,9 @@ static int test_query_device_ex(struct ibv_context *ctx, const struct ibv_query_
     attr->orig_attr.device_cap_flags = mode == 1 ? 0 : IBV_DEVICE_MEM_WINDOW_TYPE_2B;
     attr->odp_caps.general_caps = IBV_ODP_SUPPORT | IBV_ODP_SUPPORT_IMPLICIT;
     attr->odp_caps.per_transport_caps.rc_odp_caps = IBV_ODP_SUPPORT_WRITE;
+    attr->orig_attr.max_qp_wr = 2048;
+    attr->orig_attr.max_cqe = 4096;
+    attr->orig_attr.max_mw = 512;
     return 0;
 }
 
@@ -263,6 +267,7 @@ unsigned rdma_test_wrappers(void) {
     struct rdma_verbs_caps caps;
     if (rdma_verbs_query_caps(&d, 1, &caps)) return 6;
     if (caps.flags != (RDMA_VERBS_CAP_MW | RDMA_VERBS_CAP_ODP) || caps.ipv4_index != -1) return 7;
+    if (caps.max_qp_wr != 2048 || caps.max_cqe != 4096 || caps.max_mw != 512) return 7;
     /* Writes: SGE count bounds, then a two-entry write with immediate. */
     struct rdma_verbs_qp q = { .qp = &fake_qp };
     struct rdma_verbs_sge sge[5] = {

@@ -179,6 +179,45 @@ pub(crate) fn depths(grants: u32) -> Option<(u32, u32)> {
     (grants > 0).then_some((send, recv))
 }
 
+/// The largest grants per link whose QP and CQ fit `caps` in `mode`, or
+/// `None` if not even one grant fits. Mirrors the sizing in
+/// `NativeQueuePair::new_with_depth`: registration mode posts up to
+/// `WRITE_WRS` send WRs per send, and the CQ holds every send and receive
+/// WR. In window mode each grant binds its own memory window. A zero limit
+/// means the device did not report it and leaves it unbounded.
+pub(crate) fn max_grants(mode: crate::ffi::Mode, caps: &crate::ffi::Caps) -> Option<u32> {
+    let limit = |v: u32| if v == 0 { u32::MAX } else { v };
+    let per_send = match mode {
+        crate::ffi::Mode::Window => 1,
+        crate::ffi::Mode::Registration => crate::ffi::WRITE_WRS,
+    };
+    let fits = |g: u32| {
+        depths(g).is_some_and(|(send, recv)| {
+            send.checked_mul(per_send).is_some_and(|send_wrs| {
+                send_wrs <= limit(caps.max_qp_wr)
+                    && recv <= limit(caps.max_qp_wr)
+                    && send_wrs
+                        .checked_add(recv)
+                        .is_some_and(|cq| cq <= limit(caps.max_cqe) && cq <= i32::MAX as u32)
+            })
+        }) && (mode != crate::ffi::Mode::Window || g <= limit(caps.max_mw))
+    };
+    if !fits(1) {
+        return None;
+    }
+    // `fits` is monotonic: binary search the largest passing value.
+    let (mut lo, mut hi) = (1u32, u32::MAX);
+    while lo < hi {
+        let mid = lo + (hi - lo).div_ceil(2);
+        if fits(mid) {
+            lo = mid;
+        } else {
+            hi = mid - 1;
+        }
+    }
+    Some(lo)
+}
+
 /// Who started the link.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum Role {
