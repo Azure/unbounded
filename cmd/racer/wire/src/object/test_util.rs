@@ -245,7 +245,7 @@ fn serve(mut stream: UnixStream, state: &Mutex<State>, stop: &AtomicBool) {
         .set_read_timeout(Some(Duration::from_millis(20)))
         .unwrap();
     stream
-        .set_write_timeout(Some(Duration::from_millis(100)))
+        .set_write_timeout(Some(Duration::from_millis(20)))
         .unwrap();
     let deadline = Instant::now() + Duration::from_secs(10);
     let mut request = Vec::new();
@@ -401,7 +401,36 @@ fn serve(mut stream: UnixStream, state: &Mutex<State>, stop: &AtomicBool) {
         }
     };
     drop(state);
-    if stream.write_all(response.as_bytes()).is_ok() {
-        let _ = stream.write_all(&body);
+    if write_until(&mut stream, response.as_bytes(), stop, deadline) {
+        write_until(&mut stream, &body, stop, deadline);
     }
+}
+
+/// Write all of `bytes`, waiting out a slow reader until `stop` or the
+/// connection `deadline`. A reader that falls briefly behind on a loaded host
+/// must not see a truncated response; only shutdown or the deadline end it.
+fn write_until(
+    stream: &mut UnixStream,
+    mut bytes: &[u8],
+    stop: &AtomicBool,
+    deadline: Instant,
+) -> bool {
+    while !bytes.is_empty() {
+        if stop.load(Ordering::Acquire) || Instant::now() >= deadline {
+            return false;
+        }
+        match stream.write(bytes) {
+            Ok(0) => return false,
+            Ok(n) => bytes = &bytes[n..],
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::WouldBlock
+                        | std::io::ErrorKind::TimedOut
+                        | std::io::ErrorKind::Interrupted
+                ) => {}
+            Err(_) => return false,
+        }
+    }
+    true
 }
