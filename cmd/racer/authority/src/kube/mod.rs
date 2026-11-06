@@ -487,7 +487,8 @@ impl Watch {
             if self.done {
                 return Ok(None);
             }
-            let chunk = rt::deadline(self.deadline, self.conn.read_part(&mut self.body))
+            let at = read_deadline(self.deadline, crate::rt::now());
+            let chunk = rt::deadline(at, self.conn.read_part(&mut self.body))
                 .await
                 .map_err(|_| KubeError::Unavailable)?
                 .map_err(|_| KubeError::Unavailable)?;
@@ -497,6 +498,12 @@ impl Watch {
             self.pending.extend(chunk);
         }
     }
+}
+
+/// Deadline for the next read on a watch stream: the earlier of the
+/// stream's overall deadline and [`limits::WATCH_IDLE`] from `now`.
+pub fn read_deadline(overall: Instant, now: Instant) -> Instant {
+    overall.min(now + limits::WATCH_IDLE)
 }
 
 /// Add one list page to `items`. Returns its continue token, empty on the
@@ -710,6 +717,68 @@ mod tests {
         assert_eq!(str_at(&v, &["metadata", "name"]), "x");
         assert_eq!(str_at(&v, &["metadata", "missing"]), "");
         assert_eq!(map_at(&v, &["metadata", "labels"]).len(), 1);
+    }
+
+    #[test]
+    fn watch_read_deadline_is_idle_bounded() {
+        let now = Instant::now();
+        let far = now + limits::WATCH_TIMEOUT;
+        assert_eq!(read_deadline(far, now), now + limits::WATCH_IDLE);
+        let near = now + Duration::from_secs(1);
+        assert_eq!(read_deadline(near, now), near);
+        assert_eq!(read_deadline(now, now), now);
+    }
+
+    /// A silent watch stream (no events, no bookmarks) fails after
+    /// WATCH_IDLE instead of stalling until the overall watch deadline,
+    /// while a stream that keeps delivering events stays open past it.
+    #[test]
+    fn silent_watch_fails_after_idle_on_virtual_time() {
+        let clock = racer_io::ctx::VirtualClock::new();
+        let os = racer_io::sim::SimOs::seeded(5);
+        let mut ex = rt::Executor::simulated(os, &clock, 5, 64).unwrap();
+        ex.block_on(async {
+            let api = fake::FakeApi::new();
+            let config = fake::serve_at(
+                api.clone(),
+                std::path::Path::new("/kube"),
+                "10.0.0.1:443".parse().unwrap(),
+            );
+            let kube = Kube::new(config).unwrap();
+            api.put_object(
+                "/api/v1/nodes/a",
+                serde_json::json!({"metadata":{"name":"a"}}),
+            );
+            let (_, rv) = kube.list("/api/v1/nodes", "").await.unwrap();
+
+            // Active stream: an event every IDLE/2 keeps it open past IDLE.
+            let mut w = kube.watch("/api/v1/nodes", "", &rv).await.unwrap();
+            let started = rt::now();
+            let writer = api.clone();
+            rt::spawn(async move {
+                for i in 0..3 {
+                    rt::sleep(limits::WATCH_IDLE / 2).await;
+                    writer.put_object(
+                        &format!("/api/v1/nodes/n{i}"),
+                        serde_json::json!({"metadata":{"name":format!("n{i}")}}),
+                    );
+                }
+            })
+            .unwrap();
+            for _ in 0..3 {
+                assert_eq!(w.next().await.unwrap().unwrap().kind, "ADDED");
+            }
+            assert!(rt::now() - started > limits::WATCH_IDLE);
+
+            // A fresh, silent stream fails after WATCH_IDLE.
+            let (_, rv) = kube.list("/api/v1/nodes", "").await.unwrap();
+            let mut w = kube.watch("/api/v1/nodes", "", &rv).await.unwrap();
+            let quiet = rt::now();
+            assert_eq!(w.next().await.unwrap_err(), KubeError::Unavailable);
+            let waited = rt::now() - quiet;
+            assert!(waited >= limits::WATCH_IDLE, "{waited:?}");
+            assert!(waited < limits::WATCH_TIMEOUT, "{waited:?}");
+        });
     }
 
     /// A 401 forces a token reread before the TTL, and the TTL forces one

@@ -27,6 +27,12 @@ pub const API_TIMEOUT: Duration = Duration::from_secs(10);
 /// Server-side watch timeout.
 pub const WATCH_TIMEOUT: Duration = Duration::from_secs(290);
 
+/// Longest silence tolerated on an open watch stream. Watches request
+/// bookmarks, which the API server sends about once a minute, so a stream
+/// quiet for longer is treated as dead (for example a half-open connection)
+/// and re-established instead of stalling until [`WATCH_TIMEOUT`].
+pub const WATCH_IDLE: Duration = Duration::from_secs(150);
+
 /// Deadline to finish a TLS handshake, to read a request head after its first
 /// byte, to read a request body, or to write a small response.
 pub const IO_TIMEOUT: Duration = Duration::from_secs(10);
