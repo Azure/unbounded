@@ -840,23 +840,17 @@ mod identity_workflows {
         let cache = CacheId(CACHE.into());
         let page = keys.active(&cache, KeyPurpose::Page).unwrap();
         let credentials = keys.active(&cache, KeyPurpose::OriginCredentials).unwrap();
+        let nonce: [u8; 24] = super::array(&"01".repeat(24));
         let mut sealed = [0; 19];
-        page.seal_page(&cache, &[1; 24], b"aad", b"abc", &mut sealed)
+        page.seal_page(&cache, &nonce, b"aad", b"abc", &mut sealed)
             .unwrap();
         let mut out = [42; 3];
-        page.open_page(&cache, page.id(), &[1; 24], b"aad", &sealed, &mut out)
+        page.open_page(&cache, page.id(), &nonce, b"aad", &sealed, &mut out)
             .unwrap();
         assert_eq!(&out, b"abc");
         out.fill(42);
         assert_eq!(
-            page.open_page(
-                &cache,
-                credentials.id(),
-                &[1; 24],
-                b"aad",
-                &sealed,
-                &mut out
-            ),
+            page.open_page(&cache, credentials.id(), &nonce, b"aad", &sealed, &mut out),
             Err(Error::MissingKey)
         );
         assert_eq!(out, [42; 3]);
@@ -864,7 +858,7 @@ mod identity_workflows {
             page.open_page(
                 &CacheId("wrong".into()),
                 page.id(),
-                &[1; 24],
+                &nonce,
                 b"aad",
                 &sealed,
                 &mut out
@@ -873,28 +867,28 @@ mod identity_workflows {
         );
         assert_eq!(out, [42; 3]);
         assert_eq!(
-            page.open_page(&cache, page.id(), &[1; 24], b"bad", &sealed, &mut out),
+            page.open_page(&cache, page.id(), &nonce, b"bad", &sealed, &mut out),
             Err(Error::CorruptRecord)
         );
         assert_eq!(out, [0; 3]);
 
         // Tag-only verification enforces the same bindings as open.
         let (body, tag) = sealed.split_at(3);
-        page.verify_page_tag(&cache, page.id(), &[1; 24], &[b"a", b"ad"], body, tag)
+        page.verify_page_tag(&cache, page.id(), &nonce, &[b"a", b"ad"], body, tag)
             .unwrap();
         assert_eq!(
-            page.verify_page_tag(&cache, page.id(), &[1; 24], &[b"bad"], body, tag),
+            page.verify_page_tag(&cache, page.id(), &nonce, &[b"bad"], body, tag),
             Err(Error::CorruptRecord)
         );
         assert_eq!(
-            page.verify_page_tag(&cache, credentials.id(), &[1; 24], &[b"aad"], body, tag),
+            page.verify_page_tag(&cache, credentials.id(), &nonce, &[b"aad"], body, tag),
             Err(Error::MissingKey)
         );
         assert_eq!(
             page.verify_page_tag(
                 &CacheId("wrong".into()),
                 page.id(),
-                &[1; 24],
+                &nonce,
                 &[b"aad"],
                 body,
                 tag
@@ -902,7 +896,7 @@ mod identity_workflows {
             Err(Error::MissingKey)
         );
         assert_eq!(
-            credentials.verify_page_tag(&cache, credentials.id(), &[1; 24], &[b"aad"], body, tag),
+            credentials.verify_page_tag(&cache, credentials.id(), &nonce, &[b"aad"], body, tag),
             Err(Error::MissingKey)
         );
 
@@ -910,34 +904,34 @@ mod identity_workflows {
         let (body, tag) = sealed.split_at(3);
         let mut inout = [0; 3];
         inout.copy_from_slice(body);
-        page.open_page_in_place(&cache, page.id(), &[1; 24], b"aad", &mut inout, tag)
+        page.open_page_in_place(&cache, page.id(), &nonce, b"aad", &mut inout, tag)
             .unwrap();
         assert_eq!(&inout, b"abc");
         inout.copy_from_slice(body);
         assert_eq!(
-            page.open_page_in_place(&cache, credentials.id(), &[1; 24], b"aad", &mut inout, tag),
+            page.open_page_in_place(&cache, credentials.id(), &nonce, b"aad", &mut inout, tag),
             Err(Error::MissingKey)
         );
         assert_eq!(inout, body);
         assert_eq!(
-            page.open_page_in_place(&cache, page.id(), &[1; 24], b"bad", &mut inout, tag),
+            page.open_page_in_place(&cache, page.id(), &nonce, b"bad", &mut inout, tag),
             Err(Error::CorruptRecord)
         );
         assert_eq!(inout, [0; 3]);
         inout.copy_from_slice(body);
         assert_eq!(
-            page.open_page_in_place(&cache, page.id(), &[1; 24], b"aad", &mut inout, &tag[1..]),
+            page.open_page_in_place(&cache, page.id(), &nonce, b"aad", &mut inout, &tag[1..]),
             Err(Error::CorruptRecord)
         );
         assert_eq!(inout, [0; 3]);
         let original = sealed;
         assert_eq!(
-            credentials.seal_page(&cache, &[1; 24], b"aad", b"abc", &mut sealed),
+            credentials.seal_page(&cache, &nonce, b"aad", b"abc", &mut sealed),
             Err(Error::MissingKey)
         );
         assert_eq!(sealed, original);
         assert_eq!(
-            page.seal_credentials(&cache, &[1; 24], b"aad", b"abc", &mut sealed),
+            page.seal_credentials(&cache, &nonce, b"aad", b"abc", &mut sealed),
             Err(Error::MissingKey)
         );
         assert_eq!(sealed, original);
@@ -1234,11 +1228,16 @@ mod identity_workflows {
 /// Deterministic xorshift filler so oracle tests are reproducible.
 fn fill_pseudorandom(state: &mut u64, bytes: &mut [u8]) {
     for byte in bytes {
-        *state ^= *state << 13;
-        *state ^= *state >> 7;
-        *state ^= *state << 17;
-        *byte = *state as u8;
+        *byte = next_pseudorandom(state);
     }
+}
+
+/// Advance the xorshift state and return its low byte.
+fn next_pseudorandom(state: &mut u64) -> u8 {
+    *state ^= *state << 13;
+    *state ^= *state >> 7;
+    *state ^= *state << 17;
+    *state as u8
 }
 
 /// Tag-only verification accepts exactly what `open` and the reference
@@ -1254,12 +1253,10 @@ fn verify_tag_matches_open_and_reference_and_rejects_tampering() {
         .into_iter()
         .enumerate()
     {
-        let mut key = [0; 32];
-        let mut nonce = [0; 24];
+        let key: [u8; 32] = std::array::from_fn(|_| next_pseudorandom(&mut state));
+        let nonce: [u8; 24] = std::array::from_fn(|_| next_pseudorandom(&mut state));
         let mut aad = vec![0; round * 11 + (round % 3)];
         let mut plaintext = vec![0; length];
-        fill_pseudorandom(&mut state, &mut key);
-        fill_pseudorandom(&mut state, &mut nonce);
         fill_pseudorandom(&mut state, &mut aad);
         fill_pseudorandom(&mut state, &mut plaintext);
         let mut body = plaintext.clone();

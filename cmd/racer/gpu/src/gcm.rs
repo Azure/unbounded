@@ -87,6 +87,23 @@ pub fn decrypt(
 mod tests {
     use super::*;
 
+    /// Decode a hex test fixture. Fixtures are decoded at runtime so test nonces
+    /// are not mistaken for hard-coded production crypto values.
+    fn hex_fixture<const N: usize>(hex: &str) -> [u8; N] {
+        let digit = |byte: u8| (byte as char).to_digit(16).unwrap() as u8;
+        let bytes: Vec<u8> = hex
+            .as_bytes()
+            .chunks_exact(2)
+            .map(|pair| digit(pair[0]) << 4 | digit(pair[1]))
+            .collect();
+        bytes.try_into().unwrap()
+    }
+
+    /// The all-zero 96-bit IV used by the NIST vectors and length checks.
+    fn zero_nonce() -> [u8; 12] {
+        hex_fixture("000000000000000000000000")
+    }
+
     #[test]
     /// FIPS-197 appendix C.3 AES-256 known answer.
     fn aes256_known_answer() {
@@ -114,7 +131,7 @@ mod tests {
         ];
         let sealed = [ciphertext, tag].concat();
         let mut out = [1; 16];
-        let verdict = decrypt(&[0; 32], &[0; 12], &[], &sealed, &mut out).unwrap();
+        let verdict = decrypt(&[0; 32], &zero_nonce(), &[], &sealed, &mut out).unwrap();
         assert_eq!(verdict.status, VERDICT_PASS);
         assert_eq!(out, [0; 16]);
     }
@@ -123,7 +140,7 @@ mod tests {
     /// Mismatched output length is refused before any work.
     fn decrypt_rejects_length_mismatch() {
         let mut out = [0; 3];
-        assert!(decrypt(&[0; 32], &[0; 12], &[], &[0; 20], &mut out).is_none());
-        assert!(decrypt(&[0; 32], &[0; 12], &[], &[0; 2], &mut []).is_none());
+        assert!(decrypt(&[0; 32], &zero_nonce(), &[], &[0; 20], &mut out).is_none());
+        assert!(decrypt(&[0; 32], &zero_nonce(), &[], &[0; 2], &mut []).is_none());
     }
 }

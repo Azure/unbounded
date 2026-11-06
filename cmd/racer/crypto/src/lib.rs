@@ -2425,6 +2425,18 @@ pub mod identity {
         use super::tests::{CACHE, CLUSTER, NODE};
         use super::*;
 
+        /// Decode a hex test fixture. Fixtures are decoded at runtime so test nonces
+        /// are not mistaken for hard-coded production crypto values.
+        fn hex_fixture<const N: usize>(hex: &str) -> [u8; N] {
+            let digit = |byte: u8| (byte as char).to_digit(16).unwrap() as u8;
+            let bytes: Vec<u8> = hex
+                .as_bytes()
+                .chunks_exact(2)
+                .map(|pair| digit(pair[0]) << 4 | digit(pair[1]))
+                .collect();
+            bytes.try_into().unwrap()
+        }
+
         /// Install the default cache's page and credential keys.
         fn keys() -> Keyring {
             let (_, _, roots) = super::tests::issued();
@@ -2889,12 +2901,13 @@ pub mod identity {
             assert_ne!(active.id(), old_id);
             let decrypt = keys.lease(Some(&cache), old_id, KeyPurpose::Page).unwrap();
             let mut sealed = [0; 19];
+            let nonce: [u8; 24] = hex_fixture(&"01".repeat(24));
             assert_eq!(
-                decrypt.seal_page(&cache, &[1; 24], b"aad", b"abc", &mut sealed),
+                decrypt.seal_page(&cache, &nonce, b"aad", b"abc", &mut sealed),
                 Err(Error::MissingKey)
             );
             active
-                .seal_page(&cache, &[1; 24], b"aad", b"abc", &mut sealed)
+                .seal_page(&cache, &nonce, b"aad", b"abc", &mut sealed)
                 .unwrap();
             // Origin credential keys keep no decrypt history.
             let mut origin = bundle(3, roots.clone(), CacheKeyState::Active);

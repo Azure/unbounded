@@ -133,11 +133,11 @@ pub fn initial_seats(shared: &Shared) -> usize {
     }
 }
 
-fn jitter(shared: &Shared, salt: u32, max: Duration) -> Duration {
+fn jitter(shared: &Shared, stream: u32, max: Duration) -> Duration {
     rules::jitter(
         &shared.config.pod_uid,
         &mut **shared.rng.borrow_mut(),
-        salt,
+        stream,
         max,
     )
 }

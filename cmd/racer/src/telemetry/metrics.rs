@@ -1620,12 +1620,9 @@ mod tests {
                 // Compatibility series remain per worker.
                 "racer_worker_relay_used{worker=\"4\"} 1\n".to_string(),
             ] {
-                assert!(
-                    output.contains(&expected),
-                    "missing {expected:?} in {output}"
-                );
+                assert!(output.contains(&expected), "missing {expected:?}");
             }
-            assert!(!output.contains("recycler"), "{output}");
+            assert!(!output.contains("recycler"));
             assert_eq!(
                 output
                     .lines()
