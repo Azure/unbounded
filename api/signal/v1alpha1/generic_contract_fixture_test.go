@@ -168,11 +168,19 @@ func TestGenericVLLMMissingMetricFailureEvidenceDoesNotChangePlanDigest(t *testi
 
 	_, _, run := genericVLLMContractFixture(t)
 	want := run.Spec.PlanDigest
+	startedAt := metav1.NewTime(time.Unix(1, 0).UTC())
+	finishedAt := metav1.NewTime(time.Unix(2, 0).UTC())
 	run.Status.Evidence.Identity = &QualificationEvidenceIdentity{
 		PlanDigest: run.Spec.PlanDigest,
 		Participants: []ParticipantEvidenceIdentity{{
 			Index: 0,
 			Role:  ParticipantRoleParticipant,
+			Start: NodeFingerprint{
+				NodeUID: types.UID("node-1"),
+			},
+			End: NodeFingerprint{
+				NodeUID: types.UID("node-1"),
+			},
 		}},
 		Stages: []StageEvidenceSummary{{
 			Name:                   "vllm-smoke",
@@ -180,6 +188,8 @@ func TestGenericVLLMMissingMetricFailureEvidenceDoesNotChangePlanDigest(t *testi
 			Test:                   run.Spec.ResolvedPlan.Phases[0].Stages[0].Test.Identity,
 			Mode:                   CheckExecutionModeRunOnce,
 			Verdict:                StageVerdictFailed,
+			StartedAt:              startedAt,
+			FinishedAt:             finishedAt,
 			InvocationCount:        1,
 			FailedInvocations:      1,
 			DurableEvidenceDigest:  fixtureDigestE,
@@ -213,6 +223,11 @@ func TestGenericVLLMMissingMetricFailureEvidenceDoesNotChangePlanDigest(t *testi
 
 	if got != want {
 		t.Fatalf("evidence-only missing metric changed plan digest: got %q, want %q", got, want)
+	}
+
+	crd := readCRD(t, "signal.unbounded-cloud.io_certificationruns.yaml")
+	if errors := validateCRDCEL(t, crd, unstructuredObject(t, run)); len(errors) != 0 {
+		t.Fatalf("server-equivalent CEL rejected qualification evidence with diagnosticOnly omitted: %v", errors.ToAggregate())
 	}
 }
 

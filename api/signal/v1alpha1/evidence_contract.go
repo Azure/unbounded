@@ -157,7 +157,7 @@ type InvocationEvidenceReference struct {
 
 // +kubebuilder:validation:XValidation:rule="self.finishedAt >= self.startedAt",message="stage finishedAt must not precede startedAt"
 // +kubebuilder:validation:XValidation:rule="self.successfulInvocations + self.timedOutInvocations + self.failedInvocations + self.inconclusiveInvocations + self.canceledInvocations == self.invocationCount",message="invocation outcome counts must equal invocationCount"
-// +kubebuilder:validation:XValidation:rule="!self.qualificationEligible || (self.test.trust == 'Approved' && !self.diagnosticOnly)",message="qualification-eligible evidence requires an approved test and must not be diagnostic-only"
+// +kubebuilder:validation:XValidation:rule="!self.qualificationEligible || (self.test.trust == 'Approved' && (!has(self.diagnosticOnly) || !self.diagnosticOnly))",message="qualification-eligible evidence requires an approved test and must not be diagnostic-only"
 type StageEvidenceSummary struct {
 	// +kubebuilder:validation:Minimum=0
 	// +kubebuilder:validation:Maximum=15
