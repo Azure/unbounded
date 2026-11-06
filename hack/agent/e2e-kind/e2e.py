@@ -924,18 +924,45 @@ def validate_node_stack_removed() -> None:
     log(f"{mode} node stack is gone after reset")
 
 
-def create_bpffs_sentinel(machine: str) -> None:
-    log(f"Creating bpffs sentinel in nspawn machine '{machine}'...")
-    machine_shell(machine, textwrap.dedent(f"""\
+# Each nspawn machine sees its own bpffs at /sys/fs/bpf, mounted on the host at
+# /run/bpffs/<machine> (the machine's service override). Each container slot
+# has the same layout.
+NODE_BPFFS_BASE = "/run/bpffs"
+
+
+def bpffs_sentinel_script() -> str:
+    """Shell that makes a sentinel in the bpffs at /sys/fs/bpf of the node
+    stack. A directory is a bpffs object of its own, so this needs neither
+    bpftool (the node image ships only the kernel-versioned wrapper, which
+    fails on a host whose kernel has no matching linux-tools) nor any BPF
+    program."""
+    return textwrap.dedent(f"""\
+        set -e
         mountpoint -q /sys/fs/bpf
-        rm -f /sys/fs/bpf/{BPFFS_SENTINEL}
-        bpftool map create /sys/fs/bpf/{BPFFS_SENTINEL} type hash key 4 value 4 entries 1 name unb_e2e
-        test -e /sys/fs/bpf/{BPFFS_SENTINEL}
-    """))
+        rm -rf /sys/fs/bpf/{BPFFS_SENTINEL}
+        mkdir /sys/fs/bpf/{BPFFS_SENTINEL}
+        test -d /sys/fs/bpf/{BPFFS_SENTINEL}
+    """)
+
+
+def create_bpffs_sentinel(machine: str) -> None:
+    """Make the sentinel in the bpffs of nspawn machine *machine*. machinectl
+    shell does not reliably pass on the exit status of the command it runs,
+    so the result is checked on the host, at the machine's bpffs mount."""
+    log(f"Creating bpffs sentinel in nspawn machine '{machine}'...")
+    machine_shell(machine, bpffs_sentinel_script())
+    result = ssh_capture_quiet(f"sudo test -d {NODE_BPFFS_BASE}/{machine}/{BPFFS_SENTINEL}")
+    if result.returncode != 0:
+        die(f"the bpffs sentinel made in nspawn machine '{machine}' is not at "
+            f"{NODE_BPFFS_BASE}/{machine} on the host")
 
 
 def assert_bpffs_sentinel_absent(machine: str) -> None:
-    result = machine_shell_quiet(machine, f"test ! -e /sys/fs/bpf/{BPFFS_SENTINEL}")
+    """Assert nspawn machine *machine* has a bpffs of its own, without the
+    sentinel the previous machine made. Checked on the host, for the same
+    reason as create_bpffs_sentinel."""
+    ssh_cmd(f"sudo mountpoint -q {NODE_BPFFS_BASE}/{machine}")
+    result = ssh_capture_quiet(f"sudo test ! -e {NODE_BPFFS_BASE}/{machine}/{BPFFS_SENTINEL}")
     if result.returncode != 0:
         die(f"bpffs sentinel from previous machine is visible in '{machine}'")
 

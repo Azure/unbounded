@@ -298,6 +298,36 @@ class NodeStackDiagnosticsTests(unittest.TestCase):
         self._run("none", ssh)
 
 
+class BPFFSSentinelTests(unittest.TestCase):
+    def test_script_needs_no_bpftool_and_stops_on_error(self):
+        script = e2e.bpffs_sentinel_script()
+        self.assertNotIn("bpftool", script)
+        self.assertTrue(script.startswith("set -e\n"))
+        self.assertIn(f"mkdir /sys/fs/bpf/{e2e.BPFFS_SENTINEL}", script)
+
+    def test_nspawn_sentinel_is_checked_on_the_host(self):
+        ok = unittest.mock.Mock(returncode=0)
+        with patch.object(e2e, "machine_shell") as shell, \
+                patch.object(e2e, "ssh_capture_quiet", return_value=ok) as host:
+            e2e.create_bpffs_sentinel("kube1")
+        shell.assert_called_once()
+        host.assert_called_once_with(f"sudo test -d /run/bpffs/kube1/{e2e.BPFFS_SENTINEL}")
+
+    def test_a_sentinel_missing_on_the_host_fails(self):
+        missing = unittest.mock.Mock(returncode=1)
+        with patch.object(e2e, "machine_shell"), \
+                patch.object(e2e, "ssh_capture_quiet", return_value=missing), \
+                self.assertRaises(SystemExit):
+            e2e.create_bpffs_sentinel("kube1")
+
+    def test_a_sentinel_left_in_the_new_machine_fails(self):
+        visible = unittest.mock.Mock(returncode=1)
+        with patch.object(e2e, "ssh_cmd"), \
+                patch.object(e2e, "ssh_capture_quiet", return_value=visible), \
+                self.assertRaises(SystemExit):
+            e2e.assert_bpffs_sentinel_absent("kube2")
+
+
 class SoftRebootTests(unittest.TestCase):
     def _run(self, mode, markers):
         """Run the soft reboot check with the kubelet start marker answering from
