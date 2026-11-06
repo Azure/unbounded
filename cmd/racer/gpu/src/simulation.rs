@@ -36,7 +36,7 @@ use std::{
         fd::{FromRawFd, OwnedFd},
         unix::fs::{FileExt, MetadataExt},
     },
-    sync::{Arc, Mutex, MutexGuard},
+    sync::{Arc, Condvar, Mutex, MutexGuard},
 };
 
 /// Granularity imports must be a multiple of. Real GPUs use 2 MiB; smaller
@@ -154,6 +154,9 @@ pub struct Live {
 #[derive(Clone)]
 pub struct Simulation {
     world: Arc<Mutex<World>>,
+
+    /// Wakes calls waiting at a [`Simulation::hold`].
+    gate: Arc<Condvar>,
 }
 
 /// Scope guard from [`Simulation::enter`]. Restores the previous one on drop.
@@ -440,6 +443,15 @@ struct World {
 
     /// Async-contract violations deferred mode found and nobody took yet.
     violations: Violations,
+
+    /// Operations whose calls wait for a permit before running.
+    held: Vec<Operation>,
+
+    /// One entry per call [`Simulation::admit`] let through and none took yet.
+    permits: Vec<Operation>,
+
+    /// One entry per call waiting at a hold.
+    waiting: Vec<Operation>,
 }
 
 /// Recorded async-contract violations.
@@ -477,6 +489,7 @@ impl Simulation {
                 rdma_flush: true,
                 ..World::default()
             })),
+            gate: Arc::new(Condvar::new()),
         }
     }
 
@@ -511,6 +524,37 @@ impl Simulation {
     /// `-5` is a driver error). Nothing changes.
     pub fn fault(&self, operation: Operation, code: c_int) {
         self.world().faults.push_back((operation, code));
+    }
+
+    /// Make calls to `operation` wait (`true`) until [`Simulation::admit`]
+    /// lets each one through, or let every call run (`false`, the default).
+    /// A waiting call blocks its thread but not the simulation, so tests can
+    /// hold work in flight until other threads reach a known state.
+    pub fn hold(&self, operation: Operation, held: bool) {
+        let mut world = self.world();
+        world.held.retain(|op| *op != operation);
+        if held {
+            world.held.push(operation);
+        } else {
+            world.permits.retain(|op| *op != operation);
+        }
+        drop(world);
+        self.gate.notify_all();
+    }
+
+    /// Let one held call to `operation`, waiting now or made later, run.
+    pub fn admit(&self, operation: Operation) {
+        self.world().permits.push(operation);
+        self.gate.notify_all();
+    }
+
+    /// Calls to `operation` waiting at a hold now.
+    pub fn waiting(&self, operation: Operation) -> usize {
+        self.world()
+            .waiting
+            .iter()
+            .filter(|op| **op == operation)
+            .count()
     }
 
     /// Whether GPU `dst` can read GPU `src`'s memory over a peer path. By
@@ -622,6 +666,22 @@ fn with<R: Into<i64> + Copy + From<i32>>(
         return R::from(code::EUNAVAILABLE);
     };
     let mut world = simulation.world();
+    if world.held.contains(&operation) {
+        world.waiting.push(operation);
+        while world.held.contains(&operation) {
+            if let Some(permit) = world.permits.iter().position(|op| *op == operation) {
+                world.permits.remove(permit);
+                break;
+            }
+            world = simulation
+                .gate
+                .wait(world)
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+        }
+        if let Some(waiting) = world.waiting.iter().position(|op| *op == operation) {
+            world.waiting.remove(waiting);
+        }
+    }
     let fault = world
         .faults
         .iter()
@@ -1824,5 +1884,50 @@ mod tests {
         let sim = Simulation::new(vec![SimDevice::new(0)]);
         sim.world().violation("test".into());
         drop(sim);
+    }
+
+    #[test]
+    /// A held operation waits on its own thread until admitted, one call per
+    /// permit, while the rest of the simulation keeps running; releasing the
+    /// hold lets every waiting call through.
+    fn held_calls_wait_for_admission() {
+        let sim = Simulation::new(vec![SimDevice::new(0)]);
+        let _env = sim.enter();
+        sim.hold(Operation::Init, true);
+        let calls: Vec<_> = (0..3)
+            .map(|_| {
+                let sim = sim.clone();
+                std::thread::spawn(move || {
+                    let _env = sim.enter();
+                    unsafe { (api().init)() }
+                })
+            })
+            .collect();
+        let wait = |count| {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+            while sim.waiting(Operation::Init) != count {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "held calls did not wait"
+                );
+                std::thread::yield_now();
+            }
+        };
+        wait(3);
+        // Unheld operations still run while calls wait.
+        let mut context = std::ptr::null_mut();
+        assert_eq!(unsafe { (api().context)(0, &mut context) }, code::OK);
+        assert_eq!(sim.waiting(Operation::Init), 3);
+        sim.admit(Operation::Init);
+        wait(2);
+        sim.hold(Operation::Init, false);
+        wait(0);
+        for call in calls {
+            assert_eq!(call.join().unwrap(), code::OK);
+        }
+        // A permit left over from a released hold does not survive it.
+        sim.admit(Operation::Init);
+        sim.hold(Operation::Init, false);
+        assert!(sim.world().permits.is_empty());
     }
 }
