@@ -88,7 +88,8 @@ func parseOptions(args []string, output io.Writer) (options, error) {
 	f.DurationVar(&opts.duration, "duration", 0, "Load phase duration; zero runs until signaled")
 	f.StringVar(&opts.blobDigests, "trusted-blob-digests", "", "Comma-separated digests computed earlier for the first catalog blobs (same seed and size); skips hashing them at startup")
 	f.IntVar(&opts.pull.PageCredits, "page-credits", 0, "UDS only: pages Racer may send ahead of each read, 0-64 (0 uses the SDK default of 2); bounds Racer's per-read fetch window")
-	f.Int64Var(&opts.pull.RangeBytes, "range-bytes", 0, "UDS only: read each blob as pinned byte ranges of this size, resuming a failed range at its first unread byte (0 reads whole objects); requires verify=false")
+	f.Int64Var(&opts.pull.RangeBytes, "range-bytes", 0, "UDS only: read each blob as pinned byte ranges of this size, resuming a failed range at its first unread byte (0 reads whole objects); requires verify=false unless delivery=host-read")
+	f.StringVar(&opts.pull.Delivery, "delivery", deliveryStream, "UDS only: stream (SDK Get over the socket) or host-read (Racer writes each blob into a pooled, preallocated memfd passed with SCM_RIGHTS; with range-bytes, each range lands at its offset, so verify works)")
 	f.IntVar(&opts.pull.RangeParallel, "range-parallel", 0, "UDS only: concurrent ranges per blob with range-bytes (0 means 1)")
 	f.IntVar(&opts.pull.RangeRetries, "range-retries", 0, "UDS only: resumes allowed per range with range-bytes")
 	f.BoolVar(&opts.pull.RangeRotate, "range-rotate", false, "UDS only: start each process at a host-name-derived range with range-bytes")
@@ -156,8 +157,15 @@ func parseOptions(args []string, output io.Writer) (options, error) {
 		return opts, errors.New("range-bytes, range-parallel, and range-retries must be nonnegative")
 	}
 
-	if opts.pull.RangeBytes > 0 && (opts.pull.Backend != "uds" || opts.pull.Verify || opts.pull.DiagnoseIntegrity) {
-		return opts, errors.New("range-bytes requires backend=uds and verify=false")
+	if err := validateDelivery(opts.pull); err != nil {
+		return opts, err
+	}
+
+	// Ranges arrive out of order over the stream, so only host-read, which
+	// writes each range at its own offset, can verify them.
+	if opts.pull.RangeBytes > 0 && (opts.pull.Backend != "uds" ||
+		opts.pull.Delivery != deliveryHostRead && (opts.pull.Verify || opts.pull.DiagnoseIntegrity)) {
+		return opts, errors.New("range-bytes requires backend=uds and, unless delivery=host-read, verify=false")
 	}
 
 	if opts.startDelay < 0 || opts.duration < 0 || opts.startAt < 0 {

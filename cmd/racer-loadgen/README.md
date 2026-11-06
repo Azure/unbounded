@@ -211,7 +211,8 @@ These flags help when many nodes load one very large blob, such as 1 TB:
 - `--page-credits=N` (UDS only, 0-64) sets how many pages Racer may send ahead
   of each read. The dataplane's fetch window for a read is the smaller of this
   and `RACER_RANGE_WINDOW_PAGES`; 0 keeps the SDK default of 2.
-- `--range-bytes=N` (UDS only, requires `--verify=false`) reads each blob as
+- `--range-bytes=N` (UDS only, requires `--verify=false` unless
+  `--delivery=host-read`) reads each blob as
   byte ranges pinned to one ETag. `--range-parallel` ranges run at once (raise
   `--blob-concurrency` to at least the same value, since it sizes the SDK
   connection pool). A range that fails mid-transfer resumes at its first
@@ -221,6 +222,20 @@ These flags help when many nodes load one very large blob, such as 1 TB:
   pages at the same moment. `--range-cohorts=K` instead splits pods into K
   cohorts (by the trailing number of `--node-name` when it has one); a cohort
   starts at the same range, and cohorts start evenly spaced across the blob.
+- `--delivery=host-read` (UDS only; default `stream`) has the dataplane write
+  each blob straight into a memfd with positioned io_uring writes instead of
+  sending it over the socket (`POST /v1/objects/<key>/host-read`, see the
+  Racer reference). The memfd is passed with `SCM_RIGHTS` on the same client
+  socket, so it works across pods that share the socket's hostPath and needs
+  no shared uid. Each concurrent pull borrows a memfd from a pool; memfds are
+  grown with `ftruncate` and `fallocate` to the largest blob seen and reused,
+  so their pages stay allocated and are charged to the loadgen's memory
+  cgroup, not the dataplane's. Budget about `concurrency * blob-concurrency *
+  blob size` of shared memory. Received bytes count per page as the
+  dataplane confirms them. With `--range-bytes`, each range is written at its
+  own offset, so `--verify=true` hashes the memfd through a read-only mapping.
+  Whole-object reads skip Stat and size the window from the catalog
+  descriptor. `--diagnose-integrity` is not supported.
 
 ## Memory and measurement
 
