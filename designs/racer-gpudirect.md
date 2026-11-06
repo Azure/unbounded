@@ -120,9 +120,13 @@ If a CUDA free or unmap call fails, the dataplane keeps the resource and counts
 the leak, as the `verbs` crate does. It never frees memory that a GPU may still
 write.
 
-`host-read` writes with io_uring `Write` at an explicit file offset. It never
-maps the client's file, so a client that truncates its memfd cannot crash the
-dataplane.
+`host-read` writes with io_uring `Write` at an explicit file offset. It maps
+the client's file only when the file is a tmpfs memfd sealed with
+`F_SEAL_SHRINK`, open read-write, and long enough for the window, so a client
+cannot truncate it under the mapping and crash the dataplane. Then pages that
+are not plaintext in dataplane memory arrive sealed, as for `gpu-read`, and a
+crypto worker copies the ciphertext into the mapping and decrypts it in place
+(`cmd/racer/src/client/direct/host_map.rs`).
 
 ### Fallback
 
