@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import atexit
 import base64
+import importlib.util
 import json
 import os
 import signal
@@ -79,6 +80,8 @@ if SMOKE_ISOLATION and SMOKE_ISOLATION not in SMOKE_ISOLATION_MODES:
 NONE_UNITS = ("unbounded-containerd.service", "unbounded-kubelet.service")
 
 KUBECTL = "kubectl"
+# The kind cluster the smoke runs against; its container is kind-control-plane.
+KIND_CLUSTER = "kind"
 VIRSH = ["virsh", "--connect", "qemu:///system"]
 DEVNULL = subprocess.DEVNULL
 
@@ -87,6 +90,35 @@ _procs: list[subprocess.Popen[Any]] = []
 
 def log(msg: str) -> None:
     print(f"==> {msg}", file=sys.stderr)
+
+
+def _load_kind_kubeconfig() -> Any:
+    path = REPO_ROOT / "hack" / "agent" / "e2e-kind" / "kind_kubeconfig.py"
+    spec = importlib.util.spec_from_file_location("kind_kubeconfig", path)
+    assert spec and spec.loader
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+kind_kubeconfig = _load_kind_kubeconfig()
+
+
+def pin_kind_kubeconfig(directory: Path = TMPDIR) -> Path:
+    """Point every kubeconfig reader at the kind cluster's own kubeconfig.
+
+    The smoke creates Machines, secrets and RBAC. Run against the default
+    kubeconfig, they would go to whatever its current-context names, which
+    another shell can change mid-run. Stops before anything else when the
+    kubeconfig is not the kind cluster's alone.
+    """
+    try:
+        path = kind_kubeconfig.pin(REPO_ROOT, KIND_CLUSTER, path=directory / "kind.kubeconfig")
+    except kind_kubeconfig.KubeconfigError as exc:
+        # Not die(): its debug collection would run kubectl.
+        sys.exit(f"FAIL: refusing to run the smoke: {exc}")
+    log(f"Using kubeconfig {path} (context {kind_kubeconfig.kind_context(KIND_CLUSTER)})")
+    return path
 
 
 def die(msg: str) -> None:
@@ -1023,6 +1055,7 @@ def run_operation_smoke_suite() -> None:
 
 
 def main() -> None:
+    pin_kind_kubeconfig()
     signal.signal(signal.SIGINT, _sigint_handler)
     atexit.register(cleanup)
 

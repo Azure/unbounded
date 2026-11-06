@@ -412,6 +412,7 @@ def assert_no_dhcp() -> None:
 def main() -> None:
     global PASSED
 
+    smoke.pin_kind_kubeconfig(TMP)
     atexit.register(cleanup)
     setup_network()
     blank_efi, active_efi = create_vm()
