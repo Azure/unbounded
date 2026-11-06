@@ -190,7 +190,7 @@ func certificationRun() *signalv1.CertificationRun {
 				NodeName: "worker-0",
 				NodeUID:  types.UID("node-uid"),
 			}},
-			ScriptBundle: signalv1.ScriptBundleReference{
+			ScriptBundle: &signalv1.ScriptBundleReference{
 				Name:   "script-snapshot",
 				UID:    types.UID("script-uid"),
 				Digest: "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",

@@ -17,6 +17,7 @@ import (
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/rest"
 
+	signalv1 "github.com/Azure/unbounded/api/signal/v1alpha1"
 	"github.com/Azure/unbounded/internal/signaladapter"
 	"github.com/Azure/unbounded/internal/version"
 )
@@ -25,6 +26,8 @@ const adapterName = "project-signal-adapter"
 
 type config struct {
 	signaladapter.Request
+	PhaseIndex int
+	StageIndex int
 }
 
 func main() {
@@ -49,6 +52,8 @@ func main() {
 	flags.StringVar(&cfg.ExecutionName, "execution-name", "", "Check-specific backend execution name")
 	flags.Var(uidValue{target: &cfg.RunUID}, "run-uid", "CertificationRun UID")
 	flags.IntVar(&cfg.CheckIndex, "check-index", -1, "Zero-based check position in the CertificationRun suite")
+	flags.IntVar(&cfg.PhaseIndex, "phase-index", -1, "Zero-based phase position in the resolved CertificationRun plan")
+	flags.IntVar(&cfg.StageIndex, "stage-index", -1, "Zero-based stage position in the resolved CertificationRun phase")
 	flags.StringVar(&cfg.ResultConfigMap, "result-configmap", "", "Immutable check result ConfigMap name")
 
 	command.CompletionOptions.DisableDefaultCmd = true
@@ -78,6 +83,57 @@ func run(ctx context.Context, cfg config) error {
 	runner := &signaladapter.Runner{
 		Dynamic:    dynamicClient,
 		Kubernetes: kubernetesClient,
+	}
+
+	if cfg.PhaseIndex >= 0 || cfg.StageIndex >= 0 {
+		if cfg.CheckIndex >= 0 || cfg.PhaseIndex < 0 || cfg.StageIndex < 0 {
+			return errors.New("stage mode requires phase-index and stage-index and excludes check-index")
+		}
+
+		request := signaladapter.StageRequest{
+			Namespace:       cfg.Namespace,
+			WorkflowName:    cfg.WorkflowName,
+			RunName:         cfg.RunName,
+			ExecutionName:   cfg.ExecutionName,
+			RunUID:          cfg.RunUID,
+			PhaseIndex:      cfg.PhaseIndex,
+			StageIndex:      cfg.StageIndex,
+			ResultConfigMap: cfg.ResultConfigMap,
+		}
+
+		execution, resolveErr := runner.ResolveStageRequest(ctx, request)
+		if resolveErr != nil {
+			return resolveErr
+		}
+
+		executor := &signaladapter.KubernetesStageExecutor{
+			Runner:        runner,
+			Namespace:     cfg.Namespace,
+			WorkflowName:  cfg.WorkflowName,
+			ExecutionName: cfg.ExecutionName,
+		}
+		stageRunner := signaladapter.StageRunner{
+			Executor: executor,
+			Evidence: func(
+				evidenceCtx context.Context,
+				evidenceExecution signaladapter.StageExecutionRequest,
+				envelopes []signalv1.InvocationResultEnvelope,
+			) error {
+				return runner.PersistInvocationEvidence(
+					evidenceCtx,
+					request,
+					evidenceExecution,
+					envelopes,
+				)
+			},
+		}
+
+		summary, executeErr := stageRunner.Execute(ctx, execution)
+		if executeErr != nil {
+			return executeErr
+		}
+
+		return runner.PersistStageResult(ctx, request, execution, summary)
 	}
 
 	resolved, check, err := runner.ResolveRequest(ctx, cfg.Request)
