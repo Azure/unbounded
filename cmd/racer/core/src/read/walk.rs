@@ -2305,9 +2305,19 @@ impl Fill {
         }
     }
 
-    /// Record the outstanding probe's outcome and its evidence.
+    /// Record the outstanding probe's outcome and its evidence. A destination's shed or full flight,
+    /// or a relay's `Overloaded` answer, is load, like a local refusal: a walk refused only for load ends
+    /// `Overloaded` ([`Fill::exhausted_error`]), so the read restarts the page once load clears
+    /// instead of spending its capped `Unavailable` restarts.
     fn complete(&mut self, outcome: Outcome, budget: &mut AcquisitionBudget) -> Result<Action> {
-        self.other = self.other.saturating_add(1);
+        if matches!(
+            outcome,
+            Outcome::Shed | Outcome::Fetching | Outcome::Probe(ProbeOutcome::Overloaded)
+        ) {
+            self.busy = self.busy.saturating_add(1);
+        } else {
+            self.other = self.other.saturating_add(1);
+        }
         self.complete_busy(outcome, budget)
     }
 

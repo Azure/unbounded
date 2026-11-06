@@ -1759,6 +1759,41 @@ fn local_admission_saturation_is_overloaded_not_unavailable() {
 }
 
 #[test]
+fn owners_that_only_shed_are_overloaded_not_unavailable() {
+    let shed = answer(ResponseKind::Overloaded);
+    let relay = Event::Reply(Reply::Answer {
+        kind: ResponseKind::Overloaded,
+        signed: false,
+    });
+    let full = answer(ResponseKind::FlightFull);
+    // Every owner shed or had a full flight, or a relay refused for load, mixed with local
+    // refusals: busy.
+    for replies in [
+        &[shed][..],
+        &[relay],
+        &[full],
+        &[shed, LOCAL_BUSY, relay, full],
+    ] {
+        assert_eq!(
+            format!("{:?}", reader_done(replies)),
+            format!("{:?}", Action::Done(Err(Error::Overloaded))),
+            "{replies:?}"
+        );
+    }
+    // Any other evidence still wins.
+    for replies in [
+        &[shed, UNAVAILABLE][..],
+        &[Event::Reply(Reply::TimedOut), shed],
+    ] {
+        assert_eq!(
+            format!("{:?}", reader_done(replies)),
+            format!("{:?}", Action::Done(Err(Error::Unavailable))),
+            "{replies:?}"
+        );
+    }
+}
+
+#[test]
 fn unreachable_owners_still_fail_unavailable() {
     // All owners down.
     assert_eq!(
