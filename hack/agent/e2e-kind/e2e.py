@@ -1044,16 +1044,11 @@ def assert_bpffs_sentinel_absent(machine: str) -> None:
 
 
 def create_container_bpffs_sentinel(slot: str) -> None:
-    """Pin a sentinel map in the bpffs of the running container slot, which the
+    """Make a sentinel in the bpffs of the running container slot, which the
     host mounts at /run/bpffs/<slot> and the container sees at /sys/fs/bpf."""
     log(f"Creating bpffs sentinel in container slot '{slot}'...")
-    node_exec(textwrap.dedent(f"""\
-        mountpoint -q /sys/fs/bpf
-        rm -f /sys/fs/bpf/{BPFFS_SENTINEL}
-        bpftool map create /sys/fs/bpf/{BPFFS_SENTINEL} type hash key 4 value 4 entries 1 name unb_e2e
-        test -e /sys/fs/bpf/{BPFFS_SENTINEL}
-    """))
-    ssh_cmd(f"sudo test -e {CONTAINER_BPFFS_BASE}/{slot}/{BPFFS_SENTINEL}")
+    node_exec(bpffs_sentinel_script())
+    ssh_cmd(f"sudo test -d {CONTAINER_BPFFS_BASE}/{slot}/{BPFFS_SENTINEL}")
 
 
 def assert_container_bpffs_sentinel_absent(slot: str) -> None:

@@ -428,6 +428,14 @@ class BPFFSSentinelTests(unittest.TestCase):
             e2e.assert_bpffs_sentinel_absent("kube2")
 
 
+class ContainerBPFFSSentinelTests(unittest.TestCase):
+    def test_container_sentinel_uses_the_shared_script_and_checks_the_host(self):
+        with patch.object(e2e, "node_exec") as node_exec, patch.object(e2e, "ssh_cmd") as host:
+            e2e.create_container_bpffs_sentinel("kube1")
+        node_exec.assert_called_once_with(e2e.bpffs_sentinel_script())
+        host.assert_called_once_with(f"sudo test -d /run/bpffs/kube1/{e2e.BPFFS_SENTINEL}")
+
+
 class SoftRebootTests(unittest.TestCase):
     def _run(self, mode, markers):
         """Run the soft reboot check with the kubelet start marker answering from
