@@ -22,7 +22,6 @@ use crate::peer::forwarding::VerifiedRequest;
 use crate::peer::protocol::PeerResponse;
 use crate::peer::server::LocalPageService;
 use crate::runtime::Cancellation;
-use crate::runtime::HashMap;
 use crate::runtime::RequestScope;
 use crate::security::OriginContext;
 use crate::security::PeerOriginContext;
@@ -50,11 +49,6 @@ type Completion = mailbox::Completion<Result<Value>, AcquisitionBudget>;
 type Command = mailbox::Command<Work, Result<Value>, AcquisitionBudget, RequestScope>;
 type Receipt = mailbox::Receipt<Work, Result<Value>, AcquisitionBudget, RequestScope>;
 type Handoff = mailbox::Mailbox<Work, Result<Value>, AcquisitionBudget, RequestScope>;
-
-thread_local! {
-    // Installed only on the owning I/O thread. No Rc enters the shared directory.
-    static LOCALS: RefCell<HashMap<usize, (WorkerId, Weak<Coordinator>)>> = RefCell::new(HashMap::default());
-}
 
 struct Mailbox {
     worker: WorkerId,
@@ -98,9 +92,27 @@ impl std::ops::Deref for Mailbox {
     }
 }
 
+/// One worker's view of the [`NodeDirectory`]: the shared map and mailboxes
+/// plus this worker's own coordinator, bound by [`WorkerDirectory::install`].
+/// Each worker thread builds its own view from the node graph, so no Rc
+/// enters the shared directory and no thread-local lookup is needed. Tests that
+/// model several workers on one thread may share one view and select the
+/// current worker with `simulation_scope`.
+pub struct WorkerDirectory {
+    shared: Arc<NodeDirectory>,
+    local: RefCell<Option<(WorkerId, Weak<Coordinator>)>>,
+}
+
+impl std::ops::Deref for WorkerDirectory {
+    type Target = NodeDirectory;
+    fn deref(&self) -> &NodeDirectory {
+        &self.shared
+    }
+}
+
 /// The map is immutable for the lifetime of this directory. Construct a replacement
 /// only after all endpoints and completion receipts have drained.
-pub struct WorkerDirectory {
+pub struct NodeDirectory {
     /// Node-wide prefetch tickets, scheduler, and owner budget.
     pub prefetch: Arc<crate::prefetch::service::Prefetch>,
     spill: std::sync::Mutex<super::spill::Config>,
@@ -350,56 +362,30 @@ impl WorkerDirectory {
     /// Production gets this isolation from its owning OS thread.
     #[cfg(test)]
     pub(crate) fn simulation_scope(
-        &self,
+        self: &Arc<Self>,
         local: Option<(WorkerId, Rc<Coordinator>)>,
     ) -> SimulationLocal {
-        let key = self as *const Self as usize;
-        let previous = LOCALS.with(|locals| {
-            let mut locals = locals.borrow_mut();
-            let previous = locals.remove(&key);
-            if let Some((worker, local)) = local {
-                locals.insert(key, (worker, Rc::downgrade(&local)));
-            }
-            previous
-        });
-        SimulationLocal { key, previous }
+        let previous = self
+            .local
+            .replace(local.map(|(worker, local)| (worker, Rc::downgrade(&local))));
+        SimulationLocal {
+            directory: self.clone(),
+            previous,
+        }
     }
+    /// A directory with a fresh node-wide state and one unbound view of it.
     pub fn new(
         map: Arc<WorkerMap>,
         workers: Vec<WorkerId>,
         capacity: usize,
         ctx: racer_io::WorkerCtx,
     ) -> Result<Self> {
-        if workers.is_empty()
-            || capacity == 0
-            || workers
-                .iter()
-                .enumerate()
-                .any(|(i, w)| workers[..i].contains(w))
-        {
-            return Err(Error::InvalidConfiguration);
-        }
-        Ok(Self {
-            prefetch: Arc::new(crate::prefetch::service::Prefetch::new(ctx.clone())),
-            spill: std::sync::Mutex::new(super::spill::Config::default()),
-            subscriptions: super::range_stream::Scheduler::new(
-                capacity.saturating_mul(workers.len()),
-                ctx.clone(),
-            ),
-            map,
-            ctx,
-            mailboxes: workers
-                .into_iter()
-                .map(|worker| {
-                    Arc::new(Mailbox {
-                        worker,
-                        inner: Arc::new(Handoff::new(capacity).expect("validated capacity")),
-                        failed_verdicts: std::sync::Mutex::new(Vec::new()),
-                    })
-                })
-                .collect(),
-            sequence: AtomicU64::new(1),
-        })
+        Ok(Arc::new(NodeDirectory::new(map, workers, capacity, ctx)?).view())
+    }
+
+    /// The node-wide state shared by every worker's view.
+    pub fn node(&self) -> &Arc<NodeDirectory> {
+        &self.shared
     }
 
     pub fn install(
@@ -414,20 +400,18 @@ impl WorkerDirectory {
             .index()
             .set_hold_capacity_percent(self.spill_config().retained_percent)?;
         let mailbox = self.mailbox(worker)?.clone();
-        let key = Arc::as_ptr(self) as usize;
-        LOCALS.with(|locals| {
-            let mut locals = locals.borrow_mut();
-            if locals
-                .get(&key)
+        {
+            let mut bound = self.local.borrow_mut();
+            if bound
+                .as_ref()
                 .and_then(|(_, local)| local.upgrade())
                 .is_some()
             {
                 return Err(Error::InvalidConfiguration);
             }
             mailbox.install()?;
-            locals.insert(key, (worker, Rc::downgrade(&local)));
-            Ok(())
-        })?;
+            *bound = Some((worker, Rc::downgrade(&local)));
+        }
         Ok(WorkerEndpoint {
             directory: self.clone(),
             mailbox,
@@ -436,33 +420,22 @@ impl WorkerDirectory {
         })
     }
 
-    fn mailbox(&self, worker: WorkerId) -> Result<&Arc<Mailbox>> {
-        self.mailboxes
-            .iter()
-            .find(|m| m.worker == worker)
-            .ok_or(Error::InvalidConfiguration)
-    }
     /// This worker's read coordinator.
     pub(crate) fn local_coordinator(&self) -> Result<Rc<Coordinator>> {
         self.local()
     }
     pub(super) fn local(&self) -> Result<Rc<Coordinator>> {
-        LOCALS
-            .with(|locals| {
-                locals
-                    .borrow()
-                    .get(&(self as *const Self as usize))
-                    .and_then(|(_, local)| local.upgrade())
-            })
+        self.local
+            .borrow()
+            .as_ref()
+            .and_then(|(_, local)| local.upgrade())
             .ok_or(Error::Unavailable)
     }
     fn is_local(&self, owner: WorkerId) -> bool {
-        LOCALS.with(|locals| {
-            locals
-                .borrow()
-                .get(&(self as *const Self as usize))
-                .is_some_and(|(worker, _)| *worker == owner)
-        })
+        self.local
+            .borrow()
+            .as_ref()
+            .is_some_and(|(worker, _)| *worker == owner)
     }
     fn seal(&self, context: &OriginContext, scope: &RequestScope) -> Result<PeerOriginContext> {
         let sequence = self
@@ -474,23 +447,6 @@ impl WorkerDirectory {
         self.local()?
             .credentials
             .seal(context, AttemptId(attempt), scope)
-    }
-    pub fn metadata_owner(&self, object: &ObjectId) -> Result<WorkerId> {
-        self.map.metadata_owner(object)
-    }
-    pub fn page_owner(&self, page: &PageId) -> Result<WorkerId> {
-        self.map.owner(page)
-    }
-
-    /// Apply read spill settings. Call before installing workers.
-    pub fn configure_spill(&self, config: super::spill::Config) -> Result<()> {
-        config.validate()?;
-        *self.spill.lock().unwrap() = config;
-        Ok(())
-    }
-
-    pub fn spill_config(&self) -> super::spill::Config {
-        *self.spill.lock().unwrap()
     }
 
     /// Add one holder to `page` on its owning worker only, until `until`.
@@ -673,22 +629,6 @@ impl WorkerDirectory {
             Value::Resident(resident) => Ok(resident),
             _ => Err(Error::StaleFlight),
         }
-    }
-
-    fn submit(
-        &self,
-        worker: WorkerId,
-        work: Work,
-        scope: &RequestScope,
-        budget: Option<AcquisitionBudget>,
-    ) -> Result<Receipt> {
-        scope.check()?;
-        let mailbox = self.mailbox(worker)?;
-        let generation = self
-            .sequence
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_add(1))
-            .map_err(|_| Error::Unavailable)?;
-        mailbox.inner.submit(generation, work, scope, budget)
     }
 
     async fn budgeted(
@@ -916,11 +856,10 @@ impl WorkerDirectory {
     /// work is queued on the mailbox as another worker's request would be.
     #[cfg(test)]
     pub(crate) fn as_remote<T>(&self, f: impl FnOnce() -> T) -> T {
-        let key = self as *const Self as usize;
-        let entry = LOCALS.with(|locals| locals.borrow_mut().remove(&key));
+        let entry = self.local.borrow_mut().take();
         let output = f();
         if let Some(entry) = entry {
-            LOCALS.with(|locals| locals.borrow_mut().insert(key, entry));
+            self.local.replace(Some(entry));
         }
         output
     }
@@ -1009,19 +948,13 @@ impl WorkerDirectory {
 
 #[cfg(test)]
 pub(crate) struct SimulationLocal {
-    key: usize,
+    directory: Arc<WorkerDirectory>,
     previous: Option<(WorkerId, std::rc::Weak<Coordinator>)>,
 }
 #[cfg(test)]
 impl Drop for SimulationLocal {
     fn drop(&mut self) {
-        LOCALS.with(|locals| {
-            let mut locals = locals.borrow_mut();
-            locals.remove(&self.key);
-            if let Some(previous) = self.previous.take() {
-                locals.insert(self.key, previous);
-            }
-        });
+        self.directory.local.replace(self.previous.take());
     }
 }
 
@@ -1088,22 +1021,14 @@ impl WorkerEndpoint {
             return Err(Error::Unavailable);
         }
         self.mailbox.uninstall()?;
-        LOCALS.with(|locals| {
-            locals
-                .borrow_mut()
-                .remove(&(Arc::as_ptr(&self.directory) as usize))
-        });
+        self.directory.local.borrow_mut().take();
         Ok(())
     }
 }
 impl Drop for WorkerEndpoint {
     fn drop(&mut self) {
         self.stop_admission();
-        LOCALS.with(|locals| {
-            locals
-                .borrow_mut()
-                .remove(&(Arc::as_ptr(&self.directory) as usize));
-        });
+        self.directory.local.borrow_mut().take();
         // Queued work has not started and can be fenced as non-submission. Drop
         // outside the mailbox lock because its permit releases against that lock.
         Executor::reject_queued(&self.mailbox, Error::Unavailable);
@@ -1356,7 +1281,96 @@ async fn execute(
     }
 }
 
-// PeerServer owns local services through Rc; retain the node-wide directory Arc.
+impl NodeDirectory {
+    pub fn new(
+        map: Arc<WorkerMap>,
+        workers: Vec<WorkerId>,
+        capacity: usize,
+        ctx: racer_io::WorkerCtx,
+    ) -> Result<Self> {
+        if workers.is_empty()
+            || capacity == 0
+            || workers
+                .iter()
+                .enumerate()
+                .any(|(i, w)| workers[..i].contains(w))
+        {
+            return Err(Error::InvalidConfiguration);
+        }
+        Ok(Self {
+            prefetch: Arc::new(crate::prefetch::service::Prefetch::new(ctx.clone())),
+            spill: std::sync::Mutex::new(super::spill::Config::default()),
+            subscriptions: super::range_stream::Scheduler::new(
+                capacity.saturating_mul(workers.len()),
+                ctx.clone(),
+            ),
+            map,
+            ctx,
+            mailboxes: workers
+                .into_iter()
+                .map(|worker| {
+                    Arc::new(Mailbox {
+                        worker,
+                        inner: Arc::new(Handoff::new(capacity).expect("validated capacity")),
+                        failed_verdicts: std::sync::Mutex::new(Vec::new()),
+                    })
+                })
+                .collect(),
+            sequence: AtomicU64::new(1),
+        })
+    }
+
+    pub fn metadata_owner(&self, object: &ObjectId) -> Result<WorkerId> {
+        self.map.metadata_owner(object)
+    }
+    pub fn page_owner(&self, page: &PageId) -> Result<WorkerId> {
+        self.map.owner(page)
+    }
+
+    /// Apply read spill settings. Call before installing workers.
+    pub fn configure_spill(&self, config: super::spill::Config) -> Result<()> {
+        config.validate()?;
+        *self.spill.lock().unwrap() = config;
+        Ok(())
+    }
+
+    pub fn spill_config(&self) -> super::spill::Config {
+        *self.spill.lock().unwrap()
+    }
+
+    fn mailbox(&self, worker: WorkerId) -> Result<&Arc<Mailbox>> {
+        self.mailboxes
+            .iter()
+            .find(|m| m.worker == worker)
+            .ok_or(Error::InvalidConfiguration)
+    }
+
+    fn submit(
+        &self,
+        worker: WorkerId,
+        work: Work,
+        scope: &RequestScope,
+        budget: Option<AcquisitionBudget>,
+    ) -> Result<Receipt> {
+        scope.check()?;
+        let mailbox = self.mailbox(worker)?;
+        let generation = self
+            .sequence
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_add(1))
+            .map_err(|_| Error::Unavailable)?;
+        mailbox.inner.submit(generation, work, scope, budget)
+    }
+
+    /// A new view for one worker, unbound until [`WorkerDirectory::install`].
+    pub fn view(self: &Arc<Self>) -> WorkerDirectory {
+        WorkerDirectory {
+            shared: self.clone(),
+            local: RefCell::new(None),
+        }
+    }
+}
+
+// PeerServer owns local services through Rc; retain this worker's directory view.
 impl LocalPageService for Arc<WorkerDirectory> {
     fn serve_peer<'a>(
         &'a self,
@@ -1966,7 +1980,7 @@ mod tests {
                 if !submit_before_poll {
                     endpoint.poll(&mut cx, 0).unwrap();
                 }
-                let sender = directory.clone();
+                let sender = directory.node().clone();
                 let mut receipt = std::thread::spawn(move || {
                     sender
                         .submit(
@@ -2225,7 +2239,8 @@ mod tests {
         fn sync<T: Sync>() {}
         send::<Command>();
         send::<Completion>();
-        send::<WorkerDirectory>();
-        sync::<WorkerDirectory>();
+        // Only the node-wide state crosses threads; each worker owns its view.
+        send::<Arc<NodeDirectory>>();
+        sync::<NodeDirectory>();
     }
 }

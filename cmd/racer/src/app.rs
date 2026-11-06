@@ -49,6 +49,7 @@ use crate::peer::transport::Transfers;
 use crate::rdma::Links;
 use crate::read::Coordinator;
 use crate::read::candidates::CandidatePolicy;
+use crate::read::dispatch::NodeDirectory;
 use crate::read::dispatch::WorkerDirectory;
 use crate::read::dispatch::WorkerEndpoint;
 use crate::read::dispatch::WorkerMap;
@@ -172,7 +173,7 @@ pub struct NodeState {
 
     control_worker: WorkerId,
 
-    workers: Arc<WorkerDirectory>,
+    workers: Arc<NodeDirectory>,
 
     count: usize,
 
@@ -254,7 +255,7 @@ impl NodeState {
             keys: Arc::new(KeyEpochs::with_clock(crate::enrollment::wall_clock(&clock))),
             control_worker: WorkerId(0),
             cache_rollout: crate::app::rollout::Rollout::new(workers.iter().copied()),
-            workers: Arc::new(WorkerDirectory::new(map, workers, capacity, ctx)?),
+            workers: Arc::new(NodeDirectory::new(map, workers, capacity, ctx)?),
             count,
             prepared: AtomicUsize::new(0),
             checkpoint: Mutex::new(CheckpointCut::default()),
@@ -1354,6 +1355,9 @@ impl WorkerApplication {
             reactor.ctx().rng.clone(),
         ));
         let is_sampler = worker == node.control_worker;
+        // This worker's own view of the node directory; it binds this worker's
+        // coordinator when the endpoint installs.
+        let directory = Arc::new(node.workers.view());
         let node_pressure = node.pressure.clone();
         let control = if worker == node.control_worker {
             Some(Self::assemble_control(
@@ -1568,7 +1572,6 @@ impl WorkerApplication {
         ));
         let (coordinator, metadata) = Self::assemble_reads(
             config,
-            &node,
             snapshots.clone(),
             availability,
             delivery.clone(),
@@ -1584,7 +1587,7 @@ impl WorkerApplication {
                 crypto: crypto.clone(),
                 credentials: credentials.clone(),
                 admission: admission.clone(),
-                metadata_owner: node.workers.clone(),
+                metadata_owner: directory.clone(),
             },
         );
         let relay = Rc::new(Relay::new(
@@ -1602,7 +1605,7 @@ impl WorkerApplication {
             io.clone(),
             forwarding,
             admission.clone(),
-            Rc::new(node.workers.clone()),
+            Rc::new(directory.clone()),
             relay,
             wire,
             signatures,
@@ -1681,7 +1684,7 @@ impl WorkerApplication {
                 .map(|managed| (managed.report.clone(), config.shares.get())),
             rdma_withdrawn: false,
             telemetry: Rc::new(telemetry),
-            directory: node.workers.clone(),
+            directory: directory.clone(),
             node,
             endpoint: None,
             control_task: None,
@@ -1733,13 +1736,13 @@ impl WorkerApplication {
     /// Connect shared publication state to worker-local read and metadata services.
     fn assemble_reads(
         config: &Config,
-        node: &NodeState,
         snapshots: Rc<PublicationTarget>,
         availability: Rc<crate::control::Availability>,
         delivery: Rc<Delivery>,
         metrics: &crate::telemetry::Metrics,
         dependencies: FillDependencies,
     ) -> (Rc<Coordinator>, Rc<MetadataService>) {
+        let directory = dependencies.metadata_owner.clone();
         let candidates = dependencies.candidates.clone();
         let drivers = candidates.drivers().clone();
         let origin = dependencies.origin.clone();
@@ -1755,11 +1758,11 @@ impl WorkerApplication {
             MetadataDependencies {
                 index,
                 fill: fill.clone(),
-                owners: node.workers.clone(),
+                owners: directory.clone(),
             },
         ));
         let streams = Rc::new(RangeStreams::new(
-            node.workers.clone(),
+            directory.clone(),
             delivery,
             config.limits.range_window_pages.get(),
             drivers,

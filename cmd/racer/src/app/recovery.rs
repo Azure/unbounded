@@ -605,7 +605,7 @@ impl WorkerApplication {
 fn select(
     candidates: impl IntoIterator<Item = CheckpointImage>,
     geometry: &HashMap<WorkerId, CheckpointGeometry>,
-    workers: &WorkerDirectory,
+    workers: &crate::read::dispatch::NodeDirectory,
     (page_capacity, metadata_capacity): (usize, usize),
     keys: &Keyring,
     caches: &[racer_wire::control::CacheDefinition],
@@ -640,7 +640,7 @@ fn select(
 fn validate_candidate(
     mut image: CheckpointImage,
     geometry: &HashMap<WorkerId, CheckpointGeometry>,
-    workers: &WorkerDirectory,
+    workers: &crate::read::dispatch::NodeDirectory,
     (page_capacity, metadata_capacity): (usize, usize),
     keys: &Keyring,
     caches: &[racer_wire::control::CacheDefinition],
