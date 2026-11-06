@@ -1,4 +1,4 @@
-//! Model fidelity: the ported racer-sim scenario, its report, and determinism.
+//! Model fidelity: a scenario, its report, and determinism.
 use racer_dst::{
     Choices, Scenario,
     choices::Source,
@@ -9,7 +9,7 @@ use racer_dst::{
 };
 
 #[test]
-fn concurrent_cold_readers_report_matches_racer_sim_invariants() {
+fn concurrent_cold_readers_report_holds_invariants() {
     let scenario = scenarios::concurrent_cold_readers();
     assert_eq!(scenario.fidelity, Fidelity::Model);
     let (outcome, report) = model::run(&scenario, Choices::seeded(2));
@@ -61,7 +61,7 @@ fn model_scenario_checks_fail_the_run() {
 }
 
 /// A crypto queue far below production's sheds request verifications at the owners with the
-/// unsigned overload head (racer-sim `verification_sheds_send_readers_to_helpers`): every read
+/// unsigned overload head: every read
 /// ends and origin traffic stays bounded.
 #[test]
 fn verification_sheds_end_every_read() {

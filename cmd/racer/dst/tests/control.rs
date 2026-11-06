@@ -1,8 +1,8 @@
-//! Model control scenarios: racer-sim's control plans at small sizes, and a
-//! report dump for parity runs against racer-sim.
+//! Model control scenarios: the control plans at small sizes, and report
+//! dumps for runs at larger sizes.
 use racer_dst::{Choices, engine::SECONDS, model, scenarios};
 
-/// racer-sim's `control_scenarios_run_from_the_cli`: every plan at 40 Pods
+/// Every plan at 40 Pods
 /// for 60 s runs without a hard invariant failure.
 #[test]
 fn control_plans_run_clean_at_40_pods() {
@@ -19,11 +19,10 @@ fn control_plans_run_clean_at_40_pods() {
     }
 }
 
-/// Write the report of `CTL_PLAN` (racer-sim plan name) at `CTL_NODES` Pods
-/// and `CTL_SEED` to `CTL_OUT` (stdout if unset), for the parity table in
-/// `dst/MODEL.md`.
+/// Write the report of `CTL_PLAN` (a control plan name) at `CTL_NODES` Pods
+/// and `CTL_SEED` to `CTL_OUT` (stdout if unset).
 #[test]
-#[ignore = "parity: run with --ignored --nocapture"]
+#[ignore = "report: run with --ignored --nocapture"]
 fn control_report() {
     let var = |k: &str| std::env::var(k).ok();
     let plan: &'static str =
@@ -47,7 +46,7 @@ fn control_report() {
 /// `CTL_NODES`, `CTL_RATE` reads per node per second, `CTL_SECS` and
 /// `CTL_SEED` to `CTL_OUT` (stdout if unset).
 #[test]
-#[ignore = "parity: run with --ignored --nocapture"]
+#[ignore = "report: run with --ignored --nocapture"]
 fn combined_report() {
     let var = |k: &str| std::env::var(k).ok();
     let name = var("CTL_PLAN").unwrap_or_else(|| "full-cold-start".into());

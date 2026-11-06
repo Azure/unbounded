@@ -11,7 +11,7 @@ name: racer nightly
 # - dst: the deterministic simulation seed set widened to DST_SEEDS seeds per
 #   scenario (`make racer-dst`); every seed runs twice and must match.
 # - model-scale: the ignored large Model tests in
-#   cmd/racer/dst/tests/model_parity.rs (hot-page storm on a large pool, the
+#   cmd/racer/dst/tests/model_scenarios.rs (hot-page storm on a large pool, the
 #   2000-node cold start) and the per-node memory check at 5x10^4 nodes.
 on:
   workflow_dispatch:
@@ -132,7 +132,7 @@ jobs:
       - name: Large Model scenarios
         run: >-
           timeout --signal=TERM --kill-after=10s 2400s
-          cargo +1.96.0 test --release --locked --manifest-path cmd/racer/Cargo.toml -p racer-dst --test model_parity
+          cargo +1.96.0 test --release --locked --manifest-path cmd/racer/Cargo.toml -p racer-dst --test model_scenarios
           -- --ignored --exact --nocapture
           mesh_hot_page_storm_stays_bounded_on_a_large_pool cold_start_2000
 
@@ -142,6 +142,6 @@ jobs:
           MODEL_NODES: "50000"
         run: >-
           timeout --signal=TERM --kill-after=10s 2400s
-          cargo +1.96.0 test --release --locked --manifest-path cmd/racer/Cargo.toml -p racer-dst --test model_parity
+          cargo +1.96.0 test --release --locked --manifest-path cmd/racer/Cargo.toml -p racer-dst --test model_scenarios
           -- --ignored --exact --nocapture --test-threads=1
           model_memory_per_node

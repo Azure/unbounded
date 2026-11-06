@@ -1,10 +1,9 @@
-//! Ports of racer-sim's combined scenario tests (`sim/src/combined.rs` `tests`) to the Model's
-//! combined scenarios (`scenarios::combined`); `dst/MODEL.md` (racer-sim inventory) lists what
-//! is ported and what is not.
+//! Combined scenario tests: control plans co-stepped with the Model read path
+//! (`scenarios::combined`).
 use racer_dst::{Choices, model, scenarios};
 use serde_json::Value;
 
-/// racer-sim `quick`: `scenario` at `nodes`, `secs` and `rate` reads per node per second.
+/// `scenario` at `nodes`, `secs` and `rate` reads per node per second.
 fn quick(scenario: &str, nodes: u32, secs: u64, seed: u64, rate: f64) -> Value {
     let scenario = scenarios::combined(scenario, nodes, rate, Some(secs));
     let (outcome, report) = model::run(&scenario, Choices::seeded(seed));
@@ -30,7 +29,6 @@ fn assert_clean(r: &Value) {
     );
 }
 
-/// racer-sim `cold_start_reads_after_enrollment`.
 #[test]
 fn cold_start_reads_after_enrollment() {
     let r = quick("full-cold-start", 200, 120, 1, 0.05);
@@ -46,7 +44,6 @@ fn cold_start_reads_after_enrollment() {
     assert!(max <= topology::REPLICAS as u64 * 2, "{max}");
 }
 
-/// racer-sim `failover_crashes_data_nodes_too`.
 #[test]
 fn failover_crashes_data_nodes_too() {
     let r = quick("full-failover", 200, 300, 1, 0.2);
@@ -56,7 +53,7 @@ fn failover_crashes_data_nodes_too() {
     assert!(counter(&r, "reads_completed") >= 1);
 }
 
-/// racer-sim `failover_repeats_are_skips_or_their_orphans`: in a failover run every repeated
+/// In a failover run every repeated
 /// origin request is classified, and every repeat while the previous fetcher still held the
 /// page is a skip (an owner above rank 0 that fetched after evidence against rank 0) or the
 /// rank 0 refetch such a skip leaves behind (an orphan).
@@ -87,7 +84,7 @@ fn failover_repeats_are_skips_or_their_orphans() {
         assert!(skips > 0, "{o}");
         assert!(orphans <= skips, "{o}");
         assert!(held <= skips + orphans, "{o}");
-        // The Model never cancels an origin request (racer-sim `origin_canceled`).
+        // The Model never cancels an origin request.
         let failures =
             counter(&r, "origin_5xx") + counter(&r, "origin_412") + counter(&r, "origin_403");
         assert!(n(&repeats["after_failure"]) <= failures, "{o}");
@@ -101,7 +98,7 @@ fn failover_repeats_are_skips_or_their_orphans() {
     }
 }
 
-/// racer-sim `churn_grows_the_data_plane`. The Model has no `membership_adoptions` counter;
+/// The Model has no `membership_adoptions` counter;
 /// a node adopts exactly what its client applied (`dst/MODEL.md`, Combined scenarios).
 #[test]
 fn churn_grows_the_data_plane() {
@@ -116,7 +113,6 @@ fn churn_grows_the_data_plane() {
     assert!(counter(&r, "reads_completed") >= 1);
 }
 
-/// racer-sim `lagging_clients_skew_the_data_plane`.
 #[test]
 fn lagging_clients_skew_the_data_plane() {
     let r = quick("full-lagging", 300, 600, 1, 0.2);
@@ -133,9 +129,9 @@ fn lagging_clients_skew_the_data_plane() {
     );
 }
 
-/// racer-sim `data_faults_join_the_control_plans`: the combined plans carry data-plane faults
-/// by default and `"combined_faults"` turns them off. racer-sim's explicit `faults` list has no
-/// Model counterpart (scenario faults are set in code).
+/// The combined plans carry data-plane faults
+/// by default and `"combined_faults"` turns them off. Explicit
+/// faults beyond these are set in code, not in the config.
 #[test]
 fn data_faults_join_the_control_plans() {
     use racer_dst::scenarios::{DataFaults, combined_with};
@@ -181,7 +177,6 @@ fn data_faults_join_the_control_plans() {
     );
 }
 
-/// racer-sim `replays_exactly`.
 #[test]
 fn replays_exactly() {
     let run = |name: &str, seed: u64| {
@@ -201,7 +196,7 @@ fn replays_exactly() {
     assert_ne!(run("full-churn", 3).0.trace, run("full-churn", 4).0.trace);
 }
 
-/// racer-sim `failover_drops_the_dead_member`: the Pod crashed for good at `d / 2 + 5 s` leaves
+/// The Pod crashed for good at `d / 2 + 5 s` leaves
 /// the membership once its Node has been not ready for the grace, so peers stop choosing it.
 #[test]
 fn failover_drops_the_dead_member() {

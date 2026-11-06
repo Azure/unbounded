@@ -1,5 +1,4 @@
-//! Model ports of racer-sim scenarios: each runs with its racer-sim invariants (the scenario
-//! checks) and prints its report; `dst/MODEL.md` compares the numbers with racer-sim.
+//! Model scenarios: each runs with its scenario checks and prints its report.
 use racer_dst::{Choices, Scenario, model, scenarios};
 
 fn run(scenario: Scenario, seed: u64) -> serde_json::Value {
@@ -16,7 +15,7 @@ fn run(scenario: Scenario, seed: u64) -> serde_json::Value {
 fn origin_forbidden_fails_only_the_leader() {
     let report = run(scenarios::origin_forbidden(), 11);
     let counters = &report["metrics"]["counters"];
-    // Each 403 fails only its leader and re-elects a waiter (racer-sim `flight_reelected`). A
+    // Each 403 fails only its leader and re-elects a waiter. A
     // leader whose walk fails otherwise (shed by every owner) re-elects a waiter too.
     let reelected = counters["flights_reelected"].as_u64().unwrap();
     let forbidden = counters["origin_403"].as_u64().unwrap();
@@ -35,7 +34,7 @@ fn hot_page_storm_fans_out_through_helpers() {
     assert_hot_page_fanin_bounded(&report);
 }
 
-/// racer-sim `assert_bounded_hot_page_storm`: peak fan-in for the hot page is at most the exempt
+/// Peak fan-in for the hot page is at most the exempt
 /// cap plus the other owners (`designs/racer-mesh-v2.md`, Hot keys). It holds because an owner
 /// counts an admitted body request from admission, including while it waits on the fill
 /// (production `PeerServer::dispatch_verified`, Model `serve_admitted`), not only once its body
@@ -53,7 +52,7 @@ fn assert_hot_page_fanin_bounded(report: &serde_json::Value) {
     );
 }
 
-/// racer-sim `mesh_hot_page_storm_stays_bounded_on_a_large_pool` (seed 4): the hot page storm on
+/// The hot page storm on
 /// 2,048 nodes, where a column (about 64 nodes) is twice the shed threshold, so without the exempt
 /// cap the column alone would pile onto the owner. Every read completes, origin is asked once and
 /// fan-in stays bounded.
@@ -64,9 +63,7 @@ fn mesh_hot_page_storm_stays_bounded_on_a_large_pool() {
     assert_hot_page_fanin_bounded(&report);
 }
 
-/// racer-sim `owners_above_rank_zero_do_not_overlap_a_slow_origin_fetch` and
-/// `relay_shed_rank0_probes_do_not_overlap_a_slow_origin_fetch` (seed 3): under a slow origin,
-/// owners above rank 0 join rank 0's fill through their copy-only probes, so every page is asked
+/// Under a slow origin, owners above rank 0 join rank 0's fill through their copy-only probes, so every page is asked
 /// of origin once.
 #[test]
 fn owners_above_rank_zero_do_not_overlap_a_slow_origin_fetch() {
@@ -151,9 +148,8 @@ fn faults_end_every_read() {
     println!("{:#}", report["coverage"]);
 }
 
-/// Peak RSS per node of a Model cold start at `MODEL_NODES` nodes (default 10,000); compare with
-/// racer-sim's ~103 KB/node at 5x10^4 nodes. Run alone:
-/// `MODEL_NODES=50000 cargo test --release -p racer-dst --test model_parity model_memory -- --ignored --nocapture`.
+/// Peak RSS per node of a Model cold start at `MODEL_NODES` nodes (default 10,000). Run alone:
+/// `MODEL_NODES=50000 cargo test --release -p racer-dst --test model_scenarios model_memory -- --ignored --nocapture`.
 #[test]
 #[ignore = "large: run alone with --release --ignored"]
 fn model_memory_per_node() {
@@ -213,10 +209,10 @@ fn model_memory_per_node() {
     );
 }
 
-/// One line per parity scenario with the numbers `dst/MODEL.md` tabulates.
+/// One line per scenario with its headline numbers.
 #[test]
 #[ignore = "summary: run with --release --ignored --nocapture"]
-fn parity_summary() {
+fn scenario_summary() {
     let cases = [
         (scenarios::concurrent_cold_readers(), 2),
         (scenarios::cold_start(400), 8),
@@ -347,11 +343,10 @@ fn range_deadline_discards_held_pages() {
     );
 }
 
-/// Gap closed by link circuits (`dst/MODEL.md`, Combined scenarios, Parity): `full-failover`
+/// Gap closed by link circuits (`dst/MODEL.md`, Combined scenarios): `full-failover`
 /// cuts sites 0 and 1. Production opens a worker's circuit to a peer whose connect failed
 /// (`src/peer.rs` `request_network`, `src/topology.rs` `LinkHealth`) and routes around it
-/// (`Paths::blocked`). Without circuits the Model failed 86 reads at seed 8 against racer-sim's
-/// 12; with them it fails 13.
+/// (`Paths::blocked`). With circuits off, more reads fail at seed 8.
 #[test]
 fn site_cut_opens_link_circuits_and_routes_around() {
     let measure = |circuits: bool| {
@@ -374,7 +369,7 @@ fn site_cut_opens_link_circuits_and_routes_around() {
         failed < failed_off,
         "{failed} reads failed, {failed_off} without circuits"
     );
-    // racer-sim fails 12 reads at this seed; the scale tolerance is 2x.
+    // An absolute bound on failures at this seed.
     assert!(failed <= 24, "{failed} reads failed");
 }
 
@@ -401,7 +396,7 @@ fn counter(r: &serde_json::Value, k: &str) -> u64 {
     r["metrics"]["counters"][k].as_u64().unwrap_or(0)
 }
 
-/// racer-sim `single_reader_then_storm_reuses_copies` (seed 7): one reader fetches an object,
+/// One reader fetches an object,
 /// then every node reads it; the origin sees each page once.
 #[test]
 fn single_reader_then_storm_reuses_copies() {
@@ -419,7 +414,7 @@ fn single_reader_then_storm_reuses_copies() {
     assert!(counter(&r, "relays") + counter(&r, "peer_pages") > 0);
 }
 
-/// racer-sim `cold_storm_bounds_origin_per_page` (seed 3): a 300-node cold storm reaches the
+/// A 300-node cold storm reaches the
 /// origin at most `REPLICAS` times per page.
 #[test]
 fn cold_storm_bounds_origin_per_page() {
@@ -437,9 +432,9 @@ fn cold_storm_bounds_origin_per_page() {
     assert!(counter(&r, "flight_joins") > 0);
 }
 
-/// racer-sim `origin_errors_follow_the_fill_plan` (seed 4): 403 and 5xx fail the fill
-/// (`fills_failed`), and 403 fails reads `OriginForbidden`. racer-sim's `remaining_walks`
-/// (412 continuing the walk) has no Model counter.
+/// 403 and 5xx fail the fill
+/// (`fills_failed`), and 403 fails reads `OriginForbidden`. A 412 continuing the walk
+/// has no Model counter.
 #[test]
 fn origin_errors_follow_the_fill_plan() {
     use racer_dst::{engine::SECONDS, resources::OriginErrors};
@@ -463,7 +458,7 @@ fn origin_errors_follow_the_fill_plan() {
     assert!(r["metrics"]["errors"]["OriginForbidden"].as_u64() > Some(0));
 }
 
-/// racer-sim `full_outbound_pools_refuse_links` (seed 8): with production connection slots, a
+/// With production connection slots, a
 /// 400-node cold storm within 10 ms makes outbound pools refuse links past their per-endpoint cap
 /// (`Overloaded`, production `checkout_with_state`); with slots off nothing is counted.
 #[test]
@@ -494,12 +489,12 @@ fn full_outbound_pools_refuse_links() {
     }
 }
 
-/// racer-sim `expired_leaders_hand_their_fill_to_later_waiters` (seed 7): origin at 1 MiB/s is
+/// Origin at 1 MiB/s is
 /// slower than the read deadline while 16 readers arrive every second for 12 s. An expired
 /// leader's fill keeps running for later waiters (`WorkerCore::poll` passes `Wait::Lead` through
 /// `allow_handover` and `retain_operation`, `core/src/read/worker.rs`), so no page is fetched
-/// again while its fill runs. racer-sim compares handover on and off; production has no switch
-/// and the Model never cancels an origin request, so the port checks the handover side only.
+/// again while its fill runs. Production has no switch to
+/// turn handover off and the Model never cancels an origin request, so only handover is checked.
 #[test]
 fn expired_leaders_hand_their_fill_to_later_waiters() {
     use racer_dst::engine::{MILLIS, SECONDS};
@@ -558,7 +553,7 @@ fn run_costs(
     run(storms(name, nodes, end, spec).costs(costs), seed)
 }
 
-/// racer-sim `cold_nodes_contend_for_one_global_origin` (seed 1): each of 8 nodes reads a distinct
+/// Each of 8 nodes reads a distinct
 /// cold object, so every byte comes from the one shared origin server. Slowing it slows the fleet,
 /// and the last read cannot finish before the origin has sent every byte once.
 #[test]
@@ -597,7 +592,7 @@ fn cold_nodes_contend_for_one_global_origin() {
     );
 }
 
-/// racer-sim `warm_peer_fanout_is_limited_by_source_node_network` (seed 3): one node warms a
+/// One node warms a
 /// one-page object, then all 17 nodes read it at once over 64 MiB/s NICs. Origin is asked at most
 /// once per owner, peers serve the copies, and the few sources serialize them on their NICs: the
 /// fanout takes at least the aggregate NIC floor and far longer than one reader.
@@ -635,7 +630,7 @@ fn warm_peer_fanout_is_limited_by_source_node_network() {
     );
 }
 
-/// racer-sim `workers_share_node_network_bandwidth` (seed 5): NIC service is per node, not per
+/// NIC service is per node, not per
 /// worker, so four workers do not multiply a node's bandwidth for a fanout.
 #[test]
 fn workers_share_node_network_bandwidth() {
