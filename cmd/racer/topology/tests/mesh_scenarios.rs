@@ -499,14 +499,14 @@ fn sorted_difference_counts_missing_items() {
 
 #[test]
 fn full_mesh_degrees_and_routes() {
-    let report = MeshScenario::new(64, 256, 2).run();
-    assert_eq!(report.degree.min, 63);
-    assert_eq!(report.degree.max, 63);
+    let report = MeshScenario::new(256, 256, 2).run();
+    assert_eq!(report.degree.min, 255);
+    assert_eq!(report.degree.max, 255);
     assert_eq!(report.pools[0].routes.max_links(), 1);
     // A leave in a full mesh removes exactly the member's own edges.
-    assert_eq!(report.per_leave.max, 63);
-    // A join to 65 members splits the full mesh into columns.
-    assert!(report.per_join.max > 63, "{:?}", report.per_join);
+    assert_eq!(report.per_leave.max, 255);
+    // A join to 257 members splits the full mesh into columns.
+    assert!(report.per_join.max > 255, "{:?}", report.per_join);
 }
 
 #[test]
@@ -535,7 +535,13 @@ fn rdma_needs_a_shared_site() {
 /// The spec's table of peers per node (one Site).
 #[test]
 fn degree_matches_the_spec_table() {
-    for (nodes, table) in [(64, 63.0), (256, 45.0), (1024, 93.0)] {
+    for (nodes, table) in [
+        (64, 63.0),
+        (150, 149.0),
+        (256, 255.0),
+        (257, 45.0),
+        (1024, 93.0),
+    ] {
         assert_default_pool(nodes, 1024, Some(table));
     }
 }
@@ -556,7 +562,7 @@ fn default_pool_of_20k_routes_in_two_links() {
 }
 
 /// A 256 member selector pool inside a 20k cluster: reads between its members stay within the
-/// pool and take at most 2 links, and its peers per node inside the pool match a 256 member pool.
+/// pool and take at most 2 links, and the pool is a full mesh of 255 peers per node.
 /// Selector pools rank first for RDMA, so with one Site nearly all its links are RDMA.
 #[test]
 fn selector_pool_in_a_20k_cluster_stays_in_the_pool() {
@@ -574,7 +580,11 @@ fn selector_pool_in_a_20k_cluster_stays_in_the_pool() {
     assert_eq!(routes.long, 0);
     assert!(routes.max_links() <= 2);
     let mean = pool.pool_degree.mean;
-    assert!((mean - 45.0).abs() <= 45.0 * 0.03, "{:?}", pool.pool_degree);
+    assert!(
+        (mean - 255.0).abs() <= 255.0 * 0.03,
+        "{:?}",
+        pool.pool_degree
+    );
     assert!(routes.rdma_fraction() > 0.95, "{routes:?}");
 }
 
@@ -607,11 +617,11 @@ fn churn_changes_few_edges_at_20k() {
     }
 }
 
-/// Crossing a power of four changes the column count, so most edges move. This is rare (pool sizes
-/// 256, 1024, 4096, ...), and the spec accepts it.
+/// Crossing a power of four, or the full mesh limit, changes the column count, so most edges
+/// move. This is rare (pool sizes 256, 1024, 4096, ...), and the spec accepts it.
 #[test]
 fn crossing_a_power_of_four_rebuilds_the_mesh() {
-    let s = MeshScenario::new(256, 0, 0);
+    let s = MeshScenario::new(257, 0, 0);
     let full = s.membership(Change::None);
     let left = s.membership(Change::Leave(7));
     let (edges, members) = churn(&full, &left);

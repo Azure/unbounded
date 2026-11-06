@@ -16,13 +16,13 @@ use sha2::Digest;
 use std::{mem::size_of, sync::Arc};
 
 /// Pools of up to this many members are one column: a full mesh.
-pub const FULL_MESH_MAX: usize = 64;
+pub const FULL_MESH_MAX: usize = 256;
 
 /// Ring points each member puts on its column's ring.
 pub const POINTS: u32 = 16;
 
 /// Most RDMA peers a node takes (queue pairs per device).
-pub const RDMA_PEERS: usize = 128;
+pub const RDMA_PEERS: usize = 256;
 
 /// Hash prefix for a member's column choice.
 const COLUMN_DOMAIN: &[u8] = b"/mesh/v2/column\0";
@@ -670,8 +670,9 @@ mod tests {
     fn columns_change_only_at_powers_of_four() {
         for (k, c, t) in [
             (64, 1, 64),
-            (65, 8, 9),
-            (256, 16, 16),
+            (65, 1, 65),
+            (256, 1, 256),
+            (257, 16, 17),
             (1024, 32, 32),
             (4096, 64, 64),
             (20_000, 128, 157),
@@ -679,8 +680,8 @@ mod tests {
         ] {
             assert_eq!(target_columns(k), (c, t), "k={k}");
         }
-        let mut previous = target_columns(65).0;
-        for k in 66..70_000 {
+        let mut previous = target_columns(FULL_MESH_MAX + 1).0;
+        for k in FULL_MESH_MAX + 2..70_000 {
             let c = target_columns(k).0;
             if c != previous {
                 assert!(k.is_power_of_two() && k.trailing_zeros() % 2 == 0, "k={k}");
