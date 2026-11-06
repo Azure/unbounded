@@ -22,24 +22,62 @@ metadata:
     app.kubernetes.io/name: unbounded-machineallocation-controller
     app.kubernetes.io/component: controller
 rules:
-  - apiGroups: ["unbounded-cloud.io"]
-    resources: ["machineallocations"]
-    verbs: ["get", "list", "watch", "patch"]
-  - apiGroups: ["unbounded-cloud.io"]
-    resources: ["machineallocations/status"]
-    verbs: ["get", "update", "patch"]
-  - apiGroups: ["unbounded-cloud.io"]
-    resources: ["machineclasses", "sites", "machineconfigurationversions"]
-    verbs: ["get", "list", "watch"]
-  - apiGroups: ["unbounded-cloud.io"]
-    resources: ["machines"]
-    verbs: ["get", "list", "watch", "create", "patch", "allocate"]
-  - apiGroups: ["unbounded-cloud.io"]
-    resources: ["machineoperations"]
-    verbs: ["get", "list", "watch", "create", "patch"]
-  - apiGroups: [""]
-    resources: ["nodes"]
-    verbs: ["get", "list", "watch"]
+  - apiGroups:
+      - "unbounded-cloud.io"
+    resources:
+      - "machineallocations"
+    verbs:
+      - "get"
+      - "list"
+      - "watch"
+      - "patch"
+  - apiGroups:
+      - "unbounded-cloud.io"
+    resources:
+      - "machineallocations/status"
+    verbs:
+      - "get"
+      - "update"
+      - "patch"
+  - apiGroups:
+      - "unbounded-cloud.io"
+    resources:
+      - "machineclasses"
+      - "sites"
+      - "machineconfigurationversions"
+    verbs:
+      - "get"
+      - "list"
+      - "watch"
+  - apiGroups:
+      - "unbounded-cloud.io"
+    resources:
+      - "machines"
+    verbs:
+      - "get"
+      - "list"
+      - "watch"
+      - "create"
+      - "patch"
+      - "allocate"
+  - apiGroups:
+      - "unbounded-cloud.io"
+    resources:
+      - "machineoperations"
+    verbs:
+      - "get"
+      - "list"
+      - "watch"
+      - "create"
+      - "patch"
+  - apiGroups:
+      - ""
+    resources:
+      - "nodes"
+    verbs:
+      - "get"
+      - "list"
+      - "watch"
 
 ---
 # Bind unbounded-machineallocation-controller-provider-config with a
@@ -55,9 +93,15 @@ metadata:
     app.kubernetes.io/name: unbounded-machineallocation-controller
     app.kubernetes.io/component: controller
 rules:
-  - apiGroups: [""]
-    resources: ["configmaps"]
-    verbs: ["get", "list", "watch", "patch"]
+  - apiGroups:
+      - ""
+    resources:
+      - "configmaps"
+    verbs:
+      - "get"
+      - "list"
+      - "watch"
+      - "patch"
 
 ---
 # Bind unbounded-machineallocation-controller-bootstrap-tokens with a
@@ -74,9 +118,14 @@ metadata:
     app.kubernetes.io/name: unbounded-machineallocation-controller
     app.kubernetes.io/component: controller
 rules:
-  - apiGroups: [""]
-    resources: ["secrets"]
-    verbs: ["get", "create", "delete"]
+  - apiGroups:
+      - ""
+    resources:
+      - "secrets"
+    verbs:
+      - "get"
+      - "create"
+      - "delete"
 
 ---
 # Bind unbounded-machineallocation-operations with a ClusterRoleBinding to the
@@ -92,12 +141,18 @@ metadata:
     app.kubernetes.io/name: unbounded-machineallocation-operations
     app.kubernetes.io/component: controller
 rules:
-  - apiGroups: ["unbounded-cloud.io"]
-    resources: ["machineallocations"]
-    verbs: ["get"]
-  - apiGroups: ["unbounded-cloud.io"]
-    resources: ["sites"]
-    verbs: ["get"]
+  - apiGroups:
+      - "unbounded-cloud.io"
+    resources:
+      - "machineallocations"
+    verbs:
+      - "get"
+  - apiGroups:
+      - "unbounded-cloud.io"
+    resources:
+      - "sites"
+    verbs:
+      - "get"
 
 ---
 # Bind unbounded-machineallocation-operations-bootstrap-tokens with a
@@ -111,6 +166,9 @@ metadata:
     app.kubernetes.io/name: unbounded-machineallocation-operations
     app.kubernetes.io/component: controller
 rules:
-  - apiGroups: [""]
-    resources: ["secrets"]
-    verbs: ["get"]
+  - apiGroups:
+      - ""
+    resources:
+      - "secrets"
+    verbs:
+      - "get"

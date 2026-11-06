@@ -20,10 +20,15 @@ spec:
   failurePolicy: Fail
   matchConstraints:
     resourceRules:
-      - apiGroups: [""]
-        apiVersions: ["v1"]
-        operations: ["CREATE", "DELETE"]
-        resources: ["secrets"]
+      - apiGroups:
+          - ""
+        apiVersions:
+          - "v1"
+        operations:
+          - "CREATE"
+          - "DELETE"
+        resources:
+          - "secrets"
     namespaceSelector:
       matchLabels:
         kubernetes.io/metadata.name: kube-system
@@ -45,4 +50,5 @@ metadata:
   name: unbounded-machineallocation-bootstrap-tokens
 spec:
   policyName: unbounded-machineallocation-bootstrap-tokens
-  validationActions: ["Deny"]
+  validationActions:
+    - "Deny"

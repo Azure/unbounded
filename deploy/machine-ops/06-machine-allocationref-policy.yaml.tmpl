@@ -11,10 +11,14 @@ spec:
   failurePolicy: Fail
   matchConstraints:
     resourceRules:
-      - apiGroups: ["unbounded-cloud.io"]
-        apiVersions: ["*"]
-        operations: ["CREATE"]
-        resources: ["machines"]
+      - apiGroups:
+          - "unbounded-cloud.io"
+        apiVersions:
+          - "*"
+        operations:
+          - "CREATE"
+        resources:
+          - "machines"
   validations:
     - expression: "!has(object.spec) || !has(object.spec.allocationRef) || authorizer.group('unbounded-cloud.io').resource('machines').check('allocate').allowed()"
       message: "only an identity granted the allocate verb on machines may set spec.allocationRef"
@@ -27,4 +31,5 @@ metadata:
   name: unbounded-machine-allocationref
 spec:
   policyName: unbounded-machine-allocationref
-  validationActions: ["Deny"]
+  validationActions:
+    - "Deny"
