@@ -14,6 +14,12 @@
 //! and for one Lease duration plus one certificate lifetime after that, capped
 //! at its NotAfter. A removed root is listed as retired until its NotAfter so a
 //! stale Lease annotation can never add it back.
+//!
+//! When all [`MAX_ROOTS`] slots are taken, a new offer evicts the root not
+//! offered in this pass with the earliest `retain_until`; the evicted root is
+//! retired like any other removed root. An offer is refused only when every
+//! slot holds a currently offered root. Certificates from an evicted issuer
+//! stop verifying before their retention would have ended.
 
 use crate::entropy::Entropy;
 use base64::{Engine, engine::general_purpose::STANDARD};
@@ -422,8 +428,10 @@ fn prune_decrypt(keys: &mut Vec<CacheEncryptionKey>, retained: usize) {
 pub struct Plan {
     pub durable: Durable,
     pub changed: bool,
-    /// Offers refused because [`MAX_ROOTS`] was reached.
+    /// Offers refused because every [`MAX_ROOTS`] slot holds an offered root.
     pub refused_roots: usize,
+    /// Roots no longer offered that were evicted early to make room.
+    pub evicted_roots: usize,
 }
 
 /// Compute the next keyring. `catalog` must already be admitted.
@@ -539,6 +547,8 @@ pub fn plan_with(
     let min_life = (policy.certificate_lifetime + SKEW).as_secs();
     d.retired.retain(|r| r.until > now);
     let mut refused = 0;
+    let mut evicted = 0;
+    let offered: BTreeSet<String> = offers.iter().map(|o| STANDARD.encode(&o.der)).collect();
     for offer in offers {
         let encoded = STANDARD.encode(&offer.der);
         if let Some(r) = d.roots.iter_mut().find(|r| r.der == encoded) {
@@ -564,8 +574,27 @@ pub fn plan_with(
             continue;
         }
         if d.roots.len() >= MAX_ROOTS {
-            refused += 1;
-            continue;
+            // Evict the departed root closest to removal anyway.
+            let victim = d
+                .roots
+                .iter()
+                .enumerate()
+                .filter(|(_, r)| !offered.contains(&r.der))
+                .min_by_key(|(_, r)| r.retain_until)
+                .map(|(i, _)| i);
+            let Some(i) = victim else {
+                refused += 1;
+                continue;
+            };
+            let r = d.roots.remove(i);
+            let der = STANDARD.decode(&r.der).unwrap_or_default();
+            if r.not_after > now {
+                d.retired.push(Retired {
+                    sha256: sha256(&der),
+                    until: r.not_after,
+                });
+            }
+            evicted += 1;
         }
         d.roots.push(Root {
             der: encoded,
@@ -620,6 +649,7 @@ pub fn plan_with(
         durable: d,
         changed,
         refused_roots: refused,
+        evicted_roots: evicted,
     })
 }
 
@@ -936,6 +966,98 @@ pub(crate) mod tests {
         let p = plan(&policy(), &Durable::default(), &[], &offers, t).unwrap();
         assert_eq!(p.durable.roots.len(), MAX_ROOTS);
         assert_eq!(p.refused_roots, 2);
+    }
+
+    #[test]
+    fn full_keyring_evicts_departed_roots_for_new_offers() {
+        let t = now();
+        let stale: Vec<_> = (0..MAX_ROOTS)
+            .map(|i| Offer {
+                der: root(7),
+                seat: (i % 16) as u8,
+                holder: format!("old-{i}"),
+            })
+            .collect();
+        let full = plan(&policy(), &Durable::default(), &[], &stale, t).unwrap();
+        assert_eq!(full.durable.roots.len(), MAX_ROOTS);
+        // The old seats are gone; three new seats offer new roots.
+        let fresh: Vec<_> = (0..3)
+            .map(|i| Offer {
+                der: root(7),
+                seat: i as u8,
+                holder: format!("new-{i}"),
+            })
+            .collect();
+        let p = plan(&policy(), &full.durable, &[], &fresh, t + 60).unwrap();
+        assert_eq!(p.refused_roots, 0);
+        assert_eq!(p.evicted_roots, 3);
+        assert_eq!(p.durable.roots.len(), MAX_ROOTS);
+        for o in &fresh {
+            assert!(p.durable.root_committed(&o.der));
+        }
+        assert_eq!(p.durable.retired.len(), 3);
+        p.durable.validate().unwrap();
+        // An evicted root offered again by a stale annotation stays out.
+        let evicted: Vec<_> = stale
+            .iter()
+            .filter(|o| !p.durable.root_committed(&o.der))
+            .cloned()
+            .collect();
+        assert_eq!(evicted.len(), 3);
+        let again = plan(&policy(), &p.durable, &[], &evicted, t + 120).unwrap();
+        for o in &evicted {
+            assert!(!again.durable.root_committed(&o.der));
+        }
+        assert_eq!(again.evicted_roots, 0);
+        assert_eq!(again.refused_roots, 0);
+    }
+
+    #[test]
+    fn full_keyring_of_offered_roots_refuses() {
+        let t = now();
+        let offers: Vec<_> = (0..MAX_ROOTS)
+            .map(|i| Offer {
+                der: root(7),
+                seat: (i % 16) as u8,
+                holder: format!("h-{i}"),
+            })
+            .collect();
+        let full = plan(&policy(), &Durable::default(), &[], &offers, t).unwrap();
+        let mut more = offers.clone();
+        more.push(Offer {
+            der: root(7),
+            seat: 0,
+            holder: "late".into(),
+        });
+        let p = plan(&policy(), &full.durable, &[], &more, t + 60).unwrap();
+        assert_eq!(p.refused_roots, 1);
+        assert_eq!(p.evicted_roots, 0);
+        assert!(!p.durable.root_committed(&more[MAX_ROOTS].der));
+        for o in &offers {
+            assert!(p.durable.root_committed(&o.der));
+        }
+    }
+
+    #[test]
+    fn repeated_rollouts_keep_new_seats_ready() {
+        let mut d = Durable::default();
+        let mut t = now();
+        for _ in 0..20 {
+            let seats: Vec<_> = (0..16)
+                .map(|i| Offer {
+                    der: root(7),
+                    seat: i as u8,
+                    holder: "h".into(),
+                })
+                .collect();
+            let p = plan(&policy(), &d, &[], &seats, t).unwrap();
+            assert_eq!(p.refused_roots, 0);
+            for o in &seats {
+                assert!(p.durable.root_committed(&o.der));
+            }
+            d = p.durable;
+            t += 600;
+        }
     }
 
     #[test]
