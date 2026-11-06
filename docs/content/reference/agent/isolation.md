@@ -91,13 +91,18 @@ is enabled:
 |---|---|---|
 | Agent | `"Experimental": {"ContainerIsolation": true}` in the [agent config]({{< relref "reference/agent/configuration" >}}) | The config fails validation, `--isolation container` is rejected, and a change to `container` at a repave is reported `Failed` with reason `ExperimentalNotEnabled` |
 | Machina | `experimentalContainerIsolation: true` in the machina configuration (`deploy/machina/03-config.yaml.tmpl`) | Machina does not provision a Machine that declares `container` (it is marked `Failed`), and `IsolationDrift` reports `ExperimentalModeDisabled` |
+| Metalman | `--experimental-container-isolation` on `metalman serve-pxe` (for the operator-managed Deployment, append it with a metalman `extraArgs` [workload override]({{< relref "reference/workload-overrides" >}})) | A `HostReplace` of a Machine that declares `container` fails before any power action (target reason `ExperimentalModeDisabled`), and netboot serves no agent configuration for it |
+| machine-ops-controller | `--experimental-container-isolation` on `machine-ops-controller` (`MACHINE_OPS_EXPERIMENTAL_CONTAINER_ISOLATION=true` for `make machine-ops-manifests`) | A `HostReplace` of a Machine that declares `container` fails before the provider runs |
 | kubectl | `--experimental-container-isolation` on `kubectl unbounded machine manual-bootstrap` | `--isolation container` is rejected before the cluster is contacted |
 
-The agent's setting is the one that decides. Machina with the setting, and
-`kubectl` with the flag, write it into every agent configuration they produce,
-whatever mode the Machine declares, so a node can later be changed to
-`container` at a repave. Other provisioners (metalman netboot, a host replace)
-do not write it, so the agents they install refuse `container`.
+The agent's setting is the one that decides. Machina, metalman and
+machine-ops-controller with the setting, and `kubectl` with the flag, write it
+into every agent configuration they produce, whatever mode the Machine
+declares, so a node can later be changed to `container` at a repave. Enable it
+on every provisioner that installs the node. The `IsolationDrift` condition is
+maintained by machina for every Machine, metalman-provisioned ones included, so
+a pending change to `container` is reported as `ExperimentalModeDisabled`
+unless machina enables the mode as well.
 
 ```bash
 kubectl unbounded machine manual-bootstrap my-node --site mysite \

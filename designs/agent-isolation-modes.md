@@ -447,7 +447,10 @@ Provisional until the node facts in section 13 are collected.
 - Gate: experimental. The agent refuses the mode unless its configuration sets
   `Experimental.ContainerIsolation`; machina provisions it only with
   `experimentalContainerIsolation` (and then opts every agent config it writes
-  in), and `kubectl unbounded machine manual-bootstrap` needs
+  in), metalman (`serve-pxe`) and machine-ops-controller (`HostReplace`) do the
+  same with `--experimental-container-isolation`, sharing
+  `provision.CheckIsolationEnabled` with machina, and
+  `kubectl unbounded machine manual-bootstrap` needs
   `--experimental-container-isolation`.
 - SELinux: when enforcing, set `process.selinuxLabel` to `spc_t`. A preflight
   check verifies label support. Provisional.
