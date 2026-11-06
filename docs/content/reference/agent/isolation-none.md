@@ -99,10 +99,13 @@ The same-path contract holds, as in every mode; see
   kubelet credentials, in `/etc/unbounded/agent/none-upgrade-config`) and puts them back,
   byte for byte, before the previous version starts again. If they cannot be put
   back the error says so and the saved copy is kept. Before anything changes the
-  agent records the version being replaced in
-  `/etc/unbounded/agent/none-upgrade-journal.json`; if the agent stops in the
-  middle of an upgrade, its next start rolls the node back to that version, or
-  finishes the upgrade if it had already succeeded.
+  agent records the version being replaced, and a digest of the configuration
+  being applied, in `/etc/unbounded/agent/none-upgrade-journal.json`; if the
+  agent stops in the middle of an upgrade, its next start rolls the node back to
+  that version, or finishes the upgrade if the applied config shows it had
+  already succeeded, and either way leaves the stack running. A recovery that
+  fails is logged, the daemon keeps running, and the next repave tries it again
+  before it upgrades.
 - **Pods outlive the units.** containerd runs with `KillMode=process`, so a plain
   unit stop leaves pods running, and ending a shim reparents the pod's processes
   instead of stopping them. Reset ends the shims and then kills the pods' whole

@@ -59,7 +59,23 @@ func (op NoneOperator) node(p noneops.Params) NoneNode {
 // no nspawn lifecycle hooks to reconcile; what it may have is an upgrade the
 // agent did not finish, which is finished here, before the daemon operates the
 // node: rolled back, or committed when it had already succeeded.
+//
+// A recovery that fails is logged and does not stop the daemon. Refusing to
+// start would leave the node with no in-band way out: no repave, which retries
+// the recovery (see RepaveNode), and no reset.
 func (op NoneOperator) EnsureLifecycleMigration(ctx context.Context, log *slog.Logger, active *ActiveMachine) error {
+	if err := op.recoverUpgrade(ctx, log, active); err != nil {
+		log.Error("the node may be down; the next repave or agent start tries again", "error", err)
+	}
+
+	return nil
+}
+
+// recoverUpgrade finishes an interrupted upgrade against the applied config.
+// The recovery decides from the configuration, not the version name, so it
+// needs no download overrides; the repave's are not persisted with the applied
+// config in any case.
+func (op NoneOperator) recoverUpgrade(ctx context.Context, log *slog.Logger, active *ActiveMachine) error {
 	cfg := *active.Config
 
 	if err := op.node(noneops.Params{Log: log, Config: &cfg}).RecoverUpgrade(ctx); err != nil {
@@ -103,6 +119,12 @@ func (op NoneOperator) RepaveNode(ctx context.Context, log *slog.Logger, active 
 		"old_version", active.Config.Cluster.Version,
 		"new_version", newCfg.Cluster.Version,
 	)
+
+	// An upgrade that was interrupted and could not be recovered at the daemon
+	// start is retried first; Upgrade refuses to start over its journal.
+	if err := op.recoverUpgrade(ctx, log, active); err != nil {
+		return err
+	}
 
 	resolve := op.ResolveDownloads
 	if resolve == nil {
