@@ -611,7 +611,11 @@ fn connect_failure_on_every_address_is_reported() {
 
 #[test]
 fn attempt_scope_narrows_only_non_final_attempts() {
-    let parent = scope();
+    let parent = RequestScope::host(
+        crate::model::RequestId([7; 16]),
+        Instant::now() + Duration::from_secs(10),
+    )
+    .unwrap();
     // Final attempt: the full request scope.
     assert_eq!(attempt_scope(&parent, 1).deadline.0, parent.deadline.0);
     // 10s over two attempts is capped at ATTEMPT_CAP.

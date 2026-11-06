@@ -2070,7 +2070,7 @@ fn startup_finishes_local_snapshot_installation_while_next_long_poll_is_held() {
     let env = racer_io::Env::host();
     let mut fixture = ControlFixture::new();
     fixture.hold_long_poll.store(true, Ordering::Release);
-    let (config, node) = fixture.bootstrap_node(&env, 2, Duration::from_secs(5));
+    let (config, node) = fixture.bootstrap_node(&env, 2, Duration::from_secs(30));
     let finished = std::sync::Barrier::new(2);
     let results = thread::scope(|threads| {
         let mut handles = Vec::new();
@@ -2879,7 +2879,7 @@ fn startup_reauthenticates_retained_identity_and_fails_closed() {
             &config,
             &node,
             &config.limits,
-            &scope(&racer_io::Clock::host(), Duration::from_secs(5)).unwrap(),
+            &scope(&racer_io::Clock::host(), Duration::from_secs(30)).unwrap(),
             &env.ctx,
         )
     };

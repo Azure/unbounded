@@ -460,10 +460,13 @@ pub(crate) mod enrollment {
             let _ = std::fs::remove_dir_all(&self.0);
         }
     }
+    /// A request scope for enrollment fixtures. Its deadline only bounds a
+    /// stuck test: the durable enrollment steps sync files on a real ring,
+    /// and a contended disk can stall each sync for seconds.
     pub(crate) fn scope() -> crate::runtime::RequestScope {
         crate::runtime::RequestScope::host(
             crate::model::RequestId([7; 16]),
-            std::time::Instant::now() + std::time::Duration::from_secs(10),
+            std::time::Instant::now() + std::time::Duration::from_secs(60),
         )
         .unwrap()
     }
