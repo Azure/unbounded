@@ -142,8 +142,18 @@ impl<A: PoolAccount> PoolAccount for std::sync::Arc<A> {
     }
 }
 
-/// Erase secrets so the stores cannot be optimized away.
+/// Erase secrets so the stores cannot be optimized away. Page-sized buffers
+/// are zeroed with non-temporal stores (see [`crate::stream`]): the buffer is
+/// idle until its next checkout, so caching the zeros only costs bandwidth.
 pub fn wipe_bytes(bytes: &mut [u8]) {
+    if crate::stream::zero_streaming(bytes) {
+        return;
+    }
+    wipe_bytes_libc(bytes);
+}
+
+/// [`wipe_bytes`] through `explicit_bzero` regardless of length.
+pub(crate) fn wipe_bytes_libc(bytes: &mut [u8]) {
     #[cfg(all(
         target_os = "linux",
         any(target_env = "gnu", target_env = "musl"),

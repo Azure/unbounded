@@ -169,6 +169,7 @@ mod segments;
 mod sync;
 
 mod slab;
+pub mod stream;
 
 pub use demand::{
     DEFAULT_DECAY_WINDOWS, DEFAULT_INITIAL_TARGET, DEFAULT_MAX_DEPTH, DEFAULT_MIN_DEPTH,

@@ -871,7 +871,9 @@ impl BufferPool {
     ) -> Result<CiphertextPage> {
         let length = page.bytes().len();
         let mut buffer = self.aligned_ciphertext(reservation, length)?;
-        buffer.as_mut_slice().copy_from_slice(page.bytes());
+        // The copy is next read by an O_DIRECT write or a peer send, not by
+        // this core, so stream it past the cache.
+        page_alloc::stream::copy_streaming(buffer.as_mut_slice(), page.bytes());
         let mut copy = self.aligned_ciphertext_page(buffer, page.envelope().clone())?;
         copy.provenance = page.provenance;
         page.record_copy_out(&copy);
