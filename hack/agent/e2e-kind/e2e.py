@@ -1700,8 +1700,9 @@ def _build_failing_agent_tarball(tarball: Path) -> None:
 def _build_daemon_failing_agent_tarball(tarball: Path) -> None:
     """Package an executable that passes verification but fails as the daemon.
 
-    It answers version, which is all verification runs, so the failure comes
-    from the daemon.
+    It answers version and supports-isolation, which is all verification runs
+    (the second only on a host that is not in nspawn mode), so the failure
+    comes from the daemon.
     """
 
     _build_script_agent_tarball(
@@ -1710,6 +1711,9 @@ def _build_daemon_failing_agent_tarball(tarball: Path) -> None:
         "#!/bin/sh\n"
         "if [ \"${1:-}\" = \"version\" ]; then\n"
         "    echo unbounded-agent e2e-daemon-failing\n"
+        "    exit 0\n"
+        "fi\n"
+        "if [ \"${1:-}\" = \"supports-isolation\" ]; then\n"
         "    exit 0\n"
         "fi\n"
         "echo failing upgraded agent daemon >&2\n"
