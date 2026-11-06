@@ -213,6 +213,10 @@ pub(crate) struct Cm {
 
     /// Ids whose destruction failed. Never freed.
     pub(crate) leaked_ids: Cell<usize>,
+
+    /// A `DEVICE_REMOVAL` event arrived: the device is gone (for example an
+    /// Azure VF hot-unplug), and every id and QP on it is dead.
+    removed: Cell<bool>,
 }
 
 impl Cm {
@@ -255,7 +259,14 @@ impl Cm {
             ids: RefCell::new(BTreeMap::new()),
             next_token: Cell::new(0),
             leaked_ids: Cell::new(0),
+            removed: Cell::new(false),
         }))
+    }
+
+    /// True once any id on this device, the listener included, reported
+    /// `DEVICE_REMOVAL`.
+    pub(crate) fn removed(&self) -> bool {
+        self.removed.get()
     }
 
     /// The event channel's nonblocking fd.
@@ -369,6 +380,11 @@ impl Cm {
 
     fn handle(&self, device: &NativeDevice, event: &CmEvent) {
         let api = &device.api;
+        if event.kind == event::DEVICE_REMOVAL {
+            // Reported on every id bound to the device, the listener too, so
+            // the owner learns of the loss even with no link on the rail.
+            self.removed.set(true);
+        }
         if event.kind == event::CONNECT_REQUEST {
             self.request(device, event);
             return;

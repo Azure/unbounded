@@ -527,6 +527,7 @@ impl Links {
                 BreakReason::Abandoned => Event::RdmaLinkBreakAbandoned,
                 BreakReason::Declined => Event::RdmaLinkBreakDeclined,
                 BreakReason::GrantExpired => Event::RdmaLinkBreakGrantExpired,
+                BreakReason::DeviceLost => Event::RdmaLinkBreakDeviceLost,
             };
             metrics.record(event, grown);
         }

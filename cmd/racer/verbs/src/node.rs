@@ -76,11 +76,16 @@ pub enum BreakReason {
     /// link started a graceful `Close`. Also counted as [`Self::Closed`]
     /// once the close finishes.
     GrantExpired,
+
+    /// The link's device was removed (for example an Azure VF hot-unplug).
+    /// The rail stays down for the rest of the round; no backoff, because
+    /// no new link starts on it until the caller reactivates.
+    DeviceLost,
 }
 
 impl BreakReason {
     /// Every reason, in counter index order.
-    pub const ALL: [Self; 7] = [
+    pub const ALL: [Self; 8] = [
         Self::Error,
         Self::Timeout,
         Self::PeerClosed,
@@ -88,6 +93,7 @@ impl BreakReason {
         Self::Abandoned,
         Self::Declined,
         Self::GrantExpired,
+        Self::DeviceLost,
     ];
 
     fn of(reason: Break) -> Self {
@@ -351,6 +357,14 @@ struct NodeShared {
     /// Link breaks by [`BreakReason`] index, since the node started.
     break_counts: [AtomicU64; BreakReason::ALL.len()],
 
+    /// Devices this node lost (see [`BreakReason::DeviceLost`]), since the
+    /// node started.
+    device_losses: AtomicU64,
+
+    /// Rails whose device was lost this round, cleared when the round's
+    /// devices are freed.
+    lost: Mutex<Vec<u16>>,
+
     /// The latest [`Client::retain`] request, not yet applied.
     retain: Mutex<Option<std::collections::BTreeSet<LinkKey>>>,
 
@@ -378,6 +392,8 @@ pub fn node(workers: usize) -> Result<(Vec<Client>, OwnerPort)> {
         prefetch: RwLock::new(BTreeMap::new()),
         breaks: Mutex::new(Vec::new()),
         break_counts: Default::default(),
+        device_losses: AtomicU64::new(0),
+        lost: Mutex::new(Vec::new()),
         retain: Mutex::new(None),
         closed: AtomicBool::new(false),
         drained: AtomicBool::new(false),
@@ -726,6 +742,24 @@ impl Client {
         Some(pools.get(&(rail, id))?.count_in(state))
     }
 
+    /// Devices lost since the node started: each one broke every link on its
+    /// rail with [`BreakReason::DeviceLost`]. A caller that sees this grow
+    /// should [`Self::close`] the round and reactivate once the device is
+    /// back.
+    pub fn device_losses(&self) -> u64 {
+        self.shared.device_losses.load(Ordering::Relaxed)
+    }
+
+    /// Rails whose device was lost this round. New links on them fail with
+    /// [`Error::Unavailable`] until the round is closed and reactivated.
+    pub fn lost_rails(&self) -> Vec<u16> {
+        self.shared
+            .lost
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
+    }
+
     /// Close the node: the owner sends `Close` on ready links, breaks every
     /// link, and frees everything once no page is held. Does not wait.
     pub fn close(&self) {
@@ -876,6 +910,9 @@ pub struct Owner {
 
     backoff: BTreeMap<LinkKey, Backoff>,
 
+    /// Rails whose device was removed this round.
+    lost: std::collections::BTreeSet<u16>,
+
     next_epoch: u64,
 
     /// Shutdown has started for this round.
@@ -921,6 +958,7 @@ impl Owner {
             activating: None,
             attaching: Vec::new(),
             backoff: BTreeMap::new(),
+            lost: std::collections::BTreeSet::new(),
             next_epoch: 1,
             closing: false,
             dirty: false,
@@ -1606,6 +1644,9 @@ impl Owner {
     /// (whose QPs still exist until destroyed) cannot crowd out live ones.
     fn create(&mut self, key: LinkKey, role: Role, now: Instant) -> Result<Link> {
         let settings = self.settings.ok_or(Error::Unavailable)?;
+        if self.lost.contains(&key.rail) {
+            return Err(Error::Unavailable);
+        }
         let device = self.devices.get(&key.rail).ok_or(Error::Unavailable)?;
         let live = self
             .links
@@ -1774,7 +1815,10 @@ impl Owner {
         self.count_break(reason);
 
         match reason {
-            BreakReason::PeerClosed | BreakReason::Closed | BreakReason::GrantExpired => {
+            BreakReason::PeerClosed
+            | BreakReason::Closed
+            | BreakReason::GrantExpired
+            | BreakReason::DeviceLost => {
                 self.backoff.remove(&key);
             }
             // Benign: retry soon, and forget any escalation.
@@ -1840,6 +1884,19 @@ impl Owner {
             device.device.begin_pass();
         }
 
+        // A removed device fails its links' QPs too: break them as lost
+        // before polling turns that into an error break with a backoff.
+        let removed: Vec<u16> = self
+            .devices
+            .iter()
+            .filter(|(rail, device)| device.device.removed() && !self.lost.contains(rail))
+            .map(|(rail, _)| *rail)
+            .collect();
+
+        for rail in removed {
+            self.lose_device(rail, now);
+        }
+
         let mut broken = Vec::new();
 
         for (key, link) in &mut self.links {
@@ -1870,6 +1927,31 @@ impl Owner {
         for (key, reason) in broken {
             self.break_link(key, reason, now);
         }
+    }
+
+    /// `rail`'s device is gone: break every link on it at once (a `Close`
+    /// could never be sent), fail their ops so callers fall back without
+    /// waiting for deadlines, and refuse new links until the round closes.
+    fn lose_device(&mut self, rail: u16, now: Instant) {
+        if !self.lost.insert(rail) {
+            return;
+        }
+        self.shared.device_losses.fetch_add(1, Ordering::Relaxed);
+        self.shared
+            .lost
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push(rail);
+        let keys: Vec<LinkKey> = self
+            .links
+            .keys()
+            .filter(|key| key.rail == rail)
+            .copied()
+            .collect();
+        for key in keys {
+            self.break_for(key, BreakReason::DeviceLost, now);
+        }
+        self.dirty = true;
     }
 
     /// Destroy dying links; keep the ones whose destroy failed for a retry.
@@ -1943,6 +2025,12 @@ impl Owner {
 
         self.devices.clear();
         self.backoff.clear();
+        self.lost.clear();
+        self.shared
+            .lost
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clear();
 
         if self
             .quota

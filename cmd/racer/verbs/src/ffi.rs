@@ -736,6 +736,12 @@ impl NativeDevice {
         self.in_pass.set(true);
     }
 
+    /// True once the connection manager reported the device removed. Every
+    /// QP and id on it is dead; only teardown remains.
+    pub(crate) fn removed(&self) -> bool {
+        self.cm.as_ref().is_some_and(Cm::removed)
+    }
+
     /// Close the pass opened by [`Self::begin_pass`].
     pub(crate) fn end_pass(&self) {
         self.in_pass.set(false);

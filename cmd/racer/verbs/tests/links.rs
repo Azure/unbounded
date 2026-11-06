@@ -1429,3 +1429,49 @@ fn device_attach_does_not_block_live_links() {
         );
     });
 }
+
+#[test]
+/// A removed device (an Azure VF hot-unplug) breaks every link on its rail
+/// at once, fails their ops without waiting for deadlines, counts the loss,
+/// and refuses new links on the rail until the round is closed; a fresh
+/// round then activates normally.
+fn device_removal_breaks_rail_and_recovers_after_reopen() {
+    let _profile = default_profile(Profile::Registration);
+    let mut w = world();
+    let (ea, _) = link_up(&mut w);
+    let deadline = w.now() + 60 * SECOND;
+    let granted = w.a.clients[0].grant(TO_B, ea, [1; 16], 10, deadline);
+    let granted = wait(&mut w, &granted).unwrap();
+    assert_eq!(w.a.clients[0].device_losses(), 0);
+    assert!(w.sim.remove_device("sim1") >= 2, "listener and link ids");
+    pump(&mut w);
+    assert_eq!(ready(&granted.arrival).err(), Some(Error::Unavailable));
+    assert!(!matches!(
+        w.a.clients[0].link(TO_B),
+        LinkState::Ready { .. } | LinkState::Backoff(_)
+    ));
+    assert_eq!(w.a.clients[0].link_breaks(BreakReason::DeviceLost), 1);
+    assert_eq!(w.a.clients[1].device_losses(), 1);
+    assert_eq!(w.a.clients[1].lost_rails(), vec![7]);
+    let refused = w.a.clients[0].open(TO_B);
+    assert_eq!(wait(&mut w, &refused).err(), Some(Error::Unavailable));
+    // The peer sees the connection end and breaks too.
+    assert!(!matches!(
+        w.b.clients[0].link(TO_A),
+        LinkState::Ready { .. }
+    ));
+    // A second removal event changes nothing.
+    w.sim.remove_device("sim1");
+    pump(&mut w);
+    assert_eq!(w.a.clients[0].device_losses(), 1);
+    w.a.clients[0].close();
+    pump(&mut w);
+    assert!(w.a.clients[0].drained());
+    assert!(w.a.clients[0].lost_rails().is_empty());
+    w.a.clients[0].reopen().unwrap();
+    let activation = w.a.clients[1].activate(config(&w.a.charge));
+    assert!(wait(&mut w, &activation).is_ok());
+    assert_eq!(w.a.clients[0].device_losses(), 1, "losses are cumulative");
+    link_up(&mut w);
+    shutdown(w);
+}

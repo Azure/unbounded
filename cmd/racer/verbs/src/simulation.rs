@@ -660,6 +660,28 @@ impl Simulation {
         }
     }
 
+    /// Hot-unplug the device named `name`, like an Azure VF removal: every
+    /// connection manager id on its event channels, the listener included,
+    /// reports `DEVICE_REMOVAL`. Returns how many events were queued.
+    pub fn remove_device(&self, name: &str) -> usize {
+        let mut world = self.world.borrow_mut();
+        let ids: Vec<u32> = world
+            .resources
+            .iter()
+            .filter_map(|(&id, resource)| match resource {
+                Resource::CmId { channel, .. } => {
+                    let device = world.device(*channel)?;
+                    (world.device_info(device)?.name == name).then_some(id)
+                }
+                _ => None,
+            })
+            .collect();
+        for &id in &ids {
+            world.cm_event(id, registration::event::DEVICE_REMOVAL, None, &[]);
+        }
+        ids.len()
+    }
+
     /// Fail the next matching call on any resource.
     pub fn fault(&self, operation: Operation, fault: Fault) {
         self.fault_on(operation, None, fault);
