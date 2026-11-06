@@ -1754,7 +1754,11 @@ impl WorkerApplication {
         let credentials = dependencies.credentials.clone();
         let index = dependencies.writer.index().clone();
         let admission = dependencies.admission.clone();
-        let fill = Rc::new(Fill::new(dependencies).with_metrics(metrics.clone()));
+        let fill = Rc::new(
+            Fill::new(dependencies)
+                .with_metrics(metrics.clone())
+                .with_plaintext_wait(delivery.reactor().clone()),
+        );
         let metadata = Rc::new(MetadataService::new(
             candidates,
             origin,

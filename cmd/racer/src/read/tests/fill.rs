@@ -1505,6 +1505,91 @@ fn cooperative_reclaim_bounds_busy_cycle_and_preserves_cancellation() {
 }
 
 #[test]
+fn plaintext_wait_grows_to_its_ceiling_with_jitter() {
+    use crate::read::fill::{PLAINTEXT_WAIT_MAX, PLAINTEXT_WAIT_MIN, plaintext_wait};
+    for count in 1..=u8::MAX {
+        let full = PLAINTEXT_WAIT_MIN
+            .saturating_mul(1 << u32::from(count - 1).min(16))
+            .min(PLAINTEXT_WAIT_MAX);
+        for seed in 0..16 {
+            let delay = plaintext_wait(seed, count);
+            assert!(
+                delay >= full / 2 && delay <= full,
+                "{seed} {count}: {delay:?}"
+            );
+        }
+    }
+    let spread: std::collections::BTreeSet<_> =
+        (0..64).map(|seed| plaintext_wait(seed, 8)).collect();
+    assert!(spread.len() > 32);
+}
+
+#[test]
+fn network_plaintext_waits_for_a_release_until_its_scope_ends() {
+    for mode in ["release", "deadline", "cancel"] {
+        let clock = racer_io::SimClock::new(913);
+        let sim_env = clock.ctx(0);
+        let env = racer_io::Env::new(racer_io::Driver::Uring, sim_env.clone());
+        let f = fixture_with(&env, 3, None);
+        let fill = f.fill.clone().with_plaintext_wait(f.reactor.clone());
+        let admission = &fill.dependencies.admission;
+        let pressure = admission
+            .reserve(
+                None,
+                ResourceClass::Plaintext,
+                admission.limit(ResourceClass::Plaintext)
+                    - admission.used(ResourceClass::Plaintext),
+            )
+            .unwrap();
+        let failures = crate::telemetry::Failures::default();
+        admission
+            .policy()
+            .set_observer(failures.observer(WorkerId(0)));
+        let scope = RequestScope::on(
+            &sim_env.clock,
+            f.scope.request,
+            sim_env.clock.now() + Duration::from_secs(60),
+        )
+        .unwrap();
+        let mut reserve = Box::pin(fill.reserve_network_plaintext(&scope, &f.page));
+        let mut cx = Context::from_waker(futures::task::noop_waker_ref());
+        // The yield, then waits that outlast the old single retry.
+        for _ in 0..8 {
+            assert!(reserve.as_mut().poll(&mut cx).is_pending(), "{mode}");
+            clock.advance(Duration::from_millis(20));
+        }
+        match mode {
+            "release" => {
+                drop(pressure);
+                clock.advance(crate::read::fill::PLAINTEXT_WAIT_MAX);
+                let Poll::Ready(Ok(charge)) = reserve.as_mut().poll(&mut cx) else {
+                    panic!("a release admits the waiting reservation");
+                };
+                assert_eq!(charge.amount(), PAGE_BYTES as usize);
+            }
+            "deadline" => {
+                clock.advance(Duration::from_secs(120));
+                assert!(matches!(
+                    reserve.as_mut().poll(&mut cx),
+                    Poll::Ready(Err(Error::DeadlineExceeded))
+                ));
+            }
+            _ => {
+                scope.cancel().unwrap();
+                assert!(matches!(
+                    reserve.as_mut().poll(&mut cx),
+                    Poll::Ready(Err(Error::Canceled))
+                ));
+            }
+        }
+        // A wait is not a final rejection.
+        let mut out = String::new();
+        failures.write_protected(true, &mut out).unwrap();
+        assert!(out.contains("total=0 retained=0"), "{mode}: {out}");
+    }
+}
+
+#[test]
 fn cooperative_reclaim_fair_share_keeps_other_cache_and_live_ciphertext() {
     let env = racer_io::Env::host();
     let mut limits = crate::test_support::cluster::config(false).limits;

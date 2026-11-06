@@ -49,6 +49,7 @@ use crate::telemetry::{Detail, FillAdmissionSite};
 use racer_io::ring::IoBuffer;
 use std::rc::Rc;
 use std::sync::Arc;
+use std::time::Duration;
 
 #[derive(Clone)]
 pub struct FillDependencies {
@@ -77,6 +78,30 @@ type LocalPlaintextKeys = std::cell::RefCell<
     std::collections::BTreeMap<PageId, Rc<std::cell::Cell<Option<racer_wire::control::KeyId>>>>,
 >;
 
+/// First wait for local plaintext; each later wait doubles it up to [`PLAINTEXT_WAIT_MAX`].
+pub(super) const PLAINTEXT_WAIT_MIN: Duration = Duration::from_millis(1);
+
+/// Ceiling of one wait for local plaintext. Short, as a release is not signaled.
+pub(super) const PLAINTEXT_WAIT_MAX: Duration = Duration::from_millis(50);
+
+/// Wait `count` (1 for the first) for local plaintext, jittered into its upper half by a hash of
+/// `seed` and `count` so readers released by one charge do not retry in lockstep.
+pub(super) fn plaintext_wait(seed: u64, count: u8) -> Duration {
+    let shift = u32::from(count.saturating_sub(1)).min(16);
+    let full = PLAINTEXT_WAIT_MIN
+        .saturating_mul(1 << shift)
+        .min(PLAINTEXT_WAIT_MAX);
+    let half = full / 2;
+    let mut mix = seed ^ (u64::from(count) << 56) ^ 0x9e37_79b9_7f4a_7c15;
+    mix = (mix ^ (mix >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+    mix = (mix ^ (mix >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+    mix ^= mix >> 31;
+    let span = u64::try_from(half.as_nanos())
+        .unwrap_or(u64::MAX)
+        .saturating_add(1);
+    half + Duration::from_nanos(mix % span)
+}
+
 /// A host descriptor to hand to cuFile, or None for simulated descriptors.
 fn host_descriptor(descriptor: &racer_io::ring::Descriptor) -> Option<std::os::fd::OwnedFd> {
     use std::os::fd::AsFd;
@@ -101,6 +126,9 @@ pub struct Fill {
 
     diagnostic: Option<DriverDiagnostic>,
     fence_acquisition: bool,
+    /// Timers for waiting out local plaintext pressure. Without one, a network fill fails
+    /// `Overloaded` once its reclaim attempt cannot make room.
+    plaintext_wait: Option<Rc<crate::runtime::Reactor>>,
 }
 
 /// Immediate acquisition tier, not the original producer or corruption location.
@@ -722,8 +750,11 @@ impl Fill {
         let amount = self.page_plaintext_bytes()?;
         // The memory cache retains no plaintext, so nothing local can be
         // reclaimed. Retry once after a yield, which lets completed readers
-        // drop their plaintext.
+        // drop their plaintext. With a timer, keep waiting for them under a
+        // growing jittered backoff until the scope ends: concurrent readers
+        // queue for plaintext instead of failing and retrying elsewhere.
         let mut exhausted = false;
+        let mut waits: u8 = 0;
         loop {
             scope.check()?;
             let (mut result, mut detail) =
@@ -741,6 +772,23 @@ impl Fill {
                 if !matches!(result, Err(Error::Overloaded)) {
                     return result;
                 }
+            }
+            if (exhausted || deficit.is_none())
+                && let Some(reactor) = &self.plaintext_wait
+                // An amount past the whole limit is never admitted.
+                && amount <= admission.limit(ResourceClass::Plaintext)
+            {
+                waits = waits.saturating_add(1);
+                let request = u64::from_le_bytes(
+                    scope.request.0[..8]
+                        .try_into()
+                        .map_err(|_| Error::Internal)?,
+                );
+                let delay = plaintext_wait(page.number.0 ^ request, waits);
+                reactor
+                    .sleep_until(scope.clock().now() + delay, scope)
+                    .await?;
+                continue;
             }
             if exhausted || deficit.is_none() {
                 admission.policy().observer().final_fill_admission(
@@ -888,7 +936,14 @@ impl Fill {
             gpu_copies: Rc::default(),
             diagnostic: None,
             fence_acquisition: false,
+            plaintext_wait: None,
         }
+    }
+    /// Wait on `reactor`'s timers for completed readers to release plaintext instead of failing
+    /// a network fill `Overloaded`, until the fill's scope ends.
+    pub(crate) fn with_plaintext_wait(mut self, reactor: Rc<crate::runtime::Reactor>) -> Self {
+        self.plaintext_wait = Some(reactor);
+        self
     }
     pub fn with_metrics(mut self, metrics: Metrics) -> Self {
         self.metrics = metrics;
