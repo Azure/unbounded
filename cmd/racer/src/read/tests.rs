@@ -3905,4 +3905,19 @@ mod timeouts {
         assert_eq!(f.budget.remaining_attempts(), 16);
         assert_eq!(f.budget.remaining_links(), 24);
     }
+
+    #[test]
+    fn direct_byte_credits_follow_the_published_page_size() {
+        use racer_wire::object::PageSize;
+        let small = PageSize::new(64 * 1024).unwrap();
+        assert_eq!(crate::read::direct_byte_credits(4, small), 4 * 64 * 1024);
+        assert_eq!(
+            crate::read::direct_byte_credits(4, PageSize::MAX),
+            4 * crate::model::PAGE_BYTES
+        );
+        assert_eq!(
+            crate::read::direct_byte_credits(usize::MAX, PageSize::MAX),
+            u64::MAX
+        );
+    }
 }

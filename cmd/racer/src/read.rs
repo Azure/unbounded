@@ -17,8 +17,8 @@ use crate::model::ByteRange;
 use crate::model::MetadataSelector;
 use crate::model::ObjectId;
 use crate::model::ObjectMetadata;
+use crate::model::PageSize;
 use crate::model::ResolvedRange;
-use crate::model::{PAGE_BYTES, PageSize};
 use crate::peer::forwarding::VerifiedRequest;
 use crate::peer::protocol::FetchMode;
 use crate::peer::protocol::Operation as PeerOperation;
@@ -401,7 +401,7 @@ impl Coordinator {
                         pin: None,
                         range,
                         page_credits: direct_window,
-                        byte_credits: direct_window as u64 * PAGE_BYTES,
+                        byte_credits: direct_byte_credits(direct_window, snapshot.page_size),
                     }
                 }
                 kind => kind,
@@ -867,6 +867,12 @@ fn validate_metadata(
 }
 
 /// Preserve the object's length when translating an unsatisfiable client range.
+/// Byte credits for a direct read's `window` pages at the published page
+/// size, so a small-page cluster does not grant 16 MiB per page.
+fn direct_byte_credits(window: usize, page: PageSize) -> u64 {
+    (window as u64).saturating_mul(page.get())
+}
+
 fn resolve_range(range: ByteRange, length: u64, page: PageSize) -> Result<ResolvedRange> {
     range
         .resolve_paged(length, page)
