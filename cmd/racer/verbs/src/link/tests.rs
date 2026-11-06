@@ -412,9 +412,11 @@ fn abandoned_arrival_with_late_release() {
 }
 
 #[test]
-/// An exposed grant that is never written or released breaks the link at
-/// its deadline; destroy fences and frees the buffer.
-fn exposed_grant_deadline_breaks() {
+/// An exposed grant that is never written or released survives its deadline
+/// for [`EXPOSED_GRACE`], then closes the link gracefully: `Close` goes out,
+/// the peer sees `PeerClosed`, neither side errors, and destroy fences and
+/// frees the buffer, which stays exposed until then.
+fn exposed_grant_deadline_closes_after_grace() {
     profiles(|| {
         let mut p = pair();
         let now = p.now;
@@ -422,7 +424,19 @@ fn exposed_grant_deadline_breaks() {
         assert_eq!(pump(&mut p), (None, None));
         let granted = poll(&granted).unwrap().unwrap();
         p.now += 5 * SECOND;
-        assert_eq!(p.a.link.poll(&p.a.pool, p.now), Err(Break::Error));
+        assert_eq!(p.a.link.poll(&p.a.pool, p.now), Ok(()));
+        assert_eq!(p.a.link.phase(), Phase::Ready);
+        assert!(!p.a.link.take_grant_expired());
+        assert_eq!(
+            p.a.link.next_deadline(),
+            Some(now + 5 * SECOND + EXPOSED_GRACE)
+        );
+        p.now += EXPOSED_GRACE;
+        assert_eq!(pump(&mut p), (Some(Break::Closed), Some(Break::PeerClosed)));
+        assert!(p.a.link.take_grant_expired());
+        assert!(!p.a.link.take_grant_expired());
+        // Still exposed: a late write cannot land in a reused buffer.
+        assert_eq!(p.a.pool.shared().count_in(BufferState::Exposed), 1);
         assert!(p.a.link.destroy(&p.a.pool));
         assert_eq!(
             poll(&granted.arrival).map(|r| r.err()),
@@ -430,6 +444,35 @@ fn exposed_grant_deadline_breaks() {
         );
         assert_eq!(free(&p.a), 4);
         // The peer sees its QP fail on its next post or poll.
+        finish(p);
+    });
+}
+
+#[test]
+/// A write that arrives after the grant's deadline but within
+/// [`EXPOSED_GRACE`] still lands, and the link stays up.
+fn late_write_within_grace_lands() {
+    profiles(|| {
+        let mut p = pair();
+        let now = p.now;
+        let granted = grant(&mut p.a, 10, now + 5 * SECOND, now);
+        assert_eq!(pump(&mut p), (None, None));
+        let granted = poll(&granted).unwrap().unwrap();
+        p.now += 5 * SECOND + EXPOSED_GRACE / 2;
+        assert_eq!(pump(&mut p), (None, None));
+        let later = p.now + 5 * SECOND;
+        let written = write(&mut p.b, granted.tag, vec![3; 10], later, p.now);
+        assert_eq!(pump(&mut p), (None, None));
+        assert_eq!(poll(&written), Some(Ok(())));
+        let Some(Ok(Arrival::Page(page))) = poll(&granted.arrival) else {
+            panic!("the late write lands");
+        };
+        assert_eq!(page.bytes(), [3; 10]);
+        drop(page);
+        p.now += EXPOSED_GRACE;
+        assert_eq!(pump(&mut p), (None, None));
+        assert_eq!(p.a.link.phase(), Phase::Ready);
+        assert!(!p.a.link.take_grant_expired());
         finish(p);
     });
 }
@@ -814,8 +857,9 @@ fn duplicate_immediate_and_bad_length_break() {
 }
 
 #[test]
-/// A dropped write leaves the grant exposed until its deadline breaks it.
-fn dropped_write_breaks_at_grant_deadline() {
+/// A dropped write leaves the grant exposed until its deadline plus
+/// [`EXPOSED_GRACE`], which closes the link.
+fn dropped_write_closes_after_grant_grace() {
     profiles(|| {
         let mut p = pair();
         let now = p.now;
@@ -832,7 +876,9 @@ fn dropped_write_breaks_at_grant_deadline() {
         assert_eq!(poll(&written), Some(Ok(())));
         assert_eq!(poll(&granted.arrival).map(|r| r.is_ok()), None);
         p.now += 5 * SECOND;
-        assert_eq!(pump(&mut p).0, Some(Break::Error));
+        assert_eq!(pump(&mut p), (None, None));
+        p.now += EXPOSED_GRACE;
+        assert_eq!(pump(&mut p).0, Some(Break::Closed));
         assert!(p.a.link.destroy(&p.a.pool));
         assert!(matches!(
             poll(&granted.arrival),

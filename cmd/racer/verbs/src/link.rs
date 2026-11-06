@@ -31,6 +31,19 @@ pub const SETUP_TIMEOUT: Duration = Duration::from_secs(5);
 /// After sending `Close`, break at the latest this long later.
 pub(crate) const CLOSE_GRACE: Duration = Duration::from_secs(1);
 
+/// How long past its deadline an exposed grant may wait for the peer's
+/// write or `Release` before the link closes gracefully.
+///
+/// Only the peer or a QP teardown can fence an exposed grant: the protocol
+/// has no grantor-side revoke, and invalidating the window alone would leave
+/// the tag in the peer's grant table (a later reuse of the tag, or the
+/// peer's write, would then break the link anyway). So an orphaned grant
+/// (for example the peer shed the request before it saw the grant) keeps
+/// its buffer exposed and its grant slot held for this long, and then the
+/// link sends `Close`. The buffer stays `Exposed` until the QP is destroyed,
+/// so a late write can never land in a reused buffer.
+pub const EXPOSED_GRACE: Duration = Duration::from_secs(10);
+
 const SEND_CTL: u8 = 1;
 const RECV_CTL: u8 = 2;
 const WRITE: u8 = 3;
@@ -195,7 +208,7 @@ pub(crate) enum Phase {
 /// Why a link must be broken.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum Break {
-    /// Error completion, protocol violation, or exposed grant deadline.
+    /// Error completion or protocol violation.
     Error,
 
     /// The peer sent `Close`.
@@ -474,6 +487,10 @@ pub(crate) struct Link {
     /// Ops were failed by `destroy`.
     failed: bool,
 
+    /// An exposed grant outlived [`EXPOSED_GRACE`] and started a `Close`.
+    /// Taken by [`Link::take_grant_expired`].
+    grant_expired: bool,
+
     /// The last poll read a full completion batch: more may wait in the CQ
     /// without raising a new channel event.
     more: bool,
@@ -554,6 +571,7 @@ impl Link {
             established: false,
             more: false,
             failed: false,
+            grant_expired: false,
         })
     }
 
@@ -586,6 +604,11 @@ impl Link {
 
     pub(crate) fn link_id(&self) -> u64 {
         self.link_id
+    }
+
+    /// Whether an expired exposed grant started a `Close` since the last call.
+    pub(crate) fn take_grant_expired(&mut self) -> bool {
+        std::mem::take(&mut self.grant_expired)
     }
 
     /// When the link became `Ready`, if it did.
@@ -906,8 +929,12 @@ impl Link {
             at(self.created + SETUP_TIMEOUT);
         }
         for grant in self.grants.values() {
-            if matches!(grant.state, GrantState::Bound | GrantState::Exposed) {
-                at(grant.deadline);
+            match grant.state {
+                GrantState::Bound => at(grant.deadline),
+                GrantState::Exposed if self.phase == Phase::Ready => {
+                    at(grant.deadline + EXPOSED_GRACE);
+                }
+                _ => {}
             }
         }
         for waiting in self.waiting.values() {
@@ -1238,6 +1265,7 @@ impl Link {
     /// Fail or break on passed deadlines.
     fn expire(&mut self, now: Instant) -> std::result::Result<(), Break> {
         let mut canceled = Vec::new();
+        let mut orphaned = false;
 
         for (&tag, entry) in &mut self.grants {
             if now < entry.deadline {
@@ -1245,8 +1273,12 @@ impl Link {
             }
 
             match entry.state {
-                // An exposed window can only be fenced by the peer or a break.
-                GrantState::Exposed => return Err(Break::Error),
+                // An exposed window can only be fenced by the peer or a QP
+                // teardown. Wait out the grace for a late write or release,
+                // then close the link without counting it as a failure.
+                GrantState::Exposed => {
+                    orphaned |= now >= entry.deadline + EXPOSED_GRACE;
+                }
                 GrantState::Bound => {
                     entry.state =
                         GrantState::Invalidating(Outcome::Canceled(Error::DeadlineExceeded));
@@ -1260,6 +1292,19 @@ impl Link {
             self.outbox
                 .retain(|o| !matches!(o, Outgoing::Grant(t) if *t == tag));
             self.outbox.push_back(Outgoing::Invalidate(tag));
+        }
+
+        if orphaned {
+            match self.phase {
+                Phase::Ready => {
+                    self.close(now, CLOSE_GRACE);
+                    self.grant_expired = true;
+                }
+                // Already closing: the teardown fences the grant.
+                Phase::Closing { .. } => {}
+                // Grants exist only on ready links.
+                Phase::Created | Phase::Connecting => return Err(Break::Error),
+            }
         }
 
         let expired: Vec<u32> = self

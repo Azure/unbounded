@@ -37,13 +37,85 @@ pub const COMMAND_QUEUE: usize = 64;
 /// First backoff after a failed link.
 pub const BACKOFF_MIN: Duration = Duration::from_secs(1);
 
-/// Longest backoff.
-pub const BACKOFF_MAX: Duration = Duration::from_secs(60);
+/// Longest backoff. Short, because every page to a key in backoff goes over
+/// HTTP; repeated failures only cost a cheap setup attempt this often.
+pub const BACKOFF_MAX: Duration = Duration::from_secs(5);
 
 /// A link ready this long resets its backoff.
 pub const BACKOFF_RESET: Duration = Duration::from_secs(60);
 
-pub use link::SETUP_TIMEOUT;
+pub use link::{EXPOSED_GRACE, SETUP_TIMEOUT};
+
+/// Why the owner tore down (or started closing) a link. Counted per node,
+/// see [`Client::link_breaks`].
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash, PartialOrd, Ord)]
+pub enum BreakReason {
+    /// Error completion, protocol violation, or a failed connect. Backs off.
+    Error,
+
+    /// Not ready within [`SETUP_TIMEOUT`]. Backs off.
+    Timeout,
+
+    /// The peer sent `Close`. No backoff.
+    PeerClosed,
+
+    /// Our own `Close` finished (idle close, retain, shutdown, or an
+    /// expired grant). No backoff.
+    Closed,
+
+    /// The caller broke the link with [`Client::break_link`], typically a
+    /// failed setup exchange. Backs off.
+    Abandoned,
+
+    /// The caller declined the link with [`Client::decline_link`]: the peer
+    /// refused the setup for a benign reason (lost tie-break, rate limit,
+    /// overload). Retries after [`BACKOFF_MIN`] without escalating.
+    Declined,
+
+    /// An exposed grant outlived its deadline plus [`EXPOSED_GRACE`], so the
+    /// link started a graceful `Close`. Also counted as [`Self::Closed`]
+    /// once the close finishes.
+    GrantExpired,
+}
+
+impl BreakReason {
+    /// Every reason, in counter index order.
+    pub const ALL: [Self; 7] = [
+        Self::Error,
+        Self::Timeout,
+        Self::PeerClosed,
+        Self::Closed,
+        Self::Abandoned,
+        Self::Declined,
+        Self::GrantExpired,
+    ];
+
+    fn of(reason: Break) -> Self {
+        match reason {
+            Break::Error => Self::Error,
+            Break::Timeout => Self::Timeout,
+            Break::PeerClosed => Self::PeerClosed,
+            Break::Closed => Self::Closed,
+        }
+    }
+}
+
+/// Published links by state, from the latest snapshot. Idle keys are not
+/// tracked.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct LinkCounts {
+    /// Setup in progress.
+    pub connecting: usize,
+
+    /// Data may flow.
+    pub ready: usize,
+
+    /// Closing or being destroyed.
+    pub breaking: usize,
+
+    /// Refused until the backoff passes.
+    pub backoff: usize,
+}
 
 /// Opaque caller identity for a link. Racer uses `SHA-256(NodeId)` and the
 /// rail.
@@ -204,7 +276,8 @@ enum Command {
         done: Completer<()>,
     },
 
-    Break(LinkKey, Epoch),
+    /// Break the link; `true` declines it (benign, no escalating backoff).
+    Break(LinkKey, Epoch, bool),
 }
 
 /// Published link states, keyed by link.
@@ -272,8 +345,11 @@ struct NodeShared {
     /// region, and [`Client::prefetch`] holds the read lock across the call.
     prefetch: RwLock<BTreeMap<u16, ffi::Prefetcher>>,
 
-    /// Breaks that did not fit in a command queue.
-    breaks: Mutex<Vec<(LinkKey, Epoch)>>,
+    /// Breaks that did not fit in a command queue; `true` declines.
+    breaks: Mutex<Vec<(LinkKey, Epoch, bool)>>,
+
+    /// Link breaks by [`BreakReason`] index, since the node started.
+    break_counts: [AtomicU64; BreakReason::ALL.len()],
 
     /// The latest [`Client::retain`] request, not yet applied.
     retain: Mutex<Option<std::collections::BTreeSet<LinkKey>>>,
@@ -301,6 +377,7 @@ pub fn node(workers: usize) -> Result<(Vec<Client>, OwnerPort)> {
         device_pools: RwLock::new(BTreeMap::new()),
         prefetch: RwLock::new(BTreeMap::new()),
         breaks: Mutex::new(Vec::new()),
+        break_counts: Default::default(),
         retain: Mutex::new(None),
         closed: AtomicBool::new(false),
         drained: AtomicBool::new(false),
@@ -399,6 +476,30 @@ impl Client {
             .as_ref()
             .and_then(|c| c.links.get(&key).copied())
             .unwrap_or(LinkState::Idle)
+    }
+
+    /// Links by state in the latest published snapshot.
+    pub fn link_counts(&self) -> LinkCounts {
+        let (_, links) = self.shared.links.load();
+        let mut counts = LinkCounts::default();
+
+        for state in links.values() {
+            match state {
+                LinkState::Idle => {}
+                LinkState::Connecting(_) => counts.connecting += 1,
+                LinkState::Ready { .. } => counts.ready += 1,
+                LinkState::Breaking => counts.breaking += 1,
+                LinkState::Backoff(_) => counts.backoff += 1,
+            }
+        }
+
+        counts
+    }
+
+    /// Links broken (or, for [`BreakReason::GrantExpired`], closed) for
+    /// `reason` since the node started.
+    pub fn link_breaks(&self, reason: BreakReason) -> u64 {
+        self.shared.break_counts[reason as usize].load(Ordering::Relaxed)
     }
 
     /// Close every link whose key is not in `keep`: ready links send `Close`
@@ -589,14 +690,25 @@ impl Client {
     /// ops fail with `Unavailable`. Never lost: a full queue falls back to a
     /// shared list.
     pub fn break_link(&self, key: LinkKey, epoch: Epoch) {
-        if let Err((_, Command::Break(key, epoch))) =
-            self.worker.try_send(Command::Break(key, epoch))
+        self.submit_break(key, epoch, false);
+    }
+
+    /// Like [`Self::break_link`], for a setup the peer declined for a benign
+    /// reason (lost tie-break, rate limit, overload): the key retries after
+    /// [`BACKOFF_MIN`] and its backoff does not escalate.
+    pub fn decline_link(&self, key: LinkKey, epoch: Epoch) {
+        self.submit_break(key, epoch, true);
+    }
+
+    fn submit_break(&self, key: LinkKey, epoch: Epoch, declined: bool) {
+        if let Err((_, Command::Break(key, epoch, declined))) =
+            self.worker.try_send(Command::Break(key, epoch, declined))
         {
             self.shared
                 .breaks
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner)
-                .push((key, epoch));
+                .push((key, epoch, declined));
             self.shared.owner.wake();
         }
     }
@@ -923,8 +1035,8 @@ impl Owner {
                 .unwrap_or_else(PoisonError::into_inner),
         );
 
-        for (key, epoch) in breaks {
-            self.break_matching(key, epoch, now);
+        for (key, epoch, declined) in breaks {
+            self.break_matching(key, epoch, declined, now);
         }
 
         let retain = self
@@ -993,7 +1105,7 @@ impl Owner {
             Command::Open(key, done) => {
                 // The initiator went away: do not leave the link Connecting.
                 if let Err(Ok(opened)) = done.complete(self.open(key, now)) {
-                    self.break_matching(key, opened.epoch, now);
+                    self.break_matching(key, opened.epoch, false, now);
                 }
             }
             Command::Accept {
@@ -1064,7 +1176,9 @@ impl Owner {
                     let _ = done.complete(Err(Error::Unavailable));
                 }
             },
-            Command::Break(key, epoch) => self.break_matching(key, epoch, now),
+            Command::Break(key, epoch, declined) => {
+                self.break_matching(key, epoch, declined, now);
+            }
         }
     }
 
@@ -1590,27 +1704,45 @@ impl Owner {
         result
     }
 
-    fn break_matching(&mut self, key: LinkKey, epoch: Epoch, now: Instant) {
+    fn break_matching(&mut self, key: LinkKey, epoch: Epoch, declined: bool, now: Instant) {
         if self
             .links
             .get(&key)
             .is_some_and(|link| link.epoch() == epoch)
         {
-            self.break_link(key, Break::Error, now);
+            let reason = if declined {
+                BreakReason::Declined
+            } else {
+                BreakReason::Abandoned
+            };
+            self.break_for(key, reason, now);
         }
     }
 
     /// Move `key`'s link to the dying list and record what comes next.
     fn break_link(&mut self, key: LinkKey, reason: Break, now: Instant) {
+        self.break_for(key, BreakReason::of(reason), now);
+    }
+
+    /// Count `reason` in the shared break counters.
+    fn count_break(&self, reason: BreakReason) {
+        self.shared.break_counts[reason as usize].fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn break_for(&mut self, key: LinkKey, reason: BreakReason, now: Instant) {
         let Some(link) = self.links.remove(&key) else {
             return;
         };
 
+        self.count_break(reason);
+
         match reason {
-            Break::PeerClosed | Break::Closed => {
+            BreakReason::PeerClosed | BreakReason::Closed | BreakReason::GrantExpired => {
                 self.backoff.remove(&key);
             }
-            Break::Error | Break::Timeout => {
+            // Benign: retry soon, and forget any escalation.
+            BreakReason::Declined => self.back_off(key, true, now),
+            BreakReason::Error | BreakReason::Timeout | BreakReason::Abandoned => {
                 let reset = link
                     .ready_since()
                     .is_some_and(|since| now.saturating_duration_since(since) >= BACKOFF_RESET);
@@ -1680,7 +1812,14 @@ impl Owner {
 
             let phase = link.phase();
 
-            if let Err(reason) = link.poll(&device.pool, now) {
+            let polled = link.poll(&device.pool, now);
+
+            if link.take_grant_expired() {
+                self.shared.break_counts[BreakReason::GrantExpired as usize]
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+
+            if let Err(reason) = polled {
                 broken.push((*key, reason));
             } else if link.phase() != phase {
                 self.dirty = true;

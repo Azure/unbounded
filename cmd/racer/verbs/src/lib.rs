@@ -97,8 +97,9 @@ pub use channel::Op;
 pub use ffi::Endpoint;
 pub use link::{Arrival, DirectBytes, Epoch, Granted, Source};
 pub use node::{
-    BACKOFF_MAX, BACKOFF_MIN, BACKOFF_RESET, COMMAND_QUEUE, Client, LinkKey, LinkSelector,
-    LinkState, NodeConfig, Opened, Owner, OwnerPort, SETUP_TIMEOUT, Setup, node,
+    BACKOFF_MAX, BACKOFF_MIN, BACKOFF_RESET, BreakReason, COMMAND_QUEUE, Client, EXPOSED_GRACE,
+    LinkCounts, LinkKey, LinkSelector, LinkState, NodeConfig, Opened, Owner, OwnerPort,
+    SETUP_TIMEOUT, Setup, node,
 };
 pub use pool::{BufferState, DevicePage, RegisteredPage};
 pub use role::{DRAIN_REPORT, OwnerRole, OwnerStop};

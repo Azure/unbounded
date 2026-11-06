@@ -17,8 +17,9 @@ use racer_io::{
     exec::{Next, Role},
 };
 use rdma_verbs::{
-    Arrival, BACKOFF_MIN, BufferState, COMMAND_QUEUE, Client, DRAIN_REPORT, Epoch, Error, Granted,
-    LinkKey, LinkState, NodeConfig, Op, Opened, Owner, OwnerRole, SETUP_TIMEOUT, Setup, Source,
+    Arrival, BACKOFF_MAX, BACKOFF_MIN, BreakReason, BufferState, COMMAND_QUEUE, Client,
+    DRAIN_REPORT, EXPOSED_GRACE, Epoch, Error, Granted, LinkKey, LinkState, NodeConfig, Op, Opened,
+    Owner, OwnerRole, SETUP_TIMEOUT, Setup, Source,
     simulation::{
         Device, Fault, MemfdMemory, Operation, Profile, Simulation, current_profile,
         default_profile,
@@ -432,21 +433,39 @@ fn fabric_faults_break_without_producing_pages() {
                 assert_eq!(ready(&written), Ok(()));
             }
             let mut cx = Context::from_waker(futures::task::noop_waker_ref());
-            let arrival = match granted.arrival.poll(&mut cx) {
-                Poll::Ready(result) => result,
+            let (arrival, orphaned) = match granted.arrival.poll(&mut cx) {
+                Poll::Ready(result) => (result, false),
                 Poll::Pending => {
-                    // Nothing reached a: its exposed grant breaks at the deadline.
+                    // Nothing reached a: its exposed grant waits out the
+                    // grace past its deadline, then the link closes.
                     w.clock.advance(5 * SECOND);
                     pump(&mut w);
-                    ready(&granted.arrival)
+                    assert!(pending(&granted.arrival), "{fault:?}");
+                    w.clock.advance(EXPOSED_GRACE);
+                    pump(&mut w);
+                    (ready(&granted.arrival), true)
                 }
             };
             assert_eq!(arrival.err(), Some(Error::Unavailable), "{fault:?}");
+            assert_eq!(w.a.clients[0].buffers(7, BufferState::Free), Some(BUFFERS));
+            if orphaned {
+                // A close, counted as an expired grant.
+                assert_eq!(w.a.clients[0].link_breaks(BreakReason::GrantExpired), 1);
+                // With only the write dropped, the peer is healthy and the
+                // close is clean. With a failed write, the peer already broke
+                // and the `Close` fails.
+                if fault == Fault::Drop {
+                    assert_eq!(w.a.clients[0].link_breaks(BreakReason::Error), 0);
+                    assert_eq!(w.a.clients[0].link_breaks(BreakReason::Closed), 1);
+                    assert_eq!(w.a.clients[0].link(TO_B), LinkState::Idle);
+                }
+                shutdown(w);
+                continue;
+            }
             assert!(
                 matches!(w.a.clients[0].link(TO_B), LinkState::Backoff(_)),
                 "{fault:?}"
             );
-            assert_eq!(w.a.clients[0].buffers(7, BufferState::Free), Some(BUFFERS));
             let reopen = w.a.clients[0].open(TO_B);
             assert_eq!(
                 wait(&mut w, &reopen).err(),
@@ -495,6 +514,82 @@ fn abort_and_backoff() {
             delay >= BACKOFF_MIN * 16 / 10 && delay <= BACKOFF_MIN * 24 / 10,
             "{delay:?}"
         );
+        shutdown(w);
+    });
+}
+
+#[test]
+/// `decline_link` (a benign setup refusal) retries after `BACKOFF_MIN`
+/// without escalating, even after earlier failures, and every break is
+/// counted by reason. Link states are counted from the snapshot.
+fn decline_does_not_escalate_and_breaks_are_counted() {
+    profiles(|| {
+        let mut w = world();
+        let (ea, _) = link_up(&mut w);
+        let counts = w.a.clients[0].link_counts();
+        assert_eq!(counts.ready, 1);
+        assert_eq!(counts.backoff, 0);
+        // A failed setup escalates the backoff.
+        w.a.clients[1].break_link(TO_B, ea);
+        pump(&mut w);
+        assert_eq!(w.a.clients[0].link_breaks(BreakReason::Abandoned), 1);
+        assert_eq!(w.a.clients[0].link_counts().backoff, 1);
+        let LinkState::Backoff(until) = w.a.clients[0].link(TO_B) else {
+            panic!("not backing off");
+        };
+        w.clock.advance(until - w.now());
+        pump(&mut w);
+        // Escalate once more with a setup timeout.
+        let opened = w.a.clients[0].open(TO_B);
+        wait(&mut w, &opened).unwrap();
+        w.clock.advance(SETUP_TIMEOUT);
+        pump(&mut w);
+        assert_eq!(w.a.clients[0].link_breaks(BreakReason::Timeout), 1);
+        let LinkState::Backoff(until) = w.a.clients[0].link(TO_B) else {
+            panic!("not backing off");
+        };
+        w.clock.advance(until - w.now());
+        pump(&mut w);
+        // A declined setup backs off by `BACKOFF_MIN` only.
+        let opened = w.a.clients[0].open(TO_B);
+        let opened = wait(&mut w, &opened).unwrap();
+        assert_eq!(w.a.clients[0].link_counts().connecting, 1);
+        w.a.clients[1].decline_link(TO_B, opened.epoch);
+        pump(&mut w);
+        assert_eq!(w.a.clients[0].link_breaks(BreakReason::Declined), 1);
+        let LinkState::Backoff(until) = w.a.clients[0].link(TO_B) else {
+            panic!("not backing off");
+        };
+        let delay = until - w.now();
+        assert!(
+            delay >= BACKOFF_MIN * 8 / 10 && delay <= BACKOFF_MIN * 12 / 10,
+            "{delay:?}"
+        );
+        assert_eq!(w.a.clients[0].link_breaks(BreakReason::Error), 0);
+        shutdown(w);
+    });
+}
+
+#[test]
+/// The backoff never exceeds `BACKOFF_MAX` (plus jitter).
+fn backoff_is_capped() {
+    profiles(|| {
+        let mut w = world();
+        let mut last = Duration::ZERO;
+        for _ in 0..6 {
+            let opened = w.a.clients[0].open(TO_B);
+            wait(&mut w, &opened).unwrap();
+            w.clock.advance(SETUP_TIMEOUT);
+            pump(&mut w);
+            let LinkState::Backoff(until) = w.a.clients[0].link(TO_B) else {
+                panic!("not backing off");
+            };
+            last = until - w.now();
+            assert!(last <= BACKOFF_MAX * 12 / 10, "{last:?}");
+            w.clock.advance(last);
+            pump(&mut w);
+        }
+        assert!(last >= BACKOFF_MAX * 8 / 10, "{last:?}");
         shutdown(w);
     });
 }
