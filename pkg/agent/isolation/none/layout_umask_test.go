@@ -19,6 +19,7 @@ func withUmask(t *testing.T, mask int) {
 	t.Helper()
 
 	old := syscall.Umask(mask)
+
 	t.Cleanup(func() { syscall.Umask(old) })
 }
 
