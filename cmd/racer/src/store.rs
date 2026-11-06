@@ -1051,7 +1051,7 @@ impl StoreWriter {
             ),
             _metric: self
                 .metrics
-                .lease(crate::telemetry::Gauge::PendingDiskWrites)?,
+                .lease_local(crate::telemetry::Gauge::PendingDiskWrites)?,
             ticket,
             page,
             _reservation: Rc::new(dirty),

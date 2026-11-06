@@ -1700,7 +1700,7 @@ impl Fill {
         let owned_scope = caller_scope.child(caller_scope.request, ceiling)?;
         let mut operation = self.dependencies.flights.retain_driver_operation(
             &leader,
-            self.metrics.lease(Gauge::ActiveFills)?,
+            self.metrics.lease_local(Gauge::ActiveFills)?,
             handover,
         )?;
         let mut owned_budget = acquisition.budget.transfer();

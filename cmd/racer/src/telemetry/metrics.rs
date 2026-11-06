@@ -891,6 +891,15 @@ impl Metrics {
             .lease(gauge)
             .ok_or(crate::error::Error::Overloaded)
     }
+    /// Like [`Metrics::lease`], but counted on this worker's shard slot so
+    /// concurrent workers do not contend on one gauge cache line. The lease may
+    /// be dropped on any thread. Use only for gauges never replaced by
+    /// [`Metrics::set_gauge`] or [`Metrics::add_gauge`].
+    pub fn lease_local(&self, gauge: Gauge) -> Result<crate::telemetry::primitives::Lease> {
+        self.core
+            .lease_shard(gauge)
+            .ok_or(crate::error::Error::Overloaded)
+    }
     /// The destination is bounded by the diagnostic server; no intermediate String.
     /// Relaxed per-series observations are not a coherent snapshot of all workers.
     pub fn write_prometheus(&self, out: &mut impl std::fmt::Write) -> std::fmt::Result {
@@ -1930,6 +1939,23 @@ mod tests {
             drop(workers);
             std::thread::spawn(move || drop(lease)).join().unwrap();
             assert_eq!(reader.gauge(Gauge::ActiveRequests), 5);
+        }
+
+        /// Shard-local fill and disk-write leases sum across workers and
+        /// release from another thread after their writer handles are gone.
+        #[test]
+        fn local_gauge_leases_sum_across_workers_and_release_anywhere() {
+            let workers = Metrics::for_workers(2).unwrap();
+            for gauge in [Gauge::ActiveFills, Gauge::PendingDiskWrites] {
+                let first = workers[0].lease_local(gauge).unwrap();
+                let second = workers[1].lease_local(gauge).unwrap();
+                assert_eq!(workers[0].gauge(gauge), 2);
+                drop(first);
+                assert_eq!(workers[1].gauge(gauge), 1);
+                let reader = workers[0].clone();
+                std::thread::spawn(move || drop(second)).join().unwrap();
+                assert_eq!(reader.gauge(gauge), 0);
+            }
         }
     }
 }
