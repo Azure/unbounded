@@ -74,7 +74,7 @@ func TestNetworkStepsUseTheirOverride(t *testing.T) {
 		return func(context.Context) error { ran = append(ran, name); return err }
 	}
 
-	h := Hooks{SetupNetwork: mark("setup", nil), CleanupNetwork: mark("cleanup", nil), WaitLocalDNS: mark("wait", boom)}
+	h := Hooks{SetupNetwork: mark("setup", nil), CleanupNetwork: mark("cleanup", nil), WaitLocalDNS: func(ctx context.Context, _ *goalstates.NodeStart) error { return mark("wait", boom)(ctx) }}
 
 	require.NoError(t, h.SetupLocalDNSNetwork(t.Context(), quiet(), nil))
 	require.NoError(t, h.CleanupHostNetwork(t.Context(), quiet()))

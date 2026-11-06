@@ -82,6 +82,8 @@ type fixture struct {
 	hook   struct {
 		setup, cleanup, dns, kubelet, download int
 		kubeletErr                             error
+		// dnsWaited is the LocalDNS node listener of each readiness wait.
+		dnsWaited []string
 	}
 }
 
@@ -102,7 +104,12 @@ func newFixture(t *testing.T, dns bool, mutate func(*goalstates.MachineGoalState
 			f.hook.download++
 			return nil
 		}, WaitKubelet: func(context.Context) error { f.hook.kubelet++; return f.hook.kubeletErr }},
-		Hooks: hostnode.Hooks{HostRoot: f.root, SetupNetwork: func(context.Context) error { f.hook.setup++; return nil }, CleanupNetwork: func(context.Context) error { f.hook.cleanup++; return nil }, WaitLocalDNS: func(context.Context) error { f.hook.dns++; return nil }},
+		Hooks: hostnode.Hooks{HostRoot: f.root, SetupNetwork: func(context.Context) error { f.hook.setup++; return nil }, CleanupNetwork: func(context.Context) error { f.hook.cleanup++; return nil }, WaitLocalDNS: func(_ context.Context, ns *goalstates.NodeStart) error {
+			f.hook.dns++
+			f.hook.dnsWaited = append(f.hook.dnsWaited, ns.LocalDNS.NodeListenerIP.String())
+
+			return nil
+		}},
 	})
 
 	return f
@@ -809,7 +816,7 @@ func TestGPUSetupFailureStopsTheStartBeforeAnyUnit(t *testing.T) {
 		Log:       quiet(),
 		GoalState: f.gs,
 		Overrides: Overrides{Layout: none.Layout{Base: filepath.Join(t.TempDir(), "node")}, SystemdDir: f.sys, Run: f.h.run, Proc: filepath.Join(t.TempDir(), "noproc"), ImageArchiveDir: f.images, SetupGPU: func(context.Context) error { return errors.New("no toolkit") }},
-		Hooks:     hostnode.Hooks{HostRoot: f.root, SetupNetwork: func(context.Context) error { return nil }, WaitLocalDNS: func(context.Context) error { return nil }},
+		Hooks:     hostnode.Hooks{HostRoot: f.root, SetupNetwork: func(context.Context) error { return nil }, WaitLocalDNS: func(context.Context, *goalstates.NodeStart) error { return nil }},
 	})
 
 	require.ErrorContains(t, f.node.Start(t.Context(), false, false, false), "no toolkit")
@@ -869,7 +876,7 @@ func TestPrepareNamesAMissingConfiguredToolkit(t *testing.T) {
 		Log:       quiet(),
 		GoalState: f.gs,
 		Overrides: Overrides{Layout: none.Layout{Base: filepath.Join(t.TempDir(), "node")}, SystemdDir: f.sys, Run: f.h.run, Proc: filepath.Join(t.TempDir(), "noproc"), ImageArchiveDir: f.images},
-		Hooks:     hostnode.Hooks{HostRoot: f.root, SetupNetwork: func(context.Context) error { return nil }, WaitLocalDNS: func(context.Context) error { return nil }},
+		Hooks:     hostnode.Hooks{HostRoot: f.root, SetupNetwork: func(context.Context) error { return nil }, WaitLocalDNS: func(context.Context, *goalstates.NodeStart) error { return nil }},
 	})
 
 	_, err := node.Prepare(t.Context())
