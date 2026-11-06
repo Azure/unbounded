@@ -1369,3 +1369,28 @@ fn sim_deadline_heap_stays_bounded_under_churn() {
         "heap len {len}"
     );
 }
+
+#[test]
+fn sim_timer_heap_stays_bounded_when_sleeps_drop() {
+    let os = SimOs::new();
+    let clock = crate::ctx::VirtualClock::new();
+    let reactor = simulated(&os, &clock);
+    let until = clock.now() + Duration::from_secs(30);
+    let waker = std::task::Waker::noop();
+    for _ in 0..1000 {
+        let mut sleep = std::pin::pin!(reactor.sleep_until(until));
+        assert!(
+            sleep
+                .as_mut()
+                .poll(&mut Context::from_waker(waker))
+                .is_pending()
+        );
+    }
+    let state = reactor.state();
+    assert!(state.timers.entries.is_empty());
+    assert!(
+        state.timers.heap.len() <= 65,
+        "heap len {}",
+        state.timers.heap.len()
+    );
+}

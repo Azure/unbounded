@@ -1677,6 +1677,13 @@ struct Timers {
 impl Timers {
     fn insert(&mut self, until: Instant) -> u64 {
         self.next += 1;
+        // Dropped sleeps leave heap entries behind; compact once they
+        // dominate so the heap stays within `2 * entries + 64`.
+        if self.heap.len() > 2 * self.entries.len() + 64 {
+            let entries = &self.entries;
+            self.heap
+                .retain(|Reverse((_, key))| entries.contains_key(key));
+        }
         self.heap.push(Reverse((until, self.next)));
         self.entries.insert(self.next, None);
         self.next
