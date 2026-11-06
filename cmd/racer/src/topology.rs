@@ -1165,11 +1165,11 @@ pub(crate) mod tests {
     /// silent: unavailable for routing until it answers anything.
     #[test]
     fn a_silent_peer_is_routed_around_until_it_answers() {
-        let env = racer_io::Env::host();
         let clock = racer_io::SimClock::new(1);
-        let sim_env = clock.ctx(0);
-        let sim_ctx = sim_env.clone();
-        let health = LinkHealth::on(env.ctx.clock.clone())
+        let sim_ctx = clock.ctx(0);
+        // Health, `sent`, and `now` all read the simulated clock, so advancing
+        // it is what makes the exchange overdue.
+        let health = LinkHealth::on(sim_ctx.clock.clone())
             .with_silence(Duration::from_secs(10), Duration::from_secs(2));
         let peer = NodeId("peer".into());
         let page = crate::model::PageId {
