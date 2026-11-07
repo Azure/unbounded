@@ -18,6 +18,7 @@ import (
 	"github.com/Azure/unbounded/internal/hostroot"
 	"github.com/Azure/unbounded/internal/provision"
 	"github.com/Azure/unbounded/pkg/agent/goalstates"
+	"github.com/Azure/unbounded/pkg/agent/isolation"
 	"github.com/Azure/unbounded/pkg/agent/phases"
 	"github.com/Azure/unbounded/pkg/agent/phases/nodestart"
 )
@@ -67,11 +68,33 @@ func canonicalImageIdentity(image string) string {
 func bootstrapIdentity(cfg *provision.UnboundedAgentConfig) (bootstrap.Identity, error) {
 	// Keep identity tied to the cluster and installed rootfs, while allowing
 	// credentials and artifact locations to be refreshed for a retry.
-	data, err := json.Marshal(struct {
+	identity := struct {
 		KubernetesVersion string
 		OCIImage          string
 		APIServer         string
-	}{strings.TrimPrefix(cfg.Cluster.Version, "v"), canonicalImageIdentity(cfg.OCIImage), cfg.Kubelet.ApiServer})
+	}{strings.TrimPrefix(cfg.Cluster.Version, "v"), canonicalImageIdentity(cfg.OCIImage), cfg.Kubelet.ApiServer}
+
+	// The isolation mode is part of the identity only when it is not the
+	// default, so every nspawn installation, with the mode unset or set to
+	// nspawn, keeps its recorded fingerprint. A host installed in one mode then
+	// refuses a start in another until it is reset, instead of building a
+	// second node stack beside the first.
+	var (
+		data []byte
+		err  error
+	)
+
+	if mode, merr := cfg.IsolationMode(); merr == nil && mode != isolation.DefaultMode {
+		data, err = json.Marshal(struct {
+			KubernetesVersion string
+			OCIImage          string
+			APIServer         string
+			Isolation         string
+		}{identity.KubernetesVersion, identity.OCIImage, identity.APIServer, string(mode)})
+	} else {
+		data, err = json.Marshal(identity)
+	}
+
 	if err != nil {
 		return bootstrap.Identity{}, err
 	}

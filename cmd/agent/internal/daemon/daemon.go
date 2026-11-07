@@ -330,7 +330,7 @@ func registerMachine(ctx context.Context, log *slog.Logger, c client.Client, cfg
 			slog.String("machineID", string(machine.UID)),
 		)
 
-		return reportProvisioningFormat(ctx, c, cfg)
+		return reportMachineObservations(ctx, log, c, cfg)
 	} else if apimeta.IsNoMatchError(err) {
 		return fmt.Errorf("machine CRD is not installed (machina not deployed?): %w", err)
 	} else if !apierrors.IsNotFound(err) {
@@ -343,7 +343,7 @@ func registerMachine(ctx context.Context, log *slog.Logger, c client.Client, cfg
 	machine = buildMachineCR(cfg)
 	if err := c.Create(ctx, &machine); apierrors.IsAlreadyExists(err) {
 		log.Info("Machine CR was created by another client", slog.String("machine", machineName))
-		return reportProvisioningFormat(ctx, c, cfg)
+		return reportMachineObservations(ctx, log, c, cfg)
 	} else if err != nil {
 		return fmt.Errorf("create Machine CR %q: %w", machineName, err)
 	}
@@ -354,7 +354,7 @@ func registerMachine(ctx context.Context, log *slog.Logger, c client.Client, cfg
 		slog.String("machineID", string(machine.UID)),
 	)
 
-	return reportProvisioningFormat(ctx, c, cfg)
+	return reportMachineObservations(ctx, log, c, cfg)
 }
 
 // Report only explicit installation observations, using existing status
@@ -410,6 +410,11 @@ func buildMachineCR(cfg *provision.AgentConfig) v1alpha3.Machine {
 				NodeLabels:         cfg.Kubelet.Labels,
 				RegisterWithTaints: cfg.Kubelet.RegisterWithTaints,
 			},
+			// The agent registers a Machine nobody created. Its spec says the
+			// mode the agent runs, or IsolationDrift would be True from the
+			// first reconcile. This create is the only time the agent writes
+			// spec.isolation; it never writes the spec of an existing Machine.
+			Isolation: v1alpha3.IsolationMode(cfg.Isolation),
 		},
 	}
 
