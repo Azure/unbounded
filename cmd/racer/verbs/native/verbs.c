@@ -23,6 +23,7 @@
 #include <fcntl.h>
 #include <limits.h>
 #include <stdint.h>
+#include <stdio.h>
 #include <stddef.h>
 #include <stdlib.h>
 #include <string.h>
@@ -251,7 +252,10 @@ void *rdma_verbs_open(const char *name, int cm) {
     if (cm) {
         int m = 0;
         struct ibv_context **list = rdma_get_devices(&m);
-        if (!list) return NULL;
+        if (!list) {
+            fprintf(stderr, "racer: stage=rdma-open device=%s cm=1 step=get_devices errno=%d\n", name, errno);
+            return NULL;
+        }
         for (int i = 0; i < m; ++i) {
             if (strcmp(name, ibv_get_device_name(list[i]->device))) continue;
             struct rdma_verbs_device *d = calloc(1, sizeof(*d));
@@ -259,9 +263,12 @@ void *rdma_verbs_open(const char *name, int cm) {
             d->ctx = list[i]; d->cm_list = list;
             d->pd = ibv_alloc_pd(d->ctx);
             if (d->pd) return d;
+            fprintf(stderr, "racer: stage=rdma-open device=%s cm=1 step=alloc_pd errno=%d\n", name, errno);
             free(d);
-            break;
+            rdma_free_devices(list);
+            return NULL;
         }
+        fprintf(stderr, "racer: stage=rdma-open device=%s cm=1 step=lookup devices=%d\n", name, m);
         rdma_free_devices(list);
         return NULL;
     }

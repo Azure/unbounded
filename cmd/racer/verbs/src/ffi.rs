@@ -875,6 +875,10 @@ fn discover_with_api(
         } else if port.flags & PORT_RC != 0 && port.ipv4_index >= 0 {
             (Mode::Registration, port.ipv4_gid)
         } else {
+            eprintln!(
+                "racer: stage=rdma-discover device={name} port={} skipped=no_mode flags={} ipv4_index={}",
+                port.port, port.flags, port.ipv4_index
+            );
             continue;
         };
         let open_quota = quota();
@@ -889,6 +893,10 @@ fn discover_with_api(
             return Err(Error::Unavailable);
         }
         let Some(raw) = NonNull::new(raw) else {
+            eprintln!(
+                "racer: stage=rdma-discover device={name} port={} skipped=open_failed mode={mode:?}",
+                port.port
+            );
             continue;
         };
         // From here dropping `device` releases whatever was set up.
