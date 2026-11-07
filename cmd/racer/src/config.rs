@@ -82,7 +82,16 @@ pub struct ScaledLimits {
     pub path_cache_bytes: bool,
     pub metadata_entries: bool,
     pub relay_transfers: bool,
+    /// Neither registered-memory variable was set, so the scaled default is
+    /// capped at [`DEFAULT_REGISTERED_BYTES_CAP`].
+    pub registered_bytes_default_cap: bool,
 }
+
+/// Node-wide ceiling on the default RDMA registered pool. The per-worker
+/// default scales the pool with node size, so small nodes pin little memory,
+/// while large nodes stop at a pool that still holds 56 buffers per rail on
+/// eight rails. An explicit setting is never capped.
+pub const DEFAULT_REGISTERED_BYTES_CAP: u64 = 8 * 1024 * MIB;
 
 /// Origin transport and Azure credential settings.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -367,7 +376,10 @@ impl Config {
             metadata_entries,
             relay_transfers,
         ] = scaled;
+        let registered_bytes_default_cap =
+            !v.is_set("RACER_REGISTERED_BYTES") && !v.is_set("RACER_REGISTERED_BYTES_PER_WORKER");
         let scaled_limits = ScaledLimits {
+            registered_bytes_default_cap,
             plaintext_bytes,
             ciphertext_bytes,
             dirty_bytes,
@@ -578,6 +590,13 @@ impl Config {
         scale(&mut limits.path_cache_bytes, scaled.path_cache_bytes)?;
         scale(&mut limits.metadata_entries, scaled.metadata_entries)?;
         scale(&mut limits.relay_transfers, scaled.relay_transfers)?;
+        if scaled.registered_bytes_default_cap {
+            let cap = usize::try_from(DEFAULT_REGISTERED_BYTES_CAP).unwrap_or(usize::MAX);
+            if limits.registered_bytes.get() > cap {
+                limits.registered_bytes =
+                    NonZeroUsize::new(cap).ok_or(Error::InvalidConfiguration)?;
+            }
+        }
         self.limits = scratch;
         self.scaled_limits = ScaledLimits::default();
         Ok(())
@@ -1364,6 +1383,7 @@ mod tests {
                 path_cache_bytes: true,
                 metadata_entries: true,
                 relay_transfers: true,
+                registered_bytes_default_cap: true,
             }
         );
         // An explicit per-worker amount is still scaled.
@@ -1376,6 +1396,26 @@ mod tests {
         assert!(!node.scaled_limits.flights);
         node.scale_limits(3).unwrap();
         assert_eq!(node.limits.flights.get(), 10);
+        // The default registered pool scales with workers up to its cap.
+        let per_worker = 384 * MIB as usize;
+        let mut small = parse(&[]).unwrap();
+        small.scale_limits(2).unwrap();
+        assert_eq!(small.limits.registered_bytes.get(), 2 * per_worker);
+        let mut large = parse(&[]).unwrap();
+        large.scale_limits(86).unwrap();
+        assert_eq!(
+            large.limits.registered_bytes.get() as u64,
+            DEFAULT_REGISTERED_BYTES_CAP
+        );
+        // An explicit per-worker amount or node-wide total is never capped.
+        let mut explicit = parse(&[("RACER_REGISTERED_BYTES_PER_WORKER", "402653184")]).unwrap();
+        assert!(!explicit.scaled_limits.registered_bytes_default_cap);
+        explicit.scale_limits(86).unwrap();
+        assert_eq!(explicit.limits.registered_bytes.get(), 86 * per_worker);
+        let total = 16 * 1024 * MIB;
+        let mut node = parse(&[("RACER_REGISTERED_BYTES", &total.to_string())]).unwrap();
+        node.scale_limits(86).unwrap();
+        assert_eq!(node.limits.registered_bytes.get() as u64, total);
         // Each pair is a node-wide name and its per-worker name.
         for (node_name, worker_name) in table::SHARED_BUDGETS {
             assert_eq!(format!("{node_name}_PER_WORKER"), worker_name);
@@ -2320,11 +2360,11 @@ mod tests {
             let before = config.limits.clone();
             config.scale_limits(workers).unwrap();
             for (name, field) in SCALED_FIELDS {
-                assert_eq!(
-                    field(&config.limits).get(),
-                    field(&before).get() * workers,
-                    "{name}"
-                );
+                let mut expected = field(&before).get() * workers;
+                if name == "RACER_REGISTERED_BYTES" {
+                    expected = expected.min(DEFAULT_REGISTERED_BYTES_CAP as usize);
+                }
+                assert_eq!(field(&config.limits).get(), expected, "{name}");
             }
             for field in [
                 (|l: &Limits| l.waiters_per_flight) as fn(&Limits) -> NonZeroUsize,
@@ -2425,7 +2465,7 @@ mod tests {
             vec![("RACER_PEER_INFLIGHT_MAX", "0")],
             vec![("RACER_PEER_INFLIGHT_MAX", "65537")],
             vec![("RACER_PEER_PER_NEIGHBOR_MAX", "0")],
-            vec![("RACER_PEER_PER_NEIGHBOR_MAX", "257")],
+            vec![("RACER_PEER_PER_NEIGHBOR_MAX", "4097")],
             vec![("RACER_PEER_ADMISSION_RECOVERY_MS", "0")],
             vec![("RACER_PEER_ADMISSION_RECOVERY_MS", "60001")],
         ] {

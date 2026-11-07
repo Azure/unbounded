@@ -144,7 +144,7 @@ const LIMITS: [[Var; 2]; 16] = [
         "RACER_PLAINTEXT_BYTES",
         "RACER_PLAINTEXT_BYTES_PER_WORKER",
         uint(1, MAX_BYTES, BYTES),
-        "67108864",
+        "134217728",
         "Plaintext admission budget for in-flight decrypts and pages held by range reads. Each worker's share must fit one page more than `RACER_RANGE_WINDOW_PAGES`."
     ),
     shared_budget!(
@@ -166,7 +166,7 @@ const LIMITS: [[Var; 2]; 16] = [
         "RACER_REGISTERED_BYTES_PER_WORKER",
         uint(1, MAX_BYTES, BYTES),
         "402653184",
-        "Native RDMA page-buffer pool, used only when RDMA is enabled; then at least one page plus 16 bytes. One native thread owns the whole pool, so it is never divided. Each grant holds one 18 MiB buffer until its page is consumed; `racer_rdma_free_buffers` shows what is left."
+        "Native RDMA page-buffer pool, used only when RDMA is enabled; then at least one page plus 16 bytes. One native thread owns the whole pool, so it is never divided. When neither variable is set, the scaled default is capped at 8 GiB node-wide. The pool is split evenly over RDMA rails, and a rail without a whole buffer is not used. Each grant holds one 18 MiB buffer until its page is consumed; `racer_rdma_free_buffers` shows what is left."
     ),
     shared_budget!(
         "RACER_REQUEST_CONTEXT_BYTES",
@@ -515,7 +515,7 @@ const BASE: &[Var] = &[
         "RACER_RANGE_WINDOW_PAGES",
         Group::Limits,
         uint(1, 64, COUNT),
-        Value("2"),
+        Value("4"),
         "Pages each read fetches ahead of delivery, in any order.",
     ),
     var(
@@ -572,14 +572,14 @@ const BASE: &[Var] = &[
         "RACER_PEER_INFLIGHT_MAX",
         Group::Network,
         uint(1, 65_536, COUNT),
-        Value("256"),
+        Value("4096"),
         "Peer exchanges in flight.",
     ),
     var(
         "RACER_PEER_PER_NEIGHBOR_MAX",
         Group::Network,
         uint(1, 65_536, COUNT),
-        Value("32"),
+        Value("512"),
         "Peer exchanges in flight to one neighbor; at most `RACER_PEER_INFLIGHT_MAX`.",
     ),
     var(

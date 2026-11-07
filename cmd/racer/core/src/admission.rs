@@ -149,7 +149,7 @@ impl Default for Limits {
     /// dimensions are stated per worker and scaled by the I/O worker count during sizing.
     fn default() -> Self {
         Self {
-            plaintext_bytes: nz(64 * MIB),
+            plaintext_bytes: nz(128 * MIB),
             ciphertext_bytes: nz(128 * MIB),
             dirty_bytes: nz(160 * MIB),
             registered_bytes: nz(384 * MIB),
@@ -162,7 +162,7 @@ impl Default for Limits {
             peer_connections: nz(PEER_CONNECTIONS),
             outbound_connections: nz(OUTBOUND_CONNECTIONS),
             pipes: nz(16),
-            range_window_pages: nz(2),
+            range_window_pages: nz(4),
             header_bytes: nz(32 * 1024),
             placement_cache_bytes: nz(16 * MIB),
             cached_paths: nz(128),

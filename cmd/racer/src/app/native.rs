@@ -1060,7 +1060,8 @@ mod tests {
                 .map(|value| value.parse::<usize>().unwrap())
                 .unwrap_or(crate::config::DEFAULT_MAX_THREADS)
         );
-        assert_eq!(config.slab_bytes, 1024 * 1024 * 1024);
+        assert_eq!(config.slab_bytes, 4 * 1024 * 1024 * 1024);
+        assert_eq!(config.segment_bytes, 1024 * 1024 * 1024);
         // Byte budgets stay unset so the runtime scales them per I/O worker.
         for key in [
             "RACER_PLAINTEXT_BYTES",
@@ -1078,11 +1079,13 @@ mod tests {
         assert_eq!(plan.pairs.len(), 5);
         let admission = flow_control::Quotas::new(AdmissionPolicy::new(limits.clone()));
         let page = crate::model::PAGE_BYTES as usize;
+        // Progress floors hold one page more than the range window.
+        let pages = config.limits.range_window_pages.get() + 1;
         for (class, floor) in [
-            (ResourceClass::Plaintext, 3 * page),
+            (ResourceClass::Plaintext, pages * page),
             (
                 ResourceClass::Ciphertext,
-                3 * (page + 16) + crate::store::MAX_HEADER_BYTES,
+                pages * (page + 16) + crate::store::MAX_HEADER_BYTES,
             ),
             (ResourceClass::DirtyCiphertext, page + 16),
             (
@@ -1107,7 +1110,7 @@ mod tests {
         // Reducing thread cap or quotas keeps local groups and re-partitions the
         // node budget. An impossible byte floor must fail rather than deadlock.
         let mut too_small = config.limits.clone();
-        too_small.plaintext_bytes = NonZeroUsize::new(3 * page - 1).unwrap();
+        too_small.plaintext_bytes = NonZeroUsize::new(pages * page - 1).unwrap();
         assert!(size_workers(&too_small, &mut plan, false).is_err());
     }
 
@@ -1271,7 +1274,8 @@ mod tests {
                 assert_eq!(partition.get(), node / expected);
             }
             assert_eq!(limits.connections_per_neighbor.get(), 16);
-            let floor = 3 * crate::model::PAGE_BYTES as usize;
+            let floor =
+                (config.limits.range_window_pages.get() + 1) * crate::model::PAGE_BYTES as usize;
             config.limits.plaintext_bytes = NonZeroUsize::new(2 * floor).unwrap();
             let mut plan = make_plan(&config);
             let result = size_workers(&config.limits, &mut plan, false);
@@ -1309,7 +1313,8 @@ mod tests {
         use crate::affinity::EffectiveTopology;
         let mut config = default_config(false);
         config.scale_limits(11).unwrap();
-        let floor = 3 * crate::model::PAGE_BYTES as usize;
+        let floor =
+            (config.limits.range_window_pages.get() + 1) * crate::model::PAGE_BYTES as usize;
         for supported in 1..=10 {
             config.limits.plaintext_bytes = NonZeroUsize::new(supported * floor).unwrap();
             config.limits.ciphertext_bytes = NonZeroUsize::new(1024 * 1024 * 1024).unwrap();

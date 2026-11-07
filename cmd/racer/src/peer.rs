@@ -118,8 +118,8 @@ pub struct Config {
 impl Default for Config {
     fn default() -> Self {
         Self {
-            total: 256,
-            per_peer: 32,
+            total: 4096,
+            per_peer: 512,
             recovery: RECOVERY,
         }
     }
