@@ -72,14 +72,14 @@ data:
   RACER_CHECKPOINT_BYTES: "67108864"
   # Shared admission budgets come in two forms. RACER_<NAME>_PER_WORKER, which
   # carries the default, is multiplied by the final I/O worker count, so
-  # automatic sizing works on any core count: plaintext 64 MiB, ciphertext
+  # automatic sizing works on any core count: plaintext 128 MiB, ciphertext
   # 128 MiB, dirty 160 MiB, request context 32 MiB, and registered 384 MiB
-  # (native RDMA only) per worker. The plain RACER_<NAME> is a node-wide total
+  # (native RDMA only, capped at 8 GiB per node by default) per worker. The plain RACER_<NAME> is a node-wide total
   # divided across workers; startup fails if it cannot fund at least half of the
   # planned I/O workers. Set at most one form of each budget.
-  # Each worker needs roughly 115 MiB of these byte budgets at minimum
-  # (plaintext and ciphertext about 48 MiB each, dirty 16 MiB, plus request
-  # context) with the default range window of two pages.
+  # Each worker needs roughly 210 MiB of these byte budgets at minimum
+  # (plaintext about 80 MiB, ciphertext about 96 MiB, dirty 16 MiB, plus
+  # request context) with the default range window of four pages.
   # Budgets are admission ceilings, not reservations: resident memory grows
   # toward them under load, so per-worker defaults scale with core count.
   # To bound memory, cap total threads with RACER_MAX_THREADS, or set
@@ -113,6 +113,8 @@ data:
   # RACER_SLAB_DIRECTORY still holds checkpoints and must remain writable.
   # Cluster-bound checkpoints restore completed-page holds, not jobs or credentials.
   # Older formats and incompatible layouts start cold; no fsync crash guarantee.
-  RACER_SLAB_BYTES_PER_WORKER: "1073741824"
-  RACER_SEGMENT_BYTES: "67108864"
+  # 1 GiB segments keep per-segment tail waste small with 16 MiB pages; a slab
+  # must hold more whole segments than the free reserve.
+  RACER_SLAB_BYTES_PER_WORKER: "4294967296"
+  RACER_SEGMENT_BYTES: "1073741824"
   RACER_FREE_SEGMENT_RESERVE_PER_WORKER: "2"

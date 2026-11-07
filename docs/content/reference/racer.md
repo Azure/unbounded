@@ -1590,6 +1590,15 @@ override for host networking and set `RACER_NVIDIA` in
 `racer-config`. The operator does
 not silently discard them or stop the old controller first.
 
+The operator writes `racer-settings` only when it is absent, so upgrades keep
+existing values. New installs seed `RACER_SEGMENT_BYTES` at 1 GiB and
+`RACER_SLAB_BYTES_PER_WORKER` at 4 GiB; earlier releases seeded 64 MiB and
+1 GiB. A 64 MiB segment holds only three 16 MiB page records, wasting about a
+quarter of each device and leaving a small free-segment reserve. To adopt the
+new geometry on an existing install, edit both keys in `racer-settings`; this
+changes storage geometry and starts a cold cache. Keys absent from
+`racer-settings` take the dataplane defaults of the new release.
+
 Expect a cold cache after changing device layout,
 worker count, or storage geometry. Recovery does not scan payloads to rebuild
 the cache. Make sure origins can serve the resulting misses.
