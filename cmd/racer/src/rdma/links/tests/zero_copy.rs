@@ -378,3 +378,76 @@ fn rehome_aligned_copies_shared_pages_into_the_pool() {
     pump!(w);
     assert_eq!(free(&w), Some(2));
 }
+
+/// Copying a registered page out for retention evicts idle entries of its
+/// cache when their charges hold the share, and still fails `Overloaded`
+/// without evicting when every entry is in use.
+#[test]
+fn memory_cache_copy_out_reclaims_idle_entries_before_overloaded() {
+    let env = racer_io::Env::host();
+    let mut w = world();
+    link_up(&env, &mut w);
+    let granule = page_alloc::buf::GRANULE;
+    let mut limits = crate::test_support::cluster::config(false).limits;
+    limits.metadata_entries = std::num::NonZeroUsize::new(16).unwrap();
+    // Two cached pages, the registered arrival, and less than one copy.
+    limits.ciphertext_bytes = std::num::NonZeroUsize::new(3 * granule + 19).unwrap();
+    let admission = Rc::new(flow_control::Quotas::new(AdmissionPolicy::new(limits)));
+    let cache = MemoryCache::new(
+        BufferPool::new(admission.clone()),
+        crate::test_support::availability(&env),
+    );
+    let ids: Vec<_> = [1u8, 2]
+        .into_iter()
+        .map(|key| {
+            let page = crate::memory::tests::bundle_for(
+                &admission,
+                crate::model::VersionMetadata {
+                    content_type: None,
+                    version: crate::model::ObjectVersion {
+                        object: crate::model::ObjectId {
+                            cache: racer_wire::control::CacheId(
+                                crate::test_support::security::CACHE.into(),
+                            ),
+                            key: crate::model::CacheKey([key; 32]),
+                        },
+                        etag: crate::model::StrongEtag::test_value("a"),
+                    },
+                    length: 3,
+                },
+            );
+            let id = page.plaintext.page().clone();
+            cache.publish(page).unwrap();
+            id
+        })
+        .collect();
+    assert_eq!(admission.used(ResourceClass::Ciphertext), 2 * granule);
+    let page = bundle(&admission, "v1");
+    let cache_id = page.plaintext.page().version.object.cache.clone();
+    let mut result = page.clone();
+    result.ciphertext = registered(&env, &mut w, &admission, &page.ciphertext);
+    drop(page);
+    let _filler = admission
+        .reserve(Some(&cache_id), ResourceClass::Ciphertext, granule - 1)
+        .unwrap();
+    // Readers hold every entry: nothing is evicted and the copy-out fails.
+    let readers: Vec<_> = ids
+        .iter()
+        .map(|id| cache.ciphertext(id).unwrap().unwrap())
+        .collect();
+    assert_eq!(cache.publish(result.clone()).err(), Some(Error::Overloaded));
+    for id in &ids {
+        assert!(cache.ciphertext(id).unwrap().is_some());
+    }
+    // Idle entries yield to the copy-out.
+    drop(readers);
+    cache.publish(result.clone()).unwrap();
+    let cached = cache.ciphertext(result.plaintext.page()).unwrap().unwrap();
+    assert!(!cached.ciphertext.is_registered());
+    let evicted = ids
+        .iter()
+        .filter(|id| cache.ciphertext(id).unwrap().is_none())
+        .count();
+    assert!(evicted >= 1);
+    assert!(admission.used(ResourceClass::Ciphertext) <= 3 * granule + 19);
+}

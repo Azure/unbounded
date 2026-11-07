@@ -1573,7 +1573,7 @@ impl MemoryCache {
         {
             return Ok(());
         }
-        page.copy.ciphertext = self.pool.retainable(page.copy.ciphertext)?;
+        page.copy.ciphertext = self.retainable(page.copy.ciphertext)?;
         let id = &page.copy.ciphertext.envelope().page;
         let mut entries = self.ciphertext_entries.borrow_mut();
         if entries.contains_key(id) {
@@ -1587,6 +1587,34 @@ impl MemoryCache {
         drop(entries);
         self.keep_headroom(&cache);
         Ok(())
+    }
+    /// Copy registered ciphertext out for retention, evicting idle entries of
+    /// its cache once if the copy's charge is refused. Retained entries hold
+    /// their Ciphertext charge, so a full cache would otherwise refuse the
+    /// copy while holding idle bytes. Called before any entry borrow.
+    fn retainable(&self, ciphertext: CiphertextPage) -> Result<CiphertextPage> {
+        match self.pool.retainable(ciphertext.clone()) {
+            Err(Error::Overloaded) => {}
+            result => return result,
+        }
+        let class = ResourceClass::Ciphertext;
+        let cache = &ciphertext.envelope().page.version.object.cache;
+        let amount = self
+            .pool
+            .aligned_capacity(ciphertext.bytes().len())
+            .unwrap_or(ciphertext.bytes().len());
+        let admission = &self.pool.admission;
+        if let Some((owner, bytes)) = admission.reclamation(cache, class, amount) {
+            self.reclaim(
+                class,
+                owner.as_ref(),
+                bytes,
+                |cache| admission.excess(cache, class),
+                |_, _| 0,
+                |_, _| 0,
+            );
+        }
+        self.pool.retainable(ciphertext)
     }
     /// Evict idle entries so `cache` can still admit one range window of
     /// ciphertext. Retained entries keep their Ciphertext charge, so a full
@@ -1669,7 +1697,7 @@ impl MemoryCache {
                 .pages
                 .contains_key(page.plaintext.page())
         {
-            page.ciphertext = self.pool.retainable(page.ciphertext)?;
+            page.ciphertext = self.retainable(page.ciphertext)?;
         }
         let id = page.plaintext.page();
         self.ciphertext_entries.borrow_mut().remove(id);
