@@ -110,6 +110,8 @@ func Preflight(log *slog.Logger, cfg config.AgentConfig, _ *goalstates.MachineGo
 	switch mode {
 	case isolation.ModeNone:
 		checks = append(checks, CheckNoneBackend(log))
+	case isolation.ModeContainer:
+		checks = append(checks, CheckContainerBackend(log))
 	case isolation.ModeNSpawn:
 		checks = append(checks, CheckNSpawnRuntime(log))
 	}

@@ -122,6 +122,26 @@ class CatalogTests(unittest.TestCase):
         self.assertEqual(t03.suite, "isolation-rollback")
         self.assertEqual(t03.isolation_mode, "")
 
+    def test_the_in_place_rollback_scenario_starts_in_container(self):
+        """Only a container host keeps its configuration at the shared host
+        paths the rollback digest compares."""
+        t04 = next(s for s in plan.CATALOG if s.id == "T04")
+        self.assertEqual(t04.suite, "isolation-rollback-in-place")
+        self.assertEqual(t04.isolation_mode, "container")
+
+    def test_container_scenarios_are_marked_provisional_or_need_their_platform(self):
+        for scenario in plan.CATALOG:
+            if scenario.isolation_mode == "container":
+                self.assertTrue("provisional" in scenario.tags or scenario.requires, scenario.id)
+        a01 = plan.SCENARIOS_BY_ID["A01"]
+        self.assertEqual(a01.requires, ("host-os:acl",))
+        self.assertIn("acl", plan.skip_reason(a01, "ubuntu2404"))
+
+    def test_every_suite_in_the_catalog_exists(self):
+        for scenario in plan.CATALOG:
+            if scenario.suite:
+                self.assertIn(scenario.suite, e2e.SUITES, scenario.id)
+
     def test_reset_scenarios_cover_every_mode_and_a_reprovisioned_node(self):
         """The uninstall script is gone; `unbounded-agent reset` on the host is
         what the reset scenarios check, in every mode and after a reprovision."""

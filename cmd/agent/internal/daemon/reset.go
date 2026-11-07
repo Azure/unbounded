@@ -14,6 +14,7 @@ import (
 
 	"golang.org/x/sys/unix"
 
+	"github.com/Azure/unbounded/cmd/agent/internal/containerops"
 	"github.com/Azure/unbounded/cmd/agent/internal/installstate"
 	"github.com/Azure/unbounded/cmd/agent/internal/noneops"
 	"github.com/Azure/unbounded/internal/executil"
@@ -191,6 +192,11 @@ type resetHost struct {
 	nonePresent func() bool
 	// noneTeardown is the none node's teardown.
 	noneTeardown func(log *slog.Logger) hostNodeTeardown
+	// containerPresent reports whether the host has traces of a container
+	// node: the agent's container layout directory or a slot's unit.
+	containerPresent func() bool
+	// containerTeardown is the container node's teardown.
+	containerTeardown func(log *slog.Logger) hostNodeTeardown
 }
 
 func defaultResetHost() resetHost {
@@ -199,7 +205,31 @@ func defaultResetHost() resetHost {
 		noneTeardown: func(log *slog.Logger) hostNodeTeardown {
 			return &noneops.Teardown{Log: log, Layout: none.Layout{}}
 		},
+		containerPresent: containerops.Present,
+		containerTeardown: func(log *slog.Logger) hostNodeTeardown {
+			return &containerops.Teardown{Log: log}
+		},
 	}
+}
+
+// presentTeardowns returns the teardown of every non-nspawn mode whose traces
+// are on the host, in a fixed order.
+func (h resetHost) presentTeardowns(log *slog.Logger) []hostNodeTeardown {
+	var out []hostNodeTeardown
+
+	for _, m := range []struct {
+		present  func() bool
+		teardown func(*slog.Logger) hostNodeTeardown
+	}{
+		{h.nonePresent, h.noneTeardown},
+		{h.containerPresent, h.containerTeardown},
+	} {
+		if m.present != nil && m.teardown != nil && m.present() {
+			out = append(out, m.teardown(log))
+		}
+	}
+
+	return out
 }
 
 // resetResources is the whole reset: the node and everything the agent
@@ -226,30 +256,28 @@ func resetNodeResources(log *slog.Logger) phases.Task {
 // artifacts, systemd reload. Each mode's tasks sit in the position of the nspawn task they
 // correspond to.
 func resetResourcesOn(log *slog.Logger, h resetHost) phases.Task {
-	var noneNode hostNodeTeardown
-	if h.nonePresent != nil && h.nonePresent() {
-		noneNode = h.noneTeardown(log)
-	}
+	present := h.presentTeardowns(log)
 
-	withNone := func(nspawn phases.Task, pick func(hostNodeTeardown) phases.Task) []phases.Task {
-		if noneNode == nil {
-			return []phases.Task{nspawn}
+	withModes := func(nspawn phases.Task, pick func(hostNodeTeardown) phases.Task) []phases.Task {
+		out := []phases.Task{nspawn}
+		for _, t := range present {
+			out = append(out, pick(t))
 		}
 
-		return []phases.Task{nspawn, pick(noneNode)}
+		return out
 	}
 
 	tasks := []phases.Task{RemoveDaemonUnit(log)}
-	tasks = append(tasks, withNone(phases.Parallel(log,
+	tasks = append(tasks, withModes(phases.Parallel(log,
 		reset.StopMachine(log, goalstates.NSpawnMachineKube1),
 		reset.StopMachine(log, goalstates.NSpawnMachineKube2),
 	), hostNodeTeardown.Stop)...)
 	tasks = append(tasks, reset.RemoveWireGuardKeys(log))
-	tasks = append(tasks, withNone(phases.Parallel(log,
+	tasks = append(tasks, withModes(phases.Parallel(log,
 		reset.RemoveNSpawnConfig(log, goalstates.NSpawnMachineKube1),
 		reset.RemoveNSpawnConfig(log, goalstates.NSpawnMachineKube2),
 	), hostNodeTeardown.RemoveConfig)...)
-	tasks = append(tasks, withNone(phases.Parallel(log,
+	tasks = append(tasks, withModes(phases.Parallel(log,
 		reset.RemoveMachine(log, goalstates.NSpawnMachineKube1),
 		reset.RemoveMachine(log, goalstates.NSpawnMachineKube2),
 	), hostNodeTeardown.Destroy)...)

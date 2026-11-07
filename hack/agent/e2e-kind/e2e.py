@@ -55,7 +55,15 @@ Subcommands (called as individual workflow steps):
     declare-isolation-mismatch         Set spec.isolation to an unapplied mode and verify drift appears.
     validate-reprovision-refused       Declare a mode that needs a reprovision without the opt-in and
                                        verify the change is refused and the node stays in its mode.
-    validate-isolation-preflight       Run preflight with --isolation and verify the mode's own check ran.
+    validate-experimental-refused      Declare container on a host whose agent config does not opt in and
+                                       verify the change is refused and the node stays in its mode.
+    validate-change-needs-nspawn-runtime
+                                       Verify a change to nspawn is refused while the host lacks machinectl.
+    install-nspawn-runtime             Install systemd-container on the host.
+    validate-change-rollback-config    Fail an in-place change and verify shared host config is restored.
+    validate-change-rollback-to-container
+                                       Fail an in-place change to container and verify rollback.
+    validate-isolation-preflight      Run preflight with --isolation and verify the mode's own check ran.
     reset-agent-on-host                Run unbounded-agent reset on the host and verify it is clean.
     validate-no-reprovision-handoff    Verify no reprovision handoff unit or staged config is left.
     validate-same-mode-declaration     Declare the applied mode and verify nothing moves or is recorded.
@@ -145,16 +153,34 @@ E2E_SITE_NAME = os.environ.get("E2E_SITE_NAME", "e2e")
 # Fixed nspawn machine names used by unbounded-agent (decoupled from the kube node name).
 NSPAWN_MACHINE_NAMES = ["kube1", "kube2"]
 
-# Isolation mode under test, from ISOLATION_MODE: nspawn or none. Empty is
-# today's behavior: no --isolation flag is passed, the host runs the default
-# nspawn mode, and every existing step behaves exactly as before. A new mode is
-# added here, with its node-stack checks in the helpers that branch on
+# Isolation mode under test, from ISOLATION_MODE: nspawn, none or container.
+# Empty is today's behavior: no --isolation flag is passed, the host runs the
+# default nspawn mode, and every existing step behaves exactly as before. A new
+# mode is added here, with its node-stack checks in the helpers that branch on
 # isolation_mode(), its preflight check in PREFLIGHT_MODE_CHECKS and any pair it
 # changes in place in IN_PLACE_PAIRS.
-ISOLATION_MODES = ("nspawn", "none")
+ISOLATION_MODES = ("nspawn", "none", "container")
 ISOLATION_MODE = os.environ.get("ISOLATION_MODE", "")
 if ISOLATION_MODE and ISOLATION_MODE not in ISOLATION_MODES:
     sys.exit(f"ISOLATION_MODE must be one of {', '.join(ISOLATION_MODES)}, got {ISOLATION_MODE!r}")
+# container is experimental: the agent refuses it unless its configuration sets
+# Experimental.ContainerIsolation, which manual-bootstrap writes for
+# --experimental-container-isolation. The bootstrap passes the flag whenever
+# ISOLATION_MODE is set, so an nspawn host can change to container later, and
+# for the suites in CONTAINER_OPT_IN_SUITES. E2E_EXPERIMENTAL_CONTAINER_ISOLATION=1
+# forces it for a default run.
+EXPERIMENTAL_CONTAINER_ISOLATION = os.environ.get("E2E_EXPERIMENTAL_CONTAINER_ISOLATION", "") == "1"
+# Node-stack root and supervising unit of the container mode
+# (container.DefaultBase and container.UnitName in pkg/agent/isolation/container).
+# The slot directory is the container's rootfs; the OCI bundles live beside the
+# slots, each slot has a private bpffs, and runc is installed by the agent.
+CONTAINER_ROOT_BASE = "/var/lib/unbounded/containers"
+CONTAINER_BUNDLE_BASE = f"{CONTAINER_ROOT_BASE}/bundles"
+CONTAINER_UNIT_GLOB = "unbounded-node-*.service"
+CONTAINER_BPFFS_BASE = "/run/bpffs"
+CONTAINER_RUNC = "/opt/unbounded/runtime/runc"
+# The journal an in-place mode change keeps while it runs.
+IN_PLACE_JOURNAL = "/etc/unbounded/agent/isolation-migration.json"
 # Agent-owned units and install base of the none mode (pkg/agent/isolation/none).
 NONE_NODE_BASE = "/opt/unbounded/node"
 NONE_UNITS = ("unbounded-containerd.service", "unbounded-kubelet.service")
@@ -819,6 +845,30 @@ def node_exec(command: str) -> str:
     return ssh_capture(f"sudo {DAEMON_BINARY} exec -- /bin/sh -c {shlex.quote(command)}")
 
 
+def container_slots_from_units(units_output: str) -> list[str]:
+    """Return the slots whose unbounded-node-<slot>.service appears in
+    `systemctl list-units --no-legend` output."""
+    slots = []
+    for line in units_output.splitlines():
+        fields = line.split()
+        # A failed unit is listed with a leading status marker.
+        if fields and fields[0] in ("*", "\u25cf"):
+            fields = fields[1:]
+        if fields and fields[0].startswith("unbounded-node-") and fields[0].endswith(".service"):
+            slots.append(fields[0][len("unbounded-node-"):-len(".service")])
+    return slots
+
+
+def active_container_slot() -> str:
+    """Return the slot of the one active unbounded-node-<slot>.service, failing
+    unless exactly one runs."""
+    units = ssh_capture_quiet(f"sudo systemctl list-units --no-legend --state=active '{CONTAINER_UNIT_GLOB}'")
+    slots = container_slots_from_units(units.stdout)
+    if len(slots) != 1:
+        die(f"container mode must run exactly one {CONTAINER_UNIT_GLOB} unit, found {slots}")
+    return slots[0]
+
+
 def none_current_version() -> str:
     """Return the version the none mode's current link selects, or empty."""
     out = ssh_capture_quiet(f"sudo readlink {NONE_NODE_BASE}/current")
@@ -852,6 +902,16 @@ def validate_isolation_mode() -> None:
             ssh_cmd(f"sudo systemctl is-active {unit}")
         if not none_current_version():
             die(f"{NONE_NODE_BASE}/current is not a link to an installed version")
+    elif mode == "container":
+        slot = active_container_slot()
+        # The slot directory is the container's rootfs (container.Root), so it
+        # holds the unpacked image directly, next to its OCI bundle, and the
+        # slot has a private bpffs mount.
+        ssh_cmd(f"sudo test -f {CONTAINER_ROOT_BASE}/{slot}/etc/os-release")
+        ssh_cmd(f"sudo test -f {CONTAINER_BUNDLE_BASE}/{slot}/config.json")
+        ssh_cmd(f"sudo test -x {CONTAINER_RUNC}")
+        ssh_cmd(f"sudo mountpoint -q {CONTAINER_BPFFS_BASE}/{slot}")
+        ssh_cmd(f"sudo {DAEMON_BINARY} exec -- /bin/true")
     log(f"Isolation mode {mode} verified on the host")
 
 
@@ -923,12 +983,22 @@ def validate_node_stack_removed() -> None:
                 die(f"nspawn machine '{nspawn_name}' is still running after reset")
             log(f"nspawn machine '{nspawn_name}' is not running")
         return
-    if mode != "none":
+    if mode == "none":
+        leftovers = present_on_host([
+            NONE_NODE_BASE,
+            *[f"/etc/systemd/system/{unit}" for unit in NONE_UNITS],
+        ])
+    elif mode == "container":
+        # Reset destroys each slot (container.Backend.Destroy): its unit,
+        # bundle, rootfs and bpffs mount.
+        leftovers = present_on_host([
+            path
+            for slot in NSPAWN_MACHINE_NAMES
+            for path in (f"{CONTAINER_ROOT_BASE}/{slot}", f"{CONTAINER_BUNDLE_BASE}/{slot}",
+                         f"/etc/systemd/system/unbounded-node-{slot}.service", f"{CONTAINER_BPFFS_BASE}/{slot}")
+        ])
+    else:
         die(f"no node stack removal check for isolation mode {mode!r}")
-    leftovers = present_on_host([
-        NONE_NODE_BASE,
-        *[f"/etc/systemd/system/{unit}" for unit in NONE_UNITS],
-    ])
     if leftovers:
         die(f"reset left {mode} node stack artifacts on the host: {leftovers}")
     log(f"{mode} node stack is gone after reset")
@@ -971,6 +1041,23 @@ def assert_bpffs_sentinel_absent(machine: str) -> None:
     result = ssh_capture_quiet(f"sudo test ! -e {NODE_BPFFS_BASE}/{machine}/{BPFFS_SENTINEL}")
     if result.returncode != 0:
         die(f"bpffs sentinel from previous machine is visible in '{machine}'")
+
+
+def create_container_bpffs_sentinel(slot: str) -> None:
+    """Make a sentinel in the bpffs of the running container slot, which the
+    host mounts at /run/bpffs/<slot> and the container sees at /sys/fs/bpf."""
+    log(f"Creating bpffs sentinel in container slot '{slot}'...")
+    node_exec(bpffs_sentinel_script())
+    ssh_cmd(f"sudo test -d {CONTAINER_BPFFS_BASE}/{slot}/{BPFFS_SENTINEL}")
+
+
+def assert_container_bpffs_sentinel_absent(slot: str) -> None:
+    """Assert the new container slot has its own bpffs, without the sentinel
+    the previous slot pinned."""
+    ssh_cmd(f"sudo mountpoint -q {CONTAINER_BPFFS_BASE}/{slot}")
+    result = ssh_capture_quiet(f"sudo test ! -e {CONTAINER_BPFFS_BASE}/{slot}/{BPFFS_SENTINEL}")
+    if result.returncode != 0:
+        die(f"bpffs sentinel from the previous slot is visible in container slot '{slot}'")
 
 
 def _b64(val: str) -> str:
@@ -1151,6 +1238,8 @@ def node_config_bootstrap_args(node_config: NodeConfig) -> list[str]:
         args.extend(["--oci-image", node_config.rootfs_oci_image])
     if ISOLATION_MODE:
         args.extend(["--isolation", ISOLATION_MODE])
+    if ISOLATION_MODE or EXPERIMENTAL_CONTAINER_ISOLATION:
+        args.append("--experimental-container-isolation")
     for mount in node_config.additional_host_mounts:
         spec = mount["source"]
         if mount.get("target"):
@@ -4064,9 +4153,11 @@ def redact_diagnostics(text: str) -> str:
 
 def dump_node_stack_diagnostics() -> None:
     """Print what is needed to see why a Node did not register: unit state and
-    journals on the host and the state of a mode change. Every query is best
-    effort and nothing here can fail the run. A mode with its own runtime adds
-    its queries here."""
+    journals on the host and the state of a mode change, and for container mode
+    the runc state, the in-container kubelet and containerd journals and the
+    OCI bundle. Every query is best effort and nothing here can fail the run. A
+    mode with its own runtime adds its queries here."""
+    runc = CONTAINER_RUNC
     queries = [
         ("failed host units", "sudo systemctl --failed --no-legend"),
         ("node stack units", "sudo systemctl list-units --no-legend --all "
@@ -4074,13 +4165,30 @@ def dump_node_stack_diagnostics() -> None:
         ("agent and node unit journals", "sudo journalctl --no-pager -n 120 -u 'unbounded-*' -u 'systemd-nspawn@*'"),
         ("host kubelet", "sudo systemctl status kubelet.service --no-pager -l 2>&1 | tail -30"),
         ("isolation migration journals and reprovision handoff",
-         "sudo sh -c 'for f in /etc/unbounded/agent/isolation-migration.json "
+         f"sudo sh -c 'for f in {IN_PLACE_JOURNAL} "
          f"{REPROVISION_DIR}/journal.json; do echo == $f; cat $f 2>&1; echo; done; "
          f"ls -la {REPROVISION_DIR} 2>&1; "
          f"systemctl status {REPROVISION_UNIT} --no-pager -l 2>&1 | tail -30'"),
         ("cgroup controllers", "cat /sys/fs/cgroup/cgroup.controllers; stat -fc %T /sys/fs/cgroup"),
         ("kernel messages", "sudo dmesg 2>/dev/null | tail -30"),
     ]
+    if isolation_mode() == "container":
+        queries += [
+            ("runc list", f"sudo {runc} list"),
+            ("runc state", f"for c in $(sudo {runc} list -q); do sudo {runc} state $c; done"),
+            ("in-container unit status",
+             f"for c in $(sudo {runc} list -q); do echo == $c; "
+             f"sudo {runc} exec $c systemctl --failed --no-legend 2>&1; "
+             f"sudo {runc} exec $c systemctl status kubelet containerd --no-pager -l 2>&1 | tail -60; done"),
+            ("in-container journals",
+             f"for c in $(sudo {runc} list -q); do echo == $c; "
+             f"sudo {runc} exec $c journalctl --no-pager -n 150 -u kubelet -u containerd 2>&1; done"),
+            ("container mountinfo", f"for c in $(sudo {runc} list -q); do echo == $c; "
+                                    f"sudo {runc} exec $c cat /proc/self/mountinfo 2>&1 | tail -40; done"),
+            ("container bpffs mounts", f"mount -t bpf 2>&1 | grep {CONTAINER_BPFFS_BASE} || true"),
+            ("container bundle config",
+             f"sudo sh -c 'cat {CONTAINER_BUNDLE_BASE}/*/config.json 2>/dev/null | head -c 6000'"),
+        ]
     for title, command in queries:
         try:
             result = ssh_capture_quiet(command)
@@ -5446,6 +5554,10 @@ def start_machina_controller() -> None:
         "make", "machina-manifests",
         f"MACHINA_IMAGE={MACHINA_E2E_IMAGE}",
         f"MACHINA_API_SERVER_ENDPOINT={api_server}",
+        # machina's own experimental gate is covered by its unit tests. The
+        # suites test the agent's gate, so machina must not mask the agent's
+        # reports with ExperimentalModeDisabled when a suite declares container.
+        "MACHINA_EXPERIMENTAL_CONTAINER_ISOLATION=true",
     ], cwd=str(REPO_ROOT))
 
     rendered = REPO_ROOT / "deploy" / "machina" / "rendered"
@@ -6390,6 +6502,9 @@ def validate_node_repave_upgrade(node_config: NodeConfig) -> None:
         create_bpffs_sentinel(old_nspawn)
     else:
         old_marker = isolation_node_marker()
+        if isolation_mode() == "container":
+            old_slot = active_container_slot()
+            create_container_bpffs_sentinel(old_slot)
 
     assign_repave_configuration(target_version_number, target_mcv)
 
@@ -6403,11 +6518,16 @@ def validate_node_repave_upgrade(node_config: NodeConfig) -> None:
             die(f"repave did not switch nspawn machines: still using {new_nspawn}")
         assert_bpffs_sentinel_absent(new_nspawn)
     else:
-        # none flips its current link to the new version, so the marker
-        # must change.
+        # none flips its current link to the new version; container switches
+        # slots like nspawn. Either way the marker must change.
         new_marker = isolation_node_marker()
         if new_marker == old_marker:
             die(f"repave did not replace the {isolation_mode()} node stack: still {new_marker!r}")
+        if isolation_mode() == "container":
+            new_slot = active_container_slot()
+            if new_slot == old_slot:
+                die(f"repave did not switch container slots: still using {new_slot}")
+            assert_container_bpffs_sentinel_absent(new_slot)
         if applied_isolation() != isolation_mode():
             die("repave changed the isolation mode")
     wait_for_node_kubelet_version(AGENT_MACHINE_NAME, target_kubelet_version)
@@ -6608,9 +6728,9 @@ def set_effective_isolation(mode: str) -> None:
 
 # Ordered mode pairs the daemon changes in place (pkg/agent/isolation/migrate.Plan).
 # In place needs a target with a slot of its own beside the source; none has no
-# slot, so with nspawn and none every change is a reprovision. A mode with
-# slots adds its pairs with nspawn here.
-IN_PLACE_PAIRS: frozenset[tuple[str, str]] = frozenset()
+# slot, so only nspawn and container change in place, in both directions, and
+# any pair involving none is a reprovision.
+IN_PLACE_PAIRS: frozenset[tuple[str, str]] = frozenset({("nspawn", "container"), ("container", "nspawn")})
 
 
 def expected_change_strategy(source: str, target: str) -> str:
@@ -6740,7 +6860,8 @@ def assert_no_automatic_retry(change: dict[str, Any], soak_secs: int | None = No
 # the node; the controller reports them as ChangeRefused, any other failure as
 # ChangeFailed (cmd/machina/machina/controller/isolation_conditions.go).
 REASON_REPROVISION_NOT_ALLOWED = "ReprovisionNotAllowed"
-REFUSED_CHANGE_REASONS = (REASON_REPROVISION_NOT_ALLOWED, "UnsupportedMode")
+REASON_EXPERIMENTAL_NOT_ENABLED = "ExperimentalNotEnabled"
+REFUSED_CHANGE_REASONS = (REASON_REPROVISION_NOT_ALLOWED, REASON_EXPERIMENTAL_NOT_ENABLED, "UnsupportedMode")
 # How long a change may stay InProgress before the controller calls it
 # ChangeStale (isolationChangeStaleAfter).
 CHANGE_STALE_AFTER_SECS = 2 * 3600
@@ -6769,8 +6890,9 @@ def validate_change_failed_condition(target: str, change: dict[str, Any]) -> Non
 
 
 def other_isolation_mode(mode: str) -> str:
-    """Return a mode other than *mode*: none for nspawn, nspawn otherwise."""
-    return "none" if mode == "nspawn" else "nspawn"
+    """Return a mode the node can reach from *mode* only by reprovision: none
+    for nspawn and container, nspawn for none."""
+    return "nspawn" if mode == "none" else "none"
 
 
 def validate_reprovision_refused() -> None:
@@ -6893,6 +7015,202 @@ def reset_agent_on_host() -> None:
     log(f"unbounded-agent reset left a clean host in {isolation_mode()} mode")
 
 
+def applied_config_opts_in_to_container() -> bool:
+    """Report whether the applied config of the host sets
+    Experimental.ContainerIsolation, without which the agent refuses the
+    container mode."""
+    for path in applied_config_files():
+        doc = json.loads(ssh_capture(f"sudo cat {path}"))
+        if (doc.get("Experimental") or {}).get("ContainerIsolation"):
+            return True
+    return False
+
+
+def validate_experimental_refused() -> None:
+    """Declare container on a host whose agent config does not opt in to the
+    experimental mode and assert the agent refuses it: the change is Failed
+    with reason ExperimentalNotEnabled, IsolationDrift reports ChangeRefused,
+    the repave the Node deletion triggered still brings the node back in its
+    applied mode, and nothing retries the change. The spec is then set back to
+    the applied mode. A host bootstrapped with
+    --experimental-container-isolation opts in, so there is nothing to refuse."""
+    source = applied_isolation()
+    if source == "container" or applied_config_opts_in_to_container():
+        log("The host opts in to the experimental container mode; nothing to refuse")
+        return
+    previous = isolation_change_view()
+    marker = isolation_node_marker()
+    declare_isolation_spec("container")
+    validate_change_pending(source, "container", marker, previous)
+    log(f"Deleting Node '{AGENT_MACHINE_NAME}'; the change to the experimental container mode must be refused...")
+    kubectl(["delete", "node", AGENT_MACHINE_NAME])
+    change = wait_for_isolation_change("container", "Failed", previous)
+    if change.get("reason") != REASON_EXPERIMENTAL_NOT_ENABLED:
+        die(f"the change to container failed with reason {change.get('reason')!r}, expected "
+            f"{REASON_EXPERIMENTAL_NOT_ENABLED}: {change.get('message', '')!r}")
+    wait_for_node()
+    if applied_isolation() != source:
+        die(f"a refused change left the applied mode at {applied_isolation()!r}, expected {source!r}")
+    validate_isolation_mode()
+    validate_change_failed_condition("container", change)
+    assert_no_automatic_retry(change)
+    validate_no_reprovision_handoff()
+    declare_isolation_spec(source)
+    validate_isolation_status()
+    validate_workload()
+    log(f"The change {source} -> container was refused without the experimental opt-in and the node "
+        f"stayed in {source}")
+
+
+def active_node_slot() -> str:
+    """Return the slot the node stack of the mode under test runs in. Only
+    nspawn and container have more than one slot; none always uses kube1."""
+    mode = isolation_mode()
+    if mode == "nspawn":
+        return active_nspawn_machine()
+    if mode == "container":
+        return active_container_slot()
+    return "kube1"
+
+
+def alternate_node_slot() -> str:
+    """Return the slot an in-place mode change prepares its target in."""
+    active = active_node_slot()
+    return next(name for name in NSPAWN_MACHINE_NAMES if name != active)
+
+
+def applied_config_name(mode: str, slot: str) -> str:
+    """Return the file name stem of a slot's applied config
+    (goalstates.AppliedConfigName): the slot for nspawn, <mode>-<slot> otherwise."""
+    return slot if mode == "nspawn" else f"{mode}-{slot}"
+
+
+def inject_migration_target_fault(target: str) -> str:
+    """Make the target of an in-place change fail at the persist step, after the
+    source has stopped and the target has started, so the rollback path runs.
+
+    Persisting writes the target slot's applied config and then its checksum
+    sidecar next to it. A directory where the sidecar belongs makes the second
+    write fail, for a target of any mode and without depending on timing. The
+    target's own pre-start hook reads only the config file, which does not
+    exist yet at that point, so the target still starts. Returns the path to
+    remove afterward. The fault is harness-only; override it with
+    MIGRATION_FAULT_CMD and MIGRATION_FAULT_CLEANUP_CMD."""
+    custom = os.environ.get("MIGRATION_FAULT_CMD", "")
+    if custom:
+        ssh_cmd(custom)
+        return ""
+    name = applied_config_name(target, alternate_node_slot())
+    path = f"/etc/unbounded/agent/{name}-applied-config.json.sha256"
+    ssh_cmd(f"sudo mkdir -p {shlex.quote(path)}")
+    return path
+
+
+def clear_migration_target_fault(path: str) -> None:
+    custom = os.environ.get("MIGRATION_FAULT_CLEANUP_CMD", "")
+    if custom:
+        ssh_cmd(custom)
+    elif path:
+        # The rollback removes the applied config and sidecar of the failed
+        # target slot, which removes the empty directory standing in for it.
+        ssh_cmd(f"sudo rmdir {shlex.quote(path)} 2>/dev/null || true")
+
+
+def assert_rollback_ran(message: str, source: str, custom_fault: bool = False) -> None:
+    """Assert a failed isolation change failed the way the test meant it to: the
+    source was stopped, the failure happened, and the source was started again
+    ("rolled back to <source>"). A failure before any change (preflight) says
+    "was not changed" and proves nothing about rollback. With the default
+    injected fault the failure is the persist step."""
+    if not message:
+        die("the failed isolation change carries no message")
+    if f"rolled back to {source}" not in message:
+        die(f"the isolation change failed without a rollback to {source}: {message!r}")
+    if not custom_fault and "persist applied config" not in message:
+        die(f"the isolation change did not fail at the injected fault (persisting the target): {message!r}")
+
+
+def validate_change_rollback(node_config: NodeConfig, target: str) -> None:
+    """Fail an in-place change after the source stopped and assert the failure
+    is recorded with a rollback, nothing retries it, IsolationDrift reports
+    ChangeFailed, no in-place journal is left, and that once the spec is set
+    back the source mode is running again on a Node that registered itself."""
+    source = applied_isolation()
+    if expected_change_strategy(source, target) != "inplace":
+        die(f"{source} -> {target} is not an in-place change; the rollback check needs one")
+    previous = isolation_change_view()
+    marker = isolation_node_marker()
+    fault = inject_migration_target_fault(target)
+    try:
+        declare_isolation_spec(target)
+        validate_change_pending(source, target, marker, previous)
+        kubectl(["delete", "node", AGENT_MACHINE_NAME])
+        change = wait_for_isolation_change(target, "Failed", previous)
+    finally:
+        clear_migration_target_fault(fault)
+    assert_rollback_ran(change.get("message", ""), source, custom_fault=bool(os.environ.get("MIGRATION_FAULT_CMD")))
+    validate_change_failed_condition(target, change)
+    assert_no_automatic_retry(change)
+    declare_isolation_spec(source)
+    set_effective_isolation(source)
+    wait_for_node()
+    if applied_isolation() != source:
+        die(f"rollback left the applied mode at {applied_isolation()!r}, expected {source!r}")
+    validate_isolation_mode()
+    validate_isolation_status()
+    _wait_until(lambda: f"the in-place journal {IN_PLACE_JOURNAL} is still on the host"
+                if present_on_host([IN_PLACE_JOURNAL]) else "", 120)
+    node = json.loads(kubectl_capture(["get", "node", AGENT_MACHINE_NAME, "-o", "json"]))
+    _assert_expected_node_config(node, node_config)
+    validate_workload()
+    log(f"Isolation change rollback to {source} PASSED")
+
+
+def container_host_lacks_nspawn_runtime() -> bool:
+    """Report whether the host has no machinectl, as a container host does until
+    systemd-container is installed."""
+    return ssh_capture_quiet("command -v machinectl").returncode != 0
+
+
+def validate_change_needs_nspawn_runtime() -> None:
+    """Assert a change to nspawn is refused before anything changes when the host
+    lacks the nspawn runtime. Bootstrap installs it, an in-place change does
+    not, so the migration preflight must stop it rather than let it stop the
+    source, fail to start the target and roll back. The Node was deleted for
+    the repave, so it registers itself again on the untouched source stack."""
+    if not container_host_lacks_nspawn_runtime():
+        log("The host already has the nspawn runtime; nothing to refuse")
+        return
+    source = applied_isolation()
+    previous = isolation_change_view()
+    marker = isolation_node_marker()
+    declare_isolation_spec("nspawn")
+    validate_change_pending(source, "nspawn", marker, previous)
+    kubectl(["delete", "node", AGENT_MACHINE_NAME])
+    change = wait_for_isolation_change("nspawn", "Failed", previous, timeout_secs=180)
+    message = change.get("message", "")
+    if "cannot run isolation mode nspawn" not in message or "machinectl" not in message:
+        die(f"the change was refused for the wrong reason: {message!r}")
+    if isolation_node_marker() != marker or applied_isolation() != source:
+        die("a refused isolation change changed the node stack")
+    validate_change_failed_condition("nspawn", change)
+    declare_isolation_spec(source)
+    wait_for_node()
+    validate_isolation_status()
+    log("A change to nspawn was refused before the node was touched: the nspawn runtime is missing")
+
+
+def install_nspawn_runtime() -> None:
+    """Install systemd-container on the host, the documented prerequisite for
+    moving a container host to nspawn in place."""
+    if not container_host_lacks_nspawn_runtime():
+        return
+    ssh_cmd("sudo DEBIAN_FRONTEND=noninteractive apt-get install -y systemd-container")
+    if container_host_lacks_nspawn_runtime():
+        die("machinectl is still missing after installing systemd-container")
+    log("Installed systemd-container")
+
+
 def restore_deleted_node() -> None:
     """Bring back a Node object that was deleted without a repave to follow: a
     NodeReboot restarts the node stack, and the kubelet registers the Node
@@ -6934,7 +7252,18 @@ def validate_same_mode_declaration() -> None:
 PREFLIGHT_MODE_CHECKS = {
     "nspawn": "nspawn-runtime",
     "none": "none-backend",
+    "container": "container-backend",
 }
+# Host paths the node stacks of different modes write; a failed in-place change
+# must leave them as it found them (pkg/agent/confsnap.SharedPaths).
+SHARED_CONFIG_PATHS = (
+    "/etc/containerd",
+    "/var/lib/kubelet/config.yaml",
+    "/var/lib/kubelet/kubeconfig",
+    "/var/lib/kubelet/pki",
+    "/etc/kubernetes",
+    "/etc/cni/net.d",
+)
 
 
 def _change_age_secs(change: dict[str, Any], now: float) -> float | None:
@@ -7121,6 +7450,72 @@ def check_isolation_preflight_report(mode: str, report: dict[str, Any]) -> None:
     log(f"Preflight ran the {want} check for {mode} (status {report.get('status')})")
 
 
+def shared_config_digest_script() -> str:
+    """Return the shell script that prints a sha256 (or a link target) for every
+    file under the shared configuration paths. The kubelet rotates its client
+    certificate on its own schedule (kubelet-client-<timestamp>.pem and the
+    kubelet-client-current.pem link), so those are left out; a rotation during
+    a test is not a configuration change."""
+    return ("for p in " + " ".join(SHARED_CONFIG_PATHS) + "; do "
+            "[ -e \"$p\" ] || [ -L \"$p\" ] || continue; "
+            "find \"$p\" -xdev \\( -type f -o -type l \\) ! -name 'kubelet-client-*.pem' | sort | "
+            "while read -r f; do "
+            "if [ -L \"$f\" ]; then echo \"link $(readlink \"$f\") $f\"; "
+            "else echo \"$(sha256sum \"$f\" | cut -d' ' -f1) $f\"; fi; done; done")
+
+
+def parse_digest(out: str) -> dict[str, str]:
+    """Parse the output of the digest script into {path: value}."""
+    digest: dict[str, str] = {}
+    for line in out.splitlines():
+        value, _, path = line.rpartition(" ")
+        if path:
+            digest[path] = value
+    return digest
+
+
+def shared_config_digest() -> dict[str, str]:
+    """Return a sha256 for every file under the shared configuration paths on
+    the VM, plus link targets, keyed by path."""
+    return parse_digest(ssh_capture(f"sudo sh -c {shlex.quote(shared_config_digest_script())}"))
+
+
+def digest_differences(before: dict[str, str], after: dict[str, str]) -> list[str]:
+    """Describe how two shared_config_digest results differ."""
+    changes = []
+    for path in sorted(before.keys() | after.keys()):
+        if path not in after:
+            changes.append(f"removed {path}")
+        elif path not in before:
+            changes.append(f"added {path}")
+        elif before[path] != after[path]:
+            changes.append(f"changed {path}")
+    return changes
+
+
+def validate_change_rollback_config(node_config: NodeConfig) -> None:
+    """Fail an in-place change, then assert the shared host configuration is
+    byte for byte what it was before the change started."""
+    source = applied_isolation()
+    if source not in ("nspawn", "container"):
+        # In place is nspawn <-> container only (migrate.Plan). From any other
+        # mode the change is a reprovision, the in-place rollback never runs and
+        # the comparison below would pass trivially.
+        die(f"the shared-configuration rollback check needs an nspawn or container source, not {source}; "
+            "run it with ISOLATION_MODE=container")
+    before = shared_config_digest()
+    if not before:
+        die(f"no shared configuration files found on the host before the change; a {source} host "
+            "may keep none at these paths (nspawn keeps its configuration inside the machine), so run "
+            "this step with ISOLATION_MODE=container")
+    # In place is nspawn <-> container only; fail the move to the other one.
+    validate_change_rollback(node_config, "nspawn" if source == "container" else "container")
+    changes = digest_differences(before, shared_config_digest())
+    if changes:
+        die("rollback left the shared configuration different: " + "; ".join(changes[:20]))
+    log(f"Rollback restored all {len(before)} shared configuration files")
+
+
 def collect_isolation_evidence() -> None:
     """Print one JSON document describing the mode state of the VM and the
     Machine, for the test plan report. Every query is best effort."""
@@ -7147,6 +7542,7 @@ def collect_isolation_evidence() -> None:
         "'unbounded-*.service' 'systemd-nspawn@*.service'"))
     attempt("none_current_version", none_current_version)
     attempt("machinectl", lambda: run_ssh("sudo machinectl list --no-legend"))
+    attempt("runc_containers", lambda: run_ssh(f"sudo sh -c '[ -x {CONTAINER_RUNC} ] && {CONTAINER_RUNC} list -q'"))
     attempt("agent_daemon", lambda: run_ssh("sudo systemctl is-active unbounded-agent-daemon.service"))
     attempt("agent_version", lambda: run_ssh(f"sudo {DAEMON_BINARY} version"))
     attempt("host_boot_id", lambda: run_ssh("cat /proc/sys/kernel/random/boot_id"))
@@ -7553,13 +7949,13 @@ SUITES: dict[str, list[str]] = {
     "bootstrap-recovery": ["run-agent-recovery", "wait-for-node", "validate-workload",
                            "validate-node-repave-upgrade", "validate-bootstrap-repair"],
     # The isolation test plan suites. Run with ISOLATION_MODE unset (nspawn by
-    # default, no --isolation flag), nspawn or none; the suite is the same for
-    # every mode. Every agent and host operation that applies to a node stack:
-    # join, status, preflight, exec/logs, soft reboot (NodeReboot), host-driven
-    # and operation-driven AgentUpgrade with rollback, repave, host reboot,
-    # AgentReset, reinstall on the same disk. In none, a configuration-only
-    # repave must also put every pod in the new Node's pod CIDR, and survive the
-    # daemon being killed in the middle of it.
+    # default, no --isolation flag), nspawn, none or container; the suite is the
+    # same for every mode. Every agent and host operation that applies to a
+    # node stack: join, status, preflight, exec/logs, soft reboot (NodeReboot),
+    # host-driven and operation-driven AgentUpgrade with rollback, repave, host
+    # reboot, AgentReset, reinstall on the same disk. In none, a
+    # configuration-only repave must also put every pod in the new Node's pod
+    # CIDR, and survive the daemon being killed in the middle of it.
     "isolation-operations": [
         "run-agent", "wait-for-node", "validate-isolation-mode", "validate-host-root",
         "validate-controllers-healthy", "validate-node-config", "dump-persisted-agent-config",
@@ -7574,7 +7970,7 @@ SUITES: dict[str, list[str]] = {
     ],
     # `unbounded-agent reset` run on the host, without the control plane,
     # removes the node stack of the mode, the agent's files and any reprovision
-    # handoff. Run with ISOLATION_MODE unset, nspawn or none.
+    # handoff. Run with ISOLATION_MODE unset, nspawn, none or container.
     "isolation-reset": [
         "run-agent", "wait-for-node", "validate-isolation-mode", "validate-workload",
         "reset-agent-on-host",
@@ -7586,14 +7982,26 @@ SUITES: dict[str, list[str]] = {
         "run-agent", "wait-for-node", "validate-isolation-mode", "change-to-none",
         "validate-no-reprovision-handoff", "reset-agent-on-host",
     ],
-    # Every ordered pair of modes: nspawn -> none and none -> nspawn, both by
-    # reprovision with the allow-reprovision opt-in set. The strategy follows
-    # from the pair; each change asserts the one status.isolationChange
-    # records. Both stops also check that the changed node still behaves: a
-    # soft reboot, a host reboot, a workload and, in none, the preflight. A mode
-    # added to ISOLATION_MODES adds its pairs here.
+    # Every ordered pair of modes: nspawn -> container (in place), container ->
+    # none and none -> container (reprovision), container -> nspawn (in place),
+    # nspawn -> none and none -> nspawn (reprovision). A reprovision runs with
+    # the allow-reprovision opt-in set. The strategy follows from the pair; each
+    # change asserts the one status.isolationChange records. The last two stops
+    # (none, then nspawn) also check that the changed node still behaves: a
+    # soft reboot, a host reboot, a workload and, in none, the preflight. Every
+    # change, in place or not, is followed by a check that no reprovision
+    # handoff is left. The suite bootstraps with --experimental-container-isolation
+    # (CONTAINER_OPT_IN_SUITES), so it runs with ISOLATION_MODE unset.
     "isolation-matrix": [
         "run-agent", "wait-for-node", "validate-isolation-mode", "validate-workload",
+        "change-to-container", "validate-isolation-status", "validate-isolation-exec-logs",
+        "validate-no-reprovision-handoff",
+        "change-to-none", "validate-isolation-status", "validate-isolation-exec-logs",
+        "validate-no-reprovision-handoff",
+        "change-to-container", "validate-isolation-status", "validate-isolation-exec-logs",
+        "validate-no-reprovision-handoff",
+        "change-to-nspawn", "validate-isolation-status", "validate-isolation-exec-logs",
+        "validate-no-reprovision-handoff",
         "change-to-none", "validate-isolation-status", "validate-isolation-exec-logs",
         "validate-isolation-soft-reboot", "validate-isolation-preflight", "validate-host-reboot",
         "validate-workload", "validate-no-reprovision-handoff",
@@ -7614,17 +8022,40 @@ SUITES: dict[str, list[str]] = {
         "reset-agent",
     ],
     # A change that cannot go ahead leaves the node in its mode: declaring the
-    # applied mode moves nothing and records nothing, and a change that needs a
-    # reprovision is refused without the allow-reprovision opt-in while the
-    # repave still brings the node back in its applied mode, with no handoff
-    # staged and no retry. Run with ISOLATION_MODE unset, nspawn or none. The
-    # in-place rollback checks come with a mode that changes in place.
+    # applied mode moves nothing and records nothing, a change that needs a
+    # reprovision is refused without the allow-reprovision opt-in, and with
+    # ISOLATION_MODE unset (no experimental opt-in) a change to container is
+    # refused as ExperimentalNotEnabled. Each time the repave still brings the
+    # node back in its applied mode, with no handoff staged and no retry. Run
+    # with ISOLATION_MODE unset, nspawn, none or container. The in-place
+    # rollback checks are isolation-rollback-in-place.
     "isolation-rollback": [
         "run-agent", "wait-for-node", "validate-isolation-mode", "validate-workload",
-        "validate-same-mode-declaration", "validate-reprovision-refused",
+        "validate-same-mode-declaration", "validate-reprovision-refused", "validate-experimental-refused",
+        "validate-isolation-status", "reset-agent",
+    ],
+    # A failed in-place change restores the source and the shared host
+    # configuration and is not retried, in both directions: container ->
+    # nspawn after a change to nspawn on a host without the nspawn runtime is
+    # refused before the node is touched, then nspawn -> container. Run with
+    # ISOLATION_MODE=container: only a container host keeps its configuration
+    # at the shared host paths the digest compares.
+    "isolation-rollback-in-place": [
+        "run-agent", "wait-for-node", "validate-isolation-mode", "validate-workload",
+        "validate-same-mode-declaration", "validate-change-needs-nspawn-runtime",
+        "install-nspawn-runtime", "validate-change-rollback-config",
+        "change-to-nspawn", "validate-change-rollback-to-container",
         "validate-isolation-status", "reset-agent",
     ],
 }
+
+
+# Suites that change the node to container whatever ISOLATION_MODE is; their
+# bootstrap opts in to the experimental mode (suite_needs_container_opt_in).
+CONTAINER_OPT_IN_SUITES = frozenset(
+    suite for suite, steps in SUITES.items()
+    if any(step in ("change-to-container", "validate-change-rollback-to-container") for step in steps)
+)
 
 
 def validate_suites() -> None:
@@ -7634,8 +8065,18 @@ def validate_suites() -> None:
             die(f"suite {suite} contains unknown steps: {unknown}")
 
 
+def suite_needs_container_opt_in(suite: str) -> bool:
+    """Report whether a suite changes the node to container, which the agent
+    refuses unless the bootstrap opted the host in to the experimental mode."""
+    return suite in CONTAINER_OPT_IN_SUITES
+
+
 def run_suite(node_config: NodeConfig, suite: str) -> None:
+    global EXPERIMENTAL_CONTAINER_ISOLATION  # noqa: PLW0603
     validate_suites()
+    if suite_needs_container_opt_in(suite) and not EXPERIMENTAL_CONTAINER_ISOLATION:
+        log(f"suite {suite!r} changes the node to container; bootstrapping with --experimental-container-isolation")
+        EXPERIMENTAL_CONTAINER_ISOLATION = True
     steps = SUITES[suite]
     for index, step in enumerate(steps, start=1):
         log(f"[{index}/{len(steps)}] {suite}: {step}")
@@ -7719,6 +8160,11 @@ COMMANDS: dict[str, Command] = {
     **{f"change-to-{mode}": (lambda nc, mode=mode: change_isolation_mode(nc, mode)) for mode in ISOLATION_MODES},
     "validate-same-mode-declaration": _without_node_config(validate_same_mode_declaration),
     "validate-reprovision-refused": _without_node_config(validate_reprovision_refused),
+    "validate-experimental-refused": _without_node_config(validate_experimental_refused),
+    "validate-change-rollback-to-container": lambda nc: validate_change_rollback(nc, "container"),
+    "validate-change-rollback-config": validate_change_rollback_config,
+    "validate-change-needs-nspawn-runtime": _without_node_config(validate_change_needs_nspawn_runtime),
+    "install-nspawn-runtime": _without_node_config(install_nspawn_runtime),
     "validate-no-reprovision-handoff": _without_node_config(validate_no_reprovision_handoff),
     "reset-agent-on-host": _without_node_config(reset_agent_on_host),
     "validate-isolation-status": _without_node_config(validate_isolation_status),

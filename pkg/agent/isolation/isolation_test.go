@@ -22,7 +22,7 @@ func TestParseMode(t *testing.T) {
 		{"", ModeNSpawn, false},
 		{"nspawn", ModeNSpawn, false},
 		{"none", ModeNone, false},
-		{"container", "", true},
+		{"container", ModeContainer, false},
 		{"microvm", "", true},
 		{"NSpawn", "", true},
 	}

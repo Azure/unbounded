@@ -5,10 +5,16 @@ package nodestart
 
 import (
 	"context"
+	"errors"
 	"io"
+	"log/slog"
 	"net/http"
 	"strings"
 	"testing"
+
+	"github.com/stretchr/testify/require"
+
+	"github.com/Azure/unbounded/pkg/agent/goalstates"
 )
 
 type roundTripFunc func(*http.Request) (*http.Response, error)
@@ -60,4 +66,41 @@ func TestLocalDNSReadyRejectsFailureStatus(t *testing.T) {
 	if err == nil || !strings.Contains(err.Error(), "503 Service Unavailable") {
 		t.Fatalf("localDNSReady() error = %v", err)
 	}
+}
+
+// Restarting the network unit restarts the node units that require it, so it
+// is restarted only when its files changed.
+func TestSetupLocalDNSNetworkRestartsOnlyWhenChanged(t *testing.T) {
+	t.Parallel()
+
+	gs := &goalstates.NodeStart{LocalDNS: goalstates.LocalDNS{Enabled: true}}
+
+	for _, changed := range []bool{false, true} {
+		var calls []string
+
+		task := &setupLocalDNSNetwork{
+			log:       slog.New(slog.DiscardHandler),
+			goalState: gs,
+			write:     func(*goalstates.NodeStart) (bool, error) { return changed, nil },
+			systemctl: func(_ context.Context, args ...string) error {
+				calls = append(calls, strings.Join(args, " "))
+				return nil
+			},
+		}
+
+		require.NoError(t, task.Do(context.Background()))
+
+		if changed {
+			require.Equal(t, []string{"daemon-reload", "restart " + goalstates.LocalDNSNetworkUnit}, calls)
+		} else {
+			require.Empty(t, calls, "unchanged files restart nothing")
+		}
+	}
+
+	failing := &setupLocalDNSNetwork{
+		log:       slog.New(slog.DiscardHandler),
+		goalState: gs,
+		write:     func(*goalstates.NodeStart) (bool, error) { return false, errors.New("read-only /etc") },
+	}
+	require.ErrorContains(t, failing.Do(context.Background()), "read-only /etc")
 }

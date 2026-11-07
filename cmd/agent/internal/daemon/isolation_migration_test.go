@@ -96,6 +96,9 @@ func newMigHarness(t *testing.T, from isolation.Mode) *migHarness {
 	cfg.Isolation = string(from)
 	cfg.NodeName = testNode
 	cfg.Kubelet.Labels = map[string]string{"role": "gpu"}
+	// The host opts in to the experimental container mode, which the in-place
+	// tests change to and from.
+	cfg.Experimental = &provision.ExperimentalConfig{ContainerIsolation: true}
 	h.active = &ActiveMachine{Name: "kube1", Config: cfg, Mode: from}
 	h.applied["kube1"] = cfg
 	h.hostRoot = filepath.Join(h.dir, "hostroot")
@@ -162,6 +165,9 @@ func newMigHarness(t *testing.T, from isolation.Mode) *migHarness {
 			h.events = append(h.events, "kubelet-on-host "+slot)
 			return h.failAt["kubelet-on-host"]
 		},
+		PrepareHost: func(_ context.Context, _ *slog.Logger, mode isolation.Mode) error {
+			return record("prepare-host " + string(mode))
+		},
 		Preflight: func(_ context.Context, _ *slog.Logger, mode isolation.Mode, _ migrate.Strategy) error {
 			h.events = append(h.events, "preflight "+string(mode))
 			return h.failAt["preflight"]
@@ -220,7 +226,8 @@ func (h *migHarness) installUnit() {
 
 func TestMigrateInPlace_BothDirections(t *testing.T) {
 	for _, tt := range []struct{ from, to isolation.Mode }{
-		{isolation.ModeNSpawn, isolation.ModeNSpawn},
+		{isolation.ModeNSpawn, isolation.ModeContainer},
+		{isolation.ModeContainer, isolation.ModeNSpawn},
 	} {
 		t.Run(string(tt.from)+" to "+string(tt.to), func(t *testing.T) {
 			h := newMigHarness(t, tt.from)
@@ -233,6 +240,7 @@ func TestMigrateInPlace_BothDirections(t *testing.T) {
 				"cleanup-network",
 				"persist kube2",
 				"kubelet-on-host kube2",
+				"prepare-host " + string(tt.to),
 				"remove-config kube1",
 			}, h.events)
 
@@ -261,7 +269,7 @@ func TestMigrateInPlace_FromSlotTwoGoesToSlotOne(t *testing.T) {
 	h.active.Name = "kube2"
 	h.applied = map[string]*provision.AgentConfig{"kube2": h.active.Config}
 
-	require.NoError(t, h.run(isolation.ModeNSpawn, migrate.InPlace))
+	require.NoError(t, h.run(isolation.ModeContainer, migrate.InPlace))
 
 	assert.Equal(t, []string{"destroy kube1", "prepare kube1", "start kube1"}, h.target.Calls())
 	assert.Contains(t, h.applied, "kube1")
@@ -272,10 +280,10 @@ func TestMigrateInPlace_PreflightFailureChangesNothing(t *testing.T) {
 	h := newMigHarness(t, isolation.ModeNSpawn)
 	h.failAt["preflight"] = errors.New("no runtime")
 
-	err := h.run(isolation.ModeNSpawn, migrate.InPlace)
+	err := h.run(isolation.ModeContainer, migrate.InPlace)
 	require.ErrorContains(t, err, "no runtime")
 
-	assert.Equal(t, []string{"preflight nspawn"}, h.events, "no download, no config change")
+	assert.Equal(t, []string{"preflight container"}, h.events, "no download, no config change")
 	assert.Empty(t, h.source.Calls())
 	assert.Empty(t, h.target.Calls())
 
@@ -287,7 +295,7 @@ func TestMigrateInPlace_DownloadFailureChangesNothing(t *testing.T) {
 	h := newMigHarness(t, isolation.ModeNSpawn)
 	h.failAt["download"] = errors.New("offline")
 
-	require.ErrorContains(t, h.run(isolation.ModeNSpawn, migrate.InPlace), "offline")
+	require.ErrorContains(t, h.run(isolation.ModeContainer, migrate.InPlace), "offline")
 	assert.Empty(t, h.source.Calls())
 	assert.Empty(t, h.target.Calls())
 }
@@ -296,7 +304,7 @@ func TestMigrateInPlace_ResolveDownloadsFailureChangesNothing(t *testing.T) {
 	h := newMigHarness(t, isolation.ModeNSpawn)
 	h.failAt["downloads"] = errors.New("registry unreachable")
 
-	require.ErrorContains(t, h.run(isolation.ModeNSpawn, migrate.InPlace), "registry unreachable")
+	require.ErrorContains(t, h.run(isolation.ModeContainer, migrate.InPlace), "registry unreachable")
 	assert.Empty(t, h.events)
 }
 
@@ -304,7 +312,7 @@ func TestMigrateInPlace_RefusesWhenAlternateSlotIsRecordedInUse(t *testing.T) {
 	h := newMigHarness(t, isolation.ModeNSpawn)
 	h.applied["kube2"] = h.active.Config
 
-	require.ErrorContains(t, h.run(isolation.ModeNSpawn, migrate.InPlace), "still recorded as in use")
+	require.ErrorContains(t, h.run(isolation.ModeContainer, migrate.InPlace), "still recorded as in use")
 	assert.Empty(t, h.events)
 }
 
@@ -313,7 +321,7 @@ func TestMigrateInPlace_AnUnreadableAlternateRecordIsOverwrittenAndRollsBack(t *
 	h.failAt["read kube2"] = errors.New("is a directory")
 	h.failAt["persist kube2"] = errors.New("is a directory")
 
-	require.ErrorContains(t, h.run(isolation.ModeNSpawn, migrate.InPlace), "rolled back to nspawn")
+	require.ErrorContains(t, h.run(isolation.ModeContainer, migrate.InPlace), "rolled back to nspawn")
 	assert.Equal(t, []string{"stop kube1", "start kube1"}, h.source.Calls())
 }
 
@@ -321,7 +329,7 @@ func TestMigrateInPlace_PrepareFailureLeavesTheSourceRunning(t *testing.T) {
 	h := newMigHarness(t, isolation.ModeNSpawn)
 	h.target.PrepareErr = errors.New("unpack failed")
 
-	require.ErrorContains(t, h.run(isolation.ModeNSpawn, migrate.InPlace), "unpack failed")
+	require.ErrorContains(t, h.run(isolation.ModeContainer, migrate.InPlace), "unpack failed")
 	assert.Empty(t, h.source.Calls())
 	assert.NotContains(t, h.events, "cleanup-network", "the source is not touched before the target is built")
 }
@@ -330,7 +338,7 @@ func TestMigrateInPlace_TargetStartFailureRollsBackToTheSource(t *testing.T) {
 	h := newMigHarness(t, isolation.ModeNSpawn)
 	h.target.StartErr = errors.New("container did not start")
 
-	err := h.run(isolation.ModeNSpawn, migrate.InPlace)
+	err := h.run(isolation.ModeContainer, migrate.InPlace)
 	require.ErrorContains(t, err, "container did not start")
 	require.ErrorContains(t, err, "rolled back to nspawn")
 
@@ -348,7 +356,7 @@ func TestMigrateInPlace_PersistFailureRestoresTheSourceConfig(t *testing.T) {
 	h := newMigHarness(t, isolation.ModeNSpawn)
 	h.failAt["persist kube2"] = errors.New("disk full")
 
-	require.ErrorContains(t, h.run(isolation.ModeNSpawn, migrate.InPlace), "disk full")
+	require.ErrorContains(t, h.run(isolation.ModeContainer, migrate.InPlace), "disk full")
 
 	assert.Contains(t, h.events, "remove-config kube2")
 	assert.Contains(t, h.events, "persist kube1", "the source's applied config is written back")
@@ -359,7 +367,7 @@ func TestMigrateInPlace_ReadinessFailureRollsBack(t *testing.T) {
 	h := newMigHarness(t, isolation.ModeNSpawn)
 	h.failAt["kubelet-on-host"] = errors.New("kubelet inactive")
 
-	err := h.run(isolation.ModeNSpawn, migrate.InPlace)
+	err := h.run(isolation.ModeContainer, migrate.InPlace)
 	require.ErrorContains(t, err, "wait for the target node stack")
 	require.ErrorContains(t, err, "rolled back to nspawn")
 
@@ -372,7 +380,7 @@ func TestMigrateInPlace_LocalKubeletFailureRollsBack(t *testing.T) {
 	h := newMigHarness(t, isolation.ModeNSpawn)
 	h.failAt["kubelet-on-host"] = errors.New("kubelet inactive")
 
-	require.ErrorContains(t, h.run(isolation.ModeNSpawn, migrate.InPlace), "kubelet inactive")
+	require.ErrorContains(t, h.run(isolation.ModeContainer, migrate.InPlace), "kubelet inactive")
 	assert.Equal(t, []string{"stop kube1", "start kube1"}, h.source.Calls())
 }
 
@@ -381,7 +389,7 @@ func TestMigrateInPlace_RollbackFailureIsJournaled(t *testing.T) {
 	h.target.StartErr = errors.New("container did not start")
 	h.source.StartErr = errors.New("machine will not start")
 
-	err := h.run(isolation.ModeNSpawn, migrate.InPlace)
+	err := h.run(isolation.ModeContainer, migrate.InPlace)
 	require.ErrorIs(t, err, migrate.ErrRollbackFailed)
 	require.ErrorContains(t, err, "needs attention")
 
@@ -394,11 +402,63 @@ func TestMigrateInPlace_CleanupFailureStillSucceedsAndKeepsTheJournalToRetry(t *
 	h := newMigHarness(t, isolation.ModeNSpawn)
 	h.source.DestroyErr = errors.New("busy")
 
-	require.NoError(t, h.run(isolation.ModeNSpawn, migrate.InPlace))
+	require.NoError(t, h.run(isolation.ModeContainer, migrate.InPlace))
 
 	j, err := h.journal()
 	require.NoError(t, err)
 	assert.Equal(t, migrate.StepReady, j.Step, "the next daemon start finishes the cleanup")
+}
+
+// The target mode's host preparation runs once the target is up. A failure
+// does not undo the change; the journal is kept so the next start retries it.
+func TestMigrateInPlace_HostPreparationFailureKeepsTheJournalToRetry(t *testing.T) {
+	h := newMigHarness(t, isolation.ModeNSpawn)
+	h.failAt["prepare-host container"] = errors.New("nft is busy")
+
+	require.NoError(t, h.run(isolation.ModeContainer, migrate.InPlace))
+
+	assert.Equal(t, []string{"stop kube1", "destroy kube1"}, h.source.Calls(), "the source is still cleaned up")
+	assert.Contains(t, h.applied, "kube2")
+
+	j, err := h.journal()
+	require.NoError(t, err)
+	assert.Equal(t, migrate.StepReady, j.Step, "the next daemon start prepares the host again")
+
+	// The next start finishes the change.
+	delete(h.failAt, "prepare-host container")
+
+	h.events = nil
+
+	require.NoError(t, h.env.resolveJournal(context.Background(), discardLogger(), j))
+	assert.Equal(t, []string{"prepare-host container", "remove-config kube1"}, h.events)
+
+	j, err = h.journal()
+	require.NoError(t, err)
+	assert.Equal(t, migrate.StepComplete, j.Step)
+}
+
+// A rolled back change leaves the source mode's host preparation alone.
+func TestMigrateInPlace_RollbackDoesNotPrepareTheHost(t *testing.T) {
+	h := newMigHarness(t, isolation.ModeNSpawn)
+	h.failAt["kubelet-on-host"] = errors.New("not ready")
+
+	require.Error(t, h.run(isolation.ModeContainer, migrate.InPlace))
+	assert.NotContains(t, h.events, "prepare-host container")
+}
+
+func TestPrepareHostFor(t *testing.T) {
+	log := discardLogger()
+
+	task, err := prepareHostFor(log, isolation.ModeNSpawn)
+	require.NoError(t, err)
+	assert.Equal(t, "serial(configure-nftables, harden-apt)", task.Name())
+
+	task, err = prepareHostFor(log, isolation.ModeContainer)
+	require.NoError(t, err)
+	assert.Equal(t, "serial(configure-nftables, remove-apt-hardening)", task.Name())
+
+	_, err = prepareHostFor(log, isolation.ModeNone)
+	require.ErrorContains(t, err, "not supported")
 }
 
 // ---------------------------------------------------------------------------
@@ -410,7 +470,7 @@ func writeJournal(t *testing.T, h *migHarness, step migrate.Step, mutate ...func
 
 	j := migrate.Journal{
 		Strategy: migrate.InPlace,
-		From:     isolation.ModeNSpawn, To: isolation.ModeNSpawn,
+		From:     isolation.ModeNSpawn, To: isolation.ModeContainer,
 		SourceSlot: "kube1", TargetSlot: "kube2", Step: step,
 	}
 	for _, m := range mutate {
@@ -454,12 +514,12 @@ func TestMigrateInPlace_ResumeAtEveryStep(t *testing.T) {
 		},
 		{
 			step: migrate.StepAwaitingReady, persisted: true,
-			source: []string{"destroy kube1"}, wantEvents: []string{"kubelet-on-host kube2", "remove-config kube1"},
+			source: []string{"destroy kube1"}, wantEvents: []string{"kubelet-on-host kube2", "prepare-host container", "remove-config kube1"},
 			final: migrate.StepComplete, wantConfig: []string{"kube2"},
 		},
 		{
 			step: migrate.StepReady, persisted: true,
-			source: []string{"destroy kube1"}, wantEvents: []string{"remove-config kube1"},
+			source: []string{"destroy kube1"}, wantEvents: []string{"prepare-host container", "remove-config kube1"},
 			final: migrate.StepComplete, wantConfig: []string{"kube2"},
 		},
 	}
@@ -471,7 +531,7 @@ func TestMigrateInPlace_ResumeAtEveryStep(t *testing.T) {
 
 			if tt.persisted {
 				target := h.active.Config.DeepCopy()
-				target.Isolation = string(isolation.ModeNSpawn)
+				target.Isolation = string(isolation.ModeContainer)
 				h.applied["kube2"] = target
 			}
 
@@ -514,7 +574,7 @@ func TestMigrateInPlace_ResumeAwaitingReadyRollsBackWhenTheTargetIsNotUp(t *test
 	journal := writeJournal(t, h, migrate.StepAwaitingReady)
 
 	target := h.active.Config.DeepCopy()
-	target.Isolation = string(isolation.ModeNSpawn)
+	target.Isolation = string(isolation.ModeContainer)
 	h.applied["kube2"] = target
 	h.failAt["kubelet-on-host"] = errors.New("timed out")
 

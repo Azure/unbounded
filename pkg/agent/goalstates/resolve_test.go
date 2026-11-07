@@ -104,7 +104,7 @@ func TestResolveMachineNvidiaToolkit(t *testing.T) {
 	})
 
 	t.Run("no setting is the default for every mode", func(t *testing.T) {
-		for _, mode := range []string{"", "nspawn", "none"} {
+		for _, mode := range []string{"", "nspawn", "none", "container"} {
 			gs := resolve(t, &config.AgentConfig{Isolation: mode})
 			require.Equal(t, NvidiaToolkit{}, gs.NodeStart.NvidiaToolkit, mode)
 			require.Equal(t, NvidiaContainerRuntimePath, gs.NodeStart.Containerd.NvidiaRuntime.RuntimePath, mode)
@@ -112,7 +112,7 @@ func TestResolveMachineNvidiaToolkit(t *testing.T) {
 	})
 
 	t.Run("the other modes ignore it", func(t *testing.T) {
-		for _, mode := range []string{"", "nspawn"} {
+		for _, mode := range []string{"", "nspawn", "container"} {
 			gs := resolve(t, &config.AgentConfig{Isolation: mode, NvidiaToolkit: toolkit})
 			require.Equal(t, NvidiaToolkit{}, gs.NodeStart.NvidiaToolkit, mode)
 			require.Equal(t, NvidiaContainerRuntimePath, gs.NodeStart.Containerd.NvidiaRuntime.RuntimePath, mode)

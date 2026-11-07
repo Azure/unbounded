@@ -307,7 +307,8 @@ selects where the node stack runs is:
 
 | Flag | Type | Default | Description |
 |------|------|---------|-------------|
-| `--isolation` | string | empty (`nspawn`) | `nspawn` or `none`. Other values are rejected. |
+| `--isolation` | string | empty (`nspawn`) | `nspawn`, `none`, or `container`. Other values are rejected; `container` needs `--experimental-container-isolation`. |
+| `--experimental-container-isolation` | bool | `false` | Opts the generated agent configuration in to the experimental `container` mode (`Experimental.ContainerIsolation`), for `--isolation container` or a later change to it. |
 
 See [Selecting a mode]({{< relref "reference/agent/isolation#selecting-a-mode" >}}).
 
@@ -424,7 +425,7 @@ name, default `--ttl 300`, and `--wait=true`.
 
 | Command | Operation kind | Notes |
 |---------|----------------|-------|
-| `kubectl unbounded machine node-reboot NAME` | `NodeReboot` | Restarts the node stack (the nspawn machine, or the host units in `none` mode). The host does not reboot. |
+| `kubectl unbounded machine node-reboot NAME` | `NodeReboot` | Restarts the node stack (the nspawn machine, the host units in `none` mode, or the container in `container` mode). The host does not reboot. |
 | `kubectl unbounded machine host-hard-reboot NAME` | `HostHardReboot` | Reboots or power-cycles the host through the owning backend. |
 | `kubectl unbounded machine host-soft-reboot NAME` | `HostSoftReboot` | Reboots the host OS through the in-host agent (`systemctl reboot`). |
 | `kubectl unbounded machine power-off NAME` | `HostPowerOff` | Powers off the host. |

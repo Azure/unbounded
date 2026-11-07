@@ -9,7 +9,8 @@ and sysfs paths required by the AMD Kubernetes device plugin inside the node
 stack. Kubernetes resource advertisement is still handled by a user-deployed AMD
 device plugin. Most of this page describes the default `nspawn`
 [isolation mode]({{< relref "reference/agent/isolation" >}}); see
-[GPU support by isolation mode](#gpu-support-by-isolation-mode) for `none`.
+[GPU support by isolation mode](#gpu-support-by-isolation-mode) for `none` and
+`container`.
 
 ## Prerequisites
 
@@ -30,6 +31,7 @@ custom containerd runtime for AMD GPUs.
 |---|---|
 | [`nspawn`]({{< relref "reference/agent/nspawn" >}}) | `Bind=` entries, read-only sysfs bind-mounts, and `DeviceAllow=` rules in the nspawn config. The rest of this page describes this mode. |
 | [`none`]({{< relref "reference/agent/isolation-none" >}}) | Native. The node stack runs on the host and sees `/dev/kfd`, `/dev/dri/*`, and the AMD sysfs paths directly. Nothing is bind-mounted. |
+| [`container`]({{< relref "reference/agent/isolation-container" >}}) | The same device and sysfs requests become OCI mounts, devices, and cgroup device rules. Provisional and unverified on Azure Container Linux. Devices that appear on the host after the container started are not visible until it restarts. |
 
 ## How It Works
 

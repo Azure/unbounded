@@ -35,7 +35,7 @@ func TestPackageSetForNSpawnIsUnchanged(t *testing.T) {
 func TestPackageSetForOtherModesDropsSystemdContainer(t *testing.T) {
 	t.Parallel()
 
-	for _, mode := range []isolation.Mode{isolation.ModeNone} {
+	for _, mode := range []isolation.Mode{isolation.ModeNone, isolation.ModeContainer} {
 		set := packageSetFor(mode)
 		assert.NotContains(t, set.debian, "systemd-container")
 		assert.NotContains(t, set.rpm, "systemd-container")

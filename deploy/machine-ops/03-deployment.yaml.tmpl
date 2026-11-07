@@ -62,6 +62,10 @@ spec:
             {{- if .APIServerEndpoint }}
             - --api-server-endpoint={{ .APIServerEndpoint }}
             {{- end }}
+            {{- /* Experimental container isolation for HostReplace: off unless set to "true". */}}
+            {{- if eq (default "false" .ExperimentalContainerIsolation) "true" }}
+            - --experimental-container-isolation
+            {{- end }}
             - --metrics-bind-address=:8080
             - --health-probe-bind-address=:8081
           ports:

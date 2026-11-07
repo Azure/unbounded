@@ -186,6 +186,17 @@ func (r *repaveReconciler) planIsolationChange(ctx context.Context, active *Acti
 		return "", false
 	}
 
+	// An experimental mode is reached only on a host whose applied agent
+	// configuration opts in to it.
+	if active.Config != nil {
+		if err := active.Config.CheckModeEnabled(target); err != nil {
+			r.refuseIsolationChange(ctx, current, target, "", v1alpha3.IsolationChangeReasonExperimentalNotEnabled,
+				fmt.Sprintf("%v; %s", err, keeps))
+
+			return "", false
+		}
+	}
+
 	strategy, err := migrate.Plan(current, target)
 	if err != nil {
 		r.refuseIsolationChange(ctx, current, target, "", v1alpha3.IsolationChangeReasonUnsupportedMode,

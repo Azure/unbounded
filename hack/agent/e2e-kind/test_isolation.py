@@ -17,10 +17,30 @@ class IsolationModeTests(unittest.TestCase):
             args = e2e.node_config_bootstrap_args(e2e.load_node_config(""))
         self.assertNotIn("--isolation", args)
 
+    def test_default_passes_no_experimental_flag(self):
+        with patch.object(e2e, "ISOLATION_MODE", ""), patch.object(e2e, "EXPERIMENTAL_CONTAINER_ISOLATION", False):
+            args = e2e.node_config_bootstrap_args(e2e.load_node_config(""))
+        self.assertNotIn("--experimental-container-isolation", args)
+
     def test_explicit_mode_adds_flag(self):
         with patch.object(e2e, "ISOLATION_MODE", "none"):
             args = e2e.node_config_bootstrap_args(e2e.load_node_config(""))
         self.assertEqual(args[args.index("--isolation") + 1], "none")
+
+    def test_every_explicit_mode_opts_in_to_the_experimental_container_mode(self):
+        """An nspawn or none host bootstrapped by the harness may later change to
+        container, which the agent refuses unless its config opts in."""
+        for mode in e2e.ISOLATION_MODES:
+            with self.subTest(mode=mode), patch.object(e2e, "ISOLATION_MODE", mode), \
+                    patch.object(e2e, "EXPERIMENTAL_CONTAINER_ISOLATION", False):
+                args = e2e.node_config_bootstrap_args(e2e.load_node_config(""))
+            self.assertIn("--experimental-container-isolation", args)
+
+    def test_the_experimental_opt_in_alone_adds_no_isolation_flag(self):
+        with patch.object(e2e, "ISOLATION_MODE", ""), patch.object(e2e, "EXPERIMENTAL_CONTAINER_ISOLATION", True):
+            args = e2e.node_config_bootstrap_args(e2e.load_node_config(""))
+        self.assertIn("--experimental-container-isolation", args)
+        self.assertNotIn("--isolation", args)
 
     def test_applied_config_without_isolation_is_nspawn(self):
         self.assertEqual(e2e.parse_applied_isolation(json.dumps({"MachineName": "kube1"})), "nspawn")
@@ -28,13 +48,16 @@ class IsolationModeTests(unittest.TestCase):
         self.assertEqual(e2e.parse_applied_isolation(json.dumps({"Isolation": "none"})), "none")
 
     def test_only_the_modes_of_this_harness_are_known(self):
-        self.assertEqual(e2e.ISOLATION_MODES, ("nspawn", "none"))
+        self.assertEqual(e2e.ISOLATION_MODES, ("nspawn", "none", "container"))
 
     def test_the_strategy_follows_from_the_pair(self):
-        """none has no slot, so every change between nspawn and none is a
-        reprovision (pkg/agent/isolation/migrate.Plan). The harness does not
-        choose it."""
-        for pair in (("nspawn", "none"), ("none", "nspawn")):
+        """nspawn and container change in place in both directions; none has no
+        slot, so every pair involving none is a reprovision
+        (pkg/agent/isolation/migrate.Plan). The harness does not choose it."""
+        self.assertEqual(e2e.IN_PLACE_PAIRS, frozenset({("nspawn", "container"), ("container", "nspawn")}))
+        for pair in (("nspawn", "container"), ("container", "nspawn")):
+            self.assertEqual(e2e.expected_change_strategy(*pair), "inplace", pair)
+        for pair in (("nspawn", "none"), ("none", "nspawn"), ("container", "none"), ("none", "container")):
             self.assertEqual(e2e.expected_change_strategy(*pair), "reprovision", pair)
 
     def test_an_in_place_pair_is_expected_in_place(self):
@@ -46,7 +69,14 @@ class IsolationModeTests(unittest.TestCase):
     def test_every_mode_has_a_change_step(self):
         for mode in e2e.ISOLATION_MODES:
             self.assertIn(f"change-to-{mode}", e2e.COMMANDS)
-        self.assertNotIn("change-to-container", e2e.COMMANDS)
+
+    def test_every_mode_has_a_preflight_check(self):
+        self.assertEqual(set(e2e.PREFLIGHT_MODE_CHECKS), set(e2e.ISOLATION_MODES))
+        self.assertEqual(e2e.PREFLIGHT_MODE_CHECKS["container"], "container-backend")
+
+    def test_a_reprovision_target_is_never_in_place(self):
+        for mode in e2e.ISOLATION_MODES:
+            self.assertEqual(e2e.expected_change_strategy(mode, e2e.other_isolation_mode(mode)), "reprovision", mode)
 
 
 class SuiteTests(unittest.TestCase):
@@ -93,7 +123,48 @@ class SuiteTests(unittest.TestCase):
 
     def test_no_suite_refers_to_a_mode_this_harness_does_not_know(self):
         for name, steps in e2e.SUITES.items():
-            self.assertFalse([s for s in steps if "container" in s], name)
+            for step in steps:
+                if step.startswith("change-to-"):
+                    self.assertIn(step.removeprefix("change-to-"), e2e.ISOLATION_MODES, name)
+
+    def test_the_matrix_runs_every_ordered_pair(self):
+        steps = e2e.SUITES["isolation-matrix"]
+        modes = ["nspawn", *[s.removeprefix("change-to-") for s in steps if s.startswith("change-to-")]]
+        pairs = set(zip(modes, modes[1:]))
+        want = {(a, b) for a in e2e.ISOLATION_MODES for b in e2e.ISOLATION_MODES if a != b}
+        self.assertEqual(pairs, want)
+
+    def test_only_suites_that_reach_container_opt_in(self):
+        self.assertEqual(e2e.CONTAINER_OPT_IN_SUITES, frozenset({"isolation-matrix", "isolation-rollback-in-place"}))
+        for suite in ("lifecycle", "isolation-operations", "isolation-drift", "isolation-rollback"):
+            self.assertFalse(e2e.suite_needs_container_opt_in(suite), suite)
+
+    def test_running_a_container_suite_turns_the_opt_in_on(self):
+        with patch.object(e2e, "EXPERIMENTAL_CONTAINER_ISOLATION", False), patch.object(e2e, "log"), \
+                patch.dict(e2e.COMMANDS, {step: (lambda nc: None) for step in e2e.SUITES["isolation-matrix"]}):
+            e2e.run_suite(None, "isolation-matrix")
+            self.assertTrue(e2e.EXPERIMENTAL_CONTAINER_ISOLATION)
+
+    def test_running_another_suite_leaves_the_opt_in_off(self):
+        with patch.object(e2e, "EXPERIMENTAL_CONTAINER_ISOLATION", False), patch.object(e2e, "log"), \
+                patch.dict(e2e.COMMANDS, {step: (lambda nc: None) for step in e2e.SUITES["isolation-rollback"]}):
+            e2e.run_suite(None, "isolation-rollback")
+            self.assertFalse(e2e.EXPERIMENTAL_CONTAINER_ISOLATION)
+
+    def test_the_in_place_rollback_suite_refuses_then_installs_the_runtime_before_the_rollback_checks(self):
+        steps = e2e.SUITES["isolation-rollback-in-place"]
+        refuse = steps.index("validate-change-needs-nspawn-runtime")
+        install = steps.index("install-nspawn-runtime")
+        rollback = steps.index("validate-change-rollback-config")
+        to_nspawn = steps.index("change-to-nspawn")
+        to_container = steps.index("validate-change-rollback-to-container")
+        self.assertLess(refuse, install)
+        self.assertLess(install, rollback)
+        self.assertLess(rollback, to_nspawn)
+        self.assertLess(to_nspawn, to_container)
+
+    def test_the_rollback_suite_refuses_an_experimental_change(self):
+        self.assertIn("validate-experimental-refused", e2e.SUITES["isolation-rollback"])
 
     def test_the_operation_driven_names_are_gone(self):
         for suite in ("isolation-migration", "isolation-container-reprovision"):
@@ -126,7 +197,7 @@ class PlanStepTests(unittest.TestCase):
         self.assertEqual(e2e.isolation_drift_expectation("none", "none", failed), ("False", "AppliedModeMatches"))
 
     def test_a_refused_change_is_reported_as_change_refused(self):
-        for reason in ("ReprovisionNotAllowed", "UnsupportedMode"):
+        for reason in ("ReprovisionNotAllowed", "ExperimentalNotEnabled", "UnsupportedMode"):
             refused = {"targetMode": "none", "phase": "Failed", "reason": reason}
             self.assertEqual(e2e.isolation_drift_expectation("none", "nspawn", refused), ("True", "ChangeRefused"))
         other = {"targetMode": "none", "phase": "Failed", "reason": "SomethingElse"}
@@ -280,8 +351,22 @@ class NodeStackDiagnosticsTests(unittest.TestCase):
         self.assertIn(f"{e2e.REPROVISION_DIR}/journal.json", joined)
         self.assertIn(f"systemctl status {e2e.REPROVISION_UNIT}", joined)
 
-    def test_no_mode_queries_runc(self):
-        for mode in e2e.ISOLATION_MODES:
+    def test_container_mode_asks_for_the_in_container_journals(self):
+        commands = []
+
+        def ssh(command):
+            commands.append(command)
+            return unittest.mock.Mock(stdout="out", stderr="", returncode=0)
+
+        self._run("container", ssh)
+        joined = "\n".join(commands)
+        self.assertIn("/opt/unbounded/runtime/runc list", joined)
+        self.assertIn("journalctl --no-pager -n 150 -u kubelet -u containerd", joined)
+        self.assertIn("/var/lib/unbounded/containers/bundles/*/config.json", joined)
+        self.assertIn("/etc/unbounded/agent/isolation-migration.json", joined)
+
+    def test_other_modes_do_not_query_runc(self):
+        for mode in (m for m in e2e.ISOLATION_MODES if m != "container"):
             commands = []
 
             def ssh(command):
@@ -341,6 +426,14 @@ class BPFFSSentinelTests(unittest.TestCase):
                 patch.object(e2e, "ssh_capture_quiet", return_value=visible), \
                 self.assertRaises(SystemExit):
             e2e.assert_bpffs_sentinel_absent("kube2")
+
+
+class ContainerBPFFSSentinelTests(unittest.TestCase):
+    def test_container_sentinel_uses_the_shared_script_and_checks_the_host(self):
+        with patch.object(e2e, "node_exec") as node_exec, patch.object(e2e, "ssh_cmd") as host:
+            e2e.create_container_bpffs_sentinel("kube1")
+        node_exec.assert_called_once_with(e2e.bpffs_sentinel_script())
+        host.assert_called_once_with(f"sudo test -d /run/bpffs/kube1/{e2e.BPFFS_SENTINEL}")
 
 
 class SoftRebootTests(unittest.TestCase):
@@ -704,7 +797,7 @@ class DeclareMismatchTests(unittest.TestCase):
         self.assertIn("validate-reprovision-refused", e2e.SUITES["isolation-drift"])
 
     def test_the_mismatch_is_a_mode_other_than_the_applied_one(self):
-        for applied, other in (("none", "nspawn"), ("nspawn", "none")):
+        for applied, other in (("none", "nspawn"), ("nspawn", "none"), ("container", "none")):
             declared = []
             seen = view(other, applied, drift("True", "AppliedModeDiffers"))
             with patch.object(e2e, "ISOLATION_MODE", applied), \
@@ -800,6 +893,12 @@ class ReprovisionRefusedTests(unittest.TestCase):
         calls = self._refuse(source="none")
         self.assertEqual([c[1] for c in calls if c[0] == "declare"], ["nspawn", "none"])
 
+    def test_a_container_host_is_refused_a_reprovision_to_none(self):
+        """container -> nspawn is in place, so the refusal check moves a
+        container host to none."""
+        calls = self._refuse(source="container")
+        self.assertEqual([c[1] for c in calls if c[0] == "declare"], ["none", "container"])
+
     def test_a_failure_for_another_reason_fails(self):
         with self.assertRaises(SystemExit):
             self._refuse(reason="")
@@ -886,6 +985,19 @@ class ResetOnHostTests(unittest.TestCase):
                 e2e.validate_node_stack_removed()
         with patch.object(e2e, "ISOLATION_MODE", "none"), patch.object(e2e, "present_on_host", return_value=[]):
             e2e.validate_node_stack_removed()
+
+    def test_every_container_slot_must_be_gone(self):
+        with patch.object(e2e, "ISOLATION_MODE", "container"), patch.object(e2e, "present_on_host", return_value=[]) as asked:
+            e2e.validate_node_stack_removed()
+        paths = asked.call_args.args[0]
+        for slot in ("kube1", "kube2"):
+            for path in (f"/var/lib/unbounded/containers/{slot}", f"/var/lib/unbounded/containers/bundles/{slot}",
+                         f"/etc/systemd/system/unbounded-node-{slot}.service", f"/run/bpffs/{slot}"):
+                self.assertIn(path, paths)
+        with patch.object(e2e, "ISOLATION_MODE", "container"), \
+                patch.object(e2e, "present_on_host", return_value=["/run/bpffs/kube1"]):
+            with self.assertRaises(SystemExit):
+                e2e.validate_node_stack_removed()
 
 
 def pod(name, ip, phase="Running", host_network=False, deleting=False, ips=None):
@@ -1002,6 +1114,394 @@ class AppliedConfigFilesTests(unittest.TestCase):
             files = e2e.applied_config_files()
         self.assertEqual(files, ["/etc/unbounded/agent/kube1-applied-config.json"])
         self.assertIn("[ -f", commands[0], "a directory named like an applied config must not count as a slot")
+
+
+class ContainerUnitTests(unittest.TestCase):
+    def test_slots_come_from_the_unit_names(self):
+        out = (
+            "unbounded-node-kube1.service loaded active running Unbounded node kube1\n"
+            "unbounded-node-kube2.service loaded active running Unbounded node kube2\n"
+        )
+        self.assertEqual(e2e.container_slots_from_units(out), ["kube1", "kube2"])
+
+    def test_a_status_marker_before_the_unit_is_skipped(self):
+        out = "\u25cf unbounded-node-kube2.service loaded failed failed Unbounded node kube2\n"
+        self.assertEqual(e2e.container_slots_from_units(out), ["kube2"])
+
+    def test_other_units_and_blank_output_are_ignored(self):
+        self.assertEqual(e2e.container_slots_from_units(""), [])
+        self.assertEqual(e2e.container_slots_from_units("unbounded-containerd.service loaded active running x\n"), [])
+
+    def test_exactly_one_active_slot_is_required(self):
+        two = unittest.mock.Mock(returncode=0, stdout=(
+            "unbounded-node-kube1.service loaded active running x\n"
+            "unbounded-node-kube2.service loaded active running x\n"))
+        for units in (two, unittest.mock.Mock(returncode=0, stdout="")):
+            with self.subTest(units=units.stdout), patch.object(e2e, "ssh_capture_quiet", return_value=units), \
+                    self.assertRaises(SystemExit):
+                e2e.active_container_slot()
+
+
+class ContainerModeValidationTests(unittest.TestCase):
+    def _validate(self, failing=""):
+        commands = []
+        units = unittest.mock.Mock(returncode=0, stdout="unbounded-node-kube2.service loaded active running x\n")
+        machines = unittest.mock.Mock(returncode=0, stdout="0\n")
+
+        def quiet(command):
+            return units if "list-units" in command else machines
+
+        def ssh(command):
+            commands.append(command)
+            if failing and failing in command:
+                raise SystemExit(1)
+
+        with patch.object(e2e, "ISOLATION_MODE", "container"), \
+                patch.object(e2e, "applied_isolation", return_value="container"), \
+                patch.object(e2e, "ssh_capture_quiet", side_effect=quiet), patch.object(e2e, "ssh_cmd", side_effect=ssh):
+            e2e.validate_isolation_mode()
+        return "\n".join(commands)
+
+    def test_the_active_slot_has_its_rootfs_bundle_runc_and_bpffs(self):
+        joined = self._validate()
+        self.assertIn("test -f /var/lib/unbounded/containers/kube2/etc/os-release", joined)
+        self.assertIn("test -f /var/lib/unbounded/containers/bundles/kube2/config.json", joined)
+        self.assertIn("test -x /opt/unbounded/runtime/runc", joined)
+        self.assertIn("mountpoint -q /run/bpffs/kube2", joined)
+        self.assertIn("exec -- /bin/true", joined)
+
+    def test_a_missing_bundle_fails(self):
+        with self.assertRaises(SystemExit):
+            self._validate(failing="bundles/kube2/config.json")
+
+    def test_an_nspawn_machine_on_a_container_host_fails(self):
+        units = unittest.mock.Mock(returncode=0, stdout="unbounded-node-kube1.service loaded active running x\n")
+        machines = unittest.mock.Mock(returncode=0, stdout="1\n")
+        with patch.object(e2e, "ISOLATION_MODE", "container"), \
+                patch.object(e2e, "applied_isolation", return_value="container"), \
+                patch.object(e2e, "ssh_capture_quiet", side_effect=lambda c: units if "list-units" in c else machines), \
+                patch.object(e2e, "ssh_cmd"):
+            with self.assertRaises(SystemExit):
+                e2e.validate_isolation_mode()
+
+
+class ActiveSlotTests(unittest.TestCase):
+    def test_a_container_host_names_its_slot_from_the_unit(self):
+        units = unittest.mock.Mock(returncode=0, stdout="unbounded-node-kube2.service loaded active running x\n")
+        with patch.object(e2e, "ISOLATION_MODE", "container"), patch.object(e2e, "ssh_capture_quiet", return_value=units):
+            self.assertEqual(e2e.active_node_slot(), "kube2")
+            self.assertEqual(e2e.alternate_node_slot(), "kube1")
+
+    def test_none_always_uses_kube1(self):
+        with patch.object(e2e, "ISOLATION_MODE", "none"):
+            self.assertEqual(e2e.active_node_slot(), "kube1")
+            self.assertEqual(e2e.alternate_node_slot(), "kube2")
+
+    def test_the_applied_config_name_follows_the_mode(self):
+        """goalstates.AppliedConfigName: the slot for nspawn, <mode>-<slot> otherwise."""
+        self.assertEqual(e2e.applied_config_name("nspawn", "kube2"), "kube2")
+        self.assertEqual(e2e.applied_config_name("container", "kube2"), "container-kube2")
+
+
+class MigrationTargetFaultTests(unittest.TestCase):
+    def test_the_fault_is_a_directory_where_the_target_checksum_sidecar_belongs(self):
+        """Persisting writes the target slot's config and then its checksum
+        sidecar, so a directory at the sidecar path fails the persist for a
+        target of any mode and leaves the target's own pre-start hook, which
+        reads only the config file, alone."""
+        cases = (("nspawn", "kube1", "kube1"), ("nspawn", "kube2", "kube2"),
+                 ("container", "kube1", "container-kube1"), ("container", "kube2", "container-kube2"))
+        for target, slot, name in cases:
+            with self.subTest(target=target, slot=slot), patch.dict("os.environ", {}, clear=False), \
+                    patch.object(e2e, "alternate_node_slot", return_value=slot), patch.object(e2e, "ssh_cmd") as ssh:
+                path = e2e.inject_migration_target_fault(target)
+            self.assertEqual(path, f"/etc/unbounded/agent/{name}-applied-config.json.sha256")
+            self.assertIn("mkdir -p", ssh.call_args.args[0])
+            self.assertIn(path, ssh.call_args.args[0])
+
+    def test_a_custom_fault_command_replaces_it(self):
+        with patch.dict("os.environ", {"MIGRATION_FAULT_CMD": "true"}), patch.object(e2e, "ssh_cmd") as ssh:
+            self.assertEqual(e2e.inject_migration_target_fault("container"), "")
+        ssh.assert_called_once_with("true")
+
+    def test_clearing_removes_only_the_empty_directory(self):
+        with patch.dict("os.environ", {}, clear=False), patch.object(e2e, "ssh_cmd") as ssh:
+            e2e.clear_migration_target_fault("/etc/unbounded/agent/kube2-applied-config.json.sha256")
+        self.assertIn("rmdir", ssh.call_args.args[0])
+
+
+class RollbackCheckTests(unittest.TestCase):
+    def test_a_none_source_is_refused_because_the_rollback_would_never_run(self):
+        with patch.object(e2e, "applied_isolation", return_value="none"), \
+                patch.object(e2e, "shared_config_digest") as digest:
+            with self.assertRaises(SystemExit):
+                e2e.validate_change_rollback_config(None)
+        digest.assert_not_called()
+
+    def test_the_config_check_fails_the_move_to_the_other_in_place_mode(self):
+        for source, target in (("container", "nspawn"), ("nspawn", "container")):
+            with self.subTest(source=source), patch.object(e2e, "applied_isolation", return_value=source), \
+                    patch.object(e2e, "shared_config_digest", return_value={"/etc/containerd/config.toml": "a"}), \
+                    patch.object(e2e, "validate_change_rollback") as rollback:
+                e2e.validate_change_rollback_config(None)
+            self.assertEqual(rollback.call_args.args[1], target)
+
+    def test_a_changed_shared_config_fails(self):
+        digests = iter([{"/etc/containerd/config.toml": "a"}, {"/etc/containerd/config.toml": "b"}])
+        with patch.object(e2e, "applied_isolation", return_value="container"), \
+                patch.object(e2e, "shared_config_digest", side_effect=lambda: next(digests)), \
+                patch.object(e2e, "validate_change_rollback"):
+            with self.assertRaises(SystemExit):
+                e2e.validate_change_rollback_config(None)
+
+    def test_a_host_with_no_shared_config_fails(self):
+        with patch.object(e2e, "applied_isolation", return_value="nspawn"), \
+                patch.object(e2e, "shared_config_digest", return_value={}), \
+                patch.object(e2e, "validate_change_rollback") as rollback:
+            with self.assertRaises(SystemExit):
+                e2e.validate_change_rollback_config(None)
+        rollback.assert_not_called()
+
+    def test_a_rollback_message_must_name_the_rollback_and_the_injected_fault(self):
+        good = "persist applied config: x (rolled back to container)"
+        e2e.assert_rollback_ran(good, "container")
+        for bad in ("", "preflight nspawn: no (the container node was not changed)",
+                    "start nspawn: boom (rolled back to container)"):
+            with self.subTest(message=bad), self.assertRaises(SystemExit):
+                e2e.assert_rollback_ran(bad, "container")
+
+    def test_a_custom_fault_only_needs_the_rollback(self):
+        e2e.assert_rollback_ran("boom (rolled back to nspawn)", "nspawn", custom_fault=True)
+        with self.assertRaises(SystemExit):
+            e2e.assert_rollback_ran("boom (the nspawn node was not changed)", "nspawn", custom_fault=True)
+
+
+class DigestTests(unittest.TestCase):
+    def test_digest_differences(self):
+        before = {"/a": "1", "/b": "2", "/c": "3"}
+        after = {"/a": "1", "/b": "9", "/d": "4"}
+        self.assertEqual(e2e.digest_differences(before, after), ["changed /b", "removed /c", "added /d"])
+        self.assertEqual(e2e.digest_differences(before, dict(before)), [])
+
+    def test_a_kubelet_client_certificate_rotation_is_not_a_change(self):
+        import pathlib
+        import subprocess
+        import tempfile
+
+        (e2e.REPO_ROOT / "tmp").mkdir(exist_ok=True)
+
+        with tempfile.TemporaryDirectory(dir=str(e2e.REPO_ROOT / "tmp")) as tmp:
+            pki = pathlib.Path(tmp) / "pki"
+            pki.mkdir()
+            (pki / "ca.crt").write_text("ca")
+            (pki / "kubelet-client-2026-01-01-00-00-00.pem").write_text("old")
+            (pki / "kubelet-client-current.pem").symlink_to("kubelet-client-2026-01-01-00-00-00.pem")
+            (pathlib.Path(tmp) / "config.yaml").write_text("cfg")
+
+            def digest():
+                with patch.object(e2e, "SHARED_CONFIG_PATHS", (str(pki), str(pathlib.Path(tmp) / "config.yaml"))):
+                    script = e2e.shared_config_digest_script()
+
+                return e2e.parse_digest(subprocess.run(["sh", "-c", script], capture_output=True, text=True,
+                                                       check=True).stdout)
+
+            before = digest()
+            self.assertIn(str(pki / "ca.crt"), before)
+            self.assertIn(str(pathlib.Path(tmp) / "config.yaml"), before)
+            self.assertFalse([p for p in before if "kubelet-client-" in p], before)
+
+            # The kubelet rotates its certificate.
+            (pki / "kubelet-client-current.pem").unlink()
+            (pki / "kubelet-client-2026-02-01-00-00-00.pem").write_text("new")
+            (pki / "kubelet-client-current.pem").symlink_to("kubelet-client-2026-02-01-00-00-00.pem")
+            self.assertEqual(e2e.digest_differences(before, digest()), [])
+
+            # A real configuration change is still seen.
+            (pki / "ca.crt").write_text("changed")
+            self.assertEqual(e2e.digest_differences(before, digest()), [f"changed {pki / 'ca.crt'}"])
+
+
+class ChangeRollbackTests(unittest.TestCase):
+    def _run(self, source, target, env=None, wait_raises=False, journal_left=False):
+        failed = {"targetMode": target, "phase": "Failed", "lastTransitionTime": "t2",
+                  "message": f"persist applied config: x (rolled back to {source})"}
+        calls = []
+        patches = [
+            patch.dict("os.environ", env or {}, clear=False),
+            patch.object(e2e, "applied_isolation", return_value=source),
+            patch.object(e2e, "isolation_change_view", return_value={}),
+            patch.object(e2e, "isolation_node_marker", return_value="m"),
+            patch.object(e2e, "declare_isolation_spec", side_effect=lambda mode: calls.append(("declare", mode))),
+            patch.object(e2e, "validate_change_pending"),
+            patch.object(e2e, "kubectl", side_effect=lambda args: calls.append(("kubectl", args[0]))),
+            patch.object(e2e, "inject_migration_target_fault",
+                         side_effect=lambda t: calls.append(("inject", t)) or "/p"),
+            patch.object(e2e, "clear_migration_target_fault", side_effect=lambda path: calls.append(("clear", path))),
+            patch.object(e2e, "wait_for_isolation_change",
+                         side_effect=(SystemExit(1) if wait_raises else lambda *a, **k: failed)),
+            patch.object(e2e, "validate_change_failed_condition"),
+            patch.object(e2e, "assert_no_automatic_retry"),
+            patch.object(e2e, "set_effective_isolation"),
+            patch.object(e2e, "wait_for_node"),
+            patch.object(e2e, "validate_isolation_mode"),
+            patch.object(e2e, "validate_isolation_status"),
+            patch.object(e2e, "present_on_host", return_value=[e2e.IN_PLACE_JOURNAL] if journal_left else []),
+            patch.object(e2e.time, "sleep"),
+            patch.object(e2e, "kubectl_capture", return_value="{}"),
+            patch.object(e2e, "_assert_expected_node_config"),
+            patch.object(e2e, "validate_workload"),
+        ]
+        if journal_left:
+            clock = iter(range(0, 100000, 100))
+            patches.append(patch.object(e2e.time, "monotonic", side_effect=lambda: next(clock)))
+        for item in patches:
+            item.start()
+        try:
+            e2e.validate_change_rollback(None, target)
+        finally:
+            for item in reversed(patches):
+                item.stop()
+        return calls
+
+    def test_every_target_gets_the_fault_up_front_and_it_is_cleared(self):
+        for source, target in (("nspawn", "container"), ("container", "nspawn")):
+            calls = self._run(source, target)
+            self.assertIn(("inject", target), calls, target)
+            self.assertIn(("clear", "/p"), calls, target)
+            order = [c[0] for c in calls]
+            self.assertLess(order.index("inject"), order.index("declare"),
+                            "the fault is in place before the change is declared")
+
+    def test_a_pair_that_is_not_in_place_is_refused(self):
+        for source, target in (("nspawn", "none"), ("none", "container")):
+            with self.subTest(source=source, target=target), self.assertRaises(SystemExit):
+                self._run(source, target)
+
+    def test_the_spec_is_set_back_to_the_source_afterward(self):
+        calls = self._run("nspawn", "container")
+        self.assertEqual([call[1] for call in calls if call[0] == "declare"], ["container", "nspawn"])
+
+    def test_the_fault_is_removed_even_when_the_wait_fails(self):
+        for source, target in (("container", "nspawn"), ("nspawn", "container")):
+            with self.subTest(source=source), self.assertRaises(SystemExit):
+                self._run(source, target, wait_raises=True)
+
+    def test_a_left_in_place_journal_fails(self):
+        with self.assertRaises(SystemExit):
+            self._run("nspawn", "container", journal_left=True)
+
+
+class NSpawnRuntimeRefusalTests(unittest.TestCase):
+    def _refuse(self, lacks=True, message="host cannot run isolation mode nspawn: nspawn-runtime: machinectl",
+                marker_after="container-kube1"):
+        change = {"targetMode": "nspawn", "phase": "Failed", "message": message, "lastTransitionTime": "t2"}
+        markers = iter(["container-kube1", marker_after])
+        with patch.object(e2e, "container_host_lacks_nspawn_runtime", return_value=lacks), \
+                patch.object(e2e, "applied_isolation", return_value="container"), \
+                patch.object(e2e, "isolation_change_view", return_value={}), \
+                patch.object(e2e, "isolation_node_marker", side_effect=lambda: next(markers)), \
+                patch.object(e2e, "declare_isolation_spec") as declared, \
+                patch.object(e2e, "validate_change_pending"), patch.object(e2e, "kubectl") as kubectl, \
+                patch.object(e2e, "wait_for_isolation_change", return_value=change) as waited, \
+                patch.object(e2e, "validate_change_failed_condition"), patch.object(e2e, "wait_for_node"), \
+                patch.object(e2e, "validate_isolation_status"):
+            e2e.validate_change_needs_nspawn_runtime()
+        return declared, kubectl, waited
+
+    def test_a_host_that_has_the_runtime_has_nothing_to_refuse(self):
+        with patch.object(e2e, "container_host_lacks_nspawn_runtime", return_value=False), \
+                patch.object(e2e, "declare_isolation_spec") as declared:
+            e2e.validate_change_needs_nspawn_runtime()
+        declared.assert_not_called()
+
+    def test_the_expected_refusal_passes_and_the_spec_is_set_back(self):
+        declared, kubectl, waited = self._refuse()
+        self.assertEqual([c.args[0] for c in declared.call_args_list], ["nspawn", "container"])
+        self.assertEqual(waited.call_args.kwargs["timeout_secs"], 180, "a refusal is quick")
+        self.assertIn("node", kubectl.call_args.args[0])
+
+    def test_a_refusal_for_another_reason_fails(self):
+        with self.assertRaises(SystemExit):
+            self._refuse(message="something unrelated")
+
+    def test_a_refusal_that_changed_the_node_fails(self):
+        with self.assertRaises(SystemExit):
+            self._refuse(marker_after="container-kube2")
+
+    def test_installing_the_runtime_is_skipped_when_it_is_there(self):
+        with patch.object(e2e, "container_host_lacks_nspawn_runtime", return_value=False), \
+                patch.object(e2e, "ssh_cmd") as ssh:
+            e2e.install_nspawn_runtime()
+        ssh.assert_not_called()
+
+    def test_a_runtime_still_missing_after_the_install_fails(self):
+        with patch.object(e2e, "container_host_lacks_nspawn_runtime", return_value=True), \
+                patch.object(e2e, "ssh_cmd") as ssh:
+            with self.assertRaises(SystemExit):
+                e2e.install_nspawn_runtime()
+        self.assertIn("systemd-container", ssh.call_args.args[0])
+
+
+class ExperimentalRefusedTests(unittest.TestCase):
+    def _refuse(self, source="nspawn", reason="ExperimentalNotEnabled", opted_in=False, applied_after=None):
+        change = {"targetMode": "container", "phase": "Failed", "reason": reason,
+                  "message": "isolation container is experimental", "lastTransitionTime": "t2"}
+        applied = iter([source, applied_after or source, applied_after or source])
+        calls = []
+        patches = [
+            patch.object(e2e, "applied_isolation", side_effect=lambda: next(applied)),
+            patch.object(e2e, "applied_config_opts_in_to_container", return_value=opted_in),
+            patch.object(e2e, "isolation_change_view", return_value={}),
+            patch.object(e2e, "isolation_node_marker", return_value="m"),
+            patch.object(e2e, "declare_isolation_spec", side_effect=lambda mode: calls.append(("declare", mode))),
+            patch.object(e2e, "validate_change_pending"),
+            patch.object(e2e, "kubectl", side_effect=lambda args: calls.append(("kubectl", args[0], args[1]))),
+            patch.object(e2e, "wait_for_isolation_change", return_value=change),
+            patch.object(e2e, "wait_for_node", side_effect=lambda: calls.append(("node",))),
+            patch.object(e2e, "validate_isolation_mode"),
+            patch.object(e2e, "validate_change_failed_condition",
+                         side_effect=lambda target, ch: calls.append(("condition", target))),
+            patch.object(e2e, "assert_no_automatic_retry", side_effect=lambda ch: calls.append(("soak",))),
+            patch.object(e2e, "validate_no_reprovision_handoff", side_effect=lambda: calls.append(("handoff",))),
+            patch.object(e2e, "validate_isolation_status"),
+            patch.object(e2e, "validate_workload"),
+        ]
+        for item in patches:
+            item.start()
+        try:
+            e2e.validate_experimental_refused()
+        finally:
+            for item in reversed(patches):
+                item.stop()
+        return calls
+
+    def test_a_host_without_the_opt_in_is_refused_and_comes_back(self):
+        calls = self._refuse()
+        self.assertEqual([c[1] for c in calls if c[0] == "declare"], ["container", "nspawn"])
+        self.assertIn(("kubectl", "delete", "node"), calls)
+        for step in (("node",), ("condition", "container"), ("soak",), ("handoff",)):
+            self.assertIn(step, calls)
+
+    def test_a_host_that_opts_in_has_nothing_to_refuse(self):
+        self.assertEqual(self._refuse(opted_in=True), [])
+        self.assertEqual(self._refuse(source="container"), [])
+
+    def test_a_failure_for_another_reason_fails(self):
+        for reason in ("", "ReprovisionNotAllowed"):
+            with self.subTest(reason=reason), self.assertRaises(SystemExit):
+                self._refuse(reason=reason)
+
+    def test_a_refusal_that_changed_the_mode_fails(self):
+        with self.assertRaises(SystemExit):
+            self._refuse(applied_after="container")
+
+    def test_the_opt_in_is_read_from_the_applied_config(self):
+        files = ["/etc/unbounded/agent/kube1-applied-config.json"]
+        for doc, want in (({"Experimental": {"ContainerIsolation": True}}, True), ({"Experimental": {}}, False),
+                          ({}, False), ({"Experimental": None}, False)):
+            with self.subTest(doc=doc), patch.object(e2e, "applied_config_files", return_value=files), \
+                    patch.object(e2e, "ssh_capture", return_value=json.dumps(doc)):
+                self.assertEqual(e2e.applied_config_opts_in_to_container(), want)
 
 
 if __name__ == "__main__":

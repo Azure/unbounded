@@ -24,10 +24,11 @@ from typing import Any
 
 # The isolation modes the report has columns for. A new mode is added here and,
 # when it changes in place with another mode, its pairs to IN_PLACE_PAIRS.
-MODES = ("nspawn", "none")
+MODES = ("nspawn", "none", "container")
 # Ordered mode pairs changed in place (pkg/agent/isolation/migrate.Plan); every
-# other pair is a reprovision. none has no slot, so nspawn and none have none.
-IN_PLACE_PAIRS: frozenset[tuple[str, str]] = frozenset()
+# other pair is a reprovision. none has no slot, so only nspawn and container
+# change in place, in both directions.
+IN_PLACE_PAIRS: frozenset[tuple[str, str]] = frozenset({("nspawn", "container"), ("container", "nspawn")})
 STRATEGIES = (("inPlace",) if IN_PLACE_PAIRS else ()) + ("reprovision",)
 
 # What each e2e.py step exercises, for the coverage matrix. Steps that only
@@ -53,6 +54,10 @@ STEP_OPERATIONS: dict[str, str] = {
     "reset-agent-on-host": "Reset on the host (unbounded-agent reset)",
     "validate-no-reprovision-handoff": "No reprovision handoff left on the host",
     "validate-reprovision-refused": "Mode change refused without the reprovision opt-in",
+    "validate-experimental-refused": "Mode change refused without the experimental opt-in",
+    "validate-change-needs-nspawn-runtime": "Mode change refused before the node is touched",
+    "validate-change-rollback-config": "In-place change rollback and config restore",
+    "validate-change-rollback-to-container": "In-place change rollback and config restore",
     "validate-same-mode-declaration": "Declaring the applied mode moves nothing",
     "declare-isolation-mismatch": "Machine status (isolation, IsolationDrift)",
     "validate-host-root": "Host and cluster checks",
@@ -243,8 +248,8 @@ def build_blocks(results: dict[str, Any]) -> list[tuple[str, Any]]:
     trans = transition_matrix(scenarios)
     if trans:
         blocks.append(("h2", "Mode transitions"))
-        blocks.append(("p", "Every move between nspawn and none is a reprovision; none has no slot to prepare "
-                            "the target in beside the source."))
+        blocks.append(("p", "In place is supported between nspawn and container only; any move involving none is a "
+                            "reprovision, as none has no slot to prepare the target in beside the source."))
         blocks.append(("table", (["Transition", *STRATEGIES],
                                  [[pair, *[_word(trans[pair].get(s)) for s in STRATEGIES]] for pair in sorted(trans)])))
 

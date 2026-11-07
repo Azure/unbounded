@@ -229,7 +229,10 @@ deletes the VM resource, and recreates the same VM name with fresh cloud-init
 custom data that installs `unbounded-agent`. The old OS disk is not reused.
 Configure `machine-ops-controller --api-server-endpoint` with an API server
 address reachable from replaced hosts; the generated agent bootstrap config uses
-that value.
+that value. A Machine that declares the experimental `spec.isolation: container`
+is replaced only when `machine-ops-controller` runs with
+`--experimental-container-isolation`; see
+[Enabling the container mode]({{< relref "reference/agent/isolation#enabling-the-container-mode" >}}).
 
 **Bare metal (PXE)** - metalman sets the PXE or HTTP boot override, force-restarts
 the machine through Redfish, writes the selected host OS image, installs or

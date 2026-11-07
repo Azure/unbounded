@@ -21,7 +21,7 @@ import (
 )
 
 // The plans of the modes that run the node stack outside an nspawn machine
-// (none) differ in how a node is built and started, not in the bootstrap
+// (none, container) differ in how a node is built and started, not in the bootstrap
 // sequence around it. The sequence lives here; each plan owns its node and
 // states what differs through a hostMode.
 
