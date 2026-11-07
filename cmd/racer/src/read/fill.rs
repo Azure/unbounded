@@ -1420,8 +1420,18 @@ impl Fill {
     }
 
     /// Package host ciphertext for GPU verification.
-    fn seal(&self, page: &PageId, copy: UnverifiedPage) -> Result<Box<super::sealed::SealedPage>> {
+    ///
+    /// A registered RDMA page is copied out first, as [`Self::decrypt`] does:
+    /// the sealed page lives until the client sink's decrypt and the verdict's
+    /// persist finish, and a registered buffer held that long throttles RDMA
+    /// receive to the client and disk rate.
+    pub(super) fn seal(
+        &self,
+        page: &PageId,
+        mut copy: UnverifiedPage,
+    ) -> Result<Box<super::sealed::SealedPage>> {
         validate_copy(&copy.copy, page, self.page_size()?)?;
+        copy.copy.ciphertext = self.detach_registered(copy.copy.ciphertext);
         let envelope = copy.copy.ciphertext.envelope().clone();
         let sealed = Box::new(super::sealed::SealedPage {
             metadata: copy.copy.metadata.clone(),

@@ -3030,6 +3030,59 @@ fn registered_ciphertext_decrypts_in_place_and_persists_a_copy() {
     );
 }
 
+/// A sealed page lives until the client sink's decrypt and the verdict's
+/// persist finish, so sealing copies a registered page out first and the
+/// RDMA buffer returns to its pool before either starts.
+#[test]
+fn sealing_registered_ciphertext_releases_the_buffer_before_decrypt_and_persist() {
+    let env = racer_io::Env::host();
+    let mut f = fixture_with(&env, 3, None);
+    let mut w = crate::rdma::links::tests::world_for(
+        [
+            crate::rdma::links::tests::node_id(1),
+            crate::rdma::links::tests::node_id(2),
+        ],
+        false,
+    );
+    let env = w.env.clone();
+    crate::rdma::links::tests::link_up(&env, &mut w);
+    let good = encrypted_copy(&mut f);
+    let copy = registered_copy(&env, &f, &mut w, &good, good.ciphertext.bytes().to_vec());
+    crate::rdma::links::tests::pump(&mut w.a.owner, &mut w.b.owner);
+    assert_eq!(
+        free_buffers(&w),
+        Some(1),
+        "the received page holds a buffer"
+    );
+    let copies = crate::memory::registered_copy_outs();
+    let sealed = f
+        .fill
+        .seal(
+            &f.page,
+            crate::memory::UnverifiedPage {
+                copy,
+                disk_token: None,
+            },
+        )
+        .unwrap();
+    assert_eq!(crate::memory::registered_copy_outs(), copies + 1);
+    let crate::read::sealed::SealedSource::Host(host) = &sealed.source else {
+        panic!("host source");
+    };
+    assert!(!host.copy.ciphertext.is_registered());
+    assert_eq!(host.copy.ciphertext.bytes(), good.ciphertext.bytes());
+    crate::rdma::links::tests::pump(&mut w.a.owner, &mut w.b.owner);
+    assert_eq!(
+        free_buffers(&w),
+        Some(2),
+        "released while the sealed page still awaits decrypt and persist"
+    );
+    // The verdict persists the detached copy without another copy-out.
+    f.fill.sealed_verdict(sealed.report(), true);
+    assert_eq!(crate::memory::registered_copy_outs(), copies + 1);
+    drop(sealed);
+}
+
 #[test]
 fn registered_copy_out_refused_by_admission_keeps_the_registered_page() {
     let env = racer_io::Env::host();
