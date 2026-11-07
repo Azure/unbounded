@@ -357,6 +357,111 @@ pub fn rail_presence(root: &Path, device: &str, key: &str) -> RailPresence {
     }
 }
 
+/// Names sysfs under `root` lists for hardware `key` (see
+/// [`Inventory::rail_key`]), sorted: every device at a PCI key's address
+/// (a VF can carry several, such as a null-GID twin), or the device itself
+/// for a name key when it exists.
+pub fn rail_devices(root: &Path, key: &str) -> Vec<String> {
+    let mut names: Vec<String> = std::fs::read_dir(root)
+        .map(|entries| {
+            entries
+                .filter_map(|entry| entry.ok()?.file_name().into_string().ok())
+                .filter(|name| match key.strip_prefix(PCI_KEY_PREFIX) {
+                    Some(bdf) => sysfs_pci(root, name).as_deref() == Some(bdf),
+                    None => name == key && valid_device(name),
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    names.sort();
+    names
+}
+
+/// Whether sysfs under `root` shows any port of `device` ACTIVE. Tests
+/// whose tree has no `ports` directory count as active.
+pub fn device_active(root: &Path, device: &str) -> bool {
+    if !valid_device(device) {
+        return false;
+    }
+    let Ok(ports) = std::fs::read_dir(root.join(device).join("ports")) else {
+        return root.join(device).exists() && !root.join(device).join("ports").exists();
+    };
+    ports.filter_map(|port| port.ok()).any(|port| {
+        std::fs::read_to_string(port.path().join("state"))
+            .is_ok_and(|state| state.contains("ACTIVE"))
+    })
+}
+
+/// Where sysfs lists verbs character devices (`uverbsN/dev` is `major:minor`).
+pub const SYSFS_INFINIBAND_VERBS: &str = "/sys/class/infiniband_verbs";
+
+/// Where rdma-core looks for a verbs device by number when its
+/// `/dev/infiniband/uverbsN` node cannot be opened.
+pub const DEV_CHAR: &str = "/dev/char";
+
+/// `(major, minor)` of every verbs character device sysfs under `root`
+/// lists, sorted. Entries without a well-formed `dev` are skipped.
+pub fn verbs_char_devices(root: &Path) -> Vec<(u32, u32)> {
+    let mut devices: Vec<(u32, u32)> = std::fs::read_dir(root)
+        .map(|entries| {
+            entries
+                .filter_map(|entry| {
+                    let entry = entry.ok()?;
+                    if !entry.file_name().to_str()?.starts_with("uverbs") {
+                        return None;
+                    }
+                    let dev = std::fs::read_to_string(entry.path().join("dev")).ok()?;
+                    let (major, minor) = dev.trim().split_once(':')?;
+                    Some((major.parse().ok()?, minor.parse().ok()?))
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    devices.sort_unstable();
+    devices
+}
+
+/// Create a fresh `<dir>/<major>:<minor>` node for every verbs character
+/// device sysfs under `sysfs` lists, replacing any old one. Returns how many
+/// were created.
+///
+/// A container's `/dev/infiniband/uverbsN` is a bind mount of the node the
+/// runtime saw at start. After a VF replug, opening it keeps reaching the
+/// removed device while this process still holds contexts on it (the
+/// connection manager's among them), so the device cannot be reopened until
+/// the process restarts. rdma-core then falls back to `/dev/char/M:m`
+/// (`util/open_cdev.c`), which udev maintains on hosts but which a container
+/// lacks; a node created after the replug reaches the new device.
+pub fn refresh_char_devices(sysfs: &Path, dir: &Path) -> std::io::Result<usize> {
+    let devices = verbs_char_devices(sysfs);
+    if devices.is_empty() {
+        return Ok(0);
+    }
+    std::fs::create_dir_all(dir)?;
+    for &(major, minor) in &devices {
+        let path = dir.join(format!("{major}:{minor}"));
+        match std::fs::remove_file(&path) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
+        }
+        let c_path = std::ffi::CString::new(path.as_os_str().as_encoded_bytes())
+            .map_err(|_| std::io::Error::from(std::io::ErrorKind::InvalidInput))?;
+        // SAFETY: `c_path` is a valid NUL-terminated path for the call.
+        let made = unsafe {
+            libc::mknod(
+                c_path.as_ptr(),
+                libc::S_IFCHR | 0o600,
+                libc::makedev(major, minor),
+            )
+        };
+        if made != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+    }
+    Ok(devices.len())
+}
+
 /// [`inventory`] with each port's PCI address, when sysfs reports one.
 fn keyed_inventory() -> Vec<(RailMapping, Option<String>)> {
     inventory_keyed_at(
@@ -688,6 +793,102 @@ mod tests {
     }
 
     #[test]
+    /// sysfs lists every device name at a PCI address, and a device counts
+    /// as active only once one of its ports is ACTIVE.
+    fn rail_devices_list_every_name_at_an_address_and_port_state() {
+        use std::os::unix::fs::symlink;
+        struct Scratch(std::path::PathBuf);
+        impl Drop for Scratch {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        let dir = Scratch(
+            Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("target")
+                .join(format!("rail-devices-{}", std::process::id())),
+        );
+        let root = dir.0.join("infiniband");
+        let pci = dir.0.join("7870:00:00.0");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::create_dir_all(&pci).unwrap();
+        let key = "pci:7870:00:00.0";
+        assert!(rail_devices(&root, key).is_empty());
+        assert!(rail_devices(&root, "mana_0").is_empty());
+        for name in ["roceP30832p0s0", "rdmaP30832p0s0"] {
+            std::fs::create_dir_all(root.join(name).join("ports").join("1")).unwrap();
+            symlink(&pci, root.join(name).join("device")).unwrap();
+        }
+        std::fs::create_dir_all(root.join("other")).unwrap();
+        assert_eq!(
+            rail_devices(&root, key),
+            vec!["rdmaP30832p0s0".to_owned(), "roceP30832p0s0".to_owned()]
+        );
+        assert_eq!(rail_devices(&root, "other"), vec!["other".to_owned()]);
+        assert!(rail_devices(&root, "pci:0000:01:00.0").is_empty());
+        // Ports exist but none is up yet.
+        let state = root.join("roceP30832p0s0/ports/1/state");
+        assert!(!device_active(&root, "roceP30832p0s0"));
+        std::fs::write(&state, "1: DOWN\n").unwrap();
+        assert!(!device_active(&root, "roceP30832p0s0"));
+        std::fs::write(&state, "4: ACTIVE\n").unwrap();
+        assert!(device_active(&root, "roceP30832p0s0"));
+        assert!(device_active(&root, "other"), "no ports directory");
+        assert!(!device_active(&root, "missing"));
+        assert!(!device_active(&root, "../escape"));
+    }
+
+    #[test]
+    /// Verbs character device numbers are read from sysfs, and a refresh
+    /// replaces stale nodes.
+    fn verbs_char_devices_read_numbers_and_refresh_replaces_nodes() {
+        struct Scratch(std::path::PathBuf);
+        impl Drop for Scratch {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        let dir = Scratch(
+            Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("target")
+                .join(format!("char-devices-{}", std::process::id())),
+        );
+        let sysfs = dir.0.join("infiniband_verbs");
+        let dev = dir.0.join("char");
+        assert!(verbs_char_devices(&sysfs).is_empty(), "no sysfs");
+        assert_eq!(refresh_char_devices(&sysfs, &dev).unwrap(), 0);
+        assert!(!dev.exists(), "nothing to create, no directory");
+        for (name, value) in [
+            ("uverbs1", "231:193\n"),
+            ("uverbs0", "231:192\n"),
+            ("uverbs2", "garbage\n"),
+            ("abi_version", "1\n"),
+        ] {
+            std::fs::create_dir_all(sysfs.join(name)).unwrap();
+            std::fs::write(sysfs.join(name).join("dev"), value).unwrap();
+        }
+        assert_eq!(verbs_char_devices(&sysfs), vec![(231, 192), (231, 193)]);
+        // Creating device nodes needs CAP_MKNOD: check what is possible.
+        std::fs::create_dir_all(&dev).unwrap();
+        std::fs::write(dev.join("231:192"), b"stale").unwrap();
+        match refresh_char_devices(&sysfs, &dev) {
+            Ok(count) => {
+                use std::os::unix::fs::{FileTypeExt, MetadataExt};
+                assert_eq!(count, 2);
+                for minor in [192, 193] {
+                    let meta = std::fs::metadata(dev.join(format!("231:{minor}"))).unwrap();
+                    assert!(meta.file_type().is_char_device(), "stale node replaced");
+                    assert_eq!(meta.rdev(), libc::makedev(231, minor));
+                }
+            }
+            Err(error) => {
+                assert_eq!(error.raw_os_error(), Some(libc::EPERM), "{error}");
+                assert!(!dev.join("231:192").exists(), "the stale node is gone");
+            }
+        }
+    }
+
+    #[test]
     /// The sysfs probe tells a present device from one renamed at the same
     /// PCI address (a VF replug) and from a missing one, and a name key only
     /// checks the name.
@@ -778,6 +979,58 @@ mod tests {
         );
         assert_eq!(inventory.device_key("mlx5_00", 2), None);
         assert_eq!(inventory.device_key("missing", 1), None);
+    }
+
+    #[test]
+    /// After a MANA VF replug sysfs lists two devices at the old PCI address:
+    /// `rdmaP...` with a null GID and `roceP...` with the RoCE GID. Only the
+    /// usable one is inventoried, so the key is not ambiguous and the
+    /// replacement keeps the lost device's rail.
+    fn vf_replug_with_null_gid_twin_keeps_rail() {
+        use std::os::unix::fs::symlink;
+        struct Scratch(std::path::PathBuf);
+        impl Drop for Scratch {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        let dir = Scratch(
+            Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("target")
+                .join(format!("vf-replug-{}", std::process::id())),
+        );
+        let root = dir.0.join("infiniband");
+        let pci = dir.0.join("7870:00:00.0");
+        std::fs::create_dir_all(&pci).unwrap();
+        for name in ["mana_0", "rdmaP30832p0s0", "roceP30832p0s0"] {
+            std::fs::create_dir_all(root.join(name)).unwrap();
+            symlink(&pci, root.join(name).join("device")).unwrap();
+        }
+        let port = |device: &str, gid: [u8; 16]| PortInfo {
+            device: device.into(),
+            port: 1,
+            gid,
+            numa_node: None,
+        };
+        let inventory = Inventory::default();
+        let before = inventory
+            .update_keyed(inventory_keyed_at(vec![port("mana_0", [1; 16])], &root))
+            .unwrap();
+        assert_eq!(rails(&before), vec![("mana_0".into(), 0)]);
+        let after = inventory
+            .update_keyed(inventory_keyed_at(
+                vec![
+                    port("rdmaP30832p0s0", [0; 16]),
+                    port("roceP30832p0s0", [1; 16]),
+                ],
+                &root,
+            ))
+            .unwrap();
+        assert_eq!(rails(&after), vec![("roceP30832p0s0".into(), 0)]);
+        assert_eq!(
+            inventory.device_key("roceP30832p0s0", 1).as_deref(),
+            Some("pci:7870:00:00.0")
+        );
     }
 
     #[test]
