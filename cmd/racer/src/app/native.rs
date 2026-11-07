@@ -275,6 +275,7 @@ impl WorkerApplication {
             // logged, and retried, never a silent idle round.
             let result = match result {
                 Ok(rails) if rails.is_empty() && !self.attaching_landings => {
+                    eprintln!("racer: stage=rdma-activation step=settle reason=no_rail_selected");
                     Err(Error::Unavailable)
                 }
                 result => result,
