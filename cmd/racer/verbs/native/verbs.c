@@ -196,7 +196,7 @@ int rdma_verbs_discover(struct rdma_verbs_port *out, uint32_t capacity) {
     int count = 0, n = 0;
     struct ibv_device **list = ibv_get_device_list(&n);
     if (!list) return -errno;
-    if (getenv("RACER_VERBS_DEBUG")) fprintf(stderr, "racer: stage=rdma-discover devices=%d\n", n);
+    fprintf(stderr, "racer: stage=rdma-discover devices=%d\n", n);
     for (int i = 0; i < n; ++i) {
         struct ibv_context *ctx = ibv_open_device(list[i]);
         if (!ctx) {
@@ -212,7 +212,7 @@ int rdma_verbs_discover(struct rdma_verbs_port *out, uint32_t capacity) {
             if (attr.device_cap_flags & IBV_DEVICE_MEM_WINDOW_TYPE_2B) flags |= RDMA_VERBS_PORT_MW;
             else if (supports_rc(ctx)) flags |= RDMA_VERBS_PORT_RC;
         }
-        if (!flags && getenv("RACER_VERBS_DEBUG"))
+        if (!flags)
             fprintf(stderr, "racer: stage=rdma-discover device=%s skipped=no_capability query=%d errno=%d\n",
                     ibv_get_device_name(list[i]), queried, errno);
         if (!flags) {
